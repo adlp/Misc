@@ -4,16 +4,13 @@ import subprocess
 import os
 import git
 import tempfile
+import sys
 import difflib
+import argparse
 
-# Fonction pour exécuter une commande locale et récupérer son output
-def run_command(command):
-    try:
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, check=True, text=True)
-        return result.stdout.strip()
-    except subprocess.CalledProcessError as e:
-        print(f"Erreur lors de l'exécution de la commande: {e.stderr}")
-        return None
+# Fonction pour exécuter une commande locale et récupérer son output depuis stdin
+def get_content_from_stdin():
+    return sys.stdin.read().strip()
 
 # Fonction pour cloner le dépôt Git temporairement et récupérer le texte du fichier
 def get_file_from_git(repo_url, file_path):
@@ -57,50 +54,71 @@ def push_to_git(repo_url, file_path, new_content, commit_message):
         origin = repo.remote(name='origin')
         origin.push()
 
-# Programme principal
-def main(command, repo_url, file_path):
-    # Exécuter la commande locale
-    result = run_command(command)
+# Fonction principale
+def main():
+    # Utilisation d'argparse pour gérer les options
+    parser = argparse.ArgumentParser(description="Script de gestion de fichiers et de dépôt Git.")
+    parser.add_argument("-r", "--repo", required=True, help="URL du dépôt Git")
+    parser.add_argument("-f", "--file", required=True, help="Chemin du fichier dans le dépôt Git")
+    parser.add_argument("-m", "--message", help="Message de commit pour pousser automatiquement")
+    parser.add_argument("-g", "--get", action="store_true", help="Afficher le contenu du fichier dans Git sans mise à jour")
+
+    args = parser.parse_args()
+
+    # Si le flag -g est activé, on affiche juste le fichier de Git
+    if args.get:
+        git_content, _ = get_file_from_git(args.repo, args.file)
+        if git_content is not None:
+            print(f"Contenu du fichier {args.file} dans le dépôt {args.repo} :\n")
+            print(git_content)
+        else:
+            print(f"Le fichier {args.file} n'existe pas dans le dépôt {args.repo}.")
+        return
+
+    # Si stdin est utilisé pour le fichier d'entrée
+    result = get_content_from_stdin()
+
     if not result:
-        print("Impossible de récupérer le texte.")
+        print("Aucun contenu n'a été fourni via stdin.")
         return
 
     # Récupérer le fichier depuis le dépôt Git
-    git_content, is_new_file = get_file_from_git(repo_url, file_path)
+    git_content, is_new_file = get_file_from_git(args.repo, args.file)
 
     if is_new_file:
-        print(f"Le fichier {file_path} n'existe pas dans le dépôt.")
-        notice = input("Entrez une notice pour le commit de ce nouveau fichier : ").strip()
-
-        if notice:
-            # Pousser le nouveau fichier sur Git avec la notice
-            push_to_git(repo_url, file_path, result, notice)
-            print("Nouveau fichier ajouté et poussé sur Git.")
+        print(f"Le fichier {args.file} n'existe pas dans le dépôt.")
+        if args.message:
+            # Pousser le nouveau fichier sur Git avec le message
+            push_to_git(args.repo, args.file, result, args.message)
+            print(f"Nouveau fichier ajouté et poussé sur Git avec le message : {args.message}")
         else:
-            print("Aucune notice entrée, annulation de la création du fichier.")
+            notice = input("Entrez une notice pour le commit de ce nouveau fichier : ").strip()
+            if notice:
+                push_to_git(args.repo, args.file, result, notice)
+                print("Nouveau fichier ajouté et poussé sur Git.")
+            else:
+                print("Aucune notice entrée, annulation de la création du fichier.")
     else:
         # Comparer les deux textes si le fichier existe
         if result != git_content:
             print("Les fichiers ne correspondent pas.")
-            # Afficher le diff entre les fichiers
             display_diff(git_content, result)
 
-            notice = input("Entrez une notice pour le commit (laisser vide pour annuler) : ").strip()
-
-            if notice:
-                # Pousser le fichier mis à jour sur Git avec la notice
-                push_to_git(repo_url, file_path, result, notice)
-                print("Fichier mis à jour et poussé sur Git.")
+            if args.message:
+                # Pousser le fichier mis à jour sur Git avec le message fourni
+                push_to_git(args.repo, args.file, result, args.message)
+                print(f"Fichier mis à jour et poussé sur Git avec le message : {args.message}")
             else:
-                print("Aucune notice entrée, annulation.")
+                notice = input("Entrez une notice pour le commit (laisser vide pour annuler) : ").strip()
+
+                if notice:
+                    # Pousser le fichier mis à jour sur Git avec la notice
+                    push_to_git(args.repo, args.file, result, notice)
+                    print("Fichier mis à jour et poussé sur Git.")
+                else:
+                    print("Aucune notice entrée, annulation.")
         else:
             print("Les fichiers sont identiques, aucune action nécessaire.")
 
-
 if __name__ == "__main__":
-    # Paramètres à définir
-    command = "cat /home/adlp/Projets/GiTouNe/gitoune"  # Script à exécuter
-    repo_url = "git@github.com:adlp/Poc.git"  # URL du dépôt Git
-    file_path = "Tools/fichier.txt"  # Chemin du fichier à comparer dans le dépôt Git
-
-    main(command, repo_url, file_path)
+    main()
