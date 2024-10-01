@@ -1,5 +1,3 @@
-Contenu du fichier Tools/fichier.txt dans le dépôt git@github.com:adlp/Poc.git à la version a5d5f06 :
-
 #!/usr/bin/python3
 
 import subprocess
