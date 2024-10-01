@@ -32,7 +32,9 @@ python script to push a tar file to a repo....
 
   `
 ssh adlp-octopussy sysupgrade -b /tmp/backup-octopussy.tgz
+
 scp adlp-octopussy:/tmp/backup-octopussy.tgz /tmp/backup-octopussy.tgz
+
 ./gitar -t /tmp/backup-octopussy.tgz -r ssh://git@git.adlp.org:653222/adlp/TopSecret.git -p OpenWrt/Octopussy -m "cron $(date)"
   `
 
