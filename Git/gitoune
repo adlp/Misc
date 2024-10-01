@@ -99,32 +99,32 @@ def main():
         git_content, _ = get_file_from_git(args.repo, args.file, commit=commit)
         if git_content is not None:
             if commit:
-                print(f"Contenu du fichier {args.file} dans le dépôt {args.repo} à la version {commit} :\n")
+                print(f"Contenu du fichier {args.file} dans le dépôt {args.repo} à la version {commit} :\n",file=sys.stderr)
             else:
-                print(f"Contenu du fichier {args.file} dans le dépôt {args.repo} :\n")
+                print(f"Contenu du fichier {args.file} dans le dépôt {args.repo} :\n",file=sys.stderr)
             print(git_content)
         else:
-            print(f"Le fichier {args.file} n'existe pas dans le dépôt {args.repo}.")
+            print(f"Le fichier {args.file} n'existe pas dans le dépôt {args.repo}.",file=sys.stderr)
         return
 
     # Si stdin est utilisé pour le fichier d'entrée
     result = get_content_from_stdin()
 
     if not result:
-        print("Aucun contenu n'a été fourni via stdin.")
+        print("Aucun contenu n'a été fourni via stdin.",file=sys.stderr)
         return
 
     # Récupérer le fichier depuis le dépôt Git
     git_content, is_new_file = get_file_from_git(args.repo, args.file)
 
     if is_new_file:
-        print(f"Le fichier {args.file} n'existe pas dans le dépôt.")
+        print(f"Le fichier {args.file} n'existe pas dans le dépôt.",file=sys.stderr)
         if args.message:
             # Pousser le nouveau fichier sur Git avec le message
             push_to_git(args.repo, args.file, result, args.message)
-            print(f"Nouveau fichier ajouté et poussé sur Git avec le message : {args.message}")
+            print(f"Nouveau fichier ajouté et poussé sur Git avec le message : {args.message}",file=sys.stderr)
         else:
-            print("Aucun message fourni, annulation de la création du fichier.")
+            print("Aucun message fourni, annulation de la création du fichier.",file=sys.stderr)
     else:
         # Comparer les deux textes si le fichier existe
         if result != git_content:
