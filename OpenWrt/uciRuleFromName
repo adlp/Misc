@@ -1,0 +1,98 @@
+#!/bin/sh
+
+#set -x
+
+getrulnum() {
+    uci show firewall | grep ".name='$1'" | sed "s/.*\[\(.*\)\].*/\1/g"
+    }
+
+getrulstat() {
+    uci show firewall.@rule[${nur}] | grep enabled -q
+    if [ $? = 0 ]; then
+        uci show firewall.@rule[${nur}] | grep enabled  | cut -d"'" -f2
+    else
+        echo 1
+    fi
+    }
+
+case "$1" in
+    -l)
+        if [ $# -ne 1 ]; then
+            gre=" grep -i $2 "
+        else
+            gre=" cat "
+        fi
+        uci show firewall | grep -E "\@rule.*.name" | cut -d"'" -f2 | $gre | while read nom
+            do
+                echo -ne "$nom:\t"
+                $0 -g "${nom}"
+                done
+        ;;
+    -g)
+        #echo "Affiche le statut de la regle"
+        nur=$(getrulnum $2)
+        if [ -n "${nur}" ]; then
+            if [ "$(getrulstat ${nur})" == "1" ]; then
+                echo "Enable"
+            else
+                echo "Disable"
+            fi
+        else
+            echo "No rules"
+        fi
+        ;;
+    -s)
+        echo "Set le statut de la regle"
+        if [ -z "$3" ]; then
+            echo "Manque le 3eme parametre"
+            exit 254
+            fi
+        st=$(echo "$3" | awk '{print tolower($0)}')
+        nur=$(getrulnum $2)
+        if [ -n "${nur}" ]; then
+            case "${st}" in
+                1|up|enable)
+                    uci set firewall.@rule[${nur}].enabled='1'
+                    ;;
+                0|down|disable)
+                    uci set firewall.@rule[${nur}].enabled='0'
+                    ;;
+                *)
+                    echo "Statut demande ${st} inconnu"
+                    exit 253
+                    ;;
+                esac
+            uci commit firewall
+            service firewall restart
+            $0 -g $2
+        else
+            echo "No rules"
+        fi
+        ;;
+    -t)
+        echo "Toggle le statut de la regle"
+        nur=$(getrulnum $2)
+        if [ -n "${nur}" ]; then
+            $0 -g $2
+            if [ "$(getrulstat ${nur})" == "1" ]; then
+                uci set firewall.@rule[${nur}].enabled='0'
+            else
+                uci set firewall.@rule[${nur}].enabled='1'
+            fi
+            uci commit firewall
+            service firewall restart
+            $0 -g $2
+        else
+            echo "No rules"
+        fi
+        ;;
+    *)
+        cat << EOF
+$0 pour activer/desactiver les regles du FW
+    -l                      Pour les lister
+    -t <nomregle>           Pour faire un toggle d'etat de la regle
+    -s <nomregle> <up|down> Pour activer ou desactiver une regle
+    -g <nomregle>           Pour afficher l'etat d'une regle
+EOF
+        ;;
+    esac
