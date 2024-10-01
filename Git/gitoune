@@ -1,6 +1,5 @@
 #!/usr/bin/python3
 
-
 import subprocess
 import os
 import git
@@ -55,6 +54,14 @@ def push_to_git(repo_url, file_path, new_content, commit_message):
         origin = repo.remote(name='origin')
         origin.push()
 
+# Fonction pour afficher les logs de changements d'un fichier
+def show_file_log(repo_url, file_path):
+    with tempfile.TemporaryDirectory() as tempdir:
+        repo = git.Repo.clone_from(repo_url, tempdir)
+        logs = repo.git.log("--", file_path)
+        print(f"\nHistorique des changements pour {file_path} :\n")
+        print(logs)
+
 # Fonction principale
 def main():
     # Utilisation d'argparse pour gérer les options
@@ -64,8 +71,14 @@ def main():
     parser.add_argument("-m", "--message", help="Message de commit pour pousser automatiquement")
     parser.add_argument("-g", "--get", action="store_true", help="Afficher le contenu du fichier dans Git sans mise à jour")
     parser.add_argument("-d", "--diff", action="store_true", help="Afficher la différence entre le fichier dans Git et le stdin")
+    parser.add_argument("-l", "--log", action="store_true", help="Afficher les logs de changement du fichier")
 
     args = parser.parse_args()
+
+    # Si le flag -l est activé, on affiche les logs de changements du fichier
+    if args.log:
+        show_file_log(args.repo, args.file)
+        return
 
     # Si le flag -g est activé, on affiche juste le fichier de Git
     if args.get:
