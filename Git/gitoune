@@ -1,10 +1,12 @@
-#!/usr/bin/python3
+Contenu du fichier Tools/fichier.txt dans le dépôt git@github.com:adlp/Poc.git à la version a5d5f06 :
 
+#!/usr/bin/python3
 
 import subprocess
 import os
 import git
 import tempfile
+import difflib
 
 # Fonction pour exécuter une commande locale et récupérer son output
 def run_command(command):
@@ -26,6 +28,18 @@ def get_file_from_git(repo_url, file_path):
                 return f.read().strip(), False  # False indique que le fichier existe déjà
         else:
             return None, True  # True indique que le fichier n'existe pas encore
+
+# Fonction pour afficher le diff entre deux fichiers
+def display_diff(original_content, new_content):
+    original_lines = original_content.splitlines()
+    new_lines = new_content.splitlines()
+
+    diff = difflib.unified_diff(original_lines, new_lines, lineterm='', fromfile='Original', tofile='Nouveau')
+
+    # Affichage ligne par ligne
+    print("\nVoici les différences entre les fichiers :")
+    for line in diff:
+        print(line)
 
 # Fonction pour pousser le fichier modifié sur Git
 def push_to_git(repo_url, file_path, new_content, commit_message):
@@ -70,6 +84,9 @@ def main(command, repo_url, file_path):
         # Comparer les deux textes si le fichier existe
         if result != git_content:
             print("Les fichiers ne correspondent pas.")
+            # Afficher le diff entre les fichiers
+            display_diff(git_content, result)
+
             notice = input("Entrez une notice pour le commit (laisser vide pour annuler) : ").strip()
 
             if notice:
@@ -81,6 +98,13 @@ def main(command, repo_url, file_path):
         else:
             print("Les fichiers sont identiques, aucune action nécessaire.")
 
+if __name__ == "__main__":
+    # Paramètres à définir
+    command = "/chemin/vers/RecuperationDeFichier"  # Script à exécuter
+    repo_url = "https://gitlab.com/utilisateur/mon_projet.git"  # URL du dépôt Git
+    file_path = "chemin/vers/fichier.txt"  # Chemin du fichier à comparer dans le dépôt Git
+
+    main(command, repo_url, file_path)
 
 
 if __name__ == "__main__":
