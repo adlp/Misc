@@ -13,10 +13,14 @@ def get_content_from_stdin():
     return sys.stdin.read().strip()
 
 # Fonction pour cloner le dépôt Git temporairement et récupérer le texte du fichier
-def get_file_from_git(repo_url, file_path):
+def get_file_from_git(repo_url, file_path, commit=None):
     with tempfile.TemporaryDirectory() as tempdir:
         repo = git.Repo.clone_from(repo_url, tempdir)
         target_file = os.path.join(tempdir, file_path)
+        
+        if commit:
+            # Checkout à un commit spécifique si fourni
+            repo.git.checkout(commit)
         
         if os.path.exists(target_file):
             with open(target_file, 'r') as f:
@@ -58,7 +62,15 @@ def push_to_git(repo_url, file_path, new_content, commit_message):
 def show_file_log(repo_url, file_path):
     with tempfile.TemporaryDirectory() as tempdir:
         repo = git.Repo.clone_from(repo_url, tempdir)
-        logs = repo.git.log("--", file_path)
+        # Commande Git pour les logs formatés
+        logs = repo.git.log(
+            "--graph",
+            "--pretty=format:'%h -%d %s (%ci, %cr) <%an>'",
+            "--abbrev-commit",
+            "--date=relative",
+            "--name-only",
+            "--", file_path
+        )
         print(f"\nHistorique des changements pour {file_path} :\n")
         print(logs)
 
@@ -70,6 +82,7 @@ def main():
     parser.add_argument("-f", "--file", required=True, help="Chemin du fichier dans le dépôt Git")
     parser.add_argument("-m", "--message", help="Message de commit pour pousser automatiquement")
     parser.add_argument("-g", "--get", action="store_true", help="Afficher le contenu du fichier dans Git sans mise à jour")
+    parser.add_argument("-G", "--get-commit", help="Afficher le contenu du fichier à une version spécifique du commit")
     parser.add_argument("-d", "--diff", action="store_true", help="Afficher la différence entre le fichier dans Git et le stdin")
     parser.add_argument("-l", "--log", action="store_true", help="Afficher les logs de changement du fichier")
 
@@ -80,11 +93,15 @@ def main():
         show_file_log(args.repo, args.file)
         return
 
-    # Si le flag -g est activé, on affiche juste le fichier de Git
-    if args.get:
-        git_content, _ = get_file_from_git(args.repo, args.file)
+    # Si le flag -g ou -G est activé, on affiche juste le fichier de Git (à une version spécifique pour -G)
+    if args.get or args.get_commit:
+        commit = args.get_commit if args.get_commit else None
+        git_content, _ = get_file_from_git(args.repo, args.file, commit=commit)
         if git_content is not None:
-            print(f"Contenu du fichier {args.file} dans le dépôt {args.repo} :\n")
+            if commit:
+                print(f"Contenu du fichier {args.file} dans le dépôt {args.repo} à la version {commit} :\n")
+            else:
+                print(f"Contenu du fichier {args.file} dans le dépôt {args.repo} :\n")
             print(git_content)
         else:
             print(f"Le fichier {args.file} n'existe pas dans le dépôt {args.repo}.")
