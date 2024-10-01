@@ -1,0 +1,85 @@
+#!/usr/bin/python3
+
+
+import os
+import sys
+import time
+import socket
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import urllib.parse
+
+# Configuration
+HOST = "10.0.10.252"
+PORT = 8080
+
+def daemonize():
+    pid=os.fork()
+    if pid >0:
+        print("On quitte le pere")
+        sys.exit(0)
+
+    print("On se detache du terminal")
+    os.setsid()
+
+    # Fork à nouveau pour garantir que le processus ne réacquiert pas un terminal de contrôle
+    pid = os.fork()
+    if pid > 0:
+        sys.exit(0)
+
+    # Rediriger les fichiers de descripteurs standard (stdin, stdout, stderr)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    with open('/dev/null', 'r') as f:
+        os.dup2(f.fileno(), sys.stdin.fileno())
+    with open('/dev/null', 'a+') as f:
+        os.dup2(f.fileno(), sys.stdout.fileno())
+    with open('/dev/null', 'a+') as f:
+        os.dup2(f.fileno(), sys.stderr.fileno())
+
+# Handler HTTP
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        # Parse l'URL pour extraire la commande et les arguments
+        parsed_path = urllib.parse.urlparse(self.path)
+        #command = parsed_path.path.strip("/")  # La commande est dans l'URL sans le "/"
+        command = parsed_path.path
+        #args = urllib.parse.parse_qs(parsed_path.query)  # Les arguments sont après le "?"
+        #args_list = [arg for arg_list in args.values() for arg in arg_list]
+        args_list = parsed_path.query.split("&")
+
+        # Construit la commande avec les arguments
+        cmd = [command] + args_list
+        error = False
+        if cmd[0] in ["/root/uciRuleFromName"]:
+            try:
+                # Exécute la commande et capture la sortie
+                result = os.popen(" ".join(cmd)).read()
+                self.send_response(200)
+                self.send_header("Content-type", "text/plain")
+                self.end_headers()
+                self.wfile.write(result.encode())
+            except Exception as e:
+                error = True
+        if error:
+            # En cas d'erreur, renvoie un message d'erreur
+            self.send_response(500)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(f"Erreur lors de l'exécution de la commande: {str(e)}".encode())
+
+# Démarrer le serveur
+def start_server():
+    server = HTTPServer((HOST, PORT), SimpleHTTPRequestHandler)
+    print(f"Serveur démarré sur {HOST}:{PORT}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("Arrêt du serveur")
+        server.server_close()
+
+if __name__ == "__main__":
+    # Démarrer le processus comme un daemon
+    #daemonize()
+
+    # Démarrer le serveur HTTP en tant que daemon
+    start_server()
