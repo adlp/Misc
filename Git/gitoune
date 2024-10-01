@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 
+
 import subprocess
 import os
 import git
@@ -8,7 +9,7 @@ import sys
 import difflib
 import argparse
 
-# Fonction pour exécuter une commande locale et récupérer son output depuis stdin
+# Fonction pour récupérer le contenu depuis stdin
 def get_content_from_stdin():
     return sys.stdin.read().strip()
 
@@ -62,6 +63,7 @@ def main():
     parser.add_argument("-f", "--file", required=True, help="Chemin du fichier dans le dépôt Git")
     parser.add_argument("-m", "--message", help="Message de commit pour pousser automatiquement")
     parser.add_argument("-g", "--get", action="store_true", help="Afficher le contenu du fichier dans Git sans mise à jour")
+    parser.add_argument("-d", "--diff", action="store_true", help="Afficher la différence entre le fichier dans Git et le stdin")
 
     args = parser.parse_args()
 
@@ -92,31 +94,21 @@ def main():
             push_to_git(args.repo, args.file, result, args.message)
             print(f"Nouveau fichier ajouté et poussé sur Git avec le message : {args.message}")
         else:
-            notice = input("Entrez une notice pour le commit de ce nouveau fichier : ").strip()
-            if notice:
-                push_to_git(args.repo, args.file, result, notice)
-                print("Nouveau fichier ajouté et poussé sur Git.")
-            else:
-                print("Aucune notice entrée, annulation de la création du fichier.")
+            print("Aucun message fourni, annulation de la création du fichier.")
     else:
         # Comparer les deux textes si le fichier existe
         if result != git_content:
             print("Les fichiers ne correspondent pas.")
-            display_diff(git_content, result)
-
+            if args.diff:
+                # Afficher le diff si l'option -d est utilisée
+                display_diff(git_content, result)
+            
             if args.message:
                 # Pousser le fichier mis à jour sur Git avec le message fourni
                 push_to_git(args.repo, args.file, result, args.message)
                 print(f"Fichier mis à jour et poussé sur Git avec le message : {args.message}")
             else:
-                notice = input("Entrez une notice pour le commit (laisser vide pour annuler) : ").strip()
-
-                if notice:
-                    # Pousser le fichier mis à jour sur Git avec la notice
-                    push_to_git(args.repo, args.file, result, notice)
-                    print("Fichier mis à jour et poussé sur Git.")
-                else:
-                    print("Aucune notice entrée, annulation.")
+                print("Aucun message fourni, les modifications ne seront pas poussées.")
         else:
             print("Les fichiers sont identiques, aucune action nécessaire.")
 
