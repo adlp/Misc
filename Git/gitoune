@@ -96,14 +96,6 @@ def main(command, repo_url, file_path):
         else:
             print("Les fichiers sont identiques, aucune action nécessaire.")
 
-if __name__ == "__main__":
-    # Paramètres à définir
-    command = "/chemin/vers/RecuperationDeFichier"  # Script à exécuter
-    repo_url = "https://gitlab.com/utilisateur/mon_projet.git"  # URL du dépôt Git
-    file_path = "chemin/vers/fichier.txt"  # Chemin du fichier à comparer dans le dépôt Git
-
-    main(command, repo_url, file_path)
-
 
 if __name__ == "__main__":
     # Paramètres à définir
