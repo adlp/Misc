@@ -1,0 +1,92 @@
+#!/usr/bin/python3
+
+
+import subprocess
+import os
+import git
+import tempfile
+
+# Fonction pour exécuter une commande locale et récupérer son output
+def run_command(command):
+    try:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, check=True, text=True)
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        print(f"Erreur lors de l'exécution de la commande: {e.stderr}")
+        return None
+
+# Fonction pour cloner le dépôt Git temporairement et récupérer le texte du fichier
+def get_file_from_git(repo_url, file_path):
+    with tempfile.TemporaryDirectory() as tempdir:
+        repo = git.Repo.clone_from(repo_url, tempdir)
+        target_file = os.path.join(tempdir, file_path)
+        
+        if os.path.exists(target_file):
+            with open(target_file, 'r') as f:
+                return f.read().strip(), False  # False indique que le fichier existe déjà
+        else:
+            return None, True  # True indique que le fichier n'existe pas encore
+
+# Fonction pour pousser le fichier modifié sur Git
+def push_to_git(repo_url, file_path, new_content, commit_message):
+    with tempfile.TemporaryDirectory() as tempdir:
+        repo = git.Repo.clone_from(repo_url, tempdir)
+        target_file = os.path.join(tempdir, file_path)
+        
+        # Créer les répertoires si nécessaires
+        os.makedirs(os.path.dirname(target_file), exist_ok=True)
+        
+        # Écrire le nouveau contenu dans le fichier
+        with open(target_file, 'w') as f:
+            f.write(new_content)
+        
+        repo.git.add(file_path)
+        repo.index.commit(commit_message)
+        origin = repo.remote(name='origin')
+        origin.push()
+
+# Programme principal
+def main(command, repo_url, file_path):
+    # Exécuter la commande locale
+    result = run_command(command)
+    if not result:
+        print("Impossible de récupérer le texte.")
+        return
+
+    # Récupérer le fichier depuis le dépôt Git
+    git_content, is_new_file = get_file_from_git(repo_url, file_path)
+
+    if is_new_file:
+        print(f"Le fichier {file_path} n'existe pas dans le dépôt.")
+        notice = input("Entrez une notice pour le commit de ce nouveau fichier : ").strip()
+
+        if notice:
+            # Pousser le nouveau fichier sur Git avec la notice
+            push_to_git(repo_url, file_path, result, notice)
+            print("Nouveau fichier ajouté et poussé sur Git.")
+        else:
+            print("Aucune notice entrée, annulation de la création du fichier.")
+    else:
+        # Comparer les deux textes si le fichier existe
+        if result != git_content:
+            print("Les fichiers ne correspondent pas.")
+            notice = input("Entrez une notice pour le commit (laisser vide pour annuler) : ").strip()
+
+            if notice:
+                # Pousser le fichier mis à jour sur Git avec la notice
+                push_to_git(repo_url, file_path, result, notice)
+                print("Fichier mis à jour et poussé sur Git.")
+            else:
+                print("Aucune notice entrée, annulation.")
+        else:
+            print("Les fichiers sont identiques, aucune action nécessaire.")
+
+
+
+if __name__ == "__main__":
+    # Paramètres à définir
+    command = "cat /home/adlp/Projets/GiTouNe/gitoune"  # Script à exécuter
+    repo_url = "git@github.com:adlp/Poc.git"  # URL du dépôt Git
+    file_path = "Tools/fichier.txt"  # Chemin du fichier à comparer dans le dépôt Git
+
+    main(command, repo_url, file_path)
