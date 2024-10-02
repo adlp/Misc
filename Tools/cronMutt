@@ -16,9 +16,11 @@ import os
 import hashlib
 import subprocess
 
-Version=0.7
+Version=0.8
 ### Todo un mode flush pour le tee
-### Tofo intercepter le keyboard interrupt
+### Todo intercepter le keyboard interrupt
+### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
+# 0.8 On rajoute un header propre a cet outils
 # 0.7 On rajoute une notion de priorite
 # 0.6 On jolieffie le from
 # 0.5 en mode tee, on ne saute pas de lignes
@@ -140,7 +142,7 @@ else:
     inf = sys.stdin
 
 # Preparation Ouverture du mail
-muttcmd=['mutt','-s',subject,'-e',f'my_hdr From:{mailFrom}','-e',f'my_hdr In-Reply-To: {inReplyTo}','-e',f'my_hdr Message-ID: {messageId}']
+muttcmd=['mutt','-s',subject,'e',f'my_hdr X-cronMutt: cronMutt-{Version}','-e',f'my_hdr From:{mailFrom}','-e',f'my_hdr In-Reply-To: {inReplyTo}','-e',f'my_hdr Message-ID: {messageId}']
 if mailType is not None:
     muttcmd.append('-e')
     muttcmd.append(f'set content_type=text/{mailType}')
