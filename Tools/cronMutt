@@ -12,8 +12,10 @@ import os
 import hashlib
 import subprocess
 
-Version=0.5
+Version=0.6
 ### Todo un mode flush pour le tee
+### Tofo intercepter le keyboard interrupt
+# 0.6 On jolieffie le from
 # 0.5 en mode tee, on ne saute pas de lignes
 # 0.4 Activation du X (no sub chg), Ajout du changement du from, Ajout du tee mode (dump en meme temps que mail le stdout et stderr)
 # 0.3 Rajout du traitement des erreures
@@ -107,6 +109,9 @@ if inReplyTo is None:
     inReplyTo=hashlib.md5(subject.encode('utf-8')).hexdigest()
 if mailFrom is None:
     mailFrom=replyTo
+if "<" not in mailFrom:
+    tmp=mailFrom
+    mailFrom=f'{tmp.split("@")[0]} <{tmp}>'
 
 
 # Ouverture du process a suivre
