@@ -9,12 +9,15 @@ import json
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.8.2"
-### TODO Rajouter un helpeur de prunage (en fonction du rc file), compactage
+Version="0.8.3"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
 ### TODO Mieux gerer le repertoire d'appel du programme (clause where) : elle n'est necessaire qu'au restore
+### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
+### TODO Rajouter dans le n la virgule pour faire des operation batches (bkp, report, prune...)
+### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.8.3 meilleure gestion interne du rapport (pour facilitee les differentes sorties et les concatenations)
 # 0.8.2 un rapport prettygoooood
 # 0.8.1 un rapport plus fin
 # 0.8 1er rapport
@@ -263,7 +266,7 @@ def cmd_lstfiles(nick,bid,debug=0):
         bid=getlastbkp(nick,debug=debug)[0]
     boex(nick,['list','--glob-archives',cfg['GLOB_ARCH'],'::'+bid],debug=debug)
 
-def prep_report(nick,debug=0,maxp=None,human=False):
+def prep_report(nick,debug=0,maxp=None):
     import re
     cfg=cfgreaded(nick,debug=debug)
     pruneme=[]
@@ -292,21 +295,15 @@ def prep_report(nick,debug=0,maxp=None,human=False):
         i['chunker_params']=[]
         kept[i['name']]={}
         kept[i['name']]['name']             =i['name']
-        #kept[i['name']]['start']            =i['start']
         kept[i['name']]['durationM']        =i['duration']/60
-        kept[i['name']]['original_size']    =convert_octets_readable(i['stats']['original_size'])
-        kept[i['name']]['compressed_size']  =convert_octets_readable(i['stats']['compressed_size'])
-        kept[i['name']]['deduplicated_size']=convert_octets_readable(i['stats']['deduplicated_size'])
+        kept[i['name']]['original_size']    =i['stats']['original_size']
+        kept[i['name']]['compressed_size']  =i['stats']['compressed_size']
+        kept[i['name']]['deduplicated_size']=i['stats']['deduplicated_size']
         kept[i['name']]['nfiles']           =i['stats']['nfiles']
         
         if i['name'] in pruneme:
             i['pruneMe']='Yes'
-            if i['stats']['original_size'] > 0:
-                kept[i['name']]['original_size']    ="-"+kept[i['name']]['original_size']
-                kept[i['name']]['compressed_size']  ="-"+kept[i['name']]['compressed_size']
-                kept[i['name']]['deduplicated_size']="-"+kept[i['name']]['deduplicated_size']
             kept[i['name']]['prunMe']='Yes'
-            #resume['prunable']+=i['stats']['compressed_size']
             resume['prunable']+=i['stats']['deduplicated_size']
             resume['prunable_os']+=i['stats']['original_size']
             resume['prunable_cs']+=i['stats']['compressed_size']
@@ -319,14 +316,11 @@ def prep_report(nick,debug=0,maxp=None,human=False):
     resume['moy_duration']=resume['duration']/c
     resume['unique_csize']=r['cache']['stats']['unique_csize']
     for i in ['duration','compressed_size','deduplicated_size','nfiles','original_size','unique_csize']:
-        resume['moy_'+i]=convert_octets_readable(resume[i]/c)
-        resume[i]=convert_octets_readable(resume[i])
+        resume['moy_'+i]=resume[i]/c
 
 
     resume['total_size']=r['cache']['stats']['total_size']
     resume['total_csize']=r['cache']['stats']['total_csize']
-    for i in ['prunable','prunable_cs','prunable_os','total_size','total_csize']:
-        resume[i]=convert_octets_readable(resume[i])
 
     resume['last']=r['archives'][c-1]['start']
     resume['lastname']=r['archives'][c-1]['name']
@@ -345,13 +339,13 @@ def prep_report(nick,debug=0,maxp=None,human=False):
     tcmpl[nick]={}
     tcmpl[nick]['nom']          =cfg['SER_NAME']
     tcmpl[nick]['date derniere']=dabesi["date"]
-    tcmpl[nick]['depuis']       =f"{dabesi['since']:.2f}"
-    tcmpl[nick]['duree']        =f"{ kept[resume['lastname']]['durationM']:.2f}"
+    tcmpl[nick]['depuis']       =dabesi['since']
+    tcmpl[nick]['duree']        =kept[resume['lastname']]['durationM']
     tcmpl[nick]['derniere']     =kept[resume['lastname']]['deduplicated_size']
     tcmpl[nick]['moy']          =resume['moy_deduplicated_size']
     tcmpl[nick]['taille']       =resume['unique_csize']
     tcmpl[nick]['recuperable']  =resume['prunable']
-    tcmpl[nick]['reste']        =convert_octets_readable(avail)
+    tcmpl[nick]['reste']        =avail
 
     tbkps={}
     tbkps['Prunable']={}
@@ -365,7 +359,7 @@ def prep_report(nick,debug=0,maxp=None,human=False):
         if kept[i]['prunMe'] == 'No':
             if (maxp is None) or ((notPrunable - cpt ) <= maxp):
                 tbkps[i]=kept[i]
-                tbkps[i]['duration']=f"{kept[i]['durationM']:.2f}"
+                tbkps[i]['duration']=kept[i]['durationM']
                 tbkps[i].pop('durationM')
                 tbkps[i].pop('prunMe')
             cpt+=1
@@ -378,7 +372,16 @@ def prep_report(nick,debug=0,maxp=None,human=False):
     return(tcmpl,tbkps)
 
 def cmd_report(nick,debug=0,maxp=None):
-    (tcmpl,tbkps)=prep_report(nick,debug=debug,maxp=maxp,human=False)
+    (tcmpl,tbkps)=prep_report(nick,debug=debug,maxp=maxp)
+    for i in ['derniere','moy','taille','recuperable','reste']:
+        tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
+    tcmpl[nick]['depuis']=f"{tcmpl[nick]['depuis']:.2f} h"
+    tcmpl[nick]['duree']=f"{tcmpl[nick]['duree']:.2f} min"
+    for i in tbkps.keys():
+        for j in ['original_size','compressed_size','deduplicated_size']:
+            tbkps[i][j]=convert_octets_readable(tbkps[i][j])
+        if 'duration' in tbkps[i].keys():
+            tbkps[i]['duration']=f"{tbkps[i]['duration']:.2f} min"
     print(prettyTabelise(tcmpl))
     print(prettyTabelise(tbkps))
 
