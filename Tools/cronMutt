@@ -12,6 +12,8 @@ import os
 import hashlib
 import subprocess
 
+Version=0.2
+
 def subprosend(cmd,datas):
     mutt=subprocess.Popen(cmd,encoding ='utf-8',
                          stdin=subprocess.PIPE,
@@ -27,6 +29,10 @@ def retShell(cmd):
     out, err = ps.communicate()
     return(out)
 
+def version():
+    print(f"Version {Version}")
+    sys.exit(0)
+
 def usage():
     print("     E       Mail even empty data")
     print("     i:      in-reply-to")
@@ -38,11 +44,12 @@ def usage():
     print("     t:      type du mail")
     print("     D       debug")
     print("     h       Helpeur")
+    print("     V       Version")
     sys.exit(123)
 
 
 try:
-    opts, args = getopt.getopt(sys.argv[1:], "hDEi:s:d:r:m:e:t:", ["help"])
+    opts, args = getopt.getopt(sys.argv[1:], "hVDEi:s:d:r:m:e:t:", ["help"])
 except getopt.GetoptError as err:
     print(err)  # will print something like "option -a not recognized"
     usage()
@@ -62,6 +69,8 @@ replyTo=os.environ["LOGNAME"]
 for opt,arg in opts:
     if   opt in '-h':
         usage()
+    elif opt in '-V':
+        version()
     elif opt in '-D':
         debug=True
     elif opt in '-E':
