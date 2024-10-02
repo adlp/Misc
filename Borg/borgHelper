@@ -9,14 +9,15 @@ import json
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.16.1"
-### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres
+Version="0.17"
+### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
 ### TODO Mieux gerer le repertoire d'appel du programme (clause where) : elle n'est necessaire qu'au restore
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.17 Refactoring code cf boex... a refaire login/reporting. Maintenant les retour des bkp ne partiront plus forcement en erreure si ce n'est que du Warning)
 # 0.16.1 pousse sur disque les retours de sauvegarde et en stdout/stderr
 # 0.16 pousse sur disque les retours de sauvegarde
 # 0.15.1 True cache
@@ -221,7 +222,9 @@ def cmd_login(serna,nick,keyfile,passphrase,repo,mountpoint,debug=0):
     cfg=cfgread(nick,debug=debug)
     if keyfile is not None:
         if os.path.exists(keyfile) and os.path.isfile(keyfile):
-            boex(nick,['key','import',repo,keyfile],debug=debug)
+            rb=boex(nick,['key','import',repo,keyfile],debug=debug)
+            print(rb)
+            sys.exit(rb['exitcode'])
         else:
             printer("Fichier "+keyfile+" absent, Mais attention, machine "+nick+" integre")
             sys.exit(2)
@@ -242,7 +245,9 @@ def cmd_mount(nick,debug=0):
 
     if os.path.exists(cfg['MOUNTPOINT']) and os.path.isdir(cfg['MOUNTPOINT']) and len(os.listdir(cfg['MOUNTPOINT'])) == 0:
         if(not mountedornot(cfg['MOUNTPOINT'],debug=debug)):
-            boex(nick,['mount','--glob-archives',cfg['GLOB_ARCH'],cfg['BORG_REPO'],cfg['MOUNTPOINT']],debug=debug)
+            rb=boex(nick,['mount','--glob-archives',cfg['GLOB_ARCH'],cfg['BORG_REPO'],cfg['MOUNTPOINT']],debug=debug)
+            print(rb)
+            sys.exit(rb['exitcode'])
         else:
             printer('Deja monte')
             sys.exit(3)
@@ -253,21 +258,29 @@ def cmd_mount(nick,debug=0):
 def cmd_umount(nick,debug=0):
     cfg=cfgreaded(nick,debug=debug)
     if(mountedornot(cfg['MOUNTPOINT'],debug=debug)):
-        boex(nick,['umount',cfg['MOUNTPOINT']],debug=debug)
+        rb=boex(nick,['umount',cfg['MOUNTPOINT']],debug=debug)
+        print(rb)
+        sys.exit(rb['exitcode'])
     else:
         printer('Pas monte')
         sys.exit(3)
 
 def cmd_lstbkp(nick,debug=0):
     cfg=cfgreaded(nick,debug=debug)
-    boex(nick,['list','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+    rb=boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+    for i in rb['stdout'][0]['archives']:
+        print(f"{i['name']} {i['start']}")
+    sys.exit(rb['exitcode'])
 
 def getlastbkp(nick,nbl=1,debug=0):
     cfg=cfgreaded(nick,debug=debug)
-    lines=boex(nick,['list','--glob-archives',cfg['GLOB_ARCH']],ret=True,debug=debug)['stdout']
+    rb=boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+    #lines=boex(nick,['list','--glob-archives',cfg['GLOB_ARCH']],ret=True,debug=debug)['stdout']
+    lines=rb['stdout'][0]['archives']
     ret=[]
     for i in range(nbl*-1,0):
-        ret.append(lines[i].split(' ')[0])
+        #ret.append(lines[i].split(' ')[0])
+        ret.append(lines[i]['name'])
     return(ret)
     #return(lines[-1].split(' ')[0])
 
@@ -275,7 +288,11 @@ def cmd_lstfiles(nick,bid,debug=0):
     cfg=cfgreaded(nick,debug=debug)
     if bid is None:
         bid=getlastbkp(nick,debug=debug)[0]
-    boex(nick,['list','--glob-archives',cfg['GLOB_ARCH'],'::'+bid],debug=debug)
+    #rb=boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH'],'::'+bid],debug=debug)
+    rb=boex(nick,['list','--glob-archives',cfg['GLOB_ARCH'],'::'+bid],debug=0)
+    for i in rb['stdout']:
+        print(i)
+    sys.exit(rb['exitcode'])
 
 def cacheJsonBoexWithLM(nick,boexarg,prefix="/tmp/borgHelper-",suffix=".json",output="stdout",debug=0):
     last_modified=json.loads(''.join(boex(nick,['info','--json'],ret=True,debug=debug)['stdout']))['repository']['last_modified']
@@ -501,18 +518,29 @@ def cmd_diffbkp(nick,bidun=None,bideux=None,debug=0):
 
     arg=['diff',f"{cfg['BORG_REPO']}::{bidun}", bideux]
 
-    boex(nick,arg,debug=debug)
+    rb=boex(nick,arg,debug=debug,retjson=False)
+    for i in rb['stdout']:
+        print(i)
+    sys.exit(rb['exitcode'])
 
 def cmd_resto(nick,bid,ftor,where,debug=0):
     cfg=cfgreaded(nick,debug=debug)
     if bid is None:
         bid=getlastbkp(nick,debug=debug)[0]
-    boex(nick,['extract','--exclude','*/log/*','::'+bid,ftor],rep=where,debug=debug)
+    rb=boex(nick,['extract','--exclude','*/log/*','::'+bid,ftor],rep=where,debug=debug)
+    print(rb)
+    sys.exit(rb['exitcode'])
 
 def cmd_delbkp(nick,bid,debug=0):
     cfg=cfgreaded(nick,debug=debug)
-    boex(nick,['delete','::'+bid],debug=debug)
+    rb=boex(nick,['delete','::'+bid],debug=debug)
+    if rb['exitcode'] != 0:
+        print(rb)
+        sys.exit(rb['exitcode'])
     boex(nick,['compact','--cleanup-commits'],debug=debug)
+    if rb['exitcode'] != 0:
+        print(rb)
+    sys.exit(rb['exitcode'])
 
 
 def cmd_prune(nick,dryrun=False,debug=0):
@@ -544,7 +572,9 @@ def cmd_prune(nick,dryrun=False,debug=0):
         cmd.extend(f'--save-space --info --list --glob-archives={cfg["GLOB_ARCH"]}'.split(' '))
         ret=boex(nick,cmd,ret=dryrun,debug=debug)['stderr']
         if not dryrun:
-            boex(nick,['compact','--cleanup-commits'],debug=debug)
+            rb=boex(nick,['compact','--cleanup-commits'],debug=debug)
+            print(rb)
+            sys.exit(rb['exitcode'])
         else:
             return(ret)
     else:
@@ -602,9 +632,15 @@ def cmd_bkp(nick,debug=0):
         print(json.dumps(anaRet,indent=4),file=fd)
         fd.close()
 
-    print('\n'.join(anaRet['stdout']),file=sys.stdout,flush=True)
-    print('\n'.join(anaRet['stderr']),file=sys.stderr,flush=True)
-    sys.exit(anaRet['exitcode'])
+    print(json.dumps(anaRet['stdout'][0],indent=4),file=sys.stdout,flush=True)
+    print(json.dumps(anaRet['stderr'],indent=4),file=sys.stdout,flush=True)
+    newretC=0
+    if anaRet['exitcode']:
+        for i in (anaRet['stderr']):
+            if i['levelname'] == "ERROR":
+                newretC=2
+
+    sys.exit(newretC)
 
 def cmd_poc(nick,debug=0):
     nomFi=f"/tmp/borgHelper-bkp-{nick}.json"
@@ -618,9 +654,10 @@ def cmd_poc(nick,debug=0):
     #print(json.dumps(pouff,indent=4))
     #print(json.dumps(ret['stderr'][1],indent=4))
     #print(ret['stderr'])
+    #print(json.dumps(ret,indent=4))
 
 
-def boex(nick,arg,rep=None,ret=False,debug=0,preBorg=None,forceEnv=None): #,getStdErr=False):
+def boex(nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True): #,getStdErr=False):
     cfg=cfgreaded(nick,debug=debug)
     varcur=os.environ.copy()
     varfut={}
@@ -662,18 +699,37 @@ def boex(nick,arg,rep=None,ret=False,debug=0,preBorg=None,forceEnv=None): #,getS
                          stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE)
     inf, errs = ps.communicate()
-    if ret:
-        return({'stdout':''.join(inf).splitlines(), 'stderr': ''.join(errs).splitlines(),'exitcode': ps.returncode })
-    else:
-        for line in inf:
-            print(line,end='',flush=True)
-        if len(errs):
-            print(f'\n===================({ps.returncode})=======================================\n',flush=True)
-            for line in errs:
-                print(line,end="",flush=True)
-    
-        if ps.returncode != 0:
-            sys.exit(ps.returncode)
+
+    ret={}
+    ret['stdout']=[]
+    ret['stderr']=[]
+    if(len(inf)):
+        if inf[0] in '[{' and retjson:
+            ret['stdout'].append(json.loads(inf))
+        else:
+            for i in inf.split('\n'):
+                ret['stdout'].append(i)
+    if(len(errs)):
+        if errs[0] in '[{':
+            ret['stderr'].append(json.loads(errs))
+        else:
+            for i in errs.split('\n'):
+                ret['stderr'].append(i)
+    ret['exitcode']=ps.returncode
+    return(ret)
+
+    #if ret:
+    #    return({'stdout':''.join(inf).splitlines(), 'stderr': ''.join(errs).splitlines(),'exitcode': ps.returncode })
+    #else:
+    #    for line in inf:
+    #        print(line,end='',flush=True)
+    #    if len(errs):
+    #        print(f'\n===================({ps.returncode})=======================================\n',flush=True)
+    #        for line in errs:
+    #            print(line,end="",flush=True)
+   # 
+   #     if ps.returncode != 0:
+   #         sys.exit(ps.returncode)
 
 
 ######### Analyse Arguments
