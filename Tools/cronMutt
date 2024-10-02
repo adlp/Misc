@@ -20,9 +20,10 @@ from datetime import datetime
 import requests
 from requests.auth import HTTPBasicAuth
 
-Version="0.18"
+Version="0.18.1"
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
+# 0.18.1 deplacement de l'initialisation de var afin d'eviter les bug
 # 0.18 correctif si on n'a pas d'environnement
 # 0.17.4 Rajout de points de debug
 # 0.17.3 si -o no alors on n'envoie pas de mail lorsque tout va bien (meme s'il y a du monde)
@@ -195,6 +196,10 @@ muttcmd=['mutt','-e',f'my_hdr X-cronMutt: cronMutt-{Version}','-e',f'my_hdr X-cr
 # Ouverture du process a suivre
 errs=[]
 exitCode=0
+retstd={}
+retstd['stdout']=[]
+retstd['stderr']=[]
+
 if cmd is not None:
     if not cmdCache:
         muttcmd.append('-e')
@@ -204,10 +209,6 @@ if cmd is not None:
                          stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE)
-
-    retstd={}
-    retstd['stdout']=[]
-    retstd['stderr']=[]
 
     # Creation puis demarrage des threads de lecture du stdout et stderr
     tstdout = threading.Thread(target=read_stream, args=(ps.stdout, retstd, "stdout"))
