@@ -9,7 +9,7 @@ import json
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.15.1"
+Version="0.16"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -17,6 +17,7 @@ Version="0.15.1"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.16 pousse sur disque les retours de sauvegarde
 # 0.15.1 True cache
 # 0.15 Cache v1
 # 0.14 boexec renvoie un dico stdout/stderr... et cela est pris en compte hein...
@@ -594,8 +595,13 @@ def cmd_bkp(nick,debug=0):
     if 'EXCLUDE_NEXT' in list(cfg.keys()):
         create.extend(cfg['EXCLUDE_NEXT'].split(' '))
 
-    boex(nick,create,preBorg=preBorg,forceEnv=forceEnv,debug=debug)
+    nomFi=f"/tmp/borgHelper-bkk-{nick}.json"
+    anaRet=boex(nick,create,preBorg=preBorg,forceEnv=forceEnv,ret=True,debug=debug)
+    with open(nomFi,"w") as fd:
+        print(json.dumps(anaRet,indent=4),file=fd)
+        fd.close()
 
+    sys.exit(anaRet['exitcode'])
 
 def boex(nick,arg,rep=None,ret=False,debug=0,preBorg=None,forceEnv=None): #,getStdErr=False):
     cfg=cfgreaded(nick,debug=debug)
@@ -640,11 +646,7 @@ def boex(nick,arg,rep=None,ret=False,debug=0,preBorg=None,forceEnv=None): #,getS
                          stderr=subprocess.PIPE)
     inf, errs = ps.communicate()
     if ret:
-        return({'stdout':''.join(inf).splitlines(), 'stderr': ''.join(errs).splitlines() })
-#        if getStdErr:
-#            return(''.join(errs).splitlines())
-#        else:
-#            return(''.join(inf).splitlines())
+        return({'stdout':''.join(inf).splitlines(), 'stderr': ''.join(errs).splitlines(),'exitcode': ps.returncode })
     else:
         for line in inf:
             print(line,end='',flush=True)
