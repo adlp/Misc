@@ -9,7 +9,7 @@ import json
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.12"
+Version="0.13"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -17,6 +17,7 @@ Version="0.12"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.13 debug de l'affichage des report (lorsque l'avail n'est pas lisible)
 # 0.12 on peut ne pas avoir la var SSH_REMFO
 # 0.11 Possibilite de choisir la clef ssh
 # 0.10 Prise en compte d'une liste "d'exclusion compltementarire"
@@ -335,8 +336,6 @@ def prep_report(nick,debug=0,maxp=None):
         print(json.dumps(kept,indent=4))
 
     avail=dfRepo(nick)
-    if avail is None:
-        avail=""
     dabesi=d2DateNSince(resume['last'])
 
     tcmpl={}
@@ -378,7 +377,10 @@ def prep_report(nick,debug=0,maxp=None):
 def cmd_report(nick,debug=0,maxp=None):
     (tcmpl,tbkps)=prep_report(nick,debug=debug,maxp=maxp)
     for i in ['derniere','moy','taille','recuperable','reste']:
-        tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
+        if (i in tcmpl[nick].keys()) and not(tcmpl[nick][i] is  None):
+            tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
+        else:
+            tcmpl[nick][i]=""
     tcmpl[nick]['depuis']=f"{tcmpl[nick]['depuis']:.2f} h"
     tcmpl[nick]['duree']=f"{tcmpl[nick]['duree']:.2f} min"
     for i in tbkps.keys():
