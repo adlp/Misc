@@ -18,9 +18,10 @@ import subprocess
 import threading
 from datetime import datetime
 
-Version="0.15"
+Version="0.15.1"
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
+# 0.15.1 Saut de ligne manquant, corrige
 # 0.15 L'affichage stdout se fait en direct, on n'attends plus que le process soit execute
 # 0.14 On renvoie le meme errorcode que le programme execute en fin sys.ext
 # 0.13 On rajoute le hostname dans les entees
@@ -219,7 +220,7 @@ datas=""
 for line in retstd['stdout']:
     #if teeMode:
     #    print(line,end="",flush=True)
-    datas+=line
+    datas+=line+"\n"
 if cmd is not None:
     if len(errs):
         datas+="\n=============================================================================\n"
@@ -227,7 +228,7 @@ if cmd is not None:
         for line in retstd['stderr']:
             #if teeMode:
             #    print(line,end="",flush=True)
-            datas+=line
+            datas+=line+"\n"
 
 # Emission de la donnee
 if not (not emptySend and not len(datas)):
