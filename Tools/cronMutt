@@ -12,7 +12,14 @@ import os
 import hashlib
 import subprocess
 
-Version=0.4
+Version=0.5
+### Todo un mode flush pour le tee
+# 0.5 en mode tee, on ne saute pas de lignes
+# 0.4 Activation du X (no sub chg), Ajout du changement du from, Ajout du tee mode (dump en meme temps que mail le stdout et stderr)
+# 0.3 Rajout du traitement des erreures
+# 0.2 On rajoute le versionning a cronMutt
+# 0.1  Un outils pour mieux gerer l'envoie des mails a partir des corns
+
 
 def subprosend(cmd,datas):
     mutt=subprocess.Popen(cmd,encoding ='utf-8',
@@ -132,14 +139,14 @@ muttcmd.append(dest)
 datas=""
 for line in inf:
     if teeMode:
-        print(line)
+        print(line,end="")
     datas+=line
 if cmd is not None:
     if len(errs):
         datas+="\n=============================================================================\n"
         for line in errs:
             if teeMode:
-                print(line)
+                print(line,end="")
             datas+=line
 
 # Emission de la donnee
