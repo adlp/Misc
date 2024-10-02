@@ -17,11 +17,12 @@ import hashlib
 import subprocess
 from datetime import datetime
 
-Version="0.11"
+Version="0.12"
 ### Todo un mode flush pour le tee
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
 ### Todo rajouter header date debut + rajouter header de la commande (mais desativable par un flag)
+# 0.12 On tete de faire de l'autodetection pour le teemode
 # 0.11 On gere les pb de caracteres space de microsoft
 # 0.10 Pipe mode fonctionnelle : on flush
 # 0.9 New header : date debut execution/ commande lancee / exit code
@@ -84,7 +85,10 @@ cmd=None
 mailType=None
 replyTo=os.environ["LOGNAME"]
 exitReact=True
-teeMode=False
+if sys.stdin.isatty():
+    teeMode=True
+else:
+    teeMode=False
 mailFrom=None
 #-e "set content_type=text/html" 
 cmdCache=False
