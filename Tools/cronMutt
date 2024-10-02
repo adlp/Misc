@@ -20,9 +20,10 @@ from datetime import datetime
 import requests
 from requests.auth import HTTPBasicAuth
 
-Version="0.17.1"
+Version="0.17.2"
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
+# 0.17.2 debug sur les emissions empty ou pas, etc
 # 0.17.1 L'option -o force maintenant le mail malgres le nextcloud
 # 0.17 On rajoute un flag -o qui envoie systematiquement le mail lorsque c'est ok (a ceux preciser dans le -o
 # 0.16 Si tout va bien on pousse sur le nc. Si le -E on envoie le gentil mail quand meme. Si tout vat mal, nc+mail
@@ -275,12 +276,13 @@ if nextcloud is not None and nextauth is not None:
     ncsended=nextcloudput(nextcloud,nextauth,datas)
     if emptySend or ps.returncode != 0 or ncsended != 0 or destok is not None:
         subprosend(muttcmd,datas)
-    
-elif (not emptySend) and not len(datas):
+
+elif emptySend or len(datas):
+#elif (not emptySend) and not len(datas):
 #elif not (not emptySend and not len(datas)):
     subprosend(muttcmd,datas)
     if debug:
-        print("Sended")
+        print(f"Sended-{len(datas)}")
 
 if debug:
     print(len(datas))
