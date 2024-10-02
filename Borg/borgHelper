@@ -9,7 +9,7 @@ import json
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.20"
+Version="0.22"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -17,6 +17,8 @@ Version="0.20"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.22 Integration d'init pour initialiser un repo (local)
+# 0.21 Corrrections due a l'integration de BORG_ROOTBKP BORG_ARCHNAME (0.20)
 # 0.20 rajout de BORG_ARCHNAME et BORG_ROOTBKP afin de changer les noms des archives, et choisir une zone spé de backup...
 # 0.19 Extend la doc, changement de certaines docs pour que ca passe ds la version ulterieur de python.. risque de pb d'utf8, mais python 3 est par defaut en utf8...
 # 0.18   Prise en compte des plantage de borg sans le moindre stdout
@@ -75,6 +77,8 @@ def usage(doc=None,debug=0):
         printer("       On lance la restauration")
         printer("⚡️ -c DelBkp [-n nickname/servername] -b backupid")
         printer("       ⚡️ On delete un backup sur le repo ⚡️ DANGER")
+        printer("   -c Init [-n nickname/servername]")
+        printer("       Initialisation d'un repInitialisation d'un repoo")
         printer("   -c Bkp [-n nickname/servername]")
         printer("       On lance un backup")
         printer("⚗️ ⚡️-c Prune [-n nickname/servername]")
@@ -144,6 +148,9 @@ def usage(doc=None,debug=0):
         printer("   -c Prune [-n nickname/servername]")
         printer("      ⚡️ On delete les vieux backup sur le repo ⚡️ DANGER")
         printer("   ⚗️i DEV VERSION")
+    elif doc == 'init':
+        printer('   -c init [-n nickname/servername]')
+        printer('      Initiaslisation du repo')
     else:
         printer(f"  Desole pas de documation pour la commande {doc}")
 
@@ -603,7 +610,14 @@ def cmd_prune(nick,dryrun=False,debug=0):
     else:
         usage('prune')
 
-    
+def cmd_init(nick,debug=0):
+    cfg=cfgreaded(nick,debug=debug)
+
+    cmd=[]
+    # borg init --encryption repokey /path/to/repo
+    cmd.extend("init --encryption repokey".split(' '))
+    ret=boex(nick,cmd,debug=debug)
+    print(ret)
 
 def cmd_bkp(nick,debug=0):
     cfg=cfgreaded(nick,debug=debug)
@@ -642,14 +656,14 @@ def cmd_bkp(nick,debug=0):
     #create.extend(('--log-json --json --debug -v --stats ::{fqdn}-root-{now} /').split(' '))
     create.extend(('--log-json --json --debug -v --stats').split(' '))
     if 'BORG_ARCHNAME' in cfg.keys():
-        create.extend('::{fqdn}-'+cfg.keys['BORG_ARCHNAME']+'-{now}')
+        create.append('::{fqdn}-'+cfg.keys['BORG_ARCHNAME']+'-{now}')
     else:
-        create.extend('::{fqdn}-root-{now}')
+        create.append('::{fqdn}-root-{now}')
 
     if 'BORG_ROOTBKP' in cfg.keys():
-        create.extend(cfg.keys['BORG_ROOTBKP'])
+        create.append(cfg.keys['BORG_ROOTBKP'])
     else:
-        create.extend('/')
+        create.append('/')
         
     if 'EXCLUDE' not in list(cfg.keys()):
         printer(list(cfg.keys()))
@@ -805,7 +819,7 @@ optab={ 'stats'     :'cdn',      'login'     :'cdsnkprm',
         'restore'   :'cdnbfw',   'diffbkp'   :'cdnbw',
         'delbkp'    :'cdnb',     'bkp'       :'cdn',
         'prune'     :'cdn',      'report'    :'cdnb',
-        'poc'       :'cdn',}
+        'init'      :'cdn',     'poc'       :'cdn',}
 
 for opt,arg in opts:
     if   opt in '-h':
@@ -928,6 +942,8 @@ elif cmd == 'bkp':
 elif cmd == 'prune':
     # printer("   -c Prune [-n nickname/servername]")
     cmd_prune(nick,debug=debug)
+elif cmd == 'init':
+    cmd_init(nick,debug=debug)
 elif cmd == 'poc':
     cmd_poc(nick,debug=debug)
 else:
