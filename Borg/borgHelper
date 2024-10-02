@@ -9,7 +9,7 @@ import json
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.19"
+Version="0.20"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -17,6 +17,7 @@ Version="0.19"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.20 rajout de BORG_ARCHNAME et BORG_ROOTBKP afin de changer les noms des archives, et choisir une zone spé de backup...
 # 0.19 Extend la doc, changement de certaines docs pour que ca passe ds la version ulterieur de python.. risque de pb d'utf8, mais python 3 est par defaut en utf8...
 # 0.18   Prise en compte des plantage de borg sans le moindre stdout
 # 0.17.3 Retire la variable ret pour la petite prune
@@ -638,7 +639,18 @@ def cmd_bkp(nick,debug=0):
 
     create=['create']
     #create.extend(('--log-json --json --debug -v --stats '+cfg['BORG_REPO']+'::{fqdn}-root-{now} /').split(' '))
-    create.extend(('--log-json --json --debug -v --stats ::{fqdn}-root-{now} /').split(' '))
+    #create.extend(('--log-json --json --debug -v --stats ::{fqdn}-root-{now} /').split(' '))
+    create.extend(('--log-json --json --debug -v --stats').split(' '))
+    if 'BORG_ARCHNAME' in cfg.keys():
+        create.extend('::{fqdn}-'+cfg.keys['BORG_ARCHNAME']+'-{now}')
+    else:
+        create.extend('::{fqdn}-root-{now}')
+
+    if 'BORG_ROOTBKP' in cfg.keys():
+        create.extend(cfg.keys['BORG_ROOTBKP'])
+    else:
+        create.extend('/')
+        
     if 'EXCLUDE' not in list(cfg.keys()):
         printer(list(cfg.keys()))
         printer("Il est necessaire que EXCLUDE soit configures dans ~/.borghelperrc")
