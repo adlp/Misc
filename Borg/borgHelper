@@ -6,10 +6,14 @@ import configparser
 import subprocess,select
 import json
 
+### Notes
+# repo01 a cfg dans ~root/.ssh/config
+# sshd distant a cfg pour permettre le sendEnv
+# sur le repo01 poser la clef du serveur
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.22"
+Version="0.23"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -17,6 +21,7 @@ Version="0.22"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.23 Tout plein de correctifs pour faire marcher les backups cf 0.20
 # 0.22 Integration d'init pour initialiser un repo (local)
 # 0.21 Corrrections due a l'integration de BORG_ROOTBKP BORG_ARCHNAME (0.20)
 # 0.20 rajout de BORG_ARCHNAME et BORG_ROOTBKP afin de changer les noms des archives, et choisir une zone spé de backup...
@@ -655,15 +660,15 @@ def cmd_bkp(nick,debug=0):
     #create.extend(('--log-json --json --debug -v --stats '+cfg['BORG_REPO']+'::{fqdn}-root-{now} /').split(' '))
     #create.extend(('--log-json --json --debug -v --stats ::{fqdn}-root-{now} /').split(' '))
     create.extend(('--log-json --json --debug -v --stats').split(' '))
+    archname='root'
     if 'BORG_ARCHNAME' in cfg.keys():
-        create.append('::{fqdn}-'+cfg.keys['BORG_ARCHNAME']+'-{now}')
-    else:
-        create.append('::{fqdn}-root-{now}')
+        archname=cfg['BORG_ARCHNAME']
+    create.append('::{fqdn}-'+archname+'-{now}')
 
+    rootbkp="/"
     if 'BORG_ROOTBKP' in cfg.keys():
-        create.append(cfg.keys['BORG_ROOTBKP'])
-    else:
-        create.append('/')
+        rootbkp=cfg['BORG_ROOTBKP']
+    create.append(rootbkp)
         
     if 'EXCLUDE' not in list(cfg.keys()):
         printer(list(cfg.keys()))
