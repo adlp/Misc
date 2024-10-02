@@ -8,10 +8,13 @@ import subprocess,select
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.1"
+Version="0.2"
 ### TODO Rajouter un helpeur de prunage (en fonction du rc file), compactage
 ### TODO Rajouter un helpeur de backupage (en fonction du rc file)
-### TODO Rajouter un truc pour le helpeur diff sans parametre donne le diff des deux dernieres versions
+### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres
+### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
+### TODO Mieux aider la creation du borgrc
+# 0.2 Maintenant on peiut faire un diff entre les 2 dernieres versions (en precisant rien)
 # 0.1 Premiere version (officielle) qui reagit bien a toutes les commandes
 
 
@@ -33,7 +36,7 @@ def usage(doc=None,debug=0):
         printer("       On liste les backup connus")
         printer("   -c LstBkpFls [-n nickname/servername] [-b backupid/last]")
         printer("       On liste les fichiers d'un backup precis")
-        printer("   -c DiffBkp [-n nickname/servername] -b backupid [-w where]")
+        printer("   -c DiffBkp [-n nickname/servername] [-b backupid] [-w where]")
         printer("       Liste les mouvements des fichiers entre le backupid et le dernier backup")
         printer("   -c Restore [-n nickname/servername] [-b backupid/last] -f file2get -w where")
         printer("       On lance la restauration")
@@ -75,7 +78,7 @@ def usage(doc=None,debug=0):
     elif doc in 'diffbkp':
         printer("   -c DiffBkp [-n nickname/servername] -b backupid [-w where]")
         printer("       Liste les mouvements des fichiers entre le backupid et le dernier backup")
-        printer("           backupid    : Le nom du backup interessant")
+        printer("           backupid    : Le nom du backup interessant (si pas precisé compare les 2 derniers)")
         printer("           where       : Repertoire de filtre")
     elif doc in 'restore':
         printer("   -c Restore [-n nickname/servername] -b backupid -f file2get -w where")
@@ -217,20 +220,27 @@ def cmd_lstbkp(nick,debug=0):
     cfg=cfgreaded(nick,debug=debug)
     boex(nick,['list','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
 
-def getlastbkp(nick,debug=0):
+def getlastbkp(nick,nbl=1,debug=0):
     cfg=cfgreaded(nick,debug=debug)
     lines=boex(nick,['list','--glob-archives',cfg['GLOB_ARCH']],ret=True,debug=debug)
-    return(lines[-1].split(' ')[0])
+    ret=[]
+    for i in range(nbl*-1,0):
+        ret.append(lines[i].split(' ')[0])
+    return(ret)
+    #return(lines[-1].split(' ')[0])
 
 def cmd_lstfiles(nick,bid,debug=0):
     cfg=cfgreaded(nick,debug=debug)
     if bid is None:
-        bid=getlastbkp(nick,debug=debug)
+        bid=getlastbkp(nick,debug=debug)[0]
     boex(nick,['list','--glob-archives',cfg['GLOB_ARCH'],'::'+bid],debug=debug)
 
 def cmd_diffbkp(nick,bid,where,debug=0):
     cfg=cfgreaded(nick,debug=debug)
-    ladiff=getlastbkp(nick,debug=debug)
+    twodiff=getlastbkp(nick,2,debug=debug)
+    if bid is None:
+        bid=twodiff[1]
+    ladiff=twodiff[0]
     if ladiff==bid:
         printer("Desole, ce sont les memes backups")
         sys.exit(1)
@@ -244,7 +254,7 @@ def cmd_diffbkp(nick,bid,where,debug=0):
 def cmd_resto(nick,bid,ftor,where,debug=0):
     cfg=cfgreaded(nick,debug=debug)
     if bid is None:
-        bid=getlastbkp(nick,debug=debug)
+        bid=getlastbkp(nick,debug=debug)[0]
     boex(nick,['extract','--exclude','*/log/*','::'+bid,ftor],rep=where,debug=debug)
 
 def boex(nick,arg,rep='/tmp',ret=False,debug=0):
@@ -374,9 +384,9 @@ elif cmd in 'lstbkpfls':
         options['-b']=None
     cmd_lstfiles(nick,options['-b'],debug=debug)
 elif cmd in 'diffbkp':
-    # printer("-c DiffBkp [-n nickname/servername] -b backupid -w where")
+    # printer("-c DiffBkp [-n nickname/servername] [-b backupid] -w where")
     if '-b' not in options.keys():
-        usage(cmd)
+        options['-b']=None
     if '-w' not in options.keys():
         options['-w']=None
     cmd_diffbkp(nick,options['-b'],options['-w'],debug=debug)
