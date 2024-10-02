@@ -8,12 +8,13 @@ import subprocess,select
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.3"
+Version="0.4"
 ### TODO Rajouter un helpeur de prunage (en fonction du rc file), compactage
 ### TODO Rajouter un helpeur de backupage (en fonction du rc file)
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
+# 0.4 On rajoute le backup
 # 0.3 Rajout d'un helper pour deleter une sauvegarde precise
 # 0.2.1 Semblerait que le diff soit inverse
 # 0.2 Maintenant on peiut faire un diff entre les 2 dernieres versions (en precisant rien)
@@ -44,12 +45,14 @@ def usage(doc=None,debug=0):
         printer("       On lance la restauration")
         printer("   -c DelBkp [-n nickname/servername] -b backupid")
         printer("       /!\ On delete un backup sur le repo /!\ DANGER")
-    elif doc in 'stats':
+        printer("   -c Bkp [-n nickname/servername]")
+        printer("       On lance un backup")
+    elif doc == 'stats':
         printer("   -c Stats [-n server-name/nickname]")
         printer("       Affiche toutes les informations des serveurs connus")
         printer("           Sans parametre listera tout")
         printer("           Avec parametre donnera le detail d'un serveur")
-    elif doc in 'login':
+    elif doc == 'login':
         printer("   -c Login [-s servername] [-n nickname] [-k keyfile.key] -p passphrase -r repo")
         printer("       Integre le serveur dans borgHelper")
         printer("           servername  : le nom du serveur, sert de filtre pour lister les backups, sinon srv local")
@@ -57,34 +60,34 @@ def usage(doc=None,debug=0):
         printer("           keyfile     : le fichier de clefs")
         printer("           passpharse  : le mot de passe d'acces au repo")
         printer("           repo        : l'addresse du repo")
-    elif doc in 'mount':
+    elif doc == 'mount':
         printer("   -c Mount [-n nickname/servername]")
         printer("       Rend accessible les sauvegarde dans un repertoire visible via la commande Stat ou affiche en fin de mount")
         printer("       A utiliser rarement, car tant que le repo est monté, on ne peut plus backuper")
         printer("           si -n non precisé alores on travaille avec le serveur courant")
         printer("           nickname    : Le nom de l'enregistrement du serveur")
-    elif doc in 'umount':
+    elif doc == 'umount':
         printer("   -c UMount [-n nickname/servername]")
         printer("       Coupe cet acces")
         printer("           si -n non precisé alores on travaille avec le serveur courant")
         printer("           nickname    : Le nom de l'enregistrement du serveur")
-    elif doc in 'lstbkp':
+    elif doc == 'lstbkp':
         printer("   -c ListBkp [-n nickname/servername]")
         printer("       Liste les backup (backupid) disponibles")
         printer("           si -n non precisé alores on travaille avec le serveur courant")
         printer("           nickname    : Le nom de l'enregistrement du serveur")
-    elif doc in 'listbkpfls':
+    elif doc == 'listbkpfls':
         printer("   -c LstBkpFls [-n nickname/servername] -b backupid")
         printer("       Liste les fichiers disponibles dans le backup backupid")
         printer("           si -n non precisé alores on travaille avec le serveur courant")
         printer("           nickname    : Le nom de l'enregistrement du serveur")
         printer("           backupid    : Le nom du backup interessant")
-    elif doc in 'diffbkp':
+    elif doc == 'diffbkp':
         printer("   -c DiffBkp [-n nickname/servername] -b backupid [-w where]")
         printer("       Liste les mouvements des fichiers entre le backupid et le dernier backup")
         printer("           backupid    : Le nom du backup interessant (si pas precisé compare les 2 derniers)")
         printer("           where       : Repertoire de filtre")
-    elif doc in 'restore':
+    elif doc == 'restore':
         printer("   -c Restore [-n nickname/servername] -b backupid -f file2get -w where")
         printer("       Restaure l'arbo (ou fichier) file2berestored depuis le backup backupid dans l'emplacement where")
         printer("           si -n non precisé alores on travaille avec le serveur courant")
@@ -266,7 +269,45 @@ def cmd_delbkp(nick,bid,debug=0):
     boex(nick,['delete','::'+bid],debug=debug)
     boex(nick,['compact','--cleanup-commits'],debug=debug)
 
-def boex(nick,arg,rep='/tmp',ret=False,debug=0):
+def cmd_bkp(nick,debug=0):
+    cfg=cfgreaded(nick,debug=debug)
+
+###    SetEnv BORG_PASSPHRASE=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX BORG_REPO=repo01:/mnt/borg03/sxb-03
+### Ce qui change par rapport a un vrai boex
+###    Variable env BORG_REPO reecrite
+###    Precedence du ssh
+###
+###    cmda=f"ssh -Ao StrictHostKeyChecking=no -o LogLevel=ERROR -o UserKnownHostsFile=/dev/null {host} 'borg create --log-json --json --debug -v --stats "
+###    cmdb="::{fqdn}-root-{now} / --exclude /media --exclude /dev --exclude /proc --exclude /sys --exclude /var/run --exclude /run --exclude /lost+found --exclude /mnt --exclude /var/lib/lxcfs --exclude /tmp --exclude /var/lib/docker --exclude-if-present .nobackup  --exclude-caches --exclude-nodump --keep-exclude-tags'"
+
+### Ce qu'il faut faire
+###     1. Stocker les ordres d'exclusion du backup (le reste sera pour le moment hardcodé)
+###     2. Preceder la commande du backup ssh proprement (avec enregistrement de la clef)
+###     3. Traiter les codes retours
+    preBorg=['ssh','-o','SendEnv BORG_*']
+    if 'SSH_REMFO' in cfg.keys():
+        preBorg.append('-R')
+        preBorg.append(cfg['SSH_REMFO'])
+    preBorg.extend(f'-A -o VisualHostKey=no -o StrictHostKeyChecking=accept-new {cfg["SER_NAME"]}'.split(' '))
+
+    create=['create']
+    create.extend(('--log-json --json --debug -v --stats ::{fqdn}-root-{now} /').split(' '))
+    if 'EXCLUDE' not in list(cfg.keys()):
+        printer(list(cfg.keys()))
+        printer("Il est necessaire que EXLUDE soit configures dans ~/.borghelperrc")
+        printer('  EXCLUDE = --exclude /media --exclude /dev --exclude /proc --exclude /sys --exclude /var/run --exclude /run --exclude /lost+found --exclude /mnt --exclude /var/lib/lxcfs --exclude /tmp --exclude /var/lib/docker --exclude-if-present .nobackup  --exclude-caches --exclude-nodump --keep-exclude-tags')
+        exit(1)
+    create.extend(cfg['EXCLUDE'].split(' '))
+
+    if 'SSH_REPO' in cfg.keys():
+        forceEnv={}
+        forceEnv['BORG_REPO']=cfg['SSH_REPO']
+    else:
+        forceEnv=None
+
+    boex(nick,create,preBorg=preBorg,forceEnv=forceEnv,debug=debug)
+    
+def boex(nick,arg,rep='/tmp',ret=False,debug=0,preBorg=None,forceEnv=None):
     cfg=cfgreaded(nick,debug=debug)
     varcur=os.environ.copy()
     varfut={}
@@ -274,7 +315,18 @@ def boex(nick,arg,rep='/tmp',ret=False,debug=0):
         if k in ['BORG_REPO','BORG_PASSPHRASE','BORG_REMOTE_PATH','BORG_RSH','BORG_SHOW_SYSINFO','BORG_RELOCATED_REPO_ACCESS_IS_OK']:
             varfut[k]=cfg[k]
 
-    commande=['borg']
+    if forceEnv is not None:
+        for k in list(forceEnv.keys()):
+            varfut[k]=forceEnv[k]
+
+    if debug != 0:
+        printer(varfut)
+
+    if preBorg is not None:
+        commande=preBorg
+        commande.append('borg')
+    else:
+        commande=['borg']
     commande.extend(arg)
     varfut['PATH']=varcur['PATH']
     if debug:
@@ -322,7 +374,7 @@ optab={ 'stats'     :'cdn',      'login'     :'cdsnkprm',
         'mount'     :'cdn',      'umount'    :'cdn',
         'lstbkp'    :'cdn',      'lstbkpfls' :'cdnb',
         'restore'   :'cdnbfw',   'diffbkp'   :'cdnbw',
-        'delbkp'    :'cdnb' }
+        'delbkp'    :'cdnb',     'bkp'       :'cdn' }
 
 for opt,arg in opts:
     if   opt in '-h':
@@ -353,13 +405,15 @@ for opt,arg in opts:
     if opt in '-n':
         nick=arg
 
+if debug != 0:
+    printer(f'La commande fume {cmd}')
 
-if   cmd in 'stats':
+if   cmd == 'stats':
     if '-n' in options.keys():
         cmd_stats(nick)
     else:
         cmd_stats()
-elif cmd in 'login':
+elif cmd == 'login':
     # TODO blocquer si mounted
     # printer("-c Login [-s servername] [-n nickname] [-k keyfile.key] -p passphrase -r repo")
     if '-s' not in options.keys():
@@ -379,28 +433,28 @@ elif cmd in 'login':
     if '-m' not in options.keys():
         options['-m']=None
     cmd_login(serna,nick,options['-k'],options['-p'],options['-r'],options['-m'],debug=debug)
-elif cmd in 'mount':
+elif cmd == 'mount':
     # printer("-c Mount [-n nickname/servername]")
     cmd_mount(nick,debug=debug)
-elif cmd in 'umount':
+elif cmd == 'umount':
     # printer("-c UMount [-n nickname/servername]")
     cmd_umount(nick,debug=debug)
-elif cmd in 'lstbkp':
+elif cmd == 'lstbkp':
     # printer("-c LstBkp [-n nickname/servername]")
     cmd_lstbkp(nick,debug=debug)
-elif cmd in 'lstbkpfls':
+elif cmd == 'lstbkpfls':
     # printer("-c LstBkpFls [-n nickname/servername] [-b backupid/last]")
     if '-b' not in options.keys() or 'last' in options['-b']:
         options['-b']=None
     cmd_lstfiles(nick,options['-b'],debug=debug)
-elif cmd in 'diffbkp':
+elif cmd == 'diffbkp':
     # printer("-c DiffBkp [-n nickname/servername] [-b backupid] -w where")
     if '-b' not in options.keys():
         options['-b']=None
     if '-w' not in options.keys():
         options['-w']=None
     cmd_diffbkp(nick,options['-b'],options['-w'],debug=debug)
-elif cmd in 'restore':
+elif cmd == 'restore':
     # printer("-c Restore [-n nickname/servername] [-b backupid/last] -f file2get -w where")
     if '-b' not in options.keys() or 'last' in options['-b']:
         options['-b']=None
@@ -409,11 +463,14 @@ elif cmd in 'restore':
     if '-w' not in options.keys():
         usage(cmd)
     cmd_resto(nick,options['-b'],options['-f'],options['-w'],debug=debug)
-elif cmd in 'delbkp':
+elif cmd == 'delbkp':
     # printer("   -c DelBkp [-n nickname/servername] -b backupid")
     if '-b' not in options.keys() or 'last' in options['-b']:
         usage(cmd)
     cmd_delbkp(nick,options['-b'],debug=debug)
+elif cmd == 'bkp':
+    # printer("   -c Bkp [-n nickname/servername]")
+    cmd_bkp(nick,debug=debug)
 else:
     printer("Mais comment on peut en arriver la ?")
     usage()
