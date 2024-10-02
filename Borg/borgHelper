@@ -14,13 +14,13 @@ Version="0.5"
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
 ### TODO Mieux gerer le repertoire d'appel du programme (clause where) : elle n'est necessaire qu'au restore
+# 0.5 Correction : on ne force plus le chemin d'execution tout le temps a /tmp
 # 0.5 Et la petite prune est la yeaaah
 # 0.4 On rajoute le backup
 # 0.3 Rajout d'un helper pour deleter une sauvegarde precise
 # 0.2.1 Semblerait que le diff soit inverse
 # 0.2 Maintenant on peiut faire un diff entre les 2 dernieres versions (en precisant rien)
 # 0.1 Premiere version (officielle) qui reagit bien a toutes les commandes
-
 
 def version():
     print(f"Version {Version}")
@@ -341,7 +341,7 @@ def cmd_bkp(nick,debug=0):
 
     boex(nick,create,preBorg=preBorg,forceEnv=forceEnv,debug=debug)
     
-def boex(nick,arg,rep='/tmp',ret=False,debug=0,preBorg=None,forceEnv=None):
+def boex(nick,arg,rep=None,ret=False,debug=0,preBorg=None,forceEnv=None):
     cfg=cfgreaded(nick,debug=debug)
     varcur=os.environ.copy()
     varfut={}
@@ -361,6 +361,9 @@ def boex(nick,arg,rep='/tmp',ret=False,debug=0,preBorg=None,forceEnv=None):
         commande.append('borg')
     else:
         commande=['borg']
+
+    if rep is None:
+        rep=os.getcwd()
     commande.extend(arg)
     varfut['PATH']=varcur['PATH']
     if debug:
