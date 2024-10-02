@@ -17,7 +17,7 @@ import hashlib
 import subprocess
 from datetime import datetime
 
-Version="0.8.1"
+Version="0.9"
 ### Todo un mode flush pour le tee
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
