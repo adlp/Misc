@@ -20,9 +20,10 @@ from datetime import datetime
 import requests
 from requests.auth import HTTPBasicAuth
 
-Version="0.18.2"
+Version="0.18.3"
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
+# 0.18.3 correction du pb utf8 vue grace au 0.18.2 sur la poussée de donnes vers le nc
 # 0.18.2 correction d'une coquille pour les stderr par mail
 # 0.18.1 deplacement de l'initialisation de var afin d'eviter les bug
 # 0.18 correctif si on n'a pas d'environnement
@@ -281,7 +282,7 @@ ncsended=0
 if nextcloud is not None and nextauth is not None:
     if debug:
         print(f'Depose sur nc ${nextcloud}')
-    ncsended=nextcloudput(nextcloud,nextauth,datas)
+    ncsended=nextcloudput(nextcloud,nextauth,datas.encode('utf-8'))
 
 # Je veux envoyer le mail si
 #   * Le nextcloud n'a pas marché
