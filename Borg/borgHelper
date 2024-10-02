@@ -4,16 +4,18 @@ import getopt,sys,os
 import socket
 import configparser
 import subprocess,select
+import json
 
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.7.1"
+Version="0.8"
 ### TODO Rajouter un helpeur de prunage (en fonction du rc file), compactage
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
 ### TODO Mieux gerer le repertoire d'appel du programme (clause where) : elle n'est necessaire qu'au restore
+# 0.8 1er rapport
 # 0.7.1 flushing 4 print 2 screen
 # 0.6 prise en compte des backup locaux
 # 0.5 Correction : on ne force plus le chemin d'execution tout le temps a /tmp
@@ -42,6 +44,8 @@ def usage(doc=None,debug=0):
         printer("       On liste les backup connus")
         printer("   -c LstBkpFls [-n nickname/servername] [-b backupid/last]")
         printer("       On liste les fichiers d'un backup precis")
+        printer("   -c Report [-n nickname/servername] [-b backupid/last]")
+        printer("       Rapport sur le dernier (ou pas) backup")
         printer("   -c DiffBkp [-n nickname/servername] [-b backupid] [-w where]")
         printer("       Liste les mouvements des fichiers entre le backupid et le dernier backup")
         printer("   -c Restore [-n nickname/servername] [-b backupid/last] -f file2get -w where")
@@ -136,7 +140,6 @@ def cfgreaded(nick,debug=0):
         sys.exit(3)
     return(cfg)
 
-
 def cfgwrite(nick,serna,passphrase,repo,mountpoint,debug=0):
     config= configparser.ConfigParser()
     config.optionxform=str
@@ -155,6 +158,17 @@ def cfgwrite(nick,serna,passphrase,repo,mountpoint,debug=0):
     with open(cfgfile, 'w') as fd:
         config.write(fd)
         fd.close()
+
+def convert_octets_readable(size_in_bytes,sib=1000):
+    suffixes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB']
+    index = 0
+
+    while size_in_bytes >= sib and index < len(suffixes) - 1:
+        size_in_bytes /= sib
+        index += 1
+
+    # Formatage avec deux chiffres après la virgule
+    return f"{size_in_bytes:.2f} {suffixes[index]}"
 
 def affconf(nick):
     cfg=cfgreaded(nick)
@@ -247,6 +261,76 @@ def cmd_lstfiles(nick,bid,debug=0):
         bid=getlastbkp(nick,debug=debug)[0]
     boex(nick,['list','--glob-archives',cfg['GLOB_ARCH'],'::'+bid],debug=debug)
 
+def cmd_report(nick,bid,debug=0):
+    import re
+    cfg=cfgreaded(nick,debug=debug)
+    pruneme=[]
+    for i in cmd_prune(nick,dryrun=True,debug=debug):
+        if 'Would prune:' in i:
+            pruneme.append(((re.sub(r'( )*',r'\1',i)).split(' '))[2])
+    if bid is None:
+        bid=getlastbkp(nick,debug=debug)[0]
+    r=json.loads('\n'.join(boex(nick,['info','--json','--glob-archives',cfg['GLOB_ARCH']],ret=True,debug=debug)))
+    #print(r)
+
+    resume={}
+    resume['duration']=0
+    for i in ['duration','compressed_size','deduplicated_size','nfiles','original_size','prunable']:
+        resume[i]=0
+
+    c=0
+    kept={}
+    for i in r['archives']:
+        resume['duration']+=i['duration']
+        resume['compressed_size']+=i['stats']['compressed_size']
+        resume['deduplicated_size']+=i['stats']['deduplicated_size']
+        resume['original_size']+=i['stats']['original_size']
+        resume['nfiles']+=i['stats']['nfiles']
+
+        i['command_line']=[]
+        i['chunker_params']=[]
+        kept[i['name']]={}
+        kept[i['name']]['name']             =i['name']
+        #kept[i['name']]['start']            =i['start']
+        kept[i['name']]['durationM']        =i['duration']/60
+        kept[i['name']]['original_size']    =convert_octets_readable(i['stats']['original_size'])
+        kept[i['name']]['compressed_size']  =convert_octets_readable(i['stats']['compressed_size'])
+        kept[i['name']]['deduplicated_size']=convert_octets_readable(i['stats']['deduplicated_size'])
+        kept[i['name']]['nfiles']           =i['stats']['nfiles']
+        
+        if i['name'] in pruneme:
+            i['pruneme']='Yes'
+            if i['stats']['original_size'] > 0:
+                kept[i['name']]['original_size']    ="-"+kept[i['name']]['original_size']
+                kept[i['name']]['compressed_size']  ="-"+kept[i['name']]['compressed_size']
+                kept[i['name']]['deduplicated_size']="-"+kept[i['name']]['deduplicated_size']
+            kept[i['name']]['prunMe']='Yes'
+            #resume['prunable']+=i['stats']['compressed_size']
+            resume['prunable']+=i['stats']['deduplicated_size']
+        else:
+            i['pruneme']='No'
+            kept[i['name']]['prunMe']='No'
+        c+=1
+
+    resume['moy_duration']=resume['duration']/c
+    resume['unique_csize']=r['cache']['stats']['unique_csize']
+    for i in ['duration','compressed_size','deduplicated_size','nfiles','original_size','unique_csize']:
+    #for i in ['duration','compressed_size','deduplicated_size','nfiles','original_size']:
+        resume['moy_'+i]=convert_octets_readable(resume[i]/c)
+        resume[i]=convert_octets_readable(resume[i])
+    resume['prunable']=convert_octets_readable(resume['prunable'])
+    resume['last']=r['archives'][c-1]['start']
+
+    if debug > 0:
+        print(json.dumps(r,indent=4))
+
+    print(json.dumps(resume,indent=4))
+    print(json.dumps(kept,indent=4))
+    if ':' not in r['repository']['location']:
+        print("Il faudrait calculer ce qu'il reste sur ce sto, et mettre une condistionnelle sur les 'var d'env'")
+
+
+
 def cmd_diffbkp(nick,bid,where,debug=0):
     cfg=cfgreaded(nick,debug=debug)
     twodiff=getlastbkp(nick,2,debug=debug)
@@ -275,7 +359,7 @@ def cmd_delbkp(nick,bid,debug=0):
     boex(nick,['compact','--cleanup-commits'],debug=debug)
 
 
-def cmd_prune(nick,debug=0):
+def cmd_prune(nick,dryrun=False,debug=0):
     cfg=cfgreaded(nick,debug=debug)
     cmd=['prune']
     for i in list(cfg.keys()):
@@ -297,9 +381,16 @@ def cmd_prune(nick,debug=0):
 
     if len(cmd) >1:
         # BORG_PASSPHRASE=$pass borg prune --keep-daily 31 --save-space --info --list --stats --glob-archives="$arcg-*" $repo
-        cmd.extend(f'--save-space --info --list --stats --glob-archives={cfg["GLOB_ARCH"]}'.split(' '))
-        boex(nick,cmd,debug=debug)
-        boex(nick,['compact','--cleanup-commits'],debug=debug)
+        if dryrun:
+            cmd.append('--dry-run')
+        else:
+            cmd.append('--stats')
+        cmd.extend(f'--save-space --info --list --glob-archives={cfg["GLOB_ARCH"]}'.split(' '))
+        ret=boex(nick,cmd,ret=dryrun,debug=debug,getStdErr=True)
+        if not dryrun:
+            boex(nick,['compact','--cleanup-commits'],debug=debug)
+        else:
+            return(ret)
     else:
         usage('prune')
 
@@ -347,7 +438,7 @@ def cmd_bkp(nick,debug=0):
 
     boex(nick,create,preBorg=preBorg,forceEnv=forceEnv,debug=debug)
     
-def boex(nick,arg,rep=None,ret=False,debug=0,preBorg=None,forceEnv=None):
+def boex(nick,arg,rep=None,ret=False,debug=0,preBorg=None,forceEnv=None,getStdErr=False):
     cfg=cfgreaded(nick,debug=debug)
     varcur=os.environ.copy()
     varfut={}
@@ -390,7 +481,10 @@ def boex(nick,arg,rep=None,ret=False,debug=0,preBorg=None,forceEnv=None):
                          stderr=subprocess.PIPE)
     inf, errs = ps.communicate()
     if ret:
-        return(''.join(inf).splitlines())
+        if getStdErr:
+            return(''.join(errs).splitlines())
+        else:
+            return(''.join(inf).splitlines())
     else:
         for line in inf:
             print(line,end='',flush=True)
@@ -420,7 +514,7 @@ optab={ 'stats'     :'cdn',      'login'     :'cdsnkprm',
         'lstbkp'    :'cdn',      'lstbkpfls' :'cdnb',
         'restore'   :'cdnbfw',   'diffbkp'   :'cdnbw',
         'delbkp'    :'cdnb',     'bkp'       :'cdn',
-        'prune'     :'cdn' }
+        'prune'     :'cdn',      'report'    :'cdnb' }
 
 for opt,arg in opts:
     if   opt in '-h':
@@ -493,6 +587,11 @@ elif cmd == 'lstbkpfls':
     if '-b' not in options.keys() or 'last' in options['-b']:
         options['-b']=None
     cmd_lstfiles(nick,options['-b'],debug=debug)
+elif cmd == 'report':
+    # printer("   -c Report [-n nickname/servername] [-b backupid/last]")
+    if '-b' not in options.keys() or 'last' in options['-b']:
+        options['-b']=None
+    cmd_report(nick,options['-b'],debug=debug)
 elif cmd == 'diffbkp':
     # printer("-c DiffBkp [-n nickname/servername] [-b backupid] -w where")
     if '-b' not in options.keys():
