@@ -1,0 +1,27 @@
+#!/bin/bash
+
+if [ $# != 4 ]; then
+    cat <<EOF
+Script qui permet de transferer un fichier d\'un git a un autre avec un commentaire
+
+Les parametres doivent etres mis dans l\'ordre qui suis
+    Repo Source
+    Fichier Source avec son path dans le git
+    Repo Destination
+    Fichier Destination avec son path dans le git
+EOF
+    exit 0
+fi
+
+RepoSrc=$1
+FileSrc=$2
+
+RepoDst=$3
+FileDst=$4
+
+
+
+gitoune -r ${RepoSrc} -f ${FileSrc} -l | grep --color=never "^\*" | sed -e "s=^\* '==g" -e "s=^\(.*\) (2...-.*$=\1=g" -e "s= - = =g" | tac | while read id msg
+    do
+        gitoune -r ${RepoSrc} -f ${FileSrc} -G $id | gitoune -r ${RepoDst} -f ${FileDst} -m "${msg}"
+        done
