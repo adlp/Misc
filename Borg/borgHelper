@@ -9,12 +9,13 @@ import json
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.8"
+Version="0.8.1"
 ### TODO Rajouter un helpeur de prunage (en fonction du rc file), compactage
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
 ### TODO Mieux gerer le repertoire d'appel du programme (clause where) : elle n'est necessaire qu'au restore
+# 0.8.1 un rapport plus fin
 # 0.8 1er rapport
 # 0.7.1 flushing 4 print 2 screen
 # 0.6 prise en compte des backup locaux
@@ -261,25 +262,24 @@ def cmd_lstfiles(nick,bid,debug=0):
         bid=getlastbkp(nick,debug=debug)[0]
     boex(nick,['list','--glob-archives',cfg['GLOB_ARCH'],'::'+bid],debug=debug)
 
-def cmd_report(nick,bid,debug=0):
+def cmd_report(nick,debug=0,maxp=None):
     import re
     cfg=cfgreaded(nick,debug=debug)
     pruneme=[]
     for i in cmd_prune(nick,dryrun=True,debug=debug):
         if 'Would prune:' in i:
             pruneme.append(((re.sub(r'( )*',r'\1',i)).split(' '))[2])
-    if bid is None:
-        bid=getlastbkp(nick,debug=debug)[0]
     r=json.loads('\n'.join(boex(nick,['info','--json','--glob-archives',cfg['GLOB_ARCH']],ret=True,debug=debug)))
     #print(r)
 
     resume={}
     resume['duration']=0
-    for i in ['duration','compressed_size','deduplicated_size','nfiles','original_size','prunable']:
+    for i in ['duration','compressed_size','deduplicated_size','nfiles','original_size','prunable','prunable_os','prunable_cs']:
         resume[i]=0
 
     c=0
     kept={}
+    notPrunable=0
     for i in r['archives']:
         resume['duration']+=i['duration']
         resume['compressed_size']+=i['stats']['compressed_size']
@@ -299,7 +299,7 @@ def cmd_report(nick,bid,debug=0):
         kept[i['name']]['nfiles']           =i['stats']['nfiles']
         
         if i['name'] in pruneme:
-            i['pruneme']='Yes'
+            i['pruneMe']='Yes'
             if i['stats']['original_size'] > 0:
                 kept[i['name']]['original_size']    ="-"+kept[i['name']]['original_size']
                 kept[i['name']]['compressed_size']  ="-"+kept[i['name']]['compressed_size']
@@ -307,28 +307,83 @@ def cmd_report(nick,bid,debug=0):
             kept[i['name']]['prunMe']='Yes'
             #resume['prunable']+=i['stats']['compressed_size']
             resume['prunable']+=i['stats']['deduplicated_size']
+            resume['prunable_os']+=i['stats']['original_size']
+            resume['prunable_cs']+=i['stats']['compressed_size']
         else:
-            i['pruneme']='No'
+            i['pruneMe']='No'
             kept[i['name']]['prunMe']='No'
+            notPrunable+=1
         c+=1
 
     resume['moy_duration']=resume['duration']/c
     resume['unique_csize']=r['cache']['stats']['unique_csize']
     for i in ['duration','compressed_size','deduplicated_size','nfiles','original_size','unique_csize']:
-    #for i in ['duration','compressed_size','deduplicated_size','nfiles','original_size']:
         resume['moy_'+i]=convert_octets_readable(resume[i]/c)
         resume[i]=convert_octets_readable(resume[i])
-    resume['prunable']=convert_octets_readable(resume['prunable'])
+
+
+    resume['total_size']=r['cache']['stats']['total_size']
+    resume['total_csize']=r['cache']['stats']['total_csize']
+    for i in ['prunable','prunable_cs','prunable_os','total_size','total_csize']:
+        resume[i]=convert_octets_readable(resume[i])
+
     resume['last']=r['archives'][c-1]['start']
+    resume['lastname']=r['archives'][c-1]['name']
 
     if debug > 0:
         print(json.dumps(r,indent=4))
+        print(json.dumps(resume,indent=4))
+        print(json.dumps(kept,indent=4))
 
-    print(json.dumps(resume,indent=4))
-    print(json.dumps(kept,indent=4))
-    if ':' not in r['repository']['location']:
-        print("Il faudrait calculer ce qu'il reste sur ce sto, et mettre une condistionnelle sur les 'var d'env'")
+    avail=dfRepo(nick)
+    if avail is None:
+        avail=""
+    dabesi=d2DateNSince(resume['last'])
+    print(f'    Nom           ; Duree       :depuis          : Derniere      : Taille                : Recuperable : Restant ')
+    print(f"{cfg['SER_NAME']} ; { kept[resume['lastname']]['durationM']:.2f} ;{dabesi['since']:.2f}; {kept[resume['lastname']]['deduplicated_size'] }; {resume['unique_csize']};{resume['prunable']};{avail}")
+    print(f"prunable;{resume['prunable_os']};{ resume['prunable_cs']};{resume['prunable']}")
+    print(f'{dabesi["date"]}')
+    cpt=0
+    for i in kept.keys():
+        if kept[i]['prunMe'] == 'No':
+            if (maxp is None) or ((notPrunable - cpt ) <= maxp):
+                print(f"{i};{kept[i]['original_size']};{kept[i]['compressed_size']};{kept[i]['deduplicated_size']};{kept[i]['nfiles']}")
+            cpt+=1
+    print(f"All;{resume['total_size']};{resume['total_csize']};{resume['unique_csize']}")
 
+def d2DateNSince(datepourrie):
+    from datetime import datetime
+    from time import gmtime,mktime
+
+    forPour     = "%Y-%m-%dT%H:%M:%S.%f"
+    now         = datetime.fromtimestamp(mktime(gmtime()))
+    now         = datetime.now()
+    datelisible = datetime.strptime(datepourrie, forPour)
+    since       = (now - datelisible).total_seconds() / 60 / 60
+
+    forNew      = "%Y/%m/%d %H:%M:%S"
+    newstart    = datelisible.strftime(forNew)
+
+    return({'since':since, 'date':newstart})
+
+
+
+def dfRepo(nick,debug=0):
+    cfg=cfgreaded(nick,debug=debug)
+
+    if ':' not in cfg['BORG_REPO']:
+        process = subprocess.Popen(f'df { cfg["BORG_REPO"] } --output=avail | tail -1 ', stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+        stdout, stderr = process.communicate()
+    else:
+        return None
+
+    if debug:
+        stderr(stdout.decode('utf-8'))
+        stderr(stdout.decode('utf-8').split(" ")[-1])
+    # Vérifie si l'exécution a réussi
+    if process.returncode == 0:
+        return int(stdout.decode('utf-8').split(" ")[-1])*1024
+    return None
 
 
 def cmd_diffbkp(nick,bid,where,debug=0):
@@ -591,7 +646,9 @@ elif cmd == 'report':
     # printer("   -c Report [-n nickname/servername] [-b backupid/last]")
     if '-b' not in options.keys() or 'last' in options['-b']:
         options['-b']=None
-    cmd_report(nick,options['-b'],debug=debug)
+    else:
+        options['-b']=int(options['-b'])
+    cmd_report(nick,maxp=options['-b'],debug=debug)
 elif cmd == 'diffbkp':
     # printer("-c DiffBkp [-n nickname/servername] [-b backupid] -w where")
     if '-b' not in options.keys():
