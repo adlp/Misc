@@ -8,12 +8,13 @@ import subprocess,select
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.5"
+Version="0.6"
 ### TODO Rajouter un helpeur de prunage (en fonction du rc file), compactage
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
 ### TODO Mieux gerer le repertoire d'appel du programme (clause where) : elle n'est necessaire qu'au restore
+# 0.6 prise en compte des backup locaux
 # 0.5 Correction : on ne force plus le chemin d'execution tout le temps a /tmp
 # 0.5 Et la petite prune est la yeaaah
 # 0.4 On rajoute le backup
@@ -318,13 +319,22 @@ def cmd_bkp(nick,debug=0):
 ###     1. Stocker les ordres d'exclusion du backup (le reste sera pour le moment hardcodé)
 ###     2. Preceder la commande du backup ssh proprement (avec enregistrement de la clef)
 ###     3. Traiter les codes retours
+    if 'SSH_REPO' in cfg.keys():
+        forceEnv={}
+        forceEnv['BORG_REPO']=cfg['SSH_REPO']
+    else:
+        forceEnv=None
+
     preBorg=['ssh','-o','SendEnv BORG_*']
     if 'SSH_REMFO' in cfg.keys():
         preBorg.append('-R')
         preBorg.append(cfg['SSH_REMFO'])
     preBorg.extend(f'-A -o VisualHostKey=no -o StrictHostKeyChecking=accept-new {cfg["SER_NAME"]}'.split(' '))
+    if len(cfg['SSH_REMFO']) == 0:
+        preBorg=None
 
     create=['create']
+    #create.extend(('--log-json --json --debug -v --stats '+cfg['BORG_REPO']+'::{fqdn}-root-{now} /').split(' '))
     create.extend(('--log-json --json --debug -v --stats ::{fqdn}-root-{now} /').split(' '))
     if 'EXCLUDE' not in list(cfg.keys()):
         printer(list(cfg.keys()))
@@ -333,11 +343,6 @@ def cmd_bkp(nick,debug=0):
         exit(1)
     create.extend(cfg['EXCLUDE'].split(' '))
 
-    if 'SSH_REPO' in cfg.keys():
-        forceEnv={}
-        forceEnv['BORG_REPO']=cfg['SSH_REPO']
-    else:
-        forceEnv=None
 
     boex(nick,create,preBorg=preBorg,forceEnv=forceEnv,debug=debug)
     
@@ -345,6 +350,8 @@ def boex(nick,arg,rep=None,ret=False,debug=0,preBorg=None,forceEnv=None):
     cfg=cfgreaded(nick,debug=debug)
     varcur=os.environ.copy()
     varfut={}
+    if debug != 0:
+        printer('Boex the first')
     for k in list(cfg.keys()):
         if k in ['BORG_REPO','BORG_PASSPHRASE','BORG_REMOTE_PATH','BORG_RSH','BORG_SHOW_SYSINFO','BORG_RELOCATED_REPO_ACCESS_IS_OK']:
             varfut[k]=cfg[k]
