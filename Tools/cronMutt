@@ -22,6 +22,7 @@ Version="0.12"
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
 ### Todo rajouter header date debut + rajouter header de la commande (mais desativable par un flag)
+# 0.13 On rajoute le hostname dans les entees
 # 0.12 On tete de faire de l'autodetection pour le teemode
 # 0.11 On gere les pb de caracteres space de microsoft
 # 0.10 Pipe mode fonctionnelle : on flush
@@ -141,7 +142,7 @@ if "<" not in mailFrom:
         print(f'{tmp.split("@")}')
 
 # Preparation Ouverture du mail 1/2
-muttcmd=['mutt','-e',f'my_hdr X-cronMutt: cronMutt-{Version}','-e',f'my_hdr X-cronMuttStart: {str(datetime.now())}','-e',f'my_hdr From:{mailFrom}','-e',f'my_hdr In-Reply-To: {inReplyTo}','-e',f'my_hdr Message-ID: {messageId}']
+muttcmd=['mutt','-e',f'my_hdr X-cronMutt: cronMutt-{Version}','-e',f'my_hdr X-cronMuttStart: {str(datetime.now())}','-e',f'my_hdr X-cronMuttHost: {os.uname()[1]}','-e',f'my_hdr From:{mailFrom}','-e',f'my_hdr In-Reply-To: {inReplyTo}','-e',f'my_hdr Message-ID: {messageId}']
 
 
 # Ouverture du process a suivre
