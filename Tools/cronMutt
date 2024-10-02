@@ -20,9 +20,10 @@ from datetime import datetime
 import requests
 from requests.auth import HTTPBasicAuth
 
-Version="0.16"
+Version="0.17"
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
+# 0.17 On rajoute un flag -o qui envoie systematiquement le mail lorsque c'est ok (a ceux preciser dans le -o
 # 0.16 Si tout va bien on pousse sur le nc. Si le -E on envoie le gentil mail quand meme. Si tout vat mal, nc+mail
 # 0.15.1 Saut de ligne manquant, corrige
 # 0.15 L'affichage stdout se fait en direct, on n'attends plus que le process soit execute
@@ -74,6 +75,7 @@ def usage():
     print("     i:      in-reply-to")
     print("     s:      Mail subject")
     print("     d:      Destination email")
+    print("     o:      Destinataire ok mail (sinon c'est uniquement pour les d)")
     print("     r:      ReplyTo")
     print("     f:      from (si different du reply to)")
     print("     m:      message id")
@@ -101,7 +103,7 @@ def read_stream(stream, output_list, stream_name):
     stream.close()
 
 try:
-    opts, args = getopt.getopt(sys.argv[1:], "hVDEi:s:d:r:f:m:e:ct:XTp:n:N:", ["help"])
+    opts, args = getopt.getopt(sys.argv[1:], "hVDEi:s:d:o:r:f:m:e:ct:XTp:n:N:", ["help"])
 except getopt.GetoptError as err:
     print(err)  # will print something like "option -a not recognized"
     usage()
@@ -112,6 +114,7 @@ emptySend=False
 subject=f"//cron//{os.path.basename(__file__)}"
 inReplyTo=None
 dest=os.environ["LOGNAME"]
+destok=None
 messageId=os.path.basename(__file__)
 cmd=None
 mailType=None
@@ -143,6 +146,8 @@ for opt,arg in opts:
         subject=arg
     elif opt in "-d":
         dest=arg
+    elif opt in '-o':
+        destok=arg
     elif opt in '-f':
         mailFrom=arg
     elif opt in "-r":
@@ -235,10 +240,6 @@ if ps.returncode != 0:
     muttcmd.append('-e')
     muttcmd.append(f'my_hdr X-Priority:1')
 muttcmd.append('--')
-muttcmd.append(dest)
-
-if debug:
-    print(f"{' '.join(muttcmd)}")
 
 # Traitement des donnees
 datas=""
@@ -256,13 +257,26 @@ if cmd is not None:
             #    print(line,end="",flush=True)
             datas+=line+"\n"
 
+if destok is not None and ps.returncode == 0:
+    muttcmd.append(destok)
+else:
+    if destok is not None:
+        dest+=","+destok
+    muttcmd.append(dest)
+
+if debug:
+    print(f"{' '.join(muttcmd)}")
+
 # Emission du mail de la donnee
 if nextcloud is not None and nextauth is not None:
+    if debug:
+        print(f'Depose sur nc ${nextcloud}')
     ncsended=nextcloudput(nextcloud,nextauth,datas)
     if emptySend or ps.returncode != 0 or ncsended != 0:
         subprosend(muttcmd,datas)
     
-elif not (not emptySend and not len(datas)):
+elif (not emptySend) and not len(datas):
+#elif not (not emptySend and not len(datas)):
     subprosend(muttcmd,datas)
     if debug:
         print("Sended")
