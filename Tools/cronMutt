@@ -15,11 +15,14 @@ import getopt,sys
 import os
 import hashlib
 import subprocess
+from datetime import datetime
 
 Version="0.8.1"
 ### Todo un mode flush pour le tee
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
+### Todo rajouter header date debut + rajouter header de la commande (mais desativable par un flag)
+# 0.9 New header : date debut execution/ commande lancee / exit code
 # 0.8.1 On rajoute un header propre a cet outils sans la faute
 # 0.7 On rajoute une notion de priorite
 # 0.6 On jolieffie le from
@@ -51,6 +54,7 @@ def usage():
     print("     f:      from (si different du reply to)")
     print("     m:      message id")
     print("     e:      excute command")
+    print("     c       cache la commande du header")
     print("     t:      type du mail")
     print("     X       fonctionelle avec le mode -e xxxx, ne change pas le sujet sur exit code")
     print("     T       mode tee affiche a l'ecran")
@@ -61,7 +65,7 @@ def usage():
 
 
 try:
-    opts, args = getopt.getopt(sys.argv[1:], "hVDEi:s:d:r:f:m:e:t:XT", ["help"])
+    opts, args = getopt.getopt(sys.argv[1:], "hVDEi:s:d:r:f:m:e:ct:XT", ["help"])
 except getopt.GetoptError as err:
     print(err)  # will print something like "option -a not recognized"
     usage()
@@ -80,6 +84,7 @@ exitReact=True
 teeMode=False
 mailFrom=None
 #-e "set content_type=text/html" 
+cmdCache=False
 
 for opt,arg in opts:
     if   opt in '-h':
@@ -110,6 +115,8 @@ for opt,arg in opts:
         exitReact=False
     elif opt in '-T':
         teeMode=True
+    elif opt in '-c':
+        cmdCache=True
     
 
 if inReplyTo is None:
@@ -123,15 +130,25 @@ if "<" not in mailFrom:
         print(f"{tmp} ET {mailFrom}")
         print(f'{tmp.split("@")}')
 
+# Preparation Ouverture du mail 1/2
+muttcmd=['mutt','-e',f'my_hdr X-cronMutt: cronMutt-{Version}','-e',f'my_hdr X-cronMuttStart: {str(datetime.now())}','-e',f'my_hdr From:{mailFrom}','-e',f'my_hdr In-Reply-To: {inReplyTo}','-e',f'my_hdr Message-ID: {messageId}']
+
 
 # Ouverture du process a suivre
 errs=[]
 if cmd is not None:
+    if not cmdCache:
+        muttcmd.append('-e')
+        muttcmd.append(f'my_hdr X-cronMuttCmd: {cmd}')
+
     ps=subprocess.Popen(['/bin/sh','-c',cmd],encoding ='utf-8',
                          stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE)
     inf, errs = ps.communicate()
+
+    muttcmd.append('-e')
+    muttcmd.append(f'my_hdr X-cronMuttExitCode: {str(ps.returncode)}')
 
     if exitReact and ps.returncode != 0:
         tmp=subject
@@ -141,8 +158,10 @@ if cmd is not None:
 else:
     inf = sys.stdin
 
-# Preparation Ouverture du mail
-muttcmd=['mutt','-s',subject,'-e',f'my_hdr X-cronMutt: cronMutt-{Version}','-e',f'my_hdr From:{mailFrom}','-e',f'my_hdr In-Reply-To: {inReplyTo}','-e',f'my_hdr Message-ID: {messageId}']
+# Preparation Ouverture du mail 2/2
+muttcmd.append('-s')
+muttcmd.append(subject)
+
 if mailType is not None:
     muttcmd.append('-e')
     muttcmd.append(f'set content_type=text/{mailType}')
