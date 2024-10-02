@@ -1,0 +1,27 @@
+#!/bin/bash
+
+if [ $# != 4 ]; then
+    cat <<EOF
+Script qui permet de transferer un fichier d\'un git a un autre avec un commentaire
+
+Les parametres doivent etres mis dans l\'ordre qui suis
+    Repo Source
+    Fichier Source avec son path dans le git
+    Repo Destination
+    Fichier Destination avec son path dans le git
+EOF
+    exit 0
+fi
+
+RepoSrc=git@gitlab.santeol.com:infra/ketchup.git
+FileSrc=scripts/cronMutt
+
+RepoDst=git@github.com:adlp/Misc.git
+FileDst=Tools/cronMutt
+
+
+
+gitoune -r git@gitlab.santeol.com:infra/ketchup.git -f scripts/cronMutt -l | grep --color=never "^\*" | sed -e "s=^\* '==g" -e "s=^\(.*\) (2...-.*$=\1=g" -e "s= - = =g" | tac | while read id msg
+    do
+        gitoune -r git@gitlab.santeol.com:infra/ketchup.git -f scripts/cronMutt -G $id | gitoune -r git@github.com:adlp/Misc.git -f Tools/cronMutt -m "${msg}"
+        done
