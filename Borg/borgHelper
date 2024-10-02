@@ -8,12 +8,13 @@ import subprocess,select
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.2.1"
+Version="0.3"
 ### TODO Rajouter un helpeur de prunage (en fonction du rc file), compactage
 ### TODO Rajouter un helpeur de backupage (en fonction du rc file)
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
+# 0.3 Rajout d'un helper pour deleter une sauvegarde precise
 # 0.2.1 Semblerait que le diff soit inverse
 # 0.2 Maintenant on peiut faire un diff entre les 2 dernieres versions (en precisant rien)
 # 0.1 Premiere version (officielle) qui reagit bien a toutes les commandes
@@ -41,6 +42,8 @@ def usage(doc=None,debug=0):
         printer("       Liste les mouvements des fichiers entre le backupid et le dernier backup")
         printer("   -c Restore [-n nickname/servername] [-b backupid/last] -f file2get -w where")
         printer("       On lance la restauration")
+        printer("   -c DelBkp [-n nickname/servername] -b backupid")
+        printer("       /!\ On delete un backup sur le repo /!\ DANGER")
     elif doc in 'stats':
         printer("   -c Stats [-n server-name/nickname]")
         printer("       Affiche toutes les informations des serveurs connus")
@@ -258,6 +261,11 @@ def cmd_resto(nick,bid,ftor,where,debug=0):
         bid=getlastbkp(nick,debug=debug)[0]
     boex(nick,['extract','--exclude','*/log/*','::'+bid,ftor],rep=where,debug=debug)
 
+def cmd_delbkp(nick,bid,debug=0):
+    cfg=cfgreaded(nick,debug=debug)
+    boex(nick,['delete','::'+bid],debug=debug)
+    boex(nick,['compact','--cleanup-commits'],debug=debug)
+
 def boex(nick,arg,rep='/tmp',ret=False,debug=0):
     cfg=cfgreaded(nick,debug=debug)
     varcur=os.environ.copy()
@@ -313,7 +321,8 @@ cmd=None
 optab={ 'stats'     :'cdn',      'login'     :'cdsnkprm',
         'mount'     :'cdn',      'umount'    :'cdn',
         'lstbkp'    :'cdn',      'lstbkpfls' :'cdnb',
-        'restore'   :'cdnbfw',   'diffbkp'   :'cdnbw' }
+        'restore'   :'cdnbfw',   'diffbkp'   :'cdnbw',
+        'delbkp'    :'cdnb' }
 
 for opt,arg in opts:
     if   opt in '-h':
@@ -400,6 +409,11 @@ elif cmd in 'restore':
     if '-w' not in options.keys():
         usage(cmd)
     cmd_resto(nick,options['-b'],options['-f'],options['-w'],debug=debug)
+elif cmd in 'delbkp':
+    # printer("   -c DelBkp [-n nickname/servername] -b backupid")
+    if '-b' not in options.keys() or 'last' in options['-b']:
+        usage(cmd)
+    cmd_delbkp(nick,options['-b'],debug=debug)
 else:
     printer("Mais comment on peut en arriver la ?")
     usage()
