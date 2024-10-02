@@ -9,7 +9,7 @@ import json
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.10"
+Version="0.11"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -17,7 +17,7 @@ Version="0.10"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
-### TODO Rajouter la possibilite de preciser une clef ssh
+# 0.11 Possibilite de choisir la clef ssh
 # 0.10 Prise en compte d'une liste "d'exclusion compltementarire"
 # 0.9 Maintenant on peut faire un diff entre 2 archives specifies
 # 0.8.3 meilleure gestion interne du rapport (pour facilitee les differentes sorties et les concatenations)
@@ -185,8 +185,8 @@ def affconf(nick):
         print('**Mounted**')
     else:
         print('Not Mounted')
-    for i in cfg.keys():
-        print(f"  {i}={cfg[i]}")
+#    for i in cfg.keys():
+#        print(f"  {i}={cfg[i]}")
     
 def cmd_stats(nick=None,debug=0):
     if os.path.exists(cfgfile) and os.path.isfile(cfgfile):
@@ -541,6 +541,9 @@ def cmd_bkp(nick,debug=0):
         preBorg.append('-R')
         preBorg.append(cfg['SSH_REMFO'])
     preBorg.extend(f'-A -o VisualHostKey=no -o StrictHostKeyChecking=accept-new {cfg["SER_NAME"]}'.split(' '))
+    if 'SSH_KEY' in cfg.keys():
+        preBorg.append('-i')
+        preBorg.append(cfg['SSH_KEY'])
     if len(cfg['SSH_REMFO']) == 0:
         preBorg=None
 
