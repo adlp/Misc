@@ -12,7 +12,7 @@ import os
 import hashlib
 import subprocess
 
-Version=0.2
+Version=0.3
 
 def subprosend(cmd,datas):
     mutt=subprocess.Popen(cmd,encoding ='utf-8',
@@ -21,13 +21,6 @@ def subprosend(cmd,datas):
                          stderr=subprocess.PIPE)
     stdoutdata,stderrdata=mutt.communicate(input=datas)
 
-def retShell(cmd):
-    ps=subprocess.Popen(['/bin/sh','-c',cmd],encoding ='utf-8',
-                         stdin=subprocess.PIPE,
-                         stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE)
-    out, err = ps.communicate()
-    return(out)
 
 def version():
     print(f"Version {Version}")
@@ -42,6 +35,7 @@ def usage():
     print("     m:      message id")
     print("     e:      excute command")
     print("     t:      type du mail")
+    print("     X       fonctionelle avec le mode -e xxxx, ne change pas le sujet sur exit code")
     print("     D       debug")
     print("     h       Helpeur")
     print("     V       Version")
@@ -64,6 +58,7 @@ messageId=os.path.basename(__file__)
 cmd=None
 mailType=None
 replyTo=os.environ["LOGNAME"]
+exitReact=True
 #-e "set content_type=text/html" 
 
 for opt,arg in opts:
@@ -89,10 +84,31 @@ for opt,arg in opts:
         cmd=arg
     elif opt in '-t':
         mailType=arg
+    elif opt in '-X':
+        exitReact=False
 
 if inReplyTo is None:
     inReplyTo=hashlib.md5(subject.encode('utf-8')).hexdigest()
 
+
+# Ouverture du process a suivre
+errs=[]
+if cmd is not None:
+    ps=subprocess.Popen(['/bin/sh','-c',cmd],encoding ='utf-8',
+                         stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE)
+    inf, errs = ps.communicate()
+
+    if exitReact and ps.returncode != 0:
+        tmp=subject
+        subject="*** "+tmp
+        if debug:
+            print(f"exit={ps.returncode}")
+else:
+    inf = sys.stdin
+
+# Preparation Ouverture du mail
 muttcmd=['mutt','-s',subject,'-e',f'my_hdr From: "{replyTo}"','-e',f'my_hdr In-Reply-To: {inReplyTo}','-e',f'my_hdr Message-ID: {messageId}']
 if mailType is not None:
     muttcmd.append('-e')
@@ -100,15 +116,18 @@ if mailType is not None:
 muttcmd.append('--')
 muttcmd.append(dest)
 
-if cmd is not None:
-    inf = retShell(cmd)
-else:
-    inf = sys.stdin
 
+# Traitement des donnees
 datas=""
 for line in inf:
     datas+=line
+if cmd is not None:
+    if len(errs):
+        datas+="\n=============================================================================\n"
+        for line in errs:
+            datas+=line
 
+# Emission de la donnee
 if not (not emptySend and not len(datas)):
     subprosend(muttcmd,datas)
     if debug:
