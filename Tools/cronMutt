@@ -20,9 +20,10 @@ from datetime import datetime
 import requests
 from requests.auth import HTTPBasicAuth
 
-Version="0.18.1"
+Version="0.18.2"
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
+# 0.18.2 correction d'une coquille pour les stderr par mail
 # 0.18.1 deplacement de l'initialisation de var afin d'eviter les bug
 # 0.18 correctif si on n'a pas d'environnement
 # 0.17.4 Rajout de points de debug
@@ -255,7 +256,8 @@ for line in retstd['stdout']:
     #    print(line,end="",flush=True)
     datas+=line+"\n"
 if cmd is not None:
-    if len(errs):
+    #if len(errs):
+    if len(retstd['stderr']):
         datas+="\n=============================================================================\n"
         #for line in errs:
         for line in retstd['stderr']:
