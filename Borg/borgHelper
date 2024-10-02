@@ -9,7 +9,7 @@ import json
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.13"
+Version="0.13.1"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -17,6 +17,7 @@ Version="0.13"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.13.1 debug du diff qui suite aux evo ne marchait plus correctement en mode supra simpliste...
 # 0.13 debug de l'affichage des report (lorsque l'avail n'est pas lisible)
 # 0.12 on peut ne pas avoir la var SSH_REMFO
 # 0.11 Possibilite de choisir la clef ssh
@@ -452,13 +453,17 @@ def cmd_diffbkp(nick,bidun=None,bideux=None,debug=0):
     twodiff=getlastbkp(nick,2,debug=debug)
     if bidun is None and bideux is None:
         bidun=twodiff[0]
-        bidun=twodiff[1]
+        bideux=twodiff[1]
     elif bideux is None:
         bideux=bidun
         bidun=twodiff[1]
     if bidun == bideux:
         printer("Desole, ce sont les memes backups")
         sys.exit(1)
+
+    if debug:
+        printer(f"Compraison de {bidun} et {bideux}")
+        printer(twodiff)
 
     if bidun > bideux:
         bid=bideux
