@@ -9,7 +9,7 @@ import json
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.17"
+Version="0.17.1"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -17,6 +17,7 @@ Version="0.17"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.17.1 Bug en cours sur le stderr
 # 0.17 Refactoring code cf boex... a refaire login/reporting. Maintenant les retour des bkp ne partiront plus forcement en erreure si ce n'est que du Warning)
 # 0.16.1 pousse sur disque les retours de sauvegarde et en stdout/stderr
 # 0.16 pousse sur disque les retours de sauvegarde
@@ -295,7 +296,7 @@ def cmd_lstfiles(nick,bid,debug=0):
     sys.exit(rb['exitcode'])
 
 def cacheJsonBoexWithLM(nick,boexarg,prefix="/tmp/borgHelper-",suffix=".json",output="stdout",debug=0):
-    last_modified=json.loads(''.join(boex(nick,['info','--json'],ret=True,debug=debug)['stdout']))['repository']['last_modified']
+    last_modified=json.loads(''.join(boex(nick,['info','--json'],debug=debug)['stdout']))['repository']['last_modified']
     nomFi=prefix+nick+'-'+last_modified+suffix
     if os.path.isfile(nomFi):
         if debug:
@@ -309,7 +310,7 @@ def cacheJsonBoexWithLM(nick,boexarg,prefix="/tmp/borgHelper-",suffix=".json",ou
     else:
         if debug:
             printer("Create cache")
-        ret=json.loads('\n'.join(boex(nick,boexarg,ret=True,debug=debug)[output]))
+        ret=json.loads('\n'.join(boex(nick,boexarg,debug=debug)[output]))
         with open(nomFi,"w") as fd:
             print(json.dumps(ret,indent=4),file=fd)
             fd.close()
@@ -627,7 +628,7 @@ def cmd_bkp(nick,debug=0):
         create.extend(cfg['EXCLUDE_NEXT'].split(' '))
 
     nomFi=f"/tmp/borgHelper-bkp-{nick}.json"
-    anaRet=boex(nick,create,preBorg=preBorg,forceEnv=forceEnv,ret=True,debug=debug)
+    anaRet=boex(nick,create,preBorg=preBorg,forceEnv=forceEnv,debug=debug)
     with open(nomFi,"w") as fd:
         print(json.dumps(anaRet,indent=4),file=fd)
         fd.close()
@@ -703,6 +704,15 @@ def boex(nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True): #,g
     ret={}
     ret['stdout']=[]
     ret['stderr']=[]
+
+    if debug:
+        printer('StdOut')
+        printer(inf)
+        printer('-----------------------------------------------------------------------')
+        printer('StdErr')
+        printer(type(errs))
+        printer(errs)
+    
     if(len(inf)):
         if inf[0] in '[{' and retjson:
             ret['stdout'].append(json.loads(inf))
@@ -711,7 +721,9 @@ def boex(nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True): #,g
                 ret['stdout'].append(i)
     if(len(errs)):
         if errs[0] in '[{':
-            ret['stderr'].append(json.loads(errs))
+            for i in errs.split('\n'):
+                ret['stderr'].append(json.loads(i))
+            #ret['stderr'].append(json.loads(errs))
         else:
             for i in errs.split('\n'):
                 ret['stderr'].append(i)
