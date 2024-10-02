@@ -15,11 +15,13 @@ import getopt,sys
 import os
 import hashlib
 import subprocess
+import threading
 from datetime import datetime
 
-Version="0.14"
+Version="0.15"
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
+# 0.15 L'affichage stdout se fait en direct, on n'attends plus que le process soit execute
 # 0.14 On renvoie le meme errorcode que le programme execute en fin sys.ext
 # 0.13 On rajoute le hostname dans les entees
 # 0.12 On tete de faire de l'autodetection pour le teemode
@@ -67,6 +69,15 @@ def usage():
     print("     V       Version")
     sys.exit(123)
 
+def read_stream(stream, output_list, stream_name):
+    global teeMode
+    for line in stream:
+        output_list[stream_name].append(line.strip())
+        if teeMode:
+            if stream_name == 'stderr':
+                print("[STDERR]:",end='',flush=True)
+            print(line,end="",flush=True)
+    stream.close()
 
 try:
     opts, args = getopt.getopt(sys.argv[1:], "hVDEi:s:d:r:f:m:e:ct:XTp:", ["help"])
@@ -156,7 +167,23 @@ if cmd is not None:
                          stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE)
-    inf, errs = ps.communicate()
+
+    retstd={}
+    retstd['stdout']=[]
+    retstd['stderr']=[]
+
+    # Creation puis demarrage des threads de lecture du stdout et stderr
+    tstdout = threading.Thread(target=read_stream, args=(ps.stdout, retstd, "stdout"))
+    tstderr = threading.Thread(target=read_stream, args=(ps.stderr, retstd, "stderr"))
+    tstdout.start()
+    tstderr.start()
+
+    #Attente de la fin d'exec des thread et process (les thread affichent en tps reel)
+    tstdout.join()
+    tstderr.join()
+    ps.wait()
+
+    ###inf, errs = ps.communicate()
     exitCode=ps.returncode
 
     muttcmd.append('-e')
@@ -186,19 +213,20 @@ muttcmd.append(dest)
 if debug:
     print(f"{' '.join(muttcmd)}")
 
-
 # Traitement des donnees
 datas=""
-for line in inf:
-    if teeMode:
-        print(line,end="",flush=True)
+#for line in inf:
+for line in retstd['stdout']:
+    #if teeMode:
+    #    print(line,end="",flush=True)
     datas+=line
 if cmd is not None:
     if len(errs):
         datas+="\n=============================================================================\n"
-        for line in errs:
-            if teeMode:
-                print(line,end="",flush=True)
+        #for line in errs:
+        for line in retstd['stderr']:
+            #if teeMode:
+            #    print(line,end="",flush=True)
             datas+=line
 
 # Emission de la donnee
