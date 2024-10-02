@@ -9,7 +9,7 @@ import json
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.13.1"
+Version="0.14"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -17,6 +17,7 @@ Version="0.13.1"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.14 boexec renvoie un dico stdout/stderr... et cela est pris en compte hein...
 # 0.13.1 debug du diff qui suite aux evo ne marchait plus correctement en mode supra simpliste...
 # 0.13 debug de l'affichage des report (lorsque l'avail n'est pas lisible)
 # 0.12 on peut ne pas avoir la var SSH_REMFO
@@ -259,7 +260,7 @@ def cmd_lstbkp(nick,debug=0):
 
 def getlastbkp(nick,nbl=1,debug=0):
     cfg=cfgreaded(nick,debug=debug)
-    lines=boex(nick,['list','--glob-archives',cfg['GLOB_ARCH']],ret=True,debug=debug)
+    lines=boex(nick,['list','--glob-archives',cfg['GLOB_ARCH']],ret=True,debug=debug)['stdout']
     ret=[]
     for i in range(nbl*-1,0):
         ret.append(lines[i].split(' ')[0])
@@ -279,7 +280,7 @@ def prep_report(nick,debug=0,maxp=None):
     for i in cmd_prune(nick,dryrun=True,debug=debug):
         if 'Would prune:' in i:
             pruneme.append(((re.sub(r'( )*',r'\1',i)).split(' '))[2])
-    r=json.loads('\n'.join(boex(nick,['info','--json','--glob-archives',cfg['GLOB_ARCH']],ret=True,debug=debug)))
+    r=json.loads('\n'.join(boex(nick,['info','--json','--glob-archives',cfg['GLOB_ARCH']],ret=True,debug=debug)['stdout']))
     #print(r)
 
     resume={}
@@ -513,7 +514,7 @@ def cmd_prune(nick,dryrun=False,debug=0):
         else:
             cmd.append('--stats')
         cmd.extend(f'--save-space --info --list --glob-archives={cfg["GLOB_ARCH"]}'.split(' '))
-        ret=boex(nick,cmd,ret=dryrun,debug=debug,getStdErr=True)
+        ret=boex(nick,cmd,ret=dryrun,debug=debug)['stderr']
         if not dryrun:
             boex(nick,['compact','--cleanup-commits'],debug=debug)
         else:
@@ -568,8 +569,9 @@ def cmd_bkp(nick,debug=0):
         create.extend(cfg['EXCLUDE_NEXT'].split(' '))
 
     boex(nick,create,preBorg=preBorg,forceEnv=forceEnv,debug=debug)
-    
-def boex(nick,arg,rep=None,ret=False,debug=0,preBorg=None,forceEnv=None,getStdErr=False):
+
+
+def boex(nick,arg,rep=None,ret=False,debug=0,preBorg=None,forceEnv=None): #,getStdErr=False):
     cfg=cfgreaded(nick,debug=debug)
     varcur=os.environ.copy()
     varfut={}
@@ -612,10 +614,11 @@ def boex(nick,arg,rep=None,ret=False,debug=0,preBorg=None,forceEnv=None,getStdEr
                          stderr=subprocess.PIPE)
     inf, errs = ps.communicate()
     if ret:
-        if getStdErr:
-            return(''.join(errs).splitlines())
-        else:
-            return(''.join(inf).splitlines())
+        return({'stdout':''.join(inf).splitlines(), 'stderr': ''.join(errs).splitlines() })
+#        if getStdErr:
+#            return(''.join(errs).splitlines())
+#        else:
+#            return(''.join(inf).splitlines())
     else:
         for line in inf:
             print(line,end='',flush=True)
