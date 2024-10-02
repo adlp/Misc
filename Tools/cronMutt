@@ -17,11 +17,10 @@ import hashlib
 import subprocess
 from datetime import datetime
 
-Version="0.12"
-### Todo un mode flush pour le tee
+Version="0.14"
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
-### Todo rajouter header date debut + rajouter header de la commande (mais desativable par un flag)
+# 0.14 On renvoie le meme errorcode que le programme execute en fin sys.ext
 # 0.13 On rajoute le hostname dans les entees
 # 0.12 On tete de faire de l'autodetection pour le teemode
 # 0.11 On gere les pb de caracteres space de microsoft
@@ -147,6 +146,7 @@ muttcmd=['mutt','-e',f'my_hdr X-cronMutt: cronMutt-{Version}','-e',f'my_hdr X-cr
 
 # Ouverture du process a suivre
 errs=[]
+exitCode=0
 if cmd is not None:
     if not cmdCache:
         muttcmd.append('-e')
@@ -157,6 +157,7 @@ if cmd is not None:
                          stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE)
     inf, errs = ps.communicate()
+    exitCode=ps.returncode
 
     muttcmd.append('-e')
     muttcmd.append(f'my_hdr X-cronMuttExitCode: {str(ps.returncode)}')
@@ -208,3 +209,5 @@ if not (not emptySend and not len(datas)):
 
 if debug:
     print(len(datas))
+
+sys.exit(exitCode)
