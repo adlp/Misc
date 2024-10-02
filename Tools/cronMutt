@@ -12,7 +12,7 @@ import os
 import hashlib
 import subprocess
 
-Version=0.3
+Version=0.4
 
 def subprosend(cmd,datas):
     mutt=subprocess.Popen(cmd,encoding ='utf-8',
@@ -32,10 +32,12 @@ def usage():
     print("     s:      Mail subject")
     print("     d:      Destination email")
     print("     r:      ReplyTo")
+    print("     f:      from (si different du reply to)")
     print("     m:      message id")
     print("     e:      excute command")
     print("     t:      type du mail")
     print("     X       fonctionelle avec le mode -e xxxx, ne change pas le sujet sur exit code")
+    print("     T       mode tee affiche a l'ecran")
     print("     D       debug")
     print("     h       Helpeur")
     print("     V       Version")
@@ -43,7 +45,7 @@ def usage():
 
 
 try:
-    opts, args = getopt.getopt(sys.argv[1:], "hVDEi:s:d:r:m:e:t:", ["help"])
+    opts, args = getopt.getopt(sys.argv[1:], "hVDEi:s:d:r:f:m:e:t:XT", ["help"])
 except getopt.GetoptError as err:
     print(err)  # will print something like "option -a not recognized"
     usage()
@@ -59,6 +61,8 @@ cmd=None
 mailType=None
 replyTo=os.environ["LOGNAME"]
 exitReact=True
+teeMode=False
+mailFrom=None
 #-e "set content_type=text/html" 
 
 for opt,arg in opts:
@@ -76,6 +80,8 @@ for opt,arg in opts:
         subject=arg
     elif opt in "-d":
         dest=arg
+    elif opt in '-f':
+        mailFrom=arg
     elif opt in "-r":
         replyTo=arg
     elif opt in "-m":
@@ -86,9 +92,14 @@ for opt,arg in opts:
         mailType=arg
     elif opt in '-X':
         exitReact=False
+    elif opt in '-T':
+        teeMode=True
+    
 
 if inReplyTo is None:
     inReplyTo=hashlib.md5(subject.encode('utf-8')).hexdigest()
+if mailFrom is None:
+    mailFrom=replyTo
 
 
 # Ouverture du process a suivre
@@ -109,7 +120,7 @@ else:
     inf = sys.stdin
 
 # Preparation Ouverture du mail
-muttcmd=['mutt','-s',subject,'-e',f'my_hdr From: "{replyTo}"','-e',f'my_hdr In-Reply-To: {inReplyTo}','-e',f'my_hdr Message-ID: {messageId}']
+muttcmd=['mutt','-s',subject,'-e',f'my_hdr From: "{mailFrom}"','-e',f'my_hdr In-Reply-To: {inReplyTo}','-e',f'my_hdr Message-ID: {messageId}']
 if mailType is not None:
     muttcmd.append('-e')
     muttcmd.append(f'set content_type=text/{mailType}')
@@ -120,11 +131,15 @@ muttcmd.append(dest)
 # Traitement des donnees
 datas=""
 for line in inf:
+    if teeMode:
+        print(line)
     datas+=line
 if cmd is not None:
     if len(errs):
         datas+="\n=============================================================================\n"
         for line in errs:
+            if teeMode:
+                print(line)
             datas+=line
 
 # Emission de la donnee
