@@ -17,11 +17,12 @@ import hashlib
 import subprocess
 from datetime import datetime
 
-Version="0.9"
+Version="0.11"
 ### Todo un mode flush pour le tee
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
 ### Todo rajouter header date debut + rajouter header de la commande (mais desativable par un flag)
+# 0.11 On gere les pb de caracteres space de microsoft
 # 0.10 Pipe mode fonctionnelle : on flush
 # 0.9 New header : date debut execution/ commande lancee / exit code
 # 0.8.1 On rajoute un header propre a cet outils sans la faute
@@ -58,6 +59,7 @@ def usage():
     print("     c       cache la commande du header")
     print("     t:      type du mail")
     print("     X       fonctionelle avec le mode -e xxxx, ne change pas le sujet sur exit code")
+    print("     p:      code Page encoding (default: utf8 / ISO-8859–16)")
     print("     T       mode tee affiche a l'ecran")
     print("     D       debug")
     print("     h       Helpeur")
@@ -66,7 +68,7 @@ def usage():
 
 
 try:
-    opts, args = getopt.getopt(sys.argv[1:], "hVDEi:s:d:r:f:m:e:ct:XT", ["help"])
+    opts, args = getopt.getopt(sys.argv[1:], "hVDEi:s:d:r:f:m:e:ct:XTp:", ["help"])
 except getopt.GetoptError as err:
     print(err)  # will print something like "option -a not recognized"
     usage()
@@ -86,6 +88,7 @@ teeMode=False
 mailFrom=None
 #-e "set content_type=text/html" 
 cmdCache=False
+encoding="utf-8"
 
 for opt,arg in opts:
     if   opt in '-h':
@@ -118,6 +121,8 @@ for opt,arg in opts:
         teeMode=True
     elif opt in '-c':
         cmdCache=True
+    elif opt in '-p':
+        encoding=arg
     
 
 if inReplyTo is None:
@@ -142,7 +147,7 @@ if cmd is not None:
         muttcmd.append('-e')
         muttcmd.append(f'my_hdr X-cronMuttCmd: {cmd}')
 
-    ps=subprocess.Popen(['/bin/sh','-c',cmd],encoding ='utf-8',
+    ps=subprocess.Popen(['/bin/sh','-c',cmd],encoding =encoding,
                          stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE)
