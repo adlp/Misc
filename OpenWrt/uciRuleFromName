@@ -17,12 +17,7 @@ getrulstat() {
 
 case "$1" in
     -l)
-        if [ $# -ne 1 ]; then
-            gre=" grep -i $2 "
-        else
-            gre=" cat "
-        fi
-        uci show firewall | grep -E "\@rule.*.name" | cut -d"'" -f2 | $gre | while read nom
+        uci show firewall | grep -E "\@rule.*.name" | cut -d"'" -f2 | grep ${2:+-i} "${2:-^}" | while read nom
             do
                 echo -ne "$nom:\t"
                 $0 -g "${nom}"
