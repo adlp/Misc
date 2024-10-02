@@ -112,6 +112,9 @@ if mailFrom is None:
 if "<" not in mailFrom:
     tmp=mailFrom
     mailFrom=f'{tmp.split("@")[0]} <{tmp}>'
+    if debug:
+        print(f"{tmp} ET {mailFrom}")
+        print(f'{tmp.split("@")}')
 
 
 # Ouverture du process a suivre
@@ -132,12 +135,15 @@ else:
     inf = sys.stdin
 
 # Preparation Ouverture du mail
-muttcmd=['mutt','-s',subject,'-e',f'my_hdr From: "{mailFrom}"','-e',f'my_hdr In-Reply-To: {inReplyTo}','-e',f'my_hdr Message-ID: {messageId}']
+muttcmd=['mutt','-s',subject,'-e',f'my_hdr From:{mailFrom}','-e',f'my_hdr In-Reply-To: {inReplyTo}','-e',f'my_hdr Message-ID: {messageId}']
 if mailType is not None:
     muttcmd.append('-e')
     muttcmd.append(f'set content_type=text/{mailType}')
 muttcmd.append('--')
 muttcmd.append(dest)
+
+if debug:
+    print(f"{' '.join(muttcmd)}")
 
 
 # Traitement des donnees
