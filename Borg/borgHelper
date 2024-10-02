@@ -9,7 +9,7 @@ import json
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.17.2"
+Version="0.17.3"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -17,6 +17,7 @@ Version="0.17.2"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.17.3 Retire la variable ret pour la petite prune
 # 0.17.2 Bug corrige pour les backup... en esperant que pour le reste ca soit green (car la on pallie aux cochonneries de borg himself)
 # 0.17.1 Bug en cours sur le stderr
 # 0.17 Refactoring code cf boex... a refaire login/reporting. Maintenant les retour des bkp ne partiront plus forcement en erreure si ce n'est que du Warning)
@@ -572,7 +573,7 @@ def cmd_prune(nick,dryrun=False,debug=0):
         else:
             cmd.append('--stats')
         cmd.extend(f'--save-space --info --list --glob-archives={cfg["GLOB_ARCH"]}'.split(' '))
-        ret=boex(nick,cmd,ret=dryrun,debug=debug)['stderr']
+        ret=boex(nick,cmd,debug=debug)['stderr']
         if not dryrun:
             rb=boex(nick,['compact','--cleanup-commits'],debug=debug)
             print(rb)
