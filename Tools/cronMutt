@@ -7,14 +7,19 @@
 # on peut programmer le a qui con repond et le message id  ( -r / -m )
 # ca peut etre lui le lanceur il n'est pas que piped Et ainsi on peut recuperer le stderr (-e '')
 
+### Pour les version python anterieur a 3.6
+### pip install future-fstrings
+### -*- coding: future_fstrings -*-
+
 import getopt,sys
 import os
 import hashlib
 import subprocess
 
-Version=0.6
+Version=0.7
 ### Todo un mode flush pour le tee
 ### Tofo intercepter le keyboard interrupt
+# 0.7 On rajoute une notion de priorite
 # 0.6 On jolieffie le from
 # 0.5 en mode tee, on ne saute pas de lignes
 # 0.4 Activation du X (no sub chg), Ajout du changement du from, Ajout du tee mode (dump en meme temps que mail le stdout et stderr)
@@ -139,6 +144,9 @@ muttcmd=['mutt','-s',subject,'-e',f'my_hdr From:{mailFrom}','-e',f'my_hdr In-Rep
 if mailType is not None:
     muttcmd.append('-e')
     muttcmd.append(f'set content_type=text/{mailType}')
+if ps.returncode != 0:
+    muttcmd.append('-e')
+    muttcmd.append(f'my_hdr X-Priority:1')
 muttcmd.append('--')
 muttcmd.append(dest)
 
