@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+
+import getopt,sys,os
+import socket
+import configparser
+import subprocess,select
+
+
+cfgfile="/root/.borghelperrc"
+
+Version="0.1"
+# 0.1 Premiere version (officielle) qui reagit bien a toutes les commandes
+
+
+def version():
+    print(f"Version {Version}")
+    sys.exit(0)
+
+def usage(doc=None,debug=0):
+    if doc is None:
+        printer("   -H <Stats|Login|Mount|UMount|ListBkp|ListBkpFiles|Restore>")
+        printer("       Permet d'avoir les documentations detaillés des differentes commandes")
+        printer("   -c Stats [-n server-name/nickname]")
+        printer("       Liste les backup references, et le fait qu'ils soient mount ou pas")
+        printer("   -c Login [-s servername] [-n nickname] [-k keyfile.key] -p passphrase -r repo -m mountpoint")
+        printer("       n se log sur le serveur, utilise que si le serveur n'est pas referencé")
+        printer("   -c <Mount|UMount> [-n nickname/servername]")
+        printer("       On monte et on demonte le FS (BIEN Penser a demonter !!!)")
+        printer("   -c LstBkp [-n nickname/servername]")
+        printer("       On liste les backup connus")
+        printer("   -c LstBkpFls [-n nickname/servername] [-b backupid/last]")
+        printer("       On liste les fichiers d'un backup precis")
+        printer("   -c DiffBkp [-n nickname/servername] -b backupid [-w where]")
+        printer("       Liste les mouvements des fichiers entre le backupid et le dernier backup")
+        printer("   -c Restore [-n nickname/servername] [-b backupid/last] -f file2get -w where")
+        printer("       On lance la restauration")
+    elif doc in 'stats':
+        printer("   -c Stats [-n server-name/nickname]")
+        printer("       Affiche toutes les informations des serveurs connus")
+        printer("           Sans parametre listera tout")
+        printer("           Avec parametre donnera le detail d'un serveur")
+    elif doc in 'login':
+        printer("   -c Login [-s servername] [-n nickname] [-k keyfile.key] -p passphrase -r repo")
+        printer("       Integre le serveur dans borgHelper")
+        printer("           servername  : le nom du serveur, sert de filtre pour lister les backups, sinon srv local")
+        printer("           nickname    : nom apparant du serveur, permet pour un  serveur d'avoir plusieur repo")
+        printer("           keyfile     : le fichier de clefs")
+        printer("           passpharse  : le mot de passe d'acces au repo")
+        printer("           repo        : l'addresse du repo")
+    elif doc in 'mount':
+        printer("   -c Mount [-n nickname/servername]")
+        printer("       Rend accessible les sauvegarde dans un repertoire visible via la commande Stat ou affiche en fin de mount")
+        printer("       A utiliser rarement, car tant que le repo est monté, on ne peut plus backuper")
+        printer("           si -n non precisé alores on travaille avec le serveur courant")
+        printer("           nickname    : Le nom de l'enregistrement du serveur")
+    elif doc in 'umount':
+        printer("   -c UMount [-n nickname/servername]")
+        printer("       Coupe cet acces")
+        printer("           si -n non precisé alores on travaille avec le serveur courant")
+        printer("           nickname    : Le nom de l'enregistrement du serveur")
+    elif doc in 'lstbkp':
+        printer("   -c ListBkp [-n nickname/servername]")
+        printer("       Liste les backup (backupid) disponibles")
+        printer("           si -n non precisé alores on travaille avec le serveur courant")
+        printer("           nickname    : Le nom de l'enregistrement du serveur")
+    elif doc in 'listbkpfls':
+        printer("   -c LstBkpFls [-n nickname/servername] -b backupid")
+        printer("       Liste les fichiers disponibles dans le backup backupid")
+        printer("           si -n non precisé alores on travaille avec le serveur courant")
+        printer("           nickname    : Le nom de l'enregistrement du serveur")
+        printer("           backupid    : Le nom du backup interessant")
+    elif doc in 'diffbkp':
+        printer("   -c DiffBkp [-n nickname/servername] -b backupid [-w where]")
+        printer("       Liste les mouvements des fichiers entre le backupid et le dernier backup")
+        printer("           backupid    : Le nom du backup interessant")
+        printer("           where       : Repertoire de filtre")
+    elif doc in 'restore':
+        printer("   -c Restore [-n nickname/servername] -b backupid -f file2get -w where")
+        printer("       Restaure l'arbo (ou fichier) file2berestored depuis le backup backupid dans l'emplacement where")
+        printer("           si -n non precisé alores on travaille avec le serveur courant")
+        printer("           nickname    : Le nom de l'enregistrement du serveur")
+        printer("           backupid    : Le nom du backup interessant")
+        printer("           file2get    : Le nom du fichier ou de l'arbo a recuperer")
+        printer("           where       : Repertoire de restauration")
+    else:
+        printer(f"  Desole pas de documation pour la commande {doc}")
+
+    sys.exit(1)
+
+def printer(data,debug=0):
+    print(data,file=sys.stderr)
+
+def cfgread(nick,debug=0):
+    #BORG_REPO #BORG_PASSPHRASE #BORG_RELOCATED_REPO_ACCESS_IS_OK
+    #GLOB_ARCH #SER_NAME #NICK
+    if os.path.exists(cfgfile) and os.path.isfile(cfgfile):
+        config= configparser.ConfigParser()   
+        config.optionxform=str
+        config.read(cfgfile)
+        if nick not in config.keys():
+            return(None)
+        else:
+            #pretab={}
+            #for i in config[nick].keys():
+            #    printer(i)
+            #    printer(config[nick][i])
+            #    pretab[i]=config[nick][i]
+            #printer("show must go on")
+            #return(pretab)
+            return(config[nick])
+    else:
+        return(None)
+
+def cfgreaded(nick,debug=0):
+    cfg=cfgread(nick,debug=debug)
+    if cfg is None:
+        printer("Ce serveur est inconnu")
+        sys.exit(3)
+    return(cfg)
+
+
+def cfgwrite(nick,serna,passphrase,repo,mountpoint,debug=0):
+    config= configparser.ConfigParser()
+    config.optionxform=str
+    config.read(cfgfile)
+
+    config[nick]={}
+    config[nick]['BORG_REPO']=repo
+    config[nick]['BORG_PASSPHRASE']=passphrase
+    config[nick]['SER_NAME']=serna
+    config[nick]['GLOB_ARCH']=serna+'-root-*'
+    if mountpoint is None:
+        config[nick]['MOUNTPOINT']="/mnt/borg/"+nick
+    else:
+        config[nick]['MOUNTPOINT']=mountpoint
+
+    with open(cfgfile, 'w') as fd:
+        config.write(fd)
+        fd.close()
+
+def affconf(nick):
+    cfg=cfgreaded(nick)
+    print(nick+': ',end='')
+    if mountedornot(cfg['MOUNTPOINT'],debug=debug):
+        print('**Mounted**')
+    else:
+        print('Not Mounted')
+    for i in cfg.keys():
+        print(f"  {i}={cfg[i]}")
+    
+def cmd_stats(nick=None,debug=0):
+    if os.path.exists(cfgfile) and os.path.isfile(cfgfile):
+        config= configparser.ConfigParser()   
+        config.optionxform=str
+        config.read(cfgfile)
+        if nick is None:
+            for n in config.keys():
+                if n in 'DEFAULT':
+                    continue
+                affconf(n)
+        elif nick in config.keys():
+            affconf(nick)
+        else:
+            print(f'{nick} pas trouvé dans {cfgfile}')
+            sys.exit(1)
+    else:
+        printer(f'Fichier {cfgfile} absent')
+        sys.exit(2)
+
+
+def cmd_login(serna,nick,keyfile,passphrase,repo,mountpoint,debug=0):
+    cfgwrite(nick,serna,passphrase,repo,mountpoint,debug=debug)
+    cfg=cfgread(nick,debug=debug)
+    if keyfile is not None:
+        if os.path.exists(keyfile) and os.path.isfile(keyfile):
+            boex(nick,['key','import',repo,keyfile],debug=debug)
+        else:
+            printer("Fichier "+keyfile+" absent, Mais attention, machine "+nick+" integre")
+            sys.exit(2)
+
+def mountedornot(mountpoint,debug=0):
+    founded=False
+    if debug:
+        printer(f' On control {mountpoint}')
+    with open('/proc/mounts') as fd:
+        while (line := fd.readline()) and not founded:
+            if mountpoint in line:
+                founded=True
+        fd.close()
+    return(founded)
+
+def cmd_mount(nick,debug=0):
+    cfg=cfgreaded(nick)
+
+    if os.path.exists(cfg['MOUNTPOINT']) and os.path.isdir(cfg['MOUNTPOINT']) and len(os.listdir(cfg['MOUNTPOINT'])) == 0:
+        if(not mountedornot(cfg['MOUNTPOINT'],debug=debug)):
+            boex(nick,['mount','--glob-archives',cfg['GLOB_ARCH'],cfg['BORG_REPO'],cfg['MOUNTPOINT']],debug=debug)
+        else:
+            printer('Deja monte')
+            sys.exit(3)
+    else:
+        printer("Il faut que le repertoire "+cfg['MOUNTPOINT']+" existe et soit vide!")
+        sys.exit(2)
+
+def cmd_umount(nick,debug=0):
+    cfg=cfgreaded(nick,debug=debug)
+    if(mountedornot(cfg['MOUNTPOINT'],debug=debug)):
+        boex(nick,['umount',cfg['MOUNTPOINT']],debug=debug)
+    else:
+        printer('Pas monte')
+        sys.exit(3)
+
+def cmd_lstbkp(nick,debug=0):
+    cfg=cfgreaded(nick,debug=debug)
+    boex(nick,['list','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+
+def getlastbkp(nick,debug=0):
+    cfg=cfgreaded(nick,debug=debug)
+    lines=boex(nick,['list','--glob-archives',cfg['GLOB_ARCH']],ret=True,debug=debug)
+    return(lines[-1].split(' ')[0])
+
+def cmd_lstfiles(nick,bid,debug=0):
+    cfg=cfgreaded(nick,debug=debug)
+    if bid is None:
+        bid=getlastbkp(nick,debug=debug)
+    boex(nick,['list','--glob-archives',cfg['GLOB_ARCH'],'::'+bid],debug=debug)
+
+def cmd_diffbkp(nick,bid,where,debug=0):
+    cfg=cfgreaded(nick,debug=debug)
+    ladiff=getlastbkp(nick,debug=debug)
+    if ladiff==bid:
+        printer("Desole, ce sont les memes backups")
+        sys.exit(1)
+
+    arg=['diff',f"{cfg['BORG_REPO']}::{bid}", ladiff]
+    if where is not None:
+        arg.append(where)
+
+    boex(nick,arg,debug=debug)
+
+def cmd_resto(nick,bid,ftor,where,debug=0):
+    cfg=cfgreaded(nick,debug=debug)
+    if bid is None:
+        bid=getlastbkp(nick,debug=debug)
+    boex(nick,['extract','--exclude','*/log/*','::'+bid,ftor],rep=where,debug=debug)
+
+def boex(nick,arg,rep='/tmp',ret=False,debug=0):
+    cfg=cfgreaded(nick,debug=debug)
+    varcur=os.environ.copy()
+    varfut={}
+    for k in list(cfg.keys()):
+        if k in ['BORG_REPO','BORG_PASSPHRASE','BORG_REMOTE_PATH','BORG_RSH','BORG_SHOW_SYSINFO','BORG_RELOCATED_REPO_ACCESS_IS_OK']:
+            varfut[k]=cfg[k]
+
+    commande=['borg']
+    commande.extend(arg)
+    varfut['PATH']=varcur['PATH']
+    if debug:
+        for k in varfut:
+            printer(f' {k}={varfut[k]}')
+        printer(f"+{rep}")
+        printer(commande)
+        printer(f"{' '.join(commande)}")
+        printer(f"+{rep} >{' '.join(commande)}")
+        if arg[1] in "extract":
+            sys.exit(4)
+    ps=subprocess.Popen(commande,encoding ='utf-8',
+                         env=varfut,cwd=rep,bufsize=8192,
+                         stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE)
+    inf, errs = ps.communicate()
+    if ret:
+        return(''.join(inf).splitlines())
+    else:
+        for line in inf:
+            print(line,end='')
+        if len(errs):
+            print(f'\n===================({ps.returncode})=======================================\n')
+            for line in errs:
+                print(line,end="")
+    
+        if ps.returncode != 0:
+            sys.exit(ps.returncode)
+
+
+######### Analyse Arguments
+
+try:
+    opts, args = getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:f:w:dv", ["help"])
+except getopt.GetoptError as err:
+    print(err)  # will print something like "option -a not recognized"
+    usage()
+    sys.exit(2)
+
+debug=0
+cmd=None
+
+optab={ 'stats'     :'cdn',      'login'     :'cdsnkprm',
+        'mount'     :'cdn',      'umount'    :'cdn',
+        'lstbkp'    :'cdn',      'lstbkpfls' :'cdnb',
+        'restore'   :'cdnbfw',   'diffbkp'   :'cdnbw' }
+
+for opt,arg in opts:
+    if   opt in '-h':
+        usage()
+    elif opt in '-H':
+        usage(arg.lower())
+    elif opt in '-c':
+        cmd=arg.lower()
+    elif opt in '-d':
+        debug+=1
+    elif opt in '-v':
+        version()
+        
+
+if cmd is None or cmd not in optab.keys():
+    usage()
+# On part du principe que usage(xxx) quitte avec un exitcode
+
+options={}
+nick=socket.gethostname()
+
+for opt,arg in opts:
+    if opt[1] not in optab[cmd]:
+        printer("step2"+opt[1])
+        usage(cmd)
+    else:
+        options[opt]=arg
+    if opt in '-n':
+        nick=arg
+
+
+if   cmd in 'stats':
+    if '-n' in options.keys():
+        cmd_stats(nick)
+    else:
+        cmd_stats()
+elif cmd in 'login':
+    # TODO blocquer si mounted
+    # printer("-c Login [-s servername] [-n nickname] [-k keyfile.key] -p passphrase -r repo")
+    if '-s' not in options.keys():
+        serna=socket.gethostname()
+    else:
+        serna=options['-s']
+    if '-n' not in options.keys():
+        nick=serna
+    if '-k' not in options.keys():
+        options['-k']=None
+    if '-p' not in options.keys():
+        printer('p')
+        usage(cmd)
+    if '-r' not in options.keys():
+        printer('r')
+        usage(cmd)
+    if '-m' not in options.keys():
+        options['-m']=None
+    cmd_login(serna,nick,options['-k'],options['-p'],options['-r'],options['-m'],debug=debug)
+elif cmd in 'mount':
+    # printer("-c Mount [-n nickname/servername]")
+    cmd_mount(nick,debug=debug)
+elif cmd in 'umount':
+    # printer("-c UMount [-n nickname/servername]")
+    cmd_umount(nick,debug=debug)
+elif cmd in 'lstbkp':
+    # printer("-c LstBkp [-n nickname/servername]")
+    cmd_lstbkp(nick,debug=debug)
+elif cmd in 'lstbkpfls':
+    # printer("-c LstBkpFls [-n nickname/servername] [-b backupid/last]")
+    if '-b' not in options.keys() or 'last' in options['-b']:
+        options['-b']=None
+    cmd_lstfiles(nick,options['-b'],debug=debug)
+elif cmd in 'diffbkp':
+    # printer("-c DiffBkp [-n nickname/servername] -b backupid -w where")
+    if '-b' not in options.keys():
+        usage(cmd)
+    if '-w' not in options.keys():
+        options['-w']=None
+    cmd_diffbkp(nick,options['-b'],options['-w'],debug=debug)
+elif cmd in 'restore':
+    # printer("-c Restore [-n nickname/servername] [-b backupid/last] -f file2get -w where")
+    if '-b' not in options.keys() or 'last' in options['-b']:
+        options['-b']=None
+    if '-f' not in options.keys():
+        usage(cmd)
+    if '-w' not in options.keys():
+        usage(cmd)
+    cmd_resto(nick,options['-b'],options['-f'],options['-w'],debug=debug)
+else:
+    printer("Mais comment on peut en arriver la ?")
+    usage()
