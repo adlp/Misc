@@ -606,6 +606,20 @@ def cmd_bkp(nick,debug=0):
     print('\n'.join(anaRet['stderr']),file=sys.stderr,flush=True)
     sys.exit(anaRet['exitcode'])
 
+def cmd_poc(nick,debug=0):
+    nomFi=f"/tmp/borgHelper-bkp-{nick}.json"
+    caTxt=""
+    with open(nomFi,'r') as fd:
+        for line in fd:
+            caTxt+=line #.replace('"',"'")
+        fd.close()
+    ret=json.loads(caTxt)
+    #pouff=json.loads('\n'.join(ret['stderr']))
+    #print(json.dumps(pouff,indent=4))
+    #print(json.dumps(ret['stderr'][1],indent=4))
+    #print(ret['stderr'])
+
+
 def boex(nick,arg,rep=None,ret=False,debug=0,preBorg=None,forceEnv=None): #,getStdErr=False):
     cfg=cfgreaded(nick,debug=debug)
     varcur=os.environ.copy()
@@ -679,7 +693,8 @@ optab={ 'stats'     :'cdn',      'login'     :'cdsnkprm',
         'lstbkp'    :'cdn',      'lstbkpfls' :'cdnb',
         'restore'   :'cdnbfw',   'diffbkp'   :'cdnbw',
         'delbkp'    :'cdnb',     'bkp'       :'cdn',
-        'prune'     :'cdn',      'report'    :'cdnb' }
+        'prune'     :'cdn',      'report'    :'cdnb',
+        'poc'       :'cdn',}
 
 for opt,arg in opts:
     if   opt in '-h':
@@ -802,6 +817,8 @@ elif cmd == 'bkp':
 elif cmd == 'prune':
     # printer("   -c Prune [-n nickname/servername]")
     cmd_prune(nick,debug=debug)
+elif cmd == 'poc':
+    cmd_poc(nick,debug=debug)
 else:
     printer("Mais comment on peut en arriver la ?")
     usage()
