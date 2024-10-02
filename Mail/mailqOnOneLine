@@ -1,0 +1,183 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Data::Dumper;
+use Getopt::Long;
+
+sub trait1msqid {
+    my ($id,$tab,$del,$hol,$log,$rq)=@_;
+    
+    print $id.";Resume;".$$tab{"Received"}.";".$$tab{"From"}.";".$$tab{"sender"}.";".$$tab{"To"}.";".$$tab{"Date"}.";".$$tab{"Subject"}."\n";
+    if(defined($log)) {
+        ###if(open(LOG,"</var/log/mail.log")) {
+        if(open(LOG,"grep $id /var/log/mail.log | tail -n 2 |")) { 
+            while(<LOG>) { if(/$id/) { print "$id;Log;$_"; } }
+            close(LOG);
+            }
+        }
+    if( (defined($del) and open(FR,"/usr/sbin/postsuper -d $id 2>/dev/null |"))
+      or(defined($rq)  and open(FR,"/usr/sbin/postsuper -r $id 2>/dev/null |"))
+      or(defined($hol) and open(FR,"/usr/sbin/postsuper -h $id 2>/dev/null |")) ) {
+        while(<FR>) {}
+        close(FR);
+        }
+    }
+
+sub getheader {
+    my ($ret,$msgid)=@_;
+    my $cont=1;
+    my $totest;
+    my $ligne;
+    my @toget=("From","To","Date","Subject","sender");
+
+    $$ret{Received}="";
+    if(open(FR,"/usr/sbin/postcat -q $msgid 2>/dev/null |")) {
+        while($cont and $ligne=<FR>) {
+            if($ligne =~ /^$/) { $cont=0; }
+            ###elsif($ligne =~ /^Received: from / and !($ligne =~ /localhost/)) {
+            elsif($ligne =~ /^Received: from / and !($ligne =~ /\(localhost \[127\.0\.0\.1]\)/)) {
+                chomp($ligne);
+                $ligne=~ s/^Received: from //g;
+                $$ret{Received}=$ligne;
+                }
+            else {
+                foreach $totest (@toget) {
+                    if($ligne =~ /^$totest: / and !defined($$ret{$totest})) { 
+                        chomp($ligne);
+                        $ligne=~ s/^$totest: //g;
+                        $$ret{$totest}=$ligne;
+                        }
+                    }
+                }
+            }
+        close(FR);
+        }
+    if($$ret{Received} eq "") { $$ret{Received}="localhost"; }
+    foreach(@toget) { if(!defined($$ret{$_})) { $$ret{$_}=""; } }
+    }
+
+sub testheader {
+    my ($regex,$chaine)=@_;
+    my $ret;
+
+    if(defined($regex)) {
+        if($chaine =~ /$regex/i)    { $ret=1; }
+        else                        { $ret=0; }
+        }
+    else                            { $ret=1; }
+
+    return($ret);
+    }
+
+sub dossomstat {
+    my ($res,$id,$val)=@_;
+    my $filtre;
+
+    foreach $filtre (("Received","To","From","sender")) {
+        if(defined($$val{$filtre})) {   # FIXME Coder l'integration des msgID
+            if(!defined($$res{$filtre}{$$val{$filtre}}{Nb})) {
+                $$res{$filtre}{$$val{$filtre}}{Nb}=1;
+                }
+            else {
+                $$res{$filtre}{$$val{$filtre}}{Nb}++;
+                }
+            }
+        }
+    }
+
+open(MQ,"mailq 2>/dev/null |") or die "Impossible d'ouvrir la mailq...\n";
+
+my $precline=<MQ>;
+$precline="";
+my %tab;
+my ($suitetrait,$id);
+my @null;
+my %cou;
+my %resstat;
+my ($stat,$help,$SMTP,$FoT,$From,$To,$Sender);
+my ($actdel,$acthol,$Log,$actrq);
+GetOptions('Stat' => \$stat,'help' =>\$help,'SMTP=s'=> \$SMTP,
+    'FromOrTo=s' => \$FoT, 'From=s' => \$From, 'To=s' => \$To,'Sender=s' => \$Sender,
+    'Delete' => \$actdel, 'Hold' => \$acthol, 'Send' => \$actrq, 'Log' => \$Log );
+
+if(defined($actdel) and defined($acthol)) { 
+    print "Options incompatibles\n\n";
+    $help=1;
+    }
+elsif((defined($actdel) or defined($acthol)) and !(defined($From) or defined($To) or defined($SMTP))) { 
+    print "On ne peux holder ou deleter sans filtre\n\n";
+    $help=1;
+    }
+elsif($Log and ($stat or $actdel or $acthol)) {
+    print "Options incompatibles\n\n";
+    $help=1;
+    }
+
+if($help) {
+    print "Fonctions disponibles: ./mailqon1line [--SMTP <srv>] [--FromOrTo <email>|[--From <email> |& --To <email>] [--Delete || --Hold]
+  --SMTP %s     : Recherche les serveur SMTP emetteur
+  --FromOrTo %s : Recheche dans le champs email from ou to
+  --From %s     : Recheche dans le champs email from
+  --Sender %s   : Recheche dans le header du mail le champs sender
+  --To %s       : Recheche dans le champs email to
+  --Delete      : Supprime le mail de la mailq
+  --Send        : Remet enqueue
+  --Hold        : Met dans la queue d'attente
+  --Stat        : Ne renvoie des statistiques sur les memes filtres (desactive les options hold et delete)
+  --Queue %s    : TODO Specification de la mailque (sans option : active hold et defferred)
+  --FiltreSpe %s: TODO permet de specifier des Header
+  --Cat         : TODO postcat -q
+";
+    exit();
+    }
+
+
+if(defined($FoT)) {
+    $From=$FoT;
+    $To=$FoT;
+    }
+while(<MQ>) {
+    chomp();
+    if(!/^--/) {
+        tr/\t / /s;
+        s/\*//g;
+        #### NB etant donné l'usage de 'mq' un tel algo n'est plus tres util...
+        if($precline eq "" and $_ ne "")    { #On va commencer une nouvelle ligne
+            ($id,@null)=split(/ /,$_,2);
+            $tab{$id}{mq}=$_;
+            $suitetrait=0;
+            }
+        else { $suitetrait++; }
+        $tab{$id}{mq}.=$_;
+        $precline=$_;
+        if($suitetrait==1) { ### En theorie le dernier est traite...
+            getheader($tab{$id},$id);
+            $cou{from}  =testheader($From,$tab{$id}{"From"});
+            $cou{to}    =testheader($To,$tab{$id}{"To"});
+            $cou{smtp}  =testheader($SMTP,$tab{$id}{"Received"});
+            $cou{sender}=testheader($Sender,$tab{$id}{"sender"});
+            if($cou{smtp} and $cou{sender}) { # la recherche sur un champs non defini renvoie toujours ok
+                if(defined($FoT)) {
+                    if($cou{from} or $cou{to}) {
+                        if($stat)   { dossomstat(\%resstat,$id,$tab{$id}); }
+                        else        { trait1msqid($id,$tab{$id},$actdel,$acthol,$Log,$actrq); }
+                        }
+                    }
+                elsif($cou{from} and $cou{to}) {
+                    if($stat)   { dossomstat(\%resstat,$id,$tab{$id}); }
+                    else        { trait1msqid($id,$tab{$id},$actdel,$acthol,$Log,$actrq); }
+                    }
+                }
+            }
+        }
+    }
+close(MQ);
+
+if($stat) {
+    foreach my $filtre (keys(%resstat)) {
+        foreach my $val (keys($resstat{$filtre})) {
+            print "$filtre;".$resstat{$filtre}{$val}{Nb}.";$val\n";
+            }
+        }
+    }
