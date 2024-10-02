@@ -17,10 +17,13 @@ import hashlib
 import subprocess
 import threading
 from datetime import datetime
+import requests
+from requests.auth import HTTPBasicAuth
 
-Version="0.15.1"
+Version="0.16"
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
+# 0.16 Si tout va bien on pousse sur le nc. Si le -E on envoie le gentil mail quand meme. Si tout vat mal, nc+mail
 # 0.15.1 Saut de ligne manquant, corrige
 # 0.15 L'affichage stdout se fait en direct, on n'attends plus que le process soit execute
 # 0.14 On renvoie le meme errorcode que le programme execute en fin sys.ext
@@ -38,6 +41,21 @@ Version="0.15.1"
 # 0.2 On rajoute le versionning a cronMutt
 # 0.1  Un outils pour mieux gerer l'envoie des mails a partir des corns
 
+def nextcloudput(urldav,lopa,datas):
+    # Prepare auth
+    lopata=lopa.split(':',2)
+    auth = HTTPBasicAuth(lopata[0],lopata[1])
+    # Envoyer le fichier au partage Nextcloud
+    response = requests.put(urldav, data=datas, auth=auth)
+
+    # Vérifier le succès de l'opération
+    if response.status_code in [200, 201, 204]:
+        ret=0
+    else:
+        ret=response.status_code
+        #print(f"Erreur lors de l'envoi du fichier : {response.status_code}")
+        #print(response.text)
+    return(ret)
 
 def subprosend(cmd,datas):
     mutt=subprocess.Popen(cmd,encoding ='utf-8',
@@ -65,6 +83,8 @@ def usage():
     print("     X       fonctionelle avec le mode -e xxxx, ne change pas le sujet sur exit code")
     print("     p:      code Page encoding (default: utf8 / ISO-8859–16)")
     print("     T       mode tee affiche a l'ecran")
+    print("     n:      url path avec nom de fichier webdav du nextcloud")
+    print("     N:      login:password du nextcloud")
     print("     D       debug")
     print("     h       Helpeur")
     print("     V       Version")
@@ -81,7 +101,7 @@ def read_stream(stream, output_list, stream_name):
     stream.close()
 
 try:
-    opts, args = getopt.getopt(sys.argv[1:], "hVDEi:s:d:r:f:m:e:ct:XTp:", ["help"])
+    opts, args = getopt.getopt(sys.argv[1:], "hVDEi:s:d:r:f:m:e:ct:XTp:n:N:", ["help"])
 except getopt.GetoptError as err:
     print(err)  # will print something like "option -a not recognized"
     usage()
@@ -105,6 +125,8 @@ mailFrom=None
 #-e "set content_type=text/html" 
 cmdCache=False
 encoding="utf-8"
+nextcloud=None
+nextauth=None
 
 for opt,arg in opts:
     if   opt in '-h':
@@ -139,6 +161,10 @@ for opt,arg in opts:
         cmdCache=True
     elif opt in '-p':
         encoding=arg
+    elif opt in '-n':
+        nextcloud=arg
+    elif opt in "-N":
+        nextauth=arg
     
 
 if inReplyTo is None:
@@ -230,8 +256,13 @@ if cmd is not None:
             #    print(line,end="",flush=True)
             datas+=line+"\n"
 
-# Emission de la donnee
-if not (not emptySend and not len(datas)):
+# Emission du mail de la donnee
+if nextcloud is not None and nextauth is not None:
+    ncsended=nextcloudput(nextcloud,nextauth,datas)
+    if emptySend or ps.returncode != 0 or ncsended != 0:
+        subprosend(muttcmd,datas)
+    
+elif not (not emptySend and not len(datas)):
     subprosend(muttcmd,datas)
     if debug:
         print("Sended")
