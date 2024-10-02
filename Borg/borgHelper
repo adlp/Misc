@@ -9,14 +9,15 @@ import json
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.8.3"
+Version="0.9"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
 ### TODO Mieux gerer le repertoire d'appel du programme (clause where) : elle n'est necessaire qu'au restore
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
-### TODO Rajouter dans le n la virgule pour faire des operation batches (bkp, report, prune...)
+### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.9 Maintenant on peut faire un diff entre 2 archives specifies
 # 0.8.3 meilleure gestion interne du rapport (pour facilitee les differentes sorties et les concatenations)
 # 0.8.2 un rapport prettygoooood
 # 0.8.1 un rapport plus fin
@@ -441,19 +442,25 @@ def dfRepo(nick,debug=0):
     return None
 
 
-def cmd_diffbkp(nick,bid,where,debug=0):
+def cmd_diffbkp(nick,bidun=None,bideux=None,debug=0):
     cfg=cfgreaded(nick,debug=debug)
     twodiff=getlastbkp(nick,2,debug=debug)
-    if bid is None:
-        bid=twodiff[1]
-    ladiff=twodiff[0]
-    if ladiff==bid:
+    if bidun is None and bideux is None:
+        bidun=twodiff[0]
+        bidun=twodiff[1]
+    elif bideux is None:
+        bideux=bidun
+        bidun=twodiff[1]
+    if bidun == bideux:
         printer("Desole, ce sont les memes backups")
         sys.exit(1)
 
-    arg=['diff',f"{cfg['BORG_REPO']}::{ladiff}", bid]
-    if where is not None:
-        arg.append(where)
+    if bidun > bideux:
+        bid=bideux
+        bideux=bidun
+        bidun=bid
+
+    arg=['diff',f"{cfg['BORG_REPO']}::{bidun}", bideux]
 
     boex(nick,arg,debug=debug)
 
@@ -707,10 +714,14 @@ elif cmd == 'report':
 elif cmd == 'diffbkp':
     # printer("-c DiffBkp [-n nickname/servername] [-b backupid] -w where")
     if '-b' not in options.keys():
-        options['-b']=None
-    if '-w' not in options.keys():
-        options['-w']=None
-    cmd_diffbkp(nick,options['-b'],options['-w'],debug=debug)
+        bidun=None
+        bideux=None
+    elif ',' in options['-b']:
+        (bidun,bideux)=options['-b'].split(',',2)
+    else:
+        bidun=options['-b']
+        bideux=None
+    cmd_diffbkp(nick,bidun,bideux,debug=debug)
 elif cmd == 'restore':
     # printer("-c Restore [-n nickname/servername] [-b backupid/last] -f file2get -w where")
     if '-b' not in options.keys() or 'last' in options['-b']:
