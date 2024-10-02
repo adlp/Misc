@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+
+# Le programme ne doit rien faire si son stdin est vide (-S alors il petera quand emem son mail)
+# Le programme doit gerener le in reply to si necessaire (-i blah)
+# Le programme doit generer le sujet si necessaire (-s subject)
+# Le programme doit envoyer a l'user executant  (-d email) LOGNAME
+# on peut programmer le a qui con repond et le message id  ( -r / -m )
+# ca peut etre lui le lanceur il n'est pas que piped Et ainsi on peut recuperer le stderr (-e '')
+
+import getopt,sys
+import os
+import hashlib
+import subprocess
+
+def subprosend(cmd,datas):
+    mutt=subprocess.Popen(cmd,encoding ='utf-8',
+                         stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE)
+    stdoutdata,stderrdata=mutt.communicate(input=datas)
+
+def retShell(cmd):
+    ps=subprocess.Popen(['/bin/sh','-c',cmd],encoding ='utf-8',
+                         stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE)
+    out, err = ps.communicate()
+    return(out)
+
+def usage():
+    print("     E       Mail even empty data")
+    print("     i:      in-reply-to")
+    print("     s:      Mail subject")
+    print("     d:      Destination email")
+    print("     r:      ReplyTo")
+    print("     m:      message id")
+    print("     e:      excute command")
+    print("     t:      type du mail")
+    print("     D       debug")
+    print("     h       Helpeur")
+    sys.exit(123)
+
+
+try:
+    opts, args = getopt.getopt(sys.argv[1:], "hDEi:s:d:r:m:e:t:", ["help"])
+except getopt.GetoptError as err:
+    print(err)  # will print something like "option -a not recognized"
+    usage()
+    sys.exit(2)
+
+debug=False
+emptySend=False
+subject=f"//cron//{os.path.basename(__file__)}"
+inReplyTo=None
+dest=os.environ["LOGNAME"]
+messageId=os.path.basename(__file__)
+cmd=None
+mailType=None
+replyTo=os.environ["LOGNAME"]
+#-e "set content_type=text/html" 
+
+for opt,arg in opts:
+    if   opt in '-h':
+        usage()
+    elif opt in '-D':
+        debug=True
+    elif opt in '-E':
+        emptySend=True
+    elif opt in '-i':
+        inReplyTo=arg
+    elif opt in '-s':
+        subject=arg
+    elif opt in "-d":
+        dest=arg
+    elif opt in "-r":
+        replyTo=arg
+    elif opt in "-m":
+        messageId=arg
+    elif opt in "-e":
+        cmd=arg
+    elif opt in '-t':
+        mailType=arg
+
+if inReplyTo is None:
+    inReplyTo=hashlib.md5(subject.encode('utf-8')).hexdigest()
+
+muttcmd=['mutt','-s',subject,'-e',f'my_hdr From: "{replyTo}"','-e',f'my_hdr In-Reply-To: {inReplyTo}','-e',f'my_hdr Message-ID: {messageId}']
+if mailType is not None:
+    muttcmd.append('-e')
+    muttcmd.append(f'set content_type=text/{mailType}')
+muttcmd.append('--')
+muttcmd.append(dest)
+
+if cmd is not None:
+    inf = retShell(cmd)
+else:
+    inf = sys.stdin
+
+datas=""
+for line in inf:
+    datas+=line
+
+if not (not emptySend and not len(datas)):
+    subprosend(muttcmd,datas)
+    if debug:
+        print("Sended")
+
+if debug:
+    print(len(datas))
