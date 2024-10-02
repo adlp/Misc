@@ -9,7 +9,7 @@ import json
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.9"
+Version="0.10"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -17,6 +17,8 @@ Version="0.9"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+### TODO Rajouter la possibilite de preciser une clef ssh
+# 0.10 Prise en compte d'une liste "d'exclusion compltementarire"
 # 0.9 Maintenant on peut faire un diff entre 2 archives specifies
 # 0.8.3 meilleure gestion interne du rapport (pour facilitee les differentes sorties et les concatenations)
 # 0.8.2 un rapport prettygoooood
@@ -551,7 +553,8 @@ def cmd_bkp(nick,debug=0):
         printer('  EXCLUDE = --exclude /media --exclude /dev --exclude /proc --exclude /sys --exclude /var/run --exclude /run --exclude /lost+found --exclude /mnt --exclude /var/lib/lxcfs --exclude /tmp --exclude /var/lib/docker --exclude-if-present .nobackup  --exclude-caches --exclude-nodump --keep-exclude-tags')
         exit(1)
     create.extend(cfg['EXCLUDE'].split(' '))
-
+    if 'EXCLUDE_NEXT' in list(cfg.keys()):
+        create.extend(cfg['EXCLUDE_NEXT'].split(' '))
 
     boex(nick,create,preBorg=preBorg,forceEnv=forceEnv,debug=debug)
     
