@@ -20,9 +20,10 @@ from datetime import datetime
 import requests
 from requests.auth import HTTPBasicAuth
 
-Version="0.17.2"
+Version="0.17.3"
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
+# 0.17.3 si -o no alors on n'envoie pas de mail lorsque tout va bien (meme s'il y a du monde)
 # 0.17.2 debug sur les emissions empty ou pas, etc
 # 0.17.1 L'option -o force maintenant le mail malgres le nextcloud
 # 0.17 On rajoute un flag -o qui envoie systematiquement le mail lorsque c'est ok (a ceux preciser dans le -o
@@ -223,7 +224,7 @@ if cmd is not None:
     muttcmd.append('-e')
     muttcmd.append(f'my_hdr X-cronMuttExitCode: {str(ps.returncode)}')
 
-    if exitReact and ps.returncode != 0:
+    if exitReact and exitCode != 0:
         tmp=subject
         subject="*** "+tmp
         if debug:
@@ -238,7 +239,7 @@ muttcmd.append(subject)
 if mailType is not None:
     muttcmd.append('-e')
     muttcmd.append(f'set content_type=text/{mailType}')
-if ps.returncode != 0:
+if exitCode != 0:
     muttcmd.append('-e')
     muttcmd.append(f'my_hdr X-Priority:1')
 muttcmd.append('--')
@@ -259,27 +260,44 @@ if cmd is not None:
             #    print(line,end="",flush=True)
             datas+=line+"\n"
 
-if destok is not None and ps.returncode == 0:
+if destok is not None and exitCode == 0:
     muttcmd.append(destok)
 else:
-    if destok is not None:
+    if destok is not None and destok != "no":
         dest+=","+destok
     muttcmd.append(dest)
 
 if debug:
     print(f"{' '.join(muttcmd)}")
 
+ncsended=0
+
 # Emission du mail de la donnee
 if nextcloud is not None and nextauth is not None:
     if debug:
         print(f'Depose sur nc ${nextcloud}')
     ncsended=nextcloudput(nextcloud,nextauth,datas)
-    if emptySend or ps.returncode != 0 or ncsended != 0 or destok is not None:
-        subprosend(muttcmd,datas)
 
+# Je veux envoyer le mail si
+#   * Le nextcloud n'a pas marché
+#   * il y a un destok
+#   * il y a un empty
+#   * il y a de la data
+#   * il y a une errere
+
+sendit=False
+if ncsended != 0:
+    sendit=True
+elif exitCode != 0:
+    sendit=True
+elif destok is not None and destok == "no" and exitCode == 0:
+    sendit=False
 elif emptySend or len(datas):
-#elif (not emptySend) and not len(datas):
-#elif not (not emptySend and not len(datas)):
+    sendit=True
+else:
+    sendit=False
+
+if sendit:
     subprosend(muttcmd,datas)
     if debug:
         print(f"Sended-{len(datas)}")
