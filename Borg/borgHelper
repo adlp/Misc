@@ -8,12 +8,13 @@ import subprocess,select
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.4"
+Version="0.5"
 ### TODO Rajouter un helpeur de prunage (en fonction du rc file), compactage
-### TODO Rajouter un helpeur de backupage (en fonction du rc file)
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
+### TODO Mieux gerer le repertoire d'appel du programme (clause where) : elle n'est necessaire qu'au restore
+# 0.5 Et la petite prune est la yeaaah
 # 0.4 On rajoute le backup
 # 0.3 Rajout d'un helper pour deleter une sauvegarde precise
 # 0.2.1 Semblerait que le diff soit inverse
@@ -47,6 +48,8 @@ def usage(doc=None,debug=0):
         printer("       /!\ On delete un backup sur le repo /!\ DANGER")
         printer("   -c Bkp [-n nickname/servername]")
         printer("       On lance un backup")
+        printer("   -c Prune [-n nickname/servername]")
+        printer("      /!\ On delete les vieux backup sur le repo /!\ DANGER")
     elif doc == 'stats':
         printer("   -c Stats [-n server-name/nickname]")
         printer("       Affiche toutes les informations des serveurs connus")
@@ -269,6 +272,37 @@ def cmd_delbkp(nick,bid,debug=0):
     boex(nick,['delete','::'+bid],debug=debug)
     boex(nick,['compact','--cleanup-commits'],debug=debug)
 
+
+def cmd_prune(nick,debug=0):
+    cfg=cfgreaded(nick,debug=debug)
+    cmd=['prune']
+    for i in list(cfg.keys()):
+        if 'KEEP_DAILY' == i:
+            cmd.append('--keep-daily')
+            cmd.append(cfg[i])
+        elif 'KEEP_WEEKLY' == i:
+            cmd.append('--keep-weekly')
+            cmd.append(cfg[i])
+        elif 'KEEP_MONTHLY' == i:
+            cmd.append('--keep-monthly')
+            cmd.append(cfg[i])
+        elif 'KEEP_YEARLY' == i:
+            cmd.append('--keep-yearly')
+            cmd.append(cfg[i])
+        elif 'KEEP_HOURLY' == i:
+            cmd.append('--keep-hourly')
+            cmd.append(cfg[i])
+
+    if len(cmd) >1:
+        # BORG_PASSPHRASE=$pass borg prune --keep-daily 31 --save-space --info --list --stats --glob-archives="$arcg-*" $repo
+        cmd.extend(f'--save-space --info --list --stats --glob-archives={cfg["GLOB_ARCH"]}'.split(' '))
+        boex(nick,cmd,debug=debug)
+        boex(nick,['compact','--cleanup-commits'],debug=debug)
+    else:
+        usage('prune')
+
+    
+
 def cmd_bkp(nick,debug=0):
     cfg=cfgreaded(nick,debug=debug)
 
@@ -374,7 +408,8 @@ optab={ 'stats'     :'cdn',      'login'     :'cdsnkprm',
         'mount'     :'cdn',      'umount'    :'cdn',
         'lstbkp'    :'cdn',      'lstbkpfls' :'cdnb',
         'restore'   :'cdnbfw',   'diffbkp'   :'cdnbw',
-        'delbkp'    :'cdnb',     'bkp'       :'cdn' }
+        'delbkp'    :'cdnb',     'bkp'       :'cdn',
+        'prune'     :'cdn' }
 
 for opt,arg in opts:
     if   opt in '-h':
@@ -471,6 +506,9 @@ elif cmd == 'delbkp':
 elif cmd == 'bkp':
     # printer("   -c Bkp [-n nickname/servername]")
     cmd_bkp(nick,debug=debug)
+elif cmd == 'prune':
+    # printer("   -c Prune [-n nickname/servername]")
+    cmd_prune(nick,debug=debug)
 else:
     printer("Mais comment on peut en arriver la ?")
     usage()
