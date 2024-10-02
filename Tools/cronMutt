@@ -20,9 +20,10 @@ from datetime import datetime
 import requests
 from requests.auth import HTTPBasicAuth
 
-Version="0.17.4"
+Version="0.18"
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
+# 0.18 correctif si on n'a pas d'environnement
 # 0.17.4 Rajout de points de debug
 # 0.17.3 si -o no alors on n'envoie pas de mail lorsque tout va bien (meme s'il y a du monde)
 # 0.17.2 debug sur les emissions empty ou pas, etc
@@ -117,12 +118,12 @@ debug=False
 emptySend=False
 subject=f"//cron//{os.path.basename(__file__)}"
 inReplyTo=None
-dest=os.environ["LOGNAME"]
+dest=os.getenv('LOGNAME','nobody')
 destok=None
 messageId=os.path.basename(__file__)
 cmd=None
 mailType=None
-replyTo=os.environ["LOGNAME"]
+replyTo=os.getenv("LOGNAME",'nobody')
 exitReact=True
 if sys.stdin.isatty():
     teeMode=True
