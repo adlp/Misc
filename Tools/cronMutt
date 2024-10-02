@@ -20,9 +20,10 @@ from datetime import datetime
 import requests
 from requests.auth import HTTPBasicAuth
 
-Version="0.17.3"
+Version="0.17.4"
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
+# 0.17.4 Rajout de points de debug
 # 0.17.3 si -o no alors on n'envoie pas de mail lorsque tout va bien (meme s'il y a du monde)
 # 0.17.2 debug sur les emissions empty ou pas, etc
 # 0.17.1 L'option -o force maintenant le mail malgres le nextcloud
@@ -288,13 +289,23 @@ if nextcloud is not None and nextauth is not None:
 sendit=False
 if ncsended != 0:
     sendit=True
+    if debug:
+        print('Not Sended')
 elif exitCode != 0:
     sendit=True
+    if debug:
+        print(f'ExitCode-{exitCode}')
 elif destok is not None and destok == "no" and exitCode == 0:
     sendit=False
+    if debug:
+        print('destok no')
 elif emptySend or len(datas):
     sendit=True
+    if debug:
+        print('Send empty if empty en full if len')
 else:
+    if debug:
+        print('Fall back')
     sendit=False
 
 if sendit:
