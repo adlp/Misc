@@ -9,12 +9,13 @@ import json
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.8.1"
+Version="0.8.2"
 ### TODO Rajouter un helpeur de prunage (en fonction du rc file), compactage
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
 ### TODO Mieux gerer le repertoire d'appel du programme (clause where) : elle n'est necessaire qu'au restore
+# 0.8.2 un rapport prettygoooood
 # 0.8.1 un rapport plus fin
 # 0.8 1er rapport
 # 0.7.1 flushing 4 print 2 screen
@@ -262,7 +263,7 @@ def cmd_lstfiles(nick,bid,debug=0):
         bid=getlastbkp(nick,debug=debug)[0]
     boex(nick,['list','--glob-archives',cfg['GLOB_ARCH'],'::'+bid],debug=debug)
 
-def cmd_report(nick,debug=0,maxp=None):
+def prep_report(nick,debug=0,maxp=None,human=False):
     import re
     cfg=cfgreaded(nick,debug=debug)
     pruneme=[]
@@ -339,17 +340,47 @@ def cmd_report(nick,debug=0,maxp=None):
     if avail is None:
         avail=""
     dabesi=d2DateNSince(resume['last'])
-    print(f'    Nom           ; Duree       :depuis          : Derniere      : Taille                : Recuperable : Restant ')
-    print(f"{cfg['SER_NAME']} ; { kept[resume['lastname']]['durationM']:.2f} ;{dabesi['since']:.2f}; {kept[resume['lastname']]['deduplicated_size'] }; {resume['unique_csize']};{resume['prunable']};{avail}")
-    print(f"prunable;{resume['prunable_os']};{ resume['prunable_cs']};{resume['prunable']}")
-    print(f'{dabesi["date"]}')
+
+    tcmpl={}
+    tcmpl[nick]={}
+    tcmpl[nick]['nom']          =cfg['SER_NAME']
+    tcmpl[nick]['date derniere']=dabesi["date"]
+    tcmpl[nick]['depuis']       =f"{dabesi['since']:.2f}"
+    tcmpl[nick]['duree']        =f"{ kept[resume['lastname']]['durationM']:.2f}"
+    tcmpl[nick]['derniere']     =kept[resume['lastname']]['deduplicated_size']
+    tcmpl[nick]['moy']          =resume['moy_deduplicated_size']
+    tcmpl[nick]['taille']       =resume['unique_csize']
+    tcmpl[nick]['recuperable']  =resume['prunable']
+    tcmpl[nick]['reste']        =convert_octets_readable(avail)
+
+    tbkps={}
+    tbkps['Prunable']={}
+    tbkps['Prunable']['name']               ='Prunable'
+    tbkps['Prunable']['original_size']      =resume['prunable_os']
+    tbkps['Prunable']['compressed_size']    =resume['prunable_cs']
+    tbkps['Prunable']['deduplicated_size']  =resume['prunable']
+    
     cpt=0
     for i in kept.keys():
         if kept[i]['prunMe'] == 'No':
             if (maxp is None) or ((notPrunable - cpt ) <= maxp):
-                print(f"{i};{kept[i]['original_size']};{kept[i]['compressed_size']};{kept[i]['deduplicated_size']};{kept[i]['nfiles']}")
+                tbkps[i]=kept[i]
+                tbkps[i]['duration']=f"{kept[i]['durationM']:.2f}"
+                tbkps[i].pop('durationM')
+                tbkps[i].pop('prunMe')
             cpt+=1
-    print(f"All;{resume['total_size']};{resume['total_csize']};{resume['unique_csize']}")
+    tbkps['All']={}
+    tbkps['All']['name']='All'
+    tbkps['All']['original_size']       =resume['total_size']
+    tbkps['All']['compressed_size']     =resume['total_csize']
+    tbkps['All']['deduplicated_size']   =resume['unique_csize']
+
+    return(tcmpl,tbkps)
+
+def cmd_report(nick,debug=0,maxp=None):
+    (tcmpl,tbkps)=prep_report(nick,debug=debug,maxp=maxp,human=False)
+    print(prettyTabelise(tcmpl))
+    print(prettyTabelise(tbkps))
 
 def d2DateNSince(datepourrie):
     from datetime import datetime
@@ -366,6 +397,27 @@ def d2DateNSince(datepourrie):
 
     return({'since':since, 'date':newstart})
 
+def prettyTabelise(tab):
+    from prettytable import PrettyTable
+    # https://pypi.org/project/prettytable/
+
+    clefs={}
+    serrure=0
+    for i in tab.keys():
+        for j in tab[i].keys():
+            if j not in clefs.keys():
+                clefs[j]=serrure
+                serrure+=1
+    t=PrettyTable(clefs.keys())
+    for i in tab.keys():
+        liste=[]
+        for j in clefs:
+            if j not in tab[i]:
+                liste.append("")
+            else:
+                liste.append(tab[i][j])
+        t.add_row(liste)
+    return(t)
 
 
 def dfRepo(nick,debug=0):
