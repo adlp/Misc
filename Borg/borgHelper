@@ -9,6 +9,9 @@ import subprocess,select
 cfgfile="/root/.borghelperrc"
 
 Version="0.1"
+### TODO Rajouter un helpeur de prunage (en fonction du rc file), compactage
+### TODO Rajouter un helpeur de backupage (en fonction du rc file)
+### TODO Rajouter un truc pour le helpeur diff sans parametre donne le diff des deux dernieres versions
 # 0.1 Premiere version (officielle) qui reagit bien a toutes les commandes
 
 
