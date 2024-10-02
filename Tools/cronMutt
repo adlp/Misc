@@ -22,6 +22,7 @@ Version="0.9"
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
 ### Todo rajouter header date debut + rajouter header de la commande (mais desativable par un flag)
+# 0.10 Pipe mode fonctionnelle : on flush
 # 0.9 New header : date debut execution/ commande lancee / exit code
 # 0.8.1 On rajoute un header propre a cet outils sans la faute
 # 0.7 On rajoute une notion de priorite
@@ -179,14 +180,14 @@ if debug:
 datas=""
 for line in inf:
     if teeMode:
-        print(line,end="")
+        print(line,end="",flush=True)
     datas+=line
 if cmd is not None:
     if len(errs):
         datas+="\n=============================================================================\n"
         for line in errs:
             if teeMode:
-                print(line,end="")
+                print(line,end="",flush=True)
             datas+=line
 
 # Emission de la donnee
