@@ -8,13 +8,13 @@ import subprocess,select
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.7"
+Version="0.7.1"
 ### TODO Rajouter un helpeur de prunage (en fonction du rc file), compactage
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
 ### TODO Mieux gerer le repertoire d'appel du programme (clause where) : elle n'est necessaire qu'au restore
-# 0.7 flushing 4 print 2 screen
+# 0.7.1 flushing 4 print 2 screen
 # 0.6 prise en compte des backup locaux
 # 0.5 Correction : on ne force plus le chemin d'execution tout le temps a /tmp
 # 0.5 Et la petite prune est la yeaaah
@@ -397,7 +397,7 @@ def boex(nick,arg,rep=None,ret=False,debug=0,preBorg=None,forceEnv=None):
         if len(errs):
             print(f'\n===================({ps.returncode})=======================================\n',flush=True)
             for line in errs:
-                print(line,end="",flus,True)
+                print(line,end="",flush=True)
     
         if ps.returncode != 0:
             sys.exit(ps.returncode)
