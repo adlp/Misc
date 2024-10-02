@@ -9,7 +9,7 @@ import json
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.15"
+Version="0.15.1"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -17,6 +17,7 @@ Version="0.15"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.15.1 True cache
 # 0.15 Cache v1
 # 0.14 boexec renvoie un dico stdout/stderr... et cela est pris en compte hein...
 # 0.13.1 debug du diff qui suite aux evo ne marchait plus correctement en mode supra simpliste...
@@ -274,6 +275,28 @@ def cmd_lstfiles(nick,bid,debug=0):
         bid=getlastbkp(nick,debug=debug)[0]
     boex(nick,['list','--glob-archives',cfg['GLOB_ARCH'],'::'+bid],debug=debug)
 
+def cacheJsonBoexWithLM(nick,boexarg,prefix="/tmp/borgHelper-",suffix=".json",output="stdout",debug=0):
+    last_modified=json.loads(''.join(boex(nick,['info','--json'],ret=True,debug=debug)['stdout']))['repository']['last_modified']
+    nomFi=prefix+nick+'-'+last_modified+suffix
+    if os.path.isfile(nomFi):
+        if debug:
+            printer("Use cache")
+        caTxt=""
+        with open(nomFi,'r') as fd:
+            for line in fd:
+                caTxt+=line
+            fd.close()
+        ret=json.loads(caTxt)
+    else:
+        if debug:
+            printer("Create cache")
+        ret=json.loads('\n'.join(boex(nick,boexarg,ret=True,debug=debug)[output]))
+        with open(nomFi,"w") as fd:
+            print(json.dumps(ret,indent=4),file=fd)
+            fd.close()
+    return(ret)
+    
+
 def prep_report(nick,debug=0,maxp=None):
     import re
     cfg=cfgreaded(nick,debug=debug)
@@ -281,8 +304,9 @@ def prep_report(nick,debug=0,maxp=None):
     for i in cmd_prune(nick,dryrun=True,debug=debug):
         if 'Would prune:' in i:
             pruneme.append(((re.sub(r'( )*',r'\1',i)).split(' '))[2])
-    r=json.loads('\n'.join(boex(nick,['info','--json','--glob-archives',cfg['GLOB_ARCH']],ret=True,debug=debug)['stdout']))
-    #print(r)
+
+    #r=json.loads('\n'.join(boex(nick,['info','--json','--glob-archives',cfg['GLOB_ARCH']],ret=True,debug=debug)['stdout']))
+    r=cacheJsonBoexWithLM(nick,['info','--json','--glob-archives',cfg['GLOB_ARCH']],suffix="-info.json",debug=debug)
 
     resume={}
     resume['duration']=0
@@ -378,24 +402,7 @@ def prep_report(nick,debug=0,maxp=None):
     return(tcmpl,tbkps)
 
 def cmd_report(nick,debug=0,maxp=None):
-    last_modified=json.loads(''.join(boex(nick,['info','--json'],ret=True,debug=debug)['stdout']))['repository']['last_modified']
-    if os.path.isfile("/tmp/borgHelper"+last_modified+".json"):
-        cachedlines=""
-        with open("/tmp/borgHelper"+last_modified+".json",'r') as file:
-            for line in file:
-                cachedlines+=line
-            file.close()
-        cachedjson=json.loads(cachedlines)
-        tcmpl=cachedjson['tcmpl']
-        tbkps=cachedjson['tbkps']
-    else:
-        (tcmpl,tbkps)=prep_report(nick,debug=debug,maxp=maxp)
-        with open("/tmp/borgHelper"+last_modified+".json",'w') as file:
-            cachedjson={}
-            cachedjson['tcmpl']=tcmpl
-            cachedjson['tbkps']=tbkps
-            print(json.dumps(cachedjson,indent=4),file=file)
-            file.close()
+    (tcmpl,tbkps)=prep_report(nick,debug=debug,maxp=maxp)
 
     for i in ['derniere','moy','taille','recuperable','reste']:
         if (i in tcmpl[nick].keys()) and not(tcmpl[nick][i] is  None):
