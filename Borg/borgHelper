@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
 
+#/*
+#* borgHelper to help you calling borg
+#* Copyright (C) 2024 Antoine DELAPORTE
+#*
+#* This program is free software: you can redistribute it and/or modify
+#* it under the terms of the GNU General Public License as published by
+#* the Free Software Foundation, either version 3 of the License, or
+#* (at your option) any later version.
+#*
+#* This program is distributed in the hope that it will be useful,
+#* but WITHOUT ANY WARRANTY; without even the implied warranty of
+#* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#* GNU General Public License for more details.
+#*
+#* You should have received a copy of the GNU General Public License
+#* along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#*/
+
 import getopt,sys,os
 import socket
 import configparser
@@ -13,7 +31,7 @@ import json
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.23"
+Version="0.24"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -21,6 +39,7 @@ Version="0.23"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.24 License Header
 # 0.23 Tout plein de correctifs pour faire marcher les backups cf 0.20
 # 0.22 Integration d'init pour initialiser un repo (local)
 # 0.21 Corrrections due a l'integration de BORG_ROOTBKP BORG_ARCHNAME (0.20)
