@@ -26,47 +26,79 @@ import argparse
 import shutil
 from filecmp import dircmp
 
+# Fonction d'affichage de debug
+def debug_print(debug, message):
+    if debug:
+        print(message)
+
 # Fonction pour extraire le fichier .tar.gz dans un répertoire temporaire
-def extract_tar(tar_path, extract_to):
+def extract_tar(tar_path, extract_to, debug=False):
+    debug_print(debug, f"Extraction du fichier tar {tar_path} vers {extract_to}")
     with tarfile.open(tar_path, 'r:gz') as tar:
         tar.extractall(path=extract_to)
 
-# Fonction pour comparer deux répertoires et identifier les différences
-def compare_directories(dir1, dir2):
+# Fonction pour comparer deux répertoires de manière récursive et identifier les différences
+def recursive_compare_directories(dir1, dir2, added=None, deleted=None, modified=None, debug=False):
+    if added is None:
+        added = []
+    if deleted is None:
+        deleted = []
+    if modified is None:
+        modified = []
+
     comparison = dircmp(dir1, dir2)
-    added = comparison.left_only  # Fichiers présents seulement dans l'archive tar
-    deleted = comparison.right_only  # Fichiers présents seulement dans le Git
-    modified = comparison.diff_files  # Fichiers modifiés
+    added.extend([os.path.join(dir1, file) for file in comparison.left_only])
+    deleted.extend([os.path.join(dir2, file) for file in comparison.right_only])
+    modified.extend([os.path.join(dir1, file) for file in comparison.diff_files])
+
+    # Comparaison des sous-répertoires
+    for subdir in comparison.common_dirs:
+        recursive_compare_directories(
+            os.path.join(dir1, subdir),
+            os.path.join(dir2, subdir),
+            added, deleted, modified,
+            debug
+        )
+
     return added, deleted, modified
 
 # Fonction pour synchroniser le contenu du tar avec le dépôt Git
-def sync_with_git(repo, repo_dir, temp_dir, message):
-    added, deleted, modified = compare_directories(temp_dir, repo_dir)
+def sync_with_git(repo, repo_dir, temp_dir, message, debug=False):
+    added, deleted, modified = recursive_compare_directories(temp_dir, repo_dir, debug=debug)
 
     # Ajouter les fichiers nouveaux ou modifiés
     for file in added + modified:
-        full_path = os.path.join(temp_dir, file)
-        target_path = os.path.join(repo_dir, file)
-        if os.path.isfile(full_path):
-            shutil.copy2(full_path, target_path)
-        elif os.path.isdir(full_path):
-            shutil.copytree(full_path, target_path)
+        relative_path = os.path.relpath(file, temp_dir)
+        target_path = os.path.join(repo_dir, relative_path)
+        if os.path.isfile(file):
+            debug_print(debug, f"Ajout ou modification du fichier : {target_path}")
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            shutil.copy2(file, target_path)
+        elif os.path.isdir(file):
+            debug_print(debug, f"Ajout ou modification du répertoire : {target_path}")
+            if os.path.exists(target_path):
+                shutil.rmtree(target_path)  # Suppression du répertoire existant
+            shutil.copytree(file, target_path)
         repo.git.add(target_path)
 
     # Supprimer les fichiers qui ne sont plus dans l'archive
     for file in deleted:
-        target_path = os.path.join(repo_dir, file)
+        relative_path = os.path.relpath(file, repo_dir)
+        target_path = os.path.join(repo_dir, relative_path)
         if os.path.exists(target_path):
             if os.path.isfile(target_path):
+                debug_print(debug, f"Suppression du fichier : {target_path}")
                 os.remove(target_path)
             elif os.path.isdir(target_path):
+                debug_print(debug, f"Suppression du répertoire : {target_path}")
                 shutil.rmtree(target_path)
-            repo.git.rm(target_path)
+            repo.git.rm('-r', target_path)
 
     # Si des fichiers ont été ajoutés, modifiés ou supprimés, faire un commit
     if added or deleted or modified:
         repo.index.commit(message)
         origin = repo.remote(name='origin')
+        debug_print(debug, f"Push des modifications avec le message : {message}")
         origin.push()
         print(f"Modifications commitées avec succès : {message}")
     else:
@@ -79,15 +111,17 @@ def main():
     parser.add_argument("-r", "--repo", required=True, help="URL du dépôt Git")
     parser.add_argument("-p", "--path", required=True, help="Chemin dans le dépôt Git où synchroniser les fichiers")
     parser.add_argument("-m", "--message", required=True, help="Message de commit")
+    parser.add_argument("-D", "--debug", action="store_true", help="Activer le mode debug pour afficher les détails des opérations")
 
     args = parser.parse_args()
 
     # Créer un répertoire temporaire pour extraire le fichier tar.gz
     with tempfile.TemporaryDirectory() as temp_dir:
-        extract_tar(args.tarfile, temp_dir)
+        extract_tar(args.tarfile, temp_dir, args.debug)
 
         # Cloner le dépôt Git dans un autre répertoire temporaire
         with tempfile.TemporaryDirectory() as git_dir:
+            debug_print(args.debug, f"Clonage du dépôt {args.repo} vers {git_dir}")
             repo = git.Repo.clone_from(args.repo, git_dir)
 
             # Chemin vers l'arborescence cible dans le dépôt Git
@@ -97,7 +131,7 @@ def main():
             os.makedirs(target_path, exist_ok=True)
 
             # Synchroniser le contenu du tar avec le dépôt Git
-            sync_with_git(repo, target_path, temp_dir, args.message)
+            sync_with_git(repo, target_path, temp_dir, args.message, args.debug)
 
 if __name__ == "__main__":
     main()
