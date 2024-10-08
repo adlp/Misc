@@ -1,0 +1,173 @@
+services:
+### TODO externalise with override images
+### TODO priviliged ? truly ?
+### TODO add timezone
+    nextcloud:
+        container_name: ${SITE}
+        hostname: nc.${SITE}
+        image: nextcloud:29.0.7-apache
+        privileged: true
+        restart: always
+        #network_mode: bridge
+        ports:
+            - 0.0.0.0:${EXPONC}:80
+        environment:
+            - MYSQL_PASSWORD=${MYUSERPWD}
+            - MYSQL_HOST=db
+            - MYSQL_USER=nextcloud
+            - MYSQL_DATABASE=nextcloud
+            - NEXTCLOUD_ADMIN_USER=admin
+            - NEXTCLOUD_ADMIN_PASSWORD=${NCADMINPWD}
+            - REDIS_HOST=redis
+            - NEXTCLOUD_TRUSTED_DOMAINS=${SITE}
+            - NEXTCLOUD_DATA_DIR=/var/www/html/data
+            - PHP_MEMORY_LIMIT=1024M
+            - TRUSTED_PROXIES=172.17.0.1
+            - SMTP_HOST=172.17.0.1
+            - OVERWRITEPROTOCOL=https
+            - PHP_MEMORY_LIMIT=512M
+        volumes:
+            - ${DOPATH}/var+www+html:/var/www/html/:rw
+        logging:
+            driver: syslog
+            options:
+                syslog-address: udp://127.0.0.1:514
+                syslog-facility: local0
+                tag: ${SITE}
+        depends_on:
+            - db
+            - redis
+        extra_hosts:
+            - ${SITE}:172.17.0.1
+
+    nextcron:
+        container_name: nextcron${SITE}
+        hostname: nc.${SITE}
+        image: nextcloud:29.0.7-apache
+        privileged: true
+        restart: always
+        #network_mode: bridge
+        environment:
+            - MYSQL_PASSWORD=${MYUSERPWD}
+            - MYSQL_HOST=db
+            - MYSQL_USER=nextcloud
+            - MYSQL_DATABASE=nextcloud
+            - NEXTCLOUD_ADMIN_USER=admin
+            - NEXTCLOUD_ADMIN_PASSWORD=${NCADMINPWD}
+            - REDIS_HOST=redis
+            - NEXTCLOUD_TRUSTED_DOMAINS=${SITE}
+            - NEXTCLOUD_DATA_DIR=/var/www/html/data
+            - PHP_MEMORY_LIMIT=1024M
+            - TRUSTED_PROXIES=172.17.0.1
+            - SMTP_HOST=172.17.0.1
+            - OVERWRITEPROTOCOL=https
+            - PHP_MEMORY_LIMIT=512M
+        volumes:
+            - ${DOPATH}/var+www+html:/var/www/html/:rw
+        command: su - www-data -s /bin/bash -c "/usr/local/bin/php /var/www/html/cron.php --help;sleep 3600"
+        logging:
+            driver: syslog
+            options:
+                syslog-address: udp://127.0.0.1:514
+                syslog-facility: local0
+                tag: ${SITE}
+        depends_on:
+            - db
+            - redis
+            - nextcloud
+        extra_hosts:
+            - nextcron.${SITE}:172.17.0.1
+
+    collabora:
+        container_name: collabora.${SITE}
+        image: collabora/code:latest
+        cap_add:
+          - MKNOD
+        environment:
+          - domain=${SITE}
+          - dictionaries=fr
+    #      - username=someuser
+    #      - password=somepassword
+        ports:
+          - ${EXPOCO}:9980
+        restart: always
+        volumes:
+          - /etc/localtime:/etc/localtime:ro
+        logging:
+          driver: syslog
+          options:
+            syslog-address: udp://127.0.0.1:514
+            syslog-facility: local0
+            tag: collabora.${SITE}
+        extra_hosts:
+            - ${SITE}:172.17.0.1
+#            - gestion-co.gaelle-thanatopraxie.fr:172.17.0.1
+
+
+    db: 
+        container_name: db.${SITE}
+        hostname: db.${SITE}
+        #image: mariadb:10.9
+        image: mariadb:10.2.14
+        command: --transaction-isolation=READ-COMMITTED --binlog-format=ROW
+        restart: always
+        volumes:
+            - ${DOPATH}/etc+mysql/:/etc/mysql/conf.d:ro
+            - ${DOPATH}/var+lib+mysql/:/var/lib/mysql:rw
+            - ${DOPATH}/var+log+mysql/:/var/log/mysql:rw
+        environment:
+            - MYSQL_ROOT_PASSWORD=${MYROOTPWD}
+            - MYSQL_DATABASE=nextcloud
+            - MYSQL_USER=nextcloud
+            - MYSQL_PASSWORD=${MYUSERPWD}
+        logging:
+            driver: syslog
+            options:
+                syslog-address: udp://127.0.0.1:514
+                syslog-facility: local0
+                tag: db.${SITE}
+
+    db-dump: 
+        container_name: db-dump.${SITE}
+        hostname: db-dump.${SITE}
+        #image: mariadb:10.9
+        image: mariadb:10.2.14
+        ###command: --transaction-isolation=READ-COMMITTED --binlog-format=ROW
+        restart: always
+        volumes:
+            - ${DOPATH}/etc+mysql/:/etc/mysql/conf.d:ro
+            - ${DOPATH}/var+lib+mysqldump/:/var/lib/mysqldump:rw
+            - ${DOPATH}/nextcloud-inr.sh:/db-dump:ro
+        environment:
+            - MYSQL_ROOT_PASSWORD=${MYROOTPWD}
+            - MYSQL_DATABASE=nextcloud
+            - MYSQL_USER=nextcloud
+            - MYSQL_PASSWORD=${MYUSERPWD}
+        command: /db-dump
+        logging:
+            driver: syslog
+            options:
+                syslog-address: udp://127.0.0.1:514
+                syslog-facility: local0
+                tag: db.${SITE}
+
+    redis:
+        tty: true
+        container_name: redis.${SITE}
+        hostname: redis.${SITE}
+        image: redis:5.0.7
+        restart: always
+        privileged: true
+        logging:
+           driver: syslog
+           options:
+                syslog-address: udp://127.0.0.1:514
+                syslog-facility: local0
+                tag: redis.${SITE}
+        #network_mode: bridge
+        #ports:
+        #    - 0.0.0.0:8071:6379
+        volumes:
+            - ${DOPATH}/redis+data:/data:rw
+
+
