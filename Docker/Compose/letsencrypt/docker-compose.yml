@@ -1,0 +1,23 @@
+services:
+  letsencrypt:
+    hostname: letsencrypt
+    container_name: letsencrypt
+    image: certbot/certbot:latest
+    volumes:
+      - ${DOPATH}/etc+letsencrypt:/etc/letsencrypt
+      - ${DOPATH}/var+lib+letsencrypt:/var/lib/letsencrypt
+      - ${DOPATH}/var+lib+letsencrypt/webrootauth:/var/lib/letsencrypt/webrootauth
+      - ${DOPATH}/var+log+letsencrypt:/var/log/letsencrypt
+      - ${NGPATH}/static:/webrootauth
+    # To create a new Cert
+    ### docker exec -it letsencrypt certbot certonly --webroot --register-unsafely-without-email --agree-tos --webroot-path "/webrootauth" -d example.lan -d www.example.lan
+    # to renew cert ... to modifu
+    # 3 6    * * 1-5  root    docker exec letsencrypt certbot renew --webroot --register-unsafely-without-email --agree-tos  --webroot-path /webrootauth
+    entrypoint: sleep infinity
+    restart: unless-stopped
+    logging:
+        driver: syslog
+        options:
+            syslog-address: udp://127.0.0.1:514
+            syslog-facility: local0
+            tag: letsencrypt
