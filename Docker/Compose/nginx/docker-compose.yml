@@ -8,12 +8,12 @@ services:
         - 0.0.0.0:80:80
         - 0.0.0.0:443:443
     volumes:
-        - /home/_Dockers/nginx/conf.d:/etc/nginx/conf.d:ro
-        - /home/_Dockers/nginx/include.d:/etc/nginx/include.d:ro
-        - /home/_Dockers/nginx/ssl.d:/etc/nginx/ssl.d:ro
-        - /home/_Dockers/nginx/static:/var/www:ro
-        - /home/_Dockers/nginx/cache:/var/cache/nginx/proxy_temp:rw
-        - /home/_Dockers/letsencrypt/etc+letsencrypt:/etc/letsencrypt:ro
+        - ${DOPATH}/conf.d:/etc/nginx/conf.d:ro
+        - ${DOPATH}/include.d:/etc/nginx/include.d:ro
+        - ${DOPATH}/ssl.d:/etc/nginx/ssl.d:ro
+        - ${DOPATH}/static:/var/www:ro
+        - ${DOPATH}/cache:/var/cache/nginx/proxy_temp:rw
+        - ${LEPATH}/etc+letsencrypt:/etc/letsencrypt:ro
     restart: always
     logging:
       driver: syslog
