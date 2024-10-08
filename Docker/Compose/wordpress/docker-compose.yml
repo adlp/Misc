@@ -1,0 +1,45 @@
+services:
+  db:
+    # We use a mariadb image which supports both amd64 & arm64 architecture
+    image: mariadb:10.2.14
+    #image: mariadb:10.6.4-focal
+    # If you really want to use MySQL, uncomment the following line
+    #image: mysql:8.0.27
+    command: '--default-authentication-plugin=mysql_native_password'
+    volumes:
+      - ${DOPATH}/db:/var/lib/mysql
+    restart: always
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYROOTPWD}
+      - MYSQL_DATABASE=wordpress
+      - MYSQL_USER=wordpress
+      - MYSQL_PASSWORD=${MYUSERPWD}
+    logging:
+      driver: syslog
+      options:
+        syslog-address: udp://127.0.0.1:514
+        syslog-facility: local0
+        tag: db.${SITE}
+  wordpress:
+    image: wordpress:6.6.2-php8.1-apache
+    volumes:
+      - ${DOPATH}/wordpress:/var/www/html
+    ports:
+      - 0.0.0.0:${EXPO}:80
+    restart: always
+    environment:
+      - WORDPRESS_DB_HOST=db
+      - WORDPRESS_DB_USER=wordpress
+      - WORDPRESS_DB_PASSWORD=${MYUSERPWD}
+      - WORDPRESS_DB_NAME=wordpress
+    logging:
+      driver: syslog
+      options:
+        syslog-address: udp://127.0.0.1:514
+        syslog-facility: local0
+        tag: ${SITE}
+    depends_on:
+        - db
+    extra_hosts:
+            - ${SITE}:172.17.0.1
+
