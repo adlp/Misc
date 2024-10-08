@@ -1,0 +1,6 @@
+etc+mysql
+redis+data
+var+lib+mysql
+var+lib+mysqldump
+var+log+mysql
+var+www+html
