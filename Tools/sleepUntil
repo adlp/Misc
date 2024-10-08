@@ -1,0 +1,62 @@
+#!/bin/bash
+
+#/*
+#* sleepUntil is like the at unix command but can be put in a script: it lock the process like(with)... sleep
+#* Copyright (C) 2024 Antoine DELAPORTE
+#*
+#* This program is free software: you can redistribute it and/or modify
+#* it under the terms of the GNU General Public License as published by
+#* the Free Software Foundation, either version 3 of the License, or
+#* (at your option) any later version.
+#*
+#* This program is distributed in the hope that it will be useful,
+#* but WITHOUT ANY WARRANTY; without even the implied warranty of
+#* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#* GNU General Public License for more details.
+#*
+#* You should have received a copy of the GNU General Public License
+#* along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#*/
+
+# Fonction d'affichage d'aide
+usage() {
+    echo "Usage: $0 <HH:MM:SS> [commande|commande arguments]"
+    echo "  HH:MM:SS    Heure ou le sleep relachera le lock"
+    echo "  commande    Commande qui sera executée a l'heure donnée (avec les arguments"
+    echo "Si le timout s'execute coorectement alors l'exit code sera a 0, sinon il sera a 1"
+    exit 1
+}
+
+command="exit 0"
+
+case "$#" in
+    "0") usage;;
+    "1") target_time=$1;;
+    *)  target_time=$1
+        shift
+        command=$*;;
+    esac
+
+# Obtenir l'heure actuelle en secondes depuis minuit
+current_seconds=$(date +%s)
+
+# Obtenir la date actuelle et remplacer l'heure par l'heure cible
+target_seconds=$(date -d "$(date +%Y-%m-%d) $target_time" +%s)
+
+# Calculer la différence de temps (en secondes)
+sleep_seconds=$((target_seconds - current_seconds))
+
+# Si l'heure cible est dans le futur, attendre jusqu'à cette heure
+if [[ $sleep_seconds -gt 0 ]]; then
+    echo "Attente jusqu'à $target_time... soit $sleep_seconds secondes d'attente"
+    sleep $sleep_seconds
+else
+    echo "L'heure spécifiée est déjà passée pour aujourd'hui."
+    exit 1
+fi
+
+# Le script continue ici après l'attente
+echo "Il est maintenant $target_time."
+
+$command
+exit $?
