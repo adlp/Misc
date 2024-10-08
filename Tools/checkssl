@@ -1,0 +1,171 @@
+#!/bin/bash
+
+#/*
+#* checkssl is an helper to chech an certificate status
+#* Copyright (C) 2024 Antoine DELAPORTE
+#*
+#* This program is free software: you can redistribute it and/or modify
+#* it under the terms of the GNU General Public License as published by
+#* the Free Software Foundation, either version 3 of the License, or
+#* (at your option) any later version.
+#*
+#* This program is distributed in the hope that it will be useful,
+#* but WITHOUT ANY WARRANTY; without even the implied warranty of
+#* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#* GNU General Public License for more details.
+#*
+#* You should have received a copy of the GNU General Public License
+#* along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#*/
+
+# Initialisation des variables
+url=""
+ip=""
+threshold=15
+exit_code=0
+
+# Fonction d'affichage d'aide
+usage() {
+    echo "Usage: $0 -u <url> [-i <ip>] [-h] [-d] [-t <threshold>]"
+    echo "  -u: URL du serveur ou fichier (https, imap, imaps, pop3, pop3s, file)"
+    echo "  -i: IP pour forcer la résolution DNS (non applicable pour file://)"
+    echo "  -t: DAYS restant avant exitcode a 2"
+    echo "  -d mode debug"
+    exit 1
+}
+
+# Fonction pour calculer les jours restants
+days_remaining() {
+    local end_date="$1"
+    local end_epoch=$(date -d "$end_date" +%s)
+    local now_epoch=$(date +%s)
+    echo $(( ($end_epoch - $now_epoch) / 86400 ))
+}
+
+# Lecture des arguments
+while getopts "u:i:hdt:" opt; do
+    case $opt in
+        u) url="$OPTARG" ;;
+        i) ip="$OPTARG" ;;
+        d) set -x;;
+        t) threshold="$OPTARG" ;;
+        h) usage ;;
+        *) usage ;;
+    esac
+done
+
+# Vérification de l'URL
+if [[ -z "$url" ]]; then
+    echo "Erreur : L'URL est requise."
+    usage
+fi
+
+# Extraction du protocole et de l'hôte/port
+protocol=$(echo "$url" | grep :// | sed -e 's,^\(.*://\).*,\1,g')
+url_no_proto=$(echo "$url" | sed -e s,$protocol,,g)
+
+# Gestion spécifique des fichiers locaux (file://)
+if [[ "$protocol" == "file://" ]]; then
+    crt_file=$(echo "$url_no_proto" | sed 's,^file://,,g')
+
+    # Vérification que le fichier existe
+    if [[ ! -f "$crt_file" ]]; then
+        echo "Erreur : Le fichier $crt_file n'existe pas."
+        exit 1
+    fi
+
+    # Récupérer les informations du certificat à partir du fichier
+    cert_info=$(openssl x509 -in "$crt_file" -noout -subject -enddate)
+
+    # Extraction des CN et de la date de fin
+    cn=$(echo "$cert_info" | grep "subject=" | sed -n 's/.*CN=\(.*\)/\1/p')
+    end_date=$(echo "$cert_info" | grep "notAfter=" | cut -d= -f2)
+
+    # Calcul des jours restants
+    days_left=$(days_remaining "$end_date")
+
+    # Affichage des informations
+    echo "CN du certificat : $cn"
+    echo "Date de fin de validité : $end_date"
+    echo "Jours restants : $days_left"
+
+    # Sortie avec code 2 si moins de 15 jours
+    if [[ $days_left -le $threshold ]]; then
+        exit_code=2
+    fi
+
+    exit $exit_code
+fi
+
+# Extraction de l'hôte et du port si l'URL n'est pas file://
+host=$(echo "$url_no_proto" | cut -d/ -f1)
+port=$(echo "$host" | awk -F: '{print $2}')
+host=$(echo "$host" | awk -F: '{print $1}')
+
+# Définir le port par défaut selon le protocole
+if [[ -z "$port" ]]; then
+    case $protocol in
+        https://) port=443 ;;
+        imap://) port=143 ;;
+        imaps://) port=993 ;;
+        pop3://) port=110 ;;
+        pop3s://) port=995 ;;
+        *) echo "Protocole non supporté"; exit 1 ;;
+    esac
+fi
+
+# Utiliser l'IP forcée si fournie
+if [[ -n "$ip" ]]; then
+    host_ip="$ip"
+else
+    host_ip="$host"
+fi
+
+# Choix de la commande openssl en fonction du protocole
+case $protocol in
+    https://)
+        openssl_cmd="openssl s_client -connect $host_ip:$port -servername $host 2>/dev/null"
+        ;;
+    imap://|pop3://)
+        openssl_cmd="openssl s_client -connect $host_ip:$port -starttls ${protocol%://} 2>/dev/null"
+        ;;
+    imaps://|pop3s://)
+        openssl_cmd="openssl s_client -connect $host_ip:$port 2>/dev/null"
+        ;;
+    *)
+        echo "Protocole non supporté"
+        exit 1
+        ;;
+esac
+
+# Récupérer les informations du certificat
+#cert_info=$(echo | eval $openssl_cmd | openssl x509 -noout -subject -enddate)
+cert_info=$(echo | eval $openssl_cmd | openssl x509 -noout -subject -enddate -text)
+
+# Vérification si le certificat est récupéré
+if [[ -z "$cert_info" ]]; then
+    echo "Erreur : Impossible de récupérer le certificat."
+    exit 1
+fi
+
+# Extraction des CN et de la date de fin
+cn=$(echo "$cert_info" | grep "subject=" | sed -n 's/.*CN =\(.*\)/\1/p')
+dns=$(echo "$cert_info" | grep "DNS:" | sed 's/DNS://g' | tr -s "\t " " ")
+end_date=$(echo "$cert_info" | grep "notAfter=" | cut -d= -f2)
+
+# Calcul des jours restants
+days_left=$(days_remaining "$end_date")
+
+# Affichage des informations
+echo "CN du certificat : $cn"
+echo "X509v3 Subject Alternative Name: $dns"
+echo "Date de fin de validité : $end_date"
+echo "Jours restants : $days_left"
+
+# Sortie avec code 2 si moins de 15 jours
+if [[ $days_left -le $threshold ]]; then
+    exit_code=2
+fi
+
+exit $exit_code
+
