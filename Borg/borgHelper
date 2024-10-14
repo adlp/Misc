@@ -31,7 +31,7 @@ import json
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.27"
+Version="0.27.1"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -39,6 +39,7 @@ Version="0.27"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.27.1 now report multi host
 # 0.27 report, it's working !! :)... report, the true bengining !
 # 0.26 borghelperrc, is no more hard coded :) (yipii)
 # 0.25 Now Login is used (for sto), correct a bug for some return
@@ -443,7 +444,8 @@ def prep_report(nick,debug=0,maxp=None):
 
     tcmpl={}
     tcmpl[nick]={}
-    tcmpl[nick]['nom']          =cfg['SER_NAME']
+    #tcmpl[nick]['nom']          =cfg['SER_NAME']
+    tcmpl[nick]['nom']          =nick
     tcmpl[nick]['date derniere']=dabesi["date"]
     tcmpl[nick]['depuis']       =dabesi['since']
     tcmpl[nick]['duree']        =kept[resume['lastname']]['durationM']
@@ -477,23 +479,28 @@ def prep_report(nick,debug=0,maxp=None):
 
     return(tcmpl,tbkps)
 
-def cmd_report(nick,debug=0,maxp=None):
-    (tcmpl,tbkps)=prep_report(nick,debug=debug,maxp=maxp)
-
-    for i in ['derniere','moy','taille','recuperable','reste']:
-        if (i in tcmpl[nick].keys()) and not(tcmpl[nick][i] is  None):
-            tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
-        else:
-            tcmpl[nick][i]=""
-    tcmpl[nick]['depuis']=f"{tcmpl[nick]['depuis']:.2f} h"
-    tcmpl[nick]['duree']=f"{tcmpl[nick]['duree']:.2f} min"
-    for i in tbkps.keys():
-        for j in ['original_size','compressed_size','deduplicated_size']:
-            tbkps[i][j]=convert_octets_readable(tbkps[i][j])
-        if 'duration' in tbkps[i].keys():
-            tbkps[i]['duration']=f"{tbkps[i]['duration']:.2f} min"
-    print(prettyTabelise(tcmpl))
-    print(prettyTabelise(tbkps))
+def cmd_report(nicks,debug=0,maxp=None):
+    reshos={}
+    resbck={}
+    for nick in nicks.split(','):
+        (tcmpl,tbkps)=prep_report(nick,debug=debug,maxp=maxp)
+    
+        for i in ['derniere','moy','taille','recuperable','reste']:
+            if (i in tcmpl[nick].keys()) and not(tcmpl[nick][i] is  None):
+                tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
+            else:
+                tcmpl[nick][i]=""
+        tcmpl[nick]['depuis']=f"{tcmpl[nick]['depuis']:.2f} h"
+        tcmpl[nick]['duree']=f"{tcmpl[nick]['duree']:.2f} min"
+        for i in tbkps.keys():
+            for j in ['original_size','compressed_size','deduplicated_size']:
+                tbkps[i][j]=convert_octets_readable(tbkps[i][j])
+            if 'duration' in tbkps[i].keys():
+                tbkps[i]['duration']=f"{tbkps[i]['duration']:.2f} min"
+        reshos[nick]=tcmpl[nick]
+        resbck[nick]=tbkps
+        print(prettyTabelise(tbkps))
+    print(prettyTabelise(reshos))
 
 def d2DateNSince(datepourrie):
     from datetime import datetime
