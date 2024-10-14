@@ -31,7 +31,7 @@ import json
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.27.1"
+Version="0.27.3"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -39,6 +39,8 @@ Version="0.27.1"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.27.3 html report are made, not finish but made, not fi....
+# 0.27.2 report, more stable
 # 0.27.1 now report multi host
 # 0.27 report, it's working !! :)... report, the true bengining !
 # 0.26 borghelperrc, is no more hard coded :) (yipii)
@@ -97,8 +99,8 @@ def usage(doc=None,debug=0):
         printer("       On liste les backup connus")
         printer("   -c LstBkpFls [-n nickname/servername] [-b backupid/last]")
         printer("       On liste les fichiers d'un backup precis")
-        printer("⚗️  -c Report [-n nickname/servername] [-b backupid/last]")
-        printer("       Rapport sur le dernier (ou pas) backup")
+        printer("⚗️  -c Report [-n nickname/servername] [-b backupid/last] [-l]")
+        printer("       Rapport sur le dernier (ou pas) backup, avec sortie en htmL")
         printer("   -c DiffBkp [-n nickname/servername] [-b backupid] [-w where]")
         printer("       Liste les mouvements des fichiers entre le backupid et le dernier backup")
         printer("   -c Restore [-n nickname/servername] [-b backupid/last] -f file2get -w where")
@@ -363,15 +365,19 @@ def cacheJsonBoexWithLM(nick,boexarg,prefix="/tmp/borgHelper-",suffix=".json",ou
             for line in fd:
                 caTxt+=line
             fd.close()
-        ret=json.loads(caTxt)[0]
+        ret=json.loads(caTxt)
     else:
         if debug:
             printer("Create cache")
-        ret=boex(nick,boexarg,debug=debug)[output][0] #BUG POTENTIEL, probablement sortire 1er elem fiche
+        ret=boex(nick,boexarg,debug=debug)[output][0]
         with open(nomFi,"w") as fd:
             print(json.dumps(ret,indent=4),file=fd)
             fd.close()
-    return(ret)
+    #Quand on en est la, ca ne sent pas bon
+    if type(ret) is list:
+        return(ret[0])
+    else:
+        return(ret)
     
 
 def prep_report(nick,debug=0,maxp=None):
@@ -479,12 +485,18 @@ def prep_report(nick,debug=0,maxp=None):
 
     return(tcmpl,tbkps)
 
-def cmd_report(nicks,debug=0,maxp=None):
+def cmd_report(nicks,htrep=False,dayback=None,debug=0,maxp=None):
     reshos={}
     resbck={}
+    reshosto={}
+    for i in ['duree','derniere','taille','recuperable']:
+        reshosto[i]=0
+    reshosto['nom']='Totaux'
     for nick in nicks.split(','):
         (tcmpl,tbkps)=prep_report(nick,debug=debug,maxp=maxp)
     
+        for i in ['duree','derniere','taille','recuperable']:
+            reshosto[i]+=tcmpl[nick][i]
         for i in ['derniere','moy','taille','recuperable','reste']:
             if (i in tcmpl[nick].keys()) and not(tcmpl[nick][i] is  None):
                 tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
@@ -499,8 +511,24 @@ def cmd_report(nicks,debug=0,maxp=None):
                 tbkps[i]['duration']=f"{tbkps[i]['duration']:.2f} min"
         reshos[nick]=tcmpl[nick]
         resbck[nick]=tbkps
-        print(prettyTabelise(tbkps))
-    print(prettyTabelise(reshos))
+    for i in ['derniere','taille','recuperable']:
+        reshosto[i]=convert_octets_readable(reshosto[i])
+    reshosto['duree']=f"{reshosto['duree']:.2f} min"
+    reshos['Totaux']=reshosto
+    if htrep:
+        print("<!DOCTYPE html>")
+        print("<html>")
+        print('  <body bgcolor="#ffffff">')
+        print("    <br>")
+        print(htmlTabelise(reshos,colnames=['nom','duree','depuis','derniere','taille','recuperable','reste']))
+        print('  </body>')
+        print('</html>')
+        for nick in nicks.split(','):
+            print(htmlTabelise(resbck[nick],colnames=['name','duration','original_size','compressed_size','deduplicated_size','nfiles']))
+    else:
+        print(prettyTabelise(reshos))
+        for nick in nicks.split(','):
+            print(prettyTabelise(resbck[nick]))
 
 def d2DateNSince(datepourrie):
     from datetime import datetime
@@ -539,6 +567,28 @@ def prettyTabelise(tab):
         t.add_row(liste)
     return(t)
 
+def htmlTabelise(tabl,border=0,colnames=None):
+    ret=""
+    ret+="<table border='0'>\n  <tr>\n"
+    # Generation du tableau pour les titres
+    if colnames == None:
+        colnames=[]
+        for y in tabl.keys(): # On cherche ds tout les elements
+            for x in tabl[y].keys():   # On pecho la clef, car ca c'est de la bonne
+                colnames.append(x)
+    for x in colnames:
+        ret+=f"    <td colspan=1>{x}</td><td style='width:20px;'></td>\n"
+    ret+="    </tr>\n"
+    for y in tabl.keys():
+        ret+='  <tr>\n'
+        for x in colnames:
+            val=""
+            if x in tabl[y].keys():
+                val=tabl[y][x]
+            ret+=f"    <td colspan=1>{val}</td><td style='width:20px;'></td>\n"
+        ret+='    </tr>\n'
+    ret+='</table>\n'
+    return(ret)
 
 def dfRepo(nick,debug=0):
     cfg=cfgreaded(nick,debug=debug)
@@ -838,7 +888,7 @@ def boex(nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True): #,g
 ######### Analyse Arguments
 
 try:
-    opts, args = getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:f:w:dv", ["help"])
+    opts, args = getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:f:w:dvl", ["help"])
 except getopt.GetoptError as err:
     print(err)  # will print something like "option -a not recognized"
     usage()
@@ -852,8 +902,8 @@ optab={ 'stats'     :'cdn',      'login'     :'cdsnkprm',
         'lstbkp'    :'cdn',      'lstbkpfls' :'cdnb',
         'restore'   :'cdnbfw',   'diffbkp'   :'cdnbw',
         'delbkp'    :'cdnb',     'bkp'       :'cdn',
-        'prune'     :'cdn',      'report'    :'cdnb',
-        'init'      :'cdn',     'poc'       :'cdn',}
+        'prune'     :'cdn',      'report'    :'cdnbl',
+        'init'      :'cdn',      'poc'       :'cdn',}
 
 for opt,arg in opts:
     if   opt in '-h':
@@ -944,7 +994,10 @@ elif cmd == 'report':
         options['-b']=None
     else:
         options['-b']=int(options['-b'])
-    cmd_report(nick,maxp=options['-b'],debug=debug)
+    if '-l' in options.keys():
+        cmd_report(nick,htrep=True,maxp=options['-b'],debug=debug)
+    else:
+        cmd_report(nick,maxp=options['-b'],debug=debug)
 elif cmd == 'diffbkp':
     # printer("-c DiffBkp [-n nickname/servername] [-b backupid] -w where")
     if '-b' not in options.keys():
