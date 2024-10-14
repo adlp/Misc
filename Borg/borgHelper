@@ -31,7 +31,7 @@ import json
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.26"
+Version="0.27"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -39,6 +39,7 @@ Version="0.26"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.27 report, it's working !! :)... report, the true bengining !
 # 0.26 borghelperrc, is no more hard coded :) (yipii)
 # 0.25 Now Login is used (for sto), correct a bug for some return
 # 0.24 License Header
@@ -351,7 +352,7 @@ def cmd_lstfiles(nick,bid,debug=0):
     sys.exit(rb['exitcode'])
 
 def cacheJsonBoexWithLM(nick,boexarg,prefix="/tmp/borgHelper-",suffix=".json",output="stdout",debug=0):
-    last_modified=json.loads(''.join(boex(nick,['info','--json'],debug=debug)['stdout']))['repository']['last_modified']
+    last_modified=boex(nick,['info','--json'],debug=debug)['stdout'][0]['repository']['last_modified']
     nomFi=prefix+nick+'-'+last_modified+suffix
     if os.path.isfile(nomFi):
         if debug:
@@ -361,11 +362,11 @@ def cacheJsonBoexWithLM(nick,boexarg,prefix="/tmp/borgHelper-",suffix=".json",ou
             for line in fd:
                 caTxt+=line
             fd.close()
-        ret=json.loads(caTxt)
+        ret=json.loads(caTxt)[0]
     else:
         if debug:
             printer("Create cache")
-        ret=json.loads('\n'.join(boex(nick,boexarg,debug=debug)[output]))
+        ret=boex(nick,boexarg,debug=debug)[output][0] #BUG POTENTIEL, probablement sortire 1er elem fiche
         with open(nomFi,"w") as fd:
             print(json.dumps(ret,indent=4),file=fd)
             fd.close()
