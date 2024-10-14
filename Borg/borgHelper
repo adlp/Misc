@@ -29,9 +29,9 @@ import json
 # sshd distant a cfg pour permettre le sendEnv
 # sur le repo01 poser la clef du serveur
 
-cfgfile="/root/.borghelperrc"
+cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.25"
+Version="0.26"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -39,6 +39,7 @@ Version="0.25"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.26 borghelperrc, is no more hard coded :) (yipii)
 # 0.25 Now Login is used (for sto), correct a bug for some return
 # 0.24 License Header
 # 0.23 Tout plein de correctifs pour faire marcher les backups cf 0.20
