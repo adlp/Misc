@@ -31,7 +31,7 @@ import json
 
 cfgfile="/root/.borghelperrc"
 
-Version="0.24"
+Version="0.25"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -39,6 +39,7 @@ Version="0.24"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.25 Now Login is used (for sto), correct a bug for some return
 # 0.24 License Header
 # 0.23 Tout plein de correctifs pour faire marcher les backups cf 0.20
 # 0.22 Integration d'init pour initialiser un repo (local)
@@ -668,7 +669,7 @@ def cmd_bkp(nick,debug=0):
     if 'SSH_REMFO' in cfg.keys():
         preBorg.append('-R')
         preBorg.append(cfg['SSH_REMFO'])
-    preBorg.extend(f'-A -o VisualHostKey=no -o StrictHostKeyChecking=accept-new {cfg["SER_NAME"]}'.split(' '))
+    preBorg.extend(f'-A -o VisualHostKey=no -o StrictHostKeyChecking=accept-new {cfg["SER_LOGIN"]}@{cfg["SER_NAME"]}'.split(' '))
     if 'SSH_KEY' in cfg.keys():
         preBorg.append('-i')
         preBorg.append(cfg['SSH_KEY'])
@@ -717,7 +718,7 @@ def cmd_bkp(nick,debug=0):
         for i in (anaRet['stderr']):
             if debug:
                 printer(i)
-            if i['levelname'] == "ERROR":
+            if type(i) != str and i['levelname'] == "ERROR":
                 newretC=2
 
     sys.exit(newretC)
