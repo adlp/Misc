@@ -31,7 +31,7 @@ import json
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.27.5"
+Version="0.28"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -39,6 +39,7 @@ Version="0.27.5"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.28 Now stars and exit code for report with too much old
 # 0.27.5 tracking des fichiers de cache
 # 0.27.4 recuperation sur erreur de borg dans boex
 # 0.27.3 html report are made, not finish but made, not fi....
@@ -491,11 +492,18 @@ def cmd_report(nicks,htrep=False,dayback=None,debug=0,maxp=None):
     reshos={}
     resbck={}
     reshosto={}
+    errcode=0
+
     for i in ['duree','derniere','taille','recuperable']:
         reshosto[i]=0
     reshosto['nom']='Totaux'
     for nick in nicks.split(','):
+        cfg=cfgreaded(nick,debug=debug)
         (tcmpl,tbkps)=prep_report(nick,debug=debug,maxp=maxp)
+
+        if(tcmpl[nick]['depuis'] > (float(cfg["MAX_AGE_BKP"])*60)):
+            errcode=1
+            tcmpl[nick]['nom']=f"***{nick}"
     
         for i in ['duree','derniere','taille','recuperable']:
             reshosto[i]+=tcmpl[nick][i]
@@ -531,6 +539,7 @@ def cmd_report(nicks,htrep=False,dayback=None,debug=0,maxp=None):
         print(prettyTabelise(reshos))
         for nick in nicks.split(','):
             print(prettyTabelise(resbck[nick]))
+    return(errcode)
 
 def d2DateNSince(datepourrie):
     from datetime import datetime
@@ -996,14 +1005,16 @@ elif cmd == 'lstbkpfls':
     cmd_lstfiles(nick,options['-b'],debug=debug)
 elif cmd == 'report':
     # printer("   -c Report [-n nickname/servername] [-b backupid/last]")
+    errcmd=0
     if '-b' not in options.keys() or 'last' in options['-b']:
         options['-b']=None
     else:
         options['-b']=int(options['-b'])
     if '-l' in options.keys():
-        cmd_report(nick,htrep=True,maxp=options['-b'],debug=debug)
+        errcmd=cmd_report(nick,htrep=True,maxp=options['-b'],debug=debug)
     else:
-        cmd_report(nick,maxp=options['-b'],debug=debug)
+        errcmd=cmd_report(nick,maxp=options['-b'],debug=debug)
+    sys.exit(errcmd)
 elif cmd == 'diffbkp':
     # printer("-c DiffBkp [-n nickname/servername] [-b backupid] -w where")
     if '-b' not in options.keys():
