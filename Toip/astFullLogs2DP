@@ -99,7 +99,7 @@ while (my $line = <$DESC>) {
                 if (not ($excont ~~ @noDispExten)) {
                     if('l' ~~ @logType) {
                         $coloChoosed='White';
-                        if(length($matchLog) and $curli =~ /$matchLog/) { $coloChoosed='Red'; }
+                        if(length($matchLog) and $curli =~ /$matchLog/i) { $coloChoosed='Red'; }
                         if($resume==0) {
                             printColor($coloChoosed,$curli."\n");
                             }
@@ -127,18 +127,23 @@ while (my $line = <$DESC>) {
                             }
                         }
                     if(defined($tacont{$excont}[int($linnuco)]) and 'c' ~~ @logType) {
+                        $curli="[$excont:$linnuco]: ".$tacont{$excont}[int($linnuco)];
+                        $coloChoosed='Yellow';
+                        if(length($matchLog) and $curli =~ /$matchLog/i) { $coloChoosed='Red'; }
                         printColor('Blue',"        [$excont:$linnuco]:");
-                        printColor("Yellow",$tacont{$excont}[int($linnuco)]."\n");
+                        printColor($coloChoosed,$tacont{$excont}[int($linnuco)]."\n");
                         }
                     # else { print("=======$excont/".int($linnuco)."\n"); }
                     }
                 }
             elsif('i' ~~ @logType) {
+                $coloChoosed='Gray';
+                if(length($matchLog) and $curli =~ /$matchLog/i) { $coloChoosed='Red'; }
                 if($resume==0) {
-                    printColor('Gray',$_."\n");
+                    printColor($coloChoosed,$curli."\n");
                     }
                 elsif(/Started music on hold/ or /Stopped music on hold/ or /bridge/) {
-                    printColor('Gray',$_."\n");
+                    printColor($coloChoosed,$curli."\n");
                     }
                 }
             }
