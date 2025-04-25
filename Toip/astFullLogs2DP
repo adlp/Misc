@@ -5,7 +5,7 @@ use warnings;
 
 use Getopt::Std;
 
-my %ansiColor=( 'Red'=>31, 'Green'=>32, 'Yellow'=>33, 'Blue'=>34, 'Magenta'=>35, 'Cyan'=>36, 'White'=>37 );
+my %ansiColor=( 'Red'=>31, 'Green'=>32, 'Yellow'=>33, 'Blue'=>34, 'Magenta'=>35, 'Cyan'=>36, 'White'=>37, 'Gray'=>90 );
 
 sub printColor {
     my ($color,$truc2prn)=@_;
@@ -45,29 +45,35 @@ my $log="/var/log/asterisk/full";
 if(!defined($opts{'t'}))    { print_usage(); }
 if(defined($opts{'f'}))     { $log=$opts{'f'}; }
 
-my $mrk=$opts{'t'};
+my @mrks=split(/,/,$opts{'t'});
 my %tacont;
 
 my $FL=*STDIN;
 if($log ne "-")     { open($FL,'<',$log) or die $! };
 
-while(<$FL>) {
-    if(/\]\[$mrk\]/) {
-        chomp();
-        print($_."\n");
-        if(/\]\[$mrk\] pbx.c: Executing \[/) {
-            # [Oct 18 09:01:52] VERBOSE[275996][C-000002ac] pbx.c: Executing [33164764275@from-external:1] NoOp("IAX2/TOOTAi-2924", "[C-000002ac] Icelus Clay 33164764275 Appel entrant de 0618497867 0618497867") in new stack
-            s/^.* pbx.c: Executing \[(.*)@(.*):(\d*)\] .*/$1\@$2 $3/;
-            my($excont,$linnuco)=split(/ /);
-            if(!defined($tacont{$excont})) { 
-                $tacont{$excont}=[];
-                $tacont{$excont}=[astloadcontext($excont)];
-            }
-            if(defined($tacont{$excont}[int($linnuco)])) {
-                printColor('Blue',"        [$excont:$linnuco]:");
-                printColor("Yellow",$tacont{$excont}[int($linnuco)]."\n");
+while(my $line=<$FL>) {
+    foreach my $mrk (@mrks) {
+        $_=$line;
+        if(/\]\[$mrk\]/) {
+            chomp();
+            if(/\]\[$mrk\] pbx.c: Executing \[/) {
+                printColor('White',$_."\n");
+                # [Oct 18 09:01:52] VERBOSE[275996][C-000002ac] pbx.c: Executing [33164764275@from-external:1] NoOp("IAX2/TOOTAi-2924", "[C-000002ac] Icelus Clay 33164764275 Appel entrant de 0618497867 0618497867") in new stack
+                s/^.* pbx.c: Executing \[(.*)@(.*):(\d*)\] .*/$1\@$2 $3/;
+                my($excont,$linnuco)=split(/ /);
+                if(!defined($tacont{$excont})) { 
+                    $tacont{$excont}=[];
+                    $tacont{$excont}=[astloadcontext($excont)];
                 }
-            else { print("=======$excont/".int($linnuco)."\n"); }
+                if(defined($tacont{$excont}[int($linnuco)])) {
+                    printColor('Blue',"        [$excont:$linnuco]:");
+                    printColor("Yellow",$tacont{$excont}[int($linnuco)]."\n");
+                    }
+                else { print("=======$excont/".int($linnuco)."\n"); }
+                }
+            else {
+                printColor('Gray',$_."\n");
+                }
             }
         }
     }
