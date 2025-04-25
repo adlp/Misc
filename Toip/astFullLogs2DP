@@ -108,8 +108,9 @@ if(defined($exten)) {
         s/^\[(\w+[ ]*\d+ \d+:\d+:\d+)\] .*\[\d+\](\[\S+\]) .*/$1 $2/;
         $cid=$2;
         $fiext=undef;
-        if ($line =~ m{(?:/|\s)\Q$exten\E(?:[:@-])}) {
+        if ($line =~ m{(?:/|\s)\Q$exten\E(?:[:@-])} and ! ($line =~ /connected line has changed. Saving it until answer for/)) {
             #printColor('Red',"$exten///:".$_."\n");
+            #printColor('Blue',$line."\n");
             $fiext=$exten;
             }
 
