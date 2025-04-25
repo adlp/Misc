@@ -27,7 +27,8 @@ sub print_usage {
     print("-a l,c,i Affiche les logs,la conf correspondante et les interlogues (defaut l,c,i)\n");
     print("-n exten1\@context,exten2\@context n'affiche pas les extension precises\n");
     print("-w white, no color\n");
-    print('-m chaine    permet de faire rougir les lignes contenant chaine dans les logs');
+    print("-m chaine    permet de faire rougir les lignes contenant chaine dans les logs\n");
+    print("-r hanyle tout les parametres autre que t et f afin de n'afficher qu'un resume\n");
     print("Si des données sont presente sur le stdin, cela by passe le -f\n");
     exit(1);
     }
@@ -51,18 +52,20 @@ sub astloadcontext {
 
 
 my %opts;
-getopts("t:f:a:n:m:w",\%opts) or print_usage();
+getopts("t:f:a:n:m:wr",\%opts) or print_usage();
 
 my @logType=['l','c','i'];
 my @noDispExten=[''];
 my $log="/var/log/asterisk/full";
 my $matchLog='';
+my $resume=0;
 if(!defined($opts{'t'}))    { print_usage(); }
 if(defined($opts{'f'}))     { $log=$opts{'f'}; }
 if(defined($opts{'a'}))     { @logType=split(/,/,$opts{'a'}); }
 if(defined($opts{'n'}))     { @noDispExten=split(/,/,$opts{'n'}); }
 if(defined($opts{'m'}))     { $matchLog=$opts{'m'}; }
 if(defined($opts{'w'}))     { $nocolor=1; }
+if(defined($opts{'r'}))     { $resume=1; @logType=['l',"i"]; }
 
 
 my @mrks=split(/,/,$opts{'t'});
@@ -97,7 +100,31 @@ while (my $line = <$DESC>) {
                     if('l' ~~ @logType) {
                         $coloChoosed='White';
                         if(length($matchLog) and $curli =~ /$matchLog/) { $coloChoosed='Red'; }
-                        printColor($coloChoosed,$curli."\n");
+                        if($resume==0) {
+                            printColor($coloChoosed,$curli."\n");
+                            }
+                        else {
+                            $_=$curli;
+                            if($resume==1) {
+                                printColor('Gray',$_."\n");
+                                $resume++;
+                                }
+                            elsif($resume==2) {
+                                if(/ Executing \[h\@/) {
+                                    printColor($coloChoosed,$_."\n");
+                                    $resume++;
+                                    }
+                                }
+                            if(/s\@toolsGoMarking:\d+] NoOp/ and ! /debugage/) {
+                                printColor($coloChoosed,$curli."\n");
+                                }
+                            elsif(/] Queue\(/) {
+                                printColor($coloChoosed,$curli."\n");
+                                }
+                            elsif(/ pbx.c: Executing \[getSite\@tools:\d+] Set\(".*", "__GoGetSiteDtmf=/ and ! /No DMTF Needed for/) {
+                                printColor($coloChoosed,$curli."\n");
+                                }
+                            }
                         }
                     if(defined($tacont{$excont}[int($linnuco)]) and 'c' ~~ @logType) {
                         printColor('Blue',"        [$excont:$linnuco]:");
@@ -107,7 +134,12 @@ while (my $line = <$DESC>) {
                     }
                 }
             elsif('i' ~~ @logType) {
-                printColor('Gray',$_."\n");
+                if($resume==0) {
+                    printColor('Gray',$_."\n");
+                    }
+                elsif(/Started music on hold/ or /Stopped music on hold/ or /bridge/) {
+                    printColor('Gray',$_."\n");
+                    }
                 }
             }
         }
