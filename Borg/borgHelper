@@ -31,7 +31,7 @@ import json
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.29.1"
+Version="0.30"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -39,6 +39,7 @@ Version="0.29.1"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.30 If BORG_ARCHNAME begin by :: archname will be it (not only middle name) and will be finish by the backuptime + correction
 # 0.29.1 And now... prune tooooo :)
 # 0.29 Now -n nick mean all known borged host ;) ... usuable only for report a this time :/
 # 0.28 Now stars and exit code for report with too much old
@@ -770,7 +771,10 @@ def cmd_bkp(nick,debug=0):
     archname='root'
     if 'BORG_ARCHNAME' in cfg.keys():
         archname=cfg['BORG_ARCHNAME']
-    create.append('::{fqdn}-'+archname+'-{now}')
+    if archname[:2] == "::":
+        create.append(archname+'-{now}')
+    else:
+        create.append('::{fqdn}-'+archname+'-{now}')
 
     rootbkp="/"
     if 'BORG_ROOTBKP' in cfg.keys():
@@ -805,7 +809,7 @@ def cmd_bkp(nick,debug=0):
         for i in (anaRet['stderr']):
             if debug:
                 printer(i)
-            if type(i) != str and i['levelname'] == "ERROR":
+            if type(i) != str and 'levelname' in i and i['levelname'] == "ERROR":
                 newretC=2
 
     sys.exit(newretC)
