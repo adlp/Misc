@@ -6,6 +6,8 @@ use warnings;
 use Getopt::Std;
 use IO::Uncompress::Gunzip;
 
+use experimental 'smartmatch';
+
 my %ansiColor=( 'Red'=>31, 'Green'=>32, 'Yellow'=>33, 'Blue'=>34, 'Magenta'=>35, 'Cyan'=>36, 'White'=>37, 'Gray'=>90 );
 my $nocolor=0;
 
