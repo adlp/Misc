@@ -13,7 +13,7 @@ my $nocolor=0;
 
 sub printColor {
     my ($color,$truc2prn)=@_;
-    if($nocolor) {
+    if($nocolor or ($color eq "")) {
         print($truc2prn);
         }
     else {
@@ -29,6 +29,7 @@ sub print_usage {
     print("-w white, no color\n");
     print("-m chaine    permet de faire rougir les lignes contenant chaine dans les logs\n");
     print("-r hanyle tout les parametres autre que t et f afin de n'afficher qu'un resume\n");
+    print("-e exten     nom de l'extension dont on recherche les appelles\n");
     print("Si des données sont presente sur le stdin, cela by passe le -f\n");
     exit(1);
     }
@@ -52,35 +53,97 @@ sub astloadcontext {
 
 
 my %opts;
-getopts("t:f:a:n:m:wr",\%opts) or print_usage();
+getopts("t:f:a:n:m:wre:",\%opts) or print_usage();
 
 my @logType=['l','c','i'];
 my @noDispExten=[''];
 my $log="/var/log/asterisk/full";
 my $matchLog='';
 my $resume=0;
-if(!defined($opts{'t'}))    { print_usage(); }
+my $exten=undef;
+
+if((!defined($opts{'t'})) and (!defined($opts{'e'})))    { print_usage(); }
 if(defined($opts{'f'}))     { $log=$opts{'f'}; }
 if(defined($opts{'a'}))     { @logType=split(/,/,$opts{'a'}); }
 if(defined($opts{'n'}))     { @noDispExten=split(/,/,$opts{'n'}); }
 if(defined($opts{'m'}))     { $matchLog=$opts{'m'}; }
 if(defined($opts{'w'}))     { $nocolor=1; }
 if(defined($opts{'r'}))     { $resume=1; @logType=['l',"i"]; }
+if(defined($opts{'e'}))     { $exten=$opts{'e'}; }
 
 
-my @mrks=split(/,/,$opts{'t'});
+my @mrks=[];
+if(defined($opts{'t'})) {
+    @mrks=split(/,/,$opts{'t'});
+    }
 my %tacont;
 
 my $FD=*STDIN;
 my $rastdin=-t STDIN;
-if($rastdin and $log eq "-") { print "Bug dans la matrice ya rien dans le stdin";die $! }
-elsif($rastdin)             { open($FD,'<',$log) or die $! };
+if($rastdin and $log eq "-")    { print "Bug dans la matrice ya rien dans le stdin";die $! }
+elsif($rastdin)                 { open($FD,'<',$log) or die $! };
 
 my $curli="";
 my $coloChoosed;
 
 my $DESC = IO::Uncompress::Gunzip->new($FD)
     or die "Erreur de décompression: $IO::Uncompress::Gunzip::GunzipError\n";
+
+if(defined($exten)) {
+    my %memret;
+    my $cid;
+    my $fiext;
+
+    while (my $line = <$DESC>) {
+        $_=$line;
+        chomp();
+
+### Stockage de la 1ere ligne par CID
+### Si ligne contient exten + un CID pas encore afficher 1ere ligne => afficher 1ere ligne
+### Si ligne contient un CID affiché & [h@.*:1} => affiche la ligne
+### Si la ligne contient un reachable + exten => affiche
+        #[Mar 14 07:59:27] VERBOSE[1752443][C-00013714] ...
+        #[Mar 14 07:59:27] VERBOSE[1752433][C-00013712] pbx.c: Executing [clusterDB@tools:13] Verbose("Local/95602@internal-000049af;2", "clusterDB : DB(ASTREINTE/ASTR/2/status)=att=att") in new stack
+
+        s/^\[(\w+[ ]*\d+ \d+:\d+:\d+)\] .*\[\d+\](\[\S+\]) .*/$1 $2/;
+        $cid=$2;
+        $fiext=undef;
+        if ($line =~ m{(?:/|\s)\Q$exten\E(?:[:@-])}) {
+            #printColor('Red',"$exten///:".$_."\n");
+            $fiext=$exten;
+            }
+
+        if(defined($cid)) {
+            if(!defined($memret{$cid})) {
+                $memret{$cid}={};
+                $memret{$cid}{'fl'}=$line;
+                $memret{$cid}{'st'}=0;
+                }
+            if(defined($fiext) and ($memret{$cid}{'st'} == 0)) {
+                printColor('Green',$memret{$cid}{'fl'});
+                $memret{$cid}{'st'}++;
+                }
+            if(($memret{$cid}{'st'} == 1) and $line =~ /\[h@.*:1\]/) {
+                #printColor('Yellow',$cid."\n");
+                #printColor('Yellow',$memret{$cid}{'st'}."\n");
+                printColor('Yellow',$line);
+                $memret{$cid}{'st'}++;
+                }
+            }
+        if ($line =~ m{(?:\s|')\Q$exten\E(?:\s|')(?=.*reachable)}i) {
+            printColor('Red',$line);
+            }
+        if(defined($fiext) and $line =~ m/each/i) {
+            1;
+            }
+        if(!defined($fiext) and !defined($cid)) {
+            1;
+            #printColor('Gray',$line);
+            }
+        }
+
+    exit(0);
+    }
 
 while (my $line = <$DESC>) {
     foreach my $mrk (@mrks) {
