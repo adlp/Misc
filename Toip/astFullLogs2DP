@@ -22,14 +22,17 @@ sub printColor {
     }
 
 sub print_usage {
+    print(" <-t|-e|-c> XXXXX [-r] [-a <l|c|i>] [-n XXXX] [-w] [-m XXXXX] [-f XXXXX]\n");
+    print("\n");
     print("-t le channel-id sur le quel on sort les morceaux du dialplan correspondant, NEEDED\n");
+    print("-e exten     nom de l'extension dont on recherche les appelles\n");
+    print("-c channel   nom du channel (pex PJSIP/EXTEN-ID) dont on recherche les channel-id\n");
     print("-f le fichuier de log, par defaut /var/log/asterisk/full mais stdin autorise  zcat XXXX | truc\n");
     print("-a l,c,i Affiche les logs,la conf correspondante et les interlogues (defaut l,c,i)\n");
     print("-n exten1\@context,exten2\@context n'affiche pas les extension precises\n");
     print("-w white, no color\n");
     print("-m chaine    permet de faire rougir les lignes contenant chaine dans les logs\n");
     print("-r hanyle tout les parametres autre que t et f afin de n'afficher qu'un resume\n");
-    print("-e exten     nom de l'extension dont on recherche les appelles\n");
     print("Si des données sont presente sur le stdin, cela by passe le -f\n");
     exit(1);
     }
@@ -53,7 +56,7 @@ sub astloadcontext {
 
 
 my %opts;
-getopts("t:f:a:n:m:wre:",\%opts) or print_usage();
+getopts("t:f:a:n:m:wre:c:",\%opts) or print_usage();
 
 my @logType=['l','c','i'];
 my @noDispExten=[''];
@@ -61,8 +64,9 @@ my $log="/var/log/asterisk/full";
 my $matchLog='';
 my $resume=0;
 my $exten=undef;
+my $channel=undef;
 
-if((!defined($opts{'t'})) and (!defined($opts{'e'})))    { print_usage(); }
+if((!defined($opts{'t'})) and (!defined($opts{'e'})) and (!defined($opts{'c'})))    { print_usage(); }
 if(defined($opts{'f'}))     { $log=$opts{'f'}; }
 if(defined($opts{'a'}))     { @logType=split(/,/,$opts{'a'}); }
 if(defined($opts{'n'}))     { @noDispExten=split(/,/,$opts{'n'}); }
@@ -70,6 +74,12 @@ if(defined($opts{'m'}))     { $matchLog=$opts{'m'}; }
 if(defined($opts{'w'}))     { $nocolor=1; }
 if(defined($opts{'r'}))     { $resume=1; @logType=['l',"i"]; }
 if(defined($opts{'e'}))     { $exten=$opts{'e'}; }
+if(defined($opts{'c'}))     { 
+    $channel=$opts{'c'};
+    $_=$channel;
+    if(!/\//) { print_usage(); }
+    elsif(!/-/) { print_usage(); }
+    }
 
 
 my @mrks=[];
@@ -88,6 +98,24 @@ my $coloChoosed;
 
 my $DESC = IO::Uncompress::Gunzip->new($FD)
     or die "Erreur de décompression: $IO::Uncompress::Gunzip::GunzipError\n";
+
+
+if(defined($channel)) {
+    my %seen;
+    my @champs;
+    my $champ;
+    while (my $line = <$DESC>) {
+        $_=$line;
+        if(/$channel/) {
+            s/\[/;/g;
+            s/\]/;/g;
+            @champs=split(/;/);
+            $champ=$champs[5];
+            $seen{$champ}=1 if defined $champ;
+            }
+        }
+    print "$_\n" for sort keys %seen;
+    }
 
 if(defined($exten)) {
     my %memret;
