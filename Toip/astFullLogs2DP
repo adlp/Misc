@@ -178,13 +178,13 @@ while (my $line = <$DESC>) {
                                     $resume++;
                                     }
                                 }
-                            if(/s\@toolsGoMarking:\d+] NoOp/ and ! /debugage/) {
+                            if($_ =~ /s\@toolsGoMarking:\d+] NoOp/ and ! $_ =~ /debugage/) {
                                 printColor($coloChoosed,$curli."\n");
                                 }
                             elsif(/] Queue\(/) {
                                 printColor($coloChoosed,$curli."\n");
                                 }
-                            elsif(/ pbx.c: Executing \[getSite\@tools:\d+] Set\(".*", "__GoGetSiteDtmf=/ and ! /No DMTF Needed for/) {
+                            elsif($_ =~ / pbx.c: Executing \[getSite\@tools:\d+] Set\(".*", "__GoGetSiteDtmf=/ or ! $_ =~ /No DMTF Needed for/) {
                                 printColor($coloChoosed,$curli."\n");
                                 }
                             }
@@ -203,10 +203,10 @@ while (my $line = <$DESC>) {
                 $coloChoosed='Gray';
                 if(length($matchLog) and $curli =~ /$matchLog/i) { $coloChoosed='Red'; }
                 if($resume==0) {
-                    printColor($coloChoosed,$curli."\n");
+                    printColor($coloChoosed,$line);
                     }
-                elsif(/Started music on hold/ or /Stopped music on hold/ or /bridge/) {
-                    printColor($coloChoosed,$curli."\n");
+                if($line =~ /Started music on hold/ or $line =~ /Stopped music on hold/ or $line =~ /bridge/) {
+                    printColor($coloChoosed,$_."\n");
                     }
                 }
             }
