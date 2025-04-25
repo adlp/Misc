@@ -14,10 +14,11 @@ sub printColor {
 
 sub print_usage {
     print("-t le channel-id sur le quel on sort les morceaux du dialplan correspondant, NEEDED\n");
-    print("-f le fichuier de log, par defaut /var/log/asterisk/full, permet de faire zcat XXXX | truc -f -\n");
+    print("-f le fichuier de log, par defaut /var/log/asterisk/full mais stdin autorise  zcat XXXX | truc\n");
     print("-a l,c,i Affiche les logs,la conf correspondante et les interlogues (defaut l,c,i\n");
     print("-n exten1\@context,exten2\@context n'affiche pas les extension precises\n");
-    print('-m chaine    permet de faire rougir les lignes contenant chaine dans l');
+    print('-m chaine    permet de faire rougir les lignes contenant chaine dans les logs');
+    print("Si des données sont presente sur le stdin, cela by passe le -f\n");
     exit(1);
     }
 
@@ -42,7 +43,6 @@ sub astloadcontext {
 my %opts;
 getopts("t:f:a:n:m:",\%opts) or print_usage();
 
-
 my @logType=['l','c','i'];
 my @noDispExten=[''];
 my $log="/var/log/asterisk/full";
@@ -58,7 +58,9 @@ my @mrks=split(/,/,$opts{'t'});
 my %tacont;
 
 my $FL=*STDIN;
-if($log ne "-")     { open($FL,'<',$log) or die $! };
+my $rastdin=-t STDIN;
+if($rastdin and $log eq "-") { print "Bug dans la matrice ya rien dans le stdin";die $! }
+elsif($rastdin)             { open($FL,'<',$log) or die $! };
 
 my $curli="";
 my $coloChoosed;
