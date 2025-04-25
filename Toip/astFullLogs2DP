@@ -121,6 +121,7 @@ if(defined($exten)) {
                 }
             if(defined($fiext) and ($memret{$cid}{'st'} == 0)) {
                 printColor('Green',$memret{$cid}{'fl'});
+                $memret{'StatusPoste'}{'reach'}=1;
                 $memret{$cid}{'st'}++;
                 }
             if(($memret{$cid}{'st'} == 1) and $line =~ /\[h@.*:1\]/) {
@@ -131,14 +132,18 @@ if(defined($exten)) {
                 }
             }
         if ($line =~ m{(?:\s|')\Q$exten\E(?:\s|')(?=.*reachable)}i) {
-            printColor('Red',$line);
-            }
-        if(defined($fiext) and $line =~ m/each/i) {
-            1;
-            }
-        if(!defined($fiext) and !defined($cid)) {
-            1;
-            #printColor('Gray',$line);
+            if($line =~ m/unreachable/i) {
+                if(!defined($memret{'StatusPoste'}{'reach'}) or $memret{'StatusPoste'}{'reach'}) {
+                    printColor('Red',$line);
+                    $memret{'StatusPoste'}{'reach'}=0;
+                    }
+                }
+            else {
+                if(!defined($memret{'StatusPoste'}{'reach'}) or $memret{'StatusPoste'}{'reach'}==0) {
+                    printColor('Red',$line);
+                    $memret{'StatusPoste'}{'reach'}=1;
+                    }
+                }
             }
         }
 
