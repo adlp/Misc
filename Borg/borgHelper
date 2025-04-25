@@ -31,7 +31,7 @@ import json
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.28"
+Version="0.29"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -39,6 +39,7 @@ Version="0.28"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.29 Now -n nick mean all known borged host ;) ... usuable only for report a this time :/
 # 0.28 Now stars and exit code for report with too much old
 # 0.27.5 tracking des fichiers de cache
 # 0.27.4 recuperation sur erreur de borg dans boex
@@ -210,6 +211,20 @@ def cfgread(nick,debug=0):
             #printer("show must go on")
             #return(pretab)
             return(config[nick])
+    else:
+        return(None)
+
+def cfgreadnicks(debug=0):
+    ret=None
+    preret=[]
+    if os.path.exists(cfgfile) and os.path.isfile(cfgfile):
+        config= configparser.ConfigParser()   
+        config.optionxform=str
+        config.read(cfgfile)
+        for nick in config.keys():
+            if nick != "DEFAULT":
+                preret.append(nick)
+        return(','.join(preret))
     else:
         return(None)
 
@@ -948,6 +963,9 @@ for opt,arg in opts:
         options[opt]=arg
     if opt in '-n':
         nick=arg
+
+if nick == "ALL":
+    nick=cfgreadnicks(debug)
 
 if debug != 0:
     printer(f'La commande fume {cmd}')
