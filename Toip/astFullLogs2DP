@@ -1,29 +1,11 @@
 #!/usr/bin/perl
 
-#/*
-#* astFullLogs2DP Compare logs too dialplan
-#* Copyright (C) 2024 Antoine DELAPORTE
-#*
-#* This program is free software: you can redistribute it and/or modify
-#* it under the terms of the GNU General Public License as published by
-#* the Free Software Foundation, either version 3 of the License, or
-#* (at your option) any later version.
-#*
-#* This program is distributed in the hope that it will be useful,
-#* but WITHOUT ANY WARRANTY; without even the implied warranty of
-#* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#* GNU General Public License for more details.
-#*
-#* You should have received a copy of the GNU General Public License
-#* along with this program.  If not, see <http://www.gnu.org/licenses/>.
-#*/
-
 use strict;
 use warnings;
 
 use Getopt::Std;
 
-my %ansiColor=( 'Red'=>31, 'Green'=>32, 'Yellow'=>33, 'Blue'=>34, 'Magenta'=>35, 'Cyan'=>36, 'White'=>37, 'Gray'=>90 );
+my %ansiColor=( 'Red'=>31, 'Green'=>32, 'Yellow'=>33, 'Blue'=>34, 'Magenta'=>35, 'Cyan'=>36, 'White'=>37 );
 
 sub printColor {
     my ($color,$truc2prn)=@_;
@@ -63,35 +45,29 @@ my $log="/var/log/asterisk/full";
 if(!defined($opts{'t'}))    { print_usage(); }
 if(defined($opts{'f'}))     { $log=$opts{'f'}; }
 
-my @mrks=split(/,/,$opts{'t'});
+my $mrk=$opts{'t'};
 my %tacont;
 
 my $FL=*STDIN;
 if($log ne "-")     { open($FL,'<',$log) or die $! };
 
-while(my $line=<$FL>) {
-    foreach my $mrk (@mrks) {
-        $_=$line;
-        if(/\]\[$mrk\]/) {
-            chomp();
-            if(/\]\[$mrk\] pbx.c: Executing \[/) {
-                printColor('White',$_."\n");
-                # [Oct 18 09:01:52] VERBOSE[275996][C-000002ac] pbx.c: Executing [33164764275@from-external:1] NoOp("IAX2/TOOTAi-2924", "[C-000002ac] Icelus Clay 33164764275 Appel entrant de 0618497867 0618497867") in new stack
-                s/^.* pbx.c: Executing \[(.*)@(.*):(\d*)\] .*/$1\@$2 $3/;
-                my($excont,$linnuco)=split(/ /);
-                if(!defined($tacont{$excont})) { 
-                    $tacont{$excont}=[];
-                    $tacont{$excont}=[astloadcontext($excont)];
+while(<$FL>) {
+    if(/\]\[$mrk\]/) {
+        chomp();
+        print($_."\n");
+        if(/\]\[$mrk\] pbx.c: Executing \[/) {
+            # [Oct 18 09:01:52] VERBOSE[275996][C-000002ac] pbx.c: Executing [33164764275@from-external:1] NoOp("IAX2/TOOTAi-2924", "[C-000002ac] Icelus Clay 33164764275 Appel entrant de 0618497867 0618497867") in new stack
+            s/^.* pbx.c: Executing \[(.*)@(.*):(\d*)\] .*/$1\@$2 $3/;
+            my($excont,$linnuco)=split(/ /);
+            if(!defined($tacont{$excont})) { 
+                $tacont{$excont}=[];
+                $tacont{$excont}=[astloadcontext($excont)];
+            }
+            if(defined($tacont{$excont}[int($linnuco)])) {
+                printColor('Blue',"        [$excont:$linnuco]:");
+                printColor("Yellow",$tacont{$excont}[int($linnuco)]."\n");
                 }
-                if(defined($tacont{$excont}[int($linnuco)])) {
-                    printColor('Blue',"        [$excont:$linnuco]:");
-                    printColor("Yellow",$tacont{$excont}[int($linnuco)]."\n");
-                    }
-                else { print("=======$excont/".int($linnuco)."\n"); }
-                }
-            else {
-                printColor('Gray',$_."\n");
-                }
+            else { print("=======$excont/".int($linnuco)."\n"); }
             }
         }
     }
