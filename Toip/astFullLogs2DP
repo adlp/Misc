@@ -15,6 +15,8 @@ sub printColor {
 sub print_usage {
     print("-t le channel-id sur le quel on sort les morceaux du dialplan correspondant, NEEDED\n");
     print("-f le fichuier de log, par defaut /var/log/asterisk/full, permet de faire zcat XXXX | truc -f -\n");
+    print("-a l,c,i Affiche les logs,la conf correspondante et les interlogues (defaut l,c,i\n");
+    print("-n exten1\@context,exten2\@context n'affiche pas les extension precises\n");
     exit(1);
     }
 
@@ -37,13 +39,17 @@ sub astloadcontext {
     }
 
 my %opts;
-getopts("t:f:",\%opts) or print_usage();
+getopts("t:f:a:n:",\%opts) or print_usage();
 
 
-
+my @logType=['l','c','i'];
+my @noDispExten=[''];
 my $log="/var/log/asterisk/full";
 if(!defined($opts{'t'}))    { print_usage(); }
 if(defined($opts{'f'}))     { $log=$opts{'f'}; }
+if(defined($opts{'a'}))     { @logType=split(/,/,$opts{'a'}); }
+if(defined($opts{'n'}))     { @noDispExten=split(/,/,$opts{'n'}); }
+
 
 my @mrks=split(/,/,$opts{'t'});
 my %tacont;
@@ -57,7 +63,9 @@ while(my $line=<$FL>) {
         if(/\]\[$mrk\]/) {
             chomp();
             if(/\]\[$mrk\] pbx.c: Executing \[/) {
-                printColor('White',$_."\n");
+                if('l' ~~ @logType) {
+                    printColor('White',$_."\n");
+                    }
                 # [Oct 18 09:01:52] VERBOSE[275996][C-000002ac] pbx.c: Executing [33164764275@from-external:1] NoOp("IAX2/TOOTAi-2924", "[C-000002ac] Icelus Clay 33164764275 Appel entrant de 0618497867 0618497867") in new stack
                 s/^.* pbx.c: Executing \[(.*)@(.*):(\d*)\] .*/$1\@$2 $3/;
                 my($excont,$linnuco)=split(/ /);
@@ -65,13 +73,13 @@ while(my $line=<$FL>) {
                     $tacont{$excont}=[];
                     $tacont{$excont}=[astloadcontext($excont)];
                 }
-                if(defined($tacont{$excont}[int($linnuco)])) {
+                if(defined($tacont{$excont}[int($linnuco)]) and 'c' ~~ @logType) {
                     printColor('Blue',"        [$excont:$linnuco]:");
                     printColor("Yellow",$tacont{$excont}[int($linnuco)]."\n");
                     }
-                else { print("=======$excont/".int($linnuco)."\n"); }
+                # else { print("=======$excont/".int($linnuco)."\n"); }
                 }
-            else {
+            elsif('i' ~~ @logType) {
                 printColor('Gray',$_."\n");
                 }
             }
