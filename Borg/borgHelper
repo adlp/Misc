@@ -31,7 +31,7 @@ import json
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.30"
+Version="0.31"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -39,6 +39,7 @@ Version="0.30"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.31 in report print name server at the top of the table
 # 0.30 If BORG_ARCHNAME begin by :: archname will be it (not only middle name) and will be finish by the backuptime + correction
 # 0.29.1 And now... prune tooooo :)
 # 0.29 Now -n nick mean all known borged host ;) ... usuable only for report a this time :/
@@ -542,6 +543,14 @@ def cmd_report(nicks,htrep=False,dayback=None,debug=0,maxp=None):
         reshosto[i]=convert_octets_readable(reshosto[i])
     reshosto['duree']=f"{reshosto['duree']:.2f} min"
     reshos['Totaux']=reshosto
+
+    for outer_key, inner_dict in resbck.items():
+        for inner_key, nested_dict in inner_dict.items():
+            if "name" in nested_dict:  # Vérifie si la clé 'name' existe
+                valeur_name = nested_dict.pop("name")  # Retirer la clé 'name'
+                nested_dict = {outer_key: valeur_name, **nested_dict}  # Ajouter TITI en premier
+                inner_dict[inner_key] = nested_dict  # Mettre à jour le dictionnaire imbriqué
+
     if htrep:
         print("<!DOCTYPE html>")
         print("<html>")
@@ -551,7 +560,7 @@ def cmd_report(nicks,htrep=False,dayback=None,debug=0,maxp=None):
         print('  </body>')
         print('</html>')
         for nick in nicks.split(','):
-            print(htmlTabelise(resbck[nick],colnames=['name','duration','original_size','compressed_size','deduplicated_size','nfiles']))
+            print(htmlTabelise(resbck[nick],colnames=[nick,'duration','original_size','compressed_size','deduplicated_size','nfiles']))
     else:
         print(prettyTabelise(reshos))
         for nick in nicks.split(','):
