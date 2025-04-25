@@ -57,15 +57,15 @@ my %tacont;
 my $FL=*STDIN;
 if($log ne "-")     { open($FL,'<',$log) or die $! };
 
+my $curli="";
+
 while(my $line=<$FL>) {
     foreach my $mrk (@mrks) {
         $_=$line;
         if(/\]\[$mrk\]/) {
             chomp();
             if(/\]\[$mrk\] pbx.c: Executing \[/) {
-                if('l' ~~ @logType) {
-                    printColor('White',$_."\n");
-                    }
+                $curli=$_;
                 # [Oct 18 09:01:52] VERBOSE[275996][C-000002ac] pbx.c: Executing [33164764275@from-external:1] NoOp("IAX2/TOOTAi-2924", "[C-000002ac] Icelus Clay 33164764275 Appel entrant de 0618497867 0618497867") in new stack
                 s/^.* pbx.c: Executing \[(.*)@(.*):(\d*)\] .*/$1\@$2 $3/;
                 my($excont,$linnuco)=split(/ /);
@@ -73,11 +73,16 @@ while(my $line=<$FL>) {
                     $tacont{$excont}=[];
                     $tacont{$excont}=[astloadcontext($excont)];
                 }
-                if(defined($tacont{$excont}[int($linnuco)]) and 'c' ~~ @logType) {
-                    printColor('Blue',"        [$excont:$linnuco]:");
-                    printColor("Yellow",$tacont{$excont}[int($linnuco)]."\n");
+                if (not ($excont ~~ @noDispExten)) {
+                    if('l' ~~ @logType) {
+                        printColor('White',$curli."\n");
+                        }
+                    if(defined($tacont{$excont}[int($linnuco)]) and 'c' ~~ @logType) {
+                        printColor('Blue',"        [$excont:$linnuco]:");
+                        printColor("Yellow",$tacont{$excont}[int($linnuco)]."\n");
+                        }
+                    # else { print("=======$excont/".int($linnuco)."\n"); }
                     }
-                # else { print("=======$excont/".int($linnuco)."\n"); }
                 }
             elsif('i' ~~ @logType) {
                 printColor('Gray',$_."\n");
