@@ -17,6 +17,7 @@ sub print_usage {
     print("-f le fichuier de log, par defaut /var/log/asterisk/full, permet de faire zcat XXXX | truc -f -\n");
     print("-a l,c,i Affiche les logs,la conf correspondante et les interlogues (defaut l,c,i\n");
     print("-n exten1\@context,exten2\@context n'affiche pas les extension precises\n");
+    print('-m chaine    permet de faire rougir les lignes contenant chaine dans l');
     exit(1);
     }
 
@@ -39,16 +40,18 @@ sub astloadcontext {
     }
 
 my %opts;
-getopts("t:f:a:n:",\%opts) or print_usage();
+getopts("t:f:a:n:m:",\%opts) or print_usage();
 
 
 my @logType=['l','c','i'];
 my @noDispExten=[''];
 my $log="/var/log/asterisk/full";
+my $matchLog='';
 if(!defined($opts{'t'}))    { print_usage(); }
 if(defined($opts{'f'}))     { $log=$opts{'f'}; }
 if(defined($opts{'a'}))     { @logType=split(/,/,$opts{'a'}); }
 if(defined($opts{'n'}))     { @noDispExten=split(/,/,$opts{'n'}); }
+if(defined($opts{'m'}))     { $matchLog=$opts{'m'}; }
 
 
 my @mrks=split(/,/,$opts{'t'});
@@ -58,6 +61,7 @@ my $FL=*STDIN;
 if($log ne "-")     { open($FL,'<',$log) or die $! };
 
 my $curli="";
+my $coloChoosed;
 
 while(my $line=<$FL>) {
     foreach my $mrk (@mrks) {
@@ -75,7 +79,9 @@ while(my $line=<$FL>) {
                 }
                 if (not ($excont ~~ @noDispExten)) {
                     if('l' ~~ @logType) {
-                        printColor('White',$curli."\n");
+                        $coloChoosed='White';
+                        if(length($matchLog) and $curli =~ /$matchLog/) { $coloChoosed='Red'; }
+                        printColor($coloChoosed,$curli."\n");
                         }
                     if(defined($tacont{$excont}[int($linnuco)]) and 'c' ~~ @logType) {
                         printColor('Blue',"        [$excont:$linnuco]:");
