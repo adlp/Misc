@@ -31,7 +31,7 @@ import json
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.29"
+Version="0.29.1"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -39,6 +39,7 @@ Version="0.29"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.29.1 And now... prune tooooo :)
 # 0.29 Now -n nick mean all known borged host ;) ... usuable only for report a this time :/
 # 0.28 Now stars and exit code for report with too much old
 # 0.27.5 tracking des fichiers de cache
@@ -713,8 +714,9 @@ def cmd_prune(nick,dryrun=False,debug=0):
         ret=boex(nick,cmd,debug=debug)['stderr']
         if not dryrun:
             rb=boex(nick,['compact','--cleanup-commits'],debug=debug)
-            print(rb)
-            sys.exit(rb['exitcode'])
+            #print(rb)
+            #sys.exit(rb['exitcode'])
+            return(rb)
         else:
             return(ret)
     else:
@@ -1063,7 +1065,23 @@ elif cmd == 'bkp':
     cmd_bkp(nick,debug=debug)
 elif cmd == 'prune':
     # printer("   -c Prune [-n nickname/servername]")
-    cmd_prune(nick,debug=debug)
+    errcmd=0
+    ret={}
+    if ',' in nick:
+        nicks=nick
+        for nick in nicks.split(','):
+            print(f"Prunning {nick}...")
+            ret=cmd_prune(nick,debug=debug)
+            if ret['exitcode'] != 0:
+                print(ret)
+                errcmd=ret['exitcode']
+    else:
+        print(f"Prunning {nick}...")
+        ret=cmd_prune(nick,debug=debug)
+        errcmd=ret['exitcode']
+        if errcmd != 0:
+            print(ret)
+    sys.exit(errcmd)
 elif cmd == 'init':
     cmd_init(nick,debug=debug)
 elif cmd == 'poc':
