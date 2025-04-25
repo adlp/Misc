@@ -7,17 +7,24 @@ use Getopt::Std;
 use IO::Uncompress::Gunzip;
 
 my %ansiColor=( 'Red'=>31, 'Green'=>32, 'Yellow'=>33, 'Blue'=>34, 'Magenta'=>35, 'Cyan'=>36, 'White'=>37, 'Gray'=>90 );
+my $nocolor=0;
 
 sub printColor {
     my ($color,$truc2prn)=@_;
-    print("\e[$ansiColor{$color}m".$truc2prn."\e[0m");
+    if($nocolor) {
+        print($truc2prn);
+        }
+    else {
+        print("\e[$ansiColor{$color}m".$truc2prn."\e[0m");
+        }
     }
 
 sub print_usage {
     print("-t le channel-id sur le quel on sort les morceaux du dialplan correspondant, NEEDED\n");
     print("-f le fichuier de log, par defaut /var/log/asterisk/full mais stdin autorise  zcat XXXX | truc\n");
-    print("-a l,c,i Affiche les logs,la conf correspondante et les interlogues (defaut l,c,i\n");
+    print("-a l,c,i Affiche les logs,la conf correspondante et les interlogues (defaut l,c,i)\n");
     print("-n exten1\@context,exten2\@context n'affiche pas les extension precises\n");
+    print("-w white, no color\n");
     print('-m chaine    permet de faire rougir les lignes contenant chaine dans les logs');
     print("Si des données sont presente sur le stdin, cela by passe le -f\n");
     exit(1);
@@ -42,7 +49,7 @@ sub astloadcontext {
 
 
 my %opts;
-getopts("t:f:a:n:m:",\%opts) or print_usage();
+getopts("t:f:a:n:m:w",\%opts) or print_usage();
 
 my @logType=['l','c','i'];
 my @noDispExten=[''];
@@ -53,6 +60,7 @@ if(defined($opts{'f'}))     { $log=$opts{'f'}; }
 if(defined($opts{'a'}))     { @logType=split(/,/,$opts{'a'}); }
 if(defined($opts{'n'}))     { @noDispExten=split(/,/,$opts{'n'}); }
 if(defined($opts{'m'}))     { $matchLog=$opts{'m'}; }
+if(defined($opts{'w'}))     { $nocolor=1; }
 
 
 my @mrks=split(/,/,$opts{'t'});
