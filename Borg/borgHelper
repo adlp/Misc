@@ -31,7 +31,7 @@ import json
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.33.1"
+Version="0.34"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -39,6 +39,7 @@ Version="0.33.1"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.34 Key exportation is possible
 # 0.33.1 Default hardcoded value for MAX_AGE_BKP
 # 0.33 Mount is only for the last bcp, but you can specify one of them
 # 0.32 ALL not is not ALL if no in ALL
@@ -111,7 +112,7 @@ def usage(doc=None,debug=0):
         printer("       On liste les backup connus")
         printer("   -c LstBkpFls [-n nickname/servername] [-b backupid/last]")
         printer("       On liste les fichiers d'un backup precis")
-        printer("⚗️  -c Report [-n nickname/servername] [-b backupid/last] [-l]")
+        printer("⚗️  -c Report [-n nickname/servername/ALL] [-b backupid/last] [-l]")
         printer("       Rapport sur le dernier (ou pas) backup, avec sortie en htmL")
         printer("   -c DiffBkp [-n nickname/servername] [-b backupid] [-w where]")
         printer("       Liste les mouvements des fichiers entre le backupid et le dernier backup")
@@ -122,9 +123,15 @@ def usage(doc=None,debug=0):
         printer("   -c Init [-n nickname/servername]")
         printer("       Initialisation d'un repInitialisation d'un repoo")
         printer("   -c Bkp [-n nickname/servername]")
+        printer("       On export la clef de l'archive")
+        printer("   -c Key [-n nickname/servername/ALL]")
         printer("       On lance un backup")
-        printer("⚗️ ⚡️-c Prune [-n nickname/servername]")
+        printer("⚗️ ⚡️-c Prune [-n nickname/servername/ALL]")
         printer("      ⚡️ On delete les vieux backup sur le repo ⚡️ DANGER")
+    elif doc == 'key':
+        printer("   -c Key [-n nickname/servername/ALL]")
+        printer("       On export la clef de l'archive")
+        printer("       Tres pratique en cas de coup dur...")
     elif doc == 'stats':
         printer("   -c Stats [-n server-name/nickname]")
         printer("       Affiche toutes les informations des serveurs connus")
@@ -371,6 +378,14 @@ def cmd_lstbkp(nick,debug=0):
     for i in rb['stdout'][0]['archives']:
         print(f"{i['name']} {i['start']}")
     sys.exit(rb['exitcode'])
+
+def cmd_key(nicks,debug=0):
+    for nick in nicks.split(','):
+        cfg=cfgreaded(nick,debug=debug)
+        rb=boex(nick,['key','export','--paper'],debug=debug)
+        if rb['exitcode'] == 0:
+            for i in rb["stdout"]:
+                print(i)
 
 def getlastbkp(nick,nbl=1,debug=0):
     cfg=cfgreaded(nick,debug=debug)
@@ -973,7 +988,8 @@ optab={ 'stats'     :'cdn',      'login'     :'cdsnkprm',
         'restore'   :'cdnbfw',   'diffbkp'   :'cdnbw',
         'delbkp'    :'cdnb',     'bkp'       :'cdn',
         'prune'     :'cdn',      'report'    :'cdnbl',
-        'init'      :'cdn',      'poc'       :'cdn',}
+        'init'      :'cdn',      'poc'       :'cdn',
+        'key'       :'cdn',}
 
 for opt,arg in opts:
     if   opt in '-h':
@@ -1063,6 +1079,8 @@ elif cmd == 'lstbkpfls':
     if '-b' not in options.keys() or 'last' in options['-b']:
         options['-b']=None
     cmd_lstfiles(nick,options['-b'],debug=debug)
+elif cmd == 'key':
+    cmd_key(nick,debug=None)
 elif cmd == 'report':
     # printer("   -c Report [-n nickname/servername] [-b backupid/last]")
     errcmd=0
