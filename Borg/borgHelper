@@ -31,7 +31,7 @@ import json
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.33"
+Version="0.33.1"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -39,6 +39,7 @@ Version="0.33"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.33.1 Default hardcoded value for MAX_AGE_BKP
 # 0.33 Mount is only for the last bcp, but you can specify one of them
 # 0.32 ALL not is not ALL if no in ALL
 # 0.31 in report print name server at the top of the table
@@ -537,7 +538,12 @@ def cmd_report(nicks,htrep=False,dayback=None,debug=0,maxp=None):
         cfg=cfgreaded(nick,debug=debug)
         (tcmpl,tbkps)=prep_report(nick,debug=debug,maxp=maxp)
 
-        if(tcmpl[nick]['depuis'] > (float(cfg["MAX_AGE_BKP"])*60)):
+        if "MAX_AGE_BKP" not in cfg:
+            maxage=25*60
+        else:
+            maxage=float(cfg["MAX_AGE_BKP"])*60
+
+        if(tcmpl[nick]['depuis'] > maxage):
             errcode=1
             tcmpl[nick]['nom']=f"***{nick}"
     
