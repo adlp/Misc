@@ -31,7 +31,7 @@ import json
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.32"
+Version="0.33"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -39,6 +39,7 @@ Version="0.32"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.33 Mount is only for the last bcp, but you can specify one of them
 # 0.32 ALL not is not ALL if no in ALL
 # 0.31 in report print name server at the top of the table
 # 0.30 If BORG_ARCHNAME begin by :: archname will be it (not only middle name) and will be finish by the backuptime + correction
@@ -101,8 +102,10 @@ def usage(doc=None,debug=0):
         printer("       Liste les backup references, et le fait qu'ils soient mount ou pas")
         printer("   -c Login [-s servername] [-n nickname] [-k keyfile.key] -p passphrase -r repo -m mountpoint")
         printer("       n se log sur le serveur, utilise que si le serveur n'est pas referencé")
-        printer("   -c <Mount|UMount> [-n nickname/servername]")
-        printer("       On monte et on demonte le FS (BIEN Penser a demonter !!!)")
+        printer("   -c <Mount> [-n nickname/servername] [-b backupid/last/ALL]")
+        printer("       On monte le backup sur la derniere archive, ou celle precisée FS (BIEN Penser a demonter !!!)")
+        printer("   -c <UMount> [-n nickname/servername]")
+        printer("       On demonte le FS")
         printer("   -c LstBkp [-n nickname/servername]")
         printer("       On liste les backup connus")
         printer("   -c LstBkpFls [-n nickname/servername] [-b backupid/last]")
@@ -135,11 +138,13 @@ def usage(doc=None,debug=0):
         printer("           passpharse  : le mot de passe d'acces au repo")
         printer("           repo        : l'addresse du repo")
     elif doc == 'mount':
-        printer("   -c Mount [-n nickname/servername]")
+        printer("   -c Mount [-n nickname/servername] [-b backupid/last/ALL]")
         printer("       Rend accessible les sauvegarde dans un repertoire visible via la commande Stat ou affiche en fin de mount")
         printer("       A utiliser rarement, car tant que le repo est monté, on ne peut plus backuper")
         printer("           si -n non precisé alores on travaille avec le serveur courant")
         printer("           nickname    : Le nom de l'enregistrement du serveur")
+        printer("           backupid    : Le nom du backup interessant, si non precisé, le dernier sera monté")
+        printer("                         ALL : permet de monter tout les backups, il y aura un sous repertoire par backup")
     elif doc == 'umount':
         printer("   -c UMount [-n nickname/servername]")
         printer("       Coupe cet acces")
@@ -322,13 +327,24 @@ def mountedornot(mountpoint,debug=0):
         fd.close()
     return(founded)
 
-def cmd_mount(nick,debug=0):
+def cmd_mount(nick,bid=None,debug=0):
     cfg=cfgreaded(nick)
+
+    if bid is None:
+        bid=getlastbkp(nick,debug=debug)[0]
+    #rb=boex(nick,['list','--glob-archives',cfg['GLOB_ARCH'],'::'+bid],debug=0)
+
+    repo=cfg['BORG_REPO']+"::"+bid
+    if bid == "ALL":
+        repo=cfg['BORG_REPO']
+
+    #BORG_PASSPHRASE=CLEF borg mount /mnt/Backup00/borg00/yoda.santeol.com/::yoda.santeol.com-root-2025-04-02T21:30:04 /mnt/borg/yoda
 
     if os.path.exists(cfg['MOUNTPOINT']) and os.path.isdir(cfg['MOUNTPOINT']) and len(os.listdir(cfg['MOUNTPOINT'])) == 0:
         if(not mountedornot(cfg['MOUNTPOINT'],debug=debug)):
-            rb=boex(nick,['mount','--glob-archives',cfg['GLOB_ARCH'],cfg['BORG_REPO'],cfg['MOUNTPOINT']],debug=debug)
-            print(rb)
+            rb=boex(nick,['mount',repo,cfg['MOUNTPOINT']],debug=debug)
+            if(rb['exitcode'] != 0 or len(rb['stdout']) != 0 or len(rb['stderr'])):
+                print(rb)
             sys.exit(rb['exitcode'])
         else:
             printer('Deja monte')
@@ -341,7 +357,8 @@ def cmd_umount(nick,debug=0):
     cfg=cfgreaded(nick,debug=debug)
     if(mountedornot(cfg['MOUNTPOINT'],debug=debug)):
         rb=boex(nick,['umount',cfg['MOUNTPOINT']],debug=debug)
-        print(rb)
+        if(rb['exitcode'] != 0 or len(rb['stdout']) != 0 or len(rb['stderr'])):
+            print(rb)
         sys.exit(rb['exitcode'])
     else:
         printer('Pas monte')
@@ -729,8 +746,6 @@ def cmd_prune(nick,dryrun=False,debug=0):
             #sys.exit(rb['exitcode'])
             return(rb)
         else:
-            if debug:
-                print("=====oullllla=========================")
             return(ret)
     else:
         usage('prune')
@@ -868,6 +883,7 @@ def boex(nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True): #,g
         rep=os.getcwd()
     commande.extend(arg)
     varfut['PATH']=varcur['PATH']
+    varfut["LC_ALL"]="fr_FR.UTF-8"
     if debug:
         for k in varfut:
             printer(f' {k}={varfut[k]}')
@@ -946,7 +962,7 @@ debug=0
 cmd=None
 
 optab={ 'stats'     :'cdn',      'login'     :'cdsnkprm',
-        'mount'     :'cdn',      'umount'    :'cdn',
+        'mount'     :'cdnb',     'umount'    :'cdn',
         'lstbkp'    :'cdn',      'lstbkpfls' :'cdnb',
         'restore'   :'cdnbfw',   'diffbkp'   :'cdnbw',
         'delbkp'    :'cdnb',     'bkp'       :'cdn',
@@ -1027,7 +1043,9 @@ elif cmd == 'login':
     cmd_login(serna,nick,options['-k'],options['-p'],options['-r'],options['-m'],debug=debug)
 elif cmd == 'mount':
     # printer("-c Mount [-n nickname/servername]")
-    cmd_mount(nick,debug=debug)
+    if '-b' not in options.keys() or 'last' in options['-b']:
+        options['-b']=None
+    cmd_mount(nick,bid=options['-b'],debug=debug)
 elif cmd == 'umount':
     # printer("-c UMount [-n nickname/servername]")
     cmd_umount(nick,debug=debug)
