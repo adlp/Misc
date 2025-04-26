@@ -31,7 +31,7 @@ import json
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.34"
+Version="0.34.1"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -39,6 +39,7 @@ Version="0.34"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.34.1 debug key debugged, so no debug when no debug nor half debug bug
 # 0.34 Key exportation is possible
 # 0.33.1 Default hardcoded value for MAX_AGE_BKP
 # 0.33 Mount is only for the last bcp, but you can specify one of them
@@ -384,6 +385,7 @@ def cmd_key(nicks,debug=0):
         cfg=cfgreaded(nick,debug=debug)
         rb=boex(nick,['key','export','--paper'],debug=debug)
         if rb['exitcode'] == 0:
+            print(f"[{nick}]:{cfg['BORG_PASSPHRASE']}")
             for i in rb["stdout"]:
                 print(i)
 
@@ -1080,7 +1082,7 @@ elif cmd == 'lstbkpfls':
         options['-b']=None
     cmd_lstfiles(nick,options['-b'],debug=debug)
 elif cmd == 'key':
-    cmd_key(nick,debug=None)
+    cmd_key(nick,debug=debug)
 elif cmd == 'report':
     # printer("   -c Report [-n nickname/servername] [-b backupid/last]")
     errcmd=0
