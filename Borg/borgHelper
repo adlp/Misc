@@ -31,7 +31,7 @@ import json
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.35"
+Version="0.35.1"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -39,6 +39,7 @@ Version="0.35"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.35.1 html is much more lovely
 # 0.35 correct time alert / colorized and limited report now :)
 # 0.34.1 debug key debugged, so no debug when no debug nor half debug bug
 # 0.34 Key exportation is possible
@@ -627,8 +628,8 @@ def cmd_report(nicks,htrep=False,dayback=None,debug=0,maxp=None):
         print("    <br>")
         print(htmlTabelise(reshos,colnames=['nom','duree','depuis','derniere','taille','recuperable','reste'],errhost=errhost))
         for nick in nicks.split(','):
-            print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','compressed_size','deduplicated_size','nfiles'],errhost=errhost))
             print('    <br>')
+            print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','compressed_size','deduplicated_size','nfiles'],errhost=errhost))
         print('  </body>')
         print('</html>')
     else:
@@ -685,23 +686,32 @@ def htmlTabelise(tabl,border=0,colnames=None,errhost=[]):
                 colnames.append(x)
     for x in colnames:
         if x in errhost:
-            ret+=f"    <td colspan=1 style='background:#FF6161;'>{x}</td><td style='width:20px;background:#FF6161;'></td>\n"
+            ret+=f"    <th colspan=1 style='background:#FF6161;'>{x}</td><td style='width:20px;background:#FF6161;'></th>\n"
         else:
-            ret+=f"    <td colspan=1 style='background:#BEEDFF;'>{x}</td><td style='width:20px;background:#BEEDFF;'></td>\n"
+            ret+=f"    <th colspan=1 style='background:#00A4E6;'>{x}</td><td style='width:20px;background:#00A4E6;'></th>\n"
     ret+="    </tr>\n"
     blue=0
+    listy=len(tabl.keys())
     for y in tabl.keys():
         ret+='  <tr>\n'
+        listy-=1
+        concol=0
+        colstyl=""
         for x in colnames:
             val=""
+            if concol:
+                colstyl='text-align:right;'
             if x in tabl[y].keys():
                 val=tabl[y][x]
-            if val in errhost:
-                ret+=f"    <td colspan=1 style='background:#FF6161;'>{val}</td><td style='width:20px;background:#FF6161;'></td>\n"
+            if listy == 0:
+                ret+=f"    <td colspan=1 style='{colstyl}'><em>{val}</em></td><td style='width:20px;'></td>\n"
+            elif val in errhost:
+                ret+=f"    <td colspan=1 style='{colstyl}background:#FF6161;'>{val}</td><td style='width:20px;background:#FF6161;'></td>\n"
             elif blue:
-                ret+=f"    <td colspan=1 style='background:#BEEDFF;'>{val}</td><td style='width:20px;background:#BEEDFF;'></td>\n"
+                ret+=f"    <td colspan=1 style='{colstyl}background:#BEEDFF;'>{val}</td><td style='width:20px;background:#BEEDFF;'></td>\n"
             else:
-                ret+=f"    <td colspan=1>{val}</td><td style='width:20px;'></td>\n"
+                ret+=f"    <td colspan=1 style='{colstyl}'>{val}</td><td style='width:20px;'></td>\n"
+            concol+=1
         ret+='    </tr>\n'
         if blue:
             blue=0
