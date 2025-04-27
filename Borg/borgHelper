@@ -31,7 +31,7 @@ import json
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.34.1"
+Version="0.35"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -39,6 +39,7 @@ Version="0.34.1"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.35 correct time alert / colorized and limited report now :)
 # 0.34.1 debug key debugged, so no debug when no debug nor half debug bug
 # 0.34 Key exportation is possible
 # 0.33.1 Default hardcoded value for MAX_AGE_BKP
@@ -534,19 +535,37 @@ def prep_report(nick,debug=0,maxp=None):
                 tbkps[i].pop('durationM')
                 tbkps[i].pop('prunMe')
             cpt+=1
-    tbkps['All']={}
-    tbkps['All']['name']='All'
-    tbkps['All']['original_size']       =resume['total_size']
-    tbkps['All']['compressed_size']     =resume['total_csize']
-    tbkps['All']['deduplicated_size']   =resume['unique_csize']
+    tbkps['Totaux']={}
+    tbkps['Totaux']['name']='Totaux'
+    tbkps['Totaux']['original_size']       =resume['total_size']
+    tbkps['Totaux']['compressed_size']     =resume['total_csize']
+    tbkps['Totaux']['deduplicated_size']   =resume['unique_csize']
 
     return(tcmpl,tbkps)
+
+def filtrer_lignes(tableau, X):
+    # Convertir les clés en liste pour les indexer
+    toutes_cles = list(tableau.keys())
+
+    # Si X est supérieur au nombre total de hashes
+    if X > len(toutes_cles):
+        # Conserver les 2 premiers et tous les derniers
+        cles_a_conserver = toutes_cles
+    else:
+        # Si X <= nombre total, conserver seulement les 2 premiers et les X derniers
+        cles_a_conserver = toutes_cles[:2] + toutes_cles[-X:]
+
+    # Reconstruire le hash avec les clés sélectionnées
+    nouveau_hash = {cle: tableau[cle] for cle in cles_a_conserver}
+
+    return nouveau_hash
 
 def cmd_report(nicks,htrep=False,dayback=None,debug=0,maxp=None):
     reshos={}
     resbck={}
     reshosto={}
     errcode=0
+    errhost=[]
 
     for i in ['duree','derniere','taille','recuperable']:
         reshosto[i]=0
@@ -555,14 +574,16 @@ def cmd_report(nicks,htrep=False,dayback=None,debug=0,maxp=None):
         cfg=cfgreaded(nick,debug=debug)
         (tcmpl,tbkps)=prep_report(nick,debug=debug,maxp=maxp)
 
-        if "MAX_AGE_BKP" not in cfg:
-            maxage=25*60
-        else:
-            maxage=float(cfg["MAX_AGE_BKP"])*60
+        maxage=25
+        if "MAX_AGE_BKP" in cfg:
+            maxage=float(cfg["MAX_AGE_BKP"])
 
         if(tcmpl[nick]['depuis'] > maxage):
             errcode=1
-            tcmpl[nick]['nom']=f"***{nick}"
+            if htrep:
+                errhost.append(nick)
+            else:
+                tcmpl[nick]['nom']=f"***{nick}"
     
         for i in ['duree','derniere','taille','recuperable']:
             reshosto[i]+=tcmpl[nick][i]
@@ -584,7 +605,7 @@ def cmd_report(nicks,htrep=False,dayback=None,debug=0,maxp=None):
         reshosto[i]=convert_octets_readable(reshosto[i])
     reshosto['duree']=f"{reshosto['duree']:.2f} min"
     reshos['Totaux']=reshosto
-
+ 
     for outer_key, inner_dict in resbck.items():
         for inner_key, nested_dict in inner_dict.items():
             if "name" in nested_dict:  # Vérifie si la clé 'name' existe
@@ -592,20 +613,28 @@ def cmd_report(nicks,htrep=False,dayback=None,debug=0,maxp=None):
                 nested_dict = {outer_key: valeur_name, **nested_dict}  # Ajouter TITI en premier
                 inner_dict[inner_key] = nested_dict  # Mettre à jour le dictionnaire imbriqué
 
+    resshortbck={}
+    for nick in resbck.keys():
+        disp=0
+        if "DISPLAY_BKP" in cfg:
+            disp=int(cfg["DISPLAY_BKP"])
+        resshortbck[nick]=filtrer_lignes(resbck[nick],disp)
+
     if htrep:
         print("<!DOCTYPE html>")
         print("<html>")
         print('  <body bgcolor="#ffffff">')
         print("    <br>")
-        print(htmlTabelise(reshos,colnames=['nom','duree','depuis','derniere','taille','recuperable','reste']))
+        print(htmlTabelise(reshos,colnames=['nom','duree','depuis','derniere','taille','recuperable','reste'],errhost=errhost))
+        for nick in nicks.split(','):
+            print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','compressed_size','deduplicated_size','nfiles'],errhost=errhost))
+            print('    <br>')
         print('  </body>')
         print('</html>')
-        for nick in nicks.split(','):
-            print(htmlTabelise(resbck[nick],colnames=[nick,'duration','original_size','compressed_size','deduplicated_size','nfiles']))
     else:
         print(prettyTabelise(reshos))
         for nick in nicks.split(','):
-            print(prettyTabelise(resbck[nick]))
+            print(prettyTabelise(resshortbck[nick]))
     return(errcode)
 
 def d2DateNSince(datepourrie):
@@ -645,7 +674,7 @@ def prettyTabelise(tab):
         t.add_row(liste)
     return(t)
 
-def htmlTabelise(tabl,border=0,colnames=None):
+def htmlTabelise(tabl,border=0,colnames=None,errhost=[]):
     ret=""
     ret+="<table border='0'>\n  <tr>\n"
     # Generation du tableau pour les titres
@@ -655,16 +684,29 @@ def htmlTabelise(tabl,border=0,colnames=None):
             for x in tabl[y].keys():   # On pecho la clef, car ca c'est de la bonne
                 colnames.append(x)
     for x in colnames:
-        ret+=f"    <td colspan=1>{x}</td><td style='width:20px;'></td>\n"
+        if x in errhost:
+            ret+=f"    <td colspan=1 style='background:#FF6161;'>{x}</td><td style='width:20px;background:#FF6161;'></td>\n"
+        else:
+            ret+=f"    <td colspan=1 style='background:#BEEDFF;'>{x}</td><td style='width:20px;background:#BEEDFF;'></td>\n"
     ret+="    </tr>\n"
+    blue=0
     for y in tabl.keys():
         ret+='  <tr>\n'
         for x in colnames:
             val=""
             if x in tabl[y].keys():
                 val=tabl[y][x]
-            ret+=f"    <td colspan=1>{val}</td><td style='width:20px;'></td>\n"
+            if val in errhost:
+                ret+=f"    <td colspan=1 style='background:#FF6161;'>{val}</td><td style='width:20px;background:#FF6161;'></td>\n"
+            elif blue:
+                ret+=f"    <td colspan=1 style='background:#BEEDFF;'>{val}</td><td style='width:20px;background:#BEEDFF;'></td>\n"
+            else:
+                ret+=f"    <td colspan=1>{val}</td><td style='width:20px;'></td>\n"
         ret+='    </tr>\n'
+        if blue:
+            blue=0
+        else:
+            blue=1
     ret+='</table>\n'
     return(ret)
 
