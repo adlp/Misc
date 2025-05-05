@@ -31,7 +31,7 @@ import json
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.35.1"
+Version="0.36"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -39,6 +39,7 @@ Version="0.35.1"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.36 .borghelperrc can be specified
 # 0.35.1 html is much more lovely
 # 0.35 correct time alert / colorized and limited report now :)
 # 0.34.1 debug key debugged, so no debug when no debug nor half debug bug
@@ -101,7 +102,7 @@ def version():
 
 def usage(doc=None,debug=0):
     if doc is None:
-        printer("   -H <Stats|Login|Mount|UMount|ListBkp|ListBkpFiles|Restore>")
+        printer("   -H <Stats|Login|Mount|UMount|ListBkp|ListBkpFiles|Restore> [-C /root/.borghelperrc")
         printer("       Permet d'avoir les documentations detaillés des differentes commandes")
         printer("   -c Stats [-n server-name/nickname]")
         printer("       Liste les backup references, et le fait qu'ils soient mount ou pas")
@@ -1027,7 +1028,7 @@ def boex(nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True): #,g
 ######### Analyse Arguments
 
 try:
-    opts, args = getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:f:w:dvl", ["help"])
+    opts, args = getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:f:w:dvlC:", ["help"])
 except getopt.GetoptError as err:
     print(err)  # will print something like "option -a not recognized"
     usage()
@@ -1036,14 +1037,14 @@ except getopt.GetoptError as err:
 debug=0
 cmd=None
 
-optab={ 'stats'     :'cdn',      'login'     :'cdsnkprm',
-        'mount'     :'cdnb',     'umount'    :'cdn',
-        'lstbkp'    :'cdn',      'lstbkpfls' :'cdnb',
-        'restore'   :'cdnbfw',   'diffbkp'   :'cdnbw',
-        'delbkp'    :'cdnb',     'bkp'       :'cdn',
-        'prune'     :'cdn',      'report'    :'cdnbl',
-        'init'      :'cdn',      'poc'       :'cdn',
-        'key'       :'cdn',}
+optab={ 'stats'     :'Ccdn',      'login'     :'Ccdsnkprm',
+        'mount'     :'Ccdnb',     'umount'    :'Ccdn',
+        'lstbkp'    :'Ccdn',      'lstbkpfls' :'Ccdnb',
+        'restore'   :'Ccdnbfw',   'diffbkp'   :'Ccdnbw',
+        'delbkp'    :'Ccdnb',     'bkp'       :'Ccdn',
+        'prune'     :'Ccdn',      'report'    :'Ccdnbl',
+        'init'      :'Ccdn',      'poc'       :'Ccdn',
+        'key'       :'Ccdn',}
 
 for opt,arg in opts:
     if   opt in '-h':
@@ -1056,6 +1057,8 @@ for opt,arg in opts:
         debug+=1
     elif opt in '-v':
         version()
+    elif opt in '-C':
+        cfgfile=arg
         
 
 if cmd is None or cmd not in optab.keys():
