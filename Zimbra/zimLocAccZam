@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+
+import subprocess
+import ldap
+import ldap.filter
+import os
+import json
+import re
+import requests
+import configparser
+import yaml
+import argparse
+import time
+import sys
+
+
+class Zammad:
+
+    group=""
+    organization_id=""
+    customer_id=""
+
+
+    def __init__(self,url="",token="",group=None,customer_id=None,organization_id=None):
+        ret=0
+
+        if group != None:
+            self.group=group
+        if customer_id != None:
+            self.customer_id=customer_id
+        if organization_id != None:
+            self.organization_id=organization_id
+
+        if len(url) and len(token):
+            self.zammad_url=url
+            self.HEADERS = {"Authorization": f"Token {token}", "Content-Type": "application/json"}
+        else:
+            return None
+
+    def _groupNCo(self,group,customer_id,organization_id):
+        if group == None and self.group == None:
+            return 0
+        elif group != None:
+            self.group = group
+        if customer_id == None and self.customer_id == None:
+            return 0
+        elif customer_id != None:
+            self.customer_id = customer_id
+        if organization_id == None and self.organization_id == None:
+            return 0
+        elif organization_id != None:
+            self.organization_id = organization_id
+
+    def create(self,title,group=None,customer_id=None,organization_id=None,subject=None,body=None,priority_id=2,internal=False):
+        """Crée un ticket dans Zammad"""
+        if subject == None:
+            subject=title
+        if body == None:
+            body=subject
+        if self._groupNCo(group,customer_id,organization_id) == 0:
+            return None
+        payload = {
+            "title": title,
+            "group": self.group,
+            "customer_id": self.customer_id,
+            "organization_id": self.organization_id,
+            "article": {
+                "subject": subject,
+                "body": body,
+                "type": "note",
+                "internal": internal
+                },
+            "state": "open",
+            "priority_id": priority_id
+            }
+        #print(payload)
+        response = requests.post(f"{self.zammad_url}/api/v1/tickets", json=payload, headers=self.HEADERS)
+        respCode = response.status_code
+        if respCode == 200:
+            ticket = response.json()
+            #print(f"✅ Ticket créé avec ID {ticket['id']}")
+            return ticket["id"]
+        else:
+            #print(f"❌ Erreur {respCode} lors de la création du ticket :{response.text} ")
+            ticket = response.json()
+            #print(ticket)
+            #print(f"✅ Ticket créé avec ID {ticket['id']}")
+            if('id' in ticket):
+                return ticket["id"]
+            else:
+                return None
+
+    def note(self,ticket_id,subject,body="",internal=True):
+        """ Rajoute une note """
+        payload = {
+            "ticket_id": ticket_id,
+            "subject": subject,
+            "body" : body,
+            "type" : "note",
+            "internal":internal
+            }
+        response = requests.post(f"{self.zammad_url}/api/v1/ticket_articles", json=payload, headers=self.HEADERS)
+
+        #return(response.status_code == 200:
+        return(response.status_code)
+
+    def close(self,ticket_id):
+        """Ferme un ticket donné dans Zammad"""
+        payload = {"state": "closed"}
+        response = requests.put(f"{self.zammad_url}/api/v1/tickets/{ticket_id}", json=payload, headers=self.HEADERS)
+        if response.status_code == 200:
+            return(0)
+        else:
+            return(reponse.status_code)
+
+    def search_by_title(self,keyword):
+        """Recherche un ticket ouvert par titre ou début de titre"""
+        query = f'state.name:open AND title:"{keyword}"'
+        response = requests.get(f"{self.zammad_url}/api/v1/tickets/search?query={query}", headers=self.HEADERS)
+
+        if response.status_code == 200:
+            tickets = response.json()
+            #print(tickets)
+            if tickets["tickets"]:
+                return(tickets["tickets"])
+                #print(f"✅ {len(tickets['tickets'])} ticket(s) trouvé(s) :")
+                #for ticket in tickets["tickets"]:
+                #    print(f"- ID: {ticket}, Titre: {tickets['assets']['Ticket'][str(ticket)]['title']}")
+            else:
+                return([])
+                #print("❌ Aucun ticket correspondant trouvé.")
+        else:
+            return([])
+            #print(f"⚠️ Erreur lors de la recherche : {response.text}")
+
+    def ticket(self,ticket_id):
+        """ Recupere un ticket """
+        response = requests.get(f"{self.zammad_url}/api/v1/tickets/{ticket_id}", headers=self.HEADERS)
+
+        if response.status_code == 200:
+            return(response.json())
+        else:
+            return(None)
+
+
+
+# 🔐 Récupération du mot de passe LDAP
+def get_ldap_password():
+    try:
+        output = subprocess.check_output(["zmlocalconfig", "-s", "ldap_root_password"], text=True)
+        return output.strip().split()[-1]
+    except Exception as e:
+        raise RuntimeError(f"Erreur lors de la récupération du mot de passe LDAP : {e}")
+
+# 🔗 Connexion LDAP
+def connect_ldap(password):
+    ldap_url = "ldap://localhost:389"
+    bind_dn = "uid=zimbra,cn=admins,cn=zimbra"
+    conn = ldap.initialize(ldap_url)
+    conn.simple_bind_s(bind_dn, password)
+    return conn
+
+# 🔍 Recherche des comptes lockout
+def get_locked_accounts(conn, base_dn):
+    search_filter = "(&(zimbraAccountStatus=*)(zimbraAccountStatus=lockout))"
+    attributes = None  # None = récupérer tous les attributs
+    results = conn.search_s(base_dn, ldap.SCOPE_SUBTREE, search_filter, attributes)
+
+    locked = {}
+    for dn, entry in results:
+        email = entry.get("mail", [b"unknown"])[0].decode()
+
+        # 🔍 Extraction de tous les attributs LDAP
+        infos = {}
+        for attr, values in entry.items():
+            # Certains attributs ont plusieurs valeurs
+            if attr == "userPassword":
+                continue
+            infos[attr] = [v.decode(errors="ignore") for v in values]
+
+        locked[email] = {
+            "dn": dn,
+            "status": infos.get("zimbraAccountStatus", [""])[0],
+            "infos": infos
+        }
+
+    return locked
+
+def extract_failed_auth_lines(email, log_path="/opt/zimbra/log/audit.log"):
+    """
+    Recherche les lignes du fichier de log contenant une erreur d'authentification pour un email donné.
+
+    Args:
+        email (str): L'adresse email à rechercher.
+        log_path (str): Chemin du fichier de log Zimbra.
+
+    Returns:
+        dict: Dictionnaire {num_ligne: contenu_ligne} des lignes correspondantes.
+    """
+    failed_lines = []
+
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as logfile:
+            #for i, line in enumerate(logfile, start=1):
+            for line in logfile:
+                if "authentication failed for" in line and email in line:
+                    #failed_lines[i] = line.strip()
+                    failed_lines.append(line.strip())
+    except FileNotFoundError:
+        print(f"Fichier introuvable : {log_path}")
+    except Exception as e:
+        print(f"Erreur lors de la lecture du fichier : {e}")
+
+    return failed_lines
+
+# 🔍 Filtrage des comptes à exclure
+def is_excluded(account):
+    return any(re.match(regex, account) for regex in EXCLUDE_REGEXES)
+
+# 🧾 Exécution
+if __name__ == "__main__":
+
+    CONFIG_PATH = os.path.expanduser("~/.zimLocAccZam")
+
+    parser = argparse.ArgumentParser(description="Generateur de tickets Zammad lorsque compte lock")
+    parser.add_argument('-d','--debug',help='Afficher des infos complementaire',action="store_true")
+    parser.add_argument('-C','--config',help='permet de changer le fichier de configuration',action='append')
+    parser.add_argument('-a','--always',help='Affiche les emails _encore_ locked',action="store_true")
+    parser.add_argument('-s','--silent',help='Silence absolue',action="store_true")
+    args = parser.parse_args()
+
+
+    # 📖 Lecture de la configuration
+    if args.config:
+        CONFIG_PATH = os.path.expanduser(args.config)
+        
+    config = configparser.ConfigParser()
+    config.read(CONFIG_PATH)
+    
+    ZAMMAD_URL      = config.get("zammad", "url")
+    ZAMMAD_TOKEN    = config.get("zammad", "token")
+    ZAMMAD_GRP      = config.get("zammad", "group")
+    ZAMMAD_CUST_ID  = config.get("zammad", "customer_id")
+    ZAMMAD_ORGZ_ID  = config.get("zammad", "organization_id")
+    CACHE_PATH      = config.get("general", "cache_file")
+    base_dn         = config.get("general", "base_dn")
+    EXCLUDE_REGEXES = [r.strip() for r in config.get("general", "exclude_regexes").split(",")]
+    
+    # 📦 Lecture du cache
+    if os.path.exists(CACHE_PATH):
+        with open(CACHE_PATH, "r") as f:
+            cache = json.load(f)
+    else:
+        cache = {}
+
+
+    password = get_ldap_password()
+    conn = connect_ldap(password)
+
+    locked_accounts = get_locked_accounts(conn, base_dn)
+    new_cache={}
+
+    # Open Ticketing System
+    zammad=Zammad(url= ZAMMAD_URL,token= ZAMMAD_TOKEN, group=ZAMMAD_GRP,customer_id=ZAMMAD_CUST_ID,organization_id=ZAMMAD_ORGZ_ID)
+
+    for account in locked_accounts.keys():
+        if is_excluded(account):
+            continue
+        if account not in cache:
+            ### Compte absent du cache (donc pas de ticket)
+            logs        = "\n".join(extract_failed_auth_lines(account))
+            infos       = locked_accounts[account]['infos']
+            ticket_id   = zammad.create(f'[ZIMBRA] Locked :{account}',subject="infos",body=yaml.dump(infos,allow_unicode=True))
+            zammad.note(ticket_id,"logs",logs)
+            new_cache[account] = {"ticket_id": ticket_id, "logs":logs,'infos':infos}
+            if not args.silent:
+                print(f'Ticket {ticket_id} tout neuf pour {account}')
+        else:
+            # Toujours bloqué, on garde le ticket, on verifie qu'il n'est pas fermé...
+            new_cache[account] = cache[account]
+            tick=zammad.ticket(cache[account]['ticket_id'])
+            if tick is None or tick['close_at'] is not None:
+                logs        = "\n".join(extract_failed_auth_lines(account))
+                infos       = locked_accounts[account]['infos']
+                ticket_id   = zammad.create(f'[ZIMBRA] Locked :{account}',subject="infos",body=yaml.dump(infos,allow_unicode=True))
+                if not args.silent:
+                    print(f'Ticket reCréation de ticket {ticket_id} pour {account}')
+                zammad.note(ticket_id,"logs",logs)
+                new_cache[account] = {"ticket_id": ticket_id, "logs":logs,'infos':infos}
+            else:
+                if not args.silent or args.always:
+                    print(f'Tiket {cache[account]["ticket_id"]} existe et ouvert pour {account}')
+
+    # 🔁 Détection des comptes débloqués
+    for account in cache:
+        ticket_id=cache[account]['ticket_id']
+        if account not in locked_accounts.keys() and not is_excluded(account) and zammad.ticket(ticket_id) is not None:
+            if not args.silent:
+                print(f"Cloture du ticket {ticket_id} cf {account}")
+            zammad.close(ticket_id)
+
+    # 💾 Mise à jour du cache
+    with open(CACHE_PATH, "w") as f:
+        json.dump(new_cache, f, indent=2)
