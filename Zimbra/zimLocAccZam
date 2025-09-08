@@ -275,6 +275,7 @@ if __name__ == "__main__":
             new_cache[account] = {"ticket_id": ticket_id, "logs":logs,'infos':infos}
             if not args.silent:
                 print(f'Ticket {ticket_id} tout neuf pour {account}')
+                print(f'    visible là : {ZAMMAD_URL}/#ticket/zoom/{ticket_id}')
         else:
             # Toujours bloqué, on garde le ticket, on verifie qu'il n'est pas fermé...
             new_cache[account] = cache[account]
@@ -288,8 +289,9 @@ if __name__ == "__main__":
                 zammad.note(ticket_id,"logs",logs)
                 new_cache[account] = {"ticket_id": ticket_id, "logs":logs,'infos':infos}
             else:
-                if not args.silent or args.always:
+                if not args.silent and args.always:
                     print(f'Tiket {cache[account]["ticket_id"]} existe et ouvert pour {account}')
+                    print(f'    visible là : {ZAMMAD_URL}/#ticket/zoom/{tick["id"]}')
 
     # 🔁 Détection des comptes débloqués
     for account in cache:
@@ -297,6 +299,8 @@ if __name__ == "__main__":
         if account not in locked_accounts.keys() and not is_excluded(account) and zammad.ticket(ticket_id) is not None:
             if not args.silent:
                 print(f"Cloture du ticket {ticket_id} cf {account}")
+                print(f'    visible là : {ZAMMAD_URL}/#ticket/zoom/{ticket_id}')
+            zammad.note(ticket_id,"Cloture","Le compte est debloque")
             zammad.close(ticket_id)
 
     # 💾 Mise à jour du cache
