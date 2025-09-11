@@ -13,6 +13,7 @@ import argparse
 import time
 import sys
 
+# Script pour remplacer avantageusement la commande suivante : /opt/zimbra/bin/zmaccts | grep -v "^zzz_" | grep  " lockout "
 
 class Zammad:
 
@@ -227,6 +228,7 @@ if __name__ == "__main__":
     parser.add_argument('-C','--config',help='permet de changer le fichier de configuration',action='append')
     parser.add_argument('-a','--always',help='Affiche les emails _encore_ locked',action="store_true")
     parser.add_argument('-s','--silent',help='Silence absolue',action="store_true")
+    parser.add_argument('-n','--no-create',help="Ne cree pas le ticket meme si c'est necessaire",action="store_true",dest='no_create')
     args = parser.parse_args()
 
 
@@ -270,9 +272,12 @@ if __name__ == "__main__":
             ### Compte absent du cache (donc pas de ticket)
             logs        = "\n".join(extract_failed_auth_lines(account))
             infos       = locked_accounts[account]['infos']
-            ticket_id   = zammad.create(f'[ZIMBRA] Locked :{account}',subject="infos",body=yaml.dump(infos,allow_unicode=True))
-            zammad.note(ticket_id,"logs",logs)
-            new_cache[account] = {"ticket_id": ticket_id, "logs":logs,'infos':infos}
+            if not args.no_create:
+                ticket_id   = zammad.create(f'[ZIMBRA] Locked :{account}',subject="infos",body=yaml.dump(infos,allow_unicode=True))
+                zammad.note(ticket_id,"logs",logs)
+                new_cache[account] = {"ticket_id": ticket_id, "logs":logs,'infos':infos}
+            else:
+                ticket_id   = "****"
             if not args.silent:
                 print(f'Ticket {ticket_id} tout neuf pour {account}')
                 print(f'    visible là : {ZAMMAD_URL}/#ticket/zoom/{ticket_id}')
