@@ -247,7 +247,7 @@ if __name__ == "__main__":
     CACHE_PATH      = config.get("general", "cache_file")
     base_dn         = config.get("general", "base_dn")
     EXCLUDE_REGEXES = [r.strip() for r in config.get("general", "exclude_regexes").split(",")]
-    
+
     # 📦 Lecture du cache
     if os.path.exists(CACHE_PATH):
         with open(CACHE_PATH, "r") as f:
@@ -302,11 +302,20 @@ if __name__ == "__main__":
     for account in cache:
         ticket_id=cache[account]['ticket_id']
         if account not in locked_accounts.keys() and not is_excluded(account) and zammad.ticket(ticket_id) is not None:
-            if not args.silent:
-                print(f"Cloture du ticket {ticket_id} cf {account}")
+            tick=zammad.ticket(ticket_id)
+            if tick is None:
+                print(f" Cas de figure perturbant : le ticket {ticket_id} pour {account} a existé, mais ca n'est plus le cas, il n'est meme pas fermé...")
+                continue
+
+            zammad.note(ticket_id,"Cloture","Le compte est debloque vue Zimbra")
+            if tick['close_at'] is None:
+                zammad.close(ticket_id)
+                if not args.silent:
+                    print(f"Cloture du ticket {ticket_id} cf {account}")
+                    print(f'    visible là : {ZAMMAD_URL}/#ticket/zoom/{ticket_id}')
+            elif not args.silent:
+                print(f"Ticket {ticket_id} cf {account} deja cloturé dans Zammad ?!?")
                 print(f'    visible là : {ZAMMAD_URL}/#ticket/zoom/{ticket_id}')
-            zammad.note(ticket_id,"Cloture","Le compte est debloque")
-            zammad.close(ticket_id)
 
     # 💾 Mise à jour du cache
     with open(CACHE_PATH, "w") as f:
