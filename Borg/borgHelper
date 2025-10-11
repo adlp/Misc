@@ -23,7 +23,6 @@ import socket
 import configparser
 import subprocess,select
 import json
-import sentry_sdk
 
 ### Notes
 # repo01 a cfg dans ~root/.ssh/config
@@ -32,7 +31,7 @@ import sentry_sdk
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.35.2"
+Version="0.36.1"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -40,6 +39,7 @@ Version="0.35.2"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.36.2 Corr version + deplacement import sentry
 # 0.36 Sentry integration (with id cfg through env, or files...)
 # 0.35.1 html is much more lovely
 # 0.35 correct time alert / colorized and limited report now :)
@@ -1060,6 +1060,7 @@ def boex(nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True): #,g
 # Activation or not de sentry
 sentryid=getDataFromEnvOrFile(env="BORGHELPERC_SENTRY_ID",envpath="BORGHELPERC_SENTRY_FILE",paths="/usr/local/etc/borghelper-sentry")
 if sentryid != None:
+    import sentry_sdk
     sentry_sdk.init(
         sentryid,
         # Set traces_sample_rate to 1.0 to capture 100%
