@@ -23,6 +23,7 @@ import socket
 import configparser
 import subprocess,select
 import json
+import sentry_sdk
 
 ### Notes
 # repo01 a cfg dans ~root/.ssh/config
@@ -31,7 +32,7 @@ import json
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.36"
+Version="0.35.2"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -39,7 +40,7 @@ Version="0.36"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
-# 0.36 .borghelperrc can be specified
+# 0.36 Sentry integration (with id cfg through env, or files...)
 # 0.35.1 html is much more lovely
 # 0.35 correct time alert / colorized and limited report now :)
 # 0.34.1 debug key debugged, so no debug when no debug nor half debug bug
@@ -96,13 +97,43 @@ Version="0.36"
 # 0.2 Maintenant on peiut faire un diff entre les 2 dernieres versions (en precisant rien)
 # 0.1 Premiere version (officielle) qui reagit bien a toutes les commandes
 
+def getDataFromEnvOrFile(env=None,envpath=None,paths=None):
+    """
+    Vérifie si `env_var` est définie, sinon cherche un fichier dans `path_list_str`.
+    Appelle `toto(data)` avec la valeur trouvée.
+    """
+    # 🔍 Vérifie la variable d’environnement
+    if env:
+        data = os.environ.get(env)
+        if data:
+            return(data)
+    if envpath:
+        fileName = os.environ.get(envpath)
+        if fileName and os.path.isfile(fileName) and os.access(fileName, os.R_OK):
+            with open(fileName, 'r', encoding='utf-8') as f:
+                data = f.readline().strip()
+                return(data)
+
+    # 🔍 Recherche du premier fichier accessible
+    pathlst = [p.strip() for p in paths.split(',')]
+    for path in pathlst:
+        if os.path.isfile(path) and os.access(path, os.R_OK):
+            with open(path, 'r', encoding='utf-8') as f:
+                data = f.readline().strip()
+                print(f"📄 Fichier trouvé : {path}")
+                return(data)
+
+    # ❌ Rien trouvé
+    return(None)
+
+
 def version():
     print(f"Version {Version}")
     sys.exit(0)
 
 def usage(doc=None,debug=0):
     if doc is None:
-        printer("   -H <Stats|Login|Mount|UMount|ListBkp|ListBkpFiles|Restore> [-C /root/.borghelperrc")
+        printer("   -H <Stats|Login|Mount|UMount|ListBkp|ListBkpFiles|Restore>")
         printer("       Permet d'avoir les documentations detaillés des differentes commandes")
         printer("   -c Stats [-n server-name/nickname]")
         printer("       Liste les backup references, et le fait qu'ils soient mount ou pas")
@@ -132,6 +163,7 @@ def usage(doc=None,debug=0):
         printer("       On lance un backup")
         printer("⚗️ ⚡️-c Prune [-n nickname/servername/ALL]")
         printer("      ⚡️ On delete les vieux backup sur le repo ⚡️ DANGER")
+        printer("  Sentry configuration : BORGHELPERC_SENTRY_ID BORGHELPERC_SENTRY_FILE ou /usr/local/etc/borghelper-sentry")
     elif doc == 'key':
         printer("   -c Key [-n nickname/servername/ALL]")
         printer("       On export la clef de l'archive")
@@ -1024,11 +1056,21 @@ def boex(nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True): #,g
    #     if ps.returncode != 0:
    #         sys.exit(ps.returncode)
 
-
+#### MAIN
+# Activation or not de sentry
+sentryid=getDataFromEnvOrFile(env="BORGHELPERC_SENTRY_ID",envpath="BORGHELPERC_SENTRY_FILE",paths="/usr/local/etc/borghelper-sentry")
+if sentryid != None:
+    sentry_sdk.init(
+        sentryid,
+        # Set traces_sample_rate to 1.0 to capture 100%
+        # of transactions for performance monitoring.
+        # We recommend adjusting this value in production.
+        traces_sample_rate=1.0
+        )
 ######### Analyse Arguments
 
 try:
-    opts, args = getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:f:w:dvlC:", ["help"])
+    opts, args = getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:f:w:dvl", ["help"])
 except getopt.GetoptError as err:
     print(err)  # will print something like "option -a not recognized"
     usage()
@@ -1037,14 +1079,14 @@ except getopt.GetoptError as err:
 debug=0
 cmd=None
 
-optab={ 'stats'     :'Ccdn',      'login'     :'Ccdsnkprm',
-        'mount'     :'Ccdnb',     'umount'    :'Ccdn',
-        'lstbkp'    :'Ccdn',      'lstbkpfls' :'Ccdnb',
-        'restore'   :'Ccdnbfw',   'diffbkp'   :'Ccdnbw',
-        'delbkp'    :'Ccdnb',     'bkp'       :'Ccdn',
-        'prune'     :'Ccdn',      'report'    :'Ccdnbl',
-        'init'      :'Ccdn',      'poc'       :'Ccdn',
-        'key'       :'Ccdn',}
+optab={ 'stats'     :'cdn',      'login'     :'cdsnkprm',
+        'mount'     :'cdnb',     'umount'    :'cdn',
+        'lstbkp'    :'cdn',      'lstbkpfls' :'cdnb',
+        'restore'   :'cdnbfw',   'diffbkp'   :'cdnbw',
+        'delbkp'    :'cdnb',     'bkp'       :'cdn',
+        'prune'     :'cdn',      'report'    :'cdnbl',
+        'init'      :'cdn',      'poc'       :'cdn',
+        'key'       :'cdn',}
 
 for opt,arg in opts:
     if   opt in '-h':
@@ -1057,8 +1099,6 @@ for opt,arg in opts:
         debug+=1
     elif opt in '-v':
         version()
-    elif opt in '-C':
-        cfgfile=arg
         
 
 if cmd is None or cmd not in optab.keys():
