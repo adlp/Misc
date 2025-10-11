@@ -23,6 +23,7 @@ import socket
 import configparser
 import subprocess,select
 import json
+import sqlite3
 
 ### Notes
 # repo01 a cfg dans ~root/.ssh/config
@@ -31,7 +32,7 @@ import json
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.37"
+Version="0.38"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -39,6 +40,7 @@ Version="0.37"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.38 On met les cache en sqlite
 # 0.37 Fichier de conf parametrable
 # 0.36.2 Corr version + deplacement import sentry
 # 0.36 Sentry integration (with id cfg through env, or files...)
@@ -447,7 +449,134 @@ def cmd_lstfiles(nick,bid,debug=0):
         print(i)
     sys.exit(rb['exitcode'])
 
-def cacheJsonBoexWithLM(nick,boexarg,prefix="/tmp/borgHelper-",suffix=".json",output="stdout",debug=0):
+def ensure_table_exists(db_path, table_name, create_query):
+    """
+    Vérifie si une table existe dans la base SQLite, et la crée si elle est absente.
+
+    :param db_path: Chemin vers le fichier .sqlite
+    :param table_name: Nom de la table à vérifier
+    :param create_query: Requête SQL complète pour créer la table
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        # Vérifie si la table existe
+        cursor.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name=?;
+        """, (table_name,))
+        result = cursor.fetchone()
+
+        if result:
+            if debug:
+                print(f"✅ La table '{table_name}' existe déjà.")
+        else:
+            if debug:
+                print(f"⚠️ La table '{table_name}' n'existe pas. Création en cours...")
+            cursor.execute(create_query)
+            conn.commit()
+            if debug:
+                print(f"✅ Table '{table_name}' créée avec succès.")
+
+    except sqlite3.Error as e:
+        print(f"❌ Erreur SQLite : {e}")
+    finally:
+        conn.close()
+
+def get_details_if_exists(db_path, table_name, nom, lastmodified):
+    """
+    Recherche une entrée dans la table avec les champs 'nom' et 'lastmodified'.
+    Si elle existe, retourne 'details', sinon retourne None.
+
+    :param db_path: Chemin vers le fichier .sqlite
+    :param table_name: Nom de la table à interroger
+    :param nom: Valeur du champ 'nom'
+    :param lastmodified: Valeur du champ 'lastmodified'
+    :return: Valeur du champ 'details' ou None
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        query = f"""
+        SELECT details FROM {table_name}
+        WHERE nom = ? AND lastmodified = ?
+        LIMIT 1;
+        """
+        cursor.execute(query, (nom, lastmodified))
+        result = cursor.fetchone()
+
+        return result[0] if result else None
+
+    except sqlite3.Error as e:
+        print(f"❌ Erreur SQLite : {e}")
+        return None
+    finally:
+        conn.close()
+
+def insert_in_db(db_path, table_name, nom, lastmodified, details):
+    """
+    Insère une ligne dans la table si aucune entrée ne correspond à 'nom' et 'lastmodified'.
+
+    :param db_path: Chemin vers le fichier .sqlite
+    :param table_name: Nom de la table
+    :param nom: Valeur du champ 'nom'
+    :param lastmodified: Valeur du champ 'lastmodified'
+    :param details: Valeur à insérer dans le champ 'details'
+    :return: True si insertion effectuée, False si déjà présent
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        # Insère la nouvelle entrée
+        query_insert = f"""
+        INSERT INTO {table_name} (nom, lastmodified, details)
+        VALUES (?, ?, ?);
+        """
+        cursor.execute(query_insert, (nom, lastmodified, details))
+        conn.commit()
+        if debug:
+            print(f"✅ Entrée insérée avec succès.")
+        return True
+
+    except sqlite3.Error as e:
+        print(f"❌ Erreur SQLite : {e}")
+        return False
+    finally:
+        conn.close()
+
+def cacheJsonBoexWithLM(nick,boexarg,prefix=None,suffix=None,output="stdout",debug=0,db_file="/tmp/borgsql.db"):
+    last_modified=boex(nick,['info','--json'],debug=debug)['stdout'][0]['repository']['last_modified']
+    # nick, last modified, json
+    table="cachejsonboexlm"
+    create_sql=f"""
+    CREATE TABLE {table} (
+        id INTEGER PRIMARY KEY,
+        nom TEXT NOT NULL,
+        lastmodified TEXT NOT NULL,
+        details TEXT
+    );
+    """
+    ensure_table_exists(db_file, table, create_sql)
+    details=get_details_if_exists(db_file, table, nick, last_modified)
+    if details == None:
+        if debug:
+            print('❌ Pas de detail, on les crees')
+        details=boex(nick,boexarg,debug=debug)[output][0]
+        insert_in_db(db_file, table, nick, last_modified, json.dumps(details))
+    else:
+        details=json.loads(details)
+        if debug:
+            print("✅ il y avait du detail, on le renvoie")
+    
+    if type(details) is list:
+        return(ret[0])
+    return(details)
+    
+
+def cacheJsonBoexWithLM2(nick,boexarg,prefix="/tmp/borgHelper-",suffix=".json",output="stdout",debug=0):
     last_modified=boex(nick,['info','--json'],debug=debug)['stdout'][0]['repository']['last_modified']
     nomFi=prefix+nick+'-'+last_modified+suffix
     if os.path.isfile(nomFi):
@@ -1041,6 +1170,9 @@ def boex(nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True): #,g
 
     if debug:
         printer(json.dumps(ret,indent=4))
+
+    if ret["exitcode"] != 0 and len(ret['stderr']):
+        printer(ret['stderr'])
 
     return(ret)
 
