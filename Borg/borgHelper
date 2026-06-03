@@ -32,7 +32,7 @@ import sqlite3
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
 
-Version="0.38.1"
+Version="0.38.2"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -40,6 +40,7 @@ Version="0.38.1"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.38.2 division par zero
 # 0.38.1 Correctifs et amelioration de la partie sentry
 # 0.38 On met les cache en sqlite
 # 0.37 Fichier de conf parametrable
@@ -651,17 +652,29 @@ def prep_report(nick,debug=0,maxp=None):
             notPrunable+=1
         c+=1
 
-    resume['moy_duration']=resume['duration']/c
-    resume['unique_csize']=r['cache']['stats']['unique_csize']
-    for i in ['duration','compressed_size','deduplicated_size','nfiles','original_size','unique_csize']:
-        resume['moy_'+i]=resume[i]/c
+    if c:
+        resume['moy_duration']=resume['duration']/c
+        resume['unique_csize']=r['cache']['stats']['unique_csize']
+        for i in ['duration','compressed_size','deduplicated_size','nfiles','original_size','unique_csize']:
+            resume['moy_'+i]=resume[i]/c
+    else:
+        resume['moy_duration']=resume['duration']
+        resume['unique_csize']=r['cache']['stats']['unique_csize']
+        for i in ['duration','compressed_size','deduplicated_size','nfiles','original_size','unique_csize']:
+            resume['moy_'+i]=resume[i]
 
 
     resume['total_size']=r['cache']['stats']['total_size']
     resume['total_csize']=r['cache']['stats']['total_csize']
 
-    resume['last']=r['archives'][c-1]['start']
-    resume['lastname']=r['archives'][c-1]['name']
+    if not c:
+        #import pprint
+        #pprint.pprint(r)
+        resume['last']=r['repository']['last_modified']
+        resume['lastname']=""
+    else:
+        resume['last']=r['archives'][c-1]['start']
+        resume['lastname']=r['archives'][c-1]['name']
 
     if debug > 0:
         print(json.dumps(r,indent=4))
@@ -677,8 +690,12 @@ def prep_report(nick,debug=0,maxp=None):
     tcmpl[nick]['nom']          =nick
     tcmpl[nick]['date derniere']=dabesi["date"]
     tcmpl[nick]['depuis']       =dabesi['since']
-    tcmpl[nick]['duree']        =kept[resume['lastname']]['durationM']
-    tcmpl[nick]['derniere']     =kept[resume['lastname']]['deduplicated_size']
+    if not c:
+        tcmpl[nick]['duree']        =-1
+        tcmpl[nick]['derniere']     =0
+    else:
+        tcmpl[nick]['duree']        =kept[resume['lastname']]['durationM']
+        tcmpl[nick]['derniere']     =kept[resume['lastname']]['deduplicated_size']
     tcmpl[nick]['moy']          =resume['moy_deduplicated_size']
     tcmpl[nick]['taille']       =resume['unique_csize']
     tcmpl[nick]['recuperable']  =resume['prunable']
@@ -1160,7 +1177,9 @@ def boex(nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True): #,g
     if(len(errs)):
         if errs[0] in '{':
             try:
-                ret['stderr']=json.loads('['+','.join(errs.split('\n'))[:-1]+']')
+                #ret['stderr']=json.loads('['+','.join(errs.split('\n'))[:-1]+']')
+                theJson='['+','.join(errs.split('\n'))[:-1]+']'
+                ret['stderr']=theJson
             except:
                 errs=errs.replace('"','_')
                 ret['stderr']=json.loads('["'+errs+'"]')
