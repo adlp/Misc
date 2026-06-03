@@ -1394,12 +1394,11 @@ def boex(nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True): #,g
     if(len(errs)):
         if errs[0] in '{':
             try:
-                #ret['stderr']=json.loads('['+','.join(errs.split('\n'))[:-1]+']')
                 theJson='['+','.join(errs.split('\n'))[:-1]+']'
-                ret['stderr']=theJson
-            except:
-                errs=errs.replace('"','_')
-                ret['stderr']=json.loads('["'+errs+'"]')
+                ret['stderr']=json.loads(theJson)
+            except json.JSONDecodeError:
+                for i in errs.split('\n'):
+                    ret['stderr'].append(i)
         else:
             for i in errs.split('\n'):
                 ret['stderr'].append(i)
