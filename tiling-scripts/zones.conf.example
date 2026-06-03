@@ -1,0 +1,102 @@
+# ~/.config/tiling/zones.conf
+#
+# Fichier de configuration du tiling XFCE.
+# Rechargé à chaque lancement — aucun redémarrage nécessaire après modification.
+#
+# ── Trois types de sections ───────────────────────────────────────────────────
+#
+#  [zones]              Zones par défaut — toujours disponibles en fallback
+#  [zones:1920x1080]    Zones spécifiques à une résolution de moniteur
+#  [zones:Firefox]      Zones spécifiques à une application (WM class)
+#
+# Ordre d'affichage dans rofi :
+#   1. Zones app-spécifiques [zones:AppClass]  (si section existe, affichées en premier)
+#   2. Zones résolution [zones:WxH]            (si section existe pour le moniteur courant)
+#      OU zones par défaut [zones]             (fallback si pas de section résolution)
+#
+# Format :  nom = x,y,largeur,hauteur[,unlock]
+#
+# Valeurs : pixels entiers  (ex: 960)
+#           ou pourcentages (ex: 50%)
+#
+# Flag optionnel ,unlock : place la fenêtre sans la verrouiller.
+# Par défaut (sans ,unlock) toute zone verrouille la fenêtre après placement.
+#
+# Les pourcentages sont relatifs au moniteur sur lequel la fenêtre se trouve.
+# Détection automatique à chaque lancement — fonctionne en multi-écran.
+#
+# Ordre d'affichage dans rofi = ordre dans ce fichier.
+# Les lignes vides et commentaires (#) sont ignorés.
+
+# ══════════════════════════════════════════════════════════════════════════════
+[ui]
+# ══════════════════════════════════════════════════════════════════════════════
+# Personnalisation visuelle des menus rofi.
+
+# Couleur de fond du premier rofi (sélection de fenêtre).
+# Format CSS : #rrggbb  (laisser vide = couleur rofi par défaut)
+window-rofi-color = #2a1a2a
+
+# Couleur de fond du second rofi (sélection de zone) — distingue des autres menus.
+# Format CSS : #rrggbb  (laisser vide = couleur rofi par défaut)
+zone-rofi-color = #1a2a4a
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+[zones]
+# ══════════════════════════════════════════════════════════════════════════════
+# Zones disponibles pour toutes les apps et toutes les résolutions.
+# Utilisées quand aucune section [zones:WxH] ne correspond au moniteur courant.
+
+# ── Quarts ────────────────────────────────────────────────────────────────────
+haut-gauche   = 0%,0%,50%,50%
+haut-droit    = 50%,0%,50%,50%
+bas-gauche    = 0%,50%,50%,50%
+bas-droit     = 50%,50%,50%,50%
+
+# ── Moitiés ───────────────────────────────────────────────────────────────────
+gauche        = 0%,0%,50%,100%
+droite        = 50%,0%,50%,100%
+haut          = 0%,0%,100%,50%
+bas           = 0%,50%,100%,50%
+
+# ── Plein écran (sans lock — permet de revenir en fenêtré) ────────────────────
+plein-ecran   = 0%,0%,100%,100%,unlock
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+[zones:1920x1080]
+# ══════════════════════════════════════════════════════════════════════════════
+# Zones affichées uniquement sur les moniteurs 1920×1080.
+# Remplacent [zones] pour cette résolution (pas de cumul).
+
+# ── Tiers ─────────────────────────────────────────────────────────────────────
+tiers-gauche  = 0,0,640,1080
+tiers-milieu  = 640,0,640,1080
+tiers-droit   = 1280,0,640,1080
+
+# ── Quarts ────────────────────────────────────────────────────────────────────
+haut-gauche   = 0%,0%,50%,50%
+haut-droit    = 50%,0%,50%,50%
+bas-gauche    = 0%,50%,50%,50%
+bas-droit     = 50%,50%,50%,50%
+
+# ── Moitiés ───────────────────────────────────────────────────────────────────
+gauche        = 0%,0%,50%,100%
+droite        = 50%,0%,50%,100%
+
+# ── Plein écran (sans lock) ───────────────────────────────────────────────────
+plein-ecran   = 0%,0%,100%,100%,unlock
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+[zones:Firefox]
+# ══════════════════════════════════════════════════════════════════════════════
+# Zones spécifiques à Firefox — affichées EN PREMIER dans rofi, avant les autres.
+# Le nom de section = WM class (wmctrl -lx, partie après le dernier point).
+# Exemples : Firefox, Signal, Gvim, Xfce4-terminal, Thunar, Code
+
+# ── Navigation + outil ────────────────────────────────────────────────────────
+browser-large  = 0%,0%,70%,100%
+browser-droite = 30%,0%,70%,100%
+browser-plein  = 0%,0%,100%,100%,unlock
