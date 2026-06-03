@@ -9,7 +9,7 @@ Centralise la configuration de plusieurs dépôts/serveurs dans un fichier INI e
 
 - Python 3.8+
 - `borg` dans le PATH
-- `prettytable` (`pip install prettytable`) — requis pour `Report` en mode texte
+- `prettytable` (`pip install prettytable`) — requis pour `Report` et les commandes d'index
 
 ---
 
@@ -130,7 +130,6 @@ borgHelper -c Bkp -n mon-serveur
 ```
 
 Nécessite : `EXCLUDE`, `SER_LOGIN`, `SER_NAME`.  
-Écrit le rapport JSON dans `/tmp/borgHelper-bkp-<nick>.json`.  
 Code retour 0 si succès ou warnings, 2 si erreur borg.
 
 ---
@@ -145,7 +144,7 @@ borgHelper -c Prune -n ALL
 ```
 
 Requiert au moins une clef `KEEP_*` dans la conf.  
-Enchaîne automatiquement `borg compact`.
+Enchaîne automatiquement `borg compact` puis invalide le cache.
 
 ---
 
@@ -212,13 +211,13 @@ borgHelper -c Restore -n mon-serveur -b archive-id \
 ---
 
 ### `Mount` / `UMount`
-Monte/démonte une archive via FUSE.  
+Monte/démonte les archives via FUSE.  
 **Le dépôt ne peut pas être sauvegardé tant qu'il est monté.**
 
 ```bash
-borgHelper -c Mount -n mon-serveur               # dernière archive
-borgHelper -c Mount -n mon-serveur -b archive-id
-borgHelper -c Mount -n mon-serveur -b ALL        # toutes les archives
+borgHelper -c Mount -n mon-serveur               # toutes les archives (défaut)
+borgHelper -c Mount -n mon-serveur -b last       # dernière archive uniquement
+borgHelper -c Mount -n mon-serveur -b archive-id # archive précise
 borgHelper -c UMount -n mon-serveur
 ```
 
@@ -238,7 +237,7 @@ borgHelper -c Key -n ALL
 
 ### `DelBkp`
 Supprime une archive précise.  
-**Opération destructive.**
+**Opération destructive.** Invalide le cache automatiquement.
 
 ```bash
 borgHelper -c DelBkp -n mon-serveur -b archive-id
@@ -252,24 +251,6 @@ Initialise un nouveau dépôt borg (chiffrement `repokey`).
 ```bash
 borgHelper -c Init -n mon-serveur
 ```
-
----
-
-## Cache
-
-Les appels `borg info --json` coûteux sont mis en cache dans `/tmp/borgsql.db` (SQLite).  
-La clef de cache est `(nick, last_modified)` — invalidé automatiquement à chaque nouvelle sauvegarde.
-
----
-
-## Sentry
-
-Intégration optionnelle pour remonter les erreurs.  
-DSN lu dans l'ordre :
-
-1. Variable d'environnement `BORGHELPERC_SENTRY_DSN`
-2. Fichier pointé par `BORGHELPERC_SENTRY_FILE`
-3. Fichier `/usr/local/etc/borghelper-sentry`
 
 ---
 
@@ -312,13 +293,46 @@ Colonnes : nick, date, archive avant, archive après, type, taille avant, taille
 
 ---
 
-## Base de données diff
+### `CacheInfo`
+Affiche le contenu du cache SQLite (`~/.borghelper-cache.db`).
 
-Fichier : `~/.borghelper-diff.db` (SQLite)
+```bash
+borgHelper -c CacheInfo
+borgHelper -c CacheInfo -n mon-serveur
+```
+
+---
+
+### `CacheClean`
+Supprime les entrées périmées du cache en vérifiant le `last_modified` courant de chaque dépôt.  
+Supprime aussi les entrées pour les nicks absents de la conf.
+
+```bash
+borgHelper -c CacheClean
+borgHelper -c CacheClean -n mon-serveur
+```
+
+---
+
+## Fichiers de données
+
+| Fichier | Contenu |
+|---------|---------|
+| `~/.borghelperrc` | Configuration des dépôts (INI) |
+| `~/.borghelper-cache.db` | Cache des appels `borg info/list` (SQLite, persistant) |
+| `~/.borghelper-diff.db` | Index des diffs entre archives (SQLite) |
+
+### Cache (`~/.borghelper-cache.db`)
+
+Clef : `(nick, last_modified)` — invalidé automatiquement dès que le dépôt change.  
+Purge automatique après `DelBkp` et `Prune`.  
+Nettoyage manuel : `CacheClean`.
+
+### Index diff (`~/.borghelper-diff.db`)
 
 Tables :
 - `diff_index` — un enregistrement par fichier modifié par paire d'archives
-- `diff_indexed_pairs` — sentinel des paires déjà traitées (évite le ré-indexage)
+- `diff_indexed_pairs` — sentinel des paires déjà traitées
 
 Schéma `diff_index` :
 
@@ -332,6 +346,17 @@ Schéma `diff_index` :
 | path | TEXT | Chemin absolu du fichier |
 | size_before | INTEGER | Taille avant en octets (NULL si added) |
 | size_after | INTEGER | Taille après en octets (NULL si removed) |
+
+---
+
+## Sentry
+
+Intégration optionnelle pour remonter les erreurs.  
+DSN lu dans l'ordre :
+
+1. Variable d'environnement `BORGHELPERC_SENTRY_DSN`
+2. Fichier pointé par `BORGHELPERC_SENTRY_FILE`
+3. Fichier `/usr/local/etc/borghelper-sentry`
 
 ---
 
@@ -351,6 +376,9 @@ Schéma `diff_index` :
 ```cron
 # Backup quotidien à 2h
 0 2 * * *  borgHelper -c Bkp -n mon-serveur
+
+# Index diff après le backup
+5 2 * * *  borgHelper -c Index -n mon-serveur
 
 # Prune hebdomadaire le dimanche à 3h
 0 3 * * 0  borgHelper -c Prune -n mon-serveur
