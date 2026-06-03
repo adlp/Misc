@@ -34,7 +34,7 @@ import re
 cfgfile=os.path.expanduser("~/.borghelperrc")
 diff_db_file=os.path.expanduser("~/.borghelper-diff.db")
 
-Version="0.39"
+Version="0.39.1"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -42,6 +42,7 @@ Version="0.39"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.39.1 fix parsing stderr JSON dans boex (crash sur \escape)
 # 0.39 Index/Search/FileHist — diff index SQLite
 # 0.38.2 division par zero
 # 0.38.1 Correctifs et amelioration de la partie sentry
