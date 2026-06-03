@@ -24,6 +24,7 @@ import configparser
 import subprocess,select
 import json
 import sqlite3
+import re
 
 ### Notes
 # repo01 a cfg dans ~root/.ssh/config
@@ -31,8 +32,9 @@ import sqlite3
 # sur le repo01 poser la clef du serveur
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
+diff_db_file=os.path.expanduser("~/.borghelper-diff.db")
 
-Version="0.38.2"
+Version="0.39"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -40,6 +42,7 @@ Version="0.38.2"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.39 Index/Search/FileHist — diff index SQLite
 # 0.38.2 division par zero
 # 0.38.1 Correctifs et amelioration de la partie sentry
 # 0.38 On met les cache en sqlite
@@ -168,6 +171,12 @@ def usage(doc=None,debug=0):
         printer("       On lance un backup")
         printer("⚗️ ⚡️-c Prune [-n nickname/servername/ALL]")
         printer("      ⚡️ On delete les vieux backup sur le repo ⚡️ DANGER")
+        printer("   -c Index [-n nickname/servername/ALL]")
+        printer("       Indexe les diffs entre archives consécutives dans ~/.borghelper-diff.db")
+        printer("   -c Search -f <pattern> [-n nickname/servername/ALL]")
+        printer("       Cherche dans l'index des diffs par nom de fichier (glob * et ?)")
+        printer("   -c FileHist -f <chemin> [-n nickname/servername/ALL]")
+        printer("       Historique des changements d'un chemin exact")
         printer("  Sentry configuration : BORGHELPERC_SENTRY_ID BORGHELPERC_SENTRY_FILE ou /usr/local/etc/borghelper-sentry")
     elif doc == 'key':
         printer("   -c Key [-n nickname/servername/ALL]")
@@ -243,6 +252,20 @@ def usage(doc=None,debug=0):
     elif doc == 'init':
         printer('   -c init [-n nickname/servername]')
         printer('      Initiaslisation du repo')
+    elif doc == 'index':
+        printer("   -c Index [-n nickname/servername/ALL]")
+        printer("       Indexe les diffs entre archives consécutives dans ~/.borghelper-diff.db")
+        printer("       Incrémental : paires déjà traitées ignorées")
+        printer("       Types indexés : added, removed, modified, C (permissions), B (lien cassé)…")
+    elif doc == 'search':
+        printer("   -c Search -f <pattern> [-n nickname/servername/ALL]")
+        printer("       Cherche dans l'index des diffs par pattern de chemin")
+        printer("       Sous-chaîne libre ou glob avec * et ?")
+        printer("       Ex : -f '*.conf'   -f '/etc/nginx*'   -f 'passwd'")
+    elif doc == 'filehist':
+        printer("   -c FileHist -f <chemin> [-n nickname/servername/ALL]")
+        printer("       Historique complet des changements d'un chemin exact")
+        printer("       Ex : -f /etc/nginx/nginx.conf")
     else:
         printer(f"  Desole pas de documation pour la commande {doc}")
 
@@ -376,12 +399,11 @@ def mountedornot(mountpoint,debug=0):
         fd.close()
     return(founded)
 
-def cmd_mount(nick,bid=None,debug=0):
+def cmd_mount(nick,bid='ALL',debug=0):
     cfg=cfgreaded(nick)
 
-    if bid is None:
+    if bid is None or bid == 'last':
         bid=getlastbkp(nick,debug=debug)[0]
-    #rb=boex(nick,['list','--glob-archives',cfg['GLOB_ARCH'],'::'+bid],debug=0)
 
     repo=cfg['BORG_REPO']+"::"+bid
     if bid == "ALL":
@@ -604,8 +626,203 @@ def cacheJsonBoexWithLM2(nick,boexarg,prefix="/tmp/borgHelper-",suffix=".json",o
         return(ret)
     
 
+def ensure_diff_db(db_path=None):
+    if db_path is None:
+        db_path=diff_db_file
+    conn=sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS diff_index (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            nick             TEXT NOT NULL,
+            archive_old      TEXT NOT NULL,
+            archive_new      TEXT NOT NULL,
+            archive_new_date TEXT,
+            change_type      TEXT NOT NULL,
+            path             TEXT NOT NULL,
+            size_before      INTEGER,
+            size_after       INTEGER,
+            indexed_at       TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_diff_nick_path    ON diff_index(nick, path);
+        CREATE INDEX IF NOT EXISTS idx_diff_nick_archive ON diff_index(nick, archive_new);
+        CREATE TABLE IF NOT EXISTS diff_indexed_pairs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            nick        TEXT NOT NULL,
+            archive_old TEXT NOT NULL,
+            archive_new TEXT NOT NULL,
+            entry_count INTEGER DEFAULT 0,
+            indexed_at  TEXT DEFAULT (datetime('now')),
+            UNIQUE(nick, archive_old, archive_new)
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+def is_diff_pair_indexed(nick,archive_old,archive_new,db_path=None):
+    if db_path is None:
+        db_path=diff_db_file
+    try:
+        conn=sqlite3.connect(db_path)
+        cur=conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=? LIMIT 1",
+            (nick,archive_old,archive_new))
+        result=cur.fetchone()
+        conn.close()
+        return result is not None
+    except sqlite3.Error:
+        return False
+
+def store_diff_entries(nick,archive_old,archive_new,archive_new_date,entries,db_path=None):
+    if db_path is None:
+        db_path=diff_db_file
+    try:
+        conn=sqlite3.connect(db_path)
+        if entries:
+            conn.executemany(
+                "INSERT INTO diff_index (nick,archive_old,archive_new,archive_new_date,change_type,path,size_before,size_after) VALUES (?,?,?,?,?,?,?,?)",
+                [(nick,archive_old,archive_new,archive_new_date,
+                  e['change_type'],e['path'],e.get('size_before'),e.get('size_after'))
+                 for e in entries])
+        conn.execute(
+            "INSERT OR IGNORE INTO diff_indexed_pairs (nick,archive_old,archive_new,entry_count) VALUES (?,?,?,?)",
+            (nick,archive_old,archive_new,len(entries)))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.Error as e:
+        printer(f"SQLite error: {e}")
+        return False
+
+def parse_borg_size(s):
+    s=s.strip()
+    for unit,mult in [('TB',10**12),('GB',10**9),('MB',10**6),('kB',10**3),('B',1)]:
+        if s.endswith(unit):
+            try:
+                return int(float(s[:-len(unit)].strip())*mult)
+            except (ValueError,TypeError):
+                return None
+    return None
+
+def parse_diff_line(line):
+    line=line.rstrip()
+    if not line:
+        return None
+    m=re.match(r'^added\s+([\d.]+\s+\w+)\s+(.+)$',line)
+    if m:
+        return {'change_type':'added','size_before':None,
+                'size_after':parse_borg_size(m.group(1)),'path':m.group(2)}
+    m=re.match(r'^removed\s+([\d.]+\s+\w+)\s+(.+)$',line)
+    if m:
+        return {'change_type':'removed','size_before':parse_borg_size(m.group(1)),
+                'size_after':None,'path':m.group(2)}
+    m=re.match(r'^modified\s+\+([\d.]+\s+\w+)\s+-([\d.]+\s+\w+)\s+(.+)$',line)
+    if m:
+        return {'change_type':'modified',
+                'size_before':parse_borg_size(m.group(2)),
+                'size_after':parse_borg_size(m.group(1)),
+                'path':m.group(3)}
+    m=re.match(r'^([A-Z])\s+(.+)$',line)
+    if m:
+        return {'change_type':m.group(1),'size_before':None,
+                'size_after':None,'path':m.group(2)}
+    return None
+
+def cmd_index(nick,debug=0,db_path=None):
+    if db_path is None:
+        db_path=diff_db_file
+    ensure_diff_db(db_path)
+    cfg=cfgreaded(nick,debug=debug)
+    rb=boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+    archives=rb['stdout'][0]['archives']
+    if len(archives)<2:
+        printer(f"{nick}: moins de 2 archives, rien à indexer")
+        return 0
+    new_pairs=0
+    skipped=0
+    for i in range(len(archives)-1):
+        a_old=archives[i]['name']
+        a_new=archives[i+1]['name']
+        date_new=archives[i+1]['start']
+        if is_diff_pair_indexed(nick,a_old,a_new,db_path):
+            skipped+=1
+            continue
+        print(f"  {nick}: {a_old} → {a_new}",flush=True)
+        rb2=boex(nick,['diff',f"{cfg['BORG_REPO']}::{a_old}",a_new],debug=debug,retjson=False)
+        entries=[]
+        for line in rb2['stdout']:
+            p=parse_diff_line(line)
+            if p and p['path']:
+                entries.append(p)
+        store_diff_entries(nick,a_old,a_new,date_new,entries,db_path)
+        new_pairs+=1
+    print(f"{nick}: {new_pairs} paires indexées (+{skipped} déjà en cache)")
+    return 0
+
+def cmd_search(nick,pattern,debug=0,db_path=None):
+    if db_path is None:
+        db_path=diff_db_file
+    ensure_diff_db(db_path)
+    sql_pat=pattern.replace('*','%').replace('?','_')
+    if '%' not in sql_pat and '_' not in sql_pat:
+        sql_pat='%'+sql_pat+'%'
+    try:
+        conn=sqlite3.connect(db_path)
+        rows=[]
+        for n in nick.split(','):
+            cur=conn.execute(
+                "SELECT nick,archive_new_date,archive_new,change_type,path,size_before,size_after "
+                "FROM diff_index WHERE nick=? AND path LIKE ? "
+                "ORDER BY archive_new_date,path",
+                (n,sql_pat))
+            rows.extend(cur.fetchall())
+        conn.close()
+        if not rows:
+            print("Aucun résultat.")
+            return
+        from prettytable import PrettyTable
+        t=PrettyTable(['nick','date','archive','type','chemin','avant','après'])
+        t.align['chemin']='l'
+        t.align['archive']='l'
+        for nick_r,date_r,arch_r,type_r,path_r,sb,sa in rows:
+            t.add_row([nick_r,(date_r or '')[:19],arch_r,type_r,path_r,
+                       convert_octets_readable(sb) if sb else '',
+                       convert_octets_readable(sa) if sa else ''])
+        print(t)
+    except sqlite3.Error as e:
+        printer(f"SQLite error: {e}")
+
+def cmd_filehist(nick,path,debug=0,db_path=None):
+    if db_path is None:
+        db_path=diff_db_file
+    ensure_diff_db(db_path)
+    try:
+        conn=sqlite3.connect(db_path)
+        rows=[]
+        for n in nick.split(','):
+            cur=conn.execute(
+                "SELECT nick,archive_new_date,archive_old,archive_new,change_type,size_before,size_after "
+                "FROM diff_index WHERE nick=? AND path=? ORDER BY archive_new_date",
+                (n,path))
+            rows.extend(cur.fetchall())
+        conn.close()
+        if not rows:
+            print(f"Aucune entrée pour : {path}")
+            return
+        from prettytable import PrettyTable
+        t=PrettyTable(['nick','date','archive avant','archive après','type','avant','après'])
+        t.align['archive avant']='l'
+        t.align['archive après']='l'
+        for nick_r,date_r,a_old,a_new,type_r,sb,sa in rows:
+            t.add_row([nick_r,(date_r or '')[:19],a_old,a_new,type_r,
+                       convert_octets_readable(sb) if sb else '',
+                       convert_octets_readable(sa) if sa else ''])
+        print(t)
+    except sqlite3.Error as e:
+        printer(f"SQLite error: {e}")
+
+
 def prep_report(nick,debug=0,maxp=None):
-    import re
     cfg=cfgreaded(nick,debug=debug)
     pruneme=[]
     for i in cmd_prune(nick,dryrun=True,debug=debug):
@@ -1243,7 +1460,8 @@ optab={ 'stats'     :'Ccdn',      'login'     :'Ccdsnkprm',
         'delbkp'    :'Ccdnb',     'bkp'       :'Ccdn',
         'prune'     :'Ccdn',      'report'    :'Ccdnbl',
         'init'      :'Ccdn',      'poc'       :'Ccdn',
-        'key'       :'Ccdn',}
+        'key'       :'Ccdn',      'index'     :'Ccdn',
+        'search'    :'Ccdnf',     'filehist'  :'Ccdnf',}
 
 for opt,arg in opts:
     if   opt in '-h':
@@ -1321,8 +1539,8 @@ elif cmd == 'login':
     cmd_login(serna,nick,options['-k'],options['-p'],options['-r'],options['-m'],debug=debug)
 elif cmd == 'mount':
     # printer("-c Mount [-n nickname/servername]")
-    if '-b' not in options.keys() or 'last' in options['-b']:
-        options['-b']=None
+    if '-b' not in options.keys():
+        options['-b']='ALL'
     cmd_mount(nick,bid=options['-b'],debug=debug)
 elif cmd == 'umount':
     # printer("-c UMount [-n nickname/servername]")
@@ -1400,6 +1618,17 @@ elif cmd == 'init':
     cmd_init(nick,debug=debug)
 elif cmd == 'poc':
     cmd_poc(nick,debug=debug)
+elif cmd == 'index':
+    for n in nick.split(','):
+        cmd_index(n,debug=debug)
+elif cmd == 'search':
+    if '-f' not in options.keys():
+        usage(cmd)
+    cmd_search(nick,options['-f'],debug=debug)
+elif cmd == 'filehist':
+    if '-f' not in options.keys():
+        usage(cmd)
+    cmd_filehist(nick,options['-f'],debug=debug)
 else:
     printer("Mais comment on peut en arriver la ?")
     usage()
