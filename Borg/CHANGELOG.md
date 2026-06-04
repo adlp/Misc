@@ -1,5 +1,15 @@
 # Changelog — borgHelper
 
+## 0.45.2 — 2026-06-04
+
+### Ajout — `BORG_KEY_FILE` dans borghelperrc
+
+- `boex` passe `BORG_KEY_FILE` à borg si la clé est définie dans la section du nick
+- Utile quand plusieurs nicks partagent le même dépôt physique avec chiffrement `keyfile`
+- Inactif si absent de la conf (pas d'effet de bord)
+
+---
+
 ## 0.45.1 — 2026-06-04
 
 ### Optimisation — `Report` : cache du prune dry-run + 1 seul appel borg info

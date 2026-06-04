@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.45.1"
+Version="0.45.2"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.45.1"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.45.2 boex : BORG_KEY_FILE passé à borg si présent dans borghelperrc
 # 0.45.1 Report : prune dry-run caché en SQLite, 1 seul appel borg info par nick
 # 0.45 Bkp : indexation automatique via --list pendant backup (-I pour désactiver)
 # 0.44.3 Report : erreur borg par nick affichée dans le tableau, exit 2, rapport continue
@@ -1996,7 +1997,7 @@ def boex(nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True): #,g
     if debug != 0:
         printer('Boex the first')
     for k in list(cfg.keys()):
-        if k in ['BORG_REPO','BORG_PASSPHRASE','BORG_REMOTE_PATH','BORG_RSH','BORG_SHOW_SYSINFO','BORG_RELOCATED_REPO_ACCESS_IS_OK']:
+        if k in ['BORG_REPO','BORG_PASSPHRASE','BORG_REMOTE_PATH','BORG_RSH','BORG_SHOW_SYSINFO','BORG_RELOCATED_REPO_ACCESS_IS_OK','BORG_KEY_FILE']:
             varfut[k]=cfg[k]
 
     if forceEnv is not None:

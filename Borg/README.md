@@ -62,6 +62,9 @@ SSH_KEY          = /root/.ssh/id_borg
 # Identifiant SQLite (optionnel — surcharge le nick dans le nom des fichiers DB)
 DB_NAME                  = mon-serveur-home   # → borghelperrc-mon-serveur-home-cache.db
 
+# Clef explicite (keyfile mode, utile si plusieurs nicks partagent le même dépôt)
+BORG_KEY_FILE            = /root/.config/borg/keys/abcdef123456
+
 # Borg divers
 BORG_REMOTE_PATH            = borg1
 BORG_RSH                    = ssh -p 2222
