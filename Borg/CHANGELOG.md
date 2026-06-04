@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## 0.42 — 2026-06-04
+
+### Changement cassant — Emplacement des fichiers DB
+
+- Les deux DBs SQLite (`-cache.db` et `-diff.db`) sont maintenant dans `~/.cache/borghelper/` par défaut
+- Le nom des fichiers inclut le basename sanitisé du fichier de configuration : `borghelperrc-cache.db`, `borghelperrc-diff.db`
+- Configurable via la clé `CACHE_DIR` dans la section `[DEFAULT]` de `.borghelperrc`
+- Exemple avec `-C /etc/borg-prod.rc` → `~/.cache/borghelper/borg-prod_rc-cache.db`
+- **Migration** : les anciens `~/.borghelper-cache.db` et `~/.borghelper-diff.db` ne sont plus utilisés — relancer `Index` et `IndexSnap` pour reconstruire les index
+
+---
+
 ## 0.41.1 — 2026-06-04
 
 ### Correctifs — `IndexSnap`

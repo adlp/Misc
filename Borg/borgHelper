@@ -32,10 +32,25 @@ import re
 # sur le repo01 poser la clef du serveur
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
-diff_db_file=os.path.expanduser("~/.borghelper-diff.db")
-cache_db_file=os.path.expanduser("~/.borghelper-cache.db")
+diff_db_file=None
+cache_db_file=None
 
-Version="0.41.1"
+def _db_name_from_cfg(path):
+    base=os.path.basename(os.path.abspath(path)).lstrip('.')
+    return re.sub(r'[^a-zA-Z0-9_-]','_',base)
+
+def init_db_paths():
+    global cache_db_file,diff_db_file
+    cp=configparser.ConfigParser()
+    if os.path.exists(cfgfile):
+        cp.read(cfgfile)
+    cache_dir=os.path.expanduser(cp.defaults().get('cache_dir','~/.cache/borghelper'))
+    os.makedirs(cache_dir,exist_ok=True)
+    db_name=_db_name_from_cfg(cfgfile)
+    cache_db_file=os.path.join(cache_dir,f"{db_name}-cache.db")
+    diff_db_file =os.path.join(cache_dir,f"{db_name}-diff.db")
+
+Version="0.42"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -43,6 +58,7 @@ Version="0.41.1"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.42 DBs dans ~/.cache/borghelper/ (ou CACHE_DIR), nommés d'après le fichier de conf
 # 0.41.1 IndexSnap : fix borg list --json invalide pour contenu archive → --format parse manuel
 # 0.41 IndexSnap + archive_snapshot : Search/FileHist trouve fichiers stables (non prunés)
 # 0.40.3 DiffBkp reécrit sur SQLite diff index (auto-index à la volée, affichage prettytable)
@@ -1748,7 +1764,8 @@ for opt,arg in opts:
         version()
     elif opt in '-C':
         cfgfile=os.path.expanduser(arg)
-        
+
+init_db_paths()
 
 if cmd is None or cmd not in optab.keys():
     usage()

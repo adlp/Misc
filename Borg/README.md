@@ -338,16 +338,25 @@ borgHelper -c CacheClean -n mon-serveur
 | Fichier | Contenu |
 |---------|---------|
 | `~/.borghelperrc` | Configuration des dépôts (INI) |
-| `~/.borghelper-cache.db` | Cache des appels `borg info/list` (SQLite, persistant) |
-| `~/.borghelper-diff.db` | Index des diffs entre archives (SQLite) |
+| `~/.cache/borghelper/<conf>-cache.db` | Cache des appels `borg info/list` (SQLite, persistant) |
+| `~/.cache/borghelper/<conf>-diff.db` | Index des diffs et snapshots d'archives (SQLite) |
 
-### Cache (`~/.borghelper-cache.db`)
+`<conf>` = basename sanitisé du fichier de configuration (ex : `borghelperrc` pour `~/.borghelperrc`).
+
+Le répertoire de stockage est configurable via la clé `CACHE_DIR` dans la section `[DEFAULT]` de `.borghelperrc` :
+
+```ini
+[DEFAULT]
+CACHE_DIR = /data/borgcache
+```
+
+### Cache (`<conf>-cache.db`)
 
 Clef : `(nick, last_modified)` — invalidé automatiquement dès que le dépôt change.  
 Purge automatique après `DelBkp` et `Prune`.  
 Nettoyage manuel : `CacheClean`.
 
-### Index diff (`~/.borghelper-diff.db`)
+### Index diff (`<conf>-diff.db`)
 
 Tables :
 - `diff_index` — un enregistrement par fichier modifié par paire d'archives
