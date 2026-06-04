@@ -1,5 +1,14 @@
 # Changelog — borgHelper
 
+## 0.49.5 — 2026-06-04
+
+### Ajout — `Report` : `=présent` avec taille disque et %
+
+- `present_sz = original_size - added_sz - modified_sz` (calculé sans requête supplémentaire)
+- Format : `N (P%) · SIZE (S%)` — cohérent avec `+ajouté` et `-supprimé`
+
+---
+
 ## 0.49.4 — 2026-06-04
 
 ### Ajout — `Report` : taille disque exprimée en % dans les stats
