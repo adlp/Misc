@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## 0.46.2 — 2026-06-04
+
+### Correctifs — `IndexError: list index out of range`
+
+- `_boex_check_stdout` : helper commun qui lève `RuntimeError` si `boex` retourne stdout vide ou code d'erreur
+- `getlastbkp` : crash si borg list échoue → RuntimeError propagée aux appelants
+- `cmd_index` : borg list inaccessible → message d'erreur + return 1 (ne crash plus)
+- `cmd_indexsnap` : même fix
+- `cmd_diffbkp` : même fix → exit 2
+
+---
+
 ## 0.46.1 — 2026-06-04
 
 ### Améliorations — `Restore`

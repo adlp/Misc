@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.46.1"
+Version="0.46.2"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.46.1"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.46.2 fix IndexError stdout vide dans cmd_index/indexsnap/getlastbkp/cmd_diffbkp
 # 0.46.1 Restore : -f glob (* ?), -w avec sous-rép / -W plat, structure tar correcte
 # 0.46 Restore : archive auto via SQLite si -b absent ; -w .tar/.tgz crée/append un tar
 # 0.45.2 boex : BORG_KEY_FILE passé à borg si présent dans borghelperrc
@@ -542,7 +543,7 @@ def cmd_key(nicks,debug=0):
 def getlastbkp(nick,nbl=1,debug=0):
     cfg=cfgreaded(nick,debug=debug)
     rb=boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
-    #lines=boex(nick,['list','--glob-archives',cfg['GLOB_ARCH']],ret=True,debug=debug)['stdout']
+    _boex_check_stdout(rb,nick,'borg list')
     lines=rb['stdout'][0]['archives']
     ret=[]
     for i in range(nbl*-1,0):
@@ -699,6 +700,17 @@ def clear_cache_nick(nick,db_path=None):
         return count
     except sqlite3.Error:
         return 0
+
+def _boex_check_stdout(rb,nick,cmd='borg'):
+    """Lève RuntimeError si boex a échoué ou retourné stdout vide."""
+    if rb['exitcode']!=0 or not rb['stdout']:
+        msgs=[]
+        for i in rb.get('stderr',[]):
+            if isinstance(i,dict) and i.get('levelname')=='ERROR':
+                msgs.append(i.get('message','').split('\n')[0])
+            elif isinstance(i,str) and i.strip() and not i.startswith('Platform'):
+                msgs.append(i.strip()[:100])
+        raise RuntimeError('; '.join(msgs[:2]) or f"{cmd} failed (code {rb['exitcode']})")
 
 def _boex_last_modified(nick,debug=0):
     """Appelle borg info --json, retourne last_modified, lève RuntimeError si échec."""
@@ -1026,6 +1038,11 @@ def cmd_index(nick,debug=0,db_path=None):
     ensure_diff_db(db_path)
     cfg=cfgreaded(nick,debug=debug)
     rb=boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+    try:
+        _boex_check_stdout(rb,nick,'borg list')
+    except RuntimeError as e:
+        printer(f"{nick}: {e}")
+        return 1
     archives=rb['stdout'][0]['archives']
     if len(archives)<2:
         printer(f"{nick}: moins de 2 archives, rien à indexer")
@@ -1058,6 +1075,11 @@ def cmd_indexsnap(nick,debug=0,db_path=None):
     ensure_diff_db(db_path)
     cfg=cfgreaded(nick,debug=debug)
     rb=boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+    try:
+        _boex_check_stdout(rb,nick,'borg list')
+    except RuntimeError as e:
+        printer(f"{nick}: {e}")
+        return 1
     archives=rb['stdout'][0]['archives']
     if not archives:
         printer(f"{nick}: aucune archive")
@@ -1744,6 +1766,11 @@ def cmd_diffbkp(nick,bidun=None,bideux=None,debug=0,db_path=None):
     if not is_diff_pair_indexed(nick,bidun,bideux,db_path):
         print(f"Paire non indexée — calcul en cours...",flush=True)
         rb=boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+        try:
+            _boex_check_stdout(rb,nick,'borg list')
+        except RuntimeError as e:
+            printer(f"borg list a échoué : {e}")
+            sys.exit(2)
         archives=rb['stdout'][0]['archives']
         date_new=next((a['start'] for a in archives if a['name']==bideux),None)
         rb2=boex(nick,['diff',f"{cfg['BORG_REPO']}::{bidun}",bideux],debug=debug,retjson=False)
