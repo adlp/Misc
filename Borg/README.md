@@ -234,6 +234,8 @@ borgHelper -c Restore -n mon-serveur -f 'home/user/*.log' \
            -W /tmp/logs.tgz             # glob → tgz plat (sans sous-répertoires)
 borgHelper -c Restore -n mon-serveur -f home/user \
            -W /tmp/restauration         # répertoire plat
+borgHelper -c Restore -n mon-serveur -f 'etc/nginx/*.conf' -L          # liste les droits
+borgHelper -c Restore -n mon-serveur -f 'etc/nginx/*.conf' -L > droits.txt  # vers fichier texte
 ```
 
 | Option | Description |
@@ -242,9 +244,12 @@ borgHelper -c Restore -n mon-serveur -f home/user \
 | `-f` | Chemin exact ou glob (`*`, `?`) — ex : `etc/nginx/*.conf` |
 | `-w <dest>` | Restauration avec sous-répertoires (répertoire ou `.tar`/`.tgz`) |
 | `-W <dest>` | Restauration plate — fichiers à la racine, sans sous-répertoires |
+| `-L` | Affiche droits/propriétaires (format `ls -la`) sans restaurer — redirigeable vers un fichier texte |
 
 Si la cible est un `.tar` : crée ou ajoute au fichier existant (append).  
 Si la cible est un `.tgz` : crée uniquement — erreur (exit 3) si le fichier existe déjà (gzip ne supporte pas l'append).
+
+**Droits d'origine préservés** : `borg extract` utilise `--numeric-owner` pour conserver uid/gid numériques ; `tarfile` capture ensuite `mode`, `uid`, `gid`, `mtime` depuis les fichiers extraits. Les droits d'origine sont donc présents dans le tar (quand borgHelper est lancé en root).
 
 ---
 

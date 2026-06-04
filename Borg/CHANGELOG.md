@@ -1,5 +1,23 @@
 # Changelog — borgHelper
 
+## 0.48 — 2026-06-04
+
+### Ajout — `Restore` : préservation des droits d'origine + option `-L` (liste des droits)
+
+#### Droits d'origine dans le tar (`--numeric-owner`)
+- `borg extract` appelé avec `--numeric-owner` : préserve les uid/gid numériques des fichiers extraits
+- `tarfile.add()` capture `mode`, `uid`, `gid`, `mtime` via `os.lstat()` sur les fichiers extraits
+- Résultat : le tar contient les droits/propriétaires exacts de l'archive d'origine (quand lancé en root)
+
+#### Option `-L` : affichage des droits sans restauration
+- `borgHelper -c Restore -n <nick> -f <chemin> -L`
+- Affiche les droits des fichiers/répertoires correspondants (format `ls -la`) depuis l'archive
+- Si `-b` absent : recherche via SQLite la dernière archive contenant le fichier (comme `Restore` normal)
+- Sortie redirigeable vers un fichier texte : `borgHelper -c Restore -n srv -f 'home/*' -L > droits.txt`
+- Implémenté via `borg list --format '{mode} {user:8} {group:8} {size:>12} {isomtime} {path}{NL}'`
+
+---
+
 ## 0.47.2 — 2026-06-04
 
 ### Correctif — `Restore` : `OSError: No space left on device`

@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.47.2"
+Version="0.48"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.47.2"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.48 Restore : droits d'origine dans le tar (--numeric-owner) ; -L affiche droits sans restaurer
 # 0.47.2 Restore : OSError ENOSPC attrapé → message clair au lieu de traceback
 # 0.47.1 IDX_INCLUDE/IDX_EXCLUDE dans borghelperrc : filtre chemins indexés
 # 0.47 NOIDX=1 dans borghelperrc désactive indexation ; index vide → erreur avec conseil
@@ -292,12 +293,14 @@ def usage(doc=None,debug=0):
         printer("           backupid    : Le nom du backup interessant (si pas precisé compare les 2 derniers)")
         printer("           where       : Repertoire de filtre")
     elif doc == 'restore':
-        printer("   -c Restore [-n nickname/servername] [-b backupid] -f chemin (-w|-W) dest")
+        printer("   -c Restore [-n nickname/servername] [-b backupid] -f chemin (-w|-W) dest | -L")
         printer("       Restaure un fichier ou une arborescence depuis une archive")
         printer("       -b        : archive précise ; absent → dernière archive SQLite contenant -f")
         printer("       -f        : chemin exact ou glob (* ?) ex : etc/nginx/*.conf  home/user")
         printer("       -w <dest> : restauration avec sous-répertoires (répertoire ou .tar/.tgz)")
         printer("       -W <dest> : restauration plate — fichiers à la racine, sans sous-répertoires")
+        printer("       -L        : affiche droits/propriétaires des fichiers (mode ls -la) sans restaurer")
+        printer("                   Droits d'origine préservés dans le tar via --numeric-owner")
     elif doc == 'delbkp':
         printer("   -c DelBkp [-n nickname/servername] -b backupid")
         printer("       ⚡️ On delete un backup sur le repo ⚡️ DANGER")
@@ -1890,8 +1893,9 @@ def _find_last_archive_with_file(nick,path,debug=0):
         return None
 
 def _borg_extract_args(bid,ftor):
-    """Construit les args borg extract selon que ftor est un pattern ou un chemin exact."""
-    base=['extract','--exclude','*/log/*',f'::{bid}']
+    """Construit les args borg extract selon que ftor est un pattern ou un chemin exact.
+    --numeric-owner : préserve uid/gid numériques pour restaurer les droits d'origine."""
+    base=['extract','--numeric-owner','--exclude','*/log/*',f'::{bid}']
     if '*' in ftor or '?' in ftor:
         base+=[f'--pattern=sh:{ftor}']
     else:
@@ -1947,6 +1951,28 @@ def _restore_to_tar(nick,bid,ftor,tarpath,flat=False,debug=0):
                 printer(f"[ERREUR] Écriture impossible : {e}")
             sys.exit(3)
         print(f"Restauré {'(plat) ' if flat else ''}dans {tarpath}",flush=True)
+    sys.exit(rb['exitcode'])
+
+def cmd_listperms(nick,bid,ftor,debug=0):
+    """Liste les droits/propriétaires des fichiers dans l'archive (format ls -la)."""
+    if bid is None:
+        bid=_find_last_archive_with_file(nick,ftor,debug=debug)
+        if bid:
+            print(f"Archive : {bid}",flush=True)
+        else:
+            bid=getlastbkp(nick,debug=debug)[0]
+            print(f"Archive (dernière) : {bid}",flush=True)
+    fmt='{mode} {user:8} {group:8} {size:>12} {isomtime} {path}{NL}'
+    args=['list','--format',fmt,f'::{bid}']
+    if '*' in ftor or '?' in ftor:
+        args+=[f'--pattern=sh:{ftor}']
+    else:
+        args.append(ftor)
+    rb=boex(nick,args,debug=debug,retjson=False)
+    for line in rb['stdout']:
+        if line.strip():
+            print(line)
+    _print_boex_stderr(rb)
     sys.exit(rb['exitcode'])
 
 def cmd_resto(nick,bid,ftor,where,flat=False,debug=0):
@@ -2299,7 +2325,7 @@ if sentryid != None:
 ######### Analyse Arguments
 
 try:
-    opts, args = getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:dvjlIC:", ["help"])
+    opts, args = getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:dvjlILC:", ["help"])
 except getopt.GetoptError as err:
     print(err)  # will print something like "option -a not recognized"
     usage()
@@ -2311,7 +2337,7 @@ cmd=None
 optab={ 'stats'     :'Ccdn',      'login'     :'Ccdsnkprm',
         'mount'     :'Ccdnb',     'umount'    :'Ccdn',
         'lstbkp'    :'Ccdn',      'lstbkpfls' :'Ccdnb',
-        'restore'   :'CcdnbfwW',  'diffbkp'   :'Ccdnbw',
+        'restore'   :'CcdnbfwWL', 'diffbkp'   :'Ccdnbw',
         'delbkp'    :'Ccdnb',     'bkp'       :'CcdnI',
         'prune'     :'Ccdn',      'report'    :'Ccdnbl',
         'init'      :'Ccdn',
@@ -2442,13 +2468,16 @@ elif cmd == 'restore':
         options['-b']=None
     if '-f' not in options.keys():
         usage(cmd)
-    if '-w' not in options.keys() and '-W' not in options.keys():
-        usage(cmd)
-    if '-W' in options.keys():
-        where=options['-W']; flat=True
+    if '-L' in options:
+        cmd_listperms(nick,options['-b'],options['-f'],debug=debug)
     else:
-        where=options['-w']; flat=False
-    cmd_resto(nick,options['-b'],options['-f'],where,flat=flat,debug=debug)
+        if '-w' not in options.keys() and '-W' not in options.keys():
+            usage(cmd)
+        if '-W' in options.keys():
+            where=options['-W']; flat=True
+        else:
+            where=options['-w']; flat=False
+        cmd_resto(nick,options['-b'],options['-f'],where,flat=flat,debug=debug)
 elif cmd == 'delbkp':
     # printer("   -c DelBkp [-n nickname/servername] -b backupid")
     if '-b' not in options.keys() or 'last' in options['-b']:
