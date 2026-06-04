@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## 0.51 — 2026-06-04
+
+### Ajout — `Index` / `IndexSnap` : option `-F` (force réindexation)
+
+- `-F` force la réindexation même si les paires/snapshots sont déjà présents en cache SQLite
+- `cmd_index -F` : supprime les entrées `diff_index` + `diff_indexed_pairs` existantes avant de réindexer chaque paire
+- `cmd_indexsnap -F` : supprime `archive_snapshot` + `archive_snapshot_indexed` de la dernière archive avant réindexation
+- Utile quand l'index existe mais contient des données manquantes ou corrompues
+- Propagé automatiquement : `Index -F` appelle `IndexSnap -F` en fin de traitement
+
+---
+
 ## 0.50 — 2026-06-04
 
 ### Ajout — `Restore` : `-w -` / `-W -` → tar vers stdout

@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.50"
+Version="0.51"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.50"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.51 Index/IndexSnap : -F force la réindexation même si déjà présent en cache
 # 0.50 Restore : -w -  ou -W - envoie le tar en stdout (pipe) ; messages → stderr
 # 0.49.5 Report : =présent inclut taille disque et % (original_size - added - modified)
 # 0.49.4 Report : taille disque aussi en % (/ original_size du backup)
@@ -230,10 +231,12 @@ def usage(doc=None,debug=0):
         printer("       On lance un backup")
         printer("⚗️ ⚡️-c Prune [-n nickname/servername/ALL]")
         printer("      ⚡️ On delete les vieux backup sur le repo ⚡️ DANGER")
-        printer("   -c Index [-n nickname/servername/ALL]")
+        printer("   -c Index [-n nickname/servername/ALL] [-F]")
         printer("       Indexe les diffs entre archives consécutives + snapshot de la dernière archive")
-        printer("   -c IndexSnap [-n nickname/servername/ALL]")
+        printer("       -F : force la réindexation même si déjà en cache")
+        printer("   -c IndexSnap [-n nickname/servername/ALL] [-F]")
         printer("       Indexe le listing complet de la dernière archive (fichiers stables)")
+        printer("       -F : force la réindexation même si déjà en cache")
         printer("   -c Search -f <pattern> [-n nickname/servername/ALL] [-b archive|ALL]")
         printer("       Cherche dans l'index des diffs par nom de fichier (glob * et ?)")
         printer("       -b : depuis archive X (défaut : dernière paire)")
@@ -328,14 +331,16 @@ def usage(doc=None,debug=0):
         printer('   -c init [-n nickname/servername]')
         printer('      Initiaslisation du repo')
     elif doc == 'index':
-        printer("   -c Index [-n nickname/servername/ALL]")
+        printer("   -c Index [-n nickname/servername/ALL] [-F]")
         printer("       Indexe les diffs entre archives consécutives (incrémental)")
         printer("       Appelle IndexSnap automatiquement à la fin")
+        printer("       -F : force la réindexation de toutes les paires même si déjà en cache")
         printer("       Types : added, removed, modified, C (permissions), B (lien cassé), T (type changé)")
     elif doc == 'indexsnap':
-        printer("   -c IndexSnap [-n nickname/servername/ALL]")
+        printer("   -c IndexSnap [-n nickname/servername/ALL] [-F]")
         printer("       Indexe le listing complet de la dernière archive dans le SQLite")
         printer("       Permet à Search et FileHist de trouver les fichiers stables (jamais modifiés)")
+        printer("       -F : force la réindexation même si le snapshot est déjà en cache")
         printer("       Appelé automatiquement par Index — à lancer manuellement après un Prune")
     elif doc == 'search':
         printer("   -c Search -f <pattern> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive]")
@@ -1076,7 +1081,7 @@ def parse_diff_line(line):
                 'size_after':None,'path':m.group(2)}
     return None
 
-def cmd_index(nick,debug=0,db_path=None):
+def cmd_index(nick,debug=0,db_path=None,force=False):
     if _nick_noidx(nick):
         printer(f"{nick}: indexation désactivée (NOIDX=1)")
         return 0
@@ -1100,9 +1105,18 @@ def cmd_index(nick,debug=0,db_path=None):
         a_old=archives[i]['name']
         a_new=archives[i+1]['name']
         date_new=archives[i+1]['start']
-        if is_diff_pair_indexed(nick,a_old,a_new,db_path):
+        if not force and is_diff_pair_indexed(nick,a_old,a_new,db_path):
             skipped+=1
             continue
+        if force and is_diff_pair_indexed(nick,a_old,a_new,db_path):
+            try:
+                conn=sqlite3.connect(db_path)
+                conn.execute("DELETE FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
+                conn.execute("DELETE FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
+                conn.commit()
+                conn.close()
+            except sqlite3.Error as e:
+                printer(f"SQLite error (purge): {e}")
         print(f"  {nick}: {a_old} → {a_new}",flush=True)
         rb2=boex(nick,['diff',f"{cfg['BORG_REPO']}::{a_old}",a_new],debug=debug,retjson=False)
         entries=[]
@@ -1113,10 +1127,10 @@ def cmd_index(nick,debug=0,db_path=None):
         store_diff_entries(nick,a_old,a_new,date_new,entries,db_path)
         new_pairs+=1
     print(f"{nick}: {new_pairs} paires indexées (+{skipped} déjà en cache)")
-    cmd_indexsnap(nick,debug=debug,db_path=db_path)
+    cmd_indexsnap(nick,debug=debug,db_path=db_path,force=force)
     return 0
 
-def cmd_indexsnap(nick,debug=0,db_path=None):
+def cmd_indexsnap(nick,debug=0,db_path=None,force=False):
     if _nick_noidx(nick):
         printer(f"{nick}: indexation désactivée (NOIDX=1)")
         return 0
@@ -1138,8 +1152,17 @@ def cmd_indexsnap(nick,debug=0,db_path=None):
     archive_name=latest['name']
     archive_date=latest['start']
     if is_archive_snapshot_indexed(nick,archive_name,db_path):
-        print(f"{nick}: snapshot {archive_name} déjà indexé")
-        return 0
+        if not force:
+            print(f"{nick}: snapshot {archive_name} déjà indexé")
+            return 0
+        try:
+            conn=sqlite3.connect(db_path)
+            conn.execute("DELETE FROM archive_snapshot WHERE nick=? AND archive=?",(nick,archive_name))
+            conn.execute("DELETE FROM archive_snapshot_indexed WHERE nick=? AND archive=?",(nick,archive_name))
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as e:
+            printer(f"SQLite error (purge snapshot): {e}")
     print(f"  {nick}: snapshot {archive_name}...",flush=True)
     rb2=boex(nick,['list','--format','{size} {isomtime} {path}{NL}',f"::{archive_name}"],debug=debug,retjson=False)
     if rb2['exitcode'] != 0:
@@ -2607,11 +2630,13 @@ elif cmd == 'cacheinfo':
 elif cmd == 'cacheclean':
     cmd_cache_clean(nick,debug=debug)
 elif cmd == 'index':
+    _force='-F' in options
     for n in nick.split(','):
-        cmd_index(n,debug=debug)
+        cmd_index(n,debug=debug,force=_force)
 elif cmd == 'indexsnap':
+    _force='-F' in options
     for n in nick.split(','):
-        cmd_indexsnap(n,debug=debug)
+        cmd_indexsnap(n,debug=debug,force=_force)
 elif cmd == 'search':
     if '-f' not in options.keys():
         usage(cmd)
