@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## 0.53 — 2026-06-04
+
+### Ajout — `Report` : option `-j` sortie JSON
+
+- `-j` : sortie `json.dumps({'summary': ..., 'backups': ...})` à la place des tableaux ASCII/HTML
+- `summary` : dict par nick (même données que le tableau résumé, stats du dernier backup incluses)
+- `backups` : dict par nick → dict par archive (toutes colonnes, stats +ajouté/-supprimé/=présent)
+- Mutuellement exclusif avec `-l` (HTML) : `-j` prioritaire
+- Ajout de `j` dans `optab['report']` et paramètre `as_json` dans `cmd_report()`
+
+---
+
 ## 0.52 — 2026-06-04
 
 ### Ajout — `Report` : réindexation automatique des paires manquantes

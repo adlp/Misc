@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.52"
+Version="0.53"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.52"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.53 Report : -j sortie JSON {summary, backups}
 # 0.52 Report : réindexation auto des paires manquantes (stats —, hors premier dump)
 # 0.51.2 fix -F absent de optab index/indexsnap → usage() appelé au lieu d'indexer
 # 0.51.1 fix -F absent de getopt → option non reconnue
@@ -218,8 +219,8 @@ def usage(doc=None,debug=0):
         printer("       On liste les backup connus")
         printer("   -c LstBkpFls [-n nickname/servername] [-b backupid/last]")
         printer("       On liste les fichiers d'un backup precis")
-        printer("⚗️  -c Report [-n nickname/servername/ALL] [-b backupid/last] [-l]")
-        printer("       Rapport sur le dernier (ou pas) backup, avec sortie en htmL")
+        printer("⚗️  -c Report [-n nickname/servername/ALL] [-b N] [-l] [-j]")
+        printer("       Rapport sur les backups  |  -l : HTML  |  -j : JSON")
         printer("   -c DiffBkp [-n nickname/servername] [-b backupid] [-w where]")
         printer("       Liste les mouvements des fichiers entre le backupid et le dernier backup")
         printer("   -c Restore [-n nickname/servername] [-b backupid/last] -f file2get -w where")
@@ -297,9 +298,9 @@ def usage(doc=None,debug=0):
         printer("           nickname    : Le nom de l'enregistrement du serveur")
         printer("           backupid    : Le nom du backup interessant")
     elif doc == 'report':
-        printer("   -c Report [-n nickname/servername] [-b backupid/last]")
-        printer("       Rapport sur le dernier (ou pas) backup")
-        printer("   ⚗️i DEV VERSION")
+        printer("   -c Report [-n nickname/servername] [-b N] [-l] [-j]")
+        printer("       Rapport sur les backups")
+        printer("       -l : sortie HTML  |  -j : sortie JSON  |  -b N : N derniers backups")
     elif doc == 'diffbkp':
         printer("   -c DiffBkp [-n nickname/servername] -b backupid [-w where]")
         printer("       Liste les mouvements des fichiers entre le backupid et le dernier backup")
@@ -1734,7 +1735,7 @@ def filtrer_lignes(tableau, X):
 
     return nouveau_hash
 
-def cmd_report(nicks,htrep=False,dayback=None,debug=0,maxp=None):
+def cmd_report(nicks,htrep=False,dayback=None,debug=0,maxp=None,as_json=False):
     reshos={}
     resbck={}
     reshosto={}
@@ -1808,7 +1809,9 @@ def cmd_report(nicks,htrep=False,dayback=None,debug=0,maxp=None):
             disp=int(cfg["DISPLAY_BKP"])
         resshortbck[nick]=filtrer_lignes(resbck[nick],disp)
 
-    if htrep:
+    if as_json:
+        print(json.dumps({'summary':reshos,'backups':resbck},ensure_ascii=False,indent=2))
+    elif htrep:
         print("<!DOCTYPE html>")
         print("<html>")
         print('  <body bgcolor="#ffffff">')
@@ -2486,7 +2489,7 @@ optab={ 'stats'     :'Ccdn',      'login'     :'Ccdsnkprm',
         'lstbkp'    :'Ccdn',      'lstbkpfls' :'Ccdnb',
         'restore'   :'CcdnbfwWL', 'diffbkp'   :'Ccdnbw',
         'delbkp'    :'Ccdnb',     'bkp'       :'CcdnI',
-        'prune'     :'Ccdn',      'report'    :'Ccdnbl',
+        'prune'     :'Ccdn',      'report'    :'Ccdnblj',
         'init'      :'Ccdn',
         'key'       :'Ccdn',      'index'     :'CcdnF',
         'search'    :'CcdnfbB',   'filehist'  :'CcdnfbB',
@@ -2594,7 +2597,9 @@ elif cmd == 'report':
         options['-b']=None
     else:
         options['-b']=int(options['-b'])
-    if '-l' in options.keys():
+    if '-j' in options:
+        errcmd=cmd_report(nick,as_json=True,maxp=options['-b'],debug=debug)
+    elif '-l' in options.keys():
         errcmd=cmd_report(nick,htrep=True,maxp=options['-b'],debug=debug)
     else:
         errcmd=cmd_report(nick,maxp=options['-b'],debug=debug)
