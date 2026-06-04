@@ -1,5 +1,15 @@
 # Changelog — borgHelper
 
+## 0.49.1 — 2026-06-04
+
+### Correctif — `Report` : colonnes stats toujours visibles en ASCII
+
+- `prettyTabelise` auto-découvre les colonnes depuis les clés des entrées → si aucune archive n'a de stats (index absent), les colonnes n'apparaissaient pas
+- Fix : toutes les vraies archives (celles avec `nfiles`) reçoivent toujours les 3 colonnes (`+ajouté`, `-supprimé`, `=présent`), avec `'—'` quand aucune donnée d'index n'est disponible
+- Résultat : colonnes présentes dans ASCII et HTML, que l'index soit construit ou non
+
+---
+
 ## 0.49 — 2026-06-04
 
 ### Ajout — `Report` : statistiques % ajoutés/supprimés/présents par backup
