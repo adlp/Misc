@@ -184,13 +184,17 @@ borgHelper -c LstBkpFls -n mon-serveur -b mon-serveur-root-2025-04-02T21:30:04
 ---
 
 ### `DiffBkp`
-Différences entre deux archives (fichiers modifiés/ajoutés/supprimés).
+Différences entre deux archives (fichiers modifiés/ajoutés/supprimés).  
+Repose sur `~/.borghelper-diff.db` — si la paire n'est pas encore indexée, le diff est calculé et stocké automatiquement.  
+Affichage en tableau : colonnes type / chemin / taille avant / taille après.
 
 ```bash
 borgHelper -c DiffBkp -n mon-serveur                          # 2 dernières archives
 borgHelper -c DiffBkp -n mon-serveur -b archive-ancienne      # vs dernière
 borgHelper -c DiffBkp -n mon-serveur -b archive-1,archive-2   # entre deux précises
 ```
+
+> Pour des réponses instantanées, lancer `Index` après chaque `Bkp`.
 
 ---
 
@@ -256,7 +260,8 @@ borgHelper -c Init -n mon-serveur
 
 ### `Index`
 Indexe les diffs entre archives consécutives dans `~/.borghelper-diff.db`.  
-Incrémental : paires déjà traitées ignorées. À relancer après chaque `Bkp`.
+Incrémental : paires déjà traitées ignorées. Appelle automatiquement `IndexSnap` à la fin.  
+À relancer après chaque `Bkp`.
 
 ```bash
 borgHelper -c Index -n mon-serveur
@@ -267,8 +272,20 @@ Types d'événements stockés : `added`, `removed`, `modified`, `C` (permissions
 
 ---
 
+### `IndexSnap`
+Indexe le listing complet de la dernière archive dans `~/.borghelper-diff.db`.  
+Permet à `Search` et `FileHist` de trouver les fichiers stables (jamais modifiés, donc absents du diff index).  
+Appelé automatiquement par `Index` — à lancer manuellement si les archives ont changé sans relancer `Index`.
+
+```bash
+borgHelper -c IndexSnap -n mon-serveur
+borgHelper -c IndexSnap -n ALL
+```
+
+---
+
 ### `Search`
-Cherche par nom de fichier dans l'index des diffs.  
+Cherche par nom de fichier dans l'index des diffs **et** dans le snapshot de la dernière archive.  
 Pattern libre (sous-chaîne) ou glob avec `*` et `?`.
 
 ```bash
@@ -277,19 +294,21 @@ borgHelper -c Search -f '*.conf' -n ALL               # glob
 borgHelper -c Search -f '/etc/nginx*' -n mon-serveur  # préfixe
 ```
 
-Colonnes : nick, date, archive, type, chemin, taille avant, taille après.
+Colonnes : nick, date, archive, type, chemin, taille avant, taille après.  
+Type `présent` : fichier stable dans le backup, sans historique de changement récent.
 
 ---
 
 ### `FileHist`
-Historique complet des changements pour un chemin **exact**.
+Historique complet des changements pour un chemin **exact**, incluant la présence dans le snapshot.
 
 ```bash
 borgHelper -c FileHist -f /etc/nginx/nginx.conf -n mon-serveur
 borgHelper -c FileHist -f /var/lib/postgresql -n ALL
 ```
 
-Colonnes : nick, date, archive avant, archive après, type, taille avant, taille après.
+Colonnes : nick, date, archive avant, archive après, type, taille avant, taille après.  
+Type `présent` : fichier trouvé dans le snapshot de la dernière archive (stable, non modifié récemment).
 
 ---
 
@@ -333,6 +352,8 @@ Nettoyage manuel : `CacheClean`.
 Tables :
 - `diff_index` — un enregistrement par fichier modifié par paire d'archives
 - `diff_indexed_pairs` — sentinel des paires déjà traitées
+- `archive_snapshot` — listing complet de la dernière archive indexée par nick
+- `archive_snapshot_indexed` — sentinel des archives déjà snapshotées
 
 Schéma `diff_index` :
 
@@ -377,7 +398,7 @@ DSN lu dans l'ordre :
 # Backup quotidien à 2h
 0 2 * * *  borgHelper -c Bkp -n mon-serveur
 
-# Index diff après le backup
+# Index diff + snapshot après le backup (IndexSnap est appelé automatiquement par Index)
 5 2 * * *  borgHelper -c Index -n mon-serveur
 
 # Prune hebdomadaire le dimanche à 3h

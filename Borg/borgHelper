@@ -35,7 +35,7 @@ cfgfile=os.path.expanduser("~/.borghelperrc")
 diff_db_file=os.path.expanduser("~/.borghelper-diff.db")
 cache_db_file=os.path.expanduser("~/.borghelper-cache.db")
 
-Version="0.40.2"
+Version="0.41.1"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -43,6 +43,9 @@ Version="0.40.2"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.41.1 IndexSnap : fix borg list --json invalide pour contenu archive → --format parse manuel
+# 0.41 IndexSnap + archive_snapshot : Search/FileHist trouve fichiers stables (non prunés)
+# 0.40.3 DiffBkp reécrit sur SQLite diff index (auto-index à la volée, affichage prettytable)
 # 0.40.2 cmd_bkp : affichage stderr lisible [LEVELNAME] msg, exit code propagé depuis borg
 # 0.40.1 Suppression écriture /tmp/borgHelper-bkp-*.json et commande poc
 # 0.40 Cache persistant ~/.borghelper-cache.db, CacheInfo/CacheClean, purge auto après delete/prune
@@ -790,6 +793,24 @@ def ensure_diff_db(db_path=None):
             indexed_at  TEXT DEFAULT (datetime('now')),
             UNIQUE(nick, archive_old, archive_new)
         );
+        CREATE TABLE IF NOT EXISTS archive_snapshot (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            nick         TEXT NOT NULL,
+            archive      TEXT NOT NULL,
+            archive_date TEXT,
+            path         TEXT NOT NULL,
+            size         INTEGER,
+            mtime        TEXT,
+            UNIQUE(nick, archive, path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_snap_nick_path ON archive_snapshot(nick, path);
+        CREATE TABLE IF NOT EXISTS archive_snapshot_indexed (
+            nick         TEXT NOT NULL,
+            archive      TEXT NOT NULL,
+            entry_count  INTEGER DEFAULT 0,
+            indexed_at   TEXT DEFAULT (datetime('now')),
+            UNIQUE(nick, archive)
+        );
     """)
     conn.commit()
     conn.close()
@@ -823,6 +844,38 @@ def store_diff_entries(nick,archive_old,archive_new,archive_new_date,entries,db_
         conn.execute(
             "INSERT OR IGNORE INTO diff_indexed_pairs (nick,archive_old,archive_new,entry_count) VALUES (?,?,?,?)",
             (nick,archive_old,archive_new,len(entries)))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.Error as e:
+        printer(f"SQLite error: {e}")
+        return False
+
+def is_archive_snapshot_indexed(nick,archive,db_path=None):
+    if db_path is None:
+        db_path=diff_db_file
+    try:
+        conn=sqlite3.connect(db_path)
+        cur=conn.cursor()
+        cur.execute("SELECT 1 FROM archive_snapshot_indexed WHERE nick=? AND archive=? LIMIT 1",(nick,archive))
+        result=cur.fetchone()
+        conn.close()
+        return result is not None
+    except sqlite3.Error:
+        return False
+
+def store_archive_snapshot(nick,archive,archive_date,files,db_path=None):
+    if db_path is None:
+        db_path=diff_db_file
+    try:
+        conn=sqlite3.connect(db_path)
+        if files:
+            conn.executemany(
+                "INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,path,size,mtime) VALUES (?,?,?,?,?,?)",
+                [(nick,archive,archive_date,f['path'],f.get('size'),f.get('mtime')) for f in files])
+        conn.execute(
+            "INSERT OR IGNORE INTO archive_snapshot_indexed (nick,archive,entry_count) VALUES (?,?,?)",
+            (nick,archive,len(files)))
         conn.commit()
         conn.close()
         return True
@@ -893,6 +946,49 @@ def cmd_index(nick,debug=0,db_path=None):
         store_diff_entries(nick,a_old,a_new,date_new,entries,db_path)
         new_pairs+=1
     print(f"{nick}: {new_pairs} paires indexées (+{skipped} déjà en cache)")
+    cmd_indexsnap(nick,debug=debug,db_path=db_path)
+    return 0
+
+def cmd_indexsnap(nick,debug=0,db_path=None):
+    if db_path is None:
+        db_path=diff_db_file
+    ensure_diff_db(db_path)
+    cfg=cfgreaded(nick,debug=debug)
+    rb=boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+    archives=rb['stdout'][0]['archives']
+    if not archives:
+        printer(f"{nick}: aucune archive")
+        return 0
+    latest=archives[-1]
+    archive_name=latest['name']
+    archive_date=latest['start']
+    if is_archive_snapshot_indexed(nick,archive_name,db_path):
+        print(f"{nick}: snapshot {archive_name} déjà indexé")
+        return 0
+    print(f"  {nick}: snapshot {archive_name}...",flush=True)
+    rb2=boex(nick,['list','--format','{size} {isomtime} {path}{NL}',f"::{archive_name}"],debug=debug,retjson=False)
+    if rb2['exitcode'] != 0:
+        printer(f"borg list a échoué (code {rb2['exitcode']})")
+        for i in rb2['stderr']:
+            if isinstance(i,dict):
+                printer(f"  [{i.get('levelname','?')}] {i.get('message',i)}")
+            elif isinstance(i,str) and i.strip():
+                printer(f"  {i}")
+        return rb2['exitcode']
+    files=[]
+    for line in rb2['stdout']:
+        line=line.strip()
+        if not line:
+            continue
+        parts=line.split(' ',2)
+        if len(parts)==3:
+            try:
+                size=int(parts[0])
+            except ValueError:
+                size=None
+            files.append({'path':parts[2],'size':size,'mtime':parts[1]})
+    store_archive_snapshot(nick,archive_name,archive_date,files,db_path)
+    print(f"{nick}: {len(files)} fichiers dans le snapshot {archive_name}")
     return 0
 
 def cmd_search(nick,pattern,debug=0,db_path=None):
@@ -910,6 +1006,15 @@ def cmd_search(nick,pattern,debug=0,db_path=None):
                 "SELECT nick,archive_new_date,archive_new,change_type,path,size_before,size_after "
                 "FROM diff_index WHERE nick=? AND path LIKE ? "
                 "ORDER BY archive_new_date,path",
+                (n,sql_pat))
+            rows.extend(cur.fetchall())
+            cur=conn.execute(
+                "SELECT nick,archive_date,archive,'présent',path,NULL,size "
+                "FROM archive_snapshot "
+                "WHERE nick=? AND path LIKE ? "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM diff_index d WHERE d.nick=archive_snapshot.nick AND d.path=archive_snapshot.path"
+                ") ORDER BY archive,path",
                 (n,sql_pat))
             rows.extend(cur.fetchall())
         conn.close()
@@ -941,10 +1046,16 @@ def cmd_filehist(nick,path,debug=0,db_path=None):
                 "FROM diff_index WHERE nick=? AND path=? ORDER BY archive_new_date",
                 (n,path))
             rows.extend(cur.fetchall())
+            cur=conn.execute(
+                "SELECT nick,archive_date,'',archive,'présent',NULL,size "
+                "FROM archive_snapshot WHERE nick=? AND path=? ORDER BY archive",
+                (n,path))
+            rows.extend(cur.fetchall())
         conn.close()
         if not rows:
             print(f"Aucune entrée pour : {path}")
             return
+        rows.sort(key=lambda r: (r[1] or ''))
         from prettytable import PrettyTable
         t=PrettyTable(['nick','date','archive avant','archive après','type','avant','après'])
         t.align['archive avant']='l'
@@ -1272,7 +1383,9 @@ def dfRepo(nick,debug=0):
     return None
 
 
-def cmd_diffbkp(nick,bidun=None,bideux=None,debug=0):
+def cmd_diffbkp(nick,bidun=None,bideux=None,debug=0,db_path=None):
+    if db_path is None:
+        db_path=diff_db_file
     cfg=cfgreaded(nick,debug=debug)
     twodiff=getlastbkp(nick,2,debug=debug)
     if bidun is None and bideux is None:
@@ -1285,21 +1398,57 @@ def cmd_diffbkp(nick,bidun=None,bideux=None,debug=0):
         printer("Desole, ce sont les memes backups")
         sys.exit(1)
 
-    if debug:
-        printer(f"Compraison de {bidun} et {bideux}")
-        printer(twodiff)
-
     if bidun > bideux:
-        bid=bideux
-        bideux=bidun
-        bidun=bid
+        bidun,bideux=bideux,bidun
 
-    arg=['diff',f"{cfg['BORG_REPO']}::{bidun}", bideux]
+    if debug:
+        printer(f"Comparaison de {bidun} et {bideux}")
 
-    rb=boex(nick,arg,debug=debug,retjson=False)
-    for i in rb['stdout']:
-        print(i)
-    sys.exit(rb['exitcode'])
+    ensure_diff_db(db_path)
+
+    if not is_diff_pair_indexed(nick,bidun,bideux,db_path):
+        print(f"Paire non indexée — calcul en cours...",flush=True)
+        rb=boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+        archives=rb['stdout'][0]['archives']
+        date_new=next((a['start'] for a in archives if a['name']==bideux),None)
+        rb2=boex(nick,['diff',f"{cfg['BORG_REPO']}::{bidun}",bideux],debug=debug,retjson=False)
+        if rb2['exitcode'] != 0:
+            printer(f"borg diff a échoué (code {rb2['exitcode']})")
+            sys.exit(rb2['exitcode'])
+        entries=[]
+        for line in rb2['stdout']:
+            p=parse_diff_line(line)
+            if p and p['path']:
+                entries.append(p)
+        store_diff_entries(nick,bidun,bideux,date_new,entries,db_path)
+
+    try:
+        conn=sqlite3.connect(db_path)
+        cur=conn.execute(
+            "SELECT change_type,path,size_before,size_after "
+            "FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=? "
+            "ORDER BY change_type,path",
+            (nick,bidun,bideux))
+        rows=cur.fetchall()
+        conn.close()
+    except sqlite3.Error as e:
+        printer(f"SQLite error: {e}")
+        sys.exit(3)
+
+    print(f"{bidun} → {bideux}")
+    if not rows:
+        print("Aucune différence.")
+        sys.exit(0)
+
+    from prettytable import PrettyTable
+    t=PrettyTable(['type','chemin','avant','après'])
+    t.align['chemin']='l'
+    for type_r,path_r,sb,sa in rows:
+        t.add_row([type_r,path_r,
+                   convert_octets_readable(sb) if sb else '',
+                   convert_octets_readable(sa) if sa else ''])
+    print(t)
+    sys.exit(0)
 
 def cmd_resto(nick,bid,ftor,where,debug=0):
     cfg=cfgreaded(nick,debug=debug)
@@ -1583,7 +1732,8 @@ optab={ 'stats'     :'Ccdn',      'login'     :'Ccdsnkprm',
         'init'      :'Ccdn',
         'key'       :'Ccdn',      'index'     :'Ccdn',
         'search'    :'Ccdnf',     'filehist'  :'Ccdnf',
-        'cacheinfo' :'Ccdn',      'cacheclean':'Ccdn',}
+        'cacheinfo' :'Ccdn',      'cacheclean':'Ccdn',
+        'indexsnap' :'Ccdn',}
 
 for opt,arg in opts:
     if   opt in '-h':
@@ -1745,6 +1895,9 @@ elif cmd == 'cacheclean':
 elif cmd == 'index':
     for n in nick.split(','):
         cmd_index(n,debug=debug)
+elif cmd == 'indexsnap':
+    for n in nick.split(','):
+        cmd_indexsnap(n,debug=debug)
 elif cmd == 'search':
     if '-f' not in options.keys():
         usage(cmd)

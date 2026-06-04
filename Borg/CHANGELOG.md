@@ -1,5 +1,47 @@
 # Changelog — borgHelper
 
+## 0.41.1 — 2026-06-04
+
+### Correctifs — `IndexSnap`
+
+- `borg list --json ::archive` non supporté dans borg 1.x pour le contenu d'une archive → remplacé par `borg list --format '{size} {isomtime} {path}{NL}' ::archive` avec parse ligne par ligne
+- Affichage du stderr borg en cas d'échec (était silencieux)
+
+---
+
+## 0.41 — 2026-06-04
+
+### Ajouts — Snapshot archive + recherche de fichiers stables
+
+#### Nouvelle table `archive_snapshot`
+- Stocke le listing complet des fichiers de la dernière archive (`borg list --json ::archive`)
+- Clé : `(nick, archive, path)` — incrémental, paires déjà indexées ignorées
+- Champs : nick, archive, archive_date, path, size, mtime
+
+#### Nouvelle commande `IndexSnap [-n nick/ALL]`
+- Indexe le listing de la dernière archive de chaque nick
+- Appelée automatiquement par `Index` à la fin de chaque indexation de diffs
+
+#### `Search` étendu
+- Résultats UNION : diff_index (changements) + archive_snapshot (fichiers présents sans historique de changement)
+- Les fichiers stables depuis plus longtemps que la rétention de prune apparaissent maintenant avec le type `présent`
+
+#### `FileHist` étendu
+- Ajoute les lignes `présent` depuis archive_snapshot, triées chronologiquement avec le reste
+
+---
+
+## 0.40.3 — 2026-06-04
+
+### Refactoring — `DiffBkp` sur SQLite
+
+- `DiffBkp` utilise désormais `~/.borghelper-diff.db` au lieu d'appeler `borg diff` en direct
+- Si la paire d'archives n'est pas encore indexée, le diff est calculé et stocké automatiquement à la volée
+- Affichage en tableau (prettytable) : colonnes type / chemin / taille avant / taille après
+- Paires indexées via `Index` : réponse instantanée, sans appel réseau
+
+---
+
 ## 0.40.2 — 2026-06-04
 
 ### Correctifs — `cmd_bkp` : affichage et codes retour
