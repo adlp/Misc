@@ -1,5 +1,28 @@
 # Changelog — borgHelper
 
+## 0.42.2 — 2026-06-04
+
+### Ajout — `DB_NAME` dans borghelperrc
+
+- Nouvelle clé optionnelle `DB_NAME` dans la section d'un dépôt
+- Si définie, remplace le nick dans le nom des fichiers SQLite : `<conf>-<DB_NAME>-cache.db`
+- Utile quand plusieurs nicks partagent le même dépôt physique
+- Caractères non alphanumériques sanitisés automatiquement
+
+---
+
+## 0.42.1 — 2026-06-04
+
+### Changement cassant — Un SQLite par nick
+
+- Chaque dépôt (nick) possède désormais ses propres fichiers DB
+- Nommage : `<conf>-<nick>-cache.db` et `<conf>-<nick>-diff.db`
+- `get_cache_db(nick)` / `get_diff_db(nick)` remplacent les globals `cache_db_file` / `diff_db_file`
+- `cmd_cache_info`, `cmd_cache_clean`, `cmd_search`, `cmd_filehist` : connexion par nick
+- **Migration** : relancer `Index` et `IndexSnap` pour reconstruire les index dans les nouveaux fichiers
+
+---
+
 ## 0.42 — 2026-06-04
 
 ### Changement cassant — Emplacement des fichiers DB

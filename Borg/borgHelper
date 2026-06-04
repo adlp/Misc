@@ -32,25 +32,35 @@ import re
 # sur le repo01 poser la clef du serveur
 
 cfgfile=os.path.expanduser("~/.borghelperrc")
-diff_db_file=None
-cache_db_file=None
+_cache_dir=None
+_db_prefix=None
 
 def _db_name_from_cfg(path):
     base=os.path.basename(os.path.abspath(path)).lstrip('.')
     return re.sub(r'[^a-zA-Z0-9_-]','_',base)
 
 def init_db_paths():
-    global cache_db_file,diff_db_file
+    global _cache_dir,_db_prefix
     cp=configparser.ConfigParser()
     if os.path.exists(cfgfile):
         cp.read(cfgfile)
-    cache_dir=os.path.expanduser(cp.defaults().get('cache_dir','~/.cache/borghelper'))
-    os.makedirs(cache_dir,exist_ok=True)
-    db_name=_db_name_from_cfg(cfgfile)
-    cache_db_file=os.path.join(cache_dir,f"{db_name}-cache.db")
-    diff_db_file =os.path.join(cache_dir,f"{db_name}-diff.db")
+    _cache_dir=os.path.expanduser(cp.defaults().get('cache_dir','~/.cache/borghelper'))
+    os.makedirs(_cache_dir,exist_ok=True)
+    _db_prefix=_db_name_from_cfg(cfgfile)
 
-Version="0.42"
+def get_db_nick(nick):
+    cfg=cfgread(nick)
+    if cfg is not None and 'DB_NAME' in cfg:
+        return re.sub(r'[^a-zA-Z0-9_-]','_',cfg['DB_NAME'])
+    return nick
+
+def get_cache_db(nick):
+    return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-cache.db")
+
+def get_diff_db(nick):
+    return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
+
+Version="0.42.2"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -58,6 +68,8 @@ Version="0.42"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.42.2 DB_NAME dans borghelperrc : surcharge le nick dans le nom des fichiers SQLite
+# 0.42.1 Un SQLite par nick : <conf>-<nick>-cache.db / <conf>-<nick>-diff.db
 # 0.42 DBs dans ~/.cache/borghelper/ (ou CACHE_DIR), nommés d'après le fichier de conf
 # 0.41.1 IndexSnap : fix borg list --json invalide pour contenu archive → --format parse manuel
 # 0.41 IndexSnap + archive_snapshot : Search/FileHist trouve fichiers stables (non prunés)
@@ -607,9 +619,7 @@ def insert_in_db(db_path, table_name, nom, lastmodified, details):
     finally:
         conn.close()
 
-def ensure_cache_db(db_path=None):
-    if db_path is None:
-        db_path=cache_db_file
+def ensure_cache_db(db_path):
     conn=sqlite3.connect(db_path)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS cachejsonboexlm (
@@ -625,9 +635,8 @@ def ensure_cache_db(db_path=None):
     conn.close()
 
 def purge_stale_cache(nick,current_lm,db_path=None):
-    """Supprime les entrées du cache pour nick dont lastmodified != current_lm."""
     if db_path is None:
-        db_path=cache_db_file
+        db_path=get_cache_db(nick)
     try:
         conn=sqlite3.connect(db_path)
         cur=conn.execute("DELETE FROM cachejsonboexlm WHERE nom=? AND lastmodified!=?",(nick,current_lm))
@@ -639,9 +648,8 @@ def purge_stale_cache(nick,current_lm,db_path=None):
         return 0
 
 def clear_cache_nick(nick,db_path=None):
-    """Vide tout le cache d'un nick (après delete/prune)."""
     if db_path is None:
-        db_path=cache_db_file
+        db_path=get_cache_db(nick)
     try:
         conn=sqlite3.connect(db_path)
         cur=conn.execute("DELETE FROM cachejsonboexlm WHERE nom=?",(nick,))
@@ -654,7 +662,7 @@ def clear_cache_nick(nick,db_path=None):
 
 def cacheJsonBoexWithLM(nick,boexarg,output="stdout",debug=0,db_path=None):
     if db_path is None:
-        db_path=cache_db_file
+        db_path=get_cache_db(nick)
     ensure_cache_db(db_path)
     last_modified=boex(nick,['info','--json'],debug=debug)['stdout'][0]['repository']['last_modified']
     purge_stale_cache(nick,last_modified,db_path)
@@ -689,52 +697,35 @@ def cacheJsonBoexWithLM(nick,boexarg,output="stdout",debug=0,db_path=None):
         return details[0]
     return details
 
-def cmd_cache_info(nick=None,debug=0,db_path=None):
-    if db_path is None:
-        db_path=cache_db_file
-    ensure_cache_db(db_path)
-    try:
-        conn=sqlite3.connect(db_path)
-        if nick and nick!='ALL':
-            rows=[]
-            for n in nick.split(','):
-                cur=conn.execute(
-                    "SELECT nom,lastmodified,length(details) FROM cachejsonboexlm WHERE nom=? ORDER BY lastmodified DESC",(n,))
-                rows.extend(cur.fetchall())
-        else:
-            cur=conn.execute(
-                "SELECT nom,lastmodified,length(details) FROM cachejsonboexlm ORDER BY nom,lastmodified DESC")
-            rows=cur.fetchall()
-        conn.close()
-        if not rows:
-            print("Cache vide.")
-            return
-        from prettytable import PrettyTable
-        t=PrettyTable(['nick','last_modified','taille'])
-        for nom,lm,size in rows:
-            t.add_row([nom,lm,convert_octets_readable(size) if size else '0 B'])
-        print(t)
-    except sqlite3.Error as e:
-        printer(f"SQLite error: {e}")
-
-def cmd_cache_clean(nick=None,debug=0,db_path=None):
-    """Supprime les entrées périmées en vérifiant le last_modified courant de chaque dépôt."""
-    if db_path is None:
-        db_path=cache_db_file
-    ensure_cache_db(db_path)
-    nicks_to_clean=[]
-    if nick and nick!='ALL':
-        nicks_to_clean=nick.split(',')
-    else:
+def cmd_cache_info(nick=None,debug=0):
+    nicks=nick.split(',') if nick and nick!='ALL' else cfgreadnicks(debug).split(',')
+    rows=[]
+    for n in nicks:
+        db_path=get_cache_db(n)
+        ensure_cache_db(db_path)
         try:
             conn=sqlite3.connect(db_path)
-            cur=conn.execute("SELECT DISTINCT nom FROM cachejsonboexlm")
-            nicks_to_clean=[r[0] for r in cur.fetchall()]
+            cur=conn.execute(
+                "SELECT nom,lastmodified,length(details) FROM cachejsonboexlm WHERE nom=? ORDER BY lastmodified DESC",(n,))
+            rows.extend(cur.fetchall())
             conn.close()
-        except sqlite3.Error:
-            return
+        except sqlite3.Error as e:
+            printer(f"SQLite error ({n}): {e}")
+    if not rows:
+        print("Cache vide.")
+        return
+    from prettytable import PrettyTable
+    t=PrettyTable(['nick','last_modified','taille'])
+    for nom,lm,size in rows:
+        t.add_row([nom,lm,convert_octets_readable(size) if size else '0 B'])
+    print(t)
+
+def cmd_cache_clean(nick=None,debug=0):
+    nicks_to_clean=nick.split(',') if nick and nick!='ALL' else cfgreadnicks(debug).split(',')
     total=0
     for n in nicks_to_clean:
+        db_path=get_cache_db(n)
+        ensure_cache_db(db_path)
         cfg=cfgread(n,debug=debug)
         if cfg is None:
             count=clear_cache_nick(n,db_path)
@@ -781,9 +772,7 @@ def cacheJsonBoexWithLM2(nick,boexarg,prefix="/tmp/borgHelper-",suffix=".json",o
         return(ret)
     
 
-def ensure_diff_db(db_path=None):
-    if db_path is None:
-        db_path=diff_db_file
+def ensure_diff_db(db_path):
     conn=sqlite3.connect(db_path)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS diff_index (
@@ -833,7 +822,7 @@ def ensure_diff_db(db_path=None):
 
 def is_diff_pair_indexed(nick,archive_old,archive_new,db_path=None):
     if db_path is None:
-        db_path=diff_db_file
+        db_path=get_diff_db(nick)
     try:
         conn=sqlite3.connect(db_path)
         cur=conn.cursor()
@@ -848,7 +837,7 @@ def is_diff_pair_indexed(nick,archive_old,archive_new,db_path=None):
 
 def store_diff_entries(nick,archive_old,archive_new,archive_new_date,entries,db_path=None):
     if db_path is None:
-        db_path=diff_db_file
+        db_path=get_diff_db(nick)
     try:
         conn=sqlite3.connect(db_path)
         if entries:
@@ -869,7 +858,7 @@ def store_diff_entries(nick,archive_old,archive_new,archive_new_date,entries,db_
 
 def is_archive_snapshot_indexed(nick,archive,db_path=None):
     if db_path is None:
-        db_path=diff_db_file
+        db_path=get_diff_db(nick)
     try:
         conn=sqlite3.connect(db_path)
         cur=conn.cursor()
@@ -882,7 +871,7 @@ def is_archive_snapshot_indexed(nick,archive,db_path=None):
 
 def store_archive_snapshot(nick,archive,archive_date,files,db_path=None):
     if db_path is None:
-        db_path=diff_db_file
+        db_path=get_diff_db(nick)
     try:
         conn=sqlite3.connect(db_path)
         if files:
@@ -935,7 +924,7 @@ def parse_diff_line(line):
 
 def cmd_index(nick,debug=0,db_path=None):
     if db_path is None:
-        db_path=diff_db_file
+        db_path=get_diff_db(nick)
     ensure_diff_db(db_path)
     cfg=cfgreaded(nick,debug=debug)
     rb=boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
@@ -967,7 +956,7 @@ def cmd_index(nick,debug=0,db_path=None):
 
 def cmd_indexsnap(nick,debug=0,db_path=None):
     if db_path is None:
-        db_path=diff_db_file
+        db_path=get_diff_db(nick)
     ensure_diff_db(db_path)
     cfg=cfgreaded(nick,debug=debug)
     rb=boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
@@ -1007,17 +996,16 @@ def cmd_indexsnap(nick,debug=0,db_path=None):
     print(f"{nick}: {len(files)} fichiers dans le snapshot {archive_name}")
     return 0
 
-def cmd_search(nick,pattern,debug=0,db_path=None):
-    if db_path is None:
-        db_path=diff_db_file
-    ensure_diff_db(db_path)
+def cmd_search(nick,pattern,debug=0):
     sql_pat=pattern.replace('*','%').replace('?','_')
     if '%' not in sql_pat and '_' not in sql_pat:
         sql_pat='%'+sql_pat+'%'
-    try:
-        conn=sqlite3.connect(db_path)
-        rows=[]
-        for n in nick.split(','):
+    rows=[]
+    for n in nick.split(','):
+        db_path=get_diff_db(n)
+        ensure_diff_db(db_path)
+        try:
+            conn=sqlite3.connect(db_path)
             cur=conn.execute(
                 "SELECT nick,archive_new_date,archive_new,change_type,path,size_before,size_after "
                 "FROM diff_index WHERE nick=? AND path LIKE ? "
@@ -1033,30 +1021,29 @@ def cmd_search(nick,pattern,debug=0,db_path=None):
                 ") ORDER BY archive,path",
                 (n,sql_pat))
             rows.extend(cur.fetchall())
-        conn.close()
-        if not rows:
-            print("Aucun résultat.")
-            return
-        from prettytable import PrettyTable
-        t=PrettyTable(['nick','date','archive','type','chemin','avant','après'])
-        t.align['chemin']='l'
-        t.align['archive']='l'
-        for nick_r,date_r,arch_r,type_r,path_r,sb,sa in rows:
-            t.add_row([nick_r,(date_r or '')[:19],arch_r,type_r,path_r,
-                       convert_octets_readable(sb) if sb else '',
-                       convert_octets_readable(sa) if sa else ''])
-        print(t)
-    except sqlite3.Error as e:
-        printer(f"SQLite error: {e}")
+            conn.close()
+        except sqlite3.Error as e:
+            printer(f"SQLite error ({n}): {e}")
+    if not rows:
+        print("Aucun résultat.")
+        return
+    from prettytable import PrettyTable
+    t=PrettyTable(['nick','date','archive','type','chemin','avant','après'])
+    t.align['chemin']='l'
+    t.align['archive']='l'
+    for nick_r,date_r,arch_r,type_r,path_r,sb,sa in rows:
+        t.add_row([nick_r,(date_r or '')[:19],arch_r,type_r,path_r,
+                   convert_octets_readable(sb) if sb else '',
+                   convert_octets_readable(sa) if sa else ''])
+    print(t)
 
-def cmd_filehist(nick,path,debug=0,db_path=None):
-    if db_path is None:
-        db_path=diff_db_file
-    ensure_diff_db(db_path)
-    try:
-        conn=sqlite3.connect(db_path)
-        rows=[]
-        for n in nick.split(','):
+def cmd_filehist(nick,path,debug=0):
+    rows=[]
+    for n in nick.split(','):
+        db_path=get_diff_db(n)
+        ensure_diff_db(db_path)
+        try:
+            conn=sqlite3.connect(db_path)
             cur=conn.execute(
                 "SELECT nick,archive_new_date,archive_old,archive_new,change_type,size_before,size_after "
                 "FROM diff_index WHERE nick=? AND path=? ORDER BY archive_new_date",
@@ -1067,22 +1054,22 @@ def cmd_filehist(nick,path,debug=0,db_path=None):
                 "FROM archive_snapshot WHERE nick=? AND path=? ORDER BY archive",
                 (n,path))
             rows.extend(cur.fetchall())
-        conn.close()
-        if not rows:
-            print(f"Aucune entrée pour : {path}")
-            return
-        rows.sort(key=lambda r: (r[1] or ''))
-        from prettytable import PrettyTable
-        t=PrettyTable(['nick','date','archive avant','archive après','type','avant','après'])
-        t.align['archive avant']='l'
-        t.align['archive après']='l'
-        for nick_r,date_r,a_old,a_new,type_r,sb,sa in rows:
-            t.add_row([nick_r,(date_r or '')[:19],a_old,a_new,type_r,
-                       convert_octets_readable(sb) if sb else '',
-                       convert_octets_readable(sa) if sa else ''])
-        print(t)
-    except sqlite3.Error as e:
-        printer(f"SQLite error: {e}")
+            conn.close()
+        except sqlite3.Error as e:
+            printer(f"SQLite error ({n}): {e}")
+    if not rows:
+        print(f"Aucune entrée pour : {path}")
+        return
+    rows.sort(key=lambda r: (r[1] or ''))
+    from prettytable import PrettyTable
+    t=PrettyTable(['nick','date','archive avant','archive après','type','avant','après'])
+    t.align['archive avant']='l'
+    t.align['archive après']='l'
+    for nick_r,date_r,a_old,a_new,type_r,sb,sa in rows:
+        t.add_row([nick_r,(date_r or '')[:19],a_old,a_new,type_r,
+                   convert_octets_readable(sb) if sb else '',
+                   convert_octets_readable(sa) if sa else ''])
+    print(t)
 
 
 def prep_report(nick,debug=0,maxp=None):
@@ -1401,7 +1388,7 @@ def dfRepo(nick,debug=0):
 
 def cmd_diffbkp(nick,bidun=None,bideux=None,debug=0,db_path=None):
     if db_path is None:
-        db_path=diff_db_file
+        db_path=get_diff_db(nick)
     cfg=cfgreaded(nick,debug=debug)
     twodiff=getlastbkp(nick,2,debug=debug)
     if bidun is None and bideux is None:

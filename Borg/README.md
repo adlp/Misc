@@ -59,6 +59,9 @@ SSH_REPO         = repo01:/mnt/borg/mon-serveur  # BORG_REPO côté serveur sauv
 SSH_REMFO        = 8022:localhost:22             # tunnel inverse SSH
 SSH_KEY          = /root/.ssh/id_borg
 
+# Identifiant SQLite (optionnel — surcharge le nick dans le nom des fichiers DB)
+DB_NAME                  = mon-serveur-home   # → borghelperrc-mon-serveur-home-cache.db
+
 # Borg divers
 BORG_REMOTE_PATH            = borg1
 BORG_RSH                    = ssh -p 2222
@@ -338,10 +341,11 @@ borgHelper -c CacheClean -n mon-serveur
 | Fichier | Contenu |
 |---------|---------|
 | `~/.borghelperrc` | Configuration des dépôts (INI) |
-| `~/.cache/borghelper/<conf>-cache.db` | Cache des appels `borg info/list` (SQLite, persistant) |
-| `~/.cache/borghelper/<conf>-diff.db` | Index des diffs et snapshots d'archives (SQLite) |
+| `~/.cache/borghelper/<conf>-<nick>-cache.db` | Cache des appels `borg info/list` (SQLite, persistant) |
+| `~/.cache/borghelper/<conf>-<nick>-diff.db` | Index des diffs et snapshots d'archives (SQLite) |
 
-`<conf>` = basename sanitisé du fichier de configuration (ex : `borghelperrc` pour `~/.borghelperrc`).
+`<conf>` = basename sanitisé du fichier de configuration (ex : `borghelperrc` pour `~/.borghelperrc`).  
+`<nick>` = identifiant du dépôt (ou valeur de `DB_NAME` si définie dans la section) — un fichier par dépôt.
 
 Le répertoire de stockage est configurable via la clé `CACHE_DIR` dans la section `[DEFAULT]` de `.borghelperrc` :
 
