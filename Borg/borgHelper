@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.44.3"
+Version="0.45"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.44.3"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.45 Bkp : indexation automatique via --list pendant backup (-I pour désactiver)
 # 0.44.3 Report : erreur borg par nick affichée dans le tableau, exit 2, rapport continue
 # 0.44.2 Search/FileHist/DuIdx : -B <archive> borne de fin de plage
 # 0.44.1 Help : IndexSnap, DuIdx, Search/FileHist -b documentés dans -h et -H
@@ -207,8 +208,8 @@ def usage(doc=None,debug=0):
         printer("       ⚡️ On delete un backup sur le repo ⚡️ DANGER")
         printer("   -c Init [-n nickname/servername]")
         printer("       Initialisation d'un repInitialisation d'un repoo")
-        printer("   -c Bkp [-n nickname/servername]")
-        printer("       On export la clef de l'archive")
+        printer("   -c Bkp [-n nickname/servername] [-I]")
+        printer("       Lance un backup + indexation automatique (-I pour désactiver)")
         printer("   -c Key [-n nickname/servername/ALL]")
         printer("       On lance un backup")
         printer("⚗️ ⚡️-c Prune [-n nickname/servername/ALL]")
@@ -296,9 +297,10 @@ def usage(doc=None,debug=0):
         printer("       nickname    : Le nom de l'enregistrement du serveur")
         printer("       backupid    : Le nom du backup interessant")
     elif doc == 'bkp':
-        printer("   -c Bkp [-n nickname/servername]")
-        printer("       On lance un backup")
-        printer("       Lance le backup en temps reel (utilisé par les crontabs pex), avec les parametres du fichier de conf")
+        printer("   -c Bkp [-n nickname/servername] [-I]")
+        printer("       Lance le backup avec les paramètres du fichier de conf")
+        printer("       Par défaut : capture --list pendant le backup et indexe automatiquement (diff + snapshot)")
+        printer("       -I : désactive l'indexation (pas de --list, pas d'index SQLite post-backup)")
     elif doc == 'prune':
         printer("   -c Prune [-n nickname/servername]")
         printer("      ⚡️ On delete les vieux backup sur le repo ⚡️ DANGER")
@@ -1798,21 +1800,45 @@ def cmd_init(nick,debug=0):
     ret=boex(nick,cmd,debug=debug)
     print(ret)
 
-def cmd_bkp(nick,debug=0):
+_BKP_STATUS_MAP={'A':'added','M':'modified','C':'C','B':'B','T':'T','d':'removed'}
+
+def _bkp_parse_list(stderr):
+    """Extrait les entrées de fichiers depuis la sortie --list de borg create."""
+    entries=[]
+    for i in stderr:
+        if isinstance(i,dict):
+            # borg.output.list avec --log-json : message = "<status> <path>"
+            if i.get('name')=='borg.output.list' or i.get('type')=='file_status':
+                if i.get('type')=='file_status':
+                    status=i.get('status',''); path=i.get('path','')
+                else:
+                    msg=i.get('message','')
+                    if len(msg)>=3 and msg[1]==' ':
+                        status,path=msg[0],msg[2:]
+                    else:
+                        continue
+                ct=_BKP_STATUS_MAP.get(status)
+                if ct and path:
+                    entries.append({'change_type':ct,'path':path,'size_before':None,'size_after':None})
+        elif isinstance(i,str):
+            s=i.strip()
+            if len(s)>=3 and s[1]==' ' and s[0] in _BKP_STATUS_MAP:
+                ct=_BKP_STATUS_MAP[s[0]]
+                entries.append({'change_type':ct,'path':s[2:],'size_before':None,'size_after':None})
+    return entries
+
+def _bkp_is_list_entry(i):
+    """True si l'entrée est une ligne --list (à masquer dans l'affichage)."""
+    if isinstance(i,dict):
+        return i.get('name')=='borg.output.list' or i.get('type')=='file_status'
+    if isinstance(i,str):
+        s=i.strip()
+        return len(s)>=3 and s[1]==' ' and s[0] in _BKP_STATUS_MAP
+    return False
+
+def cmd_bkp(nick,no_index=False,debug=0):
     cfg=cfgreaded(nick,debug=debug)
 
-###    SetEnv BORG_PASSPHRASE=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX BORG_REPO=repo01:/mnt/borg03/sxb-03
-### Ce qui change par rapport a un vrai boex
-###    Variable env BORG_REPO reecrite
-###    Precedence du ssh
-###
-###    cmda=f"ssh -Ao StrictHostKeyChecking=no -o LogLevel=ERROR -o UserKnownHostsFile=/dev/null {host} 'borg create --log-json --json --debug -v --stats "
-###    cmdb="::{fqdn}-root-{now} / --exclude /media --exclude /dev --exclude /proc --exclude /sys --exclude /var/run --exclude /run --exclude /lost+found --exclude /mnt --exclude /var/lib/lxcfs --exclude /tmp --exclude /var/lib/docker --exclude-if-present .nobackup  --exclude-caches --exclude-nodump --keep-exclude-tags'"
-
-### Ce qu'il faut faire
-###     1. Stocker les ordres d'exclusion du backup (le reste sera pour le moment hardcodé)
-###     2. Preceder la commande du backup ssh proprement (avec enregistrement de la clef)
-###     3. Traiter les codes retours
     if 'SSH_REPO' in cfg.keys():
         forceEnv={}
         forceEnv['BORG_REPO']=cfg['SSH_REPO']
@@ -1830,10 +1856,20 @@ def cmd_bkp(nick,debug=0):
     if 'SSH_REMFO' not in cfg.keys() or len(cfg['SSH_REMFO']) == 0:
         preBorg=None
 
+    # Récupérer l'archive précédente avant backup (pour diff index)
+    archive_old=None
+    if not no_index:
+        try:
+            prev=getlastbkp(nick,1,debug=debug)
+            archive_old=prev[0] if prev else None
+        except Exception:
+            archive_old=None
+
     create=['create']
-    #create.extend(('--log-json --json --debug -v --stats '+cfg['BORG_REPO']+'::{fqdn}-root-{now} /').split(' '))
-    #create.extend(('--log-json --json --debug -v --stats ::{fqdn}-root-{now} /').split(' '))
-    create.extend(('--log-json --json --debug -v --stats').split(' '))
+    base_flags='--log-json --json --debug -v --stats'
+    if not no_index:
+        base_flags+=' --list --filter AMCBTd'
+    create.extend(base_flags.split(' '))
     archname='root'
     if 'BORG_ARCHNAME' in cfg.keys():
         archname=cfg['BORG_ARCHNAME']
@@ -1846,7 +1882,7 @@ def cmd_bkp(nick,debug=0):
     if 'BORG_ROOTBKP' in cfg.keys():
         rootbkp=cfg['BORG_ROOTBKP']
     create.append(rootbkp)
-        
+
     if 'EXCLUDE' not in list(cfg.keys()):
         printer(list(cfg.keys()))
         printer("Il est necessaire que EXCLUDE soit configures dans ~/.borghelperrc")
@@ -1863,23 +1899,42 @@ def cmd_bkp(nick,debug=0):
 
     if 'stderr' in anaRet.keys() and len(anaRet['stderr']):
         for i in anaRet['stderr']:
-            if isinstance(i, dict):
-                lvl = i.get('levelname', 'INFO')
-                msg = i.get('message', str(i))
-                print(f"[{lvl}] {msg}", file=sys.stderr, flush=True)
+            if _bkp_is_list_entry(i):
+                continue  # masqué sauf debug
+            if isinstance(i,dict):
+                lvl=i.get('levelname','INFO')
+                msg=i.get('message',str(i))
+                print(f"[{lvl}] {msg}",file=sys.stderr,flush=True)
                 if debug:
                     printer(i)
-            elif isinstance(i, str) and i.strip():
-                print(i, file=sys.stderr, flush=True)
+            elif isinstance(i,str) and i.strip():
+                print(i,file=sys.stderr,flush=True)
 
     newretC=0
     if anaRet['exitcode']:
         for i in anaRet['stderr']:
-            if isinstance(i, dict) and i.get('levelname') == "ERROR":
+            if isinstance(i,dict) and i.get('levelname')=='ERROR':
                 newretC=2
                 break
-        if newretC == 0:
+        if newretC==0:
             newretC=anaRet['exitcode']
+
+    # Indexation depuis la sortie --list
+    if newretC==0 and not no_index and anaRet['stdout']:
+        try:
+            arch_info=anaRet['stdout'][0].get('archive',{})
+            archive_new=arch_info.get('name')
+            archive_new_date=arch_info.get('start')
+            if archive_new and archive_old:
+                entries=_bkp_parse_list(anaRet['stderr'])
+                db_path=get_diff_db(nick)
+                ensure_diff_db(db_path)
+                store_diff_entries(nick,archive_old,archive_new,archive_new_date,entries,db_path)
+                print(f"Index : {len(entries)} entrée(s) stockée(s) ({archive_old} → {archive_new})",
+                      file=sys.stderr,flush=True)
+            cmd_indexsnap(nick,debug=debug)
+        except Exception as e:
+            printer(f"[WARN] indexation post-backup échouée : {e}")
 
     sys.exit(newretC)
 
@@ -1995,7 +2050,7 @@ if sentryid != None:
 ######### Analyse Arguments
 
 try:
-    opts, args = getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:dvjlC:", ["help"])
+    opts, args = getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:dvjlIC:", ["help"])
 except getopt.GetoptError as err:
     print(err)  # will print something like "option -a not recognized"
     usage()
@@ -2008,7 +2063,7 @@ optab={ 'stats'     :'Ccdn',      'login'     :'Ccdsnkprm',
         'mount'     :'Ccdnb',     'umount'    :'Ccdn',
         'lstbkp'    :'Ccdn',      'lstbkpfls' :'Ccdnb',
         'restore'   :'Ccdnbfw',   'diffbkp'   :'Ccdnbw',
-        'delbkp'    :'Ccdnb',     'bkp'       :'Ccdn',
+        'delbkp'    :'Ccdnb',     'bkp'       :'CcdnI',
         'prune'     :'Ccdn',      'report'    :'Ccdnbl',
         'init'      :'Ccdn',
         'key'       :'Ccdn',      'index'     :'Ccdn',
@@ -2148,8 +2203,7 @@ elif cmd == 'delbkp':
         usage(cmd)
     cmd_delbkp(nick,options['-b'],debug=debug)
 elif cmd == 'bkp':
-    # printer("   -c Bkp [-n nickname/servername]")
-    cmd_bkp(nick,debug=debug)
+    cmd_bkp(nick,no_index=('-I' in options),debug=debug)
 elif cmd == 'prune':
     # printer("   -c Prune [-n nickname/servername]")
     errcmd=0

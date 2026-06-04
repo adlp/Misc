@@ -1,5 +1,19 @@
 # Changelog — borgHelper
 
+## 0.45 — 2026-06-04
+
+### Ajout — `Bkp` : indexation automatique pendant le backup
+
+- Par défaut, `Bkp` ajoute `--list --filter AMCBTd` au `borg create`
+- Après backup réussi : parse la sortie `--list` (entrées `borg.output.list`) → stocke dans `diff_index`
+- Appelle ensuite `IndexSnap` pour le snapshot de la nouvelle archive
+- Entrées list masquées dans l'affichage stderr (sauf debug) — évite des milliers de lignes `[INFO] A /etc/...`
+- `-I` : désactive tout (pas de `--list`, pas d'indexation)
+- Statuts capturés : `A`→added, `M`→modified, `C`/`B`/`T`→flags, `d`→removed
+- Note : les tailles ne sont pas disponibles depuis `--list` (stockées à `None`) — `DuIdx` affichera `—` pour ces entrées
+
+---
+
 ## 0.44.3 — 2026-06-04
 
 ### Correctifs — `Report` : gestion des erreurs borg par nick

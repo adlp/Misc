@@ -126,14 +126,18 @@ borgHelper -c Login -n mon-serveur -p motdepasse -r /mnt/borg/local -k /root/bor
 ---
 
 ### `Bkp`
-Lance une sauvegarde selon la configuration du dépôt.
+Lance une sauvegarde selon la configuration du dépôt.  
+Par défaut, capture les fichiers modifiés pendant le backup (`--list`) et indexe automatiquement dans le SQLite (`diff_index` + snapshot).
 
 ```bash
-borgHelper -c Bkp -n mon-serveur
+borgHelper -c Bkp -n mon-serveur        # backup + indexation automatique
+borgHelper -c Bkp -n mon-serveur -I     # backup seul, sans indexation
 ```
 
 Nécessite : `EXCLUDE`, `SER_LOGIN`, `SER_NAME`.  
 Code retour 0 si succès ou warnings, 2 si erreur borg.
+
+> `-I` désactive `--list` et toute écriture SQLite — utile si l'indexation est gérée séparément via `Index`.
 
 ---
 
