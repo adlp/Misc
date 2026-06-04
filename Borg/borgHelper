@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.51.1"
+Version="0.51.2"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.51.1"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.51.2 fix -F absent de optab index/indexsnap → usage() appelé au lieu d'indexer
 # 0.51.1 fix -F absent de getopt → option non reconnue
 # 0.51 Index/IndexSnap : -F force la réindexation même si déjà présent en cache
 # 0.50 Restore : -w -  ou -W - envoie le tar en stdout (pipe) ; messages → stderr
@@ -2461,10 +2462,10 @@ optab={ 'stats'     :'Ccdn',      'login'     :'Ccdsnkprm',
         'delbkp'    :'Ccdnb',     'bkp'       :'CcdnI',
         'prune'     :'Ccdn',      'report'    :'Ccdnbl',
         'init'      :'Ccdn',
-        'key'       :'Ccdn',      'index'     :'Ccdn',
+        'key'       :'Ccdn',      'index'     :'CcdnF',
         'search'    :'CcdnfbB',   'filehist'  :'CcdnfbB',
         'cacheinfo' :'Ccdn',      'cacheclean':'Ccdn',
-        'indexsnap' :'Ccdn',
+        'indexsnap' :'CcdnF',
         'duidx'     :'CcdnfbBsj',}
 
 for opt,arg in opts:

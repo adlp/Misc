@@ -1,5 +1,14 @@
 # Changelog — borgHelper
 
+## 0.51.2 — 2026-06-04
+
+### Fix — `-F` absent de `optab` pour `index` / `indexsnap`
+
+- `-F` non listé dans `optab['index']` et `optab['indexsnap']` → `step2F` + `usage()` appelé
+- Ajout de `F` dans les deux entrées `optab`
+
+---
+
 ## 0.51.1 — 2026-06-04
 
 ### Fix — `-F` absent de `getopt`
