@@ -1,5 +1,20 @@
 # Changelog — borgHelper
 
+## 0.47 — 2026-06-04
+
+### Ajout — `NOIDX` et détection index vide
+
+#### `NOIDX = 1` dans borghelperrc
+- Désactive toute indexation pour ce nick : `Index`, `IndexSnap`, et `Bkp` (en plus du flag `-I`)
+- Message informatif quand le nick est ignoré
+
+#### Index vide → erreur explicite
+- `_is_index_empty(nick)` : vérifie si `diff_index` et `archive_snapshot` sont tous deux vides pour ce nick
+- `Search`, `FileHist`, `DuIdx` : si index vide pour un nick → `[ERREUR] Index vide pour X — lancez : borgHelper -c Index -n X`
+- Permet de distinguer "aucun résultat" de "index jamais initialisé"
+
+---
+
 ## 0.46.2 — 2026-06-04
 
 ### Correctifs — `IndexError: list index out of range`
