@@ -1,5 +1,14 @@
 # Changelog — borgHelper
 
+## 0.51.1 — 2026-06-04
+
+### Fix — `-F` absent de `getopt`
+
+- `-F` n'était pas déclaré dans la chaîne `getopt` → `option -F not recognized` à l'exécution
+- Ajout de `F` (sans `:`, flag sans argument) dans la chaîne getopt
+
+---
+
 ## 0.51 — 2026-06-04
 
 ### Ajout — `Index` / `IndexSnap` : option `-F` (force réindexation)
