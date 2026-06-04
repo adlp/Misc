@@ -1,5 +1,16 @@
 # Changelog — borgHelper
 
+## 0.44.2 — 2026-06-04
+
+### Ajout — `-B <archive>` borne de fin pour `Search`, `FileHist`, `DuIdx`
+
+- `-B <archive>` : limite la recherche jusqu'à cet archive (inclus)
+- Combinable avec `-b` : `-b X -B Y` → plage [X, Y]
+- `-b ALL -B Y` → tout l'index jusqu'à Y
+- Sans `-B` : comportement inchangé (jusqu'au dernier)
+
+---
+
 ## 0.44.1 — 2026-06-04
 
 ### Correctifs — Aide `-h` / `-H`

@@ -299,7 +299,7 @@ borgHelper -c Search -f '/etc/nginx*' -n mon-serveur  # préfixe
 
 Colonnes : nick, date, archive, type, chemin, taille avant, taille après.  
 Type `présent` : fichier stable dans le backup, sans historique de changement récent.  
-Plage : `-b <archive>` (depuis X), `-b ALL` (tout l'index), sans `-b` (dernière paire).
+Plage : `-b <archive>` (depuis X), `-B <archive>` (jusqu'à Y), `-b ALL` (tout), sans `-b`/`-B` (dernière paire).
 
 ---
 
@@ -334,7 +334,7 @@ Sans `-f` ou avec pattern sans `/*` : résumé global (type / nb / taille totale
 Avec `-f '*'` ou `-f 'path/*'` : vue pivotée par chemin — colonnes `added/modif` | `removed` | `présent`.  
 Tri avec `-s <col>[:asc|desc]` — colonnes : `chemin`, `added`, `removed`, `present`.  
 JSON avec `-j`.  
-Plage d'archives : `-b <archive>` (depuis X jusqu'au dernier), `-b ALL` (tout l'index), sans `-b` (dernière paire uniquement).
+Plage d'archives : `-b <archive>` (depuis X), `-B <archive>` (jusqu'à Y), `-b ALL` (tout), sans `-b`/`-B` (dernière paire).
 
 ---
 
