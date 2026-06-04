@@ -1,5 +1,16 @@
 # Changelog — borgHelper
 
+## 0.47.2 — 2026-06-04
+
+### Correctif — `Restore` : `OSError: No space left on device`
+
+- `_restore_to_tar` et restauration plate (`-W`) : `OSError` attrapé autour des opérations d'écriture
+- `errno 28` (ENOSPC) : message `[ERREUR] Espace disque insuffisant sur la cible : <fichier>` + exit 3
+- Autres `OSError` : message d'erreur + exit 3
+- Le répertoire temporaire est nettoyé proprement dans tous les cas (context manager)
+
+---
+
 ## 0.47.1 — 2026-06-04
 
 ### Ajout — `IDX_INCLUDE` et `IDX_EXCLUDE` dans borghelperrc

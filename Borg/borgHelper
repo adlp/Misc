@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.47.1"
+Version="0.47.2"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.47.1"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.47.2 Restore : OSError ENOSPC attrapé → message clair au lieu de traceback
 # 0.47.1 IDX_INCLUDE/IDX_EXCLUDE dans borghelperrc : filtre chemins indexés
 # 0.47 NOIDX=1 dans borghelperrc désactive indexation ; index vide → erreur avec conseil
 # 0.46.2 fix IndexError stdout vide dans cmd_index/indexsnap/getlastbkp/cmd_diffbkp
@@ -1926,18 +1927,25 @@ def _restore_to_tar(nick,bid,ftor,tarpath,flat=False,debug=0):
             mode='w:gz'
         else:
             mode='a' if exists else 'w'
-        with tf_mod.open(tarpath,mode) as tf:
-            for root,dirs,files in os.walk(tmpdir):
-                if not flat:
-                    for d in dirs:
-                        dp=os.path.join(root,d)
-                        tf.add(dp,arcname=os.path.relpath(dp,tmpdir),recursive=False)
-                for f in files:
-                    fp=os.path.join(root,f)
-                    arcname=(os.path.basename(fp) if flat
-                             else os.path.relpath(fp,tmpdir))
-                    tf.add(fp,arcname=arcname)
-        n_files=sum(len(fs) for _,_,fs in os.walk(tmpdir))
+        try:
+            with tf_mod.open(tarpath,mode) as tf:
+                for root,dirs,files in os.walk(tmpdir):
+                    if not flat:
+                        for d in dirs:
+                            dp=os.path.join(root,d)
+                            tf.add(dp,arcname=os.path.relpath(dp,tmpdir),recursive=False)
+                    for f in files:
+                        fp=os.path.join(root,f)
+                        arcname=(os.path.basename(fp) if flat
+                                 else os.path.relpath(fp,tmpdir))
+                        tf.add(fp,arcname=arcname)
+        except OSError as e:
+            import errno as _errno
+            if e.errno==_errno.ENOSPC:
+                printer(f"[ERREUR] Espace disque insuffisant sur la cible : {e.filename or tarpath}")
+            else:
+                printer(f"[ERREUR] Écriture impossible : {e}")
+            sys.exit(3)
         print(f"Restauré {'(plat) ' if flat else ''}dans {tarpath}",flush=True)
     sys.exit(rb['exitcode'])
 
@@ -1961,9 +1969,17 @@ def cmd_resto(nick,bid,ftor,where,flat=False,debug=0):
             if rb['exitcode'] not in (0,1):
                 sys.exit(rb['exitcode'])
             os.makedirs(where,exist_ok=True)
-            for root,_,files in os.walk(tmpdir):
-                for f in files:
-                    shutil.copy2(os.path.join(root,f),os.path.join(where,f))
+            try:
+                for root,_,files in os.walk(tmpdir):
+                    for f in files:
+                        shutil.copy2(os.path.join(root,f),os.path.join(where,f))
+            except OSError as e:
+                import errno as _errno
+                if e.errno==_errno.ENOSPC:
+                    printer(f"[ERREUR] Espace disque insuffisant sur la cible : {e.filename or where}")
+                else:
+                    printer(f"[ERREUR] Copie impossible : {e}")
+                sys.exit(3)
             print(f"Restauré (plat) dans {where}",flush=True)
         sys.exit(rb['exitcode'])
     else:
