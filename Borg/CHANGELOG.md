@@ -1,5 +1,20 @@
 # Changelog — borgHelper
 
+## 0.49.2 — 2026-06-04
+
+### Correctifs
+
+#### `_diff_stats_for_nick` : `sqlite3.connect` manquant
+- `conn=get_diff_db(nick)` retournait un chemin (string) au lieu d'une connexion
+- `conn.execute(...)` → `AttributeError` → avalé par `except Exception: return {}` → stats toujours `—`
+- Fix : `db_path=get_diff_db(nick)` + `conn=sqlite3.connect(db_path)`
+
+#### `boex` : `KeyboardInterrupt` non géré
+- Ctrl-C pendant `ps.communicate()` provoquait un traceback Python + message Sentry
+- Fix : `try/except KeyboardInterrupt` autour de `communicate()` → `ps.kill()` + exit 130
+
+---
+
 ## 0.49.1 — 2026-06-04
 
 ### Correctif — `Report` : colonnes stats toujours visibles en ASCII

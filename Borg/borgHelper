@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.49.1"
+Version="0.49.2"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.49.1"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.49.2 fix _diff_stats_for_nick (sqlite3.connect manquant) + KeyboardInterrupt dans boex
 # 0.49.1 Report : stats colonnes toujours présentes en ASCII (— si pas d'index)
 # 0.49 Report : stats % ajoutés/supprimés/présents par backup depuis diff_index SQLite
 # 0.48 Restore : droits d'origine dans le tar (--numeric-owner) ; -L affiche droits sans restaurer
@@ -1472,7 +1473,8 @@ def cmd_filehist(nick,path,archive_from=None,archive_to=None,debug=0):
 def _diff_stats_for_nick(nick):
     """Counts per archive_new from diff_index: {archive: {'added':N,'removed':N,'modified':N}}."""
     try:
-        conn=get_diff_db(nick)
+        db_path=get_diff_db(nick)
+        conn=sqlite3.connect(db_path)
         rows=conn.execute(
             "SELECT archive_new,change_type,COUNT(*) FROM diff_index WHERE nick=? "
             "GROUP BY archive_new,change_type",(nick,)).fetchall()
@@ -2303,7 +2305,13 @@ def boex(nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True): #,g
                          stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE)
-    inf, errs = ps.communicate()
+    try:
+        inf, errs = ps.communicate()
+    except KeyboardInterrupt:
+        ps.kill()
+        ps.wait()
+        printer("\n[INTERRUPTED] Opération annulée par l'utilisateur.")
+        sys.exit(130)
 
     ret={}
     ret['stdout']=[]
