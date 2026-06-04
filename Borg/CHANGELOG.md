@@ -1,5 +1,18 @@
 # Changelog — borgHelper
 
+## 0.49 — 2026-06-04
+
+### Ajout — `Report` : statistiques % ajoutés/supprimés/présents par backup
+
+- Nouvelle fonction `_diff_stats_for_nick(nick)` : agrège les counts par type depuis `diff_index` pour chaque archive
+- Calcul par archive : `+ajouté`, `-supprimé`, `=présent` en nb de fichiers et % relatif au total de la backup précédente
+- Formule : `total_précédent = nfiles_courant - ajoutés + supprimés` (derivé de `nfiles` borg info)
+- Format d'affichage : `N (P%)` — ex : `12 (3%)` / `5 (1%)` / `380 (96%)`
+- Si pas d'index pour l'archive : colonnes absentes (pas d'erreur)
+- Colonnes ajoutées dans les tables ASCII (prettyTabelise) et HTML (htmlTabelise)
+
+---
+
 ## 0.48 — 2026-06-04
 
 ### Ajout — `Restore` : préservation des droits d'origine + option `-L` (liste des droits)

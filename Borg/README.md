@@ -182,7 +182,9 @@ Les données de rapport sont mises en cache par `last_modified` du dépôt (SQLi
 
 En cas d'erreur sur un dépôt, le rapport continue avec les autres serveurs. Le dépôt en erreur apparaît en rouge (HTML) ou préfixé `*** ERREUR` (ASCII) avec le message d'erreur dans la colonne `reste`.
 
-Colonnes : nom, durée, depuis (heures), taille dernière, taille totale, récupérable, espace disque restant.
+Colonnes résumé : nom, durée, depuis (heures), taille dernière, taille totale, récupérable, espace disque restant.
+
+**Statistiques de mouvement par backup** (si l'index SQLite est disponible) : colonnes `+ajouté`, `-supprimé`, `=présent` affichées sous la forme `N (P%)`. Le pourcentage est relatif au nombre de fichiers de la backup précédente. Les archives non encore indexées n'affichent pas ces colonnes.
 
 ---
 
