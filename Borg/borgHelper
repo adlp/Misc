@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.44.2"
+Version="0.44.3"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.44.2"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.44.3 Report : erreur borg par nick affichée dans le tableau, exit 2, rapport continue
 # 0.44.2 Search/FileHist/DuIdx : -B <archive> borne de fin de plage
 # 0.44.1 Help : IndexSnap, DuIdx, Search/FileHist -b documentés dans -h et -H
 # 0.44 Search/FileHist/DuIdx : -b <archive>|ALL pour filtrer la plage d'archives
@@ -698,7 +699,16 @@ def cacheJsonBoexWithLM(nick,boexarg,output="stdout",debug=0,db_path=None):
     if db_path is None:
         db_path=get_cache_db(nick)
     ensure_cache_db(db_path)
-    last_modified=boex(nick,['info','--json'],debug=debug)['stdout'][0]['repository']['last_modified']
+    rb=boex(nick,['info','--json'],debug=debug)
+    if rb['exitcode']!=0 or not rb['stdout']:
+        msgs=[]
+        for i in rb['stderr']:
+            if isinstance(i,dict) and i.get('levelname')=='ERROR':
+                msgs.append(i.get('message','').split('\n')[0])
+            elif isinstance(i,str) and i.strip() and not i.startswith('Platform') and not i.startswith('Borg:'):
+                msgs.append(i.strip())
+        raise RuntimeError('; '.join(msgs[:3]) or f"borg info failed (code {rb['exitcode']})")
+    last_modified=rb['stdout'][0]['repository']['last_modified']
     purge_stale_cache(nick,last_modified,db_path)
     try:
         conn=sqlite3.connect(db_path)
@@ -1475,7 +1485,21 @@ def cmd_report(nicks,htrep=False,dayback=None,debug=0,maxp=None):
     reshosto['nom']='Totaux'
     for nick in nicks.split(','):
         cfg=cfgreaded(nick,debug=debug)
-        (tcmpl,tbkps)=prep_report(nick,debug=debug,maxp=maxp)
+        try:
+            (tcmpl,tbkps)=prep_report(nick,debug=debug,maxp=maxp)
+        except Exception as e:
+            errcode=2
+            printer(f"[ERREUR] {nick}: {e}")
+            err_msg=str(e)[:80]
+            if htrep:
+                errhost.append(nick)
+                reshos[nick]={'nom':nick,'duree':'—','depuis':'ERREUR','derniere':'—',
+                              'taille':'—','recuperable':'—','reste':f"⚠ {err_msg}"}
+            else:
+                reshos[nick]={'nom':f"*** ERREUR {nick}",'duree':'—','depuis':'ERREUR',
+                              'derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {err_msg}"}
+            resbck[nick]={}
+            continue
 
         maxage=25
         if "MAX_AGE_BKP" in cfg:
@@ -1487,7 +1511,7 @@ def cmd_report(nicks,htrep=False,dayback=None,debug=0,maxp=None):
                 errhost.append(nick)
             else:
                 tcmpl[nick]['nom']=f"***{nick}"
-    
+
         for i in ['duree','derniere','taille','recuperable']:
             reshosto[i]+=tcmpl[nick][i]
         for i in ['derniere','moy','taille','recuperable','reste']:

@@ -1,5 +1,15 @@
 # Changelog — borgHelper
 
+## 0.44.3 — 2026-06-04
+
+### Correctifs — `Report` : gestion des erreurs borg par nick
+
+- `cacheJsonBoexWithLM` : si `borg info` retourne un code non-nul ou stdout vide, lève `RuntimeError` avec le message d'erreur borg (fin du crash IndexError)
+- `cmd_report` : attrape l'exception par nick, affiche une ligne erreur dans le tableau (rouge en HTML, `*** ERREUR` en ASCII), note exit code 2, continue les autres nicks
+- Colonne `reste` contient le message d'erreur tronqué pour identification rapide
+
+---
+
 ## 0.44.2 — 2026-06-04
 
 ### Ajout — `-B <archive>` borne de fin pour `Search`, `FileHist`, `DuIdx`
