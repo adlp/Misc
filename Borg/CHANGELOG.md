@@ -1,5 +1,16 @@
 # Changelog — borgHelper
 
+## 0.40.2 — 2026-06-04
+
+### Correctifs — `cmd_bkp` : affichage et codes retour
+
+- Suppression du double affichage : `boex()` n'imprime plus `stderr` directement — c'est `cmd_bkp` qui gère
+- Stderr parsé (JSON borg) : chaque entrée affichée sous forme `[LEVELNAME] message` (lisible humain)
+- Stderr fallback (strings, cas JSONDecodeError) : chaque ligne non-vide affichée telle quelle
+- Code retour : si borg sort avec code ≠ 0 et qu'aucun dict `ERROR` n'est trouvé dans stderr, le code retour borg est propagé directement (couvre la branche fallback de 0.39.1)
+
+---
+
 ## 0.40.1 — 2026-06-03
 
 ### Suppressions

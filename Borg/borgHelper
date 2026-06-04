@@ -35,7 +35,7 @@ cfgfile=os.path.expanduser("~/.borghelperrc")
 diff_db_file=os.path.expanduser("~/.borghelper-diff.db")
 cache_db_file=os.path.expanduser("~/.borghelper-cache.db")
 
-Version="0.40.1"
+Version="0.40.2"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -43,6 +43,7 @@ Version="0.40.1"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.40.2 cmd_bkp : affichage stderr lisible [LEVELNAME] msg, exit code propagé depuis borg
 # 0.40.1 Suppression écriture /tmp/borgHelper-bkp-*.json et commande poc
 # 0.40 Cache persistant ~/.borghelper-cache.db, CacheInfo/CacheClean, purge auto après delete/prune
 # 0.39.1 fix parsing stderr JSON dans boex (crash sur \escape)
@@ -1429,19 +1430,26 @@ def cmd_bkp(nick,debug=0):
 
     if 'stdout' in anaRet.keys() and len(anaRet['stdout']):
         print(json.dumps(anaRet['stdout'][0],indent=4),file=sys.stdout,flush=True)
-    else:
-        print("")
-    if 'stderr' in anaRet.keys():
-        print(json.dumps(anaRet['stderr'],indent=4),file=sys.stderr,flush=True)
-        print("")
+
+    if 'stderr' in anaRet.keys() and len(anaRet['stderr']):
+        for i in anaRet['stderr']:
+            if isinstance(i, dict):
+                lvl = i.get('levelname', 'INFO')
+                msg = i.get('message', str(i))
+                print(f"[{lvl}] {msg}", file=sys.stderr, flush=True)
+                if debug:
+                    printer(i)
+            elif isinstance(i, str) and i.strip():
+                print(i, file=sys.stderr, flush=True)
 
     newretC=0
     if anaRet['exitcode']:
-        for i in (anaRet['stderr']):
-            if debug:
-                printer(i)
-            if type(i) != str and 'levelname' in i and i['levelname'] == "ERROR":
+        for i in anaRet['stderr']:
+            if isinstance(i, dict) and i.get('levelname') == "ERROR":
                 newretC=2
+                break
+        if newretC == 0:
+            newretC=anaRet['exitcode']
 
     sys.exit(newretC)
 
@@ -1523,9 +1531,6 @@ def boex(nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True): #,g
 
     if debug:
         printer(json.dumps(ret,indent=4))
-
-    if ret["exitcode"] != 0 and len(ret['stderr']):
-        printer(ret['stderr'])
 
     return(ret)
 
