@@ -1,5 +1,16 @@
 # Changelog — borgHelper
 
+## 0.49.4 — 2026-06-04
+
+### Ajout — `Report` : taille disque exprimée en % dans les stats
+
+- `_fmt_stats(s, nf, total_sz)` : nouveau paramètre `total_sz` = `original_size` de l'archive courante
+- Format : `N (P%) · SIZE (S%)` — ex : `12 (3%) · 3.2 MiB (1%)`
+- `=présent` : nb fichiers + % uniquement (taille des fichiers stables non stockée dans diff_index)
+- Dénominateur taille : `original_size` du backup courant (disponible depuis borg info)
+
+---
+
 ## 0.49.3 — 2026-06-04
 
 ### Ajout — `Report` : stats dans le tableau résumé + taille disque
