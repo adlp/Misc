@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.53.1"
+Version="0.54"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.53.1"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.54 Prune : nettoyage automatique du diff.db (entrées des archives supprimées)
 # 0.53.1 fix getDataFromEnvOrFile : supprime print "📄 Fichier trouvé"
 # 0.53 Report : -j sortie JSON {summary, backups}
 # 0.52 Report : réindexation auto des paires manquantes (stats —, hors premier dump)
@@ -2170,6 +2171,41 @@ def cmd_delbkp(nick,bid,debug=0):
     sys.exit(rb['exitcode'])
 
 
+def _cleanup_index_after_prune(nick,debug=0):
+    if _nick_noidx(nick):
+        return
+    db_path=get_diff_db(nick)
+    if not os.path.exists(db_path):
+        return
+    cfg=cfgreaded(nick,debug=debug)
+    rb=boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+    try:
+        _boex_check_stdout(rb,nick,'borg list')
+    except RuntimeError:
+        return
+    current=set(a['name'] for a in rb['stdout'][0]['archives'])
+    try:
+        conn=sqlite3.connect(db_path)
+        if current:
+            ph=','.join('?'*len(current))
+            lst=list(current)
+            r1=conn.execute(f"DELETE FROM diff_index WHERE nick=? AND archive_new NOT IN ({ph})",[nick]+lst).rowcount
+            r2=conn.execute(f"DELETE FROM diff_indexed_pairs WHERE nick=? AND (archive_old NOT IN ({ph}) OR archive_new NOT IN ({ph}))",[nick]+lst+lst).rowcount
+            r3=conn.execute(f"DELETE FROM archive_snapshot WHERE nick=? AND archive NOT IN ({ph})",[nick]+lst).rowcount
+            r4=conn.execute(f"DELETE FROM archive_snapshot_indexed WHERE nick=? AND archive NOT IN ({ph})",[nick]+lst).rowcount
+        else:
+            r1=conn.execute("DELETE FROM diff_index WHERE nick=?",(nick,)).rowcount
+            r2=conn.execute("DELETE FROM diff_indexed_pairs WHERE nick=?",(nick,)).rowcount
+            r3=conn.execute("DELETE FROM archive_snapshot WHERE nick=?",(nick,)).rowcount
+            r4=conn.execute("DELETE FROM archive_snapshot_indexed WHERE nick=?",(nick,)).rowcount
+        conn.commit()
+        conn.close()
+        total=r1+r2+r3+r4
+        if total>0:
+            print(f"{nick}: index nettoyé ({r1} diff, {r2} paires, {r3}+{r4} snapshots)")
+    except sqlite3.Error as e:
+        printer(f"SQLite cleanup error: {e}")
+
 def cmd_prune(nick,dryrun=False,debug=0):
     cfg=cfgreaded(nick,debug=debug)
     cmd=['prune']
@@ -2201,6 +2237,7 @@ def cmd_prune(nick,dryrun=False,debug=0):
         if not dryrun:
             rb=boex(nick,['compact','--cleanup-commits'],debug=debug)
             clear_cache_nick(nick)
+            _cleanup_index_after_prune(nick,debug=debug)
             return(rb)
         else:
             return(ret)

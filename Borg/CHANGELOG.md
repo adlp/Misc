@@ -1,5 +1,18 @@
 # Changelog — borgHelper
 
+## 0.54 — 2026-06-04
+
+### Ajout — `Prune` : nettoyage automatique du diff.db après prune réel
+
+- Après `borg prune` + `compact`, `_cleanup_index_after_prune()` récupère la liste courante des archives
+- Supprime de `diff_index` les entrées dont `archive_new` n'existe plus
+- Supprime de `diff_indexed_pairs` les paires dont `archive_old` ou `archive_new` n'existe plus
+- Supprime de `archive_snapshot` et `archive_snapshot_indexed` les archives disparues
+- Affiche un résumé si des entrées ont été supprimées : `N diff, N paires, N+N snapshots`
+- Pas exécuté sur dry-run ; ignoré si `NOIDX=1` ou si le diff.db n'existe pas encore
+
+---
+
 ## 0.53.1 — 2026-06-04
 
 ### Fix — suppression du `print` debug dans `getDataFromEnvOrFile`
