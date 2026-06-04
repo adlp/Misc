@@ -184,7 +184,11 @@ En cas d'erreur sur un dépôt, le rapport continue avec les autres serveurs. Le
 
 Colonnes résumé : nom, durée, depuis (heures), taille dernière, taille totale, récupérable, espace disque restant.
 
-**Statistiques de mouvement par backup** (si l'index SQLite est disponible) : colonnes `+ajouté`, `-supprimé`, `=présent` affichées sous la forme `N (P%)`. Le pourcentage est relatif au nombre de fichiers de la backup précédente. Les archives non encore indexées n'affichent pas ces colonnes.
+**Statistiques de mouvement** (si l'index SQLite est disponible) :
+- **Tableau résumé** (1 ligne par serveur) : colonnes `+ajouté`, `-supprimé`, `=présent` du **dernier backup**
+- **Tableau détail** (1 ligne par archive) : mêmes colonnes pour chaque backup listé
+- Format : `N (P%) · SIZE` — nombre de fichiers, pourcentage relatif au backup précédent, et taille disque
+- `—` si l'archive n'est pas encore indexée (`borgHelper -c Index -n <nick>` pour initialiser)
 
 ---
 

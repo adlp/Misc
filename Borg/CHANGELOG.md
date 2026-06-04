@@ -1,5 +1,23 @@
 # Changelog — borgHelper
 
+## 0.49.3 — 2026-06-04
+
+### Ajout — `Report` : stats dans le tableau résumé + taille disque
+
+#### Tableau résumé du haut (par serveur)
+- Colonnes `+ajouté`, `-supprimé`, `=présent` ajoutées : stats du **dernier backup**
+- Format : `N (P%) · SIZE` pour ajouté/supprimé, `N (P%)` pour présent
+- `—` si l'index n'a pas encore été construit pour ce nick
+
+#### Taille disque dans les stats (tous tableaux)
+- `_diff_stats_for_nick` : requête étendue avec `SUM(size_after)` / `SUM(size_before)`
+- added → `size_after` (taille des nouveaux fichiers)
+- removed → `size_before` (taille des fichiers supprimés)
+- modified → `size_after` (taille après modification)
+- Format unifié via `_fmt_stats(s, nf)` : `"N (P%) · X MiB"`
+
+---
+
 ## 0.49.2 — 2026-06-04
 
 ### Correctifs

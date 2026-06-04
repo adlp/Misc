@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.49.2"
+Version="0.49.3"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.49.2"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.49.3 Report : stats dans tableau résumé (dernier bkp) + taille disque dans les stats
 # 0.49.2 fix _diff_stats_for_nick (sqlite3.connect manquant) + KeyboardInterrupt dans boex
 # 0.49.1 Report : stats colonnes toujours présentes en ASCII (— si pas d'index)
 # 0.49 Report : stats % ajoutés/supprimés/présents par backup depuis diff_index SQLite
@@ -1471,24 +1472,28 @@ def cmd_filehist(nick,path,archive_from=None,archive_to=None,debug=0):
 
 
 def _diff_stats_for_nick(nick):
-    """Counts per archive_new from diff_index: {archive: {'added':N,'removed':N,'modified':N}}."""
+    """Counts and sizes per archive_new from diff_index."""
     try:
         db_path=get_diff_db(nick)
         conn=sqlite3.connect(db_path)
         rows=conn.execute(
-            "SELECT archive_new,change_type,COUNT(*) FROM diff_index WHERE nick=? "
-            "GROUP BY archive_new,change_type",(nick,)).fetchall()
+            "SELECT archive_new,change_type,COUNT(*),SUM(size_after),SUM(size_before) "
+            "FROM diff_index WHERE nick=? GROUP BY archive_new,change_type",(nick,)).fetchall()
         conn.close()
         stats={}
-        for arch,ctype,cnt in rows:
+        for arch,ctype,cnt,sz_after,sz_before in rows:
             if arch not in stats:
-                stats[arch]={'added':0,'removed':0,'modified':0}
+                stats[arch]={'added':0,'removed':0,'modified':0,
+                             'added_sz':0,'removed_sz':0,'modified_sz':0}
             if ctype=='added':
                 stats[arch]['added']+=cnt
+                stats[arch]['added_sz']+=(sz_after or 0)
             elif ctype=='removed':
                 stats[arch]['removed']+=cnt
+                stats[arch]['removed_sz']+=(sz_before or 0)
             else:
                 stats[arch]['modified']+=cnt
+                stats[arch]['modified_sz']+=(sz_after or 0)
         return stats
     except Exception:
         return {}
@@ -1612,23 +1617,39 @@ def prep_report(nick,debug=0,maxp=None):
     tbkps['Totaux']['deduplicated_size']   =resume['unique_csize']
 
     diff_stats=_diff_stats_for_nick(nick)
+
+    def _fmt_stats(s,nf):
+        na,nr,nm=s['added'],s['removed'],s['modified']
+        present=max(0,nf-na-nm)
+        total_prev=present+nr+nm
+        pct=lambda n: f" ({100*n//total_prev}%)" if total_prev>0 else ""
+        return {
+            '+ajouté' :f"{na}{pct(na)} · {convert_octets_readable(s['added_sz'])}",
+            '-supprimé':f"{nr}{pct(nr)} · {convert_octets_readable(s['removed_sz'])}",
+            '=présent' :f"{present}{pct(present)}",
+        }
+
+    # Stats du dernier backup dans le tableau résumé
+    last_arch=resume.get('lastname','')
+    s_last=diff_stats.get(last_arch) if last_arch else None
+    if s_last:
+        nf_last=kept.get(last_arch,{}).get('nfiles',0) or 0
+        for k,v in _fmt_stats(s_last,nf_last).items():
+            tcmpl[nick][k]=v
+    else:
+        tcmpl[nick]['+ajouté'] ='—'
+        tcmpl[nick]['-supprimé']='—'
+        tcmpl[nick]['=présent'] ='—'
+
+    # Stats par backup dans le tableau détaillé
     for arch in list(tbkps.keys()):
-        if 'nfiles' not in tbkps[arch]:  # Prunable / Totaux : pas de stats
+        if 'nfiles' not in tbkps[arch]:
             continue
         s=diff_stats.get(arch)
         if s:
             nf=tbkps[arch].get('nfiles',0) or 0
-            na,nr,nm=s['added'],s['removed'],s['modified']
-            present=max(0,nf-na-nm)
-            total_prev=present+nr+nm
-            if total_prev>0:
-                tbkps[arch]['+ajouté'] =f"{na} ({100*na//total_prev}%)"
-                tbkps[arch]['-supprimé']=f"{nr} ({100*nr//total_prev}%)"
-                tbkps[arch]['=présent'] =f"{present} ({100*present//total_prev}%)"
-            else:
-                tbkps[arch]['+ajouté'] =str(na) if na else '—'
-                tbkps[arch]['-supprimé']=str(nr) if nr else '—'
-                tbkps[arch]['=présent'] ='—'
+            for k,v in _fmt_stats(s,nf).items():
+                tbkps[arch][k]=v
         else:
             tbkps[arch]['+ajouté'] ='—'
             tbkps[arch]['-supprimé']='—'
@@ -1732,7 +1753,7 @@ def cmd_report(nicks,htrep=False,dayback=None,debug=0,maxp=None):
         print("<html>")
         print('  <body bgcolor="#ffffff">')
         print("    <br>")
-        print(htmlTabelise(reshos,colnames=['nom','duree','depuis','derniere','taille','recuperable','reste'],errhost=errhost))
+        print(htmlTabelise(reshos,colnames=['nom','duree','depuis','derniere','taille','recuperable','reste','+ajouté','-supprimé','=présent'],errhost=errhost))
         for nick in nicks.split(','):
             print('    <br>')
             print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','compressed_size','deduplicated_size','nfiles','+ajouté','-supprimé','=présent'],errhost=errhost))
