@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.53"
+Version="0.53.1"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.53"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.53.1 fix getDataFromEnvOrFile : supprime print "📄 Fichier trouvé"
 # 0.53 Report : -j sortie JSON {summary, backups}
 # 0.52 Report : réindexation auto des paires manquantes (stats —, hors premier dump)
 # 0.51.2 fix -F absent de optab index/indexsnap → usage() appelé au lieu d'indexer
@@ -192,7 +193,6 @@ def getDataFromEnvOrFile(env=None,envpath=None,paths=None):
         if os.path.isfile(path) and os.access(path, os.R_OK):
             with open(path, 'r', encoding='utf-8') as f:
                 data = f.readline().strip()
-                print(f"📄 Fichier trouvé : {path}")
                 return(data)
 
     # ❌ Rien trouvé

@@ -1,5 +1,14 @@
 # Changelog — borgHelper
 
+## 0.53.1 — 2026-06-04
+
+### Fix — suppression du `print` debug dans `getDataFromEnvOrFile`
+
+- `"📄 Fichier trouvé : <path>"` affiché à chaque démarrage si le fichier sentry existe
+- Ligne `print(f"📄 Fichier trouvé : {path}")` supprimée
+
+---
+
 ## 0.53 — 2026-06-04
 
 ### Ajout — `Report` : option `-j` sortie JSON
