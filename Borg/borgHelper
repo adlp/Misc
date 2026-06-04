@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.42.2"
+Version="0.43.1"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,8 @@ Version="0.42.2"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.43.1 DuIdx : fix colonne added/modif vide + tri -s col[:asc|desc] + sortie -j JSON
+# 0.43 DuIdx : résumé taille/nb par type (added/modified/removed/présent) sur pattern de chemin
 # 0.42.2 DB_NAME dans borghelperrc : surcharge le nick dans le nom des fichiers SQLite
 # 0.42.1 Un SQLite par nick : <conf>-<nick>-cache.db / <conf>-<nick>-diff.db
 # 0.42 DBs dans ~/.cache/borghelper/ (ou CACHE_DIR), nommés d'après le fichier de conf
@@ -1037,6 +1039,165 @@ def cmd_search(nick,pattern,debug=0):
                    convert_octets_readable(sa) if sa else ''])
     print(t)
 
+_DUIDX_TYPE_ORDER=['added','modified','removed','C','B','T','présent']
+_SNAP_NOTIN="AND NOT EXISTS(SELECT 1 FROM diff_index d WHERE d.nick=archive_snapshot.nick AND d.path=archive_snapshot.path)"
+
+def _duidx_path_key(path,depth):
+    parts=path.split('/')
+    return '/'.join(parts[:depth+1]) if depth<len(parts) else path
+
+def _duidx_add(totals,key,ct,sz):
+    k=(key,ct)
+    if k not in totals: totals[k]=[0,0]
+    totals[k][0]+=1
+    totals[k][1]+=(sz or 0)
+
+def _duidx_collect(nick,sql_pat,key_fn):
+    """Collecte par chemin (clé = key_fn(path))."""
+    totals={}
+    for n in nick.split(','):
+        db_path=get_diff_db(n)
+        ensure_diff_db(db_path)
+        try:
+            conn=sqlite3.connect(db_path)
+            for ct,path,sz in conn.execute(
+                    "SELECT change_type,path,"
+                    "CASE WHEN change_type='removed' THEN size_before ELSE size_after END "
+                    "FROM diff_index WHERE nick=? AND path LIKE ?",(n,sql_pat)):
+                _duidx_add(totals,key_fn(path),ct,sz)
+            for path,sz in conn.execute(
+                    "SELECT path,size FROM archive_snapshot WHERE nick=? AND path LIKE ? "+_SNAP_NOTIN,
+                    (n,sql_pat)):
+                _duidx_add(totals,key_fn(path),'présent',sz)
+            conn.close()
+        except sqlite3.Error as e:
+            printer(f"SQLite error ({n}): {e}")
+    return totals
+
+def _duidx_collect_global(nick,sql_pat):
+    """Collecte globale agrégée par type (sans groupement chemin)."""
+    totals={}
+    for n in nick.split(','):
+        db_path=get_diff_db(n)
+        ensure_diff_db(db_path)
+        try:
+            conn=sqlite3.connect(db_path)
+            for ct,cnt,sz in conn.execute(
+                    "SELECT change_type,COUNT(*),SUM(CASE WHEN change_type='removed' THEN size_before ELSE size_after END) "
+                    "FROM diff_index WHERE nick=? AND path LIKE ? GROUP BY change_type",(n,sql_pat)):
+                k=('',ct)
+                if k not in totals: totals[k]=[0,0]
+                totals[k][0]+=cnt; totals[k][1]+=(sz or 0)
+            row=conn.execute(
+                "SELECT COUNT(*),SUM(size) FROM archive_snapshot WHERE nick=? AND path LIKE ? "+_SNAP_NOTIN,
+                (n,sql_pat)).fetchone()
+            if row and row[0]:
+                k=('','présent')
+                if k not in totals: totals[k]=[0,0]
+                totals[k][0]+=row[0]; totals[k][1]+=(row[1] or 0)
+            conn.close()
+        except sqlite3.Error as e:
+            printer(f"SQLite error ({n}): {e}")
+    return totals
+
+_DUIDX_COL_KEYS  =['added','removed','présent']
+_DUIDX_COL_NAMES =['added/modif','removed','présent']
+
+def _duidx_fmt(cnt,sz):
+    return f"{cnt} / {convert_octets_readable(sz)}" if cnt else '—'
+
+def _duidx_merge(totals):
+    """Fusionne added/modified/C/B/T → 'added' pour la vue pivotée."""
+    merged={}
+    for (pk,ct),(cnt,sz) in totals.items():
+        eff='added' if ct in ('added','modified','C','B','T') else ct
+        k=(pk,eff)
+        if k not in merged: merged[k]=[0,0]
+        merged[k][0]+=cnt; merged[k][1]+=sz
+    return merged
+
+def _duidx_sort_key(pk,merged,sort_by,reverse):
+    """Clé de tri pour une ligne de la vue pivotée."""
+    if sort_by=='chemin': return pk
+    idx=_DUIDX_COL_KEYS.index(sort_by) if sort_by in _DUIDX_COL_KEYS else 0
+    sz=merged.get((pk,_DUIDX_COL_KEYS[idx]),[0,0])[1]
+    return -sz if reverse else sz
+
+def _duidx_print(totals,label,grouped,sort_by='chemin',reverse=False,as_json=False):
+    if not totals:
+        print("Aucune donnée." if not as_json else '{}')
+        return
+    if grouped:
+        merged=_duidx_merge(totals)
+        paths=sorted(set(pk for pk,_ in merged),
+                     key=lambda pk:_duidx_sort_key(pk,merged,sort_by,reverse),
+                     reverse=(reverse if sort_by!='chemin' else False))
+        totcol={ck:[0,0] for ck in _DUIDX_COL_KEYS}
+        rows_data=[]
+        for pk in paths:
+            entry={'chemin':pk}
+            for ck,cn in zip(_DUIDX_COL_KEYS,_DUIDX_COL_NAMES):
+                cnt,sz=merged.get((pk,ck),[0,0])
+                entry[cn]={'nb':cnt,'taille':sz}
+                totcol[ck][0]+=cnt; totcol[ck][1]+=sz
+            rows_data.append(entry)
+        if as_json:
+            out={'pattern':label,'rows':rows_data,
+                 'total':{cn:{'nb':totcol[ck][0],'taille':totcol[ck][1]}
+                          for ck,cn in zip(_DUIDX_COL_KEYS,_DUIDX_COL_NAMES)}}
+            print(json.dumps(out,ensure_ascii=False,indent=2))
+            return
+        from prettytable import PrettyTable
+        t=PrettyTable(['chemin']+_DUIDX_COL_NAMES)
+        t.align['chemin']='l'
+        for cn in _DUIDX_COL_NAMES: t.align[cn]='r'
+        for entry in rows_data:
+            t.add_row([entry['chemin']]+[_duidx_fmt(entry[cn]['nb'],entry[cn]['taille'])
+                                          for cn in _DUIDX_COL_NAMES])
+        t.add_row(['---']+['---']*len(_DUIDX_COL_NAMES))
+        t.add_row(['TOTAL']+[_duidx_fmt(totcol[ck][0],totcol[ck][1]) for ck in _DUIDX_COL_KEYS])
+    else:
+        order=_DUIDX_TYPE_ORDER
+        rows_data=[]
+        for (pk,ct),(cnt,sz) in sorted(totals.items(),
+                key=lambda x:(order.index(x[0][1]) if x[0][1] in order else 99)):
+            rows_data.append({'type':ct,'nb':cnt,'taille':sz})
+        if as_json:
+            out={'pattern':label,'rows':rows_data,
+                 'total':{'nb':sum(r['nb'] for r in rows_data),
+                          'taille':sum(r['taille'] for r in rows_data)}}
+            print(json.dumps(out,ensure_ascii=False,indent=2))
+            return
+        from prettytable import PrettyTable
+        t=PrettyTable(['type','nb','taille'])
+        t.align['type']='l'; t.align['taille']='r'
+        total_count=total_size=0
+        for r in rows_data:
+            t.add_row([r['type'],r['nb'],convert_octets_readable(r['taille']) if r['taille'] else '—'])
+            total_count+=r['nb']; total_size+=r['taille']
+        t.add_row(['---','---','---'])
+        t.add_row(['TOTAL',total_count,convert_octets_readable(total_size)])
+    if label: print(f"Pattern : {label}")
+    print(t)
+
+def cmd_duidx(nick,pattern=None,sort_by='chemin',reverse=False,as_json=False,debug=0):
+    if pattern is None:
+        totals=_duidx_collect_global(nick,'%')
+        _duidx_print(totals,None,False,sort_by,reverse,as_json)
+        return
+    if '/*' in pattern or pattern=='*':
+        prefix=pattern.rsplit('/*',1)[0] if '/*' in pattern else ''
+        depth=prefix.count('/')+1 if prefix else 0
+        sql_pat=(prefix+'/%').lstrip('/') if prefix else '%'
+        totals=_duidx_collect(nick,sql_pat,lambda p:_duidx_path_key(p,depth))
+        _duidx_print(totals,pattern,True,sort_by,reverse,as_json)
+    else:
+        sql_pat=pattern.replace('*','%').replace('?','_')
+        if '%' not in sql_pat and '_' not in sql_pat:
+            sql_pat='%'+sql_pat+'%'
+        totals=_duidx_collect_global(nick,sql_pat)
+        _duidx_print(totals,pattern,False,sort_by,reverse,as_json)
+
 def cmd_filehist(nick,path,debug=0):
     rows=[]
     for n in nick.split(','):
@@ -1717,7 +1878,7 @@ if sentryid != None:
 ######### Analyse Arguments
 
 try:
-    opts, args = getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:f:w:dvlC:", ["help"])
+    opts, args = getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:f:w:dvjlC:", ["help"])
 except getopt.GetoptError as err:
     print(err)  # will print something like "option -a not recognized"
     usage()
@@ -1736,7 +1897,8 @@ optab={ 'stats'     :'Ccdn',      'login'     :'Ccdsnkprm',
         'key'       :'Ccdn',      'index'     :'Ccdn',
         'search'    :'Ccdnf',     'filehist'  :'Ccdnf',
         'cacheinfo' :'Ccdn',      'cacheclean':'Ccdn',
-        'indexsnap' :'Ccdn',}
+        'indexsnap' :'Ccdn',
+        'duidx'     :'Ccdnfsj',}
 
 for opt,arg in opts:
     if   opt in '-h':
@@ -1910,6 +2072,16 @@ elif cmd == 'filehist':
     if '-f' not in options.keys():
         usage(cmd)
     cmd_filehist(nick,options['-f'],debug=debug)
+elif cmd == 'duidx':
+    _du_sort=options.get('-s','chemin')
+    _du_rev=_du_sort.endswith(':desc')
+    _du_sort=_du_sort.replace(':asc','').replace(':desc','')
+    if _du_sort not in ('chemin','added','removed','présent','present'):
+        _du_sort='chemin'
+    if _du_sort=='present': _du_sort='présent'
+    cmd_duidx(nick,options.get('-f',None),
+              sort_by=_du_sort,reverse=_du_rev,
+              as_json=('-j' in options),debug=debug)
 else:
     printer("Mais comment on peut en arriver la ?")
     usage()

@@ -1,5 +1,29 @@
 # Changelog — borgHelper
 
+## 0.43.1 — 2026-06-04
+
+### Correctifs et améliorations — `DuIdx`
+
+- Fix : colonne `added/modif` toujours vide (clé `'added/modif'` vs `'added'` dans le dict)
+- Vue pivotée : tri par colonne avec `-s <col>[:asc|desc]` — valeurs : `chemin`, `added`, `removed`, `present`
+- Sortie JSON avec `-j` — structure `{pattern, rows:[{chemin, added/modif:{nb,taille}, ...}], total}`
+
+---
+
+## 0.43 — 2026-06-04
+
+### Ajout — commande `DuIdx`
+
+- Résumé `du -sh`-like à partir du SQLite : taille totale et nombre de fichiers par type de changement
+- Types : `added`, `modified`, `removed`, `C`, `B`, `T`, `présent` (stables)
+- Pattern de chemin : sous-chaîne libre ou glob `*`/`?` (ex : `home/*`, `*.conf`)
+- `-f` optionnel — défaut `*` (tout le dépôt)
+- Ligne TOTAL en bas du tableau
+- Taille : `size_after` pour added/modified, `size_before` pour removed, `size` pour présent
+- Note : les entrées `diff_index` comptent les événements, pas les fichiers uniques
+
+---
+
 ## 0.42.2 — 2026-06-04
 
 ### Ajout — `DB_NAME` dans borghelperrc

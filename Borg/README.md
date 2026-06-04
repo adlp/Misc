@@ -315,6 +315,25 @@ Type `présent` : fichier trouvé dans le snapshot de la dernière archive (stab
 
 ---
 
+### `DuIdx`
+Résumé `du -sh`-like depuis le SQLite : taille totale et nombre d'entrées par type de changement sur un pattern de chemin.
+
+```bash
+borgHelper -c DuIdx -n mon-serveur                         # résumé global par type
+borgHelper -c DuIdx -f '*' -n mon-serveur                  # détail par répertoire racine
+borgHelper -c DuIdx -f 'home/*' -n mon-serveur             # détail sous home/
+borgHelper -c DuIdx -f '*.log' -n ALL                      # résumé global sur les .log
+borgHelper -c DuIdx -f '*' -s présent:desc -n mon-serveur  # trié par taille présent desc
+borgHelper -c DuIdx -f '*' -j -n mon-serveur               # sortie JSON
+```
+
+Sans `-f` ou avec pattern sans `/*` : résumé global (type / nb / taille totale).  
+Avec `-f '*'` ou `-f 'path/*'` : vue pivotée par chemin — colonnes `added/modif` | `removed` | `présent`.  
+Tri avec `-s <col>[:asc|desc]` — colonnes : `chemin`, `added`, `removed`, `present`.  
+JSON avec `-j`.
+
+---
+
 ### `CacheInfo`
 Affiche le contenu du cache SQLite (`~/.borghelper-cache.db`).
 
