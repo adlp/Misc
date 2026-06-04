@@ -168,6 +168,8 @@ borgHelper -c Report -n mon-serveur -b 5   # afficher 5 dernières archives
 Code retour 1 si un dépôt dépasse `MAX_AGE_BKP` heures depuis la dernière sauvegarde.  
 Code retour 2 si un dépôt est inaccessible (erreur borg).
 
+Les données de rapport sont mises en cache par `last_modified` du dépôt (SQLite). Si le dépôt n'a pas changé depuis le dernier `Report`, un seul appel réseau est effectué (`borg info --json`) au lieu de trois.
+
 En cas d'erreur sur un dépôt, le rapport continue avec les autres serveurs. Le dépôt en erreur apparaît en rouge (HTML) ou préfixé `*** ERREUR` (ASCII) avec le message d'erreur dans la colonne `reste`.
 
 Colonnes : nom, durée, depuis (heures), taille dernière, taille totale, récupérable, espace disque restant.

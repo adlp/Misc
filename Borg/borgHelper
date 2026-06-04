@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.45"
+Version="0.45.1"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.45"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.45.1 Report : prune dry-run caché en SQLite, 1 seul appel borg info par nick
 # 0.45 Bkp : indexation automatique via --list pendant backup (-I pour désactiver)
 # 0.44.3 Report : erreur borg par nick affichée dans le tableau, exit 2, rapport continue
 # 0.44.2 Search/FileHist/DuIdx : -B <archive> borne de fin de plage
@@ -689,7 +690,7 @@ def clear_cache_nick(nick,db_path=None):
         db_path=get_cache_db(nick)
     try:
         conn=sqlite3.connect(db_path)
-        cur=conn.execute("DELETE FROM cachejsonboexlm WHERE nom=?",(nick,))
+        cur=conn.execute("DELETE FROM cachejsonboexlm WHERE nom=? OR nom=?",(nick,f"{nick}:prune"))
         count=cur.rowcount
         conn.commit()
         conn.close()
@@ -697,10 +698,8 @@ def clear_cache_nick(nick,db_path=None):
     except sqlite3.Error:
         return 0
 
-def cacheJsonBoexWithLM(nick,boexarg,output="stdout",debug=0,db_path=None):
-    if db_path is None:
-        db_path=get_cache_db(nick)
-    ensure_cache_db(db_path)
+def _boex_last_modified(nick,debug=0):
+    """Appelle borg info --json, retourne last_modified, lève RuntimeError si échec."""
     rb=boex(nick,['info','--json'],debug=debug)
     if rb['exitcode']!=0 or not rb['stdout']:
         msgs=[]
@@ -710,7 +709,58 @@ def cacheJsonBoexWithLM(nick,boexarg,output="stdout",debug=0,db_path=None):
             elif isinstance(i,str) and i.strip() and not i.startswith('Platform') and not i.startswith('Borg:'):
                 msgs.append(i.strip())
         raise RuntimeError('; '.join(msgs[:3]) or f"borg info failed (code {rb['exitcode']})")
-    last_modified=rb['stdout'][0]['repository']['last_modified']
+    return rb['stdout'][0]['repository']['last_modified']
+
+def cache_prune_dryrun(nick,last_modified,debug=0,db_path=None):
+    """Retourne la liste des archives à pruner, mise en cache par last_modified."""
+    if db_path is None:
+        db_path=get_cache_db(nick)
+    ensure_cache_db(db_path)
+    nom=f"{nick}:prune"
+    purge_stale_cache(nom,last_modified,db_path)
+    try:
+        conn=sqlite3.connect(db_path)
+        row=conn.execute(
+            "SELECT details FROM cachejsonboexlm WHERE nom=? AND lastmodified=? LIMIT 1",
+            (nom,last_modified)).fetchone()
+        conn.close()
+    except sqlite3.Error:
+        row=None
+    if row is not None:
+        if debug: print(f'Cache hit (prune {nick})')
+        return json.loads(row[0])
+    if debug: print(f'Cache miss (prune {nick}) — borg prune --dry-run')
+    cfg=cfgreaded(nick,debug=debug)
+    cmd=['prune','--dry-run','--save-space','--info','--list']
+    for key,flag in [('KEEP_DAILY','--keep-daily'),('KEEP_WEEKLY','--keep-weekly'),
+                     ('KEEP_MONTHLY','--keep-monthly'),('KEEP_YEARLY','--keep-yearly'),
+                     ('KEEP_HOURLY','--keep-hourly')]:
+        if key in cfg:
+            cmd.extend([flag,cfg[key]])
+    cmd.append(f'--glob-archives={cfg["GLOB_ARCH"]}')
+    ret=boex(nick,cmd,debug=debug)['stderr']
+    pruneme=[]
+    for i in ret:
+        line=i if isinstance(i,str) else i.get('message','')
+        if 'Would prune:' in line:
+            pruneme.append((re.sub(r'( )*',r'\1',line)).split(' ')[2])
+    try:
+        conn=sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT OR IGNORE INTO cachejsonboexlm (nom,lastmodified,details) VALUES (?,?,?)",
+            (nom,last_modified,json.dumps(pruneme)))
+        conn.commit()
+        conn.close()
+    except sqlite3.Error as e:
+        printer(f"Cache write error (prune): {e}")
+    return pruneme
+
+def cacheJsonBoexWithLM(nick,boexarg,output="stdout",debug=0,db_path=None,last_modified=None):
+    if db_path is None:
+        db_path=get_cache_db(nick)
+    ensure_cache_db(db_path)
+    if last_modified is None:
+        last_modified=_boex_last_modified(nick,debug=debug)
     purge_stale_cache(nick,last_modified,db_path)
     try:
         conn=sqlite3.connect(db_path)
@@ -779,9 +829,9 @@ def cmd_cache_clean(nick=None,debug=0):
             total+=count
             continue
         try:
-            rb=boex(n,['info','--json'],debug=debug)
-            lm=rb['stdout'][0]['repository']['last_modified']
+            lm=_boex_last_modified(n,debug=debug)
             deleted=purge_stale_cache(n,lm,db_path)
+            deleted+=purge_stale_cache(f"{n}:prune",lm,db_path)
             if deleted:
                 print(f"  {n}: {deleted} entrée(s) périmée(s) supprimée(s)")
             else:
@@ -1340,13 +1390,13 @@ def cmd_filehist(nick,path,archive_from=None,archive_to=None,debug=0):
 
 def prep_report(nick,debug=0,maxp=None):
     cfg=cfgreaded(nick,debug=debug)
-    pruneme=[]
-    for i in cmd_prune(nick,dryrun=True,debug=debug):
-        if 'Would prune:' in i:
-            pruneme.append(((re.sub(r'( )*',r'\1',i)).split(' '))[2])
-
-    #r=json.loads('\n'.join(boex(nick,['info','--json','--glob-archives',cfg['GLOB_ARCH']],ret=True,debug=debug)['stdout']))
-    r=cacheJsonBoexWithLM(nick,['info','--json','--glob-archives',cfg['GLOB_ARCH']],suffix="-info.json",debug=debug)
+    # Un seul appel borg info --json pour last_modified
+    last_modified=_boex_last_modified(nick,debug=debug)
+    # Prune dry-run caché
+    pruneme=cache_prune_dryrun(nick,last_modified,debug=debug)
+    # Info glob caché (last_modified fourni → pas de 2e appel borg info)
+    r=cacheJsonBoexWithLM(nick,['info','--json','--glob-archives',cfg['GLOB_ARCH']],
+                          debug=debug,last_modified=last_modified)
 
     resume={}
     resume['duration']=0

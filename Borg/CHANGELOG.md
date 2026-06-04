@@ -1,5 +1,20 @@
 # Changelog — borgHelper
 
+## 0.45.1 — 2026-06-04
+
+### Optimisation — `Report` : cache du prune dry-run + 1 seul appel borg info
+
+- `_boex_last_modified(nick)` : extrait le point commun des deux caches
+- `cache_prune_dryrun(nick, last_modified)` : met en cache le résultat de `borg prune --dry-run` (clé `{nick}:prune` dans `cachejsonboexlm`)
+- `cacheJsonBoexWithLM` : accepte `last_modified=` pour éviter un appel borg info redondant
+- `prep_report` : **1 seul `borg info --json`** par nick → `last_modified` partagé entre les deux caches
+- Cache hit complet : 1 appel réseau au lieu de 3 (borg info + borg info --glob + prune dry-run)
+- Fix : `suffix="-info.json"` retiré de l'appel `cacheJsonBoexWithLM` dans `prep_report` (TypeError latent)
+- `clear_cache_nick` : purge aussi `{nick}:prune`
+- `cmd_cache_clean` : purge aussi les entrées `:prune` périmées
+
+---
+
 ## 0.45 — 2026-06-04
 
 ### Ajout — `Bkp` : indexation automatique pendant le backup
