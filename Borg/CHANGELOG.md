@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## 0.52 — 2026-06-04
+
+### Ajout — `Report` : réindexation automatique des paires manquantes
+
+- Lors de la génération du rapport, si une archive affiche `—` en stats et que sa paire n'est pas dans `diff_indexed_pairs`, elle est réindexée automatiquement (borg diff à la volée)
+- Seules les paires non indexées sont traitées — le premier dump (sans prédécesseur) est ignoré
+- Les paires déjà indexées mais vides (0 changements) restent `—` (comportement attendu)
+- Message de diagnostic vers `stderr` : `réindexation auto <old> → <new>`
+- Après réparation, `diff_stats` est recalculé avant d'afficher le rapport
+
+---
+
 ## 0.51.2 — 2026-06-04
 
 ### Fix — `-F` absent de `optab` pour `index` / `indexsnap`
