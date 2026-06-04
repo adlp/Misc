@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.54"
+Version="0.55"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.54"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.55 Bkp : exit 0 si stderr contient uniquement INFO/WARNING (pas d'ERROR/CRITICAL)
 # 0.54 Prune : nettoyage automatique du diff.db (entrées des archives supprimées)
 # 0.53.1 fix getDataFromEnvOrFile : supprime print "📄 Fichier trouvé"
 # 0.53 Report : -j sortie JSON {summary, backups}
@@ -2368,11 +2369,10 @@ def cmd_bkp(nick,no_index=False,debug=0):
     newretC=0
     if anaRet['exitcode']:
         for i in anaRet['stderr']:
-            if isinstance(i,dict) and i.get('levelname')=='ERROR':
+            if isinstance(i,dict) and i.get('levelname') in ('ERROR','CRITICAL'):
                 newretC=2
                 break
-        if newretC==0:
-            newretC=anaRet['exitcode']
+        # INFO/WARNING only → borg exit 1 = avertissements, pas une erreur
 
     # Indexation depuis la sortie --list
     if newretC==0 and not no_index and anaRet['stdout']:

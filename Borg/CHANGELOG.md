@@ -1,5 +1,16 @@
 # Changelog — borgHelper
 
+## 0.55 — 2026-06-04
+
+### Fix — `Bkp` : exit 0 si stderr contient uniquement INFO/WARNING
+
+- Borg renvoie exit code 1 quand des avertissements se produisent pendant le backup (fichiers modifiés, droits insuffisants, etc.)
+- Précédemment : cet exit 1 était propagé tel quel si aucun `ERROR` n'était trouvé
+- Désormais : si aucun message de niveau `ERROR` ou `CRITICAL` n'est présent dans stderr, exit code = 0
+- Seule la présence d'un `ERROR` ou `CRITICAL` déclenche exit 2
+
+---
+
 ## 0.54 — 2026-06-04
 
 ### Ajout — `Prune` : nettoyage automatique du diff.db après prune réel
