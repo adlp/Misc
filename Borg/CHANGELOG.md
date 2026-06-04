@@ -1,5 +1,24 @@
 # Changelog — borgHelper
 
+## 0.46 — 2026-06-04
+
+### Améliorations — `Restore`
+
+#### Sans `-b` : sélection automatique de l'archive depuis le SQLite
+- `_find_last_archive_with_file` : cherche dans `archive_snapshot` puis `diff_index` la dernière archive connue contenant le chemin
+- Si trouvée : utilisée et affichée ; sinon : fallback sur la dernière archive (comportement précédent)
+
+#### `-w .tar` ou `-w .tgz` : sortie archive tar
+- Extraction vers un répertoire temporaire puis création/append du tar via Python `tarfile`
+- `.tar` : append si le fichier existe déjà
+- `.tgz` / `.tar.gz` : recréation (gzip ne supporte pas l'append) avec warning si le fichier existe
+- Répertoire temporaire nettoyé automatiquement
+
+#### Fix
+- `cmd_resto` : affichage stderr propre au lieu de `print(rb)` (dump dict brut)
+
+---
+
 ## 0.45.2 — 2026-06-04
 
 ### Ajout — `BORG_KEY_FILE` dans borghelperrc

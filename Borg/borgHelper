@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.45.2"
+Version="0.46"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.45.2"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.46 Restore : archive auto via SQLite si -b absent ; -w .tar/.tgz crée/append un tar
 # 0.45.2 boex : BORG_KEY_FILE passé à borg si présent dans borghelperrc
 # 0.45.1 Report : prune dry-run caché en SQLite, 1 seul appel borg info par nick
 # 0.45 Bkp : indexation automatique via --list pendant backup (-I pour désactiver)
@@ -1784,13 +1785,83 @@ def cmd_diffbkp(nick,bidun=None,bideux=None,debug=0,db_path=None):
     print(t)
     sys.exit(0)
 
+def _find_last_archive_with_file(nick,path,debug=0):
+    """Retourne la dernière archive connue contenant ce chemin (via SQLite), ou None."""
+    db_path=get_diff_db(nick)
+    try:
+        ensure_diff_db(db_path)
+        conn=sqlite3.connect(db_path)
+        # archive_snapshot : fichier présent dans la dernière archive indexée
+        row=conn.execute(
+            "SELECT archive FROM archive_snapshot WHERE nick=? AND path=? ORDER BY archive DESC LIMIT 1",
+            (nick,path)).fetchone()
+        if row:
+            conn.close()
+            return row[0]
+        # diff_index : dernière archive où le fichier n'était pas supprimé
+        row=conn.execute(
+            "SELECT archive_new FROM diff_index WHERE nick=? AND path=? AND change_type!='removed' "
+            "ORDER BY archive_new_date DESC LIMIT 1",
+            (nick,path)).fetchone()
+        conn.close()
+        return row[0] if row else None
+    except sqlite3.Error:
+        return None
+
+def _is_tar_dest(path):
+    return path.endswith('.tar') or path.endswith('.tgz') or path.endswith('.tar.gz')
+
+def _restore_to_tar(nick,bid,ftor,tarpath,debug=0):
+    import tempfile,tarfile as tf_mod
+    with tempfile.TemporaryDirectory(prefix='borghelper_restore_') as tmpdir:
+        rb=boex(nick,['extract','--exclude','*/log/*','::'+bid,ftor],rep=tmpdir,debug=debug)
+        if rb['exitcode'] not in (0,1):
+            for i in rb['stderr']:
+                if isinstance(i,dict):
+                    print(f"[{i.get('levelname','?')}] {i.get('message',i)}",file=sys.stderr)
+                elif isinstance(i,str) and i.strip():
+                    print(i,file=sys.stderr)
+            sys.exit(rb['exitcode'])
+        is_gz=tarpath.endswith('.tgz') or tarpath.endswith('.tar.gz')
+        exists=os.path.exists(tarpath)
+        if is_gz:
+            if exists:
+                printer(f"[WARN] {tarpath} existe — écrasement (gzip ne supporte pas l'append)")
+            mode='w:gz'
+        else:
+            mode='a' if exists else 'w'
+        with tf_mod.open(tarpath,mode) as tf:
+            for root,dirs,files in os.walk(tmpdir):
+                for d in dirs:
+                    dp=os.path.join(root,d)
+                    tf.add(dp,arcname=os.path.relpath(dp,tmpdir),recursive=False)
+                for f in files:
+                    fp=os.path.join(root,f)
+                    tf.add(fp,arcname=os.path.relpath(fp,tmpdir))
+        print(f"Restauré dans {tarpath}",flush=True)
+    sys.exit(rb['exitcode'])
+
 def cmd_resto(nick,bid,ftor,where,debug=0):
     cfg=cfgreaded(nick,debug=debug)
     if bid is None:
-        bid=getlastbkp(nick,debug=debug)[0]
-    rb=boex(nick,['extract','--exclude','*/log/*','::'+bid,ftor],rep=where,debug=debug)
-    print(rb)
-    sys.exit(rb['exitcode'])
+        bid=_find_last_archive_with_file(nick,ftor,debug=debug)
+        if bid:
+            print(f"Archive sélectionnée depuis l'index : {bid}",flush=True)
+        else:
+            bid=getlastbkp(nick,debug=debug)[0]
+            print(f"Archive sélectionnée (dernière) : {bid}",flush=True)
+    if _is_tar_dest(where):
+        _restore_to_tar(nick,bid,ftor,where,debug=debug)
+    else:
+        rb=boex(nick,['extract','--exclude','*/log/*','::'+bid,ftor],rep=where,debug=debug)
+        for i in rb['stderr']:
+            if isinstance(i,dict):
+                lvl=i.get('levelname','INFO')
+                if lvl not in ('DEBUG',):
+                    print(f"[{lvl}] {i.get('message',i)}",file=sys.stderr)
+            elif isinstance(i,str) and i.strip():
+                print(i,file=sys.stderr)
+        sys.exit(rb['exitcode'])
 
 def cmd_delbkp(nick,bid,debug=0):
     cfg=cfgreaded(nick,debug=debug)

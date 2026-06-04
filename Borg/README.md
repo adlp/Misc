@@ -219,13 +219,22 @@ Restaure un fichier ou une arborescence depuis une archive.
 ```bash
 borgHelper -c Restore -n mon-serveur -b archive-id \
            -f etc/nginx/nginx.conf -w /tmp/restauration
+borgHelper -c Restore -n mon-serveur -f etc/nginx/nginx.conf \
+           -w /tmp/restauration          # archive auto depuis SQLite
+borgHelper -c Restore -n mon-serveur -f home/user \
+           -w /tmp/backup.tar            # sortie tar (append si existe)
+borgHelper -c Restore -n mon-serveur -f etc \
+           -w /tmp/backup.tgz           # sortie tgz (recréé si existe)
 ```
 
 | Option | Description |
 |--------|-------------|
-| `-b` | Nom de l'archive (ou `last`) |
-| `-f` | Chemin relatif à restaurer |
-| `-w` | Répertoire de destination |
+| `-b` | Nom de l'archive — si absent : dernière archive connue dans le SQLite contenant `-f` |
+| `-f` | Chemin à restaurer |
+| `-w` | Répertoire de destination, ou fichier `.tar`/`.tgz`/`.tar.gz` |
+
+Si `-w` est un `.tar` : crée ou ajoute au fichier existant.  
+Si `-w` est un `.tgz` : crée (ou recrée avec warning si déjà présent — append impossible en gzip).
 
 ---
 
