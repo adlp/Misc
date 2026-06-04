@@ -242,6 +242,9 @@ borgHelper -c Restore -n mon-serveur -f home/user \
            -W /tmp/restauration         # répertoire plat
 borgHelper -c Restore -n mon-serveur -f 'etc/nginx/*.conf' -L          # liste les droits
 borgHelper -c Restore -n mon-serveur -f 'etc/nginx/*.conf' -L > droits.txt  # vers fichier texte
+borgHelper -c Restore -n mon-serveur -f 'home/user' -w - | tar -tvf -  # tar vers stdout
+borgHelper -c Restore -n mon-serveur -f 'home/user' -w - \
+           | ssh autre "tar -xf - -C /restore"                          # pipe vers hôte distant
 ```
 
 | Option | Description |
@@ -249,7 +252,9 @@ borgHelper -c Restore -n mon-serveur -f 'etc/nginx/*.conf' -L > droits.txt  # ve
 | `-b` | Nom de l'archive — si absent : dernière archive SQLite contenant `-f` |
 | `-f` | Chemin exact ou glob (`*`, `?`) — ex : `etc/nginx/*.conf` |
 | `-w <dest>` | Restauration avec sous-répertoires (répertoire ou `.tar`/`.tgz`) |
+| `-w -` | Tar non-compressé vers stdout (pipeable) |
 | `-W <dest>` | Restauration plate — fichiers à la racine, sans sous-répertoires |
+| `-W -` | Tar plat non-compressé vers stdout |
 | `-L` | Affiche droits/propriétaires (format `ls -la`) sans restaurer — redirigeable vers un fichier texte |
 
 Si la cible est un `.tar` : crée ou ajoute au fichier existant (append).  

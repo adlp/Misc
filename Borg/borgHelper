@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.49.5"
+Version="0.50"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.49.5"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.50 Restore : -w -  ou -W - envoie le tar en stdout (pipe) ; messages → stderr
 # 0.49.5 Report : =présent inclut taille disque et % (original_size - added - modified)
 # 0.49.4 Report : taille disque aussi en % (/ original_size du backup)
 # 0.49.3 Report : stats dans tableau résumé (dernier bkp) + taille disque dans les stats
@@ -304,7 +305,9 @@ def usage(doc=None,debug=0):
         printer("       -b        : archive précise ; absent → dernière archive SQLite contenant -f")
         printer("       -f        : chemin exact ou glob (* ?) ex : etc/nginx/*.conf  home/user")
         printer("       -w <dest> : restauration avec sous-répertoires (répertoire ou .tar/.tgz)")
+        printer("       -w -      : tar non-compressé vers stdout (pipe possible)")
         printer("       -W <dest> : restauration plate — fichiers à la racine, sans sous-répertoires")
+        printer("       -W -      : tar plat non-compressé vers stdout")
         printer("       -L        : affiche droits/propriétaires des fichiers (mode ls -la) sans restaurer")
         printer("                   Droits d'origine préservés dans le tar via --numeric-owner")
     elif doc == 'delbkp':
@@ -1992,23 +1995,29 @@ def _print_boex_stderr(rb):
 
 def _restore_to_tar(nick,bid,ftor,tarpath,flat=False,debug=0):
     import tempfile,tarfile as tf_mod
+    stdout_mode=(tarpath=='-')
     with tempfile.TemporaryDirectory(prefix='borghelper_restore_') as tmpdir:
         rb=boex(nick,_borg_extract_args(bid,ftor),rep=tmpdir,debug=debug)
         _print_boex_stderr(rb)
         if rb['exitcode'] not in (0,1):
             sys.exit(rb['exitcode'])
-        is_gz=tarpath.endswith('.tgz') or tarpath.endswith('.tar.gz')
-        exists=os.path.exists(tarpath)
-        if is_gz:
-            if exists:
-                printer(f"[ERREUR] {tarpath} existe déjà — impossible d'ajouter à un fichier gzip.")
-                printer(f"  Supprimez-le manuellement ou choisissez un autre nom.")
-                sys.exit(3)
-            mode='w:gz'
+        if stdout_mode:
+            mode='w|'   # streaming non-compressé vers stdout
         else:
-            mode='a' if exists else 'w'
+            is_gz=tarpath.endswith('.tgz') or tarpath.endswith('.tar.gz')
+            exists=os.path.exists(tarpath)
+            if is_gz:
+                if exists:
+                    print(f"[ERREUR] {tarpath} existe déjà — impossible d'ajouter à un fichier gzip.",file=sys.stderr)
+                    print(f"  Supprimez-le manuellement ou choisissez un autre nom.",file=sys.stderr)
+                    sys.exit(3)
+                mode='w:gz'
+            else:
+                mode='a' if exists else 'w'
         try:
-            with tf_mod.open(tarpath,mode) as tf:
+            fobj=sys.stdout.buffer if stdout_mode else None
+            with (tf_mod.open(fileobj=fobj,mode=mode) if stdout_mode
+                  else tf_mod.open(tarpath,mode)) as tf:
                 for root,dirs,files in os.walk(tmpdir):
                     if not flat:
                         for d in dirs:
@@ -2019,14 +2028,17 @@ def _restore_to_tar(nick,bid,ftor,tarpath,flat=False,debug=0):
                         arcname=(os.path.basename(fp) if flat
                                  else os.path.relpath(fp,tmpdir))
                         tf.add(fp,arcname=arcname)
+        except BrokenPipeError:
+            sys.exit(0)
         except OSError as e:
             import errno as _errno
             if e.errno==_errno.ENOSPC:
-                printer(f"[ERREUR] Espace disque insuffisant sur la cible : {e.filename or tarpath}")
+                print(f"[ERREUR] Espace disque insuffisant sur la cible : {e.filename or tarpath}",file=sys.stderr)
             else:
-                printer(f"[ERREUR] Écriture impossible : {e}")
+                print(f"[ERREUR] Écriture impossible : {e}",file=sys.stderr)
             sys.exit(3)
-        print(f"Restauré {'(plat) ' if flat else ''}dans {tarpath}",flush=True)
+        if not stdout_mode:
+            print(f"Restauré {'(plat) ' if flat else ''}dans {tarpath}",flush=True)
     sys.exit(rb['exitcode'])
 
 def cmd_listperms(nick,bid,ftor,debug=0):
@@ -2053,14 +2065,16 @@ def cmd_listperms(nick,bid,ftor,debug=0):
 
 def cmd_resto(nick,bid,ftor,where,flat=False,debug=0):
     cfg=cfgreaded(nick,debug=debug)
+    stdout_mode=(where=='-')
+    out=sys.stderr if stdout_mode else sys.stdout
     if bid is None:
         bid=_find_last_archive_with_file(nick,ftor,debug=debug)
         if bid:
-            print(f"Archive sélectionnée depuis l'index : {bid}",flush=True)
+            print(f"Archive sélectionnée depuis l'index : {bid}",file=out,flush=True)
         else:
             bid=getlastbkp(nick,debug=debug)[0]
-            print(f"Archive sélectionnée (dernière) : {bid}",flush=True)
-    if _is_tar_dest(where):
+            print(f"Archive sélectionnée (dernière) : {bid}",file=out,flush=True)
+    if stdout_mode or _is_tar_dest(where):
         _restore_to_tar(nick,bid,ftor,where,flat=flat,debug=debug)
     elif flat:
         # Extraction plate vers répertoire : temp → copie sans sous-répertoires

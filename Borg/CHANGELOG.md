@@ -1,5 +1,18 @@
 # Changelog — borgHelper
 
+## 0.50 — 2026-06-04
+
+### Ajout — `Restore` : `-w -` / `-W -` → tar vers stdout
+
+- `where == '-'` : tar non-compressé streamé vers `sys.stdout.buffer` (`mode='w|'`)
+- Fonctionne avec `-w -` (arborescence) et `-W -` (plat)
+- Tous les messages informatifs (archive sélectionnée, erreurs) redirigés vers stderr pour ne pas corrompre le flux binaire
+- `BrokenPipeError` géré proprement (pipe fermé par le lecteur → exit 0)
+- Exemple : `borgHelper -c Restore -n srv -f 'home/user' -w - | tar -tvf -`
+- Exemple : `borgHelper -c Restore -n srv -f 'home/user' -w - | ssh autre "tar -xf - -C /restore"`
+
+---
+
 ## 0.49.5 — 2026-06-04
 
 ### Ajout — `Report` : `=présent` avec taille disque et %
