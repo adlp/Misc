@@ -1,5 +1,21 @@
 # Changelog — borgHelper
 
+## 0.46.1 — 2026-06-04
+
+### Améliorations — `Restore`
+
+- `-f` accepte les globs `*` et `?` (ex : `etc/nginx/*.conf`, `home/user*`)
+  - Avec glob : `borg extract --pattern=sh:...` utilisé à la place du chemin direct
+  - `_find_last_archive_with_file` utilise `LIKE` sur l'index SQLite pour les patterns
+- Structure des répertoires préservée dans les tar (sous-répertoires inclus par défaut)
+- `-w <dest>` : restauration avec sous-répertoires (comportement précédent)
+- `-W <dest>` : restauration plate — fichiers à la racine, sans arborescence
+  - Pour tar : `arcname = basename(fichier)`
+  - Pour répertoire : copie plate via `shutil.copy2`
+- `.tgz` existant : exit 3 avec message d'erreur (au lieu de warning + écrasement silencieux)
+
+---
+
 ## 0.46 — 2026-06-04
 
 ### Améliorations — `Restore`

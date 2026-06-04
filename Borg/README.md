@@ -221,20 +221,23 @@ borgHelper -c Restore -n mon-serveur -b archive-id \
            -f etc/nginx/nginx.conf -w /tmp/restauration
 borgHelper -c Restore -n mon-serveur -f etc/nginx/nginx.conf \
            -w /tmp/restauration          # archive auto depuis SQLite
+borgHelper -c Restore -n mon-serveur -f 'etc/nginx/*.conf' \
+           -w /tmp/backup.tar            # glob → tar avec arborescence
+borgHelper -c Restore -n mon-serveur -f 'home/user/*.log' \
+           -W /tmp/logs.tgz             # glob → tgz plat (sans sous-répertoires)
 borgHelper -c Restore -n mon-serveur -f home/user \
-           -w /tmp/backup.tar            # sortie tar (append si existe)
-borgHelper -c Restore -n mon-serveur -f etc \
-           -w /tmp/backup.tgz           # sortie tgz (recréé si existe)
+           -W /tmp/restauration         # répertoire plat
 ```
 
 | Option | Description |
 |--------|-------------|
-| `-b` | Nom de l'archive — si absent : dernière archive connue dans le SQLite contenant `-f` |
-| `-f` | Chemin à restaurer |
-| `-w` | Répertoire de destination, ou fichier `.tar`/`.tgz`/`.tar.gz` |
+| `-b` | Nom de l'archive — si absent : dernière archive SQLite contenant `-f` |
+| `-f` | Chemin exact ou glob (`*`, `?`) — ex : `etc/nginx/*.conf` |
+| `-w <dest>` | Restauration avec sous-répertoires (répertoire ou `.tar`/`.tgz`) |
+| `-W <dest>` | Restauration plate — fichiers à la racine, sans sous-répertoires |
 
-Si `-w` est un `.tar` : crée ou ajoute au fichier existant.  
-Si `-w` est un `.tgz` : crée (ou recrée avec warning si déjà présent — append impossible en gzip).
+Si la cible est un `.tar` : crée ou ajoute au fichier existant (append).  
+Si la cible est un `.tgz` : crée uniquement — erreur (exit 3) si le fichier existe déjà (gzip ne supporte pas l'append).
 
 ---
 
