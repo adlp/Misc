@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## 0.47.1 — 2026-06-04
+
+### Ajout — `IDX_INCLUDE` et `IDX_EXCLUDE` dans borghelperrc
+
+- `IDX_INCLUDE = /etc /home /root` : liste blanche — seuls ces chemins sont indexés
+- `IDX_EXCLUDE = /proc /sys /tmp /var/log` : liste noire — ces chemins sont exclus de l'index
+- Support préfixe et glob (`*`, `?`) pour chaque entrée
+- Si les deux sont définis : `IDX_INCLUDE` filtre d'abord, puis `IDX_EXCLUDE` s'applique
+- Appliqué dans : `Index` (diffs), `IndexSnap` (snapshot), `Bkp` (--list parsing)
+
+---
+
 ## 0.47 — 2026-06-04
 
 ### Ajout — `NOIDX` et détection index vide

@@ -65,6 +65,10 @@ DB_NAME                  = mon-serveur-home   # → borghelperrc-mon-serveur-hom
 # Désactiver l'indexation pour ce dépôt (Search/FileHist/DuIdx non disponibles)
 NOIDX                    = 1
 
+# Filtres d'indexation (chemins séparés par espaces, glob * et ? supportés)
+IDX_INCLUDE              = /etc /home /root   # liste blanche — seuls ces chemins indexés
+IDX_EXCLUDE              = /proc /sys /tmp /var/log  # liste noire — ces chemins ignorés
+
 # Clef explicite (keyfile mode, utile si plusieurs nicks partagent le même dépôt)
 BORG_KEY_FILE            = /root/.config/borg/keys/abcdef123456
 
