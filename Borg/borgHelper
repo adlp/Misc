@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.43.1"
+Version="0.44.1"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,8 @@ Version="0.43.1"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.44.1 Help : IndexSnap, DuIdx, Search/FileHist -b documentés dans -h et -H
+# 0.44 Search/FileHist/DuIdx : -b <archive>|ALL pour filtrer la plage d'archives
 # 0.43.1 DuIdx : fix colonne added/modif vide + tri -s col[:asc|desc] + sortie -j JSON
 # 0.43 DuIdx : résumé taille/nb par type (added/modified/removed/présent) sur pattern de chemin
 # 0.42.2 DB_NAME dans borghelperrc : surcharge le nick dans le nom des fichiers SQLite
@@ -210,13 +212,21 @@ def usage(doc=None,debug=0):
         printer("⚗️ ⚡️-c Prune [-n nickname/servername/ALL]")
         printer("      ⚡️ On delete les vieux backup sur le repo ⚡️ DANGER")
         printer("   -c Index [-n nickname/servername/ALL]")
-        printer("       Indexe les diffs entre archives consécutives dans ~/.borghelper-diff.db")
-        printer("   -c Search -f <pattern> [-n nickname/servername/ALL]")
+        printer("       Indexe les diffs entre archives consécutives + snapshot de la dernière archive")
+        printer("   -c IndexSnap [-n nickname/servername/ALL]")
+        printer("       Indexe le listing complet de la dernière archive (fichiers stables)")
+        printer("   -c Search -f <pattern> [-n nickname/servername/ALL] [-b archive|ALL]")
         printer("       Cherche dans l'index des diffs par nom de fichier (glob * et ?)")
-        printer("   -c FileHist -f <chemin> [-n nickname/servername/ALL]")
+        printer("       -b : depuis archive X (défaut : dernière paire)")
+        printer("   -c FileHist -f <chemin> [-n nickname/servername/ALL] [-b archive|ALL]")
         printer("       Historique des changements d'un chemin exact")
+        printer("       -b : depuis archive X (défaut : dernière paire)")
+        printer("   -c DuIdx [-f pattern] [-n nickname/servername/ALL] [-b archive|ALL] [-s col[:asc|desc]] [-j]")
+        printer("       Résumé du-like : taille/nb par type depuis le SQLite")
+        printer("       Sans -f : résumé global  |  -f '*' : par répertoire racine  |  -f 'home/*' : sous home/")
+        printer("       -b ALL|archive  -s chemin|added|removed|present[:asc|desc]  -j JSON")
         printer("   -c CacheInfo [-n nickname/servername/ALL]")
-        printer("       Affiche le contenu du cache (~/.borghelper-cache.db)")
+        printer("       Affiche le contenu du cache SQLite")
         printer("   -c CacheClean [-n nickname/servername/ALL]")
         printer("       Supprime les entrées périmées du cache")
         printer("  Sentry configuration : BORGHELPERC_SENTRY_ID BORGHELPERC_SENTRY_FILE ou /usr/local/etc/borghelper-sentry")
@@ -296,21 +306,42 @@ def usage(doc=None,debug=0):
         printer('      Initiaslisation du repo')
     elif doc == 'index':
         printer("   -c Index [-n nickname/servername/ALL]")
-        printer("       Indexe les diffs entre archives consécutives dans ~/.borghelper-diff.db")
-        printer("       Incrémental : paires déjà traitées ignorées")
-        printer("       Types indexés : added, removed, modified, C (permissions), B (lien cassé)…")
+        printer("       Indexe les diffs entre archives consécutives (incrémental)")
+        printer("       Appelle IndexSnap automatiquement à la fin")
+        printer("       Types : added, removed, modified, C (permissions), B (lien cassé), T (type changé)")
+    elif doc == 'indexsnap':
+        printer("   -c IndexSnap [-n nickname/servername/ALL]")
+        printer("       Indexe le listing complet de la dernière archive dans le SQLite")
+        printer("       Permet à Search et FileHist de trouver les fichiers stables (jamais modifiés)")
+        printer("       Appelé automatiquement par Index — à lancer manuellement après un Prune")
     elif doc == 'search':
-        printer("   -c Search -f <pattern> [-n nickname/servername/ALL]")
-        printer("       Cherche dans l'index des diffs par pattern de chemin")
+        printer("   -c Search -f <pattern> [-n nickname/servername/ALL] [-b archive|ALL]")
+        printer("       Cherche dans l'index des diffs et le snapshot par pattern de chemin")
         printer("       Sous-chaîne libre ou glob avec * et ?")
         printer("       Ex : -f '*.conf'   -f '/etc/nginx*'   -f 'passwd'")
+        printer("       -b <archive> : depuis cet archive jusqu'au dernier")
+        printer("       -b ALL       : tout l'index (toutes les paires)")
+        printer("       sans -b      : uniquement la dernière paire (défaut)")
     elif doc == 'filehist':
-        printer("   -c FileHist -f <chemin> [-n nickname/servername/ALL]")
+        printer("   -c FileHist -f <chemin> [-n nickname/servername/ALL] [-b archive|ALL]")
         printer("       Historique complet des changements d'un chemin exact")
+        printer("       Inclut les entrées 'présent' du snapshot (fichiers stables)")
         printer("       Ex : -f /etc/nginx/nginx.conf")
+        printer("       -b <archive> : depuis cet archive  |  -b ALL : tout  |  sans -b : dernière paire")
+    elif doc == 'duidx':
+        printer("   -c DuIdx [-f pattern] [-n nickname/servername/ALL] [-b archive|ALL] [-s col[:asc|desc]] [-j]")
+        printer("       Résumé du-like depuis le SQLite : taille et nb de fichiers par type")
+        printer("       Sans -f        : résumé global par type (added, removed, présent…)")
+        printer("       -f '*'         : détail par répertoire/fichier racine")
+        printer("       -f 'home/*'    : détail par entrée sous home/")
+        printer("       -f '*.conf'    : résumé global sur les .conf uniquement")
+        printer("       -b <archive>   : depuis archive X jusqu'au dernier")
+        printer("       -b ALL         : tout l'index")
+        printer("       -s col[:asc|desc] : trier par chemin|added|removed|present (défaut: chemin:asc)")
+        printer("       -j             : sortie JSON {pattern, rows, total}")
     elif doc == 'cacheinfo':
         printer("   -c CacheInfo [-n nickname/servername/ALL]")
-        printer("       Affiche le contenu du cache SQLite (~/.borghelper-cache.db)")
+        printer("       Affiche le contenu du cache SQLite (un fichier par nick)")
         printer("       Colonnes : nick, last_modified du repo, taille des données en cache")
     elif doc == 'cacheclean':
         printer("   -c CacheClean [-n nickname/servername/ALL]")
@@ -998,7 +1029,7 @@ def cmd_indexsnap(nick,debug=0,db_path=None):
     print(f"{nick}: {len(files)} fichiers dans le snapshot {archive_name}")
     return 0
 
-def cmd_search(nick,pattern,debug=0):
+def cmd_search(nick,pattern,archive_from=None,debug=0):
     sql_pat=pattern.replace('*','%').replace('?','_')
     if '%' not in sql_pat and '_' not in sql_pat:
         sql_pat='%'+sql_pat+'%'
@@ -1008,20 +1039,19 @@ def cmd_search(nick,pattern,debug=0):
         ensure_diff_db(db_path)
         try:
             conn=sqlite3.connect(db_path)
+            af_sql,af_params=_diff_archive_filter(n,archive_from,conn)
             cur=conn.execute(
                 "SELECT nick,archive_new_date,archive_new,change_type,path,size_before,size_after "
-                "FROM diff_index WHERE nick=? AND path LIKE ? "
-                "ORDER BY archive_new_date,path",
-                (n,sql_pat))
+                "FROM diff_index WHERE nick=? AND path LIKE ?"+af_sql+
+                " ORDER BY archive_new_date,path",
+                [n,sql_pat]+af_params)
             rows.extend(cur.fetchall())
+            snap_date=af_params[0] if (archive_from not in (None,'ALL') and af_params) else ''
             cur=conn.execute(
                 "SELECT nick,archive_date,archive,'présent',path,NULL,size "
-                "FROM archive_snapshot "
-                "WHERE nick=? AND path LIKE ? "
-                "AND NOT EXISTS ("
-                "  SELECT 1 FROM diff_index d WHERE d.nick=archive_snapshot.nick AND d.path=archive_snapshot.path"
-                ") ORDER BY archive,path",
-                (n,sql_pat))
+                "FROM archive_snapshot WHERE nick=? AND path LIKE ? "+_snap_notin(snap_date)+
+                " ORDER BY archive,path",
+                ([n,sql_pat]+([snap_date] if snap_date else [])))
             rows.extend(cur.fetchall())
             conn.close()
         except sqlite3.Error as e:
@@ -1040,7 +1070,33 @@ def cmd_search(nick,pattern,debug=0):
     print(t)
 
 _DUIDX_TYPE_ORDER=['added','modified','removed','C','B','T','présent']
-_SNAP_NOTIN="AND NOT EXISTS(SELECT 1 FROM diff_index d WHERE d.nick=archive_snapshot.nick AND d.path=archive_snapshot.path)"
+_SNAP_NOTIN="AND NOT EXISTS(SELECT 1 FROM diff_index d WHERE d.nick=archive_snapshot.nick AND d.path=archive_snapshot.path{extra})"
+
+def _diff_archive_filter(nick,archive_from,conn):
+    """Retourne (sql_extra, params) pour filtrer diff_index par plage d'archives.
+    archive_from=None  → uniquement la dernière paire (archive_new = MAX)
+    archive_from='ALL' → tout l'index
+    archive_from=name  → depuis cet archive (archive_new_date >= date de name)
+    """
+    if archive_from=='ALL':
+        return '',[]
+    if archive_from is None:
+        row=conn.execute("SELECT MAX(archive_new) FROM diff_index WHERE nick=?",(nick,)).fetchone()
+        if row and row[0]:
+            return ' AND archive_new=?',[row[0]]
+        return '',[]
+    # Chercher la date de l'archive demandée
+    row=conn.execute(
+        "SELECT archive_new_date FROM diff_index WHERE nick=? AND (archive_new=? OR archive_old=?) LIMIT 1",
+        (nick,archive_from,archive_from)).fetchone()
+    if row and row[0]:
+        return ' AND archive_new_date>=?',[row[0]]
+    return ' AND archive_new>=?',[archive_from]
+
+def _snap_notin(extra_date_filter=''):
+    """Clause NOT EXISTS pour archive_snapshot, avec filtre date optionnel."""
+    date_cond=' AND d.archive_new_date>=?' if extra_date_filter else ''
+    return f"AND NOT EXISTS(SELECT 1 FROM diff_index d WHERE d.nick=archive_snapshot.nick AND d.path=archive_snapshot.path{date_cond})"
 
 def _duidx_path_key(path,depth):
     parts=path.split('/')
@@ -1052,7 +1108,7 @@ def _duidx_add(totals,key,ct,sz):
     totals[k][0]+=1
     totals[k][1]+=(sz or 0)
 
-def _duidx_collect(nick,sql_pat,key_fn):
+def _duidx_collect(nick,sql_pat,key_fn,archive_from=None):
     """Collecte par chemin (clé = key_fn(path))."""
     totals={}
     for n in nick.split(','):
@@ -1060,21 +1116,24 @@ def _duidx_collect(nick,sql_pat,key_fn):
         ensure_diff_db(db_path)
         try:
             conn=sqlite3.connect(db_path)
+            af_sql,af_params=_diff_archive_filter(n,archive_from,conn)
             for ct,path,sz in conn.execute(
                     "SELECT change_type,path,"
                     "CASE WHEN change_type='removed' THEN size_before ELSE size_after END "
-                    "FROM diff_index WHERE nick=? AND path LIKE ?",(n,sql_pat)):
+                    "FROM diff_index WHERE nick=? AND path LIKE ?"+af_sql,
+                    [n,sql_pat]+af_params):
                 _duidx_add(totals,key_fn(path),ct,sz)
+            snap_date=af_params[0] if (archive_from not in (None,'ALL') and af_params) else ''
             for path,sz in conn.execute(
-                    "SELECT path,size FROM archive_snapshot WHERE nick=? AND path LIKE ? "+_SNAP_NOTIN,
-                    (n,sql_pat)):
+                    "SELECT path,size FROM archive_snapshot WHERE nick=? AND path LIKE ? "+_snap_notin(snap_date),
+                    ([n,sql_pat]+([snap_date] if snap_date else []))):
                 _duidx_add(totals,key_fn(path),'présent',sz)
             conn.close()
         except sqlite3.Error as e:
             printer(f"SQLite error ({n}): {e}")
     return totals
 
-def _duidx_collect_global(nick,sql_pat):
+def _duidx_collect_global(nick,sql_pat,archive_from=None):
     """Collecte globale agrégée par type (sans groupement chemin)."""
     totals={}
     for n in nick.split(','):
@@ -1082,15 +1141,18 @@ def _duidx_collect_global(nick,sql_pat):
         ensure_diff_db(db_path)
         try:
             conn=sqlite3.connect(db_path)
+            af_sql,af_params=_diff_archive_filter(n,archive_from,conn)
             for ct,cnt,sz in conn.execute(
                     "SELECT change_type,COUNT(*),SUM(CASE WHEN change_type='removed' THEN size_before ELSE size_after END) "
-                    "FROM diff_index WHERE nick=? AND path LIKE ? GROUP BY change_type",(n,sql_pat)):
+                    "FROM diff_index WHERE nick=? AND path LIKE ? GROUP BY change_type"+af_sql,
+                    [n,sql_pat]+af_params):
                 k=('',ct)
                 if k not in totals: totals[k]=[0,0]
                 totals[k][0]+=cnt; totals[k][1]+=(sz or 0)
+            snap_date=af_params[0] if (archive_from not in (None,'ALL') and af_params) else ''
             row=conn.execute(
-                "SELECT COUNT(*),SUM(size) FROM archive_snapshot WHERE nick=? AND path LIKE ? "+_SNAP_NOTIN,
-                (n,sql_pat)).fetchone()
+                "SELECT COUNT(*),SUM(size) FROM archive_snapshot WHERE nick=? AND path LIKE ? "+_snap_notin(snap_date),
+                ([n,sql_pat]+([snap_date] if snap_date else []))).fetchone()
             if row and row[0]:
                 k=('','présent')
                 if k not in totals: totals[k]=[0,0]
@@ -1180,40 +1242,42 @@ def _duidx_print(totals,label,grouped,sort_by='chemin',reverse=False,as_json=Fal
     if label: print(f"Pattern : {label}")
     print(t)
 
-def cmd_duidx(nick,pattern=None,sort_by='chemin',reverse=False,as_json=False,debug=0):
+def cmd_duidx(nick,pattern=None,sort_by='chemin',reverse=False,as_json=False,archive_from=None,debug=0):
     if pattern is None:
-        totals=_duidx_collect_global(nick,'%')
+        totals=_duidx_collect_global(nick,'%',archive_from)
         _duidx_print(totals,None,False,sort_by,reverse,as_json)
         return
     if '/*' in pattern or pattern=='*':
         prefix=pattern.rsplit('/*',1)[0] if '/*' in pattern else ''
         depth=prefix.count('/')+1 if prefix else 0
         sql_pat=(prefix+'/%').lstrip('/') if prefix else '%'
-        totals=_duidx_collect(nick,sql_pat,lambda p:_duidx_path_key(p,depth))
+        totals=_duidx_collect(nick,sql_pat,lambda p:_duidx_path_key(p,depth),archive_from)
         _duidx_print(totals,pattern,True,sort_by,reverse,as_json)
     else:
         sql_pat=pattern.replace('*','%').replace('?','_')
         if '%' not in sql_pat and '_' not in sql_pat:
             sql_pat='%'+sql_pat+'%'
-        totals=_duidx_collect_global(nick,sql_pat)
+        totals=_duidx_collect_global(nick,sql_pat,archive_from)
         _duidx_print(totals,pattern,False,sort_by,reverse,as_json)
 
-def cmd_filehist(nick,path,debug=0):
+def cmd_filehist(nick,path,archive_from=None,debug=0):
     rows=[]
     for n in nick.split(','):
         db_path=get_diff_db(n)
         ensure_diff_db(db_path)
         try:
             conn=sqlite3.connect(db_path)
+            af_sql,af_params=_diff_archive_filter(n,archive_from,conn)
             cur=conn.execute(
                 "SELECT nick,archive_new_date,archive_old,archive_new,change_type,size_before,size_after "
-                "FROM diff_index WHERE nick=? AND path=? ORDER BY archive_new_date",
-                (n,path))
+                "FROM diff_index WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date",
+                [n,path]+af_params)
             rows.extend(cur.fetchall())
+            snap_date=af_params[0] if (archive_from not in (None,'ALL') and af_params) else ''
             cur=conn.execute(
                 "SELECT nick,archive_date,'',archive,'présent',NULL,size "
-                "FROM archive_snapshot WHERE nick=? AND path=? ORDER BY archive",
-                (n,path))
+                "FROM archive_snapshot WHERE nick=? AND path=? "+_snap_notin(snap_date),
+                ([n,path]+([snap_date] if snap_date else [])))
             rows.extend(cur.fetchall())
             conn.close()
         except sqlite3.Error as e:
@@ -1895,10 +1959,10 @@ optab={ 'stats'     :'Ccdn',      'login'     :'Ccdsnkprm',
         'prune'     :'Ccdn',      'report'    :'Ccdnbl',
         'init'      :'Ccdn',
         'key'       :'Ccdn',      'index'     :'Ccdn',
-        'search'    :'Ccdnf',     'filehist'  :'Ccdnf',
+        'search'    :'Ccdnfb',    'filehist'  :'Ccdnfb',
         'cacheinfo' :'Ccdn',      'cacheclean':'Ccdn',
         'indexsnap' :'Ccdn',
-        'duidx'     :'Ccdnfsj',}
+        'duidx'     :'Ccdnfbsj',}
 
 for opt,arg in opts:
     if   opt in '-h':
@@ -2067,11 +2131,11 @@ elif cmd == 'indexsnap':
 elif cmd == 'search':
     if '-f' not in options.keys():
         usage(cmd)
-    cmd_search(nick,options['-f'],debug=debug)
+    cmd_search(nick,options['-f'],archive_from=options.get('-b',None),debug=debug)
 elif cmd == 'filehist':
     if '-f' not in options.keys():
         usage(cmd)
-    cmd_filehist(nick,options['-f'],debug=debug)
+    cmd_filehist(nick,options['-f'],archive_from=options.get('-b',None),debug=debug)
 elif cmd == 'duidx':
     _du_sort=options.get('-s','chemin')
     _du_rev=_du_sort.endswith(':desc')
@@ -2081,7 +2145,8 @@ elif cmd == 'duidx':
     if _du_sort=='present': _du_sort='présent'
     cmd_duidx(nick,options.get('-f',None),
               sort_by=_du_sort,reverse=_du_rev,
-              as_json=('-j' in options),debug=debug)
+              as_json=('-j' in options),
+              archive_from=options.get('-b',None),debug=debug)
 else:
     printer("Mais comment on peut en arriver la ?")
     usage()

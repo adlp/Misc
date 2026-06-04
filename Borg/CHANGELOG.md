@@ -1,5 +1,27 @@
 # Changelog — borgHelper
 
+## 0.44.1 — 2026-06-04
+
+### Correctifs — Aide `-h` / `-H`
+
+- `-h` général : ajout `IndexSnap`, `DuIdx`, mention `-b` pour `Search`/`FileHist`
+- `-H indexsnap`, `-H duidx` : nouvelles entrées détaillées
+- `-H search`, `-H filehist` : mention de `-b` et du snapshot
+- `-H index` : mention de l'appel automatique à `IndexSnap`
+
+---
+
+## 0.44 — 2026-06-04
+
+### Ajout — Filtre plage d'archives pour `Search`, `FileHist`, `DuIdx`
+
+- Sans `-b` : uniquement la dernière paire d'archives (archive_new = MAX)
+- `-b <archive>` : depuis cet archive jusqu'au dernier (archive_new_date ≥ date de l'archive)
+- `-b ALL` : tout l'index, toutes les paires
+- Filtre appliqué aussi sur la clause `NOT EXISTS` du snapshot (présent)
+
+---
+
 ## 0.43.1 — 2026-06-04
 
 ### Correctifs et améliorations — `DuIdx`
