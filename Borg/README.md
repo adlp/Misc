@@ -228,8 +228,9 @@ Colonnes résumé : nom, durée, depuis (heures), taille dernière, taille total
 - `—` si l'archive n'est pas encore indexée (`borgHelper -c Index -n <nick>` pour indexer)
 
 **Mode offline** (`-o`) — rapport sans appel borg, depuis `diff.db` uniquement :
-- Colonnes : dernière archive, date, +ajouté, -supprimé, =modifié (nb · taille)
-- Pas de données de taille archive, pas de vérification de fraîcheur, pas d'info prunable
+- Colonnes : dernière archive, date, taille, nfiles, +ajouté, -supprimé, =modifié
+- `taille` et `nfiles` disponibles si `archive_stats` est peuplée (après `Bkp` ou `Index`)
+- Pas de vérification de fraîcheur (`MAX_AGE_BKP`), pas d'info prunable
 - Combinable avec `-j`, `-l`, `-N <n>`
 - Erreur explicite si `diff.db` absent ou index vide
 
@@ -510,9 +511,11 @@ Contrainte d'unicité : `UNIQUE(nom, lastmodified)`.
 
 ### `diff.db`
 
-Index des diffs inter-archives et snapshots. Deux tables de sentinelle (`diff_indexed_pairs`, `archive_snapshot_indexed`) protègent l'idempotence des indexations.
+Index des diffs inter-archives, snapshots et métadonnées d'archives. Deux tables de sentinelle (`diff_indexed_pairs`, `archive_snapshot_indexed`) protègent l'idempotence des indexations.
 
 `archive_snapshot` est une table mince qui référence `snapshot_file` par `file_id` — les chemins sont stockés une seule fois (déduplication). La vue `archive_snapshot_v` expose la jointure de façon transparente pour toutes les lectures.
+
+`archive_stats` stocke les métadonnées de taille par archive (peuplée par `Bkp` et `Index`) — utilisée par `Report -o` pour éviter tout appel borg.
 
 ```mermaid
 erDiagram
@@ -560,6 +563,17 @@ erDiagram
         TEXT indexed_at
     }
 
+    archive_stats {
+        TEXT nick PK
+        TEXT archive PK
+        TEXT archive_date
+        REAL duration
+        INTEGER original_size
+        INTEGER compressed_size
+        INTEGER deduplicated_size
+        INTEGER nfiles
+    }
+
     snapshot_file ||--o{ archive_snapshot : "file_id → id"
 ```
 
@@ -576,6 +590,7 @@ erDiagram
 | `diff_indexed_pairs` | `idx_pairs_nick` | `(nick)` | suppressions Prune |
 | `snapshot_file` | `idx_snapfile_nick_path` | `(nick, path)` | insertion / lookup |
 | `archive_snapshot` | `idx_snap_nick_archive` | `(nick, archive)` | suppressions Prune |
+| `archive_stats` | `idx_astats_nick` | `(nick)` | Report -o, suppressions Prune |
 
 ---
 
