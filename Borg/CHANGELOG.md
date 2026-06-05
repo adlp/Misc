@@ -1,5 +1,15 @@
 # Changelog — borgHelper
 
+## 0.59 — 2026-06-05
+
+### Changement — `Index -S` remplace la commande `IndexSnap`
+
+- Nouvelle option `-S` sur `Index` : exécute uniquement le snapshot (équivalent à l'ancienne commande `IndexSnap`)
+- `-S -F` : force le recalcul du snapshot seul
+- `IndexSnap` retiré du dispatch CLI (la fonction interne `cmd_indexsnap` reste utilisée par `Index` et `Bkp`)
+
+---
+
 ## 0.58 — 2026-06-05
 
 ### Ajout — `Bkp` : stdout JSON enrichi si exit 0

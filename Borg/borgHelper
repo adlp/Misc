@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.58"
+Version="0.59"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.58"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.59 Index -S : snapshot seul (remplace commande IndexSnap) ; IndexSnap retiré du CLI
 # 0.58 Bkp : stdout JSON enrichi (borgHelper_messages, borgHelper_file_counts) si exit 0
 # 0.57 Report : ne réindexe plus automatiquement les paires manquantes (affiche — si absent)
 # 0.56 DB : déduplication snapshot_file, WAL, indexes couvrants, migration auto
@@ -2567,7 +2568,7 @@ if sentryid != None:
 ######### Analyse Arguments
 
 try:
-    opts, args = getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:dvjlILCF", ["help"])
+    opts, args = getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:dvjlILCFS", ["help"])
 except getopt.GetoptError as err:
     print(err)  # will print something like "option -a not recognized"
     usage()
@@ -2583,10 +2584,9 @@ optab={ 'stats'     :'Ccdn',      'login'     :'Ccdsnkprm',
         'delbkp'    :'Ccdnb',     'bkp'       :'CcdnI',
         'prune'     :'Ccdn',      'report'    :'Ccdnblj',
         'init'      :'Ccdn',
-        'key'       :'Ccdn',      'index'     :'CcdnF',
+        'key'       :'Ccdn',      'index'     :'CcdnFS',
         'search'    :'CcdnfbB',   'filehist'  :'CcdnfbB',
         'cacheinfo' :'Ccdn',      'cacheclean':'Ccdn',
-        'indexsnap' :'CcdnF',
         'duidx'     :'CcdnfbBsj',}
 
 for opt,arg in opts:
@@ -2756,12 +2756,12 @@ elif cmd == 'cacheclean':
     cmd_cache_clean(nick,debug=debug)
 elif cmd == 'index':
     _force='-F' in options
+    _snaponly='-S' in options
     for n in nick.split(','):
-        cmd_index(n,debug=debug,force=_force)
-elif cmd == 'indexsnap':
-    _force='-F' in options
-    for n in nick.split(','):
-        cmd_indexsnap(n,debug=debug,force=_force)
+        if _snaponly:
+            cmd_indexsnap(n,debug=debug,force=_force)
+        else:
+            cmd_index(n,debug=debug,force=_force)
 elif cmd == 'search':
     if '-f' not in options.keys():
         usage(cmd)

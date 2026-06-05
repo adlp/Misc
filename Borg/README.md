@@ -368,33 +368,25 @@ borgHelper -c Init -n mon-serveur
 
 ### `Index`
 Indexe les diffs entre archives consécutives dans `~/.borghelper-diff.db`.  
-Incrémental : paires déjà traitées ignorées. Appelle automatiquement `IndexSnap` à la fin.  
+Incrémental : paires déjà traitées ignorées. Met à jour le snapshot de la dernière archive à la fin.  
 À relancer après chaque `Bkp`.
 
 ```bash
-borgHelper -c Index -n mon-serveur
+borgHelper -c Index -n mon-serveur           # diffs + snapshot
 borgHelper -c Index -n ALL
-borgHelper -c Index -n mon-serveur -F   # force la réindexation même si déjà présent
+borgHelper -c Index -n mon-serveur -F        # force la réindexation complète (diffs + snapshot)
+borgHelper -c Index -n mon-serveur -S        # snapshot seul (sans recalculer les diffs)
+borgHelper -c Index -n mon-serveur -S -F     # force le snapshot seul
 ```
 
-`-F` : supprime et recalcule toutes les paires existantes (utile si des stats sont manquantes ou incohérentes).
+| Option | Description |
+|--------|-------------|
+| `-F` | Supprime et recalcule toutes les paires existantes (utile si stats manquantes ou incohérentes) |
+| `-S` | Snapshot seul — indexe uniquement le listing de la dernière archive, sans toucher aux diffs |
 
 Types d'événements stockés : `added`, `removed`, `modified`, `C` (permissions/proprio), `B` (lien cassé), `T` (type changé).
 
----
-
-### `IndexSnap`
-Indexe le listing complet de la dernière archive dans `~/.borghelper-diff.db`.  
-Permet à `Search` et `FileHist` de trouver les fichiers stables (jamais modifiés, donc absents du diff index).  
-Appelé automatiquement par `Index` — à lancer manuellement si les archives ont changé sans relancer `Index`.
-
-```bash
-borgHelper -c IndexSnap -n mon-serveur
-borgHelper -c IndexSnap -n ALL
-borgHelper -c IndexSnap -n mon-serveur -F   # force la réindexation du snapshot
-```
-
-`-F` : supprime le snapshot existant et le recalcule depuis borg.
+Le snapshot (`-S`) permet à `Search` et `FileHist` de trouver les fichiers stables (jamais modifiés, donc absents du diff index). Appelé automatiquement en fin d'`Index` normal — utiliser `-S` uniquement si les archives ont changé sans relancer `Index`.
 
 ---
 
