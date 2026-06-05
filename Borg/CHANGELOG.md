@@ -1,5 +1,15 @@
 # Changelog — borgHelper
 
+## 0.57 — 2026-06-05
+
+### Changement — `Report` : suppression de la réindexation automatique
+
+- Le bloc auto-repair de `prep_report` (réindexation à la volée des paires manquantes) est supprimé
+- Si une paire n'est pas indexée, les stats affichent `—` sans déclencher `borg diff`
+- Pour indexer, utiliser explicitement `borgHelper -c Index -n <nick>`
+
+---
+
 ## 0.56 — 2026-06-05
 
 ### Refactor — DB : déduplication de contenu, WAL, indexes couvrants
