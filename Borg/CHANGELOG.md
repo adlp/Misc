@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## 0.64 — 2026-06-05
+
+### Ajout — `archive_stats` dans `diff.db` : tailles d'archives persistées localement
+
+- Nouvelle table `archive_stats(nick, archive, archive_date, duration, original_size, compressed_size, deduplicated_size, nfiles)`
+- Peuplée par `Bkp` : stats issues de `borg create --json` (archive juste créée)
+- Peuplée par `Index` : appel `borg info --json --glob-archives` en fin d'indexation (toutes les archives)
+- Nettoyée par `Prune` : `_cleanup_index_after_prune` supprime les archives prunées
+- `Report -o` : colonnes `taille` et `nfiles` disponibles sans appel borg si `archive_stats` est peuplée
+
+---
+
 ## 0.63 — 2026-06-05
 
 ### Ajout — `Report -o` : mode offline stats-only depuis diff.db

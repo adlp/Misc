@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.63"
+Version="0.64"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.63"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.64 archive_stats dans diff.db : peuplé par Bkp + Index, utilisé par Report -o
 # 0.63 Report -o : mode offline stats-only depuis diff.db (aucun appel borg)
 # 0.62 Bkp : borgHelper_messages retiré du stdout (stderr reste stderr)
 # 0.61 Report : -N <n> surcharge DISPLAY_BKP (-b retiré de Report, sémantique archive)
@@ -1014,6 +1015,18 @@ def ensure_diff_db(db_path):
             indexed_at  TEXT DEFAULT (datetime('now')),
             UNIQUE(nick, archive)
         );
+        CREATE TABLE IF NOT EXISTS archive_stats (
+            nick               TEXT NOT NULL,
+            archive            TEXT NOT NULL,
+            archive_date       TEXT,
+            duration           REAL,
+            original_size      INTEGER,
+            compressed_size    INTEGER,
+            deduplicated_size  INTEGER,
+            nfiles             INTEGER,
+            PRIMARY KEY (nick, archive)
+        );
+        CREATE INDEX IF NOT EXISTS idx_astats_nick ON archive_stats(nick);
     """)
     cols=[r[1] for r in conn.execute("PRAGMA table_info(archive_snapshot)").fetchall()]
     if 'path' in cols:
@@ -1073,6 +1086,23 @@ def store_diff_entries(nick,archive_old,archive_new,archive_new_date,entries,db_
         return True
     except sqlite3.Error as e:
         printer(f"SQLite error: {e}")
+        return False
+
+def store_archive_stats(nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles,db_path=None):
+    if db_path is None:
+        db_path=get_diff_db(nick)
+    try:
+        conn=sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT OR REPLACE INTO archive_stats "
+            "(nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.Error as e:
+        printer(f"SQLite error (archive_stats): {e}")
         return False
 
 def is_archive_snapshot_indexed(nick,archive,db_path=None):
@@ -1191,6 +1221,19 @@ def cmd_index(nick,debug=0,db_path=None,force=False):
         store_diff_entries(nick,a_old,a_new,date_new,entries,db_path)
         new_pairs+=1
     print(f"{nick}: {new_pairs} paires indexées (+{skipped} déjà en cache)")
+    # Peuplement archive_stats depuis borg info --json
+    rbi=boex(nick,['info','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+    try:
+        _boex_check_stdout(rbi,nick,'borg info')
+        for a in rbi['stdout'][0]['archives']:
+            st=a.get('stats',{})
+            store_archive_stats(nick,a['name'],a.get('start'),
+                a.get('duration'),
+                st.get('original_size'),st.get('compressed_size'),
+                st.get('deduplicated_size'),st.get('nfiles'),
+                db_path)
+    except (RuntimeError,KeyError,TypeError):
+        pass
     cmd_indexsnap(nick,debug=debug,db_path=db_path,force=force)
     return 0
 
@@ -1800,22 +1843,39 @@ def cmd_report_offline(nicks,htrep=False,debug=0,maxp=None,as_json=False):
         archives=rows
         if maxp is not None:
             archives=archives[-maxp:]
+        # Charger archive_stats depuis diff.db
+        try:
+            conn=sqlite3.connect(db_path)
+            astats={r[0]:{'duration':r[1],'original_size':r[2],'compressed_size':r[3],
+                          'deduplicated_size':r[4],'nfiles':r[5]}
+                    for r in conn.execute(
+                        "SELECT archive,duration,original_size,compressed_size,"
+                        "deduplicated_size,nfiles FROM archive_stats WHERE nick=?",(nick,)).fetchall()}
+            conn.close()
+        except sqlite3.Error:
+            astats={}
         detail[nick]={}
         for arch,arch_date in archives:
             s=diff_stats.get(arch,{})
+            a=astats.get(arch,{})
             detail[nick][arch]={
                 'archive':arch,
                 'date':(arch_date or '')[:19],
+                'taille':convert_octets_readable(a.get('original_size')) if a.get('original_size') else '—',
+                'nfiles':str(a.get('nfiles','—')),
                 '+ajouté' :_fmt(s.get('added',0),   s.get('added_sz',0)),
                 '-supprimé':_fmt(s.get('removed',0), s.get('removed_sz',0)),
                 '=modifié' :_fmt(s.get('modified',0),s.get('modified_sz',0)),
             }
         last_arch,last_date=archives[-1] if archives else (None,None)
         s=diff_stats.get(last_arch,{}) if last_arch else {}
+        a=astats.get(last_arch,{}) if last_arch else {}
         summary[nick]={
             'nick':nick,
             'dernière archive':last_arch or '—',
             'date':(last_date or '')[:19],
+            'taille':convert_octets_readable(a.get('original_size')) if a.get('original_size') else '—',
+            'nfiles':str(a.get('nfiles','—')),
             '+ajouté' :_fmt(s.get('added',0),   s.get('added_sz',0)),
             '-supprimé':_fmt(s.get('removed',0), s.get('removed_sz',0)),
             '=modifié' :_fmt(s.get('modified',0),s.get('modified_sz',0)),
@@ -1825,8 +1885,8 @@ def cmd_report_offline(nicks,htrep=False,debug=0,maxp=None,as_json=False):
         return 0
     if not summary:
         return 0
-    sum_cols=['nick','dernière archive','date','+ajouté','-supprimé','=modifié']
-    det_cols=['archive','date','+ajouté','-supprimé','=modifié']
+    sum_cols=['nick','dernière archive','date','taille','nfiles','+ajouté','-supprimé','=modifié']
+    det_cols=['archive','date','taille','nfiles','+ajouté','-supprimé','=modifié']
     if htrep:
         print("<!DOCTYPE html><html><body bgcolor='#ffffff'><br>")
         print(htmlTabelise(summary,colnames=sum_cols))
@@ -2316,11 +2376,13 @@ def _cleanup_index_after_prune(nick,debug=0):
             r2=conn.execute(f"DELETE FROM diff_indexed_pairs WHERE nick=? AND (archive_old NOT IN ({ph}) OR archive_new NOT IN ({ph}))",[nick]+lst+lst).rowcount
             r3=conn.execute(f"DELETE FROM archive_snapshot WHERE nick=? AND archive NOT IN ({ph})",[nick]+lst).rowcount
             r4=conn.execute(f"DELETE FROM archive_snapshot_indexed WHERE nick=? AND archive NOT IN ({ph})",[nick]+lst).rowcount
+            conn.execute(f"DELETE FROM archive_stats WHERE nick=? AND archive NOT IN ({ph})",[nick]+lst)
         else:
             r1=conn.execute("DELETE FROM diff_index WHERE nick=?",(nick,)).rowcount
             r2=conn.execute("DELETE FROM diff_indexed_pairs WHERE nick=?",(nick,)).rowcount
             r3=conn.execute("DELETE FROM archive_snapshot WHERE nick=?",(nick,)).rowcount
             r4=conn.execute("DELETE FROM archive_snapshot_indexed WHERE nick=?",(nick,)).rowcount
+            conn.execute("DELETE FROM archive_stats WHERE nick=?",(nick,))
         _cleanup_snapshot_file_orphans(nick,conn)
         conn.commit()
         conn.close()
@@ -2506,21 +2568,30 @@ def cmd_bkp(nick,no_index=False,debug=0):
             elif isinstance(i,str) and i.strip():
                 print(i,file=sys.stderr,flush=True)
 
-    # Indexation depuis la sortie --list
-    if newretC==0 and not no_index and anaRet['stdout']:
+    # Indexation + archive_stats depuis la sortie --list / --json
+    if newretC==0 and anaRet['stdout']:
         try:
             arch_info=anaRet['stdout'][0].get('archive',{})
             archive_new=arch_info.get('name')
             archive_new_date=arch_info.get('start')
-            if archive_new and archive_old:
+            db_path=get_diff_db(nick)
+            ensure_diff_db(db_path)
+            # Stockage des stats de taille de la nouvelle archive
+            if archive_new:
+                st=arch_info.get('stats',{})
+                store_archive_stats(nick,archive_new,archive_new_date,
+                    arch_info.get('duration'),
+                    st.get('original_size'),st.get('compressed_size'),
+                    st.get('deduplicated_size'),st.get('nfiles'),
+                    db_path)
+            if not no_index and archive_new and archive_old:
                 entries=[e for e in _bkp_parse_list(anaRet['stderr'])
                          if _idx_path_ok(e['path'],cfg)]
-                db_path=get_diff_db(nick)
-                ensure_diff_db(db_path)
                 store_diff_entries(nick,archive_old,archive_new,archive_new_date,entries,db_path)
                 print(f"Index : {len(entries)} entrée(s) stockée(s) ({archive_old} → {archive_new})",
                       file=sys.stderr,flush=True)
-            cmd_indexsnap(nick,debug=debug)
+            if not no_index:
+                cmd_indexsnap(nick,debug=debug)
         except Exception as e:
             printer(f"[WARN] indexation post-backup échouée : {e}")
 
