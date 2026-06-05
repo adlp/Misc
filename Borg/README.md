@@ -198,7 +198,7 @@ borgHelper -c Prune -n ALL
 ```
 
 Requiert au moins une clef `KEEP_*` dans la conf.  
-Enchaîne automatiquement `borg compact` puis invalide le cache.
+Enchaîne automatiquement `borg compact`, invalide le cache SQLite, et purge les entrées orphelines du `diff.db` (archives supprimées retirées de `diff_index`, `diff_indexed_pairs`, `snapshot_file` et `archive_snapshot`).
 
 ---
 
@@ -210,6 +210,7 @@ borgHelper -c Report -n mon-serveur
 borgHelper -c Report -n ALL
 borgHelper -c Report -n ALL -l              # sortie HTML
 borgHelper -c Report -n mon-serveur -b 5   # afficher 5 dernières archives
+borgHelper -c Report -n ALL -j             # sortie JSON
 ```
 
 Code retour 1 si un dépôt dépasse `MAX_AGE_BKP` heures depuis la dernière sauvegarde.  
@@ -225,7 +226,27 @@ Colonnes résumé : nom, durée, depuis (heures), taille dernière, taille total
 - **Tableau résumé** (1 ligne par serveur) : colonnes `+ajouté`, `-supprimé`, `=présent` du **dernier backup**
 - **Tableau détail** (1 ligne par archive) : mêmes colonnes pour chaque backup listé
 - Format : `N (P%) · SIZE` — nombre de fichiers, pourcentage relatif au backup précédent, et taille disque
-- `—` si l'archive n'est pas encore indexée (`borgHelper -c Index -n <nick>` pour initialiser)
+- `—` si l'archive n'est pas encore indexée (`borgHelper -c Index -n <nick>` pour indexer)
+
+**Sortie JSON** (`-j`) — structure :
+
+```json
+{
+  "summary": {
+    "mon-serveur": {
+      "last_backup": "2026-06-05T02:00:04",
+      "hours_since": 4.2,
+      "total_size": 9871234560,
+      "added": 12, "removed": 1, "modified": 3
+    }
+  },
+  "backups": {
+    "mon-serveur": [
+      { "name": "mon-serveur-root-2026-06-05T02:00:04", "start": "...", "... ": "..." }
+    ]
+  }
+}
+```
 
 ---
 
@@ -353,7 +374,10 @@ Incrémental : paires déjà traitées ignorées. Appelle automatiquement `Index
 ```bash
 borgHelper -c Index -n mon-serveur
 borgHelper -c Index -n ALL
+borgHelper -c Index -n mon-serveur -F   # force la réindexation même si déjà présent
 ```
+
+`-F` : supprime et recalcule toutes les paires existantes (utile si des stats sont manquantes ou incohérentes).
 
 Types d'événements stockés : `added`, `removed`, `modified`, `C` (permissions/proprio), `B` (lien cassé), `T` (type changé).
 
@@ -367,7 +391,10 @@ Appelé automatiquement par `Index` — à lancer manuellement si les archives o
 ```bash
 borgHelper -c IndexSnap -n mon-serveur
 borgHelper -c IndexSnap -n ALL
+borgHelper -c IndexSnap -n mon-serveur -F   # force la réindexation du snapshot
 ```
+
+`-F` : supprime le snapshot existant et le recalcule depuis borg.
 
 ---
 
