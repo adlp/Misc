@@ -1,5 +1,14 @@
 # Changelog — borgHelper
 
+## 0.67 — 2026-06-06
+
+### Fix — CLI : arguments positionnels non reconnus rejetés
+
+- `borgHelper -c bkp toto` : `toto` était silencieusement ignoré, le backup tournait avec `nick = hostname`
+- Désormais : erreur explicite `"Argument(s) non reconnu(s) : toto"` + rappel d'utiliser `-n <nick>`
+
+---
+
 ## 0.66 — 2026-06-05
 
 ### Performance — `Index` : `borg diff` parallèle + insert groupé
