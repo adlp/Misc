@@ -160,10 +160,6 @@ Code retour 0 si succès ou warnings, 2 si erreur borg.
     "stats": { "nfiles": 183241, "original_size": 9871234560, "... ": "..." }
   },
   "cache": { "...": "..." },
-  "borgHelper_messages": [
-    "[INFO] Starting repository check",
-    "[WARNING] /proc: [Errno 13] Permission denied"
-  ],
   "borgHelper_file_counts": {
     "added": 12,
     "modified": 3,

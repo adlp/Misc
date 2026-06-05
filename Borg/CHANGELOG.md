@@ -1,5 +1,14 @@
 # Changelog — borgHelper
 
+## 0.62 — 2026-06-05
+
+### Correction — `Bkp` : `borgHelper_messages` retiré du stdout
+
+- La sortie stderr (messages `[INFO]`/`[WARNING]`) reste dans stderr — elle n'est plus copiée dans stdout
+- `borgHelper_file_counts` et `borgHelper_files` (debug) restent dans le JSON stdout si exit 0
+
+---
+
 ## 0.61 — 2026-06-05
 
 ### Changement — `Report` : `-N <n>` remplace `-b <n>` pour surcharger `DISPLAY_BKP`

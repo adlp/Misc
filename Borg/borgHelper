@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.61"
+Version="0.62"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.61"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.62 Bkp : borgHelper_messages retiré du stdout (stderr reste stderr)
 # 0.61 Report : -N <n> surcharge DISPLAY_BKP (-b retiré de Report, sémantique archive)
 # 0.60 Report : -b surcharge DISPLAY_BKP (filtrer_lignes utilisait toujours la conf)
 # 0.59 Index -S : snapshot seul (remplace commande IndexSnap) ; IndexSnap retiré du CLI
@@ -2403,15 +2404,6 @@ def cmd_bkp(nick,no_index=False,debug=0):
     if 'stdout' in anaRet.keys() and len(anaRet['stdout']):
         out=dict(anaRet['stdout'][0])
         if newretC==0:
-            msgs=[]
-            for i in anaRet.get('stderr',[]):
-                if _bkp_is_list_entry(i):
-                    continue
-                if isinstance(i,dict):
-                    msgs.append(f"[{i.get('levelname','INFO')}] {i.get('message',str(i))}")
-                elif isinstance(i,str) and i.strip():
-                    msgs.append(i.strip())
-            out['borgHelper_messages']=msgs
             all_entries=_bkp_parse_list(anaRet.get('stderr',[]))
             counts={}
             for e in all_entries:
