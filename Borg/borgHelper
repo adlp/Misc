@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.65"
+Version="0.66"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.65"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.66 Index : borg diff parallèle (IDX_WORKERS, défaut 4) + insert groupé + purge groupée
 # 0.65 Index : borg info pour archive_stats seulement si archives manquantes (pas systématique)
 # 0.64 archive_stats dans diff.db : peuplé par Bkp + Index, utilisé par Report -o
 # 0.63 Report -o : mode offline stats-only depuis diff.db (aucun appel borg)
@@ -1194,33 +1195,72 @@ def cmd_index(nick,debug=0,db_path=None,force=False):
     if len(archives)<2:
         printer(f"{nick}: moins de 2 archives, rien à indexer")
         return 0
-    new_pairs=0
+
+    # Phase 1 : déterminer les paires à indexer + purge groupée si force
+    pairs_todo=[]
     skipped=0
+    pairs_to_purge=[]
     for i in range(len(archives)-1):
         a_old=archives[i]['name']
         a_new=archives[i+1]['name']
         date_new=archives[i+1]['start']
-        if not force and is_diff_pair_indexed(nick,a_old,a_new,db_path):
+        already=is_diff_pair_indexed(nick,a_old,a_new,db_path)
+        if already and not force:
             skipped+=1
             continue
-        if force and is_diff_pair_indexed(nick,a_old,a_new,db_path):
-            try:
-                conn=sqlite3.connect(db_path)
+        if already and force:
+            pairs_to_purge.append((a_old,a_new))
+        pairs_todo.append((a_old,a_new,date_new))
+    if pairs_to_purge:
+        try:
+            conn=sqlite3.connect(db_path)
+            for a_old,a_new in pairs_to_purge:
                 conn.execute("DELETE FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
                 conn.execute("DELETE FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
-                conn.commit()
-                conn.close()
-            except sqlite3.Error as e:
-                printer(f"SQLite error (purge): {e}")
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as e:
+            printer(f"SQLite error (purge): {e}")
+
+    # Phase 2 : borg diff en parallèle
+    workers=max(1,int(cfg.get('IDX_WORKERS','4')))
+    from concurrent.futures import ThreadPoolExecutor,as_completed
+    def _run_diff(pair):
+        a_old,a_new,date_new=pair
         print(f"  {nick}: {a_old} → {a_new}",flush=True)
         rb2=boex(nick,['diff',f"{cfg['BORG_REPO']}::{a_old}",a_new],debug=debug,retjson=False)
-        entries=[]
-        for line in rb2['stdout']:
-            p=parse_diff_line(line)
-            if p and p['path'] and _idx_path_ok(p['path'],cfg):
-                entries.append(p)
-        store_diff_entries(nick,a_old,a_new,date_new,entries,db_path)
-        new_pairs+=1
+        entries=[p for line in rb2['stdout']
+                 for p in [parse_diff_line(line)]
+                 if p and p['path'] and _idx_path_ok(p['path'],cfg)]
+        return (a_old,a_new,date_new,entries)
+    results=[]
+    if pairs_todo:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs={ex.submit(_run_diff,p):p for p in pairs_todo}
+            for fut in as_completed(futs):
+                try:
+                    results.append(fut.result())
+                except Exception as e:
+                    printer(f"[WARN] borg diff échoué : {e}")
+
+    # Phase 3 : insert groupé (connexion unique)
+    if results:
+        try:
+            conn=sqlite3.connect(db_path)
+            for a_old,a_new,date_new,entries in results:
+                if entries:
+                    conn.executemany(
+                        "INSERT INTO diff_index (nick,archive_old,archive_new,archive_new_date,change_type,path,size_before,size_after) VALUES (?,?,?,?,?,?,?,?)",
+                        [(nick,a_old,a_new,date_new,e['change_type'],e['path'],e.get('size_before'),e.get('size_after'))
+                         for e in entries])
+                conn.execute(
+                    "INSERT OR IGNORE INTO diff_indexed_pairs (nick,archive_old,archive_new,entry_count) VALUES (?,?,?,?)",
+                    (nick,a_old,a_new,len(entries)))
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as e:
+            printer(f"SQLite error (insert): {e}")
+    new_pairs=len(results)
     print(f"{nick}: {new_pairs} paires indexées (+{skipped} déjà en cache)")
     # Peuplement archive_stats : seulement si des archives manquent
     archive_names=set(a['name'] for a in archives)

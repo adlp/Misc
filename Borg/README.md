@@ -69,6 +69,9 @@ NOIDX                    = 1
 IDX_INCLUDE              = /etc /home /root   # liste blanche — seuls ces chemins indexés
 IDX_EXCLUDE              = /proc /sys /tmp /var/log  # liste noire — ces chemins ignorés
 
+# Parallélisation de l'indexation (nombre de borg diff simultanés, défaut 4)
+IDX_WORKERS              = 4
+
 # Clef explicite (keyfile mode, utile si plusieurs nicks partagent le même dépôt)
 BORG_KEY_FILE            = /root/.config/borg/keys/abcdef123456
 

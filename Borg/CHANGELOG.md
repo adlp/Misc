@@ -1,5 +1,21 @@
 # Changelog — borgHelper
 
+## 0.66 — 2026-06-05
+
+### Performance — `Index` : `borg diff` parallèle + insert groupé
+
+- **Phase 1** : détermination des paires à indexer + purge groupée en une seule transaction SQLite (si `-F`)
+- **Phase 2** : appels `borg diff` en parallèle via `ThreadPoolExecutor` — `borg diff` est read-only (lock partagé)
+- **Phase 3** : insert groupé en une seule connexion SQLite avec commit unique
+- `IDX_WORKERS` dans borghelperrc : nombre de workers parallèles (défaut : 4)
+
+```ini
+IDX_WORKERS = 8   # pour dépôts distants rapides
+IDX_WORKERS = 1   # pour forcer le séquentiel
+```
+
+---
+
 ## 0.65 — 2026-06-05
 
 ### Fix — `Index` : `borg info` pour `archive_stats` uniquement si archives manquantes
