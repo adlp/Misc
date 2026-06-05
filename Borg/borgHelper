@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.55"
+Version="0.56"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.55"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.56 DB : déduplication snapshot_file, WAL, indexes couvrants, migration auto
 # 0.55 Bkp : exit 0 si stderr contient uniquement INFO/WARNING (pas d'ERROR/CRITICAL)
 # 0.54 Prune : nettoyage automatique du diff.db (entrées des archives supprimées)
 # 0.53.1 fix getDataFromEnvOrFile : supprime print "📄 Fichier trouvé"
@@ -688,6 +689,7 @@ def insert_in_db(db_path, table_name, nom, lastmodified, details):
 
 def ensure_cache_db(db_path):
     conn=sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS cachejsonboexlm (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -937,8 +939,31 @@ def cacheJsonBoexWithLM2(nick,boexarg,prefix="/tmp/borgHelper-",suffix=".json",o
         return(ret)
     
 
+def _migrate_archive_snapshot(conn):
+    """Migration v1→v2 : archive_snapshot plat → snapshot_file (dédup) + archive_snapshot mince."""
+    print("  Migration snapshot → schéma déduplication...", file=sys.stderr, flush=True)
+    conn.executescript("""
+        INSERT OR IGNORE INTO snapshot_file (nick, path, size, mtime)
+            SELECT nick, path, size, mtime FROM archive_snapshot;
+        CREATE TABLE archive_snapshot_new (
+            nick         TEXT NOT NULL,
+            archive      TEXT NOT NULL,
+            archive_date TEXT,
+            file_id      INTEGER NOT NULL,
+            PRIMARY KEY (nick, archive, file_id)
+        );
+        INSERT INTO archive_snapshot_new (nick, archive, archive_date, file_id)
+            SELECT a.nick, a.archive, a.archive_date, sf.id
+            FROM archive_snapshot a
+            JOIN snapshot_file sf ON sf.nick=a.nick AND sf.path=a.path;
+        DROP TABLE archive_snapshot;
+        ALTER TABLE archive_snapshot_new RENAME TO archive_snapshot;
+        CREATE INDEX IF NOT EXISTS idx_snap_nick_archive ON archive_snapshot(nick, archive);
+    """)
+
 def ensure_diff_db(db_path):
     conn=sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS diff_index (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -954,6 +979,8 @@ def ensure_diff_db(db_path):
         );
         CREATE INDEX IF NOT EXISTS idx_diff_nick_path    ON diff_index(nick, path);
         CREATE INDEX IF NOT EXISTS idx_diff_nick_archive ON diff_index(nick, archive_new);
+        CREATE INDEX IF NOT EXISTS idx_diff_nick_newtype ON diff_index(nick, archive_new, change_type);
+        CREATE INDEX IF NOT EXISTS idx_diff_nick_date    ON diff_index(nick, archive_new_date);
         CREATE TABLE IF NOT EXISTS diff_indexed_pairs (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             nick        TEXT NOT NULL,
@@ -963,24 +990,44 @@ def ensure_diff_db(db_path):
             indexed_at  TEXT DEFAULT (datetime('now')),
             UNIQUE(nick, archive_old, archive_new)
         );
-        CREATE TABLE IF NOT EXISTS archive_snapshot (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            nick         TEXT NOT NULL,
-            archive      TEXT NOT NULL,
-            archive_date TEXT,
-            path         TEXT NOT NULL,
-            size         INTEGER,
-            mtime        TEXT,
-            UNIQUE(nick, archive, path)
+        CREATE INDEX IF NOT EXISTS idx_pairs_nick ON diff_indexed_pairs(nick);
+        CREATE TABLE IF NOT EXISTS snapshot_file (
+            id    INTEGER PRIMARY KEY AUTOINCREMENT,
+            nick  TEXT NOT NULL,
+            path  TEXT NOT NULL,
+            size  INTEGER,
+            mtime TEXT,
+            UNIQUE(nick, path)
         );
-        CREATE INDEX IF NOT EXISTS idx_snap_nick_path ON archive_snapshot(nick, path);
+        CREATE INDEX IF NOT EXISTS idx_snapfile_nick_path ON snapshot_file(nick, path);
         CREATE TABLE IF NOT EXISTS archive_snapshot_indexed (
-            nick         TEXT NOT NULL,
-            archive      TEXT NOT NULL,
-            entry_count  INTEGER DEFAULT 0,
-            indexed_at   TEXT DEFAULT (datetime('now')),
+            nick        TEXT NOT NULL,
+            archive     TEXT NOT NULL,
+            entry_count INTEGER DEFAULT 0,
+            indexed_at  TEXT DEFAULT (datetime('now')),
             UNIQUE(nick, archive)
         );
+    """)
+    cols=[r[1] for r in conn.execute("PRAGMA table_info(archive_snapshot)").fetchall()]
+    if 'path' in cols:
+        _migrate_archive_snapshot(conn)
+    else:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS archive_snapshot (
+                nick         TEXT NOT NULL,
+                archive      TEXT NOT NULL,
+                archive_date TEXT,
+                file_id      INTEGER NOT NULL,
+                PRIMARY KEY (nick, archive, file_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_snap_nick_archive ON archive_snapshot(nick, archive);
+        """)
+    conn.executescript("""
+        DROP VIEW IF EXISTS archive_snapshot_v;
+        CREATE VIEW archive_snapshot_v AS
+            SELECT s.nick, s.archive, s.archive_date, sf.path, sf.size, sf.mtime
+            FROM archive_snapshot s
+            JOIN snapshot_file sf ON sf.id=s.file_id;
     """)
     conn.commit()
     conn.close()
@@ -1041,8 +1088,12 @@ def store_archive_snapshot(nick,archive,archive_date,files,db_path=None):
         conn=sqlite3.connect(db_path)
         if files:
             conn.executemany(
-                "INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,path,size,mtime) VALUES (?,?,?,?,?,?)",
-                [(nick,archive,archive_date,f['path'],f.get('size'),f.get('mtime')) for f in files])
+                "INSERT OR REPLACE INTO snapshot_file (nick,path,size,mtime) VALUES (?,?,?,?)",
+                [(nick,f['path'],f.get('size'),f.get('mtime')) for f in files])
+            conn.executemany(
+                "INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,file_id) "
+                "SELECT ?,?,?,id FROM snapshot_file WHERE nick=? AND path=?",
+                [(nick,archive,archive_date,nick,f['path']) for f in files])
         conn.execute(
             "INSERT OR IGNORE INTO archive_snapshot_indexed (nick,archive,entry_count) VALUES (?,?,?)",
             (nick,archive,len(files)))
@@ -1165,6 +1216,7 @@ def cmd_indexsnap(nick,debug=0,db_path=None,force=False):
             conn=sqlite3.connect(db_path)
             conn.execute("DELETE FROM archive_snapshot WHERE nick=? AND archive=?",(nick,archive_name))
             conn.execute("DELETE FROM archive_snapshot_indexed WHERE nick=? AND archive=?",(nick,archive_name))
+            _cleanup_snapshot_file_orphans(nick,conn)
             conn.commit()
             conn.close()
         except sqlite3.Error as e:
@@ -1221,7 +1273,7 @@ def cmd_search(nick,pattern,archive_from=None,archive_to=None,debug=0):
             snap_extra=[x for x in [df,dt] if x]
             cur=conn.execute(
                 "SELECT nick,archive_date,archive,'présent',path,NULL,size "
-                "FROM archive_snapshot WHERE nick=? AND path LIKE ? "+_snap_notin(df,dt)+
+                "FROM archive_snapshot_v WHERE nick=? AND path LIKE ? "+_snap_notin(df,dt)+
                 " ORDER BY archive,path",
                 [n,sql_pat]+snap_extra)
             rows.extend(cur.fetchall())
@@ -1242,7 +1294,7 @@ def cmd_search(nick,pattern,archive_from=None,archive_to=None,debug=0):
     print(t)
 
 _DUIDX_TYPE_ORDER=['added','modified','removed','C','B','T','présent']
-_SNAP_NOTIN="AND NOT EXISTS(SELECT 1 FROM diff_index d WHERE d.nick=archive_snapshot.nick AND d.path=archive_snapshot.path{extra})"
+_SNAP_NOTIN="AND NOT EXISTS(SELECT 1 FROM diff_index d WHERE d.nick=archive_snapshot_v.nick AND d.path=archive_snapshot_v.path{extra})"
 
 def _diff_archive_filter(nick,archive_from,conn,archive_to=None):
     """Retourne (sql_extra, params) pour filtrer diff_index par plage d'archives.
@@ -1283,7 +1335,7 @@ def _snap_notin(date_from='',date_to=''):
     if date_from: conds.append('d.archive_new_date>=?')
     if date_to:   conds.append('d.archive_new_date<=?')
     extra=(' AND '+' AND '.join(conds)) if conds else ''
-    return f"AND NOT EXISTS(SELECT 1 FROM diff_index d WHERE d.nick=archive_snapshot.nick AND d.path=archive_snapshot.path{extra})"
+    return f"AND NOT EXISTS(SELECT 1 FROM diff_index d WHERE d.nick=archive_snapshot_v.nick AND d.path=archive_snapshot_v.path{extra})"
 
 def _duidx_path_key(path,depth):
     parts=path.split('/')
@@ -1325,7 +1377,7 @@ def _duidx_collect(nick,sql_pat,key_fn,archive_from=None,archive_to=None):
             df,dt=_snap_params(af_params,archive_from,archive_to)
             snap_extra=[x for x in [df,dt] if x]
             for path,sz in conn.execute(
-                    "SELECT path,size FROM archive_snapshot WHERE nick=? AND path LIKE ? "+_snap_notin(df,dt),
+                    "SELECT path,size FROM archive_snapshot_v WHERE nick=? AND path LIKE ? "+_snap_notin(df,dt),
                     [n,sql_pat]+snap_extra):
                 _duidx_add(totals,key_fn(path),'présent',sz)
             conn.close()
@@ -1355,7 +1407,7 @@ def _duidx_collect_global(nick,sql_pat,archive_from=None,archive_to=None):
             df,dt=_snap_params(af_params,archive_from,archive_to)
             snap_extra=[x for x in [df,dt] if x]
             row=conn.execute(
-                "SELECT COUNT(*),SUM(size) FROM archive_snapshot WHERE nick=? AND path LIKE ? "+_snap_notin(df,dt),
+                "SELECT COUNT(*),SUM(size) FROM archive_snapshot_v WHERE nick=? AND path LIKE ? "+_snap_notin(df,dt),
                 [n,sql_pat]+snap_extra).fetchone()
             if row and row[0]:
                 k=('','présent')
@@ -1484,7 +1536,7 @@ def cmd_filehist(nick,path,archive_from=None,archive_to=None,debug=0):
             snap_extra=[x for x in [df,dt] if x]
             cur=conn.execute(
                 "SELECT nick,archive_date,'',archive,'présent',NULL,size "
-                "FROM archive_snapshot WHERE nick=? AND path=? "+_snap_notin(df,dt),
+                "FROM archive_snapshot_v WHERE nick=? AND path=? "+_snap_notin(df,dt),
                 [n,path]+snap_extra)
             rows.extend(cur.fetchall())
             conn.close()
@@ -2013,7 +2065,7 @@ def _find_last_archive_with_file(nick,path,debug=0):
         ensure_diff_db(db_path)
         conn=sqlite3.connect(db_path)
         row=conn.execute(
-            f"SELECT archive FROM archive_snapshot WHERE nick=? AND path {op} ? ORDER BY archive DESC LIMIT 1",
+            f"SELECT archive FROM archive_snapshot_v WHERE nick=? AND path {op} ? ORDER BY archive DESC LIMIT 1",
             (nick,val)).fetchone()
         if row:
             conn.close()
@@ -2172,6 +2224,13 @@ def cmd_delbkp(nick,bid,debug=0):
     sys.exit(rb['exitcode'])
 
 
+def _cleanup_snapshot_file_orphans(nick,conn):
+    """Supprime snapshot_file sans référence dans archive_snapshot (après suppression d'archives)."""
+    conn.execute(
+        "DELETE FROM snapshot_file WHERE nick=? AND id NOT IN "
+        "(SELECT file_id FROM archive_snapshot WHERE nick=?)",
+        (nick,nick))
+
 def _cleanup_index_after_prune(nick,debug=0):
     if _nick_noidx(nick):
         return
@@ -2199,6 +2258,7 @@ def _cleanup_index_after_prune(nick,debug=0):
             r2=conn.execute("DELETE FROM diff_indexed_pairs WHERE nick=?",(nick,)).rowcount
             r3=conn.execute("DELETE FROM archive_snapshot WHERE nick=?",(nick,)).rowcount
             r4=conn.execute("DELETE FROM archive_snapshot_indexed WHERE nick=?",(nick,)).rowcount
+        _cleanup_snapshot_file_orphans(nick,conn)
         conn.commit()
         conn.close()
         total=r1+r2+r3+r4

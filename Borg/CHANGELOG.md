@@ -1,5 +1,32 @@
 # Changelog — borgHelper
 
+## 0.56 — 2026-06-05
+
+### Refactor — DB : déduplication de contenu, WAL, indexes couvrants
+
+**Schéma `diff.db` — déduplication `archive_snapshot`**
+
+- Nouvelle table `snapshot_file(id, nick, path, size, mtime)` — états de fichiers uniques, `UNIQUE(nick, path)`
+- `archive_snapshot` devient une table mince `(nick, archive, archive_date, file_id)` — référence par id
+- Vue `archive_snapshot_v` — jointure transparente pour toutes les lectures (Search, FileHist, DuIdx, Restore)
+- `store_archive_snapshot` : `INSERT OR REPLACE INTO snapshot_file` puis `INSERT … SELECT id` — plus de duplication de paths
+- Migration automatique au premier lancement : `ensure_diff_db` détecte l'ancienne colonne `path` et migre sans intervention
+- `_cleanup_snapshot_file_orphans` : supprime les `snapshot_file` orphelins après prune ou force re-index
+
+**Indexes ajoutés**
+
+- `diff_index` : `idx_diff_nick_newtype(nick, archive_new, change_type)` — accélère `_diff_stats_for_nick`
+- `diff_index` : `idx_diff_nick_date(nick, archive_new_date)` — accélère les filtres par plage de dates
+- `diff_indexed_pairs` : `idx_pairs_nick(nick)` — accélère les suppressions par nick lors du prune
+- `snapshot_file` : `idx_snapfile_nick_path(nick, path)` — lookup O(log n) pour l'insertion et la recherche
+- `archive_snapshot` : `idx_snap_nick_archive(nick, archive)` — accélère les suppressions par archive
+
+**WAL mode**
+
+- `PRAGMA journal_mode=WAL` activé dans `ensure_diff_db` et `ensure_cache_db` — lectures concurrentes sans blocage
+
+---
+
 ## 0.55 — 2026-06-04
 
 ### Fix — `Bkp` : exit 0 si stderr contient uniquement INFO/WARNING
