@@ -1,5 +1,16 @@
 # Changelog — borgHelper
 
+## 0.63 — 2026-06-05
+
+### Ajout — `Report -o` : mode offline stats-only depuis diff.db
+
+- `-o` : rapport sans aucun appel borg — lit uniquement `diff.db`
+- Colonnes : dernière archive, date, +ajouté, -supprimé, =modifié (avec tailles)
+- Combinable avec `-j` (JSON), `-l` (HTML), `-N <n>` (limite archives)
+- Erreur explicite si `diff.db` absent ou index vide
+
+---
+
 ## 0.62 — 2026-06-05
 
 ### Correction — `Bkp` : `borgHelper_messages` retiré du stdout

@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.62"
+Version="0.63"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.62"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.63 Report -o : mode offline stats-only depuis diff.db (aucun appel borg)
 # 0.62 Bkp : borgHelper_messages retiré du stdout (stderr reste stderr)
 # 0.61 Report : -N <n> surcharge DISPLAY_BKP (-b retiré de Report, sémantique archive)
 # 0.60 Report : -b surcharge DISPLAY_BKP (filtrer_lignes utilisait toujours la conf)
@@ -1770,6 +1771,85 @@ def filtrer_lignes(tableau, X):
 
     return nouveau_hash
 
+def cmd_report_offline(nicks,htrep=False,debug=0,maxp=None,as_json=False):
+    """Rapport stats-only depuis diff.db — aucun appel borg."""
+    from prettytable import PrettyTable
+    summary={}
+    detail={}
+    def _fmt(n,sz):
+        return f"{n} · {convert_octets_readable(sz)}" if n else '—'
+    for nick in nicks.split(','):
+        db_path=get_diff_db(nick)
+        if not os.path.exists(db_path):
+            printer(f"[ERREUR] {nick}: diff.db absent — lancez borgHelper -c Index -n {nick}")
+            continue
+        ensure_diff_db(db_path)
+        diff_stats=_diff_stats_for_nick(nick)
+        if not diff_stats:
+            printer(f"[ERREUR] {nick}: index vide — lancez borgHelper -c Index -n {nick}")
+            continue
+        try:
+            conn=sqlite3.connect(db_path)
+            rows=conn.execute(
+                "SELECT DISTINCT archive_new, archive_new_date FROM diff_index WHERE nick=? ORDER BY archive_new_date",
+                (nick,)).fetchall()
+            conn.close()
+        except sqlite3.Error as e:
+            printer(f"SQLite error ({nick}): {e}")
+            continue
+        archives=rows
+        if maxp is not None:
+            archives=archives[-maxp:]
+        detail[nick]={}
+        for arch,arch_date in archives:
+            s=diff_stats.get(arch,{})
+            detail[nick][arch]={
+                'archive':arch,
+                'date':(arch_date or '')[:19],
+                '+ajouté' :_fmt(s.get('added',0),   s.get('added_sz',0)),
+                '-supprimé':_fmt(s.get('removed',0), s.get('removed_sz',0)),
+                '=modifié' :_fmt(s.get('modified',0),s.get('modified_sz',0)),
+            }
+        last_arch,last_date=archives[-1] if archives else (None,None)
+        s=diff_stats.get(last_arch,{}) if last_arch else {}
+        summary[nick]={
+            'nick':nick,
+            'dernière archive':last_arch or '—',
+            'date':(last_date or '')[:19],
+            '+ajouté' :_fmt(s.get('added',0),   s.get('added_sz',0)),
+            '-supprimé':_fmt(s.get('removed',0), s.get('removed_sz',0)),
+            '=modifié' :_fmt(s.get('modified',0),s.get('modified_sz',0)),
+        }
+    if as_json:
+        print(json.dumps({'summary':summary,'detail':detail},ensure_ascii=False,indent=2))
+        return 0
+    if not summary:
+        return 0
+    sum_cols=['nick','dernière archive','date','+ajouté','-supprimé','=modifié']
+    det_cols=['archive','date','+ajouté','-supprimé','=modifié']
+    if htrep:
+        print("<!DOCTYPE html><html><body bgcolor='#ffffff'><br>")
+        print(htmlTabelise(summary,colnames=sum_cols))
+        for nick,arcs in detail.items():
+            if arcs:
+                print('<br>')
+                print(htmlTabelise(arcs,colnames=det_cols))
+        print("</body></html>")
+    else:
+        t=PrettyTable(sum_cols)
+        for nick,s in summary.items():
+            t.add_row([s[c] for c in sum_cols])
+        print(t)
+        for nick,arcs in detail.items():
+            if not arcs:
+                continue
+            td=PrettyTable(det_cols)
+            td.align['archive']='l'
+            for a in arcs.values():
+                td.add_row([a[c] for c in det_cols])
+            print(td)
+    return 0
+
 def cmd_report(nicks,htrep=False,dayback=None,debug=0,maxp=None,as_json=False):
     reshos={}
     resbck={}
@@ -2564,7 +2644,7 @@ if sentryid != None:
 ######### Analyse Arguments
 
 try:
-    opts, args = getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:dvjlILCFSN:", ["help"])
+    opts, args = getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:dvjlILCFSN:o", ["help"])
 except getopt.GetoptError as err:
     print(err)  # will print something like "option -a not recognized"
     usage()
@@ -2578,7 +2658,7 @@ optab={ 'stats'     :'Ccdn',      'login'     :'Ccdsnkprm',
         'lstbkp'    :'Ccdn',      'lstbkpfls' :'Ccdnb',
         'restore'   :'CcdnbfwWL', 'diffbkp'   :'Ccdnbw',
         'delbkp'    :'Ccdnb',     'bkp'       :'CcdnI',
-        'prune'     :'Ccdn',      'report'    :'CcdnlNj',
+        'prune'     :'Ccdn',      'report'    :'CcdnlNjo',
         'init'      :'Ccdn',
         'key'       :'Ccdn',      'index'     :'CcdnFS',
         'search'    :'CcdnfbB',   'filehist'  :'CcdnfbB',
@@ -2681,7 +2761,14 @@ elif cmd == 'key':
 elif cmd == 'report':
     errcmd=0
     _maxp=int(options['-N']) if '-N' in options else None
-    if '-j' in options:
+    if '-o' in options:
+        if '-j' in options:
+            errcmd=cmd_report_offline(nick,as_json=True,maxp=_maxp,debug=debug)
+        elif '-l' in options:
+            errcmd=cmd_report_offline(nick,htrep=True,maxp=_maxp,debug=debug)
+        else:
+            errcmd=cmd_report_offline(nick,maxp=_maxp,debug=debug)
+    elif '-j' in options:
         errcmd=cmd_report(nick,as_json=True,maxp=_maxp,debug=debug)
     elif '-l' in options.keys():
         errcmd=cmd_report(nick,htrep=True,maxp=_maxp,debug=debug)

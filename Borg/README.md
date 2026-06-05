@@ -207,6 +207,9 @@ borgHelper -c Report -n ALL
 borgHelper -c Report -n ALL -l              # sortie HTML
 borgHelper -c Report -n mon-serveur -N 5   # afficher 5 dernières archives (surcharge DISPLAY_BKP)
 borgHelper -c Report -n ALL -j             # sortie JSON
+borgHelper -c Report -n ALL -o             # mode offline : stats depuis diff.db, aucun appel borg
+borgHelper -c Report -n ALL -o -j          # offline + JSON
+borgHelper -c Report -n ALL -o -N 10       # offline + 10 dernières archives
 ```
 
 Code retour 1 si un dépôt dépasse `MAX_AGE_BKP` heures depuis la dernière sauvegarde.  
@@ -223,6 +226,12 @@ Colonnes résumé : nom, durée, depuis (heures), taille dernière, taille total
 - **Tableau détail** (1 ligne par archive) : mêmes colonnes pour chaque backup listé
 - Format : `N (P%) · SIZE` — nombre de fichiers, pourcentage relatif au backup précédent, et taille disque
 - `—` si l'archive n'est pas encore indexée (`borgHelper -c Index -n <nick>` pour indexer)
+
+**Mode offline** (`-o`) — rapport sans appel borg, depuis `diff.db` uniquement :
+- Colonnes : dernière archive, date, +ajouté, -supprimé, =modifié (nb · taille)
+- Pas de données de taille archive, pas de vérification de fraîcheur, pas d'info prunable
+- Combinable avec `-j`, `-l`, `-N <n>`
+- Erreur explicite si `diff.db` absent ou index vide
 
 **Sortie JSON** (`-j`) — structure :
 
