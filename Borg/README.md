@@ -411,7 +411,7 @@ borgHelper -c CacheClean -n mon-serveur
 | Fichier | Contenu |
 |---------|---------|
 | `~/.borghelperrc` | Configuration des dépôts (INI) |
-| `~/.cache/borghelper/<conf>-<nick>-cache.db` | Cache des appels `borg info/list` (SQLite, persistant) |
+| `~/.cache/borghelper/<conf>-<nick>-cache.db` | Cache des appels `borg info/list` (SQLite) |
 | `~/.cache/borghelper/<conf>-<nick>-diff.db` | Index des diffs et snapshots d'archives (SQLite) |
 
 `<conf>` = basename sanitisé du fichier de configuration (ex : `borghelperrc` pour `~/.borghelperrc`).  
@@ -424,32 +424,97 @@ Le répertoire de stockage est configurable via la clé `CACHE_DIR` dans la sect
 CACHE_DIR = /data/borgcache
 ```
 
-### Cache (`<conf>-cache.db`)
+---
 
-Clef : `(nick, last_modified)` — invalidé automatiquement dès que le dépôt change.  
-Purge automatique après `DelBkp` et `Prune`.  
-Nettoyage manuel : `CacheClean`.
+## Schéma relationnel des bases de données
 
-### Index diff (`<conf>-diff.db`)
+### `cache.db`
 
-Tables :
-- `diff_index` — un enregistrement par fichier modifié par paire d'archives
-- `diff_indexed_pairs` — sentinel des paires déjà traitées
-- `archive_snapshot` — listing complet de la dernière archive indexée par nick
-- `archive_snapshot_indexed` — sentinel des archives déjà snapshotées
+Cache des résultats `borg info` / `borg list`, invalidé par `last_modified` du dépôt.  
+Purge automatique après `DelBkp` et `Prune`. Nettoyage manuel : `CacheClean`.
 
-Schéma `diff_index` :
+```mermaid
+erDiagram
+    cachejsonboexlm {
+        INTEGER id PK
+        TEXT nom "nick ou nick:prune"
+        TEXT lastmodified "last_modified du dépôt borg"
+        TEXT details "JSON sérialisé"
+    }
+```
 
-| Colonne | Type | Description |
-|---------|------|-------------|
-| nick | TEXT | Dépôt borgHelper |
-| archive_old | TEXT | Archive source du diff |
-| archive_new | TEXT | Archive cible du diff |
-| archive_new_date | TEXT | Date ISO de archive_new |
-| change_type | TEXT | added / removed / modified / C / B / T |
-| path | TEXT | Chemin absolu du fichier |
-| size_before | INTEGER | Taille avant en octets (NULL si added) |
-| size_after | INTEGER | Taille après en octets (NULL si removed) |
+Contrainte d'unicité : `UNIQUE(nom, lastmodified)`.
+
+---
+
+### `diff.db`
+
+Index des diffs inter-archives et snapshots. Deux tables de sentinelle (`diff_indexed_pairs`, `archive_snapshot_indexed`) protègent l'idempotence des indexations.
+
+`archive_snapshot` est une table mince qui référence `snapshot_file` par `file_id` — les chemins sont stockés une seule fois (déduplication). La vue `archive_snapshot_v` expose la jointure de façon transparente pour toutes les lectures.
+
+```mermaid
+erDiagram
+    diff_index {
+        INTEGER id PK
+        TEXT nick
+        TEXT archive_old
+        TEXT archive_new
+        TEXT archive_new_date "ISO datetime"
+        TEXT change_type "added|removed|modified|C|B|T"
+        TEXT path
+        INTEGER size_before "NULL si added"
+        INTEGER size_after "NULL si removed"
+        TEXT indexed_at
+    }
+
+    diff_indexed_pairs {
+        INTEGER id PK
+        TEXT nick
+        TEXT archive_old
+        TEXT archive_new "UNIQUE(nick,archive_old,archive_new)"
+        INTEGER entry_count
+        TEXT indexed_at
+    }
+
+    snapshot_file {
+        INTEGER id PK
+        TEXT nick
+        TEXT path "UNIQUE(nick, path)"
+        INTEGER size
+        TEXT mtime "ISO datetime"
+    }
+
+    archive_snapshot {
+        TEXT nick "PK partielle"
+        TEXT archive "PK partielle"
+        TEXT archive_date
+        INTEGER file_id FK
+    }
+
+    archive_snapshot_indexed {
+        TEXT nick "UNIQUE(nick, archive)"
+        TEXT archive
+        INTEGER entry_count
+        TEXT indexed_at
+    }
+
+    snapshot_file ||--o{ archive_snapshot : "file_id → id"
+```
+
+**Vue** `archive_snapshot_v` : `archive_snapshot ⋈ snapshot_file` — utilisée par `Search`, `FileHist`, `DuIdx`, `Restore`.
+
+**Indexes** :
+
+| Table | Index | Colonnes | Requête cible |
+|-------|-------|----------|---------------|
+| `diff_index` | `idx_diff_nick_path` | `(nick, path)` | Search, FileHist |
+| `diff_index` | `idx_diff_nick_archive` | `(nick, archive_new)` | DiffBkp, Report |
+| `diff_index` | `idx_diff_nick_newtype` | `(nick, archive_new, change_type)` | stats Report |
+| `diff_index` | `idx_diff_nick_date` | `(nick, archive_new_date)` | filtres plage `-b`/`-B` |
+| `diff_indexed_pairs` | `idx_pairs_nick` | `(nick)` | suppressions Prune |
+| `snapshot_file` | `idx_snapfile_nick_path` | `(nick, path)` | insertion / lookup |
+| `archive_snapshot` | `idx_snap_nick_archive` | `(nick, archive)` | suppressions Prune |
 
 ---
 
