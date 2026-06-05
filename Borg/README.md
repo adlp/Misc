@@ -602,7 +602,7 @@ DSN lu dans l'ordre :
 # Backup quotidien à 2h
 0 2 * * *  borgHelper -c Bkp -n mon-serveur
 
-# Index diff + snapshot après le backup (IndexSnap est appelé automatiquement par Index)
+# Index diff + snapshot après le backup
 5 2 * * *  borgHelper -c Index -n mon-serveur
 
 # Prune hebdomadaire le dimanche à 3h
