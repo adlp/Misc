@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.59"
+Version="0.61"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,8 @@ Version="0.59"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.61 Report : -N <n> surcharge DISPLAY_BKP (-b retiré de Report, sémantique archive)
+# 0.60 Report : -b surcharge DISPLAY_BKP (filtrer_lignes utilisait toujours la conf)
 # 0.59 Index -S : snapshot seul (remplace commande IndexSnap) ; IndexSnap retiré du CLI
 # 0.58 Bkp : stdout JSON enrichi (borgHelper_messages, borgHelper_file_counts) si exit 0
 # 0.57 Report : ne réindexe plus automatiquement les paires manquantes (affiche — si absent)
@@ -1839,6 +1841,8 @@ def cmd_report(nicks,htrep=False,dayback=None,debug=0,maxp=None,as_json=False):
         disp=0
         if "DISPLAY_BKP" in cfg:
             disp=int(cfg["DISPLAY_BKP"])
+        if maxp is not None:
+            disp=maxp
         resshortbck[nick]=filtrer_lignes(resbck[nick],disp)
 
     if as_json:
@@ -2568,7 +2572,7 @@ if sentryid != None:
 ######### Analyse Arguments
 
 try:
-    opts, args = getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:dvjlILCFS", ["help"])
+    opts, args = getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:dvjlILCFSN:", ["help"])
 except getopt.GetoptError as err:
     print(err)  # will print something like "option -a not recognized"
     usage()
@@ -2582,7 +2586,7 @@ optab={ 'stats'     :'Ccdn',      'login'     :'Ccdsnkprm',
         'lstbkp'    :'Ccdn',      'lstbkpfls' :'Ccdnb',
         'restore'   :'CcdnbfwWL', 'diffbkp'   :'Ccdnbw',
         'delbkp'    :'Ccdnb',     'bkp'       :'CcdnI',
-        'prune'     :'Ccdn',      'report'    :'Ccdnblj',
+        'prune'     :'Ccdn',      'report'    :'CcdnlNj',
         'init'      :'Ccdn',
         'key'       :'Ccdn',      'index'     :'CcdnFS',
         'search'    :'CcdnfbB',   'filehist'  :'CcdnfbB',
@@ -2683,18 +2687,14 @@ elif cmd == 'lstbkpfls':
 elif cmd == 'key':
     cmd_key(nick,debug=debug)
 elif cmd == 'report':
-    # printer("   -c Report [-n nickname/servername] [-b backupid/last]")
     errcmd=0
-    if '-b' not in options.keys() or 'last' in options['-b']:
-        options['-b']=None
-    else:
-        options['-b']=int(options['-b'])
+    _maxp=int(options['-N']) if '-N' in options else None
     if '-j' in options:
-        errcmd=cmd_report(nick,as_json=True,maxp=options['-b'],debug=debug)
+        errcmd=cmd_report(nick,as_json=True,maxp=_maxp,debug=debug)
     elif '-l' in options.keys():
-        errcmd=cmd_report(nick,htrep=True,maxp=options['-b'],debug=debug)
+        errcmd=cmd_report(nick,htrep=True,maxp=_maxp,debug=debug)
     else:
-        errcmd=cmd_report(nick,maxp=options['-b'],debug=debug)
+        errcmd=cmd_report(nick,maxp=_maxp,debug=debug)
     sys.exit(errcmd)
 elif cmd == 'diffbkp':
     # printer("-c DiffBkp [-n nickname/servername] [-b backupid] -w where")

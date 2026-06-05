@@ -1,5 +1,24 @@
 # Changelog — borgHelper
 
+## 0.61 — 2026-06-05
+
+### Changement — `Report` : `-N <n>` remplace `-b <n>` pour surcharger `DISPLAY_BKP`
+
+- `-b` retiré de `Report` (sémantique ambiguë — dans les autres commandes `-b` = nom d'archive)
+- `-N <n>` : affiche les `n` dernières archives, surcharge `DISPLAY_BKP` de la conf
+- Les deux niveaux de filtrage (`prep_report` et `filtrer_lignes`) sont maintenant cohérents
+
+---
+
+## 0.60 — 2026-06-05
+
+### Fix — `Report` : `filtrer_lignes` respecte maintenant `maxp`
+
+- `filtrer_lignes` ignorait `maxp` et utilisait toujours `DISPLAY_BKP` de la conf
+- Corrigé en préparation du remplacement `-b` → `-N`
+
+---
+
 ## doc — 2026-06-05
 
 ### Documentation — README mis à jour

@@ -209,7 +209,7 @@ Rapport sur l'état des sauvegardes — texte (prettytable) ou HTML.
 borgHelper -c Report -n mon-serveur
 borgHelper -c Report -n ALL
 borgHelper -c Report -n ALL -l              # sortie HTML
-borgHelper -c Report -n mon-serveur -b 5   # afficher 5 dernières archives
+borgHelper -c Report -n mon-serveur -N 5   # afficher 5 dernières archives (surcharge DISPLAY_BKP)
 borgHelper -c Report -n ALL -j             # sortie JSON
 ```
 
