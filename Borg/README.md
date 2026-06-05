@@ -589,7 +589,7 @@ erDiagram
 | `diff_index` | `idx_diff_nick_path` | `(nick, path)` | Search, FileHist |
 | `diff_index` | `idx_diff_nick_archive` | `(nick, archive_new)` | DiffBkp, Report |
 | `diff_index` | `idx_diff_nick_newtype` | `(nick, archive_new, change_type)` | stats Report |
-| `diff_index` | `idx_diff_nick_date` | `(nick, archive_new_date)` | filtres plage `-b`/`-B` |
+| `diff_index` | `idx_diff_nick_date` | `(nick, archive_new_date)` | filtres plage `-b`/`-B` (Search, DuIdx) |
 | `diff_indexed_pairs` | `idx_pairs_nick` | `(nick)` | suppressions Prune |
 | `snapshot_file` | `idx_snapfile_nick_path` | `(nick, path)` | insertion / lookup |
 | `archive_snapshot` | `idx_snap_nick_archive` | `(nick, archive)` | suppressions Prune |

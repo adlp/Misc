@@ -79,14 +79,15 @@ IDX_WORKERS = 1   # pour forcer le séquentiel
 
 ## doc — 2026-06-05
 
-### Documentation — README mis à jour
+### Documentation — README et aide intégrée mis à jour
 
-- Schéma relationnel Mermaid ERD des deux bases (`cache.db`, `diff.db`) avec FK, vue et tableau des indexes
-- `Bkp` : exemples de sortie JSON (`borgHelper_messages`, `borgHelper_file_counts`, `borgHelper_files`)
-- `Prune` : mention de la purge automatique du `diff.db` après suppression d'archives
-- `Report` : option `-j` avec exemple de sortie JSON `{summary, backups}`
-- `Index` : option `-F` et option `-S` (snapshot seul, remplace `IndexSnap`)
-- `IndexSnap` retiré — toutes références remplacées par `Index -S`
+- Schéma relationnel Mermaid ERD : `cache.db`, `diff.db` + table `archive_stats`
+- `Bkp` : exemples JSON stdout (`borgHelper_file_counts`, `borgHelper_files` debug), exit codes
+- `Prune` : mention purge diff.db + `archive_stats` après suppression d'archives
+- `Report` : `-N n` (remplace `-b`), `-o` mode offline + description colonnes
+- `Index` : `-F`, `-S`, `IDX_WORKERS` parallélisme
+- `IndexSnap` retiré — remplacé par `Index -S` dans aide et README
+- Usage inline (`-H`) : toutes les commandes mises à jour (Report, Bkp, Prune, Index, Init)
 
 ---
 
