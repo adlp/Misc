@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.64"
+Version="0.65"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.64"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.65 Index : borg info pour archive_stats seulement si archives manquantes (pas systématique)
 # 0.64 archive_stats dans diff.db : peuplé par Bkp + Index, utilisé par Report -o
 # 0.63 Report -o : mode offline stats-only depuis diff.db (aucun appel borg)
 # 0.62 Bkp : borgHelper_messages retiré du stdout (stderr reste stderr)
@@ -1221,19 +1222,30 @@ def cmd_index(nick,debug=0,db_path=None,force=False):
         store_diff_entries(nick,a_old,a_new,date_new,entries,db_path)
         new_pairs+=1
     print(f"{nick}: {new_pairs} paires indexées (+{skipped} déjà en cache)")
-    # Peuplement archive_stats depuis borg info --json
-    rbi=boex(nick,['info','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+    # Peuplement archive_stats : seulement si des archives manquent
+    archive_names=set(a['name'] for a in archives)
     try:
-        _boex_check_stdout(rbi,nick,'borg info')
-        for a in rbi['stdout'][0]['archives']:
-            st=a.get('stats',{})
-            store_archive_stats(nick,a['name'],a.get('start'),
-                a.get('duration'),
-                st.get('original_size'),st.get('compressed_size'),
-                st.get('deduplicated_size'),st.get('nfiles'),
-                db_path)
-    except (RuntimeError,KeyError,TypeError):
-        pass
+        conn=sqlite3.connect(db_path)
+        existing=set(r[0] for r in conn.execute(
+            "SELECT archive FROM archive_stats WHERE nick=?",(nick,)).fetchall())
+        conn.close()
+    except sqlite3.Error:
+        existing=set()
+    missing=archive_names-existing
+    if missing or force:
+        rbi=boex(nick,['info','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+        try:
+            _boex_check_stdout(rbi,nick,'borg info')
+            for a in rbi['stdout'][0]['archives']:
+                if force or a['name'] in missing:
+                    st=a.get('stats',{})
+                    store_archive_stats(nick,a['name'],a.get('start'),
+                        a.get('duration'),
+                        st.get('original_size'),st.get('compressed_size'),
+                        st.get('deduplicated_size'),st.get('nfiles'),
+                        db_path)
+        except (RuntimeError,KeyError,TypeError):
+            pass
     cmd_indexsnap(nick,debug=debug,db_path=db_path,force=force)
     return 0
 

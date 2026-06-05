@@ -1,5 +1,15 @@
 # Changelog — borgHelper
 
+## 0.65 — 2026-06-05
+
+### Fix — `Index` : `borg info` pour `archive_stats` uniquement si archives manquantes
+
+- Régression 0.64 : `borg info --json --glob-archives` appelé à chaque `Index` même si `archive_stats` était complet
+- Désormais : comparaison entre les archives connues de borg et celles présentes dans `archive_stats`
+- `borg info` n'est appelé que si au moins une archive manque (ou `-F` forcé)
+
+---
+
 ## 0.64 — 2026-06-05
 
 ### Ajout — `archive_stats` dans `diff.db` : tailles d'archives persistées localement
