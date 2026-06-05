@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.67"
+Version="0.68"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.67"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.68 diff.db : VACUUM après Prune, auto_vacuum=INCREMENTAL, DIFF_KEEP purge auto
 # 0.67 CLI : args positionnels non reconnus → erreur explicite (ex: borgHelper -c bkp toto)
 # 0.66 Index : borg diff parallèle (IDX_WORKERS, défaut 4) + insert groupé + purge groupée
 # 0.65 Index : borg info pour archive_stats seulement si archives manquantes (pas systématique)
@@ -977,6 +978,7 @@ def _migrate_archive_snapshot(conn):
 def ensure_diff_db(db_path):
     conn=sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS diff_index (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1180,6 +1182,28 @@ def parse_diff_line(line):
                 'size_after':None,'path':m.group(2)}
     return None
 
+def _diff_keep_purge(nick,keep,db_path):
+    """Purge diff_index + diff_indexed_pairs au-delà des <keep> dernières paires."""
+    try:
+        conn=sqlite3.connect(db_path)
+        rows=conn.execute(
+            "SELECT archive_old,archive_new FROM diff_indexed_pairs WHERE nick=? "
+            "ORDER BY indexed_at DESC",(nick,)).fetchall()
+        to_delete=rows[keep:]
+        if not to_delete:
+            conn.close()
+            return
+        for a_old,a_new in to_delete:
+            conn.execute("DELETE FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",
+                         (nick,a_old,a_new))
+            conn.execute("DELETE FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=?",
+                         (nick,a_old,a_new))
+        conn.commit()
+        conn.close()
+        print(f"{nick}: DIFF_KEEP={keep} — {len(to_delete)} paire(s) ancienne(s) purgées")
+    except sqlite3.Error as e:
+        printer(f"SQLite error (diff_keep_purge): {e}")
+
 def cmd_index(nick,debug=0,db_path=None,force=False):
     if _nick_noidx(nick):
         printer(f"{nick}: indexation désactivée (NOIDX=1)")
@@ -1265,6 +1289,10 @@ def cmd_index(nick,debug=0,db_path=None,force=False):
             printer(f"SQLite error (insert): {e}")
     new_pairs=len(results)
     print(f"{nick}: {new_pairs} paires indexées (+{skipped} déjà en cache)")
+    # DIFF_KEEP : purge des paires au-delà de la limite configurée
+    diff_keep=cfg.get('DIFF_KEEP','')
+    if diff_keep.strip().isdigit():
+        _diff_keep_purge(nick,int(diff_keep),db_path)
     # Peuplement archive_stats : seulement si des archives manquent
     archive_names=set(a['name'] for a in archives)
     try:
@@ -2440,10 +2468,11 @@ def _cleanup_index_after_prune(nick,debug=0):
             conn.execute("DELETE FROM archive_stats WHERE nick=?",(nick,))
         _cleanup_snapshot_file_orphans(nick,conn)
         conn.commit()
-        conn.close()
         total=r1+r2+r3+r4
         if total>0:
             print(f"{nick}: index nettoyé ({r1} diff, {r2} paires, {r3}+{r4} snapshots)")
+        conn.execute("VACUUM")
+        conn.close()
     except sqlite3.Error as e:
         printer(f"SQLite cleanup error: {e}")
 

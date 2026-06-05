@@ -1,5 +1,19 @@
 # Changelog — borgHelper
 
+## 0.68 — 2026-06-06
+
+### Performance — `diff.db` : réduction taille et fragmentation
+
+- **`VACUUM` après Prune** : espace des lignes supprimées récupéré immédiatement après nettoyage
+- **`PRAGMA auto_vacuum=INCREMENTAL`** : récupération incrémentale des pages vides au fil du temps
+- **`DIFF_KEEP = N`** dans borghelperrc : purge automatique des N+1 paires les plus anciennes de `diff_index` après chaque `Index`
+
+```ini
+DIFF_KEEP = 30   # conserver les 30 dernières paires indexées seulement
+```
+
+---
+
 ## 0.67 — 2026-06-06
 
 ### Fix — CLI : arguments positionnels non reconnus rejetés

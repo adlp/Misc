@@ -72,6 +72,11 @@ IDX_EXCLUDE              = /proc /sys /tmp /var/log  # liste noire — ces chemi
 # Parallélisation de l'indexation (nombre de borg diff simultanés, défaut 4)
 IDX_WORKERS              = 4
 
+# Limiter la taille de diff_index : conserver seulement les N dernières paires indexées
+# Les paires plus anciennes sont purgées automatiquement après chaque Index
+# Non défini = pas de limite (tout l'historique conservé)
+DIFF_KEEP                = 30
+
 # Clef explicite (keyfile mode, utile si plusieurs nicks partagent le même dépôt)
 BORG_KEY_FILE            = /root/.config/borg/keys/abcdef123456
 
