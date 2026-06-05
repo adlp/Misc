@@ -1,5 +1,18 @@
 # Changelog — borgHelper
 
+## doc — 2026-06-05
+
+### Documentation — README mis à jour
+
+- Schéma relationnel Mermaid ERD des deux bases (`cache.db`, `diff.db`) avec FK, vue et tableau des indexes
+- `Bkp` : exemples de sortie JSON (`borgHelper_messages`, `borgHelper_file_counts`, `borgHelper_files`)
+- `Prune` : mention de la purge automatique du `diff.db` après suppression d'archives
+- `Report` : option `-j` avec exemple de sortie JSON `{summary, backups}`
+- `Index` : option `-F` et option `-S` (snapshot seul, remplace `IndexSnap`)
+- `IndexSnap` retiré — toutes références remplacées par `Index -S`
+
+---
+
 ## 0.59 — 2026-06-05
 
 ### Changement — `Index -S` remplace la commande `IndexSnap`
