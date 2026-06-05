@@ -149,6 +149,43 @@ Code retour 0 si succès ou warnings, 2 si erreur borg.
 
 > `-I` désactive `--list` et toute écriture SQLite — utile si l'indexation est gérée séparément via `Index`.
 
+**Sortie stdout (JSON)** — si exit 0, le JSON borg est enrichi de deux clefs borgHelper :
+
+```json
+{
+  "archive": {
+    "name": "mon-serveur-root-2026-06-05T02:00:04",
+    "start": "2026-06-05T02:00:04.000000",
+    "duration": 42.3,
+    "stats": { "nfiles": 183241, "original_size": 9871234560, "... ": "..." }
+  },
+  "cache": { "...": "..." },
+  "borgHelper_messages": [
+    "[INFO] Starting repository check",
+    "[WARNING] /proc: [Errno 13] Permission denied"
+  ],
+  "borgHelper_file_counts": {
+    "added": 12,
+    "modified": 3,
+    "removed": 1
+  }
+}
+```
+
+En mode debug (`-d`), `borgHelper_files` s'ajoute avec la liste complète des fichiers touchés :
+
+```json
+{
+  "...": "...",
+  "borgHelper_file_counts": { "added": 2, "modified": 1 },
+  "borgHelper_files": [
+    { "change_type": "added",    "path": "/etc/hosts",         "size_before": null, "size_after": null },
+    { "change_type": "added",    "path": "/home/user/.bashrc", "size_before": null, "size_after": null },
+    { "change_type": "modified", "path": "/var/log/syslog",    "size_before": null, "size_after": null }
+  ]
+}
+```
+
 ---
 
 ### `Prune`
