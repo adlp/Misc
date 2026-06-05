@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## 0.58 — 2026-06-05
+
+### Ajout — `Bkp` : stdout JSON enrichi si exit 0
+
+- `borgHelper_messages` : liste des messages stderr filtrés (`[LEVEL] msg`), hors entrées fichiers
+- `borgHelper_file_counts` : dict `{change_type: count}` — nombre de fichiers par type (added, removed, modified…)
+- En mode debug (`-d`) : `borgHelper_files` — liste complète des entrées fichiers (chemin + type)
+- Le stderr interactif (`[LEVEL] msg`) reste inchangé
+- `newretC` calculé avant les prints pour cohérence
+
+---
+
 ## 0.57 — 2026-06-05
 
 ### Changement — `Report` : suppression de la réindexation automatique

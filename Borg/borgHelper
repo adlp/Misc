@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.57"
+Version="0.58"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -68,6 +68,7 @@ Version="0.57"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.58 Bkp : stdout JSON enrichi (borgHelper_messages, borgHelper_file_counts) si exit 0
 # 0.57 Report : ne réindexe plus automatiquement les paires manquantes (affiche — si absent)
 # 0.56 DB : déduplication snapshot_file, WAL, indexes couvrants, migration auto
 # 0.55 Bkp : exit 0 si stderr contient uniquement INFO/WARNING (pas d'ERROR/CRITICAL)
@@ -2386,13 +2387,39 @@ def cmd_bkp(nick,no_index=False,debug=0):
 
     anaRet=boex(nick,create,preBorg=preBorg,forceEnv=forceEnv,debug=debug)
 
+    newretC=0
+    if anaRet['exitcode']:
+        for i in anaRet['stderr']:
+            if isinstance(i,dict) and i.get('levelname') in ('ERROR','CRITICAL'):
+                newretC=2
+                break
+        # INFO/WARNING only → borg exit 1 = avertissements, pas une erreur
+
     if 'stdout' in anaRet.keys() and len(anaRet['stdout']):
-        print(json.dumps(anaRet['stdout'][0],indent=4),file=sys.stdout,flush=True)
+        out=dict(anaRet['stdout'][0])
+        if newretC==0:
+            msgs=[]
+            for i in anaRet.get('stderr',[]):
+                if _bkp_is_list_entry(i):
+                    continue
+                if isinstance(i,dict):
+                    msgs.append(f"[{i.get('levelname','INFO')}] {i.get('message',str(i))}")
+                elif isinstance(i,str) and i.strip():
+                    msgs.append(i.strip())
+            out['borgHelper_messages']=msgs
+            all_entries=_bkp_parse_list(anaRet.get('stderr',[]))
+            counts={}
+            for e in all_entries:
+                counts[e['change_type']]=counts.get(e['change_type'],0)+1
+            out['borgHelper_file_counts']=counts
+            if debug:
+                out['borgHelper_files']=all_entries
+        print(json.dumps(out,indent=4),file=sys.stdout,flush=True)
 
     if 'stderr' in anaRet.keys() and len(anaRet['stderr']):
         for i in anaRet['stderr']:
             if _bkp_is_list_entry(i):
-                continue  # masqué sauf debug
+                continue
             if isinstance(i,dict):
                 lvl=i.get('levelname','INFO')
                 msg=i.get('message',str(i))
@@ -2401,14 +2428,6 @@ def cmd_bkp(nick,no_index=False,debug=0):
                     printer(i)
             elif isinstance(i,str) and i.strip():
                 print(i,file=sys.stderr,flush=True)
-
-    newretC=0
-    if anaRet['exitcode']:
-        for i in anaRet['stderr']:
-            if isinstance(i,dict) and i.get('levelname') in ('ERROR','CRITICAL'):
-                newretC=2
-                break
-        # INFO/WARNING only → borg exit 1 = avertissements, pas une erreur
 
     # Indexation depuis la sortie --list
     if newretC==0 and not no_index and anaRet['stdout']:
