@@ -68,6 +68,7 @@ Version="0.69"
 ### TODO Rajouter dans le diff au b l'option d'une virgule, afin de choisir sur quoi on fait le diff
 ### TODO Verifier l'etat de toutes les docs
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 0.69 SQLite : messages d'erreur explicites (fichier inaccessible, corrompu, répertoire manquant)
 # 0.68 diff.db : VACUUM après Prune, auto_vacuum=INCREMENTAL, DIFF_KEEP purge auto
 # 0.67 CLI : args positionnels non reconnus → erreur explicite (ex: borgHelper -c bkp toto)
 # 0.66 Index : borg diff parallèle (IDX_WORKERS, défaut 4) + insert groupé + purge groupée
