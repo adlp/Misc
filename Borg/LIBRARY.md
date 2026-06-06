@@ -365,7 +365,7 @@ sys.exit(0)
 | `search(nick, pattern, archive_from, archive_to, debug)` | Recherche par chemin |
 | `filehist(nick, path, archive_from, archive_to, debug)` | Historique d'un chemin |
 | `duidx(nick, pattern, sort_by, reverse, as_json, ...)` | Résumé taille/type |
-| `diffbkp(nick, bidun, bideux, debug)` | Différences entre deux archives |
+| `diffbkp(nick, bidun, bideux, debug)` | Différences entre deux archives — `+`/`-`/`=` par ligne, résumé compteurs |
 | `restore(nick, bid, ftor, where, flat, debug)` | Restauration |
 | `listperms(nick, bid, ftor, debug)` | Liste droits fichiers sans restaurer |
 | `list_backups(nick, debug)` | Liste les archives |

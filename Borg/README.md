@@ -1,4 +1,4 @@
-# borgHelper  `v1.0.2`
+# borgHelper  `v1.0.3`
 
 Script Python 3 d'aide à la gestion des sauvegardes [BorgBackup](https://www.borgbackup.org/).  
 Centralise la configuration de plusieurs dépôts/serveurs dans un fichier INI et expose des commandes haut niveau.  
@@ -255,13 +255,28 @@ borgHelper -c LstBkpFls -n mon-serveur -b mon-serveur-root-2025-04-02T21:30:04
 ---
 
 ### `DiffBkp`
-Différences entre deux archives (fichiers modifiés/ajoutés/supprimés).
+Différences entre deux archives — un fichier par ligne.
 
 ```bash
 borgHelper -c DiffBkp -n mon-serveur                          # 2 dernières archives
 borgHelper -c DiffBkp -n mon-serveur -b archive-ancienne      # vs dernière
 borgHelper -c DiffBkp -n mon-serveur -b archive-1,archive-2   # entre deux précises
 ```
+
+Première colonne : `+` ajouté, `-` supprimé, `=` présent dans les deux archives (modifié, permissions, type).  
+La taille est affichée en fin de ligne : taille finale pour `+`, initiale pour `-`, `avant → après` pour `=`.
+
+```
+mon-serveur-root-2026-06-04T02:00:01 → mon-serveur-root-2026-06-05T02:00:01
++ /etc/newfile                    42.3 KB
+- /var/log/oldlog                 1.2 MB
+= /etc/nginx/nginx.conf           8.5 KB → 9.1 KB
+= /etc/hosts                      [C]
+
++ 1  - 1  = 2
+```
+
+Source : index SQLite si la paire est indexée, sinon `borg diff` + stockage automatique.
 
 ---
 
