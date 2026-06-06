@@ -2,7 +2,9 @@
 
 Script Python 3 d'aide à la gestion des sauvegardes [BorgBackup](https://www.borgbackup.org/).  
 Centralise la configuration de plusieurs dépôts/serveurs dans un fichier INI et expose des commandes haut niveau.  
-Utilisable comme CLI ou comme **librairie Python** (`from borgHelper import BorgHelper`).
+Utilisable comme CLI ou comme **librairie Python** — voir [LIBRARY.md](LIBRARY.md).
+
+> Fonctionnement interne et schémas de base de données → [TECHNICAL.md](TECHNICAL.md)
 
 ---
 
@@ -19,29 +21,6 @@ Utilisable comme CLI ou comme **librairie Python** (`from borgHelper import Borg
 ```bash
 cp borgHelper /usr/local/bin/borgHelper
 chmod +x /usr/local/bin/borgHelper
-```
-
-### Usage comme librairie Python
-
-`borgHelper.py` est un symlink vers `borgHelper` — placer les deux dans le même répertoire ou dans le `PYTHONPATH` :
-
-```python
-from borgHelper import BorgHelper, BorgHelperDB, BorgRunner
-
-bh = BorgHelper('/path/to/.borghelperrc')
-
-# Lancer un backup
-bh.backup('myserver')
-
-# Indexer les diffs
-bh.index('myserver')
-
-# Rapport offline (sans appel borg)
-bh.report_offline('myserver')
-
-# Accès direct aux couches
-bh.db    # BorgHelperDB — opérations SQLite
-bh.borg  # BorgRunner   — subprocess borg + config
 ```
 
 ---
@@ -84,25 +63,24 @@ SSH_REMFO        = 8022:localhost:22             # tunnel inverse SSH
 SSH_KEY          = /root/.ssh/id_borg
 
 # Identifiant SQLite (optionnel — surcharge le nick dans le nom des fichiers DB)
-DB_NAME                  = mon-serveur-home   # → borghelperrc-mon-serveur-home-cache.db
+DB_NAME          = mon-serveur-home              # → borghelperrc-mon-serveur-home-cache.db
 
 # Désactiver l'indexation pour ce dépôt (Search/FileHist/DuIdx non disponibles)
-NOIDX                    = 1
+NOIDX            = 1
 
 # Filtres d'indexation (chemins séparés par espaces, glob * et ? supportés)
-IDX_INCLUDE              = /etc /home /root   # liste blanche — seuls ces chemins indexés
-IDX_EXCLUDE              = /proc /sys /tmp /var/log  # liste noire — ces chemins ignorés
+IDX_INCLUDE      = /etc /home /root              # liste blanche — seuls ces chemins indexés
+IDX_EXCLUDE      = /proc /sys /tmp /var/log      # liste noire — ces chemins ignorés
 
 # Parallélisation de l'indexation (nombre de borg diff simultanés, défaut 4)
-IDX_WORKERS              = 4
+IDX_WORKERS      = 4
 
 # Limiter la taille de diff_index : conserver seulement les N dernières paires indexées
-# Les paires plus anciennes sont purgées automatiquement après chaque Index
 # Non défini = pas de limite (tout l'historique conservé)
-DIFF_KEEP                = 30
+DIFF_KEEP        = 30
 
 # Clef explicite (keyfile mode, utile si plusieurs nicks partagent le même dépôt)
-BORG_KEY_FILE            = /root/.config/borg/keys/abcdef123456
+BORG_KEY_FILE    = /root/.config/borg/keys/abcdef123456
 
 # Borg divers
 BORG_REMOTE_PATH            = borg1
@@ -112,6 +90,13 @@ BORG_RELOCATED_REPO_ACCESS_IS_OK = yes
 ```
 
 Le nickname (nom de section) sert d'identifiant partout avec `-n`.
+
+Répertoire de cache configurable via la clé `CACHE_DIR` dans la section `[DEFAULT]` :
+
+```ini
+[DEFAULT]
+CACHE_DIR = /data/borgcache
+```
 
 ---
 
@@ -189,7 +174,7 @@ Code retour 0 si succès ou warnings, 2 si erreur borg.
     "name": "mon-serveur-root-2026-06-05T02:00:04",
     "start": "2026-06-05T02:00:04.000000",
     "duration": 42.3,
-    "stats": { "nfiles": 183241, "original_size": 9871234560, "... ": "..." }
+    "stats": { "nfiles": 183241, "original_size": 9871234560, "...": "..." }
   },
   "cache": { "...": "..." },
   "borgHelper_file_counts": {
@@ -200,19 +185,7 @@ Code retour 0 si succès ou warnings, 2 si erreur borg.
 }
 ```
 
-En mode debug (`-d`), `borgHelper_files` s'ajoute avec la liste complète des fichiers touchés :
-
-```json
-{
-  "...": "...",
-  "borgHelper_file_counts": { "added": 2, "modified": 1 },
-  "borgHelper_files": [
-    { "change_type": "added",    "path": "/etc/hosts",         "size_before": null, "size_after": null },
-    { "change_type": "added",    "path": "/home/user/.bashrc", "size_before": null, "size_after": null },
-    { "change_type": "modified", "path": "/var/log/syslog",    "size_before": null, "size_after": null }
-  ]
-}
-```
+En mode debug (`-d`), `borgHelper_files` s'ajoute avec la liste complète des fichiers touchés.
 
 ---
 
@@ -226,7 +199,7 @@ borgHelper -c Prune -n ALL
 ```
 
 Requiert au moins une clef `KEEP_*` dans la conf.  
-Enchaîne automatiquement `borg compact`, invalide le cache SQLite, et purge les entrées orphelines du `diff.db` (archives supprimées retirées de `diff_index`, `diff_indexed_pairs`, `snapshot_file` et `archive_snapshot`).
+Enchaîne automatiquement `borg compact`, invalide le cache SQLite, et purge les entrées orphelines du `diff.db`.
 
 ---
 
@@ -237,7 +210,7 @@ Rapport sur l'état des sauvegardes — texte (prettytable) ou HTML.
 borgHelper -c Report -n mon-serveur
 borgHelper -c Report -n ALL
 borgHelper -c Report -n ALL -l              # sortie HTML
-borgHelper -c Report -n mon-serveur -N 5   # afficher 5 dernières archives (surcharge DISPLAY_BKP)
+borgHelper -c Report -n mon-serveur -N 5    # 5 dernières archives (surcharge DISPLAY_BKP)
 borgHelper -c Report -n ALL -j             # sortie JSON
 borgHelper -c Report -n ALL -o             # mode offline : stats depuis diff.db, aucun appel borg
 borgHelper -c Report -n ALL -o -j          # offline + JSON
@@ -245,46 +218,16 @@ borgHelper -c Report -n ALL -o -N 10       # offline + 10 dernières archives
 ```
 
 Code retour 1 si un dépôt dépasse `MAX_AGE_BKP` heures depuis la dernière sauvegarde.  
-Code retour 2 si un dépôt est inaccessible (erreur borg).
-
-Les données de rapport sont mises en cache par `last_modified` du dépôt (SQLite). Si le dépôt n'a pas changé depuis le dernier `Report`, un seul appel réseau est effectué (`borg info --json`) au lieu de trois.
-
-En cas d'erreur sur un dépôt, le rapport continue avec les autres serveurs. Le dépôt en erreur apparaît en rouge (HTML) ou préfixé `*** ERREUR` (ASCII) avec le message d'erreur dans la colonne `reste`.
-
-Colonnes résumé : nom, durée, depuis (heures), taille dernière, taille totale, récupérable, espace disque restant.
+Code retour 2 si un dépôt est inaccessible.
 
 **Statistiques de mouvement** (si l'index SQLite est disponible) :
-- **Tableau résumé** (1 ligne par serveur) : colonnes `+ajouté`, `-supprimé`, `=présent` du **dernier backup**
-- **Tableau détail** (1 ligne par archive) : mêmes colonnes pour chaque backup listé
-- Format : `N (P%) · SIZE` — nombre de fichiers, pourcentage relatif au backup précédent, et taille disque
-- `—` si l'archive n'est pas encore indexée (`borgHelper -c Index -n <nick>` pour indexer)
+- Colonnes `+ajouté`, `-supprimé`, `=présent` par archive
+- Format : `N (P%) · SIZE` — nombre, pourcentage relatif au backup précédent, taille
+- `—` si l'archive n'est pas encore indexée
 
 **Mode offline** (`-o`) — rapport sans appel borg, depuis `diff.db` uniquement :
-- Colonnes : dernière archive, date, taille, nfiles, +ajouté, -supprimé, =modifié
 - `taille` et `nfiles` disponibles si `archive_stats` est peuplée (après `Bkp` ou `Index`)
-- Pas de vérification de fraîcheur (`MAX_AGE_BKP`), pas d'info prunable
 - Combinable avec `-j`, `-l`, `-N <n>`
-- Erreur explicite si `diff.db` absent ou index vide
-
-**Sortie JSON** (`-j`) — structure :
-
-```json
-{
-  "summary": {
-    "mon-serveur": {
-      "last_backup": "2026-06-05T02:00:04",
-      "hours_since": 4.2,
-      "total_size": 9871234560,
-      "added": 12, "removed": 1, "modified": 3
-    }
-  },
-  "backups": {
-    "mon-serveur": [
-      { "name": "mon-serveur-root-2026-06-05T02:00:04", "start": "...", "... ": "..." }
-    ]
-  }
-}
-```
 
 ---
 
@@ -308,17 +251,13 @@ borgHelper -c LstBkpFls -n mon-serveur -b mon-serveur-root-2025-04-02T21:30:04
 ---
 
 ### `DiffBkp`
-Différences entre deux archives (fichiers modifiés/ajoutés/supprimés).  
-Repose sur `~/.borghelper-diff.db` — si la paire n'est pas encore indexée, le diff est calculé et stocké automatiquement.  
-Affichage en tableau : colonnes type / chemin / taille avant / taille après.
+Différences entre deux archives (fichiers modifiés/ajoutés/supprimés).
 
 ```bash
 borgHelper -c DiffBkp -n mon-serveur                          # 2 dernières archives
 borgHelper -c DiffBkp -n mon-serveur -b archive-ancienne      # vs dernière
 borgHelper -c DiffBkp -n mon-serveur -b archive-1,archive-2   # entre deux précises
 ```
-
-> Pour des réponses instantanées, lancer `Index` après chaque `Bkp`.
 
 ---
 
@@ -333,11 +272,8 @@ borgHelper -c Restore -n mon-serveur -f etc/nginx/nginx.conf \
 borgHelper -c Restore -n mon-serveur -f 'etc/nginx/*.conf' \
            -w /tmp/backup.tar            # glob → tar avec arborescence
 borgHelper -c Restore -n mon-serveur -f 'home/user/*.log' \
-           -W /tmp/logs.tgz             # glob → tgz plat (sans sous-répertoires)
-borgHelper -c Restore -n mon-serveur -f home/user \
-           -W /tmp/restauration         # répertoire plat
+           -W /tmp/logs.tgz             # glob → tgz plat
 borgHelper -c Restore -n mon-serveur -f 'etc/nginx/*.conf' -L          # liste les droits
-borgHelper -c Restore -n mon-serveur -f 'etc/nginx/*.conf' -L > droits.txt  # vers fichier texte
 borgHelper -c Restore -n mon-serveur -f 'home/user' -w - | tar -tvf -  # tar vers stdout
 borgHelper -c Restore -n mon-serveur -f 'home/user' -w - \
            | ssh autre "tar -xf - -C /restore"                          # pipe vers hôte distant
@@ -346,17 +282,12 @@ borgHelper -c Restore -n mon-serveur -f 'home/user' -w - \
 | Option | Description |
 |--------|-------------|
 | `-b` | Nom de l'archive — si absent : dernière archive SQLite contenant `-f` |
-| `-f` | Chemin exact ou glob (`*`, `?`) — ex : `etc/nginx/*.conf` |
+| `-f` | Chemin exact ou glob (`*`, `?`) |
 | `-w <dest>` | Restauration avec sous-répertoires (répertoire ou `.tar`/`.tgz`) |
 | `-w -` | Tar non-compressé vers stdout (pipeable) |
-| `-W <dest>` | Restauration plate — fichiers à la racine, sans sous-répertoires |
+| `-W <dest>` | Restauration plate — fichiers à la racine |
 | `-W -` | Tar plat non-compressé vers stdout |
-| `-L` | Affiche droits/propriétaires (format `ls -la`) sans restaurer — redirigeable vers un fichier texte |
-
-Si la cible est un `.tar` : crée ou ajoute au fichier existant (append).  
-Si la cible est un `.tgz` : crée uniquement — erreur (exit 3) si le fichier existe déjà (gzip ne supporte pas l'append).
-
-**Droits d'origine préservés** : `borg extract` utilise `--numeric-owner` pour conserver uid/gid numériques ; `tarfile` capture ensuite `mode`, `uid`, `gid`, `mtime` depuis les fichiers extraits. Les droits d'origine sont donc présents dans le tar (quand borgHelper est lancé en root).
+| `-L` | Affiche droits/propriétaires sans restaurer |
 
 ---
 
@@ -365,18 +296,16 @@ Monte/démonte les archives via FUSE.
 **Le dépôt ne peut pas être sauvegardé tant qu'il est monté.**
 
 ```bash
-borgHelper -c Mount -n mon-serveur               # toutes les archives (défaut)
-borgHelper -c Mount -n mon-serveur -b last       # dernière archive uniquement
-borgHelper -c Mount -n mon-serveur -b archive-id # archive précise
+borgHelper -c Mount -n mon-serveur               # toutes les archives
+borgHelper -c Mount -n mon-serveur -b last       # dernière archive
+borgHelper -c Mount -n mon-serveur -b archive-id
 borgHelper -c UMount -n mon-serveur
 ```
-
-Le répertoire `MOUNTPOINT` doit exister et être vide avant le montage.
 
 ---
 
 ### `Key`
-Exporte la clef du dépôt en format papier (à stocker hors ligne).
+Exporte la clef du dépôt en format papier.
 
 ```bash
 borgHelper -c Key -n mon-serveur
@@ -386,8 +315,7 @@ borgHelper -c Key -n ALL
 ---
 
 ### `DelBkp`
-Supprime une archive précise.  
-**Opération destructive.** Invalide le cache automatiquement.
+Supprime une archive précise. **Opération destructive.**
 
 ```bash
 borgHelper -c DelBkp -n mon-serveur -b archive-id
@@ -405,60 +333,51 @@ borgHelper -c Init -n mon-serveur
 ---
 
 ### `Index`
-Indexe les diffs entre archives consécutives dans `~/.borghelper-diff.db`.  
-Incrémental : paires déjà traitées ignorées. Met à jour le snapshot de la dernière archive à la fin.  
-À relancer après chaque `Bkp`.
+Indexe les diffs entre archives consécutives dans `diff.db`.  
+Incrémental — paires déjà traitées ignorées. Met à jour le snapshot de la dernière archive à la fin.
 
 ```bash
 borgHelper -c Index -n mon-serveur           # diffs + snapshot
 borgHelper -c Index -n ALL
-borgHelper -c Index -n mon-serveur -F        # force la réindexation complète (diffs + snapshot)
-borgHelper -c Index -n mon-serveur -S        # snapshot seul (sans recalculer les diffs)
+borgHelper -c Index -n mon-serveur -F        # force la réindexation complète
+borgHelper -c Index -n mon-serveur -S        # snapshot seul
 borgHelper -c Index -n mon-serveur -S -F     # force le snapshot seul
 ```
 
 | Option | Description |
 |--------|-------------|
-| `-F` | Supprime et recalcule toutes les paires existantes (utile si stats manquantes ou incohérentes) |
-| `-S` | Snapshot seul — indexe uniquement le listing de la dernière archive, sans toucher aux diffs |
+| `-F` | Supprime et recalcule toutes les paires existantes |
+| `-S` | Snapshot seul — indexe uniquement le listing de la dernière archive |
 
-Types d'événements stockés : `added`, `removed`, `modified`, `C` (permissions/proprio), `B` (lien cassé), `T` (type changé).
-
-Le snapshot (`-S`) permet à `Search` et `FileHist` de trouver les fichiers stables (jamais modifiés, donc absents du diff index). Appelé automatiquement en fin d'`Index` normal — utiliser `-S` uniquement si les archives ont changé sans relancer `Index`.
+Types d'événements : `added`, `removed`, `modified`, `C` (permissions), `B` (lien cassé), `T` (type changé).
 
 ---
 
 ### `Search`
-Cherche par nom de fichier dans l'index des diffs **et** dans le snapshot de la dernière archive.  
-Pattern libre (sous-chaîne) ou glob avec `*` et `?`.
+Cherche par nom de fichier dans l'index des diffs et dans le snapshot.
 
 ```bash
-borgHelper -c Search -f passwd -n mon-serveur         # sous-chaîne
-borgHelper -c Search -f '*.conf' -n ALL               # glob
-borgHelper -c Search -f '/etc/nginx*' -n mon-serveur  # préfixe
+borgHelper -c Search -f passwd -n mon-serveur
+borgHelper -c Search -f '*.conf' -n ALL
+borgHelper -c Search -f '/etc/nginx*' -n mon-serveur
 ```
 
-Colonnes : nick, date, archive, type, chemin, taille avant, taille après.  
-Type `présent` : fichier stable dans le backup, sans historique de changement récent.  
-Plage : `-b <archive>` (depuis X), `-B <archive>` (jusqu'à Y), `-b ALL` (tout), sans `-b`/`-B` (dernière paire).
+Plage : `-b <archive>` (depuis), `-B <archive>` (jusqu'à), `-b ALL` (tout), sans les deux (dernière paire).
 
 ---
 
 ### `FileHist`
-Historique complet des changements pour un chemin **exact**, incluant la présence dans le snapshot.
+Historique complet des changements pour un chemin exact.
 
 ```bash
 borgHelper -c FileHist -f /etc/nginx/nginx.conf -n mon-serveur
 borgHelper -c FileHist -f /var/lib/postgresql -n ALL
 ```
 
-Colonnes : nick, date, archive avant, archive après, type, taille avant, taille après.  
-Type `présent` : fichier trouvé dans le snapshot de la dernière archive (stable, non modifié récemment).
-
 ---
 
 ### `DuIdx`
-Résumé `du -sh`-like depuis le SQLite : taille totale et nombre d'entrées par type de changement sur un pattern de chemin.
+Résumé `du -sh`-like depuis le SQLite.
 
 ```bash
 borgHelper -c DuIdx -n mon-serveur                         # résumé global par type
@@ -467,173 +386,20 @@ borgHelper -c DuIdx -f 'home/*' -n mon-serveur             # détail sous home/
 borgHelper -c DuIdx -f '*.log' -n ALL                      # résumé global sur les .log
 borgHelper -c DuIdx -f '*' -s présent:desc -n mon-serveur  # trié par taille présent desc
 borgHelper -c DuIdx -f '*' -j -n mon-serveur               # sortie JSON
-borgHelper -c DuIdx -f '*' -b ALL -n mon-serveur           # toutes les archives
-borgHelper -c DuIdx -f '*' -b server-root-2026-01-01T02:00:00 -n mon-serveur  # depuis archive X
 ```
-
-Sans `-f` ou avec pattern sans `/*` : résumé global (type / nb / taille totale).  
-Avec `-f '*'` ou `-f 'path/*'` : vue pivotée par chemin — colonnes `added/modif` | `removed` | `présent`.  
-Tri avec `-s <col>[:asc|desc]` — colonnes : `chemin`, `added`, `removed`, `present`.  
-JSON avec `-j`.  
-Plage d'archives : `-b <archive>` (depuis X), `-B <archive>` (jusqu'à Y), `-b ALL` (tout), sans `-b`/`-B` (dernière paire).
 
 ---
 
-### `CacheInfo`
-Affiche le contenu du cache SQLite (`~/.borghelper-cache.db`).
+### `CacheInfo` / `CacheClean`
 
 ```bash
 borgHelper -c CacheInfo
 borgHelper -c CacheInfo -n mon-serveur
-```
-
----
-
-### `CacheClean`
-Supprime les entrées périmées du cache en vérifiant le `last_modified` courant de chaque dépôt.  
-Supprime aussi les entrées pour les nicks absents de la conf.
-
-```bash
 borgHelper -c CacheClean
 borgHelper -c CacheClean -n mon-serveur
 ```
 
----
-
-## Fichiers de données
-
-| Fichier | Contenu |
-|---------|---------|
-| `~/.borghelperrc` | Configuration des dépôts (INI) |
-| `~/.cache/borghelper/<conf>-<nick>-cache.db` | Cache des appels `borg info/list` (SQLite) |
-| `~/.cache/borghelper/<conf>-<nick>-diff.db` | Index des diffs et snapshots d'archives (SQLite) |
-
-`<conf>` = basename sanitisé du fichier de configuration (ex : `borghelperrc` pour `~/.borghelperrc`).  
-`<nick>` = identifiant du dépôt (ou valeur de `DB_NAME` si définie dans la section) — un fichier par dépôt.
-
-Le répertoire de stockage est configurable via la clé `CACHE_DIR` dans la section `[DEFAULT]` de `.borghelperrc` :
-
-```ini
-[DEFAULT]
-CACHE_DIR = /data/borgcache
-```
-
----
-
-## Schéma relationnel des bases de données
-
-### `cache.db`
-
-Cache des résultats `borg info` / `borg list`, invalidé par `last_modified` du dépôt.  
-Purge automatique après `DelBkp` et `Prune`. Nettoyage manuel : `CacheClean`.
-
-```mermaid
-erDiagram
-    cachejsonboexlm {
-        INTEGER id PK
-        TEXT nom "nick ou nick:prune"
-        TEXT lastmodified "last_modified du dépôt borg"
-        TEXT details "JSON sérialisé"
-    }
-```
-
-Contrainte d'unicité : `UNIQUE(nom, lastmodified)`.
-
----
-
-### `diff.db`
-
-Index des diffs inter-archives, snapshots et métadonnées d'archives. Deux tables de sentinelle (`diff_indexed_pairs`, `archive_snapshot_indexed`) protègent l'idempotence des indexations.
-
-`archive_snapshot` est une table mince qui référence `snapshot_file` par `file_id` — les chemins sont stockés une seule fois (déduplication). La vue `archive_snapshot_v` expose la jointure de façon transparente pour toutes les lectures.
-
-`archive_stats` stocke les métadonnées de taille par archive (peuplée par `Bkp` et `Index`) — utilisée par `Report -o` pour éviter tout appel borg.
-
-```mermaid
-erDiagram
-    diff_index {
-        INTEGER id PK
-        TEXT nick
-        TEXT archive_old
-        TEXT archive_new
-        TEXT archive_new_date "ISO datetime"
-        TEXT change_type "added|removed|modified|C|B|T"
-        TEXT path
-        INTEGER size_before "NULL si added"
-        INTEGER size_after "NULL si removed"
-        TEXT indexed_at
-    }
-
-    diff_indexed_pairs {
-        INTEGER id PK
-        TEXT nick
-        TEXT archive_old
-        TEXT archive_new "UNIQUE(nick,archive_old,archive_new)"
-        INTEGER entry_count
-        TEXT indexed_at
-    }
-
-    snapshot_file {
-        INTEGER id PK
-        TEXT nick
-        TEXT path "UNIQUE(nick, path)"
-        INTEGER size
-        TEXT mtime "ISO datetime"
-    }
-
-    archive_snapshot {
-        TEXT nick "PK partielle"
-        TEXT archive "PK partielle"
-        TEXT archive_date
-        INTEGER file_id FK
-    }
-
-    archive_snapshot_indexed {
-        TEXT nick "UNIQUE(nick, archive)"
-        TEXT archive
-        INTEGER entry_count
-        TEXT indexed_at
-    }
-
-    archive_stats {
-        TEXT nick PK
-        TEXT archive PK
-        TEXT archive_date
-        REAL duration
-        INTEGER original_size
-        INTEGER compressed_size
-        INTEGER deduplicated_size
-        INTEGER nfiles
-    }
-
-    snapshot_file ||--o{ archive_snapshot : "file_id → id"
-```
-
-**Vue** `archive_snapshot_v` : `archive_snapshot ⋈ snapshot_file` — utilisée par `Search`, `FileHist`, `DuIdx`, `Restore`.
-
-**Indexes** :
-
-| Table | Index | Colonnes | Requête cible |
-|-------|-------|----------|---------------|
-| `diff_index` | `idx_diff_nick_path` | `(nick, path)` | Search, FileHist |
-| `diff_index` | `idx_diff_nick_archive` | `(nick, archive_new)` | DiffBkp, Report |
-| `diff_index` | `idx_diff_nick_newtype` | `(nick, archive_new, change_type)` | stats Report |
-| `diff_index` | `idx_diff_nick_date` | `(nick, archive_new_date)` | filtres plage `-b`/`-B` (Search, DuIdx) |
-| `diff_indexed_pairs` | `idx_pairs_nick` | `(nick)` | suppressions Prune |
-| `snapshot_file` | `idx_snapfile_nick_path` | `(nick, path)` | insertion / lookup |
-| `archive_snapshot` | `idx_snap_nick_archive` | `(nick, archive)` | suppressions Prune |
-| `archive_stats` | `idx_astats_nick` | `(nick)` | Report -o, suppressions Prune |
-
----
-
-## Sentry
-
-Intégration optionnelle pour remonter les erreurs.  
-DSN lu dans l'ordre :
-
-1. Variable d'environnement `BORGHELPERC_SENTRY_DSN`
-2. Fichier pointé par `BORGHELPERC_SENTRY_FILE`
-3. Fichier `/usr/local/etc/borghelper-sentry`
+`CacheClean` vérifie le `last_modified` courant et supprime les entrées périmées ou pour des nicks absents de la conf.
 
 ---
 

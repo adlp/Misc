@@ -2,6 +2,12 @@
 
 ## 1.0.0 — 2026-06-06
 
+### Documentation : découpage en 3 fichiers
+
+- `README.md` — présentation, installation, config, toutes les commandes CLI, crontab, codes retour
+- `TECHNICAL.md` *(nouveau)* — architecture interne, schémas ERD cache.db + diff.db, indexes, flux d'indexation, gestion taille, migration schéma, Sentry
+- `LIBRARY.md` *(nouveau)* — usage des classes avec exemples complets (backup, report, search, requêtes SQL directes, script de supervision, référence méthodes)
+
 ### Refactoring : architecture 3 classes, importable comme librairie
 
 - `BorgHelperDB` : toutes les opérations SQLite (cache.db + diff.db)
