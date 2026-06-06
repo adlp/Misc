@@ -1,5 +1,20 @@
 # Changelog — borgHelper
 
+## 0.69 — 2026-06-06
+
+### Erreurs SQLite : messages explicites
+
+- Ajout helper `_db_connect(db_path)` : capture `OperationalError` à l'ouverture et affiche un message ciblé selon la cause :
+  - répertoire parent inexistant → nom du répertoire manquant
+  - permission refusée sur le répertoire → chemin concerné
+  - fichier existant non lisible/inscriptible → nom du fichier
+  - autre cause → message brut SQLite + chemin
+- `ensure_diff_db` : ajout `try/except DatabaseError` → message de corruption avec nom du fichier + instruction de suppression
+- `ensure_cache_db` : même traitement
+
+Avant : traceback Python brut sans indication du fichier.  
+Après : message d'erreur actionnable avec chemin précis et cause.
+
 ## 0.68 — 2026-06-06
 
 ### Performance — `diff.db` : réduction taille et fragmentation

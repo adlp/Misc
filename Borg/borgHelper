@@ -60,7 +60,7 @@ def get_cache_db(nick):
 def get_diff_db(nick):
     return os.path.join(_cache_dir,f"{_db_prefix}-{get_db_nick(nick)}-diff.db")
 
-Version="0.68"
+Version="0.69"
 ### TODO Mieux gerer les sorties d'erreure de borg (si pas tout les parametres)
 ### TODO Mieux gerer les parametres "manquant" du borgrc (mountpoint)
 ### TODO Mieux aider la creation du borgrc
@@ -701,21 +701,43 @@ def insert_in_db(db_path, table_name, nom, lastmodified, details):
     finally:
         conn.close()
 
+def _db_connect(db_path):
+    try:
+        return sqlite3.connect(db_path)
+    except sqlite3.OperationalError as e:
+        parent=os.path.dirname(os.path.abspath(db_path))
+        if not os.path.exists(parent):
+            printer(f"DB : répertoire introuvable : {parent}")
+        elif not os.access(parent,os.W_OK):
+            printer(f"DB : permission refusée sur le répertoire : {parent}")
+        elif os.path.exists(db_path) and not os.access(db_path,os.R_OK|os.W_OK):
+            printer(f"DB : fichier inaccessible : {db_path}")
+        else:
+            printer(f"DB : impossible d'ouvrir {db_path}")
+            printer(f"  -> {e}")
+        sys.exit(1)
+
 def ensure_cache_db(db_path):
-    conn=sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS cachejsonboexlm (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            nom          TEXT NOT NULL,
-            lastmodified TEXT NOT NULL,
-            details      TEXT,
-            UNIQUE(nom, lastmodified)
-        );
-        CREATE INDEX IF NOT EXISTS idx_cache_nom ON cachejsonboexlm(nom);
-    """)
-    conn.commit()
-    conn.close()
+    try:
+        conn=_db_connect(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS cachejsonboexlm (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                nom          TEXT NOT NULL,
+                lastmodified TEXT NOT NULL,
+                details      TEXT,
+                UNIQUE(nom, lastmodified)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cache_nom ON cachejsonboexlm(nom);
+        """)
+        conn.commit()
+        conn.close()
+    except sqlite3.DatabaseError as e:
+        printer(f"DB corrompue : {db_path}")
+        printer(f"  -> {e}")
+        printer("  Supprimez le fichier et relancez pour reconstruire le cache.")
+        sys.exit(1)
 
 def purge_stale_cache(nick,current_lm,db_path=None):
     if db_path is None:
@@ -976,88 +998,94 @@ def _migrate_archive_snapshot(conn):
     """)
 
 def ensure_diff_db(db_path):
-    conn=sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS diff_index (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            nick             TEXT NOT NULL,
-            archive_old      TEXT NOT NULL,
-            archive_new      TEXT NOT NULL,
-            archive_new_date TEXT,
-            change_type      TEXT NOT NULL,
-            path             TEXT NOT NULL,
-            size_before      INTEGER,
-            size_after       INTEGER,
-            indexed_at       TEXT DEFAULT (datetime('now'))
-        );
-        CREATE INDEX IF NOT EXISTS idx_diff_nick_path    ON diff_index(nick, path);
-        CREATE INDEX IF NOT EXISTS idx_diff_nick_archive ON diff_index(nick, archive_new);
-        CREATE INDEX IF NOT EXISTS idx_diff_nick_newtype ON diff_index(nick, archive_new, change_type);
-        CREATE INDEX IF NOT EXISTS idx_diff_nick_date    ON diff_index(nick, archive_new_date);
-        CREATE TABLE IF NOT EXISTS diff_indexed_pairs (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            nick        TEXT NOT NULL,
-            archive_old TEXT NOT NULL,
-            archive_new TEXT NOT NULL,
-            entry_count INTEGER DEFAULT 0,
-            indexed_at  TEXT DEFAULT (datetime('now')),
-            UNIQUE(nick, archive_old, archive_new)
-        );
-        CREATE INDEX IF NOT EXISTS idx_pairs_nick ON diff_indexed_pairs(nick);
-        CREATE TABLE IF NOT EXISTS snapshot_file (
-            id    INTEGER PRIMARY KEY AUTOINCREMENT,
-            nick  TEXT NOT NULL,
-            path  TEXT NOT NULL,
-            size  INTEGER,
-            mtime TEXT,
-            UNIQUE(nick, path)
-        );
-        CREATE INDEX IF NOT EXISTS idx_snapfile_nick_path ON snapshot_file(nick, path);
-        CREATE TABLE IF NOT EXISTS archive_snapshot_indexed (
-            nick        TEXT NOT NULL,
-            archive     TEXT NOT NULL,
-            entry_count INTEGER DEFAULT 0,
-            indexed_at  TEXT DEFAULT (datetime('now')),
-            UNIQUE(nick, archive)
-        );
-        CREATE TABLE IF NOT EXISTS archive_stats (
-            nick               TEXT NOT NULL,
-            archive            TEXT NOT NULL,
-            archive_date       TEXT,
-            duration           REAL,
-            original_size      INTEGER,
-            compressed_size    INTEGER,
-            deduplicated_size  INTEGER,
-            nfiles             INTEGER,
-            PRIMARY KEY (nick, archive)
-        );
-        CREATE INDEX IF NOT EXISTS idx_astats_nick ON archive_stats(nick);
-    """)
-    cols=[r[1] for r in conn.execute("PRAGMA table_info(archive_snapshot)").fetchall()]
-    if 'path' in cols:
-        _migrate_archive_snapshot(conn)
-    else:
+    try:
+        conn=_db_connect(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
         conn.executescript("""
-            CREATE TABLE IF NOT EXISTS archive_snapshot (
-                nick         TEXT NOT NULL,
-                archive      TEXT NOT NULL,
-                archive_date TEXT,
-                file_id      INTEGER NOT NULL,
-                PRIMARY KEY (nick, archive, file_id)
+            CREATE TABLE IF NOT EXISTS diff_index (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                nick             TEXT NOT NULL,
+                archive_old      TEXT NOT NULL,
+                archive_new      TEXT NOT NULL,
+                archive_new_date TEXT,
+                change_type      TEXT NOT NULL,
+                path             TEXT NOT NULL,
+                size_before      INTEGER,
+                size_after       INTEGER,
+                indexed_at       TEXT DEFAULT (datetime('now'))
             );
-            CREATE INDEX IF NOT EXISTS idx_snap_nick_archive ON archive_snapshot(nick, archive);
+            CREATE INDEX IF NOT EXISTS idx_diff_nick_path    ON diff_index(nick, path);
+            CREATE INDEX IF NOT EXISTS idx_diff_nick_archive ON diff_index(nick, archive_new);
+            CREATE INDEX IF NOT EXISTS idx_diff_nick_newtype ON diff_index(nick, archive_new, change_type);
+            CREATE INDEX IF NOT EXISTS idx_diff_nick_date    ON diff_index(nick, archive_new_date);
+            CREATE TABLE IF NOT EXISTS diff_indexed_pairs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                nick        TEXT NOT NULL,
+                archive_old TEXT NOT NULL,
+                archive_new TEXT NOT NULL,
+                entry_count INTEGER DEFAULT 0,
+                indexed_at  TEXT DEFAULT (datetime('now')),
+                UNIQUE(nick, archive_old, archive_new)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pairs_nick ON diff_indexed_pairs(nick);
+            CREATE TABLE IF NOT EXISTS snapshot_file (
+                id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                nick  TEXT NOT NULL,
+                path  TEXT NOT NULL,
+                size  INTEGER,
+                mtime TEXT,
+                UNIQUE(nick, path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_snapfile_nick_path ON snapshot_file(nick, path);
+            CREATE TABLE IF NOT EXISTS archive_snapshot_indexed (
+                nick        TEXT NOT NULL,
+                archive     TEXT NOT NULL,
+                entry_count INTEGER DEFAULT 0,
+                indexed_at  TEXT DEFAULT (datetime('now')),
+                UNIQUE(nick, archive)
+            );
+            CREATE TABLE IF NOT EXISTS archive_stats (
+                nick               TEXT NOT NULL,
+                archive            TEXT NOT NULL,
+                archive_date       TEXT,
+                duration           REAL,
+                original_size      INTEGER,
+                compressed_size    INTEGER,
+                deduplicated_size  INTEGER,
+                nfiles             INTEGER,
+                PRIMARY KEY (nick, archive)
+            );
+            CREATE INDEX IF NOT EXISTS idx_astats_nick ON archive_stats(nick);
         """)
-    conn.executescript("""
-        DROP VIEW IF EXISTS archive_snapshot_v;
-        CREATE VIEW archive_snapshot_v AS
-            SELECT s.nick, s.archive, s.archive_date, sf.path, sf.size, sf.mtime
-            FROM archive_snapshot s
-            JOIN snapshot_file sf ON sf.id=s.file_id;
-    """)
-    conn.commit()
-    conn.close()
+        cols=[r[1] for r in conn.execute("PRAGMA table_info(archive_snapshot)").fetchall()]
+        if 'path' in cols:
+            _migrate_archive_snapshot(conn)
+        else:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS archive_snapshot (
+                    nick         TEXT NOT NULL,
+                    archive      TEXT NOT NULL,
+                    archive_date TEXT,
+                    file_id      INTEGER NOT NULL,
+                    PRIMARY KEY (nick, archive, file_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_snap_nick_archive ON archive_snapshot(nick, archive);
+            """)
+        conn.executescript("""
+            DROP VIEW IF EXISTS archive_snapshot_v;
+            CREATE VIEW archive_snapshot_v AS
+                SELECT s.nick, s.archive, s.archive_date, sf.path, sf.size, sf.mtime
+                FROM archive_snapshot s
+                JOIN snapshot_file sf ON sf.id=s.file_id;
+        """)
+        conn.commit()
+        conn.close()
+    except sqlite3.DatabaseError as e:
+        printer(f"DB corrompue : {db_path}")
+        printer(f"  -> {e}")
+        printer("  Supprimez le fichier et relancez pour reconstruire l'index.")
+        sys.exit(1)
 
 def is_diff_pair_indexed(nick,archive_old,archive_new,db_path=None):
     if db_path is None:
