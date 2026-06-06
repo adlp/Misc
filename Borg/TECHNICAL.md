@@ -26,6 +26,7 @@ borgHelper est structuré en trois couches :
 | `~/.borghelperrc` | Configuration des dépôts (INI) |
 | `~/.cache/borghelper/<conf>-<nick>-cache.db` | Cache des appels `borg info/list` (SQLite) |
 | `~/.cache/borghelper/<conf>-<nick>-diff.db` | Index des diffs, snapshots et stats d'archives (SQLite) |
+| `~/.cache/borghelper/<conf>-<nick>-priority.lock` | Lock PID temporaire posé par `Bkp`/`Restore` (absent si aucune opération prioritaire) |
 
 - `<conf>` = basename sanitisé du fichier de configuration (ex : `borghelperrc` pour `~/.borghelperrc`)
 - `<nick>` = identifiant du dépôt (ou valeur de `DB_NAME` si définie dans la section) — un fichier par dépôt
@@ -219,6 +220,8 @@ erDiagram
 ### `Bkp` (indexation automatique)
 
 ```
+set_priority_lock(nick)                                  → <nick>-priority.lock (PID)
+    ↓
 borg create --list --filter AMCBTd
     ↓
 stderr parsé → _bkp_parse_list() → entrées de type added/modified/removed/C/B/T
@@ -229,6 +232,8 @@ filtre IDX_INCLUDE/IDX_EXCLUDE par fichier (en RAM)
 store_archive_stats(nick, archive_new, ...)              → archive_stats
 indexsnap(nick)                                          → snapshot_file + archive_snapshot
                                                             + snap_excluded_stats
+    ↓
+finally: clear_priority_lock(nick)                       → supprime le lock
 ```
 
 ### `Index` (indexation manuelle, parallèle)
@@ -291,6 +296,41 @@ IDX_INCLUDE = /home/*/documents/*       # uniquement les documents des utilisate
 ```
 
 > Note : `fnmatch` en Python traite `*` comme "n'importe quelle séquence de caractères **incluant** `/`". `/home/*/.bash_history` matche donc `/home/user/.bash_history` ET `/home/user/subdir/.bash_history`.
+
+---
+
+## Priorité Bkp/Restore sur Index
+
+`Bkp` et `Restore` sont prioritaires sur `Index` — si une indexation tourne en parallèle sur le même dépôt, elle s'interrompt proprement.
+
+### Mécanisme — lock PID
+
+```
+Bkp / Restore démarre
+    ↓
+set_priority_lock(nick) → écrit le PID dans <cache>/<prefix>-<nick>-priority.lock
+    ↓
+opération borg (create / extract)
+    ↓
+finally: clear_priority_lock(nick) → supprime le fichier
+         (garanti même en cas d'exception ou sys.exit)
+```
+
+```
+Index Phase 2 — après chaque borg diff terminé
+    ↓
+check_priority_lock(nick)
+    ├── lock absent           → continue normalement
+    ├── lock présent, PID vivant → interrompt : annule les futures en attente
+    │                              les diffs en cours terminent proprement
+    │                              Phase 3 : commit des résultats déjà obtenus
+    │                              affiche : "N paire(s) non indexée(s) — reprendre avec : borgHelper -c Index -n <nick>"
+    └── lock périmé (PID mort) → supprime le fichier, continue normalement
+```
+
+### Reprise transparente
+
+`Index` est incrémental : `diff_indexed_pairs` garde la sentinelle de chaque paire indexée. Après interruption, relancer `Index` saute les paires déjà traitées et reprend les suivantes.
 
 ---
 

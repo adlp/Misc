@@ -390,3 +390,6 @@ sys.exit(0)
 | `_diff_stats_for_nick(nick)` | Stats de mouvement par archive (used by Report) |
 | `store_excluded_diff_stats(nick, a_old, a_new, exclu, db_path)` | Stocke stats fichiers exclus d'une paire |
 | `store_excluded_snap_stats(nick, archive, count, size, db_path)` | Stocke stats fichiers exclus d'un snapshot |
+| `set_priority_lock(nick)` | Pose le lock prioritaire (écrit le PID) — appelé par `Bkp`/`Restore` |
+| `clear_priority_lock(nick)` | Supprime le lock prioritaire |
+| `check_priority_lock(nick)` | `True` si un processus prioritaire vivant tient le lock (stale → auto-supprimé) |

@@ -1,4 +1,4 @@
-# borgHelper  `v1.0.1`
+# borgHelper  `v1.0.2`
 
 Script Python 3 d'aide à la gestion des sauvegardes [BorgBackup](https://www.borgbackup.org/).  
 Centralise la configuration de plusieurs dépôts/serveurs dans un fichier INI et expose des commandes haut niveau.  
@@ -168,6 +168,8 @@ Code retour 0 si succès ou warnings, 2 si erreur borg.
 
 > `-I` désactive `--list` et toute écriture SQLite — utile si l'indexation est gérée séparément via `Index`.
 
+> **Priorité sur Index :** `Bkp` pose un lock pendant toute la durée de l'opération. Si `Index` tourne en parallèle sur le même dépôt, il s'interrompt proprement et affiche la commande pour reprendre.
+
 **Sortie stdout (JSON)** — si exit 0, le JSON borg est enrichi de deux clefs borgHelper :
 
 ```json
@@ -291,6 +293,8 @@ borgHelper -c Restore -n mon-serveur -f 'home/user' -w - \
 | `-W -` | Tar plat non-compressé vers stdout |
 | `-L` | Affiche droits/propriétaires sans restaurer |
 
+> **Priorité sur Index :** `Restore` pose un lock pendant toute la durée de l'extraction — même comportement que `Bkp`.
+
 ---
 
 ### `Mount` / `UMount`
@@ -352,6 +356,8 @@ borgHelper -c Index -n mon-serveur -S -F     # force le snapshot seul
 | `-S` | Snapshot seul — indexe uniquement le listing de la dernière archive |
 
 Types d'événements : `added`, `removed`, `modified`, `C` (permissions), `B` (lien cassé), `T` (type changé).
+
+> **Interruptible :** si `Bkp` ou `Restore` démarre pendant `Index`, l'indexation s'arrête proprement après les diffs en cours et affiche le nombre de paires restantes. Relancer `Index` reprend là où c'était arrêté (incrémental).
 
 ---
 
