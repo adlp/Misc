@@ -20,6 +20,29 @@ cp borgHelper /usr/local/bin/borgHelper
 chmod +x /usr/local/bin/borgHelper
 ```
 
+### Usage comme librairie Python
+
+`borgHelper.py` est un symlink vers `borgHelper` — placer les deux dans le même répertoire ou dans le `PYTHONPATH` :
+
+```python
+from borgHelper import BorgHelper, BorgHelperDB, BorgRunner
+
+bh = BorgHelper('/path/to/.borghelperrc')
+
+# Lancer un backup
+bh.backup('myserver')
+
+# Indexer les diffs
+bh.index('myserver')
+
+# Rapport offline (sans appel borg)
+bh.report_offline('myserver')
+
+# Accès direct aux couches
+bh.db    # BorgHelperDB — opérations SQLite
+bh.borg  # BorgRunner   — subprocess borg + config
+```
+
 ---
 
 ## Fichier de configuration
