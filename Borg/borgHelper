@@ -6,14 +6,15 @@
 #* See <http://www.gnu.org/licenses/>
 #*/
 
-import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time
+import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.6"
+Version="1.0.7"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 1.0.7 Index : terminate() des borg diff actifs sur priority lock (arrêt immédiat, pas d'attente)
 # 1.0.6 Bkp/Restore attendent fin des borg diff actifs avant borg create/extract (index-running lock)
 # 1.0.5 Priority lock par BORG_REPO : Bkp interrompt Index sur tous les nicks du même dépôt
 # 1.0.4 BORG_EXE : chemin borg configurable par section, fallback sur PATH
@@ -1662,21 +1663,34 @@ class BorgHelper:
                 printer(f"SQLite error (purge): {e}")
         # Phase 2 : borg diff en parallèle
         workers=max(1,int(cfg.get('IDX_WORKERS','4')))
+        borg_exe=cfg.get('BORG_EXE','borg')
+        varcur=os.environ.copy()
+        diff_env={k:cfg[k] for k in cfg.keys() if k in ('BORG_REPO','BORG_PASSPHRASE','BORG_REMOTE_PATH','BORG_RSH','BORG_SHOW_SYSINFO','BORG_RELOCATED_REPO_ACCESS_IS_OK','BORG_KEY_FILE')}
+        diff_env['PATH']=varcur['PATH']; diff_env['LC_ALL']='fr_FR.UTF-8'
+        running_procs={}; running_procs_lock=threading.Lock()
         def _run_diff(pair):
             a_old,a_new,date_new=pair
             print(f"  {nick}: {a_old} → {a_new}",flush=True)
-            rb2=self.borg.boex(nick,['diff',f"{cfg['BORG_REPO']}::{a_old}",a_new],debug=debug,retjson=False)
-            entries=[]; exclu={}  # exclu accumule en RAM jusqu'à fin du diff
-            for line in rb2['stdout']:
-                p=parse_diff_line(line)
-                if not p or not p['path']: continue
-                if self._idx_path_ok(p['path'],cfg):
-                    entries.append(p)
-                else:
-                    ct=p['change_type']
-                    sz=p.get('size_after') or p.get('size_before') or 0
-                    if ct not in exclu: exclu[ct]={'count':0,'size':0}
-                    exclu[ct]['count']+=1; exclu[ct]['size']+=sz
+            cmd=[borg_exe,'diff',f"{cfg['BORG_REPO']}::{a_old}",a_new]
+            ps=subprocess.Popen(cmd,encoding='utf-8',env=diff_env,cwd=os.getcwd(),
+                                stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            with running_procs_lock: running_procs[pair]=ps
+            try:
+                inf,_=ps.communicate()
+            finally:
+                with running_procs_lock: running_procs.pop(pair,None)
+            entries=[]; exclu={}
+            if ps.returncode in (0,1):
+                for line in inf.splitlines():
+                    p=parse_diff_line(line)
+                    if not p or not p['path']: continue
+                    if self._idx_path_ok(p['path'],cfg):
+                        entries.append(p)
+                    else:
+                        ct=p['change_type']
+                        sz=p.get('size_after') or p.get('size_before') or 0
+                        if ct not in exclu: exclu[ct]={'count':0,'size':0}
+                        exclu[ct]['count']+=1; exclu[ct]['size']+=sz
             return (a_old,a_new,date_new,entries,exclu)
         interrupted=False
         results=[]
@@ -1687,9 +1701,13 @@ class BorgHelper:
                     futs={ex.submit(_run_diff,p):p for p in pairs_todo}
                     for fut in as_completed(futs):
                         if not interrupted and self.db.check_priority_lock(nick):
-                            printer(f"  {nick}: opération prioritaire (Bkp/Restore) détectée — indexation interrompue")
+                            printer(f"  {nick}: opération prioritaire (Bkp/Restore) détectée — arrêt des diffs en cours")
                             for f in futs:
                                 if not f.done(): f.cancel()
+                            with running_procs_lock:
+                                for ps in running_procs.values():
+                                    try: ps.terminate()
+                                    except OSError: pass
                             interrupted=True
                         try: results.append(fut.result())
                         except CancelledError: pass

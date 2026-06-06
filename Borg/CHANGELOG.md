@@ -1,5 +1,18 @@
 # Changelog — borgHelper
 
+## 1.0.7 — 2026-06-06
+
+### Index : arrêt immédiat des `borg diff` actifs sur priority lock
+
+- `_run_diff` gère désormais son propre `subprocess.Popen` (au lieu de `boex`) pour conserver la référence au processus
+- Dict thread-safe `running_procs` stocke les `Popen` actifs pendant Phase 2
+- Quand le priority lock est détecté dans la boucle `as_completed` :
+  - futures en attente → `cancel()`
+  - processus `borg diff` en cours → `ps.terminate()` (SIGTERM)
+  - `ps.communicate()` retourne immédiatement → running lock libéré → `Bkp` débloqué en quelques secondes
+- Avant : `Bkp` attendait la fin naturelle de chaque diff (potentiellement plusieurs minutes)
+- Après : arrêt en quelques secondes, quelle que soit la taille des archives
+
 ## 1.0.6 — 2026-06-06
 
 ### Bkp/Restore : attente réelle de la fin des `borg diff` actifs
