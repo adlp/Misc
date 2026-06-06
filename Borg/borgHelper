@@ -6,14 +6,15 @@
 #* See <http://www.gnu.org/licenses/>
 #*/
 
-import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading,signal
+import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.9"
+Version="1.0.10"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 1.0.10 Index : SIGKILL + borg break-lock (SIGINT bloquait : cleanup borg lui-même bloquant)
 # 1.0.9 Index : SIGINT au lieu de SIGTERM — borg libère ses locks avant de mourir
 # 1.0.8 Index : thread moniteur priority lock (0.5s poll) — terminate() sans attendre fin d'un diff
 # 1.0.7 Index : terminate() des borg diff actifs sur priority lock (arrêt immédiat, pas d'attente)
@@ -1710,8 +1711,24 @@ class BorgHelper:
                                     if not f.done(): f.cancel()
                                 with running_procs_lock:
                                     for ps in list(running_procs.values()):
-                                        try: ps.send_signal(signal.SIGINT)
+                                        try: ps.kill()
                                         except OSError: pass
+                                # Attendre que les _run_diff aient reap leurs processus (plus de zombies)
+                                deadline=time.time()+15
+                                while time.time()<deadline:
+                                    with running_procs_lock:
+                                        if not running_procs: break
+                                    time.sleep(0.1)
+                                # Purger les stale locks borg laissés par les process tués
+                                if 'BORG_REPO' in cfg:
+                                    printer(f"  {nick}: purge des locks borg (break-lock)...")
+                                    try:
+                                        bl=subprocess.run([borg_exe,'break-lock',cfg['BORG_REPO']],
+                                                          env=diff_env,timeout=30,capture_output=True)
+                                        if bl.returncode!=0:
+                                            printer(f"  [WARN] borg break-lock : {bl.stderr.decode(errors='replace')[:200]}")
+                                    except Exception as e:
+                                        printer(f"  [WARN] borg break-lock échoué : {e}")
                                 return
                             time.sleep(0.5)
                     monitor=threading.Thread(target=_priority_monitor,daemon=True)

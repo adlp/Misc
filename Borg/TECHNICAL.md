@@ -332,7 +332,9 @@ ThreadPoolExecutor — borg diff en parallèle (Popen direct, running_procs dict
     ├── priority lock absent  → continue à surveiller
     └── priority lock détecté → interrupted_event.set()
                                  cancel() futures en attente
-                                 ps.send_signal(SIGINT) sur chaque Popen actif — borg libère ses locks (finally blocks)
+                                 ps.kill() (SIGKILL) sur chaque Popen actif
+                                 poll running_procs jusqu'à vide (zombies reapés, PIDs disparus)
+                                 borg break-lock <BORG_REPO> → supprime les stale lock files
                                  retour en ≤ 0.5 s quelle que soit la charge
     as_completed() collecte les résultats (CancelledError ignoré)
     ↓

@@ -1,5 +1,23 @@
 # Changelog — borgHelper
 
+## 1.0.10 — 2026-06-06
+
+### Index : SIGKILL + `borg break-lock` — arrêt garanti sans stale locks
+
+**Problème 1.0.9 :** SIGINT demande à borg de faire son cleanup, mais ce cleanup lui-même se bloque (I/O sur FUSE, ou opération interne en attente). `ps.communicate()` attend que le process meure → tout le threadpool hang → `wait_index_idle` timeout 120s → `borg create` voit encore les locks → échec.
+
+**Solution :**
+
+1. **SIGKILL** (`ps.kill()`) → mort instantanée, aucun cleanup, aucune chance de bloquer
+2. **Poll `running_procs`** jusqu'à vide (deadline 15 s) → les threads `_run_diff` ont exécuté `ps.communicate()` qui reap les zombies ; les PIDs ne sont plus dans la table de processus
+3. **`borg break-lock <BORG_REPO>`** → borg liste ses lock files, trouve les PIDs morts → les supprime → dépôt déverrouillé
+4. `clear_index_running_lock` → `wait_index_idle` retourne → `borg create` démarre sans conflit
+
+**Pourquoi le poll PIDs avant break-lock ?** Tant qu'un process est zombie (tué mais non reap), `os.kill(pid, 0)` retourne 0 — borg croit le lock légitime et ne le supprime pas. Le poll garantit que `ps.communicate()` (appel à `waitpid`) a reapé tous les zombies avant break-lock.
+
+- Import `signal` supprimé (inutile)
+- `ps.send_signal(signal.SIGINT)` → `ps.kill()` + poll `running_procs` + `borg break-lock`
+
 ## 1.0.9 — 2026-06-06
 
 ### Index : SIGINT au lieu de SIGTERM — libération propre des locks borg
