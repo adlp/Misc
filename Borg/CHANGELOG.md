@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## 1.0.9 — 2026-06-06
+
+### Index : SIGINT au lieu de SIGTERM — libération propre des locks borg
+
+**Problème :** `ps.terminate()` envoie SIGTERM au processus `borg diff`. Sous Python, SIGTERM appelle `_exit()` au niveau C — les blocs `finally` et les `__exit__` de context managers ne s'exécutent **pas**. Borg stocke ses locks dans des fichiers applicatifs (pas des OS file locks) via des context managers `with Lock(...):`. Avec SIGTERM, ces locks ne sont jamais libérés. Résultat : `borg create` voit des stale lock files et timeout.
+
+**Solution :** `ps.send_signal(signal.SIGINT)` à la place de `ps.terminate()`.  
+SIGINT (KeyboardInterrupt en Python) est intercepté par l'interpréteur Python, qui lève `KeyboardInterrupt` dans le thread courant. Cette exception remonte normalement à travers la pile : les blocs `finally` s'exécutent, les `with Lock():` appellent leur `__exit__` → borg supprime ses fichiers de lock → `borg create` trouve le dépôt libre.
+
+- Ajout de `signal` aux imports
+- `ps.terminate()` → `ps.send_signal(signal.SIGINT)` dans `_priority_monitor`
+
 ## 1.0.8 — 2026-06-06
 
 ### Index : thread moniteur priority lock — arrêt sans attendre la fin d'un diff
