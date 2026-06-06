@@ -1,5 +1,16 @@
 # Changelog — borgHelper
 
+## 1.0.11 — 2026-06-06
+
+### Report : fallback base uniquement si dépôt occupé
+
+- Si `Report` est lancé pendant un `Bkp`, `Restore` ou `Index` sur le même dépôt, borgHelper détecte le lock actif (`priority.lock` ou `index-running.lock`) et lit les données depuis la base SQLite (`archive_stats` + `diff_index`) au lieu d'appeler borg
+- Affiche un message : `dépôt occupé (Bkp/Index en cours) — rapport depuis la base uniquement`
+- Les champs borg-only (`taille`/unique_csize, `récupérable`/prune, `reste`/df) apparaissent vides — les autres champs (archives, tailles, diffs, durées) sont complets depuis l'index
+- Compatible multi-nick : chaque nick est évalué indépendamment (mixte online/offline possible)
+- Nouveau : `BorgHelperDB.check_index_running(nick)` — symétrique de `check_priority_lock`
+- Nouveau : `BorgHelper.prep_report_from_db(nick, maxp)` — construit `(tcmpl, tbkps)` depuis SQLite uniquement
+
 ## 1.0.10 — 2026-06-06
 
 ### Index : SIGKILL + `borg break-lock` — arrêt garanti sans stale locks

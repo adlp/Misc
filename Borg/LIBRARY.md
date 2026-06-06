@@ -395,4 +395,5 @@ sys.exit(0)
 | `check_priority_lock(nick)` | `True` si un processus prioritaire vivant tient le lock (stale → auto-supprimé) |
 | `set_index_running_lock(nick)` | Pose le lock "Index actif" pendant Phase 2 — appelé par `Index` |
 | `clear_index_running_lock(nick)` | Supprime le lock "Index actif" |
+| `check_index_running(nick)` | `True` si un Index vivant tient le running lock (stale → auto-supprimé) |
 | `wait_index_idle(nick, timeout=120)` | Attend jusqu'à `timeout` s que `Index` libère ses verrous borg |

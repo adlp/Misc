@@ -352,6 +352,26 @@ Phase 3 : commit des résultats (paires annulées/terminées non commitées → 
 
 ---
 
+## Report sur dépôt occupé
+
+Si `Report` est lancé pendant un `Bkp`, `Restore` ou `Index`, borgHelper détecte le lock actif et bascule automatiquement en mode base uniquement pour ce nick.
+
+```
+Report démarre pour nick N
+    ↓
+check_priority_lock(N) || check_index_running(N)
+    ├── False → prep_report() normal (appels borg)
+    └── True  → message "dépôt occupé — rapport depuis la base uniquement"
+                 prep_report_from_db() :
+                   archive_stats → tailles, durées, dates
+                   diff_index    → statistiques +/-/=
+                 champs borg-only (taille/unique_csize, récupérable, reste) → vides
+```
+
+Chaque nick est évalué indépendamment — un rapport multi-nick peut mixer des données online et offline.
+
+---
+
 ## Migration de schéma
 
 `ensure_diff_db()` détecte automatiquement l'ancien schéma de `archive_snapshot` (colonne `path` directe) et migre vers le schéma déduplication (`file_id → snapshot_file`) au premier lancement après mise à jour.

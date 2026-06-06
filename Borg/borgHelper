@@ -9,11 +9,12 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.10"
+Version="1.0.11"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 1.0.11 Report : détection dépôt occupé → données depuis archive_stats/diff_index uniquement
 # 1.0.10 Index : SIGKILL + borg break-lock (SIGINT bloquait : cleanup borg lui-même bloquant)
 # 1.0.9 Index : SIGINT au lieu de SIGTERM — borg libère ses locks avant de mourir
 # 1.0.8 Index : thread moniteur priority lock (0.5s poll) — terminate() sans attendre fin d'un diff
@@ -483,6 +484,18 @@ class BorgHelperDB:
     def clear_index_running_lock(self,nick):
         try: os.unlink(self._index_running_lock_path(nick))
         except OSError: pass
+
+    def check_index_running(self,nick):
+        p=self._index_running_lock_path(nick)
+        if not os.path.exists(p): return False
+        try:
+            with open(p) as f: pid=int(f.read().strip())
+            if pid==os.getpid(): return False
+            os.kill(pid,0); return True
+        except (OSError,ValueError):
+            try: os.unlink(p)
+            except OSError: pass
+            return False
 
     def wait_index_idle(self,nick,timeout=120):
         """Attend que l'Index en cours sur ce dépôt libère ses verrous borg (max timeout s)."""
@@ -1860,6 +1873,70 @@ class BorgHelper:
             totals=self.db._duidx_collect_global(nick,sql_pat,archive_from,archive_to)
             _duidx_print(totals,pattern,False,sort_by,reverse,as_json)
 
+    def prep_report_from_db(self,nick,maxp=None):
+        """Comme prep_report() mais lit uniquement l'index SQLite — utilisé quand le dépôt est occupé."""
+        db_path=self.db.get_diff_db(nick)
+        if not os.path.exists(db_path):
+            raise Exception(f"diff.db absent — lancez borgHelper -c Index -n {nick}")
+        self.db.ensure_diff_db(db_path)
+        try:
+            conn=sqlite3.connect(db_path)
+            rows=conn.execute("SELECT archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles FROM archive_stats WHERE nick=? ORDER BY archive_date",(nick,)).fetchall()
+            conn.close()
+        except sqlite3.Error as e:
+            raise Exception(f"SQLite error: {e}")
+        if not rows:
+            raise Exception(f"archive_stats vide — lancez borgHelper -c Index -n {nick}")
+        diff_stats=self.db._diff_stats_for_nick(nick)
+        def _fmt_stats(s,nf,total_sz=0):
+            na,nr,nm=s['added'],s['removed'],s['modified']
+            present=max(0,nf-na-nm); total_prev=present+nr+nm
+            present_sz=max(0,total_sz-s['added_sz']-s['modified_sz'])
+            pct_n=lambda n: f" ({100*n//total_prev}%)" if total_prev>0 else ""
+            pct_sz=lambda sz: f" ({100*sz//total_sz}%)" if total_sz>0 else ""
+            return {'+ajouté':f"{na}{pct_n(na)} · {convert_octets_readable(s['added_sz'])}{pct_sz(s['added_sz'])}",
+                    '-supprimé':f"{nr}{pct_n(nr)} · {convert_octets_readable(s['removed_sz'])}{pct_sz(s['removed_sz'])}",
+                    '=présent':f"{present}{pct_n(present)} · {convert_octets_readable(present_sz)}{pct_sz(present_sz)}"}
+        kept={}
+        for archive,arch_date,duration,orig,compr,dedup,nfiles in rows:
+            kept[archive]={'name':archive,'durationM':(duration or 0)/60,
+                'original_size':orig or 0,'compressed_size':compr or 0,
+                'deduplicated_size':dedup or 0,'nfiles':nfiles or 0,
+                'archive_date':arch_date,'prunMe':'No'}
+        c=len(kept)
+        last_arch=rows[-1][0]; last_date=rows[-1][1]
+        dabesi=d2DateNSince(last_date) if last_date else {'date':'—','since':0.0}
+        total_dedup=sum(v['deduplicated_size'] for v in kept.values())
+        last_k=kept[last_arch]
+        tcmpl={}
+        tcmpl[nick]={'nom':nick,'date derniere':dabesi['date'],'depuis':dabesi['since'],
+            'duree':last_k['durationM'],'derniere':last_k['deduplicated_size'],
+            'moy':total_dedup/c if c else 0,
+            'taille':None,'recuperable':None,'reste':None}
+        s_last=diff_stats.get(last_arch)
+        if s_last:
+            for k,v in _fmt_stats(s_last,last_k['nfiles'],last_k['original_size']).items(): tcmpl[nick][k]=v
+        else:
+            tcmpl[nick]['+ajouté']='—'; tcmpl[nick]['-supprimé']='—'; tcmpl[nick]['=présent']='—'
+        tbkps={'Prunable':{'name':'Prunable','original_size':0,'compressed_size':0,'deduplicated_size':0}}
+        display_keys=list(kept.keys())
+        if maxp is not None: display_keys=display_keys[-maxp:]
+        for arch in display_keys:
+            k=kept[arch]
+            tbkps[arch]={'name':arch,'duration':k['durationM'],
+                'original_size':k['original_size'],'compressed_size':k['compressed_size'],
+                'deduplicated_size':k['deduplicated_size'],'nfiles':k['nfiles']}
+            s=diff_stats.get(arch)
+            if s:
+                for kk,vv in _fmt_stats(s,k['nfiles'],k['original_size']).items(): tbkps[arch][kk]=vv
+            else:
+                tbkps[arch]['+ajouté']='—'; tbkps[arch]['-supprimé']='—'; tbkps[arch]['=présent']='—'
+        total_orig=sum(v['original_size'] for v in kept.values())
+        total_compr=sum(v['compressed_size'] for v in kept.values())
+        total_dedup2=sum(v['deduplicated_size'] for v in kept.values())
+        tbkps['Totaux']={'name':'Totaux','original_size':total_orig,'compressed_size':total_compr,'deduplicated_size':total_dedup2}
+        return tcmpl,tbkps
+
     def prep_report(self,nick,debug=0,maxp=None):
         cfg=self.borg.cfgreaded(nick,debug=debug)
         last_modified=self.borg._boex_last_modified(nick,debug=debug)
@@ -2028,8 +2105,10 @@ class BorgHelper:
         reshosto['nom']='Totaux'
         for nick in nicks.split(','):
             cfg=self.borg.cfgreaded(nick,debug=debug)
+            locked=self.db.check_priority_lock(nick) or self.db.check_index_running(nick)
+            if locked: printer(f"  {nick}: dépôt occupé (Bkp/Index en cours) — rapport depuis la base uniquement")
             try:
-                (tcmpl,tbkps)=self.prep_report(nick,debug=debug,maxp=maxp)
+                (tcmpl,tbkps)=self.prep_report_from_db(nick,maxp=maxp) if locked else self.prep_report(nick,debug=debug,maxp=maxp)
             except Exception as e:
                 errcode=2; printer(f"[ERREUR] {nick}: {e}"); err_msg=str(e)[:80]
                 if htrep:
@@ -2044,7 +2123,7 @@ class BorgHelper:
                 errcode=1
                 if htrep: errhost.append(nick)
                 else: tcmpl[nick]['nom']=f"***{nick}"
-            for i in ['duree','derniere','taille','recuperable']: reshosto[i]+=tcmpl[nick][i]
+            for i in ['duree','derniere','taille','recuperable']: reshosto[i]+=(tcmpl[nick][i] or 0)
             for i in ['derniere','moy','taille','recuperable','reste']:
                 if (i in tcmpl[nick].keys()) and not(tcmpl[nick][i] is None): tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
                 else: tcmpl[nick][i]=""
