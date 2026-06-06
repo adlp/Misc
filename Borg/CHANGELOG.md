@@ -1,5 +1,24 @@
 # Changelog — borgHelper
 
+## 1.0.1 — 2026-06-06
+
+### IDX_INCLUDE / IDX_EXCLUDE : glob complet + stats fichiers exclus
+
+**Patterns glob dans les filtres d'indexation :**
+- `_idx_path_ok` distingue maintenant explicitement patron glob (contient `*`, `?`, `[`) vs préfixe plain
+- Glob → `fnmatch` : `*` matche n'importe quelle séquence y compris `/`
+  - `*.bak` → filtre tous les fichiers `.bak` quel que soit le répertoire
+  - `/home/*/.bash_history` → filtre tous les `.bash_history` dans toute arborescence sous `/home/`
+- Préfixe plain → `startswith` (comportement inchangé)
+
+**Stats des fichiers exclus (nouvelles tables diff.db) :**
+- `diff_excluded_stats` — agrégat par paire (archive_old, archive_new) et change_type : `file_count`, `total_size`
+- `snap_excluded_stats` — agrégat par archive snapshot : `file_count`, `total_size`
+- Compteurs accumulés en RAM pendant chaque `borg diff` / listing snapshot, écrits en lot en fin de paire
+- Peuplés par `Index`, `IndexSnap (-S)` et `Bkp` (taille non disponible pour Bkp car `--list` ne donne pas les tailles)
+- Nettoyés automatiquement lors du Prune (archives supprimées) et lors du force-reindex (`-F`)
+- Nouvelles méthodes `BorgHelperDB` : `store_excluded_diff_stats`, `store_excluded_snap_stats`
+
 ## 1.0.0 — 2026-06-06
 
 ### Documentation : découpage en 3 fichiers

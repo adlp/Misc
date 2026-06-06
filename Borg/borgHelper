@@ -9,11 +9,12 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re
 from concurrent.futures import ThreadPoolExecutor,as_completed
 
-Version="1.0.0"
+Version="1.0.1"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 1.0.1 IDX_INCLUDE/IDX_EXCLUDE : glob complet (*.bak, /home/*/.bash_history) + stats fichiers exclus en DB
 # 1.0.0 Refactoring : BorgHelperDB / BorgRunner / BorgHelper — importable comme librairie
 # 0.69 SQLite : messages d'erreur explicites (fichier inaccessible, corrompu, répertoire manquant)
 # 0.68 diff.db : VACUUM après Prune, auto_vacuum=INCREMENTAL, DIFF_KEEP purge auto
@@ -545,6 +546,23 @@ class BorgHelperDB:
                     PRIMARY KEY (nick, archive)
                 );
                 CREATE INDEX IF NOT EXISTS idx_astats_nick ON archive_stats(nick);
+                CREATE TABLE IF NOT EXISTS diff_excluded_stats (
+                    nick        TEXT NOT NULL,
+                    archive_old TEXT NOT NULL,
+                    archive_new TEXT NOT NULL,
+                    change_type TEXT NOT NULL,
+                    file_count  INTEGER NOT NULL DEFAULT 0,
+                    total_size  INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (nick, archive_old, archive_new, change_type)
+                );
+                CREATE INDEX IF NOT EXISTS idx_exclu_nick_arch ON diff_excluded_stats(nick, archive_new);
+                CREATE TABLE IF NOT EXISTS snap_excluded_stats (
+                    nick       TEXT NOT NULL,
+                    archive    TEXT NOT NULL,
+                    file_count INTEGER NOT NULL DEFAULT 0,
+                    total_size INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (nick, archive)
+                );
             """)
             cols=[r[1] for r in conn.execute("PRAGMA table_info(archive_snapshot)").fetchall()]
             if 'path' in cols:
@@ -658,6 +676,32 @@ class BorgHelperDB:
             print(f"{nick}: DIFF_KEEP={keep} — {len(to_delete)} paire(s) ancienne(s) purgées")
         except sqlite3.Error as e:
             printer(f"SQLite error (diff_keep_purge): {e}")
+
+    def store_excluded_diff_stats(self,nick,archive_old,archive_new,exclu,db_path=None):
+        """exclu : {change_type: {'count': N, 'size': M}}"""
+        if not exclu: return
+        if db_path is None: db_path=self.get_diff_db(nick)
+        try:
+            conn=sqlite3.connect(db_path)
+            conn.executemany(
+                "INSERT OR REPLACE INTO diff_excluded_stats "
+                "(nick,archive_old,archive_new,change_type,file_count,total_size) VALUES (?,?,?,?,?,?)",
+                [(nick,archive_old,archive_new,ct,s['count'],s['size']) for ct,s in exclu.items()])
+            conn.commit(); conn.close()
+        except sqlite3.Error as e:
+            printer(f"SQLite error (excluded_diff_stats): {e}")
+
+    def store_excluded_snap_stats(self,nick,archive,count,size,db_path=None):
+        if count==0: return
+        if db_path is None: db_path=self.get_diff_db(nick)
+        try:
+            conn=sqlite3.connect(db_path)
+            conn.execute(
+                "INSERT OR REPLACE INTO snap_excluded_stats (nick,archive,file_count,total_size) VALUES (?,?,?,?)",
+                (nick,archive,count,size))
+            conn.commit(); conn.close()
+        except sqlite3.Error as e:
+            printer(f"SQLite error (excluded_snap_stats): {e}")
 
     def _cleanup_snapshot_file_orphans(self,nick,conn):
         conn.execute("DELETE FROM snapshot_file WHERE nick=? AND id NOT IN (SELECT file_id FROM archive_snapshot WHERE nick=?)",(nick,nick))
@@ -930,10 +974,16 @@ class BorgHelper:
         import fnmatch
         includes=[p for p in cfg.get('IDX_INCLUDE','').split() if p]
         excludes=[p for p in cfg.get('IDX_EXCLUDE','').split() if p]
+        def _match(path,pat):
+            # glob pattern (*, ?, [) → fnmatch (* matches any chars including /)
+            # plain prefix (/home/, /etc) → startswith
+            if any(c in pat for c in ('*','?','[')):
+                return fnmatch.fnmatch(path,pat)
+            return path.startswith(pat)
         if includes:
-            if not any(path.startswith(p) or fnmatch.fnmatch(path,p) for p in includes): return False
+            if not any(_match(path,p) for p in includes): return False
         if excludes:
-            if any(path.startswith(p) or fnmatch.fnmatch(path,p) for p in excludes): return False
+            if any(_match(path,p) for p in excludes): return False
         return True
 
     def cache_prune_dryrun(self,nick,last_modified,debug=0,db_path=None):
@@ -1016,12 +1066,16 @@ class BorgHelper:
                 r3=conn.execute(f"DELETE FROM archive_snapshot WHERE nick=? AND archive NOT IN ({ph})",[nick]+lst).rowcount
                 r4=conn.execute(f"DELETE FROM archive_snapshot_indexed WHERE nick=? AND archive NOT IN ({ph})",[nick]+lst).rowcount
                 conn.execute(f"DELETE FROM archive_stats WHERE nick=? AND archive NOT IN ({ph})",[nick]+lst)
+                conn.execute(f"DELETE FROM diff_excluded_stats WHERE nick=? AND (archive_old NOT IN ({ph}) OR archive_new NOT IN ({ph}))",[nick]+lst+lst)
+                conn.execute(f"DELETE FROM snap_excluded_stats WHERE nick=? AND archive NOT IN ({ph})",[nick]+lst)
             else:
                 r1=conn.execute("DELETE FROM diff_index WHERE nick=?",(nick,)).rowcount
                 r2=conn.execute("DELETE FROM diff_indexed_pairs WHERE nick=?",(nick,)).rowcount
                 r3=conn.execute("DELETE FROM archive_snapshot WHERE nick=?",(nick,)).rowcount
                 r4=conn.execute("DELETE FROM archive_snapshot_indexed WHERE nick=?",(nick,)).rowcount
                 conn.execute("DELETE FROM archive_stats WHERE nick=?",(nick,))
+                conn.execute("DELETE FROM diff_excluded_stats WHERE nick=?",(nick,))
+                conn.execute("DELETE FROM snap_excluded_stats WHERE nick=?",(nick,))
             self.db._cleanup_snapshot_file_orphans(nick,conn)
             conn.commit()
             total=r1+r2+r3+r4
@@ -1380,9 +1434,20 @@ class BorgHelper:
                     self.db.store_archive_stats(nick,archive_new,archive_new_date,arch_info.get('duration'),
                         st.get('original_size'),st.get('compressed_size'),st.get('deduplicated_size'),st.get('nfiles'),db_path)
                 if not no_index and archive_new and archive_old:
-                    entries=[e for e in _bkp_parse_list(anaRet['stderr']) if self._idx_path_ok(e['path'],cfg)]
+                    all_bkp=_bkp_parse_list(anaRet['stderr'])
+                    entries=[]; exclu={}
+                    for e in all_bkp:
+                        if self._idx_path_ok(e['path'],cfg):
+                            entries.append(e)
+                        else:
+                            ct=e['change_type']
+                            if ct not in exclu: exclu[ct]={'count':0,'size':0}
+                            exclu[ct]['count']+=1
                     self.db.store_diff_entries(nick,archive_old,archive_new,archive_new_date,entries,db_path)
-                    print(f"Index : {len(entries)} entrée(s) stockée(s) ({archive_old} → {archive_new})",file=sys.stderr,flush=True)
+                    if exclu:
+                        self.db.store_excluded_diff_stats(nick,archive_old,archive_new,exclu,db_path)
+                    exclu_msg=f" ({sum(s['count'] for s in exclu.values())} exclus)" if exclu else ""
+                    print(f"Index : {len(entries)} entrée(s) stockée(s) ({archive_old} → {archive_new}){exclu_msg}",file=sys.stderr,flush=True)
                 if not no_index: self.indexsnap(nick,debug=debug)
             except Exception as e:
                 printer(f"[WARN] indexation post-backup échouée : {e}")
@@ -1447,7 +1512,7 @@ class BorgHelper:
                 if isinstance(i,dict): printer(f"  [{i.get('levelname','?')}] {i.get('message',i)}")
                 elif isinstance(i,str) and i.strip(): printer(f"  {i}")
             return rb2['exitcode']
-        files=[]
+        files=[]; exclu_count=0; exclu_size=0
         for line in rb2['stdout']:
             line=line.strip()
             if not line: continue
@@ -1458,8 +1523,14 @@ class BorgHelper:
                 path=parts[2]
                 if self._idx_path_ok(path,cfg):
                     files.append({'path':path,'size':size,'mtime':parts[1]})
+                else:
+                    exclu_count+=1; exclu_size+=(size or 0)
         self.db.store_archive_snapshot(nick,archive_name,archive_date,files,db_path)
-        print(f"{nick}: {len(files)} fichiers dans le snapshot {archive_name}")
+        if exclu_count:
+            self.db.store_excluded_snap_stats(nick,archive_name,exclu_count,exclu_size,db_path)
+            print(f"{nick}: {len(files)} fichiers dans le snapshot {archive_name} ({exclu_count} exclus, {convert_octets_readable(exclu_size)})")
+        else:
+            print(f"{nick}: {len(files)} fichiers dans le snapshot {archive_name}")
         return 0
 
     def index(self,nick,debug=0,db_path=None,force=False):
@@ -1490,6 +1561,7 @@ class BorgHelper:
                 for a_old,a_new in pairs_to_purge:
                     conn.execute("DELETE FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
                     conn.execute("DELETE FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
+                    conn.execute("DELETE FROM diff_excluded_stats WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
                 conn.commit(); conn.close()
             except sqlite3.Error as e:
                 printer(f"SQLite error (purge): {e}")
@@ -1499,8 +1571,18 @@ class BorgHelper:
             a_old,a_new,date_new=pair
             print(f"  {nick}: {a_old} → {a_new}",flush=True)
             rb2=self.borg.boex(nick,['diff',f"{cfg['BORG_REPO']}::{a_old}",a_new],debug=debug,retjson=False)
-            entries=[p for line in rb2['stdout'] for p in [parse_diff_line(line)] if p and p['path'] and self._idx_path_ok(p['path'],cfg)]
-            return (a_old,a_new,date_new,entries)
+            entries=[]; exclu={}  # exclu accumule en RAM jusqu'à fin du diff
+            for line in rb2['stdout']:
+                p=parse_diff_line(line)
+                if not p or not p['path']: continue
+                if self._idx_path_ok(p['path'],cfg):
+                    entries.append(p)
+                else:
+                    ct=p['change_type']
+                    sz=p.get('size_after') or p.get('size_before') or 0
+                    if ct not in exclu: exclu[ct]={'count':0,'size':0}
+                    exclu[ct]['count']+=1; exclu[ct]['size']+=sz
+            return (a_old,a_new,date_new,entries,exclu)
         results=[]
         if pairs_todo:
             with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -1512,11 +1594,16 @@ class BorgHelper:
         if results:
             try:
                 conn=sqlite3.connect(db_path)
-                for a_old,a_new,date_new,entries in results:
+                for a_old,a_new,date_new,entries,exclu in results:
                     if entries:
                         conn.executemany("INSERT INTO diff_index (nick,archive_old,archive_new,archive_new_date,change_type,path,size_before,size_after) VALUES (?,?,?,?,?,?,?,?)",
                             [(nick,a_old,a_new,date_new,e['change_type'],e['path'],e.get('size_before'),e.get('size_after')) for e in entries])
                     conn.execute("INSERT OR IGNORE INTO diff_indexed_pairs (nick,archive_old,archive_new,entry_count) VALUES (?,?,?,?)",(nick,a_old,a_new,len(entries)))
+                    if exclu:
+                        conn.executemany(
+                            "INSERT OR REPLACE INTO diff_excluded_stats "
+                            "(nick,archive_old,archive_new,change_type,file_count,total_size) VALUES (?,?,?,?,?,?)",
+                            [(nick,a_old,a_new,ct,s['count'],s['size']) for ct,s in exclu.items()])
                 conn.commit(); conn.close()
             except sqlite3.Error as e:
                 printer(f"SQLite error (insert): {e}")
