@@ -9,11 +9,12 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.12"
+Version="1.0.13"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 1.0.13 Index : SQLite verrouillé → attente automatique déverrouillage (retry 2s, max 300s)
 # 1.0.12 Report -o : même résumé que Report, toutes machines affichées même sans index
 # 1.0.11 Report : détection dépôt occupé → données depuis archive_stats/diff_index uniquement
 # 1.0.10 Index : SIGKILL + borg break-lock (SIGINT bloquait : cleanup borg lui-même bloquant)
@@ -704,28 +705,44 @@ class BorgHelperDB:
             result=cur.fetchone(); conn.close(); return result is not None
         except sqlite3.Error: return False
 
+    def _with_lock_retry(self,fn,max_wait=300):
+        t0=time.time(); warned=False
+        while True:
+            try: return fn()
+            except sqlite3.OperationalError as e:
+                if "database is locked" not in str(e).lower(): raise
+                if time.time()-t0>=max_wait: raise
+                if not warned:
+                    printer(f"  SQLite verrouillé — attente déverrouillage (max {max_wait}s)...")
+                    warned=True
+                time.sleep(2)
+
     def store_diff_entries(self,nick,archive_old,archive_new,archive_new_date,entries,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
-        try:
+        def _do():
             conn=sqlite3.connect(db_path)
-            if entries:
-                conn.executemany(
-                    "INSERT INTO diff_index (nick,archive_old,archive_new,archive_new_date,change_type,path,size_before,size_after) VALUES (?,?,?,?,?,?,?,?)",
-                    [(nick,archive_old,archive_new,archive_new_date,e['change_type'],e['path'],e.get('size_before'),e.get('size_after')) for e in entries])
-            conn.execute("INSERT OR IGNORE INTO diff_indexed_pairs (nick,archive_old,archive_new,entry_count) VALUES (?,?,?,?)",(nick,archive_old,archive_new,len(entries)))
-            conn.commit(); conn.close(); return True
-        except sqlite3.Error as e:
-            printer(f"SQLite error: {e}"); return False
+            try:
+                if entries:
+                    conn.executemany(
+                        "INSERT INTO diff_index (nick,archive_old,archive_new,archive_new_date,change_type,path,size_before,size_after) VALUES (?,?,?,?,?,?,?,?)",
+                        [(nick,archive_old,archive_new,archive_new_date,e['change_type'],e['path'],e.get('size_before'),e.get('size_after')) for e in entries])
+                conn.execute("INSERT OR IGNORE INTO diff_indexed_pairs (nick,archive_old,archive_new,entry_count) VALUES (?,?,?,?)",(nick,archive_old,archive_new,len(entries)))
+                conn.commit(); return True
+            finally: conn.close()
+        try: return self._with_lock_retry(_do)
+        except sqlite3.Error as e: printer(f"SQLite error: {e}"); return False
 
     def store_archive_stats(self,nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
-        try:
+        def _do():
             conn=sqlite3.connect(db_path)
-            conn.execute("INSERT OR REPLACE INTO archive_stats (nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles) VALUES (?,?,?,?,?,?,?,?)",
-                         (nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles))
-            conn.commit(); conn.close(); return True
-        except sqlite3.Error as e:
-            printer(f"SQLite error (archive_stats): {e}"); return False
+            try:
+                conn.execute("INSERT OR REPLACE INTO archive_stats (nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles) VALUES (?,?,?,?,?,?,?,?)",
+                             (nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles))
+                conn.commit(); return True
+            finally: conn.close()
+        try: return self._with_lock_retry(_do)
+        except sqlite3.Error as e: printer(f"SQLite error (archive_stats): {e}"); return False
 
     def is_archive_snapshot_indexed(self,nick,archive,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
@@ -738,57 +755,65 @@ class BorgHelperDB:
 
     def store_archive_snapshot(self,nick,archive,archive_date,files,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
-        try:
+        def _do():
             conn=sqlite3.connect(db_path)
-            if files:
-                conn.executemany("INSERT OR REPLACE INTO snapshot_file (nick,path,size,mtime) VALUES (?,?,?,?)",
-                                 [(nick,f['path'],f.get('size'),f.get('mtime')) for f in files])
-                conn.executemany("INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,file_id) SELECT ?,?,?,id FROM snapshot_file WHERE nick=? AND path=?",
-                                 [(nick,archive,archive_date,nick,f['path']) for f in files])
-            conn.execute("INSERT OR IGNORE INTO archive_snapshot_indexed (nick,archive,entry_count) VALUES (?,?,?)",(nick,archive,len(files)))
-            conn.commit(); conn.close(); return True
-        except sqlite3.Error as e:
-            printer(f"SQLite error: {e}"); return False
+            try:
+                if files:
+                    conn.executemany("INSERT OR REPLACE INTO snapshot_file (nick,path,size,mtime) VALUES (?,?,?,?)",
+                                     [(nick,f['path'],f.get('size'),f.get('mtime')) for f in files])
+                    conn.executemany("INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,file_id) SELECT ?,?,?,id FROM snapshot_file WHERE nick=? AND path=?",
+                                     [(nick,archive,archive_date,nick,f['path']) for f in files])
+                conn.execute("INSERT OR IGNORE INTO archive_snapshot_indexed (nick,archive,entry_count) VALUES (?,?,?)",(nick,archive,len(files)))
+                conn.commit(); return True
+            finally: conn.close()
+        try: return self._with_lock_retry(_do)
+        except sqlite3.Error as e: printer(f"SQLite error: {e}"); return False
 
     def _diff_keep_purge(self,nick,keep,db_path):
-        try:
+        def _do():
             conn=sqlite3.connect(db_path)
-            rows=conn.execute("SELECT archive_old,archive_new FROM diff_indexed_pairs WHERE nick=? ORDER BY indexed_at DESC",(nick,)).fetchall()
-            to_delete=rows[keep:]
-            if not to_delete: conn.close(); return
-            for a_old,a_new in to_delete:
-                conn.execute("DELETE FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
-                conn.execute("DELETE FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
-            conn.commit(); conn.close()
-            print(f"{nick}: DIFF_KEEP={keep} — {len(to_delete)} paire(s) ancienne(s) purgées")
-        except sqlite3.Error as e:
-            printer(f"SQLite error (diff_keep_purge): {e}")
+            try:
+                rows=conn.execute("SELECT archive_old,archive_new FROM diff_indexed_pairs WHERE nick=? ORDER BY indexed_at DESC",(nick,)).fetchall()
+                to_delete=rows[keep:]
+                if not to_delete: return
+                for a_old,a_new in to_delete:
+                    conn.execute("DELETE FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
+                    conn.execute("DELETE FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
+                conn.commit()
+                print(f"{nick}: DIFF_KEEP={keep} — {len(to_delete)} paire(s) ancienne(s) purgées")
+            finally: conn.close()
+        try: self._with_lock_retry(_do)
+        except sqlite3.Error as e: printer(f"SQLite error (diff_keep_purge): {e}")
 
     def store_excluded_diff_stats(self,nick,archive_old,archive_new,exclu,db_path=None):
         """exclu : {change_type: {'count': N, 'size': M}}"""
         if not exclu: return
         if db_path is None: db_path=self.get_diff_db(nick)
-        try:
+        def _do():
             conn=sqlite3.connect(db_path)
-            conn.executemany(
-                "INSERT OR REPLACE INTO diff_excluded_stats "
-                "(nick,archive_old,archive_new,change_type,file_count,total_size) VALUES (?,?,?,?,?,?)",
-                [(nick,archive_old,archive_new,ct,s['count'],s['size']) for ct,s in exclu.items()])
-            conn.commit(); conn.close()
-        except sqlite3.Error as e:
-            printer(f"SQLite error (excluded_diff_stats): {e}")
+            try:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO diff_excluded_stats "
+                    "(nick,archive_old,archive_new,change_type,file_count,total_size) VALUES (?,?,?,?,?,?)",
+                    [(nick,archive_old,archive_new,ct,s['count'],s['size']) for ct,s in exclu.items()])
+                conn.commit()
+            finally: conn.close()
+        try: self._with_lock_retry(_do)
+        except sqlite3.Error as e: printer(f"SQLite error (excluded_diff_stats): {e}")
 
     def store_excluded_snap_stats(self,nick,archive,count,size,db_path=None):
         if count==0: return
         if db_path is None: db_path=self.get_diff_db(nick)
-        try:
+        def _do():
             conn=sqlite3.connect(db_path)
-            conn.execute(
-                "INSERT OR REPLACE INTO snap_excluded_stats (nick,archive,file_count,total_size) VALUES (?,?,?,?)",
-                (nick,archive,count,size))
-            conn.commit(); conn.close()
-        except sqlite3.Error as e:
-            printer(f"SQLite error (excluded_snap_stats): {e}")
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO snap_excluded_stats (nick,archive,file_count,total_size) VALUES (?,?,?,?)",
+                    (nick,archive,count,size))
+                conn.commit()
+            finally: conn.close()
+        try: self._with_lock_retry(_do)
+        except sqlite3.Error as e: printer(f"SQLite error (excluded_snap_stats): {e}")
 
     def _cleanup_snapshot_file_orphans(self,nick,conn):
         conn.execute("DELETE FROM snapshot_file WHERE nick=? AND id NOT IN (SELECT file_id FROM archive_snapshot WHERE nick=?)",(nick,nick))

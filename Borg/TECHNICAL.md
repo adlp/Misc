@@ -352,6 +352,26 @@ Phase 3 : commit des résultats (paires annulées/terminées non commitées → 
 
 ---
 
+## SQLite verrouillé pendant l'indexation
+
+Si `Index` ou `Bkp` tente d'écrire dans `diff.db` alors qu'un autre processus (backup ou restauration sur le même dépôt) tient un verrou SQLite, l'opération attend automatiquement au lieu d'échouer.
+
+```
+store_diff_entries / store_archive_stats / store_archive_snapshot
+_diff_keep_purge / store_excluded_diff_stats / store_excluded_snap_stats
+    ↓
+_with_lock_retry(fn, max_wait=300)
+    ├── fn() réussit → retour immédiat
+    └── OperationalError "database is locked"
+            → message "SQLite verrouillé — attente déverrouillage (max 300s)..."  (une seule fois)
+            → sleep 2 s → retry fn()
+            → ... jusqu'à max_wait secondes
+            └── si toujours bloqué après 300 s → re-raise → erreur normale
+```
+
+- Chaque tentative ouvre et ferme sa propre connexion (`try/finally conn.close()`) — aucune fuite de connexion entre deux essais
+- La valeur `max_wait=300` couvre les backups longs sans attendre indéfiniment
+
 ## Report sur dépôt occupé
 
 Si `Report` est lancé pendant un `Bkp`, `Restore` ou `Index`, borgHelper détecte le lock actif et bascule automatiquement en mode base uniquement pour ce nick.
