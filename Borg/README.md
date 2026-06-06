@@ -1,4 +1,4 @@
-# borgHelper  `v1.0.0`
+# borgHelper  `v1.0.1`
 
 Script Python 3 d'aide à la gestion des sauvegardes [BorgBackup](https://www.borgbackup.org/).  
 Centralise la configuration de plusieurs dépôts/serveurs dans un fichier INI et expose des commandes haut niveau.  
@@ -68,9 +68,11 @@ DB_NAME          = mon-serveur-home              # → borghelperrc-mon-serveur-
 # Désactiver l'indexation pour ce dépôt (Search/FileHist/DuIdx non disponibles)
 NOIDX            = 1
 
-# Filtres d'indexation (chemins séparés par espaces, glob * et ? supportés)
+# Filtres d'indexation (séparés par espaces)
+# Préfixe plain : /home/, /etc  → startswith
+# Pattern glob  : *.bak, /home/*/.bash_history  → * matche tout y compris /
 IDX_INCLUDE      = /etc /home /root              # liste blanche — seuls ces chemins indexés
-IDX_EXCLUDE      = /proc /sys /tmp /var/log      # liste noire — ces chemins ignorés
+IDX_EXCLUDE      = /proc /sys /tmp /var/log *.bak /home/*/.bash_history  # liste noire
 
 # Parallélisation de l'indexation (nombre de borg diff simultanés, défaut 4)
 IDX_WORKERS      = 4

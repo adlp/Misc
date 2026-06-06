@@ -61,7 +61,7 @@ Contrainte : `UNIQUE(nom, lastmodified)`.
 
 ## Base de données `diff.db`
 
-Index des diffs inter-archives, snapshots du dernier état, et métadonnées de taille par archive.
+Index des diffs inter-archives, snapshots du dernier état, métadonnées de taille et statistiques des fichiers exclus par les filtres d'indexation.
 
 ### Comportement WAL et auto-vacuum
 
@@ -97,6 +97,17 @@ Sentinelle d'idempotence pour les snapshots — une ligne par archive dont le sn
 Métadonnées de taille par archive (original, compressé, dédupliqué, nfiles, durée).  
 Peuplée par `Bkp` (depuis le JSON borg) et par `Index` (via `borg info --json`).  
 Utilisée par `Report -o` pour produire un rapport complet sans aucun appel borg.
+
+#### `diff_excluded_stats`
+Agrégat des fichiers filtrés par `IDX_INCLUDE`/`IDX_EXCLUDE` lors de l'indexation des diffs.  
+Une ligne par (nick, archive_old, archive_new, change_type) : `file_count` + `total_size`.  
+Peuplée par `Index` et `Bkp` (taille non disponible pour `Bkp` car `--list` ne retourne pas les tailles).  
+Permet de savoir combien de fichiers ont été intentionnellement exclus de l'index et quelle taille ils représentent.
+
+#### `snap_excluded_stats`
+Agrégat des fichiers filtrés lors de l'indexation du snapshot de la dernière archive.  
+Une ligne par (nick, archive) : `file_count` + `total_size`.  
+Peuplée par `IndexSnap` (`-S`) et en fin d'`Index` normal.
 
 ### Vue `archive_snapshot_v`
 
@@ -168,6 +179,22 @@ erDiagram
         INTEGER nfiles
     }
 
+    diff_excluded_stats {
+        TEXT nick PK
+        TEXT archive_old PK
+        TEXT archive_new PK
+        TEXT change_type PK
+        INTEGER file_count
+        INTEGER total_size
+    }
+
+    snap_excluded_stats {
+        TEXT nick PK
+        TEXT archive PK
+        INTEGER file_count
+        INTEGER total_size
+    }
+
     snapshot_file ||--o{ archive_snapshot : "file_id → id"
 ```
 
@@ -183,6 +210,7 @@ erDiagram
 | `snapshot_file` | `idx_snapfile_nick_path` | `(nick, path)` | insertion / lookup |
 | `archive_snapshot` | `idx_snap_nick_archive` | `(nick, archive)` | suppressions Prune |
 | `archive_stats` | `idx_astats_nick` | `(nick)` | Report -o, suppressions Prune |
+| `diff_excluded_stats` | `idx_exclu_nick_arch` | `(nick, archive_new)` | consultation stats exclus |
 
 ---
 
@@ -195,9 +223,12 @@ borg create --list --filter AMCBTd
     ↓
 stderr parsé → _bkp_parse_list() → entrées de type added/modified/removed/C/B/T
     ↓
-store_diff_entries(nick, archive_old, archive_new, ...)  → diff_index + diff_indexed_pairs
+filtre IDX_INCLUDE/IDX_EXCLUDE par fichier (en RAM)
+    ├── inclus  → store_diff_entries()       → diff_index + diff_indexed_pairs
+    └── exclus  → store_excluded_diff_stats() → diff_excluded_stats (count seul, taille = 0)
 store_archive_stats(nick, archive_new, ...)              → archive_stats
 indexsnap(nick)                                          → snapshot_file + archive_snapshot
+                                                            + snap_excluded_stats
 ```
 
 ### `Index` (indexation manuelle, parallèle)
@@ -206,16 +237,21 @@ indexsnap(nick)                                          → snapshot_file + arc
 borg list --json
     ↓
 Phase 1 : déterminer les paires manquantes (diff_indexed_pairs)
+          si force : purge diff_index + diff_indexed_pairs + diff_excluded_stats
     ↓
 Phase 2 : ThreadPoolExecutor(IDX_WORKERS) → borg diff par paire en parallèle
+          pour chaque ligne : filtre IDX_INCLUDE/IDX_EXCLUDE
+          compteurs exclus accumulés en RAM jusqu'à fin du diff
     ↓
-Phase 3 : insert groupé (connexion SQLite unique) → diff_index + diff_indexed_pairs
+Phase 3 : insert groupé (connexion SQLite unique)
+          → diff_index + diff_indexed_pairs
+          → diff_excluded_stats (count + total_size par change_type)
     ↓
 DIFF_KEEP : purge des paires au-delà de la limite
     ↓
 borg info --json (seulement si archive_stats manquantes) → archive_stats
     ↓
-indexsnap() → snapshot_file + archive_snapshot
+indexsnap() → snapshot_file + archive_snapshot + snap_excluded_stats
 ```
 
 ---
@@ -227,9 +263,34 @@ Pour les dépôts à fort volume (plusieurs GB de diff.db) :
 | Levier | Paramètre | Effet |
 |--------|-----------|-------|
 | Purge automatique | `DIFF_KEEP = N` | Supprime les paires au-delà des N dernières après chaque Index |
-| Filtre chemins | `IDX_INCLUDE` / `IDX_EXCLUDE` | Réduit le nombre d'entrées indexées |
+| Filtre chemins | `IDX_INCLUDE` / `IDX_EXCLUDE` | Réduit le nombre d'entrées indexées ; stats des exclus dans `diff_excluded_stats` / `snap_excluded_stats` |
 | Vacuum post-prune | automatique | Récupère l'espace après suppression d'archives |
 | Auto-vacuum | `PRAGMA auto_vacuum=INCREMENTAL` | Récupération progressive en continu |
+
+---
+
+## Filtres d'indexation : patterns glob
+
+`IDX_INCLUDE` et `IDX_EXCLUDE` supportent deux syntaxes :
+
+| Syntaxe | Exemple | Comportement |
+|---------|---------|--------------|
+| Préfixe plain | `/home/`, `/etc` | `path.startswith(pattern)` — tout chemin commençant par ce préfixe |
+| Pattern glob | `*.bak`, `/home/*/.bash_history` | `fnmatch(path, pattern)` — `*` matche toute séquence **y compris** `/` |
+
+La distinction est automatique : si le pattern contient `*`, `?` ou `[`, fnmatch est utilisé ; sinon startswith.
+
+**Exemples :**
+
+```ini
+IDX_EXCLUDE = *.bak *.tmp *.swp         # tous les .bak/.tmp/.swp dans toute arborescence
+IDX_EXCLUDE = /home/*/.bash_history     # .bash_history dans tout sous-répertoire de /home/
+IDX_EXCLUDE = /home/*/.cache/*          # tout le cache utilisateur
+IDX_INCLUDE = /etc /home /root          # préfixes plains (pas de glob)
+IDX_INCLUDE = /home/*/documents/*       # uniquement les documents des utilisateurs
+```
+
+> Note : `fnmatch` en Python traite `*` comme "n'importe quelle séquence de caractères **incluant** `/`". `/home/*/.bash_history` matche donc `/home/user/.bash_history` ET `/home/user/subdir/.bash_history`.
 
 ---
 

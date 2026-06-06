@@ -252,6 +252,48 @@ for path, nb in rows:
 conn.close()
 ```
 
+### Consulter les fichiers exclus des filtres d'indexation
+
+```python
+import sqlite3
+from borgHelper import BorgHelper
+
+bh = BorgHelper()
+
+# Stats exclus du diff (par paire d'archives)
+db_path = bh.db.get_diff_db('mon-serveur')
+conn = sqlite3.connect(db_path)
+
+# Vue d'ensemble : total exclus par change_type sur toutes les paires
+rows = conn.execute(
+    "SELECT change_type, SUM(file_count) as nb, SUM(total_size) as sz "
+    "FROM diff_excluded_stats WHERE nick=? GROUP BY change_type",
+    ('mon-serveur',)
+).fetchall()
+for ct, nb, sz in rows:
+    from borgHelper import convert_octets_readable
+    print(f"  exclus {ct}: {nb} fichiers, {convert_octets_readable(sz or 0)}")
+
+# Détail par archive
+rows = conn.execute(
+    "SELECT archive_new, change_type, file_count, total_size "
+    "FROM diff_excluded_stats WHERE nick=? ORDER BY archive_new, change_type",
+    ('mon-serveur',)
+).fetchall()
+
+# Stats exclus du snapshot (dernière archive)
+row = conn.execute(
+    "SELECT archive, file_count, total_size FROM snap_excluded_stats WHERE nick=? "
+    "ORDER BY archive DESC LIMIT 1",
+    ('mon-serveur',)
+).fetchone()
+if row:
+    arch, cnt, sz = row
+    print(f"Snapshot {arch}: {cnt} fichiers exclus ({convert_octets_readable(sz or 0)})")
+
+conn.close()
+```
+
 ### Stocker des stats depuis borg info
 
 ```python
@@ -336,3 +378,15 @@ sys.exit(0)
 | `stats(nick, debug)` | État de montage |
 | `cache_info(nick, debug)` | Affiche le cache |
 | `cache_clean(nick, debug)` | Nettoie le cache |
+
+### Méthodes `BorgHelperDB` utiles en lecture
+
+| Méthode | Description |
+|---------|-------------|
+| `get_diff_db(nick)` | Chemin du diff.db d'un nick |
+| `get_cache_db(nick)` | Chemin du cache.db d'un nick |
+| `is_diff_pair_indexed(nick, a_old, a_new)` | Vérifie si une paire est indexée |
+| `is_archive_snapshot_indexed(nick, archive)` | Vérifie si le snapshot est indexé |
+| `_diff_stats_for_nick(nick)` | Stats de mouvement par archive (used by Report) |
+| `store_excluded_diff_stats(nick, a_old, a_new, exclu, db_path)` | Stocke stats fichiers exclus d'une paire |
+| `store_excluded_snap_stats(nick, archive, count, size, db_path)` | Stocke stats fichiers exclus d'un snapshot |
