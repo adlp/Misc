@@ -9,11 +9,12 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.4"
+Version="1.0.5"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 1.0.5 Priority lock par BORG_REPO : Bkp interrompt Index sur tous les nicks du même dépôt
 # 1.0.4 BORG_EXE : chemin borg configurable par section, fallback sur PATH
 # 1.0.3 DiffBkp : affichage ligne par ligne +/-/= depuis l'index SQLite, résumé compteurs
 # 1.0.2 Bkp/Restore prioritaires sur Index : lock PID, indexation interrompue proprement et reprise
@@ -432,7 +433,12 @@ class BorgHelperDB:
         return os.path.join(self.cache_dir,f"{self.db_prefix}-{self.get_db_nick(nick)}-diff.db")
 
     def _priority_lock_path(self,nick):
-        return os.path.join(self.cache_dir,f"{self.db_prefix}-{self.get_db_nick(nick)}-priority.lock")
+        cfg=self._cfg_reader(nick) if self._cfg_reader else None
+        if cfg and 'BORG_REPO' in cfg:
+            repo_key=re.sub(r'[^a-zA-Z0-9_-]','_',cfg['BORG_REPO'])
+        else:
+            repo_key=self.get_db_nick(nick)
+        return os.path.join(self.cache_dir,f"{self.db_prefix}-{repo_key}-priority.lock")
 
     def set_priority_lock(self,nick):
         try:

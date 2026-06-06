@@ -1,5 +1,14 @@
 # Changelog — borgHelper
 
+## 1.0.5 — 2026-06-06
+
+### Priority lock par BORG_REPO (inter-nicks)
+
+- Correction : le lock prioritaire est maintenant keyed sur `BORG_REPO` (sanitisé) plutôt que sur le nick
+- Si plusieurs nicks pointent le même dépôt borg, `Bkp` sur `nick-A` interrompt `Index` sur `nick-B`, `nick-C`, etc. (même `BORG_REPO`)
+- Nicks sur des dépôts différents → locks différents → aucune interférence
+- Fallback sur le nick si `BORG_REPO` non disponible (comportement inchangé pour usage standalone)
+
 ## 1.0.4 — 2026-06-06
 
 ### BORG_EXE : chemin borg configurable
