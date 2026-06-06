@@ -1,5 +1,27 @@
 # Changelog — borgHelper
 
+## 1.0.0 — 2026-06-06
+
+### Refactoring : architecture 3 classes, importable comme librairie
+
+- `BorgHelperDB` : toutes les opérations SQLite (cache.db + diff.db)
+- `BorgRunner` : subprocess borg + lecture/écriture borghelperrc
+- `BorgHelper` : services haut niveau, combine DB + Borg
+
+API librairie :
+```python
+from borgHelper import BorgHelper
+bh = BorgHelper('/path/to/.borghelperrc')
+bh.backup('myserver')
+bh.index('myserver')
+bh.report('myserver')
+```
+
+- `if __name__ == '__main__': _cli_main()` — importable sans effets de bord
+- Comportement CLI identique (optab, dispatch, exit codes inchangés)
+- Méthodes publiques : `backup`, `prune`, `index`, `indexsnap`, `report`, `report_offline`, `search`, `filehist`, `duidx`, `diffbkp`, `restore`, `stats`, `key`, `mount`, `umount`, `cache_info`, `cache_clean`, etc.
+- 1999 lignes (−1060 vs 0.69 : suppression inline changelog, dead code, legacy functions)
+
 ## 0.69 — 2026-06-06
 
 ### Erreurs SQLite : messages explicites
