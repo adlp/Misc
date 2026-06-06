@@ -328,15 +328,17 @@ Index Phase 2
 set_index_running_lock(nick)  → <repo>-index-running.lock (PID)
     ↓
 ThreadPoolExecutor — borg diff en parallèle (Popen direct, running_procs dict)
-    après chaque diff terminé : check_priority_lock(nick)
-    ├── absent           → continue
-    ├── PID vivant       → cancel() futures en attente
-    │                      ps.terminate() sur chaque Popen actif (SIGTERM)
-    │                      communicate() retourne → diffs stoppés en secondes
-    │                      interrupted=True
-    └── PID mort (stale) → supprime, continue
+    thread moniteur daemon (_priority_monitor) — poll 0.5 s
+    ├── priority lock absent  → continue à surveiller
+    └── priority lock détecté → interrupted_event.set()
+                                 cancel() futures en attente
+                                 ps.terminate() sur chaque Popen actif (SIGTERM)
+                                 retour en ≤ 0.5 s quelle que soit la charge
+    as_completed() collecte les résultats (CancelledError ignoré)
     ↓
-finally: clear_index_running_lock(nick)  → <repo>-index-running.lock supprimé
+finally: interrupted_event.set() → arrête le moniteur
+         monitor.join(timeout=2)
+         clear_index_running_lock(nick)  → <repo>-index-running.lock supprimé
          ← Bkp/Restore débloqué ici (wait_index_idle retourne)
     ↓
 Phase 3 : commit des résultats (paires annulées/terminées non commitées → reprises au prochain Index)

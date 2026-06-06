@@ -1,5 +1,20 @@
 # Changelog — borgHelper
 
+## 1.0.8 — 2026-06-06
+
+### Index : thread moniteur priority lock — arrêt sans attendre la fin d'un diff
+
+**Problème :** En 1.0.7, le check priority lock était dans la boucle `as_completed`. Si tous les workers `IDX_WORKERS` étaient bloqués dans `ps.communicate()`, aucun future ne complétait → `as_completed` ne progressait pas → `terminate()` non appelé → `Bkp` attendait jusqu'à 120 s.
+
+**Solution — thread moniteur dédié :**
+- Un thread daemon `_priority_monitor` démarre dès la soumission des futures, poll le priority lock toutes les 0.5 s
+- Dès détection : `interrupted_event.set()`, `cancel()` sur les futures en attente, `ps.terminate()` sur tous les `Popen` actifs via `running_procs`
+- Indépendant du rythme de `as_completed` — réagit dans les 0.5 s quelle que soit la charge
+- Thread arrêté proprement (`interrupted_event.set()` dans `finally`, `monitor.join(timeout=2)`)
+- `interrupted` booléen remplacé par `interrupted_event.is_set()` pour cohérence
+
+**Délai d'interruption :** ≤ 0.5 s après pose du priority lock par `Bkp`
+
 ## 1.0.7 — 2026-06-06
 
 ### Index : arrêt immédiat des `borg diff` actifs sur priority lock

@@ -9,11 +9,12 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.7"
+Version="1.0.8"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 1.0.8 Index : thread moniteur priority lock (0.5s poll) — terminate() sans attendre fin d'un diff
 # 1.0.7 Index : terminate() des borg diff actifs sur priority lock (arrêt immédiat, pas d'attente)
 # 1.0.6 Bkp/Restore attendent fin des borg diff actifs avant borg create/extract (index-running lock)
 # 1.0.5 Priority lock par BORG_REPO : Bkp interrompt Index sur tous les nicks du même dépôt
@@ -1692,29 +1693,39 @@ class BorgHelper:
                         if ct not in exclu: exclu[ct]={'count':0,'size':0}
                         exclu[ct]['count']+=1; exclu[ct]['size']+=sz
             return (a_old,a_new,date_new,entries,exclu)
-        interrupted=False
+        interrupted_event=threading.Event()
         results=[]
         if pairs_todo:
             self.db.set_index_running_lock(nick)
             try:
                 with ThreadPoolExecutor(max_workers=workers) as ex:
                     futs={ex.submit(_run_diff,p):p for p in pairs_todo}
-                    for fut in as_completed(futs):
-                        if not interrupted and self.db.check_priority_lock(nick):
-                            printer(f"  {nick}: opération prioritaire (Bkp/Restore) détectée — arrêt des diffs en cours")
-                            for f in futs:
-                                if not f.done(): f.cancel()
-                            with running_procs_lock:
-                                for ps in running_procs.values():
-                                    try: ps.terminate()
-                                    except OSError: pass
-                            interrupted=True
-                        try: results.append(fut.result())
-                        except CancelledError: pass
-                        except Exception as e: printer(f"[WARN] borg diff échoué : {e}")
+                    def _priority_monitor():
+                        while not interrupted_event.is_set():
+                            if self.db.check_priority_lock(nick):
+                                printer(f"  {nick}: opération prioritaire (Bkp/Restore) détectée — arrêt des diffs en cours")
+                                interrupted_event.set()
+                                for f in list(futs):
+                                    if not f.done(): f.cancel()
+                                with running_procs_lock:
+                                    for ps in list(running_procs.values()):
+                                        try: ps.terminate()
+                                        except OSError: pass
+                                return
+                            time.sleep(0.5)
+                    monitor=threading.Thread(target=_priority_monitor,daemon=True)
+                    monitor.start()
+                    try:
+                        for fut in as_completed(futs):
+                            try: results.append(fut.result())
+                            except CancelledError: pass
+                            except Exception as e: printer(f"[WARN] borg diff échoué : {e}")
+                    finally:
+                        interrupted_event.set()
+                        monitor.join(timeout=2)
             finally:
                 self.db.clear_index_running_lock(nick)
-        if interrupted:
+        if interrupted_event.is_set():
             remaining=len(pairs_todo)-len(results)
             if remaining: printer(f"  {nick}: {remaining} paire(s) non indexée(s) — reprendre avec : borgHelper -c Index -n {nick}")
         # Phase 3 : insert groupé
