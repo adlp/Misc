@@ -9,11 +9,12 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.11"
+Version="1.0.12"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 1.0.12 Report -o : même résumé que Report, toutes machines affichées même sans index
 # 1.0.11 Report : détection dépôt occupé → données depuis archive_stats/diff_index uniquement
 # 1.0.10 Index : SIGKILL + borg break-lock (SIGINT bloquait : cleanup borg lui-même bloquant)
 # 1.0.9 Index : SIGINT au lieu de SIGTERM — borg libère ses locks avant de mourir
@@ -2034,70 +2035,68 @@ class BorgHelper:
         return tcmpl,tbkps
 
     def report_offline(self,nicks,htrep=False,debug=0,maxp=None,as_json=False):
-        from prettytable import PrettyTable
-        summary={}; detail={}
-        def _fmt(n,sz): return f"{n} · {convert_octets_readable(sz)}" if n else '—'
+        reshos={}; resbck={}; reshosto={}; errcode=0; errhost=[]
+        for i in ['duree','derniere','taille','recuperable']: reshosto[i]=0
+        reshosto['nom']='Totaux'
         for nick in nicks.split(','):
-            db_path=self.db.get_diff_db(nick)
-            if not os.path.exists(db_path):
-                printer(f"[ERREUR] {nick}: diff.db absent — lancez borgHelper -c Index -n {nick}"); continue
-            self.db.ensure_diff_db(db_path)
-            diff_stats=self.db._diff_stats_for_nick(nick)
-            if not diff_stats:
-                printer(f"[ERREUR] {nick}: index vide — lancez borgHelper -c Index -n {nick}"); continue
+            cfg=self.borg.cfgreaded(nick,debug=debug)
             try:
-                conn=sqlite3.connect(db_path)
-                rows=conn.execute("SELECT DISTINCT archive_new, archive_new_date FROM diff_index WHERE nick=? ORDER BY archive_new_date",(nick,)).fetchall()
-                conn.close()
-            except sqlite3.Error as e:
-                printer(f"SQLite error ({nick}): {e}"); continue
-            archives=rows
-            if maxp is not None: archives=archives[-maxp:]
-            try:
-                conn=sqlite3.connect(db_path)
-                astats={r[0]:{'duration':r[1],'original_size':r[2],'compressed_size':r[3],'deduplicated_size':r[4],'nfiles':r[5]}
-                        for r in conn.execute("SELECT archive,duration,original_size,compressed_size,deduplicated_size,nfiles FROM archive_stats WHERE nick=?",(nick,)).fetchall()}
-                conn.close()
-            except sqlite3.Error: astats={}
-            detail[nick]={}
-            for arch,arch_date in archives:
-                s=diff_stats.get(arch,{}); a=astats.get(arch,{})
-                detail[nick][arch]={'archive':arch,'date':(arch_date or '')[:19],
-                    'taille':convert_octets_readable(a.get('original_size')) if a.get('original_size') else '—',
-                    'nfiles':str(a.get('nfiles','—')),
-                    '+ajouté':_fmt(s.get('added',0),s.get('added_sz',0)),
-                    '-supprimé':_fmt(s.get('removed',0),s.get('removed_sz',0)),
-                    '=modifié':_fmt(s.get('modified',0),s.get('modified_sz',0))}
-            last_arch,last_date=archives[-1] if archives else (None,None)
-            s=diff_stats.get(last_arch,{}) if last_arch else {}
-            a=astats.get(last_arch,{}) if last_arch else {}
-            summary[nick]={'nick':nick,'dernière archive':last_arch or '—','date':(last_date or '')[:19],
-                'taille':convert_octets_readable(a.get('original_size')) if a.get('original_size') else '—',
-                'nfiles':str(a.get('nfiles','—')),
-                '+ajouté':_fmt(s.get('added',0),s.get('added_sz',0)),
-                '-supprimé':_fmt(s.get('removed',0),s.get('removed_sz',0)),
-                '=modifié':_fmt(s.get('modified',0),s.get('modified_sz',0))}
+                (tcmpl,tbkps)=self.prep_report_from_db(nick,maxp=maxp)
+            except Exception as e:
+                errcode=2; err_msg=str(e)[:80]
+                if htrep:
+                    errhost.append(nick)
+                    reshos[nick]={'nom':nick,'duree':'—','depuis':'—','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {err_msg}"}
+                else:
+                    reshos[nick]={'nom':f"*** {nick}",'duree':'—','depuis':'—','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {err_msg}"}
+                resbck[nick]={}; continue
+            maxage=25
+            if "MAX_AGE_BKP" in cfg: maxage=float(cfg["MAX_AGE_BKP"])
+            if tcmpl[nick]['depuis']>maxage:
+                errcode=1
+                if htrep: errhost.append(nick)
+                else: tcmpl[nick]['nom']=f"***{nick}"
+            for i in ['duree','derniere','taille','recuperable']: reshosto[i]+=(tcmpl[nick][i] or 0)
+            for i in ['derniere','moy','taille','recuperable','reste']:
+                if (i in tcmpl[nick].keys()) and not(tcmpl[nick][i] is None): tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
+                else: tcmpl[nick][i]=""
+            tcmpl[nick]['depuis']=f"{tcmpl[nick]['depuis']:.2f} h"
+            tcmpl[nick]['duree']=f"{tcmpl[nick]['duree']:.2f} min"
+            for i in tbkps.keys():
+                for j in ['original_size','compressed_size','deduplicated_size']:
+                    tbkps[i][j]=convert_octets_readable(tbkps[i][j])
+                if 'duration' in tbkps[i].keys():
+                    tbkps[i]['duration']=f"{tbkps[i]['duration']:.2f} min"
+            reshos[nick]=tcmpl[nick]; resbck[nick]=tbkps
+        for i in ['derniere','taille','recuperable']: reshosto[i]=convert_octets_readable(reshosto[i])
+        reshosto['duree']=f"{reshosto['duree']:.2f} min"
+        reshos['Totaux']=reshosto
+        for outer_key,inner_dict in resbck.items():
+            for inner_key,nested_dict in inner_dict.items():
+                if "name" in nested_dict:
+                    valeur_name=nested_dict.pop("name")
+                    nested_dict={outer_key:valeur_name,**nested_dict}
+                    inner_dict[inner_key]=nested_dict
+        resshortbck={}
+        for nick in resbck.keys():
+            disp=0
+            if "DISPLAY_BKP" in cfg: disp=int(cfg["DISPLAY_BKP"])
+            if maxp is not None: disp=maxp
+            resshortbck[nick]=filtrer_lignes(resbck[nick],disp)
         if as_json:
-            print(json.dumps({'summary':summary,'detail':detail},ensure_ascii=False,indent=2)); return 0
-        if not summary: return 0
-        sum_cols=['nick','dernière archive','date','taille','nfiles','+ajouté','-supprimé','=modifié']
-        det_cols=['archive','date','taille','nfiles','+ajouté','-supprimé','=modifié']
-        if htrep:
-            print("<!DOCTYPE html><html><body bgcolor='#ffffff'><br>")
-            print(htmlTabelise(summary,colnames=sum_cols))
-            for nick,arcs in detail.items():
-                if arcs: print('<br>'); print(htmlTabelise(arcs,colnames=det_cols))
-            print("</body></html>")
+            print(json.dumps({'summary':reshos,'backups':resbck},ensure_ascii=False,indent=2))
+        elif htrep:
+            print("<!DOCTYPE html>\n<html>\n  <body bgcolor=\"#ffffff\">\n    <br>")
+            print(htmlTabelise(reshos,colnames=['nom','duree','depuis','derniere','taille','recuperable','reste','+ajouté','-supprimé','=présent'],errhost=errhost))
+            for nick in nicks.split(','):
+                print('    <br>')
+                print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','compressed_size','deduplicated_size','nfiles','+ajouté','-supprimé','=présent'],errhost=errhost))
+            print('  </body>\n</html>')
         else:
-            t=PrettyTable(sum_cols)
-            for nick,s in summary.items(): t.add_row([s[c] for c in sum_cols])
-            print(t)
-            for nick,arcs in detail.items():
-                if not arcs: continue
-                td=PrettyTable(det_cols); td.align['archive']='l'
-                for a in arcs.values(): td.add_row([a[c] for c in det_cols])
-                print(td)
-        return 0
+            print(prettyTabelise(reshos))
+            for nick in nicks.split(','):
+                print(prettyTabelise(resshortbck[nick]))
+        return errcode
 
     def report(self,nicks,htrep=False,dayback=None,debug=0,maxp=None,as_json=False):
         reshos={}; resbck={}; reshosto={}; errcode=0; errhost=[]

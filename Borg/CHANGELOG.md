@@ -1,5 +1,14 @@
 # Changelog — borgHelper
 
+## 1.0.12 — 2026-06-06
+
+### Report `-o` : même résumé que Report, toutes machines affichées
+
+- `report_offline` (`-o`) produit désormais le même tableau résumé que `report` : colonnes `nom`, `duree`, `depuis`, `derniere`, `taille`, `recuperable`, `reste`, `+ajouté`, `-supprimé`, `=présent` + ligne `Totaux`
+- Les nicks sans index (`diff.db` absent ou `archive_stats` vide) sont affichés avec `—` au lieu d'être silencieusement ignorés — le rapport est exhaustif même pour les machines non encore indexées
+- Réécrit pour utiliser `prep_report_from_db()` (partagé avec le fallback offline de `report`) + même code de rendu que `report()`
+- Les champs borg-only (`taille`/unique_csize, `récupérable`, `reste`) restent vides puisqu'il n'y a aucun appel borg
+
 ## 1.0.11 — 2026-06-06
 
 ### Report : fallback base uniquement si dépôt occupé

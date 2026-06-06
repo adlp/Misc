@@ -361,7 +361,7 @@ sys.exit(0)
 | `index(nick, debug, db_path, force)` | Indexe les diffs, parallèle |
 | `indexsnap(nick, debug, db_path, force)` | Snapshot de la dernière archive |
 | `report(nicks, htrep, debug, maxp, as_json)` | Rapport avec appels borg |
-| `report_offline(nicks, htrep, debug, maxp, as_json)` | Rapport depuis diff.db uniquement |
+| `report_offline(nicks, htrep, debug, maxp, as_json)` | Rapport depuis diff.db uniquement — même résumé que `report`, toutes machines affichées même sans index |
 | `search(nick, pattern, archive_from, archive_to, debug)` | Recherche par chemin |
 | `filehist(nick, path, archive_from, archive_to, debug)` | Historique d'un chemin |
 | `duidx(nick, pattern, sort_by, reverse, as_json, ...)` | Résumé taille/type |

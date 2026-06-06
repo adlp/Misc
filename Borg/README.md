@@ -1,4 +1,4 @@
-# borgHelper  `v1.0.11`
+# borgHelper  `v1.0.12`
 
 Script Python 3 d'aide à la gestion des sauvegardes [BorgBackup](https://www.borgbackup.org/).  
 Centralise la configuration de plusieurs dépôts/serveurs dans un fichier INI et expose des commandes haut niveau.  
@@ -219,7 +219,7 @@ borgHelper -c Report -n ALL
 borgHelper -c Report -n ALL -l              # sortie HTML
 borgHelper -c Report -n mon-serveur -N 5    # 5 dernières archives (surcharge DISPLAY_BKP)
 borgHelper -c Report -n ALL -j             # sortie JSON
-borgHelper -c Report -n ALL -o             # mode offline : stats depuis diff.db, aucun appel borg
+borgHelper -c Report -n ALL -o             # mode offline : même résumé que Report, toutes machines (même sans index), aucun appel borg
 borgHelper -c Report -n ALL -o -j          # offline + JSON
 borgHelper -c Report -n ALL -o -N 10       # offline + 10 dernières archives
 ```
