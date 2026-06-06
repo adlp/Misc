@@ -26,7 +26,7 @@ borgHelper est structuré en trois couches :
 | `~/.borghelperrc` | Configuration des dépôts (INI) |
 | `~/.cache/borghelper/<conf>-<nick>-cache.db` | Cache des appels `borg info/list` (SQLite) |
 | `~/.cache/borghelper/<conf>-<nick>-diff.db` | Index des diffs, snapshots et stats d'archives (SQLite) |
-| `~/.cache/borghelper/<conf>-<nick>-priority.lock` | Lock PID temporaire posé par `Bkp`/`Restore` (absent si aucune opération prioritaire) |
+| `~/.cache/borghelper/<conf>-<repo_sanitisé>-priority.lock` | Lock PID temporaire posé par `Bkp`/`Restore` — keyed sur `BORG_REPO`, partagé entre tous les nicks du même dépôt |
 
 - `<conf>` = basename sanitisé du fichier de configuration (ex : `borghelperrc` pour `~/.borghelperrc`)
 - `<nick>` = identifiant du dépôt (ou valeur de `DB_NAME` si définie dans la section) — un fichier par dépôt
@@ -305,10 +305,13 @@ IDX_INCLUDE = /home/*/documents/*       # uniquement les documents des utilisate
 
 ### Mécanisme — lock PID
 
+Le lock est keyed sur `BORG_REPO` (sanitisé), pas sur le nick. Tous les nicks pointant le même dépôt borg partagent donc le même fichier de lock — `Bkp` sur `nick-A` interrompt `Index` sur `nick-B` si `BORG_REPO` identique.
+
 ```
 Bkp / Restore démarre
     ↓
-set_priority_lock(nick) → écrit le PID dans <cache>/<prefix>-<nick>-priority.lock
+set_priority_lock(nick) → résout BORG_REPO du nick
+                        → écrit le PID dans <cache>/<prefix>-<BORG_REPO sanitisé>-priority.lock
     ↓
 opération borg (create / extract)
     ↓

@@ -1,4 +1,4 @@
-# borgHelper  `v1.0.4`
+# borgHelper  `v1.0.5`
 
 Script Python 3 d'aide à la gestion des sauvegardes [BorgBackup](https://www.borgbackup.org/).  
 Centralise la configuration de plusieurs dépôts/serveurs dans un fichier INI et expose des commandes haut niveau.  
@@ -171,7 +171,7 @@ Code retour 0 si succès ou warnings, 2 si erreur borg.
 
 > `-I` désactive `--list` et toute écriture SQLite — utile si l'indexation est gérée séparément via `Index`.
 
-> **Priorité sur Index :** `Bkp` pose un lock pendant toute la durée de l'opération. Si `Index` tourne en parallèle sur le même dépôt, il s'interrompt proprement et affiche la commande pour reprendre.
+> **Priorité sur Index :** `Bkp` pose un lock sur le dépôt borg (`BORG_REPO`). Si `Index` tourne en parallèle sur n'importe quel nick pointant le même dépôt, il s'interrompt proprement et affiche la commande pour reprendre.
 
 **Sortie stdout (JSON)** — si exit 0, le JSON borg est enrichi de deux clefs borgHelper :
 
@@ -311,7 +311,7 @@ borgHelper -c Restore -n mon-serveur -f 'home/user' -w - \
 | `-W -` | Tar plat non-compressé vers stdout |
 | `-L` | Affiche droits/propriétaires sans restaurer |
 
-> **Priorité sur Index :** `Restore` pose un lock pendant toute la durée de l'extraction — même comportement que `Bkp`.
+> **Priorité sur Index :** `Restore` pose un lock sur le dépôt borg — même comportement que `Bkp`, même portée inter-nicks.
 
 ---
 
