@@ -1,5 +1,22 @@
 # Changelog — borgHelper
 
+## 1.0.6 — 2026-06-06
+
+### Bkp/Restore : attente réelle de la fin des `borg diff` actifs
+
+**Problème :** `Bkp` posait le priority lock et appelait `borg create` immédiatement. Si des `borg diff` étaient encore en cours (IDX_WORKERS threads), borg ne pouvait pas acquérir le verrou exclusif → `Failed to create/acquire the lock … (timeout)`.
+
+**Solution — `index-running` lock :**
+- `Index` pose un lock `<cache>/<prefix>-<repo>-index-running.lock` (PID) au début de Phase 2 (avant le ThreadPoolExecutor), le supprime dans un `finally` après la fin de tous les diffs
+- `Bkp`/`Restore` appellent `wait_index_idle(nick)` après `set_priority_lock` : attend jusqu'à 120 s que le running lock disparaisse (polling 1 s), puis lance `borg create`/`borg extract`
+- Lock périmé (PID mort) → supprimé automatiquement, pas de blocage
+- Séquence complète :
+  1. `Bkp` set priority lock → `Index` détecte, annule les futures en attente
+  2. `Bkp` attend running lock → les diffs en cours terminent, running lock supprimé
+  3. `Bkp` lance `borg create` sans conflit de verrou borg
+
+**Nouvelles méthodes `BorgHelperDB` :** `_index_running_lock_path`, `set_index_running_lock`, `clear_index_running_lock`, `wait_index_idle`
+
 ## 1.0.5 — 2026-06-06
 
 ### Priority lock par BORG_REPO (inter-nicks)
