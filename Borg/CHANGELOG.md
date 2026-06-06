@@ -21,6 +21,8 @@ bh.report('myserver')
 - Comportement CLI identique (optab, dispatch, exit codes inchangés)
 - Méthodes publiques : `backup`, `prune`, `index`, `indexsnap`, `report`, `report_offline`, `search`, `filehist`, `duidx`, `diffbkp`, `restore`, `stats`, `key`, `mount`, `umount`, `cache_info`, `cache_clean`, etc.
 - 1999 lignes (−1060 vs 0.69 : suppression inline changelog, dead code, legacy functions)
+- `borgHelper.py` : symlink vers `borgHelper` — import direct `from borgHelper import BorgHelper`
+- README : section usage librairie + version `v1.0.0` en en-tête
 
 ## 0.69 — 2026-06-06
 
