@@ -26,7 +26,8 @@ borgHelper est structuré en trois couches :
 | `~/.borghelperrc` | Configuration des dépôts (INI) |
 | `~/.cache/borghelper/<conf>-<nick>-cache.db` | Cache des appels `borg info/list` (SQLite) |
 | `~/.cache/borghelper/<conf>-<nick>-diff.db` | Index des diffs, snapshots et stats d'archives (SQLite) |
-| `~/.cache/borghelper/<conf>-<repo_sanitisé>-priority.lock` | Lock PID temporaire posé par `Bkp`/`Restore` — keyed sur `BORG_REPO`, partagé entre tous les nicks du même dépôt |
+| `~/.cache/borghelper/<conf>-<repo_sanitisé>-priority.lock` | Lock PID posé par `Bkp`/`Restore` — signal d'interruption pour `Index` sur le même dépôt |
+| `~/.cache/borghelper/<conf>-<repo_sanitisé>-index-running.lock` | Lock PID posé par `Index` pendant Phase 2 — `Bkp`/`Restore` attendent sa disparition avant `borg create`/`borg extract` |
 
 - `<conf>` = basename sanitisé du fichier de configuration (ex : `borghelperrc` pour `~/.borghelperrc`)
 - `<nick>` = identifiant du dépôt (ou valeur de `DB_NAME` si définie dans la section) — un fichier par dépôt
@@ -310,25 +311,33 @@ Le lock est keyed sur `BORG_REPO` (sanitisé), pas sur le nick. Tous les nicks p
 ```
 Bkp / Restore démarre
     ↓
-set_priority_lock(nick) → résout BORG_REPO du nick
-                        → écrit le PID dans <cache>/<prefix>-<BORG_REPO sanitisé>-priority.lock
+set_priority_lock(nick)    → <repo>-priority.lock (PID)  ← signal à Index de s'arrêter
     ↓
-opération borg (create / extract)
+wait_index_idle(nick)      → poll 1s jusqu'à 120s
+    ├── <repo>-index-running.lock absent / PID mort → continue
+    └── PID vivant → attente... (Index en cours de terminer ses diffs actifs)
     ↓
-finally: clear_priority_lock(nick) → supprime le fichier
-         (garanti même en cas d'exception ou sys.exit)
+opération borg (create / extract)   ← plus de conflit de verrou borg
+    ↓
+finally: clear_priority_lock(nick)  → supprime priority.lock
 ```
 
 ```
-Index Phase 2 — après chaque borg diff terminé
+Index Phase 2
     ↓
-check_priority_lock(nick)
-    ├── lock absent           → continue normalement
-    ├── lock présent, PID vivant → interrompt : annule les futures en attente
-    │                              les diffs en cours terminent proprement
-    │                              Phase 3 : commit des résultats déjà obtenus
-    │                              affiche : "N paire(s) non indexée(s) — reprendre avec : borgHelper -c Index -n <nick>"
-    └── lock périmé (PID mort) → supprime le fichier, continue normalement
+set_index_running_lock(nick)  → <repo>-index-running.lock (PID)
+    ↓
+ThreadPoolExecutor — borg diff en parallèle
+    après chaque diff : check_priority_lock(nick)
+    ├── absent           → continue
+    ├── PID vivant       → annule futures en attente, interrupted=True
+    │                      les diffs actifs terminent proprement
+    └── PID mort (stale) → supprime, continue
+    ↓
+finally: clear_index_running_lock(nick)  → <repo>-index-running.lock supprimé
+         ← Bkp/Restore débloqué ici
+    ↓
+Phase 3 : commit des résultats (paires annulées non commitées → reprises au prochain Index)
 ```
 
 ### Reprise transparente

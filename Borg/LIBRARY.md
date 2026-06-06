@@ -393,3 +393,6 @@ sys.exit(0)
 | `set_priority_lock(nick)` | Pose le lock prioritaire (écrit le PID) — appelé par `Bkp`/`Restore` |
 | `clear_priority_lock(nick)` | Supprime le lock prioritaire |
 | `check_priority_lock(nick)` | `True` si un processus prioritaire vivant tient le lock (stale → auto-supprimé) |
+| `set_index_running_lock(nick)` | Pose le lock "Index actif" pendant Phase 2 — appelé par `Index` |
+| `clear_index_running_lock(nick)` | Supprime le lock "Index actif" |
+| `wait_index_idle(nick, timeout=120)` | Attend jusqu'à `timeout` s que `Index` libère ses verrous borg |
