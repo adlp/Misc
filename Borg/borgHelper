@@ -9,11 +9,12 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.2"
+Version="1.0.3"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 1.0.3 DiffBkp : affichage ligne par ligne +/-/= depuis l'index SQLite, résumé compteurs
 # 1.0.2 Bkp/Restore prioritaires sur Index : lock PID, indexation interrompue proprement et reprise
 # 1.0.1 IDX_INCLUDE/IDX_EXCLUDE : glob complet (*.bak, /home/*/.bash_history) + stats fichiers exclus en DB
 # 1.0.0 Refactoring : BorgHelperDB / BorgRunner / BorgHelper — importable comme librairie
@@ -1268,18 +1269,33 @@ class BorgHelper:
             self.db.store_diff_entries(nick,bidun,bideux,date_new,entries,db_path)
         try:
             conn=sqlite3.connect(db_path)
-            cur=conn.execute("SELECT change_type,path,size_before,size_after FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=? ORDER BY change_type,path",(nick,bidun,bideux))
+            cur=conn.execute(
+                "SELECT change_type,path,size_before,size_after FROM diff_index "
+                "WHERE nick=? AND archive_old=? AND archive_new=? ORDER BY path,change_type",
+                (nick,bidun,bideux))
             rows=cur.fetchall(); conn.close()
         except sqlite3.Error as e:
             printer(f"SQLite error: {e}"); sys.exit(3)
         print(f"{bidun} → {bideux}")
         if not rows: print("Aucune différence."); sys.exit(0)
-        from prettytable import PrettyTable
-        t=PrettyTable(['type','chemin','avant','après'])
-        t.align['chemin']='l'
-        for type_r,path_r,sb,sa in rows:
-            t.add_row([type_r,path_r,convert_octets_readable(sb) if sb else '',convert_octets_readable(sa) if sa else ''])
-        print(t); sys.exit(0)
+        n_add=n_rem=n_mod=0
+        for ct,path,sb,sa in rows:
+            if ct=='added':
+                sym='+'; n_add+=1
+                tail=f"  {convert_octets_readable(sa)}" if sa else ''
+            elif ct=='removed':
+                sym='-'; n_rem+=1
+                tail=f"  {convert_octets_readable(sb)}" if sb else ''
+            else:
+                sym='='; n_mod+=1
+                if sb and sa:
+                    tail=f"  {convert_octets_readable(sb)} → {convert_octets_readable(sa)}"
+                elif sa: tail=f"  {convert_octets_readable(sa)}"
+                elif sb: tail=f"  {convert_octets_readable(sb)}"
+                else: tail=f"  [{ct}]" if ct!='modified' else ''
+            print(f"{sym} {path}{tail}")
+        print(f"\n+ {n_add}  - {n_rem}  = {n_mod}")
+        sys.exit(0)
 
     def listperms(self,nick,bid,ftor,debug=0):
         if bid is None:

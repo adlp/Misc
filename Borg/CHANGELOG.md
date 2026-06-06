@@ -1,5 +1,18 @@
 # Changelog — borgHelper
 
+## 1.0.3 — 2026-06-06
+
+### DiffBkp : affichage ligne par ligne depuis l'index
+
+- Affichage un fichier par ligne : `+ chemin`, `- chemin`, `= chemin`
+  - `+` = ajouté, `-` = supprimé, `=` = modifié/permissions/type (présent dans les deux archives)
+- Taille affichée en fin de ligne : taille finale pour `+`, initiale pour `-`, `avant → après` pour `=`
+- Types non-`modified` (`C`, `B`, `T`) affichent le code entre crochets si pas de taille (`[C]`, `[B]`, `[T]`)
+- Tri alphabétique par chemin (toutes entrées mélangées, symbol différencie)
+- Ligne résumé `+ N  - N  = N` à la fin
+- Source : index SQLite si la paire est indexée, sinon `borg diff` + stockage automatique (comportement inchangé)
+- Suppression de la `PrettyTable` pour ce résultat
+
 ## 1.0.2 — 2026-06-06
 
 ### Priorité Bkp/Restore sur Index
