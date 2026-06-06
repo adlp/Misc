@@ -1,5 +1,21 @@
 # Changelog — borgHelper
 
+## 1.0.2 — 2026-06-06
+
+### Priorité Bkp/Restore sur Index
+
+**Problème :** `Index` parallèle (`IDX_WORKERS` workers `borg diff`) peut bloquer le démarrage d'un `Bkp` ou ralentir une restauration par contention sur le dépôt borg.
+
+**Solution — lock PID :**
+- `Bkp` et `Restore` posent un lock fichier (`<cache>/<prefix>-<nick>-priority.lock`, contient le PID) avant tout appel `borg`, et le retirent dans un `finally` (garanti même sur `sys.exit()`/exception)
+- `Index` vérifie le lock après chaque `borg diff` complété (dans la boucle `as_completed`)
+  - Si lock actif (PID vivant) → annule les futures en attente, termine proprement les diffs déjà lancés
+  - Affiche le nombre de paires non indexées et la commande pour reprendre
+- Lock périmé (PID mort) → supprimé automatiquement, pas de blocage
+- Reprise transparente : `diff_indexed_pairs` est incrémental, les paires déjà indexées sont ignorées au prochain `Index`
+
+**Nouvelles méthodes `BorgHelperDB` :** `set_priority_lock`, `clear_priority_lock`, `check_priority_lock`, `_priority_lock_path`
+
 ## 1.0.1 — 2026-06-06
 
 ### IDX_INCLUDE / IDX_EXCLUDE : glob complet + stats fichiers exclus

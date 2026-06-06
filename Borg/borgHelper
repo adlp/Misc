@@ -7,13 +7,14 @@
 #*/
 
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re
-from concurrent.futures import ThreadPoolExecutor,as_completed
+from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.1"
+Version="1.0.2"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 1.0.2 Bkp/Restore prioritaires sur Index : lock PID, indexation interrompue proprement et reprise
 # 1.0.1 IDX_INCLUDE/IDX_EXCLUDE : glob complet (*.bak, /home/*/.bash_history) + stats fichiers exclus en DB
 # 1.0.0 Refactoring : BorgHelperDB / BorgRunner / BorgHelper — importable comme librairie
 # 0.69 SQLite : messages d'erreur explicites (fichier inaccessible, corrompu, répertoire manquant)
@@ -427,6 +428,31 @@ class BorgHelperDB:
 
     def get_diff_db(self,nick):
         return os.path.join(self.cache_dir,f"{self.db_prefix}-{self.get_db_nick(nick)}-diff.db")
+
+    def _priority_lock_path(self,nick):
+        return os.path.join(self.cache_dir,f"{self.db_prefix}-{self.get_db_nick(nick)}-priority.lock")
+
+    def set_priority_lock(self,nick):
+        try:
+            with open(self._priority_lock_path(nick),'w') as f: f.write(str(os.getpid()))
+        except OSError: pass
+
+    def clear_priority_lock(self,nick):
+        try: os.unlink(self._priority_lock_path(nick))
+        except OSError: pass
+
+    def check_priority_lock(self,nick):
+        """True si un processus prioritaire (Bkp/Restore) tient le lock et est encore vivant."""
+        p=self._priority_lock_path(nick)
+        if not os.path.exists(p): return False
+        try:
+            with open(p) as f: pid=int(f.read().strip())
+            if pid==os.getpid(): return False
+            os.kill(pid,0); return True
+        except (OSError,ValueError):
+            try: os.unlink(p)
+            except OSError: pass
+            return False
 
     def _db_connect(self,db_path):
         try:
@@ -1281,28 +1307,32 @@ class BorgHelper:
             else:
                 bid=self.borg.getlastbkp(nick,debug=debug)[0]
                 print(f"Archive sélectionnée (dernière) : {bid}",file=out,flush=True)
-        if stdout_mode or _is_tar_dest(where):
-            self._restore_to_tar(nick,bid,ftor,where,flat=flat,debug=debug)
-        elif flat:
-            import tempfile,shutil
-            with tempfile.TemporaryDirectory(prefix='borghelper_restore_') as tmpdir:
-                rb=self.borg.boex(nick,_borg_extract_args(bid,ftor),rep=tmpdir,debug=debug)
-                _print_boex_stderr(rb)
-                if rb['exitcode'] not in (0,1): sys.exit(rb['exitcode'])
-                os.makedirs(where,exist_ok=True)
-                try:
-                    for root,_,files in os.walk(tmpdir):
-                        for f in files: shutil.copy2(os.path.join(root,f),os.path.join(where,f))
-                except OSError as e:
-                    import errno as _errno
-                    if e.errno==_errno.ENOSPC: printer(f"[ERREUR] Espace disque insuffisant : {e.filename or where}")
-                    else: printer(f"[ERREUR] Copie impossible : {e}")
-                    sys.exit(3)
-                print(f"Restauré (plat) dans {where}",flush=True)
-            sys.exit(rb['exitcode'])
-        else:
-            rb=self.borg.boex(nick,_borg_extract_args(bid,ftor),rep=where,debug=debug)
-            _print_boex_stderr(rb); sys.exit(rb['exitcode'])
+        self.db.set_priority_lock(nick)
+        try:
+            if stdout_mode or _is_tar_dest(where):
+                self._restore_to_tar(nick,bid,ftor,where,flat=flat,debug=debug)
+            elif flat:
+                import tempfile,shutil
+                with tempfile.TemporaryDirectory(prefix='borghelper_restore_') as tmpdir:
+                    rb=self.borg.boex(nick,_borg_extract_args(bid,ftor),rep=tmpdir,debug=debug)
+                    _print_boex_stderr(rb)
+                    if rb['exitcode'] not in (0,1): sys.exit(rb['exitcode'])
+                    os.makedirs(where,exist_ok=True)
+                    try:
+                        for root,_,files in os.walk(tmpdir):
+                            for f in files: shutil.copy2(os.path.join(root,f),os.path.join(where,f))
+                    except OSError as e:
+                        import errno as _errno
+                        if e.errno==_errno.ENOSPC: printer(f"[ERREUR] Espace disque insuffisant : {e.filename or where}")
+                        else: printer(f"[ERREUR] Copie impossible : {e}")
+                        sys.exit(3)
+                    print(f"Restauré (plat) dans {where}",flush=True)
+                sys.exit(rb['exitcode'])
+            else:
+                rb=self.borg.boex(nick,_borg_extract_args(bid,ftor),rep=where,debug=debug)
+                _print_boex_stderr(rb); sys.exit(rb['exitcode'])
+        finally:
+            self.db.clear_priority_lock(nick)
 
     def _restore_to_tar(self,nick,bid,ftor,tarpath,flat=False,debug=0):
         import tempfile,tarfile as tf_mod
@@ -1397,61 +1427,65 @@ class BorgHelper:
         create.extend(cfg['EXCLUDE'].split(' '))
         if 'EXCLUDE_NEXT' in list(cfg.keys()):
             create.extend(cfg['EXCLUDE_NEXT'].split(' '))
-        anaRet=self.borg.boex(nick,create,preBorg=preBorg,forceEnv=forceEnv,debug=debug)
-        newretC=0
-        if anaRet['exitcode']:
-            for i in anaRet['stderr']:
-                if isinstance(i,dict) and i.get('levelname') in ('ERROR','CRITICAL'):
-                    newretC=2; break
-        if 'stdout' in anaRet.keys() and len(anaRet['stdout']):
-            out=dict(anaRet['stdout'][0])
-            if newretC==0:
-                all_entries=_bkp_parse_list(anaRet.get('stderr',[]))
-                counts={}
-                for e in all_entries:
-                    counts[e['change_type']]=counts.get(e['change_type'],0)+1
-                out['borgHelper_file_counts']=counts
-                if debug: out['borgHelper_files']=all_entries
-            print(json.dumps(out,indent=4),file=sys.stdout,flush=True)
-        if 'stderr' in anaRet.keys() and len(anaRet['stderr']):
-            for i in anaRet['stderr']:
-                if _bkp_is_list_entry(i): continue
-                if isinstance(i,dict):
-                    lvl=i.get('levelname','INFO'); msg=i.get('message',str(i))
-                    print(f"[{lvl}] {msg}",file=sys.stderr,flush=True)
-                    if debug: printer(i)
-                elif isinstance(i,str) and i.strip():
-                    print(i,file=sys.stderr,flush=True)
-        if newretC==0 and anaRet['stdout']:
-            try:
-                arch_info=anaRet['stdout'][0].get('archive',{})
-                archive_new=arch_info.get('name')
-                archive_new_date=arch_info.get('start')
-                db_path=self.db.get_diff_db(nick)
-                self.db.ensure_diff_db(db_path)
-                if archive_new:
-                    st=arch_info.get('stats',{})
-                    self.db.store_archive_stats(nick,archive_new,archive_new_date,arch_info.get('duration'),
-                        st.get('original_size'),st.get('compressed_size'),st.get('deduplicated_size'),st.get('nfiles'),db_path)
-                if not no_index and archive_new and archive_old:
-                    all_bkp=_bkp_parse_list(anaRet['stderr'])
-                    entries=[]; exclu={}
-                    for e in all_bkp:
-                        if self._idx_path_ok(e['path'],cfg):
-                            entries.append(e)
-                        else:
-                            ct=e['change_type']
-                            if ct not in exclu: exclu[ct]={'count':0,'size':0}
-                            exclu[ct]['count']+=1
-                    self.db.store_diff_entries(nick,archive_old,archive_new,archive_new_date,entries,db_path)
-                    if exclu:
-                        self.db.store_excluded_diff_stats(nick,archive_old,archive_new,exclu,db_path)
-                    exclu_msg=f" ({sum(s['count'] for s in exclu.values())} exclus)" if exclu else ""
-                    print(f"Index : {len(entries)} entrée(s) stockée(s) ({archive_old} → {archive_new}){exclu_msg}",file=sys.stderr,flush=True)
-                if not no_index: self.indexsnap(nick,debug=debug)
-            except Exception as e:
-                printer(f"[WARN] indexation post-backup échouée : {e}")
-        sys.exit(newretC)
+        self.db.set_priority_lock(nick)
+        try:
+            anaRet=self.borg.boex(nick,create,preBorg=preBorg,forceEnv=forceEnv,debug=debug)
+            newretC=0
+            if anaRet['exitcode']:
+                for i in anaRet['stderr']:
+                    if isinstance(i,dict) and i.get('levelname') in ('ERROR','CRITICAL'):
+                        newretC=2; break
+            if 'stdout' in anaRet.keys() and len(anaRet['stdout']):
+                out=dict(anaRet['stdout'][0])
+                if newretC==0:
+                    all_entries=_bkp_parse_list(anaRet.get('stderr',[]))
+                    counts={}
+                    for e in all_entries:
+                        counts[e['change_type']]=counts.get(e['change_type'],0)+1
+                    out['borgHelper_file_counts']=counts
+                    if debug: out['borgHelper_files']=all_entries
+                print(json.dumps(out,indent=4),file=sys.stdout,flush=True)
+            if 'stderr' in anaRet.keys() and len(anaRet['stderr']):
+                for i in anaRet['stderr']:
+                    if _bkp_is_list_entry(i): continue
+                    if isinstance(i,dict):
+                        lvl=i.get('levelname','INFO'); msg=i.get('message',str(i))
+                        print(f"[{lvl}] {msg}",file=sys.stderr,flush=True)
+                        if debug: printer(i)
+                    elif isinstance(i,str) and i.strip():
+                        print(i,file=sys.stderr,flush=True)
+            if newretC==0 and anaRet['stdout']:
+                try:
+                    arch_info=anaRet['stdout'][0].get('archive',{})
+                    archive_new=arch_info.get('name')
+                    archive_new_date=arch_info.get('start')
+                    db_path=self.db.get_diff_db(nick)
+                    self.db.ensure_diff_db(db_path)
+                    if archive_new:
+                        st=arch_info.get('stats',{})
+                        self.db.store_archive_stats(nick,archive_new,archive_new_date,arch_info.get('duration'),
+                            st.get('original_size'),st.get('compressed_size'),st.get('deduplicated_size'),st.get('nfiles'),db_path)
+                    if not no_index and archive_new and archive_old:
+                        all_bkp=_bkp_parse_list(anaRet['stderr'])
+                        entries=[]; exclu={}
+                        for e in all_bkp:
+                            if self._idx_path_ok(e['path'],cfg):
+                                entries.append(e)
+                            else:
+                                ct=e['change_type']
+                                if ct not in exclu: exclu[ct]={'count':0,'size':0}
+                                exclu[ct]['count']+=1
+                        self.db.store_diff_entries(nick,archive_old,archive_new,archive_new_date,entries,db_path)
+                        if exclu:
+                            self.db.store_excluded_diff_stats(nick,archive_old,archive_new,exclu,db_path)
+                        exclu_msg=f" ({sum(s['count'] for s in exclu.values())} exclus)" if exclu else ""
+                        print(f"Index : {len(entries)} entrée(s) stockée(s) ({archive_old} → {archive_new}){exclu_msg}",file=sys.stderr,flush=True)
+                    if not no_index: self.indexsnap(nick,debug=debug)
+                except Exception as e:
+                    printer(f"[WARN] indexation post-backup échouée : {e}")
+            sys.exit(newretC)
+        finally:
+            self.db.clear_priority_lock(nick)
 
     def prune(self,nick,dryrun=False,debug=0):
         cfg=self.borg.cfgreaded(nick,debug=debug)
@@ -1583,13 +1617,23 @@ class BorgHelper:
                     if ct not in exclu: exclu[ct]={'count':0,'size':0}
                     exclu[ct]['count']+=1; exclu[ct]['size']+=sz
             return (a_old,a_new,date_new,entries,exclu)
+        interrupted=False
         results=[]
         if pairs_todo:
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 futs={ex.submit(_run_diff,p):p for p in pairs_todo}
                 for fut in as_completed(futs):
+                    if not interrupted and self.db.check_priority_lock(nick):
+                        printer(f"  {nick}: opération prioritaire (Bkp/Restore) détectée — indexation interrompue")
+                        for f in futs:
+                            if not f.done(): f.cancel()
+                        interrupted=True
                     try: results.append(fut.result())
+                    except CancelledError: pass
                     except Exception as e: printer(f"[WARN] borg diff échoué : {e}")
+        if interrupted:
+            remaining=len(pairs_todo)-len(results)
+            if remaining: printer(f"  {nick}: {remaining} paire(s) non indexée(s) — reprendre avec : borgHelper -c Index -n {nick}")
         # Phase 3 : insert groupé
         if results:
             try:
