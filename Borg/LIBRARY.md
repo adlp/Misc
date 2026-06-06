@@ -317,6 +317,113 @@ for a in rb['stdout'][0]['archives']:
 
 ---
 
+## Accès direct à la base SQLite en ligne de commande
+
+Le `diff.db` est un fichier SQLite standard — consultable avec `sqlite3` sans Python.
+
+### Trouver le chemin du diff.db
+
+```bash
+# Chemin standard : ~/.cache/borghelper/<conf>-<nick>-diff.db
+# <conf> = basename du borghelperrc sans extension
+# Exemple pour ~/.borghelperrc et nick "mon-serveur" :
+DB=~/.cache/borghelper/borghelperrc-mon-serveur-diff.db
+
+# Ou depuis borgHelper (affiche le répertoire de cache) :
+borgHelper -c CacheInfo -n mon-serveur
+```
+
+### Configuration sqlite3
+
+```bash
+sqlite3 $DB
+# Dans le shell interactif :
+.headers on
+.mode column
+.width auto
+# Quitter :
+.quit
+```
+
+### Requêtes utiles
+
+```bash
+# Tables disponibles
+sqlite3 $DB ".tables"
+
+# Liste des archives avec tailles
+sqlite3 -header -column $DB "
+SELECT archive, archive_date, nfiles,
+       original_size/1048576 AS orig_MB,
+       deduplicated_size/1048576 AS dedup_MB
+FROM archive_stats WHERE nick='mon-serveur'
+ORDER BY archive_date;"
+
+# Paires indexées (avec compteur d'entrées)
+sqlite3 -header -column $DB "
+SELECT archive_old, archive_new, entry_count, indexed_at
+FROM diff_indexed_pairs WHERE nick='mon-serveur'
+ORDER BY indexed_at DESC LIMIT 10;"
+
+# Historique d'un fichier spécifique
+sqlite3 -header -column $DB "
+SELECT archive_new_date, archive_new, change_type,
+       size_before, size_after
+FROM diff_index
+WHERE nick='mon-serveur' AND path='/etc/nginx/nginx.conf'
+ORDER BY archive_new_date;"
+
+# Fichiers les plus souvent modifiés
+sqlite3 -header -column $DB "
+SELECT path, COUNT(*) AS nb
+FROM diff_index
+WHERE nick='mon-serveur' AND change_type='modified'
+GROUP BY path ORDER BY nb DESC LIMIT 20;"
+
+# Gros fichiers ajoutés dans la dernière archive
+sqlite3 -header -column $DB "
+SELECT path, size_after/1048576 AS size_MB
+FROM diff_index
+WHERE nick='mon-serveur' AND change_type='added'
+  AND archive_new = (
+    SELECT archive_new FROM diff_indexed_pairs
+    WHERE nick='mon-serveur' ORDER BY indexed_at DESC LIMIT 1)
+ORDER BY size_after DESC LIMIT 20;"
+
+# Résumé +/-/= par archive (compteurs)
+sqlite3 -header -column $DB "
+SELECT archive_new, change_type, COUNT(*) AS nb,
+       SUM(COALESCE(size_after, size_before))/1048576 AS size_MB
+FROM diff_index WHERE nick='mon-serveur'
+GROUP BY archive_new, change_type
+ORDER BY archive_new DESC, change_type;"
+
+# Fichiers exclus par les filtres d'indexation
+sqlite3 -header -column $DB "
+SELECT change_type, SUM(file_count) AS nb, SUM(total_size)/1048576 AS size_MB
+FROM diff_excluded_stats WHERE nick='mon-serveur'
+GROUP BY change_type;"
+
+# Recherche dans le snapshot (dernière archive)
+sqlite3 -header -column $DB "
+SELECT sf.path, sf.size/1024 AS size_KB, sf.mtime
+FROM snapshot_file sf
+JOIN archive_snapshot s ON s.file_id = sf.id
+WHERE s.nick='mon-serveur' AND sf.path LIKE '%nginx%'
+LIMIT 20;"
+```
+
+### Export CSV
+
+```bash
+# Exporter archive_stats en CSV
+sqlite3 -header -csv $DB \
+  "SELECT * FROM archive_stats WHERE nick='mon-serveur' ORDER BY archive_date;" \
+  > archive_stats.csv
+```
+
+---
+
 ## Intégration dans un script de supervision
 
 ```python
