@@ -1,4 +1,4 @@
-# borgHelper  `v1.0.3`
+# borgHelper  `v1.0.4`
 
 Script Python 3 d'aide à la gestion des sauvegardes [BorgBackup](https://www.borgbackup.org/).  
 Centralise la configuration de plusieurs dépôts/serveurs dans un fichier INI et expose des commandes haut niveau.  
@@ -83,6 +83,9 @@ DIFF_KEEP        = 30
 
 # Clef explicite (keyfile mode, utile si plusieurs nicks partagent le même dépôt)
 BORG_KEY_FILE    = /root/.config/borg/keys/abcdef123456
+
+# Chemin de l'exécutable borg (défaut : 'borg' dans le PATH)
+BORG_EXE                    = /usr/local/bin/borg1
 
 # Borg divers
 BORG_REMOTE_PATH            = borg1
