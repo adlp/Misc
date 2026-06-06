@@ -9,11 +9,12 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.3"
+Version="1.0.4"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 1.0.4 BORG_EXE : chemin borg configurable par section, fallback sur PATH
 # 1.0.3 DiffBkp : affichage ligne par ligne +/-/= depuis l'index SQLite, résumé compteurs
 # 1.0.2 Bkp/Restore prioritaires sur Index : lock PID, indexation interrompue proprement et reprise
 # 1.0.1 IDX_INCLUDE/IDX_EXCLUDE : glob complet (*.bak, /home/*/.bash_history) + stats fichiers exclus en DB
@@ -931,10 +932,11 @@ class BorgRunner:
         if forceEnv is not None:
             for k in list(forceEnv.keys()): varfut[k]=forceEnv[k]
         if debug!=0: printer(varfut)
+        borg_exe=cfg.get('BORG_EXE','borg')
         if preBorg is not None:
-            commande=preBorg; commande.append('borg')
+            commande=preBorg; commande.append(borg_exe)
         else:
-            commande=['borg']
+            commande=[borg_exe]
         if rep is None: rep=os.getcwd()
         commande.extend(arg)
         varfut['PATH']=varcur['PATH']

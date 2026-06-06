@@ -1,5 +1,14 @@
 # Changelog — borgHelper
 
+## 1.0.4 — 2026-06-06
+
+### BORG_EXE : chemin borg configurable
+
+- Nouvelle clé de configuration `BORG_EXE` par section (ou `[DEFAULT]`)
+- Spécifie le chemin complet vers l'exécutable borg (ex : `/usr/local/bin/borg1`, `/opt/borg/bin/borg`)
+- Si absent : utilise `borg` depuis le `PATH` (comportement inchangé)
+- Utile si plusieurs versions de borg coexistent ou si borg n'est pas dans le PATH standard
+
 ## 1.0.3 — 2026-06-06
 
 ### DiffBkp : affichage ligne par ligne depuis l'index
