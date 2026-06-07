@@ -428,10 +428,23 @@ Après de grosses purges (`IdxPurge`), le fichier SQLite conserve les pages lib�
 
 **Principe** : `VACUUM INTO` crée une copie compacte dans le *même répertoire* (même filesystem), ce qui évite l'erreur `database or disk is full` liée à `/tmp` sur une partition séparée.
 
+> **Important** : le nom de fichier dans `VACUUM INTO` doit être une chaîne SQL entre apostrophes — sans guillemets, SQLite l'interprèterait comme un nom de colonne et retournerait `no such column`.
+
+```bash
+# ❌ ERREUR — popo est interprété comme un nom de colonne
+sqlite3 mon.db "VACUUM INTO popo"
+
+# ✅ CORRECT — le nom de fichier est entre apostrophes SQL
+sqlite3 mon.db "VACUUM INTO 'popo.db'"
+```
+
+Procédure complète :
+
 ```bash
 DB=~/.cache/borghelper/borghelperrc-mon-serveur-diff.db
 
 # 1. Créer une copie compacte dans le même répertoire
+#    Note : les apostrophes AUTOUR de ${DB}.compact font partie du SQL
 sqlite3 "$DB" "VACUUM INTO '${DB}.compact'"
 
 # 2. Remplacer l'original (garder .bak le temps de vérifier)
