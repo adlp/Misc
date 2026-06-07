@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.19"
+Version="1.0.20"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
@@ -2142,9 +2142,9 @@ class BorgHelper:
         diff_stats=self.db._diff_stats_for_nick(nick)
         def _fmt_stats(s,nf,total_sz=0):
             na,nr,nm=s['added'],s['removed'],s['modified']
-            present=max(0,nf-na-nm); total_prev=present+nr+nm
+            present=max(0,nf-na-nm)
             present_sz=max(0,total_sz-s['added_sz']-s['modified_sz'])
-            pct_n=lambda n: f" ({100*n//total_prev}%)" if total_prev>0 else ""
+            pct_n=lambda n: f" ({100*n//nf}%)" if nf>0 else ""
             pct_sz=lambda sz: f" ({100*sz//total_sz}%)" if total_sz>0 else ""
             return {'+ajouté':f"{na}{pct_n(na)} · {convert_octets_readable(s['added_sz'])}{pct_sz(s['added_sz'])}",
                     '-supprimé':f"{nr}{pct_n(nr)} · {convert_octets_readable(s['removed_sz'])}{pct_sz(s['removed_sz'])}",
@@ -2260,9 +2260,9 @@ class BorgHelper:
         diff_stats=self.db._diff_stats_for_nick(nick)
         def _fmt_stats(s,nf,total_sz=0):
             na,nr,nm=s['added'],s['removed'],s['modified']
-            present=max(0,nf-na-nm); total_prev=present+nr+nm
+            present=max(0,nf-na-nm)
             present_sz=max(0,total_sz-s['added_sz']-s['modified_sz'])
-            pct_n=lambda n: f" ({100*n//total_prev}%)" if total_prev>0 else ""
+            pct_n=lambda n: f" ({100*n//nf}%)" if nf>0 else ""
             pct_sz=lambda sz: f" ({100*sz//total_sz}%)" if total_sz>0 else ""
             return {'+ajouté':f"{na}{pct_n(na)} · {convert_octets_readable(s['added_sz'])}{pct_sz(s['added_sz'])}",
                     '-supprimé':f"{nr}{pct_n(nr)} · {convert_octets_readable(s['removed_sz'])}{pct_sz(s['removed_sz'])}",

@@ -1,5 +1,18 @@
 # Changelog — borgHelper
 
+## 1.0.20 — 2026-06-07
+
+### `Report` : pourcentages cohérents — base unique = archive courante
+
+Les colonnes `+ajouté`, `-supprimé`, `=présent` affichaient deux bases différentes :
+- comptages (fichiers) → base = archive précédente
+- tailles (octets)     → base = archive courante
+
+Les deux utilisent maintenant la même base : **l'archive courante** (`nfiles` / `original_size`).
+
+Lecture uniforme : "X% des fichiers de ce backup sont nouveaux / supprimés / inchangés".  
+`ajouté% + présent% ≈ 100%` (les fichiers modifiés sont comptés dans `=présent`).
+
 ## 1.0.19 — 2026-06-07
 
 ### `DiffTop` : top N arborescences par changements sur une paire d'archives

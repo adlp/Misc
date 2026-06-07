@@ -1,4 +1,4 @@
-# borgHelper  `v1.0.19`
+# borgHelper  `v1.0.20`
 
 Script Python 3 d'aide à la gestion des sauvegardes [BorgBackup](https://www.borgbackup.org/).  
 Centralise la configuration de plusieurs dépôts/serveurs dans un fichier INI et expose des commandes haut niveau.  
@@ -243,7 +243,11 @@ Code retour 2 si un dépôt est inaccessible.
 
 **Statistiques de mouvement** (si l'index SQLite est disponible) :
 - Colonnes `+ajouté`, `-supprimé`, `=présent` par archive
-- Format : `N (P%) · SIZE` — nombre, pourcentage relatif au backup précédent, taille
+- Format : `N (P%) · SIZE` — nombre, pourcentage relatif au total de l'archive courante, taille
+- Les deux pourcentages (fichiers et taille) utilisent la même base : l'archive courante
+  - `ajouté%` = part des fichiers/octets nouveaux dans ce backup
+  - `présent%` = part des fichiers/octets inchangés
+  - `supprimé%` = rapport au nombre/volume total du backup courant (base identique aux autres)
 - `—` si l'archive n'est pas encore indexée
 
 **Mode offline** (`-o`) — rapport sans appel borg, depuis `diff.db` uniquement :
