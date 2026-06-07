@@ -9,11 +9,12 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.16"
+Version="1.0.17"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 1.0.17 IdxPurge : VACUUM INTO même répertoire (évite /tmp saturé), fallback avec message si échec
 # 1.0.16 IdxPurge : PRAGMA incremental_vacuum au lieu de VACUUM (pas de copie, disque non plein requis)
 # 1.0.15 IdxPurge : sans -x → lit IDX_EXCLUDE/IDX_INCLUDE du borghelperrc, purge selon config
 # 1.0.14 IdxTop : top N arborescences par entrées diff_index (diagnostic diff.db volumineux)
@@ -2024,10 +2025,20 @@ class BorgHelper:
                 AND di.archive_new=diff_indexed_pairs.archive_new)
                 WHERE nick=?""",(nick,))
             conn.commit(); conn.close()
-            printer(f"  {nick}: {count:,} entrées supprimées — récupération espace en cours...")
-            conn2=sqlite3.connect(db_path,timeout=60)
-            conn2.execute("PRAGMA incremental_vacuum"); conn2.close()
-            printer(f"  {nick}: espace récupéré")
+            printer(f"  {nick}: {count:,} entrées supprimées — compactage en cours...")
+            tmp_path=db_path+'.vacuum_tmp'
+            try:
+                conn2=sqlite3.connect(db_path,timeout=60)
+                conn2.execute(f"VACUUM INTO '{tmp_path}'")
+                conn2.close()
+                os.replace(tmp_path,db_path)
+                printer(f"  {nick}: compactage terminé")
+            except sqlite3.Error as ve:
+                try:
+                    if os.path.exists(tmp_path): os.unlink(tmp_path)
+                except OSError: pass
+                printer(f"  [WARN] compactage impossible ({ve}) — entrées supprimées mais espace non récupéré")
+                printer(f"  [WARN] relancer manuellement : sqlite3 '{db_path}' \"VACUUM INTO '{db_path}.tmp'\" && mv '{db_path}.tmp' '{db_path}'")
         except sqlite3.Error as e:
             printer(f"  SQLite error: {e}")
             try: conn.close()

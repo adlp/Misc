@@ -1,5 +1,20 @@
 # Changelog — borgHelper
 
+## 1.0.17 — 2026-06-07
+
+### `IdxPurge` : `VACUUM INTO` pour éviter l'erreur "database or disk is full"
+
+`VACUUM` (et `PRAGMA incremental_vacuum` sur les DB en mode `auto_vacuum=NONE`) écrit son fichier temporaire dans `/tmp`, qui peut être sur une partition séparée et saturée — même si le filesystem du `diff.db` a de l'espace disponible.
+
+`VACUUM INTO 'chemin.tmp'` crée la copie compacte dans le **même répertoire** que le `diff.db`, utilisant l'espace libre du bon filesystem. Suivi d'un `os.replace` atomique.
+
+Si le compactage échoue malgré tout (disque vraiment plein), les entrées sont quand même supprimées et borgHelper affiche la commande manuelle à relancer quand de l'espace sera libéré :
+
+```
+[WARN] compactage impossible (...) — entrées supprimées mais espace non récupéré
+[WARN] relancer manuellement : sqlite3 'diff.db' "VACUUM INTO 'diff.db.tmp'" && mv 'diff.db.tmp' 'diff.db'
+```
+
 ## 1.0.16 — 2026-06-07
 
 ### `IdxPurge` : `PRAGMA incremental_vacuum` au lieu de `VACUUM`
