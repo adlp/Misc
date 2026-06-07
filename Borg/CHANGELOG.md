@@ -1,5 +1,47 @@
 # Changelog — borgHelper
 
+## 1.0.14 — 2026-06-07
+
+### `IdxTop` et `IdxPurge` — diagnostic et nettoyage rétroactif du diff.db
+
+Deux nouvelles commandes pour gérer les `diff.db` devenus trop volumineux (accumulation d'entrées sur des arborescences très actives comme `/var/lib/docker`, caches, artefacts de compilation).
+
+#### `IdxTop` — diagnostic des gros contributeurs
+
+```bash
+borgHelper -c IdxTop -n mon-serveur
+borgHelper -c IdxTop -n mon-serveur -N 30 -p 4   # top 30, profondeur 4
+```
+
+- Stream de `diff_index` par batch (50 000 lignes), regroupement par préfixe en Python
+- Affiche les N arborescences avec le plus d'entrées : chemin, nb entrées, taille cumulée, % du total
+- Configurable : `-N` (nb résultats, défaut 20) · `-p` (profondeur répertoire, défaut 3)
+- Résultat typique : identifie en quelques secondes quelle arbo représente 35 % des entrées
+
+#### `IdxPurge` — purge rétroactive + VACUUM
+
+```bash
+borgHelper -c IdxPurge -n mon-serveur -x /var/lib/docker -D   # dry-run
+borgHelper -c IdxPurge -n mon-serveur -x /var/lib/docker       # purge réelle
+borgHelper -c IdxPurge -n mon-serveur -x '*.pyc'               # glob
+borgHelper -c IdxPurge -n mon-serveur -x '/home/*/.cache/*'    # glob (* matche /)
+```
+
+- Préfixe plain : supprime toutes les entrées dont le chemin vaut exactement le préfixe ou commence par `préfixe/`
+- Glob : utilise SQLite `GLOB` (`*` matche tout y compris `/`)
+- Après suppression : recalcule `diff_indexed_pairs.entry_count` + `VACUUM` pour récupérer l'espace immédiatement
+- `-D` : dry-run — affiche le volume concerné sans rien modifier
+
+#### Workflow recommandé
+
+```
+borgHelper -c IdxTop -n mon-serveur          # identifier les arbo volumineuses
+  → ajouter les arbo à IDX_EXCLUDE dans le borghelperrc
+borgHelper -c IdxPurge -n mon-serveur -D -x /var/lib/docker  # vérifier
+borgHelper -c IdxPurge -n mon-serveur -x /var/lib/docker     # purger
+  → diff.db : 6 GB → quelques centaines de MB
+```
+
 ## 1.0.13 — 2026-06-06
 
 ### Index : attente automatique si SQLite verrouillé

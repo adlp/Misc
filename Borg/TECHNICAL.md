@@ -352,6 +352,55 @@ Phase 3 : commit des résultats (paires annulées/terminées non commitées → 
 
 ---
 
+## Gestion du volume de `diff_index`
+
+### Diagnostic : `IdxTop`
+
+`IdxTop` parcourt `diff_index` en streaming (batch 50 000 lignes) et regroupe les entrées par préfixe de répertoire en Python. Aucun `GROUP BY` en SQL — la profondeur configurable (-p) permet de voir à n'importe quel niveau d'arborescence.
+
+```
+IdxTop -n nick [-N top] [-p profondeur]
+    ↓
+stream diff_index WHERE nick=?  (fetchmany 50000)
+    ↓
+get_prefix(path, depth)  :  '/var/lib/docker/overlay2/abc/diff/usr/...'
+                                 depth=3 → '/var/lib/docker'
+    ↓
+defaultdict accumule count + sum(size) par préfixe
+    ↓
+top N par count → prettytable
+```
+
+### Nettoyage rétroactif : `IdxPurge`
+
+Supprime en masse les entrées `diff_index` correspondant à un préfixe ou un glob, puis recalcule `diff_indexed_pairs.entry_count` et lance `VACUUM`.
+
+```
+IdxPurge -x <pattern> -n nick [-D]
+    ↓
+COUNT + SUM sur diff_index (dry-run ou confirmation)
+    si -D → affiche volume, s'arrête
+    ↓
+DELETE FROM diff_index WHERE nick=? AND (path=? OR path LIKE ?/%)   # préfixe
+DELETE FROM diff_index WHERE nick=? AND path GLOB ?                  # glob
+    ↓
+UPDATE diff_indexed_pairs SET entry_count = (SELECT COUNT(*) ...)    # recalcul
+    ↓
+VACUUM  (connexion séparée après commit — VACUUM interdit en transaction)
+```
+
+**Préfixe vs glob :**
+- Préfixe (pas de `*?[`) : `path = ? OR path LIKE préfixe/%` — correspondance exacte de répertoire, sans faux positifs
+- Glob (`*?[` présents) : SQLite `GLOB` — `*` matche tout y compris `/`
+
+**Workflow recommandé :**
+```
+IdxTop → identifier → ajouter IDX_EXCLUDE dans borghelperrc → IdxPurge
+```
+`IDX_EXCLUDE` empêche les futures indexations d'ingérer ces chemins ; `IdxPurge` purge l'historique déjà en base.
+
+---
+
 ## SQLite verrouillé pendant l'indexation
 
 Si `Index` ou `Bkp` tente d'écrire dans `diff.db` alors qu'un autre processus (backup ou restauration sur le même dépôt) tient un verrou SQLite, l'opération attend automatiquement au lieu d'échouer.
