@@ -412,10 +412,13 @@ top N par count → prettytable
 
 ### Nettoyage rétroactif : `IdxPurge`
 
-Supprime en masse les entrées `diff_index` correspondant à un préfixe ou un glob, puis recalcule `diff_indexed_pairs.entry_count` et lance `VACUUM`.
+Supprime en masse les entrées `diff_index` correspondant à un préfixe ou un glob, puis recalcule `diff_indexed_pairs.entry_count` et compacte le fichier.
 
 ```
-IdxPurge -x <pattern> -n nick [-D]
+IdxPurge [-x <pattern>] -n nick [-D]
+    ↓
+sans -x : lit IDX_EXCLUDE/IDX_INCLUDE du borghelperrc → construit condition SQL
+avec -x : pattern explicite (préfixe ou glob)
     ↓
 COUNT + SUM sur diff_index (dry-run ou confirmation)
     si -D → affiche volume, s'arrête
@@ -425,8 +428,12 @@ DELETE FROM diff_index WHERE nick=? AND path GLOB ?                  # glob
     ↓
 UPDATE diff_indexed_pairs SET entry_count = (SELECT COUNT(*) ...)    # recalcul
     ↓
-VACUUM  (connexion séparée après commit — VACUUM interdit en transaction)
+VACUUM INTO 'diff.db.vacuum_tmp'  (même répertoire → évite /tmp saturé)
+os.replace('diff.db.vacuum_tmp', 'diff.db')
+    └── si échec : entrées supprimées, message avec commande manuelle
 ```
+
+**Pourquoi `VACUUM INTO` et pas `VACUUM` ?** `VACUUM` écrit son fichier temporaire dans `/tmp`, qui peut être sur une partition séparée et pleine même si le filesystem du `diff.db` a de l'espace. `VACUUM INTO chemin` crée la copie compacte dans le même répertoire, utilisant l'espace libre du bon filesystem.
 
 **Préfixe vs glob :**
 - Préfixe (pas de `*?[`) : `path = ? OR path LIKE préfixe/%` — correspondance exacte de répertoire, sans faux positifs
