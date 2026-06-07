@@ -422,6 +422,34 @@ sqlite3 -header -csv $DB \
   > archive_stats.csv
 ```
 
+### Compactage manuel (VACUUM INTO)
+
+Après de grosses purges (`IdxPurge`), le fichier SQLite conserve les pages libérées en interne (freelist) sans réduire sa taille sur disque. `borgHelper idxpurge` fait ce compactage automatiquement, mais si l'espace disque manquait même dans le répertoire de la base, voici la procédure manuelle.
+
+**Principe** : `VACUUM INTO` crée une copie compacte dans le *même répertoire* (même filesystem), ce qui évite l'erreur `database or disk is full` liée à `/tmp` sur une partition séparée.
+
+```bash
+DB=~/.cache/borghelper/borghelperrc-mon-serveur-diff.db
+
+# 1. Créer une copie compacte dans le même répertoire
+sqlite3 "$DB" "VACUUM INTO '${DB}.compact'"
+
+# 2. Remplacer l'original (garder .bak le temps de vérifier)
+mv "$DB" "${DB}.bak"
+mv "${DB}.compact" "$DB"
+
+# 3. Vérifier que la taille a bien diminué, puis supprimer le backup
+ls -lh "${DB}.bak" "$DB"
+rm "${DB}.bak"
+```
+
+Le fichier résultant est immédiatement utilisable par borgHelper :
+- `journal_mode=WAL` et `auto_vacuum=INCREMENTAL` sont réappliqués automatiquement à la prochaine connexion borgHelper.
+- Le schéma et les données sont intacts (`VACUUM INTO` est une copie compacte fidèle).
+- Aucune ré-indexation nécessaire.
+
+> **Espace requis** : `VACUUM INTO` a besoin d'environ autant d'espace que la taille *réelle* des données (sans les pages libres) — bien moins que la taille actuelle du fichier si celui-ci contient beaucoup de freelist.
+
 ---
 
 ## Intégration dans un script de supervision
