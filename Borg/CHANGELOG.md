@@ -1,5 +1,16 @@
 # Changelog — borgHelper
 
+## 1.0.22 — 2026-06-07
+
+### `Report` : colonnes fichiers/espace au format `Pre()+Add()-Supp()`
+
+Les trois colonnes `+ajouté`, `-supprimé`, `=présent` remplacées par deux colonnes :
+
+- `fichiers` : `Pre(80%)+Add(8%)-Supp(3%)` — pourcentages relatifs à l'archive courante
+- `espace`   : `Pre(8.5 GB)+Add(1.2 GB)-Supp(200 MB)` — tailles réelles
+
+Format identique en résumé et en détail par archive.
+
 ## 1.0.21 — 2026-06-07
 
 ### `Report` : résumé en pourcentages seuls

@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.21"
+Version="1.0.22"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
@@ -2140,21 +2140,13 @@ class BorgHelper:
         if not rows:
             raise Exception(f"archive_stats vide — lancez borgHelper -c Index -n {nick}")
         diff_stats=self.db._diff_stats_for_nick(nick)
-        def _fmt_stats(s,nf,total_sz=0,summary=False):
+        def _fmt_stats(s,nf,total_sz=0):
             na,nr,nm=s['added'],s['removed'],s['modified']
             present=max(0,nf-na-nm)
             present_sz=max(0,total_sz-s['added_sz']-s['modified_sz'])
-            if summary:
-                pn=lambda n: f"{100*n//nf}%" if nf>0 else "—"
-                ps=lambda sz: f"{100*sz//total_sz}%" if total_sz>0 else "—"
-                return {'+ajouté':f"{pn(na)} · {ps(s['added_sz'])}",
-                        '-supprimé':f"{pn(nr)} · {ps(s['removed_sz'])}",
-                        '=présent':f"{pn(present)} · {ps(present_sz)}"}
-            pct_n=lambda n: f" ({100*n//nf}%)" if nf>0 else ""
-            pct_sz=lambda sz: f" ({100*sz//total_sz}%)" if total_sz>0 else ""
-            return {'+ajouté':f"{na}{pct_n(na)} · {convert_octets_readable(s['added_sz'])}{pct_sz(s['added_sz'])}",
-                    '-supprimé':f"{nr}{pct_n(nr)} · {convert_octets_readable(s['removed_sz'])}{pct_sz(s['removed_sz'])}",
-                    '=présent':f"{present}{pct_n(present)} · {convert_octets_readable(present_sz)}{pct_sz(present_sz)}"}
+            pn=lambda n: f"{100*n//nf}%" if nf>0 else "—"
+            return {'fichiers':f"Pre({pn(present)})+Add({pn(na)})-Supp({pn(nr)})",
+                    'espace':f"Pre({convert_octets_readable(present_sz)})+Add({convert_octets_readable(s['added_sz'])})-Supp({convert_octets_readable(s['removed_sz'])})"}
         kept={}
         for archive,arch_date,duration,orig,compr,dedup,nfiles in rows:
             kept[archive]={'name':archive,'durationM':(duration or 0)/60,
@@ -2173,9 +2165,9 @@ class BorgHelper:
             'taille':None,'recuperable':None,'reste':None}
         s_last=diff_stats.get(last_arch)
         if s_last:
-            for k,v in _fmt_stats(s_last,last_k['nfiles'],last_k['original_size'],summary=True).items(): tcmpl[nick][k]=v
+            for k,v in _fmt_stats(s_last,last_k['nfiles'],last_k['original_size']).items(): tcmpl[nick][k]=v
         else:
-            tcmpl[nick]['+ajouté']='—'; tcmpl[nick]['-supprimé']='—'; tcmpl[nick]['=présent']='—'
+            tcmpl[nick]['fichiers']='—'; tcmpl[nick]['espace']='—'
         tbkps={'Prunable':{'name':'Prunable','original_size':0,'compressed_size':0,'deduplicated_size':0}}
         display_keys=list(kept.keys())
         if maxp is not None: display_keys=display_keys[-maxp:]
@@ -2188,7 +2180,7 @@ class BorgHelper:
             if s:
                 for kk,vv in _fmt_stats(s,k['nfiles'],k['original_size']).items(): tbkps[arch][kk]=vv
             else:
-                tbkps[arch]['+ajouté']='—'; tbkps[arch]['-supprimé']='—'; tbkps[arch]['=présent']='—'
+                tbkps[arch]['fichiers']='—'; tbkps[arch]['espace']='—'
         total_orig=sum(v['original_size'] for v in kept.values())
         total_compr=sum(v['compressed_size'] for v in kept.values())
         total_dedup2=sum(v['deduplicated_size'] for v in kept.values())
@@ -2264,29 +2256,21 @@ class BorgHelper:
                 cpt+=1
         tbkps['Totaux']={'name':'Totaux','original_size':resume['total_size'],'compressed_size':resume['total_csize'],'deduplicated_size':resume['unique_csize']}
         diff_stats=self.db._diff_stats_for_nick(nick)
-        def _fmt_stats(s,nf,total_sz=0,summary=False):
+        def _fmt_stats(s,nf,total_sz=0):
             na,nr,nm=s['added'],s['removed'],s['modified']
             present=max(0,nf-na-nm)
             present_sz=max(0,total_sz-s['added_sz']-s['modified_sz'])
-            if summary:
-                pn=lambda n: f"{100*n//nf}%" if nf>0 else "—"
-                ps=lambda sz: f"{100*sz//total_sz}%" if total_sz>0 else "—"
-                return {'+ajouté':f"{pn(na)} · {ps(s['added_sz'])}",
-                        '-supprimé':f"{pn(nr)} · {ps(s['removed_sz'])}",
-                        '=présent':f"{pn(present)} · {ps(present_sz)}"}
-            pct_n=lambda n: f" ({100*n//nf}%)" if nf>0 else ""
-            pct_sz=lambda sz: f" ({100*sz//total_sz}%)" if total_sz>0 else ""
-            return {'+ajouté':f"{na}{pct_n(na)} · {convert_octets_readable(s['added_sz'])}{pct_sz(s['added_sz'])}",
-                    '-supprimé':f"{nr}{pct_n(nr)} · {convert_octets_readable(s['removed_sz'])}{pct_sz(s['removed_sz'])}",
-                    '=présent':f"{present}{pct_n(present)} · {convert_octets_readable(present_sz)}{pct_sz(present_sz)}"}
+            pn=lambda n: f"{100*n//nf}%" if nf>0 else "—"
+            return {'fichiers':f"Pre({pn(present)})+Add({pn(na)})-Supp({pn(nr)})",
+                    'espace':f"Pre({convert_octets_readable(present_sz)})+Add({convert_octets_readable(s['added_sz'])})-Supp({convert_octets_readable(s['removed_sz'])})"}
         last_arch=resume.get('lastname','')
         s_last=diff_stats.get(last_arch) if last_arch else None
         if s_last:
             nf_last=kept.get(last_arch,{}).get('nfiles',0) or 0
             sz_last=kept.get(last_arch,{}).get('original_size',0) or 0
-            for k,v in _fmt_stats(s_last,nf_last,sz_last,summary=True).items(): tcmpl[nick][k]=v
+            for k,v in _fmt_stats(s_last,nf_last,sz_last).items(): tcmpl[nick][k]=v
         else:
-            tcmpl[nick]['+ajouté']='—'; tcmpl[nick]['-supprimé']='—'; tcmpl[nick]['=présent']='—'
+            tcmpl[nick]['fichiers']='—'; tcmpl[nick]['espace']='—'
         for arch in list(tbkps.keys()):
             if 'nfiles' not in tbkps[arch]: continue
             s=diff_stats.get(arch)
@@ -2294,7 +2278,7 @@ class BorgHelper:
                 nf=tbkps[arch].get('nfiles',0) or 0; sz=tbkps[arch].get('original_size',0) or 0
                 for k,v in _fmt_stats(s,nf,sz).items(): tbkps[arch][k]=v
             else:
-                tbkps[arch]['+ajouté']='—'; tbkps[arch]['-supprimé']='—'; tbkps[arch]['=présent']='—'
+                tbkps[arch]['fichiers']='—'; tbkps[arch]['espace']='—'
         return tcmpl,tbkps
 
     def report_offline(self,nicks,htrep=False,debug=0,maxp=None,as_json=False):
@@ -2350,10 +2334,10 @@ class BorgHelper:
             print(json.dumps({'summary':reshos,'backups':resbck},ensure_ascii=False,indent=2))
         elif htrep:
             print("<!DOCTYPE html>\n<html>\n  <body bgcolor=\"#ffffff\">\n    <br>")
-            print(htmlTabelise(reshos,colnames=['nom','duree','depuis','derniere','taille','recuperable','reste','+ajouté','-supprimé','=présent'],errhost=errhost))
+            print(htmlTabelise(reshos,colnames=['nom','duree','depuis','derniere','taille','recuperable','reste','fichiers','espace'],errhost=errhost))
             for nick in nicks.split(','):
                 print('    <br>')
-                print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','compressed_size','deduplicated_size','nfiles','+ajouté','-supprimé','=présent'],errhost=errhost))
+                print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','compressed_size','deduplicated_size','nfiles','fichiers','espace'],errhost=errhost))
             print('  </body>\n</html>')
         else:
             print(prettyTabelise(reshos))
@@ -2416,10 +2400,10 @@ class BorgHelper:
             print(json.dumps({'summary':reshos,'backups':resbck},ensure_ascii=False,indent=2))
         elif htrep:
             print("<!DOCTYPE html>\n<html>\n  <body bgcolor=\"#ffffff\">\n    <br>")
-            print(htmlTabelise(reshos,colnames=['nom','duree','depuis','derniere','taille','recuperable','reste','+ajouté','-supprimé','=présent'],errhost=errhost))
+            print(htmlTabelise(reshos,colnames=['nom','duree','depuis','derniere','taille','recuperable','reste','fichiers','espace'],errhost=errhost))
             for nick in nicks.split(','):
                 print('    <br>')
-                print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','compressed_size','deduplicated_size','nfiles','+ajouté','-supprimé','=présent'],errhost=errhost))
+                print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','compressed_size','deduplicated_size','nfiles','fichiers','espace'],errhost=errhost))
             print('  </body>\n</html>')
         else:
             print(prettyTabelise(reshos))
