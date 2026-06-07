@@ -1,5 +1,16 @@
 # Changelog — borgHelper
 
+## 1.0.23 — 2026-06-07
+
+### `Report` : résumé % seuls, détail valeur+%
+
+Affichage différencié entre résumé (tableau par hôte) et détail (tableau par archive) :
+
+| Contexte | `fichiers` | `espace` |
+|----------|-----------|---------|
+| Résumé | `Pre(80%)+Add(8%)-Supp(3%)` | `Pre(85%)+Add(12%)-Supp(2%)` |
+| Détail | `Pre(800/80%)+Add(80/8%)-Supp(30/3%)` | `Pre(8.5 GB/85%)+Add(1.2 GB/12%)-Supp(200 MB/2%)` |
+
 ## 1.0.22 — 2026-06-07
 
 ### `Report` : colonnes fichiers/espace au format `Pre()+Add()-Supp()`

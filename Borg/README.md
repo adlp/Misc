@@ -1,4 +1,4 @@
-# borgHelper  `v1.0.22`
+# borgHelper  `v1.0.23`
 
 Script Python 3 d'aide à la gestion des sauvegardes [BorgBackup](https://www.borgbackup.org/).  
 Centralise la configuration de plusieurs dépôts/serveurs dans un fichier INI et expose des commandes haut niveau.  
@@ -242,9 +242,14 @@ Code retour 1 si un dépôt dépasse `MAX_AGE_BKP` heures depuis la dernière sa
 Code retour 2 si un dépôt est inaccessible.
 
 **Statistiques de mouvement** (si l'index SQLite est disponible) — deux colonnes :
-- `fichiers` : `Pre(X%)+Add(Y%)-Supp(Z%)` — pourcentages relatifs au total de l'archive courante
-- `espace`   : `Pre(A)+Add(B)-Supp(C)` — tailles réelles (présent / ajouté / supprimé)
+
+| Contexte | `fichiers` | `espace` |
+|----------|-----------|---------|
+| Résumé (par hôte) | `Pre(80%)+Add(8%)-Supp(3%)` | `Pre(85%)+Add(12%)-Supp(2%)` |
+| Détail (par archive) | `Pre(800/80%)+Add(80/8%)-Supp(30/3%)` | `Pre(8.5 GB/85%)+Add(1.2 GB/12%)-Supp(200 MB/2%)` |
+
 - `—` dans les deux colonnes si l'archive n'est pas encore indexée
+- Pourcentages relatifs au total de l'archive courante (`nfiles` / `original_size`)
 
 **Mode offline** (`-o`) — rapport sans appel borg, depuis `diff.db` uniquement :
 - `taille` et `nfiles` disponibles si `archive_stats` est peuplée (après `Bkp` ou `Index`)
