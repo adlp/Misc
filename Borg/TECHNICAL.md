@@ -402,12 +402,14 @@ IdxTop -n nick [-N top] [-p profondeur]
     ↓
 stream diff_index WHERE nick=?  (fetchmany 50000)
     ↓
-get_prefix(path, depth)  :  '/var/lib/docker/overlay2/abc/diff/usr/...'
-                                 depth=3 → '/var/lib/docker'
+get_prefix(path, depth)
+    chemin absolu   : '/var/lib/docker/overlay2/abc/diff/usr/...' → depth=3 → '/var/lib/docker'
+    chemin relatif  : 'home/_Dockers/example/data/file.gz'        → depth=3 → 'home/_Dockers/example'
+    chemin court    : '/etc/nginx/nginx.conf'                      → depth=3 → '/etc/nginx/nginx.conf' (inchangé)
     ↓
 defaultdict accumule count + sum(size) par préfixe
     ↓
-top N par count → prettytable
+top N par count (nombre d'entrées, pas le poids) → prettytable
 ```
 
 ### Nettoyage rétroactif : `IdxPurge`
