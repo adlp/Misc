@@ -430,6 +430,48 @@ borgHelper -c DuIdx -f '*' -j -n mon-serveur               # sortie JSON
 
 ---
 
+### `IdxTop`
+Top N arborescences du `diff_index` par nombre d'entrées — diagnostic d'un `diff.db` volumineux.
+
+```bash
+borgHelper -c IdxTop -n mon-serveur           # top 20, profondeur 3
+borgHelper -c IdxTop -n mon-serveur -N 10     # top 10
+borgHelper -c IdxTop -n mon-serveur -p 4      # profondeur 4
+```
+
+| Option | Description |
+|--------|-------------|
+| `-N <n>` | Nombre de lignes affichées (défaut : 20) |
+| `-p <n>` | Profondeur de regroupement des chemins (défaut : 3) |
+
+Parcours en streaming (batchs 50 000 lignes) — fonctionne sur les grosses bases sans surcharge mémoire.
+
+---
+
+### `IdxPurge`
+Supprime rétroactivement des entrées de `diff_index` et compacte le `diff.db`.
+
+```bash
+borgHelper -c IdxPurge -n mon-serveur -D              # dry-run selon IDX_EXCLUDE/IDX_INCLUDE
+borgHelper -c IdxPurge -n mon-serveur                 # purge selon IDX_EXCLUDE/IDX_INCLUDE
+borgHelper -c IdxPurge -n mon-serveur -x /var/log     # purge un préfixe explicite
+borgHelper -c IdxPurge -n mon-serveur -x '*/node_modules/*'  # purge un glob
+```
+
+| Option | Description |
+|--------|-------------|
+| `-x <pattern>` | Pattern explicite (préfixe ou glob avec `*?[`) |
+| `-D` | Dry-run — affiche le volume sans supprimer |
+
+Sans `-x`, lit `IDX_EXCLUDE`/`IDX_INCLUDE` depuis la configuration du nick et purge tout ce qui serait exclu à l'indexation.
+
+Après suppression, `IdxPurge` recalcule `diff_indexed_pairs.entry_count` et compacte le fichier via `VACUUM INTO` (dans le même répertoire, évite les problèmes de `/tmp` plein). Si le compactage échoue, les entrées sont quand même supprimées et la commande manuelle est affichée.
+
+> **Workflow recommandé :**  
+> `IdxTop` → identifier les arborescences volumineuses → ajouter à `IDX_EXCLUDE` dans borghelperrc → `IdxPurge` (sans `-x`) pour purger l'historique existant.
+
+---
+
 ### `CacheInfo` / `CacheClean`
 
 ```bash
