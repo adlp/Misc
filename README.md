@@ -45,6 +45,11 @@ python script to push stdin data to a repo
     ./gitoune -r git@github.com:adlp/Misc.git -f Git/gitoune -g >/usr/local/bin/gitoune
     `
 
+### git2git_file
+Script bash pour transférer un fichier d'un dépôt git à un autre en conservant l'historique des commits.
+
+  `./git2git_file <repo_src> <fichier_src> <repo_dst> <fichier_dst>`
+
 ### gitar
 python script to push a tar file to a repo....
 
@@ -59,3 +64,50 @@ scp adlp-octopussy:/tmp/backup-octopussy.tgz /tmp/backup-octopussy.tgz
 ## OpenWrt
 ### uciRuleFromName
 A shell script to let me activate or desactivate a firewall rule in line...
+
+## Borg
+### borgHelper
+Script Python 3 d'aide à la gestion des sauvegardes BorgBackup.
+
+  * Configuration multi-dépôts/serveurs dans un fichier INI
+  * CLI et librairie Python
+  * Commandes : Bkp, Prune, Report, Index, Search, FileHist, Restore, DiffBkp, Mount/UMount, DuIdx, IdxTop, IdxPurge, DiffTop...
+  * Indexation SQLite incrémentale des diffs inter-archives
+  * Détails : README.md dans le répertoire Borg/
+
+## Docker
+### Compose
+Fichiers docker-compose pour services auto-hébergés :
+  * letsencrypt
+  * nextcloud
+  * nginx
+  * wordpress
+
+## Halloween
+### web2shell
+Serveur HTTP Python minimaliste pour exécuter des commandes shell via HTTP.
+
+## Mail
+### mailqOnOneLine
+Script Perl affichant la mailq Postfix en une ligne par message (from, to, sujet, date).
+
+## Toip
+### astFullLogs2DP
+Script Perl d'analyse des logs Asterisk — filtrage par channel-id, extension ou channel, avec support gzip et couleurs ANSI.
+
+## Tools
+### checkssl
+Script bash pour vérifier l'état d'un certificat SSL.
+
+### cronMutt
+Script Python pour gérer la sortie d'une commande cron — envoi conditionnel par mail (mutt), push Nextcloud, etc.
+
+### sleepUntil
+Script bash similaire à `at` mais bloquant : suspend le processus jusqu'à une heure précise, utilisable dans un script.
+
+### whosshkey
+Script bash similaire à `last` mais pour les clefs SSH.
+
+## Zapiz
+### zapiz.py
+Framework Python (FastAPI) pour exposer des fonctions Python en API REST avec authentification OIDC ou CSV, documentation Swagger auto-générée.
