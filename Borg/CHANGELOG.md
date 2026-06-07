@@ -1,5 +1,22 @@
 # Changelog — borgHelper
 
+## 1.0.15 — 2026-06-07
+
+### `IdxPurge` sans `-x` : purge selon IDX_EXCLUDE/IDX_INCLUDE du borghelperrc
+
+Sans l'option `-x`, `IdxPurge` lit directement les filtres `IDX_EXCLUDE` et `IDX_INCLUDE` de la configuration du nick et purge tout ce que ces filtres auraient exclu à l'indexation.
+
+```bash
+# Après avoir modifié IDX_EXCLUDE dans borghelperrc :
+borgHelper -c IdxPurge -n mon-serveur -D   # dry-run — voir le volume
+borgHelper -c IdxPurge -n mon-serveur      # purger selon la config
+```
+
+- Affiche les patterns lus depuis la config avant d'agir
+- Logique identique à `_idx_path_ok` : IDX_INCLUDE whitelist d'abord, IDX_EXCLUDE blacklist ensuite
+- La condition SQL est construite dynamiquement à partir des patterns (GLOB ou LIKE selon présence de `*?[`)
+- `-x` reste disponible pour un pattern explicite ponctuel (comportement 1.0.14 inchangé)
+
 ## 1.0.14 — 2026-06-07
 
 ### `IdxTop` et `IdxPurge` — diagnostic et nettoyage rétroactif du diff.db

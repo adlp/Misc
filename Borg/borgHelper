@@ -9,11 +9,12 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.14"
+Version="1.0.15"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 1.0.15 IdxPurge : sans -x → lit IDX_EXCLUDE/IDX_INCLUDE du borghelperrc, purge selon config
 # 1.0.14 IdxTop : top N arborescences par entrées diff_index (diagnostic diff.db volumineux)
 # 1.0.14 IdxPurge : purge rétroactive diff_index par préfixe/glob + VACUUM
 # 1.0.13 Index : SQLite verrouillé → attente automatique déverrouillage (retry 2s, max 300s)
@@ -348,10 +349,10 @@ def usage(doc=None,debug=0):
         printer("⚗️  -c IdxTop [-n nick/ALL] [-N top] [-p profondeur]")
         printer("       Top N arborescences par entrées dans diff_index — diagnostiquer un diff.db volumineux")
         printer("       -N n : top N (défaut 20)  |  -p d : profondeur répertoire (défaut 3)")
-        printer("⚡️ -c IdxPurge -x <pattern> [-n nick/ALL] [-D]")
-        printer("       Purge rétroactive de diff_index par préfixe de chemin ou glob + VACUUM")
-        printer("       -x '/var/lib/docker' : tout sous cette arbo  |  -x '*.pyc' : glob")
-        printer("       -D : dry-run — affiche le volume sans supprimer")
+        printer("⚡️ -c IdxPurge [-x <pattern>] [-n nick/ALL] [-D]")
+        printer("       Purge rétroactive de diff_index + VACUUM  (-D : dry-run)")
+        printer("       Sans -x : lit IDX_EXCLUDE/IDX_INCLUDE depuis le borghelperrc")
+        printer("       -x '/var/lib/docker' : préfixe explicite  |  -x '*.pyc' : glob")
         printer("  Sentry configuration : BORGHELPERC_SENTRY_ID BORGHELPERC_SENTRY_FILE ou /usr/local/etc/borghelper-sentry")
     elif doc=='key':
         printer("   -c Key [-n nickname/servername/ALL]")
@@ -428,13 +429,14 @@ def usage(doc=None,debug=0):
         printer("       Utile pour identifier quoi ajouter à IDX_EXCLUDE avant IdxPurge")
         printer("       -N n : nombre de résultats (défaut 20)  -p d : profondeur (défaut 3)")
     elif doc=='idxpurge':
-        printer("   -c IdxPurge -x <pattern> [-n nick/servername/ALL] [-D]")
-        printer("       Purge rétroactive des entrées diff_index par préfixe ou glob de chemin")
-        printer("       Puis VACUUM pour récupérer l'espace disque immédiatement")
-        printer("       -x '/var/lib/docker' : tout ce qui commence par ce préfixe")
-        printer("       -x '*.pyc' ou -x '/home/*/.cache/*' : glob (* matche /)")
+        printer("   -c IdxPurge [-x <pattern>] [-n nick/servername/ALL] [-D]")
+        printer("       Purge rétroactive des entrées diff_index + VACUUM")
+        printer("       Sans -x : lit IDX_EXCLUDE/IDX_INCLUDE depuis le borghelperrc")
+        printer("               → purge tout ce que les filtres actuels auraient exclu")
+        printer("       -x '/var/lib/docker' : préfixe explicite (tout sous cette arbo)")
+        printer("       -x '*.pyc' ou -x '*/.git/*' : glob (* matche /)")
         printer("       -D : dry-run — affiche le volume sans rien supprimer")
-        printer("       Workflow : IdxTop → ajouter IDX_EXCLUDE → IdxPurge")
+        printer("       Workflow : IdxTop → modifier IDX_EXCLUDE → IdxPurge (sans -x)")
     else:
         printer(f"  Desole pas de documentation pour la commande {doc}")
     sys.exit(1)
@@ -1959,15 +1961,46 @@ class BorgHelper:
         printer(f"Total : {total_count:,} entrées · {convert_octets_readable(total_size)}")
         printer(str(t))
 
-    def idxpurge(self,nick,pattern,dryrun=False,debug=0):
+    def idxpurge(self,nick,pattern=None,dryrun=False,debug=0):
         db_path=self.db.get_diff_db(nick)
         if not os.path.exists(db_path):
             printer(f"  {nick}: diff.db absent"); return
-        is_glob=any(c in pattern for c in '*?[')
-        if is_glob:
-            sql_where="nick=? AND path GLOB ?"; params=(nick,pattern)
+        def _pat_cond(patterns):
+            parts=[]; args=[]
+            for pat in patterns:
+                if any(c in pat for c in '*?['):
+                    parts.append("path GLOB ?"); args.append(pat)
+                else:
+                    parts.append("(path=? OR path LIKE ?)")
+                    args.extend([pat,pat.rstrip('/')+'/%'])
+            return ' OR '.join(parts),args
+        if pattern is not None:
+            is_glob=any(c in pattern for c in '*?[')
+            if is_glob:
+                sql_where="nick=? AND path GLOB ?"; params=(nick,pattern)
+            else:
+                sql_where="nick=? AND (path=? OR path LIKE ?)"; params=(nick,pattern,pattern.rstrip('/')+'/%')
         else:
-            sql_where="nick=? AND (path=? OR path LIKE ?)"; params=(nick,pattern,pattern.rstrip('/')+'/%')
+            cfg=self.borg.cfgread(nick)
+            includes=[p for p in cfg.get('IDX_INCLUDE','').split() if p]
+            excludes=[p for p in cfg.get('IDX_EXCLUDE','').split() if p]
+            if not includes and not excludes:
+                printer(f"  {nick}: aucun IDX_INCLUDE/IDX_EXCLUDE dans la config"); return
+            if includes: printer(f"  {nick}: IDX_INCLUDE : {' '.join(includes)}")
+            if excludes: printer(f"  {nick}: IDX_EXCLUDE : {' '.join(excludes)}")
+            if includes and excludes:
+                inc_sql,inc_args=_pat_cond(includes)
+                exc_sql,exc_args=_pat_cond(excludes)
+                sql_where=f"nick=? AND (NOT ({inc_sql}) OR ({exc_sql}))"
+                params=tuple([nick]+inc_args+exc_args)
+            elif includes:
+                inc_sql,inc_args=_pat_cond(includes)
+                sql_where=f"nick=? AND NOT ({inc_sql})"
+                params=tuple([nick]+inc_args)
+            else:
+                exc_sql,exc_args=_pat_cond(excludes)
+                sql_where=f"nick=? AND ({exc_sql})"
+                params=tuple([nick]+exc_args)
         try:
             conn=sqlite3.connect(db_path,timeout=60)
             row=conn.execute(
@@ -1975,9 +2008,10 @@ class BorgHelper:
                 params).fetchone()
             count,size=row[0],row[1] or 0
             if not count:
-                printer(f"  {nick}: aucune entrée pour '{pattern}'")
+                printer(f"  {nick}: aucune entrée à purger")
                 conn.close(); return
-            printer(f"  {nick}: {count:,} entrées · {convert_octets_readable(size)} — '{pattern}'")
+            label=f" — '{pattern}'" if pattern is not None else ""
+            printer(f"  {nick}: {count:,} entrées · {convert_octets_readable(size)}{label}")
             if dryrun:
                 printer(f"  {nick}: dry-run — aucune modification")
                 conn.close(); return
@@ -2443,10 +2477,9 @@ def _cli_main():
         for n in nick.split(','):
             bh.idxtop(n,depth=_depth,topn=_topn,debug=debug)
     elif cmd=='idxpurge':
-        if '-x' not in options: usage(cmd)
         _dryrun='-D' in options
         for n in nick.split(','):
-            bh.idxpurge(n,pattern=options['-x'],dryrun=_dryrun,debug=debug)
+            bh.idxpurge(n,pattern=options.get('-x'),dryrun=_dryrun,debug=debug)
     else:
         printer("Mais comment on peut en arriver la ?"); usage()
 

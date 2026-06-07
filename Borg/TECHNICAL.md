@@ -432,9 +432,23 @@ VACUUM  (connexion séparée après commit — VACUUM interdit en transaction)
 - Préfixe (pas de `*?[`) : `path = ? OR path LIKE préfixe/%` — correspondance exacte de répertoire, sans faux positifs
 - Glob (`*?[` présents) : SQLite `GLOB` — `*` matche tout y compris `/`
 
+**Modes de `IdxPurge` :**
+
+| Invocation | Comportement |
+|------------|--------------|
+| `IdxPurge -x <pattern>` | Purge un pattern explicite (préfixe ou glob) |
+| `IdxPurge` (sans `-x`) | Lit `IDX_EXCLUDE`/`IDX_INCLUDE` du borghelperrc, construit la condition SQL dynamiquement, purge tout ce qui serait exclu par les filtres actuels |
+
+Sans `-x`, la condition SQL est construite à partir de tous les patterns de la config :
+```
+IDX_EXCLUDE seul  → DELETE WHERE nick=? AND (p1 OR p2 OR ...)
+IDX_INCLUDE seul  → DELETE WHERE nick=? AND NOT (p1 OR p2 OR ...)
+Les deux          → DELETE WHERE nick=? AND (NOT (includes) OR (excludes))
+```
+
 **Workflow recommandé :**
 ```
-IdxTop → identifier → ajouter IDX_EXCLUDE dans borghelperrc → IdxPurge
+IdxTop → identifier → modifier IDX_EXCLUDE dans borghelperrc → IdxPurge (sans -x)
 ```
 `IDX_EXCLUDE` empêche les futures indexations d'ingérer ces chemins ; `IdxPurge` purge l'historique déjà en base.
 
