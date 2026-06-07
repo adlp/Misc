@@ -275,28 +275,58 @@ Pour les dépôts à fort volume (plusieurs GB de diff.db) :
 
 ---
 
-## Filtres d'indexation : patterns glob
+## Filtres d'indexation : IDX_INCLUDE / IDX_EXCLUDE
 
-`IDX_INCLUDE` et `IDX_EXCLUDE` supportent deux syntaxes :
+### Syntaxe multi-valeurs
 
-| Syntaxe | Exemple | Comportement |
-|---------|---------|--------------|
+Plusieurs patterns sur une ligne séparés par espaces, ou multiligne avec indentation (syntaxe INI standard — continuation par leading whitespace) :
+
+```ini
+# Ligne unique
+IDX_EXCLUDE = /tmp /proc /sys *.pyc *.o
+
+# Multiligne (indentation obligatoire pour la continuation)
+IDX_EXCLUDE = /tmp /proc /sys
+    /var/lib/docker
+    /home/*/.cache/*
+    *.pyc *.o *.log *.bak
+```
+
+### Types de patterns
+
+| Syntaxe | Exemple | Mécanisme |
+|---------|---------|-----------|
 | Préfixe plain | `/home/`, `/etc` | `path.startswith(pattern)` — tout chemin commençant par ce préfixe |
 | Pattern glob | `*.bak`, `/home/*/.bash_history` | `fnmatch(path, pattern)` — `*` matche toute séquence **y compris** `/` |
 
-La distinction est automatique : si le pattern contient `*`, `?` ou `[`, fnmatch est utilisé ; sinon startswith.
+Distinction automatique : présence de `*`, `?` ou `[` → fnmatch ; sinon startswith.
 
-**Exemples :**
+> `fnmatch` traite `*` comme "n'importe quelle séquence **incluant** `/`". `/home/*/.bash_history` matche `/home/user/.bash_history` ET `/home/user/subdir/.bash_history`.
 
-```ini
-IDX_EXCLUDE = *.bak *.tmp *.swp         # tous les .bak/.tmp/.swp dans toute arborescence
-IDX_EXCLUDE = /home/*/.bash_history     # .bash_history dans tout sous-répertoire de /home/
-IDX_EXCLUDE = /home/*/.cache/*          # tout le cache utilisateur
-IDX_INCLUDE = /etc /home /root          # préfixes plains (pas de glob)
-IDX_INCLUDE = /home/*/documents/*       # uniquement les documents des utilisateurs
+### Logique de filtrage
+
+```
+Un chemin est indexé si :
+    (IDX_INCLUDE absent  OU  chemin matche au moins un INCLUDE)
+ ET (IDX_EXCLUDE absent  OU  chemin ne matche aucun EXCLUDE)
 ```
 
-> Note : `fnmatch` en Python traite `*` comme "n'importe quelle séquence de caractères **incluant** `/`". `/home/*/.bash_history` matche donc `/home/user/.bash_history` ET `/home/user/subdir/.bash_history`.
+Les deux clés sont cumulatives — INCLUDE whitelist d'abord, EXCLUDE blacklist ensuite.
+
+### Exemples complets
+
+```ini
+# Indexer seulement /etc et /home, sauf les caches et fichiers temporaires
+IDX_INCLUDE = /etc /home /root
+IDX_EXCLUDE = /home/*/.cache /home/*/.local/share/Trash
+    *.pyc *.o *.log *.bak *.tmp *.swp
+
+# Dépôt système : tout sauf les arbo volatiles
+IDX_EXCLUDE = /proc /sys /dev /run /tmp
+    /var/lib/docker /var/lib/lxc
+    /var/log /var/cache
+    *.pyc *.o
+```
 
 ---
 

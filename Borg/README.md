@@ -68,11 +68,25 @@ DB_NAME          = mon-serveur-home              # → borghelperrc-mon-serveur-
 # Désactiver l'indexation pour ce dépôt (Search/FileHist/DuIdx non disponibles)
 NOIDX            = 1
 
-# Filtres d'indexation (séparés par espaces)
-# Préfixe plain : /home/, /etc  → startswith
-# Pattern glob  : *.bak, /home/*/.bash_history  → * matche tout y compris /
+# Filtres d'indexation
+# Plusieurs patterns séparés par espaces sur une ligne,
+# ou multiligne avec indentation (syntaxe INI standard) :
+#
+#   IDX_EXCLUDE = /tmp /proc /sys
+#       /var/lib/docker
+#       /home/*/.cache/*
+#       *.pyc *.o *.log
+#
+# Préfixe plain : /home/, /etc  → startswith (rapide)
+# Pattern glob  : *.bak, /home/*/.bash_history  → fnmatch (* matche tout y compris /)
+#
+# Logique : IDX_INCLUDE (liste blanche) ET IDX_EXCLUDE (liste noire) sont cumulatifs.
+# Un chemin est indexé si : (aucun INCLUDE défini OU matche un INCLUDE)
+#                        ET (aucun EXCLUDE défini OU ne matche aucun EXCLUDE)
 IDX_INCLUDE      = /etc /home /root              # liste blanche — seuls ces chemins indexés
-IDX_EXCLUDE      = /proc /sys /tmp /var/log *.bak /home/*/.bash_history  # liste noire
+IDX_EXCLUDE      = /proc /sys /tmp /var/log
+    /var/lib/docker /home/*/.cache
+    *.bak *.pyc /home/*/.bash_history            # liste noire
 
 # Parallélisation de l'indexation (nombre de borg diff simultanés, défaut 4)
 IDX_WORKERS      = 4
