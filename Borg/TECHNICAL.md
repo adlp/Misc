@@ -302,6 +302,8 @@ IDX_EXCLUDE = /tmp /proc /sys
 Distinction automatique : présence de `*`, `?` ou `[` → fnmatch ; sinon startswith.
 
 > `fnmatch` traite `*` comme "n'importe quelle séquence **incluant** `/`". `/home/*/.bash_history` matche `/home/user/.bash_history` ET `/home/user/subdir/.bash_history`.
+>
+> Ce comportement permet les patterns **depth-independent** : `*/.git/*` matche `/projet/.git/HEAD` ET `/srv/app/sous/repo/.git/objects/ab/cd` — quelle que soit la profondeur dans l'arborescence.
 
 ### Logique de filtrage
 
@@ -326,6 +328,13 @@ IDX_EXCLUDE = /proc /sys /dev /run /tmp
     /var/lib/docker /var/lib/lxc
     /var/log /var/cache
     *.pyc *.o
+
+# Patterns depth-independent : exclure les .git/ à n'importe quelle profondeur
+# */.git/*  → tous les fichiers dans n'importe quel .git/
+# */.git    → le répertoire .git lui-même s'il apparaît comme entrée
+IDX_EXCLUDE = */.git/* */.git
+    */__pycache__/* */.tox/*
+    */node_modules/*
 ```
 
 ---

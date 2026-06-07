@@ -42,6 +42,21 @@ borgHelper -c IdxPurge -n mon-serveur -x /var/lib/docker     # purger
   → diff.db : 6 GB → quelques centaines de MB
 ```
 
+**Patterns depth-independent :** `*` matche `/`, donc `*/.git/*` purge tous les fichiers dans n'importe quel `.git/` quelle que soit la profondeur :
+
+```bash
+borgHelper -c IdxPurge -n mon-serveur -x '*/.git/*'
+borgHelper -c IdxPurge -n mon-serveur -x '*/node_modules/*'
+borgHelper -c IdxPurge -n mon-serveur -x '*/__pycache__/*'
+```
+
+Même syntaxe dans `IDX_EXCLUDE` pour le futur :
+
+```ini
+IDX_EXCLUDE = */.git/* */.git
+    */node_modules/* */__pycache__/*
+```
+
 ## 1.0.13 — 2026-06-06
 
 ### Index : attente automatique si SQLite verrouillé
