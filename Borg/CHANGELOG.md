@@ -1,5 +1,21 @@
 # Changelog — borgHelper
 
+## 1.0.19 — 2026-06-07
+
+### `DiffTop` : top N arborescences par changements sur une paire d'archives
+
+Nouveau diagnostic ciblé sur un diff précis (par défaut : la dernière paire indexée).
+
+```bash
+borgHelper -c DiffTop -n mon-serveur          # top 10, profondeur 3, dernière paire
+borgHelper -c DiffTop -n mon-serveur -N 5     # top 5
+borgHelper -c DiffTop -n mon-serveur -p 4     # profondeur 4
+borgHelper -c DiffTop -n mon-serveur -b archive-old,archive-new  # paire explicite
+```
+
+Colonnes : `total (nb+%)`, `+nb`, `+taille`, `-nb`, `-taille`, `=nb`, `taille`.  
+Tri par total. Source : `diff_index` — aucun appel borg.
+
 ## 1.0.18 — 2026-06-07
 
 ### `IdxTop` : fix regroupement des chemins sans `/` initial

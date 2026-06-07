@@ -1,4 +1,4 @@
-# borgHelper  `v1.0.18`
+# borgHelper  `v1.0.19`
 
 Script Python 3 d'aide à la gestion des sauvegardes [BorgBackup](https://www.borgbackup.org/).  
 Centralise la configuration de plusieurs dépôts/serveurs dans un fichier INI et expose des commandes haut niveau.  
@@ -469,6 +469,27 @@ Après suppression, `IdxPurge` recalcule `diff_indexed_pairs.entry_count` et com
 
 > **Workflow recommandé :**  
 > `IdxTop` → identifier les arborescences volumineuses → ajouter à `IDX_EXCLUDE` dans borghelperrc → `IdxPurge` (sans `-x`) pour purger l'historique existant.
+
+---
+
+### `DiffTop`
+Top N arborescences par nombre de changements sur une paire d'archives — diagnostic rapide après un backup.
+
+```bash
+borgHelper -c DiffTop -n mon-serveur                         # top 10, profondeur 3, dernière paire indexée
+borgHelper -c DiffTop -n mon-serveur -N 5                    # top 5
+borgHelper -c DiffTop -n mon-serveur -p 4                    # profondeur 4
+borgHelper -c DiffTop -n mon-serveur -b archive-old,archive-new  # paire explicite
+```
+
+| Option | Description |
+|--------|-------------|
+| `-N <n>` | Nombre de lignes affichées (défaut : 10) |
+| `-p <n>` | Profondeur de regroupement (défaut : 3) |
+| `-b <old,new>` | Paire d'archives explicite (défaut : dernière paire indexée) |
+
+Colonnes : `total (nb+%)` · `+nb` · `+taille` · `-nb` · `-taille` · `=nb` · `taille`.  
+Trié par total. Source : `diff_index` — aucun appel borg, résultat immédiat si la paire est indexée.
 
 ---
 

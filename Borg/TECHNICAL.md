@@ -412,6 +412,29 @@ defaultdict accumule count + sum(size) par préfixe
 top N par count (nombre d'entrées, pas le poids) → prettytable
 ```
 
+
+### Diagnostic par diff : `DiffTop`
+
+`DiffTop` est comme `IdxTop` mais ciblé sur une seule paire d'archives plutôt que l'ensemble du `diff_index`. Utile pour savoir quelle arborescence a provoqué le plus de changements lors d'un backup précis.
+
+```
+DiffTop -n nick [-N top] [-p profondeur] [-b archive-old,archive-new]
+    ↓
+sans -b : dernière paire de diff_indexed_pairs (ORDER BY indexed_at DESC)
+    ↓
+stream diff_index WHERE nick=? AND archive_old=? AND archive_new=?  (fetchmany 50000)
+    ↓
+get_prefix(path, depth)  — même logique que IdxTop
+    ↓
+defaultdict accumule par préfixe :
+    added_n / added_s (size_after)
+    removed_n / removed_s (size_before)
+    modified_n
+    total = added_n + removed_n + modified_n
+    ↓
+top N par total → prettytable (colonnes : total, +nb, +taille, -nb, -taille, =nb, taille)
+```
+
 ### Nettoyage rétroactif : `IdxPurge`
 
 Supprime en masse les entrées `diff_index` correspondant à un préfixe ou un glob, puis recalcule `diff_indexed_pairs.entry_count` et compacte le fichier.

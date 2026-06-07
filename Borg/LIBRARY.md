@@ -511,6 +511,7 @@ sys.exit(0)
 | `report(nicks, htrep, debug, maxp, as_json)` | Rapport avec appels borg |
 | `report_offline(nicks, htrep, debug, maxp, as_json)` | Rapport depuis diff.db uniquement — même résumé que `report`, toutes machines affichées même sans index |
 | `idxtop(nick, depth, topn, debug)` | Top N arborescences par nb d'entrées dans diff_index — diagnostiquer un diff.db volumineux |
+| `difftop(nick, bkp, depth, topn, debug)` | Top N arborescences par changements sur une paire d'archives — diagnostiquer les changements d'un backup |
 | `idxpurge(nick, pattern=None, dryrun, debug)` | Purge rétroactive de diff_index + VACUUM — sans pattern : lit IDX_EXCLUDE/IDX_INCLUDE depuis la config |
 | `search(nick, pattern, archive_from, archive_to, debug)` | Recherche par chemin |
 | `filehist(nick, path, archive_from, archive_to, debug)` | Historique d'un chemin |

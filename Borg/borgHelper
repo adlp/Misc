@@ -9,11 +9,12 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.18"
+Version="1.0.19"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
 ### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
+# 1.0.19 DiffTop : top N arborescences par changements sur une paire d'archives
 # 1.0.18 IdxTop : fix get_prefix — chemins sans / initial non tronqués à la profondeur demandée
 # 1.0.17 IdxPurge : VACUUM INTO même répertoire (évite /tmp saturé), fallback avec message si échec
 # 1.0.16 IdxPurge : PRAGMA incremental_vacuum au lieu de VACUUM (pas de copie, disque non plein requis)
@@ -1966,6 +1967,83 @@ class BorgHelper:
         printer(f"Total : {total_count:,} entrées · {convert_octets_readable(total_size)}")
         printer(str(t))
 
+
+    def difftop(self,nick,bkp=None,depth=3,topn=10,debug=0):
+        from collections import defaultdict
+        db_path=self.db.get_diff_db(nick)
+        if not os.path.exists(db_path):
+            printer(f"  {nick}: diff.db absent — lancez borgHelper -c Index -n {nick}"); return
+        if bkp:
+            parts=bkp.split(',')
+            if len(parts)==2: arch_old,arch_new=parts[0].strip(),parts[1].strip()
+            else: printer(f"  {nick}: -b attend 'archive-old,archive-new'"); return
+        else:
+            try:
+                conn=sqlite3.connect(db_path,timeout=60)
+                row=conn.execute(
+                    "SELECT archive_old,archive_new FROM diff_indexed_pairs WHERE nick=? ORDER BY indexed_at DESC LIMIT 1",
+                    (nick,)).fetchone()
+                conn.close()
+            except sqlite3.Error as e:
+                printer(f"  SQLite error: {e}"); return
+            if not row:
+                printer(f"  {nick}: aucune paire indexée — lancez borgHelper -c Index -n {nick}"); return
+            arch_old,arch_new=row
+        def get_prefix(path,d):
+            if not path: return '(vide)'
+            leading='/' if path[0]=='/' else ''
+            parts=[p for p in path.split('/') if p]
+            if len(parts)<=d: return path
+            return leading+'/'.join(parts[:d])
+        stats=defaultdict(lambda:{'total':0,'added_n':0,'added_s':0,'removed_n':0,'removed_s':0,'modified_n':0,'size':0})
+        total_count=0; total_size=0
+        try:
+            conn=sqlite3.connect(db_path,timeout=60)
+            cur=conn.execute(
+                "SELECT path,change_type,size_before,size_after FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",
+                (nick,arch_old,arch_new))
+            while True:
+                rows=cur.fetchmany(50000)
+                if not rows: break
+                for path,ct,sb,sa in rows:
+                    pfx=get_prefix(path,depth)
+                    s=stats[pfx]
+                    s['total']+=1
+                    sz=(sa or sb or 0)
+                    s['size']+=sz
+                    if ct=='added':    s['added_n']+=1;    s['added_s']+=(sa or 0)
+                    elif ct=='removed': s['removed_n']+=1; s['removed_s']+=(sb or 0)
+                    else:              s['modified_n']+=1
+                    total_count+=1; total_size+=sz
+            conn.close()
+        except sqlite3.Error as e:
+            printer(f"  SQLite error: {e}"); return
+        if not total_count:
+            printer(f"  {nick}: aucune entrée pour cette paire ({arch_old} → {arch_new})"); return
+        top=sorted(stats.items(),key=lambda x:x[1]['total'],reverse=True)[:topn]
+        from prettytable import PrettyTable
+        t=PrettyTable()
+        t.field_names=['arborescence','total','+nb','+taille','-nb','-taille','=nb','taille']
+        for f in t.field_names: t.align[f]='r'
+        t.align['arborescence']='l'
+        for pfx,s in top:
+            pct=f"{100*s['total']//total_count}%"
+            t.add_row([
+                pfx,
+                f"{s['total']:,} ({pct})",
+                f"{s['added_n']:,}" if s['added_n'] else '—',
+                convert_octets_readable(s['added_s']) if s['added_s'] else '—',
+                f"{s['removed_n']:,}" if s['removed_n'] else '—',
+                convert_octets_readable(s['removed_s']) if s['removed_s'] else '—',
+                f"{s['modified_n']:,}" if s['modified_n'] else '—',
+                convert_octets_readable(s['size']),
+            ])
+        printer(f"\n{nick} — top {topn} par changements (profondeur {depth})")
+        printer(f"  {arch_old}")
+        printer(f"→ {arch_new}")
+        printer(f"Total : {total_count:,} changements · {convert_octets_readable(total_size)}")
+        printer(str(t))
+
     def idxpurge(self,nick,pattern=None,dryrun=False,debug=0):
         db_path=self.db.get_diff_db(nick)
         if not os.path.exists(db_path):
@@ -2372,7 +2450,7 @@ def _cli_main():
            'delbkp':'Ccdnb','bkp':'CcdnI','prune':'Ccdn','report':'CcdnlNjo',
            'init':'Ccdn','key':'Ccdn','index':'CcdnFS','search':'CcdnfbB',
            'filehist':'CcdnfbB','cacheinfo':'Ccdn','cacheclean':'Ccdn','duidx':'CcdnfbBsj',
-           'idxtop':'CcdnNp','idxpurge':'CcdnxD'}
+           'idxtop':'CcdnNp','difftop':'CcdnNpb','idxpurge':'CcdnxD'}
 
     if cmd is None or cmd not in optab.keys():
         usage()
@@ -2491,6 +2569,11 @@ def _cli_main():
         _topn=int(options.get('-N','20'))
         for n in nick.split(','):
             bh.idxtop(n,depth=_depth,topn=_topn,debug=debug)
+    elif cmd=='difftop':
+        _depth=int(options.get('-p','3'))
+        _topn=int(options.get('-N','10'))
+        for n in nick.split(','):
+            bh.difftop(n,bkp=options.get('-b'),depth=_depth,topn=_topn,debug=debug)
     elif cmd=='idxpurge':
         _dryrun='-D' in options
         for n in nick.split(','):
