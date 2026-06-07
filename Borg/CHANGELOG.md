@@ -1,5 +1,15 @@
 # Changelog — borgHelper
 
+## 1.0.16 — 2026-06-07
+
+### `IdxPurge` : `PRAGMA incremental_vacuum` au lieu de `VACUUM`
+
+`VACUUM` crée une copie complète du fichier avant de remplacer l'original — sur un `diff.db` de plusieurs GB, cela nécessite autant d'espace libre que la taille du fichier, et échoue avec `database or disk is full` si le disque est serré.
+
+Remplacé par `PRAGMA incremental_vacuum` : reclaime les pages libérées en tronquant le fichier depuis la fin, sans aucune copie. Possible car `diff.db` a `PRAGMA auto_vacuum=INCREMENTAL` depuis l'origine.
+
+L'espace est récupéré immédiatement et proportionnellement aux entrées supprimées, sans risque de remplir le disque.
+
 ## 1.0.15 — 2026-06-07
 
 ### `IdxPurge` sans `-x` : purge selon IDX_EXCLUDE/IDX_INCLUDE du borghelperrc
