@@ -1,5 +1,13 @@
 # Changelog — borgHelper
 
+## 1.0.18 — 2026-06-07
+
+### `IdxTop` : fix regroupement des chemins sans `/` initial
+
+`get_prefix` ignorait la profondeur pour les chemins sans `/` initial (borg peut produire des chemins relatifs) — chaque fichier formait sa propre clé au lieu d'être regroupé. Corrigé : les chemins relatifs sont maintenant tronqués à la même profondeur que les chemins absolus.
+
+`IdxTop` est trié par nombre d'entrées (colonne `entrées`), pas par poids.
+
 ## 1.0.17 — 2026-06-07
 
 ### `IdxPurge` : `VACUUM INTO` pour éviter l'erreur "database or disk is full"

@@ -1,4 +1,4 @@
-# borgHelper  `v1.0.17`
+# borgHelper  `v1.0.18`
 
 Script Python 3 d'aide à la gestion des sauvegardes [BorgBackup](https://www.borgbackup.org/).  
 Centralise la configuration de plusieurs dépôts/serveurs dans un fichier INI et expose des commandes haut niveau.  
