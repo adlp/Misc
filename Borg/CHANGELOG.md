@@ -1,5 +1,14 @@
 # Changelog — borgHelper
 
+## 1.0.21 — 2026-06-07
+
+### `Report` : résumé en pourcentages seuls
+
+Dans le tableau résumé par hôte, les colonnes `+ajouté`, `-supprimé`, `=présent` affichaient le même format verbeux que le détail par archive (`15 (8%) · 1.2 GB (12%)`).
+
+Format résumé : `8% · 12%` — pourcentage fichiers · pourcentage taille, sans les valeurs absolues.  
+Le détail par archive conserve le format complet `N (P%) · SIZE (Q%)`.
+
 ## 1.0.20 — 2026-06-07
 
 ### `Report` : pourcentages cohérents — base unique = archive courante

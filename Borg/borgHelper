@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.20"
+Version="1.0.21"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
@@ -2140,10 +2140,16 @@ class BorgHelper:
         if not rows:
             raise Exception(f"archive_stats vide — lancez borgHelper -c Index -n {nick}")
         diff_stats=self.db._diff_stats_for_nick(nick)
-        def _fmt_stats(s,nf,total_sz=0):
+        def _fmt_stats(s,nf,total_sz=0,summary=False):
             na,nr,nm=s['added'],s['removed'],s['modified']
             present=max(0,nf-na-nm)
             present_sz=max(0,total_sz-s['added_sz']-s['modified_sz'])
+            if summary:
+                pn=lambda n: f"{100*n//nf}%" if nf>0 else "—"
+                ps=lambda sz: f"{100*sz//total_sz}%" if total_sz>0 else "—"
+                return {'+ajouté':f"{pn(na)} · {ps(s['added_sz'])}",
+                        '-supprimé':f"{pn(nr)} · {ps(s['removed_sz'])}",
+                        '=présent':f"{pn(present)} · {ps(present_sz)}"}
             pct_n=lambda n: f" ({100*n//nf}%)" if nf>0 else ""
             pct_sz=lambda sz: f" ({100*sz//total_sz}%)" if total_sz>0 else ""
             return {'+ajouté':f"{na}{pct_n(na)} · {convert_octets_readable(s['added_sz'])}{pct_sz(s['added_sz'])}",
@@ -2167,7 +2173,7 @@ class BorgHelper:
             'taille':None,'recuperable':None,'reste':None}
         s_last=diff_stats.get(last_arch)
         if s_last:
-            for k,v in _fmt_stats(s_last,last_k['nfiles'],last_k['original_size']).items(): tcmpl[nick][k]=v
+            for k,v in _fmt_stats(s_last,last_k['nfiles'],last_k['original_size'],summary=True).items(): tcmpl[nick][k]=v
         else:
             tcmpl[nick]['+ajouté']='—'; tcmpl[nick]['-supprimé']='—'; tcmpl[nick]['=présent']='—'
         tbkps={'Prunable':{'name':'Prunable','original_size':0,'compressed_size':0,'deduplicated_size':0}}
@@ -2258,10 +2264,16 @@ class BorgHelper:
                 cpt+=1
         tbkps['Totaux']={'name':'Totaux','original_size':resume['total_size'],'compressed_size':resume['total_csize'],'deduplicated_size':resume['unique_csize']}
         diff_stats=self.db._diff_stats_for_nick(nick)
-        def _fmt_stats(s,nf,total_sz=0):
+        def _fmt_stats(s,nf,total_sz=0,summary=False):
             na,nr,nm=s['added'],s['removed'],s['modified']
             present=max(0,nf-na-nm)
             present_sz=max(0,total_sz-s['added_sz']-s['modified_sz'])
+            if summary:
+                pn=lambda n: f"{100*n//nf}%" if nf>0 else "—"
+                ps=lambda sz: f"{100*sz//total_sz}%" if total_sz>0 else "—"
+                return {'+ajouté':f"{pn(na)} · {ps(s['added_sz'])}",
+                        '-supprimé':f"{pn(nr)} · {ps(s['removed_sz'])}",
+                        '=présent':f"{pn(present)} · {ps(present_sz)}"}
             pct_n=lambda n: f" ({100*n//nf}%)" if nf>0 else ""
             pct_sz=lambda sz: f" ({100*sz//total_sz}%)" if total_sz>0 else ""
             return {'+ajouté':f"{na}{pct_n(na)} · {convert_octets_readable(s['added_sz'])}{pct_sz(s['added_sz'])}",
@@ -2272,7 +2284,7 @@ class BorgHelper:
         if s_last:
             nf_last=kept.get(last_arch,{}).get('nfiles',0) or 0
             sz_last=kept.get(last_arch,{}).get('original_size',0) or 0
-            for k,v in _fmt_stats(s_last,nf_last,sz_last).items(): tcmpl[nick][k]=v
+            for k,v in _fmt_stats(s_last,nf_last,sz_last,summary=True).items(): tcmpl[nick][k]=v
         else:
             tcmpl[nick]['+ajouté']='—'; tcmpl[nick]['-supprimé']='—'; tcmpl[nick]['=présent']='—'
         for arch in list(tbkps.keys()):
