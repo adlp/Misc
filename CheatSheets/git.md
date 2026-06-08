@@ -3,22 +3,24 @@
 ## Flux Git
 
 ```mermaid
-flowchart LR
-    WD["Working Directory"]
-    IDX["Index (Stage)"]
-    LOCAL["Local Repo"]
-    REMOTE["Remote Repo"]
+sequenceDiagram
+    box Local Repo
+        participant WT as working tree
+        participant IDX as index / staging area
+        participant LB as local branch<br/>(ex: master)
+        participant RT as remote-tracking ref<br/>(ex: origin/master)
+    end
+    box Remote Repo
+        participant RB as remote branch
+    end
 
-    WD -->|"git add"| IDX
-    IDX -->|"git commit"| LOCAL
-    LOCAL -->|"git push"| REMOTE
-
-    REMOTE -->|"git fetch"| LOCAL
-    REMOTE -->|"git pull (fetch+merge)"| WD
-    LOCAL -->|"git checkout / git restore"| WD
-    LOCAL -->|"git reset"| IDX
-
-    IDX -->|"git restore --staged"| WD
+    WT->>IDX: git add
+    IDX->>LB: git commit
+    LB->>RB: git push
+    RB->>RT: git fetch
+    RB->>WT: git pull
+    LB->>WT: git checkout
+    RT->>WT: git merge / rebase
 ```
 
 
