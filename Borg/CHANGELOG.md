@@ -1,5 +1,20 @@
 # Changelog — borgHelper
 
+## 1.0.28 — 2026-06-08
+
+### `Report` : résumé — format `Chg(X%) Supp(Y%)`
+
+Le tableau résumé par hôte remplace `Pre()+Add()-Supp()` par deux indicateurs orthogonaux :
+
+| Colonne | Formule |
+|---------|---------|
+| `fichiers` | `Chg((added+modified)/nfiles_new) Supp(removed/nfiles_prev)` |
+| `espace`   | `Chg((added_sz+modified_sz)/total_sz) Supp(removed_sz/prev_sz)` |
+
+Avec `nfiles_prev = nfiles_new − added + removed` et `prev_sz = total_sz − added_sz + removed_sz`.
+
+`Chg` et `Supp` ont des dénominateurs distincts et cohérents — pas de problème de somme > 100%.
+
 ## 1.0.27 — 2026-06-08
 
 ### `IdxTop` : inchangés par archive

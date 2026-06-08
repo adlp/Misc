@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.27"
+Version="1.0.28"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
@@ -2204,8 +2204,13 @@ class BorgHelper:
             pn=lambda n: f"{100*n//nf}%" if nf>0 else "—"
             ps=lambda sz: f"{100*sz//total_sz}%" if total_sz>0 else "—"
             if summary:
-                return {'fichiers':f"Pre({pn(present)})+Add({pn(na)})-Supp({pn(nr)})",
-                        'espace':f"Pre({ps(present_sz)})+Add({ps(s['added_sz'])})-Supp({ps(s['removed_sz'])})"}
+                prev_nf=nf-na+nr; prev_sz=total_sz-s['added_sz']+s['removed_sz']
+                pn_chg=f"{100*(na+nm)//nf}%" if nf>0 else "—"
+                pn_supp=f"{100*nr//prev_nf}%" if prev_nf>0 else "—"
+                ps_chg=f"{100*(s['added_sz']+s['modified_sz'])//total_sz}%" if total_sz>0 else "—"
+                ps_supp=f"{100*s['removed_sz']//prev_sz}%" if prev_sz>0 else "—"
+                return {'fichiers':f"Chg({pn_chg}) Supp({pn_supp})",
+                        'espace':f"Chg({ps_chg}) Supp({ps_supp})"}
             def fv(n,p): return f"{n}/{p}"
             def sv(sz,p): return f"{convert_octets_readable(sz)}/{p}"
             return {'fichiers':f"Pre({fv(present,pn(present))})+Add({fv(na,pn(na))})-Supp({fv(nr,pn(nr))})",
@@ -2326,8 +2331,13 @@ class BorgHelper:
             pn=lambda n: f"{100*n//nf}%" if nf>0 else "—"
             ps=lambda sz: f"{100*sz//total_sz}%" if total_sz>0 else "—"
             if summary:
-                return {'fichiers':f"Pre({pn(present)})+Add({pn(na)})-Supp({pn(nr)})",
-                        'espace':f"Pre({ps(present_sz)})+Add({ps(s['added_sz'])})-Supp({ps(s['removed_sz'])})"}
+                prev_nf=nf-na+nr; prev_sz=total_sz-s['added_sz']+s['removed_sz']
+                pn_chg=f"{100*(na+nm)//nf}%" if nf>0 else "—"
+                pn_supp=f"{100*nr//prev_nf}%" if prev_nf>0 else "—"
+                ps_chg=f"{100*(s['added_sz']+s['modified_sz'])//total_sz}%" if total_sz>0 else "—"
+                ps_supp=f"{100*s['removed_sz']//prev_sz}%" if prev_sz>0 else "—"
+                return {'fichiers':f"Chg({pn_chg}) Supp({pn_supp})",
+                        'espace':f"Chg({ps_chg}) Supp({ps_supp})"}
             def fv(n,p): return f"{n}/{p}"
             def sv(sz,p): return f"{convert_octets_readable(sz)}/{p}"
             return {'fichiers':f"Pre({fv(present,pn(present))})+Add({fv(na,pn(na))})-Supp({fv(nr,pn(nr))})",

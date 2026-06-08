@@ -245,11 +245,16 @@ Code retour 2 si un dépôt est inaccessible.
 
 | Contexte | `fichiers` | `espace` |
 |----------|-----------|---------|
-| Résumé (par hôte) | `Pre(80%)+Add(8%)-Supp(3%)` | `Pre(85%)+Add(12%)-Supp(2%)` |
+| Résumé (par hôte) | `Chg(3%) Supp(1%)` | `Chg(8%) Supp(2%)` |
 | Détail (par archive) | `Pre(800/80%)+Add(80/8%)-Supp(30/3%)` | `Pre(8.5 GB/85%)+Add(1.2 GB/12%)-Supp(200 MB/2%)` |
 
+Résumé :
+- `Chg` = (added + modified) / nfiles_courante — % de fichiers changés ou nouveaux
+- `Supp` = removed / (nfiles_courante − added + removed) — % de fichiers supprimés par rapport à l'archive précédente
+
+Détail par archive : valeur + % sur base de l'archive courante.
+
 - `—` dans les deux colonnes si l'archive n'est pas encore indexée
-- Pourcentages relatifs au total de l'archive courante (`nfiles` / `original_size`)
 
 **Mode offline** (`-o`) — rapport sans appel borg, depuis `diff.db` uniquement :
 - `taille` et `nfiles` disponibles si `archive_stats` est peuplée (après `Bkp` ou `Index`)
