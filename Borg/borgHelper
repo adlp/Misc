@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.31"
+Version="1.0.32"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
@@ -1093,6 +1093,12 @@ class BorgRunner:
             inf,errs=ps.communicate()
         except KeyboardInterrupt:
             ps.kill(); ps.wait()
+            import glob as _glob, shutil as _shutil
+            for _d in _glob.glob('/tmp/_MEI*'):
+                try:
+                    if subprocess.run(['fuser',_d],capture_output=True).returncode!=0:
+                        _shutil.rmtree(_d,ignore_errors=True)
+                except Exception: pass
             printer("\n[INTERRUPTED] Opération annulée par l'utilisateur.")
             sys.exit(130)
         ret={'stdout':[],'stderr':[]}

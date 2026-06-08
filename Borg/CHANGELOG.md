@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.32 — 2026-06-08
+
+### `boex` : purge `_MEI*` PyInstaller sur Ctrl+C
+
+Même nettoyage que 1.0.31 : après `ps.kill()/wait()` sur `KeyboardInterrupt` dans `boex`, les répertoires `/tmp/_MEI*` orphelins sont supprimés (via `fuser`).
+
 ## 1.0.31 — 2026-06-08
 
 ### `Index` : nettoyage des répertoires PyInstaller orphelins après SIGKILL
