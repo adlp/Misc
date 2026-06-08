@@ -258,7 +258,7 @@ Détail par archive : valeur + % sur base de l'archive courante.
 
 **Mode offline** (`-o`) — rapport sans appel borg, depuis `diff.db` uniquement :
 - `nfiles` et tailles par archive disponibles si `archive_stats` est peuplée (après `Bkp` ou `Index`)
-- `taille` (taille dédupliquée du dépôt entier) disponible si `repo_stats` est peuplée (après `Bkp` ou `Prune`)
+- `taille` (taille dédupliquée du dépôt entier) disponible si `repo_stats` est peuplée (après `Bkp`)
 - `reste` (espace disponible) alimenté via `df` local — non disponible pour les dépôts distants SSH
 - `recuperable` toujours indisponible hors ligne (nécessite `borg prune --dry-run`)
 - Combinable avec `-j`, `-l`, `-N <n>`

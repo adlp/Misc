@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.31"
+Version="1.0.30"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
@@ -1661,24 +1661,16 @@ class BorgHelper:
             elif 'KEEP_HOURLY'==i: cmd.extend(['--keep-hourly',cfg[i]])
         if len(cmd)>1:
             if dryrun: cmd.append('--dry-run')
-            else: cmd.append('--json')
+            else: cmd.append('--stats')
             cmd.extend(f'--save-space --info --list --glob-archives={cfg["GLOB_ARCH"]}'.split(' '))
-            prune_ret=self.borg.boex(nick,cmd,debug=debug)
+            ret=self.borg.boex(nick,cmd,debug=debug)['stderr']
             if not dryrun:
-                try:
-                    cst=prune_ret.get('stdout',[{}])[0].get('cache',{}).get('stats',{}) if prune_ret.get('stdout') else {}
-                    if cst.get('unique_csize') is not None:
-                        db_path=self.db.get_diff_db(nick)
-                        self.db.ensure_diff_db(db_path)
-                        self.db.store_repo_stats(nick,cst['unique_csize'],cst.get('total_size'),cst.get('total_csize'),db_path)
-                except Exception as e:
-                    printer(f"[WARN] repo_stats post-prune : {e}")
                 rb=self.borg.boex(nick,['compact','--cleanup-commits'],debug=debug)
                 self.db.clear_cache_nick(nick)
                 self._cleanup_index_after_prune(nick,debug=debug)
                 return rb
             else:
-                return prune_ret['stderr']
+                return ret
         else:
             usage('prune')
 
