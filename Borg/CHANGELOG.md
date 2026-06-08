@@ -1,5 +1,13 @@
 # Changelog — borgHelper
 
+## 1.0.29 — 2026-06-08
+
+### `Report -o` : colonne `reste` désormais alimentée
+
+En mode offline (`-o`), la colonne `reste` (espace disque disponible sur le dépôt) était toujours `None`. Elle appelle maintenant `dfRepo` (simple `df` local) — disponible tant que le système de fichiers est accessible, même sans connexion borg.
+
+Pas d'effet sur les dépôts distants (SSH) : `dfRepo` retourne `None` si `BORG_REPO` contient `:`.
+
 ## 1.0.28 — 2026-06-08
 
 ### `Report` : résumé — format `Chg(X%) Supp(Y%)`

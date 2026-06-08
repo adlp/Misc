@@ -258,6 +258,7 @@ Détail par archive : valeur + % sur base de l'archive courante.
 
 **Mode offline** (`-o`) — rapport sans appel borg, depuis `diff.db` uniquement :
 - `taille` et `nfiles` disponibles si `archive_stats` est peuplée (après `Bkp` ou `Index`)
+- `reste` (espace disponible) alimenté via `df` local — disponible si le système de fichiers est accessible (non disponible pour les dépôts distants SSH)
 - Combinable avec `-j`, `-l`, `-N <n>`
 
 ---

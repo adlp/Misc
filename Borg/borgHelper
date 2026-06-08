@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.28"
+Version="1.0.29"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
@@ -2230,7 +2230,7 @@ class BorgHelper:
         tcmpl[nick]={'nom':nick,'date derniere':dabesi['date'],'depuis':dabesi['since'],
             'duree':last_k['durationM'],'derniere':last_k['deduplicated_size'],
             'moy':total_dedup/c if c else 0,
-            'taille':None,'recuperable':None,'reste':None}
+            'taille':None,'recuperable':None,'reste':self.borg.dfRepo(nick)}
         s_last=diff_stats.get(last_arch)
         if s_last:
             for k,v in _fmt_stats(s_last,last_k['nfiles'],last_k['original_size'],summary=True).items(): tcmpl[nick][k]=v
