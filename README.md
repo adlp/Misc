@@ -1,10 +1,15 @@
 # Introduction
-  * Le projet courant est en fait une multitude de petit projet distinct, qui faut traiter distinctement
-  * Chaques mini projets et dans un repertoire different
+  * Le projet courant est en fait une multitude de petits projets distincts, à traiter indépendamment
+  * Chaque mini-projet est dans un répertoire différent
   * Lorsque l'on travaille sur un mini-projet, on ne peut pas modifier un autre mini-projet directement
-  * Chaques mini-porjet a son README.md
-  * Chaques mini-projet a son changelog.txt
-  * Chaques mini-projet a son mini resume dans le README.md ici present
+  * Chaque mini-projet a son README.md
+  * Chaque mini-projet a son changelog.txt
+  * Chaque mini-projet a son mini-résumé dans le README.md ici présent
+
+# CheatSheets
+Fiches de référence rapide.
+  * `CheatSheets/git.md` — commandes git, flux (remotes, push/fetch/pull, upstream)
+  * `CheatSheets/tmux.md` — sélection souris vers clipboard X11
 
 # Mini-Projets
 ## tiling-scripts
@@ -63,7 +68,7 @@ scp adlp-octopussy:/tmp/backup-octopussy.tgz /tmp/backup-octopussy.tgz
 
 ## OpenWrt
 ### uciRuleFromName
-A shell script to let me activate or desactivate a firewall rule in line...
+Script shell pour activer ou désactiver une règle de pare-feu en ligne de commande.
 
 ## Borg
 ### borgHelper
