@@ -1,5 +1,13 @@
 # Changelog — borgHelper
 
+## 1.0.33 — 2026-06-08
+
+### `Report` : fix `—` sur archives indexées sans changements visibles
+
+**Bug** : quand tous les changements entre deux archives sont filtrés par `IDX_EXCLUDE`, `diff_index` reste vide pour cette paire mais `diff_indexed_pairs` la marque quand même comme indexée. Au report suivant, `_diff_stats_for_nick` ne trouvait rien dans `diff_index` → `None` → `—`.
+
+**Fix** : `_diff_stats_for_nick` initialise maintenant un stat-zéro pour toutes les archives présentes dans `diff_indexed_pairs` avant de les surcharger avec les valeurs réelles de `diff_index`. Les archives indexées sans changements visibles affichent désormais `Pre(N/100%)+Add(0/0%)-Supp(0/0%)`.
+
 ## 1.0.32 — 2026-06-08
 
 ### `boex` : purge `_MEI*` PyInstaller sur Ctrl+C
