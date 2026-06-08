@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.23"
+Version="1.0.24"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
@@ -1831,7 +1831,9 @@ class BorgHelper:
             except sqlite3.Error as e:
                 printer(f"SQLite error (insert): {e}")
         new_pairs=len(results)
-        print(f"{nick}: {new_pairs} paires indexées (+{skipped} déjà en cache)")
+        total_exclu=sum(sum(s['count'] for s in exclu.values()) for _,_,_,_,exclu in results)
+        exclu_suffix=f", {total_exclu:,} exclus" if total_exclu else ""
+        print(f"{nick}: {new_pairs} paires indexées (+{skipped} déjà en cache{exclu_suffix})")
         diff_keep=cfg.get('DIFF_KEEP','')
         if diff_keep.strip().isdigit():
             self.db._diff_keep_purge(nick,int(diff_keep),db_path)
@@ -1955,6 +1957,12 @@ class BorgHelper:
             printer(f"  SQLite error: {e}"); return
         if not total_count:
             printer(f"  {nick}: diff_index vide"); return
+        try:
+            conn2=sqlite3.connect(db_path)
+            exclu_row=conn2.execute("SELECT SUM(file_count),SUM(total_size) FROM diff_excluded_stats WHERE nick=?",(nick,)).fetchone()
+            conn2.close()
+            exclu_n=exclu_row[0] or 0; exclu_sz=exclu_row[1] or 0
+        except sqlite3.Error: exclu_n=0; exclu_sz=0
         top=sorted(stats.items(),key=lambda x:x[1]['count'],reverse=True)[:topn]
         from prettytable import PrettyTable
         t=PrettyTable(); t.field_names=['arborescence','entrées','taille','% total']
@@ -1964,7 +1972,9 @@ class BorgHelper:
             pct=f"{100*s['count']//total_count}%"
             t.add_row([pfx,f"{s['count']:,}",convert_octets_readable(s['size']),pct])
         printer(f"\n{nick} — top {topn} arborescences dans diff_index (profondeur {depth})")
-        printer(f"Total : {total_count:,} entrées · {convert_octets_readable(total_size)}")
+        printer(f"Indexés : {total_count:,} entrées · {convert_octets_readable(total_size)}")
+        if exclu_n:
+            printer(f"Exclus  : {exclu_n:,} entrées · {convert_octets_readable(exclu_sz)} (IDX_EXCLUDE)")
         printer(str(t))
 
 
@@ -2020,6 +2030,12 @@ class BorgHelper:
             printer(f"  SQLite error: {e}"); return
         if not total_count:
             printer(f"  {nick}: aucune entrée pour cette paire ({arch_old} → {arch_new})"); return
+        try:
+            conn3=sqlite3.connect(db_path,timeout=60)
+            exclu_row=conn3.execute("SELECT SUM(file_count),SUM(total_size) FROM diff_excluded_stats WHERE nick=? AND archive_old=? AND archive_new=?",(nick,arch_old,arch_new)).fetchone()
+            conn3.close()
+            exclu_n=exclu_row[0] or 0; exclu_sz=exclu_row[1] or 0
+        except sqlite3.Error: exclu_n=0; exclu_sz=0
         top=sorted(stats.items(),key=lambda x:x[1]['total'],reverse=True)[:topn]
         from prettytable import PrettyTable
         t=PrettyTable()
@@ -2041,7 +2057,9 @@ class BorgHelper:
         printer(f"\n{nick} — top {topn} par changements (profondeur {depth})")
         printer(f"  {arch_old}")
         printer(f"→ {arch_new}")
-        printer(f"Total : {total_count:,} changements · {convert_octets_readable(total_size)}")
+        printer(f"Indexés : {total_count:,} changements · {convert_octets_readable(total_size)}")
+        if exclu_n:
+            printer(f"Exclus  : {exclu_n:,} entrées · {convert_octets_readable(exclu_sz)} (IDX_EXCLUDE)")
         printer(str(t))
 
     def idxpurge(self,nick,pattern=None,dryrun=False,debug=0):

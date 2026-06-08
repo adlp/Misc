@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## 1.0.24 — 2026-06-08
+
+### `IdxTop` / `DiffTop` / `Index` : affichage des entrées non indexées
+
+Les fichiers exclus par `IDX_EXCLUDE` (stockés dans `diff_excluded_stats`) sont désormais visibles :
+
+- **`IdxTop`** — ligne `Exclus : N · taille (IDX_EXCLUDE)` après le total indexé (toutes paires confondues)
+- **`DiffTop`** — idem pour la paire spécifique affichée
+- **`Index` résumé final** — `, N exclus` ajouté au bilan de paires indexées
+
+La ligne Exclus est omise si aucun fichier n'a été filtré.
+
 ## 1.0.23 — 2026-06-07
 
 ### `Report` : résumé % seuls, détail valeur+%

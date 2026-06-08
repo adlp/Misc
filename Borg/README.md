@@ -451,6 +451,15 @@ borgHelper -c IdxTop -n mon-serveur -p 4      # profondeur 4
 
 Parcours en streaming (batchs 50 000 lignes) — fonctionne sur les grosses bases sans surcharge mémoire.
 
+Affiche également le total des entrées **exclues** par `IDX_EXCLUDE` (stockées dans `diff_excluded_stats`) :
+
+```
+Indexés : 142 350 entrées · 1.2 GB
+Exclus  : 18 200 entrées · 3.4 GB (IDX_EXCLUDE)
+```
+
+Si `IDX_EXCLUDE` est vide ou qu'aucun fichier n'a été filtré, la ligne Exclus est omise.
+
 ---
 
 ### `IdxPurge`
@@ -495,6 +504,9 @@ borgHelper -c DiffTop -n mon-serveur -b archive-old,archive-new  # paire explici
 
 Colonnes : `total (nb+%)` · `+nb` · `+taille` · `-nb` · `-taille` · `=nb` · `taille`.  
 Trié par total. Source : `diff_index` — aucun appel borg, résultat immédiat si la paire est indexée.
+
+Affiche également le total des entrées **exclues** par `IDX_EXCLUDE` pour cette paire spécifique.  
+La ligne Exclus est omise si aucun fichier n'a été filtré pour cette paire.
 
 ---
 
