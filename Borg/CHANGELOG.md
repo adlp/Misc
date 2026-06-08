@@ -1,5 +1,13 @@
 # Changelog — borgHelper
 
+## 1.0.31 — 2026-06-08
+
+### `Prune` : `--json` pour alimenter `repo_stats`
+
+`borg prune` passe de `--stats` à `--json` (non-dryrun). `cache.stats.unique_csize` est extrait du stdout JSON et stocké dans `repo_stats`, exactement comme après `Bkp`.
+
+Le dryrun (`-D`) conserve son comportement inchangé (lit stderr).
+
 ## 1.0.30 — 2026-06-08
 
 ### `Report -o` : colonne `taille` alimentée depuis `repo_stats`
