@@ -15,7 +15,9 @@ sequenceDiagram
     end
 
     WT->>IDX: git add
+    IDX->>WT: git restore --staged
     IDX->>LB: git commit
+    LB->>IDX: git reset HEAD~1
     LB->>RB: git push
     RB->>RT: git fetch
     RB->>WT: git pull
