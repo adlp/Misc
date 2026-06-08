@@ -48,18 +48,22 @@ gitGraph
    merge hotfix
 ```
 
-### Commandes — transitions d'état
+### Commandes correspondantes
 
-```mermaid
-flowchart LR
-    MAIN["main"]
-    FEAT["feature"]
-    DEL["✗ supprimée"]
+```bash
+# — commits A, B sur main —
+git checkout -b feature   # créer et basculer sur feature
+# — commits C, D sur feature —
+git checkout main         # revenir sur main
+# — commit E sur main —
+git merge feature         # merger feature → main
+git branch -d feature     # supprimer la branche mergée
 
-    MAIN -->|"git checkout -b &lt;nom&gt;\ngit switch -c &lt;nom&gt;"| FEAT
-    FEAT -->|"git checkout main\ngit switch main"| MAIN
-    FEAT -->|"git merge &lt;feature&gt;\ngit rebase &lt;feature&gt;"| MAIN
-    FEAT -->|"git branch -d\ngit branch -D"| DEL
+git checkout -b hotfix    # créer et basculer sur hotfix
+# — commit fix —
+git checkout main
+git merge hotfix
+git branch -d hotfix
 ```
 
 ### Référence rapide
