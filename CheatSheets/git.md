@@ -26,6 +26,60 @@ sequenceDiagram
 ```
 
 
+## Branches
+
+### Visuel — historique
+
+```mermaid
+gitGraph
+   commit id: "A"
+   commit id: "B"
+   branch feature
+   checkout feature
+   commit id: "C"
+   commit id: "D"
+   checkout main
+   commit id: "E"
+   merge feature id: "merge"
+   branch hotfix
+   checkout hotfix
+   commit id: "fix"
+   checkout main
+   merge hotfix
+```
+
+### Commandes — transitions d'état
+
+```mermaid
+flowchart TD
+    MAIN["main (HEAD)"]
+    FEAT["feature branch"]
+    DEL["branch supprimée"]
+
+    MAIN -->|"git branch &lt;nom&gt;"| FEAT
+    MAIN -->|"git checkout -b &lt;nom&gt;\ngit switch -c &lt;nom&gt;"| FEAT
+    FEAT -->|"git checkout main\ngit switch main"| MAIN
+    MAIN -->|"git merge &lt;feature&gt;"| MAIN
+    MAIN -->|"git rebase &lt;feature&gt;"| MAIN
+    FEAT -->|"git branch -d &lt;nom&gt;"| DEL
+    FEAT -->|"git branch -D &lt;nom&gt; (force)"| DEL
+```
+
+### Référence rapide
+
+```bash
+git branch                        # lister les branches locales
+git branch -a                     # lister local + remote
+git branch <nom>                  # créer une branche
+git checkout -b <nom>             # créer et basculer
+git switch <nom>                  # basculer (git >= 2.23)
+git merge <branche>               # merger dans la branche courante
+git rebase <branche>              # rebaser sur <branche>
+git branch -d <nom>               # supprimer (si mergée)
+git branch -D <nom>               # supprimer (force)
+git branch -m <ancien> <nouveau>  # renommer
+```
+
 ## Remotes
 
 ```bash
