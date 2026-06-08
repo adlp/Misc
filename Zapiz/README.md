@@ -79,19 +79,37 @@ app = Zapiz(
 
 ## API de routing
 
-### Ajouter une route
+### Gestion des routes
+
+```python
+# Ajout
+app["/"]                = Zapiz.Route(home, daType="html")
+app["POST /submit"]     = Zapiz.Route(handler, daType="json")
+app["GET /admin"]       = Zapiz.Route(fn, daType="html", acl="admin")
+
+# Lecture
+route = app["/"]        # → Route(func=..., daType='html', acl=None, file=None)
+
+# Suppression (→ 404)
+del app["/old"]
+```
+
+Le verbe est optionnel dans la clé : `app["/"]` équivaut à `app["GET /"]`.
+
+**`Zapiz.Route`** — paramètres :
+
+| Champ | Défaut | Description |
+|-------|--------|-------------|
+| `func` | — | Handler `async def f(varSession, params) → dict` |
+| `daType` | `"html"` | `"html"`, `"json"`, `"md"`, `"Dhtml"`, `"fileResponse"` |
+| `acl` | `None` | Nom de groupe requis (vérifié dans `varSession['groups']`) |
+| `file` | `None` | Chemin fichier statique (bypasse `func`) |
+
+### Méthode alternative (bas niveau)
 
 ```python
 app.api_add(uri, func, daType="html", verb="GET", acl=None)
 ```
-
-| Paramètre | Description |
-|-----------|-------------|
-| `uri` | Chemin URL |
-| `func` | Handler `async def f(varSession, params) → dict` |
-| `daType` | `"html"`, `"json"`, `"md"`, `"Dhtml"`, ou `"fileResponse"` |
-| `verb` | `"GET"` ou `"POST"` |
-| `acl` | Nom de groupe requis (vérifié dans `varSession['groups']`) |
 
 ### Format de retour des handlers
 
@@ -136,12 +154,11 @@ async def admin_page(varSession, params):
 ### Autres méthodes
 
 ```python
-app.api_del("/uri")          # Désactive une route (retourne 404)
 app.api_lst()                # Retourne le tableau de toutes les routes actives
 app.add_template("dossier")  # Ajoute un répertoire de templates supplémentaire
 ```
 
-> **Note** : `api_add("/foo", …)` enregistre automatiquement `/foo` et `/foo/`.
+> **Note** : les routes sont enregistrées avec et sans slash final (`/foo` et `/foo/`).
 
 ## Routes auth intégrées
 
