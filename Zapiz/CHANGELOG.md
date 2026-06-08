@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.2] - 2026-06-08
+
+### Améliorations
+
+- Docstrings ajoutées sur toutes les méthodes publiques et privées de `Zapiz` et `Route`
+
+---
+
 ## [1.1.1] - 2026-06-08
 
 ### Corrections

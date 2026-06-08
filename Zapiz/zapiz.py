@@ -38,6 +38,7 @@ import markdown
 
 @dataclass
 class Route:
+    """Route configuration. Use with app[key] = Route(...) or api_add()."""
     func: Callable
     daType: str = "html"
     acl: Optional[str] = None
@@ -45,7 +46,7 @@ class Route:
 
 
 class Zapiz:
-    VERSION = "1.1.1"
+    VERSION = "1.1.2"
     Route = Route
 
     def __init__(self, host: str="127.0.0.1", port: int=8080,
@@ -56,6 +57,10 @@ class Zapiz:
             title=None, description=None, version= None, docs_url=None, redoc_url=None, openapi_url=None,
             template_dir="templates",static_dir="static",token_url="token",root=os.path.abspath(os.getcwd())+"/",
             sentry=None,debug=False):
+        """Initialize Zapiz. Mounts static files, wires auth routes, registers startup hook.
+        FastAPI metadata params (title, description, version, docs_url, redoc_url, openapi_url) passed through.
+        sentry DSN is injected into every template context under key 'sentry'.
+        Set ZAPIZ_DEBUG=1 env var to expose GET /debug for graceful shutdown."""
         self.host = host
         self.port = port
         self.app = FastAPI(title=title,description=description,version=version,docs_url=docs_url,redoc_url=redoc_url,openapi_url=openapi_url)
@@ -111,6 +116,7 @@ class Zapiz:
                 return response
 
     def extract_request_info(self,obj):
+        """Extract ip/user/mth/uri from a Request or varSession dict. Returns dict with those keys."""
         uri = None
         ip = None
         user = None
@@ -153,6 +159,7 @@ class Zapiz:
             }
 
     def bugprint(self,infos,chaine,liste1=None,debug=False):
+        """Log a debug message with user context. No-op unless self.debug=True or debug=True."""
         if not self.debug and not debug:
             return
 
@@ -168,6 +175,7 @@ class Zapiz:
             self.logger.info(f"{user} {chaine}")
 
     def _setup_middlewares(self):
+        """Register HTTP logging middleware: ip(user) METHOD /path STATUS duration."""
         @self.app.middleware("http")
         async def log_requests(request: Request, call_next):
             start = time.time()
@@ -189,9 +197,11 @@ class Zapiz:
             return response
 
     def run(self):
+        """Start the uvicorn server."""
         uvicorn.run(self.app, host=self.host, port=self.port,access_log=False)
 
     def add_template(self,template_dir,templateid=None):
+        """Register an additional Jinja2 template directory. Select it via 'templateid' key in handler return dict."""
         if not templateid:
             if '/' in template_dir:
                 templateid=template_dir.split('/')[-1]
@@ -201,6 +211,7 @@ class Zapiz:
         self.templates[templateid]=Jinja2Templates(directory=template_dir)
 
     def add_static(self,static_dir,staticid=None):
+        """Mount an additional static file directory under /staticid."""
         if not staticid:
             if '/' in static_dir:
                 staticid=static_dir
@@ -210,6 +221,7 @@ class Zapiz:
 
     #async def auth_login_page(request: Request):
     async def auth_login_page(self,varSession,params={}):
+        """Render login.html with OIDC params (authentik_url, oidc_client_id, oidc_redirect_uri)."""
         template_data={}
         template_data['authentik_url']=self.oidc_auth_url
         template_data['oidc_client_id']=self.oidc_client_id
@@ -218,6 +230,7 @@ class Zapiz:
         return({'template':'login.html', 'varSession':varSession,'template_data':template_data})
 
     async def auth_local_login(self,varSession,params={}):
+        """Authenticate via CSV file. Reads form fields username/password, issues JWT pair on success."""
         form = varSession['form']
         username = form.get("username")
         password = form.get("password")
@@ -247,7 +260,7 @@ class Zapiz:
 
     # Fonction utilitaire pour lire le CSV et retourner les infos utilisateur
     def get_user_from_csv(self,csvfile, username):
-        # python3 -c "import bcrypt; print(bcrypt.hashpw(b'monmotdepasse', bcrypt.gensalt()).decode())"
+        """Look up username in CSV (format: user:bcrypt_hash:name:email:group1,group2). Returns dict or None."""
         with open(csvfile, newline="", encoding="utf-8") as f:
             reader = csv.reader(f, delimiter=":")
             for row in reader:
@@ -266,6 +279,7 @@ class Zapiz:
     
     @staticmethod
     def decode_payload(token: str):
+        """Decode JWT payload without signature verification. For inspection only — never use for auth."""
         import base64
         import json
 
@@ -282,6 +296,7 @@ class Zapiz:
 
     #async def auth_oidc_callback(self,request: Request, code: str):
     async def auth_oidc_callback(self,varSession,params={}):
+        """Handle OIDC authorization code callback. Exchanges code, validates id_token via JWKS, issues internal JWT pair."""
         code=None
         if varSession.get('form'):
             code=varSession['form'].get('code')
@@ -356,9 +371,11 @@ class Zapiz:
         return({'redirect':'/','set_cookie': {'access_token':access_token,'refresh_token':refresh_token}})
 
     async def auth_logout(self,varSession,params={}):
+        """Clear access_token and refresh_token cookies, redirect to /."""
         return({'redirect':'/','del_cookie': ['access_token','refresh_token']})
 
     async def auth_refresh(self, request: Request, next=None):
+        """Regenerate access token from refresh_token cookie. Redirects to next param or Referer header."""
         # 1. Récupérer le refresh token depuis le cookie
         refresh_token = request.cookies.get("refresh_token")
         if not refresh_token:
@@ -398,6 +415,7 @@ class Zapiz:
         return response
 
     async def auth_secret(self,varSession,params={}):
+        """Render whoami page (secret.html) with current user claims from access token."""
         nextstep={}
         request=varSession['request']
         nextstep['request']=request
@@ -440,6 +458,7 @@ class Zapiz:
         })
 
     def setup_auth_routes(self):
+        """Register built-in auth routes: /login, /login/localback, /login/callback, /login/whoami, /logout."""
         self.api_add("/login",self.auth_login_page,daType="html")
         self.api_add("/login/localback",self.auth_local_login,verb="POST",daType="html")
         self.api_add('/login/callback',self.auth_oidc_callback,daType="html")
@@ -448,16 +467,14 @@ class Zapiz:
         self.api_add('/logout',self.auth_logout,daType="html")
 
     def _setup_docs(self):
+        """Register custom /docs endpoint with Swagger UI."""
         @self.app.get("/docs", include_in_schema=False)
         async def custom_docs():
             return get_swagger_ui_html(openapi_url=self.app.openapi_url, title="Zapiz API Docs")
 
     def api_add(self, uri: str, func: Callable,daType:str="html",verb:str="GET",acl=None,file=None):
-        """ 
-        Format des routes
-        uri func html verb  await (et on rajoutede suite s'il faut un await)
-        Le add remplacera comme un sauvage le comportement de mv :)
-        """
+        """Register a handler for uri. First call creates the FastAPI route; subsequent calls hot-swap the handler.
+        Both /uri and /uri/ are registered. daType: html|json|md|Dhtml|fileResponse. acl: required group name."""
 
         fncAsync=None
         if not file:
@@ -486,19 +503,12 @@ class Zapiz:
 
 
     def api_del(self, uri: str, verb:str="GET"):
-        """ 
-        On ne supprime jamais un URI, on la fait pointer sur une 404 (merci fastapi...)
-        Bon en fait, suffit que ce soit le comportement par defaut de _secure_api
-        Par contre... je m'interroge sur le comportement de swag'n co
-        """
+        """Disable a route — subsequent requests return 404. FastAPI route itself is not removed."""
         if uri in self.api_routes[verb]:
             self.api_routes[verb][uri]['func']=None
 
     def api_lst(self):
-        """ 
-        Format des routes
-        uri func html verb  await (et on rajoutede suite s'il faut un await)
-        """
+        """Return active routes grouped by verb: {'GET': ['/foo', ...], 'POST': [...]}."""
         ret={}
         for verb in self.api_routes.keys():
             ret[verb]=[]
@@ -508,20 +518,24 @@ class Zapiz:
         return(ret)
 
     def _parse_route_key(self, key: str):
+        """Parse 'GET /path' or '/path' (defaults to GET) into (verb, uri) tuple."""
         parts = key.strip().split(None, 1)
         if len(parts) == 2 and parts[0].upper() in ("GET", "POST"):
             return parts[0].upper(), parts[1]
         return "GET", parts[0]
 
     def __setitem__(self, key: str, route: Route):
+        """Register or hot-swap a route. Key: 'VERB /path' or '/path' (GET). Value: Zapiz.Route instance."""
         verb, uri = self._parse_route_key(key)
         self.api_add(uri, route.func, daType=route.daType, verb=verb, acl=route.acl, file=route.file)
 
     def __delitem__(self, key: str):
+        """Disable a route (→ 404). Key: 'VERB /path' or '/path'."""
         verb, uri = self._parse_route_key(key)
         self.api_del(uri, verb=verb)
 
     def __getitem__(self, key: str):
+        """Return the Route registered at key. Raises KeyError if not found or disabled."""
         verb, uri = self._parse_route_key(key)
         uris = [uri, uri + "/"] if uri[-1] != "/" else [uri]
         for u in uris:
@@ -536,12 +550,15 @@ class Zapiz:
         raise KeyError(f"{verb} {uri}")
 
     def auth_create_token(self,data: dict, expires_delta: timedelta, token_type: str):
+        """Create a signed HS256 JWT with exp and type claims. token_type: 'access' or 'refresh'."""
         to_encode = data.copy()
         expire = datetime.utcnow() + expires_delta
         to_encode.update({"exp": expire, "type": token_type})
         return jwt.encode(to_encode, self.secret_key, algorithm=self.algo)
 
     def api_tokens_status(self,request:Request):
+        """Validate access token from cookies; silently regenerate from refresh token if expired.
+        Returns dict with keys payload/datas/access_token/refresh_token, or None if unauthenticated."""
         ret={}
         # 1. Récupérer le token d'accès depuis le cookie
         ret['access_token']  = request.cookies.get("access_token")
@@ -591,6 +608,7 @@ class Zapiz:
         return(ret)
 
     def _secure_api_tab(self, verb,uri):
+        """Return the universal FastAPI handler for (verb, uri). Handles auth, ACL, dispatch, and response type."""
         async def wrapper(request: Request):
             if not self.api_routes[verb].get(uri,None) or not self.api_routes[verb][uri]['func']:
                 return JSONResponse( status_code=404, content={"detail": "Ressource introuvable"})
@@ -717,9 +735,7 @@ class Zapiz:
         return wrapper
 
     def declare_path(app, method: str, path: str, *, summary: str = None, include_in_schema: bool = True):
-        """
-        Permet de preformarter pour swag, car, ca swag
-        """
+        """Decorator for direct FastAPI route registration with Swagger metadata extracted from docstring."""
         def decorator(func):
             doc = func.__doc__ or "Pas de description disponible."
             lines = doc.strip().split("\n")
