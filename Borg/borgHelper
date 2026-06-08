@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.29"
+Version="1.0.30"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
@@ -679,6 +679,13 @@ class BorgHelperDB:
                     total_size INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (nick, archive)
                 );
+                CREATE TABLE IF NOT EXISTS repo_stats (
+                    nick           TEXT NOT NULL PRIMARY KEY,
+                    unique_csize   INTEGER,
+                    total_size     INTEGER,
+                    total_csize    INTEGER,
+                    updated_at     TEXT DEFAULT (datetime('now'))
+                );
             """)
             cols=[r[1] for r in conn.execute("PRAGMA table_info(archive_snapshot)").fetchall()]
             if 'path' in cols:
@@ -771,6 +778,27 @@ class BorgHelperDB:
             finally: conn.close()
         try: return self._with_lock_retry(_do)
         except sqlite3.Error as e: printer(f"SQLite error (archive_stats): {e}"); return False
+
+    def store_repo_stats(self,nick,unique_csize,total_size,total_csize,db_path=None):
+        if db_path is None: db_path=self.get_diff_db(nick)
+        def _do():
+            conn=sqlite3.connect(db_path)
+            try:
+                conn.execute("INSERT OR REPLACE INTO repo_stats (nick,unique_csize,total_size,total_csize,updated_at) VALUES (?,?,?,?,datetime('now'))",
+                             (nick,unique_csize,total_size,total_csize))
+                conn.commit(); return True
+            finally: conn.close()
+        try: return self._with_lock_retry(_do)
+        except sqlite3.Error as e: printer(f"SQLite error (repo_stats): {e}"); return False
+
+    def get_repo_stats(self,nick,db_path=None):
+        if db_path is None: db_path=self.get_diff_db(nick)
+        try:
+            conn=sqlite3.connect(db_path)
+            row=conn.execute("SELECT unique_csize,total_size,total_csize FROM repo_stats WHERE nick=?",(nick,)).fetchone()
+            conn.close()
+            return {'unique_csize':row[0],'total_size':row[1],'total_csize':row[2]} if row else {}
+        except sqlite3.Error: return {}
 
     def is_archive_snapshot_indexed(self,nick,archive,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
@@ -1597,6 +1625,9 @@ class BorgHelper:
                         st=arch_info.get('stats',{})
                         self.db.store_archive_stats(nick,archive_new,archive_new_date,arch_info.get('duration'),
                             st.get('original_size'),st.get('compressed_size'),st.get('deduplicated_size'),st.get('nfiles'),db_path)
+                        cst=anaRet['stdout'][0].get('cache',{}).get('stats',{})
+                        if cst.get('unique_csize') is not None:
+                            self.db.store_repo_stats(nick,cst['unique_csize'],cst.get('total_size'),cst.get('total_csize'),db_path)
                     if not no_index and archive_new and archive_old:
                         all_bkp=_bkp_parse_list(anaRet['stderr'])
                         entries=[]; exclu={}
@@ -2227,10 +2258,11 @@ class BorgHelper:
         total_dedup=sum(v['deduplicated_size'] for v in kept.values())
         last_k=kept[last_arch]
         tcmpl={}
+        repo_st=self.db.get_repo_stats(nick)
         tcmpl[nick]={'nom':nick,'date derniere':dabesi['date'],'depuis':dabesi['since'],
             'duree':last_k['durationM'],'derniere':last_k['deduplicated_size'],
             'moy':total_dedup/c if c else 0,
-            'taille':None,'recuperable':None,'reste':self.borg.dfRepo(nick)}
+            'taille':repo_st.get('unique_csize'),'recuperable':None,'reste':self.borg.dfRepo(nick)}
         s_last=diff_stats.get(last_arch)
         if s_last:
             for k,v in _fmt_stats(s_last,last_k['nfiles'],last_k['original_size'],summary=True).items(): tcmpl[nick][k]=v

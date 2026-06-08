@@ -111,6 +111,12 @@ Agrégat des fichiers filtrés lors de l'indexation du snapshot de la dernière 
 Une ligne par (nick, archive) : `file_count` + `total_size`.  
 Peuplée par `IndexSnap` (`-S`) et en fin d'`Index` normal.
 
+#### `repo_stats`
+Statistiques globales du dépôt borg (niveau cache, pas par archive).  
+Une ligne par nick : `unique_csize` (taille dédupliquée totale du dépôt), `total_size`, `total_csize`, `updated_at`.  
+Peuplée par `Bkp` depuis `cache.stats` du JSON `borg create --json`.  
+Utilisée par `Report -o` pour alimenter la colonne `taille` sans appel borg.
+
 ### Vue `archive_snapshot_v`
 
 ```sql

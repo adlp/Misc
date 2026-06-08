@@ -1,5 +1,20 @@
 # Changelog — borgHelper
 
+## 1.0.30 — 2026-06-08
+
+### `Report -o` : colonne `taille` alimentée depuis `repo_stats`
+
+`borg create --json` retourne `cache.stats.unique_csize` (taille dédupliquée du dépôt entier). Ce champ est désormais persisté dans une nouvelle table `repo_stats` après chaque `Bkp` réussi, et utilisé par `Report -o`.
+
+**Nouvelle table `diff.db`** :
+```sql
+repo_stats (nick PK, unique_csize, total_size, total_csize, updated_at)
+```
+
+Nouveaux méthodes `BorgHelperDB` : `store_repo_stats()`, `get_repo_stats()`.
+
+Limite : `repo_stats` n'est mis à jour qu'après `Bkp` (pas après `Prune` — `borg prune` sans `--json` ne retourne pas les stats structurées).
+
 ## 1.0.29 — 2026-06-08
 
 ### `Report -o` : colonne `reste` désormais alimentée
