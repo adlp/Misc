@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.1] - 2026-06-08
+
+### Corrections
+
+- Swagger affiche désormais le nom et la docstring du handler utilisateur (via `__name__` et `__doc__` copiés sur le `wrapper` FastAPI lors du premier `api_add`)
+
+---
+
 ## [1.1.0] - 2026-06-08
 
 ### Ajouts

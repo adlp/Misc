@@ -45,7 +45,7 @@ class Route:
 
 
 class Zapiz:
-    VERSION = "1.1.0"
+    VERSION = "1.1.1"
     Route = Route
 
     def __init__(self, host: str="127.0.0.1", port: int=8080,
@@ -469,11 +469,14 @@ class Zapiz:
 
         for u in uris:
             if not(self.api_routes[verb].get(u,None)):    # Si pas encore declarer alors creer la route
+                handler = self._secure_api_tab(verb, u)
+                if func:
+                    handler.__name__ = func.__name__
+                    handler.__doc__  = func.__doc__
                 if verb=="GET":
-                    self.app.get(u)(self._secure_api_tab(verb,u))
+                    self.app.get(u)(handler)
                 elif verb=="POST":
-                    #self.app.post(u, response_class=response_class)(self._secure_api_tab()verb,u)
-                    self.app.post(u)(self._secure_api_tab(verb,u))
+                    self.app.post(u)(handler)
             self.api_routes[verb][u]={}
             self.api_routes[verb][u]['func']=func
             self.api_routes[verb][u]['daType']=daType
