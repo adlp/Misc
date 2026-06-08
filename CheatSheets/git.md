@@ -51,18 +51,15 @@ gitGraph
 ### Commandes — transitions d'état
 
 ```mermaid
-flowchart TD
-    MAIN["main (HEAD)"]
-    FEAT["feature branch"]
-    DEL["branch supprimée"]
+flowchart LR
+    MAIN["main"]
+    FEAT["feature"]
+    DEL["✗ supprimée"]
 
-    MAIN -->|"git branch &lt;nom&gt;"| FEAT
     MAIN -->|"git checkout -b &lt;nom&gt;\ngit switch -c &lt;nom&gt;"| FEAT
     FEAT -->|"git checkout main\ngit switch main"| MAIN
-    MAIN -->|"git merge &lt;feature&gt;"| MAIN
-    MAIN -->|"git rebase &lt;feature&gt;"| MAIN
-    FEAT -->|"git branch -d &lt;nom&gt;"| DEL
-    FEAT -->|"git branch -D &lt;nom&gt; (force)"| DEL
+    FEAT -->|"git merge &lt;feature&gt;\ngit rebase &lt;feature&gt;"| MAIN
+    FEAT -->|"git branch -d\ngit branch -D"| DEL
 ```
 
 ### Référence rapide
