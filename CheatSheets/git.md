@@ -1,5 +1,27 @@
 # Git — Cheat Sheet
 
+## Flux Git
+
+```mermaid
+flowchart LR
+    WD["Working Directory"]
+    IDX["Index (Stage)"]
+    LOCAL["Local Repo"]
+    REMOTE["Remote Repo"]
+
+    WD -->|"git add"| IDX
+    IDX -->|"git commit"| LOCAL
+    LOCAL -->|"git push"| REMOTE
+
+    REMOTE -->|"git fetch"| LOCAL
+    REMOTE -->|"git pull (fetch+merge)"| WD
+    LOCAL -->|"git checkout / git restore"| WD
+    LOCAL -->|"git reset"| IDX
+
+    IDX -->|"git restore --staged"| WD
+```
+
+
 ## Remotes
 
 ```bash
