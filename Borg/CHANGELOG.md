@@ -1,5 +1,19 @@
 # Changelog — borgHelper
 
+## 1.0.27 — 2026-06-08
+
+### `IdxTop` : inchangés par archive
+
+Section `Inchangés par archive` ajoutée avant le tableau, listant pour chaque archive indexée :
+
+```
+Inchangés par archive :
+  archive-2024-01-01 : 95 000 (97%) / 98 000 fichiers
+  archive-2024-01-02 : 96 200 (96%) / 100 000 fichiers
+```
+
+Calcul : `nfiles` (depuis `archive_stats`) − added_total − modified_total (indexés + exclus). Seules les archives présentes dans `archive_stats` et `diff_index` sont affichées.
+
 ## 1.0.26 — 2026-06-08
 
 ### `DiffTop` : fichiers inchangés calculés depuis les index

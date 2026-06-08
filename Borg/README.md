@@ -462,6 +462,16 @@ Le détail `+ajoutés · -supprimés · =modifiés` est affiché sur la même li
 
 Si `IDX_EXCLUDE` est vide ou qu'aucun fichier n'a été filtré, la ligne Exclus est omise.
 
+Affiche également les fichiers **inchangés par archive** avant le tableau :
+
+```
+Inchangés par archive :
+  archive-2024-01-01 : 95 000 (97%) / 98 000 fichiers
+  archive-2024-01-02 : 96 200 (96%) / 100 000 fichiers
+```
+
+Calcul : `nfiles − added_total − modified_total` (indexés + exclus). Seules les archives présentes dans `archive_stats` et `diff_index` sont affichées.
+
 ---
 
 ### `IdxPurge`
