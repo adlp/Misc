@@ -19,6 +19,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from datetime import datetime, timedelta
 from typing import Callable, Dict, Optional
 from fastapi.staticfiles import StaticFiles
+from dataclasses import dataclass, field
 import uvicorn
 from authlib.integrations.starlette_client import OAuth
 from starlette.middleware.sessions import SessionMiddleware
@@ -35,8 +36,17 @@ import bcrypt
 import markdown
 
 
+@dataclass
+class Route:
+    func: Callable
+    daType: str = "html"
+    acl: Optional[str] = None
+    file: Optional[str] = None
+
+
 class Zapiz:
-    VERSION = "1.0.0"
+    VERSION = "1.1.0"
+    Route = Route
 
     def __init__(self, host: str="127.0.0.1", port: int=8080,
             startup: Callable=None,
@@ -493,6 +503,34 @@ class Zapiz:
                 if self.api_routes[verb][uri]:
                     ret[verb].append(uri)
         return(ret)
+
+    def _parse_route_key(self, key: str):
+        parts = key.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].upper() in ("GET", "POST"):
+            return parts[0].upper(), parts[1]
+        return "GET", parts[0]
+
+    def __setitem__(self, key: str, route: Route):
+        verb, uri = self._parse_route_key(key)
+        self.api_add(uri, route.func, daType=route.daType, verb=verb, acl=route.acl, file=route.file)
+
+    def __delitem__(self, key: str):
+        verb, uri = self._parse_route_key(key)
+        self.api_del(uri, verb=verb)
+
+    def __getitem__(self, key: str):
+        verb, uri = self._parse_route_key(key)
+        uris = [uri, uri + "/"] if uri[-1] != "/" else [uri]
+        for u in uris:
+            entry = self.api_routes.get(verb, {}).get(u)
+            if entry:
+                return Route(
+                    func=entry["func"],
+                    daType=entry["daType"],
+                    acl=entry["acl"],
+                    file=entry["file"],
+                )
+        raise KeyError(f"{verb} {uri}")
 
     def auth_create_token(self,data: dict, expires_delta: timedelta, token_type: str):
         to_encode = data.copy()

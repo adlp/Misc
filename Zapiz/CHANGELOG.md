@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.1.0] - 2026-06-08
+
+### Ajouts
+
+- `Zapiz.Route` dataclass — porte `func`, `daType`, `acl`, `file`
+- `app["GET /path"] = Zapiz.Route(fn, daType="html")` — ajout de route
+- `del app["GET /path"]` — suppression de route
+- `app["/path"]` — lecture d'une route (retourne `Zapiz.Route`)
+- Verbe optionnel dans la clé : `app["/"]` équivaut à `app["GET /"]`
+- `api_add` / `api_del` / `api_lst` restent fonctionnels (inchangés)
+
+---
+
 ## [1.0.0] - 2026-06-08
 
 Version initiale mise en production.
