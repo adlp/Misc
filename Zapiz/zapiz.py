@@ -50,7 +50,9 @@ class Zapiz:
         logging.basicConfig( level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
         self.logger = logging.getLogger("myapi")
         self._setup_middlewares()
+        self.root = root
         self.templates={}
+        self.template_dirs={'base': template_dir}
         self.templates['base']=Jinja2Templates(directory=template_dir)
         self.app.mount("/"+static_dir, StaticFiles(directory=root+static_dir), name="static")
         self.api_routes= { 'GET':{},'POST':{}}
@@ -183,6 +185,7 @@ class Zapiz:
                 templateid=template_dir.split('/')[-1]
             else:
                 templateid=template_dir
+        self.template_dirs[templateid]=template_dir
         self.templates[templateid]=Jinja2Templates(directory=template_dir)
 
     def add_static(self,static_dir,staticid=None):
@@ -191,7 +194,7 @@ class Zapiz:
                 staticid=static_dir
             else:
                 staticid=static_dir.split('/')[-1]
-        self.app.mount("/"+staticid, StaticFiles(directory=root+static_dir), name=staticid)
+        self.app.mount("/"+staticid, StaticFiles(directory=self.root+static_dir), name=staticid)
 
     #async def auth_login_page(request: Request):
     async def auth_login_page(self,varSession,params={}):
@@ -249,6 +252,7 @@ class Zapiz:
                     }
         return None
     
+    @staticmethod
     def decode_payload(token: str):
         import base64
         import json
@@ -342,7 +346,7 @@ class Zapiz:
     async def auth_logout(self,varSession,params={}):
         return({'redirect':'/','del_cookie': ['access_token','refresh_token']})
 
-    async def auth_refresh(request: Request, next=None):
+    async def auth_refresh(self, request: Request, next=None):
         # 1. Récupérer le refresh token depuis le cookie
         refresh_token = request.cookies.get("refresh_token")
         if not refresh_token:
@@ -375,13 +379,10 @@ class Zapiz:
 
         # 7. Poser les cookies et renvoyer
         self.bugprint(request,'💋💋 auth_refresh')
-        #response = JSONResponse({"status": "ok"})
-        if next:
-            referer=next
+        referer = next if next else request.headers.get("referer", "/")
         response = RedirectResponse(url=referer, status_code=303)
         response.set_cookie("access_token", new_access_token, httponly=True)
         response.set_cookie("refresh_token", new_refresh_token, httponly=True)
-        referer = request.headers.get("referer", "/")
         return response
 
     async def auth_secret(self,varSession,params={}):
@@ -639,7 +640,7 @@ class Zapiz:
                     #html_content = markdown.markdown(md_text)
                     #html_content = markdown.markdown(self.templates[templateid].TemplateResponse(result['template'],nextstep))
                     #print(f"🌈🚪{result['template']}")
-                    with open('templates/'+result['template'],'r') as f:
+                    with open(os.path.join(self.template_dirs.get(templateid,'templates'), result['template']),'r') as f:
                         md_text=f.read()
                     html_content = markdown.markdown(md_text,extensions=["fenced_code","tables","extra"])
                     #response= f"<html><body>{html_content}</body></html>"
