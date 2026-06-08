@@ -81,6 +81,24 @@ git branch -D <nom>               # supprimer (force)
 git branch -m <ancien> <nouveau>  # renommer
 ```
 
+### Commit avant checkout ?
+
+Non — sauf si les changements non commités entrent en conflit avec la branche cible.
+
+| Situation | Comportement |
+|-----------|-------------|
+| Changements compatibles | Git les emporte automatiquement sur l'autre branche |
+| Changements incompatibles | Git refuse le checkout |
+
+En cas de refus :
+
+```bash
+git stash        # mettre de côté, récupérer après checkout
+git stash pop    # récupérer après le checkout
+# ou
+git commit       # commiter avant de changer
+```
+
 ## Remotes
 
 ```bash
