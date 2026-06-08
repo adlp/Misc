@@ -260,7 +260,8 @@ class Zapiz:
 
     # Fonction utilitaire pour lire le CSV et retourner les infos utilisateur
     def get_user_from_csv(self,csvfile, username):
-        """Look up username in CSV (format: user:bcrypt_hash:name:email:group1,group2). Returns dict or None."""
+        """Look up username in CSV (format: user:bcrypt_hash:name:email:group1,group2). Returns dict or None.
+        Generate hash: python3 -c "import bcrypt; print(bcrypt.hashpw(b'password', bcrypt.gensalt()).decode())" """
         with open(csvfile, newline="", encoding="utf-8") as f:
             reader = csv.reader(f, delimiter=":")
             for row in reader:
