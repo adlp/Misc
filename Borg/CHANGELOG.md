@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.31 — 2026-06-08
+
+### `Index` : nettoyage des répertoires PyInstaller orphelins après SIGKILL
+
+Quand `Bkp`/`Restore` interrompt un `Index` en cours via SIGKILL, les répertoires `/tmp/_MEI*` créés par borg (binaire PyInstaller) ne sont pas nettoyés. Le moniteur de priorité purge désormais ces répertoires orphelins après avoir attendu que les processus tués soient reap'd, en vérifiant via `fuser` qu'aucun process actif ne les utilise encore.
+
 ## 1.0.30 — 2026-06-08
 
 ### `Report -o` : colonne `taille` alimentée depuis `repo_stats`

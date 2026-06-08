@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.30"
+Version="1.0.31"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
@@ -1817,6 +1817,13 @@ class BorgHelper:
                                     with running_procs_lock:
                                         if not running_procs: break
                                     time.sleep(0.1)
+                                # Purger les répertoires PyInstaller orphelins (_MEI*) laissés par SIGKILL
+                                import glob as _glob, shutil as _shutil
+                                for _d in _glob.glob('/tmp/_MEI*'):
+                                    try:
+                                        if subprocess.run(['fuser',_d],capture_output=True).returncode!=0:
+                                            _shutil.rmtree(_d,ignore_errors=True)
+                                    except Exception: pass
                                 # Purger les stale locks borg laissés par les process tués
                                 if 'BORG_REPO' in cfg:
                                     printer(f"  {nick}: purge des locks borg (break-lock)...")
