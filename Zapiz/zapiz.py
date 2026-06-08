@@ -36,6 +36,8 @@ import markdown
 
 
 class Zapiz:
+    VERSION = "1.0.0"
+
     def __init__(self, host: str="127.0.0.1", port: int=8080,
             startup: Callable=None,
             oidc_client_id=None, oidc_client_secret=None, oidc_issuer=None, oidc_auth_url=None, oidc_toke_url=None,oidc_redi_url=None,oidc_jwks_url=None,oidc_usin_url=None,
