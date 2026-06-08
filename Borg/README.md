@@ -455,8 +455,10 @@ Affiche également le total des entrées **exclues** par `IDX_EXCLUDE` (stockée
 
 ```
 Indexés : 142 350 entrées · 1.2 GB
-Exclus  : 18 200 entrées · 3.4 GB (IDX_EXCLUDE)
+Exclus  :  18 200 entrées · 3.4 GB (IDX_EXCLUDE) — +5 000 · -200 · =13 000
 ```
+
+Le détail `+ajoutés · -supprimés · =modifiés` est affiché sur la même ligne. Seuls les types présents sont affichés. Les fichiers inchangés ne peuvent pas être comptés (`borg diff` ne les liste pas).
 
 Si `IDX_EXCLUDE` est vide ou qu'aucun fichier n'a été filtré, la ligne Exclus est omise.
 
@@ -505,7 +507,7 @@ borgHelper -c DiffTop -n mon-serveur -b archive-old,archive-new  # paire explici
 Colonnes : `total (nb+%)` · `+nb` · `+taille` · `-nb` · `-taille` · `=nb` · `taille`.  
 Trié par total. Source : `diff_index` — aucun appel borg, résultat immédiat si la paire est indexée.
 
-Affiche également le total des entrées **exclues** par `IDX_EXCLUDE` pour cette paire spécifique.  
+Affiche également le total des entrées **exclues** par `IDX_EXCLUDE` pour cette paire, avec détail `+ajoutés · -supprimés · =modifiés` sur la même ligne.  
 La ligne Exclus est omise si aucun fichier n'a été filtré pour cette paire.
 
 ---

@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## 1.0.25 — 2026-06-08
+
+### `IdxTop` / `DiffTop` : détail +/-/= des exclus sur une ligne
+
+La ligne `Exclus` affiche désormais le détail par type de changement :
+
+```
+Exclus  : 18 200 entrées · 3.4 GB (IDX_EXCLUDE) — +5 000 · -200 · =13 000
+```
+
+Seuls les types présents sont affichés. Note : les fichiers **inchangés** ne peuvent pas être comptés car `borg diff` ne les liste pas.
+
 ## 1.0.24 — 2026-06-08
 
 ### `IdxTop` / `DiffTop` / `Index` : affichage des entrées non indexées
