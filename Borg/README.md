@@ -507,8 +507,17 @@ borgHelper -c DiffTop -n mon-serveur -b archive-old,archive-new  # paire explici
 Colonnes : `total (nb+%)` · `+nb` · `+taille` · `-nb` · `-taille` · `=nb` · `taille`.  
 Trié par total. Source : `diff_index` — aucun appel borg, résultat immédiat si la paire est indexée.
 
-Affiche également le total des entrées **exclues** par `IDX_EXCLUDE` pour cette paire, avec détail `+ajoutés · -supprimés · =modifiés` sur la même ligne.  
-La ligne Exclus est omise si aucun fichier n'a été filtré pour cette paire.
+Affiche également le total des entrées **exclues** par `IDX_EXCLUDE` pour cette paire, avec détail `+ajoutés · -supprimés · =modifiés` sur la même ligne.
+
+Affiche enfin le nombre de fichiers **inchangés**, calculé depuis les index :
+
+```
+Indexés  : 3 200 changements · 450 MB
+Exclus   :   800 entrées · 1.2 GB (IDX_EXCLUDE) — +300 · -50 · =450
+Inchangés: 96 000 (97%) sur 99 500 fichiers dans archive-new
+```
+
+Calcul : `nfiles_new − added_total − modified_total` (indexés + exclus). Ligne omise si `archive_stats` ne contient pas `nfiles` pour l'archive cible.
 
 ---
 

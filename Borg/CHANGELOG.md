@@ -1,5 +1,19 @@
 # Changelog — borgHelper
 
+## 1.0.26 — 2026-06-08
+
+### `DiffTop` : fichiers inchangés calculés depuis les index
+
+Ligne `Inchangés` ajoutée après les exclusions :
+
+```
+Indexés  : 3 200 changements · 450 MB
+Exclus   :   800 entrées · 1.2 GB (IDX_EXCLUDE) — +300 · -50 · =450
+Inchangés: 96 000 (97%) sur 99 500 fichiers dans archive-new
+```
+
+Calcul : `nfiles_new` (depuis `archive_stats`) − added_total − modified_total, où les totaux incluent indexés et exclus. Ligne omise si `archive_stats` ne contient pas `nfiles` pour l'archive cible.
+
 ## 1.0.25 — 2026-06-08
 
 ### `IdxTop` / `DiffTop` : détail +/-/= des exclus sur une ligne

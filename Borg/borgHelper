@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.25"
+Version="1.0.26"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
@@ -2008,7 +2008,7 @@ class BorgHelper:
             if len(parts)<=d: return path
             return leading+'/'.join(parts[:d])
         stats=defaultdict(lambda:{'total':0,'added_n':0,'added_s':0,'removed_n':0,'removed_s':0,'modified_n':0,'size':0})
-        total_count=0; total_size=0
+        total_count=0; total_size=0; total_added=0; total_modified=0
         try:
             conn=sqlite3.connect(db_path,timeout=60)
             cur=conn.execute(
@@ -2023,9 +2023,9 @@ class BorgHelper:
                     s['total']+=1
                     sz=(sa or sb or 0)
                     s['size']+=sz
-                    if ct=='added':    s['added_n']+=1;    s['added_s']+=(sa or 0)
+                    if ct=='added':    s['added_n']+=1;    s['added_s']+=(sa or 0); total_added+=1
                     elif ct=='removed': s['removed_n']+=1; s['removed_s']+=(sb or 0)
-                    else:              s['modified_n']+=1
+                    else:              s['modified_n']+=1; total_modified+=1
                     total_count+=1; total_size+=sz
             conn.close()
         except sqlite3.Error as e:
@@ -2035,10 +2035,12 @@ class BorgHelper:
         try:
             conn3=sqlite3.connect(db_path,timeout=60)
             exclu_rows3=conn3.execute("SELECT change_type,SUM(file_count),SUM(total_size) FROM diff_excluded_stats WHERE nick=? AND archive_old=? AND archive_new=? GROUP BY change_type",(nick,arch_old,arch_new)).fetchall()
+            nfiles_row=conn3.execute("SELECT nfiles FROM archive_stats WHERE nick=? AND archive=?",(nick,arch_new)).fetchone()
             conn3.close()
             exclu_by_ct3={r[0]:(r[1] or 0,r[2] or 0) for r in exclu_rows3}
             exclu_n=sum(v[0] for v in exclu_by_ct3.values()); exclu_sz=sum(v[1] for v in exclu_by_ct3.values())
-        except sqlite3.Error: exclu_by_ct3={}; exclu_n=0; exclu_sz=0
+            nfiles_new=nfiles_row[0] if nfiles_row and nfiles_row[0] else None
+        except sqlite3.Error: exclu_by_ct3={}; exclu_n=0; exclu_sz=0; nfiles_new=None
         top=sorted(stats.items(),key=lambda x:x[1]['total'],reverse=True)[:topn]
         from prettytable import PrettyTable
         t=PrettyTable()
@@ -2060,10 +2062,16 @@ class BorgHelper:
         printer(f"\n{nick} — top {topn} par changements (profondeur {depth})")
         printer(f"  {arch_old}")
         printer(f"→ {arch_new}")
+        added_total=total_added+exclu_by_ct3.get('added',(0,0))[0]
+        modified_total=total_modified+exclu_by_ct3.get('modified',(0,0))[0]
+        unchanged=max(0,nfiles_new-added_total-modified_total) if nfiles_new is not None else None
         printer(f"Indexés : {total_count:,} changements · {convert_octets_readable(total_size)}")
         if exclu_n:
             exclu_detail3=' · '.join(f"{s}{exclu_by_ct3[ct][0]:,}" for ct,s in [('added','+'),('removed','-'),('modified','=')] if ct in exclu_by_ct3)
             printer(f"Exclus  : {exclu_n:,} entrées · {convert_octets_readable(exclu_sz)} (IDX_EXCLUDE) — {exclu_detail3}")
+        if unchanged is not None:
+            pct_unch=f" ({100*unchanged//nfiles_new}%)" if nfiles_new>0 else ""
+            printer(f"Inchangés: {unchanged:,}{pct_unch} sur {nfiles_new:,} fichiers dans {arch_new}")
         printer(str(t))
 
     def idxpurge(self,nick,pattern=None,dryrun=False,debug=0):
