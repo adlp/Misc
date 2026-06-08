@@ -162,5 +162,5 @@ app = Zapiz(..., debug=True)
 
 ```bash
 # Expose GET /debug — arrêt propre du serveur + redirection vers /
-HAPIMIE_DEBUG=1 python app.py
+ZAPIZ_DEBUG=1 python app.py
 ```

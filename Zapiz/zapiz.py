@@ -82,7 +82,7 @@ class Zapiz:
         if startup:
             self.app.on_event("startup")(startup)
 
-        if int(os.getenv('HAPIMIE_DEBUG',0))==1:
+        if int(os.getenv('ZAPIZ_DEBUG',0))==1:
             @self.app.get("/debug")
             async def shutdown():
                 # On prépare la redirection
