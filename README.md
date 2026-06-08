@@ -8,8 +8,8 @@
 
 # CheatSheets
 Fiches de référence rapide.
-  * `CheatSheets/git.md` — commandes git, flux (remotes, push/fetch/pull, upstream)
-  * `CheatSheets/tmux.md` — sélection souris vers clipboard X11
+  * [CheatSheets/git.md](CheatSheets/git.md) — commandes git, flux (remotes, push/fetch/pull, upstream)
+  * [CheatSheets/tmux.md](CheatSheets/tmux.md) — sélection souris vers clipboard X11
 
 # Mini-Projets
 ## tiling-scripts
