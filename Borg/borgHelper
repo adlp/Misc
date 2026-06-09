@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.35"
+Version="1.0.36"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
@@ -2242,19 +2242,10 @@ class BorgHelper:
         diff_stats=self.db._diff_stats_for_nick(nick)
         def _fmt_stats(s,nf,total_sz=0,summary=False):
             na,nr,nm=s['added'],s['removed'],s['modified']
-            present=max(0,nf-na-nm)
-            present_sz=max(0,total_sz-s['added_sz']-s['modified_sz'])
-            pn=lambda n: f"{100*n//nf}%" if nf>0 else "—"
-            ps=lambda sz: f"{100*sz//total_sz}%" if total_sz>0 else "—"
-            if summary:
-                prev_nf=nf-na+nr; prev_sz=total_sz-s['added_sz']+s['removed_sz']
-                pn_modif=f"{100*(nm+nr)//prev_nf}%" if prev_nf>0 else "—"
-                ps_modif=f"{100*(s['modified_sz']+s['removed_sz'])//prev_sz}%" if prev_sz>0 else "—"
-                return {'modifications':f"{pn_modif} / {ps_modif}"}
-            def fv(n,p): return f"{n}/{p}"
-            def sv(sz,p): return f"{convert_octets_readable(sz)}/{p}"
-            return {'fichiers':f"Pre({fv(present,pn(present))})+Add({fv(na,pn(na))})-Supp({fv(nr,pn(nr))})",
-                    'espace':f"Pre({sv(present_sz,ps(present_sz))})+Add({sv(s['added_sz'],ps(s['added_sz']))})-Supp({sv(s['removed_sz'],ps(s['removed_sz']))})"}
+            prev_nf=nf-na+nr; prev_sz=total_sz-s['added_sz']+s['removed_sz']
+            pn_modif=f"{100*(nm+nr)//prev_nf}%nb" if prev_nf>0 else "—"
+            ps_modif=f"{100*(s['modified_sz']+s['removed_sz'])//prev_sz}%B" if prev_sz>0 else "—"
+            return {'modifications':f"{pn_modif} / {ps_modif}"}
         kept={}
         for archive,arch_date,duration,orig,compr,dedup,nfiles in rows:
             kept[archive]={'name':archive,'durationM':(duration or 0)/60,
@@ -2289,7 +2280,7 @@ class BorgHelper:
             if s:
                 for kk,vv in _fmt_stats(s,k['nfiles'],k['original_size']).items(): tbkps[arch][kk]=vv
             else:
-                tbkps[arch]['fichiers']='—'; tbkps[arch]['espace']='—'
+                tbkps[arch]['modifications']='—'
         total_orig=sum(v['original_size'] for v in kept.values())
         total_compr=sum(v['compressed_size'] for v in kept.values())
         total_dedup2=sum(v['deduplicated_size'] for v in kept.values())
@@ -2367,19 +2358,10 @@ class BorgHelper:
         diff_stats=self.db._diff_stats_for_nick(nick)
         def _fmt_stats(s,nf,total_sz=0,summary=False):
             na,nr,nm=s['added'],s['removed'],s['modified']
-            present=max(0,nf-na-nm)
-            present_sz=max(0,total_sz-s['added_sz']-s['modified_sz'])
-            pn=lambda n: f"{100*n//nf}%" if nf>0 else "—"
-            ps=lambda sz: f"{100*sz//total_sz}%" if total_sz>0 else "—"
-            if summary:
-                prev_nf=nf-na+nr; prev_sz=total_sz-s['added_sz']+s['removed_sz']
-                pn_modif=f"{100*(nm+nr)//prev_nf}%" if prev_nf>0 else "—"
-                ps_modif=f"{100*(s['modified_sz']+s['removed_sz'])//prev_sz}%" if prev_sz>0 else "—"
-                return {'modifications':f"{pn_modif} / {ps_modif}"}
-            def fv(n,p): return f"{n}/{p}"
-            def sv(sz,p): return f"{convert_octets_readable(sz)}/{p}"
-            return {'fichiers':f"Pre({fv(present,pn(present))})+Add({fv(na,pn(na))})-Supp({fv(nr,pn(nr))})",
-                    'espace':f"Pre({sv(present_sz,ps(present_sz))})+Add({sv(s['added_sz'],ps(s['added_sz']))})-Supp({sv(s['removed_sz'],ps(s['removed_sz']))})"}
+            prev_nf=nf-na+nr; prev_sz=total_sz-s['added_sz']+s['removed_sz']
+            pn_modif=f"{100*(nm+nr)//prev_nf}%nb" if prev_nf>0 else "—"
+            ps_modif=f"{100*(s['modified_sz']+s['removed_sz'])//prev_sz}%B" if prev_sz>0 else "—"
+            return {'modifications':f"{pn_modif} / {ps_modif}"}
         last_arch=resume.get('lastname','')
         s_last=diff_stats.get(last_arch) if last_arch else None
         if s_last:
@@ -2395,7 +2377,7 @@ class BorgHelper:
                 nf=tbkps[arch].get('nfiles',0) or 0; sz=tbkps[arch].get('original_size',0) or 0
                 for k,v in _fmt_stats(s,nf,sz).items(): tbkps[arch][k]=v
             else:
-                tbkps[arch]['fichiers']='—'; tbkps[arch]['espace']='—'
+                tbkps[arch]['modifications']='—'
         return tcmpl,tbkps
 
     def report_offline(self,nicks,htrep=False,debug=0,maxp=None,as_json=False):
@@ -2454,7 +2436,7 @@ class BorgHelper:
             print(htmlTabelise(reshos,colnames=['nom','duree','depuis','derniere','taille','recuperable','reste','modifications'],errhost=errhost))
             for nick in nicks.split(','):
                 print('    <br>')
-                print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','compressed_size','deduplicated_size','nfiles','fichiers','espace'],errhost=errhost))
+                print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','compressed_size','deduplicated_size','nfiles','modifications'],errhost=errhost))
             print('  </body>\n</html>')
         else:
             print(prettyTabelise(reshos))
@@ -2520,7 +2502,7 @@ class BorgHelper:
             print(htmlTabelise(reshos,colnames=['nom','duree','depuis','derniere','taille','recuperable','reste','modifications'],errhost=errhost))
             for nick in nicks.split(','):
                 print('    <br>')
-                print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','compressed_size','deduplicated_size','nfiles','fichiers','espace'],errhost=errhost))
+                print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','compressed_size','deduplicated_size','nfiles','modifications'],errhost=errhost))
             print('  </body>\n</html>')
         else:
             print(prettyTabelise(reshos))

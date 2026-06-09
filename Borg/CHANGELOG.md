@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.36 — 2026-06-09
+
+### Colonne `modifications` unifiée résumé + détail — suffixes `%nb` / `%B`
+
+Colonne `modifications` étendue au détail par archive (remplace `fichiers` + `espace`). Même formule partout. Format : `"3%nb / 8%B"` — `%nb` pour le pourcentage fichiers, `%B` pour le pourcentage espace disque.
+
 ## 1.0.35 — 2026-06-09
 
 ### Résumé : colonne `modifications` (fichiers + espace)
