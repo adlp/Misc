@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## 1.0.39 — 2026-06-09
+
+### `diffbkp` : re-calcul forcé + stockage filtré + affichage complet
+
+**Bug** : l'indexation à la volée de `diffbkp` stockait tous les fichiers sans appliquer `IDX_EXCLUDE`, polluant `diff_index`. De plus, si la paire était déjà en cache (même incorrectement), `diffbkp` lisait les données corrompues sans recalculer.
+
+**Fix** :
+- `diffbkp` force toujours un re-calcul via `borg diff` (purge préalable de la paire)
+- Stockage filtré : `entries_ok` → `diff_index`, fichiers exclus → `diff_excluded_stats`
+- Affichage depuis `all_entries` (non filtré) — le diff complet reste visible à l'écran
+- L'utilisateur doit relancer `borgHelper -c Index -n <nick> --force` une fois pour nettoyer les paires déjà mal indexées
+
 ## 1.0.38 — 2026-06-09
 
 ### Statistiques : fichiers exclus inclus dans `modifications`

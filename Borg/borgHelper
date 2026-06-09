@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.38"
+Version="1.0.39"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
@@ -1406,33 +1406,41 @@ class BorgHelper:
         if bidun>bideux: bidun,bideux=bideux,bidun
         if debug: printer(f"Comparaison de {bidun} et {bideux}")
         self.db.ensure_diff_db(db_path)
-        if not self.db.is_diff_pair_indexed(nick,bidun,bideux,db_path):
-            print(f"Paire non indexée — calcul en cours...",flush=True)
-            rb=self.borg.boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
-            try:
-                self.borg._boex_check_stdout(rb,nick,'borg list')
-            except RuntimeError as e:
-                printer(f"borg list a échoué : {e}"); sys.exit(2)
-            archives=rb['stdout'][0]['archives']
-            date_new=next((a['start'] for a in archives if a['name']==bideux),None)
-            rb2=self.borg.boex(nick,['diff',f"{cfg['BORG_REPO']}::{bidun}",bideux],debug=debug,retjson=False)
-            if rb2['exitcode']!=0:
-                printer(f"borg diff a échoué (code {rb2['exitcode']})"); sys.exit(rb2['exitcode'])
-            entries=[p for line in rb2['stdout'] for p in [parse_diff_line(line)] if p and p['path']]
-            self.db.store_diff_entries(nick,bidun,bideux,date_new,entries,db_path)
+        print(f"Calcul en cours...",flush=True)
+        rb=self.borg.boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+        try:
+            self.borg._boex_check_stdout(rb,nick,'borg list')
+        except RuntimeError as e:
+            printer(f"borg list a échoué : {e}"); sys.exit(2)
+        archives=rb['stdout'][0]['archives']
+        date_new=next((a['start'] for a in archives if a['name']==bideux),None)
+        rb2=self.borg.boex(nick,['diff',f"{cfg['BORG_REPO']}::{bidun}",bideux],debug=debug,retjson=False)
+        if rb2['exitcode']!=0:
+            printer(f"borg diff a échoué (code {rb2['exitcode']})"); sys.exit(rb2['exitcode'])
+        all_entries=[p for line in rb2['stdout'] for p in [parse_diff_line(line)] if p and p['path']]
+        entries_ok=[]; exclu={}
+        for p in all_entries:
+            if self._idx_path_ok(p['path'],cfg):
+                entries_ok.append(p)
+            else:
+                ct=p['change_type']; sz=p.get('size_after') or p.get('size_before') or 0
+                if ct not in exclu: exclu[ct]={'count':0,'size':0}
+                exclu[ct]['count']+=1; exclu[ct]['size']+=sz
         try:
             conn=sqlite3.connect(db_path)
-            cur=conn.execute(
-                "SELECT change_type,path,size_before,size_after FROM diff_index "
-                "WHERE nick=? AND archive_old=? AND archive_new=? ORDER BY path,change_type",
-                (nick,bidun,bideux))
-            rows=cur.fetchall(); conn.close()
+            conn.execute("DELETE FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",(nick,bidun,bideux))
+            conn.execute("DELETE FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=?",(nick,bidun,bideux))
+            conn.execute("DELETE FROM diff_excluded_stats WHERE nick=? AND archive_old=? AND archive_new=?",(nick,bidun,bideux))
+            conn.commit(); conn.close()
         except sqlite3.Error as e:
-            printer(f"SQLite error ({db_path}): {e}"); sys.exit(3)
+            printer(f"SQLite error ({db_path}): {e}")
+        self.db.store_diff_entries(nick,bidun,bideux,date_new,entries_ok,db_path)
+        if exclu: self.db.store_excluded_diff_stats(nick,bidun,bideux,exclu,db_path)
         print(f"{bidun} → {bideux}")
-        if not rows: print("Aucune différence."); sys.exit(0)
+        if not all_entries: print("Aucune différence."); sys.exit(0)
         n_add=n_rem=n_mod=0
-        for ct,path,sb,sa in rows:
+        for p in all_entries:
+            ct,path,sb,sa=p['change_type'],p['path'],p.get('size_before'),p.get('size_after')
             if ct=='added':
                 sym='+'; n_add+=1
                 tail=f"  {convert_octets_readable(sa)}" if sa else ''
