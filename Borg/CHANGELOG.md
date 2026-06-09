@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.45 — 2026-06-09
+
+### Parsing stderr ligne par ligne dans `boex`
+
+Remplace le parsing en bloc (`json.loads('[' + join + ']')`) par un parsing ligne par ligne. Quand le JSON global échouait (ex. bannière SSH mélangée au JSON borg), les entrées `file_status` restaient sous forme de chaîne brute `{"type":"file_status"...}` et n'étaient pas filtrées. Désormais chaque ligne est parsée indépendamment : les lignes JSON valides deviennent des dicts (correctement filtrés), les autres restent des strings.
+
 ## 1.0.44 — 2026-06-09
 
 ### Filtrage messages DEBUG borg sur `bkp`

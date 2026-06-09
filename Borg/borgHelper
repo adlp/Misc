@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.44"
+Version="1.0.45"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -1136,14 +1136,12 @@ class BorgRunner:
             else:
                 for i in inf.split('\n'): ret['stdout'].append(i)
         if len(errs):
-            if errs[0] in '{':
-                try:
-                    theJson='['+','.join(errs.split('\n'))[:-1]+']'
-                    ret['stderr']=json.loads(theJson)
-                except json.JSONDecodeError:
-                    for i in errs.split('\n'): ret['stderr'].append(i)
-            else:
-                for i in errs.split('\n'): ret['stderr'].append(i)
+            for _line in errs.split('\n'):
+                if not _line.strip(): continue
+                if _line[0]=='{':
+                    try: ret['stderr'].append(json.loads(_line))
+                    except json.JSONDecodeError: ret['stderr'].append(_line)
+                else: ret['stderr'].append(_line)
         ret['exitcode']=ps.returncode
         if debug: printer(json.dumps(ret,indent=4))
         return ret
