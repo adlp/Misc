@@ -1,5 +1,15 @@
 # Changelog — borgHelper
 
+## 1.0.35 — 2026-06-09
+
+### Résumé : colonne `modifications` (fichiers + espace)
+
+Remplace les colonnes `fichiers`/`espace` du résumé par une seule colonne `modifications` affichant `"XX% / YY%"`.
+
+Formule : dénominateur = état précédent (`inchangés + modifiés + supprimés`), numérateur = `modifiés + supprimés`. Première valeur = pourcentage fichiers, seconde = pourcentage espace disque.
+
+Le détail par archive conserve `fichiers` et `espace` inchangés.
+
 ## 1.0.34 — 2026-06-09
 
 ### Erreurs SQLite : nom de fichier inclus dans le message
