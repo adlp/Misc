@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.40 — 2026-06-09
+
+### `diffbkp` : cache conservé + stockage filtré corrigé
+
+Restaure le comportement cache : si la paire est déjà indexée, lecture depuis `diff_index` (rapide, sans appel borg). Si non indexée : borg diff → filtre via `_idx_path_ok` → stockage filtré (`diff_index`) + exclus (`diff_excluded_stats`) → affichage complet (non filtré). Les paires mal indexées antérieurement nécessitent un `borgHelper -c Index -n <nick> --force`.
+
 ## 1.0.39 — 2026-06-09
 
 ### `diffbkp` : re-calcul forcé + stockage filtré + affichage complet
