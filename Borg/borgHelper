@@ -9,9 +9,11 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.41"
+Version="1.0.42"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
+
+class SchemaVersionError(Exception): pass
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
@@ -550,9 +552,9 @@ class BorgHelperDB:
         row=conn.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()
         stored=int(row[0]) if row else 0
         if stored>schema_version:
-            printer(f"Erreur ({db_path}) : schéma DB v{stored} > attendu v{schema_version}.")
-            printer("  DB créée par une version plus récente de borgHelper — mettez à jour borgHelper.")
-            sys.exit(1)
+            raise SchemaVersionError(
+                f"({db_path}) schéma DB v{stored} > attendu v{schema_version} — "
+                "DB créée par une version plus récente de borgHelper, mettez à jour borgHelper.")
         conn.execute("INSERT OR REPLACE INTO db_meta VALUES('schema_version',?)",(str(schema_version),))
         conn.execute("INSERT OR REPLACE INTO db_meta VALUES('borghelper_version',?)",(Version,))
 
@@ -2722,4 +2724,7 @@ def _cli_main():
 
 
 if __name__=='__main__':
-    _cli_main()
+    try:
+        _cli_main()
+    except SchemaVersionError as e:
+        printer(f"Erreur schéma DB : {e}"); sys.exit(1)

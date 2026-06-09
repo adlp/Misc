@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.42 — 2026-06-09
+
+### `SchemaVersionError` : mismatch DB non bloquant pour `bkp`/`restore`
+
+Remplace `sys.exit(1)` de `_check_set_meta` par `raise SchemaVersionError`. Pour `bkp`, l'exception est absorbée par le `except Exception` existant → warning + borg s'exécute normalement. Pour `Index`, `Report`, etc., l'exception remonte jusqu'à `__main__` et affiche un message propre avant de quitter.
+
 ## 1.0.41 — 2026-06-09
 
 ### Versionning schéma DB (`db_meta`)
