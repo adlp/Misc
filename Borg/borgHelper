@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.37"
+Version="1.0.38"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
@@ -881,6 +881,7 @@ class BorgHelperDB:
             # Paires indexées (même si entries=0 — tous exclus ou aucun changement)
             indexed=conn.execute("SELECT DISTINCT archive_new FROM diff_indexed_pairs WHERE nick=?",(nick,)).fetchall()
             rows=conn.execute("SELECT archive_new,change_type,COUNT(*),SUM(size_after),SUM(size_before) FROM diff_index WHERE nick=? GROUP BY archive_new,change_type",(nick,)).fetchall()
+            exclu_rows=conn.execute("SELECT archive_new,change_type,SUM(file_count),SUM(total_size) FROM diff_excluded_stats WHERE nick=? GROUP BY archive_new,change_type",(nick,)).fetchall()
             conn.close()
             zero=lambda: {'added':0,'removed':0,'modified':0,'added_sz':0,'removed_sz':0,'modified_sz':0}
             stats={arch:zero() for (arch,) in indexed}
@@ -889,6 +890,11 @@ class BorgHelperDB:
                 if ctype=='added': stats[arch]['added']+=cnt; stats[arch]['added_sz']+=(sz_after or 0)
                 elif ctype=='removed': stats[arch]['removed']+=cnt; stats[arch]['removed_sz']+=(sz_before or 0)
                 else: stats[arch]['modified']+=cnt; stats[arch]['modified_sz']+=(sz_after or 0)
+            for arch,ctype,cnt,sz in exclu_rows:
+                if arch not in stats: stats[arch]=zero()
+                if ctype=='added': stats[arch]['added']+=cnt; stats[arch]['added_sz']+=(sz or 0)
+                elif ctype=='removed': stats[arch]['removed']+=cnt; stats[arch]['removed_sz']+=(sz or 0)
+                else: stats[arch]['modified']+=cnt; stats[arch]['modified_sz']+=(sz or 0)
             return stats
         except Exception: return {}
 

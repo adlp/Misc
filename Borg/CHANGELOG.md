@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.38 — 2026-06-09
+
+### Statistiques : fichiers exclus inclus dans `modifications`
+
+`_diff_stats_for_nick` agrège maintenant `diff_excluded_stats` (par `archive_new`) en plus de `diff_index`. Les fichiers filtrés par `IDX_EXCLUDE` (added/modified/removed) sont comptés dans le numérateur et le dénominateur de la colonne `modifications`, ce qui donne un pourcentage représentatif de l'intégralité des fichiers modifiés.
+
 ## 1.0.37 — 2026-06-09
 
 ### Index : annulation propre en base des diffs interrompus
