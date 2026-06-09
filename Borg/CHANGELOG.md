@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.41 — 2026-06-09
+
+### Versionning schéma DB (`db_meta`)
+
+Ajout table `db_meta (key, value)` dans `cache.db` et `diff.db`. Stocke `schema_version` (entier, incrémenté uniquement sur changement de schéma) et `borghelper_version` (version du script). Au démarrage : si `schema_version` DB > constante attendue → erreur + exit (DB d'une version future incompatible). Constantes actuelles : `DIFF_DB_SCHEMA_VERSION=1`, `CACHE_DB_SCHEMA_VERSION=1`.
+
 ## 1.0.40 — 2026-06-09
 
 ### `diffbkp` : cache conservé + stockage filtré corrigé

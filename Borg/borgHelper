@@ -9,7 +9,9 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.40"
+Version="1.0.41"
+DIFF_DB_SCHEMA_VERSION  = 1
+CACHE_DB_SCHEMA_VERSION = 1
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
@@ -544,6 +546,16 @@ class BorgHelperDB:
                 return
         printer(f"  [WARN] Timeout attente Index ({timeout}s) — lancement quand même")
 
+    def _check_set_meta(self,conn,schema_version,db_path):
+        row=conn.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()
+        stored=int(row[0]) if row else 0
+        if stored>schema_version:
+            printer(f"Erreur ({db_path}) : schéma DB v{stored} > attendu v{schema_version}.")
+            printer("  DB créée par une version plus récente de borgHelper — mettez à jour borgHelper.")
+            sys.exit(1)
+        conn.execute("INSERT OR REPLACE INTO db_meta VALUES('schema_version',?)",(str(schema_version),))
+        conn.execute("INSERT OR REPLACE INTO db_meta VALUES('borghelper_version',?)",(Version,))
+
     def _db_connect(self,db_path):
         try:
             return sqlite3.connect(db_path)
@@ -565,6 +577,10 @@ class BorgHelperDB:
             conn=self._db_connect(db_path)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript("""
+                CREATE TABLE IF NOT EXISTS db_meta (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT
+                );
                 CREATE TABLE IF NOT EXISTS cachejsonboexlm (
                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
                     nom          TEXT NOT NULL,
@@ -574,6 +590,7 @@ class BorgHelperDB:
                 );
                 CREATE INDEX IF NOT EXISTS idx_cache_nom ON cachejsonboexlm(nom);
             """)
+            self._check_set_meta(conn,CACHE_DB_SCHEMA_VERSION,db_path)
             conn.commit(); conn.close()
         except sqlite3.DatabaseError as e:
             printer(f"DB corrompue : {db_path}")
@@ -608,6 +625,10 @@ class BorgHelperDB:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
             conn.executescript("""
+                CREATE TABLE IF NOT EXISTS db_meta (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT
+                );
                 CREATE TABLE IF NOT EXISTS diff_index (
                     id               INTEGER PRIMARY KEY AUTOINCREMENT,
                     nick             TEXT NOT NULL,
@@ -708,6 +729,7 @@ class BorgHelperDB:
                     FROM archive_snapshot s
                     JOIN snapshot_file sf ON sf.id=s.file_id;
             """)
+            self._check_set_meta(conn,DIFF_DB_SCHEMA_VERSION,db_path)
             conn.commit(); conn.close()
         except sqlite3.DatabaseError as e:
             printer(f"DB corrompue : {db_path}")
