@@ -25,7 +25,18 @@ export PYTHONPATH=$(pwd):$PYTHONPATH
 Import :
 
 ```python
-from borgHelper import BorgHelper, BorgHelperDB, BorgRunner
+from borgHelper import BorgHelper, BorgHelperDB, BorgRunner, SchemaVersionError
+```
+
+### Exception `SchemaVersionError`
+
+Levée par `ensure_diff_db()` / `ensure_cache_db()` si la `schema_version` stockée en DB est supérieure à la constante attendue par le script (DB créée par une version plus récente). À intercepter si l'opération doit continuer sans indexation :
+
+```python
+try:
+    db.ensure_diff_db(db_path)
+except SchemaVersionError as e:
+    print(f"[WARN] DB incompatible, indexation ignorée : {e}")
 ```
 
 ---
