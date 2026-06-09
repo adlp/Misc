@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.44 — 2026-06-09
+
+### Filtrage messages DEBUG borg sur `bkp`
+
+Supprime du stderr les messages `DEBUG` de borg (ex. `Merging into master chunks index`, `Reading cached archive chunk index`) lors d'un backup. Ces messages n'apparaissent qu'avec l'option `--debug`. Les entrées fichier par fichier (`file_status`) étaient déjà filtrées.
+
 ## 1.0.43 — 2026-06-09
 
 ### Format nom d'archive sans deux-points

@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.43"
+Version="1.0.44"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -1655,6 +1655,7 @@ class BorgHelper:
                     if _bkp_is_list_entry(i): continue
                     if isinstance(i,dict):
                         lvl=i.get('levelname','INFO'); msg=i.get('message',str(i))
+                        if lvl=='DEBUG' and not debug: continue
                         print(f"[{lvl}] {msg}",file=sys.stderr,flush=True)
                         if debug: printer(i)
                     elif isinstance(i,str) and i.strip():
