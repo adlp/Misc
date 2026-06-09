@@ -45,6 +45,11 @@ Cache des résultats `borg info` et `borg prune --dry-run`, invalidé automatiqu
 
 ```mermaid
 erDiagram
+    db_meta {
+        TEXT key PK "schema_version | borghelper_version"
+        TEXT value
+    }
+
     cachejsonboexlm {
         INTEGER id PK
         TEXT nom "nick ou nick:prune"
@@ -72,6 +77,16 @@ Index des diffs inter-archives, snapshots du dernier état, métadonnées de tai
 - `VACUUM` explicite après `Prune` pour récupérer l'espace immédiatement
 
 ### Tables
+
+#### `db_meta`
+Métadonnées de versionning du schéma — une ligne par clé.
+
+| Clé | Valeur | Notes |
+|-----|--------|-------|
+| `schema_version` | entier (ex : `"1"`) | Incrémenté uniquement lors d'un changement de schéma |
+| `borghelper_version` | chaîne (ex : `"1.0.41"`) | Mise à jour à chaque ouverture de la DB |
+
+Au démarrage : si `schema_version` stockée > constante attendue (`DIFF_DB_SCHEMA_VERSION` / `CACHE_DB_SCHEMA_VERSION`) → erreur + exit. Indique que la DB a été créée par une version plus récente incompatible.
 
 #### `diff_index`
 Stocke chaque événement de fichier entre deux archives consécutives.
@@ -132,6 +147,11 @@ Utilisée par `Search`, `FileHist`, `DuIdx`, `Restore` — expose la jointure de
 
 ```mermaid
 erDiagram
+    db_meta {
+        TEXT key PK "schema_version | borghelper_version"
+        TEXT value
+    }
+
     diff_index {
         INTEGER id PK
         TEXT nick
@@ -533,6 +553,26 @@ Chaque nick est évalué indépendamment — un rapport multi-nick peut mixer de
 ---
 
 ## Migration de schéma
+
+### Versionning (`db_meta`)
+
+Chaque DB (`cache.db`, `diff.db`) contient une table `db_meta (key TEXT PK, value TEXT)` avec deux entrées permanentes :
+
+- `schema_version` : entier correspondant aux constantes `DIFF_DB_SCHEMA_VERSION` / `CACHE_DB_SCHEMA_VERSION` du script
+- `borghelper_version` : version de borgHelper qui a ouvert la DB en dernier
+
+À chaque ouverture (`ensure_diff_db` / `ensure_cache_db`) :
+1. Si `schema_version` DB > constante attendue → erreur + exit (DB d'une version future)
+2. Sinon → mise à jour de `borghelper_version` et confirmation de `schema_version`
+
+La `schema_version` ne change **pas** à chaque release — seulement lors d'un changement structurel du schéma (ajout/suppression de colonne, nouvelle table, etc.).
+
+| Constante | Valeur actuelle |
+|-----------|-----------------|
+| `DIFF_DB_SCHEMA_VERSION` | `1` |
+| `CACHE_DB_SCHEMA_VERSION` | `1` |
+
+### Migration `archive_snapshot` (historique)
 
 `ensure_diff_db()` détecte automatiquement l'ancien schéma de `archive_snapshot` (colonne `path` directe) et migre vers le schéma déduplication (`file_id → snapshot_file`) au premier lancement après mise à jour.
 
