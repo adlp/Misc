@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.36"
+Version="1.0.37"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
@@ -1785,8 +1785,8 @@ class BorgHelper:
                 inf,_=ps.communicate()
             finally:
                 with running_procs_lock: running_procs.pop(pair,None)
-            entries=[]; exclu={}
-            if ps.returncode in (0,1):
+            entries=[]; exclu={}; ok=ps.returncode in (0,1)
+            if ok:
                 for line in inf.splitlines():
                     p=parse_diff_line(line)
                     if not p or not p['path']: continue
@@ -1797,7 +1797,7 @@ class BorgHelper:
                         sz=p.get('size_after') or p.get('size_before') or 0
                         if ct not in exclu: exclu[ct]={'count':0,'size':0}
                         exclu[ct]['count']+=1; exclu[ct]['size']+=sz
-            return (a_old,a_new,date_new,entries,exclu)
+            return (a_old,a_new,date_new,entries,exclu,ok)
         interrupted_event=threading.Event()
         results=[]
         if pairs_todo:
@@ -1860,7 +1860,12 @@ class BorgHelper:
         if results:
             try:
                 conn=sqlite3.connect(db_path)
-                for a_old,a_new,date_new,entries,exclu in results:
+                for a_old,a_new,date_new,entries,exclu,ok in results:
+                    if not ok:
+                        conn.execute("DELETE FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
+                        conn.execute("DELETE FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
+                        conn.execute("DELETE FROM diff_excluded_stats WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
+                        continue
                     if entries:
                         conn.executemany("INSERT INTO diff_index (nick,archive_old,archive_new,archive_new_date,change_type,path,size_before,size_after) VALUES (?,?,?,?,?,?,?,?)",
                             [(nick,a_old,a_new,date_new,e['change_type'],e['path'],e.get('size_before'),e.get('size_after')) for e in entries])
@@ -1873,8 +1878,9 @@ class BorgHelper:
                 conn.commit(); conn.close()
             except sqlite3.Error as e:
                 printer(f"SQLite error ({db_path}): {e}")
-        new_pairs=len(results)
-        total_exclu=sum(sum(s['count'] for s in exclu.values()) for _,_,_,_,exclu in results)
+        ok_results=[r for r in results if r[5]]
+        new_pairs=len(ok_results)
+        total_exclu=sum(sum(s['count'] for s in exclu.values()) for _,_,_,_,exclu,_ in ok_results)
         exclu_suffix=f", {total_exclu:,} exclus" if total_exclu else ""
         print(f"{nick}: {new_pairs} paires indexées (+{skipped} déjà en cache{exclu_suffix})")
         diff_keep=cfg.get('DIFF_KEEP','')

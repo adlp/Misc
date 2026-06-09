@@ -1,5 +1,13 @@
 # Changelog — borgHelper
 
+## 1.0.37 — 2026-06-09
+
+### Index : annulation propre en base des diffs interrompus
+
+**Bug** : quand un `borg diff` en cours était tué (`ps.kill()`), `communicate()` retournait quand même (returncode=-9), entries=[], et la paire était insérée dans `diff_indexed_pairs` avec 0 entrées — marquée "indexée" à tort, impossible à reprendre.
+
+**Fix** : `_run_diff` retourne maintenant un flag `ok = returncode in (0,1)`. En Phase 3, les paires `ok=False` déclenchent une purge (`diff_index`, `diff_indexed_pairs`, `diff_excluded_stats`) au lieu d'un insert. Elles seront réindexées au prochain lancement.
+
 ## 1.0.36 — 2026-06-09
 
 ### Colonne `modifications` unifiée résumé + détail — suffixes `%nb` / `%B`
