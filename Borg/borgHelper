@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.33"
+Version="1.0.34"
 ### TODO Mieux gerer les sorties d'erreure de borg
 ### TODO Mieux gerer les parametres "manquant" du borgrc
 ### TODO Mieux aider la creation du borgrc
@@ -765,7 +765,7 @@ class BorgHelperDB:
                 conn.commit(); return True
             finally: conn.close()
         try: return self._with_lock_retry(_do)
-        except sqlite3.Error as e: printer(f"SQLite error: {e}"); return False
+        except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
 
     def store_archive_stats(self,nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
@@ -777,7 +777,7 @@ class BorgHelperDB:
                 conn.commit(); return True
             finally: conn.close()
         try: return self._with_lock_retry(_do)
-        except sqlite3.Error as e: printer(f"SQLite error (archive_stats): {e}"); return False
+        except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
 
     def store_repo_stats(self,nick,unique_csize,total_size,total_csize,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
@@ -789,7 +789,7 @@ class BorgHelperDB:
                 conn.commit(); return True
             finally: conn.close()
         try: return self._with_lock_retry(_do)
-        except sqlite3.Error as e: printer(f"SQLite error (repo_stats): {e}"); return False
+        except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
 
     def get_repo_stats(self,nick,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
@@ -823,7 +823,7 @@ class BorgHelperDB:
                 conn.commit(); return True
             finally: conn.close()
         try: return self._with_lock_retry(_do)
-        except sqlite3.Error as e: printer(f"SQLite error: {e}"); return False
+        except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
 
     def _diff_keep_purge(self,nick,keep,db_path):
         def _do():
@@ -839,7 +839,7 @@ class BorgHelperDB:
                 print(f"{nick}: DIFF_KEEP={keep} — {len(to_delete)} paire(s) ancienne(s) purgées")
             finally: conn.close()
         try: self._with_lock_retry(_do)
-        except sqlite3.Error as e: printer(f"SQLite error (diff_keep_purge): {e}")
+        except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}")
 
     def store_excluded_diff_stats(self,nick,archive_old,archive_new,exclu,db_path=None):
         """exclu : {change_type: {'count': N, 'size': M}}"""
@@ -855,7 +855,7 @@ class BorgHelperDB:
                 conn.commit()
             finally: conn.close()
         try: self._with_lock_retry(_do)
-        except sqlite3.Error as e: printer(f"SQLite error (excluded_diff_stats): {e}")
+        except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}")
 
     def store_excluded_snap_stats(self,nick,archive,count,size,db_path=None):
         if count==0: return
@@ -869,7 +869,7 @@ class BorgHelperDB:
                 conn.commit()
             finally: conn.close()
         try: self._with_lock_retry(_do)
-        except sqlite3.Error as e: printer(f"SQLite error (excluded_snap_stats): {e}")
+        except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}")
 
     def _cleanup_snapshot_file_orphans(self,nick,conn):
         conn.execute("DELETE FROM snapshot_file WHERE nick=? AND id NOT IN (SELECT file_id FROM archive_snapshot WHERE nick=?)",(nick,nick))
@@ -934,7 +934,7 @@ class BorgHelperDB:
                     _duidx_add(totals,key_fn(path),'présent',sz)
                 conn.close()
             except sqlite3.Error as e:
-                printer(f"SQLite error ({n}): {e}")
+                printer(f"SQLite error ({db_path}): {e}")
         return totals
 
     def _duidx_collect_global(self,nick,sql_pat,archive_from=None,archive_to=None):
@@ -960,7 +960,7 @@ class BorgHelperDB:
                     totals[k][0]+=row[0]; totals[k][1]+=(row[1] or 0)
                 conn.close()
             except sqlite3.Error as e:
-                printer(f"SQLite error ({n}): {e}")
+                printer(f"SQLite error ({db_path}): {e}")
         return totals
 
     def get_cache_rows(self,nick):
@@ -971,7 +971,7 @@ class BorgHelperDB:
             cur=conn.execute("SELECT nom,lastmodified,length(details) FROM cachejsonboexlm WHERE nom=? ORDER BY lastmodified DESC",(nick,))
             rows=cur.fetchall(); conn.close(); return rows
         except sqlite3.Error as e:
-            printer(f"SQLite error ({nick}): {e}"); return []
+            printer(f"SQLite error ({db_path}): {e}"); return []
 
 
 # ── BorgRunner — borg subprocess + borghelperrc config ────────────────────────
@@ -1192,7 +1192,7 @@ class BorgHelper:
             conn.execute("INSERT OR IGNORE INTO cachejsonboexlm (nom,lastmodified,details) VALUES (?,?,?)",(nom,last_modified,json.dumps(pruneme)))
             conn.commit(); conn.close()
         except sqlite3.Error as e:
-            printer(f"Cache write error (prune): {e}")
+            printer(f"Cache write error ({db_path}): {e}")
         return pruneme
 
     def cacheJsonBoexWithLM(self,nick,boexarg,output="stdout",debug=0,db_path=None,last_modified=None):
@@ -1205,7 +1205,7 @@ class BorgHelper:
             row=conn.execute("SELECT details FROM cachejsonboexlm WHERE nom=? AND lastmodified=? LIMIT 1",(nick,last_modified)).fetchone()
             conn.close()
         except sqlite3.Error as e:
-            printer(f"Cache SQLite error: {e}"); row=None
+            printer(f"Cache SQLite error ({db_path}): {e}"); row=None
         if row is None:
             if debug: print('Cache miss — appel borg')
             details=self.borg.boex(nick,boexarg,debug=debug)[output][0]
@@ -1214,7 +1214,7 @@ class BorgHelper:
                 conn.execute("INSERT OR IGNORE INTO cachejsonboexlm (nom,lastmodified,details) VALUES (?,?,?)",(nick,last_modified,json.dumps(details)))
                 conn.commit(); conn.close()
             except sqlite3.Error as e:
-                printer(f"Cache write error: {e}")
+                printer(f"Cache write error ({db_path}): {e}")
         else:
             if debug: print('Cache hit')
             details=json.loads(row[0])
@@ -1256,7 +1256,7 @@ class BorgHelper:
             if total>0: print(f"{nick}: index nettoyé ({r1} diff, {r2} paires, {r3}+{r4} snapshots)")
             conn.execute("VACUUM"); conn.close()
         except sqlite3.Error as e:
-            printer(f"SQLite cleanup error: {e}")
+            printer(f"SQLite cleanup error ({db_path}): {e}")
 
     def _find_last_archive_with_file(self,nick,path,debug=0):
         db_path=self.db.get_diff_db(nick)
@@ -1422,7 +1422,7 @@ class BorgHelper:
                 (nick,bidun,bideux))
             rows=cur.fetchall(); conn.close()
         except sqlite3.Error as e:
-            printer(f"SQLite error: {e}"); sys.exit(3)
+            printer(f"SQLite error ({db_path}): {e}"); sys.exit(3)
         print(f"{bidun} → {bideux}")
         if not rows: print("Aucune différence."); sys.exit(0)
         n_add=n_rem=n_mod=0
@@ -1705,7 +1705,7 @@ class BorgHelper:
                 self.db._cleanup_snapshot_file_orphans(nick,conn)
                 conn.commit(); conn.close()
             except sqlite3.Error as e:
-                printer(f"SQLite error (purge snapshot): {e}")
+                printer(f"SQLite error ({db_path}): {e}")
         print(f"  {nick}: snapshot {archive_name}...",flush=True)
         rb2=self.borg.boex(nick,['list','--format','{size} {isomtime} {path}{NL}',f"::{archive_name}"],debug=debug,retjson=False)
         if rb2['exitcode']!=0:
@@ -1766,7 +1766,7 @@ class BorgHelper:
                     conn.execute("DELETE FROM diff_excluded_stats WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
                 conn.commit(); conn.close()
             except sqlite3.Error as e:
-                printer(f"SQLite error (purge): {e}")
+                printer(f"SQLite error ({db_path}): {e}")
         # Phase 2 : borg diff en parallèle
         workers=max(1,int(cfg.get('IDX_WORKERS','4')))
         borg_exe=cfg.get('BORG_EXE','borg')
@@ -1872,7 +1872,7 @@ class BorgHelper:
                             [(nick,a_old,a_new,ct,s['count'],s['size']) for ct,s in exclu.items()])
                 conn.commit(); conn.close()
             except sqlite3.Error as e:
-                printer(f"SQLite error (insert): {e}")
+                printer(f"SQLite error ({db_path}): {e}")
         new_pairs=len(results)
         total_exclu=sum(sum(s['count'] for s in exclu.values()) for _,_,_,_,exclu in results)
         exclu_suffix=f", {total_exclu:,} exclus" if total_exclu else ""
@@ -1920,7 +1920,7 @@ class BorgHelper:
                 cur=conn.execute("SELECT nick,archive_date,archive,'présent',path,NULL,size FROM archive_snapshot_v WHERE nick=? AND path LIKE ? "+_snap_notin(df,dt)+" ORDER BY archive,path",[n,sql_pat]+snap_extra)
                 rows.extend(cur.fetchall()); conn.close()
             except sqlite3.Error as e:
-                printer(f"SQLite error ({n}): {e}")
+                printer(f"SQLite error ({db_path}): {e}")
         if not rows: print("Aucun résultat."); return
         from prettytable import PrettyTable
         t=PrettyTable(['nick','date','archive','type','chemin','avant','après'])
@@ -1946,7 +1946,7 @@ class BorgHelper:
                 cur=conn.execute("SELECT nick,archive_date,'',archive,'présent',NULL,size FROM archive_snapshot_v WHERE nick=? AND path=? "+_snap_notin(df,dt),[n,path]+snap_extra)
                 rows.extend(cur.fetchall()); conn.close()
             except sqlite3.Error as e:
-                printer(f"SQLite error ({n}): {e}")
+                printer(f"SQLite error ({db_path}): {e}")
         if not rows: print(f"Aucune entrée pour : {path}"); return
         rows.sort(key=lambda r:(r[1] or ''))
         from prettytable import PrettyTable
@@ -1997,7 +1997,7 @@ class BorgHelper:
                     total_count+=1; total_size+=(size or 0)
             conn.close()
         except sqlite3.Error as e:
-            printer(f"  SQLite error: {e}"); return
+            printer(f"  SQLite error ({db_path}): {e}"); return
         if not total_count:
             printer(f"  {nick}: diff_index vide"); return
         try:
@@ -2067,7 +2067,7 @@ class BorgHelper:
                     (nick,)).fetchone()
                 conn.close()
             except sqlite3.Error as e:
-                printer(f"  SQLite error: {e}"); return
+                printer(f"  SQLite error ({db_path}): {e}"); return
             if not row:
                 printer(f"  {nick}: aucune paire indexée — lancez borgHelper -c Index -n {nick}"); return
             arch_old,arch_new=row
@@ -2099,7 +2099,7 @@ class BorgHelper:
                     total_count+=1; total_size+=sz
             conn.close()
         except sqlite3.Error as e:
-            printer(f"  SQLite error: {e}"); return
+            printer(f"  SQLite error ({db_path}): {e}"); return
         if not total_count:
             printer(f"  {nick}: aucune entrée pour cette paire ({arch_old} → {arch_new})"); return
         try:
@@ -2221,7 +2221,7 @@ class BorgHelper:
                 printer(f"  [WARN] compactage impossible ({ve}) — entrées supprimées mais espace non récupéré")
                 printer(f"  [WARN] relancer manuellement : sqlite3 '{db_path}' \"VACUUM INTO '{db_path}.tmp'\" && mv '{db_path}.tmp' '{db_path}'")
         except sqlite3.Error as e:
-            printer(f"  SQLite error: {e}")
+            printer(f"  SQLite error ({db_path}): {e}")
             try: conn.close()
             except: pass
 
@@ -2236,7 +2236,7 @@ class BorgHelper:
             rows=conn.execute("SELECT archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles FROM archive_stats WHERE nick=? ORDER BY archive_date",(nick,)).fetchall()
             conn.close()
         except sqlite3.Error as e:
-            raise Exception(f"SQLite error: {e}")
+            raise Exception(f"SQLite error ({db_path}): {e}")
         if not rows:
             raise Exception(f"archive_stats vide — lancez borgHelper -c Index -n {nick}")
         diff_stats=self.db._diff_stats_for_nick(nick)

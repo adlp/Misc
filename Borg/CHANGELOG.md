@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.34 — 2026-06-09
+
+### Erreurs SQLite : nom de fichier inclus dans le message
+
+Tous les `printer()` et `raise Exception()` sur erreur SQLite affichent maintenant `({db_path})` en plus du message d'erreur. Plus besoin de deviner quelle base est en cause (ex. `database or disk is full`).
+
 ## 1.0.33 — 2026-06-08
 
 ### `Report` : fix `—` sur archives indexées sans changements visibles
