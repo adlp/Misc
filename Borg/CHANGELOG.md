@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.43 — 2026-06-09
+
+### Format nom d'archive sans deux-points
+
+`{now}` → `{now:%Y-%m-%dT%H%M%S}` : `sg210-root-2026-05-31T230006` au lieu de `sg210-root-2026-05-31T23:00:06`. Compatible avec les systèmes de fichiers qui n'acceptent pas les `:`.
+
 ## 1.0.42 — 2026-06-09
 
 ### `SchemaVersionError` : mismatch DB non bloquant pour `bkp`/`restore`

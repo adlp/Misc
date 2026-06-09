@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.42"
+Version="1.0.43"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -1618,8 +1618,8 @@ class BorgHelper:
         create.extend(base_flags.split(' '))
         archname='root'
         if 'BORG_ARCHNAME' in cfg.keys(): archname=cfg['BORG_ARCHNAME']
-        if archname[:2]=="::": create.append(archname+'-{now}')
-        else: create.append('::{fqdn}-'+archname+'-{now}')
+        if archname[:2]=="::": create.append(archname+'-{now:%Y-%m-%dT%H%M%S}')
+        else: create.append('::{fqdn}-'+archname+'-{now:%Y-%m-%dT%H%M%S}')
         rootbkp="/"
         if 'BORG_ROOTBKP' in cfg.keys(): rootbkp=cfg['BORG_ROOTBKP']
         create.append(rootbkp)
