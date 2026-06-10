@@ -9,15 +9,11 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.53"
+Version="1.0.54"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
 class SchemaVersionError(Exception): pass
-### TODO Mieux gerer les sorties d'erreure de borg
-### TODO Mieux gerer les parametres "manquant" du borgrc
-### TODO Mieux aider la creation du borgrc
-### TODO Rajouter de quoi trouver les caches, et nettoyer ceux si
 # 1.0.19 DiffTop : top N arborescences par changements sur une paire d'archives
 # 1.0.18 IdxTop : fix get_prefix — chemins sans / initial non tronqués à la profondeur demandée
 # 1.0.17 IdxPurge : VACUUM INTO même répertoire (évite /tmp saturé), fallback avec message si échec

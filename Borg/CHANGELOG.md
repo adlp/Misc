@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.54 — 2026-06-10
+
+### Résumé : suppression des TODO obsolètes
+
+Supprime les 4 commentaires TODO en tête de fichier (gestion erreurs borg, paramètres borgrc manquants, aide création borgrc, nettoyage caches) — fonctionnalités toutes implémentées.
+
 ## 1.0.53 — 2026-06-10
 
 ### Résumé : version borgHelper dans tous les stdout JSON
