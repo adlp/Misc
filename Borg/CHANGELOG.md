@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.62 — 2026-06-10
+
+### Nouvelle commande : `SnapUrge`
+
+Purge les anciens snapshots (`archive_snapshot`, `archive_snapshot_indexed`, `snap_excluded_stats`) en conservant les K archives les plus récentes (tri alphabétique, donc chronologique pour les noms borg). Nettoie les `snapshot_file` orphelins via `_cleanup_snapshot_file_orphans`. VACUUM via `_vacuum_db`. Options : `-k <keep>` (défaut 5), `-D` (dry-run), `-n nick/ALL`.
+
 ## 1.0.61 — 2026-06-10
 
 ### Bugfix : option `-A` de la commande `index` non reconnue

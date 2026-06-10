@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.61"
+Version="1.0.62"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -388,6 +388,9 @@ def usage(doc=None,debug=0):
         printer("       Purge rétroactive de diff_index + VACUUM  (-D : dry-run)")
         printer("       Sans -x : lit IDX_EXCLUDE/IDX_INCLUDE depuis le borghelperrc")
         printer("       -x '/var/lib/docker' : préfixe explicite  |  -x '*.pyc' : glob")
+        printer("⚡️ -c SnapUrge [-n nick/ALL] [-k keep] [-D]")
+        printer("       Purge les anciens snapshots (archive_snapshot) en gardant les K derniers + VACUUM")
+        printer("       -k n : nombre de snapshots à conserver (défaut 5)  |  -D : dry-run")
         printer("  Sentry configuration : BORGHELPERC_SENTRY_ID BORGHELPERC_SENTRY_FILE ou /usr/local/etc/borghelper-sentry")
     elif doc=='key':
         printer("   -c Key [-n nickname/servername/ALL]")
@@ -473,6 +476,13 @@ def usage(doc=None,debug=0):
         printer("       -x '*.pyc' ou -x '*/.git/*' : glob (* matche /)")
         printer("       -D : dry-run — affiche le volume sans rien supprimer")
         printer("       Workflow : IdxTop → modifier IDX_EXCLUDE → IdxPurge (sans -x)")
+    elif doc=='snapurge':
+        printer("   -c SnapUrge [-n nick/servername/ALL] [-k keep] [-D]")
+        printer("       Purge les snapshots anciens (archive_snapshot / snapshot_file) + VACUUM")
+        printer("       Conserve uniquement les K archives les plus récentes (tri alphabétique)")
+        printer("       -k n : nombre de snapshots à conserver (défaut 5)")
+        printer("       -D   : dry-run — liste les archives à purger sans rien supprimer")
+        printer("       Note : n'affecte pas diff_index — utiliser IdxPurge pour les diffs")
     else:
         printer(f"  Desole pas de documentation pour la commande {doc}")
     sys.exit(1)
@@ -2361,6 +2371,41 @@ class BorgHelper:
             try: conn.close()
             except: pass
 
+    def snapurge(self,nick,keep=5,dryrun=False,debug=0):
+        db_path=self.db.get_diff_db(nick)
+        if not os.path.exists(db_path):
+            printer(f"  {nick}: diff.db absent"); return
+        try:
+            conn=sqlite3.connect(db_path,timeout=60)
+            archives=sorted([r[0] for r in conn.execute(
+                "SELECT archive FROM archive_snapshot_indexed WHERE nick=?",(nick,))])
+            total=len(archives)
+            if total<=keep:
+                printer(f"  {nick}: {total} snapshot(s) indexé(s) — rien à purger (keep={keep})")
+                conn.close(); return
+            to_delete=archives[:total-keep]
+            ph=','.join('?'*len(to_delete))
+            row=conn.execute(
+                f"SELECT COUNT(*) FROM archive_snapshot WHERE nick=? AND archive IN ({ph})",
+                [nick]+to_delete).fetchone()
+            count=row[0]
+            printer(f"  {nick}: {len(to_delete)} archive(s) à purger sur {total} ({count:,} entrées snapshot) — keep={keep}")
+            for a in to_delete: printer(f"    - {a}")
+            if dryrun:
+                printer(f"  {nick}: dry-run — aucune modification")
+                conn.close(); return
+            conn.execute(f"DELETE FROM archive_snapshot WHERE nick=? AND archive IN ({ph})",[nick]+to_delete)
+            conn.execute(f"DELETE FROM archive_snapshot_indexed WHERE nick=? AND archive IN ({ph})",[nick]+to_delete)
+            conn.execute(f"DELETE FROM snap_excluded_stats WHERE nick=? AND archive IN ({ph})",[nick]+to_delete)
+            self.db._cleanup_snapshot_file_orphans(nick,conn)
+            conn.commit(); conn.close()
+            printer(f"  {nick}: {count:,} entrées supprimées")
+            self._vacuum_db(db_path,verbose=True)
+        except sqlite3.Error as e:
+            printer(f"  SQLite error ({db_path}): {e}")
+            try: conn.close()
+            except: pass
+
     def prep_report_from_db(self,nick,maxp=None):
         """Comme prep_report() mais lit uniquement l'index SQLite — utilisé quand le dépôt est occupé."""
         db_path=self.db.get_diff_db(nick)
@@ -2701,7 +2746,7 @@ def _cli_main():
            'delbkp':'Ccdnb','bkp':'CcdnI','prune':'Ccdn','report':'CcdnlNjo',
            'init':'Ccdn','key':'Ccdn','index':'CcdnFSA','search':'CcdnfbB',
            'filehist':'CcdnfbB','cacheinfo':'Ccdn','cacheclean':'Ccdn','duidx':'CcdnfbBsj',
-           'idxtop':'CcdnNp','difftop':'CcdnNpb','idxpurge':'CcdnxD'}
+           'idxtop':'CcdnNp','difftop':'CcdnNpb','idxpurge':'CcdnxD','snapurge':'CcdnkD'}
 
     if cmd is None or cmd not in optab.keys():
         usage()
@@ -2829,6 +2874,11 @@ def _cli_main():
         _dryrun='-D' in options
         for n in nick.split(','):
             bh.idxpurge(n,pattern=options.get('-x'),dryrun=_dryrun,debug=debug)
+    elif cmd=='snapurge':
+        _dryrun='-D' in options
+        _keep=int(options.get('-k','5'))
+        for n in nick.split(','):
+            bh.snapurge(n,keep=_keep,dryrun=_dryrun,debug=debug)
     else:
         printer("Mais comment on peut en arriver la ?"); usage()
 
