@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.64 — 2026-06-10
+
+### IdxPurge : IDX_SNAP_KEEP déduit de KEEP_* par défaut
+
+Si `IDX_SNAP_KEEP` absent de la config, le seuil de rétention des snapshots est calculé comme `sum(KEEP_DAILY + KEEP_WEEKLY + KEEP_MONTHLY + KEEP_YEARLY + KEEP_HOURLY)`. Fallback à 10 si aucune règle KEEP_* n'est définie.
+
 ## 1.0.63 — 2026-06-10
 
 ### Refactor : purge des snapshots intégrée dans `IdxPurge`

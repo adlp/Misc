@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.63"
+Version="1.0.64"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -388,7 +388,7 @@ def usage(doc=None,debug=0):
         printer("       Purge rétroactive de diff_index + anciens snapshots + VACUUM  (-D : dry-run)")
         printer("       Sans -x : lit IDX_EXCLUDE/IDX_INCLUDE depuis le borghelperrc")
         printer("       -x '/var/lib/docker' : préfixe explicite  |  -x '*.pyc' : glob")
-        printer("       IDX_SNAP_KEEP=10 dans borghelperrc : nb de snapshots à conserver (défaut 10)")
+        printer("       IDX_SNAP_KEEP dans borghelperrc : nb de snapshots à conserver (défaut = somme KEEP_*, sinon 10)")
         printer("  Sentry configuration : BORGHELPERC_SENTRY_ID BORGHELPERC_SENTRY_FILE ou /usr/local/etc/borghelper-sentry")
     elif doc=='key':
         printer("   -c Key [-n nickname/servername/ALL]")
@@ -473,7 +473,7 @@ def usage(doc=None,debug=0):
         printer("       -x '/var/lib/docker' : préfixe explicite (tout sous cette arbo)")
         printer("       -x '*.pyc' ou -x '*/.git/*' : glob (* matche /)")
         printer("       -D : dry-run — affiche le volume sans rien supprimer")
-        printer("       Snapshots : purge automatique des archives au-delà de IDX_SNAP_KEEP (défaut 10)")
+        printer("       Snapshots : purge automatique au-delà de IDX_SNAP_KEEP (défaut = somme KEEP_*, sinon 10)")
         printer("       Workflow : IdxTop → modifier IDX_EXCLUDE → IdxPurge (sans -x)")
     else:
         printer(f"  Desole pas de documentation pour la commande {doc}")
@@ -2318,7 +2318,9 @@ class BorgHelper:
         if not os.path.exists(db_path):
             printer(f"  {nick}: diff.db absent"); return
         cfg=self.borg.cfgread(nick)
-        keep_snap=int(cfg.get('IDX_SNAP_KEEP',10))
+        keep_snap=int(cfg.get('IDX_SNAP_KEEP',
+            sum(int(cfg.get(k,0)) for k in ['KEEP_DAILY','KEEP_WEEKLY','KEEP_MONTHLY','KEEP_YEARLY','KEEP_HOURLY'])
+            or 10))
         def _pat_cond(patterns):
             parts=[]; args=[]
             for pat in patterns:
