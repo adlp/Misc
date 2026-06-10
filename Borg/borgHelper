@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.57"
+Version="1.0.58"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -58,7 +58,10 @@ _DUIDX_COL_NAMES=['added/modif','removed','présent']
 # ── Module-level utilities (pure functions) ────────────────────────────────────
 
 def printer(data,debug=0):
-    print(data,file=sys.stderr)
+    if isinstance(data,str) and ('[ERREUR]' in data or '[WARN]' in data):
+        print(f"{data}  [borgHelper v{Version}]",file=sys.stderr)
+    else:
+        print(data,file=sys.stderr)
 
 def _db_name_from_cfg(path):
     base=os.path.basename(os.path.abspath(path)).lstrip('.')

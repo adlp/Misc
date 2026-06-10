@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.58 — 2026-06-10
+
+### Résumé : version borgHelper dans les messages d'erreur stderr
+
+`printer()` ajoute automatiquement `[borgHelper vX.Y.Z]` en suffixe de tout message stderr contenant `[ERREUR]` ou `[WARN]`. Aucun site d'appel modifié — effet global sur tous les avertissements et erreurs.
+
 ## 1.0.57 — 2026-06-10
 
 ### Résumé : report live toujours via borg (plus de fallback DB)
