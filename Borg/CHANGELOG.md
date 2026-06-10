@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.50 — 2026-06-10
+
+### Suppression colonne `moy` du résumé
+
+La taille dédupliquée moyenne par archive est redondante avec la colonne `derniere`. Supprimée de `prep_report_from_db`, `prep_report` et de la boucle de conversion dans `report`.
+
 ## 1.0.49 — 2026-06-10
 
 ### `modifications` : espace disque en valeur absolue lisible

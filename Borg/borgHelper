@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.49"
+Version="1.0.50"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -2353,7 +2353,6 @@ class BorgHelper:
         repo_st=self.db.get_repo_stats(nick)
         tcmpl[nick]={'nom':nick,'date derniere':dabesi['date'],'depuis':dabesi['since'],
             'duree':last_k['durationM'],'derniere':last_k['deduplicated_size'],
-            'moy':total_dedup/c if c else 0,
             'taille':repo_st.get('unique_csize'),'recuperable':None,'reste':self.borg.dfRepo(nick)}
         s_last=diff_stats.get(last_arch)
         if s_last:
@@ -2433,7 +2432,6 @@ class BorgHelper:
         else:
             tcmpl[nick]['duree']=kept[resume['lastname']]['durationM']
             tcmpl[nick]['derniere']=kept[resume['lastname']]['deduplicated_size']
-        tcmpl[nick]['moy']=resume['moy_deduplicated_size']
         tcmpl[nick]['taille']=resume['unique_csize']
         tcmpl[nick]['recuperable']=resume['prunable']
         tcmpl[nick]['reste']=avail
@@ -2496,7 +2494,7 @@ class BorgHelper:
                 if htrep: errhost.append(nick)
                 else: tcmpl[nick]['nom']=f"***{nick}"
             for i in ['duree','derniere','taille','recuperable']: reshosto[i]+=(tcmpl[nick][i] or 0)
-            for i in ['derniere','moy','taille','recuperable','reste']:
+            for i in ['derniere','taille','recuperable','reste']:
                 if (i in tcmpl[nick].keys()) and not(tcmpl[nick][i] is None): tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
                 else: tcmpl[nick][i]=""
             tcmpl[nick]['depuis']=f"{tcmpl[nick]['depuis']:.2f} h"
@@ -2568,7 +2566,7 @@ class BorgHelper:
                 if htrep: errhost.append(nick)
                 else: tcmpl[nick]['nom']=f"***{nick}"
             for i in ['duree','derniere','taille','recuperable']: reshosto[i]+=(tcmpl[nick][i] or 0)
-            for i in ['derniere','moy','taille','recuperable','reste']:
+            for i in ['derniere','taille','recuperable','reste']:
                 if (i in tcmpl[nick].keys()) and not(tcmpl[nick][i] is None): tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
                 else: tcmpl[nick][i]=""
             tcmpl[nick]['depuis']=f"{tcmpl[nick]['depuis']:.2f} h"
