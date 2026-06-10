@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.57 — 2026-06-10
+
+### Résumé : report live toujours via borg (plus de fallback DB)
+
+`report` (sans `-o`) appelle désormais toujours `prep_report()` (borg live), y compris quand Bkp/Restore est en cours. Dans ce cas, `borg info` sera mis en attente du verrou borg plutôt que de tomber en fallback DB. `wait_index_idle` + `set_report_running_lock` stoppent l'indexation avant l'appel borg (inchangé). Alerte uniquement si borg échoue (`errcode=2`) ou si l'âge du dernier backup dépasse `MAX_AGE_BKP` ou si le dépôt est vide (`duree==-1`). La correction de `_msg` → alerte ne s'applique plus qu'à `report_offline` (`-o`), où elle est légitime.
+
 ## 1.0.56 — 2026-06-10
 
 ### Résumé : alerte systématique si aucun backup détectable (-o ou non)

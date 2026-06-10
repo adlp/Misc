@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.56"
+Version="1.0.57"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -2576,16 +2576,14 @@ class BorgHelper:
         reshosto['nom']='Totaux'
         for nick in nicks.split(','):
             cfg=self.borg.cfgreaded(nick,debug=debug)
-            priority_locked=self.db.check_priority_lock(nick)
-            if not priority_locked:
-                self.db.set_report_running_lock(nick)
-                self.db.wait_index_idle(nick,timeout=30)
-            if priority_locked:
-                printer(f"  {nick}: dépôt occupé (Bkp/Restore en cours) — rapport depuis la base uniquement")
+            if self.db.check_priority_lock(nick):
+                printer(f"  {nick}: Bkp/Restore en cours — borg info sera mis en attente du verrou")
+            self.db.set_report_running_lock(nick)
+            self.db.wait_index_idle(nick,timeout=30)
             try:
-                (tcmpl,tbkps)=self.prep_report_from_db(nick,maxp=maxp) if priority_locked else self.prep_report(nick,debug=debug,maxp=maxp)
+                (tcmpl,tbkps)=self.prep_report(nick,debug=debug,maxp=maxp)
             except Exception as e:
-                if not priority_locked: self.db.clear_report_running_lock(nick)
+                self.db.clear_report_running_lock(nick)
                 errcode=2; printer(f"[ERREUR] {nick}: {e}"); err_msg=str(e)[:80]
                 if htrep:
                     errhost.append(nick)
@@ -2593,12 +2591,7 @@ class BorgHelper:
                 else:
                     reshos[nick]={'nom':f"*** ERREUR {nick}",'duree':'—','depuis':'ERREUR','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {err_msg}"}
                 resbck[nick]={}; continue
-            if not priority_locked: self.db.clear_report_running_lock(nick)
-            if '_msg' in tcmpl.get(nick,{}):
-                errcode=1
-                if htrep: errhost.append(nick)
-                reshos[nick]=tcmpl[nick] if htrep else {'nom':f"*** {nick}",'duree':tcmpl[nick]['_msg'],'depuis':'','derniere':'','taille':'','recuperable':'','reste':'','modifications':''}
-                resbck[nick]={}; continue
+            self.db.clear_report_running_lock(nick)
             if tcmpl[nick].get('duree')==-1:
                 # dépôt vide (c==0) : aucune archive borg → alerte systématique
                 errcode=1
