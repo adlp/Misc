@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.55 — 2026-06-10
+
+### Résumé : borg diff --json-lines + streaming stdout + insert pipeline
+
+`borg diff` lancé avec `--json-lines` : sortie JSON structurée par ligne au lieu de texte humain. Nouveau parser `parse_diff_line_json` remplace les regex de `parse_diff_line`. `_run_diff` lit désormais le stdout de borg ligne à ligne (streaming) au lieu d'attendre `communicate()` : la mémoire pic est réduite et le parsing débute dès la première ligne. L'insert SQLite est déplacé dans la boucle `as_completed` (ancienne Phase 3 supprimée) : chaque paire est écrite en DB dès que son diff se termine, sans attendre les paires encore en cours. Même changement appliqué à `listperms`. Sur les gros dépôts, la latence entre fin du dernier diff et données disponibles en DB est quasi nulle.
+
 ## 1.0.54 — 2026-06-10
 
 ### Résumé : suppression des TODO obsolètes
