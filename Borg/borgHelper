@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.59"
+Version="1.0.60"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -1321,6 +1321,28 @@ class BorgHelper:
         if type(details) is list: return details[0]
         return details
 
+    def _vacuum_db(self,db_path,verbose=True):
+        """VACUUM INTO dans le même répertoire que db_path (évite de saturer /tmp).
+        verbose=True : imprime 'compactage en cours/terminé' + hint manuel en cas d'échec.
+        Retourne True si succès, False sinon."""
+        tmp_path=db_path+'.vacuum_tmp'
+        try:
+            conn=sqlite3.connect(db_path,timeout=60)
+            if verbose: printer(f"  compactage en cours...")
+            conn.execute(f"VACUUM INTO '{tmp_path}'")
+            conn.close()
+            os.replace(tmp_path,db_path)
+            if verbose: printer(f"  compactage terminé")
+            return True
+        except sqlite3.Error as ve:
+            try:
+                if os.path.exists(tmp_path): os.unlink(tmp_path)
+            except OSError: pass
+            printer(f"  [WARN] compactage impossible ({ve}) — entrées purgées mais espace non récupéré")
+            if verbose:
+                printer(f"  [WARN] relancer manuellement : sqlite3 '{db_path}' \"VACUUM INTO '{db_path}.tmp'\" && mv '{db_path}.tmp' '{db_path}'")
+            return False
+
     def _cleanup_index_after_prune(self,nick,debug=0):
         if self._nick_noidx(nick): return
         db_path=self.db.get_diff_db(nick)
@@ -1354,17 +1376,7 @@ class BorgHelper:
             conn.commit(); conn.close()
             total=r1+r2+r3+r4
             if total>0: print(f"{nick}: index nettoyé ({r1} diff, {r2} paires, {r3}+{r4} snapshots)")
-            tmp_path=db_path+'.vacuum_tmp'
-            try:
-                conn2=sqlite3.connect(db_path,timeout=60)
-                conn2.execute(f"VACUUM INTO '{tmp_path}'")
-                conn2.close()
-                os.replace(tmp_path,db_path)
-            except sqlite3.Error as ve:
-                try:
-                    if os.path.exists(tmp_path): os.unlink(tmp_path)
-                except OSError: pass
-                printer(f"  [WARN] compactage diff.db impossible ({ve}) — entrées purgées mais espace non récupéré")
+            self._vacuum_db(db_path,verbose=False)
         except sqlite3.Error as e:
             printer(f"SQLite cleanup error ({db_path}): {e}")
             try: conn.close()
@@ -2342,20 +2354,8 @@ class BorgHelper:
                 AND di.archive_new=diff_indexed_pairs.archive_new)
                 WHERE nick=?""",(nick,))
             conn.commit(); conn.close()
-            printer(f"  {nick}: {count:,} entrées supprimées — compactage en cours...")
-            tmp_path=db_path+'.vacuum_tmp'
-            try:
-                conn2=sqlite3.connect(db_path,timeout=60)
-                conn2.execute(f"VACUUM INTO '{tmp_path}'")
-                conn2.close()
-                os.replace(tmp_path,db_path)
-                printer(f"  {nick}: compactage terminé")
-            except sqlite3.Error as ve:
-                try:
-                    if os.path.exists(tmp_path): os.unlink(tmp_path)
-                except OSError: pass
-                printer(f"  [WARN] compactage impossible ({ve}) — entrées supprimées mais espace non récupéré")
-                printer(f"  [WARN] relancer manuellement : sqlite3 '{db_path}' \"VACUUM INTO '{db_path}.tmp'\" && mv '{db_path}.tmp' '{db_path}'")
+            printer(f"  {nick}: {count:,} entrées supprimées")
+            self._vacuum_db(db_path,verbose=True)
         except sqlite3.Error as e:
             printer(f"  SQLite error ({db_path}): {e}")
             try: conn.close()

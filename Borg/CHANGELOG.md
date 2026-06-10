@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.60 — 2026-06-10
+
+### Résumé : factorisation du VACUUM SQLite
+
+Nouvelle méthode `BorgHelper._vacuum_db(db_path, verbose)` : `VACUUM INTO` dans le même répertoire + `os.replace`, `[WARN]` non bloquant en cas d'échec. `verbose=True` (IdxPurge) affiche compactage en cours/terminé + hint manuel ; `verbose=False` (_cleanup_index_after_prune) est silencieux en cas de succès. Les deux anciens blocs dupliqués sont remplacés par un appel à cette méthode.
+
 ## 1.0.59 — 2026-06-10
 
 ### Résumé : VACUUM après prune via VACUUM INTO (évite l'erreur "disk is full")
