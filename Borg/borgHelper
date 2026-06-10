@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.58"
+Version="1.0.59"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -1351,12 +1351,24 @@ class BorgHelper:
                 conn.execute("DELETE FROM diff_excluded_stats WHERE nick=?",(nick,))
                 conn.execute("DELETE FROM snap_excluded_stats WHERE nick=?",(nick,))
             self.db._cleanup_snapshot_file_orphans(nick,conn)
-            conn.commit()
+            conn.commit(); conn.close()
             total=r1+r2+r3+r4
             if total>0: print(f"{nick}: index nettoyé ({r1} diff, {r2} paires, {r3}+{r4} snapshots)")
-            conn.execute("VACUUM"); conn.close()
+            tmp_path=db_path+'.vacuum_tmp'
+            try:
+                conn2=sqlite3.connect(db_path,timeout=60)
+                conn2.execute(f"VACUUM INTO '{tmp_path}'")
+                conn2.close()
+                os.replace(tmp_path,db_path)
+            except sqlite3.Error as ve:
+                try:
+                    if os.path.exists(tmp_path): os.unlink(tmp_path)
+                except OSError: pass
+                printer(f"  [WARN] compactage diff.db impossible ({ve}) — entrées purgées mais espace non récupéré")
         except sqlite3.Error as e:
             printer(f"SQLite cleanup error ({db_path}): {e}")
+            try: conn.close()
+            except: pass
 
     def _find_last_archive_with_file(self,nick,path,debug=0):
         db_path=self.db.get_diff_db(nick)

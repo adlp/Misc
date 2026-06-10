@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.59 — 2026-06-10
+
+### Résumé : VACUUM après prune via VACUUM INTO (évite l'erreur "disk is full")
+
+`_cleanup_index_after_prune` utilisait `VACUUM` qui crée une copie complète en espace temporaire (`/tmp`). Sur les serveurs où `/tmp` est un `tmpfs` plus petit que `diff.db`, cela échouait avec "database or disk is full" même si la partition de données avait de l'espace. Remplacé par `VACUUM INTO db_path.vacuum_tmp` (même répertoire que la DB) + `os.replace`, identique au pattern déjà utilisé par `IdxPurge`. Échec de compactage → `[WARN]` non bloquant, les entrées purgées sont conservées.
+
 ## 1.0.58 — 2026-06-10
 
 ### Résumé : version borgHelper dans les messages d'erreur stderr
