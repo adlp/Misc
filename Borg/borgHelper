@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.46"
+Version="1.0.47"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -569,7 +569,7 @@ class BorgHelperDB:
             try:
                 with open(p) as f: pid=int(f.read().strip())
                 os.kill(pid,0)
-                if waited==0: printer(f"  Index en cours sur ce dépôt — attente libération verrous borg...")
+                if waited==0: printer(f"  {nick}: indexation en cours — report en attente (max {timeout}s)...")
                 time.sleep(1); waited+=1
             except (OSError,ValueError):
                 try: os.unlink(p)

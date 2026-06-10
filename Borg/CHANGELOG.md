@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.47 — 2026-06-10
+
+### Message `wait_index_idle` plus explicite
+
+Inclut le nom du dépôt (nick) et le timeout dans le message affiché quand `report` attend la fin d'une indexation en cours.
+
 ## 1.0.46 — 2026-06-10
 
 ### `report` interrompt l'indexation en cours
