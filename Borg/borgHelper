@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.55"
+Version="1.0.56"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -2518,7 +2518,9 @@ class BorgHelper:
                     reshos[nick]={'nom':f"*** {nick}",'duree':'—','depuis':'—','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {err_msg}"}
                 resbck[nick]={}; continue
             if '_msg' in tcmpl.get(nick,{}):
-                reshos[nick]=tcmpl[nick] if htrep else {'nom':nick,'duree':tcmpl[nick]['_msg'],'depuis':'','derniere':'','taille':'','recuperable':'','reste':'','modifications':''}
+                errcode=1
+                if htrep: errhost.append(nick)
+                reshos[nick]=tcmpl[nick] if htrep else {'nom':f"*** {nick}",'duree':tcmpl[nick]['_msg'],'depuis':'','derniere':'','taille':'','recuperable':'','reste':'','modifications':''}
                 resbck[nick]={}; continue
             maxage=25
             if "MAX_AGE_BKP" in cfg: maxage=float(cfg["MAX_AGE_BKP"])
@@ -2593,8 +2595,21 @@ class BorgHelper:
                 resbck[nick]={}; continue
             if not priority_locked: self.db.clear_report_running_lock(nick)
             if '_msg' in tcmpl.get(nick,{}):
-                reshos[nick]=tcmpl[nick] if htrep else {'nom':nick,'duree':tcmpl[nick]['_msg'],'depuis':'','derniere':'','taille':'','recuperable':'','reste':'','modifications':''}
+                errcode=1
+                if htrep: errhost.append(nick)
+                reshos[nick]=tcmpl[nick] if htrep else {'nom':f"*** {nick}",'duree':tcmpl[nick]['_msg'],'depuis':'','derniere':'','taille':'','recuperable':'','reste':'','modifications':''}
                 resbck[nick]={}; continue
+            if tcmpl[nick].get('duree')==-1:
+                # dépôt vide (c==0) : aucune archive borg → alerte systématique
+                errcode=1
+                if htrep: errhost.append(nick)
+                else: tcmpl[nick]['nom']=f"*** {nick}"
+                tcmpl[nick]['depuis']='—'; tcmpl[nick]['duree']='—'; tcmpl[nick]['derniere']='—'
+                for i in ['taille','recuperable','reste']:
+                    v=tcmpl[nick].get(i)
+                    tcmpl[nick][i]=convert_octets_readable(v) if v is not None else ''
+                tcmpl[nick].setdefault('modifications','—')
+                reshos[nick]=tcmpl[nick]; resbck[nick]={}; continue
             maxage=25
             if "MAX_AGE_BKP" in cfg: maxage=float(cfg["MAX_AGE_BKP"])
             if tcmpl[nick]['depuis']>maxage:

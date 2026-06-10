@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.56 — 2026-06-10
+
+### Résumé : alerte systématique si aucun backup détectable (-o ou non)
+
+`report` et `report_offline` génèrent désormais `errcode=1` + marqueur `***` / `errhost` dans deux cas : (1) `_msg` retourné par `prep_report_from_db` (diff.db absent ou aucune archive indexée) ; (2) dépôt borg vide (`c==0`, `duree==-1`) dans `prep_report` — le `depuis` affiché vaut `—` au lieu de la date de modification du repo, `duree` et `derniere` valent `—`.
+
 ## 1.0.55 — 2026-06-10
 
 ### Résumé : borg diff --json-lines + streaming stdout + insert pipeline
