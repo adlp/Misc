@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.51 — 2026-06-10
+
+### Résumé : message colspan quand archive_stats est vide
+
+Quand `archive_stats` est vide (diff.db absent ou aucune archive indexée), le résumé affiche la commande à exécuter dans une seule cellule qui regroupe toutes les colonnes sauf `nom` — au lieu de lever une exception. En HTML : `colspan=100` sur la cellule message. En terminal : message dans la colonne `duree`. `prep_report_from_db` retourne un dict `_msg` au lieu de lever une exception ; `htmlTabelise` gère le rendu colspan.
+
 ## 1.0.50 — 2026-06-10
 
 ### Suppression colonne `moy` du résumé

@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.50"
+Version="1.0.51"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -193,6 +193,11 @@ def htmlTabelise(tabl,border=0,colnames=None,errhost=[]):
     blue=0; listy=len(tabl.keys())
     for y in tabl.keys():
         ret+='  <tr>\n'; listy-=1; concol=0; colstyl=""
+        if '_msg' in tabl[y]:
+            nom_val=tabl[y].get('nom',y)
+            ret+=f"    <td colspan=1>{nom_val}</td><td style='width:20px;'></td>\n"
+            ret+=f"    <td colspan=100 style='text-align:left;font-style:italic;color:#888;'>{tabl[y]['_msg']}</td>\n"
+            ret+='  </tr>\n'; blue=0 if blue else 1; continue
         for x in colnames:
             val=""
             if concol: colstyl='text-align:right;'
@@ -2320,7 +2325,7 @@ class BorgHelper:
         """Comme prep_report() mais lit uniquement l'index SQLite — utilisé quand le dépôt est occupé."""
         db_path=self.db.get_diff_db(nick)
         if not os.path.exists(db_path):
-            raise Exception(f"diff.db absent — lancez borgHelper -c Index -n {nick}")
+            return {nick:{'nom':nick,'_msg':f"diff.db absent — lancez : borgHelper -c Index -n {nick}"}},{}
         self.db.ensure_diff_db(db_path)
         try:
             conn=sqlite3.connect(db_path)
@@ -2329,7 +2334,7 @@ class BorgHelper:
         except sqlite3.Error as e:
             raise Exception(f"SQLite error ({db_path}): {e}")
         if not rows:
-            raise Exception(f"archive_stats vide — lancez borgHelper -c Index -n {nick}")
+            return {nick:{'nom':nick,'_msg':f"Aucune archive indexée — lancez : borgHelper -c Index -n {nick}"}},{}
         diff_stats=self.db._diff_stats_for_nick(nick)
         def _fmt_stats(s,nf,total_sz=0,summary=False):
             na,nr,nm=s['added'],s['removed'],s['modified']
@@ -2487,6 +2492,9 @@ class BorgHelper:
                 else:
                     reshos[nick]={'nom':f"*** {nick}",'duree':'—','depuis':'—','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {err_msg}"}
                 resbck[nick]={}; continue
+            if '_msg' in tcmpl.get(nick,{}):
+                reshos[nick]=tcmpl[nick] if htrep else {'nom':nick,'duree':tcmpl[nick]['_msg'],'depuis':'','derniere':'','taille':'','recuperable':'','reste':'','modifications':''}
+                resbck[nick]={}; continue
             maxage=25
             if "MAX_AGE_BKP" in cfg: maxage=float(cfg["MAX_AGE_BKP"])
             if tcmpl[nick]['depuis']>maxage:
@@ -2559,6 +2567,9 @@ class BorgHelper:
                     reshos[nick]={'nom':f"*** ERREUR {nick}",'duree':'—','depuis':'ERREUR','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {err_msg}"}
                 resbck[nick]={}; continue
             if not priority_locked: self.db.clear_report_running_lock(nick)
+            if '_msg' in tcmpl.get(nick,{}):
+                reshos[nick]=tcmpl[nick] if htrep else {'nom':nick,'duree':tcmpl[nick]['_msg'],'depuis':'','derniere':'','taille':'','recuperable':'','reste':'','modifications':''}
+                resbck[nick]={}; continue
             maxage=25
             if "MAX_AGE_BKP" in cfg: maxage=float(cfg["MAX_AGE_BKP"])
             if tcmpl[nick]['depuis']>maxage:
