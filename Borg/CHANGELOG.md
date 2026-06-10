@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.53 — 2026-06-10
+
+### Résumé : version borgHelper dans tous les stdout JSON
+
+Tous les outputs JSON stdout incluent désormais la clé `borghelper_version` (valeur : string X.Y.Z). Concerne : `backup` (stdout borg create), `report`/`report_offline` (clé `-j`), et les commandes `DiffIndex`/`SnapIndex` en mode JSON (`-J`).
+
 ## 1.0.52 — 2026-06-10
 
 ### Résumé : réindexation ciblée sur une archive spécifique (`-A`)

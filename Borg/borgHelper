@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.52"
+Version="1.0.53"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -276,7 +276,7 @@ def _duidx_print(totals,label,grouped,sort_by='chemin',reverse=False,as_json=Fal
                 totcol[ck][0]+=cnt; totcol[ck][1]+=sz
             rows_data.append(entry)
         if as_json:
-            out={'pattern':label,'rows':rows_data,
+            out={'borghelper_version':Version,'pattern':label,'rows':rows_data,
                  'total':{cn:{'nb':totcol[ck][0],'taille':totcol[ck][1]} for ck,cn in zip(_DUIDX_COL_KEYS,_DUIDX_COL_NAMES)}}
             print(json.dumps(out,ensure_ascii=False,indent=2)); return
         from prettytable import PrettyTable
@@ -293,7 +293,7 @@ def _duidx_print(totals,label,grouped,sort_by='chemin',reverse=False,as_json=Fal
         for (pk,ct),(cnt,sz) in sorted(totals.items(),key=lambda x:(order.index(x[0][1]) if x[0][1] in order else 99)):
             rows_data.append({'type':ct,'nb':cnt,'taille':sz})
         if as_json:
-            out={'pattern':label,'rows':rows_data,
+            out={'borghelper_version':Version,'pattern':label,'rows':rows_data,
                  'total':{'nb':sum(r['nb'] for r in rows_data),'taille':sum(r['taille'] for r in rows_data)}}
             print(json.dumps(out,ensure_ascii=False,indent=2)); return
         from prettytable import PrettyTable
@@ -1691,6 +1691,7 @@ class BorgHelper:
                         newretC=2; break
             if 'stdout' in anaRet.keys() and len(anaRet['stdout']):
                 out=dict(anaRet['stdout'][0])
+                out['borghelper_version']=Version
                 if newretC==0:
                     all_entries=_bkp_parse_list(anaRet.get('stderr',[]))
                     counts={}
@@ -2535,7 +2536,7 @@ class BorgHelper:
             if maxp is not None: disp=maxp
             resshortbck[nick]=filtrer_lignes(resbck[nick],disp)
         if as_json:
-            print(json.dumps({'summary':reshos,'backups':resbck},ensure_ascii=False,indent=2))
+            print(json.dumps({'borghelper_version':Version,'summary':reshos,'backups':resbck},ensure_ascii=False,indent=2))
         elif htrep:
             print("<!DOCTYPE html>\n<html>\n  <body bgcolor=\"#ffffff\">\n    <br>")
             print(htmlTabelise(reshos,colnames=['nom','duree','depuis','derniere','taille','recuperable','reste','modifications'],errhost=errhost))
@@ -2610,7 +2611,7 @@ class BorgHelper:
             if maxp is not None: disp=maxp
             resshortbck[nick]=filtrer_lignes(resbck[nick],disp)
         if as_json:
-            print(json.dumps({'summary':reshos,'backups':resbck},ensure_ascii=False,indent=2))
+            print(json.dumps({'borghelper_version':Version,'summary':reshos,'backups':resbck},ensure_ascii=False,indent=2))
         elif htrep:
             print("<!DOCTYPE html>\n<html>\n  <body bgcolor=\"#ffffff\">\n    <br>")
             print(htmlTabelise(reshos,colnames=['nom','duree','depuis','derniere','taille','recuperable','reste','modifications'],errhost=errhost))
