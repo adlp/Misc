@@ -1,5 +1,15 @@
 # Changelog — borgHelper
 
+## 1.0.48 — 2026-06-10
+
+### Correction `%B` toujours 0 dans le rapport
+
+`backup()` stockait les entrées post-backup depuis `_bkp_parse_list` (tailles toutes NULL) et marquait la paire comme indexée dans `diff_indexed_pairs`. `index()` voyait la paire déjà indexée et la sautait → les tailles restaient NULL → `0%B` permanent.
+
+Fix : ajout de `diff_pair_has_sizes()` dans `BorgHelperDB`. Dans la phase 1 de `index()`, si une paire est déjà indexée mais sans tailles (post-backup), elle est ajoutée à `pairs_to_purge` et re-indexée via `borg diff` — qui fournit les vraies tailles. Sans changement de schéma DB.
+
+Cas particuliers : `entry_count=0` (aucun changement) et paires avec uniquement des entrées `C/B/T` (sans taille par nature) sont correctement traités comme "avec tailles" pour éviter une boucle de re-indexation.
+
 ## 1.0.47 — 2026-06-10
 
 ### Message `wait_index_idle` plus explicite

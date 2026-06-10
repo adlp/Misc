@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.47"
+Version="1.0.48"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -791,6 +791,21 @@ class BorgHelperDB:
             cur=conn.cursor()
             cur.execute("SELECT 1 FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=? LIMIT 1",(nick,archive_old,archive_new))
             result=cur.fetchone(); conn.close(); return result is not None
+        except sqlite3.Error: return False
+
+    def diff_pair_has_sizes(self,nick,archive_old,archive_new,db_path=None):
+        """True si la paire indexée contient des tailles (borg diff), False si stockée sans tailles (backup list)."""
+        if db_path is None: db_path=self.get_diff_db(nick)
+        try:
+            conn=sqlite3.connect(db_path)
+            row=conn.execute("SELECT entry_count FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=? LIMIT 1",(nick,archive_old,archive_new)).fetchone()
+            if row is None: conn.close(); return False
+            if row[0]==0: conn.close(); return True  # aucun changement → pas de taille à vérifier
+            # S'il n'y a que des entrées C/B/T (sans taille par nature), considère comme "avec tailles"
+            has_content=conn.execute("SELECT 1 FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=? AND change_type IN ('added','removed','modified') LIMIT 1",(nick,archive_old,archive_new)).fetchone()
+            if not has_content: conn.close(); return True
+            has_sz=conn.execute("SELECT 1 FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=? AND (size_after IS NOT NULL OR size_before IS NOT NULL) LIMIT 1",(nick,archive_old,archive_new)).fetchone()
+            conn.close(); return has_sz is not None
         except sqlite3.Error: return False
 
     def _with_lock_retry(self,fn,max_wait=300):
@@ -1822,8 +1837,10 @@ class BorgHelper:
         for i in range(len(archives)-1):
             a_old=archives[i]['name']; a_new=archives[i+1]['name']; date_new=archives[i+1]['start']
             already=self.db.is_diff_pair_indexed(nick,a_old,a_new,db_path)
-            if already and not force: skipped+=1; continue
-            if already and force: pairs_to_purge.append((a_old,a_new))
+            if already and not force:
+                if self.db.diff_pair_has_sizes(nick,a_old,a_new,db_path): skipped+=1; continue
+                pairs_to_purge.append((a_old,a_new))  # indexé sans tailles (post-backup) → re-indexer
+            elif already and force: pairs_to_purge.append((a_old,a_new))
             pairs_todo.append((a_old,a_new,date_new))
         if pairs_to_purge:
             try:
