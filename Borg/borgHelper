@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.48"
+Version="1.0.49"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -2333,9 +2333,10 @@ class BorgHelper:
         diff_stats=self.db._diff_stats_for_nick(nick)
         def _fmt_stats(s,nf,total_sz=0,summary=False):
             na,nr,nm=s['added'],s['removed'],s['modified']
-            prev_nf=nf-na+nr; prev_sz=total_sz-s['added_sz']+s['removed_sz']
+            prev_nf=nf-na+nr
             pn_modif=f"{100*(nm+nr)//prev_nf}%nb" if prev_nf>0 else "—"
-            ps_modif=f"{100*(s['modified_sz']+s['removed_sz'])//prev_sz}%B" if prev_sz>0 else "—"
+            total_changed_sz=s['added_sz']+s['modified_sz']+s['removed_sz']
+            ps_modif=convert_octets_readable(total_changed_sz) if total_changed_sz>0 else "—"
             return {'modifications':f"{pn_modif} / {ps_modif}"}
         kept={}
         for archive,arch_date,duration,orig,compr,dedup,nfiles in rows:
@@ -2449,9 +2450,10 @@ class BorgHelper:
         diff_stats=self.db._diff_stats_for_nick(nick)
         def _fmt_stats(s,nf,total_sz=0,summary=False):
             na,nr,nm=s['added'],s['removed'],s['modified']
-            prev_nf=nf-na+nr; prev_sz=total_sz-s['added_sz']+s['removed_sz']
+            prev_nf=nf-na+nr
             pn_modif=f"{100*(nm+nr)//prev_nf}%nb" if prev_nf>0 else "—"
-            ps_modif=f"{100*(s['modified_sz']+s['removed_sz'])//prev_sz}%B" if prev_sz>0 else "—"
+            total_changed_sz=s['added_sz']+s['modified_sz']+s['removed_sz']
+            ps_modif=convert_octets_readable(total_changed_sz) if total_changed_sz>0 else "—"
             return {'modifications':f"{pn_modif} / {ps_modif}"}
         last_arch=resume.get('lastname','')
         s_last=diff_stats.get(last_arch) if last_arch else None

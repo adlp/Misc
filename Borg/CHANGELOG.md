@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.49 — 2026-06-10
+
+### `modifications` : espace disque en valeur absolue lisible
+
+Remplace `YY%B` (pourcentage entier, toujours 0 avant fix des tailles) par la somme des tailles absolues des fichiers ajoutés + modifiés + supprimés, affichée en format lisible (`convert_octets_readable`). Exemple : `24%nb / 1.37 GB`. Affiche `—` si aucune donnée de taille disponible.
+
 ## 1.0.48 — 2026-06-10
 
 ### Correction `%B` toujours 0 dans le rapport
