@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.52 — 2026-06-10
+
+### Résumé : réindexation ciblée sur une archive spécifique (`-A`)
+
+Nouvelle option `-A <archive>` pour `borgHelper -c Index` : réindexe uniquement la paire dont `archive_new` correspond à l'archive donnée, sans toucher aux autres paires. Utile pour forcer la réindexation d'un backup précis (ex : `12%nb / —` qui indique des tailles manquantes). Implémenté via `target_archive=None` dans `index()`.
+
 ## 1.0.51 — 2026-06-10
 
 ### Résumé : message colspan quand archive_stats est vide

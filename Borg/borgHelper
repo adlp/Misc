@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.51"
+Version="1.0.52"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -343,10 +343,11 @@ def usage(doc=None,debug=0):
         printer("⚗️ ⚡️-c Prune [-n nickname/servername/ALL]")
         printer("      ⚡️ On delete les vieux backup sur le repo ⚡️ DANGER")
         printer("      Purge automatique du diff.db (archives supprimées)")
-        printer("   -c Index [-n nickname/servername/ALL] [-F] [-S]")
+        printer("   -c Index [-n nickname/servername/ALL] [-F] [-S] [-A archive]")
         printer("       Indexe les diffs entre archives consécutives + snapshot de la dernière archive")
         printer("       Parallèle par défaut (IDX_WORKERS=4 dans borghelperrc)")
         printer("       -F : force la réindexation  |  -S : snapshot seul (sans recalculer les diffs)")
+        printer("       -A <archive> : réindexe uniquement la paire dont archive_new=<archive>")
         printer("   -c Search -f <pattern> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive]")
         printer("       Cherche dans l'index des diffs par nom de fichier (glob * et ?)")
         printer("       -b : depuis archive X  |  -B : jusqu'à archive Y  |  -b ALL : tout l'index")
@@ -417,9 +418,10 @@ def usage(doc=None,debug=0):
         printer('   -c Init [-n nickname/servername]')
         printer('      Initialise un nouveau dépôt borg (chiffrement repokey)')
     elif doc=='index':
-        printer("   -c Index [-n nickname/servername/ALL] [-F] [-S]")
+        printer("   -c Index [-n nickname/servername/ALL] [-F] [-S] [-A archive]")
         printer("       Indexe les diffs entre archives consécutives (incrémental, parallèle)")
         printer("       -F : force la réindexation  -S : snapshot seul")
+        printer("       -A <archive> : réindexe uniquement la paire dont archive_new=<archive>")
         printer("       IDX_WORKERS dans borghelperrc : nb de borg diff parallèles (défaut 4)")
     elif doc=='search':
         printer("   -c Search -f <pattern> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive]")
@@ -1823,7 +1825,7 @@ class BorgHelper:
             print(f"{nick}: {len(files)} fichiers dans le snapshot {archive_name}")
         return 0
 
-    def index(self,nick,debug=0,db_path=None,force=False):
+    def index(self,nick,debug=0,db_path=None,force=False,target_archive=None):
         if self._nick_noidx(nick):
             printer(f"{nick}: indexation désactivée (NOIDX=1)"); return 0
         if db_path is None: db_path=self.db.get_diff_db(nick)
@@ -1841,6 +1843,10 @@ class BorgHelper:
         pairs_todo=[]; skipped=0; pairs_to_purge=[]
         for i in range(len(archives)-1):
             a_old=archives[i]['name']; a_new=archives[i+1]['name']; date_new=archives[i+1]['start']
+            if target_archive is not None:
+                if a_new!=target_archive: skipped+=1; continue
+                pairs_to_purge.append((a_old,a_new))
+                pairs_todo.append((a_old,a_new,date_new)); continue
             already=self.db.is_diff_pair_indexed(nick,a_old,a_new,db_path)
             if already and not force:
                 if self.db.diff_pair_has_sizes(nick,a_old,a_new,db_path): skipped+=1; continue
@@ -2748,10 +2754,10 @@ def _cli_main():
     elif cmd=='cacheclean':
         bh.cache_clean(nick,debug=debug)
     elif cmd=='index':
-        _force='-F' in options; _snaponly='-S' in options
+        _force='-F' in options; _snaponly='-S' in options; _target=options.get('-A',None)
         for n in nick.split(','):
             if _snaponly: bh.indexsnap(n,debug=debug,force=_force)
-            else: bh.index(n,debug=debug,force=_force)
+            else: bh.index(n,debug=debug,force=_force,target_archive=_target)
     elif cmd=='search':
         if '-f' not in options: usage(cmd)
         bh.search(nick,options['-f'],archive_from=options.get('-b',None),archive_to=options.get('-B',None),debug=debug)
