@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.61 — 2026-06-10
+
+### Bugfix : option `-A` de la commande `index` non reconnue
+
+`-A` absent du string `getopt` (`A:` ajouté) et de `optab['index']` (`A` ajouté). L'option était parsée nulle part — `getopt` levait une erreur avant même d'atteindre le dispatch.
+
 ## 1.0.60 — 2026-06-10
 
 ### Résumé : factorisation du VACUUM SQLite

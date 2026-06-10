@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.60"
+Version="1.0.61"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -2676,7 +2676,7 @@ def _cli_main():
         sentry_sdk.init(dsn=sentryid,environment="production",release=f"borgHelper@{Version}",traces_sample_rate=1.0)
 
     try:
-        opts,args=getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:dvjlILCFSN:ox:D",["help"])
+        opts,args=getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILCFSN:ox:D",["help"])
     except getopt.GetoptError as err:
         print(err); usage(); sys.exit(2)
     if args:
@@ -2699,7 +2699,7 @@ def _cli_main():
     optab={'stats':'Ccdn','login':'Ccdsnkprm','mount':'Ccdnb','umount':'Ccdn',
            'lstbkp':'Ccdn','lstbkpfls':'Ccdnb','restore':'CcdnbfwWL','diffbkp':'Ccdnbw',
            'delbkp':'Ccdnb','bkp':'CcdnI','prune':'Ccdn','report':'CcdnlNjo',
-           'init':'Ccdn','key':'Ccdn','index':'CcdnFS','search':'CcdnfbB',
+           'init':'Ccdn','key':'Ccdn','index':'CcdnFSA','search':'CcdnfbB',
            'filehist':'CcdnfbB','cacheinfo':'Ccdn','cacheclean':'Ccdn','duidx':'CcdnfbBsj',
            'idxtop':'CcdnNp','difftop':'CcdnNpb','idxpurge':'CcdnxD'}
 
