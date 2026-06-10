@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.45"
+Version="1.0.46"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -492,6 +492,35 @@ class BorgHelperDB:
     def check_priority_lock(self,nick):
         """True si un processus prioritaire (Bkp/Restore) tient le lock et est encore vivant."""
         p=self._priority_lock_path(nick)
+        if not os.path.exists(p): return False
+        try:
+            with open(p) as f: pid=int(f.read().strip())
+            if pid==os.getpid(): return False
+            os.kill(pid,0); return True
+        except (OSError,ValueError):
+            try: os.unlink(p)
+            except OSError: pass
+            return False
+
+    def _report_running_lock_path(self,nick):
+        cfg=self._cfg_reader(nick) if self._cfg_reader else None
+        if cfg and 'BORG_REPO' in cfg:
+            repo_key=re.sub(r'[^a-zA-Z0-9_-]','_',cfg['BORG_REPO'])
+        else:
+            repo_key=self.get_db_nick(nick)
+        return os.path.join(self.cache_dir,f"{self.db_prefix}-{repo_key}-report-running.lock")
+
+    def set_report_running_lock(self,nick):
+        try:
+            with open(self._report_running_lock_path(nick),'w') as f: f.write(str(os.getpid()))
+        except OSError: pass
+
+    def clear_report_running_lock(self,nick):
+        try: os.unlink(self._report_running_lock_path(nick))
+        except OSError: pass
+
+    def check_report_running(self,nick):
+        p=self._report_running_lock_path(nick)
         if not os.path.exists(p): return False
         try:
             with open(p) as f: pid=int(f.read().strip())
@@ -1846,8 +1875,8 @@ class BorgHelper:
                     futs={ex.submit(_run_diff,p):p for p in pairs_todo}
                     def _priority_monitor():
                         while not interrupted_event.is_set():
-                            if self.db.check_priority_lock(nick):
-                                printer(f"  {nick}: opération prioritaire (Bkp/Restore) détectée — arrêt des diffs en cours")
+                            if self.db.check_priority_lock(nick) or self.db.check_report_running(nick):
+                                printer(f"  {nick}: opération prioritaire (Bkp/Restore/Report) détectée — arrêt des diffs en cours")
                                 interrupted_event.set()
                                 for f in list(futs):
                                     if not f.done(): f.cancel()
@@ -2495,11 +2524,16 @@ class BorgHelper:
         reshosto['nom']='Totaux'
         for nick in nicks.split(','):
             cfg=self.borg.cfgreaded(nick,debug=debug)
-            locked=self.db.check_priority_lock(nick) or self.db.check_index_running(nick)
-            if locked: printer(f"  {nick}: dépôt occupé (Bkp/Index en cours) — rapport depuis la base uniquement")
+            priority_locked=self.db.check_priority_lock(nick)
+            if not priority_locked:
+                self.db.set_report_running_lock(nick)
+                self.db.wait_index_idle(nick,timeout=30)
+            if priority_locked:
+                printer(f"  {nick}: dépôt occupé (Bkp/Restore en cours) — rapport depuis la base uniquement")
             try:
-                (tcmpl,tbkps)=self.prep_report_from_db(nick,maxp=maxp) if locked else self.prep_report(nick,debug=debug,maxp=maxp)
+                (tcmpl,tbkps)=self.prep_report_from_db(nick,maxp=maxp) if priority_locked else self.prep_report(nick,debug=debug,maxp=maxp)
             except Exception as e:
+                if not priority_locked: self.db.clear_report_running_lock(nick)
                 errcode=2; printer(f"[ERREUR] {nick}: {e}"); err_msg=str(e)[:80]
                 if htrep:
                     errhost.append(nick)
@@ -2507,6 +2541,7 @@ class BorgHelper:
                 else:
                     reshos[nick]={'nom':f"*** ERREUR {nick}",'duree':'—','depuis':'ERREUR','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {err_msg}"}
                 resbck[nick]={}; continue
+            if not priority_locked: self.db.clear_report_running_lock(nick)
             maxage=25
             if "MAX_AGE_BKP" in cfg: maxage=float(cfg["MAX_AGE_BKP"])
             if tcmpl[nick]['depuis']>maxage:

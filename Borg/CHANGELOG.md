@@ -1,5 +1,13 @@
 # Changelog — borgHelper
 
+## 1.0.46 — 2026-06-10
+
+### `report` interrompt l'indexation en cours
+
+`report` (sans `-o`) pose un verrou `report-running.lock` avant d'appeler borg, ce qui déclenche l'arrêt du `_priority_monitor` dans `index` (comme pour Bkp/Restore). Puis attend `wait_index_idle` (max 30 s) que les `borg diff` en cours libèrent le dépôt avant de lancer `prep_report` en live. Résultat : le rapport obtient toujours les données fraîches du backup le plus récent, même si une indexation parallèle était en cours.
+
+Seul cas de fallback sur la DB conservé : quand un Bkp/Restore tient le `priority.lock`.
+
 ## 1.0.45 — 2026-06-09
 
 ### Parsing stderr ligne par ligne dans `boex`
