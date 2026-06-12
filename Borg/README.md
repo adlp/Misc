@@ -185,7 +185,10 @@ Code retour 0 si succès ou warnings, 2 si erreur borg.
 
 > `-I` désactive `--list`, toute écriture SQLite et l'appel automatique à `Index` — utile si l'indexation est gérée séparément.
 
-> **Priorité sur Index :** `Bkp` pose un lock sur le dépôt borg (`BORG_REPO`). Si `Index` tourne en parallèle sur n'importe quel nick pointant le même dépôt, les `borg diff` en cours reçoivent un SIGTERM et s'arrêtent en quelques secondes. `Bkp` attend la libération du verrou borg puis lance `borg create`.
+> **Priorité sur Index :** `Bkp` est prioritaire sur `Index` à tout moment — même si `Index` est en cours à n'importe quelle étape :
+> - Si `Index` démarre alors que `Bkp` est déjà actif → annulation immédiate avant même le premier `borg diff`.
+> - Si `Bkp` démarre pendant un `Index` → les `borg diff` actifs reçoivent SIGKILL, `Index` s'arrête complètement (borg info et indexsnap inclus).
+> - Dans les deux cas, `Index` pose un flag de reprise (`index-pending.lock`) : `Bkp` le détecte en fin d'exécution et relance automatiquement `Index` complet.
 
 **Sortie stdout (JSON)** — si exit 0, le JSON borg est enrichi de deux clefs borgHelper :
 
@@ -241,7 +244,7 @@ borgHelper -c Report -n ALL -o -N 10       # offline + 10 dernières archives
 Code retour 1 si un dépôt dépasse `MAX_AGE_BKP` heures depuis la dernière sauvegarde.  
 Code retour 2 si un dépôt est inaccessible.
 
-**Variation de taille** — colonne `size_delta` : pourcentage de variation de `original_size` par rapport à l'archive précédente (`+11%`, `-5%`, `—` pour la première). `original_size` est stable dans le temps (indépendant de la déduplication inter-archives).
+**Variation de taille** — colonne `size_delta` : pourcentage de variation de `original_size` par rapport à l'archive précédente (`+11%`, `-5%`, `—` pour la première). `original_size` est stable dans le temps (indépendant de la déduplication inter-archives). Dans le résumé (ligne par hôte), ce delta de la dernière archive est aussi affiché entre parenthèses dans la colonne `derniere` — ex. `1.37 GB (+11%)`.
 
 **Statistiques de mouvement** (si l'index SQLite est disponible) — colonne `modifications` :
 
@@ -407,7 +410,7 @@ Types d'événements : `added`, `removed`, `modified`, `C` (permissions), `B` (l
 
 Le snapshot (`-S`) est **incrémental par défaut** : si un snapshot précédent et le diff correspondant existent, seules les entrées `added/removed/modified` sont appliquées par SQL, et `borg list` est appelé uniquement sur les fichiers ajoutés (pour leur mtime). Fallback vers `borg list` complet si : pas de snapshot précédent, diff absent, > 5 000 ajouts, ou erreur borg. `-F` force le `borg list` complet.
 
-> **Interruptible :** si `Bkp` ou `Restore` démarre pendant `Index`, l'indexation s'arrête proprement après les diffs en cours et affiche le nombre de paires restantes. Relancer `Index` reprend là où c'était arrêté (incrémental).
+> **Interruptible et reprise automatique :** si `Bkp` ou `Restore` démarre pendant `Index`, l'indexation s'arrête immédiatement (diffs tués + borg info + indexsnap annulés). `Index` pose un flag de reprise ; `Bkp` le détecte à la fin de son exécution et relance automatiquement `Index` complet. Les paires déjà indexées sont sautées (incrémental).
 
 ---
 

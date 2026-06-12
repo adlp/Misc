@@ -28,6 +28,7 @@ borgHelper est structuré en trois couches :
 | `~/.cache/borghelper/<conf>-<nick>-diff.db` | Index des diffs, snapshots et stats d'archives (SQLite) |
 | `~/.cache/borghelper/<conf>-<repo_sanitisé>-priority.lock` | Lock PID posé par `Bkp`/`Restore` — signal d'interruption pour `Index` sur le même dépôt |
 | `~/.cache/borghelper/<conf>-<repo_sanitisé>-index-running.lock` | Lock PID posé par `Index` pendant Phase 2 — `Bkp`/`Restore` attendent sa disparition avant `borg create`/`borg extract` |
+| `~/.cache/borghelper/<conf>-<nick>-index-pending.lock` | Flag (vide) posé par `Index` quand interrompu par `Bkp`/`Restore` — `Bkp` le détecte en fin d'exécution et relance `Index` complet automatiquement |
 
 - `<conf>` = basename sanitisé du fichier de configuration (ex : `borghelperrc` pour `~/.borghelperrc`)
 - `<nick>` = identifiant du dépôt (ou valeur de `DB_NAME` si définie dans la section) — un fichier par dépôt
@@ -259,7 +260,13 @@ filtre IDX_INCLUDE/IDX_EXCLUDE par fichier (en RAM)
 store_archive_stats(nick, archive_new, ...)              → archive_stats
 indexsnap(nick)                                          → voir flux IndexSnap ci-dessous
     ↓
-finally: clear_priority_lock(nick)                       → supprime le lock
+clear_priority_lock(nick)                                → priority.lock supprimé (Bkp terminé)
+    ↓
+index(nick, target_archive=archive_new, set_pending=False) → borg diff pour remplir les tailles
+    ↓
+si index-pending.lock présent → clear + index(nick, set_pending=False)  ← reprise Index externe interrompu
+    ↓
+finally: clear_priority_lock(nick)                       → no-op (déjà supprimé)
 ```
 
 ### `Index` (indexation manuelle, parallèle)
@@ -399,7 +406,7 @@ IDX_EXCLUDE = */.git/* */.git
 
 ## Priorité Bkp/Restore sur Index
 
-`Bkp` et `Restore` sont prioritaires sur `Index` — si une indexation tourne en parallèle sur le même dépôt, elle s'interrompt proprement.
+`Bkp` et `Restore` sont prioritaires sur `Index` à tout moment — quelle que soit l'étape en cours.
 
 ### Mécanisme — lock PID
 
@@ -412,7 +419,7 @@ set_priority_lock(nick)    → <repo>-priority.lock (PID)  ← signal à Index d
     ↓
 wait_index_idle(nick)      → poll 1s jusqu'à 120s
     ├── <repo>-index-running.lock absent / PID mort → continue
-    └── PID vivant → attente... (Index en cours de terminer ses diffs actifs)
+    └── PID vivant → attente... (Index en cours de s'arrêter)
     ↓
 opération borg (create / extract)   ← plus de conflit de verrou borg
     ↓
@@ -420,7 +427,11 @@ finally: clear_priority_lock(nick)  → supprime priority.lock
 ```
 
 ```
-Index Phase 2
+Index — démarrage
+    ↓
+check_priority_lock(nick)
+    ├── True (Bkp/Restore déjà actif) → set_index_pending_lock() + annulation immédiate
+    └── False → continue
     ↓
 set_index_running_lock(nick)  → <repo>-index-running.lock (PID)
     ↓
@@ -432,7 +443,6 @@ ThreadPoolExecutor — borg diff en parallèle (Popen direct, running_procs dict
                                  ps.kill() (SIGKILL) sur chaque Popen actif
                                  poll running_procs jusqu'à vide (zombies reapés, PIDs disparus)
                                  borg break-lock <BORG_REPO> → supprime les stale lock files
-                                 retour en ≤ 0.5 s quelle que soit la charge
     as_completed() collecte les résultats (CancelledError ignoré)
     ↓
 finally: interrupted_event.set() → arrête le moniteur
@@ -440,12 +450,15 @@ finally: interrupted_event.set() → arrête le moniteur
          clear_index_running_lock(nick)  → <repo>-index-running.lock supprimé
          ← Bkp/Restore débloqué ici (wait_index_idle retourne)
     ↓
-Phase 3 : commit des résultats (paires annulées/terminées non commitées → reprises au prochain Index)
+si interrupted_event.is_set() → set_index_pending_lock() + return 1
+                                 ← borg info et indexsnap sont sautés
 ```
 
-### Reprise transparente
+### Reprise automatique après Bkp
 
-`Index` est incrémental : `diff_indexed_pairs` garde la sentinelle de chaque paire indexée. Après interruption, relancer `Index` saute les paires déjà traitées et reprend les suivantes.
+Quand `Index` est interrompu (early-exit ou mid-run), `index-pending.lock` est posé. `Bkp` le détecte en fin d'exécution (après son `index` ciblé) et relance automatiquement un `Index` complet (`set_pending=False` pour éviter toute boucle récursive).
+
+`Index` est incrémental : `diff_indexed_pairs` garde la sentinelle de chaque paire indexée. La reprise saute les paires déjà traitées et n'indexe que les suivantes.
 
 ---
 

@@ -515,9 +515,9 @@ sys.exit(0)
 
 | Méthode | Description |
 |---------|-------------|
-| `backup(nick, no_index, debug)` | Lance `borg create` + indexation |
+| `backup(nick, no_index, debug)` | Lance `borg create` + indexation automatique (indexsnap + index ciblé sur la nouvelle archive) ; si un `Index` externe avait été interrompu, le relance en fin d'exécution |
 | `prune(nick, dryrun, debug)` | `borg prune` + compact + nettoyage index |
-| `index(nick, debug, db_path, force)` | Indexe les diffs, parallèle |
+| `index(nick, debug, db_path, force, target_archive, set_pending)` | Indexe les diffs, parallèle ; `target_archive` restreint à une paire ; `set_pending=True` (défaut) pose `index-pending.lock` si interrompu par priorité — mettre `False` pour les appels internes |
 | `indexsnap(nick, debug, db_path, force)` | Snapshot de la dernière archive — incrémental par défaut (force=True pour `borg list` complet) ; purge auto des snapshots anciens (IDX_SNAP_KEEP) |
 | `report(nicks, htrep, debug, maxp, as_json)` | Rapport avec appels borg |
 | `report_offline(nicks, htrep, debug, maxp, as_json)` | Rapport depuis diff.db uniquement — même résumé que `report`, toutes machines affichées même sans index |
@@ -560,3 +560,6 @@ sys.exit(0)
 | `clear_index_running_lock(nick)` | Supprime le lock "Index actif" |
 | `check_index_running(nick)` | `True` si un Index vivant tient le running lock (stale → auto-supprimé) |
 | `wait_index_idle(nick, timeout=120)` | Attend jusqu'à `timeout` s que `Index` libère ses verrous borg |
+| `set_index_pending_lock(nick)` | Pose le flag de reprise — appelé par `Index` quand interrompu par priorité (`set_pending=True`) |
+| `clear_index_pending_lock(nick)` | Supprime le flag de reprise |
+| `check_index_pending_lock(nick)` | `True` si un `Index` interrompu attend d'être repris |
