@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.73 — 2026-06-12
+
+### Report résumé : `size_delta` de la dernière sauvegarde dans `modifications`
+
+La colonne `modifications` du résumé (ligne par hôte) affiche maintenant le `size_delta` de la dernière archive entre parenthèses — ex. `3%nb / 1.37 GB (+11%)`. Absent (`—`) si c'est la première archive ou si le delta est nul. Implémenté dans `prep_report` et `prep_report_from_db`.
+
 ## 1.0.72 — 2026-06-12
 
 ### `Index` interrompu par `bkp` : reprise automatique après le backup
