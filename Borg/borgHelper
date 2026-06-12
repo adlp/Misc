@@ -14,40 +14,6 @@ DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
 class SchemaVersionError(Exception): pass
-# 1.0.19 DiffTop : top N arborescences par changements sur une paire d'archives
-# 1.0.18 IdxTop : fix get_prefix — chemins sans / initial non tronqués à la profondeur demandée
-# 1.0.17 IdxPurge : VACUUM INTO même répertoire (évite /tmp saturé), fallback avec message si échec
-# 1.0.16 IdxPurge : PRAGMA incremental_vacuum au lieu de VACUUM (pas de copie, disque non plein requis)
-# 1.0.15 IdxPurge : sans -x → lit IDX_EXCLUDE/IDX_INCLUDE du borghelperrc, purge selon config
-# 1.0.14 IdxTop : top N arborescences par entrées diff_index (diagnostic diff.db volumineux)
-# 1.0.14 IdxPurge : purge rétroactive diff_index par préfixe/glob + VACUUM
-# 1.0.13 Index : SQLite verrouillé → attente automatique déverrouillage (retry 2s, max 300s)
-# 1.0.12 Report -o : même résumé que Report, toutes machines affichées même sans index
-# 1.0.11 Report : détection dépôt occupé → données depuis archive_stats/diff_index uniquement
-# 1.0.10 Index : SIGKILL + borg break-lock (SIGINT bloquait : cleanup borg lui-même bloquant)
-# 1.0.9 Index : SIGINT au lieu de SIGTERM — borg libère ses locks avant de mourir
-# 1.0.8 Index : thread moniteur priority lock (0.5s poll) — terminate() sans attendre fin d'un diff
-# 1.0.7 Index : terminate() des borg diff actifs sur priority lock (arrêt immédiat, pas d'attente)
-# 1.0.6 Bkp/Restore attendent fin des borg diff actifs avant borg create/extract (index-running lock)
-# 1.0.5 Priority lock par BORG_REPO : Bkp interrompt Index sur tous les nicks du même dépôt
-# 1.0.4 BORG_EXE : chemin borg configurable par section, fallback sur PATH
-# 1.0.3 DiffBkp : affichage ligne par ligne +/-/= depuis l'index SQLite, résumé compteurs
-# 1.0.2 Bkp/Restore prioritaires sur Index : lock PID, indexation interrompue proprement et reprise
-# 1.0.1 IDX_INCLUDE/IDX_EXCLUDE : glob complet (*.bak, /home/*/.bash_history) + stats fichiers exclus en DB
-# 1.0.0 Refactoring : BorgHelperDB / BorgRunner / BorgHelper — importable comme librairie
-# 0.69 SQLite : messages d'erreur explicites (fichier inaccessible, corrompu, répertoire manquant)
-# 0.68 diff.db : VACUUM après Prune, auto_vacuum=INCREMENTAL, DIFF_KEEP purge auto
-# 0.67 CLI : args positionnels non reconnus → erreur explicite
-# 0.66 Index : borg diff parallèle (IDX_WORKERS) + insert groupé
-# 0.65 Index : borg info archive_stats seulement si archives manquantes
-# 0.64 archive_stats dans diff.db : Bkp + Index, utilisé par Report -o
-# 0.63 Report -o : mode offline depuis diff.db
-# 0.62 Bkp : borgHelper_messages retiré du stdout
-# 0.61 Report : -N <n> surcharge DISPLAY_BKP
-# 0.59 Index -S : snapshot seul (remplace IndexSnap)
-# 0.58 Bkp : stdout JSON enrichi
-# 0.56 DB : déduplication snapshot_file, WAL, indexes
-# 0.55 Bkp : exit 0 si stderr INFO/WARNING uniquement
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 _BKP_STATUS_MAP={'A':'added','M':'modified','C':'C','B':'B','T':'T','d':'removed'}
