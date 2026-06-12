@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.64"
+Version="1.0.65"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -1871,6 +1871,19 @@ class BorgHelper:
             print(f"{nick}: {len(files)} fichiers dans le snapshot {archive_name} ({exclu_count} exclus, {convert_octets_readable(exclu_size)})")
         else:
             print(f"{nick}: {len(files)} fichiers dans le snapshot {archive_name}")
+        keep_snap=int(cfg.get('IDX_SNAP_KEEP',
+            sum(int(cfg.get(k,0)) for k in ['KEEP_DAILY','KEEP_WEEKLY','KEEP_MONTHLY','KEEP_YEARLY','KEEP_HOURLY'])
+            or 10))
+        try:
+            conn=sqlite3.connect(db_path,timeout=60)
+            snap_del,snap_count=self._snapurge_check(nick,conn,keep_snap)
+            if snap_del:
+                self._snapurge_exec(nick,conn,snap_del)
+                conn.commit()
+                print(f"{nick}: {snap_count:,} entrées snapshot supprimées ({len(snap_del)} archives anciennes)")
+            conn.close()
+        except sqlite3.Error as e:
+            printer(f"  [WARN] purge snapshot échouée ({e})")
         return 0
 
     def index(self,nick,debug=0,db_path=None,force=False,target_archive=None):

@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.65 — 2026-06-12
+
+### `indexsnap` : purge automatique des snapshots anciens
+
+Après indexation du snapshot, `indexsnap` appelle `_snapurge_check` / `_snapurge_exec` et purge les archives au-delà de `IDX_SNAP_KEEP` (même logique que `IdxPurge`). Erreur non bloquante (`[WARN]`).
+
 ## 1.0.64 — 2026-06-10
 
 ### IdxPurge : IDX_SNAP_KEEP déduit de KEEP_* par défaut
