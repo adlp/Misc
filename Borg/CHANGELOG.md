@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.67 — 2026-06-12
+
+### Report : colonne `dedup_delta` — variation de taille dédupliquée
+
+Nouvelle colonne dans le tableau des sauvegardes du rapport (`Report` et `Report -o`) : `dedup_delta` affiche le pourcentage de variation de `deduplicated_size` par rapport à l'archive précédente (`+11%`, `-5%`, `—` pour la première). Calculé dans `prep_report` et `prep_report_from_db` à partir des valeurs déjà stockées dans `archive_stats`.
+
 ## 1.0.66 — 2026-06-12
 
 ### `indexsnap` incrémental via `diff_index`

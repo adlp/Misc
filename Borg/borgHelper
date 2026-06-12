@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.66"
+Version="1.0.67"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -82,6 +82,11 @@ def getDataFromEnvOrFile(env=None,envpath=None,paths=None):
             with open(path,'r',encoding='utf-8') as f:
                 return f.readline().strip()
     return None
+
+def _fmt_dedup_delta(curr,prev):
+    if prev is None or prev==0: return '—'
+    pct=int(round((curr-prev)*100/prev))
+    return f"+{pct}%" if pct>=0 else f"{pct}%"
 
 def convert_octets_readable(size_in_bytes,sib=1000):
     suffixes=['B','KB','MB','GB','TB','PB','EB','ZB','YB']
@@ -2546,14 +2551,18 @@ class BorgHelper:
             for k,v in _fmt_stats(s_last,last_k['nfiles'],last_k['original_size'],summary=True).items(): tcmpl[nick][k]=v
         else:
             tcmpl[nick]['modifications']='—'
+        all_arches=list(kept.keys())
+        dedup_delta_map={arch:_fmt_dedup_delta(kept[arch]['deduplicated_size'],
+            kept[all_arches[idx-1]]['deduplicated_size'] if idx>0 else None)
+            for idx,arch in enumerate(all_arches)}
         tbkps={'Prunable':{'name':'Prunable','original_size':0,'compressed_size':0,'deduplicated_size':0}}
-        display_keys=list(kept.keys())
+        display_keys=all_arches
         if maxp is not None: display_keys=display_keys[-maxp:]
         for arch in display_keys:
             k=kept[arch]
             tbkps[arch]={'name':arch,'duration':k['durationM'],
                 'original_size':k['original_size'],'compressed_size':k['compressed_size'],
-                'deduplicated_size':k['deduplicated_size'],'nfiles':k['nfiles']}
+                'deduplicated_size':k['deduplicated_size'],'dedup_delta':dedup_delta_map[arch],'nfiles':k['nfiles']}
             s=diff_stats.get(arch)
             if s:
                 for kk,vv in _fmt_stats(s,k['nfiles'],k['original_size']).items(): tbkps[arch][kk]=vv
@@ -2622,6 +2631,10 @@ class BorgHelper:
         tcmpl[nick]['taille']=resume['unique_csize']
         tcmpl[nick]['recuperable']=resume['prunable']
         tcmpl[nick]['reste']=avail
+        all_kept=list(kept.keys())
+        dedup_delta_map={arch:_fmt_dedup_delta(kept[arch]['deduplicated_size'],
+            kept[all_kept[idx-1]]['deduplicated_size'] if idx>0 else None)
+            for idx,arch in enumerate(all_kept)}
         tbkps={'Prunable':{'name':'Prunable','original_size':resume['prunable_os'],'compressed_size':resume['prunable_cs'],'deduplicated_size':resume['prunable']}}
         cpt=0
         for i in kept.keys():
@@ -2629,6 +2642,7 @@ class BorgHelper:
                 if (maxp is None) or ((notPrunable-cpt)<=maxp):
                     tbkps[i]=kept[i]
                     tbkps[i]['duration']=kept[i]['durationM']
+                    tbkps[i]['dedup_delta']=dedup_delta_map[i]
                     tbkps[i].pop('durationM'); tbkps[i].pop('prunMe')
                 cpt+=1
         tbkps['Totaux']={'name':'Totaux','original_size':resume['total_size'],'compressed_size':resume['total_csize'],'deduplicated_size':resume['unique_csize']}
@@ -2719,7 +2733,7 @@ class BorgHelper:
             print(htmlTabelise(reshos,colnames=['nom','duree','depuis','derniere','taille','recuperable','reste','modifications'],errhost=errhost))
             for nick in nicks.split(','):
                 print('    <br>')
-                print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','compressed_size','deduplicated_size','nfiles','modifications'],errhost=errhost))
+                print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','compressed_size','deduplicated_size','dedup_delta','nfiles','modifications'],errhost=errhost))
             print('  </body>\n</html>')
         else:
             print(prettyTabelise(reshos))
@@ -2800,7 +2814,7 @@ class BorgHelper:
             print(htmlTabelise(reshos,colnames=['nom','duree','depuis','derniere','taille','recuperable','reste','modifications'],errhost=errhost))
             for nick in nicks.split(','):
                 print('    <br>')
-                print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','compressed_size','deduplicated_size','nfiles','modifications'],errhost=errhost))
+                print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','compressed_size','deduplicated_size','dedup_delta','nfiles','modifications'],errhost=errhost))
             print('  </body>\n</html>')
         else:
             print(prettyTabelise(reshos))

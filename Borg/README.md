@@ -241,6 +241,8 @@ borgHelper -c Report -n ALL -o -N 10       # offline + 10 dernières archives
 Code retour 1 si un dépôt dépasse `MAX_AGE_BKP` heures depuis la dernière sauvegarde.  
 Code retour 2 si un dépôt est inaccessible.
 
+**Variation de taille dédupliquée** — colonne `dedup_delta` : pourcentage de variation de `deduplicated_size` par rapport à l'archive précédente (`+11%`, `-5%`, `—` pour la première).
+
 **Statistiques de mouvement** (si l'index SQLite est disponible) — colonne `modifications` :
 
 | Contexte | `modifications` | Exemple |
