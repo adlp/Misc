@@ -391,15 +391,19 @@ borgHelper -c Index -n mon-serveur           # diffs + snapshot
 borgHelper -c Index -n ALL
 borgHelper -c Index -n mon-serveur -F        # force la réindexation complète
 borgHelper -c Index -n mon-serveur -S        # snapshot seul
-borgHelper -c Index -n mon-serveur -S -F     # force le snapshot seul
+borgHelper -c Index -n mon-serveur -S -F     # force le snapshot seul (borg list complet)
+borgHelper -c Index -n mon-serveur -A <archive>  # indexe uniquement la paire terminant par <archive>
 ```
 
 | Option | Description |
 |--------|-------------|
-| `-F` | Supprime et recalcule toutes les paires existantes |
+| `-F` | Supprime et recalcule toutes les paires existantes (snapshot : force `borg list` complet) |
 | `-S` | Snapshot seul — indexe uniquement le listing de la dernière archive |
+| `-A <archive>` | Restreint l'indexation à la paire dont `archive_new` correspond à `<archive>` |
 
 Types d'événements : `added`, `removed`, `modified`, `C` (permissions), `B` (lien cassé), `T` (type changé).
+
+Le snapshot (`-S`) est **incrémental par défaut** : si un snapshot précédent et le diff correspondant existent, seules les entrées `added/removed/modified` sont appliquées par SQL, et `borg list` est appelé uniquement sur les fichiers ajoutés (pour leur mtime). Fallback vers `borg list` complet si : pas de snapshot précédent, diff absent, > 5 000 ajouts, ou erreur borg. `-F` force le `borg list` complet.
 
 > **Interruptible :** si `Bkp` ou `Restore` démarre pendant `Index`, l'indexation s'arrête proprement après les diffs en cours et affiche le nombre de paires restantes. Relancer `Index` reprend là où c'était arrêté (incrémental).
 
@@ -482,7 +486,7 @@ Calcul : `nfiles − added_total − modified_total` (indexés + exclus). Seules
 ---
 
 ### `IdxPurge`
-Supprime rétroactivement des entrées de `diff_index` et compacte le `diff.db`.
+Supprime rétroactivement des entrées de `diff_index`, purge les snapshots anciens et compacte le `diff.db`.
 
 ```bash
 borgHelper -c IdxPurge -n mon-serveur -D              # dry-run selon IDX_EXCLUDE/IDX_INCLUDE
@@ -497,6 +501,8 @@ borgHelper -c IdxPurge -n mon-serveur -x '*/node_modules/*'  # purge un glob
 | `-D` | Dry-run — affiche le volume sans supprimer |
 
 Sans `-x`, lit `IDX_EXCLUDE`/`IDX_INCLUDE` depuis la configuration du nick et purge tout ce qui serait exclu à l'indexation.
+
+**Purge automatique des snapshots :** en fin d'opération, `IdxPurge` purge aussi les snapshots (`archive_snapshot`) au-delà du seuil `IDX_SNAP_KEEP`. Si `IDX_SNAP_KEEP` n'est pas défini, le seuil est calculé comme `sum(KEEP_DAILY + KEEP_WEEKLY + KEEP_MONTHLY + KEEP_YEARLY + KEEP_HOURLY)`, ou 10 si aucune règle KEEP_* n'est configurée. Le dry-run `-D` affiche également les snapshots qui seraient purgés.
 
 Après suppression, `IdxPurge` recalcule `diff_indexed_pairs.entry_count` et compacte le fichier via `VACUUM INTO` (dans le même répertoire, évite les problèmes de `/tmp` plein). Si le compactage échoue, les entrées sont quand même supprimées et la commande manuelle est affichée.
 

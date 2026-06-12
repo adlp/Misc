@@ -257,8 +257,7 @@ filtre IDX_INCLUDE/IDX_EXCLUDE par fichier (en RAM)
     ├── inclus  → store_diff_entries()       → diff_index + diff_indexed_pairs
     └── exclus  → store_excluded_diff_stats() → diff_excluded_stats (count seul, taille = 0)
 store_archive_stats(nick, archive_new, ...)              → archive_stats
-indexsnap(nick)                                          → snapshot_file + archive_snapshot
-                                                            + snap_excluded_stats
+indexsnap(nick)                                          → voir flux IndexSnap ci-dessous
     ↓
 finally: clear_priority_lock(nick)                       → supprime le lock
 ```
@@ -283,7 +282,38 @@ DIFF_KEEP : purge des paires au-delà de la limite
     ↓
 borg info --json (seulement si archive_stats manquantes) → archive_stats
     ↓
-indexsnap() → snapshot_file + archive_snapshot + snap_excluded_stats
+indexsnap() → voir flux IndexSnap ci-dessous
+```
+
+### `IndexSnap` (snapshot de la dernière archive)
+
+```
+Tentative incrémentale (_indexsnap_incremental) — sauf si -F :
+    ├── cherche snapshot précédent + diff_indexed_pairs pour la paire prev→new
+    ├── si introuvable ou diff absent → fallback borg list complet
+    ├── charge diffs (diff_index) : added / removed / modified
+    ├── si > 5 000 ajouts → fallback borg list complet
+    ├── clone archive_snapshot prev → new (INSERT OR IGNORE)
+    ├── removed → DELETE archive_snapshot + _cleanup_snapshot_file_orphans
+    ├── modified → UPDATE snapshot_file.size (mtime conservé)
+    ├── added   → borg list --format '{size} {isomtime} {path}{NL}' ::<archive> [paths]
+    │             → INSERT OR REPLACE snapshot_file + archive_snapshot
+    └── INSERT archive_snapshot_indexed ; commit
+    Affichage : "(+N -N ~N, incrémental)"
+
+Fallback borg list complet (si force, ou si incrémental échoue) :
+    borg list --format '{size} {isomtime} {path}{NL}' ::<archive>
+        ↓
+    filtre IDX_INCLUDE/IDX_EXCLUDE
+        ├── inclus → snapshot_file + archive_snapshot + archive_snapshot_indexed
+        └── exclus → snap_excluded_stats
+        ↓
+    INSERT archive_snapshot_indexed
+
+Purge auto des snapshots anciens :
+    _snapurge_check / _snapurge_exec → supprime archives au-delà de IDX_SNAP_KEEP
+    IDX_SNAP_KEEP = config, ou sum(KEEP_*), ou 10
+    Erreur non bloquante ([WARN])
 ```
 
 ---
@@ -294,8 +324,10 @@ Pour les dépôts à fort volume (plusieurs GB de diff.db) :
 
 | Levier | Paramètre | Effet |
 |--------|-----------|-------|
-| Purge automatique | `DIFF_KEEP = N` | Supprime les paires au-delà des N dernières après chaque Index |
+| Purge automatique diffs | `DIFF_KEEP = N` | Supprime les paires au-delà des N dernières après chaque Index |
+| Purge automatique snapshots | `IDX_SNAP_KEEP = N` | Conserve N snapshots max ; purge en fin d'IndexSnap et d'IdxPurge. Défaut : sum(KEEP_*) ou 10 |
 | Filtre chemins | `IDX_INCLUDE` / `IDX_EXCLUDE` | Réduit le nombre d'entrées indexées ; stats des exclus dans `diff_excluded_stats` / `snap_excluded_stats` |
+| IndexSnap incrémental | automatique | Applique les diffs SQL + `borg list` ciblé sur `added` — évite le `borg list` complet à chaque indexation |
 | Vacuum post-prune | automatique | Récupère l'espace après suppression d'archives |
 | Auto-vacuum | `PRAGMA auto_vacuum=INCREMENTAL` | Récupération progressive en continu |
 
@@ -503,6 +535,8 @@ IDX_EXCLUDE seul  → DELETE WHERE nick=? AND (p1 OR p2 OR ...)
 IDX_INCLUDE seul  → DELETE WHERE nick=? AND NOT (p1 OR p2 OR ...)
 Les deux          → DELETE WHERE nick=? AND (NOT (includes) OR (excludes))
 ```
+
+**Purge snapshots intégrée :** en fin d'opération (même s'il n'y avait rien à purger dans `diff_index`), `IdxPurge` appelle `_snapurge_check`/`_snapurge_exec` et supprime les snapshots (`archive_snapshot` + `archive_snapshot_indexed` + `snap_excluded_stats`) dont l'archive dépasse `IDX_SNAP_KEEP`. Un seul commit SQLite et un seul VACUUM pour les deux opérations.
 
 **Workflow recommandé :**
 ```
