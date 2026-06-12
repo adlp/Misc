@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.69 — 2026-06-12
+
+### Report : `size_delta` remplace `dedup_delta` — basé sur `original_size`
+
+`dedup_delta` (variation de `deduplicated_size`) remplacé par `size_delta` (variation de `original_size`). `original_size` est stable dans le temps (taille réelle des données de l'archive, indépendante de la déduplication inter-archives) — contrairement à `deduplicated_size` qui varie selon les archives voisines. La colonne est repositionnée après `original_size` dans le tableau. Le chargement de valeurs figées depuis `archive_stats` dans `prep_report` devient inutile et est supprimé.
+
 ## 1.0.68 — 2026-06-12
 
 ### Report : `dedup_delta` utilise les valeurs figées de `archive_stats`
