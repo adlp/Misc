@@ -173,7 +173,7 @@ borgHelper -c Login -n mon-serveur -p motdepasse -r /mnt/borg/local -k /root/bor
 
 ### `Bkp`
 Lance une sauvegarde selon la configuration du dépôt.  
-Par défaut, capture les fichiers modifiés pendant le backup (`--list`) et indexe automatiquement dans le SQLite (`diff_index` + snapshot).
+Par défaut, capture les fichiers modifiés pendant le backup (`--list`) et indexe automatiquement dans le SQLite (`diff_index` + snapshot + tailles via `borg diff`).
 
 ```bash
 borgHelper -c Bkp -n mon-serveur        # backup + indexation automatique
@@ -183,7 +183,7 @@ borgHelper -c Bkp -n mon-serveur -I     # backup seul, sans indexation
 Nécessite : `EXCLUDE`, `SER_LOGIN`, `SER_NAME`.  
 Code retour 0 si succès ou warnings, 2 si erreur borg.
 
-> `-I` désactive `--list` et toute écriture SQLite — utile si l'indexation est gérée séparément via `Index`.
+> `-I` désactive `--list`, toute écriture SQLite et l'appel automatique à `Index` — utile si l'indexation est gérée séparément.
 
 > **Priorité sur Index :** `Bkp` pose un lock sur le dépôt borg (`BORG_REPO`). Si `Index` tourne en parallèle sur n'importe quel nick pointant le même dépôt, les `borg diff` en cours reçoivent un SIGTERM et s'arrêtent en quelques secondes. `Bkp` attend la libération du verrou borg puis lance `borg create`.
 
@@ -573,11 +573,8 @@ borgHelper -c CacheClean -n mon-serveur
 ## Exemples de crontab
 
 ```cron
-# Backup quotidien à 2h
+# Backup quotidien à 2h — index (diff + snapshot + tailles) automatique
 0 2 * * *  borgHelper -c Bkp -n mon-serveur
-
-# Index diff + snapshot après le backup
-5 2 * * *  borgHelper -c Index -n mon-serveur
 
 # Prune hebdomadaire le dimanche à 3h
 0 3 * * 0  borgHelper -c Prune -n mon-serveur

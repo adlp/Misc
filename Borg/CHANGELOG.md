@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.70 — 2026-06-12
+
+### `bkp` : indexation complète (avec tailles) automatique après backup
+
+La commande `bkp` lance maintenant automatiquement `index()` après `indexsnap()`, ciblé sur la nouvelle archive (`-A <archive_new>`). Cela déclenche `borg diff --json-lines` pour remplir les tailles (`size_before`/`size_after`) dans `diff_index` — opération jusqu'ici nécessitant un appel manuel séparé à `Index`. Le `priority_lock` est levé avant l'appel à `index()` (le travail borg est terminé) ; le `finally` reste inoffensif (double `clear` absorbé par `OSError: pass`).
+
 ## 1.0.69 — 2026-06-12
 
 ### Report : `size_delta` remplace `dedup_delta` — basé sur `original_size`

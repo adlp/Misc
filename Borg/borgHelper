@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.69"
+Version="1.0.70"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -1792,6 +1792,9 @@ class BorgHelper:
                         exclu_msg=f" ({sum(s['count'] for s in exclu.values())} exclus)" if exclu else ""
                         print(f"Index : {len(entries)} entrée(s) stockée(s) ({archive_old} → {archive_new}){exclu_msg}",file=sys.stderr,flush=True)
                     if not no_index: self.indexsnap(nick,debug=debug)
+                    if not no_index and archive_new and archive_old:
+                        self.db.clear_priority_lock(nick)
+                        self.index(nick,debug=debug,target_archive=archive_new)
                 except Exception as e:
                     printer(f"[WARN] indexation post-backup échouée : {e}")
             sys.exit(newretC)
