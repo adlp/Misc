@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.75 — 2026-06-13
+
+### Report résumé : suppression de la clé `size_delta_last` du dict résumé
+
+`size_delta_last` était visible dans la sortie JSON (`-j`) et en fallback `colnames`. Remplacé `get()` par `pop()` dans `report` et `report_offline` pour consommer la clé après usage.
+
 ## 1.0.74 — 2026-06-12
 
 ### Report résumé : `size_delta` de la dernière sauvegarde dans la colonne `derniere`

@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.74"
+Version="1.0.75"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -2699,7 +2699,7 @@ class BorgHelper:
             for i in ['derniere','taille','recuperable','reste']:
                 if (i in tcmpl[nick].keys()) and not(tcmpl[nick][i] is None): tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
                 else: tcmpl[nick][i]=""
-            sd=tcmpl[nick].get('size_delta_last','—')
+            sd=tcmpl[nick].pop('size_delta_last','—')
             if sd!='—': tcmpl[nick]['derniere']+=f" ({sd})"
             tcmpl[nick]['depuis']=f"{tcmpl[nick]['depuis']:.2f} h"
             tcmpl[nick]['duree']=f"{tcmpl[nick]['duree']:.2f} min"
@@ -2782,7 +2782,7 @@ class BorgHelper:
             for i in ['derniere','taille','recuperable','reste']:
                 if (i in tcmpl[nick].keys()) and not(tcmpl[nick][i] is None): tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
                 else: tcmpl[nick][i]=""
-            sd=tcmpl[nick].get('size_delta_last','—')
+            sd=tcmpl[nick].pop('size_delta_last','—')
             if sd!='—': tcmpl[nick]['derniere']+=f" ({sd})"
             tcmpl[nick]['depuis']=f"{tcmpl[nick]['depuis']:.2f} h"
             tcmpl[nick]['duree']=f"{tcmpl[nick]['duree']:.2f} min"
