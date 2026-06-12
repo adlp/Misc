@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.70"
+Version="1.0.71"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -1990,6 +1990,8 @@ class BorgHelper:
     def index(self,nick,debug=0,db_path=None,force=False,target_archive=None):
         if self._nick_noidx(nick):
             printer(f"{nick}: indexation désactivée (NOIDX=1)"); return 0
+        if self.db.check_priority_lock(nick):
+            printer(f"{nick}: opération prioritaire (Bkp/Restore) en cours — Index annulé"); return 1
         if db_path is None: db_path=self.db.get_diff_db(nick)
         self.db.ensure_diff_db(db_path)
         cfg=self.borg.cfgreaded(nick,debug=debug)
@@ -2136,6 +2138,8 @@ class BorgHelper:
                 if db_conn:
                     try: db_conn.close()
                     except: pass
+        if interrupted_event.is_set():
+            printer(f"{nick}: indexation interrompue — reprise possible via borgHelper -c Index -n {nick}"); return 1
         ok_results=[r for r in results if r[5]]
         new_pairs=len(ok_results)
         total_exclu=sum(sum(s['count'] for s in exclu.values()) for _,_,_,_,exclu,_ in ok_results)

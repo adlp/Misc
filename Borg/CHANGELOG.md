@@ -1,5 +1,15 @@
 # Changelog — borgHelper
 
+## 1.0.71 — 2026-06-12
+
+### `Index` : priorité `bkp` étendue à toute la durée d'exécution
+
+Deux correctifs :
+
+1. **Early-exit au démarrage** : si `priority_lock` est posé au moment où `Index` démarre (Bkp/Restore déjà actif), l'indexation est annulée immédiatement sans lancer `borg list` ni aucun diff.
+
+2. **Arrêt complet après interrupt** : lorsque `_priority_monitor` interrompt les diffs en cours, `index()` s'arrête aussitôt après (au lieu de continuer avec `borg info` + `indexsnap`). `bkp` peut donc reprendre sans attendre la fin de ces opérations post-diff.
+
 ## 1.0.70 — 2026-06-12
 
 ### `bkp` : indexation complète (avec tailles) automatique après backup
