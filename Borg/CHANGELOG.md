@@ -1,5 +1,16 @@
 # Changelog — borgHelper
 
+## 1.0.66 — 2026-06-12
+
+### `indexsnap` incrémental via `diff_index`
+
+Nouveau `_indexsnap_incremental` : si un snapshot précédent et un diff indexé existent, met à jour le snapshot par diff SQL au lieu d'un `borg list` complet :
+- `removed` → DELETE de archive_snapshot + cleanup orphelins
+- `modified` → UPDATE size dans snapshot_file (mtime conservé)
+- `added` → `borg list` ciblé sur ces chemins uniquement (mtime exact)
+- Fallback automatique vers `borg list` complet si : pas de snapshot précédent, diff absent, > 5000 ajouts, ou erreur borg
+- `-F` force toujours le `borg list` complet
+
 ## 1.0.65 — 2026-06-12
 
 ### `indexsnap` : purge automatique des snapshots anciens

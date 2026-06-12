@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.65"
+Version="1.0.66"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -1817,6 +1817,86 @@ class BorgHelper:
         else:
             usage('prune')
 
+    def _indexsnap_incremental(self,nick,archive_name,archive_date,cfg,db_path,debug=0):
+        """Mise à jour incrémentale du snapshot via diff_index.
+        Retourne (nfiles, exclu_count, exclu_size, n_added, n_removed, n_modified) ou None (fallback borg list)."""
+        try:
+            conn=sqlite3.connect(db_path,timeout=60)
+            row=conn.execute(
+                "SELECT archive FROM archive_snapshot_indexed WHERE nick=? AND archive<? ORDER BY archive DESC LIMIT 1",
+                (nick,archive_name)).fetchone()
+            if not row:
+                conn.close(); return None
+            prev_archive=row[0]
+            if not conn.execute(
+                "SELECT 1 FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=?",
+                (nick,prev_archive,archive_name)).fetchone():
+                conn.close(); return None
+            diffs=conn.execute(
+                "SELECT path,change_type,size_after FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",
+                (nick,prev_archive,archive_name)).fetchall()
+            removed=[p for p,ct,_ in diffs if ct=='removed' and self._idx_path_ok(p,cfg)]
+            modified=[(sz,p) for p,ct,sz in diffs if ct=='modified' and self._idx_path_ok(p,cfg)]
+            added=[p for p,ct,_ in diffs if ct=='added' and self._idx_path_ok(p,cfg)]
+            exclu_count=sum(1 for p,ct,_ in diffs if not self._idx_path_ok(p,cfg))
+            exclu_size=sum(sz or 0 for p,ct,sz in diffs if not self._idx_path_ok(p,cfg))
+            if len(added)>5000:
+                conn.close(); return None
+            # Clone prev snapshot → archive_name
+            conn.execute(
+                "INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,file_id) "
+                "SELECT nick,?,?,file_id FROM archive_snapshot WHERE nick=? AND archive=?",
+                (archive_name,archive_date,nick,prev_archive))
+            # Apply removed
+            for path in removed:
+                conn.execute(
+                    "DELETE FROM archive_snapshot WHERE nick=? AND archive=? AND file_id="
+                    "(SELECT id FROM snapshot_file WHERE nick=? AND path=?)",
+                    (nick,archive_name,nick,path))
+            if removed:
+                self.db._cleanup_snapshot_file_orphans(nick,conn)
+            # Apply modified (update size, keep mtime)
+            for sz,path in modified:
+                if sz is not None:
+                    conn.execute("UPDATE snapshot_file SET size=? WHERE nick=? AND path=?",(sz,nick,path))
+            conn.commit()
+            # Fetch added via targeted borg list (with mtime)
+            if added:
+                rb=self.borg.boex(nick,
+                    ['list','--format','{size} {isomtime} {path}{NL}',f'::{archive_name}']+added,
+                    debug=debug,retjson=False)
+                if rb['exitcode']!=0:
+                    conn.execute("DELETE FROM archive_snapshot WHERE nick=? AND archive=?",(nick,archive_name))
+                    self.db._cleanup_snapshot_file_orphans(nick,conn)
+                    conn.commit(); conn.close(); return None
+                add_rows=[]
+                for line in rb['stdout']:
+                    line=line.strip()
+                    if not line: continue
+                    parts=line.split(' ',2)
+                    if len(parts)==3:
+                        try: sz2=int(parts[0])
+                        except ValueError: sz2=None
+                        add_rows.append((nick,parts[2],sz2,parts[1]))
+                if add_rows:
+                    conn.executemany("INSERT OR REPLACE INTO snapshot_file (nick,path,size,mtime) VALUES (?,?,?,?)",add_rows)
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,file_id) "
+                        "SELECT ?,?,?,id FROM snapshot_file WHERE nick=? AND path=?",
+                        [(archive_name,archive_date,nick,nick,r[1]) for r in add_rows])
+            nfiles=conn.execute(
+                "SELECT COUNT(*) FROM archive_snapshot WHERE nick=? AND archive=?",(nick,archive_name)).fetchone()[0]
+            conn.execute(
+                "INSERT OR IGNORE INTO archive_snapshot_indexed (nick,archive,entry_count) VALUES (?,?,?)",
+                (nick,archive_name,nfiles))
+            conn.commit(); conn.close()
+            return nfiles,exclu_count,exclu_size,len(added),len(removed),len(modified)
+        except sqlite3.Error as e:
+            printer(f"  [WARN] indexsnap incrémental échoué ({e}) — fallback borg list")
+            try: conn.close()
+            except: pass
+            return None
+
     def indexsnap(self,nick,debug=0,db_path=None,force=False):
         if self._nick_noidx(nick):
             printer(f"{nick}: indexation désactivée (NOIDX=1)"); return 0
@@ -1845,32 +1925,45 @@ class BorgHelper:
             except sqlite3.Error as e:
                 printer(f"SQLite error ({db_path}): {e}")
         print(f"  {nick}: snapshot {archive_name}...",flush=True)
-        rb2=self.borg.boex(nick,['list','--format','{size} {isomtime} {path}{NL}',f"::{archive_name}"],debug=debug,retjson=False)
-        if rb2['exitcode']!=0:
-            printer(f"borg list a échoué (code {rb2['exitcode']})")
-            for i in rb2['stderr']:
-                if isinstance(i,dict): printer(f"  [{i.get('levelname','?')}] {i.get('message',i)}")
-                elif isinstance(i,str) and i.strip(): printer(f"  {i}")
-            return rb2['exitcode']
-        files=[]; exclu_count=0; exclu_size=0
-        for line in rb2['stdout']:
-            line=line.strip()
-            if not line: continue
-            parts=line.split(' ',2)
-            if len(parts)==3:
-                try: size=int(parts[0])
-                except ValueError: size=None
-                path=parts[2]
-                if self._idx_path_ok(path,cfg):
-                    files.append({'path':path,'size':size,'mtime':parts[1]})
-                else:
-                    exclu_count+=1; exclu_size+=(size or 0)
-        self.db.store_archive_snapshot(nick,archive_name,archive_date,files,db_path)
-        if exclu_count:
-            self.db.store_excluded_snap_stats(nick,archive_name,exclu_count,exclu_size,db_path)
-            print(f"{nick}: {len(files)} fichiers dans le snapshot {archive_name} ({exclu_count} exclus, {convert_octets_readable(exclu_size)})")
+        # Tentative incrémentale (pas en mode force)
+        inc=None
+        if not force:
+            inc=self._indexsnap_incremental(nick,archive_name,archive_date,cfg,db_path,debug)
+        if inc is not None:
+            nfiles,exclu_count,exclu_size,n_add,n_rem,n_mod=inc
+            suffix=f" (+{n_add} -{n_rem} ~{n_mod}, incrémental)"
+            if exclu_count:
+                print(f"{nick}: {nfiles} fichiers dans le snapshot {archive_name}{suffix} ({exclu_count} exclus, {convert_octets_readable(exclu_size)})")
+            else:
+                print(f"{nick}: {nfiles} fichiers dans le snapshot {archive_name}{suffix}")
         else:
-            print(f"{nick}: {len(files)} fichiers dans le snapshot {archive_name}")
+            # Fallback : borg list complet
+            rb2=self.borg.boex(nick,['list','--format','{size} {isomtime} {path}{NL}',f"::{archive_name}"],debug=debug,retjson=False)
+            if rb2['exitcode']!=0:
+                printer(f"borg list a échoué (code {rb2['exitcode']})")
+                for i in rb2['stderr']:
+                    if isinstance(i,dict): printer(f"  [{i.get('levelname','?')}] {i.get('message',i)}")
+                    elif isinstance(i,str) and i.strip(): printer(f"  {i}")
+                return rb2['exitcode']
+            files=[]; exclu_count=0; exclu_size=0
+            for line in rb2['stdout']:
+                line=line.strip()
+                if not line: continue
+                parts=line.split(' ',2)
+                if len(parts)==3:
+                    try: size=int(parts[0])
+                    except ValueError: size=None
+                    path=parts[2]
+                    if self._idx_path_ok(path,cfg):
+                        files.append({'path':path,'size':size,'mtime':parts[1]})
+                    else:
+                        exclu_count+=1; exclu_size+=(size or 0)
+            self.db.store_archive_snapshot(nick,archive_name,archive_date,files,db_path)
+            if exclu_count:
+                self.db.store_excluded_snap_stats(nick,archive_name,exclu_count,exclu_size,db_path)
+                print(f"{nick}: {len(files)} fichiers dans le snapshot {archive_name} ({exclu_count} exclus, {convert_octets_readable(exclu_size)})")
+            else:
+                print(f"{nick}: {len(files)} fichiers dans le snapshot {archive_name}")
         keep_snap=int(cfg.get('IDX_SNAP_KEEP',
             sum(int(cfg.get(k,0)) for k in ['KEEP_DAILY','KEEP_WEEKLY','KEEP_MONTHLY','KEEP_YEARLY','KEEP_HOURLY'])
             or 10))
