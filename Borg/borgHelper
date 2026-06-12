@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.73"
+Version="1.0.74"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -2583,9 +2583,7 @@ class BorgHelper:
         size_delta_map={arch:_fmt_dedup_delta(kept[arch]['original_size'],
             kept[all_arches[idx-1]]['original_size'] if idx>0 else None)
             for idx,arch in enumerate(all_arches)}
-        last_delta=size_delta_map.get(last_arch,'—')
-        if last_delta!='—':
-            tcmpl[nick]['modifications']=tcmpl[nick].get('modifications','—')+f" ({last_delta})"
+        tcmpl[nick]['size_delta_last']=size_delta_map.get(last_arch,'—')
         tbkps={'Prunable':{'name':'Prunable','original_size':0,'compressed_size':0,'deduplicated_size':0}}
         display_keys=all_arches
         if maxp is not None: display_keys=display_keys[-maxp:]
@@ -2693,9 +2691,7 @@ class BorgHelper:
             for k,v in _fmt_stats(s_last,nf_last,sz_last,summary=True).items(): tcmpl[nick][k]=v
         else:
             tcmpl[nick]['modifications']='—'
-        last_delta=size_delta_map.get(last_arch,'—') if last_arch else '—'
-        if last_delta!='—':
-            tcmpl[nick]['modifications']=tcmpl[nick].get('modifications','—')+f" ({last_delta})"
+        tcmpl[nick]['size_delta_last']=size_delta_map.get(last_arch,'—') if last_arch else '—'
         for arch in list(tbkps.keys()):
             if 'nfiles' not in tbkps[arch]: continue
             s=diff_stats.get(arch)
@@ -2737,6 +2733,8 @@ class BorgHelper:
             for i in ['derniere','taille','recuperable','reste']:
                 if (i in tcmpl[nick].keys()) and not(tcmpl[nick][i] is None): tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
                 else: tcmpl[nick][i]=""
+            sd=tcmpl[nick].get('size_delta_last','—')
+            if sd!='—': tcmpl[nick]['derniere']+=f" ({sd})"
             tcmpl[nick]['depuis']=f"{tcmpl[nick]['depuis']:.2f} h"
             tcmpl[nick]['duree']=f"{tcmpl[nick]['duree']:.2f} min"
             for i in tbkps.keys():
@@ -2818,6 +2816,8 @@ class BorgHelper:
             for i in ['derniere','taille','recuperable','reste']:
                 if (i in tcmpl[nick].keys()) and not(tcmpl[nick][i] is None): tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
                 else: tcmpl[nick][i]=""
+            sd=tcmpl[nick].get('size_delta_last','—')
+            if sd!='—': tcmpl[nick]['derniere']+=f" ({sd})"
             tcmpl[nick]['depuis']=f"{tcmpl[nick]['depuis']:.2f} h"
             tcmpl[nick]['duree']=f"{tcmpl[nick]['duree']:.2f} min"
             for i in tbkps.keys():
