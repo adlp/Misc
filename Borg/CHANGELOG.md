@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## 1.0.72 — 2026-06-12
+
+### `Index` interrompu par `bkp` : reprise automatique après le backup
+
+Quand un `Index` externe est interrompu par un backup prioritaire, un fichier `index-pending.lock` est posé. `backup()` le détecte en fin d'exécution (après son propre `index` ciblé) et lance automatiquement un `Index` complet — sans intervention manuelle.
+
+Deux cas couverts :
+- **Early-exit** : `priority_lock` déjà actif au démarrage de `Index` → pending posé immédiatement
+- **Interrupt mid-run** : `_priority_monitor` tue les diffs → pending posé après le retour de la phase diff
+
+Les appels internes à `index()` depuis `backup()` utilisent `set_pending=False` pour ne pas déclencher de reprise récursive.
+
 ## 1.0.71 — 2026-06-12
 
 ### `Index` : priorité `bkp` étendue à toute la durée d'exécution

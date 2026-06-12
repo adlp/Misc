@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.71"
+Version="1.0.72"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -611,6 +611,21 @@ class BorgHelperDB:
                 except OSError: pass
                 return
         printer(f"  [WARN] Timeout attente Index ({timeout}s) — lancement quand même")
+
+    def _index_pending_lock_path(self,nick):
+        return os.path.join(self.cache_dir,f"{self.db_prefix}-{self.get_db_nick(nick)}-index-pending.lock")
+
+    def set_index_pending_lock(self,nick):
+        try:
+            with open(self._index_pending_lock_path(nick),'w') as f: f.write('')
+        except OSError: pass
+
+    def clear_index_pending_lock(self,nick):
+        try: os.unlink(self._index_pending_lock_path(nick))
+        except OSError: pass
+
+    def check_index_pending_lock(self,nick):
+        return os.path.exists(self._index_pending_lock_path(nick))
 
     def _check_set_meta(self,conn,schema_version,db_path):
         row=conn.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()
@@ -1794,7 +1809,11 @@ class BorgHelper:
                     if not no_index: self.indexsnap(nick,debug=debug)
                     if not no_index and archive_new and archive_old:
                         self.db.clear_priority_lock(nick)
-                        self.index(nick,debug=debug,target_archive=archive_new)
+                        self.index(nick,debug=debug,target_archive=archive_new,set_pending=False)
+                    if not no_index and self.db.check_index_pending_lock(nick):
+                        self.db.clear_index_pending_lock(nick)
+                        printer(f"{nick}: reprise de l'Index interrompu...")
+                        self.index(nick,debug=debug,set_pending=False)
                 except Exception as e:
                     printer(f"[WARN] indexation post-backup échouée : {e}")
             sys.exit(newretC)
@@ -1987,10 +2006,11 @@ class BorgHelper:
             printer(f"  [WARN] purge snapshot échouée ({e})")
         return 0
 
-    def index(self,nick,debug=0,db_path=None,force=False,target_archive=None):
+    def index(self,nick,debug=0,db_path=None,force=False,target_archive=None,set_pending=True):
         if self._nick_noidx(nick):
             printer(f"{nick}: indexation désactivée (NOIDX=1)"); return 0
         if self.db.check_priority_lock(nick):
+            if set_pending: self.db.set_index_pending_lock(nick)
             printer(f"{nick}: opération prioritaire (Bkp/Restore) en cours — Index annulé"); return 1
         if db_path is None: db_path=self.db.get_diff_db(nick)
         self.db.ensure_diff_db(db_path)
@@ -2139,7 +2159,8 @@ class BorgHelper:
                     try: db_conn.close()
                     except: pass
         if interrupted_event.is_set():
-            printer(f"{nick}: indexation interrompue — reprise possible via borgHelper -c Index -n {nick}"); return 1
+            if set_pending: self.db.set_index_pending_lock(nick)
+            printer(f"{nick}: indexation interrompue — reprise automatique après le backup"); return 1
         ok_results=[r for r in results if r[5]]
         new_pairs=len(ok_results)
         total_exclu=sum(sum(s['count'] for s in exclu.values()) for _,_,_,_,exclu,_ in ok_results)
