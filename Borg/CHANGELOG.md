@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.68 — 2026-06-12
+
+### Report : `dedup_delta` utilise les valeurs figées de `archive_stats`
+
+Dans `prep_report` (rapport live), le calcul de `dedup_delta` utilisait les `deduplicated_size` retournées par `borg info` — valeurs qui varient à chaque nouveau backup (la déduplication redistribue les chunks entre archives). Corrigé : `prep_report` charge les valeurs de `archive_stats` (figées au moment de l'indexation initiale) et les utilise pour le delta. Fallback sur la valeur live si l'archive n'est pas encore dans `archive_stats`.
+
 ## 1.0.67 — 2026-06-12
 
 ### Report : colonne `dedup_delta` — variation de taille dédupliquée
