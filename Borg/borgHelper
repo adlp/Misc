@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.75"
+Version="1.0.76"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -473,93 +473,51 @@ class BorgHelperDB:
     def get_diff_db(self,nick):
         return os.path.join(self.cache_dir,f"{self.db_prefix}-{self.get_db_nick(nick)}-diff.db")
 
-    def _priority_lock_path(self,nick):
+    def _repo_key(self,nick):
         cfg=self._cfg_reader(nick) if self._cfg_reader else None
         if cfg and 'BORG_REPO' in cfg:
-            repo_key=re.sub(r'[^a-zA-Z0-9_-]','_',cfg['BORG_REPO'])
-        else:
-            repo_key=self.get_db_nick(nick)
-        return os.path.join(self.cache_dir,f"{self.db_prefix}-{repo_key}-priority.lock")
+            return re.sub(r'[^a-zA-Z0-9_-]','_',cfg['BORG_REPO'])
+        return self.get_db_nick(nick)
 
-    def set_priority_lock(self,nick):
+    def _pid_lock_path(self,nick,suffix):
+        return os.path.join(self.cache_dir,f"{self.db_prefix}-{self._repo_key(nick)}-{suffix}.lock")
+
+    def _set_pid_lock(self,path):
         try:
-            with open(self._priority_lock_path(nick),'w') as f: f.write(str(os.getpid()))
+            with open(path,'w') as f: f.write(str(os.getpid()))
         except OSError: pass
 
-    def clear_priority_lock(self,nick):
-        try: os.unlink(self._priority_lock_path(nick))
+    def _clear_pid_lock(self,path):
+        try: os.unlink(path)
         except OSError: pass
 
+    def _check_pid_lock(self,path):
+        if not os.path.exists(path): return False
+        try:
+            with open(path) as f: pid=int(f.read().strip())
+            if pid==os.getpid(): return False
+            os.kill(pid,0); return True
+        except (OSError,ValueError):
+            try: os.unlink(path)
+            except OSError: pass
+            return False
+
+    def _priority_lock_path(self,nick): return self._pid_lock_path(nick,'priority')
+    def set_priority_lock(self,nick): self._set_pid_lock(self._priority_lock_path(nick))
+    def clear_priority_lock(self,nick): self._clear_pid_lock(self._priority_lock_path(nick))
     def check_priority_lock(self,nick):
         """True si un processus prioritaire (Bkp/Restore) tient le lock et est encore vivant."""
-        p=self._priority_lock_path(nick)
-        if not os.path.exists(p): return False
-        try:
-            with open(p) as f: pid=int(f.read().strip())
-            if pid==os.getpid(): return False
-            os.kill(pid,0); return True
-        except (OSError,ValueError):
-            try: os.unlink(p)
-            except OSError: pass
-            return False
+        return self._check_pid_lock(self._priority_lock_path(nick))
 
-    def _report_running_lock_path(self,nick):
-        cfg=self._cfg_reader(nick) if self._cfg_reader else None
-        if cfg and 'BORG_REPO' in cfg:
-            repo_key=re.sub(r'[^a-zA-Z0-9_-]','_',cfg['BORG_REPO'])
-        else:
-            repo_key=self.get_db_nick(nick)
-        return os.path.join(self.cache_dir,f"{self.db_prefix}-{repo_key}-report-running.lock")
+    def _report_running_lock_path(self,nick): return self._pid_lock_path(nick,'report-running')
+    def set_report_running_lock(self,nick): self._set_pid_lock(self._report_running_lock_path(nick))
+    def clear_report_running_lock(self,nick): self._clear_pid_lock(self._report_running_lock_path(nick))
+    def check_report_running(self,nick): return self._check_pid_lock(self._report_running_lock_path(nick))
 
-    def set_report_running_lock(self,nick):
-        try:
-            with open(self._report_running_lock_path(nick),'w') as f: f.write(str(os.getpid()))
-        except OSError: pass
-
-    def clear_report_running_lock(self,nick):
-        try: os.unlink(self._report_running_lock_path(nick))
-        except OSError: pass
-
-    def check_report_running(self,nick):
-        p=self._report_running_lock_path(nick)
-        if not os.path.exists(p): return False
-        try:
-            with open(p) as f: pid=int(f.read().strip())
-            if pid==os.getpid(): return False
-            os.kill(pid,0); return True
-        except (OSError,ValueError):
-            try: os.unlink(p)
-            except OSError: pass
-            return False
-
-    def _index_running_lock_path(self,nick):
-        cfg=self._cfg_reader(nick) if self._cfg_reader else None
-        if cfg and 'BORG_REPO' in cfg:
-            repo_key=re.sub(r'[^a-zA-Z0-9_-]','_',cfg['BORG_REPO'])
-        else:
-            repo_key=self.get_db_nick(nick)
-        return os.path.join(self.cache_dir,f"{self.db_prefix}-{repo_key}-index-running.lock")
-
-    def set_index_running_lock(self,nick):
-        try:
-            with open(self._index_running_lock_path(nick),'w') as f: f.write(str(os.getpid()))
-        except OSError: pass
-
-    def clear_index_running_lock(self,nick):
-        try: os.unlink(self._index_running_lock_path(nick))
-        except OSError: pass
-
-    def check_index_running(self,nick):
-        p=self._index_running_lock_path(nick)
-        if not os.path.exists(p): return False
-        try:
-            with open(p) as f: pid=int(f.read().strip())
-            if pid==os.getpid(): return False
-            os.kill(pid,0); return True
-        except (OSError,ValueError):
-            try: os.unlink(p)
-            except OSError: pass
-            return False
+    def _index_running_lock_path(self,nick): return self._pid_lock_path(nick,'index-running')
+    def set_index_running_lock(self,nick): self._set_pid_lock(self._index_running_lock_path(nick))
+    def clear_index_running_lock(self,nick): self._clear_pid_lock(self._index_running_lock_path(nick))
+    def check_index_running(self,nick): return self._check_pid_lock(self._index_running_lock_path(nick))
 
     def wait_index_idle(self,nick,timeout=120):
         """Attend que l'Index en cours sur ce dépôt libère ses verrous borg (max timeout s)."""

@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.76 — 2026-06-13
+
+### Refactoring interne : consolidation du système de locks PID
+
+Extraction de `_repo_key(nick)` (calcul de la clé repo à partir de `BORG_REPO` ou `DB_NAME`) pour éliminer la duplication dans les 3 méthodes `_*_lock_path`. Ajout de `_pid_lock_path(nick, suffix)`, `_set_pid_lock`, `_clear_pid_lock`, `_check_pid_lock` comme helpers génériques. Les 12 méthodes publiques de lock (priority, report-running, index-running) deviennent des wrappers d'une ligne. Aucun changement de comportement.
+
 ## 1.0.75 — 2026-06-13
 
 ### Report résumé : suppression de la clé `size_delta_last` du dict résumé
