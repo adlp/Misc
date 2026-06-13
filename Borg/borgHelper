@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 #/*
 #* borgHelper to help you calling borg
-#* Copyright (C) 2024 Antoine DELAPORTE
+#* Copyright (C) 2026 Antoine DELAPORTE
 #* This program is free software: GNU GPL v3 or later
 #* See <http://www.gnu.org/licenses/>
 #*/
