@@ -1,5 +1,13 @@
 # Changelog — zimLocAccZam
 
+## 1.0.2 — 2026-08-05
+
+- Plus de stack trace en cas de problème d'accès Zimbra/LDAP ou Zammad. Logique principale déplacée dans `main()`, appelée sous `try/except` :
+  - `ldap.LDAPError` / `RuntimeError` (échec `zmlocalconfig`, bind LDAP, recherche LDAP) → message clair sur stderr, exit code `2`.
+  - `requests.exceptions.RequestException` (Zammad injoignable/timeout) → message clair sur stderr, exit code `3`.
+  - `configparser.Error` / `FileNotFoundError` (config invalide/absente) → message clair sur stderr, exit code `1`.
+  - Toute autre exception inattendue → message clair sur stderr, exit code `1` (jamais de traceback brut).
+
 ## 1.0.1 — 2026-08-05
 
 Corrections de bugs :

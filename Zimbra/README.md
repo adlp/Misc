@@ -51,6 +51,15 @@ zimLocAccZam [-d] [-C fichier_config] [-a] [-s] [-n]
 - `-s, --silent` : aucune sortie
 - `-n, --no-create` : ne crée pas de ticket (dry-run côté création)
 
+## Codes de sortie
+
+- `0` : exécution normale
+- `1` : erreur de configuration (fichier manquant/invalide) ou erreur inattendue
+- `2` : erreur d'accès Zimbra/LDAP (bind, recherche, `zmlocalconfig`)
+- `3` : erreur d'accès Zammad (requête HTTP en échec)
+
+Aucun cas ne remonte de stack trace brute : message d'erreur clair sur stderr dans tous les cas.
+
 ## Versions
 
 Voir `CHANGELOG.md`.
