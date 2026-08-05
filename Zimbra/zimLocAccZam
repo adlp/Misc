@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.8
 
 import subprocess
 import ldap
@@ -248,6 +248,16 @@ if __name__ == "__main__":
     base_dn         = config.get("general", "base_dn")
     EXCLUDE_REGEXES = [r.strip() for r in config.get("general", "exclude_regexes").split(",")]
 
+    # 🧨 Lecture et activation (ou pas) de la conf sentry
+    if "sentry" in config and "dsn" in config['sentry']:
+        import sentry_sdk
+        sentry_sdk.init(
+            dsn=config.get("sentry","dsn"),
+            # Add data like request headers and IP for users,
+            # see https://docs.sentry.io/platforms/python/data-management/data-collected/ for more info
+            send_default_pii=True,
+            )
+
     # 📦 Lecture du cache
     if os.path.exists(CACHE_PATH):
         with open(CACHE_PATH, "r") as f:
@@ -273,7 +283,12 @@ if __name__ == "__main__":
             logs        = "\n".join(extract_failed_auth_lines(account))
             infos       = locked_accounts[account]['infos']
             if not args.no_create:
-                ticket_id   = zammad.create(f'[ZIMBRA] Locked :{account}',subject="infos",body=yaml.dump(infos,allow_unicode=True))
+                whatToDump={}
+                for i in ['zimbraPasswordLockoutFailureTime','zimbraPasswordLockoutLockedTime','zimbraPasswordModifiedTime','zimbraAuthTokens']:
+                    if i in infos.keys():
+                        whatToDump[i]=infos[i]
+                #ticket_id   = zammad.create(f'[ZIMBRA] Locked :{account}',subject="infos",body=yaml.dump(infos,allow_unicode=True))
+                ticket_id   = zammad.create(f'[ZIMBRA] Locked :{account}',subject="infos",body=yaml.dump(whatToDump,allow_unicode=True))
                 zammad.note(ticket_id,"logs",logs)
                 new_cache[account] = {"ticket_id": ticket_id, "logs":logs,'infos':infos}
             else:
