@@ -24,4 +24,24 @@ Corrections de bugs :
 
 ## 1.0.0 — 2026-08-05
 
-Version initiale (commit `5d02937`).
+Version initiale versionnée (commit `5d02937`, "1er round"). Ajout sentry optionnel, filtrage `whatToDump` des attributs LDAP dumpés dans le ticket.
+
+## 0.4 — 2025-09-30
+
+- Boucle "comptes débloqués" : vérifie l'état réel du ticket (`tick`) avant de le clore — gère le cas où le ticket a disparu côté Zammad, et n'essaie plus de fermer un ticket déjà fermé.
+- Log explicite si le ticket attendu n'existe plus.
+
+## 0.3 — 2025-09-11
+
+- Ajout de l'option `-n/--no-create` (dry-run : détecte sans créer de ticket).
+- Ajout du commentaire d'en-tête décrivant la commande `zmaccts` remplacée.
+
+## 0.2 — 2025-09-08
+
+- Ajout des liens directs vers le ticket (`{ZAMMAD_URL}/#ticket/zoom/{ticket_id}`) dans les messages de création/clôture.
+- Ajout d'une note Zammad ("Cloture") avant fermeture du ticket.
+- Fix logique : `if not args.silent or args.always` → `and` (le flag `--always` n'aurait sinon jamais eu d'effet réel sur le silence).
+
+## 0.1 — 2025-09-04
+
+Première version connue (pré-git).
