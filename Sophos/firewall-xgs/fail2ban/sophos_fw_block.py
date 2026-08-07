@@ -5,7 +5,7 @@ Appelé par fail2ban (actionban/actionunban) pour bloquer/débloquer des IP
 via une règle firewall existante référençant le groupe cible.
 """
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 import argparse
 import configparser
@@ -216,11 +216,16 @@ def main():
     parser.add_argument(
         "--debug", action="store_true", help="log les requêtes/réponses XML brutes"
     )
+    parser.add_argument(
+        "--group", help="surcharge le groupe (IPHostGroup) défini dans la config"
+    )
     args = parser.parse_args()
 
     setup_logging(args.debug)
     ip = validate_ip(args.ip)
     cfg = load_config(args.config)
+    if args.group:
+        cfg["group"] = args.group
 
     try:
         if args.action == "ban":

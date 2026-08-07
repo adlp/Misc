@@ -63,6 +63,13 @@ Ajouter `--debug` pour logger les requêtes/réponses XML brutes (mot de
 passe masqué) — utile pour diagnostiquer une erreur API (ex: code `534`
 ci-dessus).
 
+Ajouter `--group <nom>` pour surcharger ponctuellement le groupe défini
+dans la config (ex: tester sur un groupe de test avant bascule en prod) :
+
+```bash
+/usr/local/bin/sophos_fw_block.py ban 203.0.113.5 --group Fail2Ban-Test
+```
+
 Logs envoyés sur syslog (tag `sophos-fw-block`) + stderr (visible dans les
 logs fail2ban en cas d'échec, exit code 1).
 

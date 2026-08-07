@@ -1,5 +1,12 @@
 # Changelog
 
+## firewall-xgs/fail2ban 1.1.0 — 2026-08-07
+
+### Added
+- `--group` : surcharge en ligne de commande le groupe (`IPHostGroup`)
+  défini dans le fichier de config — utile pour tester/gérer plusieurs
+  groupes sans dupliquer la config
+
 ## firewall-xgs/fail2ban 1.0.1 — 2026-08-07
 
 ### Fixed
