@@ -53,6 +53,44 @@ action  = %(action_)s
           sophos-xgs
 ```
 
+### Exemple : sonde de scripts PHP inexistants (404)
+
+`filter.d/php-404.conf` détecte les requêtes `GET/POST/HEAD` vers un
+`*.php` qui répondent `404` (scan de vulnérabilités classique :
+`xmlrpc.php`, `wp-login.php`, etc). Une requête PHP en `200` ne matche
+jamais — le code est littéral dans le failregex.
+
+```bash
+sudo cp filter.d/php-404.conf /etc/fail2ban/filter.d/
+```
+
+```ini
+[php-404]
+enabled  = true
+port     = http,https
+filter   = php-404
+logpath  = /var/log/nginx/access.log
+action   = %(action_)s
+           sophos-xgs
+maxretry = 3
+findtime = 600
+bantime  = 86400
+```
+
+Le filtre attend l'IP client réelle en dernier champ de la ligne (cas
+courant derrière un proxy/CDN qui l'ajoute en fin de log) — voir le
+commentaire dans `filter.d/php-404.conf` pour la variante sans proxy.
+
+Tester le filtre avec `fail2ban-regex`, sans toucher à fail2ban :
+
+```bash
+# sur une ligne précise
+fail2ban-regex '192.168.2.1 - - [06/Aug/2026:13:53:05 +0000] "GET /xmlrpc.php?rsd HTTP/1.1" 404 5140 "-" "Mozilla/5.0" "34.22.236.107"' filter.d/php-404.conf
+
+# sur tout le fichier de log
+fail2ban-regex /var/log/nginx/access.log filter.d/php-404.conf
+```
+
 `fail2ban-server` tourne en root : le script lit `/etc/sophos-fw/api.conf`
 (root:root, 600) sans souci de permissions.
 

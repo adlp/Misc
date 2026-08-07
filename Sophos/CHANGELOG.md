@@ -1,5 +1,17 @@
 # Changelog
 
+## firewall-xgs/fail2ban 1.3.0 — 2026-08-07
+
+### Added
+- `filter.d/php-404.conf` : détecte les sondes de scripts PHP inexistants
+  (404) — scan de vulnérabilités classique (xmlrpc.php, wp-login.php,
+  etc). Une requête PHP en 200 ne matche jamais (code littéral dans le
+  failregex). Capture l'IP client réelle en dernier champ de la ligne
+  (cas proxy/CDN), avec variante commentée pour logs sans proxy.
+- README : exemple de jail complet (`[php-404]`) branché sur l'action
+  `sophos-xgs`, et 2 exemples `fail2ban-regex` pour tester le filtre
+  (sur une ligne précise, puis sur tout le fichier de log)
+
 ## firewall-xgs/fail2ban 1.2.1 — 2026-08-07
 
 ### Documentation
