@@ -5,7 +5,7 @@ Appelé par fail2ban (actionban/actionunban) pour bloquer/débloquer des IP
 via une règle firewall existante référençant le groupe cible.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import argparse
 import configparser
@@ -30,6 +30,7 @@ from urllib3.exceptions import InsecureRequestWarning  # noqa: E402
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 DEFAULT_CONFIG_PATH = "/etc/sophos-fw/api.conf"
+DEFAULT_PREFIX = "f2b_"
 
 
 def setup_logging(debug=False):
@@ -59,6 +60,7 @@ def load_config(path):
             "password": sec["password"],
             "verify_ssl": sec.getboolean("verify_ssl", fallback=False),
             "group": sec["group"],
+            "prefix": sec.get("prefix", fallback=DEFAULT_PREFIX),
         }
     except KeyError as exc:
         raise SystemExit(f"clé manquante dans {path}: {exc}")
@@ -72,8 +74,8 @@ def validate_ip(ip):
     return ip
 
 
-def host_name_for_ip(ip):
-    return "f2b_" + ip.replace(".", "_").replace(":", "_")
+def host_name_for_ip(ip, prefix=DEFAULT_PREFIX):
+    return prefix + ip.replace(".", "_").replace(":", "_")
 
 
 def api_call(cfg, body_xml):
@@ -137,6 +139,28 @@ def get_group_hosts(cfg):
     return [h.text for h in hostlist.findall("Host") if h.text]
 
 
+def get_iphost_address(cfg, name):
+    body = (
+        "<Get><IPHost><Filter>"
+        f'<key name="Name" criteria="=">{escape(name)}</key>'
+        "</Filter></IPHost></Get>"
+    )
+    root = api_call(cfg, body)
+    host = root.find(".//IPHost")
+    if host is None:
+        return None
+    return host.findtext("IPAddress")
+
+
+def list_group(cfg):
+    """Retourne [(nom_objet, ip)] pour chaque membre du groupe configuré.
+
+    `ip` vaut None si l'objet IPHost référencé dans le groupe n'existe
+    plus (référence orpheline).
+    """
+    return [(name, get_iphost_address(cfg, name)) for name in get_group_hosts(cfg)]
+
+
 def set_group_hosts(cfg, hosts):
     host_xml = "".join(f"<Host>{escape(h)}</Host>" for h in hosts)
     body = (
@@ -185,7 +209,7 @@ def delete_iphost(cfg, name):
 
 
 def ban(cfg, ip):
-    name = host_name_for_ip(ip)
+    name = host_name_for_ip(ip, cfg["prefix"])
     create_iphost(cfg, name, ip)
     hosts = get_group_hosts(cfg)
     if name not in hosts:
@@ -196,7 +220,7 @@ def ban(cfg, ip):
 
 
 def unban(cfg, ip):
-    name = host_name_for_ip(ip)
+    name = host_name_for_ip(ip, cfg["prefix"])
     hosts = get_group_hosts(cfg)
     if name in hosts:
         hosts = [h for h in hosts if h != name]
@@ -208,8 +232,8 @@ def unban(cfg, ip):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["ban", "unban"])
-    parser.add_argument("ip")
+    parser.add_argument("action", choices=["ban", "unban", "list"])
+    parser.add_argument("ip", nargs="?", help="requis pour ban/unban, ignoré pour list")
     parser.add_argument(
         "--config", default=DEFAULT_CONFIG_PATH, help="chemin fichier config API"
     )
@@ -219,21 +243,32 @@ def main():
     parser.add_argument(
         "--group", help="surcharge le groupe (IPHostGroup) défini dans la config"
     )
+    parser.add_argument(
+        "--prefix", help="surcharge le préfixe des noms IPHost défini dans la config"
+    )
     args = parser.parse_args()
 
+    if args.action in ("ban", "unban") and not args.ip:
+        parser.error(f"argument ip requis pour l'action '{args.action}'")
+
     setup_logging(args.debug)
-    ip = validate_ip(args.ip)
+    ip = validate_ip(args.ip) if args.ip else None
     cfg = load_config(args.config)
     if args.group:
         cfg["group"] = args.group
+    if args.prefix:
+        cfg["prefix"] = args.prefix
 
     try:
         if args.action == "ban":
             ban(cfg, ip)
-        else:
+        elif args.action == "unban":
             unban(cfg, ip)
+        else:
+            for name, host_ip in list_group(cfg):
+                print(f"{host_ip or '?':<15} {name}")
     except Exception as exc:
-        logging.error("%s %s: %s", args.action, ip, exc)
+        logging.error("%s%s: %s", args.action, f" {ip}" if ip else "", exc)
         sys.exit(1)
 
 

@@ -5,3 +5,5 @@ username = apiuser
 password = changeme
 verify_ssl = false
 group = Fail2Ban-Block
+# préfixe des noms IPHost créés (optionnel, défaut: f2b_)
+prefix = f2b_

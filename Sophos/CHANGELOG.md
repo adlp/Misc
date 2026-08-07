@@ -1,5 +1,14 @@
 # Changelog
 
+## firewall-xgs/fail2ban 1.2.0 — 2026-08-07
+
+### Added
+- Action `list` (place de `ban`/`unban`) : affiche les IP actuellement
+  bloquées dans le groupe configuré (`ip introuvable` marquée `?` si
+  l'objet `IPHost` référencé n'existe plus)
+- Préfixe des noms `IPHost` (`f2b_` par défaut) rendu paramétrable via la
+  clé `prefix` du fichier de config et surchargeable via `--prefix`
+
 ## firewall-xgs/fail2ban 1.1.0 — 2026-08-07
 
 ### Added

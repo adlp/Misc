@@ -70,6 +70,15 @@ dans la config (ex: tester sur un groupe de test avant bascule en prod) :
 /usr/local/bin/sophos_fw_block.py ban 203.0.113.5 --group Fail2Ban-Test
 ```
 
+Ajouter `--prefix <préfixe>` pour surcharger ponctuellement le préfixe
+des noms `IPHost` défini dans la config (défaut : `f2b_`).
+
+Lister les IP actuellement bloquées dans le groupe (pas d'IP à fournir) :
+
+```bash
+/usr/local/bin/sophos_fw_block.py list
+```
+
 Logs envoyés sur syslog (tag `sophos-fw-block`) + stderr (visible dans les
 logs fail2ban en cas d'échec, exit code 1).
 
