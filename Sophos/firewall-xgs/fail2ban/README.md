@@ -72,3 +72,10 @@ logs fail2ban en cas d'échec, exit code 1).
   Passer à `true` + fournir un cert de confiance si le firewall est joignable
   sur un réseau non fiable.
 - IPv4 uniquement pour l'instant (`HostType=IP`, `IPFamily=IPv4`).
+
+## Note : warning `RequestsDependencyWarning`
+
+Le paquet `python3-requests` d'apt (2.25.1) émet parfois un warning au
+chargement si une version d'`urllib3`/`chardet` plus récente que celle
+attendue est présente sur le système. Ce warning est filtré directement
+dans le script (aucune action requise, pas de `pip install`).

@@ -5,7 +5,7 @@ Appelé par fail2ban (actionban/actionunban) pour bloquer/débloquer des IP
 via une règle firewall existante référençant le groupe cible.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 import argparse
 import configparser
@@ -13,11 +13,19 @@ import ipaddress
 import logging
 import logging.handlers
 import sys
+import warnings
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
-import requests
-from urllib3.exceptions import InsecureRequestWarning
+# requests (paquet apt, ancien) vérifie la version d'urllib3/chardet au
+# chargement et émet ce warning si une version plus récente est installée
+# par ailleurs (pip --user) ; sans impact sur le fonctionnement du script.
+warnings.filterwarnings(
+    "ignore", message=r".*doesn't match a supported version.*"
+)
+
+import requests  # noqa: E402
+from urllib3.exceptions import InsecureRequestWarning  # noqa: E402
 
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 

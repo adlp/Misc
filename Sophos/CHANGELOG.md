@@ -1,5 +1,12 @@
 # Changelog
 
+## firewall-xgs/fail2ban 1.0.1 — 2026-08-07
+
+### Fixed
+- Filtre le `RequestsDependencyWarning` (`urllib3`/`chardet` "doesn't match a
+  supported version") émis par le `requests` apt (2.25.1) au chargement du
+  module, sans toucher aux paquets système ni faire de `pip install`
+
 ## firewall-xgs/fail2ban 1.0.0 — 2026-08-07
 
 Première version fonctionnelle, validée sur firewall XGS réel.
