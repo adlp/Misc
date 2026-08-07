@@ -3,3 +3,4 @@ CLAUDE.md
 */CLAUDE.md
 **/.claude
 **/__pycache__/
+**/conf/*.conf

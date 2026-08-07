@@ -19,6 +19,10 @@ l'IP d'un `IPHostGroup` référencé par une règle Deny existante.
    compte avec profil ayant l'accès API, puis activer l'API sur la zone
    d'administration (System → Administration → Device Access → coche "API"
    sur la zone depuis laquelle ce script appelle le firewall).
+4. **IP autorisée** : si l'appel échoue avec `534: API operations are not
+   allowed from the requester IP address`, ajouter l'IP de la machine qui
+   lance le script à la liste d'accès autorisée du compte API
+   (Administration → User → Edit → "Login Restriction for this User").
 
 ## Installation
 
@@ -54,6 +58,10 @@ action  = %(action_)s
 /usr/local/bin/sophos_fw_block.py ban 203.0.113.5
 /usr/local/bin/sophos_fw_block.py unban 203.0.113.5
 ```
+
+Ajouter `--debug` pour logger les requêtes/réponses XML brutes (mot de
+passe masqué) — utile pour diagnostiquer une erreur API (ex: code `534`
+ci-dessus).
 
 Logs envoyés sur syslog (tag `sophos-fw-block`) + stderr (visible dans les
 logs fail2ban en cas d'échec, exit code 1).

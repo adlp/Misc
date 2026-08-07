@@ -5,6 +5,8 @@ Appelé par fail2ban (actionban/actionunban) pour bloquer/débloquer des IP
 via une règle firewall existante référençant le groupe cible.
 """
 
+__version__ = "1.0.0"
+
 import argparse
 import configparser
 import ipaddress
@@ -22,9 +24,9 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 DEFAULT_CONFIG_PATH = "/etc/sophos-fw/api.conf"
 
 
-def setup_logging():
+def setup_logging(debug=False):
     logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
     try:
         syslog = logging.handlers.SysLogHandler(address="/dev/log")
         syslog.setFormatter(logging.Formatter("sophos-fw-block: %(message)s"))
@@ -73,10 +75,12 @@ def api_call(cfg, body_xml):
         f"<Password>{escape(cfg['password'])}</Password></Login>"
     )
     xml = f"<Request>{login}{body_xml}</Request>"
+    logging.debug("requête XML: %s", xml.replace(escape(cfg["password"]), "***"))
     resp = requests.post(
         url, data={"reqxml": xml}, verify=cfg["verify_ssl"], timeout=15
     )
     resp.raise_for_status()
+    logging.debug("réponse XML: %s", resp.text)
     root = ET.fromstring(resp.text)
     check_login(root)
     return root
@@ -91,10 +95,22 @@ def check_login(root):
 
 
 def parse_status(root, tag):
+    """Retourne (code, texte) du <Status> sous `tag`.
+
+    Certaines erreurs API renvoient un format sans <Status> (ex: <Error>
+    <Message>). On retombe alors sur ce message, ou à défaut sur le XML
+    brut du nœud pour ne pas perdre l'info en cas de schéma imprévu.
+    """
     el = root.find(f".//{tag}/Status")
-    if el is None:
-        return None, None
-    return el.attrib.get("code"), (el.text or "").strip()
+    if el is not None:
+        return el.attrib.get("code"), (el.text or "").strip()
+    msg = root.find(f".//{tag}//Message")
+    if msg is not None and msg.text:
+        return None, msg.text.strip()
+    node = root.find(f".//{tag}")
+    if node is not None:
+        return None, ET.tostring(node, encoding="unicode").strip()
+    return None, ET.tostring(root, encoding="unicode").strip()
 
 
 def get_group_hosts(cfg):
@@ -189,9 +205,12 @@ def main():
     parser.add_argument(
         "--config", default=DEFAULT_CONFIG_PATH, help="chemin fichier config API"
     )
+    parser.add_argument(
+        "--debug", action="store_true", help="log les requêtes/réponses XML brutes"
+    )
     args = parser.parse_args()
 
-    setup_logging()
+    setup_logging(args.debug)
     ip = validate_ip(args.ip)
     cfg = load_config(args.config)
 
