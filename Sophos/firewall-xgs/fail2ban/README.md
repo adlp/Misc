@@ -56,9 +56,11 @@ action  = %(action_)s
 ### Exemple : sonde de scripts PHP inexistants (404)
 
 `filter.d/php-404.conf` détecte les requêtes `GET/POST/HEAD` vers un
-`*.php` qui répondent `404` (scan de vulnérabilités classique :
-`xmlrpc.php`, `wp-login.php`, etc). Une requête PHP en `200` ne matche
-jamais — le code est littéral dans le failregex.
+`*.php`/`*.php7`/`*.php8`, ou vers un chemin WordPress classique
+(`wp-login`, `wp-admin`, `xmlrpc`, `wp-content`, `wp-includes`,
+`wordpress`), qui répondent `404`. Une requête PHP/WordPress en `200` ne
+matche jamais — le code `404` est littéral dans chacun des deux
+failregex.
 
 ```bash
 sudo cp filter.d/php-404.conf /etc/fail2ban/filter.d/

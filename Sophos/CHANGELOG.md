@@ -12,6 +12,13 @@
   `sophos-xgs`, et 2 exemples `fail2ban-regex` pour tester le filtre
   (sur une ligne précise, puis sur tout le fichier de log)
 
+### Changed
+- `filter.d/php-404.conf` : failregex remplacé par une version testée en
+  conditions réelles — 2 patterns distincts (`.php`/`.php7`/`.php8`, et
+  chemins WordPress `wp-login`/`wp-admin`/`xmlrpc`/`wp-content`/
+  `wp-includes`/`wordpress`), chacun avec `404` littéral pour garantir
+  qu'un hit PHP/WordPress en 200 ne matche jamais
+
 ## firewall-xgs/fail2ban 1.2.1 — 2026-08-07
 
 ### Documentation
