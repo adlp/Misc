@@ -8,7 +8,11 @@ l'IP d'un `IPHostGroup` référencé par une règle Deny existante.
 
 - **ban** : crée un objet `IPHost` pour l'IP (`f2b_<ip>`), l'ajoute au groupe.
 - **unban** : retire l'IP du groupe, supprime l'objet `IPHost`.
+- **list** : affiche les IP actuellement bloquées dans le groupe.
 - Idempotent : ré-appeler ban/unban sur une IP déjà (dés)activée ne casse rien.
+
+Détail de toutes les options et du format de config attendu :
+`sophos_fw_block.py --help`
 
 ## Prérequis côté Sophos Firewall
 

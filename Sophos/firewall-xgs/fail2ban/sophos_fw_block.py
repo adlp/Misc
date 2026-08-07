@@ -5,7 +5,7 @@ Appelé par fail2ban (actionban/actionunban) pour bloquer/débloquer des IP
 via une règle firewall existante référençant le groupe cible.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 import argparse
 import configparser
@@ -230,12 +230,43 @@ def unban(cfg, ip):
     delete_iphost(cfg, name)
 
 
+CONFIG_HELP = f"""\
+Fichier de config attendu (section [api]), défaut: {DEFAULT_CONFIG_PATH}
+
+  [api]
+  host        = 192.168.1.1      # IP/nom du firewall XGS
+  port        = 4444             # port admin API (défaut: 4444)
+  username    = apiuser          # compte avec accès API activé
+  password    = ***
+  verify_ssl  = false            # true si cert firewall vérifiable
+  group       = Fail2Ban-Block   # IPHostGroup déjà créé, référencé
+                                  #   par une règle Deny sur le firewall
+  prefix      = f2b_             # optionnel, préfixe des IPHost créés
+
+Exemples:
+  sophos_fw_block.py ban 203.0.113.5
+  sophos_fw_block.py unban 203.0.113.5
+  sophos_fw_block.py list
+  sophos_fw_block.py ban 203.0.113.5 --group Fail2Ban-Test --debug
+"""
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["ban", "unban", "list"])
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=CONFIG_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "action",
+        choices=["ban", "unban", "list"],
+        help="ban/unban une IP, ou list les IP actuellement bloquées",
+    )
     parser.add_argument("ip", nargs="?", help="requis pour ban/unban, ignoré pour list")
     parser.add_argument(
-        "--config", default=DEFAULT_CONFIG_PATH, help="chemin fichier config API"
+        "--config",
+        default=DEFAULT_CONFIG_PATH,
+        help=f"chemin fichier config API (défaut: {DEFAULT_CONFIG_PATH})",
     )
     parser.add_argument(
         "--debug", action="store_true", help="log les requêtes/réponses XML brutes"
@@ -244,7 +275,9 @@ def main():
         "--group", help="surcharge le groupe (IPHostGroup) défini dans la config"
     )
     parser.add_argument(
-        "--prefix", help="surcharge le préfixe des noms IPHost défini dans la config"
+        "--prefix",
+        help="surcharge le préfixe des noms IPHost défini dans la config"
+        f" (défaut config: {DEFAULT_PREFIX})",
     )
     args = parser.parse_args()
 

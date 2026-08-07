@@ -1,5 +1,12 @@
 # Changelog
 
+## firewall-xgs/fail2ban 1.2.1 — 2026-08-07
+
+### Documentation
+- `--help` détaillé : description de chaque option, format complet du
+  fichier de config attendu (`[api]` : host, port, username, password,
+  verify_ssl, group, prefix), exemples d'appel
+
 ## firewall-xgs/fail2ban 1.2.0 — 2026-08-07
 
 ### Added
