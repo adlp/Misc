@@ -58,7 +58,7 @@ zimLocAccZam [-d] [-C fichier_config] [-a] [-s] [-n]
 - `2` : erreur d'accès Zimbra/LDAP (bind, recherche, `zmlocalconfig`)
 - `3` : erreur d'accès Zammad (requête HTTP en échec)
 
-Aucun cas ne remonte de stack trace brute : message d'erreur clair sur stderr dans tous les cas.
+Aucun cas ne remonte de stack trace brute : message d'erreur clair sur stderr dans tous les cas, enrichi du compte/ticket en cours de traitement quand cette info est connue (ex : `Erreur d'accès Zammad : ... [compte=bob@example.org, ticket=5]`).
 
 ## Versions
 

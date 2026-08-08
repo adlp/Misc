@@ -1,6 +1,6 @@
 #!/usr/bin/env python3.8
 
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 
 import subprocess
 import ldap
@@ -14,6 +14,13 @@ import argparse
 import sys
 
 # Script pour remplacer avantageusement la commande suivante : /opt/zimbra/bin/zmaccts | grep -v "^zzz_" | grep  " lockout "
+
+# 🩹 Contexte du compte/ticket en cours de traitement, pour enrichir les messages d'erreur
+_CTX = {}
+
+def _ctx_info():
+    parts = [f"{k}={v}" for k, v in _CTX.items() if v not in (None, "", "****")]
+    return f" [{', '.join(parts)}]" if parts else ""
 
 class Zammad:
 
@@ -280,6 +287,7 @@ def main():
     zammad=Zammad(url= ZAMMAD_URL,token= ZAMMAD_TOKEN, group=ZAMMAD_GRP,customer_id=ZAMMAD_CUST_ID,organization_id=ZAMMAD_ORGZ_ID)
 
     for account in locked_accounts.keys():
+        _CTX.clear(); _CTX['compte'] = account
         if is_excluded(account):
             continue
         if account not in cache:
@@ -288,6 +296,7 @@ def main():
             infos       = locked_accounts[account]['infos']
             if not args.no_create:
                 ticket_id   = zammad.create(f'[ZIMBRA] Locked :{account}',subject="infos",body=yaml.dump(filter_infos(infos),allow_unicode=True))
+                _CTX['ticket'] = ticket_id
                 zammad.note(ticket_id,"logs",logs)
                 new_cache[account] = {"ticket_id": ticket_id, "logs":logs,'infos':infos}
             else:
@@ -297,12 +306,14 @@ def main():
                 print(f'    visible là : {ZAMMAD_URL}/#ticket/zoom/{ticket_id}')
         else:
             # Toujours bloqué, on garde le ticket, on verifie qu'il n'est pas fermé...
+            _CTX['ticket'] = cache[account]['ticket_id']
             new_cache[account] = cache[account]
             tick=zammad.ticket(cache[account]['ticket_id'])
             if tick is None or tick['close_at'] is not None:
                 logs        = "\n".join(extract_failed_auth_lines(account))
                 infos       = locked_accounts[account]['infos']
                 ticket_id   = zammad.create(f'[ZIMBRA] Locked :{account}',subject="infos",body=yaml.dump(filter_infos(infos),allow_unicode=True))
+                _CTX['ticket'] = ticket_id
                 if not args.silent:
                     print(f'Ticket reCréation de ticket {ticket_id} pour {account}')
                 zammad.note(ticket_id,"logs",logs)
@@ -315,6 +326,7 @@ def main():
     # 🔁 Détection des comptes débloqués
     for account in cache:
         ticket_id=cache[account]['ticket_id']
+        _CTX.clear(); _CTX['compte'] = account; _CTX['ticket'] = ticket_id
         if account not in locked_accounts.keys() and not is_excluded(account):
             tick=zammad.ticket(ticket_id)
             if tick is None:
@@ -340,17 +352,17 @@ if __name__ == "__main__":
     try:
         main()
     except ldap.LDAPError as e:
-        print(f"Erreur d'accès LDAP/Zimbra : {e}", file=sys.stderr)
+        print(f"Erreur d'accès LDAP/Zimbra : {e}{_ctx_info()}", file=sys.stderr)
         sys.exit(2)
     except RuntimeError as e:
-        print(f"Erreur d'accès Zimbra : {e}", file=sys.stderr)
+        print(f"Erreur d'accès Zimbra : {e}{_ctx_info()}", file=sys.stderr)
         sys.exit(2)
     except (requests.exceptions.RequestException, ValueError) as e:
-        print(f"Erreur d'accès Zammad : {e}", file=sys.stderr)
+        print(f"Erreur d'accès Zammad : {e}{_ctx_info()}", file=sys.stderr)
         sys.exit(3)
     except (configparser.Error, FileNotFoundError) as e:
-        print(f"Erreur de configuration : {e}", file=sys.stderr)
+        print(f"Erreur de configuration : {e}{_ctx_info()}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
-        print(f"Erreur inattendue : {e}", file=sys.stderr)
+        print(f"Erreur inattendue : {e}{_ctx_info()}", file=sys.stderr)
         sys.exit(1)
