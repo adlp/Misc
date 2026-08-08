@@ -1,5 +1,10 @@
 # Changelog — zimLocAccZam
 
+## 1.0.4 — 2026-08-07
+
+- Audit complet post-1.0.3 (tests avec LDAP/Zammad stubbés : création, exclusion, clôture, recréation de ticket) pour vérifier l'absence d'autres régressions du même type que le fix `EXCLUDE_REGEXES`.
+- Fix trouvé pendant cet audit : une réponse Zammad non-JSON (proxy cassé, page d'erreur HTML — cas réaliste de panne d'accès) fait lever `response.json()` une erreur de décodage JSON qui n'était pas interceptée par `except requests.exceptions.RequestException`, et tombait donc en "Erreur inattendue" (exit 1) au lieu d'"Erreur d'accès Zammad" (exit 3). Le type d'exception exact dépend même de l'environnement (`simplejson` vs `json` stdlib selon ce qui est installé). Handler élargi à `ValueError` (classe commune aux deux implémentations) pour capturer ce cas de façon portable.
+
 ## 1.0.3 — 2026-08-07
 
 - Fix régression introduite en 1.0.2 : `EXCLUDE_REGEXES` était devenue une variable locale à `main()` lors du passage du code principal dans une fonction, alors que `is_excluded()` (au niveau module) y accède en tant que globale → `NameError: name 'EXCLUDE_REGEXES' is not defined` à chaque exécution (capturé par le nouveau handler générique, d'où le message "Erreur inattendue"). Ajout de `global EXCLUDE_REGEXES` dans `main()`.
