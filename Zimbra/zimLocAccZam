@@ -1,6 +1,6 @@
 #!/usr/bin/env python3.8
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 import subprocess
 import ldap
@@ -223,6 +223,8 @@ def filter_infos(infos):
 
 # 🧾 Exécution
 def main():
+    global EXCLUDE_REGEXES
+
     CONFIG_PATH = os.path.expanduser("~/.zimLocAccZam")
 
     parser = argparse.ArgumentParser(description="Generateur de tickets Zammad lorsque compte lock")

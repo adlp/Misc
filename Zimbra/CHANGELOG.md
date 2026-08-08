@@ -1,5 +1,9 @@
 # Changelog — zimLocAccZam
 
+## 1.0.3 — 2026-08-07
+
+- Fix régression introduite en 1.0.2 : `EXCLUDE_REGEXES` était devenue une variable locale à `main()` lors du passage du code principal dans une fonction, alors que `is_excluded()` (au niveau module) y accède en tant que globale → `NameError: name 'EXCLUDE_REGEXES' is not defined` à chaque exécution (capturé par le nouveau handler générique, d'où le message "Erreur inattendue"). Ajout de `global EXCLUDE_REGEXES` dans `main()`.
+
 ## 1.0.2 — 2026-08-05
 
 - Plus de stack trace en cas de problème d'accès Zimbra/LDAP ou Zammad. Logique principale déplacée dans `main()`, appelée sous `try/except` :
