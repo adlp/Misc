@@ -2,13 +2,20 @@
 
 Script d'action fail2ban qui bloque/débloque des IP sur un Sophos Firewall
 XGS via son API XML legacy (`webconsole/APIController`), en ajoutant/retirant
-l'IP d'un `IPHostGroup` référencé par une règle Deny existante.
+l'IP d'un `IPHostGroup` et/ou d'une IP list (`IPHost` type `IP list`)
+référencé(e) par une règle Deny existante. Au moins un des deux doit être
+configuré, les deux peuvent l'être en même temps.
 
 ## Fonctionnement
 
-- **ban** : crée un objet `IPHost` pour l'IP (`f2b_<ip>`), l'ajoute au groupe.
-- **unban** : retire l'IP du groupe, supprime l'objet `IPHost`.
-- **list** : affiche les IP actuellement bloquées dans le groupe.
+- **ban** :
+  - si `group` configuré : crée un objet `IPHost` pour l'IP (`f2b_<ip>`),
+    l'ajoute au groupe.
+  - si `iplist` configuré : ajoute l'IP directement dans la liste
+    d'adresses de l'IP list.
+- **unban** : inverse des opérations ci-dessus.
+- **list** : affiche les IP actuellement bloquées (groupe et/ou IP list,
+  selon config).
 - Idempotent : ré-appeler ban/unban sur une IP déjà (dés)activée ne casse rien.
 
 Détail de toutes les options et du format de config attendu :
@@ -16,9 +23,14 @@ Détail de toutes les options et du format de config attendu :
 
 ## Prérequis côté Sophos Firewall
 
-1. **Groupe IP** : créer un `IPHostGroup` (ex: `Fail2Ban-Block`) — vide au départ.
-2. **Règle firewall** : créer une règle Deny (source = ce groupe) sur la zone
-   concernée (WAN typiquement), placée avant les règles d'autorisation.
+1. **Objet(s) cible(s)** — au choix, ou les deux :
+   - **Groupe IP** : créer un `IPHostGroup` (ex: `Fail2Ban-Block`) — vide au
+     départ.
+   - **IP list** : onglet `IP Host` → créer un objet, type `IP list`
+     (ex: `Fail2Ban-List`) — vide au départ.
+2. **Règle firewall** : créer une règle Deny (source = groupe et/ou IP list)
+   sur la zone concernée (WAN typiquement), placée avant les règles
+   d'autorisation.
 3. **Utilisateur API** : Backup & Firmware / System Services → créer un
    compte avec profil ayant l'accès API, puis activer l'API sur la zone
    d'administration (System → Administration → Device Access → coche "API"
@@ -130,8 +142,16 @@ dans la config (ex: tester sur un groupe de test avant bascule en prod) :
 /usr/local/bin/sophos_fw_block.py ban 203.0.113.5 --group Fail2Ban-Test
 ```
 
+Ajouter `--iplist <nom>` pour surcharger ponctuellement l'IP list définie
+dans la config :
+
+```bash
+/usr/local/bin/sophos_fw_block.py ban 203.0.113.5 --iplist Fail2Ban-List
+```
+
 Ajouter `--prefix <préfixe>` pour surcharger ponctuellement le préfixe
-des noms `IPHost` défini dans la config (défaut : `f2b_`).
+des noms `IPHost` défini dans la config (défaut : `f2b_`, utilisé
+seulement avec `group`).
 
 Lister les IP actuellement bloquées dans le groupe (pas d'IP à fournir) :
 
@@ -148,6 +168,11 @@ logs fail2ban en cas d'échec, exit code 1).
   Passer à `true` + fournir un cert de confiance si le firewall est joignable
   sur un réseau non fiable.
 - IPv4 uniquement pour l'instant (`HostType=IP`, `IPFamily=IPv4`).
+- IP list : le script suppose le champ `<ListOfIPAddresses>` (liste
+  d'adresses séparées par des virgules) pour un `IPHost` de type `IP
+  list`. Non confirmé contre la doc API officielle — à valider avec
+  `--debug` sur le premier `ban` réel ; en cas d'erreur `parse_status`
+  affichera le XML brut retourné par le firewall pour ajuster si besoin.
 
 ## Note : warning `RequestsDependencyWarning`
 

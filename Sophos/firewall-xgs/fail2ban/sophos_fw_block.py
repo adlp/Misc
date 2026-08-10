@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Ajoute/retire une IP d'un IPHostGroup Sophos Firewall (XGS) via API XML.
+"""Ajoute/retire une IP d'un IPHostGroup et/ou d'une IP list Sophos
+Firewall (XGS) via API XML.
 
 Appelé par fail2ban (actionban/actionunban) pour bloquer/débloquer des IP
-via une règle firewall existante référençant le groupe cible.
+via une règle firewall existante référençant le groupe et/ou l'IP list.
 """
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 import argparse
 import configparser
@@ -53,17 +54,21 @@ def load_config(path):
         raise SystemExit(f"config introuvable ou illisible: {path}")
     try:
         sec = cp["api"]
-        return {
+        cfg = {
             "host": sec["host"],
             "port": sec.getint("port", fallback=4444),
             "username": sec["username"],
             "password": sec["password"],
             "verify_ssl": sec.getboolean("verify_ssl", fallback=False),
-            "group": sec["group"],
+            "group": sec.get("group", fallback=None) or None,
+            "iplist": sec.get("iplist", fallback=None) or None,
             "prefix": sec.get("prefix", fallback=DEFAULT_PREFIX),
         }
     except KeyError as exc:
         raise SystemExit(f"clé manquante dans {path}: {exc}")
+    if not cfg["group"] and not cfg["iplist"]:
+        raise SystemExit(f"{path}: au moins une des clés group/iplist requise")
+    return cfg
 
 
 def validate_ip(ip):
@@ -208,26 +213,71 @@ def delete_iphost(cfg, name):
         logging.warning("suppression IPHost %s non confirmée: %s %s", name, code, text)
 
 
+def get_iplist_addresses(cfg):
+    body = (
+        "<Get><IPHost><Filter>"
+        f'<key name="Name" criteria="=">{escape(cfg["iplist"])}</key>'
+        "</Filter></IPHost></Get>"
+    )
+    root = api_call(cfg, body)
+    host = root.find(".//IPHost")
+    if host is None:
+        raise RuntimeError(f"IP list {cfg['iplist']} introuvable sur le firewall")
+    raw = host.findtext("ListOfIPAddresses") or ""
+    return [ip.strip() for ip in raw.split(",") if ip.strip()]
+
+
+def set_iplist_addresses(cfg, ips):
+    body = (
+        '<Set operation="update"><IPHost>'
+        f"<Name>{escape(cfg['iplist'])}</Name>"
+        "<HostType>IPList</HostType>"
+        f"<ListOfIPAddresses>{escape(','.join(ips))}</ListOfIPAddresses>"
+        "</IPHost></Set>"
+    )
+    root = api_call(cfg, body)
+    code, text = parse_status(root, "IPHost")
+    if code != "200":
+        raise RuntimeError(f"mise à jour IP list {cfg['iplist']} échouée: {code} {text}")
+    logging.info("IP list %s mise à jour (%d IP)", cfg["iplist"], len(ips))
+
+
 def ban(cfg, ip):
-    name = host_name_for_ip(ip, cfg["prefix"])
-    create_iphost(cfg, name, ip)
-    hosts = get_group_hosts(cfg)
-    if name not in hosts:
-        hosts.append(name)
-        set_group_hosts(cfg, hosts)
-    else:
-        logging.info("%s déjà présent dans %s", name, cfg["group"])
+    if cfg["group"]:
+        name = host_name_for_ip(ip, cfg["prefix"])
+        create_iphost(cfg, name, ip)
+        hosts = get_group_hosts(cfg)
+        if name not in hosts:
+            hosts.append(name)
+            set_group_hosts(cfg, hosts)
+        else:
+            logging.info("%s déjà présent dans %s", name, cfg["group"])
+    if cfg["iplist"]:
+        ips = get_iplist_addresses(cfg)
+        if ip not in ips:
+            ips.append(ip)
+            set_iplist_addresses(cfg, ips)
+        else:
+            logging.info("%s déjà présent dans %s", ip, cfg["iplist"])
 
 
 def unban(cfg, ip):
-    name = host_name_for_ip(ip, cfg["prefix"])
-    hosts = get_group_hosts(cfg)
-    if name in hosts:
-        hosts = [h for h in hosts if h != name]
-        set_group_hosts(cfg, hosts)
-    else:
-        logging.info("%s absent de %s", name, cfg["group"])
-    delete_iphost(cfg, name)
+    if cfg["group"]:
+        name = host_name_for_ip(ip, cfg["prefix"])
+        hosts = get_group_hosts(cfg)
+        if name in hosts:
+            hosts = [h for h in hosts if h != name]
+            set_group_hosts(cfg, hosts)
+        else:
+            logging.info("%s absent de %s", name, cfg["group"])
+        delete_iphost(cfg, name)
+    if cfg["iplist"]:
+        ips = get_iplist_addresses(cfg)
+        if ip in ips:
+            ips = [x for x in ips if x != ip]
+            set_iplist_addresses(cfg, ips)
+        else:
+            logging.info("%s absent de %s", ip, cfg["iplist"])
 
 
 CONFIG_HELP = f"""\
@@ -239,15 +289,24 @@ Fichier de config attendu (section [api]), défaut: {DEFAULT_CONFIG_PATH}
   username    = apiuser          # compte avec accès API activé
   password    = ***
   verify_ssl  = false            # true si cert firewall vérifiable
-  group       = Fail2Ban-Block   # IPHostGroup déjà créé, référencé
-                                  #   par une règle Deny sur le firewall
+  group       = Fail2Ban-Block   # optionnel, IPHostGroup déjà créé,
+                                  #   référencé par une règle Deny
+  iplist      = Fail2Ban-List    # optionnel, IPHost de type "IP list"
+                                  #   déjà créé (onglet IP Host, type
+                                  #   "IP list"), référencé par une règle
   prefix      = f2b_             # optionnel, préfixe des IPHost créés
+                                  #   (utilisé seulement avec group)
+
+Au moins une des deux clés group/iplist est requise. Les deux peuvent
+être renseignées ensemble : l'IP est alors ajoutée/retirée des deux
+objets à chaque ban/unban.
 
 Exemples:
   sophos_fw_block.py ban 203.0.113.5
   sophos_fw_block.py unban 203.0.113.5
   sophos_fw_block.py list
   sophos_fw_block.py ban 203.0.113.5 --group Fail2Ban-Test --debug
+  sophos_fw_block.py ban 203.0.113.5 --iplist Fail2Ban-List
 """
 
 
@@ -275,6 +334,9 @@ def main():
         "--group", help="surcharge le groupe (IPHostGroup) défini dans la config"
     )
     parser.add_argument(
+        "--iplist", help="surcharge l'IP list (IPHost type IP list) définie dans la config"
+    )
+    parser.add_argument(
         "--prefix",
         help="surcharge le préfixe des noms IPHost défini dans la config"
         f" (défaut config: {DEFAULT_PREFIX})",
@@ -289,6 +351,8 @@ def main():
     cfg = load_config(args.config)
     if args.group:
         cfg["group"] = args.group
+    if args.iplist:
+        cfg["iplist"] = args.iplist
     if args.prefix:
         cfg["prefix"] = args.prefix
 
@@ -298,8 +362,12 @@ def main():
         elif args.action == "unban":
             unban(cfg, ip)
         else:
-            for name, host_ip in list_group(cfg):
-                print(f"{host_ip or '?':<15} {name}")
+            if cfg["group"]:
+                for name, host_ip in list_group(cfg):
+                    print(f"{host_ip or '?':<15} {name}")
+            if cfg["iplist"]:
+                for host_ip in get_iplist_addresses(cfg):
+                    print(f"{host_ip:<15} {cfg['iplist']}")
     except Exception as exc:
         logging.error("%s%s: %s", args.action, f" {ip}" if ip else "", exc)
         sys.exit(1)

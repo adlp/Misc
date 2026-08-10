@@ -4,6 +4,9 @@ port = 4444
 username = apiuser
 password = changeme
 verify_ssl = false
+# au moins une des deux clés group/iplist est requise (les deux possibles)
 group = Fail2Ban-Block
-# préfixe des noms IPHost créés (optionnel, défaut: f2b_)
+# IPHost de type "IP list" déjà créé (onglet IP Host, type "IP list")
+# iplist = Fail2Ban-List
+# préfixe des noms IPHost créés par group (optionnel, défaut: f2b_)
 prefix = f2b_

@@ -1,5 +1,21 @@
 # Changelog
 
+## firewall-xgs/fail2ban 1.4.0 — 2026-08-10
+
+### Added
+- Support d'un objet `IPHost` de type `IP list` (onglet IP Host → type
+  "IP list") en plus ou à la place du `IPHostGroup` existant. Nouvelle
+  clé config `iplist` (optionnelle) + option `--iplist`. Au moins une
+  des deux clés `group`/`iplist` est requise ; les deux peuvent être
+  actives simultanément (ban/unban répercuté sur les deux objets).
+  `list` affiche le contenu des deux si configurés.
+
+### Documentation
+- README/`--help`/`api.conf.example` mis à jour (nouveau prérequis IP
+  list côté firewall, exemples `--iplist`). Champ XML supposé
+  (`ListOfIPAddresses`, liste séparée par virgules) non confirmé contre
+  la doc API officielle — à valider avec `--debug` en conditions réelles.
+
 ## firewall-xgs/fail2ban 1.3.1 — 2026-08-10
 
 ### Documentation
