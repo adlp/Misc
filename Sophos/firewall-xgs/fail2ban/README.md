@@ -49,8 +49,25 @@ Dans `jail.local` :
 ```ini
 [sshd]
 enabled = true
-action  = %(action_)s
+action  = sophos-xgs
+```
+
+`action = sophos-xgs` seul : blocage uniquement côté Sophos (aucune règle
+iptables locale ajoutée). Pour bloquer aussi localement (iptables) en plus
+du firewall Sophos, ajouter `%(action_)s` :
+
+```ini
+action = %(action_)s
           sophos-xgs
+```
+
+Si des jails existantes remplissent déjà iptables inutilement (action
+`%(action_)s` sans besoin de blocage local), retirer `%(action_)s` de
+`action`, `reload` fail2ban, puis nettoyer les règles déjà posées :
+
+```bash
+sudo fail2ban-client reload
+sudo fail2ban-client unban --all   # si des règles iptables persistent
 ```
 
 ### Exemple : sonde de scripts PHP inexistants (404)
@@ -72,8 +89,7 @@ enabled  = true
 port     = http,https
 filter   = php-404
 logpath  = /var/log/nginx/access.log
-action   = %(action_)s
-           sophos-xgs
+action   = sophos-xgs
 maxretry = 3
 findtime = 600
 bantime  = 86400

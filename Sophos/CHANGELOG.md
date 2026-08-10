@@ -1,5 +1,14 @@
 # Changelog
 
+## firewall-xgs/fail2ban 1.3.1 — 2026-08-10
+
+### Documentation
+- README : exemples de jail passés à `action = sophos-xgs` seul (pas de
+  double blocage iptables + Sophos par défaut). Note expliquant comment
+  ajouter `%(action_)s` si un blocage local iptables est aussi voulu, et
+  comment nettoyer les règles iptables déjà posées par une jail
+  reconfigurée (`fail2ban-client reload` / `unban --all`).
+
 ## firewall-xgs/fail2ban 1.3.0 — 2026-08-07
 
 ### Added

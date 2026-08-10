@@ -5,7 +5,7 @@ Appelé par fail2ban (actionban/actionunban) pour bloquer/débloquer des IP
 via une règle firewall existante référençant le groupe cible.
 """
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 import argparse
 import configparser
