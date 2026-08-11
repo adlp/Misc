@@ -6,7 +6,7 @@ Appelé par fail2ban (actionban/actionunban) pour bloquer/débloquer des IP
 via une règle firewall existante référençant le groupe et/ou l'IP list.
 """
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 import argparse
 import configparser
@@ -190,9 +190,11 @@ def api_call(cfg, body_xml):
     dt = time.monotonic() - t0
     if DEBUG_TIMING:
         label = sys._getframe(1).f_code.co_name
+        http_version = {10: "1.0", 11: "1.1"}.get(resp.raw.version, resp.raw.version)
         logging.debug(
-            "[timing] appel API [%s] : %.3fs (HTTP %s, %d octets)",
-            label, dt, resp.status_code, len(resp.content),
+            "[timing] appel API [%s] : %.3fs (HTTP/%s %s, %d octets, Connection: %s)",
+            label, dt, http_version, resp.status_code, len(resp.content),
+            resp.headers.get("Connection", "<absent>"),
         )
     resp.raise_for_status()
     logging.debug("réponse XML: %s", resp.text)
@@ -319,33 +321,19 @@ def set_group_hosts(cfg, hosts):
 
 
 def add_to_group(cfg, name):
-    """Tente d'ajouter `name` au groupe en 1 seul appel, sans Get préalable.
+    """Ajoute `name` au groupe (get_group_hosts + set_group_hosts).
 
-    Essaie operation="add" sur le groupe avec juste ce membre. Non confirmé
-    comme fonctionnant sur un groupe déjà existant (échoué en test avec un
-    host fictif, 501 "validation failed" — voir test_group_merge.py) ; testé
-    ici avec un host réel (déjà créé par create_iphost avant cet appel), ce
-    qui n'avait pas été essayé. Si ça échoue quand même, repli sur le chemin
-    sûr (get_group_hosts + set_group_hosts, +1 appel) plutôt que de supposer
-    que le membre a été ajouté.
+    `operation="add"` sur un IPHostGroup déjà existant échoue TOUJOURS,
+    confirmé deux fois en conditions réelles : avec un host fictif (501
+    "Configuration parameters validation failed") et avec un host réel
+    (502 "Entity having same name already exists" — l'entité en conflit
+    est le GROUPE lui-même, pas le membre : ce message ne veut donc PAS
+    dire "membre déjà présent"). Un précédent code interprétait ce texte
+    comme "déjà présent" et s'arrêtait là sans jamais ajouter le membre —
+    bug silencieux (IPHost créé mais jamais bloqué). Ne plus tenter ce
+    chemin : toujours get+set (voir set_group_hosts pour le détail des
+    opérations confirmées dangereuses/non fonctionnelles sur IPHostGroup).
     """
-    body = (
-        '<Set operation="add"><IPHostGroup>'
-        f"<Name>{escape(cfg['group'])}</Name>"
-        f"<HostList><Host>{escape(name)}</Host></HostList>"
-        "</IPHostGroup></Set>"
-    )
-    root = api_call(cfg, body)
-    code, text = parse_status(root, "IPHostGroup")
-    if code == "200":
-        logging.info("%s ajouté à %s", name, cfg["group"])
-        return
-    if code and any(s in (text or "").lower() for s in ("already", "duplicate", "exist")):
-        logging.warning("%s déjà présent dans %s", name, cfg["group"])
-        return
-    logging.debug(
-        "operation=add sur %s a échoué (%s %s), repli get+set", cfg["group"], code, text
-    )
     hosts = get_group_hosts(cfg)
     if name not in hosts:
         hosts.append(name)

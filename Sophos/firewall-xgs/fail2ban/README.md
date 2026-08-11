@@ -11,8 +11,9 @@ configuré, les deux peuvent l'être en même temps.
 - **ban** :
   - si `group` configuré : crée un objet `IPHost` pour l'IP (`f2b_<ip>`)
     sans vérifier au préalable s'il existe déjà (un warning est loggé si
-    le firewall répond que l'objet existe), puis l'ajoute au groupe, de
-    même sans lecture préalable de la liste (warning si déjà membre).
+    le firewall répond que l'objet existe), puis l'ajoute au groupe (Get
+    de la liste actuelle puis Set complet — la seule méthode fiable,
+    voir "Limites connues").
   - si `iplist` configuré : ajoute l'IP directement dans la liste
     d'adresses de l'IP list.
 - **unban** : retire l'IP du groupe et supprime l'objet `IPHost` — un
@@ -212,12 +213,10 @@ logs fail2ban en cas d'échec, exit code 1).
   list`. Non confirmé contre la doc API officielle — à valider avec
   `--debug` sur le premier `ban` réel ; en cas d'erreur `parse_status`
   affichera le XML brut retourné par le firewall pour ajuster si besoin.
-- `ban` tente d'ajouter le membre au groupe en 1 appel
-  (`Set operation="add"`, sans lire la liste au préalable) ; testé en
-  échec avec un objet fictif (501, voir `test_group_merge.py`), pas
-  encore confirmé avec un objet réel. Repli automatique et sûr sur le
-  chemin get+set si ça échoue, donc pas de risque, mais le gain de temps
-  espéré n'est pas garanti tant que ce n'est pas observé en usage réel.
+- Tentative d'ajout au groupe en 1 appel (`Set operation="add"`)
+  abandonnée : confirmé en échouant toujours sur un groupe existant (501
+  avec un objet fictif, 502 avec un objet réel — voir CHANGELOG 1.6.1).
+  `ban` refait un `Get` avant chaque `Set` sur le groupe, comme avant 1.6.0.
 - `vacuum` ne détecte l'usage d'un `IPHost` que via son appartenance au
   groupe configuré — un objet `<prefix>*` référencé directement par une
   autre règle firewall (sans passer par ce groupe) ne serait pas détecté

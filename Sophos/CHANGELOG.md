@@ -1,5 +1,25 @@
 # Changelog
 
+## firewall-xgs/fail2ban 1.6.1 — 2026-08-11
+
+### Fixed
+- **Bug silencieux introduit en 1.6.0** : `add_to_group()` interprétait
+  toute erreur contenant "already"/"exist" comme "membre déjà présent"
+  et s'arrêtait là sans jamais faire le repli get+set. Confirmé en réel :
+  `Set operation="add"` sur un `IPHostGroup` existant renvoie
+  `502 Entity having same name already exists` même pour un tout nouveau
+  membre — l'entité en conflit est le **groupe**, pas le membre. Résultat
+  en prod : l'IPHost était créé mais jamais ajouté au groupe → IP non
+  bloquée, alors que le script ne loggait qu'un warning (pas d'erreur,
+  exit code 0). `add_to_group()` refait systématiquement get_group_hosts
+  + set_group_hosts, comme avant 1.6.0. `operation="add"` sur un
+  IPHostGroup existant est maintenant confirmé non fonctionnel dans tous
+  les cas testés (host fictif : 501 ; host réel : 502) — plus aucune
+  tentative de ce type dans le script.
+- Si vous avez utilisé `ban` en 1.6.0, vérifiez que les IP bannies depuis
+  sont bien membres du groupe (`sophos_fw_block.py list`) — possible
+  qu'elles aient été créées sans être bloquées.
+
 ## firewall-xgs/fail2ban 1.6.0 — 2026-08-11
 
 ### Added

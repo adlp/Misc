@@ -6,9 +6,14 @@ Sert à vérifier si ban peut passer de 3 appels API (create/get/set) à 2 en
 évitant le Get préalable avant chaque ajout de membre au groupe.
 
 Résultat déjà établi (voir CHANGELOG) : NON, operation="add" sur un groupe
-existant échoue (501, sémantique "create" pas "append") — ban/unban gardent
-le schéma get-puis-set. Ce script ne fait donc plus que documenter/re-vérifier
-ce point si besoin (ex: après une mise à jour firmware Sophos).
+existant échoue TOUJOURS — confirmé deux fois en réel : avec un host fictif
+(501 "Configuration parameters validation failed") et avec un host réel
+(502 "Entity having same name already exists" — l'entité en conflit est le
+GROUPE, pas le membre ; ne pas confondre avec un signal "membre déjà
+présent", ça a causé un bug silencieux en prod, voir CHANGELOG 1.6.1).
+ban/unban gardent le schéma get-puis-set. Ce script ne fait donc plus que
+documenter/re-vérifier ce point si besoin (ex: après une mise à jour
+firmware Sophos).
 
 /!\ Un second test (Remove ciblé sur un membre) a été supprimé de ce script :
 confirmé DANGEREUX et reproductible sur firewall réel — au lieu de retirer
