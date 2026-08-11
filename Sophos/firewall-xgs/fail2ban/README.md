@@ -17,6 +17,10 @@ configuré, les deux peuvent l'être en même temps.
 - **list** : affiche les IP actuellement bloquées (groupe et/ou IP list,
   selon config).
 - Idempotent : ré-appeler ban/unban sur une IP déjà (dés)activée ne casse rien.
+- group et iplist (si les deux configurés) traités en parallèle, et
+  session HTTP réutilisée entre les appels API d'une même invocation —
+  limite le temps par ban/unban (l'API XML Sophos réauthentifie à
+  chaque appel, c'est le facteur dominant restant).
 
 Détail de toutes les options et du format de config attendu :
 `sophos_fw_block.py --help`

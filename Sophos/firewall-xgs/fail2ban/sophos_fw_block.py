@@ -6,7 +6,7 @@ Appelé par fail2ban (actionban/actionunban) pour bloquer/débloquer des IP
 via une règle firewall existante référençant le groupe et/ou l'IP list.
 """
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 import argparse
 import configparser
@@ -16,6 +16,7 @@ import logging.handlers
 import sys
 import warnings
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from xml.sax.saxutils import escape
 
 # requests (paquet apt, ancien) vérifie la version d'urllib3/chardet au
@@ -32,6 +33,13 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 DEFAULT_CONFIG_PATH = "/etc/sophos-fw/api.conf"
 DEFAULT_PREFIX = "f2b_"
+
+# Session HTTP réutilisée pour tous les appels API d'une même invocation :
+# évite un handshake TCP/TLS neuf à chaque appel. Sûr en usage concurrent
+# ici (threads dans ban()/unban()) car aucun état mutable de la session
+# n'est touché par requête (auth transite dans le corps XML, pas en
+# cookie/en-tête de session).
+_session = requests.Session()
 
 
 def setup_logging(debug=False):
@@ -91,7 +99,7 @@ def api_call(cfg, body_xml):
     )
     xml = f"<Request>{login}{body_xml}</Request>"
     logging.debug("requête XML: %s", xml.replace(escape(cfg["password"]), "***"))
-    resp = requests.post(
+    resp = _session.post(
         url, data={"reqxml": xml}, verify=cfg["verify_ssl"], timeout=15
     )
     resp.raise_for_status()
@@ -242,8 +250,33 @@ def set_iplist_addresses(cfg, ips):
     logging.info("IP list %s mise à jour (%d IP)", cfg["iplist"], len(ips))
 
 
+def _run_parallel(*funcs):
+    """Exécute des callables sans argument, en parallèle si plusieurs.
+
+    group et iplist sont deux objets indépendants sur le firewall : les
+    traiter dans des threads séparés évite d'attendre séquentiellement
+    les allers-retours API de l'un puis de l'autre. Lève une exception
+    combinée si au moins un callable échoue (les autres vont à leur terme).
+    """
+    if not funcs:
+        return
+    if len(funcs) == 1:
+        funcs[0]()
+        return
+    with ThreadPoolExecutor(max_workers=len(funcs)) as pool:
+        futures = [pool.submit(f) for f in funcs]
+        errors = []
+        for f in futures:
+            try:
+                f.result()
+            except Exception as exc:
+                errors.append(str(exc))
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+
 def ban(cfg, ip):
-    if cfg["group"]:
+    def do_group():
         name = host_name_for_ip(ip, cfg["prefix"])
         create_iphost(cfg, name, ip)
         hosts = get_group_hosts(cfg)
@@ -252,7 +285,8 @@ def ban(cfg, ip):
             set_group_hosts(cfg, hosts)
         else:
             logging.info("%s déjà présent dans %s", name, cfg["group"])
-    if cfg["iplist"]:
+
+    def do_iplist():
         ips = get_iplist_addresses(cfg)
         if ip not in ips:
             ips.append(ip)
@@ -260,9 +294,16 @@ def ban(cfg, ip):
         else:
             logging.info("%s déjà présent dans %s", ip, cfg["iplist"])
 
+    tasks = []
+    if cfg["group"]:
+        tasks.append(do_group)
+    if cfg["iplist"]:
+        tasks.append(do_iplist)
+    _run_parallel(*tasks)
+
 
 def unban(cfg, ip):
-    if cfg["group"]:
+    def do_group():
         name = host_name_for_ip(ip, cfg["prefix"])
         hosts = get_group_hosts(cfg)
         if name in hosts:
@@ -271,13 +312,21 @@ def unban(cfg, ip):
         else:
             logging.info("%s absent de %s", name, cfg["group"])
         delete_iphost(cfg, name)
-    if cfg["iplist"]:
+
+    def do_iplist():
         ips = get_iplist_addresses(cfg)
         if ip in ips:
             ips = [x for x in ips if x != ip]
             set_iplist_addresses(cfg, ips)
         else:
             logging.info("%s absent de %s", ip, cfg["iplist"])
+
+    tasks = []
+    if cfg["group"]:
+        tasks.append(do_group)
+    if cfg["iplist"]:
+        tasks.append(do_iplist)
+    _run_parallel(*tasks)
 
 
 CONFIG_HELP = f"""\

@@ -1,5 +1,17 @@
 # Changelog
 
+## firewall-xgs/fail2ban 1.4.1 — 2026-08-11
+
+### Changed
+- Réutilisation d'une session HTTP (`requests.Session`) entre tous les
+  appels API d'une même invocation — évite un handshake TCP/TLS neuf à
+  chaque appel.
+- ban/unban : traitement de `group` et `iplist` en parallèle (threads)
+  quand les deux sont configurés, au lieu de séquentiel — ces deux
+  objets étant indépendants sur le firewall, ça réduit d'autant le
+  temps total de l'opération. Comportement identique en cas d'échec :
+  les deux branches vont à leur terme, erreurs combinées levées ensuite.
+
 ## firewall-xgs/fail2ban 1.4.0 — 2026-08-10
 
 ### Added
