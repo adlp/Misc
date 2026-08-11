@@ -1,5 +1,60 @@
 # Changelog
 
+## firewall-xgs/fail2ban 2.2.0 — 2026-08-11
+
+### Added
+- Action `start` : comme `ban` mais pour toutes les IP actuellement
+  bannies par fail2ban, sans IP en argument — crée l'`IPHost` manquant
+  pour chacune (idempotent) avant de pousser la liste complète. Comble le
+  vide documenté en 2.0.0 (jail avec des bans déjà en cours au premier
+  déploiement, ou après un redémarrage). `push_from_fail2ban()` accepte
+  désormais un paramètre `ips` optionnel pour éviter un second appel à
+  `fail2ban-client` quand l'appelant l'a déjà récupérée (cas de `start`).
+
+## firewall-xgs/fail2ban 2.1.0 — 2026-08-11
+
+### Added
+- Action `flush` : vide entièrement `group` puis lance `vacuum`, sans
+  interroger fail2ban. N'agit pas sur `iplist`. `--dry-run` disponible —
+  calcule les candidats vacuum comme si le groupe était déjà vide (tous
+  les `IPHost` `<prefix>*` deviennent orphelins une fois le groupe vidé),
+  donc reflète fidèlement ce que ferait un flush réel. Verrou exclusif
+  posé pour toute la durée (vidage + vacuum), pas seulement le sous-appel
+  vacuum, pour éviter qu'un ban concurrent ne crée un IPHost entre les
+  deux étapes.
+
+## firewall-xgs/fail2ban 2.0.0 — 2026-08-11
+
+Refonte architecturale : fail2ban devient la seule source de vérité côté
+`ban`/`unban`, au lieu d'un ajout/retrait incrémental interrogeant l'XGS.
+Casse la compatibilité de config (nouvelle clé `jail` requise) — d'où le
+bump majeur.
+
+### Changed
+- `ban`/`unban` interrogent désormais `fail2ban-client status <jail>` et
+  **écrasent** l'état XGS (`group` et/ou `iplist`) avec cette liste
+  complète, sans plus jamais lire l'état XGS actuel avant d'écrire.
+  `ban` crée en plus l'`IPHost` de la nouvelle IP avant de pousser (pour
+  que le groupe puisse la référencer) ; `unban` ne fait que repousser
+  (fail2ban a déjà retiré l'IP de sa propre liste avant l'appel) — plus
+  de suppression explicite d'`IPHost` dans `unban`, ce rôle revient à
+  `vacuum`.
+- Nouvelle clé de config `jail` (requise pour ban/unban/sync) et
+  `fail2ban_client` (optionnel, défaut `fail2ban-client`), + option
+  `--jail`.
+- `_run_parallel()` retiré (n'était utile que pour paralléliser
+  group/iplist dans l'ancien ban/unban incrémental — le nouveau push est
+  1 lecture fail2ban + 1-2 écritures XGS, plus besoin) ainsi que
+  `add_to_group()` (remplacé par `set_group_hosts()` appelé directement
+  depuis `push_from_fail2ban()`).
+
+### Added
+- Action `sync` : compare, en lecture seule, la liste fail2ban actuelle à
+  l'état XGS (`group`/`iplist`) — IP communes, seulement dans fail2ban
+  (seraient ajoutées au prochain push), seulement sur XGS (seraient
+  retirées). Utile avant activation (jail avec bans préexistants) ou pour
+  détecter une dérive.
+
 ## firewall-xgs/fail2ban 1.6.1 — 2026-08-11
 
 ### Fixed

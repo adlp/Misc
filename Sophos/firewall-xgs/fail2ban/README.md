@@ -1,36 +1,46 @@
 # fail2ban → Sophos Firewall (XGS)
 
-Script d'action fail2ban qui bloque/débloque des IP sur un Sophos Firewall
-XGS via son API XML legacy (`webconsole/APIController`), en ajoutant/retirant
-l'IP d'un `IPHostGroup` et/ou d'une IP list (`IPHost` type `IP list`)
+Script d'action fail2ban qui reflète l'état d'une jail fail2ban sur un
+Sophos Firewall XGS via son API XML legacy (`webconsole/APIController`),
+dans un `IPHostGroup` et/ou une IP list (`IPHost` type `IP list`)
 référencé(e) par une règle Deny existante. Au moins un des deux doit être
 configuré, les deux peuvent l'être en même temps.
 
+**fail2ban est la seule source de vérité** : `ban`/`unban` interrogent
+`fail2ban-client status <jail>` et écrasent l'état XGS avec cette liste
+complète, sans jamais lire l'état XGS actuel au préalable. Ce n'est donc
+plus un ajout/retrait incrémental d'IP côté XGS, mais un push intégral à
+chaque événement.
+
 ## Fonctionnement
 
-- **ban** :
-  - si `group` configuré : crée un objet `IPHost` pour l'IP (`f2b_<ip>`)
-    sans vérifier au préalable s'il existe déjà (un warning est loggé si
-    le firewall répond que l'objet existe), puis l'ajoute au groupe (Get
-    de la liste actuelle puis Set complet — la seule méthode fiable,
-    voir "Limites connues").
-  - si `iplist` configuré : ajoute l'IP directement dans la liste
-    d'adresses de l'IP list.
-- **unban** : retire l'IP du groupe et supprime l'objet `IPHost` — un
-  warning est loggé si l'IP était déjà absente du groupe ou si l'objet
-  `IPHost` n'existait déjà plus (au lieu d'une erreur).
-- **list** : affiche les IP actuellement bloquées (groupe et/ou IP list,
-  selon config).
+- **ban** : crée l'objet `IPHost` pour la nouvelle IP (`f2b_<ip>`, sans
+  vérifier au préalable s'il existe — warning si le firewall répond que
+  l'objet existe déjà), puis pousse la liste complète de la jail
+  (`fail2ban-client status <jail>`) sur `group` et/ou `iplist`.
+- **unban** : repousse la liste complète de la jail (déjà mise à jour par
+  fail2ban avant l'appel de ce script) — pas de suppression explicite de
+  l'IPHost, c'est le rôle de `vacuum`.
+- **list** : affiche les IP actuellement présentes sur XGS (groupe et/ou
+  IP list, selon config) — état XGS brut, indépendant de fail2ban.
+- **sync** : compare, sans rien modifier, la liste fail2ban actuelle à
+  l'état XGS (communes / seulement fail2ban / seulement XGS) — pour voir
+  ce qu'un prochain ban/unban changerait avant qu'il n'écrase l'état XGS.
 - **vacuum** : supprime les objets `IPHost` `<prefix>*` qui ne sont plus
-  membres du groupe (orphelins — ex: après un `unban` interrompu avant la
-  suppression de l'objet). `--dry-run` affiche la liste sans agir.
-- Idempotent : ré-appeler ban/unban sur une IP déjà (dés)activée ne casse rien.
-- group et iplist (si les deux configurés) traités en parallèle, et
-  session HTTP réutilisée entre les appels API d'une même invocation.
-- `list` : les IP des membres du groupe sont récupérées en parallèle
-  (jusqu'à 10 requêtes simultanées) au lieu d'une par une — c'était le
-  vrai facteur dominant sur un groupe de plusieurs machines (ex: ~12s
-  pour 10 hôtes en séquentiel).
+  membres du groupe (orphelins — ex: `ban` a créé l'objet mais échoué
+  avant le push). `--dry-run` affiche la liste sans agir.
+- **flush** : vide entièrement `group` puis lance `vacuum` — sans
+  interroger fail2ban. N'agit pas sur `iplist`. `--dry-run` affiche ce
+  qui serait supprimé sans rien modifier.
+- **start** : comme `ban`, mais pour toutes les IP actuellement bannies
+  par fail2ban (pas d'IP en argument) — crée l'`IPHost` manquant pour
+  chacune avant de pousser la liste complète. À lancer au démarrage du
+  service ou si la jail avait déjà des bans avant le premier ban/sync.
+- Idempotent : ré-appeler ban/unban/start n'importe quand ne casse rien
+  (repush la même liste fail2ban).
+- Session HTTP réutilisée entre les appels API d'une même invocation.
+- `list`/`sync` : les IP des membres du groupe sont récupérées en
+  parallèle (jusqu'à 10 requêtes simultanées) au lieu d'une par une.
 - Verrou inter-process (`/run/lock/sophos-fw-block.lock`) : ban/unban
   prennent un verrou partagé (plusieurs peuvent tourner en même temps,
   cas normal avec fail2ban), vacuum prend un verrou exclusif — évite
@@ -64,7 +74,7 @@ Détail de toutes les options et du format de config attendu :
 sudo mkdir -p /etc/sophos-fw
 sudo cp api.conf.example /etc/sophos-fw/api.conf
 sudo chmod 600 /etc/sophos-fw/api.conf
-sudo vim /etc/sophos-fw/api.conf   # host, username, password, group
+sudo vim /etc/sophos-fw/api.conf   # host, username, password, group, jail
 
 pip3 install -r requirements.txt   # ou: apt install python3-requests
 
@@ -182,10 +192,21 @@ Ajouter `--prefix <préfixe>` pour surcharger ponctuellement le préfixe
 des noms `IPHost` défini dans la config (défaut : `f2b_`, utilisé
 seulement avec `group`).
 
+Ajouter `--jail <nom>` pour surcharger ponctuellement la jail fail2ban
+définie dans la config (requis pour ban/unban/sync).
+
 Lister les IP actuellement bloquées dans le groupe (pas d'IP à fournir) :
 
 ```bash
 /usr/local/bin/sophos_fw_block.py list
+```
+
+Comparer fail2ban et XGS sans rien modifier — utile avant le premier
+déploiement (si la jail a déjà des bans en cours) ou pour vérifier
+l'absence de dérive :
+
+```bash
+/usr/local/bin/sophos_fw_block.py sync
 ```
 
 Nettoyer les objets `IPHost` orphelins (préfixés mais plus dans le
@@ -198,6 +219,21 @@ groupe) — nécessite `group` configuré et un préfixe non vide :
 
 À lancer en cron périodique si besoin (ex: quotidien) plutôt qu'à chaque
 ban — le verrou exclusif empêche toute collision avec un ban/unban en cours.
+
+Tout vider (groupe + IPHost orphelins), sans toucher fail2ban ni iplist —
+utile pour repartir d'un état propre côté XGS :
+
+```bash
+/usr/local/bin/sophos_fw_block.py flush --dry-run   # affiche sans agir
+/usr/local/bin/sophos_fw_block.py flush             # vide + nettoie
+```
+
+Resynchroniser toutes les IP actuellement bannies (démarrage du service,
+ou jail avec des bans déjà en cours) :
+
+```bash
+/usr/local/bin/sophos_fw_block.py start
+```
 
 Logs envoyés sur syslog (tag `sophos-fw-block`) + stderr (visible dans les
 logs fail2ban en cas d'échec, exit code 1).
@@ -213,19 +249,25 @@ logs fail2ban en cas d'échec, exit code 1).
   list`. Non confirmé contre la doc API officielle — à valider avec
   `--debug` sur le premier `ban` réel ; en cas d'erreur `parse_status`
   affichera le XML brut retourné par le firewall pour ajuster si besoin.
-- Tentative d'ajout au groupe en 1 appel (`Set operation="add"`)
-  abandonnée : confirmé en échouant toujours sur un groupe existant (501
-  avec un objet fictif, 502 avec un objet réel — voir CHANGELOG 1.6.1).
-  `ban` refait un `Get` avant chaque `Set` sur le groupe, comme avant 1.6.0.
+- `Set operation="add"` sur un `IPHostGroup` existant échoue toujours
+  (501 avec un objet fictif, 502 avec un objet réel — l'entité en conflit
+  est le groupe lui-même, pas le membre). `ban`/`unban` utilisent
+  `set_group_hosts()` (Get puis Set complet) pour toute écriture du
+  groupe. `Remove` avec une `HostList` (retrait ciblé d'un membre) est
+  confirmé dangereux — vide tout le groupe au lieu du seul membre visé,
+  voir `test_group_merge.py`. Ni l'un ni l'autre n'est utilisé.
 - `vacuum` ne détecte l'usage d'un `IPHost` que via son appartenance au
   groupe configuré — un objet `<prefix>*` référencé directement par une
   autre règle firewall (sans passer par ce groupe) ne serait pas détecté
   comme utilisé et serait supprimé à tort. Cas non couvert : `vacuum`
   n'est prévu que pour nettoyer les orphelins issus du flux ban/unban de
   ce script.
-- `Remove` sur un `IPHostGroup` avec une `HostList` (retrait ciblé d'un
-  membre) est confirmé dangereux — vide tout le groupe au lieu du seul
-  membre visé, voir `test_group_merge.py`. Jamais utilisé dans le script.
+- Premier déploiement sur une jail ayant déjà des IP bannies : lancer
+  `start` (crée l'IPHost manquant pour chaque IP déjà bannie et pousse la
+  liste complète) — `sync` avant permet de voir l'écart au préalable.
+- `fail2ban-client status <jail>` doit renvoyer une ligne `Banned IP
+  list:` — format observé sur les versions testées ; `get_banned_ips()`
+  lève une erreur explicite si absent plutôt que de deviner.
 
 ## Note : warning `RequestsDependencyWarning`
 

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Ajoute/retire une IP d'un IPHostGroup et/ou d'une IP list Sophos
-Firewall (XGS) via API XML.
+"""Pousse la liste des IP bannies d'une jail fail2ban vers un IPHostGroup
+et/ou une IP list Sophos Firewall (XGS) via API XML.
 
-Appelé par fail2ban (actionban/actionunban) pour bloquer/débloquer des IP
-via une règle firewall existante référençant le groupe et/ou l'IP list.
+fail2ban est la source de vérité : ban/unban interrogent `fail2ban-client
+status <jail>` puis écrasent l'état XGS avec cette liste (aucune lecture
+de l'état XGS actuel pendant ce push). `list`/`vacuum`/`sync` lisent
+l'XGS pour inspection/nettoyage/comparaison, mais ne participent pas au
+push.
 """
 
-__version__ = "1.6.1"
+__version__ = "2.2.0"
 
 import argparse
 import configparser
@@ -14,6 +17,7 @@ import fcntl
 import ipaddress
 import logging
 import logging.handlers
+import subprocess
 import sys
 import time
 import warnings
@@ -36,6 +40,7 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 DEFAULT_CONFIG_PATH = "/etc/sophos-fw/api.conf"
 DEFAULT_PREFIX = "f2b_"
+DEFAULT_FAIL2BAN_CLIENT = "fail2ban-client"
 LOCK_PATH = "/run/lock/sophos-fw-block.lock"
 
 # Session HTTP réutilisée pour tous les appels API d'une même invocation :
@@ -136,6 +141,10 @@ def load_config(path):
             "group": sec.get("group", fallback=None) or None,
             "iplist": sec.get("iplist", fallback=None) or None,
             "prefix": sec.get("prefix", fallback=DEFAULT_PREFIX),
+            "jail": sec.get("jail", fallback=None) or None,
+            "fail2ban_client": sec.get(
+                "fail2ban_client", fallback=DEFAULT_FAIL2BAN_CLIENT
+            ),
         }
     except KeyError as exc:
         raise SystemExit(f"clé manquante dans {path}: {exc}")
@@ -150,6 +159,38 @@ def validate_ip(ip):
     except ValueError:
         raise SystemExit(f"IP invalide: {ip}")
     return ip
+
+
+def get_banned_ips(cfg):
+    """IP actuellement bannies dans la jail configurée, via fail2ban-client.
+
+    Source de vérité pour ban/unban/sync : ne reflète que ce que fail2ban
+    connaît (pas l'état XGS). "Banned IP list:" est le format de sortie de
+    `fail2ban-client status <jail>` sur les versions testées ; si le format
+    change, l'erreur explicite ci-dessous permet de le repérer vite.
+    """
+    if not cfg["jail"]:
+        raise SystemExit("jail requis dans la config (ou --jail) pour interroger fail2ban")
+    cmd = [cfg["fail2ban_client"], "status", cfg["jail"]]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except FileNotFoundError:
+        raise RuntimeError(f"{cfg['fail2ban_client']} introuvable (PATH ?)")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"fail2ban-client status {cfg['jail']} : timeout")
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"fail2ban-client status {cfg['jail']} a échoué (jail inconnue ?): "
+            f"{result.stderr.strip()}"
+        )
+    for line in result.stdout.splitlines():
+        if "Banned IP list:" in line:
+            _, _, rest = line.partition("Banned IP list:")
+            return rest.split()
+    raise RuntimeError(
+        f"'Banned IP list' introuvable dans la sortie de fail2ban-client "
+        f"pour la jail {cfg['jail']} (format de sortie inattendu)"
+    )
 
 
 def host_name_for_ip(ip, prefix=DEFAULT_PREFIX):
@@ -320,28 +361,6 @@ def set_group_hosts(cfg, hosts):
     logging.info("groupe %s mis à jour (%d hôtes)", cfg["group"], len(hosts))
 
 
-def add_to_group(cfg, name):
-    """Ajoute `name` au groupe (get_group_hosts + set_group_hosts).
-
-    `operation="add"` sur un IPHostGroup déjà existant échoue TOUJOURS,
-    confirmé deux fois en conditions réelles : avec un host fictif (501
-    "Configuration parameters validation failed") et avec un host réel
-    (502 "Entity having same name already exists" — l'entité en conflit
-    est le GROUPE lui-même, pas le membre : ce message ne veut donc PAS
-    dire "membre déjà présent"). Un précédent code interprétait ce texte
-    comme "déjà présent" et s'arrêtait là sans jamais ajouter le membre —
-    bug silencieux (IPHost créé mais jamais bloqué). Ne plus tenter ce
-    chemin : toujours get+set (voir set_group_hosts pour le détail des
-    opérations confirmées dangereuses/non fonctionnelles sur IPHostGroup).
-    """
-    hosts = get_group_hosts(cfg)
-    if name not in hosts:
-        hosts.append(name)
-        set_group_hosts(cfg, hosts)
-    else:
-        logging.warning("%s déjà présent dans %s", name, cfg["group"])
-
-
 def create_iphost(cfg, name, ip):
     body = (
         '<Set operation="add"><IPHost>'
@@ -403,95 +422,57 @@ def set_iplist_addresses(cfg, ips):
     logging.info("IP list %s mise à jour (%d IP)", cfg["iplist"], len(ips))
 
 
-def _run_parallel(*funcs):
-    """Exécute des callables sans argument, en parallèle si plusieurs.
+def push_from_fail2ban(cfg, ips=None):
+    """Écrase l'état XGS (group et/ou iplist) avec la liste fail2ban.
 
-    group et iplist sont deux objets indépendants sur le firewall : les
-    traiter dans des threads séparés évite d'attendre séquentiellement
-    les allers-retours API de l'un puis de l'autre. Lève une exception
-    combinée si au moins un callable échoue (les autres vont à leur terme).
+    Aucune lecture de l'état XGS actuel : on pousse la liste calculée,
+    point. group -> HostList complète (noms dérivés des IP) ; iplist ->
+    ListOfIPAddresses complète (IP brutes). Utilisé par ban/unban/start :
+    la différence, c'est que fail2ban a déjà mis à jour sa propre liste
+    avant l'appel (ip en plus pour ban, en moins pour unban, liste
+    complète pour start), donc ce même push produit le bon résultat.
+
+    `ips` : liste déjà récupérée à passer pour éviter un second appel à
+    fail2ban-client (utilisé par start, qui a besoin de la liste avant
+    de créer les IPHost manquants). None -> la récupère elle-même.
     """
-    if not funcs:
-        return
-    if len(funcs) == 1:
-        funcs[0]()
-        return
-
-    def timed(f):
-        t0 = time.monotonic()
-        f()
-        if DEBUG_TIMING:
-            logging.debug(
-                "[timing] tâche parallèle [%s] : %.3fs", f.__name__, time.monotonic() - t0
-            )
-
-    with ThreadPoolExecutor(max_workers=len(funcs)) as pool:
-        futures = [pool.submit(timed, f) for f in funcs]
-        errors = []
-        for f in futures:
-            try:
-                f.result()
-            except Exception as exc:
-                errors.append(str(exc))
-    if errors:
-        raise RuntimeError("; ".join(errors))
+    if ips is None:
+        ips = get_banned_ips(cfg)
+    if cfg["group"]:
+        hosts = [host_name_for_ip(ip, cfg["prefix"]) for ip in ips]
+        set_group_hosts(cfg, hosts)
+    if cfg["iplist"]:
+        set_iplist_addresses(cfg, ips)
+    return ips
 
 
 def ban(cfg, ip):
-    def do_group():
+    if cfg["group"]:
         name = host_name_for_ip(ip, cfg["prefix"])
         create_iphost(cfg, name, ip)
-        add_to_group(cfg, name)
-
-    def do_iplist():
-        ips = get_iplist_addresses(cfg)
-        if ip not in ips:
-            ips.append(ip)
-            set_iplist_addresses(cfg, ips)
-        else:
-            logging.info("%s déjà présent dans %s", ip, cfg["iplist"])
-
-    tasks = []
-    if cfg["group"]:
-        tasks.append(do_group)
-    if cfg["iplist"]:
-        tasks.append(do_iplist)
-    _run_parallel(*tasks)
+    push_from_fail2ban(cfg)
 
 
 def unban(cfg, ip):
-    def do_group():
-        name = host_name_for_ip(ip, cfg["prefix"])
+    logging.info("unban %s : resync depuis fail2ban (jail %s)", ip, cfg["jail"])
+    push_from_fail2ban(cfg)
 
-        def update_group():
-            hosts = get_group_hosts(cfg)
-            if name in hosts:
-                hosts.remove(name)
-                set_group_hosts(cfg, hosts)
-            else:
-                logging.warning("%s absent de %s", name, cfg["group"])
 
-        def do_delete():
-            delete_iphost(cfg, name)
+def start(cfg):
+    """Comme ban, mais pour toutes les IP actuellement bannies par fail2ban.
 
-        # retrait du groupe (get+set) et suppression de l'objet IPHost
-        # portent sur deux objets distincts : indépendants, en parallèle.
-        _run_parallel(update_group, do_delete)
-
-    def do_iplist():
-        ips = get_iplist_addresses(cfg)
-        if ip in ips:
-            ips = [x for x in ips if x != ip]
-            set_iplist_addresses(cfg, ips)
-        else:
-            logging.info("%s absent de %s", ip, cfg["iplist"])
-
-    tasks = []
+    Utile au démarrage (service qui vient de (re)démarrer, jail avec des
+    bans déjà en cours) : crée l'IPHost manquant pour CHAQUE IP bannie
+    (idempotent, pas seulement la dernière comme ban) avant de pousser la
+    liste complète — comble le vide documenté dans les limites connues
+    (une IP déjà bannie avant le premier ban n'a pas d'IPHost).
+    """
+    ips = get_banned_ips(cfg)
     if cfg["group"]:
-        tasks.append(do_group)
-    if cfg["iplist"]:
-        tasks.append(do_iplist)
-    _run_parallel(*tasks)
+        for ip in ips:
+            name = host_name_for_ip(ip, cfg["prefix"])
+            create_iphost(cfg, name, ip)
+    push_from_fail2ban(cfg, ips=ips)
 
 
 def get_all_iphost_names(cfg, prefix):
@@ -546,6 +527,81 @@ def vacuum(cfg, dry_run=False):
     logging.info("vacuum: %d objet(s) supprimés", len(candidates))
 
 
+def flush(cfg, dry_run=False):
+    """Vide entièrement le groupe puis vacuum — sans interroger fail2ban.
+
+    N'agit que sur `group` (pas `iplist`). Le verrou exclusif (posé par
+    l'appelant, voir main()) couvre les deux étapes : sinon un ban
+    concurrent pourrait créer un IPHost entre le vidage du groupe et le
+    scan de vacuum, qui le verrait comme orphelin et le supprimerait à
+    tort.
+    """
+    if not cfg["group"]:
+        raise SystemExit("flush nécessite `group` configuré (config ou --group)")
+    prefix = cfg["prefix"]
+    if not prefix:
+        raise SystemExit("flush nécessite un prefix non vide (config ou --prefix), requis par vacuum")
+
+    if dry_run:
+        logging.info("flush (dry-run): groupe %s serait vidé", cfg["group"])
+        # une fois le groupe vide, tout IPHost <prefix>* devient orphelin
+        candidates = sorted(get_all_iphost_names(cfg, prefix))
+        if not candidates:
+            logging.info("vacuum (dry-run): rien à supprimer (préfixe %s)", prefix)
+        else:
+            for name in candidates:
+                print(name)
+            logging.info("vacuum (dry-run): %d objet(s) seraient supprimés", len(candidates))
+        return
+
+    set_group_hosts(cfg, [])
+    logging.info("groupe %s vidé", cfg["group"])
+    vacuum(cfg, dry_run=False)
+
+
+def _print_sync_diff(label, fail2ban_ips, xgs_ips):
+    common = sorted(fail2ban_ips & xgs_ips)
+    only_fail2ban = sorted(fail2ban_ips - xgs_ips)
+    only_xgs = sorted(xgs_ips - fail2ban_ips)
+    print(f"\n--- {label} ---")
+    print(f"communes ({len(common)}):")
+    for ip in common:
+        print(f"  = {ip}")
+    print(
+        f"seulement fail2ban, absentes de {label} ({len(only_fail2ban)}) "
+        "— seraient ajoutées au prochain ban/unban:"
+    )
+    for ip in only_fail2ban:
+        print(f"  + {ip}")
+    print(
+        f"seulement {label}, absentes de fail2ban ({len(only_xgs)}) "
+        "— seraient retirées au prochain ban/unban:"
+    )
+    for ip in only_xgs:
+        print(f"  - {ip}")
+
+
+def sync_report(cfg):
+    """Compare l'état fail2ban (source de vérité) à l'état XGS actuel.
+
+    Lecture seule — ne modifie rien. Sert à voir ce qu'un prochain
+    ban/unban changerait (puisque ban/unban écrasent l'XGS avec la liste
+    fail2ban sans jamais la lire au préalable), et à détecter une dérive
+    (ex: premier déploiement avec des bans déjà existants dans la jail,
+    objet supprimé manuellement sur le firewall, etc.).
+    """
+    fail2ban_ips = set(get_banned_ips(cfg))
+    print(f"fail2ban (jail {cfg['jail']}): {len(fail2ban_ips)} IP bannie(s)")
+
+    if cfg["group"]:
+        xgs_ips = {ip for _, ip in list_group(cfg) if ip}
+        _print_sync_diff(f"groupe {cfg['group']}", fail2ban_ips, xgs_ips)
+
+    if cfg["iplist"]:
+        xgs_ips = set(get_iplist_addresses(cfg))
+        _print_sync_diff(f"iplist {cfg['iplist']}", fail2ban_ips, xgs_ips)
+
+
 CONFIG_HELP = f"""\
 Fichier de config attendu (section [api]), défaut: {DEFAULT_CONFIG_PATH}
 
@@ -562,23 +618,52 @@ Fichier de config attendu (section [api]), défaut: {DEFAULT_CONFIG_PATH}
                                   #   "IP list"), référencé par une règle
   prefix      = f2b_             # optionnel, préfixe des IPHost créés
                                   #   (utilisé seulement avec group)
+  jail        = sshd             # requis pour ban/unban/sync : jail
+                                  #   fail2ban interrogée via fail2ban-client
+  fail2ban_client = fail2ban-client  # optionnel, chemin/nom du binaire
 
 Au moins une des deux clés group/iplist est requise. Les deux peuvent
 être renseignées ensemble : l'IP est alors ajoutée/retirée des deux
 objets à chaque ban/unban.
 
-vacuum supprime les IPHost <prefix>* du groupe qui ne sont plus membres du
-groupe (orphelins, ex: après un unban interrompu). Nécessite `group`
-configuré (config ou --group) et un prefix non vide.
+ban/unban interrogent `fail2ban-client status <jail>` et écrasent
+l'état XGS (group et/ou iplist) avec cette liste complète — aucune
+lecture de l'état XGS actuel avant d'écrire. fail2ban est donc la seule
+source de vérité ; ban crée en plus l'IPHost pour la nouvelle IP avant
+de pousser (nécessaire pour que le groupe puisse la référencer).
+
+vacuum supprime les IPHost <prefix>* qui ne sont plus membres du groupe
+configuré (orphelins, ex: après un ban créant l'objet mais échouant
+avant le push). Nécessite `group` configuré (config ou --group) et un
+prefix non vide.
+
+sync compare, sans rien modifier, la liste fail2ban (jail configurée) à
+l'état XGS actuel (group et/ou iplist) : IP communes, seulement dans
+fail2ban (seraient ajoutées au prochain ban/unban), seulement sur XGS
+(seraient retirées). Utile pour détecter une dérive avant qu'un
+ban/unban n'écrase silencieusement l'état XGS.
+
+flush vide entièrement `group` puis lance vacuum, sans interroger
+fail2ban. N'agit pas sur `iplist`. Mêmes prérequis que vacuum (group +
+prefix non vide).
+
+start fait comme ban mais pour TOUTES les IP actuellement bannies par
+fail2ban (pas d'IP en argument) : crée l'IPHost manquant pour chacune
+avant de pousser la liste complète. À lancer au démarrage du service ou
+manuellement si la jail avait déjà des bans avant le premier ban/sync.
 
 Exemples:
   sophos_fw_block.py ban 203.0.113.5
   sophos_fw_block.py unban 203.0.113.5
   sophos_fw_block.py list
-  sophos_fw_block.py ban 203.0.113.5 --group Fail2Ban-Test --debug
+  sophos_fw_block.py sync
+  sophos_fw_block.py start
+  sophos_fw_block.py ban 203.0.113.5 --group Fail2Ban-Test --jail sshd --debug
   sophos_fw_block.py ban 203.0.113.5 --iplist Fail2Ban-List
   sophos_fw_block.py vacuum --dry-run
   sophos_fw_block.py vacuum
+  sophos_fw_block.py flush --dry-run
+  sophos_fw_block.py flush
 """
 
 
@@ -590,12 +675,17 @@ def main():
     )
     parser.add_argument(
         "action",
-        choices=["ban", "unban", "list", "vacuum"],
-        help="ban/unban une IP, list les IP bloquées, ou vacuum "
-        "(supprime les IPHost <prefix>* orphelins du groupe)",
+        choices=["ban", "unban", "list", "vacuum", "sync", "flush", "start"],
+        help="ban/unban une IP (push depuis fail2ban), list les IP "
+        "bloquées sur XGS, vacuum (supprime les IPHost <prefix>* "
+        "orphelins), sync (compare fail2ban et XGS sans rien modifier), "
+        "flush (vide le groupe puis vacuum, sans interroger fail2ban), "
+        "start (comme ban mais pour toutes les IP bannies, sans IP en argument)",
     )
     parser.add_argument(
-        "ip", nargs="?", help="requis pour ban/unban, ignoré pour list/vacuum"
+        "ip",
+        nargs="?",
+        help="requis pour ban/unban, ignoré pour list/vacuum/sync/flush/start",
     )
     parser.add_argument(
         "--config",
@@ -623,9 +713,13 @@ def main():
         f" (défaut config: {DEFAULT_PREFIX})",
     )
     parser.add_argument(
+        "--jail", help="surcharge la jail fail2ban définie dans la config"
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="vacuum uniquement : affiche les IPHost qui seraient supprimés, sans agir",
+        help="vacuum/flush uniquement : affiche les IPHost qui seraient "
+        "supprimés (et, pour flush, que le groupe serait vidé), sans agir",
     )
     args = parser.parse_args()
 
@@ -645,6 +739,8 @@ def main():
         cfg["iplist"] = args.iplist
     if args.prefix:
         cfg["prefix"] = args.prefix
+    if args.jail:
+        cfg["jail"] = args.jail
 
     t0 = time.monotonic()
     try:
@@ -654,9 +750,17 @@ def main():
         elif args.action == "unban":
             with locked(exclusive=False):
                 unban(cfg, ip)
+        elif args.action == "start":
+            with locked(exclusive=False):
+                start(cfg)
         elif args.action == "vacuum":
             with locked(exclusive=True):
                 vacuum(cfg, dry_run=args.dry_run)
+        elif args.action == "flush":
+            with locked(exclusive=True):
+                flush(cfg, dry_run=args.dry_run)
+        elif args.action == "sync":
+            sync_report(cfg)
         else:
             if cfg["group"]:
                 for name, host_ip in list_group(cfg):
