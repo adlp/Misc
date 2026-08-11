@@ -1,5 +1,40 @@
 # Changelog
 
+## firewall-xgs/fail2ban 1.6.0 — 2026-08-11
+
+### Added
+- `vacuum` : nouvelle action qui supprime les objets `IPHost` `<prefix>*`
+  orphelins (plus membres du groupe configuré — ex: après un `unban`
+  interrompu avant la suppression de l'objet). `--dry-run` affiche la
+  liste sans agir. Refuse de s'exécuter sans `group` configuré ou avec
+  un préfixe vide (garde-fou, évite de tout supprimer par erreur).
+- Verrou inter-process (`fcntl.flock`, `/run/lock/sophos-fw-block.lock`) :
+  ban/unban prennent un verrou partagé (plusieurs peuvent tourner
+  simultanément, cas normal avec fail2ban), `vacuum` un verrou exclusif —
+  évite qu'un vacuum supprime un `IPHost` qu'un ban est en train de créer
+  (race condition entre lecture de la liste et écriture).
+- `add_to_group()` : `ban` tente d'ajouter le membre au groupe en 1 appel
+  (`Set operation="add"`, sans lecture préalable de la liste), avec repli
+  automatique sur le chemin sûr get+set si ça échoue. Gain de vitesse non
+  garanti (testé en échec avec un objet fictif, pas encore confirmé avec
+  un objet réel) mais sans risque grâce au repli.
+
+### Changed
+- `create_iphost`/`delete_iphost`/`unban` : les cas "déjà fait" (objet
+  déjà existant, déjà absent du groupe, déjà supprimé) passent de `info`
+  à `warning` en log — plus visibles sans être des erreurs.
+- `ban` simplifié : `create_iphost` puis `add_to_group`, sans lecture
+  préalable de la liste du groupe (l'ancien code lisait le groupe avant
+  d'ajouter, devenu inutile avec `add_to_group`).
+
+### Fixed
+- `test_group_merge.py` : le test de retrait ciblé (`Remove` sur
+  `IPHostGroup` avec `HostList`) a été retiré du script — confirmé
+  reproductible en conditions réelles : au lieu de retirer le seul membre
+  visé, il vide tout le groupe et laisse l'objet dans un état où même un
+  `Set operation="update"` normal échoue ensuite (500). Documenté dans
+  `set_group_hosts()` et le README : ne jamais utiliser cette opération.
+
 ## firewall-xgs/fail2ban 1.5.0 — 2026-08-11
 
 ### Added

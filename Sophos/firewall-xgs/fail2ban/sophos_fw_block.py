@@ -6,10 +6,11 @@ Appelé par fail2ban (actionban/actionunban) pour bloquer/débloquer des IP
 via une règle firewall existante référençant le groupe et/ou l'IP list.
 """
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 import argparse
 import configparser
+import fcntl
 import ipaddress
 import logging
 import logging.handlers
@@ -18,6 +19,7 @@ import time
 import warnings
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from xml.sax.saxutils import escape
 
 # requests (paquet apt, ancien) vérifie la version d'urllib3/chardet au
@@ -34,6 +36,7 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 DEFAULT_CONFIG_PATH = "/etc/sophos-fw/api.conf"
 DEFAULT_PREFIX = "f2b_"
+LOCK_PATH = "/run/lock/sophos-fw-block.lock"
 
 # Session HTTP réutilisée pour tous les appels API d'une même invocation :
 # évite un handshake TCP/TLS neuf à chaque appel. Sûr en usage concurrent
@@ -85,6 +88,25 @@ def _patch_connection_timing():
     HTTPSConnection.connect = timed_connect
 
 
+@contextmanager
+def locked(exclusive):
+    """Verrou inter-process sur LOCK_PATH (flock, libéré même sur crash).
+
+    ban/unban prennent un verrou partagé (plusieurs peuvent tourner en
+    même temps, cas normal avec fail2ban). vacuum prend un verrou
+    exclusif : il calcule "IPHost avec ce préfixe absents du groupe" puis
+    supprime — si un ban est en cours entre la création de l'IPHost et
+    son ajout au groupe, vacuum verrait cet IPHost comme orphelin et le
+    supprimerait à tort (race condition). L'exclusivité empêche ça.
+    """
+    with open(LOCK_PATH, "a+") as fd:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+
+
 def setup_logging(debug=False, debug_timing=False):
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG if (debug or debug_timing) else logging.INFO)
@@ -132,6 +154,25 @@ def validate_ip(ip):
 
 def host_name_for_ip(ip, prefix=DEFAULT_PREFIX):
     return prefix + ip.replace(".", "_").replace(":", "_")
+
+
+def ip_from_host_name(name, prefix):
+    """Inverse de host_name_for_ip(), quand c'est possible sans appel API.
+
+    Ne fonctionne que pour un nom généré par ce script (préfixe connu,
+    IPv4 — les ":" d'une IPv6 seraient ambigus avec les "_" du séparateur
+    de champs). Retourne None si le nom ne correspond pas à ce format
+    (objet créé manuellement, IPv6, etc.) : l'appelant doit alors
+    retomber sur un Get IPHost classique pour ce membre.
+    """
+    if not name.startswith(prefix):
+        return None
+    candidate = name[len(prefix):].replace("_", ".")
+    try:
+        ipaddress.ip_address(candidate)
+    except ValueError:
+        return None
+    return candidate
 
 
 def api_call(cfg, body_xml):
@@ -220,20 +261,49 @@ def list_group(cfg):
     """Retourne [(nom_objet, ip)] pour chaque membre du groupe configuré.
 
     `ip` vaut None si l'objet IPHost référencé dans le groupe n'existe
-    plus (référence orpheline). Un Get par membre est nécessaire (l'API
-    ne renvoie pas les IP dans le Get du groupe) — ces lookups sont
-    indépendants les uns des autres, donc lancés en parallèle plutôt que
-    séquentiellement (dominant le temps de `list` sur un groupe non trivial).
+    plus (référence orpheline).
+
+    L'API ne renvoie pas les IP dans le Get du groupe, mais le nom d'un
+    objet créé par ce script encode déjà l'IP (host_name_for_ip) : pour
+    ces membres-là, aucun Get supplémentaire n'est nécessaire. Seuls les
+    membres au nom non reconnu (objet ajouté manuellement, etc.) déclenchent
+    un Get IPHost — en parallèle s'il y en a plusieurs. Sur un groupe
+    entièrement géré par ce script, ça ramène `list` de N+1 appels API à 1
+    seul (le Get du groupe), l'API Sophos observée sérialisant les
+    requêtes côté serveur (le parallélisme client n'y change rien).
     """
     names = get_group_hosts(cfg)
     if not names:
         return []
-    with ThreadPoolExecutor(max_workers=min(len(names), MAX_PARALLEL_REQUESTS)) as pool:
-        ips = list(pool.map(lambda n: get_iphost_address(cfg, n), names))
-    return list(zip(names, ips))
+
+    resolved = {}
+    unresolved = []
+    for name in names:
+        ip = ip_from_host_name(name, cfg["prefix"])
+        if ip is not None:
+            resolved[name] = ip
+        else:
+            unresolved.append(name)
+
+    if unresolved:
+        with ThreadPoolExecutor(max_workers=min(len(unresolved), MAX_PARALLEL_REQUESTS)) as pool:
+            fetched = list(pool.map(lambda n: get_iphost_address(cfg, n), unresolved))
+        resolved.update(zip(unresolved, fetched))
+
+    return [(name, resolved[name]) for name in names]
 
 
 def set_group_hosts(cfg, hosts):
+    """Remplace toute la HostList du groupe par `hosts`.
+
+    Toujours passer par un Get (get_group_hosts) puis ce Set avec la liste
+    complète : `operation="add"` sur un IPHostGroup existant échoue (501,
+    sémantique "create"), et `<Remove><IPHostGroup>...<HostList>...` pour
+    retirer un membre précis est CONFIRMÉ dangereux — testé en réel, il vide
+    tout le groupe au lieu du seul membre visé et laisse l'objet dans un état
+    où même ce Set échoue ensuite (500). Ne jamais utiliser Remove sur un
+    IPHostGroup avec une HostList (voir test_group_merge.py).
+    """
     host_xml = "".join(f"<Host>{escape(h)}</Host>" for h in hosts)
     body = (
         '<Set operation="update"><IPHostGroup>'
@@ -246,6 +316,42 @@ def set_group_hosts(cfg, hosts):
     if code != "200":
         raise RuntimeError(f"mise à jour groupe {cfg['group']} échouée: {code} {text}")
     logging.info("groupe %s mis à jour (%d hôtes)", cfg["group"], len(hosts))
+
+
+def add_to_group(cfg, name):
+    """Tente d'ajouter `name` au groupe en 1 seul appel, sans Get préalable.
+
+    Essaie operation="add" sur le groupe avec juste ce membre. Non confirmé
+    comme fonctionnant sur un groupe déjà existant (échoué en test avec un
+    host fictif, 501 "validation failed" — voir test_group_merge.py) ; testé
+    ici avec un host réel (déjà créé par create_iphost avant cet appel), ce
+    qui n'avait pas été essayé. Si ça échoue quand même, repli sur le chemin
+    sûr (get_group_hosts + set_group_hosts, +1 appel) plutôt que de supposer
+    que le membre a été ajouté.
+    """
+    body = (
+        '<Set operation="add"><IPHostGroup>'
+        f"<Name>{escape(cfg['group'])}</Name>"
+        f"<HostList><Host>{escape(name)}</Host></HostList>"
+        "</IPHostGroup></Set>"
+    )
+    root = api_call(cfg, body)
+    code, text = parse_status(root, "IPHostGroup")
+    if code == "200":
+        logging.info("%s ajouté à %s", name, cfg["group"])
+        return
+    if code and any(s in (text or "").lower() for s in ("already", "duplicate", "exist")):
+        logging.warning("%s déjà présent dans %s", name, cfg["group"])
+        return
+    logging.debug(
+        "operation=add sur %s a échoué (%s %s), repli get+set", cfg["group"], code, text
+    )
+    hosts = get_group_hosts(cfg)
+    if name not in hosts:
+        hosts.append(name)
+        set_group_hosts(cfg, hosts)
+    else:
+        logging.warning("%s déjà présent dans %s", name, cfg["group"])
 
 
 def create_iphost(cfg, name, ip):
@@ -261,7 +367,7 @@ def create_iphost(cfg, name, ip):
     if code == "200":
         logging.info("IPHost %s créé", name)
     elif code and "already exist" in (text or "").lower():
-        logging.info("IPHost %s existe déjà", name)
+        logging.warning("IPHost %s existe déjà", name)
     else:
         raise RuntimeError(f"création IPHost {name} échouée: {code} {text}")
 
@@ -275,7 +381,7 @@ def delete_iphost(cfg, name):
     elif code and any(
         s in (text or "").lower() for s in ("not exist", "not found")
     ):
-        logging.info("IPHost %s: %s", name, text)
+        logging.warning("IPHost %s: %s", name, text)
     else:
         logging.warning("suppression IPHost %s non confirmée: %s %s", name, code, text)
 
@@ -346,19 +452,8 @@ def _run_parallel(*funcs):
 def ban(cfg, ip):
     def do_group():
         name = host_name_for_ip(ip, cfg["prefix"])
-        # create_iphost (nouvel objet) et get_group_hosts (lecture du
-        # groupe) portent sur deux objets distincts : indépendants,
-        # lancés en parallèle plutôt que l'un après l'autre.
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            f_create = pool.submit(create_iphost, cfg, name, ip)
-            f_hosts = pool.submit(get_group_hosts, cfg)
-            f_create.result()
-            hosts = f_hosts.result()
-        if name not in hosts:
-            hosts.append(name)
-            set_group_hosts(cfg, hosts)
-        else:
-            logging.info("%s déjà présent dans %s", name, cfg["group"])
+        create_iphost(cfg, name, ip)
+        add_to_group(cfg, name)
 
     def do_iplist():
         ips = get_iplist_addresses(cfg)
@@ -386,7 +481,7 @@ def unban(cfg, ip):
                 hosts.remove(name)
                 set_group_hosts(cfg, hosts)
             else:
-                logging.info("%s absent de %s", name, cfg["group"])
+                logging.warning("%s absent de %s", name, cfg["group"])
 
         def do_delete():
             delete_iphost(cfg, name)
@@ -411,6 +506,58 @@ def unban(cfg, ip):
     _run_parallel(*tasks)
 
 
+def get_all_iphost_names(cfg, prefix):
+    """Retourne tous les noms d'IPHost du firewall commençant par `prefix`.
+
+    Pas de Filter côté API (syntaxe "like" non confirmée pour ce champ) :
+    Get sans filtre puis filtrage côté client sur le nom. Un seul appel.
+    """
+    root = api_call(cfg, "<Get><IPHost></IPHost></Get>")
+    names = []
+    for host in root.findall(".//IPHost"):
+        name = host.findtext("Name")
+        if name and name.startswith(prefix):
+            names.append(name)
+    return names
+
+
+def vacuum_candidates(cfg):
+    """IPHost préfixés par ce script mais absents du groupe configuré.
+
+    Ne couvre que l'usage via le groupe géré par ce script — un IPHost
+    préfixé référencé directement par une autre règle firewall (sans
+    passer par ce groupe) ne serait pas détecté comme utilisé et serait
+    supprimé à tort. Cas non couvert : vacuum n'est prévu que pour
+    nettoyer les objets orphelins issus du flux ban/unban de ce script.
+    """
+    prefix = cfg["prefix"]
+    if not prefix:
+        raise SystemExit("vacuum nécessite un prefix non vide (config ou --prefix)")
+    if not cfg["group"]:
+        raise SystemExit(
+            "vacuum nécessite `group` configuré (les IPHost créés par ban "
+            "ne sont utilisés que via ce groupe)"
+        )
+    all_names = set(get_all_iphost_names(cfg, prefix))
+    used = set(get_group_hosts(cfg))
+    return sorted(all_names - used)
+
+
+def vacuum(cfg, dry_run=False):
+    candidates = vacuum_candidates(cfg)
+    if not candidates:
+        logging.info("vacuum: rien à supprimer (préfixe %s)", cfg["prefix"])
+        return
+    if dry_run:
+        for name in candidates:
+            print(name)
+        logging.info("vacuum (dry-run): %d objet(s) seraient supprimés", len(candidates))
+        return
+    for name in candidates:
+        delete_iphost(cfg, name)
+    logging.info("vacuum: %d objet(s) supprimés", len(candidates))
+
+
 CONFIG_HELP = f"""\
 Fichier de config attendu (section [api]), défaut: {DEFAULT_CONFIG_PATH}
 
@@ -432,12 +579,18 @@ Au moins une des deux clés group/iplist est requise. Les deux peuvent
 être renseignées ensemble : l'IP est alors ajoutée/retirée des deux
 objets à chaque ban/unban.
 
+vacuum supprime les IPHost <prefix>* du groupe qui ne sont plus membres du
+groupe (orphelins, ex: après un unban interrompu). Nécessite `group`
+configuré (config ou --group) et un prefix non vide.
+
 Exemples:
   sophos_fw_block.py ban 203.0.113.5
   sophos_fw_block.py unban 203.0.113.5
   sophos_fw_block.py list
   sophos_fw_block.py ban 203.0.113.5 --group Fail2Ban-Test --debug
   sophos_fw_block.py ban 203.0.113.5 --iplist Fail2Ban-List
+  sophos_fw_block.py vacuum --dry-run
+  sophos_fw_block.py vacuum
 """
 
 
@@ -449,10 +602,13 @@ def main():
     )
     parser.add_argument(
         "action",
-        choices=["ban", "unban", "list"],
-        help="ban/unban une IP, ou list les IP actuellement bloquées",
+        choices=["ban", "unban", "list", "vacuum"],
+        help="ban/unban une IP, list les IP bloquées, ou vacuum "
+        "(supprime les IPHost <prefix>* orphelins du groupe)",
     )
-    parser.add_argument("ip", nargs="?", help="requis pour ban/unban, ignoré pour list")
+    parser.add_argument(
+        "ip", nargs="?", help="requis pour ban/unban, ignoré pour list/vacuum"
+    )
     parser.add_argument(
         "--config",
         default=DEFAULT_CONFIG_PATH,
@@ -478,6 +634,11 @@ def main():
         help="surcharge le préfixe des noms IPHost défini dans la config"
         f" (défaut config: {DEFAULT_PREFIX})",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="vacuum uniquement : affiche les IPHost qui seraient supprimés, sans agir",
+    )
     args = parser.parse_args()
 
     if args.action in ("ban", "unban") and not args.ip:
@@ -500,9 +661,14 @@ def main():
     t0 = time.monotonic()
     try:
         if args.action == "ban":
-            ban(cfg, ip)
+            with locked(exclusive=False):
+                ban(cfg, ip)
         elif args.action == "unban":
-            unban(cfg, ip)
+            with locked(exclusive=False):
+                unban(cfg, ip)
+        elif args.action == "vacuum":
+            with locked(exclusive=True):
+                vacuum(cfg, dry_run=args.dry_run)
         else:
             if cfg["group"]:
                 for name, host_ip in list_group(cfg):

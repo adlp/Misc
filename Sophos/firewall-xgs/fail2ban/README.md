@@ -9,13 +9,20 @@ configuré, les deux peuvent l'être en même temps.
 ## Fonctionnement
 
 - **ban** :
-  - si `group` configuré : crée un objet `IPHost` pour l'IP (`f2b_<ip>`),
-    l'ajoute au groupe.
+  - si `group` configuré : crée un objet `IPHost` pour l'IP (`f2b_<ip>`)
+    sans vérifier au préalable s'il existe déjà (un warning est loggé si
+    le firewall répond que l'objet existe), puis l'ajoute au groupe, de
+    même sans lecture préalable de la liste (warning si déjà membre).
   - si `iplist` configuré : ajoute l'IP directement dans la liste
     d'adresses de l'IP list.
-- **unban** : inverse des opérations ci-dessus.
+- **unban** : retire l'IP du groupe et supprime l'objet `IPHost` — un
+  warning est loggé si l'IP était déjà absente du groupe ou si l'objet
+  `IPHost` n'existait déjà plus (au lieu d'une erreur).
 - **list** : affiche les IP actuellement bloquées (groupe et/ou IP list,
   selon config).
+- **vacuum** : supprime les objets `IPHost` `<prefix>*` qui ne sont plus
+  membres du groupe (orphelins — ex: après un `unban` interrompu avant la
+  suppression de l'objet). `--dry-run` affiche la liste sans agir.
 - Idempotent : ré-appeler ban/unban sur une IP déjà (dés)activée ne casse rien.
 - group et iplist (si les deux configurés) traités en parallèle, et
   session HTTP réutilisée entre les appels API d'une même invocation.
@@ -23,6 +30,10 @@ configuré, les deux peuvent l'être en même temps.
   (jusqu'à 10 requêtes simultanées) au lieu d'une par une — c'était le
   vrai facteur dominant sur un groupe de plusieurs machines (ex: ~12s
   pour 10 hôtes en séquentiel).
+- Verrou inter-process (`/run/lock/sophos-fw-block.lock`) : ban/unban
+  prennent un verrou partagé (plusieurs peuvent tourner en même temps,
+  cas normal avec fail2ban), vacuum prend un verrou exclusif — évite
+  qu'un vacuum supprime un `IPHost` qu'un ban est en train de créer.
 
 Détail de toutes les options et du format de config attendu :
 `sophos_fw_block.py --help`
@@ -176,6 +187,17 @@ Lister les IP actuellement bloquées dans le groupe (pas d'IP à fournir) :
 /usr/local/bin/sophos_fw_block.py list
 ```
 
+Nettoyer les objets `IPHost` orphelins (préfixés mais plus dans le
+groupe) — nécessite `group` configuré et un préfixe non vide :
+
+```bash
+/usr/local/bin/sophos_fw_block.py vacuum --dry-run   # affiche sans agir
+/usr/local/bin/sophos_fw_block.py vacuum             # supprime
+```
+
+À lancer en cron périodique si besoin (ex: quotidien) plutôt qu'à chaque
+ban — le verrou exclusif empêche toute collision avec un ban/unban en cours.
+
 Logs envoyés sur syslog (tag `sophos-fw-block`) + stderr (visible dans les
 logs fail2ban en cas d'échec, exit code 1).
 
@@ -190,6 +212,21 @@ logs fail2ban en cas d'échec, exit code 1).
   list`. Non confirmé contre la doc API officielle — à valider avec
   `--debug` sur le premier `ban` réel ; en cas d'erreur `parse_status`
   affichera le XML brut retourné par le firewall pour ajuster si besoin.
+- `ban` tente d'ajouter le membre au groupe en 1 appel
+  (`Set operation="add"`, sans lire la liste au préalable) ; testé en
+  échec avec un objet fictif (501, voir `test_group_merge.py`), pas
+  encore confirmé avec un objet réel. Repli automatique et sûr sur le
+  chemin get+set si ça échoue, donc pas de risque, mais le gain de temps
+  espéré n'est pas garanti tant que ce n'est pas observé en usage réel.
+- `vacuum` ne détecte l'usage d'un `IPHost` que via son appartenance au
+  groupe configuré — un objet `<prefix>*` référencé directement par une
+  autre règle firewall (sans passer par ce groupe) ne serait pas détecté
+  comme utilisé et serait supprimé à tort. Cas non couvert : `vacuum`
+  n'est prévu que pour nettoyer les orphelins issus du flux ban/unban de
+  ce script.
+- `Remove` sur un `IPHostGroup` avec une `HostList` (retrait ciblé d'un
+  membre) est confirmé dangereux — vide tout le groupe au lieu du seul
+  membre visé, voir `test_group_merge.py`. Jamais utilisé dans le script.
 
 ## Note : warning `RequestsDependencyWarning`
 
