@@ -6,7 +6,7 @@ Appelé par fail2ban (actionban/actionunban) pour bloquer/débloquer des IP
 via une règle firewall existante référençant le groupe et/ou l'IP list.
 """
 
-__version__ = "1.4.1"
+__version__ = "1.4.2"
 
 import argparse
 import configparser
@@ -36,10 +36,20 @@ DEFAULT_PREFIX = "f2b_"
 
 # Session HTTP réutilisée pour tous les appels API d'une même invocation :
 # évite un handshake TCP/TLS neuf à chaque appel. Sûr en usage concurrent
-# ici (threads dans ban()/unban()) car aucun état mutable de la session
-# n'est touché par requête (auth transite dans le corps XML, pas en
-# cookie/en-tête de session).
+# ici (threads dans ban()/unban()/list_group()) car aucun état mutable de
+# la session n'est touché par requête (auth transite dans le corps XML,
+# pas en cookie/en-tête de session). Pool dimensionné pour encaisser les
+# requêtes parallèles (jusqu'à MAX_PARALLEL_REQUESTS) sans recréer de
+# connexion à chaque lot.
+MAX_PARALLEL_REQUESTS = 10
+
 _session = requests.Session()
+_session.mount(
+    "https://",
+    requests.adapters.HTTPAdapter(
+        pool_connections=MAX_PARALLEL_REQUESTS, pool_maxsize=MAX_PARALLEL_REQUESTS
+    ),
+)
 
 
 def setup_logging(debug=False):
@@ -169,9 +179,17 @@ def list_group(cfg):
     """Retourne [(nom_objet, ip)] pour chaque membre du groupe configuré.
 
     `ip` vaut None si l'objet IPHost référencé dans le groupe n'existe
-    plus (référence orpheline).
+    plus (référence orpheline). Un Get par membre est nécessaire (l'API
+    ne renvoie pas les IP dans le Get du groupe) — ces lookups sont
+    indépendants les uns des autres, donc lancés en parallèle plutôt que
+    séquentiellement (dominant le temps de `list` sur un groupe non trivial).
     """
-    return [(name, get_iphost_address(cfg, name)) for name in get_group_hosts(cfg)]
+    names = get_group_hosts(cfg)
+    if not names:
+        return []
+    with ThreadPoolExecutor(max_workers=min(len(names), MAX_PARALLEL_REQUESTS)) as pool:
+        ips = list(pool.map(lambda n: get_iphost_address(cfg, n), names))
+    return list(zip(names, ips))
 
 
 def set_group_hosts(cfg, hosts):
@@ -278,8 +296,14 @@ def _run_parallel(*funcs):
 def ban(cfg, ip):
     def do_group():
         name = host_name_for_ip(ip, cfg["prefix"])
-        create_iphost(cfg, name, ip)
-        hosts = get_group_hosts(cfg)
+        # create_iphost (nouvel objet) et get_group_hosts (lecture du
+        # groupe) portent sur deux objets distincts : indépendants,
+        # lancés en parallèle plutôt que l'un après l'autre.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_create = pool.submit(create_iphost, cfg, name, ip)
+            f_hosts = pool.submit(get_group_hosts, cfg)
+            f_create.result()
+            hosts = f_hosts.result()
         if name not in hosts:
             hosts.append(name)
             set_group_hosts(cfg, hosts)
@@ -305,13 +329,18 @@ def ban(cfg, ip):
 def unban(cfg, ip):
     def do_group():
         name = host_name_for_ip(ip, cfg["prefix"])
-        hosts = get_group_hosts(cfg)
-        if name in hosts:
-            hosts = [h for h in hosts if h != name]
-            set_group_hosts(cfg, hosts)
-        else:
-            logging.info("%s absent de %s", name, cfg["group"])
-        delete_iphost(cfg, name)
+
+        def update_group():
+            hosts = get_group_hosts(cfg)
+            if name in hosts:
+                hosts.remove(name)
+                set_group_hosts(cfg, hosts)
+            else:
+                logging.info("%s absent de %s", name, cfg["group"])
+
+        # retrait du groupe (get+set) et suppression de l'objet IPHost
+        # portent sur deux objets distincts : indépendants, en parallèle.
+        _run_parallel(update_group, lambda: delete_iphost(cfg, name))
 
     def do_iplist():
         ips = get_iplist_addresses(cfg)

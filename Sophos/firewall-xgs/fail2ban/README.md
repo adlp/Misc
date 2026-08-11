@@ -18,9 +18,11 @@ configuré, les deux peuvent l'être en même temps.
   selon config).
 - Idempotent : ré-appeler ban/unban sur une IP déjà (dés)activée ne casse rien.
 - group et iplist (si les deux configurés) traités en parallèle, et
-  session HTTP réutilisée entre les appels API d'une même invocation —
-  limite le temps par ban/unban (l'API XML Sophos réauthentifie à
-  chaque appel, c'est le facteur dominant restant).
+  session HTTP réutilisée entre les appels API d'une même invocation.
+- `list` : les IP des membres du groupe sont récupérées en parallèle
+  (jusqu'à 10 requêtes simultanées) au lieu d'une par une — c'était le
+  vrai facteur dominant sur un groupe de plusieurs machines (ex: ~12s
+  pour 10 hôtes en séquentiel).
 
 Détail de toutes les options et du format de config attendu :
 `sophos_fw_block.py --help`

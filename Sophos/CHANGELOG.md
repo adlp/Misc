@@ -1,5 +1,22 @@
 # Changelog
 
+## firewall-xgs/fail2ban 1.4.2 — 2026-08-11
+
+### Fixed
+- Vrai goulot d'étranglement de `list` identifié : `list_group()` faisait
+  1 appel Get par membre du groupe, **séquentiellement** (N+1 appels pour
+  N machines — 11 appels pour 10 machines, ~1s/appel côté API Sophos =
+  les ~12s constatés). Ces lookups sont indépendants entre eux : lancés
+  en parallèle (jusqu'à `MAX_PARALLEL_REQUESTS = 10` à la fois). Testé :
+  10 hôtes à 0.3s/appel simulé passe de 3.3s (séquentiel) à 0.6s.
+- ban/unban (chemin `group`) : les 2-3 appels internes (création/lecture/
+  écriture de l'IPHost et du groupe) ne sont pas tous dépendants les uns
+  des autres — les paires indépendantes (create+get pour ban ; update
+  groupe+delete IPHost pour unban) tournent maintenant en parallèle.
+- Pool de connexions HTTP de la session dimensionné pour encaisser les
+  requêtes parallèles (`pool_maxsize=10`) sans recréer de connexion à
+  chaque lot.
+
 ## firewall-xgs/fail2ban 1.4.1 — 2026-08-11
 
 ### Changed
