@@ -1,5 +1,18 @@
 # Changelog
 
+## firewall-xgs/fail2ban 1.5.0 — 2026-08-11
+
+### Added
+- `--debug-timing` : log la durée de chaque appel API (label = fonction
+  appelante), la durée d'établissement de chaque connexion TCP+TLS
+  (une fois par connexion mise en pool, réutilisée ensuite — permet de
+  voir si la lenteur vient du réseau ou du traitement côté firewall),
+  la durée de chaque tâche parallèle (group/iplist, ou lookups `list`),
+  et le temps total de l'action. Utile car la parallélisation côté
+  client (1.4.1/1.4.2) n'a pas réduit les délais constatés en usage
+  réel — cette option permet de voir si l'API Sophos sérialise les
+  requêtes côté serveur malgré le parallélisme client.
+
 ## firewall-xgs/fail2ban 1.4.2 — 2026-08-11
 
 ### Fixed

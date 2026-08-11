@@ -6,7 +6,7 @@ Appelé par fail2ban (actionban/actionunban) pour bloquer/débloquer des IP
 via une règle firewall existante référençant le groupe et/ou l'IP list.
 """
 
-__version__ = "1.4.2"
+__version__ = "1.5.0"
 
 import argparse
 import configparser
@@ -14,6 +14,7 @@ import ipaddress
 import logging
 import logging.handlers
 import sys
+import time
 import warnings
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
@@ -51,10 +52,42 @@ _session.mount(
     ),
 )
 
+# Activé par --debug-timing : log la durée de chaque appel API, la durée
+# de l'établissement de connexion TCP+TLS (une seule fois par connexion
+# du pool, réutilisée ensuite), et la durée totale de l'action.
+DEBUG_TIMING = False
 
-def setup_logging(debug=False):
+
+def _patch_connection_timing():
+    """Instrumente urllib3 pour logger le temps de connexion TCP+TLS.
+
+    Une connexion HTTPS n'est établie qu'une fois par connexion mise en
+    pool (réutilisée pour les appels suivants sur ce thread) : si ce
+    temps n'apparaît qu'une ou deux fois dans les logs alors que le
+    goulot persiste, la lenteur vient du traitement côté firewall, pas
+    du réseau.
+    """
+    from urllib3.connection import HTTPSConnection
+
+    if getattr(HTTPSConnection.connect, "_sophos_timed", False):
+        return
+    orig_connect = HTTPSConnection.connect
+
+    def timed_connect(self):
+        t0 = time.monotonic()
+        orig_connect(self)
+        logging.debug(
+            "[timing] connexion TCP+TLS vers %s:%s établie en %.3fs",
+            self.host, self.port, time.monotonic() - t0,
+        )
+
+    timed_connect._sophos_timed = True
+    HTTPSConnection.connect = timed_connect
+
+
+def setup_logging(debug=False, debug_timing=False):
     logger = logging.getLogger()
-    logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    logger.setLevel(logging.DEBUG if (debug or debug_timing) else logging.INFO)
     try:
         syslog = logging.handlers.SysLogHandler(address="/dev/log")
         syslog.setFormatter(logging.Formatter("sophos-fw-block: %(message)s"))
@@ -109,9 +142,17 @@ def api_call(cfg, body_xml):
     )
     xml = f"<Request>{login}{body_xml}</Request>"
     logging.debug("requête XML: %s", xml.replace(escape(cfg["password"]), "***"))
+    t0 = time.monotonic()
     resp = _session.post(
         url, data={"reqxml": xml}, verify=cfg["verify_ssl"], timeout=15
     )
+    dt = time.monotonic() - t0
+    if DEBUG_TIMING:
+        label = sys._getframe(1).f_code.co_name
+        logging.debug(
+            "[timing] appel API [%s] : %.3fs (HTTP %s, %d octets)",
+            label, dt, resp.status_code, len(resp.content),
+        )
     resp.raise_for_status()
     logging.debug("réponse XML: %s", resp.text)
     root = ET.fromstring(resp.text)
@@ -281,8 +322,17 @@ def _run_parallel(*funcs):
     if len(funcs) == 1:
         funcs[0]()
         return
+
+    def timed(f):
+        t0 = time.monotonic()
+        f()
+        if DEBUG_TIMING:
+            logging.debug(
+                "[timing] tâche parallèle [%s] : %.3fs", f.__name__, time.monotonic() - t0
+            )
+
     with ThreadPoolExecutor(max_workers=len(funcs)) as pool:
-        futures = [pool.submit(f) for f in funcs]
+        futures = [pool.submit(timed, f) for f in funcs]
         errors = []
         for f in futures:
             try:
@@ -338,9 +388,12 @@ def unban(cfg, ip):
             else:
                 logging.info("%s absent de %s", name, cfg["group"])
 
+        def do_delete():
+            delete_iphost(cfg, name)
+
         # retrait du groupe (get+set) et suppression de l'objet IPHost
         # portent sur deux objets distincts : indépendants, en parallèle.
-        _run_parallel(update_group, lambda: delete_iphost(cfg, name))
+        _run_parallel(update_group, do_delete)
 
     def do_iplist():
         ips = get_iplist_addresses(cfg)
@@ -409,6 +462,12 @@ def main():
         "--debug", action="store_true", help="log les requêtes/réponses XML brutes"
     )
     parser.add_argument(
+        "--debug-timing",
+        action="store_true",
+        help="log la durée de chaque appel API (dont connexion TCP+TLS), "
+        "des tâches parallèles, et le temps total de l'action",
+    )
+    parser.add_argument(
         "--group", help="surcharge le groupe (IPHostGroup) défini dans la config"
     )
     parser.add_argument(
@@ -424,7 +483,11 @@ def main():
     if args.action in ("ban", "unban") and not args.ip:
         parser.error(f"argument ip requis pour l'action '{args.action}'")
 
-    setup_logging(args.debug)
+    setup_logging(args.debug, args.debug_timing)
+    global DEBUG_TIMING
+    DEBUG_TIMING = args.debug_timing
+    if DEBUG_TIMING:
+        _patch_connection_timing()
     ip = validate_ip(args.ip) if args.ip else None
     cfg = load_config(args.config)
     if args.group:
@@ -434,6 +497,7 @@ def main():
     if args.prefix:
         cfg["prefix"] = args.prefix
 
+    t0 = time.monotonic()
     try:
         if args.action == "ban":
             ban(cfg, ip)
@@ -449,6 +513,9 @@ def main():
     except Exception as exc:
         logging.error("%s%s: %s", args.action, f" {ip}" if ip else "", exc)
         sys.exit(1)
+    finally:
+        if DEBUG_TIMING:
+            logging.debug("[timing] action %s : %.3fs au total", args.action, time.monotonic() - t0)
 
 
 if __name__ == "__main__":

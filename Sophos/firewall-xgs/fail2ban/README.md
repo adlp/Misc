@@ -141,6 +141,17 @@ Ajouter `--debug` pour logger les requêtes/réponses XML brutes (mot de
 passe masqué) — utile pour diagnostiquer une erreur API (ex: code `534`
 ci-dessus).
 
+Ajouter `--debug-timing` pour logger la durée de chaque appel API, de
+chaque connexion TCP+TLS établie (une fois par connexion mise en pool,
+réutilisée ensuite), de chaque tâche parallèle, et le temps total de
+l'action — utile pour situer où passe le temps si un ban/unban/list
+reste lent malgré le parallélisme client (ex: API Sophos qui
+sérialise les requêtes côté serveur, indépendamment du client) :
+
+```bash
+/usr/local/bin/sophos_fw_block.py ban 203.0.113.5 --debug-timing
+```
+
 Ajouter `--group <nom>` pour surcharger ponctuellement le groupe défini
 dans la config (ex: tester sur un groupe de test avant bascule en prod) :
 
