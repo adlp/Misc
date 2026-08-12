@@ -37,24 +37,18 @@ chaque événement.
   chacune avant de pousser la liste complète. À lancer au démarrage du
   service ou si la jail avait déjà des bans avant le premier ban/sync.
 - Idempotent : ré-appeler ban/unban/start n'importe quand ne casse rien
-  (repush la même liste fail2ban).
-- **Cache du dernier push** (`/run/sophos-fw-block/`) : si la liste
-  fail2ban est identique au dernier push réussi, `ban`/`unban` sautent
-  tout appel Sophos — utile quand un push lent fait que fail2ban
-  redemande le même ban avant que le précédent soit terminé. `flush`
-  invalide ce cache (modifie l'XGS en dehors du mécanisme de push).
-  Contrepartie : un ban/unban redondant ne re-corrige plus une éventuelle
-  modification manuelle faite entre-temps sur le firewall (avant ce
-  cache, le repush — même sans effet réel — servait aussi de filet de
-  sécurité implicite) ; `sync`/`start` restent les outils pour ça.
+  (repush la même liste fail2ban) — et corrige gratuitement toute dérive
+  côté XGS au passage (pas de cache d'état, chaque push non dédupliqué
+  repousse réellement la liste complète).
 - **Dédup par IP en vol** : si un ban/unban est déjà en cours pour une
   IP donnée, tout appel concurrent pour la **même IP** est abandonné
   immédiatement (pas d'attente) — évite un push concurrent redondant
   pendant qu'un premier push (lent) est encore en cours pour cette même
-  IP. Des IP différentes restent traitées en parallèle. Contrepartie :
-  un unban(X) arrivant pendant qu'un ban(X) est en vol est abandonné
-  sans repush ; reflété au prochain événement sur cette IP ou via
-  `sync`/`start`.
+  IP (seule protection contre les appels redondants). Des IP différentes
+  restent traitées en parallèle. Contrepartie : un unban(X) arrivant
+  pendant qu'un ban(X) est en vol est abandonné sans repush ; reflété au
+  prochain événement sur cette IP ou via `sync`/`start`. Jugé négligeable
+  en pratique (écart ban→unban >> durée d'un push).
 - Session HTTP réutilisée entre les appels API d'une même invocation.
 - `list`/`sync` : les IP des membres du groupe sont récupérées en
   parallèle (jusqu'à 10 requêtes simultanées) au lieu d'une par une.

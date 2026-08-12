@@ -1,5 +1,27 @@
 # Changelog
 
+## firewall-xgs/fail2ban 2.4.0 — 2026-08-12
+
+### Removed
+- Cache du dernier push réussi (2.3.0, `_load_last_pushed`/
+  `_save_last_pushed`/`_clear_cache`/`_unchanged_since_last_push`,
+  `/run/sophos-fw-block/lastpush-*.json`). Retiré : le verrou par IP
+  (2.3.1, `_ip_activity_lock`) couvre déjà le cas motivant le cache
+  (rebans rapides de la même IP pendant qu'un push est en vol), et le
+  supprimer restaure une propriété perdue en 2.3.0 — chaque push non
+  dédupliqué repousse la liste complète, corrigeant gratuitement toute
+  dérive côté XGS au lieu de la laisser filer silencieusement derrière
+  un skip. Simplifie aussi le code (plus de gestion d'invalidation par
+  `flush`). `push_from_fail2ban()` redevient inconditionnel.
+
+Argument retenu : le délai ban→unban dépasse largement la durée d'un
+push (~5-8s), donc la collision que le cache aurait pu éviter dans ce
+sens ne se produit pas en pratique ; et un ban qui suit rapidement un
+unban sur la même IP fait de toute façon office de resync. Le verrou par
+IP reste la seule protection contre les appels redondants — testé
+(collision en vol toujours dédupliquée ; sans collision, chaque appel
+repousse réellement, plus de skip sur état inchangé).
+
 ## firewall-xgs/fail2ban 2.3.1 — 2026-08-12
 
 ### Added
