@@ -9,7 +9,7 @@ l'XGS pour inspection/nettoyage/comparaison, mais ne participent pas au
 push.
 """
 
-__version__ = "2.3.0"
+__version__ = "2.3.1"
 
 import argparse
 import configparser
@@ -116,13 +116,16 @@ def locked(exclusive):
             fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
 
 
-def _cache_path(cfg):
-    """Fichier cache propre à ce (host, group, iplist, jail) — évite
-    qu'une config vise un mauvais cache si plusieurs api.conf distincts
-    tournent sur la même machine (plusieurs firewalls/jails)."""
+def _target_digest(cfg):
+    """Identifiant court propre à ce (host, group, iplist, jail) — évite
+    qu'une config vise un mauvais cache/verrou si plusieurs api.conf
+    distincts tournent sur la même machine (plusieurs firewalls/jails)."""
     key = f"{cfg['host']}|{cfg['group']}|{cfg['iplist']}|{cfg['jail']}"
-    digest = hashlib.sha256(key.encode()).hexdigest()[:16]
-    return f"{CACHE_DIR}/lastpush-{digest}.json"
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def _cache_path(cfg):
+    return f"{CACHE_DIR}/lastpush-{_target_digest(cfg)}.json"
 
 
 def _load_last_pushed(cfg):
@@ -164,6 +167,47 @@ def _unchanged_since_last_push(cfg, ips):
     cache (voir _clear_cache) puisqu'il modifie l'XGS hors de ce mécanisme.
     """
     return _load_last_pushed(cfg) == sorted(ips)
+
+
+@contextmanager
+def _ip_activity_lock(cfg, ip):
+    """Verrou non-bloquant par IP : yield True si acquis, False sinon.
+
+    Si un ban/unban est déjà en cours pour cette IP (autre process pas
+    encore terminé — cas typique : push précédent lent, fail2ban rappelle
+    l'action pour la même IP), l'appelant doit abandonner immédiatement
+    plutôt qu'attendre ou repousser en double. Complète
+    _unchanged_since_last_push() : celui-ci évite un push redondant une
+    fois l'état stabilisé, celui-ci évite un push CONCURRENT redondant
+    pendant qu'un premier est encore en vol.
+
+    Le fichier de verrou n'est jamais supprimé (accepté : /run est un
+    tmpfs, nettoyé au reboot, coût négligeable même avec des milliers
+    d'IP distinctes) — le supprimer introduirait un TOCTOU classique
+    (unlink pendant qu'un autre process vient d'ouvrir/flock le même
+    chemin juste avant la suppression).
+
+    Compromis à connaître : si un ban(X) est en vol et qu'un unban(X)
+    arrive entre-temps (IP réhabilitée très vite), cet unban est abandonné
+    sans repousser — l'état fail2ban le plus récent ne sera reflété
+    qu'au prochain événement sur cette IP, ou via `sync`/`start` manuel.
+    Cas rare (retrait généralement bien plus espacé qu'un ban), accepté
+    pour éliminer le cas fréquent observé (rebans rapides de la même IP).
+    """
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = f"{CACHE_DIR}/inprogress-{_target_digest(cfg)}-{ip.replace(':', '_')}.lock"
+    fd = open(path, "a+")
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fd.close()
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+        fd.close()
 
 
 def setup_logging(debug=False, debug_timing=False):
@@ -521,22 +565,31 @@ def push_from_fail2ban(cfg, ips):
 
 
 def ban(cfg, ip):
-    ips = get_banned_ips(cfg)
-    if _unchanged_since_last_push(cfg, ips):
-        logging.info(
-            "ban %s : déjà reflété sur XGS (aucun changement fail2ban), aucun appel Sophos", ip
-        )
-        return
-    if cfg["group"]:
-        name = host_name_for_ip(ip, cfg["prefix"])
-        create_iphost(cfg, name, ip)
-    push_from_fail2ban(cfg, ips)
+    with _ip_activity_lock(cfg, ip) as acquired:
+        if not acquired:
+            logging.info("ban %s : déjà en cours (autre appel), abandonné", ip)
+            return
+        ips = get_banned_ips(cfg)
+        if _unchanged_since_last_push(cfg, ips):
+            logging.info(
+                "ban %s : déjà reflété sur XGS (aucun changement fail2ban), aucun appel Sophos",
+                ip,
+            )
+            return
+        if cfg["group"]:
+            name = host_name_for_ip(ip, cfg["prefix"])
+            create_iphost(cfg, name, ip)
+        push_from_fail2ban(cfg, ips)
 
 
 def unban(cfg, ip):
-    logging.info("unban %s : resync depuis fail2ban (jail %s)", ip, cfg["jail"])
-    ips = get_banned_ips(cfg)
-    push_from_fail2ban(cfg, ips)
+    with _ip_activity_lock(cfg, ip) as acquired:
+        if not acquired:
+            logging.info("unban %s : déjà en cours (autre appel), abandonné", ip)
+            return
+        logging.info("unban %s : resync depuis fail2ban (jail %s)", ip, cfg["jail"])
+        ips = get_banned_ips(cfg)
+        push_from_fail2ban(cfg, ips)
 
 
 def start(cfg):

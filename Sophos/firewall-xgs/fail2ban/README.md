@@ -47,6 +47,14 @@ chaque événement.
   modification manuelle faite entre-temps sur le firewall (avant ce
   cache, le repush — même sans effet réel — servait aussi de filet de
   sécurité implicite) ; `sync`/`start` restent les outils pour ça.
+- **Dédup par IP en vol** : si un ban/unban est déjà en cours pour une
+  IP donnée, tout appel concurrent pour la **même IP** est abandonné
+  immédiatement (pas d'attente) — évite un push concurrent redondant
+  pendant qu'un premier push (lent) est encore en cours pour cette même
+  IP. Des IP différentes restent traitées en parallèle. Contrepartie :
+  un unban(X) arrivant pendant qu'un ban(X) est en vol est abandonné
+  sans repush ; reflété au prochain événement sur cette IP ou via
+  `sync`/`start`.
 - Session HTTP réutilisée entre les appels API d'une même invocation.
 - `list`/`sync` : les IP des membres du groupe sont récupérées en
   parallèle (jusqu'à 10 requêtes simultanées) au lieu d'une par une.

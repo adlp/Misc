@@ -1,5 +1,26 @@
 # Changelog
 
+## firewall-xgs/fail2ban 2.3.1 — 2026-08-12
+
+### Added
+- Verrou non-bloquant par IP (`_ip_activity_lock`,
+  `/run/sophos-fw-block/inprogress-*.lock`) : si un ban/unban est déjà en
+  cours pour une IP donnée, tout appel concurrent pour la **même IP** est
+  abandonné immédiatement (pas d'attente, pas de push en double) plutôt
+  que de vérifier après coup si l'état a changé. Complète le cache de
+  2.3.0 : celui-ci évite un push redondant une fois l'état stabilisé,
+  celui-ci évite un push **concurrent** redondant pendant qu'un premier
+  est encore en vol pour la même IP — le cas exact rapporté en prod
+  (rebans rapides de la même IP pendant qu'un push lent est en cours).
+  Des IP différentes restent traitées en parallèle (pas de blocage
+  croisé, testé). Diminue d'autant le besoin de `sync` périodique.
+
+Compromis documenté (voir docstring `_ip_activity_lock`) : un unban(X)
+arrivant pendant qu'un ban(X) est en vol est abandonné sans repush —
+l'état le plus récent n'est reflété qu'au prochain événement sur cette
+IP, ou via `sync`/`start` manuel. Cas rare (retrait bien plus espacé
+qu'un ban), accepté pour éliminer le cas fréquent.
+
 ## firewall-xgs/fail2ban 2.3.0 — 2026-08-12
 
 ### Added
