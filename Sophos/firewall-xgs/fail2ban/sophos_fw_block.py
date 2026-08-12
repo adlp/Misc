@@ -9,14 +9,17 @@ l'XGS pour inspection/nettoyage/comparaison, mais ne participent pas au
 push.
 """
 
-__version__ = "2.2.2"
+__version__ = "2.3.0"
 
 import argparse
 import configparser
 import fcntl
+import hashlib
 import ipaddress
+import json
 import logging
 import logging.handlers
+import os
 import subprocess
 import sys
 import time
@@ -42,6 +45,7 @@ DEFAULT_CONFIG_PATH = "/etc/sophos-fw/api.conf"
 DEFAULT_PREFIX = "f2b_"
 DEFAULT_FAIL2BAN_CLIENT = "fail2ban-client"
 LOCK_PATH = "/run/lock/sophos-fw-block.lock"
+CACHE_DIR = "/run/sophos-fw-block"
 
 # Session HTTP réutilisée pour tous les appels API d'une même invocation :
 # évite un handshake TCP/TLS neuf à chaque appel. Sûr en usage concurrent
@@ -110,6 +114,56 @@ def locked(exclusive):
             yield
         finally:
             fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+
+
+def _cache_path(cfg):
+    """Fichier cache propre à ce (host, group, iplist, jail) — évite
+    qu'une config vise un mauvais cache si plusieurs api.conf distincts
+    tournent sur la même machine (plusieurs firewalls/jails)."""
+    key = f"{cfg['host']}|{cfg['group']}|{cfg['iplist']}|{cfg['jail']}"
+    digest = hashlib.sha256(key.encode()).hexdigest()[:16]
+    return f"{CACHE_DIR}/lastpush-{digest}.json"
+
+
+def _load_last_pushed(cfg):
+    try:
+        with open(_cache_path(cfg)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _save_last_pushed(cfg, ips):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = _cache_path(cfg)
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(sorted(ips), f)
+    os.replace(tmp, path)  # atomique : évite un cache tronqué si écritures concurrentes
+
+
+def _clear_cache(cfg):
+    try:
+        os.remove(_cache_path(cfg))
+    except FileNotFoundError:
+        pass
+
+
+def _unchanged_since_last_push(cfg, ips):
+    """True si `ips` (liste fail2ban actuelle) == dernier push XGS réussi.
+
+    Optimisation pure : si fail2ban redemande un ban déjà reflété sur XGS
+    (cas observé : le push précédent est lent, fail2ban rappelle l'action
+    pour la même IP avant que le premier push soit terminé), on évite tout
+    appel Sophos. Skippé (donc ré-évalué à chaque appel) tant que la
+    liste fail2ban n'a pas réellement changé. Ne garantit PAS que l'état
+    XGS réel correspond toujours au cache (une modification manuelle sur
+    le firewall entre deux push identiques ne serait plus auto-corrigée
+    par un ban/unban redondant comme avant) — `sync`/`start`/`flush`
+    restent les outils pour vérifier/forcer un état réel. `flush` vide le
+    cache (voir _clear_cache) puisqu'il modifie l'XGS hors de ce mécanisme.
+    """
+    return _load_last_pushed(cfg) == sorted(ips)
 
 
 def setup_logging(debug=False, debug_timing=False):
@@ -438,7 +492,7 @@ def set_iplist_addresses(cfg, ips):
     logging.info("IP list %s mise à jour (%d IP)", cfg["iplist"], len(ips))
 
 
-def push_from_fail2ban(cfg, ips=None):
+def push_from_fail2ban(cfg, ips):
     """Écrase l'état XGS (group et/ou iplist) avec la liste fail2ban.
 
     Aucune lecture de l'état XGS actuel : on pousse la liste calculée,
@@ -448,30 +502,41 @@ def push_from_fail2ban(cfg, ips=None):
     avant l'appel (ip en plus pour ban, en moins pour unban, liste
     complète pour start), donc ce même push produit le bon résultat.
 
-    `ips` : liste déjà récupérée à passer pour éviter un second appel à
-    fail2ban-client (utilisé par start, qui a besoin de la liste avant
-    de créer les IPHost manquants). None -> la récupère elle-même.
+    Skip complet (aucun appel Sophos) si `ips` est identique au dernier
+    push réussi — voir _unchanged_since_last_push().
     """
-    if ips is None:
-        ips = get_banned_ips(cfg)
+    if _unchanged_since_last_push(cfg, ips):
+        logging.info(
+            "push ignoré : liste fail2ban inchangée depuis le dernier push réussi (%d IP)",
+            len(ips),
+        )
+        return ips
     if cfg["group"]:
         hosts = [host_name_for_ip(ip, cfg["prefix"]) for ip in ips]
         set_group_hosts(cfg, hosts)
     if cfg["iplist"]:
         set_iplist_addresses(cfg, ips)
+    _save_last_pushed(cfg, ips)
     return ips
 
 
 def ban(cfg, ip):
+    ips = get_banned_ips(cfg)
+    if _unchanged_since_last_push(cfg, ips):
+        logging.info(
+            "ban %s : déjà reflété sur XGS (aucun changement fail2ban), aucun appel Sophos", ip
+        )
+        return
     if cfg["group"]:
         name = host_name_for_ip(ip, cfg["prefix"])
         create_iphost(cfg, name, ip)
-    push_from_fail2ban(cfg)
+    push_from_fail2ban(cfg, ips)
 
 
 def unban(cfg, ip):
     logging.info("unban %s : resync depuis fail2ban (jail %s)", ip, cfg["jail"])
-    push_from_fail2ban(cfg)
+    ips = get_banned_ips(cfg)
+    push_from_fail2ban(cfg, ips)
 
 
 def start(cfg):
@@ -488,7 +553,7 @@ def start(cfg):
         for ip in ips:
             name = host_name_for_ip(ip, cfg["prefix"])
             create_iphost(cfg, name, ip)
-    push_from_fail2ban(cfg, ips=ips)
+    push_from_fail2ban(cfg, ips)
 
 
 def get_all_iphost_names(cfg, prefix):
@@ -551,6 +616,11 @@ def flush(cfg, dry_run=False):
     concurrent pourrait créer un IPHost entre le vidage du groupe et le
     scan de vacuum, qui le verrait comme orphelin et le supprimerait à
     tort.
+
+    Vide aussi le cache de dernier push (_clear_cache) : flush modifie
+    l'XGS hors de push_from_fail2ban, un ban/unban suivant avec la même
+    liste fail2ban ne doit pas croire à tort que rien n'a changé et
+    sauter le push.
     """
     if not cfg["group"]:
         raise SystemExit("flush nécessite `group` configuré (config ou --group)")
@@ -571,6 +641,7 @@ def flush(cfg, dry_run=False):
         return
 
     set_group_hosts(cfg, [])
+    _clear_cache(cfg)
     logging.info("groupe %s vidé", cfg["group"])
     vacuum(cfg, dry_run=False)
 

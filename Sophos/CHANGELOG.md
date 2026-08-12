@@ -1,5 +1,30 @@
 # Changelog
 
+## firewall-xgs/fail2ban 2.3.0 — 2026-08-12
+
+### Added
+- Cache local du dernier push réussi (`/run/sophos-fw-block/lastpush-*.json`,
+  un fichier par combinaison host/group/iplist/jail) : `ban`/`unban`
+  comparent la liste fail2ban actuelle à ce cache et **sautent tout appel
+  Sophos** si elle est identique. Répond au cas observé en prod : un push
+  lent (5-8s) fait que fail2ban redemande le même ban pour la même IP
+  avant que le premier push soit terminé — désormais ces appels
+  redondants ne touchent plus le firewall du tout. Écriture atomique
+  (fichier temporaire + rename) pour rester correct si plusieurs
+  ban/unban tournent en parallèle (verrou partagé).
+- `flush` invalide ce cache (il modifie l'XGS en dehors de
+  `push_from_fail2ban`) — sans ça, un ban/unban suivant avec la même
+  liste fail2ban croirait à tort que rien n'a changé et sauterait le
+  repush après un flush.
+
+### Changed
+- Compromis à connaître : avant ce cache, un ban/unban redondant
+  re-poussait quand même la liste (sans effet réel, mais ça corrigeait
+  au passage une éventuelle modification manuelle faite sur le firewall
+  entre deux pushes identiques). Avec le cache, ce filet de sécurité
+  implicite disparaît pour les pushes identiques — `sync`/`start` restent
+  les outils pour vérifier/forcer un état réel en cas de doute.
+
 ## firewall-xgs/fail2ban 2.2.2 — 2026-08-12
 
 ### Added

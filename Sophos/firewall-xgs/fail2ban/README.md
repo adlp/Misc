@@ -38,6 +38,15 @@ chaque événement.
   service ou si la jail avait déjà des bans avant le premier ban/sync.
 - Idempotent : ré-appeler ban/unban/start n'importe quand ne casse rien
   (repush la même liste fail2ban).
+- **Cache du dernier push** (`/run/sophos-fw-block/`) : si la liste
+  fail2ban est identique au dernier push réussi, `ban`/`unban` sautent
+  tout appel Sophos — utile quand un push lent fait que fail2ban
+  redemande le même ban avant que le précédent soit terminé. `flush`
+  invalide ce cache (modifie l'XGS en dehors du mécanisme de push).
+  Contrepartie : un ban/unban redondant ne re-corrige plus une éventuelle
+  modification manuelle faite entre-temps sur le firewall (avant ce
+  cache, le repush — même sans effet réel — servait aussi de filet de
+  sécurité implicite) ; `sync`/`start` restent les outils pour ça.
 - Session HTTP réutilisée entre les appels API d'une même invocation.
 - `list`/`sync` : les IP des membres du groupe sont récupérées en
   parallèle (jusqu'à 10 requêtes simultanées) au lieu d'une par une.
