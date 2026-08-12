@@ -287,3 +287,94 @@ Le paquet `python3-requests` d'apt (2.25.1) émet parfois un warning au
 chargement si une version d'`urllib3`/`chardet` plus récente que celle
 attendue est présente sur le système. Ce warning est filtré directement
 dans le script (aucune action requise, pas de `pip install`).
+
+## Bonus : blocage local nginx (`nginx_fw_block.py`)
+
+Script indépendant (aucune dépendance à `sophos_fw_block.py` ni à
+Sophos — stdlib Python uniquement) qui maintient un fichier geo-map
+nginx local listant les IP bannies, et déclenche un reload nginx quand
+ce fichier change. Utile en complément ou à la place de Sophos :
+purement local, un reload nginx (~instantané) au lieu des 5-8s observées
+côté API Sophos (voir plus haut). Peut tourner en parallèle de
+`sophos-xgs` sur la même jail (les deux actions dans `action =`).
+
+**`ban`/`unban` ne dépendent pas de fail2ban** : ils lisent/modifient/
+réécrivent `map_file` directement (I/O locale uniquement) — ajoute/retire
+juste l'IP concernée, idempotent (aucune écriture ni reload si l'IP est
+déjà dans l'état voulu). Seule l'action `start` interroge
+`fail2ban-client status <jail>` pour régénérer le fichier en entier
+(bootstrap ou resynchro complète) ; `jail` n'est donc requis que pour
+`start`. Verrou non-bloquant par IP identique à `sophos_fw_block.py`
+2.3.1 : un ban/unban déjà en cours pour une IP fait abandonner
+immédiatement tout appel concurrent pour cette même IP.
+
+### Installation
+
+```bash
+sudo mkdir -p /etc/nginx-fw-block
+sudo cp nginx.conf.example /etc/nginx-fw-block/config.conf
+sudo vim /etc/nginx-fw-block/config.conf   # jail, map_file, reload_cmd
+
+sudo cp nginx_fw_block.py /usr/local/bin/
+sudo chmod +x /usr/local/bin/nginx_fw_block.py
+
+sudo cp action.d/nginx-local.conf /etc/fail2ban/action.d/
+```
+
+Dans `jail.local` (combinable avec `sophos-xgs`) :
+
+```ini
+[php-404]
+enabled = true
+action  = sophos-xgs
+          nginx-local
+```
+
+Côté nginx (voir `nginx_fw_block.py --help` pour le format exact du
+fichier généré) :
+
+```nginx
+geo $remote_addr $is_banned {
+    default 0;
+    include /etc/nginx/banned_ips.conf;
+}
+
+server {
+    if ($is_banned) { return 403; }   # global
+
+    location /wp-login.php {
+        if ($is_banned) { return 403; }   # ou ciblé sur une route précise
+    }
+}
+```
+
+Si le trafic est proxysé (IP réelle dans un header, pas `$remote_addr`),
+configurer `ngx_http_realip_module` en amont :
+
+```nginx
+set_real_ip_from  <IP/CIDR du proxy ou CDN>;
+real_ip_header    X-Forwarded-For;
+```
+
+### Test manuel
+
+```bash
+/usr/local/bin/nginx_fw_block.py start           # régénère tout depuis fail2ban
+/usr/local/bin/nginx_fw_block.py list             # affiche le fichier local actuel
+/usr/local/bin/nginx_fw_block.py ban 203.0.113.5 --debug-timing
+```
+
+`reload_cmd` est une commande shell arbitraire définie dans la config —
+adapter selon le déploiement (`nginx -s reload` en bare metal,
+`docker exec <conteneur> nginx -s reload` en Docker).
+
+### Limites connues
+
+- `reload_cmd` ne s'exécute que si `ban`/`unban` change réellement le
+  contenu de `map_file` (idempotent) — pas de reload inutile.
+- `ban`/`unban` ne connaissent que `map_file`, pas fail2ban : si le
+  fichier est modifié/supprimé manuellement, ou après un décalage quelconque,
+  relancer `start` pour resynchroniser depuis fail2ban (source de vérité
+  pour cette action précise uniquement).
+- Pas d'équivalent `vacuum`/`sync` : pas d'objet firewall persistant à
+  nettoyer (contrairement aux `IPHost` Sophos) — juste un fichier plat.

@@ -1,0 +1,7 @@
+[nginx]
+jail = sshd
+# fail2ban_client = fail2ban-client
+map_file = /etc/nginx/banned_ips.conf
+# reload_cmd = nginx -s reload
+# exemple Docker :
+# reload_cmd = docker exec mon-conteneur-nginx nginx -s reload

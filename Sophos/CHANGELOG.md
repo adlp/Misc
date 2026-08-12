@@ -1,5 +1,40 @@
 # Changelog
 
+## firewall-xgs/fail2ban/nginx_fw_block.py 1.1.0 — 2026-08-12
+
+Nouveau script, indépendant de `sophos_fw_block.py` (stdlib uniquement,
+pas d'import croisé) : maintient un fichier geo-map nginx local listant
+les IP bannies, et déclenche un reload nginx quand ce fichier change.
+Alternative/complément à Sophos : purement local, reload nginx
+(~instantané) au lieu des 5-8s observées côté API Sophos.
+
+### Added
+- Actions `ban`/`unban`/`list`/`start`, config `[nginx]` (`jail`,
+  `fail2ban_client`, `map_file`, `reload_cmd`), `--jail`/`--map-file`/
+  `--reload-cmd`/`--debug`/`--debug-timing`.
+- `reload_cmd` : commande shell arbitraire définie dans la config
+  (adaptable au déploiement — bare metal ou `docker exec ... nginx -s
+  reload`).
+- Verrou non-bloquant par IP (identique à `sophos_fw_block.py` 2.3.1) :
+  un ban/unban déjà en cours pour une IP fait abandonner immédiatement
+  tout appel concurrent pour cette même IP.
+- `action.d/nginx-local.conf`, `nginx.conf.example`, doc dans le README
+  (section "Bonus : blocage local nginx").
+
+### Changed
+- `ban`/`unban` **ne dépendent pas de fail2ban** : ils lisent/modifient/
+  réécrivent `map_file` directement (I/O locale uniquement), idempotent
+  (aucune écriture ni reload si l'IP est déjà dans l'état voulu). Design
+  initial (1.0.0) les faisait interroger `fail2ban-client status <jail>`
+  et pousser la liste complète à chaque appel — remplacé par un
+  ajout/retrait incrémental local, fail2ban n'étant plus nécessaire pour
+  ces deux actions (utile car aucune raison d'éviter une lecture locale,
+  contrairement à l'API Sophos lente). Seule l'action `start` interroge
+  encore fail2ban, pour une resynchro complète (bootstrap ou après
+  intervention manuelle sur le fichier). Testé : zéro appel
+  `fail2ban-client` pendant ban/unban, idempotence confirmée (pas de
+  reload sur IP déjà présente/absente).
+
 ## firewall-xgs/fail2ban 2.4.0 — 2026-08-12
 
 ### Removed
