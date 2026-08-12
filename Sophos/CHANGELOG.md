@@ -1,5 +1,38 @@
 # Changelog
 
+## firewall-xgs/fail2ban 2.5.0 — 2026-08-12
+
+### Added
+- IP list shardées (`iplist_prefix`) : alternative à `iplist` (mutuellement
+  exclusifs) pour contourner la limite Sophos de 1000 entrées par IP
+  list. Nouvelles clés config : `iplist_prefix`, `iplist_seed_ip`
+  (requis — IP placeholder pour créer une liste, Sophos exige >= 1
+  adresse), `iplist_max_entries` (défaut/plafond 1000), `alert_email`,
+  `smtp_host`/`smtp_port` (défaut `localhost:25`).
+- `ban` ajoute l'IP à la liste shardée **active** (la plus récente non
+  pleine) ; une fois `iplist_max_entries` atteint, crée automatiquement
+  la liste suivante (seedée) et envoie un mail à `alert_email` si
+  configuré (sinon warning loggé, jamais fatal).
+- `unban` retire l'IP de la liste shardée qui la contient **uniquement**
+  — aucune autre liste n'est touchée, donc **aucun décalage en cascade**
+  quand une IP est retirée d'une liste antérieure (exigence explicite :
+  minimiser les modifications de liste). Chaque ban/unban ne fait donc
+  jamais plus d'1 appel Sophos d'écriture, sur exactement la liste
+  concernée.
+- État shardé (quelle IP dans quelle liste) suivi localement dans
+  `/var/lib/sophos-fw-block/shards-*.json` (persistant, contrairement aux
+  verrous/état éphémère de `/run` — c'est la seule trace permettant à
+  `unban` de cibler la bonne liste sans relire tout Sophos).
+- `start` crée la/les listes shardées si absentes et resynchronise
+  (ajoute les IP manquantes, retire les IP expirées de leur liste
+  respective) depuis fail2ban — même principe que pour `group`/`iplist`.
+- `list` affiche l'état shardé local (pas d'appel Sophos — reflète ce
+  que le script croit avoir poussé).
+- Testé : bootstrap sans email, dépassement de seuil avec email (réel,
+  vérifié via un serveur SMTP local de test — from/to/subject corrects),
+  échec SMTP non fatal, unban ciblé sans impact sur les autres listes,
+  `start` répartissant/resynchronisant correctement sur plusieurs listes.
+
 ## firewall-xgs/fail2ban/nginx_fw_block.py 1.1.0 — 2026-08-12
 
 Nouveau script, indépendant de `sophos_fw_block.py` (stdlib uniquement,

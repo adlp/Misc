@@ -9,16 +9,19 @@ l'XGS pour inspection/nettoyage/comparaison, mais ne participent pas au
 push.
 """
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 import argparse
 import configparser
 import fcntl
 import hashlib
 import ipaddress
+import json
 import logging
 import logging.handlers
 import os
+import smtplib
+import socket
 import subprocess
 import sys
 import time
@@ -26,6 +29,7 @@ import warnings
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from email.message import EmailMessage
 from xml.sax.saxutils import escape
 
 # requests (paquet apt, ancien) vérifie la version d'urllib3/chardet au
@@ -43,8 +47,16 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 DEFAULT_CONFIG_PATH = "/etc/sophos-fw/api.conf"
 DEFAULT_PREFIX = "f2b_"
 DEFAULT_FAIL2BAN_CLIENT = "fail2ban-client"
+DEFAULT_SMTP_HOST = "localhost"
+DEFAULT_SMTP_PORT = 25
 LOCK_PATH = "/run/lock/sophos-fw-block.lock"
 CACHE_DIR = "/run/sophos-fw-block"
+# État des IP list shardées : doit survivre à un reboot (contrairement aux
+# verrous/cache de /run) — c'est la seule trace de "quelle IP est dans
+# quelle liste", nécessaire pour qu'unban cible la bonne liste sans
+# interroger Sophos ni toutes les relire.
+SHARD_STATE_DIR = "/var/lib/sophos-fw-block"
+IPLIST_HARD_CAP = 1000  # limite Sophos réelle, jamais dépassable
 
 # Session HTTP réutilisée pour tous les appels API d'une même invocation :
 # évite un handshake TCP/TLS neuf à chaque appel. Sûr en usage concurrent
@@ -116,10 +128,14 @@ def locked(exclusive):
 
 
 def _target_digest(cfg):
-    """Identifiant court propre à ce (host, group, iplist, jail) — évite
-    qu'une config vise un mauvais verrou si plusieurs api.conf distincts
-    tournent sur la même machine (plusieurs firewalls/jails)."""
-    key = f"{cfg['host']}|{cfg['group']}|{cfg['iplist']}|{cfg['jail']}"
+    """Identifiant court propre à cette config (host, group, iplist,
+    iplist_prefix, jail) — évite qu'une config vise un mauvais verrou/état
+    si plusieurs api.conf distincts tournent sur la même machine
+    (plusieurs firewalls/jails)."""
+    key = (
+        f"{cfg['host']}|{cfg['group']}|{cfg['iplist']}|"
+        f"{cfg['iplist_prefix']}|{cfg['jail']}"
+    )
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
@@ -200,11 +216,43 @@ def load_config(path):
             "fail2ban_client": sec.get(
                 "fail2ban_client", fallback=DEFAULT_FAIL2BAN_CLIENT
             ),
+            "iplist_prefix": sec.get("iplist_prefix", fallback=None) or None,
+            "iplist_seed_ip": sec.get("iplist_seed_ip", fallback=None) or None,
+            "iplist_max_entries": sec.getint(
+                "iplist_max_entries", fallback=IPLIST_HARD_CAP
+            ),
+            "alert_email": sec.get("alert_email", fallback=None) or None,
+            "smtp_host": sec.get("smtp_host", fallback=DEFAULT_SMTP_HOST),
+            "smtp_port": sec.getint("smtp_port", fallback=DEFAULT_SMTP_PORT),
+            "smtp_from": sec.get(
+                "smtp_from", fallback=f"sophos-fw-block@{socket.gethostname()}"
+            ),
         }
     except KeyError as exc:
         raise SystemExit(f"clé manquante dans {path}: {exc}")
-    if not cfg["group"] and not cfg["iplist"]:
-        raise SystemExit(f"{path}: au moins une des clés group/iplist requise")
+    if not cfg["group"] and not cfg["iplist"] and not cfg["iplist_prefix"]:
+        raise SystemExit(
+            f"{path}: au moins une des clés group/iplist/iplist_prefix requise"
+        )
+    if cfg["iplist"] and cfg["iplist_prefix"]:
+        raise SystemExit(
+            f"{path}: iplist et iplist_prefix sont mutuellement exclusifs "
+            "(liste unique vs listes shardées)"
+        )
+    if cfg["iplist_prefix"]:
+        if not cfg["iplist_seed_ip"]:
+            raise SystemExit(
+                f"{path}: iplist_seed_ip requis avec iplist_prefix (IP "
+                "placeholder pour pouvoir créer une liste vide)"
+            )
+        try:
+            ipaddress.ip_address(cfg["iplist_seed_ip"])
+        except ValueError:
+            raise SystemExit(f"{path}: iplist_seed_ip invalide: {cfg['iplist_seed_ip']}")
+        if not 1 <= cfg["iplist_max_entries"] <= IPLIST_HARD_CAP:
+            raise SystemExit(
+                f"{path}: iplist_max_entries doit être entre 1 et {IPLIST_HARD_CAP}"
+            )
     return cfg
 
 
@@ -468,20 +516,22 @@ def get_iplist_addresses(cfg):
     return [ip.strip() for ip in raw.split(",") if ip.strip()]
 
 
-def set_iplist_addresses(cfg, ips):
-    """Remplace toute la ListOfIPAddresses de l'IP list par `ips`.
+def set_iplist_addresses(cfg, ips, name=None):
+    """Remplace toute la ListOfIPAddresses de l'IP list `name` par `ips`
+    (défaut : `cfg['iplist']` — liste unique historique).
 
-    Seule méthode qui fonctionne : `operation="add"` sur un IPHost déjà
-    existant échoue (502 "Entity having same name already exists", même
-    comportement que sur IPHostGroup — voir set_group_hosts() et
-    test_iplist_add.py). ~5-8s observés en réel pour cet appel, y compris
-    quand `ips` est identique au contenu actuel : le coût vient de
-    l'application de la config sur un objet référencé par une règle
-    active, pas de la taille du diff ni du type d'opération.
+    Seule méthode qui fonctionne sur une liste déjà existante :
+    `operation="add"` échoue (502 "Entity having same name already
+    exists", même comportement que sur IPHostGroup — voir
+    set_group_hosts() et test_iplist_add.py). ~5-8s observés en réel pour
+    cet appel, y compris quand `ips` est identique au contenu actuel : le
+    coût vient de l'application de la config sur un objet référencé par
+    une règle active, pas de la taille du diff ni du type d'opération.
     """
+    name = name or cfg["iplist"]
     body = (
         '<Set operation="update"><IPHost>'
-        f"<Name>{escape(cfg['iplist'])}</Name>"
+        f"<Name>{escape(name)}</Name>"
         "<HostType>IPList</HostType>"
         f"<ListOfIPAddresses>{escape(','.join(ips))}</ListOfIPAddresses>"
         "</IPHost></Set>"
@@ -489,8 +539,194 @@ def set_iplist_addresses(cfg, ips):
     root = api_call(cfg, body)
     code, text = parse_status(root, "IPHost")
     if code != "200":
-        raise RuntimeError(f"mise à jour IP list {cfg['iplist']} échouée: {code} {text}")
-    logging.info("IP list %s mise à jour (%d IP)", cfg["iplist"], len(ips))
+        raise RuntimeError(f"mise à jour IP list {name} échouée: {code} {text}")
+    logging.info("IP list %s mise à jour (%d IP)", name, len(ips))
+
+
+def create_iplist(cfg, name, ips):
+    """Crée une nouvelle IP list (`operation="add"`, fonctionne car
+    l'objet n'existe pas encore — contrairement à un Set sur une liste
+    déjà existante, voir set_iplist_addresses). `ips` ne doit jamais être
+    vide : Sophos exige au moins une adresse pour créer l'objet."""
+    body = (
+        '<Set operation="add"><IPHost>'
+        f"<Name>{escape(name)}</Name>"
+        "<IPFamily>IPv4</IPFamily><HostType>IPList</HostType>"
+        f"<ListOfIPAddresses>{escape(','.join(ips))}</ListOfIPAddresses>"
+        "</IPHost></Set>"
+    )
+    root = api_call(cfg, body)
+    code, text = parse_status(root, "IPHost")
+    if code == "200":
+        logging.info("IP list %s créée (%d IP)", name, len(ips))
+    elif code and "already exist" in (text or "").lower():
+        logging.warning("IP list %s existe déjà", name)
+    else:
+        raise RuntimeError(f"création IP list {name} échouée: {code} {text}")
+
+
+def _shard_state_path(cfg):
+    return f"{SHARD_STATE_DIR}/shards-{_target_digest(cfg)}.json"
+
+
+def _load_shard_state(cfg):
+    """{"active": nom_liste_courante|None, "lists": {nom: [ip, ...]}}.
+
+    Seule trace de "quelle IP est dans quelle liste" : nécessaire pour
+    qu'unban cible directement la bonne liste sans interroger Sophos.
+    Persistant (/var/lib, pas /run) — une perte de cet état est
+    récupérable via `start` (reconstruit depuis fail2ban, voir
+    shard_start), mais rare/évitable en le gardant hors tmpfs.
+    """
+    try:
+        with open(_shard_state_path(cfg)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"active": None, "lists": {}}
+
+
+def _save_shard_state(cfg, state):
+    os.makedirs(SHARD_STATE_DIR, exist_ok=True)
+    path = _shard_state_path(cfg)
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _send_alert_email(cfg, list_name, count):
+    """Envoie un mail d'alerte (nouvelle IP list créée). Non fatal : un
+    échec d'envoi (pas de relai SMTP local, etc.) ne doit pas faire
+    échouer le ban en cours — juste loggé en warning."""
+    if not cfg["alert_email"]:
+        logging.warning(
+            "nouvelle IP list %s créée mais alert_email non configuré, pas de mail envoyé",
+            list_name,
+        )
+        return
+    msg = EmailMessage()
+    msg["Subject"] = f"[sophos-fw-block] nouvelle IP list créée : {list_name}"
+    msg["From"] = cfg["smtp_from"]
+    msg["To"] = cfg["alert_email"]
+    msg.set_content(
+        f"La liste précédente a atteint le seuil configuré "
+        f"({cfg['iplist_max_entries']} entrées).\n"
+        f"Nouvelle liste créée automatiquement : {list_name}\n\n"
+        f"Si une règle firewall doit référencer explicitement chaque IP "
+        f"list (plutôt qu'un groupe les englobant toutes), pensez à "
+        f"l'ajouter à la règle correspondante sur le Sophos."
+    )
+    try:
+        with smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"], timeout=10) as smtp:
+            smtp.send_message(msg)
+        logging.info("mail d'alerte envoyé à %s (%s)", cfg["alert_email"], list_name)
+    except OSError as exc:
+        logging.warning("échec d'envoi du mail d'alerte (%s): %s", list_name, exc)
+
+
+def _create_new_shard(cfg, state, alert):
+    """Crée la prochaine IP list de la famille (préfixe + numéro suivant),
+    seedée avec `iplist_seed_ip` (Sophos exige >= 1 adresse à la création),
+    l'enregistre dans `state`. `alert=True` envoie le mail (vrai
+    dépassement de seuil) ; `alert=False` pour la toute première création
+    (bootstrap normal, pas un événement à notifier)."""
+    n = len(state["lists"]) + 1
+    name = f"{cfg['iplist_prefix']}{n}"
+    seed = cfg["iplist_seed_ip"]
+    create_iplist(cfg, name, [seed])
+    state["lists"][name] = [seed]
+    logging.warning("nouvelle IP list shardée créée: %s (seed %s)", name, seed)
+    if alert:
+        _send_alert_email(cfg, name, len(state["lists"][name]))
+    return name
+
+
+def _shard_for_new_entry(cfg, state):
+    """Retourne le nom de la liste où ajouter une nouvelle IP, en créant
+    une nouvelle liste si besoin (bootstrap sans alerte, dépassement de
+    seuil avec alerte)."""
+    active = state.get("active")
+    if active is None:
+        active = _create_new_shard(cfg, state, alert=False)
+    elif len(state["lists"][active]) >= cfg["iplist_max_entries"]:
+        active = _create_new_shard(cfg, state, alert=True)
+    state["active"] = active
+    return active
+
+
+def shard_ban(cfg, ip):
+    """Ajoute `ip` à la liste shardée active, sans toucher aux autres.
+
+    Ne rebalance jamais (pas de "décalage" en cas de trou dans une liste
+    précédente) : une fois la liste active pleine (iplist_max_entries),
+    une nouvelle liste est créée et devient l'active ; les listes
+    précédentes ne reçoivent plus jamais de nouvelle IP, seulement des
+    retraits (shard_unban) — minimise les écritures par ban/unban à 1 API
+    call sur 1 seule liste, jamais plus.
+    """
+    state = _load_shard_state(cfg)
+    for name, members in state["lists"].items():
+        if ip in members:
+            logging.warning("%s déjà présent dans %s, rien à faire", ip, name)
+            return
+
+    active = _shard_for_new_entry(cfg, state)
+    members = state["lists"][active]
+    members.append(ip)
+    set_iplist_addresses(cfg, members, name=active)
+    _save_shard_state(cfg, state)
+
+
+def shard_unban(cfg, ip):
+    """Retire `ip` de la liste shardée qui la contient — jamais les autres."""
+    state = _load_shard_state(cfg)
+    for name, members in state["lists"].items():
+        if ip in members:
+            members.remove(ip)
+            set_iplist_addresses(cfg, members, name=name)
+            _save_shard_state(cfg, state)
+            return
+    logging.warning("%s absente de toutes les IP list shardées, rien à faire", ip)
+
+
+def shard_start(cfg):
+    """Crée la/les listes shardées si besoin et resynchronise depuis
+    fail2ban (source de vérité pour cette action précise uniquement).
+
+    Contrairement à ban/unban (1 seule liste touchée par appel), start
+    peut réécrire plusieurs listes : c'est une resynchro explicite/rare
+    (bootstrap, perte de `_shard_state_path`, dérive), pas le chemin
+    critique en fréquence — cohérent avec le comportement déjà accepté
+    pour `group` (une création d'IPHost par IP bannie, sans y chercher à
+    optimiser davantage).
+    """
+    state = _load_shard_state(cfg)
+    if not state["lists"]:
+        _shard_for_new_entry(cfg, state)
+        _save_shard_state(cfg, state)
+
+    fail2ban_ips = set(get_banned_ips(cfg))
+    seed = cfg["iplist_seed_ip"]
+    tracked = {
+        ip for members in state["lists"].values() for ip in members if ip != seed
+    }
+
+    to_remove = sorted(tracked - fail2ban_ips)
+    to_add = sorted(fail2ban_ips - tracked)
+
+    for ip in to_remove:
+        for name, members in state["lists"].items():
+            if ip in members:
+                members.remove(ip)
+                set_iplist_addresses(cfg, members, name=name)
+                break
+
+    for ip in to_add:
+        active = _shard_for_new_entry(cfg, state)
+        state["lists"][active].append(ip)
+        set_iplist_addresses(cfg, state["lists"][active], name=active)
+
+    _save_shard_state(cfg, state)
 
 
 def push_from_fail2ban(cfg, ips):
@@ -521,11 +757,14 @@ def ban(cfg, ip):
         if not acquired:
             logging.info("ban %s : déjà en cours (autre appel), abandonné", ip)
             return
-        ips = get_banned_ips(cfg)
-        if cfg["group"]:
-            name = host_name_for_ip(ip, cfg["prefix"])
-            create_iphost(cfg, name, ip)
-        push_from_fail2ban(cfg, ips)
+        if cfg["group"] or cfg["iplist"]:
+            ips = get_banned_ips(cfg)
+            if cfg["group"]:
+                name = host_name_for_ip(ip, cfg["prefix"])
+                create_iphost(cfg, name, ip)
+            push_from_fail2ban(cfg, ips)
+        if cfg["iplist_prefix"]:
+            shard_ban(cfg, ip)
 
 
 def unban(cfg, ip):
@@ -534,8 +773,11 @@ def unban(cfg, ip):
             logging.info("unban %s : déjà en cours (autre appel), abandonné", ip)
             return
         logging.info("unban %s : resync depuis fail2ban (jail %s)", ip, cfg["jail"])
-        ips = get_banned_ips(cfg)
-        push_from_fail2ban(cfg, ips)
+        if cfg["group"] or cfg["iplist"]:
+            ips = get_banned_ips(cfg)
+            push_from_fail2ban(cfg, ips)
+        if cfg["iplist_prefix"]:
+            shard_unban(cfg, ip)
 
 
 def start(cfg):
@@ -545,14 +787,19 @@ def start(cfg):
     bans déjà en cours) : crée l'IPHost manquant pour CHAQUE IP bannie
     (idempotent, pas seulement la dernière comme ban) avant de pousser la
     liste complète — comble le vide documenté dans les limites connues
-    (une IP déjà bannie avant le premier ban n'a pas d'IPHost).
+    (une IP déjà bannie avant le premier ban n'a pas d'IPHost). Avec
+    `iplist_prefix` : crée aussi la/les listes shardées si besoin (voir
+    shard_start).
     """
-    ips = get_banned_ips(cfg)
-    if cfg["group"]:
-        for ip in ips:
-            name = host_name_for_ip(ip, cfg["prefix"])
-            create_iphost(cfg, name, ip)
-    push_from_fail2ban(cfg, ips)
+    if cfg["group"] or cfg["iplist"]:
+        ips = get_banned_ips(cfg)
+        if cfg["group"]:
+            for ip in ips:
+                name = host_name_for_ip(ip, cfg["prefix"])
+                create_iphost(cfg, name, ip)
+        push_from_fail2ban(cfg, ips)
+    if cfg["iplist_prefix"]:
+        shard_start(cfg)
 
 
 def get_all_iphost_names(cfg, prefix):
@@ -639,6 +886,22 @@ def flush(cfg, dry_run=False):
     vacuum(cfg, dry_run=False)
 
 
+def list_shards(cfg):
+    """Affiche l'état local suivi des listes shardées (pas d'appel Sophos
+    — reflète ce que ce script croit avoir poussé, pas une lecture live
+    de l'XGS ; en cas de doute, `start` resynchronise depuis fail2ban)."""
+    state = _load_shard_state(cfg)
+    if not state["lists"]:
+        print(f"aucune IP list shardée (préfixe {cfg['iplist_prefix']}) — lancer `start`")
+        return
+    for name, members in sorted(state["lists"].items()):
+        marker = " (active)" if name == state.get("active") else ""
+        print(f"{name}{marker}: {len(members)} entrée(s)")
+        for ip in members:
+            tag = " [seed]" if ip == cfg["iplist_seed_ip"] else ""
+            print(f"  {ip}{tag}")
+
+
 def _print_sync_diff(label, fail2ban_ips, xgs_ips):
     common = sorted(fail2ban_ips & xgs_ips)
     only_fail2ban = sorted(fail2ban_ips - xgs_ips)
@@ -702,9 +965,34 @@ Fichier de config attendu (section [api]), défaut: {DEFAULT_CONFIG_PATH}
                                   #   fail2ban interrogée via fail2ban-client
   fail2ban_client = fail2ban-client  # optionnel, chemin/nom du binaire
 
-Au moins une des deux clés group/iplist est requise. Les deux peuvent
-être renseignées ensemble : l'IP est alors ajoutée/retirée des deux
-objets à chaque ban/unban.
+  # alternative à iplist : familles de listes shardées (limite Sophos :
+  # 1000 IP par IP list). Mutuellement exclusif avec iplist.
+  iplist_prefix      = Fail2Ban-List-  # optionnel, active le sharding
+  iplist_seed_ip     = 192.0.2.1       # requis avec iplist_prefix : IP
+                                        #   placeholder (Sophos exige >=1
+                                        #   adresse pour créer une liste)
+  iplist_max_entries = 1000            # optionnel, défaut 1000 (max
+                                        #   Sophos), seuil de création
+                                        #   d'une nouvelle liste
+  alert_email        = admin@ex.com    # optionnel, mail à la création
+                                        #   d'une nouvelle liste shardée
+  smtp_host          = localhost       # optionnel, défaut localhost
+  smtp_port          = 25              # optionnel, défaut 25
+
+Au moins une des clés group/iplist/iplist_prefix est requise. group et
+iplist(_prefix) sont indépendants et peuvent être renseignés ensemble :
+l'IP est alors ajoutée/retirée des deux à chaque ban/unban. iplist et
+iplist_prefix sont mutuellement exclusifs entre eux.
+
+Mode shardé (iplist_prefix) : chaque ban/unban ne touche qu'UNE seule
+liste (celle qui contient l'IP pour unban ; la liste "active" — la plus
+récente non pleine — pour ban), jamais les autres : pas de décalage en
+cascade quand une IP est retirée d'une liste antérieure. Une fois la
+liste active à `iplist_max_entries`, une nouvelle liste est créée
+(seedée avec `iplist_seed_ip`, qui y reste en permanence) et un mail est
+envoyé à `alert_email` si configuré (sinon juste un warning loggé).
+`start` crée aussi la/les listes shardées si absentes et resynchronise
+depuis fail2ban (source de vérité pour cette action précise).
 
 ban/unban interrogent `fail2ban-client status <jail>` et écrasent
 l'état XGS (group et/ou iplist) avec cette liste complète — aucune
@@ -848,6 +1136,8 @@ def main():
             if cfg["iplist"]:
                 for host_ip in get_iplist_addresses(cfg):
                     print(f"{host_ip:<15} {cfg['iplist']}")
+            if cfg["iplist_prefix"]:
+                list_shards(cfg)
     except Exception as exc:
         logging.error("%s%s: %s", args.action, f" {ip}" if ip else "", exc)
         sys.exit(1)

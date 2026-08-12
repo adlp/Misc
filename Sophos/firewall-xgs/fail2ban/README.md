@@ -3,8 +3,9 @@
 Script d'action fail2ban qui reflète l'état d'une jail fail2ban sur un
 Sophos Firewall XGS via son API XML legacy (`webconsole/APIController`),
 dans un `IPHostGroup` et/ou une IP list (`IPHost` type `IP list`)
-référencé(e) par une règle Deny existante. Au moins un des deux doit être
-configuré, les deux peuvent l'être en même temps.
+référencé(e) par une règle Deny existante. Au moins un des trois
+(`group`, `iplist`, `iplist_prefix` — voir "IP list shardées" plus bas)
+doit être configuré, combinables.
 
 **fail2ban est la seule source de vérité** : `ban`/`unban` interrogent
 `fail2ban-client status <jail>` et écrasent l'état XGS avec cette liste
@@ -59,6 +60,49 @@ chaque événement.
 
 Détail de toutes les options et du format de config attendu :
 `sophos_fw_block.py --help`
+
+## IP list shardées (`iplist_prefix`)
+
+Alternative à `iplist` (mutuellement exclusifs) pour contourner la
+limite Sophos de 1000 entrées par IP list : le script gère une **famille**
+de listes nommées `<iplist_prefix><N>` (`Fail2Ban-List-1`,
+`Fail2Ban-List-2`, ...), créées automatiquement au fur et à mesure.
+
+- **ban** ajoute l'IP à la liste **active** (la plus récente non pleine).
+  Une fois `iplist_max_entries` atteint (défaut/plafond 1000, la seed
+  comprise), une nouvelle liste est créée automatiquement (seedée avec
+  `iplist_seed_ip` — Sophos exige au moins une adresse pour créer
+  l'objet) et un mail est envoyé à `alert_email` si configuré (sinon
+  simple warning loggé, jamais fatal pour le ban en cours).
+- **unban** retire l'IP de la liste qui la contient — **uniquement
+  celle-ci**. Les autres listes ne sont jamais touchées : pas de
+  décalage en cascade quand une liste antérieure se vide partiellement.
+  Chaque ban/unban ne fait donc jamais plus d'1 appel Sophos d'écriture.
+- L'état (quelle IP dans quelle liste) est suivi localement dans
+  `/var/lib/sophos-fw-block/shards-*.json` — persistant (pas `/run`),
+  c'est la seule trace permettant à `unban` de cibler la bonne liste
+  sans tout relire sur Sophos. En cas de perte (rare), `start`
+  reconstruit l'état en resynchronisant depuis fail2ban.
+- **start** crée la/les listes manquantes et resynchronise (ajoute les
+  IP manquantes, retire les IP expirées de leur liste respective).
+- **list** affiche l'état shardé local (pas d'appel Sophos — reflète ce
+  que le script croit avoir poussé ; en cas de doute, relancer `start`).
+
+Config (section `[api]`) :
+
+```ini
+iplist_prefix      = Fail2Ban-List-
+iplist_seed_ip     = 192.0.2.1        # placeholder, reste en permanence dans chaque liste
+iplist_max_entries = 1000             # optionnel, défaut/plafond 1000
+alert_email        = admin@example.com  # optionnel
+smtp_host          = localhost        # optionnel, défaut localhost
+smtp_port          = 25               # optionnel, défaut 25
+```
+
+Une règle firewall par liste (ou une règle référençant chaque liste)
+est nécessaire côté Sophos si le blocage doit couvrir toutes les
+listes créées au fil du temps — pensez à ajouter la nouvelle liste à
+la règle lors de la réception du mail d'alerte.
 
 ## Prérequis côté Sophos Firewall
 
