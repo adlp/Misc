@@ -1,5 +1,14 @@
 # Changelog
 
+## firewall-xgs/fail2ban 2.2.1 — 2026-08-12
+
+### Added
+- `--debug-timing` logue aussi la durée de `fail2ban-client status
+  <jail>` (`get_banned_ips()`) — permet de distinguer le temps passé côté
+  fail2ban (local, rapide) du temps côté API Sophos (dominant, voir
+  action `sync`/tests réels : ~5s pour un push `iplist` de 8 IP, tout
+  côté serveur).
+
 ## firewall-xgs/fail2ban 2.2.0 — 2026-08-11
 
 ### Added

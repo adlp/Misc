@@ -164,11 +164,12 @@ passe masqué) — utile pour diagnostiquer une erreur API (ex: code `534`
 ci-dessus).
 
 Ajouter `--debug-timing` pour logger la durée de chaque appel API, de
-chaque connexion TCP+TLS établie (une fois par connexion mise en pool,
-réutilisée ensuite), de chaque tâche parallèle, et le temps total de
-l'action — utile pour situer où passe le temps si un ban/unban/list
-reste lent malgré le parallélisme client (ex: API Sophos qui
-sérialise les requêtes côté serveur, indépendamment du client) :
+`fail2ban-client status <jail>`, de chaque connexion TCP+TLS établie
+(une fois par connexion mise en pool, réutilisée ensuite), de chaque
+tâche parallèle, et le temps total de l'action — utile pour situer où
+passe le temps (ex: en usage réel, un push `iplist` de quelques IP prend
+~5s, entièrement côté traitement Sophos — connexion et fail2ban-client
+étant chacun de l'ordre de quelques ms) :
 
 ```bash
 /usr/local/bin/sophos_fw_block.py ban 203.0.113.5 --debug-timing

@@ -9,7 +9,7 @@ l'XGS pour inspection/nettoyage/comparaison, mais ne participent pas au
 push.
 """
 
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 
 import argparse
 import configparser
@@ -172,12 +172,18 @@ def get_banned_ips(cfg):
     if not cfg["jail"]:
         raise SystemExit("jail requis dans la config (ou --jail) pour interroger fail2ban")
     cmd = [cfg["fail2ban_client"], "status", cfg["jail"]]
+    t0 = time.monotonic()
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
     except FileNotFoundError:
         raise RuntimeError(f"{cfg['fail2ban_client']} introuvable (PATH ?)")
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"fail2ban-client status {cfg['jail']} : timeout")
+    finally:
+        if DEBUG_TIMING:
+            logging.debug(
+                "[timing] fail2ban-client status %s : %.3fs", cfg["jail"], time.monotonic() - t0
+            )
     if result.returncode != 0:
         raise RuntimeError(
             f"fail2ban-client status {cfg['jail']} a échoué (jail inconnue ?): "
