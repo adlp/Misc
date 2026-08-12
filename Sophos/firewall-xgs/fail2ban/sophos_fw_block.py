@@ -9,7 +9,7 @@ l'XGS pour inspection/nettoyage/comparaison, mais ne participent pas au
 push.
 """
 
-__version__ = "2.2.1"
+__version__ = "2.2.2"
 
 import argparse
 import configparser
@@ -414,6 +414,16 @@ def get_iplist_addresses(cfg):
 
 
 def set_iplist_addresses(cfg, ips):
+    """Remplace toute la ListOfIPAddresses de l'IP list par `ips`.
+
+    Seule méthode qui fonctionne : `operation="add"` sur un IPHost déjà
+    existant échoue (502 "Entity having same name already exists", même
+    comportement que sur IPHostGroup — voir set_group_hosts() et
+    test_iplist_add.py). ~5-8s observés en réel pour cet appel, y compris
+    quand `ips` est identique au contenu actuel : le coût vient de
+    l'application de la config sur un objet référencé par une règle
+    active, pas de la taille du diff ni du type d'opération.
+    """
     body = (
         '<Set operation="update"><IPHost>'
         f"<Name>{escape(cfg['iplist'])}</Name>"

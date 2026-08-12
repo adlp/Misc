@@ -1,5 +1,28 @@
 # Changelog
 
+## firewall-xgs/fail2ban 2.2.2 — 2026-08-12
+
+### Added
+- `test_iplist_add.py` : nouveau script diagnostic, teste
+  `Set operation="add"` sur un `IPHost` de type IP list (jamais testé
+  jusqu'ici, seulement sur `IPHostGroup`).
+
+### Fixed
+- Confirmé en réel : `operation="add"` échoue aussi sur un `IPHost`
+  existant (502 "Entity having same name already exists", IP list
+  inchangée) — même comportement générique que sur `IPHostGroup`. Aucune
+  sémantique d'ajout incrémental nulle part dans cette API pour un objet
+  nommé déjà existant. Documenté dans `set_iplist_addresses()`.
+- Mesure clé : la restauration en fin de test (`operation="update"` avec
+  un contenu **identique** à l'existant) a quand même pris ~8.4s en
+  conditions réelles — le coût observé (~5-8s par push) n'est donc pas lié
+  à la taille du diff ni au fait que le contenu change réellement, mais au
+  fait qu'une écriture réussie sur un objet référencé par une règle active
+  déclenche systématiquement le même coût (recompile de policy probable).
+  Confirme qu'aucune optimisation de la requête elle-même n'est possible ;
+  seuls le batching/debounce ou un mécanisme différent (liste tirée par le
+  firewall) peuvent réduire l'impact perçu.
+
 ## firewall-xgs/fail2ban 2.2.1 — 2026-08-12
 
 ### Added
