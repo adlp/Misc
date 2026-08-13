@@ -139,6 +139,12 @@ sudo chmod +x /usr/local/bin/sophos_fw_block.py
 sudo cp action.d/sophos-xgs.conf /etc/fail2ban/action.d/
 ```
 
+L'action est lancée via `systemd-run --no-block` (voir le fichier) : fail2ban
+rend la main immédiatement sans attendre le push Sophos (~5-8s, voir
+"Limites connues") — nécessite systemd sur l'hôte. Contrepartie : un
+échec de ban/unban n'apparaît plus dans les logs fail2ban, seulement via
+`journalctl` / syslog (tag `sophos-fw-block`).
+
 Dans `jail.local` :
 
 ```ini
@@ -364,6 +370,10 @@ sudo chmod +x /usr/local/bin/nginx_fw_block.py
 
 sudo cp action.d/nginx-local.conf /etc/fail2ban/action.d/
 ```
+
+Comme `sophos-xgs`, lancée via `systemd-run --no-block` (nécessite systemd) —
+échec visible via `journalctl` / syslog (tag `nginx-fw-block`), plus dans
+les logs fail2ban.
 
 Dans `jail.local` (combinable avec `sophos-xgs`) :
 

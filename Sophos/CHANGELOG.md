@@ -1,5 +1,20 @@
 # Changelog
 
+## firewall-xgs/fail2ban action.d — 2026-08-13
+
+Config-only, aucun changement de script (pas de bump de version).
+
+### Changed
+- `action.d/sophos-xgs.conf` et `action.d/nginx-local.conf` : `actionban`/
+  `actionunban` passent par `systemd-run --quiet --no-block` — fail2ban
+  rend la main immédiatement au lieu d'attendre le push Sophos (~5-8s) ou
+  le reload nginx. Nécessite systemd sur l'hôte (vérifié dispo/testé).
+  Contrepartie documentée : un échec de ban/unban n'apparaît plus dans
+  les logs fail2ban, seulement via `journalctl`/syslog (tag
+  `sophos-fw-block`/`nginx-fw-block`). Aucun changement requis côté
+  script — le verrouillage déjà en place (`_ip_activity_lock`, `locked()`)
+  gérait déjà le cas d'invocations concurrentes.
+
 ## firewall-xgs/fail2ban 2.5.0 — 2026-08-12
 
 ### Added
