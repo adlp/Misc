@@ -432,3 +432,16 @@ adapter selon le déploiement (`nginx -s reload` en bare metal,
   pour cette action précise uniquement).
 - Pas d'équivalent `vacuum`/`sync` : pas d'objet firewall persistant à
   nettoyer (contrairement aux `IPHost` Sophos) — juste un fichier plat.
+
+### Côté nginx : blocage sans erreur (tarpit) + détection de sondes
+
+- `nginx-conf/` : snippets nginx complets (`geo`/`map`, `realip` si
+  reverse-proxy en amont type Sophos XGS WAF, tarpit `limit_rate` +
+  payload statique qui ralentit les IP bannies au lieu de leur renvoyer
+  une erreur, sans jamais atteindre le backend réel) — voir
+  `nginx-conf/README.md`.
+- `filter.d/php-404-extended.conf` : variante de `php-404.conf` pour un
+  `log_format` custom (IP réelle dans `$remote_addr`, pas en dernier
+  champ) — utile pour tout vhost derrière ce même nginx, y compris ceux
+  qui n'ont pas de PHP (ex: Authentik — répond 404 comme n'importe quelle
+  appli aux sondes de scan WordPress).

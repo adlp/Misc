@@ -1,5 +1,32 @@
 # Changelog
 
+## firewall-xgs/fail2ban — 2026-08-17
+
+Config-only (filtre fail2ban + snippets nginx), aucun changement de
+script Python (pas de bump de version).
+
+### Added
+- `filter.d/php-404-extended.conf` : variante de `php-404.conf` adaptée
+  au `log_format extended` custom (nginx derrière Sophos XGS avec
+  `ngx_http_realip_module`) — IP réelle dans `$remote_addr` (premier
+  champ après le 5e ` - `), pas en dernier champ de ligne comme
+  l'original. Détecte les mêmes sondes PHP/WordPress, `HTTP:404`
+  littéral (jamais de match sur 200). Testé (5 cas : extensions PHP,
+  chemins WordPress, succès jamais matché, trafic normal Authentik
+  jamais matché, chaîne X-Forwarded-For présente).
+- `nginx-conf/` : snippets nginx complets (companion de
+  `nginx_fw_block.py`) pour bloquer les IP bannies **sans renvoyer
+  d'erreur** — tarpit (réponse lente via `limit_rate` + payload
+  statique) plutôt qu'un 403 immédiat, empêchant tout accès au backend
+  réel pour les IP bannies (`if` en amont de toute `location`, jamais
+  de `proxy_pass` atteint). Fichiers : `geo-badguys.conf` (bloc
+  `geo`/`map`, niveau `http{}` — doit y être inclus, erreur "geo
+  directive is not allowed here" sinon), `realip.conf` (optionnel, pour
+  restaurer la vraie IP client derrière un reverse-proxy applicatif type
+  Sophos XGS WAF), `tarpit-server.conf` (snippet `server{}`),
+  `tarpit/payload.txt` (payload de padding, ~3000 octets ⇒ ~5min à 10
+  octets/s), `README.md` (installation, réglages, debug).
+
 ## firewall-xgs/fail2ban action.d — 2026-08-13
 
 Config-only, aucun changement de script (pas de bump de version).
