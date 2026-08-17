@@ -1,5 +1,21 @@
 # Changelog
 
+## firewall-xgs/fail2ban — 2026-08-18
+
+Config-only (nouveau filtre), aucun changement de script Python.
+
+### Added
+- `filter.d/scanner-404-403-extended.conf` : détecte un comportement de
+  scanner générique — trop d'erreurs 404/403 en rafale sur n'importe
+  quel chemin (pas seulement PHP/WordPress comme `php-404-extended.conf`).
+  Le seuil "trop" vient du `maxretry`/`findtime` de la jail, le filtre
+  matche juste "requête en erreur 404/403". `ignoreregex` exclut les 404
+  bénins fréquents (favicon/robots/apple-touch-icon). Exemple de jail
+  documenté dans le README, réglé sur un débit de scan observé en réel
+  (~10 erreurs/s) : `maxretry=10 findtime=3` détecte en ~1s au lieu
+  d'attendre jusqu'à 60s. Testé (5 cas : 404 générique, 403 générique,
+  succès jamais matché, favicon/robots ignorés malgré 404).
+
 ## firewall-xgs/fail2ban — 2026-08-17
 
 Config-only (filtre fail2ban + snippets nginx), aucun changement de

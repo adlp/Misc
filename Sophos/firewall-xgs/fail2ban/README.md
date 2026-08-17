@@ -445,3 +445,25 @@ adapter selon le déploiement (`nginx -s reload` en bare metal,
   champ) — utile pour tout vhost derrière ce même nginx, y compris ceux
   qui n'ont pas de PHP (ex: Authentik — répond 404 comme n'importe quelle
   appli aux sondes de scan WordPress).
+- `filter.d/scanner-404-403-extended.conf` : détecte un comportement de
+  scanner générique — trop d'erreurs 404/403 en rafale, sur **n'importe
+  quel chemin** (pas seulement PHP/WordPress). Le "trop" vient du
+  `maxretry`/`findtime` de la jail, pas du filtre :
+
+  ```ini
+  [scanner-404-403]
+  enabled  = true
+  port     = http,https
+  filter   = scanner-404-403-extended
+  logpath  = /var/log/nginx/access.log
+  action   = sophos-xgs
+             nginx-local
+  maxretry = 10      # 10 erreurs...
+  findtime = 3       # ...en 3s -> signature scan (~10 erreurs/s observées
+                      #   en réel), ban en ~1s au lieu d'attendre jusqu'à 60s
+  bantime  = 86400
+  ```
+
+  `ignoreregex` exclut déjà `favicon.ico`/`robots.txt`/`apple-touch-icon*`
+  (404 bénins fréquents des navigateurs) — étoffer si d'autres assets
+  connus manquent sur ton site.
