@@ -1,5 +1,17 @@
 # Changelog
 
+## firewall-xgs/fail2ban — 2026-08-18 (6)
+
+Config-only, aucun changement de script Python.
+
+### Fixed
+- `nginx-conf/tarpit-server.conf` : ajout de `default_type text/plain;`
+  (hors du `if`, contexte normal). Sans ça, le `return CODE "texte";`
+  héritait du `default_type` global (souvent `application/octet-stream`
+  par défaut chez nginx), poussant le navigateur à proposer un
+  téléchargement au lieu d'afficher le texte — invisible en usage
+  normal (curl ne s'en souciait pas, d'où la découverte tardive).
+
 ## firewall-xgs/fail2ban — 2026-08-18 (5)
 
 Config-only, aucun changement de script Python.
