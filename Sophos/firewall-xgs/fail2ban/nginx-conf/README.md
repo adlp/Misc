@@ -106,6 +106,10 @@ confirmé).
   Un payload trop petit part quasi instantanément quel que soit le
   débit configuré (tient dans un seul paquet TCP) — rester au-dessus de
   quelques centaines d'octets pour un effet perceptible.
+- **Code HTTP retourné** : `403` par défaut dans `tarpit-server.conf`
+  (lignes `return` et `error_page`, à modifier ensemble avec le même
+  code). Codes usuels : `403`, `429`, `503`. Éviter `444` (coupe la
+  connexion sans réponse chez nginx — contraire au principe du tarpit).
 
 ## Test
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## firewall-xgs/fail2ban — 2026-08-18 (4)
+
+Config-only, aucun changement de script Python.
+
+### Changed
+- `nginx-conf/tarpit-server.conf` : code HTTP retourné aux IP bannies
+  désormais configurable (403 par défaut) au lieu d'être fixé à 200 via
+  `alias`. Remplace le `rewrite ^ /__tarpit__ last;` par `return
+  $CODE;` + `error_page $CODE = /__tarpit__;` (le `=` sans valeur
+  derrière `error_page` conserve le code d'origine au lieu de le forcer
+  à 200) — le contenu du tarpit reste servi et throttlé via
+  `limit_rate` normalement. Documenté dans `nginx-conf/README.md`.
+
 ## firewall-xgs/fail2ban — 2026-08-18 (3)
 
 Config-only (nouveaux filtres), aucun changement de script Python.
