@@ -1,5 +1,27 @@
 # Changelog
 
+## firewall-xgs/fail2ban — 2026-08-18 (5)
+
+Config-only, aucun changement de script Python.
+
+### Changed
+- `nginx-conf/tarpit-server.conf` : abandon de `alias`/`error_page` pour
+  le tarpit — après tests approfondis en conditions réelles (nginx
+  1.31.3, build Debian officiel, sans module tiers), `error_page` ne
+  redirige jamais en interne vers la location cible (vérifié avec/sans
+  `if`, avec/sans `internal`, plusieurs codes sans collision possible,
+  et même pour un 404 nginx natif) — cause non identifiée. Remplacé par
+  `return CODE "texte";` (payload désormais en dur dans le fichier,
+  ~2964 octets, plus de fichier externe/`location`/`alias`) — seule
+  méthode constatée fiable pour choisir le code HTTP tout en servant du
+  contenu throttlé. `nginx-conf/tarpit/payload.txt` n'est plus utilisé
+  par nginx (conservé comme référence de génération dans le README).
+- `nginx-conf/geo-badguys.conf` : débit par défaut du tarpit passé de
+  10 à 100 octets/s (`map $is_banned $tarpit_rate`).
+- `nginx-conf/README.md` : documentation mise à jour (installation
+  simplifiée, section expliquant le choix `return` vs `error_page`,
+  script de régénération du payload adapté).
+
 ## firewall-xgs/fail2ban — 2026-08-18 (4)
 
 Config-only, aucun changement de script Python.

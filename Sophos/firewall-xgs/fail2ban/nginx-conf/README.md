@@ -10,8 +10,12 @@ bas) les IP bannies par fail2ban, alimentées via `../nginx_fw_block.py`
 |---|---|---|
 | `geo-badguys.conf` | `http {}` | Définit `$is_banned` depuis `badguys.map`, et `$tarpit_rate` (débit selon `$is_banned`) |
 | `realip.conf` | `http {}` (ou `server {}`) | Restaure la vraie IP client si nginx est derrière un reverse-proxy applicatif (ex: Sophos XGS WAF) — **optionnel, seulement si concerné** |
-| `tarpit-server.conf` | `server {}`, avant toute `location` | Applique le ralentissement et empêche toute IP bannie d'atteindre un backend réel |
-| `tarpit/payload.txt` | — | Contenu servi aux IP bannies (texte de padding, ~3000 octets) |
+| `tarpit-server.conf` | `server {}`, avant toute `location` | Applique le ralentissement et empêche toute IP bannie d'atteindre un backend réel — payload embarqué directement dans le fichier (voir plus bas pourquoi) |
+
+`tarpit/payload.txt` n'existe plus séparément : une tentative de le servir via
+`alias`/`error_page` (code HTTP personnalisable) s'est révélée non fiable
+dans certains environnements nginx (voir section suivante) — le payload est
+maintenant un littéral directement dans `return CODE "...";`.
 
 ## Pourquoi ralentir plutôt que rejeter (403) ?
 
@@ -28,8 +32,6 @@ limité — pas une solution à généraliser à tout le trafic).
 1. Copier les fichiers :
    ```bash
    sudo cp geo-badguys.conf tarpit-server.conf /etc/nginx/include.d/
-   sudo mkdir -p /etc/nginx/tarpit
-   sudo cp tarpit/payload.txt /etc/nginx/tarpit/payload.txt
    ```
    (adapter les chemins à ton bind-mount Docker si nginx tourne en
    conteneur — ex: `/home/_Dockers/nginx/data/include.d/` côté hôte pour
@@ -89,27 +91,48 @@ renseigner `set_real_ip_from`/`real_ip_header` dans `realip.conf` en
 conséquence (l'IP interne de l'équipement amont + le nom du header
 confirmé).
 
+## Pourquoi `return CODE "texte";` et pas `alias`/`error_page` ?
+
+Version testée initialement : `location = /__tarpit__ { alias
+payload.txt; }`, atteinte via `error_page CODE = /__tarpit__;` (pour
+choisir le code HTTP tout en gardant le payload dans un fichier séparé).
+Constat en conditions réelles (nginx 1.31.3, build Debian officiel,
+sans module tiers) : `error_page` ne redirige **jamais** en interne vers
+la location cible — vérifié avec/sans `if`, avec/sans `internal`,
+plusieurs codes (dont un sans collision possible), et même pour un 404
+généré nativement par nginx (pas via `return`) — cause non identifiée.
+Seul `rewrite ... last;` (sans changer le code, donc 200 fixe) atteignait
+la location de façon fiable.
+
+`return CODE "texte";` contourne le problème : le contenu est renvoyé
+directement, sans passer par une seconde location ni par `error_page`.
+Contrepartie : le payload est en dur dans `tarpit-server.conf` (pas de
+fichier externe).
+
 ## Réglages
 
 - **Débit** : `map $is_banned $tarpit_rate { ... }` dans
-  `geo-badguys.conf` — défaut `10` (octets/s). Plus bas = plus lent.
-- **Durée du tarpit** ≈ taille de `tarpit/payload.txt` ÷ débit. Fourni à
-  ~3000 octets ⇒ ~5 min à 10 octets/s. Régénérer avec une taille
-  différente si besoin :
+  `geo-badguys.conf` — défaut `100` (octets/s). Plus bas = plus lent.
+- **Durée du tarpit** ≈ taille du payload (dans `tarpit-server.conf`) ÷
+  débit. Fourni à ~2964 octets ⇒ ~30s à 100 octets/s. Régénérer avec une
+  taille différente si besoin (remplacer le texte entre guillemets dans
+  `tarpit-server.conf`) :
   ```bash
   python3 -c "
-  line = 'Please wait, your request is being processed. Do not close this connection.\n'
-  target = 3000  # <-- ajuster (octets)
-  print((line * (target // len(line) + 1))[:target], end='')
-  " > payload.txt
+  line = 'Please wait, your request is being processed. Do not close this connection.'
+  n = 3000 // (len(line) + 1)  # <-- ajuster 3000 (octets cible)
+  print('\n'.join([line]*n) + '\n', end='')
+  "
   ```
   Un payload trop petit part quasi instantanément quel que soit le
   débit configuré (tient dans un seul paquet TCP) — rester au-dessus de
-  quelques centaines d'octets pour un effet perceptible.
+  quelques centaines d'octets pour un effet perceptible. Si le texte
+  change, échapper `"` (`\"`), `\` (`\\`) et `$` (`\$` — sinon interprété
+  comme une variable nginx).
 - **Code HTTP retourné** : `403` par défaut dans `tarpit-server.conf`
-  (lignes `return` et `error_page`, à modifier ensemble avec le même
-  code). Codes usuels : `403`, `429`, `503`. Éviter `444` (coupe la
-  connexion sans réponse chez nginx — contraire au principe du tarpit).
+  (le nombre juste après `return`). Codes usuels : `403`, `429`, `503`.
+  Éviter `444` (coupe la connexion sans réponse chez nginx — contraire
+  au principe du tarpit).
 
 ## Test
 
