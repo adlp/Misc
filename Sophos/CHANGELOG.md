@@ -1,5 +1,22 @@
 # Changelog
 
+## firewall-xgs/fail2ban — 2026-08-18 (3)
+
+Config-only (nouveaux filtres), aucun changement de script Python.
+
+### Added
+- `filter.d/php-404-syslog.conf`, `filter.d/scanner-404-403-syslog.conf` :
+  variantes syslog des filtres `-extended` (probes PHP/WordPress et
+  scanner générique), pour des logs nginx reçus via syslog (ex:
+  conteneur Authentik/nginx qui logue sur stdout, capté par rsyslog —
+  enveloppe timestamp ISO8601 + hostname + tag `nginx[pid]:` en tête de
+  ligne). Sans realip sur ce flux : IP réelle prise dans
+  `$http_x_forwarded_for` (après le `/` dans `$remote_addr/$xff`),
+  `$remote_addr` valant l'IP interne du proxy/passerelle docker. Ancrage
+  du match sur le tag syslog `nginx\[\d+\]: ` plutôt que `^` en début de
+  ligne. Testé avec 6 cas Python `re` (200 jamais matché, 404 PHP, 403
+  scanner, 404 scanner, ignoreregex favicon).
+
 ## firewall-xgs/fail2ban — 2026-08-18 (2)
 
 Config-only (filtres existants), aucun changement de script Python.

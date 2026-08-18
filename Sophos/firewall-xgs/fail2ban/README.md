@@ -476,3 +476,29 @@ adapter selon le déploiement (`nginx -s reload` en bare metal,
   `ignoreregex` exclut déjà `favicon.ico`/`robots.txt`/`apple-touch-icon*`
   (404 bénins fréquents des navigateurs) — étoffer si d'autres assets
   connus manquent sur ton site.
+- `filter.d/php-404-syslog.conf` et `filter.d/scanner-404-403-syslog.conf` :
+  même principe que les `-extended`, pour des logs reçus via **syslog**
+  (ex: conteneur nginx qui logue sur stdout, capté par rsyslog — cas
+  d'Authentik derrière nginx en Docker). Enveloppe syslog en tête de
+  ligne (timestamp ISO8601, hostname, tag `nginx[pid]:`), même structure
+  de champs que le format `extended` ensuite, mais **sans realip** :
+  l'IP réelle est dans `$http_x_forwarded_for` (après le `/`, dans le
+  champ `$remote_addr/$http_x_forwarded_for`), `$remote_addr` valant
+  l'IP interne du proxy/passerelle docker. L'ancre de match est le tag
+  syslog `nginx\[\d+\]: ` plutôt qu'un `^` en début de ligne (variable
+  selon le timestamp/hostname syslog) :
+
+  ```ini
+  [scanner-404-403-syslog]
+  enabled  = true
+  filter   = scanner-404-403-syslog
+  logpath  = /var/log/syslog
+  action   = sophos-xgs
+             nginx-local
+  maxretry = 10
+  findtime = 3
+  bantime  = 86400
+  ```
+
+  Une ligne sans XFF (`$http_x_forwarded_for` à `-`, accès direct/local)
+  ne matche pas : `-` n'est pas une IP/hostname valide pour `<HOST>`.
