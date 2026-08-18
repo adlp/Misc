@@ -1,5 +1,23 @@
 # Changelog
 
+## firewall-xgs/fail2ban — 2026-08-18 (2)
+
+Config-only (filtres existants), aucun changement de script Python.
+
+### Changed
+- `filter.d/php-404-extended.conf`, `filter.d/scanner-404-403-extended.conf` :
+  ajout de failregex pour un second `log_format` nginx (`snmain`,
+  `$server_name` en 1ère colonne) utilisé sur un autre vhost. IP réelle
+  prise dans `$http_x_forwarded_for` (dernier champ) au lieu de
+  `$remote_addr` — ce vhost n'a pas `realip` configuré, `$remote_addr` y
+  vaut l'IP interne du reverse-proxy amont. Statut HTTP en clair (`404`,
+  pas `HTTP:404`). Tolère une chaîne XFF (`"ip1, ip2"`), seule la
+  1ère IP sert de HOST. Les failregex du format `extended` précédent
+  sont conservées telles quelles (autre vhost, toujours en service) —
+  chaque filtre matche maintenant les deux formats indifféremment.
+  Testé avec 8 cas Python `re` (nouveau format, ancien format, 200
+  jamais matché, chaîne XFF, ignoreregex favicon).
+
 ## firewall-xgs/fail2ban — 2026-08-18
 
 Config-only (nouveau filtre), aucun changement de script Python.

@@ -440,11 +440,20 @@ adapter selon le déploiement (`nginx -s reload` en bare metal,
   payload statique qui ralentit les IP bannies au lieu de leur renvoyer
   une erreur, sans jamais atteindre le backend réel) — voir
   `nginx-conf/README.md`.
-- `filter.d/php-404-extended.conf` : variante de `php-404.conf` pour un
-  `log_format` custom (IP réelle dans `$remote_addr`, pas en dernier
-  champ) — utile pour tout vhost derrière ce même nginx, y compris ceux
-  qui n'ont pas de PHP (ex: Authentik — répond 404 comme n'importe quelle
-  appli aux sondes de scan WordPress).
+- `filter.d/php-404-extended.conf` et `filter.d/scanner-404-403-extended.conf` :
+  chacun couvre **deux** `log_format` nginx différents (2 vhosts avec des
+  formats distincts), le filtre matche les deux sans distinction :
+  - `extended` : IP réelle dans `$remote_addr` (via `realip`), pas en
+    dernier champ.
+  - `snmain` (`$server_name` en 1ère colonne) : IP réelle dans
+    `$http_x_forwarded_for` (dernier champ), `$remote_addr` y est l'IP
+    interne du reverse-proxy amont (realip non appliqué sur ce vhost) ;
+    statut HTTP en clair (`404`, pas `HTTP:404`). Tolère une chaîne XFF
+    (`"ip1, ip2"`) — seule la 1ère IP (client d'origine) sert de HOST.
+  - `php-404-extended.conf` : variante de `php-404.conf` — utile pour
+    tout vhost derrière ce même nginx, y compris ceux qui n'ont pas de
+    PHP (ex: Authentik — répond 404 comme n'importe quelle appli aux
+    sondes de scan WordPress).
 - `filter.d/scanner-404-403-extended.conf` : détecte un comportement de
   scanner générique — trop d'erreurs 404/403 en rafale, sur **n'importe
   quel chemin** (pas seulement PHP/WordPress). Le "trop" vient du
