@@ -1,5 +1,9 @@
 # Changelog — zimLocAccZam
 
+## 1.0.7 — 2026-08-19
+
+- Filtre LDAP inversé : au lieu de chercher spécifiquement `zimbraAccountStatus=lockout` (fragile — rate tout compte dans un autre état non actif, ou si la valeur exacte diffère), recherche désormais tout compte (`objectClass=zimbraAccount`) dont `zimbraAccountStatus` est renseigné et différent de `active`. Trouvé suite à un cas réel : un compte volontairement bloqué n'était pas détecté (0 résultat confirmé y compris en `ldapsearch` direct avec l'ancien filtre).
+
 ## 1.0.6 — 2026-08-19
 
 - Flag `-d/--debug` rendu réellement fonctionnel (jusqu'ici parsé mais jamais utilisé). Affiche sur stderr : config utilisée, `exclude_regexes`, taille du cache chargé, récupération du mot de passe LDAP, bind LDAP OK, nombre de comptes lockout trouvés, et pour chaque compte traité (dans les deux boucles) : exclusion, nouveau/déjà connu, création/recréation de ticket, id du ticket créé, clôture de ticket, écriture finale du cache.

@@ -5,12 +5,12 @@ Script Python remplaçant avantageusement :
 /opt/zimbra/bin/zmaccts | grep -v "^zzz_" | grep " lockout "
 ```
 
-Détecte les comptes Zimbra verrouillés (lockout) via LDAP, crée/rouvre/ferme automatiquement des tickets Zammad correspondants, et journalise les lignes d'échec d'authentification associées depuis `audit.log`.
+Détecte les comptes Zimbra non actifs (lockout, locked, closed, maintenance, pending...) via LDAP, crée/rouvre/ferme automatiquement des tickets Zammad correspondants, et journalise les lignes d'échec d'authentification associées depuis `audit.log`.
 
 ## Fonctionnement
 
 1. Bind LDAP admin (mot de passe récupéré via `zmlocalconfig`).
-2. Recherche des comptes avec `zimbraAccountStatus=lockout`.
+2. Recherche des comptes avec `zimbraAccountStatus` renseigné et différent de `active`.
 3. Pour chaque compte verrouillé :
    - Nouveau (absent du cache) → création ticket Zammad + note avec logs d'échec.
    - Déjà connu mais ticket fermé/disparu → recréation du ticket.

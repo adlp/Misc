@@ -1,6 +1,6 @@
 #!/usr/bin/env python3.8
 
-__version__ = "1.0.6"
+__version__ = "1.0.7"
 
 import subprocess
 import ldap
@@ -171,9 +171,9 @@ def connect_ldap(password):
     conn.simple_bind_s(bind_dn, password)
     return conn
 
-# 🔍 Recherche des comptes lockout
+# 🔍 Recherche des comptes non actifs (lockout, locked, closed, maintenance, pending...)
 def get_locked_accounts(conn, base_dn):
-    search_filter = "(&(zimbraAccountStatus=*)(zimbraAccountStatus=lockout))"
+    search_filter = "(&(objectClass=zimbraAccount)(zimbraAccountStatus=*)(!(zimbraAccountStatus=active)))"
     attributes = None  # None = récupérer tous les attributs
     results = conn.search_s(base_dn, ldap.SCOPE_SUBTREE, search_filter, attributes)
 
@@ -290,7 +290,7 @@ def main():
     debug("bind LDAP OK")
 
     locked_accounts = get_locked_accounts(conn, base_dn)
-    debug(f"comptes lockout trouvés : {len(locked_accounts)} ({', '.join(locked_accounts.keys()) or '-'})")
+    debug(f"comptes non-actifs trouvés : {len(locked_accounts)} ({', '.join(locked_accounts.keys()) or '-'})")
     new_cache={}
 
     # Open Ticketing System
