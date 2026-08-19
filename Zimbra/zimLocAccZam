@@ -1,6 +1,6 @@
 #!/usr/bin/env python3.8
 
-__version__ = "1.0.5"
+__version__ = "1.0.6"
 
 import subprocess
 import ldap
@@ -17,10 +17,15 @@ import sys
 
 # 🩹 Contexte du compte/ticket en cours de traitement, pour enrichir les messages d'erreur
 _CTX = {}
+_DEBUG = False
 
 def _ctx_info():
     parts = [f"{k}={v}" for k, v in _CTX.items() if v not in (None, "", "****")]
     return f" [{', '.join(parts)}]" if parts else ""
+
+def debug(msg):
+    if _DEBUG:
+        print(f"[debug] {msg}", file=sys.stderr)
 
 class Zammad:
 
@@ -230,7 +235,7 @@ def filter_infos(infos):
 
 # 🧾 Exécution
 def main():
-    global EXCLUDE_REGEXES
+    global EXCLUDE_REGEXES, _DEBUG
 
     CONFIG_PATH = os.path.expanduser("~/.zimLocAccZam")
 
@@ -241,15 +246,16 @@ def main():
     parser.add_argument('-s','--silent',help='Silence absolue',action="store_true")
     parser.add_argument('-n','--no-create',help="Ne cree pas le ticket meme si c'est necessaire",action="store_true",dest='no_create')
     args = parser.parse_args()
-
+    _DEBUG = args.debug
 
     # 📖 Lecture de la configuration
     if args.config:
         CONFIG_PATH = os.path.expanduser(args.config)
-        
+
+    debug(f"config utilisée : {CONFIG_PATH}")
     config = configparser.ConfigParser()
     config.read(CONFIG_PATH)
-    
+
     ZAMMAD_URL      = config.get("zammad", "url")
     ZAMMAD_TOKEN    = config.get("zammad", "token")
     ZAMMAD_GRP      = config.get("zammad", "group")
@@ -258,6 +264,7 @@ def main():
     CACHE_PATH      = config.get("general", "cache_file")
     base_dn         = config.get("general", "base_dn")
     EXCLUDE_REGEXES = [r.strip() for r in config.get("general", "exclude_regexes").split(",") if r.strip()]
+    debug(f"exclude_regexes : {EXCLUDE_REGEXES}")
 
     # 🧨 Lecture et activation (ou pas) de la conf sentry
     if "sentry" in config and "dsn" in config['sentry']:
@@ -275,12 +282,15 @@ def main():
             cache = json.load(f)
     else:
         cache = {}
-
+    debug(f"cache chargé ({CACHE_PATH}) : {len(cache)} compte(s)")
 
     password = get_ldap_password()
+    debug("mot de passe LDAP récupéré")
     conn = connect_ldap(password)
+    debug("bind LDAP OK")
 
     locked_accounts = get_locked_accounts(conn, base_dn)
+    debug(f"comptes lockout trouvés : {len(locked_accounts)} ({', '.join(locked_accounts.keys()) or '-'})")
     new_cache={}
 
     # Open Ticketing System
@@ -288,62 +298,78 @@ def main():
 
     for account in locked_accounts.keys():
         _CTX.clear(); _CTX['compte'] = account
+        debug(f"traitement compte {account}")
         if is_excluded(account):
+            debug(f"  → exclu (exclude_regexes)")
             continue
         if account not in cache:
             ### Compte absent du cache (donc pas de ticket)
+            debug(f"  → absent du cache, nouveau ticket")
             logs        = "\n".join(extract_failed_auth_lines(account))
             infos       = locked_accounts[account]['infos']
             if not args.no_create:
+                debug(f"  → création ticket Zammad pour {account}")
                 ticket_id   = zammad.create(f'[ZIMBRA] Locked :{account}',subject="infos",body=yaml.dump(filter_infos(infos),allow_unicode=True))
                 _CTX['ticket'] = ticket_id
+                debug(f"  → ticket créé : {ticket_id}")
                 zammad.note(ticket_id,"logs",logs)
                 new_cache[account] = {"ticket_id": ticket_id, "logs":logs,'infos':infos}
             else:
                 ticket_id   = "****"
+                debug(f"  → --no-create : pas de ticket créé")
             if not args.silent:
                 print(f'Ticket {ticket_id} tout neuf pour {account}')
                 print(f'    visible là : {ZAMMAD_URL}/#ticket/zoom/{ticket_id}')
         else:
             # Toujours bloqué, on garde le ticket, on verifie qu'il n'est pas fermé...
             _CTX['ticket'] = cache[account]['ticket_id']
+            debug(f"  → déjà connu, ticket {cache[account]['ticket_id']} — vérification état")
             new_cache[account] = cache[account]
             tick=zammad.ticket(cache[account]['ticket_id'])
             if tick is None or tick['close_at'] is not None:
+                debug(f"  → ticket {cache[account]['ticket_id']} fermé/disparu, recréation")
                 logs        = "\n".join(extract_failed_auth_lines(account))
                 infos       = locked_accounts[account]['infos']
                 ticket_id   = zammad.create(f'[ZIMBRA] Locked :{account}',subject="infos",body=yaml.dump(filter_infos(infos),allow_unicode=True))
                 _CTX['ticket'] = ticket_id
+                debug(f"  → nouveau ticket créé : {ticket_id}")
                 if not args.silent:
                     print(f'Ticket reCréation de ticket {ticket_id} pour {account}')
                 zammad.note(ticket_id,"logs",logs)
                 new_cache[account] = {"ticket_id": ticket_id, "logs":logs,'infos':infos}
             else:
+                debug(f"  → ticket {cache[account]['ticket_id']} toujours ouvert, rien à faire")
                 if not args.silent and args.always:
                     print(f'Tiket {cache[account]["ticket_id"]} existe et ouvert pour {account}')
                     print(f'    visible là : {ZAMMAD_URL}/#ticket/zoom/{tick["id"]}')
 
     # 🔁 Détection des comptes débloqués
+    debug("détection des comptes débloqués (comparaison cache/lockout)")
     for account in cache:
         ticket_id=cache[account]['ticket_id']
         _CTX.clear(); _CTX['compte'] = account; _CTX['ticket'] = ticket_id
         if account not in locked_accounts.keys() and not is_excluded(account):
+            debug(f"traitement compte débloqué {account} (ticket {ticket_id})")
             tick=zammad.ticket(ticket_id)
             if tick is None:
+                debug(f"  → ticket {ticket_id} introuvable côté Zammad")
                 print(f" Cas de figure perturbant : le ticket {ticket_id} pour {account} a existé, mais ca n'est plus le cas, il n'est meme pas fermé...")
                 continue
 
             zammad.note(ticket_id,"Cloture","Le compte est debloque vue Zimbra")
             if tick['close_at'] is None:
+                debug(f"  → clôture ticket {ticket_id}")
                 zammad.close(ticket_id)
                 if not args.silent:
                     print(f"Cloture du ticket {ticket_id} cf {account}")
                     print(f'    visible là : {ZAMMAD_URL}/#ticket/zoom/{ticket_id}')
             elif not args.silent:
+                debug(f"  → ticket {ticket_id} déjà fermé")
                 print(f"Ticket {ticket_id} cf {account} deja cloturé dans Zammad ?!?")
                 print(f'    visible là : {ZAMMAD_URL}/#ticket/zoom/{ticket_id}')
 
     # 💾 Mise à jour du cache
+    debug(f"écriture du cache ({CACHE_PATH}) : {len(new_cache)} compte(s)")
     with open(CACHE_PATH, "w") as f:
         json.dump(new_cache, f, indent=2)
 

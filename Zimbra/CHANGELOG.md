@@ -1,5 +1,9 @@
 # Changelog — zimLocAccZam
 
+## 1.0.6 — 2026-08-19
+
+- Flag `-d/--debug` rendu réellement fonctionnel (jusqu'ici parsé mais jamais utilisé). Affiche sur stderr : config utilisée, `exclude_regexes`, taille du cache chargé, récupération du mot de passe LDAP, bind LDAP OK, nombre de comptes lockout trouvés, et pour chaque compte traité (dans les deux boucles) : exclusion, nouveau/déjà connu, création/recréation de ticket, id du ticket créé, clôture de ticket, écriture finale du cache.
+
 ## 1.0.5 — 2026-08-07
 
 - Les messages d'erreur affichés par les handlers top-level (`main()`) incluent désormais le contexte connu au moment de l'exception — compte et/ou numéro de ticket en cours de traitement — quand cette info est disponible. Ex : `Erreur d'accès Zammad : ... [compte=bob@example.org, ticket=5]`. Rien n'est affiché si aucun contexte n'est encore connu (erreur avant la boucle de traitement).
