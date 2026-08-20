@@ -1,5 +1,19 @@
 # Changelog
 
+## firewall-xgs/fail2ban — 2026-08-20
+
+Config-only (nouveau filtre), aucun changement de script Python.
+
+### Added
+- `filter.d/env-probe-snmain.conf` : détecte les sondes vers des
+  fichiers `.env` (secrets/config exposés) — `.env`, `.env.local`,
+  `.env.production`, `.env.example`, `.env.bak`, `.env.backup`,
+  `/api/.env`, etc. Format `snmain` (`$server_name` en 1ère colonne, IP
+  réelle dans `$http_x_forwarded_for`, statut en clair). `maxretry = 1`
+  recommandé (une seule requête vers un `.env` est déjà un signal
+  fort). Testé avec 7 cas réels (bot Amazonbot scannant divers chemins
+  `.env`) + vérif 200 jamais matché.
+
 ## firewall-xgs/fail2ban — 2026-08-18 (6)
 
 Config-only, aucun changement de script Python.

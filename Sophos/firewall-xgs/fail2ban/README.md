@@ -502,3 +502,25 @@ adapter selon le déploiement (`nginx -s reload` en bare metal,
 
   Une ligne sans XFF (`$http_x_forwarded_for` à `-`, accès direct/local)
   ne matche pas : `-` n'est pas une IP/hostname valide pour `<HOST>`.
+- `filter.d/env-probe-snmain.conf` : détecte les sondes vers des
+  fichiers `.env` (secrets/config exposés) — `.env`, `.env.local`,
+  `.env.production`, `.env.example`, `.env.bak`, `.env.backup`,
+  `/api/.env`, etc. Format `snmain` (voir plus haut) — statut en clair,
+  HOST dans le dernier champ, tolère une chaîne XFF :
+
+  ```ini
+  [env-probe]
+  enabled  = true
+  port     = http,https
+  filter   = env-probe-snmain
+  logpath  = /var/log/nginx/access.log
+  action   = sophos-xgs
+             nginx-local
+  maxretry = 1
+  findtime = 60
+  bantime  = 86400
+  ```
+
+  `maxretry = 1` : une seule requête vers un `.env` est déjà un signal
+  fort (pas de faux positif légitime plausible), contrairement à un 404
+  générique — pas besoin d'attendre une rafale.
