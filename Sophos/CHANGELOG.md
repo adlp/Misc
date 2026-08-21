@@ -1,5 +1,30 @@
 # Changelog
 
+## firewall-xgs/fail2ban — 2026-08-21 (2)
+
+Config-only, aucun changement de script Python.
+
+### Fixed
+- `filter.d/env-probe-snmain.conf`, `filter.d/php-404-extended.conf`
+  (variante `snmain`), `filter.d/scanner-404-403-extended.conf`
+  (variante `snmain`) : le HOST était pris comme "le 1er token" du
+  dernier champ (`(<HOST>)[^"]*"$`) — cassé quand un reverse-proxy/CDN
+  en amont (Cloudflare notamment) place sa propre IPv6 en tête de la
+  chaîne XFF avant l'IPv4 du client réel (ex:
+  `"2a06:98c0:3600::103, 104.23.225.162"`). fail2ban matchait alors
+  l'IPv6 et tentait de bannir une adresse que l'infra (sans support
+  IPv6) ne peut pas traiter — ban sans effet. Remplacé par une capture
+  explicite de la 1ère IPv4 dans le champ (`(?P<host>\d{1,3}\.\d{1,3}\.
+  \d{1,3}\.\d{1,3})`, ignore les segments IPv6). Testé avec 12 cas
+  (formats snmain/extended, chaîne XFF simple/IPv6+IPv4, 200 jamais
+  matché).
+
+### Added
+- `filter.d/git-probe-snmain.conf` : détecte les sondes `.git`
+  (`.git/config`, `.git/HEAD`, `.git-credentials`, `.gitconfig`,
+  `.gitlab-ci.yml`, `.github/*`) — même principe qu'`env-probe-snmain`
+  (`maxretry = 1`), avec la capture HOST corrigée dès sa création.
+
 ## firewall-xgs/fail2ban — 2026-08-21
 
 Config-only, aucun changement de script Python.

@@ -526,3 +526,17 @@ adapter selon le déploiement (`nginx -s reload` en bare metal,
   `maxretry = 1` : une seule requête vers un `.env` est déjà un signal
   fort (pas de faux positif légitime plausible), contrairement à un 404
   générique — pas besoin d'attendre une rafale.
+- `filter.d/git-probe-snmain.conf` : même principe pour les sondes
+  `.git` (`.git/config`, `.git/HEAD`, `.git-credentials`, `.gitconfig`,
+  `.gitlab-ci.yml`, `.github/*`, préfixe commun `/.git`) — même jail
+  type (`maxretry = 1`, remplacer `filter = env-probe-snmain` par
+  `git-probe-snmain`).
+
+**Extraction du HOST dans les formats `snmain` (`env-probe-snmain`,
+`git-probe-snmain`, et les variantes `snmain` de `php-404-extended`/
+`scanner-404-403-extended`)** : capture la **1ère IPv4** trouvée dans le
+dernier champ, pas "le 1er token" — nécessaire car certains
+reverse-proxy/CDN en amont (Cloudflare notamment) placent leur propre
+IPv6 en tête de la chaîne XFF, avant l'IPv4 du client réel (ex:
+`"2a06:98c0:3600::103, 104.23.225.162"`). Un `<HOST>` classique aurait
+matché l'IPv6 — ban sans effet si l'infra derrière ne gère pas IPv6.
