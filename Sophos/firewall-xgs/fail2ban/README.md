@@ -437,8 +437,10 @@ adapter selon le déploiement (`nginx -s reload` en bare metal,
 
 - `nginx-conf/` : snippets nginx complets (`geo`/`map`, `realip` si
   reverse-proxy en amont type Sophos XGS WAF, tarpit `limit_rate` +
-  payload statique qui ralentit les IP bannies au lieu de leur renvoyer
-  une erreur, sans jamais atteindre le backend réel) — voir
+  payload qui ralentit les IP bannies au lieu de leur renvoyer une
+  erreur, sans jamais atteindre le backend réel, et rate-limiting
+  natif `limit_req` — protège contre les rafales trop rapides pour que
+  fail2ban réagisse à temps, avec exemption RFC1918) — voir
   `nginx-conf/README.md`.
 - `filter.d/php-404-extended.conf` et `filter.d/scanner-404-403-extended.conf` :
   chacun couvre **deux** `log_format` nginx différents (2 vhosts avec des

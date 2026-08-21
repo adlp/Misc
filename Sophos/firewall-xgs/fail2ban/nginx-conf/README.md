@@ -11,6 +11,8 @@ bas) les IP bannies par fail2ban, alimentées via `../nginx_fw_block.py`
 | `geo-badguys.conf` | `http {}` | Définit `$is_banned` depuis `badguys.map`, et `$tarpit_rate` (débit selon `$is_banned`) |
 | `realip.conf` | `http {}` (ou `server {}`) | Restaure la vraie IP client si nginx est derrière un reverse-proxy applicatif (ex: Sophos XGS WAF) — **optionnel, seulement si concerné** |
 | `tarpit-server.conf` | `server {}`, avant toute `location` | Applique le ralentissement et empêche toute IP bannie d'atteindre un backend réel — payload embarqué directement dans le fichier (voir plus bas pourquoi) |
+| `ratelimit.conf` | `http {}` | Définit `$ratelimit_key` (vide pour les IP RFC1918 exemptées) et la zone `limit_req_zone` |
+| `ratelimit-server.conf` | `server {}`, avant toute `location` | Applique le rate-limiting — indépendant du tarpit, protège contre les rafales trop rapides pour que fail2ban réagisse à temps |
 
 `tarpit/payload.txt` n'existe plus séparément : une tentative de le servir via
 `alias`/`error_page` (code HTTP personnalisable) s'est révélée non fiable
@@ -31,19 +33,21 @@ limité — pas une solution à généraliser à tout le trafic).
 
 1. Copier les fichiers :
    ```bash
-   sudo cp geo-badguys.conf tarpit-server.conf /etc/nginx/include.d/
+   sudo cp geo-badguys.conf tarpit-server.conf ratelimit.conf ratelimit-server.conf /etc/nginx/include.d/
    ```
    (adapter les chemins à ton bind-mount Docker si nginx tourne en
    conteneur — ex: `/home/_Dockers/nginx/data/include.d/` côté hôte pour
    `/etc/nginx/include.d/` côté conteneur, comme pour `badguys.map`)
 
-2. Dans `nginx.conf`, inclure `geo-badguys.conf` **au niveau `http {}`**
-   (pas `server{}`/`location{}` — `geo`/`map` n'y sont pas autorisés,
-   erreur `"geo" directive is not allowed here` sinon) :
+2. Dans `nginx.conf`, inclure `geo-badguys.conf` et `ratelimit.conf`
+   **au niveau `http {}`** (pas `server{}`/`location{}` — `geo`/`map`/
+   `limit_req_zone` n'y sont pas autorisés, erreur `"geo" directive is
+   not allowed here` sinon) :
    ```nginx
    http {
        ...
        include /etc/nginx/include.d/geo-badguys.conf;
+       include /etc/nginx/include.d/ratelimit.conf;
 
        # seulement si nginx est derrière un reverse-proxy applicatif
        # (voir realip.conf pour savoir si c'est le cas) :
@@ -55,6 +59,7 @@ limité — pas une solution à généraliser à tout le trafic).
            ...
 
            include /etc/nginx/include.d/tarpit-server.conf;
+           include /etc/nginx/include.d/ratelimit-server.conf;
 
            location / {
                proxy_pass http://backend_reel;
@@ -63,6 +68,8 @@ limité — pas une solution à généraliser à tout le trafic).
        }
    }
    ```
+   (`tarpit-server.conf` et `ratelimit-server.conf` sont indépendants —
+   inclure l'un, l'autre, ou les deux selon le besoin)
 
 3. `nginx -t` puis reload (ou laisser `nginx_fw_block.py` s'en charger au
    prochain ban — mais teste `nginx -t` manuellement au moins une fois
@@ -134,6 +141,27 @@ fichier externe).
   Éviter `444` (coupe la connexion sans réponse chez nginx — contraire
   au principe du tarpit).
 
+## Réglages du rate-limiting (`ratelimit.conf` / `ratelimit-server.conf`)
+
+- **rate** : `rate=10r/s` dans `ratelimit.conf` — débit nominal max par
+  IP. Ajuster selon le trafic légitime réel (une page avec beaucoup
+  d'assets/API calls simultanés peut dépasser ça pour un seul
+  visiteur — surveiller les faux positifs en prod).
+- **burst/nodelay** : `burst=20 nodelay` dans `ratelimit-server.conf` —
+  tolère une rafale de 20 requêtes au-delà du débit nominal avant de
+  rejeter, traitées immédiatement (`nodelay`, pas de mise en file
+  d'attente qui ralentirait artificiellement des visiteurs légitimes).
+- **Exemption RFC1918** : IP privées (`10/8`, `172.16/12`, `192.168/16`)
+  vues comme IP "réelle" (`$remote_addr`, donc après `realip` si
+  configuré) exemptées via `geo`/`map` dans `ratelimit.conf` — utile
+  pour un équipement interne (Sophos lui-même, monitoring...). Ne
+  fonctionne que si `realip.conf` est correctement configuré pour ce
+  vhost ; sinon `$remote_addr` vaut déjà l'IP interne du proxy amont
+  pour TOUT le trafic (voir avertissement dans `ratelimit.conf`).
+- **Code retourné en cas de dépassement** : `503` par défaut (limite
+  nginx). Personnalisable via `limit_req_status <code>;` dans le même
+  bloc que `limit_req`.
+
 ## Test
 
 ```bash
@@ -144,6 +172,10 @@ time curl -s -o /dev/null https://exemple.tld/  # depuis l'IP bannie
 # confirme que le backend réel n'est jamais contacté pour cette IP :
 # rien ne doit apparaître dans les logs applicatifs du backend pour
 # cette requête, seulement dans les logs nginx (accès + $is_banned).
+
+# rate-limiting : rafale de requêtes depuis une IP normale, doit
+# recevoir des 503 après le burst configuré :
+for i in $(seq 1 40); do curl -s -o /dev/null -w "%{http_code}\n" https://exemple.tld/; done
 ```
 
 ## Débogage

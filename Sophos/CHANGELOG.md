@@ -1,5 +1,23 @@
 # Changelog
 
+## firewall-xgs/fail2ban — 2026-08-21
+
+Config-only, aucun changement de script Python.
+
+### Added
+- `nginx-conf/ratelimit.conf` (http{}) et `nginx-conf/ratelimit-server.conf`
+  (server{}) : rate-limiting nginx natif (`limit_req`, 10r/s + burst 20
+  nodelay par défaut) en complément de fail2ban — fail2ban est réactif
+  (lit les logs puis bannit) et ne peut pas empêcher les dizaines/
+  centaines de requêtes qu'un bot envoie avant que le ban soit effectif
+  (latence lecture log + action, ex: 5-8s pour l'API Sophos).
+  `limit_req` encaisse le choc en temps réel, sans latence externe.
+  IP privées (RFC1918) exemptées via `geo`/`map` (clé de rate-limit
+  vide) — utile pour un équipement interne (Sophos lui-même,
+  monitoring) vu comme IP "réelle" après `realip`. Indépendant du
+  tarpit (`tarpit-server.conf`) — les deux fichiers `-server.conf`
+  peuvent être inclus ensemble ou séparément.
+
 ## firewall-xgs/fail2ban — 2026-08-20
 
 Config-only (nouveau filtre), aucun changement de script Python.
