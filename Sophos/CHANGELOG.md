@@ -1,5 +1,16 @@
 # Changelog
 
+## firewall-xgs/fail2ban — 2026-08-21 (3)
+
+Config-only, aucun changement de script Python.
+
+### Changed
+- `nginx-conf/ratelimit-server.conf` : ajout de `limit_req_status 429;`
+  — nginx renvoie `503` par défaut pour des raisons historiques
+  (`limit_req` existait avant la normalisation du code `429` "Too Many
+  Requests", RFC 6585, 2012), `429` est sémantiquement plus correct.
+  Doc (`nginx-conf/README.md`) mise à jour en conséquence.
+
 ## firewall-xgs/fail2ban — 2026-08-21 (2)
 
 Config-only, aucun changement de script Python.

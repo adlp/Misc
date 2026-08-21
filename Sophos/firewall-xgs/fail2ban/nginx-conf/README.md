@@ -158,9 +158,11 @@ fichier externe).
   fonctionne que si `realip.conf` est correctement configuré pour ce
   vhost ; sinon `$remote_addr` vaut déjà l'IP interne du proxy amont
   pour TOUT le trafic (voir avertissement dans `ratelimit.conf`).
-- **Code retourné en cas de dépassement** : `503` par défaut (limite
-  nginx). Personnalisable via `limit_req_status <code>;` dans le même
-  bloc que `limit_req`.
+- **Code retourné en cas de dépassement** : `429` (via
+  `limit_req_status 429;` dans `ratelimit-server.conf` — nginx renvoie
+  `503` par défaut pour des raisons historiques, `limit_req` existait
+  avant la normalisation du code `429` "Too Many Requests", RFC 6585,
+  2012).
 
 ## Test
 
@@ -174,7 +176,7 @@ time curl -s -o /dev/null https://exemple.tld/  # depuis l'IP bannie
 # cette requête, seulement dans les logs nginx (accès + $is_banned).
 
 # rate-limiting : rafale de requêtes depuis une IP normale, doit
-# recevoir des 503 après le burst configuré :
+# recevoir des 429 après le burst configuré :
 for i in $(seq 1 40); do curl -s -o /dev/null -w "%{http_code}\n" https://exemple.tld/; done
 ```
 
