@@ -9,7 +9,7 @@ l'XGS pour inspection/nettoyage/comparaison, mais ne participent pas au
 push.
 """
 
-__version__ = "2.5.1"
+__version__ = "2.5.2"
 
 import argparse
 import configparser
@@ -445,6 +445,27 @@ def list_group(cfg):
     return [(name, resolved[name]) for name in names]
 
 
+def _api_error_hint(code, text):
+    """Message d'aide pour les erreurs API connues sur un Set groupe/IP
+    list — vide si le code/texte ne correspond à rien de reconnu.
+
+    Ajouté au message d'exception (RuntimeError), donc remonte
+    automatiquement dans le log d'erreur main() -> logging.error() ->
+    syslog (voir setup_logging(), handler SysLogHandler déjà en place) :
+    pas de plomberie syslog séparée à ajouter ici.
+    """
+    text_l = (text or "").lower()
+    if code == "500" and "entity" in text_l:
+        return (
+            " -- probable IPHost manquant référencé (supprimé par vacuum "
+            "alors que fail2ban le considère encore banni, ou groupe dans "
+            "un état corrompu suite à un ancien Remove ciblé sur un membre "
+            "— voir README) : lancer 'start' pour recréer les IPHost "
+            "manquants et resynchroniser depuis fail2ban"
+        )
+    return ""
+
+
 def set_group_hosts(cfg, hosts):
     """Remplace toute la HostList du groupe par `hosts`.
 
@@ -466,7 +487,10 @@ def set_group_hosts(cfg, hosts):
     root = api_call(cfg, body)
     code, text = parse_status(root, "IPHostGroup")
     if code != "200":
-        raise RuntimeError(f"mise à jour groupe {cfg['group']} échouée: {code} {text}")
+        raise RuntimeError(
+            f"mise à jour groupe {cfg['group']} échouée: {code} {text}"
+            f"{_api_error_hint(code, text)}"
+        )
     logging.info("groupe %s mis à jour (%d hôtes)", cfg["group"], len(hosts))
 
 

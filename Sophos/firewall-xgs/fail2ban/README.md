@@ -342,6 +342,13 @@ logs fail2ban en cas d'échec, exit code 1).
 - Premier déploiement sur une jail ayant déjà des IP bannies : lancer
   `start` (crée l'IPHost manquant pour chaque IP déjà bannie et pousse la
   liste complète) — `sync` avant permet de voir l'écart au préalable.
+- Erreurs API connues sur un `Set` groupe/IP list : le message
+  d'exception inclut désormais un indice pour les codes reconnus (ex:
+  500 "Operation could not be performed on Entity" → suggère `start`,
+  cause probable détaillée plus haut dans `vacuum`). Ce message remonte
+  automatiquement dans le syslog (tag `sophos-fw-block`, voir
+  `setup_logging()`) via le passage normal par `logging.error()` dans
+  `main()` — aucune configuration supplémentaire requise.
 - `fail2ban-client status <jail>` doit renvoyer une ligne `Banned IP
   list:` — format observé sur les versions testées ; `get_banned_ips()`
   lève une erreur explicite si absent plutôt que de deviner.

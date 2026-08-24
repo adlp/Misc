@@ -1,5 +1,19 @@
 # Changelog
 
+## firewall-xgs/fail2ban 2.5.2 — 2026-08-24
+
+### Added
+- `_api_error_hint()` : message d'aide ajouté aux exceptions
+  `set_group_hosts()` sur un code d'erreur API reconnu — actuellement
+  500 "Operation could not be performed on Entity" (cause probable :
+  IPHost manquant, voir fix vacuum ci-dessous, ou groupe corrompu par
+  un ancien `Remove` ciblé) → suggère `start`. Remonte automatiquement
+  dans le syslog (tag `sophos-fw-block`) via le passage normal par
+  `logging.error()` dans `main()` — aucune plomberie syslog séparée
+  nécessaire, le handler existe déjà (`setup_logging()`).
+  `set_iplist_addresses()` non concerné : la piste "IPHost manquant"
+  ne s'applique pas à ce flux (pas d'objets IPHost référencés).
+
 ## firewall-xgs/fail2ban 2.5.1 — 2026-08-24
 
 ### Fixed
