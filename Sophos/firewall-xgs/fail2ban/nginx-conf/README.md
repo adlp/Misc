@@ -176,9 +176,32 @@ time curl -s -o /dev/null https://exemple.tld/  # depuis l'IP bannie
 # cette requête, seulement dans les logs nginx (accès + $is_banned).
 
 # rate-limiting : rafale de requêtes depuis une IP normale, doit
-# recevoir des 429 après le burst configuré :
-for i in $(seq 1 40); do curl -s -o /dev/null -w "%{http_code}\n" https://exemple.tld/; done
+# recevoir des 429 après le burst configuré. IMPORTANT : en séquentiel
+# (boucle for), le débit réel reste souvent sous rate+burst à cause du
+# temps d'établissement TCP/TLS de chaque curl -- aucun 429 ne sort
+# alors que limit_req fonctionne très bien (confirmé en réel). Utiliser
+# du parallèle avec un volume net au-dessus de rate+burst (~30) :
+seq 1 100 | xargs -P 100 -I{} curl -s -o /dev/null -w "%{http_code}\n" https://exemple.tld/
 ```
+
+Si aucun `429` ne sort même en parallèle : vérifier que ce n'est pas
+l'IP de test qui est exemptée (RFC1918, voir plus haut) via les headers
+de debug suivants, temporairement dans le `server{}` :
+```nginx
+add_header X-Debug-RemoteAddr $remote_addr always;
+add_header X-Debug-RatelimitKey $ratelimit_key always;
+```
+`curl -sv https://exemple.tld/ 2>&1 | grep -i X-Debug` -- une
+`X-Debug-RatelimitKey:` vide confirme l'exemption (attendu pour une IP
+RFC1918 ; tester depuis une IP publique pour valider le rate-limit).
+
+Un ralentissement perceptible pendant le test parallèle (les requêtes
+semblent mises en pause plutôt que de recevoir un 429 immédiat) sans
+qu'aucun 429 n'apparaisse peut aussi venir du backend proxifié qui
+sature sous la charge parallèle générée par le test lui-même, pas de
+`limit_req` (qui s'applique avant `proxy_pass`, donc rejette
+immédiatement sans jamais atteindre le backend une fois le seuil
+dépassé).
 
 ## Débogage
 

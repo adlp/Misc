@@ -1,5 +1,22 @@
 # Changelog
 
+## firewall-xgs/fail2ban — 2026-08-24 (2)
+
+Documentation uniquement, aucun changement de script/config.
+
+### Changed
+- `nginx-conf/README.md` : section Test du rate-limiting corrigée —
+  une boucle `curl` séquentielle (`for`) ne déclenche souvent aucun
+  `429` car le débit réel reste sous `rate+burst` (overhead TCP/TLS de
+  chaque appel), alors que `limit_req` fonctionne très bien (confirmé
+  en réel : 40 requêtes séquentielles → rien, 100 en parallèle via
+  `xargs -P` → 429 comme attendu). Remplacé par un test parallèle, plus
+  la procédure de vérification via headers de debug
+  (`X-Debug-RatelimitKey`) pour distinguer une IP exemptée (RFC1918)
+  d'un vrai souci de conf, et une note sur un faux signal possible
+  (backend proxifié qui sature sous la charge du test, sans rapport
+  avec `limit_req`).
+
 ## firewall-xgs/fail2ban 2.5.3 — 2026-08-24
 
 ### Fixed
