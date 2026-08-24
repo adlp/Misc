@@ -1,5 +1,21 @@
 # Changelog
 
+## firewall-xgs/fail2ban 2.5.3 — 2026-08-24
+
+### Fixed
+- `main()` ne capturait que `except Exception`, pas `SystemExit` — or
+  plusieurs fonctions (`validate_ip`, `load_config`, prérequis
+  `vacuum`/`flush`...) lèvent `raise SystemExit("message")`, et
+  `SystemExit` hérite de `BaseException`, pas `Exception`. Ces erreurs
+  ne touchaient donc jamais `logging.error()` (ni le syslog, ni le
+  format de log cohérent avec le reste du script) — juste le message
+  Python brut sur stderr. Fix : `except (Exception, SystemExit)`.
+  `validate_ip`/`load_config`/les surcharges `--group`/`--iplist`/
+  `--prefix`/`--jail` sont aussi déplacés à l'intérieur du bloc `try`
+  (ils s'exécutaient avant, donc hors de toute capture). `KeyboardInterrupt`
+  volontairement toujours hors capture. Testé en réel : IP invalide
+  passée à `ban` remonte maintenant bien via `logging.error()`.
+
 ## firewall-xgs/fail2ban 2.5.2 — 2026-08-24
 
 ### Added

@@ -9,7 +9,7 @@ l'XGS pour inspection/nettoyage/comparaison, mais ne participent pas au
 push.
 """
 
-__version__ = "2.5.2"
+__version__ = "2.5.3"
 
 import argparse
 import configparser
@@ -1146,19 +1146,21 @@ def main():
     DEBUG_TIMING = args.debug_timing
     if DEBUG_TIMING:
         _patch_connection_timing()
-    ip = validate_ip(args.ip) if args.ip else None
-    cfg = load_config(args.config)
-    if args.group:
-        cfg["group"] = args.group
-    if args.iplist:
-        cfg["iplist"] = args.iplist
-    if args.prefix:
-        cfg["prefix"] = args.prefix
-    if args.jail:
-        cfg["jail"] = args.jail
 
+    ip = None
     t0 = time.monotonic()
     try:
+        ip = validate_ip(args.ip) if args.ip else None
+        cfg = load_config(args.config)
+        if args.group:
+            cfg["group"] = args.group
+        if args.iplist:
+            cfg["iplist"] = args.iplist
+        if args.prefix:
+            cfg["prefix"] = args.prefix
+        if args.jail:
+            cfg["jail"] = args.jail
+
         if args.action == "ban":
             with locked(exclusive=False):
                 ban(cfg, ip)
@@ -1185,7 +1187,13 @@ def main():
                     print(f"{host_ip:<15} {cfg['iplist']}")
             if cfg["iplist_prefix"]:
                 list_shards(cfg)
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
+        # SystemExit inclus : plusieurs fonctions (validate_ip, load_config,
+        # vacuum/flush) lèvent `raise SystemExit("message")` pour un arrêt
+        # propre avec message clair — SystemExit hérite de BaseException,
+        # pas Exception, donc `except Exception` seul le laisserait passer
+        # sans jamais toucher logging.error()/syslog. KeyboardInterrupt
+        # reste volontairement non capté ici (Ctrl-C ne doit pas logguer).
         logging.error("%s%s: %s", args.action, f" {ip}" if ip else "", exc)
         sys.exit(1)
     finally:

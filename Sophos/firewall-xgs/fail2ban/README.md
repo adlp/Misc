@@ -349,6 +349,15 @@ logs fail2ban en cas d'échec, exit code 1).
   automatiquement dans le syslog (tag `sophos-fw-block`, voir
   `setup_logging()`) via le passage normal par `logging.error()` dans
   `main()` — aucune configuration supplémentaire requise.
+- **Tout `raise` (erreur de config, IP invalide, erreur API, prérequis
+  `vacuum`/`flush`...) finit dans le syslog**, pas seulement les
+  `RuntimeError`. `main()` capture explicitement `SystemExit` en plus
+  d'`Exception` — sans ça, les nombreux `raise SystemExit("message")`
+  du script (config manquante, IP malformée, prérequis manquants...)
+  héritent de `BaseException` (pas `Exception`), donc un simple `except
+  Exception` les laissait passer sans jamais toucher `logging.error()`.
+  `KeyboardInterrupt` reste volontairement non capté (Ctrl-C ne doit
+  pas logguer).
 - `fail2ban-client status <jail>` doit renvoyer une ligne `Banned IP
   list:` — format observé sur les versions testées ; `get_banned_ips()`
   lève une erreur explicite si absent plutôt que de deviner.
