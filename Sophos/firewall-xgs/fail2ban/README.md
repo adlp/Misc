@@ -27,9 +27,14 @@ chaque événement.
 - **sync** : compare, sans rien modifier, la liste fail2ban actuelle à
   l'état XGS (communes / seulement fail2ban / seulement XGS) — pour voir
   ce qu'un prochain ban/unban changerait avant qu'il n'écrase l'état XGS.
-- **vacuum** : supprime les objets `IPHost` `<prefix>*` qui ne sont plus
-  membres du groupe (orphelins — ex: `ban` a créé l'objet mais échoué
-  avant le push). `--dry-run` affiche la liste sans agir.
+- **vacuum** : supprime les objets `IPHost` `<prefix>*` qui sont à la
+  fois absents du groupe ET plus bannis par fail2ban (vrais orphelins —
+  ex: unban ancien, jail supprimée). Une IP encore bannie mais dont
+  l'`IPHost` n'est pas (encore) dans le groupe — ex: `ban` a créé l'objet
+  mais échoué avant le push — est protégée, pas supprimée : la supprimer
+  casserait le prochain ban/unban (référence à un `IPHost` inexistant,
+  500 "Operation could not be performed on Entity" — bug corrigé en
+  2.5.1, voir CHANGELOG). `--dry-run` affiche la liste sans agir.
 - **flush** : vide entièrement `group` puis lance `vacuum` — sans
   interroger fail2ban. N'agit pas sur `iplist`. `--dry-run` affiche ce
   qui serait supprimé sans rien modifier. **Toujours enchaîner avec

@@ -9,7 +9,7 @@ l'XGS pour inspection/nettoyage/comparaison, mais ne participent pas au
 push.
 """
 
-__version__ = "2.5.0"
+__version__ = "2.5.1"
 
 import argparse
 import configparser
@@ -818,7 +818,18 @@ def get_all_iphost_names(cfg, prefix):
 
 
 def vacuum_candidates(cfg):
-    """IPHost préfixés par ce script mais absents du groupe configuré.
+    """IPHost préfixés par ce script, absents du groupe ET plus bannis
+    par fail2ban.
+
+    "Absent du groupe" seul ne suffit pas à qualifier un orphelin : si un
+    `ban` a créé l'IPHost puis échoué avant de l'ajouter au groupe (blip
+    réseau, XGS temporairement occupé...), fail2ban considère toujours
+    l'IP bannie mais son IPHost n'est pas (encore) dans le groupe — le
+    supprimer casserait le prochain ban/unban (le Set du groupe
+    référencerait un IPHost inexistant -> 500 "Operation could not be
+    performed on Entity", confirmé en réel, voir CHANGELOG). Un IPHost
+    n'est donc candidat que s'il est absent du groupe ET que son IP n'est
+    plus dans `get_banned_ips(cfg)`.
 
     Ne couvre que l'usage via le groupe géré par ce script — un IPHost
     préfixé référencé directement par une autre règle firewall (sans
@@ -836,7 +847,8 @@ def vacuum_candidates(cfg):
         )
     all_names = set(get_all_iphost_names(cfg, prefix))
     used = set(get_group_hosts(cfg))
-    return sorted(all_names - used)
+    banned_names = {host_name_for_ip(ip, prefix) for ip in get_banned_ips(cfg)}
+    return sorted(all_names - used - banned_names)
 
 
 def vacuum(cfg, dry_run=False):

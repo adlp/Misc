@@ -1,5 +1,24 @@
 # Changelog
 
+## firewall-xgs/fail2ban 2.5.1 — 2026-08-24
+
+### Fixed
+- `vacuum_candidates()` : un `IPHost` absent du groupe n'était pas
+  forcément un orphelin — si un `ban` créait l'objet puis échouait avant
+  de l'ajouter au groupe (blip réseau, XGS temporairement occupé...),
+  fail2ban considérait toujours l'IP bannie mais son `IPHost` restait
+  hors groupe. Le `vacuum` quotidien (cron) le supprimait à tort ; le
+  `ban`/`unban` suivant (n'importe lequel) reconstruit la `HostList`
+  complète depuis fail2ban, qui référence toujours cette IP —
+  `Set operation="update"` du groupe échoue alors avec 500 "Operation
+  could not be performed on Entity" (l'entité référencée n'existe
+  plus). Reproduit et diagnostiqué en réel (rapport utilisateur : aucun
+  `flush` en cause, juste ban/unban fail2ban + `vacuum` cron quotidien).
+  Fix : `vacuum_candidates()` exclut désormais aussi les IP toujours
+  bannies selon `get_banned_ips(cfg)`, même absentes du groupe — ne
+  supprime plus que les vrais orphelins (IP plus bannie du tout). Testé
+  via mock (groupe/IPHost/fail2ban simulés).
+
 ## firewall-xgs/fail2ban — 2026-08-24
 
 Documentation uniquement (docstring `flush()`, aide CLI, README) —
