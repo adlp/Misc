@@ -862,6 +862,16 @@ def flush(cfg, dry_run=False):
     concurrent pourrait créer un IPHost entre le vidage du groupe et le
     scan de vacuum, qui le verrait comme orphelin et le supprimerait à
     tort.
+
+    IMPORTANT : ne touche PAS à l'état de fail2ban. Si des IP sont encore
+    bannies côté fail2ban au moment du flush, leurs IPHost sont supprimés
+    (vacuum) mais fail2ban continue de les considérer bannies. Un `ban`
+    normal qui suit ne recrée l'IPHost QUE pour la nouvelle IP (pas pour
+    celles déjà bannies), donc le Set du groupe référence alors des noms
+    d'IPHost inexistants -> échec 500 "Operation could not be performed
+    on Entity" côté XGS (confirmé en réel, voir CHANGELOG). TOUJOURS
+    lancer `start` juste après un `flush` pour recréer les IPHost
+    manquants et resynchroniser proprement avant de reprendre ban/unban.
     """
     if not cfg["group"]:
         raise SystemExit("flush nécessite `group` configuré (config ou --group)")
@@ -1047,7 +1057,8 @@ def main():
         help="ban/unban une IP (push depuis fail2ban), list les IP "
         "bloquées sur XGS, vacuum (supprime les IPHost <prefix>* "
         "orphelins), sync (compare fail2ban et XGS sans rien modifier), "
-        "flush (vide le groupe puis vacuum, sans interroger fail2ban), "
+        "flush (vide le groupe puis vacuum, sans interroger fail2ban -- "
+        "TOUJOURS suivre d'un start), "
         "start (comme ban mais pour toutes les IP bannies, sans IP en argument)",
     )
     parser.add_argument(

@@ -32,7 +32,15 @@ chaque événement.
   avant le push). `--dry-run` affiche la liste sans agir.
 - **flush** : vide entièrement `group` puis lance `vacuum` — sans
   interroger fail2ban. N'agit pas sur `iplist`. `--dry-run` affiche ce
-  qui serait supprimé sans rien modifier.
+  qui serait supprimé sans rien modifier. **Toujours enchaîner avec
+  `start` juste après** : `flush` ne touche pas l'état de fail2ban — si
+  des IP sont encore bannies au moment du flush, `vacuum` supprime leurs
+  `IPHost` mais fail2ban continue de les considérer bannies. Un `ban`
+  normal qui suit ne recrée l'`IPHost` que pour la nouvelle IP, pas les
+  précédentes — le prochain `Set` du groupe référence alors des `IPHost`
+  inexistants et échoue (500 "Operation could not be performed on
+  Entity", confirmé en réel). `start` recrée tous les `IPHost` manquants
+  avant de reprendre.
 - **start** : comme `ban`, mais pour toutes les IP actuellement bannies
   par fail2ban (pas d'IP en argument) — crée l'`IPHost` manquant pour
   chacune avant de pousser la liste complète. À lancer au démarrage du
@@ -283,11 +291,13 @@ groupe) — nécessite `group` configuré et un préfixe non vide :
 ban — le verrou exclusif empêche toute collision avec un ban/unban en cours.
 
 Tout vider (groupe + IPHost orphelins), sans toucher fail2ban ni iplist —
-utile pour repartir d'un état propre côté XGS :
+utile pour repartir d'un état propre côté XGS. **Toujours enchaîner avec
+`start`** (sinon le prochain `ban` échoue, voir plus haut) :
 
 ```bash
 /usr/local/bin/sophos_fw_block.py flush --dry-run   # affiche sans agir
 /usr/local/bin/sophos_fw_block.py flush             # vide + nettoie
+/usr/local/bin/sophos_fw_block.py start             # recrée les IPHost manquants, resynchronise
 ```
 
 Resynchroniser toutes les IP actuellement bannies (démarrage du service,

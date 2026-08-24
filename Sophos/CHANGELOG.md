@@ -1,5 +1,23 @@
 # Changelog
 
+## firewall-xgs/fail2ban — 2026-08-24
+
+Documentation uniquement (docstring `flush()`, aide CLI, README) —
+aucun changement de comportement du script (pas de bump).
+
+### Fixed (doc)
+- `flush` ne touche pas l'état de fail2ban : si des IP sont encore
+  bannies au moment du flush, `vacuum` supprime leurs `IPHost` mais
+  fail2ban continue de les considérer bannies. Un `ban` normal qui suit
+  ne recrée l'`IPHost` que pour la nouvelle IP (pas les précédentes) —
+  le `Set` du groupe référence alors des `IPHost` inexistants et échoue
+  (500 "Operation could not be performed on Entity"). Confirmé en réel
+  (diagnostic via `--debug`, groupe non corrompu — un `Set` avec liste
+  vide, via `flush`, réussissait très bien ; seul le `Set` avec la
+  liste complète référençant des `IPHost` manquants échouait). Fix :
+  toujours enchaîner `flush` puis `start` — documenté dans le docstring
+  de `flush()`, l'aide `--help`, et le README.
+
 ## firewall-xgs/fail2ban — 2026-08-21 (3)
 
 Config-only, aucun changement de script Python.
