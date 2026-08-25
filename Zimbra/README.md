@@ -74,6 +74,23 @@ Filtre + jail pour bannir les IP en échec d'authentification répété sur Zimb
 
 Avant d'activer le jail en prod, valider la regex sur le serveur : `fail2ban-regex /opt/zimbra/log/audit.log /etc/fail2ban/filter.d/zimbra-audit.conf` (le format exact des lignes peut varier selon la version de Zimbra — non vérifié ici contre un vrai log).
 
+### Scanners web hors-sujet (`fail2ban/filter.d/zimbra-nginx-scanners.conf`)
+
+Deuxième jail, sur `/opt/zimbra/log/nginx.access.log` : bannit les scans de chemins qui n'ont rien à faire sur Zimbra (WordPress, phpMyAdmin, `.env`/`.git` leakés, exploits Laravel/Symfony/Spring, webshells, tout `.php` — Zimbra ne sert jamais de PHP). Une seule requête sur ces chemins suffit à déclencher (`maxretry=2`), contrairement à un jail brute-force classique.
+
+- `fail2ban/filter.d/zimbra-nginx-scanners.conf` → `/etc/fail2ban/filter.d/`
+- `fail2ban/jail.d/zimbra-nginx-scanners.conf` → `/etc/fail2ban/jail.d/`
+
+**Prérequis reverse proxy (différent de celui d'`audit.log`)** : ici c'est le module `realip` de nginx lui-même, pas `zimbraMailTrustedIP`. Sans ça, `$remote_addr` dans l'access log est l'IP du reverse proxy, pas du client. Dans un template `/opt/zimbra/conf/nginx/templates/nginx.conf.web.https.default.template` (ou équivalent) :
+```
+set_real_ip_from <IP_ou_CIDR_du_reverse_proxy>;
+real_ip_header X-Forwarded-For;
+real_ip_recursive on;
+```
+puis `zmproxyctl restart`.
+
+Regex basée sur le format `combined` standard de nginx, testée uniquement sur lignes synthétiques (pas de vrai `nginx.access.log` disponible ici) — valider avec `fail2ban-regex` avant activation, comme pour le jail `audit.log`.
+
 ## Versions
 
 Voir `CHANGELOG.md`.

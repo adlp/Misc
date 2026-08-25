@@ -1,5 +1,9 @@
 # Changelog — zimLocAccZam
 
+## fail2ban/ — 2026-08-25 (scanners web)
+
+Ajout d'un second jail : `zimbra-nginx-scanners`, sur `nginx.access.log`, pour bannir les scans de chemins hors-sujet (WordPress, phpMyAdmin, `.env`/`.git`, exploits Laravel/Symfony/Spring, tout `.php` — Zimbra n'en sert jamais). `maxretry=2` volontairement bas. Nécessite le module `realip` de nginx configuré côté Zimbra (prérequis distinct de `zimbraMailTrustedIP` utilisé pour `audit.log`). Voir `README.md`.
+
 ## fail2ban/ — 2026-08-25
 
 Fix regex suite à test sur une vraie ligne `audit.log` de prod : le format réel n'a pas de paire `ip=...;oip=...`, juste `oip=` seul (précédé d'un bloc `[thread:url]` sans rapport). L'ancienne regex `ip=\S+;oip=<HOST>;` ne matchait donc jamais. Corrigé pour chercher `oip=<HOST>` n'importe où dans la ligne, avec fallback sur `ip=<HOST>` seul si `oip=` absent (cas sans trusted proxy configuré).
