@@ -1,5 +1,18 @@
 # Changelog
 
+## geoip-imap-europe — 2026-08-25 (2)
+
+### Added
+- `scripts/geoip-imap-europe.sh` : ajout d'un cron quotidien
+  (`/etc/crontabs/root`, 4h) qui appelle `/etc/init.d/banip reload` —
+  banIP n'installe aucun cron lui-même (vérifié dans le README officiel),
+  et seul `reload` retélécharge réellement les feeds (check ETag,
+  `start`/`restart` ne font que restaurer le cache). Idempotent (n'ajoute
+  la ligne que si absente). `docs/geoip_imap_openwrt.md` : nouvelle
+  section distinguant la fréquence de mise à jour des plages IP par pays
+  (quotidienne, via ce cron) de celle du périmètre pays "Europe" dans
+  `EU_CODES` (quasi statique, réexécution manuelle du script suffisante).
+
 ## geoip-imap-europe — 2026-08-25
 
 ### Added

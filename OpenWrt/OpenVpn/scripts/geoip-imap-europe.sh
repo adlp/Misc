@@ -70,6 +70,16 @@ uci commit banip
 /etc/init.d/banip enable
 /etc/init.d/banip reload
 
+# 7. Cron de rafraîchissement quotidien (banIP n'en installe pas lui-même).
+#    "reload" ne retélécharge que les feeds modifiés (check ETag) — léger.
+CRON_LINE="0 4 * * * /etc/init.d/banip reload"
+CRONTAB="/etc/crontabs/root"
+touch "$CRONTAB"
+if ! grep -qF "/etc/init.d/banip reload" "$CRONTAB"; then
+    echo "$CRON_LINE" >> "$CRONTAB"
+    /etc/init.d/cron restart
+fi
+
 echo "OK : $(echo $NON_EU | wc -w) pays non-européens bloqués sur ports $IMAP_PORTS."
 echo "Vérifier : nft list set inet banIP country"
 echo "Logs     : logread | grep -i banip"

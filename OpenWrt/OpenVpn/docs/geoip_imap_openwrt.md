@@ -87,6 +87,27 @@ Vérifié sur les sources réelles de `luci-app-banip` :
   Toute modification du scope port reste CLI (relancer le script après
   avoir ajusté `IMAP_PORTS`).
 
+## Mise à jour régulière des données
+
+Deux listes distinctes, deux fréquences :
+
+- **Plages IP par pays** (les CIDR eux-mêmes, changent avec le temps —
+  réattributions RIR) : rafraîchies par banIP via `/etc/init.d/banip
+  reload` — seule commande qui retélécharge réellement (`start`/`restart`
+  ne font que restaurer le cache existant). banIP n'installe **aucun**
+  cron automatiquement (vérifié dans le README officiel) → le script
+  ajoute une entrée quotidienne dans `/etc/crontabs/root` :
+  ```
+  0 4 * * * /etc/init.d/banip reload
+  ```
+  Léger : `reload` ne retélécharge que les feeds modifiés (check ETag).
+  Statut du dernier run : `/etc/init.d/banip status`.
+
+- **Périmètre pays "Europe" / liste non-EU** (`EU_CODES` dans le script) :
+  quasi statique, pas besoin de cron. Relancer le script manuellement si
+  le périmètre change (ex. adhésion/sortie UE) — il recalcule tout depuis
+  l'index ipdeny à chaque exécution (idempotent).
+
 ## Limites connues
 
 - Premier sync = ~180 requêtes HTTP (une par pays non-EU) vers ipdeny :
