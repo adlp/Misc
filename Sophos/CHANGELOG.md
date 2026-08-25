@@ -1,5 +1,19 @@
 # Changelog
 
+## firewall-xgs/fail2ban — 2026-08-25
+
+Config uniquement, aucun changement de script.
+
+### Added
+- `nginx-conf/ratelimit.conf` : exemption du rate-limiting (`limit_req`)
+  pour toute requête authentifiée (`$remote_user` non vide), en plus de
+  l'exemption RFC1918 existante — combinées via un `map` sur la
+  concaténation des deux flags (`$ratelimit_exempt_ip$ratelimit_exempt_user`
+  → `~1` → `$ratelimit_key` vide). Suppose que le vhost a déjà un
+  mécanisme d'auth qui peuple `$remote_user` (absent de ces snippets) ;
+  sans ça, cette exemption ne fait rien. Documenté dans
+  `nginx-conf/README.md`.
+
 ## firewall-xgs/fail2ban — 2026-08-24 (2)
 
 Documentation uniquement, aucun changement de script/config.

@@ -158,6 +158,15 @@ fichier externe).
   fonctionne que si `realip.conf` est correctement configuré pour ce
   vhost ; sinon `$remote_addr` vaut déjà l'IP interne du proxy amont
   pour TOUT le trafic (voir avertissement dans `ratelimit.conf`).
+- **Exemption requêtes authentifiées** : toute requête où `$remote_user`
+  est renseigné (auth_basic, auth_request, ou tout mécanisme nginx qui
+  peuple cette variable après succès de l'authentification) est
+  également exemptée — un visiteur authentifié qui déclenche
+  beaucoup d'appels légitimes (SPA, API...) ne doit pas être bloqué
+  comme un bot anonyme. `$remote_user` vide = non authentifié = toujours
+  soumis au rate-limit. Suppose que le mécanisme d'auth (absent de ces
+  snippets) est déjà configuré sur le vhost et peuple bien cette
+  variable — sinon cette exemption ne fait simplement rien.
 - **Code retourné en cas de dépassement** : `429` (via
   `limit_req_status 429;` dans `ratelimit-server.conf` — nginx renvoie
   `503` par défaut pour des raisons historiques, `limit_req` existait
