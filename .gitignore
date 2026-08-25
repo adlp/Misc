@@ -4,3 +4,4 @@ CLAUDE.md
 **/.claude
 **/__pycache__/
 **/conf/*.conf
+*.swp
