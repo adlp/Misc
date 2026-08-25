@@ -1,0 +1,45 @@
+port 1194
+proto udp
+dev tun
+
+ca   /etc/easy-rsa/pki/ca.crt
+cert /etc/easy-rsa/pki/issued/server.crt
+key  /etc/easy-rsa/pki/private/server.key
+dh   /etc/easy-rsa/pki/dh.pem
+tls-auth /etc/easy-rsa/pki/ta.key 0
+
+server 10.8.0.0 255.255.255.0
+
+push "route 192.168.1.0 255.255.255.0"
+push "redirect-gateway def1 bypass-dhcp"
+push "dhcp-option DNS 192.168.1.1"
+
+keepalive 10 120
+cipher AES-256-GCM
+persist-key
+persist-tun
+
+# Certificat optionnel
+verify-client-cert optional
+
+# Authentification par login/mot de passe
+auth-user-pass-verify /etc/openvpn/check-auth.sh via-file
+script-security 2
+
+# Username comme identifiant de session
+username-as-common-name
+
+# Autoriser plusieurs connexions avec le même certificat
+duplicate-cn
+
+# Limitation des connexions simultanées
+client-connect /etc/openvpn/client-connect.sh
+
+# Gestion des clients
+client-config-dir /etc/openvpn/ccd
+crl-verify /etc/easy-rsa/pki/crl.pem
+
+status /tmp/openvpn-status.log
+status-version 2
+log    /tmp/openvpn.log
+verb 3
