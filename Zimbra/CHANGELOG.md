@@ -1,5 +1,9 @@
 # Changelog — zimLocAccZam
 
+## fail2ban/ — 2026-08-25
+
+Fix regex suite à test sur une vraie ligne `audit.log` de prod : le format réel n'a pas de paire `ip=...;oip=...`, juste `oip=` seul (précédé d'un bloc `[thread:url]` sans rapport). L'ancienne regex `ip=\S+;oip=<HOST>;` ne matchait donc jamais. Corrigé pour chercher `oip=<HOST>` n'importe où dans la ligne, avec fallback sur `ip=<HOST>` seul si `oip=` absent (cas sans trusted proxy configuré).
+
 ## fail2ban/ — 2026-08-19
 
 Ajout (non lié au versionnage du script) : filtre + jail fail2ban ciblant les échecs d'authentification dans `/opt/zimbra/log/audit.log`, avec gestion du cas reverse proxy (`ip=` vs `oip=`, cf. `zimbraMailTrustedIP`). Voir `README.md` section "fail2ban".
