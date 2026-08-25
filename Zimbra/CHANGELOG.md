@@ -1,5 +1,9 @@
 # Changelog — zimLocAccZam
 
+## fail2ban/ — 2026-08-19
+
+Ajout (non lié au versionnage du script) : filtre + jail fail2ban ciblant les échecs d'authentification dans `/opt/zimbra/log/audit.log`, avec gestion du cas reverse proxy (`ip=` vs `oip=`, cf. `zimbraMailTrustedIP`). Voir `README.md` section "fail2ban".
+
 ## 1.0.7 — 2026-08-19
 
 - Filtre LDAP inversé : au lieu de chercher spécifiquement `zimbraAccountStatus=lockout` (fragile — rate tout compte dans un autre état non actif, ou si la valeur exacte diffère), recherche désormais tout compte (`objectClass=zimbraAccount`) dont `zimbraAccountStatus` est renseigné et différent de `active`. Trouvé suite à un cas réel : un compte volontairement bloqué n'était pas détecté (0 résultat confirmé y compris en `ldapsearch` direct avec l'ancien filtre).

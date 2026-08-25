@@ -60,6 +60,20 @@ zimLocAccZam [-d] [-C fichier_config] [-a] [-s] [-n]
 
 Aucun cas ne remonte de stack trace brute : message d'erreur clair sur stderr dans tous les cas, enrichi du compte/ticket en cours de traitement quand cette info est connue (ex : `Erreur d'accès Zammad : ... [compte=bob@example.org, ticket=5]`).
 
+## fail2ban (`fail2ban/`)
+
+Filtre + jail pour bannir les IP en échec d'authentification répété sur Zimbra, à partir de `/opt/zimbra/log/audit.log` (couvre webmail/SOAP, IMAP, POP, SMTP auth — tout remonte dans ce log via la catégorie `security`).
+
+- `fail2ban/filter.d/zimbra-audit.conf` — à copier dans `/etc/fail2ban/filter.d/`
+- `fail2ban/jail.d/zimbra-audit.conf` — à copier dans `/etc/fail2ban/jail.d/` (adapter `port` aux services réellement exposés)
+
+**Prérequis si Zimbra est derrière un reverse proxy** (nginx Zimbra lui-même, et/ou un reverse proxy externe devant) : sans ça, `ip=` dans `audit.log` est l'IP du proxy, pas celle du client, et le jail bannirait le proxy au lieu de l'attaquant.
+
+1. `zmprov mcf +zimbraMailTrustedIP <IP du nginx zimbra-proxy>` (+ `127.0.0.1` si colocalisé avec mailboxd) → fait apparaître un champ `oip=` (originating IP) dans `audit.log`, que le filtre utilise en priorité.
+2. Si un reverse proxy externe est en plus devant le nginx Zimbra : remplacer `$proxy_add_x_forwarded_for` par `$http_x_forwarded_for` dans `/opt/zimbra/conf/nginx/templates/*` puis `zmproxyctl restart` (sinon `audit.log` reçoit une liste d'IP concaténées, rejetée par Zimbra).
+
+Avant d'activer le jail en prod, valider la regex sur le serveur : `fail2ban-regex /opt/zimbra/log/audit.log /etc/fail2ban/filter.d/zimbra-audit.conf` (le format exact des lignes peut varier selon la version de Zimbra — non vérifié ici contre un vrai log).
+
 ## Versions
 
 Voir `CHANGELOG.md`.
