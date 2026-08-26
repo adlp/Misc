@@ -12,9 +12,10 @@ réseau des services exposés (GeoIP).
 - `docs/openvpn_auth_doc.md` — authentification mixte : groupe **admin**
   (certificat individuel + login/mot de passe) et groupe **user** (certificat
   partagé + login/mot de passe), limitation des connexions simultanées.
-- `docs/geoip_imap_openwrt.md` — restriction GeoIP du port IMAP (143/993,
-  forward DNAT) à l'Europe via banIP, indépendant d'OpenVPN mais hébergé sur
-  le même routeur.
+- `docs/geoip_imap_openwrt.md` — routage GeoIP du port IMAP (143/993) :
+  Europe → serveur mail réel, reste du monde → serveur tarpit (LAN, hors
+  sous-projet), via 2 port forwards conditionnels (`ipset`+`redirect` fw4).
+  Indépendant d'OpenVPN mais hébergé sur le même routeur.
 - `scripts/openvpn_client_manager.sh` (`ovpn-client`) — gestion des clients :
   création (certificats admin/partagés), ajout d'utilisateurs, génération des
   `.ovpn`, listing.
@@ -23,8 +24,9 @@ réseau des services exposés (GeoIP).
   certificat/CN.
 - `scripts/client-connect.sh` — script `client-connect` OpenVPN : limite le
   nombre de connexions simultanées par utilisateur.
-- `scripts/geoip-imap-europe.sh` — installe/configure banIP + luci-app-banip
-  pour bloquer sur les ports IMAP tout trafic hors Europe (UE27+EEE+UK+CH).
+- `scripts/geoip-imap-europe.sh` — pose les ipsets/redirects fw4 qui
+  routent IMAP Europe → serveur réel, reste du monde → tarpit, avec
+  overrides manuels persistants (IP toujours autorisée/bloquée).
 
 ## Infrastructure
 

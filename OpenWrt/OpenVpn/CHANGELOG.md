@@ -1,5 +1,52 @@
 # Changelog
 
+## geoip-imap-europe — 2026-08-26
+
+Refonte complète de l'approche GeoIP IMAP — abandon de banIP au profit
+d'un routage conditionnel au niveau NAT.
+
+### Changed
+- `scripts/geoip-imap-europe.sh` réécrit : au lieu de bloquer (`drop`)
+  le trafic non-européen après DNAT via banIP, pose désormais **2 port
+  forwards conditionnels** — Europe → serveur mail réel, reste du monde
+  → serveur tarpit (LAN, sous-projet Mail). Mécanisme : `config redirect`
+  supporte nativement l'option `ipset` (avec inversion `!nom`), vérifié
+  dans les sources réelles de `firewall4` (`redirect.uc`) — donc 100%
+  UCI standard, LuCI-éditable (Firewall > Port Forwards + IP Sets), sans
+  nftables écrit à la main.
+- Raison de l'abandon de banIP (documentée dans
+  `docs/geoip_imap_openwrt.md`) : banIP filtre au stade *forward*, après
+  que le NAT a déjà choisi la destination — si le NAT envoie le trafic
+  non-EU vers un serveur tarpit, banIP le droppe quand même avant qu'il
+  n'atteigne ce tarpit. Le routage conditionnel au stade NAT
+  (prerouting) élimine ce conflit par construction.
+- Set européen volontairement réduit à 32 pays (UE27+EEE+UK+CH) au lieu
+  de lister ~180+ pays non-européens comme dans la version banIP — plus
+  léger (moins de requêtes ipdeny, set plus petit), motivé par
+  l'hypothèse qu'il y a plus d'IP non-EU que EU dans le monde.
+
+### Added
+- Overrides manuels persistants : `geoimap_manual_allow_v4` /
+  `geoimap_manual_block_v4` (ipsets vides à la création, jamais
+  réinitialisés par le script) — une IP ajoutée à `manual_allow` part
+  vers le serveur réel même si non-européenne (redirect positionné avant
+  la règle générique "reste du monde" — l'ordre des sections UCI fait la
+  priorité fw4) ; une IP dans `manual_block` est droppée quel que soit
+  le pays (`config rule` côté forward, indépendant du NAT donc pas de
+  contrainte d'ordre avec les redirects).
+- Garde-fou : le script neutralise automatiquement l'ancienne config
+  banIP (feed `country` + `banip.custom.feeds`) si présente, et retire
+  l'ancien cron `banip reload` — sinon la règle banIP resterait active
+  et casserait silencieusement le trafic vers le tarpit.
+- Détection du chemin d'exécution : avertit si lancé hors `/usr/bin`
+  (le cron installé pointerait vers un fichier disparaissant au reboot
+  si laissé sous `/tmp`, qui est un tmpfs).
+
+### Removed
+- Dépendance à `banip`/`luci-app-banip` pour cette fonctionnalité (les
+  paquets peuvent rester installés pour un autre usage, mais ne sont
+  plus requis ni configurés par ce script).
+
 ## geoip-imap-europe — 2026-08-25 (2)
 
 ### Added

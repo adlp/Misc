@@ -1,132 +1,148 @@
-# GeoIP : restreindre IMAP à l'Europe sur OpenWRT
+# GeoIP : router IMAP Europe / reste du monde vers 2 destinations
 
 ## Contexte
 
-Trafic IMAP (143/993) forwardé (DNAT) depuis le WAN du routeur OpenWRT
-(MsConceptAtelier) vers un serveur mail interne. Objectif : bloquer toute
-connexion IMAP entrante qui ne vient pas d'Europe (UE27 + EEE + UK + CH),
-sans toucher aux autres services exposés (OpenVPN, admin, etc.).
+Trafic IMAP (143/993) entrant sur le WAN du routeur OpenWRT
+(MsConceptAtelier). Objectif : les connexions depuis l'Europe (UE27 + EEE +
+UK + CH) sont forwardées vers le vrai serveur mail interne ; toutes les
+autres vers un serveur tarpit (faux banner IMAP puis silence, sur une
+machine LAN dédiée — voir sous-projet Mail). Plus overrides manuels
+(IP toujours autorisées / toujours bloquées, indépendants du pays).
 
-## Choix technique : banIP + feed custom scopé port
+## Historique : pourquoi pas banIP
 
-**Vérifié sur les sources réelles du paquet** (openwrt/packages,
-`net/banip/files/`), pas supposé :
+Une première version (voir git log) utilisait banIP pour bloquer (`drop`)
+tout le trafic IMAP non-européen après DNAT vers le serveur réel. Ça
+fonctionnait pour un simple blocage, mais **incompatible avec un tarpit** :
+banIP filtre au stade *forward* (après que le NAT ait déjà choisi la
+destination), donc si le NAT envoie le trafic non-EU vers le serveur
+tarpit, la règle banIP le droppe quand même avant qu'il n'atteigne le
+tarpit — le tarpit ne recevrait jamais rien.
 
-- `ban_country` est **exclusivement une blocklist**. Il n'existe **aucune**
-  option `ban_country_allow` ou équivalent pour en faire une allow-list.
-  → Pour "n'autoriser que l'Europe", on liste tous les pays **non**
-  européens en blocklist (résultat identique).
-- Le feed `country` par défaut n'a pas de restriction de port : il
-  s'applique à tout le trafic entrant (input WAN + forward WAN, donc les
-  flux DNAT aussi). Pour le limiter aux ports IMAP, il faut redéfinir le
-  feed via `/etc/banip/banip.custom.feeds` avec un champ `"flag": "tcp 143
-  993"`.
-- **Piège** : `banip.custom.feeds` **remplace entièrement**
-  `banip.feeds` (`f_getfeed()` charge l'un ou l'autre, jamais les deux —
-  pas de merge). Il faut donc réécrire l'entrée `country` au complet
-  (`url_4`, `url_6`, `rule`, `chain`, `descr`) et pas seulement ajouter
-  `flag`, sous peine de casser le feed silencieusement (= IMAP resterait
-  ouvert à tous, échec silencieux).
-- Les données pays viennent de ipdeny.com (`{code}-aggregated.zone`), un
-  fichier par code ISO 3166-1 alpha-2. Pas d'agrégat "continent" dans ce
-  flux → la liste "non-Europe" est calculée dynamiquement depuis l'index
-  ipdeny (pas de liste figée qui pourrait devenir incomplète/obsolète).
+Abandonné au profit d'un routage conditionnel **au niveau du NAT
+lui-même** (prerouting), qui choisit la destination selon la source —
+pas de conflit possible avec un filtre après-coup.
 
-## Périmètre "Europe" retenu
+## Architecture retenue
 
-UE27 + EEE (Islande, Norvège, Liechtenstein) + Royaume-Uni + Suisse (32
-codes). Exclut volontairement Russie, Turquie, Ukraine, Balkans hors-UE.
-Codes dans `EU_CODES` en tête du script — à ajuster si le périmètre doit
-changer.
+Vérifié dans les sources réelles de `firewall4` (pas supposé) :
+`config redirect` (le "Port Forward" standard OpenWrt/LuCI) supporte
+nativement une option `ipset`, avec inversion (`!nomset`) — exactement
+comme `config rule` (déjà utilisé par des outils comme banIP). Donc tout
+se fait en UCI standard, sans nftables écrit à la main :
+
+- `firewall.geoimap_eu_v4` (`config ipset`) : CIDR IPv4 des 32 pays
+  européens retenus (UE27+EEE+UK+CH), recalculés à chaque exécution du
+  script depuis ipdeny.com. Set volontairement **petit** (32 pays, pas
+  ~180+) — contrainte explicite du besoin ("alléger le système").
+- `firewall.geoimap_eu_<port>` (`config redirect`, `ipset='geoimap_eu_v4
+  src'`) : DNAT vers le serveur mail réel.
+- `firewall.geoimap_noneu_<port>` (`config redirect`, `ipset
+  ='!geoimap_eu_v4 src'`, inversé) : DNAT vers le serveur tarpit.
+- `firewall.geoimap_manual_allow_v4` / `geoimap_manual_block_v4`
+  (`config ipset`, vides à la création, **jamais réinitialisés** par le
+  script) : overrides persistants.
+  - `geoimap_manual_allow_<port>` (`config redirect`, priorité avant
+    `geoimap_noneu_<port>` — l'ordre des sections UCI = ordre
+    d'évaluation fw4) : une IP non-européenne explicitement autorisée
+    part quand même vers le serveur réel.
+  - `geoimap_block_<port>` (`config rule`, `target='DROP'`) : filtre
+    indépendant du NAT (stade forward), bloque une IP donnée quel que
+    soit le pays — pas de contrainte d'ordre avec les redirects (hooks
+    différents : NAT en prerouting, ce rule en forward).
+
+Une seule règle par port par catégorie (boucle `for PORT in 143 993`) —
+évite de parier sur le support d'une liste de ports dans `src_dport`
+d'un `redirect` (non vérifié, donc pas utilisé).
 
 ## Installation
 
 ```sh
-scp scripts/geoip-imap-europe.sh root@MsConceptAtelier:/tmp/
-ssh root@MsConceptAtelier '/tmp/geoip-imap-europe.sh'
+scp scripts/geoip-imap-europe.sh root@MsConceptAtelier:/usr/bin/
+ssh root@MsConceptAtelier 'chmod +x /usr/bin/geoip-imap-europe.sh'
 ```
 
-Le script :
-1. Installe `banip` + `luci-app-banip` (WUI) si absents.
-2. Récupère la liste des codes pays connus d'ipdeny.
-3. Calcule "tous les pays sauf Europe".
-4. Écrit `/etc/banip/banip.custom.feeds` (feed `country` scopé `tcp 143 993`).
-5. Configure `/etc/config/banip` (`ban_feed=country`, `ban_country=<non-EU>`).
-6. Active et recharge banIP.
+Éditer en tête du script avant le premier lancement :
+- `REAL_MAIL_IP` — IP LAN du serveur mail réel
+- `TARPIT_IP` — IP LAN du serveur tarpit (sous-projet Mail)
+- `DEST_ZONE` — zone firewall de destination (`lan` par défaut)
 
-Idempotent, relançable sans risque (recalcule tout à chaque exécution).
+```sh
+ssh root@MsConceptAtelier '/usr/bin/geoip-imap-europe.sh'
+```
+
+Idempotent — sauf les ipsets manuels (créés vides une seule fois, jamais
+réinitialisés, donc relancer le script ne perd pas les overrides ajoutés
+entre-temps).
+
+**Important** : lancer depuis `/usr/bin`, pas `/tmp` (tmpfs, vidé au
+reboot) — sinon le cron installé pointerait vers un fichier qui
+disparaît au redémarrage.
+
+## Overrides manuels
+
+```sh
+# Toujours autoriser une IP (même hors Europe) vers le serveur réel
+uci add_list firewall.geoimap_manual_allow_v4.entry='203.0.113.5'
+uci commit firewall && /etc/init.d/firewall reload
+
+# Toujours bloquer une IP (même si en Europe)
+uci add_list firewall.geoimap_manual_block_v4.entry='198.51.100.9'
+uci commit firewall && /etc/init.d/firewall reload
+```
+
+Éditables aussi en LuCI : Network → Firewall → IP Sets.
 
 ## Vérification
 
 ```sh
-# Set nftables peuplé ?
-nft list set inet banIP country
+# Contenu du set européen
+nft list set inet fw4 geoimap_eu_v4
 
-# Règle limitée aux bons ports ?
-nft list chain inet banIP wan-forward | grep -i "143\|993"
+# Règles de redirection effectivement posées
+nft list chain inet fw4 dstnat | grep -i geoimap
 
-# Logs banIP
-logread | grep -i banip
+# Logs firewall
+logread | grep -i fw4
 ```
 
-Tester depuis une IP hors Europe (VPN, proxy) que la connexion IMAP est
-bien refusée, et depuis une IP européenne qu'elle passe toujours.
+Tester depuis une IP hors Europe (VPN, proxy) que la connexion IMAP part
+bien vers le tarpit (faux banner puis silence), et depuis une IP
+européenne qu'elle atteint bien le vrai serveur.
 
-## Accès WUI (LuCI)
+## Mise à jour régulière
 
-`luci-app-banip` installé par le script → Services → banIP dans LuCI.
-Vérifié sur les sources réelles de `luci-app-banip` :
-
-- Visible/éditable en WUI : `ban_enabled`, `ban_feed`, `ban_country` (onglet
-  Countries). ~180 pays cochés = liste longue mais fonctionnelle.
-- **Pas** visible/éditable en WUI : le contenu de
-  `/etc/banip/banip.custom.feeds` (restriction port 143/993). La WUI lit ce
-  fichier uniquement pour peupler la liste des feeds disponibles, elle ne
-  propose aucun éditeur pour son contenu (`flag`, `url_4`, etc.) et ne le
-  réécrit jamais → aucun risque qu'un save WUI écrase l'override du script.
-  Toute modification du scope port reste CLI (relancer le script après
-  avoir ajusté `IMAP_PORTS`).
-
-## Mise à jour régulière des données
-
-Deux listes distinctes, deux fréquences :
-
-- **Plages IP par pays** (les CIDR eux-mêmes, changent avec le temps —
-  réattributions RIR) : rafraîchies par banIP via `/etc/init.d/banip
-  reload` — seule commande qui retélécharge réellement (`start`/`restart`
-  ne font que restaurer le cache existant). banIP n'installe **aucun**
-  cron automatiquement (vérifié dans le README officiel) → le script
-  ajoute une entrée quotidienne dans `/etc/crontabs/root` :
-  ```
-  0 4 * * * /etc/init.d/banip reload
-  ```
-  Léger : `reload` ne retélécharge que les feeds modifiés (check ETag).
-  Statut du dernier run : `/etc/init.d/banip status`.
-
-- **Périmètre pays "Europe" / liste non-EU** (`EU_CODES` dans le script) :
-  quasi statique, pas besoin de cron. Relancer le script manuellement si
-  le périmètre change (ex. adhésion/sortie UE) — il recalcule tout depuis
-  l'index ipdeny à chaque exécution (idempotent).
+- **CIDR européens** (`geoimap_eu_v4`) : recalculés chaque jour via cron
+  installé par le script (`0 4 * * * /usr/bin/geoip-imap-europe.sh`,
+  ~32 requêtes HTTP vers ipdeny). Rejoue tout le script (idempotent),
+  ne touche jamais les ipsets/overrides manuels.
+- **Périmètre "Europe"** (`EU_CODES` dans le script) : quasi statique,
+  ajuster manuellement le script si le périmètre change, puis relancer.
+- **Overrides manuels** : jamais touchés automatiquement, gérés à la main
+  (CLI ou LuCI) indéfiniment.
 
 ## Limites connues
 
-- Premier sync = ~180 requêtes HTTP (une par pays non-EU) vers ipdeny :
-  peut être lent sur routeur contraint, prévoir plusieurs minutes.
-- Si ipdeny est indisponible lors d'un refresh banIP planifié, ce pays
-  garde ses anciennes données (pas de coupure du service, mais IP
-  potentiellement obsolètes) — surveiller les logs.
-- Périmètre "Europe" codé en dur (`EU_CODES`) : pas d'ajustement
-  automatique si un pays change de statut (ex. adhésion/sortie UE).
+- IPv4 uniquement (décision explicite — IPv6 jugé non pertinent sur ce WAN).
+- Premier run : ~32 requêtes HTTP séquentielles vers ipdeny (léger,
+  quelques secondes à quelques dizaines de secondes).
+- Le tarpit lui-même (faux banner IMAP + silence) est un composant du
+  sous-projet Mail, pas de celui-ci — le routeur ne fait que le routage
+  conditionnel par source.
 
 ## Rollback
 
 ```sh
-uci -q delete banip.global.ban_country
-uci -q delete banip.global.ban_feed
-rm -f /etc/banip/banip.custom.feeds
-uci commit banip
-/etc/init.d/banip reload
-# ou complètement désactiver :
-/etc/init.d/banip stop
-/etc/init.d/banip disable
+for PORT in 143 993; do
+    for R in block allow eu noneu; do
+        uci -q delete firewall.geoimap_${R}_${PORT}
+    done
+done
+uci -q delete firewall.geoimap_eu_v4
+uci -q delete firewall.geoimap_manual_allow_v4
+uci -q delete firewall.geoimap_manual_block_v4
+uci commit firewall
+/etc/init.d/firewall reload
+sed -i '\#geoip-imap-europe.sh#d' /etc/crontabs/root
+/etc/init.d/cron restart
 ```
