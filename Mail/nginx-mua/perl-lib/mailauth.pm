@@ -44,6 +44,9 @@ my $trackerLog=$ENV{'TRACKER_LOG'};
 
 our $auth_ok;
 
+# durée (s) du tarpit pop3/imap déclenché par TARPIT_AFTER (dom2srv.txt, 9e champ)
+my $tarpitDelay = 5;
+
 sub handler {
   my $r = shift;
 
@@ -128,6 +131,11 @@ sub handler {
     if(defined($fields[6] and defined($fields[7]))) {
         $rules{$match}{'passin'}=$fields[6];
         $rules{$match}{'passou'}=$fields[7];
+    }
+    # TARPIT_AFTER (9e champ, optionnel) : active le tarpit pop3/imap pour
+    # cette règle, valeur = seuil Auth-Login-Attempt ; absent/vide = désactivé
+    if(defined($fields[8]) and $fields[8] ne '') {
+        $rules{$match}{'tarpitafter'}=$fields[8];
     }
     #syslog('info','Matching:'.$match.', with:'.$r->header_in('Auth-User'));
 
@@ -264,6 +272,32 @@ sub handler {
     #else {
     #    syslog('info',"Please Prepare to ban ".$r->header_in('Client-IP').":".$r->header_in('Auth-Protocol')."/".$r->header_in('Auth-User'));
     #    }
+
+    # tarpit pop3/imap : après échec réel (pas KILL, qui court-circuite ce bloc
+    # entier), si la règle définit TARPIT_AFTER et que le nombre d'essais sur
+    # CETTE connexion (Auth-Login-Attempt, fourni par nginx) l'a dépassé —
+    # ralentit la réponse avant de renvoyer "Invalid login or password"
+    if($auth_ok==0
+       and defined($rules{$match}{'tarpitafter'})
+       and $r->header_in('Auth-Protocol') =~ m/^(pop3|imap)$/
+       and $r->header_in('Auth-Login-Attempt') >= $rules{$match}{'tarpitafter'}) {
+      $status='Tarpit delivered';
+      syslog('info', join(';',$trackerF2b."-Out",
+          $auth_ok,
+          $r->header_in('Host'),
+          $r->header_in('Client-IP'),
+          $r->header_in('Client-Host'),
+          $r->header_in('Auth-User'),
+          $r->header_in("Auth-Protocol"),
+          $r->header_in("Auth-Method"),
+          $r->header_in("Auth-Login-Attempt"),
+          $match,
+          $rules{$match}{$r->header_in("Auth-Protocol")}{'host'},
+          $rules{$match}{$r->header_in("Auth-Protocol")}{'port'},
+          $status
+          ));
+      sleep($tarpitDelay);
+    }
   }
 
   if ($auth_ok==1){

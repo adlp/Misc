@@ -79,19 +79,20 @@ MAP_FILE=/etc/nginx/perl/lib/dom2srv.txt
 Une règle par ligne, format :
 
 ```
-MATCH ; SMTP_HOST[:PORT] ; POP3_HOST[:PORT] ; IMAP_HOST[:PORT] ; LOGIN_IN ; LOGIN_OUT ; PASS_IN ; PASS_OUT
+MATCH ; SMTP_HOST[:PORT] ; POP3_HOST[:PORT] ; IMAP_HOST[:PORT] ; LOGIN_IN ; LOGIN_OUT ; PASS_IN ; PASS_OUT ; TARPIT_AFTER
 ```
 
 - `MATCH` : regex testée sur `Auth-User` (le login envoyé par le client). Première ligne qui matche = règle retenue. `*` sert de règle par défaut/fourre-tout.
 - `*_HOST[:PORT]` : backend à utiliser pour chaque protocole. Le SMTP cible **ne doit pas demander d'authentification** (nginx a déjà authentifié via POP3, cf. plus bas) — il doit accepter la relève depuis le réseau où tourne nginx-mua.
 - `LOGIN_IN`/`LOGIN_OUT` et `PASS_IN`/`PASS_OUT` : paire regex `s/IN/OUT/` appliquée au login et au mot de passe avant transmission au backend (ex. réécrire un alias en adresse réelle). Optionnel — laisser vide si pas de réécriture.
 - `SMTP_HOST = KILL` : au lieu de router, déclenche un tarpit — boucle de `sleep(3)` (répétée `POP3_PORT` fois) avec log à chaque itération, sans jamais authentifier. Sert à ralentir/bannir un motif de login ciblé (ex. scanners, comptes bruteforcés) sans bloquer nginx pour les autres clients.
+- `TARPIT_AFTER` (9e champ, optionnel) : active un tarpit **pop3/imap** pour cette règle. Valeur = nombre d'essais (`Auth-Login-Attempt`, compté par nginx sur la connexion en cours) au-delà duquel un échec d'auth déclenche un `sleep` (5 s, constante `$tarpitDelay` dans `mailauth.pm`) avant la réponse `Invalid login or password`, avec un log `Tarpit delivered`. Vide/absent = désactivé (comportement par défaut, y compris pour les règles écrites avant l'ajout de ce champ). Ne compte que dans la connexion TCP en cours — un client qui se reconnecte à chaque essai y échappe ; c'est fail2ban (cf. section dédiée) qui couvre ce cas via les logs `TRACKER-Out`. N'affecte pas SMTP, qui a son propre mécanisme `KILL` ci-dessus.
 - Caractères interdits dans les mots de passe (alias de compte) : `+ % ^ $ * )`.
 
 Exemple :
 
 ```
-# MATCH                  ; SMTP HOST         ; POP3 HOST         ; IMAP HOST         ; LOGIN IN                 ; LOGIN OUT ; PASS IN ; PASS OUT
+# MATCH                  ; SMTP HOST         ; POP3 HOST         ; IMAP HOST         ; LOGIN IN                 ; LOGIN OUT ; PASS IN ; PASS OUT ; TARPIT_AFTER
 
 # Routage simple, tous les comptes de exemple1.example vers le même backend
 @exemple1\.example$      ; 10.0.10.9:25      ; 10.0.10.9:110      ; 10.0.10.9:143      ;
@@ -99,8 +100,11 @@ Exemple :
 # Réécriture d'alias : jdupont@exemple2.example -> jean.dupont@exemple2.example côté backend
 ^jdupont@exemple2\.example$ ; 10.0.20.5:25   ; 10.0.20.5:110      ; 10.0.20.5:143      ; jdupont   ; jean.dupont
 
-# Tarpit : bloque/ralentit tout login commençant par "admin" (scan/bruteforce), 5 itérations de sleep(3)
+# Tarpit SMTP : bloque/ralentit tout login commençant par "admin" (scan/bruteforce), 5 itérations de sleep(3)
 ^admin                   ; KILL:5            ;                    ;                    ;
+
+# Tarpit pop3/imap : ralentit après 3 échecs sur la même connexion
+@exemple3\.example$      ; 10.0.30.5:25      ; 10.0.30.5:110      ; 10.0.30.5:143      ;           ;           ;         ;          ; 3
 
 # Règle par défaut (dernière ligne, sert de filet si aucun MATCH précédent ne correspond)
 *                        ; 172.17.0.1:2535   ; 172.17.0.1:110     ; 172.17.0.1:143     ;
@@ -152,7 +156,7 @@ input(type="imudp" port="514")
 - `fail2ban/filter.d/nginx-mua.conf` — à copier dans `/etc/fail2ban/filter.d/`
 - `fail2ban/jail.d/nginx-mua.conf` — à copier dans `/etc/fail2ban/jail.d/` (adapter `logpath`/`port` au déploiement)
 
-Ligne ciblée par le filtre, tag `TRACKER_F2B` (`TRACKER` dans l'exemple `.env`) suivi de `-Out` : `TRACKER-Out;<auth_ok>;Host;Client-IP;Client-Host;Auth-User;Auth-Protocol;Auth-Method;Auth-Login-Attempt;match;backend-host;backend-port;status`. `auth_ok=0` = échec (login/pass invalide sur le backend POP3, ou motif matché par une règle `KILL` — tarpit, cf. `dom2srv.txt`) ; `auth_ok=1` = succès, jamais matché par le filtre.
+Ligne ciblée par le filtre, tag `TRACKER_F2B` (`TRACKER` dans l'exemple `.env`) suivi de `-Out` : `TRACKER-Out;<auth_ok>;Host;Client-IP;Client-Host;Auth-User;Auth-Protocol;Auth-Method;Auth-Login-Attempt;match;backend-host;backend-port;status`. `auth_ok=0` = échec (login/pass invalide sur le backend POP3, motif matché par une règle `KILL`, ou tarpit `TARPIT_AFTER` pop3/imap délivré — `status` vaut alors `Tarpit delivered`) ; `auth_ok=1` = succès, jamais matché par le filtre.
 
 Le `KILL` de `dom2srv.txt` génère plusieurs lignes `TRACKER-Out;0;...` pour une seule connexion (une par itération du tarpit) — le `maxretry` bas du jail suffit à bannir dès la première tentative sur un motif déjà connu comme malveillant.
 
