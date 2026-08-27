@@ -139,6 +139,25 @@ Bind-mounts de `/etc/postfix` et `/var/spool/postfix` du service `smtp`. Persist
 3. S'assurer que `${DOPATHLETS}` (Let's Encrypt) contient un certificat valide pour le nom utilisé dans `conf.d/mail.conf` (`ssl_certificate`/`ssl_certificate_key`).
 4. `docker compose up -d` — démarre `smtp` (Postfix, initialise `etc+postfix/`/`var+spool+postfix/` au premier lancement si vides) puis `nginx-mua`.
 
+## fail2ban (`fail2ban/`)
+
+`mailauth.pm` envoie chaque tentative en syslog (voir `perl-lib/mailauth.pm`), via `Sys::Syslog`, directement au serveur `SYSLOG_SERVER:SYSLOG_PORT` défini dans `.env` (UDP par défaut) — indépendamment des logs du conteneur nginx-mua lui-même (driver `syslog` de Docker). Le host qui reçoit ces paquets doit avoir un rsyslog en écoute UDP sur ce port :
+
+```
+# /etc/rsyslog.d/49-nginx-mua.conf sur le host SYSLOG_SERVER
+module(load="imudp")
+input(type="imudp" port="514")
+```
+
+- `fail2ban/filter.d/nginx-mua.conf` — à copier dans `/etc/fail2ban/filter.d/`
+- `fail2ban/jail.d/nginx-mua.conf` — à copier dans `/etc/fail2ban/jail.d/` (adapter `logpath`/`port` au déploiement)
+
+Ligne ciblée par le filtre, tag `TRACKER_F2B` (`TRACKER` dans l'exemple `.env`) suivi de `-Out` : `TRACKER-Out;<auth_ok>;Host;Client-IP;Client-Host;Auth-User;Auth-Protocol;Auth-Method;Auth-Login-Attempt;match;backend-host;backend-port;status`. `auth_ok=0` = échec (login/pass invalide sur le backend POP3, ou motif matché par une règle `KILL` — tarpit, cf. `dom2srv.txt`) ; `auth_ok=1` = succès, jamais matché par le filtre.
+
+Le `KILL` de `dom2srv.txt` génère plusieurs lignes `TRACKER-Out;0;...` pour une seule connexion (une par itération du tarpit) — le `maxretry` bas du jail suffit à bannir dès la première tentative sur un motif déjà connu comme malveillant.
+
+Filtre non vérifié avec `fail2ban-regex` sur un serveur réel (juste une regex Python équivalente sur une ligne construite à partir du code, cf. commentaire du filtre) — à revalider avant activation en prod.
+
 ## Limites connues / points de vigilance
 
 - La validation d'auth passe toujours par POP3, même pour IMAP/SMTP — un backend POP3 down/mal configuré bloque l'auth des trois protocoles pour les comptes de la règle concernée.

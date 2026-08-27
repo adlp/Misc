@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 ### Added
+- `nginx-mua/fail2ban/filter.d/nginx-mua.conf` + `nginx-mua/fail2ban/jail.d/nginx-mua.conf` : filter/jail proposés pour les lignes `TRACKER-Out` de `mailauth.pm` (même convention que `Zimbra/fail2ban/`)
+- `nginx-mua/README.md` : section fail2ban documentant ces fichiers
 - `perl-lib/mailauth.pm` : chemin de `dom2srv.txt` configurable via `MAP_FILE` dans `.env`, garde la valeur par défaut actuelle si absent (ajouté à l'exemple `.env` du README)
 - Ajout README.md et CLAUDE.md racine (arborescence `mailqOnOneLine` + `nginx-mua/`)
 - `nginx-mua/README.md` : documentation complète (utilité, architecture, config, flux d'auth, déploiement, limites connues)
