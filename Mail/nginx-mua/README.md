@@ -96,7 +96,6 @@ Bind-mounts de `/etc/postfix` et `/var/spool/postfix` du service `smtp`. Persist
 2. Renseigner `perl-lib/dom2srv.txt` avec les règles de routage réelles (backends, réécritures éventuelles).
 3. S'assurer que `${DOPATHLETS}` (Let's Encrypt) contient un certificat valide pour le nom utilisé dans `conf.d/mail.conf` (`ssl_certificate`/`ssl_certificate_key`).
 4. `docker compose up -d` — démarre `smtp` (Postfix, initialise `etc+postfix/`/`var+spool+postfix/` au premier lancement si vides) puis `nginx-mua`.
-5. `POC/` contient un compose autonome pour tester le service Postfix seul, indépendamment de nginx-mua.
 
 ## Limites connues / points de vigilance
 

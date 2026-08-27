@@ -39,8 +39,6 @@ Configuration (`.env`) : domaine du site, image nginx, ports exposés, chemins h
 
 `etc+postfix/` et `var+spool+postfix/` sont les bind-mounts du conteneur Postfix (`/etc/postfix`, `/var/spool/postfix`). `src/Dockerfile-pf` construit une image qui, au premier démarrage, dézippe un squelette Postfix stock si ces dossiers sont vides — permet de persister la conf hors du conteneur sans avoir à la committer entièrement.
 
-`POC/` : ancien docker-compose autonome pour Postfix seul (préfigure `nginx-mua/docker-compose.yml`, conservé pour référence).
-
 ## Voir aussi
 
-- [nginx-mua/README.md](nginx-mua/README.md) — détail du format `dom2srv.txt`
+- [nginx-mua/README.md](nginx-mua/README.md) — utilité, architecture, config, flux d'auth, déploiement
