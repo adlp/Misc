@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Added
-- `perl-lib/mailauth.pm` : tarpit pop3/imap configurable par règle (`TARPIT_AFTER`, 9e champ de `dom2srv.txt`) — `sleep` après N échecs dépassés **par IP cliente** (compteur en mémoire du worker, indépendant de la connexion, remis à zéro sur succès), log `Tarpit delivered` ; désactivé par défaut, rétrocompatible avec les règles sans ce champ
+- `perl-lib/mailauth.pm` : tarpit pop3/imap configurable par règle (`TARPIT_AFTER`, 9e champ de `dom2srv.txt`) — `sleep` après N échecs dépassés **par IP cliente** (compteur en mémoire du worker, indépendant de la connexion, remis à zéro sur succès), log `Tarpit delivered` ; désactivé par défaut, rétrocompatible avec les règles sans ce champ. Validé en conditions réelles (conteneur `nginx:1.25.3-perl`, `worker_processes 1`, backend POP3 factice) : délai de 5s exact dès la 3e connexion distincte pour une même IP, log `Tarpit delivered` unique (un doublon trouvé lors du test a été retiré)
 - `nginx-mua/fail2ban/filter.d/nginx-mua.conf` + `nginx-mua/fail2ban/jail.d/nginx-mua.conf` : filter/jail proposés pour les lignes `TRACKER-Out` de `mailauth.pm` (même convention que `Zimbra/fail2ban/`)
 - `nginx-mua/README.md` : section fail2ban documentant ces fichiers
 - `perl-lib/mailauth.pm` : chemin de `dom2srv.txt` configurable via `MAP_FILE` dans `.env`, garde la valeur par défaut actuelle si absent (ajouté à l'exemple `.env` du README)

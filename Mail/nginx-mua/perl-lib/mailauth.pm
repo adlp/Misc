@@ -297,21 +297,10 @@ sub handler {
        and defined($rules{$match}{'tarpitafter'})
        and $r->header_in('Auth-Protocol') =~ m/^(pop3|imap)$/
        and $failsByIP{$clientIP} >= $rules{$match}{'tarpitafter'}) {
+      # pas de syslog ici : le log TRACKER-Out final de handler() (plus bas)
+      # reprend ce $status une fois le sleep terminé, un 2e log ici ferait
+      # doublon (vérifié en conditions réelles, cf. commit)
       $status='Tarpit delivered';
-      syslog('info', join(';',$trackerF2b."-Out",
-          $auth_ok,
-          $r->header_in('Host'),
-          $r->header_in('Client-IP'),
-          $r->header_in('Client-Host'),
-          $r->header_in('Auth-User'),
-          $r->header_in("Auth-Protocol"),
-          $r->header_in("Auth-Method"),
-          $r->header_in("Auth-Login-Attempt"),
-          $match,
-          $rules{$match}{$r->header_in("Auth-Protocol")}{'host'},
-          $rules{$match}{$r->header_in("Auth-Protocol")}{'port'},
-          $status
-          ));
       sleep($tarpitDelay);
     }
   }
