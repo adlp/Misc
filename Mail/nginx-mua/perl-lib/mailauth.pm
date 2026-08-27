@@ -23,8 +23,8 @@ my $ENV={};
 open(FD,"<",$envFile);
 while(<FD>) {
     chomp;
-    ($key,$value)=split(/=/);
-    $ENV{$key}=$value;
+    ($envKey,$envValue)=split(/=/);
+    $ENV{$envKey}=$envValue;
     }
 close(FD);
 
@@ -97,42 +97,42 @@ sub handler {
   # utilisée qu'en filet de secours après la boucle (cf. plus bas) si rien d'autre
   # n'a matché avant la fin du fichier.
   open(FD,"<",$mapFile);
-  my %hash;
+  my %rules;
   $match="";
-  $cont=1;
-  while($cont) {
+  $keepSearching=1;
+  while($keepSearching) {
     $_=<FD>;
     chomp;
     #syslog('info','LIGNE LU:'.$_);
-    my @cdc=split(/;/,$_);
+    my @fields=split(/;/,$_);
     #rien.exemple.example;10.0.10.9:8142;192.0.2.1:8144;192.0.2.2:8145;\(.*\)@exemple.example;\1;A;b
     #     0           1                 2            3               4           5 6 7
     #MASK;SMTPIP:PORT;POP3IP:PORT;IMAPIP:PORT
-    $match=$cdc[0]; # clé du hash = le motif lui-même, pas l'Auth-User
-    #$hash{$match}{'match'}=$cdc[0];
-    if(defined($cdc[1] and $cdc[1] =~ m/:/)) {
-        ($hash{$match}{'smtp'}{'host'},$hash{$match}{'smtp'}{'port'})=split(/:/,$cdc[1]); 
+    $match=$fields[0]; # clé de %rules = le motif lui-même, pas l'Auth-User
+    #$rules{$match}{'match'}=$fields[0];
+    if(defined($fields[1] and $fields[1] =~ m/:/)) {
+        ($rules{$match}{'smtp'}{'host'},$rules{$match}{'smtp'}{'port'})=split(/:/,$fields[1]); 
     }
-    if(defined($cdc[2] and $cdc[2] =~ m/:/)) {
-        ($hash{$match}{'pop3'}{'host'},$hash{$match}{'pop3'}{'port'})=split(/:/,$cdc[2]); 
+    if(defined($fields[2] and $fields[2] =~ m/:/)) {
+        ($rules{$match}{'pop3'}{'host'},$rules{$match}{'pop3'}{'port'})=split(/:/,$fields[2]); 
     }
-    if(defined($cdc[3] and $cdc[3] =~ m/:/)) {
-        ($hash{$match}{'imap'}{'host'},$hash{$match}{'imap'}{'port'})=split(/:/,$cdc[3]); 
+    if(defined($fields[3] and $fields[3] =~ m/:/)) {
+        ($rules{$match}{'imap'}{'host'},$rules{$match}{'imap'}{'port'})=split(/:/,$fields[3]); 
     }
-    if(defined($cdc[4] and defined($cdc[5]))) {
-        $hash{$match}{'loginin'}=$cdc[4];
-        $hash{$match}{'loginou'}=$cdc[5];
+    if(defined($fields[4] and defined($fields[5]))) {
+        $rules{$match}{'loginin'}=$fields[4];
+        $rules{$match}{'loginou'}=$fields[5];
     }
-    if(defined($cdc[6] and defined($cdc[7]))) {
-        $hash{$match}{'passin'}=$cdc[6];
-        $hash{$match}{'passou'}=$cdc[7];
+    if(defined($fields[6] and defined($fields[7]))) {
+        $rules{$match}{'passin'}=$fields[6];
+        $rules{$match}{'passou'}=$fields[7];
     }
     #syslog('info','Matching:'.$match.', with:'.$r->header_in('Auth-User'));
 
     # `cmp` : 0 si égal -> "$match cmp '*'" est vrai (non nul) tant que la ligne
     # courante n'est PAS le catch-all "*", donc on ne s'arrête jamais dessus ici
-    if($match cmp "*" and $r->header_in('Auth-User') =~ m/$match/) { $cont=0; }
-    if(eof(FD)) { $cont=0; }
+    if($match cmp "*" and $r->header_in('Auth-User') =~ m/$match/) { $keepSearching=0; }
+    if(eof(FD)) { $keepSearching=0; }
   }
   close(FD);
 
@@ -141,19 +141,19 @@ sub handler {
   #syslog('info','match ou pas:'.$r->header_in('Auth-User')."/".$match);
   # aucune règle spécifique n'a matché avant la fin du fichier -> repli sur "*"
   if(!($r->header_in('Auth-User') =~ m/$match/)) { $match="*" }
-  if(!defined($hash{$match})) {
+  if(!defined($rules{$match})) {
     $status='no matching possible';
     $auth_ok=0;
   }
   #syslog('info','matched:'.$match);
 
   # backend SMTP = "KILL" -> tarpit au lieu de router (voir README, section dom2srv.txt)
-  if(!($hash{$match}{"smtp"}{'host'} cmp "KILL")) {
+  if(!($rules{$match}{"smtp"}{'host'} cmp "KILL")) {
     $auth_ok=0;
     $status='Licence to kill';
-    # ici $hash{...}{"smtp"}{'port'} = nombre d'itérations du tarpit (KILL:N),
+    # ici $rules{...}{"smtp"}{'port'} = nombre d'itérations du tarpit (KILL:N),
     # pas un port réseau
-    for(my $i=1;$i <= $hash{$match}{"smtp"}{'port'};$i++) {
+    for(my $i=1;$i <= $rules{$match}{"smtp"}{'port'};$i++) {
       syslog('info', join(';',$trackerF2b."-Out",
         $auth_ok,
         $r->header_in('Host'),
@@ -164,8 +164,8 @@ sub handler {
         $r->header_in("Auth-Method"),
         $r->header_in("Auth-Login-Attempt"),
         $match,
-        $hash{$match}{$r->header_in("Auth-Protocol")}{'host'},
-        $hash{$match}{$r->header_in("Auth-Protocol")}{'port'},
+        $rules{$match}{$r->header_in("Auth-Protocol")}{'host'},
+        $rules{$match}{$r->header_in("Auth-Protocol")}{'port'},
         $status
         ));
       sleep(3);
@@ -182,8 +182,8 @@ sub handler {
         $r->header_in("Auth-Method"),
         $r->header_in("Auth-Login-Attempt"),
         $match,
-        $hash{$match}{$r->header_in("Auth-Protocol")}{'host'},
-        $hash{$match}{$r->header_in("Auth-Protocol")}{'port'},
+        $rules{$match}{$r->header_in("Auth-Protocol")}{'host'},
+        $rules{$match}{$r->header_in("Auth-Protocol")}{'port'},
         $status
         ));
     $status='Licence to kill';
@@ -194,14 +194,14 @@ sub handler {
   # AVANT la validation POP3 ci-dessous : c'est $AuthUser/$AuthPass (déjà réécrits)
   # qui sont testés contre le backend, pas les valeurs brutes envoyées par le client
   $AuthUser=$r->header_in("Auth-User");
-  if($auth_ok and defined($hash{$match}{'loginin'})) {
-    $AuthUser=~ s/$hash{$match}{'loginin'}/$hash{$match}{'loginou'}/g;
-    syslog('info',"Metamorphose : ".$r->header_in("Auth-User")."=~ s/".$hash{$match}{'loginin'}."/".$hash{$match}{'loginou'}."/g=".$AuthUser);
+  if($auth_ok and defined($rules{$match}{'loginin'})) {
+    $AuthUser=~ s/$rules{$match}{'loginin'}/$rules{$match}{'loginou'}/g;
+    syslog('info',"Metamorphose : ".$r->header_in("Auth-User")."=~ s/".$rules{$match}{'loginin'}."/".$rules{$match}{'loginou'}."/g=".$AuthUser);
     $r->header_out("Auth-User",$AuthUser);
   }
   $AuthPass=$r->header_in("Auth-Pass");
-  if($auth_ok and defined($hash{$match}{'passin'})) {
-    $AuthPass=~ s/$hash{$match}{'passin'}/$hash{$match}{'passou'}/g;
+  if($auth_ok and defined($rules{$match}{'passin'})) {
+    $AuthPass=~ s/$rules{$match}{'passin'}/$rules{$match}{'passou'}/g;
     $r->header_out("Auth-Pass",$AuthPass);
   }
 
@@ -217,24 +217,24 @@ sub handler {
   # protocole réellement demandé par le client (imap/pop3/smtp) — sert de vérif
   # d'auth générique pour les trois ; un backend pop3 down bloque tout le monde
   if($auth_ok) {
-    $mail_server=$hash{$match}{"pop3"}{'host'};
-    $mail_serpor=$hash{$match}{"pop3"}{'port'};
-    #$pop = Net::POP3->new($mail_server,Port=>$mail_serpor,Debug =>1) #,doSSL=>'starttls')
-    $pop = Net::POP3->new($mail_server,Port=>$mail_serpor) #,doSSL=>'starttls')
+    $popHost=$rules{$match}{"pop3"}{'host'};
+    $popPort=$rules{$match}{"pop3"}{'port'};
+    #$popClient = Net::POP3->new($popHost,Port=>$popPort,Debug =>1) #,doSSL=>'starttls')
+    $popClient = Net::POP3->new($popHost,Port=>$popPort) #,doSSL=>'starttls')
         or $auth_ok=0;
 
     if($auth_ok==0) {
-        #syslog('info',"Can't open connection to $mail_server:$mail_serpor : $!");
-        $status="Can't open connection to $mail_server:$mail_serpor : $!";
+        #syslog('info',"Can't open connection to $popHost:$popPort : $!");
+        $status="Can't open connection to $popHost:$popPort : $!";
     }
-    #elsif($auth_ok and !($pop->login($AuthUser,$AuthPass)>0)) {
-    #elsif($auth_ok and !($val=$pop->login($AuthUser,$AuthPass)>0)) {
+    #elsif($auth_ok and !($popClient->login($AuthUser,$AuthPass)>0)) {
+    #elsif($auth_ok and !($val=$popClient->login($AuthUser,$AuthPass)>0)) {
     else {
-      $pop->login($AuthUser,$AuthPass) or $auth_ok=0;
+      $popClient->login($AuthUser,$AuthPass) or $auth_ok=0;
       if($auth_ok==0) {
-        #syslog('info',"Can't authenticate ".$r->header_in('Auth-User')."on $mail_server:$mail_serpor: $!");
-        $status="Can't authenticate on $mail_server:$mail_serpor: $!".$AuthPass;
-        syslog('info',"Can't authenticate on $mail_server:$mail_serpor: ".$r->header_in('Auth-User').":".$r->header_in('Auth-Pass'));
+        #syslog('info',"Can't authenticate ".$r->header_in('Auth-User')."on $popHost:$popPort: $!");
+        $status="Can't authenticate on $popHost:$popPort: $!".$AuthPass;
+        syslog('info',"Can't authenticate on $popHost:$popPort: ".$r->header_in('Auth-User').":".$r->header_in('Auth-Pass'));
         $auth_ok=0;
         syslog('info', join(';',$trackerLog."-Log",
             $auth_ok,
@@ -246,13 +246,13 @@ sub handler {
             $r->header_in("Auth-Method"),
             $r->header_in("Auth-Login-Attempt"),
             $match,
-            $hash{$match}{$r->header_in("Auth-Protocol")}{'host'},
-            $hash{$match}{$r->header_in("Auth-Protocol")}{'port'},
+            $rules{$match}{$r->header_in("Auth-Protocol")}{'host'},
+            $rules{$match}{$r->header_in("Auth-Protocol")}{'port'},
             $status
             ));
-        $status="Can't authenticate on $mail_server:$mail_serpor:  please $!";
+        $status="Can't authenticate on $popHost:$popPort:  please $!";
       }
-      $pop->quit;
+      $popClient->quit;
     }
     #if($auth_ok) {
     #    syslog('info',"Pre-Auth-Phase ok");
@@ -266,8 +266,8 @@ sub handler {
 
   if ($auth_ok==1){
     $r->header_out("Auth-Status", "OK") ;
-    $r->header_out("Auth-Server",   $hash{$match}{$r->header_in("Auth-Protocol")}{'host'});
-    $r->header_out("Auth-Port",     $hash{$match}{$r->header_in("Auth-Protocol")}{'port'});
+    $r->header_out("Auth-Server",   $rules{$match}{$r->header_in("Auth-Protocol")}{'host'});
+    $r->header_out("Auth-Port",     $rules{$match}{$r->header_in("Auth-Protocol")}{'port'});
 
     # backend smtp = pas d'auth attendue (déjà faite ici) -> credentials vidés ;
     # imap/pop3 gardent Auth-User/Auth-Pass (rewrités) pour l'auth réelle côté backend
@@ -293,8 +293,8 @@ sub handler {
       $r->header_in("Auth-Method"),
       $r->header_in("Auth-Login-Attempt"),
       $match,
-      $hash{$match}{$r->header_in("Auth-Protocol")}{'host'},
-      $hash{$match}{$r->header_in("Auth-Protocol")}{'port'},
+      $rules{$match}{$r->header_in("Auth-Protocol")}{'host'},
+      $rules{$match}{$r->header_in("Auth-Protocol")}{'port'},
       $status
       ));
 #  syslog('info', join(';',$trackerF2b."-ADLP",
@@ -308,8 +308,8 @@ sub handler {
 #      $r->header_in("Auth-Method"),
 #      $r->header_in("Auth-Login-Attempt"),
 #      $match,
-#      $hash{$match}{$r->header_in("Auth-Protocol")}{'host'},
-#      $hash{$match}{$r->header_in("Auth-Protocol")}{'port'},
+#      $rules{$match}{$r->header_in("Auth-Protocol")}{'host'},
+#      $rules{$match}{$r->header_in("Auth-Protocol")}{'port'},
 #      $status
 #      ));
 
@@ -325,8 +325,8 @@ sub handler {
 ###        $r->header_in("Auth-Method"),
 ###        $r->header_in("Auth-Login-Attempt"),
 ###        $match,
-###        $hash{$match}{$r->header_in("Auth-Protocol")}{'host'},
-###        $hash{$match}{$r->header_in("Auth-Protocol")}{'port'},
+###        $rules{$match}{$r->header_in("Auth-Protocol")}{'host'},
+###        $rules{$match}{$r->header_in("Auth-Protocol")}{'port'},
 ###        "End Of Sleep"
 ###        ));
 ###    }
