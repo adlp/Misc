@@ -71,6 +71,7 @@ SYSLOG_PORT=514
 SYSLOG_PROTO=udp
 TRACKER_F2B=TRACKER
 TRACKER_LOG=MUA-LOG
+MAP_FILE=/etc/nginx/perl/lib/dom2srv.txt
 ```
 
 ### `dom2srv.txt` (monté dans `perl-lib/`, lu par `mailauth.pm`)
