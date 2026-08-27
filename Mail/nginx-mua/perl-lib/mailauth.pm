@@ -105,7 +105,7 @@ sub handler {
     chomp;
     #syslog('info','LIGNE LU:'.$_);
     my @cdc=split(/;/,$_);
-    #rien.koa29.org;10.0.10.9:8142;123.1.2.3:8144;44.2.5.4:8145;\(.*\)@adlp.org;\1;A;b
+    #rien.exemple.example;10.0.10.9:8142;192.0.2.1:8144;192.0.2.2:8145;\(.*\)@exemple.example;\1;A;b
     #     0           1                 2            3               4           5 6 7
     #MASK;SMTPIP:PORT;POP3IP:PORT;IMAPIP:PORT
     $match=$cdc[0]; # clé du hash = le motif lui-même, pas l'Auth-User
