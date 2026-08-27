@@ -1,5 +1,9 @@
 # Changelog — zimLocAccZam
 
+## fail2ban/ — 2026-08-27 (fix regex audit.log, autres protocoles)
+
+Test du filtre `zimbra-audit.conf` contre les formats imap/pop3/soap (via wiki.zimbra.com "Understanding And Troubleshooting Authentication Log Events" et forums.zimbra.org, pas de log réel disponible pour ces protocoles). Découverte : en imap derrière proxy, `ip=` (IP proxy) et `oip=` (IP réelle) coexistent dans le MÊME bloc avec `oip=` APRÈS `ip=` (`[ip=<proxy>;oip=<réelle>;via=...;ua=...;]`) — l'ancienne regex, qui exigeait `oip=` en tout début de bloc (calée sur le seul cas http_dav observé, où `oip=` est seul), ne matchait donc jamais ce format. Regex réécrite pour chercher `oip=`/`ip=` n'importe où dans la ligne (plus d'ancrage sur la position/l'ordre des champs), avec `\b` pour ne pas confondre `ip=` et le `ip=` interne à `oip=`. Revérifié : http_dav réel, imap avec/sans proxy, succès d'auth (ne doit pas matcher, pas de `error=`) — tous corrects.
+
 ## fail2ban/ — 2026-08-27 (fix regex scanners web)
 
 Fix regex suite à test sur une vraie ligne `nginx.access.log` de prod, qui ne matchait pas : `93.123.109.228:44188 - - [27/Aug/2026:00:58:43 +0200]  "GET http://MAUVAISNDD/.env.production HTTP/1.1" 302 338 "-" "l9explore/1.2.2" "-" "100.96.47.2:80"`. Deux problèmes : le format Zimbra logue `IP:port` (l'ancrage `^<HOST> -` ne matchait donc jamais), et la requête peut être en URI absolue (`GET http://host/chemin`) plutôt qu'en chemin relatif. Regex corrigée pour absorber le port après l'IP et matcher le badpath n'importe où dans la cible de requête, chemin relatif ou URI absolue. Revérifié : ancien format (sans port, chemin relatif) toujours détecté, et les 3 chemins Zimbra légitimes (`/principals/`, `/service/soap/AuthRequest`, `/Microsoft-Server-ActiveSync`) toujours 0 faux positif.

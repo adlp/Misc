@@ -72,7 +72,9 @@ Filtre + jail pour bannir les IP en échec d'authentification répété sur Zimb
 1. `zmprov mcf +zimbraMailTrustedIP <IP du nginx zimbra-proxy>` (+ `127.0.0.1` si colocalisé avec mailboxd) → fait apparaître un champ `oip=` (originating IP) dans `audit.log`, que le filtre utilise en priorité.
 2. Si un reverse proxy externe est en plus devant le nginx Zimbra : remplacer `$proxy_add_x_forwarded_for` par `$http_x_forwarded_for` dans `/opt/zimbra/conf/nginx/templates/*` puis `zmproxyctl restart` (sinon `audit.log` reçoit une liste d'IP concaténées, rejetée par Zimbra).
 
-Avant d'activer le jail en prod, valider la regex sur le serveur : `fail2ban-regex /opt/zimbra/log/audit.log /etc/fail2ban/filter.d/zimbra-audit.conf` (le format exact des lignes peut varier selon la version de Zimbra — non vérifié ici contre un vrai log).
+Avant d'activer le jail en prod, valider la regex sur le serveur : `fail2ban-regex /opt/zimbra/log/audit.log /etc/fail2ban/filter.d/zimbra-audit.conf` (le format exact des lignes peut varier selon la version de Zimbra).
+
+Format vérifié pour `http_dav` (vraie ligne de prod) et `imap` (exemples documentés par Zimbra, `ip=` + `oip=` dans le même bloc, `oip=` après `ip=`) — la regex cherche `oip=`/`ip=` n'importe où dans le bloc plutôt que d'ancrer sur l'ordre des champs, donc `pop3`/`soap` (même mécanisme de logging, non vérifiés sur log réel) devraient aussi matcher.
 
 ### Scanners web hors-sujet (`fail2ban/filter.d/zimbra-nginx-scanners.conf`)
 
