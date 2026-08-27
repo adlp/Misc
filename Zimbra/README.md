@@ -89,7 +89,7 @@ real_ip_recursive on;
 ```
 puis `zmproxyctl restart`.
 
-Regex basée sur le format `combined` standard de nginx, testée uniquement sur lignes synthétiques (pas de vrai `nginx.access.log` disponible ici) — valider avec `fail2ban-regex` avant activation, comme pour le jail `audit.log`.
+Regex basée sur le format `combined` de nginx, corrigée suite à test sur une vraie ligne de prod (IP loggée en `IP:port`, requête parfois en URI absolue plutôt qu'en chemin relatif) — reste à valider avec `fail2ban-regex` en conditions réelles avant activation, comme pour le jail `audit.log`.
 
 ## Versions
 

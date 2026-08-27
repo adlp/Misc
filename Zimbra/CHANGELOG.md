@@ -1,5 +1,9 @@
 # Changelog — zimLocAccZam
 
+## fail2ban/ — 2026-08-27 (fix regex scanners web)
+
+Fix regex suite à test sur une vraie ligne `nginx.access.log` de prod, qui ne matchait pas : `93.123.109.228:44188 - - [27/Aug/2026:00:58:43 +0200]  "GET http://MAUVAISNDD/.env.production HTTP/1.1" 302 338 "-" "l9explore/1.2.2" "-" "100.96.47.2:80"`. Deux problèmes : le format Zimbra logue `IP:port` (l'ancrage `^<HOST> -` ne matchait donc jamais), et la requête peut être en URI absolue (`GET http://host/chemin`) plutôt qu'en chemin relatif. Regex corrigée pour absorber le port après l'IP et matcher le badpath n'importe où dans la cible de requête, chemin relatif ou URI absolue. Revérifié : ancien format (sans port, chemin relatif) toujours détecté, et les 3 chemins Zimbra légitimes (`/principals/`, `/service/soap/AuthRequest`, `/Microsoft-Server-ActiveSync`) toujours 0 faux positif.
+
 ## fail2ban/ — 2026-08-25 (scanners web)
 
 Ajout d'un second jail : `zimbra-nginx-scanners`, sur `nginx.access.log`, pour bannir les scans de chemins hors-sujet (WordPress, phpMyAdmin, `.env`/`.git`, exploits Laravel/Symfony/Spring, tout `.php` — Zimbra n'en sert jamais). `maxretry=2` volontairement bas. Nécessite le module `realip` de nginx configuré côté Zimbra (prérequis distinct de `zimbraMailTrustedIP` utilisé pour `audit.log`). Voir `README.md`.
