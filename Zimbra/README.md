@@ -74,6 +74,8 @@ Filtre + jail pour bannir les IP en échec d'authentification répété sur Zimb
 
 Avant d'activer le jail en prod, valider la regex sur le serveur : `fail2ban-regex /opt/zimbra/log/audit.log /etc/fail2ban/filter.d/zimbra-audit.conf` (le format exact des lignes peut varier selon la version de Zimbra).
 
+**Whitelisting** : géré par `ignoreip` dans chaque `jail.d/*.conf` (déjà `127.0.0.1/8 ::1` par défaut), pas par `ignoreregex` (vide à dessein dans les deux filtres). Ajouter les IP admin/monitoring à whitelister dans `ignoreip`, sur les deux jails si besoin. IPv6 entre crochets (`ip=[::1]`) non vérifié — pas de log IPv6 réel disponible pour tester.
+
 Format vérifié pour `http_dav` (vraie ligne de prod) et `imap` (exemples documentés par Zimbra, `ip=` + `oip=` dans le même bloc, `oip=` après `ip=`) — la regex cherche `oip=`/`ip=` n'importe où dans le bloc plutôt que d'ancrer sur l'ordre des champs, donc `pop3`/`soap` (même mécanisme de logging, non vérifiés sur log réel) devraient aussi matcher.
 
 ### Scanners web hors-sujet (`fail2ban/filter.d/zimbra-nginx-scanners.conf`)

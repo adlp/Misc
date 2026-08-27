@@ -1,5 +1,9 @@
 # Changelog — zimLocAccZam
 
+## fail2ban/ — 2026-08-27 (vérif whitelisting)
+
+Vérifié que le whitelisting fonctionne bien : `ignoreip = 127.0.0.1/8 ::1` (dans les deux `jail.d/*.conf`) couvre correctement `127.0.0.1` et `::1` une fois l'IP extraite par la failregex, sur les deux filtres (`zimbra-audit`, `zimbra-nginx-scanners`) ; une IP externe type `203.0.113.9` n'est pas couverte. Le whitelisting se fait via `ignoreip` du jail, pas via `ignoreregex` (resté vide à dessein dans les deux filtres — sert à exclure des lignes par contenu, pas par IP). Caveat non résolu : pas vérifié si `<HOST>` matche une IPv6 entre crochets (`ip=[::1]`, `oip=[2001:db8::1]`) — aucun vrai log IPv6 disponible pour tester ; à vérifier via `fail2ban-regex` si IPv6 utilisé en prod. Si des IP admin/monitoring doivent être whitelistées en plus du loopback, les ajouter dans `ignoreip` des deux jails.
+
 ## fail2ban/ — 2026-08-27 (fix regex audit.log, autres protocoles)
 
 Test du filtre `zimbra-audit.conf` contre les formats imap/pop3/soap (via wiki.zimbra.com "Understanding And Troubleshooting Authentication Log Events" et forums.zimbra.org, pas de log réel disponible pour ces protocoles). Découverte : en imap derrière proxy, `ip=` (IP proxy) et `oip=` (IP réelle) coexistent dans le MÊME bloc avec `oip=` APRÈS `ip=` (`[ip=<proxy>;oip=<réelle>;via=...;ua=...;]`) — l'ancienne regex, qui exigeait `oip=` en tout début de bloc (calée sur le seul cas http_dav observé, où `oip=` est seul), ne matchait donc jamais ce format. Regex réécrite pour chercher `oip=`/`ip=` n'importe où dans la ligne (plus d'ancrage sur la position/l'ordre des champs), avec `\b` pour ne pas confondre `ip=` et le `ip=` interne à `oip=`. Revérifié : http_dav réel, imap avec/sans proxy, succès d'auth (ne doit pas matcher, pas de `error=`) — tous corrects.
