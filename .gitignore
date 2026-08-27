@@ -5,3 +5,4 @@ CLAUDE.md
 **/__pycache__/
 **/conf/*.conf
 *.swp
+Mail/nginx-mua/var+spool+postfix/
