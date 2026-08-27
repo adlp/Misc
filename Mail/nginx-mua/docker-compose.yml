@@ -1,0 +1,58 @@
+version: "3"
+services:
+  nginx-mua:
+    container_name: ${SITE}
+    hostname: ${SITE}
+    image: nginx:${IMNG}-perl
+    cap_add:
+        - NET_ADMIN
+    env_file:
+        - .env
+    ports:
+        - ${EXPOPOP3}:110
+        - ${EXPOPOP3S}:995
+        - ${EXPOIMAP}:143
+        - ${EXPOIMAPS}:993
+        - ${EXPOSMTP}:587
+#        - ${EXPOWWW}:80
+    #network_mode: host
+    #net: host
+    volumes:
+        - ${DOPATH}/nginx.conf:/etc/nginx/nginx.conf:ro
+        - ${DOPATH}/conf.d:/etc/nginx/conf.d:ro
+        - ${DOPATH}/include.d:/etc/nginx/include.d:ro
+        - ${DOPATH}/ssl.d:/etc/nginx/ssl.d:ro
+        - ${DOPATH}/perl-lib:/etc/nginx/perl/lib:ro
+        - ${DOPATHLETS}:/etc/letsencrypt:ro
+        - ${DOPATH}/.env:/usr/local/etc/environment:ro
+    restart: always
+    logging:
+        driver: "syslog"
+        options:
+          syslog-address: "udp://127.0.0.1:514"
+          syslog-facility: "local0"
+          tag: "${SITE}"
+#    extra_hosts:
+#        - upstreams:172.17.0.1
+    depends_on:
+        - smtp
+  smtp:
+    build:
+        context: ${DOPATH}/src
+        dockerfile: Dockerfile-pf
+    image: local/postfix
+    restart: unless-stopped
+    hostname: pf-${SITE}
+    container_name: pf-${SITE}
+    ports:
+        - 172.17.0.1:2535:25
+    volumes:
+        - ${DOPATH}/etc+postfix:/etc/postfix
+        - ${DOPATH}/var+spool+postfix:/var/spool/postfix
+    logging:
+        driver: "syslog"
+        options:
+          syslog-address: "udp://127.0.0.1:514"
+          syslog-facility: "local0"
+          tag: "pf-${SITE}"
+

@@ -1,0 +1,4 @@
+# MATCH ; SMTP HOST; POP3 HOST ; IMAP HOST ; LOGIN IN ; LOGIN OUT; PASS IN ; PASS OUT
+#  0    ;    1     ;    2      ;     3     ;     4    ;    5     ;    6    ;   7
+# Sur les parties host, on peut specifier le port cible en mettant des IP:PORT
+# Le SMTP cible ne doit pas demander d'auth
