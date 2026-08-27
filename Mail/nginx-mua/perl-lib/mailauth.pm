@@ -1,3 +1,6 @@
+# backend auth_http pour nginx mail (voir conf.d/mail.conf + conf.d/http.conf) :
+# route chaque connexion IMAP/POP3/SMTP vers un backend selon dom2srv.txt,
+# valide toujours les identifiants en POP3 (même pour IMAP/SMTP), logue en syslog pour fail2ban.
 package mailauth;
 use nginx;
 use Env;
@@ -13,8 +16,9 @@ use Env;
 my $mapFile="/etc/nginx/perl/lib/dom2srv.txt";
 my $envFile="/usr/local/etc/environment";
 
-
-
+# parsing manuel de .env (monté en lecture dans le conteneur) : %ENV du process
+# reste celui de nginx, ce hash local ($ENV, pas la variable spéciale Perl) porte
+# la config applicative (SYSLOG_*, TRACKER_*, SITE)
 my $ENV={};
 open(FD,"<",$envFile);
 while(<FD>) {
@@ -87,6 +91,11 @@ sub handler {
         $r->header_in('Client-Host')));
 
   ##### Ici on recupere les regles de redirection
+  # lit dom2srv.txt ligne par ligne et arrête dès qu'une ligne (hors "*") matche
+  # Auth-User : les lignes suivantes du fichier ne sont donc jamais parsées.
+  # La ligne "*" (catch-all), elle, ne stoppe jamais la boucle ici — elle n'est
+  # utilisée qu'en filet de secours après la boucle (cf. plus bas) si rien d'autre
+  # n'a matché avant la fin du fichier.
   open(FD,"<",$mapFile);
   my %hash;
   $match="";
@@ -99,7 +108,7 @@ sub handler {
     #rien.koa29.org;10.0.10.9:8142;123.1.2.3:8144;44.2.5.4:8145;\(.*\)@adlp.org;\1;A;b
     #     0           1                 2            3               4           5 6 7
     #MASK;SMTPIP:PORT;POP3IP:PORT;IMAPIP:PORT
-    $match=$cdc[0];
+    $match=$cdc[0]; # clé du hash = le motif lui-même, pas l'Auth-User
     #$hash{$match}{'match'}=$cdc[0];
     if(defined($cdc[1] and $cdc[1] =~ m/:/)) {
         ($hash{$match}{'smtp'}{'host'},$hash{$match}{'smtp'}{'port'})=split(/:/,$cdc[1]); 
@@ -120,6 +129,8 @@ sub handler {
     }
     #syslog('info','Matching:'.$match.', with:'.$r->header_in('Auth-User'));
 
+    # `cmp` : 0 si égal -> "$match cmp '*'" est vrai (non nul) tant que la ligne
+    # courante n'est PAS le catch-all "*", donc on ne s'arrête jamais dessus ici
     if($match cmp "*" and $r->header_in('Auth-User') =~ m/$match/) { $cont=0; }
     if(eof(FD)) { $cont=0; }
   }
@@ -128,6 +139,7 @@ sub handler {
   # Ici le veritable traitement commence...
   $status="OK";
   #syslog('info','match ou pas:'.$r->header_in('Auth-User')."/".$match);
+  # aucune règle spécifique n'a matché avant la fin du fichier -> repli sur "*"
   if(!($r->header_in('Auth-User') =~ m/$match/)) { $match="*" }
   if(!defined($hash{$match})) {
     $status='no matching possible';
@@ -135,9 +147,12 @@ sub handler {
   }
   #syslog('info','matched:'.$match);
 
+  # backend SMTP = "KILL" -> tarpit au lieu de router (voir README, section dom2srv.txt)
   if(!($hash{$match}{"smtp"}{'host'} cmp "KILL")) {
     $auth_ok=0;
     $status='Licence to kill';
+    # ici $hash{...}{"smtp"}{'port'} = nombre d'itérations du tarpit (KILL:N),
+    # pas un port réseau
     for(my $i=1;$i <= $hash{$match}{"smtp"}{'port'};$i++) {
       syslog('info', join(';',$trackerF2b."-Out",
         $auth_ok,
@@ -175,6 +190,9 @@ sub handler {
   }
 
 
+  # réécriture login/pass (LOGIN_IN->LOGIN_OUT / PASS_IN->PASS_OUT de dom2srv.txt)
+  # AVANT la validation POP3 ci-dessous : c'est $AuthUser/$AuthPass (déjà réécrits)
+  # qui sont testés contre le backend, pas les valeurs brutes envoyées par le client
   $AuthUser=$r->header_in("Auth-User");
   if($auth_ok and defined($hash{$match}{'loginin'})) {
     $AuthUser=~ s/$hash{$match}{'loginin'}/$hash{$match}{'loginou'}/g;
@@ -193,8 +211,11 @@ sub handler {
   #  }
 
   ########## Premier test d'authentification
-  ### Necessaire pour 1/ Authentifier le smtp    2/ centraliser le fail2ban 
+  ### Necessaire pour 1/ Authentifier le smtp    2/ centraliser le fail2ban
   #if($auth_ok and !($r->header_in('Auth-Protocol') cmp 'smtp')) {
+  # validation UNIQUE via POP3 sur le backend pop3 de la règle, quel que soit le
+  # protocole réellement demandé par le client (imap/pop3/smtp) — sert de vérif
+  # d'auth générique pour les trois ; un backend pop3 down bloque tout le monde
   if($auth_ok) {
     $mail_server=$hash{$match}{"pop3"}{'host'};
     $mail_serpor=$hash{$match}{"pop3"}{'port'};
@@ -248,6 +269,8 @@ sub handler {
     $r->header_out("Auth-Server",   $hash{$match}{$r->header_in("Auth-Protocol")}{'host'});
     $r->header_out("Auth-Port",     $hash{$match}{$r->header_in("Auth-Protocol")}{'port'});
 
+    # backend smtp = pas d'auth attendue (déjà faite ici) -> credentials vidés ;
+    # imap/pop3 gardent Auth-User/Auth-Pass (rewrités) pour l'auth réelle côté backend
     if(!($r->header_in('Auth-Protocol') cmp 'smtp')) {
         $r->header_out('Auth-User',     '');
         $r->header_out('Auth-Pass',     '');
