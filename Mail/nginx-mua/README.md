@@ -52,6 +52,7 @@ Variables lues par `docker-compose.yml` :
 | `SYSLOG_SERVER`, `SYSLOG_PORT`, `SYSLOG_PROTO` | destination syslog pour les logs d'auth |
 | `TRACKER_F2B`, `TRACKER_LOG` | tags utilisés dans les lignes de log (à filtrer côté fail2ban/log parsing) |
 | `MAP_FILE` | *(optionnel)* chemin du fichier de règles lu par `mailauth.pm`, défaut `/etc/nginx/perl/lib/dom2srv.txt` (= `dom2srv.txt` monté dans `perl-lib/`) |
+| `TARPIT_ENABLED` | *(optionnel)* coupe-circuit global du tarpit pop3/imap (`TARPIT_AFTER`, cf. `dom2srv.txt`) : `0` le désactive entièrement, quelles que soient les règles. Absent/autre valeur = activé (défaut) |
 
 Exemple :
 
@@ -72,6 +73,7 @@ SYSLOG_PROTO=udp
 TRACKER_F2B=TRACKER
 TRACKER_LOG=MUA-LOG
 MAP_FILE=/etc/nginx/perl/lib/dom2srv.txt
+TARPIT_ENABLED=1
 ```
 
 ### `dom2srv.txt` (monté dans `perl-lib/`, lu par `mailauth.pm`)
@@ -86,7 +88,7 @@ MATCH ; SMTP_HOST[:PORT] ; POP3_HOST[:PORT] ; IMAP_HOST[:PORT] ; LOGIN_IN ; LOGI
 - `*_HOST[:PORT]` : backend à utiliser pour chaque protocole. Le SMTP cible **ne doit pas demander d'authentification** (nginx a déjà authentifié via POP3, cf. plus bas) — il doit accepter la relève depuis le réseau où tourne nginx-mua.
 - `LOGIN_IN`/`LOGIN_OUT` et `PASS_IN`/`PASS_OUT` : paire regex `s/IN/OUT/` appliquée au login et au mot de passe avant transmission au backend (ex. réécrire un alias en adresse réelle). Optionnel — laisser vide si pas de réécriture.
 - `SMTP_HOST = KILL` : au lieu de router, déclenche un tarpit — boucle de `sleep(3)` (répétée `POP3_PORT` fois) avec log à chaque itération, sans jamais authentifier. Sert à ralentir/bannir un motif de login ciblé (ex. scanners, comptes bruteforcés) sans bloquer nginx pour les autres clients.
-- `TARPIT_AFTER` (9e champ, optionnel) : active un tarpit **pop3/imap** pour cette règle. Valeur = nombre d'échecs d'auth **par IP cliente** (`Client-IP`, compté côté `mailauth.pm`, indépendamment de la connexion TCP — un client qui se reconnecte n'échappe donc pas au compteur) au-delà duquel un nouvel échec déclenche un `sleep` (5 s, constante `$tarpitDelay` dans `mailauth.pm`) avant la réponse `Invalid login or password`, avec un log `Tarpit delivered`. Le compteur est remis à zéro pour cette IP dès un succès. Vide/absent = désactivé (comportement par défaut, y compris pour les règles écrites avant l'ajout de ce champ). N'affecte pas SMTP, qui a son propre mécanisme `KILL` ci-dessus.
+- `TARPIT_AFTER` (9e champ, optionnel) : active un tarpit **pop3/imap** pour cette règle (soumis au coupe-circuit global `TARPIT_ENABLED` de `.env`, ci-dessus — `TARPIT_ENABLED=0` l'emporte sur toute valeur ici). Valeur = nombre d'échecs d'auth **par IP cliente** (`Client-IP`, compté côté `mailauth.pm`, indépendamment de la connexion TCP — un client qui se reconnecte n'échappe donc pas au compteur) au-delà duquel un nouvel échec déclenche un `sleep` (5 s, constante `$tarpitDelay` dans `mailauth.pm`) avant la réponse `Invalid login or password`, avec un log `Tarpit delivered`. Le compteur est remis à zéro pour cette IP dès un succès. Vide/absent = désactivé (comportement par défaut, y compris pour les règles écrites avant l'ajout de ce champ). N'affecte pas SMTP, qui a son propre mécanisme `KILL` ci-dessus.
   - Compteur en mémoire du worker nginx (`%failsByIP` dans `mailauth.pm`), pas de fichier/DB : pas de décroissance temporelle en dehors d'un succès, perdu au reload/redémarrage de nginx, et **pas partagé entre workers** si `worker_processes` > 1 (approximatif dans ce cas — chaque worker a son propre compteur). Suffisant comme dissuasion ; fail2ban (section dédiée) reste l'autorité pour le bannissement IP réel, sur la base des mêmes logs `TRACKER-Out`.
 - Caractères interdits dans les mots de passe (alias de compte) : `+ % ^ $ * )`.
 

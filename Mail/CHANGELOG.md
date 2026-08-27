@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- `perl-lib/mailauth.pm` : coupe-circuit global `TARPIT_ENABLED` (`.env`) pour le tarpit pop3/imap — `0` désactive le mécanisme entièrement quelles que soient les règles `dom2srv.txt` ; absent/autre valeur = activé (défaut, rétrocompatible)
 - `perl-lib/mailauth.pm` : tarpit pop3/imap configurable par règle (`TARPIT_AFTER`, 9e champ de `dom2srv.txt`) — `sleep` après N échecs dépassés **par IP cliente** (compteur en mémoire du worker, indépendant de la connexion, remis à zéro sur succès), log `Tarpit delivered` ; désactivé par défaut, rétrocompatible avec les règles sans ce champ. Validé en conditions réelles (conteneur `nginx:1.25.3-perl`, `worker_processes 1`, backend POP3 factice) : délai de 5s exact dès la 3e connexion distincte pour une même IP, log `Tarpit delivered` unique (un doublon trouvé lors du test a été retiré)
 - `nginx-mua/fail2ban/filter.d/nginx-mua.conf` + `nginx-mua/fail2ban/jail.d/nginx-mua.conf` : filter/jail proposés pour les lignes `TRACKER-Out` de `mailauth.pm` (même convention que `Zimbra/fail2ban/`)
 - `nginx-mua/README.md` : section fail2ban documentant ces fichiers

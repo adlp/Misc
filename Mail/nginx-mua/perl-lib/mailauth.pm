@@ -30,6 +30,12 @@ close(FD);
 # MAP_FILE optionnel dans .env ; sinon valeur par défaut ci-dessous
 my $mapFile=$ENV{'MAP_FILE'} || "/etc/nginx/perl/lib/dom2srv.txt";
 
+# coupe-circuit global du tarpit pop3/imap (TARPIT_AFTER, dom2srv.txt) :
+# TARPIT_ENABLED=0 dans .env désactive le mécanisme entièrement, quelles que
+# soient les règles dom2srv.txt ; absent ou toute autre valeur = activé (défaut,
+# rétrocompatible avec les déploiements sans cette variable)
+my $tarpitEnabled = !(defined($ENV{'TARPIT_ENABLED'}) and $ENV{'TARPIT_ENABLED'} eq '0');
+
 my $sysHost=$ENV{'SYSLOG_SERVER'};
 my $sysPort=$ENV{'SYSLOG_PORT'};
 my $sysProto=$ENV{'SYSLOG_PROTO'};
@@ -284,24 +290,27 @@ sub handler {
     # tarpit pop3/imap : après échec réel (pas KILL, qui court-circuite ce bloc
     # entier), compte les échecs par IP cliente (voir %failsByIP ci-dessus) —
     # pas Auth-Login-Attempt, qui ne compte que dans la connexion en cours et
-    # ne voit donc jamais un client qui se reconnecte à chaque essai
-    my $clientIP = $r->header_in('Client-IP');
-    if($r->header_in('Auth-Protocol') =~ m/^(pop3|imap)$/) {
-      if($auth_ok==0) { $failsByIP{$clientIP}++; }
-      else             { delete $failsByIP{$clientIP}; }
-    }
+    # ne voit donc jamais un client qui se reconnecte à chaque essai.
+    # Tout ce bloc est court-circuité si TARPIT_ENABLED=0 dans .env.
+    if($tarpitEnabled) {
+      my $clientIP = $r->header_in('Client-IP');
+      if($r->header_in('Auth-Protocol') =~ m/^(pop3|imap)$/) {
+        if($auth_ok==0) { $failsByIP{$clientIP}++; }
+        else             { delete $failsByIP{$clientIP}; }
+      }
 
-    # si la règle définit TARPIT_AFTER et que ce compteur l'a dépassé —
-    # ralentit la réponse avant de renvoyer "Invalid login or password"
-    if($auth_ok==0
-       and defined($rules{$match}{'tarpitafter'})
-       and $r->header_in('Auth-Protocol') =~ m/^(pop3|imap)$/
-       and $failsByIP{$clientIP} >= $rules{$match}{'tarpitafter'}) {
-      # pas de syslog ici : le log TRACKER-Out final de handler() (plus bas)
-      # reprend ce $status une fois le sleep terminé, un 2e log ici ferait
-      # doublon (vérifié en conditions réelles, cf. commit)
-      $status='Tarpit delivered';
-      sleep($tarpitDelay);
+      # si la règle définit TARPIT_AFTER et que ce compteur l'a dépassé —
+      # ralentit la réponse avant de renvoyer "Invalid login or password"
+      if($auth_ok==0
+         and defined($rules{$match}{'tarpitafter'})
+         and $r->header_in('Auth-Protocol') =~ m/^(pop3|imap)$/
+         and $failsByIP{$clientIP} >= $rules{$match}{'tarpitafter'}) {
+        # pas de syslog ici : le log TRACKER-Out final de handler() (plus bas)
+        # reprend ce $status une fois le sleep terminé, un 2e log ici ferait
+        # doublon (vérifié en conditions réelles, cf. commit)
+        $status='Tarpit delivered';
+        sleep($tarpitDelay);
+      }
     }
   }
 
