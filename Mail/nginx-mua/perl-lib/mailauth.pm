@@ -47,6 +47,14 @@ our $auth_ok;
 # durée (s) du tarpit pop3/imap déclenché par TARPIT_AFTER (dom2srv.txt, 9e champ)
 my $tarpitDelay = 5;
 
+# compteur d'échecs pop3/imap par IP cliente, pour le tarpit TARPIT_AFTER.
+# En mémoire du worker nginx (pas de fichier/DB) : remis à zéro par IP dès un
+# succès, jamais par décroissance temporelle sinon ; perdu au reload/redémarrage
+# de nginx ; pas partagé entre workers si worker_processes > 1 (approximatif
+# dans ce cas, mais suffisant comme dissuasion — fail2ban reste l'autorité pour
+# le bannissement IP réel, cf. section fail2ban du README)
+my %failsByIP;
+
 sub handler {
   my $r = shift;
 
@@ -274,13 +282,21 @@ sub handler {
     #    }
 
     # tarpit pop3/imap : après échec réel (pas KILL, qui court-circuite ce bloc
-    # entier), si la règle définit TARPIT_AFTER et que le nombre d'essais sur
-    # CETTE connexion (Auth-Login-Attempt, fourni par nginx) l'a dépassé —
+    # entier), compte les échecs par IP cliente (voir %failsByIP ci-dessus) —
+    # pas Auth-Login-Attempt, qui ne compte que dans la connexion en cours et
+    # ne voit donc jamais un client qui se reconnecte à chaque essai
+    my $clientIP = $r->header_in('Client-IP');
+    if($r->header_in('Auth-Protocol') =~ m/^(pop3|imap)$/) {
+      if($auth_ok==0) { $failsByIP{$clientIP}++; }
+      else             { delete $failsByIP{$clientIP}; }
+    }
+
+    # si la règle définit TARPIT_AFTER et que ce compteur l'a dépassé —
     # ralentit la réponse avant de renvoyer "Invalid login or password"
     if($auth_ok==0
        and defined($rules{$match}{'tarpitafter'})
        and $r->header_in('Auth-Protocol') =~ m/^(pop3|imap)$/
-       and $r->header_in('Auth-Login-Attempt') >= $rules{$match}{'tarpitafter'}) {
+       and $failsByIP{$clientIP} >= $rules{$match}{'tarpitafter'}) {
       $status='Tarpit delivered';
       syslog('info', join(';',$trackerF2b."-Out",
           $auth_ok,
