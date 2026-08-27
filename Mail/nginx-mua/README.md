@@ -52,6 +52,26 @@ Variables lues par `docker-compose.yml` :
 | `SYSLOG_SERVER`, `SYSLOG_PORT`, `SYSLOG_PROTO` | destination syslog pour les logs d'auth |
 | `TRACKER_F2B`, `TRACKER_LOG` | tags utilisés dans les lignes de log (à filtrer côté fail2ban/log parsing) |
 
+Exemple :
+
+```dotenv
+SITE=mail.mondomaine.example
+IMNG=1.25.3
+EXPOPOP3=203.0.113.10:110
+EXPOPOP3S=203.0.113.10:995
+EXPOIMAP=203.0.113.10:143
+EXPOIMAPS=203.0.113.10:993
+EXPOSMTP=203.0.113.10:587
+EXPOWWW=203.0.113.10:80
+DOPATH=/home/_Dockers/mail.mondomaine.example
+DOPATHLETS=/etc/letsencrypt
+SYSLOG_SERVER=172.17.0.1
+SYSLOG_PORT=514
+SYSLOG_PROTO=udp
+TRACKER_F2B=TRACKER
+TRACKER_LOG=MUA-LOG
+```
+
 ### `dom2srv.txt` (monté dans `perl-lib/`, lu par `mailauth.pm`)
 
 Une règle par ligne, format :
@@ -65,6 +85,26 @@ MATCH ; SMTP_HOST[:PORT] ; POP3_HOST[:PORT] ; IMAP_HOST[:PORT] ; LOGIN_IN ; LOGI
 - `LOGIN_IN`/`LOGIN_OUT` et `PASS_IN`/`PASS_OUT` : paire regex `s/IN/OUT/` appliquée au login et au mot de passe avant transmission au backend (ex. réécrire un alias en adresse réelle). Optionnel — laisser vide si pas de réécriture.
 - `SMTP_HOST = KILL` : au lieu de router, déclenche un tarpit — boucle de `sleep(3)` (répétée `POP3_PORT` fois) avec log à chaque itération, sans jamais authentifier. Sert à ralentir/bannir un motif de login ciblé (ex. scanners, comptes bruteforcés) sans bloquer nginx pour les autres clients.
 - Caractères interdits dans les mots de passe (alias de compte) : `+ % ^ $ * )`.
+
+Exemple :
+
+```
+# MATCH                  ; SMTP HOST         ; POP3 HOST         ; IMAP HOST         ; LOGIN IN                 ; LOGIN OUT ; PASS IN ; PASS OUT
+
+# Routage simple, tous les comptes de exemple1.example vers le même backend
+@exemple1\.example$      ; 10.0.10.9:25      ; 10.0.10.9:110      ; 10.0.10.9:143      ;
+
+# Réécriture d'alias : jdupont@exemple2.example -> jean.dupont@exemple2.example côté backend
+^jdupont@exemple2\.example$ ; 10.0.20.5:25   ; 10.0.20.5:110      ; 10.0.20.5:143      ; jdupont   ; jean.dupont
+
+# Tarpit : bloque/ralentit tout login commençant par "admin" (scan/bruteforce), 5 itérations de sleep(3)
+^admin                   ; KILL:5            ;                    ;                    ;
+
+# Règle par défaut (dernière ligne, sert de filet si aucun MATCH précédent ne correspond)
+*                        ; 172.17.0.1:2535   ; 172.17.0.1:110     ; 172.17.0.1:143     ;
+```
+
+Sur une règle `KILL`, le port du champ `SMTP_HOST` (ici `KILL:5`) est lu comme le nombre d'itérations du tarpit, pas comme un numéro de port.
 
 ### `conf.d/`
 
