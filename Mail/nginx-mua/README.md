@@ -51,6 +51,7 @@ Variables lues par `docker-compose.yml` :
 | `DOPATHLETS` | chemin hôte de `/etc/letsencrypt` (certs) |
 | `SYSLOG_SERVER`, `SYSLOG_PORT`, `SYSLOG_PROTO` | destination syslog pour les logs d'auth |
 | `TRACKER_F2B`, `TRACKER_LOG` | tags utilisés dans les lignes de log (à filtrer côté fail2ban/log parsing) |
+| `MAP_FILE` | *(optionnel)* chemin du fichier de règles lu par `mailauth.pm`, défaut `/etc/nginx/perl/lib/dom2srv.txt` (= `dom2srv.txt` monté dans `perl-lib/`) |
 
 Exemple :
 

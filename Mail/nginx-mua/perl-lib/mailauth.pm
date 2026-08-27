@@ -13,12 +13,11 @@ use Sys::Syslog qw(:standard :macros setlogsock);  # standard functions & macros
 use Net::POP3;
 use Env;
 
-my $mapFile="/etc/nginx/perl/lib/dom2srv.txt";
 my $envFile="/usr/local/etc/environment";
 
 # parsing manuel de .env (monté en lecture dans le conteneur) : %ENV du process
 # reste celui de nginx, ce hash local ($ENV, pas la variable spéciale Perl) porte
-# la config applicative (SYSLOG_*, TRACKER_*, SITE)
+# la config applicative (SYSLOG_*, TRACKER_*, SITE, MAP_FILE)
 my $ENV={};
 open(FD,"<",$envFile);
 while(<FD>) {
@@ -27,6 +26,9 @@ while(<FD>) {
     $ENV{$envKey}=$envValue;
     }
 close(FD);
+
+# MAP_FILE optionnel dans .env ; sinon valeur par défaut ci-dessous
+my $mapFile=$ENV{'MAP_FILE'} || "/etc/nginx/perl/lib/dom2srv.txt";
 
 my $sysHost=$ENV{'SYSLOG_SERVER'};
 my $sysPort=$ENV{'SYSLOG_PORT'};
