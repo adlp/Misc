@@ -53,6 +53,7 @@ Variables lues par `docker-compose.yml` :
 | `TRACKER_F2B`, `TRACKER_LOG` | tags utilisés dans les lignes de log (à filtrer côté fail2ban/log parsing) |
 | `MAP_FILE` | *(optionnel)* chemin du fichier de règles lu par `mailauth.pm`, défaut `/etc/nginx/perl/lib/dom2srv.txt` (= `dom2srv.txt` monté dans `perl-lib/`) |
 | `TARPIT_ENABLED` | *(optionnel)* coupe-circuit global du tarpit pop3/imap (`TARPIT_AFTER`, cf. `dom2srv.txt`) : `0` le désactive entièrement, quelles que soient les règles. Absent/autre valeur = activé (défaut) |
+| `QUEUE_FLUSH_INTERVAL` | *(optionnel, service `smtp`/pf-mua uniquement)* intervalle en secondes entre deux `postqueue -f` (`run.sh`, cf. `src/Dockerfile-pf`). Défaut `300` si absent |
 
 Exemple :
 
@@ -74,6 +75,7 @@ TRACKER_F2B=TRACKER
 TRACKER_LOG=MUA-LOG
 MAP_FILE=/etc/nginx/perl/lib/dom2srv.txt
 TARPIT_ENABLED=1
+QUEUE_FLUSH_INTERVAL=300
 ```
 
 ### `dom2srv.txt` (monté dans `perl-lib/`, lu par `mailauth.pm`)
@@ -157,7 +159,7 @@ Bind-mounts de `/etc/postfix` et `/var/spool/postfix` du service `smtp`. Persist
 
 **Logs Postfix** : `main.cf` fixe `maillog_file = /dev/stdout` — Postfix (≥3.4) n'appelle pas `syslog(3)`, il écrit directement sur le stdout du conteneur, mais en reproduisant lui-même le format syslog traditionnel (`<horodatage> <hostname> <programme>[<pid>]: <message>`), un tag par sous-processus (`postfix/smtpd[...]:`, `postfix/qmgr[...]:`, etc.). Ce tag interne vient de `syslog_name` dans `main.cf` — absent ici, donc défaut `postfix`. Le service `smtp` de `docker-compose.yml` renvoie ensuite ce stdout via le driver `syslog` de Docker (`tag: "pf-${SITE}"`), qui enveloppe la ligne (déjà taguée par Postfix) dans son propre envoi syslog. Deux tags superposés côté récepteur : `pf-${SITE}` en tag syslog externe (RFC3164 APP-NAME), `postfix/<sous-processus>` à l'intérieur du message. Pour changer le tag interne Postfix, ajouter `syslog_name = ...` dans `main.cf`.
 
-**Flush périodique de la queue** : `src/Dockerfile-pf` (`run.sh`) lance en arrière-plan `while true; do sleep 300; postqueue -f; done` avant `postfix start-fg` — force une tentative de livraison de tous les messages en attente toutes les 5 min, plutôt que d'attendre le backoff naturel de Postfix (`queue_run_delay`, 300s par défaut aussi, mais qui respecte le délai individuel de chaque message au lieu de forcer une tentative immédiate). Validé en conditions réelles (image `local/postfix` buildée depuis ce Dockerfile, `relayhost` volontairement injoignable) : chaque cycle de flush déclenche bien une nouvelle tentative de connexion immédiate sur le message en attente. Intervalle en dur dans le script (300s) — modifier `run.sh` dans `Dockerfile-pf` pour changer.
+**Flush périodique de la queue** : `src/Dockerfile-pf` (`run.sh`) lance en arrière-plan `while true; do sleep "${QUEUE_FLUSH_INTERVAL:-300}"; postqueue -f; done` avant `postfix start-fg` — force une tentative de livraison de tous les messages en attente à cet intervalle, plutôt que d'attendre le backoff naturel de Postfix (`queue_run_delay`, 300s par défaut aussi, mais qui respecte le délai individuel de chaque message au lieu de forcer une tentative immédiate). Intervalle configurable via `QUEUE_FLUSH_INTERVAL` dans `.env` (défaut `300`) — nécessite `env_file: .env` sur le service `smtp` de `docker-compose.yml` (déjà en place). Validé en conditions réelles (image `local/postfix` buildée depuis ce Dockerfile, `relayhost` volontairement injoignable) : chaque cycle de flush déclenche bien une nouvelle tentative de connexion immédiate sur le message en attente, et l'intervalle réellement observé correspond à la valeur passée (défaut comme override).
 
 ## Fonctionnement (flux d'une connexion)
 

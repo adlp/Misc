@@ -44,6 +44,8 @@ services:
     restart: unless-stopped
     hostname: pf-${SITE}
     container_name: pf-${SITE}
+    env_file:
+        - .env
     ports:
         - 172.17.0.1:2535:25
     volumes:

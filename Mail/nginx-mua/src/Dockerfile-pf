@@ -25,8 +25,8 @@ test -e /etc/mailname || echo Creating /etc/mailname\n\
 test -e /etc/mailname || /usr/bin/hostname >/etc/mailname\n\
 echo Compiling\n\
 /usr/bin/newaliases\n\
-echo Starting periodic queue flush every 300s\n\
-( while true; do sleep 300; /usr/sbin/postqueue -f; done ) &\n\
+echo Starting periodic queue flush every ${QUEUE_FLUSH_INTERVAL:-300}s\n\
+( while true; do sleep "${QUEUE_FLUSH_INTERVAL:-300}"; /usr/sbin/postqueue -f; done ) &\n\
 echo Running\n\
 /usr/sbin/postfix start-fg\n\
 \n\
