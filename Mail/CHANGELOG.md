@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- `src/Dockerfile-pf` : flush périodique de la queue Postfix (`postqueue -f` toutes les 300s en arrière-plan dans `run.sh`) — force une tentative de livraison immédiate des messages en attente au lieu du seul backoff naturel de Postfix. Validé en conditions réelles (image `local/postfix` buildée depuis ce Dockerfile, `relayhost` injoignable) : chaque cycle déclenche bien une nouvelle tentative de connexion sur le message en attente
 - `conf.d/mail.conf` : `xclient on` sur les blocs SMTP (465/587) — appliqué et **validé en conditions réelles de bout en bout** (conteneur `nginx:1.25.3-perl` + vraie image `local/postfix` buildée depuis `src/Dockerfile-pf` + vrai `mailauth.pm`/`dom2srv.txt`) : soumission SMTP réelle acceptée et mise en queue par le vrai Postfix, `Client-IP` identique entre les logs `mailauth.pm` et les logs pf-mua (XCLIENT propage bien la valeur), `error_log` sans erreur. Sûr uniquement parce que la soumission est routée vers pf-mua (qui trust XCLIENT), jamais vers un backend non confirmé
 - `perl-lib/dom2srv.txt` : exemple de règle (commentée) routant `SMTP_HOST` vers pf-mua (`172.17.0.1:2535`) ; en-tête mis à jour avec le 9e champ `TARPIT_AFTER` (oublié précédemment)
 - `etc+postfix/main.cf` : commentaire sur `relayhost` rappelant de le pointer vers le vrai backend final avant déploiement
