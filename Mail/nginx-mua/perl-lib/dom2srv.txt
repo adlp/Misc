@@ -1,4 +1,12 @@
-# MATCH ; SMTP HOST; POP3 HOST ; IMAP HOST ; LOGIN IN ; LOGIN OUT; PASS IN ; PASS OUT
-#  0    ;    1     ;    2      ;     3     ;     4    ;    5     ;    6    ;   7
+# MATCH ; SMTP HOST; POP3 HOST ; IMAP HOST ; LOGIN IN ; LOGIN OUT; PASS IN ; PASS OUT ; TARPIT_AFTER
+#  0    ;    1     ;    2      ;     3     ;     4    ;    5     ;    6    ;   7      ;    8
 # Sur les parties host, on peut specifier le port cible en mettant des IP:PORT
 # Le SMTP cible ne doit pas demander d'auth
+# TARPIT_AFTER (optionnel) : voir README, section dom2srv.txt
+
+# SMTP routé vers pf-mua (service `smtp` local, xclient on/off dans mail.conf
+# n'est sûr que si TOUT le SMTP passe par ici — voir README, section "pf-mua
+# comme tampon de soumission"). pf-mua relaie ensuite vers le backend final
+# via relayhost (etc+postfix/main.cf). POP3/IMAP restent routés directement
+# vers le backend réel (pf-mua ne fait pas de POP3/IMAP).
+#example\.example$;172.17.0.1:2535;10.0.0.1:110;10.0.0.1:143;;;;
