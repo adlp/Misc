@@ -174,4 +174,5 @@ Filtre non vérifié avec `fail2ban-regex` sur un serveur réel (juste une regex
 - La validation d'auth passe toujours par POP3, même pour IMAP/SMTP — un backend POP3 down/mal configuré bloque l'auth des trois protocoles pour les comptes de la règle concernée.
 - Le mécanisme `KILL` bloque le worker nginx-perl le temps du tarpit (`sleep` synchrone) — dimensionner selon le volume d'attaque attendu.
 - Les mots de passe transitent en clair entre `mailauth.pm` et le backend POP3 (pas de TLS sur cette connexion interne) — acceptable seulement si le backend est sur un réseau de confiance (Docker bridge / LAN).
+- `xclient off` sur les blocs SMTP (`conf.d/mail.conf`, 465/587) : le backend ne voit jamais l'IP du client réel, seulement celle de nginx-mua — gêne le diagnostic (ex. "lost connection after DATA" côté backend). Pistes documentées en commentaire dans `mail.conf` (`xclient on` + prérequis backend, `timeout` 587 à ajuster) — pas encore appliquées.
 - Voir aussi `../CLAUDE.md` pour les fichiers à ne jamais committer tels quels (`.env`, `dom2srv.txt` réels, spool Postfix).
