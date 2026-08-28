@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 ### Added
+- `etc+postfix/main.cf` : `smtpd_authorized_xclient_hosts = $mynetworks` — fait confiance à XCLIENT depuis les réseaux déjà trustés (exemple/local ; le backend réel en prod, un Zimbra externe, nécessite sa propre config vérifiée séparément)
+- `nginx-mua/README.md` : section détaillant le mécanisme XCLIENT (déroulé protocolaire, ce qui est visible ou non dans les logs backend une fois activé) et l'alternative PROXY protocol
 - `conf.d/mail.conf` : commentaires diagnostic (non appliqués) sur `xclient off` (backend ne voit pas l'IP client réelle, prérequis Zimbra `smtpd_authorized_xclient_hosts` côté backend) et `timeout` du bloc 587 (ajustable si coupures "lost connection after DATA" viennent du proxy plutôt que du client), reportés dans `README.md`
 - `nginx-mua/README.md` : documente le double tag syslog Postfix (`syslog_name` interne via `maillog_file`, puis tag Docker `pf-${SITE}`)
 - `perl-lib/mailauth.pm` : coupe-circuit global `TARPIT_ENABLED` (`.env`) pour le tarpit pop3/imap — `0` désactive le mécanisme entièrement quelles que soient les règles `dom2srv.txt` ; absent/autre valeur = activé (défaut, rétrocompatible)

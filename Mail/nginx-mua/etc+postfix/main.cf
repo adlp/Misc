@@ -41,6 +41,12 @@ alias_database = hash:/etc/aliases
 mydestination = $myhostname, localhost, localhost.localdomain, localhost
 relayhost = 8.8.8.8:25
 mynetworks = 127.0.0.0/8 [::ffff:127.0.0.0]/104 [::1]/128 172.16.0.0/12 192.168.0.0/16
+# accepte la commande XCLIENT (voir README, section "xclient/PROXY protocol")
+# depuis les mêmes réseaux déjà trustés par mynetworks — permet à un proxy
+# amont (nginx-mua) de faire passer l'IP réelle du client pour les logs/
+# smtpd_*_restrictions de CE Postfix. $mynetworks est la valeur recommandée
+# par la doc Postfix (XCLIENT_README) pour ce cas d'usage.
+smtpd_authorized_xclient_hosts = $mynetworks
 mailbox_size_limit = 0
 recipient_delimiter = +
 inet_interfaces = all

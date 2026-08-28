@@ -122,6 +122,21 @@ Sur une règle `KILL`, le port du champ `SMTP_HOST` (ici `KILL:5`) est lu comme 
 
 **Logs nginx** : `nginx.conf` fixe `error_log /dev/stderr info;` — capté par le driver `syslog` du service `nginx-mua` (`docker-compose.yml`, `tag: "${SITE}"`), même principe que `maillog_file` côté Postfix ci-dessous. Utile pour voir, par exemple, un timeout `587`/`465` (cf. `timeout` dans `mail.conf`) qui coupe une connexion côté proxy — ça se distingue d'une coupure faite par le vrai client, invisible pour nginx.
 
+**xclient / PROXY protocol : transmettre l'IP réelle au backend** (`xclient off` actuellement sur les blocs SMTP, voir commentaires dans `mail.conf`) — sans ça, le backend ne voit que l'IP de nginx-mua, jamais celle du client. Deux mécanismes existent pour ce problème (aucun n'est ni dans la trame TCP — impossible, la connexion vient bien de nginx-mua — ni dans le contenu du message) :
+
+- **XCLIENT** (celui référencé dans `mail.conf`) : une commande SMTP à part entière, envoyée par le proxy dans le dialogue de contrôle, *avant* `MAIL FROM` :
+  1. nginx-mua se connecte au backend en TCP (source = IP de nginx-mua, inévitable).
+  2. `EHLO` ; si le backend fait confiance à l'IP de nginx-mua (`smtpd_authorized_xclient_hosts`), il annonce la capacité `XCLIENT`.
+  3. nginx-mua envoie `XCLIENT ADDR=<ip client> NAME=[...] PROTO=SMTP HELO=...`.
+  4. Le backend **réinitialise le contexte de session** pour cette connexion : logs, `smtpd_*_restrictions`, en-tête `Received:` généré, tout se comporte ensuite comme si la connexion venait de cette IP — le socket TCP sous-jacent, lui, reste connecté à nginx-mua tout du long.
+  5. nginx-mua relance un `EHLO` puis `MAIL FROM`/`RCPT TO`/`DATA` normalement, sur la même connexion.
+
+  Équivalent SMTP du `X-Forwarded-For` HTTP, mais en verbe protocolaire plutôt qu'en en-tête. Configuré côté Postfix via `smtpd_authorized_xclient_hosts` (`etc+postfix/main.cf` de ce repo : `= $mynetworks`, valeur recommandée par la doc Postfix pour ce cas d'usage — un proxy sur un réseau déjà trusté). Le backend réel utilisé en prod ici est un **Zimbra externe** (hors de ce repo) : son Postfix (`main.cf`) est régénéré par `zmconfigd` à partir de LDAP — vérifier le mécanisme d'override propre à la version Zimbra avant d'y toucher, un edit à la main risque d'être écrasé.
+
+  **Ce qu'on voit dans les logs backend une fois activé** : la quasi-totalité des lignes (déconnexion, rejets, `Received:` du message) montrent l'IP réelle du client, pas celle de nginx-mua — c'est le but. Une seule ligne y échappe : le tout premier `connect from ...`, loggé à l'établissement de la connexion TCP, *avant* que XCLIENT soit traité — celle-là montre encore l'IP de nginx-mua. Un admin qui corrèle par PID de processus `smtpd` peut donc reconstituer qu'un proxy est passé par là, mais ce n'est pas visible en lecture rapide des logs, et ça ne gêne pas le diagnostic recherché ici (le "connect from" initial reste un repère fiable pour savoir que c'est bien nginx-mua qui a ouvert la connexion).
+
+- **PROXY protocol** (ligne commentée `#listen 587 proxy_protocol;` dans `mail.conf`) : alternative plus basse-niveau (haproxy-style) — un préfixe est ajouté au tout début du flux TCP brut, avant même la bannière SMTP, plutôt qu'un verbe applicatif envoyé après coup. Demande aussi un support explicite côté backend (différent de XCLIENT, pas interchangeable).
+
 ### `etc+postfix/` et `var+spool+postfix/`
 
 Bind-mounts de `/etc/postfix` et `/var/spool/postfix` du service `smtp`. Persistent la conf et le spool Postfix hors du conteneur. `src/Dockerfile-pf` embarque un squelette Postfix stock (tar.gz) et, au démarrage (`run.sh`), ne le décompresse dans ces dossiers que s'ils sont vides (`test -e master.cf || tar xzf ...`) — donc une fois initialisés, ces dossiers hôte font foi et le squelette embarqué dans l'image n'est plus utilisé. `var+spool+postfix/` (spool de messages, données utilisateur) est exclu du dépôt (`.gitignore`) ; dans `etc+postfix/`, seuls `main.cf`, `header_checks` et `sender_bcc` sont personnalisés, le reste est la config Postfix stock nécessaire au fonctionnement du paquet.
