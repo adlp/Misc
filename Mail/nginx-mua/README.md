@@ -120,6 +120,8 @@ Sur une règle `KILL`, le port du champ `SMTP_HOST` (ici `KILL:5`) est lu comme 
 - `mail.conf` : bloc `mail {}` nginx — certs TLS, `auth_http` pointant vers `mailauth.pm`, un `server {}` par protocole/port (465 SSL implicite, 587 STARTTLS, 110/995 POP3, 143/993 IMAP).
 - `http.conf` : bloc `http {}` minimal, sert uniquement à exposer `mailauth.pm` en local (`127.0.0.1:3615/auth`) via `ngx_http_perl_module` — jamais exposé publiquement.
 
+**Logs nginx** : `nginx.conf` fixe `error_log /dev/stderr info;` — capté par le driver `syslog` du service `nginx-mua` (`docker-compose.yml`, `tag: "${SITE}"`), même principe que `maillog_file` côté Postfix ci-dessous. Utile pour voir, par exemple, un timeout `587`/`465` (cf. `timeout` dans `mail.conf`) qui coupe une connexion côté proxy — ça se distingue d'une coupure faite par le vrai client, invisible pour nginx.
+
 ### `etc+postfix/` et `var+spool+postfix/`
 
 Bind-mounts de `/etc/postfix` et `/var/spool/postfix` du service `smtp`. Persistent la conf et le spool Postfix hors du conteneur. `src/Dockerfile-pf` embarque un squelette Postfix stock (tar.gz) et, au démarrage (`run.sh`), ne le décompresse dans ces dossiers que s'ils sont vides (`test -e master.cf || tar xzf ...`) — donc une fois initialisés, ces dossiers hôte font foi et le squelette embarqué dans l'image n'est plus utilisé. `var+spool+postfix/` (spool de messages, données utilisateur) est exclu du dépôt (`.gitignore`) ; dans `etc+postfix/`, seuls `main.cf`, `header_checks` et `sender_bcc` sont personnalisés, le reste est la config Postfix stock nécessaire au fonctionnement du paquet.

@@ -16,6 +16,7 @@
 - Commentaires dans `perl-lib/mailauth.pm` (logique de matching/catch-all, sémantique `KILL`, validation POP3 unique tous protocoles, ordre réécriture/validation)
 
 ### Changed
+- `nginx.conf` : `error_log` pointe sur `/dev/stderr` au lieu d'un fichier du conteneur — capté par le driver `syslog` du service `nginx-mua`, les erreurs (ex. timeout proxy 587/465) étaient invisibles jusqu'ici (pas de volume sur `/var/log/nginx`)
 - `perl-lib/mailauth.pm` : renomme variables peu parlantes (`@cdc`→`@fields`, `$cont`→`$keepSearching`, `%hash`→`%rules`, `$pop`→`$popClient`, `$mail_server`/`$mail_serpor`→`$popHost`/`$popPort`, `$key`/`$value`→`$envKey`/`$envValue`) — pas de changement de comportement
 
 ### Removed
