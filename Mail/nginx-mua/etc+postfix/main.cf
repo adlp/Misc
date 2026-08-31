@@ -34,6 +34,20 @@ smtp_tls_session_cache_database = btree:${data_directory}/smtp_scache
 
 
 smtpd_relay_restrictions = permit_mynetworks permit_sasl_authenticated defer_unauth_destination
+# vérifie le destinataire en direct auprès de relayhost (sonde RCPT TO, sans
+# livrer) avant d'accepter le message — le client (via nginx-mua) reçoit alors
+# la vraie erreur "550 no such user" etc. du backend final en direct, au lieu
+# d'un accept immédiat suivi d'un bounce (NDR) async à la vraie tentative de
+# livraison. Complète smtpd_relay_restrictions (autorisation de relayer),
+# pas un remplacement. Résultat mis en cache (address_verify_map, défaut
+# btree:$data_directory/verify_cache) pour éviter de sonder à chaque essai.
+# ⚠️ reject_unverified_recipient DOIT précéder permit_mynetworks/
+# permit_sasl_authenticated : Postfix évalue la liste dans l'ordre et s'arrête
+# au premier match définitif — nginx-mua se connecte depuis mynetworks (c'est
+# le trafic qu'on veut justement vérifier), donc un permit_mynetworks placé
+# avant court-circuiterait la vérification à chaque fois (bug vérifié en
+# conditions réelles avant correction : les deux ordres ont été testés).
+smtpd_recipient_restrictions = reject_unverified_recipient permit_mynetworks permit_sasl_authenticated permit
 myhostname = pf-mua.example.com
 alias_maps = hash:/etc/aliases
 alias_database = hash:/etc/aliases
