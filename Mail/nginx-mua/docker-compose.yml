@@ -51,6 +51,11 @@ services:
     volumes:
         - ${DOPATH}/etc+postfix:/etc/postfix
         - ${DOPATH}/var+spool+postfix:/var/spool/postfix
+        # cache apt persistant, utilisé seulement en mode buildless (voir
+        # README, section "Mode buildless") — inoffensif ici (mode build),
+        # ne jamais monter tout /opt (écraserait /opt/tgz baké dans l'image)
+        - ${DOPATH}/opt-apt-cache:/opt/apt-cache
+        - ${DOPATH}/opt-apt-lists:/opt/apt-lists
     logging:
         driver: "syslog"
         options:

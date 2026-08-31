@@ -1,11 +1,18 @@
 FROM ubuntu:22.04
 
+# mode build (classique) : postfix installé au build, squelette capturé dans
+# /opt/tgz pour restauration si les volumes /etc/postfix et/ou
+# /var/spool/postfix sont neufs au démarrage. Le même run.sh sait aussi
+# s'auto-installer au runtime si démarré sans avoir été buildé (mode
+# buildless, cf. README section dédiée) — voir run.sh pour la logique.
+
 RUN mkdir /opt/tgz
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends postfix \
     && rm -rf /var/lib/apt/lists/*
 
+RUN echo 'maillog_file = /dev/stdout' >>/etc/postfix/main.cf
 
 RUN tar czf /opt/tgz/etc+postfix.tgz /etc/postfix
 RUN tar czf /opt/tgz/var+spool+postfix.tgz /var/spool/postfix
@@ -13,25 +20,7 @@ RUN tar czf /opt/tgz/var+spool+postfix.tgz /var/spool/postfix
 RUN rm -rf /etc/postfix /var/spool/postfix
 RUN mkdir /etc/postfix /var/spool/postfix
 
-RUN echo 'maillog_file = /dev/stdout' >>/etc/postfix/main.cf
-
-RUN echo '#!/bin/bash\n\
-cd /\n\
-test -e /etc/postfix/master.cf  || echo Uncompressing etc\n\
-test -e /etc/postfix/master.cf  ||  tar xzf /opt/tgz/etc+postfix.tgz\n\
-test -e /var/spool/postfix/private/smtp || echo Uncompressing varspool\n\
-test -e /var/spool/postfix/private/smtp ||  tar xzf /opt/tgz/var+spool+postfix.tgz\n\
-test -e /etc/mailname || echo Creating /etc/mailname\n\
-test -e /etc/mailname || /usr/bin/hostname >/etc/mailname\n\
-echo Compiling\n\
-/usr/bin/newaliases\n\
-echo Starting periodic queue flush every ${QUEUE_FLUSH_INTERVAL:-300}s\n\
-( while true; do sleep "${QUEUE_FLUSH_INTERVAL:-300}"; /usr/sbin/postqueue -f; done ) &\n\
-echo Running\n\
-/usr/sbin/postfix start-fg\n\
-\n\
-' >/run.sh
-
+COPY run.sh /run.sh
 RUN chmod +x /run.sh
 
 CMD [ "/run.sh" ]
