@@ -9,6 +9,7 @@ mails.
 import argparse
 import base64
 import getpass
+import re
 import sys
 import time
 import warnings
@@ -22,12 +23,75 @@ warnings.filterwarnings("ignore", message=r"urllib3 \(.*\) or chardet \(.*\) doe
 import requests  # noqa: E402
 
 API_URL = "https://www.signal-spam.fr/api/signaler"
-__version__ = "1.1.0"
+__version__ = "1.2.0"
+
+HEADER_BODY_SPLIT_RE = re.compile(rb"\r\n\r\n|\n\n")
 
 
-def report_mail(session: requests.Session, login: str, password: str, eml_path: Path) -> tuple[bool, str]:
+def split_headers_body(raw: bytes) -> tuple[bytes, bytes, bytes]:
+    """Sépare un .eml en (bloc d'en-têtes, séparateur, corps)."""
+    match = HEADER_BODY_SPLIT_RE.search(raw)
+    if not match:
+        return raw, b"", b""
+    return raw[: match.start()], match.group(0), raw[match.end():]
+
+
+def parse_header_entries(header_block: bytes) -> list[bytes]:
+    """Découpe un bloc d'en-têtes en entrées, en recollant les lignes de continuation (repliement RFC 5322)."""
+    entries: list[bytes] = []
+    for line in header_block.splitlines(keepends=True):
+        if line[:1] in (b" ", b"\t") and entries:
+            entries[-1] += line
+        else:
+            entries.append(line)
+    return entries
+
+
+def _is_received(text: str) -> bool:
+    return text.split(":", 1)[0].strip().lower() == "received"
+
+
+def strip_relay_headers(raw: bytes, hide_ips: list[str]) -> tuple[bytes, list[tuple[str, str | None]]]:
+    """Retire les en-têtes Received correspondant aux IP de relais à cacher.
+
+    Retourne (nouveau .eml, liste de (en-tête supprimé, en-tête Received suivant révélé)),
+    cette dernière servant à l'affichage --dump-headers : l'en-tête "révélé" est celui du
+    hop précédent dans la chaîne (physiquement juste en dessous), c'est-à-dire l'IP qui
+    apparaissait juste derrière le relais caché.
+    """
+    header_block, sep, body = split_headers_body(raw)
+    if not sep:
+        return raw, []
+
+    ip_pattern = re.compile(
+        r"(?<![0-9.])(?:" + "|".join(re.escape(ip) for ip in hide_ips) + r")(?![0-9.])"
+    )
+
+    entries = parse_header_entries(header_block)
+    texts = [entry.decode("latin-1") for entry in entries]
+
+    kept_entries: list[bytes] = []
+    removals: list[tuple[str, str | None]] = []
+    for idx, (entry, text) in enumerate(zip(entries, texts)):
+        if _is_received(text) and ip_pattern.search(text):
+            revealed = next(
+                (t.rstrip("\r\n") for t in texts[idx + 1:] if _is_received(t)), None
+            )
+            removals.append((text.rstrip("\r\n"), revealed))
+        else:
+            kept_entries.append(entry)
+
+    new_raw = b"".join(kept_entries) + sep + body
+    return new_raw, removals
+
+
+def report_mail(
+    session: requests.Session, login: str, password: str, eml_path: Path, hide_ips: list[str]
+) -> tuple[bool, str]:
     """Signale un fichier .eml à signal-spam.fr. Retourne (succès, message)."""
     raw = eml_path.read_bytes()
+    if hide_ips:
+        raw, _ = strip_relay_headers(raw, hide_ips)
     encoded = base64.b64encode(raw).decode("ascii")
     try:
         resp = session.post(
@@ -42,6 +106,22 @@ def report_mail(session: requests.Session, login: str, password: str, eml_path: 
     if resp.status_code in (200, 202):
         return True, f"HTTP {resp.status_code}"
     return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+
+
+def dump_header_transformation(eml_path: Path, hide_ips: list[str]) -> None:
+    raw = eml_path.read_bytes()
+    _, removals = strip_relay_headers(raw, hide_ips)
+    if not removals:
+        print("    aucun en-tête Received ne correspond aux IP indiquées, rien à transformer")
+        return
+    for removed, revealed in removals:
+        print("    en-tête Received supprimé (relais caché) :")
+        print(f"      - {removed}")
+        if revealed:
+            print("    en-tête Received révélé juste derrière (origine réelle probable) :")
+            print(f"      + {revealed}")
+        else:
+            print("      (aucun en-tête Received derrière ce relais)")
 
 
 def main() -> int:
@@ -61,10 +141,23 @@ def main() -> int:
         "--dry-run", action="store_true",
         help="Liste les fichiers qui seraient signalés sans envoyer de requête",
     )
+    parser.add_argument(
+        "--hide-ip", action="append", default=None, metavar="IP",
+        help="IP de relais à retirer des en-têtes Received avant envoi (répétable), "
+             "pour laisser apparaître l'IP d'origine réelle du spam",
+    )
+    parser.add_argument(
+        "--dump-headers", action="store_true",
+        help="Avec --dry-run et --hide-ip: affiche la transformation des en-têtes Received sans envoyer",
+    )
     args = parser.parse_args()
 
     if not args.directory.is_dir():
         print(f"Erreur: {args.directory} n'est pas un répertoire.", file=sys.stderr)
+        return 1
+
+    if args.dump_headers and not args.dry_run:
+        print("Erreur: --dump-headers nécessite --dry-run.", file=sys.stderr)
         return 1
 
     password = args.password or getpass.getpass("Mot de passe signal-spam.fr: ")
@@ -79,6 +172,8 @@ def main() -> int:
     if args.dry_run:
         for path in eml_files:
             print(f"[dry-run] {path.name}")
+            if args.dump_headers and args.hide_ip:
+                dump_header_transformation(path, args.hide_ip)
         return 0
 
     ok_count = 0
@@ -88,7 +183,7 @@ def main() -> int:
     total = len(eml_files)
     for i, eml_path in enumerate(eml_files):
         progress = f"[{i + 1}/{total}]"
-        success, message = report_mail(session, args.login, password, eml_path)
+        success, message = report_mail(session, args.login, password, eml_path, args.hide_ip)
         if success:
             done_path = eml_path.with_suffix(eml_path.suffix + ".done")
             eml_path.rename(done_path)

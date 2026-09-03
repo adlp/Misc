@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.0
+  * Ajoute `--hide-ip` : retire des en-têtes `Received` l'IP d'un relais interne
+    avant envoi, pour faire apparaître la véritable origine du spam
+  * Ajoute `--dump-headers` (avec `--dry-run`) : affiche la transformation des
+    en-têtes `Received` sans envoyer
+  * Ajoute `.gitignore` (`*.eml`, `*.eml.done`, `__pycache__/`)
+
 ## 1.1.0
   * Ajoute un compteur de progression `[x/y]` devant chaque ligne OK/FAIL
 
