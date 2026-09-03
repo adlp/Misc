@@ -15,12 +15,12 @@ Options :
   * `--delay N` — délai en secondes entre deux signalements (défaut : 1.0)
   * `--version` — affiche la version
 
-Chaque mail signalé avec succès (HTTP 202) voit son fichier renommé de `.eml` en `.eml.done`, ce qui permet de relancer le script sans re-signaler les mêmes mails.
+Chaque mail signalé avec succès (HTTP 200 ou 202) voit son fichier renommé de `.eml` en `.eml.done`, ce qui permet de relancer le script sans re-signaler les mêmes mails.
 
 ## API signal-spam.fr
 
 Non documentée officiellement (reverse-engineering du plugin Thunderbird) :
   * `POST https://www.signal-spam.fr/api/signaler`
   * Auth Basic avec login/mot de passe du compte signal-spam.fr
-  * Corps `multipart/form-data`, champ `message` = contenu brut du `.eml`
-  * Succès = HTTP 202
+  * Corps formulaire, champ `message` = contenu du `.eml` encodé en base64
+  * Succès = HTTP 200 ou 202

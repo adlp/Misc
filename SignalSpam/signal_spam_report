@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Signale en masse des mails .eml à signal-spam.fr via son API.
 
-Chaque fichier .eml signalé avec succès (HTTP 202) est renommé en .eml.done
-pour permettre de relancer le script sans re-signaler les mêmes mails.
+Chaque fichier .eml signalé avec succès (HTTP 200 ou 202) est renommé en
+.eml.done pour permettre de relancer le script sans re-signaler les mêmes
+mails.
 """
 
 import argparse
+import base64
 import getpass
 import sys
 import time
@@ -14,24 +16,25 @@ from pathlib import Path
 import requests
 
 API_URL = "https://www.signal-spam.fr/api/signaler"
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 
 def report_mail(session: requests.Session, login: str, password: str, eml_path: Path) -> tuple[bool, str]:
     """Signale un fichier .eml à signal-spam.fr. Retourne (succès, message)."""
     raw = eml_path.read_bytes()
+    encoded = base64.b64encode(raw).decode("ascii")
     try:
         resp = session.post(
             API_URL,
             auth=(login, password),
-            files={"message": ("message", raw)},
+            data={"message": encoded},
             timeout=30,
         )
     except requests.RequestException as exc:
         return False, f"erreur réseau: {exc}"
 
-    if resp.status_code == 202:
-        return True, "202 Accepted"
+    if resp.status_code in (200, 202):
+        return True, f"HTTP {resp.status_code}"
     return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
 
 
