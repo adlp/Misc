@@ -18,7 +18,38 @@ Options :
     du dernier relais qui l'a transmis
   * `--dump-headers` — avec `--dry-run` et `--hide-ip` : affiche la transformation des
     en-têtes `Received` (supprimé / révélé) sans rien envoyer
+  * `--profile NOM` — section de `~/.signal-spam.fr.rc` à utiliser (défaut : section `[default]`)
   * `--version` — affiche la version
+
+## Fichier de configuration `~/.signal-spam.fr.rc` (optionnel)
+
+Format INI, une section par profil. Toute clé absente d'un profil est complétée par la
+section `[default]` (surcharge par section). Toute clé fournie en ligne de commande
+prend le pas sur la config, quel que soit le profil.
+
+```ini
+[default]
+login = ton@email.fr
+password = motdepasse
+directory = /chemin/vers/mails
+hide_ip = 8.8.8.8, 9.9.9.9
+
+[travail]
+login = travail@email.fr
+directory = /chemin/vers/mails-travail
+```
+
+Sans `--profile`, la section `[default]` est utilisée telle quelle — c'est elle qui
+permet l'appel sans aucun paramètre (`python3 signal_spam_report`). Avec
+`--profile travail`, `login` et `directory` sont ceux de `[travail]`, `password` et
+`hide_ip` sont hérités de `[default]`.
+
+Toutes les clés sont optionnelles et individuellement surchargeables en ligne de
+commande (`-u`, `-p`, `directory` positionnel, `--hide-ip`). Le fichier lui-même est
+optionnel : sans lui, `-u`/le répertoire redeviennent obligatoires en ligne de commande.
+
+Le fichier peut contenir un mot de passe en clair : `chmod 600 ~/.signal-spam.fr.rc`
+(un avertissement est affiché sinon).
 
 ### Exemple : masquer un relais interne
 

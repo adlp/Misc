@@ -8,8 +8,10 @@ mails.
 
 import argparse
 import base64
+import configparser
 import getpass
 import re
+import stat
 import sys
 import time
 import warnings
@@ -23,7 +25,9 @@ warnings.filterwarnings("ignore", message=r"urllib3 \(.*\) or chardet \(.*\) doe
 import requests  # noqa: E402
 
 API_URL = "https://www.signal-spam.fr/api/signaler"
-__version__ = "1.2.0"
+__version__ = "1.3.0"
+
+CONFIG_PATH = Path.home() / ".signal-spam.fr.rc"
 
 HEADER_BODY_SPLIT_RE = re.compile(rb"\r\n\r\n|\n\n")
 
@@ -124,14 +128,55 @@ def dump_header_transformation(eml_path: Path, hide_ips: list[str]) -> None:
             print("      (aucun en-tête Received derrière ce relais)")
 
 
+def load_config(profile: str | None, config_path: Path = CONFIG_PATH) -> dict[str, str]:
+    """Charge la configuration effective depuis config_path.
+
+    Sans --profile, renvoie la section [default] (fallback pour toutes les
+    autres sections, via configparser). Avec --profile NOM, renvoie la
+    section NOM, dont les clés absentes sont complétées par [default].
+    Fichier absent : renvoie {} (config totalement optionnelle), sauf si un
+    profil précis est demandé, auquel cas c'est une erreur.
+    """
+    if not config_path.exists():
+        if profile:
+            print(f"Erreur: fichier de configuration {config_path} introuvable (profil {profile!r} demandé).", file=sys.stderr)
+            sys.exit(1)
+        return {}
+
+    mode = config_path.stat().st_mode
+    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        print(
+            f"Attention: {config_path} est accessible à d'autres utilisateurs "
+            f"(peut contenir un mot de passe en clair) — chmod 600 {config_path} recommandé.",
+            file=sys.stderr,
+        )
+
+    parser = configparser.ConfigParser(default_section="default")
+    parser.read(config_path)
+
+    if profile:
+        if not parser.has_section(profile):
+            print(f"Erreur: profil {profile!r} absent de {config_path}.", file=sys.stderr)
+            sys.exit(1)
+        return dict(parser[profile])
+    return dict(parser.defaults())
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Signale des mails .eml à signal-spam.fr")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    parser.add_argument("directory", type=Path, help="Répertoire contenant les fichiers .eml")
-    parser.add_argument("-u", "--login", required=True, help="Identifiant (email) signal-spam.fr")
+    parser.add_argument(
+        "directory", type=Path, nargs="?", default=None,
+        help="Répertoire contenant les fichiers .eml (surcharge 'directory' de la config)",
+    )
+    parser.add_argument(
+        "-u", "--login", default=None,
+        help="Identifiant (email) signal-spam.fr (surcharge 'login' de la config)",
+    )
     parser.add_argument(
         "-p", "--password", default=None,
-        help="Mot de passe signal-spam.fr (demandé de façon interactive si omis)",
+        help="Mot de passe signal-spam.fr (surcharge 'password' de la config; "
+             "demandé de façon interactive si toujours absent)",
     )
     parser.add_argument(
         "--delay", type=float, default=1.0,
@@ -144,27 +189,46 @@ def main() -> int:
     parser.add_argument(
         "--hide-ip", action="append", default=None, metavar="IP",
         help="IP de relais à retirer des en-têtes Received avant envoi (répétable), "
-             "pour laisser apparaître l'IP d'origine réelle du spam",
+             "pour laisser apparaître l'IP d'origine réelle du spam "
+             "(surcharge 'hide_ip' de la config)",
     )
     parser.add_argument(
         "--dump-headers", action="store_true",
         help="Avec --dry-run et --hide-ip: affiche la transformation des en-têtes Received sans envoyer",
     )
+    parser.add_argument(
+        "--profile", metavar="NOM", default=None,
+        help=f"Section de {CONFIG_PATH} à utiliser (défaut: section [default] si le fichier existe)",
+    )
     args = parser.parse_args()
 
-    if not args.directory.is_dir():
-        print(f"Erreur: {args.directory} n'est pas un répertoire.", file=sys.stderr)
+    config = load_config(args.profile)
+
+    login = args.login or config.get("login")
+    if not login:
+        parser.error("--login requis (ou clé 'login' dans la configuration)")
+
+    directory = args.directory or (Path(config["directory"]) if config.get("directory") else None)
+    if directory is None:
+        parser.error("répertoire requis (argument positionnel, ou clé 'directory' dans la configuration)")
+
+    if not directory.is_dir():
+        print(f"Erreur: {directory} n'est pas un répertoire.", file=sys.stderr)
         return 1
 
     if args.dump_headers and not args.dry_run:
         print("Erreur: --dump-headers nécessite --dry-run.", file=sys.stderr)
         return 1
 
-    password = args.password or getpass.getpass("Mot de passe signal-spam.fr: ")
+    hide_ips = args.hide_ip or (
+        [ip.strip() for ip in config["hide_ip"].split(",") if ip.strip()] if config.get("hide_ip") else None
+    )
 
-    eml_files = sorted(args.directory.glob("*.eml"))
+    password = args.password or config.get("password") or getpass.getpass("Mot de passe signal-spam.fr: ")
+
+    eml_files = sorted(directory.glob("*.eml"))
     if not eml_files:
-        print(f"Aucun fichier .eml trouvé dans {args.directory}.")
+        print(f"Aucun fichier .eml trouvé dans {directory}.")
         return 0
 
     print(f"{len(eml_files)} mail(s) à signaler.")
@@ -172,8 +236,8 @@ def main() -> int:
     if args.dry_run:
         for path in eml_files:
             print(f"[dry-run] {path.name}")
-            if args.dump_headers and args.hide_ip:
-                dump_header_transformation(path, args.hide_ip)
+            if args.dump_headers and hide_ips:
+                dump_header_transformation(path, hide_ips)
         return 0
 
     ok_count = 0
@@ -183,7 +247,7 @@ def main() -> int:
     total = len(eml_files)
     for i, eml_path in enumerate(eml_files):
         progress = f"[{i + 1}/{total}]"
-        success, message = report_mail(session, args.login, password, eml_path, args.hide_ip)
+        success, message = report_mail(session, login, password, eml_path, hide_ips)
         if success:
             done_path = eml_path.with_suffix(eml_path.suffix + ".done")
             eml_path.rename(done_path)

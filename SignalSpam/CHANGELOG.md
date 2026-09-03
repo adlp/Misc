@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.0
+  * Ajoute le fichier de configuration optionnel `~/.signal-spam.fr.rc` (INI,
+    clés `login`/`password`/`directory`/`hide_ip`), avec section `[default]`
+    utilisée sans argument et surchargeable par section (`[default]` sert de
+    fallback à chaque profil) et par ligne de commande
+  * Ajoute `--profile NOM` pour choisir une section du fichier de config
+  * Avertit si le fichier de config est lisible par d'autres utilisateurs
+
 ## 1.2.0
   * Ajoute `--hide-ip` : retire des en-têtes `Received` l'IP d'un relais interne
     avant envoi, pour faire apparaître la véritable origine du spam
