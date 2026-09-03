@@ -116,3 +116,7 @@ Script bash similaire à `last` mais pour les clefs SSH.
 ## Zapiz
 ### zapiz.py
 Framework Python (FastAPI) pour exposer des fonctions Python en API REST avec authentification OIDC ou CSV, documentation Swagger auto-générée.
+
+## SignalSpam
+### signal_spam_report
+Script Python pour signaler en masse des mails `.eml` à signal-spam.fr (API non-officielle). Renomme en `.eml.done` chaque mail signalé avec succès.
