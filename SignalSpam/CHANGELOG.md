@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.2
+  * Masque le `RequestsDependencyWarning` (urllib3/chardet Debian trop
+    récents vs requests) au lancement
+
 ## 1.0.1
   * Corrige le signalement : le contenu du mail doit être encodé en base64
     et envoyé comme champ de formulaire classique, pas comme fichier

@@ -11,12 +11,18 @@ import base64
 import getpass
 import sys
 import time
+import warnings
 from pathlib import Path
 
-import requests
+# Debian empaquette des versions d'urllib3/chardet plus récentes que celles
+# supportées par python3-requests, ce qui déclenche un avertissement
+# inoffensif à l'import.
+warnings.filterwarnings("ignore", message=r"urllib3 \(.*\) or chardet \(.*\) doesn't match a supported version")
+
+import requests  # noqa: E402
 
 API_URL = "https://www.signal-spam.fr/api/signaler"
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 
 def report_mail(session: requests.Session, login: str, password: str, eml_path: Path) -> tuple[bool, str]:
