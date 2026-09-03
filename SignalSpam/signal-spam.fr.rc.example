@@ -1,0 +1,17 @@
+# Exemple de configuration pour signal_spam_report.
+# Copier vers ~/.signal-spam.fr.rc puis : chmod 600 ~/.signal-spam.fr.rc
+#
+# La section [default] est utilisée quand le script est lancé sans
+# --profile. Toute clé absente d'une autre section est complétée par
+# [default]. Toute option en ligne de commande (-u, -p, --hide-ip,
+# répertoire positionnel) prend le pas sur la config.
+
+[default]
+login = ton@email.fr
+password = motdepasse
+directory = /chemin/vers/mails
+hide_ip = 8.8.8.8, 9.9.9.9
+
+[travail]
+login = travail@email.fr
+directory = /chemin/vers/mails-travail

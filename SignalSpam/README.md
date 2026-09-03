@@ -25,19 +25,8 @@ Options :
 
 Format INI, une section par profil. Toute clé absente d'un profil est complétée par la
 section `[default]` (surcharge par section). Toute clé fournie en ligne de commande
-prend le pas sur la config, quel que soit le profil.
-
-```ini
-[default]
-login = ton@email.fr
-password = motdepasse
-directory = /chemin/vers/mails
-hide_ip = 8.8.8.8, 9.9.9.9
-
-[travail]
-login = travail@email.fr
-directory = /chemin/vers/mails-travail
-```
+prend le pas sur la config, quel que soit le profil. Exemple : `signal-spam.fr.rc.example`
+(à copier vers `~/.signal-spam.fr.rc`).
 
 Sans `--profile`, la section `[default]` est utilisée telle quelle — c'est elle qui
 permet l'appel sans aucun paramètre (`python3 signal_spam_report`). Avec
