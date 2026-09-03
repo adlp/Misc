@@ -1,5 +1,9 @@
 # Changelog — zimLocAccZam
 
+## fail2ban/ — 2026-09-03 (analyse tentative d'injection réelle)
+
+Documenté l'analyse d'un reject réel capté par `zimbra-postfix-submission` : payload d'injection de commande shell (`$(...)`, pas Shellshock) dans le `to=`, exécutant `id; hostname` et exfiltrant le résultat en base64 via GET HTTP vers un domaine `*.oast.online` (callback Interactsh, scan automatisé non ciblé). Postfix rejette avant DATA donc Zimbra ne voit jamais la valeur ; risque réel = tout script tiers qui interpolerait ce champ brut dans un shell en aval (milter, parseur de logs, webhook). Pas de changement de filtre nécessaire (déjà couvert). Voir `README.md` section "Abus postfix submission".
+
 ## fail2ban/ — 2026-09-03 (nouveau jail postfix submission)
 
 Ajout d'un troisième jail : `zimbra-postfix-submission`, sur les logs postfix (`postfix/submission/smtpd` port 587, `postfix/smtpd` classique inclus). Déclenché par 3 vraies lignes de prod : pipelining cassé juste après CONNECT (scanner/smuggling TLS), et deux rejects "Access denied" sur RCPT (un spam/relais classique, un avec tentative d'injection de commande façon Shellshock — payload base64 ciblant un callback OOB interactsh/oast.online). Une seule regex `NOQUEUE: reject: RCPT ... Access denied` couvre les deux cas de reject sans avoir à parser le payload. Pas de règle sur `Anonymous TLS connection established` seule (pas malveillant isolément). Vérifié en simulation Python : les 4 lignes réelles (pipelining, 2 rejects, TLS anonyme) se comportent comme attendu, et 2 lignes légitimes construites (accept SASL, reject "User unknown") ne matchent pas. `logpath` mis par défaut sur `/var/log/zimbra.log` (Debian/Ubuntu) mais **non confirmé** — postfix logue via syslog, pas dans `/opt/zimbra/log/`, donc à vérifier sur le serveur réel avant activation (RHEL/CentOS : `/var/log/maillog`). Comme les deux autres filtres, pas de `fail2ban-regex` réel disponible ici.

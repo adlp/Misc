@@ -113,6 +113,8 @@ Pourquoi c'est un signal fiable sur submission (587) : ce service n'accepte que 
 
 Faux positifs vérifiés (simulation Python) : ligne d'acceptation SASL légitime (`client=...sasl_username=...`) et reject "User unknown" (contenu, pas host-level) → aucun des deux ne matche.
 
+**Analyse d'une tentative réelle (2026-09-03)** : un des rejects observés portait un payload d'injection de commande dans le `to=` (pas du Shellshock — un `$(...)` shell générique). Décodage : `id; hostname` exécuté via `eval`, sortie encodée en base64 puis exfiltrée en GET HTTP vers un domaine `*.oast.online` (Interactsh, callback OOB utilisé par les scanners de vuln automatisés type nuclei — pas une attaque ciblée). Postfix rejette au stade RCPT (avant DATA), donc Zimbra/sieve/amavis ne voient jamais cette valeur : le danger n'est pas Zimbra lui-même mais tout outil tiers en aval (milter custom, parseur de logs/bounces, webhook/SIEM) qui interpolerait ce champ brut dans un `eval`/`os.system`/backtick shell au lieu d'un appel paramétré. Recommandations : auditer les scripts custom qui consomment `from=`/`to=`/`helo=` des logs postfix (jamais de shell interpolé, `shlex.quote` ou appel par liste d'arguments sinon) ; en défense en profondeur, bloquer en sortie les domaines `*.oast.online`/`*.burpcollaborator.net`/`*.dnslog.cn` si le firewall le permet. Le jail `zimbra-postfix-submission` ci-dessus bannit déjà l'IP source sur ce type de reject, aucun changement de filtre nécessaire pour ce cas.
+
 ## Versions
 
 Voir `CHANGELOG.md`.
