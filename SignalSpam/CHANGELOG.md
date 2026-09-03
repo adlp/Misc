@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.1.0
+  * Ajoute un compteur de progression `[x/y]` devant chaque ligne OK/FAIL
+
 ## 1.0.2
   * Masque le `RequestsDependencyWarning` (urllib3/chardet Debian trop
     récents vs requests) au lancement

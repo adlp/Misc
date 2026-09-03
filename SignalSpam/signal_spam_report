@@ -22,7 +22,7 @@ warnings.filterwarnings("ignore", message=r"urllib3 \(.*\) or chardet \(.*\) doe
 import requests  # noqa: E402
 
 API_URL = "https://www.signal-spam.fr/api/signaler"
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 
 def report_mail(session: requests.Session, login: str, password: str, eml_path: Path) -> tuple[bool, str]:
@@ -85,16 +85,18 @@ def main() -> int:
     fail_count = 0
     session = requests.Session()
 
+    total = len(eml_files)
     for i, eml_path in enumerate(eml_files):
+        progress = f"[{i + 1}/{total}]"
         success, message = report_mail(session, args.login, password, eml_path)
         if success:
             done_path = eml_path.with_suffix(eml_path.suffix + ".done")
             eml_path.rename(done_path)
             ok_count += 1
-            print(f"OK   {eml_path.name} -> {done_path.name}")
+            print(f"{progress} OK   {eml_path.name} -> {done_path.name}")
         else:
             fail_count += 1
-            print(f"FAIL {eml_path.name}: {message}", file=sys.stderr)
+            print(f"{progress} FAIL {eml_path.name}: {message}", file=sys.stderr)
 
         if i < len(eml_files) - 1 and args.delay > 0:
             time.sleep(args.delay)
