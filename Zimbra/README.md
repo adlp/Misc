@@ -95,6 +95,24 @@ puis `zmproxyctl restart`.
 
 Regex basée sur le format `combined` de nginx, corrigée suite à test sur une vraie ligne de prod (IP loggée en `IP:port`, requête parfois en URI absolue plutôt qu'en chemin relatif) — reste à valider avec `fail2ban-regex` en conditions réelles avant activation, comme pour le jail `audit.log`.
 
+### Abus postfix submission (`fail2ban/filter.d/zimbra-postfix-submission.conf`)
+
+Troisième jail, sur les logs postfix (`postfix/submission/smtpd`, port 587 — et `postfix/smtpd` classique par la même occasion, la regex couvre les deux) : bannit deux signatures d'abus vues en prod, indépendantes d'`audit.log`/`nginx.access.log`.
+
+- `improper command pipelining after CONNECT` : protocole cassé juste après connexion (scanner ou smuggling TLS envoyant du binaire brut au lieu de parler SMTP).
+- `NOQUEUE: reject: RCPT ... 554 5.7.1 ... Access denied` : rejet host-level (RBL/access map/postscreen, pas un souci de contenu type "User unknown"). Couvre aussi bien le spam/relais classique que les tentatives d'injection de commande (payload base64/Shellshock-like) dans le HELO ou l'adresse — la regex n'a pas besoin de parser le payload, seul le "Access denied" compte.
+
+Pas de règle sur `Anonymous TLS connection established` seule (ligne qui précède parfois le reject) : une négo TLS anonyme n'est pas malveillante en soi, c'est le reject qui suit qui est le signal et qui matche déjà via la deuxième regex.
+
+Pourquoi c'est un signal fiable sur submission (587) : ce service n'accepte que des clients authentifiés (SASL) ; un rejet host-level à ce stade ne peut venir que d'un client qui tente de relayer/injecter sans auth valide, jamais de trafic légitime.
+
+- `fail2ban/filter.d/zimbra-postfix-submission.conf` → `/etc/fail2ban/filter.d/`
+- `fail2ban/jail.d/zimbra-postfix-submission.conf` → `/etc/fail2ban/jail.d/`
+
+**⚠️ `logpath` à vérifier avant activation** : contrairement aux deux autres jails, postfix ne logue pas dans `/opt/zimbra/log/` mais via syslog (facility mail). Chemin mis par défaut à `/var/log/zimbra.log` (Debian/Ubuntu) — sur RHEL/CentOS/Rocky c'est `/var/log/maillog`. Confirmer avec `grep 'postfix/submission/smtpd' <fichier candidat>` et adapter `logpath` dans le jail. Comme les deux autres filtres, non testé avec `fail2ban-regex` sur un vrai serveur — à valider avant activation.
+
+Faux positifs vérifiés (simulation Python) : ligne d'acceptation SASL légitime (`client=...sasl_username=...`) et reject "User unknown" (contenu, pas host-level) → aucun des deux ne matche.
+
 ## Versions
 
 Voir `CHANGELOG.md`.
