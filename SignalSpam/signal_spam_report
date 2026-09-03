@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Signale en masse des mails .eml à signal-spam.fr via son API.
+
+Chaque fichier .eml signalé avec succès (HTTP 202) est renommé en .eml.done
+pour permettre de relancer le script sans re-signaler les mêmes mails.
+"""
+
+import argparse
+import getpass
+import sys
+import time
+from pathlib import Path
+
+import requests
+
+API_URL = "https://www.signal-spam.fr/api/signaler"
+__version__ = "1.0.0"
+
+
+def report_mail(session: requests.Session, login: str, password: str, eml_path: Path) -> tuple[bool, str]:
+    """Signale un fichier .eml à signal-spam.fr. Retourne (succès, message)."""
+    raw = eml_path.read_bytes()
+    try:
+        resp = session.post(
+            API_URL,
+            auth=(login, password),
+            files={"message": ("message", raw)},
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        return False, f"erreur réseau: {exc}"
+
+    if resp.status_code == 202:
+        return True, "202 Accepted"
+    return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Signale des mails .eml à signal-spam.fr")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("directory", type=Path, help="Répertoire contenant les fichiers .eml")
+    parser.add_argument("-u", "--login", required=True, help="Identifiant (email) signal-spam.fr")
+    parser.add_argument(
+        "-p", "--password", default=None,
+        help="Mot de passe signal-spam.fr (demandé de façon interactive si omis)",
+    )
+    parser.add_argument(
+        "--delay", type=float, default=1.0,
+        help="Délai en secondes entre deux signalements (défaut: 1.0)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Liste les fichiers qui seraient signalés sans envoyer de requête",
+    )
+    args = parser.parse_args()
+
+    if not args.directory.is_dir():
+        print(f"Erreur: {args.directory} n'est pas un répertoire.", file=sys.stderr)
+        return 1
+
+    password = args.password or getpass.getpass("Mot de passe signal-spam.fr: ")
+
+    eml_files = sorted(args.directory.glob("*.eml"))
+    if not eml_files:
+        print(f"Aucun fichier .eml trouvé dans {args.directory}.")
+        return 0
+
+    print(f"{len(eml_files)} mail(s) à signaler.")
+
+    if args.dry_run:
+        for path in eml_files:
+            print(f"[dry-run] {path.name}")
+        return 0
+
+    ok_count = 0
+    fail_count = 0
+    session = requests.Session()
+
+    for i, eml_path in enumerate(eml_files):
+        success, message = report_mail(session, args.login, password, eml_path)
+        if success:
+            done_path = eml_path.with_suffix(eml_path.suffix + ".done")
+            eml_path.rename(done_path)
+            ok_count += 1
+            print(f"OK   {eml_path.name} -> {done_path.name}")
+        else:
+            fail_count += 1
+            print(f"FAIL {eml_path.name}: {message}", file=sys.stderr)
+
+        if i < len(eml_files) - 1 and args.delay > 0:
+            time.sleep(args.delay)
+
+    print(f"\nTerminé: {ok_count} signalé(s), {fail_count} échec(s).")
+    return 0 if fail_count == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
