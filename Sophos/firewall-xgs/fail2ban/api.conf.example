@@ -10,7 +10,8 @@ group = Fail2Ban-Block
 # iplist = Fail2Ban-List
 # préfixe des noms IPHost créés par group (optionnel, défaut: f2b_)
 prefix = f2b_
-# jail fail2ban interrogée (requis pour ban/unban/sync)
+# jail(s) fail2ban interrogée(s) (requis pour ban/unban/sync)
+# plusieurs jails : séparées par des virgules, ex sshd,nginx-http-auth
 jail = sshd
 # chemin/nom du binaire fail2ban-client (optionnel, défaut: fail2ban-client)
 # fail2ban_client = fail2ban-client

@@ -1,4 +1,6 @@
 [nginx]
+# requis seulement pour start. Plusieurs jails : séparées par des
+# virgules, ex sshd,nginx-http-auth
 jail = sshd
 # fail2ban_client = fail2ban-client
 map_file = /etc/nginx/banned_ips.conf

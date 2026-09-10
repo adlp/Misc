@@ -267,8 +267,12 @@ Ajouter `--prefix <préfixe>` pour surcharger ponctuellement le préfixe
 des noms `IPHost` défini dans la config (défaut : `f2b_`, utilisé
 seulement avec `group`).
 
-Ajouter `--jail <nom>` pour surcharger ponctuellement la jail fail2ban
-définie dans la config (requis pour ban/unban/sync).
+Ajouter `--jail <nom>` pour surcharger ponctuellement la/les jail(s)
+fail2ban définie(s) dans la config (requis pour ban/unban/sync).
+Plusieurs jails : séparées par des virgules (`--jail
+sshd,nginx-http-auth,nginx-botsearch`, ou dans `jail = ...` en config) —
+une requête `fail2ban-client status` par jail, résultat = union des IP
+bannies (une IP présente dans plusieurs jails n'apparaît qu'une fois).
 
 Lister les IP actuellement bloquées dans le groupe (pas d'IP à fournir) :
 
@@ -385,7 +389,10 @@ juste l'IP concernée, idempotent (aucune écriture ni reload si l'IP est
 déjà dans l'état voulu). Seule l'action `start` interroge
 `fail2ban-client status <jail>` pour régénérer le fichier en entier
 (bootstrap ou resynchro complète) ; `jail` n'est donc requis que pour
-`start`. Verrou non-bloquant par IP identique à `sophos_fw_block.py`
+`start`. Plusieurs jails : séparées par des virgules (`jail =
+sshd,nginx-http-auth` en config, ou `--jail sshd,nginx-http-auth`) — une
+requête par jail, résultat = union des IP bannies. Verrou non-bloquant
+par IP identique à `sophos_fw_block.py`
 2.3.1 : un ban/unban déjà en cours pour une IP fait abandonner
 immédiatement tout appel concurrent pour cette même IP.
 

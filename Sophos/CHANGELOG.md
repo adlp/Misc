@@ -1,5 +1,22 @@
 # Changelog
 
+## firewall-xgs/fail2ban 2.6.0 (sophos_fw_block.py) / 1.2.0 (nginx_fw_block.py) — 2026-09-10
+
+### Added
+- Support de plusieurs jails fail2ban dans les deux scripts : la clé
+  `jail` (config ou `--jail`) accepte désormais une liste séparée par
+  des virgules (ex `jail = sshd,nginx-http-auth,nginx-botsearch`).
+  `get_banned_ips()` interroge `fail2ban-client status <jail>` une fois
+  par jail et retourne l'union des IP bannies (dédupliquée, ordre de
+  première apparition conservé) — une IP présente dans plusieurs jails
+  n'est poussée/écrite qu'une fois côté XGS/nginx. Nouvelle fonction
+  `parse_jails()` (dupliquée dans les deux scripts, cohérent avec le
+  choix déjà fait de les garder indépendants) pour le découpage/dédup.
+  `cfg["jail"]` est maintenant un tuple (plus une chaîne ou None) dans
+  les deux scripts — tout code interne l'affichant utilise
+  `",".join(cfg["jail"])`. Rétrocompatible : une seule jail dans `jail =
+  ...` continue de fonctionner à l'identique (tuple à 1 élément).
+
 ## firewall-xgs/fail2ban — 2026-08-25
 
 Config uniquement, aucun changement de script.

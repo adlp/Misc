@@ -12,7 +12,7 @@ Indépendant de sophos_fw_block.py (pas d'import croisé) : script
 autonome sans dépendance externe (stdlib uniquement), déployable seul.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import argparse
 import configparser
@@ -50,6 +50,16 @@ def setup_logging(debug=False, debug_timing=False):
     logger.addHandler(stderr)
 
 
+def parse_jails(raw):
+    """Découpe une valeur `jail` (config ou --jail) en tuple de noms de
+    jails, séparés par des virgules, espaces superflus tolérés, doublons
+    supprimés (ordre de première apparition conservé). Tuple vide si
+    `raw` est vide/None."""
+    if not raw:
+        return ()
+    return tuple(dict.fromkeys(j.strip() for j in raw.split(",") if j.strip()))
+
+
 def load_config(path):
     cp = configparser.ConfigParser()
     if not cp.read(path):
@@ -57,7 +67,7 @@ def load_config(path):
     try:
         sec = cp["nginx"]
         cfg = {
-            "jail": sec.get("jail", fallback=None) or None,
+            "jail": parse_jails(sec.get("jail", fallback=None)),
             "fail2ban_client": sec.get(
                 "fail2ban_client", fallback=DEFAULT_FAIL2BAN_CLIENT
             ),
@@ -77,31 +87,23 @@ def validate_ip(ip):
     return ip
 
 
-def get_banned_ips(cfg):
-    """IP actuellement bannies dans la jail configurée, via fail2ban-client.
-
-    Même logique/format attendu que sophos_fw_block.py (dupliqué
-    volontairement — script autonome sans dépendance croisée, voir
-    docstring du module).
-    """
-    if not cfg["jail"]:
-        raise SystemExit("jail requis dans la config (ou --jail) pour interroger fail2ban")
-    cmd = [cfg["fail2ban_client"], "status", cfg["jail"]]
+def _get_banned_ips_for_jail(cfg, jail):
+    cmd = [cfg["fail2ban_client"], "status", jail]
     t0 = time.monotonic()
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
     except FileNotFoundError:
         raise RuntimeError(f"{cfg['fail2ban_client']} introuvable (PATH ?)")
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"fail2ban-client status {cfg['jail']} : timeout")
+        raise RuntimeError(f"fail2ban-client status {jail} : timeout")
     finally:
         if DEBUG_TIMING:
             logging.debug(
-                "[timing] fail2ban-client status %s : %.3fs", cfg["jail"], time.monotonic() - t0
+                "[timing] fail2ban-client status %s : %.3fs", jail, time.monotonic() - t0
             )
     if result.returncode != 0:
         raise RuntimeError(
-            f"fail2ban-client status {cfg['jail']} a échoué (jail inconnue ?): "
+            f"fail2ban-client status {jail} a échoué (jail inconnue ?): "
             f"{result.stderr.strip()}"
         )
     for line in result.stdout.splitlines():
@@ -110,8 +112,27 @@ def get_banned_ips(cfg):
             return rest.split()
     raise RuntimeError(
         f"'Banned IP list' introuvable dans la sortie de fail2ban-client "
-        f"pour la jail {cfg['jail']} (format de sortie inattendu)"
+        f"pour la jail {jail} (format de sortie inattendu)"
     )
+
+
+def get_banned_ips(cfg):
+    """IP actuellement bannies, union de toutes les jails configurées, via
+    fail2ban-client.
+
+    Même logique/format attendu que sophos_fw_block.py (dupliqué
+    volontairement — script autonome sans dépendance croisée, voir
+    docstring du module). Une jail interrogée par appel ; une IP bannie
+    dans plusieurs jails n'apparaît qu'une fois (union, ordre de première
+    apparition conservé).
+    """
+    if not cfg["jail"]:
+        raise SystemExit("jail requis dans la config (ou --jail) pour interroger fail2ban")
+    ips = {}
+    for jail in cfg["jail"]:
+        for ip in _get_banned_ips_for_jail(cfg, jail):
+            ips[ip] = None
+    return list(ips)
 
 
 def write_map_file(cfg, ips):
@@ -260,6 +281,10 @@ Fichier de config attendu (section [nginx]), défaut: {DEFAULT_CONFIG_PATH}
 
   [nginx]
   jail            = sshd                       # requis seulement pour start
+                                                #   plusieurs jails : séparées
+                                                #   par des virgules, ex
+                                                #   "sshd,nginx-http-auth"
+                                                #   (union des IP bannies)
   fail2ban_client = fail2ban-client             # optionnel, idem
   map_file        = {DEFAULT_MAP_FILE}
   reload_cmd      = {DEFAULT_RELOAD_CMD}        # ex Docker: docker exec <container> nginx -s reload
@@ -288,6 +313,7 @@ Exemples:
   nginx_fw_block.py list
   nginx_fw_block.py start
   nginx_fw_block.py ban 203.0.113.5 --jail sshd --map-file /tmp/test.conf --reload-cmd "true" --debug-timing
+  nginx_fw_block.py start --jail sshd,nginx-http-auth,nginx-botsearch
 """
 
 
@@ -312,7 +338,9 @@ def main():
         help=f"chemin fichier config (défaut: {DEFAULT_CONFIG_PATH})",
     )
     parser.add_argument(
-        "--jail", help="surcharge la jail fail2ban définie dans la config"
+        "--jail",
+        help="surcharge la/les jail(s) fail2ban définie(s) dans la config "
+        "(une ou plusieurs, séparées par des virgules)",
     )
     parser.add_argument(
         "--map-file", help="surcharge le fichier cible défini dans la config"
@@ -340,7 +368,7 @@ def main():
     ip = validate_ip(args.ip) if args.ip else None
     cfg = load_config(args.config)
     if args.jail:
-        cfg["jail"] = args.jail
+        cfg["jail"] = parse_jails(args.jail)
     if args.map_file:
         cfg["map_file"] = args.map_file
     if args.reload_cmd:
