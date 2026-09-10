@@ -1,0 +1,30 @@
+# Exemple de config API SÉPARÉE pour une jail à comportement distinct
+# (voir README.md, section "Jails avec des comportements distincts") --
+# ici la jail `recidive` de fail2ban (récidivistes : IP déjà bannies
+# plusieurs fois par d'autres jails), avec son propre groupe XGS et son
+# propre préfixe d'IPHost, pour ne jamais mélanger ces IP avec celles
+# d'une jail "normale" (ex php-404) qui a un bantime bien plus court.
+#
+# Même firewall/compte API que api.conf.example ici (host/username/
+# password identiques) -- possible aussi de pointer un firewall ou un
+# compte API entièrement différent si besoin.
+#
+# Installation : voir jail.local.example, action sophos-xgs[config="..."]
+
+[api]
+host = 192.168.1.1
+port = 4444
+username = apiuser
+password = changeme
+verify_ssl = false
+# groupe DÉDIÉ, distinct de celui d'api.conf.example (Fail2Ban-Block) --
+# référencé par sa propre règle Deny sur le XGS, typiquement plus
+# stricte/durable qu'une règle visant les IP bannies "normales"
+group = Fail2Ban-Recidive
+# préfixe DÉDIÉ, distinct de celui d'api.conf.example (f2b_) -- évite
+# toute collision de nom d'IPHost entre les deux configs
+prefix = recid_
+# UNIQUEMENT la jail recidive : si d'autres jails étaient listées ici,
+# get_banned_ips unirait leurs IP bannies et les pousserait aussi dans
+# Fail2Ban-Recidive, ce qui n'est pas le but (voir README)
+jail = recidive

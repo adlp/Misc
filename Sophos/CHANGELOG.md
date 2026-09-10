@@ -1,5 +1,64 @@
 # Changelog
 
+## firewall-xgs/fail2ban — 2026-09-10 (4)
+
+### Added
+- `jail.local.example` : exemple complet combinant `sophos-xgs` et
+  `nginx-local` sur deux jails à bantime très différent — `php-404`
+  (ban 1 jour) et `recidive` (jail standard de fail2ban, re-bannit tout
+  récidiviste détecté sur n'importe quelle jail, ban 1 semaine via son
+  propre groupe/préfixe XGS).
+- `api-recidive.conf.example` : config API Sophos dédiée à la jail
+  `recidive` (groupe `Fail2Ban-Recidive`, préfixe `recid_`, `jail =
+  recidive` seule) — référencée depuis `jail.local.example` via
+  `sophos-xgs[config="..."]`, mise en pratique concrète du mécanisme de
+  comportements distincts par jail (voir entrée précédente).
+- `README.md` : renvoi vers ces deux fichiers depuis la section "Jails
+  avec des comportements distincts". Commentaires systématiquement sur
+  leur propre ligne (jamais en fin de ligne après une valeur) dans
+  `jail.local.example` : fail2ban utilise `configparser` en interne, qui
+  ne traite PAS `#` en fin de ligne comme un commentaire inline par
+  défaut — il rejoindrait la valeur (`bantime` deviendrait par ex
+  `"86400   # 1 jour"`, cassant la conversion en entier).
+
+## firewall-xgs/fail2ban — 2026-09-10 (3)
+
+Modifie action.d/*.conf (mécanisme fail2ban standard [Init]/tags, pas
+les scripts Python eux-mêmes — aucun changement de comportement pour
+les jails qui n'utilisent pas les nouvelles surcharges).
+
+### Added
+- `action.d/sophos-xgs.conf` : `actionban`/`actionunban` passent
+  désormais `--config`/`--group`/`--iplist`/`--prefix` (repris du CLI
+  du script), surchargeables **par jail** via la syntaxe fail2ban
+  `action = sophos-xgs[group="...", prefix="..."]` — permet à des
+  jails différentes de cibler des groupes/IP lists/firewalls XGS
+  distincts (comportements distincts), sans toucher à `api.conf` ni
+  aux autres jails. `group`/`iplist`/`prefix` vides par défaut (aucune
+  surcharge, le script ignore un flag vide — voir --help) ; `config`
+  vaut `DEFAULT_CONFIG_PATH` par défaut (le script n'accepte pas un
+  `--config` vide).
+- `action.d/nginx-local.conf` : même mécanisme avec
+  `--map-file`/`--reload-cmd`/`--config`, ex pour rediriger une jail
+  scanner vers le `map_file` du tarpit (`nginx-conf/tarpit-server.conf`)
+  plutôt que celui d'un blocage nginx classique.
+- `README.md` : nouvelle section "Jails avec des comportements
+  distincts", à distinguer de la section existante sur les jails
+  *partageant* la même cible (2.6.0).
+
+## firewall-xgs/fail2ban 2.6.1 (sophos_fw_block.py) / 1.2.1 (nginx_fw_block.py) — 2026-09-10
+
+### Changed
+- `DEFAULT_CONFIG_PATH` déplacé de `/etc/sophos-fw/api.conf` vers
+  `/usr/local/etc/sophos-fw/api.conf` (sophos_fw_block.py), et de
+  `/etc/nginx-fw-block/config.conf` vers
+  `/usr/local/etc/nginx-fw-block/config.conf` (nginx_fw_block.py) —
+  cohérent avec l'installation des binaires sous `/usr/local/bin`.
+  README.md, les docstrings `test_group_merge.py`/`test_iplist_add.py`
+  et `nginx-conf/README.md` mis à jour en conséquence. `--config` reste
+  disponible pour pointer ailleurs si besoin (ex config déjà déployée
+  sous l'ancien chemin).
+
 ## firewall-xgs/fail2ban — 2026-09-10 (2)
 
 Documentation uniquement (action.d/*.conf + README.md), aucun changement

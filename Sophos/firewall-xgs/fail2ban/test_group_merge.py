@@ -26,7 +26,7 @@ dans ce projet.
 automatiquement à la fin du test (aucun effet de bord observé sur l'échec 501).
 
 Usage:
-    ./test_group_merge.py --group Fail2Ban-Test [--config /etc/sophos-fw/api.conf]
+    ./test_group_merge.py --group Fail2Ban-Test [--config /usr/local/etc/sophos-fw/api.conf]
 
 Prérequis : au moins 2 membres déjà présents dans le groupe de test, par
 exemple via :

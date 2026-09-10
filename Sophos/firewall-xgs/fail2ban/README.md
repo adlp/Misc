@@ -139,10 +139,10 @@ la règle lors de la réception du mail d'alerte.
 ## Installation
 
 ```bash
-sudo mkdir -p /etc/sophos-fw
-sudo cp api.conf.example /etc/sophos-fw/api.conf
-sudo chmod 600 /etc/sophos-fw/api.conf
-sudo vim /etc/sophos-fw/api.conf   # host, username, password, group, jail
+sudo mkdir -p /usr/local/etc/sophos-fw
+sudo cp api.conf.example /usr/local/etc/sophos-fw/api.conf
+sudo chmod 600 /usr/local/etc/sophos-fw/api.conf
+sudo vim /usr/local/etc/sophos-fw/api.conf   # host, username, password, group, jail
 
 pip3 install -r requirements.txt   # ou: apt install python3-requests
 
@@ -209,6 +209,71 @@ liste COMPLÈTE poussée sur le firewall à chaque appel (voir "Limites
 connues") — n'y lister qu'une seule jail écraserait le groupe avec les
 seules IP de cette jail et effacerait celles bannies par les autres.
 
+### Jails avec des comportements distincts
+
+Cas différent du précédent (qui parle de jails *partageant* la même
+cible) : ici chaque jail doit pousser vers une cible **différente** —
+groupe/liste IP différent, préfixe différent, voire firewall ou compte
+API entièrement différent. `action.d/sophos-xgs.conf` expose pour ça
+les mêmes options que le CLI (`--group`, `--iplist`, `--prefix`,
+`--config`), surchargeables **par jail** entre crochets, sans toucher à
+`api.conf` ni aux autres jails :
+
+```ini
+[sshd]
+enabled = true
+action  = sophos-xgs
+# pas de surcharge : utilise group/iplist/prefix/jail tels que définis
+# dans api.conf
+
+[nginx-scanners]
+enabled = true
+action  = sophos-xgs[group="Fail2Ban-Scanners", prefix="scan_"]
+# même firewall/compte API (api.conf), mais groupe et préfixe d'IPHost
+# dédiés — utile pour appliquer une règle Deny différente (durée,
+# journalisation...) à ce trafic-là sans toucher au groupe sshd/ssh
+```
+
+Basculer carrément vers un fichier `api.conf` distinct (autre firewall,
+autres credentials) :
+
+```ini
+[nginx-scanners]
+action = sophos-xgs[config="/usr/local/etc/sophos-fw/api-scanners.conf"]
+```
+
+`group`/`iplist`/`prefix` laissés vides (défaut) ne surchargent rien —
+comme lancer `ban`/`unban` sans ces options CLI, `api.conf` décide.
+Attention : `jail` **n'est volontairement pas surchargeable ici** —
+`ban`/`unban` reconstruisent toujours la liste complète depuis TOUTES
+les jails du `jail =` de la config effectivement utilisée (voir
+paragraphe précédent) ; pour des jails à cibles distinctes, chacune a
+donc sa propre config (`config="..."`) avec son propre `jail = ...`, ou
+partage la même config avec le même `jail = jail1,jail2` si elles
+doivent malgré tout retomber sur les mêmes IP bannies mais des cibles
+XGS différentes (`group`/`iplist` différents).
+
+Même mécanisme côté nginx local (`action.d/nginx-local.conf`), avec
+`--map-file`/`--reload-cmd`/`--config` — utile par exemple pour envoyer
+un scanner détecté (`scanner-404-403-*`) vers le `map_file` consommé
+par le tarpit (`nginx-conf/tarpit-server.conf`) plutôt que vers celui
+d'un blocage nginx classique :
+
+```ini
+[scanner-404-403]
+enabled = true
+action  = nginx-local[map_file="/etc/nginx/include.d/tarpit_ips.conf"]
+```
+
+**Exemple complet prêt à l'emploi** : `jail.local.example` +
+`api-recidive.conf.example` combinent les deux actions sur deux jails à
+bantime très différent — `php-404` (scan 404, ban 1 jour) et `recidive`
+(jail standard de fail2ban, re-bannit tout récidiviste détecté sur
+n'importe quelle autre jail, ban 1 semaine) — chacune avec ses propres
+`maxretry`/`findtime`/`bantime`, `recidive` utilisant en plus son propre
+groupe/préfixe XGS via `--config` (voir commentaires dans les deux
+fichiers pour le détail du raisonnement).
+
 ### Exemple : sonde de scripts PHP inexistants (404)
 
 `filter.d/php-404.conf` détecte les requêtes `GET/POST/HEAD` vers un
@@ -248,8 +313,9 @@ fail2ban-regex '192.168.2.1 - - [06/Aug/2026:13:53:05 +0000] "GET /xmlrpc.php?rs
 fail2ban-regex /var/log/nginx/access.log filter.d/php-404.conf
 ```
 
-`fail2ban-server` tourne en root : le script lit `/etc/sophos-fw/api.conf`
-(root:root, 600) sans souci de permissions.
+`fail2ban-server` tourne en root : le script lit
+`/usr/local/etc/sophos-fw/api.conf` (root:root, 600) sans souci de
+permissions.
 
 ## Test manuel
 
@@ -424,9 +490,9 @@ immédiatement tout appel concurrent pour cette même IP.
 ### Installation
 
 ```bash
-sudo mkdir -p /etc/nginx-fw-block
-sudo cp nginx.conf.example /etc/nginx-fw-block/config.conf
-sudo vim /etc/nginx-fw-block/config.conf   # jail, map_file, reload_cmd
+sudo mkdir -p /usr/local/etc/nginx-fw-block
+sudo cp nginx.conf.example /usr/local/etc/nginx-fw-block/config.conf
+sudo vim /usr/local/etc/nginx-fw-block/config.conf   # jail, map_file, reload_cmd
 
 sudo cp nginx_fw_block.py /usr/local/bin/
 sudo chmod +x /usr/local/bin/nginx_fw_block.py

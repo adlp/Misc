@@ -12,7 +12,7 @@ Indépendant de sophos_fw_block.py (pas d'import croisé) : script
 autonome sans dépendance externe (stdlib uniquement), déployable seul.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 import argparse
 import configparser
@@ -27,7 +27,7 @@ import sys
 import time
 from contextlib import contextmanager
 
-DEFAULT_CONFIG_PATH = "/etc/nginx-fw-block/config.conf"
+DEFAULT_CONFIG_PATH = "/usr/local/etc/nginx-fw-block/config.conf"
 DEFAULT_FAIL2BAN_CLIENT = "fail2ban-client"
 DEFAULT_MAP_FILE = "/etc/nginx/banned_ips.conf"
 DEFAULT_RELOAD_CMD = "nginx -s reload"
