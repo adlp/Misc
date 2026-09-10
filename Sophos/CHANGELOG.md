@@ -1,5 +1,22 @@
 # Changelog
 
+## firewall-xgs/fail2ban — 2026-09-10 (2)
+
+Documentation uniquement (action.d/*.conf + README.md), aucun changement
+de script.
+
+### Changed
+- `action.d/sophos-xgs.conf` et `action.d/nginx-local.conf` : exemple
+  `jail.local` ajouté pour le cas où plusieurs jails fail2ban partagent
+  le même `group`/`iplist` (Sophos) ou `map_file` (nginx) — avec
+  l'avertissement associé : la clé `jail` de la config API/nginx doit
+  alors lister TOUTES ces jails (séparées par des virgules, voir
+  changelog 2.6.0/1.2.0 ci-dessous), sinon `ban`/`unban` (sophos, qui
+  reconstruit la liste complète à chaque appel) ou `start` (nginx, seule
+  action qui interroge fail2ban) écraseraient l'état poussé avec les
+  seules IP d'une jail et effaceraient celles bannies par les autres.
+  Même ajout dans `README.md` (sections installation des deux scripts).
+
 ## firewall-xgs/fail2ban 2.6.0 (sophos_fw_block.py) / 1.2.0 (nginx_fw_block.py) — 2026-09-10
 
 ### Added

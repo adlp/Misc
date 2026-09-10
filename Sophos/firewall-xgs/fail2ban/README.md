@@ -184,6 +184,31 @@ sudo fail2ban-client reload
 sudo fail2ban-client unban --all   # si des règles iptables persistent
 ```
 
+**Plusieurs jails partageant le même `group`/`iplist`** (ex `sshd` et
+`nginx-http-auth` poussées vers le même `IPHostGroup`) : ajouter
+`action = sophos-xgs` dans CHAQUE jail concernée, et lister TOUTES ces
+jails dans `jail = ...` côté `api.conf` (séparées par des virgules) :
+
+```ini
+[sshd]
+enabled = true
+action  = sophos-xgs
+
+[nginx-http-auth]
+enabled = true
+action  = sophos-xgs
+```
+
+```ini
+# api.conf
+jail = sshd,nginx-http-auth
+```
+
+Indispensable : `ban`/`unban` interrogent `jail` pour reconstruire la
+liste COMPLÈTE poussée sur le firewall à chaque appel (voir "Limites
+connues") — n'y lister qu'une seule jail écraserait le groupe avec les
+seules IP de cette jail et effacerait celles bannies par les autres.
+
 ### Exemple : sonde de scripts PHP inexistants (404)
 
 `filter.d/php-404.conf` détecte les requêtes `GET/POST/HEAD` vers un
@@ -421,6 +446,31 @@ enabled = true
 action  = sophos-xgs
           nginx-local
 ```
+
+**Plusieurs jails partageant le même `map_file`** (ex `php-404` et
+`nginx-botsearch` poussées vers le même fichier geo-map) : ajouter
+`nginx-local` dans CHAQUE jail concernée, et lister TOUTES ces jails
+dans `jail = ...` côté `nginx.conf` (séparées par des virgules) :
+
+```ini
+[php-404]
+enabled = true
+action  = nginx-local
+
+[nginx-botsearch]
+enabled = true
+action  = nginx-local
+```
+
+```ini
+# nginx.conf
+jail = php-404,nginx-botsearch
+```
+
+Utile pour `start` (resynchro complète depuis fail2ban) : sans lister
+toutes les jails, `start` ne verrait que les bans d'une seule et
+régénérerait un fichier incomplet. Sans effet sur `ban`/`unban`
+eux-mêmes (I/O locale sur `map_file`, ne consultent jamais `jail`).
 
 Côté nginx (voir `nginx_fw_block.py --help` pour le format exact du
 fichier généré) :
