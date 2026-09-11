@@ -9,12 +9,13 @@
 #   cp filter.d/php-404.conf /etc/fail2ban/filter.d/
 #   cp action.d/sophos-xgs.conf action.d/nginx-local.conf /etc/fail2ban/action.d/
 #   cp jail.local.example /etc/fail2ban/jail.local   # puis adapter logpath
-#   cp api.conf.example /usr/local/etc/sophos-fw/api.conf
-#   cp api-recidive.conf.example /usr/local/etc/sophos-fw/api-recidive.conf
-#   cp nginx.conf.example /usr/local/etc/nginx-fw-block/config.conf
-#   # api.conf / nginx.conf (main) : jail = php-404 UNIQUEMENT -- la
-#   # jail recidive a sa propre config API (api-recidive.conf, voir
-#   # ci-dessous) et n'a pas besoin d'être listée ici.
+#   cp api.conf.example /usr/local/etc/sophos-fw-block.conf
+#   cp api-recidive.conf.example /usr/local/etc/sophos-fw-block-recidive.conf
+#   cp nginx.conf.example /usr/local/etc/nginx-fw-block.conf
+#   # sophos-fw-block.conf / nginx-fw-block.conf (main) : jail = php-404
+#   # UNIQUEMENT -- la jail recidive a sa propre config API
+#   # (sophos-fw-block-recidive.conf, voir ci-dessous) et n'a pas besoin
+#   # d'être listée ici.
 
 [php-404]
 enabled  = true
@@ -43,7 +44,7 @@ logpath   = /var/log/fail2ban.log
 # nginx-local sans surcharge : repousse vers le même badguys.map que
 # php-404 -- le bantime bien plus long suffit à distinguer le
 # traitement, inutile de dupliquer aussi la cible nginx ici.
-action    = sophos-xgs[config="/usr/local/etc/sophos-fw/api-recidive.conf"]
+action    = sophos-xgs[config="/usr/local/etc/sophos-fw-block-recidive.conf"]
             nginx-local
 # 3 bans en 1 jour déclenchent un ban d'1 semaine
 maxretry  = 3

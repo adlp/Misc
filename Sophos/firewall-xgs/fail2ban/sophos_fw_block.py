@@ -9,7 +9,7 @@ l'XGS pour inspection/nettoyage/comparaison, mais ne participent pas au
 push.
 """
 
-__version__ = "2.6.1"
+__version__ = "2.6.2"
 
 import argparse
 import configparser
@@ -44,7 +44,7 @@ from urllib3.exceptions import InsecureRequestWarning  # noqa: E402
 
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
-DEFAULT_CONFIG_PATH = "/usr/local/etc/sophos-fw/api.conf"
+DEFAULT_CONFIG_PATH = "/usr/local/etc/sophos-fw-block.conf"
 DEFAULT_PREFIX = "f2b_"
 DEFAULT_FAIL2BAN_CLIENT = "fail2ban-client"
 DEFAULT_SMTP_HOST = "localhost"

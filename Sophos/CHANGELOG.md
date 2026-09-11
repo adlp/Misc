@@ -1,5 +1,20 @@
 # Changelog
 
+## firewall-xgs/fail2ban 2.6.2 (sophos_fw_block.py) / 1.2.2 (nginx_fw_block.py) — 2026-09-11
+
+### Changed
+- `DEFAULT_CONFIG_PATH` remis à plat directement sous `/usr/local/etc/`
+  (pas de sous-répertoire) : `/usr/local/etc/sophos-fw-block.conf`
+  (sophos_fw_block.py, était `/usr/local/etc/sophos-fw/api.conf`) et
+  `/usr/local/etc/nginx-fw-block.conf` (nginx_fw_block.py, était
+  `/usr/local/etc/nginx-fw-block/config.conf`). `README.md`,
+  `action.d/sophos-xgs.conf`/`nginx-local.conf` (défaut du paramètre
+  `config`), `jail.local.example`/`api-recidive.conf.example`
+  (renommé en usage : voir install `sophos-fw-block-recidive.conf`),
+  `nginx-conf/README.md`, `test_group_merge.py`/`test_iplist_add.py`
+  mis à jour en conséquence. Plus de `mkdir -p` nécessaire à
+  l'installation (`/usr/local/etc/` existe déjà).
+
 ## firewall-xgs/fail2ban — 2026-09-10 (4)
 
 ### Added

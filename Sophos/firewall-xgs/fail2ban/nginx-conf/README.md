@@ -221,7 +221,7 @@ docker exec nginx nginx -T | grep -A5 'geo \$remote_addr'
 # contenu actuel de la liste de bannis :
 docker exec nginx cat /etc/nginx/include.d/badguys.map
 # ou, sans passer par le conteneur :
-/usr/local/bin/nginx_fw_block.py list --config /usr/local/etc/nginx-fw-block/config.conf
+/usr/local/bin/nginx_fw_block.py list --config /usr/local/etc/nginx-fw-block.conf
 ```
 
 Si une IP dans `badguys.map` n'est toujours pas ralentie : vérifier dans

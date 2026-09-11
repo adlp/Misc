@@ -24,7 +24,7 @@ requête.
 automatiquement à la fin (replace complet avec la liste d'origine).
 
 Usage:
-    ./test_iplist_add.py --iplist Fail2Ban-Test-List [--config /usr/local/etc/sophos-fw/api.conf] [--debug]
+    ./test_iplist_add.py --iplist Fail2Ban-Test-List [--config /usr/local/etc/sophos-fw-block.conf] [--debug]
 
 Prérequis : l'IP list de test doit déjà exister sur le firewall (onglet
 IP Host, type "IP list"), avec au moins une IP dedans pour un test

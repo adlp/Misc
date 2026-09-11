@@ -139,10 +139,9 @@ la règle lors de la réception du mail d'alerte.
 ## Installation
 
 ```bash
-sudo mkdir -p /usr/local/etc/sophos-fw
-sudo cp api.conf.example /usr/local/etc/sophos-fw/api.conf
-sudo chmod 600 /usr/local/etc/sophos-fw/api.conf
-sudo vim /usr/local/etc/sophos-fw/api.conf   # host, username, password, group, jail
+sudo cp api.conf.example /usr/local/etc/sophos-fw-block.conf
+sudo chmod 600 /usr/local/etc/sophos-fw-block.conf
+sudo vim /usr/local/etc/sophos-fw-block.conf   # host, username, password, group, jail
 
 pip3 install -r requirements.txt   # ou: apt install python3-requests
 
@@ -239,7 +238,7 @@ autres credentials) :
 
 ```ini
 [nginx-scanners]
-action = sophos-xgs[config="/usr/local/etc/sophos-fw/api-scanners.conf"]
+action = sophos-xgs[config="/usr/local/etc/sophos-fw-block-scanners.conf"]
 ```
 
 `group`/`iplist`/`prefix` laissés vides (défaut) ne surchargent rien —
@@ -314,7 +313,7 @@ fail2ban-regex /var/log/nginx/access.log filter.d/php-404.conf
 ```
 
 `fail2ban-server` tourne en root : le script lit
-`/usr/local/etc/sophos-fw/api.conf` (root:root, 600) sans souci de
+`/usr/local/etc/sophos-fw-block.conf` (root:root, 600) sans souci de
 permissions.
 
 ## Test manuel
@@ -490,9 +489,8 @@ immédiatement tout appel concurrent pour cette même IP.
 ### Installation
 
 ```bash
-sudo mkdir -p /usr/local/etc/nginx-fw-block
-sudo cp nginx.conf.example /usr/local/etc/nginx-fw-block/config.conf
-sudo vim /usr/local/etc/nginx-fw-block/config.conf   # jail, map_file, reload_cmd
+sudo cp nginx.conf.example /usr/local/etc/nginx-fw-block.conf
+sudo vim /usr/local/etc/nginx-fw-block.conf   # jail, map_file, reload_cmd
 
 sudo cp nginx_fw_block.py /usr/local/bin/
 sudo chmod +x /usr/local/bin/nginx_fw_block.py
