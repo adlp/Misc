@@ -169,6 +169,25 @@
       </table>
       <p class="hint">Clic sur un dossier : ouvrir. Clic droit sur un dossier : télécharger un .tar.
         Clic sur un fichier : le télécharger.</p>
+      <p class="hint" id="browsePinnedHint" hidden></p>
+    </div>
+  </section>
+
+  <!-- VIEW 5 : HISTORIQUE COMPLET -->
+  <section id="view-history" hidden>
+    <button class="secondary" onclick="showMachines()">← Serveurs</button>
+    <div class="card">
+      <div class="machine-head">
+        <h2 id="historyTitle" style="margin:0"></h2>
+        <button class="danger" id="historyPruneBtn">⚡ Lancer Prune</button>
+      </div>
+      <p class="hint">Toutes les archives indexées en base (lecture SQLite uniquement).</p>
+      <div id="historyError" class="error"></div>
+      <table id="historyTableEl">
+        <thead><tr><th>Archive</th><th>Durée</th><th>Taille orig.</th><th>Δ</th><th>Comp.</th>
+          <th>Dédup.</th><th>Fichiers</th><th>Modifs</th><th>Actions</th></tr></thead>
+        <tbody id="historyBody"></tbody>
+      </table>
     </div>
   </section>
 
@@ -221,13 +240,13 @@ function setPassphrase(nick,val){
 // ── View switching ────────────────────────────────────────────────────────
 
 function showView(id){
-  ['view-login','view-machines','view-detail','view-browse'].forEach(v=>{
+  ['view-login','view-machines','view-detail','view-browse','view-history'].forEach(v=>{
     document.getElementById(v).hidden=(v!==id);
   });
   document.getElementById('logoutBtn').hidden=(id==='view-login');
   document.getElementById('serversBtn').hidden=(id==='view-login'||id==='view-machines');
   document.getElementById('headerSub').textContent = id==='view-login' ? 'non connecté' :
-    (id==='view-detail'||id==='view-browse' ? 'serveur : '+currentNick : 'connecté');
+    (id==='view-detail'||id==='view-browse'||id==='view-history' ? 'serveur : '+currentNick : 'connecté');
 }
 
 function logout(){
@@ -329,6 +348,7 @@ async function loadMachines(){
           <div>
             <button class="secondary bkp-now-btn" data-nick="${escapeAttr(nick)}">▶ Backup</button>
             <button class="secondary explore-btn" data-nick="${escapeAttr(nick)}">🗂 Explorer</button>
+            <button class="secondary history-btn" data-nick="${escapeAttr(nick)}">📜 Historique complet</button>
             <button class="open-machine-btn" data-nick="${escapeAttr(nick)}">Ouvrir →</button>
           </div>
         </div>
@@ -344,13 +364,16 @@ async function loadMachines(){
             <td>${escapeHtml(s['modifications']||'—')}</td>
           </tr>
         </table>
+        <p class="hint" style="margin-bottom:4px">10 dernières sauvegardes :</p>
+        <div class="history-panel" style="margin-bottom:4px">Chargement…</div>
         <div class="pass-row">
-          <button class="secondary history-btn" data-nick="${escapeAttr(nick)}">📋 Historique (10 dernières)</button>
           <span class="pill">🔑 passphrase : ${hasPass?'✓ enregistrée pour la session':'non renseignée — à saisir sur la page du serveur'}</span>
         </div>
-        <div class="history-panel" hidden style="margin-top:8px"></div>
       </div>`;
   }).join('');
+  Array.from(listEl.querySelectorAll('.machine-card')).forEach((card,i)=>{
+    loadHistoryInline(nicks[i],card.querySelector('.history-panel'));
+  });
 }
 
 document.getElementById('machinesList').addEventListener('click', e=>{
@@ -361,16 +384,27 @@ document.getElementById('machinesList').addEventListener('click', e=>{
   const exploreBtn=e.target.closest('.explore-btn');
   if(exploreBtn){ openMachine(exploreBtn.dataset.nick); openBrowse(); return; }
   const histBtn=e.target.closest('.history-btn');
-  if(histBtn){ toggleHistory(histBtn); return; }
+  if(histBtn){ openHistory(histBtn.dataset.nick); return; }
 });
 
-async function toggleHistory(btn){
-  const panel=btn.closest('.machine-card').querySelector('.history-panel');
-  if(!panel.hidden){ panel.hidden=true; return; }
-  panel.hidden=false;
-  if(panel.dataset.loaded==='1') return;
-  panel.innerHTML='Chargement…';
-  const nick=btn.dataset.nick;
+function _renderHistoryRows(backups,withActions){
+  const archives=Object.keys(backups).filter(k=>k!=='Prunable'&&k!=='Totaux');
+  if(archives.length===0) return {archives,html:''};
+  const html=archives.map(a=>{
+    const b=backups[a];
+    const actionsTd=withActions?`<td>
+        <button class="secondary hist-explore-btn" data-archive="${escapeAttr(a)}">🗂 Explorer</button>
+        <button class="danger hist-delete-btn" data-archive="${escapeAttr(a)}">🗑 Supprimer</button>
+      </td>`:'';
+    return `<tr><td>${escapeHtml(a)}</td><td>${escapeHtml(b.duration||'—')}</td>`
+      +`<td>${escapeHtml(b.original_size||'—')}</td><td>${escapeHtml(b.size_delta||'—')}</td>`
+      +`<td>${escapeHtml(b.compressed_size||'—')}</td><td>${escapeHtml(b.deduplicated_size||'—')}</td>`
+      +`<td>${escapeHtml(String(b.nfiles??'—'))}</td><td>${escapeHtml(b.modifications||'—')}</td>${actionsTd}</tr>`;
+  }).join('');
+  return {archives,html};
+}
+
+async function loadHistoryInline(nick,panel){
   const r=await apiCall('GET','/report',{nick,n:'10',json:'true',offline:'true'},false);
   if(r.httpStatus===401) return;
   if(r.exitcode===undefined || r.httpStatus>=500 || (!r.stdout && r.stderr)){
@@ -381,21 +415,70 @@ async function toggleHistory(btn){
   try{ parsed=JSON.parse(r.stdout); }
   catch(e){ panel.innerHTML='<p class="error">Réponse Report illisible : '+escapeHtml(r.stdout.slice(0,200))+'</p>'; return; }
   const backups=(parsed.backups&&parsed.backups[nick])||{};
-  const archives=Object.keys(backups).filter(k=>k!=='Prunable'&&k!=='Totaux');
-  if(archives.length===0){
-    panel.innerHTML='<p class="hint">Aucune archive indexée en base.</p>';
-  }else{
-    panel.innerHTML='<table><thead><tr><th>Archive</th><th>Durée</th><th>Taille orig.</th>'
-      +'<th>Δ</th><th>Comp.</th><th>Dédup.</th><th>Fichiers</th><th>Modifs</th></tr></thead><tbody>'
-      +archives.map(a=>{
-        const b=backups[a];
-        return `<tr><td>${escapeHtml(a)}</td><td>${escapeHtml(b.duration||'—')}</td>`
-          +`<td>${escapeHtml(b.original_size||'—')}</td><td>${escapeHtml(b.size_delta||'—')}</td>`
-          +`<td>${escapeHtml(b.compressed_size||'—')}</td><td>${escapeHtml(b.deduplicated_size||'—')}</td>`
-          +`<td>${escapeHtml(String(b.nfiles??'—'))}</td><td>${escapeHtml(b.modifications||'—')}</td></tr>`;
-      }).join('')+'</tbody></table>';
+  const {archives,html}=_renderHistoryRows(backups,false);
+  panel.innerHTML = archives.length===0 ? '<p class="hint">Aucune archive indexée en base.</p>'
+    : '<table><thead><tr><th>Archive</th><th>Durée</th><th>Taille orig.</th>'
+      +'<th>Δ</th><th>Comp.</th><th>Dédup.</th><th>Fichiers</th><th>Modifs</th></tr></thead><tbody>'+html+'</tbody></table>';
+}
+
+// ── Historique complet (toutes les archives + actions) ──────────────────────
+
+function openHistory(nick){
+  currentNick=nick;
+  document.getElementById('historyTitle').textContent='Historique complet — '+nick;
+  document.getElementById('historyError').textContent='';
+  showView('view-history');
+  loadHistoryFull(nick);
+}
+
+async function loadHistoryFull(nick){
+  const err=document.getElementById('historyError');
+  const body=document.getElementById('historyBody');
+  err.textContent=''; body.innerHTML='<tr><td colspan="9">Chargement…</td></tr>';
+  const r=await apiCall('GET','/report',{nick,json:'true',offline:'true'},false);
+  if(r.httpStatus===401) return;
+  if(r.exitcode===undefined || r.httpStatus>=500 || (!r.stdout && r.stderr)){
+    err.textContent='Erreur : '+(r.stderr||('HTTP '+r.httpStatus)); body.innerHTML=''; return;
   }
-  panel.dataset.loaded='1';
+  let parsed;
+  try{ parsed=JSON.parse(r.stdout); }
+  catch(e){ err.textContent='Réponse Report illisible : '+r.stdout.slice(0,200); body.innerHTML=''; return; }
+  const backups=(parsed.backups&&parsed.backups[nick])||{};
+  const {archives,html}=_renderHistoryRows(backups,true);
+  body.innerHTML = archives.length===0 ? '<tr><td colspan="9">Aucune archive indexée en base.</td></tr>' : html;
+}
+
+document.getElementById('historyBody').addEventListener('click', e=>{
+  const exBtn=e.target.closest('.hist-explore-btn');
+  if(exBtn){ openBrowseAtArchive(currentNick,exBtn.dataset.archive); return; }
+  const delBtn=e.target.closest('.hist-delete-btn');
+  if(delBtn){ deleteArchive(currentNick,delBtn.dataset.archive,delBtn); return; }
+});
+
+async function deleteArchive(nick,archive,btn){
+  if(!confirm(`DANGER : supprimer définitivement l'archive ${archive} de ${nick} ? Irréversible.`)) return;
+  if(!getPassphrase(nick) && !confirm('Aucune passphrase enregistrée pour ce serveur — continuer sans (utilisera celle du .borghelperrc si présente) ?')) return;
+  btn.disabled=true;
+  const r=await apiCall('DELETE','/delbkp',{nick,bid:archive},true,nick);
+  btn.disabled=false;
+  if(r.httpStatus===401) return;
+  if(r.exitcode===0){ alert(`Archive ${archive} supprimée.`); loadHistoryFull(nick); }
+  else{ alert(`Échec suppression (exitcode ${r.exitcode}) :\n`+(r.stderr||r.stdout||'(pas de détail)')); }
+}
+
+document.getElementById('historyPruneBtn').addEventListener('click', ()=>runHistoryPrune(currentNick));
+
+async function runHistoryPrune(nick){
+  if(!confirm('DANGER : supprime les archives selon KEEP_*. Irréversible. Continuer ?')) return;
+  if(!getPassphrase(nick) && !confirm('Aucune passphrase enregistrée pour ce serveur — continuer sans (utilisera celle du .borghelperrc si présente) ?')) return;
+  const btn=document.getElementById('historyPruneBtn');
+  const orig=btn.textContent;
+  btn.disabled=true; btn.textContent='Prune en cours…';
+  const r=await apiCall('POST','/prune',{nick},true,nick);
+  btn.disabled=false; btn.textContent=orig;
+  if(r.httpStatus===401) return;
+  if(r.exitcode===0){ alert(`Prune ${nick} terminé.`); loadHistoryFull(nick); }
+  else{ alert(`Prune en erreur (exitcode ${r.exitcode}) :\n`+(r.stderr||r.stdout||'(pas de détail)')); }
 }
 
 async function runBackupNow(nick,btn){
@@ -601,14 +684,27 @@ async function runAction(){
 let browseNick=null;
 let browsePath='';
 let browseEntriesByPath={};
+let browseArchive=null;
 
 function openBrowse(){
   browseNick=currentNick;
   browsePath='';
+  browseArchive=null;
   showView('view-browse');
   loadBrowse();
 }
-function closeBrowse(){ showView('view-detail'); }
+function openBrowseAtArchive(nick,archive){
+  currentNick=nick;
+  browseNick=nick;
+  browsePath='';
+  browseArchive=archive;
+  showView('view-browse');
+  loadBrowse();
+}
+function closeBrowse(){
+  if(browseArchive){ browseArchive=null; showView('view-history'); }
+  else{ showView('view-detail'); }
+}
 
 function renderBreadcrumb(){
   const el=document.getElementById('browseBreadcrumb');
@@ -627,12 +723,23 @@ document.getElementById('browseBreadcrumb').addEventListener('click', e=>{
 });
 
 async function loadBrowse(){
-  document.getElementById('browseTitle').textContent=browseNick+' — '+(browsePath||'/');
+  const hint=document.getElementById('browsePinnedHint');
+  if(browseArchive){
+    document.getElementById('browseTitle').textContent=browseNick+' — archive '+browseArchive+' — '+(browsePath||'/');
+    hint.hidden=false;
+    hint.textContent="Vue épinglée sur l'archive "+browseArchive+" : seuls les événements de cette sauvegarde sont affichés (droits/genre/propriétaire = dernier état connu, pas forcément celui de cette archive).";
+  }else{
+    document.getElementById('browseTitle').textContent=browseNick+' — '+(browsePath||'/');
+    hint.hidden=true;
+  }
   document.getElementById('browseError').textContent='';
   renderBreadcrumb();
-  // archive_from=ALL : pour que chaque entrée porte son historique complet (nécessaire pour ne
-  // proposer au téléchargement que les archives où le fichier a réellement bougé).
-  const r=await apiCall('GET','/treehist',{nick:browseNick,prefix:browsePath,archive_from:'ALL',json:'true'},false);
+  // archive_from=ALL (sauf vue épinglée) : pour que chaque entrée porte son historique complet
+  // (nécessaire pour ne proposer au téléchargement que les archives où le fichier a réellement bougé).
+  const params={nick:browseNick,prefix:browsePath,json:'true'};
+  if(browseArchive){ params.archive_from=browseArchive; params.archive_to=browseArchive; }
+  else{ params.archive_from='ALL'; }
+  const r=await apiCall('GET','/treehist',params,false);
   if(r.httpStatus===401) return;
   if(r.exitcode!==0){
     document.getElementById('browseError').textContent=r.stderr||('exitcode '+r.exitcode);

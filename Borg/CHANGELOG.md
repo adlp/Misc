@@ -1,12 +1,23 @@
 # Changelog — borgHelper
 
-## Interface web — historique des 10 dernières sauvegardes par serveur — 2026-09-17
+## Interface web — vue Historique complet par serveur (Prune / DelBkp / Explorer par archive) — 2026-09-17
 
-Bouton **📋 Historique (10 dernières)** sur chaque carte de la page Serveurs : déplie un tableau par
-archive (durée, taille originale, Δ taille, taille compressée, taille dédupliquée, nb fichiers,
-modifications), via `Report -o -N 10 -j` (`/report?n=10&offline=true&json=true`) — lecture SQLite
-uniquement, aucune passphrase requise. Chargé une seule fois au premier dépli, mis en cache dans le
-panneau tant que la liste des serveurs n'est pas rafraîchie.
+Le tableau des **10 dernières sauvegardes** sur chaque carte de la page Serveurs s'affiche désormais
+**automatiquement** (aucun clic requis — c'était auparavant un panneau à déplier).
+
+Nouveau bouton **📜 Historique complet** (remplace l'ancien bouton de dépli) : ouvre une nouvelle vue
+listant **toutes** les archives indexées en base pour ce serveur (`Report -o -j`, sans `-N`), avec par
+archive :
+- **🗂 Explorer** — ouvre l'explorateur d'arborescence épinglé sur cette seule archive
+  (`archive_from`/`archive_to` = l'archive choisie), pour ne voir que les événements propres à cette
+  sauvegarde, sans l'historique des autres. Un bandeau d'information rappelle que droits/genre/
+  propriétaire restent le dernier état connu (limitation déjà documentée de `TreeHist`).
+- **🗑 Supprimer** — `DelBkp` sur cette archive (confirmation, 🔑 passphrase).
+
+Bouton **⚡ Lancer Prune** en haut de la vue (portée sur tout le dépôt, confirmation, 🔑 passphrase).
+
+Aucun changement côté `borgHelper` — endpoints `/report`, `/treehist`, `/delbkp`, `/prune` déjà
+existants, simplement recombinés côté UI.
 
 ## Interface web — lien Swagger dans le pied de page — 2026-09-17
 

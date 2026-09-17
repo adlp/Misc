@@ -687,9 +687,10 @@ page de l'interface web (visible sur toutes les pages, y compris la page de conn
    enregistrée, sinon celle du `.borghelperrc` si présente — avertissement sinon) ; la liste se
    rafraîchit automatiquement une fois terminé. Bouton **🗂 Explorer** juste à côté pour accéder
    directement à l'explorateur d'arborescence de ce serveur, sans passer par la page de détail.
-   Bouton **📋 Historique (10 dernières)** dépliant un tableau par archive (durée, taille originale,
-   Δ taille, compressée, dédupliquée, nb fichiers, modifications) — `Report -o -N 10 -j` hors-ligne,
-   aucune passphrase requise, chargé une seule fois au premier dépli.
+   Tableau des **10 dernières sauvegardes** (durée, taille originale, Δ taille, compressée,
+   dédupliquée, nb fichiers, modifications) affiché **automatiquement** sous chaque carte — `Report -o
+   -N 10 -j` hors-ligne, aucune passphrase requise, chargé au rendu de la liste, aucun clic requis.
+   Bouton **📜 Historique complet** juste à côté pour ouvrir la vue Historique (point 5) de ce serveur.
 3. **Détail d'un serveur** : champ **BORG_PASSPHRASE** à enregistrer pour la session (`sessionStorage`,
    par nick) — c'est ici, et seulement ici, qu'elle se saisit. Envoyée en `X-Borg-Passphrase` pour les
    actions qui en ont besoin (repérées par 🔑) ; les actions destructives (`Prune`, `DelBkp`, `Restore`,
@@ -714,6 +715,18 @@ page de l'interface web (visible sur toutes les pages, y compris la page de conn
      (fichier ou dossier, brut ou tar) : `Restore -n <nick> -f <chemin> -w <destination> [-b <archive>]`
      — extraction disque classique avec droits préservés (`borg extract` réel, contrairement au
      téléchargement brut navigateur) ; mise à jour en direct selon l'archive sélectionnée.
+5. **Historique complet** (bouton **📜 Historique complet** sur la page Serveurs) : toutes les archives
+   indexées en base pour ce serveur (`Report -o -j`, sans limite `-N`), mêmes colonnes que le tableau
+   des 10 dernières, plus une colonne **Actions** par archive :
+   - **🗂 Explorer** : ouvre l'explorateur d'arborescence (point 4) **épinglé sur cette archive** —
+     seuls les événements propres à cette sauvegarde sont affichés (`TreeHist -b <archive> -B
+     <archive>`), pas ceux des autres archives. Les colonnes droits/genre/propriétaire restent, comme
+     toujours, le **dernier état connu** (pas forcément celui de cette archive précise — limitation
+     documentée de `TreeHist`). Le bouton retour ramène à cette vue Historique plutôt qu'à la page de
+     détail.
+   - **🗑 Supprimer** (`DelBkp`) : supprime définitivement cette archive — confirmation, 🔑 passphrase.
+   - Bouton **⚡ Lancer Prune** en haut de la vue (portée sur tout le dépôt, pas une archive précise,
+     selon `KEEP_*` de la conf) — confirmation, 🔑 passphrase.
 
 Cette page HTML elle-même n'est pas protégée par `X-API-Key` (elle ne contient aucun secret — la clé et
 les passphrases ne sont saisies et envoyées que depuis le navigateur, via `fetch()`) ; c'est l'API qui
