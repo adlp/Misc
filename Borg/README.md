@@ -587,21 +587,33 @@ pip install fastapi uvicorn pydantic
 à côté du script : `uvicorn borgHelperWWW:app` importe le module par son nom et échoue sans l'extension
 `.py` ("Could not import module"). Inutile pour `python3 borgHelperWWW` en exécution directe.
 
-### Configuration (variables d'environnement)
+### Configuration
 
-| Variable | Rôle |
-|----------|------|
-| `BORGHELPERWWW_CFGFILE` | **Requis.** Chemin vers un `.borghelperrc` dédié à l'API (distinct de celui de l'admin CLI) |
-| `BORGHELPERWWW_API_KEY` | **Requis.** Clé partagée attendue dans le header `X-API-Key` sur chaque appel |
-| `BORGHELPERWWW_BORGHELPER_BIN` | Chemin vers le script `borgHelper` (défaut : à côté de `borgHelperWWW`) |
-| `BORGHELPERWWW_TIMEOUT` | Timeout en secondes par commande (défaut 3600 ; vide/0 = pas de limite) |
-| `BORGHELPERWWW_HOST` / `BORGHELPERWWW_PORT` | Bind (défaut `127.0.0.1:8000`) — seulement pour `python3 borgHelperWWW` en direct |
+Deux façons de configurer, selon le mode de lancement :
 
-Le serveur refuse de démarrer si `BORGHELPERWWW_CFGFILE` ou `BORGHELPERWWW_API_KEY` est absent.
+| Variable d'environnement | Option CLI (`python3 borgHelperWWW ...` uniquement) | Rôle |
+|---------------------------|-------------------------------------------------------|------|
+| `BORGHELPERWWW_CFGFILE` | `-C`, `--cfgfile` | **Requis.** `.borghelperrc` dédié à l'API (distinct de celui de l'admin CLI) |
+| `BORGHELPERWWW_API_KEY` | `-K`, `--api-key` | **Requis.** Clé partagée attendue dans le header `X-API-Key` |
+| `BORGHELPERWWW_BORGHELPER_BIN` | `--borghelper-bin` | Chemin du script `borgHelper` (défaut : à côté de `borgHelperWWW`) |
+| `BORGHELPERWWW_TIMEOUT` | `--timeout` | Timeout en secondes par commande (défaut 3600 ; 0 = illimité) |
+| `BORGHELPERWWW_HOST` | `--host` | Bind — adresse (défaut `127.0.0.1`) |
+| `BORGHELPERWWW_PORT` | `--port` | Bind — port (défaut `8000`) |
+
+Le serveur refuse de démarrer si le fichier de conf ou la clé API sont absents (ni option ni variable).
+
+- **`uvicorn borgHelperWWW:app`** : uvicorn importe le module et possède seul `sys.argv` — seules les
+  variables d'environnement sont lues, pas d'options CLI possibles ici.
+- **`python3 borgHelperWWW ...`** : les options CLI ci-dessus sont prioritaires sur les variables
+  d'environnement déjà présentes.
 
 ### Lancement
 
 ```bash
+# Via options CLI (exécution directe uniquement)
+python3 borgHelperWWW -C /etc/borghelperrc-www -K "$(openssl rand -hex 32)" --host 0.0.0.0 --port 8000
+
+# Via variables d'environnement (marche dans les deux modes)
 export BORGHELPERWWW_CFGFILE=/etc/borghelperrc-www
 export BORGHELPERWWW_API_KEY=$(openssl rand -hex 32)
 python3 borgHelperWWW                      # dev, uvicorn intégré
@@ -610,6 +622,28 @@ uvicorn borgHelperWWW:app --host 0.0.0.0 --port 8000 --workers 2
 ```
 
 Swagger interactif : `http://<host>:<port>/docs`
+
+### Interface web
+
+`http://<host>:<port>/` — page unique (SPA, HTML/CSS/JS vanilla, aucune dépendance externe, servie par
+`borgHelperWWW_ui.html`, obligatoirement à côté du script).
+
+1. **Connexion** : saisie de la clé `X-API-Key`. Vérifiée par un appel `Report` hors-ligne ; conservée en
+   `sessionStorage` (effacée à la fermeture de l'onglet, jamais persistée sur disque).
+2. **Serveurs** : liste des nicks avec un rapport sommaire hors-ligne (aucune passphrase requise pour
+   cette liste — lecture SQLite uniquement). Bouton **+ Nouveau serveur** pour `Login`. Pour chaque
+   serveur, un champ **BORG_PASSPHRASE** à enregistrer pour la session (même mécanisme `sessionStorage`,
+   par nick).
+3. **Détail d'un serveur** : la passphrase enregistrée est envoyée en `X-Borg-Passphrase` pour les
+   actions qui en ont besoin (repérées par 🔑) ; les actions destructives (`Prune`, `DelBkp`, `Restore`,
+   `IdxPurge`, `Init`) demandent une confirmation avant exécution. Le résultat brut (`exitcode`, `stdout`,
+   `stderr`) s'affiche tel quel.
+
+Cette page HTML elle-même n'est pas protégée par `X-API-Key` (elle ne contient aucun secret — la clé et
+les passphrases ne sont saisies et envoyées que depuis le navigateur, via `fetch()`) ; c'est l'API qui
+reste la seule frontière de sécurité. En conséquence, servir `borgHelperWWW` derrière HTTPS est fortement
+recommandé dès que le navigateur n'est pas sur `localhost` : la clé API et les passphrases transitent en
+clair sur le réseau sinon.
 
 ### Authentification et passphrase
 

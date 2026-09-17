@@ -1,5 +1,26 @@
 # Changelog — borgHelper
 
+## 1.0.81 — 2026-09-17
+
+### `borgHelperWWW` : interface web
+
+Nouveau fichier `borgHelperWWW_ui.html` (SPA vanilla JS, servi sur `/`, aucune dépendance externe) :
+connexion par clé API, liste des serveurs (rapport hors-ligne, aucune passphrase requise), passphrase
+par serveur saisie et conservée en `sessionStorage` pour la session du navigateur, puis panneau
+d'actions par serveur (toutes les commandes de l'API, confirmation pour les actions destructives).
+Testé via curl sur chaque endpoint utilisé par la page + vérification statique du JS (syntaxe, ids DOM,
+handlers) faute d'extension Chrome disponible dans cette session.
+
+## 1.0.80 — 2026-09-17
+
+### `borgHelperWWW` : options CLI (-C, -K, --host, --port, ...)
+
+En exécution directe (`python3 borgHelperWWW ...`), la conf peut désormais être passée en options CLI
+en plus des variables d'environnement : `-C/--cfgfile`, `-K/--api-key`, `--borghelper-bin`, `--timeout`,
+`--host`, `--port` (priment sur l'environnement). Sous `uvicorn borgHelperWWW:app`, uvicorn possède
+seul `sys.argv` — les variables d'environnement `BORGHELPERWWW_*` restent le seul canal dans ce mode
+(inchangé). `python3 borgHelperWWW --help` pour le détail.
+
 ## demo.borghelperrc — 2026-09-17
 
 Fichier de conf démo, 100% local (pas de SSH) : deux nicks `demo-modules` (`/lib/modules`) et

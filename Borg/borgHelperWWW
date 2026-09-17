@@ -11,13 +11,35 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from borgHelper import Version as BORGHELPER_VERSION
 
-# ── Configuration (env vars only — this is meant to run under uvicorn) ─────────
+# ── Configuration ────────────────────────────────────────────────────────────
+# Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
+# sys.argv, donc seules les variables d'environnement BORGHELPERWWW_* sont lues.
+# En exécution directe (`python3 borgHelperWWW ...`), les options CLI ci-dessous sont
+# converties en variables d'environnement avant la résolution de conf plus bas — elles
+# priment donc sur l'environnement déjà présent.
+
+if __name__=='__main__':
+    import argparse
+    _p=argparse.ArgumentParser(prog='borgHelperWWW',description="API HTTP FastAPI pour borgHelper")
+    _p.add_argument('-C','--cfgfile',help="Chemin vers le .borghelperrc dédié à l'API (déf. BORGHELPERWWW_CFGFILE)")
+    _p.add_argument('-K','--api-key',help="Clé partagée attendue dans X-API-Key (déf. BORGHELPERWWW_API_KEY)")
+    _p.add_argument('--borghelper-bin',help="Chemin du script borgHelper (déf. BORGHELPERWWW_BORGHELPER_BIN)")
+    _p.add_argument('--timeout',type=int,help="Timeout par commande en secondes, 0=illimité (déf. BORGHELPERWWW_TIMEOUT)")
+    _p.add_argument('--host',help="Adresse d'écoute (déf. BORGHELPERWWW_HOST, sinon 127.0.0.1)")
+    _p.add_argument('--port',type=int,help="Port d'écoute (déf. BORGHELPERWWW_PORT, sinon 8000)")
+    _args=_p.parse_args()
+    if _args.cfgfile: os.environ['BORGHELPERWWW_CFGFILE']=_args.cfgfile
+    if _args.api_key: os.environ['BORGHELPERWWW_API_KEY']=_args.api_key
+    if _args.borghelper_bin: os.environ['BORGHELPERWWW_BORGHELPER_BIN']=_args.borghelper_bin
+    if _args.timeout is not None: os.environ['BORGHELPERWWW_TIMEOUT']=str(_args.timeout)
+    if _args.host: os.environ['BORGHELPERWWW_HOST']=_args.host
+    if _args.port is not None: os.environ['BORGHELPERWWW_PORT']=str(_args.port)
 
 BORGHELPER_BIN=Path(os.environ.get('BORGHELPERWWW_BORGHELPER_BIN',Path(__file__).resolve().parent/'borgHelper'))
 CFGFILE=os.environ.get('BORGHELPERWWW_CFGFILE')
@@ -25,13 +47,13 @@ API_KEY=os.environ.get('BORGHELPERWWW_API_KEY')
 TIMEOUT=int(os.environ.get('BORGHELPERWWW_TIMEOUT','3600')) or None
 
 if not CFGFILE:
-    sys.exit("BORGHELPERWWW_CFGFILE non défini — chemin vers le .borghelperrc dédié à l'API")
+    sys.exit("Fichier de conf manquant — -C/--cfgfile ou BORGHELPERWWW_CFGFILE (chemin du .borghelperrc dédié à l'API)")
 if not os.path.isfile(CFGFILE):
-    sys.exit(f"BORGHELPERWWW_CFGFILE={CFGFILE} introuvable")
+    sys.exit(f"Fichier de conf introuvable : {CFGFILE}")
 if not API_KEY:
-    sys.exit("BORGHELPERWWW_API_KEY non défini — clé partagée requise pour authentifier les appels API")
+    sys.exit("Clé API manquante — -K/--api-key ou BORGHELPERWWW_API_KEY (clé partagée pour authentifier les appels API)")
 if not BORGHELPER_BIN.is_file():
-    sys.exit(f"borgHelper introuvable ({BORGHELPER_BIN}) — BORGHELPERWWW_BORGHELPER_BIN pour surcharger")
+    sys.exit(f"borgHelper introuvable ({BORGHELPER_BIN}) — --borghelper-bin ou BORGHELPERWWW_BORGHELPER_BIN pour surcharger")
 
 app=FastAPI(
     title="borgHelperWWW",
@@ -74,6 +96,20 @@ def run_borghelper(cmd: str, nick: Optional[str]=None, extra_args=(), passphrase
         raise HTTPException(504,detail=f"Commande {cmd} : timeout après {TIMEOUT}s")
     result=CommandResult(exitcode=proc.returncode,stdout=proc.stdout,stderr=proc.stderr)
     return JSONResponse(status_code=200 if proc.returncode==0 else 400,content=result.dict())
+
+# ── Interface web ────────────────────────────────────────────────────────────
+# Page unique (SPA) : saisie de la clé API, liste des serveurs (rapport hors-ligne),
+# puis détail par serveur avec passphrase de session + actions. Aucun secret n'est
+# embarqué dans ce HTML — l'authentification se fait côté client via fetch() une fois
+# la page chargée, donc cette route reste volontairement non protégée par X-API-Key.
+_UI_FILE=Path(__file__).resolve().parent/'borgHelperWWW_ui.html'
+if not _UI_FILE.is_file():
+    sys.exit(f"Interface web introuvable ({_UI_FILE})")
+_UI_HTML=_UI_FILE.read_text(encoding='utf-8')
+
+@app.get("/",response_class=HTMLResponse,include_in_schema=False)
+def ui_index():
+    return _UI_HTML
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 # Un endpoint par commande CLI de borgHelper (voir README.md), sauf Mount/UMount.

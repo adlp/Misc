@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>borgHelperWWW</title>
+<style>
+  :root{
+    --bg:#f4f5f7; --panel:#ffffff; --border:#dde1e6; --text:#1c2430; --muted:#697182;
+    --accent:#2b6cb0; --accent-hover:#245a94; --danger:#c0392b; --danger-hover:#a5311f;
+    --ok:#1e7d3a; --warn:#b8860b; --mono:ui-monospace,SFMono-Regular,Consolas,Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text)}
+  header{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--border)}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  header .sub{color:var(--muted);font-size:12px}
+  main{max-width:1100px;margin:0 auto;padding:20px}
+  section[hidden]{display:none!important}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:20px;margin-bottom:16px}
+  label{display:block;font-size:13px;font-weight:600;margin-bottom:4px;color:var(--muted)}
+  input[type=text],input[type=password],input[type=number],select{
+    width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:14px;background:#fff;color:var(--text)
+  }
+  input[type=checkbox]{width:16px;height:16px;vertical-align:middle;margin-right:6px}
+  .field{margin-bottom:12px}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .row>.field{flex:1;min-width:160px}
+  button{cursor:pointer;border:none;border-radius:6px;padding:9px 16px;font-size:14px;font-weight:600;background:var(--accent);color:#fff}
+  button:hover{background:var(--accent-hover)}
+  button.secondary{background:#e7eaef;color:var(--text)}
+  button.secondary:hover{background:#dadfe6}
+  button.danger{background:var(--danger)}
+  button.danger:hover{background:var(--danger-hover)}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .error{color:var(--danger);font-size:13px;margin-top:8px;min-height:1em}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--border)}
+  th{color:var(--muted);font-weight:600}
+  .machine-card{display:flex;flex-direction:column;gap:10px;margin-bottom:14px}
+  .machine-head{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
+  .machine-head h3{margin:0;font-size:15px}
+  .badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600}
+  .badge.ok{background:#e3f6e8;color:var(--ok)}
+  .badge.warn{background:#fdf2df;color:var(--warn)}
+  .badge.err{background:#fbe4e1;color:var(--danger)}
+  .pass-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .pass-row input{max-width:260px}
+  .pill{font-size:11px;color:var(--muted)}
+  #backBtn{margin-bottom:12px}
+  .actions-layout{display:flex;gap:20px;flex-wrap:wrap}
+  #actionList{list-style:none;margin:0;padding:0;min-width:220px;flex:0 0 220px}
+  #actionList li{margin-bottom:4px}
+  #actionList button{width:100%;text-align:left;background:#eef1f5;color:var(--text);font-weight:500}
+  #actionList button.active{background:var(--accent);color:#fff}
+  #actionList button.danger-item{color:var(--danger)}
+  #actionPanel{flex:1;min-width:280px}
+  #actionPanel h3{margin-top:0}
+  #actionDesc{color:var(--muted);font-size:13px;margin:-4px 0 14px}
+  pre{background:#11151c;color:#d7dde5;padding:12px;border-radius:6px;overflow:auto;font-family:var(--mono);font-size:12.5px;max-height:420px;white-space:pre-wrap;word-break:break-word}
+  pre.stderr{color:#ffb4a8}
+  .result-meta{display:flex;gap:10px;align-items:center;margin:10px 0}
+  .hint{font-size:12px;color:var(--muted);margin-top:-6px;margin-bottom:10px}
+  footer{text-align:center;color:var(--muted);font-size:12px;padding:20px}
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>borgHelperWWW</h1>
+    <div class="sub" id="headerSub">non connecté</div>
+  </div>
+  <div>
+    <button class="secondary" id="logoutBtn" hidden onclick="logout()">Déconnexion</button>
+  </div>
+</header>
+
+<main>
+
+  <!-- VIEW 1 : LOGIN -->
+  <section id="view-login">
+    <div class="card" style="max-width:420px;margin:60px auto">
+      <h2 style="margin-top:0">Connexion</h2>
+      <div class="field">
+        <label for="apiKeyInput">Clé API (X-API-Key)</label>
+        <input type="password" id="apiKeyInput" placeholder="clé partagée de l'administrateur borgHelperWWW" autocomplete="off">
+      </div>
+      <button onclick="doLogin()" id="loginBtn">Connecter</button>
+      <div class="error" id="loginError"></div>
+      <p class="hint">La clé est conservée en mémoire pour cet onglet (sessionStorage) — effacée à la fermeture.</p>
+    </div>
+  </section>
+
+  <!-- VIEW 2 : MACHINES LIST -->
+  <section id="view-machines" hidden>
+    <div class="card">
+      <div class="machine-head">
+        <h2 style="margin:0">Serveurs</h2>
+        <div>
+          <button class="secondary" onclick="loadMachines()">Rafraîchir</button>
+          <button onclick="toggleNewServer()">+ Nouveau serveur</button>
+        </div>
+      </div>
+      <p class="hint">Rapport hors-ligne (base SQLite uniquement, aucune passphrase requise pour cette liste).</p>
+      <div id="machinesError" class="error"></div>
+      <div id="machinesList">Chargement…</div>
+    </div>
+
+    <div class="card" id="newServerCard" hidden>
+      <h3 style="margin-top:0">Ajouter un serveur (Login)</h3>
+      <p class="hint">⚠️ La passphrase saisie ici est écrite en clair dans le .borghelperrc du serveur borgHelperWWW.</p>
+      <div class="row">
+        <div class="field"><label>Nom d'hôte (servername)</label><input type="text" id="ns_servername"></div>
+        <div class="field"><label>Nickname (optionnel, déf. = servername)</label><input type="text" id="ns_nickname"></div>
+      </div>
+      <div class="field"><label>Dépôt (repo)</label><input type="text" id="ns_repo" placeholder="/chemin/ou/user@host:/chemin"></div>
+      <div class="field"><label>Passphrase du dépôt</label><input type="password" id="ns_passphrase"></div>
+      <div class="row">
+        <div class="field"><label>Keyfile (optionnel)</label><input type="text" id="ns_keyfile"></div>
+        <div class="field"><label>Mountpoint (optionnel)</label><input type="text" id="ns_mountpoint"></div>
+      </div>
+      <button onclick="submitNewServer()">Créer</button>
+      <button class="secondary" onclick="toggleNewServer()">Annuler</button>
+      <pre id="newServerResult" hidden></pre>
+    </div>
+  </section>
+
+  <!-- VIEW 3 : MACHINE DETAIL -->
+  <section id="view-detail" hidden>
+    <button class="secondary" id="backBtn" onclick="showMachines()">← Serveurs</button>
+    <div class="card">
+      <div class="machine-head">
+        <h2 id="detailTitle" style="margin:0"></h2>
+      </div>
+      <div class="pass-row">
+        <label style="margin:0" for="detailPass">Passphrase (BORG_PASSPHRASE)</label>
+        <input type="password" id="detailPass" placeholder="requise pour les actions marquées 🔑">
+        <button class="secondary" onclick="saveDetailPassphrase()">Enregistrer pour la session</button>
+        <span class="pill" id="detailPassStatus"></span>
+      </div>
+    </div>
+
+    <div class="card actions-layout">
+      <ul id="actionList"></ul>
+      <div id="actionPanel">
+        <p class="hint">Choisir une action à gauche.</p>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer>borgHelperWWW — interface web</footer>
+
+<script>
+'use strict';
+
+// ── State ──────────────────────────────────────────────────────────────────
+
+const SS_KEY='bhww_apikey';
+const SS_PASS='bhww_passphrases';
+let currentNick=null;
+let currentActionId=null;
+
+function getApiKey(){ return sessionStorage.getItem(SS_KEY)||''; }
+function setApiKey(k){ sessionStorage.setItem(SS_KEY,k); }
+function clearApiKey(){ sessionStorage.removeItem(SS_KEY); }
+
+function getPassphrases(){
+  try{ return JSON.parse(sessionStorage.getItem(SS_PASS)||'{}'); }catch(e){ return {}; }
+}
+function getPassphrase(nick){ return getPassphrases()[nick]||''; }
+function setPassphrase(nick,val){
+  const p=getPassphrases();
+  if(val){ p[nick]=val; } else { delete p[nick]; }
+  sessionStorage.setItem(SS_PASS,JSON.stringify(p));
+}
+
+// ── View switching ────────────────────────────────────────────────────────
+
+function showView(id){
+  ['view-login','view-machines','view-detail'].forEach(v=>{
+    document.getElementById(v).hidden=(v!==id);
+  });
+  document.getElementById('logoutBtn').hidden=(id==='view-login');
+  document.getElementById('headerSub').textContent = id==='view-login' ? 'non connecté' :
+    (id==='view-detail' ? 'serveur : '+currentNick : 'connecté');
+}
+
+function logout(){
+  clearApiKey();
+  sessionStorage.removeItem(SS_PASS);
+  showView('view-login');
+  document.getElementById('apiKeyInput').value='';
+  document.getElementById('loginError').textContent='';
+}
+
+// ── API helper ────────────────────────────────────────────────────────────
+
+async function apiCall(method, path, params, needsPass, nickForPass){
+  const url=new URL(path, location.origin);
+  Object.entries(params||{}).forEach(([k,v])=>{
+    if(v!==undefined && v!==null && v!=='') url.searchParams.set(k,v);
+  });
+  const headers={'X-API-Key':getApiKey()};
+  if(needsPass){
+    const p=getPassphrase(nickForPass);
+    if(p) headers['X-Borg-Passphrase']=p;
+  }
+  let res;
+  try{
+    res=await fetch(url.toString(), {method, headers});
+  }catch(e){
+    return {httpStatus:0, exitcode:-1, stdout:'', stderr:'Requête impossible : '+e.message};
+  }
+  if(res.status===401){
+    logout();
+    document.getElementById('loginError').textContent='Session expirée ou clé invalide — reconnectez-vous.';
+    return {httpStatus:401, exitcode:-1, stdout:'', stderr:'401 Unauthorized'};
+  }
+  let body;
+  try{ body=await res.json(); }
+  catch(e){ body={exitcode:-1, stdout:'', stderr:'Réponse invalide (HTTP '+res.status+')'}; }
+  return {httpStatus:res.status, ...body};
+}
+
+// ── Login ─────────────────────────────────────────────────────────────────
+
+async function doLogin(){
+  const key=document.getElementById('apiKeyInput').value.trim();
+  const errEl=document.getElementById('loginError');
+  errEl.textContent='';
+  if(!key){ errEl.textContent='Clé requise.'; return; }
+  const btn=document.getElementById('loginBtn'); btn.disabled=true;
+  setApiKey(key);
+  const r=await apiCall('GET','/report',{nick:'ALL',offline:'true',json:'true'},false);
+  btn.disabled=false;
+  if(r.httpStatus===401 || r.httpStatus===0){
+    clearApiKey();
+    errEl.textContent = r.httpStatus===0 ? r.stderr : 'Clé API invalide.';
+    return;
+  }
+  showView('view-machines');
+  loadMachines();
+}
+
+document.getElementById('apiKeyInput').addEventListener('keydown', e=>{ if(e.key==='Enter') doLogin(); });
+
+// ── Machines list ─────────────────────────────────────────────────────────
+
+function badgeFor(depuisStr){
+  // "12.34 h" or "—"
+  if(!depuisStr || depuisStr==='—') return '<span class="badge warn">aucune archive</span>';
+  const h=parseFloat(depuisStr);
+  if(isNaN(h)) return '';
+  if(h>48) return '<span class="badge err">'+depuisStr+'</span>';
+  if(h>25) return '<span class="badge warn">'+depuisStr+'</span>';
+  return '<span class="badge ok">'+depuisStr+'</span>';
+}
+
+async function loadMachines(){
+  const errEl=document.getElementById('machinesError');
+  const listEl=document.getElementById('machinesList');
+  errEl.textContent=''; listEl.textContent='Chargement…';
+  const r=await apiCall('GET','/report',{nick:'ALL',offline:'true',json:'true'},false);
+  if(r.httpStatus===401) return;
+  if(r.exitcode===undefined || r.httpStatus>=500 || (!r.stdout && r.stderr)){
+    errEl.textContent='Erreur : '+(r.stderr||('HTTP '+r.httpStatus));
+    listEl.textContent='';
+    return;
+  }
+  let parsed;
+  try{ parsed=JSON.parse(r.stdout); }
+  catch(e){ errEl.textContent='Réponse Report illisible : '+r.stdout.slice(0,200); listEl.textContent=''; return; }
+  const summary=parsed.summary||{};
+  const nicks=Object.keys(summary).filter(n=>n!=='Totaux').sort();
+  if(nicks.length===0){ listEl.innerHTML='<p class="hint">Aucun serveur déclaré dans le fichier de conf.</p>'; return; }
+  const passes=getPassphrases();
+  listEl.innerHTML=nicks.map(nick=>{
+    const s=summary[nick];
+    const hasPass=!!passes[nick];
+    return `
+      <div class="machine-card card" style="margin-bottom:14px">
+        <div class="machine-head">
+          <h3>${escapeHtml(nick)} ${badgeFor(s['depuis'])}</h3>
+          <button class="open-machine-btn" data-nick="${escapeAttr(nick)}">Ouvrir →</button>
+        </div>
+        <table>
+          <tr><th>Dernière</th><th>Depuis</th><th>Durée</th><th>Taille dédup.</th><th>Récupérable</th><th>Espace restant</th><th>Modifs</th></tr>
+          <tr>
+            <td>${escapeHtml(s['date derniere']||'—')}</td>
+            <td>${escapeHtml(s['depuis']||'—')}</td>
+            <td>${escapeHtml(s['duree']||'—')}</td>
+            <td>${escapeHtml(s['taille']||'—')}</td>
+            <td>${escapeHtml(s['recuperable']||'—')}</td>
+            <td>${escapeHtml(s['reste']||'—')}</td>
+            <td>${escapeHtml(s['modifications']||'—')}</td>
+          </tr>
+        </table>
+        <div class="pass-row">
+          <label style="margin:0" for="pass_${cssId(nick)}">BORG_PASSPHRASE</label>
+          <input type="password" id="pass_${cssId(nick)}" placeholder="passphrase du dépôt" value="${hasPass?escapeAttr(passes[nick]):''}">
+          <button class="secondary save-pass-btn" data-nick="${escapeAttr(nick)}">Enregistrer</button>
+          <span class="pill">${hasPass?'✓ enregistrée pour la session':'non renseignée'}</span>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+document.getElementById('machinesList').addEventListener('click', e=>{
+  const openBtn=e.target.closest('.open-machine-btn');
+  if(openBtn){ openMachine(openBtn.dataset.nick); return; }
+  const saveBtn=e.target.closest('.save-pass-btn');
+  if(saveBtn){ saveListPassphrase(saveBtn.dataset.nick); return; }
+});
+
+function saveListPassphrase(nick){
+  const el=document.getElementById('pass_'+cssId(nick));
+  setPassphrase(nick, el.value);
+  loadMachines();
+}
+
+function toggleNewServer(){
+  const c=document.getElementById('newServerCard');
+  c.hidden=!c.hidden;
+}
+
+async function submitNewServer(){
+  const servername=document.getElementById('ns_servername').value.trim();
+  const nickname=document.getElementById('ns_nickname').value.trim();
+  const repo=document.getElementById('ns_repo').value.trim();
+  const repo_passphrase=document.getElementById('ns_passphrase').value;
+  const keyfile=document.getElementById('ns_keyfile').value.trim();
+  const mountpoint=document.getElementById('ns_mountpoint').value.trim();
+  const out=document.getElementById('newServerResult');
+  if(!servername || !repo || !repo_passphrase){
+    out.hidden=false; out.textContent='servername, repo et passphrase sont requis.'; return;
+  }
+  const r=await apiCall('POST','/login',{
+    servername, nickname:nickname||undefined, repo, repo_passphrase,
+    keyfile:keyfile||undefined, mountpoint:mountpoint||undefined
+  }, false);
+  out.hidden=false;
+  out.textContent=`exitcode: ${r.exitcode}\n\n--- stdout ---\n${r.stdout}\n--- stderr ---\n${r.stderr}`;
+  if(r.exitcode===0){ loadMachines(); }
+}
+
+// ── Machine detail / actions ─────────────────────────────────────────────
+
+const ACTIONS=[
+  {id:'stats', label:'Stats', method:'GET', path:'/stats', needsPass:false, params:[]},
+  {id:'lstbkp', label:'Lister les archives', method:'GET', path:'/lstbkp', needsPass:false, params:[]},
+  {id:'lstbkpfls', label:'Lister fichiers d\'une archive', method:'GET', path:'/lstbkpfls', needsPass:false,
+    params:[{name:'bid',label:'Archive (vide = dernière)',type:'text'}]},
+  {id:'report', label:'Rapport détaillé', method:'GET', path:'/report', needsPass:true,
+    params:[
+      {name:'n',label:'N dernières archives',type:'number'},
+      {name:'offline',label:'Mode hors-ligne (DB seule, pas de passphrase)',type:'bool'},
+      {name:'html',label:'Sortie HTML',type:'bool'},
+    ]},
+  {id:'diffbkp', label:'Diff entre 2 archives', method:'GET', path:'/diffbkp', needsPass:false,
+    params:[{name:'bid_old',label:'Archive ancienne (vide = avant-dernière)',type:'text'},
+            {name:'bid_new',label:'Archive récente (vide = dernière)',type:'text'}]},
+  {id:'search', label:'Rechercher un chemin', method:'GET', path:'/search', needsPass:false,
+    params:[{name:'pattern',label:'Motif (glob * ?)',type:'text',required:true},
+            {name:'archive_from',label:'Depuis archive',type:'text'},
+            {name:'archive_to',label:"Jusqu'à archive",type:'text'}]},
+  {id:'filehist', label:"Historique d'un fichier", method:'GET', path:'/filehist', needsPass:false,
+    params:[{name:'path',label:'Chemin exact',type:'text',required:true},
+            {name:'archive_from',label:'Depuis archive',type:'text'},
+            {name:'archive_to',label:"Jusqu'à archive",type:'text'}]},
+  {id:'duidx', label:'Résumé taille (DuIdx)', method:'GET', path:'/duidx', needsPass:false,
+    params:[{name:'pattern',label:"Motif (vide = résumé global, '*' = par répertoire)",type:'text'},
+            {name:'sort',label:'Tri',type:'select',options:['chemin','added','removed','présent'],default:'chemin'},
+            {name:'json',label:'Sortie JSON',type:'bool'},
+            {name:'archive_from',label:'Depuis archive',type:'text'},
+            {name:'archive_to',label:"Jusqu'à archive",type:'text'}]},
+  {id:'idxtop', label:'Top arborescences (IdxTop)', method:'GET', path:'/idxtop', needsPass:false,
+    params:[{name:'topn',label:'Top N',type:'number',default:20},
+            {name:'depth',label:'Profondeur',type:'number',default:3}]},
+  {id:'difftop', label:'Top arborescences par diff (DiffTop)', method:'GET', path:'/difftop', needsPass:false,
+    params:[{name:'bid',label:'Archive (vide = dernière)',type:'text'},
+            {name:'topn',label:'Top N',type:'number',default:10},
+            {name:'depth',label:'Profondeur',type:'number',default:3}]},
+  {id:'cacheinfo', label:'Cache SQLite : contenu', method:'GET', path:'/cacheinfo', needsPass:false, params:[]},
+  {id:'key', label:'Exporter la clef (papier)', method:'GET', path:'/key', needsPass:true, params:[],
+    sensitive:true},
+  {id:'restoreperms', label:"Droits d'un fichier (sans restaurer)", method:'GET', path:'/restore/perms', needsPass:true,
+    params:[{name:'ftor',label:'Chemin ou glob',type:'text',required:true},
+            {name:'bid',label:'Archive (vide = dernière)',type:'text'}]},
+  {id:'bkp', label:'Lancer un backup', method:'POST', path:'/bkp', needsPass:true,
+    params:[{name:'no_index',label:"Désactiver l'indexation",type:'bool'}]},
+  {id:'index', label:'Indexer', method:'POST', path:'/index', needsPass:true,
+    params:[{name:'force',label:'Forcer la réindexation',type:'bool'},
+            {name:'snapshot_only',label:'Snapshot seul',type:'bool'},
+            {name:'archive',label:'Archive spécifique (vide = toutes)',type:'text'}]},
+  {id:'init', label:'Initialiser le dépôt', method:'POST', path:'/init', needsPass:true,
+    params:[], destructive:true, confirmMsg:'Initialiser un nouveau dépôt borg pour ce serveur ?'},
+  {id:'cacheclean', label:'Nettoyer le cache', method:'POST', path:'/cacheclean', needsPass:false, params:[]},
+  {id:'restore', label:'Restaurer (écrit sur le disque du serveur borgHelperWWW)', method:'POST', path:'/restore', needsPass:true,
+    params:[{name:'ftor',label:'Chemin ou glob à restaurer',type:'text',required:true},
+            {name:'where',label:'Destination (chemin local au serveur borgHelperWWW)',type:'text',required:true},
+            {name:'bid',label:'Archive (vide = dernière)',type:'text'},
+            {name:'flat',label:'Arborescence plate (tgz)',type:'bool'}],
+    destructive:true, confirmMsg:'Restaurer va écrire des fichiers sur le disque du serveur borgHelperWWW. Continuer ?'},
+  {id:'idxpurge', label:'⚡ Purger index (IdxPurge)', method:'POST', path:'/idxpurge', needsPass:false,
+    params:[{name:'pattern',label:'Motif explicite (vide = IDX_EXCLUDE/IDX_INCLUDE de la conf)',type:'text'},
+            {name:'dryrun',label:'Dry-run (aucune suppression)',type:'bool'}],
+    destructive:true, confirmMsg:'Purger rétroactivement diff_index et les anciens snapshots ?'},
+  {id:'prune', label:'⚡ Purger les vieux backups (Prune)', method:'POST', path:'/prune', needsPass:true,
+    params:[], destructive:true, confirmMsg:'DANGER : supprime les archives selon KEEP_*. Irréversible. Continuer ?'},
+  {id:'delbkp', label:'⚡ Supprimer une archive (DelBkp)', method:'DELETE', path:'/delbkp', needsPass:true,
+    params:[{name:'bid',label:'Archive à supprimer',type:'text',required:true}],
+    destructive:true, confirmMsg:'DANGER : suppression définitive de cette archive. Continuer ?'},
+];
+
+function openMachine(nick){
+  currentNick=nick;
+  document.getElementById('detailTitle').textContent=nick;
+  document.getElementById('detailPass').value=getPassphrase(nick);
+  updateDetailPassStatus();
+  renderActionList();
+  document.getElementById('actionPanel').innerHTML='<p class="hint">Choisir une action à gauche.</p>';
+  currentActionId=null;
+  showView('view-detail');
+}
+
+function showMachines(){ showView('view-machines'); loadMachines(); }
+
+function saveDetailPassphrase(){
+  setPassphrase(currentNick, document.getElementById('detailPass').value);
+  updateDetailPassStatus();
+}
+function updateDetailPassStatus(){
+  const has=!!getPassphrase(currentNick);
+  document.getElementById('detailPassStatus').textContent = has ? '✓ enregistrée pour la session' : 'non renseignée';
+}
+
+function renderActionList(){
+  const ul=document.getElementById('actionList');
+  ul.innerHTML=ACTIONS.map(a=>`<li><button class="${a.destructive?'danger-item':''}" id="abtn_${a.id}" onclick="selectAction('${a.id}')">${a.needsPass?'🔑 ':''}${escapeHtml(a.label)}</button></li>`).join('');
+}
+
+function selectAction(id){
+  currentActionId=id;
+  document.querySelectorAll('#actionList button').forEach(b=>b.classList.remove('active'));
+  document.getElementById('abtn_'+id).classList.add('active');
+  const a=ACTIONS.find(x=>x.id===id);
+  const panel=document.getElementById('actionPanel');
+  const fieldsHtml=a.params.map(p=>{
+    const fid='p_'+p.name;
+    if(p.type==='bool'){
+      return `<div class="field"><label style="display:inline"><input type="checkbox" id="${fid}"> ${escapeHtml(p.label)}</label></div>`;
+    }
+    if(p.type==='select'){
+      const opts=p.options.map(o=>`<option value="${escapeAttr(o)}" ${o===p.default?'selected':''}>${escapeHtml(o)}</option>`).join('');
+      return `<div class="field"><label for="${fid}">${escapeHtml(p.label)}</label><select id="${fid}">${opts}</select></div>`;
+    }
+    return `<div class="field"><label for="${fid}">${escapeHtml(p.label)}${p.required?' *':''}</label><input type="${p.type}" id="${fid}" ${p.default!==undefined?('value="'+escapeAttr(p.default)+'"'):''}></div>`;
+  }).join('');
+  panel.innerHTML=`
+    <h3>${a.needsPass?'🔑 ':''}${escapeHtml(a.label)}</h3>
+    <div id="actionDesc">${a.method} ${escapeHtml(a.path)}${a.needsPass?' — nécessite la passphrase de ce serveur':''}${a.sensitive?' — <strong>résultat sensible</strong>':''}</div>
+    ${fieldsHtml}
+    <button class="${a.destructive?'danger':''}" onclick="runAction()">${a.destructive?'⚡ Exécuter':'Exécuter'}</button>
+    <div class="result-meta" id="resultMeta"></div>
+    <div id="resultBox" hidden>
+      <div><strong>stdout</strong></div><pre id="resultStdout"></pre>
+      <div><strong>stderr</strong></div><pre id="resultStderr" class="stderr"></pre>
+    </div>`;
+}
+
+async function runAction(){
+  const a=ACTIONS.find(x=>x.id===currentActionId);
+  if(!a) return;
+  const params={nick:currentNick};
+  for(const p of a.params){
+    const el=document.getElementById('p_'+p.name);
+    if(p.type==='bool'){ params[p.name]=el.checked?'true':'false'; }
+    else{
+      const v=el.value.trim();
+      if(p.required && !v){ alert(p.label+' est requis.'); return; }
+      if(v) params[p.name]=v;
+    }
+  }
+  if(a.destructive && !confirm(a.confirmMsg||'Confirmer cette action ?')) return;
+  if(a.needsPass && !getPassphrase(currentNick) && !confirm('Aucune passphrase enregistrée pour ce serveur — continuer sans (utilisera celle du .borghelperrc si présente) ?')) return;
+
+  const meta=document.getElementById('resultMeta');
+  meta.textContent='Exécution…';
+  const box=document.getElementById('resultBox'); box.hidden=true;
+  const r=await apiCall(a.method, a.path, params, a.needsPass, currentNick);
+  if(r.httpStatus===401) return;
+  box.hidden=false;
+  document.getElementById('resultStdout').textContent=r.stdout||'(vide)';
+  document.getElementById('resultStderr').textContent=r.stderr||'(vide)';
+  const okBadge = r.exitcode===0 ? '<span class="badge ok">exitcode 0</span>' : `<span class="badge err">exitcode ${r.exitcode}</span>`;
+  meta.innerHTML=okBadge+` <span class="pill">HTTP ${r.httpStatus}</span>`;
+}
+
+// ── Utils ─────────────────────────────────────────────────────────────────
+
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function escapeAttr(s){ return escapeHtml(s); }
+function cssId(s){ return String(s).replace(/[^a-zA-Z0-9_-]/g,'_'); }
+
+// ── Boot ──────────────────────────────────────────────────────────────────
+
+(function boot(){
+  if(getApiKey()){
+    showView('view-machines');
+    loadMachines();
+  } else {
+    showView('view-login');
+  }
+})();
+</script>
+</body>
+</html>
