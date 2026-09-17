@@ -227,6 +227,8 @@ borgHelper -c Prune -n ALL
 
 Requiert au moins une clef `KEEP_*` dans la conf.  
 Enchaîne automatiquement `borg compact`, invalide le cache SQLite, et purge les entrées orphelines du `diff.db`.
+Met aussi à jour le schéma de `cache.db`/`diff.db` si nécessaire avant toute opération (comme `Bkp`/`Index`)
+— voir [Schéma de base de données](TECHNICAL.md#migrations-diffdb--table-de-correspondance-version--action).
 
 ---
 

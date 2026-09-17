@@ -621,16 +621,30 @@ La `schema_version` ne change **pas** à chaque release — seulement lors d'un 
 
 | Constante | Valeur actuelle |
 |-----------|-----------------|
-| `DIFF_DB_SCHEMA_VERSION` | `1` |
+| `DIFF_DB_SCHEMA_VERSION` | `2` |
 | `CACHE_DB_SCHEMA_VERSION` | `1` |
 
-### Migration `archive_snapshot` (historique)
+### Migrations diff.db — table de correspondance version ↔ action
 
-`ensure_diff_db()` détecte automatiquement l'ancien schéma de `archive_snapshot` (colonne `path` directe) et migre vers le schéma déduplication (`file_id → snapshot_file`) au premier lancement après mise à jour.
+Chaque palier de `DIFF_DB_SCHEMA_VERSION` correspond à une ou plusieurs migrations, **auto-détectées par
+introspection** (`PRAGMA table_info`, pas seulement par comparaison de `schema_version` — donc rejouables
+sans risque même après une migration partielle ou un `schema_version` désynchronisé) et appliquées par
+`ensure_diff_db()` avant toute autre opération :
 
-### Migration `snapshot_file.type`
+| Version | Migration | Détection | Détail |
+|---------|-----------|-----------|--------|
+| 1 | — (schéma initial) | — | `diff_index`, `snapshot_file`, `archive_snapshot`, `archive_stats`, ... |
+| 2 | Déduplication `archive_snapshot` | colonne `path` présente sur `archive_snapshot` | `_migrate_archive_snapshot()` : colonne `path` directe → `file_id → snapshot_file` |
+| 2 | `snapshot_file.type` | colonne `type` absente sur `snapshot_file` | `ALTER TABLE snapshot_file ADD COLUMN type TEXT` — alimente la colonne « genre » de `TreeHist` |
 
-`ensure_diff_db()` ajoute automatiquement la colonne `type` à `snapshot_file` (`ALTER TABLE`) si absente. Additive et rétrocompatible (aucun appelant existant ne fait `SELECT *` sur `archive_snapshot_v` ni de dépaquetage positionnel) — pas de bump de `DIFF_DB_SCHEMA_VERSION`. Les lignes déjà écrites gardent `type=NULL` jusqu'à réindexation du snapshot (`Index -F -S` ou `Bkp`).
+`ensure_diff_db()` est désormais garanti appelé (donc les migrations garanties appliquées) avant tout
+accès à `diff.db`/`cache.db` depuis **Bkp**, **Index**, **Prune** et tous les autres consommateurs —
+`prune()` ne passait par aucun `ensure_*_db()` avant 1.0.90, ce qui pouvait laisser `_cleanup_index_after_prune()`
+et `clear_cache_nick()` opérer sur un schéma non migré.
+
+Les lignes `snapshot_file` déjà écrites avant la migration 2 gardent `type=NULL` jusqu'à réindexation du
+snapshot — `indexsnap()` s'auto-répare au besoin (voir CHANGELOG 1.0.89) : un `type IS NULL` détecté
+force un resnapshot complet une fois, sans intervention manuelle.
 
 ---
 

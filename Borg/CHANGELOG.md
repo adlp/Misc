@@ -1,5 +1,26 @@
 # Changelog — borgHelper
 
+## 1.0.90 — 2026-09-17
+
+### `Prune` migre désormais la DB comme `Bkp`/`Index` — `DIFF_DB_SCHEMA_VERSION` bumpée à 2
+
+`prune()` ne passait par aucun `ensure_diff_db()`/`ensure_cache_db()` avant d'exécuter
+`_cleanup_index_after_prune()` et `clear_cache_nick()` — contrairement à `Bkp`/`Index`/`Report`, il
+pouvait donc opérer sur un schéma non migré (colonne `snapshot_file.type` manquante, ancien
+`archive_snapshot`). Corrigé : `prune()` appelle désormais `ensure_cache_db()`/`ensure_diff_db()` en
+tout premier, et `_cleanup_index_after_prune()` le fait aussi en défense en profondeur.
+
+`DIFF_DB_SCHEMA_VERSION` passe de 1 à 2, documentant enfin correctement les deux migrations
+structurelles déjà en place (déduplication `archive_snapshot`, `snapshot_file.type`) — jusqu'ici les
+deux étaient appliquées sous version 1, rendant le numéro inexploitable pour savoir si une DB était à
+jour. Les migrations restent auto-détectées par introspection (`PRAGMA table_info`), pas seulement par
+comparaison de version — donc rejouables sans risque. Table de correspondance version ↔ migration dans
+TECHNICAL.md.
+
+Vérifié par test réel : DB ramenée à un état pré-migration (colonne `type` supprimée, `schema_version`
+forcé à 1), seul `Prune` lancé (aucun `Bkp`/`Index`) → colonne restaurée, `schema_version` remonté à 2.
+Garde anti-régression (DB plus récente que le binaire) revérifiée, toujours fonctionnelle.
+
 ## 1.0.89 — 2026-09-17
 
 ### `IndexSnap` : auto-réparation du `type` manquant

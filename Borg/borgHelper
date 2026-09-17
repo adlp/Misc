@@ -9,9 +9,18 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.89"
-DIFF_DB_SCHEMA_VERSION  = 1
+Version="1.0.90"
+DIFF_DB_SCHEMA_VERSION  = 2
 CACHE_DB_SCHEMA_VERSION = 1
+# Historique diff.db — chaque palier correspond à une migration idempotente et auto-détectée
+# (par introspection PRAGMA table_info, pas seulement par comparaison de schema_version — donc
+# rejouable sans risque même après une migration partielle) appliquée par ensure_diff_db() :
+#   1 : schéma initial (diff_index, snapshot_file, archive_snapshot, archive_stats, ...)
+#   2 : archive_snapshot déduplication (BorgHelperDB._migrate_archive_snapshot, depuis colonne
+#       `path` directe vers `file_id` → snapshot_file) + snapshot_file.type (genre TreeHist —
+#       ALTER TABLE ADD COLUMN, auto-réparé au besoin par indexsnap(), voir CHANGELOG 1.0.86/1.0.89)
+# Ne concerne QUE diff.db, appelé par ensure_diff_db() — désormais garanti avant tout accès
+# depuis Bkp, Index, Prune (voir prune()) et tous les autres consommateurs de diff.db/cache.db.
 
 class SchemaVersionError(Exception): pass
 
@@ -1334,6 +1343,7 @@ class BorgHelper:
         if self._nick_noidx(nick): return
         db_path=self.db.get_diff_db(nick)
         if not os.path.exists(db_path): return
+        self.db.ensure_diff_db(db_path)
         cfg=self.borg.cfgreaded(nick,debug=debug)
         rb=self.borg.boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
         try:
@@ -1801,6 +1811,10 @@ class BorgHelper:
 
     def prune(self,nick,dryrun=False,debug=0):
         cfg=self.borg.cfgreaded(nick,debug=debug)
+        # Garantit que cache.db/diff.db sont à jour (migrations auto) avant que Prune n'y touche —
+        # Prune ne passait jusqu'ici par aucun ensure_*_db(), contrairement à Bkp/Index/Report.
+        self.db.ensure_cache_db(self.db.get_cache_db(nick))
+        self.db.ensure_diff_db(self.db.get_diff_db(nick))
         cmd=['prune']
         for i in list(cfg.keys()):
             if 'KEEP_DAILY'==i: cmd.extend(['--keep-daily',cfg[i]])
