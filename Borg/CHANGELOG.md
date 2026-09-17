@@ -1,5 +1,15 @@
 # Changelog — borgHelper
 
+## 1.0.84 — 2026-09-17
+
+### `TreeHist` : ne remonte que le contenu direct du répertoire
+
+Corrigé : `TreeHist` listait tout le sous-arbre sous `<préfixe>` (n'importe quelle profondeur) au lieu de
+son seul contenu direct. Restreint désormais à `path=<préfixe>` (l'entrée du répertoire lui-même) et à
+ses enfants immédiats (`path LIKE 'préfixe/%' AND path NOT LIKE 'préfixe/%/%'`) — jamais le contenu d'un
+sous-répertoire. Pour y descendre, relancer `TreeHist -f <sous-répertoire>`. Vérifié par test réel
+(changements à 3 profondeurs : racine, sous-répertoire direct, sous-répertoire imbriqué).
+
 ## 1.0.83 — 2026-09-17
 
 ### `TreeHist` : bascule en listing courant si rien n'a changé

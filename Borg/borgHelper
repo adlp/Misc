@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.83"
+Version="1.0.84"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -349,7 +349,8 @@ def usage(doc=None,debug=0):
         printer("   -c FileHist -f <chemin> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive]")
         printer("       Historique des changements d'un chemin exact")
         printer("   -c TreeHist [-f <préfixe>] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive]")
-        printer("       Pour chaque objet sous <préfixe> (racine si omis) : liste des archives où il a changé")
+        printer("       Contenu DIRECT de <préfixe> (racine si omis) : pour chaque objet à ce niveau")
+        printer("       uniquement (pas de descente dans les sous-répertoires), archives où il a changé")
         printer("       (apparu/modifié/disparu…)  |  -b ALL : tout l'historique, sinon dernière archive indexée seulement")
         printer("       Aucune modification trouvée → contenu courant du répertoire à la place (snapshot) :")
         printer("       sous-répertoires (apparition/disparition) et fichiers (création/modif/suppression),")
@@ -433,8 +434,9 @@ def usage(doc=None,debug=0):
         printer("       Historique complet des changements d'un chemin exact")
     elif doc=='treehist':
         printer("   -c TreeHist [-f <préfixe>] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive]")
-        printer("       Pour chaque objet sous <préfixe> (toute l'arborescence si omis) : liste triée par")
-        printer("       chemin des événements (added/modified/removed/…) et de l'archive où ils ont eu lieu")
+        printer("       Contenu DIRECT de <préfixe> (racine entière si omis) uniquement — jamais le contenu")
+        printer("       d'un sous-répertoire (relancer TreeHist avec -f pointant dessus pour y descendre) :")
+        printer("       liste triée par chemin des événements (added/modified/removed/…) et de l'archive")
         printer("       -b : depuis archive X  |  -B : jusqu'à archive Y  |  -b ALL : tout l'index")
         printer("       Sans -b/-B : dernière archive indexée seulement (comme Search)")
         printer("       Si aucune modification dans la plage demandée : affiche à la place le contenu")
@@ -2253,8 +2255,12 @@ class BorgHelper:
         _print_section('Fichiers',files)
 
     def treehist(self,nick,prefix=None,archive_from=None,archive_to=None,debug=0):
+        # Ne remonte que le contenu direct de <prefix> : sa propre entrée (path=prefix) et ses
+        # enfants immédiats (path LIKE 'prefix/%' MAIS pas plus profond, donc PAS LIKE 'prefix/%/%') —
+        # jamais le contenu d'un sous-répertoire.
         prefix=(prefix or '').strip().lstrip('/').rstrip('/')
         sql_pat=(prefix+'/%') if prefix else '%'
+        sql_deep=(prefix+'/%/%') if prefix else '%/%'
         all_rows=[]
         for n in nick.split(','):
             db_path=self.db.get_diff_db(n)
@@ -2265,9 +2271,9 @@ class BorgHelper:
                 conn=sqlite3.connect(db_path)
                 af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
                 if prefix:
-                    where='(path LIKE ? OR path=?)'; base_params=[sql_pat,prefix]
+                    where='(path=? OR (path LIKE ? AND path NOT LIKE ?))'; base_params=[prefix,sql_pat,sql_deep]
                 else:
-                    where='path LIKE ?'; base_params=[sql_pat]
+                    where='path NOT LIKE ?'; base_params=[sql_deep]
                 rows=conn.execute(f"SELECT nick,archive_new_date,archive_new,change_type,path FROM diff_index WHERE nick=? AND {where}"+af_sql+" ORDER BY path,archive_new_date",[n]+base_params+af_params).fetchall()
                 if rows: all_rows.extend(rows)
                 else: self._treehist_listing(n,prefix,conn,debug=debug)

@@ -445,12 +445,14 @@ borgHelper -c FileHist -f /var/lib/postgresql -n ALL
 ---
 
 ### `TreeHist`
-Pour chaque objet sous un préfixe d'arborescence (toute l'arborescence si `-f` omis) : liste triée par
-chemin des événements où il a changé (`added`/`modified`/`removed`/…) et l'archive concernée.
+Contenu **direct** d'un répertoire (racine entière si `-f` omis) — jamais le contenu d'un
+sous-répertoire : pour chaque objet à ce niveau uniquement, liste triée par chemin des événements où il
+a changé (`added`/`modified`/`removed`/…) et l'archive concernée. Pour descendre dans un
+sous-répertoire, relancer `TreeHist` avec `-f` pointant dessus.
 
 ```bash
-borgHelper -c TreeHist -n mon-serveur                        # racine entière, dernière archive indexée
-borgHelper -c TreeHist -f /etc -n mon-serveur -b ALL          # tout /etc, tout l'historique
+borgHelper -c TreeHist -n mon-serveur                        # contenu direct de la racine
+borgHelper -c TreeHist -f /etc -n mon-serveur -b ALL          # contenu direct de /etc, tout l'historique
 borgHelper -c TreeHist -f /var/lib/docker -n ALL -b ALL
 ```
 
