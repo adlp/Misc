@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## 1.0.85 — 2026-09-17
+
+### `TreeHist` : liste toujours l'intégralité du répertoire courant
+
+`TreeHist` n'affichait que les entrées ayant changé dans la plage demandée ; les fichiers/répertoires
+présents mais inchangés (ou dont l'historique a été purgé) étaient absents. Unifié les deux anciens
+modes (table plate des changements / listing de secours) en un seul : toujours l'intégralité du
+répertoire courant (snapshot), chaque entrée annotée de ses propres événements dans la plage `-b`/`-B`
+(défaut : dernière archive indexée, comme avant), avec `aucun événement dans la plage` pour les entrées
+présentes mais inchangées sur la période — au lieu d'être simplement omises. Vérifié par test réel
+(fichier modifié + fichier jamais touché dans le même répertoire, aux deux apparaissent désormais).
+
 ## 1.0.84 — 2026-09-17
 
 ### `TreeHist` : ne remonte que le contenu direct du répertoire

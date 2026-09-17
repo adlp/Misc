@@ -446,9 +446,13 @@ borgHelper -c FileHist -f /var/lib/postgresql -n ALL
 
 ### `TreeHist`
 Contenu **direct** d'un répertoire (racine entière si `-f` omis) — jamais le contenu d'un
-sous-répertoire : pour chaque objet à ce niveau uniquement, liste triée par chemin des événements où il
-a changé (`added`/`modified`/`removed`/…) et l'archive concernée. Pour descendre dans un
-sous-répertoire, relancer `TreeHist` avec `-f` pointant dessus.
+sous-répertoire. Liste **toujours l'intégralité** du répertoire courant (dernier snapshot indexé),
+comme un `ls` enrichi — un objet par ligne, y compris les entrées sans événement dans la plage demandée
+(présentes, simplement inchangées sur la période) :
+- sous-répertoires : leurs événements propres (`added directory`/`removed directory`/…) dans la plage
+- fichiers : leur historique de création/modification/suppression dans la plage
+
+Pour descendre dans un sous-répertoire, relancer `TreeHist` avec `-f` pointant dessus.
 
 ```bash
 borgHelper -c TreeHist -n mon-serveur                        # contenu direct de la racine
@@ -457,20 +461,8 @@ borgHelper -c TreeHist -f /var/lib/docker -n ALL -b ALL
 ```
 
 Plage : `-b <archive>` (depuis), `-B <archive>` (jusqu'à), `-b ALL` (tout), sans les deux (dernière
-paire indexée seulement — comme `Search`).
-
-**Répertoire sans modification dans la plage demandée** : `TreeHist` affiche à la place le contenu
-courant du répertoire (dernier snapshot indexé), comme un `ls` enrichi — un objet par ligne :
-- sous-répertoires : leurs apparitions/disparitions (`added directory`/`removed directory`/…)
-- fichiers : tout leur historique de création/modification/suppression
-
-Cet historique par entrée porte toujours sur **tout l'index**, indépendamment de `-b`/`-B` (la plage ne
-sert qu'à décider si on bascule en mode « contenu courant »).
-
-```bash
-borgHelper -c TreeHist -f /var/lib/docker/quiet-volume -n mon-serveur
-# → rien de changé récemment sous ce chemin : liste son contenu actuel avec l'historique de chaque entrée
-```
+paire indexée seulement — comme `Search`). Une entrée présente mais sans événement dans cette plage
+affiche `aucun événement dans la plage` plutôt que d'être omise.
 
 ---
 

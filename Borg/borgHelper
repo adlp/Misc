@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.84"
+Version="1.0.85"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -349,12 +349,11 @@ def usage(doc=None,debug=0):
         printer("   -c FileHist -f <chemin> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive]")
         printer("       Historique des changements d'un chemin exact")
         printer("   -c TreeHist [-f <préfixe>] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive]")
-        printer("       Contenu DIRECT de <préfixe> (racine si omis) : pour chaque objet à ce niveau")
-        printer("       uniquement (pas de descente dans les sous-répertoires), archives où il a changé")
-        printer("       (apparu/modifié/disparu…)  |  -b ALL : tout l'historique, sinon dernière archive indexée seulement")
-        printer("       Aucune modification trouvée → contenu courant du répertoire à la place (snapshot) :")
-        printer("       sous-répertoires (apparition/disparition) et fichiers (création/modif/suppression),")
-        printer("       historique complet par entrée quelle que soit la plage -b/-B demandée")
+        printer("       Contenu DIRECT de <préfixe> (racine si omis), toujours en entier — sous-répertoires")
+        printer("       et fichiers présents (snapshot), même sans événement dans la plage demandée — pas")
+        printer("       de descente dans les sous-répertoires. Chaque entrée : ses événements dans la plage")
+        printer("       (apparu/modifié/disparu…)  |  -b ALL : tout l'historique, sinon dernière archive indexée")
+        printer("       'aucun événement dans la plage' si l'entrée existe mais n'a pas bougé sur la période")
         printer("   -c DuIdx [-f pattern] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-s col[:asc|desc]] [-j]")
         printer("       Résumé du-like : taille/nb par type depuis le SQLite")
         printer("       Sans -f : résumé global  |  -f '*' : par répertoire  |  -j : JSON")
@@ -435,14 +434,12 @@ def usage(doc=None,debug=0):
     elif doc=='treehist':
         printer("   -c TreeHist [-f <préfixe>] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive]")
         printer("       Contenu DIRECT de <préfixe> (racine entière si omis) uniquement — jamais le contenu")
-        printer("       d'un sous-répertoire (relancer TreeHist avec -f pointant dessus pour y descendre) :")
-        printer("       liste triée par chemin des événements (added/modified/removed/…) et de l'archive")
+        printer("       d'un sous-répertoire (relancer TreeHist avec -f pointant dessus pour y descendre).")
+        printer("       Liste TOUJOURS l'intégralité du répertoire courant (snapshot) — sous-répertoires")
+        printer("       (apparition/disparition) et fichiers (création/modification/suppression) —, y")
+        printer("       compris les entrées sans événement dans la plage demandée (présentes, inchangées).")
         printer("       -b : depuis archive X  |  -B : jusqu'à archive Y  |  -b ALL : tout l'index")
         printer("       Sans -b/-B : dernière archive indexée seulement (comme Search)")
-        printer("       Si aucune modification dans la plage demandée : affiche à la place le contenu")
-        printer("       courant du répertoire (dernier snapshot indexé) — un objet par ligne, chaque")
-        printer("       sous-répertoire avec ses apparitions/disparitions, chaque fichier avec tout son")
-        printer("       historique de création/modification/suppression (historique complet, sans borne)")
     elif doc=='duidx':
         printer("   -c DuIdx [-f pattern] [-n nick/ALL] [-b archive|ALL] [-B archive] [-s col[:asc|desc]] [-j]")
         printer("       Résumé du-like depuis le SQLite : taille et nb de fichiers par type")
@@ -2207,11 +2204,11 @@ class BorgHelper:
             t.add_row([nick_r,(date_r or '')[:19],a_old,a_new,type_r,convert_octets_readable(sb) if sb else '',convert_octets_readable(sa) if sa else ''])
         print(t)
 
-    def _treehist_listing(self,n,prefix,conn,debug=0):
-        """Aucune modification sous prefix (dans la plage demandée) : liste le contenu courant
-        du répertoire (dernière archive snapshotée), chaque enfant annoté de son historique complet
-        (apparition/disparition pour les sous-répertoires, création/modification/suppression pour
-        les fichiers), indépendamment de la plage d'archives demandée."""
+    def _treehist_listing(self,n,prefix,conn,archive_from=None,archive_to=None,debug=0):
+        """Liste le contenu DIRECT du répertoire courant (dernière archive snapshotée) — sous-répertoires
+        et fichiers présents, même sans événement dans la plage demandée. Chaque entrée est annotée de
+        ses propres événements dans cette plage (défaut : dernière archive indexée, comme Search/-b ALL
+        pour tout l'historique) ; 'aucun événement dans la plage' si l'entrée existe mais n'a pas bougé."""
         row=conn.execute("SELECT archive FROM archive_snapshot_v WHERE nick=? ORDER BY archive_date DESC LIMIT 1",(n,)).fetchone()
         if row is None:
             print(f"{n}: aucun snapshot indexé sous {prefix or '/'} — lancez : borgHelper -c Index -n {n}"); return
@@ -2230,23 +2227,33 @@ class BorgHelper:
             seg=rel.split('/',1)
             name=seg[0]; is_dir=len(seg)>1
             children[name]=children.get(name,False) or is_dir
+        af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
+        from prettytable import PrettyTable
+        def _events_for(full_path):
+            return conn.execute("SELECT change_type,archive_new,archive_new_date FROM diff_index WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date",[n,full_path]+af_params).fetchall()
+        if prefix:
+            own_events=_events_for(prefix)
+            if own_events:
+                print(f"{n}: {prefix} (entrée elle-même)")
+                t=PrettyTable(['type','archive','date'])
+                t.align['archive']='l'
+                for ct,arch,date in own_events:
+                    t.add_row([ct,arch,(date or '')[:19]])
+                print(t)
         if not children:
             print(f"{n}: {prefix or '/'} vide ou introuvable dans le snapshot ({latest})"); return
         dirs=sorted(name for name,d in children.items() if d)
         files=sorted(name for name,d in children.items() if not d)
-        from prettytable import PrettyTable
-        def _events_for(name):
-            full=f"{prefix}/{name}" if prefix else name
-            return full,conn.execute("SELECT change_type,archive_new,archive_new_date FROM diff_index WHERE nick=? AND path=? ORDER BY archive_new_date",(n,full)).fetchall()
         def _print_section(title,names):
             if not names: return
             print(f"{n}: {title} de {prefix or '/'} (snapshot {latest})")
             t=PrettyTable(['nom','type','archive','date'])
             t.align['nom']='l'; t.align['archive']='l'
             for name in names:
-                full,events=_events_for(name)
+                full=f"{prefix}/{name}" if prefix else name
+                events=_events_for(full)
                 if not events:
-                    t.add_row([name,'—','—','présent depuis l\'origine'])
+                    t.add_row([name,'—','—','aucun événement dans la plage'])
                 else:
                     for ct,arch,date in events:
                         t.add_row([name,ct,arch,(date or '')[:19]])
@@ -2255,13 +2262,10 @@ class BorgHelper:
         _print_section('Fichiers',files)
 
     def treehist(self,nick,prefix=None,archive_from=None,archive_to=None,debug=0):
-        # Ne remonte que le contenu direct de <prefix> : sa propre entrée (path=prefix) et ses
-        # enfants immédiats (path LIKE 'prefix/%' MAIS pas plus profond, donc PAS LIKE 'prefix/%/%') —
-        # jamais le contenu d'un sous-répertoire.
+        # Contenu DIRECT de <prefix> (racine si omis) uniquement — jamais le contenu d'un
+        # sous-répertoire. Liste toujours tout le répertoire courant (fichiers/sous-répertoires
+        # présents, même sans événement dans la plage demandée), pas seulement ce qui a changé.
         prefix=(prefix or '').strip().lstrip('/').rstrip('/')
-        sql_pat=(prefix+'/%') if prefix else '%'
-        sql_deep=(prefix+'/%/%') if prefix else '%/%'
-        all_rows=[]
         for n in nick.split(','):
             db_path=self.db.get_diff_db(n)
             self.db.ensure_diff_db(db_path)
@@ -2269,24 +2273,10 @@ class BorgHelper:
                 printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
             try:
                 conn=sqlite3.connect(db_path)
-                af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
-                if prefix:
-                    where='(path=? OR (path LIKE ? AND path NOT LIKE ?))'; base_params=[prefix,sql_pat,sql_deep]
-                else:
-                    where='path NOT LIKE ?'; base_params=[sql_deep]
-                rows=conn.execute(f"SELECT nick,archive_new_date,archive_new,change_type,path FROM diff_index WHERE nick=? AND {where}"+af_sql+" ORDER BY path,archive_new_date",[n]+base_params+af_params).fetchall()
-                if rows: all_rows.extend(rows)
-                else: self._treehist_listing(n,prefix,conn,debug=debug)
+                self._treehist_listing(n,prefix,conn,archive_from=archive_from,archive_to=archive_to,debug=debug)
                 conn.close()
             except sqlite3.Error as e:
                 printer(f"SQLite error ({db_path}): {e}")
-        if all_rows:
-            from prettytable import PrettyTable
-            t=PrettyTable(['nick','chemin','type','archive','date'])
-            t.align['chemin']='l'; t.align['archive']='l'
-            for nick_r,date_r,arch_r,type_r,path_r in all_rows:
-                t.add_row([nick_r,path_r,type_r,arch_r,(date_r or '')[:19]])
-            print(t)
 
     def duidx(self,nick,pattern=None,sort_by='chemin',reverse=False,as_json=False,archive_from=None,archive_to=None,debug=0):
         if pattern is None:
