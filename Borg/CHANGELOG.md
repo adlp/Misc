@@ -1,5 +1,16 @@
 # Changelog — borgHelper
 
+## Interface web — bouton Backup immédiat sur la liste des serveurs — 2026-09-17
+
+Bouton **▶ Backup** sur chaque carte serveur de la page « Serveurs » : lance un `Bkp` immédiat
+(`POST /bkp`) sans passer par la page détail. Confirmation avant lancement ; utilise la passphrase de
+session déjà enregistrée pour ce nick si présente, sinon avertit et propose de continuer sans (comme les
+actions 🔑 de la page détail). Bouton désactivé pendant l'exécution, résultat affiché (succès/erreur +
+détail), liste rafraîchie automatiquement ensuite pour refléter le nouveau backup.
+
+Vérifié par test réel : appel `POST /bkp` tel que déclenché par le bouton → exitcode 0, backup réel
+effectué sur le dépôt démo.
+
 ## 1.0.92 — TreeHist affiche les droits unix — 2026-09-17
 
 ### Nouvelle colonne `droits` (mode ls-style) sur `TreeHist`

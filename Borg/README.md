@@ -678,7 +678,10 @@ Swagger interactif : `http://<host>:<port>/docs`
 2. **Serveurs** : liste des nicks avec un rapport sommaire hors-ligne (aucune passphrase requise pour
    cette liste — lecture SQLite uniquement). Bouton **+ Nouveau serveur** pour `Login`. Pas de saisie de
    passphrase sur cette page — juste un badge indiquant si elle est déjà enregistrée pour la session ou
-   non ; à renseigner sur la page du serveur concerné.
+   non ; à renseigner sur la page du serveur concerné. Bouton **▶ Backup** sur chaque carte serveur pour
+   lancer un `Bkp` immédiat (confirmation avant lancement ; utilise la passphrase de session si
+   enregistrée, sinon celle du `.borghelperrc` si présente — avertissement sinon) ; la liste se
+   rafraîchit automatiquement une fois terminé.
 3. **Détail d'un serveur** : champ **BORG_PASSPHRASE** à enregistrer pour la session (`sessionStorage`,
    par nick) — c'est ici, et seulement ici, qu'elle se saisit. Envoyée en `X-Borg-Passphrase` pour les
    actions qui en ont besoin (repérées par 🔑) ; les actions destructives (`Prune`, `DelBkp`, `Restore`,

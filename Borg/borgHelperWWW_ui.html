@@ -324,7 +324,10 @@ async function loadMachines(){
       <div class="machine-card card" style="margin-bottom:14px">
         <div class="machine-head">
           <h3>${escapeHtml(nick)} ${badgeFor(s['depuis'])}</h3>
-          <button class="open-machine-btn" data-nick="${escapeAttr(nick)}">Ouvrir →</button>
+          <div>
+            <button class="secondary bkp-now-btn" data-nick="${escapeAttr(nick)}">▶ Backup</button>
+            <button class="open-machine-btn" data-nick="${escapeAttr(nick)}">Ouvrir →</button>
+          </div>
         </div>
         <table>
           <tr><th>Dernière</th><th>Depuis</th><th>Durée</th><th>Taille dédup.</th><th>Récupérable</th><th>Espace restant</th><th>Modifs</th></tr>
@@ -348,7 +351,25 @@ async function loadMachines(){
 document.getElementById('machinesList').addEventListener('click', e=>{
   const openBtn=e.target.closest('.open-machine-btn');
   if(openBtn){ openMachine(openBtn.dataset.nick); return; }
+  const bkpBtn=e.target.closest('.bkp-now-btn');
+  if(bkpBtn){ runBackupNow(bkpBtn.dataset.nick,bkpBtn); return; }
 });
+
+async function runBackupNow(nick,btn){
+  if(!confirm(`Lancer un backup immédiat pour ${nick} ?`)) return;
+  if(!getPassphrase(nick) && !confirm("Aucune passphrase enregistrée pour ce serveur — continuer sans (utilisera celle du .borghelperrc si présente) ?")) return;
+  const orig=btn.textContent;
+  btn.disabled=true; btn.textContent='Backup en cours…';
+  const r=await apiCall('POST','/bkp',{nick},true,nick);
+  btn.disabled=false; btn.textContent=orig;
+  if(r.httpStatus===401) return;
+  if(r.exitcode===0){
+    alert(`Backup ${nick} terminé (exitcode 0).`);
+  }else{
+    alert(`Backup ${nick} en erreur (exitcode ${r.exitcode}) :\n`+(r.stderr||r.stdout||'(pas de détail)'));
+  }
+  loadMachines();
+}
 
 function toggleNewServer(){
   const c=document.getElementById('newServerCard');
