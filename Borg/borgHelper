@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.88"
+Version="1.0.89"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -345,6 +345,8 @@ def usage(doc=None,debug=0):
         printer("       Parallèle par défaut (IDX_WORKERS=4 dans borghelperrc)")
         printer("       -F : force la réindexation  |  -S : snapshot seul (sans recalculer les diffs)")
         printer("       -A <archive> : réindexe uniquement la paire dont archive_new=<archive>")
+        printer("       IndexSnap s'auto-répare : un type manquant (colonne snapshot_file.type) force un")
+        printer("       resnapshot complet automatique une fois (au prochain Bkp/Index), sans -F manuel")
         printer("   -c Search -f <pattern> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive]")
         printer("       Cherche dans l'index des diffs par nom de fichier (glob * et ?)")
         printer("       -b : depuis archive X  |  -B : jusqu'à archive Y  |  -b ALL : tout l'index")
@@ -429,6 +431,8 @@ def usage(doc=None,debug=0):
         printer("       Indexe les diffs entre archives consécutives (incrémental, parallèle)")
         printer("       -F : force la réindexation  -S : snapshot seul")
         printer("       -A <archive> : réindexe uniquement la paire dont archive_new=<archive>")
+        printer("       Auto-réparation : un type manquant (snapshot_file.type) force un resnapshot")
+        printer("       complet une fois, automatiquement, sans besoin de -F (voir TreeHist)")
         printer("       IDX_WORKERS dans borghelperrc : nb de borg diff parallèles (défaut 4)")
     elif doc=='search':
         printer("   -c Search -f <pattern> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive]")
@@ -1927,9 +1931,23 @@ class BorgHelper:
             except sqlite3.Error as e:
                 printer(f"SQLite error ({db_path}): {e}")
         print(f"  {nick}: snapshot {archive_name}...",flush=True)
-        # Tentative incrémentale (pas en mode force)
-        inc=None
+        # Auto-réparation : le clonage incrémental réutilise le file_id (donc le type) des fichiers
+        # inchangés — un type manquant (migration snapshot_file.type, ou ancien snapshot pré-1.0.86)
+        # ne se répare jamais tout seul via l'incrémental. S'il en reste, un resnapshot complet est
+        # forcé une fois pour tout repeupler ; les backups suivants repassent en incrémental normal.
+        auto_repair=False
         if not force:
+            try:
+                rconn=sqlite3.connect(db_path)
+                has_null=rconn.execute("SELECT 1 FROM snapshot_file WHERE nick=? AND type IS NULL LIMIT 1",(nick,)).fetchone()
+                rconn.close()
+                if has_null:
+                    auto_repair=True
+                    print(f"  {nick}: type manquant pour certaines entrées — resnapshot complet (auto-réparation)")
+            except sqlite3.Error: pass
+        # Tentative incrémentale (pas en mode force, pas en auto-réparation)
+        inc=None
+        if not force and not auto_repair:
             inc=self._indexsnap_incremental(nick,archive_name,archive_date,cfg,db_path,debug)
         if inc is not None:
             nfiles,exclu_count,exclu_size,n_add,n_rem,n_mod=inc

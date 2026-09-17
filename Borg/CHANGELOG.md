@@ -1,5 +1,20 @@
 # Changelog — borgHelper
 
+## 1.0.89 — 2026-09-17
+
+### `IndexSnap` : auto-réparation du `type` manquant
+
+Le clonage incrémental (`_indexsnap_incremental`) réutilise le `file_id` (donc le `type`) des fichiers
+inchangés — un `type` manquant (migration `snapshot_file.type` ou ancien snapshot pré-1.0.86) ne se
+réparait jamais tout seul via l'incrémental normal, obligeant un `Index -F -S` manuel. `indexsnap()`
+détecte désormais toute entrée `type IS NULL` avant de tenter l'incrémental et, si trouvée, force un
+resnapshot complet cette fois-là (message « type manquant… auto-réparation ») — les backups suivants
+repassent en incrémental normal une fois tout repeuplé. Se déclenche automatiquement au prochain `Bkp`
+(indexation auto activée) ou `Index`, sans intervention.
+
+Vérifié par test réel : `type` neutralisé manuellement (simulation de données pré-1.0.86), `Bkp` normal
+(sans `-F`/`-S`) lancé → détection, resnapshot complet automatique, tous les `type` repeuplés.
+
 ## 1.0.88 — 2026-09-17
 
 ### `TreeHist` : added/removed ne concernent que l'entrée elle-même

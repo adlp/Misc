@@ -476,8 +476,10 @@ Plage : `-b <archive>` (depuis), `-B <archive>` (jusqu'à), `-b ALL` (tout), san
 paire indexée seulement — comme `Search`). Une entrée présente mais sans événement dans cette plage
 affiche `aucun événement dans la plage` plutôt que d'être omise.
 
-Genre `inconnu (réindexer)` : entrée snapshotée avant l'ajout de la colonne `type` — réindexer
-(`Index -F -S` ou un nouveau `Bkp`) pour la peupler.
+Genre `inconnu (réindexer)` : entrée snapshotée avant l'ajout de la colonne `type`. Se répare tout seul
+au **prochain `Bkp`** (indexation automatique activée) : `IndexSnap` détecte un `type` manquant et force
+un resnapshot complet cette fois-là (message « type manquant… auto-réparation »), puis revient à
+l'incrémental normal ensuite. Pour forcer immédiatement sans attendre un backup : `Index -F -S`.
 
 ---
 
