@@ -459,6 +459,11 @@ sous-arborescence** (fichier ajouté/modifié/supprimé à n'importe quelle prof
 lister le détail (pas de contenu de sous-répertoire, juste les types/archives/dates distincts concernés).
 Un fichier, lui, n'affiche que ses propres événements.
 
+`added`/`removed` sur un répertoire ne concernent **que son entrée à lui** (ex. `added directory` /
+`removed directory` quand il est réellement créé/supprimé). Un mouvement interne quelconque — même un
+simple `added` ou `removed` d'un fichier niché en dessous — remonte en `modified` générique, jamais en
+`added`/`removed` emprunté à un descendant.
+
 Pour descendre dans un sous-répertoire, relancer `TreeHist` avec `-f` pointant dessus.
 
 ```bash

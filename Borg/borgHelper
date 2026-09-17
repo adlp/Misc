@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.87"
+Version="1.0.88"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -357,6 +357,8 @@ def usage(doc=None,debug=0):
         printer("       (apparu/modifié/disparu…)  |  -b ALL : tout l'historique, sinon dernière archive indexée")
         printer("       Un sous-répertoire montre un événement dès qu'un changement a eu lieu N'IMPORTE")
         printer("       OÙ dans sa sous-arborescence (sans en lister le détail) ; un fichier, seulement le sien")
+        printer("       added/removed ne concernent QUE l'entrée elle-même — un mouvement interne, quel")
+        printer("       qu'il soit, remonte en 'modified' générique (jamais un added/removed emprunté)")
         printer("   -c DuIdx [-f pattern] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-s col[:asc|desc]] [-j]")
         printer("       Résumé du-like : taille/nb par type depuis le SQLite")
         printer("       Sans -f : résumé global  |  -f '*' : par répertoire  |  -j : JSON")
@@ -448,6 +450,8 @@ def usage(doc=None,debug=0):
         printer("       Un sous-répertoire affiche un événement dès qu'un changement a eu lieu N'IMPORTE")
         printer("       OÙ dans sa sous-arborescence, sans en lister le détail (type/archive/date distincts")
         printer("       uniquement) — un fichier n'affiche que ses propres événements")
+        printer("       added/removed sur un répertoire ne concernent QUE son entrée à lui (ex. 'added")
+        printer("       directory') — un mouvement interne quelconque remonte en 'modified' générique")
     elif doc=='duidx':
         printer("   -c DuIdx [-f pattern] [-n nick/ALL] [-b archive|ALL] [-B archive] [-s col[:asc|desc]] [-j]")
         printer("       Résumé du-like depuis le SQLite : taille et nb de fichiers par type")
@@ -2251,11 +2255,16 @@ class BorgHelper:
         def _events_for(full_path,recursive=False):
             # recursive=True (répertoires) : un événement n'importe où dans la sous-arborescence
             # compte comme un événement de CE répertoire — sans en lister le détail (pas de contenu
-            # de sous-répertoire), juste (type, archive, date) distincts.
-            if recursive:
-                deep_pat=(full_path+'/%') if full_path else '%'
-                return conn.execute("SELECT DISTINCT change_type,archive_new,archive_new_date FROM diff_index WHERE nick=? AND (path=? OR path LIKE ?)"+af_sql+" ORDER BY archive_new_date",[n,full_path,deep_pat]+af_params).fetchall()
-            return conn.execute("SELECT change_type,archive_new,archive_new_date FROM diff_index WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date",[n,full_path]+af_params).fetchall()
+            # de sous-répertoire). added/removed ne concernent QUE l'entrée du répertoire lui-même
+            # (ex. 'added directory'/'removed directory') ; un mouvement d'un descendant, quel qu'il
+            # soit (added/removed/modified plus bas), remonte comme 'modified' générique.
+            own=conn.execute("SELECT change_type,archive_new,archive_new_date FROM diff_index WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date",[n,full_path]+af_params).fetchall()
+            if not recursive: return own
+            deep_pat=(full_path+'/%') if full_path else '%'
+            deep=conn.execute("SELECT DISTINCT archive_new,archive_new_date FROM diff_index WHERE nick=? AND path LIKE ?"+af_sql+" ORDER BY archive_new_date",[n,deep_pat]+af_params).fetchall()
+            own_archives={a for _,a,_ in own}
+            synthetic=[('modified',arch,date) for arch,date in deep if arch not in own_archives]
+            return sorted(own+synthetic,key=lambda r:r[2] or '')
         def _genre(is_dir,known_type):
             if known_type: return _TREEHIST_GENRES.get(known_type,f"type '{known_type}'")
             return 'répertoire' if is_dir else 'inconnu (réindexer)'

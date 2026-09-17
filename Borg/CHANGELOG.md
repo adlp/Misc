@@ -1,5 +1,21 @@
 # Changelog — borgHelper
 
+## 1.0.88 — 2026-09-17
+
+### `TreeHist` : added/removed ne concernent que l'entrée elle-même
+
+Le rollup des sous-répertoires (1.0.87) pouvait afficher `added` ou `removed` sur un répertoire alors
+que seul un descendant avait été ajouté/supprimé — trompeur (laissait croire que le répertoire lui-même
+avait été créé/supprimé). Désormais : `added`/`removed` ne s'affichent que si l'entrée du répertoire
+**elle-même** a ce marqueur dans `diff_index` (ex. `added directory`/`removed directory`) ; tout
+mouvement interne quelconque (ajout/suppression/modification d'un descendant, à n'importe quelle
+profondeur) remonte en `modified` générique. Un événement propre à l'entrée (ex. `ctime`) prime sur le
+synthétique `modified` pour la même archive — pas de doublon.
+
+Vérifié par test réel : fichier ajouté 2 niveaux sous un répertoire → le répertoire affiche `modified`
+(pas `added`) ; un sous-répertoire ayant à la fois son propre `ctime` et un descendant ajouté à la même
+archive n'affiche que son `ctime` (pas de ligne `modified` redondante).
+
 ## 1.0.87 — 2026-09-17
 
 ### `TreeHist` : un sous-répertoire "a eu des événements" si sa sous-arborescence a changé
