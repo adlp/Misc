@@ -1,5 +1,28 @@
 # Changelog — borgHelper
 
+## 1.0.93 — TreeHist affiche aussi le propriétaire (user:group, uid:gid) — 2026-09-17
+
+### Nouvelle colonne `propriétaire` sur `TreeHist`
+
+Précision sur la demande précédente (1.0.92, droits unix) : « droits » incluait aussi
+utilisateur/groupe. `TreeHist` affiche désormais le propriétaire du **dernier état connu** de chaque
+entrée sous la forme `user:group (uid:gid)` (ex. `root:root (0:0)`), à côté du genre et des droits —
+colonne `owner` en JSON (`-j`).
+
+Nécessite une nouvelle colonne `snapshot_file.owner` (migration `ALTER TABLE` automatique dans
+`ensure_diff_db()`, additive/rétrocompatible — `DIFF_DB_SCHEMA_VERSION` 3→4). `indexsnap()` (chemins
+complet et incrémental) demande désormais `{user}`/`{group}`/`{uid}`/`{gid}` en plus de
+`{mode}`/`{type}`/`{size}`/`{isomtime}` à `borg list`. L'auto-réparation d'`indexsnap()` détecte
+maintenant `type IS NULL OR mode IS NULL OR owner IS NULL` — un resnapshot complet se déclenche
+automatiquement au prochain `Bkp`/`Index` si l'une des trois colonnes manque. Les entrées déjà
+snapshotées avant cette version affichent `—` jusqu'à réindexation.
+
+Interface web : nouvelle colonne **Propriétaire** dans l'explorateur d'arborescence.
+
+Vérifié par test réel : migration + auto-réparation sur la DB demo (colonnes absentes → détectées,
+resnapshot complet, `owner` peuplé — `root:root (0:0)` — `schema_version` remonté à 4) ; affiché
+correctement en CLI, en JSON, et sur la page web servie.
+
 ## Interface web — bouton Backup immédiat sur la liste des serveurs — 2026-09-17
 
 Bouton **▶ Backup** sur chaque carte serveur de la page « Serveurs » : lance un `Bkp` immédiat

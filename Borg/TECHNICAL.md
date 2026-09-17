@@ -101,13 +101,15 @@ Sentinelle d'idempotence pour les diffs — une ligne par paire (archive_old, ar
 Empêche de ré-indexer une paire déjà traitée. Purge des lignes orphelines par `Prune`.
 
 #### `snapshot_file`
-Dictionnaire global des chemins de fichiers avec leur taille, mtime, type et droits.  
+Dictionnaire global des chemins de fichiers avec leur taille, mtime, type, droits et propriétaire.  
 Contrainte `UNIQUE(nick, path)` — le même chemin n'est stocké qu'une seule fois par nick (déduplication).  
 `type` : code borg (`{type}` de `borg list --format`) — `d` répertoire, `-` fichier, `l` lien symbolique,
 `p` fifo, `s` socket, `b`/`c` périphérique bloc/caractère.  
 `mode` : droits unix ls-style (`{mode}` de `borg list --format`, ex. `drwxr-xr-x`) — dernier état connu.  
+`owner` : propriétaire construit depuis `{user}:{group} ({uid}:{gid})` de `borg list --format` (ex.
+`root:root (0:0)`) — dernier état connu.  
 `NULL` pour les lignes écrites avant l'ajout de ces colonnes (migrations `ALTER TABLE` automatiques dans
-`ensure_diff_db()`, ré-indexer pour peupler). Utilisées par `TreeHist` pour les colonnes « genre »/« droits ».
+`ensure_diff_db()`, ré-indexer pour peupler). Utilisées par `TreeHist` pour les colonnes « genre »/« droits »/« propriétaire ».
 
 #### `archive_snapshot`
 Table mince : associe une archive à ses fichiers via `file_id → snapshot_file.id`.  
@@ -142,7 +144,7 @@ Utilisée par `Report -o` pour alimenter la colonne `taille` sans appel borg.
 
 ```sql
 CREATE VIEW archive_snapshot_v AS
-    SELECT s.nick, s.archive, s.archive_date, sf.path, sf.size, sf.mtime, sf.type, sf.mode
+    SELECT s.nick, s.archive, s.archive_date, sf.path, sf.size, sf.mtime, sf.type, sf.mode, sf.owner
     FROM archive_snapshot s
     JOIN snapshot_file sf ON sf.id = s.file_id;
 ```
@@ -188,6 +190,7 @@ erDiagram
         TEXT mtime "ISO datetime"
         TEXT type "code borg d/-/l/p/s/b/c, NULL si non réindexé"
         TEXT mode "ls-style ex. drwxr-xr-x, NULL si non réindexé"
+        TEXT owner "user:group (uid:gid), NULL si non réindexé"
     }
 
     archive_snapshot {
@@ -623,7 +626,7 @@ La `schema_version` ne change **pas** à chaque release — seulement lors d'un 
 
 | Constante | Valeur actuelle |
 |-----------|-----------------|
-| `DIFF_DB_SCHEMA_VERSION` | `3` |
+| `DIFF_DB_SCHEMA_VERSION` | `4` |
 | `CACHE_DB_SCHEMA_VERSION` | `1` |
 
 ### Migrations diff.db — table de correspondance version ↔ action
@@ -639,15 +642,17 @@ sans risque même après une migration partielle ou un `schema_version` désynch
 | 2 | Déduplication `archive_snapshot` | colonne `path` présente sur `archive_snapshot` | `_migrate_archive_snapshot()` : colonne `path` directe → `file_id → snapshot_file` |
 | 2 | `snapshot_file.type` | colonne `type` absente sur `snapshot_file` | `ALTER TABLE snapshot_file ADD COLUMN type TEXT` — alimente la colonne « genre » de `TreeHist` |
 | 3 | `snapshot_file.mode` | colonne `mode` absente sur `snapshot_file` | `ALTER TABLE snapshot_file ADD COLUMN mode TEXT` — droits unix ls-style (`{mode}` de `borg list`), colonne « droits » de `TreeHist` |
+| 4 | `snapshot_file.owner` | colonne `owner` absente sur `snapshot_file` | `ALTER TABLE snapshot_file ADD COLUMN owner TEXT` — `{user}:{group} ({uid}:{gid})` de `borg list`, colonne « propriétaire » de `TreeHist` |
 
 `ensure_diff_db()` est désormais garanti appelé (donc les migrations garanties appliquées) avant tout
 accès à `diff.db`/`cache.db` depuis **Bkp**, **Index**, **Prune** et tous les autres consommateurs —
 `prune()` ne passait par aucun `ensure_*_db()` avant 1.0.90, ce qui pouvait laisser `_cleanup_index_after_prune()`
 et `clear_cache_nick()` opérer sur un schéma non migré.
 
-Les lignes `snapshot_file` déjà écrites avant les migrations 2/3 gardent `type`/`mode` à `NULL` jusqu'à
-réindexation du snapshot — `indexsnap()` s'auto-répare au besoin (voir CHANGELOG 1.0.89/1.0.92) : un
-`type IS NULL OR mode IS NULL` détecté force un resnapshot complet une fois, sans intervention manuelle.
+Les lignes `snapshot_file` déjà écrites avant les migrations 2/3/4 gardent `type`/`mode`/`owner` à `NULL` jusqu'à
+réindexation du snapshot — `indexsnap()` s'auto-répare au besoin (voir CHANGELOG 1.0.89/1.0.92/1.0.93) : un
+`type IS NULL OR mode IS NULL OR owner IS NULL` détecté force un resnapshot complet une fois, sans
+intervention manuelle.
 
 ---
 

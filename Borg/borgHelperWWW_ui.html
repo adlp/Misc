@@ -163,7 +163,7 @@
       <div id="browseBreadcrumb" class="pill" style="margin-bottom:10px"></div>
       <div id="browseError" class="error"></div>
       <table id="browseTableEl">
-        <thead><tr><th>Nom</th><th>Genre</th><th>Droits</th><th>Dernier événement</th></tr></thead>
+        <thead><tr><th>Nom</th><th>Genre</th><th>Droits</th><th>Propriétaire</th><th>Dernier événement</th></tr></thead>
         <tbody id="browseBody"></tbody>
       </table>
       <p class="hint">Clic sur un dossier : ouvrir. Clic droit sur un dossier : télécharger un .tar.
@@ -607,14 +607,15 @@ async function loadBrowse(){
   browseEntriesByPath={};
   entries.forEach(e=>{ browseEntriesByPath[e.full_path]=e; });
   const tbody=document.getElementById('browseBody');
-  if(entries.length===0){ tbody.innerHTML='<tr><td colspan="4" class="hint">Répertoire vide</td></tr>'; return; }
+  if(entries.length===0){ tbody.innerHTML='<tr><td colspan="5" class="hint">Répertoire vide</td></tr>'; return; }
   tbody.innerHTML=entries.map(e=>{
     const lastEv=e.events && e.events.length ? e.events[e.events.length-1] : null;
     const evText=lastEv ? `${lastEv.type} (${lastEv.archive})` : '—';
     const icon=e.is_dir?'📁':'📄';
     return `<tr class="browse-row" style="cursor:pointer" data-full="${escapeAttr(e.full_path)}" data-isdir="${e.is_dir}">
       <td>${icon} ${escapeHtml(e.name)}</td><td>${escapeHtml(e.genre)}</td>
-      <td style="font-family:var(--mono)">${escapeHtml(e.mode||'—')}</td><td>${escapeHtml(evText)}</td>
+      <td style="font-family:var(--mono)">${escapeHtml(e.mode||'—')}</td>
+      <td style="font-family:var(--mono)">${escapeHtml(e.owner||'—')}</td><td>${escapeHtml(evText)}</td>
     </tr>`;
   }).join('');
 }
