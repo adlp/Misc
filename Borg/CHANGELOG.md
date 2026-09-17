@@ -1,5 +1,19 @@
 # Changelog — borgHelper
 
+## 1.0.87 — 2026-09-17
+
+### `TreeHist` : un sous-répertoire "a eu des événements" si sa sous-arborescence a changé
+
+Un sous-répertoire n'affichait un événement que si SA PROPRE entrée avait un marqueur direct dans
+`diff_index` (ex. `added directory`) — restant "aucun événement" même si un fichier profondément niché
+en dessous avait changé. Désormais : un sous-répertoire (et `.`, toujours un répertoire) affiche un
+événement dès qu'un changement a eu lieu n'importe où dans sa sous-arborescence (`path=<lui> OR path
+LIKE '<lui>/%'`, `SELECT DISTINCT` sur type/archive/date) — sans en lister le détail, toujours pas de
+contenu de sous-répertoire. Les fichiers, eux, n'affichent que leurs propres événements (inchangé).
+
+Vérifié par test réel : fichier modifié 2 niveaux sous un sous-répertoire dont la propre entrée n'a
+aucun marqueur → le sous-répertoire, son parent et `.` affichent tous `modified` grâce au rollup.
+
 ## 1.0.86 — 2026-09-17
 
 ### `TreeHist` : un seul tableau, colonne genre (répertoire/fichier/lien/…)

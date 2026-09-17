@@ -454,6 +454,11 @@ Colonnes : `nom`, `genre` (répertoire / fichier / lien symbolique / fifo / sock
 caractère — type réel stocké par borg), type d'événement (`added`/`modified`/`removed`/…), archive,
 date. `aucun événement dans la plage` si l'entrée n'a pas bougé sur la période demandée.
 
+**Un sous-répertoire affiche un événement dès qu'un changement a eu lieu n'importe où dans sa
+sous-arborescence** (fichier ajouté/modifié/supprimé à n'importe quelle profondeur en dessous) — sans en
+lister le détail (pas de contenu de sous-répertoire, juste les types/archives/dates distincts concernés).
+Un fichier, lui, n'affiche que ses propres événements.
+
 Pour descendre dans un sous-répertoire, relancer `TreeHist` avec `-f` pointant dessus.
 
 ```bash
