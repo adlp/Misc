@@ -446,11 +446,13 @@ borgHelper -c FileHist -f /var/lib/postgresql -n ALL
 
 ### `TreeHist`
 Contenu **direct** d'un répertoire (racine entière si `-f` omis) — jamais le contenu d'un
-sous-répertoire. Liste **toujours l'intégralité** du répertoire courant (dernier snapshot indexé),
-comme un `ls` enrichi — un objet par ligne, y compris les entrées sans événement dans la plage demandée
-(présentes, simplement inchangées sur la période) :
-- sous-répertoires : leurs événements propres (`added directory`/`removed directory`/…) dans la plage
-- fichiers : leur historique de création/modification/suppression dans la plage
+sous-répertoire — en **un seul tableau** : le répertoire courant lui-même apparaît en `.`, puis ses
+enfants immédiats. Liste **toujours l'intégralité** du contenu (dernier snapshot indexé), comme un
+`ls` enrichi, y compris les entrées sans événement dans la plage demandée (présentes, inchangées).
+
+Colonnes : `nom`, `genre` (répertoire / fichier / lien symbolique / fifo / socket / périph. bloc ou
+caractère — type réel stocké par borg), type d'événement (`added`/`modified`/`removed`/…), archive,
+date. `aucun événement dans la plage` si l'entrée n'a pas bougé sur la période demandée.
 
 Pour descendre dans un sous-répertoire, relancer `TreeHist` avec `-f` pointant dessus.
 
@@ -463,6 +465,9 @@ borgHelper -c TreeHist -f /var/lib/docker -n ALL -b ALL
 Plage : `-b <archive>` (depuis), `-B <archive>` (jusqu'à), `-b ALL` (tout), sans les deux (dernière
 paire indexée seulement — comme `Search`). Une entrée présente mais sans événement dans cette plage
 affiche `aucun événement dans la plage` plutôt que d'être omise.
+
+Genre `inconnu (réindexer)` : entrée snapshotée avant l'ajout de la colonne `type` — réindexer
+(`Index -F -S` ou un nouveau `Bkp`) pour la peupler.
 
 ---
 

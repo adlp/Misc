@@ -101,8 +101,12 @@ Sentinelle d'idempotence pour les diffs — une ligne par paire (archive_old, ar
 Empêche de ré-indexer une paire déjà traitée. Purge des lignes orphelines par `Prune`.
 
 #### `snapshot_file`
-Dictionnaire global des chemins de fichiers avec leur taille et mtime.  
-Contrainte `UNIQUE(nick, path)` — le même chemin n'est stocké qu'une seule fois par nick (déduplication).
+Dictionnaire global des chemins de fichiers avec leur taille, mtime et type.  
+Contrainte `UNIQUE(nick, path)` — le même chemin n'est stocké qu'une seule fois par nick (déduplication).  
+`type` : code borg (`{type}` de `borg list --format`) — `d` répertoire, `-` fichier, `l` lien symbolique,
+`p` fifo, `s` socket, `b`/`c` périphérique bloc/caractère. `NULL` pour les lignes écrites avant l'ajout
+de la colonne (migration `ALTER TABLE` automatique dans `ensure_diff_db()`, ré-indexer pour peupler).
+Utilisé par `TreeHist` pour la colonne « genre ».
 
 #### `archive_snapshot`
 Table mince : associe une archive à ses fichiers via `file_id → snapshot_file.id`.  
@@ -137,7 +141,7 @@ Utilisée par `Report -o` pour alimenter la colonne `taille` sans appel borg.
 
 ```sql
 CREATE VIEW archive_snapshot_v AS
-    SELECT s.nick, s.archive, s.archive_date, sf.path, sf.size, sf.mtime
+    SELECT s.nick, s.archive, s.archive_date, sf.path, sf.size, sf.mtime, sf.type
     FROM archive_snapshot s
     JOIN snapshot_file sf ON sf.id = s.file_id;
 ```
@@ -181,6 +185,7 @@ erDiagram
         TEXT path "UNIQUE(nick, path)"
         INTEGER size
         TEXT mtime "ISO datetime"
+        TEXT type "code borg d/-/l/p/s/b/c, NULL si non réindexé"
     }
 
     archive_snapshot {
@@ -622,6 +627,10 @@ La `schema_version` ne change **pas** à chaque release — seulement lors d'un 
 ### Migration `archive_snapshot` (historique)
 
 `ensure_diff_db()` détecte automatiquement l'ancien schéma de `archive_snapshot` (colonne `path` directe) et migre vers le schéma déduplication (`file_id → snapshot_file`) au premier lancement après mise à jour.
+
+### Migration `snapshot_file.type`
+
+`ensure_diff_db()` ajoute automatiquement la colonne `type` à `snapshot_file` (`ALTER TABLE`) si absente. Additive et rétrocompatible (aucun appelant existant ne fait `SELECT *` sur `archive_snapshot_v` ni de dépaquetage positionnel) — pas de bump de `DIFF_DB_SCHEMA_VERSION`. Les lignes déjà écrites gardent `type=NULL` jusqu'à réindexation du snapshot (`Index -F -S` ou `Bkp`).
 
 ---
 

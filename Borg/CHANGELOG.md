@@ -1,5 +1,24 @@
 # Changelog — borgHelper
 
+## 1.0.86 — 2026-09-17
+
+### `TreeHist` : un seul tableau, colonne genre (répertoire/fichier/lien/…)
+
+Fusionné en un seul tableau (au lieu de sections séparées « entrée elle-même »/« sous-répertoires »/
+« fichiers ») : le répertoire courant apparaît en `.`, suivi de ses enfants immédiats. Nouvelle colonne
+`genre` tirée du **type réel stocké par borg** (`{type}` de `borg list`) : `répertoire`, `fichier`,
+`lien symbolique`, `fifo`, `socket`, `périph. bloc`/`caractère` — plus fiable que l'ancienne heuristique
+par profondeur de chemin.
+
+Nécessite une nouvelle colonne `snapshot_file.type` (migration `ALTER TABLE` automatique dans
+`ensure_diff_db()`, additive/rétrocompatible, pas de bump `DIFF_DB_SCHEMA_VERSION`). `indexsnap()`
+(chemins complet et incrémental) demande désormais `{type}` en plus de `{size}`/`{isomtime}` à
+`borg list`. Les entrées déjà snapshotées avant cette version affichent `inconnu (réindexer)` jusqu'à
+réindexation (`Index -F -S` ou nouveau `Bkp`).
+
+Vérifié par test réel : répertoire, fichier régulier, lien symbolique et fifo tous correctement
+identifiés ; DB pré-migration testée (dégradation propre vers `inconnu (réindexer)`, pas de crash).
+
 ## 1.0.85 — 2026-09-17
 
 ### `TreeHist` : liste toujours l'intégralité du répertoire courant
