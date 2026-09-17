@@ -672,10 +672,11 @@ Swagger interactif : `http://<host>:<port>/docs`
 1. **Connexion** : saisie de la clé `X-API-Key`. Vérifiée par un appel `Report` hors-ligne ; conservée en
    `sessionStorage` (effacée à la fermeture de l'onglet, jamais persistée sur disque).
 2. **Serveurs** : liste des nicks avec un rapport sommaire hors-ligne (aucune passphrase requise pour
-   cette liste — lecture SQLite uniquement). Bouton **+ Nouveau serveur** pour `Login`. Pour chaque
-   serveur, un champ **BORG_PASSPHRASE** à enregistrer pour la session (même mécanisme `sessionStorage`,
-   par nick).
-3. **Détail d'un serveur** : la passphrase enregistrée est envoyée en `X-Borg-Passphrase` pour les
+   cette liste — lecture SQLite uniquement). Bouton **+ Nouveau serveur** pour `Login`. Pas de saisie de
+   passphrase sur cette page — juste un badge indiquant si elle est déjà enregistrée pour la session ou
+   non ; à renseigner sur la page du serveur concerné.
+3. **Détail d'un serveur** : champ **BORG_PASSPHRASE** à enregistrer pour la session (`sessionStorage`,
+   par nick) — c'est ici, et seulement ici, qu'elle se saisit. Envoyée en `X-Borg-Passphrase` pour les
    actions qui en ont besoin (repérées par 🔑) ; les actions destructives (`Prune`, `DelBkp`, `Restore`,
    `IdxPurge`, `Init`) demandent une confirmation avant exécution. Le résultat brut (`exitcode`, `stdout`,
    `stderr`) s'affiche tel quel.

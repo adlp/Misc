@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## borgHelperWWW UI — 2026-09-17
+
+Retiré la saisie de passphrase de la page « Serveurs » (liste) — champ input + bouton Enregistrer par
+carte serveur, remplacés par un badge lecture-seule (enregistrée / non renseignée). La passphrase ne se
+saisit plus que sur la page détail du serveur concerné.
+
 ## 1.0.90 — 2026-09-17
 
 ### `Prune` migre désormais la DB comme `Bkp`/`Index` — `DIFF_DB_SCHEMA_VERSION` bumpée à 2
