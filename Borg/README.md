@@ -685,8 +685,11 @@ Swagger interactif : `http://<host>:<port>/docs`
    - **Clic droit sur un dossier** : télécharge un `.tar` de cette arborescence, à une archive
      choisissable dans une liste déroulante (`borg export-tar`, streamé directement au navigateur).
    - **Clic sur un fichier** : le télécharge, à une archive choisissable (`borg extract --stdout`,
-     streamé directement, jamais écrit sur le disque du serveur borgHelperWWW).
-   - Sans archive choisie : la dernière disponible.
+     streamé directement, jamais écrit sur le disque du serveur borgHelperWWW). La liste déroulante ne
+     propose **que les archives où ce fichier a réellement changé** (`added`/`modified` — `removed`
+     exclu, `TreeHist -j -b ALL` sur son historique complet), pas toutes les archives du dépôt.
+   - Sans archive choisie : la dernière disponible. Le `.tar` d'un dossier (clic droit), lui, propose
+     toutes les archives — un instantané complet n'a pas de notion de « mouvement » à filtrer.
 
 Cette page HTML elle-même n'est pas protégée par `X-API-Key` (elle ne contient aucun secret — la clé et
 les passphrases ne sont saisies et envoyées que depuis le navigateur, via `fetch()`) ; c'est l'API qui

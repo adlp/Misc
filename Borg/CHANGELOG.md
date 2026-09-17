@@ -1,5 +1,19 @@
 # Changelog — borgHelper
 
+## Interface web — téléchargement de fichier : archives filtrées au mouvement réel — 2026-09-17
+
+La liste déroulante d'archives pour télécharger un fichier proposait tout l'historique du dépôt
+(`/lstbkp`), sans lien avec ce fichier précis. Elle ne propose désormais que les archives où **ce
+fichier** a réellement changé (`added`/`modified` — `removed` exclu, le fichier n'y existe plus).
+`loadBrowse()` charge maintenant l'explorateur avec `archive_from=ALL` (historique complet par entrée,
+au lieu de la dernière paire seulement) et réutilise ces événements déjà en mémoire — aucun appel API
+supplémentaire pour peupler le menu. Sans mouvement indexé pour ce fichier : la dernière archive reste
+proposée par défaut. Le `.tar` d'un dossier (clic droit) continue de proposer toutes les archives —
+sans objet à filtrer pour un instantané complet.
+
+Vérifié par test réel : fichier modifié 2 fois sur 3 backups → 2 archives (et seulement ces 2)
+proposées ; fichier jamais retouché → 0 archive proposée avec le fichier lui-même.
+
 ## 1.0.91 + borgHelperWWW — Explorateur d'arborescence — 2026-09-17
 
 ### `borgHelper` : `TreeHist -j`

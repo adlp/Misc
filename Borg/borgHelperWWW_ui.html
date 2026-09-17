@@ -531,6 +531,7 @@ async function runAction(){
 
 let browseNick=null;
 let browsePath='';
+let browseEntriesByPath={};
 
 function openBrowse(){
   browseNick=currentNick;
@@ -560,7 +561,9 @@ async function loadBrowse(){
   document.getElementById('browseTitle').textContent=browseNick+' — '+(browsePath||'/');
   document.getElementById('browseError').textContent='';
   renderBreadcrumb();
-  const r=await apiCall('GET','/treehist',{nick:browseNick,prefix:browsePath,json:'true'},false);
+  // archive_from=ALL : pour que chaque entrée porte son historique complet (nécessaire pour ne
+  // proposer au téléchargement que les archives où le fichier a réellement bougé).
+  const r=await apiCall('GET','/treehist',{nick:browseNick,prefix:browsePath,archive_from:'ALL',json:'true'},false);
   if(r.httpStatus===401) return;
   if(r.exitcode!==0){
     document.getElementById('browseError').textContent=r.stderr||('exitcode '+r.exitcode);
@@ -575,6 +578,8 @@ async function loadBrowse(){
     document.getElementById('browseBody').innerHTML=''; return;
   }
   const entries=(data.entries||[]).filter(e=>e.name!=='.');
+  browseEntriesByPath={};
+  entries.forEach(e=>{ browseEntriesByPath[e.full_path]=e; });
   const tbody=document.getElementById('browseBody');
   if(entries.length===0){ tbody.innerHTML='<tr><td colspan="3" class="hint">Répertoire vide</td></tr>'; return; }
   tbody.innerHTML=entries.map(e=>{
@@ -607,16 +612,38 @@ async function openDownloadDialog(fullPath,isTar){
   document.getElementById('dlModalError').textContent='';
   const sel=document.getElementById('dlArchiveSelect');
   sel.innerHTML='<option value="">dernière archive</option>';
-  const r=await apiCall('GET','/lstbkp',{nick:browseNick},false);
-  if(r.exitcode===0 && r.stdout){
-    r.stdout.trim().split('\n').filter(Boolean).reverse().forEach(line=>{
-      const sp=line.indexOf(' ');
-      const name=sp>=0?line.slice(0,sp):line;
-      const date=sp>=0?line.slice(sp+1):'';
+  if(isTar){
+    // Tar d'une arborescence : toutes les archives (une tar est un instantané complet, le
+    // filtrage "mouvement" n'a de sens que pour un fichier précis).
+    const r=await apiCall('GET','/lstbkp',{nick:browseNick},false);
+    if(r.exitcode===0 && r.stdout){
+      r.stdout.trim().split('\n').filter(Boolean).reverse().forEach(line=>{
+        const sp=line.indexOf(' ');
+        const name=sp>=0?line.slice(0,sp):line;
+        const date=sp>=0?line.slice(sp+1):'';
+        const opt=document.createElement('option');
+        opt.value=name; opt.textContent=date+' — '+name;
+        sel.appendChild(opt);
+      });
+    }
+  }else{
+    // Fichier : ne proposer que les archives où CE fichier a réellement bougé (added/modified —
+    // removed exclu, le fichier n'existe plus dans cette archive-là).
+    const entry=browseEntriesByPath[fullPath];
+    const events=(entry&&entry.events)||[];
+    const moved=events.filter(e=>e.type==='added'||e.type==='modified')
+      .sort((a,b)=>(b.date||'').localeCompare(a.date||''));
+    if(moved.length===0){
       const opt=document.createElement('option');
-      opt.value=name; opt.textContent=date+' — '+name;
+      opt.disabled=true; opt.textContent='(aucun mouvement indexé — dernière archive disponible)';
       sel.appendChild(opt);
-    });
+    }else{
+      moved.forEach(e=>{
+        const opt=document.createElement('option');
+        opt.value=e.archive; opt.textContent=`${e.date} — ${e.type} — ${e.archive}`;
+        sel.appendChild(opt);
+      });
+    }
   }
   document.getElementById('downloadOverlay').hidden=false;
   document.getElementById('downloadModal').hidden=false;
