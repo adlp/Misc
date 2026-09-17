@@ -1,5 +1,10 @@
 # Changelog — borgHelper
 
+## Interface web — lien Swagger dans le pied de page — 2026-09-17
+
+Lien **Swagger / API** (`/docs`) ajouté dans le pied de page de l'interface web, visible sur toutes
+les pages y compris la page de connexion.
+
 ## Interface web — bouton Serveurs dans l'en-tête — 2026-09-17
 
 Bouton **Serveurs** ajouté à côté de **Déconnexion** dans l'en-tête : retour direct à la liste des

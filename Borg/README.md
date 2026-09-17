@@ -667,7 +667,8 @@ python3 borgHelperWWW                      # dev, uvicorn intégré
 uvicorn borgHelperWWW:app --host 0.0.0.0 --port 8000 --workers 2
 ```
 
-Swagger interactif : `http://<host>:<port>/docs`
+Swagger interactif : `http://<host>:<port>/docs` — également accessible via un lien dans le pied de
+page de l'interface web (visible sur toutes les pages, y compris la page de connexion).
 
 ### Interface web
 
