@@ -682,7 +682,8 @@ Swagger interactif : `http://<host>:<port>/docs`
    non ; à renseigner sur la page du serveur concerné. Bouton **▶ Backup** sur chaque carte serveur pour
    lancer un `Bkp` immédiat (confirmation avant lancement ; utilise la passphrase de session si
    enregistrée, sinon celle du `.borghelperrc` si présente — avertissement sinon) ; la liste se
-   rafraîchit automatiquement une fois terminé.
+   rafraîchit automatiquement une fois terminé. Bouton **🗂 Explorer** juste à côté pour accéder
+   directement à l'explorateur d'arborescence de ce serveur, sans passer par la page de détail.
 3. **Détail d'un serveur** : champ **BORG_PASSPHRASE** à enregistrer pour la session (`sessionStorage`,
    par nick) — c'est ici, et seulement ici, qu'elle se saisit. Envoyée en `X-Borg-Passphrase` pour les
    actions qui en ont besoin (repérées par 🔑) ; les actions destructives (`Prune`, `DelBkp`, `Restore`,

@@ -326,6 +326,7 @@ async function loadMachines(){
           <h3>${escapeHtml(nick)} ${badgeFor(s['depuis'])}</h3>
           <div>
             <button class="secondary bkp-now-btn" data-nick="${escapeAttr(nick)}">▶ Backup</button>
+            <button class="secondary explore-btn" data-nick="${escapeAttr(nick)}">🗂 Explorer</button>
             <button class="open-machine-btn" data-nick="${escapeAttr(nick)}">Ouvrir →</button>
           </div>
         </div>
@@ -353,6 +354,8 @@ document.getElementById('machinesList').addEventListener('click', e=>{
   if(openBtn){ openMachine(openBtn.dataset.nick); return; }
   const bkpBtn=e.target.closest('.bkp-now-btn');
   if(bkpBtn){ runBackupNow(bkpBtn.dataset.nick,bkpBtn); return; }
+  const exploreBtn=e.target.closest('.explore-btn');
+  if(exploreBtn){ openMachine(exploreBtn.dataset.nick); openBrowse(); return; }
 });
 
 async function runBackupNow(nick,btn){

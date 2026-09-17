@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## Interface web — bouton Explorer sur la liste des serveurs — 2026-09-17
+
+Bouton **🗂 Explorer** ajouté à côté du bouton **▶ Backup** sur chaque carte de la page Serveurs :
+ouvre directement l'explorateur d'arborescence (`TreeHist`) du serveur concerné, sans passer par la
+page de détail au préalable.
+
 ## 1.0.93 — TreeHist affiche aussi le propriétaire (user:group, uid:gid) — 2026-09-17
 
 ### Nouvelle colonne `propriétaire` sur `TreeHist`
