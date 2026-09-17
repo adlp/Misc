@@ -444,6 +444,34 @@ borgHelper -c FileHist -f /var/lib/postgresql -n ALL
 
 ---
 
+### `TreeHist`
+Pour chaque objet sous un préfixe d'arborescence (toute l'arborescence si `-f` omis) : liste triée par
+chemin des événements où il a changé (`added`/`modified`/`removed`/…) et l'archive concernée.
+
+```bash
+borgHelper -c TreeHist -n mon-serveur                        # racine entière, dernière archive indexée
+borgHelper -c TreeHist -f /etc -n mon-serveur -b ALL          # tout /etc, tout l'historique
+borgHelper -c TreeHist -f /var/lib/docker -n ALL -b ALL
+```
+
+Plage : `-b <archive>` (depuis), `-B <archive>` (jusqu'à), `-b ALL` (tout), sans les deux (dernière
+paire indexée seulement — comme `Search`).
+
+**Répertoire sans modification dans la plage demandée** : `TreeHist` affiche à la place le contenu
+courant du répertoire (dernier snapshot indexé), comme un `ls` enrichi — un objet par ligne :
+- sous-répertoires : leurs apparitions/disparitions (`added directory`/`removed directory`/…)
+- fichiers : tout leur historique de création/modification/suppression
+
+Cet historique par entrée porte toujours sur **tout l'index**, indépendamment de `-b`/`-B` (la plage ne
+sert qu'à décider si on bascule en mode « contenu courant »).
+
+```bash
+borgHelper -c TreeHist -f /var/lib/docker/quiet-volume -n mon-serveur
+# → rien de changé récemment sous ce chemin : liste son contenu actuel avec l'historique de chaque entrée
+```
+
+---
+
 ### `DuIdx`
 Résumé `du -sh`-like depuis le SQLite.
 
@@ -679,6 +707,7 @@ comportement) — `GET` pour les commandes en lecture, `POST`/`DELETE` pour cell
 | POST | `/index` | Index |
 | GET | `/search` | Search |
 | GET | `/filehist` | FileHist |
+| GET | `/treehist` | TreeHist |
 | GET | `/duidx` | DuIdx |
 | GET | `/cacheinfo` | CacheInfo |
 | POST | `/cacheclean` | CacheClean |

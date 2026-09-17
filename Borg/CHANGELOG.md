@@ -1,5 +1,43 @@
 # Changelog — borgHelper
 
+## 1.0.83 — 2026-09-17
+
+### `TreeHist` : bascule en listing courant si rien n'a changé
+
+Quand la requête (répertoire + plage `-b`/`-B`) ne trouve aucune modification, `TreeHist` affiche
+désormais le contenu courant du répertoire (dernier snapshot indexé) au lieu d'un message vide :
+sous-répertoires avec leurs apparitions/disparitions, fichiers avec tout leur historique de
+création/modification/suppression — historique par entrée toujours calculé sur tout l'index, sans
+tenir compte de `-b`/`-B` (qui ne sert qu'à décider du mode d'affichage).
+
+### Correctif `_indexsnap_incremental` : colonnes `archive_snapshot` corrompues
+
+Repéré en marge du travail sur `TreeHist` : l'INSERT qui applique les fichiers `added` (indexation
+incrémentale du snapshot, chemin par défaut) liait ses paramètres dans le mauvais ordre —
+`(archive_name,archive_date,nick,nick,path)` au lieu de `(nick,archive_name,archive_date,nick,path)` —
+ce qui corrompait les colonnes `nick`/`archive`/`archive_date` de `archive_snapshot` pour chaque fichier
+ajouté via ce chemin. `diff_index` n'était pas affecté. Corrigé (paramètres réordonnés), vérifié par
+test réel (backup incrémental avec fichier ajouté → `archive_snapshot` cohérent).
+
+⚠️ Les lignes déjà écrites avant ce correctif restent corrompues en base — réindexer le snapshot
+(`borgHelper -c Index -n <nick> -F -S`) pour les régénérer proprement.
+
+## 1.0.82 — 2026-09-17
+
+### Nouvelle commande `TreeHist`
+
+Pour chaque objet sous un préfixe d'arborescence (toute l'arborescence si `-f` omis) : liste triée par
+chemin des événements (`added`/`modified`/`removed`/…) et de l'archive où ils ont eu lieu. DB-only
+(`diff_index`), pas d'appel borg, pas de passphrase requise — même mécanique que `Search`/`FileHist`
+(`-b ALL` pour tout l'historique, sinon dernière archive indexée seulement). Reportée dans
+`borgHelperWWW` (`GET /treehist`) et dans l'interface web.
+
+Au passage, repéré (non corrigé — hors scope) un bug préexistant dans `index()` : le `threading.Event`
+utilisé pour arrêter le thread moniteur de priorité est aussi lu comme indicateur d'interruption après
+la boucle — il est toujours `set()` à la fin, donc `index()` affiche systématiquement "indexation
+interrompue" et pose `index_pending_lock`, même en cas de succès complet. Les insertions en base ne sont
+pas affectées (elles ont lieu avant ce check), seuls le message et le code de retour sont faux.
+
 ## 1.0.81 — 2026-09-17
 
 ### `borgHelperWWW` : interface web

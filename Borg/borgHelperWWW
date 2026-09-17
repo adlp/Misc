@@ -235,6 +235,16 @@ def filehist(nick: str, path: str, archive_from: Optional[str]=None, archive_to:
     if archive_to: extra+=['-B',archive_to]
     return run_borghelper('filehist',nick=nick,extra_args=extra)
 
+@app.get("/treehist",response_model=CommandResult,tags=["lecture"],summary="Pour chaque objet sous un préfixe : archives où il a changé")
+def treehist(nick: str, prefix: Optional[str]=None, archive_from: Optional[str]=None, archive_to: Optional[str]=None,
+             x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    extra=[]
+    if prefix: extra+=['-f',prefix]
+    if archive_from: extra+=['-b',archive_from]
+    if archive_to: extra+=['-B',archive_to]
+    return run_borghelper('treehist',nick=nick,extra_args=extra)
+
 @app.get("/duidx",response_model=CommandResult,tags=["lecture"])
 def duidx(nick: str, pattern: Optional[str]=None, sort: str="chemin", json_output: bool=Query(default=False,alias="json"),
           archive_from: Optional[str]=None, archive_to: Optional[str]=None, x_api_key: Optional[str]=Header(default=None)):
