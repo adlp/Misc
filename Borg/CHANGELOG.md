@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## Interface web — bouton Serveurs dans l'en-tête — 2026-09-17
+
+Bouton **Serveurs** ajouté à côté de **Déconnexion** dans l'en-tête : retour direct à la liste des
+serveurs depuis n'importe quelle page (détail, explorateur). Masqué sur la page de connexion et sur
+la page Serveurs elle-même.
+
 ## Interface web — bouton Explorer sur la liste des serveurs — 2026-09-17
 
 Bouton **🗂 Explorer** ajouté à côté du bouton **▶ Backup** sur chaque carte de la page Serveurs :

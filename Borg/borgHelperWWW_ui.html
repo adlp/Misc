@@ -75,6 +75,7 @@
     <div class="sub" id="headerSub">non connecté</div>
   </div>
   <div>
+    <button class="secondary" id="serversBtn" hidden onclick="showMachines()">Serveurs</button>
     <button class="secondary" id="logoutBtn" hidden onclick="logout()">Déconnexion</button>
   </div>
 </header>
@@ -224,6 +225,7 @@ function showView(id){
     document.getElementById(v).hidden=(v!==id);
   });
   document.getElementById('logoutBtn').hidden=(id==='view-login');
+  document.getElementById('serversBtn').hidden=(id==='view-login'||id==='view-machines');
   document.getElementById('headerSub').textContent = id==='view-login' ? 'non connecté' :
     (id==='view-detail'||id==='view-browse' ? 'serveur : '+currentNick : 'connecté');
 }

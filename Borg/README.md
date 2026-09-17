@@ -675,7 +675,9 @@ Swagger interactif : `http://<host>:<port>/docs`
 `borgHelperWWW_ui.html`, obligatoirement à côté du script).
 
 1. **Connexion** : saisie de la clé `X-API-Key`. Vérifiée par un appel `Report` hors-ligne ; conservée en
-   `sessionStorage` (effacée à la fermeture de l'onglet, jamais persistée sur disque).
+   `sessionStorage` (effacée à la fermeture de l'onglet, jamais persistée sur disque). Bouton
+   **Serveurs** dans l'en-tête (à côté de **Déconnexion**), visible sur toutes les pages sauf
+   Connexion et Serveurs elle-même, pour revenir directement à la liste des serveurs.
 2. **Serveurs** : liste des nicks avec un rapport sommaire hors-ligne (aucune passphrase requise pour
    cette liste — lecture SQLite uniquement). Bouton **+ Nouveau serveur** pour `Login`. Pas de saisie de
    passphrase sur cette page — juste un badge indiquant si elle est déjà enregistrée pour la session ou
