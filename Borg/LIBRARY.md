@@ -48,9 +48,11 @@ except SchemaVersionError as e:
 Point d'entrée principal. Orchestre `BorgHelperDB` et `BorgRunner`.
 
 ```python
-bh = BorgHelper(cfgfile=None, cache_dir=None)
-# cfgfile  : chemin vers le borghelperrc (défaut : ~/.borghelperrc)
-# cache_dir: répertoire des DB SQLite (défaut : valeur CACHE_DIR du borghelperrc ou ~/.cache/borghelper)
+bh = BorgHelper(cfgfile=None, cache_dir=None, passphrase=None)
+# cfgfile   : chemin vers le borghelperrc (défaut : ~/.borghelperrc)
+# cache_dir : répertoire des DB SQLite (défaut : valeur CACHE_DIR du borghelperrc ou ~/.cache/borghelper)
+# passphrase: complète/supplante BORG_PASSPHRASE du borghelperrc pour toute la durée de vie de bh
+#             (utile pour ne pas persister de passphrase en clair dans un borghelperrc partagé)
 ```
 
 Attributs :
@@ -70,7 +72,7 @@ db = BorgHelperDB(cache_dir, db_prefix, cfg_reader=None)
 Lecture du borghelperrc, exécution des commandes borg via subprocess.
 
 ```python
-runner = BorgRunner(cfgfile=None)
+runner = BorgRunner(cfgfile=None, passphrase=None)
 ```
 
 ---

@@ -1,5 +1,25 @@
 # Changelog — borgHelper
 
+## 1.0.78 — 2026-09-17
+
+### `-P` : passphrase en paramètre + correctif `-C`
+
+Nouveau paramètre `-P <passphrase>` (et variable d'environnement `BORGHELPERC_RUNTIME_PASSPHRASE`,
+prioritaire sur `-P` uniquement par ordre de résolution — l'env est le défaut, `-P` le supplante s'il
+est fourni explicitement) : complète ou supplante `BORG_PASSPHRASE` du `.borghelperrc` pour l'appel en
+cours, sans le persister. Permet de garder un `.borghelperrc` sans passphrase en clair et de l'injecter
+à l'exécution — cas d'usage principal : `borgHelperWWW`.
+
+Corrigé au passage : `-C <fichier>` n'acceptait en réalité aucun argument (absent du spec `getopt`,
+`-C /chemin` provoquait "Argument(s) non reconnu(s)") alors que la doc l'a toujours documenté comme
+prenant un chemin. `-C` fonctionne maintenant comme documenté.
+
+### Nouveau : `borgHelperWWW`
+
+API HTTP (FastAPI + Swagger) au-dessus de `borgHelper`, en sous-processus (aucune modification du
+comportement CLI). Toutes les commandes sauf `Mount`/`UMount`. Auth par clé partagée (`X-API-Key`),
+passphrase par appel (`X-Borg-Passphrase` → `-P`). Voir [README.md](README.md#borghelperwww--api-http).
+
 ## 1.0.77 — 2026-09-17
 
 ### `LstBkp` et `LstBkpFls` : DB uniquement, plus d'appel `borg`

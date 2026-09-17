@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.77"
+Version="1.0.78"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -304,6 +304,9 @@ def usage(doc=None,debug=0):
     if doc is None:
         printer("   -H <Stats|Login|Mount|UMount|ListBkp|ListBkpFiles|Restore> [-C /root/.borghelperrc]")
         printer("       Permet d'avoir les documentations detaillés des differentes commandes")
+        printer("   [-C /autre/.borghelperrc] [-P passphrase]  (combinable avec toute commande)")
+        printer("       -C : fichier de conf alternatif  |  -P : complète/supplante BORG_PASSPHRASE du fichier")
+        printer("       BORGHELPERC_RUNTIME_PASSPHRASE (env) : défaut de -P, invisible dans `ps aux` (préférer sur machine partagée)")
         printer("   -c Stats [-n server-name/nickname]")
         printer("       Liste les backup references, et le fait qu'ils soient mount ou pas")
         printer("   -c Login [-s servername] [-n nickname] [-k keyfile.key] -p passphrase -r repo -m mountpoint")
@@ -1027,8 +1030,9 @@ class BorgHelperDB:
 class BorgRunner:
     """Borg subprocess wrapper and borghelperrc configuration layer."""
 
-    def __init__(self,cfgfile=None):
+    def __init__(self,cfgfile=None,passphrase=None):
         self.cfgfile=cfgfile or os.path.expanduser("~/.borghelperrc")
+        self.passphrase=passphrase
 
     def cfgread(self,nick,debug=0):
         if os.path.exists(self.cfgfile) and os.path.isfile(self.cfgfile):
@@ -1036,7 +1040,9 @@ class BorgRunner:
             config.optionxform=str
             config.read(self.cfgfile)
             if nick not in config.keys(): return None
-            return config[nick]
+            cfg=config[nick]
+            if self.passphrase is not None: cfg['BORG_PASSPHRASE']=self.passphrase
+            return cfg
         return None
 
     def cfgreadnicks(self,debug=0):
@@ -1176,8 +1182,8 @@ class BorgHelper:
         bh.report('myserver')
     """
 
-    def __init__(self,cfgfile=None,cache_dir=None):
-        self.borg=BorgRunner(cfgfile)
+    def __init__(self,cfgfile=None,cache_dir=None,passphrase=None):
+        self.borg=BorgRunner(cfgfile,passphrase=passphrase)
         cp=configparser.ConfigParser()
         if os.path.exists(self.borg.cfgfile): cp.read(self.borg.cfgfile)
         resolved_cache=cache_dir or os.path.expanduser(cp.defaults().get('cache_dir','~/.cache/borghelper'))
@@ -2804,7 +2810,7 @@ def _cli_main():
         sentry_sdk.init(dsn=sentryid,environment="production",release=f"borgHelper@{Version}",traces_sample_rate=1.0)
 
     try:
-        opts,args=getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILCFSN:ox:D",["help"])
+        opts,args=getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILC:FSN:ox:DP:",["help"])
     except getopt.GetoptError as err:
         print(err); usage(); sys.exit(2)
     if args:
@@ -2812,17 +2818,19 @@ def _cli_main():
         printer("Utiliser -n <nick> pour spécifier le dépôt.")
         usage(); sys.exit(2)
 
-    # 1ère passe : extraire cfgfile, debug, cmd
-    cfgfile_arg=None; debug=0; cmd=None
+    # 1ère passe : extraire cfgfile, passphrase, debug, cmd
+    # BORGHELPERC_RUNTIME_PASSPHRASE : défaut process-scoped, plus sûr que -P (invisible dans `ps aux`)
+    cfgfile_arg=None; passphrase_arg=os.environ.get('BORGHELPERC_RUNTIME_PASSPHRASE'); debug=0; cmd=None
     for opt,arg in opts:
         if opt=='-C': cfgfile_arg=os.path.expanduser(arg)
+        elif opt=='-P': passphrase_arg=arg
         elif opt=='-d': debug+=1
         elif opt=='-v': print(f"Version {Version}"); sys.exit(0)
         elif opt in ('-h','--help'): usage(); sys.exit(1)
         elif opt=='-H': usage(arg.lower()); sys.exit(1)
         elif opt=='-c': cmd=arg.lower()
 
-    bh=BorgHelper(cfgfile=cfgfile_arg)
+    bh=BorgHelper(cfgfile=cfgfile_arg,passphrase=passphrase_arg)
 
     optab={'stats':'Ccdn','login':'Ccdsnkprm','mount':'Ccdnb','umount':'Ccdn',
            'lstbkp':'Ccdn','lstbkpfls':'Ccdnb','restore':'CcdnbfwWL','diffbkp':'Ccdnbw',
@@ -2830,6 +2838,7 @@ def _cli_main():
            'init':'Ccdn','key':'Ccdn','index':'CcdnFSA','search':'CcdnfbB',
            'filehist':'CcdnfbB','cacheinfo':'Ccdn','cacheclean':'Ccdn','duidx':'CcdnfbBsj',
            'idxtop':'CcdnNp','difftop':'CcdnNpb','idxpurge':'CcdnxD'}
+    optab={k:v+'P' for k,v in optab.items()}
 
     if cmd is None or cmd not in optab.keys():
         usage()

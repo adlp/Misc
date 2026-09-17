@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+#/*
+#* borgHelperWWW - FastAPI wrapper around borgHelper (subprocess-based)
+#* Copyright (C) 2026 Antoine DELAPORTE
+#* This program is free software: GNU GPL v3 or later
+#* See <http://www.gnu.org/licenses/>
+#*/
+
+import os,sys,secrets,subprocess
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+from borgHelper import Version as BORGHELPER_VERSION
+
+# ── Configuration (env vars only — this is meant to run under uvicorn) ─────────
+
+BORGHELPER_BIN=Path(os.environ.get('BORGHELPERWWW_BORGHELPER_BIN',Path(__file__).resolve().parent/'borgHelper'))
+CFGFILE=os.environ.get('BORGHELPERWWW_CFGFILE')
+API_KEY=os.environ.get('BORGHELPERWWW_API_KEY')
+TIMEOUT=int(os.environ.get('BORGHELPERWWW_TIMEOUT','3600')) or None
+
+if not CFGFILE:
+    sys.exit("BORGHELPERWWW_CFGFILE non défini — chemin vers le .borghelperrc dédié à l'API")
+if not os.path.isfile(CFGFILE):
+    sys.exit(f"BORGHELPERWWW_CFGFILE={CFGFILE} introuvable")
+if not API_KEY:
+    sys.exit("BORGHELPERWWW_API_KEY non défini — clé partagée requise pour authentifier les appels API")
+if not BORGHELPER_BIN.is_file():
+    sys.exit(f"borgHelper introuvable ({BORGHELPER_BIN}) — BORGHELPERWWW_BORGHELPER_BIN pour surcharger")
+
+app=FastAPI(
+    title="borgHelperWWW",
+    version=BORGHELPER_VERSION,
+    description=(
+        "API HTTP au-dessus de borgHelper (exécute le binaire borgHelper en sous-processus, "
+        f"avec -C {CFGFILE}).\n\n"
+        "Authentification : header `X-API-Key`.\n\n"
+        "Passphrase du dépôt borg : header `X-Borg-Passphrase` (optionnel) — complète ou "
+        "supplante `BORG_PASSPHRASE` du borghelperrc pour cet appel uniquement (transmise au "
+        "sous-processus via variable d'environnement, jamais visible dans `ps aux`).\n\n"
+        "⚠️ Toutes les commandes CLI sont exposées sauf Mount/UMount (accès FUSE local, "
+        "sans objet pour un serveur HTTP). `Login` écrit en clair la passphrase fournie dans "
+        f"{CFGFILE} — à réserver au provisioning, pas à un usage courant."
+    ),
+)
+
+# ── Auth ─────────────────────────────────────────────────────────────────────
+
+def require_api_key(x_api_key: Optional[str]=Header(default=None)):
+    if not x_api_key or not secrets.compare_digest(x_api_key,API_KEY):
+        raise HTTPException(401,detail="X-API-Key manquant ou invalide")
+
+# ── Exécution borgHelper ────────────────────────────────────────────────────
+
+class CommandResult(BaseModel):
+    exitcode: int
+    stdout: str
+    stderr: str
+
+def run_borghelper(cmd: str, nick: Optional[str]=None, extra_args=(), passphrase: Optional[str]=None) -> JSONResponse:
+    argv=[sys.executable,str(BORGHELPER_BIN),'-C',CFGFILE,'-c',cmd]
+    if nick: argv+=['-n',nick]
+    argv+=list(extra_args)
+    env=os.environ.copy()
+    if passphrase: env['BORGHELPERC_RUNTIME_PASSPHRASE']=passphrase
+    try:
+        proc=subprocess.run(argv,capture_output=True,text=True,timeout=TIMEOUT,env=env)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504,detail=f"Commande {cmd} : timeout après {TIMEOUT}s")
+    result=CommandResult(exitcode=proc.returncode,stdout=proc.stdout,stderr=proc.stderr)
+    return JSONResponse(status_code=200 if proc.returncode==0 else 400,content=result.dict())
+
+# ── Endpoints ────────────────────────────────────────────────────────────────
+# Un endpoint par commande CLI de borgHelper (voir README.md), sauf Mount/UMount.
+
+@app.get("/stats",response_model=CommandResult,tags=["lecture"])
+def stats(nick: Optional[str]=None, x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    return run_borghelper('stats',nick=nick)
+
+@app.post("/login",response_model=CommandResult,tags=["admin"])
+def login(servername: str, nickname: Optional[str]=None, repo: str=Query(...),
+          repo_passphrase: str=Query(...,description="Passphrase persistée en clair dans le borghelperrc du serveur, PAS le header X-Borg-Passphrase"),
+          keyfile: Optional[str]=None, mountpoint: Optional[str]=None,
+          x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    extra=['-s',servername,'-r',repo,'-p',repo_passphrase]
+    if keyfile: extra+=['-k',keyfile]
+    if mountpoint: extra+=['-m',mountpoint]
+    return run_borghelper('login',nick=nickname,extra_args=extra)
+
+@app.get("/lstbkp",response_model=CommandResult,tags=["lecture"])
+def lstbkp(nick: str, x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    return run_borghelper('lstbkp',nick=nick)
+
+@app.get("/lstbkpfls",response_model=CommandResult,tags=["lecture"])
+def lstbkpfls(nick: str, bid: Optional[str]=None, x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    extra=['-b',bid] if bid else []
+    return run_borghelper('lstbkpfls',nick=nick,extra_args=extra)
+
+@app.get("/report",response_model=CommandResult,tags=["lecture"])
+def report(nick: str="ALL", n: Optional[int]=Query(default=None,description="n dernières archives"),
+           html: bool=False, json_output: bool=Query(default=False,alias="json"),
+           offline: bool=Query(default=False,description="diff.db uniquement, aucun appel borg"),
+           x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    extra=[]
+    if n is not None: extra+=['-N',str(n)]
+    if html: extra.append('-l')
+    if json_output: extra.append('-j')
+    if offline: extra.append('-o')
+    return run_borghelper('report',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
+
+@app.get("/diffbkp",response_model=CommandResult,tags=["lecture"])
+def diffbkp(nick: str, bid_old: Optional[str]=None, bid_new: Optional[str]=None,
+            x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    extra=[]
+    if bid_old and bid_new: extra=['-b',f"{bid_old},{bid_new}"]
+    elif bid_old: extra=['-b',bid_old]
+    return run_borghelper('diffbkp',nick=nick,extra_args=extra)
+
+@app.get("/restore/perms",response_model=CommandResult,tags=["lecture"],summary="Liste les droits d'un fichier sans restaurer (Restore -L)")
+def restore_perms(nick: str, ftor: str, bid: Optional[str]=None, x_api_key: Optional[str]=Header(default=None),
+                   x_borg_passphrase: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    extra=['-f',ftor,'-L']
+    if bid: extra+=['-b',bid]
+    return run_borghelper('restore',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
+
+@app.post("/restore",response_model=CommandResult,tags=["mutation"],summary="Restaure un fichier/une arborescence sur le disque du serveur borgHelperWWW")
+def restore(nick: str, ftor: str, where: str, bid: Optional[str]=None, flat: bool=False,
+            x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    extra=['-f',ftor,'-W' if flat else '-w',where]
+    if bid: extra+=['-b',bid]
+    return run_borghelper('restore',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
+
+@app.delete("/delbkp",response_model=CommandResult,tags=["mutation"],summary="⚡ Supprime une archive sur le dépôt — irréversible")
+def delbkp(nick: str, bid: str, x_api_key: Optional[str]=Header(default=None),
+           x_borg_passphrase: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    return run_borghelper('delbkp',nick=nick,extra_args=['-b',bid],passphrase=x_borg_passphrase)
+
+@app.post("/init",response_model=CommandResult,tags=["mutation"],summary="Initialise un nouveau dépôt borg (repokey)")
+def init(nick: str, x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    return run_borghelper('init',nick=nick,passphrase=x_borg_passphrase)
+
+@app.post("/bkp",response_model=CommandResult,tags=["mutation"],summary="Lance un backup (+ indexation automatique)")
+def bkp(nick: str, no_index: bool=False, x_api_key: Optional[str]=Header(default=None),
+        x_borg_passphrase: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    extra=['-I'] if no_index else []
+    return run_borghelper('bkp',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
+
+@app.get("/key",response_model=CommandResult,tags=["lecture"],summary="Exporte la clef du dépôt (format papier)")
+def key(nick: str, x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    return run_borghelper('key',nick=nick,passphrase=x_borg_passphrase)
+
+@app.post("/prune",response_model=CommandResult,tags=["mutation"],summary="⚡ Supprime les vieux backups selon KEEP_* — irréversible")
+def prune(nick: str, x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    return run_borghelper('prune',nick=nick,passphrase=x_borg_passphrase)
+
+@app.post("/index",response_model=CommandResult,tags=["mutation"])
+def index(nick: str, force: bool=False, snapshot_only: bool=False, archive: Optional[str]=None,
+          x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    extra=[]
+    if force: extra.append('-F')
+    if snapshot_only: extra.append('-S')
+    if archive: extra+=['-A',archive]
+    return run_borghelper('index',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
+
+@app.get("/search",response_model=CommandResult,tags=["lecture"])
+def search(nick: str, pattern: str, archive_from: Optional[str]=None, archive_to: Optional[str]=None,
+           x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    extra=['-f',pattern]
+    if archive_from: extra+=['-b',archive_from]
+    if archive_to: extra+=['-B',archive_to]
+    return run_borghelper('search',nick=nick,extra_args=extra)
+
+@app.get("/filehist",response_model=CommandResult,tags=["lecture"])
+def filehist(nick: str, path: str, archive_from: Optional[str]=None, archive_to: Optional[str]=None,
+             x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    extra=['-f',path]
+    if archive_from: extra+=['-b',archive_from]
+    if archive_to: extra+=['-B',archive_to]
+    return run_borghelper('filehist',nick=nick,extra_args=extra)
+
+@app.get("/duidx",response_model=CommandResult,tags=["lecture"])
+def duidx(nick: str, pattern: Optional[str]=None, sort: str="chemin", json_output: bool=Query(default=False,alias="json"),
+          archive_from: Optional[str]=None, archive_to: Optional[str]=None, x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    extra=[]
+    if pattern: extra+=['-f',pattern]
+    extra+=['-s',sort]
+    if json_output: extra.append('-j')
+    if archive_from: extra+=['-b',archive_from]
+    if archive_to: extra+=['-B',archive_to]
+    return run_borghelper('duidx',nick=nick,extra_args=extra)
+
+@app.get("/cacheinfo",response_model=CommandResult,tags=["lecture"])
+def cacheinfo(nick: str="ALL", x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    return run_borghelper('cacheinfo',nick=nick)
+
+@app.post("/cacheclean",response_model=CommandResult,tags=["mutation"])
+def cacheclean(nick: str="ALL", x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    return run_borghelper('cacheclean',nick=nick)
+
+@app.get("/idxtop",response_model=CommandResult,tags=["lecture"])
+def idxtop(nick: str="ALL", topn: int=20, depth: int=3, x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    return run_borghelper('idxtop',nick=nick,extra_args=['-N',str(topn),'-p',str(depth)])
+
+@app.get("/difftop",response_model=CommandResult,tags=["lecture"])
+def difftop(nick: str="ALL", bid: Optional[str]=None, topn: int=10, depth: int=3,
+            x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    extra=['-N',str(topn),'-p',str(depth)]
+    if bid: extra+=['-b',bid]
+    return run_borghelper('difftop',nick=nick,extra_args=extra)
+
+@app.post("/idxpurge",response_model=CommandResult,tags=["mutation"],summary="⚡ Purge rétroactive de diff_index + anciens snapshots")
+def idxpurge(nick: str="ALL", pattern: Optional[str]=None, dryrun: bool=False,
+             x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    extra=['-D'] if dryrun else []
+    if pattern: extra+=['-x',pattern]
+    return run_borghelper('idxpurge',nick=nick,extra_args=extra)
+
+if __name__=='__main__':
+    import uvicorn
+    uvicorn.run(app,host=os.environ.get('BORGHELPERWWW_HOST','127.0.0.1'),
+                port=int(os.environ.get('BORGHELPERWWW_PORT','8000')))

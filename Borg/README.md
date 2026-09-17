@@ -136,6 +136,9 @@ Options communes :
 | `-n ALL` | Tous les dépôts du fichier de conf |
 | `-d` | Mode debug (cumulable : `-dd`) |
 | `-C <fichier>` | Fichier de conf alternatif |
+| `-P <passphrase>` | Complète/supplante `BORG_PASSPHRASE` du fichier de conf pour cet appel |
+
+Variable d'environnement `BORGHELPERC_RUNTIME_PASSPHRASE` : valeur par défaut de `-P` — préférable sur une machine partagée car invisible dans `ps aux` (contrairement à `-P`, qui apparaît en clair dans la liste des processus).
 
 ---
 
@@ -563,6 +566,102 @@ borgHelper -c CacheClean -n mon-serveur
 ```
 
 `CacheClean` vérifie le `last_modified` courant et supprime les entrées périmées ou pour des nicks absents de la conf.
+
+---
+
+## `borgHelperWWW` — API HTTP
+
+`borgHelperWWW` expose borgHelper en API REST (FastAPI + Swagger). Il s'appuie sur `borgHelper` en
+sous-processus (via `python3 borgHelper -C <conf> -c <commande> ...`) — pas d'appel direct aux classes
+Python, donc aucun changement de comportement par rapport au CLI.
+
+Toutes les commandes sont exposées **sauf `Mount`/`UMount`** (accès FUSE local, sans objet en HTTP).
+
+### Prérequis
+
+```bash
+pip install fastapi uvicorn pydantic
+```
+
+### Configuration (variables d'environnement)
+
+| Variable | Rôle |
+|----------|------|
+| `BORGHELPERWWW_CFGFILE` | **Requis.** Chemin vers un `.borghelperrc` dédié à l'API (distinct de celui de l'admin CLI) |
+| `BORGHELPERWWW_API_KEY` | **Requis.** Clé partagée attendue dans le header `X-API-Key` sur chaque appel |
+| `BORGHELPERWWW_BORGHELPER_BIN` | Chemin vers le script `borgHelper` (défaut : à côté de `borgHelperWWW`) |
+| `BORGHELPERWWW_TIMEOUT` | Timeout en secondes par commande (défaut 3600 ; vide/0 = pas de limite) |
+| `BORGHELPERWWW_HOST` / `BORGHELPERWWW_PORT` | Bind (défaut `127.0.0.1:8000`) — seulement pour `python3 borgHelperWWW` en direct |
+
+Le serveur refuse de démarrer si `BORGHELPERWWW_CFGFILE` ou `BORGHELPERWWW_API_KEY` est absent.
+
+### Lancement
+
+```bash
+export BORGHELPERWWW_CFGFILE=/etc/borghelperrc-www
+export BORGHELPERWWW_API_KEY=$(openssl rand -hex 32)
+python3 borgHelperWWW                      # dev, uvicorn intégré
+# ou en prod :
+uvicorn borgHelperWWW:app --host 0.0.0.0 --port 8000 --workers 2
+```
+
+Swagger interactif : `http://<host>:<port>/docs`
+
+### Authentification et passphrase
+
+- **`X-API-Key`** (header, requis sur tous les endpoints) — protège l'accès à l'API elle-même. Sans
+  cette clé, n'importe qui pourrait déclencher `Prune`/`DelBkp`/`Restore` sur les dépôts configurés.
+- **`X-Borg-Passphrase`** (header, optionnel) — complète ou supplante `BORG_PASSPHRASE` du
+  `.borghelperrc` pour cet appel uniquement (équivalent HTTP de `-P` / `BORGHELPERC_RUNTIME_PASSPHRASE`).
+  Permet de garder le `.borghelperrc` de l'API **sans passphrase en clair** : chaque appelant fournit
+  la sienne à la demande.
+- **`Login`** est un cas à part : il **écrit** la passphrase fournie (`repo_passphrase`) en clair dans
+  `BORGHELPERWWW_CFGFILE` (c'est son rôle : déclarer un nouveau dépôt). À réserver au provisioning.
+
+### Endpoints
+
+Un endpoint par commande CLI (voir [Commandes](#commandes) ci-dessus pour le détail de chaque
+comportement) — `GET` pour les commandes en lecture, `POST`/`DELETE` pour celles qui modifient un état :
+
+| Méthode | Route | Commande CLI |
+|---------|-------|--------------|
+| GET | `/stats` | Stats |
+| POST | `/login` | Login |
+| GET | `/lstbkp` | LstBkp |
+| GET | `/lstbkpfls` | LstBkpFls |
+| GET | `/report` | Report |
+| GET | `/diffbkp` | DiffBkp |
+| GET | `/restore/perms` | Restore -L |
+| POST | `/restore` | Restore |
+| DELETE | `/delbkp` | DelBkp ⚡ |
+| POST | `/init` | Init |
+| POST | `/bkp` | Bkp |
+| GET | `/key` | Key |
+| POST | `/prune` | Prune ⚡ |
+| POST | `/index` | Index |
+| GET | `/search` | Search |
+| GET | `/filehist` | FileHist |
+| GET | `/duidx` | DuIdx |
+| GET | `/cacheinfo` | CacheInfo |
+| POST | `/cacheclean` | CacheClean |
+| GET | `/idxtop` | IdxTop |
+| GET | `/difftop` | DiffTop |
+| POST | `/idxpurge` | IdxPurge ⚡ |
+
+Réponse (`CommandResult`) commune à tous les endpoints :
+
+```json
+{"exitcode": 0, "stdout": "...", "stderr": "..."}
+```
+
+`exitcode != 0` ⇒ HTTP 400 (le détail reste dans le corps JSON — voir [Codes retour](#codes-retour)).
+
+### Limites connues
+
+- Exécution synchrone : `Bkp`/`Prune`/`Index` sur un gros dépôt occupent un worker HTTP pendant toute
+  leur durée — pas de file d'attente/job asynchrone. Prévoir `--workers` et un timeout côté reverse-proxy.
+- Le budget d'authentification est volontairement simple (une seule clé partagée). Pour un usage
+  multi-utilisateurs avec traçabilité par appelant, ajouter une couche d'auth dédiée devant l'API.
 
 ---
 
