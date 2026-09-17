@@ -1,6 +1,12 @@
 # Changelog — borgHelper
 
-## Interface web — colonnes plus larges dans l'Historique complet — 2026-09-17
+## Interface web — navigation rapide + alerte visuelle sur la liste des serveurs — 2026-09-17
+
+Ligne de liens rapides au-dessus de la liste des serveurs : clic sur un nom → défilement direct
+(`scrollIntoView`) vers la carte de ce serveur, utile quand la liste est longue. Nom affiché en rouge
+(lien ET titre de la carte) si `Report` remonte une erreur pour ce serveur — détecté via le préfixe
+`***` déjà posé par `report_offline()` sur le champ `nom` (diff.db absent, dernière sauvegarde plus
+ancienne que `MAX_AGE_BKP`, ou erreur SQLite). Aucun changement côté `borgHelper`.
 
 Page élargie (`main` 1100px → 1400px) pour réduire les marges latérales vides. Tableau de l'Historique
 complet : colonnes ajustées au contenu (`width:auto`) au lieu d'un étirement uniforme forcé qui créait

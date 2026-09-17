@@ -44,6 +44,11 @@
   #historyTableEl th,#historyTableEl td{white-space:nowrap}
   #browseBreadcrumb a{color:var(--accent);text-decoration:none}
   #browseBreadcrumb a:hover{text-decoration:underline}
+  #machinesJump{display:flex;flex-wrap:wrap;gap:4px 12px;margin-bottom:14px;font-size:13px}
+  #machinesJump a{color:var(--accent);text-decoration:none}
+  #machinesJump a:hover{text-decoration:underline}
+  #machinesJump a.jump-err{color:var(--danger);font-weight:600}
+  .nick-err{color:var(--danger)}
   .machine-card{display:flex;flex-direction:column;gap:10px;margin-bottom:14px}
   .machine-head{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
   .machine-head h3{margin:0;font-size:15px}
@@ -111,6 +116,7 @@
         </div>
       </div>
       <p class="hint">Rapport hors-ligne (base SQLite uniquement, aucune passphrase requise pour cette liste).</p>
+      <div id="machinesJump"></div>
       <div id="machinesError" class="error"></div>
       <div id="machinesList">Chargement…</div>
     </div>
@@ -342,15 +348,24 @@ async function loadMachines(){
   catch(e){ errEl.textContent='Réponse Report illisible : '+r.stdout.slice(0,200); listEl.textContent=''; return; }
   const summary=parsed.summary||{};
   const nicks=Object.keys(summary).filter(n=>n!=='Totaux').sort();
-  if(nicks.length===0){ listEl.innerHTML='<p class="hint">Aucun serveur déclaré dans le fichier de conf.</p>'; return; }
+  const jumpEl=document.getElementById('machinesJump');
+  if(nicks.length===0){
+    listEl.innerHTML='<p class="hint">Aucun serveur déclaré dans le fichier de conf.</p>';
+    jumpEl.innerHTML=''; return;
+  }
   const passes=getPassphrases();
+  // Report préfixe 'nom' par '***' quand il remonte une erreur pour ce serveur (diff.db absent,
+  // dernière sauvegarde trop ancienne (MAX_AGE_BKP), ou exception SQLite).
+  const errFlags={};
   listEl.innerHTML=nicks.map(nick=>{
     const s=summary[nick];
     const hasPass=!!passes[nick];
+    const isErr=(s['nom']||'').startsWith('***');
+    errFlags[nick]=isErr;
     return `
       <div class="machine-card card" style="margin-bottom:14px">
         <div class="machine-head">
-          <h3>${escapeHtml(nick)} ${badgeFor(s['depuis'])}</h3>
+          <h3${isErr?' class="nick-err"':''}>${escapeHtml(nick)} ${badgeFor(s['depuis'])}</h3>
           <div>
             <button class="secondary bkp-now-btn" data-nick="${escapeAttr(nick)}">▶ Backup</button>
             <button class="secondary explore-btn" data-nick="${escapeAttr(nick)}">🗂 Explorer</button>
@@ -377,10 +392,23 @@ async function loadMachines(){
         </div>
       </div>`;
   }).join('');
+  machineCardsByNick={};
   Array.from(listEl.querySelectorAll('.machine-card')).forEach((card,i)=>{
+    machineCardsByNick[nicks[i]]=card;
     loadHistoryInline(nicks[i],card.querySelector('.history-panel'));
   });
+  jumpEl.innerHTML=nicks.map(nick=>
+    `<a href="#" class="jump-link${errFlags[nick]?' jump-err':''}" data-nick="${escapeAttr(nick)}">${escapeHtml(nick)}</a>`
+  ).join(' · ');
 }
+
+let machineCardsByNick={};
+document.getElementById('machinesJump').addEventListener('click', e=>{
+  const a=e.target.closest('.jump-link'); if(!a) return;
+  e.preventDefault();
+  const card=machineCardsByNick[a.dataset.nick];
+  if(card) card.scrollIntoView({behavior:'smooth',block:'start'});
+});
 
 document.getElementById('machinesList').addEventListener('click', e=>{
   const openBtn=e.target.closest('.open-machine-btn');

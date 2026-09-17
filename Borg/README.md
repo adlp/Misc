@@ -680,7 +680,11 @@ page de l'interface web (visible sur toutes les pages, y compris la page de conn
    **Serveurs** dans l'en-tête (à côté de **Déconnexion**), visible sur toutes les pages sauf
    Connexion et Serveurs elle-même, pour revenir directement à la liste des serveurs.
 2. **Serveurs** : liste des nicks avec un rapport sommaire hors-ligne (aucune passphrase requise pour
-   cette liste — lecture SQLite uniquement). Bouton **+ Nouveau serveur** pour `Login`. Pas de saisie de
+   cette liste — lecture SQLite uniquement). Ligne de **liens rapides** au-dessus de la liste (un par
+   serveur) : clic → défilement direct vers la carte de ce serveur (utile quand la liste est longue).
+   Nom en **rouge** (lien ET titre de la carte) si `Report` remonte une erreur pour ce serveur (`nom`
+   préfixé par `***` — diff.db absent, dernière sauvegarde plus ancienne que `MAX_AGE_BKP`, ou erreur
+   SQLite). Bouton **+ Nouveau serveur** pour `Login`. Pas de saisie de
    passphrase sur cette page — juste un badge indiquant si elle est déjà enregistrée pour la session ou
    non ; à renseigner sur la page du serveur concerné. Bouton **▶ Backup** sur chaque carte serveur pour
    lancer un `Bkp` immédiat (confirmation avant lancement ; utilise la passphrase de session si
