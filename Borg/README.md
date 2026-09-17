@@ -754,9 +754,11 @@ clair sur le réseau sinon.
 Un endpoint par commande CLI (voir [Commandes](#commandes) ci-dessus pour le détail de chaque
 comportement) — `GET` pour les commandes en lecture, `POST`/`DELETE` pour celles qui modifient un état.
 Exception : `GET /version` n'exécute aucune commande — il renvoie les versions de `borgHelperWWW`
-(`WWW_VERSION`, constante interne) et de `borgHelper` (`Version`, importée), toutes deux **chargées une
-fois au démarrage du processus**. Comme `/`, volontairement **non protégé** par `X-API-Key` (aucune
-donnée sensible) — affiché dans le pied de page de l'interface web, visible même avant connexion.
+(`WWW_VERSION`, constante interne), de `borgHelper` (`Version`, importée) et de
+`borgHelperWWW_ui.html` (`UI_VERSION`, extraite par regex du commentaire `<!-- UI_VERSION: X.Y.Z -->`
+en tête du fichier HTML), toutes trois **chargées une fois au démarrage du processus**. Comme `/`,
+volontairement **non protégé** par `X-API-Key` (aucune donnée sensible) — affiché dans le pied de page
+de l'interface web, visible même avant connexion.
 
 | Méthode | Route | Commande CLI |
 |---------|-------|--------------|

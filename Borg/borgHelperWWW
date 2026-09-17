@@ -20,7 +20,7 @@ from borgHelper import Version as BORGHELPER_VERSION, BorgRunner
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.0.0"
+WWW_VERSION="1.0.1"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -190,14 +190,16 @@ _UI_FILE=Path(__file__).resolve().parent/'borgHelperWWW_ui.html'
 if not _UI_FILE.is_file():
     sys.exit(f"Interface web introuvable ({_UI_FILE})")
 _UI_HTML=_UI_FILE.read_text(encoding='utf-8')
+_UI_VERSION_MATCH=re.search(r'<!--\s*UI_VERSION:\s*(\S+)',_UI_HTML)
+UI_VERSION=_UI_VERSION_MATCH.group(1) if _UI_VERSION_MATCH else 'inconnue'
 
 @app.get("/",response_class=HTMLResponse,include_in_schema=False)
 def ui_index():
     return _UI_HTML
 
-@app.get("/version",tags=["lecture"],summary="Versions chargées au démarrage de borgHelperWWW (lui-même + borgHelper) — non protégé, aucune donnée sensible")
+@app.get("/version",tags=["lecture"],summary="Versions chargées au démarrage de borgHelperWWW (lui-même + borgHelper + borgHelperWWW_ui.html) — non protégé, aucune donnée sensible")
 def version():
-    return {'borghelperwww_version':WWW_VERSION,'borghelper_version':BORGHELPER_VERSION}
+    return {'borghelperwww_version':WWW_VERSION,'borghelper_version':BORGHELPER_VERSION,'ui_version':UI_VERSION}
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 # Un endpoint par commande CLI de borgHelper (voir README.md), sauf Mount/UMount.

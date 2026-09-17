@@ -1,5 +1,15 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.0.1 + UI 1.0.0 — versionnage UI, intégré à /version — 2026-09-17
+
+`borgHelperWWW_ui.html` reçoit lui aussi son propre numéro de version (`UI_VERSION`, commentaire
+`<!-- UI_VERSION: X.Y.Z -->` en tête du fichier) — à incrémenter à chaque commit qui modifie ce fichier
+(même règle symétrique que `borgHelper`/`Version` et `borgHelperWWW`/`WWW_VERSION`).
+
+`borgHelperWWW` extrait cette version par regex au démarrage (lecture de `_UI_HTML`) et l'ajoute à la
+réponse de `GET /version` (`ui_version`). Pied de page : affiche désormais les trois versions
+(borgHelperWWW, borgHelper, UI).
+
 ## borgHelperWWW 1.0.0 — versionnage propre + affichage dans le pied de page — 2026-09-17
 
 `borgHelperWWW` reçoit son propre numéro de version (`WWW_VERSION`, jusqu'ici il réutilisait par erreur

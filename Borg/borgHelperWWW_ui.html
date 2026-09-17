@@ -1,4 +1,6 @@
 <!DOCTYPE html>
+<!-- UI_VERSION: 1.0.0 — bumper à chaque commit qui modifie ce fichier (lu par borgHelperWWW au
+     démarrage, exposé via GET /version) -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -243,7 +245,7 @@ let currentActionId=null;
     if(!r.ok) return;
     const v=await r.json();
     document.getElementById('footerVersions').textContent=
-      ` v${v.borghelperwww_version} (borgHelper v${v.borghelper_version})`;
+      ` v${v.borghelperwww_version} (borgHelper v${v.borghelper_version}, UI v${v.ui_version})`;
   }catch(e){ /* info non critique, silencieux */ }
 })();
 
