@@ -679,7 +679,14 @@ Swagger interactif : `http://<host>:<port>/docs`
    par nick) — c'est ici, et seulement ici, qu'elle se saisit. Envoyée en `X-Borg-Passphrase` pour les
    actions qui en ont besoin (repérées par 🔑) ; les actions destructives (`Prune`, `DelBkp`, `Restore`,
    `IdxPurge`, `Init`) demandent une confirmation avant exécution. Le résultat brut (`exitcode`, `stdout`,
-   `stderr`) s'affiche tel quel.
+   `stderr`) s'affiche tel quel. Bouton **🗂 Explorer l'arborescence** dans le bandeau du serveur.
+4. **Explorateur d'arborescence** (`TreeHist -j`) : navigation façon gestionnaire de fichiers.
+   - **Clic sur un dossier** : l'ouvre (contenu direct, comme `TreeHist -f <dossier>`).
+   - **Clic droit sur un dossier** : télécharge un `.tar` de cette arborescence, à une archive
+     choisissable dans une liste déroulante (`borg export-tar`, streamé directement au navigateur).
+   - **Clic sur un fichier** : le télécharge, à une archive choisissable (`borg extract --stdout`,
+     streamé directement, jamais écrit sur le disque du serveur borgHelperWWW).
+   - Sans archive choisie : la dernière disponible.
 
 Cette page HTML elle-même n'est pas protégée par `X-API-Key` (elle ne contient aucun secret — la clé et
 les passphrases ne sont saisies et envoyées que depuis le navigateur, via `fetch()`) ; c'est l'API qui
@@ -729,13 +736,29 @@ comportement) — `GET` pour les commandes en lecture, `POST`/`DELETE` pour cell
 | GET | `/difftop` | DiffTop |
 | POST | `/idxpurge` | IdxPurge ⚡ |
 
-Réponse (`CommandResult`) commune à tous les endpoints :
+Réponse (`CommandResult`) commune à tous les endpoints ci-dessus :
 
 ```json
 {"exitcode": 0, "stdout": "...", "stderr": "..."}
 ```
 
 `exitcode != 0` ⇒ HTTP 400 (le détail reste dans le corps JSON — voir [Codes retour](#codes-retour)).
+
+### `/download/file` et `/download/tar` — téléchargements binaires
+
+Seule exception au principe « tout passe par le binaire `borgHelper` en sous-processus » : un
+téléchargement doit streamer des octets bruts vers le navigateur (`Content-Disposition: attachment`),
+incompatible avec la réponse JSON texte de `CommandResult`. Ces deux routes lisent la conf via
+`BorgRunner` (mode librairie) et appellent `borg` **directement**, sans passer par `borgHelper` :
+
+| Méthode | Route | Paramètres | Commande borg |
+|---------|-------|------------|----------------|
+| GET | `/download/file` | `nick`, `path`, `bid` (optionnel, défaut dernière archive) | `borg extract --stdout` |
+| GET | `/download/tar` | `nick`, `prefix` (optionnel, défaut racine), `bid` (optionnel) | `borg export-tar` |
+
+Passphrase via `X-Borg-Passphrase` comme les autres actions marquées 🔑. Réponse : le flux binaire
+directement (pas de `CommandResult`) ; en cas d'erreur avant le début du stream, `HTTPException` JSON
+classique (404 nick/archive inconnu, 502 `borg list` en échec, 504 timeout).
 
 ### Limites connues
 

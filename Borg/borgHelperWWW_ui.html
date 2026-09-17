@@ -37,6 +37,9 @@
   table{width:100%;border-collapse:collapse;font-size:13px}
   th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--border)}
   th{color:var(--muted);font-weight:600}
+  .browse-row:hover{background:#f0f3f7}
+  #browseBreadcrumb a{color:var(--accent);text-decoration:none}
+  #browseBreadcrumb a:hover{text-decoration:underline}
   .machine-card{display:flex;flex-direction:column;gap:10px;margin-bottom:14px}
   .machine-head{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
   .machine-head h3{margin:0;font-size:15px}
@@ -132,6 +135,7 @@
     <div class="card">
       <div class="machine-head">
         <h2 id="detailTitle" style="margin:0"></h2>
+        <button onclick="openBrowse()">🗂 Explorer l'arborescence</button>
       </div>
       <div class="pass-row">
         <label style="margin:0" for="detailPass">Passphrase (BORG_PASSPHRASE)</label>
@@ -149,7 +153,38 @@
     </div>
   </section>
 
+  <!-- VIEW 4 : TREE BROWSER -->
+  <section id="view-browse" hidden>
+    <button class="secondary" onclick="closeBrowse()">← Retour au serveur</button>
+    <div class="card">
+      <div class="machine-head">
+        <h2 id="browseTitle" style="margin:0"></h2>
+      </div>
+      <div id="browseBreadcrumb" class="pill" style="margin-bottom:10px"></div>
+      <div id="browseError" class="error"></div>
+      <table id="browseTableEl">
+        <thead><tr><th>Nom</th><th>Genre</th><th>Dernier événement</th></tr></thead>
+        <tbody id="browseBody"></tbody>
+      </table>
+      <p class="hint">Clic sur un dossier : ouvrir. Clic droit sur un dossier : télécharger un .tar.
+        Clic sur un fichier : le télécharger.</p>
+    </div>
+  </section>
+
 </main>
+
+<!-- Modale de sélection d'archive pour un téléchargement -->
+<div id="downloadModal" class="card" style="position:fixed;top:80px;left:50%;transform:translateX(-50%);max-width:420px;z-index:50;box-shadow:0 8px 24px rgba(0,0,0,.35)" hidden>
+  <h3 id="dlModalTitle" style="margin-top:0"></h3>
+  <div class="field">
+    <label for="dlArchiveSelect">Archive</label>
+    <select id="dlArchiveSelect"><option value="">dernière archive</option></select>
+  </div>
+  <button onclick="confirmDownload()">Télécharger</button>
+  <button class="secondary" onclick="closeDownloadModal()">Annuler</button>
+  <div id="dlModalError" class="error"></div>
+</div>
+<div id="downloadOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,.3);z-index:40" hidden onclick="closeDownloadModal()"></div>
 
 <footer>borgHelperWWW — interface web</footer>
 
@@ -180,12 +215,12 @@ function setPassphrase(nick,val){
 // ── View switching ────────────────────────────────────────────────────────
 
 function showView(id){
-  ['view-login','view-machines','view-detail'].forEach(v=>{
+  ['view-login','view-machines','view-detail','view-browse'].forEach(v=>{
     document.getElementById(v).hidden=(v!==id);
   });
   document.getElementById('logoutBtn').hidden=(id==='view-login');
   document.getElementById('headerSub').textContent = id==='view-login' ? 'non connecté' :
-    (id==='view-detail' ? 'serveur : '+currentNick : 'connecté');
+    (id==='view-detail'||id==='view-browse' ? 'serveur : '+currentNick : 'connecté');
 }
 
 function logout(){
@@ -490,6 +525,140 @@ async function runAction(){
   document.getElementById('resultStderr').textContent=r.stderr||'(vide)';
   const okBadge = r.exitcode===0 ? '<span class="badge ok">exitcode 0</span>' : `<span class="badge err">exitcode ${r.exitcode}</span>`;
   meta.innerHTML=okBadge+` <span class="pill">HTTP ${r.httpStatus}</span>`;
+}
+
+// ── Tree browser (TreeHist) ──────────────────────────────────────────────
+
+let browseNick=null;
+let browsePath='';
+
+function openBrowse(){
+  browseNick=currentNick;
+  browsePath='';
+  showView('view-browse');
+  loadBrowse();
+}
+function closeBrowse(){ showView('view-detail'); }
+
+function renderBreadcrumb(){
+  const el=document.getElementById('browseBreadcrumb');
+  const parts=browsePath?browsePath.split('/'):[];
+  let acc='';
+  const links=['<a href="#" data-path="">/</a>'];
+  parts.forEach(p=>{
+    acc=acc?acc+'/'+p:p;
+    links.push(' / <a href="#" data-path="'+escapeAttr(acc)+'">'+escapeHtml(p)+'</a>');
+  });
+  el.innerHTML=links.join('');
+}
+document.getElementById('browseBreadcrumb').addEventListener('click', e=>{
+  const a=e.target.closest('a'); if(!a) return;
+  e.preventDefault(); browsePath=a.dataset.path; loadBrowse();
+});
+
+async function loadBrowse(){
+  document.getElementById('browseTitle').textContent=browseNick+' — '+(browsePath||'/');
+  document.getElementById('browseError').textContent='';
+  renderBreadcrumb();
+  const r=await apiCall('GET','/treehist',{nick:browseNick,prefix:browsePath,json:'true'},false);
+  if(r.httpStatus===401) return;
+  if(r.exitcode!==0){
+    document.getElementById('browseError').textContent=r.stderr||('exitcode '+r.exitcode);
+    document.getElementById('browseBody').innerHTML=''; return;
+  }
+  let parsed;
+  try{ parsed=JSON.parse(r.stdout); }
+  catch(e){ document.getElementById('browseError').textContent='Réponse illisible : '+r.stdout.slice(0,200); return; }
+  const data=parsed[browseNick];
+  if(!data || data.error){
+    document.getElementById('browseError').textContent=(data&&data.error)||'Aucune donnée';
+    document.getElementById('browseBody').innerHTML=''; return;
+  }
+  const entries=(data.entries||[]).filter(e=>e.name!=='.');
+  const tbody=document.getElementById('browseBody');
+  if(entries.length===0){ tbody.innerHTML='<tr><td colspan="3" class="hint">Répertoire vide</td></tr>'; return; }
+  tbody.innerHTML=entries.map(e=>{
+    const lastEv=e.events && e.events.length ? e.events[e.events.length-1] : null;
+    const evText=lastEv ? `${lastEv.type} (${lastEv.archive})` : '—';
+    const icon=e.is_dir?'📁':'📄';
+    return `<tr class="browse-row" style="cursor:pointer" data-full="${escapeAttr(e.full_path)}" data-isdir="${e.is_dir}">
+      <td>${icon} ${escapeHtml(e.name)}</td><td>${escapeHtml(e.genre)}</td><td>${escapeHtml(evText)}</td>
+    </tr>`;
+  }).join('');
+}
+
+document.getElementById('browseBody').addEventListener('click', e=>{
+  const tr=e.target.closest('.browse-row'); if(!tr) return;
+  if(tr.dataset.isdir==='true'){ browsePath=tr.dataset.full; loadBrowse(); }
+  else{ openDownloadDialog(tr.dataset.full,false); }
+});
+document.getElementById('browseBody').addEventListener('contextmenu', e=>{
+  const tr=e.target.closest('.browse-row'); if(!tr) return;
+  if(tr.dataset.isdir==='true'){ e.preventDefault(); openDownloadDialog(tr.dataset.full,true); }
+});
+
+// ── Download (fichier ou .tar, à une archive choisie) ────────────────────
+
+let dlPending=null; // {nick,path,isTar}
+
+async function openDownloadDialog(fullPath,isTar){
+  dlPending={nick:browseNick,path:fullPath,isTar};
+  document.getElementById('dlModalTitle').textContent=(isTar?'Télécharger un .tar de ':'Télécharger ')+fullPath;
+  document.getElementById('dlModalError').textContent='';
+  const sel=document.getElementById('dlArchiveSelect');
+  sel.innerHTML='<option value="">dernière archive</option>';
+  const r=await apiCall('GET','/lstbkp',{nick:browseNick},false);
+  if(r.exitcode===0 && r.stdout){
+    r.stdout.trim().split('\n').filter(Boolean).reverse().forEach(line=>{
+      const sp=line.indexOf(' ');
+      const name=sp>=0?line.slice(0,sp):line;
+      const date=sp>=0?line.slice(sp+1):'';
+      const opt=document.createElement('option');
+      opt.value=name; opt.textContent=date+' — '+name;
+      sel.appendChild(opt);
+    });
+  }
+  document.getElementById('downloadOverlay').hidden=false;
+  document.getElementById('downloadModal').hidden=false;
+}
+function closeDownloadModal(){
+  document.getElementById('downloadOverlay').hidden=true;
+  document.getElementById('downloadModal').hidden=true;
+  dlPending=null;
+}
+async function confirmDownload(){
+  if(!dlPending) return;
+  const bid=document.getElementById('dlArchiveSelect').value||undefined;
+  const {nick,path,isTar}=dlPending;
+  try{
+    if(isTar) await downloadViaFetch('/download/tar',{nick,prefix:path,bid},nick,path.split('/').pop()+'.tar');
+    else await downloadViaFetch('/download/file',{nick,path,bid},nick,path.split('/').pop());
+  }catch(e){
+    document.getElementById('dlModalError').textContent=e.message; return;
+  }
+  closeDownloadModal();
+}
+
+async function downloadViaFetch(path,params,nick,fallbackName){
+  const url=new URL(path, location.origin);
+  Object.entries(params).forEach(([k,v])=>{ if(v!==undefined && v!=='') url.searchParams.set(k,v); });
+  const headers={'X-API-Key':getApiKey()};
+  const p=getPassphrase(nick); if(p) headers['X-Borg-Passphrase']=p;
+  const res=await fetch(url.toString(), {headers});
+  if(res.status===401){ logout(); throw new Error('Session expirée.'); }
+  if(!res.ok){
+    let detail='HTTP '+res.status;
+    try{ const body=await res.json(); if(body.detail) detail=body.detail; }catch(e){}
+    throw new Error('Téléchargement échoué : '+detail);
+  }
+  const blob=await res.blob();
+  const dispo=res.headers.get('Content-Disposition')||'';
+  const m=/filename="?([^"]+)"?/.exec(dispo);
+  const filename=m?m[1]:fallbackName;
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob); a.download=filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
 }
 
 // ── Utils ─────────────────────────────────────────────────────────────────

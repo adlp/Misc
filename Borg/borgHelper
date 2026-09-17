@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.90"
+Version="1.0.91"
 DIFF_DB_SCHEMA_VERSION  = 2
 CACHE_DB_SCHEMA_VERSION = 1
 # Historique diff.db — chaque palier correspond à une migration idempotente et auto-détectée
@@ -361,7 +361,7 @@ def usage(doc=None,debug=0):
         printer("       -b : depuis archive X  |  -B : jusqu'à archive Y  |  -b ALL : tout l'index")
         printer("   -c FileHist -f <chemin> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive]")
         printer("       Historique des changements d'un chemin exact")
-        printer("   -c TreeHist [-f <préfixe>] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive]")
+        printer("   -c TreeHist [-f <préfixe>] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-j]")
         printer("       Un seul tableau : contenu DIRECT de <préfixe> (racine si omis, lui-même en '.'),")
         printer("       toujours en entier — pas de descente dans les sous-répertoires. Colonne genre")
         printer("       (répertoire/fichier/lien symbolique/…) + événements de chaque entrée dans la plage")
@@ -370,6 +370,7 @@ def usage(doc=None,debug=0):
         printer("       OÙ dans sa sous-arborescence (sans en lister le détail) ; un fichier, seulement le sien")
         printer("       added/removed ne concernent QUE l'entrée elle-même — un mouvement interne, quel")
         printer("       qu'il soit, remonte en 'modified' générique (jamais un added/removed emprunté)")
+        printer("       -j : sortie JSON {path,archive,entries:[{name,full_path,genre,is_dir,events}]}")
         printer("   -c DuIdx [-f pattern] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-s col[:asc|desc]] [-j]")
         printer("       Résumé du-like : taille/nb par type depuis le SQLite")
         printer("       Sans -f : résumé global  |  -f '*' : par répertoire  |  -j : JSON")
@@ -450,7 +451,7 @@ def usage(doc=None,debug=0):
         printer("   -c FileHist -f <chemin> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive]")
         printer("       Historique complet des changements d'un chemin exact")
     elif doc=='treehist':
-        printer("   -c TreeHist [-f <préfixe>] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive]")
+        printer("   -c TreeHist [-f <préfixe>] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-j]")
         printer("       Un seul tableau : contenu DIRECT de <préfixe> (racine entière si omis) uniquement —")
         printer("       jamais le contenu d'un sous-répertoire (relancer avec -f pointant dessus pour y")
         printer("       descendre). Le répertoire courant apparaît lui-même en '.'. Toujours l'intégralité")
@@ -465,6 +466,7 @@ def usage(doc=None,debug=0):
         printer("       uniquement) — un fichier n'affiche que ses propres événements")
         printer("       added/removed sur un répertoire ne concernent QUE son entrée à lui (ex. 'added")
         printer("       directory') — un mouvement interne quelconque remonte en 'modified' générique")
+        printer("       -j : sortie JSON {nick:{path,archive,entries:[{name,full_path,genre,is_dir,events}]}}")
     elif doc=='duidx':
         printer("   -c DuIdx [-f pattern] [-n nick/ALL] [-b archive|ALL] [-B archive] [-s col[:asc|desc]] [-j]")
         printer("       Résumé du-like depuis le SQLite : taille et nb de fichiers par type")
@@ -2253,14 +2255,18 @@ class BorgHelper:
             t.add_row([nick_r,(date_r or '')[:19],a_old,a_new,type_r,convert_octets_readable(sb) if sb else '',convert_octets_readable(sa) if sa else ''])
         print(t)
 
-    def _treehist_listing(self,n,prefix,conn,archive_from=None,archive_to=None,debug=0):
+    def _treehist_listing(self,n,prefix,conn,archive_from=None,archive_to=None,debug=0,as_json=False):
         """Liste le contenu DIRECT du répertoire courant (dernière archive snapshotée) en un seul
         tableau : le répertoire courant lui-même en '.', puis ses enfants immédiats — même sans
         événement dans la plage demandée. Colonne 'genre' (répertoire/fichier/lien symbolique/…) tirée
-        du type réel stocké par borg ; 'aucun événement dans la plage' si l'entrée n'a pas bougé."""
+        du type réel stocké par borg ; 'aucun événement dans la plage' si l'entrée n'a pas bougé.
+        as_json=True : ne print rien, retourne un dict {path,archive,entries:[...]} ou {'error':msg}
+        (utilisé par borgHelperWWW pour l'explorateur d'arborescence)."""
         row=conn.execute("SELECT archive FROM archive_snapshot_v WHERE nick=? ORDER BY archive_date DESC LIMIT 1",(n,)).fetchone()
         if row is None:
-            print(f"{n}: aucun snapshot indexé sous {prefix or '/'} — lancez : borgHelper -c Index -n {n}"); return
+            msg=f"aucun snapshot indexé sous {prefix or '/'} — lancez : borgHelper -c Index -n {n}"
+            if as_json: return {'error':msg}
+            print(f"{n}: {msg}"); return None
         latest=row[0]
         sql_pat=(prefix+'/%') if prefix else '%'
         if prefix:
@@ -2282,7 +2288,9 @@ class BorgHelper:
             children[name]=children.get(name,False) or is_dir
             if not is_dir: type_by_name[name]=ftype
         if not children and (not prefix or own_type is None):
-            print(f"{n}: {prefix or '/'} vide ou introuvable dans le snapshot ({latest})"); return
+            msg=f"{prefix or '/'} vide ou introuvable dans le snapshot ({latest})"
+            if as_json: return {'error':msg}
+            print(f"{n}: {msg}"); return None
         af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
         def _events_for(full_path,recursive=False):
             # recursive=True (répertoires) : un événement n'importe où dans la sous-arborescence
@@ -2300,40 +2308,57 @@ class BorgHelper:
         def _genre(is_dir,known_type):
             if known_type: return _TREEHIST_GENRES.get(known_type,f"type '{known_type}'")
             return 'répertoire' if is_dir else 'inconnu (réindexer)'
-        from prettytable import PrettyTable
-        t=PrettyTable(['nom','genre','type','archive','date'])
-        t.align['nom']='l'; t.align['archive']='l'
-        def _add_rows(name,genre,full_path,recursive=False):
+        entries=[] if as_json else None
+        if not as_json:
+            from prettytable import PrettyTable
+            t=PrettyTable(['nom','genre','type','archive','date'])
+            t.align['nom']='l'; t.align['archive']='l'
+        def _add_rows(name,genre,full_path,is_dir,recursive=False):
             events=_events_for(full_path,recursive=recursive)
+            if as_json:
+                entries.append({'name':name,'full_path':full_path,'genre':genre,'is_dir':is_dir,
+                    'events':[{'type':ct,'archive':arch,'date':(date or '')[:19]} for ct,arch,date in events]})
+                return
             if not events:
                 t.add_row([name,genre,'—','—','aucun événement dans la plage'])
             else:
                 for ct,arch,date in events:
                     t.add_row([name,genre,ct,arch,(date or '')[:19]])
-        _add_rows('.',_TREEHIST_GENRES.get(own_type,'répertoire'),prefix,recursive=True)
+        _add_rows('.',_TREEHIST_GENRES.get(own_type,'répertoire'),prefix,True,recursive=True)
         for name in sorted(children):
             full=f"{prefix}/{name}" if prefix else name
             is_dir=children[name]
-            _add_rows(name,_genre(is_dir,type_by_name.get(name)),full,recursive=is_dir)
+            _add_rows(name,_genre(is_dir,type_by_name.get(name)),full,is_dir,recursive=is_dir)
+        if as_json:
+            return {'path':prefix,'archive':latest,'entries':entries}
         print(f"{n}: {prefix or '/'} (snapshot {latest})")
         print(t)
+        return None
 
-    def treehist(self,nick,prefix=None,archive_from=None,archive_to=None,debug=0):
+    def treehist(self,nick,prefix=None,archive_from=None,archive_to=None,debug=0,as_json=False):
         # Contenu DIRECT de <prefix> (racine si omis) uniquement — jamais le contenu d'un
         # sous-répertoire. Liste toujours tout le répertoire courant (fichiers/sous-répertoires
         # présents, même sans événement dans la plage demandée), pas seulement ce qui a changé.
         prefix=(prefix or '').strip().lstrip('/').rstrip('/')
+        results={}
         for n in nick.split(','):
             db_path=self.db.get_diff_db(n)
             self.db.ensure_diff_db(db_path)
             if self.db._is_index_empty(n,db_path):
-                printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
+                msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
+                if as_json: results[n]={'error':msg}
+                else: printer(f"[ERREUR] {msg}")
+                continue
             try:
                 conn=sqlite3.connect(db_path)
-                self._treehist_listing(n,prefix,conn,archive_from=archive_from,archive_to=archive_to,debug=debug)
+                result=self._treehist_listing(n,prefix,conn,archive_from=archive_from,archive_to=archive_to,debug=debug,as_json=as_json)
+                if as_json: results[n]=result
                 conn.close()
             except sqlite3.Error as e:
-                printer(f"SQLite error ({db_path}): {e}")
+                if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
+                else: printer(f"SQLite error ({db_path}): {e}")
+        if as_json:
+            print(json.dumps(results,ensure_ascii=False,indent=2))
 
     def duidx(self,nick,pattern=None,sort_by='chemin',reverse=False,as_json=False,archive_from=None,archive_to=None,debug=0):
         if pattern is None:
@@ -2983,7 +3008,7 @@ def _cli_main():
            'delbkp':'Ccdnb','bkp':'CcdnI','prune':'Ccdn','report':'CcdnlNjo',
            'init':'Ccdn','key':'Ccdn','index':'CcdnFSA','search':'CcdnfbB',
            'filehist':'CcdnfbB','cacheinfo':'Ccdn','cacheclean':'Ccdn','duidx':'CcdnfbBsj',
-           'idxtop':'CcdnNp','difftop':'CcdnNpb','idxpurge':'CcdnxD','treehist':'CcdnfbB'}
+           'idxtop':'CcdnNp','difftop':'CcdnNpb','idxpurge':'CcdnxD','treehist':'CcdnfbBj'}
     optab={k:v+'P' for k,v in optab.items()}
 
     if cmd is None or cmd not in optab.keys():
@@ -3090,7 +3115,7 @@ def _cli_main():
         if '-f' not in options: usage(cmd)
         bh.filehist(nick,options['-f'],archive_from=options.get('-b',None),archive_to=options.get('-B',None),debug=debug)
     elif cmd=='treehist':
-        bh.treehist(nick,options.get('-f',None),archive_from=options.get('-b',None),archive_to=options.get('-B',None),debug=debug)
+        bh.treehist(nick,options.get('-f',None),archive_from=options.get('-b',None),archive_to=options.get('-B',None),debug=debug,as_json=('-j' in options))
     elif cmd=='duidx':
         _du_sort=options.get('-s','chemin')
         _du_rev=_du_sort.endswith(':desc')

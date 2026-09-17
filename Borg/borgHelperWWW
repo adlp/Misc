@@ -6,16 +6,16 @@
 #* See <http://www.gnu.org/licenses/>
 #*/
 
-import os,sys,secrets,subprocess
+import os,re,sys,secrets,subprocess
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
-from borgHelper import Version as BORGHELPER_VERSION
+from borgHelper import Version as BORGHELPER_VERSION, BorgRunner
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -96,6 +96,85 @@ def run_borghelper(cmd: str, nick: Optional[str]=None, extra_args=(), passphrase
         raise HTTPException(504,detail=f"Commande {cmd} : timeout après {TIMEOUT}s")
     result=CommandResult(exitcode=proc.returncode,stdout=proc.stdout,stderr=proc.stderr)
     return JSONResponse(status_code=200 if proc.returncode==0 else 400,content=result.dict())
+
+# ── Téléchargements (accès borg direct, streaming binaire) ─────────────────────
+# Seule exception au principe "tout passe par borgHelper en sous-processus" : un téléchargement
+# doit streamer des octets bruts vers le navigateur, incompatible avec le pipe texte/JSON de
+# run_borghelper(). Lit la conf via BorgRunner (mode librairie, cfgfile+passphrase), exécute borg
+# directement (extract --stdout / export-tar) et streame son stdout comme réponse HTTP.
+
+_BORG_ENV_KEYS=('BORG_REPO','BORG_PASSPHRASE','BORG_REMOTE_PATH','BORG_RSH','BORG_SHOW_SYSINFO',
+                 'BORG_RELOCATED_REPO_ACCESS_IS_OK','BORG_KEY_FILE')
+_FILENAME_UNSAFE=re.compile(r'[^A-Za-z0-9_.\-]+')
+
+def _borg_cfg(nick: str, passphrase: Optional[str]):
+    cfg=BorgRunner(cfgfile=CFGFILE,passphrase=passphrase).cfgread(nick)
+    if cfg is None:
+        raise HTTPException(404,detail=f"Nick inconnu : {nick}")
+    return cfg
+
+def _borg_env(cfg):
+    env=os.environ.copy()
+    for k in _BORG_ENV_KEYS:
+        if k in cfg.keys(): env[k]=cfg[k]
+    return env
+
+def _latest_archive(cfg,env):
+    borg_exe=cfg.get('BORG_EXE','borg')
+    try:
+        proc=subprocess.run([borg_exe,'list','--short','--glob-archives',cfg['GLOB_ARCH'],cfg['BORG_REPO']],
+                             capture_output=True,text=True,env=env,timeout=60)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504,detail="borg list : timeout")
+    if proc.returncode!=0:
+        raise HTTPException(502,detail=f"borg list a échoué : {proc.stderr[:300]}")
+    lines=[l for l in proc.stdout.splitlines() if l.strip()]
+    if not lines:
+        raise HTTPException(404,detail="Aucune archive dans ce dépôt")
+    return lines[-1]
+
+def _safe_filename(name: str) -> str:
+    name=(name or '').strip('/').split('/')[-1] or 'download'
+    return _FILENAME_UNSAFE.sub('_',name) or 'download'
+
+def _stream_proc(proc):
+    try:
+        while True:
+            chunk=proc.stdout.read(65536)
+            if not chunk: break
+            yield chunk
+    finally:
+        try: proc.stdout.close()
+        except Exception: pass
+        proc.wait()
+
+@app.get("/download/file",tags=["téléchargement"],summary="Télécharge un fichier depuis une archive (borg extract --stdout)")
+def download_file(nick: str, path: str, bid: Optional[str]=None,
+                   x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    cfg=_borg_cfg(nick,x_borg_passphrase)
+    env=_borg_env(cfg)
+    archive=bid or _latest_archive(cfg,env)
+    borg_exe=cfg.get('BORG_EXE','borg')
+    proc=subprocess.Popen([borg_exe,'extract','--stdout',f"{cfg['BORG_REPO']}::{archive}",path],
+                          stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env)
+    return StreamingResponse(_stream_proc(proc),media_type='application/octet-stream',
+        headers={'Content-Disposition':f'attachment; filename="{_safe_filename(path)}"'})
+
+@app.get("/download/tar",tags=["téléchargement"],summary="Télécharge un .tar d'une arborescence depuis une archive (borg export-tar)")
+def download_tar(nick: str, prefix: Optional[str]=None, bid: Optional[str]=None,
+                  x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    cfg=_borg_cfg(nick,x_borg_passphrase)
+    env=_borg_env(cfg)
+    archive=bid or _latest_archive(cfg,env)
+    borg_exe=cfg.get('BORG_EXE','borg')
+    cmd=[borg_exe,'export-tar',f"{cfg['BORG_REPO']}::{archive}",'-']
+    if prefix: cmd.append(prefix)
+    proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env)
+    filename=(_safe_filename(prefix) if prefix else nick)+'.tar'
+    return StreamingResponse(_stream_proc(proc),media_type='application/x-tar',
+        headers={'Content-Disposition':f'attachment; filename="{filename}"'})
 
 # ── Interface web ────────────────────────────────────────────────────────────
 # Page unique (SPA) : saisie de la clé API, liste des serveurs (rapport hors-ligne),
@@ -237,12 +316,13 @@ def filehist(nick: str, path: str, archive_from: Optional[str]=None, archive_to:
 
 @app.get("/treehist",response_model=CommandResult,tags=["lecture"],summary="Pour chaque objet sous un préfixe : archives où il a changé")
 def treehist(nick: str, prefix: Optional[str]=None, archive_from: Optional[str]=None, archive_to: Optional[str]=None,
-             x_api_key: Optional[str]=Header(default=None)):
+             json_output: bool=Query(default=False,alias="json"), x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     extra=[]
     if prefix: extra+=['-f',prefix]
     if archive_from: extra+=['-b',archive_from]
     if archive_to: extra+=['-B',archive_to]
+    if json_output: extra.append('-j')
     return run_borghelper('treehist',nick=nick,extra_args=extra)
 
 @app.get("/duidx",response_model=CommandResult,tags=["lecture"])

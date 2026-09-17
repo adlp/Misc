@@ -1,5 +1,32 @@
 # Changelog — borgHelper
 
+## 1.0.91 + borgHelperWWW — Explorateur d'arborescence — 2026-09-17
+
+### `borgHelper` : `TreeHist -j`
+
+Nouveau flag `-j` sur `TreeHist` : sortie JSON `{nick:{path,archive,entries:[{name,full_path,genre,
+is_dir,events}]}}` au lieu du tableau texte — même contenu, structuré pour une consommation
+programmatique (utilisé par le nouvel explorateur web).
+
+### `borgHelperWWW` : endpoints `/download/file` et `/download/tar`
+
+Nouveaux endpoints streamant des octets bruts (`borg extract --stdout` / `borg export-tar`) directement
+vers l'appelant — seule exception au principe « tout passe par le binaire borgHelper en sous-processus »,
+binaire streaming incompatible avec la réponse JSON texte des autres endpoints. Conf lue via `BorgRunner`
+en mode librairie, `borg` appelé directement.
+
+### Interface web : explorateur d'arborescence
+
+Bouton **🗂 Explorer l'arborescence** dans le bandeau du serveur. Navigation façon gestionnaire de
+fichiers sur `TreeHist -j` : clic sur un dossier = l'ouvrir, clic droit sur un dossier = télécharger un
+`.tar` de son contenu (à une archive choisissable), clic sur un fichier = le télécharger (à une archive
+choisissable) — téléchargement direct dans le navigateur (fetch + blob + `<a download>`), jamais écrit
+sur le disque du serveur borgHelperWWW.
+
+Vérifié par test réel : navigation JSON via `/treehist`, téléchargement d'un fichier régulier
+(comparaison octet-à-octet avec l'original — identique) et d'un `.tar` de ~140 Mo (contenu vérifié via
+`tar tf`) — le tout via curl et via la page servie par `borgHelperWWW`.
+
 ## borgHelperWWW UI — 2026-09-17
 
 Retiré la saisie de passphrase de la page « Serveurs » (liste) — champ input + bouton Enregistrer par
