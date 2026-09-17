@@ -223,7 +223,7 @@
 </div>
 <div id="downloadOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,.3);z-index:40" hidden onclick="closeDownloadModal()"></div>
 
-<footer>borgHelperWWW — interface web — <a href="/docs" target="_blank" rel="noopener">Swagger / API</a></footer>
+<footer>borgHelperWWW<span id="footerVersions"></span> — interface web — <a href="/docs" target="_blank" rel="noopener">Swagger / API</a></footer>
 
 <script>
 'use strict';
@@ -234,6 +234,18 @@ const SS_KEY='bhww_apikey';
 const SS_PASS='bhww_passphrases';
 let currentNick=null;
 let currentActionId=null;
+
+// Versions chargées au démarrage de borgHelperWWW (endpoint public, non protégé par X-API-Key,
+// comme la page elle-même) — affichées dans le pied de page, visible avant même la connexion.
+(async function loadFooterVersions(){
+  try{
+    const r=await fetch('/version');
+    if(!r.ok) return;
+    const v=await r.json();
+    document.getElementById('footerVersions').textContent=
+      ` v${v.borghelperwww_version} (borgHelper v${v.borghelper_version})`;
+  }catch(e){ /* info non critique, silencieux */ }
+})();
 
 function getApiKey(){ return sessionStorage.getItem(SS_KEY)||''; }
 function setApiKey(k){ sessionStorage.setItem(SS_KEY,k); }

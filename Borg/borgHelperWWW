@@ -17,6 +17,11 @@ from pydantic import BaseModel
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from borgHelper import Version as BORGHELPER_VERSION, BorgRunner
 
+# Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
+# sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
+# pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
+WWW_VERSION="1.0.0"
+
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
 # sys.argv, donc seules les variables d'environnement BORGHELPERWWW_* sont lues.
@@ -189,6 +194,10 @@ _UI_HTML=_UI_FILE.read_text(encoding='utf-8')
 @app.get("/",response_class=HTMLResponse,include_in_schema=False)
 def ui_index():
     return _UI_HTML
+
+@app.get("/version",tags=["lecture"],summary="Versions chargées au démarrage de borgHelperWWW (lui-même + borgHelper) — non protégé, aucune donnée sensible")
+def version():
+    return {'borghelperwww_version':WWW_VERSION,'borghelper_version':BORGHELPER_VERSION}
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 # Un endpoint par commande CLI de borgHelper (voir README.md), sauf Mount/UMount.

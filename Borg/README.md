@@ -752,10 +752,15 @@ clair sur le réseau sinon.
 ### Endpoints
 
 Un endpoint par commande CLI (voir [Commandes](#commandes) ci-dessus pour le détail de chaque
-comportement) — `GET` pour les commandes en lecture, `POST`/`DELETE` pour celles qui modifient un état :
+comportement) — `GET` pour les commandes en lecture, `POST`/`DELETE` pour celles qui modifient un état.
+Exception : `GET /version` n'exécute aucune commande — il renvoie les versions de `borgHelperWWW`
+(`WWW_VERSION`, constante interne) et de `borgHelper` (`Version`, importée), toutes deux **chargées une
+fois au démarrage du processus**. Comme `/`, volontairement **non protégé** par `X-API-Key` (aucune
+donnée sensible) — affiché dans le pied de page de l'interface web, visible même avant connexion.
 
 | Méthode | Route | Commande CLI |
 |---------|-------|--------------|
+| GET | `/version` | *(aucune — spécifique à borgHelperWWW)* |
 | GET | `/stats` | Stats |
 | POST | `/login` | Login |
 | GET | `/lstbkp` | LstBkp |

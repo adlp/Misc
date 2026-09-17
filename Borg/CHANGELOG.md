@@ -1,5 +1,16 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.0.0 — versionnage propre + affichage dans le pied de page — 2026-09-17
+
+`borgHelperWWW` reçoit son propre numéro de version (`WWW_VERSION`, jusqu'ici il réutilisait par erreur
+`Version` de `borgHelper` pour le champ `version` de l'app FastAPI) — à incrémenter uniquement quand le
+source de `borgHelperWWW` change (même règle que `borgHelper` pour son propre `Version`).
+
+Nouvel endpoint `GET /version` (non protégé, comme `/`) renvoyant `borghelperwww_version` et
+`borghelper_version`, toutes deux résolues une fois au démarrage du processus (import de `borgHelper`
+pour la seconde). Pied de page de l'interface web : affiche désormais les deux versions, récupérées via
+`/version` au chargement de la page (avant même la connexion).
+
 ## Interface web — navigation rapide + alerte visuelle sur la liste des serveurs — 2026-09-17
 
 Ligne de liens rapides au-dessus de la liste des serveurs : clic sur un nom → défilement direct
