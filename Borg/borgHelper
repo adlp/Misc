@@ -9,8 +9,8 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.91"
-DIFF_DB_SCHEMA_VERSION  = 2
+Version="1.0.92"
+DIFF_DB_SCHEMA_VERSION  = 3
 CACHE_DB_SCHEMA_VERSION = 1
 # Historique diff.db — chaque palier correspond à une migration idempotente et auto-détectée
 # (par introspection PRAGMA table_info, pas seulement par comparaison de schema_version — donc
@@ -19,6 +19,8 @@ CACHE_DB_SCHEMA_VERSION = 1
 #   2 : archive_snapshot déduplication (BorgHelperDB._migrate_archive_snapshot, depuis colonne
 #       `path` directe vers `file_id` → snapshot_file) + snapshot_file.type (genre TreeHist —
 #       ALTER TABLE ADD COLUMN, auto-réparé au besoin par indexsnap(), voir CHANGELOG 1.0.86/1.0.89)
+#   3 : snapshot_file.mode (droits unix ls-style du dernier état connu, colonne TreeHist —
+#       ALTER TABLE ADD COLUMN, même auto-réparation qu'au palier 2)
 # Ne concerne QUE diff.db, appelé par ensure_diff_db() — désormais garanti avant tout accès
 # depuis Bkp, Index, Prune (voir prune()) et tous les autres consommateurs de diff.db/cache.db.
 
@@ -363,14 +365,15 @@ def usage(doc=None,debug=0):
         printer("       Historique des changements d'un chemin exact")
         printer("   -c TreeHist [-f <préfixe>] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-j]")
         printer("       Un seul tableau : contenu DIRECT de <préfixe> (racine si omis, lui-même en '.'),")
-        printer("       toujours en entier — pas de descente dans les sous-répertoires. Colonne genre")
-        printer("       (répertoire/fichier/lien symbolique/…) + événements de chaque entrée dans la plage")
+        printer("       toujours en entier — pas de descente dans les sous-répertoires. Colonnes genre")
+        printer("       (répertoire/fichier/lien symbolique/…) + droits unix (dernier état connu) +")
+        printer("       événements de chaque entrée dans la plage")
         printer("       (apparu/modifié/disparu…)  |  -b ALL : tout l'historique, sinon dernière archive indexée")
         printer("       Un sous-répertoire montre un événement dès qu'un changement a eu lieu N'IMPORTE")
         printer("       OÙ dans sa sous-arborescence (sans en lister le détail) ; un fichier, seulement le sien")
         printer("       added/removed ne concernent QUE l'entrée elle-même — un mouvement interne, quel")
         printer("       qu'il soit, remonte en 'modified' générique (jamais un added/removed emprunté)")
-        printer("       -j : sortie JSON {path,archive,entries:[{name,full_path,genre,is_dir,events}]}")
+        printer("       -j : sortie JSON {path,archive,entries:[{name,full_path,genre,mode,is_dir,events}]}")
         printer("   -c DuIdx [-f pattern] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-s col[:asc|desc]] [-j]")
         printer("       Résumé du-like : taille/nb par type depuis le SQLite")
         printer("       Sans -f : résumé global  |  -f '*' : par répertoire  |  -j : JSON")
@@ -457,16 +460,17 @@ def usage(doc=None,debug=0):
         printer("       descendre). Le répertoire courant apparaît lui-même en '.'. Toujours l'intégralité")
         printer("       du contenu (snapshot), y compris les entrées sans événement dans la plage demandée.")
         printer("       Colonnes : nom, genre (répertoire/fichier/lien symbolique/fifo/socket/périph.),")
-        printer("       type d'événement (added/modified/removed/…), archive, date")
+        printer("       droits unix ls-style (dernier état connu, ex. 'drwxr-xr-x'), type d'événement")
+        printer("       (added/modified/removed/…), archive, date")
         printer("       -b : depuis archive X  |  -B : jusqu'à archive Y  |  -b ALL : tout l'index")
         printer("       Sans -b/-B : dernière archive indexée seulement (comme Search)")
-        printer("       Genre 'inconnu (réindexer)' : entrée snapshotée avant l'ajout de cette colonne")
+        printer("       Genre/droits 'inconnu (réindexer)'/'—' : entrée snapshotée avant l'ajout de ces colonnes")
         printer("       Un sous-répertoire affiche un événement dès qu'un changement a eu lieu N'IMPORTE")
         printer("       OÙ dans sa sous-arborescence, sans en lister le détail (type/archive/date distincts")
         printer("       uniquement) — un fichier n'affiche que ses propres événements")
         printer("       added/removed sur un répertoire ne concernent QUE son entrée à lui (ex. 'added")
         printer("       directory') — un mouvement interne quelconque remonte en 'modified' générique")
-        printer("       -j : sortie JSON {nick:{path,archive,entries:[{name,full_path,genre,is_dir,events}]}}")
+        printer("       -j : sortie JSON {nick:{path,archive,entries:[{name,full_path,genre,mode,is_dir,events}]}}")
     elif doc=='duidx':
         printer("   -c DuIdx [-f pattern] [-n nick/ALL] [-b archive|ALL] [-B archive] [-s col[:asc|desc]] [-j]")
         printer("       Résumé du-like depuis le SQLite : taille et nb de fichiers par type")
@@ -712,6 +716,7 @@ class BorgHelperDB:
                     size  INTEGER,
                     mtime TEXT,
                     type  TEXT,
+                    mode  TEXT,
                     UNIQUE(nick, path)
                 );
                 CREATE INDEX IF NOT EXISTS idx_snapfile_nick_path ON snapshot_file(nick, path);
@@ -762,6 +767,8 @@ class BorgHelperDB:
             sf_cols=[r[1] for r in conn.execute("PRAGMA table_info(snapshot_file)").fetchall()]
             if 'type' not in sf_cols:
                 conn.execute("ALTER TABLE snapshot_file ADD COLUMN type TEXT")
+            if 'mode' not in sf_cols:
+                conn.execute("ALTER TABLE snapshot_file ADD COLUMN mode TEXT")
             cols=[r[1] for r in conn.execute("PRAGMA table_info(archive_snapshot)").fetchall()]
             if 'path' in cols:
                 self._migrate_archive_snapshot(conn)
@@ -779,7 +786,7 @@ class BorgHelperDB:
             conn.executescript("""
                 DROP VIEW IF EXISTS archive_snapshot_v;
                 CREATE VIEW archive_snapshot_v AS
-                    SELECT s.nick, s.archive, s.archive_date, sf.path, sf.size, sf.mtime, sf.type
+                    SELECT s.nick, s.archive, s.archive_date, sf.path, sf.size, sf.mtime, sf.type, sf.mode
                     FROM archive_snapshot s
                     JOIN snapshot_file sf ON sf.id=s.file_id;
             """)
@@ -906,8 +913,8 @@ class BorgHelperDB:
             conn=sqlite3.connect(db_path)
             try:
                 if files:
-                    conn.executemany("INSERT OR REPLACE INTO snapshot_file (nick,path,size,mtime,type) VALUES (?,?,?,?,?)",
-                                     [(nick,f['path'],f.get('size'),f.get('mtime'),f.get('type')) for f in files])
+                    conn.executemany("INSERT OR REPLACE INTO snapshot_file (nick,path,size,mtime,type,mode) VALUES (?,?,?,?,?,?)",
+                                     [(nick,f['path'],f.get('size'),f.get('mtime'),f.get('type'),f.get('mode')) for f in files])
                     conn.executemany("INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,file_id) SELECT ?,?,?,id FROM snapshot_file WHERE nick=? AND path=?",
                                      [(nick,archive,archive_date,nick,f['path']) for f in files])
                 conn.execute("INSERT OR IGNORE INTO archive_snapshot_indexed (nick,archive,entry_count) VALUES (?,?,?)",(nick,archive,len(files)))
@@ -1882,10 +1889,10 @@ class BorgHelper:
                 if sz is not None:
                     conn.execute("UPDATE snapshot_file SET size=? WHERE nick=? AND path=?",(sz,nick,path))
             conn.commit()
-            # Fetch added via targeted borg list (avec mtime et type)
+            # Fetch added via targeted borg list (avec mtime, type et mode)
             if added:
                 rb=self.borg.boex(nick,
-                    ['list','--format','{type} {size} {isomtime} {path}{NL}',f'::{archive_name}']+added,
+                    ['list','--format','{mode} {type} {size} {isomtime} {path}{NL}',f'::{archive_name}']+added,
                     debug=debug,retjson=False)
                 if rb['exitcode']!=0:
                     conn.execute("DELETE FROM archive_snapshot WHERE nick=? AND archive=?",(nick,archive_name))
@@ -1895,13 +1902,14 @@ class BorgHelper:
                 for line in rb['stdout']:
                     line=line.strip()
                     if not line: continue
-                    parts=line.split(' ',3)
-                    if len(parts)==4:
-                        try: sz2=int(parts[1])
+                    parts=line.split(' ',4)
+                    if len(parts)==5:
+                        try: sz2=int(parts[2])
                         except ValueError: sz2=None
-                        add_rows.append((nick,parts[3],sz2,parts[2],parts[0]))
+                        # (nick,path,size,mtime,type,mode) — ordre exact des colonnes de l'INSERT ci-dessous
+                        add_rows.append((nick,parts[4],sz2,parts[3],parts[1],parts[0]))
                 if add_rows:
-                    conn.executemany("INSERT OR REPLACE INTO snapshot_file (nick,path,size,mtime,type) VALUES (?,?,?,?,?)",add_rows)
+                    conn.executemany("INSERT OR REPLACE INTO snapshot_file (nick,path,size,mtime,type,mode) VALUES (?,?,?,?,?,?)",add_rows)
                     conn.executemany(
                         "INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,file_id) "
                         "SELECT ?,?,?,id FROM snapshot_file WHERE nick=? AND path=?",
@@ -1948,18 +1956,19 @@ class BorgHelper:
                 printer(f"SQLite error ({db_path}): {e}")
         print(f"  {nick}: snapshot {archive_name}...",flush=True)
         # Auto-réparation : le clonage incrémental réutilise le file_id (donc le type) des fichiers
-        # inchangés — un type manquant (migration snapshot_file.type, ou ancien snapshot pré-1.0.86)
-        # ne se répare jamais tout seul via l'incrémental. S'il en reste, un resnapshot complet est
-        # forcé une fois pour tout repeupler ; les backups suivants repassent en incrémental normal.
+        # inchangés — un type/mode manquant (migration snapshot_file.type/.mode, ou ancien snapshot
+        # pré-1.0.86/pré-1.0.92) ne se répare jamais tout seul via l'incrémental. S'il en reste, un
+        # resnapshot complet est forcé une fois pour tout repeupler ; les backups suivants repassent
+        # en incrémental normal.
         auto_repair=False
         if not force:
             try:
                 rconn=sqlite3.connect(db_path)
-                has_null=rconn.execute("SELECT 1 FROM snapshot_file WHERE nick=? AND type IS NULL LIMIT 1",(nick,)).fetchone()
+                has_null=rconn.execute("SELECT 1 FROM snapshot_file WHERE nick=? AND (type IS NULL OR mode IS NULL) LIMIT 1",(nick,)).fetchone()
                 rconn.close()
                 if has_null:
                     auto_repair=True
-                    print(f"  {nick}: type manquant pour certaines entrées — resnapshot complet (auto-réparation)")
+                    print(f"  {nick}: type/mode manquant pour certaines entrées — resnapshot complet (auto-réparation)")
             except sqlite3.Error: pass
         # Tentative incrémentale (pas en mode force, pas en auto-réparation)
         inc=None
@@ -1974,7 +1983,7 @@ class BorgHelper:
                 print(f"{nick}: {nfiles} fichiers dans le snapshot {archive_name}{suffix}")
         else:
             # Fallback : borg list complet
-            rb2=self.borg.boex(nick,['list','--format','{type} {size} {isomtime} {path}{NL}',f"::{archive_name}"],debug=debug,retjson=False)
+            rb2=self.borg.boex(nick,['list','--format','{mode} {type} {size} {isomtime} {path}{NL}',f"::{archive_name}"],debug=debug,retjson=False)
             if rb2['exitcode']!=0:
                 printer(f"borg list a échoué (code {rb2['exitcode']})")
                 for i in rb2['stderr']:
@@ -1985,14 +1994,14 @@ class BorgHelper:
             for line in rb2['stdout']:
                 line=line.strip()
                 if not line: continue
-                parts=line.split(' ',3)
-                if len(parts)==4:
-                    ftype=parts[0]
-                    try: size=int(parts[1])
+                parts=line.split(' ',4)
+                if len(parts)==5:
+                    mode,ftype=parts[0],parts[1]
+                    try: size=int(parts[2])
                     except ValueError: size=None
-                    path=parts[3]
+                    path=parts[4]
                     if self._idx_path_ok(path,cfg):
-                        files.append({'path':path,'size':size,'mtime':parts[2],'type':ftype})
+                        files.append({'path':path,'size':size,'mtime':parts[3],'type':ftype,'mode':mode})
                     else:
                         exclu_count+=1; exclu_size+=(size or 0)
             self.db.store_archive_snapshot(nick,archive_name,archive_date,files,db_path)
@@ -2273,20 +2282,21 @@ class BorgHelper:
             where='(path=? OR path LIKE ?)'; params=[prefix,sql_pat]
         else:
             where='path LIKE ?'; params=[sql_pat]
-        snap_rows=conn.execute(f"SELECT path,type FROM archive_snapshot_v WHERE nick=? AND archive=? AND {where}",[n,latest]+params).fetchall()
+        snap_rows=conn.execute(f"SELECT path,type,mode FROM archive_snapshot_v WHERE nick=? AND archive=? AND {where}",[n,latest]+params).fetchall()
         plen=len(prefix)+1 if prefix else 0
         children={}       # name -> is_dir (heuristique de secours si le type est inconnu)
         type_by_name={}   # name -> type réel de SA PROPRE entrée (pas celui d'un enfant plus profond)
-        own_type=None
-        for path,ftype in snap_rows:
+        mode_by_name={}   # name -> droits unix (dernier état connu) de SA PROPRE entrée
+        own_type=None; own_mode=None
+        for path,ftype,fmode in snap_rows:
             if prefix and path==prefix:
-                own_type=ftype; continue
+                own_type=ftype; own_mode=fmode; continue
             rel=path[plen:] if prefix else path
             if not rel: continue
             seg=rel.split('/',1)
             name=seg[0]; is_dir=len(seg)>1
             children[name]=children.get(name,False) or is_dir
-            if not is_dir: type_by_name[name]=ftype
+            if not is_dir: type_by_name[name]=ftype; mode_by_name[name]=fmode
         if not children and (not prefix or own_type is None):
             msg=f"{prefix or '/'} vide ou introuvable dans le snapshot ({latest})"
             if as_json: return {'error':msg}
@@ -2311,24 +2321,25 @@ class BorgHelper:
         entries=[] if as_json else None
         if not as_json:
             from prettytable import PrettyTable
-            t=PrettyTable(['nom','genre','type','archive','date'])
+            t=PrettyTable(['nom','genre','droits','type','archive','date'])
             t.align['nom']='l'; t.align['archive']='l'
-        def _add_rows(name,genre,full_path,is_dir,recursive=False):
+        def _add_rows(name,genre,droits,full_path,is_dir,recursive=False):
             events=_events_for(full_path,recursive=recursive)
+            droits_disp=droits or '—'
             if as_json:
-                entries.append({'name':name,'full_path':full_path,'genre':genre,'is_dir':is_dir,
+                entries.append({'name':name,'full_path':full_path,'genre':genre,'mode':droits,'is_dir':is_dir,
                     'events':[{'type':ct,'archive':arch,'date':(date or '')[:19]} for ct,arch,date in events]})
                 return
             if not events:
-                t.add_row([name,genre,'—','—','aucun événement dans la plage'])
+                t.add_row([name,genre,droits_disp,'—','—','aucun événement dans la plage'])
             else:
                 for ct,arch,date in events:
-                    t.add_row([name,genre,ct,arch,(date or '')[:19]])
-        _add_rows('.',_TREEHIST_GENRES.get(own_type,'répertoire'),prefix,True,recursive=True)
+                    t.add_row([name,genre,droits_disp,ct,arch,(date or '')[:19]])
+        _add_rows('.',_TREEHIST_GENRES.get(own_type,'répertoire'),own_mode,prefix,True,recursive=True)
         for name in sorted(children):
             full=f"{prefix}/{name}" if prefix else name
             is_dir=children[name]
-            _add_rows(name,_genre(is_dir,type_by_name.get(name)),full,is_dir,recursive=is_dir)
+            _add_rows(name,_genre(is_dir,type_by_name.get(name)),mode_by_name.get(name),full,is_dir,recursive=is_dir)
         if as_json:
             return {'path':prefix,'archive':latest,'entries':entries}
         print(f"{n}: {prefix or '/'} (snapshot {latest})")

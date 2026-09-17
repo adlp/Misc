@@ -1,5 +1,26 @@
 # Changelog — borgHelper
 
+## 1.0.92 — TreeHist affiche les droits unix — 2026-09-17
+
+### Nouvelle colonne `droits` (mode ls-style) sur `TreeHist`
+
+`TreeHist` affiche désormais les droits unix du **dernier état connu** de chaque fichier/répertoire
+(ex. `drwxr-xr-x`, `-rwxr-xr-x`, `lrwxrwxrwx`), à côté du genre — colonne `mode` en JSON (`-j`).
+
+Nécessite une nouvelle colonne `snapshot_file.mode` (migration `ALTER TABLE` automatique dans
+`ensure_diff_db()`, additive/rétrocompatible — `DIFF_DB_SCHEMA_VERSION` 2→3). `indexsnap()` (chemins
+complet et incrémental) demande désormais `{mode}` en plus de `{type}`/`{size}`/`{isomtime}` à
+`borg list`. L'auto-réparation d'`indexsnap()` (1.0.89) détecte maintenant `type IS NULL OR mode IS
+NULL` — un resnapshot complet se déclenche automatiquement au prochain `Bkp`/`Index` si l'une ou
+l'autre colonne manque. Les entrées déjà snapshotées avant cette version affichent `—` jusqu'à
+réindexation.
+
+Interface web : nouvelle colonne **Droits** dans l'explorateur d'arborescence.
+
+Vérifié par test réel : migration + auto-réparation sur la DB demo (`type`/`mode` absents → détectés,
+resnapshot complet, colonnes peuplées, `schema_version` remonté à 3) ; droits corrects affichés pour un
+répertoire, un fichier exécutable et un lien symbolique (CLI, JSON, et page web).
+
 ## Interface web — téléchargement .tar (droits préservés) + commande équivalente — 2026-09-17
 
 ### Téléchargement de fichier au format .tar

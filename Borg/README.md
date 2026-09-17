@@ -453,8 +453,11 @@ enfants immédiats. Liste **toujours l'intégralité** du contenu (dernier snaps
 `ls` enrichi, y compris les entrées sans événement dans la plage demandée (présentes, inchangées).
 
 Colonnes : `nom`, `genre` (répertoire / fichier / lien symbolique / fifo / socket / périph. bloc ou
-caractère — type réel stocké par borg), type d'événement (`added`/`modified`/`removed`/…), archive,
-date. `aucun événement dans la plage` si l'entrée n'a pas bougé sur la période demandée.
+caractère — type réel stocké par borg), `droits` (ls-style, ex. `drwxr-xr-x` — **dernier état connu**,
+pas forcément celui de l'archive sélectionnée dans `-b`/`-B`), type d'événement
+(`added`/`modified`/`removed`/…), archive, date. `aucun événement dans la plage` si l'entrée n'a pas
+bougé sur la période demandée ; genre/droits `inconnu (réindexer)`/`—` si l'entrée a été snapshotée
+avant l'ajout de ces colonnes — réindexer (`Index -F -S`) pour les peupler.
 
 **Un sous-répertoire affiche un événement dès qu'un changement a eu lieu n'importe où dans sa
 sous-arborescence** (fichier ajouté/modifié/supprimé à n'importe quelle profondeur en dessous) — sans en
@@ -478,10 +481,11 @@ Plage : `-b <archive>` (depuis), `-B <archive>` (jusqu'à), `-b ALL` (tout), san
 paire indexée seulement — comme `Search`). Une entrée présente mais sans événement dans cette plage
 affiche `aucun événement dans la plage` plutôt que d'être omise.
 
-Genre `inconnu (réindexer)` : entrée snapshotée avant l'ajout de la colonne `type`. Se répare tout seul
-au **prochain `Bkp`** (indexation automatique activée) : `IndexSnap` détecte un `type` manquant et force
-un resnapshot complet cette fois-là (message « type manquant… auto-réparation »), puis revient à
-l'incrémental normal ensuite. Pour forcer immédiatement sans attendre un backup : `Index -F -S`.
+Genre/droits `inconnu (réindexer)`/`—` : entrée snapshotée avant l'ajout des colonnes `type`/`mode`. Se
+répare tout seul au **prochain `Bkp`** (indexation automatique activée) : `IndexSnap` détecte un
+`type`/`mode` manquant et force un resnapshot complet cette fois-là (message « type/mode manquant…
+auto-réparation »), puis revient à l'incrémental normal ensuite. Pour forcer immédiatement sans attendre
+un backup : `Index -F -S`.
 
 ---
 
@@ -680,7 +684,8 @@ Swagger interactif : `http://<host>:<port>/docs`
    actions qui en ont besoin (repérées par 🔑) ; les actions destructives (`Prune`, `DelBkp`, `Restore`,
    `IdxPurge`, `Init`) demandent une confirmation avant exécution. Le résultat brut (`exitcode`, `stdout`,
    `stderr`) s'affiche tel quel. Bouton **🗂 Explorer l'arborescence** dans le bandeau du serveur.
-4. **Explorateur d'arborescence** (`TreeHist -j`) : navigation façon gestionnaire de fichiers.
+4. **Explorateur d'arborescence** (`TreeHist -j`) : navigation façon gestionnaire de fichiers. Colonne
+   **Droits** (ls-style, `drwxr-xr-x`…) affichée pour chaque entrée — dernier état connu.
    - **Clic sur un dossier** : l'ouvre (contenu direct, comme `TreeHist -f <dossier>`).
    - **Clic droit sur un dossier** : télécharge un `.tar` de cette arborescence, à une archive
      choisissable dans une liste déroulante (`borg export-tar`, streamé directement au navigateur).
