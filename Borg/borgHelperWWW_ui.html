@@ -38,6 +38,8 @@
   th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--border)}
   th{color:var(--muted);font-weight:600}
   .browse-row:hover{background:#f0f3f7}
+  .hist-actions{white-space:nowrap;display:flex;gap:6px}
+  .hist-actions button{flex:0 0 auto}
   #browseBreadcrumb a{color:var(--accent);text-decoration:none}
   #browseBreadcrumb a:hover{text-decoration:underline}
   .machine-card{display:flex;flex-direction:column;gap:10px;margin-bottom:14px}
@@ -392,7 +394,7 @@ function _renderHistoryRows(backups,withActions){
   if(archives.length===0) return {archives,html:''};
   const html=archives.map(a=>{
     const b=backups[a];
-    const actionsTd=withActions?`<td>
+    const actionsTd=withActions?`<td class="hist-actions">
         <button class="secondary hist-explore-btn" data-archive="${escapeAttr(a)}">🗂 Explorer</button>
         <button class="danger hist-delete-btn" data-archive="${escapeAttr(a)}">🗑 Supprimer</button>
       </td>`:'';

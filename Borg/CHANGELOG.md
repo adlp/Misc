@@ -1,5 +1,10 @@
 # Changelog — borgHelper
 
+## Interface web — alignement des boutons Explorer/Supprimer (Historique complet) — 2026-09-17
+
+Colonne Actions de la vue Historique complet : boutons **🗂 Explorer** et **🗑 Supprimer** alignés en
+ligne (flexbox, espacement constant), plus de retour à la ligne intempestif.
+
 ## Interface web — vue Historique complet par serveur (Prune / DelBkp / Explorer par archive) — 2026-09-17
 
 Le tableau des **10 dernières sauvegardes** sur chaque carte de la page Serveurs s'affiche désormais
