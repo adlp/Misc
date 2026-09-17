@@ -1,0 +1,46 @@
+; borgHelper — fichier de conf DEMO, 100% local, aucun accès réseau/SSH.
+; Sauvegarde le host local sur lui-même, dans deux dépôts distincts sous /tmp.
+; Usage :
+;   borgHelper -C demo.borghelperrc -c Init    -n demo-modules
+;   borgHelper -C demo.borghelperrc -c Init    -n demo-usrlocal
+;   borgHelper -C demo.borghelperrc -c Bkp     -n demo-modules
+;   borgHelper -C demo.borghelperrc -c Bkp     -n demo-usrlocal
+;   borgHelper -C demo.borghelperrc -c Stats
+;   borgHelper -C demo.borghelperrc -c LstBkp  -n demo-modules
+;   borgHelper -C demo.borghelperrc -c Report  -n ALL
+;
+; ⚠️ Démo uniquement : BORG_PASSPHRASE en clair, dépôts jetables sous /tmp
+; (perdus au reboot). Ne pas copier tel quel en production.
+
+[DEFAULT]
+CACHE_DIR = /tmp/demo_borghelper/cache
+
+[demo-modules]
+BORG_REPO       = /tmp/demo_borghelper/repo-modules
+BORG_PASSPHRASE = demo-passphrase-modules
+SER_NAME        = p-sxb-35
+SER_LOGIN       = root
+GLOB_ARCH       = p-sxb-35-modules-*
+MOUNTPOINT      = /tmp/demo_borghelper/mnt-modules
+BORG_ARCHNAME   = modules
+BORG_ROOTBKP    = /lib/modules
+EXCLUDE         = --exclude-caches --exclude-nodump --keep-exclude-tags
+KEEP_DAILY      = 7
+KEEP_WEEKLY     = 4
+MAX_AGE_BKP     = 25
+DISPLAY_BKP     = 5
+
+[demo-usrlocal]
+BORG_REPO       = /tmp/demo_borghelper/repo-usrlocal
+BORG_PASSPHRASE = demo-passphrase-usrlocal
+SER_NAME        = p-sxb-35
+SER_LOGIN       = root
+GLOB_ARCH       = p-sxb-35-usrlocal-*
+MOUNTPOINT      = /tmp/demo_borghelper/mnt-usrlocal
+BORG_ARCHNAME   = usrlocal
+BORG_ROOTBKP    = /usr/local
+EXCLUDE         = --exclude-caches --exclude-nodump --keep-exclude-tags
+KEEP_DAILY      = 7
+KEEP_WEEKLY     = 4
+MAX_AGE_BKP     = 25
+DISPLAY_BKP     = 5

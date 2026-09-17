@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## demo.borghelperrc — 2026-09-17
+
+Fichier de conf démo, 100% local (pas de SSH) : deux nicks `demo-modules` (`/lib/modules`) et
+`demo-usrlocal` (`/usr/local`) sur le host courant, dépôts/cache/DB SQLite sous `/tmp/demo_borghelper`.
+Testé de bout en bout (Init, Bkp, Stats, LstBkp, LstBkpFls, Report).
+
 ## 1.0.79 — 2026-09-17
 
 ### `borgHelperWWW.py` : symlink manquant pour `uvicorn borgHelperWWW:app`
