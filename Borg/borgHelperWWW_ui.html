@@ -15,7 +15,7 @@
   header{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--border)}
   header h1{font-size:16px;margin:0;font-weight:600}
   header .sub{color:var(--muted);font-size:12px}
-  main{max-width:1100px;margin:0 auto;padding:20px}
+  main{max-width:1400px;margin:0 auto;padding:20px}
   section[hidden]{display:none!important}
   .card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:20px;margin-bottom:16px}
   label{display:block;font-size:13px;font-weight:600;margin-bottom:4px;color:var(--muted)}
@@ -40,6 +40,8 @@
   .browse-row:hover{background:#f0f3f7}
   .hist-actions{white-space:nowrap;display:flex;gap:6px}
   .hist-actions button{flex:0 0 auto}
+  #historyTableEl{width:auto;min-width:100%}
+  #historyTableEl th,#historyTableEl td{white-space:nowrap}
   #browseBreadcrumb a{color:var(--accent);text-decoration:none}
   #browseBreadcrumb a:hover{text-decoration:underline}
   .machine-card{display:flex;flex-direction:column;gap:10px;margin-bottom:14px}
@@ -185,11 +187,13 @@
       </div>
       <p class="hint">Toutes les archives indexées en base (lecture SQLite uniquement).</p>
       <div id="historyError" class="error"></div>
+      <div style="overflow-x:auto">
       <table id="historyTableEl">
         <thead><tr><th>Archive</th><th>Durée</th><th>Taille orig.</th><th>Δ</th><th>Comp.</th>
           <th>Dédup.</th><th>Fichiers</th><th>Modifs</th><th>Actions</th></tr></thead>
         <tbody id="historyBody"></tbody>
       </table>
+      </div>
     </div>
   </section>
 

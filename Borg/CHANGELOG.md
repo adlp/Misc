@@ -1,5 +1,12 @@
 # Changelog — borgHelper
 
+## Interface web — colonnes plus larges dans l'Historique complet — 2026-09-17
+
+Page élargie (`main` 1100px → 1400px) pour réduire les marges latérales vides. Tableau de l'Historique
+complet : colonnes ajustées au contenu (`width:auto`) au lieu d'un étirement uniforme forcé qui créait
+de grosses colonnes vides et des sauts de ligne inutiles ; cellules non-coupables (`white-space:nowrap`) ;
+défilement horizontal (`overflow-x:auto`) en secours sur petit écran.
+
 ## Interface web — alignement des boutons Explorer/Supprimer (Historique complet) — 2026-09-17
 
 Colonne Actions de la vue Historique complet : boutons **🗂 Explorer** et **🗑 Supprimer** alignés en
