@@ -174,8 +174,11 @@
 </main>
 
 <!-- Modale de sélection d'archive pour un téléchargement -->
-<div id="downloadModal" class="card" style="position:fixed;top:80px;left:50%;transform:translateX(-50%);max-width:420px;z-index:50;box-shadow:0 8px 24px rgba(0,0,0,.35)" hidden>
+<div id="downloadModal" class="card" style="position:fixed;top:80px;left:50%;transform:translateX(-50%);max-width:460px;z-index:50;box-shadow:0 8px 24px rgba(0,0,0,.35)" hidden>
   <h3 id="dlModalTitle" style="margin-top:0"></h3>
+  <div class="field" id="dlFormatField" hidden>
+    <label style="display:inline"><input type="checkbox" id="dlTarFormat"> Format .tar (préserve les droits d'accès, propriétaire, dates)</label>
+  </div>
   <div class="field">
     <label for="dlArchiveSelect">Archive</label>
     <select id="dlArchiveSelect"><option value="">dernière archive</option></select>
@@ -183,6 +186,8 @@
   <button onclick="confirmDownload()">Télécharger</button>
   <button class="secondary" onclick="closeDownloadModal()">Annuler</button>
   <div id="dlModalError" class="error"></div>
+  <p class="hint" style="margin-bottom:2px">Commande borgHelper équivalente (extraction locale, droits préservés) :</p>
+  <pre id="dlEquivCmd" style="font-size:11.5px;max-height:none"></pre>
 </div>
 <div id="downloadOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,.3);z-index:40" hidden onclick="closeDownloadModal()"></div>
 
@@ -602,17 +607,23 @@ document.getElementById('browseBody').addEventListener('contextmenu', e=>{
   if(tr.dataset.isdir==='true'){ e.preventDefault(); openDownloadDialog(tr.dataset.full,true); }
 });
 
-// ── Download (fichier ou .tar, à une archive choisie) ────────────────────
+// ── Download (fichier brut, fichier .tar, ou dossier .tar, à une archive choisie) ──────────
 
-let dlPending=null; // {nick,path,isTar}
+let dlPending=null; // {nick,path,isDir}
 
-async function openDownloadDialog(fullPath,isTar){
-  dlPending={nick:browseNick,path:fullPath,isTar};
-  document.getElementById('dlModalTitle').textContent=(isTar?'Télécharger un .tar de ':'Télécharger ')+fullPath;
+async function openDownloadDialog(fullPath,isDir){
+  dlPending={nick:browseNick,path:fullPath,isDir};
+  document.getElementById('dlModalTitle').textContent=(isDir?'Télécharger un .tar de ':'Télécharger ')+fullPath;
   document.getElementById('dlModalError').textContent='';
+  const formatField=document.getElementById('dlFormatField');
+  const tarCheck=document.getElementById('dlTarFormat');
+  formatField.hidden=isDir; // un dossier est toujours en .tar, pas de choix à faire
+  tarCheck.checked=false;
+  tarCheck.onchange=updateEquivCmd;
   const sel=document.getElementById('dlArchiveSelect');
   sel.innerHTML='<option value="">dernière archive</option>';
-  if(isTar){
+  sel.onchange=updateEquivCmd;
+  if(isDir){
     // Tar d'une arborescence : toutes les archives (une tar est un instantané complet, le
     // filtrage "mouvement" n'a de sens que pour un fichier précis).
     const r=await apiCall('GET','/lstbkp',{nick:browseNick},false);
@@ -628,7 +639,7 @@ async function openDownloadDialog(fullPath,isTar){
     }
   }else{
     // Fichier : ne proposer que les archives où CE fichier a réellement bougé (added/modified —
-    // removed exclu, le fichier n'existe plus dans cette archive-là).
+    // removed exclu, le fichier n'existe plus dans cette archive-là). Même filtre, brut ou .tar.
     const entry=browseEntriesByPath[fullPath];
     const events=(entry&&entry.events)||[];
     const moved=events.filter(e=>e.type==='added'||e.type==='modified')
@@ -645,9 +656,21 @@ async function openDownloadDialog(fullPath,isTar){
       });
     }
   }
+  updateEquivCmd();
   document.getElementById('downloadOverlay').hidden=false;
   document.getElementById('downloadModal').hidden=false;
 }
+
+function updateEquivCmd(){
+  if(!dlPending) return;
+  const {nick,path}=dlPending;
+  const bid=document.getElementById('dlArchiveSelect').value;
+  const bidArg=bid?` -b ${shQuote(bid)}`:'';
+  const cmd=`borgHelper -c Restore -n ${shQuote(nick)} -f ${shQuote(path)} -w /chemin/local/de/destination${bidArg}`;
+  document.getElementById('dlEquivCmd').textContent=cmd;
+}
+function shQuote(s){ return /^[A-Za-z0-9_.\-\/]+$/.test(s) ? s : "'"+String(s).replace(/'/g,"'\\''")+"'"; }
+
 function closeDownloadModal(){
   document.getElementById('downloadOverlay').hidden=true;
   document.getElementById('downloadModal').hidden=true;
@@ -656,9 +679,10 @@ function closeDownloadModal(){
 async function confirmDownload(){
   if(!dlPending) return;
   const bid=document.getElementById('dlArchiveSelect').value||undefined;
-  const {nick,path,isTar}=dlPending;
+  const {nick,path,isDir}=dlPending;
+  const asTar=isDir || document.getElementById('dlTarFormat').checked;
   try{
-    if(isTar) await downloadViaFetch('/download/tar',{nick,prefix:path,bid},nick,path.split('/').pop()+'.tar');
+    if(asTar) await downloadViaFetch('/download/tar',{nick,prefix:path,bid},nick,path.split('/').pop()+'.tar');
     else await downloadViaFetch('/download/file',{nick,path,bid},nick,path.split('/').pop());
   }catch(e){
     document.getElementById('dlModalError').textContent=e.message; return;

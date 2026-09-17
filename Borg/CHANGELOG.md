@@ -1,5 +1,23 @@
 # Changelog — borgHelper
 
+## Interface web — téléchargement .tar (droits préservés) + commande équivalente — 2026-09-17
+
+### Téléchargement de fichier au format .tar
+
+Le téléchargement brut (`borg extract --stdout`) ne transporte que le contenu, pas les métadonnées
+(mode, propriétaire, date). Ajout d'une case « Format .tar (préserve les droits d'accès) » dans la
+fenêtre de téléchargement d'un fichier : cochée, réutilise `/download/tar` avec ce fichier comme
+`prefix` (déjà générique — fonctionnait sans changement backend, `borg export-tar` acceptant un chemin
+de fichier comme de dossier). Vérifié par test réel : `tar tvf` sur un fichier ainsi téléchargé montre
+mode/propriétaire/date d'origine préservés (`-rwxr-xr-x root/root ... 2023-04-22 ...`).
+
+### Commande `borgHelper` équivalente, systématique
+
+La fenêtre de téléchargement (fichier brut, fichier .tar, ou dossier .tar) affiche désormais toujours la
+commande `borgHelper -c Restore -n <nick> -f <chemin> -w <destination> [-b <archive>]` qui produit le
+même résultat en ligne de commande (extraction disque réelle, droits préservés) — mise à jour en direct
+quand l'archive sélectionnée change.
+
 ## Interface web — téléchargement de fichier : archives filtrées au mouvement réel — 2026-09-17
 
 La liste déroulante d'archives pour télécharger un fichier proposait tout l'historique du dépôt
