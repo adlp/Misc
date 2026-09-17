@@ -1,5 +1,13 @@
 # Changelog — borgHelper
 
+## 1.0.79 — 2026-09-17
+
+### `borgHelperWWW.py` : symlink manquant pour `uvicorn borgHelperWWW:app`
+
+`uvicorn <module>:app` importe le module par son nom via `importlib` — échoue sans extension `.py`
+("Could not import module"). Ajout du symlink `borgHelperWWW.py → borgHelperWWW`, même principe que
+`borgHelper.py`. Sans impact sur `python3 borgHelperWWW` (exécution directe).
+
 ## 1.0.78 — 2026-09-17
 
 ### `-P` : passphrase en paramètre + correctif `-C`

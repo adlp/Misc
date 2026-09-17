@@ -583,6 +583,10 @@ Toutes les commandes sont exposées **sauf `Mount`/`UMount`** (accès FUSE local
 pip install fastapi uvicorn pydantic
 ```
 
+`borgHelperWWW.py` (symlink vers `borgHelperWWW`, même principe que `borgHelper.py`) doit être présent
+à côté du script : `uvicorn borgHelperWWW:app` importe le module par son nom et échoue sans l'extension
+`.py` ("Could not import module"). Inutile pour `python3 borgHelperWWW` en exécution directe.
+
 ### Configuration (variables d'environnement)
 
 | Variable | Rôle |
