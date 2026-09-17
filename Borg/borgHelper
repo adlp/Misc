@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.76"
+Version="1.0.77"
 DIFF_DB_SCHEMA_VERSION  = 1
 CACHE_DB_SCHEMA_VERSION = 1
 
@@ -1401,18 +1401,32 @@ class BorgHelper:
             printer('Pas monte'); sys.exit(3)
 
     def list_backups(self,nick,debug=0):
-        cfg=self.borg.cfgreaded(nick,debug=debug)
-        rb=self.borg.boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
-        for i in rb['stdout'][0]['archives']:
-            print(f"{i['name']} {i['start']}")
-        sys.exit(rb['exitcode'])
+        db_path=self.db.get_diff_db(nick)
+        self.db.ensure_diff_db(db_path)
+        conn=sqlite3.connect(db_path)
+        rows=conn.execute("SELECT archive,archive_date FROM archive_stats WHERE nick=? ORDER BY archive_date",(nick,)).fetchall()
+        conn.close()
+        if not rows:
+            printer("Aucune archive indexée en base — lancer 'index' ou 'bkp'."); sys.exit(1)
+        for name,date in rows:
+            print(f"{name} {date}")
+        sys.exit(0)
 
     def list_files(self,nick,bid,debug=0):
-        cfg=self.borg.cfgreaded(nick,debug=debug)
-        if bid is None: bid=self.borg.getlastbkp(nick,debug=debug)[0]
-        rb=self.borg.boex(nick,['list','--glob-archives',cfg['GLOB_ARCH'],'::'+bid],debug=debug,retjson=False)
-        for i in rb['stdout']: print(i)
-        sys.exit(rb['exitcode'])
+        db_path=self.db.get_diff_db(nick)
+        self.db.ensure_diff_db(db_path)
+        conn=sqlite3.connect(db_path)
+        if bid is None:
+            row=conn.execute("SELECT archive FROM archive_stats WHERE nick=? ORDER BY archive_date DESC LIMIT 1",(nick,)).fetchone()
+            if row is None:
+                conn.close(); printer("Aucune archive indexée en base — lancer 'index' ou 'bkp'."); sys.exit(1)
+            bid=row[0]
+        rows=conn.execute("SELECT path FROM archive_snapshot_v WHERE nick=? AND archive=? ORDER BY path",(nick,bid)).fetchall()
+        conn.close()
+        if not rows:
+            printer(f"Aucun fichier indexé pour {bid} — lancer 'indexsnap'."); sys.exit(1)
+        for (path,) in rows: print(path)
+        sys.exit(0)
 
     def key(self,nicks,debug=0):
         for nick in nicks.split(','):

@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## 1.0.77 — 2026-09-17
+
+### `LstBkp` et `LstBkpFls` : DB uniquement, plus d'appel `borg`
+
+`list_backups` lit désormais `archive_stats` et `list_files` lit `archive_snapshot_v` (via `get_diff_db`) au lieu d'exécuter `borg list`. Réponse quasi-instantanée pour les dépôts distants, au prix de dépendre de l'indexation (`Bkp`/`Index` pour la liste d'archives, `Indexsnap` pour les fichiers) — message d'erreur explicite si rien n'est indexé.
+
 ## 1.0.76 — 2026-06-13
 
 ### Refactoring interne : consolidation du système de locks PID

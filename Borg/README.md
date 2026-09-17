@@ -270,21 +270,25 @@ Formule (identique résumé et détail) :
 ---
 
 ### `LstBkp`
-Liste les archives disponibles.
+Liste les archives disponibles — lecture base uniquement, pas d'appel `borg` (rapide).
 
 ```bash
 borgHelper -c LstBkp -n mon-serveur
 ```
 
+Nécessite `archive_stats` peuplée (`Bkp` ou `Index`). Sinon : "Aucune archive indexée en base".
+
 ---
 
 ### `LstBkpFls`
-Liste les fichiers d'une archive.
+Liste les fichiers d'une archive — lecture base uniquement, pas d'appel `borg` (rapide).
 
 ```bash
 borgHelper -c LstBkpFls -n mon-serveur
 borgHelper -c LstBkpFls -n mon-serveur -b mon-serveur-root-2025-04-02T213004
 ```
+
+Nécessite le snapshot de l'archive peuplé (`Indexsnap`). Sinon : "Aucun fichier indexé — lancer 'indexsnap'".
 
 ---
 
