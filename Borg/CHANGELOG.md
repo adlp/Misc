@@ -1,5 +1,13 @@
 # Changelog — borgHelper
 
+## Interface web — historique des 10 dernières sauvegardes par serveur — 2026-09-17
+
+Bouton **📋 Historique (10 dernières)** sur chaque carte de la page Serveurs : déplie un tableau par
+archive (durée, taille originale, Δ taille, taille compressée, taille dédupliquée, nb fichiers,
+modifications), via `Report -o -N 10 -j` (`/report?n=10&offline=true&json=true`) — lecture SQLite
+uniquement, aucune passphrase requise. Chargé une seule fois au premier dépli, mis en cache dans le
+panneau tant que la liste des serveurs n'est pas rafraîchie.
+
 ## Interface web — lien Swagger dans le pied de page — 2026-09-17
 
 Lien **Swagger / API** (`/docs`) ajouté dans le pied de page de l'interface web, visible sur toutes

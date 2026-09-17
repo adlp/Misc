@@ -687,6 +687,9 @@ page de l'interface web (visible sur toutes les pages, y compris la page de conn
    enregistrée, sinon celle du `.borghelperrc` si présente — avertissement sinon) ; la liste se
    rafraîchit automatiquement une fois terminé. Bouton **🗂 Explorer** juste à côté pour accéder
    directement à l'explorateur d'arborescence de ce serveur, sans passer par la page de détail.
+   Bouton **📋 Historique (10 dernières)** dépliant un tableau par archive (durée, taille originale,
+   Δ taille, compressée, dédupliquée, nb fichiers, modifications) — `Report -o -N 10 -j` hors-ligne,
+   aucune passphrase requise, chargé une seule fois au premier dépli.
 3. **Détail d'un serveur** : champ **BORG_PASSPHRASE** à enregistrer pour la session (`sessionStorage`,
    par nick) — c'est ici, et seulement ici, qu'elle se saisit. Envoyée en `X-Borg-Passphrase` pour les
    actions qui en ont besoin (repérées par 🔑) ; les actions destructives (`Prune`, `DelBkp`, `Restore`,

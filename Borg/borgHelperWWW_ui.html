@@ -345,8 +345,10 @@ async function loadMachines(){
           </tr>
         </table>
         <div class="pass-row">
+          <button class="secondary history-btn" data-nick="${escapeAttr(nick)}">📋 Historique (10 dernières)</button>
           <span class="pill">🔑 passphrase : ${hasPass?'✓ enregistrée pour la session':'non renseignée — à saisir sur la page du serveur'}</span>
         </div>
+        <div class="history-panel" hidden style="margin-top:8px"></div>
       </div>`;
   }).join('');
 }
@@ -358,7 +360,43 @@ document.getElementById('machinesList').addEventListener('click', e=>{
   if(bkpBtn){ runBackupNow(bkpBtn.dataset.nick,bkpBtn); return; }
   const exploreBtn=e.target.closest('.explore-btn');
   if(exploreBtn){ openMachine(exploreBtn.dataset.nick); openBrowse(); return; }
+  const histBtn=e.target.closest('.history-btn');
+  if(histBtn){ toggleHistory(histBtn); return; }
 });
+
+async function toggleHistory(btn){
+  const panel=btn.closest('.machine-card').querySelector('.history-panel');
+  if(!panel.hidden){ panel.hidden=true; return; }
+  panel.hidden=false;
+  if(panel.dataset.loaded==='1') return;
+  panel.innerHTML='Chargement…';
+  const nick=btn.dataset.nick;
+  const r=await apiCall('GET','/report',{nick,n:'10',json:'true',offline:'true'},false);
+  if(r.httpStatus===401) return;
+  if(r.exitcode===undefined || r.httpStatus>=500 || (!r.stdout && r.stderr)){
+    panel.innerHTML='<p class="error">Erreur : '+escapeHtml(r.stderr||('HTTP '+r.httpStatus))+'</p>';
+    return;
+  }
+  let parsed;
+  try{ parsed=JSON.parse(r.stdout); }
+  catch(e){ panel.innerHTML='<p class="error">Réponse Report illisible : '+escapeHtml(r.stdout.slice(0,200))+'</p>'; return; }
+  const backups=(parsed.backups&&parsed.backups[nick])||{};
+  const archives=Object.keys(backups).filter(k=>k!=='Prunable'&&k!=='Totaux');
+  if(archives.length===0){
+    panel.innerHTML='<p class="hint">Aucune archive indexée en base.</p>';
+  }else{
+    panel.innerHTML='<table><thead><tr><th>Archive</th><th>Durée</th><th>Taille orig.</th>'
+      +'<th>Δ</th><th>Comp.</th><th>Dédup.</th><th>Fichiers</th><th>Modifs</th></tr></thead><tbody>'
+      +archives.map(a=>{
+        const b=backups[a];
+        return `<tr><td>${escapeHtml(a)}</td><td>${escapeHtml(b.duration||'—')}</td>`
+          +`<td>${escapeHtml(b.original_size||'—')}</td><td>${escapeHtml(b.size_delta||'—')}</td>`
+          +`<td>${escapeHtml(b.compressed_size||'—')}</td><td>${escapeHtml(b.deduplicated_size||'—')}</td>`
+          +`<td>${escapeHtml(String(b.nfiles??'—'))}</td><td>${escapeHtml(b.modifications||'—')}</td></tr>`;
+      }).join('')+'</tbody></table>';
+  }
+  panel.dataset.loaded='1';
+}
 
 async function runBackupNow(nick,btn){
   if(!confirm(`Lancer un backup immédiat pour ${nick} ?`)) return;
