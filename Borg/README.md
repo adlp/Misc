@@ -547,7 +547,14 @@ borgHelper -c DuIdx -f 'home/*' -n mon-serveur             # détail sous home/
 borgHelper -c DuIdx -f '*.log' -n ALL                      # résumé global sur les .log
 borgHelper -c DuIdx -f '*' -s présent:desc -n mon-serveur  # trié par taille présent desc
 borgHelper -c DuIdx -f '*' -j -n mon-serveur               # sortie JSON
+borgHelper -c DuIdx -n mon-serveur -R                      # sortie brute, une ligne JSON par chemin
 ```
+
+`-R` (Story 1.4) : mode brut, une ligne `{chemin,type,taille}` par chemin, **jamais groupée** —
+distinct de `-j` qui reste le mode groupé historique (JSON `rows`/`total` par arborescence ou par
+type, format inchangé). Usage interne : `borgHelperWWW` s'en sert pour filtrer par périmètre de
+chemin puis regrouper lui-même sur les seules lignes en périmètre (voir « Autorisation par
+groupes » plus haut) ; utile aussi en CLI pour post-traiter les données par-chemin soi-même.
 
 ---
 
@@ -558,12 +565,14 @@ Top N arborescences du `diff_index` par nombre d'entrées — diagnostic d'un `d
 borgHelper -c IdxTop -n mon-serveur           # top 20, profondeur 3
 borgHelper -c IdxTop -n mon-serveur -N 10     # top 10
 borgHelper -c IdxTop -n mon-serveur -p 4      # profondeur 4
+borgHelper -c IdxTop -n mon-serveur -j        # sortie brute, une ligne JSON par chemin
 ```
 
 | Option | Description |
 |--------|-------------|
 | `-N <n>` | Nombre de lignes affichées (défaut : 20) |
 | `-p <n>` | Profondeur de regroupement des chemins (défaut : 3) |
+| `-j` | Sortie brute (Story 1.4) : une ligne `{chemin,taille}` par chemin, **sans** regroupement/top-N ni les figures Exclus/Inchangés — `-N`/`-p` sont ignorés dans ce mode. Usage interne (`borgHelperWWW` filtre par périmètre puis regroupe/classe lui-même). |
 
 Parcours en streaming (batchs 50 000 lignes) — fonctionne sur les grosses bases sans surcharge mémoire.
 
@@ -624,6 +633,7 @@ borgHelper -c DiffTop -n mon-serveur                         # top 10, profondeu
 borgHelper -c DiffTop -n mon-serveur -N 5                    # top 5
 borgHelper -c DiffTop -n mon-serveur -p 4                    # profondeur 4
 borgHelper -c DiffTop -n mon-serveur -b archive-old,archive-new  # paire explicite
+borgHelper -c DiffTop -n mon-serveur -j                      # sortie brute, une ligne JSON par chemin
 ```
 
 | Option | Description |
@@ -631,6 +641,7 @@ borgHelper -c DiffTop -n mon-serveur -b archive-old,archive-new  # paire explici
 | `-N <n>` | Nombre de lignes affichées (défaut : 10) |
 | `-p <n>` | Profondeur de regroupement (défaut : 3) |
 | `-b <old,new>` | Paire d'archives explicite (défaut : dernière paire indexée) |
+| `-j` | Sortie brute (Story 1.4) : une ligne `{chemin,type,taille_avant,taille_apres}` par chemin, **sans** regroupement/top-N ni les figures Exclus/Inchangés — `-N`/`-p` sont ignorés dans ce mode. Usage interne (`borgHelperWWW` filtre par périmètre puis regroupe/classe lui-même). |
 
 Colonnes : `total (nb+%)` · `+nb` · `+taille` · `-nb` · `-taille` · `=nb` · `taille`.  
 Trié par total. Source : `diff_index` — aucun appel borg, résultat immédiat si la paire est indexée.
@@ -841,11 +852,30 @@ sur les nicks demandés (admin, ou autorisation par groupes désactivée) ne voi
 changement de format : texte par défaut, JSON seulement sur demande explicite là où c'était déjà
 possible — exactement comme avant cette story.
 
-`DuIdx`/`IdxTop`/`DiffTop` (agrégats) restent, pour l'instant, non filtrés (Story 1.4, distincte —
-recalcul d'agrégats, pas un simple retrait de lignes) ; `Restore`/`/download/file`/`/download/tar`
-(garde pré-appel, pas un filtrage a posteriori) sont couverts par un epic séparé, construit sur
-cette même résolution de périmètre. `Bkp/Index/Prune/DelBkp/Init/Key/IdxPurge/Stats` n'ont pas de
-notion de sous-chemin et ne sont jamais concernés.
+Depuis la Story 1.4, `DuIdx`/`IdxTop`/`DiffTop` (agrégats disque/top-N par chemin) sont filtrés eux
+aussi — mais pas par simple retrait de lignes comme les six commandes ci-dessus : ces trois
+commandes **groupent/agrègent déjà** (en Python, voire en SQL pour `DuIdx`) **avant** de produire
+leur JSON existant, donc filtrer ce JSON après coup serait incorrect (une frontière de périmètre
+peut tomber au milieu d'un groupe déjà constitué). `borgHelper` expose donc, en plus de son mode
+groupé existant, un mode **brut** ungroupé, une ligne JSON par chemin — `-R` pour `DuIdx` (dont le
+`-j` existant reste le mode groupé historique, inchangé) ; `-j` pour `IdxTop`/`DiffTop`, qui
+n'avaient aucun mode JSON avant cette story. Quand l'appelant est scopé, `borgHelperWWW` demande ce
+mode brut, retire les lignes hors périmètre, puis **recalcule lui-même** le regroupement/tri/top-N
+à partir des lignes filtrées — jamais un total/classement transmis depuis le calcul non filtré puis
+partiellement masqué. `DuIdx`/`IdxTop`/`DiffTop` sont traités **mono-nick** pour le périmètre (comme
+`LstBkpFls`/`DiffBkp` en Story 1.3) : `nick=ALL`/plusieurs nicks chez un appelant scopé est refusé
+(`400`, aucune donnée) plutôt que de tenter un regroupement inter-nicks que cette story ne construit
+pas pour ces trois commandes. Les figures « Exclus » (`IDX_EXCLUDE`) et « Inchangés par archive »
+(dérivées de `nfiles`, sans colonne de chemin) sont des figures **portant sur le nick entier** — non
+scopables correctement — et sont donc **omises** de la réponse pour tout appelant scopé, jamais
+approximées. Une paire d'archives (`DiffTop`) sans la moindre ligne dans le périmètre renvoie un
+résultat vide (`rows: []`), jamais une erreur. Un appelant sans restriction ne voit, comme pour les
+six autres commandes, **aucun** changement de format.
+
+`Restore`/`/download/file`/`/download/tar` (garde pré-appel, pas un filtrage a posteriori) sont
+couverts par un epic séparé, construit sur cette même résolution de périmètre.
+`Bkp/Index/Prune/DelBkp/Init/Key/IdxPurge/Stats` n'ont pas de notion de sous-chemin et ne sont jamais
+concernés.
 
 ⚠️ **Chemins stockés sans `/` initial, préfixes `GROUPS_PATHS` avec un `/` initial** : vérifié
 contre le dépôt réel (`borg create /lib/modules` stocke des chemins d'archive `lib/modules/...`,
@@ -1080,14 +1110,14 @@ entrées (purge totale au-delà, garde-fou anti-croissance illimitée). `GET /re
 mode `offline=true` (le mode en ligne interroge le dépôt en direct via `borg info`, non couvert par
 cette empreinte).
 
-⚠️ **Périmètre de chemin actif ⇒ jamais servi depuis ce cache** (Story 1.3) : pour `/search`,
-`/filehist`, `/lstbkpfls`, `/diffbkp`, `/treehist`, `/treefind`, dès qu'**au moins un** nick de la
-requête porte un périmètre restreint (`GROUPS_PATHS`), l'appel contourne entièrement
-`_RESPONSE_CACHE` — ni lu, ni écrit — et relance `borgHelper` à chaque fois. Seul le cas
-entièrement non restreint (autorisation par groupes désactivée, ou appelant sans aucun périmètre
-sur tous les nicks demandés) continue d'utiliser ce cache, exactement comme avant cette story. Un
-cache dédié au résultat **filtré**, avec le périmètre dans sa clé, est prévu pour une story
-ultérieure du même epic (1.5) — pas celle-ci.
+⚠️ **Périmètre de chemin actif ⇒ jamais servi depuis ce cache** (Story 1.3, étendu Story 1.4) : pour
+`/search`, `/filehist`, `/lstbkpfls`, `/diffbkp`, `/treehist`, `/treefind`, `/duidx`, `/idxtop`,
+`/difftop`, dès qu'**au moins un** nick de la requête porte un périmètre restreint (`GROUPS_PATHS`),
+l'appel contourne entièrement `_RESPONSE_CACHE` — ni lu, ni écrit — et relance `borgHelper` à chaque
+fois. Seul le cas entièrement non restreint (autorisation par groupes désactivée, ou appelant sans
+aucun périmètre sur tous les nicks demandés) continue d'utiliser ce cache, exactement comme avant
+ces deux stories. Un cache dédié au résultat **filtré**, avec le périmètre dans sa clé, est prévu
+pour une story ultérieure du même epic (1.5) — pas celle-ci.
 
 | Méthode | Route | Commande CLI | Cache |
 |---------|-------|--------------|:---:|
@@ -1188,17 +1218,18 @@ classique (404 nick/archive inconnu, 502 `borg list` en échec, 504 timeout, **4
   leur durée — pas de file d'attente/job asynchrone. Prévoir `--workers` et un timeout côté reverse-proxy.
 - Le budget d'authentification est volontairement simple (une seule clé partagée). Pour un usage
   multi-utilisateurs avec traçabilité par appelant, ajouter une couche d'auth dédiée devant l'API.
-- **Interface web pas encore adaptée au filtrage par périmètre (Story 1.3)** : `borgHelperWWW_ui.html`
-  ne distingue pas encore une réponse filtrée (JSON forcé par un périmètre restreint) d'une réponse
-  normale — elle continue d'afficher le JSON forcé comme si c'était la forme attendue, sans indiquer
-  à l'utilisateur que le résultat a été réduit à son périmètre. Connu, non traité dans cette story
-  (périmètre volontairement limité à l'API HTTP elle-même) — suivi séparé côté UI.
-- **`DuIdx`/`IdxTop`/`DiffTop` non filtrés par périmètre (Story 1.3)** : ces trois commandes
-  d'agrégats renvoient encore des totaux/tops calculés sur l'ensemble d'un nick, sans tenir compte
-  d'un périmètre `GROUPS_PATHS` restreint — un appelant scopé peut donc en déduire de l'information
-  sur des chemins hors de son périmètre (tailles, noms de plus gros consommateurs, etc.). Fermé par
-  Story 1.4 (recalcul d'agrégats filtrés), non par celle-ci (périmètre volontairement limité aux
-  commandes qui renvoient des chemins ou des listes indexées par chemin).
+- **Interface web pas encore adaptée au filtrage par périmètre (Stories 1.3–1.4)** :
+  `borgHelperWWW_ui.html` ne distingue pas encore une réponse filtrée (JSON forcé par un périmètre
+  restreint) d'une réponse normale — elle continue d'afficher le JSON forcé comme si c'était la forme
+  attendue, sans indiquer à l'utilisateur que le résultat a été réduit à son périmètre. Vrai pour les
+  six commandes de la Story 1.3 (`Search`, `FileHist`, `LstBkpFls`, `DiffBkp`, `TreeHist`,
+  `TreeFind`) comme pour les trois de la Story 1.4 (`DuIdx`, `IdxTop`, `DiffTop`, dont le JSON brut
+  recalculé côté `borgHelperWWW` est tout aussi indiscernable d'une réponse normale pour l'UI). Connu,
+  non traité dans ces stories (périmètre volontairement limité à l'API HTTP elle-même) — suivi séparé
+  côté UI.
+- **`DuIdx`/`IdxTop`/`DiffTop` filtrés par périmètre depuis la Story 1.4** : voir « Autorisation par
+  groupes » ci-dessus pour le mécanisme (mode brut par-chemin + recalcul côté `borgHelperWWW`,
+  traitement mono-nick, omission des figures Exclus/Inchangés non scopables pour un appelant scopé).
 
 ---
 

@@ -895,9 +895,9 @@ produit un `500` FastAPI standard (exception non gérée), pas un `CommandResult
 ### Filtrage a posteriori par périmètre — Search/FileHist/LstBkpFls/DiffBkp/TreeHist/TreeFind (Story 1.3)
 
 Applique le périmètre résolu par Story 1.1 (`_resolve_path_scope`) aux six commandes de lecture qui
-renvoient des chemins ou des listes indexées par chemin — pas encore `DuIdx`/`IdxTop`/`DiffTop`
-(agrégats, Story 1.4, distincte : recalcul de totaux/top-N, pas un simple retrait de lignes), pas
-`Restore`/téléchargements (garde pré-appel, epic séparé). Mécanisme choisi (voir
+renvoient des chemins ou des listes indexées par chemin — pas `DuIdx`/`IdxTop`/`DiffTop` (agrégats,
+mécanisme distinct, voir Story 1.4 plus bas : recalcul de totaux/top-N, pas un simple retrait de
+lignes), pas `Restore`/téléchargements (garde pré-appel, epic séparé). Mécanisme choisi (voir
 `ARCHITECTURE-SPINE.md`, AD-2) : **filtrage a posteriori**, jamais un filtrage côté `borgHelper`
 lui-même (qui reste totalement ignorant du RBAC) — `borgHelperWWW` appelle `borgHelper` normalement
 (avec `-j` forcé en interne dès qu'un périmètre s'applique), reçoit le JSON, retire les lignes hors
@@ -980,6 +980,115 @@ tort le besoin de filtrage.
 `_RESPONSE_CACHE` n'est donc ni lu ni écrit pour un appel dont au moins un nick est scopé, quels que
 soient `cmd`/`nick`/`extra_args`. Le cache reste utilisé exactement comme avant cette story pour le
 cas entièrement non restreint. Pas de nouveau cache dédié au résultat filtré ici — Story 1.5.
+
+### Filtrage a posteriori par périmètre — DuIdx/IdxTop/DiffTop (Story 1.4)
+
+Étend le mécanisme de la Story 1.3 aux trois commandes d'agrégats. Différence de fond avec les six
+commandes ci-dessus : `DuIdx`/`IdxTop`/`DiffTop` **groupent/agrègent déjà** (en Python, voire en SQL
+pour `DuIdx` — `_duidx_collect_global()` fait un `GROUP BY change_type` côté SQLite) **avant** de
+produire leur JSON existant. Filtrer ce JSON après coup serait incorrect : une frontière de
+périmètre peut tomber au milieu d'un groupe déjà constitué (ex. un préfixe `lib/modules/*` mélangeant
+des chemins en et hors périmètre sous la même clé de regroupement). Le mécanisme de la Story 1.3
+(filtrer le JSON existant) est donc structurellement inapplicable ici.
+
+**Mode brut côté `borgHelper`** : chacune des trois commandes gagne un mode ungroupé, une ligne JSON
+par chemin sous-jacent, produit **avant** toute agrégation Python/SQL :
+
+- `duidx(..., raw=True)` / CLI `-R` — nouveau flag distinct du `-j` existant de `DuIdx` (qui reste le
+  mode groupé historique, texte/JSON inchangés — vérifié `python3 -m py_compile` + diff byte-à-byte
+  contre la sortie d'avant cette story). Nouvelle méthode `BorgHelperDB._duidx_collect_raw()` — mêmes
+  deux requêtes SQL que `_duidx_collect()` (`diff_index` + `archive_snapshot_v`, même filtre
+  LIKE/archive via `sql_pat`/`_diff_archive_filter`), sans agrégation par `key_fn` : une ligne
+  `{'chemin','type','taille'}` par chemin. `duidx()` calcule `sql_pat` de façon dupliquée (jamais
+  partagée avec les branches groupé/global existantes) pour ne jamais risquer d'altérer leur
+  comportement.
+- `idxtop(..., as_json=True)` / CLI `-j` — `IdxTop` n'avait aucun mode JSON avant cette story, donc
+  pas de format existant à préserver : `-j` **est** directement le mode brut (une ligne
+  `{'chemin','taille'}` par ligne de `diff_index`, avant le `stats[pfx]` de la boucle
+  `fetchmany(50000)` existante). `-N`/`-p` sont ignorés dans ce mode (le regroupement/top-N se fait
+  côté `borgHelperWWW`, sur l'ensemble complet filtré — voir plus bas).
+- `difftop(..., as_json=True)` / CLI `-j` — même principe, une ligne
+  `{'chemin','type','taille_avant','taille_apres'}` par ligne de `diff_index` pour la paire
+  d'archives résolue (`-b` explicite ou dernière paire indexée, même résolution que le mode texte,
+  **avant** la branche JSON/texte).
+
+Les trois modes JSON sont volontairement **sans** les figures « Exclus » (`diff_excluded_stats`,
+`IDX_EXCLUDE`) ni « Inchangés par archive » (dérivé de `nfiles`) : ce sont des figures **portant sur
+le nick entier**, sans colonne de chemin — non filtrables correctement par périmètre (Boundaries du
+spec 1.4). `borgHelper` reste RBAC-ignorant (AD-3) : ces modes bruts sont une option de sortie
+générique, jamais scope/groupe-aware — c'est `borgHelperWWW` seul qui décide quoi en garder.
+
+**Traitement mono-nick pour le périmètre** — `_resolve_single_scope(request, nick)` : contrairement
+à `Search`/`FileHist`/`TreeHist`/`TreeFind` (multi-nick, une clé par nick), `DuIdx`/`IdxTop`/`DiffTop`
+sont traitées comme `LstBkpFls`/`DiffBkp` en Story 1.3 — jamais de filtrage/ré-agrégation
+inter-nicks construit ici. `nick` (potentiellement `'ALL'` ou une liste `,` — `IdxTop`/`DiffTop` ont
+un défaut de route `nick="ALL"`) est d'abord développé via `_nick_list()`, **jamais** un
+`cfgread('ALL')` direct (qui reviendrait à tort « illimité », même piège que le Groupe A du Triage
+Log de la Story 1.3). Résultat :
+- Aucun nick de la liste développée n'est scopé (`_any_scoped` faux) → `(None, None)`, l'appelant
+  passe par la branche `run_borghelper(...)` **strictement inchangée**, `nick` transmis tel quel
+  (y compris `'ALL'`/liste) — byte-identical.
+- Au moins un nick scopé, un seul nick dans la liste développée → `(nick_unique, scope)`, branche
+  `_run_scoped_raw(...)`.
+- Au moins un nick scopé, **plusieurs** nicks dans la liste développée → `HTTPException(400)`,
+  fail-closed, aucune donnée — jamais de tentative de filtrage/regroupement multi-nick.
+
+⚠️ **Angle mort pré-existant, non introduit par cette story** : `_check_group_access` ne vérifie le
+tier que si `nick` figure **littéralement** dans la query string (`request.query_params.get('nick')
+is None` → retour anticipé, sans lever). Pour `IdxTop`/`DiffTop`, dont le paramètre de route a un
+défaut `"ALL"`, un appel **sans aucun `?nick=`** contourne donc entièrement la vérification de tier
+grossière — comportement identique avant et après cette story (le défaut `nick="ALL"` de ces deux
+routes existait déjà). `_resolve_single_scope()` ne comble cet angle mort que par accident dans le
+cas où l'appelant est scopé sur au moins un nick réel (le rejet multi-nick s'applique alors avant
+toute lecture) ; un appelant sans **aucun** tier sur aucun nick verrait chaque `_resolve_path_scope`
+renvoyer `None` par la voie « aucun tier du tout » (cas 1 documenté dans le docstring de
+`_resolve_path_scope`, Story 1.1) — indiscernable ici du cas « tier réel + périmètre illimité » — et
+retomberait donc sur la branche non restreinte. Concerne potentiellement aussi `/cacheinfo`,
+`/cacheclean`, `/idxpurge` (mêmes défauts `nick="ALL"`), hors périmètre de cette story et de Story
+1.3. **Non corrigé ici** (`_check_group_access` est explicitely hors des limites du spec 1.4, et un
+correctif partiel limité à `IdxTop`/`DiffTop` serait incohérent avec les autres routes touchées par
+le même angle mort) — signalé pour triage humain, voir Review Triage Log du spec 1.4.
+
+**`_run_scoped_raw(cmd, nick, extra_args, raw_flag, filter_fn, passphrase=None)`** : variante de
+`_run_scoped()` — force `raw_flag` (`'-R'` pour `DuIdx`, `'-j'` pour `IdxTop`/`DiffTop`) au lieu du
+`'-j'` générique de `_run_scoped()` (`DuIdx` a besoin de `-R` spécifiquement, son `-j` existant
+restant le mode groupé historique). Même politique fail-closed sur JSON invalide, même non-passage
+par `_RESPONSE_CACHE`. Compromis mémoire assumé, non traité ici : pour un appelant scopé, le mode
+brut/ungroupé bufferise en mémoire l'intégralité des lignes correspondantes (liste Python +
+capture complète du subprocess + `json.loads` complet du document), contrairement au chemin
+admin/non-scopé dont l'empreinte mémoire reste bornée par l'agrégat produit par `borgHelper`
+lui-même — connu, accepté par ce mécanisme de filtrage de la Story 1.4.
+
+**Fonctions `_recompute_*`** — mirroir ligne-à-ligne de l'algorithme de regroupement de `borgHelper`
+au moment de l'écriture (Design Notes du spec 1.4 : garder ce mirroring littéral rend le contrôle de
+dérive tractable — diff les deux copies, jamais raisonner sur une équivalence comportementale) :
+
+| Fonction | Commande | Mirroir de | Forme produite |
+|---|---|---|---|
+| `_recompute_duidx` | DuIdx | `_duidx_path_key`, `_duidx_sort_key`, `_duidx_merge` (mode groupé, `pattern` en `'préfixe/*'`/`'*'`) et l'agrégation par `change_type` de `_duidx_collect_global` (mode global) — mêmes constantes `_DUIDX_TYPE_ORDER`/`_DUIDX_COL_KEYS`/`_DUIDX_COL_NAMES` dupliquées côté WWW | Même forme JSON que `duidx(as_json=True)` (`rows`/`total`, groupé ou global selon `pattern`), plus `borghelper_version` |
+| `_recompute_idxtop` | IdxTop | `get_prefix()` + `stats[pfx]` + `sorted(...,key=count,reverse=True)[:topn]` de `idxtop()` | `{'borghelper_version','nick','depth','topn','total_count','total_size','rows':[{'prefix','count','size','pct'}]}` |
+| `_recompute_difftop` | DiffTop | `get_prefix()` + `stats[pfx]` + `sorted(...,key=total,reverse=True)[:topn]` de `difftop()` | `{'borghelper_version','nick','archive_old','archive_new','depth','topn','total_count','total_size','rows':[{'prefix','total','pct','added_n','added_size','removed_n','removed_size','modified_n','size'}]}` |
+
+Chaque fonction filtre d'abord les lignes brutes par `_path_in_scope`, **puis** reproduit
+l'algorithme de regroupement/tri/top-N — jamais l'inverse (un total/classement recalculé depuis
+l'ensemble non filtré puis tronqué serait déjà une fuite de volume). C'est ce qui garantit l'exigence
+de l'I/O Matrix du spec 1.4 : `topn` est appliqué sur l'ensemble **complet** filtré, pas sur une
+tranche pré-filtrée tronquée avant que le périmètre n'ait été appliqué (`IdxTop`/`DiffTop`
+n'envoient jamais `-N`/`-p` à l'appel brut — ces deux paramètres ne s'appliquent que côté WWW, sur
+les lignes déjà filtrées). Un `parsed` sans clé `'rows'` (ex. `{'error':...}`, `diff.db` absent, `-b`
+malformé, aucune paire indexée) passe inchangé — même convention de passthrough que
+`_filter_diffbkp`. Une paire d'archives (`DiffTop`) sans la moindre ligne dans le périmètre après
+filtrage produit naturellement `rows=[]`/totaux à `0`, jamais une erreur (I/O Matrix du spec 1.4).
+
+**Endpoints** (`duidx`/`idxtop`/`difftop`) : chacun appelle `_resolve_single_scope(request, nick)` ;
+`scoped_nick is not None` → branche `_run_scoped_raw(...)`, jamais `cacheable=True` ; sinon → branche
+`run_borghelper(...)` **strictement inchangée** (mêmes arguments qu'avant cette story) — garantit le
+byte-identical pour un appelant non restreint (vérifié en direct : diff byte-à-byte du texte et du
+JSON groupé `-j` existant de `DuIdx`, seule différence `borghelper_version` après le bump de
+version).
+
+**Cache** : même règle que Story 1.3, étendue à ces trois routes — `_run_scoped_raw()` appelle
+`_exec_borghelper()` directement, jamais `_RESPONSE_CACHE`.
 
 ### `GET /access` — liste des serveurs filtrée aux droits de l'utilisateur
 

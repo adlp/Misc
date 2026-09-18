@@ -523,12 +523,12 @@ sys.exit(0)
 | `indexsnap(nick, debug, db_path, force)` | Snapshot de la dernière archive — incrémental par défaut (force=True pour `borg list` complet) ; purge auto des snapshots anciens (IDX_SNAP_KEEP) |
 | `report(nicks, htrep, debug, maxp, as_json)` | Rapport avec appels borg |
 | `report_offline(nicks, htrep, debug, maxp, as_json)` | Rapport depuis diff.db uniquement — même résumé que `report`, toutes machines affichées même sans index |
-| `idxtop(nick, depth, topn, debug)` | Top N arborescences par nb d'entrées dans diff_index — diagnostiquer un diff.db volumineux |
-| `difftop(nick, bkp, depth, topn, debug)` | Top N arborescences par changements sur une paire d'archives — diagnostiquer les changements d'un backup |
+| `idxtop(nick, depth, topn, debug, as_json)` | Top N arborescences par nb d'entrées dans diff_index — diagnostiquer un diff.db volumineux ; `as_json` (Story 1.4) : mode brut, une ligne par chemin (`{'nick','rows':[{'chemin','taille'}]}`), **sans** regroupement/top-N ni Exclus/Inchangés — `depth`/`topn` ignorés dans ce mode |
+| `difftop(nick, bkp, depth, topn, debug, as_json)` | Top N arborescences par changements sur une paire d'archives — diagnostiquer les changements d'un backup ; `as_json` (Story 1.4) : mode brut, une ligne par chemin (`{'nick','archive_old','archive_new','rows':[{'chemin','type','taille_avant','taille_apres'}]}`), **sans** regroupement/top-N ni Exclus/Inchangés — `depth`/`topn` ignorés dans ce mode |
 | `idxpurge(nick, pattern=None, dryrun, debug)` | Purge rétroactive de diff_index + snapshots anciens + VACUUM — sans pattern : lit IDX_EXCLUDE/IDX_INCLUDE depuis la config |
 | `search(nick, pattern, archive_from, archive_to, debug, as_json)` | Recherche par chemin — `as_json` : `{nick:[{date,archive,type,path,size_before,size_after},...]}` |
 | `filehist(nick, path, archive_from, archive_to, debug, as_json)` | Historique d'un chemin — `as_json` : `{nick:[{date,archive_before,archive_after,type,size_before,size_after},...]}` |
-| `duidx(nick, pattern, sort_by, reverse, as_json, ...)` | Résumé taille/type |
+| `duidx(nick, pattern, sort_by, reverse, as_json, archive_from, archive_to, debug, raw)` | Résumé taille/type ; `raw=True` (Story 1.4, distinct de `as_json` qui reste le mode groupé historique) : mode brut, une ligne par chemin (`{'pattern','rows':[{'chemin','type','taille'}]}`) |
 | `diffbkp(nick, bidun, bideux, debug, db_path, as_json)` | Différences entre deux archives — `+`/`-`/`=` par ligne, résumé compteurs ; `as_json` : `{archive_old,archive_new,entries:[...],n_add,n_rem,n_mod}` |
 | `restore(nick, bid, ftor, where, flat, debug)` | Restauration |
 | `listperms(nick, bid, ftor, debug)` | Liste droits fichiers sans restaurer |

@@ -9,6 +9,7 @@
 import os,re,sys,json,secrets,subprocess,configparser
 from pathlib import Path
 from typing import Optional
+from collections import defaultdict
 
 from fastapi import FastAPI, APIRouter, Header, HTTPException, Query, Request, Depends
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
@@ -20,7 +21,7 @@ from borgHelper import Version as BORGHELPER_VERSION, BorgRunner, BorgHelper
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.12.0"
+WWW_VERSION="1.13.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -576,6 +577,185 @@ def _filter_per_nick_listkey(results,scopes,list_key,item_path_key='full_path'):
         out[n]=val
     return out
 
+# ── Filtrage a posteriori DuIdx/IdxTop/DiffTop (Story 1.4) ──────────────────
+# Contrairement à Search/FileHist/LstBkpFls/DiffBkp/TreeHist/TreeFind (Story 1.3), ces trois
+# commandes groupent/agrègent déjà en Python (voire en SQL, pour DuIdx) AVANT de produire leur JSON
+# existant — filtrer ce JSON après coup serait incorrect (une frontière de périmètre peut tomber au
+# milieu d'un groupe déjà constitué, Intent du spec 1.4). borgHelper expose donc un mode BRUT,
+# ungroupé, par-chemin : `-R` pour DuIdx (dont le `-j` existant reste le mode groupé historique,
+# byte-identique, jamais touché ici) ; `-j` pour IdxTop/DiffTop, qui n'avaient aucun mode JSON avant
+# cette story. Les fonctions ci-dessous filtrent ces lignes brutes par périmètre PUIS reproduisent —
+# en miroir ligne-à-ligne de borgHelper au moment de l'écriture, jamais une réécriture "propre" — le
+# regroupement/tri/top-N que borgHelper applique lui-même (Design Notes du spec 1.4 : garder ce
+# mirroring littéral rend le contrôle de dérive tractable — diff les deux copies, jamais raisonner
+# sur une équivalence comportementale).
+#
+# DuIdx/IdxTop/DiffTop sont traités comme mono-nick pour le périmètre (comme LstBkpFls/DiffBkp en
+# Story 1.3) : jamais de filtrage/ré-agrégation multi-nick construit ici. `nick=ALL`/liste chez un
+# appelant scopé est refusé proprement (fail-closed, aucune donnée) plutôt que de tenter un
+# regroupement inter-nicks que cette story ne construit pas.
+
+def _resolve_single_scope(request,nick):
+    """`nick` développé via `_nick_list()` AVANT toute résolution de périmètre — jamais un
+    `cfgread('ALL')` direct, qui reviendrait à tort « illimité » (même piège que le Groupe A du
+    Triage Log de Story 1.3, pour `nick=ALL` avec un défaut de route). Retourne (None,None) si
+    l'appelant est illimité sur toute la liste (byte-identique à avant cette story, y compris pour
+    `nick=ALL`/multi-nick tel quel). Retourne (nick_unique, scope) si l'appelant est scopé et que la
+    requête ne porte que sur un seul nick réel. Lève HTTPException(400) si scopé + plusieurs nicks —
+    fail-closed, jamais de filtrage multi-nick approximatif ici."""
+    nicks=list(dict.fromkeys(_nick_list(nick)))
+    scopes=_resolve_scopes_for_request(request,nicks)
+    if not _any_scoped(scopes):
+        return None,None
+    if len(nicks)!=1:
+        raise HTTPException(400,detail="nick=ALL / plusieurs nicks non supporté pour un appelant à "
+            "périmètre restreint sur cette route")
+    return nicks[0],scopes[nicks[0]]
+
+def _run_scoped_raw(cmd,nick,extra_args,raw_flag,filter_fn,passphrase=None):
+    """Variante de `_run_scoped()` (Story 1.3) pour DuIdx/IdxTop/DiffTop : force `raw_flag` (mode brut
+    par-chemin) au lieu du `-j` générique de `_run_scoped()` — DuIdx a besoin de `-R` spécifiquement
+    puisque son `-j` existant reste le mode groupé historique. `filter_fn` reçoit le JSON brut parsé,
+    filtre par périmètre PUIS ré-agrège/re-classe (jamais l'inverse — Boundaries du spec 1.4 / AD-2).
+    Jamais mis en `_RESPONSE_CACHE` (même règle que `_run_scoped()`, AD-5)."""
+    args=list(extra_args)
+    if raw_flag not in args: args=args+[raw_flag]
+    result=_exec_borghelper(cmd,nick,args,passphrase)
+    if result.exitcode==0:
+        try:
+            parsed=json.loads(result.stdout)
+            result.stdout=json.dumps(filter_fn(parsed),ensure_ascii=False,indent=2)
+        except ValueError:
+            result.exitcode=1; result.stdout=''; result.stderr=(result.stderr or '')+"\n[borgHelperWWW] réponse non-JSON reçue pour un appelant à périmètre restreint — requête refusée."
+    return JSONResponse(status_code=200 if result.exitcode==0 else 400,content=result.dict())
+
+_DUIDX_TYPE_ORDER=['added','modified','removed','C','B','T','présent']  # miroir borgHelper:_DUIDX_TYPE_ORDER
+_DUIDX_COL_KEYS=['added','removed','présent']                            # miroir borgHelper:_DUIDX_COL_KEYS
+_DUIDX_COL_NAMES=['added/modif','removed','présent']                     # miroir borgHelper:_DUIDX_COL_NAMES
+
+def _duidx_path_key(path,depth):  # miroir borgHelper:_duidx_path_key
+    parts=path.split('/')
+    return '/'.join(parts[:depth+1]) if depth<len(parts) else path
+
+def _duidx_sort_key(pk,merged,sort_by,reverse):  # miroir borgHelper:_duidx_sort_key
+    if sort_by=='chemin': return pk
+    idx=_DUIDX_COL_KEYS.index(sort_by) if sort_by in _DUIDX_COL_KEYS else 0
+    sz=merged.get((pk,_DUIDX_COL_KEYS[idx]),[0,0])[1]
+    return -sz if reverse else sz
+
+def _parse_duidx_sort(sort):  # miroir de la normalisation `_du_sort`/`_du_rev` faite dans borgHelper:_cli_main()
+    du_sort=sort or 'chemin'
+    du_rev=du_sort.endswith(':desc')
+    du_sort=du_sort.replace(':asc','').replace(':desc','')
+    if du_sort not in ('chemin','added','removed','présent','present'): du_sort='chemin'
+    if du_sort=='present': du_sort='présent'
+    return du_sort,du_rev
+
+def _recompute_duidx(parsed,scope,pattern,sort):
+    """Filtre les lignes brutes DuIdx (`-R`) par périmètre puis reproduit `_duidx_print()`
+    (borgHelper) — mode groupé (`pattern` en 'préfixe/*' ou '*') ou global (`pattern` absent ou
+    littéral), même distinction que `duidx()` lui-même. `parsed` sans `rows` (ex. `{'error':...}`)
+    passe inchangé."""
+    if not isinstance(parsed,dict) or 'rows' not in parsed: return parsed
+    rows=[r for r in parsed['rows'] if _path_in_scope(r.get('chemin',''),scope)]
+    grouped=pattern is not None and ('/*' in pattern or pattern=='*')
+    if grouped:
+        prefix=pattern.rsplit('/*',1)[0] if '/*' in pattern else ''
+        depth=prefix.count('/')+1 if prefix else 0
+        sort_by,reverse=_parse_duidx_sort(sort)
+        merged={}
+        for r in rows:
+            pk=_duidx_path_key(r.get('chemin',''),depth)
+            ct=r.get('type')
+            eff='added' if ct in ('added','modified','C','B','T') else ct
+            k=(pk,eff)
+            if k not in merged: merged[k]=[0,0]
+            merged[k][0]+=1; merged[k][1]+=r.get('taille',0)
+        paths=sorted(set(pk for pk,_ in merged),
+                     key=lambda pk:_duidx_sort_key(pk,merged,sort_by,reverse),
+                     reverse=(reverse if sort_by!='chemin' else False))
+        totcol={ck:[0,0] for ck in _DUIDX_COL_KEYS}
+        rows_data=[]
+        for pk in paths:
+            entry={'chemin':pk}
+            for ck,cn in zip(_DUIDX_COL_KEYS,_DUIDX_COL_NAMES):
+                cnt,sz=merged.get((pk,ck),[0,0])
+                entry[cn]={'nb':cnt,'taille':sz}
+                totcol[ck][0]+=cnt; totcol[ck][1]+=sz
+            rows_data.append(entry)
+        return {'borghelper_version':parsed.get('borghelper_version'),'pattern':pattern,'rows':rows_data,
+                'total':{cn:{'nb':totcol[ck][0],'taille':totcol[ck][1]} for ck,cn in zip(_DUIDX_COL_KEYS,_DUIDX_COL_NAMES)}}
+    totals={}
+    for r in rows:
+        ct=r.get('type')
+        if ct not in totals: totals[ct]=[0,0]
+        totals[ct][0]+=1; totals[ct][1]+=r.get('taille',0)
+    order=_DUIDX_TYPE_ORDER
+    rows_data=[{'type':ct,'nb':cnt,'taille':sz} for ct,(cnt,sz) in
+               sorted(totals.items(),key=lambda x:(order.index(x[0]) if x[0] in order else 99))]
+    return {'borghelper_version':parsed.get('borghelper_version'),'pattern':pattern,'rows':rows_data,
+            'total':{'nb':sum(r['nb'] for r in rows_data),'taille':sum(r['taille'] for r in rows_data)}}
+
+def _idxtop_get_prefix(path,d):  # miroir borgHelper:idxtop().get_prefix / difftop().get_prefix (identiques)
+    if not path: return '(vide)'
+    leading='/' if path[0]=='/' else ''
+    parts=[p for p in path.split('/') if p]
+    if len(parts)<=d: return path
+    return leading+'/'.join(parts[:d])
+
+def _recompute_idxtop(parsed,scope,depth,topn):
+    """Filtre les lignes brutes IdxTop (`-j`) par périmètre puis reproduit le regroupement/tri/top-N
+    de `idxtop()` (borgHelper). Volontairement SANS `exclu_n`/`nfiles_d` (Exclus/Inchangés par
+    archive) : figures whole-nick sans colonne de chemin, non-scopables correctement — omises pour
+    tout appelant scopé (Boundaries du spec 1.4), jamais approximées."""
+    if not isinstance(parsed,dict) or 'rows' not in parsed: return parsed
+    rows=[r for r in parsed['rows'] if _path_in_scope(r.get('chemin',''),scope)]
+    stats=defaultdict(lambda:{'count':0,'size':0})
+    total_count=0; total_size=0
+    for r in rows:
+        pfx=_idxtop_get_prefix(r.get('chemin',''),depth)
+        sz=r.get('taille',0) or 0
+        stats[pfx]['count']+=1; stats[pfx]['size']+=sz
+        total_count+=1; total_size+=sz
+    top=sorted(stats.items(),key=lambda x:x[1]['count'],reverse=True)[:topn]
+    rows_out=[{'prefix':pfx,'count':s['count'],'size':s['size'],
+               'pct':(100*s['count']//total_count) if total_count else 0} for pfx,s in top]
+    return {'borghelper_version':parsed.get('borghelper_version'),'nick':parsed.get('nick'),'depth':depth,
+            'topn':topn,'total_count':total_count,'total_size':total_size,'rows':rows_out}
+
+def _recompute_difftop(parsed,scope,depth,topn):
+    """Filtre les lignes brutes DiffTop (`-j`) par périmètre puis reproduit le regroupement/tri/top-N
+    de `difftop()` (borgHelper). Une paire d'archives sans la moindre ligne dans le périmètre renvoie
+    naturellement `rows=[]`/totaux à 0 — jamais une erreur (I/O matrix du spec 1.4). Volontairement
+    SANS `exclu_n`/`nfiles_new` (Exclus/Inchangés), même raison que `_recompute_idxtop`."""
+    if not isinstance(parsed,dict) or 'rows' not in parsed: return parsed
+    rows=[r for r in parsed['rows'] if _path_in_scope(r.get('chemin',''),scope)]
+    stats=defaultdict(lambda:{'total':0,'added_n':0,'added_s':0,'removed_n':0,'removed_s':0,'modified_n':0,'size':0})
+    total_count=0; total_size=0
+    for r in rows:
+        pfx=_idxtop_get_prefix(r.get('chemin',''),depth)
+        s=stats[pfx]
+        s['total']+=1
+        sa=r.get('taille_apres',0) or 0; sb=r.get('taille_avant',0) or 0
+        sz=sa or sb or 0
+        s['size']+=sz
+        ct=r.get('type')
+        if ct=='added': s['added_n']+=1; s['added_s']+=sa
+        elif ct=='removed': s['removed_n']+=1; s['removed_s']+=sb
+        else: s['modified_n']+=1
+        total_count+=1; total_size+=sz
+    top=sorted(stats.items(),key=lambda x:x[1]['total'],reverse=True)[:topn]
+    rows_out=[]
+    for pfx,s in top:
+        pct=(100*s['total']//total_count) if total_count else 0
+        rows_out.append({'prefix':pfx,'total':s['total'],'pct':pct,
+                          'added_n':s['added_n'],'added_size':s['added_s'],
+                          'removed_n':s['removed_n'],'removed_size':s['removed_s'],
+                          'modified_n':s['modified_n'],'size':s['size']})
+    return {'borghelper_version':parsed.get('borghelper_version'),'nick':parsed.get('nick'),
+            'archive_old':parsed.get('archive_old'),'archive_new':parsed.get('archive_new'),
+            'depth':depth,'topn':topn,'total_count':total_count,'total_size':total_size,'rows':rows_out}
+
 # ── Téléchargements (accès borg direct, streaming binaire) ─────────────────────
 # Seule exception au principe "tout passe par borgHelper en sous-processus" : un téléchargement
 # doit streamer des octets bruts vers le navigateur, incompatible avec le pipe texte/JSON de
@@ -893,9 +1073,19 @@ def treefind(nick: str, request: Request, prefix: Optional[str]=None, pattern: O
     return run_borghelper('treefind',nick=nick,extra_args=extra,cacheable=True)
 
 @router.get("/duidx",response_model=CommandResult,tags=["lecture"])
-def duidx(nick: str, pattern: Optional[str]=None, sort: str="chemin", json_output: bool=Query(default=False,alias="json"),
+def duidx(nick: str, request: Request, pattern: Optional[str]=None, sort: str="chemin", json_output: bool=Query(default=False,alias="json"),
           archive_from: Optional[str]=None, archive_to: Optional[str]=None, x_api_key: Optional[str]=Header(default=None)):
+    """Réponse filtrée par périmètre (lignes brutes `-R` filtrées puis regroupées/re-triées comme
+    DuIdx lui-même) si l'appelant a un périmètre restreint sur `nick` (mono-nick pour le périmètre —
+    Story 1.4, comme LstBkpFls/DiffBkp en Story 1.3) ; identique à avant cette story sinon."""
     require_api_key(x_api_key)
+    scoped_nick,scope=_resolve_single_scope(request,nick)
+    if scoped_nick is not None:
+        extra=[]
+        if pattern: extra+=['-f',pattern]
+        if archive_from: extra+=['-b',archive_from]
+        if archive_to: extra+=['-B',archive_to]
+        return _run_scoped_raw('duidx',scoped_nick,extra,'-R',lambda data:_recompute_duidx(data,scope,pattern or None,sort))
     extra=[]
     if pattern: extra+=['-f',pattern]
     extra+=['-s',sort]
@@ -915,14 +1105,28 @@ def cacheclean(nick: str="ALL", x_api_key: Optional[str]=Header(default=None)):
     return run_borghelper('cacheclean',nick=nick)
 
 @router.get("/idxtop",response_model=CommandResult,tags=["lecture"])
-def idxtop(nick: str="ALL", topn: int=20, depth: int=3, x_api_key: Optional[str]=Header(default=None)):
+def idxtop(request: Request, nick: str="ALL", topn: int=20, depth: int=3, x_api_key: Optional[str]=Header(default=None)):
+    """Réponse filtrée par périmètre (lignes brutes `-j` filtrées puis regroupées/classées comme
+    IdxTop lui-même) si l'appelant a un périmètre restreint sur `nick` (mono-nick pour le périmètre,
+    comme DuIdx — Story 1.4) ; identique à avant cette story sinon."""
     require_api_key(x_api_key)
+    scoped_nick,scope=_resolve_single_scope(request,nick)
+    if scoped_nick is not None:
+        return _run_scoped_raw('idxtop',scoped_nick,[],'-j',lambda data:_recompute_idxtop(data,scope,depth,topn))
     return run_borghelper('idxtop',nick=nick,extra_args=['-N',str(topn),'-p',str(depth)],cacheable=True)
 
 @router.get("/difftop",response_model=CommandResult,tags=["lecture"])
-def difftop(nick: str="ALL", bid: Optional[str]=None, topn: int=10, depth: int=3,
+def difftop(request: Request, nick: str="ALL", bid: Optional[str]=None, topn: int=10, depth: int=3,
             x_api_key: Optional[str]=Header(default=None)):
+    """Réponse filtrée par périmètre (lignes brutes `-j` filtrées puis regroupées/classées comme
+    DiffTop lui-même) si l'appelant a un périmètre restreint sur `nick` (mono-nick pour le périmètre,
+    comme DuIdx/IdxTop — Story 1.4) ; identique à avant cette story sinon. Une paire d'archives sans
+    la moindre ligne dans le périmètre renvoie un résultat vide (`rows=[]`), jamais une erreur."""
     require_api_key(x_api_key)
+    scoped_nick,scope=_resolve_single_scope(request,nick)
+    if scoped_nick is not None:
+        extra=['-b',bid] if bid else []
+        return _run_scoped_raw('difftop',scoped_nick,extra,'-j',lambda data:_recompute_difftop(data,scope,depth,topn))
     extra=['-N',str(topn),'-p',str(depth)]
     if bid: extra+=['-b',bid]
     return run_borghelper('difftop',nick=nick,extra_args=extra,cacheable=True)

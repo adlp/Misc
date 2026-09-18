@@ -1,5 +1,69 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.96 + borgHelperWWW 1.13.0 — filtrage par périmètre sur DuIdx/IdxTop/DiffTop (Epic 1, Story 1.4) — 2026-09-19
+
+Quatrième brique de la consultation scopée par arborescence (Epic 1) : le périmètre de chemin
+étend maintenant aux trois commandes d'**agrégats** (`DuIdx`/`IdxTop`/`DiffTop`) le filtrage déjà
+en place depuis Story 1.3 sur les six commandes de liste/recherche — les neuf routes liées à AD-1
+sont désormais toutes couvertes.
+
+- Ces trois commandes groupent/agrègent déjà (Python, voire SQL pour `DuIdx`) **avant** de produire
+  leur JSON existant — filtrer ce JSON après coup serait incorrect (une frontière de périmètre peut
+  tomber au milieu d'un groupe déjà constitué). `borgHelper` gagne donc un mode **brut**, ungroupé,
+  une ligne JSON par chemin, distinct du JSON groupé existant : `-R` pour `DuIdx` (son `-j` existant
+  reste le mode groupé historique, byte-identique, jamais touché) ; `-j` pour `IdxTop`/`DiffTop`,
+  qui n'avaient aucun mode JSON avant cette story. `borgHelper` reste RBAC-ignorant (AD-3) : ce mode
+  brut est une option de sortie générique, jamais scope/groupe-aware.
+- Quand l'appelant est scopé, `borgHelperWWW` demande ce mode brut, retire les lignes hors
+  périmètre, puis **recalcule lui-même** — en miroir ligne-à-ligne de l'algorithme de regroupement
+  de `borgHelper` au moment de l'écriture — le regroupement/tri/top-N (`_recompute_duidx`,
+  `_recompute_idxtop`, `_recompute_difftop`) : jamais un total/classement transmis depuis le calcul
+  non filtré puis partiellement masqué. `topn` s'applique sur l'ensemble **complet** filtré, jamais
+  sur une tranche tronquée avant filtrage.
+- Les figures « Exclus » (`IDX_EXCLUDE`) et « Inchangés par archive » (dérivées de `nfiles`) sont
+  des figures portant sur le **nick entier**, sans colonne de chemin — non scopables correctement —
+  et sont donc **omises** pour tout appelant scopé, jamais approximées.
+- `DuIdx`/`IdxTop`/`DiffTop` sont traitées **mono-nick** pour le périmètre (comme `LstBkpFls`/
+  `DiffBkp` en Story 1.3) : `nick` est développé via `_nick_list()` avant résolution du périmètre
+  (jamais `cfgread('ALL')` direct) ; un appelant scopé sur `nick=ALL`/plusieurs nicks est refusé
+  (`400`, aucune donnée) plutôt que de tenter un regroupement inter-nicks que cette story ne
+  construit pas. Une paire d'archives (`DiffTop`) sans la moindre ligne dans le périmètre renvoie un
+  résultat vide (`rows: []`), jamais une erreur.
+- Un appelant sans restriction (admin, ou autorisation par groupes désactivée) ne voit **aucun**
+  changement : texte/JSON groupé existant byte-identique à avant cette story.
+- `_RESPONSE_CACHE` étendu (Story 1.3) aux trois nouvelles routes : contourné entièrement dès qu'un
+  périmètre restreint s'applique, comme pour les six commandes précédentes.
+- `borgHelper` 1.0.95 → **1.0.96** ; `borgHelperWWW` 1.12.0 → **1.13.0**.
+
+Vérifié en conditions réelles contre `demo.borghelperrc` : `python3 -m py_compile` propre ; sortie
+texte de `DuIdx`/`IdxTop`/`DiffTop` et JSON groupé existant (`-j`) de `DuIdx` diffées byte-à-byte
+contre la sortie d'avant cette story (seule différence : le numéro de version après le bump) ;
+lignes `diff_index` synthétiques insérées temporairement sous deux préfixes noyau distincts pour
+exercer un cas réel de filtrage (données réelles du dépôt de démo sans diff exploitable entre les
+dernières archives indexées) — `borgHelperWWW` lancé avec `--groups-header X-Groups`, `ops-readers`
+scopé sur un sous-répertoire de `demo-modules` : `DuIdx` (modes groupé et global), `IdxTop`,
+`DiffTop` ne renvoient que les lignes du sous-répertoire, totaux/pourcentages recalculés
+correctement depuis l'ensemble filtré (confirmé par comparaison ligne à ligne avec la réponse admin
+non filtrée) ; paire d'archives sans ligne en périmètre → résultat vide, `200`, pas d'erreur ;
+`nick=ALL` scopé → `400`, aucune donnée. Configuration et lignes de test entièrement retirées après
+vérification (`git checkout -- demo.borghelperrc`, lignes `diff_index` supprimées).
+
+`README.md`/`TECHNICAL.md`/`LIBRARY.md` mis à jour (mécanisme de filtrage par mode brut + recalcul,
+traitement mono-nick, options CLI `-R`/`-j`, retrait du caveat « `DuIdx`/`IdxTop`/`DiffTop` non
+filtrés » de Story 1.3).
+
+**Risque signalé, non corrigé dans cette story** : `_check_group_access` ne vérifie le tier que si
+`nick` figure littéralement dans la query string de la requête HTTP — un appel à `/idxtop` ou
+`/difftop` **sans aucun `?nick=`** (ces deux routes ont un défaut de route `nick="ALL"`) contourne
+donc la vérification de tier grossière. Angle mort **pré-existant** (présent avant cette story, non
+introduit par elle — `/cacheinfo`, `/cacheclean`, `/idxpurge` partagent le même défaut `nick="ALL"`
+et le même angle mort, hors périmètre de Story 1.3/1.4). `_resolve_single_scope()` de cette story ne
+le comble que par accident pour un appelant scopé sur au moins un nick réel (son propre refus
+multi-nick s'applique avant toute lecture) ; un appelant sans **aucun** tier sur aucun nick resterait
+exposé. Non corrigé ici : modifier `_check_group_access` est hors des limites frozen du spec 1.4, et
+un correctif confiné à `IdxTop`/`DiffTop` serait incohérent avec les autres routes touchées par le
+même angle mort — signalé pour triage humain/architecture (voir TECHNICAL.md).
+
 ## borgHelperWWW 1.12.0 — filtrage par périmètre sur Search/FileHist/LstBkpFls/DiffBkp/TreeHist/TreeFind (Epic 1, Story 1.3) — 2026-09-18
 
 Troisième brique de la consultation scopée par arborescence (Epic 1) : le périmètre de chemin
