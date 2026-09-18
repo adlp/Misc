@@ -664,3 +664,53 @@ DSN lu dans l'ordre :
 1. Variable d'environnement `BORGHELPERC_SENTRY_DSN`
 2. Fichier pointé par `BORGHELPERC_SENTRY_FILE`
 3. Fichier `/usr/local/etc/borghelper-sentry`
+
+---
+
+## borgHelperWWW — IP client réelle derrière un reverse proxy (`FORWARDED_ALLOW_IPS`)
+
+`borgHelperWWW` se lance de deux façons, chacune avec sa propre mécanique pour faire remonter l'IP
+client réelle (`X-Forwarded-For`) dans les logs d'accès et `Request.client.host` plutôt que l'IP TCP
+brute du reverse proxy :
+
+### Exécution directe (`python3 borgHelperWWW ...`)
+
+Le code appelle explicitement `uvicorn.run(app, ..., proxy_headers=True, forwarded_allow_ips=...)` —
+`forwarded_allow_ips` vient de `os.environ.get('BORGHELPERWWW_TRUSTED_PROXIES', '127.0.0.1')`, lui-même
+alimenté par l'option CLI `--trusted-proxies` (voir README.md, section « Derrière un reverse proxy »).
+Ce chemin ne lit **pas** la variable `FORWARDED_ALLOW_IPS` native d'uvicorn — c'est
+`BORGHELPERWWW_TRUSTED_PROXIES` qui fait foi ici, propre au projet, pour rester cohérent avec le
+préfixe `BORGHELPERWWW_*` des autres réglages (`BORGHELPERWWW_HOST`, `BORGHELPERWWW_PORT`, etc.).
+
+### Lancement externe (`uvicorn borgHelperWWW:app ...`)
+
+Ici, uvicorn possède seul `sys.argv` et son propre cycle de vie — le code Python de `borgHelperWWW`
+n'a plus la main sur la construction du serveur, donc `BORGHELPERWWW_TRUSTED_PROXIES` est **sans
+effet**. C'est le mécanisme natif d'uvicorn qui s'applique directement :
+
+- `proxy_headers` : **activé par défaut** dans uvicorn (`Config.__init__`, paramètre
+  `proxy_headers: bool = True`) — pas besoin de le passer explicitement, mais l'option CLI
+  `--proxy-headers` / `--no-proxy-headers` permet de l'activer/désactiver explicitement.
+- `forwarded_allow_ips` : résolu ainsi par uvicorn (`uvicorn/config.py`, `Config.__init__`) —
+  ```python
+  if forwarded_allow_ips is None:
+      self.forwarded_allow_ips = os.environ.get("FORWARDED_ALLOW_IPS", "127.0.0.1")
+  else:
+      self.forwarded_allow_ips = forwarded_allow_ips
+  ```
+  Donc, par ordre de priorité : l'option CLI `--forwarded-allow-ips <ip/cidr[,ip/cidr...]|*>` si
+  fournie, sinon la variable d'environnement **native** `FORWARDED_ALLOW_IPS` (sans préfixe
+  `BORGHELPERWWW_`), sinon `127.0.0.1` par défaut — le même défaut que le chemin d'exécution directe,
+  ce qui rend le comportement identique dans les deux modes de lancement **sans configuration
+  supplémentaire** tant que le reverse proxy tourne sur la même machine (le cas le plus courant).
+- La connexion TCP brute doit elle-même provenir d'une IP listée dans `forwarded_allow_ips` pour que
+  son `X-Forwarded-For` soit pris en compte — sinon l'IP de connexion réelle est conservée telle
+  quelle (protection contre l'usurpation d'IP par un client qui forgerait ce header lui-même).
+
+Exemple, reverse proxy sur un hôte distinct :
+```bash
+export FORWARDED_ALLOW_IPS=10.0.0.5
+uvicorn borgHelperWWW:app --host 0.0.0.0 --port 8000 --workers 2
+# ou, équivalent, sans variable d'environnement :
+uvicorn borgHelperWWW:app --host 0.0.0.0 --port 8000 --workers 2 --forwarded-allow-ips 10.0.0.5
+```
