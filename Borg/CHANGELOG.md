@@ -1,5 +1,18 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.4.0 — IP client réelle dans les logs derrière un reverse proxy — 2026-09-18
+
+`uvicorn.run()` (exécution directe `python3 borgHelperWWW ...`) appelé désormais avec
+`proxy_headers=True` (déjà le défaut uvicorn, rendu explicite) et `forwarded_allow_ips=` réglable via
+la nouvelle option `--trusted-proxies` / variable `BORGHELPERWWW_TRUSTED_PROXIES` (défaut `127.0.0.1`,
+même défaut qu'uvicorn) : les logs d'accès affichent l'IP client réelle (`X-Forwarded-For`) plutôt que
+celle du reverse proxy, **uniquement** si la connexion TCP brute provient d'une IP de confiance
+(sinon un client pourrait usurper son IP en forgeant lui-même ce header). Vérifié de bout en bout :
+`X-Forwarded-For` spoofé depuis une IP de confiance (127.0.0.1, défaut) → apparaît dans le log ; même
+en-tête depuis une IP explicitement exclue de `--trusted-proxies` → ignoré, IP réelle du client TCP
+loggée. Lancement via `uvicorn borgHelperWWW:app ...` externe : options natives uvicorn
+`--proxy-headers`/`--forwarded-allow-ips` (déjà fonctionnelles, aucun changement nécessaire côté code).
+
 ## borgHelperWWW 1.3.0 — clé API générée automatiquement si absente — 2026-09-18
 
 `borgHelperWWW` ne refuse plus de démarrer faute de clé API (`-K`/`--api-key`/`BORGHELPERWWW_API_KEY`) :

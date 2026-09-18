@@ -20,7 +20,7 @@ from borgHelper import Version as BORGHELPER_VERSION, BorgRunner, BorgHelper
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.3.0"
+WWW_VERSION="1.4.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -38,6 +38,9 @@ if __name__=='__main__':
     _p.add_argument('--timeout',type=int,help="Timeout par commande en secondes, 0=illimité (déf. BORGHELPERWWW_TIMEOUT)")
     _p.add_argument('--host',help="Adresse d'écoute (déf. BORGHELPERWWW_HOST, sinon 127.0.0.1)")
     _p.add_argument('--port',type=int,help="Port d'écoute (déf. BORGHELPERWWW_PORT, sinon 8000)")
+    _p.add_argument('--trusted-proxies',help="IP/CIDR des reverse proxies dont X-Forwarded-For est pris en "
+                     "compte pour l'IP client réelle dans les logs, séparées par des virgules, ou '*' pour "
+                     "toutes (déf. BORGHELPERWWW_TRUSTED_PROXIES, sinon 127.0.0.1 — même défaut qu'uvicorn)")
     _args=_p.parse_args()
     if _args.cfgfile: os.environ['BORGHELPERWWW_CFGFILE']=_args.cfgfile
     if _args.api_key: os.environ['BORGHELPERWWW_API_KEY']=_args.api_key
@@ -45,6 +48,7 @@ if __name__=='__main__':
     if _args.timeout is not None: os.environ['BORGHELPERWWW_TIMEOUT']=str(_args.timeout)
     if _args.host: os.environ['BORGHELPERWWW_HOST']=_args.host
     if _args.port is not None: os.environ['BORGHELPERWWW_PORT']=str(_args.port)
+    if _args.trusted_proxies: os.environ['BORGHELPERWWW_TRUSTED_PROXIES']=_args.trusted_proxies
 
 BORGHELPER_BIN=Path(os.environ.get('BORGHELPERWWW_BORGHELPER_BIN',Path(__file__).resolve().parent/'borgHelper'))
 CFGFILE=os.environ.get('BORGHELPERWWW_CFGFILE')
@@ -436,5 +440,10 @@ def idxpurge(nick: str="ALL", pattern: Optional[str]=None, dryrun: bool=False,
 
 if __name__=='__main__':
     import uvicorn
+    # proxy_headers=True (déjà le défaut uvicorn) : IP client réelle (X-Forwarded-For) dans les logs
+    # d'accès et scope["client"], mais seulement si la connexion vient d'une IP de confiance —
+    # forwarded_allow_ips, sinon un client pourrait usurper son IP en forgeant ce header lui-même.
     uvicorn.run(app,host=os.environ.get('BORGHELPERWWW_HOST','127.0.0.1'),
-                port=int(os.environ.get('BORGHELPERWWW_PORT','8000')))
+                port=int(os.environ.get('BORGHELPERWWW_PORT','8000')),
+                proxy_headers=True,
+                forwarded_allow_ips=os.environ.get('BORGHELPERWWW_TRUSTED_PROXIES','127.0.0.1'))

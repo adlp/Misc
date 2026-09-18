@@ -668,12 +668,30 @@ Deux façons de configurer, selon le mode de lancement :
 | `BORGHELPERWWW_TIMEOUT` | `--timeout` | Timeout en secondes par commande (défaut 3600 ; 0 = illimité) |
 | `BORGHELPERWWW_HOST` | `--host` | Bind — adresse (défaut `127.0.0.1`) |
 | `BORGHELPERWWW_PORT` | `--port` | Bind — port (défaut `8000`) |
+| `BORGHELPERWWW_TRUSTED_PROXIES` | `--trusted-proxies` | IP/CIDR des reverse proxies de confiance, séparées par des virgules, ou `*` pour toutes (défaut `127.0.0.1` — voir ci-dessous) |
 
 Le serveur refuse de démarrer si le fichier de conf est absent (ni option ni variable). La clé API,
 elle, n'est **pas requise** : si absente (ni `-K`/`--api-key` ni `BORGHELPERWWW_API_KEY`),
 `borgHelperWWW` en génère une aléatoirement (`secrets.token_urlsafe(32)`) et l'affiche sur **stderr** au
 démarrage — pratique en dev/démo, mais cette clé est **perdue au redémarrage** (pas persistée) : pour
 une clé stable, la fournir explicitement.
+
+#### Derrière un reverse proxy — IP client réelle dans les logs
+
+`uvicorn.run(..., proxy_headers=True, forwarded_allow_ips=...)` (exécution directe
+`python3 borgHelperWWW ...`) : l'IP client des logs d'accès (`INFO: <ip>:<port> - "GET ..."`) est prise
+depuis l'en-tête `X-Forwarded-For` **plutôt que** l'IP de connexion TCP brute — mais **seulement** si
+cette connexion TCP brute (le reverse proxy lui-même) figure dans `BORGHELPERWWW_TRUSTED_PROXIES` /
+`--trusted-proxies` (défaut `127.0.0.1`, comme uvicorn lui-même — couvre le cas le plus courant : proxy
+sur la même machine). Un client qui ne passe pas par une IP de confiance ne peut donc pas usurper son IP
+en forgeant lui-même ce header. Élargir avec l'IP (ou le CIDR) réel du reverse proxy si celui-ci
+n'écoute pas sur `127.0.0.1` (conteneur séparé, load-balancer distant, etc.) ; `*` fait confiance à
+n'importe quelle IP amont (à réserver aux réseaux internes fermés).
+
+Avec `uvicorn borgHelperWWW:app ...` (lancement externe) : utiliser directement les options natives
+d'uvicorn `--proxy-headers` (activé par défaut) et `--forwarded-allow-ips <ip/cidr>`, ou la variable
+d'environnement `FORWARDED_ALLOW_IPS` — `BORGHELPERWWW_TRUSTED_PROXIES` n'est lue que par l'exécution
+directe.
 
 - **`uvicorn borgHelperWWW:app`** : uvicorn importe le module et possède seul `sys.argv` — seules les
   variables d'environnement sont lues, pas d'options CLI possibles ici.
