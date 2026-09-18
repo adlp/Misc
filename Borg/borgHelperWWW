@@ -6,7 +6,7 @@
 #* See <http://www.gnu.org/licenses/>
 #*/
 
-import os,re,sys,secrets,subprocess
+import os,re,sys,secrets,subprocess,configparser
 from pathlib import Path
 from typing import Optional
 
@@ -20,7 +20,7 @@ from borgHelper import Version as BORGHELPER_VERSION, BorgRunner, BorgHelper
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.4.0"
+WWW_VERSION="1.5.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -32,9 +32,14 @@ WWW_VERSION="1.4.0"
 if __name__=='__main__':
     import argparse
     _p=argparse.ArgumentParser(prog='borgHelperWWW',description="API HTTP FastAPI pour borgHelper")
+    _p.add_argument('--conf',help="Fichier de conf borgHelperWWW (ini) — comble les réglages absents de "
+                     "la ligne de commande/l'environnement (déf. BORGHELPERWWW_CONF, voir "
+                     "borghelperwww.conf.example)")
     _p.add_argument('-C','--cfgfile',help="Chemin vers le .borghelperrc dédié à l'API (déf. BORGHELPERWWW_CFGFILE)")
     _p.add_argument('-K','--api-key',help="Clé partagée attendue dans X-API-Key (déf. BORGHELPERWWW_API_KEY)")
     _p.add_argument('--borghelper-bin',help="Chemin du script borgHelper (déf. BORGHELPERWWW_BORGHELPER_BIN)")
+    _p.add_argument('--ui-file',help="Chemin de borgHelperWWW_ui.html (déf. BORGHELPERWWW_UI_FILE, sinon à "
+                     "côté du script)")
     _p.add_argument('--timeout',type=int,help="Timeout par commande en secondes, 0=illimité (déf. BORGHELPERWWW_TIMEOUT)")
     _p.add_argument('--host',help="Adresse d'écoute (déf. BORGHELPERWWW_HOST, sinon 127.0.0.1)")
     _p.add_argument('--port',type=int,help="Port d'écoute (déf. BORGHELPERWWW_PORT, sinon 8000)")
@@ -42,13 +47,35 @@ if __name__=='__main__':
                      "compte pour l'IP client réelle dans les logs, séparées par des virgules, ou '*' pour "
                      "toutes (déf. BORGHELPERWWW_TRUSTED_PROXIES, sinon 127.0.0.1 — même défaut qu'uvicorn)")
     _args=_p.parse_args()
+    if _args.conf: os.environ['BORGHELPERWWW_CONF']=_args.conf
     if _args.cfgfile: os.environ['BORGHELPERWWW_CFGFILE']=_args.cfgfile
     if _args.api_key: os.environ['BORGHELPERWWW_API_KEY']=_args.api_key
     if _args.borghelper_bin: os.environ['BORGHELPERWWW_BORGHELPER_BIN']=_args.borghelper_bin
+    if _args.ui_file: os.environ['BORGHELPERWWW_UI_FILE']=_args.ui_file
     if _args.timeout is not None: os.environ['BORGHELPERWWW_TIMEOUT']=str(_args.timeout)
     if _args.host: os.environ['BORGHELPERWWW_HOST']=_args.host
     if _args.port is not None: os.environ['BORGHELPERWWW_PORT']=str(_args.port)
     if _args.trusted_proxies: os.environ['BORGHELPERWWW_TRUSTED_PROXIES']=_args.trusted_proxies
+
+# ── Fichier de conf borgHelperWWW (BORGHELPERWWW_CONF, optionnel) ──────────────────────────
+# Ini simple, section [borgHelperWWW] (ou clés en [DEFAULT]) : comble les BORGHELPERWWW_* absentes
+# de l'environnement à ce stade (CLI direct ci-dessus, ou variables déjà présentes, priment donc
+# toujours sur le fichier). Fonctionne dans les deux modes de lancement (direct et `uvicorn
+# borgHelperWWW:app`), puisque seule une variable d'environnement (BORGHELPERWWW_CONF) y mène.
+_CONF_KEYS={'cfgfile':'BORGHELPERWWW_CFGFILE','api_key':'BORGHELPERWWW_API_KEY',
+            'borghelper_bin':'BORGHELPERWWW_BORGHELPER_BIN','ui_file':'BORGHELPERWWW_UI_FILE',
+            'timeout':'BORGHELPERWWW_TIMEOUT','host':'BORGHELPERWWW_HOST','port':'BORGHELPERWWW_PORT',
+            'trusted_proxies':'BORGHELPERWWW_TRUSTED_PROXIES'}
+_conf_path=os.environ.get('BORGHELPERWWW_CONF')
+if _conf_path:
+    if not os.path.isfile(_conf_path):
+        sys.exit(f"Fichier de conf borgHelperWWW introuvable : {_conf_path}")
+    _cp=configparser.ConfigParser()
+    _cp.read(_conf_path)
+    _sect=_cp['borgHelperWWW'] if _cp.has_section('borgHelperWWW') else _cp['DEFAULT']
+    for _key,_envvar in _CONF_KEYS.items():
+        if _envvar not in os.environ and _key in _sect:
+            os.environ[_envvar]=_sect[_key]
 
 BORGHELPER_BIN=Path(os.environ.get('BORGHELPERWWW_BORGHELPER_BIN',Path(__file__).resolve().parent/'borgHelper'))
 CFGFILE=os.environ.get('BORGHELPERWWW_CFGFILE')
@@ -233,9 +260,9 @@ def download_tar(nick: str, prefix: Optional[str]=None, bid: Optional[str]=None,
 # puis détail par serveur avec passphrase de session + actions. Aucun secret n'est
 # embarqué dans ce HTML — l'authentification se fait côté client via fetch() une fois
 # la page chargée, donc cette route reste volontairement non protégée par X-API-Key.
-_UI_FILE=Path(__file__).resolve().parent/'borgHelperWWW_ui.html'
+_UI_FILE=Path(os.environ.get('BORGHELPERWWW_UI_FILE') or (Path(__file__).resolve().parent/'borgHelperWWW_ui.html'))
 if not _UI_FILE.is_file():
-    sys.exit(f"Interface web introuvable ({_UI_FILE})")
+    sys.exit(f"Interface web introuvable ({_UI_FILE}) — --ui-file ou BORGHELPERWWW_UI_FILE pour surcharger")
 _UI_HTML=_UI_FILE.read_text(encoding='utf-8')
 _UI_VERSION_MATCH=re.search(r'<!--\s*UI_VERSION:\s*(\S+)',_UI_HTML)
 UI_VERSION=_UI_VERSION_MATCH.group(1) if _UI_VERSION_MATCH else 'inconnue'

@@ -1,5 +1,22 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.5.0 — fichier de conf dédié (`BORGHELPERWWW_CONF`) — 2026-09-18
+
+Nouveau fichier de conf ini pour `borgHelperWWW` lui-même (`BORGHELPERWWW_CONF` / `--conf`), distinct
+du `.borghelperrc` qu'il exécute — un seul fichier peut désormais regrouper tous ses réglages :
+`cfgfile`, `api_key`, `borghelper_bin`, `ui_file`, `timeout`, `host`, `port`, `trusted_proxies`.
+Priorité : option CLI > variable d'environnement déjà présente > fichier de conf > défaut — le fichier
+ne comble que ce qui n'est pas déjà réglé autrement, et fonctionne dans les deux modes de lancement
+(exécution directe et `uvicorn borgHelperWWW:app` externe, via la variable d'environnement).
+
+Nouveau réglage `BORGHELPERWWW_UI_FILE` / `--ui-file` / clé `ui_file` : chemin de
+`borgHelperWWW_ui.html` désormais surchargeable (jusqu'ici toujours à côté du script, sans option).
+
+Fichier `borghelperwww.conf.example` ajouté (toutes les clés documentées, commentées par défaut).
+Vérifié de bout en bout : `cfgfile`/`api_key`/`port`/`timeout` depuis le fichier → serveur démarre et
+répond avec la clé du fichier sur le port du fichier ; option CLI (`--port`) prioritaire sur la même
+clé dans le fichier ; `--ui-file` sert bien un fichier HTML alternatif.
+
 ## borgHelperWWW 1.4.0 — IP client réelle dans les logs derrière un reverse proxy — 2026-09-18
 
 `uvicorn.run()` (exécution directe `python3 borgHelperWWW ...`) appelé désormais avec

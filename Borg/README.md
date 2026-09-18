@@ -658,23 +658,42 @@ pip install fastapi uvicorn pydantic
 
 ### Configuration
 
-Deux façons de configurer, selon le mode de lancement :
+Trois façons de configurer, cumulables — par ordre de priorité (la première présente l'emporte) :
 
-| Variable d'environnement | Option CLI (`python3 borgHelperWWW ...` uniquement) | Rôle |
-|---------------------------|-------------------------------------------------------|------|
-| `BORGHELPERWWW_CFGFILE` | `-C`, `--cfgfile` | **Requis.** `.borghelperrc` dédié à l'API (distinct de celui de l'admin CLI) |
-| `BORGHELPERWWW_API_KEY` | `-K`, `--api-key` | Clé partagée attendue dans le header `X-API-Key` — absente : **générée aléatoirement** au démarrage (voir ci-dessous) |
-| `BORGHELPERWWW_BORGHELPER_BIN` | `--borghelper-bin` | Chemin du script `borgHelper` (défaut : à côté de `borgHelperWWW`) |
-| `BORGHELPERWWW_TIMEOUT` | `--timeout` | Timeout en secondes par commande (défaut 3600 ; 0 = illimité) |
-| `BORGHELPERWWW_HOST` | `--host` | Bind — adresse (défaut `127.0.0.1`) |
-| `BORGHELPERWWW_PORT` | `--port` | Bind — port (défaut `8000`) |
-| `BORGHELPERWWW_TRUSTED_PROXIES` | `--trusted-proxies` | IP/CIDR des reverse proxies de confiance, séparées par des virgules, ou `*` pour toutes (défaut `127.0.0.1` — voir ci-dessous) |
+1. **Option CLI** (`python3 borgHelperWWW ...` en exécution directe uniquement — sous
+   `uvicorn borgHelperWWW:app`, uvicorn possède seul `sys.argv`)
+2. **Variable d'environnement** `BORGHELPERWWW_*` (marche dans les deux modes de lancement)
+3. **Fichier de conf** `BORGHELPERWWW_CONF` / `--conf` (ini, un seul fichier pour tous les réglages
+   ci-dessous — voir [`borghelperwww.conf.example`](borghelperwww.conf.example) ; comble uniquement
+   ce qui n'est pas déjà réglé par une option CLI ou une variable d'environnement)
 
-Le serveur refuse de démarrer si le fichier de conf est absent (ni option ni variable). La clé API,
-elle, n'est **pas requise** : si absente (ni `-K`/`--api-key` ni `BORGHELPERWWW_API_KEY`),
+| Variable d'environnement | Option CLI | Clé fichier de conf | Rôle |
+|---------------------------|------------|----------------------|------|
+| `BORGHELPERWWW_CONF` | `--conf` | — | Fichier de conf ini (voir ci-dessus) |
+| `BORGHELPERWWW_CFGFILE` | `-C`, `--cfgfile` | `cfgfile` | **Requis** (par un des trois moyens). `.borghelperrc` dédié à l'API (distinct de celui de l'admin CLI) |
+| `BORGHELPERWWW_API_KEY` | `-K`, `--api-key` | `api_key` | Clé partagée attendue dans le header `X-API-Key` — absente : **générée aléatoirement** au démarrage (voir ci-dessous) |
+| `BORGHELPERWWW_BORGHELPER_BIN` | `--borghelper-bin` | `borghelper_bin` | Chemin du script `borgHelper` (défaut : à côté de `borgHelperWWW`) |
+| `BORGHELPERWWW_UI_FILE` | `--ui-file` | `ui_file` | Chemin de `borgHelperWWW_ui.html` (défaut : à côté de `borgHelperWWW`) |
+| `BORGHELPERWWW_TIMEOUT` | `--timeout` | `timeout` | Timeout en secondes par commande (défaut 3600 ; 0 = illimité) |
+| `BORGHELPERWWW_HOST` | `--host` | `host` | Bind — adresse (défaut `127.0.0.1`) |
+| `BORGHELPERWWW_PORT` | `--port` | `port` | Bind — port (défaut `8000`) |
+| `BORGHELPERWWW_TRUSTED_PROXIES` | `--trusted-proxies` | `trusted_proxies` | IP/CIDR des reverse proxies de confiance, séparées par des virgules, ou `*` pour toutes (défaut `127.0.0.1` — voir ci-dessous) |
+
+Le serveur refuse de démarrer si le fichier de conf `.borghelperrc` (`cfgfile`) est absent (aucun des
+trois moyens ne l'a fourni). La clé API, elle, n'est **pas requise** : si absente partout,
 `borgHelperWWW` en génère une aléatoirement (`secrets.token_urlsafe(32)`) et l'affiche sur **stderr** au
 démarrage — pratique en dev/démo, mais cette clé est **perdue au redémarrage** (pas persistée) : pour
 une clé stable, la fournir explicitement.
+
+```bash
+# Un seul fichier de conf pour tout borgHelperWWW
+cp borghelperwww.conf.example /etc/borghelperwww.conf
+$EDITOR /etc/borghelperwww.conf          # cfgfile, api_key, host, port, …
+python3 borgHelperWWW --conf /etc/borghelperwww.conf
+# ou, pour uvicorn externe / systemd (fonctionne aussi en exécution directe) :
+export BORGHELPERWWW_CONF=/etc/borghelperwww.conf
+uvicorn borgHelperWWW:app --host 0.0.0.0 --port 8000 --workers 2
+```
 
 #### Derrière un reverse proxy — IP client réelle dans les logs
 
@@ -688,10 +707,25 @@ en forgeant lui-même ce header. Élargir avec l'IP (ou le CIDR) réel du revers
 n'écoute pas sur `127.0.0.1` (conteneur séparé, load-balancer distant, etc.) ; `*` fait confiance à
 n'importe quelle IP amont (à réserver aux réseaux internes fermés).
 
-Avec `uvicorn borgHelperWWW:app ...` (lancement externe) : utiliser directement les options natives
-d'uvicorn `--proxy-headers` (activé par défaut) et `--forwarded-allow-ips <ip/cidr>`, ou la variable
-d'environnement `FORWARDED_ALLOW_IPS` — `BORGHELPERWWW_TRUSTED_PROXIES` n'est lue que par l'exécution
-directe.
+Avec `uvicorn borgHelperWWW:app ...` (lancement externe) : `borgHelperWWW` ne construit plus le
+serveur lui-même — `BORGHELPERWWW_TRUSTED_PROXIES` (CLI, variable, ou clé `trusted_proxies` du fichier
+de conf) est **sans effet** dans ce mode. C'est le mécanisme natif d'uvicorn qui s'applique
+directement : `--proxy-headers` (activé par défaut) et
+`--forwarded-allow-ips <ip/cidr[,ip/cidr...]|*>`, sinon la variable d'environnement **native**
+`FORWARDED_ALLOW_IPS` (sans préfixe `BORGHELPERWWW_`), sinon `127.0.0.1` par défaut — même défaut que
+le mode d'exécution directe, donc même comportement dans les deux modes sans réglage supplémentaire
+tant que le reverse proxy tourne sur la même machine.
+
+```bash
+# reverse proxy sur un hôte distinct (10.0.0.5)
+export FORWARDED_ALLOW_IPS=10.0.0.5
+uvicorn borgHelperWWW:app --host 0.0.0.0 --port 8000 --workers 2
+# équivalent sans variable d'environnement :
+uvicorn borgHelperWWW:app --host 0.0.0.0 --port 8000 --workers 2 --forwarded-allow-ips 10.0.0.5
+```
+
+Détail de la résolution (code source uvicorn) et exemples supplémentaires : voir
+[TECHNICAL.md](TECHNICAL.md), section « borgHelperWWW — IP client réelle derrière un reverse proxy ».
 
 - **`uvicorn borgHelperWWW:app`** : uvicorn importe le module et possède seul `sys.argv` — seules les
   variables d'environnement sont lues, pas d'options CLI possibles ici.

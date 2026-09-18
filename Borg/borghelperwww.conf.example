@@ -1,0 +1,44 @@
+; borgHelperWWW — fichier de conf EXEMPLE (ini). Copier vers un chemin de votre choix, adapter, puis
+; pointer BORGHELPERWWW_CONF (ou --conf en exécution directe) dessus.
+;
+; Comble les réglages BORGHELPERWWW_* absents de la ligne de commande/l'environnement — ceux déjà
+; présents (option CLI en exécution directe, ou variable d'environnement déjà définie) priment
+; toujours sur ce fichier. Toutes les clés sont optionnelles ; seule `cfgfile` est en pratique requise
+; pour démarrer (sinon borgHelperWWW refuse de démarrer).
+;
+; ⚠️ Ce fichier peut contenir la clé API en clair (api_key) — le protéger comme .borghelperrc
+; (permissions restrictives, jamais commité avec de vraies valeurs).
+
+[borgHelperWWW]
+
+; .borghelperrc dédié à l'API (distinct de celui de l'admin CLI) — BORGHELPERWWW_CFGFILE / -C
+cfgfile = /etc/borghelperrc-www
+
+; Clé partagée attendue dans le header X-API-Key — BORGHELPERWWW_API_KEY / -K
+; Absente : borgHelperWWW en génère une aléatoirement au démarrage et l'affiche sur stderr
+; (pratique en dev/démo, perdue au redémarrage — pour une clé stable, la fournir explicitement).
+;api_key = change-me-with-a-long-random-string
+
+; Chemin du script borgHelper à exécuter en sous-processus — BORGHELPERWWW_BORGHELPER_BIN
+; Défaut : borgHelper à côté de borgHelperWWW.
+;borghelper_bin = /opt/borgHelper/borgHelper
+
+; Chemin de la page web (SPA) — BORGHELPERWWW_UI_FILE
+; Défaut : borgHelperWWW_ui.html à côté de borgHelperWWW.
+;ui_file = /opt/borgHelper/borgHelperWWW_ui.html
+
+; Timeout par commande en secondes, 0 = illimité — BORGHELPERWWW_TIMEOUT (défaut 3600)
+;timeout = 3600
+
+; Bind — adresse d'écoute (exécution directe uniquement, sans effet sous uvicorn externe) —
+; BORGHELPERWWW_HOST / --host (défaut 127.0.0.1)
+;host = 127.0.0.1
+
+; Bind — port d'écoute (exécution directe uniquement) — BORGHELPERWWW_PORT / --port (défaut 8000)
+;port = 8000
+
+; IP/CIDR des reverse proxies de confiance pour l'IP client réelle dans les logs (X-Forwarded-For),
+; séparées par des virgules, ou '*' pour toutes — BORGHELPERWWW_TRUSTED_PROXIES / --trusted-proxies
+; (exécution directe uniquement ; défaut 127.0.0.1, comme uvicorn lui-même — voir README.md,
+; section « Derrière un reverse proxy »)
+;trusted_proxies = 127.0.0.1

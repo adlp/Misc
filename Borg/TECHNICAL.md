@@ -667,6 +667,35 @@ DSN lu dans l'ordre :
 
 ---
 
+## borgHelperWWW — résolution de la configuration (`BORGHELPERWWW_CONF`)
+
+Trois couches, appliquées dans cet ordre (la première présente pour une clé donnée l'emporte, sans
+écraser une couche déjà appliquée) :
+
+1. **Options CLI** (`if __name__=='__main__':` — exécution directe uniquement) : chaque option
+   fournie écrit directement la variable d'environnement `BORGHELPERWWW_*` correspondante
+   (`os.environ[...]=...`), *avant* que quoi que ce soit d'autre ne s'exécute.
+2. **Variables d'environnement déjà présentes** (positionnées par le shell/systemd avant le
+   lancement du processus) : jamais écrasées par les couches suivantes.
+3. **Fichier de conf** (`BORGHELPERWWW_CONF`, ini, section `[borgHelperWWW]` ou clés en `[DEFAULT]`) :
+   lu par un bloc de code au niveau module (donc exécuté aussi bien en exécution directe que sous
+   `uvicorn borgHelperWWW:app`, puisqu'il ne dépend que d'une variable d'environnement, pas de
+   `sys.argv`). Pour chaque clé de `_CONF_KEYS` (`cfgfile`, `api_key`, `borghelper_bin`, `ui_file`,
+   `timeout`, `host`, `port`, `trusted_proxies`), n'écrit `os.environ[BORGHELPERWWW_X]` que si cette
+   variable n'existe **pas encore** — donc uniquement pour combler ce que les couches 1 et 2 n'ont pas
+   déjà fourni.
+
+Après ces trois couches, la résolution finale (`BORGHELPER_BIN=Path(os.environ.get(...))`,
+`CFGFILE=os.environ.get(...)`, etc.) relit simplement `os.environ`, inchangée depuis avant
+l'introduction du fichier de conf — la couche 3 n'est qu'un pré-remplissage de l'environnement, jamais
+consultée directement par la suite du code.
+
+`--host`/`--port`/`--trusted-proxies` (et leurs équivalents fichier de conf `host`/`port`/
+`trusted_proxies`) ne sont consommés que par le bloc `uvicorn.run()` en exécution directe — sans effet
+sous `uvicorn borgHelperWWW:app` externe (voir section suivante).
+
+---
+
 ## borgHelperWWW — IP client réelle derrière un reverse proxy (`FORWARDED_ALLOW_IPS`)
 
 `borgHelperWWW` se lance de deux façons, chacune avec sa propre mécanique pour faire remonter l'IP
