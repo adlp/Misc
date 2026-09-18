@@ -266,13 +266,13 @@ Code retour 2 si un dépôt est inaccessible.
 
 | Contexte | `modifications` | Exemple |
 |----------|----------------|---------|
-| Résumé (par hôte) | `XX%nb / YY%B` | `3%nb / 8%B` |
-| Détail (par archive) | `XX%nb / YY%B` | `5%nb / 12%B` |
+| Résumé (par hôte) | `XX%nb / Y.YY GB` | `3%nb / 1.37 GB` |
+| Détail (par archive) | `XX%nb / Y.YY GB` | `5%nb / 890 MB` |
 
 Formule (identique résumé et détail) :
 - dénominateur = état précédent = `nfiles − added + removed` (100%)
 - `XX%nb` = `100 × (modified + removed) / précédent` — % de fichiers modifiés ou supprimés
-- `YY%B` = même calcul sur les tailles disque
+- `Y.YY GB` = taille absolue lisible (`added_sz + modified_sz + removed_sz`), **pas** un pourcentage — `—` si nulle
 
 - `—` si l'archive n'est pas encore indexée
 
