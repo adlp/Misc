@@ -822,6 +822,76 @@ existante) peut ne pas encore exister — `cfgread` renvoie alors `None`, et le 
 `_default_section_groups()` (lecture brute de `[DEFAULT]` depuis `CFGFILE`, indépendamment de
 `_bh_paths`) plutôt que d'échouer.
 
+### Périmètre de chemin par groupe (`GROUPS_PATHS`, Story 1.1)
+
+Raffinement **orthogonal** au tier ci-dessus : réduit l'intérieur d'un tier déjà accordé, ne
+l'étend jamais et n'en remplace aucune logique — `_check_group_access`/`_effective_level` restent
+inchangés. Trois fonctions, dans l'ordre d'appel :
+
+**`_parse_groups_paths(raw)`** : parse la valeur brute `GROUPS_PATHS` (`'groupe:/a|/b,
+groupe2:/c'`) en `{groupe: [chemins...]}`. `:` sépare groupe et chemin(s), `|` sépare plusieurs
+chemins pour un même groupe, `,` sépare les groupes (`_GP_RESERVED_CHARS`). Lève `ValueError` si
+un nom de groupe ou un chemin contient l'un de ces trois caractères — **jamais** un résultat
+silencieusement mal découpé. Limite connue et acceptée : si une valeur mal formée contient une
+virgule/deux-points/pipe au point que les deux moitiés issues d'un split naïf ressemblent
+*chacune* à une entrée `groupe:/chemin` valide, l'erreur peut être manquée (pas de syntaxe
+d'échappement — décidé au niveau de `ARCHITECTURE-SPINE.md`, Deferred) ; cas jugé improbable pour
+des noms de groupes/chemins réellement choisis par un administrateur.
+
+**`_canonicalize_scope(prefixes)`** : dédoublonne, retire le `/` final, élimine tout préfixe déjà
+sous-chemin d'un préfixe plus large gardé. Trie d'abord (`sorted()`) — pour deux chaînes où l'une
+est un préfixe de chemin de l'autre, la plus courte trie toujours avant en ordre lexicographique,
+ce qui garantit qu'un ancêtre est toujours ajouté à `kept` avant ses descendants. **Racine `/`** :
+gérée par une sortie anticipée (`if '/' in cleaned: return ['/']`) plutôt que dans la boucle
+générale — `p.startswith(kept+'/')` deviendrait `p.startswith('//')` pour `kept=='/'`, qu'aucun
+chemin absolu ne commence jamais par `//`, donc la racine n'absorbait rien (bug trouvé en revue
+d'implémentation, iteration 1 : `_canonicalize_scope(['/', '/var/www'])` renvoyait
+`['/', '/var/www']` au lieu de `['/']`).
+
+**`_resolve_path_scope(user_groups, cfg)`** : miroir direct de `_effective_level` mais pour le
+périmètre — même signature, même provenance de `cfg` (`cfgread(nick)`, repli `[DEFAULT]` natif),
+strictement par nick. « Groupes correspondants » = `user_groups ∩ (GROUPS_ADMIN ∪ GROUPS_WRITE ∪
+GROUPS_READ)` de ce nick — un groupe de l'appelant qui n'a aucun tier sur ce nick n'a aucune
+influence sur son périmètre. Si l'un des groupes correspondants est absent de `GROUPS_PATHS`,
+retourne `None` (illimité) immédiatement, quels que soient les autres ; sinon retourne l'union
+canonicalisée des préfixes de tous les groupes correspondants scopés.
+
+⚠️ **`None` est ambigu — deux situations distinctes y mènent** : (1) l'appelant n'a **aucun tier**
+sur ce nick (`matching` vide, retour anticipé avant même d'appeler `_parse_groups_paths` — la
+question du périmètre n'a alors aucun sens, l'accès est déjà refusé ailleurs par le tier), et
+(2) l'appelant a un tier **et** un périmètre réellement illimité. Sans risque aujourd'hui dans
+`access()` (le `None` y est toujours appairé à `level`, qui gouverne déjà l'accès effectif), mais
+tout appelant futur qui réutiliserait `_resolve_path_scope` directement — le filtrage a posteriori
+des stories 1.3/1.4, prévu pour la réutiliser telle quelle — **doit vérifier le tier de l'appelant
+sur ce nick séparément avant d'interpréter un `None` comme « laisser tout passer »** ; l'ignorer
+accorderait par erreur un accès illimité à un appelant sans aucun droit sur le nick.
+
+⚠️ **Un nom de groupe mal orthographié dans `GROUPS_PATHS` résout silencieusement en périmètre
+illimité pour le vrai groupe** — conséquence directe, pas un bug, du choix déjà approuvé
+« absence de `GROUPS_PATHS` = illimité » (AD-3/AD-4) : si `GROUPS_READ` contient `web-team` mais
+que `GROUPS_PATHS` contient une entrée pour `web-tema` (faute de frappe), `_resolve_path_scope`
+ne trouve `web-team` scopé nulle part et lui accorde un périmètre illimité, sans avertissement —
+exactement comme un groupe qu'on aurait simplement oublié d'ajouter à `GROUPS_PATHS`. Même limite
+déjà acceptée aujourd'hui pour un nom mal orthographié dans `GROUPS_ADMIN/WRITE/READ` eux-mêmes
+(silencieusement inerte) ; pas de vérification d'existence/cohérence entre les quatre clefs.
+
+⚠️ **Fail-loud à chaque lecture, pas seulement au démarrage — mais uniquement pour un appelant
+qui détient déjà un tier sur le nick concerné** — décision explicite (option C du Spec Change Log
+de spec-1-1) : `BorgRunner.cfgread()` relit `.borghelperrc` depuis le disque à **chaque** appel
+(pas de cache config), donc un opérateur qui édite `GROUPS_PATHS` vers une valeur ambiguë
+**pendant que le process tourne** doit voir le prochain appel qui résout un périmètre pour ce nick
+échouer bruyamment — *pour un appelant ayant un tier sur ce nick seulement* : le court-circuit
+`if not matching: return None` fait qu'un appelant sans aucun tier sur ce nick n'appelle jamais
+`_parse_groups_paths` et ne voit donc jamais cette erreur (il reçoit `scope:null` normalement).
+`_validate_groups_paths_startup()` (appelée une fois à l'import, juste après l'instanciation de
+`_bh_paths`) reste une **courtoisie** — fail-fast pour le cas courant, attrapé avant tout trafic —
+mais **n'est pas le seul point d'application** : ni elle ni aucun appelant futur de
+`_resolve_path_scope`/`_parse_groups_paths` (le filtrage a posteriori des stories 1.3/1.4) ne
+doivent envelopper cet appel dans un `try/except` qui avalerait le `ValueError` — il doit remonter
+tel quel en `500` non catché. C'est la seule route du projet où le contrat habituel « `exitcode !=
+0` ⇒ 400, sinon 200 » (voir plus bas) ne s'applique pas : une config invalide en cours d'exécution
+produit un `500` FastAPI standard (exception non gérée), pas un `CommandResult` avec `exitcode`.
+
 ### `GET /access` — liste des serveurs filtrée aux droits de l'utilisateur
 
 Problème : le *fail-closed* multi-nick de `_check_group_access` (ci-dessus, voulu pour un appel
@@ -844,14 +914,27 @@ correct) : un nouvel endpoint `GET /access`, **spécial-casé en tout premier** 
 `_check_group_access` (avant même le test `GROUPS_HEADER`/le cas `Login`) — `if path=='/access': return`
 — pour rester appelable par n'importe quel utilisateur authentifié quels que soient ses groupes,
 puisque son unique rôle est justement de les refléter. Renvoie, pour chaque nick connu
-(`_nick_list('ALL')`), le niveau effectif de l'appelant (`_effective_level` sur `cfgread(nick)`) sous
-forme `{'groups_auth_enabled': bool, 'nicks': {nick: 'none'|'read'|'write'|'admin'}}` —
-`groups_auth_enabled=false` renvoie `'admin'` pour tous les nicks (aucune restriction par groupes,
-seuls `allow_destructive`/`allow_downloads` globaux s'appliquent), pour que le client n'ait qu'une
-seule forme de réponse à traiter.
+(`_nick_list('ALL')`), le niveau effectif de l'appelant (`_effective_level` sur `cfgread(nick)`) **et**,
+depuis Story 1.1 (AD-6), son périmètre de chemin résolu (`_resolve_path_scope` sur ce même `cfgread(nick)`)
+sous forme `{'groups_auth_enabled': bool, 'nicks': {nick: {'level': 'none'|'read'|'write'|'admin',
+'scope': None|list[str]}}}` — `groups_auth_enabled=false` renvoie `{'level':'admin','scope':None}`
+pour tous les nicks (aucune restriction par groupes, seuls `allow_destructive`/`allow_downloads`
+globaux s'appliquent), pour que le client n'ait qu'une seule forme de réponse à traiter. L'appel à
+`_resolve_path_scope` n'est **jamais** enveloppé dans un `try/except` (voir ci-dessus) : une
+`GROUPS_PATHS` ambiguë introduite en cours d'exécution fait échouer cette route en `500`, seule
+exception au « toujours 200 pour un appel authentifié » que son `summary=` affichait jusqu'ici —
+corrigé dans le code pour le mentionner explicitement. **Qualification importante** : cette
+exception ne touche que les appelants qui détiennent au moins un tier sur le nick dont la config
+est ambiguë — `_resolve_path_scope` retourne `None` via son court-circuit `if not matching: return
+None` *avant* d'appeler `_parse_groups_paths` pour un appelant sans aucun accès à ce nick, donc un
+tel appelant reçoit un `200` normal avec `scope:null` pour ce nick, sans jamais voir l'erreur.
 
 Le client (`loadMachines()` dans `borgHelperWWW_ui.html`) appelle `/access` **avant** `/report`,
-filtre `Object.keys(access.nicks)` à `!== 'none'`, et n'envoie à `/report` qu'une liste **explicite**
+filtre `Object.keys(access.nicks)` à `.level !== 'none'` (bare string jusqu'à Story 1.1, `{level,
+scope}` depuis — `applyBadges()`/`loadMachines()` sont les deux seuls autres endroits du frontend
+qui lisaient `nicks[nick]`, corrigés dans le même commit pour lire `.level` ; `scope` lui-même
+n'est pas encore consommé côté UI, ce sera une story ultérieure), et n'envoie à `/report` qu'une
+liste **explicite**
 de nicks pré-confirmés accessibles (jamais `nick=ALL` tant que l'autorisation par groupes est active) —
 liste vide ⇒ affichage « Aucun serveur accessible... » sans appeler `/report` du tout. Cette liste
 passe alors nécessairement la boucle *fail-closed* existante de `_check_group_access` (chaque nick

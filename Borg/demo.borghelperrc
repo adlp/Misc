@@ -34,6 +34,9 @@ DISPLAY_BKP     = 5
 ;GROUPS_ADMIN   = ops-admins
 ;GROUPS_WRITE   = ops-admins,ops-writers
 ;GROUPS_READ    = ops-admins,ops-writers,ops-readers
+; Exemple de périmètre de chemin par groupe (restreint ops-readers à un sous-répertoire de ce
+; nick ; ops-admins/ops-writers, absents de GROUPS_PATHS, gardent un accès chemin illimité) :
+;GROUPS_PATHS   = ops-readers:/lib/modules/6.8.0-generic
 
 [demo-usrlocal]
 BORG_REPO       = /tmp/demo_borghelper/repo-usrlocal

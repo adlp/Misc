@@ -1,5 +1,65 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.11.0 + UI 1.7.1 — périmètre de chemin par groupe (Epic 1, Story 1.1) — 2026-09-18
+
+Première brique de la consultation scopée par arborescence (Epic 1) : `borgHelperWWW` peut
+désormais **résoudre et exposer** un périmètre de chemin par groupe, en plus du tier
+admin/écriture/lecture existant — cette story ne filtre encore **aucune** réponse de commande
+(prévu dans une story ultérieure du même epic) ; elle pose la fonction de résolution partagée et
+l'expose via `/access`.
+
+- Nouvelle clef `.borghelperrc` par nick **`GROUPS_PATHS`** (repli `[DEFAULT]` natif, même
+  convention que `GROUPS_ADMIN/WRITE/READ`) : associe un groupe à un ou plusieurs préfixes de
+  chemin (`groupe:/a|/b, groupe2:/c`). Orthogonale au tier — ne fait que le restreindre, jamais
+  l'étendre ; un groupe absent de la clef garde un accès chemin illimité dans son tier.
+- `_resolve_path_scope(user_groups, cfg)` (miroir de `_effective_level`) : résolution strictement
+  par nick, la plus permissive gagne (un seul groupe correspondant non scopé ⇒ périmètre illimité,
+  sinon union canonicalisée des préfixes de tous les groupes correspondants scopés).
+  `_parse_groups_paths` rejette bruyamment (`ValueError`) tout nom de groupe/chemin contenant un
+  des séparateurs réservés (`:`, `|`, `,`) — jamais un découpage silencieusement ambigu.
+- `_canonicalize_scope` : dédoublonne, retire les `/` finaux, élimine les préfixes redondants —
+  **corrigé pour que la racine `/` absorbe bien tout le reste** (`_canonicalize_scope(['/',
+  '/var/www'])` renvoie maintenant `['/']` ; le check générique `p.startswith(kept+'/')` ne
+  fonctionnait pas pour `kept=='/'`, qui devient `'//'`).
+- `GET /access` : chaque nick expose désormais `{level, scope}` au lieu d'une simple chaîne de
+  niveau — `scope` est `null` (illimité) ou la liste des préfixes résolus, `null` partout quand
+  l'autorisation par groupes est désactivée. **Changement de forme de réponse, non rétro-compatible**
+  côté client (voir correctif UI ci-dessous).
+  - `_validate_groups_paths_startup()` valide `GROUPS_PATHS` de chaque nick une fois au démarrage
+    (fail-fast pour la faute de config la plus courante) — mais **n'est pas le seul point
+    d'application** : `.borghelperrc` étant relu à chaque appel (`cfgread()`, sans cache), une
+    valeur rendue ambiguë **pendant que le process tourne** fait échouer le prochain `/access`
+    concerné en `500` non catché — **uniquement pour un appelant qui détient déjà un tier sur ce
+    nick** (`_resolve_path_scope` court-circuite en `None` avant de lire `GROUPS_PATHS` pour un
+    appelant sans aucun accès au nick, qui reçoit donc `scope:null` en `200` normal, sans jamais
+    voir l'erreur) — jamais une réponse dégradée en silence pour l'appelant concerné. Conséquence
+    documentée : `/access` n'est plus inconditionnellement `200` pour un appel authentifié qui a un
+    tier sur le nick concerné — son `summary=`, le README et TECHNICAL.md sont corrigés en ce sens.
+- `borgHelperWWW_ui.html` — **correctif de compatibilité**, dans le même commit : `loadMyAccess()`/
+  `applyBadges()`/`loadMachines()` lisaient encore `nicks[nick]` comme une chaîne brute ; corrigés
+  pour lire `.level` (nouvelle forme `{level, scope}`). Restaure exactement le comportement
+  existant (calcul des badges, filtrage de la liste des serveurs) — `scope` lui-même n'est pas
+  encore consommé côté UI, ce sera une story ultérieure.
+- `demo.borghelperrc` : exemple commenté `GROUPS_PATHS` ajouté à côté de l'exemple
+  `GROUPS_ADMIN/WRITE/READ` existant.
+
+**Toujours pas de filtrage effectif** : `Search`, `FileHist`, `TreeHist`, `TreeFind`, `LstBkpFls`,
+`DiffBkp`, `DuIdx`, `IdxTop`, `DiffTop` renvoient toujours l'intégralité de ce que le tier
+autorise, périmètre ou pas — le filtrage a posteriori de ces neuf commandes est une story
+ultérieure du même epic. `Restore`/`Restore -L`/`/download/file`/`/download/tar` sont, eux,
+couverts par un **epic séparé** (garde pré-appel, pas un filtrage a posteriori) qui réutilisera
+cette même résolution de périmètre — ils ne sont ni concernés ni « oubliés » par cette liste, ils
+sont hors périmètre de cet epic. `Bkp/Index/Prune/DelBkp/Init/Key/IdxPurge/Stats` n'ont aucune
+notion de sous-chemin et ne sont jamais concernés, dans aucun epic.
+
+Vérifié : `python3 -m py_compile borgHelperWWW borgHelper` (aucune erreur de syntaxe) ; les 8
+scénarios de la matrice E/S de la spec (groupe scopé seul, groupe scopé + groupe non scopé,
+même groupe sur deux nicks indépendants, `GROUPS_PATHS` absent, préfixes redondants, séparateur
+ambigu au démarrage, `groups_auth_enabled=false`, séparateur rendu ambigu **pendant que le
+process tourne** → `500` non catché puis rétabli en `200` dès la config corrigée) rejoués contre
+un `.borghelperrc` de scratch via `curl` sur `/api/access`, plus `_canonicalize_scope(['/',
+'/var/www']) == ['/']` vérifié directement.
+
 ## borgHelperWWW 1.10.0 + UI 1.7.0 — droits alignés sur les badges, nicks sans accès invisibles — 2026-09-18
 
 Complète l'autorisation par groupes (1.9.0) : les badges de sécurité et la liste des serveurs

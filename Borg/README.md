@@ -114,6 +114,15 @@ BORG_RELOCATED_REPO_ACCESS_IS_OK = yes
 GROUPS_ADMIN     = ops-admins                    # Prune/DelBkp/IdxPurge/Init/Key/Login sur ce nick
 GROUPS_WRITE     = ops-admins,ops-writers        # Bkp/Index/Restore/CacheClean (+ lecture)
 GROUPS_READ      = ops-admins,ops-writers,ops-readers  # tout le reste (+ téléchargements)
+
+# Périmètre de chemin par groupe (facultatif, orthogonal au tier ci-dessus — ne l'étend jamais,
+# ne peut que le restreindre) : un groupe absent de cette clef garde un accès chemin illimité
+# dans la limite du tier qu'il détient déjà via GROUPS_ADMIN/WRITE/READ. Syntaxe :
+# 'groupe:/chemin/a|/chemin/b, groupe2:/chemin/c' — ':' sépare groupe et chemin(s), '|' sépare
+# plusieurs chemins pour un même groupe, ',' sépare les groupes. Ces trois caractères sont donc
+# réservés : un nom de groupe ou un chemin qui en contient fait échouer le chargement de la
+# config avec une erreur explicite (jamais un résultat silencieusement mal découpé).
+GROUPS_PATHS     = ops-readers:/var/www/client-x
 ```
 
 Le nickname (nom de section) sert d'identifiant partout avec `-n`.
@@ -801,6 +810,41 @@ comportement inchangé, seule `X-API-Key` fait foi. Une fois activée (nom du he
   configurés — un badge ne minimise donc jamais le niveau de restriction réellement subi par
   l'utilisateur connecté.
 
+**Périmètre de chemin par groupe (`GROUPS_PATHS`)** : raffinement orthogonal au tier ci-dessus —
+il ne fait jamais qu'un nick est accordé, seulement *quelle partie* de ce nick l'est. Un groupe
+absent de `GROUPS_PATHS` conserve un accès chemin illimité dans la limite du tier qu'il détient
+déjà (comportement rétro-compatible : c'est déjà ce qui se passe aujourd'hui pour un groupe
+absent de `GROUPS_ADMIN/WRITE/READ`). Résolution strictement par nick (mêmes conventions que
+`_effective_level` : lecture via `cfgread(nick)`, repli natif `[DEFAULT]`), la plus permissive
+gagne : si **au moins un** des groupes correspondants de l'appelant (ceux qui lui donnent déjà un
+tier sur ce nick) est absent de `GROUPS_PATHS`, le périmètre est **illimité** quels que soient ses
+autres groupes ; sinon le périmètre est l'**union** des préfixes de tous ses groupes scopés
+correspondants, canonicalisée (`/` final retiré, doublons éliminés, tout préfixe déjà couvert par
+un préfixe plus large gardé retiré — la racine `/` absorbe alors tout le reste). Voir
+[Fichier de configuration](#fichier-de-configuration) pour la syntaxe exacte de la clef.
+
+Cette Story 1.1 **résout et expose** ce périmètre (voir `GET /access` ci-dessous) — elle ne
+l'applique encore à **aucune** commande de lecture : `Search`/`FileHist`/`TreeHist`/`TreeFind`/
+`LstBkpFls`/`DiffBkp`/`DuIdx`/`IdxTop`/`DiffTop` renvoient toujours l'intégralité de ce que le
+tier autorise, sans filtrage par sous-arborescence (filtrage prévu dans une story ultérieure du
+même epic) ; `Restore`/`/download/file`/`/download/tar` (garde pré-appel, pas un filtrage
+a posteriori) sont couverts par un epic séparé, construit sur cette même résolution de périmètre.
+`Bkp/Index/Prune/DelBkp/Init/Key/IdxPurge/Stats` n'ont pas de notion de sous-chemin et ne sont
+jamais concernés.
+
+⚠️ **`GROUPS_PATHS` est relu, et donc revalidé, à chaque appel** — `.borghelperrc` n'est jamais mis
+en cache côté config (`cfgread()` relit le fichier depuis le disque à chaque fois). Une valeur
+`GROUPS_PATHS` rendue ambiguë (séparateur réservé dans un nom de groupe ou un chemin) **pendant que
+le process tourne** échoue donc bruyamment dès le prochain appel qui résout un périmètre pour ce
+nick — `500` non catché, jamais une réponse silencieusement dégradée. **Uniquement pour les
+appelants qui détiennent un tier sur ce nick** : la résolution de périmètre court-circuite avant
+même de lire `GROUPS_PATHS` pour un appelant sans aucun accès à ce nick (l'erreur ne le concerne
+donc jamais — il reçoit `scope:null` normalement, `200`, comme s'il n'y avait pas de problème). La
+validation faite une fois au démarrage (`_validate_groups_paths_startup()`) n'est qu'un fail-fast
+pour le cas courant (faute de frappe détectée avant que le service ne serve du trafic), pas le seul
+point de contrôle. `GET /access` n'est donc **plus inconditionnellement `200` pour un appel
+authentifié qui détient un tier sur le nick concerné** — voir sa propre description plus bas.
+
 ⚠️ Le header n'est vérifié que pour sa **valeur**, jamais pour sa **provenance** — ce mécanisme
 suppose que `borgHelperWWW` n'est atteignable **que** via le reverse proxy de confiance qui pose ce
 header (bind sur `127.0.0.1` + reverse proxy sur la même machine, ou pare-feu équivalent), exactement
@@ -1055,12 +1099,30 @@ Réponse (`CommandResult`) commune à tous les endpoints ci-dessus :
 `exitcode != 0` ⇒ HTTP 400 (le détail reste dans le corps JSON — voir [Codes retour](#codes-retour)).
 
 `GET /access` : protégée par `X-API-Key` (contrairement à `/version`), mais **jamais** par
-l'autorisation par groupes elle-même — son seul but est de la refléter. Renvoie le niveau d'accès
-effectif de l'appelant sur **chaque** nick connu :
+l'autorisation par groupes elle-même — son seul but est de la refléter. Renvoie, pour **chaque**
+nick connu, le niveau d'accès effectif de l'appelant (`level`) **et** son périmètre de chemin
+résolu (`scope` — `null` = illimité, sinon liste de préfixes canonicalisés ; voir
+[Autorisation par groupes](#autorisation-par-groupes-reverse-proxy-oidcauth_request)) :
 
 ```json
-{"groups_auth_enabled": true, "nicks": {"demo-modules": "admin", "demo-usrlocal": "none"}}
+{"groups_auth_enabled": true, "nicks": {
+  "demo-modules": {"level": "admin", "scope": null},
+  "demo-usrlocal": {"level": "read", "scope": ["/var/www/client-x"]}
+}}
 ```
+
+`groups_auth_enabled: false` (autorisation par groupes désactivée) : `level:"admin"` et
+`scope:null` pour chaque nick, sans cas particulier côté client.
+
+⚠️ **Exception à la règle générale "toujours 200 pour un appel authentifié"** — mais **seulement
+pour un appelant qui détient un tier (lecture/écriture/admin) sur le nick concerné** : `GROUPS_PATHS`
+étant relu à chaque appel (voir plus haut), une valeur devenue ambiguë dans `.borghelperrc`
+**pendant que le process tourne** fait échouer `/access` en `500` non catché pour le(s) nick(s)
+concerné(s), plutôt que de dégrader silencieusement la réponse — c'est la seule route de ce projet
+où une erreur de configuration en cours d'exécution est volontairement laissée remonter telle
+quelle à l'appelant. Un appelant sans aucun tier sur ce nick ne voit jamais cette erreur : la
+résolution de périmètre s'arrête avant même de lire `GROUPS_PATHS` pour lui, et reçoit
+normalement `level:"none", scope:null` en `200`.
 
 `groups_auth_enabled=false` (autorisation par groupes désactivée) : `"admin"` pour tous les nicks —
 reflète l'absence de restriction par groupes, sans forme de réponse différente à gérer côté client.

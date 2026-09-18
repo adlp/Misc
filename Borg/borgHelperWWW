@@ -20,7 +20,7 @@ from borgHelper import Version as BORGHELPER_VERSION, BorgRunner, BorgHelper
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.10.0"
+WWW_VERSION="1.11.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -188,6 +188,12 @@ def require_downloads_allowed():
 # la même hypothèse que le déploiement documenté pour X-Forwarded-For (voir README.md).
 _LEVEL_KEYS={3:'GROUPS_ADMIN',2:'GROUPS_WRITE',1:'GROUPS_READ'}
 _LEVEL_NAMES={1:'lecture',2:'écriture',3:'admin'}
+# Clef .borghelperrc du périmètre de chemin par groupe (Story 1.1) — mêmes conventions per-nick/
+# repli [DEFAULT] que GROUPS_ADMIN/WRITE/READ, mais pas hiérarchique : c'est une restriction
+# orthogonale au tier, jamais un tier de plus. Caractères réservés (séparateurs de la syntaxe
+# 'groupe:/a|/b, groupe2:/c') — voir _parse_groups_paths.
+_GROUPS_PATHS_KEY='GROUPS_PATHS'
+_GP_RESERVED_CHARS=(':','|',',')
 _ROUTE_LEVELS={
     '/stats':1,'/lstbkp':1,'/lstbkpfls':1,'/report':1,'/diffbkp':1,'/search':1,'/filehist':1,
     '/treehist':1,'/treefind':1,'/duidx':1,'/cacheinfo':1,'/idxtop':1,'/difftop':1,
@@ -207,6 +213,112 @@ def _effective_level(user_groups,cfg):
         allowed={g.strip() for g in (cfg.get(_LEVEL_KEYS[level],'') or '').split(',') if g.strip()}
         if user_groups & allowed: return level
     return 0
+
+def _parse_groups_paths(raw):
+    """Parse la syntaxe GROUPS_PATHS : 'groupe:/a|/b, groupe2:/c' — ':' sépare un groupe de ses
+    chemins, '|' sépare plusieurs chemins pour un même groupe, ',' sépare les groupes. Retourne
+    {groupe: [chemins...]}. Chaîne vide/absente -> {}.
+
+    Échoue BRUYAMMENT (ValueError) si un nom de groupe ou un chemin contient l'un des séparateurs
+    réservés (_GP_RESERVED_CHARS), si un chemin n'est pas absolu (doit commencer par '/'), ou si un
+    chemin est vide une fois ses '/' finaux retirés (ex. '///') — sauf la racine '/' elle-même, qui
+    reste un chemin valide (périmètre racine) — jamais un résultat silencieusement mal découpé
+    (Boundaries du spec 1.1). Appelée à la fois par _validate_groups_paths_startup() (courtoisie,
+    une fois au démarrage) et par _resolve_path_scope() (à CHAQUE appel, puisque cfgread() relit
+    .borghelperrc depuis le disque à chaque fois) — l'appelant ne doit jamais catcher cette
+    exception pour la dégrader silencieusement en scope restreint/illimité par défaut."""
+    result={}
+    raw=(raw or '').strip()
+    if not raw: return result
+    for entry in raw.split(','):
+        entry=entry.strip()
+        if not entry: continue
+        if ':' not in entry:
+            raise ValueError(f"GROUPS_PATHS : entrée sans ':' séparant groupe et chemin(s) : {entry!r}")
+        group,_,paths_raw=entry.partition(':')
+        group=group.strip()
+        if not group:
+            raise ValueError(f"GROUPS_PATHS : nom de groupe vide dans l'entrée {entry!r}")
+        for c in _GP_RESERVED_CHARS:
+            if c in group:
+                raise ValueError(f"GROUPS_PATHS : nom de groupe {group!r} contient le séparateur "
+                    f"réservé {c!r} — renommer le groupe ou choisir une autre syntaxe")
+        paths=[p.strip() for p in paths_raw.split('|') if p.strip()]
+        if not paths:
+            raise ValueError(f"GROUPS_PATHS : aucun chemin pour le groupe {group!r} dans l'entrée {entry!r}")
+        for p in paths:
+            for c in _GP_RESERVED_CHARS:
+                if c in p:
+                    raise ValueError(f"GROUPS_PATHS : chemin {p!r} (groupe {group!r}) contient le "
+                        f"séparateur réservé {c!r}")
+            if not p.startswith('/'):
+                raise ValueError(f"GROUPS_PATHS : chemin {p!r} (groupe {group!r}) doit être absolu "
+                    f"(commencer par '/')")
+            if p!='/' and p.rstrip('/')=='':
+                raise ValueError(f"GROUPS_PATHS : chemin {p!r} (groupe {group!r}) est vide une fois "
+                    f"ses '/' finaux retirés")
+        result.setdefault(group,[]).extend(paths)
+    return result
+
+def _canonicalize_scope(prefixes):
+    """Canonicalise une liste de préfixes de chemin : dédoublonne, retire le '/' final, élimine
+    tout préfixe qui est déjà un sous-chemin d'un autre préfixe gardé (le plus large couvre déjà
+    le plus étroit). Cas particulier de la racine '/' : absorbe absolument tout le reste — géré en
+    sortie anticipée plutôt que via `p.startswith(kept+'/')`, qui deviendrait `p.startswith('//')`
+    pour kept=='/' et n'absorberait donc jamais rien (bug trouvé en revue iteration 1)."""
+    cleaned=sorted({(p.rstrip('/') or '/') for p in prefixes if p and p.strip()})
+    if not cleaned: return []
+    if '/' in cleaned: return ['/']
+    kept=[]
+    for p in cleaned:
+        if not any(p==k or p.startswith(k+'/') for k in kept):
+            kept.append(p)
+    return kept
+
+def _resolve_path_scope(user_groups,cfg):
+    """cfg : SectionProxy (.borghelperrc[nick], repli [DEFAULT] natif à configparser) ou None (nick
+    inexistant). Miroir de _effective_level, mais pour le périmètre de chemin (GROUPS_PATHS) —
+    strictement par nick, jamais une vue fusionnée/globale de la config. Retourne None (illimité)
+    ou une liste de préfixes canonicalisés.
+
+    'Groupes correspondants' = les groupes de l'appelant qui détiennent un accès (n'importe quel
+    tier) sur ce nick, càd l'union GROUPS_ADMIN ∪ GROUPS_WRITE ∪ GROUPS_READ intersectée avec
+    user_groups — un groupe auquel l'appelant appartient mais qui n'a aucun accès au nick ne doit
+    ni restreindre ni élargir le périmètre. Si l'un de ces groupes correspondants est absent de
+    GROUPS_PATHS, le périmètre est illimité (None) quels que soient les autres groupes ; sinon le
+    périmètre est l'union canonicalisée des préfixes de tous les groupes correspondants scopés.
+
+    ⚠️ Ne JAMAIS envelopper cet appel (ni celui, transitif, à _parse_groups_paths) dans un
+    try/except qui avalerait un ValueError — .borghelperrc est relu à chaque cfgread(), donc une
+    valeur GROUPS_PATHS rendue ambiguë PENDANT que le process tourne doit remonter telle quelle
+    (500 non catché) au prochain appel qui résout le périmètre pour ce nick, jamais être dégradée
+    silencieusement en scope restreint ou illimité par défaut. Conséquence directe : cette fonction
+    ne lève JAMAIS pour un appelant sans le moindre tier sur ce nick (retour anticipé `if not
+    matching: return None`, avant que _parse_groups_paths ne soit même appelée) — un GROUPS_PATHS
+    ambigu sur ce nick reste invisible à un tel appelant.
+
+    ⚠️ None EST AMBIGU — retourné pour deux situations distinctes : (1) l'appelant n'a aucun tier
+    du tout sur ce nick (`matching` vide, la question du périmètre n'a alors aucun sens — accès
+    déjà refusé ailleurs par le tier), et (2) l'appelant a un tier ET un périmètre réellement
+    illimité (aucun groupe correspondant scopé). TOUT appelant futur (filtrage a posteriori des
+    stories 1.3/1.4, qui réutilisent cette fonction telle quelle) DOIT vérifier le niveau/tier de
+    l'appelant sur ce nick séparément avant d'interpréter un None comme « laisser tout passer » —
+    ne jamais traiter un None de cette fonction, à lui seul, comme une preuve d'accès illimité.
+    Actuellement sans risque dans access() (toujours appairé à `level`, qui gouverne déjà l'accès),
+    mais un futur appelant qui ignorerait le tier accorderait par erreur un accès illimité à un
+    appelant sans aucun droit sur le nick."""
+    if cfg is None: return None
+    tier_groups=set()
+    for level in (3,2,1):
+        tier_groups|={g.strip() for g in (cfg.get(_LEVEL_KEYS[level],'') or '').split(',') if g.strip()}
+    matching=user_groups & tier_groups
+    if not matching: return None
+    groups_paths=_parse_groups_paths(cfg.get(_GROUPS_PATHS_KEY,'') or '')
+    prefixes=[]
+    for g in matching:
+        if g not in groups_paths: return None  # groupe correspondant non scopé -> illimité
+        prefixes.extend(groups_paths[g])
+    return _canonicalize_scope(prefixes)
 
 def _default_section_groups():
     """[DEFAULT] brut du .borghelperrc — utilisé par Login quand le nick visé n'existe pas encore
@@ -273,6 +385,23 @@ class CommandResult(BaseModel):
 # diff.db lors de son tout premier appel sur une paire non indexée) et comparée à l'entrée en
 # cache : si identique, le résultat mis en cache est restitué sans relancer borgHelper.
 _bh_paths=BorgHelper(cfgfile=CFGFILE)
+
+def _validate_groups_paths_startup():
+    """Fail-fast à l'import : valide la syntaxe GROUPS_PATHS de chaque nick connu (repli [DEFAULT]
+    natif inclus) avant de servir le moindre trafic — attrape la faute de config la plus commune
+    (séparateur ambiguë) tôt. Simple COURTOISIE, pas le seul point d'application : cfgread() relit
+    .borghelperrc à chaque appel, donc _resolve_path_scope()/_parse_groups_paths() doivent aussi
+    échouer bruyamment plus tard si la config est modifiée pendant que le process tourne (voir
+    leurs docstrings et Boundaries du spec 1.1) — cette fonction ne les dispense pas de ça."""
+    for n in [x.strip() for x in (_bh_paths.borg.cfgreadnicks() or '').split(',') if x.strip()]:
+        cfg=_bh_paths.borg.cfgread(n)
+        if cfg is None: continue
+        try:
+            _parse_groups_paths(cfg.get(_GROUPS_PATHS_KEY,'') or '')
+        except ValueError as e:
+            sys.exit(f"Configuration invalide — GROUPS_PATHS sur le nick '{n}' : {e}")
+
+_validate_groups_paths_startup()
 _RESPONSE_CACHE={}
 
 def _cache_db_paths(nick: Optional[str]):
@@ -425,22 +554,26 @@ def healthz():
 # ── Endpoints ────────────────────────────────────────────────────────────────
 # Un endpoint par commande CLI de borgHelper (voir README.md), sauf Mount/UMount.
 
-@router.get("/access",tags=["lecture"],summary="Niveau d'accès (lecture/écriture/admin) de l'appelant sur chaque nick, d'après ses groupes — toujours 200 pour un appel authentifié")
+@router.get("/access",tags=["lecture"],summary="Niveau d'accès (lecture/écriture/admin) ET périmètre de chemin de l'appelant sur chaque nick, d'après ses groupes — 200 pour un appel authentifié, SAUF 500 (non catché, par construction) si GROUPS_PATHS a été rendu ambigu dans .borghelperrc depuis le démarrage du process — voir README.md")
 def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     nicks=_nick_list('ALL')
     if not GROUPS_HEADER:
-        # Fonctionnalité désactivée : pas de restriction par nick, seuls allow_destructive/
-        # allow_downloads (globaux) s'appliquent — 'admin' partout reflète cette absence de
-        # restriction par groupes pour que l'UI n'ait pas à connaître ce cas particulier.
-        return {'groups_auth_enabled':False,'nicks':{n:'admin' for n in nicks}}
+        # Fonctionnalité désactivée : pas de restriction par nick ni de périmètre, seuls
+        # allow_destructive/allow_downloads (globaux) s'appliquent — 'admin'/scope:null partout
+        # reflète cette absence de restriction par groupes pour que l'UI n'ait qu'une seule forme
+        # de réponse à traiter, sans cas particulier côté client.
+        return {'groups_auth_enabled':False,'nicks':{n:{'level':'admin','scope':None} for n in nicks}}
     user_groups=_parse_groups(request.headers.get(GROUPS_HEADER))
     level_names={0:'none',1:'read',2:'write',3:'admin'}
     result={}
     for n in nicks:
         cfg=_bh_paths.borg.cfgread(n)
         eff=_effective_level(user_groups,cfg) if cfg is not None else 0
-        result[n]=level_names[eff]
+        # _resolve_path_scope (donc _parse_groups_paths) n'est JAMAIS catché ici — une config
+        # GROUPS_PATHS ambiguë doit remonter en 500 non catché, pas être dégradée en silence.
+        scope=_resolve_path_scope(user_groups,cfg) if cfg is not None else None
+        result[n]={'level':level_names[eff],'scope':scope}
     return {'groups_auth_enabled':True,'nicks':result}
 
 @router.get("/stats",response_model=CommandResult,tags=["lecture"])
