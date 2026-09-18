@@ -106,15 +106,26 @@ BORG_REMOTE_PATH            = borg1
 BORG_RSH                    = ssh -p 2222
 BORG_SHOW_SYSINFO           = no
 BORG_RELOCATED_REPO_ACCESS_IS_OK = yes
+
+# Autorisation par groupes (facultatif) — non interprété par borgHelper lui-même (ignoré par la CLI),
+# reconnu uniquement par borgHelperWWW quand l'autorisation par groupes y est activée (voir sa propre
+# section « Autorisation par groupes »). Listes de noms de groupes séparés par des virgules,
+# hiérarchiques (admin ⊇ écriture ⊇ lecture — pas besoin de répéter un groupe dans les trois clefs).
+GROUPS_ADMIN     = ops-admins                    # Prune/DelBkp/IdxPurge/Init/Key/Login sur ce nick
+GROUPS_WRITE     = ops-admins,ops-writers        # Bkp/Index/Restore/CacheClean (+ lecture)
+GROUPS_READ      = ops-admins,ops-writers,ops-readers  # tout le reste (+ téléchargements)
 ```
 
 Le nickname (nom de section) sert d'identifiant partout avec `-n`.
 
-Répertoire de cache configurable via la clé `CACHE_DIR` dans la section `[DEFAULT]` :
+Répertoire de cache configurable via la clé `CACHE_DIR` dans la section `[DEFAULT]` — comme toute clef
+INI, `GROUPS_ADMIN`/`GROUPS_WRITE`/`GROUPS_READ` supportent aussi ce repli sur `[DEFAULT]` (politique
+par défaut pour tous les nicks qui ne les surchargent pas individuellement) :
 
 ```ini
 [DEFAULT]
 CACHE_DIR = /data/borgcache
+GROUPS_READ = ops-readers,ops-writers,ops-admins   # défaut : tout le monde peut au moins lire
 ```
 
 ---
@@ -681,6 +692,7 @@ Trois façons de configurer, cumulables — par ordre de priorité (la première
 | `BORGHELPERWWW_ALLOW_DESTRUCTIVE` | `--allow-destructive`, `--no-allow-destructive` | `allow_destructive` | Autorise `Prune`/`DelBkp` (destruction de sauvegardes) — **interdit par défaut** (voir ci-dessous) |
 | `BORGHELPERWWW_ALLOW_DOWNLOADS` | `--allow-downloads`, `--no-downloads` | `allow_downloads` | Autorise `/download/file` et `/download/tar` (vue d'une restauration) — **autorisé par défaut** (voir ci-dessous) |
 | `BORGHELPERWWW_API_PREFIX` | `--api-prefix` | `api_prefix` | Préfixe de toutes les routes API — défaut `/api` (voir ci-dessous) |
+| `BORGHELPERWWW_GROUPS_HEADER` | `--groups-header` | `groups_header` | Header HTTP contenant les groupes de l'utilisateur (reverse proxy OIDC) — absent : **désactivé** (voir ci-dessous) |
 
 Le serveur refuse de démarrer si le fichier de conf `.borghelperrc` (`cfgfile`) est absent (aucun des
 trois moyens ne l'a fourni). La clé API, elle, n'est **pas requise** : si absente partout,
@@ -740,6 +752,45 @@ Deux réglages de sécurité au démarrage, affichés sur **stderr** au lancemen
 
 Les deux réglages sont indépendants l'un de l'autre et des permissions habituelles (`X-API-Key`,
 `X-Borg-Passphrase`) — ils s'y ajoutent, ils ne les remplacent pas.
+
+#### Autorisation par groupes (reverse proxy OIDC/auth_request)
+
+Cas d'usage : un reverse proxy (nginx `auth_request`, oauth2-proxy…) authentifie l'utilisateur par
+OIDC et transmet ses groupes dans un header HTTP (ex. `X-Groups: ops-admins,ops-readers`, liste
+séparée par des virgules). `borgHelperWWW` peut vérifier ces groupes pour n'autoriser, **par nick**,
+que les actions correspondant au niveau d'accès de l'utilisateur — **complémentaire** à `X-API-Key`
+(jamais un remplacement : `X-API-Key` reste requis sur toutes les routes, que l'autorisation par
+groupes soit activée ou non).
+
+**Désactivée par défaut** — `BORGHELPERWWW_GROUPS_HEADER`/`--groups-header`/`groups_header` absent :
+comportement inchangé, seule `X-API-Key` fait foi. Une fois activée (nom du header à lire, ex.
+`X-Groups`) :
+
+- Chaque nick porte trois listes de groupes dans son `.borghelperrc` — **`GROUPS_ADMIN`**,
+  **`GROUPS_WRITE`**, **`GROUPS_READ`** (comma-séparées, repli sur `[DEFAULT]` comme toute autre
+  clef — voir plus haut). **Hiérarchiques** : appartenir à un groupe de `GROUPS_ADMIN` donne aussi
+  accès écriture et lecture sur ce nick ; `GROUPS_WRITE` donne aussi accès lecture — pas besoin de
+  répéter un même groupe dans les trois listes.
+- Chaque route est classée : **lecture** (`Stats`, `LstBkp`, `LstBkpFls`, `Report`, `DiffBkp`,
+  `Search`, `FileHist`, `TreeHist`, `TreeFind`, `DuIdx`, `CacheInfo`, `IdxTop`, `DiffTop`,
+  `Restore -L`, `/download/file`, `/download/tar`), **écriture** (`Bkp`, `Index`, `Restore`,
+  `CacheClean`), **admin** (`Prune`, `DelBkp`, `IdxPurge`, `Init`, `Key`). `Login` est un cas
+  particulier : accès admin requis sur le nick visé s'il existe déjà (mise à jour), ou sur la section
+  `[DEFAULT]` s'il s'agit d'en créer un nouveau (aucune section propre où lire une politique).
+- **Plusieurs nicks en un appel** (`nick=ALL` ou `nick=a,b,c`) : *fail-closed* — la requête entière est
+  refusée (`403`, nommant le premier nick en cause) si le niveau requis manque pour **au moins un**
+  des nicks visés, jamais de filtrage silencieux d'une partie de la liste.
+- Header absent ou vide sur une requête donnée (alors que l'autorisation par groupes est active) :
+  aucun groupe ⇒ aucun accès (`403` sur toute route porteuse d'un nick).
+
+⚠️ Le header n'est vérifié que pour sa **valeur**, jamais pour sa **provenance** — ce mécanisme
+suppose que `borgHelperWWW` n'est atteignable **que** via le reverse proxy de confiance qui pose ce
+header (bind sur `127.0.0.1` + reverse proxy sur la même machine, ou pare-feu équivalent), exactement
+la même hypothèse que pour `X-Forwarded-For` (voir section suivante). Un accès direct au port de
+`borgHelperWWW`, en contournant le reverse proxy, permettrait de forger n'importe quelle valeur de ce
+header.
+
+`GET /version` renvoie `groups_auth_enabled` (booléen — jamais le nom du header ni les groupes eux-mêmes).
 
 #### Derrière un reverse proxy — IP client réelle dans les logs
 

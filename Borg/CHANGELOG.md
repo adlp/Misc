@@ -1,5 +1,42 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.9.0 — autorisation par groupes (reverse proxy OIDC/auth_request) — 2026-09-18
+
+Nouveau mécanisme d'autorisation **par nick et par groupes**, complémentaire à `X-API-Key` (jamais un
+remplacement) — pensé pour un reverse proxy (nginx `auth_request`, oauth2-proxy…) qui authentifie par
+OIDC et transmet les groupes de l'utilisateur dans un header HTTP.
+
+**Désactivé par défaut** — `BORGHELPERWWW_GROUPS_HEADER` / `--groups-header` / clé `groups_header`
+absente : comportement strictement inchangé. Une fois activé (nom du header à lire, ex. `X-Groups`,
+liste de groupes séparés par des virgules) :
+
+- Trois nouvelles clefs `.borghelperrc` par nick (repli natif sur `[DEFAULT]`, comme toute autre
+  clef) : **`GROUPS_ADMIN`**, **`GROUPS_WRITE`**, **`GROUPS_READ`** — hiérarchiques (admin ⊇ écriture
+  ⊇ lecture, pas besoin de répéter un groupe dans les trois listes). Reconnues uniquement par
+  `borgHelperWWW` — ignorées par `borgHelper` CLI lui-même (aucun changement de code côté
+  `borgHelper`, juste de nouvelles clefs de configuration documentées).
+- Chaque route classée lecture/écriture/admin (`_ROUTE_LEVELS`), appliqué à toutes via un seul
+  `APIRouter(dependencies=[Depends(_check_group_access)])` — aucune signature d'endpoint modifiée.
+- `Login` traité à part (accès admin sur le nick visé s'il existe déjà, sinon sur `[DEFAULT]`).
+- Requête multi-nick (`nick=ALL` ou `nick=a,b,c`) : *fail-closed* — toute la requête est refusée si le
+  niveau manque pour ne serait-ce qu'un seul des nicks visés.
+- Header absent/vide (fonctionnalité active) : aucun groupe ⇒ aucun accès.
+- `GET /version` renvoie `groups_auth_enabled` (booléen seulement — jamais le nom du header ni les
+  groupes).
+
+⚠️ Le header n'est vérifié que pour sa valeur, jamais sa provenance — suppose `borgHelperWWW` non
+atteignable autrement que via le reverse proxy de confiance (même hypothèse déjà documentée pour
+`X-Forwarded-For`/`BORGHELPERWWW_TRUSTED_PROXIES`).
+
+Vérifié de bout en bout sur une configuration à deux nicks/trois groupes (`ops-admins`/`writers`/
+`readers` équivalents) : hiérarchie admin/écriture/lecture, isolation stricte entre nicks (accès sur
+l'un n'accorde rien sur l'autre), repli `[DEFAULT]`, multi-nick fail-closed, header absent/vide
+refusé, cas `Login` (nouveau nick refusé sans `GROUPS_ADMIN` en `[DEFAULT]`, nick existant accepté
+pour un groupe admin dessus), et non-régression complète avec la fonctionnalité désactivée.
+
+`borghelperwww.conf.example` et `demo.borghelperrc` mis à jour (nouvelles clés documentées/exemples
+commentés).
+
 ## UI 1.6.3 — correctif : les badges de sécurité ignoraient leur état réel — 2026-09-18
 
 **Bug corrigé** : les trois badges de sécurité (🔒 Destructions désactivées, 🚫 Téléchargements

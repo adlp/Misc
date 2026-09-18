@@ -55,3 +55,12 @@ cfgfile = /etc/borghelperrc-www
 ; accessibles sans préfixe) — BORGHELPERWWW_API_PREFIX / --api-prefix. Défaut '/api'. Vide ou '/'
 ; pour aucun préfixe (routes à la racine, comme avant l'introduction de ce réglage).
 ;api_prefix = /api
+
+; Active l'autorisation par groupes (reverse proxy OIDC/auth_request, ex. nginx) : nom du header HTTP
+; contenant les groupes de l'utilisateur, liste séparée par des virgules — BORGHELPERWWW_GROUPS_HEADER
+; / --groups-header. Vide/absent (défaut) : fonctionnalité désactivée, X-API-Key seul fait foi.
+; ⚠️ Suppose borgHelperWWW non atteignable autrement que via ce reverse proxy (voir README.md,
+; section « Autorisation par groupes ») — sinon ce header est forgeable par n'importe quel client.
+; Chaque nick porte alors GROUPS_ADMIN/GROUPS_WRITE/GROUPS_READ dans le .borghelperrc (voir README.md
+; du dépôt principal — pas ce fichier, qui ne configure QUE borgHelperWWW lui-même).
+;groups_header = X-Groups

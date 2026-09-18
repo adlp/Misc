@@ -773,3 +773,51 @@ de liveness configurée une fois pour toutes à un chemin fixe, sans notion d'AP
 `/docs` et `/openapi.json` (natifs FastAPI, non déclarés dans ce fichier) restent eux aussi à leur
 emplacement par défaut — ils listent automatiquement les routes du routeur avec leur préfixe effectif,
 sans configuration supplémentaire.
+
+---
+
+## borgHelperWWW — autorisation par groupes (`_check_group_access`)
+
+Appliquée à **toutes** les routes du routeur via `router=APIRouter(dependencies=[Depends(_check_group_access)])`
+— une seule déclaration couvre les 26 routes métier, sans toucher à leur signature individuelle
+(contrairement à `require_api_key`/`require_destructive_allowed`/`require_downloads_allowed`, appelés
+explicitement dans le corps de chaque fonction). `_check_group_access(request: Request)` prend
+directement l'objet `Request` de Starlette plutôt que des paramètres typés — c'est ce qui permet à une
+seule fonction de s'appliquer uniformément à des endpoints aux signatures très différentes (`nick`
+simple, `nick` + `bid`, `nickname`/`servername` pour `Login`…) sans dupliquer la logique.
+
+**No-op immédiat si `GROUPS_HEADER` est `None`** (réglage absent — cas par défaut) : aucune requête
+n'est jamais impactée tant que l'administrateur n'a pas explicitement fourni un nom de header.
+
+**Résolution du chemin** : `request.url.path` inclut déjà `API_PREFIX` (Starlette l'a appliqué au
+moment du montage via `include_router`) — `_check_group_access` le retranche
+(`path[len(API_PREFIX):]`) pour retrouver la clé de `_ROUTE_LEVELS` telle que déclarée sur le routeur
+(`/lstbkp`, pas `/api/lstbkp`).
+
+**`_ROUTE_LEVELS`** (dict `route → 1|2|3`) classe chaque route en lecture/écriture/admin ; vérifié
+au chargement par un script (routes réellement enregistrées sur `router.routes` comparées aux clés du
+dict) pour garantir qu'aucune route n'est oubliée (une route absente du dict serait, par construction,
+`required=None → 3`, donc refusée par défaut plutôt que silencieusement laissée passer — mais ne
+devrait de toute façon jamais se produire, toutes les routes réelles étant couvertes).
+
+**`_effective_level(user_groups, cfg)`** : `cfg` est la `SectionProxy` retournée par
+`BorgRunner.cfgread(nick)` (repli natif sur `[DEFAULT]`, comme n'importe quelle autre clef
+`.borghelperrc`) ou le dict `ConfigParser().defaults()` brut (cas `Login` sur un nick inexistant —
+pas de section à lire, seule une politique globale `[DEFAULT]` a un sens). Parcourt les niveaux du
+plus élevé au plus bas (`GROUPS_ADMIN` puis `GROUPS_WRITE` puis `GROUPS_READ`) et retourne le premier
+qui intersecte les groupes de l'utilisateur — implémente directement la hiérarchie admin ⊇ écriture ⊇
+lecture sans avoir à dupliquer les noms de groupes dans les trois clefs.
+
+**`_nick_list(nick_param)`** : `'ALL'` ou vide → `_bh_paths.borg.cfgreadnicks()` (tous les nicks
+connus) ; sinon `split(',')`. Réutilisé par `_check_group_access` pour vérifier **chacun** des nicks
+d'une requête multi-nick (`nick=ALL` ou `nick=a,b,c`) — *fail-closed* : la première insuffisance
+rencontrée interrompt la boucle et rejette toute la requête (`403`), jamais de filtrage silencieux
+d'une partie de la liste (le sous-processus `borgHelper` reçoit de toute façon la liste complète des
+nicks en un seul appel — un filtrage a posteriori du résultat texte/JSON par commande ne serait pas
+fiable).
+
+**Cas `Login`** traité en premier dans `_check_group_access`, avant la consultation de
+`_ROUTE_LEVELS` : le nick visé (`nickname` si fourni, sinon `servername`, comme la logique CLI/WWW
+existante) peut ne pas encore exister — `cfgread` renvoie alors `None`, et le repli se fait sur
+`_default_section_groups()` (lecture brute de `[DEFAULT]` depuis `CFGFILE`, indépendamment de
+`_bh_paths`) plutôt que d'échouer.

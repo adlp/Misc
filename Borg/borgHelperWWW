@@ -10,7 +10,7 @@ import os,re,sys,secrets,subprocess,configparser
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, APIRouter, Header, HTTPException, Query
+from fastapi import FastAPI, APIRouter, Header, HTTPException, Query, Request, Depends
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -20,7 +20,7 @@ from borgHelper import Version as BORGHELPER_VERSION, BorgRunner, BorgHelper
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.8.0"
+WWW_VERSION="1.9.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -59,6 +59,11 @@ if __name__=='__main__':
     _p.add_argument('--api-prefix',help="Préfixe des routes API (déf. BORGHELPERWWW_API_PREFIX, sinon "
                      "/api — vide ou '/' pour aucun préfixe ; '/', '/version', '/healthz' et '/docs' "
                      "restent toujours accessibles sans préfixe)")
+    _p.add_argument('--groups-header',help="Active l'autorisation par groupes (reverse proxy OIDC/"
+                     "auth_request, ex. nginx) : nom du header HTTP contenant les groupes de "
+                     "l'utilisateur, liste séparée par des virgules (ex. X-Groups). Vide/absent : "
+                     "fonctionnalité désactivée, seule X-API-Key fait foi (déf. BORGHELPERWWW_GROUPS_HEADER)."
+                     " Voir GROUPS_ADMIN/GROUPS_WRITE/GROUPS_READ dans le .borghelperrc — README.md")
     _args=_p.parse_args()
     if _args.conf: os.environ['BORGHELPERWWW_CONF']=_args.conf
     if _args.cfgfile: os.environ['BORGHELPERWWW_CFGFILE']=_args.cfgfile
@@ -69,6 +74,7 @@ if __name__=='__main__':
     if _args.host: os.environ['BORGHELPERWWW_HOST']=_args.host
     if _args.port is not None: os.environ['BORGHELPERWWW_PORT']=str(_args.port)
     if _args.trusted_proxies: os.environ['BORGHELPERWWW_TRUSTED_PROXIES']=_args.trusted_proxies
+    if _args.groups_header: os.environ['BORGHELPERWWW_GROUPS_HEADER']=_args.groups_header
     if _args.allow_destructive is not None: os.environ['BORGHELPERWWW_ALLOW_DESTRUCTIVE']=str(_args.allow_destructive)
     if _args.allow_downloads is not None: os.environ['BORGHELPERWWW_ALLOW_DOWNLOADS']=str(_args.allow_downloads)
     if _args.api_prefix is not None: os.environ['BORGHELPERWWW_API_PREFIX']=_args.api_prefix
@@ -83,7 +89,7 @@ _CONF_KEYS={'cfgfile':'BORGHELPERWWW_CFGFILE','api_key':'BORGHELPERWWW_API_KEY',
             'timeout':'BORGHELPERWWW_TIMEOUT','host':'BORGHELPERWWW_HOST','port':'BORGHELPERWWW_PORT',
             'trusted_proxies':'BORGHELPERWWW_TRUSTED_PROXIES',
             'allow_destructive':'BORGHELPERWWW_ALLOW_DESTRUCTIVE','allow_downloads':'BORGHELPERWWW_ALLOW_DOWNLOADS',
-            'api_prefix':'BORGHELPERWWW_API_PREFIX'}
+            'api_prefix':'BORGHELPERWWW_API_PREFIX','groups_header':'BORGHELPERWWW_GROUPS_HEADER'}
 _conf_path=os.environ.get('BORGHELPERWWW_CONF')
 if _conf_path:
     if not os.path.isfile(_conf_path):
@@ -112,6 +118,10 @@ ALLOW_DOWNLOADS=_env_bool('BORGHELPERWWW_ALLOW_DOWNLOADS',True)
 # /openapi.json) restent toujours accessibles sans préfixe (voir router plus bas).
 API_PREFIX=os.environ.get('BORGHELPERWWW_API_PREFIX','/api').rstrip('/')
 if API_PREFIX and not API_PREFIX.startswith('/'): API_PREFIX='/'+API_PREFIX
+# Autorisation par groupes (reverse proxy OIDC/auth_request en amont, ex. nginx) — voir plus bas
+# (_check_group_access). Vide/absent : fonctionnalité désactivée, comportement inchangé (X-API-Key
+# seul fait foi). GROUPS_HEADER est le nom du header HTTP à lire (ex. 'X-Groups'), jamais la valeur.
+GROUPS_HEADER=os.environ.get('BORGHELPERWWW_GROUPS_HEADER','').strip() or None
 
 if not CFGFILE:
     sys.exit("Fichier de conf manquant — -C/--cfgfile ou BORGHELPERWWW_CFGFILE (chemin du .borghelperrc dédié à l'API)")
@@ -145,12 +155,6 @@ app=FastAPI(
     ),
 )
 
-# Toutes les routes API métier sont déclarées sur ce routeur (préfixe appliqué en fin de fichier via
-# app.include_router) — seuls '/', '/version', '/healthz' restent déclarés directement sur `app`,
-# accessibles sans préfixe quel que soit API_PREFIX (bootstrap : la page et le endpoint qui lui
-# apprend ce préfixe doivent être joignables sans le connaître à l'avance).
-router=APIRouter()
-
 # ── Auth ─────────────────────────────────────────────────────────────────────
 
 def require_api_key(x_api_key: Optional[str]=Header(default=None)):
@@ -167,6 +171,88 @@ def require_downloads_allowed():
         raise HTTPException(403,detail="Téléchargements (/download/file, /download/tar) désactivés sur ce "
             "serveur — démarrer borgHelperWWW avec --no-downloads absent ou "
             "BORGHELPERWWW_ALLOW_DOWNLOADS=1 pour les autoriser")
+
+# ── Autorisation par groupes (reverse proxy OIDC/auth_request, ex. nginx) ──────────────────────
+# Complémentaire à X-API-Key (jamais un remplacement : X-API-Key reste requis sur toutes les routes
+# via require_api_key). Désactivée par défaut (GROUPS_HEADER absent) — comportement inchangé. Une
+# fois activée (BORGHELPERWWW_GROUPS_HEADER pointe sur le header posé par le reverse proxy, ex.
+# X-Groups), chaque route est classée lecture/écriture/admin (_ROUTE_LEVELS) et chaque nick cible
+# porte trois listes de groupes dans son .borghelperrc — GROUPS_ADMIN, GROUPS_WRITE, GROUPS_READ
+# (repli sur [DEFAULT] comme tout autre réglage .borghelperrc) — hiérarchiques : appartenir à un
+# groupe de GROUPS_ADMIN donne aussi accès écriture et lecture sur ce nick, GROUPS_WRITE donne aussi
+# accès lecture, sans avoir à répéter le nom du groupe dans les trois listes.
+#
+# ⚠️ Le header n'est vérifié que pour sa PRÉSENCE/valeur — pas pour sa provenance : ce mécanisme
+# suppose que borgHelperWWW n'est atteignable QUE via le reverse proxy de confiance qui pose ce
+# header (bind sur 127.0.0.1 + reverse proxy sur la même machine, ou pare-feu équivalent), exactement
+# la même hypothèse que le déploiement documenté pour X-Forwarded-For (voir README.md).
+_LEVEL_KEYS={3:'GROUPS_ADMIN',2:'GROUPS_WRITE',1:'GROUPS_READ'}
+_LEVEL_NAMES={1:'lecture',2:'écriture',3:'admin'}
+_ROUTE_LEVELS={
+    '/stats':1,'/lstbkp':1,'/lstbkpfls':1,'/report':1,'/diffbkp':1,'/search':1,'/filehist':1,
+    '/treehist':1,'/treefind':1,'/duidx':1,'/cacheinfo':1,'/idxtop':1,'/difftop':1,
+    '/restore/perms':1,'/download/file':1,'/download/tar':1,
+    '/bkp':2,'/index':2,'/restore':2,'/cacheclean':2,
+    '/prune':3,'/delbkp':3,'/idxpurge':3,'/init':3,'/key':3,
+}
+
+def _parse_groups(header_value):
+    if not header_value: return set()
+    return {g.strip() for g in header_value.split(',') if g.strip()}
+
+def _effective_level(user_groups,cfg):
+    """cfg : SectionProxy (.borghelperrc[nick], avec repli [DEFAULT] déjà natif à configparser) ou
+    un dict-like équivalent pour le cas Login/nick inexistant. 0 si aucun accès."""
+    for level in (3,2,1):
+        allowed={g.strip() for g in (cfg.get(_LEVEL_KEYS[level],'') or '').split(',') if g.strip()}
+        if user_groups & allowed: return level
+    return 0
+
+def _default_section_groups():
+    """[DEFAULT] brut du .borghelperrc — utilisé par Login quand le nick visé n'existe pas encore
+    (rien à lire depuis une section qui n'existe pas : politique globale de qui peut en créer une)."""
+    cp=configparser.ConfigParser(); cp.optionxform=str
+    if os.path.isfile(CFGFILE): cp.read(CFGFILE)
+    return cp.defaults()
+
+def _nick_list(nick_param):
+    if not nick_param or nick_param=='ALL':
+        return [n.strip() for n in (_bh_paths.borg.cfgreadnicks() or '').split(',') if n.strip()]
+    return [n.strip() for n in nick_param.split(',') if n.strip()]
+
+def _check_group_access(request: Request):
+    if not GROUPS_HEADER: return  # fonctionnalité désactivée : X-API-Key seul fait foi
+    path=request.url.path
+    if API_PREFIX and path.startswith(API_PREFIX): path=path[len(API_PREFIX):]
+    user_groups=_parse_groups(request.headers.get(GROUPS_HEADER))
+
+    if path=='/login':
+        nick=request.query_params.get('nickname') or request.query_params.get('servername') or ''
+        cfg=_bh_paths.borg.cfgread(nick) if nick else None
+        eff=_effective_level(user_groups, cfg if cfg is not None else _default_section_groups())
+        if eff<3:
+            raise HTTPException(403,detail=f"Groupe insuffisant pour Login sur '{nick}' — accès admin requis "
+                f"({GROUPS_HEADER}: {', '.join(sorted(user_groups)) or '(vide)'})")
+        return
+
+    required=_ROUTE_LEVELS.get(path)
+    if required is None: required=3  # route non cataloguée : refus par défaut (fail-closed), jamais censé arriver
+    nick_param=request.query_params.get('nick')
+    if nick_param is None: return  # route sans notion de nick (ne devrait pas se produire ici)
+    for n in _nick_list(nick_param):
+        cfg=_bh_paths.borg.cfgread(n)
+        eff=_effective_level(user_groups, cfg) if cfg is not None else 0
+        if eff<required:
+            raise HTTPException(403,detail=f"Groupe insuffisant pour '{n}' — accès {_LEVEL_NAMES[required]} requis "
+                f"({GROUPS_HEADER}: {', '.join(sorted(user_groups)) or '(vide)'})")
+
+# Toutes les routes API métier sont déclarées sur ce routeur (préfixe appliqué en fin de fichier via
+# app.include_router) — seuls '/', '/version', '/healthz' restent déclarés directement sur `app`,
+# accessibles sans préfixe quel que soit API_PREFIX (bootstrap : la page et le endpoint qui lui
+# apprend ce préfixe doivent être joignables sans le connaître à l'avance).
+# dependencies=[Depends(_check_group_access)] : appliqué à CHAQUE route du routeur, en plus de
+# require_api_key (appelé individuellement dans chaque fonction).
+router=APIRouter(dependencies=[Depends(_check_group_access)])
 
 # ── Exécution borgHelper ────────────────────────────────────────────────────
 
@@ -326,7 +412,8 @@ def ui_index():
 @app.get("/version",tags=["lecture"],summary="Versions + postures de sécurité chargées au démarrage de borgHelperWWW — non protégé, aucune donnée sensible")
 def version():
     return {'borghelperwww_version':WWW_VERSION,'borghelper_version':BORGHELPER_VERSION,'ui_version':UI_VERSION,
-            'allow_destructive':ALLOW_DESTRUCTIVE,'allow_downloads':ALLOW_DOWNLOADS,'api_prefix':API_PREFIX}
+            'allow_destructive':ALLOW_DESTRUCTIVE,'allow_downloads':ALLOW_DOWNLOADS,'api_prefix':API_PREFIX,
+            'groups_auth_enabled':GROUPS_HEADER is not None}
 
 @app.get("/healthz",tags=["lecture"],summary="Liveness — le processus répond, rien de plus (pas d'accès borg/DB) — non protégé")
 def healthz():

@@ -29,6 +29,11 @@ KEEP_DAILY      = 7
 KEEP_WEEKLY     = 4
 MAX_AGE_BKP     = 25
 DISPLAY_BKP     = 5
+; Exemple d'autorisation par groupes (n'a d'effet que si borgHelperWWW est lancé avec
+; --groups-header/BORGHELPERWWW_GROUPS_HEADER — voir README.md du projet) :
+;GROUPS_ADMIN   = ops-admins
+;GROUPS_WRITE   = ops-admins,ops-writers
+;GROUPS_READ    = ops-admins,ops-writers,ops-readers
 
 [demo-usrlocal]
 BORG_REPO       = /tmp/demo_borghelper/repo-usrlocal
