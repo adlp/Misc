@@ -6,3 +6,6 @@ CLAUDE.md
 **/conf/*.conf
 *.swp
 Mail/nginx-mua/var+spool+postfix/
+AGENTS.md
+*/_bmad/
+*/_bmad-output/
