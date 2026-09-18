@@ -680,6 +680,7 @@ Trois façons de configurer, cumulables — par ordre de priorité (la première
 | `BORGHELPERWWW_TRUSTED_PROXIES` | `--trusted-proxies` | `trusted_proxies` | IP/CIDR des reverse proxies de confiance, séparées par des virgules, ou `*` pour toutes (défaut `127.0.0.1` — voir ci-dessous) |
 | `BORGHELPERWWW_ALLOW_DESTRUCTIVE` | `--allow-destructive`, `--no-allow-destructive` | `allow_destructive` | Autorise `Prune`/`DelBkp` (destruction de sauvegardes) — **interdit par défaut** (voir ci-dessous) |
 | `BORGHELPERWWW_ALLOW_DOWNLOADS` | `--allow-downloads`, `--no-downloads` | `allow_downloads` | Autorise `/download/file` et `/download/tar` (vue d'une restauration) — **autorisé par défaut** (voir ci-dessous) |
+| `BORGHELPERWWW_API_PREFIX` | `--api-prefix` | `api_prefix` | Préfixe de toutes les routes API — défaut `/api` (voir ci-dessous) |
 
 Le serveur refuse de démarrer si le fichier de conf `.borghelperrc` (`cfgfile`) est absent (aucun des
 trois moyens ne l'a fourni). La clé API, elle, n'est **pas requise** : si absente partout,
@@ -695,6 +696,28 @@ python3 borgHelperWWW --conf /etc/borghelperwww.conf
 # ou, pour uvicorn externe / systemd (fonctionne aussi en exécution directe) :
 export BORGHELPERWWW_CONF=/etc/borghelperwww.conf
 uvicorn borgHelperWWW:app --host 0.0.0.0 --port 8000 --workers 2
+```
+
+#### Préfixe des routes API
+
+Toutes les routes API métier (voir [Endpoints](#endpoints) ci-dessous) sont montées sous un préfixe
+configurable — **`/api` par défaut** (`GET /lstbkp` devient `GET /api/lstbkp`, etc.). Restent
+**toujours accessibles sans préfixe**, quel que soit `api_prefix` — c'est la condition pour que la page
+web puisse se charger et apprendre ce préfixe avant de savoir où se trouve le reste de l'API :
+
+- `GET /` (la page web elle-même)
+- `GET /version` (versions + postures de sécurité, y compris `api_prefix` — la page web lit cette
+  valeur au chargement et l'utilise pour tous ses appels API ultérieurs)
+- `GET /healthz` (liveness — un superviseur/orchestrateur n'a pas à connaître `api_prefix`)
+- `GET /docs`, `GET /openapi.json` (natifs FastAPI — listent automatiquement les routes avec leur
+  préfixe effectif)
+
+`BORGHELPERWWW_API_PREFIX`/`--api-prefix`/`api_prefix` accepte une valeur vide ou `/` pour désactiver
+le préfixe (routes à la racine, comportement d'avant l'introduction de ce réglage) :
+
+```bash
+python3 borgHelperWWW -C /etc/borghelperrc-www --api-prefix /api/v1   # préfixe personnalisé
+python3 borgHelperWWW -C /etc/borghelperrc-www --api-prefix ''        # aucun préfixe
 ```
 
 #### Actions destructrices et téléchargements — postures par défaut
@@ -868,11 +891,16 @@ clair sur le réseau sinon.
 
 Un endpoint par commande CLI (voir [Commandes](#commandes) ci-dessus pour le détail de chaque
 comportement) — `GET` pour les commandes en lecture, `POST`/`DELETE` pour celles qui modifient un état.
-Exception : `GET /version` n'exécute aucune commande — il renvoie les versions de `borgHelperWWW`
-(`WWW_VERSION`, constante interne), de `borgHelper` (`Version`, importée) et de
+Toutes les routes du tableau ci-dessous sont montées sous `api_prefix` (`/api` par défaut — voir
+[Configuration](#configuration)) : `GET /lstbkp` du tableau signifie concrètement
+`GET /api/lstbkp` avec le préfixe par défaut.
+
+Exception : `GET /version` n'exécute aucune commande, n'est **jamais préfixé** (comme `/`, `/healthz`,
+`/docs`, `/openapi.json` — voir [Préfixe des routes API](#configuration)), et renvoie les versions de
+`borgHelperWWW` (`WWW_VERSION`, constante interne), de `borgHelper` (`Version`, importée) et de
 `borgHelperWWW_ui.html` (`UI_VERSION`, extraite par regex du commentaire `<!-- UI_VERSION: X.Y.Z -->`
-en tête du fichier HTML), ainsi que les postures de sécurité `allow_destructive` et `allow_downloads`
-(voir [Configuration](#configuration)) — tout **chargé une fois au démarrage du processus**. Comme `/`,
+en tête du fichier HTML), ainsi que les postures de sécurité `allow_destructive`/`allow_downloads` et
+le préfixe effectif `api_prefix` — tout **chargé une fois au démarrage du processus**. Comme `/`,
 volontairement **non protégé** par `X-API-Key` (aucune donnée sensible) — affiché dans le pied de page
 de l'interface web (versions), et via trois badges dans l'en-tête (visibles même avant connexion) :
 **🔒 Destructions désactivées** quand `allow_destructive` est à `false` (le défaut) ;

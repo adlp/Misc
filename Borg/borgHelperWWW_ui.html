@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.5.0 -->
+<!-- UI_VERSION: 1.6.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -256,6 +256,7 @@ let currentNick=null;
 let currentActionId=null;
 let allowDestructive=true; // état réel connu après résolution de loadFooterVersions() ci-dessous
 let allowDownloads=true;
+let API_PREFIX='/api'; // idem — appris depuis /version (seule route jamais préfixée, avec / et /healthz)
 
 // Versions + postures de sécurité chargées au démarrage de borgHelperWWW (endpoint public, non
 // protégé par X-API-Key, comme la page elle-même) — affichées avant même la connexion.
@@ -269,6 +270,7 @@ let allowDownloads=true;
     document.getElementById('destructiveBadge').hidden=!!v.allow_destructive;
     document.getElementById('downloadsBadge').hidden=!!v.allow_downloads;
     document.getElementById('fullAccessBadge').hidden=!(v.allow_destructive&&v.allow_downloads);
+    if(typeof v.api_prefix==='string') API_PREFIX=v.api_prefix;
     allowDestructive=!!v.allow_destructive;
     allowDownloads=!!v.allow_downloads;
     document.getElementById('historyPruneBtn').hidden=!allowDestructive;
@@ -312,7 +314,7 @@ function logout(){
 // ── API helper ────────────────────────────────────────────────────────────
 
 async function apiCall(method, path, params, needsPass, nickForPass){
-  const url=new URL(path, location.origin);
+  const url=new URL(API_PREFIX+path, location.origin);
   Object.entries(params||{}).forEach(([k,v])=>{
     if(v!==undefined && v!==null && v!=='') url.searchParams.set(k,v);
   });
@@ -1017,7 +1019,7 @@ async function confirmDownload(){
 }
 
 async function downloadViaFetch(path,params,nick,fallbackName){
-  const url=new URL(path, location.origin);
+  const url=new URL(API_PREFIX+path, location.origin);
   Object.entries(params).forEach(([k,v])=>{ if(v!==undefined && v!=='') url.searchParams.set(k,v); });
   const headers={'X-API-Key':getApiKey()};
   const p=getPassphrase(nick); if(p) headers['X-Borg-Passphrase']=p;

@@ -50,3 +50,8 @@ cfgfile = /etc/borghelperrc-www
 ; Autorise /download/file et /download/tar (téléchargement de données en vue d'une restauration) —
 ; BORGHELPERWWW_ALLOW_DOWNLOADS / --allow-downloads / --no-downloads. AUTORISÉ par défaut (true).
 ;allow_downloads = true
+
+; Préfixe des routes API (toutes sauf /, /version, /healthz, /docs, /openapi.json — toujours
+; accessibles sans préfixe) — BORGHELPERWWW_API_PREFIX / --api-prefix. Défaut '/api'. Vide ou '/'
+; pour aucun préfixe (routes à la racine, comme avant l'introduction de ce réglage).
+;api_prefix = /api

@@ -1,5 +1,26 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.8.0 + UI 1.6.0 — préfixe configurable des routes API (`/api` par défaut) — 2026-09-18
+
+Toutes les routes API métier de `borgHelperWWW` sont désormais montées sous un préfixe configurable
+(**`/api` par défaut**, ex. `GET /lstbkp` → `GET /api/lstbkp`) — nouveau
+`BORGHELPERWWW_API_PREFIX` / `--api-prefix` / clé `api_prefix` du fichier de conf. Vide ou `/`
+désactive le préfixe (comportement d'avant ce changement).
+
+Implémenté via un `APIRouter()` regroupant toutes les routes métier (`app.include_router(router,
+prefix=API_PREFIX)`) ; `/`, `/version` et `/healthz` restent **délibérément hors préfixe** (comme
+`/docs`/`/openapi.json`, natifs FastAPI) — condition nécessaire pour que la page web puisse se charger
+et apprendre le préfixe effectif (`GET /version` renvoie désormais aussi `api_prefix`) avant de savoir
+où se trouve le reste de l'API. L'interface web lit cette valeur au chargement et l'applique à tous ses
+appels API ultérieurs (`apiCall()`, `downloadViaFetch()`).
+
+Vérifié de bout en bout : préfixe par défaut (`/lstbkp` nu → 404, `/api/lstbkp` → 200, `/version` et
+`/docs` toujours accessibles nus, `/openapi.json` liste bien les chemins préfixés) ; préfixe
+personnalisé (`--api-prefix /borgapi`) ; préfixe désactivé (`--api-prefix ''`) ; téléchargements
+(`/download/file`) également montés sous le préfixe.
+
+`borghelperwww.conf.example` mis à jour avec la nouvelle clé `api_prefix`.
+
 ## UI 1.5.0 — badge « Tout autorisé » (rappel) — 2026-09-18
 
 Badge **⚠️ Tout autorisé** dans l'en-tête, visible quand `allow_destructive` **et** `allow_downloads`

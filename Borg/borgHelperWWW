@@ -10,7 +10,7 @@ import os,re,sys,secrets,subprocess,configparser
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, APIRouter, Header, HTTPException, Query
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -20,7 +20,7 @@ from borgHelper import Version as BORGHELPER_VERSION, BorgRunner, BorgHelper
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.7.1"
+WWW_VERSION="1.8.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -56,6 +56,9 @@ if __name__=='__main__':
                      "restauration) — AUTORISÉ par défaut (déf. BORGHELPERWWW_ALLOW_DOWNLOADS)")
     _p.add_argument('--no-downloads',dest='allow_downloads',action='store_false',
                      help="Interdit /download/file et /download/tar")
+    _p.add_argument('--api-prefix',help="Préfixe des routes API (déf. BORGHELPERWWW_API_PREFIX, sinon "
+                     "/api — vide ou '/' pour aucun préfixe ; '/', '/version', '/healthz' et '/docs' "
+                     "restent toujours accessibles sans préfixe)")
     _args=_p.parse_args()
     if _args.conf: os.environ['BORGHELPERWWW_CONF']=_args.conf
     if _args.cfgfile: os.environ['BORGHELPERWWW_CFGFILE']=_args.cfgfile
@@ -68,6 +71,7 @@ if __name__=='__main__':
     if _args.trusted_proxies: os.environ['BORGHELPERWWW_TRUSTED_PROXIES']=_args.trusted_proxies
     if _args.allow_destructive is not None: os.environ['BORGHELPERWWW_ALLOW_DESTRUCTIVE']=str(_args.allow_destructive)
     if _args.allow_downloads is not None: os.environ['BORGHELPERWWW_ALLOW_DOWNLOADS']=str(_args.allow_downloads)
+    if _args.api_prefix is not None: os.environ['BORGHELPERWWW_API_PREFIX']=_args.api_prefix
 
 # ── Fichier de conf borgHelperWWW (BORGHELPERWWW_CONF, optionnel) ──────────────────────────
 # Ini simple, section [borgHelperWWW] (ou clés en [DEFAULT]) : comble les BORGHELPERWWW_* absentes
@@ -78,7 +82,8 @@ _CONF_KEYS={'cfgfile':'BORGHELPERWWW_CFGFILE','api_key':'BORGHELPERWWW_API_KEY',
             'borghelper_bin':'BORGHELPERWWW_BORGHELPER_BIN','ui_file':'BORGHELPERWWW_UI_FILE',
             'timeout':'BORGHELPERWWW_TIMEOUT','host':'BORGHELPERWWW_HOST','port':'BORGHELPERWWW_PORT',
             'trusted_proxies':'BORGHELPERWWW_TRUSTED_PROXIES',
-            'allow_destructive':'BORGHELPERWWW_ALLOW_DESTRUCTIVE','allow_downloads':'BORGHELPERWWW_ALLOW_DOWNLOADS'}
+            'allow_destructive':'BORGHELPERWWW_ALLOW_DESTRUCTIVE','allow_downloads':'BORGHELPERWWW_ALLOW_DOWNLOADS',
+            'api_prefix':'BORGHELPERWWW_API_PREFIX'}
 _conf_path=os.environ.get('BORGHELPERWWW_CONF')
 if _conf_path:
     if not os.path.isfile(_conf_path):
@@ -103,6 +108,10 @@ TIMEOUT=int(os.environ.get('BORGHELPERWWW_TIMEOUT','3600')) or None
 # explicitement autorisée. Les téléchargements (vue d'une restauration), eux, sont autorisés par défaut.
 ALLOW_DESTRUCTIVE=_env_bool('BORGHELPERWWW_ALLOW_DESTRUCTIVE',False)
 ALLOW_DOWNLOADS=_env_bool('BORGHELPERWWW_ALLOW_DOWNLOADS',True)
+# Préfixe des routes API — '/', '/version', '/healthz' et les routes FastAPI natives (/docs,
+# /openapi.json) restent toujours accessibles sans préfixe (voir router plus bas).
+API_PREFIX=os.environ.get('BORGHELPERWWW_API_PREFIX','/api').rstrip('/')
+if API_PREFIX and not API_PREFIX.startswith('/'): API_PREFIX='/'+API_PREFIX
 
 if not CFGFILE:
     sys.exit("Fichier de conf manquant — -C/--cfgfile ou BORGHELPERWWW_CFGFILE (chemin du .borghelperrc dédié à l'API)")
@@ -135,6 +144,12 @@ app=FastAPI(
         f"{CFGFILE} — à réserver au provisioning, pas à un usage courant."
     ),
 )
+
+# Toutes les routes API métier sont déclarées sur ce routeur (préfixe appliqué en fin de fichier via
+# app.include_router) — seuls '/', '/version', '/healthz' restent déclarés directement sur `app`,
+# accessibles sans préfixe quel que soit API_PREFIX (bootstrap : la page et le endpoint qui lui
+# apprend ce préfixe doivent être joignables sans le connaître à l'avance).
+router=APIRouter()
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 
@@ -262,7 +277,7 @@ def _stream_proc(proc):
         except Exception: pass
         proc.wait()
 
-@app.get("/download/file",tags=["téléchargement"],summary="Télécharge un fichier depuis une archive (borg extract --stdout)")
+@router.get("/download/file",tags=["téléchargement"],summary="Télécharge un fichier depuis une archive (borg extract --stdout)")
 def download_file(nick: str, path: str, bid: Optional[str]=None,
                    x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
@@ -276,7 +291,7 @@ def download_file(nick: str, path: str, bid: Optional[str]=None,
     return StreamingResponse(_stream_proc(proc),media_type='application/octet-stream',
         headers={'Content-Disposition':f'attachment; filename="{_safe_filename(path)}"'})
 
-@app.get("/download/tar",tags=["téléchargement"],summary="Télécharge un .tar d'une arborescence depuis une archive (borg export-tar)")
+@router.get("/download/tar",tags=["téléchargement"],summary="Télécharge un .tar d'une arborescence depuis une archive (borg export-tar)")
 def download_tar(nick: str, prefix: Optional[str]=None, bid: Optional[str]=None,
                   x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
@@ -311,7 +326,7 @@ def ui_index():
 @app.get("/version",tags=["lecture"],summary="Versions + postures de sécurité chargées au démarrage de borgHelperWWW — non protégé, aucune donnée sensible")
 def version():
     return {'borghelperwww_version':WWW_VERSION,'borghelper_version':BORGHELPER_VERSION,'ui_version':UI_VERSION,
-            'allow_destructive':ALLOW_DESTRUCTIVE,'allow_downloads':ALLOW_DOWNLOADS}
+            'allow_destructive':ALLOW_DESTRUCTIVE,'allow_downloads':ALLOW_DOWNLOADS,'api_prefix':API_PREFIX}
 
 @app.get("/healthz",tags=["lecture"],summary="Liveness — le processus répond, rien de plus (pas d'accès borg/DB) — non protégé")
 def healthz():
@@ -320,12 +335,12 @@ def healthz():
 # ── Endpoints ────────────────────────────────────────────────────────────────
 # Un endpoint par commande CLI de borgHelper (voir README.md), sauf Mount/UMount.
 
-@app.get("/stats",response_model=CommandResult,tags=["lecture"])
+@router.get("/stats",response_model=CommandResult,tags=["lecture"])
 def stats(nick: Optional[str]=None, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     return run_borghelper('stats',nick=nick)
 
-@app.post("/login",response_model=CommandResult,tags=["admin"])
+@router.post("/login",response_model=CommandResult,tags=["admin"])
 def login(servername: str, nickname: Optional[str]=None, repo: str=Query(...),
           repo_passphrase: str=Query(...,description="Passphrase persistée en clair dans le borghelperrc du serveur, PAS le header X-Borg-Passphrase"),
           keyfile: Optional[str]=None, mountpoint: Optional[str]=None,
@@ -336,18 +351,18 @@ def login(servername: str, nickname: Optional[str]=None, repo: str=Query(...),
     if mountpoint: extra+=['-m',mountpoint]
     return run_borghelper('login',nick=nickname,extra_args=extra)
 
-@app.get("/lstbkp",response_model=CommandResult,tags=["lecture"])
+@router.get("/lstbkp",response_model=CommandResult,tags=["lecture"])
 def lstbkp(nick: str, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     return run_borghelper('lstbkp',nick=nick,cacheable=True)
 
-@app.get("/lstbkpfls",response_model=CommandResult,tags=["lecture"])
+@router.get("/lstbkpfls",response_model=CommandResult,tags=["lecture"])
 def lstbkpfls(nick: str, bid: Optional[str]=None, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     extra=['-b',bid] if bid else []
     return run_borghelper('lstbkpfls',nick=nick,extra_args=extra,cacheable=True)
 
-@app.get("/report",response_model=CommandResult,tags=["lecture"])
+@router.get("/report",response_model=CommandResult,tags=["lecture"])
 def report(nick: str="ALL", n: Optional[int]=Query(default=None,description="n dernières archives"),
            html: bool=False, json_output: bool=Query(default=False,alias="json"),
            offline: bool=Query(default=False,description="diff.db uniquement, aucun appel borg"),
@@ -362,7 +377,7 @@ def report(nick: str="ALL", n: Optional[int]=Query(default=None,description="n d
     # (borg info), non couvert par l'empreinte cache.db/diff.db.
     return run_borghelper('report',nick=nick,extra_args=extra,passphrase=x_borg_passphrase,cacheable=offline)
 
-@app.get("/diffbkp",response_model=CommandResult,tags=["lecture"])
+@router.get("/diffbkp",response_model=CommandResult,tags=["lecture"])
 def diffbkp(nick: str, bid_old: Optional[str]=None, bid_new: Optional[str]=None,
             x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
@@ -371,7 +386,7 @@ def diffbkp(nick: str, bid_old: Optional[str]=None, bid_new: Optional[str]=None,
     elif bid_old: extra=['-b',bid_old]
     return run_borghelper('diffbkp',nick=nick,extra_args=extra,cacheable=True)
 
-@app.get("/restore/perms",response_model=CommandResult,tags=["lecture"],summary="Liste les droits d'un fichier sans restaurer (Restore -L)")
+@router.get("/restore/perms",response_model=CommandResult,tags=["lecture"],summary="Liste les droits d'un fichier sans restaurer (Restore -L)")
 def restore_perms(nick: str, ftor: str, bid: Optional[str]=None, x_api_key: Optional[str]=Header(default=None),
                    x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
@@ -379,7 +394,7 @@ def restore_perms(nick: str, ftor: str, bid: Optional[str]=None, x_api_key: Opti
     if bid: extra+=['-b',bid]
     return run_borghelper('restore',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
 
-@app.post("/restore",response_model=CommandResult,tags=["mutation"],summary="Restaure un fichier/une arborescence sur le disque du serveur borgHelperWWW")
+@router.post("/restore",response_model=CommandResult,tags=["mutation"],summary="Restaure un fichier/une arborescence sur le disque du serveur borgHelperWWW")
 def restore(nick: str, ftor: str, where: str, bid: Optional[str]=None, flat: bool=False,
             x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
@@ -387,37 +402,37 @@ def restore(nick: str, ftor: str, where: str, bid: Optional[str]=None, flat: boo
     if bid: extra+=['-b',bid]
     return run_borghelper('restore',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
 
-@app.delete("/delbkp",response_model=CommandResult,tags=["mutation"],summary="⚡ Supprime une archive sur le dépôt — irréversible")
+@router.delete("/delbkp",response_model=CommandResult,tags=["mutation"],summary="⚡ Supprime une archive sur le dépôt — irréversible")
 def delbkp(nick: str, bid: str, x_api_key: Optional[str]=Header(default=None),
            x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     require_destructive_allowed()
     return run_borghelper('delbkp',nick=nick,extra_args=['-b',bid],passphrase=x_borg_passphrase)
 
-@app.post("/init",response_model=CommandResult,tags=["mutation"],summary="Initialise un nouveau dépôt borg (repokey)")
+@router.post("/init",response_model=CommandResult,tags=["mutation"],summary="Initialise un nouveau dépôt borg (repokey)")
 def init(nick: str, x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     return run_borghelper('init',nick=nick,passphrase=x_borg_passphrase)
 
-@app.post("/bkp",response_model=CommandResult,tags=["mutation"],summary="Lance un backup (+ indexation automatique)")
+@router.post("/bkp",response_model=CommandResult,tags=["mutation"],summary="Lance un backup (+ indexation automatique)")
 def bkp(nick: str, no_index: bool=False, x_api_key: Optional[str]=Header(default=None),
         x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     extra=['-I'] if no_index else []
     return run_borghelper('bkp',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
 
-@app.get("/key",response_model=CommandResult,tags=["lecture"],summary="Exporte la clef du dépôt (format papier)")
+@router.get("/key",response_model=CommandResult,tags=["lecture"],summary="Exporte la clef du dépôt (format papier)")
 def key(nick: str, x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     return run_borghelper('key',nick=nick,passphrase=x_borg_passphrase)
 
-@app.post("/prune",response_model=CommandResult,tags=["mutation"],summary="⚡ Supprime les vieux backups selon KEEP_* — irréversible")
+@router.post("/prune",response_model=CommandResult,tags=["mutation"],summary="⚡ Supprime les vieux backups selon KEEP_* — irréversible")
 def prune(nick: str, x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     require_destructive_allowed()
     return run_borghelper('prune',nick=nick,passphrase=x_borg_passphrase)
 
-@app.post("/index",response_model=CommandResult,tags=["mutation"])
+@router.post("/index",response_model=CommandResult,tags=["mutation"])
 def index(nick: str, force: bool=False, snapshot_only: bool=False, archive: Optional[str]=None,
           x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
@@ -427,7 +442,7 @@ def index(nick: str, force: bool=False, snapshot_only: bool=False, archive: Opti
     if archive: extra+=['-A',archive]
     return run_borghelper('index',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
 
-@app.get("/search",response_model=CommandResult,tags=["lecture"])
+@router.get("/search",response_model=CommandResult,tags=["lecture"])
 def search(nick: str, pattern: str, archive_from: Optional[str]=None, archive_to: Optional[str]=None,
            x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
@@ -436,7 +451,7 @@ def search(nick: str, pattern: str, archive_from: Optional[str]=None, archive_to
     if archive_to: extra+=['-B',archive_to]
     return run_borghelper('search',nick=nick,extra_args=extra,cacheable=True)
 
-@app.get("/filehist",response_model=CommandResult,tags=["lecture"])
+@router.get("/filehist",response_model=CommandResult,tags=["lecture"])
 def filehist(nick: str, path: str, archive_from: Optional[str]=None, archive_to: Optional[str]=None,
              x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
@@ -445,7 +460,7 @@ def filehist(nick: str, path: str, archive_from: Optional[str]=None, archive_to:
     if archive_to: extra+=['-B',archive_to]
     return run_borghelper('filehist',nick=nick,extra_args=extra,cacheable=True)
 
-@app.get("/treehist",response_model=CommandResult,tags=["lecture"],summary="Pour chaque objet sous un préfixe : archives où il a changé")
+@router.get("/treehist",response_model=CommandResult,tags=["lecture"],summary="Pour chaque objet sous un préfixe : archives où il a changé")
 def treehist(nick: str, prefix: Optional[str]=None, archive_from: Optional[str]=None, archive_to: Optional[str]=None,
              json_output: bool=Query(default=False,alias="json"), x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
@@ -456,7 +471,7 @@ def treehist(nick: str, prefix: Optional[str]=None, archive_from: Optional[str]=
     if json_output: extra.append('-j')
     return run_borghelper('treehist',nick=nick,extra_args=extra,cacheable=True)
 
-@app.get("/treefind",response_model=CommandResult,tags=["lecture"],summary="Recherche récursive par nom (glob minimal * et .) sous un préfixe, dans le dernier snapshot connu")
+@router.get("/treefind",response_model=CommandResult,tags=["lecture"],summary="Recherche récursive par nom (glob minimal * et .) sous un préfixe, dans le dernier snapshot connu")
 def treefind(nick: str, prefix: Optional[str]=None, pattern: Optional[str]=None,
              json_output: bool=Query(default=False,alias="json"), x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
@@ -466,7 +481,7 @@ def treefind(nick: str, prefix: Optional[str]=None, pattern: Optional[str]=None,
     if json_output: extra.append('-j')
     return run_borghelper('treefind',nick=nick,extra_args=extra,cacheable=True)
 
-@app.get("/duidx",response_model=CommandResult,tags=["lecture"])
+@router.get("/duidx",response_model=CommandResult,tags=["lecture"])
 def duidx(nick: str, pattern: Optional[str]=None, sort: str="chemin", json_output: bool=Query(default=False,alias="json"),
           archive_from: Optional[str]=None, archive_to: Optional[str]=None, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
@@ -478,22 +493,22 @@ def duidx(nick: str, pattern: Optional[str]=None, sort: str="chemin", json_outpu
     if archive_to: extra+=['-B',archive_to]
     return run_borghelper('duidx',nick=nick,extra_args=extra,cacheable=True)
 
-@app.get("/cacheinfo",response_model=CommandResult,tags=["lecture"])
+@router.get("/cacheinfo",response_model=CommandResult,tags=["lecture"])
 def cacheinfo(nick: str="ALL", x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     return run_borghelper('cacheinfo',nick=nick,cacheable=True)
 
-@app.post("/cacheclean",response_model=CommandResult,tags=["mutation"])
+@router.post("/cacheclean",response_model=CommandResult,tags=["mutation"])
 def cacheclean(nick: str="ALL", x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     return run_borghelper('cacheclean',nick=nick)
 
-@app.get("/idxtop",response_model=CommandResult,tags=["lecture"])
+@router.get("/idxtop",response_model=CommandResult,tags=["lecture"])
 def idxtop(nick: str="ALL", topn: int=20, depth: int=3, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     return run_borghelper('idxtop',nick=nick,extra_args=['-N',str(topn),'-p',str(depth)],cacheable=True)
 
-@app.get("/difftop",response_model=CommandResult,tags=["lecture"])
+@router.get("/difftop",response_model=CommandResult,tags=["lecture"])
 def difftop(nick: str="ALL", bid: Optional[str]=None, topn: int=10, depth: int=3,
             x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
@@ -501,13 +516,15 @@ def difftop(nick: str="ALL", bid: Optional[str]=None, topn: int=10, depth: int=3
     if bid: extra+=['-b',bid]
     return run_borghelper('difftop',nick=nick,extra_args=extra,cacheable=True)
 
-@app.post("/idxpurge",response_model=CommandResult,tags=["mutation"],summary="⚡ Purge rétroactive de diff_index + anciens snapshots")
+@router.post("/idxpurge",response_model=CommandResult,tags=["mutation"],summary="⚡ Purge rétroactive de diff_index + anciens snapshots")
 def idxpurge(nick: str="ALL", pattern: Optional[str]=None, dryrun: bool=False,
              x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     extra=['-D'] if dryrun else []
     if pattern: extra+=['-x',pattern]
     return run_borghelper('idxpurge',nick=nick,extra_args=extra)
+
+app.include_router(router,prefix=API_PREFIX)
 
 if __name__=='__main__':
     import uvicorn

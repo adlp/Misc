@@ -743,3 +743,33 @@ uvicorn borgHelperWWW:app --host 0.0.0.0 --port 8000 --workers 2
 # ou, équivalent, sans variable d'environnement :
 uvicorn borgHelperWWW:app --host 0.0.0.0 --port 8000 --workers 2 --forwarded-allow-ips 10.0.0.5
 ```
+
+---
+
+## borgHelperWWW — préfixe des routes API (`APIRouter`, tiers bootstrap)
+
+Toutes les routes métier (`/stats`, `/lstbkp`, `/download/file`, etc.) sont déclarées avec
+`@router.get(...)`/`@router.post(...)`/`@router.delete(...)` sur un `APIRouter()` créé juste après
+`app=FastAPI(...)`, puis montées en une seule fois en fin de fichier :
+
+```python
+app.include_router(router, prefix=API_PREFIX)
+```
+
+`API_PREFIX` (résolu depuis `BORGHELPERWWW_API_PREFIX`, défaut `/api`) est normalisé au moment de sa
+résolution — `.rstrip('/')` puis ajout d'un `/` de tête si non vide — de sorte qu'une valeur `/`
+devient `''` (aucun préfixe) et qu'une valeur `/api/` devient `/api` : Starlette/FastAPI exigent que
+`prefix` soit soit vide, soit commence par `/` et ne se termine jamais par `/` (`include_router` lève
+sinon une `AssertionError` au démarrage).
+
+**Trois routes restent déclarées directement sur `app`** (`@app.get(...)`, jamais sur le routeur) —
+`/`, `/version`, `/healthz` — délibérément, pour rester **joignables sans connaître `API_PREFIX` à
+l'avance** : c'est le problème d'amorçage (bootstrap) résolu ainsi — la page web (`/`) est chargée en
+premier, son JavaScript interroge immédiatement `GET /version` (toujours à la racine, jamais préfixé)
+qui lui répond notamment `api_prefix`, valeur que le client stocke (`API_PREFIX` côté JS) et préfixe
+lui-même à tous ses appels ultérieurs (`apiCall()`, `downloadViaFetch()`) vers le reste de l'API.
+`/healthz` reste aussi hors préfixe : un superviseur/orchestrateur (Kubernetes, systemd…) a une sonde
+de liveness configurée une fois pour toutes à un chemin fixe, sans notion d'API métier versionnée.
+`/docs` et `/openapi.json` (natifs FastAPI, non déclarés dans ce fichier) restent eux aussi à leur
+emplacement par défaut — ils listent automatiquement les routes du routeur avec leur préfixe effectif,
+sans configuration supplémentaire.
