@@ -871,9 +871,20 @@ comportement) — `GET` pour les commandes en lecture, `POST`/`DELETE` pour cell
 Exception : `GET /version` n'exécute aucune commande — il renvoie les versions de `borgHelperWWW`
 (`WWW_VERSION`, constante interne), de `borgHelper` (`Version`, importée) et de
 `borgHelperWWW_ui.html` (`UI_VERSION`, extraite par regex du commentaire `<!-- UI_VERSION: X.Y.Z -->`
-en tête du fichier HTML), toutes trois **chargées une fois au démarrage du processus**. Comme `/`,
+en tête du fichier HTML), ainsi que les postures de sécurité `allow_destructive` et `allow_downloads`
+(voir [Configuration](#configuration)) — tout **chargé une fois au démarrage du processus**. Comme `/`,
 volontairement **non protégé** par `X-API-Key` (aucune donnée sensible) — affiché dans le pied de page
-de l'interface web, visible même avant connexion.
+de l'interface web (versions), et via un badge **🔒 Destructions désactivées** dans l'en-tête quand
+`allow_destructive` est à `false` (défaut) ; visible même avant connexion.
+
+Quand une action est interdite côté serveur, le bouton correspondant **n'apparaît tout simplement
+pas** dans l'interface web (plutôt qu'un bouton visible qui échouerait en `403`) :
+`allow_destructive=false` retire **⚡ Purger les vieux backups (Prune)** et **⚡ Supprimer une archive
+(DelBkp)** de la liste d'actions de la page Détail, le bouton **⚡ Lancer Prune** et les boutons
+**🗑 Supprimer** par archive de la vue Historique complet ; `allow_downloads=false` retire le bouton
+**⬇ Télécharger** des résultats de recherche de l'explorateur et masque le bouton de confirmation de la
+fenêtre de téléchargement (remplacé par un message explicite — la fenêtre reste accessible en clic sur
+un fichier/clic droit sur un dossier, mais aucun téléchargement n'y est possible).
 
 `GET /healthz` : liveness check pour orchestrateurs/superviseurs (Kubernetes, Docker, systemd,
 load-balancer…) — répond `{"status":"ok"}` (HTTP 200) dès que le processus tourne, sans toucher à

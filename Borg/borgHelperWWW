@@ -20,7 +20,7 @@ from borgHelper import Version as BORGHELPER_VERSION, BorgRunner, BorgHelper
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.7.0"
+WWW_VERSION="1.7.1"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -308,9 +308,10 @@ UI_VERSION=_UI_VERSION_MATCH.group(1) if _UI_VERSION_MATCH else 'inconnue'
 def ui_index():
     return _UI_HTML
 
-@app.get("/version",tags=["lecture"],summary="Versions chargées au démarrage de borgHelperWWW (lui-même + borgHelper + borgHelperWWW_ui.html) — non protégé, aucune donnée sensible")
+@app.get("/version",tags=["lecture"],summary="Versions + postures de sécurité chargées au démarrage de borgHelperWWW — non protégé, aucune donnée sensible")
 def version():
-    return {'borghelperwww_version':WWW_VERSION,'borghelper_version':BORGHELPER_VERSION,'ui_version':UI_VERSION}
+    return {'borghelperwww_version':WWW_VERSION,'borghelper_version':BORGHELPER_VERSION,'ui_version':UI_VERSION,
+            'allow_destructive':ALLOW_DESTRUCTIVE,'allow_downloads':ALLOW_DOWNLOADS}
 
 @app.get("/healthz",tags=["lecture"],summary="Liveness — le processus répond, rien de plus (pas d'accès borg/DB) — non protégé")
 def healthz():

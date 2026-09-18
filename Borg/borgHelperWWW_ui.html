@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.2.1 -->
+<!-- UI_VERSION: 1.4.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -89,6 +89,7 @@
     <div class="sub" id="headerSub">non connecté</div>
   </div>
   <div>
+    <span class="badge ok" id="destructiveBadge" hidden style="margin-right:8px" title="Prune/DelBkp désactivés sur ce serveur (BORGHELPERWWW_ALLOW_DESTRUCTIVE)">🔒 Destructions désactivées</span>
     <button class="secondary" id="serversBtn" hidden onclick="showMachines()">Serveurs</button>
     <button class="secondary" id="logoutBtn" hidden onclick="logout()">Déconnexion</button>
   </div>
@@ -231,7 +232,7 @@
     <label for="dlArchiveSelect">Archive</label>
     <select id="dlArchiveSelect"><option value="">dernière archive</option></select>
   </div>
-  <button onclick="confirmDownload()">Télécharger</button>
+  <button id="dlConfirmBtn" onclick="confirmDownload()">Télécharger</button>
   <button class="secondary" onclick="closeDownloadModal()">Annuler</button>
   <div id="dlModalError" class="error"></div>
   <p class="hint" style="margin-bottom:2px">Commande borgHelper équivalente (extraction locale, droits préservés) :</p>
@@ -251,9 +252,11 @@ const SS_KEY='bhww_apikey';
 const SS_PASS='bhww_passphrases';
 let currentNick=null;
 let currentActionId=null;
+let allowDestructive=true; // état réel connu après résolution de loadFooterVersions() ci-dessous
+let allowDownloads=true;
 
-// Versions chargées au démarrage de borgHelperWWW (endpoint public, non protégé par X-API-Key,
-// comme la page elle-même) — affichées dans le pied de page, visible avant même la connexion.
+// Versions + postures de sécurité chargées au démarrage de borgHelperWWW (endpoint public, non
+// protégé par X-API-Key, comme la page elle-même) — affichées avant même la connexion.
 (async function loadFooterVersions(){
   try{
     const r=await fetch('/version');
@@ -261,6 +264,10 @@ let currentActionId=null;
     const v=await r.json();
     document.getElementById('footerVersions').textContent=
       ` v${v.borghelperwww_version} (borgHelper v${v.borghelper_version}, UI v${v.ui_version})`;
+    document.getElementById('destructiveBadge').hidden=!!v.allow_destructive;
+    allowDestructive=!!v.allow_destructive;
+    allowDownloads=!!v.allow_downloads;
+    document.getElementById('historyPruneBtn').hidden=!allowDestructive;
   }catch(e){ /* info non critique, silencieux */ }
 })();
 
@@ -458,9 +465,10 @@ function _renderHistoryRows(backups,withActions){
   if(archives.length===0) return {archives,html:''};
   const html=archives.map(a=>{
     const b=backups[a];
+    const deleteBtn=allowDestructive?`<button class="danger hist-delete-btn" data-archive="${escapeAttr(a)}">🗑 Supprimer</button>`:'';
     const actionsTd=withActions?`<td class="hist-actions">
         <button class="secondary hist-explore-btn" data-archive="${escapeAttr(a)}">🗂 Explorer</button>
-        <button class="danger hist-delete-btn" data-archive="${escapeAttr(a)}">🗑 Supprimer</button>
+        ${deleteBtn}
       </td>`:'';
     return `<tr><td>${escapeHtml(a)}</td><td>${escapeHtml(b.duration||'—')}</td>`
       +`<td>${escapeHtml(b.original_size||'—')}</td><td>${escapeHtml(b.size_delta||'—')}</td>`
@@ -658,10 +666,10 @@ const ACTIONS=[
             {name:'dryrun',label:'Dry-run (aucune suppression)',type:'bool'}],
     destructive:true, confirmMsg:'Purger rétroactivement diff_index et les anciens snapshots ?'},
   {id:'prune', label:'⚡ Purger les vieux backups (Prune)', method:'POST', path:'/prune', needsPass:true,
-    params:[], destructive:true, confirmMsg:'DANGER : supprime les archives selon KEEP_*. Irréversible. Continuer ?'},
+    params:[], destructive:true, requiresDestructive:true, confirmMsg:'DANGER : supprime les archives selon KEEP_*. Irréversible. Continuer ?'},
   {id:'delbkp', label:'⚡ Supprimer une archive (DelBkp)', method:'DELETE', path:'/delbkp', needsPass:true,
     params:[{name:'bid',label:'Archive à supprimer',type:'text',required:true}],
-    destructive:true, confirmMsg:'DANGER : suppression définitive de cette archive. Continuer ?'},
+    destructive:true, requiresDestructive:true, confirmMsg:'DANGER : suppression définitive de cette archive. Continuer ?'},
 ];
 
 function openMachine(nick){
@@ -688,7 +696,8 @@ function updateDetailPassStatus(){
 
 function renderActionList(){
   const ul=document.getElementById('actionList');
-  ul.innerHTML=ACTIONS.map(a=>`<li><button class="${a.destructive?'danger-item':''}" id="abtn_${a.id}" onclick="selectAction('${a.id}')">${a.needsPass?'🔑 ':''}${escapeHtml(a.label)}</button></li>`).join('');
+  ul.innerHTML=ACTIONS.filter(a=>!a.requiresDestructive||allowDestructive)
+    .map(a=>`<li><button class="${a.destructive?'danger-item':''}" id="abtn_${a.id}" onclick="selectAction('${a.id}')">${a.needsPass?'🔑 ':''}${escapeHtml(a.label)}</button></li>`).join('');
 }
 
 function selectAction(id){
@@ -887,6 +896,7 @@ async function runBrowseSearch(){
     +matches.map(m=>{
       const icon=m.is_dir?'📁':'📄';
       const gotoTarget=m.is_dir?m.full_path:m.parent;
+      const dlBtn=allowDownloads?`<button class="secondary sr-dl-btn" data-full="${escapeAttr(m.full_path)}" data-isdir="${m.is_dir}">⬇ Télécharger</button>`:'';
       return `<tr>
         <td>${icon} ${escapeHtml(m.name)}</td><td>${escapeHtml(m.genre)}</td>
         <td style="font-family:var(--mono)">${escapeHtml(m.full_path)}</td>
@@ -894,7 +904,7 @@ async function runBrowseSearch(){
         <td style="font-family:var(--mono)">${escapeHtml(m.owner||'—')}</td>
         <td class="hist-actions">
           <button class="secondary sr-goto-btn" data-target="${escapeAttr(gotoTarget)}">📂 Aller au dossier</button>
-          <button class="secondary sr-dl-btn" data-full="${escapeAttr(m.full_path)}" data-isdir="${m.is_dir}">⬇ Télécharger</button>
+          ${dlBtn}
         </td>
       </tr>`;
     }).join('')+'</tbody></table>';
@@ -924,7 +934,9 @@ let dlPending=null; // {nick,path,isDir}
 async function openDownloadDialog(fullPath,isDir){
   dlPending={nick:browseNick,path:fullPath,isDir};
   document.getElementById('dlModalTitle').textContent=(isDir?'Télécharger un .tar de ':'Télécharger ')+fullPath;
-  document.getElementById('dlModalError').textContent='';
+  document.getElementById('dlConfirmBtn').hidden=!allowDownloads;
+  document.getElementById('dlModalError').textContent=allowDownloads?'':
+    'Téléchargements désactivés sur ce serveur (BORGHELPERWWW_ALLOW_DOWNLOADS).';
   const formatField=document.getElementById('dlFormatField');
   const tarCheck=document.getElementById('dlTarFormat');
   formatField.hidden=isDir; // un dossier est toujours en .tar, pas de choix à faire

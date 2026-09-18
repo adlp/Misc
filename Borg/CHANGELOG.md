@@ -1,5 +1,30 @@
 # Changelog — borgHelper
 
+## UI 1.4.0 — masque les boutons d'actions interdites (destruction / téléchargements) — 2026-09-18
+
+Quand `allow_destructive`/`allow_downloads` (récupérés via `GET /version` au chargement de la page)
+interdisent une action, le bouton correspondant **n'apparaît plus** dans l'interface web, plutôt que
+de rester visible et d'échouer en `403` au clic :
+
+- `allow_destructive=false` : retire **Prune** et **DelBkp** de la liste d'actions de la page Détail
+  (nouveau flag `requiresDestructive` sur ces deux entrées d'`ACTIONS`), le bouton **⚡ Lancer Prune**
+  et les boutons **🗑 Supprimer** par archive de la vue Historique complet.
+- `allow_downloads=false` : retire le bouton **⬇ Télécharger** des résultats de recherche de
+  l'explorateur ; masque le bouton de confirmation de la fenêtre de téléchargement (remplacé par un
+  message explicite — ouvrir la fenêtre reste possible via clic sur un fichier/clic droit sur un
+  dossier, mais plus aucun téléchargement n'y est déclenchable).
+
+Vérifié : filtrage de la liste d'actions et des boutons conditionnels simulés en isolation (logique
+identique à celle du fichier), markup et `GET /version` cohérents en direct.
+
+## borgHelperWWW 1.7.1 + UI 1.3.0 — badge « Destructions désactivées » dans l'UI — 2026-09-18
+
+`GET /version` renvoie désormais aussi `allow_destructive` et `allow_downloads` (postures de sécurité
+au démarrage, voir 1.7.0 ci-dessous). Interface web : badge **🔒 Destructions désactivées** dans
+l'en-tête (visible sur toutes les pages, même avant connexion) quand `allow_destructive` est à `false`
+(le défaut) — masqué quand `Prune`/`DelBkp` sont explicitement autorisés. Vérifié en direct : badge
+markup présent, `allow_destructive` correctement `false` par défaut et `true` avec `--allow-destructive`.
+
 ## borgHelperWWW 1.7.0 + UI 1.2.1 — postures de sécurité par défaut (destruction / téléchargements) — 2026-09-18
 
 Deux nouveaux réglages de sécurité au démarrage de `borgHelperWWW`, affichés sur `stderr` :
