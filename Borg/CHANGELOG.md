@@ -1,5 +1,24 @@
 # Changelog — borgHelper
 
+## UI 1.6.3 — correctif : les badges de sécurité ignoraient leur état réel — 2026-09-18
+
+**Bug corrigé** : les trois badges de sécurité (🔒 Destructions désactivées, 🚫 Téléchargements
+désactivés, ⚠️ Tout autorisé) s'affichaient systématiquement, sans tenir compte de leur attribut
+`hidden` — donc sans rapport avec l'état réel du serveur (`allow_destructive`/`allow_downloads`).
+
+**Cause** : `.badge{display:inline-block;...}` (CSS auteur) l'emportait sur le comportement par défaut
+du navigateur pour `[hidden]` (`display:none`, une règle de la feuille de style *user-agent*) — en CSS,
+une déclaration auteur l'emporte toujours sur une déclaration *user-agent*, quelle que soit la
+spécificité du sélecteur. Seule `section[hidden]` avait une règle explicite ; aucune règle générique ne
+couvrait les autres éléments (ici des `<span class="badge">`).
+
+**Correctif** : règle globale `[hidden]{display:none!important}` ajoutée en tête de la feuille de
+style (remplace l'ancienne règle `section[hidden]` devenue redondante).
+
+Vérifié dans un vrai navigateur (Chrome headless, `getComputedStyle`) : avant le correctif, les trois
+badges rendent `display:inline-block` quel que soit leur `hidden` (reproduit le bug rapporté) ; après,
+`hidden=true` → `display:none`, `hidden=false` → `display:inline-block`, dans tous les cas testés.
+
 ## UI 1.6.2 — même lien « borgHelperWWW » dans le pied de page — 2026-09-18
 
 `borgHelperWWW` dans le pied de page devient aussi un lien vers `/` (même principe que le titre en
