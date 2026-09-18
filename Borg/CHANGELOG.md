@@ -1,5 +1,37 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.7.0 + UI 1.2.1 — postures de sécurité par défaut (destruction / téléchargements) — 2026-09-18
+
+Deux nouveaux réglages de sécurité au démarrage de `borgHelperWWW`, affichés sur `stderr` :
+
+- **`BORGHELPERWWW_ALLOW_DESTRUCTIVE`** / `--allow-destructive` / `--no-allow-destructive` / clé
+  `allow_destructive` du fichier de conf — **`false` par défaut**. `POST /prune` et `DELETE /delbkp`
+  répondent `403 Forbidden` tant qu'il n'est pas explicitement activé. `IdxPurge` (index local, pas les
+  sauvegardes elles-mêmes) n'est pas concerné.
+- **`BORGHELPERWWW_ALLOW_DOWNLOADS`** / `--allow-downloads` / `--no-downloads` / clé `allow_downloads`
+  du fichier de conf — **`true` par défaut**. `GET /download/file` et `GET /download/tar`
+  (téléchargement de données en vue d'une restauration) répondent `403 Forbidden` si désactivé.
+  `POST /restore` (écrit sur le disque du serveur borgHelperWWW, pas un téléchargement navigateur)
+  n'est pas concerné.
+
+Interface web : messages d'erreur de suppression d'archive et de Prune (vue Historique complet)
+affichent désormais le détail HTTP (`r.detail`/`HTTP {status}`) au lieu d'un générique « (pas de
+détail) » quand la réponse n'a pas la forme `CommandResult` habituelle (cas d'un `403` de ce nouveau
+gate).
+
+Vérifié de bout en bout : défauts (`DelBkp`/`Prune` → 403, téléchargement → 200) ; `--allow-destructive`
+(`DelBkp` atteint bien le sous-processus) ; `--no-downloads` (téléchargement → 403 avec message clair) ;
+mêmes réglages via le fichier de conf (`allow_destructive`/`allow_downloads`).
+
+`borghelperwww.conf.example` mis à jour avec les deux nouvelles clés.
+
+## borgHelperWWW 1.6.0 — endpoint `/healthz` (liveness) — 2026-09-18
+
+Nouvel endpoint `GET /healthz` : répond `{"status":"ok"}` (HTTP 200) dès que le processus tourne, sans
+accès `borg`/SQLite ni sous-processus `borgHelper` — pour sondes de liveness (Kubernetes, Docker,
+systemd, load-balancer…). Non protégé par `X-API-Key`, comme `/` et `/version`. Vérifié en direct :
+200 sans header d'authentification.
+
 ## borgHelperWWW 1.5.0 — fichier de conf dédié (`BORGHELPERWWW_CONF`) — 2026-09-18
 
 Nouveau fichier de conf ini pour `borgHelperWWW` lui-même (`BORGHELPERWWW_CONF` / `--conf`), distinct

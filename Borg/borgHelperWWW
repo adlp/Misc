@@ -20,7 +20,7 @@ from borgHelper import Version as BORGHELPER_VERSION, BorgRunner, BorgHelper
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.5.0"
+WWW_VERSION="1.7.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -46,6 +46,16 @@ if __name__=='__main__':
     _p.add_argument('--trusted-proxies',help="IP/CIDR des reverse proxies dont X-Forwarded-For est pris en "
                      "compte pour l'IP client réelle dans les logs, séparées par des virgules, ou '*' pour "
                      "toutes (déf. BORGHELPERWWW_TRUSTED_PROXIES, sinon 127.0.0.1 — même défaut qu'uvicorn)")
+    _p.add_argument('--allow-destructive',dest='allow_destructive',action='store_true',default=None,
+                     help="Autorise Prune/DelBkp (destruction de sauvegardes) — INTERDIT par défaut "
+                     "(déf. BORGHELPERWWW_ALLOW_DESTRUCTIVE)")
+    _p.add_argument('--no-allow-destructive',dest='allow_destructive',action='store_false',
+                     help="Force l'interdiction de Prune/DelBkp (annule un réglage venant de la conf/l'env)")
+    _p.add_argument('--allow-downloads',dest='allow_downloads',action='store_true',default=None,
+                     help="Autorise /download/file et /download/tar (téléchargement en vue d'une "
+                     "restauration) — AUTORISÉ par défaut (déf. BORGHELPERWWW_ALLOW_DOWNLOADS)")
+    _p.add_argument('--no-downloads',dest='allow_downloads',action='store_false',
+                     help="Interdit /download/file et /download/tar")
     _args=_p.parse_args()
     if _args.conf: os.environ['BORGHELPERWWW_CONF']=_args.conf
     if _args.cfgfile: os.environ['BORGHELPERWWW_CFGFILE']=_args.cfgfile
@@ -56,6 +66,8 @@ if __name__=='__main__':
     if _args.host: os.environ['BORGHELPERWWW_HOST']=_args.host
     if _args.port is not None: os.environ['BORGHELPERWWW_PORT']=str(_args.port)
     if _args.trusted_proxies: os.environ['BORGHELPERWWW_TRUSTED_PROXIES']=_args.trusted_proxies
+    if _args.allow_destructive is not None: os.environ['BORGHELPERWWW_ALLOW_DESTRUCTIVE']=str(_args.allow_destructive)
+    if _args.allow_downloads is not None: os.environ['BORGHELPERWWW_ALLOW_DOWNLOADS']=str(_args.allow_downloads)
 
 # ── Fichier de conf borgHelperWWW (BORGHELPERWWW_CONF, optionnel) ──────────────────────────
 # Ini simple, section [borgHelperWWW] (ou clés en [DEFAULT]) : comble les BORGHELPERWWW_* absentes
@@ -65,7 +77,8 @@ if __name__=='__main__':
 _CONF_KEYS={'cfgfile':'BORGHELPERWWW_CFGFILE','api_key':'BORGHELPERWWW_API_KEY',
             'borghelper_bin':'BORGHELPERWWW_BORGHELPER_BIN','ui_file':'BORGHELPERWWW_UI_FILE',
             'timeout':'BORGHELPERWWW_TIMEOUT','host':'BORGHELPERWWW_HOST','port':'BORGHELPERWWW_PORT',
-            'trusted_proxies':'BORGHELPERWWW_TRUSTED_PROXIES'}
+            'trusted_proxies':'BORGHELPERWWW_TRUSTED_PROXIES',
+            'allow_destructive':'BORGHELPERWWW_ALLOW_DESTRUCTIVE','allow_downloads':'BORGHELPERWWW_ALLOW_DOWNLOADS'}
 _conf_path=os.environ.get('BORGHELPERWWW_CONF')
 if _conf_path:
     if not os.path.isfile(_conf_path):
@@ -77,10 +90,19 @@ if _conf_path:
         if _envvar not in os.environ and _key in _sect:
             os.environ[_envvar]=_sect[_key]
 
+def _env_bool(name,default):
+    v=os.environ.get(name)
+    if v is None: return default
+    return v.strip().lower() in ('1','true','yes','on')
+
 BORGHELPER_BIN=Path(os.environ.get('BORGHELPERWWW_BORGHELPER_BIN',Path(__file__).resolve().parent/'borgHelper'))
 CFGFILE=os.environ.get('BORGHELPERWWW_CFGFILE')
 API_KEY=os.environ.get('BORGHELPERWWW_API_KEY')
 TIMEOUT=int(os.environ.get('BORGHELPERWWW_TIMEOUT','3600')) or None
+# Sécurité : par défaut, aucune action destructrice sur les sauvegardes (Prune/DelBkp) — doit être
+# explicitement autorisée. Les téléchargements (vue d'une restauration), eux, sont autorisés par défaut.
+ALLOW_DESTRUCTIVE=_env_bool('BORGHELPERWWW_ALLOW_DESTRUCTIVE',False)
+ALLOW_DOWNLOADS=_env_bool('BORGHELPERWWW_ALLOW_DOWNLOADS',True)
 
 if not CFGFILE:
     sys.exit("Fichier de conf manquant — -C/--cfgfile ou BORGHELPERWWW_CFGFILE (chemin du .borghelperrc dédié à l'API)")
@@ -95,6 +117,8 @@ if not API_KEY:
     print("─"*70,file=sys.stderr)
 if not BORGHELPER_BIN.is_file():
     sys.exit(f"borgHelper introuvable ({BORGHELPER_BIN}) — --borghelper-bin ou BORGHELPERWWW_BORGHELPER_BIN pour surcharger")
+print(f"Actions destructrices (Prune/DelBkp) : {'AUTORISÉES' if ALLOW_DESTRUCTIVE else 'interdites (défaut)'}"
+      f" — Téléchargements (restauration) : {'autorisés (défaut)' if ALLOW_DOWNLOADS else 'INTERDITS'}",file=sys.stderr)
 
 app=FastAPI(
     title="borgHelperWWW",
@@ -117,6 +141,17 @@ app=FastAPI(
 def require_api_key(x_api_key: Optional[str]=Header(default=None)):
     if not x_api_key or not secrets.compare_digest(x_api_key,API_KEY):
         raise HTTPException(401,detail="X-API-Key manquant ou invalide")
+
+def require_destructive_allowed():
+    if not ALLOW_DESTRUCTIVE:
+        raise HTTPException(403,detail="Actions destructrices (Prune/DelBkp) désactivées sur ce "
+            "serveur — démarrer borgHelperWWW avec --allow-destructive/BORGHELPERWWW_ALLOW_DESTRUCTIVE pour les autoriser")
+
+def require_downloads_allowed():
+    if not ALLOW_DOWNLOADS:
+        raise HTTPException(403,detail="Téléchargements (/download/file, /download/tar) désactivés sur ce "
+            "serveur — démarrer borgHelperWWW avec --no-downloads absent ou "
+            "BORGHELPERWWW_ALLOW_DOWNLOADS=1 pour les autoriser")
 
 # ── Exécution borgHelper ────────────────────────────────────────────────────
 
@@ -231,6 +266,7 @@ def _stream_proc(proc):
 def download_file(nick: str, path: str, bid: Optional[str]=None,
                    x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
+    require_downloads_allowed()
     cfg=_borg_cfg(nick,x_borg_passphrase)
     env=_borg_env(cfg)
     archive=bid or _latest_archive(cfg,env)
@@ -244,6 +280,7 @@ def download_file(nick: str, path: str, bid: Optional[str]=None,
 def download_tar(nick: str, prefix: Optional[str]=None, bid: Optional[str]=None,
                   x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
+    require_downloads_allowed()
     cfg=_borg_cfg(nick,x_borg_passphrase)
     env=_borg_env(cfg)
     archive=bid or _latest_archive(cfg,env)
@@ -274,6 +311,10 @@ def ui_index():
 @app.get("/version",tags=["lecture"],summary="Versions chargées au démarrage de borgHelperWWW (lui-même + borgHelper + borgHelperWWW_ui.html) — non protégé, aucune donnée sensible")
 def version():
     return {'borghelperwww_version':WWW_VERSION,'borghelper_version':BORGHELPER_VERSION,'ui_version':UI_VERSION}
+
+@app.get("/healthz",tags=["lecture"],summary="Liveness — le processus répond, rien de plus (pas d'accès borg/DB) — non protégé")
+def healthz():
+    return {'status':'ok'}
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 # Un endpoint par commande CLI de borgHelper (voir README.md), sauf Mount/UMount.
@@ -349,6 +390,7 @@ def restore(nick: str, ftor: str, where: str, bid: Optional[str]=None, flat: boo
 def delbkp(nick: str, bid: str, x_api_key: Optional[str]=Header(default=None),
            x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
+    require_destructive_allowed()
     return run_borghelper('delbkp',nick=nick,extra_args=['-b',bid],passphrase=x_borg_passphrase)
 
 @app.post("/init",response_model=CommandResult,tags=["mutation"],summary="Initialise un nouveau dépôt borg (repokey)")
@@ -371,6 +413,7 @@ def key(nick: str, x_api_key: Optional[str]=Header(default=None), x_borg_passphr
 @app.post("/prune",response_model=CommandResult,tags=["mutation"],summary="⚡ Supprime les vieux backups selon KEEP_* — irréversible")
 def prune(nick: str, x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
+    require_destructive_allowed()
     return run_borghelper('prune',nick=nick,passphrase=x_borg_passphrase)
 
 @app.post("/index",response_model=CommandResult,tags=["mutation"])

@@ -1,6 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.2.0 — bumper à chaque commit qui modifie ce fichier (lu par borgHelperWWW au
-     démarrage, exposé via GET /version) -->
+<!-- UI_VERSION: 1.2.1 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -533,7 +532,7 @@ async function deleteArchive(nick,archive,btn){
   btn.disabled=false;
   if(r.httpStatus===401) return;
   if(r.exitcode===0){ alert(`Archive ${archive} supprimée.`); loadHistoryFull(nick); }
-  else{ alert(`Échec suppression (exitcode ${r.exitcode}) :\n`+(r.stderr||r.stdout||'(pas de détail)')); }
+  else{ alert(`Échec suppression (HTTP ${r.httpStatus}) :\n`+(r.detail||r.stderr||r.stdout||'(pas de détail)')); }
 }
 
 document.getElementById('historyPruneBtn').addEventListener('click', ()=>runHistoryPrune(currentNick));
@@ -548,7 +547,7 @@ async function runHistoryPrune(nick){
   btn.disabled=false; btn.textContent=orig;
   if(r.httpStatus===401) return;
   if(r.exitcode===0){ alert(`Prune ${nick} terminé.`); loadHistoryFull(nick); }
-  else{ alert(`Prune en erreur (exitcode ${r.exitcode}) :\n`+(r.stderr||r.stdout||'(pas de détail)')); }
+  else{ alert(`Prune en erreur (HTTP ${r.httpStatus}) :\n`+(r.detail||r.stderr||r.stdout||'(pas de détail)')); }
 }
 
 async function runBackupNow(nick,btn){

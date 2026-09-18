@@ -678,6 +678,8 @@ Trois façons de configurer, cumulables — par ordre de priorité (la première
 | `BORGHELPERWWW_HOST` | `--host` | `host` | Bind — adresse (défaut `127.0.0.1`) |
 | `BORGHELPERWWW_PORT` | `--port` | `port` | Bind — port (défaut `8000`) |
 | `BORGHELPERWWW_TRUSTED_PROXIES` | `--trusted-proxies` | `trusted_proxies` | IP/CIDR des reverse proxies de confiance, séparées par des virgules, ou `*` pour toutes (défaut `127.0.0.1` — voir ci-dessous) |
+| `BORGHELPERWWW_ALLOW_DESTRUCTIVE` | `--allow-destructive`, `--no-allow-destructive` | `allow_destructive` | Autorise `Prune`/`DelBkp` (destruction de sauvegardes) — **interdit par défaut** (voir ci-dessous) |
+| `BORGHELPERWWW_ALLOW_DOWNLOADS` | `--allow-downloads`, `--no-downloads` | `allow_downloads` | Autorise `/download/file` et `/download/tar` (vue d'une restauration) — **autorisé par défaut** (voir ci-dessous) |
 
 Le serveur refuse de démarrer si le fichier de conf `.borghelperrc` (`cfgfile`) est absent (aucun des
 trois moyens ne l'a fourni). La clé API, elle, n'est **pas requise** : si absente partout,
@@ -694,6 +696,27 @@ python3 borgHelperWWW --conf /etc/borghelperwww.conf
 export BORGHELPERWWW_CONF=/etc/borghelperwww.conf
 uvicorn borgHelperWWW:app --host 0.0.0.0 --port 8000 --workers 2
 ```
+
+#### Actions destructrices et téléchargements — postures par défaut
+
+Deux réglages de sécurité au démarrage, affichés sur **stderr** au lancement (avec leur état effectif) :
+
+- **`Prune`/`DelBkp`** (destruction de sauvegardes — irréversible) : **interdits par défaut**
+  (`BORGHELPERWWW_ALLOW_DESTRUCTIVE`/`allow_destructive` = `false`). Toute requête `POST /prune` ou
+  `DELETE /delbkp` reçoit `403 Forbidden` tant que ce réglage n'est pas explicitement mis à `true`
+  (`--allow-destructive`, `BORGHELPERWWW_ALLOW_DESTRUCTIVE=1`, ou `allow_destructive = true` dans le
+  fichier de conf). Les autres actions de mutation (`Bkp`, `Index`, `Restore`, `Init`, `IdxPurge`,
+  `CacheClean`, `Login`) ne sont **pas** concernées par ce réglage.
+- **`/download/file` et `/download/tar`** (téléchargement en vue d'une restauration, streaming
+  binaire direct) : **autorisés par défaut** (`BORGHELPERWWW_ALLOW_DOWNLOADS`/`allow_downloads` =
+  `true`). Les désactiver (`--no-downloads`, `BORGHELPERWWW_ALLOW_DOWNLOADS=0`, ou
+  `allow_downloads = false`) fait répondre `403 Forbidden` à ces deux routes — utile pour une instance
+  en lecture seule (rapports/exploration uniquement, aucune extraction de données possible) tout en
+  gardant `POST /restore` (écrit sur le disque du serveur borgHelperWWW, pas un téléchargement
+  navigateur) inchangé par ce réglage.
+
+Les deux réglages sont indépendants l'un de l'autre et des permissions habituelles (`X-API-Key`,
+`X-Borg-Passphrase`) — ils s'y ajoutent, ils ne les remplacent pas.
 
 #### Derrière un reverse proxy — IP client réelle dans les logs
 
@@ -852,6 +875,12 @@ en tête du fichier HTML), toutes trois **chargées une fois au démarrage du pr
 volontairement **non protégé** par `X-API-Key` (aucune donnée sensible) — affiché dans le pied de page
 de l'interface web, visible même avant connexion.
 
+`GET /healthz` : liveness check pour orchestrateurs/superviseurs (Kubernetes, Docker, systemd,
+load-balancer…) — répond `{"status":"ok"}` (HTTP 200) dès que le processus tourne, sans toucher à
+`borg`/aux bases SQLite ni exécuter `borgHelper`. Non protégé par `X-API-Key`. Vérifie uniquement que le
+processus **répond** (liveness), pas que les dépôts/DB sont accessibles (pas de readiness check) — pour
+ça, `GET /cacheinfo` ou `GET /lstbkp` (protégés, nécessitent la clé API).
+
 #### Cache de réponses
 
 Les endpoints marqués **✓** dans la colonne Cache ci-dessous ne lisent (ou n'écrivent, pour `DiffBkp`
@@ -870,6 +899,7 @@ cette empreinte).
 | Méthode | Route | Commande CLI | Cache |
 |---------|-------|--------------|:---:|
 | GET | `/version` | *(aucune — spécifique à borgHelperWWW)* | |
+| GET | `/healthz` | *(aucune — liveness, spécifique à borgHelperWWW)* | |
 | GET | `/stats` | Stats | |
 | POST | `/login` | Login | |
 | GET | `/lstbkp` | LstBkp | ✓ |
@@ -895,6 +925,11 @@ cette empreinte).
 | GET | `/difftop` | DiffTop | ✓ |
 | POST | `/idxpurge` | IdxPurge ⚡ | |
 
+`DelBkp` et `Prune` (destruction de sauvegardes) reçoivent `403 Forbidden` tant que
+`BORGHELPERWWW_ALLOW_DESTRUCTIVE` n'est pas activé (interdit par défaut — voir
+[Configuration](#configuration)) ; `IdxPurge`, bien que marqué ⚡ (irréversible sur l'index local, pas
+sur les sauvegardes elles-mêmes), n'est **pas** concerné par ce réglage.
+
 Réponse (`CommandResult`) commune à tous les endpoints ci-dessus :
 
 ```json
@@ -917,7 +952,9 @@ incompatible avec la réponse JSON texte de `CommandResult`. Ces deux routes lis
 
 Passphrase via `X-Borg-Passphrase` comme les autres actions marquées 🔑. Réponse : le flux binaire
 directement (pas de `CommandResult`) ; en cas d'erreur avant le début du stream, `HTTPException` JSON
-classique (404 nick/archive inconnu, 502 `borg list` en échec, 504 timeout).
+classique (404 nick/archive inconnu, 502 `borg list` en échec, 504 timeout, **403** si
+`BORGHELPERWWW_ALLOW_DOWNLOADS` est désactivé — autorisé par défaut, voir
+[Configuration](#configuration)).
 
 ### Limites connues
 

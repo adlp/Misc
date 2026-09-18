@@ -42,3 +42,11 @@ cfgfile = /etc/borghelperrc-www
 ; (exécution directe uniquement ; défaut 127.0.0.1, comme uvicorn lui-même — voir README.md,
 ; section « Derrière un reverse proxy »)
 ;trusted_proxies = 127.0.0.1
+
+; Autorise Prune/DelBkp (destruction de sauvegardes, irréversible) — BORGHELPERWWW_ALLOW_DESTRUCTIVE /
+; --allow-destructive. INTERDIT par défaut (false) — à activer explicitement en connaissance de cause.
+;allow_destructive = false
+
+; Autorise /download/file et /download/tar (téléchargement de données en vue d'une restauration) —
+; BORGHELPERWWW_ALLOW_DOWNLOADS / --allow-downloads / --no-downloads. AUTORISÉ par défaut (true).
+;allow_downloads = true
