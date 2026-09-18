@@ -827,14 +827,35 @@ correspondants, canonicalisée (`/` final retiré, doublons éliminés, tout pr�
 un préfixe plus large gardé retiré — la racine `/` absorbe alors tout le reste). Voir
 [Fichier de configuration](#fichier-de-configuration) pour la syntaxe exacte de la clef.
 
-Cette Story 1.1 **résout et expose** ce périmètre (voir `GET /access` ci-dessous) — elle ne
-l'applique encore à **aucune** commande de lecture : `Search`/`FileHist`/`TreeHist`/`TreeFind`/
-`LstBkpFls`/`DiffBkp`/`DuIdx`/`IdxTop`/`DiffTop` renvoient toujours l'intégralité de ce que le
-tier autorise, sans filtrage par sous-arborescence (filtrage prévu dans une story ultérieure du
-même epic) ; `Restore`/`/download/file`/`/download/tar` (garde pré-appel, pas un filtrage
-a posteriori) sont couverts par un epic séparé, construit sur cette même résolution de périmètre.
-`Bkp/Index/Prune/DelBkp/Init/Key/IdxPurge/Stats` n'ont pas de notion de sous-chemin et ne sont
-jamais concernés.
+Story 1.1 **résout et expose** ce périmètre (voir `GET /access` ci-dessous). Depuis la Story 1.3,
+il est aussi **appliqué** — en filtrage a posteriori — sur six des neuf commandes de lecture
+concernées : `Search`, `FileHist`, `LstBkpFls`, `DiffBkp`, `TreeHist`, `TreeFind`. Principe : dès
+qu'**au moins un** nick de la requête porte un périmètre restreint, `borgHelperWWW` appelle
+`borgHelper` en interne avec `-j` (même si le client n'a rien demandé de spécial), retire du JSON
+obtenu les lignes/chemins hors périmètre, et répond avec ce JSON — **la réponse devient alors
+JSON même sans `?json=true`** (`TreeHist`/`TreeFind`) et même si le client n'a jamais eu la
+possibilité de le demander (`Search`/`FileHist`/`LstBkpFls`/`DiffBkp`, qui ne gagnent aucun
+paramètre `?json=` dans cette story). `DiffBkp` recalcule en plus `n_add`/`n_rem`/`n_mod` à partir
+des entrées filtrées, jamais depuis le compte non filtré. Un appelant **sans aucune restriction**
+sur les nicks demandés (admin, ou autorisation par groupes désactivée) ne voit **aucun**
+changement de format : texte par défaut, JSON seulement sur demande explicite là où c'était déjà
+possible — exactement comme avant cette story.
+
+`DuIdx`/`IdxTop`/`DiffTop` (agrégats) restent, pour l'instant, non filtrés (Story 1.4, distincte —
+recalcul d'agrégats, pas un simple retrait de lignes) ; `Restore`/`/download/file`/`/download/tar`
+(garde pré-appel, pas un filtrage a posteriori) sont couverts par un epic séparé, construit sur
+cette même résolution de périmètre. `Bkp/Index/Prune/DelBkp/Init/Key/IdxPurge/Stats` n'ont pas de
+notion de sous-chemin et ne sont jamais concernés.
+
+⚠️ **Chemins stockés sans `/` initial, préfixes `GROUPS_PATHS` avec un `/` initial** : vérifié
+contre le dépôt réel (`borg create /lib/modules` stocke des chemins d'archive `lib/modules/...`,
+jamais `/lib/modules/...`), alors que `GROUPS_PATHS` s'écrit **avec** un `/` initial (exemple
+Story 1.1 : `GROUPS_PATHS = ops-readers:/lib/modules/6.8.0-generic`). La fonction de comparaison
+partagée (`_path_in_scope`, AD-7 — segments de chemin complets, jamais sous-chaîne) normalise ce
+décalage en retirant le `/` initial des préfixes de périmètre avant de comparer — sans cette
+normalisation, toute comparaison scopée échoue silencieusement et un appelant scopé n'obtient
+jamais aucun résultat, pour aucun nick (trouvé en investigation d'implémentation, avant tout
+déploiement — fail-closed, jamais une fuite, mais un vrai bug fonctionnel).
 
 ⚠️ **`GROUPS_PATHS` est relu, et donc revalidé, à chaque appel** — `.borghelperrc` n'est jamais mis
 en cache côté config (`cfgread()` relit le fichier depuis le disque à chaque fois). Une valeur
@@ -1059,6 +1080,15 @@ entrées (purge totale au-delà, garde-fou anti-croissance illimitée). `GET /re
 mode `offline=true` (le mode en ligne interroge le dépôt en direct via `borg info`, non couvert par
 cette empreinte).
 
+⚠️ **Périmètre de chemin actif ⇒ jamais servi depuis ce cache** (Story 1.3) : pour `/search`,
+`/filehist`, `/lstbkpfls`, `/diffbkp`, `/treehist`, `/treefind`, dès qu'**au moins un** nick de la
+requête porte un périmètre restreint (`GROUPS_PATHS`), l'appel contourne entièrement
+`_RESPONSE_CACHE` — ni lu, ni écrit — et relance `borgHelper` à chaque fois. Seul le cas
+entièrement non restreint (autorisation par groupes désactivée, ou appelant sans aucun périmètre
+sur tous les nicks demandés) continue d'utiliser ce cache, exactement comme avant cette story. Un
+cache dédié au résultat **filtré**, avec le périmètre dans sa clé, est prévu pour une story
+ultérieure du même epic (1.5) — pas celle-ci.
+
 | Méthode | Route | Commande CLI | Cache |
 |---------|-------|--------------|:---:|
 | GET | `/version` | *(aucune — spécifique à borgHelperWWW)* | |
@@ -1158,6 +1188,17 @@ classique (404 nick/archive inconnu, 502 `borg list` en échec, 504 timeout, **4
   leur durée — pas de file d'attente/job asynchrone. Prévoir `--workers` et un timeout côté reverse-proxy.
 - Le budget d'authentification est volontairement simple (une seule clé partagée). Pour un usage
   multi-utilisateurs avec traçabilité par appelant, ajouter une couche d'auth dédiée devant l'API.
+- **Interface web pas encore adaptée au filtrage par périmètre (Story 1.3)** : `borgHelperWWW_ui.html`
+  ne distingue pas encore une réponse filtrée (JSON forcé par un périmètre restreint) d'une réponse
+  normale — elle continue d'afficher le JSON forcé comme si c'était la forme attendue, sans indiquer
+  à l'utilisateur que le résultat a été réduit à son périmètre. Connu, non traité dans cette story
+  (périmètre volontairement limité à l'API HTTP elle-même) — suivi séparé côté UI.
+- **`DuIdx`/`IdxTop`/`DiffTop` non filtrés par périmètre (Story 1.3)** : ces trois commandes
+  d'agrégats renvoient encore des totaux/tops calculés sur l'ensemble d'un nick, sans tenir compte
+  d'un périmètre `GROUPS_PATHS` restreint — un appelant scopé peut donc en déduire de l'information
+  sur des chemins hors de son périmètre (tailles, noms de plus gros consommateurs, etc.). Fermé par
+  Story 1.4 (recalcul d'agrégats filtrés), non par celle-ci (périmètre volontairement limité aux
+  commandes qui renvoient des chemins ou des listes indexées par chemin).
 
 ---
 

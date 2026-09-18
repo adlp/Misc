@@ -1,5 +1,72 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.12.0 — filtrage par périmètre sur Search/FileHist/LstBkpFls/DiffBkp/TreeHist/TreeFind (Epic 1, Story 1.3) — 2026-09-18
+
+Troisième brique de la consultation scopée par arborescence (Epic 1) : le périmètre de chemin
+résolu par Story 1.1 (`GROUPS_PATHS`) est désormais **appliqué**, en filtrage a posteriori, sur les
+six commandes de lecture qui renvoient des chemins ou des listes indexées par chemin —
+`Search`/`FileHist`/`LstBkpFls`/`DiffBkp`/`TreeHist`/`TreeFind`. `DuIdx`/`IdxTop`/`DiffTop`
+(agrégats) restent hors périmètre de cette story (Story 1.4, distincte : recalcul de totaux/top-N).
+
+- Dès qu'**au moins un** nick de la requête porte un périmètre restreint, `borgHelperWWW` appelle
+  `borgHelper` avec `-j` en interne (même si le client n'a rien demandé), retire du JSON les
+  lignes/chemins hors périmètre, et répond avec ce JSON — **la réponse devient JSON même sans
+  `?json=true`** (`TreeHist`/`TreeFind`), sans aucun nouveau paramètre `?json=` côté client pour
+  `Search`/`FileHist`/`LstBkpFls`/`DiffBkp`. `DiffBkp` recalcule `n_add`/`n_rem`/`n_mod` depuis les
+  entrées filtrées, jamais depuis le compte non filtré. Un appelant sans restriction (admin, ou
+  autorisation par groupes désactivée) ne voit **aucun** changement : texte par défaut, JSON
+  seulement sur demande explicite là où c'était déjà possible — byte-identical à avant cette story.
+- Requête multi-nick (`Search`/`FileHist`/`TreeHist`/`TreeFind`, `nick=a,b`) : chaque nick est
+  filtré contre **son propre** périmètre résolu ; un seul nick scopé force tout le corps en JSON,
+  les nicks non scopés de la même requête restent non filtrés.
+- Nouvelle fonction partagée `_path_in_scope(path, scope)` (AD-7 : comparaison par segments de
+  chemin complets, jamais sous-chaîne) — **corrige un bug trouvé en investigation d'implémentation,
+  avant tout déploiement** : les chemins stockés par `borgHelper` (`archive_snapshot_v`/
+  `diff_index`, vérifié contre un dépôt réel) n'ont jamais de `/` initial, alors que les préfixes
+  `GROUPS_PATHS` s'écrivent **avec** un `/` initial (convention Story 1.1) — sans normalisation de
+  ce décalage, toute comparaison scopée échouait silencieusement et un appelant scopé n'obtenait
+  jamais aucun résultat, pour aucun nick (fail-closed, jamais une fuite, mais un vrai bug
+  fonctionnel qui serait passé inaperçu sans un test contre des chemins stockés réels).
+- `_RESPONSE_CACHE` (cache mémoire existant) n'est plus utilisé (ni lu, ni écrit) pour un appel dont
+  au moins un nick est scopé — reste réservé au cas entièrement non restreint, exactement comme
+  avant cette story. Un cache dédié au résultat filtré (clé incluant le périmètre) est prévu pour
+  Story 1.5, pas celle-ci.
+- `borgHelperWWW` 1.11.0 → **1.12.0**.
+
+Vérifié en conditions réelles contre `demo.borghelperrc` (données déjà indexées par Story 1.2) :
+`borgHelperWWW` lancé avec `--groups-header X-Groups`, un groupe `ops-readers` scopé sur un sous-
+répertoire de `demo-modules` (`/lib/modules/6.2.0-39-generic`, un des trois répertoires de version
+noyau réellement présents dans les données indexées) — `Search`/`FileHist`/`LstBkpFls`/`DiffBkp`/
+`TreeHist`/`TreeFind` ne renvoient que des chemins de ce sous-répertoire, en JSON même sans
+`?json=true` ; le même groupe non scopé sur `demo-usrlocal` (multi-nick `Search`) reste non
+filtré dans la même réponse ; un appelant `ops-admins` (illimité) obtient un texte byte-identique à
+l'appel direct `borgHelper` (diff vide) et, sur `TreeHist`/`TreeFind` avec `?json=true`, un JSON
+byte-identique à l'appel direct `borgHelper -j`. Complété par des tests unitaires en isolation
+(`_path_in_scope`, `_filter_diffbkp` + recalcul des compteurs sur des entrées synthétiques
+couvrant les deux répertoires, `_filter_per_nick_listkey`, `_filter_filehist`) pour les cas que les
+données réelles du dépôt de démo ne couvraient pas (aucune différence entre les dernières archives
+indexées). `python3 -m py_compile borgHelperWWW borgHelper` propre.
+
+`README.md`/`TECHNICAL.md` mis à jour (mécanisme de filtrage, normalisation du `/` initial avec sa
+justification, caveat de cache, limite connue côté UI qui ne distingue pas encore une réponse
+filtrée).
+
+**Correction issue de la revue (itération 1, avant commit)** : `Search`/`FileHist`/`TreeHist`/
+`TreeFind` construisaient leur liste de nicks par un simple `nick.split(',')`, sans passer par
+`_nick_list()` (déjà utilisé par `_check_group_access` pour exactement ce besoin) — un appelant
+scopé demandant `nick=ALL` littéral voyait `cfgread('ALL')` renvoyer `None` (aucune section `ALL`
+n'existe), interprété comme périmètre illimité par `_resolve_scopes_for_request`, donc `_any_scoped`
+à `False` et la requête retombait entièrement non filtrée — un contournement complet du filtrage de
+cette story pour ces quatre routes via `nick=ALL`, confirmé en conditions réelles avant correction
+puis re-vérifié après (réponse filtrée, JSON forcé, aucun changement pour un appelant illimité).
+Corrigé en remplaçant le découpage manuel par `_nick_list(nick)` dans les quatre routes.
+`LstBkpFls`/`DiffBkp` (mono-nick) ne sont pas affectées : `nick=ALL` y échoue déjà proprement
+(exitcode non nul, aucune donnée) côté `borgHelper`, qui ne sait pas résoudre un nick agrégé sur ces
+deux commandes — vérifié, pas de correctif nécessaire. `_run_scoped()` durci en complément : un
+`stdout` non-JSON malgré `-j` pour un appelant scopé renvoie désormais une erreur (fail-closed)
+plutôt que de relayer tel quel une sortie potentiellement non filtrée (cas non atteignable
+aujourd'hui, mais contraire au principe fail-closed affiché par cette story).
+
 ## borgHelper 1.0.95 — mode JSON sur Search, FileHist, LstBkpFls, DiffBkp (Epic 1, Story 1.2) — 2026-09-18
 
 Deuxième brique de la consultation scopée par arborescence (Epic 1) : `Search`, `FileHist`,

@@ -6,7 +6,7 @@
 #* See <http://www.gnu.org/licenses/>
 #*/
 
-import os,re,sys,secrets,subprocess,configparser
+import os,re,sys,json,secrets,subprocess,configparser
 from pathlib import Path
 from typing import Optional
 
@@ -20,7 +20,7 @@ from borgHelper import Version as BORGHELPER_VERSION, BorgRunner, BorgHelper
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.11.0"
+WWW_VERSION="1.12.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -320,6 +320,50 @@ def _resolve_path_scope(user_groups,cfg):
         prefixes.extend(groups_paths[g])
     return _canonicalize_scope(prefixes)
 
+def _path_in_scope(path,scope):
+    """Story 1.3, AD-7 : True si `path` est dans `scope` (déjà canonicalisé par
+    `_canonicalize_scope`/`_resolve_path_scope`), False sinon. `scope=None` (illimité) -> toujours
+    True — l'appelant doit avoir déjà tranché ce cas (voir la mise en garde 'None est ambigu' de
+    `_resolve_path_scope`) avant d'arriver ici pour un nick sur lequel l'appelant n'a aucun tier.
+
+    Comparaison par segments de chemin complets, jamais sous-chaîne : `path==prefix` ou
+    `path.startswith(prefix+'/')` (le cas racine `prefix==''` absorbe tout). Normalise le décalage
+    de convention documenté (Boundaries du spec 1.3) : les chemins stockés par borgHelper
+    (`archive_snapshot_v`/`diff_index`) n'ont JAMAIS de '/' initial, alors que les préfixes
+    `GROUPS_PATHS` s'écrivent AVEC un '/' initial (convention Story 1.1) — sans ce retrait, toute
+    comparaison scopée échoue silencieusement et tout appelant scopé n'obtient jamais aucun
+    résultat, pour aucun nick (fail-closed, pas une fuite, mais un bug fonctionnel réel)."""
+    if scope is None: return True
+    path=(path or '').lstrip('/')
+    for prefix in scope:
+        p=prefix.lstrip('/')
+        if p=='' or path==p or path.startswith(p+'/'): return True
+    return False
+
+def _resolve_scopes_for_request(request,nicks):
+    """Résout le périmètre (Story 1.1, `_resolve_path_scope`) de chaque nick de `nicks` pour
+    l'appelant HTTP courant -> {nick: scope|None}. `GROUPS_HEADER` désactivé (autorisation par
+    groupes éteinte) -> illimité pour tous, sans même lire `.borghelperrc` (comportement
+    inchangé/rapide, même court-circuit que partout ailleurs dans ce fichier).
+
+    ⚠️ Par construction, cette fonction n'est appelée que depuis le corps d'un endpoint du routeur
+    (après la dépendance `_check_group_access`, qui a déjà validé le tier requis pour tous les
+    nicks demandés) — un `None` renvoyé ici pour un nick de `nicks` signifie donc toujours
+    'périmètre illimité', jamais 'aucun tier' (voir la mise en garde de `_resolve_path_scope`)."""
+    if not GROUPS_HEADER: return {n:None for n in nicks}
+    user_groups=_parse_groups(request.headers.get(GROUPS_HEADER))
+    out={}
+    for n in nicks:
+        cfg=_bh_paths.borg.cfgread(n)
+        out[n]=_resolve_path_scope(user_groups,cfg) if cfg is not None else None
+    return out
+
+def _any_scoped(scopes):
+    """True si au moins un nick de `scopes` (dict {nick: scope|None}) porte un périmètre restreint
+    -> force JSON + filtrage a posteriori (Boundaries du spec 1.3 : une requête multi-nick ne peut
+    pas mélanger texte et JSON dans un seul corps HTTP, donc UN nick scopé force tout le corps)."""
+    return any(s is not None for s in scopes.values())
+
 def _default_section_groups():
     """[DEFAULT] brut du .borghelperrc — utilisé par Login quand le nick visé n'existe pas encore
     (rien à lire depuis une section qui n'existe pas : politique globale de qui peut en créer une)."""
@@ -421,14 +465,11 @@ def _cache_fingerprint(nick: Optional[str]) -> str:
         except OSError: parts.append(f"{p}:absent")
     return '|'.join(parts)
 
-def run_borghelper(cmd: str, nick: Optional[str]=None, extra_args=(), passphrase: Optional[str]=None,
-                    cacheable: bool=False) -> JSONResponse:
-    key=(cmd,nick,tuple(extra_args)) if cacheable else None
-    if key is not None:
-        cached=_RESPONSE_CACHE.get(key)
-        if cached is not None and cached[0]==_cache_fingerprint(nick):
-            result_dict=cached[1]
-            return JSONResponse(status_code=200 if result_dict['exitcode']==0 else 400,content=result_dict)
+def _exec_borghelper(cmd: str, nick: Optional[str], extra_args, passphrase: Optional[str]=None) -> CommandResult:
+    """Sous-processus borgHelper brut, sans cache ni encapsulation JSONResponse — factorisé hors de
+    `run_borghelper()` pour être réutilisé tel quel par `_run_scoped()` (Story 1.3), qui a besoin du
+    `stdout` brut avant de le filtrer et ne doit jamais passer par `_RESPONSE_CACHE` (Boundaries du
+    spec 1.3 : le cache reste réservé au cas non restreint)."""
     argv=[sys.executable,str(BORGHELPER_BIN),'-C',CFGFILE,'-c',cmd]
     if nick: argv+=['-n',nick]
     argv+=list(extra_args)
@@ -438,11 +479,102 @@ def run_borghelper(cmd: str, nick: Optional[str]=None, extra_args=(), passphrase
         proc=subprocess.run(argv,capture_output=True,text=True,timeout=TIMEOUT,env=env)
     except subprocess.TimeoutExpired:
         raise HTTPException(504,detail=f"Commande {cmd} : timeout après {TIMEOUT}s")
-    result=CommandResult(exitcode=proc.returncode,stdout=proc.stdout,stderr=proc.stderr)
+    return CommandResult(exitcode=proc.returncode,stdout=proc.stdout,stderr=proc.stderr)
+
+def run_borghelper(cmd: str, nick: Optional[str]=None, extra_args=(), passphrase: Optional[str]=None,
+                    cacheable: bool=False) -> JSONResponse:
+    key=(cmd,nick,tuple(extra_args)) if cacheable else None
+    if key is not None:
+        cached=_RESPONSE_CACHE.get(key)
+        if cached is not None and cached[0]==_cache_fingerprint(nick):
+            result_dict=cached[1]
+            return JSONResponse(status_code=200 if result_dict['exitcode']==0 else 400,content=result_dict)
+    result=_exec_borghelper(cmd,nick,extra_args,passphrase)
     if key is not None:
         if len(_RESPONSE_CACHE)>500: _RESPONSE_CACHE.clear()  # garde-fou anti-croissance illimitée
         _RESPONSE_CACHE[key]=(_cache_fingerprint(nick),result.dict())
-    return JSONResponse(status_code=200 if proc.returncode==0 else 400,content=result.dict())
+    return JSONResponse(status_code=200 if result.exitcode==0 else 400,content=result.dict())
+
+# ── Filtrage a posteriori par périmètre (Story 1.3) ─────────────────────────
+# _run_scoped() : variante non-cacheable de run_borghelper() pour les 6 routes Search/FileHist/
+# LstBkpFls/DiffBkp/TreeHist/TreeFind quand au moins un nick de la requête porte un périmètre
+# restreint (_any_scoped()). Force -j (si absent), parse le JSON renvoyé par borgHelper, applique
+# une des fonctions _filter_* ci-dessous, ré-sérialise dans `stdout`. Jamais mis en
+# `_RESPONSE_CACHE` : deux périmètres différents ne doivent jamais partager une réponse en cache
+# (voir ARCHITECTURE-SPINE.md AD-5 — le cache dédié par périmètre est Story 1.5, pas celui-ci).
+
+def _run_scoped(cmd: str, nick: str, extra_args, filter_fn, passphrase: Optional[str]=None) -> JSONResponse:
+    args=list(extra_args)
+    if '-j' not in args: args=args+['-j']
+    result=_exec_borghelper(cmd,nick,args,passphrase)
+    if result.exitcode==0:
+        try:
+            parsed=json.loads(result.stdout)
+            result.stdout=json.dumps(filter_fn(parsed),ensure_ascii=False,indent=2)
+        except ValueError:
+            # stdout non-JSON malgré -j : ne devrait jamais arriver, mais un appelant a un périmètre
+            # restreint ici — fail-closed (jamais relayer du stdout non filtré), pas fail-open.
+            result.exitcode=1; result.stdout=''; result.stderr=(result.stderr or '')+"\n[borgHelperWWW] réponse non-JSON reçue pour un appelant à périmètre restreint — requête refusée."
+    return JSONResponse(status_code=200 if result.exitcode==0 else 400,content=result.dict())
+
+def _filter_per_nick_list(results,scopes,path_key='path'):
+    """Search : `results` = {nick: [{...,path_key:...}, ...] | {'error':msg}}. Filtre chaque liste
+    par le périmètre de SON nick ; laisse les `{'error':...}` intacts (rien à filtrer)."""
+    if not isinstance(results,dict): return results
+    out={}
+    for n,val in results.items():
+        out[n]=[row for row in val if _path_in_scope(row.get(path_key,''),scopes.get(n))] if isinstance(val,list) else val
+    return out
+
+def _filter_filehist(results,path,scopes):
+    """FileHist : mêmes formes que Search mais chaque ligne n'a PAS de champ path (c'est le `path`
+    demandé, un seul par requête, implicite pour toutes les lignes d'un nick) — donc pas de
+    filtrage ligne par ligne : soit le `path` demandé est dans le périmètre du nick (liste
+    inchangée), soit il ne l'est pas (liste vidée pour ce nick — même défaut non-glamour que
+    TreeHist/TreeFind sur un préfixe hors périmètre, voir Design Notes du spec 1.3)."""
+    if not isinstance(results,dict): return results
+    out={}
+    for n,val in results.items():
+        out[n]=(val if _path_in_scope(path,scopes.get(n)) else []) if isinstance(val,list) else val
+    return out
+
+def _filter_str_list(d,scope,key):
+    """LstBkpFls : `d` = {'nick':...,'archive':...,'files':[chemin,...]} | {'error':msg} — pas de
+    dict par nick (route mono-nick), `files` est une liste de chemins bruts (pas de dict par ligne)."""
+    if isinstance(d,dict) and key in d:
+        d=dict(d); d[key]=[s for s in d[key] if _path_in_scope(s,scope)]
+    return d
+
+def _filter_diffbkp(result,scope):
+    """DiffBkp : `result` = {'archive_old','archive_new','entries':[{...,'path':...}],'n_add','n_rem',
+    'n_mod'} | {'error':msg} — route mono-nick. Filtre `entries` par `path` puis RECALCULE
+    n_add/n_rem/n_mod à partir des entrées filtrées (Boundaries du spec 1.3 / FR8 : jamais transmis
+    depuis le compte non filtré) avec la même formule que `borgHelper.diffbkp()` : n_add = compte
+    `change_type=='added'`, n_rem = compte `'removed'`, n_mod = reste."""
+    if isinstance(result,dict) and 'entries' in result:
+        result=dict(result)
+        entries=[e for e in result['entries'] if _path_in_scope(e.get('path',''),scope)]
+        n_add=sum(1 for e in entries if e['change_type']=='added')
+        n_rem=sum(1 for e in entries if e['change_type']=='removed')
+        result['entries']=entries; result['n_add']=n_add; result['n_rem']=n_rem; result['n_mod']=len(entries)-n_add-n_rem
+    return result
+
+def _filter_per_nick_listkey(results,scopes,list_key,item_path_key='full_path'):
+    """TreeHist (`list_key='entries'`) / TreeFind (`list_key='matches'`) : `results` = {nick:
+    {...,list_key:[{...,item_path_key:...},...]} | {'error':msg}}. Filtre la liste imbriquée par le
+    périmètre de SON nick, sur `full_path` (jamais `name`, qui n'est que le nom de base — Boundaries
+    du spec 1.3). Pour TreeHist, l'entrée '.' (le préfixe demandé lui-même) est filtrée comme les
+    autres : un préfixe hors périmètre vide donc naturellement le résultat, sans cas particulier.
+    ⚠️ Ne pas confondre le `list_key`/`item_path_key` RBAC ici avec la clé JSON `'scope'` que
+    TreeFind utilise pour son propre préfixe de recherche (sans rapport, voir Design Notes)."""
+    if not isinstance(results,dict): return results
+    out={}
+    for n,val in results.items():
+        if isinstance(val,dict) and list_key in val:
+            val=dict(val)
+            val[list_key]=[item for item in val[list_key] if _path_in_scope(item.get(item_path_key,''),scopes.get(n))]
+        out[n]=val
+    return out
 
 # ── Téléchargements (accès borg direct, streaming binaire) ─────────────────────
 # Seule exception au principe "tout passe par borgHelper en sous-processus" : un téléchargement
@@ -598,9 +730,14 @@ def lstbkp(nick: str, x_api_key: Optional[str]=Header(default=None)):
     return run_borghelper('lstbkp',nick=nick,cacheable=True)
 
 @router.get("/lstbkpfls",response_model=CommandResult,tags=["lecture"])
-def lstbkpfls(nick: str, bid: Optional[str]=None, x_api_key: Optional[str]=Header(default=None)):
+def lstbkpfls(nick: str, request: Request, bid: Optional[str]=None, x_api_key: Optional[str]=Header(default=None)):
+    """Réponse filtrée par périmètre (chemins hors scope retirés de `files`) si l'appelant a un
+    périmètre restreint sur `nick` ; identique à avant Story 1.3 sinon."""
     require_api_key(x_api_key)
     extra=['-b',bid] if bid else []
+    scope=_resolve_scopes_for_request(request,[nick]).get(nick)
+    if scope is not None:
+        return _run_scoped('lstbkpfls',nick,extra,lambda data:_filter_str_list(data,scope,'files'))
     return run_borghelper('lstbkpfls',nick=nick,extra_args=extra,cacheable=True)
 
 @router.get("/report",response_model=CommandResult,tags=["lecture"])
@@ -619,12 +756,17 @@ def report(nick: str="ALL", n: Optional[int]=Query(default=None,description="n d
     return run_borghelper('report',nick=nick,extra_args=extra,passphrase=x_borg_passphrase,cacheable=offline)
 
 @router.get("/diffbkp",response_model=CommandResult,tags=["lecture"])
-def diffbkp(nick: str, bid_old: Optional[str]=None, bid_new: Optional[str]=None,
+def diffbkp(nick: str, request: Request, bid_old: Optional[str]=None, bid_new: Optional[str]=None,
             x_api_key: Optional[str]=Header(default=None)):
+    """Réponse filtrée par périmètre (`entries` + n_add/n_rem/n_mod recalculés) si l'appelant a un
+    périmètre restreint sur `nick` ; identique à avant Story 1.3 sinon."""
     require_api_key(x_api_key)
     extra=[]
     if bid_old and bid_new: extra=['-b',f"{bid_old},{bid_new}"]
     elif bid_old: extra=['-b',bid_old]
+    scope=_resolve_scopes_for_request(request,[nick]).get(nick)
+    if scope is not None:
+        return _run_scoped('diffbkp',nick,extra,lambda data:_filter_diffbkp(data,scope))
     return run_borghelper('diffbkp',nick=nick,extra_args=extra,cacheable=True)
 
 @router.get("/restore/perms",response_model=CommandResult,tags=["lecture"],summary="Liste les droits d'un fichier sans restaurer (Restore -L)")
@@ -684,41 +826,69 @@ def index(nick: str, force: bool=False, snapshot_only: bool=False, archive: Opti
     return run_borghelper('index',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
 
 @router.get("/search",response_model=CommandResult,tags=["lecture"])
-def search(nick: str, pattern: str, archive_from: Optional[str]=None, archive_to: Optional[str]=None,
+def search(nick: str, pattern: str, request: Request, archive_from: Optional[str]=None, archive_to: Optional[str]=None,
            x_api_key: Optional[str]=Header(default=None)):
+    """Réponse filtrée par périmètre, par nick, si au moins un nick de `nick` a un périmètre
+    restreint pour l'appelant (force JSON même sans `?json=true`) ; identique à avant Story 1.3
+    sinon."""
     require_api_key(x_api_key)
     extra=['-f',pattern]
     if archive_from: extra+=['-b',archive_from]
     if archive_to: extra+=['-B',archive_to]
+    nicks=_nick_list(nick)
+    scopes=_resolve_scopes_for_request(request,nicks)
+    if _any_scoped(scopes):
+        return _run_scoped('search',nick,extra,lambda data:_filter_per_nick_list(data,scopes))
     return run_borghelper('search',nick=nick,extra_args=extra,cacheable=True)
 
 @router.get("/filehist",response_model=CommandResult,tags=["lecture"])
-def filehist(nick: str, path: str, archive_from: Optional[str]=None, archive_to: Optional[str]=None,
+def filehist(nick: str, path: str, request: Request, archive_from: Optional[str]=None, archive_to: Optional[str]=None,
              x_api_key: Optional[str]=Header(default=None)):
+    """Réponse filtrée par périmètre, par nick, si au moins un nick de `nick` a un périmètre
+    restreint pour l'appelant (force JSON même sans `?json=true`) ; identique à avant Story 1.3
+    sinon."""
     require_api_key(x_api_key)
     extra=['-f',path]
     if archive_from: extra+=['-b',archive_from]
     if archive_to: extra+=['-B',archive_to]
+    nicks=_nick_list(nick)
+    scopes=_resolve_scopes_for_request(request,nicks)
+    if _any_scoped(scopes):
+        return _run_scoped('filehist',nick,extra,lambda data:_filter_filehist(data,path,scopes))
     return run_borghelper('filehist',nick=nick,extra_args=extra,cacheable=True)
 
 @router.get("/treehist",response_model=CommandResult,tags=["lecture"],summary="Pour chaque objet sous un préfixe : archives où il a changé")
-def treehist(nick: str, prefix: Optional[str]=None, archive_from: Optional[str]=None, archive_to: Optional[str]=None,
+def treehist(nick: str, request: Request, prefix: Optional[str]=None, archive_from: Optional[str]=None, archive_to: Optional[str]=None,
              json_output: bool=Query(default=False,alias="json"), x_api_key: Optional[str]=Header(default=None)):
+    """Réponse filtrée par périmètre, par nick, sur `full_path`, si au moins un nick de `nick` a un
+    périmètre restreint pour l'appelant (force JSON même sans `?json=true`) ; identique à avant
+    Story 1.3 sinon."""
     require_api_key(x_api_key)
     extra=[]
     if prefix: extra+=['-f',prefix]
     if archive_from: extra+=['-b',archive_from]
     if archive_to: extra+=['-B',archive_to]
+    nicks=_nick_list(nick)
+    scopes=_resolve_scopes_for_request(request,nicks)
+    if _any_scoped(scopes):
+        return _run_scoped('treehist',nick,extra,lambda data:_filter_per_nick_listkey(data,scopes,'entries'))
     if json_output: extra.append('-j')
     return run_borghelper('treehist',nick=nick,extra_args=extra,cacheable=True)
 
 @router.get("/treefind",response_model=CommandResult,tags=["lecture"],summary="Recherche récursive par nom (glob minimal * et .) sous un préfixe, dans le dernier snapshot connu")
-def treefind(nick: str, prefix: Optional[str]=None, pattern: Optional[str]=None,
+def treefind(nick: str, request: Request, prefix: Optional[str]=None, pattern: Optional[str]=None,
              json_output: bool=Query(default=False,alias="json"), x_api_key: Optional[str]=Header(default=None)):
+    """Réponse filtrée par périmètre, par nick, sur `full_path`, si au moins un nick de `nick` a un
+    périmètre restreint pour l'appelant (force JSON même sans `?json=true`) ; identique à avant
+    Story 1.3 sinon."""
     require_api_key(x_api_key)
     extra=[]
     if prefix: extra+=['-f',prefix]
     if pattern: extra+=['-m',pattern]
+    nicks=_nick_list(nick)
+    scopes=_resolve_scopes_for_request(request,nicks)
+    if _any_scoped(scopes):
+        return _run_scoped('treefind',nick,extra,lambda data:_filter_per_nick_listkey(data,scopes,'matches'))
     if json_output: extra.append('-j')
     return run_borghelper('treefind',nick=nick,extra_args=extra,cacheable=True)
 

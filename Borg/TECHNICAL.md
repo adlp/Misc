@@ -892,6 +892,95 @@ tel quel en `500` non catché. C'est la seule route du projet où le contrat hab
 0` ⇒ 400, sinon 200 » (voir plus bas) ne s'applique pas : une config invalide en cours d'exécution
 produit un `500` FastAPI standard (exception non gérée), pas un `CommandResult` avec `exitcode`.
 
+### Filtrage a posteriori par périmètre — Search/FileHist/LstBkpFls/DiffBkp/TreeHist/TreeFind (Story 1.3)
+
+Applique le périmètre résolu par Story 1.1 (`_resolve_path_scope`) aux six commandes de lecture qui
+renvoient des chemins ou des listes indexées par chemin — pas encore `DuIdx`/`IdxTop`/`DiffTop`
+(agrégats, Story 1.4, distincte : recalcul de totaux/top-N, pas un simple retrait de lignes), pas
+`Restore`/téléchargements (garde pré-appel, epic séparé). Mécanisme choisi (voir
+`ARCHITECTURE-SPINE.md`, AD-2) : **filtrage a posteriori**, jamais un filtrage côté `borgHelper`
+lui-même (qui reste totalement ignorant du RBAC) — `borgHelperWWW` appelle `borgHelper` normalement
+(avec `-j` forcé en interne dès qu'un périmètre s'applique), reçoit le JSON, retire les lignes hors
+périmètre, ré-sérialise.
+
+**`_path_in_scope(path, scope)`** : la fonction de comparaison partagée (AD-7 — un chemin `P` est
+dans le périmètre `S` ssi `P==S` ou `P.startswith(S+'/')`, jamais une comparaison de sous-chaîne
+brute), mirroir de la logique déjà utilisée par `_canonicalize_scope`. `scope=None` (illimité) ->
+toujours `True` ; sinon parcourt chaque préfixe canonicalisé.
+
+⚠️ **Bug trouvé en investigation d'implémentation (avant tout déploiement), pas en revue
+adversariale** : `GROUPS_PATHS` s'écrit avec un `/` initial (convention Story 1.1, ex.
+`ops-readers:/lib/modules/6.8.0-generic`), mais les chemins que `borgHelper` stocke réellement
+(`archive_snapshot_v`/`diff_index`, vérifié contre un dépôt réel `demo.borghelperrc`) n'en ont
+**jamais** — `borg create /lib/modules` archive des chemins `lib/modules/...`. Sans normalisation,
+`path.startswith(prefix+'/')` échoue toujours (`'lib/modules/x'.startswith('/lib/modules'+'/')` est
+`False`), et **tout** appelant scopé obtient un résultat vide, pour **tout** nick — fail-closed
+(jamais une fuite), mais un vrai bug fonctionnel qui serait passé inaperçu sans un test contre des
+chemins stockés réels. `_path_in_scope` retire le `/` initial de chaque préfixe de `scope` (jamais
+du `path` lui-même, qui suit déjà la convention sans `/`) avant de comparer.
+
+**`_resolve_scopes_for_request(request, nicks)`** : résout `{nick: scope|None}` pour une liste de
+nicks et l'appelant HTTP courant, via `_resolve_path_scope` par nick (jamais une résolution
+fusionnée). Court-circuite en `{n:None for n in nicks}` sans toucher `.borghelperrc` si
+`GROUPS_HEADER` est désactivé (chemin rapide, comportement inchangé). N'est appelée que depuis le
+corps d'un endpoint du routeur, donc **après** `_check_group_access` (dépendance) — le tier requis
+sur chaque nick de `nicks` est déjà garanti à ce stade, ce qui lève l'ambiguïté documentée du `None`
+de `_resolve_path_scope` (voir plus haut) : ici, un `None` ne peut plus signifier « aucun tier », il
+signifie toujours « périmètre illimité ».
+
+**`_any_scoped(scopes)`** : `True` si au moins un nick de `scopes` porte un périmètre non-`None`.
+Décide à la fois (1) de forcer `-j` + le filtrage, et (2) de forcer la réponse en JSON même sans
+`?json=` — une requête multi-nick ne peut pas mélanger texte et JSON dans un seul corps HTTP
+(`CommandResult.stdout` est une chaîne unique), donc **un seul** nick scopé force tout le corps ; les
+nicks non scopés de la même requête restent présents dans le JSON, simplement non filtrés.
+
+**Exécution** : `_exec_borghelper()` (sous-processus brut, factorisé hors de `run_borghelper()`) et
+`_run_scoped()` (Story 1.3, jamais de passage par `_RESPONSE_CACHE`) — ajoute `-j` aux `extra_args`
+si absent, parse `stdout`, applique une fonction `_filter_*`, ré-sérialise (`json.dumps(...,
+ensure_ascii=False, indent=2)`, même formatage que `borgHelper` lui-même). `exitcode!=0` : relayé
+tel quel, rien à filtrer (pas de tentative de parser un message d'erreur texte comme du JSON).
+
+**Fonctions `_filter_*`** (une par forme de JSON, jamais une seule fonction générique — les six
+commandes ont des formes différentes, voir Design Notes du spec 1.3 pour le détail champ par champ) :
+
+| Fonction | Commande(s) | Forme filtrée |
+|---|---|---|
+| `_filter_per_nick_list` | Search | `{nick: [{...,'path':...}]}` — filtre chaque ligne sur `path` |
+| `_filter_filehist` | FileHist | `{nick: [{...}]}` — **pas** de champ `path` par ligne (implicite : c'est le paramètre `path` de la requête, un seul par nick) ; le nick entier passe ou se vide selon que CE `path` est dans son périmètre |
+| `_filter_str_list` | LstBkpFls | `{'files': [chemin,...]}` — mono-nick, liste de chaînes brutes, pas de dict par ligne |
+| `_filter_diffbkp` | DiffBkp | `{'entries':[{...,'path':...}], 'n_add','n_rem','n_mod'}` — mono-nick ; filtre `entries` sur `path` PUIS recalcule les trois compteurs depuis les entrées filtrées (même formule que `borgHelper.diffbkp()` : `n_add`=compte `change_type=='added'`, `n_rem`=compte `'removed'`, `n_mod`=reste) — jamais transmis depuis le compte non filtré (Boundaries du spec 1.3, FR8) |
+| `_filter_per_nick_listkey` | TreeHist (`list_key='entries'`), TreeFind (`list_key='matches'`) | `{nick: {..., list_key:[{...,'full_path':...}]}}` — filtre sur `full_path`, jamais `name` (simple nom de base) |
+
+⚠️ **FileHist n'a pas de filtrage ligne par ligne** — piège pour un futur lecteur qui verrait
+`_filter_per_nick_list` et s'attendrait à la même forme pour FileHist : `FileHist` interroge UN
+chemin (paramètre `path` de la requête), donc chaque ligne de son JSON décrit un événement de CE
+chemin sans le répéter — filtrer par ligne avec un `path_key` absent viderait silencieusement
+**tous** les nicks, même ceux dans le périmètre. `_filter_filehist` teste `path` (le paramètre, pas
+un champ de ligne) une fois par nick à la place.
+
+⚠️ **Collision de nom `scope`** (voir aussi Design Notes du spec 1.3) : le JSON de `TreeFind` porte
+déjà une clé `'scope'` — le préfixe de recherche demandé, sans aucun rapport avec le périmètre RBAC
+de ce même nom. `_filter_per_nick_listkey` ne touche jamais à cette clé (seul `list_key` — `matches`
+— est filtré) ; le code appelant nomme ses variables de périmètre RBAC `scope`/`scopes` mais ne les
+mélange jamais avec le contenu JSON lui-même.
+
+**Endpoints** (`search`/`filehist`/`treehist`/`treefind` : `nick` peut être une liste séparée par
+des virgules, résolue nick par nick, jamais une résolution fusionnée ; `lstbkpfls`/`diffbkp` :
+mono-nick, pas de boucle) : chacun calcule `scopes`/`scope`, puis soit `_any_scoped(scopes)` (ou
+`scope is not None` pour le cas mono-nick) est vrai -> branche `_run_scoped(...)`, jamais
+`cacheable=True` ; soit c'est faux -> branche `run_borghelper(...)` **strictement inchangée**
+(mêmes arguments qu'avant cette story, `cacheable=True` comme aujourd'hui) — c'est ce qui garantit
+le byte-identical pour un appelant non restreint. Pour `treehist`/`treefind`, le paramètre client
+`json=`/`json_output` n'est ajouté à `extra_args` que dans la branche non forcée (`_run_scoped`
+ajoute `-j` lui-même, inconditionnellement, dans l'autre branche) — sinon un client qui passerait
+`json=false` sur un appel qui se trouve aussi être forcé verrait son intention explicite écraser à
+tort le besoin de filtrage.
+
+**Cache** : `_run_scoped()` appelle `_exec_borghelper()` directement, jamais `run_borghelper()` —
+`_RESPONSE_CACHE` n'est donc ni lu ni écrit pour un appel dont au moins un nick est scopé, quels que
+soient `cmd`/`nick`/`extra_args`. Le cache reste utilisé exactement comme avant cette story pour le
+cas entièrement non restreint. Pas de nouveau cache dédié au résultat filtré ici — Story 1.5.
+
 ### `GET /access` — liste des serveurs filtrée aux droits de l'utilisateur
 
 Problème : le *fail-closed* multi-nick de `_check_group_access` (ci-dessus, voulu pour un appel
