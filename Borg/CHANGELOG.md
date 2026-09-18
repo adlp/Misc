@@ -1,5 +1,9 @@
 # Changelog — borgHelper
 
+## UI 1.6.1 — le titre « borgHelperWWW » ramène à la page d'accueil — 2026-09-18
+
+`<h1>borgHelperWWW</h1>` dans l'en-tête devient un lien vers `/`. Vérifié en direct.
+
 ## borgHelperWWW 1.8.0 + UI 1.6.0 — préfixe configurable des routes API (`/api` par défaut) — 2026-09-18
 
 Toutes les routes API métier de `borgHelperWWW` sont désormais montées sous un préfixe configurable

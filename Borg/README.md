@@ -798,7 +798,8 @@ page de l'interface web (visible sur toutes les pages, y compris la page de conn
 ### Interface web
 
 `http://<host>:<port>/` — page unique (SPA, HTML/CSS/JS vanilla, aucune dépendance externe, servie par
-`borgHelperWWW_ui.html`, obligatoirement à côté du script).
+`borgHelperWWW_ui.html`, obligatoirement à côté du script). Titre **borgHelperWWW** dans l'en-tête,
+lien vers `/`, visible sur toutes les pages.
 
 1. **Connexion** : saisie de la clé `X-API-Key`. Vérifiée par un appel `Report` hors-ligne ; conservée en
    `sessionStorage` (effacée à la fermeture de l'onglet, jamais persistée sur disque). Bouton
