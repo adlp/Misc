@@ -20,7 +20,7 @@ from borgHelper import Version as BORGHELPER_VERSION, BorgRunner, BorgHelper
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.9.0"
+WWW_VERSION="1.10.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -224,6 +224,9 @@ def _check_group_access(request: Request):
     if not GROUPS_HEADER: return  # fonctionnalité désactivée : X-API-Key seul fait foi
     path=request.url.path
     if API_PREFIX and path.startswith(API_PREFIX): path=path[len(API_PREFIX):]
+
+    if path=='/access': return  # consulter ses propres droits ne requiert aucun droit particulier
+
     user_groups=_parse_groups(request.headers.get(GROUPS_HEADER))
 
     if path=='/login':
@@ -421,6 +424,24 @@ def healthz():
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 # Un endpoint par commande CLI de borgHelper (voir README.md), sauf Mount/UMount.
+
+@router.get("/access",tags=["lecture"],summary="Niveau d'accès (lecture/écriture/admin) de l'appelant sur chaque nick, d'après ses groupes — toujours 200 pour un appel authentifié")
+def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    nicks=_nick_list('ALL')
+    if not GROUPS_HEADER:
+        # Fonctionnalité désactivée : pas de restriction par nick, seuls allow_destructive/
+        # allow_downloads (globaux) s'appliquent — 'admin' partout reflète cette absence de
+        # restriction par groupes pour que l'UI n'ait pas à connaître ce cas particulier.
+        return {'groups_auth_enabled':False,'nicks':{n:'admin' for n in nicks}}
+    user_groups=_parse_groups(request.headers.get(GROUPS_HEADER))
+    level_names={0:'none',1:'read',2:'write',3:'admin'}
+    result={}
+    for n in nicks:
+        cfg=_bh_paths.borg.cfgread(n)
+        eff=_effective_level(user_groups,cfg) if cfg is not None else 0
+        result[n]=level_names[eff]
+    return {'groups_auth_enabled':True,'nicks':result}
 
 @router.get("/stats",response_model=CommandResult,tags=["lecture"])
 def stats(nick: Optional[str]=None, x_api_key: Optional[str]=Header(default=None)):

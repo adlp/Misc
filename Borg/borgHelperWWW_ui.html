@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.6.3 -->
+<!-- UI_VERSION: 1.7.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -259,6 +259,21 @@ let currentActionId=null;
 let allowDestructive=true; // état réel connu après résolution de loadFooterVersions() ci-dessous
 let allowDownloads=true;
 let API_PREFIX='/api'; // idem — appris depuis /version (seule route jamais préfixée, avec / et /healthz)
+let myAccess=null; // {groups_auth_enabled, nicks:{nick:'none'|'read'|'write'|'admin'}} — appris via /access, après connexion
+const LEVEL_RANK={none:0,read:1,write:2,admin:3};
+
+// Badges d'en-tête : recalculés une première fois (globaux seulement, avant connexion) par
+// loadFooterVersions() ci-dessous, puis affinés (par utilisateur, via myAccess) par loadMachines().
+function applyBadges(){
+  const levels=myAccess?Object.values(myAccess.nicks):[];
+  const userMax=levels.reduce((m,l)=>Math.max(m,LEVEL_RANK[l]||0),0);
+  const hasAnyAccess=myAccess?userMax>0:true; // pas encore connu (pré-connexion) : ne pas masquer à tort
+  const allAdmin=myAccess?(levels.length>0&&levels.every(l=>l==='admin')):true;
+  document.getElementById('destructiveBadge').hidden = allowDestructive && (myAccess?userMax>=3:true);
+  document.getElementById('downloadsBadge').hidden = allowDownloads && hasAnyAccess;
+  document.getElementById('fullAccessBadge').hidden = !(allowDestructive && allowDownloads && allAdmin);
+  document.getElementById('historyPruneBtn').hidden = !(allowDestructive && (myAccess?userMax>=3:true));
+}
 
 // Versions + postures de sécurité chargées au démarrage de borgHelperWWW (endpoint public, non
 // protégé par X-API-Key, comme la page elle-même) — affichées avant même la connexion.
@@ -269,15 +284,24 @@ let API_PREFIX='/api'; // idem — appris depuis /version (seule route jamais pr
     const v=await r.json();
     document.getElementById('footerVersions').textContent=
       ` v${v.borghelperwww_version} (borgHelper v${v.borghelper_version}, UI v${v.ui_version})`;
-    document.getElementById('destructiveBadge').hidden=!!v.allow_destructive;
-    document.getElementById('downloadsBadge').hidden=!!v.allow_downloads;
-    document.getElementById('fullAccessBadge').hidden=!(v.allow_destructive&&v.allow_downloads);
     if(typeof v.api_prefix==='string') API_PREFIX=v.api_prefix;
     allowDestructive=!!v.allow_destructive;
     allowDownloads=!!v.allow_downloads;
-    document.getElementById('historyPruneBtn').hidden=!allowDestructive;
+    applyBadges();
   }catch(e){ /* info non critique, silencieux */ }
 })();
+
+// Droits de l'utilisateur courant par nick (nécessite d'être connecté — X-API-Key). Rafraîchi à
+// chaque chargement de la liste des serveurs (loadMachines) : source de vérité unique pour filtrer
+// les nicks sans aucun droit hors des listes ET pour affiner les badges d'en-tête (applyBadges).
+async function loadMyAccess(){
+  const r=await apiCall('GET','/access',{},false);
+  if(r.httpStatus===401) return null;
+  if(r.exitcode!==undefined || !r.nicks) return null; // forme inattendue : ne pas casser l'affichage
+  myAccess=r;
+  applyBadges();
+  return r;
+}
 
 function getApiKey(){ return sessionStorage.getItem(SS_KEY)||''; }
 function setApiKey(k){ sessionStorage.setItem(SS_KEY,k); }
@@ -381,8 +405,24 @@ async function loadMachines(){
   const seq=++machinesLoadSeq;
   const errEl=document.getElementById('machinesError');
   const listEl=document.getElementById('machinesList');
+  const jumpEl=document.getElementById('machinesJump');
   errEl.textContent=''; listEl.innerHTML=SPINNER;
-  const r=await apiCall('GET','/report',{nick:'ALL',offline:'true',json:'true'},false);
+  const access=await loadMyAccess();
+  if(seq!==machinesLoadSeq) return;
+  // Autorisation par groupes active : ne demander à Report QUE les nicks où l'utilisateur a au
+  // moins un droit de lecture — jamais 'ALL' (qui échouerait en bloc, fail-closed côté serveur, dès
+  // qu'UN SEUL nick configuré lui est inaccessible). Un nick sans aucun droit n'apparaît ainsi
+  // jamais dans la liste, exactement comme s'il n'existait pas pour cet utilisateur.
+  let nickParam='ALL';
+  if(access && access.groups_auth_enabled){
+    const readable=Object.keys(access.nicks).filter(n=>access.nicks[n]!=='none').sort();
+    if(readable.length===0){
+      listEl.innerHTML='<p class="hint">Aucun serveur accessible avec vos droits actuels.</p>';
+      jumpEl.innerHTML=''; return;
+    }
+    nickParam=readable.join(',');
+  }
+  const r=await apiCall('GET','/report',{nick:nickParam,offline:'true',json:'true'},false);
   if(seq!==machinesLoadSeq) return; // un rafraîchissement plus récent a eu lieu entre-temps
   if(r.httpStatus===401) return;
   if(r.exitcode===undefined || r.httpStatus>=500 || (!r.stdout && r.stderr)){
@@ -395,7 +435,6 @@ async function loadMachines(){
   catch(e){ errEl.textContent='Réponse Report illisible : '+r.stdout.slice(0,200); listEl.textContent=''; return; }
   const summary=parsed.summary||{};
   const nicks=Object.keys(summary).filter(n=>n!=='Totaux').sort();
-  const jumpEl=document.getElementById('machinesJump');
   if(nicks.length===0){
     listEl.innerHTML='<p class="hint">Aucun serveur déclaré dans le fichier de conf.</p>';
     jumpEl.innerHTML=''; return;

@@ -1,5 +1,33 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.10.0 + UI 1.7.0 — droits alignés sur les badges, nicks sans accès invisibles — 2026-09-18
+
+Complète l'autorisation par groupes (1.9.0) : les badges de sécurité et la liste des serveurs
+reflètent désormais les droits **personnels** de l'utilisateur connecté, pas seulement les réglages
+globaux `allow_destructive`/`allow_downloads`.
+
+- Nouvel endpoint `GET /access` : niveau effectif (`none`/`read`/`write`/`admin`) de l'appelant sur
+  **chaque** nick connu, d'après ses groupes — `{'admin': ...}` partout si l'autorisation par groupes
+  est désactivée. Protégé par `X-API-Key` mais spécial-casé dans `_check_group_access` (accessible
+  quels que soient les groupes de l'appelant — son rôle est justement de les refléter).
+- **Liste des serveurs** : un nick sans aucun droit de lecture n'apparaît plus ni dans la liste ni dans
+  la navigation rapide (au lieu de faire échouer toute la liste en `403` dès qu'un seul nick configuré
+  est inaccessible — comportement *fail-closed* correct pour un appel explicite `nick=a,b,c`, mais
+  inadapté à `nick=ALL`). `loadMachines()` appelle `/access` en premier, puis n'envoie à `/report`
+  qu'une liste explicite des nicks accessibles ; liste vide ⇒ « Aucun serveur accessible avec vos
+  droits actuels. » sans appeler `/report`.
+- **Badges de sécurité affinés après connexion** : 🔒 Destructions désactivées tient compte de l'accès
+  admin réel (pas seulement `allow_destructive`), 🚫 Téléchargements désactivés de l'accès à au moins un
+  nick, ⚠️ Tout autorisé exige en plus l'admin sur la totalité des nicks configurés.
+- Piste de réécriture côté serveur de `nick=ALL` (mutation de `request.scope['query_string']` dans
+  `_check_group_access`) testée et écartée : sans effet sur le paramètre `nick` déjà résolu côté
+  endpoint (voir TECHNICAL.md).
+
+Vérifié : `/access` par curl sur plusieurs profils de groupes (admin, lecteur, aucun groupe, groupes
+non pertinents, fonctionnalité désactivée), simulation complète de la séquence `loadMachines()`
+(`/access` puis `/report` avec liste explicite dérivée), non-régression `nick=ALL` avec l'autorisation
+par groupes désactivée.
+
 ## borgHelperWWW 1.9.0 — autorisation par groupes (reverse proxy OIDC/auth_request) — 2026-09-18
 
 Nouveau mécanisme d'autorisation **par nick et par groupes**, complémentaire à `X-API-Key` (jamais un

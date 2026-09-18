@@ -782,6 +782,24 @@ comportement inchangé, seule `X-API-Key` fait foi. Une fois activée (nom du he
   des nicks visés, jamais de filtrage silencieux d'une partie de la liste.
 - Header absent ou vide sur une requête donnée (alors que l'autorisation par groupes est active) :
   aucun groupe ⇒ aucun accès (`403` sur toute route porteuse d'un nick).
+- **Interface web — nicks sans aucun droit invisibles** : le comportement *fail-closed* ci-dessus
+  refuserait en bloc `GET /report?nick=ALL` (utilisé par la liste des serveurs) dès qu'**un seul** nick
+  configuré est inaccessible à l'utilisateur — inutilisable pour un affichage multi-nick. L'interface
+  web contourne ceci côté client, sans toucher à la logique *fail-closed* elle-même : elle appelle
+  d'abord `GET /access` (voir [Endpoints](#endpoints)), n'envoie ensuite `GET /report` qu'avec la liste
+  **explicite** des nicks où elle a un droit de lecture au moins (jamais `nick=ALL`), et affiche « Aucun
+  serveur accessible avec vos droits actuels. » si cette liste est vide. Un nick sans aucun droit
+  n'apparaît ainsi jamais dans la liste des serveurs ni dans la navigation rapide, exactement comme s'il
+  n'existait pas pour cet utilisateur — et reste bien entendu inaccessible en accès direct (la requête
+  `403` habituelle, `nick` étant explicite).
+- **Badges de sécurité personnalisés** : les trois badges de l'en-tête (voir
+  [Endpoints](#endpoints)) sont d'abord calculés à partir des seuls réglages globaux
+  `allow_destructive`/`allow_downloads` (avant connexion), puis affinés après connexion avec le
+  résultat de `/access` — **🔒 Destructions désactivées** tient compte de l'accès admin réel de
+  l'utilisateur (pas seulement `allow_destructive`), **🚫 Téléchargements désactivés** de son accès à au
+  moins un nick, et **⚠️ Tout autorisé** exige en plus d'être admin sur la **totalité** des nicks
+  configurés — un badge ne minimise donc jamais le niveau de restriction réellement subi par
+  l'utilisateur connecté.
 
 ⚠️ Le header n'est vérifié que pour sa **valeur**, jamais pour sa **provenance** — ce mécanisme
 suppose que `borgHelperWWW` n'est atteignable **que** via le reverse proxy de confiance qui pose ce
@@ -959,7 +977,9 @@ de l'interface web (versions), et via trois badges dans l'en-tête (visibles mê
 **🚫 Téléchargements désactivés** quand `allow_downloads` est à `false` (non défaut — signale un
 réglage explicitement restrictif) ; **⚠️ Tout autorisé** quand `allow_destructive` **et**
 `allow_downloads` sont tous les deux à `true` (aucune restriction — rappel qu'aucune protection n'est
-active sur cette instance).
+active sur cette instance). Affichage initial, **global** (avant connexion) ; une fois connecté et si
+l'autorisation par groupes est active, ces trois badges sont affinés d'après les droits personnels de
+l'utilisateur — voir [Autorisation par groupes](#autorisation-par-groupes-reverse-proxy-oidcauth_request).
 
 Quand une action est interdite côté serveur, le bouton correspondant **n'apparaît tout simplement
 pas** dans l'interface web (plutôt qu'un bouton visible qui échouerait en `403`) :
@@ -995,6 +1015,7 @@ cette empreinte).
 |---------|-------|--------------|:---:|
 | GET | `/version` | *(aucune — spécifique à borgHelperWWW)* | |
 | GET | `/healthz` | *(aucune — liveness, spécifique à borgHelperWWW)* | |
+| GET | `/access` | *(aucune — spécifique à borgHelperWWW)* | |
 | GET | `/stats` | Stats | |
 | POST | `/login` | Login | |
 | GET | `/lstbkp` | LstBkp | ✓ |
@@ -1032,6 +1053,20 @@ Réponse (`CommandResult`) commune à tous les endpoints ci-dessus :
 ```
 
 `exitcode != 0` ⇒ HTTP 400 (le détail reste dans le corps JSON — voir [Codes retour](#codes-retour)).
+
+`GET /access` : protégée par `X-API-Key` (contrairement à `/version`), mais **jamais** par
+l'autorisation par groupes elle-même — son seul but est de la refléter. Renvoie le niveau d'accès
+effectif de l'appelant sur **chaque** nick connu :
+
+```json
+{"groups_auth_enabled": true, "nicks": {"demo-modules": "admin", "demo-usrlocal": "none"}}
+```
+
+`groups_auth_enabled=false` (autorisation par groupes désactivée) : `"admin"` pour tous les nicks —
+reflète l'absence de restriction par groupes, sans forme de réponse différente à gérer côté client.
+C'est sur cette route que s'appuient à la fois l'affinage des badges de sécurité de l'interface web
+(après connexion) et le filtrage de la liste des serveurs (voir [Autorisation par
+groupes](#autorisation-par-groupes-reverse-proxy-oidcauth_request) ci-dessus).
 
 ### `/download/file` et `/download/tar` — téléchargements binaires
 

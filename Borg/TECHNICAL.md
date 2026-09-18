@@ -821,3 +821,46 @@ fiable).
 existante) peut ne pas encore exister — `cfgread` renvoie alors `None`, et le repli se fait sur
 `_default_section_groups()` (lecture brute de `[DEFAULT]` depuis `CFGFILE`, indépendamment de
 `_bh_paths`) plutôt que d'échouer.
+
+### `GET /access` — liste des serveurs filtrée aux droits de l'utilisateur
+
+Problème : le *fail-closed* multi-nick de `_check_group_access` (ci-dessus, voulu pour un appel
+explicite `nick=a,b,c`) est incompatible avec `nick=ALL` tel qu'utilisé par la liste des serveurs de
+l'interface web (`loadMachines()`) — un utilisateur sans aucun droit sur ne serait-ce qu'un seul nick
+configuré verrait la requête entière rejetée (`403`), au lieu de simplement ne pas voir ce nick.
+
+**Piste écartée** : faire réécrire `nick=ALL` en une liste filtrée *côté serveur*, dans
+`_check_group_access` elle-même, en mutant `request.scope['query_string']` avant que l'endpoint ne lise
+ses propres paramètres. Testé et invalidé empiriquement (script `TestClient` autonome, supprimé après
+usage) : Starlette a déjà résolu/caché la query string du côté de FastAPI au moment où
+`_check_group_access` — une dépendance — s'exécute ; muter `scope['query_string']` après coup n'a
+**aucun effet** sur la valeur que reçoit le paramètre typé `nick: str` de l'endpoint (qui continue de
+voir `'ALL'` intact). Réécrire proprement aurait exigé de dupliquer la résolution des paramètres dans
+la dépendance elle-même — fragile, et contraire au principe d'une dépendance unique agnostique de la
+signature de chaque route.
+
+**Solution retenue**, sans toucher à `_check_group_access` pour le cas multi-nick explicite (déjà
+correct) : un nouvel endpoint `GET /access`, **spécial-casé en tout premier** dans
+`_check_group_access` (avant même le test `GROUPS_HEADER`/le cas `Login`) — `if path=='/access': return`
+— pour rester appelable par n'importe quel utilisateur authentifié quels que soient ses groupes,
+puisque son unique rôle est justement de les refléter. Renvoie, pour chaque nick connu
+(`_nick_list('ALL')`), le niveau effectif de l'appelant (`_effective_level` sur `cfgread(nick)`) sous
+forme `{'groups_auth_enabled': bool, 'nicks': {nick: 'none'|'read'|'write'|'admin'}}` —
+`groups_auth_enabled=false` renvoie `'admin'` pour tous les nicks (aucune restriction par groupes,
+seuls `allow_destructive`/`allow_downloads` globaux s'appliquent), pour que le client n'ait qu'une
+seule forme de réponse à traiter.
+
+Le client (`loadMachines()` dans `borgHelperWWW_ui.html`) appelle `/access` **avant** `/report`,
+filtre `Object.keys(access.nicks)` à `!== 'none'`, et n'envoie à `/report` qu'une liste **explicite**
+de nicks pré-confirmés accessibles (jamais `nick=ALL` tant que l'autorisation par groupes est active) —
+liste vide ⇒ affichage « Aucun serveur accessible... » sans appeler `/report` du tout. Cette liste
+passe alors nécessairement la boucle *fail-closed* existante de `_check_group_access` (chaque nick
+qu'elle contient a déjà été vérifié individuellement accessible), sans qu'aucune modification de cette
+boucle n'ait été nécessaire.
+
+Même endpoint réutilisé côté badges de sécurité (`applyBadges()`) : `myAccess` (résultat de `/access`,
+`null` avant connexion) affine les trois badges d'en-tête après connexion, en combinant le niveau
+d'accès personnel de l'utilisateur (`userMax` = rang maximal sur tous ses nicks, `allAdmin` = admin sur
+la totalité d'entre eux) avec les réglages globaux `allowDestructive`/`allowDownloads` déjà connus via
+`/version` — voir [README.md, section Autorisation par
+groupes](README.md#autorisation-par-groupes-reverse-proxy-oidcauth_request).
