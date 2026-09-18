@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.0.0 — bumper à chaque commit qui modifie ce fichier (lu par borgHelperWWW au
+<!-- UI_VERSION: 1.2.0 — bumper à chaque commit qui modifie ce fichier (lu par borgHelperWWW au
      démarrage, exposé via GET /version) -->
 <html lang="fr">
 <head>
@@ -75,6 +75,10 @@
   pre.stderr{color:#ffb4a8}
   .result-meta{display:flex;gap:10px;align-items:center;margin:10px 0}
   .hint{font-size:12px;color:var(--muted);margin-top:-6px;margin-bottom:10px}
+  .spinner{display:inline-block;width:13px;height:13px;border:2px solid var(--border);
+    border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;
+    vertical-align:middle;margin-right:6px}
+  @keyframes spin{to{transform:rotate(360deg)}}
   footer{text-align:center;color:var(--muted);font-size:12px;padding:20px}
 </style>
 </head>
@@ -174,14 +178,25 @@
         <h2 id="browseTitle" style="margin:0"></h2>
       </div>
       <div id="browseBreadcrumb" class="pill" style="margin-bottom:10px"></div>
+      <div class="row" style="margin-bottom:10px;align-items:flex-end">
+        <div class="field" style="flex:1;min-width:220px;margin-bottom:0">
+          <label for="browseSearchInput">Rechercher (à partir d'ici, récursif — <code>*</code> = n'importe quoi, <code>.</code> = littéral ; sans <code>*</code> = sous-chaîne)</label>
+          <input type="text" id="browseSearchInput" placeholder="ex : *.log   ou   config.*   ou   backup">
+        </div>
+        <button class="secondary" onclick="runBrowseSearch()">🔍 Rechercher</button>
+        <button class="secondary" id="browseSearchClearBtn" onclick="clearBrowseSearch()" hidden>✕ Revenir à l'explorateur</button>
+      </div>
       <div id="browseError" class="error"></div>
-      <table id="browseTableEl">
-        <thead><tr><th>Nom</th><th>Genre</th><th>Droits</th><th>Propriétaire</th><th>Dernier événement</th></tr></thead>
-        <tbody id="browseBody"></tbody>
-      </table>
-      <p class="hint">Clic sur un dossier : ouvrir. Clic droit sur un dossier : télécharger un .tar.
-        Clic sur un fichier : le télécharger.</p>
-      <p class="hint" id="browsePinnedHint" hidden></p>
+      <div id="browseSearchResults" hidden></div>
+      <div id="browseNormalView">
+        <table id="browseTableEl">
+          <thead><tr><th>Nom</th><th>Genre</th><th>Droits</th><th>Propriétaire</th><th>Dernier événement</th></tr></thead>
+          <tbody id="browseBody"></tbody>
+        </table>
+        <p class="hint">Clic sur un dossier : ouvrir. Clic droit sur un dossier : télécharger un .tar.
+          Clic sur un fichier : le télécharger.</p>
+        <p class="hint" id="browsePinnedHint" hidden></p>
+      </div>
     </div>
   </section>
 
@@ -232,6 +247,7 @@
 
 // ── State ──────────────────────────────────────────────────────────────────
 
+const SPINNER='<span class="spinner"></span>Chargement…';
 const SS_KEY='bhww_apikey';
 const SS_PASS='bhww_passphrases';
 let currentNick=null;
@@ -346,11 +362,14 @@ function badgeFor(depuisStr){
   return '<span class="badge ok">'+depuisStr+'</span>';
 }
 
+let machinesLoadSeq=0;
 async function loadMachines(){
+  const seq=++machinesLoadSeq;
   const errEl=document.getElementById('machinesError');
   const listEl=document.getElementById('machinesList');
-  errEl.textContent=''; listEl.textContent='Chargement…';
+  errEl.textContent=''; listEl.innerHTML=SPINNER;
   const r=await apiCall('GET','/report',{nick:'ALL',offline:'true',json:'true'},false);
+  if(seq!==machinesLoadSeq) return; // un rafraîchissement plus récent a eu lieu entre-temps
   if(r.httpStatus===401) return;
   if(r.exitcode===undefined || r.httpStatus>=500 || (!r.stdout && r.stderr)){
     errEl.textContent='Erreur : '+(r.stderr||('HTTP '+r.httpStatus));
@@ -400,7 +419,7 @@ async function loadMachines(){
           </tr>
         </table>
         <p class="hint" style="margin-bottom:4px">10 dernières sauvegardes :</p>
-        <div class="history-panel" style="margin-bottom:4px">Chargement…</div>
+        <div class="history-panel" style="margin-bottom:4px">${SPINNER}</div>
         <div class="pass-row">
           <span class="pill">🔑 passphrase : ${hasPass?'✓ enregistrée pour la session':'non renseignée — à saisir sur la page du serveur'}</span>
         </div>
@@ -479,11 +498,14 @@ function openHistory(nick){
   loadHistoryFull(nick);
 }
 
+let historyLoadSeq=0;
 async function loadHistoryFull(nick){
+  const seq=++historyLoadSeq;
   const err=document.getElementById('historyError');
   const body=document.getElementById('historyBody');
-  err.textContent=''; body.innerHTML='<tr><td colspan="9">Chargement…</td></tr>';
+  err.textContent=''; body.innerHTML=`<tr><td colspan="9">${SPINNER}</td></tr>`;
   const r=await apiCall('GET','/report',{nick,json:'true',offline:'true'},false);
+  if(seq!==historyLoadSeq) return; // une navigation plus récente a eu lieu entre-temps
   if(r.httpStatus===401) return;
   if(r.exitcode===undefined || r.httpStatus>=500 || (!r.stdout && r.stderr)){
     err.textContent='Erreur : '+(r.stderr||('HTTP '+r.httpStatus)); body.innerHTML=''; return;
@@ -770,24 +792,34 @@ document.getElementById('browseBreadcrumb').addEventListener('click', e=>{
   e.preventDefault(); browsePath=a.dataset.path; loadBrowse();
 });
 
+let browseLoadSeq=0;
 async function loadBrowse(){
+  clearBrowseSearch(); // toute navigation réelle annule une recherche en cours
+  // Capture l'état demandé au moment de l'appel : browseNick/browsePath/browseArchive peuvent
+  // changer avant que la réponse arrive (clic rapide sur un autre dossier, une autre archive, ou
+  // retour à un autre serveur) — sans ça, une réponse tardive peut afficher le contenu d'un AUTRE
+  // répertoire ou d'un AUTRE serveur que celui actuellement affiché à l'écran.
+  const seq=++browseLoadSeq;
+  const reqNick=browseNick, reqPath=browsePath, reqArchive=browseArchive;
   const hint=document.getElementById('browsePinnedHint');
-  if(browseArchive){
-    document.getElementById('browseTitle').textContent=browseNick+' — archive '+browseArchive+' — '+(browsePath||'/');
+  if(reqArchive){
+    document.getElementById('browseTitle').textContent=reqNick+' — archive '+reqArchive+' — '+(reqPath||'/');
     hint.hidden=false;
-    hint.textContent="Vue épinglée sur l'archive "+browseArchive+" : seuls les événements de cette sauvegarde sont affichés (droits/genre/propriétaire = dernier état connu, pas forcément celui de cette archive).";
+    hint.textContent="Vue épinglée sur l'archive "+reqArchive+" : seuls les événements de cette sauvegarde sont affichés (droits/genre/propriétaire = dernier état connu, pas forcément celui de cette archive).";
   }else{
-    document.getElementById('browseTitle').textContent=browseNick+' — '+(browsePath||'/');
+    document.getElementById('browseTitle').textContent=reqNick+' — '+(reqPath||'/');
     hint.hidden=true;
   }
   document.getElementById('browseError').textContent='';
   renderBreadcrumb();
+  document.getElementById('browseBody').innerHTML=`<tr><td colspan="5">${SPINNER}</td></tr>`;
   // archive_from=ALL (sauf vue épinglée) : pour que chaque entrée porte son historique complet
   // (nécessaire pour ne proposer au téléchargement que les archives où le fichier a réellement bougé).
-  const params={nick:browseNick,prefix:browsePath,json:'true'};
-  if(browseArchive){ params.archive_from=browseArchive; params.archive_to=browseArchive; }
+  const params={nick:reqNick,prefix:reqPath,json:'true'};
+  if(reqArchive){ params.archive_from=reqArchive; params.archive_to=reqArchive; }
   else{ params.archive_from='ALL'; }
   const r=await apiCall('GET','/treehist',params,false);
+  if(seq!==browseLoadSeq) return; // une navigation plus récente a eu lieu entre-temps : on ignore
   if(r.httpStatus===401) return;
   if(r.exitcode!==0){
     document.getElementById('browseError').textContent=r.stderr||('exitcode '+r.exitcode);
@@ -796,7 +828,7 @@ async function loadBrowse(){
   let parsed;
   try{ parsed=JSON.parse(r.stdout); }
   catch(e){ document.getElementById('browseError').textContent='Réponse illisible : '+r.stdout.slice(0,200); return; }
-  const data=parsed[browseNick];
+  const data=parsed[reqNick];
   if(!data || data.error){
     document.getElementById('browseError').textContent=(data&&data.error)||'Aucune donnée';
     document.getElementById('browseBody').innerHTML=''; return;
@@ -826,6 +858,64 @@ document.getElementById('browseBody').addEventListener('click', e=>{
 document.getElementById('browseBody').addEventListener('contextmenu', e=>{
   const tr=e.target.closest('.browse-row'); if(!tr) return;
   if(tr.dataset.isdir==='true'){ e.preventDefault(); openDownloadDialog(tr.dataset.full,true); }
+});
+
+// ── Recherche récursive (TreeFind) à partir du répertoire courant ──────────────────────────
+
+async function runBrowseSearch(){
+  const pattern=document.getElementById('browseSearchInput').value.trim();
+  if(!pattern) return;
+  const err=document.getElementById('browseError'); err.textContent='';
+  document.getElementById('browseNormalView').hidden=true;
+  document.getElementById('browseSearchClearBtn').hidden=false;
+  const results=document.getElementById('browseSearchResults');
+  results.hidden=false; results.innerHTML=SPINNER;
+  const r=await apiCall('GET','/treefind',{nick:browseNick,prefix:browsePath,pattern,json:'true'},false);
+  if(r.httpStatus===401) return;
+  if(r.exitcode!==0){ err.textContent=r.stderr||('exitcode '+r.exitcode); results.innerHTML=''; return; }
+  let parsed;
+  try{ parsed=JSON.parse(r.stdout); }
+  catch(e){ err.textContent='Réponse illisible : '+r.stdout.slice(0,200); results.innerHTML=''; return; }
+  const data=parsed[browseNick];
+  if(!data || data.error){ err.textContent=(data&&data.error)||'Aucune donnée'; results.innerHTML=''; return; }
+  const matches=data.matches||[];
+  if(matches.length===0){
+    results.innerHTML=`<p class="hint">Aucun résultat pour « ${escapeHtml(pattern)} » sous ${escapeHtml(browsePath||'/')}.</p>`;
+    return;
+  }
+  results.innerHTML=`<p class="hint">${matches.length} résultat(s) pour « ${escapeHtml(pattern)} » sous ${escapeHtml(browsePath||'/')} :</p>`
+    +'<table><thead><tr><th>Nom</th><th>Genre</th><th>Chemin</th><th>Droits</th><th>Propriétaire</th><th>Actions</th></tr></thead><tbody>'
+    +matches.map(m=>{
+      const icon=m.is_dir?'📁':'📄';
+      const gotoTarget=m.is_dir?m.full_path:m.parent;
+      return `<tr>
+        <td>${icon} ${escapeHtml(m.name)}</td><td>${escapeHtml(m.genre)}</td>
+        <td style="font-family:var(--mono)">${escapeHtml(m.full_path)}</td>
+        <td style="font-family:var(--mono)">${escapeHtml(m.mode||'—')}</td>
+        <td style="font-family:var(--mono)">${escapeHtml(m.owner||'—')}</td>
+        <td class="hist-actions">
+          <button class="secondary sr-goto-btn" data-target="${escapeAttr(gotoTarget)}">📂 Aller au dossier</button>
+          <button class="secondary sr-dl-btn" data-full="${escapeAttr(m.full_path)}" data-isdir="${m.is_dir}">⬇ Télécharger</button>
+        </td>
+      </tr>`;
+    }).join('')+'</tbody></table>';
+}
+
+function clearBrowseSearch(){
+  document.getElementById('browseSearchInput').value='';
+  const results=document.getElementById('browseSearchResults');
+  results.hidden=true; results.innerHTML='';
+  document.getElementById('browseSearchClearBtn').hidden=true;
+  document.getElementById('browseNormalView').hidden=false;
+}
+
+document.getElementById('browseSearchInput').addEventListener('keydown', e=>{ if(e.key==='Enter') runBrowseSearch(); });
+
+document.getElementById('browseSearchResults').addEventListener('click', e=>{
+  const gotoBtn=e.target.closest('.sr-goto-btn');
+  if(gotoBtn){ const target=gotoBtn.dataset.target; clearBrowseSearch(); browsePath=target; loadBrowse(); return; }
+  const dlBtn=e.target.closest('.sr-dl-btn');
+  if(dlBtn){ openDownloadDialog(dlBtn.dataset.full,dlBtn.dataset.isdir==='true'); return; }
 });
 
 // ── Download (fichier brut, fichier .tar, ou dossier .tar, à une archive choisie) ──────────

@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.93"
+Version="1.0.94"
 DIFF_DB_SCHEMA_VERSION  = 4
 CACHE_DB_SCHEMA_VERSION = 1
 # Historique diff.db — chaque palier correspond à une migration idempotente et auto-détectée
@@ -376,6 +376,9 @@ def usage(doc=None,debug=0):
         printer("       added/removed ne concernent QUE l'entrée elle-même — un mouvement interne, quel")
         printer("       qu'il soit, remonte en 'modified' générique (jamais un added/removed emprunté)")
         printer("       -j : sortie JSON {path,archive,entries:[{name,full_path,genre,mode,owner,is_dir,events}]}")
+        printer("   -c TreeFind [-f <préfixe>] -m <motif> [-n nickname/servername/ALL] [-j]")
+        printer("       Recherche récursive PAR NOM sous <préfixe> (racine si omis), dans le dernier")
+        printer("       snapshot connu. Motif minimal : '*' (n'importe quoi) et '.' (littéral) — voir -H TreeFind")
         printer("   -c DuIdx [-f pattern] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-s col[:asc|desc]] [-j]")
         printer("       Résumé du-like : taille/nb par type depuis le SQLite")
         printer("       Sans -f : résumé global  |  -f '*' : par répertoire  |  -j : JSON")
@@ -475,6 +478,13 @@ def usage(doc=None,debug=0):
         printer("       added/removed sur un répertoire ne concernent QUE son entrée à lui (ex. 'added")
         printer("       directory') — un mouvement interne quelconque remonte en 'modified' générique")
         printer("       -j : sortie JSON {nick:{path,archive,entries:[{name,full_path,genre,mode,owner,is_dir,events}]}}")
+    elif doc=='treefind':
+        printer("   -c TreeFind [-f <préfixe>] -m <motif> [-n nickname/servername/ALL] [-j]")
+        printer("       Recherche récursive PAR NOM (pas le chemin complet) sous <préfixe> (racine entière")
+        printer("       si omis), dans le dernier snapshot connu (comme TreeHist, mais récursif et sans")
+        printer("       historique). Motif minimal : '*' = n'importe quelle suite de caractères, '.' reste")
+        printer("       littéral ; sans '*' (ni '?') dans <motif>, sous-chaîne implicite (comme Search)")
+        printer("       -j : sortie JSON {nick:{archive,scope,pattern,matches:[{name,full_path,parent,is_dir,genre,mode,owner}]}}")
     elif doc=='duidx':
         printer("   -c DuIdx [-f pattern] [-n nick/ALL] [-b archive|ALL] [-B archive] [-s col[:asc|desc]] [-j]")
         printer("       Résumé du-like depuis le SQLite : taille et nb de fichiers par type")
@@ -2381,6 +2391,69 @@ class BorgHelper:
         if as_json:
             print(json.dumps(results,ensure_ascii=False,indent=2))
 
+    def _treefind_listing(self,n,prefix,pattern,conn,debug=0,as_json=False):
+        """Recherche récursive par NOM (pas le chemin complet) sous <prefix> (racine si omis), dans
+        le dernier snapshot connu. Motif minimal : '*' = n'importe quelle suite de caractères, '.'
+        reste littéral ; sans '*' (ni '?'), sous-chaîne implicite (comme Search). Retourne une liste
+        plate {name,full_path,parent,is_dir,genre,mode,owner}, triée par chemin."""
+        import fnmatch
+        pat=pattern or '*'
+        if '*' not in pat and '?' not in pat: pat=f'*{pat}*'
+        row=conn.execute("SELECT archive FROM archive_snapshot_v WHERE nick=? ORDER BY archive_date DESC LIMIT 1",(n,)).fetchone()
+        if row is None:
+            msg=f"aucun snapshot indexé — lancez : borgHelper -c Index -n {n}"
+            return {'error':msg} if as_json else None
+        latest=row[0]
+        scope_sql=(prefix+'/%') if prefix else '%'
+        rows=conn.execute("SELECT path,type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=? AND path LIKE ?",
+                           (n,latest,scope_sql)).fetchall()
+        matches=[]
+        for path,ftype,mode,owner in rows:
+            if prefix and path==prefix: continue  # le préfixe lui-même n'est pas un résultat
+            name=path.rsplit('/',1)[-1]
+            if not fnmatch.fnmatchcase(name,pat): continue
+            is_dir=(ftype=='d')
+            genre=_TREEHIST_GENRES.get(ftype,'répertoire' if is_dir else 'inconnu (réindexer)')
+            parent=path.rsplit('/',1)[0] if '/' in path else ''
+            matches.append({'name':name,'full_path':path,'parent':parent,'is_dir':is_dir,
+                             'genre':genre,'mode':mode,'owner':owner})
+        matches.sort(key=lambda e:e['full_path'])
+        if as_json:
+            return {'archive':latest,'scope':prefix,'pattern':pattern or '','matches':matches}
+        if not matches:
+            print(f"{n}: aucun résultat pour '{pattern}' sous {prefix or '/'} (snapshot {latest})")
+            return None
+        from prettytable import PrettyTable
+        t=PrettyTable(['nom','genre','chemin','droits','propriétaire'])
+        t.align['nom']='l'; t.align['chemin']='l'
+        for e in matches:
+            t.add_row([e['name'],e['genre'],e['full_path'],e['mode'] or '—',e['owner'] or '—'])
+        print(f"{n}: {len(matches)} résultat(s) pour '{pattern}' sous {prefix or '/'} (snapshot {latest})")
+        print(t)
+        return None
+
+    def treefind(self,nick,prefix=None,pattern=None,debug=0,as_json=False):
+        prefix=(prefix or '').strip().lstrip('/').rstrip('/')
+        results={}
+        for n in nick.split(','):
+            db_path=self.db.get_diff_db(n)
+            self.db.ensure_diff_db(db_path)
+            if self.db._is_index_empty(n,db_path):
+                msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
+                if as_json: results[n]={'error':msg}
+                else: printer(f"[ERREUR] {msg}")
+                continue
+            try:
+                conn=sqlite3.connect(db_path)
+                result=self._treefind_listing(n,prefix,pattern,conn,debug=debug,as_json=as_json)
+                if as_json: results[n]=result
+                conn.close()
+            except sqlite3.Error as e:
+                if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
+                else: printer(f"SQLite error ({db_path}): {e}")
+        if as_json:
+            print(json.dumps(results,ensure_ascii=False,indent=2))
+
     def duidx(self,nick,pattern=None,sort_by='chemin',reverse=False,as_json=False,archive_from=None,archive_to=None,debug=0):
         if pattern is None:
             totals=self.db._duidx_collect_global(nick,'%',archive_from,archive_to)
@@ -3029,7 +3102,8 @@ def _cli_main():
            'delbkp':'Ccdnb','bkp':'CcdnI','prune':'Ccdn','report':'CcdnlNjo',
            'init':'Ccdn','key':'Ccdn','index':'CcdnFSA','search':'CcdnfbB',
            'filehist':'CcdnfbB','cacheinfo':'Ccdn','cacheclean':'Ccdn','duidx':'CcdnfbBsj',
-           'idxtop':'CcdnNp','difftop':'CcdnNpb','idxpurge':'CcdnxD','treehist':'CcdnfbBj'}
+           'idxtop':'CcdnNp','difftop':'CcdnNpb','idxpurge':'CcdnxD','treehist':'CcdnfbBj',
+           'treefind':'Ccdnfmj'}
     optab={k:v+'P' for k,v in optab.items()}
 
     if cmd is None or cmd not in optab.keys():
@@ -3137,6 +3211,8 @@ def _cli_main():
         bh.filehist(nick,options['-f'],archive_from=options.get('-b',None),archive_to=options.get('-B',None),debug=debug)
     elif cmd=='treehist':
         bh.treehist(nick,options.get('-f',None),archive_from=options.get('-b',None),archive_to=options.get('-B',None),debug=debug,as_json=('-j' in options))
+    elif cmd=='treefind':
+        bh.treefind(nick,options.get('-f',None),options.get('-m',None),debug=debug,as_json=('-j' in options))
     elif cmd=='duidx':
         _du_sort=options.get('-s','chemin')
         _du_rev=_du_sort.endswith(':desc')

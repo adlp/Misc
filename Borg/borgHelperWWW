@@ -15,12 +15,12 @@ from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
-from borgHelper import Version as BORGHELPER_VERSION, BorgRunner
+from borgHelper import Version as BORGHELPER_VERSION, BorgRunner, BorgHelper
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.0.1"
+WWW_VERSION="1.2.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -89,7 +89,42 @@ class CommandResult(BaseModel):
     stdout: str
     stderr: str
 
-def run_borghelper(cmd: str, nick: Optional[str]=None, extra_args=(), passphrase: Optional[str]=None) -> JSONResponse:
+# ── Cache de réponses (commandes de lecture pure base SQLite) ──────────────────
+# Certaines commandes (LstBkp, LstBkpFls, TreeHist, FileHist, Search, DuIdx, IdxTop, DiffTop,
+# CacheInfo, DiffBkp, Report -o) ne lisent (ou n'écrivent, pour DiffBkp la première fois) que
+# cache.db/diff.db — jamais l'état live du dépôt indépendamment de ces fichiers. Empreinte =
+# mtime de tous les cache.db/diff.db concernés (tous les nicks connus si nick vide/'ALL') ;
+# recalculée APRÈS l'exécution de la commande (couvre le cas DiffBkp qui peut écrire dans
+# diff.db lors de son tout premier appel sur une paire non indexée) et comparée à l'entrée en
+# cache : si identique, le résultat mis en cache est restitué sans relancer borgHelper.
+_bh_paths=BorgHelper(cfgfile=CFGFILE)
+_RESPONSE_CACHE={}
+
+def _cache_db_paths(nick: Optional[str]):
+    nicks=[n.strip() for n in nick.split(',')] if (nick and nick!='ALL') else \
+        [n.strip() for n in _bh_paths.borg.cfgreadnicks().split(',')]
+    paths=[]
+    for n in nicks:
+        if not n: continue
+        paths.append(_bh_paths.db.get_diff_db(n))
+        paths.append(_bh_paths.db.get_cache_db(n))
+    return paths
+
+def _cache_fingerprint(nick: Optional[str]) -> str:
+    parts=[]
+    for p in _cache_db_paths(nick):
+        try: parts.append(f"{p}:{os.path.getmtime(p)}")
+        except OSError: parts.append(f"{p}:absent")
+    return '|'.join(parts)
+
+def run_borghelper(cmd: str, nick: Optional[str]=None, extra_args=(), passphrase: Optional[str]=None,
+                    cacheable: bool=False) -> JSONResponse:
+    key=(cmd,nick,tuple(extra_args)) if cacheable else None
+    if key is not None:
+        cached=_RESPONSE_CACHE.get(key)
+        if cached is not None and cached[0]==_cache_fingerprint(nick):
+            result_dict=cached[1]
+            return JSONResponse(status_code=200 if result_dict['exitcode']==0 else 400,content=result_dict)
     argv=[sys.executable,str(BORGHELPER_BIN),'-C',CFGFILE,'-c',cmd]
     if nick: argv+=['-n',nick]
     argv+=list(extra_args)
@@ -100,6 +135,9 @@ def run_borghelper(cmd: str, nick: Optional[str]=None, extra_args=(), passphrase
     except subprocess.TimeoutExpired:
         raise HTTPException(504,detail=f"Commande {cmd} : timeout après {TIMEOUT}s")
     result=CommandResult(exitcode=proc.returncode,stdout=proc.stdout,stderr=proc.stderr)
+    if key is not None:
+        if len(_RESPONSE_CACHE)>500: _RESPONSE_CACHE.clear()  # garde-fou anti-croissance illimitée
+        _RESPONSE_CACHE[key]=(_cache_fingerprint(nick),result.dict())
     return JSONResponse(status_code=200 if proc.returncode==0 else 400,content=result.dict())
 
 # ── Téléchargements (accès borg direct, streaming binaire) ─────────────────────
@@ -223,13 +261,13 @@ def login(servername: str, nickname: Optional[str]=None, repo: str=Query(...),
 @app.get("/lstbkp",response_model=CommandResult,tags=["lecture"])
 def lstbkp(nick: str, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
-    return run_borghelper('lstbkp',nick=nick)
+    return run_borghelper('lstbkp',nick=nick,cacheable=True)
 
 @app.get("/lstbkpfls",response_model=CommandResult,tags=["lecture"])
 def lstbkpfls(nick: str, bid: Optional[str]=None, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     extra=['-b',bid] if bid else []
-    return run_borghelper('lstbkpfls',nick=nick,extra_args=extra)
+    return run_borghelper('lstbkpfls',nick=nick,extra_args=extra,cacheable=True)
 
 @app.get("/report",response_model=CommandResult,tags=["lecture"])
 def report(nick: str="ALL", n: Optional[int]=Query(default=None,description="n dernières archives"),
@@ -242,7 +280,9 @@ def report(nick: str="ALL", n: Optional[int]=Query(default=None,description="n d
     if html: extra.append('-l')
     if json_output: extra.append('-j')
     if offline: extra.append('-o')
-    return run_borghelper('report',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
+    # Cacheable uniquement en mode -o (offline) : le mode en ligne interroge le dépôt en direct
+    # (borg info), non couvert par l'empreinte cache.db/diff.db.
+    return run_borghelper('report',nick=nick,extra_args=extra,passphrase=x_borg_passphrase,cacheable=offline)
 
 @app.get("/diffbkp",response_model=CommandResult,tags=["lecture"])
 def diffbkp(nick: str, bid_old: Optional[str]=None, bid_new: Optional[str]=None,
@@ -251,7 +291,7 @@ def diffbkp(nick: str, bid_old: Optional[str]=None, bid_new: Optional[str]=None,
     extra=[]
     if bid_old and bid_new: extra=['-b',f"{bid_old},{bid_new}"]
     elif bid_old: extra=['-b',bid_old]
-    return run_borghelper('diffbkp',nick=nick,extra_args=extra)
+    return run_borghelper('diffbkp',nick=nick,extra_args=extra,cacheable=True)
 
 @app.get("/restore/perms",response_model=CommandResult,tags=["lecture"],summary="Liste les droits d'un fichier sans restaurer (Restore -L)")
 def restore_perms(nick: str, ftor: str, bid: Optional[str]=None, x_api_key: Optional[str]=Header(default=None),
@@ -314,7 +354,7 @@ def search(nick: str, pattern: str, archive_from: Optional[str]=None, archive_to
     extra=['-f',pattern]
     if archive_from: extra+=['-b',archive_from]
     if archive_to: extra+=['-B',archive_to]
-    return run_borghelper('search',nick=nick,extra_args=extra)
+    return run_borghelper('search',nick=nick,extra_args=extra,cacheable=True)
 
 @app.get("/filehist",response_model=CommandResult,tags=["lecture"])
 def filehist(nick: str, path: str, archive_from: Optional[str]=None, archive_to: Optional[str]=None,
@@ -323,7 +363,7 @@ def filehist(nick: str, path: str, archive_from: Optional[str]=None, archive_to:
     extra=['-f',path]
     if archive_from: extra+=['-b',archive_from]
     if archive_to: extra+=['-B',archive_to]
-    return run_borghelper('filehist',nick=nick,extra_args=extra)
+    return run_borghelper('filehist',nick=nick,extra_args=extra,cacheable=True)
 
 @app.get("/treehist",response_model=CommandResult,tags=["lecture"],summary="Pour chaque objet sous un préfixe : archives où il a changé")
 def treehist(nick: str, prefix: Optional[str]=None, archive_from: Optional[str]=None, archive_to: Optional[str]=None,
@@ -334,7 +374,17 @@ def treehist(nick: str, prefix: Optional[str]=None, archive_from: Optional[str]=
     if archive_from: extra+=['-b',archive_from]
     if archive_to: extra+=['-B',archive_to]
     if json_output: extra.append('-j')
-    return run_borghelper('treehist',nick=nick,extra_args=extra)
+    return run_borghelper('treehist',nick=nick,extra_args=extra,cacheable=True)
+
+@app.get("/treefind",response_model=CommandResult,tags=["lecture"],summary="Recherche récursive par nom (glob minimal * et .) sous un préfixe, dans le dernier snapshot connu")
+def treefind(nick: str, prefix: Optional[str]=None, pattern: Optional[str]=None,
+             json_output: bool=Query(default=False,alias="json"), x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    extra=[]
+    if prefix: extra+=['-f',prefix]
+    if pattern: extra+=['-m',pattern]
+    if json_output: extra.append('-j')
+    return run_borghelper('treefind',nick=nick,extra_args=extra,cacheable=True)
 
 @app.get("/duidx",response_model=CommandResult,tags=["lecture"])
 def duidx(nick: str, pattern: Optional[str]=None, sort: str="chemin", json_output: bool=Query(default=False,alias="json"),
@@ -346,12 +396,12 @@ def duidx(nick: str, pattern: Optional[str]=None, sort: str="chemin", json_outpu
     if json_output: extra.append('-j')
     if archive_from: extra+=['-b',archive_from]
     if archive_to: extra+=['-B',archive_to]
-    return run_borghelper('duidx',nick=nick,extra_args=extra)
+    return run_borghelper('duidx',nick=nick,extra_args=extra,cacheable=True)
 
 @app.get("/cacheinfo",response_model=CommandResult,tags=["lecture"])
 def cacheinfo(nick: str="ALL", x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
-    return run_borghelper('cacheinfo',nick=nick)
+    return run_borghelper('cacheinfo',nick=nick,cacheable=True)
 
 @app.post("/cacheclean",response_model=CommandResult,tags=["mutation"])
 def cacheclean(nick: str="ALL", x_api_key: Optional[str]=Header(default=None)):
@@ -361,7 +411,7 @@ def cacheclean(nick: str="ALL", x_api_key: Optional[str]=Header(default=None)):
 @app.get("/idxtop",response_model=CommandResult,tags=["lecture"])
 def idxtop(nick: str="ALL", topn: int=20, depth: int=3, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
-    return run_borghelper('idxtop',nick=nick,extra_args=['-N',str(topn),'-p',str(depth)])
+    return run_borghelper('idxtop',nick=nick,extra_args=['-N',str(topn),'-p',str(depth)],cacheable=True)
 
 @app.get("/difftop",response_model=CommandResult,tags=["lecture"])
 def difftop(nick: str="ALL", bid: Optional[str]=None, topn: int=10, depth: int=3,
@@ -369,7 +419,7 @@ def difftop(nick: str="ALL", bid: Optional[str]=None, topn: int=10, depth: int=3
     require_api_key(x_api_key)
     extra=['-N',str(topn),'-p',str(depth)]
     if bid: extra+=['-b',bid]
-    return run_borghelper('difftop',nick=nick,extra_args=extra)
+    return run_borghelper('difftop',nick=nick,extra_args=extra,cacheable=True)
 
 @app.post("/idxpurge",response_model=CommandResult,tags=["mutation"],summary="⚡ Purge rétroactive de diff_index + anciens snapshots")
 def idxpurge(nick: str="ALL", pattern: Optional[str]=None, dryrun: bool=False,

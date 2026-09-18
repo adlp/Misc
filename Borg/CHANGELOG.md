@@ -1,5 +1,46 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.94 + borgHelperWWW 1.2.0 + UI 1.2.0 — recherche récursive dans l'explorateur (TreeFind) — 2026-09-18
+
+Nouvelle commande **`TreeFind`** : recherche **récursive par nom** (pas le chemin complet) sous un
+préfixe (racine entière si omis), dans le dernier snapshot connu — comme `TreeHist`, mais récursif et
+filtré par motif. Motif minimal `-m` : `*` = n'importe quelle suite de caractères, `.` reste littéral ;
+sans `*` (ni `?`), sous-chaîne implicite (comme `Search`). JSON (`-j`) inclut `parent` (répertoire
+contenant l'entrée) par résultat. Aucune migration de schéma — réutilise `archive_snapshot_v` tel quel.
+
+Endpoint `GET /treefind` (mêmes paramètres, `cacheable=True`). Interface web : champ de recherche dans
+l'explorateur d'arborescence, scope = répertoire actuellement affiché, récursif. Résultats en liste
+avec, par entrée, un lien **📂 Aller au dossier** (navigue directement — le dossier trouvé lui-même, ou
+le parent pour un fichier) et un bouton **⬇ Télécharger** réutilisant la fenêtre de téléchargement
+existante (mêmes formats brut/`.tar`, même commande `borgHelper` équivalente affichée). Toute
+navigation normale efface la recherche en cours.
+
+## borgHelperWWW 1.1.0 — cache de réponses basé sur la date de modification de la base — 2026-09-18
+
+Les endpoints qui ne lisent (ou n'écrivent, pour `DiffBkp` lors de son tout premier appel sur une paire
+non indexée) que `cache.db`/`diff.db` — `LstBkp`, `LstBkpFls`, `Report -o`, `DiffBkp`, `Search`,
+`FileHist`, `TreeHist`, `DuIdx`, `CacheInfo`, `IdxTop`, `DiffTop` — sont désormais mis en cache en
+mémoire par `borgHelperWWW` : un appel identique (même commande, nick, paramètres) est servi depuis le
+cache, **sans relancer `borgHelper`**, tant que la date de modification de tous les
+`cache.db`/`diff.db` concernés n'a pas changé. Dès qu'un `Bkp`/`Index`/`Prune`/`DelBkp`/… modifie ces
+fichiers, l'empreinte change et l'appel suivant recalcule une réponse fraîche — vérifié de bout en bout
+(un vrai `Bkp` sur le dépôt de démo fait bien apparaître la nouvelle archive dans `LstBkp` dès l'appel
+suivant). Cache borné à 500 entrées (purge totale au-delà) et perdu au redémarrage du processus.
+
+## UI 1.1.0 — animation de chargement + protection contre les réponses tardives — 2026-09-17
+
+**Bug corrigé** : quand un appel API était lent (explorateur d'arborescence notamment), rien
+n'indiquait qu'un chargement était en cours, et si l'utilisateur naviguait entre-temps (autre dossier,
+autre archive, autre serveur), la réponse tardive du **premier** appel pouvait s'afficher **après**
+celle du second — montrant le contenu d'un mauvais répertoire ou d'un mauvais serveur sans que rien ne
+le signale.
+
+Corrigé par un numéro de séquence par vue (`browseLoadSeq`, `historyLoadSeq`, `machinesLoadSeq`) :
+l'état demandé (nick/chemin/archive) est capturé au moment de l'appel, et une réponse qui revient après
+qu'une navigation plus récente a eu lieu est silencieusement ignorée. Animation de chargement
+(spinner CSS + « Chargement… ») affichée immédiatement sur : explorateur d'arborescence, liste des
+serveurs, historique des 10 dernières sauvegardes par carte, Historique complet.
+
 ## borgHelperWWW 1.0.1 + UI 1.0.0 — versionnage UI, intégré à /version — 2026-09-17
 
 `borgHelperWWW_ui.html` reçoit lui aussi son propre numéro de version (`UI_VERSION`, commentaire

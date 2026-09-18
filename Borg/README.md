@@ -490,6 +490,29 @@ forcer immédiatement sans attendre un backup : `Index -F -S`.
 
 ---
 
+### `TreeFind`
+Recherche **récursive par nom** (pas le chemin complet) sous un préfixe (racine entière si omis), dans
+le **dernier snapshot connu** — comme `TreeHist`, mais récursif, sans historique, et filtré par motif.
+
+```bash
+borgHelper -c TreeFind -n mon-serveur -m '*.log'                   # toute l'arborescence
+borgHelper -c TreeFind -n mon-serveur -f /var/log -m 'error*'      # sous un préfixe précis
+borgHelper -c TreeFind -n mon-serveur -m backup                    # sous-chaîne implicite (sans *)
+borgHelper -c TreeFind -n mon-serveur -m '*.ko' -j                 # JSON
+```
+
+Motif minimal (`-m`) : `*` = n'importe quelle suite de caractères, `.` reste **littéral** (pas de sens
+spécial) ; sans `*` (ni `?`) dans le motif, sous-chaîne implicite (comme `Search`). Comparaison sur le
+**nom** de l'entrée uniquement (dernier segment du chemin), sensible à la casse.
+
+Colonnes (mode texte) : `nom`, `genre`, `chemin` (complet), `droits`, `propriétaire` — dernier état
+connu, même limitation que `TreeHist`. JSON (`-j`) :
+`{nick:{archive,scope,pattern,matches:[{name,full_path,parent,is_dir,genre,mode,owner}]}}` — `parent`
+est le répertoire contenant l'entrée, pratique pour y naviguer directement (utilisé par l'explorateur
+de l'interface web).
+
+---
+
 ### `DuIdx`
 Résumé `du -sh`-like depuis le SQLite.
 
@@ -702,7 +725,12 @@ page de l'interface web (visible sur toutes les pages, y compris la page de conn
    `stderr`) s'affiche tel quel. Bouton **🗂 Explorer l'arborescence** dans le bandeau du serveur.
 4. **Explorateur d'arborescence** (`TreeHist -j`) : navigation façon gestionnaire de fichiers. Colonnes
    **Droits** (ls-style, `drwxr-xr-x`…) et **Propriétaire** (`user:group (uid:gid)`) affichées pour
-   chaque entrée — dernier état connu.
+   chaque entrée — dernier état connu. Chaque navigation (clic sur un dossier, sur le fil d'Ariane, sur
+   Explorer) affiche une **animation de chargement** le temps de la réponse ; un numéro de séquence
+   protège contre l'API lente : une réponse arrivée après qu'une navigation plus récente a eu lieu est
+   **ignorée** (jamais affichée), pour ne jamais montrer le contenu d'un autre répertoire ou d'un autre
+   serveur que celui affiché à l'écran. Même protection sur la liste des serveurs et sur l'Historique
+   complet.
    - **Clic sur un dossier** : l'ouvre (contenu direct, comme `TreeHist -f <dossier>`).
    - **Clic droit sur un dossier** : télécharge un `.tar` de cette arborescence, à une archive
      choisissable dans une liste déroulante (`borg export-tar`, streamé directement au navigateur).
@@ -719,6 +747,14 @@ page de l'interface web (visible sur toutes les pages, y compris la page de conn
      (fichier ou dossier, brut ou tar) : `Restore -n <nick> -f <chemin> -w <destination> [-b <archive>]`
      — extraction disque classique avec droits préservés (`borg extract` réel, contrairement au
      téléchargement brut navigateur) ; mise à jour en direct selon l'archive sélectionnée.
+   - **Recherche** (`TreeFind -j`) : champ texte au-dessus du tableau — recherche **récursive par nom**
+     à partir du répertoire actuellement affiché (motif minimal `*`/`.`, comme la commande CLI ;
+     Entrée ou bouton **🔍 Rechercher** pour lancer). Résultats en liste (chemin complet, droits,
+     propriétaire), chacun avec un bouton **📂 Aller au dossier** (navigue directement dans
+     l'explorateur — le répertoire lui-même pour un dossier trouvé, son parent pour un fichier) et un
+     bouton **⬇ Télécharger** (même fenêtre de téléchargement que ci-dessus). Bouton **✕ Revenir à
+     l'explorateur** pour effacer la recherche ; toute navigation normale (dossier, fil d'Ariane)
+     l'efface aussi automatiquement.
 5. **Historique complet** (bouton **📜 Historique complet** sur la page Serveurs) : toutes les archives
    indexées en base pour ce serveur (`Report -o -j`, sans limite `-N`), mêmes colonnes que le tableau
    des 10 dernières, plus une colonne **Actions** par archive :
@@ -760,32 +796,48 @@ en tête du fichier HTML), toutes trois **chargées une fois au démarrage du pr
 volontairement **non protégé** par `X-API-Key` (aucune donnée sensible) — affiché dans le pied de page
 de l'interface web, visible même avant connexion.
 
-| Méthode | Route | Commande CLI |
-|---------|-------|--------------|
-| GET | `/version` | *(aucune — spécifique à borgHelperWWW)* |
-| GET | `/stats` | Stats |
-| POST | `/login` | Login |
-| GET | `/lstbkp` | LstBkp |
-| GET | `/lstbkpfls` | LstBkpFls |
-| GET | `/report` | Report |
-| GET | `/diffbkp` | DiffBkp |
-| GET | `/restore/perms` | Restore -L |
-| POST | `/restore` | Restore |
-| DELETE | `/delbkp` | DelBkp ⚡ |
-| POST | `/init` | Init |
-| POST | `/bkp` | Bkp |
-| GET | `/key` | Key |
-| POST | `/prune` | Prune ⚡ |
-| POST | `/index` | Index |
-| GET | `/search` | Search |
-| GET | `/filehist` | FileHist |
-| GET | `/treehist` | TreeHist |
-| GET | `/duidx` | DuIdx |
-| GET | `/cacheinfo` | CacheInfo |
-| POST | `/cacheclean` | CacheClean |
-| GET | `/idxtop` | IdxTop |
-| GET | `/difftop` | DiffTop |
-| POST | `/idxpurge` | IdxPurge ⚡ |
+#### Cache de réponses
+
+Les endpoints marqués **✓** dans la colonne Cache ci-dessous ne lisent (ou n'écrivent, pour `DiffBkp`
+lors de son tout premier appel sur une paire non indexée) que `cache.db`/`diff.db` — jamais l'état live
+du dépôt
+indépendamment de ces fichiers. `borgHelperWWW` retient leur dernière réponse en mémoire, avec une
+empreinte = date de modification de tous les `cache.db`/`diff.db` concernés (tous les nicks connus si
+le nick demandé est vide ou `ALL`). Un appel identique est servi depuis le cache **sans relancer
+`borgHelper`** tant que cette empreinte n'a pas changé ; dès qu'un `Bkp`/`Index`/`Prune`/`DelBkp`/… a
+modifié ces fichiers, l'empreinte change et l'appel suivant recalcule (et remet en cache) une réponse
+fraîche. Cache en mémoire du processus (perdu au redémarrage), sans limite de durée mais borné à 500
+entrées (purge totale au-delà, garde-fou anti-croissance illimitée). `GET /report` n'est concerné qu'en
+mode `offline=true` (le mode en ligne interroge le dépôt en direct via `borg info`, non couvert par
+cette empreinte).
+
+| Méthode | Route | Commande CLI | Cache |
+|---------|-------|--------------|:---:|
+| GET | `/version` | *(aucune — spécifique à borgHelperWWW)* | |
+| GET | `/stats` | Stats | |
+| POST | `/login` | Login | |
+| GET | `/lstbkp` | LstBkp | ✓ |
+| GET | `/lstbkpfls` | LstBkpFls | ✓ |
+| GET | `/report` | Report | ✓ *(offline uniquement)* |
+| GET | `/diffbkp` | DiffBkp | ✓ |
+| GET | `/restore/perms` | Restore -L | |
+| POST | `/restore` | Restore | |
+| DELETE | `/delbkp` | DelBkp ⚡ | |
+| POST | `/init` | Init | |
+| POST | `/bkp` | Bkp | |
+| GET | `/key` | Key | |
+| POST | `/prune` | Prune ⚡ | |
+| POST | `/index` | Index | |
+| GET | `/search` | Search | ✓ |
+| GET | `/filehist` | FileHist | ✓ |
+| GET | `/treehist` | TreeHist | ✓ |
+| GET | `/treefind` | TreeFind | ✓ |
+| GET | `/duidx` | DuIdx | ✓ |
+| GET | `/cacheinfo` | CacheInfo | ✓ |
+| POST | `/cacheclean` | CacheClean | |
+| GET | `/idxtop` | IdxTop | ✓ |
+| GET | `/difftop` | DiffTop | ✓ |
+| POST | `/idxpurge` | IdxPurge ⚡ | |
 
 Réponse (`CommandResult`) commune à tous les endpoints ci-dessus :
 
