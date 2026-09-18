@@ -1,5 +1,12 @@
 # Changelog — borgHelper
 
+## UI 1.4.1 — badge « Téléchargements désactivés » — 2026-09-18
+
+Badge **🚫 Téléchargements désactivés** dans l'en-tête (même emplacement/mécanisme que
+**🔒 Destructions désactivées**), visible quand `allow_downloads` est à `false` — couleur `warn`
+(plutôt que `ok` comme le badge destructions) car ce n'est pas le réglage par défaut : signale une
+restriction explicitement choisie par l'administrateur. Vérifié en direct avec `--no-downloads`.
+
 ## UI 1.4.0 — masque les boutons d'actions interdites (destruction / téléchargements) — 2026-09-18
 
 Quand `allow_destructive`/`allow_downloads` (récupérés via `GET /version` au chargement de la page)

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.4.0 -->
+<!-- UI_VERSION: 1.4.1 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -90,6 +90,7 @@
   </div>
   <div>
     <span class="badge ok" id="destructiveBadge" hidden style="margin-right:8px" title="Prune/DelBkp désactivés sur ce serveur (BORGHELPERWWW_ALLOW_DESTRUCTIVE)">🔒 Destructions désactivées</span>
+    <span class="badge warn" id="downloadsBadge" hidden style="margin-right:8px" title="/download/file et /download/tar désactivés sur ce serveur (BORGHELPERWWW_ALLOW_DOWNLOADS)">🚫 Téléchargements désactivés</span>
     <button class="secondary" id="serversBtn" hidden onclick="showMachines()">Serveurs</button>
     <button class="secondary" id="logoutBtn" hidden onclick="logout()">Déconnexion</button>
   </div>
@@ -265,6 +266,7 @@ let allowDownloads=true;
     document.getElementById('footerVersions').textContent=
       ` v${v.borghelperwww_version} (borgHelper v${v.borghelper_version}, UI v${v.ui_version})`;
     document.getElementById('destructiveBadge').hidden=!!v.allow_destructive;
+    document.getElementById('downloadsBadge').hidden=!!v.allow_downloads;
     allowDestructive=!!v.allow_destructive;
     allowDownloads=!!v.allow_downloads;
     document.getElementById('historyPruneBtn').hidden=!allowDestructive;
