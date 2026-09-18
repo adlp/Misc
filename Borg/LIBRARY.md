@@ -526,14 +526,14 @@ sys.exit(0)
 | `idxtop(nick, depth, topn, debug)` | Top N arborescences par nb d'entrées dans diff_index — diagnostiquer un diff.db volumineux |
 | `difftop(nick, bkp, depth, topn, debug)` | Top N arborescences par changements sur une paire d'archives — diagnostiquer les changements d'un backup |
 | `idxpurge(nick, pattern=None, dryrun, debug)` | Purge rétroactive de diff_index + snapshots anciens + VACUUM — sans pattern : lit IDX_EXCLUDE/IDX_INCLUDE depuis la config |
-| `search(nick, pattern, archive_from, archive_to, debug)` | Recherche par chemin |
-| `filehist(nick, path, archive_from, archive_to, debug)` | Historique d'un chemin |
+| `search(nick, pattern, archive_from, archive_to, debug, as_json)` | Recherche par chemin — `as_json` : `{nick:[{date,archive,type,path,size_before,size_after},...]}` |
+| `filehist(nick, path, archive_from, archive_to, debug, as_json)` | Historique d'un chemin — `as_json` : `{nick:[{date,archive_before,archive_after,type,size_before,size_after},...]}` |
 | `duidx(nick, pattern, sort_by, reverse, as_json, ...)` | Résumé taille/type |
-| `diffbkp(nick, bidun, bideux, debug)` | Différences entre deux archives — `+`/`-`/`=` par ligne, résumé compteurs |
+| `diffbkp(nick, bidun, bideux, debug, db_path, as_json)` | Différences entre deux archives — `+`/`-`/`=` par ligne, résumé compteurs ; `as_json` : `{archive_old,archive_new,entries:[...],n_add,n_rem,n_mod}` |
 | `restore(nick, bid, ftor, where, flat, debug)` | Restauration |
 | `listperms(nick, bid, ftor, debug)` | Liste droits fichiers sans restaurer |
 | `list_backups(nick, debug)` | Liste les archives |
-| `list_files(nick, bid, debug)` | Liste fichiers d'une archive |
+| `list_files(nick, bid, debug, as_json)` | Liste fichiers d'une archive — `as_json` : `{nick,archive,files:[chemin,...]}` |
 | `delbkp(nick, bid, debug)` | Supprime une archive |
 | `mount(nick, bid, debug)` | Monte via FUSE |
 | `umount(nick, debug)` | Démonte |

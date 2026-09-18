@@ -311,9 +311,10 @@ Liste les fichiers d'une archive — lecture base uniquement, pas d'appel `borg`
 ```bash
 borgHelper -c LstBkpFls -n mon-serveur
 borgHelper -c LstBkpFls -n mon-serveur -b mon-serveur-root-2025-04-02T213004
+borgHelper -c LstBkpFls -n mon-serveur -j   # JSON : {nick,archive,files:[chemin,...]}
 ```
 
-Nécessite le snapshot de l'archive peuplé (`Indexsnap`). Sinon : "Aucun fichier indexé — lancer 'indexsnap'".
+Nécessite le snapshot de l'archive peuplé (`Indexsnap`). Sinon : "Aucun fichier indexé — lancer 'indexsnap'" (`{"error": "..."}` avec `-j`).
 
 ---
 
@@ -324,6 +325,7 @@ Différences entre deux archives — un fichier par ligne.
 borgHelper -c DiffBkp -n mon-serveur                          # 2 dernières archives
 borgHelper -c DiffBkp -n mon-serveur -b archive-ancienne      # vs dernière
 borgHelper -c DiffBkp -n mon-serveur -b archive-1,archive-2   # entre deux précises
+borgHelper -c DiffBkp -n mon-serveur -j   # JSON : {archive_old,archive_new,entries:[...],n_add,n_rem,n_mod}
 ```
 
 Première colonne : `+` ajouté, `-` supprimé, `=` présent dans les deux archives (modifié, permissions, type).  
@@ -450,6 +452,7 @@ Cherche par nom de fichier dans l'index des diffs et dans le snapshot.
 borgHelper -c Search -f passwd -n mon-serveur
 borgHelper -c Search -f '*.conf' -n ALL
 borgHelper -c Search -f '/etc/nginx*' -n mon-serveur
+borgHelper -c Search -f passwd -n mon-serveur -j   # JSON : {nick:[{date,archive,type,path,size_before,size_after},...]}
 ```
 
 Plage : `-b <archive>` (depuis), `-B <archive>` (jusqu'à), `-b ALL` (tout), sans les deux (dernière paire).
@@ -462,6 +465,7 @@ Historique complet des changements pour un chemin exact.
 ```bash
 borgHelper -c FileHist -f /etc/nginx/nginx.conf -n mon-serveur
 borgHelper -c FileHist -f /var/lib/postgresql -n ALL
+borgHelper -c FileHist -f /etc/nginx/nginx.conf -n mon-serveur -j   # JSON : {nick:[{date,archive_before,archive_after,type,size_before,size_after},...]}
 ```
 
 ---

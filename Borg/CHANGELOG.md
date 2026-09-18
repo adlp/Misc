@@ -1,5 +1,29 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.95 — mode JSON sur Search, FileHist, LstBkpFls, DiffBkp (Epic 1, Story 1.2) — 2026-09-18
+
+Deuxième brique de la consultation scopée par arborescence (Epic 1) : `Search`, `FileHist`,
+`LstBkpFls` et `DiffBkp` gagnent un flag `-j`/`as_json`, sur le même modèle que `TreeHist`/
+`TreeFind` — prérequis mécanique pour le filtrage par périmètre d'une story ultérieure du même
+epic (rien n'est filtré ici, ce changement est CLI-only).
+
+- `-j` sur les quatre commandes : sortie JSON structurée à la place du tableau texte habituel,
+  qui reste strictement inchangé sans `-j`. `Search`/`FileHist` : `{nick:[{...},...]}`, une entrée
+  par nick (comme `TreeHist`/`TreeFind`). `LstBkpFls` : `{nick,archive,files:[...]}`. `DiffBkp` :
+  `{archive_old,archive_new,entries:[...],n_add,n_rem,n_mod}`.
+- Toutes les sorties d'erreur de ces quatre commandes (index vide, paire non trouvée, échec
+  `borg list`/`borg diff`, erreur SQLite) passent aussi par `-j` — `{"error": "..."}` sur stdout
+  plutôt qu'une phrase en clair, pour ne jamais casser un consommateur qui s'attend à du JSON.
+- Champs JSON en valeurs brutes (tailles en octets, pas `convert_octets_readable`) — utile pour un
+  programme, contrairement au tableau texte destiné à un terminal.
+
+Vérifié contre le dépôt `demo.borghelperrc` réel (`Init`+`Bkp` x2 en local) : sortie texte vs `-j`
+comparées champ par champ pour `Search`/`FileHist`, `LstBkpFls -j` et `DiffBkp -j` (cas
+différence vide et compteurs `n_add/n_rem/n_mod`) conformes ; `python3 -m py_compile` propre.
+
+`README.md`/`LIBRARY.md` mis à jour (exemples `-j`, signatures) ; usage CLI (`-h`/`-H`) documente
+le nouveau flag sur les quatre commandes.
+
 ## borgHelperWWW 1.11.0 + UI 1.7.1 — périmètre de chemin par groupe (Epic 1, Story 1.1) — 2026-09-18
 
 Première brique de la consultation scopée par arborescence (Epic 1) : `borgHelperWWW` peut

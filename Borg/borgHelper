@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.94"
+Version="1.0.95"
 DIFF_DB_SCHEMA_VERSION  = 4
 CACHE_DB_SCHEMA_VERSION = 1
 # Historique diff.db — chaque palier correspond à une migration idempotente et auto-détectée
@@ -332,13 +332,13 @@ def usage(doc=None,debug=0):
         printer("       On demonte le FS")
         printer("   -c LstBkp [-n nickname/servername]")
         printer("       On liste les backup connus")
-        printer("   -c LstBkpFls [-n nickname/servername] [-b backupid/last]")
-        printer("       On liste les fichiers d'un backup precis")
+        printer("   -c LstBkpFls [-n nickname/servername] [-b backupid/last] [-j]")
+        printer("       On liste les fichiers d'un backup precis  |  -j : JSON")
         printer("⚗️  -c Report [-n nickname/servername/ALL] [-N n] [-l] [-j] [-o]")
         printer("       Rapport sur les backups  |  -l : HTML  |  -j : JSON  |  -N n : n dernières archives")
         printer("       -o : mode offline (diff.db uniquement, aucun appel borg)")
-        printer("   -c DiffBkp [-n nickname/servername] [-b backupid] [-w where]")
-        printer("       Liste les mouvements des fichiers entre le backupid et le dernier backup")
+        printer("   -c DiffBkp [-n nickname/servername] [-b backupid] [-w where] [-j]")
+        printer("       Liste les mouvements des fichiers entre le backupid et le dernier backup  |  -j : JSON")
         printer("   -c Restore [-n nickname/servername] [-b backupid/last] -f file2get -w where")
         printer("       On lance la restauration")
         printer("⚡️ -c DelBkp [-n nickname/servername] -b backupid")
@@ -360,11 +360,11 @@ def usage(doc=None,debug=0):
         printer("       -A <archive> : réindexe uniquement la paire dont archive_new=<archive>")
         printer("       IndexSnap s'auto-répare : un type manquant (colonne snapshot_file.type) force un")
         printer("       resnapshot complet automatique une fois (au prochain Bkp/Index), sans -F manuel")
-        printer("   -c Search -f <pattern> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive]")
+        printer("   -c Search -f <pattern> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-j]")
         printer("       Cherche dans l'index des diffs par nom de fichier (glob * et ?)")
-        printer("       -b : depuis archive X  |  -B : jusqu'à archive Y  |  -b ALL : tout l'index")
-        printer("   -c FileHist -f <chemin> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive]")
-        printer("       Historique des changements d'un chemin exact")
+        printer("       -b : depuis archive X  |  -B : jusqu'à archive Y  |  -b ALL : tout l'index  |  -j : JSON")
+        printer("   -c FileHist -f <chemin> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-j]")
+        printer("       Historique des changements d'un chemin exact  |  -j : JSON")
         printer("   -c TreeHist [-f <préfixe>] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-j]")
         printer("       Un seul tableau : contenu DIRECT de <préfixe> (racine si omis, lui-même en '.'),")
         printer("       toujours en entier — pas de descente dans les sous-répertoires. Colonnes genre")
@@ -414,16 +414,18 @@ def usage(doc=None,debug=0):
         printer("   -c ListBkp [-n nickname/servername]")
         printer("       Liste les backup (backupid) disponibles")
     elif doc=='listbkpfls':
-        printer("   -c LstBkpFls [-n nickname/servername] -b backupid")
+        printer("   -c LstBkpFls [-n nickname/servername] -b backupid [-j]")
         printer("       Liste les fichiers disponibles dans le backup backupid")
+        printer("       -j : sortie JSON {nick,archive,files:[chemin,...]}")
     elif doc=='report':
         printer("   -c Report [-n nickname/servername/ALL] [-N n] [-l] [-j] [-o]")
         printer("       Rapport sur les backups (tailles, fraîcheur, stats de mouvement)")
         printer("       -l : HTML  |  -j : JSON  |  -N n : n dernières archives (surcharge DISPLAY_BKP)")
         printer("       -o : mode offline — diff.db uniquement, aucun appel borg")
     elif doc=='diffbkp':
-        printer("   -c DiffBkp [-n nickname/servername] -b backupid [-w where]")
+        printer("   -c DiffBkp [-n nickname/servername] -b backupid [-w where] [-j]")
         printer("       Liste les mouvements des fichiers entre le backupid et le dernier backup")
+        printer("       -j : sortie JSON {archive_old,archive_new,entries:[{change_type,path,size_before,size_after}],n_add,n_rem,n_mod}")
     elif doc=='restore':
         printer("   -c Restore [-n nickname/servername] [-b backupid] -f chemin (-w|-W) dest | -L")
         printer("       Restaure un fichier ou une arborescence depuis une archive")
@@ -453,11 +455,13 @@ def usage(doc=None,debug=0):
         printer("       complet une fois, automatiquement, sans besoin de -F (voir TreeHist)")
         printer("       IDX_WORKERS dans borghelperrc : nb de borg diff parallèles (défaut 4)")
     elif doc=='search':
-        printer("   -c Search -f <pattern> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive]")
+        printer("   -c Search -f <pattern> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-j]")
         printer("       Cherche dans l'index des diffs et le snapshot par pattern de chemin")
+        printer("       -j : sortie JSON {nick:[{date,archive,type,path,size_before,size_after},...]} par nick")
     elif doc=='filehist':
-        printer("   -c FileHist -f <chemin> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive]")
+        printer("   -c FileHist -f <chemin> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-j]")
         printer("       Historique complet des changements d'un chemin exact")
+        printer("       -j : sortie JSON {nick:[{date,archive_before,archive_after,type,size_before,size_after},...]} par nick")
     elif doc=='treehist':
         printer("   -c TreeHist [-f <préfixe>] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-j]")
         printer("       Un seul tableau : contenu DIRECT de <préfixe> (racine entière si omis) uniquement —")
@@ -1489,19 +1493,27 @@ class BorgHelper:
             print(f"{name} {date}")
         sys.exit(0)
 
-    def list_files(self,nick,bid,debug=0):
+    def list_files(self,nick,bid,debug=0,as_json=False):
         db_path=self.db.get_diff_db(nick)
         self.db.ensure_diff_db(db_path)
         conn=sqlite3.connect(db_path)
         if bid is None:
             row=conn.execute("SELECT archive FROM archive_stats WHERE nick=? ORDER BY archive_date DESC LIMIT 1",(nick,)).fetchone()
             if row is None:
-                conn.close(); printer("Aucune archive indexée en base — lancer 'index' ou 'bkp'."); sys.exit(1)
+                conn.close()
+                msg="Aucune archive indexée en base — lancer 'index' ou 'bkp'."
+                if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(1)
+                printer(msg); sys.exit(1)
             bid=row[0]
         rows=conn.execute("SELECT path FROM archive_snapshot_v WHERE nick=? AND archive=? ORDER BY path",(nick,bid)).fetchall()
         conn.close()
         if not rows:
-            printer(f"Aucun fichier indexé pour {bid} — lancer 'indexsnap'."); sys.exit(1)
+            msg=f"Aucun fichier indexé pour {bid} — lancer 'indexsnap'."
+            if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(1)
+            printer(msg); sys.exit(1)
+        if as_json:
+            print(json.dumps({'nick':nick,'archive':bid,'files':[p for (p,) in rows]},ensure_ascii=False,indent=2))
+            sys.exit(0)
         for (path,) in rows: print(path)
         sys.exit(0)
 
@@ -1548,7 +1560,7 @@ class BorgHelper:
                 printer(f"  {n}: erreur lors de la vérification")
         print(f"Total supprimé : {total}")
 
-    def diffbkp(self,nick,bidun=None,bideux=None,debug=0,db_path=None):
+    def diffbkp(self,nick,bidun=None,bideux=None,debug=0,db_path=None,as_json=False):
         if db_path is None: db_path=self.db.get_diff_db(nick)
         cfg=self.borg.cfgreaded(nick,debug=debug)
         twodiff=self.borg.getlastbkp(nick,2,debug=debug)
@@ -1557,22 +1569,29 @@ class BorgHelper:
         elif bideux is None:
             bideux=bidun; bidun=twodiff[1]
         if bidun==bideux:
-            printer("Desole, ce sont les memes backups"); sys.exit(1)
+            msg="Desole, ce sont les memes backups"
+            if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(1)
+            printer(msg); sys.exit(1)
         if bidun>bideux: bidun,bideux=bideux,bidun
         if debug: printer(f"Comparaison de {bidun} et {bideux}")
         self.db.ensure_diff_db(db_path)
         if not self.db.is_diff_pair_indexed(nick,bidun,bideux,db_path):
-            print(f"Paire non indexée — calcul en cours...",flush=True)
+            if as_json: printer("Paire non indexée — calcul en cours...")
+            else: print(f"Paire non indexée — calcul en cours...",flush=True)
             rb=self.borg.boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
             try:
                 self.borg._boex_check_stdout(rb,nick,'borg list')
             except RuntimeError as e:
-                printer(f"borg list a échoué : {e}"); sys.exit(2)
+                msg=f"borg list a échoué : {e}"
+                if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(2)
+                printer(msg); sys.exit(2)
             archives=rb['stdout'][0]['archives']
             date_new=next((a['start'] for a in archives if a['name']==bideux),None)
             rb2=self.borg.boex(nick,['diff','--json-lines',f"{cfg['BORG_REPO']}::{bidun}",bideux],debug=debug,retjson=False)
             if rb2['exitcode']!=0:
-                printer(f"borg diff a échoué (code {rb2['exitcode']})"); sys.exit(rb2['exitcode'])
+                msg=f"borg diff a échoué (code {rb2['exitcode']})"
+                if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(rb2['exitcode'])
+                printer(msg); sys.exit(rb2['exitcode'])
             all_entries=[p for line in rb2['stdout'] for p in [parse_diff_line_json(line)] if p and p['path']]
             entries_ok=[]; exclu={}
             for p in all_entries:
@@ -1591,21 +1610,29 @@ class BorgHelper:
                 rows=conn.execute("SELECT change_type,path,size_before,size_after FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=? ORDER BY path,change_type",(nick,bidun,bideux)).fetchall()
                 conn.close()
             except sqlite3.Error as e:
-                printer(f"SQLite error ({db_path}): {e}"); sys.exit(3)
+                msg=f"SQLite error ({db_path}): {e}"
+                if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(3)
+                printer(msg); sys.exit(3)
             display_entries=[{'change_type':ct,'path':path,'size_before':sb,'size_after':sa} for ct,path,sb,sa in rows]
+        n_add=sum(1 for p in display_entries if p['change_type']=='added')
+        n_rem=sum(1 for p in display_entries if p['change_type']=='removed')
+        n_mod=len(display_entries)-n_add-n_rem
+        if as_json:
+            print(json.dumps({'archive_old':bidun,'archive_new':bideux,'entries':display_entries,
+                'n_add':n_add,'n_rem':n_rem,'n_mod':n_mod},ensure_ascii=False,indent=2))
+            sys.exit(0)
         print(f"{bidun} → {bideux}")
         if not display_entries: print("Aucune différence."); sys.exit(0)
-        n_add=n_rem=n_mod=0
         for p in display_entries:
             ct,path,sb,sa=p['change_type'],p['path'],p.get('size_before'),p.get('size_after')
             if ct=='added':
-                sym='+'; n_add+=1
+                sym='+'
                 tail=f"  {convert_octets_readable(sa)}" if sa else ''
             elif ct=='removed':
-                sym='-'; n_rem+=1
+                sym='-'
                 tail=f"  {convert_octets_readable(sb)}" if sb else ''
             else:
-                sym='='; n_mod+=1
+                sym='='
                 if sb and sa:
                     tail=f"  {convert_octets_readable(sb)} → {convert_octets_readable(sa)}"
                 elif sa: tail=f"  {convert_octets_readable(sa)}"
@@ -2228,26 +2255,41 @@ class BorgHelper:
         self.indexsnap(nick,debug=debug,db_path=db_path,force=force)
         return 0
 
-    def search(self,nick,pattern,archive_from=None,archive_to=None,debug=0):
+    def search(self,nick,pattern,archive_from=None,archive_to=None,debug=0,as_json=False):
+        """as_json=True : imprime {nick: [...lignes]} par nick réussi, {nick: {'error': msg}} par
+        nick en échec (index vide/erreur SQLite) — deux formes par clé, à distinguer par type
+        (list vs dict) côté consommateur."""
         sql_pat=pattern.replace('*','%').replace('?','_')
         if '%' not in sql_pat and '_' not in sql_pat: sql_pat='%'+sql_pat+'%'
         rows=[]
+        results={} if as_json else None
         for n in nick.split(','):
             db_path=self.db.get_diff_db(n)
             self.db.ensure_diff_db(db_path)
             if self.db._is_index_empty(n,db_path):
-                printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
+                msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
+                if as_json: results[n]={'error':msg}
+                else: printer(f"[ERREUR] {msg}")
+                continue
             try:
                 conn=sqlite3.connect(db_path)
                 af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
                 cur=conn.execute("SELECT nick,archive_new_date,archive_new,change_type,path,size_before,size_after FROM diff_index WHERE nick=? AND path LIKE ?"+af_sql+" ORDER BY archive_new_date,path",[n,sql_pat]+af_params)
-                rows.extend(cur.fetchall())
+                n_rows=cur.fetchall()
                 df,dt=_snap_params(af_params,archive_from,archive_to)
                 snap_extra=[x for x in [df,dt] if x]
                 cur=conn.execute("SELECT nick,archive_date,archive,'présent',path,NULL,size FROM archive_snapshot_v WHERE nick=? AND path LIKE ? "+_snap_notin(df,dt)+" ORDER BY archive,path",[n,sql_pat]+snap_extra)
-                rows.extend(cur.fetchall()); conn.close()
+                n_rows+=cur.fetchall(); conn.close()
             except sqlite3.Error as e:
-                printer(f"SQLite error ({db_path}): {e}")
+                if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
+                else: printer(f"SQLite error ({db_path}): {e}")
+                continue
+            rows.extend(n_rows)
+            if as_json:
+                results[n]=[{'date':(d or '')[:19],'archive':a,'type':t,'path':p,'size_before':sb,'size_after':sa}
+                            for _,d,a,t,p,sb,sa in n_rows]
+        if as_json:
+            print(json.dumps(results,ensure_ascii=False,indent=2)); return
         if not rows: print("Aucun résultat."); return
         from prettytable import PrettyTable
         t=PrettyTable(['nick','date','archive','type','chemin','avant','après'])
@@ -2256,24 +2298,38 @@ class BorgHelper:
             t.add_row([nick_r,(date_r or '')[:19],arch_r,type_r,path_r,convert_octets_readable(sb) if sb else '',convert_octets_readable(sa) if sa else ''])
         print(t)
 
-    def filehist(self,nick,path,archive_from=None,archive_to=None,debug=0):
+    def filehist(self,nick,path,archive_from=None,archive_to=None,debug=0,as_json=False):
+        """as_json : voir search() — même forme par-nick, list ou {'error':msg}."""
         rows=[]
+        results={} if as_json else None
         for n in nick.split(','):
             db_path=self.db.get_diff_db(n)
             self.db.ensure_diff_db(db_path)
             if self.db._is_index_empty(n,db_path):
-                printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
+                msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
+                if as_json: results[n]={'error':msg}
+                else: printer(f"[ERREUR] {msg}")
+                continue
             try:
                 conn=sqlite3.connect(db_path)
                 af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
                 cur=conn.execute("SELECT nick,archive_new_date,archive_old,archive_new,change_type,size_before,size_after FROM diff_index WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date",[n,path]+af_params)
-                rows.extend(cur.fetchall())
+                n_rows=cur.fetchall()
                 df,dt=_snap_params(af_params,archive_from,archive_to)
                 snap_extra=[x for x in [df,dt] if x]
                 cur=conn.execute("SELECT nick,archive_date,'',archive,'présent',NULL,size FROM archive_snapshot_v WHERE nick=? AND path=? "+_snap_notin(df,dt),[n,path]+snap_extra)
-                rows.extend(cur.fetchall()); conn.close()
+                n_rows+=cur.fetchall(); conn.close()
             except sqlite3.Error as e:
-                printer(f"SQLite error ({db_path}): {e}")
+                if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
+                else: printer(f"SQLite error ({db_path}): {e}")
+                continue
+            n_rows.sort(key=lambda r:(r[1] or ''))
+            rows.extend(n_rows)
+            if as_json:
+                results[n]=[{'date':(d or '')[:19],'archive_before':ao,'archive_after':an,'type':t,'size_before':sb,'size_after':sa}
+                            for _,d,ao,an,t,sb,sa in n_rows]
+        if as_json:
+            print(json.dumps(results,ensure_ascii=False,indent=2)); return
         if not rows: print(f"Aucune entrée pour : {path}"); return
         rows.sort(key=lambda r:(r[1] or ''))
         from prettytable import PrettyTable
@@ -3098,10 +3154,10 @@ def _cli_main():
     bh=BorgHelper(cfgfile=cfgfile_arg,passphrase=passphrase_arg)
 
     optab={'stats':'Ccdn','login':'Ccdsnkprm','mount':'Ccdnb','umount':'Ccdn',
-           'lstbkp':'Ccdn','lstbkpfls':'Ccdnb','restore':'CcdnbfwWL','diffbkp':'Ccdnbw',
+           'lstbkp':'Ccdn','lstbkpfls':'Ccdnbj','restore':'CcdnbfwWL','diffbkp':'Ccdnbwj',
            'delbkp':'Ccdnb','bkp':'CcdnI','prune':'Ccdn','report':'CcdnlNjo',
-           'init':'Ccdn','key':'Ccdn','index':'CcdnFSA','search':'CcdnfbB',
-           'filehist':'CcdnfbB','cacheinfo':'Ccdn','cacheclean':'Ccdn','duidx':'CcdnfbBsj',
+           'init':'Ccdn','key':'Ccdn','index':'CcdnFSA','search':'CcdnfbBj',
+           'filehist':'CcdnfbBj','cacheinfo':'Ccdn','cacheclean':'Ccdn','duidx':'CcdnfbBsj',
            'idxtop':'CcdnNp','difftop':'CcdnNpb','idxpurge':'CcdnxD','treehist':'CcdnfbBj',
            'treefind':'Ccdnfmj'}
     optab={k:v+'P' for k,v in optab.items()}
@@ -3140,7 +3196,7 @@ def _cli_main():
     elif cmd=='lstbkpfls':
         bid=options.get('-b',None)
         if bid=='last': bid=None
-        bh.list_files(nick,bid,debug=debug)
+        bh.list_files(nick,bid,debug=debug,as_json=('-j' in options))
     elif cmd=='key':
         bh.key(nick,debug=debug)
     elif cmd=='report':
@@ -3161,7 +3217,7 @@ def _cli_main():
             bidun,bideux=options['-b'].split(',',2)
         else:
             bidun=options['-b']; bideux=None
-        bh.diffbkp(nick,bidun,bideux,debug=debug)
+        bh.diffbkp(nick,bidun,bideux,debug=debug,as_json=('-j' in options))
     elif cmd=='restore':
         bid=options.get('-b',None)
         if bid=='last': bid=None
@@ -3205,10 +3261,10 @@ def _cli_main():
             else: bh.index(n,debug=debug,force=_force,target_archive=_target)
     elif cmd=='search':
         if '-f' not in options: usage(cmd)
-        bh.search(nick,options['-f'],archive_from=options.get('-b',None),archive_to=options.get('-B',None),debug=debug)
+        bh.search(nick,options['-f'],archive_from=options.get('-b',None),archive_to=options.get('-B',None),debug=debug,as_json=('-j' in options))
     elif cmd=='filehist':
         if '-f' not in options: usage(cmd)
-        bh.filehist(nick,options['-f'],archive_from=options.get('-b',None),archive_to=options.get('-B',None),debug=debug)
+        bh.filehist(nick,options['-f'],archive_from=options.get('-b',None),archive_to=options.get('-B',None),debug=debug,as_json=('-j' in options))
     elif cmd=='treehist':
         bh.treehist(nick,options.get('-f',None),archive_from=options.get('-b',None),archive_to=options.get('-B',None),debug=debug,as_json=('-j' in options))
     elif cmd=='treefind':
