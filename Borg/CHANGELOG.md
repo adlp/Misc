@@ -1,5 +1,10 @@
 # Changelog — borgHelper
 
+## UI 1.6.2 — même lien « borgHelperWWW » dans le pied de page — 2026-09-18
+
+`borgHelperWWW` dans le pied de page devient aussi un lien vers `/` (même principe que le titre en
+en-tête, 1.6.1). Vérifié en direct.
+
 ## UI 1.6.1 — le titre « borgHelperWWW » ramène à la page d'accueil — 2026-09-18
 
 `<h1>borgHelperWWW</h1>` dans l'en-tête devient un lien vers `/`. Vérifié en direct.
