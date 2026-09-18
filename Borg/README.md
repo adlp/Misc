@@ -874,10 +874,12 @@ Exception : `GET /version` n'exécute aucune commande — il renvoie les version
 en tête du fichier HTML), ainsi que les postures de sécurité `allow_destructive` et `allow_downloads`
 (voir [Configuration](#configuration)) — tout **chargé une fois au démarrage du processus**. Comme `/`,
 volontairement **non protégé** par `X-API-Key` (aucune donnée sensible) — affiché dans le pied de page
-de l'interface web (versions), et via deux badges dans l'en-tête (visibles même avant connexion) :
-**🔒 Destructions désactivées** quand `allow_destructive` est à `false` (le défaut) et
+de l'interface web (versions), et via trois badges dans l'en-tête (visibles même avant connexion) :
+**🔒 Destructions désactivées** quand `allow_destructive` est à `false` (le défaut) ;
 **🚫 Téléchargements désactivés** quand `allow_downloads` est à `false` (non défaut — signale un
-réglage explicitement restrictif).
+réglage explicitement restrictif) ; **⚠️ Tout autorisé** quand `allow_destructive` **et**
+`allow_downloads` sont tous les deux à `true` (aucune restriction — rappel qu'aucune protection n'est
+active sur cette instance).
 
 Quand une action est interdite côté serveur, le bouton correspondant **n'apparaît tout simplement
 pas** dans l'interface web (plutôt qu'un bouton visible qui échouerait en `403`) :

@@ -1,5 +1,12 @@
 # Changelog — borgHelper
 
+## UI 1.5.0 — badge « Tout autorisé » (rappel) — 2026-09-18
+
+Badge **⚠️ Tout autorisé** dans l'en-tête, visible quand `allow_destructive` **et** `allow_downloads`
+sont tous les deux à `true` (aucune restriction active sur l'instance) — couleur `err` (rouge), pour
+attirer l'attention sur cet état sans protection. Vérifié en direct avec `--allow-destructive`
+(`allow_downloads` restant à `true` par défaut).
+
 ## UI 1.4.1 — badge « Téléchargements désactivés » — 2026-09-18
 
 Badge **🚫 Téléchargements désactivés** dans l'en-tête (même emplacement/mécanisme que
