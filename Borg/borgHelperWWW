@@ -20,7 +20,7 @@ from borgHelper import Version as BORGHELPER_VERSION, BorgRunner, BorgHelper
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.2.0"
+WWW_VERSION="1.3.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -56,7 +56,12 @@ if not CFGFILE:
 if not os.path.isfile(CFGFILE):
     sys.exit(f"Fichier de conf introuvable : {CFGFILE}")
 if not API_KEY:
-    sys.exit("Clé API manquante — -K/--api-key ou BORGHELPERWWW_API_KEY (clé partagée pour authentifier les appels API)")
+    API_KEY=secrets.token_urlsafe(32)
+    print("─"*70,file=sys.stderr)
+    print("Aucune clé API fournie (-K/--api-key ou BORGHELPERWWW_API_KEY) — clé",file=sys.stderr)
+    print("générée aléatoirement pour cette exécution (perdue au redémarrage) :",file=sys.stderr)
+    print(f"  X-API-Key: {API_KEY}",file=sys.stderr)
+    print("─"*70,file=sys.stderr)
 if not BORGHELPER_BIN.is_file():
     sys.exit(f"borgHelper introuvable ({BORGHELPER_BIN}) — --borghelper-bin ou BORGHELPERWWW_BORGHELPER_BIN pour surcharger")
 

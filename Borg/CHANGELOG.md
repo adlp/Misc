@@ -1,5 +1,14 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.3.0 — clé API générée automatiquement si absente — 2026-09-18
+
+`borgHelperWWW` ne refuse plus de démarrer faute de clé API (`-K`/`--api-key`/`BORGHELPERWWW_API_KEY`) :
+il en génère une aléatoirement (`secrets.token_urlsafe(32)`) et l'affiche sur `stderr` au démarrage
+(encadrée, bien visible). Clé valable pour cette exécution uniquement — perdue au redémarrage, jamais
+persistée. Vérifié de bout en bout : démarrage sans clé → clé affichée → fonctionne pour l'auth → une
+clé erronée reste rejetée (401) ; démarrage avec `-K` explicite → comportement inchangé, aucune
+génération.
+
 ## borgHelper 1.0.94 + borgHelperWWW 1.2.0 + UI 1.2.0 — recherche récursive dans l'explorateur (TreeFind) — 2026-09-18
 
 Nouvelle commande **`TreeFind`** : recherche **récursive par nom** (pas le chemin complet) sous un

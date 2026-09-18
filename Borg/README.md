@@ -663,13 +663,17 @@ Deux façons de configurer, selon le mode de lancement :
 | Variable d'environnement | Option CLI (`python3 borgHelperWWW ...` uniquement) | Rôle |
 |---------------------------|-------------------------------------------------------|------|
 | `BORGHELPERWWW_CFGFILE` | `-C`, `--cfgfile` | **Requis.** `.borghelperrc` dédié à l'API (distinct de celui de l'admin CLI) |
-| `BORGHELPERWWW_API_KEY` | `-K`, `--api-key` | **Requis.** Clé partagée attendue dans le header `X-API-Key` |
+| `BORGHELPERWWW_API_KEY` | `-K`, `--api-key` | Clé partagée attendue dans le header `X-API-Key` — absente : **générée aléatoirement** au démarrage (voir ci-dessous) |
 | `BORGHELPERWWW_BORGHELPER_BIN` | `--borghelper-bin` | Chemin du script `borgHelper` (défaut : à côté de `borgHelperWWW`) |
 | `BORGHELPERWWW_TIMEOUT` | `--timeout` | Timeout en secondes par commande (défaut 3600 ; 0 = illimité) |
 | `BORGHELPERWWW_HOST` | `--host` | Bind — adresse (défaut `127.0.0.1`) |
 | `BORGHELPERWWW_PORT` | `--port` | Bind — port (défaut `8000`) |
 
-Le serveur refuse de démarrer si le fichier de conf ou la clé API sont absents (ni option ni variable).
+Le serveur refuse de démarrer si le fichier de conf est absent (ni option ni variable). La clé API,
+elle, n'est **pas requise** : si absente (ni `-K`/`--api-key` ni `BORGHELPERWWW_API_KEY`),
+`borgHelperWWW` en génère une aléatoirement (`secrets.token_urlsafe(32)`) et l'affiche sur **stderr** au
+démarrage — pratique en dev/démo, mais cette clé est **perdue au redémarrage** (pas persistée) : pour
+une clé stable, la fournir explicitement.
 
 - **`uvicorn borgHelperWWW:app`** : uvicorn importe le module et possède seul `sys.argv` — seules les
   variables d'environnement sont lues, pas d'options CLI possibles ici.
