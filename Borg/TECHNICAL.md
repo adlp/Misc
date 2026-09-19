@@ -691,6 +691,14 @@ DSN lu dans l'ordre :
 2. Fichier pointé par `BORGHELPERC_SENTRY_FILE`
 3. Fichier `/usr/local/etc/borghelper-sentry`
 
+`sentry_sdk.init()` est appelé avec `auto_enabling_integrations=False` : évite la découverte
+automatique d'intégrations tierces (boto3, frameworks web, etc.) qui coûte ~100-180ms à elle seule
+sur chaque invocation CLI, sans rapport avec cet outil. Les intégrations par défaut (`excepthook`,
+`logging`, `dedupe`, `atexit`, `modules`, `argv`, `stdlib`, `threading`) restent actives — la capture
+des exceptions non gérées n'est pas affectée. **Ne jamais ajouter `default_integrations=False`** à
+côté : ça désactive aussi `excepthook`, qui est l'unique mécanisme de capture ici (`borgHelper`
+n'appelle jamais `capture_exception()` explicitement).
+
 ---
 
 ## borgHelperWWW — résolution de la configuration (`BORGHELPERWWW_CONF`)

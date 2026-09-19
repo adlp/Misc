@@ -1,5 +1,31 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.98 — désactive la découverte automatique d'intégrations Sentry — 2026-09-19
+
+`sentry_sdk.init()` (`_cli_main()`) coûtait à lui seul ~100-180ms sur *chaque* invocation CLI
+(mesuré empiriquement, DSN réel de production), dominé par la découverte automatique d'une
+vingtaine d'intégrations tierces sans rapport avec cet outil (frameworks web, SDK cloud comme
+`boto3`). `borgHelperWWW` spawn un sous-processus borgHelper par requête HTTP — ce coût était donc
+payé à chaque appel API, y compris pour des commandes qui ne lisent que du SQLite local (`LstBkp`,
+`Search`, etc.).
+
+- `sentry_sdk.init(...,auto_enabling_integrations=False)` — option officielle du SDK. Élimine la
+  découverte automatique, garde toutes les intégrations par défaut actives (`excepthook`,
+  `logging`, `dedupe`, `atexit`, `modules`, `argv`, `stdlib`, `threading`) — capture des exceptions
+  non gérées inchangée, vérifiée directement (`'excepthook' in client.integrations` → `True` après
+  le changement).
+- **Écueil trouvé en revue** : une première version de ce correctif ajoutait aussi
+  `default_integrations=False`, qui désactive `excepthook` avec le reste — `borgHelper` n'appelle
+  jamais `capture_exception()` explicitement, donc plus aucune exception ne serait jamais remontée
+  à Sentry, silencieusement. Corrigé avant commit : seul `auto_enabling_integrations=False` est
+  utilisé.
+- Vérifié en conditions réelles contre `demo.borghelperrc` et le DSN de production
+  (`/usr/local/etc/borghelper-sentry`) : `LstBkp` (commande 100% SQLite) passe de 199-273ms à
+  88-93ms sur 3 mesures répétées, avant/après. `python3 -m py_compile borgHelper` propre.
+- Issu du spine `_bmad-output/planning-artifacts/architecture/architecture-Borg-2026-09-19/`
+  (AD-1) — voir `SOLUTION-DESIGN.md` pour le diagnostic complet.
+- `borgHelper` 1.0.97 → **1.0.98**.
+
 ## borgHelperWWW 1.15.0 — garde pré-appel Restore/téléchargements hors périmètre (Epic 2, Story 2.1) — 2026-09-19
 
 Dernière story de l'initiative RBAC arborescence : `Restore`, `Restore -L`/`listperms`,
