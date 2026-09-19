@@ -1267,3 +1267,87 @@ d'accès personnel de l'utilisateur (`userMax` = rang maximal sur tous ses nicks
 la totalité d'entre eux) avec les réglages globaux `allowDestructive`/`allowDownloads` déjà connus via
 `/version` — voir [README.md, section Autorisation par
 groupes](README.md#autorisation-par-groupes-reverse-proxy-oidcauth_request).
+
+### Garde pré-appel Restore/téléchargements (Story 2.1)
+
+Épic 2 (dernière story) : `Restore`, `Restore -L`/`listperms`, `/download/file`, `/download/tar`
+n'avaient aucune conscience du périmètre de chemin (`GROUPS_PATHS`) — contrairement aux commandes de
+liste d'Epic 1, elles écrivent sur le disque du serveur ou streament des octets directement
+(`/download/*` appelle `borg` en sous-processus, en contournant `borgHelper`), donc un filtrage
+a posteriori serait déjà trop tard : au moment où un filtre pourrait s'appliquer, l'extraction a déjà
+eu lieu. AD-2 impose un second mécanisme d'application, distinct du filtrage a posteriori d'Epic 1 :
+une validation AVANT tout appel.
+
+**`require_path_in_scope(request, nick, path) -> bool`** — nouvelle fonction, placée avec les autres
+fonctions de résolution de périmètre d'Epic 1 (juste après `_any_scoped`). Réutilise
+`_resolve_scopes_for_request`/`_path_in_scope` telles quelles (jamais réévaluées/réimplémentées) :
+`scope=_resolve_scopes_for_request(request,[nick]).get(nick)` puis `_path_in_scope(path,scope)`.
+Retourne un **booléen**, jamais une exception — écart délibéré par rapport au pattern
+`require_destructive_allowed()`/`require_downloads_allowed()` évoqué par
+`ARCHITECTURE-SPINE.md` (qui lèvent toujours la même `HTTPException(403)`) : l'investigation du spec
+2.1 (tests en direct contre `demo.borghelperrc`, voir Intent du spec) a montré que les **quatre**
+routes doivent répondre avec des **formes différentes** sur le cas hors périmètre pour respecter
+FR9/le Prevents d'AD-2 (jamais confirmer l'existence d'un chemin hors périmètre) — un `403` uniforme
+permettrait de distinguer « hors périmètre » (403) de « n'existe pas » (200/400, formes ci-dessous)
+par le seul code de statut. Chaque endpoint construit donc lui-même sa réponse synthétique sur un
+résultat `False`, immédiatement après `require_api_key()`/`require_downloads_allowed()`
+(pré-existants, inchangés), avant tout autre traitement.
+
+**Réponses synthétiques** (`_synth_restore_out_of_scope`, `_synth_restore_perms_out_of_scope`,
+`_synth_download_file_out_of_scope`, `_synth_download_tar_out_of_scope`, juste après `_stream_proc`) —
+chacune imite EXACTEMENT la forme que sa route produit aujourd'hui pour un chemin qui n'existe dans
+aucune archive :
+
+| Route | `bid` fourni | Forme synthétique |
+|---|---|---|
+| `POST /restore` | non | `400`, `CommandResult(exitcode=1, stdout="Archive sélectionnée (dernière) : <dernière archive>\n", stderr="Warning: \"--numeric-owner\" has been deprecated. Use --numeric-ids instead.\nInclude pattern '<ftor>' never matched.\n")` |
+| `POST /restore` | oui | `400`, `CommandResult(exitcode=1, stdout="", stderr="Warning: ...\nInclude pattern '<ftor>' never matched.\n")` |
+| `GET /restore/perms` | non | `200`, `CommandResult(exitcode=0, stdout="Archive (dernière) : <dernière archive>\n", stderr="")` |
+| `GET /restore/perms` | oui | `200`, `CommandResult(exitcode=0, stdout="", stderr="")` |
+| `GET /download/file` | — | `200`, corps vide (générateur qui ne produit aucun chunk), `Content-Disposition` dérivé de `path` (`_safe_filename`, inchangée) |
+| `GET /download/tar` | — | `200`, tar minimal vide (`_empty_tar_bytes()`), `Content-Disposition` dérivé de `prefix`/`nick` (même logique que la route réelle) |
+
+`_oos_last_archive_line(nick, bid, passphrase, label)` factorise la ligne d'archive commune à
+`restore`/`restore/perms` : n'imprime **rien** si `bid` est fourni (miroir exact de
+`borgHelper.restore()`/`listperms()`, qui n'impriment cette ligne QUE quand `bid is None`) ; sinon
+réutilise `_borg_cfg`/`_borg_env`/`_latest_archive` (helpers déjà utilisés par
+`download_file`/`download_tar`, définis juste au-dessus) pour déterminer la dernière archive. Ceci
+déclenche un vrai `borg list --short` en sous-processus — **ce n'est pas l'appel que le Boundaries
+« jamais d'appel borg/borgHelper » du spec 2.1 interdit** : il ne porte que sur les noms d'archive du
+nick (métadonnée déjà accessible à tout appelant qui détient un tier lecture sur ce nick, via
+`/lstbkp`), jamais sur le chemin hors périmètre demandé, qui seul est protégé par cette story.
+`/download/file`/`/download/tar` n'ont, eux, besoin d'aucun appel borg du tout pour leur réponse
+synthétique (le nom de fichier ne dépend que de `path`/`prefix`/`nick`, jamais de l'archive) — « no
+call » au sens strict pour ces deux routes.
+
+`_empty_tar_bytes()` construit le tar minimal vide via `tarfile.open(fileobj=io.BytesIO(),
+mode='w|')` puis `.close()`, mis en cache (`_EMPTY_TAR_CACHE`, module-level) après le premier appel —
+plutôt qu'un blob d'octets codé en dur, pour rester correct si `RECORDSIZE` change un jour côté
+bibliothèque standard. Vérifié byte-pour-byte identique (diff direct, voir Verification ci-dessous) à
+ce que produit un `borg export-tar` réel sans le moindre membre.
+
+⚠️ **Deux écarts trouvés entre le texte gelé de l'Intent du spec 2.1 (capturé lors de la rédaction du
+spec) et le comportement réellement observé en re-vérification live (exigée par les Design Notes du
+même spec avant implémentation)** — l'implémentation suit le comportement réellement observé,
+consigné dans le Spec Change Log du spec 2.1 :
+1. `GET /restore/perms`, cas introuvable sans `bid` : la ligne d'archive est
+   `"Archive (dernière) : <dernière archive>"` (l'archive résolue côté serveur, pas le paramètre de
+   requête `bid` — absent dans ce cas), jamais `"Archive : <dernière archive>"` — cette dernière forme (sans
+   « (dernière) ») ne peut au contraire apparaître QUE lorsque `_find_last_archive_with_file` a
+   trouvé le chemin dans l'index (`archive_snapshot_v`/`diff_index`), ce qui par définition n'est
+   jamais le cas « introuvable » que cette story doit imiter.
+2. `GET /download/tar`, tar minimal vide : **10240 octets**, tous nuls (`RECORDSIZE` — `tarfile`
+   bufferise toujours un enregistrement complet en mode stream, même sans membre), jamais 1024
+   octets (deux blocs de 512 zéros) comme le texte gelé le décrivait.
+
+**Connu, non corrigé** : `POST /restore`, sur ce dépôt et cette version de `borg` (1.2.6 au moment de
+l'implémentation), ajoute systématiquement une ligne `Warning: "--numeric-owner" has been
+deprecated...` en tête du `stderr` de tout `borg extract` réel — présente que le chemin soit trouvé
+ou non, dans ou hors périmètre (`_borg_extract_args` passe `--numeric-owner` inconditionnellement).
+Reproduite ici littéralement (constante `_RESTORE_NUMERIC_OWNER_WARNING`) pour préserver
+l'indiscernabilité byte-pour-byte vérifiée en direct, mais ce texte est **couplé à la version de
+borg installée** — à re-vérifier si `borg` ou `_borg_extract_args` changent (silencieusement désynchronisé
+sinon, dans le sens le moins risqué : le faux deviendrait plus verbeux que le vrai, jamais l'inverse
+tant que le vrai continue d'émettre cet avertissement). Un futur nettoyage naturel serait de retirer
+`--numeric-owner` de `_borg_extract_args` (déprécié par `borg` lui-même) — hors périmètre de cette
+story, non traité ici.

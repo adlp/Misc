@@ -778,6 +778,12 @@ Deux réglages de sécurité au démarrage, affichés sur **stderr** au lancemen
 Les deux réglages sont indépendants l'un de l'autre et des permissions habituelles (`X-API-Key`,
 `X-Borg-Passphrase`) — ils s'y ajoutent, ils ne les remplacent pas.
 
+**`POST /restore` n'a, à ce jour, aucun réglage d'activation/désactivation comparable** à
+`BORGHELPERWWW_ALLOW_DESTRUCTIVE` ou `BORGHELPERWWW_ALLOW_DOWNLOADS` : ni l'un ni l'autre des deux
+réglages ci-dessus ne le couvre (voir les deux bullets ci-dessus), et il n'existe aucun troisième
+réglage dédié. Seuls `X-API-Key`, et — depuis la Story 2.1 — le périmètre de chemin par groupes
+(`require_path_in_scope`, voir « Autorisation par groupes » ci-dessous) le protègent.
+
 #### Autorisation par groupes (reverse proxy OIDC/auth_request)
 
 Cas d'usage : un reverse proxy (nginx `auth_request`, oauth2-proxy…) authentifie l'utilisateur par
@@ -873,8 +879,36 @@ approximées. Une paire d'archives (`DiffTop`) sans la moindre ligne dans le pé
 résultat vide (`rows: []`), jamais une erreur. Un appelant sans restriction ne voit, comme pour les
 six autres commandes, **aucun** changement de format.
 
-`Restore`/`/download/file`/`/download/tar` (garde pré-appel, pas un filtrage a posteriori) sont
-couverts par un epic séparé, construit sur cette même résolution de périmètre.
+**`Restore`/`Restore -L`/`/download/file`/`/download/tar` (Epic 2, Story 2.1) : garde PRÉ-appel,
+jamais un filtrage a posteriori.** Ces quatre routes écrivent sur le disque du serveur
+(`POST /restore`) ou streament des octets directement (`/download/*`, qui appellent `borg`
+directement, en contournant `borgHelper`) — un filtre après coup serait déjà trop tard, l'action
+ayant eu lieu avant qu'un filtre ne puisse s'appliquer. `require_path_in_scope(request, nick, path)`
+réutilise telle quelle la même résolution de périmètre (`_resolve_path_scope`/`_path_in_scope`) que
+les commandes ci-dessus, mais tranche AVANT tout appel `borg`/`borgHelper` : chemin hors périmètre
+⇒ aucun appel n'est fait, jamais.
+
+Sur un chemin hors périmètre, chaque route répond avec une forme SYNTHÉTIQUE qui imite exactement
+sa propre réponse « chemin introuvable » (vérifiée en direct contre `demo.borghelperrc`) —
+**jamais un `403` distinct** : un `403` permettrait à l'appelant de distinguer « hors périmètre »
+de « n'existe pas » par le seul code de statut, ce qui confirmerait indirectement qu'un chemin
+existe quelque part dans l'archive même si l'appelant n'a pas le droit de le voir (voir
+[Codes retour](#codes-retour)).
+
+| Route | Hors périmètre | Forme imitée (chemin réellement introuvable) |
+|---|---|---|
+| `POST /restore` | `400`, `{"exitcode":1,"stdout":"","stderr":"Include pattern '<ftor>' never matched.\n"}` (`stdout` porte `"Archive sélectionnée (dernière) : <dernière archive>\n"` si `bid` est omis) | identique |
+| `GET /restore/perms` | `200`, `{"exitcode":0,"stdout":"","stderr":""}` (`stdout` porte `"Archive (dernière) : <dernière archive>\n"` si `bid` est omis) | identique |
+| `GET /download/file` | `200`, corps **vide** (0 octet), `Content-Disposition` présent (nom de fichier dérivé de `path`, inchangé) | identique |
+| `GET /download/tar` | `200`, tar minimal valide **vide** (`Content-Disposition` présent, nom dérivé de `prefix`/`nick`) | identique |
+
+`GET /download/tar` sans `prefix` (export de l'archive entière) est **toujours** traité comme hors
+périmètre pour un appelant restreint, quel que soit le contenu réel de l'archive — un export non
+borné ne peut être « dans le périmètre » d'aucun appelant restreint (`prefix` omis ⇒ chemin racine,
+`''`, comparé au périmètre comme n'importe quel autre chemin). Un appelant **sans aucune
+restriction** (admin, groupe absent de `GROUPS_PATHS`, ou autorisation par groupes désactivée) ne
+voit **aucun** changement — export complet toujours disponible, exactement comme avant cette story.
+
 `Bkp/Index/Prune/DelBkp/Init/Key/IdxPurge/Stats` n'ont pas de notion de sous-chemin et ne sont jamais
 concernés.
 
@@ -1240,6 +1274,13 @@ classique (404 nick/archive inconnu, 502 `borg list` en échec, 504 timeout, **4
 `BORGHELPERWWW_ALLOW_DOWNLOADS` est désactivé — autorisé par défaut, voir
 [Configuration](#configuration)).
 
+Depuis la Story 2.1 : un `path`/`prefix` hors du périmètre de l'appelant (`GROUPS_PATHS`, voir
+[Autorisation par groupes](#autorisation-par-groupes-reverse-proxy-oidcauth_request)) répond `200`
+avec un corps vide (`/download/file`) ou un tar minimal vide (`/download/tar`), jamais un `403` —
+voir le tableau de la section « Autorisation par groupes » ci-dessus pour la forme exacte et le
+raisonnement (indiscernabilité d'un chemin qui n'existe simplement pas dans l'archive). Aucun appel
+`borg` n'est fait dans ce cas pour le fichier/l'arborescence demandé.
+
 ### Limites connues
 
 - Exécution synchrone : `Bkp`/`Prune`/`Index` sur un gros dépôt occupent un worker HTTP pendant toute
@@ -1258,6 +1299,12 @@ classique (404 nick/archive inconnu, 502 `borg list` en échec, 504 timeout, **4
 - **`DuIdx`/`IdxTop`/`DiffTop` filtrés par périmètre depuis la Story 1.4** : voir « Autorisation par
   groupes » ci-dessus pour le mécanisme (mode brut par-chemin + recalcul côté `borgHelperWWW`,
   traitement mono-nick, omission des figures Exclus/Inchangés non scopables pour un appelant scopé).
+- **`POST /restore`/`GET /restore/perms` hors périmètre sans `bid` déclenchent encore un `borg list
+  --short` par requête** (Story 2.1, `_oos_last_archive_line`/`_latest_archive`, pour construire la
+  ligne d'archive de la réponse synthétique) : moins coûteux qu'avant cette story (qui exécutait
+  l'extraction/le listing complet quel que soit le périmètre), mais un appel répété reste un vrai
+  sous-processus `borg` par requête, pas gratuit — un appelant hors périmètre qui martèle ces deux
+  routes sans `bid` continue de générer de la charge côté dépôt borg.
 
 ---
 

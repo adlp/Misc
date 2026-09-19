@@ -6,7 +6,7 @@
 #* See <http://www.gnu.org/licenses/>
 #*/
 
-import os,re,sys,json,sqlite3,secrets,subprocess,configparser
+import os,re,sys,io,json,sqlite3,secrets,subprocess,configparser,tarfile
 from pathlib import Path
 from typing import Optional
 from collections import defaultdict
@@ -21,7 +21,7 @@ from borgHelper import Version as BORGHELPER_VERSION, BorgRunner, BorgHelper
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.14.0"
+WWW_VERSION="1.15.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -369,6 +369,31 @@ def _any_scoped(scopes):
     -> force JSON + filtrage a posteriori (Boundaries du spec 1.3 : une requête multi-nick ne peut
     pas mélanger texte et JSON dans un seul corps HTTP, donc UN nick scopé force tout le corps)."""
     return any(s is not None for s in scopes.values())
+
+def require_path_in_scope(request: Request, nick: str, path: Optional[str]) -> bool:
+    """Story 2.1, AD-2 : garde PRÉ-appel pour Restore/Restore -L/téléchargements — jamais un
+    filtrage a posteriori comme les routes de liste (Epic 1). `borg extract`/`export-tar` écrivent
+    sur le disque du serveur ou streament des octets directement : un filtre APRÈS l'appel serait
+    déjà une fuite, le temps qu'il s'applique l'action est faite. Retourne True si l'appel peut
+    procéder (périmètre illimité, autorisation par groupes désactivée, ou `path` dans le périmètre
+    résolu de l'appelant sur `nick`), False si l'appelant doit recevoir la réponse SYNTHÉTIQUE
+    "introuvable" propre à sa route (jamais un 403 distinct/uniforme — voir les `_synth_*`
+    ci-dessous : un 403 permettrait de distinguer "hors périmètre" de "n'existe pas" par le seul
+    code de statut, cassant FR9/le Prevents d'AD-2). C'est un raffinement délibéré du pattern
+    `require_destructive_allowed()`/`require_downloads_allowed()` évoqué par ARCHITECTURE-SPINE.md
+    (planification) : ces deux-là lèvent toujours la même `HTTPException(403)` ; l'investigation du
+    spec 2.1 (voir son Intent, quatre formes de réponse capturées en direct) a montré que les QUATRE
+    routes ont besoin d'une forme différente — donc un booléen ici, jamais une exception uniforme ;
+    chaque endpoint construit sa propre réponse synthétique sur un résultat `False`.
+
+    Ne réévalue ni ne réimplémente la résolution de périmètre elle-même
+    (`_resolve_scopes_for_request`/`_path_in_scope`, Epic 1, réutilisées telles quelles) — appelée
+    après `_check_group_access` (dépendance de routeur, déjà passée pour atteindre le corps de
+    l'endpoint), donc un scope résolu à `None` ici signifie toujours "illimité", jamais "aucun
+    tier" (précondition documentée par `_resolve_path_scope`, déjà appliquée par tout appelant
+    Epic 1 existant)."""
+    scope=_resolve_scopes_for_request(request,[nick]).get(nick)
+    return _path_in_scope(path,scope)
 
 def _default_section_groups():
     """[DEFAULT] brut du .borghelperrc — utilisé par Login quand le nick visé n'existe pas encore
@@ -1012,11 +1037,104 @@ def _stream_proc(proc):
         except Exception: pass
         proc.wait()
 
+# ── Story 2.1 : réponses synthétiques "introuvable" (hors périmètre) ───────────────────────────
+# Chacune des quatre fonctions ci-dessous imite, EXACTEMENT, la forme que sa route produit
+# aujourd'hui pour un chemin qui n'existe dans aucune archive (voir Intent du spec 2.1) — jamais un
+# 403 (voir require_path_in_scope ci-dessus). Texte/formes re-vérifiés EN DIRECT contre
+# demo.borghelperrc avant implémentation (Design Notes du spec 2.1 : le texte gelé de l'Intent
+# pouvait être obsolète) — deux écarts trouvés et corrigés par rapport au texte gelé, consignés dans
+# le Spec Change Log du spec 2.1 :
+#   1. `GET /restore/perms` : la ligne d'archive absente d'index est "Archive (dernière) : <bid>",
+#      jamais "Archive : <bid>" (qui ne peut au contraire apparaître QUE quand le chemin a été
+#      trouvé dans l'index — donc jamais dans le cas "introuvable" que cette story doit imiter).
+#   2. `GET /download/tar` : le tar minimal vide fait 10240 octets (RECORDSIZE, `tarfile` bufferise
+#      toujours un enregistrement complet en mode stream, même vide), jamais 1024 (deux blocs de
+#      512 zéros) — vérifié byte-pour-byte identique à un `borg export-tar` réel sans le moindre
+#      membre.
+# Connu, non corrigé : `POST /restore` sur ce dépôt/cette version de borg ajoute une ligne
+# "Warning: \"--numeric-owner\" has been deprecated..." AVANT "Include pattern... never matched." —
+# présente sur TOUT appel réel de `borg extract` (montré, pas seulement le cas introuvable),
+# reproduite ici à l'identique pour l'indiscernabilité mais couplée à la version de borg installée ;
+# à re-vérifier si `borg`/le flag `--numeric-owner` de `_borg_extract_args` changent (voir
+# CHANGELOG.md, Story 2.1). Même risque, même absence de source de vérité partagée, pour les libellés
+# de ligne d'archive codés en dur ci-dessous ("Archive sélectionnée (dernière)", "Archive (dernière)")
+# : ils recopient à l'identique ce qu'impriment aujourd'hui `borgHelper.restore()`/`listperms()` — si
+# ces prints changent de formulation côté `borgHelper` sans qu'on pense à répercuter le changement
+# ici, la synthèse dérive silencieusement du comportement réel qu'elle est censée imiter.
+_RESTORE_NUMERIC_OWNER_WARNING='Warning: "--numeric-owner" has been deprecated. Use --numeric-ids instead.\n'
+
+def _oos_last_archive_line(nick,bid,passphrase,label):
+    """Construit la ligne d'archive (`"<label> : <bid>\\n"`) que `borgHelper` imprimerait pour un
+    chemin introuvable — UNIQUEMENT quand `bid` est omis (borgHelper.restore()/listperms() n'impriment
+    cette ligne QUE dans ce cas ; `bid` explicite -> aucune ligne du tout, chaîne vide ici aussi).
+    Réutilise `_borg_cfg`/`_borg_env`/`_latest_archive` (déjà utilisés par download_file/download_tar
+    ci-dessous) pour déterminer la dernière archive exactement comme `self.borg.getlastbkp()` le
+    ferait côté borgHelper. Ceci appelle bien `borg list --short` en sous-processus — mais ce n'est
+    PAS l'appel que le Boundaries "jamais d'appel borg/borgHelper" du spec 2.1 interdit : celui-ci ne
+    porte que sur les NOMS D'ARCHIVE du nick (métadonnée déjà accessible à tout appelant qui détient
+    ne serait-ce qu'un tier lecture sur ce nick, ex. via /lstbkp — jamais sur le CHEMIN hors périmètre
+    demandé, qui seul est protégé ici).
+
+    `_latest_archive()` peut lever `HTTPException` (404 : nick sans aucune archive ; 502/504 : `borg
+    list` a échoué/timeout) — dans ce cas la ligne d'archive est simplement omise (chaîne vide) plutôt
+    que de laisser l'exception se propager : la synthèse "introuvable" doit rester construite quel que
+    soit l'état du dépôt, jamais un 404/502/504 qui serait une troisième forme de réponse distincte
+    des deux promises par cette story (voir Review Triage Log du spec 2.1)."""
+    if not bid:
+        cfg=_borg_cfg(nick,passphrase)
+        env=_borg_env(cfg)
+        try:
+            archive=_latest_archive(cfg,env)
+        except HTTPException:
+            return ''
+        return f"{label} : {archive}\n"
+    return ''
+
+def _synth_restore_out_of_scope(nick,ftor,bid,passphrase):
+    stdout=_oos_last_archive_line(nick,bid,passphrase,"Archive sélectionnée (dernière)")
+    stderr=_RESTORE_NUMERIC_OWNER_WARNING+f"Include pattern '{ftor}' never matched.\n"
+    return JSONResponse(status_code=400,content=CommandResult(exitcode=1,stdout=stdout,stderr=stderr).dict())
+
+def _synth_restore_perms_out_of_scope(nick,ftor,bid,passphrase):
+    stdout=_oos_last_archive_line(nick,bid,passphrase,"Archive (dernière)")
+    return JSONResponse(status_code=200,content=CommandResult(exitcode=0,stdout=stdout,stderr='').dict())
+
+_EMPTY_TAR_CACHE=None
+
+def _empty_tar_bytes():
+    """Tar minimal valide vide — vérifié byte-pour-byte identique (live, demo.borghelperrc) à ce que
+    produit `borg export-tar` pour un export sans le moindre membre. Recalculé une fois via
+    `tarfile` plutôt que codé en dur en octets, pour rester correct si RECORDSIZE change un jour
+    côté bibliothèque standard."""
+    global _EMPTY_TAR_CACHE
+    if _EMPTY_TAR_CACHE is None:
+        buf=io.BytesIO()
+        tf=tarfile.open(fileobj=buf,mode='w|')
+        tf.close()
+        _EMPTY_TAR_CACHE=buf.getvalue()
+    return _EMPTY_TAR_CACHE
+
+def _synth_download_file_out_of_scope(path):
+    return StreamingResponse(iter(()),media_type='application/octet-stream',
+        headers={'Content-Disposition':f'attachment; filename="{_safe_filename(path)}"'})
+
+def _download_tar_filename(nick,prefix):
+    """Nom de fichier `.tar` — partagé entre `download_tar()` (corps réel) et
+    `_synth_download_tar_out_of_scope` (synthèse hors périmètre) pour que les deux restent
+    identiques par construction (voir AGENTS.md : pitfall `_fmt_stats`, même risque ici)."""
+    return (_safe_filename(prefix) if prefix else nick)+'.tar'
+
+def _synth_download_tar_out_of_scope(nick,prefix):
+    return StreamingResponse(iter((_empty_tar_bytes(),)),media_type='application/x-tar',
+        headers={'Content-Disposition':f'attachment; filename="{_download_tar_filename(nick,prefix)}"'})
+
 @router.get("/download/file",tags=["téléchargement"],summary="Télécharge un fichier depuis une archive (borg extract --stdout)")
-def download_file(nick: str, path: str, bid: Optional[str]=None,
+def download_file(nick: str, path: str, request: Request, bid: Optional[str]=None,
                    x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     require_downloads_allowed()
+    if not require_path_in_scope(request,nick,path):
+        return _synth_download_file_out_of_scope(path)
     cfg=_borg_cfg(nick,x_borg_passphrase)
     env=_borg_env(cfg)
     archive=bid or _latest_archive(cfg,env)
@@ -1027,10 +1145,16 @@ def download_file(nick: str, path: str, bid: Optional[str]=None,
         headers={'Content-Disposition':f'attachment; filename="{_safe_filename(path)}"'})
 
 @router.get("/download/tar",tags=["téléchargement"],summary="Télécharge un .tar d'une arborescence depuis une archive (borg export-tar)")
-def download_tar(nick: str, prefix: Optional[str]=None, bid: Optional[str]=None,
+def download_tar(nick: str, request: Request, prefix: Optional[str]=None, bid: Optional[str]=None,
                   x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     require_downloads_allowed()
+    # Préfixe absent = export de l'archive ENTIÈRE (racine) : jamais "dans le périmètre" pour un
+    # appelant restreint quel qu'il soit (I/O Matrix du spec 2.1) — require_path_in_scope(...,'')
+    # via `prefix` (None accepté tel quel, _path_in_scope normalise) tranche déjà correctement ce
+    # cas : illimité -> True (accès identique à aujourd'hui), restreint -> toujours False.
+    if not require_path_in_scope(request,nick,prefix):
+        return _synth_download_tar_out_of_scope(nick,prefix)
     cfg=_borg_cfg(nick,x_borg_passphrase)
     env=_borg_env(cfg)
     archive=bid or _latest_archive(cfg,env)
@@ -1038,9 +1162,8 @@ def download_tar(nick: str, prefix: Optional[str]=None, bid: Optional[str]=None,
     cmd=[borg_exe,'export-tar',f"{cfg['BORG_REPO']}::{archive}",'-']
     if prefix: cmd.append(prefix)
     proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env)
-    filename=(_safe_filename(prefix) if prefix else nick)+'.tar'
     return StreamingResponse(_stream_proc(proc),media_type='application/x-tar',
-        headers={'Content-Disposition':f'attachment; filename="{filename}"'})
+        headers={'Content-Disposition':f'attachment; filename="{_download_tar_filename(nick,prefix)}"'})
 
 # ── Interface web ────────────────────────────────────────────────────────────
 # Page unique (SPA) : saisie de la clé API, liste des serveurs (rapport hors-ligne),
@@ -1163,17 +1286,22 @@ def diffbkp(nick: str, request: Request, bid_old: Optional[str]=None, bid_new: O
     return run_borghelper('diffbkp',nick=nick,extra_args=extra,cacheable=True)
 
 @router.get("/restore/perms",response_model=CommandResult,tags=["lecture"],summary="Liste les droits d'un fichier sans restaurer (Restore -L)")
-def restore_perms(nick: str, ftor: str, bid: Optional[str]=None, x_api_key: Optional[str]=Header(default=None),
+def restore_perms(nick: str, ftor: str, request: Request, bid: Optional[str]=None,
+                   x_api_key: Optional[str]=Header(default=None),
                    x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
+    if not require_path_in_scope(request,nick,ftor):
+        return _synth_restore_perms_out_of_scope(nick,ftor,bid,x_borg_passphrase)
     extra=['-f',ftor,'-L']
     if bid: extra+=['-b',bid]
     return run_borghelper('restore',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
 
 @router.post("/restore",response_model=CommandResult,tags=["mutation"],summary="Restaure un fichier/une arborescence sur le disque du serveur borgHelperWWW")
-def restore(nick: str, ftor: str, where: str, bid: Optional[str]=None, flat: bool=False,
+def restore(nick: str, ftor: str, where: str, request: Request, bid: Optional[str]=None, flat: bool=False,
             x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
+    if not require_path_in_scope(request,nick,ftor):
+        return _synth_restore_out_of_scope(nick,ftor,bid,x_borg_passphrase)
     extra=['-f',ftor,'-W' if flat else '-w',where]
     if bid: extra+=['-b',bid]
     return run_borghelper('restore',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)

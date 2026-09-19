@@ -1,5 +1,88 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.15.0 — garde pré-appel Restore/téléchargements hors périmètre (Epic 2, Story 2.1) — 2026-09-19
+
+Dernière story de l'initiative RBAC arborescence : `Restore`, `Restore -L`/`listperms`,
+`/download/file`, `/download/tar` n'avaient aucune conscience du périmètre de chemin
+(`GROUPS_PATHS`, Epic 1) — un appelant scopé à un sous-arbre d'un nick pouvait restaurer/télécharger
+n'importe quel chemin du nick entier. Contrairement aux commandes de liste d'Epic 1 (filtrage a
+posteriori, sûr car rien n'est écrit avant le filtre), ces quatre routes écrivent sur le disque du
+serveur ou streament des octets directement (`/download/*` appelle `borg` en sous-processus, en
+contournant `borgHelper`) — un filtre après coup serait déjà trop tard.
+
+- Nouvelle fonction `require_path_in_scope(request, nick, path)` — validation AVANT tout appel
+  `borg`/`borgHelper`, réutilise `_resolve_scopes_for_request`/`_path_in_scope` (Epic 1) telles
+  quelles. Retourne un booléen (jamais une exception) : l'investigation en direct (voir Intent du
+  spec 2.1) a montré que les quatre routes doivent répondre avec des **formes différentes** sur le
+  cas hors périmètre pour ne jamais confirmer l'existence d'un chemin hors périmètre (FR9/AD-2) —
+  un `403` uniforme (pattern `require_destructive_allowed()`/`require_downloads_allowed()` suggéré
+  en planification) aurait permis de distinguer « hors périmètre » de « n'existe pas » par le seul
+  code de statut.
+- Chaque route synthétise donc sa propre réponse « introuvable » sur un chemin hors périmètre,
+  **jamais un 403** : `POST /restore` → `400` imitant `Include pattern '<ftor>' never matched.` ;
+  `GET /restore/perms` → `200` imitant l'en-tête d'archive sans ligne de permissions ; `GET
+  /download/file` → `200`, corps vide ; `GET /download/tar` → `200`, tar minimal vide — voir
+  README.md/TECHNICAL.md pour les formes exactes. Aucun appel `borg`/`borgHelper` portant sur le
+  chemin demandé n'est fait dans ces cas (`/download/*`) ; `/restore`/`/restore/perms` peuvent
+  encore appeler `borg list --short` pour nommer la dernière archive quand `bid` est omis — métadonnée
+  de nick, pas du chemin protégé, déjà accessible via `/lstbkp`.
+- `GET /download/tar` sans `prefix` (export de l'archive entière) est traité comme toujours hors
+  périmètre pour un appelant restreint — un export non borné ne peut être « dans le périmètre »
+  d'aucun appelant restreint.
+- Un appelant sans restriction (admin, groupe absent de `GROUPS_PATHS`, ou autorisation par groupes
+  désactivée) ne voit **aucun** changement de comportement sur ces quatre routes.
+
+**Deux écarts trouvés entre le texte gelé de l'Intent du spec 2.1 (capturé à la rédaction du spec) et
+le comportement re-vérifié en direct avant implémentation (exigé par les Design Notes du spec)** —
+l'implémentation suit le comportement observé, pas le texte gelé, écarts consignés dans le Spec
+Change Log du spec 2.1 : (1) `GET /restore/perms` sans `bid`, cas introuvable : la ligne d'archive
+est `"Archive (dernière) : <dernière archive>"`, jamais `"Archive : <dernière archive>"` (qui ne peut apparaître que si le
+chemin a été trouvé dans l'index — jamais le cas « introuvable ») ; (2) `GET /download/tar`, tar
+minimal vide : 10240 octets (`RECORDSIZE` de `tarfile`, toujours bufferisé en entier même vide),
+jamais 1024. Connu, non corrigé : `POST /restore` sur `borg` 1.2.6 ajoute une ligne `Warning:
+"--numeric-owner" has been deprecated...` à tout `stderr` réel de `borg extract` (trouvé ou non,
+dans ou hors périmètre) ; reproduite littéralement dans la réponse synthétique pour préserver
+l'indiscernabilité vérifiée en direct, mais couplée à la version de `borg` installée — à
+re-vérifier si `borg`/`_borg_extract_args` changent (voir TECHNICAL.md).
+
+Vérifié en conditions réelles contre une copie scratch de `demo.borghelperrc` (nick dédié, deux
+sauvegardes, `Index` exécuté, `GROUPS_ADMIN/WRITE/READ` + `GROUPS_PATHS` actifs) :
+`python3 -m py_compile borgHelper borgHelperWWW` propre ; pour chacune des quatre routes, diff
+byte-pour-byte (JSON field-for-field pour `/restore`/`/restore/perms`) entre (a) un appelant scopé
+sur un chemin hors périmètre et (b) le même appelant sur un chemin dans son périmètre mais
+réellement absent de l'archive — identiques dans les deux cas `bid` omis/fourni ; `GET /download/tar`
+sans `prefix` pour un appelant restreint → même tar vide ; restauration/téléchargement réels d'un
+fichier dans le périmètre → inchangés (contenu restauré/téléchargé correct) ; appelant admin
+(illimité) restaurant un chemin hors du périmètre d'un autre groupe → procède normalement, aucun
+changement ; `GROUPS_HEADER` désactivé → aucun changement. Scratch config et dépôts `/tmp` supprimés
+après vérification.
+
+`README.md`/`TECHNICAL.md` mis à jour (nouveau garde, formes synthétiques par route, les deux écarts
+trouvés en re-vérification, la limite connue de l'avertissement `--numeric-owner`). `borgHelperWWW`
+1.14.0 → **1.15.0** ; `borgHelper` inchangé par cette story.
+
+**Corrections de revue (même story, avant premier commit)** :
+- `_oos_last_archive_line` catch désormais l'`HTTPException` (404/502/504) que peut lever
+  `_latest_archive()` (nick sans aucune archive, `borg list` en échec/timeout) et omet simplement la
+  ligne d'archive plutôt que de la laisser se propager — sans ce correctif, un nick sans archive
+  cassait la garantie d'indiscernabilité de cette story (troisième forme de réponse, ni « introuvable »
+  ni « dans le périmètre »).
+- Nouveau helper `_download_tar_filename(nick, prefix)` — factorise l'expression du nom de fichier
+  `.tar`, partagée avant ce correctif (copiée-collée identique) entre `download_tar()` et
+  `_synth_download_tar_out_of_scope`, même risque de divergence silencieuse documenté pour `_fmt_stats`
+  dans AGENTS.md.
+- `require_path_in_scope(request, nick, path)` : type de `path` corrigé en `Optional[str]` (`download_tar`
+  l'appelle avec `prefix: Optional[str]`, déjà accepté en pratique via la normalisation de
+  `_path_in_scope`, mais pas reflété par l'annotation).
+- Disclosure `--numeric-owner` élargie aux libellés de ligne d'archive codés en dur (`"Archive
+  sélectionnée (dernière)"`, `"Archive (dernière)"`) — même risque de dérive silencieuse si les
+  prints de `borgHelper.restore()`/`listperms()` changent de formulation.
+- Docs : ambiguïté `<bid>` (paramètre de requête vs archive résolue serveur) levée dans TECHNICAL.md/
+  CHANGELOG.md (`<dernière archive>`, déjà correct dans README.md) ; absence de tout réglage
+  d'activation pour `POST /restore` rendue explicite (README.md, section « Actions destructrices et
+  téléchargements ») ; note ajoutée à « Limites connues » sur le `borg list --short` toujours déclenché
+  par requête hors périmètre sans `bid`.
+
 ## borgHelper 1.0.97 + borgHelperWWW 1.14.0 — cache SQLite des réponses filtrées par périmètre (Epic 1, Story 1.5) — 2026-09-19
 
 Cinquième et dernière brique de la consultation scopée par arborescence (Epic 1) : depuis les
