@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.98"
+Version="1.0.99"
 DIFF_DB_SCHEMA_VERSION  = 4
 CACHE_DB_SCHEMA_VERSION = 1
 # Historique diff.db — chaque palier correspond à une migration idempotente et auto-détectée
@@ -90,6 +90,12 @@ def parse_borg_size(s):
             try: return int(float(s[:-len(unit)].strip())*mult)
             except (ValueError,TypeError): return None
     return None
+
+def _like_escape(s):
+    """Échappe %, _ et \\ pour un usage littéral dans un motif SQL LIKE (avec ESCAPE '\\') —
+    sans ça, un chemin réel contenant %/_  (ex. répertoire nommé 'a%b') élargit le motif de
+    préfixe et fait fuir des résultats d'un chemin voisin sans rapport."""
+    return s.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')
 
 def parse_diff_line(line):
     line=line.rstrip()
@@ -2421,7 +2427,32 @@ class BorgHelper:
             name=seg[0]; is_dir=len(seg)>1
             children[name]=children.get(name,False) or is_dir
             if not is_dir: type_by_name[name]=ftype; mode_by_name[name]=fmode; owner_by_name[name]=fowner
-        if not children and (not prefix or own_type is None):
+        # Enfants directs supprimés (diff_index) : jamais archive_snapshot_v/archive_snapshot, purgés
+        # indépendamment selon IDX_SNAP_KEEP — diff_index n'est purgé qu'au prune réel de l'archive
+        # (_cleanup_index_after_prune), donc une ligne survivante référence toujours une archive encore
+        # restaurable. Un nom déjà présent dans children n'est jamais reconsidéré ici : l'appartenance
+        # au snapshot courant prime toujours, même en cas d'historique suppression/réajout.
+        prefix_esc=_like_escape(prefix) if prefix else ''
+        scope_pat=(prefix_esc+'/%') if prefix else '%'
+        deep_excl=(prefix_esc+'/%/%') if prefix else '%/%'
+        del_rows=conn.execute("""
+            SELECT path,archive_old,size_before FROM (
+                SELECT path,change_type,archive_old,size_before,
+                       ROW_NUMBER() OVER (PARTITION BY path ORDER BY archive_new_date DESC,id DESC) AS rn
+                FROM diff_index WHERE nick=? AND path LIKE ? ESCAPE '\\' AND path NOT LIKE ? ESCAPE '\\'
+            ) WHERE rn=1 AND change_type='removed'
+        """,(n,scope_pat,deep_excl)).fetchall()
+        deleted_children={}   # name -> (archive_old,is_dir) — sélectionne, par chemin, l'événement
+                               # diff_index le PLUS RÉCENT (archive_new_date max) ; ne garde que ceux
+                               # dont ce dernier événement est 'removed' (jamais "supprimé un jour").
+                               # is_dir = heuristique size_before IS NULL : borg diff n'inclut pas de
+                               # taille pour une entrée répertoire (diff_index n'a pas de colonne de
+                               # type — voir parse_diff_line_json), donc size_before NULL == répertoire.
+        for path,archive_old,size_before in del_rows:
+            name=path[plen:] if prefix else path
+            if not name or name in children: continue
+            deleted_children[name]=(archive_old,size_before is None)
+        if not children and not deleted_children and (not prefix or own_type is None):
             msg=f"{prefix or '/'} vide ou introuvable dans le snapshot ({latest})"
             if as_json: return {'error':msg}
             print(f"{n}: {msg}"); return None
@@ -2459,11 +2490,26 @@ class BorgHelper:
             else:
                 for ct,arch,date in events:
                     t.add_row([name,genre,droits_disp,owner_disp,ct,arch,(date or '')[:19]])
+        def _add_deleted_row(name,genre,full_path,is_dir,archive_old):
+            # Entrée supprimée (diff_index) : pas d'historique 'events' comme pour une entrée présente
+            # — seule compte l'archive de dernière présence (archive_old de l'événement 'removed' le
+            # plus récent). Colonne 'type' marquée 'supprimé' pour rester visuellement distincte en
+            # mode texte. Le champ JSON 'deleted' n'est ajouté qu'ici, jamais aux entrées présentes
+            # (leur forme JSON reste strictement inchangée).
+            if as_json:
+                entries.append({'name':name,'full_path':full_path,'genre':genre,'mode':None,'owner':None,'is_dir':is_dir,
+                    'deleted':True,'last_seen_archive':archive_old,'events':[]})
+                return
+            t.add_row([name,genre,'—','—','supprimé',archive_old,'—'])
         _add_rows('.',_TREEHIST_GENRES.get(own_type,'répertoire'),own_mode,own_owner,prefix,True,recursive=True)
-        for name in sorted(children):
+        for name in sorted(set(children)|set(deleted_children)):
             full=f"{prefix}/{name}" if prefix else name
-            is_dir=children[name]
-            _add_rows(name,_genre(is_dir,type_by_name.get(name)),mode_by_name.get(name),owner_by_name.get(name),full,is_dir,recursive=is_dir)
+            if name in children:
+                is_dir=children[name]
+                _add_rows(name,_genre(is_dir,type_by_name.get(name)),mode_by_name.get(name),owner_by_name.get(name),full,is_dir,recursive=is_dir)
+            else:
+                archive_old,is_dir=deleted_children[name]
+                _add_deleted_row(name,'répertoire' if is_dir else 'fichier',full,is_dir,archive_old)
         if as_json:
             return {'path':prefix,'archive':latest,'entries':entries}
         print(f"{n}: {prefix or '/'} (snapshot {latest})")
@@ -2508,9 +2554,11 @@ class BorgHelper:
             msg=f"aucun snapshot indexé — lancez : borgHelper -c Index -n {n}"
             return {'error':msg} if as_json else None
         latest=row[0]
-        scope_sql=(prefix+'/%') if prefix else '%'
-        rows=conn.execute("SELECT path,type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=? AND path LIKE ?",
+        scope_sql=(_like_escape(prefix)+'/%') if prefix else '%'
+        rows=conn.execute("SELECT path,type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=? AND path LIKE ? ESCAPE '\\'",
                            (n,latest,scope_sql)).fetchall()
+        present_paths={r[0] for r in rows}   # tout chemin présent — jamais reconsidéré via diff_index,
+                                              # même hors du motif recherché (priorité au snapshot courant)
         matches=[]
         for path,ftype,mode,owner in rows:
             if prefix and path==prefix: continue  # le préfixe lui-même n'est pas un résultat
@@ -2521,6 +2569,28 @@ class BorgHelper:
             parent=path.rsplit('/',1)[0] if '/' in path else ''
             matches.append({'name':name,'full_path':path,'parent':parent,'is_dir':is_dir,
                              'genre':genre,'mode':mode,'owner':owner})
+        # Chemins supprimés (diff_index), récursivement sous le préfixe — jamais archive_snapshot_v
+        # (purgé selon IDX_SNAP_KEEP, pas fiable ici) : même détection "dernier événement = removed"
+        # que _treehist_listing, mais sans restriction à un seul niveau de profondeur.
+        del_rows=conn.execute("""
+            SELECT path,archive_old,archive_new,archive_new_date,size_before FROM (
+                SELECT path,change_type,archive_old,archive_new,archive_new_date,size_before,
+                       ROW_NUMBER() OVER (PARTITION BY path ORDER BY archive_new_date DESC,id DESC) AS rn
+                FROM diff_index WHERE nick=? AND path LIKE ? ESCAPE '\\'
+            ) WHERE rn=1 AND change_type='removed'
+        """,(n,scope_sql)).fetchall()
+        for path,archive_old,archive_new,archive_new_date,size_before in del_rows:
+            if prefix and path==prefix: continue
+            if path in present_paths: continue  # présent dans le dernier snapshot -> jamais listé deux fois
+            name=path.rsplit('/',1)[-1]
+            if not fnmatch.fnmatchcase(name,pat): continue
+            is_dir=size_before is None  # heuristique : diff_index n'a pas de colonne de type, borg diff
+                                         # n'inclut pas de taille pour une entrée répertoire
+            genre='répertoire' if is_dir else 'fichier'
+            parent=path.rsplit('/',1)[0] if '/' in path else ''
+            matches.append({'name':name,'full_path':path,'parent':parent,'is_dir':is_dir,
+                             'genre':genre,'mode':None,'owner':None,
+                             'deleted':True,'last_seen_archive':archive_old})
         matches.sort(key=lambda e:e['full_path'])
         if as_json:
             return {'archive':latest,'scope':prefix,'pattern':pattern or '','matches':matches}
@@ -2528,10 +2598,11 @@ class BorgHelper:
             print(f"{n}: aucun résultat pour '{pattern}' sous {prefix or '/'} (snapshot {latest})")
             return None
         from prettytable import PrettyTable
-        t=PrettyTable(['nom','genre','chemin','droits','propriétaire'])
+        t=PrettyTable(['nom','genre','chemin','droits','propriétaire','état'])
         t.align['nom']='l'; t.align['chemin']='l'
         for e in matches:
-            t.add_row([e['name'],e['genre'],e['full_path'],e['mode'] or '—',e['owner'] or '—'])
+            etat=f"supprimé ({e['last_seen_archive']})" if e.get('deleted') else ''
+            t.add_row([e['name'],e['genre'],e['full_path'],e['mode'] or '—',e['owner'] or '—',etat])
         print(f"{n}: {len(matches)} résultat(s) pour '{pattern}' sous {prefix or '/'} (snapshot {latest})")
         print(t)
         return None

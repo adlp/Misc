@@ -1,5 +1,47 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.99 / borgHelperWWW_ui 1.8.0 — fichiers/répertoires effacés visibles dans TreeHist/TreeFind — 2026-09-19
+
+`TreeHist`/`TreeFind` (l'explorateur d'arborescence de `borgHelperWWW_ui.html`) ne listaient que le
+contenu du DERNIER snapshot indexé (`archive_snapshot_v`) — un chemin supprimé depuis n'apparaissait
+plus jamais, même s'il restait réellement récupérable depuis une archive plus ancienne encore
+présente. Spec : `_bmad-output/implementation-artifacts/spec-fichiers-effaces-exploration.md`.
+
+- `_treehist_listing()`/`_treefind_listing()` : ajoutent désormais les chemins supprimés, sourcés
+  depuis `diff_index` — **jamais** `archive_snapshot_v`/`archive_snapshot`, purgés indépendamment
+  selon `IDX_SNAP_KEEP` (fenêtre glissante fixe, sans rapport avec l'existence réelle des archives),
+  alors qu'une ligne `diff_index` survivante référence toujours une archive encore restaurable
+  (`_cleanup_index_after_prune` ne la purge qu'au prune réel de l'archive). Détection : l'événement
+  `diff_index` le PLUS RÉCENT (`archive_new_date`/`id` max, via une fenêtre `ROW_NUMBER()`) d'un
+  chemin candidat est `change_type='removed'` — jamais "supprimé un jour" ; un chemin réajouté depuis
+  réapparaît normalement, sans marque. Un chemin déjà présent dans le dernier snapshot n'est jamais
+  reconsidéré via `diff_index` (priorité systématique au snapshot courant).
+- `TreeHist` : enfants DIRECTS uniquement (même granularité que l'existant), fusionnés avec les
+  enfants du snapshot. `TreeFind` : recherche récursive sous le préfixe, même sémantique de motif
+  que l'existant.
+- Entrée supprimée : `deleted:true`, `last_seen_archive` = `archive_old` de l'événement de
+  suppression (l'archive à restaurer). `is_dir` déduit par heuristique (`size_before IS NULL` sur la
+  ligne `diff_index` — `diff_index` n'a pas de colonne de type, et `borg diff` n'inclut pas de taille
+  pour une entrée répertoire, voir `parse_diff_line_json()`).
+- `TreeHist` sur un répertoire entièrement supprimé (absent du dernier snapshot) : ne renvoie plus
+  "vide ou introuvable" — ses anciens enfants directs (trouvés via `diff_index`) restent explorables.
+- Forme JSON des entrées présentes strictement inchangée (pas de champ `deleted` ajouté).
+- Mode texte CLI (PrettyTable) : entrées supprimées marquées distinctement (`TreeHist` : colonne
+  `type`="supprimé" ; `TreeFind` : nouvelle colonne `état`) — jamais une fonctionnalité JSON-only.
+- RBAC (Epic 1, `_filter_per_nick_listkey`/`_path_in_scope`) : aucune modification — les entrées
+  supprimées portent `full_path` comme les entrées présentes, le filtrage existant s'applique
+  automatiquement et identiquement.
+- `borgHelperWWW_ui.html` : marqueur visuel "supprimé" (`badge warn`) sur les lignes concernées
+  (navigation normale et résultats de recherche) ; `openDownloadDialog()` présélectionne
+  `last_seen_archive` dans le sélecteur d'archive pour une entrée supprimée au lieu de "dernière
+  archive" (qui échouerait, le fichier n'y est plus).
+- `borgHelperWWW` (routes `/treehist`/`/treefind`) : aucun changement — le filtrage RBAC et le cache
+  de réponses existants s'appliquent tels quels.
+- `python3 -m py_compile borgHelper borgHelperWWW` propre. Requête `ROW_NUMBER() OVER (...)`
+  vérifiée manuellement sur une base SQLite de test (isolée, supprimée après vérification).
+- `borgHelper` 1.0.98 → **1.0.99**. `borgHelperWWW_ui.html` 1.7.1 → **1.8.0** (`borgHelperWWW` et son
+  `WWW_VERSION` inchangés — aucune ligne de `borgHelperWWW` modifiée par cette story).
+
 ## borgHelper 1.0.98 — désactive la découverte automatique d'intégrations Sentry — 2026-09-19
 
 `sentry_sdk.init()` (`_cli_main()`) coûtait à lui seul ~100-180ms sur *chaque* invocation CLI

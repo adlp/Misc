@@ -108,6 +108,24 @@ Stocke chaque événement de fichier entre deux archives consécutives.
 - `change_type` : `added`, `removed`, `modified`, `C` (permissions/proprio), `B` (lien cassé), `T` (type changé)
 - `size_before` / `size_after` : `NULL` selon le type de changement
 
+**Source de vérité pour les chemins supprimés mais récupérables** (`TreeHist`/`TreeFind`, voir
+Design Notes ci-dessous) : jamais `archive_snapshot_v`/`archive_snapshot`, purgées indépendamment
+selon `IDX_SNAP_KEEP` (fenêtre glissante fixe, sans rapport avec l'existence réelle des archives),
+alors qu'une ligne `diff_index` survivante référence toujours une archive encore restaurable
+(`_cleanup_index_after_prune` ne la purge qu'au prune réel de l'archive référencée). Détection d'un
+chemin « supprimé » : son événement `diff_index` le PLUS RÉCENT (`archive_new_date`/`id` max) a
+`change_type='removed'` — un chemin réajouté depuis n'est jamais marqué. `size_before IS NULL` sur
+la ligne de suppression sert d'heuristique `is_dir` (`diff_index` n'a pas de colonne de type ; `borg
+diff` n'inclut pas de taille pour une entrée répertoire, voir `parse_diff_line_json()`) — limitation
+connue : `borg diff` n'inclut pas non plus de taille pour un lien symbolique, donc un lien symbolique
+supprimé est actuellement classé `répertoire`/`is_dir=true` par erreur (genre affiché `répertoire` au
+lieu du vrai type). `genre` d'une entrée supprimée est toujours `fichier`/`répertoire` selon cette
+heuristique, jamais le type réel détaillé (fifo/socket/périphérique) faute de colonne `type` dans
+`diff_index`. Coût : la requête `TreeFind` sur les chemins supprimés n'est bornée par aucun préfixe
+littéral à la racine (motif `%`) — elle balaie alors tout l'historique `diff_index` du nick ; acceptable
+tant que ce n'est pas mesuré comme un problème réel (feature récente, pas encore observée en pratique
+sur un historique volumineux).
+
 #### `diff_indexed_pairs`
 Sentinelle d'idempotence pour les diffs — une ligne par paire (archive_old, archive_new) indexée.  
 Empêche de ré-indexer une paire déjà traitée. Purge des lignes orphelines par `Prune`.
@@ -986,6 +1004,10 @@ commandes ont des formes différentes, voir Design Notes du spec 1.3 pour le dé
 | `_filter_str_list` | LstBkpFls | `{'files': [chemin,...]}` — mono-nick, liste de chaînes brutes, pas de dict par ligne |
 | `_filter_diffbkp` | DiffBkp | `{'entries':[{...,'path':...}], 'n_add','n_rem','n_mod'}` — mono-nick ; filtre `entries` sur `path` PUIS recalcule les trois compteurs depuis les entrées filtrées (même formule que `borgHelper.diffbkp()` : `n_add`=compte `change_type=='added'`, `n_rem`=compte `'removed'`, `n_mod`=reste) — jamais transmis depuis le compte non filtré (Boundaries du spec 1.3, FR8) |
 | `_filter_per_nick_listkey` | TreeHist (`list_key='entries'`), TreeFind (`list_key='matches'`) | `{nick: {..., list_key:[{...,'full_path':...}]}}` — filtre sur `full_path`, jamais `name` (simple nom de base) |
+
+Entrées supprimées (`"deleted":true`, source `diff_index` — voir `diff_index` ci-dessus) : aucune
+adaptation nécessaire dans `_filter_per_nick_listkey`/`_path_in_scope`, elles portent `full_path`
+exactement comme les entrées présentes et sont filtrées automatiquement et identiquement.
 
 ⚠️ **FileHist n'a pas de filtrage ligne par ligne** — piège pour un futur lecteur qui verrait
 `_filter_per_nick_list` et s'attendrait à la même forme pour FileHist : `FileHist` interroge UN

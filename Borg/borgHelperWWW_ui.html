@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.7.1 -->
+<!-- UI_VERSION: 1.8.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -904,13 +904,16 @@ async function loadBrowse(){
   const tbody=document.getElementById('browseBody');
   if(entries.length===0){ tbody.innerHTML='<tr><td colspan="5" class="hint">Répertoire vide</td></tr>'; return; }
   tbody.innerHTML=entries.map(e=>{
+    // Entrée supprimée (diff_index, plus dans le dernier snapshot) : toujours affichée — jamais
+    // "recoverable" ailleurs que via l'archive last_seen_archive — mais marquée distinctement.
     const lastEv=e.events && e.events.length ? e.events[e.events.length-1] : null;
-    const evText=lastEv ? `${lastEv.type} (${lastEv.archive})` : '—';
+    const evText=e.deleted ? `supprimé (dernière présence : ${escapeHtml(e.last_seen_archive||'?')})`
+      : (lastEv ? `${escapeHtml(lastEv.type)} (${escapeHtml(lastEv.archive)})` : '—');
     const icon=e.is_dir?'📁':'📄';
     return `<tr class="browse-row" style="cursor:pointer" data-full="${escapeAttr(e.full_path)}" data-isdir="${e.is_dir}">
-      <td>${icon} ${escapeHtml(e.name)}</td><td>${escapeHtml(e.genre)}</td>
+      <td>${icon} ${escapeHtml(e.name)} ${e.deleted?'<span class="badge warn">supprimé</span>':''}</td><td>${escapeHtml(e.genre)}</td>
       <td style="font-family:var(--mono)">${escapeHtml(e.mode||'—')}</td>
-      <td style="font-family:var(--mono)">${escapeHtml(e.owner||'—')}</td><td>${escapeHtml(evText)}</td>
+      <td style="font-family:var(--mono)">${escapeHtml(e.owner||'—')}</td><td>${evText}</td>
     </tr>`;
   }).join('');
 }
@@ -944,6 +947,10 @@ async function runBrowseSearch(){
   const data=parsed[browseNick];
   if(!data || data.error){ err.textContent=(data&&data.error)||'Aucune donnée'; results.innerHTML=''; return; }
   const matches=data.matches||[];
+  // Publiés dans la même map que loadBrowse : openDownloadDialog() lit browseEntriesByPath pour
+  // présélectionner last_seen_archive sur une entrée supprimée, peu importe si elle vient de la
+  // navigation normale ou d'une recherche.
+  matches.forEach(m=>{ browseEntriesByPath[m.full_path]=m; });
   if(matches.length===0){
     results.innerHTML=`<p class="hint">Aucun résultat pour « ${escapeHtml(pattern)} » sous ${escapeHtml(browsePath||'/')}.</p>`;
     return;
@@ -954,8 +961,9 @@ async function runBrowseSearch(){
       const icon=m.is_dir?'📁':'📄';
       const gotoTarget=m.is_dir?m.full_path:m.parent;
       const dlBtn=allowDownloads?`<button class="secondary sr-dl-btn" data-full="${escapeAttr(m.full_path)}" data-isdir="${m.is_dir}">⬇ Télécharger</button>`:'';
+      const delBadge=m.deleted?' <span class="badge warn">supprimé</span>':'';
       return `<tr>
-        <td>${icon} ${escapeHtml(m.name)}</td><td>${escapeHtml(m.genre)}</td>
+        <td>${icon} ${escapeHtml(m.name)}${delBadge}</td><td>${escapeHtml(m.genre)}</td>
         <td style="font-family:var(--mono)">${escapeHtml(m.full_path)}</td>
         <td style="font-family:var(--mono)">${escapeHtml(m.mode||'—')}</td>
         <td style="font-family:var(--mono)">${escapeHtml(m.owner||'—')}</td>
@@ -990,7 +998,11 @@ let dlPending=null; // {nick,path,isDir}
 
 async function openDownloadDialog(fullPath,isDir){
   dlPending={nick:browseNick,path:fullPath,isDir};
-  document.getElementById('dlModalTitle').textContent=(isDir?'Télécharger un .tar de ':'Télécharger ')+fullPath;
+  // Entrée supprimée : last_seen_archive est la SEULE archive garantie de contenir encore ce
+  // chemin — "dernière archive" (option vide par défaut) échouerait, le fichier n'y est plus.
+  const dlEntry=browseEntriesByPath[fullPath];
+  const dlLastSeenArchive=dlEntry&&dlEntry.deleted?dlEntry.last_seen_archive:null;
+  document.getElementById('dlModalTitle').textContent=(isDir?'Télécharger un .tar de ':'Télécharger ')+fullPath+(dlLastSeenArchive?' (supprimé)':'');
   document.getElementById('dlConfirmBtn').hidden=!allowDownloads;
   document.getElementById('dlModalError').textContent=allowDownloads?'':
     'Téléchargements désactivés sur ce serveur (BORGHELPERWWW_ALLOW_DOWNLOADS).';
@@ -1015,24 +1027,34 @@ async function openDownloadDialog(fullPath,isDir){
         opt.value=name; opt.textContent=date+' — '+name;
         sel.appendChild(opt);
       });
+      if(dlLastSeenArchive) sel.value=dlLastSeenArchive; // présélection : archive de dernière présence
     }
   }else{
     // Fichier : ne proposer que les archives où CE fichier a réellement bougé (added/modified —
     // removed exclu, le fichier n'existe plus dans cette archive-là). Même filtre, brut ou .tar.
     const entry=browseEntriesByPath[fullPath];
-    const events=(entry&&entry.events)||[];
-    const moved=events.filter(e=>e.type==='added'||e.type==='modified')
-      .sort((a,b)=>(b.date||'').localeCompare(a.date||''));
-    if(moved.length===0){
+    if(dlLastSeenArchive){
+      // Entrée supprimée : la seule archive pertinente est last_seen_archive, présélectionnée
+      // (jamais "dernière archive", le fichier n'y est plus).
       const opt=document.createElement('option');
-      opt.disabled=true; opt.textContent='(aucun mouvement indexé — dernière archive disponible)';
+      opt.value=dlLastSeenArchive; opt.textContent=`dernière présence — ${dlLastSeenArchive}`;
       sel.appendChild(opt);
+      sel.value=dlLastSeenArchive;
     }else{
-      moved.forEach(e=>{
+      const events=(entry&&entry.events)||[];
+      const moved=events.filter(e=>e.type==='added'||e.type==='modified')
+        .sort((a,b)=>(b.date||'').localeCompare(a.date||''));
+      if(moved.length===0){
         const opt=document.createElement('option');
-        opt.value=e.archive; opt.textContent=`${e.date} — ${e.type} — ${e.archive}`;
+        opt.disabled=true; opt.textContent='(aucun mouvement indexé — dernière archive disponible)';
         sel.appendChild(opt);
-      });
+      }else{
+        moved.forEach(e=>{
+          const opt=document.createElement('option');
+          opt.value=e.archive; opt.textContent=`${e.date} — ${e.type} — ${e.archive}`;
+          sel.appendChild(opt);
+        });
+      }
     }
   }
   updateEquivCmd();

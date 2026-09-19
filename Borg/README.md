@@ -474,7 +474,8 @@ borgHelper -c FileHist -f /etc/nginx/nginx.conf -n mon-serveur -j   # JSON : {ni
 Contenu **direct** d'un répertoire (racine entière si `-f` omis) — jamais le contenu d'un
 sous-répertoire — en **un seul tableau** : le répertoire courant lui-même apparaît en `.`, puis ses
 enfants immédiats. Liste **toujours l'intégralité** du contenu (dernier snapshot indexé), comme un
-`ls` enrichi, y compris les entrées sans événement dans la plage demandée (présentes, inchangées).
+`ls` enrichi, y compris les entrées sans événement dans la plage demandée (présentes, inchangées) —
+plus les enfants directs supprimés depuis mais toujours récupérables (voir plus bas).
 
 Colonnes : `nom`, `genre` (répertoire / fichier / lien symbolique / fifo / socket / périph. bloc ou
 caractère — type réel stocké par borg), `droits` (ls-style, ex. `drwxr-xr-x`), `propriétaire`
@@ -496,6 +497,15 @@ simple `added` ou `removed` d'un fichier niché en dessous — remonte en `modif
 
 Pour descendre dans un sous-répertoire, relancer `TreeHist` avec `-f` pointant dessus.
 
+**Fichiers/répertoires supprimés** : les enfants directs supprimés depuis (mais toujours
+récupérables — l'archive de dernière présence existe encore) apparaissent aussi, marqués
+distinctement (colonne `type`=`supprimé`, colonne `archive`=archive à restaurer). Un répertoire
+entièrement supprimé reste explorable : `TreeHist` dessus affiche son ancien contenu au lieu d'une
+erreur. Un chemin réajouté depuis sa suppression réapparaît normalement, sans marque. JSON (`-j`) :
+ces entrées portent `"deleted":true,"last_seen_archive":"<archive>"` en plus des clés habituelles
+(`mode`/`owner` à `null`, `is_dir` déduit par heuristique — voir TECHNICAL.md) ; les entrées non
+supprimées gardent une forme JSON strictement inchangée.
+
 ```bash
 borgHelper -c TreeHist -n mon-serveur                        # contenu direct de la racine
 borgHelper -c TreeHist -f /etc -n mon-serveur -b ALL          # contenu direct de /etc, tout l'historique
@@ -504,7 +514,9 @@ borgHelper -c TreeHist -f /var/lib/docker -n ALL -b ALL
 
 Plage : `-b <archive>` (depuis), `-B <archive>` (jusqu'à), `-b ALL` (tout), sans les deux (dernière
 paire indexée seulement — comme `Search`). Une entrée présente mais sans événement dans cette plage
-affiche `aucun événement dans la plage` plutôt que d'être omise.
+affiche `aucun événement dans la plage` plutôt que d'être omise. La détection des entrées
+**supprimées** est indépendante de `-b`/`-B` — la garantie de récupérabilité ne dépend pas de la plage
+consultée, elle apparaît identiquement quel que soit `-b`/`-B`.
 
 Genre/droits/propriétaire `inconnu (réindexer)`/`—` : entrée snapshotée avant l'ajout des colonnes
 `type`/`mode`/`owner`. Se répare tout seul au **prochain `Bkp`** (indexation automatique activée) :
@@ -516,7 +528,9 @@ forcer immédiatement sans attendre un backup : `Index -F -S`.
 
 ### `TreeFind`
 Recherche **récursive par nom** (pas le chemin complet) sous un préfixe (racine entière si omis), dans
-le **dernier snapshot connu** — comme `TreeHist`, mais récursif, sans historique, et filtré par motif.
+le **dernier snapshot connu** — comme `TreeHist`, mais récursif et filtré par motif — plus les chemins
+supprimés depuis mais toujours récupérables (voir plus bas ; c'est le seul historique consulté, pas
+un remplacement de `Search`).
 
 ```bash
 borgHelper -c TreeFind -n mon-serveur -m '*.log'                   # toute l'arborescence
@@ -529,11 +543,17 @@ Motif minimal (`-m`) : `*` = n'importe quelle suite de caractères, `.` reste **
 spécial) ; sans `*` (ni `?`) dans le motif, sous-chaîne implicite (comme `Search`). Comparaison sur le
 **nom** de l'entrée uniquement (dernier segment du chemin), sensible à la casse.
 
-Colonnes (mode texte) : `nom`, `genre`, `chemin` (complet), `droits`, `propriétaire` — dernier état
-connu, même limitation que `TreeHist`. JSON (`-j`) :
+Colonnes (mode texte) : `nom`, `genre`, `chemin` (complet), `droits`, `propriétaire`, `état` — dernier
+état connu, même limitation que `TreeHist`. JSON (`-j`) :
 `{nick:{archive,scope,pattern,matches:[{name,full_path,parent,is_dir,genre,mode,owner}]}}` — `parent`
 est le répertoire contenant l'entrée, pratique pour y naviguer directement (utilisé par l'explorateur
 de l'interface web).
+
+**Fichiers/répertoires supprimés** : recherchés récursivement sous le préfixe comme les chemins
+présents (même filtre de motif), et inclus dans `matches` même s'ils ne sont plus dans le dernier
+snapshot — tant qu'ils restent récupérables (archive de dernière présence encore existante). Colonne
+`état` en mode texte (`supprimé (<archive>)`) ; en JSON, `"deleted":true,"last_seen_archive":"<archive>"`
+en plus des clés habituelles (`mode`/`owner` à `null`).
 
 ---
 
@@ -1040,6 +1060,11 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
    **ignorée** (jamais affichée), pour ne jamais montrer le contenu d'un autre répertoire ou d'un autre
    serveur que celui affiché à l'écran. Même protection sur la liste des serveurs et sur l'Historique
    complet.
+   - **Fichiers/répertoires supprimés** : listés eux aussi (badge « supprimé »), tant qu'ils restent
+     récupérables. Cliquer sur un fichier supprimé, ou en télécharger un depuis la recherche, ouvre la
+     fenêtre de téléchargement avec l'archive de dernière présence **présélectionnée** (plutôt que
+     « dernière archive », qui échouerait — le fichier n'y est plus). Un dossier entièrement supprimé
+     reste explorable normalement (son ancien contenu s'affiche).
    - **Clic sur un dossier** : l'ouvre (contenu direct, comme `TreeHist -f <dossier>`).
    - **Clic droit sur un dossier** : télécharge un `.tar` de cette arborescence, à une archive
      choisissable dans une liste déroulante (`borg export-tar`, streamé directement au navigateur).
