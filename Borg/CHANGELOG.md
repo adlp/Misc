@@ -1,5 +1,84 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.97 + borgHelperWWW 1.14.0 — cache SQLite des réponses filtrées par périmètre (Epic 1, Story 1.5) — 2026-09-19
+
+Cinquième et dernière brique de la consultation scopée par arborescence (Epic 1) : depuis les
+Stories 1.3/1.4, tout appelant scopé (au moins un nick à périmètre restreint) contournait
+entièrement `_RESPONSE_CACHE` — chaque requête, même identique et récemment servie, relançait
+`borgHelper` et refiltrait de zéro (AD-5). Cette story ajoute le cache SQLite dédié que ces deux
+stories laissaient volontairement de côté.
+
+- Nouveau fichier SQLite `SCOPE_CACHE_DB` (réglage `BORGHELPERWWW_SCOPE_CACHE_DB`/`--scope-cache-db`,
+  défaut co-localisé avec `cache.db`/`diff.db`), même convention `db_meta`/`schema_version` que ces
+  deux bases (réutilise `_bh_paths.db._db_connect()`/`_check_set_meta()`, jamais dupliqué). Table
+  `scope_cache(cache_key, fingerprint, result_json, written_at)` — une ligne par `(nick réel,
+  commande, paramètres, signature de périmètre)`, jamais une clé combinée pour une requête
+  multi-nick (AD-5) : deux nicks scopés différemment dans la même requête ne partagent jamais une
+  ligne.
+- `_capture_fingerprints(nick)` : **tout premier appel** de chacune des neuf routes, strictement
+  avant la résolution du périmètre — empreinte = mtimes `cache.db`/`diff.db` du nick **et** mtime de
+  `.borghelperrc` lui-même (un `GROUPS_PATHS` resserré/relâché invalide donc le cache sans attendre
+  une nouvelle sauvegarde), capturée par nick réel pour qu'un backup/index sur un seul nick n'invalide
+  que sa propre ligne, même à l'intérieur d'une requête multi-nick. Garde-fou TOCTOU d'AD-5 : jamais
+  recapturée après l'appel `borgHelper`.
+- `_scoped_cached_mono()`/`_scoped_cached_multi()` enveloppent `_run_scoped()`/`_run_scoped_raw()`
+  (Stories 1.3/1.4, strictement inchangées) dans chacune des neuf endpoints — jamais à l'intérieur de
+  ces deux fonctions elles-mêmes, qui restent des primitives non-cacheables. Pour les quatre routes
+  multi-nick (`Search`/`FileHist`/`TreeHist`/`TreeFind`) : un hit **complet** (tous les nicks
+  demandés ont une ligne fraîche) synthétise la réponse sans appeler `borgHelper` ; tout miss (même
+  un seul nick) relance l'appel combiné existant exactement comme avant cette story, puis
+  rafraîchit une ligne par nick à partir de ce résultat.
+- Même garde-fou anti-croissance que `_RESPONSE_CACHE` (purge totale au-delà de 500 lignes, pas de
+  LRU) — cohérence plutôt que sophistication.
+
+**Deux correctifs `borgHelper` requis pour que ce cache produise un hit en pratique** (limites
+`borgHelper` initialement frozen, renégociées en cours de story après deux tours d'investigation
+live — voir `_bmad-output/implementation-artifacts/spec-1-5-cache-perimetre.md`, Amendments
+iteration 1 et 2) :
+1. `_check_set_meta()` n'écrit plus `db_meta` (`schema_version`/`borghelper_version`) que si la
+   valeur stockée diffère réellement — avant, ces deux lignes étaient réécrites à **chaque** appel,
+   même en lecture pure, avançant la date de modification de `cache.db`/`diff.db` à chaque fois
+   (chaque appel `borgHelper` est un sous-processus séparé ; fermer sa connexion SQLite déclenche un
+   checkpoint WAL qui touche le fichier).
+2. `ensure_diff_db()` ne recrée plus la vue `archive_snapshot_v` (`DROP VIEW`/`CREATE VIEW`) que si
+   elle n'existe pas déjà (simple contrôle d'existence contre `sqlite_master`, jamais une comparaison
+   textuelle du SQL stocké) — même défaut d'écriture inconditionnelle à chaque appel, découvert en
+   test live **après** le premier correctif, qui à lui seul ne suffisait pas.
+
+Sans ces deux correctifs combinés, l'empreinte qu'un appel scopé doit retrouver inchangée pour faire
+un hit était invalidée par l'appel `borgHelper` lui-même — un miss garanti à chaque fois, quelle que
+soit la justesse du mécanisme de cache. Comportement CLI/format de sortie de `borgHelper` inchangés
+par ces deux correctifs — seule la date de modification des fichiers `.db` en bénéficie.
+
+Vérifié en conditions réelles contre une copie scratch de `demo.borghelperrc` (`GROUPS_ADMIN/WRITE/
+READ` + `GROUPS_PATHS` actifs sur les deux nicks de démo, données déjà indexées réutilisées sans
+réindexation) : `python3 -m py_compile borgHelper borgHelperWWW` propre ;
+`borgHelperWWW` piloté via `fastapi.testclient.TestClient` avec `_exec_borghelper` instrumenté d'un
+compteur d'appels — (1) ligne `scope_cache` écrite après un appel scopé, désérialise vers la même
+forme `CommandResult` qu'une réponse live ; (2) 5 appels `LstBkpFls` scopés identiques consécutifs →
+**1 seul** sous-processus `borgHelper` (0 hit avant les deux correctifs `borgHelper`, confirmé lors
+de la première tentative d'implémentation — voir spec) ; (3) `Search` multi-nick avec une seule ligne
+supprimée → exactement 1 appel combiné, réponse correcte et identique pour les deux nicks (chemin
+hit-partiel) ; (4) appelant admin (illimité) : 2 appels identiques → 1 seul exec (hit
+`_RESPONSE_CACHE` normal), **0** ligne `scope_cache` écrite (additivité confirmée) ; (5) `.borghelperrc`
+touché (`os.utime`) entre deux requêtes identiques → 2e requête toujours `200`, données correctement
+re-scopées (miss, pas de crash) ; (6) garde-fou de croissance : 501 lignes de remplissage insérées
+directement, l'écriture suivante vide la table et n'y laisse qu'1 ligne ; (7) `db_meta` du nouveau
+fichier contient `schema_version='1'`, `borghelper_version` = `borgHelper.Version` ; (8) mêmes
+vérifications de stabilité (n identiques → 1 exec) répétées pour `DiffBkp`/`DuIdx`/`IdxTop`/
+`DiffTop`/`FileHist`/`TreeHist`/`TreeFind` — les neuf routes couvertes. **Test explicite requis par
+le spec** : deux appels `LstBkpFls` consécutifs directement en CLI (`borgHelper -C ... -c LstBkpFls
+-n demo-modules -j`, hors `borgHelperWWW`) contre un nick à données existantes non modifiées → mtime
+de `diff.db` identique après le 2e appel (confirmé stable sur 3 appels consécutifs) — ce test avait
+échoué avec seulement le premier correctif lors de l'itération précédente ; passe désormais avec les
+deux ensemble. Scratch config et tous les fichiers `story15_test_rc-*`
+(cache/diff-db/scope-cache) supprimés après vérification ; l'état `Index` propre aux deux dépôts de
+démo laissé en place (inchangé par cette vérification, en lecture pure).
+
+`README.md`/`TECHNICAL.md`/`borghelperwww.conf.example` mis à jour (nouveau cache, réglage
+`--scope-cache-db`/`BORGHELPERWWW_SCOPE_CACHE_DB`, règle d'invalidation, et les deux correctifs
+`borgHelper`). `borgHelper` 1.0.96 → **1.0.97** ; `borgHelperWWW` 1.13.0 → **1.14.0**.
+
 ## borgHelper 1.0.96 + borgHelperWWW 1.13.0 — filtrage par périmètre sur DuIdx/IdxTop/DiffTop (Epic 1, Story 1.4) — 2026-09-19
 
 Quatrième brique de la consultation scopée par arborescence (Epic 1) : le périmètre de chemin

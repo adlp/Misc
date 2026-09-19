@@ -64,3 +64,12 @@ cfgfile = /etc/borghelperrc-www
 ; Chaque nick porte alors GROUPS_ADMIN/GROUPS_WRITE/GROUPS_READ dans le .borghelperrc (voir README.md
 ; du dépôt principal — pas ce fichier, qui ne configure QUE borgHelperWWW lui-même).
 ;groups_header = X-Groups
+
+; Chemin du fichier SQLite du cache de réponses FILTRÉES par périmètre (Story 1.5, distinct de
+; cache.db/diff.db) — BORGHELPERWWW_SCOPE_CACHE_DB / --scope-cache-db. Défaut : co-localisé avec
+; cache.db/diff.db (voir README.md, section « Cache de réponses »). Sans effet sur le résultat ni
+; la performance du cache lui-même sauf si groups_header est actif ET qu'au moins un GROUPS_PATHS
+; restreint un appelant (sinon ce fichier reste inutilisé) — une petite capture d'empreinte
+; (quelques os.path.getmtime) a lieu à chaque requête indépendamment de ce réglage (AD-5 : elle
+; doit précéder la résolution du périmètre, donc avant de savoir si l'appelant est restreint).
+;scope_cache_db = /var/cache/borghelper/borghelperrc-www-scopecache.db

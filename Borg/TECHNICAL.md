@@ -85,9 +85,21 @@ Métadonnées de versionning du schéma — une ligne par clé.
 | Clé | Valeur | Notes |
 |-----|--------|-------|
 | `schema_version` | entier (ex : `"1"`) | Incrémenté uniquement lors d'un changement de schéma |
-| `borghelper_version` | chaîne (ex : `"1.0.41"`) | Mise à jour à chaque ouverture de la DB |
+| `borghelper_version` | chaîne (ex : `"1.0.41"`) | Écrite seulement si elle diffère de la valeur déjà stockée (Story 1.5, voir ci-dessous) |
 
 Au démarrage : si `schema_version` stockée > constante attendue (`DIFF_DB_SCHEMA_VERSION` / `CACHE_DB_SCHEMA_VERSION`) → erreur + exit. Indique que la DB a été créée par une version plus récente incompatible.
+
+**`_check_set_meta()` n'écrit `db_meta` que si la valeur change (Story 1.5)** : avant, les deux lignes
+(`schema_version`, `borghelper_version`) étaient réécrites (`INSERT OR REPLACE`) à **chaque** ouverture
+de la DB, même sans le moindre changement — chaque appel `borgHelper` étant un sous-processus distinct,
+la fermeture de la connexion SQLite déclenche un checkpoint WAL qui avance la date de modification du
+fichier `.db` **même pour un appel en lecture pure**. Désormais, chaque ligne n'est réécrite que si sa
+valeur stockée diffère réellement de la nouvelle (la valeur est de toute façon déjà lue pour la
+comparaison `stored>schema_version`, aucun coût supplémentaire). Un appel en lecture qui ne modifie
+aucune donnée laisse maintenant `cache.db`/`diff.db` bit-pour-bit inchangés, y compris leur date de
+modification — condition nécessaire (avec le correctif `ensure_diff_db()` ci-dessous) pour que le
+cache SQLite par périmètre de `borgHelperWWW` (Story 1.5, voir README.md) puisse jamais produire un
+hit : sa clé d'invalidation inclut ces dates de modification, capturées **avant** l'appel `borgHelper`.
 
 #### `diff_index`
 Stocke chaque événement de fichier entre deux archives consécutives.
@@ -150,6 +162,20 @@ CREATE VIEW archive_snapshot_v AS
 ```
 
 Utilisée par `Search`, `FileHist`, `DuIdx`, `Restore` — expose la jointure de façon transparente.
+
+**Recréation conditionnelle, pas systématique (Story 1.5)** : `ensure_diff_db()` exécutait avant
+`DROP VIEW IF EXISTS archive_snapshot_v` + `CREATE VIEW archive_snapshot_v AS ...`
+**inconditionnellement**, à chaque appel — un DDL qui, comme les écritures `db_meta` ci-dessus, avance
+la date de modification de `diff.db` même sans le moindre changement de données. Désormais, ce bloc ne
+s'exécute que si la vue n'existe pas déjà (`SELECT name FROM sqlite_master WHERE type='view' AND
+name='archive_snapshot_v'` — un simple contrôle d'existence, jamais une comparaison textuelle du SQL
+stocké, qui serait fragile face au reformatage propre de SQLite). Une future évolution du `SELECT` de
+cette vue devra passer par une migration explicite gated sur `DIFF_DB_SCHEMA_VERSION` (voir
+[Migration de schéma](#migration-de-schéma) ci-dessous), comme `_migrate_archive_snapshot` — ce
+correctif ne réduit donc pas la garantie d'auto-réparation existante, il l'aligne sur la convention de
+migration versionnée déjà suivie par le reste du schéma. Ce correctif est le second des deux
+nécessaires (avec `_check_set_meta()` ci-dessus) pour que le cache SQLite par périmètre de
+`borgHelperWWW` (Story 1.5) puisse produire un hit en pratique.
 
 ### Schéma complet
 
@@ -978,8 +1004,11 @@ tort le besoin de filtrage.
 
 **Cache** : `_run_scoped()` appelle `_exec_borghelper()` directement, jamais `run_borghelper()` —
 `_RESPONSE_CACHE` n'est donc ni lu ni écrit pour un appel dont au moins un nick est scopé, quels que
-soient `cmd`/`nick`/`extra_args`. Le cache reste utilisé exactement comme avant cette story pour le
-cas entièrement non restreint. Pas de nouveau cache dédié au résultat filtré ici — Story 1.5.
+soient `cmd`/`nick`/`extra_args`. Le cache mémoire reste utilisé exactement comme avant cette story
+pour le cas entièrement non restreint. Depuis Story 1.5, l'endpoint enveloppe `_run_scoped()` dans
+`_scoped_cached_mono()`/`_scoped_cached_multi()` — un cache SQLite **distinct**, dédié au résultat
+filtré — voir [Cache SQLite par périmètre (Story 1.5)](#cache-sqlite-par-périmètre-story-15)
+ci-dessous.
 
 ### Filtrage a posteriori par périmètre — DuIdx/IdxTop/DiffTop (Story 1.4)
 
@@ -1088,7 +1117,100 @@ JSON groupé `-j` existant de `DuIdx`, seule différence `borghelper_version` ap
 version).
 
 **Cache** : même règle que Story 1.3, étendue à ces trois routes — `_run_scoped_raw()` appelle
-`_exec_borghelper()` directement, jamais `_RESPONSE_CACHE`.
+`_exec_borghelper()` directement, jamais `_RESPONSE_CACHE`. Depuis Story 1.5, l'endpoint enveloppe
+`_run_scoped_raw()` dans `_scoped_cached_mono()` (ces trois routes sont mono-nick pour le
+périmètre) — voir [Cache SQLite par périmètre (Story 1.5)](#cache-sqlite-par-périmètre-story-15)
+ci-dessous.
+
+### Cache SQLite par périmètre (Story 1.5)
+
+`_RESPONSE_CACHE` (mémoire, existant) reste réservé au cas entièrement non restreint (AD-5) — un
+appelant scopé le contourne toujours entièrement (voir les deux sections précédentes). Ce nouveau
+cache SQLite, **distinct** de `cache.db`/`diff.db` et de `_RESPONSE_CACHE`, stocke le dérivé **déjà
+filtré** que produisent `_run_scoped()`/`_run_scoped_raw()`, pour éviter de relancer `borgHelper` et
+de refiltrer à chaque requête scopée identique.
+
+**Fichier** : `SCOPE_CACHE_DB` (réglage `BORGHELPERWWW_SCOPE_CACHE_DB`/`--scope-cache-db`, défaut
+`<cache_dir>/<db_prefix>-scopecache.db` — sans tiret avant "cache", délibérément : `get_cache_db()`/
+`get_diff_db()` produisent toujours `-{nick}-cache.db`/`-{nick}-diff.db`, donc aucun nick ne peut
+collisionner avec ce nom —, co-localisé avec `cache.db`/`diff.db`). `ensure_scope_cache_db()`
+crée son schéma une fois au démarrage — réutilise `_bh_paths.db._db_connect()`/`_check_set_meta()`
+(l'instance `BorgHelperDB` déjà utilisée pour `cache.db`/`diff.db`), donc même convention
+`db_meta`/`schema_version` (`SCOPE_CACHE_DB_SCHEMA_VERSION`) et même échec bruyant (`SchemaVersionError`
+propagée non catchée, `sqlite3.DatabaseError` → `sys.exit`) que les deux autres bases.
+
+```mermaid
+erDiagram
+    db_meta {
+        TEXT key PK "schema_version | borghelper_version"
+        TEXT value
+    }
+    scope_cache {
+        TEXT cache_key PK "json.dumps([nick, cmd, params, scope_signature])"
+        TEXT fingerprint "empreinte capturée AVANT résolution du périmètre"
+        TEXT result_json "CommandResult sérialisé (exitcode/stdout/stderr)"
+        TEXT written_at
+    }
+```
+
+**Clé de ligne** (`_scope_cache_key`) : `json.dumps([nick, cmd, params, scope_signature],
+sort_keys=True)` — jamais un `','.join` (un chemin peut contenir une virgule). `nick` est toujours
+un **nick réel unique** (jamais une liste/`ALL`) : une requête multi-nick produit une ligne **par
+nick**, jamais une clé combinée (AD-5). `params` est un dict construit par chaque endpoint avec tout
+ce qui, en plus de `nick`/`cmd`/périmètre, fait varier le résultat — y compris des paramètres qui ne
+sont **jamais** passés à `borgHelper` en sous-processus et n'existent que pour le recalcul local
+(`sort` pour DuIdx, `depth`/`topn` pour IdxTop/DiffTop) : les omettre romprait la correspondance
+requête↔ligne de cache (deux `topn` différents partageraient sinon la même ligne, renvoyant un
+résultat tronqué à la mauvaise taille).
+
+**`_scope_signature(scope)`** : sérialise le périmètre déjà canonicalisé par `_canonicalize_scope`
+(jamais réimplémenté) via `json.dumps(scope, sort_keys=True)` ; sentinel `'*'` pour `scope=None`
+(illimité) — un `json.dumps` d'une liste commence toujours par `'['`, donc `'*'` ne peut jamais
+entrer en collision avec un périmètre réel. Un nick illimité peut apparaître dans une requête
+multi-nick par ailleurs scopée (un autre nick force le passage par ce cache) — sa ligne utilise alors
+le sentinel, pas de cas particulier.
+
+**`_capture_fingerprints(nick)`** (AD-5, garde-fou TOCTOU) : **tout premier appel** de chaque
+endpoint après `require_api_key`, strictement avant `_resolve_scopes_for_request()`/
+`_resolve_single_scope()`. Retourne `{nick_réel: empreinte}` pour chaque nick réel de `nick` (déjà
+déplié via `_nick_list()` — simple opération de chaîne, sans logique RBAC, donc sans risque à
+appeler avant la résolution de périmètre). Empreinte = `_cache_fingerprint(n)` (mtimes
+`cache.db`/`diff.db` de CE nick, même convention que `_RESPONSE_CACHE`) concaténée à la mtime de
+`CFGFILE` (`.borghelperrc`) lui-même — un `GROUPS_PATHS` resserré/relâché doit invalider le cache
+même s'il ne touche ni `cache.db` ni `diff.db`. Une empreinte par nick réel (pas une empreinte unique
+pour toute la requête) : un backup/index sur un seul nick n'invalide que la ligne de CE nick, même à
+l'intérieur d'une requête multi-nick.
+
+⚠️ **Dépendance directe sur les deux correctifs `borgHelper` de cette même story** (voir
+[Base de données `diff.db`](#base-de-données-diffdb) plus haut, `_check_set_meta()` et la vue
+`archive_snapshot_v`) : sans eux, chaque invocation `borgHelper` — même une lecture pure sans le
+moindre changement de données — avance la date de modification de `cache.db`/`diff.db` (checkpoint
+WAL à la fermeture de la connexion, un sous-processus par appel), ce qui invalide l'empreinte que la
+requête suivante devrait retrouver inchangée : un hit ne serait alors quasiment jamais atteint en
+pratique, quelle que soit la justesse du mécanisme de cache lui-même. Vérifié en direct (voir
+Verification ci-dessous, item mtime) : ces deux correctifs ensemble sont nécessaires et suffisants
+pour que `diff.db` reste bit-pour-bit inchangé entre deux appels en lecture identiques.
+
+**`_scoped_cached_mono(cmd, nick, scope, fingerprint, params, run_fn)`** — cinq routes mono-nick
+(`LstBkpFls`/`DiffBkp`/`DuIdx`/`IdxTop`/`DiffTop`) : lookup avant d'appeler `run_fn` (le
+`_run_scoped()`/`_run_scoped_raw()` déjà construit par l'endpoint, strictement inchangé) ; hit → sert
+la ligne sans invoquer `borgHelper` ; miss → exécute `run_fn`, écrit/rafraîchit la ligne si
+`exitcode==0`.
+
+**`_scoped_cached_multi(cmd, nick, nicks, scopes, fingerprints, params, run_fn)`** — quatre routes
+multi-nick (`Search`/`FileHist`/`TreeHist`/`TreeFind`) : **hit complet** (chaque nick de `nicks` a
+une ligne fraîche) → synthétise la réponse `{nick: json.loads(fragment['stdout']), ...}` **sans**
+appeler `borgHelper` — chaque fragment stocke la valeur filtrée **propre à ce nick**, jamais
+l'enveloppe `{nick:...}` complète, pour que la synthèse soit un simple `json.loads` par nick. **Tout
+miss** (même un seul nick) → exécute `run_fn` (l'appel combiné `_run_scoped()` existant, exactement
+comme avant cette story — jamais éclaté en N appels), puis écrit/rafraîchit une ligne **par nick** à
+partir de ce résultat. N'écrit **aucun** fragment si l'appel combiné échoue ou si son `stdout` ne
+parse pas en dict (rien de sensible à découper par nick) — les lignes précédentes, s'il y en a,
+restent inchangées ; la requête suivante retombe simplement en miss (jamais pire qu'avant cette
+story).
+
+**Garde-fou anti-croissance** : miroir exact de la politique de `_RESPONSE_CACHE` — `DELETE FROM
+scope_cache` entièrement dès que la table dépasse 500 lignes (`_scope_cache_put`), pas de LRU.
 
 ### `GET /access` — liste des serveurs filtrée aux droits de l'utilisateur
 

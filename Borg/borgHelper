@@ -9,7 +9,7 @@
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.96"
+Version="1.0.97"
 DIFF_DB_SCHEMA_VERSION  = 4
 CACHE_DB_SCHEMA_VERSION = 1
 # Historique diff.db — chaque palier correspond à une migration idempotente et auto-détectée
@@ -627,8 +627,16 @@ class BorgHelperDB:
             raise SchemaVersionError(
                 f"({db_path}) schéma DB v{stored} > attendu v{schema_version} — "
                 "DB créée par une version plus récente de borgHelper, mettez à jour borgHelper.")
-        conn.execute("INSERT OR REPLACE INTO db_meta VALUES('schema_version',?)",(str(schema_version),))
-        conn.execute("INSERT OR REPLACE INTO db_meta VALUES('borghelper_version',?)",(Version,))
+        # Story 1.5 : n'écrire (donc ne jamais avancer le mtime du fichier DB, chaque connexion
+        # étant fermée avec checkpoint WAL) que si la valeur stockée diffère réellement — sinon un
+        # appel en lecture pure invaliderait à tort toute empreinte de cache basée sur ce mtime
+        # (voir borgHelperWWW, nouveau cache SQLite par périmètre).
+        if stored!=schema_version:
+            conn.execute("INSERT OR REPLACE INTO db_meta VALUES('schema_version',?)",(str(schema_version),))
+        ver_row=conn.execute("SELECT value FROM db_meta WHERE key='borghelper_version'").fetchone()
+        stored_ver=ver_row[0] if ver_row else None
+        if stored_ver!=Version:
+            conn.execute("INSERT OR REPLACE INTO db_meta VALUES('borghelper_version',?)",(Version,))
 
     def _db_connect(self,db_path):
         try:
@@ -806,13 +814,23 @@ class BorgHelperDB:
                     );
                     CREATE INDEX IF NOT EXISTS idx_snap_nick_archive ON archive_snapshot(nick, archive);
                 """)
-            conn.executescript("""
-                DROP VIEW IF EXISTS archive_snapshot_v;
-                CREATE VIEW archive_snapshot_v AS
-                    SELECT s.nick, s.archive, s.archive_date, sf.path, sf.size, sf.mtime, sf.type, sf.mode, sf.owner
-                    FROM archive_snapshot s
-                    JOIN snapshot_file sf ON sf.id=s.file_id;
-            """)
+            # Story 1.5 : ne (re)créer la vue que si elle n'existe pas déjà — un DROP/CREATE
+            # inconditionnel avance le mtime du fichier DB à chaque appel (checkpoint WAL à la
+            # fermeture de connexion), même sans le moindre changement de données, ce qui
+            # invaliderait à tort le cache par périmètre de borgHelperWWW. Simple contrôle
+            # d'existence (pas de diff textuelle du SQL, fragile face au stockage/formatage propre
+            # de SQLite) — une future évolution du SELECT de cette vue passera par une migration
+            # explicite gated sur DIFF_DB_SCHEMA_VERSION, comme _migrate_archive_snapshot.
+            view_row=conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='view' AND name='archive_snapshot_v'").fetchone()
+            if view_row is None:
+                conn.executescript("""
+                    DROP VIEW IF EXISTS archive_snapshot_v;
+                    CREATE VIEW archive_snapshot_v AS
+                        SELECT s.nick, s.archive, s.archive_date, sf.path, sf.size, sf.mtime, sf.type, sf.mode, sf.owner
+                        FROM archive_snapshot s
+                        JOIN snapshot_file sf ON sf.id=s.file_id;
+                """)
             self._check_set_meta(conn,DIFF_DB_SCHEMA_VERSION,db_path)
             conn.commit(); conn.close()
         except sqlite3.DatabaseError as e:

@@ -717,6 +717,7 @@ Trois façons de configurer, cumulables — par ordre de priorité (la première
 | `BORGHELPERWWW_ALLOW_DOWNLOADS` | `--allow-downloads`, `--no-downloads` | `allow_downloads` | Autorise `/download/file` et `/download/tar` (vue d'une restauration) — **autorisé par défaut** (voir ci-dessous) |
 | `BORGHELPERWWW_API_PREFIX` | `--api-prefix` | `api_prefix` | Préfixe de toutes les routes API — défaut `/api` (voir ci-dessous) |
 | `BORGHELPERWWW_GROUPS_HEADER` | `--groups-header` | `groups_header` | Header HTTP contenant les groupes de l'utilisateur (reverse proxy OIDC) — absent : **désactivé** (voir ci-dessous) |
+| `BORGHELPERWWW_SCOPE_CACHE_DB` | `--scope-cache-db` | `scope_cache_db` | Chemin du fichier SQLite du cache de réponses **filtrées** par périmètre (Story 1.5) — défaut : co-localisé avec `cache.db`/`diff.db` (voir [Cache de réponses](#cache-de-réponses)) |
 
 Le serveur refuse de démarrer si le fichier de conf `.borghelperrc` (`cfgfile`) est absent (aucun des
 trois moyens ne l'a fourni). La clé API, elle, n'est **pas requise** : si absente partout,
@@ -1110,14 +1111,41 @@ entrées (purge totale au-delà, garde-fou anti-croissance illimitée). `GET /re
 mode `offline=true` (le mode en ligne interroge le dépôt en direct via `borg info`, non couvert par
 cette empreinte).
 
-⚠️ **Périmètre de chemin actif ⇒ jamais servi depuis ce cache** (Story 1.3, étendu Story 1.4) : pour
-`/search`, `/filehist`, `/lstbkpfls`, `/diffbkp`, `/treehist`, `/treefind`, `/duidx`, `/idxtop`,
-`/difftop`, dès qu'**au moins un** nick de la requête porte un périmètre restreint (`GROUPS_PATHS`),
-l'appel contourne entièrement `_RESPONSE_CACHE` — ni lu, ni écrit — et relance `borgHelper` à chaque
-fois. Seul le cas entièrement non restreint (autorisation par groupes désactivée, ou appelant sans
-aucun périmètre sur tous les nicks demandés) continue d'utiliser ce cache, exactement comme avant
-ces deux stories. Un cache dédié au résultat **filtré**, avec le périmètre dans sa clé, est prévu
-pour une story ultérieure du même epic (1.5) — pas celle-ci.
+⚠️ **Périmètre de chemin actif ⇒ jamais servi depuis `_RESPONSE_CACHE`** (Story 1.3, étendu Story
+1.4) : pour `/search`, `/filehist`, `/lstbkpfls`, `/diffbkp`, `/treehist`, `/treefind`, `/duidx`,
+`/idxtop`, `/difftop`, dès qu'**au moins un** nick de la requête porte un périmètre restreint
+(`GROUPS_PATHS`), l'appel contourne entièrement `_RESPONSE_CACHE` — ni lu, ni écrit — et relance
+`borgHelper` **sauf** hit du cache dédié décrit ci-dessous. Seul le cas entièrement non restreint
+(autorisation par groupes désactivée, ou appelant sans aucun périmètre sur tous les nicks demandés)
+continue d'utiliser `_RESPONSE_CACHE`, exactement comme avant ces stories.
+
+**Cache SQLite dédié aux réponses filtrées par périmètre (Story 1.5)** : un second fichier SQLite,
+distinct de `cache.db`/`diff.db` (réglage `BORGHELPERWWW_SCOPE_CACHE_DB`/`--scope-cache-db`, défaut
+co-localisé avec eux — voir [Configuration](#configuration)), stocke le résultat **déjà filtré**
+pour chaque `(nick, commande, paramètres, périmètre)` — une ligne **par nick réel**, même pour une
+requête multi-nick (`Search`/`FileHist`/`TreeHist`/`TreeFind`) : deux nicks scopés différemment dans
+la même requête ne partagent jamais une ligne. Empreinte d'invalidation capturée **avant** la
+résolution du périmètre (mtimes `cache.db`/`diff.db` du nick **et** mtime de `.borghelperrc` lui-même
+— un `GROUPS_PATHS` resserré/relâché invalide donc le cache sans attendre une nouvelle sauvegarde) ;
+un appel identique est servi sans relancer `borgHelper` tant que cette empreinte n'a pas changé. Pour
+les quatre routes multi-nick, un hit **partiel** (certains nicks en cache, d'autres non) relance
+l'appel combiné existant pour **tous** les nicks demandés (comportement Story 1.3/1.4 inchangé) puis
+rafraîchit chaque fragment ; seul un hit **complet** (tous les nicks) évite l'appel `borgHelper`.
+Même garde-fou anti-croissance que `_RESPONSE_CACHE` (purge totale au-delà de 500 lignes, pas de LRU).
+Fichier auto-créé au premier démarrage (`db_meta`/`schema_version`, même convention que
+`cache.db`/`diff.db` — échec bruyant si la DB est corrompue ou d'un schéma plus récent que celui
+attendu).
+
+Ce cache dépend d'un correctif appliqué à `borgHelper` lui-même (Story 1.5) : `_check_set_meta()`
+n'écrit désormais `db_meta` (`schema_version`/`borghelper_version`) que si la valeur stockée diffère
+réellement, et `ensure_diff_db()` ne recrée la vue `archive_snapshot_v` que si elle n'existe pas déjà
+— sans ces deux correctifs, `cache.db`/`diff.db` voyaient leur date de modification avancer à **chaque**
+appel, même en lecture pure sans le moindre changement de données (chaque appel `borgHelper` étant un
+sous-processus séparé, la fermeture de connexion SQLite déclenche un checkpoint WAL qui touche le
+fichier), ce qui aurait invalidé le cache par périmètre à chaque requête et l'aurait rendu quasiment
+inopérant en pratique. Comportement CLI/format de sortie de `borgHelper` inchangés par ces deux
+correctifs — seule la date de modification des fichiers `.db` en bénéficie (moins d'écritures inutiles
+sur disque, en plus de rendre ce cache par périmètre effectif).
 
 | Méthode | Route | Commande CLI | Cache |
 |---------|-------|--------------|:---:|

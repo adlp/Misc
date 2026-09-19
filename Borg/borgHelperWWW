@@ -6,7 +6,7 @@
 #* See <http://www.gnu.org/licenses/>
 #*/
 
-import os,re,sys,json,secrets,subprocess,configparser
+import os,re,sys,json,sqlite3,secrets,subprocess,configparser
 from pathlib import Path
 from typing import Optional
 from collections import defaultdict
@@ -21,7 +21,7 @@ from borgHelper import Version as BORGHELPER_VERSION, BorgRunner, BorgHelper
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.13.0"
+WWW_VERSION="1.14.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -65,6 +65,9 @@ if __name__=='__main__':
                      "l'utilisateur, liste séparée par des virgules (ex. X-Groups). Vide/absent : "
                      "fonctionnalité désactivée, seule X-API-Key fait foi (déf. BORGHELPERWWW_GROUPS_HEADER)."
                      " Voir GROUPS_ADMIN/GROUPS_WRITE/GROUPS_READ dans le .borghelperrc — README.md")
+    _p.add_argument('--scope-cache-db',help="Chemin du fichier SQLite du cache de réponses filtrées "
+                     "par périmètre (Story 1.5, distinct de cache.db/diff.db) — déf. "
+                     "BORGHELPERWWW_SCOPE_CACHE_DB, sinon co-localisé avec cache.db/diff.db")
     _args=_p.parse_args()
     if _args.conf: os.environ['BORGHELPERWWW_CONF']=_args.conf
     if _args.cfgfile: os.environ['BORGHELPERWWW_CFGFILE']=_args.cfgfile
@@ -76,6 +79,7 @@ if __name__=='__main__':
     if _args.port is not None: os.environ['BORGHELPERWWW_PORT']=str(_args.port)
     if _args.trusted_proxies: os.environ['BORGHELPERWWW_TRUSTED_PROXIES']=_args.trusted_proxies
     if _args.groups_header: os.environ['BORGHELPERWWW_GROUPS_HEADER']=_args.groups_header
+    if _args.scope_cache_db: os.environ['BORGHELPERWWW_SCOPE_CACHE_DB']=_args.scope_cache_db
     if _args.allow_destructive is not None: os.environ['BORGHELPERWWW_ALLOW_DESTRUCTIVE']=str(_args.allow_destructive)
     if _args.allow_downloads is not None: os.environ['BORGHELPERWWW_ALLOW_DOWNLOADS']=str(_args.allow_downloads)
     if _args.api_prefix is not None: os.environ['BORGHELPERWWW_API_PREFIX']=_args.api_prefix
@@ -90,7 +94,8 @@ _CONF_KEYS={'cfgfile':'BORGHELPERWWW_CFGFILE','api_key':'BORGHELPERWWW_API_KEY',
             'timeout':'BORGHELPERWWW_TIMEOUT','host':'BORGHELPERWWW_HOST','port':'BORGHELPERWWW_PORT',
             'trusted_proxies':'BORGHELPERWWW_TRUSTED_PROXIES',
             'allow_destructive':'BORGHELPERWWW_ALLOW_DESTRUCTIVE','allow_downloads':'BORGHELPERWWW_ALLOW_DOWNLOADS',
-            'api_prefix':'BORGHELPERWWW_API_PREFIX','groups_header':'BORGHELPERWWW_GROUPS_HEADER'}
+            'api_prefix':'BORGHELPERWWW_API_PREFIX','groups_header':'BORGHELPERWWW_GROUPS_HEADER',
+            'scope_cache_db':'BORGHELPERWWW_SCOPE_CACHE_DB'}
 _conf_path=os.environ.get('BORGHELPERWWW_CONF')
 if _conf_path:
     if not os.path.isfile(_conf_path):
@@ -466,6 +471,143 @@ def _cache_fingerprint(nick: Optional[str]) -> str:
         except OSError: parts.append(f"{p}:absent")
     return '|'.join(parts)
 
+# ── Cache SQLite par périmètre (Story 1.5) ──────────────────────────────────
+# Depuis Stories 1.3/1.4, tout appelant scopé (au moins un nick à périmètre restreint) rate
+# systématiquement `_RESPONSE_CACHE` (réservé au cas non restreint, AD-5) : `_run_scoped()`/
+# `_run_scoped_raw()` relancent borgHelper et refiltrent à chaque appel, même pour une requête
+# identique récemment servie. Ce cache dédié stocke le dérivé FILTRÉ (jamais le brut), avec pour
+# clé (nick, commande, paramètres, signature_périmètre) — une ligne par nick réel, jamais une
+# clé combinée pour une requête multi-nick (AD-5). Fichier SQLite séparé, même convention
+# db_meta/schema_version que cache.db/diff.db — réutilise _bh_paths.db._db_connect()/
+# _check_set_meta() plutôt que de dupliquer ce code.
+SCOPE_CACHE_DB=os.environ.get('BORGHELPERWWW_SCOPE_CACHE_DB') or \
+    os.path.join(_bh_paths.db.cache_dir,f"{_bh_paths.db.db_prefix}-scopecache.db")
+    # Suffixe sans tiret avant "cache" — délibéré : get_cache_db()/get_diff_db() produisent
+    # toujours f"{db_prefix}-{nick}-cache.db"/f"{db_prefix}-{nick}-diff.db" (tiret immédiatement
+    # avant "cache"/"diff"), donc aucun nick, quel que soit son nom (y compris "scope"), ne peut
+    # jamais produire ce chemin par collision.
+SCOPE_CACHE_DB_SCHEMA_VERSION=1
+
+def ensure_scope_cache_db():
+    """Créé/valide le schéma de SCOPE_CACHE_DB — même convention que ensure_cache_db()/
+    ensure_diff_db() de borgHelper (table db_meta + _check_set_meta pour schema_version/
+    borghelper_version, échec bruyant SchemaVersionError si le schéma stocké est plus récent que
+    SCOPE_CACHE_DB_SCHEMA_VERSION, 'DB corrompue' + sys.exit si le fichier est illisible/corrompu).
+    Appelée une fois au démarrage (comme _validate_groups_paths_startup()) — le fichier n'est
+    ensuite plus jamais recréé/migré en cours de route par ce process."""
+    db=_bh_paths.db
+    try:
+        conn=db._db_connect(SCOPE_CACHE_DB)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS db_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );
+            CREATE TABLE IF NOT EXISTS scope_cache (
+                cache_key   TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                written_at  TEXT DEFAULT (datetime('now'))
+            );
+        """)
+        db._check_set_meta(conn,SCOPE_CACHE_DB_SCHEMA_VERSION,SCOPE_CACHE_DB)
+        conn.commit(); conn.close()
+    except sqlite3.DatabaseError as e:
+        print(f"DB corrompue : {SCOPE_CACHE_DB}",file=sys.stderr)
+        print(f"  -> {e}",file=sys.stderr)
+        print("  Supprimez le fichier et relancez pour reconstruire le cache de périmètre.",file=sys.stderr)
+        sys.exit(1)
+
+ensure_scope_cache_db()
+
+def _scope_signature(scope):
+    """AD-5 : signature canonique et univoque d'un périmètre déjà résolu/canonicalisé par
+    `_canonicalize_scope`/`_resolve_path_scope` (trié, dédoublonné, préfixes redondants éliminés
+    — jamais réimplémenté ici, seulement sérialisé) via `json.dumps` (jamais un simple
+    `','.join`, un chemin pouvant contenir une virgule). `scope=None` (illimité) -> sentinel
+    distinct et non falsifiable `'*'`, jamais une chaîne vide — un `json.dumps` d'une liste
+    produit toujours une chaîne commençant par '[', donc `'*'` ne peut jamais entrer en
+    collision avec un périmètre réel, quel qu'il soit. Un appelant totalement illimité sur un
+    nick unique ne passe normalement jamais par ce cache (servi par `_RESPONSE_CACHE`), mais un
+    nick peut être illimité tout en partageant une requête multi-nick avec un nick scopé — le
+    sentinel doit donc exister et fonctionner dans les deux cas."""
+    if scope is None: return '*'
+    return json.dumps(scope,ensure_ascii=False,sort_keys=True)
+
+def _scope_cache_key(nick,cmd,params,scope_signature):
+    """Sérialise (nick, commande, paramètres, signature_périmètre) en une clé de ligne unique et
+    déterministe. `params` est un dict simple (valeurs JSON-sérialisables) construit par chaque
+    endpoint avec tout ce qui, en plus de nick/commande/périmètre, fait varier le résultat filtré
+    (y compris les paramètres qui ne sont utilisés que pour le recalcul local DuIdx/IdxTop/
+    DiffTop et ne sont jamais passés à borgHelper en sous-processus, ex. depth/topn/sort)."""
+    return json.dumps([nick,cmd,params,scope_signature],ensure_ascii=False,sort_keys=True)
+
+def _scope_cache_get(nick,cmd,params,scope_signature,fingerprint):
+    """Retourne le CommandResult (dict) en cache pour (nick, cmd, params, scope_signature) si son
+    empreinte stockée correspond exactement à `fingerprint` (hit frais) ; None sinon (absent ou
+    périmé — l'appelant retombe alors sur le chemin borgHelper existant, jamais pire qu'avant
+    cette story). Ce cache est une pure optimisation : toute erreur SQLite (contention, corruption)
+    ou ligne stockée corrompue (`json.loads` échoue) est traitée comme un miss, jamais propagée —
+    une requête déjà calculable avant cette story ne doit jamais échouer à cause de ce cache."""
+    key=_scope_cache_key(nick,cmd,params,scope_signature)
+    try:
+        conn=_bh_paths.db._db_connect(SCOPE_CACHE_DB)
+        try:
+            row=conn.execute("SELECT fingerprint,result_json FROM scope_cache WHERE cache_key=?",(key,)).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    if row is None or row[0]!=fingerprint: return None
+    try:
+        return json.loads(row[1])
+    except ValueError:
+        return None
+
+def _scope_cache_put(nick,cmd,params,scope_signature,fingerprint,result_dict):
+    """Écrit/rafraîchit une ligne. Garde-fou anti-croissance : miroir exact de la politique brutale
+    de `_RESPONSE_CACHE` (`DELETE FROM scope_cache` entièrement si plus de 500 lignes déjà
+    présentes) — pas de LRU, cohérence plutôt que sophistication (Boundaries). Le compte-vérifie-
+    purge-puis-insère tourne dans une seule transaction (`BEGIN IMMEDIATE`) : `SCOPE_CACHE_DB` peut
+    être partagé entre plusieurs workers (--workers), contrairement à `_RESPONSE_CACHE` en mémoire —
+    sans ça deux writers concurrents pourraient tous deux observer >500 lignes et purger chacun leur
+    tour. Pure optimisation : toute erreur SQLite est avalée, jamais propagée — la réponse a déjà
+    été calculée et doit être retournée à l'appelant quoi qu'il arrive ici."""
+    key=_scope_cache_key(nick,cmd,params,scope_signature)
+    try:
+        conn=_bh_paths.db._db_connect(SCOPE_CACHE_DB)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            count=conn.execute("SELECT COUNT(*) FROM scope_cache").fetchone()[0]
+            if count>500: conn.execute("DELETE FROM scope_cache")
+            conn.execute("INSERT OR REPLACE INTO scope_cache (cache_key,fingerprint,result_json,written_at) "
+                         "VALUES (?,?,?,datetime('now'))",(key,fingerprint,json.dumps(result_dict,ensure_ascii=False)))
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
+
+def _capture_fingerprints(nick):
+    """AD-5, garde-fou TOCTOU : DOIT être appelée en tout premier, juste après `require_api_key`,
+    strictement avant que `_resolve_scopes_for_request()`/`_resolve_single_scope()` ne résolvent
+    GROUPS_PATHS pour la requête courante — jamais après (capturer après ouvrirait la fenêtre
+    TOCTOU que cette story existe à fermer : un .borghelperrc modifié entre la résolution du
+    périmètre et la capture d'empreinte pourrait faire apparaître comme "frais" un résultat
+    filtré sous l'ancien périmètre, désormais trop permissif).
+
+    Retourne {nick_réel: empreinte} pour chaque nick réel contenu dans `nick` (déjà déplié via
+    `_nick_list` — une simple opération de chaîne/lecture de la liste des nicks connus, sans
+    aucune logique RBAC/périmètre, donc sans risque à appeler ici avant la résolution de
+    périmètre). Empreinte = mtimes cache.db/diff.db de CE nick (`_cache_fingerprint`, même
+    convention que `_RESPONSE_CACHE`) + mtime de .borghelperrc (un GROUPS_PATHS resserré/relâché
+    doit invalider le cache même s'il ne touche ni cache.db ni diff.db) — une par nick réel, pour
+    qu'un backup/index sur un seul nick n'invalide que la ligne de CE nick (I/O matrix)."""
+    try: cfg_mtime=os.path.getmtime(CFGFILE)
+    except OSError: cfg_mtime='absent'
+    return {n:f"{_cache_fingerprint(n)}|cfgfile:{cfg_mtime}" for n in _nick_list(nick)}
+
 def _exec_borghelper(cmd: str, nick: Optional[str], extra_args, passphrase: Optional[str]=None) -> CommandResult:
     """Sous-processus borgHelper brut, sans cache ni encapsulation JSONResponse — factorisé hors de
     `run_borghelper()` pour être réutilisé tel quel par `_run_scoped()` (Story 1.3), qui a besoin du
@@ -628,6 +770,69 @@ def _run_scoped_raw(cmd,nick,extra_args,raw_flag,filter_fn,passphrase=None):
         except ValueError:
             result.exitcode=1; result.stdout=''; result.stderr=(result.stderr or '')+"\n[borgHelperWWW] réponse non-JSON reçue pour un appelant à périmètre restreint — requête refusée."
     return JSONResponse(status_code=200 if result.exitcode==0 else 400,content=result.dict())
+
+# ── Enveloppes de cache par périmètre autour de _run_scoped/_run_scoped_raw (Story 1.5) ────────
+# Jamais à l'intérieur de _run_scoped()/_run_scoped_raw() elles-mêmes (Code Map du spec 1.5 : ces
+# deux fonctions restent des primitives non-cacheables, c'est l'endpoint appelant qui décide).
+
+def _scoped_cached_mono(cmd,nick,scope,fingerprint,params,run_fn):
+    """Enveloppe de cache pour les cinq routes mono-nick (LstBkpFls/DiffBkp/DuIdx/IdxTop/DiffTop) :
+    lookup avant d'appeler `run_fn` (le `_run_scoped`/`_run_scoped_raw` déjà construit par
+    l'endpoint appelant, inchangé), écrit/rafraîchit la ligne après un miss. `run_fn` : callable
+    sans argument renvoyant le JSONResponse de `_run_scoped`/`_run_scoped_raw` tel quel."""
+    sig=_scope_signature(scope)
+    cached=_scope_cache_get(nick,cmd,params,sig,fingerprint)
+    if cached is not None:
+        return JSONResponse(status_code=200 if cached.get('exitcode')==0 else 400,content=cached)
+    resp=run_fn()
+    try: result_dict=json.loads(resp.body)
+    except ValueError: result_dict=None
+    if isinstance(result_dict,dict) and result_dict.get('exitcode')==0:
+        _scope_cache_put(nick,cmd,params,sig,fingerprint,result_dict)
+    return resp
+
+def _scoped_cached_multi(cmd,nick,nicks,scopes,fingerprints,params,run_fn):
+    """Enveloppe de cache pour les quatre routes multi-nick (Search/FileHist/TreeHist/TreeFind) :
+    hit complet — chaque nick de `nicks` a une ligne fraîche en cache (empreinte+signature
+    identiques) — synthétise la réponse SANS appeler borgHelper (json.loads(fragment['stdout'])
+    par nick, jamais l'enveloppe {nick:...} — Implementation Notes du spec 1.5). Tout miss -> lance
+    `run_fn` (l'appel combiné `_run_scoped` existant, EXACTEMENT comme avant cette story), puis
+    écrit/rafraîchit une ligne par nick à partir de CE résultat — jamais l'inverse. `run_fn` :
+    callable sans argument renvoyant le JSONResponse de `_run_scoped` tel quel.
+
+    N'écrit AUCUN fragment si l'appel combiné échoue ou si son stdout ne parse pas en dict (rien
+    de sensible à découper par nick) — les lignes précédentes (s'il y en a) restent inchangées, la
+    prochaine requête retombe simplement en miss (jamais pire qu'avant cette story)."""
+    fragments={}
+    for n in nicks:
+        frag=_scope_cache_get(n,cmd,params,_scope_signature(scopes.get(n)),fingerprints.get(n,''))
+        if frag is None:
+            fragments=None; break
+        fragments[n]=frag
+    if fragments is not None:
+        try:
+            combined={n:json.loads(fragments[n]['stdout']) for n in nicks}
+        except ValueError:
+            combined=None
+        if combined is not None:
+            # Chaque fragment stocke le même stderr d'origine (celui de l'appel combiné au moment
+            # de l'écriture, cf. _scope_cache_put ci-dessous) — un seul suffit, jamais concaténé.
+            stderr=fragments[nicks[0]].get('stderr','') if nicks else ''
+            result_dict={'exitcode':0,'stdout':json.dumps(combined,ensure_ascii=False,indent=2),'stderr':stderr}
+            return JSONResponse(status_code=200,content=result_dict)
+    resp=run_fn()
+    try: result_dict=json.loads(resp.body)
+    except ValueError: result_dict=None
+    if isinstance(result_dict,dict) and result_dict.get('exitcode')==0:
+        try: parsed=json.loads(result_dict['stdout'])
+        except ValueError: parsed=None
+        if isinstance(parsed,dict):
+            for n in nicks:
+                if n in parsed:
+                    frag={'exitcode':0,'stdout':json.dumps(parsed[n],ensure_ascii=False),
+                          'stderr':result_dict.get('stderr','')}
+                    _scope_cache_put(n,cmd,params,_scope_signature(scopes.get(n)),fingerprints.get(n,''),frag)
+    return resp
 
 _DUIDX_TYPE_ORDER=['added','modified','removed','C','B','T','présent']  # miroir borgHelper:_DUIDX_TYPE_ORDER
 _DUIDX_COL_KEYS=['added','removed','présent']                            # miroir borgHelper:_DUIDX_COL_KEYS
@@ -912,12 +1117,16 @@ def lstbkp(nick: str, x_api_key: Optional[str]=Header(default=None)):
 @router.get("/lstbkpfls",response_model=CommandResult,tags=["lecture"])
 def lstbkpfls(nick: str, request: Request, bid: Optional[str]=None, x_api_key: Optional[str]=Header(default=None)):
     """Réponse filtrée par périmètre (chemins hors scope retirés de `files`) si l'appelant a un
-    périmètre restreint sur `nick` ; identique à avant Story 1.3 sinon."""
+    périmètre restreint sur `nick` ; identique à avant Story 1.3 sinon. Story 1.5 : réponse
+    filtrée servie depuis le cache SQLite par périmètre si fraîche (empreinte capturée AVANT la
+    résolution du périmètre, ligne juste en dessous)."""
     require_api_key(x_api_key)
+    fingerprints=_capture_fingerprints(nick)
     extra=['-b',bid] if bid else []
     scope=_resolve_scopes_for_request(request,[nick]).get(nick)
     if scope is not None:
-        return _run_scoped('lstbkpfls',nick,extra,lambda data:_filter_str_list(data,scope,'files'))
+        return _scoped_cached_mono('lstbkpfls',nick,scope,fingerprints.get(nick,''),{'bid':bid},
+            lambda:_run_scoped('lstbkpfls',nick,extra,lambda data:_filter_str_list(data,scope,'files')))
     return run_borghelper('lstbkpfls',nick=nick,extra_args=extra,cacheable=True)
 
 @router.get("/report",response_model=CommandResult,tags=["lecture"])
@@ -939,14 +1148,18 @@ def report(nick: str="ALL", n: Optional[int]=Query(default=None,description="n d
 def diffbkp(nick: str, request: Request, bid_old: Optional[str]=None, bid_new: Optional[str]=None,
             x_api_key: Optional[str]=Header(default=None)):
     """Réponse filtrée par périmètre (`entries` + n_add/n_rem/n_mod recalculés) si l'appelant a un
-    périmètre restreint sur `nick` ; identique à avant Story 1.3 sinon."""
+    périmètre restreint sur `nick` ; identique à avant Story 1.3 sinon. Story 1.5 : réponse
+    filtrée servie depuis le cache SQLite par périmètre si fraîche."""
     require_api_key(x_api_key)
+    fingerprints=_capture_fingerprints(nick)
     extra=[]
     if bid_old and bid_new: extra=['-b',f"{bid_old},{bid_new}"]
     elif bid_old: extra=['-b',bid_old]
     scope=_resolve_scopes_for_request(request,[nick]).get(nick)
     if scope is not None:
-        return _run_scoped('diffbkp',nick,extra,lambda data:_filter_diffbkp(data,scope))
+        return _scoped_cached_mono('diffbkp',nick,scope,fingerprints.get(nick,''),
+            {'bid_old':bid_old,'bid_new':bid_new},
+            lambda:_run_scoped('diffbkp',nick,extra,lambda data:_filter_diffbkp(data,scope)))
     return run_borghelper('diffbkp',nick=nick,extra_args=extra,cacheable=True)
 
 @router.get("/restore/perms",response_model=CommandResult,tags=["lecture"],summary="Liste les droits d'un fichier sans restaurer (Restore -L)")
@@ -1010,15 +1223,20 @@ def search(nick: str, pattern: str, request: Request, archive_from: Optional[str
            x_api_key: Optional[str]=Header(default=None)):
     """Réponse filtrée par périmètre, par nick, si au moins un nick de `nick` a un périmètre
     restreint pour l'appelant (force JSON même sans `?json=true`) ; identique à avant Story 1.3
-    sinon."""
+    sinon. Story 1.5 : synthétisée depuis le cache SQLite par périmètre (une ligne par nick réel)
+    si tous les nicks de la requête ont une ligne fraîche, sinon appel combiné comme aujourd'hui
+    puis rafraîchissement des fragments."""
     require_api_key(x_api_key)
+    fingerprints=_capture_fingerprints(nick)
     extra=['-f',pattern]
     if archive_from: extra+=['-b',archive_from]
     if archive_to: extra+=['-B',archive_to]
     nicks=_nick_list(nick)
     scopes=_resolve_scopes_for_request(request,nicks)
     if _any_scoped(scopes):
-        return _run_scoped('search',nick,extra,lambda data:_filter_per_nick_list(data,scopes))
+        params={'pattern':pattern,'archive_from':archive_from,'archive_to':archive_to}
+        return _scoped_cached_multi('search',nick,nicks,scopes,fingerprints,params,
+            lambda:_run_scoped('search',nick,extra,lambda data:_filter_per_nick_list(data,scopes)))
     return run_borghelper('search',nick=nick,extra_args=extra,cacheable=True)
 
 @router.get("/filehist",response_model=CommandResult,tags=["lecture"])
@@ -1026,15 +1244,19 @@ def filehist(nick: str, path: str, request: Request, archive_from: Optional[str]
              x_api_key: Optional[str]=Header(default=None)):
     """Réponse filtrée par périmètre, par nick, si au moins un nick de `nick` a un périmètre
     restreint pour l'appelant (force JSON même sans `?json=true`) ; identique à avant Story 1.3
-    sinon."""
+    sinon. Story 1.5 : synthétisée depuis le cache SQLite par périmètre si tous les nicks de la
+    requête ont une ligne fraîche, sinon appel combiné comme aujourd'hui puis rafraîchissement."""
     require_api_key(x_api_key)
+    fingerprints=_capture_fingerprints(nick)
     extra=['-f',path]
     if archive_from: extra+=['-b',archive_from]
     if archive_to: extra+=['-B',archive_to]
     nicks=_nick_list(nick)
     scopes=_resolve_scopes_for_request(request,nicks)
     if _any_scoped(scopes):
-        return _run_scoped('filehist',nick,extra,lambda data:_filter_filehist(data,path,scopes))
+        params={'path':path,'archive_from':archive_from,'archive_to':archive_to}
+        return _scoped_cached_multi('filehist',nick,nicks,scopes,fingerprints,params,
+            lambda:_run_scoped('filehist',nick,extra,lambda data:_filter_filehist(data,path,scopes)))
     return run_borghelper('filehist',nick=nick,extra_args=extra,cacheable=True)
 
 @router.get("/treehist",response_model=CommandResult,tags=["lecture"],summary="Pour chaque objet sous un préfixe : archives où il a changé")
@@ -1042,8 +1264,10 @@ def treehist(nick: str, request: Request, prefix: Optional[str]=None, archive_fr
              json_output: bool=Query(default=False,alias="json"), x_api_key: Optional[str]=Header(default=None)):
     """Réponse filtrée par périmètre, par nick, sur `full_path`, si au moins un nick de `nick` a un
     périmètre restreint pour l'appelant (force JSON même sans `?json=true`) ; identique à avant
-    Story 1.3 sinon."""
+    Story 1.3 sinon. Story 1.5 : synthétisée depuis le cache SQLite par périmètre si tous les nicks
+    de la requête ont une ligne fraîche, sinon appel combiné comme aujourd'hui puis rafraîchissement."""
     require_api_key(x_api_key)
+    fingerprints=_capture_fingerprints(nick)
     extra=[]
     if prefix: extra+=['-f',prefix]
     if archive_from: extra+=['-b',archive_from]
@@ -1051,7 +1275,9 @@ def treehist(nick: str, request: Request, prefix: Optional[str]=None, archive_fr
     nicks=_nick_list(nick)
     scopes=_resolve_scopes_for_request(request,nicks)
     if _any_scoped(scopes):
-        return _run_scoped('treehist',nick,extra,lambda data:_filter_per_nick_listkey(data,scopes,'entries'))
+        params={'prefix':prefix,'archive_from':archive_from,'archive_to':archive_to}
+        return _scoped_cached_multi('treehist',nick,nicks,scopes,fingerprints,params,
+            lambda:_run_scoped('treehist',nick,extra,lambda data:_filter_per_nick_listkey(data,scopes,'entries')))
     if json_output: extra.append('-j')
     return run_borghelper('treehist',nick=nick,extra_args=extra,cacheable=True)
 
@@ -1060,15 +1286,19 @@ def treefind(nick: str, request: Request, prefix: Optional[str]=None, pattern: O
              json_output: bool=Query(default=False,alias="json"), x_api_key: Optional[str]=Header(default=None)):
     """Réponse filtrée par périmètre, par nick, sur `full_path`, si au moins un nick de `nick` a un
     périmètre restreint pour l'appelant (force JSON même sans `?json=true`) ; identique à avant
-    Story 1.3 sinon."""
+    Story 1.3 sinon. Story 1.5 : synthétisée depuis le cache SQLite par périmètre si tous les nicks
+    de la requête ont une ligne fraîche, sinon appel combiné comme aujourd'hui puis rafraîchissement."""
     require_api_key(x_api_key)
+    fingerprints=_capture_fingerprints(nick)
     extra=[]
     if prefix: extra+=['-f',prefix]
     if pattern: extra+=['-m',pattern]
     nicks=_nick_list(nick)
     scopes=_resolve_scopes_for_request(request,nicks)
     if _any_scoped(scopes):
-        return _run_scoped('treefind',nick,extra,lambda data:_filter_per_nick_listkey(data,scopes,'matches'))
+        params={'prefix':prefix,'pattern':pattern}
+        return _scoped_cached_multi('treefind',nick,nicks,scopes,fingerprints,params,
+            lambda:_run_scoped('treefind',nick,extra,lambda data:_filter_per_nick_listkey(data,scopes,'matches')))
     if json_output: extra.append('-j')
     return run_borghelper('treefind',nick=nick,extra_args=extra,cacheable=True)
 
@@ -1077,15 +1307,19 @@ def duidx(nick: str, request: Request, pattern: Optional[str]=None, sort: str="c
           archive_from: Optional[str]=None, archive_to: Optional[str]=None, x_api_key: Optional[str]=Header(default=None)):
     """Réponse filtrée par périmètre (lignes brutes `-R` filtrées puis regroupées/re-triées comme
     DuIdx lui-même) si l'appelant a un périmètre restreint sur `nick` (mono-nick pour le périmètre —
-    Story 1.4, comme LstBkpFls/DiffBkp en Story 1.3) ; identique à avant cette story sinon."""
+    Story 1.4, comme LstBkpFls/DiffBkp en Story 1.3) ; identique à avant cette story sinon. Story
+    1.5 : réponse filtrée servie depuis le cache SQLite par périmètre si fraîche."""
     require_api_key(x_api_key)
+    fingerprints=_capture_fingerprints(nick)
     scoped_nick,scope=_resolve_single_scope(request,nick)
     if scoped_nick is not None:
         extra=[]
         if pattern: extra+=['-f',pattern]
         if archive_from: extra+=['-b',archive_from]
         if archive_to: extra+=['-B',archive_to]
-        return _run_scoped_raw('duidx',scoped_nick,extra,'-R',lambda data:_recompute_duidx(data,scope,pattern or None,sort))
+        params={'pattern':pattern or None,'sort':sort,'archive_from':archive_from,'archive_to':archive_to}
+        return _scoped_cached_mono('duidx',scoped_nick,scope,fingerprints.get(scoped_nick,''),params,
+            lambda:_run_scoped_raw('duidx',scoped_nick,extra,'-R',lambda data:_recompute_duidx(data,scope,pattern or None,sort)))
     extra=[]
     if pattern: extra+=['-f',pattern]
     extra+=['-s',sort]
@@ -1108,11 +1342,15 @@ def cacheclean(nick: str="ALL", x_api_key: Optional[str]=Header(default=None)):
 def idxtop(request: Request, nick: str="ALL", topn: int=20, depth: int=3, x_api_key: Optional[str]=Header(default=None)):
     """Réponse filtrée par périmètre (lignes brutes `-j` filtrées puis regroupées/classées comme
     IdxTop lui-même) si l'appelant a un périmètre restreint sur `nick` (mono-nick pour le périmètre,
-    comme DuIdx — Story 1.4) ; identique à avant cette story sinon."""
+    comme DuIdx — Story 1.4) ; identique à avant cette story sinon. Story 1.5 : réponse filtrée
+    servie depuis le cache SQLite par périmètre si fraîche."""
     require_api_key(x_api_key)
+    fingerprints=_capture_fingerprints(nick)
     scoped_nick,scope=_resolve_single_scope(request,nick)
     if scoped_nick is not None:
-        return _run_scoped_raw('idxtop',scoped_nick,[],'-j',lambda data:_recompute_idxtop(data,scope,depth,topn))
+        params={'topn':topn,'depth':depth}
+        return _scoped_cached_mono('idxtop',scoped_nick,scope,fingerprints.get(scoped_nick,''),params,
+            lambda:_run_scoped_raw('idxtop',scoped_nick,[],'-j',lambda data:_recompute_idxtop(data,scope,depth,topn)))
     return run_borghelper('idxtop',nick=nick,extra_args=['-N',str(topn),'-p',str(depth)],cacheable=True)
 
 @router.get("/difftop",response_model=CommandResult,tags=["lecture"])
@@ -1121,12 +1359,16 @@ def difftop(request: Request, nick: str="ALL", bid: Optional[str]=None, topn: in
     """Réponse filtrée par périmètre (lignes brutes `-j` filtrées puis regroupées/classées comme
     DiffTop lui-même) si l'appelant a un périmètre restreint sur `nick` (mono-nick pour le périmètre,
     comme DuIdx/IdxTop — Story 1.4) ; identique à avant cette story sinon. Une paire d'archives sans
-    la moindre ligne dans le périmètre renvoie un résultat vide (`rows=[]`), jamais une erreur."""
+    la moindre ligne dans le périmètre renvoie un résultat vide (`rows=[]`), jamais une erreur.
+    Story 1.5 : réponse filtrée servie depuis le cache SQLite par périmètre si fraîche."""
     require_api_key(x_api_key)
+    fingerprints=_capture_fingerprints(nick)
     scoped_nick,scope=_resolve_single_scope(request,nick)
     if scoped_nick is not None:
         extra=['-b',bid] if bid else []
-        return _run_scoped_raw('difftop',scoped_nick,extra,'-j',lambda data:_recompute_difftop(data,scope,depth,topn))
+        params={'bid':bid,'topn':topn,'depth':depth}
+        return _scoped_cached_mono('difftop',scoped_nick,scope,fingerprints.get(scoped_nick,''),params,
+            lambda:_run_scoped_raw('difftop',scoped_nick,extra,'-j',lambda data:_recompute_difftop(data,scope,depth,topn)))
     extra=['-N',str(topn),'-p',str(depth)]
     if bid: extra+=['-b',bid]
     return run_borghelper('difftop',nick=nick,extra_args=extra,cacheable=True)
