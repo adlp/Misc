@@ -629,6 +629,7 @@ def _capture_fingerprints(nick):
     convention que `_RESPONSE_CACHE`) + mtime de .borghelperrc (un GROUPS_PATHS resserré/relâché
     doit invalider le cache même s'il ne touche ni cache.db ni diff.db) — une par nick réel, pour
     qu'un backup/index sur un seul nick n'invalide que la ligne de CE nick (I/O matrix)."""
+    if not GROUPS_HEADER: return {}
     try: cfg_mtime=os.path.getmtime(CFGFILE)
     except OSError: cfg_mtime='absent'
     return {n:f"{_cache_fingerprint(n)}|cfgfile:{cfg_mtime}" for n in _nick_list(nick)}
@@ -840,9 +841,16 @@ def _scoped_cached_multi(cmd,nick,nicks,scopes,fingerprints,params,run_fn):
         except ValueError:
             combined=None
         if combined is not None:
-            # Chaque fragment stocke le même stderr d'origine (celui de l'appel combiné au moment
-            # de l'écriture, cf. _scope_cache_put ci-dessous) — un seul suffit, jamais concaténé.
-            stderr=fragments[nicks[0]].get('stderr','') if nicks else ''
+            # Chaque fragment peut avoir été écrit par un appel combiné DIFFÉRENT (nicks distincts
+            # à des moments distincts) — jamais supposer un stderr partagé, concaténer celui de
+            # chaque fragment réellement présent dans ce hit (dédoublonné, ordre stable). En
+            # pratique toujours vide ici (Search/FileHist/TreeHist/TreeFind en mode JSON forcé
+            # n'écrivent jamais sur stderr sur un succès), mais correct même si ça change un jour.
+            seen=[];
+            for n in nicks:
+                s=fragments[n].get('stderr','')
+                if s and s not in seen: seen.append(s)
+            stderr='\n'.join(seen)
             result_dict={'exitcode':0,'stdout':json.dumps(combined,ensure_ascii=False,indent=2),'stderr':stderr}
             return JSONResponse(status_code=200,content=result_dict)
     resp=run_fn()

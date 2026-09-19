@@ -902,10 +902,13 @@ existe quelque part dans l'archive même si l'appelant n'a pas le droit de le vo
 | `GET /download/file` | `200`, corps **vide** (0 octet), `Content-Disposition` présent (nom de fichier dérivé de `path`, inchangé) | identique |
 | `GET /download/tar` | `200`, tar minimal valide **vide** (`Content-Disposition` présent, nom dérivé de `prefix`/`nick`) | identique |
 
-`GET /download/tar` sans `prefix` (export de l'archive entière) est **toujours** traité comme hors
-périmètre pour un appelant restreint, quel que soit le contenu réel de l'archive — un export non
-borné ne peut être « dans le périmètre » d'aucun appelant restreint (`prefix` omis ⇒ chemin racine,
-`''`, comparé au périmètre comme n'importe quel autre chemin). Un appelant **sans aucune
+`GET /download/tar` sans `prefix` (export de l'archive entière) est traité comme hors périmètre pour
+tout appelant dont le périmètre résolu ne couvre pas déjà l'ensemble de l'arborescence (`prefix` omis
+⇒ chemin racine, `''`, comparé au périmètre comme n'importe quel autre chemin) — un export non borné
+ne peut être « dans le périmètre » d'un périmètre qui ne couvre pas tout. Cas particulier : un groupe
+explicitement configuré avec `GROUPS_PATHS = groupe:/` (périmètre racine) obtient légitimement
+l'export complet — `/` absorbe tout par construction (`_canonicalize_scope`, Story 1.1), c'est
+l'équivalent délibéré d'un accès illimité, pas un contournement. Un appelant **sans aucune
 restriction** (admin, groupe absent de `GROUPS_PATHS`, ou autorisation par groupes désactivée) ne
 voit **aucun** changement — export complet toujours disponible, exactement comme avant cette story.
 

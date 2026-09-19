@@ -942,8 +942,10 @@ adversariale** : `GROUPS_PATHS` s'écrit avec un `/` initial (convention Story 1
 `path.startswith(prefix+'/')` échoue toujours (`'lib/modules/x'.startswith('/lib/modules'+'/')` est
 `False`), et **tout** appelant scopé obtient un résultat vide, pour **tout** nick — fail-closed
 (jamais une fuite), mais un vrai bug fonctionnel qui serait passé inaperçu sans un test contre des
-chemins stockés réels. `_path_in_scope` retire le `/` initial de chaque préfixe de `scope` (jamais
-du `path` lui-même, qui suit déjà la convention sans `/`) avant de comparer.
+chemins stockés réels. `_path_in_scope` retire le `/` initial de chaque préfixe de `scope`, **et
+aussi** de `path` lui-même (`path=(path or '').lstrip('/')`) — nécessaire depuis Story 2.1, dont les
+routes (`ftor`/`path`/`prefix`, saisie utilisateur) reçoivent des chemins qui, contrairement aux
+chemins stockés par `borgHelper` des Stories 1.3/1.4, portent bien un `/` initial.
 
 **`_resolve_scopes_for_request(request, nicks)`** : résout `{nick: scope|None}` pour une liste de
 nicks et l'appelant HTTP courant, via `_resolve_path_scope` par nick (jamais une résolution
