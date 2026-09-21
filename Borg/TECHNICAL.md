@@ -653,6 +653,39 @@ Chaque nick est évalué indépendamment — un rapport multi-nick peut mixer de
 
 ---
 
+## Chiffrement des bases — fondations (1.0.100)
+
+Règle : le code métier ne manipule que des chemins logiques, seul le chemin stocké entre en SQL, et le mode d'une base
+(`plain`/`siv1`) est dicté par son `enc_header`, jamais par la config.
+
+**Rien n'est chiffré dans cette version** : toute base reste `plain`, aucun `enc_header` n'est créé en production, et
+`DB_ENCRYPT` (défaut activé) n'a aucun effet à l'exécution tant que `DbEncrypt` n'existe pas. La KEK sera dérivée de
+`BORG_PASSPHRASE` : une fois le chiffrement en place, changer la passphrase borg exigera un `DbRekey`.
+
+- **`_open_db(db_path, nick=None, role='read', passphrase=None, **kw)`** : seul point d'ouverture SQLite
+  (`grep -c 'sqlite3.connect(' borgHelper` = 1). Crée le fichier en `0600` (`os.open`, pas d'`umask`) s'il n'existe
+  pas, renvoie une `BhConnection` (`.codec`, `.mode`, `.role`, `.nick`). Si `nick` est fourni et la base non vide, lit
+  `db_meta.enc_header` : absent → `plain` ; présent → `path_enc` doit être `siv1`/`migrating` (sinon `DbTamperError`),
+  passphrase (argument, sinon config du nick via le lecteur enregistré par `BorgHelperDB` pour son répertoire de cache) → DEK (`DbKeyError` si absente
+  ou fausse), mémorisée par processus/base. `nick=None` : jamais de codec (`scopecache.db`, `_vacuum_db` sans nick).
+  Les créateurs de base (`ensure_*_db`, `ensure_scope_cache_db`) interceptent `sqlite3.OperationalError` et appellent
+  `_db_open_fail` (diagnostic + `sys.exit(1)`, remplace l'ancien `BorgHelperDB._db_connect`, supprimé).
+- **`PathCodec`** : chemin normalisé (sans `/` initial/final, segments non vides, UTF-8 `surrogateescape`), par segment
+  `tag[i]=HMAC-SHA256(k_path, tag[i-1]‖seg[i])[:12]`, stocké `b64(tag ‖ seg ⊕ SHAKE-256(k_enc‖tag))`, segments joints
+  par `/`. b64 sans padding, `+`→`.`, `/`→`-`. Décodage séquentiel strict (tag recalculé, forme canonique, longueur ≢ 1
+  mod 4) → `DbCodecError`. `prefix_bounds(prefix)` → `(enc+'/', enc+'0')`.
+- **`BlobCodec`** : nonce 16 o, keystream `SHAKE-256`, chiffrer puis `HMAC-SHA256` (clés dérivées de `k_blob`).
+- **Enveloppe** : DEK 32 o aléatoire, KEK = KDF(passphrase, sel 16 o) ; `DB_KDF` `light` = PBKDF2 100 000,
+  `standard` = scrypt n=2^14, `strong` = scrypt n=2^15 (repli PBKDF2 300 000 / 600 000 sans `hashlib.scrypt`) ;
+  paramètres réels stockés dans l'en-tête. Sous-clés `k_path`, `k_enc`, `k_blob`, `k_hdr` = `HMAC(DEK, étiquette)`.
+- **`enc_header`** : une ligne JSON `db_meta`, `INSERT … ON CONFLICT DO NOTHING` dans `BEGIN IMMEDIATE` (jamais
+  `INSERT OR REPLACE`). Aucun chemin de production n'en crée encore.
+- **Permissions** : rc `0600` à la création (`cfgwrite`), avertissement unique à la lecture si groupe/autres y ont accès,
+  cache `0700`, `.db` `0600` ; l'existant n'est jamais chmodé.
+- **Config** : `db_encrypt_enabled(nick)` (`DB_ENCRYPT`, défaut vrai) et `db_kdf_level(nick)` (`DB_KDF`).
+
+---
+
 ## Migration de schéma
 
 ### Versionning (`db_meta`)
@@ -666,12 +699,19 @@ Chaque DB (`cache.db`, `diff.db`) contient une table `db_meta (key TEXT PK, valu
 1. Si `schema_version` DB > constante attendue → erreur + exit (DB d'une version future)
 2. Sinon → mise à jour de `borghelper_version` et confirmation de `schema_version`
 
+Depuis 1.0.100 il y a deux notions distinctes : la version **maximale comprise** (constantes `*_SCHEMA_VERSION`,
+refus si la base est plus récente) et la version **de base écrite** dans une base `plain`
+(`*_BASE_SCHEMA_VERSION`, inchangée). `_check_set_meta(conn, max, db_path, base)` refuse `stored > max`, remonte une
+base plus ancienne à `base` et ne réécrit jamais une base `plain` à `max` : un ancien binaire continue de l'ouvrir.
+Seule la future `DbEncrypt` écrira `max`, ce qui exclut les anciens binaires des seules bases chiffrées.
+
 La `schema_version` ne change **pas** à chaque release — seulement lors d'un changement structurel du schéma (ajout/suppression de colonne, nouvelle table, etc.).
 
 | Constante | Valeur actuelle |
 |-----------|-----------------|
-| `DIFF_DB_SCHEMA_VERSION` | `4` |
-| `CACHE_DB_SCHEMA_VERSION` | `1` |
+| `DIFF_DB_SCHEMA_VERSION` (maximale comprise) | `5` (base écrite : `DIFF_DB_BASE_SCHEMA_VERSION` = `4`) |
+| `CACHE_DB_SCHEMA_VERSION` (maximale comprise) | `2` (base écrite : `CACHE_DB_BASE_SCHEMA_VERSION` = `1`) |
+| `SCOPE_CACHE_DB_SCHEMA_VERSION` (borgHelperWWW, maximale comprise) | `2` (base écrite : `SCOPE_CACHE_DB_BASE_SCHEMA_VERSION` = `1`) |
 
 ### Migrations diff.db — table de correspondance version ↔ action
 
@@ -1166,7 +1206,7 @@ de refiltrer à chaque requête scopée identique.
 `<cache_dir>/<db_prefix>-scopecache.db` — sans tiret avant "cache", délibérément : `get_cache_db()`/
 `get_diff_db()` produisent toujours `-{nick}-cache.db`/`-{nick}-diff.db`, donc aucun nick ne peut
 collisionner avec ce nom —, co-localisé avec `cache.db`/`diff.db`). `ensure_scope_cache_db()`
-crée son schéma une fois au démarrage — réutilise `_bh_paths.db._db_connect()`/`_check_set_meta()`
+crée son schéma une fois au démarrage — réutilise `_open_db()`/`_bh_paths.db._check_set_meta()`
 (l'instance `BorgHelperDB` déjà utilisée pour `cache.db`/`diff.db`), donc même convention
 `db_meta`/`schema_version` (`SCOPE_CACHE_DB_SCHEMA_VERSION`) et même échec bruyant (`SchemaVersionError`
 propagée non catchée, `sqlite3.DatabaseError` → `sys.exit`) que les deux autres bases.

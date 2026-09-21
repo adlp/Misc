@@ -39,6 +39,22 @@ except SchemaVersionError as e:
     print(f"[WARN] DB incompatible, indexation ignorée : {e}")
 ```
 
+### Exceptions du chiffrement de base
+
+`DbKeyError` (passphrase absente ou fausse pour une base chiffrée), `DbModeError` (mode de la base changé depuis
+l'ouverture), `DbTamperError` (en-tête incohérent, ex. `enc_header` avec `path_enc='plain'`), `DbCodecError` (chemin ou
+blob stocké non canonique, tag/MAC invalide). Elles **n'héritent pas de `sqlite3.Error`** : un `except sqlite3.Error`
+ne les avale jamais. Aucune n'est levée par une base `plain` aujourd'hui : rien n'est encore chiffré (`DB_ENCRYPT` sans effet avant `DbEncrypt`). La clé de chiffrement sera dérivée de `BORG_PASSPHRASE` : changer la passphrase borg exigera un `DbRekey`. `DbModeError` n'a pas encore de point de levée.
+
+```python
+from borgHelper import _open_db, DbKeyError
+conn = _open_db(db_path, nick='mon-serveur', role='read')   # BhConnection ; .codec est None si la base est plain
+```
+
+`_open_db(db_path, nick=None, role='read', passphrase=None, **kw)` est le seul point d'ouverture SQLite (les `kw`,
+ex. `timeout=60`, sont transmis à `sqlite3`). `db_encrypt_enabled(nick)` / `db_kdf_level(nick)` lisent `DB_ENCRYPT` /
+`DB_KDF`.
+
 ---
 
 ## Les trois classes

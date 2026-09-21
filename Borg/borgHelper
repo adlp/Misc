@@ -7,11 +7,19 @@
 #*/
 
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
+import hmac,hashlib,secrets,base64,stat
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.99"
-DIFF_DB_SCHEMA_VERSION  = 4
-CACHE_DB_SCHEMA_VERSION = 1
+Version="1.0.100"
+# Versions de schéma — deux notions distinctes (AD-10) :
+#   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
+#   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
+#                           continue de l'ouvrir). Seule la future DbEncrypt écrira la maximale,
+#                           ce qui exclut les anciens binaires des SEULES bases chiffrées.
+DIFF_DB_SCHEMA_VERSION  = 5
+CACHE_DB_SCHEMA_VERSION = 2
+DIFF_DB_BASE_SCHEMA_VERSION  = 4
+CACHE_DB_BASE_SCHEMA_VERSION = 1
 # Historique diff.db — chaque palier correspond à une migration idempotente et auto-détectée
 # (par introspection PRAGMA table_info, pas seulement par comparaison de schema_version — donc
 # rejouable sans risque même après une migration partielle) appliquée par ensure_diff_db() :
@@ -27,6 +35,11 @@ CACHE_DB_SCHEMA_VERSION = 1
 # depuis Bkp, Index, Prune (voir prune()) et tous les autres consommateurs de diff.db/cache.db.
 
 class SchemaVersionError(Exception): pass
+# Erreurs du chiffrement de base : n'héritent PAS de sqlite3.Error (jamais avalées par un `except sqlite3.Error`).
+class DbKeyError(Exception): pass      # passphrase absente/fausse, enveloppe indéchiffrable
+class DbModeError(Exception): pass     # mode de la base changé (migration) depuis l'ouverture
+class DbTamperError(Exception): pass   # en-tête incohérent (ex. enc_header avec path_enc='plain')
+class DbCodecError(Exception): pass    # chemin/blob stocké non canonique, tag ou MAC invalide
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 _BKP_STATUS_MAP={'A':'added','M':'modified','C':'C','B':'B','T':'T','d':'removed'}
@@ -392,6 +405,8 @@ def usage(doc=None,debug=0):
         printer("       Affiche le contenu du cache SQLite")
         printer("   -c CacheClean [-n nickname/servername/ALL]")
         printer("       Supprime les entrées périmées du cache")
+        printer("   -c CodecSelfTest")
+        printer("       Auto-test du codec de chiffrement (bases temporaires, aucune vraie base touchée) ; code de sortie non nul si un contrôle échoue")
         printer("⚗️  -c IdxTop [-n nick/ALL] [-N top] [-p profondeur] [-j]")
         printer("       Top N arborescences par entrées dans diff_index — diagnostiquer un diff.db volumineux")
         printer("       -N n : top N (défaut 20)  |  -p d : profondeur répertoire (défaut 3)  |  -j : brut par-chemin (ignore -N/-p)")
@@ -502,6 +517,10 @@ def usage(doc=None,debug=0):
     elif doc=='cacheinfo':
         printer("   -c CacheInfo [-n nickname/servername/ALL]")
         printer("       Affiche le contenu du cache SQLite")
+    elif doc=='codecselftest':
+        printer("   -c CodecSelfTest")
+        printer("       Vérifie codec de chemins/blobs, enveloppe de clés, en-tête, versions de schéma, DB_ENCRYPT/DB_KDF")
+        printer("       et permissions, sur des bases temporaires. OK/FAIL par contrôle ; code de sortie non nul au moindre échec.")
     elif doc=='cacheclean':
         printer("   -c CacheClean [-n nickname/servername/ALL]")
         printer("       Supprime les entrées périmées du cache")
@@ -525,6 +544,319 @@ def usage(doc=None,debug=0):
         printer(f"  Desole pas de documentation pour la commande {doc}")
     sys.exit(1)
 
+# ── DB encryption foundations (chiffrement des chemins — story 1) ─────────────
+# Codec (PathCodec/BlobCodec), enveloppe DEK/KEK, enc_header, _open_db (point d'ouverture
+# UNIQUE de toute base SQLite : aucun autre appel de connexion brute dans ce fichier).
+# Cette livraison ne chiffre AUCUNE donnée existante : toutes les bases restent 'plain'.
+# Règle : le chemin logique reste en Python, seul le chemin stocké entre en SQL ; le mode (plain/siv1) est dicté par l'en-tête de la base.
+
+_B64_ALPHABET=frozenset('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-')
+_PATH_TAG_LEN=12
+_KDF_LEVELS=('light','standard','strong')
+_PATH_ENC_MODES=('siv1','migrating')
+
+def _b64e(b):
+    """base64 standard sans padding, '+'->'.' et '/'->'-' (alphabet A-Za-z0-9.-)."""
+    return base64.b64encode(bytes(b)).decode('ascii').rstrip('=').replace('+','.').replace('/','-')
+
+def _b64d(s):
+    """Décodage strict : alphabet exact, longueur != 1 mod 4, forme canonique (bits de bourrage nuls)."""
+    if not isinstance(s,str) or any(c not in _B64_ALPHABET for c in s):
+        raise DbCodecError("caractère hors alphabet")
+    if len(s)%4==1:
+        raise DbCodecError("longueur invalide")
+    try:
+        raw=base64.b64decode(s.replace('.','+').replace('-','/')+'='*(-len(s)%4),validate=True)
+    except ValueError:
+        raise DbCodecError("base64 invalide")
+    if _b64e(raw)!=s:
+        raise DbCodecError("encodage non canonique")
+    return raw
+
+def _xor(a,b): return bytes(x^y for x,y in zip(a,b))
+def _hmac(key,*parts): return hmac.new(key,b''.join(parts),hashlib.sha256).digest()
+def _lp(b): return len(b).to_bytes(4,'big')+b
+def _pw_bytes(pw):
+    """Passphrase str (surrogateescape) ou bytes -> bytes ; ValueError sinon."""
+    if isinstance(pw,str): return pw.encode('utf-8','surrogateescape')
+    if isinstance(pw,(bytes,bytearray)): return bytes(pw)
+    raise ValueError("passphrase : str ou bytes attendu")
+
+def _subkeys(dek):
+    """Sous-clés à étiquettes distinctes dérivées de la DEK."""
+    return {n:_hmac(dek,b'borghelper/db/'+n.encode()) for n in ('k_path','k_enc','k_blob','k_hdr')}
+
+class PathCodec:
+    """Chemin logique <-> chemin stocké (SIV déterministe chaîné, AD-3). Sans état, thread-safe."""
+    def __init__(self,k_path,k_enc):
+        self._kp=bytes(k_path); self._ke=bytes(k_enc)
+
+    @staticmethod
+    def _segments(path):
+        if isinstance(path,str): path=path.encode('utf-8','surrogateescape')
+        return [s for s in path.split(b'/') if s]
+
+    def _ks(self,tag,n): return hashlib.shake_256(self._ke+tag).digest(n)
+
+    def encode(self,path):
+        prev=b'\0'*_PATH_TAG_LEN; out=[]
+        for seg in self._segments(path):
+            tag=_hmac(self._kp,prev,seg)[:_PATH_TAG_LEN]
+            out.append(_b64e(tag+_xor(seg,self._ks(tag,len(seg)))))
+            prev=tag
+        return '/'.join(out)
+
+    def decode(self,stored):
+        if stored=='': return ''
+        prev=b'\0'*_PATH_TAG_LEN; segs=[]
+        for part in stored.split('/'):
+            raw=_b64d(part)
+            if len(raw)<=_PATH_TAG_LEN: raise DbCodecError("segment trop court")
+            tag,ct=raw[:_PATH_TAG_LEN],raw[_PATH_TAG_LEN:]
+            seg=_xor(ct,self._ks(tag,len(ct)))
+            if not hmac.compare_digest(_hmac(self._kp,prev,seg)[:_PATH_TAG_LEN],tag):
+                raise DbCodecError("tag de segment invalide")
+            segs.append(seg); prev=tag
+        return b'/'.join(segs).decode('utf-8','surrogateescape')
+
+    def prefix_bounds(self,prefix):
+        """(bas, haut) tels que enc(x) est sous prefix ssi bas <= enc(x) < haut ('/'+1 = '0')."""
+        e=self.encode(prefix)
+        return (e+'/',e+'0')
+
+class BlobCodec:
+    """Payloads de cache : nonce 16 o aléatoire, keystream SHAKE-256, chiffrer puis HMAC (AD-9)."""
+    def __init__(self,k_blob):
+        self._ke=_hmac(k_blob,b'blob-enc'); self._km=_hmac(k_blob,b'blob-mac')
+
+    def encrypt(self,data):
+        if isinstance(data,str): data=data.encode('utf-8','surrogateescape')
+        nonce=secrets.token_bytes(16)
+        ct=_xor(data,hashlib.shake_256(self._ke+nonce).digest(len(data)))
+        return _b64e(nonce+ct+_hmac(self._km,nonce,ct))
+
+    def decrypt(self,token):
+        raw=_b64d(token)
+        if len(raw)<16+32: raise DbCodecError("blob trop court")
+        nonce,ct,mac=raw[:16],raw[16:-32],raw[-32:]
+        if not hmac.compare_digest(_hmac(self._km,nonce,ct),mac): raise DbCodecError("MAC de blob invalide")
+        return _xor(ct,hashlib.shake_256(self._ke+nonce).digest(len(ct)))
+
+class DbCodec:
+    """Ensemble de codecs d'une base chiffrée (porté par BhConnection.codec ; None si plain)."""
+    def __init__(self,dek):
+        k=_subkeys(dek)
+        self.path=PathCodec(k['k_path'],k['k_enc']); self.blob=BlobCodec(k['k_blob']); self.k_hdr=k['k_hdr']
+
+def _kdf_params(level='standard'):
+    """Paramètres KDF réellement utilisés pour un niveau (repli PBKDF2 sans hashlib.scrypt)."""
+    if level not in _KDF_LEVELS: raise ValueError(f"DB_KDF inconnu : {level!r}")
+    if level=='light': return {'id':'pbkdf2','iter':100000}
+    if hasattr(hashlib,'scrypt'):
+        return {'id':'scrypt','n':2**14 if level=='standard' else 2**15,'r':8,'p':1}
+    return {'id':'pbkdf2','iter':300000 if level=='standard' else 600000}
+
+def _kdf_derive(passphrase,salt,params):
+    pw=_pw_bytes(passphrase)
+    if params.get('id')=='pbkdf2':
+        return hashlib.pbkdf2_hmac('sha256',pw,salt,int(params['iter']),32)
+    if params.get('id')=='scrypt':
+        if not hasattr(hashlib,'scrypt'):
+            raise DbKeyError("KDF scrypt requis par cette base mais indisponible (OpenSSL/hashlib sans scrypt)")
+        n,r,p=int(params['n']),int(params['r']),int(params['p'])
+        return hashlib.scrypt(pw,salt=salt,n=n,r=r,p=p,maxmem=128*n*r*p*2+(1<<20),dklen=32)
+    raise DbTamperError("identifiant KDF inconnu dans l'en-tête")
+
+def _wrap_mac(kek,path_enc,kdf_json,salt,nonce,ct):
+    return _hmac(_hmac(kek,b'wrap-mac'),_lp(path_enc.encode()),_lp(kdf_json.encode()),_lp(salt),_lp(nonce),_lp(ct))
+
+def _kdf_json(params): return json.dumps(params,sort_keys=True,separators=(',',':'))
+
+def _enc_header_build(passphrase,path_enc='siv1',kdf_level='standard',dek=None):
+    """Nouvel en-tête (dict JSON-sérialisable) enveloppant une DEK fraîche (ou fournie). -> (header,dek)."""
+    if path_enc not in _PATH_ENC_MODES: raise ValueError(f"path_enc invalide : {path_enc!r}")
+    if dek is None: dek=secrets.token_bytes(32)
+    elif len(dek)!=32: raise ValueError("DEK : 32 octets attendus")
+    params=_kdf_params(kdf_level); kj=_kdf_json(params)
+    salt=secrets.token_bytes(16); nonce=secrets.token_bytes(16)
+    kek=_kdf_derive(passphrase,salt,params)
+    ct=_xor(dek,hashlib.shake_256(_hmac(kek,b'wrap-enc')+nonce).digest(32))
+    mac=_wrap_mac(kek,path_enc,kj,salt,nonce,ct)
+    return ({'v':1,'path_enc':path_enc,'kdf':params,'salt':_b64e(salt),'nonce':_b64e(nonce),
+             'wrapped_dek':_b64e(ct),'mac':_b64e(mac),'migration_cursor':None},dek)
+
+def _int_in(v,lo,hi):
+    if type(v) is not int or not lo<=v<=hi: raise ValueError("paramètre KDF hors bornes")
+    return v
+
+def _enc_header_parse(value):
+    """Valide la forme d'un en-tête lu en base ; DbTamperError sur toute anomalie (dont plain,
+    version inconnue, paramètres KDF absents/mal typés/hors bornes — évite un déni de service par en-tête forgé)."""
+    try:
+        h=json.loads(value)
+        if not isinstance(h,dict) or type(h.get('v')) is not int or h['v']!=1: raise ValueError
+        for k in ('path_enc','kdf','salt','nonce','wrapped_dek','mac'):
+            if k not in h: raise ValueError
+        kdf=h['kdf']
+        if not isinstance(kdf,dict): raise ValueError
+        if kdf['id']=='pbkdf2':
+            _int_in(kdf['iter'],1,10_000_000)
+        elif kdf['id']=='scrypt':
+            n=_int_in(kdf['n'],2**10,2**20)
+            if n&(n-1): raise ValueError
+            _int_in(kdf['r'],1,32); _int_in(kdf['p'],1,16)
+        else: raise ValueError
+    except (KeyError,ValueError,TypeError):
+        raise DbTamperError("en-tête de chiffrement illisible ou invalide")
+    if h['path_enc'] not in _PATH_ENC_MODES:
+        raise DbTamperError(f"en-tête de chiffrement présent avec path_enc={h['path_enc']!r} (rétrogradation ?)")
+    return h
+
+def _enc_header_unlock(header,passphrase):
+    """DEK déchiffrée, ou DbKeyError (mauvaise passphrase / enveloppe altérée)."""
+    if not passphrase: raise DbKeyError("passphrase absente")
+    try:
+        salt,nonce,ct,mac=(_b64d(header[k]) for k in ('salt','nonce','wrapped_dek','mac'))
+    except DbCodecError as e:
+        raise DbTamperError(f"en-tête de chiffrement corrompu ({e})")
+    kek=_kdf_derive(passphrase,salt,header['kdf'])
+    exp=_wrap_mac(kek,header['path_enc'],_kdf_json(header['kdf']),salt,nonce,ct)
+    if not hmac.compare_digest(exp,mac):
+        raise DbKeyError("passphrase incorrecte ou en-tête altéré")
+    return _xor(ct,hashlib.shake_256(_hmac(kek,b'wrap-enc')+nonce).digest(len(ct)))
+
+def _enc_header_read(conn):
+    """Valeur brute de db_meta.enc_header, ou None (pas de table / pas de ligne / fichier illisible)."""
+    try:
+        row=conn.execute("SELECT value FROM db_meta WHERE key='enc_header'").fetchone()
+    except sqlite3.OperationalError as e:
+        if 'no such table' in str(e): return None
+        raise
+    except sqlite3.DatabaseError:
+        return None  # fichier corrompu : l'appelant le constatera à sa première requête, comme avant
+    return row[0] if row else None
+
+def _enc_header_write(conn,header):
+    """Écrit l'en-tête s'il n'existe pas (BEGIN IMMEDIATE + ON CONFLICT DO NOTHING). True si écrit.
+    Jamais INSERT OR REPLACE : deux créateurs concurrents ne doivent pas écraser la DEK."""
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cur=conn.execute("INSERT INTO db_meta(key,value) VALUES('enc_header',?) ON CONFLICT(key) DO NOTHING",
+                         (json.dumps(header,sort_keys=True),))
+        done=cur.rowcount==1
+        conn.commit()
+    except BaseException:
+        conn.rollback(); raise
+    return done
+
+_DEK_CACHE={}  # dérivation une seule fois par processus et par base : (chemin, mac, condensé passphrase) -> DEK
+_DB_CFG_READERS={}  # realpath(cache_dir) -> callable(nick)->section de config ; enregistré par BorgHelperDB
+
+def _find_cfg_reader(db_path=None):
+    """Lecteur de config du répertoire de cache de db_path ; sans db_path, le seul lecteur enregistré s'il est unique."""
+    if db_path is not None:
+        try: return _DB_CFG_READERS.get(os.path.realpath(os.path.dirname(os.path.abspath(db_path))))
+        except (OSError,ValueError,TypeError): return None
+    return next(iter(_DB_CFG_READERS.values())) if len(_DB_CFG_READERS)==1 else None
+
+def _resolve_passphrase(nick,db_path=None):
+    rd=_find_cfg_reader(db_path)
+    if rd is None or nick is None: return None
+    try: cfg=rd(nick)
+    except (Exception,SystemExit): return None
+    return cfg.get('BORG_PASSPHRASE') if cfg is not None else None
+
+class BhConnection(sqlite3.Connection):
+    """sqlite3.Connection portant .codec (None si plain), .mode, .role et .nick."""
+    codec=None; mode='plain'; role='read'; nick=None
+
+_DB_ROLES=('read','write','admin')
+
+def _db_open_fail(db_path,e):
+    """Diagnostic + sys.exit(1) sur échec d'ouverture ; à appeler par les créateurs de base."""
+    parent=os.path.dirname(os.path.abspath(db_path))
+    if not os.path.exists(parent):
+        printer(f"DB : répertoire introuvable : {parent}")
+    elif not os.access(parent,os.W_OK):
+        printer(f"DB : permission refusée sur le répertoire : {parent}")
+    elif os.path.exists(db_path) and not os.access(db_path,os.R_OK|os.W_OK):
+        printer(f"DB : fichier inaccessible : {db_path}")
+    else:
+        printer(f"DB : impossible d'ouvrir {db_path}")
+        printer(f"  -> {e}")
+    sys.exit(1)
+
+def _open_db(db_path,nick=None,role='read',passphrase=None,**kw):
+    """Point d'ouverture UNIQUE des bases SQLite (AD-1). kw -> sqlite3 (timeout=60, ...).
+    role : read|write|admin (validé et mémorisé, sans effet fonctionnel pour l'instant).
+    nick=None : pas de codec au niveau base (_vacuum_db sans nick, scopecache.db).
+    passphrase : résolue paresseusement (config du nick) et seulement si un enc_header l'exige."""
+    if role not in _DB_ROLES: raise ValueError(f"role invalide : {role!r} (attendu {'|'.join(_DB_ROLES)})")
+    if isinstance(db_path,(str,bytes,os.PathLike)) and str(db_path)!=':memory:':
+        try:
+            fd=os.open(db_path,os.O_RDWR|os.O_CREAT,0o600)  # 0600 à la création, fichier existant intact
+            os.close(fd)
+        except OSError:
+            pass  # sqlite3 rejouera l'erreur avec son propre message (OperationalError)
+    conn=sqlite3.connect(db_path,factory=BhConnection,**kw)
+    conn.role=role; conn.nick=nick
+    try:
+        if nick is not None:
+            raw=_enc_header_read(conn)
+            if raw is not None:
+                header=_enc_header_parse(raw)
+                pw=passphrase if passphrase is not None else _resolve_passphrase(nick,db_path)
+                if not pw: raise DbKeyError(f"{nick}: base chiffrée, passphrase absente")
+                ck=(os.path.realpath(db_path),header['mac'],hashlib.sha256(_pw_bytes(pw)).digest())
+                dek=_DEK_CACHE.get(ck)
+                if dek is None:
+                    dek=_enc_header_unlock(header,pw); _DEK_CACHE[ck]=dek
+                conn.codec=DbCodec(dek); conn.mode=header['path_enc']
+    except BaseException:
+        conn.close(); raise
+    return conn
+
+def _cfg_bool(cfg,key,default):
+    v=cfg.get(key) if cfg is not None else None
+    if v is None: return default
+    s=str(v).strip().lower()
+    if s in ('true','yes','on','1'): return True
+    if s in ('false','no','off','0'): return False
+    printer(f"[ERREUR] {key}={v!r} invalide (attendu true/yes/on/1 ou false/no/off/0)"); sys.exit(2)
+
+def _nick_cfg(nick,cfg):
+    rd=_find_cfg_reader()
+    if cfg is not None or rd is None or nick is None: return cfg
+    try: return rd(nick)
+    except (Exception,SystemExit): return None
+
+def db_encrypt_enabled(nick,cfg=None):
+    """DB_ENCRYPT effectif : valeur du nick, sinon [DEFAULT], sinon True. Sans effet runtime en story 1
+    (consultée à la création de base et par DbEncrypt dans les stories suivantes)."""
+    return _cfg_bool(_nick_cfg(nick,cfg),'DB_ENCRYPT',True)
+
+def db_kdf_level(nick,cfg=None):
+    """DB_KDF effectif (light|standard|strong), défaut standard ; valeur invalide -> arrêt avec message."""
+    cfg=_nick_cfg(nick,cfg)
+    v=cfg.get('DB_KDF') if cfg is not None else None
+    if v is None: return 'standard'
+    s=str(v).strip().lower()
+    if s not in _KDF_LEVELS:
+        printer(f"[ERREUR] DB_KDF={v!r} invalide (attendu {'|'.join(_KDF_LEVELS)})"); sys.exit(2)
+    return s
+
+_RC_PERM_WARNED=False
+def _warn_rc_perms(path):
+    """Avertit une fois (stderr) si le rc est accessible au groupe/autres ; ne change ni stdout ni le code de sortie."""
+    global _RC_PERM_WARNED
+    if _RC_PERM_WARNED: return
+    try: mode=os.stat(path).st_mode
+    except OSError: return
+    if mode&(stat.S_IRWXG|stat.S_IRWXO):
+        _RC_PERM_WARNED=True
+        printer(f"[WARN] {path} est accessible au groupe/autres (mode {stat.S_IMODE(mode):04o}) — il contient des passphrases : chmod 600 conseillé")
+
 # ── BorgHelperDB — all SQLite operations ──────────────────────────────────────
 
 class BorgHelperDB:
@@ -534,6 +866,8 @@ class BorgHelperDB:
         self.cache_dir=cache_dir
         self.db_prefix=db_prefix
         self._cfg_reader=cfg_reader  # callable(nick) -> configparser section | None
+        if cfg_reader is not None:
+            _DB_CFG_READERS[os.path.realpath(cache_dir)]=cfg_reader  # résolution paresseuse de la passphrase par _open_db
 
     def get_db_nick(self,nick):
         if self._cfg_reader:
@@ -626,7 +960,10 @@ class BorgHelperDB:
     def check_index_pending_lock(self,nick):
         return os.path.exists(self._index_pending_lock_path(nick))
 
-    def _check_set_meta(self,conn,schema_version,db_path):
+    def _check_set_meta(self,conn,schema_version,db_path,base_version=None):
+        """schema_version = version maximale comprise ; base_version = version écrite dans une base
+        plain (défaut : schema_version). Une base plain n'est JAMAIS réécrite à la version maximale."""
+        if base_version is None: base_version=schema_version
         row=conn.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()
         stored=int(row[0]) if row else 0
         if stored>schema_version:
@@ -637,32 +974,17 @@ class BorgHelperDB:
         # étant fermée avec checkpoint WAL) que si la valeur stockée diffère réellement — sinon un
         # appel en lecture pure invaliderait à tort toute empreinte de cache basée sur ce mtime
         # (voir borgHelperWWW, nouveau cache SQLite par périmètre).
-        if stored!=schema_version:
-            conn.execute("INSERT OR REPLACE INTO db_meta VALUES('schema_version',?)",(str(schema_version),))
+        if stored<base_version:
+            conn.execute("INSERT OR REPLACE INTO db_meta VALUES('schema_version',?)",(str(base_version),))
         ver_row=conn.execute("SELECT value FROM db_meta WHERE key='borghelper_version'").fetchone()
         stored_ver=ver_row[0] if ver_row else None
         if stored_ver!=Version:
             conn.execute("INSERT OR REPLACE INTO db_meta VALUES('borghelper_version',?)",(Version,))
 
-    def _db_connect(self,db_path):
-        try:
-            return sqlite3.connect(db_path)
-        except sqlite3.OperationalError as e:
-            parent=os.path.dirname(os.path.abspath(db_path))
-            if not os.path.exists(parent):
-                printer(f"DB : répertoire introuvable : {parent}")
-            elif not os.access(parent,os.W_OK):
-                printer(f"DB : permission refusée sur le répertoire : {parent}")
-            elif os.path.exists(db_path) and not os.access(db_path,os.R_OK|os.W_OK):
-                printer(f"DB : fichier inaccessible : {db_path}")
-            else:
-                printer(f"DB : impossible d'ouvrir {db_path}")
-                printer(f"  -> {e}")
-            sys.exit(1)
-
     def ensure_cache_db(self,db_path):
         try:
-            conn=self._db_connect(db_path)
+            try: conn=_open_db(db_path,nick=None,role='admin')
+            except sqlite3.OperationalError as e: _db_open_fail(db_path,e)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS db_meta (
@@ -678,7 +1000,7 @@ class BorgHelperDB:
                 );
                 CREATE INDEX IF NOT EXISTS idx_cache_nom ON cachejsonboexlm(nom);
             """)
-            self._check_set_meta(conn,CACHE_DB_SCHEMA_VERSION,db_path)
+            self._check_set_meta(conn,CACHE_DB_SCHEMA_VERSION,db_path,CACHE_DB_BASE_SCHEMA_VERSION)
             conn.commit(); conn.close()
         except sqlite3.DatabaseError as e:
             printer(f"DB corrompue : {db_path}")
@@ -709,7 +1031,8 @@ class BorgHelperDB:
 
     def ensure_diff_db(self,db_path):
         try:
-            conn=self._db_connect(db_path)
+            try: conn=_open_db(db_path,nick=None,role='admin')
+            except sqlite3.OperationalError as e: _db_open_fail(db_path,e)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
             conn.executescript("""
@@ -837,7 +1160,7 @@ class BorgHelperDB:
                         FROM archive_snapshot s
                         JOIN snapshot_file sf ON sf.id=s.file_id;
                 """)
-            self._check_set_meta(conn,DIFF_DB_SCHEMA_VERSION,db_path)
+            self._check_set_meta(conn,DIFF_DB_SCHEMA_VERSION,db_path,DIFF_DB_BASE_SCHEMA_VERSION)
             conn.commit(); conn.close()
         except sqlite3.DatabaseError as e:
             printer(f"DB corrompue : {db_path}")
@@ -848,7 +1171,7 @@ class BorgHelperDB:
     def purge_stale_cache(self,nick,current_lm,db_path=None):
         if db_path is None: db_path=self.get_cache_db(nick)
         try:
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick.split(':',1)[0],role='write')
             cur=conn.execute("DELETE FROM cachejsonboexlm WHERE nom=? AND lastmodified!=?",(nick,current_lm))
             count=cur.rowcount; conn.commit(); conn.close(); return count
         except sqlite3.Error: return 0
@@ -856,7 +1179,7 @@ class BorgHelperDB:
     def clear_cache_nick(self,nick,db_path=None):
         if db_path is None: db_path=self.get_cache_db(nick)
         try:
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='write')
             cur=conn.execute("DELETE FROM cachejsonboexlm WHERE nom=? OR nom=?",(nick,f"{nick}:prune"))
             count=cur.rowcount; conn.commit(); conn.close(); return count
         except sqlite3.Error: return 0
@@ -864,7 +1187,7 @@ class BorgHelperDB:
     def is_diff_pair_indexed(self,nick,archive_old,archive_new,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
         try:
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='read')
             cur=conn.cursor()
             cur.execute("SELECT 1 FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=? LIMIT 1",(nick,archive_old,archive_new))
             result=cur.fetchone(); conn.close(); return result is not None
@@ -874,7 +1197,7 @@ class BorgHelperDB:
         """True si la paire indexée contient des tailles (borg diff), False si stockée sans tailles (backup list)."""
         if db_path is None: db_path=self.get_diff_db(nick)
         try:
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='read')
             row=conn.execute("SELECT entry_count FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=? LIMIT 1",(nick,archive_old,archive_new)).fetchone()
             if row is None: conn.close(); return False
             if row[0]==0: conn.close(); return True  # aucun changement → pas de taille à vérifier
@@ -900,7 +1223,7 @@ class BorgHelperDB:
     def store_diff_entries(self,nick,archive_old,archive_new,archive_new_date,entries,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
         def _do():
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='write')
             try:
                 if entries:
                     conn.executemany(
@@ -915,7 +1238,7 @@ class BorgHelperDB:
     def store_archive_stats(self,nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
         def _do():
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='write')
             try:
                 conn.execute("INSERT OR REPLACE INTO archive_stats (nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles) VALUES (?,?,?,?,?,?,?,?)",
                              (nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles))
@@ -927,7 +1250,7 @@ class BorgHelperDB:
     def store_repo_stats(self,nick,unique_csize,total_size,total_csize,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
         def _do():
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='write')
             try:
                 conn.execute("INSERT OR REPLACE INTO repo_stats (nick,unique_csize,total_size,total_csize,updated_at) VALUES (?,?,?,?,datetime('now'))",
                              (nick,unique_csize,total_size,total_csize))
@@ -939,7 +1262,7 @@ class BorgHelperDB:
     def get_repo_stats(self,nick,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
         try:
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='read')
             row=conn.execute("SELECT unique_csize,total_size,total_csize FROM repo_stats WHERE nick=?",(nick,)).fetchone()
             conn.close()
             return {'unique_csize':row[0],'total_size':row[1],'total_csize':row[2]} if row else {}
@@ -948,7 +1271,7 @@ class BorgHelperDB:
     def is_archive_snapshot_indexed(self,nick,archive,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
         try:
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='read')
             cur=conn.cursor()
             cur.execute("SELECT 1 FROM archive_snapshot_indexed WHERE nick=? AND archive=? LIMIT 1",(nick,archive))
             result=cur.fetchone(); conn.close(); return result is not None
@@ -957,7 +1280,7 @@ class BorgHelperDB:
     def store_archive_snapshot(self,nick,archive,archive_date,files,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
         def _do():
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='write')
             try:
                 if files:
                     conn.executemany("INSERT OR REPLACE INTO snapshot_file (nick,path,size,mtime,type,mode,owner) VALUES (?,?,?,?,?,?,?)",
@@ -972,7 +1295,7 @@ class BorgHelperDB:
 
     def _diff_keep_purge(self,nick,keep,db_path):
         def _do():
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='write')
             try:
                 rows=conn.execute("SELECT archive_old,archive_new FROM diff_indexed_pairs WHERE nick=? ORDER BY indexed_at DESC",(nick,)).fetchall()
                 to_delete=rows[keep:]
@@ -991,7 +1314,7 @@ class BorgHelperDB:
         if not exclu: return
         if db_path is None: db_path=self.get_diff_db(nick)
         def _do():
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='write')
             try:
                 conn.executemany(
                     "INSERT OR REPLACE INTO diff_excluded_stats "
@@ -1006,7 +1329,7 @@ class BorgHelperDB:
         if count==0: return
         if db_path is None: db_path=self.get_diff_db(nick)
         def _do():
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='write')
             try:
                 conn.execute(
                     "INSERT OR REPLACE INTO snap_excluded_stats (nick,archive,file_count,total_size) VALUES (?,?,?,?)",
@@ -1022,7 +1345,7 @@ class BorgHelperDB:
     def _diff_stats_for_nick(self,nick):
         try:
             db_path=self.get_diff_db(nick)
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='read')
             # Paires indexées (même si entries=0 — tous exclus ou aucun changement)
             indexed=conn.execute("SELECT DISTINCT archive_new FROM diff_indexed_pairs WHERE nick=?",(nick,)).fetchall()
             rows=conn.execute("SELECT archive_new,change_type,COUNT(*),SUM(size_after),SUM(size_before) FROM diff_index WHERE nick=? GROUP BY archive_new,change_type",(nick,)).fetchall()
@@ -1045,7 +1368,7 @@ class BorgHelperDB:
 
     def _is_index_empty(self,nick,db_path):
         try:
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='read')
             n_diff=conn.execute("SELECT COUNT(*) FROM diff_index WHERE nick=?",(nick,)).fetchone()[0]
             n_snap=conn.execute("SELECT COUNT(*) FROM archive_snapshot WHERE nick=?",(nick,)).fetchone()[0]
             conn.close(); return n_diff==0 and n_snap==0
@@ -1075,7 +1398,7 @@ class BorgHelperDB:
             if self._is_index_empty(n,db_path):
                 printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
             try:
-                conn=sqlite3.connect(db_path)
+                conn=_open_db(db_path,nick=n,role='read')
                 af_sql,af_params=self._diff_archive_filter(n,archive_from,conn,archive_to)
                 for ct,path,sz in conn.execute("SELECT change_type,path,CASE WHEN change_type='removed' THEN size_before ELSE size_after END FROM diff_index WHERE nick=? AND path LIKE ?"+af_sql,[n,sql_pat]+af_params):
                     _duidx_add(totals,key_fn(path),ct,sz)
@@ -1096,7 +1419,7 @@ class BorgHelperDB:
             if self._is_index_empty(n,db_path):
                 printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
             try:
-                conn=sqlite3.connect(db_path)
+                conn=_open_db(db_path,nick=n,role='read')
                 af_sql,af_params=self._diff_archive_filter(n,archive_from,conn,archive_to)
                 for ct,cnt,sz in conn.execute("SELECT change_type,COUNT(*),SUM(CASE WHEN change_type='removed' THEN size_before ELSE size_after END) FROM diff_index WHERE nick=? AND path LIKE ? GROUP BY change_type"+af_sql,[n,sql_pat]+af_params):
                     k=('',ct)
@@ -1129,7 +1452,7 @@ class BorgHelperDB:
             if self._is_index_empty(n,db_path):
                 printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
             try:
-                conn=sqlite3.connect(db_path)
+                conn=_open_db(db_path,nick=n,role='read')
                 af_sql,af_params=self._diff_archive_filter(n,archive_from,conn,archive_to)
                 for ct,path,sz in conn.execute("SELECT change_type,path,CASE WHEN change_type='removed' THEN size_before ELSE size_after END FROM diff_index WHERE nick=? AND path LIKE ?"+af_sql,[n,sql_pat]+af_params):
                     rows.append({'chemin':path,'type':ct,'taille':sz or 0})
@@ -1146,7 +1469,7 @@ class BorgHelperDB:
         db_path=self.get_cache_db(nick)
         self.ensure_cache_db(db_path)
         try:
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='read')
             cur=conn.execute("SELECT nom,lastmodified,length(details) FROM cachejsonboexlm WHERE nom=? ORDER BY lastmodified DESC",(nick,))
             rows=cur.fetchall(); conn.close(); return rows
         except sqlite3.Error as e:
@@ -1164,6 +1487,7 @@ class BorgRunner:
 
     def cfgread(self,nick,debug=0):
         if os.path.exists(self.cfgfile) and os.path.isfile(self.cfgfile):
+            _warn_rc_perms(self.cfgfile)
             config=configparser.ConfigParser()
             config.optionxform=str
             config.read(self.cfgfile)
@@ -1176,6 +1500,7 @@ class BorgRunner:
     def cfgreadnicks(self,debug=0):
         preret=[]
         if os.path.exists(self.cfgfile) and os.path.isfile(self.cfgfile):
+            _warn_rc_perms(self.cfgfile)
             config=configparser.ConfigParser()
             config.optionxform=str
             config.read(self.cfgfile)
@@ -1201,7 +1526,8 @@ class BorgRunner:
         config[nick]['SER_NAME']=serna
         config[nick]['GLOB_ARCH']=serna+'-root-*'
         config[nick]['MOUNTPOINT']="/mnt/borg/"+nick if mountpoint is None else mountpoint
-        with open(self.cfgfile,'w') as fd:
+        # 0600 à la création (le rc contient des passphrases) ; un rc existant garde ses droits
+        with os.fdopen(os.open(self.cfgfile,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600),'w') as fd:
             config.write(fd)
 
     def _boex_check_stdout(self,rb,nick,cmd='borg'):
@@ -1315,7 +1641,7 @@ class BorgHelper:
         cp=configparser.ConfigParser()
         if os.path.exists(self.borg.cfgfile): cp.read(self.borg.cfgfile)
         resolved_cache=cache_dir or os.path.expanduser(cp.defaults().get('cache_dir','~/.cache/borghelper'))
-        os.makedirs(resolved_cache,exist_ok=True)
+        os.makedirs(resolved_cache,mode=0o700,exist_ok=True)  # 0700 à la création seulement
         self.db=BorgHelperDB(resolved_cache,_db_name_from_cfg(self.borg.cfgfile),cfg_reader=self.borg.cfgread)
 
     # ── Internal helpers ───────────────────────────────────────────────────────
@@ -1346,7 +1672,7 @@ class BorgHelper:
         nom=f"{nick}:prune"
         self.db.purge_stale_cache(nom,last_modified,db_path)
         try:
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='read')
             row=conn.execute("SELECT details FROM cachejsonboexlm WHERE nom=? AND lastmodified=? LIMIT 1",(nom,last_modified)).fetchone()
             conn.close()
         except sqlite3.Error: row=None
@@ -1368,7 +1694,7 @@ class BorgHelper:
             if 'Would prune:' in line:
                 pruneme.append((re.sub(r'( )*',r'\1',line)).split(' ')[2])
         try:
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='write')
             conn.execute("INSERT OR IGNORE INTO cachejsonboexlm (nom,lastmodified,details) VALUES (?,?,?)",(nom,last_modified,json.dumps(pruneme)))
             conn.commit(); conn.close()
         except sqlite3.Error as e:
@@ -1381,7 +1707,7 @@ class BorgHelper:
         if last_modified is None: last_modified=self.borg._boex_last_modified(nick,debug=debug)
         self.db.purge_stale_cache(nick,last_modified,db_path)
         try:
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='read')
             row=conn.execute("SELECT details FROM cachejsonboexlm WHERE nom=? AND lastmodified=? LIMIT 1",(nick,last_modified)).fetchone()
             conn.close()
         except sqlite3.Error as e:
@@ -1390,7 +1716,7 @@ class BorgHelper:
             if debug: print('Cache miss — appel borg')
             details=self.borg.boex(nick,boexarg,debug=debug)[output][0]
             try:
-                conn=sqlite3.connect(db_path)
+                conn=_open_db(db_path,nick=nick,role='write')
                 conn.execute("INSERT OR IGNORE INTO cachejsonboexlm (nom,lastmodified,details) VALUES (?,?,?)",(nick,last_modified,json.dumps(details)))
                 conn.commit(); conn.close()
             except sqlite3.Error as e:
@@ -1401,16 +1727,18 @@ class BorgHelper:
         if type(details) is list: return details[0]
         return details
 
-    def _vacuum_db(self,db_path,verbose=True):
+    def _vacuum_db(self,db_path,verbose=True,nick=None):
         """VACUUM INTO dans le même répertoire que db_path (évite de saturer /tmp).
         verbose=True : imprime 'compactage en cours/terminé' + hint manuel en cas d'échec.
         Retourne True si succès, False sinon."""
         tmp_path=db_path+'.vacuum_tmp'
         try:
-            conn=sqlite3.connect(db_path,timeout=60)
+            conn=_open_db(db_path,nick=nick,role='write',timeout=60)
             if verbose: printer(f"  compactage en cours...")
             conn.execute(f"VACUUM INTO '{tmp_path}'")
             conn.close()
+            try: os.chmod(tmp_path,stat.S_IMODE(os.stat(db_path).st_mode))  # VACUUM INTO crée avec l'umask : garder les droits d'origine
+            except OSError: pass
             os.replace(tmp_path,db_path)
             if verbose: printer(f"  compactage terminé")
             return True
@@ -1435,7 +1763,7 @@ class BorgHelper:
         except RuntimeError: return
         current=set(a['name'] for a in rb['stdout'][0]['archives'])
         try:
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='write')
             if current:
                 ph=','.join('?'*len(current)); lst=list(current)
                 r1=conn.execute(f"DELETE FROM diff_index WHERE nick=? AND archive_new NOT IN ({ph})",[nick]+lst).rowcount
@@ -1457,7 +1785,7 @@ class BorgHelper:
             conn.commit(); conn.close()
             total=r1+r2+r3+r4
             if total>0: print(f"{nick}: index nettoyé ({r1} diff, {r2} paires, {r3}+{r4} snapshots)")
-            self._vacuum_db(db_path,verbose=False)
+            self._vacuum_db(db_path,verbose=False,nick=nick)
         except sqlite3.Error as e:
             printer(f"SQLite cleanup error ({db_path}): {e}")
             try: conn.close()
@@ -1471,7 +1799,7 @@ class BorgHelper:
         val=sql_pat if has_glob else path
         try:
             self.db.ensure_diff_db(db_path)
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='read')
             row=conn.execute(f"SELECT archive FROM archive_snapshot_v WHERE nick=? AND path {op} ? ORDER BY archive DESC LIMIT 1",(nick,val)).fetchone()
             if row: conn.close(); return row[0]
             row=conn.execute(f"SELECT archive_new FROM diff_index WHERE nick=? AND path {op} ? AND change_type!='removed' ORDER BY archive_new_date DESC LIMIT 1",(nick,val)).fetchone()
@@ -1538,7 +1866,7 @@ class BorgHelper:
     def list_backups(self,nick,debug=0):
         db_path=self.db.get_diff_db(nick)
         self.db.ensure_diff_db(db_path)
-        conn=sqlite3.connect(db_path)
+        conn=_open_db(db_path,nick=nick,role='read')
         rows=conn.execute("SELECT archive,archive_date FROM archive_stats WHERE nick=? ORDER BY archive_date",(nick,)).fetchall()
         conn.close()
         if not rows:
@@ -1550,7 +1878,7 @@ class BorgHelper:
     def list_files(self,nick,bid,debug=0,as_json=False):
         db_path=self.db.get_diff_db(nick)
         self.db.ensure_diff_db(db_path)
-        conn=sqlite3.connect(db_path)
+        conn=_open_db(db_path,nick=nick,role='read')
         if bid is None:
             row=conn.execute("SELECT archive FROM archive_stats WHERE nick=? ORDER BY archive_date DESC LIMIT 1",(nick,)).fetchone()
             if row is None:
@@ -1660,7 +1988,7 @@ class BorgHelper:
             display_entries=all_entries
         else:
             try:
-                conn=sqlite3.connect(db_path)
+                conn=_open_db(db_path,nick=nick,role='read')
                 rows=conn.execute("SELECT change_type,path,size_before,size_after FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=? ORDER BY path,change_type",(nick,bidun,bideux)).fetchall()
                 conn.close()
             except sqlite3.Error as e:
@@ -1948,7 +2276,7 @@ class BorgHelper:
         """Mise à jour incrémentale du snapshot via diff_index.
         Retourne (nfiles, exclu_count, exclu_size, n_added, n_removed, n_modified) ou None (fallback borg list)."""
         try:
-            conn=sqlite3.connect(db_path,timeout=60)
+            conn=_open_db(db_path,nick=nick,role='write',timeout=60)
             row=conn.execute(
                 "SELECT archive FROM archive_snapshot_indexed WHERE nick=? AND archive<? ORDER BY archive DESC LIMIT 1",
                 (nick,archive_name)).fetchone()
@@ -2047,7 +2375,7 @@ class BorgHelper:
             if not force:
                 print(f"{nick}: snapshot {archive_name} déjà indexé"); return 0
             try:
-                conn=sqlite3.connect(db_path)
+                conn=_open_db(db_path,nick=nick,role='write')
                 conn.execute("DELETE FROM archive_snapshot WHERE nick=? AND archive=?",(nick,archive_name))
                 conn.execute("DELETE FROM archive_snapshot_indexed WHERE nick=? AND archive=?",(nick,archive_name))
                 self.db._cleanup_snapshot_file_orphans(nick,conn)
@@ -2063,7 +2391,7 @@ class BorgHelper:
         auto_repair=False
         if not force:
             try:
-                rconn=sqlite3.connect(db_path)
+                rconn=_open_db(db_path,nick=nick,role='read')
                 has_null=rconn.execute("SELECT 1 FROM snapshot_file WHERE nick=? AND (type IS NULL OR mode IS NULL OR owner IS NULL) LIMIT 1",(nick,)).fetchone()
                 rconn.close()
                 if has_null:
@@ -2114,7 +2442,7 @@ class BorgHelper:
             sum(int(cfg.get(k,0)) for k in ['KEEP_DAILY','KEEP_WEEKLY','KEEP_MONTHLY','KEEP_YEARLY','KEEP_HOURLY'])
             or 10))
         try:
-            conn=sqlite3.connect(db_path,timeout=60)
+            conn=_open_db(db_path,nick=nick,role='write',timeout=60)
             snap_del,snap_count=self._snapurge_check(nick,conn,keep_snap)
             if snap_del:
                 self._snapurge_exec(nick,conn,snap_del)
@@ -2158,7 +2486,7 @@ class BorgHelper:
             pairs_todo.append((a_old,a_new,date_new))
         if pairs_to_purge:
             try:
-                conn=sqlite3.connect(db_path)
+                conn=_open_db(db_path,nick=nick,role='write')
                 for a_old,a_new in pairs_to_purge:
                     conn.execute("DELETE FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
                     conn.execute("DELETE FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
@@ -2204,7 +2532,7 @@ class BorgHelper:
             self.db.set_index_running_lock(nick)
             db_conn=None
             try:
-                try: db_conn=sqlite3.connect(db_path)
+                try: db_conn=_open_db(db_path,nick=nick,role='read')
                 except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}")
                 with ThreadPoolExecutor(max_workers=workers) as ex:
                     futs={ex.submit(_run_diff,p):p for p in pairs_todo}
@@ -2291,7 +2619,7 @@ class BorgHelper:
         # archive_stats : seulement si archives manquantes
         archive_names=set(a['name'] for a in archives)
         try:
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='read')
             existing=set(r[0] for r in conn.execute("SELECT archive FROM archive_stats WHERE nick=?",(nick,)).fetchall())
             conn.close()
         except sqlite3.Error: existing=set()
@@ -2326,7 +2654,7 @@ class BorgHelper:
                 else: printer(f"[ERREUR] {msg}")
                 continue
             try:
-                conn=sqlite3.connect(db_path)
+                conn=_open_db(db_path,nick=n,role='read')
                 af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
                 cur=conn.execute("SELECT nick,archive_new_date,archive_new,change_type,path,size_before,size_after FROM diff_index WHERE nick=? AND path LIKE ?"+af_sql+" ORDER BY archive_new_date,path",[n,sql_pat]+af_params)
                 n_rows=cur.fetchall()
@@ -2365,7 +2693,7 @@ class BorgHelper:
                 else: printer(f"[ERREUR] {msg}")
                 continue
             try:
-                conn=sqlite3.connect(db_path)
+                conn=_open_db(db_path,nick=n,role='read')
                 af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
                 cur=conn.execute("SELECT nick,archive_new_date,archive_old,archive_new,change_type,size_before,size_after FROM diff_index WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date",[n,path]+af_params)
                 n_rows=cur.fetchall()
@@ -2531,7 +2859,7 @@ class BorgHelper:
                 else: printer(f"[ERREUR] {msg}")
                 continue
             try:
-                conn=sqlite3.connect(db_path)
+                conn=_open_db(db_path,nick=n,role='read')
                 result=self._treehist_listing(n,prefix,conn,archive_from=archive_from,archive_to=archive_to,debug=debug,as_json=as_json)
                 if as_json: results[n]=result
                 conn.close()
@@ -2619,7 +2947,7 @@ class BorgHelper:
                 else: printer(f"[ERREUR] {msg}")
                 continue
             try:
-                conn=sqlite3.connect(db_path)
+                conn=_open_db(db_path,nick=n,role='read')
                 result=self._treefind_listing(n,prefix,pattern,conn,debug=debug,as_json=as_json)
                 if as_json: results[n]=result
                 conn.close()
@@ -2673,7 +3001,7 @@ class BorgHelper:
             # pour duidx()/_duidx_collect_raw().
             rows=[]
             try:
-                conn=sqlite3.connect(db_path)
+                conn=_open_db(db_path,nick=nick,role='read')
                 cur=conn.execute("SELECT path,COALESCE(size_after,size_before,0) FROM diff_index WHERE nick=?",(nick,))
                 while True:
                     batch=cur.fetchmany(50000)
@@ -2694,7 +3022,7 @@ class BorgHelper:
         stats=defaultdict(lambda:{'count':0,'size':0})
         total_count=0; total_size=0
         try:
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='read')
             cur=conn.execute("SELECT path,COALESCE(size_after,size_before,0) FROM diff_index WHERE nick=?",(nick,))
             while True:
                 rows=cur.fetchmany(50000)
@@ -2709,7 +3037,7 @@ class BorgHelper:
         if not total_count:
             printer(f"  {nick}: diff_index vide"); return
         try:
-            conn2=sqlite3.connect(db_path)
+            conn2=_open_db(db_path,nick=nick,role='read')
             exclu_rows=conn2.execute("SELECT change_type,SUM(file_count),SUM(total_size) FROM diff_excluded_stats WHERE nick=? GROUP BY change_type",(nick,)).fetchall()
             # inchangés par archive : added+modified indexés par archive_new
             idx_am=conn2.execute(
@@ -2772,7 +3100,7 @@ class BorgHelper:
                 printer(f"  {nick}: -b attend 'archive-old,archive-new'"); return
         else:
             try:
-                conn=sqlite3.connect(db_path,timeout=60)
+                conn=_open_db(db_path,nick=nick,role='read',timeout=60)
                 row=conn.execute(
                     "SELECT archive_old,archive_new FROM diff_indexed_pairs WHERE nick=? ORDER BY indexed_at DESC LIMIT 1",
                     (nick,)).fetchone()
@@ -2789,7 +3117,7 @@ class BorgHelper:
             # filtrage par périmètre), même paire d'archives que le mode texte ci-dessous.
             rows=[]
             try:
-                conn=sqlite3.connect(db_path,timeout=60)
+                conn=_open_db(db_path,nick=nick,role='read',timeout=60)
                 cur=conn.execute(
                     "SELECT path,change_type,size_before,size_after FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",
                     (nick,arch_old,arch_new))
@@ -2813,7 +3141,7 @@ class BorgHelper:
         stats=defaultdict(lambda:{'total':0,'added_n':0,'added_s':0,'removed_n':0,'removed_s':0,'modified_n':0,'size':0})
         total_count=0; total_size=0; total_added=0; total_modified=0
         try:
-            conn=sqlite3.connect(db_path,timeout=60)
+            conn=_open_db(db_path,nick=nick,role='read',timeout=60)
             cur=conn.execute(
                 "SELECT path,change_type,size_before,size_after FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",
                 (nick,arch_old,arch_new))
@@ -2836,7 +3164,7 @@ class BorgHelper:
         if not total_count:
             printer(f"  {nick}: aucune entrée pour cette paire ({arch_old} → {arch_new})"); return
         try:
-            conn3=sqlite3.connect(db_path,timeout=60)
+            conn3=_open_db(db_path,nick=nick,role='read',timeout=60)
             exclu_rows3=conn3.execute("SELECT change_type,SUM(file_count),SUM(total_size) FROM diff_excluded_stats WHERE nick=? AND archive_old=? AND archive_new=? GROUP BY change_type",(nick,arch_old,arch_new)).fetchall()
             nfiles_row=conn3.execute("SELECT nfiles FROM archive_stats WHERE nick=? AND archive=?",(nick,arch_new)).fetchone()
             conn3.close()
@@ -2939,7 +3267,7 @@ class BorgHelper:
                 sql_where=f"nick=? AND ({exc_sql})"
                 params=tuple([nick]+exc_args)
         try:
-            conn=sqlite3.connect(db_path,timeout=60)
+            conn=_open_db(db_path,nick=nick,role='write',timeout=60)
             count=0; size=0
             if sql_where:
                 row=conn.execute(
@@ -2974,7 +3302,7 @@ class BorgHelper:
             conn.commit(); conn.close()
             if count: printer(f"  {nick}: {count:,} entrées diff supprimées")
             if snap_del: printer(f"  {nick}: {snap_count:,} entrées snapshot supprimées ({len(snap_del)} archives)")
-            self._vacuum_db(db_path,verbose=True)
+            self._vacuum_db(db_path,verbose=True,nick=nick)
         except sqlite3.Error as e:
             printer(f"  SQLite error ({db_path}): {e}")
             try: conn.close()
@@ -2987,7 +3315,7 @@ class BorgHelper:
             return {nick:{'nom':nick,'_msg':f"diff.db absent — lancez : borgHelper -c Index -n {nick}"}},{}
         self.db.ensure_diff_db(db_path)
         try:
-            conn=sqlite3.connect(db_path)
+            conn=_open_db(db_path,nick=nick,role='read')
             rows=conn.execute("SELECT archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles FROM archive_stats WHERE nick=? ORDER BY archive_date",(nick,)).fetchall()
             conn.close()
         except sqlite3.Error as e:
@@ -3301,6 +3629,215 @@ class BorgHelper:
         return errcode
 
 
+# ── CodecSelfTest — vérifie codec/en-tête/permissions sur des bases TEMPORAIRES ─
+# (aucune vraie base ni vrai rc n'est touché) ; vecteurs à réponse connue fixés ci-dessous.
+
+_ST_PATH_VECTOR='Bzlli9DHwb7cerehZg/QIH8kVKtaTDqGJoDFQ/HBn.TTx6SCURAOpcPg'  # k_path=0x01*32, k_enc=0x02*32, 'a/b/c' (recalculé indépendamment)
+
+def codec_selftest():
+    """Retourne le nombre de contrôles en échec (0 = tout OK). Affiche OK/FAIL par contrôle."""
+    import tempfile,shutil,contextlib,io
+    results=[]
+    def check(name,fn):
+        try: ok=bool(fn()); err=''
+        except Exception as e: ok=False; err=f" ({type(e).__name__}: {e})"
+        print(f"{'OK  ' if ok else 'FAIL'} {name}{err}"); results.append(ok)
+    def skip(name,why): print(f"SKIP {name} ({why})")
+    def raises(exc,fn):
+        try: fn()
+        except exc: return True
+        except BaseException: return False
+        return False
+    tmp=tempfile.mkdtemp(prefix='borghelper-selftest-')
+    # état global restauré à la fin : le self-test ne doit rien laisser derrière lui
+    saved_readers=dict(_DB_CFG_READERS); saved_deks=dict(_DEK_CACHE); saved_scrypt=getattr(hashlib,'scrypt',None)
+    try:
+        # ── primitives : vecteurs officiels ──
+        check("HMAC-SHA256 (RFC 4231 cas 1)",lambda: hmac.new(b'\x0b'*20,b'Hi There',hashlib.sha256).hexdigest()==
+              'b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7')
+        check("PBKDF2-HMAC-SHA256 (RFC 7914 §11)",lambda: hashlib.pbkdf2_hmac('sha256',b'passwd',b'salt',1,64).hex()==
+              '55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783')
+        if hasattr(hashlib,'scrypt'):
+            check("scrypt (RFC 7914 §11)",lambda: hashlib.scrypt(b'',salt=b'',n=16,r=1,p=1,dklen=64).hex()==
+                  '77d6576238657b203b19ca42c18a0497f16b4844e3074ae8dfdffa3fede21442fcd0069ded0948f8326a753a0fc81f17e8d3e0fb2e0d3628cf35e20c38d18906')
+        # ── alphabet / base64 strict ──
+        check("alphabet : +->'.' /->'-' sans padding",lambda: _b64e(bytes([0xfb,0xff,0xbf]))=='.-.-' and _b64e(b'\x00')=='AA')
+        check("_b64d : longueur = 1 mod 4 rejetée",lambda: raises(DbCodecError,lambda:_b64d('AAAAA')))
+        check("_b64d : forme non canonique rejetée",lambda: raises(DbCodecError,lambda:_b64d('AB')))
+        check("_b64d : caractère hors alphabet rejeté",lambda: raises(DbCodecError,lambda:_b64d('AA/A')) and raises(DbCodecError,lambda:_b64d('AA+A')))
+        # ── PathCodec ──
+        pc=PathCodec(b'\x01'*32,b'\x02'*32)
+        check("chemin : vecteur connu (a/b/c)",lambda: pc.encode('a/b/c')==_ST_PATH_VECTOR)
+        check("chemin : aller-retour",lambda: all(pc.decode(pc.encode(p))==q for p,q in
+              (('a/b/c','a/b/c'),('/etc/passwd/','etc/passwd'),('/home/é ü/日本語','home/é ü/日本語'),
+               ('x/'+b'\xff\xfe'.decode('utf-8','surrogateescape'),'x/'+b'\xff\xfe'.decode('utf-8','surrogateescape')),('',''))))
+        check("chemin : même nom sous deux parents -> chiffrés différents",lambda: pc.encode('x/etc').split('/')[1]!=pc.encode('y/etc').split('/')[1])
+        check("chemin : déterministe",lambda: pc.encode('a/b/c')==PathCodec(b'\x01'*32,b'\x02'*32).encode('a/b/c'))
+        check("chemin : clés différentes -> chiffrés différents",lambda: pc.encode('a/b')!=PathCodec(b'\x03'*32,b'\x02'*32).encode('a/b'))
+        enc=pc.encode('alpha/beta/gamma'); segs=enc.split('/')
+        def _flip(seg):
+            c='B' if seg[0]!='B' else 'C'
+            return c+seg[1:]
+        check("chemin : tag altéré -> DbCodecError",lambda: raises(DbCodecError,lambda:pc.decode('/'.join([_flip(segs[0])]+segs[1:]))))
+        check("chemin : segments permutés (autre parent) -> DbCodecError",lambda: raises(DbCodecError,lambda:pc.decode('/'.join([segs[0],segs[2],segs[1]]))))
+        check("chemin : longueur = 1 mod 4 -> DbCodecError",lambda: raises(DbCodecError,lambda:pc.decode(segs[0]+'A')))
+        _A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-'
+        def _noncanon():
+            # 'alpha' -> 17 octets -> 23 caractères : les 2 derniers bits du dernier caractère sont du bourrage nul
+            seg0=segs[0]
+            if len(seg0)%4 not in (2,3): return False  # le cas testé doit exister, sinon échec bruyant
+            bad=seg0[:-1]+_A[_A.index(seg0[-1])^1]
+            return raises(DbCodecError,lambda:pc.decode('/'.join([bad]+segs[1:])))
+        check("chemin : non canonique -> DbCodecError",_noncanon)
+        check("chemin : segment vide -> DbCodecError",lambda: raises(DbCodecError,lambda:pc.decode(segs[0]+'//'+segs[1])))
+        check("chemin : prefix_bounds encadre les descendants",lambda: (lambda lo,hi: lo<=pc.encode('a/b/z')<hi and not (lo<=pc.encode('a/bz')<hi))(*pc.prefix_bounds('a/b')))
+        # ── BlobCodec ──
+        bc=BlobCodec(b'\x04'*32)
+        check("blob : aller-retour + chiffrement aléatoire",lambda: bc.decrypt(bc.encrypt(b'{"x":1}'))==b'{"x":1}' and bc.encrypt(b'a')!=bc.encrypt(b'a'))
+        def _blob_tamper():
+            t=bc.encrypt(b'hello world'); t2=('B' if t[10]!='B' else 'C').join([t[:10],t[11:]])
+            return raises(DbCodecError,lambda:bc.decrypt(t2))
+        check("blob : altération -> DbCodecError",_blob_tamper)
+        # ── KDF / enveloppe / en-tête ──
+        if hasattr(hashlib,'scrypt'):
+            check("DB_KDF : paramètres par niveau",lambda: _kdf_params('light')=={'id':'pbkdf2','iter':100000} and
+                  _kdf_params('standard')['n']==2**14 and _kdf_params('strong')['n']==2**15)
+        else: skip("DB_KDF : paramètres par niveau (scrypt)","hashlib.scrypt indisponible")
+        def _fallback():
+            saved=hashlib.scrypt; del hashlib.scrypt
+            try:
+                p1,p2=_kdf_params('standard'),_kdf_params('strong')
+                h,dek=_enc_header_build('pw','siv1','standard')
+                return (p1=={'id':'pbkdf2','iter':300000} and p2=={'id':'pbkdf2','iter':600000}
+                        and h['kdf']==p1 and _enc_header_unlock(h,'pw')==dek)
+            finally: hashlib.scrypt=saved
+        if hasattr(hashlib,'scrypt'): check("sans hashlib.scrypt : repli PBKDF2 (300000/600000), paramètres stockés",_fallback)
+        else: skip("sans hashlib.scrypt : repli PBKDF2","hashlib.scrypt déjà indisponible")
+        check("DB_KDF inconnu -> ValueError",lambda: raises(ValueError,lambda:_kdf_params('turbo')))
+        hdr,dek=_enc_header_build('secret','siv1','light')
+        check("enveloppe : bonne passphrase -> DEK",lambda: _enc_header_unlock(hdr,'secret')==dek)
+        check("enveloppe : mauvaise passphrase -> DbKeyError",lambda: raises(DbKeyError,lambda:_enc_header_unlock(hdr,'autre')))
+        check("enveloppe : passphrase absente -> DbKeyError",lambda: raises(DbKeyError,lambda:_enc_header_unlock(hdr,None)))
+        def _mac_scope():
+            for k,v in (('path_enc','migrating'),('kdf',dict(hdr['kdf'],iter=hdr['kdf']['iter']+1))):
+                if not raises(DbKeyError,lambda:_enc_header_unlock(dict(hdr,**{k:v}),'secret')): return False
+            return True
+        check("enveloppe : le MAC couvre path_enc et kdf",_mac_scope)
+        check("sous-clés : distinctes",lambda: len(set(_subkeys(dek).values()))==4)
+        # ── base temporaire : en-tête, _open_db ──
+        dbp=os.path.join(tmp,'t.db')
+        def _mk(path):
+            c=_open_db(path,nick=None,role='admin'); c.execute("CREATE TABLE IF NOT EXISTS db_meta(key TEXT PRIMARY KEY,value TEXT)"); c.commit(); return c
+        c=_mk(dbp)
+        check("_open_db : rôle invalide refusé",lambda: raises(ValueError,lambda:_open_db(dbp,role='root')))
+        check("_open_db : base plain -> codec None, mode plain, rôle mémorisé",lambda: (lambda k:(k.codec is None and k.mode=='plain' and k.role=='admin'))(c))
+        check("erreurs Db* : pas des sqlite3.Error",lambda: not any(issubclass(e,sqlite3.Error) for e in (DbKeyError,DbModeError,DbTamperError,DbCodecError)))
+        check("enc_header : première écriture -> True",lambda: _enc_header_write(c,hdr) is True)
+        _raw1=_enc_header_read(c)
+        check("enc_header : 2e écriture (ON CONFLICT DO NOTHING) -> False, en-tête initial intact",
+              lambda: _enc_header_write(c,_enc_header_build('x','siv1','light')[0]) is False and _enc_header_read(c)==_raw1
+                      and json.loads(_raw1)['mac']==hdr['mac'])
+        check("_enc_header_build : DEK de mauvaise longueur -> ValueError",lambda: raises(ValueError,lambda:_enc_header_build('pw','siv1','light',dek=b'')) and raises(ValueError,lambda:_enc_header_build('pw','siv1','light',dek=b'x'*31)))
+        check("passphrase bytes acceptée (clé de cache et KDF)",lambda: _enc_header_unlock(hdr,b'secret')==dek)
+        c.close()
+        c=_open_db(dbp,nick='t',passphrase='secret')
+        check("_open_db : base siv1 + bonne passphrase -> codec",lambda: c.mode=='siv1' and c.codec is not None and c.codec.path.decode(c.codec.path.encode('a/b'))=='a/b')
+        c.close()
+        check("_open_db : mauvaise passphrase -> DbKeyError",lambda: raises(DbKeyError,lambda:_open_db(dbp,nick='t',passphrase='faux')))
+        check("_open_db : passphrase absente -> DbKeyError",lambda: raises(DbKeyError,lambda:_open_db(dbp,nick='t')))
+        c=_open_db(dbp,nick=None); check("_open_db : nick=None -> pas de codec base",lambda: c.codec is None); c.close()
+        dbt=os.path.join(tmp,'tamper.db'); c=_mk(dbt)
+        c.execute("INSERT INTO db_meta VALUES('enc_header',?)",(json.dumps(dict(hdr,path_enc='plain')),)); c.commit(); c.close()
+        check("en-tête rétrogradé (path_enc=plain) -> DbTamperError",lambda: raises(DbTamperError,lambda:_open_db(dbt,nick='t',passphrase='secret')))
+        def _bad_kdf():
+            good=dict(hdr)
+            variants=[dict(good,v=2),{k:v for k,v in good.items() if k!='v'},dict(good,kdf={'id':'pbkdf2'}),dict(good,kdf={'id':'pbkdf2','iter':10**9}),
+                      dict(good,kdf={'id':'pbkdf2','iter':'100000'}),dict(good,kdf={'id':'pbkdf2','iter':True}),dict(good,kdf={'id':'md5','iter':1}),
+                      dict(good,kdf={'id':'scrypt','n':2**30,'r':8,'p':1}),dict(good,kdf={'id':'scrypt','n':3000,'r':8,'p':1}),
+                      dict(good,kdf={'id':'scrypt','n':2**14,'r':10**6,'p':1}),dict(good,kdf={'id':'scrypt','n':2**14,'r':8,'p':10**6}),dict(good,kdf='pbkdf2')]
+            return all(raises(DbTamperError,lambda h=h:_enc_header_parse(json.dumps(h))) for h in variants)
+        check("en-tête : kdf/version invalide ou démesurée -> DbTamperError",_bad_kdf)
+        dbh=os.path.join(tmp,'hugekdf.db'); c=_mk(dbh)
+        c.execute("INSERT INTO db_meta VALUES('enc_header',?)",(json.dumps(dict(hdr,kdf={'id':'scrypt','n':2**30,'r':8,'p':1})),)); c.commit(); c.close()
+        check("_open_db : en-tête à KDF démesuré -> DbTamperError (sans calcul)",lambda: raises(DbTamperError,lambda:_open_db(dbh,nick='t',passphrase='secret')))
+        dbg=os.path.join(tmp,'garbage.db'); c=_mk(dbg)
+        c.execute("INSERT INTO db_meta VALUES('enc_header','pas du json')"); c.commit(); c.close()
+        check("en-tête illisible -> DbTamperError",lambda: raises(DbTamperError,lambda:_open_db(dbg,nick='t',passphrase='secret')))
+        # ── _check_set_meta / versions ──
+        bh=BorgHelperDB(tmp,'st')
+        def _meta(path,stored,maxv,basev):
+            c=_mk(path)
+            if stored is not None: c.execute("INSERT OR REPLACE INTO db_meta VALUES('schema_version',?)",(str(stored),)); c.commit()
+            try: bh._check_set_meta(c,maxv,path,basev); c.commit()
+            finally: pass
+            v=c.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone(); c.close(); return v and int(v[0])
+        check("versions : base <= maximale",lambda: DIFF_DB_BASE_SCHEMA_VERSION<=DIFF_DB_SCHEMA_VERSION and CACHE_DB_BASE_SCHEMA_VERSION<=CACHE_DB_SCHEMA_VERSION)
+        check("schéma : base plain à la version de base -> non modifiée",lambda: _meta(os.path.join(tmp,'m1.db'),4,5,4)==4)
+        check("schéma : base ancienne -> remontée à la version de base (pas la maximale)",lambda: _meta(os.path.join(tmp,'m2.db'),2,5,4)==4)
+        check("schéma : base neuve -> version de base",lambda: _meta(os.path.join(tmp,'m3.db'),None,5,4)==4)
+        check("schéma : version chiffrée (maximale) conservée",lambda: _meta(os.path.join(tmp,'m4.db'),5,5,4)==5)
+        check("schéma : stored > maximale -> SchemaVersionError",lambda: raises(SchemaVersionError,lambda:_meta(os.path.join(tmp,'m5.db'),6,5,4)))
+        # ── config DB_ENCRYPT / DB_KDF ──
+        def _cfgsec(text,nick='n'):
+            cp=configparser.ConfigParser(); cp.optionxform=str; cp.read_string(text); return cp[nick] if nick in cp else None
+        def _enc(text,nick='n'): return db_encrypt_enabled(nick,cfg=_cfgsec(text,nick))
+        check("DB_ENCRYPT : défaut true",lambda: _enc("[n]\nX=1\n") is True and db_encrypt_enabled('n',cfg=None) in (True,))
+        check("DB_ENCRYPT : global false",lambda: _enc("[DEFAULT]\nDB_ENCRYPT=false\n[n]\nX=1\n") is False)
+        check("DB_ENCRYPT : nick true l'emporte sur global false",lambda: _enc("[DEFAULT]\nDB_ENCRYPT=false\n[n]\nDB_ENCRYPT=true\n") is True)
+        check("DB_ENCRYPT : nick false l'emporte sur global true",lambda: _enc("[DEFAULT]\nDB_ENCRYPT=true\n[n]\nDB_ENCRYPT=off\n") is False)
+        check("DB_ENCRYPT : false/no/off/0 acceptés",lambda: all(_enc(f"[n]\nDB_ENCRYPT={v}\n") is False for v in ('false','no','off','0','FALSE')))
+        def _quiet_exit(fn):
+            with contextlib.redirect_stderr(io.StringIO()):
+                return raises(SystemExit,fn)
+        check("DB_ENCRYPT : valeur invalide -> arrêt",lambda: _quiet_exit(lambda:_enc("[n]\nDB_ENCRYPT=peut-etre\n")))
+        check("DB_KDF : défaut standard, niveaux valides",lambda: db_kdf_level('n',cfg=_cfgsec("[n]\nX=1\n"))=='standard' and
+              all(db_kdf_level('n',cfg=_cfgsec(f"[n]\nDB_KDF={v}\n"))==v for v in _KDF_LEVELS))
+        check("DB_KDF : valeur inconnue -> arrêt",lambda: _quiet_exit(lambda:db_kdf_level('n',cfg=_cfgsec("[n]\nDB_KDF=turbo\n"))))
+        # ── résolution de passphrase par répertoire de cache ──
+        def _reg():
+            da=os.path.join(tmp,'ra'); db_=os.path.join(tmp,'rb'); os.makedirs(da); os.makedirs(db_)
+            BorgHelperDB(da,'x',cfg_reader=lambda n:{'BORG_PASSPHRASE':'pa'})
+            BorgHelperDB(db_,'x',cfg_reader=lambda n:(_ for _ in ()).throw(SystemExit(3)))
+            return _resolve_passphrase('n',os.path.join(da,'x.db'))=='pa' and _resolve_passphrase('n',os.path.join(db_,'x.db')) is None \
+                   and _resolve_passphrase('n',os.path.join(tmp,'inconnu','x.db')) is None
+        check("passphrase : lecteur de config par répertoire de cache, SystemExit absorbé",_reg)
+        # ── permissions ──
+        def _mode(p): return stat.S_IMODE(os.stat(p).st_mode)
+        rc=os.path.join(tmp,'rc'); cdir=os.path.join(tmp,'cache')
+        def _perm_new():
+            b=BorgHelper(cfgfile=rc,cache_dir=cdir)
+            b.borg.cfgwrite('n','srv','pw','/repo',None)
+            c=_open_db(os.path.join(cdir,'new.db'),nick=None); c.close()
+            return (_mode(rc),_mode(cdir),_mode(os.path.join(cdir,'new.db')))==(0o600,0o700,0o600)
+        check("permissions : rc 0600, cache 0700, .db 0600 à la création",_perm_new)
+        def _perm_existing():
+            p=os.path.join(tmp,'old.db'); open(p,'w').close(); os.chmod(p,0o644)
+            d=os.path.join(tmp,'olddir'); os.mkdir(d); os.chmod(d,0o755)
+            r=os.path.join(tmp,'oldrc'); open(r,'w').write('[DEFAULT]\n'); os.chmod(r,0o644)
+            c=_open_db(p,nick=None); c.close()
+            BorgHelper(cfgfile=r,cache_dir=d).borg.cfgwrite('n','srv','pw','/repo',None)
+            return (_mode(p),_mode(d),_mode(r))==(0o644,0o755,0o644)
+        check("permissions : fichiers/répertoires existants inchangés",_perm_existing)
+        def _rcwarn():
+            global _RC_PERM_WARNED
+            saved=_RC_PERM_WARNED; _RC_PERM_WARNED=False
+            try:
+                r=os.path.join(tmp,'loose'); open(r,'w').write('[n]\nBORG_REPO=x\n'); os.chmod(r,0o644)
+                err=io.StringIO(); out=io.StringIO()
+                with contextlib.redirect_stderr(err),contextlib.redirect_stdout(out):
+                    rn=BorgRunner(r); rn.cfgread('n'); rn.cfgread('n'); rn.cfgreadnicks()
+                return err.getvalue().count('accessible au groupe/autres')==1 and out.getvalue()==''
+            finally: _RC_PERM_WARNED=saved
+        check("permissions : rc ouvert -> un seul avertissement stderr, stdout intact",_rcwarn)
+    finally:
+        shutil.rmtree(tmp,ignore_errors=True)
+        _DB_CFG_READERS.clear(); _DB_CFG_READERS.update(saved_readers)
+        _DEK_CACHE.clear(); _DEK_CACHE.update(saved_deks)
+        if saved_scrypt is not None: hashlib.scrypt=saved_scrypt
+    fails=results.count(False)
+    print(f"CodecSelfTest : {len(results)-fails}/{len(results)} OK"+(f", {fails} FAIL" if fails else ""))
+    return fails
+
 # ── CLI entry point ────────────────────────────────────────────────────────────
 
 def _cli_main():
@@ -3336,6 +3873,9 @@ def _cli_main():
         elif opt in ('-h','--help'): usage(); sys.exit(1)
         elif opt=='-H': usage(arg.lower()); sys.exit(1)
         elif opt=='-c': cmd=arg.lower()
+
+    if cmd=='codecselftest':  # avant BorgHelper() : ne doit créer ni cache ni lire le vrai rc
+        sys.exit(1 if codec_selftest() else 0)
 
     bh=BorgHelper(cfgfile=cfgfile_arg,passphrase=passphrase_arg)
 

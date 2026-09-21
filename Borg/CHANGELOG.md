@@ -1,5 +1,41 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.100 / borgHelperWWW 1.15.1 — chiffrement des chemins SQLite, story 1 : fondations — 2026-09-21
+
+Première brique du chiffrement des chemins/payloads des bases SQLite (architecture : AD-1 à AD-5, AD-10,
+AD-12, AD-14). **Aucune donnée n'est chiffrée ni migrée** : toutes les bases restent `plain` et se
+comportent exactement comme avant (mêmes sorties, mêmes codes de sortie, mêmes requêtes SQL).
+
+- **Ouverture unique** : `_open_db(db_path, nick=None, role='read', passphrase=None, **kw)` remplace
+  `BorgHelperDB._db_connect` (méthode supprimée, remplacée par la fonction de module `_open_db`) et les 50 appels de connexion SQLite directs de `borgHelper` (plus les 3 de
+  `borgHelperWWW` sur `scopecache.db`). Renvoie une `BhConnection` (sous-classe de `sqlite3.Connection`) portant
+  `.codec` (`None` si `plain`), `.mode`, `.role`, `.nick`. `role` (`read|write|admin`) est validé et mémorisé, sans
+  effet fonctionnel pour l'instant. `_vacuum_db` reçoit désormais le nick.
+- **Codec** (stdlib seule) : `PathCodec` (SIV déterministe chaîné par segment, `HMAC-SHA256` tronqué 12 o +
+  keystream `SHAKE-256`, alphabet `A-Za-z0-9.-`, décodage strict), `BlobCodec` (nonce 16 o, chiffrer puis MAC),
+  enveloppe DEK/KEK (chiffrer puis MAC, le MAC couvre `path_enc`, KDF, sel, nonce et chiffré), `enc_header`
+  (ligne JSON de `db_meta`, `INSERT … ON CONFLICT DO NOTHING` sous `BEGIN IMMEDIATE`). Aucun chemin de production
+  ne crée encore d'`enc_header`.
+- **Erreurs typées** `DbKeyError`, `DbModeError`, `DbTamperError`, `DbCodecError` (n'héritent pas de
+  `sqlite3.Error`). `enc_header` présent avec `path_enc='plain'` → `DbTamperError`.
+- **Versions de schéma** : chaque constante est désormais la version *maximale comprise*
+  (`DIFF_DB_SCHEMA_VERSION` 4→5, `CACHE_DB_SCHEMA_VERSION` 1→2, `SCOPE_CACHE_DB_SCHEMA_VERSION` 1→2) ; la version
+  *écrite* dans une base `plain` reste 4 / 1 / 1 (`*_BASE_SCHEMA_VERSION`). `_check_set_meta` ne réécrit jamais une
+  base `plain` à la version maximale : un ancien binaire continue de l'ouvrir ; seule la future `DbEncrypt` écrira
+  la maximale. Un binaire 1.0.99 refusera donc une future base chiffrée (version maximale) mais continue d'ouvrir les
+  bases `plain`.
+- **Config** : `DB_ENCRYPT` (booléen, défaut activé mais **sans aucun effet tant que `DbEncrypt` n'existe pas** ; la clé sera
+  dérivée de `BORG_PASSPHRASE`, donc changer la passphrase borg exigera un `DbRekey` ; `false`/`no`/`off`/`0` pour désactiver, global `[DEFAULT]`
+  ou par nick) et `DB_KDF` (`light`/`standard`/`strong`, défaut `standard`), lues via `db_encrypt_enabled(nick)` /
+  `db_kdf_level(nick)`. Valeur invalide → arrêt avec message. Sans effet runtime dans cette story.
+- **Permissions** : `~/.borghelperrc` créé en `0600` par `Login` ; avertissement unique sur stderr à la lecture d'un
+  rc accessible au groupe/autres ; répertoire de cache créé en `0700` ; `.db` créées en `0600`. Les fichiers et
+  répertoires existants ne sont pas modifiés.
+- **`CodecSelfTest`** (nouvelle commande) : auto-test du codec, de l'en-tête, des versions de schéma, de la config et
+  des permissions sur des bases temporaires ; `OK`/`FAIL` par contrôle, code de sortie non nul au moindre échec.
+- `borgHelperWWW` : les accès à `scopecache.db` passent par `_open_db`. Un échec d'ouverture dans `_scope_cache_get`
+  / `_scope_cache_put` est désormais traité comme un cache miss (comme documenté) au lieu d'un `sys.exit(1)`.
+
 ## borgHelper 1.0.99 / borgHelperWWW_ui 1.8.0 — fichiers/répertoires effacés visibles dans TreeHist/TreeFind — 2026-09-19
 
 `TreeHist`/`TreeFind` (l'explorateur d'arborescence de `borgHelperWWW_ui.html`) ne listaient que le

@@ -16,12 +16,12 @@ from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
-from borgHelper import Version as BORGHELPER_VERSION, BorgRunner, BorgHelper
+from borgHelper import Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.15.0"
+WWW_VERSION="1.15.1"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -503,7 +503,7 @@ def _cache_fingerprint(nick: Optional[str]) -> str:
 # identique récemment servie. Ce cache dédié stocke le dérivé FILTRÉ (jamais le brut), avec pour
 # clé (nick, commande, paramètres, signature_périmètre) — une ligne par nick réel, jamais une
 # clé combinée pour une requête multi-nick (AD-5). Fichier SQLite séparé, même convention
-# db_meta/schema_version que cache.db/diff.db — réutilise _bh_paths.db._db_connect()/
+# db_meta/schema_version que cache.db/diff.db — réutilise _open_db()/
 # _check_set_meta() plutôt que de dupliquer ce code.
 SCOPE_CACHE_DB=os.environ.get('BORGHELPERWWW_SCOPE_CACHE_DB') or \
     os.path.join(_bh_paths.db.cache_dir,f"{_bh_paths.db.db_prefix}-scopecache.db")
@@ -511,7 +511,10 @@ SCOPE_CACHE_DB=os.environ.get('BORGHELPERWWW_SCOPE_CACHE_DB') or \
     # toujours f"{db_prefix}-{nick}-cache.db"/f"{db_prefix}-{nick}-diff.db" (tiret immédiatement
     # avant "cache"/"diff"), donc aucun nick, quel que soit son nom (y compris "scope"), ne peut
     # jamais produire ce chemin par collision.
-SCOPE_CACHE_DB_SCHEMA_VERSION=1
+# Version MAXIMALE comprise (refus si la base est plus récente) vs version écrite dans la base
+# (inchangée : un ancien binaire continue d'ouvrir ce cache tant qu'il n'est pas chiffré — AD-10).
+SCOPE_CACHE_DB_SCHEMA_VERSION=2
+SCOPE_CACHE_DB_BASE_SCHEMA_VERSION=1
 
 def ensure_scope_cache_db():
     """Créé/valide le schéma de SCOPE_CACHE_DB — même convention que ensure_cache_db()/
@@ -522,7 +525,8 @@ def ensure_scope_cache_db():
     ensuite plus jamais recréé/migré en cours de route par ce process."""
     db=_bh_paths.db
     try:
-        conn=db._db_connect(SCOPE_CACHE_DB)
+        try: conn=_open_db(SCOPE_CACHE_DB,nick=None,role='admin')
+        except sqlite3.OperationalError as e: _db_open_fail(SCOPE_CACHE_DB,e)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS db_meta (
@@ -536,7 +540,7 @@ def ensure_scope_cache_db():
                 written_at  TEXT DEFAULT (datetime('now'))
             );
         """)
-        db._check_set_meta(conn,SCOPE_CACHE_DB_SCHEMA_VERSION,SCOPE_CACHE_DB)
+        db._check_set_meta(conn,SCOPE_CACHE_DB_SCHEMA_VERSION,SCOPE_CACHE_DB,SCOPE_CACHE_DB_BASE_SCHEMA_VERSION)
         conn.commit(); conn.close()
     except sqlite3.DatabaseError as e:
         print(f"DB corrompue : {SCOPE_CACHE_DB}",file=sys.stderr)
@@ -577,7 +581,7 @@ def _scope_cache_get(nick,cmd,params,scope_signature,fingerprint):
     une requête déjà calculable avant cette story ne doit jamais échouer à cause de ce cache."""
     key=_scope_cache_key(nick,cmd,params,scope_signature)
     try:
-        conn=_bh_paths.db._db_connect(SCOPE_CACHE_DB)
+        conn=_open_db(SCOPE_CACHE_DB,nick=None,role='read')
         try:
             row=conn.execute("SELECT fingerprint,result_json FROM scope_cache WHERE cache_key=?",(key,)).fetchone()
         finally:
@@ -601,7 +605,7 @@ def _scope_cache_put(nick,cmd,params,scope_signature,fingerprint,result_dict):
     été calculée et doit être retournée à l'appelant quoi qu'il arrive ici."""
     key=_scope_cache_key(nick,cmd,params,scope_signature)
     try:
-        conn=_bh_paths.db._db_connect(SCOPE_CACHE_DB)
+        conn=_open_db(SCOPE_CACHE_DB,nick=None,role='write')
         try:
             conn.execute("BEGIN IMMEDIATE")
             count=conn.execute("SELECT COUNT(*) FROM scope_cache").fetchone()[0]

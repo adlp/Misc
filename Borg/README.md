@@ -127,6 +127,25 @@ GROUPS_PATHS     = ops-readers:/var/www/client-x
 
 Le nickname (nom de section) sert d'identifiant partout avec `-n`.
 
+**Permissions.** `Login` crée `~/.borghelperrc` en `0600` (il contient des passphrases). Un rc existant n'est
+jamais modifié, mais un avertissement (une fois, sur stderr) est émis à sa lecture si le groupe ou les autres y ont
+accès. Le répertoire de cache est créé en `0700` et les bases `.db` en `0600` ; les fichiers/répertoires existants
+sont laissés tels quels.
+
+**Chiffrement des bases (en préparation).** Deux clés optionnelles, globales (`[DEFAULT]`) ou par nick (la valeur du
+nick l'emporte) :
+
+```ini
+[DEFAULT]
+DB_ENCRYPT = true       # défaut. false/no/off/0 pour désactiver (globalement ou pour un seul nick)
+DB_KDF     = standard   # light | standard (défaut) | strong — coût de dérivation de la clé
+```
+
+**Rien n'est chiffré dans cette version** : ces clés sont seulement lues et validées (valeur invalide → arrêt avec
+message). `DB_ENCRYPT` est activé par défaut mais n'a aucun effet tant que la commande `DbEncrypt` n'existe pas. La clé
+de chiffrement sera dérivée de `BORG_PASSPHRASE` : une fois le chiffrement en place, changer la passphrase borg exigera
+un `DbRekey`. `borgHelper -c CodecSelfTest` vérifie le codec sur des bases temporaires.
+
 Répertoire de cache configurable via la clé `CACHE_DIR` dans la section `[DEFAULT]` — comme toute clef
 INI, `GROUPS_ADMIN`/`GROUPS_WRITE`/`GROUPS_READ` supportent aussi ce repli sur `[DEFAULT]` (politique
 par défaut pour tous les nicks qui ne les surchargent pas individuellement) :
@@ -679,6 +698,17 @@ Inchangés: 96 000 (97%) sur 99 500 fichiers dans archive-new
 Calcul : `nfiles_new − added_total − modified_total` (indexés + exclus). Ligne omise si `archive_stats` ne contient pas `nfiles` pour l'archive cible.
 
 ---
+
+### `CodecSelfTest`
+
+```bash
+borgHelper -c CodecSelfTest
+```
+
+Auto-test du codec de chiffrement des chemins (vecteurs officiels HMAC/PBKDF2/scrypt, aller-retour, rejets
+`DbCodecError`/`DbKeyError`/`DbTamperError`, versions de schéma, `DB_ENCRYPT`/`DB_KDF`, permissions). Travaille
+uniquement sur des bases temporaires : aucune vraie base ni aucun vrai rc n'est lu. Une ligne `OK`/`FAIL` par
+contrôle ; code de sortie non nul au moindre échec.
 
 ### `CacheInfo` / `CacheClean`
 
