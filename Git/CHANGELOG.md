@@ -10,6 +10,10 @@
 
 ## gitconfig
 
+### 1.3.0 — 2026-09-22
+- `[includeIf "gitdir:~/.local/"]` remplace par `[include]` inconditionnel : `~/.local/gitconfig` est maintenant charge quel que soit l'emplacement du repo (pour `[safe]` et autres reglages locaux a la machine). Git ignore silencieusement un include vers un fichier absent.
+- Ajout des alias `whoami` (affiche l'identite git effective du repo courant) et `setid` (fixe interactivement `user.email`/`user.name` dans le `.git/config` local du repo courant, pour basculer pro/perso repo par repo). Git n'a pas de mecanisme natif de detection automatique via un fichier du worktree (seulement `gitdir`/`onbranch`/`remote url`) ; `setid` est le point d'entree explicite pour cet usage.
+
 ### 1.2.0 — 2026-09-22
 - Fix `goto` : guillemets typographiques (“ ”) au lieu de guillemets droits (" ") cassaient completement l'alias (erreur shell). Remplaces par des guillemets droits.
 

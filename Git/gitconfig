@@ -2,9 +2,14 @@
     name = unconfigured
     email = unconfigured
 
-[includeIf "gitdir:~/.local/"]
+# Charge ~/.local/gitconfig s'il existe (safe.directory et autres reglages locaux a la machine).
+# git ignore silencieusement un include vers un fichier absent : rien a faire si le fichier n'existe pas.
+[include]
     path = ~/.local/gitconfig
 # https://stackoverflow.com/questions/4220416/can-i-specify-multiple-users-for-myself-in-gitconfig
+# Pas de detection automatique de repo pro/perso (git ne sait pas conditionner sur un fichier du
+# worktree, seulement sur gitdir/onbranch/remote url) : utiliser l'alias `setid` ci-dessous une
+# fois par repo pour fixer l'identite (name/email) dans le .git/config local de ce repo.
 
 [core]
    pager = less -SR -x4
@@ -116,5 +121,7 @@
 	list-branch = ! git for-each-ref --format=' %(authorname) %09 %(refname)' --sort=authorname
 	todo = ! git grep --extended-regexp -I --line-number --break --heading --color=auto 'TODO|FIXME'
 	todo-list = ! git grep --extended-regexp -I --line-number --count 'TODO|FIXME'
+	whoami = "!f() { echo \"name:  $(git config user.name)\"; echo \"email: $(git config user.email)\"; }; f"
+	setid = "!f() { git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo \"Pas un depot git.\" >&2; exit 1; }; echo -n \"Email pour ce repo: \"; read email; test -z \"$email\" && { echo \"Email vide, abandon.\" >&2; exit 1; }; git config user.email \"$email\"; echo -n \"Nom pour ce repo (vide = garder actuel): \"; read name; test -n \"$name\" && git config user.name \"$name\"; git whoami; }; f"
 [init]
 	defaultBranch = main
