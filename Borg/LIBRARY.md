@@ -47,9 +47,13 @@ lui-même gérer l'absence de table (`sqlite3.OperationalError: no such table`) 
 ### Exceptions du chiffrement de base
 
 `DbKeyError` (passphrase absente ou fausse pour une base chiffrée), `DbModeError` (mode de la base changé depuis
-l'ouverture), `DbTamperError` (en-tête incohérent, ex. `enc_header` avec `path_enc='plain'`), `DbCodecError` (chemin ou
-blob stocké non canonique, tag/MAC invalide). Elles **n'héritent pas de `sqlite3.Error`** : un `except sqlite3.Error`
-ne les avale jamais. Aucune n'est levée par une base `plain` aujourd'hui : rien n'est encore chiffré (`DB_ENCRYPT` sans effet avant `DbEncrypt`). La clé de chiffrement sera dérivée de `BORG_PASSPHRASE` : changer la passphrase borg exigera un `DbRekey`.
+l'ouverture, ou base `migrating` ouverte avec un rôle non-admin depuis 1.0.104), `DbTamperError` (en-tête incohérent,
+ex. `enc_header` avec `path_enc='plain'`), `DbCodecError` (chemin ou blob stocké non canonique, tag/MAC invalide).
+Elles **n'héritent pas de `sqlite3.Error`** : un `except sqlite3.Error` ne les avale jamais. Une base `plain` ne lève
+aucune de ces erreurs (mode toujours valide, AD-2/AD-5). Depuis 1.0.104 (`DbEncrypt`/`DbDecrypt`/`DbRekey`, voir
+plus bas), une base réelle peut effectivement être `siv1` — jusque-là `DB_ENCRYPT` était sans effet à l'exécution.
+La clé de chiffrement est dérivée de `BORG_PASSPHRASE` : `DbRekey` ré-enveloppe la DEK avec une nouvelle KEK (même
+passphrase, nouveau sel/nonce) — ce n'est pas un mécanisme de changement de `BORG_PASSPHRASE` (voir TECHNICAL.md).
 
 `DbModeError` (depuis 1.0.102) : levée par `_write_mode_check(conn)`, appelée en tout premier par les sites qui
 écrivent un chemin (`store_diff_entries`, `store_archive_snapshot`, `_indexsnap_incremental`, le bloc d'écriture
@@ -233,6 +237,23 @@ bh.cache_info()  # tous les nicks
 # Nettoyage cache
 bh.cache_clean('mon-serveur')
 ```
+
+### Chiffrement des bases (depuis 1.0.104)
+
+```python
+bh.db_encrypt('mon-serveur', dryrun=True)             # rapport seul, rien changé
+bh.db_encrypt('mon-serveur', confirm=True)             # exécution réelle -> code 0 si OK, non nul sinon
+bh.db_decrypt('mon-serveur', confirm=True)             # sens inverse
+bh.db_rekey('mon-serveur', confirm=True)                # ré-enveloppe la DEK (refuse sur base plain)
+bh.db_status('mon-serveur')                             # imprime le mode de cache.db/diff.db (stderr)
+```
+
+`db_encrypt`/`db_decrypt`/`db_rekey` retournent un entier (0 = succès, non nul = refus/erreur — voir README pour le
+détail des refus) plutôt que de lever une exception pour les cas attendus (verrou, `DB_ENCRYPT=false`, espace disque,
+base déjà dans le mode cible). Les erreurs de chiffrement (`DbKeyError`, `DbModeError`, `DbTamperError`,
+`DbCodecError`) levées pendant la migration elle-même sont capturées et converties en message + code 2 ; une
+interruption externe (kill, crash du process) laisse la base en `path_enc='migrating'`, reprise automatiquement par
+un nouvel appel de la **même** méthode sur le même nick.
 
 ---
 

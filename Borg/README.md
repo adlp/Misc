@@ -132,8 +132,7 @@ jamais modifié, mais un avertissement (une fois, sur stderr) est émis à sa le
 accès. Le répertoire de cache est créé en `0700` et les bases `.db` en `0600` ; les fichiers/répertoires existants
 sont laissés tels quels.
 
-**Chiffrement des bases (en préparation).** Deux clés optionnelles, globales (`[DEFAULT]`) ou par nick (la valeur du
-nick l'emporte) :
+**Chiffrement des bases.** Deux clés optionnelles, globales (`[DEFAULT]`) ou par nick (la valeur du nick l'emporte) :
 
 ```ini
 [DEFAULT]
@@ -141,10 +140,19 @@ DB_ENCRYPT = true       # défaut. false/no/off/0 pour désactiver (globalement 
 DB_KDF     = standard   # light | standard (défaut) | strong — coût de dérivation de la clé
 ```
 
-**Rien n'est chiffré dans cette version** : ces clés sont seulement lues et validées (valeur invalide → arrêt avec
-message). `DB_ENCRYPT` est activé par défaut mais n'a aucun effet tant que la commande `DbEncrypt` n'existe pas. La clé
-de chiffrement sera dérivée de `BORG_PASSPHRASE` : une fois le chiffrement en place, changer la passphrase borg exigera
-un `DbRekey`. `borgHelper -c CodecSelfTest` vérifie le codec sur des bases temporaires.
+`DB_ENCRYPT=true` (défaut) ne fait rien tout seul : une base créée par `Bkp`/`Index` reste `plain` tant qu'on n'a pas
+lancé `DbEncrypt` dessus (elle n'était pas chiffrée avant, elle ne le devient pas toute seule — pas de migration
+implicite). Si une base reste `plain` alors que `DB_ENCRYPT` est actif et qu'une passphrase est disponible,
+`borgHelper` avertit une fois par base (par invocation, sur stderr) et cite la commande à lancer. `DbEncrypt`/
+`DbDecrypt`/`DbRekey`/`DbStatus` (voir [Commandes](#commandes)) basculent le mode d'une base réelle. La clé de
+chiffrement est dérivée de `BORG_PASSPHRASE`. `DbRekey` ré-enveloppe la DEK existante avec un sel/nonce frais
+(et le `DB_KDF` courant du nick, s'il a changé) — la DEK ne change pas et aucune ligne de donnée n'est touchée ; c'est
+une rotation de l'enveloppe, PAS un mécanisme de changement de `BORG_PASSPHRASE` (celui-ci exigerait de connaître
+simultanément l'ancienne et la nouvelle passphrase — hors périmètre de cette commande). Changer `BORG_PASSPHRASE`
+dans le fichier de conf d'un nick dont la base est déjà chiffrée la rend illisible (`DbKeyError`) : ne le faites pas
+sans avoir d'abord `DbDecrypt`é. `DB_ENCRYPT=false`
+pour un nick fait refuser `DbEncrypt` dessus explicitement (déchiffrer avec `DbDecrypt` reste toujours permis).
+`borgHelper -c CodecSelfTest` vérifie le codec, la migration et ses refus sur des bases temporaires.
 
 Répertoire de cache configurable via la clé `CACHE_DIR` dans la section `[DEFAULT]` — comme toute clef
 INI, `GROUPS_ADMIN`/`GROUPS_WRITE`/`GROUPS_READ` supportent aussi ce repli sur `[DEFAULT]` (politique
@@ -720,6 +728,61 @@ Calcul : `nfiles_new − added_total − modified_total` (indexés + exclus). Li
 
 ---
 
+### `DbEncrypt` / `DbDecrypt`
+
+Chiffre (ou déchiffre) les chemins d'un `diff.db` réel, en place, table par table (`snapshot_file` puis
+`diff_index` — `archive_snapshot` n'a pas de colonne `path` propre, rien à y migrer directement), par lots
+transactionnels reprenables après interruption. `cache.db` est purgé et recréé directement dans le mode
+cible (jamais migré ligne à ligne : c'est un cache, reconstructible par un simple appel borg).
+
+```bash
+borgHelper -c DbEncrypt -n mon-serveur -D    # dry-run : tables/lignes/espace, rien changé
+borgHelper -c DbEncrypt -n mon-serveur -y    # exécution réelle
+borgHelper -c DbDecrypt -n mon-serveur -D    # symétrique
+borgHelper -c DbDecrypt -n mon-serveur -y
+```
+
+| Option | Description |
+|--------|-------------|
+| `-D` | Dry-run — rapporte les tables/lignes/espace estimé, ne change rien |
+| `-y` | Exécute réellement (convention `IdxPurge` : ni `-D` ni `-y` → refus explicite, rien changé) |
+
+`DbEncrypt` refuse (code de sortie non nul, rien changé) si `DB_ENCRYPT=false` pour ce nick, si une opération
+est déjà en cours (`Bkp`/`Restore`/`Report`/`Index`), ou si l'espace disque libre est insuffisant. `DbDecrypt`
+n'a pas ce contrôle `DB_ENCRYPT` : déchiffrer reste toujours permis. Une migration interrompue (crash, kill)
+reprend automatiquement au point où elle s'est arrêtée au prochain lancement de la **même** commande sur le
+même nick — la DEK n'est jamais régénérée, aucune ligne n'est perdue ni dupliquée. Avant le tout dernier
+commit, un échantillon de lignes migrées est relu et son aller-retour vérifié ; le commit final n'a lieu
+qu'après cette validation.
+
+### `DbRekey`
+
+Ré-enveloppe la DEK existante d'un `diff.db` chiffré avec une nouvelle KEK (nouveau sel, nouveau nonce, `DB_KDF`
+courant du nick) — **aucune ligne de donnée n'est touchée** (opération quasi instantanée, même sur une grosse base).
+
+```bash
+borgHelper -c DbRekey -n mon-serveur -y
+```
+
+Refuse (rien changé) si la base n'est pas déjà `siv1` (rien à re-clé). Ce n'est **pas** un mécanisme de
+changement de `BORG_PASSPHRASE` — voir la note sur `DbRekey` plus haut ([Chiffrement des bases](#fichier-de-configuration)).
+**Limitation connue :** `borgHelperWWW` n'a aucun moyen d'être notifié d'un `DbRekey` exécuté en CLI ; son memo
+de codec par nick reste périmé jusqu'à son redémarrage.
+
+### `DbStatus`
+
+```bash
+borgHelper -c DbStatus -n mon-serveur
+borgHelper -c DbStatus -n ALL
+```
+
+Affiche le mode (`plain`/`siv1`/`migrating`) de `cache.db` et de `diff.db` pour chaque nick. Ne lit que
+l'en-tête (`db_meta.enc_header`) : aucune passphrase n'est nécessaire pour simplement connaître le mode d'une
+base chiffrée. Si une base reste `plain` alors que `DB_ENCRYPT` est actif et qu'une passphrase est
+disponible, avertit (comme `_open_db`, une fois par base et par invocation) et cite la commande `DbEncrypt`.
+
+---
+
 ### `CodecSelfTest`
 
 ```bash
@@ -736,6 +799,11 @@ indexé ne crée aucun schéma de base via les commandes de lecture (`ensure_dif
 Vérifie aussi le cache `cachejsonboexlm` (story 4) : `cacheJsonBoexWithLM` sur un nick dont le `cache.db` est chiffré
 — `details` chiffré au repos, hit servi sans second appel borg, ligne altérée traitée comme un cache miss (borg
 rappelé) plutôt que comme une exception.
+Vérifie enfin la migration (story 5) : `DbEncrypt`/`DbDecrypt` aller simple et aller-retour sur une base temporaire
+(chemins et `TreeHist` identiques avant/après), interruption simulée à mi-lots puis reprise (aucune perte ni
+duplication), les trois refus (`DB_ENCRYPT=false`, verrou d'opération en cours, espace disque insuffisant simulé),
+`DbRekey` (DEK inchangée, enveloppe renouvelée) et son refus sur une base `plain`, et l'avertissement AD-6 émis une
+fois par base.
 Travaille uniquement sur des bases temporaires : aucune vraie base ni aucun vrai rc n'est lu. Une ligne `OK`/`FAIL` par
 contrôle ; code de sortie non nul au moindre échec.
 

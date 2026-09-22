@@ -772,8 +772,12 @@ codec est déterministe et partage les mêmes clés au sein d'une base), et le b
 en cours et compare le `path_enc` obtenu à `conn.mode` (mode constaté à l'ouverture, posé une fois par `_open_db`).
 Écart → `DbModeError` (AD-11), avant tout `INSERT`/`UPDATE`/`executemany` de chemin du site. **Pas un verrou** : aucun
 `BEGIN IMMEDIATE` généralisé n'est introduit ici — une garde de cohérence, posée dans la même connexion/transaction
-implicite que l'écriture qui la suit immédiatement. Le compare-and-swap `BEGIN IMMEDIATE` côté migration (`DbEncrypt`,
-Story 5) s'appuiera sur cette barrière sans retoucher ces 4 sites. `DbModeError` n'hérite pas de `sqlite3.Error` (AD-5)
+implicite que l'écriture qui la suit immédiatement. Côté migration (`DbEncrypt`/`DbDecrypt`, Story 5 — voir plus bas) :
+la toute première transition `plain -> migrating` n'a rien à comparer (aucun `enc_header` n'existe encore) et passe
+par `_enc_header_write` (`INSERT ... ON CONFLICT DO NOTHING`, pas un compare-and-swap) ; seules les transitions
+suivantes sur un en-tête déjà présent (`siv1 -> migrating`, avancement du curseur, commit final) utilisent le
+`BEGIN IMMEDIATE` compare-and-swap (`_enc_header_cas`/`_enc_header_cas_delete`) — cette barrière s'appuie dessus sans
+retoucher ces 4 sites. `DbModeError` n'hérite pas de `sqlite3.Error` (AD-5)
 : jamais avalée par un `except sqlite3.Error`, elle remonte jusqu'à ce qu'un appelant l'attrape explicitement.
 `_indexsnap_incremental` l'appelle deux fois : une fois à l'ouverture (avant la première phase d'écriture — clonage du
 snapshot précédent, application des `removed`/`modified`), une seconde fois juste avant la seconde phase (les
@@ -972,6 +976,170 @@ Pour le verrouillage (passphrase absente/incorrecte pour un nick chiffré) : rel
 `BORG_PASSPHRASE` de ce nick est fausse (fichier distinct, le `db_prefix` de `borgHelperWWW` dérive du nom du fichier
 de conf) et vérifier `www._nick_owner_codec('nick') is www._CACHE_LOCKED`, puis que `_scope_cache_put`/`_get`
 deviennent des no-op silencieux (aucune ligne écrite, `_scope_cache_get` retourne toujours `None`).
+
+---
+
+## Migration en place : `DbEncrypt`/`DbDecrypt`/`DbRekey`/`DbStatus` (1.0.104, chiffrement story 5)
+
+Dernière pièce du chiffrement des chemins : les Stories 1-4 posaient tout le mécanisme mais aucune base réelle ne
+pouvait encore passer en chiffré. Cette story ajoute la migration elle-même, en place, sans copie de sauvegarde
+complète (AD-7 — une copie coûterait le double d'espace disque pour une base qui peut atteindre plusieurs Go).
+
+### `path_enc='migrating'` : état partagé par les deux sens, `migrating_dir` pour lever l'ambiguïté
+
+L'en-tête ne porte qu'un seul champ de mode (`path_enc`), et `migrating` est utilisé aussi bien par `DbEncrypt`
+(`plain -> migrating -> siv1`) que par `DbDecrypt` (`siv1 -> migrating -> plain`). Sans information supplémentaire,
+reprendre une migration interrompue avec la mauvaise commande traiterait les lignes déjà migrées comme si elles ne
+l'étaient pas encore (ou l'inverse) — perte ou incohérence silencieuse. Champ ajouté à l'en-tête (extra key JSON,
+**hors du MAC** — `_wrap_mac` ne couvre que `path_enc`/`kdf`/`salt`/`nonce`/`ct`, donc `migrating_dir` n'a aucune
+valeur de sécurité, seulement d'orchestration) : `migrating_dir` ∈ `{'encrypt','decrypt'}`, présent uniquement
+pendant `path_enc='migrating'`, absent avant et après (jamais écrit dans un en-tête `siv1` final, jamais dans un
+en-tête supprimé). `_db_migrate_run` refuse (`DbModeError`) de reprendre une migration dont `migrating_dir` ne
+correspond pas à la commande invoquée.
+
+**Le MAC de l'enveloppe couvre `path_enc`.** Toute transition qui change `path_enc` (`plain->migrating` excepté,
+premier `INSERT`) **reconstruit l'en-tête en entier** via `_enc_header_build(passphrase, nouveau_path_enc, level,
+dek=dek_existante)` — même DEK, nouveau sel/nonce, MAC recalculé pour le nouveau `path_enc`. Un simple
+`dict(header, path_enc=...)` laisserait un MAC calculé pour l'ANCIEN `path_enc` : la vérification `_enc_header_unlock`
+échouerait alors avec `DbKeyError("passphrase incorrecte ou en-tête altéré")` — même passphrase correcte, bug de
+migration précis rencontré et corrigé pendant cette story (voir git blame de `_db_migrate_run`).
+
+### Nouvelles primitives d'en-tête
+
+- **`_enc_header_cas(conn, old_raw, new_header)`** : mise à jour compare-and-swap d'un en-tête **déjà présent**
+  (`UPDATE db_meta SET value=? WHERE key='enc_header' AND value=old_raw`, dans son propre `BEGIN IMMEDIATE`).
+  Distincte de `_enc_header_write` (réservée à la toute première écriture, `INSERT ... ON CONFLICT DO NOTHING`).
+  `old_raw` doit avoir été lu (`_enc_header_read`) dans la même section critique juste avant l'appel. Retourne
+  `True` si mis à jour, `False` si la valeur a changé entre-temps (rien n'est écrit).
+- **`_enc_header_cas_delete(conn, old_raw)`** : suppression compare-and-swap de la ligne `enc_header` — utilisée
+  par le commit final de `DbDecrypt` (retour à une base **vraiment** `plain`, sans ligne `enc_header` du tout ;
+  AD-2 interdit `path_enc='plain'` en base, donc « redevenir plain » veut dire « ne plus avoir d'en-tête »).
+- **`_check_disk_space(db_path, margin=_DB_SPACE_MARGIN)`** (nouveau, aucun précédent) : `True` si
+  `shutil.disk_usage(dirname(db_path)).free >= os.path.getsize(db_path) * margin`. `_DB_SPACE_MARGIN=1.20` (120% de
+  la taille actuelle) : valeur de départ documentée, **non mesurée** sur une base réelle multi-Go (aucune copie
+  complète n'est faite, mais WAL/pages libres temporaires pendant les lots consomment un peu d'espace) — à ajuster
+  si l'usage réel montre une marge trop large ou trop juste. Ne bloque jamais si l'espace ne peut pas être mesuré
+  (`OSError` → `True`, comme `_check_pid_lock` traite une erreur de lecture comme « pas de verrou »).
+
+### Boucle de migration (`_db_migrate_run`)
+
+Ordre figé (AD-7) : `snapshot_file` puis `diff_index` (`_MIGRATE_TABLES`). `archive_snapshot` n'a pas de colonne
+`path` propre (seulement `file_id` vers `snapshot_file`, voir schéma `diff.db`) — rien à y migrer directement ; les
+tables de stats (`archive_stats`, `diff_excluded_stats`, `snap_excluded_stats`, `repo_stats`,
+`diff_indexed_pairs`, `archive_snapshot_indexed`) n'ont aucune colonne `path`.
+
+Connexion **admin nue** (`_open_db(db_path, nick=None, role='admin')`) : le codec est manipulé à la main
+(`DbCodec(dek)` construit une fois, dek unlockée depuis l'en-tête) plutôt que via `conn.codec`, parce qu'une base en
+cours de migration contient un MÉLANGE de lignes déjà migrées et de lignes pas encore migrées — `conn.codec` (qui
+suppose que TOUTES les valeurs stockées suivent le même mode) casserait sur les lignes pas encore migrées. Chaque
+lot : `SELECT id,path FROM <table> WHERE id>? ORDER BY id LIMIT _MIGRATE_BATCH` (2000, `_MIGRATE_BATCH` — valeur de
+départ non mesurée sur base réelle, comme la marge d'espace disque ci-dessus), transformation en Python
+(`codec.path.encode(_norm_lp(orig))` en chiffrement, `codec.path.decode(orig)` en déchiffrement), `UPDATE ... SET
+path=? WHERE id=?` par ligne, puis **dans la même transaction `BEGIN IMMEDIATE`** : vérification que
+`db_meta.enc_header` n'a pas changé depuis la dernière lecture (concurrence inattendue → `DbModeError`) et avancement
+du curseur (`enc_header.migration_cursor={'table':...,'id':dernier_id_du_lot}`). Un lot est atomique : jamais visible
+à moitié, jamais rejoué (le curseur avance avec les données, dans le même commit).
+
+**Reprise.** `_db_migrate_run` relit `migration_cursor` à l'ouverture ; si absent, démarre à `{'table':
+_MIGRATE_TABLES[0], 'id':0}`. La DEK est toujours celle de l'en-tête existant, **jamais régénérée** — une base
+interrompue en `migrating` relancée avec la même commande reprend exactement là où elle s'est arrêtée, sans
+perte (chaque ligne déjà migrée reste lisible avec la DEK courante) ni duplication (le curseur exclut les lignes
+déjà traitées via `id>cursor`).
+
+**Validation avant le commit final.** Pendant la boucle, chaque ligne traitée est candidate à l'échantillonnage
+(`sample`, plafonné à `_MIGRATE_VALIDATE_SAMPLE=50` tuples `(table,id,orig,new)` — les 50 premières rencontrées dans
+CETTE invocation, pas un tirage aléatoire sur toute la base : suffisant pour détecter une régression du codec ou de
+la boucle, pas un audit exhaustif). Une fois les deux tables terminées, chaque ligne échantillonnée est **relue**
+(`SELECT path FROM <table> WHERE id=?`) et son aller-retour vérifié : `codec.path.decode(got)==_norm_lp(orig)` en
+chiffrement, `codec.path.encode(got)==orig` en déchiffrement — une incohérence (valeur relue différente de celle
+écrite, ou aller-retour invalide) lève `DbTamperError` et **annule le commit final** (la base reste `migrating`,
+investigable, reprenable après correction). Le commit final (`path_enc: migrating -> siv1` ou suppression complète
+de l'en-tête pour `-> plain`) n'a lieu **qu'après** cette validation, jamais avant (Design Notes du spec).
+
+### `cache.db` : purge + recréation, pas de migration ligne à ligne
+
+Cohérent avec la Story 4 (le payload de `cachejsonboexlm` est un cache pur, reconstructible par un simple appel
+borg) : `_db_migrate_cache` `DELETE FROM cachejsonboexlm` puis écrit l'en-tête cible directement — `_enc_header_write`
+(première écriture) en chiffrement, `_enc_header_cas_delete` en déchiffrement. Aucune ligne de `cachejsonboexlm`
+n'est jamais migrée individuellement ; sa DEK est indépendante de celle de `diff.db` (chaque base a la sienne, AD-4).
+
+### `DbRekey` : ré-enveloppe seule, jamais un changement de passphrase
+
+`db_rekey` déchiffre la DEK avec la passphrase **courante** de la config, puis rebâtit l'en-tête via
+`_enc_header_build(passphrase, 'siv1', level, dek=dek)` (même DEK, nouveau sel/nonce/MAC). Ce n'est **pas** un
+mécanisme de rotation de `BORG_PASSPHRASE` : les deux opérations (déverrouiller l'ancienne enveloppe, reconstruire
+la nouvelle) utilisent la MÊME passphrase issue de la config — si `BORG_PASSPHRASE` a déjà été changée dans le rc
+avant `DbRekey`, le déverrouillage de l'enveloppe existante échoue (`DbKeyError`), puisque celle-ci a été enveloppée
+avec l'ANCIENNE passphrase. Changer `BORG_PASSPHRASE` sur une base déjà `siv1` n'est pas supporté par cette story :
+il faudrait connaître simultanément l'ancienne et la nouvelle passphrase, hors périmètre (voir aussi Deferred de
+l'ARCHITECTURE-SPINE : rotation complète de la DEK hors périmètre). Après un `DbRekey`, l'entrée mémoïsée
+`(_DEK_CACHE, _CODEC_CACHE)` de CE processus est purgée par prudence (clé `(realpath, ancien mac, sha256(passphrase))`
+— l'ancien MAC ne correspondra plus à rien après le rekey, donc en pratique un processus long-vivant retrouverait
+tout seul la nouvelle DEK à la prochaine ouverture ; la purge explicite est une garde, pas une nécessité stricte).
+
+**Limitation connue, documentée et non comblée (Design Notes du spec) :** `borgHelperWWW` n'a aucun canal pour être
+notifié d'un `DbRekey` exécuté en CLI (le projet est subprocess-per-call, pas de mécanisme inter-process) — son
+`_NICK_CODEC_MEMO` (Story 4) garde l'ancien `DbCodec` mémoïsé jusqu'au redémarrage du process WWW. Comme ce memo est
+clé par `(nick, sha256(passphrase))`, et que `DbRekey` ne change pas la passphrase (seulement le sel/nonce de
+l'enveloppe), le `DbCodec` mémoïsé reste en fait **fonctionnellement correct** (même DEK) — la limitation réelle est
+que `_nick_owner_codec` ne revérifierait pas l'en-tête pour détecter qu'il a changé ; inoffensif pour `DbRekey`
+précisément à cause de cette invariance de la DEK, mais à garder en tête si un futur mécanisme touchait la DEK
+elle-même (rotation complète, hors périmètre ici).
+
+### Barrière AD-11 étendue à l'ouverture
+
+`_open_db` refuse désormais (`DbModeError`) toute ouverture `nick is not None` avec `role != 'admin'` sur une base
+`path_enc='migrating'` : seule la connexion admin nue de `_db_migrate_run`/`_db_migrate_cache` (qui passe `nick=None`
+et échappe donc à cette vérification) peut lire/écrire une base en cours de migration. Un lecteur ou écrivain
+concurrent (y compris une ouverture par `Bkp`/`Index` déjà entamée avant la migration, qui relira son propre
+`conn.mode` via `_write_mode_check` au premier `INSERT`/`UPDATE`, story 3) est refusé net.
+
+### AD-6 : avertissement `plain` activé
+
+`_open_db`, dans la branche `else` (pas d'`enc_header`, base `plain`) : si `db_encrypt_enabled(nick)` et qu'une
+passphrase est résolvable, appelle `_warn_plain_db(nick, db_path)` (précédent : `_warn_rc_perms`, une entrée par
+`(nick, realpath(db_path))` dans `_PLAIN_WARNED` — une fois par base et par nick, pas une fois pour tout le
+processus comme `_warn_rc_perms` qui n'a qu'un seul rc à surveiller). `db_encrypt_enabled`/`_resolve_passphrase`
+peuvent lever `SystemExit` sur une config invalide (`DB_ENCRYPT` mal orthographié) : capturé localement (`except
+SystemExit: pass`) — ce n'est qu'un avertissement, la commande réelle qui suit lèvera la même erreur à son tour.
+`DbStatus` déclenche le même avertissement (même fonction) en lisant l'en-tête directement (`sqlite3.connect`, hors
+`_open_db` — seule exception documentée à AD-1 : aucune ligne de chemin/blob n'est lue, le codec n'entre jamais en
+jeu, donc DbStatus n'a besoin d'aucune passphrase pour simplement annoncer un mode).
+
+### Limitations connues (acceptées, pas de correctif prévu)
+
+- **`DbDecrypt` et `cache.db` absent au moment de l'appel.** `_db_migrate_cache` ne fait rien si `cache.db` n'existe
+  pas encore pour ce nick (rien à purger/recréer). Si `DB_ENCRYPT` reste `true` pour ce nick, le PROCHAIN processus
+  qui crée `cache.db` (AD-12 : `Bkp`/`Index`/`indexsnap`) le crée `siv1` d'emblée (comportement de création normal,
+  indépendant de `DbDecrypt`) — alors que `diff.db` vient d'être repassé `plain`. Incohérence transitoire
+  `diff.db=plain` / `cache.db=siv1` jusqu'à ce que l'opérateur mette `DB_ENCRYPT=false` pour ce nick ou relance
+  `DbEncrypt`. Sans conséquence fonctionnelle (chaque base a sa propre DEK et son propre mode, lu indépendamment par
+  `_open_db`) — juste une divergence de mode à connaître, visible via `DbStatus`.
+- **`_check_disk_space` n'est évalué qu'une fois, avant le début de la boucle de migration**, pas réévalué à chaque
+  lot. Un processus externe qui remplit le disque en cours de migration n'est pas spécifiquement détecté comme tel
+  — l'écriture SQLite échouera alors avec une erreur sqlite3 générique (`disk I/O error`/`database or disk is
+  full`), pas un message dédié « espace disque épuisé en cours de route ». Le mécanisme d'interruption/reprise gère
+  ce cas SANS PERTE de données (la reprise recommence au dernier lot committé, comme n'importe quel crash), mais
+  sans diagnostic ciblé au moment de l'échec.
+
+### Vérification
+
+`CodecSelfTest` (279 contrôles au total) : `_enc_header_cas`/`_enc_header_cas_delete` (succès/échec périmé,
+`sqlite3.OperationalError` convertie en `DbModeError`), `_check_disk_space` (marge simulée), aller simple +
+aller-retour `DbEncrypt`→`DbDecrypt` sur base temporaire (chemins ET `TreeHist` identiques avant/après),
+interruption simulée à mi-lots (`PathCodec.encode` monkeypatchée pour lever après N appels) puis reprise (aucune
+perte ni duplication, validation finale couvrant aussi les lignes migrées AVANT la reprise via l'échantillon
+`legacy`), les trois refus de l'I/O matrix (`DB_ENCRYPT=false`, verrou d'opération simulé, espace disque insuffisant
+simulé), `-D`/`-y` exclusifs, `DbRekey` (DEK inchangée, enveloppe renouvelée, refus sur base `plain`, échec de CAS
+capturé en code 2), `DbStatus` + avertissement AD-6 (une fois par base) + `-n ALL` (CLI, s'étend à tous les nicks
+configurés), le refus `DbModeError` de `_open_db` sur une base `migrating` pour tout rôle non-admin, et
+`_db_migrate_cache` capturée par le même `except` que `_db_migrate_run` (jamais de traceback non attrapée).
+
+Vérification manuelle réelle sur `demo.borghelperrc` (`demo-modules`, ~15 000 fichiers) : `Bkp` (déclenche
+l'avertissement AD-6) → `DbEncrypt -D` (rapport) → `DbEncrypt -y` (~2,4 s) → `TreeHist`/`Search -f '*.ko'` en JSON
+identiques octet pour octet à avant chiffrement → `DbDecrypt -y` → mêmes sorties de nouveau identiques (aller-retour
+complet) → `DbEncrypt -y` puis `DbRekey -y` → `TreeHist` toujours identique → `DB_ENCRYPT=false` sur un nick refuse
+bien `DbEncrypt -y` (code 2, base intacte).
 
 ---
 

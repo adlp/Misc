@@ -7,10 +7,10 @@
 #*/
 
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
-import hmac,hashlib,secrets,base64,stat,functools
+import hmac,hashlib,secrets,base64,stat,functools,shutil
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.103"
+Version="1.0.104"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -409,6 +409,15 @@ def usage(doc=None,debug=0):
         printer("       Sans -x : lit IDX_EXCLUDE/IDX_INCLUDE depuis le borghelperrc")
         printer("       -x '/var/lib/docker' : préfixe explicite  |  -x '*.pyc' : glob")
         printer("       IDX_SNAP_KEEP dans borghelperrc : nb de snapshots à conserver (défaut = somme KEEP_*, sinon 10)")
+        printer("🔒 -c DbEncrypt [-n nick] [-D] [-y]")
+        printer("       Chiffre les chemins de diff.db en place (reprenable) + recrée cache.db chiffré")
+        printer("       -D : dry-run (rapport, rien changé)  |  -y : exécute réellement (sinon refus)")
+        printer("🔓 -c DbDecrypt [-n nick] [-D] [-y]")
+        printer("       Inverse de DbEncrypt — pas de contrôle DB_ENCRYPT (déchiffrer reste toujours permis)")
+        printer("🔑 -c DbRekey [-n nick] [-y]")
+        printer("       Ré-enveloppe la DEK avec une nouvelle KEK (aucune donnée rechiffrée) ; refuse sur base plain")
+        printer("🔍 -c DbStatus [-n nick/ALL]")
+        printer("       Mode (plain/siv1/migrating) de cache.db et diff.db pour chaque nick")
         printer("  Sentry configuration : BORGHELPERC_SENTRY_ID BORGHELPERC_SENTRY_FILE ou /usr/local/etc/borghelper-sentry")
     elif doc=='key':
         printer("   -c Key [-n nickname/servername/ALL]")
@@ -534,6 +543,34 @@ def usage(doc=None,debug=0):
         printer("       -D : dry-run — affiche le volume sans rien supprimer")
         printer("       Snapshots : purge automatique au-delà de IDX_SNAP_KEEP (défaut = somme KEEP_*, sinon 10)")
         printer("       Workflow : IdxTop → modifier IDX_EXCLUDE → IdxPurge (sans -x)")
+    elif doc=='dbencrypt':
+        printer("   -c DbEncrypt [-n nick] [-D] [-y]")
+        printer("       Chiffre les chemins de diff.db (snapshot_file puis diff_index) EN PLACE, par lots")
+        printer("       transactionnels reprenables ; purge + recrée cache.db chiffré (pas de migration")
+        printer("       ligne à ligne pour le cache). Refuse si DB_ENCRYPT=false pour ce nick, si")
+        printer("       Bkp/Restore/Report/Index est en cours, ou si l'espace disque libre est insuffisant.")
+        printer("       -D : dry-run (tables/lignes/espace estimé, rien changé)")
+        printer("       -y : exécution réelle (sans -D ni -y : refus, rien changé)")
+        printer("       Interrompue puis relancée : reprend au curseur enregistré (DEK inchangée)")
+    elif doc=='dbdecrypt':
+        printer("   -c DbDecrypt [-n nick] [-D] [-y]")
+        printer("       Inverse de DbEncrypt (siv1 -> plain), même discipline (verrous, curseur, reprise,")
+        printer("       validation aller-retour avant le dernier commit). Pas de contrôle DB_ENCRYPT :")
+        printer("       déchiffrer reste toujours permis.")
+        printer("       -D : dry-run  |  -y : exécution réelle")
+    elif doc=='dbrekey':
+        printer("   -c DbRekey [-n nick] [-y]")
+        printer("       Ré-enveloppe la DEK existante de diff.db avec une nouvelle KEK (nouveau sel,")
+        printer("       nouveau nonce, DB_KDF courant du nick) — AUCUNE ligne de donnée n'est rechiffrée.")
+        printer("       Refuse si la base n'est pas siv1 (rien à re-clé) ou si une opération est en cours.")
+        printer("       -y : exécution réelle (sinon refus)")
+        printer("       ⚠️  borgHelperWWW n'est notifié d'aucun DbRekey CLI — redémarrer son process pour")
+        printer("       ce nick (son memo de codec reste périmé sinon, voir TECHNICAL.md)")
+    elif doc=='dbstatus':
+        printer("   -c DbStatus [-n nick/ALL]")
+        printer("       Affiche le mode (plain/siv1/migrating) de cache.db et diff.db pour chaque nick")
+        printer("       Avertissement stderr (une fois) si une base reste 'plain' alors que DB_ENCRYPT est")
+        printer("       actif et qu'une passphrase est disponible — cite la commande DbEncrypt à lancer")
     else:
         printer(f"  Desole pas de documentation pour la commande {doc}")
     sys.exit(1)
@@ -549,6 +586,18 @@ _PATH_TAG_LEN=12
 _KDF_LEVELS=('light','standard','strong')
 _PATH_ENC_MODES=('siv1','migrating')
 _DEC_MEMO_MAX=262144  # entrées du mémo de décodage (DbCodec.decode_path)
+# ── Migration (story 5) ──
+_MIGRATE_TABLES=('snapshot_file','diff_index')  # ordre figé (AD-7) : archive_snapshot n'a pas de
+# colonne path propre (jointure sur snapshot_file, rien à y migrer directement) ; les tables de
+# stats (archive_stats, diff_excluded_stats, snap_excluded_stats, repo_stats, diff_indexed_pairs,
+# archive_snapshot_indexed) n'ont aucune colonne path.
+_MIGRATE_BATCH=2000  # lignes par lot transactionnel (taille des lots non mesurée sur base réelle de
+# plusieurs Go — valeur de départ prudente ; DEFERRED : à ajuster après mesure, voir ARCHITECTURE-SPINE)
+_MIGRATE_VALIDATE_SAMPLE=50  # taille max de l'échantillon aller-retour vérifié avant le commit final
+_MIGRATE_VALIDATE_LEGACY=10  # par table déjà (partiellement) migrée avant une reprise : premières+dernières lignes échantillonnées pour auto-cohérence (pas de pré-image mémorisée d'une invocation précédente)
+_DB_SPACE_MARGIN=1.20  # espace libre exigé avant DbEncrypt/DbDecrypt : 120% de la taille actuelle du
+# .db (migration en PLACE, jamais de copie complète — AD-7/AD-9 — mais WAL/pages libres temporaires
+# pendant les lots consomment un peu d'espace ; marge de sécurité documentée, pas mesurée)
 
 def _b64e(b):
     """base64 standard sans padding, '+'->'.' et '/'->'-' (alphabet A-Za-z0-9.-)."""
@@ -755,6 +804,57 @@ def _enc_header_write(conn,header):
         conn.rollback(); raise
     return done
 
+def _enc_header_cas(conn,old_raw,new_header):
+    """Mise à jour d'un en-tête déjà existant (distincte de _enc_header_write, réservée à la toute
+    première écriture) : compare-and-swap sur la valeur brute (BEGIN IMMEDIATE, UPDATE ... WHERE
+    value=old_raw). old_raw doit avoir été lu dans la même transaction (_enc_header_read juste avant).
+    Utilisée par DbEncrypt/DbDecrypt pour toute transition sur un en-tête déjà présent (siv1->migrating,
+    avancement du curseur, migrating->siv1, ré-enveloppe DbRekey). Retourne True si mis à jour.
+    sqlite3.OperationalError (ex. "database is locked" sous contention de BEGIN IMMEDIATE) est converti
+    en DbModeError : les appelants de cette story n'ont qu'un seul contrat d'échec à gérer (True/False/
+    DbModeError), jamais une sqlite3.Error brute à traiter en plus."""
+    conn.commit()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur=conn.execute("UPDATE db_meta SET value=? WHERE key='enc_header' AND value=?",
+                          (json.dumps(new_header,sort_keys=True),old_raw))
+        done=cur.rowcount==1
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        conn.rollback(); raise DbModeError(f"en-tête verrouillé ({e}) — relancer")
+    except BaseException:
+        conn.rollback(); raise
+    return done
+
+def _enc_header_cas_delete(conn,old_raw):
+    """Suppression compare-and-swap de l'en-tête (dernier commit de DbDecrypt : retour à une base
+    VRAIMENT plain, sans ligne enc_header — AD-2 interdit path_enc='plain' en base). Retourne True
+    si supprimé. sqlite3.OperationalError (contention BEGIN IMMEDIATE) -> DbModeError, même contrat que
+    _enc_header_cas."""
+    conn.commit()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur=conn.execute("DELETE FROM db_meta WHERE key='enc_header' AND value=?",(old_raw,))
+        done=cur.rowcount==1
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        conn.rollback(); raise DbModeError(f"en-tête verrouillé ({e}) — relancer")
+    except BaseException:
+        conn.rollback(); raise
+    return done
+
+def _check_disk_space(db_path,margin=_DB_SPACE_MARGIN):
+    """Espace libre suffisant avant DbEncrypt/DbDecrypt (AD-7) : True si le volume qui porte db_path a
+    au moins `margin` fois la taille actuelle du fichier (0 si absent) de libre. Migration en place
+    (jamais de copie complète), mais WAL/pages libres temporaires pendant les lots justifient une marge
+    (20% par défaut, voir _DB_SPACE_MARGIN). Ne bloque jamais si l'espace ne peut pas être mesuré."""
+    try:
+        size=os.path.getsize(db_path) if os.path.exists(db_path) else 0
+        free=shutil.disk_usage(os.path.dirname(os.path.abspath(db_path)) or '.').free
+        return free>=size*margin
+    except OSError:
+        return True
+
 _DEK_CACHE={}  # dérivation une seule fois par processus et par base : (chemin, mac, condensé passphrase) -> DEK
 _CODEC_CACHE={}  # même clé -> DbCodec (partage le mémo de décodage entre connexions du processus)
 _DB_CFG_READERS={}  # realpath(cache_dir) -> callable(nick)->section de config ; enregistré par BorgHelperDB
@@ -812,6 +912,11 @@ def _open_db(db_path,nick=None,role='read',passphrase=None,**kw):
             raw=_enc_header_read(conn)
             if raw is not None:
                 header=_enc_header_parse(raw)
+                if header['path_enc']=='migrating' and role!='admin':
+                    # AD-11 : barrière de migration — seule la connexion admin de DbEncrypt/DbDecrypt
+                    # peut ouvrir une base 'migrating' ; tout autre lecteur/écrivain est refusé net
+                    # (pas de mode mixte, pas de résultat partiel silencieux).
+                    raise DbModeError(f"{nick}: base en cours de migration (DbEncrypt/DbDecrypt) — réessayer une fois l'opération terminée")
                 pw=passphrase if passphrase is not None else _resolve_passphrase(nick,db_path)
                 if not pw: raise DbKeyError(f"{nick}: base chiffrée, passphrase absente")
                 ck=(os.path.realpath(db_path),header['mac'],hashlib.sha256(_pw_bytes(pw)).digest())
@@ -824,6 +929,15 @@ def _open_db(db_path,nick=None,role='read',passphrase=None,**kw):
                 # défense en profondeur (AD-8) : jamais sur une connexion plain (changerait les LIKE de nom qui y restent)
                 try: conn.execute("PRAGMA case_sensitive_like=ON")
                 except sqlite3.Error: pass  # pragma déprécié : simple défense en profondeur, jamais bloquant
+            else:
+                # AD-6 : base restée 'plain' alors qu'elle pourrait être chiffrée (flag actif + passphrase
+                # dispo) — avertissement, jamais bloquant (mode plain toujours valide, voir AD-2/AD-5).
+                # db_encrypt_enabled peut lever SystemExit sur une config invalide : n'importe pas ici,
+                # ce n'est qu'un avertissement — la commande réelle lèvera la même erreur à son tour.
+                try:
+                    if db_encrypt_enabled(nick) and (passphrase if passphrase is not None else _resolve_passphrase(nick,db_path)):
+                        _warn_plain_db(nick,db_path)
+                except SystemExit: pass
     except BaseException:
         conn.close(); raise
     return conn
@@ -867,6 +981,21 @@ def _warn_rc_perms(path):
     if mode&(stat.S_IRWXG|stat.S_IRWXO):
         _RC_PERM_WARNED=True
         printer(f"[WARN] {path} est accessible au groupe/autres (mode {stat.S_IMODE(mode):04o}) — il contient des passphrases : chmod 600 conseillé")
+
+_PLAIN_WARNED=set()
+_PLAIN_WARNED_LOCK=threading.Lock()
+def _warn_plain_db(nick,db_path):
+    """AD-6 : avertit une fois (stderr, par nick+base) qu'une base restée 'plain' pourrait être
+    chiffrée. Précédent : _warn_rc_perms. Appelé seulement quand DB_ENCRYPT est actif pour ce nick et
+    qu'une passphrase est disponible (sinon DbEncrypt échouerait de toute façon). Verrou : _open_db est
+    appelée depuis des threads (ex. ThreadPoolExecutor des workers diff dans index()) — sans lui, un
+    check-then-add non atomique sur ce set partagé pourrait avertir deux fois ou pas du tout."""
+    try: key=(nick,os.path.realpath(db_path))
+    except (OSError,ValueError,TypeError): key=(nick,db_path)
+    with _PLAIN_WARNED_LOCK:
+        if key in _PLAIN_WARNED: return
+        _PLAIN_WARNED.add(key)
+    printer(f"[WARN] {nick}: base non chiffrée ({db_path}) — lancer 'borgHelper -c DbEncrypt -n {nick} -y' pour la chiffrer")
 
 # ── Accès aux chemins stockés (AD-8, AD-16) — frontière unique plain/chiffré ────
 # Le code métier manipule des chemins LOGIQUES ; ces helpers sont les seuls à savoir si la connexion
@@ -1941,6 +2070,309 @@ class BorgHelper:
             if verbose:
                 printer(f"  [WARN] relancer manuellement : sqlite3 '{db_path}' \"VACUUM INTO '{db_path}.tmp'\" && mv '{db_path}.tmp' '{db_path}'")
             return False
+
+    # ── DbEncrypt / DbDecrypt / DbRekey / DbStatus (chiffrement des chemins — story 5) ──────────
+    # Migration en place, reprenable, sans copie complète (AD-7). 'migrating' est un état partagé par
+    # DbEncrypt (plain->migrating->siv1) et DbDecrypt (siv1->migrating->plain) : le champ 'migrating_dir'
+    # ('encrypt'/'decrypt'), ajouté à l'en-tête pour la seule durée de la migration (retiré/disparaît au
+    # commit final), dit laquelle des deux commandes a le droit de la reprendre — sans lui, une reprise
+    # par la commande opposée traiterait des lignes déjà migrées comme si elles ne l'étaient pas encore.
+
+    def _db_locks_busy(self,nick):
+        """Message si une opération concurrente interdit de démarrer une migration/un rekey (AD-11), sinon None."""
+        if self.db.check_priority_lock(nick): return f"{nick}: Bkp/Restore en cours (priority lock)"
+        if self.db.check_report_running(nick): return f"{nick}: Report en cours"
+        if self.db.check_index_running(nick): return f"{nick}: Index en cours"
+        return None
+
+    def _db_migrate_run(self,nick,db_path,direction,passphrase,cfg,debug=0):
+        """Boucle de migration de diff.db (snapshot_file puis diff_index, AD-7), par lots transactionnels
+        (BEGIN IMMEDIATE couvrant les UPDATE du lot + l'avancement du curseur dans l'en-tête : jamais de
+        lot partiel visible). Connexion admin nue (nick=None) : le codec est géré ici à la main (DEK
+        déchiffrée une fois), jamais via conn.codec — la base reste 'migrating' pendant toute l'opération,
+        hors de portée de _open_db pour tout rôle non-admin (AD-11)."""
+        conn=_open_db(db_path,nick=None,role='admin')
+        try:
+            raw=_enc_header_read(conn)
+            # Re-vérification des verrous juste avant la toute première écriture qui bascule la base en
+            # 'migrating' (_db_migrate ne les a vérifiés qu'avant d'ouvrir cette connexion) : ne supprime
+            # pas la fenêtre de course — la protection ferme d'AD-11 démarre une fois le mode réellement
+            # 'migrating' — mais la réduit entre « on a décidé de démarrer » et « on a démarré ».
+            busy=self._db_locks_busy(nick)
+            if busy: raise DbModeError(f"{busy} — migration refusée")
+            if raw is None:
+                if direction=='decrypt': raise DbModeError(f"{nick}: déjà en clair")
+                level=db_kdf_level(nick,cfg=cfg)
+                new_header,_dek=_enc_header_build(passphrase,'migrating',level)
+                new_header['migrating_dir']='encrypt'
+                if not _enc_header_write(conn,new_header):
+                    raise DbModeError(f"{nick}: en-tête créé entre-temps par un autre processus — relancer")
+                raw=_enc_header_read(conn)
+            header=_enc_header_parse(raw)
+            if header['path_enc']=='siv1':
+                if direction=='encrypt': raise DbModeError(f"{nick}: déjà chiffrée")
+                # le MAC de l'enveloppe couvre path_enc (_wrap_mac) : un simple dict(header,path_enc=...)
+                # laisserait un MAC calculé pour l'ancien path_enc — toujours reconstruire via
+                # _enc_header_build (même DEK, nouveau sel/nonce/MAC) dès que path_enc change.
+                dek0=_enc_header_unlock(header,passphrase)
+                level=db_kdf_level(nick,cfg=cfg)
+                new_header,_dek0=_enc_header_build(passphrase,'migrating',level,dek=dek0)
+                new_header['migrating_dir']='decrypt'
+                if not _enc_header_cas(conn,raw,new_header):
+                    raise DbModeError(f"{nick}: en-tête changé entre-temps — relancer")
+                raw=_enc_header_read(conn); header=_enc_header_parse(raw)
+            if header['path_enc']!='migrating':
+                raise DbTamperError(f"{nick}: état d'en-tête inattendu ({header['path_enc']!r})")
+            if header.get('migrating_dir') not in (None,direction):
+                other='DbDecrypt' if direction=='encrypt' else 'DbEncrypt'
+                raise DbModeError(f"{nick}: migration en cours dans l'autre sens — relancer {other} pour la terminer")
+            if header.get('migrating_dir') is None:
+                patched=dict(header,migrating_dir=direction)  # migration démarrée avant cette version : garde défensive
+                if _enc_header_cas(conn,raw,patched):
+                    raw=_enc_header_read(conn); header=_enc_header_parse(raw)
+            dek=_enc_header_unlock(header,passphrase)
+            codec=DbCodec(dek)
+            cursor=header.get('migration_cursor') or {'table':_MIGRATE_TABLES[0],'id':0}
+            if cursor.get('table') not in _MIGRATE_TABLES: cursor={'table':_MIGRATE_TABLES[0],'id':0}
+            start_idx=_MIGRATE_TABLES.index(cursor['table'])
+            # sample : ('fresh',table,rowid,orig,new) pour les lignes migrées PENDANT cette invocation
+            # (pré-image connue, aller-retour vérifié contre elle) ; ('legacy',table,rowid) pour les
+            # lignes déjà migrées par une invocation précédente (reprise après interruption) — sans
+            # pré-image en mémoire, seule une auto-cohérence est vérifiable (voir boucle de validation
+            # plus bas). Sans cette seconde catégorie, une reprise ne validerait jamais les lignes migrées
+            # avant l'interruption : seules celles de la dernière invocation seraient couvertes.
+            sample=[]
+            if start_idx>0 or cursor['id']>0:
+                for ti,table in enumerate(_MIGRATE_TABLES):
+                    if ti>start_idx: break
+                    bound=None if ti<start_idx else cursor['id']  # table déjà complète : aucune borne ; table en cours : id<=curseur
+                    q=f"SELECT id FROM {table}" + ("" if bound is None else " WHERE id<=?")
+                    args=() if bound is None else (bound,)
+                    firsts=conn.execute(q+" ORDER BY id LIMIT ?",args+(_MIGRATE_VALIDATE_LEGACY//2,)).fetchall()
+                    lasts=conn.execute(q+" ORDER BY id DESC LIMIT ?",args+(_MIGRATE_VALIDATE_LEGACY//2,)).fetchall()
+                    for (rid,) in firsts+lasts:
+                        sample.append(('legacy',table,rid))
+            for ti,table in enumerate(_MIGRATE_TABLES):
+                if ti<start_idx: continue
+                last_id=cursor['id'] if table==cursor['table'] else 0
+                while True:
+                    rows=conn.execute(f"SELECT id,path FROM {table} WHERE id>? ORDER BY id LIMIT ?",(last_id,_MIGRATE_BATCH)).fetchall()
+                    if not rows: break
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        chk=conn.execute("SELECT value FROM db_meta WHERE key='enc_header'").fetchone()
+                        if chk is None or chk[0]!=raw:
+                            raise DbModeError(f"{nick}: en-tête modifié pendant la migration (concurrence inattendue)")
+                        batch_last=last_id
+                        for rid,stored in rows:
+                            if direction=='encrypt':
+                                orig=stored; new=codec.path.encode(_norm_lp(orig))
+                            else:
+                                orig=stored; new=codec.path.decode(orig)
+                            conn.execute(f"UPDATE {table} SET path=? WHERE id=?",(new,rid))
+                            batch_last=rid
+                            if len(sample)<_MIGRATE_VALIDATE_SAMPLE: sample.append(('fresh',table,rid,orig,new))
+                        new_header=dict(header,migration_cursor={'table':table,'id':batch_last})
+                        new_raw=json.dumps(new_header,sort_keys=True)
+                        conn.execute("UPDATE db_meta SET value=? WHERE key='enc_header' AND value=?",(new_raw,raw))
+                        conn.commit()
+                    except BaseException:
+                        conn.rollback(); raise
+                    raw=new_raw; header=new_header; last_id=batch_last
+                    if debug: printer(f"  {nick}: {table} — jusqu'à id={last_id}")
+            # Validation avant tout commit final (jamais avant — voir Design Notes de la story) : relit
+            # chaque ligne échantillonnée et vérifie l'aller-retour complet. 'fresh' (migrée pendant CETTE
+            # invocation) : decode(stored)==original en chiffrement, encode(stored)==original en
+            # déchiffrement, contre la pré-image connue. 'legacy' (migrée avant une reprise, pas de
+            # pré-image mémorisée) : auto-cohérence — en chiffrement, decode ne doit pas lever et
+            # encode(decode(x))==x (round-trip du codec) ; en déchiffrement, la valeur doit être du texte
+            # déjà normalisé (aucun MAC ne protège plus une valeur redevenue plain, seule une vérification
+            # de forme est possible).
+            for entry in sample:
+                kind,table,rid=entry[0],entry[1],entry[2]
+                row=conn.execute(f"SELECT path FROM {table} WHERE id=?",(rid,)).fetchone()
+                got=row[0] if row else None
+                if got is None:
+                    raise DbTamperError(f"{nick}: ligne {table}#{rid} disparue — commit final annulé")
+                if kind=='fresh':
+                    orig,expected=entry[3],entry[4]
+                    if got!=expected:
+                        raise DbTamperError(f"{nick}: incohérence relue sur {table}#{rid} — commit final annulé")
+                    ok=(codec.path.decode(got)==_norm_lp(orig)) if direction=='encrypt' else (codec.path.encode(got)==orig)
+                    if not ok:
+                        raise DbTamperError(f"{nick}: aller-retour invalide sur {table}#{rid} — commit final annulé")
+                else:
+                    if direction=='encrypt':
+                        try: dec=codec.path.decode(got)
+                        except DbCodecError as e:
+                            raise DbTamperError(f"{nick}: {table}#{rid} (migré avant reprise) illisible ({e}) — commit final annulé")
+                        if codec.path.encode(dec)!=got:
+                            raise DbTamperError(f"{nick}: {table}#{rid} (migré avant reprise) aller-retour invalide — commit final annulé")
+                    else:
+                        if _norm_lp(got)!=got:
+                            raise DbTamperError(f"{nick}: {table}#{rid} (migré avant reprise) valeur non normalisée — commit final annulé")
+            raw=_enc_header_read(conn); header=_enc_header_parse(raw)
+            if direction=='encrypt':
+                # même remarque que plus haut : path_enc change (migrating->siv1) -> en-tête reconstruit
+                # en entier (même DEK, nouveau sel/nonce/MAC), jamais un simple dict(...,path_enc=...).
+                level=db_kdf_level(nick,cfg=cfg)
+                final,_dekf=_enc_header_build(passphrase,'siv1',level,dek=dek)
+                if not _enc_header_cas(conn,raw,final):
+                    raise DbModeError(f"{nick}: en-tête changé pendant la validation — relancer")
+            else:
+                if not _enc_header_cas_delete(conn,raw):
+                    raise DbModeError(f"{nick}: en-tête changé pendant la validation — relancer")
+        finally:
+            conn.close()
+
+    def _db_migrate_cache(self,nick,direction,passphrase,cfg,debug=0):
+        """cache.db (cachejsonboexlm) : purge + recréation dans le mode cible, JAMAIS de migration ligne
+        à ligne (Story 4/spine) — un cache est reconstructible par un simple appel borg, sans valeur à
+        préserver au prix d'une migration en place coûteuse."""
+        cache_path=self.db.get_cache_db(nick)
+        if not os.path.exists(cache_path): return  # rien à migrer ; créée dans le bon mode au prochain accès (AD-12)
+        self.db.ensure_cache_db(cache_path)
+        conn=_open_db(cache_path,nick=None,role='admin')
+        try:
+            raw=_enc_header_read(conn)
+            cur='plain' if raw is None else _enc_header_parse(raw)['path_enc']
+            if (direction=='encrypt' and cur=='siv1') or (direction=='decrypt' and cur=='plain'):
+                return  # déjà dans le mode cible
+            conn.execute("DELETE FROM cachejsonboexlm"); conn.commit()
+            if direction=='encrypt':
+                level=db_kdf_level(nick,cfg=cfg)
+                header,_dek=_enc_header_build(passphrase,'siv1',level)
+                if not _enc_header_write(conn,header):
+                    raise DbModeError(f"{nick}: cache.db — en-tête apparu entre-temps, relancer DbEncrypt")
+            else:
+                if not _enc_header_cas_delete(conn,raw):
+                    raise DbModeError(f"{nick}: cache.db — en-tête changé entre-temps, relancer DbDecrypt")
+            if debug: printer(f"  {nick}: cache.db purgé et recréé ({'siv1' if direction=='encrypt' else 'plain'})")
+        finally:
+            conn.close()
+
+    def _db_migrate(self,nick,direction,dryrun=False,confirm=False,debug=0):
+        verb='DbEncrypt' if direction=='encrypt' else 'DbDecrypt'
+        db_path=self.db.get_diff_db(nick)
+        if not os.path.exists(db_path):
+            printer(f"  {nick}: diff.db absent — rien à faire"); return 0
+        self.db.ensure_diff_db(db_path)  # schéma courant requis avant migration (migrations legacy d'abord, AD-7)
+        cfg=self.borg.cfgread(nick)
+        if direction=='encrypt' and not db_encrypt_enabled(nick,cfg=cfg):
+            printer(f"  [ERREUR] {nick}: DB_ENCRYPT=false pour ce nick — {verb} refusé explicitement"); return 2
+        busy=self._db_locks_busy(nick)
+        if busy:
+            printer(f"  [ERREUR] {busy} — {verb} refusé"); return 2
+        passphrase=cfg.get('BORG_PASSPHRASE') if cfg else None
+        if not passphrase:
+            printer(f"  [ERREUR] {nick}: passphrase absente — {verb} impossible"); return 2
+        conn=_open_db(db_path,nick=None,role='admin')
+        raw=_enc_header_read(conn)
+        cur_mode='plain' if raw is None else _enc_header_parse(raw)['path_enc']
+        if direction=='encrypt' and cur_mode=='siv1':
+            printer(f"  {nick}: déjà chiffrée (siv1)"); conn.close(); return 0
+        if direction=='decrypt' and cur_mode=='plain':
+            printer(f"  {nick}: déjà en clair"); conn.close(); return 0
+        if cur_mode=='migrating':
+            migrating_dir=_enc_header_parse(raw).get('migrating_dir')
+            if migrating_dir not in (None,direction):
+                other='DbDecrypt' if direction=='encrypt' else 'DbEncrypt'
+                printer(f"  [ERREUR] {nick}: migration en cours dans l'autre sens — relancer {other} pour la terminer"); conn.close(); return 2
+        if not _check_disk_space(db_path):
+            printer(f"  [ERREUR] {nick}: espace disque insuffisant pour {verb} (marge {_DB_SPACE_MARGIN:.0%} de {os.path.getsize(db_path):,} octets)"); conn.close(); return 2
+        counts={t:conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in _MIGRATE_TABLES}
+        size=os.path.getsize(db_path)
+        conn.close()
+        if dryrun and confirm:
+            printer(f"  {nick}: -D et -y sont exclusifs"); return 2
+        if dryrun:
+            printer(f"  {nick}: {verb} -D — état actuel={cur_mode} · snapshot_file={counts['snapshot_file']:,} · diff_index={counts['diff_index']:,} · {convert_octets_readable(size)}")
+            printer(f"  {nick}: dry-run — aucune modification")
+            return 0
+        if not confirm:
+            printer(f"  {nick}: exécution réelle -> ajouter -y (ou -D pour un aperçu sans rien changer)"); return 2
+        try:
+            self._db_migrate_run(nick,db_path,direction,passphrase,cfg,debug=debug)
+            self._db_migrate_cache(nick,direction,passphrase,cfg,debug=debug)
+        except (DbKeyError,DbModeError,DbTamperError,DbCodecError) as e:
+            printer(f"  [ERREUR] {nick}: {type(e).__name__}: {e}"); return 2
+        printer(f"  {nick}: {verb} terminé ({'siv1' if direction=='encrypt' else 'plain'})")
+        return 0
+
+    def db_encrypt(self,nick,dryrun=False,confirm=False,debug=0):
+        return self._db_migrate(nick,'encrypt',dryrun=dryrun,confirm=confirm,debug=debug)
+
+    def db_decrypt(self,nick,dryrun=False,confirm=False,debug=0):
+        return self._db_migrate(nick,'decrypt',dryrun=dryrun,confirm=confirm,debug=debug)
+
+    def db_rekey(self,nick,confirm=False,debug=0):
+        """Ré-enveloppe la DEK existante de diff.db avec une nouvelle KEK (nouveau sel, nouveau nonce,
+        DB_KDF courant) — AUCUNE ligne de donnée touchée (AD-4). Ne concerne QUE diff.db : cache.db est
+        purgé/recréé par DbEncrypt, sa DEK n'a pas besoin d'être ré-enveloppée séparément.
+        Limitation connue, documentée (pas comblée, cf Design Notes) : borgHelperWWW n'a aucun mécanisme
+        pour être notifié d'un DbRekey exécuté en CLI — son memo de codec (_NICK_CODEC_MEMO, Story 4)
+        reste périmé jusqu'à son redémarrage."""
+        db_path=self.db.get_diff_db(nick)
+        if not os.path.exists(db_path):
+            printer(f"  {nick}: diff.db absent"); return 1
+        cfg=self.borg.cfgread(nick)
+        passphrase=cfg.get('BORG_PASSPHRASE') if cfg else None
+        if not passphrase:
+            printer(f"  [ERREUR] {nick}: passphrase absente"); return 2
+        busy=self._db_locks_busy(nick)
+        if busy:
+            printer(f"  [ERREUR] {busy} — DbRekey refusé"); return 2
+        conn=_open_db(db_path,nick=None,role='admin')
+        try:
+            raw=_enc_header_read(conn)
+            if raw is None:
+                printer(f"  [ERREUR] {nick}: base non chiffrée (plain) — rien à re-clé"); return 2
+            header=_enc_header_parse(raw)
+            if header['path_enc']!='siv1':
+                printer(f"  [ERREUR] {nick}: base en cours de migration ({header['path_enc']}) — pas de DbRekey pendant une migration"); return 2
+            try:
+                dek=_enc_header_unlock(header,passphrase)
+            except DbKeyError as e:
+                printer(f"  [ERREUR] {nick}: {e}"); return 2
+            if not confirm:
+                printer(f"  {nick}: DbRekey -> ajouter -y pour ré-envelopper la DEK avec une nouvelle KEK"); return 2
+            level=db_kdf_level(nick,cfg=cfg)
+            new_header,_dek2=_enc_header_build(passphrase,'siv1',level,dek=dek)
+            try:
+                if not _enc_header_cas(conn,raw,new_header):
+                    raise DbModeError(f"{nick}: en-tête changé entre-temps — relancer DbRekey")
+            except DbModeError as e:
+                printer(f"  [ERREUR] {nick}: {e}"); return 2
+            ck=(os.path.realpath(db_path),header['mac'],hashlib.sha256(_pw_bytes(passphrase)).digest())
+            _DEK_CACHE.pop(ck,None); _CODEC_CACHE.pop(ck,None)  # ancienne enveloppe : mémo de ce processus purgé par prudence
+            printer(f"  {nick}: DEK ré-enveloppée (nouvelle KEK) — redémarrer borgHelperWWW pour ce nick (memo de codec périmé)")
+            return 0
+        finally:
+            conn.close()
+
+    def db_status(self,nick,debug=0):
+        """AD-6 : mode de chaque base (cache.db/diff.db) pour ce nick. Lecture directe hors _open_db
+        (seule exception documentée à AD-1) : on ne lit QUE db_meta.enc_header pour en afficher le mode,
+        jamais une ligne de path/blob — le codec n'entre jamais en jeu ici. Passer par _open_db exigerait
+        une passphrase même pour simplement annoncer qu'une base est 'siv1', ce que DbStatus doit pouvoir
+        faire sans."""
+        cfg=self.borg.cfgread(nick)
+        for label,path in (('cache.db',self.db.get_cache_db(nick)),('diff.db',self.db.get_diff_db(nick))):
+            if not os.path.exists(path):
+                printer(f"  {nick}: {label}: absent"); continue
+            peek=sqlite3.connect(path)
+            try: raw=_enc_header_read(peek)
+            finally: peek.close()
+            try:
+                mode='plain' if raw is None else _enc_header_parse(raw)['path_enc']
+            except DbTamperError as e:
+                printer(f"  {nick}: {label}: en-tête invalide ({e})"); continue
+            printer(f"  {nick}: {label}: {mode}")
+            if mode=='plain':
+                try:
+                    if db_encrypt_enabled(nick,cfg=cfg) and (cfg.get('BORG_PASSPHRASE') if cfg else None):
+                        _warn_plain_db(nick,path)
+                except SystemExit: pass
 
     def _cleanup_index_after_prune(self,nick,debug=0):
         if self._nick_noidx(nick): return
@@ -3982,6 +4414,7 @@ def codec_selftest():
     tmp=tempfile.mkdtemp(prefix='borghelper-selftest-')
     # état global restauré à la fin : le self-test ne doit rien laisser derrière lui
     saved_readers=dict(_DB_CFG_READERS); saved_deks=dict(_DEK_CACHE); saved_codecs=dict(_CODEC_CACHE); saved_scrypt=getattr(hashlib,'scrypt',None)
+    saved_warned=set(_PLAIN_WARNED); saved_batch=_MIGRATE_BATCH; saved_disk_usage=shutil.disk_usage
     try:
         # ── primitives : vecteurs officiels ──
         check("HMAC-SHA256 (RFC 4231 cas 1)",lambda: hmac.new(b'\x0b'*20,b'Hi There',hashlib.sha256).hexdigest()==
@@ -4673,11 +5106,303 @@ def codec_selftest():
         check("Sentry before_send : clés sensibles (passphrase/k_path/pw/chemin) redactées dans extra/contexts/vars de frame, clé non sensible conservée telle quelle (AD-15)",_sentry_scrub_ok)
         check("Sentry _sentry_scrub : au-delà de la profondeur bornée -> '[truncated]', jamais la valeur brute non scrubbée",
               lambda: _sentry_scrub({'a':{'b':{'c':{'d':{'e':{'f':{'g':{'h':'secret'}}}}}}}})['a']['b']['c']['d']['e']['f']['g']=='[truncated]')
+        # ── Story 5 : DbEncrypt / DbDecrypt / DbRekey / DbStatus, curseur/reprise, AD-6, AD-7 ──────
+        def _cas_primitives_ok():
+            p=os.path.join(tmp,'cas.db')
+            c=_open_db(p,nick=None,role='admin'); c.execute("CREATE TABLE IF NOT EXISTS db_meta(key TEXT PRIMARY KEY,value TEXT)"); c.commit()
+            h,_dek=_enc_header_build('pw','siv1','light')
+            _enc_header_write(c,h); raw=_enc_header_read(c)
+            ok1=_enc_header_cas(c,raw,dict(h,path_enc='migrating'))          # raw à jour -> succès
+            ok2=_enc_header_cas(c,raw,dict(h,path_enc='migrating'))          # même raw rejoué (périmé) -> échec
+            raw2=_enc_header_read(c)
+            ok3=_enc_header_cas_delete(c,raw2)                               # raw2 à jour -> succès
+            ok4=_enc_header_read(c) is None
+            ok5=_enc_header_cas_delete(c,raw2) is False                      # déjà supprimé -> échec
+            c.close()
+            return ok1 and not ok2 and ok3 and ok4 and ok5
+        check("_enc_header_cas/_enc_header_cas_delete : succès si la valeur lue est à jour, False (rien changé) si périmée",_cas_primitives_ok)
+        def _disk_space_ok():
+            p=os.path.join(tmp,'ds.db')
+            with open(p,'wb') as f: f.write(b'x'*4096)  # taille non nulle : sinon size*margin=0, toujours "assez" (test sans valeur)
+            try:
+                shutil.disk_usage=lambda path: saved_disk_usage(path)._replace(free=10**15)
+                ok_plenty=_check_disk_space(p)
+                shutil.disk_usage=lambda path: saved_disk_usage(path)._replace(free=0)
+                ok_full=not _check_disk_space(p)
+                return ok_plenty and ok_full
+            finally:
+                shutil.disk_usage=saved_disk_usage
+        check("_check_disk_space : accepte si assez d'espace libre, refuse si insuffisant (simulé)",_disk_space_ok)
+        def _db5_env(nick,extra=''):
+            d=os.path.join(tmp,f'db5-{nick}'); os.makedirs(d,exist_ok=True)
+            rc=os.path.join(d,'rc')
+            with open(rc,'w') as f:
+                f.write(f"[{nick}]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw-{nick}\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n{extra}\n")
+            os.chmod(rc,0o600)
+            b=BorgHelper(cfgfile=rc,cache_dir=d)
+            p=b.db.get_diff_db(nick); b.db.ensure_diff_db(p)
+            c=_open_db(p,nick=nick,role='write')
+            dirs=[f"dir{i}" for i in range(12)]
+            files=[f"dir{i}/f{i}.txt" for i in range(12)]
+            paths=dirs+files
+            for pp in dirs:
+                c.execute("INSERT INTO snapshot_file(nick,path,size,mtime,type,mode,owner) VALUES(?,?,?,?,?,?,?)",(nick,pp,None,'m','d','drwxr-xr-x','o:g'))
+            for i,pp in enumerate(files):
+                c.execute("INSERT INTO snapshot_file(nick,path,size,mtime,type,mode,owner) VALUES(?,?,?,?,?,?,?)",(nick,pp,i,'m','-','-rw-r--r--','o:g'))
+            ids={r[1]:r[0] for r in c.execute("SELECT id,path FROM snapshot_file WHERE nick=?",(nick,))}
+            for pp in paths:
+                c.execute("INSERT INTO archive_snapshot(nick,archive,archive_date,file_id) VALUES(?,?,?,?)",(nick,'A2','2026-01-02T00:00:00',ids[pp]))
+            c.execute("INSERT INTO archive_stats(nick,archive,archive_date,nfiles) VALUES(?,?,?,?)",(nick,'A2','2026-01-02T00:00:00',len(paths)))
+            for i,pp in enumerate(files[:6]):
+                c.execute("INSERT INTO diff_index(nick,archive_old,archive_new,archive_new_date,change_type,path,size_before,size_after) VALUES(?,?,?,?,?,?,?,?)",(nick,'A1','A2','2026-01-02T00:00:00','added',pp,None,i))
+            c.commit(); c.close()
+            cp=b.db.get_cache_db(nick); b.db.ensure_cache_db(cp)
+            return b,paths
+        def _db5_paths(b,nick):
+            c=sqlite3.connect(b.db.get_diff_db(nick))
+            sf={r[0] for r in c.execute("SELECT path FROM snapshot_file WHERE nick=?",(nick,))}
+            di={r[0] for r in c.execute("SELECT path FROM diff_index WHERE nick=?",(nick,))}
+            c.close(); return sf,di
+        def _db5_header(b,nick,which='diff'):
+            path=b.db.get_diff_db(nick) if which=='diff' else b.db.get_cache_db(nick)
+            c=sqlite3.connect(path)
+            try: raw=_enc_header_read(c)
+            finally: c.close()
+            return None if raw is None else _enc_header_parse(raw)
+        def _db5_mode(b,nick,which='diff'):
+            h=_db5_header(b,nick,which); return 'plain' if h is None else h['path_enc']
+        def _db5_encrypt_decrypt_roundtrip():
+            b,paths=_db5_env('m1')
+            sf0,di0=_db5_paths(b,'m1')
+            out0=_q_run(b.treehist,'m1',None,as_json=True)
+            r1=b.db_encrypt('m1',confirm=True)                    # aller simple
+            mode1=_db5_mode(b,'m1'); cmode1=_db5_mode(b,'m1','cache')
+            sf1,di1=_db5_paths(b,'m1')
+            out1=_q_run(b.treehist,'m1',None,as_json=True)
+            r2=b.db_decrypt('m1',confirm=True)                    # aller-retour
+            mode2=_db5_mode(b,'m1'); cmode2=_db5_mode(b,'m1','cache')
+            sf2,di2=_db5_paths(b,'m1')
+            out2=_q_run(b.treehist,'m1',None,as_json=True)
+            return (r1==0 and r2==0 and mode1=='siv1' and cmode1=='siv1' and mode2=='plain' and cmode2=='plain'
+                    and sf1!=sf0 and di1!=di0 and not (sf1&sf0) and not (di1&di0)   # stocké différent une fois chiffré
+                    and sf2==sf0 and di2==di0                                        # chemins identiques à l'origine
+                    and out0==out1==out2 and 'dir0' in out0)                         # résultat utilisateur inchangé (TreeHist)
+        check("DbEncrypt (aller simple) puis DbDecrypt (aller-retour) : chemins et TreeHist identiques à l'origine, cache.db recréé dans les deux modes",_db5_encrypt_decrypt_roundtrip)
+        def _db5_interrupt_resume():
+            b,paths=_db5_env('m3')
+            sf0,di0=_db5_paths(b,'m3')
+            globals()['_MIGRATE_BATCH']=3
+            orig_encode=PathCodec.encode; calls=[0]
+            def _boom(self,path):
+                calls[0]+=1
+                if calls[0]==5: raise RuntimeError('simulated crash mid-batch')
+                return orig_encode(self,path)
+            PathCodec.encode=_boom
+            try:
+                try:
+                    b.db_encrypt('m3',confirm=True); crashed=False
+                except RuntimeError:
+                    crashed=True
+                mode_mid=_db5_mode(b,'m3')
+                sf_mid,_di_mid=_db5_paths(b,'m3')
+                partial_ok=crashed and mode_mid=='migrating' and 0<len(sf_mid&sf0)<len(sf0)
+            finally:
+                PathCodec.encode=orig_encode
+            r2=b.db_encrypt('m3',confirm=True)                    # reprise : DEK inchangée, termine
+            mode_end=_db5_mode(b,'m3')
+            sf_end,di_end=_db5_paths(b,'m3')
+            globals()['_MIGRATE_BATCH']=saved_batch
+            return (partial_ok and r2==0 and mode_end=='siv1'
+                    and len(sf_end)==len(sf0) and len(di_end)==len(di0)   # aucune perte ni duplication
+                    and not (sf_end&sf0) and not (di_end&di0))
+        check("DbEncrypt interrompu à mi-lots (simulé) puis relancé : reprend au curseur, termine, aucune perte ni duplication",_db5_interrupt_resume)
+        def _db5_encrypt_false_refused():
+            b,paths=_db5_env('m4',extra='DB_ENCRYPT=false\n')
+            sf0,di0=_db5_paths(b,'m4')
+            r=b.db_encrypt('m4',confirm=True)
+            sf1,di1=_db5_paths(b,'m4')
+            return r!=0 and sf1==sf0 and di1==di0 and _db5_mode(b,'m4')=='plain'
+        check("DbEncrypt : DB_ENCRYPT=false pour le nick -> refus explicite (code non nul), base intacte",_db5_encrypt_false_refused)
+        def _db5_locked_refused():
+            b,paths=_db5_env('m5')
+            # set_index_running_lock écrirait notre PROPRE pid : _check_pid_lock a une exception
+            # self-lock explicite (le self-test tourne dans le même processus) qui le rendrait
+            # invisible ici — on simule un AUTRE processus vivant (le parent, forcément en vie).
+            lockp=b.db._index_running_lock_path('m5')
+            with open(lockp,'w') as f: f.write(str(os.getppid()))
+            try: r=b.db_encrypt('m5',confirm=True)
+            finally:
+                try: os.unlink(lockp)
+                except OSError: pass
+            return r!=0 and _db5_mode(b,'m5')=='plain'
+        check("DbEncrypt : Index en cours (verrou simulé) -> refus, base intacte",_db5_locked_refused)
+        def _db5_disk_full_refused():
+            b,paths=_db5_env('m6')
+            try:
+                shutil.disk_usage=lambda path: saved_disk_usage(path)._replace(free=0)
+                r=b.db_encrypt('m6',confirm=True)
+            finally:
+                shutil.disk_usage=saved_disk_usage
+            return r!=0 and _db5_mode(b,'m6')=='plain'
+        check("DbEncrypt : espace disque insuffisant (simulé) -> refus avant de commencer, base intacte",_db5_disk_full_refused)
+        def _db5_dryrun_and_no_flag():
+            b,paths=_db5_env('m7')
+            out=_q_run(b.db_encrypt,'m7',dryrun=True,confirm=False)
+            dry_ok=_db5_mode(b,'m7')=='plain' and 'dry-run' in out
+            r=b.db_encrypt('m7')  # ni -D ni -y : refus, rien changé
+            return dry_ok and r!=0 and _db5_mode(b,'m7')=='plain'
+        check("DbEncrypt -D : rapport seul (rien changé) ; sans -D ni -y : refus (convention IdxPurge)",_db5_dryrun_and_no_flag)
+        def _db5_rekey_ok():
+            b,paths=_db5_env('m9')
+            b.db_encrypt('m9',confirm=True)
+            old=_db5_header(b,'m9'); old_dek=_enc_header_unlock(old,'pw-m9')
+            r=b.db_rekey('m9',confirm=True)
+            new=_db5_header(b,'m9'); new_dek=_enc_header_unlock(new,'pw-m9')
+            return (r==0 and new_dek==old_dek and new['path_enc']=='siv1'
+                    and (new['salt'],new['nonce'])!=(old['salt'],old['nonce']))
+        check("DbRekey : DEK inchangée, enveloppe (sel/nonce) renouvelée, toujours déverrouillable avec la même passphrase",_db5_rekey_ok)
+        def _db5_rekey_needs_confirm():
+            b,paths=_db5_env('m10')
+            b.db_encrypt('m10',confirm=True)
+            old=_db5_header(b,'m10')
+            r=b.db_rekey('m10',confirm=False)
+            return r!=0 and _db5_header(b,'m10')==old
+        check("DbRekey sans -y : refus, en-tête inchangé",_db5_rekey_needs_confirm)
+        def _db5_rekey_plain_refused():
+            b,paths=_db5_env('m11')
+            r=b.db_rekey('m11',confirm=True)
+            return r!=0
+        check("DbRekey sur base plain : refus explicite (rien à re-clé)",_db5_rekey_plain_refused)
+        def _db5_status_and_ad6_warn():
+            b,paths=_db5_env('m12')
+            err1=io.StringIO(); out1=io.StringIO()
+            with contextlib.redirect_stderr(err1),contextlib.redirect_stdout(out1):
+                b.db_status('m12')
+            txt=err1.getvalue()+out1.getvalue()
+            ok_status='diff.db: plain' in txt and 'cache.db: plain' in txt
+            # diff.db a déjà été ouverte via _open_db(nick=...) pendant _db5_env (insertion des lignes de
+            # test) : déjà avertie à ce moment-là (hors de la fenêtre mesurée ici) — seul cache.db (jamais
+            # ouverte avec un nick, donc jamais encore avertie) déclenche un nouvel avertissement ici.
+            warn1=txt.count('base non chiffrée')
+            err2=io.StringIO()
+            with contextlib.redirect_stderr(err2): b.db_status('m12')  # déjà averti pour les deux bases -> silencieux
+            warn2=err2.getvalue().count('base non chiffrée')
+            return ok_status and warn1==1 and warn2==0
+        check("DbStatus : mode par base (plain/siv1/migrating) ; AD-6 avertit une fois par base puis se tait",_db5_status_and_ad6_warn)
+        def _db5_migrating_refuses_other_readers():
+            b,paths=_db5_env('m13')
+            p=b.db.get_diff_db('m13')
+            level=db_kdf_level('m13',cfg=b.borg.cfgread('m13'))
+            h,_dek=_enc_header_build('pw-m13','migrating',level); h['migrating_dir']='encrypt'
+            c=_open_db(p,nick=None,role='admin'); _enc_header_write(c,h); c.close()
+            return raises(DbModeError,lambda:_open_db(p,nick='m13',role='read',passphrase='pw-m13'))
+        check("_open_db : base 'migrating' refusée à tout rôle non-admin (AD-11), même avec la bonne passphrase",_db5_migrating_refuses_other_readers)
+        def _cli_dbstatus_all_expands():
+            """CLI : DbStatus -n ALL doit s'étendre à tous les nicks configurés (comme CacheInfo/CacheClean),
+            pas être traité comme un nick littéral 'ALL' — régression trouvée en revue pour DbEncrypt/
+            DbDecrypt/DbRekey/DbStatus (les 4 sites de dispatch _cli_main, `nick.split(',')` direct)."""
+            d=os.path.join(tmp,'cli-all'); os.makedirs(d,exist_ok=True)
+            rc=os.path.join(d,'rc')
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR = {d}\n\n")
+                for nk in ('cliA','cliB'):
+                    f.write(f"[{nk}]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw-{nk}\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n\n")
+            os.chmod(rc,0o600)
+            saved_argv=sys.argv[:]
+            out=io.StringIO(); err=io.StringIO()
+            try:
+                sys.argv=['borgHelper','-C',rc,'-c','DbStatus','-n','ALL']
+                with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+                    try: _cli_main()
+                    except SystemExit: pass
+            finally:
+                sys.argv=saved_argv
+            txt=out.getvalue()+err.getvalue()
+            return 'cliA' in txt and 'cliB' in txt and 'ALL:' not in txt
+        check("CLI : DbStatus -n ALL s'étend à tous les nicks configurés (pas un nick littéral 'ALL')",_cli_dbstatus_all_expands)
+        def _db_migrate_cache_error_wrapped():
+            """Revue : l'appel à _db_migrate_cache (après _db_migrate_run) n'était PAS dans le même except
+            que _db_migrate_run -> une DbModeError venant de _db_migrate_cache (CAS/write échoués sur
+            cache.db) remontait en traceback non attrapée au lieu du [ERREUR]/code 2 documenté."""
+            b,paths=_db5_env('m14')
+            orig=BorgHelper._db_migrate_cache
+            def _boom(self,nick,direction,passphrase,cfg,debug=0):
+                raise DbModeError('simulated cache header race')
+            BorgHelper._db_migrate_cache=_boom
+            out=io.StringIO(); r=None
+            try:
+                with contextlib.redirect_stderr(out):
+                    try: r=b.db_encrypt('m14',confirm=True)
+                    except Exception: r=None  # ne doit PAS arriver si le correctif tient
+            finally:
+                BorgHelper._db_migrate_cache=orig
+            return r==2 and '[ERREUR]' in out.getvalue()
+        check("_db_migrate : _db_migrate_cache dans le même except que _db_migrate_run -> code 2 + [ERREUR], jamais une exception non attrapée",_db_migrate_cache_error_wrapped)
+        def _db_rekey_cas_failure_wrapped():
+            """Revue : le raise DbModeError sur échec de la CAS dans db_rekey était dans un try/finally
+            SANS except -> remontait non attrapée au lieu du [ERREUR]/code 2 des autres refus de la même
+            méthode."""
+            b,paths=_db5_env('m15')
+            b.db_encrypt('m15',confirm=True)
+            orig=globals()['_enc_header_cas']
+            globals()['_enc_header_cas']=lambda *a,**k: False  # simule un en-tête changé entre-temps
+            out=io.StringIO(); r=None
+            try:
+                with contextlib.redirect_stderr(out):
+                    try: r=b.db_rekey('m15',confirm=True)
+                    except Exception: r=None
+            finally:
+                globals()['_enc_header_cas']=orig
+            return r==2 and '[ERREUR]' in out.getvalue()
+        check("DbRekey : échec de la CAS (simulé) -> code 2 + [ERREUR], pas d'exception non attrapée",_db_rekey_cas_failure_wrapped)
+        def _db5_dryrun_and_confirm_exclusive():
+            b,paths=_db5_env('m17')
+            out=_q_run(b.db_encrypt,'m17',dryrun=True,confirm=True)
+            return _db5_mode(b,'m17')=='plain' and 'exclusifs' in out
+        check("DbEncrypt : -D et -y ensemble -> refus explicite (exclusifs), rien changé",_db5_dryrun_and_confirm_exclusive)
+        def _db_migrate_resume_validates_legacy_rows():
+            """Revue : l'échantillon de validation ne couvrait que les lignes migrées PENDANT l'invocation
+            courante. Sur une reprise (interruption puis relance), une ligne déjà migrée avant l'interruption
+            et corrompue entre-temps ne serait jamais revalidée avant le commit final -> corruption silencieuse.
+            Scénario : table1 (snapshot_file) intégralement migrée, table2 (diff_index) partiellement migrée,
+            interruption simulée, corruption d'une ligne de table1 (déjà migrée, donc PAS revue par cette
+            invocation sauf via l'échantillon 'legacy'), reprise -> doit être détectée (code 2, jamais commitée
+            en siv1)."""
+            b,paths=_db5_env('m16')
+            p=b.db.get_diff_db('m16')
+            globals()['_MIGRATE_BATCH']=3
+            orig_encode=PathCodec.encode; calls=[0]
+            def _boom(self,path):
+                calls[0]+=1
+                # snapshot_file=24 lignes (8 lots de 3) puis diff_index=6 lignes : 1er lot (3) committé,
+                # interruption au milieu du 2e lot de diff_index (table2 partielle, table1 complète).
+                if calls[0]==29: raise RuntimeError('simulated crash: table1 complete, table2 partial')
+                return orig_encode(self,path)
+            PathCodec.encode=_boom
+            try:
+                try: b.db_encrypt('m16',confirm=True)
+                except RuntimeError: pass
+            finally:
+                PathCodec.encode=orig_encode
+                globals()['_MIGRATE_BATCH']=saved_batch
+            h=_db5_header(b,'m16')
+            if h is None or h['path_enc']!='migrating': return False
+            c=sqlite3.connect(p)
+            row=c.execute("SELECT id,path FROM snapshot_file WHERE nick=? ORDER BY id LIMIT 1",('m16',)).fetchone()
+            rid,stored=row
+            tampered=('B' if stored[0]!='B' else 'C')+stored[1:]  # casse le tag SIV -> decode() doit lever
+            c.execute("UPDATE snapshot_file SET path=? WHERE id=?",(tampered,rid)); c.commit(); c.close()
+            r=b.db_encrypt('m16',confirm=True)  # reprise : la corruption est dans table1, déjà migrée avant l'interruption
+            return r==2 and _db5_mode(b,'m16')=='migrating'  # jamais commitée en siv1 malgré la corruption
+        check("DbEncrypt repris après interruption : la validation finale relit aussi les lignes migrées AVANT la reprise (échantillon 'legacy'), détecte une corruption qui y a été introduite",_db_migrate_resume_validates_legacy_rows)
     finally:
         shutil.rmtree(tmp,ignore_errors=True)
         _DB_CFG_READERS.clear(); _DB_CFG_READERS.update(saved_readers)
         _DEK_CACHE.clear(); _DEK_CACHE.update(saved_deks)
         _CODEC_CACHE.clear(); _CODEC_CACHE.update(saved_codecs)
+        _PLAIN_WARNED.clear(); _PLAIN_WARNED.update(saved_warned)
+        globals()['_MIGRATE_BATCH']=saved_batch
+        shutil.disk_usage=saved_disk_usage
         if saved_scrypt is not None: hashlib.scrypt=saved_scrypt
     fails=results.count(False)
     print(f"CodecSelfTest : {len(results)-fails}/{len(results)} OK"+(f", {fails} FAIL" if fails else ""))
@@ -4737,7 +5462,7 @@ def _cli_main():
                              auto_enabling_integrations=False,with_locals=False,before_send=_sentry_before_send)
 
     try:
-        opts,args=getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILC:FSN:ox:DP:R",["help"])
+        opts,args=getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILC:FSN:ox:DP:Ry",["help"])
     except getopt.GetoptError as err:
         print(err); usage(); sys.exit(2)
     if args:
@@ -4768,7 +5493,7 @@ def _cli_main():
            'init':'Ccdn','key':'Ccdn','index':'CcdnFSA','search':'CcdnfbBj',
            'filehist':'CcdnfbBj','cacheinfo':'Ccdn','cacheclean':'Ccdn','duidx':'CcdnfbBsjR',
            'idxtop':'CcdnNpj','difftop':'CcdnNpbj','idxpurge':'CcdnxD','treehist':'CcdnfbBj',
-           'treefind':'Ccdnfmj'}
+           'treefind':'Ccdnfmj','dbencrypt':'CcdnDy','dbdecrypt':'CcdnDy','dbrekey':'Ccdny','dbstatus':'Ccdn'}
     optab={k:v+'P' for k,v in optab.items()}
 
     if cmd is None or cmd not in optab.keys():
@@ -4907,6 +5632,31 @@ def _cli_main():
         _dryrun='-D' in options
         for n in nick.split(','):
             bh.idxpurge(n,pattern=options.get('-x'),dryrun=_dryrun,debug=debug)
+    elif cmd=='dbencrypt':
+        _dryrun='-D' in options; _yes='-y' in options; errcmd=0
+        _nicks=nick.split(',') if nick and nick!='ALL' else bh.borg.cfgreadnicks(debug).split(',')
+        for n in _nicks:
+            r=bh.db_encrypt(n,dryrun=_dryrun,confirm=_yes,debug=debug)
+            if r: errcmd=r
+        sys.exit(errcmd)
+    elif cmd=='dbdecrypt':
+        _dryrun='-D' in options; _yes='-y' in options; errcmd=0
+        _nicks=nick.split(',') if nick and nick!='ALL' else bh.borg.cfgreadnicks(debug).split(',')
+        for n in _nicks:
+            r=bh.db_decrypt(n,dryrun=_dryrun,confirm=_yes,debug=debug)
+            if r: errcmd=r
+        sys.exit(errcmd)
+    elif cmd=='dbrekey':
+        _yes='-y' in options; errcmd=0
+        _nicks=nick.split(',') if nick and nick!='ALL' else bh.borg.cfgreadnicks(debug).split(',')
+        for n in _nicks:
+            r=bh.db_rekey(n,confirm=_yes,debug=debug)
+            if r: errcmd=r
+        sys.exit(errcmd)
+    elif cmd=='dbstatus':
+        _nicks=nick.split(',') if nick and nick!='ALL' else bh.borg.cfgreadnicks(debug).split(',')
+        for n in _nicks:
+            bh.db_status(n,debug=debug)
     else:
         printer("Mais comment on peut en arriver la ?"); usage()
 

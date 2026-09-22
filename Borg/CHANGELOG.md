@@ -1,5 +1,65 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.104 — chiffrement des chemins SQLite, story 5 : migration (DbEncrypt/DbDecrypt/DbRekey/DbStatus) — 2026-09-22
+
+Dernière pièce du chiffrement des chemins : les Stories 1-4 posaient tout le mécanisme (codec, en-tête,
+barrière AD-11, autorité de création AD-12, requêtes/écritures/caches indépendants du mode) mais aucune
+base réelle ne pouvait encore passer en chiffré. Cette livraison ajoute `DbEncrypt`, `DbDecrypt`, `DbRekey`,
+`DbStatus`, et active enfin l'avertissement AD-6 différé depuis la Story 1. Vérifié par `CodecSelfTest`
+(279/279) et par un aller-retour réel sur `demo.borghelperrc` (`TreeHist`/`Search` identiques avant/après).
+Revue post-implémentation : `-n ALL` correctement étendu pour les 4 nouvelles commandes CLI (comme
+`CacheInfo`/`CacheClean`), `_db_migrate_cache` capturée par le même `except` que `_db_migrate_run` (sinon
+traceback non attrapée sur un échec tardif), `DbRekey` capture désormais l'échec de sa propre CAS (même
+discipline que ses autres refus), `_enc_header_cas`/`_enc_header_cas_delete` convertissent
+`sqlite3.OperationalError` (contention) en `DbModeError`, `-D`+`-y` simultanés refusés explicitement, la
+validation finale d'une migration reprise après interruption couvre aussi les lignes migrées avant la
+reprise (échantillon `legacy`), et `_warn_plain_db` est protégée par un verrou (accès concurrent depuis
+plusieurs threads).
+
+- **`DbEncrypt -n nick [-D] [-y]`.** Migre `diff.db` en place, table par table (`snapshot_file` puis
+  `diff_index` — `archive_snapshot` n'a pas de colonne `path` propre, rien à y migrer directement), par lots
+  transactionnels de 2000 lignes (`_MIGRATE_BATCH`, valeur de départ non mesurée sur base réelle — voir
+  TECHNICAL.md), curseur `(table,rowid)` persisté dans `enc_header.migration_cursor` (repris après
+  interruption, DEK jamais régénérée). Convention `IdxPurge` : `-D` rapporte tables/lignes/espace estimé sans
+  rien changer ; ni `-D` ni `-y` -> refus explicite, rien changé ; `-y` exécute réellement. Refuse si
+  `DB_ENCRYPT=false` pour ce nick, si `check_index_running`/`check_priority_lock`/`check_report_running`
+  signale une opération en cours, ou si l'espace disque libre est insuffisant (`shutil.disk_usage`, marge de
+  120% de la taille actuelle du `.db` — `_DB_SPACE_MARGIN`, non mesurée, documentée). Avant le tout dernier
+  commit (`path_enc: migrating -> siv1`), relit un échantillon de lignes migrées et vérifie l'aller-retour
+  (`decode(stored)==original`) — jamais de commit final avant validation. `cache.db`
+  (`cachejsonboexlm`) est purgée puis recréée directement en mode chiffré (pas de migration ligne à ligne,
+  cohérent avec la Story 4).
+- **`DbDecrypt -n nick [-D] [-y]`.** Symétrique (sens inverse, `path_enc: migrating -> plain` au commit
+  final — l'en-tête est alors supprimé, jamais réécrit à `path_enc='plain'`, cf AD-2). Même discipline
+  (verrous, curseur repris, validation avant le dernier commit). Pas de contrôle `DB_ENCRYPT` : déchiffrer
+  reste toujours permis.
+- **`DbRekey -n nick [-y]`.** Ré-enveloppe la DEK existante avec une nouvelle KEK (nouveau sel, nouveau
+  nonce, `DB_KDF` courant du nick) — aucune ligne de donnée n'est rechiffrée. Refuse sur une base non `siv1`
+  (rien à re-clé). Limitation documentée, non comblée : `borgHelperWWW` n'a aucun mécanisme pour être
+  notifié d'un `DbRekey` exécuté en CLI (pas de canal inter-process dans ce projet) — son memo de codec
+  (`_NICK_CODEC_MEMO`, Story 4) reste périmé jusqu'à son redémarrage.
+- **`DbStatus -n nick/ALL`.** Affiche le mode (`plain`/`siv1`/`migrating`) de `cache.db` et `diff.db` pour
+  chaque nick — lecture directe de `db_meta.enc_header` (seule exception documentée à AD-1 : aucune ligne
+  de chemin/blob n'est lue, le codec n'entre jamais en jeu, donc aucune passphrase n'est nécessaire pour
+  simplement annoncer un mode).
+- **AD-6 activé.** `_open_db` avertit désormais une fois par base et par nick (stderr, précédent
+  `_warn_rc_perms`) quand la base reste `plain` alors que `DB_ENCRYPT` est actif pour ce nick et qu'une
+  passphrase est disponible — cite la commande `DbEncrypt` à lancer. Jamais bloquant (le mode `plain` reste
+  valide, AD-2/AD-5).
+- **Barrière AD-11 étendue.** `_open_db` refuse désormais (`DbModeError`) tout rôle non-admin sur une base
+  `path_enc='migrating'` — seule la connexion admin de `DbEncrypt`/`DbDecrypt` peut l'ouvrir pendant la
+  migration ; tout lecteur/écrivain concurrent (y compris un `Bkp`/`Index` déjà en cours d'ouverture) est
+  refusé net plutôt que de voir un mode mixte.
+- **Nouvelles primitives internes :** `_enc_header_cas`/`_enc_header_cas_delete` (mise à jour/suppression
+  compare-and-swap d'un en-tête déjà existant — distinctes de `_enc_header_write`, réservée à la toute
+  première écriture) ; `_check_disk_space` (nouveau, aucun précédent) ; champ d'en-tête `migrating_dir`
+  (`'encrypt'`/`'decrypt'`, présent uniquement pendant `path_enc='migrating'`, disparaît au commit final) —
+  dit laquelle des deux commandes a le droit de reprendre une migration interrompue (sans lui, `DbDecrypt`
+  pourrait reprendre à tort une migration lancée par `DbEncrypt`, et réciproquement). Toute transition qui
+  change `path_enc` reconstruit l'en-tête en entier via `_enc_header_build` (même DEK, nouveau sel/nonce/MAC)
+  — le MAC de l'enveloppe couvre `path_enc`, un simple `dict(header,path_enc=...)` laisserait un MAC calculé
+  pour l'ancien mode.
+
 ## borgHelper 1.0.103 — chiffrement des chemins SQLite, story 4 : caches + durcissement Sentry — 2026-09-22
 
 Chiffre le dernier cache en clair de `borgHelper` (`cachejsonboexlm.details`) et durcit l'initialisation Sentry contre
