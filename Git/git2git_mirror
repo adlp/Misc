@@ -21,12 +21,17 @@
 set -euo pipefail
 
 DryRun=0
+Subdir=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         -n|--dry-run)
             DryRun=1
             shift
+            ;;
+        -s|--subdir)
+            Subdir=$2
+            shift 2
             ;;
         -h|--help)
             HELP=1
@@ -50,14 +55,20 @@ if [ "${HELP:-0}" = "1" ] || [ $# != 2 ]; then
     cat <<EOF
 Script qui synchronise l\'integralite d\'un depot git (branches, tags, refs) vers un autre depot git, a la maniere d\'un rsync.
 
-Usage : git2git_mirror [-n|--dry-run] <RepoSrc> <RepoDest>
+Usage : git2git_mirror [-n|--dry-run] [-s|--subdir <chemin>] <RepoSrc> <RepoDest>
 
-    -n, --dry-run   Simule la synchronisation sans rien pousser (affiche ce qui serait fait)
-    RepoSrc          URL ou chemin du depot git source
-    RepoDest         URL ou chemin du depot git destination (sera ecrase pour correspondre a RepoSrc)
+    -n, --dry-run       Simule la synchronisation sans rien pousser (affiche ce qui serait fait)
+    -s, --subdir <path> N\'exporte que ce sous-repertoire de RepoSrc (avec son historique),
+                        en le remontant a la racine de RepoDest. Pratique pour exposer un
+                        sous-projet comme depot independant.
+    RepoSrc             URL ou chemin du depot git source
+    RepoDest            URL ou chemin du depot git destination (sera ecrase pour correspondre a RepoSrc)
 
 Attention : le mode normal (sans --dry-run) fait un push --mirror, donc toute ref presente
-sur RepoDest et absente de RepoSrc sera supprimee.
+sur RepoDest et absente de RepoSrc (ou de son extraction avec --subdir) sera supprimee.
+
+Avec --subdir, l\'historique est reecrit (git-filter-repo) : les commits qui ne touchent pas
+ce sous-repertoire sont elimines et les hash de commits changent.
 EOF
     exit 0
 fi
@@ -68,16 +79,40 @@ RepoDest=$2
 TmpDir=$(mktemp -d)
 trap 'rm -rf "${TmpDir}"' EXIT
 
-echo "Clonage miroir de ${RepoSrc}..."
-git clone --mirror --quiet "${RepoSrc}" "${TmpDir}/mirror.git"
+if [ -n "${Subdir}" ]; then
+    if ! command -v git-filter-repo >/dev/null 2>&1; then
+        echo "git-filter-repo est requis pour --subdir (https://github.com/newren/git-filter-repo)" >&2
+        exit 1
+    fi
 
-cd "${TmpDir}/mirror.git"
+    echo "Clonage de ${RepoSrc}..."
+    git clone --quiet "${RepoSrc}" "${TmpDir}/work"
+    cd "${TmpDir}/work"
 
-if [ "${DryRun}" = "1" ]; then
-    echo "--- Dry-run : refs qui seraient poussees vers ${RepoDest} ---"
-    git push --mirror --dry-run "${RepoDest}"
+    echo "Extraction du sous-repertoire ${Subdir}..."
+    git filter-repo --subdirectory-filter "${Subdir}" --force
+
+    git remote add dest "${RepoDest}"
+
+    if [ "${DryRun}" = "1" ]; then
+        echo "--- Dry-run : refs qui seraient poussees vers ${RepoDest} ---"
+        git push --mirror --dry-run dest
+    else
+        echo "Synchronisation vers ${RepoDest}..."
+        git push --mirror dest
+        echo "Synchronisation terminee."
+    fi
 else
-    echo "Synchronisation vers ${RepoDest}..."
-    git push --mirror "${RepoDest}"
-    echo "Synchronisation terminee."
+    echo "Clonage miroir de ${RepoSrc}..."
+    git clone --mirror --quiet "${RepoSrc}" "${TmpDir}/mirror.git"
+    cd "${TmpDir}/mirror.git"
+
+    if [ "${DryRun}" = "1" ]; then
+        echo "--- Dry-run : refs qui seraient poussees vers ${RepoDest} ---"
+        git push --mirror --dry-run "${RepoDest}"
+    else
+        echo "Synchronisation vers ${RepoDest}..."
+        git push --mirror "${RepoDest}"
+        echo "Synchronisation terminee."
+    fi
 fi
