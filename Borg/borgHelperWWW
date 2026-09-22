@@ -6,7 +6,7 @@
 #* See <http://www.gnu.org/licenses/>
 #*/
 
-import os,re,sys,io,json,sqlite3,secrets,subprocess,configparser,tarfile
+import os,re,sys,io,json,sqlite3,secrets,subprocess,configparser,tarfile,hmac,hashlib
 from pathlib import Path
 from typing import Optional
 from collections import defaultdict
@@ -16,12 +16,13 @@ from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
-from borgHelper import Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail
+from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail,
+                         DbKeyError, DbTamperError, DbCodecError)
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.15.1"
+WWW_VERSION="1.15.2"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -478,6 +479,35 @@ def _validate_groups_paths_startup():
 
 _validate_groups_paths_startup()
 _RESPONSE_CACHE={}
+# AD-13 : la clé inclut un condensé salé (sel aléatoire par processus, jamais persisté) de la
+# passphrase de la requête, jamais la passphrase en clair — deux passphrases différentes pour le
+# même (cmd,nick,args) n'interfèrent jamais. Sans passphrase (route non protégée) : composante
+# absente de la clé, comportement actuel inchangé (comme aujourd'hui pour une base plain).
+_RESPONSE_CACHE_SALT=secrets.token_bytes(32)
+
+def _passphrase_digest(passphrase: Optional[str]) -> Optional[str]:
+    # Choix délibéré, aligné sur `_exec_borghelper` (`if passphrase:` — ci-dessous) : une passphrase
+    # vide ('') est traitée EXACTEMENT comme une passphrase absente (None), pas comme une passphrase
+    # distincte. Les deux produisent la même exécution sous-jacente (aucun BORGHELPERC_RUNTIME_
+    # PASSPHRASE positionné, repli sur la config serveur du nick) — les distinguer dans la clé de
+    # `_RESPONSE_CACHE` créerait deux entrées pour un résultat strictement identique, sans gain de
+    # sécurité. Si `_exec_borghelper` change un jour ce test de vacuité, ce test doit changer avec lui.
+    if not passphrase: return None
+    return hmac.new(_RESPONSE_CACHE_SALT,passphrase.encode('utf-8','surrogateescape'),hashlib.sha256).hexdigest()
+
+# Messages/erreurs reconnaissables d'une base chiffrée sans/mauvaise passphrase (Story 1 AD-5) :
+# soit le nom de l'exception (traceback non attrapé, cas actuel le plus courant côté borgHelper),
+# soit un message ad hoc qui le mentionne. Un résultat qui matche n'est JAMAIS mis en cache
+# (AD-13) : rejoué en erreur à chaque appel, jamais servi comme un succès obsolète ou trompeur.
+_DB_KEY_ERROR_MARKERS=('DbKeyError','DbModeError','DbTamperError','DbCodecError')
+
+def _is_db_key_error(result: CommandResult) -> bool:
+    # Sur-approximation délibérée par sous-chaîne : une sortie borg/borgHelper qui contiendrait par
+    # coïncidence l'un de ces mots (jamais vu en pratique, mais pas impossible, ex. dans un nom
+    # d'archive ou un chemin) serait aussi exclue du cache — préféré à un faux négatif (AD-13).
+    if result.exitcode==0: return False
+    text=f"{result.stdout or ''}\n{result.stderr or ''}"
+    return any(m in text for m in _DB_KEY_ERROR_MARKERS)
 
 def _cache_db_paths(nick: Optional[str]):
     nicks=[n.strip() for n in nick.split(',')] if (nick and nick!='ALL') else \
@@ -572,13 +602,69 @@ def _scope_cache_key(nick,cmd,params,scope_signature):
     DiffTop et ne sont jamais passés à borgHelper en sous-processus, ex. depth/topn/sort)."""
     return json.dumps([nick,cmd,params,scope_signature],ensure_ascii=False,sort_keys=True)
 
+# ── Chiffrement par ligne de scopecache.db (Story 4, AD-9) ──────────────────────────────────────
+# scopecache.db reste elle-même non chiffrée au niveau base (AD-9/Design Notes du spec 4) : seule
+# la colonne result_json est chiffrée, avec la DEK du nick PROPRIÉTAIRE de la ligne (jamais celle
+# de l'appelant), obtenue en ouvrant le diff.db de ce nick via le point d'ouverture unique
+# `_open_db` (AD-1) — jamais une seconde implémentation du déchiffrement.
+_NICK_CODEC_MEMO={}          # (nick, empreinte de passphrase) -> DbCodec | None | _CACHE_LOCKED
+_NICK_CODEC_MEMO_MAX=256     # borné, mémoire du processus uniquement, jamais persisté (Boundaries)
+_CACHE_LOCKED=object()       # sentinel : nick chiffré mais passphrase absente/incorrecte pour CE nick
+_MEMO_MISS=object()          # sentinel local : distingue "pas encore mémoïsé" de "mémoïsé à None"
+
+def _nick_owner_codec(nick):
+    """DbCodec du diff.db du nick propriétaire d'une ligne de scopecache.db, ou None si ce nick est
+    en clair (pas de diff.db, ou diff.db sans enc_header — comportement actuel, ligne non
+    chiffrée), ou le sentinel `_CACHE_LOCKED` si ce nick est chiffré mais que sa passphrase
+    (résolue depuis la config serveur, comme pour toute ouverture borgHelper de ce nick) est
+    absente ou incorrecte — dans ce dernier cas l'appelant ne doit ni lire ni écrire de ligne de
+    cache pour ce nick (jamais d'erreur visible, jamais de lecture erronée). Mémoïsé par
+    (nick, empreinte de passphrase) en mémoire du processus WWW, jamais persisté sur disque."""
+    diff_db=_bh_paths.db.get_diff_db(nick)
+    if not os.path.exists(diff_db): return None  # jamais indexé : rien à ouvrir (AD-12)
+    try:
+        cfg=_bh_paths.borg.cfgread(nick)
+    except (configparser.Error,OSError):
+        cfg=None  # rc absent/section manquante/erreur de lecture attendue : passphrase absente, silencieux
+    except Exception as e:
+        # Toute autre exception ici est INATTENDUE (cfgread ne devrait lever ni configparser.Error ni
+        # OSError autre) — dégrade quand même en "passphrase absente" (jamais une erreur visible pour
+        # l'appelant, Boundaries), mais avec une trace distincte pour qu'un opérateur ne confonde pas
+        # une vraie mauvaise config avec un simple nick verrouillé.
+        cfg=None
+        print(f"[WARN] _nick_owner_codec({nick!r}): cfgread a levé {type(e).__name__}: {e} — traité comme passphrase absente",file=sys.stderr)
+    pw=cfg.get('BORG_PASSPHRASE') if cfg else None
+    ck=(nick,hashlib.sha256((pw or '').encode('utf-8','surrogateescape')).hexdigest())
+    cached=_NICK_CODEC_MEMO.get(ck,_MEMO_MISS)
+    if cached is not _MEMO_MISS: return cached
+    conn=None
+    try:
+        conn=_open_db(diff_db,nick=nick,role='read',passphrase=pw)
+        result=conn.codec  # None (base plain) ou DbCodec (siv1 + passphrase correcte)
+    except (DbKeyError,DbTamperError,DbCodecError,sqlite3.Error):
+        result=_CACHE_LOCKED
+    finally:
+        # Séparé de la capture d'erreur ci-dessus : un échec de close() après une ouverture réussie ne
+        # doit jamais faire passer un codec valide pour _CACHE_LOCKED (mémoïsé, donc collant sinon).
+        if conn is not None:
+            try: conn.close()
+            except sqlite3.Error: pass
+    if len(_NICK_CODEC_MEMO)>=_NICK_CODEC_MEMO_MAX: _NICK_CODEC_MEMO.clear()
+    _NICK_CODEC_MEMO[ck]=result
+    return result
+
 def _scope_cache_get(nick,cmd,params,scope_signature,fingerprint):
     """Retourne le CommandResult (dict) en cache pour (nick, cmd, params, scope_signature) si son
     empreinte stockée correspond exactement à `fingerprint` (hit frais) ; None sinon (absent ou
     périmé — l'appelant retombe alors sur le chemin borgHelper existant, jamais pire qu'avant
     cette story). Ce cache est une pure optimisation : toute erreur SQLite (contention, corruption)
     ou ligne stockée corrompue (`json.loads` échoue) est traitée comme un miss, jamais propagée —
-    une requête déjà calculable avant cette story ne doit jamais échouer à cause de ce cache."""
+    une requête déjà calculable avant cette story ne doit jamais échouer à cause de ce cache.
+    Story 4/AD-9 : si le nick propriétaire de la ligne est chiffré mais verrouillé (passphrase
+    absente/incorrecte pour LUI), traité comme un miss — jamais une lecture erronée. Une ligne
+    chiffrée illisible (MAC invalide, `DbCodecError`) est aussi un miss, jamais une exception."""
+    codec=_nick_owner_codec(nick)
+    if codec is _CACHE_LOCKED: return None
     key=_scope_cache_key(nick,cmd,params,scope_signature)
     try:
         conn=_open_db(SCOPE_CACHE_DB,nick=None,role='read')
@@ -589,8 +675,12 @@ def _scope_cache_get(nick,cmd,params,scope_signature,fingerprint):
     except sqlite3.Error:
         return None
     if row is None or row[0]!=fingerprint: return None
+    payload=row[1]
+    if codec is not None:
+        try: payload=codec.blob.decrypt(payload)
+        except DbCodecError: return None  # ligne illisible = cache miss (AD-9), jamais une erreur
     try:
-        return json.loads(row[1])
+        return json.loads(payload)
     except ValueError:
         return None
 
@@ -602,8 +692,15 @@ def _scope_cache_put(nick,cmd,params,scope_signature,fingerprint,result_dict):
     être partagé entre plusieurs workers (--workers), contrairement à `_RESPONSE_CACHE` en mémoire —
     sans ça deux writers concurrents pourraient tous deux observer >500 lignes et purger chacun leur
     tour. Pure optimisation : toute erreur SQLite est avalée, jamais propagée — la réponse a déjà
-    été calculée et doit être retournée à l'appelant quoi qu'il arrive ici."""
+    été calculée et doit être retournée à l'appelant quoi qu'il arrive ici.
+    Story 4/AD-9 : `result_json` est chiffré avec la DEK du nick PROPRIÉTAIRE (`nick`, jamais celle
+    d'un autre nick d'une requête multi-nick). Nick chiffré mais verrouillé (passphrase absente/
+    incorrecte pour lui) : aucune écriture pour cette ligne, jamais d'erreur visible."""
+    codec=_nick_owner_codec(nick)
+    if codec is _CACHE_LOCKED: return  # jamais de mise en cache pour cette ligne (Boundaries)
     key=_scope_cache_key(nick,cmd,params,scope_signature)
+    payload=json.dumps(result_dict,ensure_ascii=False)
+    if codec is not None: payload=codec.blob.encrypt(payload)
     try:
         conn=_open_db(SCOPE_CACHE_DB,nick=None,role='write')
         try:
@@ -611,7 +708,7 @@ def _scope_cache_put(nick,cmd,params,scope_signature,fingerprint,result_dict):
             count=conn.execute("SELECT COUNT(*) FROM scope_cache").fetchone()[0]
             if count>500: conn.execute("DELETE FROM scope_cache")
             conn.execute("INSERT OR REPLACE INTO scope_cache (cache_key,fingerprint,result_json,written_at) "
-                         "VALUES (?,?,?,datetime('now'))",(key,fingerprint,json.dumps(result_dict,ensure_ascii=False)))
+                         "VALUES (?,?,?,datetime('now'))",(key,fingerprint,payload))
             conn.commit()
         finally:
             conn.close()
@@ -656,14 +753,16 @@ def _exec_borghelper(cmd: str, nick: Optional[str], extra_args, passphrase: Opti
 
 def run_borghelper(cmd: str, nick: Optional[str]=None, extra_args=(), passphrase: Optional[str]=None,
                     cacheable: bool=False) -> JSONResponse:
-    key=(cmd,nick,tuple(extra_args)) if cacheable else None
+    pw_digest=_passphrase_digest(passphrase) if cacheable else None
+    key=((cmd,nick,tuple(extra_args),pw_digest) if pw_digest is not None else (cmd,nick,tuple(extra_args))) \
+        if cacheable else None
     if key is not None:
         cached=_RESPONSE_CACHE.get(key)
         if cached is not None and cached[0]==_cache_fingerprint(nick):
             result_dict=cached[1]
             return JSONResponse(status_code=200 if result_dict['exitcode']==0 else 400,content=result_dict)
     result=_exec_borghelper(cmd,nick,extra_args,passphrase)
-    if key is not None:
+    if key is not None and not _is_db_key_error(result):
         if len(_RESPONSE_CACHE)>500: _RESPONSE_CACHE.clear()  # garde-fou anti-croissance illimitée
         _RESPONSE_CACHE[key]=(_cache_fingerprint(nick),result.dict())
     return JSONResponse(status_code=200 if result.exitcode==0 else 400,content=result.dict())

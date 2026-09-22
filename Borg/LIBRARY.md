@@ -58,6 +58,10 @@ de la connexion (`conn.mode`). Pas un verrou d'exclusion mutuelle, une garde de 
 avant une migration. `index()` l'intercepte spécifiquement par paire (paire reportée via `index_pending`, jamais «
 borg diff échoué ») ; ailleurs elle se propage à l'appelant.
 
+`cache_prune_dryrun`/`cacheJsonBoexWithLM` (depuis 1.0.103) : signature inchangée. Sur une base `cache.db` chiffrée,
+`details` est transparemment chiffré à l'écriture et déchiffré à la lecture (`conn.codec.blob`) ; une ligne illisible
+(`DbCodecError`) est absorbée en interne et traitée comme un cache miss, jamais propagée à l'appelant.
+
 ```python
 from borgHelper import _open_db, DbKeyError
 conn = _open_db(db_path, nick='mon-serveur', role='read')   # BhConnection ; .codec est None si la base est plain

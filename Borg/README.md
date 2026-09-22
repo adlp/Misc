@@ -733,6 +733,9 @@ chemin : mêmes résultats sur une base `plain` et sur une base chiffrée pour `
 Vérifie aussi l'écriture (story 3) : aller-retour `store_diff_entries`/`store_archive_snapshot` sur une base chiffrée
 temporaire, `DbModeError` levée (et non avalée) quand le mode change sous une transaction ouverte, et qu'un nick jamais
 indexé ne crée aucun schéma de base via les commandes de lecture (`ensure_diff_db`/`ensure_cache_db(create=False)`).
+Vérifie aussi le cache `cachejsonboexlm` (story 4) : `cacheJsonBoexWithLM` sur un nick dont le `cache.db` est chiffré
+— `details` chiffré au repos, hit servi sans second appel borg, ligne altérée traitée comme un cache miss (borg
+rappelé) plutôt que comme une exception.
 Travaille uniquement sur des bases temporaires : aucune vraie base ni aucun vrai rc n'est lu. Une ligne `OK`/`FAIL` par
 contrôle ; code de sortie non nul au moindre échec.
 
@@ -1264,6 +1267,16 @@ fichier), ce qui aurait invalidé le cache par périmètre à chaque requête et
 inopérant en pratique. Comportement CLI/format de sortie de `borgHelper` inchangés par ces deux
 correctifs — seule la date de modification des fichiers `.db` en bénéficie (moins d'écritures inutiles
 sur disque, en plus de rendre ce cache par périmètre effectif).
+
+**Chiffrement au repos (Story 4).** Sur un nick dont le `diff.db` est chiffré, chaque ligne du cache par
+périmètre ci-dessus est chiffrée avec la DEK de ce nick (jamais celle d'un autre nick d'une requête
+multi-nick) — `scopecache.db` elle-même reste un fichier non chiffré, seule la colonne du résultat
+filtré l'est. Passphrase de ce nick absente/incorrecte : ni lecture ni écriture pour ses lignes (dégrade
+en cache miss silencieux, jamais une erreur visible). `_RESPONSE_CACHE` inclut désormais un condensé
+salé de la passphrase de la requête dans sa clé quand une passphrase est fournie (deux passphrases
+différentes pour le même appel ne partagent jamais une entrée) ; sans passphrase, comportement inchangé.
+Un résultat d'erreur de clé/mode de base n'est jamais mis en cache : rejoué à chaque appel plutôt que
+servi comme une réponse obsolète.
 
 | Méthode | Route | Commande CLI | Cache |
 |---------|-------|--------------|:---:|

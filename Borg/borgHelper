@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.102"
+Version="1.0.103"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -1853,6 +1853,9 @@ class BorgHelper:
         try:
             conn=_open_db(db_path,nick=nick,role='read')
             row=conn.execute("SELECT details FROM cachejsonboexlm WHERE nom=? AND lastmodified=? LIMIT 1",(nom,last_modified)).fetchone()
+            if row is not None and conn.codec is not None:
+                try: row=(conn.codec.blob.decrypt(row[0]),)
+                except DbCodecError: row=None  # ligne illisible = cache miss (AD-9), jamais une erreur
             conn.close()
         except sqlite3.Error: row=None
         if row is not None:
@@ -1875,7 +1878,9 @@ class BorgHelper:
         try:
             self.db.ensure_cache_db(db_path)  # cache miss confirmé : on écrit -> création légitime (AD-12 ne visait que le lookup)
             conn=_open_db(db_path,nick=nick,role='write')
-            conn.execute("INSERT OR IGNORE INTO cachejsonboexlm (nom,lastmodified,details) VALUES (?,?,?)",(nom,last_modified,json.dumps(pruneme)))
+            details_json=json.dumps(pruneme)
+            stored=conn.codec.blob.encrypt(details_json) if conn.codec is not None else details_json
+            conn.execute("INSERT OR IGNORE INTO cachejsonboexlm (nom,lastmodified,details) VALUES (?,?,?)",(nom,last_modified,stored))
             conn.commit(); conn.close()
         except sqlite3.Error as e:
             printer(f"Cache write error ({db_path}): {e}")
@@ -1889,6 +1894,9 @@ class BorgHelper:
         try:
             conn=_open_db(db_path,nick=nick,role='read')
             row=conn.execute("SELECT details FROM cachejsonboexlm WHERE nom=? AND lastmodified=? LIMIT 1",(nick,last_modified)).fetchone()
+            if row is not None and conn.codec is not None:
+                try: row=(conn.codec.blob.decrypt(row[0]),)
+                except DbCodecError: row=None  # ligne illisible = cache miss (AD-9), jamais une erreur
             conn.close()
         except sqlite3.Error as e:
             printer(f"Cache SQLite error ({db_path}): {e}"); row=None
@@ -1898,7 +1906,9 @@ class BorgHelper:
             try:
                 self.db.ensure_cache_db(db_path)  # cache miss confirmé : on écrit -> création légitime (AD-12 ne visait que le lookup)
                 conn=_open_db(db_path,nick=nick,role='write')
-                conn.execute("INSERT OR IGNORE INTO cachejsonboexlm (nom,lastmodified,details) VALUES (?,?,?)",(nick,last_modified,json.dumps(details)))
+                details_json=json.dumps(details)
+                stored=conn.codec.blob.encrypt(details_json) if conn.codec is not None else details_json
+                conn.execute("INSERT OR IGNORE INTO cachejsonboexlm (nom,lastmodified,details) VALUES (?,?,?)",(nick,last_modified,stored))
                 conn.commit(); conn.close()
             except sqlite3.Error as e:
                 printer(f"Cache write error ({db_path}): {e}")
@@ -4448,6 +4458,82 @@ def codec_selftest():
             c.close()
             return ok1 and ok2
         check("_write_mode_check : mode inchangé -> silencieux ; mode changé sous une transaction ouverte -> DbModeError (AD-11)",_write_mode_check_raises)
+        def _cache_roundtrip_ok():
+            """cachejsonboexlm (Story 4, AD-9) : aller-retour chiffré/déchiffré via cacheJsonBoexWithLM
+            sur un nick dont le cache.db est chiffré (details chiffré, nom/lastmodified en clair) ;
+            ligne altérée (MAC blob invalide) = cache miss (borg rappelé), jamais une exception propagée."""
+            with open(qrc,'a') as f: f.write("[qc]\nBORG_REPO=/r\nBORG_PASSPHRASE=qcpw\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n\n")
+            os.chmod(qrc,0o600)
+            try:
+                nick='qc'; cp=bhq.db.get_cache_db(nick)
+                for suf in ('','-wal','-shm'):
+                    if os.path.exists(cp+suf): os.unlink(cp+suf)
+                bhq.db.ensure_cache_db(cp)
+                hdr,dek=_enc_header_build('qcpw','siv1','light')
+                ca=_open_db(cp,nick=None,role='admin'); _enc_header_write(ca,hdr); ca.close()
+                calls=[0]
+                def _fake_boex(nk,arg,debug=0):
+                    calls[0]+=1
+                    return {'stdout':[{'archives':[{'name':'A1'}]}],'stderr':[],'exitcode':0}
+                orig_boex=bhq.borg.boex; orig_lm=bhq.borg._boex_last_modified
+                bhq.borg.boex=_fake_boex; bhq.borg._boex_last_modified=lambda nk,debug=0:'LM1'
+                try:
+                    d1=bhq.cacheJsonBoexWithLM(nick,['info','--json'],output='stdout')
+                    d2=bhq.cacheJsonBoexWithLM(nick,['info','--json'],output='stdout')  # doit venir du cache (hit)
+                    hits_ok=calls[0]==1 and d1==d2=={'archives':[{'name':'A1'}]}
+                    c=_open_db(cp,nick=nick,passphrase='qcpw')
+                    stored=c.execute("SELECT details FROM cachejsonboexlm WHERE nom=? AND lastmodified=?",(nick,'LM1')).fetchone()[0]
+                    stored_encrypted=stored!=json.dumps(d1)  # jamais de clair sur disque
+                    i=len(stored)//2
+                    tampered=('B' if stored[i]!='B' else 'C').join([stored[:i],stored[i+1:]])
+                    c.execute("UPDATE cachejsonboexlm SET details=? WHERE nom=? AND lastmodified=?",(tampered,nick,'LM1'))
+                    c.commit(); c.close()
+                    calls[0]=0
+                    d3=bhq.cacheJsonBoexWithLM(nick,['info','--json'],output='stdout')  # ligne illisible -> miss, borg rappelé
+                    return hits_ok and stored_encrypted and d3==d1 and calls[0]==1
+                finally:
+                    bhq.borg.boex=orig_boex; bhq.borg._boex_last_modified=orig_lm
+            finally:
+                _q_rc()
+        check("cachejsonboexlm : aller-retour chiffré via cacheJsonBoexWithLM (details chiffré au repos, hit sans rappel borg), ligne altérée -> cache miss et non une exception (AD-9)",_cache_roundtrip_ok)
+        def _cache_prune_roundtrip_ok():
+            """cachejsonboexlm (Story 4, AD-9) : même contrôle que _cache_roundtrip_ok mais pour
+            cache_prune_dryrun (nom=f"{nick}:prune", site d'écriture distinct de cacheJsonBoexWithLM,
+            jamais exercé par ce dernier) : aller-retour chiffré/déchiffré, hit sans rappel borg, ligne
+            altérée (MAC blob invalide) = cache miss (borg prune --dry-run rappelé), jamais une exception."""
+            with open(qrc,'a') as f: f.write("[qp2]\nBORG_REPO=/r\nBORG_PASSPHRASE=qp2pw\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n\n")
+            os.chmod(qrc,0o600)
+            try:
+                nick='qp2'; cp=bhq.db.get_cache_db(nick); nom=f"{nick}:prune"
+                for suf in ('','-wal','-shm'):
+                    if os.path.exists(cp+suf): os.unlink(cp+suf)
+                bhq.db.ensure_cache_db(cp)
+                hdr,dek=_enc_header_build('qp2pw','siv1','light')
+                ca=_open_db(cp,nick=None,role='admin'); _enc_header_write(ca,hdr); ca.close()
+                calls=[0]
+                def _fake_boex(nk,arg,debug=0):
+                    calls[0]+=1
+                    return {'stdout':[],'stderr':['Would prune: archive-1 Sun, 2026-01-01 00:00:00'],'exitcode':0}
+                orig_boex=bhq.borg.boex; bhq.borg.boex=_fake_boex
+                try:
+                    d1=bhq.cache_prune_dryrun(nick,'LM1')
+                    d2=bhq.cache_prune_dryrun(nick,'LM1')  # doit venir du cache (hit)
+                    hits_ok=calls[0]==1 and d1==d2==['archive-1']
+                    c=_open_db(cp,nick=nick,passphrase='qp2pw')
+                    stored=c.execute("SELECT details FROM cachejsonboexlm WHERE nom=? AND lastmodified=?",(nom,'LM1')).fetchone()[0]
+                    stored_encrypted=stored!=json.dumps(d1)  # jamais de clair sur disque
+                    i=len(stored)//2
+                    tampered=('B' if stored[i]!='B' else 'C').join([stored[:i],stored[i+1:]])
+                    c.execute("UPDATE cachejsonboexlm SET details=? WHERE nom=? AND lastmodified=?",(tampered,nom,'LM1'))
+                    c.commit(); c.close()
+                    calls[0]=0
+                    d3=bhq.cache_prune_dryrun(nick,'LM1')  # ligne illisible -> miss, borg rappelé
+                    return hits_ok and stored_encrypted and d3==d1 and calls[0]==1
+                finally:
+                    bhq.borg.boex=orig_boex
+            finally:
+                _q_rc()
+        check("cachejsonboexlm : aller-retour chiffré via cache_prune_dryrun (nom=nick:prune, details chiffré au repos, hit sans rappel borg), ligne altérée -> cache miss et non une exception (AD-9)",_cache_prune_roundtrip_ok)
         def _store_diff_entries_blocked_by_mode_change():
             """La barrière est bien le premier appel du site (store_diff_entries) : si elle lève,
             aucune ligne n'est écrite et l'erreur n'est pas avalée (propagée à l'appelant)."""
@@ -4572,6 +4658,21 @@ def codec_selftest():
             finally:
                 bhq.borg.boex=orig_boex; _q_rc()
         check("nick jamais indexé/jamais mis en cache : DiffBkp/CacheClean/CachePruneDryrun/CacheJsonBoexWithLM -> aucun schéma créé avant l'échec borg (create=False + guard purge_stale_cache)",_never_indexed_borg_sites_ok)
+        # ── Sentry before_send/_sentry_scrub (AD-15) — sans ce contrôle, une régression ici fuiterait
+        # des passphrases/DEK/chemins vers Sentry avec l'ensemble des autres contrôles toujours au vert.
+        def _sentry_scrub_ok():
+            event={'extra':{'passphrase':'x','other':'y'},
+                   'contexts':{'c':{'k_path':'z','n':1}},
+                   'exception':{'values':[{'stacktrace':{'frames':[
+                       {'vars':{'pw':'secret','chemin':'/a/b','ok':'keep'}}]}}]}}
+            out=_sentry_before_send(event,None)
+            return (out['extra']=={'passphrase':'[redacted]','other':'y'} and
+                    out['contexts']['c']=={'k_path':'[redacted]','n':1} and
+                    out['exception']['values'][0]['stacktrace']['frames'][0]['vars']==
+                        {'pw':'[redacted]','chemin':'[redacted]','ok':'keep'})
+        check("Sentry before_send : clés sensibles (passphrase/k_path/pw/chemin) redactées dans extra/contexts/vars de frame, clé non sensible conservée telle quelle (AD-15)",_sentry_scrub_ok)
+        check("Sentry _sentry_scrub : au-delà de la profondeur bornée -> '[truncated]', jamais la valeur brute non scrubbée",
+              lambda: _sentry_scrub({'a':{'b':{'c':{'d':{'e':{'f':{'g':{'h':'secret'}}}}}}}})['a']['b']['c']['d']['e']['f']['g']=='[truncated]')
     finally:
         shutil.rmtree(tmp,ignore_errors=True)
         _DB_CFG_READERS.clear(); _DB_CFG_READERS.update(saved_readers)
@@ -4584,6 +4685,34 @@ def codec_selftest():
 
 # ── CLI entry point ────────────────────────────────────────────────────────────
 
+_SENTRY_SENSITIVE_KEYS=('passphrase','password','pw','dek','secret','k_path','k_enc','k_blob','k_hdr',
+                         'wrapped_dek','kek','derived','chemin','path')
+
+def _sentry_scrub(obj,depth=0):
+    """Retire récursivement toute valeur dont la clé évoque un chemin ou un secret (AD-15).
+    Portée : extra/contexts/vars de frame (avant_send) — ne touche PAS le texte libre d'un message
+    d'exception (`exception.values[*].value`), qui peut contenir un chemin en clair (ex.
+    `FileNotFoundError: /home/nick/repo/...`) ; hors périmètre de cette story (deferred-work.md)."""
+    if depth>6: return '[truncated]'
+    if isinstance(obj,dict):
+        return {k:('[redacted]' if isinstance(k,str) and any(s in k.lower() for s in _SENTRY_SENSITIVE_KEYS)
+                    else _sentry_scrub(v,depth+1)) for k,v in obj.items()}
+    if isinstance(obj,list):
+        return [_sentry_scrub(v,depth+1) for v in obj]
+    return obj
+
+def _sentry_before_send(event,hint):
+    """before_send Sentry : purge chemins/passphrase/DEK des extra/contexts/frames avant envoi (AD-15)."""
+    if 'extra' in event: event['extra']=_sentry_scrub(event['extra'])
+    if 'contexts' in event: event['contexts']=_sentry_scrub(event['contexts'])
+    exc=event.get('exception')
+    if isinstance(exc,dict):
+        for val in exc.get('values') or []:
+            frames=((val.get('stacktrace') or {}).get('frames')) or []
+            for fr in frames:
+                if 'vars' in fr: fr['vars']=_sentry_scrub(fr['vars'])
+    return event
+
 def _cli_main():
     sentryid=getDataFromEnvOrFile(env="BORGHELPERC_SENTRY_DSN",envpath="BORGHELPERC_SENTRY_FILE",paths="/usr/local/etc/borghelper-sentry")
     if sentryid is not None:
@@ -4594,8 +4723,18 @@ def _cli_main():
         # ça désactive aussi excepthook/logging/dedupe/atexit — plus aucune exception ne remonterait
         # à Sentry (vérifié : borgHelper n'appelle jamais capture_exception() explicitement, tout
         # repose sur l'excepthook par défaut).
-        sentry_sdk.init(dsn=sentryid,environment="production",release=f"borgHelper@{Version}",traces_sample_rate=1.0,
-                         auto_enabling_integrations=False)
+        # include_local_variables=False + before_send : aucun chemin/passphrase/DEK ne doit sortir du
+        # processus vers Sentry (AD-15), y compris via les variables locales des frames capturées.
+        try:
+            sentry_sdk.init(dsn=sentryid,environment="production",release=f"borgHelper@{Version}",traces_sample_rate=1.0,
+                             auto_enabling_integrations=False,include_local_variables=False,before_send=_sentry_before_send)
+        except TypeError as e:
+            # sentry-sdk < 1.26 : option renommée (with_locals), avant include_local_variables. Ne
+            # rattraper QUE ce cas précis — toute autre TypeError (mauvais usage, autre kwarg) doit
+            # remonter normalement plutôt que d'être masquée par ce repli de compatibilité.
+            if 'include_local_variables' not in str(e): raise
+            sentry_sdk.init(dsn=sentryid,environment="production",release=f"borgHelper@{Version}",traces_sample_rate=1.0,
+                             auto_enabling_integrations=False,with_locals=False,before_send=_sentry_before_send)
 
     try:
         opts,args=getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILC:FSN:ox:DP:R",["help"])

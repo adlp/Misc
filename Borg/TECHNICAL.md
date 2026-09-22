@@ -847,6 +847,134 @@ systématiquement leur connexion sur ce chemin (`finally`), y compris quand l'ex
 
 ---
 
+## Chiffrement des caches et durcissement Sentry (1.0.103 / WWW 1.15.2, chiffrement story 4)
+
+Dernière brique de chiffrement au repos avant Story 5 (`DbEncrypt`/`DbDecrypt`/`DbRekey`) : les deux caches encore en
+clair (`cachejsonboexlm` côté `borgHelper`, `scopecache.db` côté `borgHelperWWW`) et `_RESPONSE_CACHE` (mémoire,
+`borgHelperWWW`). **Aucune base réelle n'est chiffrée dans cette version.**
+
+### `cachejsonboexlm.details` (`borgHelper`, AD-9)
+
+`cache_prune_dryrun` et `cacheJsonBoexWithLM` ouvrent déjà la base avec `nick=nick` (donc `conn.codec` est déjà
+correct, aucun changement de signature d'ouverture) : le payload JSON (`details`) est chiffré/déchiffré via
+`conn.codec.blob.encrypt`/`decrypt` quand `conn.codec is not None`, no-op en `plain`. Seule cette colonne change :
+`nom`/`lastmodified` restent en clair (déjà indispensables tels quels pour la contrainte `UNIQUE(nom,lastmodified)`
+et le `WHERE` de lookup). Une ligne illisible (`DbCodecError`, ex. MAC de blob invalide après altération ou mauvaise
+clé) est capturée au site de lecture et traitée comme un cache miss (`row=None`) — jamais une exception propagée ;
+borg est simplement rappelé, comme pour tout autre miss. `CodecSelfTest` exerce ce chemin de bout en bout via
+`cacheJsonBoexWithLM` (stub de `boex`/`_boex_last_modified`) : premier appel = miss (borg appelé), second appel
+identique = hit chiffré (aucun second appel borg), altération du blob stocké = miss + rappel borg, jamais d'exception.
+
+### `scopecache.db` : chiffrement par ligne avec la DEK du nick propriétaire (`borgHelperWWW`, AD-9)
+
+`scopecache.db` reste elle-même **non chiffrée au niveau fichier** (AD-9/Design Notes du spec 4 : c'est le
+chiffrement par ligne, pas le fichier, qui protège le contenu multi-nick — le schéma et l'ouverture `nick=None`
+existants ne changent pas). Seule la colonne `result_json` change.
+
+**`_nick_owner_codec(nick)`** (nouveau) : résout le `DbCodec` à utiliser pour chiffrer/déchiffrer la ligne d'**un**
+nick réel (jamais une clé combinée multi-nick, cohérent avec `_scope_cache_key`) :
+
+1. Si `<cache_dir>/<prefix>-<nick>-diff.db` n'existe pas (nick jamais indexé) → `None` (pas d'ouverture, AD-12).
+2. Sinon, passphrase résolue via `_bh_paths.borg.cfgread(nick)['BORG_PASSPHRASE']` — la même source que toute
+   commande `borgHelper` de ce nick (rc serveur), jamais une passphrase de requête HTTP : aucune des routes qui
+   utilisent le cache par périmètre (`lstbkpfls`, `diffbkp`, `search`, `filehist`, `treehist`, `treefind`, `duidx`,
+   `idxtop`, `difftop`) n'accepte de header `X-Borg-Passphrase`.
+3. `_open_db(diff_db, nick=nick, role='read', passphrase=pw)` (point d'ouverture unique, AD-1) : `conn.codec` est
+   directement le `DbCodec` cherché (`None` si le `diff.db` est `plain`, un `DbCodec` réel si `siv1` et passphrase
+   correcte). Toute exception (`DbKeyError`, `DbTamperError`, `DbCodecError`, `sqlite3.Error`) est capturée et donne
+   le sentinel `_CACHE_LOCKED` — nick chiffré mais passphrase absente/incorrecte **pour ce nick**.
+
+Résultat mémoïsé dans `_NICK_CODEC_MEMO` par `(nick, sha256(passphrase ou ''))`, borné à `_NICK_CODEC_MEMO_MAX=256`
+entrées (vidage intégral à saturation, même politique que `DbCodec._memo`) — en mémoire du processus WWW uniquement,
+jamais persisté sur disque. La dérivation ne se fait qu'à la demande (première ligne à chiffrer/lire pour ce nick),
+jamais par avance : une route qui n'écrit jamais dans le cache de ce nick ne paie jamais le coût KDF.
+
+`_scope_cache_get`/`_scope_cache_put` : `codec is _CACHE_LOCKED` dégrade en no-op silencieux (get → `None`, comme
+un miss ; put → aucune écriture) — jamais une lecture erronée, jamais une erreur visible pour l'appelant. `codec is
+None` : comportement actuel, `result_json` en clair. `codec` réel : `result_json` chiffré/déchiffré via
+`codec.blob.encrypt`/`decrypt` ; une ligne illisible (`DbCodecError`) est un cache miss, jamais une exception.
+
+### `_RESPONSE_CACHE` aligné sur AD-13 (`borgHelperWWW`)
+
+La clé de `_RESPONSE_CACHE` inclut désormais un condensé de la passphrase de la requête quand `cacheable=True` et
+qu'une passphrase est fournie (`x_borg_passphrase`, ex. route `report -o`) : `_passphrase_digest(passphrase)` =
+HMAC-SHA256(`_RESPONSE_CACHE_SALT`, passphrase), où `_RESPONSE_CACHE_SALT` est un `secrets.token_bytes(32)` tiré une
+fois par démarrage de processus, jamais persisté — deux passphrases différentes pour le même `(cmd,nick,args)`
+produisent deux entrées de cache distinctes, jamais l'une servie à la place de l'autre. **Sans passphrase** (route
+non protégée, cas majoritaire), la clé reste `(cmd,nick,args)` telle quelle : comportement inchangé, y compris pour
+une base `plain`.
+
+`_is_db_key_error(result)` : `exitcode!=0` et l'un des marqueurs `DbKeyError`/`DbModeError`/`DbTamperError`/
+`DbCodecError` présent dans `stdout`+`stderr`. Ces exceptions n'héritent pas de `sqlite3.Error` (AD-5) et ne sont pas
+toutes encore converties en JSON structuré côté `borgHelper` à ce jour (par exemple une passphrase absente sur une
+base `siv1` remonte aujourd'hui en traceback Python non attrapée depuis `_open_db`, jamais en `{"error": ...}`) — la
+détection par sous-chaîne couvre donc aussi bien un futur message structuré qu'un traceback brut, tant que le nom de
+la classe apparaît en sortie. `run_borghelper` n'écrit jamais dans `_RESPONSE_CACHE` un résultat qui matche : rejoué
+en erreur à chaque appel, jamais servi comme un succès obsolète après correction de la passphrase, ni comme une
+erreur périmée après un changement côté serveur.
+
+### Sentry durci (`borgHelper`, AD-15)
+
+`sentry_sdk.init` reçoit `include_local_variables=False` (repli sur `with_locals=False` pour `sentry-sdk` < 1.26 où
+l'option portait l'ancien nom — capturé via `except TypeError as e: if 'include_local_variables' not in str(e): raise`,
+donc **seule** cette `TypeError` précise déclenche le repli, toute autre remonte) et `before_send=_sentry_before_send`,
+qui redacte (remplace par `'[redacted]'`) toute valeur de `event['extra']`, `event['contexts']` et des `vars` de
+chaque frame de chaque exception capturée, dès que la clé associée évoque un chemin ou un secret (sous-chaîne
+insensible à la casse dans `_SENTRY_SENSITIVE_KEYS` : `passphrase`, `pw`, `dek`, `secret`, `k_path`, `k_enc`,
+`k_blob`, `k_hdr`, `wrapped_dek`, `kek`, `derived`, `chemin`, `path`), avec une profondeur de récursion bornée à 6
+(au-delà : `'[truncated]'`, jamais la structure brute non scrubbée). `auto_enabling_integrations=False` reste seul
+(régression du CHANGELOG 1.0.98 : `default_integrations=False` désactiverait aussi l'excepthook, coupant toute
+capture d'exception — `borgHelper` n'appelle jamais `capture_exception()` explicitement).
+
+**Portée précise — ne pas surestimer.** `_sentry_scrub` ne touche que `extra`/`contexts`/les `vars` de frame. Il ne
+touche PAS le **texte libre** du message d'exception (`event['exception']['values'][*]['value']`, ce que
+`sentry_sdk` construit à partir de `str(exception)`) : une exception dont le message contient un chemin en clair (ex.
+`FileNotFoundError: /home/nick/repo/cache.db`) part vers Sentry telle quelle. Aucun site actuel de `borgHelper`
+n'insère volontairement un chemin dans un message d'exception, mais rien ne l'empêche structurellement. Limitation
+connue, consignée dans `deferred-work.md` : la fermer proprement demanderait un filtrage par motif (heuristique de
+chemin, ou liste de valeurs secrètes connues à ce moment du process) sur le texte libre, hors périmètre de cette
+story. `CodecSelfTest` couvre `_sentry_before_send`/`_sentry_scrub` directement (clés sensibles redactées, clé non
+sensible conservée, troncature au-delà de la profondeur bornée).
+
+### Vérification manuelle (`borgHelperWWW`, pas de framework de test)
+
+`demo.borghelperrc` ne suffit pas seul (dépôts locaux non chiffrés) ; protocole reproductible avec un `.borghelperrc`
+de test et un `diff.db` chiffré construit à la main (résumé, voir aussi `CodecSelfTest` pour l'équivalent côté
+`borgHelper`) :
+
+```python
+import os,sys
+os.environ['BORGHELPERWWW_CFGFILE']='/chemin/vers/test.borghelperrc'  # [nick] BORG_PASSPHRASE=... + CACHE_DIR
+sys.path.insert(0,'/chemin/vers/Borg')
+import borgHelperWWW as www, borgHelper as bh
+
+p=www._bh_paths.db.get_diff_db('nick')
+www._bh_paths.db.ensure_diff_db(p)
+hdr,dek=bh._enc_header_build('la-passphrase-du-rc','siv1','light')
+c=bh._open_db(p,nick=None,role='admin'); bh._enc_header_write(c,hdr); c.close()
+
+www._scope_cache_put('nick','treehist',{},'*','fp',{'exitcode':0,'stdout':'x','stderr':''})
+assert www._scope_cache_get('nick','treehist',{},'*','fp')=={'exitcode':0,'stdout':'x','stderr':''}
+# lecture brute de scopecache.db : result_json doit différer du JSON en clair (chiffré au repos)
+
+assert www._passphrase_digest('a')!=www._passphrase_digest('b')
+assert www._passphrase_digest(None) is None
+assert www._passphrase_digest('') is None  # '' traitée comme absente, par choix délibéré (voir commentaire)
+
+class _FakeResult:
+    def __init__(self,exitcode,stdout,stderr): self.exitcode=exitcode; self.stdout=stdout; self.stderr=stderr
+assert www._is_db_key_error(_FakeResult(0,'{}','')) is False                                    # succès -> jamais
+assert www._is_db_key_error(_FakeResult(1,'','texte sans rapport')) is False                     # échec ordinaire -> pas exclu
+assert www._is_db_key_error(_FakeResult(1,'','...DbKeyError: nick: base chiffrée...')) is True   # marqueur -> exclu
+```
+
+Pour le verrouillage (passphrase absente/incorrecte pour un nick chiffré) : relancer avec un `.borghelperrc` dont la
+`BORG_PASSPHRASE` de ce nick est fausse (fichier distinct, le `db_prefix` de `borgHelperWWW` dérive du nom du fichier
+de conf) et vérifier `www._nick_owner_codec('nick') is www._CACHE_LOCKED`, puis que `_scope_cache_put`/`_get`
+deviennent des no-op silencieux (aucune ligne écrite, `_scope_cache_get` retourne toujours `None`).
+
+---
+
 ## Migration de schéma
 
 ### Versionning (`db_meta`)

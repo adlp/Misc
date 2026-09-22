@@ -1,5 +1,76 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.103 — chiffrement des chemins SQLite, story 4 : caches + durcissement Sentry — 2026-09-22
+
+Chiffre le dernier cache en clair de `borgHelper` (`cachejsonboexlm.details`) et durcit l'initialisation Sentry contre
+la fuite de chemins/secrets (AD-9/AD-15). Toujours **aucune base réelle chiffrée** (`DbEncrypt` reste Story 5).
+**Aucun changement observable en `plain`** : vérifié par `CodecSelfTest` (258/258).
+
+- **`cachejsonboexlm.details` chiffré (AD-9).** `cache_prune_dryrun` et `cacheJsonBoexWithLM` chiffrent/déchiffrent le
+  payload JSON via `conn.codec.blob.encrypt`/`decrypt` quand `conn.codec is not None` (les deux sites ouvrent déjà la
+  base avec `nick=nick`, donc `conn.codec` est déjà correct — aucun changement de signature d'ouverture). No-op en
+  `plain`. Une ligne illisible (`DbCodecError`, ex. MAC de blob invalide) est traitée comme un cache miss — borg est
+  simplement rappelé — jamais comme une erreur propagée. Seule la colonne `details` est concernée ; `nom`/
+  `lastmodified` restent en clair (déjà indispensables tels quels pour la clé `UNIQUE`).
+- **Sentry durci (AD-15).** `sentry_sdk.init` reçoit désormais `include_local_variables=False` (repli automatique sur
+  `with_locals=False` pour `sentry-sdk` < 1.26, où l'option a été renommée — le repli ne s'applique qu'à cette
+  `TypeError` précise, toute autre remonte normalement) et un `before_send` (`_sentry_before_send`) qui redacte, dans
+  `event['extra']`, `event['contexts']` et les `vars` de chaque frame de chaque exception capturée, toute valeur dont
+  la clé évoque un chemin ou un secret (`passphrase`, `pw`, `dek`, `kek`, `k_path`, `k_enc`, `k_blob`, `k_hdr`,
+  `chemin`, `path`, …), avec une profondeur de récursion bornée (au-delà : `'[truncated]'`, jamais la valeur brute).
+  **Portée précise, ne pas surestimer** : seuls `extra`/`contexts`/les `vars` de frame sont couverts ; le **texte
+  libre** du message d'exception lui-même (`event['exception']['values'][*]['value']`, ex. `FileNotFoundError:
+  /home/nick/repo/...`) n'est PAS scrubbé — un chemin peut y apparaître verbatim. Limitation connue, documentée dans
+  `deferred-work.md` (nécessiterait un filtrage par motif/heuristique de chemin, hors périmètre de cette story).
+  `auto_enabling_integrations=False` reste seul (régression du CHANGELOG 1.0.98 : ne jamais lui adjoindre
+  `default_integrations=False`, qui désactiverait aussi l'excepthook et couperait toute capture d'exception).
+- **`CodecSelfTest`.** Trois nouveaux contrôles bout-en-bout : `cacheJsonBoexWithLM` **et** `cache_prune_dryrun` sur un
+  nick dont le `cache.db` est chiffré (`details` chiffré au repos — vérifié différent du JSON en clair —, hit sans
+  second appel borg, ligne altérée déclenchant un cache miss et un rappel borg plutôt qu'une exception) ; et
+  `_sentry_before_send`/`_sentry_scrub` eux-mêmes (clés sensibles redactées, clé non sensible conservée, profondeur
+  bornée -> `'[truncated]'`) — sans ce dernier contrôle, une régression sur le cœur d'AD-15 passait inaperçue avec
+  tous les autres contrôles au vert. 261/261 contrôles passent (+3 vs 1.0.102).
+
+## borgHelperWWW 1.15.2 — chiffrement des chemins SQLite, story 4 : scopecache + `_RESPONSE_CACHE` — 2026-09-22
+
+Chiffre `scopecache.db` ligne par ligne avec la DEK du nick propriétaire et aligne `_RESPONSE_CACHE` sur AD-13
+(passphrase dans la clé, jamais une erreur de clé mise en cache). `scopecache.db` reste elle-même une base **non
+chiffrée** au niveau fichier (AD-9) : seule la colonne `result_json` change.
+
+- **`scopecache.db` : chiffrement par ligne (AD-9).** Nouvelle fonction `_nick_owner_codec(nick)` : ouvre le `diff.db`
+  du nick propriétaire de la ligne via le point d'ouverture unique `_open_db` (AD-1, passphrase résolue comme pour
+  toute commande borgHelper de ce nick, donc jamais un second mécanisme de résolution), et retourne son `DbCodec` —
+  ou `None` si le nick est en clair/jamais indexé (comportement actuel inchangé, ligne non chiffrée), ou le sentinel
+  interne `_CACHE_LOCKED` si le nick est chiffré mais que sa passphrase est absente/incorrecte. Mémoïsé par
+  (nick, empreinte de passphrase) dans `_NICK_CODEC_MEMO`, borné (`_NICK_CODEC_MEMO_MAX=256`), en mémoire du
+  processus WWW uniquement — jamais persisté. `_scope_cache_get`/`_scope_cache_put` chiffrent/déchiffrent
+  `result_json` via `codec.blob` quand le codec est présent ; un nick verrouillé (`_CACHE_LOCKED`) dégrade la lecture
+  et l'écriture en no-op silencieux (jamais une lecture erronée, jamais une erreur visible pour l'appelant) ; une
+  ligne illisible (`DbCodecError`) est un cache miss, jamais une exception propagée.
+- **`_RESPONSE_CACHE` aligné sur AD-13.** La clé inclut désormais un condensé HMAC-SHA256 salé
+  (`_RESPONSE_CACHE_SALT`, aléatoire par processus, jamais persisté) de la passphrase de la requête
+  (`_passphrase_digest`) — deux passphrases différentes pour le même `(cmd,nick,args)` n'interfèrent jamais. Sans
+  passphrase (route non protégée), la clé reste `(cmd,nick,args)` telle quelle : comportement inchangé pour une base
+  `plain`. Un résultat détecté comme une erreur de clé/mode/altération (`_is_db_key_error` : `exitcode!=0` et l'un des
+  marqueurs `DbKeyError`/`DbModeError`/`DbTamperError`/`DbCodecError` présent en sortie — ces exceptions ne sont pas
+  toutes encore converties en JSON structuré côté `borgHelper`, la détection couvre donc aussi le traceback non
+  attrapé ; sur-approximation par sous-chaîne assumée, documentée en commentaire) n'est jamais écrit dans
+  `_RESPONSE_CACHE` : rejoué en erreur à chaque appel plutôt que servi comme obsolète.
+  **Capacité** : une passphrase suffixant désormais la clé pour les appels protégés, un même `(cmd,nick,args)`
+  interrogé avec plusieurs passphrases différentes occupe plusieurs entrées au lieu d'une seule — le seuil de purge
+  totale à 500 entrées (inchangé) est donc atteint plus vite qu'avant cette version dans ce cas d'usage.
+- **`_nick_owner_codec`** : `cfgread(nick)` n'est plus avalé par un `except (Exception,SystemExit)` générique —
+  `configparser.Error`/`OSError` (cas attendus : rc absent/malformé) dégradent silencieusement en passphrase absente,
+  toute autre exception dégrade de la même façon mais imprime un avertissement distinct sur stderr (pour distinguer
+  une vraie mauvaise configuration serveur d'un simple nick verrouillé). `conn.close()` déplacé dans un `finally`
+  séparé de la capture `DbKeyError`/`DbTamperError`/`DbCodecError`/`sqlite3.Error` : un échec de `close()` après une
+  ouverture réussie ne fait plus passer à tort un codec valide pour `_CACHE_LOCKED` (mémoïsation collante sinon).
+- Vérifié manuellement (pas de framework de test côté `borgHelperWWW`) : aller-retour chiffré/déchiffré sur
+  `scopecache.db` pour un nick chiffré, comportement inchangé (clair) pour un nick plain, verrouillage silencieux
+  (ni lecture ni écriture) pour un nick chiffré à passphrase absente/incorrecte, condensés de passphrase distincts
+  (`''`/absente traitées identiquement, par choix délibéré — voir commentaire de `_passphrase_digest`), et détection
+  positive/négative de `_is_db_key_error` — voir TECHNICAL.md pour le protocole reproductible.
+
 ## borgHelper 1.0.102 — chiffrement des chemins SQLite, story 3 : écriture — 2026-09-22
 
 Fait passer chaque écriture de chemin par le codec et pose la barrière de migration (AD-11), sans chiffrer aucune base
