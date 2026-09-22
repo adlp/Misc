@@ -112,7 +112,7 @@
 	c1 = clone --depth=1
 	se = !git rev-list --all | xargs git grep -F
 	alias = ! git config --get-regexp ^alias\\. | sed -e s/^alias\\.// -e s/\\ /\\ =\\ /
-    goto = “!f() { git reset --hard && git clean -fd && git checkout ${1-master}; }; f”
+    goto = "!f() { git reset --hard && git clean -fd && git checkout ${1-master}; }; f"
 	list-branch = ! git for-each-ref --format=' %(authorname) %09 %(refname)' --sort=authorname
 	todo = ! git grep --extended-regexp -I --line-number --break --heading --color=auto 'TODO|FIXME'
 	todo-list = ! git grep --extended-regexp -I --line-number --count 'TODO|FIXME'
