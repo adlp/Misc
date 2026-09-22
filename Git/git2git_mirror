@@ -1,0 +1,83 @@
+#!/bin/bash
+
+#/*
+#* git2git_mirror synchronise deux depots git distants (equivalent rsync)
+#* Copyright (C) 2026 Antoine DELAPORTE
+#*
+#* This program is free software: you can redistribute it and/or modify
+#* it under the terms of the GNU General Public License as published by
+#* the Free Software Foundation, either version 3 of the License, or
+#* (at your option) any later version.
+#*
+#* This program is distributed in the hope that it will be useful,
+#* but WITHOUT ANY WARRANTY; without even the implied warranty of
+#* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#* GNU General Public License for more details.
+#*
+#* You should have received a copy of the GNU General Public License
+#* along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#*/
+
+set -euo pipefail
+
+DryRun=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n|--dry-run)
+            DryRun=1
+            shift
+            ;;
+        -h|--help)
+            HELP=1
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Option inconnue : $1" >&2
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [ "${HELP:-0}" = "1" ] || [ $# != 2 ]; then
+    cat <<EOF
+Script qui synchronise l\'integralite d\'un depot git (branches, tags, refs) vers un autre depot git, a la maniere d\'un rsync.
+
+Usage : git2git_mirror [-n|--dry-run] <RepoSrc> <RepoDest>
+
+    -n, --dry-run   Simule la synchronisation sans rien pousser (affiche ce qui serait fait)
+    RepoSrc          URL ou chemin du depot git source
+    RepoDest         URL ou chemin du depot git destination (sera ecrase pour correspondre a RepoSrc)
+
+Attention : le mode normal (sans --dry-run) fait un push --mirror, donc toute ref presente
+sur RepoDest et absente de RepoSrc sera supprimee.
+EOF
+    exit 0
+fi
+
+RepoSrc=$1
+RepoDest=$2
+
+TmpDir=$(mktemp -d)
+trap 'rm -rf "${TmpDir}"' EXIT
+
+echo "Clonage miroir de ${RepoSrc}..."
+git clone --mirror --quiet "${RepoSrc}" "${TmpDir}/mirror.git"
+
+cd "${TmpDir}/mirror.git"
+
+if [ "${DryRun}" = "1" ]; then
+    echo "--- Dry-run : refs qui seraient poussees vers ${RepoDest} ---"
+    git push --mirror --dry-run "${RepoDest}"
+else
+    echo "Synchronisation vers ${RepoDest}..."
+    git push --mirror "${RepoDest}"
+    echo "Synchronisation terminee."
+fi
