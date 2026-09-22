@@ -573,8 +573,8 @@ avec -x : pattern explicite (préfixe ou glob)
 COUNT + SUM sur diff_index (dry-run ou confirmation)
     si -D → affiche volume, s'arrête
     ↓
-DELETE FROM diff_index WHERE nick=? AND (path=? OR path LIKE ?/%)   # préfixe
-DELETE FROM diff_index WHERE nick=? AND path GLOB ?                  # glob
+DELETE FROM diff_index WHERE nick=? AND (path=? OR (path>=? AND path<?))   # préfixe (intervalle 'p/'..'p0')
+DELETE FROM diff_index WHERE nick=? AND path GLOB ?                          # glob (plain) ; chiffré : voir « Requêtes sur les chemins »
     ↓
 UPDATE diff_indexed_pairs SET entry_count = (SELECT COUNT(*) ...)    # recalcul
     ↓
@@ -586,8 +586,11 @@ os.replace('diff.db.vacuum_tmp', 'diff.db')
 **Pourquoi `VACUUM INTO` et pas `VACUUM` ?** `VACUUM` écrit son fichier temporaire dans `/tmp`, qui peut être sur une partition séparée et pleine même si le filesystem du `diff.db` a de l'espace. `VACUUM INTO chemin` crée la copie compacte dans le même répertoire, utilisant l'espace libre du bon filesystem.
 
 **Préfixe vs glob :**
-- Préfixe (pas de `*?[`) : `path = ? OR path LIKE préfixe/%` — correspondance exacte de répertoire, sans faux positifs
-- Glob (`*?[` présents) : SQLite `GLOB` — `*` matche tout y compris `/`
+- Préfixe (pas de `*?[`) : `path = ? OR (path >= 'préfixe/' AND path < 'préfixe0')` — correspondance exacte de répertoire, sensible
+  à la casse, `%`/`_` littéraux (un préfixe vide ne cible rien) ; en chiffré, bornes fournies par `PathCodec.prefix_bounds`
+- Glob (`*?[` présents) : SQLite `GLOB` — `*` matche tout y compris `/` ; en chiffré, évalué en Python (`_glob_regex`) sur les
+  chemins décodés, en réduisant les lignes candidates par l'intervalle du dernier répertoire littéral du motif quand il existe,
+  puis `DELETE` par `id`
 
 **Modes de `IdxPurge` :**
 
@@ -683,6 +686,72 @@ Règle : le code métier ne manipule que des chemins logiques, seul le chemin st
 - **Permissions** : rc `0600` à la création (`cfgwrite`), avertissement unique à la lecture si groupe/autres y ont accès,
   cache `0700`, `.db` `0600` ; l'existant n'est jamais chmodé.
 - **Config** : `db_encrypt_enabled(nick)` (`DB_ENCRYPT`, défaut vrai) et `db_kdf_level(nick)` (`DB_KDF`).
+
+---
+
+## Requêtes sur les chemins (1.0.101, chiffrement story 2)
+
+Toute lecture de chemin est indépendante du mode (`plain`/chiffré) : le code métier manipule des chemins logiques et ne
+connaît que ces helpers (section « Accès aux chemins stockés » de `borgHelper`).
+
+| Besoin | Helper | `plain` | chiffré |
+|---|---|---|---|
+| Descendants d'un préfixe | `_psel_under(conn, préfixe, self_too=False)` | `path>=? AND path<?` avec `'p/'`, `'p0'` | idem avec `PathCodec.prefix_bounds` |
+| Préfixe et lui-même | `self_too=True` | `path=? OR (intervalle)` | idem, égalité sur la valeur encodée |
+| Racine / préfixe vide | `_path_range` → `None` | aucune condition | aucune condition |
+| Égalité | `_psel_eq`, `_path_stored` | valeur telle quelle | `encode` (normalisé) |
+| Nom : sous-chaîne | `_psel_like` | `path LIKE ?` | `_like_regex` sur le chemin décodé (ASCII insensible à la casse, `%`/`_` jokers) |
+| Nom : glob | `_psel_glob` | `path GLOB ?` | `_glob_regex` sur le chemin décodé |
+| Lecture | `_path_decode` | identité | `DbCodec.decode_path` (mémo borné 262 144, `DbCodecError` si altéré) |
+| Tri | `_path_sort_key` | ordre octet UTF-8, en Python | idem |
+
+Chaque `_psel_*` renvoie `(condition SQL ou '', paramètres, filtre Python ou None)` ; quand le filtre n'est pas `None`, l'appelant
+décode chaque chemin lu et l'applique (jamais de `LIKE`/`GLOB`/`ORDER BY path`/`LIMIT` dépendant du chemin sur une connexion
+chiffrée : `CodecSelfTest` le vérifie sur le SQL émis). `PRAGMA case_sensitive_like=ON` n'est posé que sur les connexions
+chiffrées (jamais en `plain`, il changerait les `LIKE` de nom qui y restent).
+
+**AD-16** : la comparaison de préfixe est sensible à la casse dans les deux modes ; les préfixes sont littéraux.
+
+**Tris en Python** (ordre octet UTF-8 = tri `BINARY` de SQLite) : `list_files`, `diffbkp` (`path, change_type`), `search`
+(`archive_new_date`/`archive`, NULL en premier, puis chemin). `TreeFind` trie déjà par `full_path` en Python.
+
+**Sites convertis** : `_treehist_listing` (dont `_events_for`), `_treefind_listing`, `_duidx_collect`/`_global`/`_raw`, `search`,
+`filehist`, `_find_last_archive_with_file`, `list_files`, `diffbkp`, `idxtop`/`difftop` (décodage avant `get_prefix`), `idxpurge`.
+`_snap_notin` (égalité entre `diff_index` et la vue, même DEK) et `_migrate_archive_snapshot` sont inchangés.
+
+**Plan d'exécution.** L'intervalle utilise `idx_diff_nick_path` sur `diff_index` et `idx_snapfile_nick_path` sur `snapshot_file`
+(mesuré : ~1 ms contre ~170 ms pour l'ancien `LIKE` sur 1,5 M de lignes ; contrôlé par `CodecSelfTest` via `EXPLAIN QUERY PLAN`).
+**Constat sur la vue `archive_snapshot_v`** : elle est définie par `archive_snapshot JOIN snapshot_file`, et le plan balaie
+`archive_snapshot` par `(nick, archive)` puis filtre le chemin — l'index de chemin n'y est pas utilisé. C'est le comportement
+d'avant ; pas de régression, pas de gain promis, plan non réécrit ici.
+
+**Sites à mesurer en Story 6** (coût du décodage sur base chiffrée réaliste, jusqu'à 3 Go) :
+- `TreeHist` à la racine : lit tout l'instantané pour en tirer les enfants directs, et les chemins distincts de `diff_index`
+  du sous-arbre pour les supprimés (piste : saut d'index par enfant) ; le même N+1 (une requête `MIN(archive_new_date)`
+  par enfant direct candidat pour trouver son dernier événement) se répète à chaque appel, à la racine comme ailleurs ;
+- `TreeFind`, `Search`, `DuIdx` (motif de nom ou préfixe large), `IdxTop`, `DiffTop` : balayage et décodage en Python ;
+- `_treefind_listing` : la fenêtre `ROW_NUMBER() OVER (PARTITION BY path ...)` des chemins supprimés porte sur
+  l'intervalle du préfixe demandé, mais décode et compare TOUT le sous-arbre concerné (pas seulement les correspondances
+  du motif) avant de filtrer par nom — contrairement à `_treehist_listing`, qui limite sa fenêtre aux enfants directs ;
+- `IdxPurge` avec glob sans répertoire littéral, `IDX_INCLUDE` (complément) : lecture et décodage de tout `diff_index` ;
+- `_find_last_archive_with_file` avec glob : parcours sans `LIMIT`, décode toutes les lignes candidates de
+  `archive_snapshot_v` puis de `diff_index` sans sortir tôt même après avoir trouvé une correspondance plus ancienne ;
+- vue `archive_snapshot_v` (constat ci-dessus) ;
+- **politique du mémo de décodage (`DbCodec._memo`).** Vidage intégral à 262 144 entrées (pas de LRU) : un balayage
+  mono-passe sur une base de plusieurs Go (`DuIdx`/`IdxTop`/`Search` sans périmètre étroit) revoit rarement le même
+  chemin stocké, donc le mémo n'apporte quasiment aucun gain de cache-hit dans ce cas précis — son bénéfice réel est
+  pour les commandes à re-décodage répété du même chemin (`_treehist_listing`/`_events_for`, appels successifs sur la
+  même session). Par ailleurs le mémo (et le `DbCodec` qui le porte, mis en cache par `_CODEC_CACHE`) contient des
+  chemins **en clair** et vit pour toute la durée du processus : à mesurer/documenter comme surface si un processus
+  long-vivant (ex. `borgHelperWWW`) est amené à traiter des passphrases/nicks différents dans sa durée de vie.
+
+Correction associée : `_duidx_collect_global` place la plage d'archives avant le `GROUP BY` (elle le suivait, ce qui la
+rendait sans effet et regroupait tout sous un seul type).
+
+**Mesure du gain d'index (170 ms → ~1 ms, Intent ci-dessus).** Chiffre obtenu sur une table SQLite jetable et synthétique
+de 1,5 M lignes construite pour l'occasion (pas incluse dans ce dépôt, pas reproductible depuis son contenu actuel) —
+un ordre de grandeur indicatif de l'écart `LIKE` de préfixe vs intervalle sur l'index `(nick, path)`, pas une mesure
+répétable sur les fixtures du projet. À re-mesurer sur une base réelle en Story 6.
 
 ---
 
@@ -1099,10 +1168,10 @@ par chemin sous-jacent, produit **avant** toute agrégation Python/SQL :
   mode groupé historique, texte/JSON inchangés — vérifié `python3 -m py_compile` + diff byte-à-byte
   contre la sortie d'avant cette story). Nouvelle méthode `BorgHelperDB._duidx_collect_raw()` — mêmes
   deux requêtes SQL que `_duidx_collect()` (`diff_index` + `archive_snapshot_v`, même filtre
-  LIKE/archive via `sql_pat`/`_diff_archive_filter`), sans agrégation par `key_fn` : une ligne
-  `{'chemin','type','taille'}` par chemin. `duidx()` calcule `sql_pat` de façon dupliquée (jamais
-  partagée avec les branches groupé/global existantes) pour ne jamais risquer d'altérer leur
-  comportement.
+  sélection de chemins `sel`/`_diff_archive_filter`), sans agrégation par `key_fn` : une ligne
+  `{'chemin','type','taille'}` par chemin. `duidx()` calcule `sel` (`('all',)`, `('under',préfixe)`,
+  `('like',motif)`) de façon dupliquée (jamais partagée avec les branches groupé/global existantes) pour ne jamais
+  risquer d'altérer leur comportement.
 - `idxtop(..., as_json=True)` / CLI `-j` — `IdxTop` n'avait aucun mode JSON avant cette story, donc
   pas de format existant à préserver : `-j` **est** directement le mode brut (une ligne
   `{'chemin','taille'}` par ligne de `diff_index`, avant le `stats[pfx]` de la boucle

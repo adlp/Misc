@@ -7,10 +7,10 @@
 #*/
 
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
-import hmac,hashlib,secrets,base64,stat
+import hmac,hashlib,secrets,base64,stat,functools
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.100"
+Version="1.0.101"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -103,12 +103,6 @@ def parse_borg_size(s):
             try: return int(float(s[:-len(unit)].strip())*mult)
             except (ValueError,TypeError): return None
     return None
-
-def _like_escape(s):
-    """Échappe %, _ et \\ pour un usage littéral dans un motif SQL LIKE (avec ESCAPE '\\') —
-    sans ça, un chemin réel contenant %/_  (ex. répertoire nommé 'a%b') élargit le motif de
-    préfixe et fait fuir des résultats d'un chemin voisin sans rapport."""
-    return s.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')
 
 def parse_diff_line(line):
     line=line.rstrip()
@@ -554,6 +548,7 @@ _B64_ALPHABET=frozenset('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 _PATH_TAG_LEN=12
 _KDF_LEVELS=('light','standard','strong')
 _PATH_ENC_MODES=('siv1','migrating')
+_DEC_MEMO_MAX=262144  # entrées du mémo de décodage (DbCodec.decode_path)
 
 def _b64e(b):
     """base64 standard sans padding, '+'->'.' et '/'->'-' (alphabet A-Za-z0-9.-)."""
@@ -647,6 +642,16 @@ class DbCodec:
     def __init__(self,dek):
         k=_subkeys(dek)
         self.path=PathCodec(k['k_path'],k['k_enc']); self.blob=BlobCodec(k['k_blob']); self.k_hdr=k['k_hdr']
+        self._memo={}
+
+    def decode_path(self,stored):
+        """PathCodec.decode avec mémo borné (vidé quand plein) : les mêmes chemins reviennent d'une requête à l'autre."""
+        v=self._memo.get(stored)
+        if v is None:
+            v=self.path.decode(stored)
+            if len(self._memo)>=_DEC_MEMO_MAX: self._memo.clear()
+            self._memo[stored]=v
+        return v
 
 def _kdf_params(level='standard'):
     """Paramètres KDF réellement utilisés pour un niveau (repli PBKDF2 sans hashlib.scrypt)."""
@@ -751,6 +756,7 @@ def _enc_header_write(conn,header):
     return done
 
 _DEK_CACHE={}  # dérivation une seule fois par processus et par base : (chemin, mac, condensé passphrase) -> DEK
+_CODEC_CACHE={}  # même clé -> DbCodec (partage le mémo de décodage entre connexions du processus)
 _DB_CFG_READERS={}  # realpath(cache_dir) -> callable(nick)->section de config ; enregistré par BorgHelperDB
 
 def _find_cfg_reader(db_path=None):
@@ -812,7 +818,12 @@ def _open_db(db_path,nick=None,role='read',passphrase=None,**kw):
                 dek=_DEK_CACHE.get(ck)
                 if dek is None:
                     dek=_enc_header_unlock(header,pw); _DEK_CACHE[ck]=dek
-                conn.codec=DbCodec(dek); conn.mode=header['path_enc']
+                codec=_CODEC_CACHE.get(ck)
+                if codec is None: codec=_CODEC_CACHE[ck]=DbCodec(dek)
+                conn.codec=codec; conn.mode=header['path_enc']
+                # défense en profondeur (AD-8) : jamais sur une connexion plain (changerait les LIKE de nom qui y restent)
+                try: conn.execute("PRAGMA case_sensitive_like=ON")
+                except sqlite3.Error: pass  # pragma déprécié : simple défense en profondeur, jamais bloquant
     except BaseException:
         conn.close(); raise
     return conn
@@ -856,6 +867,120 @@ def _warn_rc_perms(path):
     if mode&(stat.S_IRWXG|stat.S_IRWXO):
         _RC_PERM_WARNED=True
         printer(f"[WARN] {path} est accessible au groupe/autres (mode {stat.S_IMODE(mode):04o}) — il contient des passphrases : chmod 600 conseillé")
+
+# ── Accès aux chemins stockés (AD-8, AD-16) — frontière unique plain/chiffré ────
+# Le code métier manipule des chemins LOGIQUES ; ces helpers sont les seuls à savoir si la connexion
+# est chiffrée (conn.codec). Préfixe et égalité : bornes/valeur stockées fournies par le codec (jamais
+# de LIKE sur un chemin). Prédicat sur le NOM (sous-chaîne LIKE, GLOB) : en SQL en plain, en Python
+# sur chemins décodés en chiffré. Tri sur un chemin : toujours en Python (_path_sort_key).
+# Chaque _psel_* retourne (condition SQL nue ou '', paramètres, filtre Python ou None) : quand le
+# filtre Python n'est pas None, l'appelant décode chaque chemin lu et l'applique.
+
+def _norm_lp(p):
+    """Normalisation UNIQUE d'un chemin logique, dans les deux modes : segments non vides joints par '/'
+    (sans '/' initial/final, '//' fusionnés) — la même que le codec."""
+    return '/'.join(x for x in p.split('/') if x)
+
+def _path_decode(conn,stored):
+    """Chemin stocké -> chemin logique (no-op en plain ; DbCodecError si la valeur est altérée)."""
+    c=conn.codec
+    return stored if c is None or stored is None else c.decode_path(stored)
+
+def _path_stored(conn,path):
+    """Chemin logique -> valeur stockée pour une égalité (plain : tel quel ; chiffré : encodé, normalisé)."""
+    path=_norm_lp(path); c=conn.codec
+    return path if c is None else c.path.encode(path)
+
+def _path_range(conn,prefix):
+    """(bas, haut) des descendants STRICTS de prefix (path >= bas AND path < haut), ou None pour la
+    racine (préfixe vide : pas de borne). Plain : 'p/' et 'p0' ('/'+1) ; chiffré : PathCodec.prefix_bounds."""
+    c=conn.codec
+    prefix=_norm_lp(prefix)
+    if c is None: return (prefix+'/',prefix+'0') if prefix else None
+    if not c.path.encode(prefix): return None
+    return c.path.prefix_bounds(prefix)
+
+def _psel_under(conn,prefix,self_too=False,col='path'):
+    """Descendants de prefix (et prefix lui-même si self_too). Racine : aucune condition ('')."""
+    b=_path_range(conn,prefix)
+    if b is None: return '',[],None
+    rng=f"({col}>=? AND {col}<?)"
+    if self_too: return f"({col}=? OR {rng})",[_path_stored(conn,prefix),b[0],b[1]],None
+    return rng,[b[0],b[1]],None
+
+def _psel_eq(conn,path,col='path'):
+    return f"{col}=?",[_path_stored(conn,path)],None
+
+@functools.lru_cache(maxsize=256)
+def _like_regex(pat):
+    """Motif SQLite LIKE (sans ESCAPE) : % = suite quelconque, _ = un caractère ; insensible à la casse
+    pour les lettres ASCII SEULEMENT (comme SQLite), les autres caractères exacts."""
+    out=[]
+    for ch in pat:
+        if ch=='%': out.append('.*')
+        elif ch=='_': out.append('.')
+        elif ch.isascii() and ch.isalpha(): out.append('['+ch.lower()+ch.upper()+']')
+        else: out.append(re.escape(ch))
+    return re.compile(''.join(out),re.DOTALL)
+
+@functools.lru_cache(maxsize=256)
+def _glob_regex(pat):
+    """Motif SQLite GLOB (sensible à la casse) : * ? [...] avec [^...] et intervalles ; '[' non fermé = jamais de correspondance."""
+    out=[]; i=0; n=len(pat)
+    while i<n:
+        c=pat[i]; i+=1
+        if c=='*': out.append('.*')
+        elif c=='?': out.append('.')
+        elif c=='[':
+            j=i; neg=False
+            if j<n and pat[j]=='^': neg=True; j+=1
+            items=[]; first=True; closed=False
+            while j<n:
+                d=pat[j]
+                if d==']' and not first: closed=True; break
+                first=False
+                if j+2<n and pat[j+1]=='-' and pat[j+2]!=']':
+                    if d<=pat[j+2]: items.append(re.escape(d)+'-'+re.escape(pat[j+2]))
+                    j+=3
+                else: items.append(re.escape(d)); j+=1
+            if not closed: return re.compile(r'(?!)')
+            i=j+1
+            if items: out.append('['+('^' if neg else '')+''.join(items)+']')
+            else: out.append('.' if neg else '(?!)')
+        else: out.append(re.escape(c))
+    return re.compile(''.join(out),re.DOTALL)
+
+def _psel_like(conn,pat,col='path'):
+    """Prédicat de nom LIKE (plain : SQL ; chiffré : Python, même sémantique ASCII)."""
+    if conn.codec is None: return f"{col} LIKE ?",[pat],None
+    rx=_like_regex(pat); return '',[],(lambda p: rx.fullmatch(p) is not None)
+
+def _psel_glob(conn,pat,col='path'):
+    """Prédicat de nom GLOB (plain : SQL ; chiffré : Python)."""
+    if conn.codec is None: return f"{col} GLOB ?",[pat],None
+    rx=_glob_regex(pat); return '',[],(lambda p: rx.fullmatch(p) is not None)
+
+def _psel_duidx(conn,sel):
+    """sel : ('all',) | ('under',prefix) | ('like',motif_LIKE) — sélection de DuIdx."""
+    if sel[0]=='under': return _psel_under(conn,sel[1])
+    if sel[0]=='like': return _psel_like(conn,sel[1])
+    return '',[],None
+
+def _codec_fail(label,e,conn=None):
+    """Valeur de chemin stockée illisible (DbCodecError, pas une sqlite3.Error) : ferme la connexion, message par nick."""
+    msg=f"{label}: chemin stocké illisible ({e}) — base altérée ou clé incorrecte"
+    printer(f"[ERREUR] {msg}")
+    try: conn.close()
+    except Exception: pass
+    return msg
+
+def _wh(sql):
+    """' AND <cond>' ou ''."""
+    return f" AND {sql}" if sql else ''
+
+def _path_sort_key(path):
+    """Ordre octet UTF-8 (celui du tri BINARY de SQLite)."""
+    return path.encode('utf-8','surrogateescape')
 
 # ── BorgHelperDB — all SQLite operations ──────────────────────────────────────
 
@@ -1390,7 +1515,7 @@ class BorgHelperDB:
         if not clauses: return '',[]
         return ' AND '+' AND '.join(clauses),params
 
-    def _duidx_collect(self,nick,sql_pat,key_fn,archive_from=None,archive_to=None):
+    def _duidx_collect(self,nick,sel,key_fn,archive_from=None,archive_to=None):
         totals={}
         for n in nick.split(','):
             db_path=self.get_diff_db(n)
@@ -1400,18 +1525,24 @@ class BorgHelperDB:
             try:
                 conn=_open_db(db_path,nick=n,role='read')
                 af_sql,af_params=self._diff_archive_filter(n,archive_from,conn,archive_to)
-                for ct,path,sz in conn.execute("SELECT change_type,path,CASE WHEN change_type='removed' THEN size_before ELSE size_after END FROM diff_index WHERE nick=? AND path LIKE ?"+af_sql,[n,sql_pat]+af_params):
+                psql,pprm,pyf=_psel_duidx(conn,sel)
+                for ct,path,sz in conn.execute("SELECT change_type,path,CASE WHEN change_type='removed' THEN size_before ELSE size_after END FROM diff_index WHERE nick=?"+_wh(psql)+af_sql,[n]+pprm+af_params):
+                    path=_path_decode(conn,path)
+                    if pyf and not pyf(path): continue
                     _duidx_add(totals,key_fn(path),ct,sz)
                 df,dt=_snap_params(af_params,archive_from,archive_to)
                 snap_extra=[x for x in [df,dt] if x]
-                for path,sz in conn.execute("SELECT path,size FROM archive_snapshot_v WHERE nick=? AND path LIKE ? "+_snap_notin(df,dt),[n,sql_pat]+snap_extra):
+                for path,sz in conn.execute("SELECT path,size FROM archive_snapshot_v WHERE nick=?"+_wh(psql)+" "+_snap_notin(df,dt),[n]+pprm+snap_extra):
+                    path=_path_decode(conn,path)
+                    if pyf and not pyf(path): continue
                     _duidx_add(totals,key_fn(path),'présent',sz)
                 conn.close()
+            except DbCodecError as e: _codec_fail(n,e,conn)
             except sqlite3.Error as e:
                 printer(f"SQLite error ({db_path}): {e}")
         return totals
 
-    def _duidx_collect_global(self,nick,sql_pat,archive_from=None,archive_to=None):
+    def _duidx_collect_global(self,nick,sel,archive_from=None,archive_to=None):
         totals={}
         for n in nick.split(','):
             db_path=self.get_diff_db(n)
@@ -1421,25 +1552,31 @@ class BorgHelperDB:
             try:
                 conn=_open_db(db_path,nick=n,role='read')
                 af_sql,af_params=self._diff_archive_filter(n,archive_from,conn,archive_to)
-                for ct,cnt,sz in conn.execute("SELECT change_type,COUNT(*),SUM(CASE WHEN change_type='removed' THEN size_before ELSE size_after END) FROM diff_index WHERE nick=? AND path LIKE ? GROUP BY change_type"+af_sql,[n,sql_pat]+af_params):
-                    k=('',ct)
-                    if k not in totals: totals[k]=[0,0]
-                    totals[k][0]+=cnt; totals[k][1]+=(sz or 0)
+                psql,pprm,pyf=_psel_duidx(conn,sel)
                 df,dt=_snap_params(af_params,archive_from,archive_to)
                 snap_extra=[x for x in [df,dt] if x]
-                row=conn.execute("SELECT COUNT(*),SUM(size) FROM archive_snapshot_v WHERE nick=? AND path LIKE ? "+_snap_notin(df,dt),[n,sql_pat]+snap_extra).fetchone()
-                if row and row[0]:
-                    k=('','présent')
+                def _acc(k,cnt,sz):
                     if k not in totals: totals[k]=[0,0]
-                    totals[k][0]+=row[0]; totals[k][1]+=(row[1] or 0)
+                    totals[k][0]+=cnt; totals[k][1]+=(sz or 0)
+                if pyf is None:  # agrégation en SQL (aucun prédicat de nom à exécuter en Python)
+                    for ct,cnt,sz in conn.execute("SELECT change_type,COUNT(*),SUM(CASE WHEN change_type='removed' THEN size_before ELSE size_after END) FROM diff_index WHERE nick=?"+_wh(psql)+af_sql+" GROUP BY change_type",[n]+pprm+af_params):
+                        _acc(('',ct),cnt,sz)
+                    row=conn.execute("SELECT COUNT(*),SUM(size) FROM archive_snapshot_v WHERE nick=?"+_wh(psql)+" "+_snap_notin(df,dt),[n]+pprm+snap_extra).fetchone()
+                    if row and row[0]: _acc(('','présent'),row[0],row[1])
+                else:  # prédicat de nom en Python (base chiffrée) : agrégation sur chemins décodés
+                    for ct,path,sz in conn.execute("SELECT change_type,path,CASE WHEN change_type='removed' THEN size_before ELSE size_after END FROM diff_index WHERE nick=?"+_wh(psql)+af_sql,[n]+pprm+af_params):
+                        if pyf(_path_decode(conn,path)): _acc(('',ct),1,sz)
+                    for path,sz in conn.execute("SELECT path,size FROM archive_snapshot_v WHERE nick=?"+_wh(psql)+" "+_snap_notin(df,dt),[n]+pprm+snap_extra):
+                        if pyf(_path_decode(conn,path)): _acc(('','présent'),1,sz)
                 conn.close()
+            except DbCodecError as e: _codec_fail(n,e,conn)
             except sqlite3.Error as e:
                 printer(f"SQLite error ({db_path}): {e}")
         return totals
 
-    def _duidx_collect_raw(self,nick,sql_pat,archive_from=None,archive_to=None):
+    def _duidx_collect_raw(self,nick,sel,archive_from=None,archive_to=None):
         """Story 1.4 : mêmes deux requêtes SQL que _duidx_collect() (diff_index + archive_snapshot_v,
-        même filtre LIKE/archive), mais SANS agrégation par key_fn — une ligne JSON par chemin,
+        même sélection de chemins/archive), mais SANS agrégation par key_fn — une ligne JSON par chemin,
         jamais groupée. Seul moyen correct de filtrer par périmètre de chemin a posteriori
         (borgHelperWWW) : _duidx_collect()/_duidx_collect_global() agrègent déjà en SQL/Python avant
         qu'un filtre puisse s'appliquer, ce qui peut couper une frontière de périmètre au milieu
@@ -1454,13 +1591,19 @@ class BorgHelperDB:
             try:
                 conn=_open_db(db_path,nick=n,role='read')
                 af_sql,af_params=self._diff_archive_filter(n,archive_from,conn,archive_to)
-                for ct,path,sz in conn.execute("SELECT change_type,path,CASE WHEN change_type='removed' THEN size_before ELSE size_after END FROM diff_index WHERE nick=? AND path LIKE ?"+af_sql,[n,sql_pat]+af_params):
+                psql,pprm,pyf=_psel_duidx(conn,sel)
+                for ct,path,sz in conn.execute("SELECT change_type,path,CASE WHEN change_type='removed' THEN size_before ELSE size_after END FROM diff_index WHERE nick=?"+_wh(psql)+af_sql,[n]+pprm+af_params):
+                    path=_path_decode(conn,path)
+                    if pyf and not pyf(path): continue
                     rows.append({'chemin':path,'type':ct,'taille':sz or 0})
                 df,dt=_snap_params(af_params,archive_from,archive_to)
                 snap_extra=[x for x in [df,dt] if x]
-                for path,sz in conn.execute("SELECT path,size FROM archive_snapshot_v WHERE nick=? AND path LIKE ? "+_snap_notin(df,dt),[n,sql_pat]+snap_extra):
+                for path,sz in conn.execute("SELECT path,size FROM archive_snapshot_v WHERE nick=?"+_wh(psql)+" "+_snap_notin(df,dt),[n]+pprm+snap_extra):
+                    path=_path_decode(conn,path)
+                    if pyf and not pyf(path): continue
                     rows.append({'chemin':path,'type':'présent','taille':sz or 0})
                 conn.close()
+            except DbCodecError as e: _codec_fail(n,e,conn)
             except sqlite3.Error as e:
                 printer(f"SQLite error ({db_path}): {e}")
         return rows
@@ -1795,15 +1938,20 @@ class BorgHelper:
         db_path=self.db.get_diff_db(nick)
         has_glob='*' in path or '?' in path
         sql_pat=path.replace('*','%').replace('?','_') if has_glob else None
-        op='LIKE' if has_glob else '='
-        val=sql_pat if has_glob else path
         try:
             self.db.ensure_diff_db(db_path)
             conn=_open_db(db_path,nick=nick,role='read')
-            row=conn.execute(f"SELECT archive FROM archive_snapshot_v WHERE nick=? AND path {op} ? ORDER BY archive DESC LIMIT 1",(nick,val)).fetchone()
-            if row: conn.close(); return row[0]
-            row=conn.execute(f"SELECT archive_new FROM diff_index WHERE nick=? AND path {op} ? AND change_type!='removed' ORDER BY archive_new_date DESC LIMIT 1",(nick,val)).fetchone()
-            conn.close(); return row[0] if row else None
+            psql,pprm,pyf=_psel_like(conn,sql_pat) if has_glob else _psel_eq(conn,path)
+            # prédicat en Python (chiffré) : pas de LIMIT, le premier chemin qui correspond gagne
+            lim='' if pyf else ' LIMIT 1'
+            found=None
+            for arch,p in conn.execute("SELECT archive,path FROM archive_snapshot_v WHERE nick=?"+_wh(psql)+" ORDER BY archive DESC"+lim,[nick]+pprm):
+                if pyf is None or pyf(_path_decode(conn,p)): found=arch; break
+            if found is None:
+                for arch,p in conn.execute("SELECT archive_new,path FROM diff_index WHERE nick=?"+_wh(psql)+" AND change_type!='removed' ORDER BY archive_new_date DESC"+lim,[nick]+pprm):
+                    if pyf is None or pyf(_path_decode(conn,p)): found=arch; break
+            conn.close(); return found
+        except DbCodecError as e: _codec_fail(nick,e,conn); return None
         except sqlite3.Error: return None
 
     # ── Commands ───────────────────────────────────────────────────────────────
@@ -1887,7 +2035,12 @@ class BorgHelper:
                 if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(1)
                 printer(msg); sys.exit(1)
             bid=row[0]
-        rows=conn.execute("SELECT path FROM archive_snapshot_v WHERE nick=? AND archive=? ORDER BY path",(nick,bid)).fetchall()
+        try: rows=[(_path_decode(conn,p),) for (p,) in conn.execute("SELECT path FROM archive_snapshot_v WHERE nick=? AND archive=?",(nick,bid))]
+        except DbCodecError as e:
+            msg=_codec_fail(nick,e,conn)
+            if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(3)
+            sys.exit(3)
+        rows.sort(key=lambda r:_path_sort_key(r[0]))  # tri Python (ordre octet UTF-8) : identique en plain et chiffré
         conn.close()
         if not rows:
             msg=f"Aucun fichier indexé pour {bid} — lancer 'indexsnap'."
@@ -1989,8 +2142,13 @@ class BorgHelper:
         else:
             try:
                 conn=_open_db(db_path,nick=nick,role='read')
-                rows=conn.execute("SELECT change_type,path,size_before,size_after FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=? ORDER BY path,change_type",(nick,bidun,bideux)).fetchall()
+                rows=[(ct,_path_decode(conn,p),sb,sa) for ct,p,sb,sa in conn.execute("SELECT change_type,path,size_before,size_after FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",(nick,bidun,bideux))]
+                rows.sort(key=lambda r:(_path_sort_key(r[1]),r[0]))  # ORDER BY path,change_type en Python (octets UTF-8)
                 conn.close()
+            except DbCodecError as e:
+                msg=_codec_fail(nick,e,conn)
+                if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(3)
+                sys.exit(3)
             except sqlite3.Error as e:
                 msg=f"SQLite error ({db_path}): {e}"
                 if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(3)
@@ -2656,12 +2814,25 @@ class BorgHelper:
             try:
                 conn=_open_db(db_path,nick=n,role='read')
                 af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
-                cur=conn.execute("SELECT nick,archive_new_date,archive_new,change_type,path,size_before,size_after FROM diff_index WHERE nick=? AND path LIKE ?"+af_sql+" ORDER BY archive_new_date,path",[n,sql_pat]+af_params)
-                n_rows=cur.fetchall()
+                psql,pprm,pyf=_psel_like(conn,sql_pat)
+                def _fetch(q,params,key):
+                    out=[]
+                    for r in conn.execute(q,params):
+                        r=list(r); r[4]=_path_decode(conn,r[4])
+                        if pyf and not pyf(r[4]): continue
+                        out.append(tuple(r))
+                    # ORDER BY <colonne>,path en Python (NULL en premier comme SQLite ; chemin à l'ordre octet UTF-8)
+                    out.sort(key=lambda r:(r[key] is not None,r[key] or '',_path_sort_key(r[4])))
+                    return out
+                n_rows=_fetch("SELECT nick,archive_new_date,archive_new,change_type,path,size_before,size_after FROM diff_index WHERE nick=?"+_wh(psql)+af_sql,[n]+pprm+af_params,1)
                 df,dt=_snap_params(af_params,archive_from,archive_to)
                 snap_extra=[x for x in [df,dt] if x]
-                cur=conn.execute("SELECT nick,archive_date,archive,'présent',path,NULL,size FROM archive_snapshot_v WHERE nick=? AND path LIKE ? "+_snap_notin(df,dt)+" ORDER BY archive,path",[n,sql_pat]+snap_extra)
-                n_rows+=cur.fetchall(); conn.close()
+                n_rows+=_fetch("SELECT nick,archive_date,archive,'présent',path,NULL,size FROM archive_snapshot_v WHERE nick=?"+_wh(psql)+" "+_snap_notin(df,dt),[n]+pprm+snap_extra,2)
+                conn.close()
+            except DbCodecError as e:
+                msg=_codec_fail(n,e,conn)
+                if as_json: results[n]={'error':msg}
+                continue
             except sqlite3.Error as e:
                 if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
                 else: printer(f"SQLite error ({db_path}): {e}")
@@ -2695,11 +2866,12 @@ class BorgHelper:
             try:
                 conn=_open_db(db_path,nick=n,role='read')
                 af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
-                cur=conn.execute("SELECT nick,archive_new_date,archive_old,archive_new,change_type,size_before,size_after FROM diff_index WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date",[n,path]+af_params)
+                pstored=_path_stored(conn,path)
+                cur=conn.execute("SELECT nick,archive_new_date,archive_old,archive_new,change_type,size_before,size_after FROM diff_index WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date",[n,pstored]+af_params)
                 n_rows=cur.fetchall()
                 df,dt=_snap_params(af_params,archive_from,archive_to)
                 snap_extra=[x for x in [df,dt] if x]
-                cur=conn.execute("SELECT nick,archive_date,'',archive,'présent',NULL,size FROM archive_snapshot_v WHERE nick=? AND path=? "+_snap_notin(df,dt),[n,path]+snap_extra)
+                cur=conn.execute("SELECT nick,archive_date,'',archive,'présent',NULL,size FROM archive_snapshot_v WHERE nick=? AND path=? "+_snap_notin(df,dt),[n,pstored]+snap_extra)
                 n_rows+=cur.fetchall(); conn.close()
             except sqlite3.Error as e:
                 if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
@@ -2728,18 +2900,17 @@ class BorgHelper:
         du type réel stocké par borg ; 'aucun événement dans la plage' si l'entrée n'a pas bougé.
         as_json=True : ne print rien, retourne un dict {path,archive,entries:[...]} ou {'error':msg}
         (utilisé par borgHelperWWW pour l'explorateur d'arborescence)."""
+        prefix=_norm_lp(prefix)
         row=conn.execute("SELECT archive FROM archive_snapshot_v WHERE nick=? ORDER BY archive_date DESC LIMIT 1",(n,)).fetchone()
         if row is None:
             msg=f"aucun snapshot indexé sous {prefix or '/'} — lancez : borgHelper -c Index -n {n}"
             if as_json: return {'error':msg}
             print(f"{n}: {msg}"); return None
         latest=row[0]
-        sql_pat=(prefix+'/%') if prefix else '%'
-        if prefix:
-            where='(path=? OR path LIKE ?)'; params=[prefix,sql_pat]
-        else:
-            where='path LIKE ?'; params=[sql_pat]
-        snap_rows=conn.execute(f"SELECT path,type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=? AND {where}",[n,latest]+params).fetchall()
+        # le préfixe lui-même ET ses descendants : égalité + intervalle (racine : aucune borne)
+        psql,pprm,_=_psel_under(conn,prefix,self_too=True)
+        snap_rows=[(_path_decode(conn,p),t,m,o) for p,t,m,o in
+                   conn.execute("SELECT path,type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=?"+_wh(psql),[n,latest]+pprm)]
         plen=len(prefix)+1 if prefix else 0
         children={}       # name -> is_dir (heuristique de secours si le type est inconnu)
         type_by_name={}    # name -> type réel de SA PROPRE entrée (pas celui d'un enfant plus profond)
@@ -2760,16 +2931,17 @@ class BorgHelper:
         # (_cleanup_index_after_prune), donc une ligne survivante référence toujours une archive encore
         # restaurable. Un nom déjà présent dans children n'est jamais reconsidéré ici : l'appartenance
         # au snapshot courant prime toujours, même en cas d'historique suppression/réajout.
-        prefix_esc=_like_escape(prefix) if prefix else ''
-        scope_pat=(prefix_esc+'/%') if prefix else '%'
-        deep_excl=(prefix_esc+'/%/%') if prefix else '%/%'
-        del_rows=conn.execute("""
-            SELECT path,archive_old,size_before FROM (
-                SELECT path,change_type,archive_old,size_before,
-                       ROW_NUMBER() OVER (PARTITION BY path ORDER BY archive_new_date DESC,id DESC) AS rn
-                FROM diff_index WHERE nick=? AND path LIKE ? ESCAPE '\\' AND path NOT LIKE ? ESCAPE '\\'
-            ) WHERE rn=1 AND change_type='removed'
-        """,(n,scope_pat,deep_excl)).fetchall()
+        # Enfants directs uniquement : la profondeur se juge en Python sur le chemin décodé. Chemins
+        # distincts du sous-arbre (index (nick,path) seul), puis, pour les seuls enfants directs
+        # candidats, le dernier événement (archive_new_date max, id max) — pas de fenêtre sur tout le sous-arbre.
+        usql,uprm,_=_psel_under(conn,prefix)
+        del_rows=[]
+        for (stored,) in conn.execute("SELECT DISTINCT path FROM diff_index WHERE nick=?"+_wh(usql),[n]+uprm).fetchall():
+            lp=_path_decode(conn,stored)
+            nm=lp[plen:] if prefix else lp
+            if not nm or '/' in nm or nm in children: continue
+            last=conn.execute("SELECT change_type,archive_old,size_before FROM diff_index WHERE nick=? AND path=? ORDER BY archive_new_date DESC,id DESC LIMIT 1",(n,stored)).fetchone()
+            if last and last[0]=='removed': del_rows.append((lp,last[1],last[2]))
         deleted_children={}   # name -> (archive_old,is_dir) — sélectionne, par chemin, l'événement
                                # diff_index le PLUS RÉCENT (archive_new_date max) ; ne garde que ceux
                                # dont ce dernier événement est 'removed' (jamais "supprimé un jour").
@@ -2791,10 +2963,10 @@ class BorgHelper:
             # de sous-répertoire). added/removed ne concernent QUE l'entrée du répertoire lui-même
             # (ex. 'added directory'/'removed directory') ; un mouvement d'un descendant, quel qu'il
             # soit (added/removed/modified plus bas), remonte comme 'modified' générique.
-            own=conn.execute("SELECT change_type,archive_new,archive_new_date FROM diff_index WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date",[n,full_path]+af_params).fetchall()
+            own=conn.execute("SELECT change_type,archive_new,archive_new_date FROM diff_index WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date",[n,_path_stored(conn,full_path)]+af_params).fetchall()
             if not recursive: return own
-            deep_pat=(full_path+'/%') if full_path else '%'
-            deep=conn.execute("SELECT DISTINCT archive_new,archive_new_date FROM diff_index WHERE nick=? AND path LIKE ?"+af_sql+" ORDER BY archive_new_date",[n,deep_pat]+af_params).fetchall()
+            dsql,dprm,_=_psel_under(conn,full_path)
+            deep=conn.execute("SELECT DISTINCT archive_new,archive_new_date FROM diff_index WHERE nick=?"+_wh(dsql)+af_sql+" ORDER BY archive_new_date",[n]+dprm+af_params).fetchall()
             own_archives={a for _,a,_ in own}
             synthetic=[('modified',arch,date) for arch,date in deep if arch not in own_archives]
             return sorted(own+synthetic,key=lambda r:r[2] or '')
@@ -2848,7 +3020,7 @@ class BorgHelper:
         # Contenu DIRECT de <prefix> (racine si omis) uniquement — jamais le contenu d'un
         # sous-répertoire. Liste toujours tout le répertoire courant (fichiers/sous-répertoires
         # présents, même sans événement dans la plage demandée), pas seulement ce qui a changé.
-        prefix=(prefix or '').strip().lstrip('/').rstrip('/')
+        prefix=_norm_lp((prefix or '').strip())
         results={}
         for n in nick.split(','):
             db_path=self.db.get_diff_db(n)
@@ -2863,6 +3035,9 @@ class BorgHelper:
                 result=self._treehist_listing(n,prefix,conn,archive_from=archive_from,archive_to=archive_to,debug=debug,as_json=as_json)
                 if as_json: results[n]=result
                 conn.close()
+            except DbCodecError as e:
+                msg=_codec_fail(n,e,conn)
+                if as_json: results[n]={'error':msg}
             except sqlite3.Error as e:
                 if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
                 else: printer(f"SQLite error ({db_path}): {e}")
@@ -2875,6 +3050,7 @@ class BorgHelper:
         reste littéral ; sans '*' (ni '?'), sous-chaîne implicite (comme Search). Retourne une liste
         plate {name,full_path,parent,is_dir,genre,mode,owner}, triée par chemin."""
         import fnmatch
+        prefix=_norm_lp(prefix)
         pat=pattern or '*'
         if '*' not in pat and '?' not in pat: pat=f'*{pat}*'
         row=conn.execute("SELECT archive FROM archive_snapshot_v WHERE nick=? ORDER BY archive_date DESC LIMIT 1",(n,)).fetchone()
@@ -2882,9 +3058,9 @@ class BorgHelper:
             msg=f"aucun snapshot indexé — lancez : borgHelper -c Index -n {n}"
             return {'error':msg} if as_json else None
         latest=row[0]
-        scope_sql=(_like_escape(prefix)+'/%') if prefix else '%'
-        rows=conn.execute("SELECT path,type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=? AND path LIKE ? ESCAPE '\\'",
-                           (n,latest,scope_sql)).fetchall()
+        psql,pprm,_=_psel_under(conn,prefix)  # descendants stricts (racine : tout)
+        rows=[(_path_decode(conn,p),t,m,o) for p,t,m,o in
+              conn.execute("SELECT path,type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=?"+_wh(psql),[n,latest]+pprm)]
         present_paths={r[0] for r in rows}   # tout chemin présent — jamais reconsidéré via diff_index,
                                               # même hors du motif recherché (priorité au snapshot courant)
         matches=[]
@@ -2900,13 +3076,13 @@ class BorgHelper:
         # Chemins supprimés (diff_index), récursivement sous le préfixe — jamais archive_snapshot_v
         # (purgé selon IDX_SNAP_KEEP, pas fiable ici) : même détection "dernier événement = removed"
         # que _treehist_listing, mais sans restriction à un seul niveau de profondeur.
-        del_rows=conn.execute("""
+        del_rows=[(_path_decode(conn,r[0]),)+tuple(r[1:]) for r in conn.execute("""
             SELECT path,archive_old,archive_new,archive_new_date,size_before FROM (
                 SELECT path,change_type,archive_old,archive_new,archive_new_date,size_before,
                        ROW_NUMBER() OVER (PARTITION BY path ORDER BY archive_new_date DESC,id DESC) AS rn
-                FROM diff_index WHERE nick=? AND path LIKE ? ESCAPE '\\'
+                FROM diff_index WHERE nick=?"""+_wh(psql)+"""
             ) WHERE rn=1 AND change_type='removed'
-        """,(n,scope_sql)).fetchall()
+        """,[n]+pprm)]
         for path,archive_old,archive_new,archive_new_date,size_before in del_rows:
             if prefix and path==prefix: continue
             if path in present_paths: continue  # présent dans le dernier snapshot -> jamais listé deux fois
@@ -2936,7 +3112,7 @@ class BorgHelper:
         return None
 
     def treefind(self,nick,prefix=None,pattern=None,debug=0,as_json=False):
-        prefix=(prefix or '').strip().lstrip('/').rstrip('/')
+        prefix=_norm_lp((prefix or '').strip())
         results={}
         for n in nick.split(','):
             db_path=self.db.get_diff_db(n)
@@ -2951,6 +3127,9 @@ class BorgHelper:
                 result=self._treefind_listing(n,prefix,pattern,conn,debug=debug,as_json=as_json)
                 if as_json: results[n]=result
                 conn.close()
+            except DbCodecError as e:
+                msg=_codec_fail(n,e,conn)
+                if as_json: results[n]={'error':msg}
             except sqlite3.Error as e:
                 if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
                 else: printer(f"SQLite error ({db_path}): {e}")
@@ -2964,29 +3143,30 @@ class BorgHelper:
             # sql_pat que les branches ci-dessous (dupliqué exprès pour ne jamais risquer de modifier
             # leur comportement existant).
             if pattern is None:
-                sql_pat='%'
+                sel=('all',)
             elif '/*' in pattern or pattern=='*':
                 prefix=pattern.rsplit('/*',1)[0] if '/*' in pattern else ''
-                sql_pat=(prefix+'/%').lstrip('/') if prefix else '%'
+                sel=('under',_norm_lp(prefix)) if _norm_lp(prefix) else ('all',)
             else:
                 sql_pat=pattern.replace('*','%').replace('?','_')
                 if '%' not in sql_pat and '_' not in sql_pat: sql_pat='%'+sql_pat+'%'
-            rows=self.db._duidx_collect_raw(nick,sql_pat,archive_from,archive_to)
+                sel=('like',sql_pat)
+            rows=self.db._duidx_collect_raw(nick,sel,archive_from,archive_to)
             print(json.dumps({'borghelper_version':Version,'pattern':pattern,'rows':rows},ensure_ascii=False,indent=2))
             return
         if pattern is None:
-            totals=self.db._duidx_collect_global(nick,'%',archive_from,archive_to)
+            totals=self.db._duidx_collect_global(nick,('all',),archive_from,archive_to)
             _duidx_print(totals,None,False,sort_by,reverse,as_json); return
         if '/*' in pattern or pattern=='*':
             prefix=pattern.rsplit('/*',1)[0] if '/*' in pattern else ''
-            depth=prefix.count('/')+1 if prefix else 0
-            sql_pat=(prefix+'/%').lstrip('/') if prefix else '%'
-            totals=self.db._duidx_collect(nick,sql_pat,lambda p:_duidx_path_key(p,depth),archive_from,archive_to)
+            depth=_norm_lp(prefix).count('/')+1 if _norm_lp(prefix) else 0
+            sel=('under',_norm_lp(prefix)) if _norm_lp(prefix) else ('all',)
+            totals=self.db._duidx_collect(nick,sel,lambda p:_duidx_path_key(p,depth),archive_from,archive_to)
             _duidx_print(totals,pattern,True,sort_by,reverse,as_json)
         else:
             sql_pat=pattern.replace('*','%').replace('?','_')
             if '%' not in sql_pat and '_' not in sql_pat: sql_pat='%'+sql_pat+'%'
-            totals=self.db._duidx_collect_global(nick,sql_pat,archive_from,archive_to)
+            totals=self.db._duidx_collect_global(nick,('like',sql_pat),archive_from,archive_to)
             _duidx_print(totals,pattern,False,sort_by,reverse,as_json)
 
     def idxtop(self,nick,depth=3,topn=20,debug=0,as_json=False):
@@ -3007,8 +3187,10 @@ class BorgHelper:
                     batch=cur.fetchmany(50000)
                     if not batch: break
                     for path,size in batch:
-                        rows.append({'chemin':path,'taille':size or 0})
+                        rows.append({'chemin':_path_decode(conn,path),'taille':size or 0})
                 conn.close()
+            except DbCodecError as e:
+                print(json.dumps({'error':_codec_fail(nick,e,conn)},ensure_ascii=False,indent=2)); return
             except sqlite3.Error as e:
                 print(json.dumps({'error':f"SQLite error ({db_path}): {e}"},ensure_ascii=False,indent=2)); return
             print(json.dumps({'borghelper_version':Version,'nick':nick,'rows':rows},ensure_ascii=False,indent=2))
@@ -3028,10 +3210,12 @@ class BorgHelper:
                 rows=cur.fetchmany(50000)
                 if not rows: break
                 for path,size in rows:
-                    pfx=get_prefix(path,depth)
+                    pfx=get_prefix(_path_decode(conn,path),depth)
                     stats[pfx]['count']+=1; stats[pfx]['size']+=(size or 0)
                     total_count+=1; total_size+=(size or 0)
             conn.close()
+        except DbCodecError as e:
+            _codec_fail(nick,e,conn); return
         except sqlite3.Error as e:
             printer(f"  SQLite error ({db_path}): {e}"); return
         if not total_count:
@@ -3125,8 +3309,10 @@ class BorgHelper:
                     batch=cur.fetchmany(50000)
                     if not batch: break
                     for path,ct,sb,sa in batch:
-                        rows.append({'chemin':path,'type':ct,'taille_avant':sb or 0,'taille_apres':sa or 0})
+                        rows.append({'chemin':_path_decode(conn,path),'type':ct,'taille_avant':sb or 0,'taille_apres':sa or 0})
                 conn.close()
+            except DbCodecError as e:
+                print(json.dumps({'error':_codec_fail(nick,e,conn)},ensure_ascii=False,indent=2)); return
             except sqlite3.Error as e:
                 print(json.dumps({'error':f"SQLite error ({db_path}): {e}"},ensure_ascii=False,indent=2)); return
             print(json.dumps({'borghelper_version':Version,'nick':nick,'archive_old':arch_old,'archive_new':arch_new,
@@ -3149,7 +3335,7 @@ class BorgHelper:
                 rows=cur.fetchmany(50000)
                 if not rows: break
                 for path,ct,sb,sa in rows:
-                    pfx=get_prefix(path,depth)
+                    pfx=get_prefix(_path_decode(conn,path),depth)
                     s=stats[pfx]
                     s['total']+=1
                     sz=(sa or sb or 0)
@@ -3159,6 +3345,8 @@ class BorgHelper:
                     else:              s['modified_n']+=1; total_modified+=1
                     total_count+=1; total_size+=sz
             conn.close()
+        except DbCodecError as e:
+            _codec_fail(nick,e,conn); return
         except sqlite3.Error as e:
             printer(f"  SQLite error ({db_path}): {e}"); return
         if not total_count:
@@ -3232,43 +3420,87 @@ class BorgHelper:
         keep_snap=int(cfg.get('IDX_SNAP_KEEP',
             sum(int(cfg.get(k,0)) for k in ['KEEP_DAILY','KEEP_WEEKLY','KEEP_MONTHLY','KEEP_YEARLY','KEEP_HOURLY'])
             or 10))
-        def _pat_cond(patterns):
-            parts=[]; args=[]
-            for pat in patterns:
-                if any(c in pat for c in '*?['):
-                    parts.append("path GLOB ?"); args.append(pat)
-                else:
-                    parts.append("(path=? OR path LIKE ?)")
-                    args.extend([pat,pat.rstrip('/')+'/%'])
-            return ' OR '.join(parts),args
-        sql_where=None; params=None
-        if pattern is not None:
-            is_glob=any(c in pattern for c in '*?[')
-            if is_glob:
-                sql_where="nick=? AND path GLOB ?"; params=(nick,pattern)
-            else:
-                sql_where="nick=? AND (path=? OR path LIKE ?)"; params=(nick,pattern,pattern.rstrip('/')+'/%')
-        else:
+        includes=excludes=[]
+        if pattern is None:
             includes=[p for p in cfg.get('IDX_INCLUDE','').split() if p]
             excludes=[p for p in cfg.get('IDX_EXCLUDE','').split() if p]
             if includes: printer(f"  {nick}: IDX_INCLUDE : {' '.join(includes)}")
             if excludes: printer(f"  {nick}: IDX_EXCLUDE : {' '.join(excludes)}")
-            if includes and excludes:
-                inc_sql,inc_args=_pat_cond(includes)
-                exc_sql,exc_args=_pat_cond(excludes)
-                sql_where=f"nick=? AND (NOT ({inc_sql}) OR ({exc_sql}))"
-                params=tuple([nick]+inc_args+exc_args)
-            elif includes:
-                inc_sql,inc_args=_pat_cond(includes)
-                sql_where=f"nick=? AND NOT ({inc_sql})"
-                params=tuple([nick]+inc_args)
-            elif excludes:
-                exc_sql,exc_args=_pat_cond(excludes)
-                sql_where=f"nick=? AND ({exc_sql})"
-                params=tuple([nick]+exc_args)
+        def _is_glob(pat): return any(c in pat for c in '*?[')
+        _norm=_norm_lp
+        def _pat_cond(conn,patterns):
+            # plain : GLOB en SQL ; sinon le motif est un préfixe (égalité + intervalle, jamais LIKE).
+            # Un préfixe vide ne cible rien (jamais toute la base).
+            parts=[]; args=[]
+            for pat in patterns:
+                if pat.startswith('/'):
+                    parts.append("0")  # les chemins stockés n'ont jamais de '/' initial : ne cible rien (comportement historique)
+                elif _is_glob(pat):
+                    g,ga,_=_psel_glob(conn,pat); parts.append(g); args.extend(ga)
+                elif not pat.rstrip('/'):
+                    parts.append("0")
+                else:
+                    u,ua,_=_psel_under(conn,pat.rstrip('/'),self_too=True); parts.append(u); args.extend(ua)
+            return ' OR '.join(parts),args
+        def _py_match(patterns):
+            # chiffré : mêmes correspondances que _pat_cond, évaluées sur le chemin logique décodé
+            patterns=[pat for pat in patterns if not pat.startswith('/')]  # '/' initial : ne cible rien
+            rxs=[_glob_regex(pat) for pat in patterns if _is_glob(pat)]
+            bases=[b for b in (_norm(pat) for pat in patterns if not _is_glob(pat)) if b]
+            return lambda p: any(r.fullmatch(p) for r in rxs) or any(p==b or p.startswith(b+'/') for b in bases)
+        def _narrow(conn,patterns):
+            # chiffré : sur-ensemble de lignes candidates par intervalles (SQL) ; None = tout lire
+            parts=[]; args=[]
+            for pat in patterns:
+                if pat.startswith('/'): continue
+                if _is_glob(pat):
+                    head=pat[:min(k for k,c in enumerate(pat) if c in '*?[')]
+                    d=_norm(head.rsplit('/',1)[0]) if '/' in head else ''
+                    if not d: return None
+                    u,ua,_=_psel_under(conn,d)
+                else:
+                    b=_norm(pat)
+                    if not b: continue
+                    u,ua,_=_psel_under(conn,b,self_too=True)
+                parts.append(u); args.extend(ua)
+            return (' OR '.join(parts),args) if parts else ('0',[])
         try:
             conn=_open_db(db_path,nick=nick,role='write',timeout=60)
             count=0; size=0
+            sql_where=None; params=None      # plain : condition SQL
+            ids=None                          # chiffré : id des lignes à supprimer, choisies en Python
+            has_cond=pattern is not None or bool(includes) or bool(excludes)
+            if has_cond and conn.codec is None:
+                if pattern is not None:
+                    c_sql,c_args=_pat_cond(conn,[pattern])
+                    sql_where=f"nick=? AND ({c_sql})"; params=tuple([nick]+c_args)
+                elif includes and excludes:
+                    inc_sql,inc_args=_pat_cond(conn,includes)
+                    exc_sql,exc_args=_pat_cond(conn,excludes)
+                    sql_where=f"nick=? AND (NOT ({inc_sql}) OR ({exc_sql}))"
+                    params=tuple([nick]+inc_args+exc_args)
+                elif includes:
+                    inc_sql,inc_args=_pat_cond(conn,includes)
+                    sql_where=f"nick=? AND NOT ({inc_sql})"
+                    params=tuple([nick]+inc_args)
+                else:
+                    exc_sql,exc_args=_pat_cond(conn,excludes)
+                    sql_where=f"nick=? AND ({exc_sql})"
+                    params=tuple([nick]+exc_args)
+            elif has_cond:
+                if pattern is not None: pred=_py_match([pattern]); nar=_narrow(conn,[pattern])
+                elif includes and excludes:
+                    inc,exc=_py_match(includes),_py_match(excludes)
+                    pred=lambda p: (not inc(p)) or exc(p); nar=None
+                elif includes:
+                    inc=_py_match(includes); pred=lambda p: not inc(p); nar=None
+                else: pred=_py_match(excludes); nar=_narrow(conn,excludes)
+                q="SELECT id,path,COALESCE(size_after,size_before,0) FROM diff_index WHERE nick=?"; qa=[nick]
+                if nar is not None: q+=" AND ("+nar[0]+")"; qa+=nar[1]
+                ids=[]
+                for rid,sp,sz in conn.execute(q,qa):
+                    if pred(_path_decode(conn,sp)): ids.append(rid); size+=sz or 0
+                count=len(ids)
             if sql_where:
                 row=conn.execute(
                     f"SELECT COUNT(*),SUM(COALESCE(size_after,size_before,0)) FROM diff_index WHERE {sql_where}",
@@ -3276,7 +3508,7 @@ class BorgHelper:
                 count,size=row[0],row[1] or 0
             snap_del,snap_count=self._snapurge_check(nick,conn,keep_snap)
             if not count and not snap_del:
-                if not sql_where and pattern is None:
+                if not has_cond and pattern is None:
                     printer(f"  {nick}: aucun IDX_INCLUDE/IDX_EXCLUDE dans la config")
                 else:
                     printer(f"  {nick}: aucune entrée à purger")
@@ -3290,7 +3522,8 @@ class BorgHelper:
                 printer(f"  {nick}: dry-run — aucune modification")
                 conn.close(); return
             if count:
-                conn.execute(f"DELETE FROM diff_index WHERE {sql_where}",params)
+                if ids is not None: conn.executemany("DELETE FROM diff_index WHERE id=?",[(rid,) for rid in ids])  # chiffré : suppression par id
+                else: conn.execute(f"DELETE FROM diff_index WHERE {sql_where}",params)
                 conn.execute("""UPDATE diff_indexed_pairs SET entry_count=(
                     SELECT COUNT(*) FROM diff_index di
                     WHERE di.nick=diff_indexed_pairs.nick
@@ -3303,6 +3536,8 @@ class BorgHelper:
             if count: printer(f"  {nick}: {count:,} entrées diff supprimées")
             if snap_del: printer(f"  {nick}: {snap_count:,} entrées snapshot supprimées ({len(snap_del)} archives)")
             self._vacuum_db(db_path,verbose=True,nick=nick)
+        except DbCodecError as e:
+            _codec_fail(nick,e,conn); return
         except sqlite3.Error as e:
             printer(f"  SQLite error ({db_path}): {e}")
             try: conn.close()
@@ -3650,7 +3885,7 @@ def codec_selftest():
         return False
     tmp=tempfile.mkdtemp(prefix='borghelper-selftest-')
     # état global restauré à la fin : le self-test ne doit rien laisser derrière lui
-    saved_readers=dict(_DB_CFG_READERS); saved_deks=dict(_DEK_CACHE); saved_scrypt=getattr(hashlib,'scrypt',None)
+    saved_readers=dict(_DB_CFG_READERS); saved_deks=dict(_DEK_CACHE); saved_codecs=dict(_CODEC_CACHE); saved_scrypt=getattr(hashlib,'scrypt',None)
     try:
         # ── primitives : vecteurs officiels ──
         check("HMAC-SHA256 (RFC 4231 cas 1)",lambda: hmac.new(b'\x0b'*20,b'Hi There',hashlib.sha256).hexdigest()==
@@ -3829,10 +4064,261 @@ def codec_selftest():
                 return err.getvalue().count('accessible au groupe/autres')==1 and out.getvalue()==''
             finally: _RC_PERM_WARNED=saved
         check("permissions : rc ouvert -> un seul avertissement stderr, stdout intact",_rcwarn)
+        # ── requêtes (Story 2) : primitives de chemin, parité plain/chiffré, plans d'exécution ──
+        mem=sqlite3.connect(':memory:')
+        def _sql1(q,*a): return mem.execute(q,a).fetchone()[0]
+        _NB=b'\xff\xfe'.decode('utf-8','surrogateescape')
+        _like_cases=[('%log','app.LOG'),('%log','app.logx'),('a_b','aXb'),('a_b','A_B'),('a_b','a%b'),('É%','éa'),('é%','Éa'),('%日本%','x日本y'),
+                     ('a%b%c','aXXbYYc'),('%','') ,('','') ,('_','é'),('_','ab'),('a\\%','a\\x'),('a_c','a\nc'),('[a]','[a]'),('x.y','xzy')]
+        check("LIKE ASCII reproduit en Python (casse ASCII seulement, %/_ jokers, comme SQLite)",
+              lambda: all(bool(_sql1("SELECT ? LIKE ?",t,p))==(_like_regex(p).fullmatch(t) is not None) for p,t in _like_cases))
+        _glob_cases=[('*.log','a.log'),('*.log','a.LOG'),('a?c','abc'),('a?c','abbc'),('[a-c]x','bx'),('[a-c]x','dx'),('[^a-c]x','dx'),('[^a-c]x','bx'),
+                     ('[]a]x',']x'),('[]a]x','ax'),('[a-]x','-x'),('[c-a]x','bx'),('[abx','a'),('[abx','[abx'),('home/*','home/u/f'),('home/*','homes/f'),
+                     ('*/x/*','a/x/b'),('É*','éa'),('[é]x','éx'),('a[^]]c','abc'),('a[^]]c','a]c'),('*','') ,('?','é')]
+        check("GLOB reproduit en Python (sensible à la casse, [..], [^..], intervalles, [ non fermé)",
+              lambda: all(bool(_sql1("SELECT ? GLOB ?",t,p))==(_glob_regex(p).fullmatch(t) is not None) for p,t in _glob_cases))
+        _sort_paths=['a','A','a/b','a-b','a.b','a0','é','e','日本','😀','z','Z','é/a','日本/x','a b','a\tb','','a/é','a/e']
+        def _sort_ok():
+            mem.execute("CREATE TEMP TABLE IF NOT EXISTS ts(p TEXT)"); mem.execute("DELETE FROM ts")
+            mem.executemany("INSERT INTO ts VALUES(?)",[(p,) for p in _sort_paths])
+            return [r[0] for r in mem.execute("SELECT p FROM ts ORDER BY p")]==sorted(_sort_paths,key=_path_sort_key)
+        check("tri Python (octets UTF-8) identique à ORDER BY path de SQLite",_sort_ok)
+        _bpaths=['x','x/z','x/z/w','x-y','x.y','x0','x1','xx','w','y','a%b/c','a%bX/c','a_b/c','aXb/c','x/%']
+        def _bounds_ok(conn):
+            for pre in ('x','a%b','a_b','x/z'):
+                b=_path_range(conn,pre)
+                got={p for p in _bpaths if b[0]<=_path_stored(conn,p)<b[1]}
+                if got!={p for p in _bpaths if _norm_lp(p).startswith(pre+'/')}: return False
+            return _path_range(conn,'') is None and _path_range(conn,'/') is None
+        cq=_open_db(os.path.join(tmp,'q0.db'),nick=None,role='admin')
+        cq_hdr,cq_dek=_enc_header_build('pw','siv1','light')
+        cq.codec=DbCodec(cq_dek)  # connexion 'chiffrée' pour les seules primitives (aucune écriture)
+        def _closing(fn):
+            c=_open_db(os.path.join(tmp,'q0.db'),nick=None,role='admin')
+            try: return fn(c)
+            finally: c.close()
+        check("préfixe par intervalle (plain) : descendants stricts, jamais un frère ni %/_ joker",lambda: _closing(_bounds_ok))
+        check("préfixe par intervalle (chiffré) : descendants stricts, jamais un frère ni %/_ joker",lambda: _bounds_ok(cq))
+        check("racine/préfixe vide : aucune borne, aucune condition",lambda: _psel_under(cq,'')[0]=='' and _closing(lambda c:_psel_under(c,'')[0]==''))
+        cq.close()
+        check("décodage mémoïsé borné : vidé à saturation, résultat inchangé",lambda: (lambda cd:(
+              cd.decode_path(cd.path.encode('a/b'))=='a/b' and cd.decode_path(cd.path.encode('a/b'))=='a/b' and
+              (setattr(cd,'_memo',{str(i):'x' for i in range(_DEC_MEMO_MAX)}) or True) and
+              cd.decode_path(cd.path.encode('c/d'))=='c/d' and len(cd._memo)==1))(DbCodec(cq_dek)))
+        # base de test : mêmes lignes en plain ('qp') et chiffré ('qe'), écrites via le codec de chaque base
+        qcache=os.path.join(tmp,'qcache'); qrc=os.path.join(tmp,'qrc'); os.makedirs(qcache)
+        bhq=BorgHelper(cfgfile=qrc,cache_dir=qcache)
+        A1,A2,A3='h-a1','h-a2','h-a3'; D1,D2,D3='2026-01-01T00:00:00','2026-01-02T00:00:00','2026-01-03T00:00:00'
+        _dirs=['etc','etc/sub','Etc','a%b','a%b/x','aXYZb','aXYZb/x','home','home/u','home/u/docs','éa','bin','x']
+        _files=['etc/passwd','etc/sub/app.log','etc/new.LOG','Etc/upper.txt','a%b/x/f.LOG','a%b/x/g.log','aXYZb/x/g.txt','home/u/docs/r.md',
+                'home/u/old.tmp','éa/日本.log','bin/b.log','x/z','x-y','x.y','x0']
+        _gone=[('etc/gone.conf','f'),('a_b','d'),('a_b/h.tmp','f'),('home/u/olddir','d'),('x/gone','f'),('éa/gone','f'),('bin/b.old','f')]
+        _diff=[(A1,A2,D2,'removed','etc/gone.conf',5,None),(A1,A2,D2,'removed','a_b/h.tmp',2,None),(A1,A2,D2,'removed','a_b',None,None),
+               (A1,A2,D2,'removed','home/u/olddir',None,None),(A1,A2,D2,'removed','x/gone',1,None),(A1,A2,D2,'removed','home/u/old.tmp',3,None),
+               (A1,A2,D2,'added','etc/new.LOG',None,4),(A1,A2,D2,'modified','etc/passwd',1,2),(A1,A2,D2,'removed','éa/gone',7,None),
+               (A1,A2,D2,'removed','bin/b.old',2,None),
+               (A2,A3,D3,'added','a%b/x/g.log',None,1),(A2,A3,D3,'modified','etc/passwd',2,3),(A2,A3,D3,'added','home/u/old.tmp',None,3),
+               (A2,A3,D3,'added','éa/日本.log',None,6),(A2,A3,D3,'added','bin/b.log',None,2),(A2,A3,D3,'modified','Etc/upper.txt',1,2)]
+        def _q_build(nick,encrypted):
+            path=bhq.db.get_diff_db(nick)
+            for suf in ('','-wal','-shm'):
+                if os.path.exists(path+suf): os.unlink(path+suf)
+            bhq.db.ensure_diff_db(path)
+            if encrypted:
+                c=_open_db(path,nick=None,role='admin'); _enc_header_write(c,cq_hdr); c.close()
+            c=_open_db(path,nick=nick,role='write')
+            E=(lambda p: c.codec.path.encode(p)) if c.codec else (lambda p: p)
+            for p in _dirs+_files+[g for g,_t in _gone]:
+                t='d' if p in _dirs or dict(_gone).get(p)=='d' else '-'
+                c.execute("INSERT INTO snapshot_file(nick,path,size,mtime,type,mode,owner) VALUES(?,?,?,?,?,?,?)",(nick,E(p),None if t=='d' else 3,'m',t,'-rw-r--r--','o:g'))
+            ids={r[1]:r[0] for r in c.execute("SELECT id,path FROM snapshot_file WHERE nick=?",(nick,))}
+            for p in _dirs+_files: c.execute("INSERT INTO archive_snapshot(nick,archive,archive_date,file_id) VALUES(?,?,?,?)",(nick,A3,D3,ids[E(p)]))
+            for p in [x for x in _files if x!='etc/new.LOG']+_dirs+[g for g,_t in _gone]: c.execute("INSERT INTO archive_snapshot(nick,archive,archive_date,file_id) VALUES(?,?,?,?)",(nick,A1,D1,ids[E(p)]))
+            for ao,an,dn,ct,p,sb,sa in _diff:
+                c.execute("INSERT INTO diff_index(nick,archive_old,archive_new,archive_new_date,change_type,path,size_before,size_after) VALUES(?,?,?,?,?,?,?,?)",(nick,ao,an,dn,ct,E(p),sb,sa))
+            for ao,an in ((A1,A2),(A2,A3)): c.execute("INSERT INTO diff_indexed_pairs(nick,archive_old,archive_new,entry_count) VALUES(?,?,?,0)",(nick,ao,an))
+            for a,d in ((A1,D1),(A2,D2),(A3,D3)): c.execute("INSERT INTO archive_stats(nick,archive,archive_date,nfiles) VALUES(?,?,?,1)",(nick,a,d))
+            c.commit(); c.close()
+        def _q_rc(extra=''):
+            with open(qrc,'w') as f:
+                for nk in ('qp','qe'): f.write(f"[{nk}]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n{extra}\n")
+            os.chmod(qrc,0o600)
+        _q_rc()
+        _DB_CFG_READERS[os.path.realpath(qcache)]=bhq.borg.cfgread
+        _q_build('qp',False); _q_build('qe',True)
+        def _q_run(fn,*a,**k):
+            out=io.StringIO(); err=io.StringIO()
+            with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+                try: fn(*a,**k)
+                except SystemExit: pass
+            return out.getvalue()+err.getvalue()
+        def _q_pair(fn,*a,key=None,norm=None,**k):
+            """Même commande sur la base plain et la base chiffrée -> (sortie plain, sortie chiffrée), nick retiré."""
+            res=[]
+            for nk in ('qp','qe'):
+                txt=_q_run(fn,nk,*a,**k)
+                try: v=json.loads(txt)
+                except ValueError: v=txt.replace(nk,'NICK')
+                if key and isinstance(v,dict) and nk in v: v=v[nk]
+                res.append(norm(v) if norm else v)
+            return res
+        def _same(*args,**k): p,e=_q_pair(*args,**k); return p==e and p not in ('',None)
+        # journal SQL des connexions chiffrées : aucun LIKE/GLOB ni ORDER BY sur un chemin ne doit y
+        # passer — porte sur TOUT le reste du self-test (y compris IdxPurge et _find_last_archive_with_file).
+        traced=[]; _orig_open=_open_db
+        def _traced_open(*a,**k):
+            cn=_orig_open(*a,**k)
+            if cn.codec is not None: cn.set_trace_callback(traced.append)
+            return cn
+        globals()['_open_db']=_traced_open
+        try:
+            tp=[None,'etc','Etc','ETC','a%b','a%b/x','aXYZb','home/u','éa','bin','x','x/z','nope','a_b','/etc','etc/','a%b//x','//etc//']
+            for pre in tp:
+                for arch in (None,'ALL'):
+                    check(f"parité TreeHist {pre!r} -b {arch}",lambda pre=pre,arch=arch: _same(bhq.treehist,pre,archive_from=arch,as_json=True,key=True))
+            for pre,pat in (('/etc','*'),('etc/','*'),('a%b//x','*.log'),(None,'log'),(None,'*.LOG'),(None,None),('etc','*'),('a%b','*'),('home','*.tmp'),(None,'*.log'),('a_b','*'),('éa','日*'),('x','z'),('Etc','*')):
+                check(f"parité TreeFind {pre!r} {pat!r} (dont supprimés)",lambda pre=pre,pat=pat: _same(bhq.treefind,pre,pat,as_json=True,key=True))
+            for pat in ('log','*.LOG','a_b','a%b','ETC/%','éa','日本','_tc','*.tmp','x?y','zzz','[a]'):
+                for arch in (None,'ALL'):
+                    check(f"parité Search {pat!r} -b {arch}",lambda pat=pat,arch=arch: (lambda p,e:p==e)(*_q_pair(bhq.search,pat,archive_from=arch,as_json=True,key=True)))
+            for fp in ('/etc/passwd','etc//passwd','etc/passwd/','etc/passwd','etc/gone.conf','home/u/old.tmp','bin/b.log','éa/日本.log','a_b/h.tmp','Etc/upper.txt','etc'):
+                for arch in (None,'ALL'):
+                    check(f"parité FileHist {fp!r} -b {arch}",lambda fp=fp,arch=arch: (lambda p,e:p==e)(*_q_pair(bhq.filehist,fp,archive_from=arch,as_json=True,key=True)))
+            _srt=lambda v: sorted(json.dumps(x,sort_keys=True,ensure_ascii=False) for x in v['rows']) if isinstance(v,dict) and 'rows' in v else v
+            for pat in (None,'/etc/*','etc//*','etc/*','a%b/*','*','*.log','log','_tc','home/u/*','Etc/*','x/*','a_b/*'):
+                for arch in (None,'ALL'):
+                    check(f"parité DuIdx -R {pat!r} -b {arch}",lambda pat=pat,arch=arch: (lambda p,e:p==e)(*_q_pair(bhq.duidx,pat,archive_from=arch,raw=True,norm=_srt)))
+                    check(f"parité DuIdx -j {pat!r} -b {arch}",lambda pat=pat,arch=arch: _same(bhq.duidx,pat,archive_from=arch,as_json=True))
+            check("parité IdxTop -j",lambda: (lambda p,e:p==e and p)(*_q_pair(bhq.idxtop,3,20,as_json=True,norm=_srt)))
+            check("parité DiffTop -j",lambda: (lambda p,e:p==e and p)(*_q_pair(bhq.difftop,f"{A1},{A2}",3,10,as_json=True,norm=_srt)))
+            check("parité ListBkpFiles -j (ordre octet UTF-8)",lambda: (lambda p,e:p==e and p and p==dict(p,files=sorted(p['files'],key=_path_sort_key)))(
+                  *_q_pair(bhq.list_files,A3,as_json=True,norm=lambda v: {k:x for k,x in v.items() if k!='nick'})))
+            check("parité _find_last_archive_with_file (égalité et glob)",lambda: all(
+                  bhq._find_last_archive_with_file('qp',p)==bhq._find_last_archive_with_file('qe',p) for p in ('etc/passwd','*.tmp','home/u/*.tmp','nope')))
+            # DuIdx global (sans motif) : assertion ABSOLUE contre un calcul indépendant depuis _diff
+            # (pas via duidx()/_duidx_collect_global — reproduirait le bug testé) : counts/sizes added/removed/
+            # modified pour la DERNIÈRE paire d'archives seulement (A1→A2 exclue) en défaut, les DEUX paires
+            # avec -b ALL — vérifie que la correction (plage AVANT GROUP BY, pas après) tient.
+            def _duidx_diff_expected(pairs):
+                exp={}
+                for ao,an,dn,ct,p,sb,sa in _diff:
+                    if (ao,an) not in pairs: continue
+                    sz=sb if ct=='removed' else sa
+                    exp[ct]=[exp.get(ct,[0,0])[0]+1,exp.get(ct,[0,0])[1]+(sz or 0)]
+                return exp
+            def _duidx_global_ok(arch_range,pairs):
+                got=json.loads(_q_run(bhq.duidx,'qp',None,archive_from=arch_range,as_json=True))
+                gm={r['type']:[r['nb'],r['taille']] for r in got['rows'] if r['type'] in ('added','removed','modified')}
+                return gm==_duidx_diff_expected(pairs)
+            check("DuIdx global -b ALL : totaux absolus added/removed/modified (les deux paires)",lambda: _duidx_global_ok('ALL',{(A1,A2),(A2,A3)}))
+            check("DuIdx global (défaut, dernière paire A2→A3 seule, A1→A2 exclue) : totaux absolus",lambda: _duidx_global_ok(None,{(A2,A3)}))
+            # RBAC : les chemins des sorties sont logiques ; le filtre de périmètre de borgHelperWWW donne le même résultat
+            def _rbac():
+                src=os.path.join(os.path.dirname(os.path.abspath(__file__)),'borgHelperWWW')
+                if not os.path.isfile(src): return None
+                import ast
+                with open(src,encoding='utf-8') as fh: tree=ast.parse(fh.read())
+                fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_path_in_scope')
+                ns={}; exec(compile(ast.Module([fn],[]),src,'exec'),ns)
+                return ns['_path_in_scope']
+            _pis=_rbac()
+            if _pis is None: skip("RBAC : _path_in_scope identique sur sorties plain/chiffré","borgHelperWWW introuvable")
+            else:
+                def _rbac_ok():
+                    for scope in (['/etc'],['/a%b','/home/u'],['/'],['/x','/éa']):
+                        rows=[]
+                        for nk in ('qp','qe'):
+                            r=json.loads(_q_run(bhq.duidx,nk,None,archive_from='ALL',raw=True))['rows']
+                            rows.append(sorted(x['chemin'] for x in r if _pis(x['chemin'],scope)))
+                        if rows[0]!=rows[1] or not rows[0]: return False
+                    return True
+                check("RBAC : _path_in_scope donne les mêmes chemins sur base plain et chiffrée",_rbac_ok)
+            # base tamponnée : DbCodecError attendue, attrapée par la commande elle-même (pas de traceback),
+            # connexion fermée, sortie normale par-nick (search : pas seulement list_files)
+            def _tamper_search():
+                _q_build('qe',True)
+                c=_open_db(bhq.db.get_diff_db('qe'),nick='qe',role='write')
+                c.execute("UPDATE snapshot_file SET path='AAAA' WHERE id=(SELECT MIN(id) FROM snapshot_file)"); c.commit(); c.close()
+                out=io.StringIO()
+                with contextlib.redirect_stdout(out): bhq.search('qe','*',archive_from='ALL',as_json=True)
+                try: v=json.loads(out.getvalue())['qe']
+                except ValueError: return False
+                _q_build('qe',True)  # restaure une base saine pour la suite du self-test
+                return isinstance(v,dict) and 'error' in v
+            check("Search sur base altérée : DbCodecError attrapée, message par nick, pas de traceback",_tamper_search)
+            check("plans (etc) sur connexion chiffrée : aucun LIKE/GLOB, aucun ORDER BY portant sur un chemin",
+                  lambda: traced and not [q for q in traced if re.search(r'\bLIKE\b|\bGLOB\b|ORDER BY[^\n]*\bpath\b',q)])
+        finally:
+            globals()['_open_db']=_orig_open
+        def _pragma_ok():
+            cp=_open_db(bhq.db.get_diff_db('qp'),nick='qp'); ce=_open_db(bhq.db.get_diff_db('qe'),nick='qe')
+            try: return cp.execute("SELECT 'a' LIKE 'A'").fetchone()[0]==1 and ce.execute("SELECT 'a' LIKE 'A'").fetchone()[0]==0
+            finally: cp.close(); ce.close()
+        check("PRAGMA case_sensitive_like : posé sur la connexion chiffrée seulement",_pragma_ok)
+        def _plan(nick,table):
+            c=_open_db(bhq.db.get_diff_db(nick),nick=nick)
+            sql,prm,_=_psel_under(c,'etc')
+            r=' '.join(str(x[3]) for x in c.execute(f"EXPLAIN QUERY PLAN SELECT id FROM {table} WHERE nick=? AND {sql}",[nick]+prm))
+            c.close(); return r
+        check("plan : intervalle de préfixe utilise idx_diff_nick_path (plain et chiffré)",lambda: all('idx_diff_nick_path' in _plan(n,'diff_index') for n in ('qp','qe')))
+        check("plan : intervalle de préfixe utilise idx_snapfile_nick_path (plain et chiffré)",lambda: all('idx_snapfile_nick_path' in _plan(n,'snapshot_file') for n in ('qp','qe')))
+        check("casse du préfixe (AD-16) : /Etc et /etc distincts dans les deux modes",lambda: (lambda p,e:p==e and 'Etc' in json.dumps(p) and 'passwd' not in json.dumps(p))(
+              *_q_pair(bhq.treehist,'Etc',as_json=True,key=True)))
+        check("préfixe a%b : le frère aXYZb n'apparaît jamais (plain et chiffré)",lambda: all('aXYZb' not in _q_run(bhq.treehist,n,'a%b',as_json=True)+_q_run(bhq.treefind,n,'a%b','*',as_json=True) for n in ('qp','qe')))
+        check("supprimés récupérables présents en TreeHist et TreeFind (plain et chiffré)",lambda: all(
+              'gone.conf' in _q_run(bhq.treehist,n,'etc',as_json=True) and 'h.tmp' in _q_run(bhq.treefind,n,None,'*.tmp',as_json=True) for n in ('qp','qe')))
+        def _nb_roundtrip():
+            _q_build('qe',True)  # base chiffrée seule : le plain SQLite ne sait pas stocker un nom non UTF-8
+            c=_open_db(bhq.db.get_diff_db('qe'),nick='qe',role='write')
+            sp=c.codec.path.encode('bin/'+_NB+'.log')
+            c.execute("INSERT INTO snapshot_file(nick,path,size,mtime,type,mode,owner) VALUES('qe',?,1,'m','-','m','o')",(sp,))
+            c.execute("INSERT INTO archive_snapshot(nick,archive,archive_date,file_id) SELECT 'qe',?,?,id FROM snapshot_file WHERE path=?",(A3,D3,sp))
+            c.commit(); c.close()
+            m=json.loads(_q_run(bhq.treefind,'qe','bin','*.log',as_json=True))['qe']['matches']
+            files=json.loads(_q_run(bhq.list_files,'qe',A3,as_json=True))['files']
+            return any(x['full_path']=='bin/'+_NB+'.log' for x in m) and ('bin/'+_NB+'.log') in files
+        check("nom non UTF-8 : aller-retour exact via TreeFind/ListBkpFiles (base chiffrée)",_nb_roundtrip)
+        # IdxPurge : mêmes lignes supprimées en plain et en chiffré (préfixe par intervalle, glob en Python, DELETE par id)
+        def _purge_rows(nick):
+            c=_open_db(bhq.db.get_diff_db(nick),nick=nick)
+            r=sorted((_path_decode(c,p),an,ct) for p,an,ct in c.execute("SELECT path,archive_new,change_type FROM diff_index WHERE nick=?",(nick,)))
+            c.close(); return r
+        def _purge_same(pattern=None,extra='',dry=False):
+            _q_rc(extra); outs=[]; rows=[]
+            for nk,enc_ in (('qp',False),('qe',True)):
+                _q_build(nk,enc_)
+                outs.append(re.sub(r'compactage[^\n]*','',_q_run(bhq.idxpurge,nk,pattern,dry).replace(nk,'NICK')))
+                rows.append(_purge_rows(nk))
+            _q_rc()
+            return outs[0]==outs[1] and rows[0]==rows[1] and (dry or len(rows[0])<len(_diff)) and 'aucune entrée' not in outs[0]
+        for pat in ('home/*','*.tmp','etc','home/u','a%b','*/x/*','x','éa/*','[eh]*','bin/*'):
+            check(f"parité IdxPurge -x {pat!r}",lambda pat=pat: _purge_same(pat))
+        check("parité IdxPurge -x etc -D (dry-run : rien supprimé)",lambda: _purge_same('etc',dry=True))
+        check("IdxPurge -x /etc (slash initial) : ne cible rien, identique en plain et chiffré",lambda: _purge_same('/etc') is False and
+              (lambda o1,r1,o2,r2: o1==o2 and r1==r2==sorted((p,an,ct) for ao,an,dn,ct,p,sb,sa in _diff))(*(lambda:(
+                  (_q_build('qp',False) or _q_run(bhq.idxpurge,'qp','/etc',False).replace('qp','NICK')),_purge_rows('qp'),
+                  (_q_build('qe',True) or _q_run(bhq.idxpurge,'qe','/etc',False).replace('qe','NICK')),_purge_rows('qe')))()))
+        for ex in ('IDX_EXCLUDE=*.tmp etc/sub','IDX_INCLUDE=etc home','IDX_INCLUDE=etc home/*\nIDX_EXCLUDE=*.tmp Etc','IDX_EXCLUDE=a%%b','IDX_EXCLUDE=/etc *.tmp'):
+            check(f"parité IdxPurge IDX_* ({ex.splitlines()[0]}…)",lambda ex=ex: _purge_same(None,ex))
+        def _tamper():
+            _q_build('qe',True)
+            c=_open_db(bhq.db.get_diff_db('qe'),nick='qe',role='write')
+            c.execute("UPDATE snapshot_file SET path='AAAA' WHERE id=(SELECT MIN(id) FROM snapshot_file)"); c.commit(); c.close()
+            return _tamper_run()
+        def _tamper_run():
+            out=io.StringIO()
+            try:
+                with contextlib.redirect_stdout(out): bhq.list_files('qe',A1,as_json=True)
+            except SystemExit: pass
+            try: v=json.loads(out.getvalue())
+            except ValueError: return False
+            return isinstance(v,dict) and 'error' in v
+        check("valeur stockée altérée : lecture refusée, message clair, pas de traceback (DbCodecError)",_tamper)
     finally:
         shutil.rmtree(tmp,ignore_errors=True)
         _DB_CFG_READERS.clear(); _DB_CFG_READERS.update(saved_readers)
         _DEK_CACHE.clear(); _DEK_CACHE.update(saved_deks)
+        _CODEC_CACHE.clear(); _CODEC_CACHE.update(saved_codecs)
         if saved_scrypt is not None: hashlib.scrypt=saved_scrypt
     fails=results.count(False)
     print(f"CodecSelfTest : {len(results)-fails}/{len(results)} OK"+(f", {fails} FAIL" if fails else ""))

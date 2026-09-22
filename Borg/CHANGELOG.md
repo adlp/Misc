@@ -1,5 +1,56 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.101 — chiffrement des chemins SQLite, story 2 : requêtes — 2026-09-22
+
+Rend toutes les lectures de chemins indépendantes du mode (`plain`/chiffré) : préfixes et égalités passent par des
+bornes/valeurs fournies par le codec, prédicats sur le nom et tris s'exécutent en Python sur des chemins décodés quand la
+connexion est chiffrée (AD-8, AD-16). **Aucune base n'est chiffrée** : en `plain` les sorties et codes de sortie sont
+inchangés, aux exceptions ci-dessous ; le mode chiffré est vérifié par `CodecSelfTest` sur des bases temporaires.
+
+- **Comportements modifiés en `plain` par rapport à `a53b9fa`** (toutes les sorties `plain` étaient auparavant garanties
+  identiques : les points ci-dessous sont les seules exceptions, listées explicitement ; le dernier documente au
+  contraire un comportement volontairement PRÉSERVÉ malgré un changement qui aurait pu l'affecter) :
+  - **Préfixe sensible à la casse (AD-16).** Un préfixe de chemin (`TreeHist -f`, `TreeFind -f`, `FileHist -f`,
+    `DuIdx -f 'préfixe/*'`, `IdxPurge -x préfixe`) ne correspond plus qu'à la casse exacte : `/Etc` ne trouve plus `/etc`
+    (l'ancien `LIKE` était insensible à la casse ASCII et n'utilisait pas l'index). Les préfixes sont aussi littéraux :
+    `%` et `_` n'y sont plus des jokers (`DuIdx -f 'a%b/*'` ne remonte plus `aXYZb/…`, `TreeHist -f a%b` non plus).
+    `Search`, `DuIdx` sans `/*` et `IdxPurge` (glob) gardent leurs prédicats de nom inchangés (`LIKE` insensible à la casse
+    ASCII, `GLOB` sensible) et `FileHist` reste une égalité exacte (après normalisation, voir point suivant).
+  - **Préfixe/chemin normalisé.** Un `/` initial ou final, ou un `//` interne, dans un préfixe (`TreeHist -f`,
+    `TreeFind -f`, `DuIdx -f 'préfixe/*'`) ou un chemin exact (`FileHist -f`) est maintenant retiré/fusionné avant
+    comparaison, dans les deux modes (`plain` comme chiffré, un seul normaliseur `_norm_lp`) : `-f /etc`, `-f etc/` et
+    `-f etc` donnent désormais le même résultat, `FileHist -f /etc/passwd` trouve la même entrée que
+    `FileHist -f etc/passwd`. Auparavant le comportement différait selon la présence de ces caractères (l'ancien `LIKE`
+    de préfixe les traitait différemment de l'égalité de `FileHist`, elle-même sensible au moindre `/` superflu).
+  - **`DuIdx` global : correction du filtre de plage d'archives.** `_duidx_collect_global` plaçait la condition de plage
+    (`archive_new=?`, dernière archive par défaut) *après* le `GROUP BY` : elle devenait une expression de regroupement
+    au lieu d'un filtre, si bien que toutes les entrées de diff étaient comptées, toutes archives confondues, sous un
+    seul type arbitraire. La condition est maintenant placée avant le `GROUP BY` : le résumé global par type change (il
+    est désormais correct). Nécessaire pour que `DuIdx` donne les mêmes résultats en `plain` et en chiffré.
+  - **Ordre des lignes non contractuel.** `DuIdx -R`, `IdxTop -j` et `DiffTop -j` peuvent renvoyer leurs lignes dans un
+    ordre différent (ordre d'index au lieu de l'ordre de table) : ces sorties n'ont jamais été triées, l'ordre n'était
+    qu'un détail d'implémentation de l'ancien `LIKE`/balayage de table.
+  - **`IdxPurge` avec un `/` initial : comportement inchangé.** Un pattern (`-x` ou une entrée `IDX_INCLUDE`/`IDX_EXCLUDE`)
+    commençant par `/` ne cible toujours rien (les chemins stockés n'ont jamais de `/` initial) — vérifié explicitement
+    malgré la normalisation ci-dessus, qui ne s'applique pas à `IdxPurge` (commande destructive : on préserve son
+    comportement historique plutôt que de le faire bénéficier de la normalisation).
+- **Index de chemin.** Un préfixe devient `path >= 'p/' AND path < 'p0'` (plus de `LIKE 'p/%'`, de
+  `(path=? OR path LIKE ?)`, de `NOT LIKE 'p/%/%'` ni de `_like_escape`, supprimé) : `diff_index` et `snapshot_file`
+  utilisent `idx_diff_nick_path` / `idx_snapfile_nick_path`. La vue `archive_snapshot_v` balaie toujours par
+  `(nick, archive)` puis filtre le chemin (comportement inchangé, voir TECHNICAL.md).
+- **`TreeHist`** : la profondeur se calcule en Python après décodage ; les enfants supprimés se cherchent par chemins
+  distincts du sous-arbre puis par dernier événement des seuls enfants directs (plus de fenêtre `ROW_NUMBER` sur tout le
+  sous-arbre) ; la détection des événements descendants d'un répertoire n'interprète plus `%`/`_` du nom du répertoire.
+- **Tris en Python** (ordre octet UTF-8, identique à l'ancien tri SQLite) pour `ListBkpFiles`, `DiffBkp` et `Search`.
+- **Chiffré uniquement** : helpers `_path_range`/`_psel_under`/`_psel_eq`/`_psel_like`/`_psel_glob`/`_path_decode`/
+  `_path_stored`/`_path_sort_key`, `DbCodec.decode_path` (mémo borné à 262 144 entrées, partagé entre connexions du processus),
+  `LIKE` ASCII et `GLOB` reproduits en Python (regex en cache borné), `PRAGMA case_sensitive_like=ON` sur les seules
+  connexions chiffrées, `IdxPurge` : préfixe par intervalle, glob en Python, `DELETE` par `id`.
+- **`CodecSelfTest`** : parité plain/chiffré sur `TreeHist`, `TreeFind` (dont supprimés), `Search`, `FileHist`, `DuIdx`,
+  `IdxTop`, `DiffTop`, `ListBkpFiles`, `IdxPurge` (préfixe, glob, `IDX_INCLUDE`/`IDX_EXCLUDE`), RBAC (`_path_in_scope`),
+  jeu de chemins avec `%`, `_`, casse différente, imbrication, racine, non UTF-8 ; comparaison `LIKE`/`GLOB`/tri avec
+  SQLite ; plans `EXPLAIN QUERY PLAN` ; aucun `LIKE`/`GLOB`/`ORDER BY path` émis sur une connexion chiffrée.
+
 ## borgHelper 1.0.100 / borgHelperWWW 1.15.1 — chiffrement des chemins SQLite, story 1 : fondations — 2026-09-21
 
 Première brique du chiffrement des chemins/payloads des bases SQLite (architecture : AD-1 à AD-5, AD-10,

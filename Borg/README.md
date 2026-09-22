@@ -476,6 +476,9 @@ borgHelper -c Search -f passwd -n mon-serveur -j   # JSON : {nick:[{date,archive
 
 Plage : `-b <archive>` (depuis), `-B <archive>` (jusqu'à), `-b ALL` (tout), sans les deux (dernière paire).
 
+Le motif porte sur le chemin complet ; sans `*`/`?`, sous-chaîne implicite. La comparaison ignore la casse des lettres ASCII
+(`%`/`_` restent des jokers LIKE) ; résultats triés par date puis par chemin (ordre octet UTF-8).
+
 ---
 
 ### `FileHist`
@@ -486,6 +489,9 @@ borgHelper -c FileHist -f /etc/nginx/nginx.conf -n mon-serveur
 borgHelper -c FileHist -f /var/lib/postgresql -n ALL
 borgHelper -c FileHist -f /etc/nginx/nginx.conf -n mon-serveur -j   # JSON : {nick:[{date,archive_before,archive_after,type,size_before,size_after},...]}
 ```
+
+`-f` est une égalité exacte, sensible à la casse ; un `/` initial/final ou un `//` interne est normalisé avant comparaison
+(`FileHist -f /etc/passwd` et `FileHist -f etc/passwd` trouvent la même entrée).
 
 ---
 
@@ -515,6 +521,10 @@ simple `added` ou `removed` d'un fichier niché en dessous — remonte en `modif
 `added`/`removed` emprunté à un descendant.
 
 Pour descendre dans un sous-répertoire, relancer `TreeHist` avec `-f` pointant dessus.
+
+**Préfixe (`-f`) sensible à la casse et littéral** (depuis 1.0.101, aussi pour `TreeFind -f`, `DuIdx -f 'préfixe/*'`,
+`IdxPurge -x préfixe`) : `-f /Etc` ne trouve pas `/etc`, et `%`/`_` n'y sont pas des jokers (un dossier `a%b` n'inclut jamais
+son frère `aXYZb`). Auparavant la comparaison ignorait la casse ASCII.
 
 **Fichiers/répertoires supprimés** : les enfants directs supprimés depuis (mais toujours
 récupérables — l'archive de dernière présence existe encore) apparaissent aussi, marqués
@@ -562,6 +572,9 @@ Motif minimal (`-m`) : `*` = n'importe quelle suite de caractères, `.` reste **
 spécial) ; sans `*` (ni `?`) dans le motif, sous-chaîne implicite (comme `Search`). Comparaison sur le
 **nom** de l'entrée uniquement (dernier segment du chemin), sensible à la casse.
 
+Le préfixe (`-f`) est sensible à la casse et littéral (`%`/`_` n'y sont pas des jokers) ; un `/` initial/final ou un `//`
+interne est normalisé avant comparaison — voir la note dans `TreeHist` ci-dessus.
+
 Colonnes (mode texte) : `nom`, `genre`, `chemin` (complet), `droits`, `propriétaire`, `état` — dernier
 état connu, même limitation que `TreeHist`. JSON (`-j`) :
 `{nick:{archive,scope,pattern,matches:[{name,full_path,parent,is_dir,genre,mode,owner}]}}` — `parent`
@@ -588,6 +601,10 @@ borgHelper -c DuIdx -f '*' -s présent:desc -n mon-serveur  # trié par taille p
 borgHelper -c DuIdx -f '*' -j -n mon-serveur               # sortie JSON
 borgHelper -c DuIdx -n mon-serveur -R                      # sortie brute, une ligne JSON par chemin
 ```
+
+Le préfixe (`-f 'préfixe/*'`) est sensible à la casse et littéral (`%`/`_` n'y sont pas des jokers) ; un `/`
+initial/final ou un `//` interne y est normalisé avant comparaison. Le motif de nom (`-f motif` sans `/*`) reste
+insensible à la casse ASCII, comme `Search`.
 
 `-R` (Story 1.4) : mode brut, une ligne `{chemin,type,taille}` par chemin, **jamais groupée** —
 distinct de `-j` qui reste le mode groupé historique (JSON `rows`/`total` par arborescence ou par
@@ -650,8 +667,12 @@ borgHelper -c IdxPurge -n mon-serveur -x '*/node_modules/*'  # purge un glob
 
 | Option | Description |
 |--------|-------------|
-| `-x <pattern>` | Pattern explicite (préfixe ou glob avec `*?[`) |
+| `-x <pattern>` | Pattern explicite : préfixe (sensible à la casse, littéral) ou glob avec `*?[` |
 | `-D` | Dry-run — affiche le volume sans supprimer |
+
+Le préfixe (`-x`, et chaque entrée non-glob de `IDX_INCLUDE`/`IDX_EXCLUDE`) est sensible à la casse et littéral
+(`%`/`_` non-jokers). **Non normalisé, contrairement aux autres commandes** : un `/` initial ne cible jamais rien (les
+chemins stockés n'ont jamais de `/` initial), comportement volontairement préservé pour cette commande destructive.
 
 Sans `-x`, lit `IDX_EXCLUDE`/`IDX_INCLUDE` depuis la configuration du nick et purge tout ce qui serait exclu à l'indexation.
 
@@ -706,7 +727,9 @@ borgHelper -c CodecSelfTest
 ```
 
 Auto-test du codec de chiffrement des chemins (vecteurs officiels HMAC/PBKDF2/scrypt, aller-retour, rejets
-`DbCodecError`/`DbKeyError`/`DbTamperError`, versions de schéma, `DB_ENCRYPT`/`DB_KDF`, permissions). Travaille
+`DbCodecError`/`DbKeyError`/`DbTamperError`, versions de schéma, `DB_ENCRYPT`/`DB_KDF`, permissions) et des requêtes de
+chemin : mêmes résultats sur une base `plain` et sur une base chiffrée pour `TreeHist`, `TreeFind`, `Search`, `FileHist`,
+`DuIdx`, `IdxTop`, `DiffTop`, `ListBkpFiles`, `IdxPurge` et le périmètre RBAC, plans d'exécution sur les index de chemin. Travaille
 uniquement sur des bases temporaires : aucune vraie base ni aucun vrai rc n'est lu. Une ligne `OK`/`FAIL` par
 contrôle ; code de sortie non nul au moindre échec.
 

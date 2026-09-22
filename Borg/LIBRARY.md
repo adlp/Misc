@@ -55,6 +55,13 @@ conn = _open_db(db_path, nick='mon-serveur', role='read')   # BhConnection ; .co
 ex. `timeout=60`, sont transmis à `sqlite3`). `db_encrypt_enabled(nick)` / `db_kdf_level(nick)` lisent `DB_ENCRYPT` /
 `DB_KDF`.
 
+Lectures de chemins (depuis 1.0.101) : les méthodes de `BorgHelper` (`treehist`, `treefind`, `search`, `filehist`, `duidx`,
+`idxtop`, `difftop`, `list_files`, `diffbkp`, `idxpurge`) renvoient/impriment toujours des chemins **logiques**, que la base soit
+`plain` ou chiffrée. Un préfixe de chemin est sensible à la casse et littéral (voir README, `TreeHist`). Pour lire une base
+directement, ouvrir avec `_open_db(..., nick=...)` et passer par `_path_range`/`_psel_under`, `_path_stored` et `_path_decode`
+plutôt que par un `LIKE` sur `path` (qui ne fonctionnerait pas sur une base chiffrée) ; les requêtes SQL manuelles ci-dessous
+ne valent que pour une base `plain`.
+
 ---
 
 ## Les trois classes
@@ -375,6 +382,11 @@ sqlite3 $DB
 ```
 
 ### Requêtes utiles
+
+**Valables uniquement sur une base `plain`.** Ces requêtes SQL manuelles (`sqlite3` en ligne de commande) lisent la
+colonne `path` directement : sur une base chiffrée, `path` contient la valeur stockée (chiffrée), pas le chemin
+logique — un `LIKE '%nginx%'` n'y trouverait rien, et rien n'y déchiffre le résultat. Pour une base potentiellement
+chiffrée, passer par `borgHelper`/`BorgHelper` (CLI ou lib) plutôt que par ces requêtes.
 
 ```bash
 # Tables disponibles
