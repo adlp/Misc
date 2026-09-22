@@ -39,12 +39,24 @@ except SchemaVersionError as e:
     print(f"[WARN] DB incompatible, indexation ignorée : {e}")
 ```
 
+`ensure_diff_db(db_path, create=True)` / `ensure_cache_db(db_path, create=True)` — depuis 1.0.102, `create=False`
+réserve la création (fichier, schéma, `enc_header`) aux créateurs légitimes (`Index`, `Bkp`, `indexsnap`, `DbEncrypt`) :
+un appelant de lecture qui passe `create=False` sur une base absente ou sans schéma n'écrit rien sur disque et doit
+lui-même gérer l'absence de table (`sqlite3.OperationalError: no such table`) comme un index vide.
+
 ### Exceptions du chiffrement de base
 
 `DbKeyError` (passphrase absente ou fausse pour une base chiffrée), `DbModeError` (mode de la base changé depuis
 l'ouverture), `DbTamperError` (en-tête incohérent, ex. `enc_header` avec `path_enc='plain'`), `DbCodecError` (chemin ou
 blob stocké non canonique, tag/MAC invalide). Elles **n'héritent pas de `sqlite3.Error`** : un `except sqlite3.Error`
-ne les avale jamais. Aucune n'est levée par une base `plain` aujourd'hui : rien n'est encore chiffré (`DB_ENCRYPT` sans effet avant `DbEncrypt`). La clé de chiffrement sera dérivée de `BORG_PASSPHRASE` : changer la passphrase borg exigera un `DbRekey`. `DbModeError` n'a pas encore de point de levée.
+ne les avale jamais. Aucune n'est levée par une base `plain` aujourd'hui : rien n'est encore chiffré (`DB_ENCRYPT` sans effet avant `DbEncrypt`). La clé de chiffrement sera dérivée de `BORG_PASSPHRASE` : changer la passphrase borg exigera un `DbRekey`.
+
+`DbModeError` (depuis 1.0.102) : levée par `_write_mode_check(conn)`, appelée en tout premier par les sites qui
+écrivent un chemin (`store_diff_entries`, `store_archive_snapshot`, `_indexsnap_incremental`, le bloc d'écriture
+inline de `index()`) si le mode relu dans la transaction (`db_meta.enc_header`) diffère du mode constaté à l'ouverture
+de la connexion (`conn.mode`). Pas un verrou d'exclusion mutuelle, une garde de cohérence contre un écrivain ouvert
+avant une migration. `index()` l'intercepte spécifiquement par paire (paire reportée via `index_pending`, jamais «
+borg diff échoué ») ; ailleurs elle se propage à l'appelant.
 
 ```python
 from borgHelper import _open_db, DbKeyError

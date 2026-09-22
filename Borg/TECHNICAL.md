@@ -755,6 +755,98 @@ répétable sur les fixtures du projet. À re-mesurer sur une base réelle en St
 
 ---
 
+## Écriture des chemins et barrière de migration (1.0.102, chiffrement story 3)
+
+Toute écriture de chemin est, comme les lectures (story 2), indépendante du mode : elle passe par `_path_stored(conn,
+path)` (no-op en `plain`) avant le paramètre SQL. **Aucune base réelle n'est chiffrée dans cette version** ; `DbEncrypt`
+n'existe pas encore (Story 5).
+
+**4 sites convertis** : `store_diff_entries` (`diff_index.path`), `store_archive_snapshot` (`snapshot_file.path`,
+`archive_snapshot` par `path`), `_indexsnap_incremental` (uniquement les chemins **ajoutés** via `borg list` — les
+chemins lus depuis `diff_index` pour les `removed`/`modified` sont déjà des valeurs stockées de cette même base : les
+réutiliser tels quels pour retrouver la ligne `snapshot_file` correspondante est correct sans réencodage, puisque le
+codec est déterministe et partage les mêmes clés au sein d'une base), et le bloc d'écriture inline de `index()`
+(`db_conn.executemany INSERT INTO diff_index`, dans la boucle `as_completed`).
+
+**`_write_mode_check(conn)`** : relit `db_meta.enc_header` (`_enc_header_read`/`_enc_header_parse`) dans la transaction
+en cours et compare le `path_enc` obtenu à `conn.mode` (mode constaté à l'ouverture, posé une fois par `_open_db`).
+Écart → `DbModeError` (AD-11), avant tout `INSERT`/`UPDATE`/`executemany` de chemin du site. **Pas un verrou** : aucun
+`BEGIN IMMEDIATE` généralisé n'est introduit ici — une garde de cohérence, posée dans la même connexion/transaction
+implicite que l'écriture qui la suit immédiatement. Le compare-and-swap `BEGIN IMMEDIATE` côté migration (`DbEncrypt`,
+Story 5) s'appuiera sur cette barrière sans retoucher ces 4 sites. `DbModeError` n'hérite pas de `sqlite3.Error` (AD-5)
+: jamais avalée par un `except sqlite3.Error`, elle remonte jusqu'à ce qu'un appelant l'attrape explicitement.
+`_indexsnap_incremental` l'appelle deux fois : une fois à l'ouverture (avant la première phase d'écriture — clonage du
+snapshot précédent, application des `removed`/`modified`), une seconde fois juste avant la seconde phase (les
+`INSERT`/`executemany` sur les fichiers **ajoutés**), qui suit un appel `borg list` en sous-processus — un mode changé
+pendant ce sous-processus ne serait sinon jamais détecté pour cette seconde phase.
+
+**`index()` : interception par paire, une seule fois par run.** Le bloc inline attrape `except DbModeError` **avant**
+le `except Exception` générique existant (`printer("[WARN] borg diff échoué : ...")`). Sur la **première**
+`DbModeError` d'un run : la paire courante n'est ni marquée indexée ni committée (`_write_mode_check` précède tout
+`DELETE`/`INSERT` de la paire, y compris la branche `ok=False` — aucune ligne n'est donc écrite pour cette paire, qu'elle
+ait réussi ou échoué côté `borg diff`), `set_index_pending_lock(nick)` est appelée (réutilise le mécanisme
+`index_pending` déjà utilisé pour la contention de priorité, ne le duplique pas — nouvelle cause, sans conditionner sur
+`set_pending` : contrairement à l'interruption par priorité, ce cas doit toujours reporter l'indexation, y compris
+quand `backup()` appelle `index()` avec `set_pending=False`), et un message dédié est imprimé (jamais « borg diff
+échoué »). Un drapeau local (`mode_changed`) mémorise cet état pour le reste du run : le mode changé est durable
+(rien ne le fait revenir en arrière pendant une même exécution d'`index()`), donc les paires restantes ne re-testent
+plus la barrière ni ne tentent d'écrire — évite un `set_index_pending_lock`/message par paire (bruyant et redondant
+sur une exécution à dizaines de paires). `index()` retourne comme pour toute exécution partiellement en échec, donc
+`Bkp` (qui appelle `index()` dans son propre `try/except Exception` générique) ne peut jamais échouer à cause de
+cette seule erreur.
+
+**Ailleurs** (`store_diff_entries`, `store_archive_snapshot`), `DbModeError` n'a pas d'interception dédiée : elle se
+propage à l'appelant (jamais avalée en silence, AD-11) — pour les deux appelées depuis `backup()`, elle remonte au
+`try/except Exception` générique déjà présent autour de l'indexation post-backup, qui l'affiche et laisse `Bkp` se
+terminer normalement. `_indexsnap_incremental` ferme sa connexion avant de la relaisser filer (pas de fallback
+`borg list` qui réécrirait aussitôt) ; **`indexsnap()`, elle, l'attrape spécifiquement** (autour de la tentative
+incrémentale et du fallback `store_archive_snapshot`) : message dédié, `set_index_pending_lock(nick)`, retour `1` —
+nécessaire car l'appel `self.indexsnap(...)` en fin d'`index()` (`Index`/`Index -S` en CLI direct) n'a **aucun**
+`try/except` englobant sur ce chemin (contrairement à l'appel équivalent dans `backup()`, protégé par son propre
+`except Exception` générique, où une `DbModeError` non attrapée localement n'aurait été que masquée en échec
+générique, sans `index_pending` posé) ; sans ce traitement, `DbModeError` remontait en traceback non gérée jusqu'à
+l'utilisateur sur ce chemin CLI.
+
+**`ensure_diff_db(db_path, create=True)` / `ensure_cache_db(db_path, create=True)` (AD-12).** `create=False` : si le
+fichier n'a pas de schéma (`_db_has_schema`, ci-dessous), la fonction retourne sans rien créer — ni fichier, ni table,
+ni `enc_header` — et l'appelant répond « non indexé »/« index vide » comme aujourd'hui pour une base absente. Si le
+fichier a déjà un schéma, comportement inchangé (`_check_set_meta`, migrations legacy). Seuls `Index`, `Bkp` et
+`indexsnap` (créateurs légitimes) gardent le défaut `create=True` ; **tous** les autres appelants identifiés (lecture,
+l'ensemble complet — pas un sous-ensemble) passent `create=False` : `_duidx_collect`/`_global`/`_raw`,
+`_find_last_archive_with_file`, `list_backups`, `list_files`, `cache_clean`, `diffbkp`, `search`, `treehist`,
+`treefind`, `filehist`, `prep_report_from_db`, `cache_prune_dryrun`, `cacheJsonBoexWithLM`,
+`BorgHelperDB.get_cache_rows`.
+
+`cache_prune_dryrun`, `cacheJsonBoexWithLM` et `diffbkp` ne sont pas de purs lecteurs : sur un cache miss confirmé (les
+deux premières) ou une paire non indexée (`diffbkp`), elles exécutent `borg` puis écrivent le résultat. Le
+`create=False` du début ne couvre que le *lookup* (éviter de créer la base pour répondre « pas en cache »/« pas
+indexé ») ; juste avant l'écriture qui suit un miss confirmé, chacune rappelle `ensure_cache_db(db_path)`/
+`ensure_diff_db(db_path)` (`create=True`, défaut) pour garantir le schéma. Un oubli ici fait échouer l'`INSERT` avec
+`no such table` sur un cache/index jamais créé (régression rencontrée et corrigée pendant cette story, reproduite par
+`Report`/`Stats` sur `demo.borghelperrc` avec un cache vide). Le lookup lui-même appelle aussi
+`BorgHelperDB.purge_stale_cache(...)` (`role='write'`) avant ce miss confirmé : `_open_db` touche le fichier sur disque
+dès l'ouverture, même pour une purge qui ne trouvera rien à supprimer — `cache_prune_dryrun`/`cacheJsonBoexWithLM` ne
+l'appellent donc que si `_db_has_schema(db_path)` est déjà vrai (rien à purger, et rien à toucher, pour un cache
+jamais écrit).
+
+**`_db_has_schema(db_path)`** — pourquoi ce n'est pas `os.path.exists`. `_open_db` crée toujours le fichier en `0600`
+(`os.open(..., O_CREAT)`) dès qu'il est appelé, y compris en simple lecture (`role='read'`) — un comportement
+préexistant, hors périmètre de cette story. Un nick jamais indexé peut donc déjà avoir un fichier `.db` de 0 octet
+après une première commande de lecture (ex. `TreeHist`), laissé par cette ouverture. `os.path.exists` seul aurait fait
+prendre ce fichier vide pour une base réelle dès la commande de lecture suivante, et `ensure_*_db(create=False)`
+aurait alors silencieusement recréé tout le schéma — exactement le bug que cette story corrige. `_db_has_schema` teste
+`SELECT 1 FROM sqlite_master LIMIT 1` (au moins une table) plutôt que la seule présence du fichier, sur une connexion
+`timeout=60` (comme `_open_db` ailleurs dans ce fichier — sans ce délai, un `database is locked` transitoire pendant
+une écriture concurrente serait mal interprété comme « pas de schéma »). Par conséquent `list_backups`, `list_files`
+et `prep_report_from_db` (qui interrogeaient directement `archive_stats`/`archive_snapshot_v` après un
+`ensure_diff_db` auparavant inconditionnel) traitent désormais explicitement `sqlite3.OperationalError: no such
+table` comme un index vide plutôt que de laisser l'erreur remonter — **narrowé** à ce message précis (pas un
+`except sqlite3.Error` générique) : toute autre erreur SQLite (corruption, disque plein, permissions) continue de
+remonter à l'appelant au lieu d'être confondue avec « jamais indexé ». `list_backups`/`prep_report_from_db` ferment
+systématiquement leur connexion sur ce chemin (`finally`), y compris quand l'exception est re-levée.
+
+---
+
 ## Migration de schéma
 
 ### Versionning (`db_meta`)

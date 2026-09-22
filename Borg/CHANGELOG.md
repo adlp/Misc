@@ -1,5 +1,65 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.102 — chiffrement des chemins SQLite, story 3 : écriture — 2026-09-22
+
+Fait passer chaque écriture de chemin par le codec et pose la barrière de migration (AD-11), sans chiffrer aucune base
+réelle (`DbEncrypt` reste Story 5). **Aucun changement observable en `plain`** : `_path_stored`/`_write_mode_check` sont
+des no-op/silencieux tant qu'aucun `enc_header` n'existe ; vérifié par `CodecSelfTest` (257/257) et par un `Bkp`/`Index`
+complet sur `demo.borghelperrc`.
+
+- **Écriture de chemin unifiée (AD-3/AD-8).** `store_diff_entries`, `store_archive_snapshot`, `_indexsnap_incremental`
+  (chemins ajoutés via `borg list`) et le bloc d'écriture inline de `index()` passent désormais chaque valeur de chemin
+  par `_path_stored(conn,path)` avant le paramètre SQL — les 4 sites qui écrivaient encore un chemin en clair,
+  indépendamment du mode de la connexion.
+- **Barrière de migration `_write_mode_check(conn)` (AD-11).** Relit `enc_header.path_enc` dans la transaction en cours
+  et le compare au mode constaté à l'ouverture (`conn.mode`) ; lève `DbModeError` avant tout `INSERT`/`UPDATE`/
+  `executemany` de chemin si le mode a changé depuis l'ouverture (migration passée en `migrating` entre-temps). Posée en
+  tout premier dans les 4 sites ci-dessus — `_indexsnap_incremental` la pose deux fois : à l'ouverture, puis à nouveau
+  juste avant la seconde phase d'écriture (fichiers ajoutés), qui suit un appel `borg list` en sous-processus capable de
+  durer assez longtemps pour qu'un changement de mode survienne entre les deux. Ce n'est **pas** un verrou d'exclusion
+  mutuelle (pas de `BEGIN IMMEDIATE` généralisé) — une garde de cohérence sur laquelle la Story 5 (`DbEncrypt`,
+  compare-and-swap) s'appuiera sans retoucher ces sites.
+- **`index()` : `DbModeError` interceptée spécifiquement, une fois par run.** Avant le `except Exception` générique
+  existant : sur la première occurrence, la paire n'est ni marquée indexée ni committée, `set_index_pending_lock(nick)`
+  est appelée (mécanisme `index_pending` existant, réutilisé sans être dupliqué), et un message dédié est imprimé
+  (jamais « borg diff échoué »). Le mode changé étant durable pour le reste du run, un drapeau local évite de
+  re-tester la barrière et d'écrire pour chaque paire restante — sans ce drapeau, chaque paire suivante émettait son
+  propre `set_index_pending_lock`/message, bruyant et redondant. `Bkp` ne peut jamais échouer à cause de cette erreur :
+  `index()` retourne normalement comme pour toute paire en échec.
+- **`indexsnap()` : `DbModeError` interceptée spécifiquement (tentative incrémentale + fallback).** Même traitement que
+  ci-dessus (message dédié, `set_index_pending_lock`, retour `1`, pas de "traceback"). Corrige un bug réel repéré en
+  revue : sans cette interception, une `DbModeError` levée par `_indexsnap_incremental` remontait NON attrapée à
+  travers `indexsnap()` puis l'appel `self.indexsnap(...)` en fin d'`index()` — masquée en échec générique par le
+  `try/except Exception` de `backup()` (pas d'`index_pending` posé), mais une traceback brute jusqu'à l'utilisateur
+  via `Index`/`Index -S` en CLI direct (aucun `try/except` englobant sur ce chemin).
+- **`ensure_diff_db`/`ensure_cache_db(db_path, create=True)` (AD-12).** **Tous** les appelants de lecture — l'ensemble
+  complet, pas un sous-ensemble — passent désormais `create=False` : `TreeHist`, `TreeFind`, `Search`, `DuIdx`,
+  `ListBkp`, `ListBkpFiles`, `FileHist`, `DiffBkp`, `Report` en mode DB-only, `CacheInfo`
+  (`BorgHelperDB.get_cache_rows`), purge/consultation de cache, recherche de dernière archive. Une base absente ou vide
+  n'est plus créée par une simple lecture, qui répond « non indexé »/« index vide » comme si la base existait mais
+  était vide. Seuls `Index`, `Bkp` et `indexsnap` (créateurs légitimes) gardent le défaut `create=True`.
+  `list_backups`, `list_files` et `prep_report_from_db` gèrent maintenant explicitement l'absence de schéma
+  (`sqlite3.OperationalError` contenant `no such table`, narrowé — pas un `except sqlite3.Error` générique qui
+  confondrait une vraie corruption/erreur disque avec « jamais indexé ») comme un index vide, ferment systématiquement
+  leur connexion sur ce chemin, et laissent remonter toute autre erreur — nécessaire car `_open_db` touche toujours un
+  fichier 0 octet même en lecture seule (permissions à la création), donc `os.path.exists` seul ne suffit plus à
+  distinguer « jamais indexé » de « base réelle » : nouvel helper `_db_has_schema(db_path)` (au moins une table,
+  `timeout=60` comme `_open_db` ailleurs — un `database is locked` transitoire ne doit pas se lire comme « pas de
+  schéma »), utilisé par `ensure_*_db(create=False)` et ces trois fonctions.
+  `cache_prune_dryrun`, `cacheJsonBoexWithLM` (cache de sortie `boex`) et `diffbkp` restent des créateurs légitimes sur
+  leur propre chemin d'écriture : elles ne créent plus la base pour un simple lookup (`create=False` au début, comme les
+  autres lecteurs), mais réappellent `ensure_*_db()` (`create=True`, défaut) juste avant d'écrire un résultat en cache
+  ou une paire nouvellement diffée — un miss de cache confirmé, ou une paire non indexée, écrivent toujours comme avant
+  ; seul le lookup initial ne crée plus rien. `cache_prune_dryrun`/`cacheJsonBoexWithLM` n'appellent
+  `purge_stale_cache(...)` (`role='write'`, touche aussi le fichier à l'ouverture) que si `_db_has_schema(db_path)` est
+  déjà vrai — rien à purger, et rien à toucher, pour un cache jamais écrit.
+- **`CodecSelfTest`** : aller-retour d'écriture (`store_diff_entries`/`store_archive_snapshot`) sur une base chiffrée
+  temporaire ; simulation de bascule de mode pendant une transaction ouverte (`_write_mode_check` lève `DbModeError`,
+  propagée sans être avalée, aucune ligne écrite) ; simulation équivalente pour `indexsnap()` (retour `1`,
+  `index_pending` posé, pas de traceback) ; vérification qu'un nick jamais indexé/jamais mis en cache ne crée aucun
+  schéma via l'ensemble des sites de lecture convertis (`ensure_diff_db`/`ensure_cache_db(create=False)`), y compris
+  ceux qui appellent `borg` avant d'écrire (`boex` monkeypatché pour échouer immédiatement, déterministe).
+
 ## borgHelper 1.0.101 — chiffrement des chemins SQLite, story 2 : requêtes — 2026-09-22
 
 Rend toutes les lectures de chemins indépendantes du mode (`plain`/chiffré) : préfixes et égalités passent par des

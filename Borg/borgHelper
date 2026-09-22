@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.101"
+Version="1.0.102"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -891,6 +891,17 @@ def _path_stored(conn,path):
     path=_norm_lp(path); c=conn.codec
     return path if c is None else c.path.encode(path)
 
+def _write_mode_check(conn):
+    """Barrière de migration (AD-11) : relit enc_header.path_enc dans la transaction en cours et le
+    compare au mode constaté à l'ouverture (conn.mode). Lève DbModeError si le mode a changé depuis
+    l'ouverture (migration passée en 'migrating'/'siv1' entre-temps) — pas un verrou d'exclusion
+    mutuelle, une garde de cohérence (voir Design Notes de la story). À appeler en tout premier, avant
+    le premier INSERT/UPDATE/executemany d'un site qui écrit un chemin."""
+    raw=_enc_header_read(conn)
+    current='plain' if raw is None else _enc_header_parse(raw)['path_enc']
+    if current!=conn.mode:
+        raise DbModeError(f"mode de la base changé depuis l'ouverture ({conn.mode} -> {current})")
+
 def _path_range(conn,prefix):
     """(bas, haut) des descendants STRICTS de prefix (path >= bas AND path < haut), ou None pour la
     racine (préfixe vide : pas de borne). Plain : 'p/' et 'p0' ('/'+1) ; chiffré : PathCodec.prefix_bounds."""
@@ -981,6 +992,18 @@ def _wh(sql):
 def _path_sort_key(path):
     """Ordre octet UTF-8 (celui du tri BINARY de SQLite)."""
     return path.encode('utf-8','surrogateescape')
+
+def _db_has_schema(db_path):
+    """True si db_path contient au moins une table. _open_db(role='read') touche le fichier (0 octet)
+    même pour une simple lecture (permissions 0600 à la création) ; un fichier existant mais vide n'est
+    donc PAS une base créée — ensure_*_db(create=False) doit s'y fier plutôt qu'à os.path.exists (AD-12)."""
+    if not os.path.exists(db_path): return False
+    try:
+        conn=sqlite3.connect(db_path,timeout=60)
+        try: return conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is not None
+        finally: conn.close()
+    except sqlite3.Error:
+        return False
 
 # ── BorgHelperDB — all SQLite operations ──────────────────────────────────────
 
@@ -1106,7 +1129,13 @@ class BorgHelperDB:
         if stored_ver!=Version:
             conn.execute("INSERT OR REPLACE INTO db_meta VALUES('borghelper_version',?)",(Version,))
 
-    def ensure_cache_db(self,db_path):
+    def ensure_cache_db(self,db_path,create=True):
+        """create=False (AD-12) : appelants de lecture seule — si le fichier n'existe pas encore,
+        ne rien créer (ni fichier, ni schéma, ni en-tête) et retourner tel quel ; l'appelant répond
+        « non indexé »/« cache vide » comme si la base existait mais était vide. Si le fichier existe
+        déjà, comportement inchangé (migrations/_check_set_meta). Seuls Index/Bkp/indexsnap gardent
+        le défaut create=True (créateurs légitimes, AD-12)."""
+        if not create and not _db_has_schema(db_path): return
         try:
             try: conn=_open_db(db_path,nick=None,role='admin')
             except sqlite3.OperationalError as e: _db_open_fail(db_path,e)
@@ -1154,7 +1183,9 @@ class BorgHelperDB:
             CREATE INDEX IF NOT EXISTS idx_snap_nick_archive ON archive_snapshot(nick, archive);
         """)
 
-    def ensure_diff_db(self,db_path):
+    def ensure_diff_db(self,db_path,create=True):
+        """create=False (AD-12) : voir ensure_cache_db — même contrat, réservé aux lecteurs."""
+        if not create and not _db_has_schema(db_path): return
         try:
             try: conn=_open_db(db_path,nick=None,role='admin')
             except sqlite3.OperationalError as e: _db_open_fail(db_path,e)
@@ -1350,10 +1381,11 @@ class BorgHelperDB:
         def _do():
             conn=_open_db(db_path,nick=nick,role='write')
             try:
+                _write_mode_check(conn)
                 if entries:
                     conn.executemany(
                         "INSERT INTO diff_index (nick,archive_old,archive_new,archive_new_date,change_type,path,size_before,size_after) VALUES (?,?,?,?,?,?,?,?)",
-                        [(nick,archive_old,archive_new,archive_new_date,e['change_type'],e['path'],e.get('size_before'),e.get('size_after')) for e in entries])
+                        [(nick,archive_old,archive_new,archive_new_date,e['change_type'],_path_stored(conn,e['path']),e.get('size_before'),e.get('size_after')) for e in entries])
                 conn.execute("INSERT OR IGNORE INTO diff_indexed_pairs (nick,archive_old,archive_new,entry_count) VALUES (?,?,?,?)",(nick,archive_old,archive_new,len(entries)))
                 conn.commit(); return True
             finally: conn.close()
@@ -1407,11 +1439,12 @@ class BorgHelperDB:
         def _do():
             conn=_open_db(db_path,nick=nick,role='write')
             try:
+                _write_mode_check(conn)
                 if files:
                     conn.executemany("INSERT OR REPLACE INTO snapshot_file (nick,path,size,mtime,type,mode,owner) VALUES (?,?,?,?,?,?,?)",
-                                     [(nick,f['path'],f.get('size'),f.get('mtime'),f.get('type'),f.get('mode'),f.get('owner')) for f in files])
+                                     [(nick,_path_stored(conn,f['path']),f.get('size'),f.get('mtime'),f.get('type'),f.get('mode'),f.get('owner')) for f in files])
                     conn.executemany("INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,file_id) SELECT ?,?,?,id FROM snapshot_file WHERE nick=? AND path=?",
-                                     [(nick,archive,archive_date,nick,f['path']) for f in files])
+                                     [(nick,archive,archive_date,nick,_path_stored(conn,f['path'])) for f in files])
                 conn.execute("INSERT OR IGNORE INTO archive_snapshot_indexed (nick,archive,entry_count) VALUES (?,?,?)",(nick,archive,len(files)))
                 conn.commit(); return True
             finally: conn.close()
@@ -1519,7 +1552,7 @@ class BorgHelperDB:
         totals={}
         for n in nick.split(','):
             db_path=self.get_diff_db(n)
-            self.ensure_diff_db(db_path)
+            self.ensure_diff_db(db_path,create=False)
             if self._is_index_empty(n,db_path):
                 printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
             try:
@@ -1546,7 +1579,7 @@ class BorgHelperDB:
         totals={}
         for n in nick.split(','):
             db_path=self.get_diff_db(n)
-            self.ensure_diff_db(db_path)
+            self.ensure_diff_db(db_path,create=False)
             if self._is_index_empty(n,db_path):
                 printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
             try:
@@ -1585,7 +1618,7 @@ class BorgHelperDB:
         rows=[]
         for n in nick.split(','):
             db_path=self.get_diff_db(n)
-            self.ensure_diff_db(db_path)
+            self.ensure_diff_db(db_path,create=False)
             if self._is_index_empty(n,db_path):
                 printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
             try:
@@ -1610,11 +1643,14 @@ class BorgHelperDB:
 
     def get_cache_rows(self,nick):
         db_path=self.get_cache_db(nick)
-        self.ensure_cache_db(db_path)
+        self.ensure_cache_db(db_path,create=False)
         try:
             conn=_open_db(db_path,nick=nick,role='read')
             cur=conn.execute("SELECT nom,lastmodified,length(details) FROM cachejsonboexlm WHERE nom=? ORDER BY lastmodified DESC",(nick,))
             rows=cur.fetchall(); conn.close(); return rows
+        except sqlite3.OperationalError as e:
+            if 'no such table' in str(e): return []  # jamais mis en cache (create=False, AD-12)
+            printer(f"SQLite error ({db_path}): {e}"); return []
         except sqlite3.Error as e:
             printer(f"SQLite error ({db_path}): {e}"); return []
 
@@ -1811,9 +1847,9 @@ class BorgHelper:
 
     def cache_prune_dryrun(self,nick,last_modified,debug=0,db_path=None):
         if db_path is None: db_path=self.db.get_cache_db(nick)
-        self.db.ensure_cache_db(db_path)
+        self.db.ensure_cache_db(db_path,create=False)
         nom=f"{nick}:prune"
-        self.db.purge_stale_cache(nom,last_modified,db_path)
+        if _db_has_schema(db_path): self.db.purge_stale_cache(nom,last_modified,db_path)  # jamais mis en cache -> rien à purger (AD-12 : ne pas toucher le fichier)
         try:
             conn=_open_db(db_path,nick=nick,role='read')
             row=conn.execute("SELECT details FROM cachejsonboexlm WHERE nom=? AND lastmodified=? LIMIT 1",(nom,last_modified)).fetchone()
@@ -1837,6 +1873,7 @@ class BorgHelper:
             if 'Would prune:' in line:
                 pruneme.append((re.sub(r'( )*',r'\1',line)).split(' ')[2])
         try:
+            self.db.ensure_cache_db(db_path)  # cache miss confirmé : on écrit -> création légitime (AD-12 ne visait que le lookup)
             conn=_open_db(db_path,nick=nick,role='write')
             conn.execute("INSERT OR IGNORE INTO cachejsonboexlm (nom,lastmodified,details) VALUES (?,?,?)",(nom,last_modified,json.dumps(pruneme)))
             conn.commit(); conn.close()
@@ -1846,9 +1883,9 @@ class BorgHelper:
 
     def cacheJsonBoexWithLM(self,nick,boexarg,output="stdout",debug=0,db_path=None,last_modified=None):
         if db_path is None: db_path=self.db.get_cache_db(nick)
-        self.db.ensure_cache_db(db_path)
+        self.db.ensure_cache_db(db_path,create=False)
         if last_modified is None: last_modified=self.borg._boex_last_modified(nick,debug=debug)
-        self.db.purge_stale_cache(nick,last_modified,db_path)
+        if _db_has_schema(db_path): self.db.purge_stale_cache(nick,last_modified,db_path)  # jamais mis en cache -> rien à purger (AD-12 : ne pas toucher le fichier)
         try:
             conn=_open_db(db_path,nick=nick,role='read')
             row=conn.execute("SELECT details FROM cachejsonboexlm WHERE nom=? AND lastmodified=? LIMIT 1",(nick,last_modified)).fetchone()
@@ -1859,6 +1896,7 @@ class BorgHelper:
             if debug: print('Cache miss — appel borg')
             details=self.borg.boex(nick,boexarg,debug=debug)[output][0]
             try:
+                self.db.ensure_cache_db(db_path)  # cache miss confirmé : on écrit -> création légitime (AD-12 ne visait que le lookup)
                 conn=_open_db(db_path,nick=nick,role='write')
                 conn.execute("INSERT OR IGNORE INTO cachejsonboexlm (nom,lastmodified,details) VALUES (?,?,?)",(nick,last_modified,json.dumps(details)))
                 conn.commit(); conn.close()
@@ -1939,7 +1977,7 @@ class BorgHelper:
         has_glob='*' in path or '?' in path
         sql_pat=path.replace('*','%').replace('?','_') if has_glob else None
         try:
-            self.db.ensure_diff_db(db_path)
+            self.db.ensure_diff_db(db_path,create=False)
             conn=_open_db(db_path,nick=nick,role='read')
             psql,pprm,pyf=_psel_like(conn,sql_pat) if has_glob else _psel_eq(conn,path)
             # prédicat en Python (chiffré) : pas de LIMIT, le premier chemin qui correspond gagne
@@ -2013,10 +2051,15 @@ class BorgHelper:
 
     def list_backups(self,nick,debug=0):
         db_path=self.db.get_diff_db(nick)
-        self.db.ensure_diff_db(db_path)
+        self.db.ensure_diff_db(db_path,create=False)
         conn=_open_db(db_path,nick=nick,role='read')
-        rows=conn.execute("SELECT archive,archive_date FROM archive_stats WHERE nick=? ORDER BY archive_date",(nick,)).fetchall()
-        conn.close()
+        try:
+            rows=conn.execute("SELECT archive,archive_date FROM archive_stats WHERE nick=? ORDER BY archive_date",(nick,)).fetchall()
+        except sqlite3.OperationalError as e:
+            if 'no such table' not in str(e): raise
+            rows=[]  # base absente/jamais indexée (create=False, AD-12) : comme un index vide
+        finally:
+            conn.close()
         if not rows:
             printer("Aucune archive indexée en base — lancer 'index' ou 'bkp'."); sys.exit(1)
         for name,date in rows:
@@ -2025,10 +2068,13 @@ class BorgHelper:
 
     def list_files(self,nick,bid,debug=0,as_json=False):
         db_path=self.db.get_diff_db(nick)
-        self.db.ensure_diff_db(db_path)
+        self.db.ensure_diff_db(db_path,create=False)
         conn=_open_db(db_path,nick=nick,role='read')
         if bid is None:
-            row=conn.execute("SELECT archive FROM archive_stats WHERE nick=? ORDER BY archive_date DESC LIMIT 1",(nick,)).fetchone()
+            try: row=conn.execute("SELECT archive FROM archive_stats WHERE nick=? ORDER BY archive_date DESC LIMIT 1",(nick,)).fetchone()
+            except sqlite3.OperationalError as e:
+                if 'no such table' not in str(e): conn.close(); raise
+                row=None  # base absente/jamais indexée (create=False, AD-12)
             if row is None:
                 conn.close()
                 msg="Aucune archive indexée en base — lancer 'index' ou 'bkp'."
@@ -2040,6 +2086,9 @@ class BorgHelper:
             msg=_codec_fail(nick,e,conn)
             if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(3)
             sys.exit(3)
+        except sqlite3.OperationalError as e:
+            if 'no such table' not in str(e): conn.close(); raise
+            rows=[]  # base absente/jamais indexée (create=False, AD-12)
         rows.sort(key=lambda r:_path_sort_key(r[0]))  # tri Python (ordre octet UTF-8) : identique en plain et chiffré
         conn.close()
         if not rows:
@@ -2078,7 +2127,7 @@ class BorgHelper:
         total=0
         for n in nicks_to_clean:
             db_path=self.db.get_cache_db(n)
-            self.db.ensure_cache_db(db_path)
+            self.db.ensure_cache_db(db_path,create=False)
             cfg=self.borg.cfgread(n,debug=debug)
             if cfg is None:
                 count=self.db.clear_cache_nick(n,db_path)
@@ -2109,7 +2158,7 @@ class BorgHelper:
             printer(msg); sys.exit(1)
         if bidun>bideux: bidun,bideux=bideux,bidun
         if debug: printer(f"Comparaison de {bidun} et {bideux}")
-        self.db.ensure_diff_db(db_path)
+        self.db.ensure_diff_db(db_path,create=False)
         if not self.db.is_diff_pair_indexed(nick,bidun,bideux,db_path):
             if as_json: printer("Paire non indexée — calcul en cours...")
             else: print(f"Paire non indexée — calcul en cours...",flush=True)
@@ -2136,6 +2185,7 @@ class BorgHelper:
                     ct=p['change_type']; sz=p.get('size_after') or p.get('size_before') or 0
                     if ct not in exclu: exclu[ct]={'count':0,'size':0}
                     exclu[ct]['count']+=1; exclu[ct]['size']+=sz
+            self.db.ensure_diff_db(db_path)  # paire non indexée : on écrit -> création légitime (AD-12 ne visait que le lookup ci-dessus)
             self.db.store_diff_entries(nick,bidun,bideux,date_new,entries_ok,db_path)
             if exclu: self.db.store_excluded_diff_stats(nick,bidun,bideux,exclu,db_path)
             display_entries=all_entries
@@ -2435,6 +2485,7 @@ class BorgHelper:
         Retourne (nfiles, exclu_count, exclu_size, n_added, n_removed, n_modified) ou None (fallback borg list)."""
         try:
             conn=_open_db(db_path,nick=nick,role='write',timeout=60)
+            _write_mode_check(conn)
             row=conn.execute(
                 "SELECT archive FROM archive_snapshot_indexed WHERE nick=? AND archive<? ORDER BY archive DESC LIMIT 1",
                 (nick,archive_name)).fetchone()
@@ -2493,8 +2544,10 @@ class BorgHelper:
                         except ValueError: sz2=None
                         owner=f"{user}:{group} ({uid}:{gid})"
                         # (nick,path,size,mtime,type,mode,owner) — ordre exact des colonnes de l'INSERT ci-dessous
-                        add_rows.append((nick,path,sz2,mtime,ftype,mode,owner))
+                        # path stocké (_path_stored) : borg list renvoie un chemin logique, jamais écrit tel quel
+                        add_rows.append((nick,_path_stored(conn,path),sz2,mtime,ftype,mode,owner))
                 if add_rows:
+                    _write_mode_check(conn)  # AD-11 : revérifié après le sous-processus borg list, avant la 2e phase d'écriture
                     conn.executemany("INSERT OR REPLACE INTO snapshot_file (nick,path,size,mtime,type,mode,owner) VALUES (?,?,?,?,?,?,?)",add_rows)
                     conn.executemany(
                         "INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,file_id) "
@@ -2512,6 +2565,10 @@ class BorgHelper:
             try: conn.close()
             except: pass
             return None
+        except DbModeError:  # barrière AD-11 : ne pas avaler, ne pas retomber sur un fallback qui réécrirait
+            try: conn.close()
+            except: pass
+            raise
 
     def indexsnap(self,nick,debug=0,db_path=None,force=False):
         if self._nick_noidx(nick):
@@ -2557,45 +2614,53 @@ class BorgHelper:
                     print(f"  {nick}: type/mode/propriétaire manquant pour certaines entrées — resnapshot complet (auto-réparation)")
             except sqlite3.Error: pass
         # Tentative incrémentale (pas en mode force, pas en auto-réparation)
-        inc=None
-        if not force and not auto_repair:
-            inc=self._indexsnap_incremental(nick,archive_name,archive_date,cfg,db_path,debug)
-        if inc is not None:
-            nfiles,exclu_count,exclu_size,n_add,n_rem,n_mod=inc
-            suffix=f" (+{n_add} -{n_rem} ~{n_mod}, incrémental)"
-            if exclu_count:
-                print(f"{nick}: {nfiles} fichiers dans le snapshot {archive_name}{suffix} ({exclu_count} exclus, {convert_octets_readable(exclu_size)})")
+        try:
+            inc=None
+            if not force and not auto_repair:
+                inc=self._indexsnap_incremental(nick,archive_name,archive_date,cfg,db_path,debug)
+            if inc is not None:
+                nfiles,exclu_count,exclu_size,n_add,n_rem,n_mod=inc
+                suffix=f" (+{n_add} -{n_rem} ~{n_mod}, incrémental)"
+                if exclu_count:
+                    print(f"{nick}: {nfiles} fichiers dans le snapshot {archive_name}{suffix} ({exclu_count} exclus, {convert_octets_readable(exclu_size)})")
+                else:
+                    print(f"{nick}: {nfiles} fichiers dans le snapshot {archive_name}{suffix}")
             else:
-                print(f"{nick}: {nfiles} fichiers dans le snapshot {archive_name}{suffix}")
-        else:
-            # Fallback : borg list complet
-            rb2=self.borg.boex(nick,['list','--format','{mode} {type} {user} {group} {uid} {gid} {size} {isomtime} {path}{NL}',f"::{archive_name}"],debug=debug,retjson=False)
-            if rb2['exitcode']!=0:
-                printer(f"borg list a échoué (code {rb2['exitcode']})")
-                for i in rb2['stderr']:
-                    if isinstance(i,dict): printer(f"  [{i.get('levelname','?')}] {i.get('message',i)}")
-                    elif isinstance(i,str) and i.strip(): printer(f"  {i}")
-                return rb2['exitcode']
-            files=[]; exclu_count=0; exclu_size=0
-            for line in rb2['stdout']:
-                line=line.strip()
-                if not line: continue
-                parts=line.split(' ',8)
-                if len(parts)==9:
-                    mode,ftype,user,group,uid,gid,size_s,mtime,path=parts
-                    try: size=int(size_s)
-                    except ValueError: size=None
-                    owner=f"{user}:{group} ({uid}:{gid})"
-                    if self._idx_path_ok(path,cfg):
-                        files.append({'path':path,'size':size,'mtime':mtime,'type':ftype,'mode':mode,'owner':owner})
-                    else:
-                        exclu_count+=1; exclu_size+=(size or 0)
-            self.db.store_archive_snapshot(nick,archive_name,archive_date,files,db_path)
-            if exclu_count:
-                self.db.store_excluded_snap_stats(nick,archive_name,exclu_count,exclu_size,db_path)
-                print(f"{nick}: {len(files)} fichiers dans le snapshot {archive_name} ({exclu_count} exclus, {convert_octets_readable(exclu_size)})")
-            else:
-                print(f"{nick}: {len(files)} fichiers dans le snapshot {archive_name}")
+                # Fallback : borg list complet
+                rb2=self.borg.boex(nick,['list','--format','{mode} {type} {user} {group} {uid} {gid} {size} {isomtime} {path}{NL}',f"::{archive_name}"],debug=debug,retjson=False)
+                if rb2['exitcode']!=0:
+                    printer(f"borg list a échoué (code {rb2['exitcode']})")
+                    for i in rb2['stderr']:
+                        if isinstance(i,dict): printer(f"  [{i.get('levelname','?')}] {i.get('message',i)}")
+                        elif isinstance(i,str) and i.strip(): printer(f"  {i}")
+                    return rb2['exitcode']
+                files=[]; exclu_count=0; exclu_size=0
+                for line in rb2['stdout']:
+                    line=line.strip()
+                    if not line: continue
+                    parts=line.split(' ',8)
+                    if len(parts)==9:
+                        mode,ftype,user,group,uid,gid,size_s,mtime,path=parts
+                        try: size=int(size_s)
+                        except ValueError: size=None
+                        owner=f"{user}:{group} ({uid}:{gid})"
+                        if self._idx_path_ok(path,cfg):
+                            files.append({'path':path,'size':size,'mtime':mtime,'type':ftype,'mode':mode,'owner':owner})
+                        else:
+                            exclu_count+=1; exclu_size+=(size or 0)
+                self.db.store_archive_snapshot(nick,archive_name,archive_date,files,db_path)
+                if exclu_count:
+                    self.db.store_excluded_snap_stats(nick,archive_name,exclu_count,exclu_size,db_path)
+                    print(f"{nick}: {len(files)} fichiers dans le snapshot {archive_name} ({exclu_count} exclus, {convert_octets_readable(exclu_size)})")
+                else:
+                    print(f"{nick}: {len(files)} fichiers dans le snapshot {archive_name}")
+        except DbModeError as e:
+            # AD-11 : mode changé pendant indexsnap (incrémental ou fallback) — jamais avalée en
+            # silence, mais dégradée proprement (index_pending) plutôt qu'une traceback jusqu'à
+            # l'appelant CLI direct (Index/Index -S, sans try/except englobant sur ce chemin).
+            printer(f"[WARN] {nick}: mode changé pendant indexsnap : {e}")
+            self.db.set_index_pending_lock(nick)
+            return 1
         keep_snap=int(cfg.get('IDX_SNAP_KEEP',
             sum(int(cfg.get(k,0)) for k in ['KEEP_DAILY','KEEP_WEEKLY','KEEP_MONTHLY','KEEP_YEARLY','KEEP_HOURLY'])
             or 10))
@@ -2686,6 +2751,7 @@ class BorgHelper:
             return (a_old,a_new,date_new,entries,exclu,ok)
         interrupted_event=threading.Event()
         results=[]
+        mode_changed=False  # AD-11 : une fois DbModeError vue, mode durablement changé pour le reste du run
         if pairs_todo:
             self.db.set_index_running_lock(nick)
             db_conn=None
@@ -2735,9 +2801,12 @@ class BorgHelper:
                     try:
                         for fut in as_completed(futs):
                             try:
-                                result=fut.result(); results.append(result)
+                                result=fut.result()
+                                if mode_changed: continue  # déjà signalé une fois ; le mode reste changé pour le reste du run
+                                results.append(result)
                                 if db_conn:
                                     a_old,a_new,date_new,entries,exclu,ok=result
+                                    _write_mode_check(db_conn)  # AD-11 : avant tout INSERT/UPDATE/executemany de cette paire
                                     if not ok:
                                         db_conn.execute("DELETE FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
                                         db_conn.execute("DELETE FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
@@ -2745,7 +2814,7 @@ class BorgHelper:
                                     else:
                                         if entries:
                                             db_conn.executemany("INSERT INTO diff_index (nick,archive_old,archive_new,archive_new_date,change_type,path,size_before,size_after) VALUES (?,?,?,?,?,?,?,?)",
-                                                [(nick,a_old,a_new,date_new,e['change_type'],e['path'],e.get('size_before'),e.get('size_after')) for e in entries])
+                                                [(nick,a_old,a_new,date_new,e['change_type'],_path_stored(db_conn,e['path']),e.get('size_before'),e.get('size_after')) for e in entries])
                                         db_conn.execute("INSERT OR IGNORE INTO diff_indexed_pairs (nick,archive_old,archive_new,entry_count) VALUES (?,?,?,?)",(nick,a_old,a_new,len(entries)))
                                         if exclu:
                                             db_conn.executemany(
@@ -2754,6 +2823,18 @@ class BorgHelper:
                                                 [(nick,a_old,a_new,ct,s['count'],s['size']) for ct,s in exclu.items()])
                                     db_conn.commit()
                             except CancelledError: pass
+                            except DbModeError:
+                                # AD-11 : mode de la base changé depuis l'ouverture — la paire n'est ni marquée
+                                # indexée ni committée (aucun INSERT/DELETE exécuté, la barrière a précédé tout
+                                # écriture) ; reportée via index_pending (mécanisme existant, pas dupliqué) ;
+                                # Bkp ne doit jamais échouer pour cette seule paire. Le mode changé est durable
+                                # pour le reste du run : signalé UNE fois, les paires restantes sont ignorées
+                                # sans re-tester la barrière (évite le bruit d'un set_index_pending_lock/message
+                                # par paire).
+                                if not mode_changed:
+                                    mode_changed=True
+                                    self.db.set_index_pending_lock(nick)
+                                    printer(f"  {nick}: mode de la base changé pendant l'indexation — paires restantes reportées")
                             except Exception as e: printer(f"[WARN] borg diff échoué : {e}")
                     finally:
                         interrupted_event.set()
@@ -2805,7 +2886,7 @@ class BorgHelper:
         results={} if as_json else None
         for n in nick.split(','):
             db_path=self.db.get_diff_db(n)
-            self.db.ensure_diff_db(db_path)
+            self.db.ensure_diff_db(db_path,create=False)
             if self.db._is_index_empty(n,db_path):
                 msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
                 if as_json: results[n]={'error':msg}
@@ -2857,7 +2938,7 @@ class BorgHelper:
         results={} if as_json else None
         for n in nick.split(','):
             db_path=self.db.get_diff_db(n)
-            self.db.ensure_diff_db(db_path)
+            self.db.ensure_diff_db(db_path,create=False)
             if self.db._is_index_empty(n,db_path):
                 msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
                 if as_json: results[n]={'error':msg}
@@ -3024,7 +3105,7 @@ class BorgHelper:
         results={}
         for n in nick.split(','):
             db_path=self.db.get_diff_db(n)
-            self.db.ensure_diff_db(db_path)
+            self.db.ensure_diff_db(db_path,create=False)
             if self.db._is_index_empty(n,db_path):
                 msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
                 if as_json: results[n]={'error':msg}
@@ -3116,7 +3197,7 @@ class BorgHelper:
         results={}
         for n in nick.split(','):
             db_path=self.db.get_diff_db(n)
-            self.db.ensure_diff_db(db_path)
+            self.db.ensure_diff_db(db_path,create=False)
             if self.db._is_index_empty(n,db_path):
                 msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
                 if as_json: results[n]={'error':msg}
@@ -3546,15 +3627,20 @@ class BorgHelper:
     def prep_report_from_db(self,nick,maxp=None):
         """Comme prep_report() mais lit uniquement l'index SQLite — utilisé quand le dépôt est occupé."""
         db_path=self.db.get_diff_db(nick)
-        if not os.path.exists(db_path):
+        if not _db_has_schema(db_path):  # jamais indexé (AD-12) : _open_db peut avoir touché un fichier
+                                          # 0 octet sans schéma (autre commande de lecture) — pas une base
             return {nick:{'nom':nick,'_msg':f"diff.db absent — lancez : borgHelper -c Index -n {nick}"}},{}
-        self.db.ensure_diff_db(db_path)
+        self.db.ensure_diff_db(db_path,create=False)
+        conn=_open_db(db_path,nick=nick,role='read')
         try:
-            conn=_open_db(db_path,nick=nick,role='read')
             rows=conn.execute("SELECT archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles FROM archive_stats WHERE nick=? ORDER BY archive_date",(nick,)).fetchall()
-            conn.close()
+        except sqlite3.OperationalError as e:
+            if 'no such table' not in str(e): raise Exception(f"SQLite error ({db_path}): {e}")
+            rows=[]  # base présente mais jamais indexée (create=False)
         except sqlite3.Error as e:
             raise Exception(f"SQLite error ({db_path}): {e}")
+        finally:
+            conn.close()
         if not rows:
             return {nick:{'nom':nick,'_msg':f"Aucune archive indexée — lancez : borgHelper -c Index -n {nick}"}},{}
         diff_stats=self.db._diff_stats_for_nick(nick)
@@ -4314,6 +4400,178 @@ def codec_selftest():
             except ValueError: return False
             return isinstance(v,dict) and 'error' in v
         check("valeur stockée altérée : lecture refusée, message clair, pas de traceback (DbCodecError)",_tamper)
+        # ── Story 3 : écriture — _path_stored aux 4 sites, barrière _write_mode_check, create=False ──
+        def _write_roundtrip_ok():
+            """store_diff_entries/store_archive_snapshot sur base chiffrée temporaire : aller-retour
+            correct (valeur stockée != chemin logique, décodage retrouve l'original). db_path doit
+            être sous qcache (registered _DB_CFG_READERS) : store_diff_entries résout la passphrase
+            via la config du nick, comme en usage réel (Bkp/Index), pas via un paramètre explicite."""
+            with open(qrc,'a') as f: f.write("[wr]\nBORG_REPO=/r\nBORG_PASSPHRASE=wrpw\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n\n")
+            os.chmod(qrc,0o600)
+            try:
+                nick='wr'; p=bhq.db.get_diff_db(nick)
+                for suf in ('','-wal','-shm'):
+                    if os.path.exists(p+suf): os.unlink(p+suf)
+                bhq.db.ensure_diff_db(p)
+                hdr,dek=_enc_header_build('wrpw','siv1','light')
+                ca=_open_db(p,nick=None,role='admin'); _enc_header_write(ca,hdr); ca.close()
+                entries=[{'change_type':'added','path':'a/日本/b.txt','size_after':10},
+                         {'change_type':'removed','path':'a/c d/é.log','size_before':5}]
+                ok1=bhq.db.store_diff_entries(nick,'A1','A2','2026-01-01T00:00:00',entries,p)
+                files=[{'path':'x/y/z.bin','size':7,'mtime':'m','type':'-','mode':'-rw-r--r--','owner':'o:g'}]
+                ok2=bhq.db.store_archive_snapshot(nick,'A2','2026-01-01T00:00:00',files,p)
+                c=_open_db(p,nick=nick,passphrase='wrpw')
+                stored_diff={r[0] for r in c.execute("SELECT path FROM diff_index WHERE nick=?",(nick,))}
+                logical_diff={_path_decode(c,s) for s in stored_diff}
+                stored_snap={r[0] for r in c.execute("SELECT path FROM snapshot_file WHERE nick=?",(nick,))}
+                logical_snap={_path_decode(c,s) for s in stored_snap}
+                c.close()
+                return (ok1 and ok2 and logical_diff=={'a/日本/b.txt','a/c d/é.log'} and logical_snap=={'x/y/z.bin'}
+                        and not (stored_diff & logical_diff) and not (stored_snap & logical_snap))
+            finally:
+                _q_rc()
+        check("store_diff_entries/store_archive_snapshot : aller-retour correct sur base chiffrée temporaire (_path_stored)",_write_roundtrip_ok)
+        def _write_mode_check_raises():
+            """Simulation CodecSelfTest : enc_header modifié (par une autre connexion) entre l'ouverture
+            et l'écriture -> _write_mode_check lève DbModeError. Mode inchangé -> silencieux."""
+            p=os.path.join(tmp,'wm.db')
+            bhq.db.ensure_diff_db(p)
+            hdr,dek=_enc_header_build('wmpw','siv1','light')
+            ca=_open_db(p,nick=None,role='admin'); _enc_header_write(ca,hdr); ca.close()
+            c=_open_db(p,nick='wm',passphrase='wmpw')  # conn.mode='siv1' constaté à l'ouverture
+            ok1=_write_mode_check(c) is None
+            c2=sqlite3.connect(p)  # bascule simulée par une connexion tierce, hors transaction de c
+            c2.execute("UPDATE db_meta SET value=? WHERE key='enc_header'",
+                       (json.dumps(dict(hdr,path_enc='migrating'),sort_keys=True),))
+            c2.commit(); c2.close()
+            ok2=raises(DbModeError,lambda:_write_mode_check(c))
+            c.close()
+            return ok1 and ok2
+        check("_write_mode_check : mode inchangé -> silencieux ; mode changé sous une transaction ouverte -> DbModeError (AD-11)",_write_mode_check_raises)
+        def _store_diff_entries_blocked_by_mode_change():
+            """La barrière est bien le premier appel du site (store_diff_entries) : si elle lève,
+            aucune ligne n'est écrite et l'erreur n'est pas avalée (propagée à l'appelant)."""
+            p=os.path.join(tmp,'wm2.db')
+            bhq.db.ensure_diff_db(p)
+            nick='wm2'
+            orig=globals()['_write_mode_check']
+            globals()['_write_mode_check']=lambda conn: (_ for _ in ()).throw(DbModeError('simulated'))
+            try:
+                ok=raises(DbModeError,lambda: bhq.db.store_diff_entries(
+                    nick,'A1','A2','2026-01-01T00:00:00',[{'change_type':'added','path':'x','size_after':1}],p))
+            finally:
+                globals()['_write_mode_check']=orig
+            c=sqlite3.connect(p); n=c.execute("SELECT COUNT(*) FROM diff_index WHERE nick=?",(nick,)).fetchone()[0]; c.close()
+            return ok and n==0
+        check("store_diff_entries : DbModeError de la barrière propagée (pas avalée), aucune ligne écrite",_store_diff_entries_blocked_by_mode_change)
+        def _indexsnap_dbmode_error_ok():
+            """DbModeError levée par _indexsnap_incremental (bascule mi-transaction, simulée) : indexsnap()
+            la rattrape spécifiquement (pas de traceback), pose index_pending, retourne 1 — sans ce
+            traitement elle remontait non attrapée jusqu'à Index/Index -S en CLI direct (aucun try/except
+            englobant sur ce chemin, contrairement à backup() qui a son propre except générique)."""
+            with open(qrc,'a') as f: f.write("[isdm]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n\n")
+            os.chmod(qrc,0o600)
+            nick='isdm'; p=os.path.join(tmp,'isdm.db')
+            bhq.db.ensure_diff_db(p)
+            bhq.db.clear_index_pending_lock(nick)
+            orig_inc=bhq._indexsnap_incremental; orig_boex=bhq.borg.boex
+            bhq._indexsnap_incremental=lambda *a,**k: (_ for _ in ()).throw(DbModeError('simulated'))
+            bhq.borg.boex=lambda *a,**k: {'exitcode':0,'stdout':[{'archives':[{'name':'A1','start':'2026-01-01T00:00:00'}]}],'stderr':[]}
+            try:
+                out=io.StringIO(); sout=io.StringIO()
+                with contextlib.redirect_stderr(out),contextlib.redirect_stdout(sout):
+                    ret=bhq.indexsnap(nick,debug=0,db_path=p,force=False)
+                pending=bhq.db.check_index_pending_lock(nick)
+                return ret==1 and pending and 'mode changé' in out.getvalue()
+            finally:
+                bhq._indexsnap_incremental=orig_inc; bhq.borg.boex=orig_boex
+                bhq.db.clear_index_pending_lock(nick); _q_rc()
+        check("indexsnap() : DbModeError de _indexsnap_incremental rattrapée spécifiquement -> index_pending posé, retour 1, pas de traceback (AD-11)",_indexsnap_dbmode_error_ok)
+        def _no_schema(path):
+            if not os.path.exists(path): return True
+            try:
+                c=sqlite3.connect(path)
+                rows=c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                c.close(); return len(rows)==0
+            except sqlite3.Error: return True
+        def _ensure_create_false_ok():
+            """AD-12 : create=False n'écrit ni fichier ni schéma pour une base absente ; create=True
+            (défaut, réservé à Index/Bkp/indexsnap/DbEncrypt) crée toujours le schéma comme avant."""
+            p=os.path.join(tmp,'never_diff.db')
+            if os.path.exists(p): os.unlink(p)
+            bhq.db.ensure_diff_db(p,create=False)
+            r1=not os.path.exists(p)
+            bhq.db.ensure_diff_db(p)
+            r2=os.path.exists(p) and not _no_schema(p)
+            q=os.path.join(tmp,'never_cache.db')
+            if os.path.exists(q): os.unlink(q)
+            bhq.db.ensure_cache_db(q,create=False)
+            r3=not os.path.exists(q)
+            bhq.db.ensure_cache_db(q)
+            r4=os.path.exists(q) and not _no_schema(q)
+            return r1 and r2 and r3 and r4
+        check("ensure_diff_db/ensure_cache_db(create=False) : aucun fichier pour une base absente ; create=True (défaut) crée le schéma comme avant",_ensure_create_false_ok)
+        def _never_indexed_ok():
+            """Les commandes de lecture sur un nick jamais indexé répondent « non indexé »/« index vide »
+            sans créer de schéma de base (create=False propagé à TOUS les sites de lecture, AD-12)."""
+            with open(qrc,'w') as f:
+                for nk in ('qp','qe','qz'):
+                    f.write(f"[{nk}]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n\n")
+            os.chmod(qrc,0o600)
+            try:
+                diffp=bhq.db.get_diff_db('qz'); cachep=bhq.db.get_cache_db('qz')
+                for p in (diffp,cachep):
+                    for suf in ('','-wal','-shm'):
+                        if os.path.exists(p+suf): os.unlink(p+suf)
+                outs=[_q_run(bhq.treehist,'qz',None,as_json=True),
+                      _q_run(bhq.treefind,'qz',None,'*',as_json=True),
+                      _q_run(bhq.search,'qz','*',as_json=True),
+                      _q_run(bhq.duidx,'qz',None,as_json=True),
+                      _q_run(bhq.list_backups,'qz'),
+                      _q_run(bhq.list_files,'qz',None,as_json=True),
+                      _q_run(bhq.filehist,'qz','some/path',as_json=True)]
+                bhq.prep_report_from_db('qz')
+                bhq._find_last_archive_with_file('qz','nope')
+                bhq.db.get_cache_rows('qz')
+                msgs_ok=all(('Index vide' in o) or ('Aucune archive' in o) or ('"error"' in o) for o in outs)
+                return msgs_ok and _no_schema(diffp) and _no_schema(cachep)
+            finally:
+                _q_rc()
+        check("nick jamais indexé : TreeHist/TreeFind/Search/DuIdx/ListBkp/ListBkpFiles/FileHist/PrepReport/FindLastArchive/GetCacheRows -> « non indexé »/« index vide », aucun schéma créé",_never_indexed_ok)
+        def _never_indexed_borg_sites_ok():
+            """Complète _never_indexed_ok pour les sites qui, sur un lookup en échec, exécutent borg avant
+            d'écrire (DiffBkp, CachePruneDryrun, CacheJsonBoexWithLM, CacheClean) : boex() est monkeypatché
+            pour échouer immédiatement (dépôt indisponible) — déterministe, sans dépendre d'un vrai binaire
+            borg ni de son délai — et le test vérifie qu'aucun schéma n'est créé avant cet échec (create=False
+            au lookup, et le guard sur purge_stale_cache pour les deux fonctions de cache)."""
+            with open(qrc,'w') as f:
+                for nk in ('qp','qe','qz'):
+                    f.write(f"[{nk}]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n\n")
+            os.chmod(qrc,0o600)
+            orig_boex=bhq.borg.boex
+            bhq.borg.boex=lambda *a,**k: (_ for _ in ()).throw(RuntimeError('simulated: dépôt indisponible'))
+            def _q_call_safe(fn,*a,**k):
+                """Comme _q_run, mais avale aussi l'exception borg simulée (pas seulement SystemExit) :
+                diffbkp/cache_prune_dryrun/cacheJsonBoexWithLM n'ont pas de try/except autour de leur
+                appel borg (contrairement à cache_clean), la propagation est attendue ici."""
+                out=io.StringIO(); err=io.StringIO()
+                with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+                    try: fn(*a,**k)
+                    except (SystemExit,Exception): pass
+                return out.getvalue()+err.getvalue()
+            try:
+                diffp=bhq.db.get_diff_db('qz'); cachep=bhq.db.get_cache_db('qz')
+                for p in (diffp,cachep):
+                    for suf in ('','-wal','-shm'):
+                        if os.path.exists(p+suf): os.unlink(p+suf)
+                _q_call_safe(bhq.diffbkp,'qz',as_json=True)
+                _q_call_safe(bhq.cache_clean,'qz')
+                _q_call_safe(bhq.cache_prune_dryrun,'qz','2026-01-01T00:00:00')
+                _q_call_safe(bhq.cacheJsonBoexWithLM,'qz',['info','--json'])
+                return _no_schema(diffp) and _no_schema(cachep)
+            finally:
+                bhq.borg.boex=orig_boex; _q_rc()
+        check("nick jamais indexé/jamais mis en cache : DiffBkp/CacheClean/CachePruneDryrun/CacheJsonBoexWithLM -> aucun schéma créé avant l'échec borg (create=False + guard purge_stale_cache)",_never_indexed_borg_sites_ok)
     finally:
         shutil.rmtree(tmp,ignore_errors=True)
         _DB_CFG_READERS.clear(); _DB_CFG_READERS.update(saved_readers)

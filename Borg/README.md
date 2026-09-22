@@ -729,8 +729,11 @@ borgHelper -c CodecSelfTest
 Auto-test du codec de chiffrement des chemins (vecteurs officiels HMAC/PBKDF2/scrypt, aller-retour, rejets
 `DbCodecError`/`DbKeyError`/`DbTamperError`, versions de schéma, `DB_ENCRYPT`/`DB_KDF`, permissions) et des requêtes de
 chemin : mêmes résultats sur une base `plain` et sur une base chiffrée pour `TreeHist`, `TreeFind`, `Search`, `FileHist`,
-`DuIdx`, `IdxTop`, `DiffTop`, `ListBkpFiles`, `IdxPurge` et le périmètre RBAC, plans d'exécution sur les index de chemin. Travaille
-uniquement sur des bases temporaires : aucune vraie base ni aucun vrai rc n'est lu. Une ligne `OK`/`FAIL` par
+`DuIdx`, `IdxTop`, `DiffTop`, `ListBkpFiles`, `IdxPurge` et le périmètre RBAC, plans d'exécution sur les index de chemin.
+Vérifie aussi l'écriture (story 3) : aller-retour `store_diff_entries`/`store_archive_snapshot` sur une base chiffrée
+temporaire, `DbModeError` levée (et non avalée) quand le mode change sous une transaction ouverte, et qu'un nick jamais
+indexé ne crée aucun schéma de base via les commandes de lecture (`ensure_diff_db`/`ensure_cache_db(create=False)`).
+Travaille uniquement sur des bases temporaires : aucune vraie base ni aucun vrai rc n'est lu. Une ligne `OK`/`FAIL` par
 contrôle ; code de sortie non nul au moindre échec.
 
 ### `CacheInfo` / `CacheClean`
