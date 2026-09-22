@@ -1,0 +1,120 @@
+[user]
+    name = unconfigured
+    email = unconfigured
+
+[includeIf "gitdir:~/.local/"]
+    path = ~/.local/gitconfig
+# https://stackoverflow.com/questions/4220416/can-i-specify-multiple-users-for-myself-in-gitconfig
+
+[core]
+   pager = less -SR -x4
+   sshCommand = "/usr/bin/ssh -o visualHostkey=no"
+   filemode = true
+[diff]
+	tool = vimdiff
+[alias]
+    ls = "!bash -c '\
+        f() { \
+            local prefix=\"${GIT_PREFIX:-}\"; \
+            cd \"${prefix:-.}\" || exit 1; \
+            git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo \"Pas un depot git.\" >&2; exit 1; }; \
+            declare -A st; \
+            while IFS= read -r l; do \
+                c=\"${l:0:2}\"; fn=\"${l:3}\"; fn=\"${fn%\\\"}\"; fn=\"${fn#\\\"}\"; \
+                fn=\"${fn#$prefix}\"; \
+                st[\"$fn\"]=\"$c\"; \
+            done < <(git status --porcelain --ignored -- .); \
+            code_to_tag() { \
+                case \"$1\" in \
+                    \"\") echo committed ;; \
+                    \"??\") echo untracked ;; \
+                    \"!!\") echo ignored ;; \
+                    \" M\"|\"MM\") echo modified ;; \
+                    \"M \"|\"A \"|\"AM\") echo staged ;; \
+                    \" D\"|\"D \") echo deleted ;; \
+                    \"R \"|\" R\") echo renamed ;; \
+                    *) echo \"$1\" ;; \
+                esac; \
+            }; \
+            rank() { \
+                case \"$1\" in \
+                    modified|staged) echo 5 ;; \
+                    deleted) echo 4 ;; \
+                    renamed) echo 3 ;; \
+                    untracked) echo 2 ;; \
+                    ignored) echo 1 ;; \
+                    committed) echo 0 ;; \
+                    *) echo 0 ;; \
+                esac; \
+            }; \
+            dir_tag() { \
+                local d=\"$1/\"; local best=\"committed\"; local best_rank=0; \
+                local has_tracked=\"\"; \
+                has_tracked=$(git ls-files -- \"$1\" | head -n1); \
+                for key in \"${!st[@]}\"; do \
+                    if [[ \"$key\" == \"$d\"* ]]; then \
+                        local t; t=$(code_to_tag \"${st[$key]}\"); \
+                        if [[ -n \"$has_tracked\" && \"$t\" == \"ignored\" ]]; then continue; fi; \
+                        local r; r=$(rank \"$t\"); \
+                        if (( r > best_rank )); then best_rank=$r; best=$t; fi; \
+                    fi; \
+                done; \
+                echo \"$best\"; \
+            }; \
+            ls -lrtA | while IFS= read -r line; do \
+                if [[ \"$line\" == total\\ * ]]; then echo \"$line\"; continue; fi; \
+                file=\"${line##* }\"; \
+                if [[ \"$file\" == \".git\" ]]; then continue; fi; \
+                if [[ -d \"$file\" ]]; then \
+                    tag=$(dir_tag \"$file\"); \
+                    code=\"${st[$file]:-}\"; \
+                    if [[ -n \"$code\" ]]; then \
+                        own=$(code_to_tag \"$code\"); \
+                        if (( $(rank \"$own\") > $(rank \"$tag\") )); then tag=\"$own\"; fi; \
+                    fi; \
+                else \
+                    code=\"${st[$file]:-}\"; \
+                    tag=$(code_to_tag \"$code\"); \
+                fi; \
+                case \"$tag\" in \
+                    \"committed\") tata=\"✳️ \" ;; \
+                    \"untracked\") tata=\"☠️ \" ;; \
+                    \"ignored\")   tata=\"👻\" ;; \
+                    \"modified\")  tata=\"📝\" ;; \
+                    \"staged\")    tata=\"🚸\" ;; \
+                    \"deleted\")   tata=\"🧨\" ;; \
+                    \"renamed\")   tata=\"✉️ \" ;; \
+                    *)             tata=\"⁉️ \" ;; \
+                    esac; \
+                printf \"%s [%s]\\n\" \"$line\" \"$tata$tag\"; \
+            done; \
+        }; f' -"
+    allst= "!find -type d -name .git | while read gits ; do gith=$(dirname $gits); echo ======== $gith; cd $gith; git st;cd -; done"
+    allget= "!find -type d -name .git | while read gits ; do gith=$(dirname $gits); echo ======== $gith; cd $gith; git g;cd -; done"
+    addco= "!chaine=$*;test -z '$chaine' && chaine='.' ;cd $(git root);git diff \"$chaine\";echo -n \"Make an comment for $chaine (or do CTR-C to stop): \";read comm;git add \"$chaine\";git commit -m \"$comm\""
+    addcom= "!cd $(git root); git diff; git status -sb | grep -E '^ [DM]' ;echo 'Make a comment or do CTR-C to stop'; read comm; git status -sb | grep -E '^ [DM]' | while read m file; do echo $file;git add $file;done;git commit -m \"$comm\""
+#    logs = log --pretty="format:%H;%ci;%cn;%s" --name-status
+    logs = log --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%ci,%cr) %C(bold blue)<%an>%Creset' --abbrev-commit --date=relative --name-only
+	lg = log --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset' --abbrev-commit --date=relative
+    g = pull
+    p = "!test $(git st | wc -l ) -gt 1 && ( echo Merci de commiter;git st); git push"
+    root = rev-parse --show-toplevel
+	st = "!cd $(git root); git status -sb"
+	co = checkout
+	ci = commit -m 
+	commit = commit --signoff
+	br = branch
+	sb = branch -a
+	mt = mergetool
+	d = difftool
+	dst = diff --staged
+	sub = submodule
+	c1 = clone --depth=1
+	se = !git rev-list --all | xargs git grep -F
+	alias = ! git config --get-regexp ^alias\\. | sed -e s/^alias\\.// -e s/\\ /\\ =\\ /
+    goto = “!f() { git reset --hard && git clean -fd && git checkout ${1-master}; }; f”
+	list-branch = ! git for-each-ref --format=' %(authorname) %09 %(refname)' --sort=authorname
+	todo = ! git grep --extended-regexp -I --line-number --break --heading --color=auto 'TODO|FIXME'
+	todo-list = ! git grep --extended-regexp -I --line-number --count 'TODO|FIXME'
+[init]
+	defaultBranch = main

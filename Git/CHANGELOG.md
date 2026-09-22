@@ -8,6 +8,11 @@
 ### 1.0.0 — 2026-09-22
 - Creation du script : synchronisation miroir entre deux depots git (clone --mirror + push --mirror), avec option `-n/--dry-run`.
 
+## gitconfig
+
+### 1.0.0 — 2026-09-22
+- Depot de la version actuelle du `.gitconfig` personnel.
+
 ## git2git_file
 
 ### 1.0.0 — 2026-09-22
