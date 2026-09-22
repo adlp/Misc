@@ -10,6 +10,9 @@
 
 ## gitconfig
 
+### 1.1.0 — 2026-09-22
+- Fix `addco` : cassait avec un chemin relatif quand invoque depuis un sous-repertoire (les alias shell `!` de git s'executent deja a la racine du depot ; `addco` prenait l'argument tel quel puis re-cd'ait vers la racine, donc `fichier.txt` pointait au mauvais endroit). Utilise maintenant `$GIT_PREFIX` (comme `ls`) pour reconstruire le chemin racine-relatif avant `diff`/`add`.
+
 ### 1.0.0 — 2026-09-22
 - Depot de la version actuelle du `.gitconfig` personnel.
 
