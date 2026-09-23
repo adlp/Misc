@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.104"
+Version="1.0.106"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -401,6 +401,9 @@ def usage(doc=None,debug=0):
         printer("       Supprime les entrées périmées du cache")
         printer("   -c CodecSelfTest")
         printer("       Auto-test du codec de chiffrement (bases temporaires, aucune vraie base touchée) ; code de sortie non nul si un contrôle échoue")
+        printer("   -c PerfBench [-n <taille>] [-K]")
+        printer("       Mesure les temps des commandes de lecture sur un jeu synthétique (bases temporaires, plain et chiffré)")
+        printer("       -n <taille> : nb de lignes diff_index visé par mode (défaut 250000)  |  -K : + coût KDF/DbEncrypt/DbDecrypt")
         printer("⚗️  -c IdxTop [-n nick/ALL] [-N top] [-p profondeur] [-j]")
         printer("       Top N arborescences par entrées dans diff_index — diagnostiquer un diff.db volumineux")
         printer("       -N n : top N (défaut 20)  |  -p d : profondeur répertoire (défaut 3)  |  -j : brut par-chemin (ignore -N/-p)")
@@ -524,6 +527,13 @@ def usage(doc=None,debug=0):
         printer("   -c CodecSelfTest")
         printer("       Vérifie codec de chemins/blobs, enveloppe de clés, en-tête, versions de schéma, DB_ENCRYPT/DB_KDF")
         printer("       et permissions, sur des bases temporaires. OK/FAIL par contrôle ; code de sortie non nul au moindre échec.")
+    elif doc=='perfbench':
+        printer("   -c PerfBench [-n <taille>] [-K]")
+        printer("       Génère un jeu de données synthétique (SQL direct, PAS de vrai borg) sur des bases temporaires")
+        printer("       plain et chiffrée, puis chronomètre TreeHist/TreeFind/Search/DuIdx/IdxTop/DiffTop/IdxPurge/")
+        printer("       _find_last_archive_with_file et le décodage mémoïsé. -n : nb de lignes diff_index visé par")
+        printer("       mode (défaut 250000)  |  -K : + coût KDF (light/standard/strong) et DbEncrypt/DbDecrypt sur ce jeu")
+        printer("       Fichiers temporaires toujours nettoyés (succès ou échec). Code de sortie non nul si une mesure a échoué.")
     elif doc=='cacheclean':
         printer("   -c CacheClean [-n nickname/servername/ALL]")
         printer("       Supprime les entrées périmées du cache")
@@ -692,6 +702,7 @@ class DbCodec:
         k=_subkeys(dek)
         self.path=PathCodec(k['k_path'],k['k_enc']); self.blob=BlobCodec(k['k_blob']); self.k_hdr=k['k_hdr']
         self._memo={}
+        self._seg_memo={}  # (prev_tag,segment_chiffré) -> (segment_clair,tag) -- voir decode_path_verified
 
     def decode_path(self,stored):
         """PathCodec.decode avec mémo borné (vidé quand plein) : les mêmes chemins reviennent d'une requête à l'autre."""
@@ -701,6 +712,34 @@ class DbCodec:
             if len(self._memo)>=_DEC_MEMO_MAX: self._memo.clear()
             self._memo[stored]=v
         return v
+
+    def decode_path_verified(self,stored):
+        """Comme `PathCodec.decode` (valide le tag de CHAQUE segment, toute la profondeur -- même garantie
+        que `decode`/`decode_path`, jamais limité au premier niveau) mais mémoïse par SEGMENT
+        (`(prev_tag, segment_chiffré) -> (segment_clair, tag)`, borné/vidé comme `_memo`) : des chemins qui
+        partagent un même préfixe de répertoires (cas courant dans une arborescence réelle) ne refont pas
+        le travail crypto déjà fait pour ce préfixe -- accélère un balayage de beaucoup de chemins voisins
+        SANS relâcher la détection d'altération sur AUCUN segment, à AUCUNE profondeur (contrairement à un
+        décodage volontairement limité au premier niveau, qui laisserait une altération plus profonde
+        passer inaperçue — voir Story 6/CHANGELOG pour l'historique de ce choix)."""
+        if stored=='': return ''
+        p=self.path
+        prev=b'\0'*_PATH_TAG_LEN; segs=[]
+        for part in stored.split('/'):
+            key=(prev,part)
+            hit=self._seg_memo.get(key)
+            if hit is None:
+                raw=_b64d(part)
+                if len(raw)<=_PATH_TAG_LEN: raise DbCodecError("segment trop court")
+                tag,ct=raw[:_PATH_TAG_LEN],raw[_PATH_TAG_LEN:]
+                seg=_xor(ct,p._ks(tag,len(ct)))
+                if not hmac.compare_digest(_hmac(p._kp,prev,seg)[:_PATH_TAG_LEN],tag):
+                    raise DbCodecError("tag de segment invalide")
+                if len(self._seg_memo)>=_DEC_MEMO_MAX: self._seg_memo.clear()
+                hit=(seg,tag); self._seg_memo[key]=hit
+            seg,tag=hit
+            segs.append(seg); prev=tag
+        return b'/'.join(segs).decode('utf-8','surrogateescape')
 
 def _kdf_params(level='standard'):
     """Paramètres KDF réellement utilisés pour un niveau (repli PBKDF2 sans hashlib.scrypt)."""
@@ -3432,37 +3471,74 @@ class BorgHelper:
         latest=row[0]
         # le préfixe lui-même ET ses descendants : égalité + intervalle (racine : aucune borne)
         psql,pprm,_=_psel_under(conn,prefix,self_too=True)
-        snap_rows=[(_path_decode(conn,p),t,m,o) for p,t,m,o in
-                   conn.execute("SELECT path,type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=?"+_wh(psql),[n,latest]+pprm)]
         plen=len(prefix)+1 if prefix else 0
         children={}       # name -> is_dir (heuristique de secours si le type est inconnu)
         type_by_name={}    # name -> type réel de SA PROPRE entrée (pas celui d'un enfant plus profond)
         mode_by_name={}    # name -> droits unix (dernier état connu) de SA PROPRE entrée
         owner_by_name={}   # name -> propriétaire (dernier état connu) de SA PROPRE entrée
         own_type=None; own_mode=None; own_owner=None
-        for path,ftype,fmode,fowner in snap_rows:
-            if prefix and path==prefix:
-                own_type=ftype; own_mode=fmode; own_owner=fowner; continue
-            rel=path[plen:] if prefix else path
-            if not rel: continue
-            seg=rel.split('/',1)
-            name=seg[0]; is_dir=len(seg)>1
-            children[name]=children.get(name,False) or is_dir
-            if not is_dir: type_by_name[name]=ftype; mode_by_name[name]=fmode; owner_by_name[name]=fowner
+        snap_cursor=conn.execute("SELECT path,type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=?"+_wh(psql),[n,latest]+pprm)
+        if not prefix and conn.codec is not None:
+            # Racine, base chiffrée : à la racine, `psql` ne borne rien (AD-8, aucun prédicat sur le nom
+            # en SQL) -- l'instantané ENTIER est lu, et décoder le chemin complet de chaque ligne (83k sur
+            # le jeu PerfBench) dominait `TreeHist` à la racine (mesuré Story 6, ~3,7-6,6 s). Un premier
+            # correctif (décoder SEULEMENT le premier segment) faisait perdre la détection d'altération sur
+            # les segments plus profonds — une régression de sécurité réelle par rapport au comportement
+            # d'avant cette story (revue post-implémentation). `decode_path_verified` valide chaque segment
+            # de chaque chemin, comme avant, mais mémoïse par SEGMENT PARTAGÉ entre chemins de même
+            # préfixe de répertoires (cas courant) : la profondeur/structure d'un chemin reste de toute
+            # façon une fuite déjà acceptée (Deferred de la spine) — seule la répétition du calcul crypto
+            # déjà fait pour un préfixe commun est évitée, jamais la vérification elle-même.
+            for path,ftype,fmode,fowner in snap_cursor:
+                lp=conn.codec.decode_path_verified(path)
+                if not lp: continue
+                seg=lp.split('/',1)
+                name=seg[0]; is_dir=len(seg)>1
+                children[name]=children.get(name,False) or is_dir
+                if not is_dir: type_by_name[name]=ftype; mode_by_name[name]=fmode; owner_by_name[name]=fowner
+        else:
+            for path,ftype,fmode,fowner in snap_cursor:
+                lp=_path_decode(conn,path)
+                if prefix and lp==prefix:
+                    own_type=ftype; own_mode=fmode; own_owner=fowner; continue
+                rel=lp[plen:] if prefix else lp
+                if not rel: continue
+                seg=rel.split('/',1)
+                name=seg[0]; is_dir=len(seg)>1
+                children[name]=children.get(name,False) or is_dir
+                if not is_dir: type_by_name[name]=ftype; mode_by_name[name]=fmode; owner_by_name[name]=fowner
         # Enfants directs supprimés (diff_index) : jamais archive_snapshot_v/archive_snapshot, purgés
         # indépendamment selon IDX_SNAP_KEEP — diff_index n'est purgé qu'au prune réel de l'archive
         # (_cleanup_index_after_prune), donc une ligne survivante référence toujours une archive encore
         # restaurable. Un nom déjà présent dans children n'est jamais reconsidéré ici : l'appartenance
         # au snapshot courant prime toujours, même en cas d'historique suppression/réajout.
-        # Enfants directs uniquement : la profondeur se juge en Python sur le chemin décodé. Chemins
-        # distincts du sous-arbre (index (nick,path) seul), puis, pour les seuls enfants directs
-        # candidats, le dernier événement (archive_new_date max, id max) — pas de fenêtre sur tout le sous-arbre.
+        # Enfants directs uniquement : la profondeur se juge en Python. Un premier essai (Story 6, voir
+        # historique) a remplacé le `SELECT DISTINCT path` + requête par candidat par une seule requête
+        # fenêtrée `ROW_NUMBER()` — mesuré PLUS LENT (le tri de la fenêtre sur tout `diff_index` du
+        # périmètre coûte davantage que les quelques centaines de requêtes ponctuelles qu'il économise ;
+        # l'index `idx_diff_nick_path` rend déjà le `DISTINCT` bon marché). Le vrai coût mesuré est le
+        # DÉCODAGE de CHAQUE chemin distinct du sous-arbre (des dizaines de milliers sur une grosse base)
+        # rien que pour éliminer ceux qui ne sont pas des enfants directs. Correctif retenu : AD-3 ne
+        # chiffre pas le séparateur '/' entre segments (« Segments chiffrés joints par '/' » — la
+        # profondeur/structure est une fuite explicitement acceptée, Deferred de la spine) : le nombre de
+        # '/' de la valeur STOCKÉE est donc identique à celui du chemin logique, et un enfant direct se
+        # reconnaît sur la valeur stockée SANS la décoder (juste un slice + test '/' in ...). Seuls les
+        # candidats structurellement enfants directs sont décodés puis interrogés pour leur dernier
+        # événement — la requête par candidat (petit nombre, jamais le goulot mesuré) est conservée telle
+        # quelle. Mesuré Story 6/PerfBench : ~5,7 s -> voir TECHNICAL.md pour le chiffre après correctif.
         usql,uprm,_=_psel_under(conn,prefix)
+        if conn.codec is not None:
+            enc_prefix=conn.codec.path.encode(prefix) if prefix else ''
+            stored_skip=len(enc_prefix)+1 if enc_prefix else 0
+        else:
+            stored_skip=plen
         del_rows=[]
         for (stored,) in conn.execute("SELECT DISTINCT path FROM diff_index WHERE nick=?"+_wh(usql),[n]+uprm).fetchall():
+            rest=stored[stored_skip:]
+            if not rest or '/' in rest: continue  # pas structurellement un enfant direct -- jamais décodé
             lp=_path_decode(conn,stored)
             nm=lp[plen:] if prefix else lp
-            if not nm or '/' in nm or nm in children: continue
+            if not nm or nm in children: continue
             last=conn.execute("SELECT change_type,archive_old,size_before FROM diff_index WHERE nick=? AND path=? ORDER BY archive_new_date DESC,id DESC LIMIT 1",(n,stored)).fetchone()
             if last and last[0]=='removed': del_rows.append((lp,last[1],last[2]))
         deleted_children={}   # name -> (archive_old,is_dir) — sélectionne, par chemin, l'événement
@@ -4775,6 +4851,34 @@ def codec_selftest():
                 _q_build('qe',True)  # restaure une base saine pour la suite du self-test
                 return isinstance(v,dict) and 'error' in v
             check("Search sur base altérée : DbCodecError attrapée, message par nick, pas de traceback",_tamper_search)
+            def _tamper_treehist_root_deep():
+                """TreeHist À LA RACINE (base chiffrée) doit détecter une altération à N'IMPORTE QUELLE
+                profondeur, pas seulement sur le premier segment (revue post-implémentation Story 6 :
+                `decode_path_verified` valide chaque segment, contrairement à un décodage qui se serait
+                limité au premier niveau) -- corrompt le DEUXIÈME segment (pas le premier) d'un chemin
+                imbriqué ('etc/sub/app.log') et vérifie que `TreeHist` à la racine échoue proprement
+                (DbCodecError attrapée, pas de traceback), même garantie que `Search` (`_tamper_search`)."""
+                _q_build('qe',True)
+                c=_open_db(bhq.db.get_diff_db('qe'),nick='qe',role='write')
+                # cible un chemin CONNU (2 segments, présent dans A3 -- pas un `_gone`, jamais dans
+                # archive_snapshot_v) : un `SELECT ... WHERE nick=?` sans ORDER BY peut être satisfait par
+                # l'index (nick,path), donc trié sur la valeur STOCKÉE (chiffrée) -- piocher "le premier
+                # avec un '/'" y est non déterministe et peut tomber sur un `_gone`, jamais visité par la
+                # racine -> détection manquée silencieusement (constaté : reproductible en isolation).
+                target=c.codec.path.encode('etc/sub')
+                parts=target.split('/')
+                seg=parts[1]; parts[1]='B'+seg[1:] if seg[0]!='B' else 'C'+seg[1:]  # altère le TAG du 2e segment seulement
+                n=c.execute("UPDATE snapshot_file SET path=? WHERE nick='qe' AND path=?",('/'.join(parts),target)).rowcount
+                c.commit(); c.close()
+                if n!=1: return False  # la cible attendue doit exister exactement une fois
+                out=io.StringIO()
+                with contextlib.redirect_stdout(out): bhq.treehist('qe',None,archive_from='ALL',as_json=True)
+                try: v=json.loads(out.getvalue())['qe']
+                except ValueError: return False
+                _q_build('qe',True)  # restaure une base saine pour la suite du self-test
+                return isinstance(v,dict) and 'error' in v
+            check("TreeHist racine sur base altérée (2e segment d'un chemin imbriqué, 1er segment intact) : "
+                  "DbCodecError attrapée, pas de traceback",_tamper_treehist_root_deep)
             check("plans (etc) sur connexion chiffrée : aucun LIKE/GLOB, aucun ORDER BY portant sur un chemin",
                   lambda: traced and not [q for q in traced if re.search(r'\bLIKE\b|\bGLOB\b|ORDER BY[^\n]*\bpath\b',q)])
         finally:
@@ -5408,6 +5512,248 @@ def codec_selftest():
     print(f"CodecSelfTest : {len(results)-fails}/{len(results)} OK"+(f", {fails} FAIL" if fails else ""))
     return fails
 
+# ── PerfBench — mesures de performance sur jeu de données synthétique (story 6) ─
+# Générateur SQL direct (INSERT/executemany par gros lots), jamais de vrai `borg backup` (bien trop
+# lent pour représenter plusieurs Go en temps de test raisonnable). Bases TEMPORAIRES uniquement
+# (comme CodecSelfTest) : aucune vraie base ni vrai rc n'est touché, tout est nettoyé en `finally`.
+
+_PB_DEFAULT_DIFF_ROWS=250000  # voir Implementation Notes (TECHNICAL.md) pour la justification de
+# cet ordre de grandeur (octets/ligne mesurés x nombre de lignes ~ taille cible)
+_PB_KDF_DEFAULT_ROWS=30000  # -K SANS -n explicite : jeu réduit dédié pour KDF/DbEncrypt/DbDecrypt
+# ("plus lent, optionnel" — ne doit jamais migrer le jeu par défaut/complet, seulement un -n explicite
+# doit gouverner cette taille aussi, voir perf_bench())
+_PB_JUDGMENT_S=1.0  # seuil de jugement (Intent/Boundaries de la story) : opération de lecture
+# interactive (TreeHist/TreeFind/Search) qui dépasse la seconde sur le jeu de référence
+_PB_ARCHIVES=[f"pb-a{i}" for i in range(5)]        # pb-a0..pb-a4 ; pb-a4 = dernière (snapshot courant)
+_PB_DATES=[f"2026-0{i+1}-15T00:00:00" for i in range(5)]
+
+def _pb_build_dirs(n_dirs_target,seed):
+    """Arborescence synthétique, profondeur variable (jamais tout au même niveau) : part d'une
+    vingtaine de répertoires de tête réalistes, puis étend récursivement au hasard jusqu'à atteindre
+    n_dirs_target, en bornant la profondeur (7) pour rester réaliste."""
+    import random
+    rnd=random.Random(seed)
+    top=['etc','var','var/log','var/lib','var/cache','home','home/user1','home/user2','home/user3',
+         'usr','usr/share','usr/lib','usr/local','opt','srv','data','data/archive','data/archive/2024',
+         'data/archive/2025','mnt/backup','mnt/backup/daily','mnt/backup/weekly']
+    sub=['sub','cache','tmp','logs','conf.d','modules','plugins','assets','build','node_modules',
+         'src','include','bin','lib','share','doc','vendor','dist','releases','snapshots']
+    dirs=list(top)
+    while len(dirs)<n_dirs_target:
+        parent=dirs[rnd.randrange(len(dirs))]
+        if parent.count('/')>=7: parent=top[rnd.randrange(len(top))]
+        dirs.append(parent+'/'+sub[rnd.randrange(len(sub))]+str(rnd.randrange(1000)))
+    return dirs
+
+def _pb_build_paths(n_files,dirs,seed):
+    """n_files chemins uniques (garantis, suffixe numérique en cas de collision (répertoire,nom)) —
+    même nom de fichier réutilisé dans des répertoires différents (cas réaliste que AD-3 protège),
+    profondeur héritée de `dirs`."""
+    import random
+    rnd=random.Random(seed)
+    fname=['app.log','config.json','data.db','index.html','main.py','README.md','style.css',
+           'output.txt','error.log','settings.yaml','backup.tar.gz','image.png','script.sh',
+           'notes.txt','archive.zip','report.pdf','cache.bin','session.dat','manifest.xml','token.key']
+    counts={}; paths=[]
+    for _ in range(n_files):
+        d=dirs[rnd.randrange(len(dirs))]; f=fname[rnd.randrange(len(fname))]
+        c=counts.get((d,f),0); counts[(d,f)]=c+1
+        paths.append(f"{d}/{f}" if c==0 else f"{d}/{f}.{c}")
+    return paths
+
+def _pb_build_db(db_path,nick,paths,root_removed,diff_target,encrypted,passphrase=None):
+    """Construit un diff_index/snapshot_file synthétique par INSERT direct (executemany en gros lots) :
+    snapshot complet uniquement sur la dernière archive (pb-a4, comme un jeu de mesure, pas un
+    historique complet à indexer), churn (added/modified/removed) réparti sur les 4 paires
+    d'archives ; `root_removed` (quelques centaines de chemins à la racine) disparaît à la toute
+    dernière paire -> supprimés récupérables directement sous la racine (TreeHist/TreeFind)."""
+    import random
+    rnd=random.Random(4242)
+    for suf in ('','-wal','-shm'):
+        if os.path.exists(db_path+suf): os.unlink(db_path+suf)
+    dbh=BorgHelperDB(os.path.dirname(db_path),'pb')
+    dbh.ensure_diff_db(db_path)
+    if encrypted:
+        hdr,_dek=_enc_header_build(passphrase,'siv1','light')  # 'light' ici : coût KDF mesuré à part (-K)
+        c=_open_db(db_path,nick=None,role='admin'); _enc_header_write(c,hdr); c.close()
+    conn=_open_db(db_path,nick=nick,passphrase=passphrase,role='write',timeout=120)
+    conn.execute("PRAGMA synchronous=OFF")  # fixture jetable : seule la vitesse de construction compte
+    E=(lambda p: conn.codec.path.encode(p)) if conn.codec else (lambda p: p)
+    BATCH=10000
+    def _run_batched(sql,rows_iter):
+        buf=[]
+        for r in rows_iter:
+            buf.append(r)
+            if len(buf)>=BATCH: conn.executemany(sql,buf); buf=[]
+        if buf: conn.executemany(sql,buf)
+    _run_batched("INSERT INTO snapshot_file(nick,path,size,mtime,type,mode,owner) VALUES(?,?,?,?,?,?,?)",
+                 ((nick,E(p),rnd.randrange(1,5_000_000),'2026-05-15T00:00:00','-','-rw-r--r--','1000:1000') for p in paths))
+    conn.commit()
+    ids={stored:rid for stored,rid in conn.execute("SELECT path,id FROM snapshot_file WHERE nick=?",(nick,))}
+    _run_batched("INSERT INTO archive_snapshot(nick,archive,archive_date,file_id) VALUES(?,?,?,?)",
+                 ((nick,_PB_ARCHIVES[-1],_PB_DATES[-1],ids[E(p)]) for p in paths))
+    conn.execute("INSERT INTO archive_snapshot_indexed(nick,archive,entry_count) VALUES(?,?,?)",(nick,_PB_ARCHIVES[-1],len(paths)))
+    for a,d in zip(_PB_ARCHIVES,_PB_DATES):
+        conn.execute("INSERT INTO archive_stats(nick,archive,archive_date,nfiles) VALUES(?,?,?,?)",(nick,a,d,len(paths)))
+    for ao,an in zip(_PB_ARCHIVES,_PB_ARCHIVES[1:]):
+        conn.execute("INSERT INTO diff_indexed_pairs(nick,archive_old,archive_new,entry_count) VALUES(?,?,?,0)",(nick,ao,an))
+    conn.commit()
+    n_pairs=len(_PB_ARCHIVES)-1
+    per_pair=max(1,diff_target//n_pairs)
+    def _diff_rows():
+        for pi in range(n_pairs):
+            ao,an,dn=_PB_ARCHIVES[pi],_PB_ARCHIVES[pi+1],_PB_DATES[pi+1]
+            for _ in range(per_pair):
+                p=paths[rnd.randrange(len(paths))]; r=rnd.random()
+                if r<0.30: ct,sb,sa='added',None,rnd.randrange(1,1_000_000)
+                elif r<0.85: ct,sb,sa='modified',rnd.randrange(1,1_000_000),rnd.randrange(1,1_000_000)
+                else: ct,sb,sa='removed',rnd.randrange(1,1_000_000),None
+                yield (nick,ao,an,dn,ct,E(p),sb,sa)
+            if pi==n_pairs-1:
+                for p in root_removed: yield (nick,ao,an,dn,'removed',E(p),rnd.randrange(1,100000),None)
+    _run_batched("INSERT INTO diff_index(nick,archive_old,archive_new,archive_new_date,change_type,path,size_before,size_after) VALUES(?,?,?,?,?,?,?,?)",
+                 _diff_rows())
+    conn.commit(); conn.close()
+
+def perf_bench(size=None,with_kdf=False):
+    """Génère un jeu de données synthétique réaliste (SQL direct, PAS de vrai borg) et chronomètre
+    chaque commande listée dans l'Intent de la story 6, en mode plain ET chiffré (`time.perf_counter`).
+    -K (with_kdf=True) : ajoute le coût KDF (DB_KDF=standard/light/strong) et DbEncrypt/DbDecrypt —
+    sur un jeu réduit dédié (`_PB_KDF_DEFAULT_ROWS`) si `-n` n'a pas été donné explicitement (sinon,
+    `-n` gouverne aussi ce jeu, même combiné à `-K`). Fichiers temporaires nettoyés en `finally`
+    (succès ou échec). Ne corrige jamais rien — seulement question posée à l'utilisateur pour toute
+    mesure qui dépasse le seuil de jugement (Boundaries de la story) ; retourne 0 si toutes les
+    mesures ont pu s'exécuter, 1 si l'une d'elles a levé une exception (voir `results`)."""
+    import tempfile,shutil,time,io,contextlib
+    size_explicit=size is not None
+    n_diff=size or _PB_DEFAULT_DIFF_ROWS
+    n_files=max(1000,n_diff//3)
+    n_dirs=max(50,n_files//20)
+    n_root_removed=300
+    tmp=tempfile.mkdtemp(prefix='borghelper-perfbench-')
+    results=[]
+    try:
+        cache=os.path.join(tmp,'cache'); os.makedirs(cache)
+        rc=os.path.join(tmp,'rc')
+        with open(rc,'w') as f:
+            f.write("[pb_plain]\nBORG_REPO=/r\nBORG_PASSPHRASE=x\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n\n")
+            f.write("[pb_enc]\nBORG_REPO=/r\nBORG_PASSPHRASE=benchpw\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\nDB_ENCRYPT=true\n\n")
+            f.write("[pb_kdf]\nBORG_REPO=/r\nBORG_PASSPHRASE=kdfpw\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n\n")  # -K sans -n : jeu réduit dédié
+        os.chmod(rc,0o600)
+        bh=BorgHelper(cfgfile=rc,cache_dir=cache)
+        print(f"PerfBench : génération — {n_files:,} chemins, {n_dirs:,} répertoires, ~{n_diff:,} lignes diff_index par mode"
+              +(" (+ KDF/DbEncrypt/DbDecrypt, -K)" if with_kdf else ""))
+        dirs=_pb_build_dirs(n_dirs,seed=1)
+        paths=_pb_build_paths(n_files,dirs,seed=2)
+        root_removed=[f"root-removed-{i}.dat" for i in range(n_root_removed)]
+        dbs={}
+        for label,nick,encrypted,pw in (('plain','pb_plain',False,None),('siv1','pb_enc',True,'benchpw')):
+            db_path=bh.db.get_diff_db(nick)
+            t0=time.perf_counter()
+            _pb_build_db(db_path,nick,paths,root_removed,n_diff,encrypted,passphrase=pw)
+            dt=time.perf_counter()-t0
+            dbs[label]=(nick,db_path)
+            print(f"  {label:6s} : construit en {dt:.1f} s — {os.path.getsize(db_path)/1_048_576:.0f} Mio sur disque")
+        def _run_silent(fn,*a,**k):
+            out=io.StringIO(); err=io.StringIO()
+            with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err): fn(*a,**k)
+            return out.getvalue()
+        deep_dir=dirs[-1]
+        sites=[
+            ("TreeHist racine",                    lambda nick: bh.treehist(nick,None,archive_from='ALL',as_json=True)),
+            ("TreeHist sous-répertoire profond",   lambda nick: bh.treehist(nick,deep_dir,archive_from='ALL',as_json=True)),
+            ("TreeFind motif large racine (*.log)",lambda nick: bh.treefind(nick,None,'*.log',as_json=True)),
+            ("Search motif large (*.log)",         lambda nick: bh.search(nick,'*.log',archive_from='ALL',as_json=True)),
+            ("DuIdx motif large -R (*)",           lambda nick: bh.duidx(nick,'*',archive_from='ALL',raw=True)),
+            ("IdxTop",                             lambda nick: bh.idxtop(nick,depth=3,topn=20,as_json=True)),
+            ("DiffTop",                            lambda nick: bh.difftop(nick,bkp=f"{_PB_ARCHIVES[-2]},{_PB_ARCHIVES[-1]}",depth=3,topn=10,as_json=True)),
+            ("_find_last_archive_with_file (glob)",lambda nick: bh._find_last_archive_with_file(nick,'*.log')),
+            ("IdxPurge -D motif large (*.log)",    lambda nick: bh.idxpurge(nick,pattern='*.log',dryrun=True)),
+        ]
+        print(f"\n{'Commande':42s} {'mode':7s} {'durée':>10s}")
+        for label,fn in sites:
+            for mode_label,(nick,_db_path) in dbs.items():
+                t0=time.perf_counter()
+                try: _run_silent(fn,nick)
+                except Exception as e:
+                    dt=time.perf_counter()-t0
+                    results.append((label,mode_label,None,f"ERREUR {type(e).__name__}: {e}"))
+                    print(f"{label:42s} {mode_label:7s} {'ERREUR':>10s}  {e}")
+                    continue
+                dt=time.perf_counter()-t0
+                note='SEUIL DÉPASSÉ (>1s)' if dt>_PB_JUDGMENT_S else ''
+                results.append((label,mode_label,dt,note))
+                print(f"{label:42s} {mode_label:7s} {dt*1000:9.1f} ms  {note}")
+        # ── plan d'exécution : LIKE 'préfixe%' (avant AD-8/Story 2) vs intervalle d'index actuel ──
+        # remplace le chiffre non reproductible de la Story 2 (170 ms -> ~1 ms, table jetable, retiré de
+        # TECHNICAL.md) par une mesure réelle et reproductible sur CE jeu : même sélection de préfixe,
+        # LIKE (plan pré-AD-8, comparaison seulement — jamais utilisé en base chiffrée ni en code réel)
+        # contre l'intervalle `path>=? AND path<?` de `_psel_under` (idx_diff_nick_path), sur `plain`.
+        plike_nick,plike_db=dbs['plain']
+        plike_conn=_open_db(plike_db,nick=plike_nick)
+        like_prefix=dirs[len(dirs)//2]
+        t0=time.perf_counter()
+        like_count=plike_conn.execute("SELECT COUNT(*) FROM diff_index WHERE nick=? AND path LIKE ?",
+                                       (plike_nick,like_prefix+'/%')).fetchone()[0]
+        t_like=time.perf_counter()-t0
+        usql,uprm,_=_psel_under(plike_conn,like_prefix)
+        t0=time.perf_counter()
+        range_count=plike_conn.execute(f"SELECT COUNT(*) FROM diff_index WHERE nick=?"+_wh(usql),[plike_nick]+uprm).fetchone()[0]
+        t_range=time.perf_counter()-t0
+        plike_conn.close()
+        print(f"\nPlan d'exécution diff_index (préfixe {like_prefix!r}, {n_diff:,} lignes, plain) : "
+              f"LIKE 'préfixe%' {t_like*1000:.2f} ms ({like_count:,} lignes) vs intervalle d'index "
+              f"{t_range*1000:.2f} ms ({range_count:,} lignes)")
+        # ── politique du mémo de décodage : mono-passe (froid) vs ré-accès répété (mémoïsé) ──
+        nick,db_path=dbs['siv1']
+        conn=_open_db(db_path,nick=nick,passphrase='benchpw')
+        codec=conn.codec
+        sample=[r[0] for r in conn.execute("SELECT path FROM snapshot_file WHERE nick=? LIMIT 20000",(nick,))]
+        codec._memo.clear()
+        t0=time.perf_counter()
+        for s in sample: codec.decode_path(s)
+        t_cold=time.perf_counter()-t0
+        t0=time.perf_counter()
+        for s in sample: codec.decode_path(s)
+        t_warm=time.perf_counter()-t0
+        conn.close()
+        print(f"\nDbCodec.decode_path ({len(sample):,} chemins) : 1re passe (froid) {t_cold*1000:.1f} ms · "
+              f"2e passe (mémoïsé, mêmes chemins) {t_warm*1000:.1f} ms"
+              +(f" ({t_cold/t_warm:.0f}x)" if t_warm>0 else ""))
+        if with_kdf:
+            print("\n-- -K : coût KDF (par appel, = coût payé à CHAQUE requête borgHelperWWW sur base chiffrée) --")
+            for level in _KDF_LEVELS:
+                t0=time.perf_counter(); _enc_header_build('benchpw','siv1',level); dt=time.perf_counter()-t0
+                print(f"  DB_KDF={level:8s} : {dt*1000:.1f} ms/appel")
+            if size_explicit:
+                # -n donné explicitement : gouverne aussi la mesure DbEncrypt/DbDecrypt (réutilise le jeu
+                # déjà construit ci-dessus, pas de jeu séparé).
+                kdf_nick,_db_path=dbs['plain']; kdf_n_files,kdf_n_diff=n_files,n_diff
+            else:
+                # -n omis : NE JAMAIS migrer le jeu par défaut/complet (83k-333k lignes) pour "plus lent,
+                # optionnel" -- jeu réduit dédié (_PB_KDF_DEFAULT_ROWS), construit et nettoyé comme les
+                # autres (même répertoire temporaire, même `finally`).
+                kdf_n_diff=_PB_KDF_DEFAULT_ROWS; kdf_n_files=max(1000,kdf_n_diff//3)
+                kdf_dirs=_pb_build_dirs(max(50,kdf_n_files//20),seed=3)
+                kdf_paths=_pb_build_paths(kdf_n_files,kdf_dirs,seed=4)
+                kdf_nick='pb_kdf'
+                kdf_db_path=bh.db.get_diff_db(kdf_nick)
+                _pb_build_db(kdf_db_path,kdf_nick,kdf_paths,[],kdf_n_diff,False)
+            t0=time.perf_counter(); rc_enc=bh.db_encrypt(kdf_nick,confirm=True); dt=time.perf_counter()-t0
+            print(f"  DbEncrypt (lots _MIGRATE_BATCH={_MIGRATE_BATCH}) : {dt:.1f} s pour {kdf_n_files+kdf_n_diff:,} lignes (code {rc_enc})"
+                  +("" if size_explicit else f" [jeu réduit -K, -n non donné]"))
+            t0=time.perf_counter(); rc_dec=bh.db_decrypt(kdf_nick,confirm=True); dt=time.perf_counter()-t0
+            print(f"  DbDecrypt : {dt:.1f} s (code {rc_dec})")
+        over=[r for r in results if r[2] is not None and r[2]>_PB_JUDGMENT_S]
+        if over:
+            print(f"\n{len(over)} mesure(s) dépassent le seuil de jugement (>{_PB_JUDGMENT_S:.0f} s) : "
+                  "corriger maintenant ou documenter dans le Deferred de la spine — décision à demander "
+                  "à l'utilisateur avant tout correctif (Boundaries de la story), jamais d'optimisation préventive ici.")
+        errs=[r for r in results if r[2] is None]
+        return 1 if errs else 0
+    finally:
+        shutil.rmtree(tmp,ignore_errors=True)
+
 # ── CLI entry point ────────────────────────────────────────────────────────────
 
 _SENTRY_SENSITIVE_KEYS=('passphrase','password','pw','dek','secret','k_path','k_enc','k_blob','k_hdr',
@@ -5462,7 +5808,7 @@ def _cli_main():
                              auto_enabling_integrations=False,with_locals=False,before_send=_sentry_before_send)
 
     try:
-        opts,args=getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILC:FSN:ox:DP:Ry",["help"])
+        opts,args=getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILC:FSN:ox:DP:RyK",["help"])
     except getopt.GetoptError as err:
         print(err); usage(); sys.exit(2)
     if args:
@@ -5484,6 +5830,14 @@ def _cli_main():
 
     if cmd=='codecselftest':  # avant BorgHelper() : ne doit créer ni cache ni lire le vrai rc
         sys.exit(1 if codec_selftest() else 0)
+
+    if cmd=='perfbench':  # avant BorgHelper() : bases temporaires uniquement, jamais le vrai rc/cache
+        _pb_size=None
+        for opt,arg in opts:
+            if opt=='-n':
+                try: _pb_size=int(arg)
+                except ValueError: printer(f"-n invalide : {arg!r} (entier attendu)"); sys.exit(2)
+        sys.exit(perf_bench(size=_pb_size,with_kdf=any(opt=='-K' for opt,_arg in opts)))
 
     bh=BorgHelper(cfgfile=cfgfile_arg,passphrase=passphrase_arg)
 

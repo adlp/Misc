@@ -1,5 +1,98 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.106 — chiffrement des chemins SQLite, story 6 (suite) : correctif `TreeHist` à la racine — 2026-09-23
+
+Story 6 (1.0.105) avait confirmé 4 sites au-dessus du seuil de jugement (>1 s) par la mesure, sans les corriger
+(Boundaries de la story : décision posée à l'utilisateur). Décision reçue : corriger `TreeHist` à la racine
+(le plus sévère, 5,7 s en base chiffrée), documenter/différer les 3 autres (`TreeFind`, `DuIdx -R`, `IdxTop`).
+
+`TreeHist` à la racine fait deux lectures pleine-table sans possibilité de filtre SQL sur le nom (AD-8) :
+l'instantané complet (`snap_rows`, pour les enfants présents) et `diff_index` sans borne (`del_rows`, pour les
+supprimés récupérables). Le premier correctif tenté sur `del_rows` (requête fenêtrée `ROW_NUMBER()`, comme
+suggéré) a été **mesuré plus lent** que l'original — le tri qu'exige la fenêtre coûte plus cher que les ~300
+requêtes ponctuelles (déjà bon marché, indexées) qu'il économise ; non retenu. Correctif retenu à la place :
+AD-3 ne chiffre pas le séparateur `/` entre segments, donc la profondeur d'un chemin est déjà lisible sur sa
+valeur **stockée** sans la décoder (fuite de structure déjà acceptée, Deferred de la spine) — filtrer sur la
+valeur stockée AVANT `_path_decode` évite l'essentiel du décodage. Mesuré isolément (même connexion/jeu, 5
+essais, médiane) : `del_rows` ×56–58 plus rapide (4 365 ms → 77,7 ms à 250k lignes `diff_index` ; 16 649 ms →
+285 ms à 1M). Ce filtre s'applique quel que soit le préfixe (racine ou non, conditionné seulement par
+`conn.codec is not None`) — sans effet mesurable pour un préfixe non vide, `_psel_under` bornant déjà le
+`SELECT DISTINCT` à un petit sous-arbre.
+
+Pour `snap_rows`, un premier correctif (décoder SEULEMENT le premier segment de chaque chemin, nouvelle méthode
+`decode_first_segment`) a été **retiré après revue** : il faisait perdre la détection d'altération sur tout
+segment à 2 niveaux de profondeur ou plus dans `snapshot_file.path` — une régression de sécurité réelle par
+rapport au comportement d'avant cette story (`TreeHist` à la racine avait la même garantie que `Search`, testée
+par `_tamper_search`). Corrigé en gardant le gain de performance mais sans concession de sécurité : nouvelle
+méthode `DbCodec.decode_path_verified` décode et valide CHAQUE segment (même garantie que `_path_decode`), mais
+mémoïse par segment partagé entre chemins de même préfixe de répertoires — ×3,4 plus rapide (4 835 ms → 1 418 ms
+à 250k) plutôt que ×6 pour la version retirée, sans compromis. Un contrôle `CodecSelfTest` dédié corrompt
+spécifiquement le 2e segment d'un chemin imbriqué (1er segment intact) et vérifie que `TreeHist` à la racine
+échoue proprement (`DbCodecError`, pas de traceback) — il aurait échoué avec `decode_first_segment`, il passe
+avec `decode_path_verified` (280/280, +1 contrôle par rapport à 1.0.105).
+
+Bout en bout (`PerfBench`, 3 exécutions) : `TreeHist` racine chiffré 5 675–7 607 ms → **1 927–2 182 ms**, soit
+**×2,6 à ×4** selon les exécutions comparées (plage, pas un chiffre unique — variance d'une exécution complète à
+l'autre), toujours au-dessus du seuil de 1 s. Le reste du coût (une requête `DISTINCT archive_new,archive_new_date`
+par répertoire de tête dans `_events_for`, plus un balayage complet supplémentaire pour l'entrée `.` elle-même)
+n'a pas été touché dans cette livraison, documenté dans TECHNICAL.md pour une décision séparée.
+
+`PerfBench` gagne aussi une mesure LIKE-préfixe-vs-intervalle-d'index reproductible (24,5 ms vs 0,15 ms à 250k
+lignes, ~×163), qui remplace dans TECHNICAL.md le chiffre jetable 170 ms → 1 ms de la Story 2 (déjà retiré en
+1.0.105, jamais vraiment remplacé jusqu'ici) ; et `-K` sans `-n` explicite ne migre plus le jeu par défaut
+(83k–333k lignes) mais un jeu réduit dédié (`_PB_KDF_DEFAULT_ROWS=30000`), conforme au « plus lent, optionnel »
+déjà documenté — `-n` explicite (même combiné à `-K`) continue de gouverner la taille migrée, comme avant.
+
+- **`DbCodec.decode_path_verified(stored)`** (nouvelle méthode, remplace la tentative retirée
+  `PathCodec.decode_first_segment`, supprimée). Décode/valide chaque segment comme `PathCodec.decode`, mémoïsé
+  par segment (`(prev_tag,segment_chiffré) -> (segment_clair,tag)`, borné comme le mémo existant).
+- **`_treehist_listing`** : `snap_rows` (racine, base chiffrée) utilise `decode_path_verified` ; `del_rows`
+  filtre la valeur stockée (comptage de `/`) avant tout décodage, ne décode et n'interroge que les candidats
+  structurellement enfants directs — ce filtre s'applique à tout préfixe (racine ou non), pas seulement à la
+  racine.
+- **`CodecSelfTest`** : nouveau contrôle d'altération à 2 niveaux de profondeur sur `TreeHist` racine (mirroir
+  de `_tamper_search`).
+- **`perf_bench()`** : nouvelle mesure LIKE-vs-intervalle-d'index (« Plan d'exécution ») ; `-K` sans `-n`
+  explicite migre désormais un jeu réduit dédié au lieu du jeu par défaut ; docstring de valeur de retour
+  corrigée (0 si tout s'exécute, 1 si une mesure a levé une exception — ce que le code a toujours fait).
+- **Architecture Spine** (Deferred) : `TreeFind`/`DuIdx -R`/`IdxTop` portent désormais leurs chiffres mesurés
+  (décision : documenter et différer, pas de correctif) ; croissance des bases (×1,87) et taille des lots de
+  migration (~85–115 ms/lot) marquées résolues par la mesure.
+
+## borgHelper 1.0.105 — chiffrement des chemins SQLite, story 6 : mesures de performance (PerfBench) — 2026-09-23
+
+TECHNICAL.md listait, depuis la Story 2, une dizaine de points « à mesurer en Story 6 » sur une base réaliste
+(jusqu'à plusieurs Go) — aucun n'avait de chiffre réel, et le seul chiffre publié (170 ms → 1 ms) provenait
+d'une table jetable non reproductible. Cette livraison ajoute `PerfBench`, un harnais reproductible qui
+construit un jeu de données synthétique par `INSERT`/`executemany` directs (jamais un vrai `borg backup`,
+bien trop lent pour représenter plusieurs Go en temps de test raisonnable), sur des bases temporaires plain
+et chiffrée, et chronomètre chaque commande listée. Les chiffres réels remplacent les estimations dans
+TECHNICAL.md. Vérifié par `CodecSelfTest` (279/279, inchangé) et `PerfBench` (jeu par défaut, 250 000 lignes
+`diff_index` par mode, ~37 s, aucun résidu temporaire avant/après).
+
+- **`PerfBench [-n <taille>] [-K]`.** Comme `CodecSelfTest`, s'exécute avant `BorgHelper()` (aucune vraie
+  base/rc touché). `-n` : nombre de lignes `diff_index` visé par mode (défaut 250 000 — voir TECHNICAL.md pour
+  la justification de cet ordre de grandeur). `-K` : ajoute le coût KDF par niveau (`light`/`standard`/`strong`)
+  et une mesure réelle `DbEncrypt`/`DbDecrypt` sur un jeu réduit (30 000 lignes, pour rester rapide — le coût
+  KDF et la migration par lot ne dépendent pas de la taille du jeu complet pour donner un chiffre représentatif).
+  Chronomètre `TreeHist` (racine et sous-répertoire profond), `TreeFind`, `Search`, `DuIdx -R`, `IdxTop`,
+  `DiffTop`, `_find_last_archive_with_file`, `IdxPurge -D`, et le mémo de décodage (`DbCodec._memo`, passe
+  froide vs mémoïsée), en mode `plain` et `siv1`, sur les mêmes deux bases temporaires. Tout fichier temporaire
+  nettoyé en `finally` (succès ou échec).
+- **4 sites confirmés problématiques par la mesure** (seuil : >1 s sur le jeu de référence, pour une commande
+  de lecture interactive) : `TreeHist` à la racine en base chiffrée (5,7 s — `SELECT DISTINCT path` sans borne
+  puis décodage de tout `diff_index`), `TreeFind` motif large à la racine (~1,05 s dans les deux modes —
+  fenêtre `ROW_NUMBER()` qui décode tout le sous-arbre avant filtrage), `DuIdx` motif large `-R` (~1,3–1,5 s —
+  mode brut sans agrégation SQL), `IdxTop` en base chiffrée (1,04 s). Aucun correctif appliqué : conformément
+  aux Boundaries de la story, la décision (corriger maintenant vs documenter et différer) est posée à
+  l'utilisateur plutôt que décidée ici. Détail et chiffres complets : TECHNICAL.md, section « Mesures PerfBench ».
+- **Points du Deferred de l'Architecture Spine levés par la mesure** : `_MIGRATE_BATCH=2000` (~85–115 ms/lot,
+  jugé correct, aucun changement proposé) ; coût KDF (20–70 ms/appel selon niveau, cohérent avec l'estimation
+  AD-4) ; croissance de la base (×1,87 mesurée sur ce jeu, plain → chiffré, dans l'ordre de grandeur estimé
+  2–2.5×).
+- Le chiffre jetable 170 ms → 1 ms (Story 2) est retiré de TECHNICAL.md ; la section « Plan d'exécution »
+  renvoie désormais aux mesures réelles de `PerfBench`.
+
 ## borgHelper 1.0.104 — chiffrement des chemins SQLite, story 5 : migration (DbEncrypt/DbDecrypt/DbRekey/DbStatus) — 2026-09-22
 
 Dernière pièce du chiffrement des chemins : les Stories 1-4 posaient tout le mécanisme (codec, en-tête,

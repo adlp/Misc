@@ -720,38 +720,214 @@ chiffrées (jamais en `plain`, il changerait les `LIKE` de nom qui y restent).
 `_snap_notin` (égalité entre `diff_index` et la vue, même DEK) et `_migrate_archive_snapshot` sont inchangés.
 
 **Plan d'exécution.** L'intervalle utilise `idx_diff_nick_path` sur `diff_index` et `idx_snapfile_nick_path` sur `snapshot_file`
-(mesuré : ~1 ms contre ~170 ms pour l'ancien `LIKE` sur 1,5 M de lignes ; contrôlé par `CodecSelfTest` via `EXPLAIN QUERY PLAN`).
+(contrôlé par `CodecSelfTest` via `EXPLAIN QUERY PLAN`). Le chiffre jetable 170 ms → 1 ms de la version précédente de cette
+section (table jetable non reproductible, Story 2) est **remplacé** par une mesure réelle et reproductible, produite par
+`PerfBench` sur le même jeu que ses autres mesures (`-c PerfBench`, section « Plan d'exécution » de sa sortie) : sur
+`diff_index` (250 000 lignes, `plain`), un `LIKE 'préfixe%'` (plan pré-AD-8) prend **24,5 ms** contre **0,15 ms** pour
+l'intervalle d'index actuel (`path>=? AND path<?`) sur le même préfixe et les mêmes lignes trouvées (25) — soit **~163×**,
+même ordre de grandeur que le chiffre jetable qu'il remplace, mais reproductible sur les fixtures du projet (rejouable :
+`borgHelper -c PerfBench`).
 **Constat sur la vue `archive_snapshot_v`** : elle est définie par `archive_snapshot JOIN snapshot_file`, et le plan balaie
 `archive_snapshot` par `(nick, archive)` puis filtre le chemin — l'index de chemin n'y est pas utilisé. C'est le comportement
 d'avant ; pas de régression, pas de gain promis, plan non réécrit ici.
 
-**Sites à mesurer en Story 6** (coût du décodage sur base chiffrée réaliste, jusqu'à 3 Go) :
-- `TreeHist` à la racine : lit tout l'instantané pour en tirer les enfants directs, et les chemins distincts de `diff_index`
-  du sous-arbre pour les supprimés (piste : saut d'index par enfant) ; le même N+1 (une requête `MIN(archive_new_date)`
-  par enfant direct candidat pour trouver son dernier événement) se répète à chaque appel, à la racine comme ailleurs ;
-- `TreeFind`, `Search`, `DuIdx` (motif de nom ou préfixe large), `IdxTop`, `DiffTop` : balayage et décodage en Python ;
-- `_treefind_listing` : la fenêtre `ROW_NUMBER() OVER (PARTITION BY path ...)` des chemins supprimés porte sur
-  l'intervalle du préfixe demandé, mais décode et compare TOUT le sous-arbre concerné (pas seulement les correspondances
-  du motif) avant de filtrer par nom — contrairement à `_treehist_listing`, qui limite sa fenêtre aux enfants directs ;
-- `IdxPurge` avec glob sans répertoire littéral, `IDX_INCLUDE` (complément) : lecture et décodage de tout `diff_index` ;
-- `_find_last_archive_with_file` avec glob : parcours sans `LIMIT`, décode toutes les lignes candidates de
-  `archive_snapshot_v` puis de `diff_index` sans sortir tôt même après avoir trouvé une correspondance plus ancienne ;
-- vue `archive_snapshot_v` (constat ci-dessus) ;
-- **politique du mémo de décodage (`DbCodec._memo`).** Vidage intégral à 262 144 entrées (pas de LRU) : un balayage
-  mono-passe sur une base de plusieurs Go (`DuIdx`/`IdxTop`/`Search` sans périmètre étroit) revoit rarement le même
-  chemin stocké, donc le mémo n'apporte quasiment aucun gain de cache-hit dans ce cas précis — son bénéfice réel est
-  pour les commandes à re-décodage répété du même chemin (`_treehist_listing`/`_events_for`, appels successifs sur la
-  même session). Par ailleurs le mémo (et le `DbCodec` qui le porte, mis en cache par `_CODEC_CACHE`) contient des
-  chemins **en clair** et vit pour toute la durée du processus : à mesurer/documenter comme surface si un processus
-  long-vivant (ex. `borgHelperWWW`) est amené à traiter des passphrases/nicks différents dans sa durée de vie.
-
 Correction associée : `_duidx_collect_global` place la plage d'archives avant le `GROUP BY` (elle le suivait, ce qui la
 rendait sans effet et regroupait tout sous un seul type).
 
-**Mesure du gain d'index (170 ms → ~1 ms, Intent ci-dessus).** Chiffre obtenu sur une table SQLite jetable et synthétique
-de 1,5 M lignes construite pour l'occasion (pas incluse dans ce dépôt, pas reproductible depuis son contenu actuel) —
-un ordre de grandeur indicatif de l'écart `LIKE` de préfixe vs intervalle sur l'index `(nick, path)`, pas une mesure
-répétable sur les fixtures du projet. À re-mesurer sur une base réelle en Story 6.
+---
+
+## Mesures PerfBench (1.0.105, chiffrement story 6)
+
+**`PerfBench`** (`-c PerfBench [-n <taille>] [-K]`, section « PerfBench » de `borgHelper`, juste après `CodecSelfTest`)
+remplace les estimations qualitatives de la section précédente par des chiffres réels et reproductibles. Comme
+`CodecSelfTest`, elle s'exécute **avant** `BorgHelper()` : aucune vraie base ni vrai rc n'est touché. Jeu de données
+synthétique construit par `INSERT`/`executemany` directs (`_pb_build_dirs`/`_pb_build_paths`/`_pb_build_db`), **jamais**
+via un vrai `borg backup` (bien trop lent pour représenter plusieurs Go en temps de test raisonnable) : arborescence de
+profondeur variable (jusqu'à 7 niveaux), noms de fichiers réutilisés dans des répertoires différents, 300 fichiers à la
+racine supprimés à la dernière paire d'archives (supprimés récupérables). Snapshot complet uniquement sur la dernière
+des 5 archives synthétiques (`pb-a0`..`pb-a4`) ; le churn (`added`/`modified`/`removed`, pondéré 30/55/15%) est réparti
+sur les 4 paires. Chaque commande listée dans l'Intent de la story est chronométrée (`time.perf_counter`) en mode
+`plain` et `siv1`, sur les DEUX mêmes bases temporaires (nettoyées en `finally`, succès ou échec). `-K` ajoute le coût
+KDF par niveau et une mesure `DbEncrypt`/`DbDecrypt` réelle sur le jeu.
+
+**Taille par défaut (`-n`, défaut 250 000 lignes `diff_index` par mode).** Choix pragmatique, pas un chiffre arbitraire :
+à cette taille, la base `diff.db` chiffrée mesurée pèse ~204 Mio pour 83 333 chemins snapshotés + 250 000 lignes
+`diff_index`, soit ~642 octets/ligne en moyenne tables+index confondus (204 Mio / 333 333 lignes au total ; ~856
+octets/ligne si on rapporte le même total à `diff_index` seul, 204 Mio / 250 000 — l'écart vient de ce que `snapshot_file`
+et les index ne se répartissent pas proprement par ligne `diff_index` ; ordre de grandeur volontairement approximatif,
+pas une décomposition précise par table) — un ordre de grandeur proportionnellement comparable à une base réelle de
+plusieurs Go une fois les tables de stats et le WAL comptés, tout en gardant chaque
+mesure de cette liste sous la minute (build + 9 commandes × 2 modes + mémo ≈ 37 s au total). Une base réellement à
+3 Go impliquerait un jeu ~15× plus gros (≈ 3,7 M lignes `diff_index`) : hors de portée d'une commande de vérification
+CI/dev en quelques secondes — `-n` permet de monter à cette échelle à la demande pour une mesure ponctuelle plus longue,
+sans que ce soit le défaut. `-K` est testé séparément à une taille réduite (30 000 lignes) : le coût KDF et la migration
+ne dépendent pas de la taille de la même façon (un seul appel KDF, une migration linéaire par lot) et n'ont pas besoin
+du jeu complet pour donner un chiffre représentatif.
+
+**Résultats mesurés** (défaut, `-n 250000`, 83 333 chemins, 4 166 répertoires ; matériel de développement — ordre de
+grandeur, pas une garantie de SLA) :
+
+| Commande | plain | chiffré (siv1) | Seuil (>1 s) dépassé |
+|---|---:|---:|---|
+| `TreeHist` racine (`-b ALL`) | 872 ms | 5 675 ms *(avant correctif — voir ci-dessous)* | chiffré |
+| `TreeHist` sous-répertoire profond (`-b ALL`) | 909 ms | 959 ms | non |
+| `TreeFind` motif large racine (`*.log`) | **1 034 ms** | **1 070 ms** | les deux |
+| `Search` motif large (`*.log`, `-b ALL`) | 209 ms | 868 ms | non |
+| `DuIdx` motif large -R (`*`, `-b ALL`) | **1 317 ms** | **1 497 ms** | les deux |
+| `IdxTop` | 874 ms | **1 037 ms** | chiffré |
+| `DiffTop` | 310 ms | 357 ms | non |
+| `_find_last_archive_with_file` (glob) | 1.9 ms | 1.5 ms | non |
+| `IdxPurge -D` motif large (`*.log`) | 50.5 ms | 498 ms | non |
+
+`DbCodec.decode_path` (mémo, 20 000 chemins échantillonnés) : 1re passe (froid) 1 056 ms, 2e passe (mémo chaud, mêmes
+chemins) 2.5 ms — **415×**. Confirme la lecture qualitative de la section précédente : le mémo est très efficace pour
+un re-décodage répété du même chemin (`TreeHist`/`_events_for`), mais un balayage mono-passe sur motif large
+(`DuIdx`/`Search`/`IdxTop`) ne revoit quasiment jamais le même chemin stocké — son cache-hit y est proche de zéro,
+la totalité du coût de décodage y est donc payée une fois par ligne, sans économie possible par ce mécanisme.
+
+**Croissance de la base** (Deferred de la spine) : 109 Mio (`plain`) → 204 Mio (`siv1`) sur ce jeu, soit ×1.87 — dans
+l'ordre de grandeur estimé (2–2.5×), légèrement en dessous.
+
+**`-K` (jeu réduit, `-n 30000`, pour rester rapide)** :
+
+| Mesure | Valeur |
+|---|---:|
+| KDF `light` | 19.2 ms/appel |
+| KDF `standard` (défaut) | 32.7 ms/appel |
+| KDF `strong` | 67.0 ms/appel |
+| `DbEncrypt` (lots `_MIGRATE_BATCH=2000`, 40 000 lignes) | 1.7 s |
+| `DbDecrypt` (même jeu) | 2.3 s |
+
+Le coût KDF mesuré est directement celui payé à **chaque** requête `borgHelperWWW` sur base chiffrée (Code Map,
+`_exec_borghelper`/`run_borghelper` : subprocess par appel, aucune mémoïsation possible entre requêtes) : de l'ordre
+de 20 à 70 ms selon le niveau configuré. Le `standard` mesuré (32,7 ms) est ~35% *sous* l'estimation de l'Architecture
+Spine (AD-4, ~50 ms) — pas une incohérence : c'est une mesure sur UN matériel de développement précis (dépend fortement
+du CPU et de l'implémentation `scrypt` d'OpenSSL disponible), alors que l'estimation d'AD-4 était volontairement prudente
+(majorante). Pas de dégradation surprise dans un sens comme dans l'autre. `_MIGRATE_BATCH=2000` : ~85 ms/lot en chiffrement, ~115 ms/lot en
+déchiffrement sur ce jeu — taille de lot jugée correcte (pas de blocage long visible par lot), **aucun changement
+proposé** ; ce point du Deferred de la spine est levé par cette mesure.
+
+**Sites confirmés problématiques par la mesure (seuil de jugement dépassé, question posée avant tout correctif —
+Boundaries de la story) :**
+- **`TreeHist` à la racine, base chiffrée — CORRIGÉ** (accord explicite de l'utilisateur). Voir « Correctif :
+  `TreeHist` à la racine » ci-dessous pour le diagnostic, le correctif appliqué et les chiffres avant/après.
+- **`TreeFind` motif large à la racine** — 1,03–1,07 s dans les deux modes (l'écart plain/chiffré est faible ici,
+  contrairement à `TreeHist` : la fenêtre `ROW_NUMBER() OVER (PARTITION BY path ...)` décode tout le sous-arbre avant
+  filtrage par motif, coûteuse même en `plain`). **Documenté, différé** (Deferred de l'Architecture Spine) — pas de
+  correctif dans cette livraison. **Question ouverte pour une story future** : `_treefind_listing` utilise exactement
+  le même motif `ROW_NUMBER() OVER (PARTITION BY path ...)` que celui essayé (et mesuré PLUS LENT que l'original) sur
+  `_treehist_listing`/`del_rows` — voir « Correctif : `TreeHist` à la racine » ci-dessous. Rien ne garantit que ce même
+  motif soit un bon choix ICI par analogie ; il n'a pas été remis en cause ni re-mesuré isolément dans cette livraison
+  (périmètre non couvert par la décision utilisateur), seulement documenté comme un point à vérifier avant toute
+  story qui toucherait `TreeFind`.
+- **`DuIdx` motif large `-R`** — 1,32–1,50 s dans les deux modes : balayage complet sans agrégation SQL (mode brut par
+  conception). **Documenté, différé** — à noter : `-R` est le mode brut explicitement documenté comme "jamais
+  groupé" ; le mode agrégé par défaut (`DuIdx` sans `-R`) n'a pas été mesuré séparément dans cette liste et serait
+  vraisemblablement plus rapide (agrégation SQL), à vérifier si cette piste est retenue plus tard.
+- **`IdxTop`, base chiffrée** — 1,04 s (0,87 s en `plain`, sous le seuil) : même balayage `_duidx_collect` que `DuIdx`,
+  coût de décodage supplémentaire en chiffré qui fait juste franchir le seuil. **Documenté, différé.**
+
+`TreeFind`/`DuIdx -R`/`IdxTop` : décision de l'utilisateur — pas de correctif, documentation seule (voir aussi
+`ARCHITECTURE-SPINE.md`, section Deferred, qui porte désormais ces trois mêmes chiffres) : un fix réel demanderait un
+index de recherche par nom (type FTS) sur les chemins décodés, hors périmètre de cette story.
+
+---
+
+### Correctif : `TreeHist` à la racine (1.0.106)
+
+**Diagnostic réel** (la note qualitative de la Story 2 n'avait identifié qu'une partie du problème). `_treehist_listing`
+fait deux lectures pleine-table à la racine (`prefix=''`, où `_psel_under` ne pose aucune borne — AD-8 interdit tout
+prédicat sur le nom en SQL, donc aucun filtre de profondeur n'est possible côté SQL sur une valeur chiffrée) :
+
+1. **`snap_rows`** (l'instantané courant) : décode le chemin **complet** de chacun des 83 333 fichiers de l'instantané
+   rien que pour en tirer le nom du premier niveau (un fichier profond ne sert qu'à marquer son répertoire de tête
+   comme « a un enfant ») — mesuré isolément (même connexion, même jeu, 5 essais, médiane) : **4 835 ms**.
+2. **`del_rows`** (les supprimés récupérables) : `SELECT DISTINCT path FROM diff_index WHERE nick=?` sans borne,
+   décode **chaque chemin distinct** de tout `diff_index` avant de filtrer les chemins sans `/`, puis une requête par
+   candidat survivant (peu nombreux, ~300 sur ce jeu — **jamais** le goulot, contrairement à l'hypothèse initiale)
+   pour son dernier événement — mesuré isolément : **4 365 ms** (250k lignes `diff_index`), **16 649 ms** (1M lignes).
+
+**Premier essai, rejeté par la mesure.** Remplacer le `SELECT DISTINCT` + requête par candidat de `del_rows` par une
+seule requête fenêtrée `ROW_NUMBER() OVER (PARTITION BY path ...)` (même forme que `_treefind_listing`) a été mesuré
+**plus lent** : 1 301 ms (250k) / 5 494 ms (1M) — le tri qu'exige la fenêtre sur tout `diff_index` du périmètre coûte
+plus cher que les ~300 requêtes ponctuelles (déjà bon marché, indexées) qu'il économise. Non retenu.
+
+**Correctif retenu pour `del_rows`.** AD-3 ne chiffre pas le séparateur `/` entre segments (« Segments chiffrés joints
+par `/` ») : la profondeur/structure d'un chemin est donc directement lisible sur la valeur **stockée**, sans la
+décoder — une fuite déjà explicitement acceptée (Deferred de l'Architecture Spine : « structure (profondeur,
+longueurs) »). Ni AD-8 ni AD-3 n'interdisent d'exploiter cette structure déjà publique pour éviter un décodage inutile
+(AD-8 interdit un *prédicat SQL* sur le nom ; ce correctif ne touche pas le SQL, il évite un appel Python coûteux).
+Filtre la valeur stockée (`stored[skip:]`, test `'/' in rest`) **avant** `_path_decode` — seuls les candidats
+structurellement enfants directs sont décodés (et interrogés pour leur dernier événement, requête inchangée). Mesuré
+isolément : **77,7 ms** (250k) / **285 ms** (1M) — **×56 à ×58** par rapport à l'original, stable à l'échelle (croît
+avec le coût du `SELECT DISTINCT`, pas avec le décodage). Ce filtre s'applique de la même façon quel que soit le
+préfixe (racine ou non, uniquement conditionné par `conn.codec is not None`) — pas seulement à la racine ; pour un
+préfixe non vide il n'a simplement aucun effet mesurable, `_psel_under` bornant déjà le `SELECT DISTINCT` à un petit
+sous-arbre avant même ce filtre.
+
+**`snap_rows` : premier correctif tenté, RETIRÉ après revue — régression de sécurité.** Une première version décodait
+seulement le premier segment de chaque chemin stocké (nouvelle méthode `decode_first_segment`, un seul HMAC/SHAKE,
+jamais proportionnel à la profondeur) — mesurée à 808 ms (250k, ×6 par rapport à l'original), mais qui ne validait
+QUE le tag du premier segment : une altération d'un segment à 2 niveaux de profondeur ou plus dans
+`snapshot_file.path` serait passée inaperçue en base chiffrée, alors que `TreeHist` à la racine la détectait de façon
+fiable avant cette story (même garantie que `Search`, testée par `_tamper_search`). Revue post-implémentation :
+régression réelle, pas seulement un trou de couverture de test — **retiré**, `decode_first_segment` supprimé du code.
+
+**Correctif retenu pour `snap_rows`.** Nouvelle méthode `DbCodec.decode_path_verified(stored)` : décode et valide
+CHAQUE segment de CHAQUE chemin, comme `PathCodec.decode`/`_path_decode` (même garantie de détection d'altération, à
+toute profondeur) — mais mémoïse par **segment partagé** (`(prev_tag, segment_chiffré) -> (segment_clair, tag)`,
+borné comme le mémo existant) : des chemins qui partagent un même préfixe de répertoires (le cas courant dans une
+arborescence réelle) ne refont pas le travail crypto déjà fait pour ce préfixe. Aucune concession sur la sécurité,
+contrairement à la tentative précédente. Mesuré isolément (même connexion/jeu, 5 essais, médiane) : **1 418 ms**
+(250k, 83 333 fichiers) — **×3,4** par rapport à l'original (4 835 ms), moins spectaculaire que la tentative retirée
+(×6) mais sans compromis de sécurité. Un contrôle `CodecSelfTest` dédié (mirroir de `_tamper_search`) corrompt
+spécifiquement le DEUXIÈME segment d'un chemin imbriqué (premier segment intact) et vérifie que `TreeHist` à la
+racine échoue proprement (`DbCodecError` attrapée, pas de traceback) — ce contrôle aurait échoué avec
+`decode_first_segment`, il passe avec `decode_path_verified`.
+
+**Bout en bout, `TreeHist` à la racine (`PerfBench`, 250k lignes `diff_index`, 3 exécutions complètes du processus —
+plus bruitées que les mesures isolées ci-dessus, la construction du jeu et le reste de la commande borg-helper y
+contribuent aussi) :**
+
+| | avant correctif | après correctif |
+|---|---:|---:|
+| `plain` | 872–1 538 ms *(bruit machine, code plain inchangé par ce correctif)* | 883–1 379 ms *(bruit machine, idem)* |
+| `siv1` (chiffré) | 5 675–7 607 ms | **1 927–2 182 ms** |
+
+Facteur d'amélioration en chiffré : entre **×2,6** (borne basse avant / borne haute après, 5 675/2 182) et **×4,0**
+(borne haute avant / borne basse après, 7 607/1 927) selon les exécutions retenues — une plage, pas un chiffre unique,
+la variance d'une exécution complète à l'autre (bruit machine partagé, construction du jeu incluse) étant significative.
+
+**Toujours au-dessus du seuil de jugement après correctif** (~2 s > 1 s). Les deux points corrigés représentent
+ensemble ~1 496 ms sur ce jeu (77,7 ms + 1 418 ms) ; le reste (~500 ms) provient d'un coût non touché par cette
+livraison : pour chaque répertoire de tête et pour l'entrée `.` elle-même, `_events_for(full_path, recursive=True)`
+lance une requête `DISTINCT archive_new, archive_new_date` bornée à son sous-arbre (`_psel_under`) — l'appel pour `.`
+(`recursive=True`, préfixe vide) n'a lui-même aucune borne et balaie tout `diff_index` une nouvelle fois. Ce site n'a
+pas été mesuré isolément ni corrigé dans cette livraison (hors du périmètre décidé) : **documenté ici, à considérer
+séparément** si `TreeHist` à la racine doit repasser sous le seuil. `TreeHist` sous-répertoire profond n'utilise à
+aucun moment `snap_rows`-racine ni `decode_path_verified` (branche `else`, `_path_decode` inchangé) et reste sous le
+seuil ; seul le filtre structurel de `del_rows` s'y applique aussi (voir ci-dessus), sans effet mesurable.
+
+Aucune régression : `CodecSelfTest` toujours au vert après ce correctif (280/280, dont le nouveau contrôle
+d'altération à 2 niveaux de profondeur et la parité `TreeHist` plain/chiffré sur plusieurs préfixes dont la racine).
+
+**Sites mesurés et non problématiques** (sous le seuil, ou dégradation attendue/modérée) : `TreeHist` sous-répertoire
+profond, `Search`, `DiffTop`, `_find_last_archive_with_file`, `IdxPurge -D` (498 ms en chiffré reste sous le seuil,
+mais x10 par rapport au `plain` — à re-surveiller si un motif glob large est utilisé sur une base de plusieurs Go, cf.
+« Limite connue de cette mesure » ci-dessous : pas de garantie que cet écart reste x10 à plus grande échelle, pas de
+correctif proposé ici faute de dépassement du seuil sur le jeu de référence).
+Note de mesure : `IdxPurge -D` n'écrit jamais dans la base pendant `PerfBench` — vérifié par lecture du code
+(`idxpurge()` : la branche `dryrun` retourne (`conn.close(); return`) avant tout `DELETE`/`UPDATE`/`conn.commit()`) —
+son chronométrage n'est donc pas faussé par un coût d'écriture (WAL/journal) qu'un vrai dry-run n'aurait pas non plus.
+
+**Limite connue de cette mesure** : la story demande aussi de signaler « une dégradation qui grandit plus vite que
+linéairement avec la taille de la base » — `PerfBench` mesure un seul point de taille par défaut (`-n` en fixe un
+autre à la demande) ; établir la classe de complexité réelle demanderait plusieurs tailles chronométrées et comparées,
+non automatisé dans cette livraison. `TreeFind`/`DuIdx -R`/`IdxTop` (documentés, différés) et `IdxPurge -D` (sous le
+seuil mais à re-surveiller, ci-dessus) sont confirmés/notés par le seuil absolu (>1 s) ou son approche, pas par une
+mesure de croissance super-linéaire — `TreeHist` à la racine, elle, a été mesurée à deux tailles (250k et 1M lignes
+`diff_index`, voir « Correctif : `TreeHist` à la racine ») et s'y comporte de façon globalement linéaire, avant comme
+après correctif.
 
 ---
 

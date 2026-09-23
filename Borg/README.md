@@ -807,6 +807,34 @@ fois par base.
 Travaille uniquement sur des bases temporaires : aucune vraie base ni aucun vrai rc n'est lu. Une ligne `OK`/`FAIL` par
 contrôle ; code de sortie non nul au moindre échec.
 
+---
+
+### `PerfBench`
+
+```bash
+borgHelper -c PerfBench
+borgHelper -c PerfBench -n 500000
+borgHelper -c PerfBench -K
+```
+
+Génère un jeu de données synthétique réaliste (`INSERT`/`executemany` directs — jamais de vrai `borg backup`, bien trop
+lent pour représenter plusieurs Go) sur des bases temporaires `plain` et chiffrée, puis chronomètre `TreeHist` (racine
+et sous-répertoire profond), `TreeFind`, `Search`, `DuIdx -R`, `IdxTop`, `DiffTop`, `_find_last_archive_with_file` et
+`IdxPurge -D` dans les deux modes, ainsi que le mémo de décodage (`DbCodec._memo`, passe froide vs mémoïsée). Imprime
+un tableau de durées et signale toute mesure dépassant 1 s (seuil de jugement documenté dans TECHNICAL.md).
+
+`-n <taille>` : nombre de lignes `diff_index` visé par mode (défaut 250 000, voir TECHNICAL.md pour la justification
+de cet ordre de grandeur). `-K` : ajoute le coût KDF par niveau (`light`/`standard`/`strong`) et une mesure réelle
+`DbEncrypt`/`DbDecrypt` — sur un jeu réduit dédié (30 000 lignes) si `-n` n'est pas donné explicitement, pour rester
+rapide (« plus lent, optionnel ») ; `-n` donné explicitement (même combiné à `-K`) gouverne aussi cette mesure.
+
+Code de sortie non nul si une mesure a levé une exception (comme `CodecSelfTest`, sinon 0 — y compris quand une
+mesure dépasse le seuil de jugement, qui n'est qu'un signal imprimé, pas un échec).
+
+Comme `CodecSelfTest`, travaille uniquement sur des bases temporaires (aucune vraie base ni vrai rc), nettoyées en fin
+d'exécution même en cas d'erreur. Chiffres de référence et sites confirmés problématiques : TECHNICAL.md, section
+« Mesures PerfBench ».
+
 ### `CacheInfo` / `CacheClean`
 
 ```bash
