@@ -2,7 +2,7 @@
 
 #/*
 #* whosshkey look like last but for ssh key :)
-#* Copyright (C) 2024 Antoine DELAPORTE
+#* Copyright (C) 2024-2026 Antoine DELAPORTE
 #*
 #* This program is free software: you can redistribute it and/or modify
 #* it under the terms of the GNU General Public License as published by
@@ -18,14 +18,170 @@
 #* along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #*/
 
+set -euo pipefail
 
-grep ": Accepted publickey for " /var/log/auth.log | tr -s "\t " " " | cut -d" " -f1-4,9,11,13,15,16 | while read d1 d2 d3 d4 login ip port rsa cles
-    do
-    holo=$(getent passwd $login | cut -d: -f6)
-    grep -v "^#" $holo/.ssh/authorized_keys | sed -s "s/.*\(ssh-.*\)/\1/g" | sort -u | ssh-keygen -lf - | while read null clef com
-        do
-            if [ "$cles" = "$clef" ]; then
-                echo $d1 $d2 $d3 $d4: $login $ip:$port $com
-            fi
-        done
+usage() {
+    cat <<EOF
+Usage: whosshkey [-H host] [-w seconds] [last options...]
+
+  -H host   Run against a remote host over ssh (needs sudo there).
+  -w sec    Matching window in seconds between sshd auth log and last (default: 10).
+
+Needs root (or sudo) to read other users' authorized_keys and system logs.
+EOF
+}
+
+WINDOW=10
+REMOTE_HOST=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -H|--host)
+            REMOTE_HOST="$2"; shift 2 ;;
+        -w|--window)
+            WINDOW="$2"; shift 2 ;;
+        -h|--help)
+            usage; exit 0 ;;
+        --)
+            shift; break ;;
+        *)
+            break ;;
+    esac
+done
+
+if [ -n "$REMOTE_HOST" ]; then
+    exec ssh -t "$REMOTE_HOST" "sudo bash -s -- -w $WINDOW $*" < "$0"
+fi
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "warning: not root, other users' authorized_keys/logs may be unreadable" >&2
+fi
+
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+AUTH_EVENTS="$TMPDIR/auth_events"   # epoch<TAB>user<TAB>ip<TAB>fingerprint
+KEYMAP="$TMPDIR/keymap"             # fingerprint<TAB>comment
+LAST_OUT="$TMPDIR/last_out"         # raw last lines, in original order
+
+# ---- 1. collect "Accepted publickey" events, from auth.log or journalctl ----
+extract_accepted() {
+    # reads raw sshd log lines on stdin, each optionally iso-timestamped or syslog-timestamped
+    awk '
+        /Accepted publickey for/ {
+            line=$0
+            if (match(line, /Accepted publickey for [^ ]+ from [^ ]+ port [0-9]+/)) {
+                seg = substr(line, RSTART, RLENGTH)
+                split(seg, a, " ")
+                user = a[4]; ip = a[6]
+            } else { next }
+            fp = ""
+            if (match(line, /(SHA256:[^ ]+|MD5:[^ ]+)/)) {
+                fp = substr(line, RSTART, RLENGTH)
+            }
+            # timestamp: either leading ISO8601 (journalctl -o short-iso) or syslog "Mon DD HH:MM:SS"
+            ts = ""
+            if (match($0, /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+                ts = substr($0, RSTART, RLENGTH)
+                cmd = "date -d \"" ts "\" +%s"
+            } else {
+                ts = $1" "$2" "$3
+                cmd = "date -d \"" ts "\" +%s"
+            }
+            cmd | getline epoch
+            close(cmd)
+            print epoch "\t" user "\t" ip "\t" fp
+        }
+    '
+}
+
+if [ -r /var/log/auth.log ]; then
+    cat /var/log/auth.log /var/log/auth.log.1 2>/dev/null | extract_accepted > "$AUTH_EVENTS" || true
+elif command -v journalctl >/dev/null 2>&1; then
+    journalctl -u ssh -u sshd --no-pager -o short-iso 2>/dev/null | extract_accepted > "$AUTH_EVENTS" || true
+else
+    : > "$AUTH_EVENTS"
+fi
+
+# ---- 2. build fingerprint -> comment map from every reachable authorized_keys ----
+: > "$KEYMAP"
+{
+    echo /root/.ssh/authorized_keys
+    getent passwd | awk -F: '$6!="" {print $6"/.ssh/authorized_keys"}'
+} | sort -u | while read -r akfile; do
+    [ -r "$akfile" ] || continue
+    grep -v '^\s*#' "$akfile" | grep -v '^\s*$' | while read -r keyline; do
+        # strip leading options, keep from "ssh-... / ecdsa-... / sk-..." onward
+        pubpart=$(echo "$keyline" | sed -E 's/.*(ssh-[a-z0-9]+|ecdsa-[a-z0-9-]+|sk-[a-z0-9@.-]+) /\1 /')
+        out=$(echo "$pubpart" | ssh-keygen -lf - 2>/dev/null) || continue
+        fp=$(echo "$out" | awk '{print $2}')
+        comment=$(echo "$out" | awk '{$1="";$2="";$NF="";print}' | xargs)
+        [ -z "$comment" ] && comment="no-comment"
+        printf '%s\t%s\n' "$fp" "$comment" >> "$KEYMAP"
     done
+done
+
+# ---- 3. get last output (keep original order/format), plus epoch per line ----
+last -Fiw "$@" > "$LAST_OUT"
+
+# ---- 4. correlate and print ----
+awk -v window="$WINDOW" -v keymapfile="$KEYMAP" -v authfile="$AUTH_EVENTS" '
+    BEGIN {
+        FS="\t"
+        while ((getline line < keymapfile) > 0) {
+            split(line, kv, "\t")
+            keymap[kv[1]] = kv[2]
+        }
+        close(keymapfile)
+        n = 0
+        while ((getline line < authfile) > 0) {
+            split(line, ev, "\t")
+            n++
+            aepoch[n] = ev[1]; auser[n] = ev[2]; aip[n] = ev[3]; afp[n] = ev[4]
+            used[n] = 0
+        }
+        close(authfile)
+    }
+    {
+        raw = $0
+        if (raw ~ /^(wtmp begins|btmp begins)/ || raw ~ /^\s*$/) { print raw; next }
+        if (raw ~ /^(reboot|shutdown)/) { print raw "\t-"; next }
+
+        # parse: user, ip (numeric, from -i), then an ISO8601 login timestamp (from -F --time-format not set; -F gives "Wed Sep 23 10:03:12 2026")
+        n_fields = split(raw, f, /[ \t]+/)
+        user = f[1]
+        ip = ""
+        for (i = 2; i <= n_fields; i++) {
+            if (f[i] ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || f[i] ~ /:/ && f[i] ~ /^[0-9a-fA-F:]+$/) { ip = f[i]; break }
+        }
+        # find login timestamp: "Day Mon DD HH:MM:SS YYYY"
+        tsfield = -1
+        for (i = 2; i <= n_fields-4; i++) {
+            if (f[i+3] ~ /^[0-9]{2}:[0-9]{2}:[0-9]{2}$/ && f[i+4] ~ /^[0-9]{4}$/) { tsfield = i; break }
+        }
+        keystr = "-"
+        if (ip != "" && tsfield > 0) {
+            tsstr = f[tsfield]" "f[tsfield+1]" "f[tsfield+2]" "f[tsfield+3]" "f[tsfield+4]
+            cmd = "date -d \"" tsstr "\" +%s"
+            cmd | getline epoch
+            close(cmd)
+            best = -1; bestdiff = window + 1
+            for (i = 1; i <= n; i++) {
+                if (used[i]) continue
+                if (auser[i] != user) continue
+                if (aip[i] != ip) continue
+                diff = aepoch[i] - epoch
+                if (diff < 0) diff = -diff
+                if (diff <= window && diff < bestdiff) { bestdiff = diff; best = i }
+            }
+            if (best > 0) {
+                used[best] = 1
+                fp = afp[best]
+                if (fp != "" && (fp in keymap)) keystr = keymap[fp]
+                else if (fp != "") keystr = "clef inconnue (" fp ")"
+                else keystr = "clef inconnue (no-fp)"
+            }
+        }
+        print raw "\t" keystr
+    }
+' "$LAST_OUT" | column -t -s $'\t'
