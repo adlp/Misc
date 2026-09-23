@@ -10,6 +10,10 @@
 
 ## gitconfig
 
+### 1.4.0 — 2026-09-23
+- `addco` et `addcom` fonctionnent désormais comme `git add` : le point de départ est le répertoire courant (retour dans `$GIT_PREFIX` avant d'agir, car les alias shell s'exécutent à la racine), pathspecs relatifs (y compris `../..`), plusieurs arguments possibles, défaut = `.`.
+- `addcom` : périmètre limité au répertoire courant / aux chemins donnés (avant : tout le dépôt) ; boucle `git status | while read` remplacée par `git add -u`.
+
 ### 1.3.0 — 2026-09-22
 - `[includeIf "gitdir:~/.local/"]` remplace par `[include]` inconditionnel : `~/.local/gitconfig` est maintenant charge quel que soit l'emplacement du repo (pour `[safe]` et autres reglages locaux a la machine). Git ignore silencieusement un include vers un fichier absent.
 - Ajout des alias `whoami` (affiche l'identite git effective du repo courant) et `setid` (fixe interactivement `user.email`/`user.name` dans le `.git/config` local du repo courant, pour basculer pro/perso repo par repo). Git n'a pas de mecanisme natif de detection automatique via un fichier du worktree (seulement `gitdir`/`onbranch`/`remote url`) ; `setid` est le point d'entree explicite pour cet usage.

@@ -96,8 +96,8 @@
         }; f' -"
     allst= "!find -type d -name .git | while read gits ; do gith=$(dirname $gits); echo ======== $gith; cd $gith; git st;cd -; done"
     allget= "!find -type d -name .git | while read gits ; do gith=$(dirname $gits); echo ======== $gith; cd $gith; git g;cd -; done"
-    addco= "!f() { a=\"${1:-.}\"; case \"$a\" in /*) target=\"$a\" ;; *) target=\"${GIT_PREFIX:-}$a\" ;; esac; git diff -- \"$target\"; echo -n \"Make an comment for $target (or do CTR-C to stop): \"; read comm; git add -- \"$target\"; git commit -m \"$comm\"; }; f"
-    addcom= "!cd $(git root); git diff; git status -sb | grep -E '^ [DM]' ;echo 'Make a comment or do CTR-C to stop'; read comm; git status -sb | grep -E '^ [DM]' | while read m file; do echo $file;git add $file;done;git commit -m \"$comm\""
+    addco= "!f() { cd \"${GIT_PREFIX:-.}\" || exit 1; test $# -eq 0 && set -- .; git diff -- \"$@\"; echo -n \"Make an comment for $* (or do CTR-C to stop): \"; read comm; git add -- \"$@\"; git commit -m \"$comm\"; }; f"
+    addcom= "!f() { cd \"${GIT_PREFIX:-.}\" || exit 1; test $# -eq 0 && set -- .; git diff -- \"$@\"; git status -sb -- \"$@\" | grep -E '^ [DM]'; echo 'Make a comment or do CTR-C to stop'; read comm; git add -u -- \"$@\"; git commit -m \"$comm\"; }; f"
 #    logs = log --pretty="format:%H;%ci;%cn;%s" --name-status
     logs = log --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%ci,%cr) %C(bold blue)<%an>%Creset' --abbrev-commit --date=relative --name-only
 	lg = log --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset' --abbrev-commit --date=relative
