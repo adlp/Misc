@@ -1,5 +1,19 @@
 # Changelog
 
+## firewall-xgs dhcp_leases.py 1.1.0 / upload_cert.py 1.1.0 — 2026-09-24
+
+### Added
+- `firewall-xgs/dhcp_leases.py` : liste les baux DHCP du XGS via l'API XML
+  (tableau, `--json`, `--csv`, `--filter`, `--raw`). Entité par défaut
+  `DHCPLease`, non vérifiée sur un firewall réel (`--entity` pour en changer).
+- `firewall-xgs/upload_cert.py` : dépôt/mise à jour d'un certificat (PEM ou
+  PKCS12) via l'API, `--update`, `--upsert` (Get puis add/update),
+  `--dry-run`, `--debug`. Syntaxe d'upload (`Action=UploadCertificate`, champ
+  multipart `file`, `operation="update"`) non vérifiée sur un firewall réel.
+- Les deux scripts lisent leur config dans le home de l'utilisateur
+  (`~/.sophos-fw-block.conf`) : ordre `--config` > home (si présent) >
+  `/usr/local/etc/sophos-fw-block.conf`.
+
 ## firewall-xgs/fail2ban 2.6.2 (sophos_fw_block.py) / 1.2.2 (nginx_fw_block.py) — 2026-09-11
 
 ### Changed
