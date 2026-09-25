@@ -1287,6 +1287,17 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
    - **🗑 Supprimer** (`DelBkp`) : supprime définitivement cette archive — confirmation, 🔑 passphrase.
    - Bouton **⚡ Lancer Prune** en haut de la vue (portée sur tout le dépôt, pas une archive précise,
      selon `KEEP_*` de la conf) — confirmation, 🔑 passphrase.
+   - Sous le tableau, une carte **Évolution** avec trois graphiques Chart.js (chargés via
+     `/repohistory`/`/archivehistory`, en plus du tableau `/report` ci-dessus) : taille du dépôt dans
+     le temps (`unique_csize`/`total_size`/`total_csize`, un point par Bkp/Prune), gain Prune (delta
+     calculé côté navigateur, jamais stocké), et métriques par archive dans le temps
+     (`original_size`/`compressed_size`/`deduplicated_size`). Nick sans historique ou sans Prune :
+     message à la place du graphique concerné.
+     **Dépendance réseau** : ces graphiques chargent Chart.js depuis un CDN externe
+     (`cdn.jsdelivr.net`) — contrairement au reste du projet, conçu pour fonctionner entièrement
+     hors-ligne/en local, cette carte **Évolution** nécessite un accès réseau sortant vers ce CDN ; si
+     le CDN est inaccessible, un message d'erreur s'affiche à la place des graphiques (le reste de la
+     page reste fonctionnel).
 
 Cette page HTML elle-même n'est pas protégée par `X-API-Key` (elle ne contient aucun secret — la clé et
 les passphrases ne sont saisies et envoyées que depuis le navigateur, via `fetch()`) ; c'est l'API qui

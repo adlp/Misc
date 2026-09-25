@@ -1,5 +1,51 @@
 # Changelog — borgHelper
 
+## borgHelperWWW_ui.html 1.9.0 — graphiques Chart.js dans « Historique complet » — 2026-09-25
+
+Story 3 (spec-charts-evolution-sauvegardes) : `/repohistory`/`/archivehistory` (Story 2, 1.15.3)
+exposaient déjà les valeurs brutes nécessaires, mais rien dans l'UI ne les affichait dans le temps —
+seul un tableau texte (`/report`, valeurs déjà formatées, ex. « 1.23 GB », inutilisables pour un
+graphique) existait. Chart.js 4.5.1 chargé une seule fois en CDN
+(`cdn.jsdelivr.net/npm/chart.js@4.5.1`, avant le `<script>` principal, AD-7) — aucune
+`Content-Security-Policy` n'existe dans ce fichier, rien à ajuster côté `borgHelperWWW`.
+
+Nouvelle `.card` dans `#view-history`, sous le tableau existant, trois `<canvas>` : `chartRepoSize`
+(ligne, `unique_csize`/`total_size`/`total_csize` par `updated_at`, points marqués différemment selon
+`op='bkp'`/`'prune'` — cercle bleu / triangle rouge), `chartPruneGain` (barres, un point par événement
+Prune), `chartArchiveSize` (ligne, `original_size`/`compressed_size`/`deduplicated_size` par
+`archive_date`). Nouvelle fonction `loadCharts(nick)`, appelée depuis `openHistory(nick)` en plus de
+(pas à la place de) `loadHistoryFull(nick)` — deux appels réseau indépendants (`Promise.all`) qui ne se
+bloquent pas mutuellement, `apiCall('GET','/repohistory'|'/archivehistory',{nick},false)` puis
+`JSON.parse(r.stdout)`, patron exact de `apiCall` déjà utilisé partout.
+
+Forme de la réponse **non indexée par nick** (contrairement à `/report`/`/treehist`) :
+`{'borghelper_version','nick','rows':[...]}` — accès direct `parsed.rows`, jamais `parsed[nick]`.
+Ligne d'erreur (`diff.db` jamais indexé) `{'error':...}` distinguée explicitement, `rows:[]` (nick sans
+historique) et absence de Prune (graphique 2) chacun avec leur propre message `hint`/`error` à la place
+du graphique concerné — jamais de canvas Chart.js vide ni d'exception JS.
+
+Gain Prune (graphique 2) calculé **entièrement côté client**, à partir des mêmes lignes `repohistory`
+déjà chargées pour le graphique 1 (pas de second appel) : pour chaque ligne `op='prune'`, delta =
+`unique_csize` de la ligne précédente moins `unique_csize` de cette ligne, valeur brute non tronquée —
+aucune valeur envoyée au serveur, aucune persistance (paradigme de la spine, AD-1/AD-3). Garde de course
+dédiée (`chartsLoadSeq`, même patron que `historyLoadSeq`/`browseLoadSeq`) et `chart.destroy()`
+systématique avant toute recréation d'instance — une réponse tardive pour un ancien nick ne dessine
+jamais sur le graphique du nick actuellement affiché.
+
+Vérifié : `demo.borghelperrc`, `Init`+3×`Bkp`+1×`Prune` réels sur `demo-modules`, `borgHelperWWW` lancé
+localement (`-K testkey --port 18765`) ; `curl` direct sur `/repohistory`/`/archivehistory` (200, JSON
+brut conforme, `rows` avec 4/2 lignes attendues, delta Prune recalculé à la main = 1376 octets,
+identique au calcul JS) et sans clef (401). Logique de rendu (parsing `rows`/`error`, calcul du delta
+Prune, messages `hint`/`error`, formatage octets) rejouée en isolation sous Node avec les JSON réels
+renvoyés par le serveur (`Chart` stubbé) : aucune exception, tous les cas de l'I/O matrix couverts
+(peuplé, `rows:[]`, `{'error':...}`, aucun Prune). `python3 -m py_compile borgHelper borgHelperWWW`
+propre (aucun fichier Python modifié par cette story). Vérification visuelle dans un navigateur réel
+non effectuée (aucun outil de capture d'écran/navigateur disponible dans cet environnement) — à refaire
+manuellement avant mise en production.
+
+`borgHelperWWW_ui.html` 1.8.0 → **1.9.0** (`borgHelperWWW`/`WWW_VERSION` et `borgHelper`/`Version`
+inchangés — aucune ligne de ces deux fichiers modifiée par cette story).
+
 ## borgHelperWWW 1.15.3 — routes `/repohistory`, `/archivehistory` — 2026-09-25
 
 Story 2 (spec-charts-evolution-sauvegardes) : `repo_stats` (historique, 1.0.107) et `archive_stats`

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.8.0 -->
+<!-- UI_VERSION: 1.9.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -222,6 +222,25 @@
       </table>
       </div>
     </div>
+
+    <div class="card">
+      <h2 style="margin-top:0">Évolution</h2>
+      <div style="margin-bottom:24px">
+        <h3 style="margin:0 0 8px">Taille du dépôt</h3>
+        <div id="chartRepoSizeMsg" class="hint" hidden></div>
+        <canvas id="chartRepoSize" height="90"></canvas>
+      </div>
+      <div style="margin-bottom:24px">
+        <h3 style="margin:0 0 8px">Gain Prune</h3>
+        <div id="chartPruneGainMsg" class="hint" hidden></div>
+        <canvas id="chartPruneGain" height="90"></canvas>
+      </div>
+      <div>
+        <h3 style="margin:0 0 8px">Métriques par archive</h3>
+        <div id="chartArchiveSizeMsg" class="hint" hidden></div>
+        <canvas id="chartArchiveSize" height="90"></canvas>
+      </div>
+    </div>
   </section>
 
 </main>
@@ -246,6 +265,7 @@
 
 <footer><a href="/">borgHelperWWW</a><span id="footerVersions"></span> — interface web — <a href="/docs" target="_blank" rel="noopener">Swagger / API</a></footer>
 
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ" crossorigin="anonymous"></script>
 <script>
 'use strict';
 
@@ -560,6 +580,7 @@ function openHistory(nick){
   document.getElementById('historyError').textContent='';
   showView('view-history');
   loadHistoryFull(nick);
+  loadCharts(nick);
 }
 
 let historyLoadSeq=0;
@@ -580,6 +601,178 @@ async function loadHistoryFull(nick){
   const backups=(parsed.backups&&parsed.backups[nick])||{};
   const {archives,html}=_renderHistoryRows(backups,true);
   body.innerHTML = archives.length===0 ? '<tr><td colspan="9">Aucune archive indexée en base.</td></tr>' : html;
+}
+
+// ── Graphiques Chart.js (Story 3, spec-charts-evolution-sauvegardes) ────────
+// repohistory/archivehistory renvoient {'borghelper_version','nick','rows':[...]} — PAS indexé par
+// nick (contrairement à /report/ /treehist) — accès direct à .rows. Aucune valeur dérivée (gain
+// Prune) n'est jamais envoyée au serveur ni persistée : calculée ici, au rendu, à partir des lignes
+// repohistory déjà chargées pour le graphique 1.
+
+function _fmtBytes(n){
+  const suffixes=['B','KB','MB','GB','TB','PB','EB','ZB','YB'];
+  let i=0, v=Math.abs(n);
+  while(v>=1000 && i<suffixes.length-1){ v/=1000; i++; }
+  return (n<0?'-':'')+v.toFixed(2)+' '+suffixes[i];
+}
+
+let chartRepoSizeInstance=null, chartPruneGainInstance=null, chartArchiveSizeInstance=null;
+
+function _showChartMsg(msgElId, canvasId, text, isError){
+  const msgEl=document.getElementById(msgElId);
+  const canvasEl=document.getElementById(canvasId);
+  msgEl.textContent=text;
+  msgEl.className=isError?'error':'hint';
+  msgEl.hidden=false;
+  canvasEl.hidden=true;
+}
+function _hideChartMsg(msgElId, canvasId){
+  document.getElementById(msgElId).hidden=true;
+  document.getElementById(canvasId).hidden=false;
+}
+
+let chartsLoadSeq=0;
+async function loadCharts(nick){
+  const seq=++chartsLoadSeq;
+  // état initial : masquer les canvases et afficher un spinner dans chaque message div pendant le
+  // chargement (évite un flash "hint" résiduel de l'ancien nick, et des canvases vides pendant l'attente)
+  ['chartRepoSize','chartPruneGain','chartArchiveSize'].forEach(id=>{
+    document.getElementById(id+'Msg').innerHTML=SPINNER;
+    document.getElementById(id+'Msg').className='hint';
+    document.getElementById(id+'Msg').hidden=false;
+    document.getElementById(id).hidden=true;
+  });
+
+  const [repoR,archR]=await Promise.all([
+    apiCall('GET','/repohistory',{nick},false),
+    apiCall('GET','/archivehistory',{nick},false)
+  ]);
+  if(seq!==chartsLoadSeq) return; // navigation plus récente entre-temps — ne jamais dessiner sur le nick actuel
+
+  if(typeof Chart==='undefined'){
+    const msg='Bibliothèque de graphiques indisponible — CDN inaccessible ?';
+    ['chartRepoSize','chartPruneGain','chartArchiveSize'].forEach(id=>_showChartMsg(id+'Msg',id,msg,true));
+    return;
+  }
+
+  _renderRepoSizeAndPruneGainCharts(repoR);
+  _renderArchiveSizeChart(archR);
+}
+
+function _parseHistoryResponse(r){
+  // Renvoie {rows} ou {error} — jamais parsed[nick] (forme différente de /report, voir Boundaries).
+  if(r.httpStatus===401) return {error:null}; // apiCall a déjà géré logout(), rien de plus à afficher ici
+  if(r.exitcode===undefined || r.exitcode!==0 || r.httpStatus>=500 || (!r.stdout && r.stderr)){
+    return {error:r.stderr||('HTTP '+r.httpStatus)};
+  }
+  let parsed;
+  try{ parsed=JSON.parse(r.stdout); }
+  catch(e){ return {error:'Réponse illisible : '+r.stdout.slice(0,200)}; }
+  if(parsed.error) return {error:parsed.error};
+  if(!Array.isArray(parsed.rows)) return {error:'Réponse inattendue (pas de champ rows).'};
+  return {rows:parsed.rows};
+}
+
+function _renderRepoSizeAndPruneGainCharts(r){
+  if(chartRepoSizeInstance){ chartRepoSizeInstance.destroy(); chartRepoSizeInstance=null; }
+  if(chartPruneGainInstance){ chartPruneGainInstance.destroy(); chartPruneGainInstance=null; }
+
+  const {rows,error}=_parseHistoryResponse(r);
+  if(error!==undefined){
+    if(error!==null){
+      _showChartMsg('chartRepoSizeMsg','chartRepoSize',error,true);
+      _showChartMsg('chartPruneGainMsg','chartPruneGain',error,true);
+    }
+    return;
+  }
+  if(rows.length===0){
+    _showChartMsg('chartRepoSizeMsg','chartRepoSize','Aucun historique repo_stats enregistré.',false);
+    _showChartMsg('chartPruneGainMsg','chartPruneGain','Aucun historique repo_stats enregistré.',false);
+    return;
+  }
+
+  // Graphique 1 : taille du dépôt dans le temps, un point par événement (bkp/prune)
+  const labels=rows.map(row=>row.updated_at);
+  const pointColors=rows.map(row=>row.op==='prune'?'#c0392b':'#2b6cb0');
+  const pointStyles=rows.map(row=>row.op==='prune'?'triangle':'circle');
+  chartRepoSizeInstance=new Chart(document.getElementById('chartRepoSize'), {
+    type:'line',
+    data:{
+      labels,
+      datasets:[
+        {label:'unique_csize',data:rows.map(row=>row.unique_csize),borderColor:'#2b6cb0',backgroundColor:'#2b6cb0',pointBackgroundColor:pointColors,pointStyle:pointStyles,pointRadius:5,tension:0.1},
+        {label:'total_size',data:rows.map(row=>row.total_size),borderColor:'#1e7d3a',backgroundColor:'#1e7d3a',pointBackgroundColor:pointColors,pointStyle:pointStyles,pointRadius:5,tension:0.1},
+        {label:'total_csize',data:rows.map(row=>row.total_csize),borderColor:'#b8860b',backgroundColor:'#b8860b',pointBackgroundColor:pointColors,pointStyle:pointStyles,pointRadius:5,tension:0.1}
+      ]
+    },
+    options:{
+      responsive:true,
+      scales:{y:{ticks:{callback:v=>_fmtBytes(v)}}},
+      plugins:{tooltip:{callbacks:{label:ctx=>{
+        const row=rows[ctx.dataIndex];
+        return ctx.dataset.label+': '+_fmtBytes(ctx.parsed.y)+' ('+row.op+')';
+      }}}}
+    }
+  });
+
+  // Graphique 2 : gain Prune, calculé côté client uniquement à partir des mêmes lignes repohistory
+  // (pas de second appel) — pour chaque ligne op='prune', delta = unique_csize de la ligne précédente
+  // moins unique_csize de cette ligne, valeur brute non tronquée.
+  // Suppose rows déjà trié par ordre croissant de temps (garanti aujourd'hui par ORDER BY id côté
+  // serveur, Story 1/2) — sinon rows[i-1] n'est pas le point précédent et le delta est faux.
+  const pruneDeltas=[];
+  for(let i=0;i<rows.length;i++){
+    if(rows[i].op==='prune' && i>0){
+      pruneDeltas.push({label:rows[i].updated_at, delta:rows[i-1].unique_csize-rows[i].unique_csize});
+    }
+  }
+  if(pruneDeltas.length===0){
+    _showChartMsg('chartPruneGainMsg','chartPruneGain','Aucun Prune enregistré.',false);
+  } else {
+    chartPruneGainInstance=new Chart(document.getElementById('chartPruneGain'), {
+      type:'bar',
+      data:{
+        labels:pruneDeltas.map(d=>d.label),
+        datasets:[{label:'Gain Prune (unique_csize libéré)',data:pruneDeltas.map(d=>d.delta),backgroundColor:'#c0392b'}]
+      },
+      options:{
+        responsive:true,
+        scales:{y:{ticks:{callback:v=>_fmtBytes(v)}}},
+        plugins:{tooltip:{callbacks:{label:ctx=>'Gain : '+_fmtBytes(ctx.parsed.y)}}}
+      }
+    });
+  }
+}
+
+function _renderArchiveSizeChart(r){
+  if(chartArchiveSizeInstance){ chartArchiveSizeInstance.destroy(); chartArchiveSizeInstance=null; }
+
+  const {rows,error}=_parseHistoryResponse(r);
+  if(error!==undefined){
+    if(error!==null) _showChartMsg('chartArchiveSizeMsg','chartArchiveSize',error,true);
+    return;
+  }
+  if(rows.length===0){
+    _showChartMsg('chartArchiveSizeMsg','chartArchiveSize','Aucun historique archive_stats enregistré.',false);
+    return;
+  }
+
+  chartArchiveSizeInstance=new Chart(document.getElementById('chartArchiveSize'), {
+    type:'line',
+    data:{
+      labels:rows.map(row=>row.archive_date),
+      datasets:[
+        {label:'original_size',data:rows.map(row=>row.original_size),borderColor:'#2b6cb0',backgroundColor:'#2b6cb0',tension:0.1},
+        {label:'compressed_size',data:rows.map(row=>row.compressed_size),borderColor:'#1e7d3a',backgroundColor:'#1e7d3a',tension:0.1},
+        {label:'deduplicated_size',data:rows.map(row=>row.deduplicated_size),borderColor:'#b8860b',backgroundColor:'#b8860b',tension:0.1}
+      ]
+    },
+    options:{
+      responsive:true,
+      scales:{y:{ticks:{callback:v=>_fmtBytes(v)}}},
+      plugins:{tooltip:{callbacks:{label:ctx=>ctx.dataset.label+': '+_fmtBytes(ctx.parsed.y)}}}
+    }
+  });
 }
 
 document.getElementById('historyBody').addEventListener('click', e=>{
