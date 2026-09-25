@@ -95,6 +95,11 @@ IDX_WORKERS      = 4
 # Non défini = pas de limite (tout l'historique conservé)
 DIFF_KEEP        = 30
 
+# Rétention de l'historique repo_stats (taille du dépôt dans le temps, un point par Bkp/Prune)
+# en mois. Purgé à chaque écriture (fin de Bkp ou de Prune réel). Défaut 13 mois si absent,
+# non numérique, ou < 1 (0 ou négatif sont ramenés au défaut de 13 mois).
+STATS_RETENTION_MONTHS = 13
+
 # Clef explicite (keyfile mode, utile si plusieurs nicks partagent le même dépôt)
 BORG_KEY_FILE    = /root/.config/borg/keys/abcdef123456
 
@@ -314,7 +319,7 @@ Formule (identique résumé et détail) :
 
 **Mode offline** (`-o`) — rapport sans appel borg, depuis `diff.db` uniquement :
 - `nfiles` et tailles par archive disponibles si `archive_stats` est peuplée (après `Bkp` ou `Index`)
-- `taille` (taille dédupliquée du dépôt entier) disponible si `repo_stats` est peuplée (après `Bkp`)
+- `taille` (taille dédupliquée du dépôt entier) disponible si `repo_stats` est peuplée (après `Bkp` ou `Prune` réel — dernière ligne historique, quel que soit son type)
 - `reste` (espace disponible) alimenté via `df` local — non disponible pour les dépôts distants SSH
 - `recuperable` toujours indisponible hors ligne (nécessite `borg prune --dry-run`)
 - Combinable avec `-j`, `-l`, `-N <n>`

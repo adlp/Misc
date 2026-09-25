@@ -10,13 +10,13 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.106"
+Version="1.0.107"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
 #                           continue de l'ouvrir). Seule la future DbEncrypt écrira la maximale,
 #                           ce qui exclut les anciens binaires des SEULES bases chiffrées.
-DIFF_DB_SCHEMA_VERSION  = 5
+DIFF_DB_SCHEMA_VERSION  = 6
 CACHE_DB_SCHEMA_VERSION = 2
 DIFF_DB_BASE_SCHEMA_VERSION  = 4
 CACHE_DB_BASE_SCHEMA_VERSION = 1
@@ -31,6 +31,9 @@ CACHE_DB_BASE_SCHEMA_VERSION = 1
 #       ALTER TABLE ADD COLUMN, même auto-réparation qu'au palier 2)
 #   4 : snapshot_file.owner (propriétaire "user:group (uid:gid)" du dernier état connu, colonne
 #       TreeHist — ALTER TABLE ADD COLUMN, même auto-réparation)
+#   6 : repo_stats historique (BorgHelperDB._migrate_repo_stats, depuis une ligne écrasée par nick
+#       vers un historique id/op append-only — colonne `op` absente déclenche la migration, jamais
+#       une comparaison de schema_version)
 # Ne concerne QUE diff.db, appelé par ensure_diff_db() — désormais garanti avant tout accès
 # depuis Bkp, Index, Prune (voir prune()) et tous les autres consommateurs de diff.db/cache.db.
 
@@ -1351,6 +1354,25 @@ class BorgHelperDB:
             CREATE INDEX IF NOT EXISTS idx_snap_nick_archive ON archive_snapshot(nick, archive);
         """)
 
+    def _migrate_repo_stats(self,conn):
+        print("  Migration repo_stats → historique...",file=sys.stderr,flush=True)
+        conn.executescript("""
+            CREATE TABLE repo_stats_new (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                nick           TEXT,
+                op             TEXT,
+                unique_csize   INTEGER,
+                total_size     INTEGER,
+                total_csize    INTEGER,
+                updated_at     TEXT DEFAULT (datetime('now'))
+            );
+            INSERT INTO repo_stats_new (nick,op,unique_csize,total_size,total_csize,updated_at)
+                SELECT nick,'bkp',unique_csize,total_size,total_csize,updated_at FROM repo_stats;
+            DROP TABLE repo_stats;
+            ALTER TABLE repo_stats_new RENAME TO repo_stats;
+            CREATE INDEX IF NOT EXISTS idx_rstats_nick ON repo_stats(nick, id);
+        """)
+
     def ensure_diff_db(self,db_path,create=True):
         """create=False (AD-12) : voir ensure_cache_db — même contrat, réservé aux lecteurs."""
         if not create and not _db_has_schema(db_path): return
@@ -1439,7 +1461,9 @@ class BorgHelperDB:
                     PRIMARY KEY (nick, archive)
                 );
                 CREATE TABLE IF NOT EXISTS repo_stats (
-                    nick           TEXT NOT NULL PRIMARY KEY,
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    nick           TEXT,
+                    op             TEXT,
                     unique_csize   INTEGER,
                     total_size     INTEGER,
                     total_csize    INTEGER,
@@ -1467,6 +1491,10 @@ class BorgHelperDB:
                     );
                     CREATE INDEX IF NOT EXISTS idx_snap_nick_archive ON archive_snapshot(nick, archive);
                 """)
+            rstats_cols=[r[1] for r in conn.execute("PRAGMA table_info(repo_stats)").fetchall()]
+            if 'op' not in rstats_cols:
+                self._migrate_repo_stats(conn)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_rstats_nick ON repo_stats(nick, id)")
             # Story 1.5 : ne (re)créer la vue que si elle n'existe pas déjà — un DROP/CREATE
             # inconditionnel avance le mtime du fichier DB à chaque appel (checkpoint WAL à la
             # fermeture de connexion), même sans le moindre changement de données, ce qui
@@ -1572,13 +1600,23 @@ class BorgHelperDB:
         try: return self._with_lock_retry(_do)
         except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
 
-    def store_repo_stats(self,nick,unique_csize,total_size,total_csize,db_path=None):
+    def _stats_retention_months(self,nick):
+        """STATS_RETENTION_MONTHS par nick (.borghelperrc), défaut 13 mois (spine AD-5). Valeur <1 (0 ou négative) retombe aussi sur le défaut."""
+        try:
+            cfg=self._cfg_reader(nick) if self._cfg_reader else None
+            months=int(cfg.get('STATS_RETENTION_MONTHS',13)) if cfg is not None else 13
+            return months if months>=1 else 13
+        except (TypeError,ValueError): return 13
+
+    def store_repo_stats(self,nick,op,unique_csize,total_size,total_csize,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
+        months=self._stats_retention_months(nick)
         def _do():
             conn=_open_db(db_path,nick=nick,role='write')
             try:
-                conn.execute("INSERT OR REPLACE INTO repo_stats (nick,unique_csize,total_size,total_csize,updated_at) VALUES (?,?,?,?,datetime('now'))",
-                             (nick,unique_csize,total_size,total_csize))
+                conn.execute("INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize,updated_at) VALUES (?,?,?,?,?,datetime('now'))",
+                             (nick,op,unique_csize,total_size,total_csize))
+                conn.execute(f"DELETE FROM repo_stats WHERE nick=? AND updated_at < datetime('now','-{int(months)} months')",(nick,))
                 conn.commit(); return True
             finally: conn.close()
         try: return self._with_lock_retry(_do)
@@ -1588,7 +1626,7 @@ class BorgHelperDB:
         if db_path is None: db_path=self.get_diff_db(nick)
         try:
             conn=_open_db(db_path,nick=nick,role='read')
-            row=conn.execute("SELECT unique_csize,total_size,total_csize FROM repo_stats WHERE nick=?",(nick,)).fetchone()
+            row=conn.execute("SELECT unique_csize,total_size,total_csize FROM repo_stats WHERE nick=? ORDER BY id DESC LIMIT 1",(nick,)).fetchone()
             conn.close()
             return {'unique_csize':row[0],'total_size':row[1],'total_csize':row[2]} if row else {}
         except sqlite3.Error: return {}
@@ -2903,7 +2941,7 @@ class BorgHelper:
                             st.get('original_size'),st.get('compressed_size'),st.get('deduplicated_size'),st.get('nfiles'),db_path)
                         cst=anaRet['stdout'][0].get('cache',{}).get('stats',{})
                         if cst.get('unique_csize') is not None:
-                            self.db.store_repo_stats(nick,cst['unique_csize'],cst.get('total_size'),cst.get('total_csize'),db_path)
+                            self.db.store_repo_stats(nick,'bkp',cst['unique_csize'],cst.get('total_size'),cst.get('total_csize'),db_path)
                     if not no_index and archive_new and archive_old:
                         all_bkp=_bkp_parse_list(anaRet['stderr'])
                         entries=[]; exclu={}
@@ -2955,6 +2993,16 @@ class BorgHelper:
                 rb=self.borg.boex(nick,['compact','--cleanup-commits'],debug=debug)
                 self.db.clear_cache_nick(nick)
                 self._cleanup_index_after_prune(nick,debug=debug)
+                # Gain Prune (spine AD-3) : borg info --json APRÈS compact --cleanup-commits — c'est
+                # compact, pas prune --stats, qui libère réellement l'espace disque (sinon delta faux/
+                # quasi nul). Appel léger (métadonnées seulement), jamais en --dry-run.
+                try:
+                    rbi=self.borg.boex(nick,['info','--json'],debug=debug)
+                    self.borg._boex_check_stdout(rbi,nick,'borg info')
+                    cst=rbi['stdout'][0].get('cache',{}).get('stats',{})
+                    if cst.get('unique_csize') is not None:
+                        self.db.store_repo_stats(nick,'prune',cst['unique_csize'],cst.get('total_size'),cst.get('total_csize'))
+                except (RuntimeError,KeyError,TypeError,IndexError): pass
                 return rb
             else:
                 return ret
@@ -4617,6 +4665,77 @@ def codec_selftest():
         check("schéma : base neuve -> version de base",lambda: _meta(os.path.join(tmp,'m3.db'),None,5,4)==4)
         check("schéma : version chiffrée (maximale) conservée",lambda: _meta(os.path.join(tmp,'m4.db'),5,5,4)==5)
         check("schéma : stored > maximale -> SchemaVersionError",lambda: raises(SchemaVersionError,lambda:_meta(os.path.join(tmp,'m5.db'),6,5,4)))
+        # ── repo_stats historique (migration structurelle + capture Prune) ──
+        rs_dir=os.path.join(tmp,'rstats'); os.makedirs(rs_dir)
+        def _rs_reader(nick):
+            if nick=='over': return {'STATS_RETENTION_MONTHS':'1'}
+            if nick=='badval': return {'STATS_RETENTION_MONTHS':'abc'}
+            return {}
+        bhrs=BorgHelperDB(rs_dir,'rs',cfg_reader=_rs_reader)
+        def _rs_path(name): return os.path.join(rs_dir,name+'.db')
+        def _rs_migrate_check():
+            p=_rs_path('mig')
+            c=_open_db(p,nick=None,role='admin')
+            c.execute("""CREATE TABLE repo_stats (
+                nick TEXT NOT NULL PRIMARY KEY, unique_csize INTEGER, total_size INTEGER,
+                total_csize INTEGER, updated_at TEXT DEFAULT (datetime('now')))""")
+            c.execute("INSERT INTO repo_stats (nick,unique_csize,total_size,total_csize,updated_at) VALUES ('migtest',111,222,333,'2026-01-01 00:00:00')")
+            c.commit(); c.close()
+            bhrs.ensure_diff_db(p)
+            c=_open_db(p,nick='migtest',role='read')
+            cols=[r[1] for r in c.execute("PRAGMA table_info(repo_stats)").fetchall()]
+            rows=c.execute("SELECT id,nick,op,unique_csize,total_size,total_csize FROM repo_stats WHERE nick='migtest'").fetchall()
+            c.close()
+            return ('op' in cols and len(rows)==1 and rows[0][0] is not None and rows[0][1:]==('migtest','bkp',111,222,333))
+        check("repo_stats : migration ancien schéma -> historique op='bkp', valeurs conservées, id valide",_rs_migrate_check)
+        def _rs_new_db_check():
+            p=_rs_path('new'); bhrs.ensure_diff_db(p)
+            c=_open_db(p,nick=None,role='read')
+            cols=set(r[1] for r in c.execute("PRAGMA table_info(repo_stats)").fetchall()); c.close()
+            return {'id','nick','op','unique_csize','total_size','total_csize','updated_at'}<=cols
+        check("repo_stats : DB neuve -> schéma historique direct (id/op)",_rs_new_db_check)
+        def _rs_history_check():
+            p=_rs_path('hist'); bhrs.ensure_diff_db(p)
+            bhrs.store_repo_stats('h1','bkp',100,200,300,db_path=p)
+            bhrs.store_repo_stats('h1','prune',50,150,250,db_path=p)
+            c=_open_db(p,nick='h1',role='read')
+            ops=[r[0] for r in c.execute("SELECT op FROM repo_stats WHERE nick='h1' ORDER BY id").fetchall()]
+            c.close()
+            got=bhrs.get_repo_stats('h1',db_path=p)
+            return ops==['bkp','prune'] and got=={'unique_csize':50,'total_size':150,'total_csize':250}
+        check("repo_stats : historique append-only (INSERT, pas REPLACE), get_repo_stats -> dernière ligne",_rs_history_check)
+        def _rs_tie_check():
+            p=_rs_path('tie'); bhrs.ensure_diff_db(p)
+            c=_open_db(p,nick='t2',role='write')
+            for op,v in (('bkp',1),('prune',2)):
+                c.execute("INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize,updated_at) VALUES ('t2',?,?,?,?,'2026-01-01 00:00:00')",(op,v,v,v))
+            c.commit(); c.close()
+            return bhrs.get_repo_stats('t2',db_path=p)['unique_csize']==2
+        check("repo_stats : même updated_at (résolution seconde) -> get_repo_stats renvoie le plus grand id",_rs_tie_check)
+        def _rs_purge_default_check():
+            p=_rs_path('purge'); bhrs.ensure_diff_db(p)
+            c=_open_db(p,nick='p1',role='write')
+            c.execute("INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize,updated_at) VALUES ('p1','bkp',9,9,9,datetime('now','-14 months'))")
+            c.execute("INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize,updated_at) VALUES ('p1','bkp',8,8,8,datetime('now','-1 months'))")
+            c.commit(); c.close()
+            bhrs.store_repo_stats('p1','bkp',7,7,7,db_path=p)  # purge (13 mois défaut, nick sans surcharge)
+            c=_open_db(p,nick='p1',role='read')
+            vals=[r[0] for r in c.execute("SELECT unique_csize FROM repo_stats WHERE nick='p1' ORDER BY id").fetchall()]
+            c.close()
+            return 9 not in vals and vals==[8,7]
+        check("repo_stats : purge par ancienneté (13 mois défaut) — ligne expirée absente, récentes conservées",_rs_purge_default_check)
+        def _rs_purge_override_check():
+            p=_rs_path('purge_over'); bhrs.ensure_diff_db(p)
+            c=_open_db(p,nick='over',role='write')
+            c.execute("INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize,updated_at) VALUES ('over','bkp',5,5,5,datetime('now','-2 months'))")
+            c.commit(); c.close()
+            bhrs.store_repo_stats('over','bkp',6,6,6,db_path=p)  # STATS_RETENTION_MONTHS=1 pour 'over' -> purge >1 mois
+            c=_open_db(p,nick='over',role='read')
+            vals=[r[0] for r in c.execute("SELECT unique_csize FROM repo_stats WHERE nick='over' ORDER BY id").fetchall()]
+            c.close()
+            return vals==[6]
+        check("repo_stats : STATS_RETENTION_MONTHS surchargé par nick appliqué (pas le défaut 13 mois)",_rs_purge_override_check)
+        check("STATS_RETENTION_MONTHS non numérique -> fallback 13 mois (except TypeError/ValueError)",lambda: bhrs._stats_retention_months('badval')==13)
         # ── config DB_ENCRYPT / DB_KDF ──
         def _cfgsec(text,nick='n'):
             cp=configparser.ConfigParser(); cp.optionxform=str; cp.read_string(text); return cp[nick] if nick in cp else None

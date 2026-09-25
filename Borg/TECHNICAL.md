@@ -165,10 +165,22 @@ Une ligne par (nick, archive) : `file_count` + `total_size`.
 Peuplée par `IndexSnap` (`-S`) et en fin d'`Index` normal.
 
 #### `repo_stats`
-Statistiques globales du dépôt borg (niveau cache, pas par archive).  
-Une ligne par nick : `unique_csize` (taille dédupliquée totale du dépôt), `total_size`, `total_csize`, `updated_at`.  
-Peuplée par `Bkp` depuis `cache.stats` du JSON `borg create --json`. `borg prune` ne supporte pas `--json` (borg 1.2.x), donc non mis à jour après `Prune`.  
-Utilisée par `Report -o` pour alimenter la colonne `taille` sans appel borg.
+Statistiques globales du dépôt borg dans le temps (niveau cache, pas par archive) — historique, une
+ligne par événement (`id INTEGER PRIMARY KEY AUTOINCREMENT`, jamais écrasée).  
+Colonnes : `id`, `nick`, `op` (`'bkp'|'prune'`), `unique_csize` (taille dédupliquée totale du dépôt),
+`total_size`, `total_csize`, `updated_at`.  
+Peuplée par `Bkp` (`op='bkp'`, depuis `cache.stats` du JSON `borg create --json`, zéro appel borg
+supplémentaire) et par `Prune` réel (`op='prune'`, appel léger `borg info --json` fait **après**
+`compact --cleanup-commits` — l'étape qui libère réellement l'espace, jamais juste après `prune --stats`,
+sinon le delta serait faux/quasi nul ; rien n'est écrit en `--dry-run`).  
+`get_repo_stats()` lit la dernière ligne par nick (`ORDER BY id DESC LIMIT 1`, jamais un `SELECT` nu sans
+ordre — `updated_at` est à résolution seconde et peut collisionner entre deux événements rapprochés).  
+Purge par ancienneté à chaque écriture (même transaction que l'`INSERT`) : lignes plus vieilles que
+`STATS_RETENTION_MONTHS` (`.borghelperrc`, 13 mois par défaut, surchargeable par nick).  
+Utilisée par `Report -o` pour alimenter la colonne `taille` sans appel borg (dernière ligne, tout `op`
+confondu).  
+Seules des valeurs brutes renvoyées par borg sont persistées — aucune métrique dérivée (dédup, gain
+Prune) : ces calculs se font à la lecture (graphiques `borgHelperWWW`, hors périmètre de ce schéma).
 
 ### Vue `archive_snapshot_v`
 
@@ -278,6 +290,16 @@ erDiagram
         INTEGER total_size
     }
 
+    repo_stats {
+        INTEGER id PK "AUTOINCREMENT"
+        TEXT nick
+        TEXT op "bkp|prune"
+        INTEGER unique_csize
+        INTEGER total_size
+        INTEGER total_csize
+        TEXT updated_at
+    }
+
     snapshot_file ||--o{ archive_snapshot : "file_id → id"
 ```
 
@@ -294,6 +316,7 @@ erDiagram
 | `archive_snapshot` | `idx_snap_nick_archive` | `(nick, archive)` | suppressions Prune |
 | `archive_stats` | `idx_astats_nick` | `(nick)` | Report -o, suppressions Prune |
 | `diff_excluded_stats` | `idx_exclu_nick_arch` | `(nick, archive_new)` | consultation stats exclus |
+| `repo_stats` | `idx_rstats_nick` | `(nick, id)` | get_repo_stats (dernière ligne par nick), purge par ancienneté |
 
 ---
 
@@ -1342,7 +1365,7 @@ La `schema_version` ne change **pas** à chaque release — seulement lors d'un 
 
 | Constante | Valeur actuelle |
 |-----------|-----------------|
-| `DIFF_DB_SCHEMA_VERSION` (maximale comprise) | `5` (base écrite : `DIFF_DB_BASE_SCHEMA_VERSION` = `4`) |
+| `DIFF_DB_SCHEMA_VERSION` (maximale comprise) | `6` (base écrite : `DIFF_DB_BASE_SCHEMA_VERSION` = `4`) |
 | `CACHE_DB_SCHEMA_VERSION` (maximale comprise) | `2` (base écrite : `CACHE_DB_BASE_SCHEMA_VERSION` = `1`) |
 | `SCOPE_CACHE_DB_SCHEMA_VERSION` (borgHelperWWW, maximale comprise) | `2` (base écrite : `SCOPE_CACHE_DB_BASE_SCHEMA_VERSION` = `1`) |
 
@@ -1360,6 +1383,7 @@ sans risque même après une migration partielle ou un `schema_version` désynch
 | 2 | `snapshot_file.type` | colonne `type` absente sur `snapshot_file` | `ALTER TABLE snapshot_file ADD COLUMN type TEXT` — alimente la colonne « genre » de `TreeHist` |
 | 3 | `snapshot_file.mode` | colonne `mode` absente sur `snapshot_file` | `ALTER TABLE snapshot_file ADD COLUMN mode TEXT` — droits unix ls-style (`{mode}` de `borg list`), colonne « droits » de `TreeHist` |
 | 4 | `snapshot_file.owner` | colonne `owner` absente sur `snapshot_file` | `ALTER TABLE snapshot_file ADD COLUMN owner TEXT` — `{user}:{group} ({uid}:{gid})` de `borg list`, colonne « propriétaire » de `TreeHist` |
+| 6 | `repo_stats` historique | colonne `op` absente sur `repo_stats` | `_migrate_repo_stats()` : ligne unique par nick (`INSERT OR REPLACE`) → historique append-only (`id` AUTOINCREMENT, `op`) — la ligne existante devient la première ligne `op='bkp'`, aucune valeur perdue |
 
 `ensure_diff_db()` est désormais garanti appelé (donc les migrations garanties appliquées) avant tout
 accès à `diff.db`/`cache.db` depuis **Bkp**, **Index**, **Prune** et tous les autres consommateurs —

@@ -1,5 +1,45 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.107 — `repo_stats` historique + capture du gain Prune — 2026-09-25
+
+`repo_stats` (`diff.db`) n'était jusqu'ici qu'un instantané écrasé par nick (`INSERT OR REPLACE`, clé
+primaire `nick`) — l'évolution de la taille du dépôt dans le temps et le gain réel d'un Prune étaient
+perdus, alors que les valeurs brutes nécessaires (`unique_csize`/`total_size`/`total_csize`) sont déjà
+récupérées de `borg` à chaque `Bkp`. Nouveau schéma historique, une ligne par événement : `id INTEGER
+PRIMARY KEY AUTOINCREMENT`, colonne `op` (`'bkp'|'prune'`). Migration des bases existantes par contrôle
+structurel (`if 'op' not in cols`), même patron que `_migrate_archive_snapshot` — la ligne unique par
+nick devient la première ligne historique `op='bkp'`, aucune valeur perdue ; une DB neuve reçoit le
+nouveau schéma directement. Comme pour `archive_snapshot`, cette migration n'est jamais gatée par
+`schema_version`/`db_meta` (bookkeeping en écriture seule) — palier `DIFF_DB_SCHEMA_VERSION` 6, purement
+documentaire.
+
+`Prune` capture désormais une ligne `op='prune'` : appel léger `borg info --json` (métadonnées seulement)
+fait **après** `compact --cleanup-commits`, jamais juste après `prune --stats` — c'est `compact` qui
+libère réellement l'espace disque, un appel plus tôt donnerait un delta gain-Prune faux/quasi nul. Rien
+n'est écrit en `--dry-run`. `store_repo_stats()` passe d'un `INSERT OR REPLACE` à un `INSERT` historique
+et purge, dans la même transaction, les lignes plus anciennes que `STATS_RETENTION_MONTHS` (nouvelle clef
+`.borghelperrc` par nick, 13 mois par défaut, même patron que `KEEP_DAILY`/`DIFF_KEEP`). `get_repo_stats()`
+lit désormais `ORDER BY id DESC LIMIT 1` (au lieu d'un `SELECT` nu sans ordre) — nécessaire dès qu'une
+même seconde peut porter deux événements (`updated_at` à résolution seconde).
+
+Aucune métrique dérivée stockée : le gain Prune (delta entre la ligne juste avant et juste après un
+`op='prune'`) et tout calcul de ce type restent pour l'affichage (graphiques `borgHelperWWW`, hors
+périmètre de cette livraison) — seules les valeurs brutes borg sont persistées, comme pour `archive_stats`.
+`archive_stats` et son mécanisme de purge (via Prune uniquement) restent inchangés.
+
+6 nouveaux contrôles `CodecSelfTest` dédiés (286/286 OK) : migration ancien schéma → historique,
+schéma direct sur DB neuve, historisation append-only + `get_repo_stats` sur la dernière ligne, résolution
+du cas deux lignes à la même seconde (plus grand `id`), purge par ancienneté (défaut 13 mois), surcharge
+`STATS_RETENTION_MONTHS` par nick. Vérifié aussi de bout en bout sur `demo.borghelperrc` (Bkp réel ×2 puis
+Prune réel) : lignes `op='bkp'`/`op='bkp'`/`op='prune'` cohérentes en base ; confirmé par ailleurs qu'un
+Prune en `--dry-run` n'écrit aucune ligne.
+
+`_stats_retention_months` clampe désormais toute valeur `< 1` (0 ou négative) au défaut de 13 mois, comme
+le fallback déjà existant pour une valeur non numérique — `0` rendait `datetime('now','-0 months')` égal
+à « maintenant » (purge de la quasi-totalité de l'historique à chaque écriture), une valeur négative
+produisait un modificateur SQLite invalide (`datetime()` → `NULL`, purge silencieusement no-op). 1 contrôle
+`CodecSelfTest` supplémentaire dédié au fallback non-numérique existant (287/287 OK).
+
 ## borgHelper 1.0.106 — chiffrement des chemins SQLite, story 6 (suite) : correctif `TreeHist` à la racine — 2026-09-23
 
 Story 6 (1.0.105) avait confirmé 4 sites au-dessus du seuil de jugement (>1 s) par la mesure, sans les corriger
