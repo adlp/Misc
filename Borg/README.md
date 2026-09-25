@@ -668,6 +668,32 @@ Calcul : `nfiles − added_total − modified_total` (indexés + exclus). Seules
 
 ---
 
+### `RepoHistory` / `ArchiveHistory`
+Historique brut, colonnes brutes, pour un seul nick à la fois — destiné à l'API (`borgHelperWWW`
+`/repohistory`/`/archivehistory`), source des graphiques d'évolution des sauvegardes. Aucune métrique
+dérivée (gain Prune, % dédup) n'est calculée ici — uniquement les valeurs telles que stockées.
+
+```bash
+borgHelper -c RepoHistory -n mon-serveur -j       # historique repo_stats (taille du dépôt), JSON brut
+borgHelper -c ArchiveHistory -n mon-serveur -j    # historique archive_stats (par archive), JSON brut
+```
+
+| Option | Description |
+|--------|-------------|
+| `-n <nick>` | Un seul nick — jamais `nick=a,b` ni `ALL` sur plusieurs nicks configurés (rejeté, code de sortie non nul) |
+| `-j` | Sortie JSON `{borghelper_version,nick,rows:[...]}` — sans `-j` : message court, pas de crash (mode texte non destiné à un usage interactif élaboré) |
+
+`RepoHistory -j` : une ligne par événement `repo_stats` (`id`,`op` (`'bkp'|'prune'`),`unique_csize`,
+`total_size`,`total_csize`,`updated_at`), ordonnées par `id` croissant.
+
+`ArchiveHistory -j` : une ligne par archive de `archive_stats` (`archive`,`archive_date`,`duration`,
+`original_size`,`compressed_size`,`deduplicated_size`,`nfiles`), ordonnées par `archive_date`.
+
+`diff.db` jamais indexé : `{'error':'diff.db absent pour <nick>'}`, jamais une exception (même
+comportement que `IdxTop -j`).
+
+---
+
 ### `IdxPurge`
 Supprime rétroactivement des entrées de `diff_index`, purge les snapshots anciens et compacte le `diff.db`.
 
@@ -1407,6 +1433,8 @@ servi comme une réponse obsolète.
 | POST | `/cacheclean` | CacheClean | |
 | GET | `/idxtop` | IdxTop | ✓ |
 | GET | `/difftop` | DiffTop | ✓ |
+| GET | `/repohistory` | RepoHistory | ✓ |
+| GET | `/archivehistory` | ArchiveHistory | ✓ |
 | POST | `/idxpurge` | IdxPurge ⚡ | |
 
 `DelBkp` et `Prune` (destruction de sauvegardes) reçoivent `403 Forbidden` tant que

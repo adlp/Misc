@@ -1,5 +1,46 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.15.3 — routes `/repohistory`, `/archivehistory` — 2026-09-25
+
+Story 2 (spec-charts-evolution-sauvegardes) : `repo_stats` (historique, 1.0.107) et `archive_stats`
+n'étaient exposées par aucune route — rien ne permettait à l'UI de tracer l'évolution d'un dépôt dans
+le temps. Deux nouvelles routes `GET /repohistory?nick=<nick>` et `GET /archivehistory?nick=<nick>`,
+patron exact de `/idxtop`/`/cacheinfo` : `nick` en paramètre de requête requis (jamais un segment
+d'URL — `_check_group_access` lit `request.query_params.get('nick')`, un segment le contournerait
+silencieusement), `require_api_key`, délégation au sous-processus `borgHelper -c RepoHistory`/
+`-c ArchiveHistory -j` (AD-1, jamais d'accès SQLite direct depuis `borgHelperWWW`), `cacheable=True`
+(lecture pure `diff.db`, même empreinte mtime que `/idxtop`/`/difftop`). `_ROUTE_LEVELS` : deux
+nouvelles entrées niveau `1` (lecture). Pas de filtrage par périmètre de chemin (`_resolve_single_scope`) :
+ces agrégats ne portent aucun chemin de fichier, seul le niveau d'accès par nick s'applique.
+
+Côté `borgHelper` : nouvelles commandes CLI `RepoHistory`/`ArchiveHistory -n <nick> -j`, gabarit exact
+de `IdxTop -j` — requête SQL directe (`repo_stats`/`archive_stats WHERE nick=?`, ordre chronologique),
+JSON brut `{'borghelper_version','nick','rows':[...]}`, colonnes brutes uniquement (aucune métrique
+dérivée calculée ici — reste pour l'affichage, Story 3). Un seul nick à la fois : `nick=a,b`/`ALL` sur
+plusieurs nicks rejeté par `usage(cmd)` (code de sortie non nul), même contrôle que `IdxTop -j`. `diff.db`
+jamais indexé : `{'error':...}`, jamais une exception non attrapée.
+
+12 nouveaux contrôles `CodecSelfTest` dédiés (299/299 OK) : table peuplée (ordre par `id`/`archive_date`),
+table vide, `diff.db` absent, isolation entre plusieurs nicks, mode texte sans `-j` (pas de crash),
+rejet CLI multi-nick (`a,b` et `ALL` après expansion). Vérifié aussi de bout en bout sur
+`demo.borghelperrc` (`Init`+`Bkp` réels, `borgHelperWWW` lancé localement) : `curl` sur les deux routes
+avec clef API valide (200, JSON), sans clef (401), `nick=a,b` (400), nick inconnu ({'error':...} en 200
+côté cache/RBAC désactivé — RBAC nick-level testé au niveau du dictionnaire `_ROUTE_LEVELS`/
+`_check_group_access`, mécanisme inchangé).
+
+Deux correctifs issus de la revue : `repo_history()`/`archive_history()` gagnent le même garde-fou
+`_db_has_schema()` que le reste de la couche `diff.db` — un nick jamais indexé mais dont le fichier
+`diff.db` existe (table absente) renvoyait auparavant l'erreur SQLite brute « no such table », remplacée
+par le même `{'error':...}` propre que le cas fichier absent. RBAC (403 niveau insuffisant / nick inconnu)
+revérifié en direct sur `/repohistory`/`/archivehistory` avec `BORGHELPERWWW_GROUPS_HEADER` effectivement
+configuré (et pas seulement présumé par analogie avec `/idxtop`).
+
+## borgHelper 1.0.108 — commandes CLI `RepoHistory`/`ArchiveHistory` — 2026-09-25
+
+Story 2 (spec-charts-evolution-sauvegardes) : voir l'entrée `borgHelperWWW 1.15.3` ci-dessus pour le
+détail — nouvelles méthodes `BorgHelper.repo_history()`/`archive_history()` et commandes CLI associées,
+consommées par les nouvelles routes `borgHelperWWW`.
+
 ## borgHelper 1.0.107 — `repo_stats` historique + capture du gain Prune — 2026-09-25
 
 `repo_stats` (`diff.db`) n'était jusqu'ici qu'un instantané écrasé par nick (`INSERT OR REPLACE`, clé

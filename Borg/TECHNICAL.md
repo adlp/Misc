@@ -182,6 +182,18 @@ confondu).
 Seules des valeurs brutes renvoyées par borg sont persistées — aucune métrique dérivée (dédup, gain
 Prune) : ces calculs se font à la lecture (graphiques `borgHelperWWW`, hors périmètre de ce schéma).
 
+**Exposition JSON (Story 2, spec-charts-evolution-sauvegardes).** `RepoHistory -j` (commande CLI) /
+`GET /repohistory?nick=<nick>` (route `borgHelperWWW`, RBAC niveau lecture) exposent l'historique
+complet, colonnes brutes, ordonné par `id` croissant : `{'borghelper_version','nick','rows':[{'id',
+'op','unique_csize','total_size','total_csize','updated_at'},...]}`. Gabarit exact de `IdxTop -j` :
+requête directe `SELECT ... FROM repo_stats WHERE nick=? ORDER BY id`, un seul nick à la fois (`nick=a,b`
+ou `ALL` sur plusieurs nicks rejeté par `usage(cmd)`), `{'error':...}` (jamais une exception) si
+`diff.db` n'existe pas encore. `archive_stats` a son pendant symétrique : `ArchiveHistory -j` /
+`GET /archivehistory?nick=<nick>`, même `SELECT` que `prep_report_from_db()` (`archive,archive_date,
+duration,original_size,compressed_size,deduplicated_size,nfiles FROM archive_stats WHERE nick=? ORDER BY
+archive_date`). Aucune métrique dérivée dans ces deux commandes/routes — colonnes brutes uniquement, le
+calcul (gain Prune, % dédup) reste pour le rendu graphique (Story 3, hors périmètre ici).
+
 ### Vue `archive_snapshot_v`
 
 ```sql

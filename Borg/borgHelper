@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.107"
+Version="1.0.108"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -410,6 +410,12 @@ def usage(doc=None,debug=0):
         printer("⚗️  -c IdxTop [-n nick/ALL] [-N top] [-p profondeur] [-j]")
         printer("       Top N arborescences par entrées dans diff_index — diagnostiquer un diff.db volumineux")
         printer("       -N n : top N (défaut 20)  |  -p d : profondeur répertoire (défaut 3)  |  -j : brut par-chemin (ignore -N/-p)")
+        printer("   -c RepoHistory -n nick -j")
+        printer("       Historique brut repo_stats (id/op/unique_csize/total_size/total_csize/updated_at), ordre chronologique")
+        printer("       Un seul nick à la fois  |  destiné à l'API (borgHelperWWW /repohistory)")
+        printer("   -c ArchiveHistory -n nick -j")
+        printer("       Historique brut archive_stats (archive/archive_date/duration/tailles/nfiles), ordre chronologique")
+        printer("       Un seul nick à la fois  |  destiné à l'API (borgHelperWWW /archivehistory)")
         printer("⚡️ -c IdxPurge [-x <pattern>] [-n nick/ALL] [-D]")
         printer("       Purge rétroactive de diff_index + anciens snapshots + VACUUM  (-D : dry-run)")
         printer("       Sans -x : lit IDX_EXCLUDE/IDX_INCLUDE depuis le borghelperrc")
@@ -546,6 +552,14 @@ def usage(doc=None,debug=0):
         printer("       Utile pour identifier quoi ajouter à IDX_EXCLUDE avant IdxPurge")
         printer("       -N n : nombre de résultats (défaut 20)  -p d : profondeur (défaut 3)")
         printer("       -j : mode brut par-chemin, jamais groupé (une ligne JSON par chemin ; ignore -N/-p)")
+    elif doc=='repohistory':
+        printer("   -c RepoHistory -n nick -j")
+        printer("       Historique brut repo_stats (colonnes brutes, ordre chronologique par id) — un seul nick")
+        printer("       Sans -j : message court, pas de crash (commande destinée à l'API)")
+    elif doc=='archivehistory':
+        printer("   -c ArchiveHistory -n nick -j")
+        printer("       Historique brut archive_stats (colonnes brutes, ordre chronologique par archive_date) — un seul nick")
+        printer("       Sans -j : message court, pas de crash (commande destinée à l'API)")
     elif doc=='idxpurge':
         printer("   -c IdxPurge [-x <pattern>] [-n nick/servername/ALL] [-D]")
         printer("       Purge rétroactive des entrées diff_index + anciens snapshots + VACUUM")
@@ -3916,6 +3930,63 @@ class BorgHelper:
                 printer(f"  {arch} : {unch:,}{pct} / {nf:,} fichiers")
         printer(str(t))
 
+    def repo_history(self,nick,debug=0,as_json=False):
+        """Story 2 (spec-charts-evolution-sauvegardes) : historique brut repo_stats (colonnes brutes,
+        ordre chronologique), gabarit exact de idxtop() -j (borgHelper:3819-3844) — jamais de valeur
+        dérivée calculée ici (Boundaries)."""
+        db_path=self.db.get_diff_db(nick)
+        if not os.path.exists(db_path):
+            if as_json: print(json.dumps({'error':f"diff.db absent pour {nick}"},ensure_ascii=False,indent=2)); return
+            printer(f"  {nick}: diff.db absent — lancez borgHelper -c Index -n {nick}"); return
+        if not _db_has_schema(db_path):
+            msg=f"Aucune archive indexée — lancez : borgHelper -c Index -n {nick}"
+            if as_json: print(json.dumps({'error':msg},ensure_ascii=False,indent=2)); return
+            printer(f"  {nick}: {msg}"); return
+        if not as_json:
+            printer(f"  {nick}: historique repo_stats disponible via -j (JSON) — destiné à l'API")
+            return
+        try:
+            conn=_open_db(db_path,nick=nick,role='read')
+            rows=[{'id':r[0],'op':r[1],'unique_csize':r[2],'total_size':r[3],'total_csize':r[4],'updated_at':r[5]}
+                  for r in conn.execute(
+                      "SELECT id,op,unique_csize,total_size,total_csize,updated_at FROM repo_stats WHERE nick=? ORDER BY id",
+                      (nick,)).fetchall()]
+            conn.close()
+        except DbCodecError as e:
+            print(json.dumps({'error':_codec_fail(nick,e,conn)},ensure_ascii=False,indent=2)); return
+        except sqlite3.Error as e:
+            print(json.dumps({'error':f"SQLite error ({db_path}): {e}"},ensure_ascii=False,indent=2)); return
+        print(json.dumps({'borghelper_version':Version,'nick':nick,'rows':rows},ensure_ascii=False,indent=2))
+
+    def archive_history(self,nick,debug=0,as_json=False):
+        """Story 2 (spec-charts-evolution-sauvegardes) : historique brut archive_stats (colonnes
+        brutes, ordre chronologique), même SELECT que prep_report_from_db (borgHelper:4202), gabarit
+        exact de idxtop() -j — jamais de valeur dérivée calculée ici (Boundaries)."""
+        db_path=self.db.get_diff_db(nick)
+        if not os.path.exists(db_path):
+            if as_json: print(json.dumps({'error':f"diff.db absent pour {nick}"},ensure_ascii=False,indent=2)); return
+            printer(f"  {nick}: diff.db absent — lancez borgHelper -c Index -n {nick}"); return
+        if not _db_has_schema(db_path):
+            msg=f"Aucune archive indexée — lancez : borgHelper -c Index -n {nick}"
+            if as_json: print(json.dumps({'error':msg},ensure_ascii=False,indent=2)); return
+            printer(f"  {nick}: {msg}"); return
+        if not as_json:
+            printer(f"  {nick}: historique archive_stats disponible via -j (JSON) — destiné à l'API")
+            return
+        try:
+            conn=_open_db(db_path,nick=nick,role='read')
+            rows=[{'archive':r[0],'archive_date':r[1],'duration':r[2],'original_size':r[3],
+                   'compressed_size':r[4],'deduplicated_size':r[5],'nfiles':r[6]}
+                  for r in conn.execute(
+                      "SELECT archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles "
+                      "FROM archive_stats WHERE nick=? ORDER BY archive_date",
+                      (nick,)).fetchall()]
+            conn.close()
+        except DbCodecError as e:
+            print(json.dumps({'error':_codec_fail(nick,e,conn)},ensure_ascii=False,indent=2)); return
+        except sqlite3.Error as e:
+            print(json.dumps({'error':f"SQLite error ({db_path}): {e}"},ensure_ascii=False,indent=2)); return
+        print(json.dumps({'borghelper_version':Version,'nick':nick,'rows':rows},ensure_ascii=False,indent=2))
 
     def difftop(self,nick,bkp=None,depth=3,topn=10,debug=0,as_json=False):
         from collections import defaultdict
@@ -4736,6 +4807,79 @@ def codec_selftest():
             return vals==[6]
         check("repo_stats : STATS_RETENTION_MONTHS surchargé par nick appliqué (pas le défaut 13 mois)",_rs_purge_override_check)
         check("STATS_RETENTION_MONTHS non numérique -> fallback 13 mois (except TypeError/ValueError)",lambda: bhrs._stats_retention_months('badval')==13)
+        # ── RepoHistory / ArchiveHistory (Story 2, spec-charts-evolution-sauvegardes) ──
+        rh_dir=os.path.join(tmp,'rhist'); os.makedirs(rh_dir)
+        rh_rc=os.path.join(rh_dir,'rc')
+        with open(rh_rc,'w') as f:
+            for nk in ('rhA','rhB','rhEmpty'):
+                f.write(f"[{nk}]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw-{nk}\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n\n")
+        os.chmod(rh_rc,0o600)
+        bh_rh=BorgHelper(cfgfile=rh_rc,cache_dir=os.path.join(rh_dir,'cache'))
+        for nk in ('rhA','rhB','rhEmpty'):
+            bh_rh.db.ensure_diff_db(bh_rh.db.get_diff_db(nk))
+        bh_rh.db.store_repo_stats('rhA','bkp',100,200,300,db_path=bh_rh.db.get_diff_db('rhA'))
+        bh_rh.db.store_repo_stats('rhA','prune',90,190,290,db_path=bh_rh.db.get_diff_db('rhA'))
+        bh_rh.db.store_repo_stats('rhB','bkp',1,2,3,db_path=bh_rh.db.get_diff_db('rhB'))
+        bh_rh.db.store_archive_stats('rhA','A1','2026-01-01T00:00:00',5,10,8,6,100,db_path=bh_rh.db.get_diff_db('rhA'))
+        bh_rh.db.store_archive_stats('rhA','A2','2026-02-01T00:00:00',6,20,16,12,110,db_path=bh_rh.db.get_diff_db('rhA'))
+        bh_rh.db.store_archive_stats('rhB','B1','2026-01-15T00:00:00',3,5,4,3,50,db_path=bh_rh.db.get_diff_db('rhB'))
+        def _rh_run(fn,*a,**k):
+            out=io.StringIO()
+            with contextlib.redirect_stdout(out):
+                fn(*a,**k)
+            return json.loads(out.getvalue())
+        def _rh_repo_populated():
+            v=_rh_run(bh_rh.repo_history,'rhA',as_json=True); rows=v['rows']
+            return (v['nick']=='rhA' and len(rows)==2 and [r['op'] for r in rows]==['bkp','prune']
+                    and rows[0]['id']<rows[1]['id'] and rows[1]['unique_csize']==90)
+        check("RepoHistory -j : table peuplée -> rows brutes ordonnées par id",_rh_repo_populated)
+        check("RepoHistory -j : table vide (nick sans historique) -> rows=[]",
+              lambda: _rh_run(bh_rh.repo_history,'rhEmpty',as_json=True)['rows']==[])
+        check("RepoHistory -j : diff.db absent -> {'error':...}, pas une exception",
+              lambda: _rh_run(bh_rh.repo_history,'rhNope',as_json=True)=={'error':"diff.db absent pour rhNope"})
+        def _rh_repo_isolation():
+            a=_rh_run(bh_rh.repo_history,'rhA',as_json=True)['rows']
+            b=_rh_run(bh_rh.repo_history,'rhB',as_json=True)['rows']
+            return len(a)==2 and len(b)==1 and b[0]['unique_csize']==1
+        check("RepoHistory -j : plusieurs nicks isolés correctement (rhA/rhB)",_rh_repo_isolation)
+        def _rh_arch_populated():
+            v=_rh_run(bh_rh.archive_history,'rhA',as_json=True); rows=v['rows']
+            return (len(rows)==2 and rows[0]['archive']=='A1' and rows[1]['archive']=='A2'
+                    and rows[0]['archive_date']<rows[1]['archive_date'] and rows[1]['nfiles']==110)
+        check("ArchiveHistory -j : table peuplée -> rows brutes ordonnées par archive_date",_rh_arch_populated)
+        check("ArchiveHistory -j : table vide -> rows=[]",
+              lambda: _rh_run(bh_rh.archive_history,'rhEmpty',as_json=True)['rows']==[])
+        check("ArchiveHistory -j : diff.db absent -> {'error':...}, pas une exception",
+              lambda: _rh_run(bh_rh.archive_history,'rhNope',as_json=True)=={'error':"diff.db absent pour rhNope"})
+        def _rh_arch_isolation():
+            a=_rh_run(bh_rh.archive_history,'rhA',as_json=True)['rows']
+            b=_rh_run(bh_rh.archive_history,'rhB',as_json=True)['rows']
+            return len(a)==2 and len(b)==1 and b[0]['archive']=='B1'
+        check("ArchiveHistory -j : plusieurs nicks isolés correctement (rhA/rhB)",_rh_arch_isolation)
+        def _rh_text_mode_no_crash():
+            out=io.StringIO(); err=io.StringIO()
+            with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+                bh_rh.repo_history('rhA',as_json=False)
+                bh_rh.archive_history('rhA',as_json=False)
+            return bool((out.getvalue()+err.getvalue()).strip())
+        check("RepoHistory/ArchiveHistory sans -j : message court, pas de crash",_rh_text_mode_no_crash)
+        def _cli_rh_multi_rejected(cmdname,rc,argnick):
+            saved_argv=sys.argv[:]
+            out=io.StringIO(); err=io.StringIO(); code=None
+            try:
+                sys.argv=['borgHelper','-C',rc,'-c',cmdname,'-n',argnick,'-j']
+                with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+                    try: _cli_main()
+                    except SystemExit as e: code=e.code
+            finally:
+                sys.argv=saved_argv
+            return code not in (None,0),(out.getvalue()+err.getvalue())
+        check("RepoHistory -j -n a,b : rejeté (usage(cmd), code de sortie non nul)",
+              lambda: _cli_rh_multi_rejected('RepoHistory',rh_rc,'rhA,rhB')[0])
+        check("ArchiveHistory -j -n a,b : rejeté (usage(cmd), code de sortie non nul)",
+              lambda: _cli_rh_multi_rejected('ArchiveHistory',rh_rc,'rhA,rhB')[0])
+        check("ArchiveHistory -j -n ALL (plusieurs nicks configurés) : rejeté après expansion",
+              lambda: _cli_rh_multi_rejected('ArchiveHistory',rh_rc,'ALL')[0])
         # ── config DB_ENCRYPT / DB_KDF ──
         def _cfgsec(text,nick='n'):
             cp=configparser.ConfigParser(); cp.optionxform=str; cp.read_string(text); return cp[nick] if nick in cp else None
@@ -5966,7 +6110,8 @@ def _cli_main():
            'init':'Ccdn','key':'Ccdn','index':'CcdnFSA','search':'CcdnfbBj',
            'filehist':'CcdnfbBj','cacheinfo':'Ccdn','cacheclean':'Ccdn','duidx':'CcdnfbBsjR',
            'idxtop':'CcdnNpj','difftop':'CcdnNpbj','idxpurge':'CcdnxD','treehist':'CcdnfbBj',
-           'treefind':'Ccdnfmj','dbencrypt':'CcdnDy','dbdecrypt':'CcdnDy','dbrekey':'Ccdny','dbstatus':'Ccdn'}
+           'treefind':'Ccdnfmj','dbencrypt':'CcdnDy','dbdecrypt':'CcdnDy','dbrekey':'Ccdny','dbstatus':'Ccdn',
+           'repohistory':'Ccdnj','archivehistory':'Ccdnj'}
     optab={k:v+'P' for k,v in optab.items()}
 
     if cmd is None or cmd not in optab.keys():
@@ -6093,6 +6238,18 @@ def _cli_main():
             usage(cmd)
         for n in nick.split(','):
             bh.idxtop(n,depth=_depth,topn=_topn,debug=debug,as_json=('-j' in options))
+    elif cmd=='repohistory':
+        if '-j' in options and len(nick.split(','))>1:
+            printer("RepoHistory -j ne supporte qu'un seul nick à la fois (pas nick=a,b ni ALL avec plusieurs nicks configurés)")
+            usage(cmd)
+        for n in nick.split(','):
+            bh.repo_history(n,debug=debug,as_json=('-j' in options))
+    elif cmd=='archivehistory':
+        if '-j' in options and len(nick.split(','))>1:
+            printer("ArchiveHistory -j ne supporte qu'un seul nick à la fois (pas nick=a,b ni ALL avec plusieurs nicks configurés)")
+            usage(cmd)
+        for n in nick.split(','):
+            bh.archive_history(n,debug=debug,as_json=('-j' in options))
     elif cmd=='difftop':
         _depth=int(options.get('-p','3'))
         _topn=int(options.get('-N','10'))

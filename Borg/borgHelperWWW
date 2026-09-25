@@ -22,7 +22,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.15.2"
+WWW_VERSION="1.15.3"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -204,6 +204,7 @@ _GP_RESERVED_CHARS=(':','|',',')
 _ROUTE_LEVELS={
     '/stats':1,'/lstbkp':1,'/lstbkpfls':1,'/report':1,'/diffbkp':1,'/search':1,'/filehist':1,
     '/treehist':1,'/treefind':1,'/duidx':1,'/cacheinfo':1,'/idxtop':1,'/difftop':1,
+    '/repohistory':1,'/archivehistory':1,
     '/restore/perms':1,'/download/file':1,'/download/tar':1,
     '/bkp':2,'/index':2,'/restore':2,'/cacheclean':2,
     '/prune':3,'/delbkp':3,'/idxpurge':3,'/init':3,'/key':3,
@@ -1571,6 +1572,22 @@ def duidx(nick: str, request: Request, pattern: Optional[str]=None, sort: str="c
 def cacheinfo(nick: str="ALL", x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     return run_borghelper('cacheinfo',nick=nick,cacheable=True)
+
+@router.get("/repohistory",response_model=CommandResult,tags=["lecture"])
+def repohistory(nick: str, x_api_key: Optional[str]=Header(default=None)):
+    """Story 2 (spec-charts-evolution-sauvegardes) : historique brut repo_stats pour un nick,
+    délégué au sous-processus borgHelper (AD-1, jamais d'accès SQLite direct ici). `nick` en
+    paramètre de requête (pas un segment d'URL) pour que _check_group_access le voit (voir Design
+    Notes du spec). Pas de filtrage par périmètre de chemin : agrégats sans chemin de fichier."""
+    require_api_key(x_api_key)
+    return run_borghelper('repohistory',nick=nick,extra_args=['-j'],cacheable=True)
+
+@router.get("/archivehistory",response_model=CommandResult,tags=["lecture"])
+def archivehistory(nick: str, x_api_key: Optional[str]=Header(default=None)):
+    """Story 2 (spec-charts-evolution-sauvegardes) : historique brut archive_stats pour un nick,
+    même patron que /repohistory ci-dessus."""
+    require_api_key(x_api_key)
+    return run_borghelper('archivehistory',nick=nick,extra_args=['-j'],cacheable=True)
 
 @router.post("/cacheclean",response_model=CommandResult,tags=["mutation"])
 def cacheclean(nick: str="ALL", x_api_key: Optional[str]=Header(default=None)):
