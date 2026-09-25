@@ -6,7 +6,7 @@
 #* See <http://www.gnu.org/licenses/>
 #*/
 
-import os,re,sys,io,json,sqlite3,secrets,subprocess,configparser,tarfile,hmac,hashlib
+import os,re,sys,io,json,sqlite3,secrets,subprocess,configparser,tarfile,hmac,hashlib,asyncio,contextlib
 from pathlib import Path
 from typing import Optional
 from collections import defaultdict
@@ -22,7 +22,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.15.3"
+WWW_VERSION="1.16.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -129,6 +129,20 @@ if API_PREFIX and not API_PREFIX.startswith('/'): API_PREFIX='/'+API_PREFIX
 # (_check_group_access). Vide/absent : fonctionnalité désactivée, comportement inchangé (X-API-Key
 # seul fait foi). GROUPS_HEADER est le nom du header HTTP à lire (ex. 'X-Groups'), jamais la valeur.
 GROUPS_HEADER=os.environ.get('BORGHELPERWWW_GROUPS_HEADER','').strip() or None
+# Watcher bkp_status (Story 1, spec-notifications-push) — AD-3/AD-7 : période d'interrogation et
+# délai avant qu'une ligne started_at sans finished_at (processus tué, SIGKILL/OOM) soit traitée
+# comme un échec. Le timeout doit rester largement supérieur à la durée normale d'un Bkp (6h par
+# défaut) — un délai trop court déclencherait de fausses alertes d'échec sur une sauvegarde encore
+# en cours.
+BKP_WATCHER_INTERVAL=int(os.environ.get('BORGHELPERWWW_BKP_WATCHER_INTERVAL','30'))
+# Une valeur non numérique planterait au démarrage, et une valeur <1 produit un modificateur SQLite
+# datetime invalide (NULL silencieux -> la branche timeout AD-7 ne matche jamais) : repli sur le
+# défaut dans les deux cas, même motif que _stats_retention_months (borgHelper).
+try:
+    BKP_STATUS_TIMEOUT=int(os.environ.get('BORGHELPERWWW_BKP_STATUS_TIMEOUT','21600'))
+    if BKP_STATUS_TIMEOUT<1: BKP_STATUS_TIMEOUT=21600
+except ValueError:
+    BKP_STATUS_TIMEOUT=21600
 
 if not CFGFILE:
     sys.exit("Fichier de conf manquant — -C/--cfgfile ou BORGHELPERWWW_CFGFILE (chemin du .borghelperrc dédié à l'API)")
@@ -146,6 +160,44 @@ if not BORGHELPER_BIN.is_file():
 print(f"Actions destructrices (Prune/DelBkp) : {'AUTORISÉES' if ALLOW_DESTRUCTIVE else 'interdites (défaut)'}"
       f" — Téléchargements (restauration) : {'autorisés (défaut)' if ALLOW_DOWNLOADS else 'INTERDITS'}",file=sys.stderr)
 
+# ── Watcher bkp_status (Story 1, spec-notifications-push) ──────────────────────
+# Premier composant de fond de borgHelperWWW : tâche asyncio démarrée via le hook de cycle de vie
+# FastAPI (lifespan), un watcher par processus worker uvicorn (--workers 2 déjà documenté) — aucune
+# coordination inter-process requise, chaque worker réclame les lignes bkp_status par comparer-et-
+# échanger (AD-3), donc deux workers qui tombent sur la même ligne au même moment n'en traitent
+# jamais qu'un seul (l'autre voit 0 ligne affectée et passe). Pour cette story, la réclamation se
+# limite à journaliser (log serveur) nick/run_id/result — Story 2 la remplacera par l'envoi push
+# réel (pywebpush).
+def _bkp_status_watcher_pass():
+    """Un passage d'interrogation : parcourt chaque nick connu, réclame les lignes bkp_status prêtes
+    (terminées, ou bloquées depuis plus de BKP_STATUS_TIMEOUT secondes — AD-7) et journalise le
+    résultat de celles que CE worker a effectivement gagnées à la réclamation CAS."""
+    for nick in _nick_list('ALL'):
+        try:
+            db_path=_bh_paths.db.get_diff_db(nick)
+            _bh_paths.db.ensure_diff_db(db_path,create=False)  # AD-12 : jamais créer pour un nick sans historique
+            for row in _bh_paths.db.list_pending_bkp_status(nick,BKP_STATUS_TIMEOUT,db_path):
+                if not _bh_paths.db.claim_bkp_status(nick,row['run_id'],db_path):
+                    continue  # déjà réclamée par un autre worker (CAS perdu) — jamais de double traitement
+                result=row['result'] if row['finished_at'] else 'error'  # AD-7 : jamais fini = échec
+                print(f"[watcher] bkp_status réclamé : nick={nick} run_id={row['run_id']} result={result}",
+                      file=sys.stderr,flush=True)
+        except Exception as e:
+            # Un nick en erreur (DB corrompue, etc.) ne doit jamais aveugler les autres nicks de ce
+            # passage — isolation par nick, le passage suivant réessaiera.
+            print(f"[watcher] nick={nick} erreur : {e}",file=sys.stderr,flush=True)
+            continue
+
+async def _bkp_status_watcher():
+    print(f"[watcher] bkp_status démarré — interrogation toutes les {BKP_WATCHER_INTERVAL}s, "
+          f"timeout AD-7 {BKP_STATUS_TIMEOUT}s",file=sys.stderr,flush=True)
+    while True:
+        try:
+            await asyncio.to_thread(_bkp_status_watcher_pass)
+        except Exception as e:
+            print(f"[watcher] erreur pendant l'interrogation bkp_status : {e}",file=sys.stderr,flush=True)
+        await asyncio.sleep(BKP_WATCHER_INTERVAL)
+
 app=FastAPI(
     title="borgHelperWWW",
     version=BORGHELPER_VERSION,
@@ -161,6 +213,20 @@ app=FastAPI(
         f"{CFGFILE} — à réserver au provisioning, pas à un usage courant."
     ),
 )
+
+_bkp_watcher_task=None
+
+@app.on_event("startup")
+async def _start_bkp_status_watcher():
+    global _bkp_watcher_task
+    _bkp_watcher_task=asyncio.create_task(_bkp_status_watcher())
+
+@app.on_event("shutdown")
+async def _stop_bkp_status_watcher():
+    if _bkp_watcher_task is None: return
+    _bkp_watcher_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await _bkp_watcher_task
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 
@@ -736,21 +802,39 @@ def _capture_fingerprints(nick):
     except OSError: cfg_mtime='absent'
     return {n:f"{_cache_fingerprint(n)}|cfgfile:{cfg_mtime}" for n in _nick_list(nick)}
 
-def _exec_borghelper(cmd: str, nick: Optional[str], extra_args, passphrase: Optional[str]=None) -> CommandResult:
-    """Sous-processus borgHelper brut, sans cache ni encapsulation JSONResponse — factorisé hors de
-    `run_borghelper()` pour être réutilisé tel quel par `_run_scoped()` (Story 1.3), qui a besoin du
-    `stdout` brut avant de le filtrer et ne doit jamais passer par `_RESPONSE_CACHE` (Boundaries du
-    spec 1.3 : le cache reste réservé au cas non restreint)."""
+def _build_borghelper_argv_env(cmd: str, nick: Optional[str], extra_args, passphrase: Optional[str]=None):
+    """argv/env communs à tout lancement de borgHelper en sous-processus — factorisé pour être
+    partagé entre `_exec_borghelper` (attend le résultat) et `_launch_bkp_detached` (AD-2, ne
+    l'attend jamais)."""
     argv=[sys.executable,str(BORGHELPER_BIN),'-C',CFGFILE,'-c',cmd]
     if nick: argv+=['-n',nick]
     argv+=list(extra_args)
     env=os.environ.copy()
     if passphrase: env['BORGHELPERC_RUNTIME_PASSPHRASE']=passphrase
+    return argv,env
+
+def _exec_borghelper(cmd: str, nick: Optional[str], extra_args, passphrase: Optional[str]=None) -> CommandResult:
+    """Sous-processus borgHelper brut, sans cache ni encapsulation JSONResponse — factorisé hors de
+    `run_borghelper()` pour être réutilisé tel quel par `_run_scoped()` (Story 1.3), qui a besoin du
+    `stdout` brut avant de le filtrer et ne doit jamais passer par `_RESPONSE_CACHE` (Boundaries du
+    spec 1.3 : le cache reste réservé au cas non restreint)."""
+    argv,env=_build_borghelper_argv_env(cmd,nick,extra_args,passphrase)
     try:
         proc=subprocess.run(argv,capture_output=True,text=True,timeout=TIMEOUT,env=env)
     except subprocess.TimeoutExpired:
         raise HTTPException(504,detail=f"Commande {cmd} : timeout après {TIMEOUT}s")
     return CommandResult(exitcode=proc.returncode,stdout=proc.stdout,stderr=proc.stderr)
+
+def _launch_bkp_detached(nick: str, extra_args, passphrase: Optional[str]=None) -> int:
+    """Lance `borgHelper -c Bkp` en sous-processus détaché (AD-2) : jamais attendu par la requête
+    HTTP — le résultat réel est capté par `bkp_status` (borgHelper) et réclamé par le watcher, pas
+    par le stdout/stderr/exitcode de ce sous-processus (jamais lus ici, `DEVNULL`).
+    `start_new_session=True` : le sous-processus survit à un redémarrage de borgHelperWWW pendant la
+    sauvegarde (AD-2) — sans ça, un redémarrage pendant un Bkp le tuerait avec le worker parent."""
+    argv,env=_build_borghelper_argv_env('bkp',nick,extra_args,passphrase)
+    proc=subprocess.Popen(argv,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,stdin=subprocess.DEVNULL,
+                           env=env,start_new_session=True)
+    return proc.pid
 
 def run_borghelper(cmd: str, nick: Optional[str]=None, extra_args=(), passphrase: Optional[str]=None,
                     cacheable: bool=False) -> JSONResponse:
@@ -1430,12 +1514,32 @@ def init(nick: str, x_api_key: Optional[str]=Header(default=None), x_borg_passph
     require_api_key(x_api_key)
     return run_borghelper('init',nick=nick,passphrase=x_borg_passphrase)
 
-@router.post("/bkp",response_model=CommandResult,tags=["mutation"],summary="Lance un backup (+ indexation automatique)")
+@router.post("/bkp",response_model=CommandResult,tags=["mutation"],
+    summary="Lance un backup en tâche de fond (+ indexation automatique) — répond dès le lancement",
+    description="⚠️ Asynchrone (rupture de compatibilité, AD-2) : détache le sous-processus et "
+        "répond dès son lancement confirmé, jamais à la fin de la sauvegarde. `exitcode=0` "
+        "signifie « lancement réussi », pas « sauvegarde réussie » — le résultat réel (succès/"
+        "échec) est capté par `bkp_status` et journalisé par le watcher (Story 2 : notification "
+        "push). Voir CHANGELOG.md.")
 def bkp(nick: str, no_index: bool=False, x_api_key: Optional[str]=Header(default=None),
         x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
+    # Le sous-processus détaché ne fera remonter aucune erreur de lancement (cfgreaded()/EXCLUDE
+    # manquant -> sys.exit avant store_bkp_status_start, invisible côté bkp_status/watcher) : valide
+    # ici, de façon synchrone, ce que backup() validerait de toute façon avant le premier signal.
+    cfg=_bh_paths.borg.cfgread(nick)
+    if cfg is None:
+        raise HTTPException(404,detail=f"Nick inconnu : {nick}")
+    if 'EXCLUDE' not in cfg.keys():
+        raise HTTPException(400,detail=f"EXCLUDE non configuré pour {nick} dans ~/.borghelperrc")
     extra=['-I'] if no_index else []
-    return run_borghelper('bkp',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
+    try:
+        pid=_launch_bkp_detached(nick,extra,x_borg_passphrase)
+    except OSError as e:
+        raise HTTPException(500,detail=f"Échec du lancement de Bkp pour {nick} : {e}")
+    return CommandResult(exitcode=0,
+        stdout=f"Sauvegarde démarrée pour {nick} (pid {pid}) — asynchrone, résultat via bkp_status/watcher",
+        stderr="")
 
 @router.get("/key",response_model=CommandResult,tags=["lecture"],summary="Exporte la clef du dépôt (format papier)")
 def key(nick: str, x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):

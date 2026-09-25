@@ -924,6 +924,8 @@ Trois façons de configurer, cumulables — par ordre de priorité (la première
 | `BORGHELPERWWW_API_PREFIX` | `--api-prefix` | `api_prefix` | Préfixe de toutes les routes API — défaut `/api` (voir ci-dessous) |
 | `BORGHELPERWWW_GROUPS_HEADER` | `--groups-header` | `groups_header` | Header HTTP contenant les groupes de l'utilisateur (reverse proxy OIDC) — absent : **désactivé** (voir ci-dessous) |
 | `BORGHELPERWWW_SCOPE_CACHE_DB` | `--scope-cache-db` | `scope_cache_db` | Chemin du fichier SQLite du cache de réponses **filtrées** par périmètre (Story 1.5) — défaut : co-localisé avec `cache.db`/`diff.db` (voir [Cache de réponses](#cache-de-réponses)) |
+| `BORGHELPERWWW_BKP_WATCHER_INTERVAL` | — | — | Intervalle (secondes) d'interrogation `bkp_status` par le watcher — défaut 30 (voir `POST /bkp` asynchrone ci-dessus) |
+| `BORGHELPERWWW_BKP_STATUS_TIMEOUT` | — | — | Délai (secondes) avant qu'une sauvegarde démarrée mais jamais terminée soit traitée comme un échec (AD-7) — défaut 21600 (6h) |
 
 Le serveur refuse de démarrer si le fichier de conf `.borghelperrc` (`cfgfile`) est absent (aucun des
 trois moyens ne l'a fourni). La clé API, elle, n'est **pas requise** : si absente partout,
@@ -1431,7 +1433,7 @@ servi comme une réponse obsolète.
 | POST | `/restore` | Restore | |
 | DELETE | `/delbkp` | DelBkp ⚡ | |
 | POST | `/init` | Init | |
-| POST | `/bkp` | Bkp | |
+| POST | `/bkp` | Bkp *(asynchrone — voir ci-dessous)* | |
 | GET | `/key` | Key | |
 | POST | `/prune` | Prune ⚡ | |
 | POST | `/index` | Index | |
@@ -1460,6 +1462,19 @@ Réponse (`CommandResult`) commune à tous les endpoints ci-dessus :
 ```
 
 `exitcode != 0` ⇒ HTTP 400 (le détail reste dans le corps JSON — voir [Codes retour](#codes-retour)).
+
+**⚠️ `POST /bkp` est asynchrone** (rupture de compatibilité, depuis 1.16.0) : contrairement à toutes
+les autres routes ci-dessus, elle ne lance jamais `borgHelper -c Bkp` en l'attendant. Elle détache le
+sous-processus (`start_new_session=True` — survit à un redémarrage de `borgHelperWWW` pendant la
+sauvegarde) et répond dès son lancement confirmé, pas à la fin de la sauvegarde. `exitcode: 0` signifie
+donc **« lancement réussi »**, jamais « sauvegarde réussie » — `stdout` contient un message
+informatif (`"Sauvegarde démarrée pour <nick> (pid <pid>) — ..."`), jamais la sortie de `borgHelper`
+lui-même. Le résultat réel (succès/échec) est capté par une table dédiée `bkp_status` (`diff.db`,
+exclusive à `Bkp`) et réclamé périodiquement par une tâche de fond (« watcher », un par worker
+uvicorn) qui journalise `nick`/`run_id`/`result` (une future story remplacera la journalisation par
+une notification push réelle). Intervalle d'interrogation et délai avant qu'une sauvegarde bloquée
+soit traitée comme un échec : `BORGHELPERWWW_BKP_WATCHER_INTERVAL` (déf. 30s) et
+`BORGHELPERWWW_BKP_STATUS_TIMEOUT` (déf. 21600s = 6h) — voir [Configuration](#configuration).
 
 `GET /access` : protégée par `X-API-Key` (contrairement à `/version`), mais **jamais** par
 l'autorisation par groupes elle-même — son seul but est de la refléter. Renvoie, pour **chaque**

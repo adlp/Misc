@@ -2092,3 +2092,153 @@ sinon, dans le sens le moins risqué : le faux deviendrait plus verbeux que le v
 tant que le vrai continue d'émettre cet avertissement). Un futur nettoyage naturel serait de retirer
 `--numeric-owner` de `_borg_extract_args` (déprécié par `borg` lui-même) — hors périmètre de cette
 story, non traité ici.
+
+## `bkp_status` et watcher — détection de fin de sauvegarde (`borgHelper` 1.0.109 / `borgHelperWWW` 1.16.0, Story 1 de `spec-notifications-push`)
+
+Préalable à l'envoi de notifications push (Story 2, à venir) : un signal fiable pour savoir, après
+coup et quel que soit le déclencheur, si un `Bkp` a réussi ou échoué. Paradigme retenu (voir
+`ARCHITECTURE-SPINE.md` de ce spec) : un signal **dédié**, écrit à la source par `backup()`, jamais un
+signal existant détourné (`priority.lock` est partagé avec `Restore` et keyé par dépôt, pas par nick ;
+`archive_stats` est aussi écrit par `Index` — ni l'un ni l'autre n'a la précision requise).
+
+### Table `bkp_status` (`diff.db`, exclusive à `Bkp`)
+
+```sql
+CREATE TABLE IF NOT EXISTS bkp_status (
+    nick        TEXT NOT NULL,
+    run_id      TEXT NOT NULL,
+    started_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at TEXT,
+    result      TEXT,
+    notified_at TEXT,
+    PRIMARY KEY (nick, run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bkpstatus_pending ON bkp_status(nick, notified_at, finished_at);
+```
+
+Ajoutée dans `ensure_diff_db()`, additive (`CREATE TABLE IF NOT EXISTS`, comme `archive_stats`/
+`diff_excluded_stats` en leur temps) — **pas de bump `DIFF_DB_SCHEMA_VERSION`** : table entièrement
+nouvelle, aucune donnée existante à transformer, un ancien binaire qui ignorerait cette table continue
+de fonctionner sans dégradation sur tout le reste. Aucune colonne `path` : hors du périmètre du codec
+de chiffrement des chemins (`PathCodec`) — écritures/lectures directes, sans `_write_mode_check` ni
+`_path_stored`. `run_id` = `uuid.uuid4().hex`, généré par `backup()` à chaque appel.
+
+Jamais écrite par `Restore`/`Index`/`Prune` — exclusive à `backup()`. Cinq méthodes `BorgHelperDB`
+(toutes acceptent `db_path=None` → `self.get_diff_db(nick)`, même convention que
+`store_archive_stats`/`store_repo_stats`) :
+
+- `store_bkp_status_start(nick, run_id, db_path=None)` — `INSERT`, `started_at=datetime('now')`, reste
+  `NULL`.
+- `store_bkp_status_finish(nick, run_id, result, db_path=None)` — `UPDATE ... SET finished_at=...,
+  result=? WHERE nick=? AND run_id=?` : c'est ce `WHERE` qui garantit qu'elle ne touche que la ligne
+  créée par ce `backup()` (un seul appelant possible, celui qui a créé cette ligne).
+- `store_bkp_status_safety_net(nick, run_id, db_path=None)` — `UPDATE ... WHERE finished_at IS NULL` :
+  ne touche **que** si la fin normale n'a pas déjà écrit de résultat (jamais d'écrasement).
+- `list_pending_bkp_status(nick, timeout_s, db_path=None)` — lecture seule, `WHERE nick=? AND
+  notified_at IS NULL AND (finished_at IS NOT NULL OR started_at < datetime('now','-N seconds'))` ;
+  `timeout_s` passé en f-string après `int()` (même idiome que `store_repo_stats`/
+  `STATS_RETENTION_MONTHS`, jamais une valeur non castée).
+- `claim_bkp_status(nick, run_id, db_path=None)` — écriture CAS, `UPDATE bkp_status SET
+  notified_at=datetime('now') WHERE nick=? AND run_id=? AND notified_at IS NULL`, retourne
+  `cur.rowcount==1` (`True` = cet appel a gagné).
+
+### `backup()` — écriture début/fin/filet de sécurité
+
+```
+set_priority_lock(nick)
+wait_index_idle(nick)
+run_id = uuid.uuid4().hex
+ensure_diff_db(diff_db)
+store_bkp_status_start(nick, run_id, diff_db)     # AVANT tout appel boex()
+try:
+    ... boex('create', ...) ...
+    newretC = 0 ou 2 (inchangé)
+    ... indexation post-backup (inchangée) ...
+    store_bkp_status_finish(nick, run_id, 'success' if newretC==0 else 'error', diff_db)
+    sys.exit(newretC)
+finally:
+    clear_priority_lock(nick)                      # inchangé
+    store_bkp_status_safety_net(nick, run_id, diff_db)   # NOUVEAU
+```
+
+Le filet de sécurité dans le `finally` existant (qui relâche déjà `priority.lock`) ferme
+immédiatement en `result='error'` toute ligne encore sans `finished_at` — couvre une exception non
+gérée depuis `boex()` ou ailleurs dans le corps de `backup()`, **sans attendre** le timeout AD-7 du
+watcher ci-dessous. C'est un filet **différent** de celui-là : le timeout AD-7 couvre le cas où le
+processus est tué (SIGKILL/OOM) avant même d'atteindre ce `finally` (ex. le kernel OOM-killer ne
+laisse jamais un process exécuter son `finally`) — dans ce cas, la ligne `bkp_status` reste
+`finished_at IS NULL` en base pour toujours ; c'est au watcher, pas à `backup()`, de la traiter comme
+un échec après le délai.
+
+### Watcher (`borgHelperWWW`, premier composant de fond du fichier)
+
+```python
+@app.on_event("startup")
+async def _start_bkp_status_watcher():
+    global _bkp_watcher_task
+    _bkp_watcher_task = asyncio.create_task(_bkp_status_watcher())
+
+@app.on_event("shutdown")
+async def _stop_bkp_status_watcher():
+    _bkp_watcher_task.cancel()
+    ...
+```
+
+`@app.on_event(...)` plutôt que le paramètre `FastAPI(lifespan=...)` (plus récent) : l'environnement
+d'exécution observé embarque FastAPI 0.63 (paquet système `python3-fastapi`, aucune version épinglée
+dans ce projet — voir README « `pip install fastapi uvicorn pydantic` », sans contrainte de version),
+qui **ne supporte pas** `lifespan=` au constructeur (`TypeError` à l'import, vérifié directement).
+`on_event` reste supporté par toutes les versions de FastAPI couramment rencontrées, y compris les
+plus récentes (juste dépréciée en faveur de `lifespan`, pas retirée).
+
+Une tâche asyncio par processus **worker** uvicorn (`--workers 2` déjà documenté) — aucune
+coordination inter-process nécessaire : chaque worker interroge indépendamment, et la réclamation CAS
+de `claim_bkp_status` garantit qu'un seul gagne par ligne même si plusieurs l'observent au même
+balayage. `_bkp_status_watcher_pass()` (fonction synchrone, exécutée via `asyncio.to_thread` pour ne
+jamais bloquer la boucle événementielle pendant les appels SQLite) : pour chaque nick connu
+(`_nick_list('ALL')`), `ensure_diff_db(db_path, create=False)` (AD-12 : jamais créer de fichier pour
+un nick sans historique), puis `list_pending_bkp_status`/`claim_bkp_status`. Pour cette story, une
+réclamation gagnée se contente de journaliser (log serveur, `stderr`) `nick`/`run_id`/`result` — Story
+2 remplacera cette ligne par l'appel `pywebpush` réel.
+
+`BORGHELPERWWW_BKP_WATCHER_INTERVAL` (déf. 30s) : période entre deux balayages.
+`BORGHELPERWWW_BKP_STATUS_TIMEOUT` (déf. 21600s = 6h, AD-7) : délai au-delà duquel une ligne
+`started_at` sans `finished_at` est traitée comme un échec par `list_pending_bkp_status` — **le
+résultat en base reste `NULL`** dans ce cas précis (le watcher ne réécrit que `notified_at`, jamais
+`finished_at`/`result` d'une ligne qu'il n'a pas lui-même terminée) : le `'error'` de la journalisation
+est dérivé en mémoire (`row['result'] if row['finished_at'] else 'error'`), pas persisté — cohérent
+avec le texte de la spec (« traitée comme `result='error'` **par le watcher** ») et avec la formule
+CAS exacte donnée par `ARCHITECTURE-SPINE.md` (`UPDATE bkp_status SET notified_at=? WHERE run_id=? AND
+notified_at IS NULL`, qui ne touche que `notified_at`).
+
+### `POST /bkp` — asynchrone (AD-2, rupture de compatibilité)
+
+`_build_borghelper_argv_env(cmd, nick, extra_args, passphrase)` factorise l'argv/env commun entre
+`_exec_borghelper` (attend le résultat, `subprocess.run`) et `_launch_bkp_detached` (ne l'attend
+jamais, `subprocess.Popen(..., stdout=DEVNULL, stderr=DEVNULL, stdin=DEVNULL,
+start_new_session=True)`). `start_new_session=True` place le sous-processus dans sa propre session
+POSIX (équivalent `setsid`) : il survit à un redémarrage/crash de `borgHelperWWW` pendant la
+sauvegarde — sans ça, tuer/redémarrer le worker parent enverrait SIGHUP/SIGTERM au groupe de processus
+et interromprait le `Bkp` en cours.
+
+La réponse HTTP (`CommandResult(exitcode=0, stdout="Sauvegarde démarrée pour <nick> (pid <pid>) —
+...", stderr="")`) est **synthétique** — jamais le `stdout`/`stderr`/`exitcode` réels de `borgHelper`,
+qui ne sont plus jamais lus par `borgHelperWWW` pour cette route (`DEVNULL`). Seul échec possible côté
+route : `OSError` au `Popen` lui-même (binaire manquant, `ulimit` atteint, etc.) → `HTTPException(500)`
+— tout le reste (échec du `Bkp` lui-même une fois lancé) est invisible à cette réponse, capté
+uniquement par `bkp_status`.
+
+### Vérification
+
+- `CodecSelfTest` (le nom ne couvre plus que l'historique — convention existante pour toute
+  vérification DB de ce projet, voir `AGENTS.md`) : section « bkp_status » — écriture start/finish
+  (succès et échec), filet de sécurité (ligne non finie → `error` immédiat ; ligne déjà finie →
+  inchangée), `list_pending_bkp_status` (lignes finies + bloquées au-delà du timeout AD-7, jamais les
+  récentes), `claim_bkp_status` CAS concurrent (`ThreadPoolExecutor`, deux réclamations simultanées sur
+  la même ligne, une seule gagne) — 309/309 `OK`.
+- Test réel sur `demo.borghelperrc` (`borgHelperWWW -C demo.borghelperrc -K ... --port 8791`,
+  `POST /api/bkp?nick=demo-modules`) : réponse en **~0,1s** (contre la durée complète de la sauvegarde
+  auparavant) ; `bkp_status` observée directement en base — ligne `started_at` posée au lancement,
+  `finished_at`/`result='success'` à la fin réelle du `Bkp` (~12s plus tard sur ce jeu de données) ;
+  log serveur `[watcher] bkp_status réclamé : nick=demo-modules run_id=... result=success` dans le
+  balayage suivant.

@@ -6,11 +6,11 @@
 #* See <http://www.gnu.org/licenses/>
 #*/
 
-import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading
+import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading,uuid
 import hmac,hashlib,secrets,base64,stat,functools,shutil
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.108"
+Version="1.0.109"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -1457,6 +1457,16 @@ class BorgHelperDB:
                     PRIMARY KEY (nick, archive)
                 );
                 CREATE INDEX IF NOT EXISTS idx_astats_nick ON archive_stats(nick);
+                CREATE TABLE IF NOT EXISTS bkp_status (
+                    nick        TEXT NOT NULL,
+                    run_id      TEXT NOT NULL,
+                    started_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                    finished_at TEXT,
+                    result      TEXT,
+                    notified_at TEXT,
+                    PRIMARY KEY (nick, run_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_bkpstatus_pending ON bkp_status(nick, notified_at, finished_at);
                 CREATE TABLE IF NOT EXISTS diff_excluded_stats (
                     nick        TEXT NOT NULL,
                     archive_old TEXT NOT NULL,
@@ -1610,6 +1620,82 @@ class BorgHelperDB:
                 conn.execute("INSERT OR REPLACE INTO archive_stats (nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles) VALUES (?,?,?,?,?,?,?,?)",
                              (nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles))
                 conn.commit(); return True
+            finally: conn.close()
+        try: return self._with_lock_retry(_do)
+        except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
+
+    # ── bkp_status (Story 1, spec-notifications-push) : exclusif à backup(), jamais Restore/Index/
+    # Prune (AD-3). Aucune colonne `path` -> hors du périmètre du codec de chiffrement des chemins,
+    # écritures/lectures directes, sans _write_mode_check ni _path_stored.
+
+    def store_bkp_status_start(self,nick,run_id,db_path=None):
+        """Écrite par backup(), juste après set_priority_lock, avant tout appel boex()."""
+        if db_path is None: db_path=self.get_diff_db(nick)
+        def _do():
+            conn=_open_db(db_path,nick=nick,role='write')
+            try:
+                conn.execute("INSERT INTO bkp_status (nick,run_id,started_at) VALUES (?,?,datetime('now'))",(nick,run_id))
+                conn.commit(); return True
+            finally: conn.close()
+        try: return self._with_lock_retry(_do)
+        except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
+
+    def store_bkp_status_finish(self,nick,run_id,result,db_path=None):
+        """Écrite par backup() à la fin normale, avant sys.exit(newretC) — result dérivé du même
+        newretC qu'aujourd'hui ('success' si 0, sinon 'error')."""
+        if db_path is None: db_path=self.get_diff_db(nick)
+        def _do():
+            conn=_open_db(db_path,nick=nick,role='write')
+            try:
+                conn.execute("UPDATE bkp_status SET finished_at=datetime('now'),result=? WHERE nick=? AND run_id=?",(result,nick,run_id))
+                conn.commit(); return True
+            finally: conn.close()
+        try: return self._with_lock_retry(_do)
+        except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
+
+    def store_bkp_status_safety_net(self,nick,run_id,db_path=None):
+        """Filet de sécurité appelé depuis le `finally` de backup() : ne touche QUE une ligne encore
+        sans finished_at (exception non gérée depuis boex()/ailleurs) — jamais d'écrasement d'un
+        résultat déjà écrit par la fin normale. Ferme immédiatement ce cas, sans attendre le timeout
+        AD-7 (qui reste un filet supplémentaire pour un processus tué avant même d'atteindre ce
+        `finally`, ex. SIGKILL/OOM)."""
+        if db_path is None: db_path=self.get_diff_db(nick)
+        def _do():
+            conn=_open_db(db_path,nick=nick,role='write')
+            try:
+                conn.execute("UPDATE bkp_status SET finished_at=datetime('now'),result='error' "
+                             "WHERE nick=? AND run_id=? AND finished_at IS NULL",(nick,run_id))
+                conn.commit(); return True
+            finally: conn.close()
+        try: return self._with_lock_retry(_do)
+        except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
+
+    def list_pending_bkp_status(self,nick,timeout_s,db_path=None):
+        """Lignes bkp_status prêtes à être réclamées par le watcher (borgHelperWWW) : terminées
+        (finished_at renseigné) ou bloquées depuis plus de timeout_s secondes sans fin (AD-7).
+        Jamais de réclamation ici (lecture seule) — voir claim_bkp_status."""
+        if db_path is None: db_path=self.get_diff_db(nick)
+        try:
+            conn=_open_db(db_path,nick=nick,role='read')
+            rows=conn.execute(
+                "SELECT run_id,started_at,finished_at,result FROM bkp_status WHERE nick=? AND notified_at IS NULL "
+                f"AND (finished_at IS NOT NULL OR started_at < datetime('now','-{int(timeout_s)} seconds'))",
+                (nick,)).fetchall()
+            conn.close()
+            return [{'run_id':r[0],'started_at':r[1],'finished_at':r[2],'result':r[3]} for r in rows]
+        except sqlite3.Error: return []
+
+    def claim_bkp_status(self,nick,run_id,db_path=None):
+        """Réclamation par comparer-et-échanger (AD-3) : UPDATE ... WHERE notified_at IS NULL, jamais
+        de lecture-puis-écriture séparées — condition nécessaire à un déploiement multi-workers sans
+        double envoi. True si CETTE réclamation a gagné (une ligne affectée), False si déjà réclamée
+        par un autre worker (0 ligne affectée, jamais une erreur)."""
+        if db_path is None: db_path=self.get_diff_db(nick)
+        def _do():
+            conn=_open_db(db_path,nick=nick,role='write')
+            try:
+                cur=conn.execute("UPDATE bkp_status SET notified_at=datetime('now') WHERE nick=? AND run_id=? AND notified_at IS NULL",(nick,run_id))
+                conn.commit(); return cur.rowcount==1
             finally: conn.close()
         try: return self._with_lock_retry(_do)
         except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
@@ -2914,7 +3000,16 @@ class BorgHelper:
             create.extend(cfg['EXCLUDE_NEXT'].split(' '))
         self.db.set_priority_lock(nick)
         self.db.wait_index_idle(nick)
+        # bkp_status (Story 1, spec-notifications-push) : signal dédié, exclusif à backup(), écrit
+        # AVANT tout appel boex() — préalable à la détection de fin par le watcher borgHelperWWW.
+        # Reste À L'INTÉRIEUR du try (ensure_diff_db peut sys.exit/lever sur DB corrompue) : le
+        # `finally` ci-dessous doit couvrir cette fenêtre pour toujours libérer priority.lock.
         try:
+            run_id=uuid.uuid4().hex
+            bkp_status_db=self.db.get_diff_db(nick)
+            self.db.ensure_diff_db(bkp_status_db)
+            if not self.db.store_bkp_status_start(nick,run_id,bkp_status_db):
+                printer(f"[WARN] store_bkp_status_start a échoué pour {nick} (run_id={run_id})")
             anaRet=self.borg.boex(nick,create,preBorg=preBorg,forceEnv=forceEnv,debug=debug)
             newretC=0
             if anaRet['exitcode']:
@@ -2981,9 +3076,15 @@ class BorgHelper:
                         self.index(nick,debug=debug,set_pending=False)
                 except Exception as e:
                     printer(f"[WARN] indexation post-backup échouée : {e}")
+            self.db.store_bkp_status_finish(nick,run_id,'success' if newretC==0 else 'error',bkp_status_db)
             sys.exit(newretC)
         finally:
             self.db.clear_priority_lock(nick)
+            # Filet de sécurité (spec Boundaries) : si une exception non gérée (boex() ou ailleurs)
+            # a empêché store_bkp_status_finish ci-dessus, ferme la ligne en 'error' immédiatement —
+            # sans attendre le timeout AD-7 du watcher. No-op (CAS sur finished_at IS NULL) si la fin
+            # normale a déjà écrit le résultat.
+            self.db.store_bkp_status_safety_net(nick,run_id,bkp_status_db)
 
     def prune(self,nick,dryrun=False,debug=0):
         cfg=self.borg.cfgreaded(nick,debug=debug)
@@ -4880,6 +4981,78 @@ def codec_selftest():
               lambda: _cli_rh_multi_rejected('ArchiveHistory',rh_rc,'rhA,rhB')[0])
         check("ArchiveHistory -j -n ALL (plusieurs nicks configurés) : rejeté après expansion",
               lambda: _cli_rh_multi_rejected('ArchiveHistory',rh_rc,'ALL')[0])
+        # ── bkp_status (Story 1, spec-notifications-push) ──
+        bs_path=os.path.join(tmp,'bkpstatus.db'); bh.ensure_diff_db(bs_path)
+        def _bs_cols():
+            c=_open_db(bs_path,nick=None,role='read')
+            cols=set(r[1] for r in c.execute("PRAGMA table_info(bkp_status)").fetchall()); c.close()
+            return cols
+        check("bkp_status : table créée par ensure_diff_db",
+              lambda: {'nick','run_id','started_at','finished_at','result','notified_at'}<=_bs_cols())
+        def _bs_start_check():
+            bh.store_bkp_status_start('bsA','run1',db_path=bs_path)
+            c=_open_db(bs_path,nick='bsA',role='read')
+            row=c.execute("SELECT started_at,finished_at,result,notified_at FROM bkp_status WHERE nick='bsA' AND run_id='run1'").fetchone()
+            c.close()
+            return row is not None and row[0] is not None and row[1] is None and row[2] is None and row[3] is None
+        check("bkp_status : store_bkp_status_start -> started_at posé, le reste NULL",_bs_start_check)
+        def _bs_finish_success():
+            bh.store_bkp_status_finish('bsA','run1','success',db_path=bs_path)
+            c=_open_db(bs_path,nick='bsA',role='read')
+            row=c.execute("SELECT finished_at,result FROM bkp_status WHERE nick='bsA' AND run_id='run1'").fetchone()
+            c.close()
+            return row[0] is not None and row[1]=='success'
+        check("bkp_status : store_bkp_status_finish('success') -> finished_at+result posés",_bs_finish_success)
+        def _bs_finish_error():
+            bh.store_bkp_status_start('bsA','run2',db_path=bs_path)
+            bh.store_bkp_status_finish('bsA','run2','error',db_path=bs_path)
+            c=_open_db(bs_path,nick='bsA',role='read')
+            row=c.execute("SELECT result FROM bkp_status WHERE nick='bsA' AND run_id='run2'").fetchone()
+            c.close()
+            return row[0]=='error'
+        check("bkp_status : store_bkp_status_finish('error') (newretC!=0)",_bs_finish_error)
+        def _bs_safety_net_unfinished():
+            bh.store_bkp_status_start('bsA','run3',db_path=bs_path)
+            bh.store_bkp_status_safety_net('bsA','run3',db_path=bs_path)
+            c=_open_db(bs_path,nick='bsA',role='read')
+            row=c.execute("SELECT finished_at,result FROM bkp_status WHERE nick='bsA' AND run_id='run3'").fetchone()
+            c.close()
+            return row[0] is not None and row[1]=='error'
+        check("bkp_status : filet de sécurité (finally) sur ligne non finie -> result='error' immédiat",_bs_safety_net_unfinished)
+        def _bs_safety_net_noop_if_already_finished():
+            bh.store_bkp_status_start('bsA','run4',db_path=bs_path)
+            bh.store_bkp_status_finish('bsA','run4','success',db_path=bs_path)
+            bh.store_bkp_status_safety_net('bsA','run4',db_path=bs_path)  # ne doit jamais écraser un résultat déjà écrit
+            c=_open_db(bs_path,nick='bsA',role='read')
+            row=c.execute("SELECT result FROM bkp_status WHERE nick='bsA' AND run_id='run4'").fetchone()
+            c.close()
+            return row[0]=='success'
+        check("bkp_status : filet de sécurité sans effet si déjà terminée (jamais d'écrasement)",_bs_safety_net_noop_if_already_finished)
+        def _bs_pending_query():
+            bh.store_bkp_status_start('bsB','runFinished',db_path=bs_path)
+            bh.store_bkp_status_finish('bsB','runFinished','success',db_path=bs_path)
+            bh.store_bkp_status_start('bsB','runRecent',db_path=bs_path)  # non finie, récente -> pas encore éligible
+            c=_open_db(bs_path,nick='bsB',role='write')
+            c.execute("INSERT INTO bkp_status (nick,run_id,started_at) VALUES ('bsB','runStale',datetime('now','-999 seconds'))")
+            c.commit(); c.close()
+            pending={r['run_id'] for r in bh.list_pending_bkp_status('bsB',100,db_path=bs_path)}
+            return pending=={'runFinished','runStale'}
+        check("bkp_status : list_pending_bkp_status -> lignes finies + bloquées > timeout (AD-7), jamais les récentes",_bs_pending_query)
+        def _bs_claim_cas():
+            bh.store_bkp_status_start('bsC','runC',db_path=bs_path)
+            bh.store_bkp_status_finish('bsC','runC','success',db_path=bs_path)
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                results=list(ex.map(lambda _:bh.claim_bkp_status('bsC','runC',db_path=bs_path),[0,1]))
+            return sorted(results)==[False,True]
+        check("bkp_status : claim_bkp_status CAS — deux réclamations concurrentes, une seule gagne",_bs_claim_cas)
+        check("bkp_status : claim_bkp_status sur ligne déjà réclamée -> False (idempotent)",
+              lambda: bh.claim_bkp_status('bsC','runC',db_path=bs_path) is False)
+        def _bs_claim_sets_notified_at():
+            c=_open_db(bs_path,nick='bsC',role='read')
+            v=c.execute("SELECT notified_at FROM bkp_status WHERE nick='bsC' AND run_id='runC'").fetchone()[0]
+            c.close()
+            return v is not None
+        check("bkp_status : claim_bkp_status gagnant -> notified_at posé en base",_bs_claim_sets_notified_at)
         # ── config DB_ENCRYPT / DB_KDF ──
         def _cfgsec(text,nick='n'):
             cp=configparser.ConfigParser(); cp.optionxform=str; cp.read_string(text); return cp[nick] if nick in cp else None

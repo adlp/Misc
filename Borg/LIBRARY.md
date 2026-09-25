@@ -325,6 +325,34 @@ for path, nb in rows:
 conn.close()
 ```
 
+### Consulter le statut des sauvegardes (`bkp_status`, Story 1 spec-notifications-push)
+
+```python
+from borgHelper import BorgHelper
+
+bh = BorgHelper()
+
+# bh.backup(nick) écrit désormais une ligne bkp_status (diff.db, exclusif à backup()) à son début
+# et à sa fin — 'success'/'error' dérivé du même code retour que sys.exit(). Lecture/réclamation
+# directes via bh.db, sans passer par sqlite3 : mêmes méthodes que le watcher borgHelperWWW.
+db_path = bh.db.get_diff_db('mon-serveur')
+
+# Lignes prêtes à être traitées : terminées, ou bloquées depuis plus de timeout_s secondes sans fin
+# (processus tué avant sa fin normale — AD-7). Ne modifie rien (lecture seule).
+pending = bh.db.list_pending_bkp_status('mon-serveur', timeout_s=21600, db_path=db_path)
+for row in pending:
+    # 'result' est None pour une ligne réclamée uniquement via le timeout (jamais écrit en base
+    # dans ce cas) — la traiter comme un échec dans ce cas précis :
+    result = row['result'] if row['finished_at'] else 'error'
+    print(row['run_id'], result)
+
+# Réclamation par comparer-et-échanger — jamais deux appelants (process/thread) ne gagnent sur la
+# même ligne : True = cet appel a gagné, False = déjà réclamée ailleurs (pas une erreur).
+for row in pending:
+    if bh.db.claim_bkp_status('mon-serveur', row['run_id'], db_path=db_path):
+        print('réclamée :', row['run_id'])
+```
+
 ### Consulter les fichiers exclus des filtres d'indexation
 
 ```python
@@ -582,7 +610,7 @@ sys.exit(0)
 
 | Méthode | Description |
 |---------|-------------|
-| `backup(nick, no_index, debug)` | Lance `borg create` + indexation automatique (indexsnap + index ciblé sur la nouvelle archive) ; si un `Index` externe avait été interrompu, le relance en fin d'exécution |
+| `backup(nick, no_index, debug)` | Lance `borg create` + indexation automatique (indexsnap + index ciblé sur la nouvelle archive) ; si un `Index` externe avait été interrompu, le relance en fin d'exécution ; écrit une ligne `bkp_status` (diff.db) à son début et à sa fin (`'success'`/`'error'` dérivé de `sys.exit()` — voir `bh.db.list_pending_bkp_status`/`claim_bkp_status` ci-dessous) |
 | `prune(nick, dryrun, debug)` | `borg prune` + compact + nettoyage index |
 | `index(nick, debug, db_path, force, target_archive, set_pending)` | Indexe les diffs, parallèle ; `target_archive` restreint à une paire ; `set_pending=True` (défaut) pose `index-pending.lock` si interrompu par priorité — mettre `False` pour les appels internes |
 | `indexsnap(nick, debug, db_path, force)` | Snapshot de la dernière archive — incrémental par défaut (force=True pour `borg list` complet) ; purge auto des snapshots anciens (IDX_SNAP_KEEP) |

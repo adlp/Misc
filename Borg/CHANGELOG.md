@@ -1,5 +1,65 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.109 / borgHelperWWW 1.16.0 / borgHelperWWW_ui.html 1.9.1 — détection de fin de sauvegarde (`bkp_status`), `POST /bkp` asynchrone — 2026-09-25
+
+Story 1 de `spec-notifications-push` : préalable indispensable à l'envoi de notifications push
+(Story 2, à venir) — un signal fiable pour savoir, après coup et quel que soit le déclencheur, si
+une sauvegarde `Bkp` a réussi ou échoué.
+
+### ⚠️ Rupture de compatibilité : `POST /bkp` (`borgHelperWWW`) devient asynchrone
+
+Jusqu'ici synchrone : la requête HTTP restait ouverte toute la durée de la sauvegarde et recevait le
+résultat complet (`CommandResult` : `exitcode`/`stdout`/`stderr` de `borgHelper -c Bkp` lui-même).
+Désormais : `POST /bkp` lance `borgHelper -c Bkp` en sous-processus **détaché**
+(`subprocess.Popen(..., start_new_session=True)`, jamais attendu par la requête) et répond dès le
+lancement confirmé — `exitcode=0`/`stdout="Sauvegarde démarrée pour <nick> (pid <pid>) — ..."`
+signifie **« lancement réussi »**, plus « sauvegarde réussie ». Tout appelant externe de cette route
+qui interprétait la réponse comme le résultat final de la sauvegarde doit s'adapter (interroger l'état
+autrement — pas d'équivalent HTTP pour l'instant, la Story 2 ajoutera la notification push). Seul
+appelant interne recensé, `runBackupNow` (UI), adapté dans le même commit (affiche « démarré », plus
+d'attente du résultat).
+
+### `bkp_status` : nouvelle table (`diff.db`, exclusive à `Bkp`)
+
+`nick, run_id, started_at, finished_at, result('success'|'error'), notified_at` — ajoutée dans
+`ensure_diff_db()` (additive, `CREATE TABLE IF NOT EXISTS`, comme `archive_stats`/`diff_excluded_stats`
+en leur temps : pas de bump `DIFF_DB_SCHEMA_VERSION`, aucune donnée existante à transformer). Aucune
+colonne `path` : hors du périmètre du codec de chiffrement des chemins, jamais touchée par
+`_write_mode_check`/`_path_stored`. Jamais écrite par `Restore`/`Index`/`Prune` — exclusive à
+`backup()`.
+
+`backup()` écrit une ligne à son début (juste après `set_priority_lock`, avant tout appel `boex()`),
+`started_at` posé, tout le reste `NULL`. À la fin normale (avant `sys.exit(newretC)`), la ligne est
+complétée : `finished_at`, `result` dérivé du même `newretC` qu'aujourd'hui (`0`→`success`, sinon
+`error`). **Filet de sécurité** dans le `finally` existant (qui relâche déjà `priority.lock`) : si une
+exception non gérée (`boex()` ou ailleurs) a empêché l'écriture normale, la ligne encore sans
+`finished_at` est fermée immédiatement en `result='error'` — sans attendre le timeout watcher
+ci-dessous (qui reste un filet supplémentaire pour un processus tué avant même d'atteindre ce
+`finally`, ex. SIGKILL/OOM). Nouvelles méthodes `BorgHelperDB` : `store_bkp_status_start`,
+`store_bkp_status_finish`, `store_bkp_status_safety_net`, `list_pending_bkp_status`,
+`claim_bkp_status`.
+
+### Watcher `borgHelperWWW` (premier composant de fond du fichier)
+
+Tâche de fond démarrée via `@app.on_event("startup")` (un watcher par processus worker uvicorn,
+cohérent avec `--workers 2` déjà documenté — aucune coordination inter-process requise). Interroge
+`bkp_status` de chaque nick connu toutes les 30s (`BORGHELPERWWW_BKP_WATCHER_INTERVAL`), réclame par
+comparer-et-échanger (`UPDATE bkp_status SET notified_at=? WHERE nick=? AND run_id=? AND notified_at
+IS NULL`, via `_with_lock_retry` réutilisé tel quel — jamais de lecture-puis-écriture séparées, donc
+jamais de double traitement même avec plusieurs workers) les lignes terminées, ou bloquées depuis plus
+de 6h (`BORGHELPERWWW_BKP_STATUS_TIMEOUT`, largement supérieur à la durée normale d'un `Bkp` — une
+ligne `started_at` sans `finished_at` passé ce délai est traitée comme un échec). Pour cette story,
+journalise (log serveur) `nick`/`run_id`/`result` — la Story 2 remplacera la journalisation par
+l'envoi push réel (`pywebpush`).
+
+Vérifié par test réel sur `demo.borghelperrc` : `POST /bkp` répond en ~0.1s (contre la durée complète
+de la sauvegarde auparavant) ; ligne `bkp_status` observée `started_at` posé puis `finished_at`/
+`result='success'` à la fin réelle du `Bkp` ; watcher réclame et journalise dans la minute suivante.
+Plus `CodecSelfTest` (le nom ne couvre plus que l'historique — convention existante pour toute
+vérification DB de ce projet) : écriture start/finish/filet de sécurité, `list_pending_bkp_status`
+(lignes finies + AD-7, jamais les récentes), `claim_bkp_status` CAS concurrent (`ThreadPoolExecutor`,
+une seule des deux réclamations gagne) — 309/309 `OK`.
+
 ## borgHelperWWW_ui.html 1.9.0 — graphiques Chart.js dans « Historique complet » — 2026-09-25
 
 Story 3 (spec-charts-evolution-sauvegardes) : `/repohistory`/`/archivehistory` (Story 2, 1.15.3)

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.9.0 -->
+<!-- UI_VERSION: 1.9.1 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -809,17 +809,21 @@ async function runHistoryPrune(nick){
 }
 
 async function runBackupNow(nick,btn){
+  // POST /bkp est asynchrone depuis 1.16.0 (WWW) / 1.0.109 (borgHelper) : répond dès le lancement
+  // du sous-processus détaché, jamais à la fin de la sauvegarde — exitcode=0 signifie « lancement
+  // réussi », pas « sauvegarde réussie ». Le résultat réel (succès/échec) est capté par bkp_status
+  // et journalisé côté serveur (watcher) ; pas encore affiché ici (Story 2 : notification push).
   if(!confirm(`Lancer un backup immédiat pour ${nick} ?`)) return;
   if(!getPassphrase(nick) && !confirm("Aucune passphrase enregistrée pour ce serveur — continuer sans (utilisera celle du .borghelperrc si présente) ?")) return;
   const orig=btn.textContent;
-  btn.disabled=true; btn.textContent='Backup en cours…';
+  btn.disabled=true; btn.textContent='Lancement…';
   const r=await apiCall('POST','/bkp',{nick},true,nick);
   btn.disabled=false; btn.textContent=orig;
   if(r.httpStatus===401) return;
   if(r.exitcode===0){
-    alert(`Backup ${nick} terminé (exitcode 0).`);
+    alert(`Backup ${nick} démarré — sauvegarde en cours en arrière-plan (résultat non affiché ici pour l'instant).`);
   }else{
-    alert(`Backup ${nick} en erreur (exitcode ${r.exitcode}) :\n`+(r.stderr||r.stdout||'(pas de détail)'));
+    alert(`Échec du lancement du backup ${nick} (exitcode ${r.exitcode}) :\n`+(r.stderr||r.stdout||'(pas de détail)'));
   }
   loadMachines();
 }
@@ -896,7 +900,7 @@ const ACTIONS=[
   {id:'restoreperms', label:"Droits d'un fichier (sans restaurer)", method:'GET', path:'/restore/perms', needsPass:true,
     params:[{name:'ftor',label:'Chemin ou glob',type:'text',required:true},
             {name:'bid',label:'Archive (vide = dernière)',type:'text'}]},
-  {id:'bkp', label:'Lancer un backup', method:'POST', path:'/bkp', needsPass:true,
+  {id:'bkp', label:'Lancer un backup (asynchrone — répond dès le lancement)', method:'POST', path:'/bkp', needsPass:true,
     params:[{name:'no_index',label:"Désactiver l'indexation",type:'bool'}]},
   {id:'index', label:'Indexer', method:'POST', path:'/index', needsPass:true,
     params:[{name:'force',label:'Forcer la réindexation',type:'bool'},
