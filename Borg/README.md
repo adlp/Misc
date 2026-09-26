@@ -733,6 +733,11 @@ borgHelper -c ArchiveHistory -n mon-serveur -j    # historique archive_stats (pa
 
 `ArchiveHistory -j` : une ligne par archive de `archive_stats` (`archive`,`archive_date`,`duration`,
 `original_size`,`compressed_size`,`deduplicated_size`,`nfiles`), ordonnées par `archive_date`.
+Depuis 1.0.115, en plus : `files_added`/`files_modified`/`files_removed` — nombre de fichiers ajoutés,
+modifiés (types `C`/`B`/`T` inclus) et supprimés par rapport à l'archive précédente, même source que la
+colonne « Modifs » de `Report` (fichiers exclus de l'indexation compris) ; `null` si cette paire
+d'archives n'est pas indexée (première archive, purgée par `DIFF_KEEP`, `NOIDX=1`, Index pas encore
+passé).
 
 `diff.db` jamais indexé : `{'error':'diff.db absent pour <nick>'}`, jamais une exception (même
 comportement que `IdxTop -j`).
@@ -1436,8 +1441,12 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
    - Au-dessus du tableau (UI ≥ 1.12.1), une carte **Évolution** avec trois graphiques Chart.js
      (chargés via `/repohistory`/`/archivehistory`) : taille du dépôt dans le temps
      (`unique_csize`/`total_size`/`total_csize`, un point par Bkp, Prune ou Index), gain Prune (delta
-     calculé côté navigateur, jamais stocké), et métriques par archive dans le temps
-     (`original_size`/`compressed_size`/`deduplicated_size`). Nick sans historique ou sans Prune :
+     calculé côté navigateur, jamais stocké), métriques par archive dans le temps
+     (`original_size`/`compressed_size`/`deduplicated_size`), et — UI ≥ 1.13.0 — trois graphiques
+     par archive : **fichiers modifiés** (barres empilées ajoutés/modifiés/supprimés), **durée de
+     sauvegarde**, **taille dédupliquée** seule (lisible, contrairement au graphique précédent où
+     l'échelle de la taille originale l'écrase). Une archive sans valeur reste vide, jamais comptée à
+     zéro. Nick sans historique ou sans Prune :
      message à la place du graphique concerné — un `Index` complète les données manquantes.
      **Chart.js embarqué** (borgHelperWWW ≥ 1.22.0) : copie locale `vendor/chartjs/`, servie par
      borgHelperWWW sur `/static/chart.umd.min.js` — aucun accès Internet requis côté navigateur. Si

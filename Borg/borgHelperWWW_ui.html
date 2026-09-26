@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.12.2 -->
+<!-- UI_VERSION: 1.13.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -220,10 +220,25 @@
         <div id="chartPruneGainMsg" class="hint" hidden></div>
         <canvas id="chartPruneGain" height="90"></canvas>
       </div>
-      <div>
+      <div style="margin-bottom:24px">
         <h3 style="margin:0 0 8px">Métriques par archive</h3>
         <div id="chartArchiveSizeMsg" class="hint" hidden></div>
         <canvas id="chartArchiveSize" height="90"></canvas>
+      </div>
+      <div style="margin-bottom:24px">
+        <h3 style="margin:0 0 8px">Fichiers modifiés par archive</h3>
+        <div id="chartFileChangesMsg" class="hint" hidden></div>
+        <canvas id="chartFileChanges" height="90"></canvas>
+      </div>
+      <div style="margin-bottom:24px">
+        <h3 style="margin:0 0 8px">Durée de sauvegarde</h3>
+        <div id="chartDurationMsg" class="hint" hidden></div>
+        <canvas id="chartDuration" height="90"></canvas>
+      </div>
+      <div>
+        <h3 style="margin:0 0 8px">Taille dédupliquée par archive</h3>
+        <div id="chartDedupSizeMsg" class="hint" hidden></div>
+        <canvas id="chartDedupSize" height="90"></canvas>
       </div>
     </div>
     <div class="card">
@@ -674,6 +689,16 @@ function _fmtBytes(n){
 }
 
 let chartRepoSizeInstance=null, chartPruneGainInstance=null, chartArchiveSizeInstance=null;
+// Graphiques par archive supplémentaires (UI 1.13.0), tous alimentés par les mêmes lignes /archivehistory.
+const ARCHIVE_EXTRA_CHARTS=['chartFileChanges','chartDuration','chartDedupSize'];
+const chartExtraInstances={};
+
+function _fmtDuration(sec){
+  if(sec===null||sec===undefined||isNaN(sec)) return '—';
+  sec=Math.round(sec);
+  const h=Math.floor(sec/3600), m=Math.floor(sec%3600/60), s=sec%60;
+  return h ? `${h} h ${String(m).padStart(2,'0')} min` : (m ? `${m} min ${String(s).padStart(2,'0')} s` : `${s} s`);
+}
 
 function _showChartMsg(msgElId, canvasId, text, isError){
   const msgEl=document.getElementById(msgElId);
@@ -693,7 +718,7 @@ async function loadCharts(nick){
   const seq=++chartsLoadSeq;
   // état initial : masquer les canvases et afficher un spinner dans chaque message div pendant le
   // chargement (évite un flash "hint" résiduel de l'ancien nick, et des canvases vides pendant l'attente)
-  ['chartRepoSize','chartPruneGain','chartArchiveSize'].forEach(id=>{
+  ['chartRepoSize','chartPruneGain','chartArchiveSize',...ARCHIVE_EXTRA_CHARTS].forEach(id=>{
     document.getElementById(id+'Msg').innerHTML=SPINNER;
     document.getElementById(id+'Msg').className='hint';
     document.getElementById(id+'Msg').hidden=false;
@@ -708,7 +733,7 @@ async function loadCharts(nick){
 
   if(typeof Chart==='undefined'){
     const msg='Bibliothèque de graphiques indisponible — ni copie locale (vendor/chartjs/ sur le serveur), ni CDN accessible.';
-    ['chartRepoSize','chartPruneGain','chartArchiveSize'].forEach(id=>_showChartMsg(id+'Msg',id,msg,true));
+    ['chartRepoSize','chartPruneGain','chartArchiveSize',...ARCHIVE_EXTRA_CHARTS].forEach(id=>_showChartMsg(id+'Msg',id,msg,true));
     return;
   }
 
@@ -716,6 +741,7 @@ async function loadCharts(nick){
   // chargement laissé en place (exception de Chart.js, réponse inattendue...).
   _safeRender(()=>_renderRepoSizeAndPruneGainCharts(repoR),['chartRepoSize','chartPruneGain']);
   _safeRender(()=>_renderArchiveSizeChart(archR),['chartArchiveSize']);
+  ARCHIVE_EXTRA_CHARTS.forEach(id=>_safeRender(()=>_renderArchiveExtraChart(id,archR),[id]));
 }
 
 function _safeRender(fn,ids){
@@ -846,6 +872,51 @@ function _renderArchiveSizeChart(r){
       plugins:{tooltip:{callbacks:{label:ctx=>ctx.dataset.label+': '+_fmtBytes(ctx.parsed.y)}}}
     }
   });
+}
+
+// Un graphique par archive (fichiers modifiés / durée / taille dédupliquée) — archives sans valeur
+// (null : paire non indexée, statistique absente) laissées vides plutôt que comptées à zéro.
+function _renderArchiveExtraChart(id,r){
+  if(chartExtraInstances[id]){ chartExtraInstances[id].destroy(); delete chartExtraInstances[id]; }
+  const {rows,error}=_parseHistoryResponse(r);
+  if(error!==undefined){
+    _showChartMsg(id+'Msg',id,error===null?'Session expirée — reconnectez-vous.':error,true);
+    return;
+  }
+  const labels=rows.map(row=>row.archive_date);
+  const num=v=>(v===null||v===undefined)?null:v;
+  let cfg, empty;
+  if(id==='chartFileChanges'){
+    empty=!rows.some(row=>row.files_added!=null||row.files_modified!=null||row.files_removed!=null);
+    cfg={type:'bar',
+      data:{labels,datasets:[
+        {label:'Ajoutés',data:rows.map(row=>num(row.files_added)),backgroundColor:'#1e7d3a',stack:'f'},
+        {label:'Modifiés',data:rows.map(row=>num(row.files_modified)),backgroundColor:'#b8860b',stack:'f'},
+        {label:'Supprimés',data:rows.map(row=>num(row.files_removed)),backgroundColor:'#c0392b',stack:'f'}]},
+      options:{responsive:true,scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,ticks:{precision:0}}},
+        plugins:{tooltip:{callbacks:{label:ctx=>ctx.dataset.label+' : '+(ctx.parsed.y??'—').toLocaleString()+' fichier(s)'}}}}};
+  } else if(id==='chartDuration'){
+    empty=!rows.some(row=>row.duration!=null);
+    cfg={type:'bar',
+      data:{labels,datasets:[{label:'Durée',data:rows.map(row=>num(row.duration)),backgroundColor:'#2b6cb0'}]},
+      options:{responsive:true,scales:{y:{beginAtZero:true,ticks:{callback:v=>_fmtDuration(v)}}},
+        plugins:{tooltip:{callbacks:{label:ctx=>'Durée : '+_fmtDuration(ctx.parsed.y)}}}}};
+  } else {
+    empty=!rows.some(row=>row.deduplicated_size!=null);
+    cfg={type:'bar',
+      data:{labels,datasets:[{label:'Taille dédupliquée',data:rows.map(row=>num(row.deduplicated_size)),backgroundColor:'#b8860b'}]},
+      options:{responsive:true,scales:{y:{beginAtZero:true,ticks:{callback:v=>_fmtBytes(v)}}},
+        plugins:{tooltip:{callbacks:{label:ctx=>'Dédupliquée : '+_fmtBytes(ctx.parsed.y)}}}}};
+  }
+  if(empty){
+    const what={chartFileChanges:'Aucun comptage de fichiers modifiés enregistré — lancer un Index.',
+                chartDuration:'Aucune durée de sauvegarde enregistrée — lancer un Index.',
+                chartDedupSize:'Aucune taille dédupliquée enregistrée — lancer un Index.'}[id];
+    _showChartMsg(id+'Msg',id,what,false);
+    return;
+  }
+  _hideChartMsg(id+'Msg',id);
+  chartExtraInstances[id]=new Chart(document.getElementById(id),cfg);
 }
 
 document.getElementById('historyBody').addEventListener('click', e=>{

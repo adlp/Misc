@@ -1,5 +1,20 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.115 / borgHelperWWW_ui.html 1.13.0 — graphiques : fichiers modifiés, durée, taille dédupliquée — 2026-09-26
+
+Demande utilisateur : graphiques du nombre de fichiers modifiés par archive, de la durée de sauvegarde
+et de la taille dédupliquée par archive.
+
+- `ArchiveHistory -j` (donc `/archivehistory`) : `files_added`/`files_modified`/`files_removed` par
+  archive — mêmes comptages que la colonne « Modifs » de `Report` ; `null` si la paire d'archives
+  n'est pas indexée.
+- UI, Historique complet → Évolution : trois graphiques supplémentaires — fichiers modifiés (barres
+  empilées ajoutés/modifiés/supprimés), durée de sauvegarde, taille dédupliquée seule. Archive sans
+  valeur laissée vide (jamais comptée à zéro) ; message explicite si aucune donnée.
+- `CodecSelfTest` 321/321 (comptages exacts, `null` pour une paire non indexée) ; rendu vérifié sous
+  Node (DOM et Chart.js simulés) : données réelles de la démo, aucune donnée, exception Chart.js,
+  session expirée.
+
 ## borgHelperWWW 1.22.0 / borgHelperWWW_ui.html 1.12.2 — Chart.js embarqué, favicon.ico local — 2026-09-26
 
 - **Chart.js embarqué** : copie de Chart.js 4.5.1 dans `vendor/chartjs/` (licence MIT), servie par

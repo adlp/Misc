@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.114"
+Version="1.0.115"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -4210,7 +4210,13 @@ class BorgHelper:
     def archive_history(self,nick,debug=0,as_json=False):
         """Story 2 (spec-charts-evolution-sauvegardes) : historique brut archive_stats (colonnes
         brutes, ordre chronologique), même SELECT que prep_report_from_db (borgHelper:4202), gabarit
-        exact de idxtop() -j — jamais de valeur dérivée calculée ici (Boundaries)."""
+        exact de idxtop() -j — jamais de valeur dérivée calculée ici (Boundaries).
+
+        1.0.115 : + files_added/files_modified/files_removed par archive — comptages bruts de
+        diff_index (+ diff_excluded_stats) pour la paire se terminant par cette archive, EXACTEMENT
+        la source de la colonne « Modifs » de Report (_diff_stats_for_nick, types C/B/T comptés en
+        modifiés). null (jamais 0) si cette paire n'est pas indexée : première archive, paire purgée
+        par DIFF_KEEP, NOIDX=1, ou Index pas encore passé."""
         db_path=self.db.get_diff_db(nick)
         if not os.path.exists(db_path):
             if as_json: print(json.dumps({'error':f"diff.db absent pour {nick}"},ensure_ascii=False,indent=2)); return
@@ -4235,6 +4241,12 @@ class BorgHelper:
             print(json.dumps({'error':_codec_fail(nick,e,conn)},ensure_ascii=False,indent=2)); return
         except sqlite3.Error as e:
             print(json.dumps({'error':f"SQLite error ({db_path}): {e}"},ensure_ascii=False,indent=2)); return
+        diff_stats=self.db._diff_stats_for_nick(nick)
+        for r in rows:
+            st=diff_stats.get(r['archive'])
+            r['files_added']=st['added'] if st else None
+            r['files_modified']=st['modified'] if st else None
+            r['files_removed']=st['removed'] if st else None
         print(json.dumps({'borghelper_version':Version,'nick':nick,'rows':rows},ensure_ascii=False,indent=2))
 
     def _status_one(self,nick,debug=0):
@@ -5175,6 +5187,20 @@ def codec_selftest():
             return (len(rows)==2 and rows[0]['archive']=='A1' and rows[1]['archive']=='A2'
                     and rows[0]['archive_date']<rows[1]['archive_date'] and rows[1]['nfiles']==110)
         check("ArchiveHistory -j : table peuplée -> rows brutes ordonnées par archive_date",_rh_arch_populated)
+        def _rh_arch_file_counts():
+            # Paire A1 -> A2 indexée : 2 ajoutés, 1 modifié, 1 supprimé (+1 modifié exclu, compté
+            # comme dans Report) ; A1 (première archive, aucune paire) -> null, jamais 0.
+            p=bh_rh.db.get_diff_db('rhA')
+            bh_rh.db.store_diff_entries('rhA','A1','A2','2026-02-01T00:00:00',[
+                {'change_type':'added','path':'a/x','size_after':1},{'change_type':'added','path':'a/y','size_after':1},
+                {'change_type':'modified','path':'a/z','size_before':1,'size_after':2},
+                {'change_type':'removed','path':'a/w','size_before':3}],p)
+            bh_rh.db.store_excluded_diff_stats('rhA','A1','A2',{'modified':{'count':1,'size':5}},p)
+            rows={r['archive']:r for r in _rh_run(bh_rh.archive_history,'rhA',as_json=True)['rows']}
+            a1,a2=rows['A1'],rows['A2']
+            return (a2['files_added']==2 and a2['files_modified']==2 and a2['files_removed']==1
+                    and a1['files_added'] is None and a1['files_modified'] is None and a1['files_removed'] is None)
+        check("ArchiveHistory -j : files_added/modified/removed = comptages de Report, null si paire non indexée",_rh_arch_file_counts)
         check("ArchiveHistory -j : table vide -> rows=[]",
               lambda: _rh_run(bh_rh.archive_history,'rhEmpty',as_json=True)['rows']==[])
         check("ArchiveHistory -j : diff.db absent -> {'error':...}, pas une exception",
