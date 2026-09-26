@@ -151,6 +151,12 @@ groups-paths-restore`, restriction jamais un tier de plus) : `GROUPS_PATHS` pour
 (`Restore`/`DownloadFile`/`DownloadTar`) — un groupe sans entrée dans `GROUPS_PATHS_RESTORE` reprend
 simplement son entrée `GROUPS_PATHS` (repli rétro-compatible).
 
+**Sans tier (borgHelperWWW ≥ 1.20.0)** : inutile de mettre un groupe dans
+`GROUPS_ADMIN`/`GROUPS_WRITE`/`GROUPS_READ` (= accès à tout le nick) pour ensuite le restreindre. Cité
+**seulement** dans `GROUPS_PATHS`, il lit ses chemins (sans téléchargement) ; cité dans
+`GROUPS_PATHS_RESTORE`, il peut aussi les télécharger. Exemple `[dbserver01]` dans
+[`docs/borghelperrc.example`](borghelperrc.example).
+
 Cas d'usage type : un fileserver sauvegardé en un seul dépôt, où plusieurs groupes doivent pouvoir
 chercher/restaurer chacun **uniquement dans son propre périmètre**, sans voir le reste du serveur —
 les admins IT gardant, eux, un accès complet. Exemple complet et commenté (nick fictif

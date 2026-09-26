@@ -1130,11 +1130,24 @@ affichés, marqués « accès partiel », pour pouvoir descendre jusqu'au périm
 droits/propriétaire/historique, sans téléchargement, et sans aucun de leurs autres enfants. Les autres
 commandes (Search/TreeFind/rapports/restauration) restent strictement limitées au périmètre.
 
-⚠️ `GROUPS_PATHS` **n'accorde jamais** l'accès à un nick : il restreint un accès déjà donné par
-`GROUPS_ADMIN`/`GROUPS_WRITE`/`GROUPS_READ` (du nick ou de `[DEFAULT]`). Un groupe cité seulement dans
-`GROUPS_PATHS` ne voit pas le nick — vérifier avec `GET /access`.
+**Accès direct par périmètre (borgHelperWWW ≥ 1.20.0)** — pas besoin de donner d'abord un tier
+(`GROUPS_ADMIN`/`GROUPS_WRITE`/`GROUPS_READ` = accès à *tout* le nick) puis de le restreindre : un
+groupe cité **uniquement** dans `GROUPS_PATHS` et/ou `GROUPS_PATHS_RESTORE` reçoit directement un accès
+borné à ses chemins :
 
-Raffinement orthogonal au tier ci-dessus —
+| Groupe cité dans | Lire (arborescence, Search/TreeFind, historique, Report...) | Télécharger fichier/`.tar`, consulter les droits |
+|---|---|---|
+| `GROUPS_PATHS` seul | ses chemins `GROUPS_PATHS` | **non** (aucun repli) |
+| `GROUPS_PATHS_RESTORE` seul | ses chemins `GROUPS_PATHS_RESTORE` | ses chemins `GROUPS_PATHS_RESTORE` |
+| les deux | union des deux | ses chemins `GROUPS_PATHS_RESTORE` |
+
+Niveau équivalent à la lecture, jamais au-delà : `POST /restore` (écriture sur le disque du serveur),
+`Bkp`, `Index`, `Prune`... restent réservés à `GROUPS_WRITE`/`GROUPS_ADMIN`. Comme `GROUPS_READ`, il
+voit aussi la liste des archives et les stats globales du dépôt. `GET /access` renvoie `level:"read"`
+et un `restore_scope` vide (`[]`) pour un groupe `GROUPS_PATHS` seul ; l'UI masque alors les boutons de
+téléchargement (le serveur refuse de toute façon).
+
+Pour un groupe qui **a** un tier, `GROUPS_PATHS` reste un raffinement orthogonal —
 il ne fait jamais qu'un nick est accordé, seulement *quelle partie* de ce nick l'est. Un groupe
 absent de `GROUPS_PATHS` conserve un accès chemin illimité dans la limite du tier qu'il détient
 déjà (comportement rétro-compatible : c'est déjà ce qui se passe aujourd'hui pour un groupe
@@ -1231,10 +1244,9 @@ déploiement — fail-closed, jamais une fuite, mais un vrai bug fonctionnel).
 en cache côté config (`cfgread()` relit le fichier depuis le disque à chaque fois). Une valeur
 `GROUPS_PATHS` rendue ambiguë (séparateur réservé dans un nom de groupe ou un chemin) **pendant que
 le process tourne** échoue donc bruyamment dès le prochain appel qui résout un périmètre pour ce
-nick — `500` non catché, jamais une réponse silencieusement dégradée. **Uniquement pour les
-appelants qui détiennent un tier sur ce nick** : la résolution de périmètre court-circuite avant
-même de lire `GROUPS_PATHS` pour un appelant sans aucun accès à ce nick (l'erreur ne le concerne
-donc jamais — il reçoit `scope:null` normalement, `200`, comme s'il n'y avait pas de problème). La
+nick — `500` non catché, jamais une réponse silencieusement dégradée. Depuis 1.20.0 (accès direct
+par périmètre), **pour tout appelant** de ce nick, même sans tier : `GROUPS_PATHS` doit être lu pour
+savoir s'il y figure. La
 validation faite une fois au démarrage (`_validate_groups_paths_startup()`) n'est qu'un fail-fast
 pour le cas courant (faute de frappe détectée avant que le service ne serve du trafic), pas le seul
 point de contrôle. `GET /access` n'est donc **plus inconditionnellement `200` pour un appel
@@ -1593,14 +1605,12 @@ illimité, sinon liste de préfixes canonicalisés ; voir
 `read_scope:null`/`restore_scope:null` pour chaque nick, sans cas particulier côté client.
 
 ⚠️ **Exception à la règle générale "toujours 200 pour un appel authentifié"** — mais **seulement
-pour un appelant qui détient un tier (lecture/écriture/admin) sur le nick concerné** : `GROUPS_PATHS`
+pour tout appelant** (depuis 1.20.0, accès direct par périmètre) : `GROUPS_PATHS`
 étant relu à chaque appel (voir plus haut), une valeur devenue ambiguë dans `.borghelperrc`
 **pendant que le process tourne** fait échouer `/access` en `500` non catché pour le(s) nick(s)
 concerné(s), plutôt que de dégrader silencieusement la réponse — c'est la seule route de ce projet
 où une erreur de configuration en cours d'exécution est volontairement laissée remonter telle
-quelle à l'appelant. Un appelant sans aucun tier sur ce nick ne voit jamais cette erreur : la
-résolution de périmètre s'arrête avant même de lire `GROUPS_PATHS` pour lui, et reçoit
-normalement `level:"none", scope:null` en `200`.
+quelle à l'appelant.
 
 `groups_auth_enabled=false` (autorisation par groupes désactivée) : `"admin"` pour tous les nicks —
 reflète l'absence de restriction par groupes, sans forme de réponse différente à gérer côté client.

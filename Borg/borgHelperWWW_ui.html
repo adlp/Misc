@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.10.1 -->
+<!-- UI_VERSION: 1.11.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -1204,7 +1204,7 @@ async function runBrowseSearch(){
     +matches.map(m=>{
       const icon=m.is_dir?'📁':'📄';
       const gotoTarget=m.is_dir?m.full_path:m.parent;
-      const dlBtn=allowDownloads?`<button class="secondary sr-dl-btn" data-full="${escapeAttr(m.full_path)}" data-isdir="${m.is_dir}">⬇ Télécharger</button>`:'';
+      const dlBtn=(allowDownloads&&downloadInScope(browseNick,m.full_path))?`<button class="secondary sr-dl-btn" data-full="${escapeAttr(m.full_path)}" data-isdir="${m.is_dir}">⬇ Télécharger</button>`:'';
       const delBadge=m.deleted?' <span class="badge warn">supprimé</span>':'';
       return `<tr>
         <td>${icon} ${escapeHtml(m.name)}${delBadge}</td><td>${escapeHtml(m.genre)}</td>
@@ -1240,6 +1240,17 @@ document.getElementById('browseSearchResults').addEventListener('click', e=>{
 
 let dlPending=null; // {nick,path,isDir}
 
+// Périmètre de TÉLÉCHARGEMENT de l'appelant (restore_scope de /access) — miroir de _path_in_scope
+// serveur, pour ne pas proposer un téléchargement que le serveur refusera (un groupe cité seulement
+// dans GROUPS_PATHS lit mais ne télécharge pas). Le serveur reste seul juge.
+function downloadInScope(nick,path){
+  if(!myAccess||!myAccess.groups_auth_enabled) return true;
+  const a=myAccess.nicks&&myAccess.nicks[nick]; if(!a) return false;
+  const scope=a.restore_scope; if(scope===null||scope===undefined) return true;
+  const p=(path||'').replace(/^\/+/,'');
+  return scope.some(pr=>{ const q=pr.replace(/^\/+/,''); return q===''||p===q||p.startsWith(q+'/'); });
+}
+
 async function openDownloadDialog(fullPath,isDir){
   dlPending={nick:browseNick,path:fullPath,isDir};
   // Entrée supprimée : last_seen_archive est la SEULE archive garantie de contenir encore ce
@@ -1247,9 +1258,11 @@ async function openDownloadDialog(fullPath,isDir){
   const dlEntry=browseEntriesByPath[fullPath];
   const dlLastSeenArchive=dlEntry&&dlEntry.deleted?dlEntry.last_seen_archive:null;
   document.getElementById('dlModalTitle').textContent=(isDir?'Télécharger un .tar de ':'Télécharger ')+fullPath+(dlLastSeenArchive?' (supprimé)':'');
-  document.getElementById('dlConfirmBtn').hidden=!allowDownloads;
-  document.getElementById('dlModalError').textContent=allowDownloads?'':
-    'Téléchargements désactivés sur ce serveur (BORGHELPERWWW_ALLOW_DOWNLOADS).';
+  const dlInScope=downloadInScope(browseNick,fullPath);
+  document.getElementById('dlConfirmBtn').hidden=!(allowDownloads&&dlInScope);
+  document.getElementById('dlModalError').textContent=!allowDownloads?
+    'Téléchargements désactivés sur ce serveur (BORGHELPERWWW_ALLOW_DOWNLOADS).':
+    (!dlInScope?'Hors de votre périmètre de téléchargement (GROUPS_PATHS_RESTORE) — consultation seulement.':'');
   const formatField=document.getElementById('dlFormatField');
   const tarCheck=document.getElementById('dlTarFormat');
   formatField.hidden=isDir; // un dossier est toujours en .tar, pas de choix à faire

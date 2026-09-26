@@ -1,5 +1,25 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.20.0 / borgHelperWWW_ui.html 1.11.0 — accès direct par GROUPS_PATHS, sans tier — 2026-09-26
+
+Demande utilisateur : `GROUPS_ADMIN`/`GROUPS_WRITE`/`GROUPS_READ` équivalent à un accès racine aux
+sauvegardes d'un host ; devoir en donner un pour ensuite le restreindre n'a pas de sens.
+
+- Un groupe **sans aucun tier** mais cité dans `GROUPS_PATHS` obtient directement la **lecture** de ses
+  chemins (arborescence, Search/TreeFind, historique, Report filtré...) — **sans téléchargement**.
+- Cité dans `GROUPS_PATHS_RESTORE` : lecture **et téléchargement** (fichier, `.tar`, consultation des
+  droits) de ces chemins. Lecture = union de ses entrées `GROUPS_PATHS` et `GROUPS_PATHS_RESTORE`.
+- Jamais au-delà du niveau lecture : `POST /restore`, `Bkp`, `Index`, `Prune`... restent réservés à
+  `GROUPS_WRITE`/`GROUPS_ADMIN`.
+- Groupes à tier : comportement inchangé (restriction, repli par groupe de `GROUPS_PATHS_RESTORE` sur
+  `GROUPS_PATHS`).
+- `GET /access` : `level:"read"` et `restore_scope: []` pour un groupe `GROUPS_PATHS` seul.
+- UI : boutons de téléchargement masqués hors du périmètre de téléchargement.
+- Changement de comportement : `GROUPS_PATHS` est désormais lu pour tout appelant ; une valeur rendue
+  ambiguë en cours d'exécution renvoie 500 aussi à un appelant sans tier.
+- Docs : README (tableau), `docs/borghelperrc.example` (nouvel host `[dbserver01]`), DEPLOIEMENT,
+  TECHNIQUE, TECHNICAL. `push_selftest` 48/48.
+
 ## borgHelperWWW 1.19.1 / borgHelperWWW_ui.html 1.10.1 — répertoires parents du périmètre navigables — 2026-09-26
 
 Bug rapporté : un groupe borné par `GROUPS_PATHS = AD-Borg admin:/opt/backups/mysql/` voyait une

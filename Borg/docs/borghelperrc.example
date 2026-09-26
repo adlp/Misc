@@ -161,6 +161,12 @@ DISPLAY_BKP = 5
 ; déjà un tier — c'est orthogonal, jamais un tier de plus. Un groupe absent des DEUX mais présent dans
 ; GROUPS_ADMIN/WRITE/READ garde un accès chemin illimité sur tout le nick.
 ;
+; Depuis borgHelperWWW 1.20.0 — ACCÈS DIRECT : un groupe SANS tier (absent de GROUPS_ADMIN/WRITE/READ)
+; mais cité dans GROUPS_PATHS obtient directement la LECTURE de ses chemins (arborescence, recherche,
+; historique), sans téléchargement ; cité dans GROUPS_PATHS_RESTORE, il peut en plus TÉLÉCHARGER ces
+; chemins-là. Jamais POST /restore/Bkp/Index/Prune (réservés à WRITE/ADMIN). Évite de devoir donner
+; un tier — équivalent à un accès racine aux sauvegardes du nick — pour ensuite le restreindre.
+;
 ; Depuis borgHelperWWW 1.18.7 (spec-groups-paths-restore) : périmètre de LECTURE et de RESTAURATION
 ; SÉPARÉS — GROUPS_PATHS pour Search/TreeFind/FileHist/TreeHist/Report/DiffBkp/DuIdx/IdxTop/DiffTop,
 ; GROUPS_PATHS_RESTORE pour Restore/RestorePerms/DownloadFile/DownloadTar. Un groupe absent de
@@ -223,3 +229,23 @@ GROUPS_PATHS_RESTORE = AD-Borg-Restore-Audit:/srv/data/compta/archives
 ; refusé — seul /srv/data/compta/archives/... est réellement restaurable pour ce groupe. Un membre de
 ; AD-Borg-Restore-Direction, lui, accède aux DEUX (/srv/data/rh ET /srv/data/compta) mais reste
 ; refusé sur /srv/data/commun, absent de sa liste.
+
+[dbserver01]
+BORG_REPO       = /srv/backups/dbserver01
+BORG_PASSPHRASE = change-moi-une-autre-passphrase-longue
+SER_NAME        = dbserver01
+GLOB_ARCH       = dbserver01-*
+BORG_ARCHNAME   = dbserver01
+BORG_ROOTBKP    = /
+EXCLUDE = --exclude-caches --exclude-nodump --keep-exclude-tags
+
+; ── ACCÈS DIRECT par périmètre (borgHelperWWW ≥ 1.20.0) : AUCUN tier pour les DBA ──────────────
+; Seul IT a un tier (accès complet). Les DBA ne sont dans AUCUN GROUPS_ADMIN/WRITE/READ :
+;   - AD-Borg-DBA-Lecture : cité seulement dans GROUPS_PATHS -> parcourt/cherche dans les dumps
+;     MySQL, ne télécharge rien.
+;   - AD-Borg-DBA         : cité dans GROUPS_PATHS_RESTORE -> parcourt ET télécharge les dumps
+;     MySQL et PostgreSQL (lecture = union de ses deux entrées), rien d'autre du serveur.
+; Dans l'UI, la racine n'affiche que 'opt' puis 'backups' (« accès partiel ») jusqu'à leurs dumps.
+GROUPS_ADMIN         = AD-Borg-Admin-IT
+GROUPS_PATHS         = AD-Borg-DBA-Lecture:/opt/backups/mysql, AD-Borg-DBA:/opt/backups/mysql
+GROUPS_PATHS_RESTORE = AD-Borg-DBA:/opt/backups/mysql|/opt/backups/postgresql

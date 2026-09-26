@@ -39,7 +39,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.19.1"
+WWW_VERSION="1.20.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -437,11 +437,26 @@ def _parse_groups(header_value):
 
 def _effective_level(user_groups,cfg):
     """cfg : SectionProxy (.borghelperrc[nick], avec repli [DEFAULT] déjà natif à configparser) ou
-    un dict-like équivalent pour le cas Login/nick inexistant. 0 si aucun accès."""
+    un dict-like équivalent pour le cas Login/nick inexistant. 0 si aucun accès.
+
+    Accès DIRECT par périmètre (borgHelperWWW 1.20.0) : un groupe sans aucun tier mais cité dans
+    GROUPS_PATHS et/ou GROUPS_PATHS_RESTORE obtient le niveau lecture (1) — borné à ses chemins par
+    _resolve_path_scope (lecture : GROUPS_PATHS ∪ GROUPS_PATHS_RESTORE ; téléchargement :
+    GROUPS_PATHS_RESTORE seul, jamais de repli). Jamais au-delà de 1 : POST /restore, Bkp, Index...
+    restent réservés à GROUPS_WRITE/GROUPS_ADMIN. ⚠️ Parse GROUPS_PATHS(_RESTORE) même pour un
+    appelant sans tier : une valeur rendue ambiguë en cours de route lève ValueError (500) pour tout
+    appelant de ce nick, jamais dégradée en silence (validée aussi au démarrage)."""
     for level in (3,2,1):
         allowed={g.strip() for g in (cfg.get(_LEVEL_KEYS[level],'') or '').split(',') if g.strip()}
         if user_groups & allowed: return level
+    if user_groups & _direct_path_groups(cfg): return 1
     return 0
+
+def _direct_path_groups(cfg):
+    """Groupes cités dans GROUPS_PATHS ou GROUPS_PATHS_RESTORE de `cfg` (nick, repli [DEFAULT]
+    natif) — candidats à l'accès direct par périmètre (voir _effective_level)."""
+    return (set(_parse_groups_paths(cfg.get(_GROUPS_PATHS_KEY,'') or ''))
+            |set(_parse_groups_paths(cfg.get(_GROUPS_PATHS_RESTORE_KEY,'') or '')))
 
 def _parse_groups_paths(raw):
     """Parse la syntaxe GROUPS_PATHS : 'groupe:/a|/b, groupe2:/c' — ':' sépare un groupe de ses
@@ -522,10 +537,9 @@ def _resolve_path_scope(user_groups,cfg,for_restore=False):
     try/except qui avalerait un ValueError — .borghelperrc est relu à chaque cfgread(), donc une
     valeur GROUPS_PATHS rendue ambiguë PENDANT que le process tourne doit remonter telle quelle
     (500 non catché) au prochain appel qui résout le périmètre pour ce nick, jamais être dégradée
-    silencieusement en scope restreint ou illimité par défaut. Conséquence directe : cette fonction
-    ne lève JAMAIS pour un appelant sans le moindre tier sur ce nick (retour anticipé `if not
-    matching: return None`, avant que _parse_groups_paths ne soit même appelée) — un GROUPS_PATHS
-    ambigu sur ce nick reste invisible à un tel appelant.
+    silencieusement en scope restreint ou illimité par défaut. Depuis 1.20.0 (accès direct par
+    périmètre), GROUPS_PATHS(_RESTORE) est parsé pour TOUT appelant, même sans tier — un GROUPS_PATHS
+    ambigu lève donc aussi pour lui (fail-loud, plus jamais invisible).
 
     ⚠️ None EST AMBIGU — retourné pour deux situations distinctes : (1) l'appelant n'a aucun tier
     du tout sur ce nick (`matching` vide, la question du périmètre n'a alors aucun sens — accès
@@ -541,18 +555,30 @@ def _resolve_path_scope(user_groups,cfg,for_restore=False):
     tier_groups=set()
     for level in (3,2,1):
         tier_groups|={g.strip() for g in (cfg.get(_LEVEL_KEYS[level],'') or '').split(',') if g.strip()}
+    read_paths=_parse_groups_paths(cfg.get(_GROUPS_PATHS_KEY,'') or '')
+    restore_paths=_parse_groups_paths(cfg.get(_GROUPS_PATHS_RESTORE_KEY,'') or '')
     matching=user_groups & tier_groups
-    if not matching: return None
-    groups_paths=_parse_groups_paths(cfg.get(_GROUPS_PATHS_KEY,'') or '')
-    if for_restore:
+    # Accès direct par périmètre (1.20.0, voir _effective_level) : groupes de l'appelant SANS tier
+    # sur ce nick mais cités dans GROUPS_PATHS/GROUPS_PATHS_RESTORE.
+    direct=(user_groups-tier_groups) & (set(read_paths)|set(restore_paths))
+    if not matching and not direct: return None
+    prefixes=[]
+    if matching:
         # Override PAR GROUPE : un groupe présent dans GROUPS_PATHS_RESTORE utilise ce périmètre-là ;
         # un groupe absent d'ici mais présent dans GROUPS_PATHS ci-dessus garde son entrée lecture
         # (repli rétro-compatible) — jamais un remplacement global des deux dicts l'un par l'autre.
-        groups_paths={**groups_paths,**_parse_groups_paths(cfg.get(_GROUPS_PATHS_RESTORE_KEY,'') or '')}
-    prefixes=[]
-    for g in matching:
-        if g not in groups_paths: return None  # groupe correspondant non scopé -> illimité
-        prefixes.extend(groups_paths[g])
+        groups_paths={**read_paths,**restore_paths} if for_restore else read_paths
+        for g in matching:
+            if g not in groups_paths: return None  # groupe correspondant non scopé -> illimité
+            prefixes.extend(groups_paths[g])
+    for g in direct:
+        # Groupe direct : téléchargement = GROUPS_PATHS_RESTORE SEUL (aucun repli sur GROUPS_PATHS —
+        # être cité dans GROUPS_PATHS ne donne que la lecture) ; lecture = GROUPS_PATHS ∪
+        # GROUPS_PATHS_RESTORE (on doit pouvoir parcourir ce qu'on peut télécharger).
+        prefixes.extend(restore_paths.get(g,[]))
+        if not for_restore: prefixes.extend(read_paths.get(g,[]))
+    # Liste vide possible (groupe direct lecture seule, périmètre de téléchargement) -> [] = rien,
+    # jamais None (qui signifierait illimité).
     return _canonicalize_scope(prefixes)
 
 def _path_in_scope(path,scope):
@@ -2894,6 +2920,28 @@ def push_selftest():
                 and strict==[] and _filter_treehist({'h':{'entries':[ent('etc')]}},{'h':None})['h']['entries'][0]['mode']=='drwx------')
     check("TreeHist : répertoires parents du périmètre GROUPS_PATHS navigables (entrée nue), rien d'autre hors périmètre",
           _treehist_scope_ancestors_ok)
+
+    def _direct_path_access_ok():
+        """Accès direct par périmètre (1.20.0) : groupe SANS tier cité dans GROUPS_PATHS -> lecture
+        bornée, aucun téléchargement ; cité dans GROUPS_PATHS_RESTORE -> lecture + téléchargement
+        bornés ; jamais au-delà du niveau lecture ; tier illimité d'un autre groupe l'emporte ; groupe
+        cité nulle part -> aucun accès."""
+        cfg={'GROUPS_ADMIN':'AD-Borg root','GROUPS_READ':'lecteurs',
+             'GROUPS_PATHS':'dba:/opt/backups/mysql/, dev:/srv/app|/srv/lib, lecteurs:/srv/app',
+             'GROUPS_PATHS_RESTORE':'dev:/srv/app/releases, sos:/home/sos'}
+        L=_effective_level; R=_resolve_path_scope
+        return (L({'dba'},cfg)==1 and R({'dba'},cfg)==['/opt/backups/mysql'] and R({'dba'},cfg,for_restore=True)==[]
+            and L({'dev'},cfg)==1 and R({'dev'},cfg)==['/srv/app','/srv/lib']
+            and R({'dev'},cfg,for_restore=True)==['/srv/app/releases']
+            and L({'sos'},cfg)==1 and R({'sos'},cfg)==['/home/sos'] and R({'sos'},cfg,for_restore=True)==['/home/sos']
+            and L({'dba','AD-Borg root'},cfg)==3 and R({'dba','AD-Borg root'},cfg) is None
+            and R({'dba','lecteurs'},cfg)==['/opt/backups/mysql','/srv/app']
+            and R({'dba','lecteurs'},cfg,for_restore=True)==['/srv/app']
+            and L({'inconnu'},cfg)==0 and R({'inconnu'},cfg) is None
+            and _scope_nicks_for_groups({'dba'},[('h1',cfg),('h2',{'GROUPS_ADMIN':'x'})])==['h1']
+            and not _path_in_scope('opt/backups/mysql/db.sql',R({'dba'},cfg,for_restore=True)))
+    check("Accès direct GROUPS_PATHS (lecture) / GROUPS_PATHS_RESTORE (+téléchargement) sans GROUPS_ADMIN/WRITE/READ",
+          _direct_path_access_ok)
 
     fails=results.count(False)
     print(f"push selftest : {len(results)-fails}/{len(results)} OK"+(f", {fails} FAIL" if fails else ""))

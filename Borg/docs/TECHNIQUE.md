@@ -120,7 +120,10 @@ accessibles sans préfixe).
   `GROUPS_PATHS` pour la lecture (`Search`/`TreeFind`/`FileHist`/`TreeHist`/`Report`/`DiffBkp`/
   `DuIdx`/`IdxTop`/`DiffTop`), `GROUPS_PATHS_RESTORE` pour la restauration/téléchargement
   (`Restore`/`RestorePerms`/`DownloadFile`/`DownloadTar`) — un groupe sans entrée dans
-  `GROUPS_PATHS_RESTORE` reprend son entrée `GROUPS_PATHS` (repli rétro-compatible). Exemple complet
+  `GROUPS_PATHS_RESTORE` reprend son entrée `GROUPS_PATHS` (repli rétro-compatible). **Accès direct
+  (≥ 1.20.0)** : un groupe sans aucun tier mais cité dans `GROUPS_PATHS` obtient la lecture de ses
+  chemins (sans téléchargement) ; cité dans `GROUPS_PATHS_RESTORE`, lecture + téléchargement de ces
+  chemins — jamais `POST /restore`/`Bkp`/`Prune`, qui exigent un tier. Exemple complet
   (un groupe borné à un seul répertoire, un groupe borné à plusieurs répertoires à la fois, deux
   groupes distincts partageant le même répertoire, un groupe avec lecture large et restauration
   restreinte) : [`docs/borghelperrc.example`](borghelperrc.example) et

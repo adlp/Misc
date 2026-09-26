@@ -1694,6 +1694,39 @@ list`/`borg extract` contre l'**archive** (`borgHelper:2957` `listperms`, `borgH
 `os.stat`/`os.access` sur l'host distant ni sur le serveur `borgHelperWWW`. Le RBAC
 (`GROUPS_PATHS`/`GROUPS_PATHS_RESTORE`) est le **seul** filtre d'autorisation sur toute cette chaîne.
 
+### Accès direct par périmètre, sans tier (`borgHelperWWW` 1.20.0)
+
+Demande utilisateur : un tier (`GROUPS_ADMIN`/`WRITE`/`READ`) équivaut à un accès racine aux
+sauvegardes du nick — devoir en donner un pour ensuite le restreindre par `GROUPS_PATHS` est
+l'inverse du moindre privilège. Désormais :
+
+- `_effective_level` : aucun tier trouvé mais groupe de l'appelant présent dans
+  `_direct_path_groups(cfg)` (clés de `GROUPS_PATHS` ∪ `GROUPS_PATHS_RESTORE`) → niveau `1`. Jamais
+  plus : `POST /restore` (niveau 2), `Bkp`/`Index`/`CacheClean` (2), `Prune`/`DelBkp`/... (3) restent
+  refusés par `_check_group_access`. Propagé tel quel à `GET /access` (`level:"read"`) et au périmètre
+  des abonnements push (`_scope_nicks_for_groups`).
+- `_resolve_path_scope` : `direct = (user_groups − tier_groups) ∩ groupes cités`. Pour ces groupes,
+  lecture = `GROUPS_PATHS[g] ∪ GROUPS_PATHS_RESTORE[g]` (on parcourt ce qu'on peut télécharger),
+  restauration/téléchargement = `GROUPS_PATHS_RESTORE[g]` **seul, sans repli** sur `GROUPS_PATHS` (le
+  repli par groupe reste réservé aux groupes à tier, rétro-compatible). Résultat possiblement `[]`
+  (groupe `GROUPS_PATHS` seul, périmètre de téléchargement) — jamais `None`, qui signifierait
+  illimité ; `_path_in_scope(…, [])` → `False`. Un groupe à tier non scopé de l'appelant l'emporte
+  toujours (illimité) ; sinon union des préfixes à tier et directs.
+- Les routes de téléchargement (`/download/file`, `/download/tar`, `/restore/perms`) étant déjà au
+  niveau 1 et gardées par `require_path_in_scope(..., for_restore=True)`, aucune logique par route n'a
+  été ajoutée : un groupe `GROUPS_PATHS` seul passe le contrôle de niveau puis reçoit la réponse
+  synthétique « introuvable » (périmètre `[]`).
+- Conséquence : `GROUPS_PATHS(_RESTORE)` est désormais parsé pour tout appelant, même sans tier — une
+  valeur rendue ambiguë en cours d'exécution lève (500) pour lui aussi.
+- UI 1.11.0 : `downloadInScope(nick,path)` (miroir de `_path_in_scope` sur `restore_scope` de
+  `/access`) masque le bouton « Télécharger » de TreeFind et le bouton de confirmation du dialogue de
+  téléchargement hors périmètre — confort uniquement, le serveur reste seul juge.
+
+Vérifié : `push_selftest` 48/48 (contrôle dédié), essai HTTP réel sur la démo (groupe `GROUPS_PATHS`
+seul : `/access` `read` + `restore_scope:[]`, arborescence via parents, TreeFind borné, téléchargement
+0 octet synthétique, `POST /bkp` 403 ; groupe `GROUPS_PATHS_RESTORE` seul : téléchargement réel dans
+son périmètre, `POST /restore` 403 ; groupe cité nulle part : 403).
+
 ### Répertoires parents du périmètre navigables dans TreeHist (`borgHelperWWW` 1.19.1)
 
 Bug réel rapporté : groupe borné à `/opt/backups/mysql/` → racine de l'arborescence UI vide, `opt` et
