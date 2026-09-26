@@ -39,7 +39,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.18.5"
+WWW_VERSION="1.18.6"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -133,7 +133,7 @@ _CONF_KEYS={'cfgfile':'BORGHELPERWWW_CFGFILE','api_key':'BORGHELPERWWW_API_KEY',
 def _apply_conf_section(sect):
     """Comble os.environ depuis une SectionProxy configparser selon _CONF_KEYS — ne touche jamais une
     variable déjà présente (priorité : CLI/env toujours prioritaires sur tout fichier). Factorisé pour
-    être partagé par borghelperwww.conf et .borghelperrc[DEFAULT.borghelperwww] (spec-
+    être partagé par borghelperwww.conf et .borghelperrc[_borgHelperWWW] (spec-
     borghelperrc-www-section) — même règle, deux sources possibles."""
     for _key,_envvar in _CONF_KEYS.items():
         if _envvar not in os.environ and _key in sect:
@@ -147,12 +147,13 @@ if _conf_path:
     _cp.read(_conf_path)
     _apply_conf_section(_cp['borgHelperWWW'] if _cp.has_section('borgHelperWWW') else _cp['DEFAULT'])
 
-# ── .borghelperrc[DEFAULT.borghelperwww] (spec-borghelperrc-www-section) ───────────────────
+# ── .borghelperrc[_borgHelperWWW] (spec-borghelperrc-www-section) ───────────────────
 # Dernier repli fichier, APRÈS borghelperwww.conf ci-dessus (_apply_conf_section ne comble que ce qui
 # manque encore) — permet un déploiement à fichier unique (le .borghelperrc dédié à l'API porte aussi
-# les réglages borgHelperWWW) sans gérer de second borghelperwww.conf. Section ORDINAIRE (seul le nom
-# exact 'DEFAULT' a un sens spécial pour configparser) choisie pour ne jamais entrer en collision avec
-# un nom de nick réel (contient un point). Le fichier concerné est celui déjà résolu par CLI/env/--conf
+# les réglages borgHelperWWW) sans gérer de second borghelperwww.conf. Préfixe '_' réservé : borgHelper
+# (CLI, cfgreadnicks — spec-borghelperrc-www-section CAP-3) ignore silencieusement toute section
+# .borghelperrc dont le nom commence par '_' lors de l'énumération des nicks (-n ALL) — jamais un nom
+# de nick valide, pas seulement improbable. Le fichier concerné est celui déjà résolu par CLI/env/--conf
 # ci-dessus (BORGHELPERWWW_CFGFILE) — jamais un autre, et jamais 'cfgfile' lui-même (circulaire, la clé
 # est de toute façon déjà dans os.environ à ce stade si elle existe, donc naturellement ignorée par
 # _apply_conf_section). Même style que ci-dessus (configparser par défaut, options insensibles à la casse).
@@ -164,8 +165,8 @@ if _www_cfgfile and os.path.isfile(_www_cfgfile):
     except configparser.Error:
         pass  # fichier réellement invalide : cfgread() (borgHelper) donnera l'erreur détaillée plus bas
     else:
-        if _cp2.has_section('DEFAULT.borghelperwww'):
-            _apply_conf_section(_cp2['DEFAULT.borghelperwww'])
+        if _cp2.has_section('_borgHelperWWW'):
+            _apply_conf_section(_cp2['_borgHelperWWW'])
 
 def _env_bool(name,default):
     v=os.environ.get(name)
@@ -252,7 +253,7 @@ def _warn_stray_borghelperwww_keys(cfgfile):
     """Garde : une clé BORGHELPERWWW_* posée NUE dans [DEFAULT] de .borghelperrc (piège réel constaté
     — ex. BORGHELPERWWW_GROUPS_HEADER) est silencieusement ignorée par configparser (clé inconnue,
     aucune erreur) : [DEFAULT] de .borghelperrc n'est lu QUE par borgHelper (CLI, par nick). Ne
-    concerne QUE le [DEFAULT] réel (cp.defaults()) — [DEFAULT.borghelperwww] (spec-
+    concerne QUE le [DEFAULT] réel (cp.defaults()) — [_borgHelperWWW] (spec-
     borghelperrc-www-section) est une section ORDINAIRE distincte, jamais scannée ici, aucun faux
     positif sur ce mécanisme légitime. Conséquence concrète du piège : GROUPS_HEADER ainsi posé
     laisse le RBAC par groupes désactivé sans aucun signal — X-API-Key seule fait foi, accès total
@@ -265,7 +266,7 @@ def _warn_stray_borghelperwww_keys(cfgfile):
     if stray:
         print(f"[WARN] {cfgfile} [DEFAULT] contient {', '.join(stray)} — ignoré(s) : borgHelperWWW ne "
               f"lit jamais [DEFAULT] pour ses propres réglages. Utiliser --conf/BORGHELPERWWW_CONF "
-              f"(borghelperwww.conf.example), ou une section [DEFAULT.borghelperwww] dans ce même "
+              f"(borghelperwww.conf.example), ou une section [_borgHelperWWW] dans ce même "
               f"fichier (clés en minuscule, ex. groups_header = X-Groups — jamais BORGHELPERWWW_*). "
               f"Si c'est GROUPS_HEADER, le RBAC par groupes reste désactivé sans erreur d'ici là "
               f"(accès total pour tout X-API-Key valide).",
@@ -2431,18 +2432,18 @@ def push_selftest():
     finally:
         shutil.rmtree(tmpdir,ignore_errors=True)
 
-    # ── .borghelperrc[DEFAULT.borghelperwww] (spec-borghelperrc-www-section) ──
+    # ── .borghelperrc[_borgHelperWWW] (spec-borghelperrc-www-section) ──
     def _default_borghelperwww_section_ok():
         """_apply_conf_section (partagée avec borghelperwww.conf) comble bien os.environ depuis une
-        section [DEFAULT.borghelperwww] ; ne touche jamais une variable déjà présente (priorité
+        section [_borgHelperWWW] ; ne touche jamais une variable déjà présente (priorité
         CLI/env) ; la garde ci-dessus reste silencieuse sur cette section (jamais confondue avec le
         piège [DEFAULT] nu, CAP-2)."""
         cp=configparser.ConfigParser()
-        cp.read_string("[DEFAULT.borghelperwww]\ngroups_header = X-Test-Groups\napi_prefix = /custom\n")
+        cp.read_string("[_borgHelperWWW]\ngroups_header = X-Test-Groups\napi_prefix = /custom\n")
         saved={k:os.environ.pop(k,None) for k in ('BORGHELPERWWW_GROUPS_HEADER','BORGHELPERWWW_API_PREFIX')}
         os.environ['BORGHELPERWWW_API_PREFIX']='/already-set'  # priorité : ne doit jamais être écrasée
         try:
-            _apply_conf_section(cp['DEFAULT.borghelperwww'])
+            _apply_conf_section(cp['_borgHelperWWW'])
             applied_ok=(os.environ.get('BORGHELPERWWW_GROUPS_HEADER')=='X-Test-Groups'
                         and os.environ.get('BORGHELPERWWW_API_PREFIX')=='/already-set')
         finally:
@@ -2451,7 +2452,7 @@ def push_selftest():
                 else: os.environ[k]=v
         rc_path=os.path.join(tempfile.mkdtemp(prefix='borghelperwww-defaultwww-selftest-'),'test.borghelperrc')
         with open(rc_path,'w') as f:
-            f.write("[DEFAULT]\nCACHE_DIR = /tmp\n\n[DEFAULT.borghelperwww]\ngroups_header = X-Test-Groups\n")
+            f.write("[DEFAULT]\nCACHE_DIR = /tmp\n\n[_borgHelperWWW]\ngroups_header = X-Test-Groups\n")
         out=io.StringIO()
         try:
             with contextlib.redirect_stderr(out):
@@ -2460,7 +2461,7 @@ def push_selftest():
             shutil.rmtree(os.path.dirname(rc_path),ignore_errors=True)
         guard_silent_ok=(out.getvalue()=='')
         return applied_ok and guard_silent_ok
-    check("[DEFAULT.borghelperwww] : comble os.environ sans écraser l'existant, jamais confondue avec le piège [DEFAULT] nu",
+    check("[_borgHelperWWW] : comble os.environ sans écraser l'existant, jamais confondue avec le piège [DEFAULT] nu",
           _default_borghelperwww_section_ok)
 
     # ── _is_valid_http_token (garde GROUPS_HEADER, piège réel : commentaire inline collé à la valeur) ──

@@ -78,17 +78,23 @@ Deux façons de fournir ses réglages, au choix :
 - **Fichier séparé** `borghelperwww.conf.example` (racine du dépôt, déjà complet et commenté) —
   adapter au minimum `cfgfile` (le `.borghelperrc` **dédié à l'API**, généralement distinct de celui
   de l'admin CLI) et `api_key`, puis lancer avec `--conf`/`BORGHELPERWWW_CONF`.
-- **Fichier unique** (borgHelperWWW ≥ 1.18.4) — poser les mêmes réglages directement dans une section
-  `[DEFAULT.borghelperwww]` du `.borghelperrc` dédié à l'API (voir
-  [`docs/borghelperrc.example`](borghelperrc.example)) : pas de second fichier à gérer. Dernier repli
-  (priorité : CLI > env > `borghelperwww.conf` > cette section > défauts) — `borghelperwww.conf`,
-  quand présent, garde la main.
+- **Fichier unique** (borgHelperWWW ≥ 1.18.6) — poser les mêmes réglages directement dans une section
+  `[_borgHelperWWW]` (préfixe `_` réservé — `borgHelper` ignore silencieusement toute section dont le
+  nom commence ainsi lors de l'énumération des nicks, `-n ALL` inclus) du `.borghelperrc` dédié à
+  l'API (voir [`docs/borghelperrc.example`](borghelperrc.example)) : pas de second fichier à gérer.
+  Dernier repli (priorité : CLI > env > `borghelperwww.conf` > cette section > défauts) —
+  `borghelperwww.conf`, quand présent, garde la main.
 
 ⚠️ **Jamais** une clé `BORGHELPERWWW_*` (majuscule, préfixée) posée nue dans `[DEFAULT]` du
 `.borghelperrc` — piège réel constaté (RBAC silencieusement inactif, accès total pour tout
 `X-API-Key` valide) : `borgHelperWWW` ≥ 1.18.3 avertit (`[WARN]` au démarrage) si ça arrive, mais
-n'active jamais le réglage pour autant. Utiliser `[DEFAULT.borghelperwww]` (minuscule, sans préfixe)
-ci-dessus à la place.
+n'active jamais le réglage pour autant. Utiliser `[_borgHelperWWW]` ci-dessus à la place — clés en
+minuscule, sans préfixe `BORGHELPERWWW_` (`groups_header`, pas `BORGHELPERWWW_GROUPS_HEADER`).
+
+⚠️ **Un commentaire va toujours sur sa propre ligne**, jamais après une valeur sur la même ligne —
+`configparser` ne le coupe jamais (piège réel constaté, voir `docs/borghelperrc.example` en tête de
+fichier). `borgHelperWWW` ≥ 1.18.5 refuse de démarrer si `groups_header` n'est pas un nom de header
+HTTP valide, plutôt que de planter sur la première requête.
 
 Réglages les plus importants pour un premier déploiement :
 

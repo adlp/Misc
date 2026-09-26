@@ -38,18 +38,19 @@ CACHE_DIR = /var/cache/borghelper
 ; Chemin du binaire borg si non trouvé automatiquement dans le PATH.
 ;BORG_EXE = /usr/bin/borg
 
-; ── borgHelperWWW : réglages du serveur lui-même (optionnel, borgHelperWWW 1.18.4) ──────────
-; Section ORDINAIRE (le nom "DEFAULT.borghelperwww" n'a aucun sens spécial pour configparser —
-; choisi simplement pour ne jamais collisionner avec un nom de nick réel). Dernier repli, APRÈS un
-; éventuel --conf/borghelperwww.conf : permet un déploiement à FICHIER UNIQUE, ce .borghelperrc
-; suffit pour la CLI et pour borgHelperWWW, sans second fichier de conf à gérer. Mêmes clés qu'un
+; ── borgHelperWWW : réglages du serveur lui-même (optionnel, borgHelperWWW 1.18.6) ──────────
+; Préfixe "_" RÉSERVÉ : borgHelper (CLI) ignore silencieusement toute section .borghelperrc dont le
+; nom commence par "_" lors de l'énumération des nicks (-n ALL, Stats sans argument...) — jamais
+; traitée comme un nick réel, quel que soit son contenu. Dernier repli fichier, APRÈS un éventuel
+; --conf/borghelperwww.conf : permet un déploiement à FICHIER UNIQUE, ce .borghelperrc suffit pour
+; la CLI et pour borgHelperWWW, sans second fichier de conf à gérer. Mêmes clés qu'un
 ; borghelperwww.conf classique (voir borghelperwww.conf.example à la racine du dépôt pour le jeu
 ; complet et leur documentation détaillée) — ici seulement celles les plus courantes.
 ;
 ; ⚠️ Ne JAMAIS poser une clé BORGHELPERWWW_* (majuscules, préfixée) directement dans [DEFAULT]
 ; ci-dessus en pensant configurer borgHelperWWW — silencieusement ignorée (borgHelperWWW avertit au
 ; démarrage si ça arrive, mais ne le fait JAMAIS). Les clés ci-dessous sont en minuscule, sans préfixe.
-[DEFAULT.borghelperwww]
+[_borgHelperWWW]
 ; Attendue dans le header X-API-Key :
 ;api_key = une-cle-api-longue-et-aleatoire
 ; Adresse d'écoute (exécution directe uniquement) :

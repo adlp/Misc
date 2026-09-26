@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.112"
+Version="1.0.113"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -2090,7 +2090,10 @@ class BorgRunner:
             config.optionxform=str
             config.read(self.cfgfile)
             for nick in config.keys():
-                if nick!="DEFAULT" and 'ALL' not in config[nick].keys():
+                # Une section dont le nom commence par '_' est réservée à un autre composant (ex.
+                # [_borgHelperWWW], spec-borghelperrc-www-section) — jamais un nick, ignorée en
+                # silence ici. S'applique à toute section '_*' future sans code supplémentaire.
+                if nick!="DEFAULT" and not nick.startswith('_') and 'ALL' not in config[nick].keys():
                     preret.append(nick)
             return ','.join(preret)
         return None
@@ -2724,7 +2727,7 @@ class BorgHelper:
                 print('**Mounted**' if mountedornot(cfg['MOUNTPOINT'],debug=debug) else 'Not Mounted')
             if nick is None:
                 for n in config.keys():
-                    if n in 'DEFAULT': continue
+                    if n=='DEFAULT' or n.startswith('_'): continue
                     _affconf(n)
             elif nick in config.keys():
                 _affconf(nick)
@@ -6250,6 +6253,36 @@ def codec_selftest():
             txt=out.getvalue()+err.getvalue()
             return 'cliA' in txt and 'cliB' in txt and 'ALL:' not in txt
         check("CLI : DbStatus -n ALL s'étend à tous les nicks configurés (pas un nick littéral 'ALL')",_cli_dbstatus_all_expands)
+        def _cfgreadnicks_ignores_underscore_sections():
+            """cfgreadnicks() (spec-borghelperrc-www-section CAP-3) : une section .borghelperrc dont
+            le nom commence par '_' (ex. [_borgHelperWWW], réservée à un autre composant) n'est
+            JAMAIS traitée comme un nick — ignorée en silence, quel que soit son contenu (même une
+            section sans aucun réglage de nick valide, qui ferait planter toute commande qui la
+            traiterait comme telle). -n ALL sur un tel fichier ne doit jamais essayer de la lister."""
+            d=os.path.join(tmp,'cli-underscore'); os.makedirs(d,exist_ok=True)
+            rc=os.path.join(d,'rc')
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR = {d}\n\n")
+                f.write("[_borgHelperWWW]\napi_key = whatever\ngroups_header = X-Groups\n\n")
+                for nk in ('undA','undB'):
+                    f.write(f"[{nk}]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw-{nk}\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n\n")
+            os.chmod(rc,0o600)
+            br=BorgRunner(cfgfile=rc)
+            nicks=set(br.cfgreadnicks().split(','))
+            direct_ok=(nicks=={'undA','undB'} and '_borgHelperWWW' not in nicks)
+            saved_argv=sys.argv[:]
+            out=io.StringIO(); err=io.StringIO()
+            try:
+                sys.argv=['borgHelper','-C',rc,'-c','Status','-n','ALL','-j']
+                with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+                    try: _cli_main()
+                    except SystemExit: pass
+            finally:
+                sys.argv=saved_argv
+            txt=out.getvalue()+err.getvalue()
+            cli_ok=('undA' in txt and 'undB' in txt and '_borgHelperWWW' not in txt)
+            return direct_ok and cli_ok
+        check("cfgreadnicks/-n ALL ignorent silencieusement une section '_*' (réservée, ex. [_borgHelperWWW])",_cfgreadnicks_ignores_underscore_sections)
         def _db_migrate_cache_error_wrapped():
             """Revue : l'appel à _db_migrate_cache (après _db_migrate_run) n'était PAS dans le même except
             que _db_migrate_run -> une DbModeError venant de _db_migrate_cache (CAS/write échoués sur

@@ -1,5 +1,30 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.113 / borgHelperWWW 1.18.6 — section renommée [_borgHelperWWW] + borgHelper l'ignore — 2026-09-26
+
+Révision de `spec-borghelperrc-www-section` (1.18.4, `fa88c38`) à la demande de l'utilisateur : la
+section `.borghelperrc[DEFAULT.borghelperwww]` devient `[_borgHelperWWW]` (préfixe `_` réservé, plus
+court, plus explicitement "technique interne" qu'un nom composé avec un point) — même mécanique,
+même priorité (CLI > env > `borghelperwww.conf` > `.borghelperrc[_borgHelperWWW]` > défauts).
+
+**Nouveauté** (pas dans la V1) : `borgHelper` (CLI) ignore désormais **silencieusement** toute section
+`.borghelperrc` dont le nom commence par `_` lors de l'énumération des nicks — jamais traitée comme un
+nick réel. Sans ce correctif, `-n ALL` (ou toute commande qui itère via `cfgreadnicks()`) aurait tenté
+de traiter `[_borgHelperWWW]` comme un nick et planté (section sans `MOUNTPOINT`/`BORG_REPO`/etc.).
+
+- `BorgRunner.cfgreadnicks()` : filtre `not nick.startswith('_')`, générique — toute future section
+  réservée `_*` est ignorée sans code supplémentaire.
+- `stats()` (commande `Stats` sans argument) : même filtre, ajouté à son énumération propre (pas via
+  `cfgreadnicks`) ; corrige au passage un bug latent (`if n in 'DEFAULT'` — test de sous-chaîne, pas
+  d'égalité — un nick dont le nom était une sous-chaîne de "DEFAULT" aurait été silencieusement
+  sauté ; devient `if n=='DEFAULT'`).
+- `borgHelperWWW` : toutes les références à `[DEFAULT.borghelperwww]` renommées `[_borgHelperWWW]`
+  (code, commentaires, `push_selftest`).
+- `CodecSelfTest` (borgHelper) : nouveau contrôle dédié — 320/320 OK. `push_selftest`
+  (borgHelperWWW) : 29/29 OK inchangé (renommage transparent). Vérifié en réel : `Status -n ALL` sur
+  un `.borghelperrc` portant `[_borgHelperWWW]` liste bien les vrais nicks, jamais la section
+  réservée.
+
 ## borgHelperWWW 1.18.5 — garde GROUPS_HEADER + docs/borghelperrc.example corrigé — 2026-09-26
 
 Incident réel (rapporté par l'utilisateur) : `500 Internal Server Error`/`UnicodeEncodeError` sur

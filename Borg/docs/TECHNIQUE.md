@@ -115,7 +115,7 @@ accessibles sans préfixe).
   pas la seule voie d'accès) : voir `TECHNICAL.md` et `README.md`, section RBAC.
 - `groups_header` (et les autres réglages `borgHelperWWW`) se configurent par CLI, variable
   d'environnement, `borghelperwww.conf` (`--conf`), ou — depuis 1.18.4 — une section
-  `[DEFAULT.borghelperwww]` du `.borghelperrc` lui-même (déploiement à fichier unique, voir
+  `[_borgHelperWWW]` du `.borghelperrc` lui-même (déploiement à fichier unique, voir
   [DEPLOIEMENT.md §5](DEPLOIEMENT.md#5-configurer-et-lancer-borghelperwww-optionnel)). Une clé
   `BORGHELPERWWW_*` posée nue dans `[DEFAULT]` (au lieu de cette section dédiée) est silencieusement
   ignorée — `borgHelperWWW` avertit (`[WARN]`) au démarrage si ça arrive.
