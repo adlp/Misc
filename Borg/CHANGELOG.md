@@ -1,5 +1,15 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.112 — TreeFind : recherche par nom insensible à la casse — 2026-09-26
+
+`_treefind_listing` comparait le nom (dernier segment du chemin) au motif `-m` via
+`fnmatch.fnmatchcase` — sensible à la casse (`-m error` ne trouvait pas `ERROR.log`), contrairement à
+`Search`/`DuIdx` dont le `LIKE` est déjà insensible à la casse (ASCII) par défaut SQLite. Corrigé :
+comparaison via `str.casefold()` des deux côtés (nom et motif) — insensible à la casse, y compris pour
+les caractères accentués (plus large que l'ASCII-only des `LIKE` SQL ailleurs dans ce fichier).
+319/319 `CodecSelfTest` OK (nouveau contrôle dédié ajouté, données réelles indexées — `bin/b.log`
+trouvé par `*.LOG`/`B.LOG`, `upper.txt` par `UPPER`, `Etc` par `etc`).
+
 ## borgHelperWWW 1.18.1 — pywebpush et py_vapid deviennent des dépendances optionnelles — 2026-09-26
 
 Ni `pywebpush` ni `py_vapid` (sa dépendance transitive) ne sont des paquets d'un dépôt apt (PyPI-only)

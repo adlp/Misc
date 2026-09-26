@@ -583,7 +583,8 @@ borgHelper -c TreeFind -n mon-serveur -m '*.ko' -j                 # JSON
 
 Motif minimal (`-m`) : `*` = n'importe quelle suite de caractères, `.` reste **littéral** (pas de sens
 spécial) ; sans `*` (ni `?`) dans le motif, sous-chaîne implicite (comme `Search`). Comparaison sur le
-**nom** de l'entrée uniquement (dernier segment du chemin), sensible à la casse.
+**nom** de l'entrée uniquement (dernier segment du chemin), **insensible à la casse** (`casefold`,
+correct aussi pour les caractères accentués — `-m 'error*'` trouve `ERROR.log` comme `Error.LOG`).
 
 Le préfixe (`-f`) est sensible à la casse et littéral (`%`/`_` n'y sont pas des jokers) ; un `/` initial/final ou un `//`
 interne est normalisé avant comparaison — voir la note dans `TreeHist` ci-dessus.

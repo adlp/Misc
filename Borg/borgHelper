@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.111"
+Version="1.0.112"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -3917,12 +3917,15 @@ class BorgHelper:
     def _treefind_listing(self,n,prefix,pattern,conn,debug=0,as_json=False):
         """Recherche récursive par NOM (pas le chemin complet) sous <prefix> (racine si omis), dans
         le dernier snapshot connu. Motif minimal : '*' = n'importe quelle suite de caractères, '.'
-        reste littéral ; sans '*' (ni '?'), sous-chaîne implicite (comme Search). Retourne une liste
-        plate {name,full_path,parent,is_dir,genre,mode,owner}, triée par chemin."""
+        reste littéral ; sans '*' (ni '?'), sous-chaîne implicite (comme Search). Comparaison
+        insensible à la casse (casefold — plus large que l'ASCII-only de SQLite LIKE ailleurs dans ce
+        fichier, correct aussi pour les caractères accentués). Retourne une liste plate
+        {name,full_path,parent,is_dir,genre,mode,owner}, triée par chemin."""
         import fnmatch
         prefix=_norm_lp(prefix)
         pat=pattern or '*'
         if '*' not in pat and '?' not in pat: pat=f'*{pat}*'
+        pat_cf=pat.casefold()
         row=conn.execute("SELECT archive FROM archive_snapshot_v WHERE nick=? ORDER BY archive_date DESC LIMIT 1",(n,)).fetchone()
         if row is None:
             msg=f"aucun snapshot indexé — lancez : borgHelper -c Index -n {n}"
@@ -3937,7 +3940,7 @@ class BorgHelper:
         for path,ftype,mode,owner in rows:
             if prefix and path==prefix: continue  # le préfixe lui-même n'est pas un résultat
             name=path.rsplit('/',1)[-1]
-            if not fnmatch.fnmatchcase(name,pat): continue
+            if not fnmatch.fnmatchcase(name.casefold(),pat_cf): continue
             is_dir=(ftype=='d')
             genre=_TREEHIST_GENRES.get(ftype,'répertoire' if is_dir else 'inconnu (réindexer)')
             parent=path.rsplit('/',1)[0] if '/' in path else ''
@@ -3957,7 +3960,7 @@ class BorgHelper:
             if prefix and path==prefix: continue
             if path in present_paths: continue  # présent dans le dernier snapshot -> jamais listé deux fois
             name=path.rsplit('/',1)[-1]
-            if not fnmatch.fnmatchcase(name,pat): continue
+            if not fnmatch.fnmatchcase(name.casefold(),pat_cf): continue
             is_dir=size_before is None  # heuristique : diff_index n'a pas de colonne de type, borg diff
                                          # n'inclut pas de taille pour une entrée répertoire
             genre='répertoire' if is_dir else 'fichier'
@@ -5460,6 +5463,20 @@ def codec_selftest():
                     check(f"parité TreeHist {pre!r} -b {arch}",lambda pre=pre,arch=arch: _same(bhq.treehist,pre,archive_from=arch,as_json=True,key=True))
             for pre,pat in (('/etc','*'),('etc/','*'),('a%b//x','*.log'),(None,'log'),(None,'*.LOG'),(None,None),('etc','*'),('a%b','*'),('home','*.tmp'),(None,'*.log'),('a_b','*'),('éa','日*'),('x','z'),('Etc','*')):
                 check(f"parité TreeFind {pre!r} {pat!r} (dont supprimés)",lambda pre=pre,pat=pat: _same(bhq.treefind,pre,pat,as_json=True,key=True))
+            def _treefind_names(nk,pre,pat):
+                v=json.loads(_q_run(bhq.treefind,nk,pre,pat,as_json=True))[nk]
+                return {} if isinstance(v,dict) and 'error' in v else {m['name'] for m in v['matches']}
+            def _treefind_ci_ok():
+                """Insensible à la casse (casefold) sur le NOM, comme demandé par l'utilisateur — motif
+                en casse opposée au fichier/dossier réel trouve quand même le résultat, plain et
+                chiffré, avec et sans jokers explicites (sous-chaîne implicite)."""
+                for nk in ('qp','qe'):
+                    if 'b.log' not in _treefind_names(nk,None,'*.LOG'): return False       # joker explicite
+                    if 'b.log' not in _treefind_names(nk,None,'B.LOG'): return False       # sous-chaîne implicite, casse inversée
+                    if 'upper.txt' not in _treefind_names(nk,None,'UPPER'): return False   # sous-chaîne implicite
+                    if 'Etc' not in _treefind_names(nk,None,'etc'): return False           # motif minuscule -> nom à majuscule initiale
+                return True
+            check("TreeFind : recherche par nom insensible à la casse (casefold, plain et chiffré)",_treefind_ci_ok)
             for pat in ('log','*.LOG','a_b','a%b','ETC/%','éa','日本','_tc','*.tmp','x?y','zzz','[a]'):
                 for arch in (None,'ALL'):
                     check(f"parité Search {pat!r} -b {arch}",lambda pat=pat,arch=arch: (lambda p,e:p==e)(*_q_pair(bhq.search,pat,archive_from=arch,as_json=True,key=True)))
