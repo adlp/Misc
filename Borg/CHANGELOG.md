@@ -1,5 +1,22 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.18.3 — garde contre BORGHELPERWWW_* égarée dans .borghelperrc — 2026-09-26
+
+Piège réel constaté en production : un admin a posé `BORGHELPERWWW_GROUPS_HEADER=X-GROUPS` dans
+`[DEFAULT]` de son `.borghelperrc`, pensant activer le RBAC par groupes. `.borghelperrc` n'est lu que
+par `borgHelper` (CLI, par nick) — `borgHelperWWW` lit ses propres réglages uniquement depuis
+l'environnement ou `--conf`/`BORGHELPERWWW_CONF` (`borghelperwww.conf.example`). La clé était donc
+silencieusement ignorée (configparser ne signale jamais une clé inconnue) : RBAC resté désactivé,
+X-API-Key seule faisant foi — accès total à tous les nicks pour quiconque a une clé API valide, sans
+aucune erreur ni avertissement pour le détecter.
+
+- Nouvelle garde `_warn_stray_borghelperwww_keys()`, appelée juste après la validation de `CFGFILE` :
+  relit `.borghelperrc` en `configparser` séparé (`optionxform=str`, casse préservée), et avertit
+  (`[WARN]`, stderr) si `[DEFAULT]` contient une ou plusieurs clés `BORGHELPERWWW_*` — jamais
+  bloquant, juste un signal impossible à manquer au démarrage.
+- `push_selftest` : nouveau contrôle dédié (27/27 OK) — avertit sur un `.borghelperrc` piégé,
+  silencieux sur un propre.
+
 ## borgHelperWWW 1.18.2 — pywebpush/py_vapid/http_ece vendorisés — 2026-09-26
 
 `spec-push-vendoring` : les notifications push (spec-notifications-push) sont maintenant réellement

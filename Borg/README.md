@@ -952,6 +952,13 @@ Trois façons de configurer, cumulables — par ordre de priorité (la première
    ci-dessous — voir [`borghelperwww.conf.example`](borghelperwww.conf.example) ; comble uniquement
    ce qui n'est pas déjà réglé par une option CLI ou une variable d'environnement)
 
+⚠️ **Jamais dans `.borghelperrc`** : ce fichier (`-C`/`BORGHELPERWWW_CFGFILE` ci-dessous) est lu par
+`borgHelper` (CLI, réglages par nick) — une clé `BORGHELPERWWW_*` posée dans son `[DEFAULT]` est
+silencieusement ignorée par `borgHelperWWW` (aucune erreur). Piège réel constaté : `GROUPS_HEADER`
+ainsi posé laisse le RBAC désactivé sans le savoir (accès total pour tout `X-API-Key` valide) —
+`borgHelperWWW` avertit désormais (`[WARN]` au démarrage) si une clé `BORGHELPERWWW_*` traîne dans
+`[DEFAULT]` de `.borghelperrc`.
+
 | Variable d'environnement | Option CLI | Clé fichier de conf | Rôle |
 |---------------------------|------------|----------------------|------|
 | `BORGHELPERWWW_CONF` | `--conf` | — | Fichier de conf ini (voir ci-dessus) |

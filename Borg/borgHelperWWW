@@ -39,7 +39,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.18.2"
+WWW_VERSION="1.18.3"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -204,6 +204,28 @@ if not CFGFILE:
     sys.exit("Fichier de conf manquant — -C/--cfgfile ou BORGHELPERWWW_CFGFILE (chemin du .borghelperrc dédié à l'API)")
 if not os.path.isfile(CFGFILE):
     sys.exit(f"Fichier de conf introuvable : {CFGFILE}")
+
+def _warn_stray_borghelperwww_keys(cfgfile):
+    """Garde : une clé BORGHELPERWWW_* posée dans [DEFAULT] de .borghelperrc (piège réel constaté —
+    ex. BORGHELPERWWW_GROUPS_HEADER) est silencieusement ignorée par configparser (clé inconnue,
+    aucune erreur) : .borghelperrc n'est lu QUE par borgHelper (CLI, par nick) — borgHelperWWW lit
+    ses PROPRES réglages uniquement depuis l'environnement ou --conf/BORGHELPERWWW_CONF (voir
+    borghelperwww.conf.example), jamais depuis .borghelperrc. Conséquence concrète du piège :
+    GROUPS_HEADER ainsi posé laisse le RBAC par groupes désactivé sans aucun signal — X-API-Key seule
+    fait foi, accès total pour quiconque a une clé valide."""
+    try:
+        cp=configparser.ConfigParser(); cp.optionxform=str; cp.read(cfgfile)
+    except configparser.Error:
+        return  # fichier réellement invalide : cfgread() plus bas donnera l'erreur détaillée
+    stray=sorted(k for k in cp.defaults() if k.startswith('BORGHELPERWWW_'))
+    if stray:
+        print(f"[WARN] {cfgfile} [DEFAULT] contient {', '.join(stray)} — ignoré(s) : borgHelperWWW ne "
+              f"lit jamais .borghelperrc pour ses propres réglages (voir borghelperwww.conf.example). "
+              f"Si c'est GROUPS_HEADER, le RBAC par groupes reste désactivé sans erreur (accès total "
+              f"pour tout X-API-Key valide) — utiliser --conf/BORGHELPERWWW_CONF à la place.",
+              file=sys.stderr,flush=True)
+
+_warn_stray_borghelperwww_keys(CFGFILE)
 if not API_KEY:
     API_KEY=secrets.token_urlsafe(32)
     print("─"*70,file=sys.stderr)
@@ -2336,6 +2358,31 @@ def push_selftest():
             conn.close()
     finally:
         PUSH_DB=old_push_db
+        shutil.rmtree(tmpdir,ignore_errors=True)
+
+    # ── Garde BORGHELPERWWW_* égarée dans .borghelperrc[DEFAULT] (piège réel constaté en prod) ──
+    def _stray_keys_warned():
+        trap_rc=os.path.join(tmpdir,'trap.borghelperrc')
+        os.makedirs(tmpdir,exist_ok=True)
+        with open(trap_rc,'w') as f:
+            f.write("[DEFAULT]\nBORGHELPERWWW_GROUPS_HEADER = X-GROUPS\nCACHE_DIR = /tmp\n")
+        out=io.StringIO()
+        with contextlib.redirect_stderr(out):
+            _warn_stray_borghelperwww_keys(trap_rc)
+        warned=('BORGHELPERWWW_GROUPS_HEADER' in out.getvalue() and '[WARN]' in out.getvalue())
+        clean_rc=os.path.join(tmpdir,'clean.borghelperrc')
+        with open(clean_rc,'w') as f:
+            f.write("[DEFAULT]\nCACHE_DIR = /tmp\n")
+        out2=io.StringIO()
+        with contextlib.redirect_stderr(out2):
+            _warn_stray_borghelperwww_keys(clean_rc)
+        silent=(out2.getvalue()=='')
+        return warned and silent
+    tmpdir=tempfile.mkdtemp(prefix='borghelperwww-strayguard-selftest-')
+    try:
+        check("garde BORGHELPERWWW_* dans .borghelperrc[DEFAULT] : avertit si présent, silencieux sinon",
+              _stray_keys_warned)
+    finally:
         shutil.rmtree(tmpdir,ignore_errors=True)
 
     fails=results.count(False)
