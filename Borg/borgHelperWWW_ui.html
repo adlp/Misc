@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.14.0 -->
+<!-- UI_VERSION: 1.15.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -1754,6 +1754,22 @@ function routePath(st){
     default: return null;  // connexion : l'adresse ne change pas
   }
 }
+// Titre de l'onglet (UI 1.15.0) : le plus précis d'abord (les onglets tronquent à droite) ; c'est aussi
+// le libellé des entrées de Précédent/Suivant et des favoris.
+function pageTitle(st){
+  const app='borgHelperWWW';
+  switch(st.view){
+    case 'view-login': return 'Connexion — '+app;
+    case 'view-machines': return 'Serveurs — '+app;
+    case 'view-detail': return '🖥 '+st.nick+' — '+app;
+    case 'view-history': return '📜 '+st.nick+' — Historique — '+app;
+    case 'view-notifications': return '🔔 Notifications — '+app;
+    case 'view-browse':
+      return '🗂 '+st.nick+':/'+String(st.path||'').split('/').filter(Boolean).join('/')
+        +(st.archive?' @ '+st.archive:'')+' — '+app;
+    default: return app;
+  }
+}
 function parseRoute(pathname,search){
   let segs;
   try{ segs=String(pathname||'/').split('/').filter(Boolean).map(decodeURIComponent); }
@@ -1770,17 +1786,21 @@ function parseRoute(pathname,search){
 
 let routeApplying=false;  // vrai pendant qu'une adresse est rejouée : aucune nouvelle entrée d'historique
 let routeSeq=0;           // numéro de la dernière application d'adresse / navigation utilisateur
-function currentRoutePath(){
-  return routePath({view:currentViewId,nick:currentViewId==='view-browse'?browseNick:currentNick,
-                    path:browsePath,archive:browseArchive});
+function currentRouteState(){
+  return {view:currentViewId,nick:currentViewId==='view-browse'?browseNick:currentNick,
+          path:browsePath,archive:browseArchive};
 }
+function currentRoutePath(){ return routePath(currentRouteState()); }
 function syncUrl(){
-  if(routeApplying) return;
-  const url=currentRoutePath();
-  if(url!==null && url!==location.pathname+location.search){
-    history.pushState(null,'',url);
-    routeSeq++;  // navigation de l'utilisateur : une application d'adresse en attente (/access) devient obsolète
+  const st=currentRouteState();
+  if(!routeApplying){
+    const url=routePath(st);
+    if(url!==null && url!==location.pathname+location.search){
+      history.pushState(null,'',url);
+      routeSeq++;  // navigation de l'utilisateur : une application d'adresse en attente (/access) devient obsolète
+    }
   }
+  document.title=pageTitle(st);  // APRÈS pushState : le titre va à la nouvelle entrée, pas à la précédente
 }
 
 // Serveur accessible ? /access (droits réels). Inconnu et sans droit : même réponse (ne révèle pas
@@ -1829,6 +1849,19 @@ async function applyRoute(){
   } finally { routeApplying=false; }
 }
 window.addEventListener('popstate',()=>{ applyRoute(); });
+
+// Clic sur une notification push (borgHelperWWW_sw.js >= 1.3.0) : le Service Worker demande à cet onglet
+// d'aller à une adresse de l'UI (/serveur/<nick>) — nouvelle entrée d'historique, puis application comme
+// un lien (droits vérifiés, connexion d'abord si besoin). Seuls les chemins locaux sont acceptés.
+if('serviceWorker' in navigator){
+  navigator.serviceWorker.addEventListener('message',e=>{
+    const m=e.data||{};
+    if(m.type!=='navigate' || typeof m.url!=='string' || !m.url.startsWith('/') || m.url.startsWith('//')) return;
+    if(m.url!==location.pathname+location.search){ history.pushState(null,'',m.url); routeSeq++; }
+    applyRoute();
+  });
+  if(navigator.serviceWorker.startMessages) navigator.serviceWorker.startMessages();  // messages reçus même si la page n'est pas contrôlée par le SW
+}
 
 // « 🔗 Copier le lien » : presse-papier, sinon (page non sécurisée, refus) adresse affichée à copier.
 document.addEventListener('click',async e=>{

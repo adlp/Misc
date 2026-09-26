@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Test du routeur de l'UI (spec-ui-deep-links, UI >= 1.14.0) — sans dépendance, sans DOM.
-// Extrait les fonctions pures routePath/parseRoute de borgHelperWWW_ui.html et vérifie la matrice
-// d'adresses : analyse, adresses invalides, aller-retour d'encodage état -> adresse -> état.
+// Extrait les fonctions pures routePath/parseRoute/pageTitle de borgHelperWWW_ui.html et vérifie la
+// matrice d'adresses (analyse, adresses invalides, aller-retour d'encodage état -> adresse -> état) et
+// le titre de l'onglet de chaque page (UI >= 1.15.0).
 //
 //   node borgHelperWWW_ui_test.js [chemin/vers/borgHelperWWW_ui.html]
 //
@@ -24,7 +25,8 @@ function grab(name){
   }
   return src.slice(i,j+1);
 }
-const {routePath,parseRoute}=new Function(grab('routePath')+'\n'+grab('parseRoute')+'\nreturn {routePath,parseRoute};')();
+const {routePath,parseRoute,pageTitle}=new Function(grab('routePath')+'\n'+grab('parseRoute')+'\n'+grab('pageTitle')
+  +'\nreturn {routePath,parseRoute,pageTitle};')();
 
 let fail=0;
 function eq(name,got,want){
@@ -68,6 +70,17 @@ roundTrip('encodage explorateur',{view:'view-browse',nick:'srv é #1',path:'mes 
 roundTrip('encodage historique',{view:'view-history',nick:'n ?#é'});
 roundTrip('encodage serveur',{view:'view-detail',nick:'n:x %'});
 roundTrip('explorateur racine sans archive',{view:'view-browse',nick:'srv',path:'',archive:null});
+
+// Titre de l'onglet
+const T=' — borgHelperWWW';
+eq('titre connexion',pageTitle({view:'view-login'}),'Connexion'+T);
+eq('titre liste',pageTitle({view:'view-machines'}),'Serveurs'+T);
+eq('titre serveur',pageTitle({view:'view-detail',nick:'srv'}),'🖥 srv'+T);
+eq('titre historique',pageTitle({view:'view-history',nick:'srv'}),'📜 srv — Historique'+T);
+eq('titre notifications',pageTitle({view:'view-notifications'}),'🔔 Notifications'+T);
+eq('titre explorateur racine',pageTitle({view:'view-browse',nick:'srv',path:'',archive:null}),'🗂 srv:/'+T);
+eq('titre explorateur répertoire',pageTitle({view:'view-browse',nick:'srv',path:'/etc//nginx/',archive:null}),'🗂 srv:/etc/nginx'+T);
+eq('titre explorateur archive',pageTitle({view:'view-browse',nick:'srv',path:'etc',archive:'srv-2026'}),'🗂 srv:/etc @ srv-2026'+T);
 
 console.log(fail?fail+' FAIL':'TOUT OK');
 process.exit(fail?1:0);

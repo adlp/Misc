@@ -1,5 +1,22 @@
 # Changelog — borgHelper
 
+## borgHelperWWW_ui.html 1.15.0 / borgHelperWWW_sw.js 1.3.0 — clic de notification vers le serveur, titre par page — 2026-09-27
+
+Demande utilisateur : clic de notification vers `/serveur/<nick>` ; titre de la page/onglet propre à
+chaque page.
+
+- Clic sur une notification push : page du serveur concerné (`/serveur/<nick>`, `/` pour la
+  notification de test). Onglet borgHelperWWW déjà ouvert : il y va sans se recharger (Précédent
+  ramène à la page d'avant) et passe au premier plan ; sinon nouvel onglet (connexion d'abord). Droits
+  vérifiés comme pour un lien partagé.
+- Titre de l'onglet par page : `🖥 <nick>`, `🗂 <nick>:/<chemin> [@ <archive>]`,
+  `📜 <nick> — Historique`, `Serveurs`, `🔔 Notifications`, `Connexion` (+ « — borgHelperWWW »).
+- `borgHelperWWW_ui_test.js` couvre aussi les titres (33 cas).
+- borgHelperWWW inchangé, mais **à redémarrer** : il lit `borgHelperWWW_sw.js` une seule fois au
+  démarrage. Le navigateur récupère ensuite le nouveau Service Worker de lui-même.
+- Vérifié : test Node 33/33 ; Chrome headless (script ponctuel) : titres, clic de notification via le
+  vrai Service Worker, parcours précédent 27/27 ; `push_selftest` 71/71.
+
 ## borgHelperWWW_ui.html 1.14.0 — test du routeur versionné — 2026-09-27
 
 Demande utilisateur : versionner le test du routeur des adresses partageables.

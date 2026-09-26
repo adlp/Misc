@@ -1,8 +1,8 @@
-// SW_VERSION: 1.2.0
+// SW_VERSION: 1.3.0
 // borgHelperWWW — Service Worker des notifications push (spec-push-ui-prefs-json).
 // Servi par borgHelperWWW sur /sw.js (portée : toute l'origine). Ne fait qu'afficher les notifications
-// envoyées par le serveur (watcher bkp_status ou POST /push/test) et ramener au premier plan l'onglet
-// borgHelperWWW au clic — aucun cache hors-ligne, aucune interception de requête.
+// envoyées par le serveur (watcher bkp_status ou POST /push/test) et, au clic, amener l'onglet
+// borgHelperWWW sur la page du serveur concerné — aucun cache hors-ligne, aucune interception de requête.
 'use strict';
 
 self.addEventListener('install', () => self.skipWaiting());
@@ -65,11 +65,24 @@ self.addEventListener('push', e => {
   }));
 });
 
-self.addEventListener('notificationclick', e => {
+// Adresse ouverte au clic (SW >= 1.3.0) : page du serveur (/serveur/<nick>, UI >= 1.14.0), liste sinon.
+function targetUrl(d) {
+  return d && d.nick ? '/serveur/' + encodeURIComponent(d.nick) : '/';
+}
+
+// Onglet borgHelperWWW déjà ouvert : premier plan + message 'navigate' — la page change d'adresse sans
+// se recharger (état et clé de session de l'onglet conservés ; sans session : connexion puis la page).
+// Aucun onglet : nouvel onglet sur l'adresse (connexion d'abord, la clé API étant par onglet).
+async function onNotificationClick(e) {
   e.notification.close();
-  e.waitUntil((async () => {
-    const wins = await self.clients.matchAll({type: 'window', includeUncontrolled: true});
-    for (const w of wins) { if ('focus' in w) return w.focus(); }
-    if (self.clients.openWindow) return self.clients.openWindow('/');
-  })());
-});
+  const url = targetUrl(e.notification.data);
+  const wins = await self.clients.matchAll({type: 'window', includeUncontrolled: true});
+  const w = wins.find(c => c.focused) || wins[0];
+  if (w) {
+    w.postMessage({type: 'navigate', url});
+    // focus() peut être refusé (délai d'activation dépassé…) : la page a déjà reçu l'adresse.
+    return 'focus' in w ? w.focus().catch(() => w) : undefined;
+  }
+  if (self.clients.openWindow) return self.clients.openWindow(url);
+}
+self.addEventListener('notificationclick', e => e.waitUntil(onNotificationClick(e)));

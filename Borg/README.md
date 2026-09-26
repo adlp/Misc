@@ -1519,6 +1519,10 @@ montrer exactement ce dont on parle.
   « Serveur inconnu ou inaccessible avec vos droits : `<nick>` » — sans révéler si ce serveur existe.
 - Adresse inconnue (`/xyz`, `/explorer` sans serveur…) ouverte dans un navigateur : liste des serveurs,
   adresse remplacée par `/`. Un client API (curl…) reçoit toujours le `404` JSON habituel.
+- **Titre de l'onglet** (UI ≥ 1.15.0) propre à chaque page, le plus précis d'abord — `🖥 <nick>`,
+  `🗂 <nick>:/<chemin> [@ <archive>]`, `📜 <nick> — Historique`, `Serveurs`, `🔔 Notifications`,
+  `Connexion` (suivi de « — borgHelperWWW ») : onglets, favoris et menu de Précédent/Suivant
+  distinguent les pages.
 - Non reflétés dans l'adresse : la recherche de l'explorateur et l'action ouverte dans la page détail.
 - L'interface doit être publiée à la racine du site (pas sous un sous-chemin `https://host/borg/…`).
 - Test du routeur (Node, sans dépendance) : `node borgHelperWWW_ui_test.js` — à lancer après toute
@@ -1748,8 +1752,11 @@ modifier ses réglages et de se désabonner (borgHelperWWW ≥ 1.21.0 / UI ≥ 1
 propres à chaque navigateur. **Exige HTTPS** (ou `localhost`) : un navigateur refuse les notifications
 push sur une page non sécurisée. Service Worker : fichier statique `borgHelperWWW_sw.js` (à côté de
 l'UI), servi sur `GET /sw.js` sans `X-API-Key` (un navigateur ne peut pas ajouter d'en-tête à
-l'enregistrement de son propre Service Worker) — il ne fait qu'afficher la notification et ramener
-l'onglet borgHelperWWW au premier plan au clic.
+l'enregistrement de son propre Service Worker) — il ne fait qu'afficher la notification et, au clic
+(`borgHelperWWW_sw.js` ≥ 1.3.0), ouvrir la page du serveur concerné (`/serveur/<nick>`) : un onglet
+borgHelperWWW déjà ouvert y va sans se recharger (Précédent ramène à la page d'avant) et passe au
+premier plan ; sinon un nouvel onglet s'ouvre (connexion d'abord, la clé API étant par onglet). Mêmes
+règles qu'un lien partagé : serveur hors droits → liste + message de refus. Notification de test → `/`.
 
 **Stockage des préférences — fichier JSON** (`BORGHELPERWWW_PUSH_PREFS`, défaut
 `<prefixe>-push-prefs.json` à côté de `push.db`) : source de vérité unique des réglages de chaque

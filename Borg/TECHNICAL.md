@@ -1650,18 +1650,24 @@ formé → invalide). Deux points de synchronisation seulement :
 précédente) ; `doLogin` appelle `applyRoute()` au lieu d'afficher la liste ; `logout` ne touche pas
 l'adresse (la connexion suivante y revient).
 
+**Titre (UI 1.15.0).** Fonction pure `pageTitle(état)` ; `syncUrl()` fixe `document.title` à chaque
+synchro, y compris pendant `routeApplying` (rejeu d'une adresse), et **après** `pushState` : posé
+avant, il renommerait l'entrée d'historique précédente.
+
 **Limite connue.** Un nick contenant `/` s'encode `%2F`, mais Starlette décode le chemin avant le
 routage : `/serveur/a%2Fb` ne correspond pas à `/serveur/{nick}` (repli 404 → liste). Sans objet pour
 les nicks réels (noms d'hôtes).
 
 **Vérification.** `push_selftest` (routes, non-masquage, repli 404) ; `borgHelperWWW_ui_test.js`
-(versionné, Node sans dépendance ni DOM) : extrait `routePath`/`parseRoute` du HTML par appariement
+(versionné, Node sans dépendance ni DOM) : extrait `routePath`/`parseRoute`/`pageTitle` du HTML par appariement
 d'accolades et vérifie la matrice — analyse, adresses invalides, aller-retour d'encodage
 espace/`é`/`#`/`?`/`&`/`=`/`%`/`:`, archive — code de sortie 1 au moindre échec. Ponctuellement (script
 non versionné) : parcours complet dans Chrome headless piloté par CDP, avec `api_prefix` `/api` puis `/v1` (lien sans session → connexion →
 répertoire, rechargement, navigation, 4× Précédent + Suivant sans nouvelle entrée, refus, adresses
 inconnues, archive encodée, copie du lien, adresse non canonique, `/notifications`,
-déconnexion/reconnexion, clé expirée).
+déconnexion/reconnexion, clé expirée ; UI 1.15.0 : titres de chaque page et après Précédent, clic de
+notification via le vrai `borgHelperWWW_sw.js` — onglet existant amené sur `/serveur/<nick>` sans
+rechargement, Précédent, serveur hors droits refusé, message vers une autre origine ignoré).
 
 ---
 
@@ -2818,7 +2824,14 @@ connaissance de l'`endpoint` (URL secrète non devinable), comme les autres rout
 absent), servi sur `GET /sw.js` **sur `app`** (sans préfixe API, sans `X-API-Key` — un navigateur
 n'envoie aucun en-tête personnalisé à l'enregistrement d'un Service Worker), `Cache-Control: no-cache`,
 `Service-Worker-Allowed: /`. Contenu : `push` → `showNotification` (tag `bkp-<nick>`, une fin remplace
-le début), `notificationclick` → focus d'un onglet existant ou `openWindow('/')`. Aucun cache hors-ligne.
+le début), `notificationclick` → `onNotificationClick` (SW 1.3.0) : adresse `targetUrl(data)` =
+`/serveur/<nick encodé>` (ou `/` sans nick) ; onglet existant (focalisé de préférence, contrôlé ou non)
+→ `postMessage({type:'navigate',url})` puis `focus()` (échec de focus avalé : l'adresse est déjà
+transmise) ; aucun onglet → `openWindow(url)`. Côté UI (1.15.0), écouteur `message` de
+`navigator.serviceWorker` (+ `startMessages()`, pour une page non contrôlée) : chemin local uniquement
+(`/…`, jamais `//…`), `pushState` + `routeSeq++`, puis `applyRoute()` — donc droits vérifiés et
+connexion d'abord comme un lien partagé. Pas de `WindowClient.navigate()` : il recharge la page et
+échoue sur un onglet non contrôlé. Aucun cache hors-ligne.
 
 **Réglages par host (1.21.0, format 2)** : entrée `{"scope_nicks":[...],"hosts":{nick:{"start","success",
 "error"}},"expires_at","updated_at"}`. `_prefs_entry` ne garde `hosts` que pour les nicks de
