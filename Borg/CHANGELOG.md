@@ -1,5 +1,28 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.114 / borgHelperWWW_ui.html 1.12.1 — graphiques d'évolution visibles, alimentés par Index — 2026-09-26
+
+Rapport utilisateur : graphiques d'évolution invisibles, chargement sans fin sur certains, et besoin
+qu'une réindexation mette à jour leurs données.
+
+- **UI — graphiques jamais affichés dès qu'il y avait des données** (depuis 1.9.0) : `_hideChartMsg()`
+  n'était jamais appelée ; le graphique était dessiné sur un canvas resté masqué, l'indicateur de
+  chargement restait affiché indéfiniment. Seul le cas « aucune donnée » s'affichait. Corrigé ; chaque
+  graphique finit désormais toujours dessiné ou remplacé par un message (aucune donnée, erreur,
+  session expirée, exception de Chart.js).
+- **UI** : bloc « Évolution » placé au-dessus de la liste des archives dans l'Historique complet ;
+  messages « aucune donnée » explicites ; points de taille du dépôt relevés par Index en carrés gris.
+- **Index alimente les graphiques** : statistiques des archives qui n'en ont pas (antérieures, ou
+  créées hors borgHelper) et point de taille du dépôt (`op='index'`, seulement si elle a changé) — y
+  compris avec `NOIDX=1` ou moins de 2 archives. Erreurs `borg info` signalées au lieu d'être ignorées.
+- **Correctif Index — faux « indexation interrompue »** : tout Index qui traitait au moins une paire
+  d'archives se déclarait interrompu (code 1, reprise forcée au Bkp suivant, snapshot/statistiques/
+  `DIFF_KEEP` jamais atteints). Seule une vraie opération prioritaire (Bkp/Restore) interrompt
+  désormais l'Index.
+- `CodecSelfTest` 320/320 ; essais réels sur la démo (statistiques vidées puis rattrapées par Index,
+  pas de doublon au 2e Index, `NOIDX=1`, Index post-Bkp complet, vraie interruption toujours
+  fonctionnelle) ; rendu des graphiques vérifié sous Node (DOM et Chart.js simulés) sur 4 cas.
+
 ## borgHelperWWW 1.21.0 / borgHelperWWW_ui.html 1.12.0 — notifications réglables par host, type « échec » distinct — 2026-09-26
 
 Demande utilisateur : notifications paramétrables par host, et notifications en cas d'erreur.

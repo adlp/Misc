@@ -70,7 +70,7 @@ entre archives, snapshot courant, statistiques. Alimente `Search`/`TreeFind`/`Tr
 | `archive_stats` | statistiques par archive (durée, tailles originale/compressée/dédupliquée, nb fichiers) — source de `Status`/`Report` |
 | `bkp_status` | suivi d'un `Bkp` en cours/terminé (CAS pour les notifications push début/fin) — voir `TECHNICAL.md` pour le mécanisme de réclamation |
 | `diff_excluded_stats` / `snap_excluded_stats` | volumétrie de ce qui a été exclu (`EXCLUDE`), par paire d'archives / par archive |
-| `repo_stats` | historique du gain d'espace (`unique_csize`/`total_size`/`total_csize`), notamment après `Prune` — alimente les graphiques d'évolution |
+| `repo_stats` | historique de la taille du dépôt (`unique_csize`/`total_size`/`total_csize`), un point par `Bkp`, `Prune` ou `Index` (si changée) — alimente les graphiques d'évolution |
 
 ### `scopecache.db` — un fichier **global** (borgHelperWWW uniquement)
 

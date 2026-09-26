@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.12.0 -->
+<!-- UI_VERSION: 1.12.1 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -209,22 +209,6 @@
   <section id="view-history" hidden>
     <button class="secondary" onclick="showMachines()">← Serveurs</button>
     <div class="card">
-      <div class="machine-head">
-        <h2 id="historyTitle" style="margin:0"></h2>
-        <button class="danger" id="historyPruneBtn">⚡ Lancer Prune</button>
-      </div>
-      <p class="hint">Toutes les archives indexées en base (lecture SQLite uniquement).</p>
-      <div id="historyError" class="error"></div>
-      <div style="overflow-x:auto">
-      <table id="historyTableEl">
-        <thead><tr><th>Archive</th><th>Durée</th><th>Taille orig.</th><th>Δ</th><th>Comp.</th>
-          <th>Dédup.</th><th>Fichiers</th><th>Modifs</th><th>Actions</th></tr></thead>
-        <tbody id="historyBody"></tbody>
-      </table>
-      </div>
-    </div>
-
-    <div class="card">
       <h2 style="margin-top:0">Évolution</h2>
       <div style="margin-bottom:24px">
         <h3 style="margin:0 0 8px">Taille du dépôt</h3>
@@ -242,6 +226,22 @@
         <canvas id="chartArchiveSize" height="90"></canvas>
       </div>
     </div>
+    <div class="card">
+      <div class="machine-head">
+        <h2 id="historyTitle" style="margin:0"></h2>
+        <button class="danger" id="historyPruneBtn">⚡ Lancer Prune</button>
+      </div>
+      <p class="hint">Toutes les archives indexées en base (lecture SQLite uniquement).</p>
+      <div id="historyError" class="error"></div>
+      <div style="overflow-x:auto">
+      <table id="historyTableEl">
+        <thead><tr><th>Archive</th><th>Durée</th><th>Taille orig.</th><th>Δ</th><th>Comp.</th>
+          <th>Dédup.</th><th>Fichiers</th><th>Modifs</th><th>Actions</th></tr></thead>
+        <tbody id="historyBody"></tbody>
+      </table>
+      </div>
+    </div>
+
   </section>
 
   <!-- VIEW 6 : NOTIFICATIONS PUSH (Story 2c, spec-push-ui-prefs-json) -->
@@ -709,8 +709,21 @@ async function loadCharts(nick){
     return;
   }
 
-  _renderRepoSizeAndPruneGainCharts(repoR);
-  _renderArchiveSizeChart(archR);
+  // Chaque graphique finit TOUJOURS dessiné ou remplacé par un message — jamais un indicateur de
+  // chargement laissé en place (exception de Chart.js, réponse inattendue...).
+  _safeRender(()=>_renderRepoSizeAndPruneGainCharts(repoR),['chartRepoSize','chartPruneGain']);
+  _safeRender(()=>_renderArchiveSizeChart(archR),['chartArchiveSize']);
+}
+
+function _safeRender(fn,ids){
+  try{ fn(); }
+  catch(e){ ids.forEach(id=>_showChartMsg(id+'Msg',id,'Graphique impossible à afficher : '+e.message,true)); }
+  // Filet : un graphique ni dessiné ni remplacé par un message (cas non prévu) -> message explicite.
+  ids.forEach(id=>{
+    const msg=document.getElementById(id+'Msg');
+    if(!msg.hidden && msg.querySelector('.spinner'))
+      _showChartMsg(id+'Msg',id,'Aucune donnée.',false);
+  });
 }
 
 function _parseHistoryResponse(r){
@@ -733,22 +746,23 @@ function _renderRepoSizeAndPruneGainCharts(r){
 
   const {rows,error}=_parseHistoryResponse(r);
   if(error!==undefined){
-    if(error!==null){
-      _showChartMsg('chartRepoSizeMsg','chartRepoSize',error,true);
-      _showChartMsg('chartPruneGainMsg','chartPruneGain',error,true);
-    }
+    const msg=error===null?'Session expirée — reconnectez-vous.':error;
+    _showChartMsg('chartRepoSizeMsg','chartRepoSize',msg,true);
+    _showChartMsg('chartPruneGainMsg','chartPruneGain',msg,true);
     return;
   }
   if(rows.length===0){
-    _showChartMsg('chartRepoSizeMsg','chartRepoSize','Aucun historique repo_stats enregistré.',false);
-    _showChartMsg('chartPruneGainMsg','chartPruneGain','Aucun historique repo_stats enregistré.',false);
+    _showChartMsg('chartRepoSizeMsg','chartRepoSize','Aucune taille de dépôt enregistrée — alimentée à chaque Bkp, Prune ou Index.',false);
+    _showChartMsg('chartPruneGainMsg','chartPruneGain','Aucun Prune enregistré.',false);
     return;
   }
 
   // Graphique 1 : taille du dépôt dans le temps, un point par événement (bkp/prune)
   const labels=rows.map(row=>row.updated_at);
-  const pointColors=rows.map(row=>row.op==='prune'?'#c0392b':'#2b6cb0');
-  const pointStyles=rows.map(row=>row.op==='prune'?'triangle':'circle');
+  // bkp : rond ; prune : triangle rouge ; index (relevé lors d'un Index, borgHelper ≥ 1.0.114) : carré gris
+  const pointColors=rows.map(row=>row.op==='prune'?'#c0392b':(row.op==='index'?'#718096':'#2b6cb0'));
+  const pointStyles=rows.map(row=>row.op==='prune'?'triangle':(row.op==='index'?'rect':'circle'));
+  _hideChartMsg('chartRepoSizeMsg','chartRepoSize');
   chartRepoSizeInstance=new Chart(document.getElementById('chartRepoSize'), {
     type:'line',
     data:{
@@ -783,6 +797,7 @@ function _renderRepoSizeAndPruneGainCharts(r){
   if(pruneDeltas.length===0){
     _showChartMsg('chartPruneGainMsg','chartPruneGain','Aucun Prune enregistré.',false);
   } else {
+    _hideChartMsg('chartPruneGainMsg','chartPruneGain');
     chartPruneGainInstance=new Chart(document.getElementById('chartPruneGain'), {
       type:'bar',
       data:{
@@ -803,14 +818,15 @@ function _renderArchiveSizeChart(r){
 
   const {rows,error}=_parseHistoryResponse(r);
   if(error!==undefined){
-    if(error!==null) _showChartMsg('chartArchiveSizeMsg','chartArchiveSize',error,true);
+    _showChartMsg('chartArchiveSizeMsg','chartArchiveSize',error===null?'Session expirée — reconnectez-vous.':error,true);
     return;
   }
   if(rows.length===0){
-    _showChartMsg('chartArchiveSizeMsg','chartArchiveSize','Aucun historique archive_stats enregistré.',false);
+    _showChartMsg('chartArchiveSizeMsg','chartArchiveSize','Aucune statistique d\'archive enregistrée — lancer un Index pour les récupérer.',false);
     return;
   }
 
+  _hideChartMsg('chartArchiveSizeMsg','chartArchiveSize');
   chartArchiveSizeInstance=new Chart(document.getElementById('chartArchiveSize'), {
     type:'line',
     data:{

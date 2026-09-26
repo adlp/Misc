@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.113"
+Version="1.0.114"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -3431,11 +3431,54 @@ class BorgHelper:
             printer(f"  [WARN] purge snapshot échouée ({e})")
         return 0
 
+    def _refresh_chart_stats(self,nick,cfg,db_path,archives,force=False,debug=0):
+        """Statistiques des graphiques d'évolution (spec-charts-evolution-sauvegardes), rafraîchies à
+        chaque Index — y compris NOIDX=1 ou moins de 2 archives, où l'indexation des chemins elle-même
+        n'a pas lieu : ces statistiques ne portent aucun chemin.
+        - archive_stats : archives sans ligne (créées avant cette fonctionnalité, ou hors borgHelper) —
+          `borg info --json --glob-archives` (coûteux : n'est lancé que s'il en manque, ou si force).
+          ⚠️ deduplicated_size y vaut la taille UNIQUE à l'archive AUJOURD'HUI (borg info), pas la
+          donnée ajoutée lors de sa création (borg create --stats, cas d'un Bkp) — proches, pas égales.
+        - repo_stats : point op='index' (`borg info --json` du dépôt, métadonnées seulement) si les
+          tailles diffèrent du dernier point — jamais de doublon juste après un Bkp (qui relance
+          Index) ; donne un historique de taille du dépôt même sans Bkp/Prune faits par borgHelper.
+        Erreurs signalées (printer), jamais fatales pour Index."""
+        archive_names=set(a['name'] for a in archives)
+        try:
+            conn=_open_db(db_path,nick=nick,role='read')
+            existing=set(r[0] for r in conn.execute("SELECT archive FROM archive_stats WHERE nick=?",(nick,)).fetchall())
+            conn.close()
+        except sqlite3.Error: existing=set()
+        missing=archive_names-existing
+        if missing or (force and archive_names):
+            rbi=self.borg.boex(nick,['info','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+            try:
+                self.borg._boex_check_stdout(rbi,nick,'borg info')
+                n=0
+                for a in rbi['stdout'][0]['archives']:
+                    if force or a['name'] in missing:
+                        st=a.get('stats',{})
+                        self.db.store_archive_stats(nick,a['name'],a.get('start'),a.get('duration'),
+                            st.get('original_size'),st.get('compressed_size'),st.get('deduplicated_size'),st.get('nfiles'),db_path)
+                        n+=1
+                if n: print(f"{nick}: statistiques de {n} archive(s) enregistrées (graphiques)")
+            except (RuntimeError,KeyError,TypeError,IndexError) as e:
+                printer(f"{nick}: statistiques d'archives (graphiques) non récupérées : {e}")
+        rbr=self.borg.boex(nick,['info','--json'],debug=debug)
+        try:
+            self.borg._boex_check_stdout(rbr,nick,'borg info')
+            cst=rbr['stdout'][0].get('cache',{}).get('stats',{})
+            if cst.get('unique_csize') is not None:
+                cur={'unique_csize':cst['unique_csize'],'total_size':cst.get('total_size'),'total_csize':cst.get('total_csize')}
+                if self.db.get_repo_stats(nick,db_path)!=cur:
+                    self.db.store_repo_stats(nick,'index',cur['unique_csize'],cur['total_size'],cur['total_csize'],db_path)
+        except (RuntimeError,KeyError,TypeError,IndexError) as e:
+            printer(f"{nick}: taille du dépôt (graphiques) non récupérée : {e}")
+
     def index(self,nick,debug=0,db_path=None,force=False,target_archive=None,set_pending=True):
-        if self._nick_noidx(nick):
-            printer(f"{nick}: indexation désactivée (NOIDX=1)"); return 0
+        noidx=self._nick_noidx(nick)
         if self.db.check_priority_lock(nick):
-            if set_pending: self.db.set_index_pending_lock(nick)
+            if set_pending and not noidx: self.db.set_index_pending_lock(nick)
             printer(f"{nick}: opération prioritaire (Bkp/Restore) en cours — Index annulé"); return 1
         if db_path is None: db_path=self.db.get_diff_db(nick)
         self.db.ensure_diff_db(db_path)
@@ -3446,7 +3489,11 @@ class BorgHelper:
         except RuntimeError as e:
             printer(f"{nick}: {e}"); return 1
         archives=rb['stdout'][0]['archives']
+        if noidx:
+            self._refresh_chart_stats(nick,cfg,db_path,archives,force=force,debug=debug)
+            printer(f"{nick}: indexation des chemins désactivée (NOIDX=1) — statistiques des graphiques seules"); return 0
         if len(archives)<2:
+            self._refresh_chart_stats(nick,cfg,db_path,archives,force=force,debug=debug)
             printer(f"{nick}: moins de 2 archives, rien à indexer"); return 0
         # Phase 1 : paires à indexer + purge groupée si force
         pairs_todo=[]; skipped=0; pairs_to_purge=[]
@@ -3504,7 +3551,8 @@ class BorgHelper:
             ok=ps.returncode in (0,1)
             if not ok: entries=[]; exclu={}
             return (a_old,a_new,date_new,entries,exclu,ok)
-        interrupted_event=threading.Event()
+        interrupted_event=threading.Event()  # UNIQUEMENT : opération prioritaire détectée (vraie interruption)
+        monitor_stop=threading.Event()       # fin normale : arrête le thread de surveillance, sans rien signaler
         results=[]
         mode_changed=False  # AD-11 : une fois DbModeError vue, mode durablement changé pour le reste du run
         if pairs_todo:
@@ -3516,7 +3564,7 @@ class BorgHelper:
                 with ThreadPoolExecutor(max_workers=workers) as ex:
                     futs={ex.submit(_run_diff,p):p for p in pairs_todo}
                     def _priority_monitor():
-                        while not interrupted_event.is_set():
+                        while not interrupted_event.is_set() and not monitor_stop.is_set():
                             if self.db.check_priority_lock(nick) or self.db.check_report_running(nick):
                                 printer(f"  {nick}: opération prioritaire (Bkp/Restore/Report) détectée — arrêt des diffs en cours")
                                 interrupted_event.set()
@@ -3592,7 +3640,10 @@ class BorgHelper:
                                     printer(f"  {nick}: mode de la base changé pendant l'indexation — paires restantes reportées")
                             except Exception as e: printer(f"[WARN] borg diff échoué : {e}")
                     finally:
-                        interrupted_event.set()
+                        # Jamais interrupted_event ici : le tester plus bas ferait passer TOUT Index ayant
+                        # traité au moins une paire pour « interrompu » (return 1, index_pending posé,
+                        # statistiques/snapshot/DIFF_KEEP jamais atteints) — bug corrigé en 1.0.114.
+                        monitor_stop.set()
                         monitor.join(timeout=2)
             finally:
                 self.db.clear_index_running_lock(nick)
@@ -3610,24 +3661,7 @@ class BorgHelper:
         diff_keep=cfg.get('DIFF_KEEP','')
         if diff_keep.strip().isdigit():
             self.db._diff_keep_purge(nick,int(diff_keep),db_path)
-        # archive_stats : seulement si archives manquantes
-        archive_names=set(a['name'] for a in archives)
-        try:
-            conn=_open_db(db_path,nick=nick,role='read')
-            existing=set(r[0] for r in conn.execute("SELECT archive FROM archive_stats WHERE nick=?",(nick,)).fetchall())
-            conn.close()
-        except sqlite3.Error: existing=set()
-        missing=archive_names-existing
-        if missing or force:
-            rbi=self.borg.boex(nick,['info','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
-            try:
-                self.borg._boex_check_stdout(rbi,nick,'borg info')
-                for a in rbi['stdout'][0]['archives']:
-                    if force or a['name'] in missing:
-                        st=a.get('stats',{})
-                        self.db.store_archive_stats(nick,a['name'],a.get('start'),a.get('duration'),
-                            st.get('original_size'),st.get('compressed_size'),st.get('deduplicated_size'),st.get('nfiles'),db_path)
-            except (RuntimeError,KeyError,TypeError): pass
+        self._refresh_chart_stats(nick,cfg,db_path,archives,force=force,debug=debug)
         self.indexsnap(nick,debug=debug,db_path=db_path,force=force)
         return 0
 

@@ -167,12 +167,29 @@ Peuplée par `IndexSnap` (`-S`) et en fin d'`Index` normal.
 #### `repo_stats`
 Statistiques globales du dépôt borg dans le temps (niveau cache, pas par archive) — historique, une
 ligne par événement (`id INTEGER PRIMARY KEY AUTOINCREMENT`, jamais écrasée).  
-Colonnes : `id`, `nick`, `op` (`'bkp'|'prune'`), `unique_csize` (taille dédupliquée totale du dépôt),
+Colonnes : `id`, `nick`, `op` (`'bkp'|'prune'|'index'`), `unique_csize` (taille dédupliquée totale du dépôt),
 `total_size`, `total_csize`, `updated_at`.  
 Peuplée par `Bkp` (`op='bkp'`, depuis `cache.stats` du JSON `borg create --json`, zéro appel borg
 supplémentaire) et par `Prune` réel (`op='prune'`, appel léger `borg info --json` fait **après**
 `compact --cleanup-commits` — l'étape qui libère réellement l'espace, jamais juste après `prune --stats`,
-sinon le delta serait faux/quasi nul ; rien n'est écrit en `--dry-run`).  
+sinon le delta serait faux/quasi nul ; rien n'est écrit en `--dry-run`), et par `Index` (`op='index'`,
+1.0.114, `_refresh_chart_stats` : `borg info --json` du dépôt, métadonnées seulement, ligne ajoutée
+**uniquement si** `(unique_csize,total_size,total_csize)` diffère de la dernière — un `Bkp` relance Index
+juste après avoir écrit sa propre ligne, identique : pas de doublon).  
+`_refresh_chart_stats` complète aussi `archive_stats` (archives sans ligne, `borg info --json
+--glob-archives` lancé seulement s'il en manque ; `-F` : toutes) — logique auparavant en fin d'`index()`,
+désormais appelée aussi quand `index()` sort tôt (`NOIDX=1`, moins de 2 archives), erreurs `borg info`
+signalées au lieu d'être avalées. ⚠️ `deduplicated_size` d'une archive rattrapée ainsi = taille unique
+à l'archive au moment de l'Index (`borg info`), pas la donnée ajoutée à sa création (`borg create
+--stats`) ; `NOIDX=1` n'empêche plus `index()` de consulter borg (liste + info), et respecte désormais
+le verrou prioritaire (Bkp/Restore en cours → Index annulé, sans poser `index_pending`).  
+**Correctif 1.0.114 — faux « indexation interrompue »** : le `finally` de la boucle des diffs faisait
+`interrupted_event.set()` pour arrêter le thread de surveillance, puis `if interrupted_event.is_set()`
+concluait à une interruption — **tout** Index ayant traité au moins une paire renvoyait 1, posait
+`index_pending` (le Bkp suivant relançait un Index complet, lui-même « interrompu ») et n'atteignait
+jamais `archive_stats`/`indexsnap`/`DIFF_KEEP`. Événement dédié `monitor_stop` pour l'arrêt normal ;
+`interrupted_event` ne signale plus qu'une vraie opération prioritaire (vérifié : Index avec paires →
+code 0, pas de `index_pending` ; verrou prioritaire posé pendant les diffs → arrêt + `index_pending`).  
 `get_repo_stats()` lit la dernière ligne par nick (`ORDER BY id DESC LIMIT 1`, jamais un `SELECT` nu sans
 ordre — `updated_at` est à résolution seconde et peut collisionner entre deux événements rapprochés).  
 Purge par ancienneté à chaque écriture (même transaction que l'`INSERT`) : lignes plus vieilles que

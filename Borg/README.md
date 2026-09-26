@@ -505,6 +505,16 @@ borgHelper -c Index -n mon-serveur -A <archive>  # indexe uniquement la paire te
 
 Types d'événements : `added`, `removed`, `modified`, `C` (permissions), `B` (lien cassé), `T` (type changé).
 
+**Statistiques des graphiques** (borgHelper ≥ 1.0.114) : chaque `Index` — y compris `NOIDX=1` (les
+chemins ne sont alors pas indexés) ou moins de 2 archives — met aussi à jour les données des
+graphiques d'évolution de borgHelperWWW :
+- statistiques des archives qui n'en ont pas encore (archives antérieures à cette fonctionnalité, ou
+  créées hors borgHelper) — `borg info` n'est lancé que s'il en manque (`-F` : toutes). Pour ces
+  archives, la taille dédupliquée est celle d'aujourd'hui (données propres à l'archive), pas celle
+  mesurée lors de sa création ;
+- un point de taille du dépôt (`op='index'`), seulement si elle a changé depuis le dernier point
+  (jamais de doublon juste après un `Bkp`).
+
 Le snapshot (`-S`) est **incrémental par défaut** : si un snapshot précédent et le diff correspondant existent, seules les entrées `added/removed/modified` sont appliquées par SQL, et `borg list` est appelé uniquement sur les fichiers ajoutés (pour leur mtime). Fallback vers `borg list` complet si : pas de snapshot précédent, diff absent, > 5 000 ajouts, ou erreur borg. `-F` force le `borg list` complet.
 
 > **Interruptible et reprise automatique :** si `Bkp` ou `Restore` démarre pendant `Index`, l'indexation s'arrête immédiatement (diffs tués + borg info + indexsnap annulés). `Index` pose un flag de reprise ; `Bkp` le détecte à la fin de son exécution et relance automatiquement `Index` complet. Les paires déjà indexées sont sautées (incrémental).
@@ -718,7 +728,7 @@ borgHelper -c ArchiveHistory -n mon-serveur -j    # historique archive_stats (pa
 | `-n <nick>` | Un seul nick — jamais `nick=a,b` ni `ALL` sur plusieurs nicks configurés (rejeté, code de sortie non nul) |
 | `-j` | Sortie JSON `{borghelper_version,nick,rows:[...]}` — sans `-j` : message court, pas de crash (mode texte non destiné à un usage interactif élaboré) |
 
-`RepoHistory -j` : une ligne par événement `repo_stats` (`id`,`op` (`'bkp'|'prune'`),`unique_csize`,
+`RepoHistory -j` : une ligne par événement `repo_stats` (`id`,`op` (`'bkp'|'prune'|'index'`),`unique_csize`,
 `total_size`,`total_csize`,`updated_at`), ordonnées par `id` croissant.
 
 `ArchiveHistory -j` : une ligne par archive de `archive_stats` (`archive`,`archive_date`,`duration`,
