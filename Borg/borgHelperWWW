@@ -6,7 +6,7 @@
 #* See <http://www.gnu.org/licenses/>
 #*/
 
-import os,re,sys,io,json,sqlite3,secrets,subprocess,configparser,tarfile,hmac,hashlib,asyncio,contextlib
+import os,re,sys,io,json,sqlite3,secrets,subprocess,configparser,tarfile,hmac,hashlib,asyncio,contextlib,datetime
 from pathlib import Path
 from typing import Optional
 from collections import defaultdict
@@ -14,6 +14,7 @@ from collections import defaultdict
 from fastapi import FastAPI, APIRouter, Header, HTTPException, Query, Request, Depends
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from pywebpush import webpush, WebPushException
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail,
@@ -22,7 +23,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.17.0"
+WWW_VERSION="1.18.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -175,6 +176,14 @@ def _clamp_push_default_expiry(raw):
 
 PUSH_DEFAULT_EXPIRY_DAYS=_clamp_push_default_expiry(os.environ.get('BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS','30'))
 
+# Story 2b (spec-notifications-push) : `vapid_claims['sub']` exigé par le protocole Web Push (RFC 8292)
+# — un contact joignable par le service de push en cas d'abus, jamais affiché à la personne abonnée.
+# Aucune valeur "correcte" universelle ne peut être devinée pour un déploiement tiers : env var dédiée,
+# repli générique (`mailto:` non résolu mais syntaxiquement valide) plutôt qu'un crash au démarrage —
+# même esprit que API_KEY générée aléatoirement plus haut (fonctionnel par défaut, à durcir en prod).
+PUSH_VAPID_SUB=os.environ.get('BORGHELPERWWW_PUSH_VAPID_SUB','mailto:admin@example.invalid').strip() \
+    or 'mailto:admin@example.invalid'
+
 if not CFGFILE:
     sys.exit("Fichier de conf manquant — -C/--cfgfile ou BORGHELPERWWW_CFGFILE (chemin du .borghelperrc dédié à l'API)")
 if not os.path.isfile(CFGFILE):
@@ -191,18 +200,19 @@ if not BORGHELPER_BIN.is_file():
 print(f"Actions destructrices (Prune/DelBkp) : {'AUTORISÉES' if ALLOW_DESTRUCTIVE else 'interdites (défaut)'}"
       f" — Téléchargements (restauration) : {'autorisés (défaut)' if ALLOW_DOWNLOADS else 'INTERDITS'}",file=sys.stderr)
 
-# ── Watcher bkp_status (Story 1, spec-notifications-push) ──────────────────────
+# ── Watcher bkp_status (Story 1, étendu Story 2b : spec-notifications-push) ────
 # Premier composant de fond de borgHelperWWW : tâche asyncio démarrée via le hook de cycle de vie
 # FastAPI (lifespan), un watcher par processus worker uvicorn (--workers 2 déjà documenté) — aucune
 # coordination inter-process requise, chaque worker réclame les lignes bkp_status par comparer-et-
 # échanger (AD-3), donc deux workers qui tombent sur la même ligne au même moment n'en traitent
-# jamais qu'un seul (l'autre voit 0 ligne affectée et passe). Pour cette story, la réclamation se
-# limite à journaliser (log serveur) nick/run_id/result — Story 2 la remplacera par l'envoi push
-# réel (pywebpush).
+# jamais qu'un seul (l'autre voit 0 ligne affectée et passe). Story 2b : la réclamation (début ET
+# fin) déclenche désormais un envoi push réel (`_send_bkp_push`, pywebpush) en plus du log serveur
+# — remplace la simple journalisation de la Story 1.
 def _bkp_status_watcher_pass():
     """Un passage d'interrogation : parcourt chaque nick connu, réclame les lignes bkp_status prêtes
-    (terminées, ou bloquées depuis plus de BKP_STATUS_TIMEOUT secondes — AD-7) et journalise le
-    résultat de celles que CE worker a effectivement gagnées à la réclamation CAS."""
+    — à la fois le passage de FIN (terminées, ou bloquées depuis plus de BKP_STATUS_TIMEOUT secondes,
+    AD-7) et le passage de DÉBUT (Story 2b : `started_at` écrit, aucun délai à attendre) — et envoie
+    un push réel pour chaque réclamation que CE worker a effectivement gagnée au CAS."""
     for nick in _nick_list('ALL'):
         try:
             db_path=_bh_paths.db.get_diff_db(nick)
@@ -211,8 +221,15 @@ def _bkp_status_watcher_pass():
                 if not _bh_paths.db.claim_bkp_status(nick,row['run_id'],db_path):
                     continue  # déjà réclamée par un autre worker (CAS perdu) — jamais de double traitement
                 result=row['result'] if row['finished_at'] else 'error'  # AD-7 : jamais fini = échec
-                print(f"[watcher] bkp_status réclamé : nick={nick} run_id={row['run_id']} result={result}",
+                print(f"[watcher] bkp_status (fin) réclamé : nick={nick} run_id={row['run_id']} result={result}",
                       file=sys.stderr,flush=True)
+                _send_bkp_push(nick,'end',result)
+            for row in _bh_paths.db.list_pending_bkp_status_start(nick,db_path):
+                if not _bh_paths.db.claim_bkp_status_start(nick,row['run_id'],db_path):
+                    continue  # déjà réclamée par un autre worker (CAS perdu) — jamais de double traitement
+                print(f"[watcher] bkp_status (début) réclamé : nick={nick} run_id={row['run_id']}",
+                      file=sys.stderr,flush=True)
+                _send_bkp_push(nick,'start',None)
         except Exception as e:
             # Un nick en erreur (DB corrompue, etc.) ne doit jamais aveugler les autres nicks de ce
             # passage — isolation par nick, le passage suivant réessaiera.
@@ -793,6 +810,80 @@ def _push_row_to_dict(row):
             'scope_nicks':json.loads(row['scope_nicks']),
             'notify_start':bool(row['notify_start']),'notify_end':bool(row['notify_end']),
             'expires_at':row['expires_at'],'created_at':row['created_at']}
+
+# ── Envoi push réel (Story 2b, spec-notifications-push) ────────────────────────
+# Remplace la simple journalisation de la Story 1 : chaque réclamation CAS gagnée (début OU fin)
+# déclenche ici un envoi `pywebpush` réel à chaque abonnement matché — jamais de retry par
+# abonnement (voir Design Notes du spec : la ligne bkp_status est déjà réclamée, elle ne sera
+# jamais revisitée, quel que soit le sort de chaque envoi individuel).
+
+def _push_delete_endpoint(endpoint):
+    """Désabonnement (endpoint mort côté navigateur, 404/410) — même requête exacte que
+    `DELETE /push/subscribe` (Story 2a), extraite ici pour être réutilisée par le watcher sans
+    dupliquer la logique SQL. True si une ligne a effectivement été supprimée."""
+    conn=_push_conn('write')
+    try:
+        cur=conn.execute("DELETE FROM push_subscriptions WHERE endpoint=?",(endpoint,))
+        conn.commit()
+        return cur.rowcount>0
+    finally:
+        conn.close()
+
+def _push_subscriptions_for(nick,notify_col):
+    """Abonnements actifs (`expires_at IS NULL OR expires_at > datetime('now')`) avec le type de
+    notification demandé actif (`notify_col` = 'notify_start' ou 'notify_end'), dont `scope_nicks`
+    (JSON) contient `nick` — filtre SQL sur l'expiration/le type (bornable/indexable), filtre Python
+    sur l'appartenance à `scope_nicks` (JSON, pas fiable à matcher en LIKE brut sur la chaîne)."""
+    assert notify_col in ('notify_start','notify_end')
+    conn=_push_conn('read')
+    try:
+        rows=conn.execute(
+            f"SELECT * FROM push_subscriptions WHERE {notify_col}=1 "
+            "AND (expires_at IS NULL OR expires_at > datetime('now'))").fetchall()
+    finally:
+        conn.close()
+    return [r for r in rows if nick in json.loads(r['scope_nicks'])]
+
+def _send_bkp_push(nick,event,result):
+    """Envoie un push réel à chaque abonnement matché pour cet événement (`event`: 'start'|'end',
+    `result`: None pour un début, 'success'/'error' pour une fin). Erreur définitive (404/410,
+    abonnement mort côté navigateur) -> désabonnement automatique ; toute autre erreur (réseau,
+    autre code HTTP, exception non-WebPushException) -> journalisée seule, abonnement conservé,
+    jamais de retry (voir Design Notes du spec — la ligne bkp_status est déjà réclamée par CAS)."""
+    notify_col='notify_start' if event=='start' else 'notify_end'
+    try:
+        subs=_push_subscriptions_for(nick,notify_col)
+    except sqlite3.Error as e:
+        print(f"[watcher] push: erreur lecture abonnements nick={nick} : {e}",file=sys.stderr,flush=True)
+        return
+    if not subs: return
+    payload=json.dumps({'nick':nick,'event':event,'result':result,
+                         'timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat()})
+    for row in subs:
+        endpoint=row['endpoint']
+        subscription_info={'endpoint':endpoint,'keys':{'p256dh':row['p256dh'],'auth':row['auth']}}
+        try:
+            webpush(subscription_info=subscription_info,data=payload,
+                    vapid_private_key=PUSH_VAPID_PRIVATE_KEY,
+                    vapid_claims={'sub':PUSH_VAPID_SUB})
+        except WebPushException as e:
+            if e.status_code in (404,410):
+                # Revue de code : sqlite3.Error ici (DB verrouillée, etc.) ne doit jamais faire
+                # sortir cette boucle en levant — les abonnements suivants de CE nick, et le passage
+                # de début/fin restant pour ce nick dans _bkp_status_watcher_pass, doivent continuer.
+                try:
+                    _push_delete_endpoint(endpoint)
+                    print(f"[watcher] push: abonnement mort désabonné (status={e.status_code}) "
+                          f"nick={nick} event={event}",file=sys.stderr,flush=True)
+                except sqlite3.Error as de:
+                    print(f"[watcher] push: échec désabonnement (status={e.status_code}) "
+                          f"nick={nick} event={event} : {de}",file=sys.stderr,flush=True)
+            else:
+                print(f"[watcher] push: échec envoi (status={e.status_code}) nick={nick} "
+                      f"event={event} : {e}",file=sys.stderr,flush=True)
+        except Exception as e:
+            # Réseau/autre — jamais de désabonnement, jamais de retry pour cet événement précis.
+            print(f"[watcher] push: erreur envoi nick={nick} event={event} : {e}",file=sys.stderr,flush=True)
 
 def _scope_nicks_for_groups(user_groups,nick_cfgs):
     """Cœur pur de _current_scope_nicks, sans dépendance à Request ni à cfgread() — testable
@@ -2043,13 +2134,7 @@ def push_subscribe_patch(body: PushPatchBody, x_api_key: Optional[str]=Header(de
                 summary="Désabonner — endpoint déjà absent : pas d'erreur bruyante (choix d'implémentation documenté, README)")
 def push_subscribe_delete(endpoint: str, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
-    conn=_push_conn('write')
-    try:
-        cur=conn.execute("DELETE FROM push_subscriptions WHERE endpoint=?",(endpoint,))
-        conn.commit()
-        return {'deleted':cur.rowcount>0}
-    finally:
-        conn.close()
+    return {'deleted':_push_delete_endpoint(endpoint)}
 
 @router.get("/push/subscriptions",tags=["lecture"],summary="Abonnement(s) connus pour un endpoint donné")
 def push_subscriptions(endpoint: str, x_api_key: Optional[str]=Header(default=None)):
@@ -2079,7 +2164,9 @@ def push_selftest():
     (ensure_push_db()/VAPID) avant que ce flag ne soit lu dans le bloc __main__ ci-dessous — sans
     conséquence (ensure_push_db()/_init_vapid_keys() sont idempotents, jamais destructifs sur un
     fichier existant), mais ce n'est donc pas un self-test qui s'exécute "avant" toute I/O réelle."""
+    global PUSH_DB
     import tempfile,shutil,datetime as _dt
+    from unittest import mock
     results=[]
     def check(name,fn):
         try: ok=bool(fn()); err=''
@@ -2088,6 +2175,9 @@ def push_selftest():
 
     tmpdir=tempfile.mkdtemp(prefix='borghelperwww-push-selftest-')
     test_db=os.path.join(tmpdir,'push-selftest.db')
+    old_push_db=PUSH_DB
+    PUSH_DB=test_db  # Story 2b : _send_bkp_push/_push_conn ci-dessous doivent taper sur ce fichier
+    # temporaire, jamais le PUSH_DB réel — restauré dans le `finally` externe.
     try:
         conn=_open_db(test_db,nick=None,role='admin')
         conn.row_factory=sqlite3.Row
@@ -2154,9 +2244,63 @@ def push_selftest():
                   lambda: _resolve_push_expiry_days(PUSH_MAX_EXPIRY_DAYS+1)==PUSH_DEFAULT_EXPIRY_DAYS)
             check("expiry : PUSH_MAX_EXPIRY_DAYS exactement -> conservée (borne incluse)",
                   lambda: _resolve_push_expiry_days(PUSH_MAX_EXPIRY_DAYS)==PUSH_MAX_EXPIRY_DAYS)
+
+            # ── Envoi push réel, Story 2b (spec-notifications-push) : pywebpush mocké ──
+            class _FakeResp:
+                def __init__(self,code): self.status_code=code; self.text=''
+            def _insert_sub(endpoint,nick,notify_start=0,notify_end=1,expires_at=None):
+                conn.execute("""INSERT INTO push_subscriptions
+                        (endpoint,p256dh,auth,scope_nicks,notify_start,notify_end,expires_at)
+                        VALUES (?,?,?,?,?,?,?)""",
+                    (endpoint,'p256','auth',json.dumps([nick]),notify_start,notify_end,expires_at))
+                conn.commit()
+            def _sub_exists(endpoint):
+                return conn.execute("SELECT 1 FROM push_subscriptions WHERE endpoint=?",(endpoint,)).fetchone() is not None
+
+            _insert_sub('push-ep-ok','nickPush')
+            _insert_sub('push-ep-410','nickPush')
+            _insert_sub('push-ep-500','nickPush')
+            _insert_sub('push-ep-network','nickPush')
+            _insert_sub('push-ep-notifystart-only','nickPush',notify_start=1,notify_end=0)
+            _insert_sub('push-ep-expired','nickPush',expires_at="2000-01-01 00:00:00")
+            _insert_sub('push-ep-otherscope','otherNick')
+
+            sent_to=[]
+            def _fake_webpush(subscription_info,data=None,vapid_private_key=None,vapid_claims=None,**kw):
+                ep=subscription_info['endpoint']; sent_to.append((ep,data))
+                if ep=='push-ep-ok': return 'ok'
+                if ep=='push-ep-410': raise WebPushException("gone",response=_FakeResp(410))
+                if ep=='push-ep-500': raise WebPushException("server error",response=_FakeResp(500))
+                if ep=='push-ep-network': raise ConnectionError("network down")
+                return 'ok'  # push-ep-notifystart-only (test 'start') : envoi simplement réussi
+
+            with mock.patch(f"{__name__}.webpush",side_effect=_fake_webpush):
+                _send_bkp_push('nickPush','end','success')
+
+            check("push : envoi tenté pour chaque abonnement matché (type actif, périmètre, non expiré), "
+                  "jamais pour un type inactif/périmètre différent/expiré",
+                  lambda: {e for e,_ in sent_to}=={'push-ep-ok','push-ep-410','push-ep-500','push-ep-network'})
+            check("push : payload JSON contient nick/event/result/timestamp",
+                  lambda: all(json.loads(d)['nick']=='nickPush' and json.loads(d)['event']=='end'
+                              and json.loads(d)['result']=='success' and 'timestamp' in json.loads(d)
+                              for _,d in sent_to))
+            check("push : envoi réussi -> abonnement conservé",lambda: _sub_exists('push-ep-ok'))
+            check("push : WebPushException status_code=410 -> abonnement désabonné automatiquement",
+                  lambda: not _sub_exists('push-ep-410'))
+            check("push : WebPushException autre code (500) -> abonnement conservé, jamais désabonné",
+                  lambda: _sub_exists('push-ep-500'))
+            check("push : exception non-WebPushException (réseau) -> abonnement conservé, jamais désabonné",
+                  lambda: _sub_exists('push-ep-network'))
+
+            sent_to.clear()
+            with mock.patch(f"{__name__}.webpush",side_effect=_fake_webpush):
+                _send_bkp_push('nickPush','start',None)
+            check("push : événement 'start' n'envoie qu'aux abonnements notify_start=1 (jamais notify_end seul)",
+                  lambda: {e for e,_ in sent_to}=={'push-ep-notifystart-only'})
         finally:
             conn.close()
     finally:
+        PUSH_DB=old_push_db
         shutil.rmtree(tmpdir,ignore_errors=True)
 
     fails=results.count(False)

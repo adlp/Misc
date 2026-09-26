@@ -1,5 +1,71 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.110 / borgHelperWWW 1.18.0 — envoi push réel (début+fin), watcher étendu — 2026-09-26
+
+Story 2b de `spec-notifications-push` : le watcher `bkp_status` (Story 1) ne se contente plus de
+journaliser, il envoie désormais un vrai push (`pywebpush`) à chaque abonnement concerné (Story 2a) —
+à la fois au **début** d'une sauvegarde (nouveau, décision utilisateur ajoutée au spec) et à sa
+**fin** (succès/échec/timeout AD-7, inchangé dans son critère de détection).
+
+### `bkp_status.start_notified_at` (`borgHelper`, colonne + réclamation dédiée)
+
+Réclamer un **début** de sauvegarde nécessite un second signal : `notified_at` (Story 1) ne couvre que
+la fin, et un début est immédiatement éligible (`started_at` toujours posé dès l'`INSERT`), contrairement
+à une fin qui attend soit `finished_at` soit le timeout AD-7. Nouvelle colonne `start_notified_at TEXT`
+sur `bkp_status`, ajoutée par `ALTER TABLE ... ADD COLUMN` (même patron exact que `snapshot_file.type`/
+`mode`/`owner`, contrôle via `PRAGMA table_info`) — `DIFF_DB_SCHEMA_VERSION` 6→7 (palier 7). Nouvel
+index `idx_bkpstatus_pending_start ON bkp_status(nick, start_notified_at)`. Deux nouvelles méthodes
+`BorgHelperDB`, gabarit symétrique exact de `list_pending_bkp_status`/`claim_bkp_status` (fin) :
+`list_pending_bkp_status_start(nick, db_path=None)` (lecture seule, `WHERE start_notified_at IS NULL`,
+aucun délai) et `claim_bkp_status_start(nick, run_id, db_path=None)` (CAS, `UPDATE ... SET
+start_notified_at=datetime('now') WHERE ... AND start_notified_at IS NULL`).
+
+### Watcher étendu (`borgHelperWWW`, `_bkp_status_watcher_pass`)
+
+Chaque passage réclame désormais **deux** familles de lignes dans le même bloc `try`/`except` par nick
+(isolation inchangée) : la réclamation de fin existante, **et** une nouvelle réclamation de début
+(`list_pending_bkp_status_start`/`claim_bkp_status_start`). Chaque réclamation gagnée déclenche un
+envoi push réel — remplace la simple journalisation (`stderr`) de la Story 1.
+
+### Envoi push réel (`_send_bkp_push`, `pywebpush`)
+
+Pour chaque réclamation gagnée (début ou fin), interroge `push_subscriptions` (`push.db`) : `scope_nicks`
+(JSON) contient le nick, non expiré (`expires_at IS NULL OR expires_at > datetime('now')`), type
+correspondant actif (`notify_start=1` pour un début, `notify_end=1` pour une fin). Pour chaque
+abonnement matché : `pywebpush.webpush(subscription_info=..., data=<payload JSON>,
+vapid_private_key=PUSH_VAPID_PRIVATE_KEY, vapid_claims={'sub': PUSH_VAPID_SUB})`. Payload :
+`{"nick":..., "event":"start"|"end", "result":"success"|"error"|null, "timestamp":...}` — `result`
+toujours `null` pour un début. Nouvelle variable `BORGHELPERWWW_PUSH_VAPID_SUB` (déf.
+`mailto:admin@example.invalid`, générique — contact requis par le protocole Web Push RFC 8292, aucune
+valeur "correcte" universelle ne pouvant être devinée pour un déploiement tiers).
+
+Gestion d'erreur `pywebpush`, par abonnement, jamais propagée : `WebPushException` avec
+`status_code in (404,410)` (abonnement mort côté navigateur) → désabonnement automatique (`DELETE FROM
+push_subscriptions WHERE endpoint=?`, factorisé dans `_push_delete_endpoint`, réutilisé aussi par
+`DELETE /push/subscribe`). Toute autre erreur (autre code HTTP, exception réseau/non-`WebPushException`)
+→ journalisée seule (`[watcher] push: ...`), abonnement conservé, **aucun retry** : la ligne
+`bkp_status` est déjà réclamée par CAS, elle ne sera jamais revisitée par aucun watcher — limitation
+assumée (voir Design Notes du spec), pas un bug ; concevoir un retry par abonnement déplacerait le CAS
+du niveau ligne-événement au niveau ligne-événement-×-abonnement, hors périmètre de cette story.
+
+### Tests
+
+`CodecSelfTest` (`borgHelper`) : migration `start_notified_at` sur une base `bkp_status` existante
+(colonne absente, sans perte de données), `list_pending_bkp_status_start`, `claim_bkp_status_start` CAS
+concurrent (deux réclamations simultanées, une seule gagne) — 314/314 `OK`. `push_selftest`
+(`borgHelperWWW --selftest`) : `pywebpush.webpush` mocké — envoi réussi, `WebPushException(status_code=
+410)` → désabonnement, `status_code` autre/exception réseau → conservé sans retry, filtrage
+`notify_start`/`notify_end` — 26/26 `OK`. Test manuel réel sur `demo.borghelperrc` : abonnements avec
+clés `p256dh`/`auth` factices mais valides (chiffrement Web Push réel) sur des `endpoint` de test
+contrôlés (`httpbin.org/status/410` et `/status/500`), `Bkp` réel déclenché via `POST /bkp` — log
+serveur confirmant réclamation début/fin, envoi réel, désabonnement automatique sur 410, conservation
+sans retry sur 500 (détails : `TECHNICAL.md`).
+
+### Non couvert (périmètre de la story suivante)
+
+UI/Service Worker (Story 2c) : aucun changement ici, la notification affichée au navigateur reste à
+construire.
+
 ## borgHelperWWW 1.17.0 — `push.db`, clés VAPID, abonnements push (`POST`/`PATCH`/`DELETE /push/subscribe`, `GET /push/subscriptions`) — 2026-09-26
 
 Story 2a de `spec-notifications-push` : préalable indispensable à l'envoi réel de notifications push

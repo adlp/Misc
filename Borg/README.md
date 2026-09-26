@@ -933,6 +933,7 @@ Trois façons de configurer, cumulables — par ordre de priorité (la première
 | `BORGHELPERWWW_BKP_STATUS_TIMEOUT` | — | — | Délai (secondes) avant qu'une sauvegarde démarrée mais jamais terminée soit traitée comme un échec (AD-7) — défaut 21600 (6h) |
 | `BORGHELPERWWW_PUSH_DB` | `--push-db` | `push_db` | Chemin du fichier SQLite **dédié** aux clés VAPID et abonnements push (Story 2a, `spec-notifications-push`, AD-6 — jamais `scopecache.db`) — défaut : co-localisé avec `cache.db`/`diff.db` (voir [Notifications push](#notifications-push)) |
 | `BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS` | — | — | Durée d'expiration par défaut (jours) d'un abonnement push quand `expires_in_days` est absent de `POST /push/subscribe` — défaut 30, repli sur 30 si valeur invalide/négative |
+| `BORGHELPERWWW_PUSH_VAPID_SUB` | — | — | Contact (`vapid_claims['sub']`, ex. `mailto:...`) requis par le protocole Web Push (RFC 8292) pour l'envoi réel (Story 2b) — défaut générique `mailto:admin@example.invalid`, à définir en production |
 
 Le serveur refuse de démarrer si le fichier de conf `.borghelperrc` (`cfgfile`) est absent (aucun des
 trois moyens ne l'a fourni). La clé API, elle, n'est **pas requise** : si absente partout,
@@ -1482,8 +1483,9 @@ donc **« lancement réussi »**, jamais « sauvegarde réussie » — `stdout` 
 informatif (`"Sauvegarde démarrée pour <nick> (pid <pid>) — ..."`), jamais la sortie de `borgHelper`
 lui-même. Le résultat réel (succès/échec) est capté par une table dédiée `bkp_status` (`diff.db`,
 exclusive à `Bkp`) et réclamé périodiquement par une tâche de fond (« watcher », un par worker
-uvicorn) qui journalise `nick`/`run_id`/`result` (une future story remplacera la journalisation par
-une notification push réelle). Intervalle d'interrogation et délai avant qu'une sauvegarde bloquée
+uvicorn) — début **et** fin de sauvegarde — qui envoie une notification push réelle à chaque
+abonnement concerné (voir [Envoi réel](#envoi-réel-story-2b) sous [Notifications
+push](#notifications-push)). Intervalle d'interrogation et délai avant qu'une sauvegarde bloquée
 soit traitée comme un échec : `BORGHELPERWWW_BKP_WATCHER_INTERVAL` (déf. 30s) et
 `BORGHELPERWWW_BKP_STATUS_TIMEOUT` (déf. 21600s = 6h) — voir [Configuration](#configuration).
 
@@ -1522,8 +1524,7 @@ groupes](#autorisation-par-groupes-reverse-proxy-oidcauth_request) ci-dessus).
 ### Notifications push
 
 **Story 2a de `spec-notifications-push`** — stocke/expose les abonnements push navigateur et les clés
-VAPID ; n'envoie **aucun** vrai push (Story 2b, à venir, câblera le watcher `bkp_status` ci-dessus à
-`pywebpush`). Fichier dédié `push.db` (jamais `scopecache.db` — voir `BORGHELPERWWW_PUSH_DB` dans
+VAPID. Fichier dédié `push.db` (jamais `scopecache.db` — voir `BORGHELPERWWW_PUSH_DB` dans
 [Configuration](#configuration)), clés VAPID (EC P-256) générées **une seule fois** au premier
 démarrage, jamais régénérées ensuite. Clé publique VAPID exposée sur `GET /version` (déjà public, sans
 clé API) : `{"vapid_public_key": "..."}` — nécessaire côté client pour
@@ -1597,8 +1598,30 @@ Réponse commune à `POST`/`PATCH`/`GET` (un ou plusieurs objets de cette forme)
 ```
 
 Vérification interne dédiée : `borgHelperWWW -C ... --selftest` (voir `TECHNICAL.md` — génération
-VAPID, CRUD, calcul d'expiration, clamp de `BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS`, sur des fichiers
-temporaires uniquement).
+VAPID, CRUD, calcul d'expiration, clamp de `BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS`, envoi push mocké,
+sur des fichiers temporaires uniquement).
+
+#### Envoi réel (Story 2b)
+
+Le watcher `bkp_status` (voir `POST /bkp` asynchrone ci-dessus) ne se contente plus de journaliser :
+à chaque réclamation CAS gagnée — **début** de sauvegarde (`started_at` écrit, aucun délai à
+attendre) **et** fin (succès, échec, ou timeout AD-7) — il envoie un push réel (`pywebpush`) à chaque
+abonnement de `push.db` dont `scope_nicks` contient le nick concerné, non expiré, avec le type
+correspondant actif (`notify_start`/`notify_end`). Payload JSON (contenu affiché par le futur Service
+Worker, Story 2c) : `{"nick":..., "event":"start"|"end", "result":"success"|"error"|null,
+"timestamp":...}` — `result` toujours `null` pour un événement de début.
+
+Un abonnement mort côté navigateur (le service de push répond `404`/`410`) est désabonné
+automatiquement (même requête que `DELETE /push/subscribe`). Toute autre erreur (réseau, autre code
+HTTP) est journalisée côté serveur (log `[watcher] push: ...`) sans désabonner ni retenter — la ligne
+`bkp_status` est déjà réclamée par CAS, elle ne sera plus jamais revisitée par aucun watcher : une
+erreur transitoire sur un abonnement, lors d'une réclamation par ailleurs réussie pour d'autres
+abonnements, n'est donc jamais retentée pour cet événement précis (limitation assumée, pas un bug —
+voir Design Notes du spec).
+
+`vapid_claims['sub']` (contact requis par le protocole Web Push, RFC 8292, jamais affiché à la
+personne abonnée) : `BORGHELPERWWW_PUSH_VAPID_SUB` (déf. `mailto:admin@example.invalid` — générique,
+à définir en production).
 
 ### `/download/file` et `/download/tar` — téléchargements binaires
 

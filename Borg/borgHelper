@@ -10,13 +10,13 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.109"
+Version="1.0.110"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
 #                           continue de l'ouvrir). Seule la future DbEncrypt écrira la maximale,
 #                           ce qui exclut les anciens binaires des SEULES bases chiffrées.
-DIFF_DB_SCHEMA_VERSION  = 6
+DIFF_DB_SCHEMA_VERSION  = 7
 CACHE_DB_SCHEMA_VERSION = 2
 DIFF_DB_BASE_SCHEMA_VERSION  = 4
 CACHE_DB_BASE_SCHEMA_VERSION = 1
@@ -34,6 +34,8 @@ CACHE_DB_BASE_SCHEMA_VERSION = 1
 #   6 : repo_stats historique (BorgHelperDB._migrate_repo_stats, depuis une ligne écrasée par nick
 #       vers un historique id/op append-only — colonne `op` absente déclenche la migration, jamais
 #       une comparaison de schema_version)
+#   7 : bkp_status.start_notified_at (réclamation de début de sauvegarde, Story 2b
+#       spec-notifications-push — ALTER TABLE ADD COLUMN, même auto-réparation que les paliers 2-4)
 # Ne concerne QUE diff.db, appelé par ensure_diff_db() — désormais garanti avant tout accès
 # depuis Bkp, Index, Prune (voir prune()) et tous les autres consommateurs de diff.db/cache.db.
 
@@ -1501,6 +1503,17 @@ class BorgHelperDB:
                 conn.execute("ALTER TABLE snapshot_file ADD COLUMN mode TEXT")
             if 'owner' not in sf_cols:
                 conn.execute("ALTER TABLE snapshot_file ADD COLUMN owner TEXT")
+            bkps_cols=[r[1] for r in conn.execute("PRAGMA table_info(bkp_status)").fetchall()]
+            if 'start_notified_at' not in bkps_cols:
+                conn.execute("ALTER TABLE bkp_status ADD COLUMN start_notified_at TEXT")
+                # Backfill obligatoire (revue de code) : sans lui, chaque ligne bkp_status déjà
+                # existante (créée par Story 1, avant cette colonne) se retrouve start_notified_at
+                # NULL -> le prochain passage watcher les traiterait TOUTES comme un "début" en
+                # attente et enverrait un push pour chaque sauvegarde historique jamais enregistrée.
+                # On les marque déjà notifiées (started_at comme sentinelle) : seules les lignes
+                # créées après cette migration (donc réellement nouvelles) restent éligibles.
+                conn.execute("UPDATE bkp_status SET start_notified_at=started_at WHERE start_notified_at IS NULL")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_bkpstatus_pending_start ON bkp_status(nick, start_notified_at)")
             cols=[r[1] for r in conn.execute("PRAGMA table_info(archive_snapshot)").fetchall()]
             if 'path' in cols:
                 self._migrate_archive_snapshot(conn)
@@ -1695,6 +1708,35 @@ class BorgHelperDB:
             conn=_open_db(db_path,nick=nick,role='write')
             try:
                 cur=conn.execute("UPDATE bkp_status SET notified_at=datetime('now') WHERE nick=? AND run_id=? AND notified_at IS NULL",(nick,run_id))
+                conn.commit(); return cur.rowcount==1
+            finally: conn.close()
+        try: return self._with_lock_retry(_do)
+        except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
+
+    def list_pending_bkp_status_start(self,nick,db_path=None):
+        """Lignes bkp_status prêtes pour la réclamation de DÉBUT (Story 2b, spec-notifications-push) :
+        `started_at` déjà écrit (toujours vrai dès l'INSERT de store_bkp_status_start), aucun délai à
+        attendre contrairement à list_pending_bkp_status (fin) — un début est immédiatement éligible.
+        Lecture seule — voir claim_bkp_status_start."""
+        if db_path is None: db_path=self.get_diff_db(nick)
+        try:
+            conn=_open_db(db_path,nick=nick,role='read')
+            rows=conn.execute(
+                "SELECT run_id,started_at FROM bkp_status WHERE nick=? AND start_notified_at IS NULL",
+                (nick,)).fetchall()
+            conn.close()
+            return [{'run_id':r[0],'started_at':r[1]} for r in rows]
+        except sqlite3.Error: return []
+
+    def claim_bkp_status_start(self,nick,run_id,db_path=None):
+        """Réclamation par comparer-et-échanger de l'événement de DÉBUT — même patron exact que
+        claim_bkp_status (fin), colonne start_notified_at au lieu de notified_at. True si CETTE
+        réclamation a gagné (une ligne affectée), False si déjà réclamée par un autre worker."""
+        if db_path is None: db_path=self.get_diff_db(nick)
+        def _do():
+            conn=_open_db(db_path,nick=nick,role='write')
+            try:
+                cur=conn.execute("UPDATE bkp_status SET start_notified_at=datetime('now') WHERE nick=? AND run_id=? AND start_notified_at IS NULL",(nick,run_id))
                 conn.commit(); return cur.rowcount==1
             finally: conn.close()
         try: return self._with_lock_retry(_do)
@@ -5053,6 +5095,60 @@ def codec_selftest():
             c.close()
             return v is not None
         check("bkp_status : claim_bkp_status gagnant -> notified_at posé en base",_bs_claim_sets_notified_at)
+        # ── bkp_status.start_notified_at (Story 2b, spec-notifications-push) ──
+        def _bs_start_migration_from_old_schema():
+            """Simule une base bkp_status créée par Story 1 (sans start_notified_at) : DROP la
+            colonne (recréation de table sans elle) puis rappelle ensure_diff_db -> la colonne
+            doit être ajoutée sans perte des lignes déjà présentes."""
+            old_path=os.path.join(tmp,'bkpstatus_old.db')
+            c=_open_db(old_path,nick=None,role='admin')
+            c.executescript("""
+                CREATE TABLE bkp_status (
+                    nick TEXT NOT NULL, run_id TEXT NOT NULL, started_at TEXT NOT NULL,
+                    finished_at TEXT, result TEXT, notified_at TEXT,
+                    PRIMARY KEY (nick, run_id)
+                );
+            """)
+            c.execute("INSERT INTO bkp_status (nick,run_id,started_at) VALUES ('bsOld','runOld',datetime('now'))")
+            c.commit(); c.close()
+            cols_before={r[1] for r in _open_db(old_path,nick=None,role='read').execute("PRAGMA table_info(bkp_status)").fetchall()}
+            bh.ensure_diff_db(old_path)
+            c=_open_db(old_path,nick='bsOld',role='read')
+            cols_after={r[1] for r in c.execute("PRAGMA table_info(bkp_status)").fetchall()}
+            row=c.execute("SELECT started_at,start_notified_at FROM bkp_status WHERE nick='bsOld' AND run_id='runOld'").fetchone()
+            pending=bh.list_pending_bkp_status_start('bsOld',db_path=old_path)
+            c.close()
+            # Revue de code : une ligne pré-existante doit être rétro-remplie (start_notified_at=
+            # started_at) par la migration, PAS laissée NULL — sinon le premier passage watcher après
+            # mise à jour traiterait tout l'historique bkp_status comme des débuts en attente et
+            # enverrait un push pour chaque sauvegarde jamais enregistrée avant cette story.
+            return ('start_notified_at' not in cols_before and 'start_notified_at' in cols_after
+                    and row is not None and row[0] is not None and row[1]==row[0]
+                    and len(pending)==0)
+        check("bkp_status : migration ALTER TABLE ADD COLUMN start_notified_at + backfill sur base existante, jamais de flood au redémarrage",
+              _bs_start_migration_from_old_schema)
+        def _bs_pending_start_query():
+            bh.store_bkp_status_start('bsD','runD1',db_path=bs_path)
+            bh.store_bkp_status_start('bsD','runD2',db_path=bs_path)
+            bh.claim_bkp_status_start('bsD','runD2',db_path=bs_path)  # déjà réclamée -> jamais dans la liste
+            pending={r['run_id'] for r in bh.list_pending_bkp_status_start('bsD',db_path=bs_path)}
+            return pending=={'runD1'}
+        check("bkp_status : list_pending_bkp_status_start -> start_notified_at IS NULL uniquement, aucun délai",_bs_pending_start_query)
+        def _bs_claim_start_cas():
+            bh.store_bkp_status_start('bsE','runE',db_path=bs_path)
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                results=list(ex.map(lambda _:bh.claim_bkp_status_start('bsE','runE',db_path=bs_path),[0,1]))
+            return sorted(results)==[False,True]
+        check("bkp_status : claim_bkp_status_start CAS — deux réclamations concurrentes, une seule gagne",_bs_claim_start_cas)
+        check("bkp_status : claim_bkp_status_start sur ligne déjà réclamée -> False (idempotent)",
+              lambda: bh.claim_bkp_status_start('bsE','runE',db_path=bs_path) is False)
+        def _bs_claim_start_sets_start_notified_at():
+            c=_open_db(bs_path,nick='bsE',role='read')
+            v=c.execute("SELECT start_notified_at,notified_at FROM bkp_status WHERE nick='bsE' AND run_id='runE'").fetchone()
+            c.close()
+            # start_notified_at posé, notified_at (colonne de fin) inchangé (NULL, cette ligne n'a jamais fini)
+            return v[0] is not None and v[1] is None
+        check("bkp_status : claim_bkp_status_start gagnant -> start_notified_at seul posé (notified_at intact)",_bs_claim_start_sets_start_notified_at)
         # ── config DB_ENCRYPT / DB_KDF ──
         def _cfgsec(text,nick='n'):
             cp=configparser.ConfigParser(); cp.optionxform=str; cp.read_string(text); return cp[nick] if nick in cp else None

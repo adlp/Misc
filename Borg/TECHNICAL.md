@@ -2093,37 +2093,44 @@ tant que le vrai continue d'émettre cet avertissement). Un futur nettoyage natu
 `--numeric-owner` de `_borg_extract_args` (déprécié par `borg` lui-même) — hors périmètre de cette
 story, non traité ici.
 
-## `bkp_status` et watcher — détection de fin de sauvegarde (`borgHelper` 1.0.109 / `borgHelperWWW` 1.16.0, Story 1 de `spec-notifications-push`)
+## `bkp_status` et watcher — détection de fin de sauvegarde (`borgHelper` 1.0.110 / `borgHelperWWW` 1.18.0, Story 1 + Story 2b de `spec-notifications-push`)
 
-Préalable à l'envoi de notifications push (Story 2, à venir) : un signal fiable pour savoir, après
-coup et quel que soit le déclencheur, si un `Bkp` a réussi ou échoué. Paradigme retenu (voir
-`ARCHITECTURE-SPINE.md` de ce spec) : un signal **dédié**, écrit à la source par `backup()`, jamais un
-signal existant détourné (`priority.lock` est partagé avec `Restore` et keyé par dépôt, pas par nick ;
-`archive_stats` est aussi écrit par `Index` — ni l'un ni l'autre n'a la précision requise).
+Préalable à l'envoi de notifications push (Story 2b, câblée — voir [Envoi push réel](#envoi-push-réel-story-2b) plus bas) :
+un signal fiable pour savoir, après coup et quel que soit le déclencheur, si un `Bkp` a réussi ou
+échoué. Paradigme retenu (voir `ARCHITECTURE-SPINE.md` de ce spec) : un signal **dédié**, écrit à la
+source par `backup()`, jamais un signal existant détourné (`priority.lock` est partagé avec `Restore`
+et keyé par dépôt, pas par nick ; `archive_stats` est aussi écrit par `Index` — ni l'un ni l'autre n'a
+la précision requise).
 
 ### Table `bkp_status` (`diff.db`, exclusive à `Bkp`)
 
 ```sql
 CREATE TABLE IF NOT EXISTS bkp_status (
-    nick        TEXT NOT NULL,
-    run_id      TEXT NOT NULL,
-    started_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    finished_at TEXT,
-    result      TEXT,
-    notified_at TEXT,
+    nick               TEXT NOT NULL,
+    run_id             TEXT NOT NULL,
+    started_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at        TEXT,
+    result             TEXT,
+    notified_at        TEXT,
+    start_notified_at  TEXT,   -- Story 2b : réclamation de DÉBUT, distincte de notified_at (fin)
     PRIMARY KEY (nick, run_id)
 );
 CREATE INDEX IF NOT EXISTS idx_bkpstatus_pending ON bkp_status(nick, notified_at, finished_at);
+CREATE INDEX IF NOT EXISTS idx_bkpstatus_pending_start ON bkp_status(nick, start_notified_at);
 ```
 
-Ajoutée dans `ensure_diff_db()`, additive (`CREATE TABLE IF NOT EXISTS`, comme `archive_stats`/
-`diff_excluded_stats` en leur temps) — **pas de bump `DIFF_DB_SCHEMA_VERSION`** : table entièrement
-nouvelle, aucune donnée existante à transformer, un ancien binaire qui ignorerait cette table continue
-de fonctionner sans dégradation sur tout le reste. Aucune colonne `path` : hors du périmètre du codec
-de chiffrement des chemins (`PathCodec`) — écritures/lectures directes, sans `_write_mode_check` ni
+Table ajoutée dans `ensure_diff_db()`, additive (`CREATE TABLE IF NOT EXISTS`, comme `archive_stats`/
+`diff_excluded_stats` en leur temps) — **pas de bump `DIFF_DB_SCHEMA_VERSION`** pour la table
+elle-même : entièrement nouvelle, aucune donnée existante à transformer, un ancien binaire qui
+ignorerait cette table continue de fonctionner sans dégradation sur tout le reste. `start_notified_at`
+(Story 2b) est en revanche une colonne ajoutée à une table **déjà existante** : même patron
+`ALTER TABLE ... ADD COLUMN` (contrôle via `PRAGMA table_info`) que `snapshot_file.type`/`mode`/`owner`
+— et, comme pour ceux-ci, **bump `DIFF_DB_SCHEMA_VERSION` 6→7** (palier 7, voir le commentaire
+« Historique diff.db » en tête de fichier). Aucune colonne `path` : hors du périmètre du codec de
+chiffrement des chemins (`PathCodec`) — écritures/lectures directes, sans `_write_mode_check` ni
 `_path_stored`. `run_id` = `uuid.uuid4().hex`, généré par `backup()` à chaque appel.
 
-Jamais écrite par `Restore`/`Index`/`Prune` — exclusive à `backup()`. Cinq méthodes `BorgHelperDB`
+Jamais écrite par `Restore`/`Index`/`Prune` — exclusive à `backup()`. Sept méthodes `BorgHelperDB`
 (toutes acceptent `db_path=None` → `self.get_diff_db(nick)`, même convention que
 `store_archive_stats`/`store_repo_stats`) :
 
@@ -2141,6 +2148,12 @@ Jamais écrite par `Restore`/`Index`/`Prune` — exclusive à `backup()`. Cinq m
 - `claim_bkp_status(nick, run_id, db_path=None)` — écriture CAS, `UPDATE bkp_status SET
   notified_at=datetime('now') WHERE nick=? AND run_id=? AND notified_at IS NULL`, retourne
   `cur.rowcount==1` (`True` = cet appel a gagné).
+- `list_pending_bkp_status_start(nick, db_path=None)` — Story 2b, lecture seule, `WHERE nick=? AND
+  start_notified_at IS NULL` : **aucun délai à attendre**, contrairement à `list_pending_bkp_status`
+  (une ligne est éligible dès son `INSERT`, `started_at` étant toujours posé immédiatement).
+- `claim_bkp_status_start(nick, run_id, db_path=None)` — Story 2b, même patron CAS exact que
+  `claim_bkp_status`, colonne `start_notified_at` au lieu de `notified_at` : `UPDATE bkp_status SET
+  start_notified_at=datetime('now') WHERE nick=? AND run_id=? AND start_notified_at IS NULL`.
 
 ### `backup()` — écriture début/fin/filet de sécurité
 
@@ -2193,13 +2206,20 @@ plus récentes (juste dépréciée en faveur de `lifespan`, pas retirée).
 
 Une tâche asyncio par processus **worker** uvicorn (`--workers 2` déjà documenté) — aucune
 coordination inter-process nécessaire : chaque worker interroge indépendamment, et la réclamation CAS
-de `claim_bkp_status` garantit qu'un seul gagne par ligne même si plusieurs l'observent au même
-balayage. `_bkp_status_watcher_pass()` (fonction synchrone, exécutée via `asyncio.to_thread` pour ne
-jamais bloquer la boucle événementielle pendant les appels SQLite) : pour chaque nick connu
-(`_nick_list('ALL')`), `ensure_diff_db(db_path, create=False)` (AD-12 : jamais créer de fichier pour
-un nick sans historique), puis `list_pending_bkp_status`/`claim_bkp_status`. Pour cette story, une
-réclamation gagnée se contente de journaliser (log serveur, `stderr`) `nick`/`run_id`/`result` — Story
-2 remplacera cette ligne par l'appel `pywebpush` réel.
+de `claim_bkp_status`/`claim_bkp_status_start` garantit qu'un seul gagne par ligne même si plusieurs
+l'observent au même balayage. `_bkp_status_watcher_pass()` (fonction synchrone, exécutée via
+`asyncio.to_thread` pour ne jamais bloquer la boucle événementielle pendant les appels SQLite) : pour
+chaque nick connu (`_nick_list('ALL')`), `ensure_diff_db(db_path, create=False)` (AD-12 : jamais créer
+de fichier pour un nick sans historique), puis **deux** passages de réclamation dans le même bloc
+`try`/`except` par nick (isolation inchangée, couvre les deux chemins) :
+
+1. Fin (inchangé dans son critère de sélection) : `list_pending_bkp_status`/`claim_bkp_status`.
+2. Début (Story 2b, nouveau) : `list_pending_bkp_status_start`/`claim_bkp_status_start` — aucun délai
+   à attendre, une ligne fraîchement `INSERT`ée est immédiatement éligible.
+
+Chaque réclamation gagnée journalise (log serveur, `stderr`) `nick`/`run_id`/`result` **et** déclenche
+désormais un envoi push réel via `_send_bkp_push(nick, event, result)` (Story 2b, remplace la simple
+journalisation de la Story 1 — voir [Envoi push réel](#envoi-push-réel-story-2b) plus bas).
 
 `BORGHELPERWWW_BKP_WATCHER_INTERVAL` (déf. 30s) : période entre deux balayages.
 `BORGHELPERWWW_BKP_STATUS_TIMEOUT` (déf. 21600s = 6h, AD-7) : délai au-delà duquel une ligne
@@ -2235,20 +2255,24 @@ uniquement par `bkp_status`.
   (succès et échec), filet de sécurité (ligne non finie → `error` immédiat ; ligne déjà finie →
   inchangée), `list_pending_bkp_status` (lignes finies + bloquées au-delà du timeout AD-7, jamais les
   récentes), `claim_bkp_status` CAS concurrent (`ThreadPoolExecutor`, deux réclamations simultanées sur
-  la même ligne, une seule gagne) — 309/309 `OK`.
+  la même ligne, une seule gagne). Story 2b : migration `ALTER TABLE ADD COLUMN start_notified_at` sur
+  une base `bkp_status` créée avec l'ancien schéma (colonne absente, simulée par une table recréée sans
+  elle) — colonne ajoutée, ligne existante intacte ; `list_pending_bkp_status_start` (`start_notified_at
+  IS NULL` seul, aucun délai) ; `claim_bkp_status_start` CAS concurrent (même patron) — 314/314 `OK`.
 - Test réel sur `demo.borghelperrc` (`borgHelperWWW -C demo.borghelperrc -K ... --port 8791`,
   `POST /api/bkp?nick=demo-modules`) : réponse en **~0,1s** (contre la durée complète de la sauvegarde
   auparavant) ; `bkp_status` observée directement en base — ligne `started_at` posée au lancement,
   `finished_at`/`result='success'` à la fin réelle du `Bkp` (~12s plus tard sur ce jeu de données) ;
-  log serveur `[watcher] bkp_status réclamé : nick=demo-modules run_id=... result=success` dans le
-  balayage suivant.
+  log serveur `[watcher] bkp_status (fin) réclamé : nick=demo-modules run_id=... result=success` dans
+  le balayage suivant.
 
-## `push.db` — clés VAPID et abonnements push (`borgHelperWWW` 1.17.0, Story 2a de `spec-notifications-push`)
+## `push.db` — clés VAPID et abonnements push (`borgHelperWWW` 1.17.0 Story 2a / 1.18.0 Story 2b de `spec-notifications-push`)
 
-Préalable à l'envoi réel (Story 2b, qui câblera le watcher `bkp_status` ci-dessus à `pywebpush`) :
-stocke/expose seulement, n'envoie jamais de vrai push. Fichier SQLite **dédié**, jamais
-`scopecache.db` (AD-6) : contrairement à ce dernier (cache reconstructible à volonté), `push.db` porte
-les clés VAPID et les abonnements eux-mêmes — une perte n'est **pas** récupérable.
+Story 2a : stocke/expose les clés VAPID et les abonnements. Story 2b (voir [Envoi push
+réel](#envoi-push-réel-story-2b) plus bas) câble le watcher `bkp_status` ci-dessus à `pywebpush` pour
+un envoi réel. Fichier SQLite **dédié**, jamais `scopecache.db` (AD-6) : contrairement à ce dernier
+(cache reconstructible à volonté), `push.db` porte les clés VAPID et les abonnements eux-mêmes — une
+perte n'est **pas** récupérable.
 
 ### Fichier et schéma
 
@@ -2357,15 +2381,55 @@ ci-dessus, jamais via ce mécanisme.
 `DELETE` : choix délibéré, documenté (README) — un `endpoint` déjà absent renvoie `{"deleted": false}`
 avec un `200`, jamais un `404` bruyant (« déjà absent = objectif du désabonnement atteint »).
 
+### Envoi push réel (Story 2b)
+
+`_send_bkp_push(nick, event, result)` (`event`: `'start'|'end'`, `result`: `None` pour un début,
+`'success'|'error'` pour une fin) — appelée par `_bkp_status_watcher_pass()` à chaque réclamation CAS
+gagnée (début **et** fin, voir plus haut). Remplace la simple journalisation de la Story 1.
+
+1. `_push_subscriptions_for(nick, notify_col)` (`notify_col`: `'notify_start'|'notify_end'`) :
+   `SELECT * FROM push_subscriptions WHERE {notify_col}=1 AND (expires_at IS NULL OR expires_at >
+   datetime('now'))`, puis filtre Python sur `nick in json.loads(scope_nicks)` — `scope_nicks` est du
+   JSON, jamais matché de manière fiable en `LIKE` SQL brut sur la chaîne stockée.
+2. Payload commun à tous les abonnements matchés (un seul `json.dumps`, pas un par envoi) :
+   `{"nick":..., "event":"start"|"end", "result": None|"success"|"error", "timestamp":
+   datetime.utcnow().isoformat()+"Z"}`.
+3. Pour chaque abonnement : `pywebpush.webpush(subscription_info={"endpoint":..., "keys":
+   {"p256dh":..., "auth":...}}, data=payload, vapid_private_key=PUSH_VAPID_PRIVATE_KEY,
+   vapid_claims={"sub": PUSH_VAPID_SUB})`. `PUSH_VAPID_PRIVATE_KEY` : la même variable module-level
+   chargée par `_init_vapid_keys()` (Story 2a), format brut base64url déjà compatible
+   `py_vapid.Vapid.from_string()` en interne (`pywebpush` s'en charge). `PUSH_VAPID_SUB` :
+   `BORGHELPERWWW_PUSH_VAPID_SUB` (déf. `mailto:admin@example.invalid`) — contact requis par le
+   protocole Web Push (RFC 8292), jamais affiché à la personne abonnée ; aucune valeur "correcte"
+   universelle ne peut être devinée pour un déploiement tiers, d'où l'env var dédiée plutôt qu'un crash
+   au démarrage (même esprit que la génération aléatoire de `API_KEY` si absente).
+4. Gestion d'erreur, par abonnement, **jamais** propagée hors de la boucle (une erreur sur un
+   abonnement ne doit jamais empêcher l'envoi aux suivants) :
+   - `except WebPushException as e` avec `e.status_code in (404,410)` (abonnement mort côté
+     navigateur/service de push) → `_push_delete_endpoint(endpoint)` (même requête SQL exacte que
+     `DELETE /push/subscribe`, extraite en fonction commune pour éviter la duplication).
+   - `except WebPushException as e` avec un autre `status_code`, ou `except Exception` (réseau, timeout,
+     etc.) → journalisé seul (`[watcher] push: ...`, `stderr`), abonnement **conservé**, **aucun
+     retry** : la ligne `bkp_status` est déjà réclamée par CAS, elle ne sera plus jamais revisitée par
+     aucun watcher, quel que soit le sort de cet envoi précis (limitation assumée — voir Design Notes
+     du spec : concevoir un retry par abonnement déplacerait le CAS du niveau ligne-événement au niveau
+     ligne-événement-×-abonnement, changement architectural hors périmètre de cette story).
+
 ### Vérification
 
 `push_selftest()` (`borgHelperWWW --selftest`, équivalent de `CodecSelfTest` adapté : la logique
-testée — `push.db`, `py_vapid` — est confinée à `borgHelperWWW`, AD-5, donc ne peut pas vivre dans
-`codec_selftest()` de `borgHelper` sans violer le stdlib-only de ce dernier) : génération VAPID (une
-fois, jamais régénérée), CRUD abonnement (création, mise à jour des préférences avec `scope_nicks`
-intact, suppression), calcul `expires_at` (fournie/absente=défaut/« à vie »), clamp de
-`BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS` (négatif, non numérique, zéro, valide) — opère sur un fichier
-SQLite temporaire dédié, jamais le `PUSH_DB` réel — 12/12 `OK`.
+testée — `push.db`, `py_vapid`, `pywebpush` — est confinée à `borgHelperWWW`, AD-5, donc ne peut pas
+vivre dans `codec_selftest()` de `borgHelper` sans violer le stdlib-only de ce dernier) : génération
+VAPID (une fois, jamais régénérée), CRUD abonnement (création, mise à jour des préférences avec
+`scope_nicks` intact, suppression), calcul `expires_at` (fournie/absente=défaut/« à vie »), clamp de
+`BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS` (négatif, non numérique, zéro, valide). Story 2b : `PUSH_DB`
+module-level monkeypatché vers le fichier temporaire (restauré en `finally`) le temps de tester
+`_send_bkp_push` avec `pywebpush.webpush` mocké (`unittest.mock.patch`, jamais de vrai envoi réseau
+dans ce test) — envoi tenté uniquement pour les abonnements matchés (type actif, périmètre, non
+expiré), payload JSON (`nick`/`event`/`result`/`timestamp`), `WebPushException(status_code=410)` →
+désabonnement automatique, `status_code=500` ou exception réseau (`ConnectionError`) → abonnement
+conservé, jamais de retry, filtrage `notify_start`/`notify_end` correct. Le tout opère sur un fichier
+SQLite temporaire dédié, jamais le `PUSH_DB` réel — 26/26 `OK`.
 
 ⚠️ Isolation partielle par rapport à `codec_selftest()` : ce fichier s'initialise entièrement à
 l'import (pas de dispatch de commande précoce comme `-c CodecSelfTest`), donc le `PUSH_DB` réel du
@@ -2381,3 +2445,30 @@ jours, `scope_nicks` = tous les nicks connus (`GROUPS_HEADER` désactivé dans `
 réabonnement sur le même `endpoint` met à jour la ligne existante (même `id`, pas de doublon) ; `DELETE`
 puis `DELETE` à nouveau sur le même `endpoint` → `{"deleted":true}` puis `{"deleted":false}`, jamais
 d'erreur. `GET /version` expose bien `vapid_public_key`.
+
+**Test manuel réel Story 2b (envoi effectif)** — aucun navigateur disponible dans cet environnement
+d'implémentation, procédure documentée pour tout serveur avec accès réseau sortant : deux clés
+`p256dh`/`auth` valides mais factices générées via `cryptography`/`py_vapid`
+(`ec.generate_private_key(SECP256R1()).public_key().public_bytes(X962, UncompressedPoint)` pour
+`p256dh`, 16 octets aléatoires pour `auth` — nécessaire pour que le chiffrement Web Push interne à
+`pywebpush` réussisse et que la requête HTTP sortante soit réellement émise, plutôt qu'une erreur de
+chiffrement avant tout envoi réseau). Deux abonnements créés (`POST /push/subscribe`,
+`notify_start`/`notify_end` tous deux `true`) sur des `endpoint` de test contrôlés qui renvoient un
+code HTTP fixe sans jamais afficher/interpréter le contenu (`https://httpbin.org/status/410` et
+`.../status/500`) — capture directe du comportement réel de `pywebpush` face à une vraie réponse HTTP,
+sans mocker `webpush` lui-même. `borgHelperWWW` démarré sur `demo.borghelperrc`
+(`BORGHELPERWWW_BKP_WATCHER_INTERVAL=3` pour un balayage rapide), `POST /bkp?nick=demo-modules` réel :
+
+```
+[watcher] bkp_status (début) réclamé : nick=demo-modules run_id=...
+[watcher] push: abonnement mort désabonné (status=410) nick=demo-modules event=start
+[watcher] push: échec envoi (status=500) nick=demo-modules event=start : WebPushException: Push failed: 500 INTERNAL SERVER ERROR...
+[watcher] bkp_status (fin) réclamé : nick=demo-modules run_id=... result=success
+[watcher] push: échec envoi (status=500) nick=demo-modules event=end : WebPushException: Push failed: 500 INTERNAL SERVER ERROR...
+```
+
+`GET /push/subscriptions?endpoint=.../status/410` → `{"subscriptions":[]}` (désabonné automatiquement
+après le premier envoi, début) ; `.../status/500` → toujours présent après début **et** fin (jamais
+désabonné, jamais retenté au-delà de l'unique tentative par événement). Confirme, sur un vrai aller-
+retour réseau `pywebpush`, l'ensemble du chemin : réclamation CAS début+fin, envoi réel, désabonnement
+410, conservation+non-retry sur 500.
