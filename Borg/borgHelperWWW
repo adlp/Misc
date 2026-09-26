@@ -62,7 +62,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.25.0"
+WWW_VERSION="1.26.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -894,8 +894,9 @@ def _check_group_access(request: Request):
                 f"({GROUPS_HEADER}: {', '.join(sorted(user_groups)) or '(vide)'})")
 
 # Toutes les routes API métier sont déclarées sur ce routeur (préfixe appliqué en fin de fichier via
-# app.include_router) — seuls '/', '/version', '/healthz' restent déclarés directement sur `app`,
-# accessibles sans préfixe quel que soit API_PREFIX (bootstrap : la page et le endpoint qui lui
+# app.include_router) — seuls '/', '/version', '/healthz' (plus les fichiers statiques /sw.js,
+# /static/…, /favicon.ico et les adresses de l'UI /serveur/…, /explorer/…, /historique/…,
+# /notifications) restent déclarés directement sur `app`, accessibles sans préfixe quel que soit API_PREFIX (bootstrap : la page et le endpoint qui lui
 # apprend ce préfixe doivent être joignables sans le connaître à l'avance).
 # dependencies=[Depends(_check_group_access)] : appliqué à CHAQUE route du routeur, en plus de
 # require_api_key (appelé individuellement dans chaque fonction).
@@ -2200,6 +2201,34 @@ UI_VERSION=_UI_VERSION_MATCH.group(1) if _UI_VERSION_MATCH else 'inconnue'
 def ui_index():
     return _UI_HTML
 
+# Adresses partageables de l'UI (spec-ui-deep-links, 1.26.0) : la même page, l'UI lit l'adresse et
+# affiche la vue correspondante (/serveur/<nick>, /explorer/<nick>/<chemin…>, /historique/<nick>,
+# /notifications). Sur `app`, sans X-API-Key comme `/` (la page ne contient aucun secret ; les droits
+# sont appliqués par l'API à chaque appel) ; require_user (middleware) s'y applique. Aucune route API
+# ne porte ces noms, même avec api_prefix vide.
+@app.get("/serveur/{nick}",response_class=HTMLResponse,include_in_schema=False)
+@app.get("/historique/{nick}",response_class=HTMLResponse,include_in_schema=False)
+@app.get("/explorer",response_class=HTMLResponse,include_in_schema=False)
+@app.get("/explorer/{rest:path}",response_class=HTMLResponse,include_in_schema=False)
+@app.get("/notifications",response_class=HTMLResponse,include_in_schema=False)
+def ui_deep_link():
+    return _UI_HTML
+
+# Adresse inconnue ouverte dans un navigateur (/xyz, /serveur/a/b…) : la page de l'UI, qui revient à la
+# liste et remplace l'adresse par `/`. Uniquement quand AUCUNE route ne correspond (pas d'`endpoint`
+# dans le scope — un 404 levé par une route API reste intact) et pour une navigation navigateur
+# (GET + `Accept: text/html`) : un client API (curl, fetch, `Accept: */*`) garde le 404 JSON habituel,
+# même avec api_prefix vide. Statut 404 conservé.
+from starlette.exceptions import HTTPException as _StarletteHTTPException
+from fastapi.exception_handlers import http_exception_handler as _default_http_exception_handler
+
+@app.exception_handler(_StarletteHTTPException)
+async def _ui_fallback_404(request: Request, exc):
+    if (exc.status_code==404 and request.method=='GET' and 'endpoint' not in request.scope
+            and 'text/html' in request.headers.get('accept','')):
+        return HTMLResponse(_UI_HTML,status_code=404)
+    return await _default_http_exception_handler(request,exc)
+
 # Service Worker des notifications push (spec-push-ui-prefs-json) : fichier statique séparé, à côté de
 # l'UI. Servi à la RACINE (portée par défaut = toute l'origine) et sur `app`, jamais derrière
 # X-API-Key : un navigateur ne peut pas ajouter d'en-tête à la requête d'enregistrement de son propre
@@ -3199,6 +3228,35 @@ def push_selftest():
                     finally:
                         _FAVICON_CANDIDATES=old
                 check("route /favicon.ico : 404 si absent, fichier local servi dès qu'il existe (sans redémarrage)",_favicon_ok)
+                def _deep_links_ok():
+                    ui=[client.get(u) for u in ('/serveur/demo','/historique/demo','/explorer','/explorer/demo',
+                        '/explorer/demo/etc/nginx','/explorer/d%C3%A9mo/un%20r%C3%A9p?archive=a-1','/notifications')]
+                    api=client.get(f"{API_PREFIX}/access",headers={'X-API-Key':API_KEY})
+                    routes={getattr(r,'path','') for r in app.routes}
+                    ui_paths={'/serveur/{nick}','/historique/{nick}','/explorer','/explorer/{rest:path}','/notifications'}
+                    # Routes du routeur SANS préfixe (cas api_prefix vide) : aucune ne doit commencer par
+                    # un préfixe d'adresse de l'UI — collision de motifs ({x}, {rest:path}), pas seulement
+                    # de noms exacts.
+                    ui_heads=('/serveur','/historique','/explorer','/notifications')
+                    clash=[r.path for r in router.routes
+                           if any(r.path==h or r.path.startswith(h+'/') for h in ui_heads)]
+                    return (all(r.status_code==200 and r.text==_UI_HTML for r in ui) and api.status_code==200
+                            and ui_paths<=routes and not clash)
+                check("adresses de l'UI (/serveur, /historique, /explorer/…, /notifications) : page servie, aucune route API masquée",_deep_links_ok)
+                def _ui_fallback_ok():
+                    html={'Accept':'text/html,application/xhtml+xml,*/*;q=0.8'}
+                    nav=[client.get(u,headers=html) for u in ('/xyz','/serveur/a/b','/historique/a/b')]
+                    api_client=client.get('/xyz')                              # client API : 404 JSON
+                    global _FAVICON_CANDIDATES
+                    old=_FAVICON_CANDIDATES; _FAVICON_CANDIDATES=[Path(tmpdir)/'absent.ico']
+                    try: raised=client.get('/favicon.ico',headers=html)       # 404 levé PAR une route
+                    finally: _FAVICON_CANDIDATES=old
+                    post=client.post('/xyz',headers=html)
+                    return (all(r.status_code==404 and r.text==_UI_HTML for r in nav)
+                            and api_client.status_code==404 and api_client.json()=={'detail':'Not Found'}
+                            and raised.status_code==404 and raised.json()=={'detail':'favicon.ico absent'}
+                            and post.status_code in (404,405) and 'UI_VERSION' not in post.text)
+                check("adresse inconnue : page UI (404) pour un navigateur seulement ; clients API et 404 de route intacts",_ui_fallback_ok)
                 r=client.get("/version")
                 check("route /version : push_available + bornes d'expiration exposées",
                       lambda: {'push_available','push_default_expiry_days','push_max_expiry_days'}<=set(r.json()))

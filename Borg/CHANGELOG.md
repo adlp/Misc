@@ -1,5 +1,25 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.26.0 / borgHelperWWW_ui.html 1.14.0 — adresses partageables — 2026-09-27
+
+Demande utilisateur : l'adresse doit suivre les menus (`https://host/explorer/<serveur>/<répertoire>`,
+`https://host/historique/<serveur>`…) pour pouvoir passer une URL à un collègue, qui y accède
+directement s'il a les droits.
+
+- Adresses : `/`, `/serveur/<nick>`, `/explorer/<nick>[/<chemin…>][?archive=<nom>]`,
+  `/historique/<nick>`, `/notifications` — mises à jour à chaque navigation (Précédent/Suivant et
+  rechargement fonctionnent), servies par borgHelperWWW (auparavant `404`).
+- Lien ouvert sans session : connexion, puis la page visée (l'adresse est conservée).
+- Serveur inconnu ou hors droits : liste + « Serveur inconnu ou inaccessible avec vos droits : X »,
+  identique dans les deux cas. Le lien n'accorde aucun droit.
+- Adresse inconnue ouverte dans un navigateur : liste, adresse remplacée par `/` ; les clients API
+  gardent le `404` JSON.
+- Bouton **🔗 Copier le lien** près de l'étiquette du serveur (repli : adresse affichée à copier).
+- `/notifications` quand le serveur ne peut pas envoyer de push (🔔 masqué) : liste, adresse `/`.
+- Déconnexion : les droits en cache (`/access`) sont oubliés — la clé suivante recharge les siens.
+- Vérifié : `push_selftest` 71/71 ; ponctuellement (scripts hors dépôt) test Node du routeur 25/25 et
+  parcours Chrome headless 27/27, avec `api_prefix` `/api` puis `/v1`.
+
 ## borgHelper 1.0.120 — exploration plus rapide des bases chiffrées — 2026-09-26
 
 Demande utilisateur : accélérer l'exploration d'une archive une fois la base chiffrée (étude, piste 1).

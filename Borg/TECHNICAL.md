@@ -1612,6 +1612,58 @@ sans configuration supplémentaire.
 
 ---
 
+## Adresses partageables de l'UI (`borgHelperWWW` 1.26.0 / UI 1.14.0, `spec-ui-deep-links`)
+
+**Serveur.** `ui_deep_link()` renvoie `_UI_HTML` sur `/serveur/{nick}`, `/historique/{nick}`,
+`/explorer`, `/explorer/{rest:path}`, `/notifications` — sur `app` comme `/` (sans `X-API-Key`,
+`require_user` s'applique via le middleware). Aucune route du routeur ne porte ces noms, même avec
+`API_PREFIX` vide (contrôlé par `push_selftest` sur les routes du routeur sans préfixe : aucune ne
+commence par `/serveur`, `/historique`, `/explorer`, `/notifications` — collision de motifs incluse). Repli `_ui_fallback_404` (gestionnaire de
+`starlette.exceptions.HTTPException`) : sert la page avec un **404** uniquement si aucune route n'a
+correspondu (`'endpoint'` absent du scope — un `HTTPException(404)` levé par une route garde son JSON),
+méthode `GET` et `Accept` contenant `text/html` (navigation navigateur). Tout autre cas délègue au
+gestionnaire FastAPI par défaut : un client API garde `{"detail":"Not Found"}`.
+
+**UI.** Fonctions pures `routePath(état)` (vue → adresse ; `null` pour la connexion, qui n'a pas
+d'adresse) et `parseRoute(pathname, search)` (adresse → `{view, nick, path, archive}` ou
+`{view:'view-machines', invalid:true}`), segments encodés un à un (`encodeURIComponent`, un `%` mal
+formé → invalide). Deux points de synchronisation seulement :
+
+- `showView()` et `loadBrowse()` (partie synchrone, avant tout `await`) appellent `syncUrl()`, qui fait
+  `history.pushState` si l'adresse calculée diffère de la courante — pas de doublon quand
+  `openBrowse()` passe par les deux.
+- `applyRoute()` (démarrage, après `doLogin`, `popstate`) rejoue l'adresse courante. Il attend
+  `versionsReady` (promesse de `loadFooterVersions` : `API_PREFIX`, `allowDestructive`, `pushInfo`
+  connus avant d'ouvrir quoi que ce soit), charge toujours les droits (`myAccess`, sinon
+  `loadMyAccess()` — badges d'en-tête inclus), vérifie le nick (`level!=='none'`, un nick absent =
+  inconnu ; droits indisponibles → on laisse l'API trancher), **puis** pose `routeApplying`, qui
+  neutralise `syncUrl()` pendant l'appel synchrone de `openMachine`/`openHistory`/`loadBrowse`… :
+  rejouer une adresse n'empile jamais d'entrée. Après l'attente, abandon si la clé a disparu (`/access`
+  en 401 → `logout()` a réaffiché la connexion) ou si `routeSeq` a bougé — Précédent/Suivant rapides, ou
+  navigation de l'utilisateur (`syncUrl()` incrémente `routeSeq` à chaque `pushState`). Refus (inconnu
+  ou sans droit, message identique), adresse invalide et `/notifications` sans push disponible →
+  `history.replaceState('/')` + liste. En fin d'application, l'adresse est remplacée par sa forme
+  canonique (`routePath`) : `/serveur/a%3Ab` et `/serveur/a:b` ne créent pas deux entrées.
+  Pendant l'attente, la section de connexion (seule visible par défaut dans le HTML) est masquée.
+
+`doLogin` et `logout` remettent `myAccess` à `null` (droits de la nouvelle clé, jamais ceux de la
+précédente) ; `doLogin` appelle `applyRoute()` au lieu d'afficher la liste ; `logout` ne touche pas
+l'adresse (la connexion suivante y revient).
+
+**Limite connue.** Un nick contenant `/` s'encode `%2F`, mais Starlette décode le chemin avant le
+routage : `/serveur/a%2Fb` ne correspond pas à `/serveur/{nick}` (repli 404 → liste). Sans objet pour
+les nicks réels (noms d'hôtes).
+
+**Vérification.** `push_selftest` (routes, non-masquage, repli 404) ; ponctuellement, par des scripts
+non versionnés (pas de framework de test JS dans ce dépôt) : test Node des fonctions pures (aller-retour
+d'encodage espace/`é`/`#`/`?`/`&`/`%`, archive, adresses invalides) et parcours complet dans Chrome
+headless piloté par CDP, avec `api_prefix` `/api` puis `/v1` (lien sans session → connexion →
+répertoire, rechargement, navigation, 4× Précédent + Suivant sans nouvelle entrée, refus, adresses
+inconnues, archive encodée, copie du lien, adresse non canonique, `/notifications`,
+déconnexion/reconnexion, clé expirée).
+
+---
+
 ## borgHelperWWW — autorisation par groupes (`_check_group_access`)
 
 Appliquée à **toutes** les routes du routeur via `router=APIRouter(dependencies=[Depends(_check_group_access)])`

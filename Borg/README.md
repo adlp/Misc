@@ -1088,7 +1088,8 @@ configurable — **`/api` par défaut** (`GET /lstbkp` devient `GET /api/lstbkp`
 **toujours accessibles sans préfixe**, quel que soit `api_prefix` — c'est la condition pour que la page
 web puisse se charger et apprendre ce préfixe avant de savoir où se trouve le reste de l'API :
 
-- `GET /` (la page web elle-même)
+- `GET /` (la page web elle-même) et ses adresses partageables `GET /serveur/…`, `/explorer/…`,
+  `/historique/…`, `/notifications` (même page — voir [Interface web](#interface-web))
 - `GET /version` (versions + postures de sécurité, y compris `api_prefix` — la page web lit cette
   valeur au chargement et l'utilise pour tous ses appels API ultérieurs)
 - `GET /healthz` (liveness — un superviseur/orchestrateur n'a pas à connaître `api_prefix`)
@@ -1493,6 +1494,33 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
 **Icône du site** (borgHelperWWW ≥ 1.22.0) : un fichier `favicon.ico` posé à côté de
 `borgHelperWWW_ui.html` (sinon à côté de `borgHelperWWW`) est servi sur `/favicon.ico`, sans clé API —
 pris en compte immédiatement, sans redémarrage. Absent : `404`, comme avant.
+
+**Adresses partageables** (borgHelperWWW ≥ 1.26.0, UI ≥ 1.14.0) : l'adresse du navigateur suit la page
+affichée — on peut la recharger, utiliser Précédent/Suivant, ou l'envoyer à un collègue pour lui
+montrer exactement ce dont on parle.
+
+| Adresse | Page |
+|---|---|
+| `/` | Liste des serveurs |
+| `/serveur/<nick>` | Détail d'un serveur |
+| `/explorer/<nick>` | Explorateur, racine |
+| `/explorer/<nick>/<chemin…>` | Explorateur, répertoire `<chemin>` |
+| `/explorer/<nick>/<chemin…>?archive=<nom>` | Explorateur épinglé sur une archive (depuis l'Historique) |
+| `/historique/<nick>` | Historique complet |
+| `/notifications` | Réglages des notifications |
+
+- Bouton **🔗 Copier le lien** à côté de l'étiquette du serveur (détail, explorateur, historique) :
+  copie l'adresse dans le presse-papier (« ✅ Lien copié ») ; si le navigateur le refuse (page en HTTP
+  hors `localhost`…), l'adresse s'affiche dans une fenêtre pour être copiée à la main.
+- **Le lien ne dispense pas de se connecter** : la clé API reste par onglet. Sans session, la page de
+  connexion s'affiche puis, une fois connecté, la page visée — l'adresse est conservée entre-temps.
+- **Le lien n'accorde aucun droit** : ceux du destinataire s'appliquent (`GROUPS_*`, `GROUPS_PATHS`). Un
+  serveur inconnu ou hors de ses droits renvoie à la liste avec le même message dans les deux cas —
+  « Serveur inconnu ou inaccessible avec vos droits : `<nick>` » — sans révéler si ce serveur existe.
+- Adresse inconnue (`/xyz`, `/explorer` sans serveur…) ouverte dans un navigateur : liste des serveurs,
+  adresse remplacée par `/`. Un client API (curl…) reçoit toujours le `404` JSON habituel.
+- Non reflétés dans l'adresse : la recherche de l'explorateur et l'action ouverte dans la page détail.
+- L'interface doit être publiée à la racine du site (pas sous un sous-chemin `https://host/borg/…`).
 
 Cette page HTML elle-même n'est pas protégée par `X-API-Key` (elle ne contient aucun secret — la clé et
 les passphrases ne sont saisies et envoyées que depuis le navigateur, via `fetch()`) ; c'est l'API qui

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.13.4 -->
+<!-- UI_VERSION: 1.14.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -64,6 +64,7 @@
   .pill{font-size:11px;color:var(--muted)}
   /* Étiquette du serveur en cours (détail, Historique complet, explorateur) — remplace les anciens
      boutons « ← Serveurs » / « ← Retour au serveur » ; retour à la liste : bouton « Serveurs » de l'en-tête. */
+  .copy-link-btn{margin:0 0 12px 8px;padding:5px 10px;font-size:12px}
   .nick-label{display:inline-block;margin-bottom:12px;padding:6px 12px;border-radius:14px;
     background:#eef1f5;color:var(--text);font-weight:600}
   .actions-layout{display:flex;gap:20px;flex-wrap:wrap}
@@ -157,6 +158,7 @@
   <!-- VIEW 3 : MACHINE DETAIL -->
   <section id="view-detail" hidden>
     <span class="nick-label" title="Serveur en cours — « Serveurs » (en-tête) pour revenir à la liste"></span>
+    <button class="secondary copy-link-btn" title="Copier l'adresse de cette page (à partager : un collègue ayant les droits arrive directement ici)">🔗 Copier le lien</button>
     <div class="card">
       <div class="machine-head">
         <h2 id="detailTitle" style="margin:0"></h2>
@@ -181,6 +183,7 @@
   <!-- VIEW 4 : TREE BROWSER -->
   <section id="view-browse" hidden>
     <span class="nick-label" title="Serveur en cours — « Serveurs » (en-tête) pour revenir à la liste"></span>
+    <button class="secondary copy-link-btn" title="Copier l'adresse de cette page (à partager : un collègue ayant les droits arrive directement ici)">🔗 Copier le lien</button>
     <div class="card">
       <div class="machine-head">
         <h2 id="browseTitle" style="margin:0"></h2>
@@ -211,6 +214,7 @@
   <!-- VIEW 5 : HISTORIQUE COMPLET -->
   <section id="view-history" hidden>
     <span class="nick-label" title="Serveur en cours — « Serveurs » (en-tête) pour revenir à la liste"></span>
+    <button class="secondary copy-link-btn" title="Copier l'adresse de cette page (à partager : un collègue ayant les droits arrive directement ici)">🔗 Copier le lien</button>
     <div class="card">
       <h2 style="margin-top:0">Évolution</h2>
       <div style="margin-bottom:24px">
@@ -363,7 +367,10 @@ function applyBadges(){
 
 // Versions + postures de sécurité chargées au démarrage de borgHelperWWW (endpoint public, non
 // protégé par X-API-Key, comme la page elle-même) — affichées avant même la connexion.
-(async function loadFooterVersions(){
+// versionsReady : applyRoute l'attend — API_PREFIX, allowDestructive et pushInfo doivent être connus
+// avant d'ouvrir une page depuis son adresse (sinon /access part sur '/api' par défaut, et les actions
+// destructives s'affichent avant que la posture du serveur soit connue).
+const versionsReady=(async function loadFooterVersions(){
   try{
     const r=await fetch('/version');
     if(!r.ok) return;
@@ -421,6 +428,7 @@ function showView(id){
   });
   currentViewId=id;
   document.querySelectorAll('.nick-label').forEach(el=>{ el.textContent='🖥 '+(currentNick||''); });
+  syncUrl();
   document.getElementById('logoutBtn').hidden=(id==='view-login');
   document.getElementById('serversBtn').hidden=(id==='view-login'||id==='view-machines');
   document.getElementById('headerSub').textContent = id==='view-login' ? 'non connecté' :
@@ -438,6 +446,7 @@ function updateNotifBtn(){
 
 function logout(){
   clearApiKey();
+  myAccess=null;
   sessionStorage.removeItem(SS_PASS);
   showView('view-login');
   document.getElementById('apiKeyInput').value='';
@@ -489,8 +498,8 @@ async function doLogin(){
     errEl.textContent = r.httpStatus===0 ? r.stderr : 'Clé API invalide.';
     return;
   }
-  showView('view-machines');
-  loadMachines();
+  myAccess=null;  // droits de la NOUVELLE clé, jamais ceux d'une session précédente
+  applyRoute();   // l'adresse demandée (lien partagé) survit à la connexion
 }
 
 document.getElementById('apiKeyInput').addEventListener('keydown', e=>{ if(e.key==='Enter') doLogin(); });
@@ -1214,6 +1223,7 @@ async function loadBrowse(){
   // répertoire ou d'un AUTRE serveur que celui actuellement affiché à l'écran.
   const seq=++browseLoadSeq;
   const reqNick=browseNick, reqPath=browsePath, reqArchive=browseArchive;
+  syncUrl();
   const hint=document.getElementById('browsePinnedHint');
   if(reqArchive){
     document.getElementById('browseTitle').textContent=reqNick+' — archive '+reqArchive+' — '+(reqPath||'/');
@@ -1726,15 +1736,116 @@ function escapeHtml(s){
 }
 function escapeAttr(s){ return escapeHtml(s); }
 
+// ── Adresses partageables (spec-ui-deep-links, UI 1.14.0) ─────────────────────
+// Adresses : / · /serveur/<nick> · /explorer/<nick>/<chemin…>[?archive=<nom>] · /historique/<nick> ·
+// /notifications (servies par borgHelperWWW). La page de connexion n'a pas d'adresse : celle demandée
+// est conservée et appliquée après connexion. routePath/parseRoute sont pures (testables sous Node sans DOM).
+function routePath(st){
+  const e=encodeURIComponent;
+  switch(st.view){
+    case 'view-machines': return '/';
+    case 'view-detail': return '/serveur/'+e(st.nick);
+    case 'view-history': return '/historique/'+e(st.nick);
+    case 'view-notifications': return '/notifications';
+    case 'view-browse':
+      return '/explorer/'+e(st.nick)
+        +(st.path?'/'+String(st.path).split('/').filter(Boolean).map(e).join('/'):'')
+        +(st.archive?'?archive='+e(st.archive):'');
+    default: return null;  // connexion : l'adresse ne change pas
+  }
+}
+function parseRoute(pathname,search){
+  let segs;
+  try{ segs=String(pathname||'/').split('/').filter(Boolean).map(decodeURIComponent); }
+  catch(e){ return {view:'view-machines',invalid:true}; }  // encodage invalide (%E0…)
+  const [head,nick,...rest]=segs;
+  if(segs.length===0) return {view:'view-machines'};
+  if(head==='serveur' && nick && segs.length===2) return {view:'view-detail',nick};
+  if(head==='historique' && nick && segs.length===2) return {view:'view-history',nick};
+  if(head==='notifications' && segs.length===1) return {view:'view-notifications'};
+  if(head==='explorer' && nick)
+    return {view:'view-browse',nick,path:rest.join('/'),archive:new URLSearchParams(search||'').get('archive')||null};
+  return {view:'view-machines',invalid:true};
+}
+
+let routeApplying=false;  // vrai pendant qu'une adresse est rejouée : aucune nouvelle entrée d'historique
+let routeSeq=0;           // numéro de la dernière application d'adresse / navigation utilisateur
+function currentRoutePath(){
+  return routePath({view:currentViewId,nick:currentViewId==='view-browse'?browseNick:currentNick,
+                    path:browsePath,archive:browseArchive});
+}
+function syncUrl(){
+  if(routeApplying) return;
+  const url=currentRoutePath();
+  if(url!==null && url!==location.pathname+location.search){
+    history.pushState(null,'',url);
+    routeSeq++;  // navigation de l'utilisateur : une application d'adresse en attente (/access) devient obsolète
+  }
+}
+
+// Serveur accessible ? /access (droits réels). Inconnu et sans droit : même réponse (ne révèle pas
+// l'existence d'un serveur). Droits indisponibles : on laisse passer, l'API refuse de toute façon (403).
+async function nickAccessible(nick){
+  const a=myAccess||await loadMyAccess();
+  if(!a||!a.nicks) return true;
+  const n=a.nicks[nick];
+  return !!n && n.level!=='none';
+}
+
+async function applyRoute(){
+  if(!getApiKey()){ showView('view-login'); return; }
+  const seq=++routeSeq;
+  if(currentViewId==='view-login') document.getElementById('view-login').hidden=true; // pas de formulaire fantôme pendant l'attente
+  const r=parseRoute(location.pathname,location.search);
+  await versionsReady;
+  // Droits toujours chargés (badges d'en-tête, contrôle du nick) — même pour /notifications.
+  const ok=(myAccess||await loadMyAccess(), !r.nick || await nickAccessible(r.nick));
+  if(!getApiKey()) return;    // /access en 401 : logout() a déjà réaffiché la connexion
+  if(seq!==routeSeq) return;  // Précédent/Suivant rapides ou clic de l'utilisateur entre-temps : obsolète
+  routeApplying=true;  // posé APRÈS l'attente : une navigation de l'utilisateur pendant /access reste enregistrée
+  try{
+    if(r.invalid || (r.view==='view-notifications' && !pushInfo.available)){
+      history.replaceState(null,'','/'); showMachines(); return;  // 🔔 masqué : pas de page de réglages non plus
+    }
+    if(!ok){
+      history.replaceState(null,'','/');
+      showMachines();
+      document.getElementById('machinesError').textContent='Serveur inconnu ou inaccessible avec vos droits : '+r.nick;
+      return;
+    }
+    switch(r.view){
+      case 'view-detail': openMachine(r.nick); break;
+      case 'view-history': openHistory(r.nick); break;
+      case 'view-notifications': openNotifications(); break;
+      case 'view-browse':
+        currentNick=r.nick; browseNick=r.nick; browsePath=r.path; browseArchive=r.archive;
+        showView('view-browse'); loadBrowse(); break;
+      default: showMachines();
+    }
+    // Forme canonique de l'adresse (ex. « : » → « %3A ») : sans ça, la prochaine synchro de la même
+    // page verrait une adresse différente et empilerait une entrée en double.
+    const canon=currentRoutePath();
+    if(canon!==null && canon!==location.pathname+location.search) history.replaceState(null,'',canon);
+  } finally { routeApplying=false; }
+}
+window.addEventListener('popstate',()=>{ applyRoute(); });
+
+// « 🔗 Copier le lien » : presse-papier, sinon (page non sécurisée, refus) adresse affichée à copier.
+document.addEventListener('click',async e=>{
+  const btn=e.target.closest('.copy-link-btn'); if(!btn) return;
+  const url=location.href;
+  btn.dataset.label=btn.dataset.label||btn.textContent;  // libellé d'origine, même après un double clic
+  try{
+    await navigator.clipboard.writeText(url);
+    btn.textContent='✅ Lien copié';
+    clearTimeout(btn._t); btn._t=setTimeout(()=>{ btn.textContent=btn.dataset.label; },2000);
+  }catch(err){ window.prompt('Copier cette adresse :',url); }
+});
+
 // ── Boot ──────────────────────────────────────────────────────────────────
 
 (function boot(){
-  if(getApiKey()){
-    showView('view-machines');
-    loadMachines();
-  } else {
-    showView('view-login');
-  }
+  applyRoute();  // adresse courante : page visée si connecté, sinon connexion (adresse conservée)
 })();
 </script>
 </body>
