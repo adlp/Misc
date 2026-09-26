@@ -1,5 +1,29 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.18.4 — borgHelperWWW configurable depuis .borghelperrc — 2026-09-26
+
+`spec-borghelperrc-www-section` : suite directe de la garde 1.18.3 — il existe désormais un moyen
+légitime de faire ce que l'admin visait avec le piège original (poser `GROUPS_HEADER` dans le même
+fichier que la CLI) : une section `[DEFAULT.borghelperwww]` dans le `.borghelperrc` dédié à l'API.
+
+- Nouvelle section `[DEFAULT.borghelperwww]` (section `configparser` **ordinaire** — seul le nom
+  exact `DEFAULT` a un sens spécial ; celle-ci n'hérite de rien, nom choisi pour ne jamais collisionner
+  avec un nom de nick réel) : mêmes clés que `borghelperwww.conf` (`_CONF_KEYS` — `api_key`,
+  `groups_header`, `host`, `port`, etc.).
+- Priorité : flag CLI > variable d'environnement `BORGHELPERWWW_*` > `borghelperwww.conf`
+  (`--conf`/`BORGHELPERWWW_CONF`, inchangé) > `.borghelperrc[DEFAULT.borghelperwww]` (nouveau, dernier
+  repli) > défauts. `borghelperwww.conf` garde la main quand présent — déploiements existants non
+  affectés.
+- `_apply_conf_section()` (factorisée) : même logique de remplissage `os.environ` partagée par
+  `borghelperwww.conf` et la nouvelle section — un seul patron, deux sources.
+- La garde `_warn_stray_borghelperwww_keys()` (1.18.3) ne scanne que le `[DEFAULT]` réel
+  (`cp.defaults()`) — `[DEFAULT.borghelperwww]` est une section distincte, jamais confondue avec le
+  piège, aucun faux positif sur ce nouveau mécanisme légitime (vérifié).
+- `push_selftest` : nouveau contrôle dédié (28/28 OK). Vérifié en réel : résolution de `GROUPS_HEADER`
+  depuis `.borghelperrc[DEFAULT.borghelperwww]`, garde toujours silencieuse dessus, garde toujours
+  active sur le piège original (`[DEFAULT]` nu), et priorité `borghelperwww.conf` > `.borghelperrc`
+  confirmée sur les trois scénarios.
+
 ## borgHelperWWW 1.18.3 — garde contre BORGHELPERWWW_* égarée dans .borghelperrc — 2026-09-26
 
 Piège réel constaté en production : un admin a posé `BORGHELPERWWW_GROUPS_HEADER=X-GROUPS` dans

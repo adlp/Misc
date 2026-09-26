@@ -943,7 +943,7 @@ et fonctionne quand même (y compris `/push/subscribe` en CRUD), seul l'envoi pu
 
 ### Configuration
 
-Trois façons de configurer, cumulables — par ordre de priorité (la première présente l'emporte) :
+Quatre façons de configurer, cumulables — par ordre de priorité (la première présente l'emporte) :
 
 1. **Option CLI** (`python3 borgHelperWWW ...` en exécution directe uniquement — sous
    `uvicorn borgHelperWWW:app`, uvicorn possède seul `sys.argv`)
@@ -951,13 +951,19 @@ Trois façons de configurer, cumulables — par ordre de priorité (la première
 3. **Fichier de conf** `BORGHELPERWWW_CONF` / `--conf` (ini, un seul fichier pour tous les réglages
    ci-dessous — voir [`borghelperwww.conf.example`](borghelperwww.conf.example) ; comble uniquement
    ce qui n'est pas déjà réglé par une option CLI ou une variable d'environnement)
+4. **Section `[DEFAULT.borghelperwww]` du `.borghelperrc`** dédié à l'API (`-C`/`BORGHELPERWWW_CFGFILE`
+   ci-dessous) — dernier repli, même jeu de clés que le fichier de conf ci-dessus (`groups_header`,
+   `api_key`, `host`, `port`, etc., en minuscule). Permet un déploiement à **fichier unique** : pas
+   besoin de `borghelperwww.conf` séparé si tout tient dans le `.borghelperrc` déjà là pour la CLI.
+   Section `configparser` **ordinaire** (seul le nom exact `DEFAULT` a un sens spécial), choisie pour
+   ne jamais collisionner avec un nom de nick réel.
 
-⚠️ **Jamais dans `.borghelperrc`** : ce fichier (`-C`/`BORGHELPERWWW_CFGFILE` ci-dessous) est lu par
-`borgHelper` (CLI, réglages par nick) — une clé `BORGHELPERWWW_*` posée dans son `[DEFAULT]` est
-silencieusement ignorée par `borgHelperWWW` (aucune erreur). Piège réel constaté : `GROUPS_HEADER`
-ainsi posé laisse le RBAC désactivé sans le savoir (accès total pour tout `X-API-Key` valide) —
-`borgHelperWWW` avertit désormais (`[WARN]` au démarrage) si une clé `BORGHELPERWWW_*` traîne dans
-`[DEFAULT]` de `.borghelperrc`.
+⚠️ **Jamais une clé `BORGHELPERWWW_*` nue dans `[DEFAULT]`** de `.borghelperrc` (ce fichier est lu par
+`borgHelper`, CLI, réglages par nick) — silencieusement ignorée par `borgHelperWWW` (aucune erreur).
+Piège réel constaté : `BORGHELPERWWW_GROUPS_HEADER` ainsi posé laisse le RBAC désactivé sans le savoir
+(accès total pour tout `X-API-Key` valide). `borgHelperWWW` avertit (`[WARN]` au démarrage) si une clé
+`BORGHELPERWWW_*` traîne dans `[DEFAULT]` — utiliser `[DEFAULT.borghelperwww]` (clés en minuscule, sans
+préfixe, point 4 ci-dessus) à la place.
 
 | Variable d'environnement | Option CLI | Clé fichier de conf | Rôle |
 |---------------------------|------------|----------------------|------|
