@@ -49,21 +49,29 @@ KEEP_YEARLY      = 2
 
 # Backup
 EXCLUDE          = --exclude /proc --exclude /sys --exclude /dev --exclude /tmp --exclude /run
-EXCLUDE_NEXT     = --exclude /var/cache          # exclusions complémentaires optionnelles
-BORG_ARCHNAME    = root                          # partie centrale du nom d'archive
-BORG_ROOTBKP     = /                             # répertoire racine sauvegardé
+# exclusions complémentaires optionnelles
+EXCLUDE_NEXT     = --exclude /var/cache
+# partie centrale du nom d'archive
+BORG_ARCHNAME    = root
+# répertoire racine sauvegardé
+BORG_ROOTBKP     = /
 
 # Affichage rapport
-MAX_AGE_BKP      = 25                            # alerte si dernière sauvegarde > N heures (défaut 25)
-DISPLAY_BKP      = 5                             # nombre de sauvegardes affichées dans Report
+# alerte si dernière sauvegarde > N heures (défaut 25)
+MAX_AGE_BKP      = 25
+# nombre de sauvegardes affichées dans Report
+DISPLAY_BKP      = 5
 
 # SSH avancé (backup distant)
-SSH_REPO         = repo01:/mnt/borg/mon-serveur  # BORG_REPO côté serveur sauvegardé
-SSH_REMFO        = 8022:localhost:22             # tunnel inverse SSH
+# BORG_REPO côté serveur sauvegardé
+SSH_REPO         = repo01:/mnt/borg/mon-serveur
+# tunnel inverse SSH
+SSH_REMFO        = 8022:localhost:22
 SSH_KEY          = /root/.ssh/id_borg
 
 # Identifiant SQLite (optionnel — surcharge le nick dans le nom des fichiers DB)
-DB_NAME          = mon-serveur-home              # → borghelperrc-mon-serveur-home-cache.db
+# -> borghelperrc-mon-serveur-home-cache.db / -diff.db
+DB_NAME          = mon-serveur-home
 
 # Désactiver l'indexation pour ce dépôt (Search/FileHist/DuIdx non disponibles)
 NOIDX            = 1
@@ -83,10 +91,12 @@ NOIDX            = 1
 # Logique : IDX_INCLUDE (liste blanche) ET IDX_EXCLUDE (liste noire) sont cumulatifs.
 # Un chemin est indexé si : (aucun INCLUDE défini OU matche un INCLUDE)
 #                        ET (aucun EXCLUDE défini OU ne matche aucun EXCLUDE)
-IDX_INCLUDE      = /etc /home /root              # liste blanche — seuls ces chemins indexés
+# liste blanche — seuls ces chemins indexés
+IDX_INCLUDE      = /etc /home /root
+# liste noire (valeur multiligne : lignes de continuation indentées)
 IDX_EXCLUDE      = /proc /sys /tmp /var/log
     /var/lib/docker /home/*/.cache
-    *.bak *.pyc /home/*/.bash_history            # liste noire
+    *.bak *.pyc /home/*/.bash_history
 
 # Parallélisation de l'indexation (nombre de borg diff simultanés, défaut 4)
 IDX_WORKERS      = 4
@@ -162,8 +172,10 @@ sont laissés tels quels.
 
 ```ini
 [DEFAULT]
-DB_ENCRYPT = true       # défaut. false/no/off/0 pour désactiver (globalement ou pour un seul nick)
-DB_KDF     = standard   # light | standard (défaut) | strong — coût de dérivation de la clé
+# true par défaut ; false/no/off/0 pour désactiver (globalement ou pour un seul nick)
+DB_ENCRYPT = true
+# light | standard (défaut) | strong — coût de dérivation de la clé
+DB_KDF     = standard
 ```
 
 `DB_ENCRYPT=true` (défaut) ne fait rien tout seul : une base créée par `Bkp`/`Index` reste `plain` tant qu'on n'a pas
