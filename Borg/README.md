@@ -1750,7 +1750,7 @@ curl -X PATCH http://localhost:8000/api/push/subscribe -H "X-API-Key: $KEY" -H "
 curl -X POST "http://localhost:8000/api/push/test?endpoint=https://push.example.com/ep1" -H "X-API-Key: $KEY"
 # {"sent": true} — envoie une notification de TEST à ce seul abonnement (payload event:"test") ;
 # 404 endpoint inconnu, 410 abonnement mort côté navigateur (supprimé), 502 service push en erreur,
-# 503 envoi indisponible sur ce serveur (pywebpush/py_vapid absents)
+# 503 envoi indisponible sur ce serveur (vendor/ ou paquets apt manquants — voir le [WARN] au démarrage)
 
 curl -X DELETE "http://localhost:8000/api/push/subscribe?endpoint=https://push.example.com/ep1" -H "X-API-Key: $KEY"
 # {"deleted": true} — un endpoint déjà absent renvoie {"deleted": false}, jamais un 404 bruyant

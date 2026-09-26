@@ -1,5 +1,21 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.20.1 — avertissements push précis, plus jamais « pip install » — 2026-09-26
+
+Rapport utilisateur : au démarrage, `[WARN] py_vapid absent ... 'pip3 install pywebpush'` — conseil
+contraire au choix de déploiement (aucun pip/venv, dépendances push vendorisées dans `vendor/` depuis
+1.18.2). Cause réelle : `vendor/` absent du déploiement.
+
+- Nouveaux `[WARN]` (import de `pywebpush`, génération des clés VAPID) : diagnostic précis au lieu de
+  pip — dossier `vendor/` introuvable (chemin attendu affiché), module vendorisé manquant dans
+  `vendor/` (copie partielle), ou dépendance système absente (`apt install python3-cryptography` /
+  `python3-aiohttp` / `python3-requests`).
+- `POST /push/test` : message 503 renvoyant au `[WARN]` de démarrage.
+- DEPLOIEMENT.md : rappel de déployer `vendor/` avec `borgHelperWWW`.
+- Vérifié en simulant un serveur sans ces bibliothèques installées globalement : sans `vendor/`,
+  `vendor/` partiel, `cryptography` absent → message attendu ; `vendor/` complet → aucun
+  avertissement, push disponible sans pip.
+
 ## borgHelperWWW 1.20.0 / borgHelperWWW_ui.html 1.11.0 — accès direct par GROUPS_PATHS, sans tier — 2026-09-26
 
 Demande utilisateur : `GROUPS_ADMIN`/`GROUPS_WRITE`/`GROUPS_READ` équivalent à un accès racine aux

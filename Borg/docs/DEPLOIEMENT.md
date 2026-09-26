@@ -27,6 +27,11 @@ pour eux** : un `git pull`/déploiement du dépôt complet suffit une fois les t
 ci-dessus installés. Si l'admin ne fait pas cet `apt install`, `borgHelperWWW` démarre quand même —
 les notifications push sont simplement désactivées (avertissement au démarrage).
 
+⚠️ **Déployer `vendor/` avec `borgHelperWWW`** (même répertoire) — une copie manuelle limitée à
+`borgHelperWWW` et au HTML l'oublie facilement. Le `[WARN]` de démarrage dit exactement ce qui manque
+(≥ 1.20.1) : dossier `vendor/` introuvable, module vendorisé absent de `vendor/`, ou paquet apt à
+installer — jamais un `pip install`.
+
 ## 2. Récupérer le projet
 
 Déployer l'arborescence `Borg/` complète (y compris `vendor/`) à l'emplacement choisi, par exemple

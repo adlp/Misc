@@ -19,11 +19,14 @@ from pydantic import BaseModel, Field
 # (PyPI-only, contrairement à leurs propres dépendances aiohttp/requests/cryptography, toutes dans
 # les dépôts apt) — copie figée des wheels dans le repo pour éviter tout pip/venv en production, voir
 # vendor/README.md. Inséré AVANT le try/except ci-dessous pour que l'import le trouve en premier.
-sys.path.insert(0,str(Path(__file__).resolve().parent/'vendor'))
+_VENDOR_DIR=Path(__file__).resolve().parent/'vendor'
+sys.path.insert(0,str(_VENDOR_DIR))
+_PUSH_IMPORT_ERROR=None
 try:
     from pywebpush import webpush, WebPushException
     _PYWEBPUSH_AVAILABLE=True
-except ImportError:
+except ImportError as _e:
+    _PUSH_IMPORT_ERROR=_e
     # Dépendance optionnelle malgré le vendoring : aiohttp/requests/cryptography (dépendances de
     # pywebpush, apt externes jamais vendorisées) peuvent manquer si `apt install` n'a pas été fait —
     # le serveur démarre quand même, seul l'envoi push est désactivé (_send_bkp_push court-circuite,
@@ -32,6 +35,26 @@ except ImportError:
     class WebPushException(Exception): pass  # jamais levée réellement (webpush() jamais appelée si None)
     _PYWEBPUSH_AVAILABLE=False
 
+_VENDORED_PUSH_MODULES=('pywebpush','py_vapid','http_ece')
+
+def _push_deps_hint(err):
+    """Explique précisément pourquoi l'envoi push est indisponible, sans jamais renvoyer vers pip
+    (choix de déploiement : aucun pip/venv en production, spec-push-vendoring). Trois cas : dossier
+    vendor/ absent du déploiement ; un module vendorisé manquant dans vendor/ (copie partielle) ; une
+    dépendance système absente (paquet apt à installer)."""
+    missing=getattr(err,'name',None) or ''
+    if missing.split('.')[0] in _VENDORED_PUSH_MODULES:
+        if not _VENDOR_DIR.is_dir():
+            return (f"dossier vendor/ introuvable ({_VENDOR_DIR}) — le déployer avec borgHelperWWW "
+                    f"(il fait partie du dépôt, aucun pip requis)")
+        return (f"module vendorisé '{missing}' absent de {_VENDOR_DIR} — redéployer vendor/ en entier "
+                f"depuis le dépôt (aucun pip requis)")
+    apt={'aiohttp':'python3-aiohttp','requests':'python3-requests','cryptography':'python3-cryptography'}
+    pkg=apt.get(missing.split('.')[0])
+    if pkg: return f"dépendance système '{missing}' absente — 'apt install {pkg}'"
+    return (f"import impossible ({err}) — paquets système requis : 'apt install python3-aiohttp "
+            f"python3-requests python3-cryptography' ; vendor/ attendu dans {_VENDOR_DIR}")
+
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail,
                          DbKeyError, DbTamperError, DbCodecError)
@@ -39,7 +62,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.20.0"
+WWW_VERSION="1.20.1"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -358,10 +381,8 @@ _bkp_watcher_task=None
 async def _start_bkp_status_watcher():
     global _bkp_watcher_task
     if not _PYWEBPUSH_AVAILABLE:
-        print("[WARN] pywebpush absent — notifications push désactivées (abonnements/API restent "
-              "fonctionnels, mais aucun envoi réel n'aura lieu). "
-              "'pip3 install pywebpush' (ou dans un venv dédié) pour les activer.",
-              file=sys.stderr,flush=True)
+        print("[WARN] notifications push désactivées (abonnements/API restent fonctionnels, aucun "
+              f"envoi réel) : {_push_deps_hint(_PUSH_IMPORT_ERROR)}",file=sys.stderr,flush=True)
     _bkp_watcher_task=asyncio.create_task(_bkp_status_watcher())
 
 @app.on_event("shutdown")
@@ -942,9 +963,8 @@ def _init_vapid_keys():
     try:
         return _load_or_generate_vapid_keys(conn)
     except ImportError as e:
-        print(f"[WARN] py_vapid absent — impossible de générer les clés VAPID (notifications push "
-              f"désactivées tant que la lib n'est pas installée). 'pip3 install pywebpush' (qui "
-              f"l'inclut en dépendance transitive) pour les activer. ({e})",file=sys.stderr,flush=True)
+        print(f"[WARN] clés VAPID non générées, notifications push désactivées : {_push_deps_hint(e)}",
+              file=sys.stderr,flush=True)
         return None,None
     finally:
         conn.close()
@@ -2494,7 +2514,7 @@ def push_subscriptions(endpoint: str, x_api_key: Optional[str]=Header(default=No
 def push_test(endpoint: str, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     if not _PYWEBPUSH_AVAILABLE or PUSH_VAPID_PRIVATE_KEY is None:
-        raise HTTPException(503,detail="Envoi push indisponible sur ce serveur (pywebpush/py_vapid absents — voir le [WARN] au démarrage)")
+        raise HTTPException(503,detail="Envoi push indisponible sur ce serveur (voir le [WARN] au démarrage de borgHelperWWW)")
     row=_push_row(endpoint)
     if row is None:
         raise HTTPException(404,detail="Aucun abonnement pour cet endpoint")
