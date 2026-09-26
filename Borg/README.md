@@ -924,16 +924,18 @@ Toutes les commandes sont exposées **sauf `Mount`/`UMount`** (accès FUSE local
 
 ```bash
 pip install fastapi uvicorn pydantic
-pip install pywebpush   # OPTIONNEL (Story 2a/2b, spec-notifications-push) : clés VAPID (py_vapid,
-                        # dépendance transitive) et envoi push réel — confiné à borgHelperWWW (AD-5),
-                        # borgHelper (CLI) reste stdlib-only. `cryptography` (transitive elle aussi)
-                        # est en plus importée et utilisée directement (sérialisation de la clé
-                        # publique VAPID en format X962 non compressé) — pas seulement transitive.
-                        # Absent : borgHelperWWW démarre et fonctionne normalement (y compris
-                        # /push/subscribe en CRUD), seul l'envoi push réel est désactivé (avertissement
-                        # au démarrage). N'est un paquet d'aucun dépôt apt — PyPI-only, `pip3 install`
-                        # (ou venv dédié sur Ubuntu ≥23.04, PEP 668) requis pour l'activer.
+apt install python3-aiohttp python3-requests python3-cryptography  # OPTIONNEL (notifications push,
+    # spec-notifications-push) : dépendances de pywebpush, toutes dans les dépôts apt Ubuntu.
+    # `cryptography` est en plus importée et utilisée directement par borgHelperWWW (sérialisation de
+    # la clé publique VAPID en format X962 non compressé) — pas seulement transitive.
 ```
+
+`pywebpush`/`py_vapid`/`http_ece` eux-mêmes ne sont des paquets d'aucun dépôt apt (PyPI-only) —
+**vendorisés** dans `vendor/` (`spec-push-vendoring`, voir `vendor/README.md`), donc **aucun `pip
+install`/venv requis pour eux** : un `git pull` suffit une fois `python3-aiohttp`/`python3-requests`/
+`python3-cryptography` installés via apt ci-dessus. Absents (apt non fait) : `borgHelperWWW` démarre
+et fonctionne quand même (y compris `/push/subscribe` en CRUD), seul l'envoi push réel est désactivé
+(avertissement au démarrage).
 
 `borgHelperWWW.py` (symlink vers `borgHelperWWW`, même principe que `borgHelper.py`) doit être présent
 à côté du script : `uvicorn borgHelperWWW:app` importe le module par son nom et échoue sans l'extension

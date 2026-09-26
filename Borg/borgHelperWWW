@@ -14,14 +14,20 @@ from collections import defaultdict
 from fastapi import FastAPI, APIRouter, Header, HTTPException, Query, Request, Depends
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
+
+# vendor/ (spec-push-vendoring) : pywebpush/py_vapid/http_ece ne sont des paquets d'aucun dépôt apt
+# (PyPI-only, contrairement à leurs propres dépendances aiohttp/requests/cryptography, toutes dans
+# les dépôts apt) — copie figée des wheels dans le repo pour éviter tout pip/venv en production, voir
+# vendor/README.md. Inséré AVANT le try/except ci-dessous pour que l'import le trouve en premier.
+sys.path.insert(0,str(Path(__file__).resolve().parent/'vendor'))
 try:
     from pywebpush import webpush, WebPushException
     _PYWEBPUSH_AVAILABLE=True
 except ImportError:
-    # pywebpush n'est pas un paquet apt (PyPI-only) — absent par défaut sur beaucoup d'installs.
-    # Dépendance optionnelle : le serveur démarre quand même, seul l'envoi push est désactivé
-    # (_send_bkp_push court-circuite, voir plus bas) plutôt qu'un crash dur de tout borgHelperWWW
-    # pour une fonctionnalité opt-in que l'admin n'utilise peut-être pas.
+    # Dépendance optionnelle malgré le vendoring : aiohttp/requests/cryptography (dépendances de
+    # pywebpush, apt externes jamais vendorisées) peuvent manquer si `apt install` n'a pas été fait —
+    # le serveur démarre quand même, seul l'envoi push est désactivé (_send_bkp_push court-circuite,
+    # voir plus bas) plutôt qu'un crash dur de tout borgHelperWWW pour une fonctionnalité opt-in.
     webpush=None
     class WebPushException(Exception): pass  # jamais levée réellement (webpush() jamais appelée si None)
     _PYWEBPUSH_AVAILABLE=False
@@ -33,7 +39,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.18.1"
+WWW_VERSION="1.18.2"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul

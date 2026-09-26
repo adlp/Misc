@@ -1,5 +1,25 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.18.2 — pywebpush/py_vapid/http_ece vendorisés — 2026-09-26
+
+`spec-push-vendoring` : les notifications push (spec-notifications-push) sont maintenant réellement
+utilisables en production sans `pip`/`venv`. `pywebpush`/`py_vapid`/`http_ece` (PyPI-only, aucun paquet
+apt Ubuntu) sont vendorisés dans `Borg/vendor/` — copie strictement fidèle des wheels 2.5.0/1.9.4/1.2.1
+(purs Python, aucune extension compilée, ~240 Ko, licences MPL-2.0/MPL-2.0/MIT préservées). Leurs
+propres dépendances lourdes (`aiohttp`/`requests`/`cryptography`) restent des paquets apt externes
+(déjà présents dans les dépôts Ubuntu jammy) — jamais vendorisées.
+
+- `sys.path.insert(0,str(Path(__file__).resolve().parent/'vendor'))` ajouté juste avant les imports
+  optionnels `pywebpush`/`py_vapid` (mêmes conditions de fallback qu'en 1.18.1 : `aiohttp`/`requests`/
+  `cryptography` absents = démarrage quand même, notifications désactivées).
+- Installation désormais : `apt install python3-aiohttp python3-requests python3-cryptography` +
+  `git pull` — plus jamais de `pip install pywebpush` ni de venv.
+- Vérifié en masquant temporairement les paquets pip installés (`pywebpush`/`py_vapid`/`http_ece` retirés
+  de `site-packages`) : import réussi, clés VAPID générées, `push_selftest` 26/26 OK — uniquement via
+  `Borg/vendor/`, confirmé par `pywebpush.__file__`/`py_vapid.__file__` pointant vers ce dossier.
+- Mise à jour future du code vendorisé : manuelle, sur CVE/bug rapporté uniquement (voir
+  `vendor/README.md`).
+
 ## borgHelper 1.0.112 — TreeFind : recherche par nom insensible à la casse — 2026-09-26
 
 `_treefind_listing` comparait le nom (dernier segment du chemin) au motif `-m` via

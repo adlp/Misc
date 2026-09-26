@@ -2328,23 +2328,39 @@ un envoi réel. Fichier SQLite **dédié**, jamais `scopecache.db` (AD-6) : cont
 (cache reconstructible à volonté), `push.db` porte les clés VAPID et les abonnements eux-mêmes — une
 perte n'est **pas** récupérable.
 
-`pywebpush` (`borgHelperWWW` 1.18.1) est une **dépendance optionnelle** : `import pywebpush` en tête
-de fichier est en `try/except ImportError`, absent → `_PYWEBPUSH_AVAILABLE=False`, `webpush=None`.
-Ni `push.db` (CRUD des abonnements, `/push/subscribe`) ni le reste de `borgHelperWWW` n'en dépendent
-pour démarrer — seul `_send_bkp_push` court-circuite (`return` immédiat, aucun envoi, aucune
-exception) tant que la lib n'est pas installée. Un `[WARN]` au démarrage (stderr) le signale et
-recommande `pip3 install pywebpush`. Raison : `pywebpush` n'est un paquet d'aucun dépôt apt
-(PyPI-only), donc pas forcément présent sur un hôte de production qui n'a jamais eu besoin d'installer
-de dépendances Python hors stdlib pour `borgHelper` (CLI) lui-même.
+`pywebpush` (`borgHelperWWW` 1.18.1, vendoring en 1.18.2) est traitée comme une **dépendance
+optionnelle** côté code, même si elle est désormais vendorisée par défaut (voir plus bas) :
+`import pywebpush` en tête de fichier est en `try/except ImportError`, absent →
+`_PYWEBPUSH_AVAILABLE=False`, `webpush=None`. Ni `push.db` (CRUD des abonnements, `/push/subscribe`)
+ni le reste de `borgHelperWWW` n'en dépendent pour démarrer — seul `_send_bkp_push` court-circuite
+(`return` immédiat, aucun envoi, aucune exception) tant qu'elle n'est pas disponible. Un `[WARN]` au
+démarrage (stderr) le signale.
 
-Même traitement pour `py_vapid` (dépendance transitive de `pywebpush`, mais importée directement dans
-`_generate_and_store_vapid_keys` — pas garanti co-présent si quelqu'un installe les deux séparément) :
-`_init_vapid_keys()` (appelée sans garde au niveau module, `PUSH_VAPID_PRIVATE_KEY,PUSH_VAPID_PUBLIC_KEY
-=_init_vapid_keys()`) capture `ImportError` et retourne `None,None`. **Nuance importante** :
-`_load_or_generate_vapid_keys` relit une paire déjà stockée dans `push_vapid_keys` (id=1) sans jamais
-importer `py_vapid` — seule la toute première génération (aucune ligne encore en base) l'exige. Un
-serveur qui a déjà démarré une fois avec `py_vapid` présent continue donc de fonctionner sans, même si
-la lib disparaît ensuite (désinstallation, changement d'environnement).
+**Vendoring (`borgHelperWWW` 1.18.2, `spec-push-vendoring`)** : `pywebpush`/`py_vapid`/`http_ece` ne
+sont des paquets d'aucun dépôt apt (PyPI-only) — jamais forcément présents sur un hôte de production
+qui n'a jamais eu besoin d'installer de dépendances Python hors stdlib pour `borgHelper` (CLI)
+lui-même, et l'admin refuse d'imposer `pip`/`venv` aux utilisateurs. Les trois (purs Python, aucune
+extension compilée, ~240 Ko) sont copiés **tels quels** (aucune modification, licences MPL-2.0/MIT
+préservées) dans `Borg/vendor/` — voir `vendor/README.md`. `sys.path.insert(0,str(Path(__file__)
+.resolve().parent/'vendor'))`, ajouté juste avant le `try/except` ci-dessus, fait que l'import trouve
+la copie vendorisée en premier, sans jamais toucher à `site-packages`. Leurs propres dépendances
+(`aiohttp`, `requests`, `cryptography` — plus lourdes, potentiellement compilées) restent des paquets
+apt externes, **jamais vendorisées** (`python3-aiohttp`/`python3-requests`/`python3-cryptography`,
+tous dans les dépôts Ubuntu jammy) : le `try/except ImportError` reste donc nécessaire même avec le
+vendoring, en défense en profondeur si cet `apt install` n'a pas été fait. Vérifié en masquant
+temporairement les trois paquets pip de `site-packages` : import réussi depuis `vendor/` seul,
+`push_selftest` 26/26 OK. Mise à jour future du code vendorisé : manuelle, sur CVE/bug rapporté
+uniquement — jamais automatique.
+
+Même traitement d'import optionnel pour `py_vapid` (dépendance de `pywebpush`, mais importée
+directement dans `_generate_and_store_vapid_keys` — pas garanti co-présent si quelqu'un installe les
+deux séparément, désormais vendorisée elle aussi) : `_init_vapid_keys()` (appelée sans garde au niveau
+module, `PUSH_VAPID_PRIVATE_KEY,PUSH_VAPID_PUBLIC_KEY=_init_vapid_keys()`) capture `ImportError` et
+retourne `None,None`. **Nuance importante** : `_load_or_generate_vapid_keys` relit une paire déjà
+stockée dans `push_vapid_keys` (id=1) sans jamais importer `py_vapid` — seule la toute première
+génération (aucune ligne encore en base) l'exige. Un serveur qui a déjà démarré une fois avec
+`py_vapid` disponible continue donc de fonctionner sans, même si le vendoring venait à disparaître
+ensuite (`vendor/` supprimé par erreur, par exemple).
 
 ### Fichier et schéma
 
