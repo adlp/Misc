@@ -2505,6 +2505,13 @@ ci-dessus, jamais via ce mécanisme.
 `DELETE` : choix délibéré, documenté (README) — un `endpoint` déjà absent renvoie `{"deleted": false}`
 avec un `200`, jamais un `404` bruyant (« déjà absent = objectif du désabonnement atteint »).
 
+> Depuis `borgHelperWWW` 1.19.0, les préférences (`scope_nicks`/`notify_*`/`expires_at`) vivent dans
+> un fichier JSON, plus dans `push.db` — voir [Préférences push en
+> JSON](#préférences-push-en-json--uiservice-worker-borghelperwww-1190--ui-1100-spec-push-ui-prefs-json).
+> Le mécanisme ci-dessus (périmètre recalculé au réabonnement, `PATCH` sans `scope_nicks`,
+> `expires_in_days` absent/`null`) est inchangé ; seul le stockage a changé (`_expires_at_expr` SQL
+> remplacé par `_expires_at_value` Python).
+
 ### Envoi push réel (Story 2b)
 
 `_send_bkp_push(nick, event, result)` (`event`: `'start'|'end'`, `result`: `None` pour un début,
@@ -2596,3 +2603,67 @@ après le premier envoi, début) ; `.../status/500` → toujours présent après
 désabonné, jamais retenté au-delà de l'unique tentative par événement). Confirme, sur un vrai aller-
 retour réseau `pywebpush`, l'ensemble du chemin : réclamation CAS début+fin, envoi réel, désabonnement
 410, conservation+non-retry sur 500.
+
+## Préférences push en JSON + UI/Service Worker (`borgHelperWWW` 1.19.0 / UI 1.10.0, `spec-push-ui-prefs-json`)
+
+**Source de vérité des préférences** : `PUSH_PREFS_FILE` (`BORGHELPERWWW_PUSH_PREFS`/`--push-prefs`/
+clé `push_prefs`, défaut `<dirname(PUSH_DB)>/<db_prefix>-push-prefs.json`). `push.db` ne porte plus
+que les clés VAPID et les clés de chiffrement par navigateur (`endpoint`/`p256dh`/`auth`, `created_at`) ;
+ses colonnes `scope_nicks`/`notify_start`/`notify_end`/`expires_at` restent dans le schéma (aucune
+migration de schéma, `PUSH_DB_SCHEMA_VERSION` inchangé) mais ne sont plus jamais lues — `POST` y écrit
+des valeurs de remplissage (`scope_nicks='[]'`).
+
+Format : `{"version":1,"subscriptions":{<endpoint>:{"scope_nicks":[...],"notify_start":bool,
+"notify_end":bool,"expires_at":"AAAA-MM-JJ HH:MM:SS"|null,"updated_at":"..."}}}`, `sort_keys`+`indent=2`
+(diffs lisibles, édition à la main). Horodatages UTC au même format que `datetime('now')` SQLite —
+comparaison d'expiration par simple comparaison de chaînes (`expires_at > _utc_now_str()`).
+
+| Fonction | Rôle |
+|---|---|
+| `_push_prefs_locked()` | `fcntl.flock(LOCK_EX)` sur `<fichier>.lock` (plusieurs workers uvicorn) — jamais sur le fichier lui-même, remplacé par `os.replace` à chaque écriture |
+| `_push_prefs_load()` | Lecture **sans verrou** (l'écriture étant atomique, un lecteur voit toujours l'ancien ou le nouveau fichier complet) ; absent → structure vide ; JSON invalide / structure inattendue → `PushPrefsError` |
+| `_push_prefs_save(data)` | `mkstemp` dans le même répertoire (mode `0600`) + `fsync` + `os.replace` — jamais de fichier tronqué |
+| `_push_prefs_update(fn)` | Verrou → load → `fn(subs)` → save **seulement si `fn` renvoie vrai** ; exception dans `fn` → rien d'écrit |
+| `_prefs_entry(raw)` | Normalisation **fail-closed** à la lecture : `scope_nicks` non-liste/entrées non-str → ignorées, `notify_*` non-bool → `False`, `expires_at` illisible → `'1970-01-01 00:00:00'` (expiré, jamais « à vie » par accident) |
+| `_migrate_push_prefs_from_db()` | Une fois, au démarrage : si le fichier JSON est absent, recopie les préférences des lignes `push.db` existantes (colonnes historiques). Fichier présent → jamais rejoué. Erreur → `[WARN]`, démarrage poursuivi |
+
+**Fichier corrompu** : jamais écrasé (toute écriture passe par `_push_prefs_update`, qui échoue au
+load). Routes `/push/*` → `500` explicite via `_prefs_or_500` ; `_send_bkp_push` → journalisé, rien
+envoyé. Correction manuelle du fichier = reprise immédiate, sans redémarrage.
+
+**Cohérence DB/JSON** : `POST` écrit la ligne DB (clés) puis l'entrée JSON ; `DELETE` et le
+désabonnement 404/410 suppriment les deux (`_push_delete_endpoint`). Endpoint présent en DB mais absent
+du JSON → aucune notification, `prefs_missing:true` dans `GET /push/subscriptions`, `PATCH` → `409`
+(se réabonner). Entrée JSON sans ligne DB → ignorée à l'envoi (pas de clés de chiffrement).
+`_push_subscriptions_for(nick, notify_col)` filtre désormais sur le JSON puis charge les clés par
+`SELECT * ... WHERE endpoint IN (...)`.
+
+**`POST /push/test?endpoint=...`** (`_ROUTE_LEVELS` 1) : un envoi `{"event":"test"}` à ce seul
+abonnement — `503` push indisponible (`pywebpush`/`py_vapid`/clés absents), `404` inconnu, `410` mort
+(désabonné DB+JSON), `502` autre échec du service push, sinon `{"sent":true}`. Contrôle d'accès :
+connaissance de l'`endpoint` (URL secrète non devinable), comme les autres routes `/push/*`.
+
+**Service Worker** : `borgHelperWWW_sw.js` (à côté de `_UI_FILE`, lu une fois au démarrage, `[WARN]` si
+absent), servi sur `GET /sw.js` **sur `app`** (sans préfixe API, sans `X-API-Key` — un navigateur
+n'envoie aucun en-tête personnalisé à l'enregistrement d'un Service Worker), `Cache-Control: no-cache`,
+`Service-Worker-Allowed: /`. Contenu : `push` → `showNotification` (tag `bkp-<nick>`, une fin remplace
+le début), `notificationclick` → focus d'un onglet existant ou `openWindow('/')`. Aucun cache hors-ligne.
+
+**`GET /version`** ajoute `push_available` (`pywebpush` + clé VAPID + Service Worker chargés),
+`push_default_expiry_days`, `push_max_expiry_days` — l'UI n'affiche le bouton 🔔 que si
+`push_available`.
+
+**UI** (`#view-notifications`) : enregistre `/sw.js`, lit `pushManager.getSubscription()` puis
+`GET /push/subscriptions` ; s'abonner = `Notification.requestPermission()` → `pushManager.subscribe`
+(`applicationServerKey` = `vapid_public_key`, ré-essai après désabonnement si la clé serveur a changé)
+→ `POST /push/subscribe` ; enregistrer = `PATCH` (option « ne pas changer » l'expiration) ; test =
+`POST /push/test` ; se désabonner = `DELETE` serveur puis `unsubscribe()` navigateur.
+
+**Vérification** : `push_selftest` 46/46 OK (migration unique, mode `0600`, CRUD JSON, rollback sur
+exception, normalisation fail-closed, fichier corrompu jamais écrasé, 410 → DB+JSON nettoyés, routes
+via `TestClient` : POST/PATCH/GET/409/DELETE/500 fichier corrompu, `/sw.js`, `/version`, `/push/test`).
+Test réel : uvicorn + faux service push local déchiffrant le payload (`http_ece`) — abonnement, `PATCH`,
+`POST /push/test` reçu et déchiffré, `Bkp` réel avec `notify_start=false` → seule la fin reçue, édition
+manuelle du JSON (`notify_start=true`) prise en compte à chaud (début + fin reçus), `DELETE` nettoie le
+JSON. Affichage navigateur (UI, Service Worker) non vérifié dans cet environnement (aucun navigateur) —
+comportement du SW vérifié sous Node avec `self`/`registration` simulés.

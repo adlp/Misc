@@ -80,6 +80,13 @@ cfgfile = /etc/borghelperrc-www
 ; cache.db/diff.db (voir README.md, section « Notifications push »).
 ;push_db = /var/cache/borghelper/borghelperrc-www-push.db
 
+; Fichier JSON des PRÉFÉRENCES de notification de chaque abonné (début/fin de sauvegarde, nicks suivis,
+; expiration — spec-push-ui-prefs-json), réglées depuis la vue « 🔔 Notifications » de l'UI. Lisible et
+; éditable à la main (pris en compte à chaud, sans redémarrage) — BORGHELPERWWW_PUSH_PREFS /
+; --push-prefs. Défaut : à côté de push_db (<prefixe>-push-prefs.json). push.db garde les clés VAPID
+; et les clés de chiffrement de chaque navigateur ; ce fichier ne porte que les réglages.
+;push_prefs = /var/cache/borghelper/borghelperrc-www-push-prefs.json
+
 ; Durée d'expiration par défaut (jours) d'un abonnement push quand expires_in_days est absent de
 ; POST /push/subscribe — BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS (env var SEULE, pas de clé de conf
 ; ni d'option CLI pour ce réglage — même patron que les deux réglages du watcher bkp_status). Défaut

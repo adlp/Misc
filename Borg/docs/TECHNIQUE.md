@@ -94,7 +94,15 @@ vraie donnée, contrairement à `scopecache.db`.
 |---|---|
 | `db_meta` | version de schéma |
 | `push_vapid_keys` | la paire de clés VAPID du serveur (une seule ligne, `id=1`) |
-| `push_subscriptions` | un abonnement par endpoint navigateur : clés `p256dh`/`auth`, périmètre de nicks concernés (figé à la création), préférences début/fin, expiration |
+| `push_subscriptions` | un abonnement par endpoint navigateur : clés de chiffrement `p256dh`/`auth` (les anciennes colonnes de préférences ne sont plus lues depuis 1.19.0) |
+
+### `<prefixe>-push-prefs.json` — préférences de notification (borgHelperWWW ≥ 1.19.0)
+
+Fichier : réglage `push_prefs`/`BORGHELPERWWW_PUSH_PREFS`, défaut à côté de `push.db`. Un objet par
+endpoint : nicks suivis (figés à l'abonnement), `notify_start`/`notify_end`, `expires_at` (`null` = à
+vie). Réglé depuis la vue 🔔 Notifications de l'UI, **éditable à la main** (pris en compte à chaud).
+Écritures atomiques sous verrou, mode `0600` ; un fichier corrompu n'est jamais écrasé (les routes
+`/push/*` répondent 500 tant qu'il n'est pas corrigé). À sauvegarder avec `push.db`.
 
 ## 3. API HTTP (borgHelperWWW)
 
@@ -167,7 +175,9 @@ accessibles sans préfixe).
 | GET | `/idxtop` / `/difftop` | Tops par volumétrie | |
 | POST | `/idxpurge` | Purge rétroactive de `diff_index` | mutation, ⚡ destructif |
 | GET | `/download/file` / `/download/tar` | Téléchargement en vue d'une restauration | requiert `allow_downloads` |
-| POST/GET/DELETE | `/push/subscribe`, `/push/subscriptions` | Gestion des abonnements push | voir `push.db` ci-dessus |
+| POST/PATCH/GET/DELETE | `/push/subscribe`, `/push/subscriptions` | Gestion des abonnements push | voir `push.db` et fichier JSON ci-dessus |
+| POST | `/push/test` | Envoie une notification de test à un abonnement | |
+| GET | `/sw.js` | Service Worker des notifications | Non protégé (contrainte navigateur) |
 
 Format de réponse : la plupart des routes GET/POST retournent un `CommandResult` (JSON structuré,
 même schéma qu'une commande CLI `-j`) — la commande sous-jacente exacte et son mapping vers l'option

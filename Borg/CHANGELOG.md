@@ -1,5 +1,32 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.19.0 / borgHelperWWW_ui.html 1.10.0 — paramétrage des notifications dans l'UI + préférences en JSON — 2026-09-26
+
+`spec-push-ui-prefs-json` (Story 2c de `spec-notifications-push`), demande directe utilisateur :
+régler ses notifications depuis l'interface Web, réglages stockés dans un fichier JSON.
+
+- **UI** : bouton **🔔 Notifications** dans l'en-tête (si `GET /version` → `push_available`), nouvelle
+  vue : s'abonner (permission navigateur), début et/ou fin de sauvegarde, durée (défaut serveur,
+  7/30/90/365 jours, à vie), enregistrer, **envoyer un test**, se désabonner.
+- **Service Worker** : nouveau fichier `borgHelperWWW_sw.js` (`SW_VERSION 1.0.0`), servi sur
+  `GET /sw.js` sans `X-API-Key` (`Service-Worker-Allowed: /`, `no-cache`) — affiche les notifications
+  (une fin remplace le début du même nick), clic → onglet borgHelperWWW au premier plan. À déployer à
+  côté de l'UI. **HTTPS requis** (ou `localhost`) côté navigateur.
+- **Préférences par abonné en JSON** : nouveau réglage `push_prefs` / `BORGHELPERWWW_PUSH_PREFS` /
+  `--push-prefs` (défaut `<prefixe>-push-prefs.json` à côté de `push.db`). Source de vérité de
+  `scope_nicks`/`notify_start`/`notify_end`/`expires_at`, éditable à la main et pris en compte à chaud.
+  Écritures atomiques (`0600`, `os.replace`) sous `flock` ; normalisation fail-closed ; fichier corrompu
+  jamais écrasé (`/push/*` → 500 explicite, watcher n'envoie rien). `push.db` ne garde que les clés
+  VAPID et `endpoint`/`p256dh`/`auth` (anciennes colonnes conservées, plus lues — schéma inchangé).
+- **Migration automatique** au premier démarrage : préférences des abonnements existants recopiées de
+  `push.db` vers le JSON (une seule fois).
+- **Nouvelle route `POST /push/test?endpoint=...`** : notification de test (`404` inconnu, `410` mort →
+  désabonné, `502` échec service push, `503` push indisponible).
+- `GET /push/subscriptions` : champs `updated_at` et `prefs_missing` ; `PATCH` → `409` si l'entrée JSON
+  manque (se réabonner).
+- `GET /version` : `push_available`, `push_default_expiry_days`, `push_max_expiry_days`.
+- `push_selftest` 26 → 46 contrôles (JSON, migration, corruption, routes via `TestClient`).
+
 ## borgHelperWWW 1.18.7 — GROUPS_PATHS scindé lecture/restauration — 2026-09-26
 
 `spec-groups-paths-restore`, demande directe utilisateur : `GROUPS_PATHS` restreignait un même

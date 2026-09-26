@@ -12,7 +12,7 @@ from typing import Optional
 from collections import defaultdict
 
 from fastapi import FastAPI, APIRouter, Header, HTTPException, Query, Request, Depends
-from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse, Response
 from pydantic import BaseModel, Field
 
 # vendor/ (spec-push-vendoring) : pywebpush/py_vapid/http_ece ne sont des paquets d'aucun dépôt apt
@@ -39,7 +39,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.18.7"
+WWW_VERSION="1.19.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -94,6 +94,9 @@ if __name__=='__main__':
     _p.add_argument('--push-db',help="Chemin du fichier SQLite dédié aux abonnements push et clés VAPID "
                      "(Story 2a, spec-notifications-push, AD-6 — jamais scopecache.db, jamais reconstructible) "
                      "— déf. BORGHELPERWWW_PUSH_DB, sinon co-localisé avec cache.db/diff.db")
+    _p.add_argument('--push-prefs',help="Fichier JSON des préférences de notification par abonné "
+                     "(début/fin, nicks suivis, expiration — spec-push-ui-prefs-json) — déf. "
+                     "BORGHELPERWWW_PUSH_PREFS, sinon co-localisé avec push.db (<prefixe>-push-prefs.json)")
     _p.add_argument('--selftest',action='store_true',help="Lance les contrôles internes dédiés à la "
                      "story push (génération VAPID, CRUD abonnement, calcul d'expiration, clamp de "
                      "BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS) sur des fichiers SQLite TEMPORAIRES, puis "
@@ -112,6 +115,7 @@ if __name__=='__main__':
     if _args.groups_header: os.environ['BORGHELPERWWW_GROUPS_HEADER']=_args.groups_header
     if _args.scope_cache_db: os.environ['BORGHELPERWWW_SCOPE_CACHE_DB']=_args.scope_cache_db
     if _args.push_db: os.environ['BORGHELPERWWW_PUSH_DB']=_args.push_db
+    if _args.push_prefs: os.environ['BORGHELPERWWW_PUSH_PREFS']=_args.push_prefs
     _SELFTEST_REQUESTED=_args.selftest
     if _args.allow_destructive is not None: os.environ['BORGHELPERWWW_ALLOW_DESTRUCTIVE']=str(_args.allow_destructive)
     if _args.allow_downloads is not None: os.environ['BORGHELPERWWW_ALLOW_DOWNLOADS']=str(_args.allow_downloads)
@@ -128,7 +132,8 @@ _CONF_KEYS={'cfgfile':'BORGHELPERWWW_CFGFILE','api_key':'BORGHELPERWWW_API_KEY',
             'trusted_proxies':'BORGHELPERWWW_TRUSTED_PROXIES',
             'allow_destructive':'BORGHELPERWWW_ALLOW_DESTRUCTIVE','allow_downloads':'BORGHELPERWWW_ALLOW_DOWNLOADS',
             'api_prefix':'BORGHELPERWWW_API_PREFIX','groups_header':'BORGHELPERWWW_GROUPS_HEADER',
-            'scope_cache_db':'BORGHELPERWWW_SCOPE_CACHE_DB','push_db':'BORGHELPERWWW_PUSH_DB'}
+            'scope_cache_db':'BORGHELPERWWW_SCOPE_CACHE_DB','push_db':'BORGHELPERWWW_PUSH_DB',
+            'push_prefs':'BORGHELPERWWW_PUSH_PREFS'}
 
 def _apply_conf_section(sect):
     """Comble os.environ depuis une SectionProxy configparser selon _CONF_KEYS — ne touche jamais une
@@ -423,7 +428,7 @@ _ROUTE_LEVELS={
     # en paramètre) — _check_group_access (voir plus haut, `nick_param is None: return`) les laisse
     # donc passer sans jamais consulter cette entrée, exactement comme /access. Cataloguées ici pour
     # la documentation/cohérence uniquement, jamais consultées en pratique pour ces chemins.
-    '/push/subscribe':1,'/push/subscriptions':1,
+    '/push/subscribe':1,'/push/subscriptions':1,'/push/test':1,
 }
 
 def _parse_groups(header_value):
@@ -927,11 +932,137 @@ def _push_conn(role):
     conn.row_factory=sqlite3.Row
     return conn
 
-def _push_row_to_dict(row):
-    return {'id':row['id'],'endpoint':row['endpoint'],
-            'scope_nicks':json.loads(row['scope_nicks']),
-            'notify_start':bool(row['notify_start']),'notify_end':bool(row['notify_end']),
-            'expires_at':row['expires_at'],'created_at':row['created_at']}
+# ── Préférences par abonné en JSON (spec-push-ui-prefs-json) ───────────────────
+# Source de vérité UNIQUE des préférences (scope_nicks, notify_start, notify_end, expires_at), indexées
+# par endpoint. push.db ne garde que les clés VAPID et endpoint/p256dh/auth ; ses colonnes de préférence
+# sont conservées (jamais de migration destructive sur une base non reconstructible, AD-6) mais ne sont
+# plus ni lues ni tenues à jour — seule la migration initiale ci-dessous les consulte, une fois.
+PUSH_PREFS_FILE=os.environ.get('BORGHELPERWWW_PUSH_PREFS') or \
+    os.path.join(os.path.dirname(os.path.abspath(PUSH_DB)),f"{_bh_paths.db.db_prefix}-push-prefs.json")
+_PUSH_TS_FMT='%Y-%m-%d %H:%M:%S'  # même format que datetime('now') SQLite (UTC), comparable en chaîne
+
+class PushPrefsError(Exception):
+    """Fichier de préférences illisible/corrompu — jamais écrasé automatiquement (données utilisateur)."""
+
+def _utc_now_str():
+    return datetime.datetime.now(datetime.timezone.utc).strftime(_PUSH_TS_FMT)
+
+def _expires_at_value(days):
+    """`days` déjà résolu (None = « à vie », sinon entier >=1) -> expires_at (chaîne UTC) ou None."""
+    if days is None: return None
+    return (datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(days=int(days))).strftime(_PUSH_TS_FMT)
+
+@contextlib.contextmanager
+def _push_prefs_locked():
+    """Verrou exclusif inter-processus (plusieurs workers uvicorn + watcher) autour de toute
+    lecture-modification-écriture. Fichier .lock séparé : os.replace() remplace le fichier de données,
+    un flock posé dessus ne survivrait pas au remplacement."""
+    import fcntl
+    fd=os.open(PUSH_PREFS_FILE+'.lock',os.O_RDWR|os.O_CREAT,0o600)
+    try:
+        fcntl.flock(fd,fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd,fcntl.LOCK_UN); os.close(fd)
+
+def _push_prefs_load():
+    """Lecture sans verrou possible (os.replace est atomique : on lit l'ancienne ou la nouvelle version,
+    jamais un fichier à moitié écrit). Absent -> vide. Corrompu -> PushPrefsError, jamais « vide »
+    (sinon la prochaine écriture effacerait silencieusement toutes les préférences)."""
+    try:
+        with open(PUSH_PREFS_FILE,encoding='utf-8') as f: data=json.load(f)
+    except FileNotFoundError:
+        return {'version':1,'subscriptions':{}}
+    except (OSError,ValueError) as e:
+        raise PushPrefsError(f"{PUSH_PREFS_FILE} illisible ou JSON invalide ({e}) — jamais écrasé "
+                             "automatiquement : corriger ou restaurer ce fichier") from e
+    if not isinstance(data,dict) or not isinstance(data.get('subscriptions'),dict):
+        raise PushPrefsError(f"{PUSH_PREFS_FILE} : structure inattendue (attendu "
+                             "{\"subscriptions\": {endpoint: {...}}}) — jamais écrasé automatiquement")
+    return data
+
+def _push_prefs_save(data):
+    """Écriture atomique : fichier temporaire (mkstemp -> 0600) dans le MÊME répertoire, fsync, puis
+    os.replace — un lecteur concurrent ne voit jamais un JSON tronqué."""
+    import tempfile
+    fd,tmp=tempfile.mkstemp(prefix='.push-prefs-',suffix='.tmp',dir=os.path.dirname(PUSH_PREFS_FILE) or '.')
+    try:
+        with os.fdopen(fd,'w',encoding='utf-8') as f:
+            json.dump(data,f,ensure_ascii=False,indent=2,sort_keys=True); f.write('\n')
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp,PUSH_PREFS_FILE)
+    except BaseException:
+        with contextlib.suppress(OSError): os.unlink(tmp)
+        raise
+
+def _push_prefs_update(fn):
+    """Lecture-modification-écriture sous verrou : `fn(subscriptions)` modifie le dict en place et peut
+    retourner une valeur (retransmise). Une exception levée par `fn` annule l'écriture."""
+    with _push_prefs_locked():
+        data=_push_prefs_load()
+        result=fn(data['subscriptions'])
+        data['version']=1
+        _push_prefs_save(data)
+        return result
+
+def _prefs_entry(raw):
+    """Normalise une entrée (le fichier est éditable à la main) : jamais de crash sur une clé absente ou
+    mal typée. Fail-closed : scope_nicks invalide -> [] (aucune notification) ; expires_at non nul mais
+    illisible -> considéré expiré, jamais « à vie » par accident. expires_at null/absent = « à vie »."""
+    e=raw if isinstance(raw,dict) else {}
+    nicks=e.get('scope_nicks')
+    exp=e.get('expires_at')
+    if exp is not None:
+        try: datetime.datetime.strptime(exp,_PUSH_TS_FMT)
+        except (TypeError,ValueError): exp='1970-01-01 00:00:00'
+    return {'scope_nicks':[n for n in nicks if isinstance(n,str)] if isinstance(nicks,list) else [],
+            'notify_start':e.get('notify_start') is True,
+            'notify_end':e.get('notify_end',True) is True,
+            'expires_at':exp,
+            'updated_at':e.get('updated_at') if isinstance(e.get('updated_at'),str) else None}
+
+def _push_sub_dict(row,raw_prefs):
+    """Vue API d'un abonnement : identité/clés depuis push.db, préférences depuis le fichier JSON.
+    `prefs_missing` : endpoint connu de push.db sans entrée dans le fichier (fichier supprimé/édité) —
+    aucune notification ne part alors (scope_nicks vide), un réabonnement (POST) la recrée."""
+    p=_prefs_entry(raw_prefs)
+    return {'id':row['id'],'endpoint':row['endpoint'],'scope_nicks':p['scope_nicks'],
+            'notify_start':p['notify_start'],'notify_end':p['notify_end'],'expires_at':p['expires_at'],
+            'created_at':row['created_at'],'updated_at':p['updated_at'],'prefs_missing':raw_prefs is None}
+
+def _migrate_push_prefs_from_db():
+    """Une seule fois : fichier JSON absent -> exporte les préférences encore stockées dans les colonnes
+    de push.db (abonnements créés avant borgHelperWWW 1.19.0). Re-vérifie l'existence sous verrou
+    (deux workers uvicorn démarrant ensemble). Crée le fichier même vide : il devient visible pour
+    l'admin dès le premier démarrage."""
+    if os.path.exists(PUSH_PREFS_FILE): return
+    with _push_prefs_locked():
+        if os.path.exists(PUSH_PREFS_FILE): return
+        conn=_push_conn('read')
+        try:
+            rows=conn.execute("SELECT endpoint,scope_nicks,notify_start,notify_end,expires_at "
+                              "FROM push_subscriptions").fetchall()
+        finally:
+            conn.close()
+        subs={}
+        for r in rows:
+            try: nicks=json.loads(r['scope_nicks'])
+            except (TypeError,ValueError): nicks=[]
+            subs[r['endpoint']]={'scope_nicks':nicks if isinstance(nicks,list) else [],
+                                 'notify_start':bool(r['notify_start']),'notify_end':bool(r['notify_end']),
+                                 'expires_at':r['expires_at'],'updated_at':_utc_now_str()}
+        _push_prefs_save({'version':1,'subscriptions':subs})
+        if subs:
+            print(f"[push] préférences de {len(subs)} abonnement(s) migrées de push.db vers "
+                  f"{PUSH_PREFS_FILE}",file=sys.stderr,flush=True)
+
+try:
+    _migrate_push_prefs_from_db()
+except (OSError,sqlite3.Error) as _e:
+    # Fonctionnalité optionnelle : jamais un crash de tout borgHelperWWW pour elle — les routes /push/*
+    # remonteront l'erreur explicitement au premier usage.
+    print(f"[WARN] préférences push : migration/création de {PUSH_PREFS_FILE} impossible ({_e})",
+          file=sys.stderr,flush=True)
 
 # ── Envoi push réel (Story 2b, spec-notifications-push) ────────────────────────
 # Remplace la simple journalisation de la Story 1 : chaque réclamation CAS gagnée (début OU fin)
@@ -940,31 +1071,39 @@ def _push_row_to_dict(row):
 # jamais revisitée, quel que soit le sort de chaque envoi individuel).
 
 def _push_delete_endpoint(endpoint):
-    """Désabonnement (endpoint mort côté navigateur, 404/410) — même requête exacte que
-    `DELETE /push/subscribe` (Story 2a), extraite ici pour être réutilisée par le watcher sans
-    dupliquer la logique SQL. True si une ligne a effectivement été supprimée."""
+    """Désabonnement (DELETE /push/subscribe, ou endpoint mort côté navigateur 404/410 via le
+    watcher) : ligne push.db D'ABORD (plus aucun envoi possible, quel que soit l'état du fichier de
+    préférences), puis entrée du fichier JSON. True si l'un des deux contenait l'endpoint. Peut lever
+    sqlite3.Error ou PushPrefsError — à l'appelant de décider (500 explicite en route, log au watcher)."""
     conn=_push_conn('write')
     try:
         cur=conn.execute("DELETE FROM push_subscriptions WHERE endpoint=?",(endpoint,))
         conn.commit()
-        return cur.rowcount>0
+        db_deleted=cur.rowcount>0
     finally:
         conn.close()
+    prefs_deleted=_push_prefs_update(lambda subs: subs.pop(endpoint,None) is not None)
+    return db_deleted or prefs_deleted
 
 def _push_subscriptions_for(nick,notify_col):
-    """Abonnements actifs (`expires_at IS NULL OR expires_at > datetime('now')`) avec le type de
-    notification demandé actif (`notify_col` = 'notify_start' ou 'notify_end'), dont `scope_nicks`
-    (JSON) contient `nick` — filtre SQL sur l'expiration/le type (bornable/indexable), filtre Python
-    sur l'appartenance à `scope_nicks` (JSON, pas fiable à matcher en LIKE brut sur la chaîne)."""
+    """Abonnements à notifier pour cet événement : entrée du fichier JSON avec le type demandé actif
+    (`notify_col` = 'notify_start'|'notify_end'), non expirée (expires_at null = « à vie », sinon
+    comparée en chaîne au format UTC commun), dont scope_nicks contient `nick` — puis clés p256dh/auth
+    lues dans push.db pour ces seuls endpoints (un endpoint sans ligne push.db est ignoré)."""
     assert notify_col in ('notify_start','notify_end')
+    now=_utc_now_str()
+    wanted=[]
+    for ep,raw in _push_prefs_load()['subscriptions'].items():
+        p=_prefs_entry(raw)
+        if p[notify_col] and (p['expires_at'] is None or p['expires_at']>now) and nick in p['scope_nicks']:
+            wanted.append(ep)
+    if not wanted: return []
     conn=_push_conn('read')
     try:
-        rows=conn.execute(
-            f"SELECT * FROM push_subscriptions WHERE {notify_col}=1 "
-            "AND (expires_at IS NULL OR expires_at > datetime('now'))").fetchall()
+        return conn.execute(f"SELECT * FROM push_subscriptions WHERE endpoint IN ({','.join('?'*len(wanted))})",
+                            wanted).fetchall()
     finally:
         conn.close()
-    return [r for r in rows if nick in json.loads(r['scope_nicks'])]
 
 def _send_bkp_push(nick,event,result):
     """Envoie un push réel à chaque abonnement matché pour cet événement (`event`: 'start'|'end',
@@ -977,7 +1116,7 @@ def _send_bkp_push(nick,event,result):
     notify_col='notify_start' if event=='start' else 'notify_end'
     try:
         subs=_push_subscriptions_for(nick,notify_col)
-    except sqlite3.Error as e:
+    except (sqlite3.Error,PushPrefsError) as e:
         print(f"[watcher] push: erreur lecture abonnements nick={nick} : {e}",file=sys.stderr,flush=True)
         return
     if not subs: return
@@ -999,7 +1138,7 @@ def _send_bkp_push(nick,event,result):
                     _push_delete_endpoint(endpoint)
                     print(f"[watcher] push: abonnement mort désabonné (status={e.status_code}) "
                           f"nick={nick} event={event}",file=sys.stderr,flush=True)
-                except sqlite3.Error as de:
+                except (sqlite3.Error,PushPrefsError,OSError) as de:
                     print(f"[watcher] push: échec désabonnement (status={e.status_code}) "
                           f"nick={nick} event={event} : {de}",file=sys.stderr,flush=True)
             else:
@@ -1765,6 +1904,22 @@ UI_VERSION=_UI_VERSION_MATCH.group(1) if _UI_VERSION_MATCH else 'inconnue'
 def ui_index():
     return _UI_HTML
 
+# Service Worker des notifications push (spec-push-ui-prefs-json) : fichier statique séparé, à côté de
+# l'UI. Servi à la RACINE (portée par défaut = toute l'origine) et sur `app`, jamais derrière
+# X-API-Key : un navigateur ne peut pas ajouter d'en-tête à la requête d'enregistrement de son propre
+# Service Worker. Absent -> [WARN] et 404 sur /sw.js (seules les notifications push sont concernées).
+_SW_FILE=_UI_FILE.parent/'borgHelperWWW_sw.js'
+_SW_JS=_SW_FILE.read_text(encoding='utf-8') if _SW_FILE.is_file() else None
+if _SW_JS is None:
+    print(f"[WARN] Service Worker introuvable ({_SW_FILE}) — abonnement aux notifications push "
+          "impossible depuis l'UI",file=sys.stderr,flush=True)
+
+@app.get("/sw.js",include_in_schema=False)
+def service_worker():
+    if _SW_JS is None: raise HTTPException(404,detail="Service Worker absent de ce déploiement")
+    return Response(content=_SW_JS,media_type='application/javascript',
+                    headers={'Cache-Control':'no-cache','Service-Worker-Allowed':'/'})
+
 @app.get("/version",tags=["lecture"],summary="Versions + postures de sécurité chargées au démarrage de borgHelperWWW — non protégé, aucune donnée sensible")
 def version():
     return {'borghelperwww_version':WWW_VERSION,'borghelper_version':BORGHELPER_VERSION,'ui_version':UI_VERSION,
@@ -1774,7 +1929,11 @@ def version():
             # PushManager.subscribe({applicationServerKey}) — publique par nature (jamais la privée),
             # exposée ici plutôt que sur une route dédiée car /version est déjà non protégée et lue
             # au chargement de l'UI, exactement le moment où le Service Worker en a besoin (Story 2b).
-            'vapid_public_key':PUSH_VAPID_PUBLIC_KEY}
+            'vapid_public_key':PUSH_VAPID_PUBLIC_KEY,
+            # spec-push-ui-prefs-json : l'UI n'affiche la vue Notifications que si l'envoi est réellement
+            # possible (pywebpush/py_vapid présents + Service Worker déployé), et propose ces bornes.
+            'push_available':bool(_PYWEBPUSH_AVAILABLE and PUSH_VAPID_PUBLIC_KEY and _SW_JS is not None),
+            'push_default_expiry_days':PUSH_DEFAULT_EXPIRY_DAYS,'push_max_expiry_days':PUSH_MAX_EXPIRY_DAYS}
 
 @app.get("/healthz",tags=["lecture"],summary="Liveness — le processus répond, rien de plus (pas d'accès borg/DB) — non protégé")
 def healthz():
@@ -2161,11 +2320,11 @@ class PushPatchBody(BaseModel):
     notify_end: Optional[bool]=None
     expires_in_days: Optional[int]=None  # absent -> inchangé ; null explicite -> « à vie »
 
-def _expires_at_expr(days):
-    """`days` déjà résolu (None = « à vie », sinon entier >=1) -> fragment SQL pour la colonne
-    expires_at. Jamais d'entrée utilisateur brute interpolée : `days` est toujours soit None, soit un
-    int déjà validé/clampé par l'appelant (jamais une chaîne)."""
-    return "NULL" if days is None else f"datetime('now','+{int(days)} days')"
+def _prefs_or_500(fn):
+    """Fichier de préférences corrompu/illisible -> 500 explicite (jamais un écrasement silencieux)."""
+    try: return fn()
+    except (PushPrefsError,OSError) as e:
+        raise HTTPException(500,detail=f"Préférences push indisponibles : {e}")
 
 # Borne haute d'expires_in_days (jours) — sans elle, une valeur absurde (ex. 999999999999) fait
 # silencieusement déborder `datetime('now','+N days')` côté SQLite vers NULL (« à vie »), au lieu du
@@ -2186,93 +2345,105 @@ def _resolve_push_expiry_days(expires_in_days):
         return PUSH_DEFAULT_EXPIRY_DAYS  # valeur absurde fournie -> même repli que le défaut serveur
     return expires_in_days
 
+def _push_row(endpoint):
+    conn=_push_conn('read')
+    try: return conn.execute("SELECT * FROM push_subscriptions WHERE endpoint=?",(endpoint,)).fetchone()
+    finally: conn.close()
+
 @router.post("/push/subscribe",tags=["mutation"],
-             summary="Créer/rafraîchir un abonnement push — scope_nicks recalculé à chaque appel (réabonnement explicite, AD-4/Design Notes)")
+             summary="Créer/rafraîchir un abonnement push — scope_nicks recalculé à chaque appel (réabonnement explicite, AD-4/Design Notes) ; préférences écrites dans le fichier JSON")
 def push_subscribe(request: Request, body: PushSubscribeBody, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     scope_nicks=_current_scope_nicks(request)
-    fields_set=body.__fields_set__
-    if 'expires_in_days' not in fields_set:
+    if 'expires_in_days' not in body.__fields_set__:
         days=PUSH_DEFAULT_EXPIRY_DAYS  # absent de la requête -> défaut serveur (BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS)
     else:
         days=_resolve_push_expiry_days(body.expires_in_days)
     conn=_push_conn('write')
     try:
-        conn.execute(f"""INSERT INTO push_subscriptions
-                (endpoint,p256dh,auth,scope_nicks,notify_start,notify_end,expires_at)
-                VALUES (?,?,?,?,?,?,{_expires_at_expr(days)})
-                ON CONFLICT(endpoint) DO UPDATE SET
-                    p256dh=excluded.p256dh, auth=excluded.auth, scope_nicks=excluded.scope_nicks,
-                    notify_start=excluded.notify_start, notify_end=excluded.notify_end,
-                    expires_at=excluded.expires_at""",
-            (body.endpoint,body.keys.p256dh,body.keys.auth,json.dumps(scope_nicks),
-             int(body.notify_start),int(body.notify_end)))
+        # Colonnes de préférence héritées : valeurs neutres, plus jamais lues (source de vérité = JSON).
+        conn.execute("""INSERT INTO push_subscriptions (endpoint,p256dh,auth,scope_nicks) VALUES (?,?,?,'[]')
+                ON CONFLICT(endpoint) DO UPDATE SET p256dh=excluded.p256dh, auth=excluded.auth""",
+            (body.endpoint,body.keys.p256dh,body.keys.auth))
         conn.commit()
-        row=conn.execute("SELECT * FROM push_subscriptions WHERE endpoint=?",(body.endpoint,)).fetchone()
-        if row is None:
-            # TOCTOU : un DELETE concurrent (autre connexion) entre le commit ci-dessus et ce SELECT
-            # a supprimé la ligne — jamais un TypeError 500 brut depuis _push_row_to_dict(None).
-            raise HTTPException(410,detail="Abonnement supprimé entre-temps")
-        return _push_row_to_dict(row)
     finally:
         conn.close()
+    prefs={'scope_nicks':scope_nicks,'notify_start':body.notify_start,'notify_end':body.notify_end,
+           'expires_at':_expires_at_value(days),'updated_at':_utc_now_str()}
+    def _set(subs): subs[body.endpoint]=prefs
+    _prefs_or_500(lambda: _push_prefs_update(_set))
+    row=_push_row(body.endpoint)
+    if row is None:
+        # TOCTOU : un DELETE concurrent entre l'INSERT et cette relecture — jamais un TypeError 500 brut.
+        raise HTTPException(410,detail="Abonnement supprimé entre-temps")
+    return _push_sub_dict(row,prefs)
 
 @router.patch("/push/subscribe",tags=["mutation"],
               summary="Modifier les préférences (notify_start/notify_end/expiration) d'un abonnement existant — jamais scope_nicks (AD-4)")
 def push_subscribe_patch(body: PushPatchBody, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
-    conn=_push_conn('write')
-    try:
-        row=conn.execute("SELECT * FROM push_subscriptions WHERE endpoint=?",(body.endpoint,)).fetchone()
-        if row is None:
-            raise HTTPException(404,detail=f"Aucun abonnement pour cet endpoint — pas de création silencieuse (PATCH != POST)")
-        fields_set=body.__fields_set__
-        # notify_start/notify_end n'ont pas d'état « null » significatif (un type de notification est
-        # actif ou non) — contrairement à expires_in_days, où null explicite a une sémantique claire
-        # (« à vie ») : un null explicite ici est rejeté plutôt que traité comme absent (silencieux et
-        # asymétrique avec expires_in_days).
-        if 'notify_start' in fields_set and body.notify_start is None:
-            raise HTTPException(422,detail="notify_start ne peut pas être explicitement null — "
+    row=_push_row(body.endpoint)
+    if row is None:
+        raise HTTPException(404,detail="Aucun abonnement pour cet endpoint — pas de création silencieuse (PATCH != POST)")
+    fields_set=body.__fields_set__
+    # notify_start/notify_end n'ont pas d'état « null » significatif (un type de notification est
+    # actif ou non) — contrairement à expires_in_days, où null explicite a une sémantique claire
+    # (« à vie ») : un null explicite ici est rejeté plutôt que traité comme absent.
+    for f in ('notify_start','notify_end'):
+        if f in fields_set and getattr(body,f) is None:
+            raise HTTPException(422,detail=f"{f} ne peut pas être explicitement null — "
                 "omettre le champ pour ne pas le modifier, ou fournir true/false")
-        if 'notify_end' in fields_set and body.notify_end is None:
-            raise HTTPException(422,detail="notify_end ne peut pas être explicitement null — "
-                "omettre le champ pour ne pas le modifier, ou fournir true/false")
-        sets=[]; params=[]
-        if 'notify_start' in fields_set:
-            sets.append("notify_start=?"); params.append(int(body.notify_start))
-        if 'notify_end' in fields_set:
-            sets.append("notify_end=?"); params.append(int(body.notify_end))
+    def _patch(subs):
+        if body.endpoint not in subs:
+            raise HTTPException(409,detail="Préférences absentes du fichier JSON pour cet endpoint "
+                "(fichier supprimé/édité ?) — se réabonner (POST /push/subscribe) pour les recréer")
+        p=_prefs_entry(subs[body.endpoint])
+        for f in ('notify_start','notify_end'):
+            if f in fields_set: p[f]=getattr(body,f)
         if 'expires_in_days' in fields_set:
-            days=_resolve_push_expiry_days(body.expires_in_days)
-            sets.append(f"expires_at={_expires_at_expr(days)}")  # sort de « à vie », renouvelle, ou y repasse
-        if sets:
-            conn.execute(f"UPDATE push_subscriptions SET {','.join(sets)} WHERE endpoint=?",
-                          (*params,body.endpoint))
-            conn.commit()
-        row=conn.execute("SELECT * FROM push_subscriptions WHERE endpoint=?",(body.endpoint,)).fetchone()
-        if row is None:
-            # TOCTOU : un DELETE concurrent entre le commit ci-dessus et ce SELECT a supprimé la
-            # ligne — jamais un TypeError 500 brut depuis _push_row_to_dict(None).
-            raise HTTPException(410,detail="Abonnement supprimé entre-temps")
-        return _push_row_to_dict(row)
-    finally:
-        conn.close()
+            # sort de « à vie », renouvelle, ou y repasse
+            p['expires_at']=_expires_at_value(_resolve_push_expiry_days(body.expires_in_days))
+        p['updated_at']=_utc_now_str()
+        subs[body.endpoint]=p
+        return p
+    return _push_sub_dict(row,_prefs_or_500(lambda: _push_prefs_update(_patch)))
 
 @router.delete("/push/subscribe",tags=["mutation"],
                 summary="Désabonner — endpoint déjà absent : pas d'erreur bruyante (choix d'implémentation documenté, README)")
 def push_subscribe_delete(endpoint: str, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
-    return {'deleted':_push_delete_endpoint(endpoint)}
+    return {'deleted':_prefs_or_500(lambda: _push_delete_endpoint(endpoint))}
 
-@router.get("/push/subscriptions",tags=["lecture"],summary="Abonnement(s) connus pour un endpoint donné")
+@router.get("/push/subscriptions",tags=["lecture"],summary="Abonnement(s) connus pour un endpoint donné (clés push.db + préférences JSON)")
 def push_subscriptions(endpoint: str, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
-    conn=_push_conn('read')
+    row=_push_row(endpoint)
+    if row is None: return {'subscriptions':[]}
+    subs=_prefs_or_500(_push_prefs_load)['subscriptions']
+    return {'subscriptions':[_push_sub_dict(row,subs.get(endpoint))]}
+
+@router.post("/push/test",tags=["mutation"],
+             summary="Envoie une notification de TEST à un seul abonnement (endpoint) — vérifie toute la chaîne sans attendre un vrai Bkp")
+def push_test(endpoint: str, x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    if not _PYWEBPUSH_AVAILABLE or PUSH_VAPID_PRIVATE_KEY is None:
+        raise HTTPException(503,detail="Envoi push indisponible sur ce serveur (pywebpush/py_vapid absents — voir le [WARN] au démarrage)")
+    row=_push_row(endpoint)
+    if row is None:
+        raise HTTPException(404,detail="Aucun abonnement pour cet endpoint")
+    payload=json.dumps({'event':'test','nick':None,'result':None,
+                        'timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat()})
     try:
-        rows=conn.execute("SELECT * FROM push_subscriptions WHERE endpoint=?",(endpoint,)).fetchall()
-        return {'subscriptions':[_push_row_to_dict(r) for r in rows]}
-    finally:
-        conn.close()
+        webpush(subscription_info={'endpoint':endpoint,'keys':{'p256dh':row['p256dh'],'auth':row['auth']}},
+                data=payload,vapid_private_key=PUSH_VAPID_PRIVATE_KEY,vapid_claims={'sub':PUSH_VAPID_SUB})
+    except WebPushException as e:
+        if e.status_code in (404,410):
+            with contextlib.suppress(sqlite3.Error,PushPrefsError,OSError): _push_delete_endpoint(endpoint)
+            raise HTTPException(410,detail=f"Abonnement expiré côté navigateur (HTTP {e.status_code}) — supprimé, se réabonner")
+        raise HTTPException(502,detail=f"Service push du navigateur en erreur (HTTP {e.status_code}) : {e}")
+    except Exception as e:
+        raise HTTPException(502,detail=f"Envoi impossible : {e}")
+    return {'sent':True}
 
 app.include_router(router,prefix=API_PREFIX)
 
@@ -2292,7 +2463,7 @@ def push_selftest():
     (ensure_push_db()/VAPID) avant que ce flag ne soit lu dans le bloc __main__ ci-dessous — sans
     conséquence (ensure_push_db()/_init_vapid_keys() sont idempotents, jamais destructifs sur un
     fichier existant), mais ce n'est donc pas un self-test qui s'exécute "avant" toute I/O réelle."""
-    global PUSH_DB
+    global PUSH_DB,PUSH_PREFS_FILE
     import tempfile,shutil,datetime as _dt
     from unittest import mock
     results=[]
@@ -2303,9 +2474,11 @@ def push_selftest():
 
     tmpdir=tempfile.mkdtemp(prefix='borghelperwww-push-selftest-')
     test_db=os.path.join(tmpdir,'push-selftest.db')
-    old_push_db=PUSH_DB
+    old_push_db,old_prefs=PUSH_DB,PUSH_PREFS_FILE
     PUSH_DB=test_db  # Story 2b : _send_bkp_push/_push_conn ci-dessous doivent taper sur ce fichier
-    # temporaire, jamais le PUSH_DB réel — restauré dans le `finally` externe.
+    # temporaire, jamais le PUSH_DB réel — restauré dans le `finally` externe. Idem pour le fichier de
+    # préférences JSON (spec-push-ui-prefs-json).
+    PUSH_PREFS_FILE=os.path.join(tmpdir,'push-prefs-selftest.json')
     try:
         conn=_open_db(test_db,nick=None,role='admin')
         conn.row_factory=sqlite3.Row
@@ -2318,22 +2491,71 @@ def push_selftest():
             priv2,pub2=_load_or_generate_vapid_keys(conn)
             check("VAPID : réutilisées si déjà présentes (jamais régénérées)",lambda: (priv1,pub1)==(priv2,pub2))
 
-            # ── CRUD abonnement ──
+            # ── Migration push.db -> JSON (abonnements antérieurs à 1.19.0) ──
             conn.execute("""INSERT INTO push_subscriptions
                     (endpoint,p256dh,auth,scope_nicks,notify_start,notify_end,expires_at)
-                    VALUES ('ep1','p256','auth1',?,0,1,datetime('now','+30 days'))""",(json.dumps(['n1','n2']),))
+                    VALUES ('ep-legacy','p256','authL',?,1,0,NULL)""",(json.dumps(['nL']),))
             conn.commit()
-            row=conn.execute("SELECT * FROM push_subscriptions WHERE endpoint='ep1'").fetchone()
-            check("CRUD : création lisible",lambda: row is not None and json.loads(row['scope_nicks'])==['n1','n2'])
-            conn.execute("UPDATE push_subscriptions SET notify_start=1,notify_end=0 WHERE endpoint='ep1'")
-            conn.commit()
-            row=conn.execute("SELECT * FROM push_subscriptions WHERE endpoint='ep1'").fetchone()
-            check("CRUD : préférences mises à jour, scope_nicks intact (AD-4)",
-                  lambda: bool(row['notify_start']) and not bool(row['notify_end']) and json.loads(row['scope_nicks'])==['n1','n2'])
-            conn.execute("DELETE FROM push_subscriptions WHERE endpoint='ep1'")
-            conn.commit()
-            row=conn.execute("SELECT * FROM push_subscriptions WHERE endpoint='ep1'").fetchone()
-            check("CRUD : suppression effective",lambda: row is None)
+            _migrate_push_prefs_from_db()
+            def _migrated_ok():
+                e=_push_prefs_load()['subscriptions'].get('ep-legacy')
+                return (e is not None and e['scope_nicks']==['nL'] and e['notify_start'] is True
+                        and e['notify_end'] is False and e['expires_at'] is None)
+            check("JSON : migration initiale des préférences de push.db (fichier absent -> créé)",_migrated_ok)
+            check("JSON : fichier créé en 0600",lambda: (os.stat(PUSH_PREFS_FILE).st_mode & 0o777)==0o600)
+            # Une 2e migration (fichier présent) ne touche plus à rien, même si push.db change.
+            conn.execute("UPDATE push_subscriptions SET notify_start=0 WHERE endpoint='ep-legacy'"); conn.commit()
+            _migrate_push_prefs_from_db()
+            check("JSON : migration jamais rejouée une fois le fichier présent",
+                  lambda: _push_prefs_load()['subscriptions']['ep-legacy']['notify_start'] is True)
+            conn.execute("DELETE FROM push_subscriptions WHERE endpoint='ep-legacy'"); conn.commit()
+            _push_prefs_update(lambda s: s.clear())
+
+            # ── CRUD abonnement (préférences JSON) ──
+            _push_prefs_update(lambda s: s.__setitem__('ep1',{'scope_nicks':['n1','n2'],'notify_start':False,
+                'notify_end':True,'expires_at':_expires_at_value(30),'updated_at':_utc_now_str()}))
+            check("CRUD : création lisible",lambda: _push_prefs_load()['subscriptions']['ep1']['scope_nicks']==['n1','n2'])
+            def _upd(s): s['ep1']['notify_start']=True; s['ep1']['notify_end']=False
+            _push_prefs_update(_upd)
+            def _upd_ok():
+                p=_prefs_entry(_push_prefs_load()['subscriptions']['ep1'])
+                return p['notify_start'] and not p['notify_end'] and p['scope_nicks']==['n1','n2']
+            check("CRUD : préférences mises à jour, scope_nicks intact (AD-4)",_upd_ok)
+            _push_prefs_update(lambda s: s.pop('ep1',None))
+            check("CRUD : suppression effective",lambda: 'ep1' not in _push_prefs_load()['subscriptions'])
+            def _update_exception_rollback():
+                before=open(PUSH_PREFS_FILE,encoding='utf-8').read()
+                def _boom(s): s['jamais-ecrit']={}; raise RuntimeError('annulé')
+                try: _push_prefs_update(_boom)
+                except RuntimeError: pass
+                return open(PUSH_PREFS_FILE,encoding='utf-8').read()==before
+            check("JSON : exception pendant une mise à jour -> fichier inchangé (aucune écriture partielle)",
+                  _update_exception_rollback)
+
+            # ── Normalisation d'une entrée éditée à la main (fail-closed) ──
+            def _normalize_ok():
+                bad=_prefs_entry({'scope_nicks':'n1','notify_start':'yes','expires_at':'demain'})
+                missing=_prefs_entry(None)
+                return (bad['scope_nicks']==[] and bad['notify_start'] is False
+                        and bad['expires_at']=='1970-01-01 00:00:00'  # illisible -> expiré, jamais « à vie »
+                        and missing['scope_nicks']==[] and missing['expires_at'] is None)
+            check("JSON : entrée mal formée -> normalisée fail-closed (aucun nick, expirée, jamais « à vie »)",
+                  _normalize_ok)
+
+            # ── Fichier corrompu : jamais écrasé ──
+            def _corrupt_never_overwritten():
+                with open(PUSH_PREFS_FILE,'w',encoding='utf-8') as f: f.write('{ceci n\'est pas du json')
+                try:
+                    try: _push_prefs_update(lambda s: s.__setitem__('x',{}))
+                    except PushPrefsError: raised=True
+                    else: raised=False
+                    intact=open(PUSH_PREFS_FILE,encoding='utf-8').read()=='{ceci n\'est pas du json'
+                    try: _push_subscriptions_for('nickPush','notify_end'); sel_raised=False
+                    except PushPrefsError: sel_raised=True
+                    return raised and intact and sel_raised
+                finally:
+                    _push_prefs_save({'version':1,'subscriptions':{}})
+            check("JSON : fichier corrompu -> PushPrefsError, jamais écrasé ni lu comme vide",_corrupt_never_overwritten)
 
             # ── scope_nicks via GROUPS_HEADER (_scope_nicks_for_groups, eff>=1) — jamais exercé
             # jusqu'ici : le CRUD ci-dessus insère scope_nicks en SQL brut, et la vérif manuelle
@@ -2347,13 +2569,14 @@ def push_selftest():
 
             # ── expires_at : fournie / absente (défaut) / « à vie » ──
             def _expires_matches(days_value):
-                r=conn.execute(f"SELECT {_expires_at_expr(days_value)} AS v").fetchone()
-                val=_dt.datetime.strptime(r['v'],'%Y-%m-%d %H:%M:%S')
-                delta=(val-_dt.datetime.utcnow()).total_seconds()
-                return abs(delta-days_value*86400)<60
+                val=_dt.datetime.strptime(_expires_at_value(days_value),_PUSH_TS_FMT)
+                # comparée à datetime('now') SQLite : même horloge UTC, même format (continuité avec les
+                # valeurs migrées depuis push.db)
+                now=_dt.datetime.strptime(conn.execute("SELECT datetime('now') AS v").fetchone()['v'],_PUSH_TS_FMT)
+                return abs((val-now).total_seconds()-days_value*86400)<60
             check("expires_at : valeur fournie (5 jours) -> date cohérente",lambda: _expires_matches(5))
             check("expires_at : absente -> défaut serveur (PUSH_DEFAULT_EXPIRY_DAYS)",lambda: _expires_matches(PUSH_DEFAULT_EXPIRY_DAYS))
-            check("expires_at : « à vie » -> NULL",lambda: _expires_at_expr(None)=='NULL')
+            check("expires_at : « à vie » -> None",lambda: _expires_at_value(None) is None)
 
             # ── clamp BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS ──
             check("clamp : valeur négative -> repli 30",lambda: _clamp_push_default_expiry('-5')==30)
@@ -2377,13 +2600,17 @@ def push_selftest():
             class _FakeResp:
                 def __init__(self,code): self.status_code=code; self.text=''
             def _insert_sub(endpoint,nick,notify_start=0,notify_end=1,expires_at=None):
-                conn.execute("""INSERT INTO push_subscriptions
-                        (endpoint,p256dh,auth,scope_nicks,notify_start,notify_end,expires_at)
-                        VALUES (?,?,?,?,?,?,?)""",
-                    (endpoint,'p256','auth',json.dumps([nick]),notify_start,notify_end,expires_at))
+                # clés -> push.db (colonnes de préférence héritées laissées neutres, plus jamais lues) ;
+                # préférences -> fichier JSON (source de vérité)
+                conn.execute("INSERT INTO push_subscriptions (endpoint,p256dh,auth,scope_nicks) VALUES (?,?,?,'[]')",
+                             (endpoint,'p256','auth'))
                 conn.commit()
+                _push_prefs_update(lambda s: s.__setitem__(endpoint,{'scope_nicks':[nick],
+                    'notify_start':bool(notify_start),'notify_end':bool(notify_end),'expires_at':expires_at}))
             def _sub_exists(endpoint):
-                return conn.execute("SELECT 1 FROM push_subscriptions WHERE endpoint=?",(endpoint,)).fetchone() is not None
+                in_db=conn.execute("SELECT 1 FROM push_subscriptions WHERE endpoint=?",(endpoint,)).fetchone() is not None
+                in_json=endpoint in _push_prefs_load()['subscriptions']
+                return in_db and in_json
 
             _insert_sub('push-ep-ok','nickPush')
             _insert_sub('push-ep-410','nickPush')
@@ -2413,8 +2640,9 @@ def push_selftest():
                               and json.loads(d)['result']=='success' and 'timestamp' in json.loads(d)
                               for _,d in sent_to))
             check("push : envoi réussi -> abonnement conservé",lambda: _sub_exists('push-ep-ok'))
-            check("push : WebPushException status_code=410 -> abonnement désabonné automatiquement",
-                  lambda: not _sub_exists('push-ep-410'))
+            check("push : WebPushException status_code=410 -> abonnement désabonné automatiquement (push.db ET JSON)",
+                  lambda: conn.execute("SELECT 1 FROM push_subscriptions WHERE endpoint='push-ep-410'").fetchone() is None
+                          and 'push-ep-410' not in _push_prefs_load()['subscriptions'])
             check("push : WebPushException autre code (500) -> abonnement conservé, jamais désabonné",
                   lambda: _sub_exists('push-ep-500'))
             check("push : exception non-WebPushException (réseau) -> abonnement conservé, jamais désabonné",
@@ -2425,10 +2653,62 @@ def push_selftest():
                 _send_bkp_push('nickPush','start',None)
             check("push : événement 'start' n'envoie qu'aux abonnements notify_start=1 (jamais notify_end seul)",
                   lambda: {e for e,_ in sent_to}=={'push-ep-notifystart-only'})
+
+            # ── Routes HTTP de bout en bout (TestClient, sans lifespan : le watcher ne démarre pas) ──
+            # httpx (requis par TestClient) n'est pas forcément installé en production : contrôles
+            # sautés et signalés plutôt qu'un FAIL trompeur.
+            try:
+                from fastapi.testclient import TestClient
+            except Exception as e:
+                print(f"SKIP routes /push/* de bout en bout (TestClient indisponible : {e})")
+            else:
+                client=TestClient(app); H={'X-API-Key':API_KEY}; P=API_PREFIX
+                ep='https://push.example.invalid/ep-route'
+                r=client.post(f"{P}/push/subscribe",headers=H,json={'endpoint':ep,'keys':{'p256dh':'p','auth':'a'},
+                              'notify_start':True,'notify_end':False,'expires_in_days':None})
+                def _post_ok():
+                    e=_push_prefs_load()['subscriptions'].get(ep)
+                    return (r.status_code==200 and r.json()['notify_start'] is True and r.json()['expires_at'] is None
+                            and e is not None and e['notify_end'] is False and e['expires_at'] is None
+                            and conn.execute("SELECT 1 FROM push_subscriptions WHERE endpoint=?",(ep,)).fetchone())
+                check("route POST /push/subscribe : clés -> push.db, préférences -> JSON (« à vie »)",_post_ok)
+                r=client.patch(f"{P}/push/subscribe",headers=H,json={'endpoint':ep,'notify_end':True,'expires_in_days':7})
+                check("route PATCH /push/subscribe : préférences modifiées dans le JSON, scope_nicks intact",
+                      lambda: r.status_code==200 and _push_prefs_load()['subscriptions'][ep]['notify_end'] is True
+                              and _push_prefs_load()['subscriptions'][ep]['expires_at'] is not None
+                              and r.json()['scope_nicks']==_push_prefs_load()['subscriptions'][ep]['scope_nicks'])
+                r=client.get(f"{P}/push/subscriptions",headers=H,params={'endpoint':ep})
+                check("route GET /push/subscriptions : fusion push.db + JSON",
+                      lambda: r.status_code==200 and r.json()['subscriptions'][0]['notify_end'] is True
+                              and r.json()['subscriptions'][0]['prefs_missing'] is False)
+                _push_prefs_update(lambda s: s.pop(ep))
+                r=client.patch(f"{P}/push/subscribe",headers=H,json={'endpoint':ep,'notify_end':False})
+                check("route PATCH : entrée JSON absente -> 409 explicite (jamais recréée en silence)",
+                      lambda: r.status_code==409 and ep not in _push_prefs_load()['subscriptions'])
+                r=client.delete(f"{P}/push/subscribe",headers=H,params={'endpoint':ep})
+                check("route DELETE /push/subscribe : push.db et JSON nettoyés",
+                      lambda: r.status_code==200 and r.json()['deleted'] is True
+                              and conn.execute("SELECT 1 FROM push_subscriptions WHERE endpoint=?",(ep,)).fetchone() is None)
+                with open(PUSH_PREFS_FILE,'w',encoding='utf-8') as f: f.write('pas du json')
+                r=client.get(f"{P}/push/subscriptions",headers=H,params={'endpoint':'push-ep-ok'})
+                check("route GET : fichier JSON corrompu -> 500 explicite (jamais une liste vide trompeuse)",
+                      lambda: r.status_code==500 and 'Préférences push indisponibles' in r.json()['detail'])
+                _push_prefs_save({'version':1,'subscriptions':{}})
+                r=client.get("/sw.js")
+                check("route /sw.js : servie sans X-API-Key, JavaScript, portée racine autorisée",
+                      lambda: (r.status_code==200 and 'javascript' in r.headers['content-type']
+                               and r.headers.get('service-worker-allowed')=='/') if _SW_JS is not None
+                              else r.status_code==404)
+                r=client.get("/version")
+                check("route /version : push_available + bornes d'expiration exposées",
+                      lambda: {'push_available','push_default_expiry_days','push_max_expiry_days'}<=set(r.json()))
+                r=client.post(f"{P}/push/test",headers=H,params={'endpoint':'inconnu'})
+                check("route POST /push/test : endpoint inconnu -> 404 (ou 503 si envoi indisponible)",
+                      lambda: r.status_code in (404,503))
         finally:
             conn.close()
     finally:
-        PUSH_DB=old_push_db
+        PUSH_DB,PUSH_PREFS_FILE=old_push_db,old_prefs
         shutil.rmtree(tmpdir,ignore_errors=True)
 
     # ── Garde BORGHELPERWWW_* égarée dans .borghelperrc[DEFAULT] (piège réel constaté en prod) ──

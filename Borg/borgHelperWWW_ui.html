@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.9.1 -->
+<!-- UI_VERSION: 1.10.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -94,6 +94,7 @@
     <span class="badge ok" id="destructiveBadge" hidden style="margin-right:8px" title="Prune/DelBkp désactivés sur ce serveur (BORGHELPERWWW_ALLOW_DESTRUCTIVE)">🔒 Destructions désactivées</span>
     <span class="badge warn" id="downloadsBadge" hidden style="margin-right:8px" title="/download/file et /download/tar désactivés sur ce serveur (BORGHELPERWWW_ALLOW_DOWNLOADS)">🚫 Téléchargements désactivés</span>
     <span class="badge err" id="fullAccessBadge" hidden style="margin-right:8px" title="Aucune restriction sur ce serveur : Prune/DelBkp et téléchargements sont tous les deux autorisés">⚠️ Tout autorisé</span>
+    <button class="secondary" id="notifBtn" hidden onclick="openNotifications()" title="Notifications du navigateur au début/à la fin des sauvegardes">🔔 Notifications</button>
     <button class="secondary" id="serversBtn" hidden onclick="showMachines()">Serveurs</button>
     <button class="secondary" id="logoutBtn" hidden onclick="logout()">Déconnexion</button>
   </div>
@@ -243,6 +244,34 @@
     </div>
   </section>
 
+  <!-- VIEW 6 : NOTIFICATIONS PUSH (Story 2c, spec-push-ui-prefs-json) -->
+  <section id="view-notifications" hidden>
+    <button class="secondary" onclick="showMachines()">← Serveurs</button>
+    <div class="card" style="max-width:640px">
+      <h2 style="margin-top:0">Notifications de sauvegarde</h2>
+      <p class="hint">Notifications de ce navigateur au début et/ou à la fin des sauvegardes des serveurs
+        auxquels vous avez accès. Réglages propres à ce navigateur (un autre navigateur ou appareil
+        s'abonne séparément).</p>
+      <div id="notifStatus" style="margin-bottom:12px"></div>
+      <div id="notifForm" hidden>
+        <div class="field"><label style="display:inline;font-weight:500;color:var(--text)"><input type="checkbox" id="notifStart"> Début de sauvegarde</label></div>
+        <div class="field"><label style="display:inline;font-weight:500;color:var(--text)"><input type="checkbox" id="notifEnd" checked> Fin de sauvegarde (succès ou échec)</label></div>
+        <div class="field" style="max-width:360px">
+          <label for="notifExpiry">Durée de l'abonnement</label>
+          <select id="notifExpiry"></select>
+        </div>
+        <p class="hint" id="notifDetails"></p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button id="notifSubscribeBtn" onclick="notifSubscribe()">🔔 S'abonner</button>
+          <button id="notifSaveBtn" onclick="notifSave()" hidden>Enregistrer</button>
+          <button class="secondary" id="notifTestBtn" onclick="notifTest()" hidden>Envoyer un test</button>
+          <button class="danger" id="notifUnsubBtn" onclick="notifUnsubscribe()" hidden>Se désabonner</button>
+        </div>
+      </div>
+      <div id="notifError" class="error"></div>
+    </div>
+  </section>
+
 </main>
 
 <!-- Modale de sélection d'archive pour un téléchargement -->
@@ -279,14 +308,15 @@ let currentActionId=null;
 let allowDestructive=true; // état réel connu après résolution de loadFooterVersions() ci-dessous
 let allowDownloads=true;
 let API_PREFIX='/api'; // idem — appris depuis /version (seule route jamais préfixée, avec / et /healthz)
-let myAccess=null; // {groups_auth_enabled, nicks:{nick:{level:'none'|'read'|'write'|'admin',scope:null|string[]}}} — appris via /access, après connexion
+let myAccess=null; // {groups_auth_enabled, nicks:{nick:{level:'none'|'read'|'write'|'admin',read_scope:null|string[],restore_scope:null|string[]}}} — appris via /access, après connexion
+let pushInfo={available:false,vapidKey:null,defaultDays:30,maxDays:3650}; // appris depuis /version
+let currentViewId='view-login';
 const LEVEL_RANK={none:0,read:1,write:2,admin:3};
 
 // Badges d'en-tête : recalculés une première fois (globaux seulement, avant connexion) par
 // loadFooterVersions() ci-dessous, puis affinés (par utilisateur, via myAccess) par loadMachines().
-// nicks[nick] est {level,scope} depuis Story 1.1 (AD-6) — scope n'est pas encore consommé ici,
-// seul .level compte pour les badges (comportement inchangé par rapport à l'ancienne forme
-// bare-string).
+// nicks[nick] est {level,read_scope,restore_scope} (spec-groups-paths-restore) — les périmètres ne
+// sont pas consommés ici, seul .level compte pour les badges.
 function applyBadges(){
   const levels=myAccess?Object.values(myAccess.nicks).map(n=>n.level):[];
   const userMax=levels.reduce((m,l)=>Math.max(m,LEVEL_RANK[l]||0),0);
@@ -310,7 +340,10 @@ function applyBadges(){
     if(typeof v.api_prefix==='string') API_PREFIX=v.api_prefix;
     allowDestructive=!!v.allow_destructive;
     allowDownloads=!!v.allow_downloads;
+    pushInfo={available:!!(v.push_available&&v.vapid_public_key),vapidKey:v.vapid_public_key||null,
+              defaultDays:v.push_default_expiry_days||30,maxDays:v.push_max_expiry_days||3650};
     applyBadges();
+    updateNotifBtn();
   }catch(e){ /* info non critique, silencieux */ }
 })();
 
@@ -350,13 +383,23 @@ function setPassphrase(nick,val){
 // ── View switching ────────────────────────────────────────────────────────
 
 function showView(id){
-  ['view-login','view-machines','view-detail','view-browse','view-history'].forEach(v=>{
+  ['view-login','view-machines','view-detail','view-browse','view-history','view-notifications'].forEach(v=>{
     document.getElementById(v).hidden=(v!==id);
   });
+  currentViewId=id;
   document.getElementById('logoutBtn').hidden=(id==='view-login');
   document.getElementById('serversBtn').hidden=(id==='view-login'||id==='view-machines');
   document.getElementById('headerSub').textContent = id==='view-login' ? 'non connecté' :
-    (id==='view-detail'||id==='view-browse'||id==='view-history' ? 'serveur : '+currentNick : 'connecté');
+    (id==='view-detail'||id==='view-browse'||id==='view-history' ? 'serveur : '+currentNick :
+     id==='view-notifications' ? 'notifications' : 'connecté');
+  updateNotifBtn();
+}
+
+// Bouton 🔔 : seulement une fois connecté, et si le serveur peut réellement envoyer (pywebpush/py_vapid
+// présents + Service Worker déployé, `push_available` de /version).
+function updateNotifBtn(){
+  document.getElementById('notifBtn').hidden=
+    !pushInfo.available || currentViewId==='view-login' || currentViewId==='view-notifications';
 }
 
 function logout(){
@@ -1308,6 +1351,191 @@ async function downloadViaFetch(path,params,nick,fallbackName){
   a.href=URL.createObjectURL(blob); a.download=filename;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+}
+
+// ── Notifications push (Story 2c, spec-push-ui-prefs-json) ───────────────────
+// Préférences stockées côté serveur dans un fichier JSON (une entrée par endpoint navigateur) via
+// /push/subscribe ; le Service Worker (/sw.js) ne fait qu'afficher les notifications reçues.
+
+let notifSub=null;     // PushSubscription du navigateur (pushManager.getSubscription)
+let notifServer=null;  // abonnement connu du serveur pour cet endpoint (GET /push/subscriptions)
+
+// Variante d'apiCall avec corps JSON (POST/PATCH des abonnements) — mêmes en-têtes, même gestion du 401.
+async function apiJson(method, path, body, params){
+  const url=new URL(API_PREFIX+path, location.origin);
+  Object.entries(params||{}).forEach(([k,v])=>{ if(v!==undefined&&v!==null&&v!=='') url.searchParams.set(k,v); });
+  const headers={'X-API-Key':getApiKey()};
+  const opts={method, headers};
+  if(body!==undefined){ headers['Content-Type']='application/json'; opts.body=JSON.stringify(body); }
+  let res;
+  try{ res=await fetch(url.toString(), opts); }
+  catch(e){ return {httpStatus:0, detail:'Requête impossible : '+e.message}; }
+  if(res.status===401){
+    logout();
+    document.getElementById('loginError').textContent='Session expirée ou clé invalide — reconnectez-vous.';
+    return {httpStatus:401, detail:'401 Unauthorized'};
+  }
+  let data={};
+  try{ data=await res.json(); }catch(e){ /* corps vide/non JSON */ }
+  return {httpStatus:res.status, ...data};
+}
+function apiErr(r){
+  if(typeof r.detail==='string') return r.detail;
+  return 'HTTP '+r.httpStatus+(r.detail?' — '+JSON.stringify(r.detail):'');
+}
+
+function urlB64ToUint8Array(b64){
+  const pad='='.repeat((4-b64.length%4)%4);
+  const raw=atob((b64+pad).replace(/-/g,'+').replace(/_/g,'/'));
+  return Uint8Array.from(raw, c=>c.charCodeAt(0));
+}
+function fmtUtc(s){ const d=new Date(String(s).replace(' ','T')+'Z'); return isNaN(d)?s:d.toLocaleString(); }
+
+function notifUnsupported(){
+  if(!window.isSecureContext) return 'Page non sécurisée : les notifications push exigent HTTPS (ou localhost).';
+  if(!('serviceWorker' in navigator)||!('PushManager' in window)||!('Notification' in window))
+    return 'Ce navigateur ne prend pas en charge les notifications push.';
+  return null;
+}
+
+// current : undefined = pas encore abonné ; null = « à vie » ; sinon date d'expiration (UTC)
+function fillExpiry(current){
+  const opts=[];
+  if(current!==undefined) opts.push(['keep', current===null ? 'Inchangée (à vie)' : 'Inchangée (expire le '+fmtUtc(current)+')']);
+  opts.push(['', `Défaut du serveur (${pushInfo.defaultDays} jours)`]);
+  [7,30,90,365].filter(d=>d<=pushInfo.maxDays).forEach(d=>opts.push([String(d), d+' jours']));
+  opts.push(['life', 'À vie (jusqu\'au désabonnement)']);
+  document.getElementById('notifExpiry').innerHTML=
+    opts.map(([v,l])=>`<option value="${escapeAttr(v)}">${escapeHtml(l)}</option>`).join('');
+}
+// -> undefined (champ omis), null (« à vie »), ou nombre de jours
+function expiryPayload(forPatch){
+  const v=document.getElementById('notifExpiry').value;
+  if(v==='keep') return undefined;
+  if(v==='') return forPatch ? pushInfo.defaultDays : undefined; // PATCH : absent = inchangé
+  if(v==='life') return null;
+  return parseInt(v,10);
+}
+function notifTypesChecked(){
+  return document.getElementById('notifStart').checked || document.getElementById('notifEnd').checked;
+}
+
+async function openNotifications(){
+  showView('view-notifications');
+  const st=document.getElementById('notifStatus'), err=document.getElementById('notifError');
+  err.textContent=''; document.getElementById('notifForm').hidden=true;
+  const unsupported=notifUnsupported();
+  if(unsupported){ st.textContent=unsupported; return; }
+  st.innerHTML=SPINNER;
+  try{
+    const reg=await navigator.serviceWorker.register('/sw.js');
+    await navigator.serviceWorker.ready;
+    notifSub=await reg.pushManager.getSubscription();
+  }catch(e){ st.textContent=''; err.textContent='Service Worker indisponible : '+e.message; return; }
+  notifServer=null;
+  if(notifSub){
+    const r=await apiJson('GET','/push/subscriptions',undefined,{endpoint:notifSub.endpoint});
+    if(r.httpStatus!==200){ st.textContent=''; err.textContent=apiErr(r); return; }
+    notifServer=(r.subscriptions||[])[0]||null;
+  }
+  renderNotif();
+}
+
+function renderNotif(message){
+  const st=document.getElementById('notifStatus');
+  const denied=Notification.permission==='denied';
+  const subscribed=!!(notifSub && notifServer && !notifServer.prefs_missing);
+  document.getElementById('notifForm').hidden=false;
+  document.getElementById('notifSubscribeBtn').hidden=subscribed;
+  document.getElementById('notifSubscribeBtn').disabled=denied;
+  ['notifSaveBtn','notifTestBtn','notifUnsubBtn'].forEach(id=>document.getElementById(id).hidden=!subscribed);
+  if(denied) st.textContent='⛔ Notifications bloquées pour ce site dans le navigateur — les autoriser dans les réglages du site, puis revenir ici.';
+  else if(subscribed) st.innerHTML='<span class="badge ok">✅ Abonné</span>'+(message?' '+escapeHtml(message):'');
+  else if(notifSub && notifServer) st.innerHTML='<span class="badge warn">⚠️ Préférences absentes côté serveur</span> — se réabonner pour les recréer.';
+  else st.innerHTML='<span class="badge warn">Non abonné</span>'+(message?' '+escapeHtml(message):'');
+  if(subscribed){
+    document.getElementById('notifStart').checked=notifServer.notify_start;
+    document.getElementById('notifEnd').checked=notifServer.notify_end;
+    fillExpiry(notifServer.expires_at);
+    const nicks=notifServer.scope_nicks||[];
+    document.getElementById('notifDetails').innerHTML=
+      'Serveurs suivis ('+nicks.length+') : '+(nicks.length?nicks.map(n=>escapeHtml(n)).join(', '):'<em>aucun</em>')+
+      '. Liste figée à l\'abonnement (vos droits à ce moment-là) — se désabonner puis se réabonner pour la rafraîchir.';
+  } else {
+    fillExpiry(undefined);
+    document.getElementById('notifDetails').textContent=
+      'Vous serez notifié pour tous les serveurs auxquels vous avez accès au moment de l\'abonnement.';
+  }
+}
+
+async function notifSubscribe(){
+  const err=document.getElementById('notifError'); err.textContent='';
+  if(!notifTypesChecked()){ err.textContent='Cocher au moins un type de notification.'; return; }
+  const perm=await Notification.requestPermission();
+  if(perm!=='granted'){ err.textContent='Permission refusée par le navigateur.'; renderNotif(); return; }
+  const btn=document.getElementById('notifSubscribeBtn'); btn.disabled=true;
+  try{
+    const reg=await navigator.serviceWorker.ready;
+    const key=urlB64ToUint8Array(pushInfo.vapidKey);
+    let sub;
+    try{ sub=await reg.pushManager.subscribe({userVisibleOnly:true, applicationServerKey:key}); }
+    catch(e){
+      // Abonnement navigateur existant avec une autre clé serveur (clés VAPID régénérées) : le
+      // navigateur refuse d'en créer un second — on le remplace une fois.
+      const old=await reg.pushManager.getSubscription();
+      if(!old) throw e;
+      await old.unsubscribe();
+      sub=await reg.pushManager.subscribe({userVisibleOnly:true, applicationServerKey:key});
+    }
+    const j=sub.toJSON();
+    const body={endpoint:j.endpoint, keys:{p256dh:j.keys.p256dh, auth:j.keys.auth},
+                notify_start:document.getElementById('notifStart').checked,
+                notify_end:document.getElementById('notifEnd').checked};
+    const exp=expiryPayload(false); if(exp!==undefined) body.expires_in_days=exp;
+    const r=await apiJson('POST','/push/subscribe',body);
+    if(r.httpStatus!==200){ err.textContent=apiErr(r); return; }
+    notifSub=sub; notifServer=r;
+    renderNotif('Abonnement enregistré — « Envoyer un test » pour vérifier.');
+  }catch(e){ err.textContent='Abonnement impossible : '+e.message; }
+  finally{ btn.disabled=false; }
+}
+
+async function notifSave(){
+  const err=document.getElementById('notifError'); err.textContent='';
+  if(!notifTypesChecked()){ err.textContent='Aucun type coché : utiliser plutôt « Se désabonner ».'; return; }
+  const body={endpoint:notifSub.endpoint,
+              notify_start:document.getElementById('notifStart').checked,
+              notify_end:document.getElementById('notifEnd').checked};
+  const exp=expiryPayload(true); if(exp!==undefined) body.expires_in_days=exp;
+  const r=await apiJson('PATCH','/push/subscribe',body);
+  if(r.httpStatus!==200){
+    err.textContent=apiErr(r);
+    if(r.httpStatus===404||r.httpStatus===409){ notifServer=null; renderNotif(); }
+    return;
+  }
+  notifServer=r; renderNotif('Réglages enregistrés.');
+}
+
+async function notifTest(){
+  const err=document.getElementById('notifError'); err.textContent='';
+  const btn=document.getElementById('notifTestBtn'); btn.disabled=true;
+  const r=await apiJson('POST','/push/test',undefined,{endpoint:notifSub.endpoint});
+  btn.disabled=false;
+  if(r.httpStatus===200){ renderNotif('Notification de test envoyée — elle doit apparaître dans quelques secondes.'); return; }
+  err.textContent=apiErr(r);
+  if(r.httpStatus===410){ notifSub=null; notifServer=null; renderNotif(); }
+}
+
+async function notifUnsubscribe(){
+  if(!confirm('Se désabonner des notifications sur ce navigateur ?')) return;
+  const err=document.getElementById('notifError'); err.textContent='';
+  // Serveur d'abord (plus aucun envoi), puis navigateur — même si le serveur échoue, l'endpoint
+  // devient mort côté navigateur et sera nettoyé automatiquement au prochain envoi (410).
+  const r=await apiJson('DELETE','/push/subscribe',undefined,{endpoint:notifSub.endpoint});
+  if(r.httpStatus!==200) err.textContent='Serveur : '+apiErr(r);
+  try{ await notifSub.unsubscribe(); }catch(e){ /* déjà désabonné côté navigateur */ }
+  notifSub=null; notifServer=null;
+  renderNotif('Désabonné.');
 }
 
 // ── Utils ─────────────────────────────────────────────────────────────────

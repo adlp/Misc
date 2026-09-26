@@ -33,7 +33,8 @@ Déployer l'arborescence `Borg/` complète (y compris `vendor/`) à l'emplacemen
 `/opt/borghelper/`. Fichiers/dossiers dont dépend l'exécution :
 
 - `borgHelper` — CLI, exécutable seul.
-- `borgHelperWWW` + `borgHelperWWW_ui.html` + `vendor/` — API HTTP, seulement si utilisée.
+- `borgHelperWWW` + `borgHelperWWW_ui.html` + `borgHelperWWW_sw.js` + `vendor/` — API HTTP, seulement
+  si utilisée.
 - `borgHelperWWW.py` — symlink vers `borgHelperWWW`, **requis uniquement** pour
   `uvicorn borgHelperWWW:app` (uvicorn importe le module par son nom et échoue sans l'extension
   `.py` — inutile en exécution directe `python3 borgHelperWWW ...`).
@@ -107,6 +108,12 @@ Réglages les plus importants pour un premier déploiement :
 | `allow_downloads` / `--allow-downloads` | Autorise `/download/file`/`/download/tar` — **autorisé par défaut** |
 | `groups_header` / `--groups-header` | Active le RBAC par groupes (voir [TECHNIQUE.md](TECHNIQUE.md#auth--rbac)) — désactivé par défaut, `X-API-Key` seul fait foi |
 | `push_db` / `--push-db` | Fichier SQLite dédié aux clés VAPID/abonnements push — **jamais reconstructible**, à sauvegarder comme une vraie donnée |
+| `push_prefs` / `--push-prefs` | Fichier JSON des préférences de notification (défaut à côté de `push_db`) — éditable à la main, à sauvegarder avec `push_db` |
+
+**Notifications dans le navigateur** : bouton 🔔 de l'UI. **HTTPS obligatoire** (ou `localhost`) —
+les navigateurs refusent le push sur une page HTTP. Déployer `borgHelperWWW_sw.js` à côté de
+`borgHelperWWW_ui.html` (servi sur `/sw.js`) : absent, le bouton n'apparaît pas. Derrière un reverse
+proxy avec préfixe, `/sw.js` doit rester joignable à la racine de l'origine, comme `/`.
 
 Lancement, deux méthodes équivalentes :
 

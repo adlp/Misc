@@ -997,6 +997,7 @@ première requête — voir `docs/borghelperrc.example`.
 | `BORGHELPERWWW_BKP_WATCHER_INTERVAL` | — | — | Intervalle (secondes) d'interrogation `bkp_status` par le watcher — défaut 30 (voir `POST /bkp` asynchrone ci-dessus) |
 | `BORGHELPERWWW_BKP_STATUS_TIMEOUT` | — | — | Délai (secondes) avant qu'une sauvegarde démarrée mais jamais terminée soit traitée comme un échec (AD-7) — défaut 21600 (6h) |
 | `BORGHELPERWWW_PUSH_DB` | `--push-db` | `push_db` | Chemin du fichier SQLite **dédié** aux clés VAPID et abonnements push (Story 2a, `spec-notifications-push`, AD-6 — jamais `scopecache.db`) — défaut : co-localisé avec `cache.db`/`diff.db` (voir [Notifications push](#notifications-push)) |
+| `BORGHELPERWWW_PUSH_PREFS` | `--push-prefs` | `push_prefs` | Fichier **JSON** des préférences de notification par abonné (début/fin, nicks suivis, expiration — `spec-push-ui-prefs-json`), éditable à la main — défaut : à côté de `push.db` (`<prefixe>-push-prefs.json`) |
 | `BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS` | — | — | Durée d'expiration par défaut (jours) d'un abonnement push quand `expires_in_days` est absent de `POST /push/subscribe` — défaut 30, repli sur 30 si valeur invalide/négative |
 | `BORGHELPERWWW_PUSH_VAPID_SUB` | — | — | Contact (`vapid_claims['sub']`, ex. `mailto:...`) requis par le protocole Web Push (RFC 8292) pour l'envoi réel (Story 2b) — défaut générique `mailto:admin@example.invalid`, à définir en production |
 
@@ -1599,12 +1600,51 @@ groupes](#autorisation-par-groupes-reverse-proxy-oidcauth_request) ci-dessus).
 
 ### Notifications push
 
-**Story 2a de `spec-notifications-push`** — stocke/expose les abonnements push navigateur et les clés
-VAPID. Fichier dédié `push.db` (jamais `scopecache.db` — voir `BORGHELPERWWW_PUSH_DB` dans
-[Configuration](#configuration)), clés VAPID (EC P-256) générées **une seule fois** au premier
-démarrage, jamais régénérées ensuite. Clé publique VAPID exposée sur `GET /version` (déjà public, sans
-clé API) : `{"vapid_public_key": "..."}` — nécessaire côté client pour
-`PushManager.subscribe({applicationServerKey})` (Story 2b).
+**Depuis l'UI (Story 2c, `spec-push-ui-prefs-json`)** : bouton **🔔 Notifications** dans l'en-tête
+(affiché une fois connecté, si `GET /version` indique `push_available: true` — `pywebpush`/`py_vapid`
+disponibles et Service Worker déployé). La vue permet de s'abonner (le navigateur demande la
+permission), de cocher début et/ou fin de sauvegarde, de choisir la durée (défaut serveur, 7/30/90/365
+jours, ou « à vie »), d'**envoyer un test**, de modifier ses réglages et de se désabonner. Réglages
+propres à chaque navigateur. **Exige HTTPS** (ou `localhost`) : un navigateur refuse les notifications
+push sur une page non sécurisée. Service Worker : fichier statique `borgHelperWWW_sw.js` (à côté de
+l'UI), servi sur `GET /sw.js` sans `X-API-Key` (un navigateur ne peut pas ajouter d'en-tête à
+l'enregistrement de son propre Service Worker) — il ne fait qu'afficher la notification et ramener
+l'onglet borgHelperWWW au premier plan au clic.
+
+**Stockage des préférences — fichier JSON** (`BORGHELPERWWW_PUSH_PREFS`, défaut
+`<prefixe>-push-prefs.json` à côté de `push.db`) : source de vérité unique des réglages de chaque
+abonné, indexés par `endpoint`, **éditable à la main** et pris en compte à chaud (lu à chaque envoi) :
+
+```json
+{
+  "subscriptions": {
+    "https://fcm.googleapis.com/fcm/send/...": {
+      "expires_at": null,
+      "notify_end": true,
+      "notify_start": false,
+      "scope_nicks": ["srv-web", "srv-db"],
+      "updated_at": "2026-09-26 18:28:06"
+    }
+  },
+  "version": 1
+}
+```
+
+`expires_at` : `null` = « à vie », sinon date UTC `AAAA-MM-JJ HH:MM:SS`. Écritures atomiques (fichier
+temporaire + renommage, mode `0600`) sous verrou (`<fichier>.lock`, plusieurs workers uvicorn). Une
+entrée mal formée est normalisée **fail-closed** (nicks invalides -> aucun, date illisible -> expiré,
+jamais « à vie » par accident) ; un fichier **corrompu n'est jamais écrasé** : les routes `/push/*`
+répondent `500` explicite et le watcher n'envoie rien (log `[watcher] push: ...`) tant qu'il n'est pas
+corrigé. Au premier démarrage en 1.19.0, les préférences des abonnements existants sont migrées
+automatiquement depuis `push.db` (une fois). `push.db` ne garde plus que les clés VAPID et les clés de
+chiffrement de chaque navigateur (`endpoint`/`p256dh`/`auth`) ; ses anciennes colonnes de préférence
+sont conservées mais plus lues.
+
+**Stockage des clés — `push.db`** (Story 2a) : fichier dédié (jamais `scopecache.db` — voir
+`BORGHELPERWWW_PUSH_DB` dans [Configuration](#configuration)), clés VAPID (EC P-256) générées **une
+seule fois** au premier démarrage, jamais régénérées ensuite. Clé publique VAPID exposée sur
+`GET /version` (déjà public, sans clé API) : `{"vapid_public_key": "..."}` — nécessaire côté client
+pour `PushManager.subscribe({applicationServerKey})`.
 
 Gestion par `endpoint` (la `PushSubscription` du navigateur, retrouvable via
 `pushManager.getSubscription()`) plutôt que par compte : pas de couche d'authentification
@@ -1656,6 +1696,13 @@ curl -X PATCH http://localhost:8000/api/push/subscribe -H "X-API-Key: $KEY" -H "
   "endpoint": "https://push.example.com/ep1", "notify_end": false, "expires_in_days": null
 }'
 # 404 explicite si l'endpoint est inconnu — jamais de création silencieuse (PATCH != POST)
+# 409 si l'endpoint est connu de push.db mais sans entrée dans le fichier JSON (fichier supprimé/édité)
+#     — se réabonner (POST) pour recréer les préférences
+
+curl -X POST "http://localhost:8000/api/push/test?endpoint=https://push.example.com/ep1" -H "X-API-Key: $KEY"
+# {"sent": true} — envoie une notification de TEST à ce seul abonnement (payload event:"test") ;
+# 404 endpoint inconnu, 410 abonnement mort côté navigateur (supprimé), 502 service push en erreur,
+# 503 envoi indisponible sur ce serveur (pywebpush/py_vapid absents)
 
 curl -X DELETE "http://localhost:8000/api/push/subscribe?endpoint=https://push.example.com/ep1" -H "X-API-Key: $KEY"
 # {"deleted": true} — un endpoint déjà absent renvoie {"deleted": false}, jamais un 404 bruyant
@@ -1670,8 +1717,12 @@ Réponse commune à `POST`/`PATCH`/`GET` (un ou plusieurs objets de cette forme)
 ```json
 {"id": 1, "endpoint": "...", "scope_nicks": ["demo-modules"],
  "notify_start": true, "notify_end": true,
- "expires_at": "2026-10-26 07:48:45", "created_at": "2026-09-26 07:48:45"}
+ "expires_at": "2026-10-26 07:48:45", "created_at": "2026-09-26 07:48:45",
+ "updated_at": "2026-09-26 07:48:45", "prefs_missing": false}
 ```
+
+`prefs_missing: true` : endpoint connu de `push.db` sans entrée dans le fichier JSON — aucune
+notification ne part pour lui tant qu'il ne s'est pas réabonné.
 
 Vérification interne dédiée : `borgHelperWWW -C ... --selftest` (voir `TECHNICAL.md` — génération
 VAPID, CRUD, calcul d'expiration, clamp de `BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS`, envoi push mocké,
@@ -1682,10 +1733,10 @@ sur des fichiers temporaires uniquement).
 Le watcher `bkp_status` (voir `POST /bkp` asynchrone ci-dessus) ne se contente plus de journaliser :
 à chaque réclamation CAS gagnée — **début** de sauvegarde (`started_at` écrit, aucun délai à
 attendre) **et** fin (succès, échec, ou timeout AD-7) — il envoie un push réel (`pywebpush`) à chaque
-abonnement de `push.db` dont `scope_nicks` contient le nick concerné, non expiré, avec le type
-correspondant actif (`notify_start`/`notify_end`). Payload JSON (contenu affiché par le futur Service
-Worker, Story 2c) : `{"nick":..., "event":"start"|"end", "result":"success"|"error"|null,
-"timestamp":...}` — `result` toujours `null` pour un événement de début.
+abonnement dont les préférences (fichier JSON) contiennent le nick concerné dans `scope_nicks`, non
+expiré, avec le type correspondant actif (`notify_start`/`notify_end`). Payload JSON (affiché par le
+Service Worker) : `{"nick":..., "event":"start"|"end"|"test", "result":"success"|"error"|null,
+"timestamp":...}` — `result` toujours `null` pour un début ou un test.
 
 Un abonnement mort côté navigateur (le service de push répond `404`/`410`) est désabonné
 automatiquement (même requête que `DELETE /push/subscribe`). Toute autre erreur (réseau, autre code
