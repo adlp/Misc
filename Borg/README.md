@@ -1772,6 +1772,21 @@ Réponse commune à `POST`/`PATCH`/`GET` (un ou plusieurs objets de cette forme)
 `prefs_missing: true` : endpoint connu de `push.db` sans entrée dans le fichier JSON — aucune
 notification ne part pour lui tant qu'il ne s'est pas réabonné.
 
+**Dépannage — « Envoyer un test » n'affiche rien** (UI ≥ 1.11.1) : cliquer **« Tester l'affichage
+local »** (notification créée par le navigateur lui-même, sans serveur ni service push).
+
+- Le test local n'apparaît pas non plus : blocage côté navigateur/système — autorisation des
+  notifications pour le navigateur dans le système (GNOME/KDE, Windows, macOS), mode « Ne pas
+  déranger », permission du site.
+- Le test local apparaît mais pas le test serveur : acheminement. Le serveur `borgHelperWWW` doit
+  joindre en HTTPS sortant le service push du navigateur (Firefox : `updates.push.services.mozilla.com`,
+  Chrome : `fcm.googleapis.com`) — pare-feu/proxy (`HTTPS_PROXY` est respecté). Depuis 1.20.2, un
+  service injoignable donne une erreur explicite en 10 s au lieu d'une attente sans fin. Vérifier
+  depuis le serveur : `curl -sI https://updates.push.services.mozilla.com/`.
+
+Les notifications de sauvegarde sont conservées 24 h par le service push si le navigateur est hors
+ligne (TTL), puis livrées à sa reconnexion ; le test, 5 minutes.
+
 Vérification interne dédiée : `borgHelperWWW -C ... --selftest` (voir `TECHNICAL.md` — génération
 VAPID, CRUD, calcul d'expiration, clamp de `BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS`, envoi push mocké,
 sur des fichiers temporaires uniquement).

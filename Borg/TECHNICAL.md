@@ -2697,6 +2697,14 @@ n'envoie aucun en-tête personnalisé à l'enregistrement d'un Service Worker), 
 `Service-Worker-Allowed: /`. Contenu : `push` → `showNotification` (tag `bkp-<nick>`, une fin remplace
 le début), `notificationclick` → focus d'un onglet existant ou `openWindow('/')`. Aucun cache hors-ligne.
 
+**Envoi (1.20.2)** : `webpush(..., timeout=PUSH_SEND_TIMEOUT, ttl=...)` — sans `timeout`, pywebpush
+transmet `timeout=None` à `requests` (attente infinie si le service push est injoignable : bouton de
+test sans réponse) ; sans `ttl`, il envoie `TTL: 0`, le service push acceptant (201) puis jetant le
+message si le navigateur n'est pas connecté à cet instant. `PUSH_SEND_TIMEOUT=10` s, `PUSH_TTL_BKP=24 h`,
+`PUSH_TTL_TEST=5 min`. `/push/test` : erreur réseau → 502 nommant l'hôte du service push. UI 1.11.1 :
+« Tester l'affichage local » (`registration.showNotification` direct) pour séparer affichage et
+acheminement.
+
 **`GET /version`** ajoute `push_available` (`pywebpush` + clé VAPID + Service Worker chargés),
 `push_default_expiry_days`, `push_max_expiry_days` — l'UI n'affiche le bouton 🔔 que si
 `push_available`.

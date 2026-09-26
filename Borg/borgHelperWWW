@@ -6,7 +6,7 @@
 #* See <http://www.gnu.org/licenses/>
 #*/
 
-import os,re,sys,io,json,sqlite3,secrets,subprocess,configparser,tarfile,hmac,hashlib,asyncio,contextlib,datetime
+import os,re,sys,io,json,sqlite3,secrets,subprocess,configparser,tarfile,hmac,hashlib,asyncio,contextlib,datetime,urllib.parse
 from pathlib import Path
 from typing import Optional
 from collections import defaultdict
@@ -62,7 +62,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.20.1"
+WWW_VERSION="1.20.2"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -271,6 +271,15 @@ PUSH_DEFAULT_EXPIRY_DAYS=_clamp_push_default_expiry(os.environ.get('BORGHELPERWW
 # même esprit que API_KEY générée aléatoirement plus haut (fonctionnel par défaut, à durcir en prod).
 PUSH_VAPID_SUB=os.environ.get('BORGHELPERWWW_PUSH_VAPID_SUB','mailto:admin@example.invalid').strip() \
     or 'mailto:admin@example.invalid'
+
+# Paramètres d'envoi au service push du navigateur (1.20.2). Sans `timeout`, pywebpush transmet
+# timeout=None à requests : un service push injoignable (pare-feu/proxy sortant) bloquait l'appel
+# indéfiniment — bouton « Envoyer un test » sans aucune réponse. Sans `ttl`, pywebpush envoie TTL: 0 :
+# le service push accepte (201) puis JETTE le message si le navigateur n'est pas connecté à cet instant
+# précis. TTL = durée pendant laquelle le service push garde le message pour un navigateur hors ligne.
+PUSH_SEND_TIMEOUT=10          # secondes, par requête vers le service push
+PUSH_TTL_BKP=24*3600          # début/fin de sauvegarde : livrée jusqu'à 24 h plus tard
+PUSH_TTL_TEST=300             # notification de test : sans intérêt au-delà de quelques minutes
 
 if not CFGFILE:
     sys.exit("Fichier de conf manquant — -C/--cfgfile ou BORGHELPERWWW_CFGFILE (chemin du .borghelperrc dédié à l'API)")
@@ -1174,7 +1183,8 @@ def _send_bkp_push(nick,event,result):
         try:
             webpush(subscription_info=subscription_info,data=payload,
                     vapid_private_key=PUSH_VAPID_PRIVATE_KEY,
-                    vapid_claims={'sub':PUSH_VAPID_SUB})
+                    vapid_claims={'sub':PUSH_VAPID_SUB},
+                    timeout=PUSH_SEND_TIMEOUT,ttl=PUSH_TTL_BKP)
         except WebPushException as e:
             if e.status_code in (404,410):
                 # Revue de code : sqlite3.Error ici (DB verrouillée, etc.) ne doit jamais faire
@@ -2522,14 +2532,19 @@ def push_test(endpoint: str, x_api_key: Optional[str]=Header(default=None)):
                         'timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat()})
     try:
         webpush(subscription_info={'endpoint':endpoint,'keys':{'p256dh':row['p256dh'],'auth':row['auth']}},
-                data=payload,vapid_private_key=PUSH_VAPID_PRIVATE_KEY,vapid_claims={'sub':PUSH_VAPID_SUB})
+                data=payload,vapid_private_key=PUSH_VAPID_PRIVATE_KEY,vapid_claims={'sub':PUSH_VAPID_SUB},
+                timeout=PUSH_SEND_TIMEOUT,ttl=PUSH_TTL_TEST)
     except WebPushException as e:
         if e.status_code in (404,410):
             with contextlib.suppress(sqlite3.Error,PushPrefsError,OSError): _push_delete_endpoint(endpoint)
             raise HTTPException(410,detail=f"Abonnement expiré côté navigateur (HTTP {e.status_code}) — supprimé, se réabonner")
         raise HTTPException(502,detail=f"Service push du navigateur en erreur (HTTP {e.status_code}) : {e}")
     except Exception as e:
-        raise HTTPException(502,detail=f"Envoi impossible : {e}")
+        # Typiquement réseau : service push du navigateur injoignable depuis CE serveur (pare-feu,
+        # proxy sortant — requests respecte HTTPS_PROXY) ou délai PUSH_SEND_TIMEOUT dépassé.
+        host=urllib.parse.urlsplit(endpoint).hostname or '?'
+        raise HTTPException(502,detail=f"Envoi impossible vers le service push {host} depuis ce serveur "
+            f"(pare-feu/proxy sortant ?) : {type(e).__name__}: {e}")
     return {'sent':True}
 
 app.include_router(router,prefix=API_PREFIX)

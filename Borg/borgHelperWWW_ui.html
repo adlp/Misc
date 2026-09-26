@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.11.0 -->
+<!-- UI_VERSION: 1.11.1 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -265,6 +265,7 @@
           <button id="notifSubscribeBtn" onclick="notifSubscribe()">🔔 S'abonner</button>
           <button id="notifSaveBtn" onclick="notifSave()" hidden>Enregistrer</button>
           <button class="secondary" id="notifTestBtn" onclick="notifTest()" hidden>Envoyer un test</button>
+          <button class="secondary" id="notifLocalBtn" onclick="notifLocalTest()" hidden title="Affiche une notification directement depuis ce navigateur, sans passer par le serveur ni par le service push — pour distinguer un problème d'affichage (navigateur/système) d'un problème d'acheminement">Tester l'affichage local</button>
           <button class="danger" id="notifUnsubBtn" onclick="notifUnsubscribe()" hidden>Se désabonner</button>
         </div>
       </div>
@@ -1465,7 +1466,7 @@ function renderNotif(message){
   document.getElementById('notifForm').hidden=false;
   document.getElementById('notifSubscribeBtn').hidden=subscribed;
   document.getElementById('notifSubscribeBtn').disabled=denied;
-  ['notifSaveBtn','notifTestBtn','notifUnsubBtn'].forEach(id=>document.getElementById(id).hidden=!subscribed);
+  ['notifSaveBtn','notifTestBtn','notifLocalBtn','notifUnsubBtn'].forEach(id=>document.getElementById(id).hidden=!subscribed);
   if(denied) st.textContent='⛔ Notifications bloquées pour ce site dans le navigateur — les autoriser dans les réglages du site, puis revenir ici.';
   else if(subscribed) st.innerHTML='<span class="badge ok">✅ Abonné</span>'+(message?' '+escapeHtml(message):'');
   else if(notifSub && notifServer) st.innerHTML='<span class="badge warn">⚠️ Préférences absentes côté serveur</span> — se réabonner pour les recréer.';
@@ -1536,11 +1537,30 @@ async function notifSave(){
 async function notifTest(){
   const err=document.getElementById('notifError'); err.textContent='';
   const btn=document.getElementById('notifTestBtn'); btn.disabled=true;
+  renderNotif('Envoi en cours…');
   const r=await apiJson('POST','/push/test',undefined,{endpoint:notifSub.endpoint});
   btn.disabled=false;
-  if(r.httpStatus===200){ renderNotif('Notification de test envoyée — elle doit apparaître dans quelques secondes.'); return; }
+  if(r.httpStatus===200){
+    renderNotif('Notification de test transmise au service push du navigateur — elle doit apparaître dans '+
+      'quelques secondes. Rien ? Essayer « Tester l\'affichage local » : s\'il n\'affiche rien non plus, '+
+      'le blocage est côté navigateur/système (autorisation des notifications pour le navigateur dans le '+
+      'système, mode « Ne pas déranger »), pas côté serveur.');
+    return;
+  }
+  renderNotif();
   err.textContent=apiErr(r);
   if(r.httpStatus===410){ notifSub=null; notifServer=null; renderNotif(); }
+}
+
+async function notifLocalTest(){
+  const err=document.getElementById('notifError'); err.textContent='';
+  try{
+    const reg=await navigator.serviceWorker.ready;
+    await reg.showNotification('borgHelper — test local',{body:'Affichage local OK (sans serveur ni service push).',tag:'bkp-local-test'});
+    renderNotif('Notification locale demandée au navigateur. Si elle s\'affiche mais pas « Envoyer un test », '+
+      'le problème est l\'acheminement (serveur → service push du navigateur) : voir le message d\'erreur '+
+      'ou le journal de borgHelperWWW.');
+  }catch(e){ err.textContent='Affichage local impossible : '+e.message; }
 }
 
 async function notifUnsubscribe(){

@@ -1,5 +1,21 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.20.2 / borgHelperWWW_ui.html 1.11.1 — envoi push : délai, TTL, diagnostic — 2026-09-26
+
+Rapport utilisateur : « Envoyer un test » ne provoque aucun affichage dans Firefox.
+
+- **Délai d'envoi** : `webpush()` était appelé sans `timeout` (pywebpush transmet alors `None` à
+  `requests`) — un service push injoignable depuis le serveur (pare-feu, proxy sortant) bloquait
+  l'appel sans fin, sans message dans l'UI. Désormais 10 s, puis `502` explicite nommant l'hôte du
+  service push (ex. `updates.push.services.mozilla.com`).
+- **TTL** : pywebpush envoie `TTL: 0` par défaut — le service push accepte puis jette le message si
+  le navigateur n'est pas connecté à cet instant. Désormais 24 h pour début/fin de sauvegarde, 5 min
+  pour le test.
+- **UI** : « Envoi en cours… » pendant le test ; nouveau bouton « Tester l'affichage local » (sans
+  serveur ni service push) pour distinguer un blocage d'affichage (navigateur/système) d'un problème
+  d'acheminement ; message de succès expliquant la marche à suivre.
+- README : section de dépannage.
+
 ## borgHelperWWW 1.20.1 — avertissements push précis, plus jamais « pip install » — 2026-09-26
 
 Rapport utilisateur : au démarrage, `[WARN] py_vapid absent ... 'pip3 install pywebpush'` — conseil
