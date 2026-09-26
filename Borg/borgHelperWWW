@@ -39,7 +39,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.18.4"
+WWW_VERSION="1.18.5"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -187,7 +187,23 @@ if API_PREFIX and not API_PREFIX.startswith('/'): API_PREFIX='/'+API_PREFIX
 # Autorisation par groupes (reverse proxy OIDC/auth_request en amont, ex. nginx) — voir plus bas
 # (_check_group_access). Vide/absent : fonctionnalité désactivée, comportement inchangé (X-API-Key
 # seul fait foi). GROUPS_HEADER est le nom du header HTTP à lire (ex. 'X-Groups'), jamais la valeur.
+def _is_valid_http_token(value):
+    """RFC 7230 'token' (nom de header HTTP valide) : lettres/chiffres/quelques symboles, jamais
+    d'espace ni de caractère non-ASCII. Extrait pour être testable directement (push_selftest)."""
+    return bool(re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+",value))
+
 GROUPS_HEADER=os.environ.get('BORGHELPERWWW_GROUPS_HEADER','').strip() or None
+if GROUPS_HEADER is not None and not _is_valid_http_token(GROUPS_HEADER):
+    # Un nom de header HTTP n'accepte que le "token" RFC 7230 (ASCII imprimable restreint) — une
+    # valeur malformée planterait sur TOUTE requête protégée par le RBAC (request.headers.get(...)
+    # encode le nom en latin-1) plutôt qu'ici, une fois, avec un message clair. Piège réel constaté :
+    # un commentaire resté collé à la valeur sur la même ligne dans un fichier de conf (configparser
+    # n'a inline_comment_prefixes réglé nulle part dans ce projet — un commentaire va TOUJOURS sur sa
+    # propre ligne, jamais après une valeur, voir docs/borghelperrc.example).
+    sys.exit(f"BORGHELPERWWW_GROUPS_HEADER invalide : {GROUPS_HEADER!r} — un nom de header HTTP "
+              "n'accepte que lettres/chiffres/'-' (RFC 7230 token). Un commentaire est-il resté "
+              "collé à la valeur sur la même ligne dans le fichier de conf ? (toujours sur sa "
+              "propre ligne, jamais après une valeur — voir docs/borghelperrc.example)")
 # Watcher bkp_status (Story 1, spec-notifications-push) — AD-3/AD-7 : période d'interrogation et
 # délai avant qu'une ligne started_at sans finished_at (processus tué, SIGKILL/OOM) soit traitée
 # comme un échec. Le timeout doit rester largement supérieur à la durée normale d'un Bkp (6h par
@@ -2446,6 +2462,15 @@ def push_selftest():
         return applied_ok and guard_silent_ok
     check("[DEFAULT.borghelperwww] : comble os.environ sans écraser l'existant, jamais confondue avec le piège [DEFAULT] nu",
           _default_borghelperwww_section_ok)
+
+    # ── _is_valid_http_token (garde GROUPS_HEADER, piège réel : commentaire inline collé à la valeur) ──
+    def _is_valid_http_token_ok():
+        return (_is_valid_http_token('X-Groups') and _is_valid_http_token('X-My-Group_2')
+                and not _is_valid_http_token('X-Groups   ; commentaire — resté collé à la valeur')
+                and not _is_valid_http_token('X Groups')  # espace : jamais un token valide
+                and not _is_valid_http_token(''))
+    check("_is_valid_http_token : accepte un nom de header RFC 7230, rejette un commentaire inline resté collé/un espace/vide",
+          _is_valid_http_token_ok)
 
     fails=results.count(False)
     print(f"push selftest : {len(results)-fails}/{len(results)} OK"+(f", {fails} FAIL" if fails else ""))

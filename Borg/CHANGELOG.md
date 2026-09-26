@@ -1,5 +1,30 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.18.5 — garde GROUPS_HEADER + docs/borghelperrc.example corrigé — 2026-09-26
+
+Incident réel (rapporté par l'utilisateur) : `500 Internal Server Error`/`UnicodeEncodeError` sur
+toute route RBAC-protégée (`request.headers.get(GROUPS_HEADER)` encode le nom en latin-1). Cause :
+`configparser` n'a `inline_comment_prefixes` réglé nulle part dans ce projet — un commentaire posé
+après une valeur sur la même ligne (`CLE = valeur   ; commentaire`) n'est **jamais** coupé, tout le
+texte devient littéralement la valeur. La source exacte : `docs/borghelperrc.example` (ajouté cette
+session) avait des commentaires en ligne sur plusieurs réglages, y compris l'exemple `groups_header`
+— l'utilisateur l'a copié et décommenté tel quel.
+
+- **`docs/borghelperrc.example` réécrit** : plus aucun commentaire en ligne nulle part (fichier
+  entier réaudité programmatiquement) — chaque commentaire sur sa propre ligne, au-dessus du réglage,
+  seule convention déjà utilisée partout ailleurs dans ce fichier et dans `demo.borghelperrc`/
+  `borghelperwww.conf.example` (confirmés indemnes). Avertissement explicite ajouté en tête de
+  fichier.
+- **Garde `_is_valid_http_token()` + validation `GROUPS_HEADER` au démarrage** : `GROUPS_HEADER` doit
+  être un token HTTP valide (RFC 7230 — lettres/chiffres/`-`/quelques symboles, jamais d'espace ni de
+  caractère non-ASCII) ; sinon `borgHelperWWW` refuse de démarrer avec un message clair plutôt que de
+  planter sur la première requête RBAC reçue (et toutes les suivantes). Défense en profondeur : même
+  un commentaire inline **sans** caractère non-latin1 (donc qui n'aurait jamais crashé, juste
+  silencieusement corrompu `GROUPS_HEADER`) est maintenant détecté.
+- `push_selftest` : nouveau contrôle dédié (29/29 OK). Vérifié en réel : le scénario exact rapporté
+  (valeur avec commentaire inline + tiret cadratin) est bloqué au démarrage avec un message clair ;
+  une valeur propre démarre normalement.
+
 ## borgHelperWWW 1.18.4 — borgHelperWWW configurable depuis .borghelperrc — 2026-09-26
 
 `spec-borghelperrc-www-section` : suite directe de la garde 1.18.3 — il existe désormais un moyen

@@ -5,6 +5,12 @@
 ; ⚠️ Contient des passphrases en clair : chmod 600 obligatoire (borgHelper avertit sinon au
 ; démarrage — "accessible au groupe/autres... chmod 600 conseillé" — sans bloquer).
 ;
+; ⚠️ Un commentaire va TOUJOURS sur sa PROPRE ligne, jamais après une valeur sur la même ligne
+; (piège réel constaté : configparser n'a "inline_comment_prefixes" réglé NULLE PART dans ce projet
+; — "CLE = valeur   ; commentaire" donnerait littéralement "valeur   ; commentaire" comme valeur,
+; silencieusement, jusqu'à planter au premier usage qui n'accepte pas n'importe quel caractère — ex.
+; GROUPS_HEADER utilisé comme nom de header HTTP, qui n'accepte que du latin-1/ASCII imprimable).
+;
 ; Structure : une section [DEFAULT] (réglages communs à tous les nicks, surchargeables par nick) et
 ; une section par "nick" (nom court identifiant une sauvegarde = un dépôt borg = une machine/un
 ; périmètre). Un nick = tout ce que borgHelper manipule par -n.
@@ -44,32 +50,47 @@ CACHE_DIR = /var/cache/borghelper
 ; ci-dessus en pensant configurer borgHelperWWW — silencieusement ignorée (borgHelperWWW avertit au
 ; démarrage si ça arrive, mais ne le fait JAMAIS). Les clés ci-dessous sont en minuscule, sans préfixe.
 [DEFAULT.borghelperwww]
-;api_key       = une-cle-api-longue-et-aleatoire   ; attendue dans le header X-API-Key
-;host          = 127.0.0.1                          ; adresse d'écoute (exécution directe uniquement)
-;port          = 8000
-;groups_header = X-Groups   ; active le RBAC par groupes (reverse proxy OIDC/auth_request) — voir
-                             ; l'exemple [fileserver-rh]/[fileserver-compta] plus bas pour GROUPS_PATHS
+; Attendue dans le header X-API-Key :
+;api_key = une-cle-api-longue-et-aleatoire
+; Adresse d'écoute (exécution directe uniquement) :
+;host = 127.0.0.1
+;port = 8000
+; Active le RBAC par groupes (reverse proxy OIDC/auth_request) — voir l'exemple [fileserver01] plus
+; bas pour GROUPS_PATHS. Un nom de header HTTP valide UNIQUEMENT (lettres/chiffres/'-', RFC 7230) —
+; borgHelperWWW refuse de démarrer sinon plutôt que de planter sur la première requête reçue.
+;groups_header = X-Groups
 
 [mon-serveur]
 ; ── Dépôt borg ──────────────────────────────────────────────────────────────
-BORG_REPO       = /srv/backups/mon-serveur                ; chemin LOCAL du dépôt borg
-BORG_PASSPHRASE = change-moi-une-vraie-passphrase-longue   ; passphrase du dépôt (borg, pas DB_ENCRYPT)
+; Chemin LOCAL du dépôt borg :
+BORG_REPO = /srv/backups/mon-serveur
+; Passphrase du dépôt (borg, pas DB_ENCRYPT) :
+BORG_PASSPHRASE = change-moi-une-vraie-passphrase-longue
 
 ; Pour un dépôt distant via SSH plutôt que local, remplacer BORG_REPO ci-dessus par SSH_REPO et
 ; ajouter SER_NAME/SER_LOGIN (borgHelper construit la commande ssh lui-même — jamais besoin de
 ; préfixer soi-même "ssh://" dans SSH_REPO) :
-;SSH_REPO   = /srv/backups/mon-serveur    ; chemin du dépôt COTE DISTANT
-;SER_NAME   = backup-host.example.org     ; hôte SSH
-;SER_LOGIN  = backupuser                  ; utilisateur SSH
-;SSH_KEY    = /home/backupuser/.ssh/id_ed25519   ; clé privée si pas celle par défaut de l'agent
-;SSH_REMFO  = 2222                        ; port distant à forwarder (-R), rare — laisser absent sinon
+; Chemin du dépôt CÔTÉ DISTANT :
+;SSH_REPO = /srv/backups/mon-serveur
+; Hôte SSH :
+;SER_NAME = backup-host.example.org
+; Utilisateur SSH :
+;SER_LOGIN = backupuser
+; Clé privée si pas celle par défaut de l'agent :
+;SSH_KEY = /home/backupuser/.ssh/id_ed25519
+; Port distant à forwarder (-R), rare — laisser absent sinon :
+;SSH_REMFO = 2222
 
 ; ── Identification et sélection des archives ───────────────────────────────
-SER_NAME   = mon-serveur      ; nom court affiché/utilisé (sert aussi à dériver GLOB_ARCH si absent)
-GLOB_ARCH  = mon-serveur-*    ; motif borg --glob-archives pour ne lister QUE les archives de ce nick
-                                ; dans ce dépôt (utile si plusieurs nicks partagent un même BORG_REPO)
-BORG_ARCHNAME = mon-serveur   ; préfixe du nom d'archive généré à chaque Bkp (mon-serveur-YYYY-MM-DD...)
-BORG_ROOTBKP  = /              ; chemin racine à sauvegarder
+; Nom court affiché/utilisé (sert aussi à dériver GLOB_ARCH si absent) :
+SER_NAME = mon-serveur
+; Motif borg --glob-archives pour ne lister QUE les archives de ce nick dans ce dépôt (utile si
+; plusieurs nicks partagent un même BORG_REPO) :
+GLOB_ARCH = mon-serveur-*
+; Préfixe du nom d'archive généré à chaque Bkp (mon-serveur-YYYY-MM-DD...) :
+BORG_ARCHNAME = mon-serveur
+; Chemin racine à sauvegarder :
+BORG_ROOTBKP = /
 
 ; ── Exclusions borg (obligatoire — borgHelper refuse Bkp sans EXCLUDE défini) ──
 EXCLUDE = --exclude /media --exclude /dev --exclude /proc --exclude /sys --exclude /var/run --exclude /run --exclude /lost+found --exclude /mnt --exclude /var/lib/lxcfs --exclude /tmp --exclude /var/lib/docker --exclude-if-present .nobackup --exclude-caches --exclude-nodump --keep-exclude-tags
@@ -85,13 +106,18 @@ KEEP_MONTHLY = 6
 ;KEEP_HOURLY  = 24
 
 ; ── Rapport (Report) ────────────────────────────────────────────────────────
-MAX_AGE_BKP  = 25   ; âge (heures) au-delà duquel le dernier backup est signalé comme "en retard"
-DISPLAY_BKP  = 5    ; nb d'archives affichées par défaut dans Report (surchargeable par -N)
+; Âge (heures) au-delà duquel le dernier backup est signalé comme "en retard" :
+MAX_AGE_BKP = 25
+; Nb d'archives affichées par défaut dans Report (surchargeable par -N) :
+DISPLAY_BKP = 5
 
 ; ── Indexation (diff.db — recherche/historique, TreeFind/Search/FileHist/TreeHist) ──
-;IDX_WORKERS   = 4          ; nb de "borg diff" en parallèle lors d'un Index (défaut 4)
-;IDX_SNAP_KEEP = 3          ; nb de snapshots complets conservés pour la purge rétroactive (IdxPurge)
-;NOIDX         = 1          ; 1 = ce nick n'est JAMAIS indexé (Bkp saute l'étape Index automatiquement)
+; Nb de "borg diff" en parallèle lors d'un Index (défaut 4) :
+;IDX_WORKERS = 4
+; Nb de snapshots complets conservés pour la purge rétroactive (IdxPurge) :
+;IDX_SNAP_KEEP = 3
+; 1 = ce nick n'est JAMAIS indexé (Bkp saute l'étape Index automatiquement) :
+;NOIDX = 1
 ; Restreint l'indexation à des sous-arbres (accélère Index sur un gros dépôt peu consulté par
 ; chemin) — motifs glob (*, ?, [...]) ou préfixe littéral, un par ligne séparé par un espace :
 ;IDX_INCLUDE = /etc /home
@@ -99,20 +125,25 @@ DISPLAY_BKP  = 5    ; nb d'archives affichées par défaut dans Report (surcharg
 
 ; ── borgHelperWWW uniquement : RBAC par groupes (sans effet si borgHelperWWW n'est pas lancé avec
 ; --groups-header/BORGHELPERWWW_GROUPS_HEADER — voir docs/TECHNIQUE.md et README.md) ──
-;GROUPS_ADMIN = ops-admins                          ; accès admin sur CE nick (implique write+read)
-;GROUPS_WRITE = ops-admins,ops-writers               ; accès écriture (Bkp/Restore/Prune si autorisé...)
-;GROUPS_READ  = ops-admins,ops-writers,ops-readers   ; accès lecture seule
+; Accès admin sur CE nick (implique write+read) :
+;GROUPS_ADMIN = ops-admins
+; Accès écriture (Bkp/Restore/Prune si autorisé...) :
+;GROUPS_WRITE = ops-admins,ops-writers
+; Accès lecture seule :
+;GROUPS_READ = ops-admins,ops-writers,ops-readers
 ; Restreint un groupe donné à un sous-répertoire de ce nick (les groupes absents d'ici gardent un
 ; accès chemin illimité) :
 ;GROUPS_PATHS = ops-readers:/home/alice
 
 ; ── Métadonnées internes (rarement nécessaire de les régler à la main) ─────
-;DB_NAME = mon-serveur-alt   ; nom de fichier DB alternatif si le nick contient des caractères à éviter
-;DIFF_KEEP = 30              ; nb de paires d'archives les PLUS RÉCENTES à garder indexées dans
-                              ; diff_index — purge auto les plus anciennes à chaque Index si réglé
-;STATS_RETENTION_MONTHS = 13 ; ancienneté (mois) au-delà de laquelle les points repo_stats (gain
-                              ; Prune, graphiques d'évolution) sont purgés — défaut 13, valeur
-                              ; non numérique ou <1 retombe silencieusement sur ce défaut
+; Nom de fichier DB alternatif si le nick contient des caractères à éviter :
+;DB_NAME = mon-serveur-alt
+; Nb de paires d'archives les PLUS RÉCENTES à garder indexées dans diff_index — purge auto les plus
+; anciennes à chaque Index si réglé :
+;DIFF_KEEP = 30
+; Ancienneté (mois) au-delà de laquelle les points repo_stats (gain Prune, graphiques d'évolution)
+; sont purgés — défaut 13, valeur non numérique ou <1 retombe silencieusement sur ce défaut :
+;STATS_RETENTION_MONTHS = 13
 
 
 ; ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -135,7 +166,8 @@ BORG_PASSPHRASE = change-moi-une-vraie-passphrase-longue
 SER_NAME        = fileserver01
 GLOB_ARCH       = fileserver01-*
 BORG_ARCHNAME   = fileserver01
-BORG_ROOTBKP    = /srv/data   ; racine sauvegardée : /srv/data/rh, /srv/data/compta, /srv/data/commun...
+; Racine sauvegardée : /srv/data/rh, /srv/data/compta, /srv/data/commun... :
+BORG_ROOTBKP    = /srv/data
 
 EXCLUDE = --exclude-caches --exclude-nodump --keep-exclude-tags
 KEEP_DAILY  = 14
