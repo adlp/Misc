@@ -2328,6 +2328,15 @@ un envoi réel. Fichier SQLite **dédié**, jamais `scopecache.db` (AD-6) : cont
 (cache reconstructible à volonté), `push.db` porte les clés VAPID et les abonnements eux-mêmes — une
 perte n'est **pas** récupérable.
 
+`pywebpush` (`borgHelperWWW` 1.18.1) est une **dépendance optionnelle** : `import pywebpush` en tête
+de fichier est en `try/except ImportError`, absent → `_PYWEBPUSH_AVAILABLE=False`, `webpush=None`.
+Ni `push.db` (CRUD des abonnements, `/push/subscribe`) ni le reste de `borgHelperWWW` n'en dépendent
+pour démarrer — seul `_send_bkp_push` court-circuite (`return` immédiat, aucun envoi, aucune
+exception) tant que la lib n'est pas installée. Un `[WARN]` au démarrage (stderr) le signale et
+recommande `pip3 install pywebpush`. Raison : `pywebpush` n'est un paquet d'aucun dépôt apt
+(PyPI-only), donc pas forcément présent sur un hôte de production qui n'a jamais eu besoin d'installer
+de dépendances Python hors stdlib pour `borgHelper` (CLI) lui-même.
+
 ### Fichier et schéma
 
 `PUSH_DB` (réglage `BORGHELPERWWW_PUSH_DB`/`--push-db`, défaut `<cache_dir>/<db_prefix>-push.db`,

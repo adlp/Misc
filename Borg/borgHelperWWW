@@ -14,7 +14,17 @@ from collections import defaultdict
 from fastapi import FastAPI, APIRouter, Header, HTTPException, Query, Request, Depends
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from pywebpush import webpush, WebPushException
+try:
+    from pywebpush import webpush, WebPushException
+    _PYWEBPUSH_AVAILABLE=True
+except ImportError:
+    # pywebpush n'est pas un paquet apt (PyPI-only) — absent par défaut sur beaucoup d'installs.
+    # Dépendance optionnelle : le serveur démarre quand même, seul l'envoi push est désactivé
+    # (_send_bkp_push court-circuite, voir plus bas) plutôt qu'un crash dur de tout borgHelperWWW
+    # pour une fonctionnalité opt-in que l'admin n'utilise peut-être pas.
+    webpush=None
+    class WebPushException(Exception): pass  # jamais levée réellement (webpush() jamais appelée si None)
+    _PYWEBPUSH_AVAILABLE=False
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail,
@@ -23,7 +33,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.18.0"
+WWW_VERSION="1.18.1"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -267,6 +277,11 @@ _bkp_watcher_task=None
 @app.on_event("startup")
 async def _start_bkp_status_watcher():
     global _bkp_watcher_task
+    if not _PYWEBPUSH_AVAILABLE:
+        print("[WARN] pywebpush absent — notifications push désactivées (abonnements/API restent "
+              "fonctionnels, mais aucun envoi réel n'aura lieu). "
+              "'pip3 install pywebpush' (ou dans un venv dédié) pour les activer.",
+              file=sys.stderr,flush=True)
     _bkp_watcher_task=asyncio.create_task(_bkp_status_watcher())
 
 @app.on_event("shutdown")
@@ -850,6 +865,7 @@ def _send_bkp_push(nick,event,result):
     abonnement mort côté navigateur) -> désabonnement automatique ; toute autre erreur (réseau,
     autre code HTTP, exception non-WebPushException) -> journalisée seule, abonnement conservé,
     jamais de retry (voir Design Notes du spec — la ligne bkp_status est déjà réclamée par CAS)."""
+    if not _PYWEBPUSH_AVAILABLE: return  # dépendance optionnelle absente — voir avertissement au démarrage
     notify_col='notify_start' if event=='start' else 'notify_end'
     try:
         subs=_push_subscriptions_for(nick,notify_col)

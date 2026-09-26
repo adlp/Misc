@@ -923,11 +923,15 @@ Toutes les commandes sont exposées **sauf `Mount`/`UMount`** (accès FUSE local
 
 ```bash
 pip install fastapi uvicorn pydantic
-pip install pywebpush   # Story 2a (spec-notifications-push) : clés VAPID (py_vapid, dépendance
-                        # transitive) et abonnements push — confiné à borgHelperWWW (AD-5),
+pip install pywebpush   # OPTIONNEL (Story 2a/2b, spec-notifications-push) : clés VAPID (py_vapid,
+                        # dépendance transitive) et envoi push réel — confiné à borgHelperWWW (AD-5),
                         # borgHelper (CLI) reste stdlib-only. `cryptography` (transitive elle aussi)
                         # est en plus importée et utilisée directement (sérialisation de la clé
                         # publique VAPID en format X962 non compressé) — pas seulement transitive.
+                        # Absent : borgHelperWWW démarre et fonctionne normalement (y compris
+                        # /push/subscribe en CRUD), seul l'envoi push réel est désactivé (avertissement
+                        # au démarrage). N'est un paquet d'aucun dépôt apt — PyPI-only, `pip3 install`
+                        # (ou venv dédié sur Ubuntu ≥23.04, PEP 668) requis pour l'activer.
 ```
 
 `borgHelperWWW.py` (symlink vers `borgHelperWWW`, même principe que `borgHelper.py`) doit être présent

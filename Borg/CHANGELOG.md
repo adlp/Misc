@@ -1,5 +1,22 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.18.1 — pywebpush devient une dépendance optionnelle — 2026-09-26
+
+`pywebpush` n'est un paquet d'aucun dépôt apt (PyPI-only) et n'est donc pas forcément installé sur un
+hôte de production. Jusqu'ici, `from pywebpush import ...` en tête de fichier faisait planter tout
+`borgHelperWWW` (y compris `uvicorn borgHelperWWW:app`) si la lib était absente, même pour un admin qui
+n'utilise pas du tout les notifications push.
+
+- Import de `pywebpush` mis en `try/except ImportError` : si absent, `_PYWEBPUSH_AVAILABLE=False`,
+  `webpush=None`. Le reste de `borgHelperWWW` (toutes les routes, y compris `/push/subscribe` en
+  CRUD) démarre et fonctionne normalement.
+- `_send_bkp_push` (watcher) court-circuite immédiatement (`return`) si `_PYWEBPUSH_AVAILABLE` est
+  faux — aucun envoi réel n'a lieu, mais aucune exception non plus.
+- Avertissement au démarrage (`[WARN]`, stderr) si `pywebpush` est absent, invitant explicitement à
+  `pip3 install pywebpush` (ou dans un venv dédié).
+- Aucun changement de comportement quand `pywebpush` est installé (cas actuel de `demo.borghelperrc`) —
+  26/26 `push_selftest` toujours OK.
+
 ## borgHelper 1.0.111 — commande Status : état rapide par nick, 100% local — 2026-09-26
 
 `spec-status-cli-etat-rapide` : nouvelle commande CLI en lecture seule pour obtenir rapidement l'état
