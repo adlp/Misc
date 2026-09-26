@@ -57,7 +57,8 @@ BORG_ARCHNAME    = root
 BORG_ROOTBKP     = /
 
 # Affichage rapport
-# alerte si dernière sauvegarde > N heures (défaut 25)
+# alerte si dernière sauvegarde > N heures (défaut 25) : serveur en erreur dans Report, et
+# notification push « sauvegarde en retard » (borgHelperWWW >= 1.24.0, type Échec)
 MAX_AGE_BKP      = 25
 # nombre de sauvegardes affichées dans Report
 DISPLAY_BKP      = 5
@@ -1864,6 +1865,19 @@ Service Worker) : `{"nick":..., "event":"start"|"end"|"test", "result":"success"
 sauvegarde réussie avec avertissements s'affiche « ⚠️ Sauvegarde terminée avec avertissements — nick »
 (ex. « Bkp réussi — 2 fichiers modifiés pendant la sauvegarde, 1 erreur de lecture ») ; un échec
 mentionne aussi ces compteurs. Le type reste « succès » ou « échec » pour les réglages par host.
+
+**Sauvegarde en retard** (borgHelperWWW ≥ 1.24.0) : le watcher compare à chaque passage l'âge de la
+dernière archive connue de chaque serveur à son `MAX_AGE_BKP` (heures, défaut 25 — la même règle qui
+marque déjà le serveur en erreur dans `Report`). Au-delà, notification de type **Échec** (réglage
+« ❌ Échec / retard » par host) : « ⏰ Sauvegarde en retard — nick / Dernière sauvegarde il y a 31 h
+(seuil : 25 h) », payload `{"event":"overdue","result":"error","age_hours","max_age_hours",
+"last_backup","reminder"}`. Une alerte au franchissement du seuil, puis un **rappel** à chaque période
+supplémentaire (2×, 3× le seuil… — « ⏰ Toujours aucune sauvegarde »), jusqu'à la prochaine archive.
+Rien pendant un Bkp en cours, ni pour un serveur sans aucune archive connue. Tant que personne n'est
+abonné aux échecs de ce host, l'alerte n'est pas consommée : un abonnement pris pendant le retard la
+reçoit au passage suivant. Plusieurs workers uvicorn : un seul envoie (réservation atomique dans
+`push.db`, table `overdue_alerts`). « Dernière archive connue » = `archive_stats` (alimentée par chaque
+`Bkp` et par `Index`) : une archive créée hors borgHelper n'est vue qu'après un `Index`.
 
 Un abonnement mort côté navigateur (le service de push répond `404`/`410`) est désabonné
 automatiquement (même requête que `DELETE /push/subscribe`). Toute autre erreur (réseau, autre code

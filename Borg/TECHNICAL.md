@@ -2750,6 +2750,23 @@ seulement à l'ouverture/après enregistrement (`renderNotifForm`), jamais par u
 Vérifié : `push_selftest` 54/54 ; essai réel (Bkp réussi sur un host « échec seul » → rien ; Bkp en
 échec forcé → push `result:error` reçu et déchiffré).
 
+**Sauvegarde en retard (1.24.0)** : `_check_overdue(nick, db_path)`, appelé par
+`_bkp_status_watcher_pass` pour chaque nick après les réclamations début/fin. Dernière archive via
+`BorgHelperDB.last_archive_stat` (borgHelper 1.0.119 : `archive_stats`, plus récente `archive_date`,
+jamais de création de base), âge via `_archive_age_hours` (heure locale naïve, comme `d2DateNSince` de
+Report), seuil `_max_age_bkp(cfg)` (`MAX_AGE_BKP`, défaut 25, illisible/≤0 → 25). Silence si : envoi push
+indisponible, aucune archive, âge ≤ seuil, Bkp en cours (`bkp_running` : ligne `bkp_status` non finie de
+moins de `BKP_STATUS_TIMEOUT`), aucun abonné aux échecs de ce host (`_push_subscriptions_for(nick,'error')`)
+— l'alerte n'est alors pas consommée. Sinon `level = int(age // seuil)` et réservation
+`_overdue_claim` : `INSERT … ON CONFLICT(nick) DO UPDATE … WHERE last_archive != excluded OR level <
+excluded` — une seule instruction SQLite, `rowcount==1` = gagné (plusieurs workers : un seul envoi). Une
+nouvelle archive change `last_archive` : le compteur repart à 1 au prochain retard. Envoi
+`_send_bkp_push(nick,'overdue','error',{age_hours,max_age_hours,last_backup,reminder})`, type `error`
+pour le filtrage par host. `push.db` : `PUSH_DB_SCHEMA_VERSION` 2 (table `overdue_alerts`, `CREATE TABLE
+IF NOT EXISTS`, base 1 inchangée). Service Worker 1.2.0 : « ⏰ Sauvegarde en retard » / « ⏰ Toujours
+aucune sauvegarde » (rappel). `push_selftest` 63/63 ; essai réel (démo, `MAX_AGE_BKP = 0.5`) : une
+notification reçue et déchiffrée sur ~5 passages du watcher, aucun doublon.
+
 **Fichiers statiques (1.22.0)** : `/static/chart.umd.min.js` — `vendor/chartjs/chart.umd.min.js` lu
 une fois au démarrage (`_CHARTJS`, `[WARN]` si absent → 404), `Cache-Control: public, max-age=86400` ;
 l'UI le charge avec `integrity` (même SRI que le CDN) et `onerror` → injection de la balise CDN.

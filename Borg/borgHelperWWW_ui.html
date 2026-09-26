@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.13.1 -->
+<!-- UI_VERSION: 1.13.2 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -265,14 +265,15 @@
     <div class="card" style="max-width:640px">
       <h2 style="margin-top:0">Notifications de sauvegarde</h2>
       <p class="hint">Notifications de ce navigateur au début des sauvegardes, à leur réussite et à leur
-        échec (erreur, ou sauvegarde bloquée), réglables host par host. Réglages propres à ce navigateur
+        échec (erreur, sauvegarde bloquée, ou <strong>aucune sauvegarde depuis plus de MAX_AGE_BKP
+        heures</strong> — alerte puis rappel à chaque période supplémentaire), réglables host par host. Réglages propres à ce navigateur
         (un autre navigateur ou appareil s'abonne séparément).</p>
       <div id="notifStatus" style="margin-bottom:12px"></div>
       <div id="notifForm" hidden>
         <div class="field" style="overflow-x:auto">
           <table id="notifHosts" style="width:auto">
             <thead>
-              <tr><th style="text-align:left">Host</th><th>Début</th><th>Succès</th><th>❌ Échec</th></tr>
+              <tr><th style="text-align:left">Host</th><th>Début</th><th>Succès</th><th title="Sauvegarde en erreur ou bloquée, et retard : aucune sauvegarde depuis plus de MAX_AGE_BKP heures">❌ Échec / retard</th></tr>
               <tr><td><em>Tous</em></td>
                 <td style="text-align:center"><input type="checkbox" data-all="start" title="Cocher/décocher la colonne"></td>
                 <td style="text-align:center"><input type="checkbox" data-all="success" title="Cocher/décocher la colonne"></td>

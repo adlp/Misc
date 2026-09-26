@@ -62,7 +62,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.23.0"
+WWW_VERSION="1.24.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -354,11 +354,71 @@ def _bkp_status_watcher_pass():
                 print(f"[watcher] bkp_status (début) réclamé : nick={nick} run_id={row['run_id']}",
                       file=sys.stderr,flush=True)
                 _send_bkp_push(nick,'start',None)
+            _check_overdue(nick,db_path)
         except Exception as e:
             # Un nick en erreur (DB corrompue, etc.) ne doit jamais aveugler les autres nicks de ce
             # passage — isolation par nick, le passage suivant réessaiera.
             print(f"[watcher] nick={nick} erreur : {e}",file=sys.stderr,flush=True)
             continue
+
+def _max_age_bkp(cfg):
+    """MAX_AGE_BKP du nick en heures (même clé et même défaut que Report : 25) — valeur illisible ou
+    <= 0 -> 25, jamais un crash du watcher."""
+    try:
+        v=float((cfg.get('MAX_AGE_BKP','25') if cfg is not None else '25') or 25)
+        return v if v>0 else 25.0
+    except (TypeError,ValueError): return 25.0
+
+def _archive_age_hours(archive_date):
+    """Âge en heures d'une date d'archive borg (heure locale naïve, comme d2DateNSince de Report).
+    None si illisible."""
+    try: d=datetime.datetime.fromisoformat(str(archive_date))
+    except ValueError: return None
+    if d.tzinfo is not None: d=d.astimezone().replace(tzinfo=None)
+    return (datetime.datetime.now()-d).total_seconds()/3600
+
+def _overdue_claim(nick,last_archive,level):
+    """Réserve l'envoi d'une alerte de retard (comparer-et-échanger en une seule instruction SQLite,
+    sûr entre plusieurs workers uvicorn) : True seulement si ce nick n'a encore jamais été alerté pour
+    cette dernière archive, ou à un niveau inférieur. Une nouvelle archive (sauvegarde réussie)
+    remplace la ligne au prochain retard — le compteur repart de 1."""
+    conn=_push_conn('write')
+    try:
+        cur=conn.execute(
+            "INSERT INTO overdue_alerts (nick,last_archive,level,notified_at) VALUES (?,?,?,datetime('now')) "
+            "ON CONFLICT(nick) DO UPDATE SET last_archive=excluded.last_archive,level=excluded.level,"
+            "notified_at=excluded.notified_at "
+            "WHERE overdue_alerts.last_archive!=excluded.last_archive OR overdue_alerts.level<excluded.level",
+            (nick,last_archive,level))
+        conn.commit()
+        return cur.rowcount==1
+    finally:
+        conn.close()
+
+def _check_overdue(nick,db_path):
+    """Sauvegarde en retard (1.24.0) : dernière archive connue plus vieille que MAX_AGE_BKP heures
+    (même règle que Report, qui marque déjà ce nick en erreur) -> notification push de type ÉCHEC.
+    Une alerte au franchissement du seuil, puis un rappel à chaque période MAX_AGE_BKP supplémentaire
+    (2x, 3x...), jusqu'à la prochaine archive. Rien si aucune archive connue, si un Bkp est en cours
+    (il peut simplement être long ; bloqué au-delà de BKP_STATUS_TIMEOUT, il est déjà traité en
+    échec), si l'envoi push est indisponible, ou si personne n'est abonné aux échecs de ce host —
+    dans ces trois derniers cas l'alerte n'est PAS consommée : un abonnement pris pendant le retard
+    reçoit l'alerte au passage suivant, pas seulement au rappel d'après."""
+    if not _PYWEBPUSH_AVAILABLE or PUSH_VAPID_PRIVATE_KEY is None: return
+    last=_bh_paths.db.last_archive_stat(nick,db_path)
+    if last is None: return
+    archive,archive_date=last
+    age=_archive_age_hours(archive_date)
+    max_age=_max_age_bkp(_bh_paths.borg.cfgread(nick))
+    if age is None or age<=max_age: return
+    if _bh_paths.db.bkp_running(nick,BKP_STATUS_TIMEOUT,db_path): return
+    if not _push_subscriptions_for(nick,'error'): return
+    level=int(age//max_age)
+    if not _overdue_claim(nick,archive,level): return
+    print(f"[watcher] sauvegarde en retard : nick={nick} dernière archive il y a {age:.1f} h "
+          f"(MAX_AGE_BKP={max_age:g} h, alerte n°{level})",file=sys.stderr,flush=True)
+    _send_bkp_push(nick,'overdue','error',{'age_hours':round(age,1),'max_age_hours':max_age,
+                                           'last_backup':str(archive_date),'reminder':level>1})
 
 async def _bkp_status_watcher():
     print(f"[watcher] bkp_status démarré — interrogation toutes les {BKP_WATCHER_INTERVAL}s, "
@@ -883,7 +943,7 @@ ensure_scope_cache_db()
 # sqlite3.DatabaseError -> message + sys.exit(1)), appelé une fois au module-level au démarrage.
 PUSH_DB=os.environ.get('BORGHELPERWWW_PUSH_DB') or \
     os.path.join(_bh_paths.db.cache_dir,f"{_bh_paths.db.db_prefix}-push.db")
-PUSH_DB_SCHEMA_VERSION=1
+PUSH_DB_SCHEMA_VERSION=2  # 2 (1.24.0) : table overdue_alerts (CREATE TABLE IF NOT EXISTS, sans migration)
 PUSH_DB_BASE_SCHEMA_VERSION=1
 
 _PUSH_DB_SCHEMA_SCRIPT="""
@@ -904,6 +964,14 @@ _PUSH_DB_SCHEMA_SCRIPT="""
         notify_end INTEGER NOT NULL DEFAULT 1,
         expires_at TEXT,                  -- NULL = « à vie »
         created_at TEXT DEFAULT (datetime('now'))
+    );
+    -- Alertes « sauvegarde en retard » déjà envoyées (1.24.0) : une ligne par nick. `level` = nombre de
+    -- périodes MAX_AGE_BKP écoulées depuis `last_archive` au dernier envoi (1 = seuil franchi, 2 = 2x...).
+    CREATE TABLE IF NOT EXISTS overdue_alerts (
+        nick TEXT PRIMARY KEY,
+        last_archive TEXT NOT NULL,
+        level INTEGER NOT NULL,
+        notified_at TEXT DEFAULT (datetime('now'))
     );
 """
 
@@ -1182,23 +1250,24 @@ def _push_subscriptions_for(nick,kind):
         conn.close()
 
 def _send_bkp_push(nick,event,result,warnings=None):
-    """Envoie un push réel à chaque abonnement matché pour cet événement (`event`: 'start'|'end',
-    `result`: None pour un début, 'success'/'error' pour une fin). Erreur définitive (404/410,
+    """Envoie un push réel à chaque abonnement matché pour cet événement (`event`: 'start'|'end'|
+    'overdue', `result`: None pour un début, 'success'/'error' pour une fin, 'error' pour un retard). Erreur définitive (404/410,
     abonnement mort côté navigateur) -> désabonnement automatique ; toute autre erreur (réseau,
     autre code HTTP, exception non-WebPushException) -> journalisée seule, abonnement conservé,
     jamais de retry (voir Design Notes du spec — la ligne bkp_status est déjà réclamée par CAS)."""
     if not _PYWEBPUSH_AVAILABLE or PUSH_VAPID_PRIVATE_KEY is None:
         return  # dépendance optionnelle (pywebpush/py_vapid) absente — voir avertissement au démarrage
-    # Toute fin autre qu'un succès (erreur, timeout AD-7) est un échec — type 'error'.
-    kind='start' if event=='start' else ('success' if result=='success' else 'error')
+    # Toute fin autre qu'un succès (erreur, timeout AD-7) est un échec — type 'error' ; un retard de
+    # sauvegarde (event 'overdue', 1.24.0) aussi.
+    kind='start' if event=='start' else ('success' if event=='end' and result=='success' else 'error')
     try:
         subs=_push_subscriptions_for(nick,kind)
     except (sqlite3.Error,PushPrefsError) as e:
         print(f"[watcher] push: erreur lecture abonnements nick={nick} : {e}",file=sys.stderr,flush=True)
         return
     if not subs: return
-    # warnings (fin de sauvegarde, 1.23.0) : {'changed_during_backup': n|None, 'read_errors': n|None} —
-    # fichiers modifiés pendant la sauvegarde / erreurs de lecture, affichés par le Service Worker.
+    # warnings : champs supplémentaires du payload, None omis — fin de sauvegarde (1.23.0) :
+    # changed_during_backup/read_errors ; retard (1.24.0) : age_hours/max_age_hours/last_backup/reminder.
     # N'influe jamais sur le type de notification (succès/échec) ni donc sur le filtrage par host.
     data={'nick':nick,'event':event,'result':result,
           'timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat()}
@@ -2849,6 +2918,58 @@ def push_selftest():
                 ds=[json.loads(d) for _,d in sent_to]
                 return bool(ds) and all(d['changed_during_backup']==2 and 'read_errors' not in d and d['result']=='success' for d in ds)
             check("push : avertissements C/E transmis dans le payload (inconnus omis), type succès inchangé",_payload_warnings_ok)
+
+            # ── Sauvegarde en retard (1.24.0) ──
+            check("retard : MAX_AGE_BKP lu comme Report (défaut 25, illisible/<=0 -> 25)",
+                  lambda: _max_age_bkp({'MAX_AGE_BKP':'12'})==12 and _max_age_bkp({})==25
+                          and _max_age_bkp({'MAX_AGE_BKP':'abc'})==25 and _max_age_bkp({'MAX_AGE_BKP':'-3'})==25
+                          and _max_age_bkp(None)==25)
+            def _age_ok():
+                d=(_dt.datetime.now()-_dt.timedelta(hours=30)).strftime('%Y-%m-%dT%H:%M:%S.%f')
+                a=_archive_age_hours(d)
+                return a is not None and abs(a-30)<0.01 and _archive_age_hours('pas une date') is None
+            check("retard : âge d'une date d'archive borg (heure locale), None si illisible",_age_ok)
+            check("retard : réservation — 1re alerte, pas de doublon, rappel au niveau suivant, nouvelle archive -> repart",
+                  lambda: (_overdue_claim('nOv','A1',1) and not _overdue_claim('nOv','A1',1)
+                           and _overdue_claim('nOv','A1',2) and not _overdue_claim('nOv','A1',1)
+                           and _overdue_claim('nOv','A2',1)))
+            _insert_sub('push-ep-over','nickOver')   # format 1 : notify_end -> succès + échec
+            def _overdue_flow():
+                state={'date':(_dt.datetime.now()-_dt.timedelta(hours=30)).isoformat(),'archive':'X1','running':False}
+                def _run():
+                    sent_to.clear()
+                    with mock.patch.object(_bh_paths.db,'last_archive_stat',lambda n,p=None:(state['archive'],state['date'])), \
+                         mock.patch.object(_bh_paths.db,'bkp_running',lambda n,t,p=None:state['running']), \
+                         mock.patch.object(_bh_paths.borg,'cfgread',lambda n:{'MAX_AGE_BKP':'25'}), \
+                         mock.patch(f"{__name__}.webpush",side_effect=_fake_webpush), \
+                         mock.patch(f"{__name__}._PYWEBPUSH_AVAILABLE",True), \
+                         mock.patch(f"{__name__}.PUSH_VAPID_PRIVATE_KEY",PUSH_VAPID_PRIVATE_KEY or 'k'):
+                        _check_overdue('nickOver',None)
+                    return [json.loads(d) for e,d in sent_to if e=='push-ep-over']
+                first=_run()                       # 30 h > 25 h : alerte
+                again=_run()                       # même niveau : rien
+                state['date']=(_dt.datetime.now()-_dt.timedelta(hours=51)).isoformat()
+                reminder=_run()                    # 51 h = 2 périodes : rappel
+                state['archive']='X2'; state['date']=(_dt.datetime.now()-_dt.timedelta(hours=2)).isoformat()
+                fresh=_run()                       # nouvelle archive récente : rien
+                state['date']=(_dt.datetime.now()-_dt.timedelta(hours=26)).isoformat(); state['running']=True
+                running=_run()                     # en retard mais Bkp en cours : rien
+                state['running']=False
+                after=_run()                       # Bkp fini sans nouvelle archive : alerte
+                return (len(first)==1 and first[0]['event']=='overdue' and first[0]['result']=='error'
+                        and first[0]['max_age_hours']==25 and 29.9<first[0]['age_hours']<30.1 and first[0]['reminder'] is False
+                        and again==[] and len(reminder)==1 and reminder[0]['reminder'] is True
+                        and fresh==[] and running==[] and len(after)==1)
+            check("retard : alerte (type échec), pas de doublon, rappel, silence si nouvelle archive ou Bkp en cours",_overdue_flow)
+            def _overdue_no_subscriber():
+                with mock.patch.object(_bh_paths.db,'last_archive_stat',lambda n,p=None:('Z1',(_dt.datetime.now()-_dt.timedelta(hours=30)).isoformat())), \
+                     mock.patch.object(_bh_paths.db,'bkp_running',lambda n,t,p=None:False), \
+                     mock.patch.object(_bh_paths.borg,'cfgread',lambda n:{'MAX_AGE_BKP':'25'}), \
+                     mock.patch(f"{__name__}._PYWEBPUSH_AVAILABLE",True), \
+                     mock.patch(f"{__name__}.PUSH_VAPID_PRIVATE_KEY",PUSH_VAPID_PRIVATE_KEY or 'k'):
+                    _check_overdue('nickSansAbonne',None)
+                return _overdue_claim('nickSansAbonne','Z1',1)   # toujours disponible : jamais consommée
+            check("retard : sans abonné aux échecs de ce host, l'alerte n'est pas consommée",_overdue_no_subscriber)
             check("push : WebPushException status_code=410 -> abonnement désabonné automatiquement (push.db ET JSON)",
                   lambda: conn.execute("SELECT 1 FROM push_subscriptions WHERE endpoint='push-ep-410'").fetchone() is None
                           and 'push-ep-410' not in _push_prefs_load()['subscriptions'])

@@ -95,6 +95,7 @@ vraie donnée, contrairement à `scopecache.db`.
 | `db_meta` | version de schéma |
 | `push_vapid_keys` | la paire de clés VAPID du serveur (une seule ligne, `id=1`) |
 | `push_subscriptions` | un abonnement par endpoint navigateur : clés de chiffrement `p256dh`/`auth` (les anciennes colonnes de préférences ne sont plus lues depuis 1.19.0) |
+| `overdue_alerts` | alertes « sauvegarde en retard » déjà envoyées, par nick (dernière archive, niveau de rappel) — évite les doublons (≥ 1.24.0) |
 
 ### `<prefixe>-push-prefs.json` — préférences de notification (borgHelperWWW ≥ 1.19.0)
 

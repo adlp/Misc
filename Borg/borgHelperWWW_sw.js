@@ -1,4 +1,4 @@
-// SW_VERSION: 1.1.0
+// SW_VERSION: 1.2.0
 // borgHelperWWW — Service Worker des notifications push (spec-push-ui-prefs-json).
 // Servi par borgHelperWWW sur /sw.js (portée : toute l'origine). Ne fait qu'afficher les notifications
 // envoyées par le serveur (watcher bkp_status ou POST /push/test) et ramener au premier plan l'onglet
@@ -17,12 +17,26 @@ function warningsText(d) {
   return parts.join(', ');
 }
 
+// 30.5 -> « 30 h », 49 -> « 2 j 1 h », 0.5 -> « 30 min »
+function hours(h) {
+  if (typeof h !== 'number' || isNaN(h)) return '?';
+  if (h < 1) return `${Math.round(h * 60)} min`;
+  const r = Math.round(h);
+  return r >= 48 ? `${Math.floor(r / 24)} j${r % 24 ? ` ${r % 24} h` : ''}` : `${r} h`;
+}
+
 function describe(d) {
   // Payload serveur : {nick, event: 'start'|'end'|'test', result: 'success'|'error'|null, timestamp,
   //                    changed_during_backup?, read_errors?}  (compteurs : fin de sauvegarde, SW >= 1.1.0)
   const nick = d.nick || '?';
   if (d.event === 'test') return {title: 'borgHelper — test', body: 'Les notifications fonctionnent.'};
   if (d.event === 'start') return {title: `Sauvegarde démarrée — ${nick}`, body: 'Bkp en cours.'};
+  if (d.event === 'overdue') {
+    // Aucune sauvegarde depuis plus de MAX_AGE_BKP heures (SW >= 1.2.0) : alerte, puis rappels.
+    const age = hours(d.age_hours), max = hours(d.max_age_hours);
+    return {title: `⏰ ${d.reminder ? 'Toujours aucune sauvegarde' : 'Sauvegarde en retard'} — ${nick}`,
+            body: `Dernière sauvegarde il y a ${age} (seuil : ${max}). Vérifier la planification des sauvegardes.`};
+  }
   const w = warningsText(d);
   if (d.event === 'end' && d.result === 'success') {
     if (w) return {title: `⚠️ Sauvegarde terminée avec avertissements — ${nick}`,

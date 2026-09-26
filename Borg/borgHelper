@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.118"
+Version="1.0.119"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -1734,6 +1734,36 @@ class BorgHelperDB:
             finally: conn.close()
         try: return self._with_lock_retry(_do)
         except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
+
+    def last_archive_stat(self,nick,db_path=None):
+        """(archive, archive_date) de l'archive la plus récente connue d'archive_stats — même source
+        que la colonne « depuis » de Report (MAX_AGE_BKP) — ou None (aucune archive connue, base
+        absente/illisible). Lecture seule, utilisée par le watcher de borgHelperWWW (retard de sauvegarde).
+        Jamais de création de base (AD-12) : fichier absent -> None sans l'ouvrir."""
+        if db_path is None: db_path=self.get_diff_db(nick)
+        if not os.path.exists(db_path): return None
+        try:
+            conn=_open_db(db_path,nick=nick,role='read')
+            try:
+                r=conn.execute("SELECT archive,archive_date FROM archive_stats WHERE nick=? AND archive_date IS NOT NULL "
+                               "ORDER BY archive_date DESC LIMIT 1",(nick,)).fetchone()
+            finally: conn.close()
+            return (r[0],r[1]) if r else None
+        except sqlite3.Error: return None
+
+    def bkp_running(self,nick,timeout_s,db_path=None):
+        """True si un Bkp de ce nick est en cours : ligne bkp_status sans finished_at, démarrée depuis
+        moins de timeout_s secondes (au-delà : bloquée, traitée en échec par le watcher, AD-7).
+        Jamais de création de base (AD-12)."""
+        if db_path is None: db_path=self.get_diff_db(nick)
+        if not os.path.exists(db_path): return False
+        try:
+            conn=_open_db(db_path,nick=nick,role='read')
+            try:
+                return conn.execute("SELECT 1 FROM bkp_status WHERE nick=? AND finished_at IS NULL "
+                    f"AND started_at >= datetime('now','-{int(timeout_s)} seconds') LIMIT 1",(nick,)).fetchone() is not None
+            finally: conn.close()
+        except sqlite3.Error: return False
 
     def list_pending_bkp_status(self,nick,timeout_s,db_path=None):
         """Lignes bkp_status prêtes à être réclamées par le watcher (borgHelperWWW) : terminées
@@ -5285,6 +5315,9 @@ def codec_selftest():
             finally:  # A3 retirée : les contrôles suivants comptent exactement A1/A2 pour rhA
                 c=sqlite3.connect(p); c.execute("DELETE FROM archive_stats WHERE nick='rhA' AND archive='A3'"); c.commit(); c.close()
         check("archive_stats C/E : exposés par ArchiveHistory, conservés par un rattrapage Index, NULL si inconnus",_rh_arch_warn_counts)
+        check("last_archive_stat : archive la plus récente (date), None si aucune archive / base absente",
+              lambda: bh_rh.db.last_archive_stat('rhA')==('A2','2026-02-01T00:00:00')
+                      and bh_rh.db.last_archive_stat('rhEmpty') is None and bh_rh.db.last_archive_stat('rhNope') is None)
         def _astats_migration():
             d=os.path.join(tmp,'astats-mig'); os.makedirs(d); dbp=os.path.join(d,'old.db')
             c=sqlite3.connect(dbp)
@@ -5393,6 +5426,15 @@ def codec_selftest():
             r=[x for x in bh.list_pending_bkp_status('bsW',100,db_path=bs_path) if x['run_id']=='runW'][0]
             return r['changed_during_backup']==3 and r['read_errors']==0
         check("bkp_status : compteurs C/E écrits à la fin et relus par list_pending_bkp_status (notification)",_bs_warn_counts)
+        def _bs_running():
+            bh.store_bkp_status_start('bsR','runR',db_path=bs_path)
+            running=bh.bkp_running('bsR',100,db_path=bs_path)
+            bh.store_bkp_status_finish('bsR','runR','success',db_path=bs_path)
+            c=_open_db(bs_path,nick='bsS',role='write')
+            c.execute("INSERT INTO bkp_status (nick,run_id,started_at) VALUES ('bsS','runStale',datetime('now','-999 seconds'))")
+            c.commit(); c.close()
+            return running and not bh.bkp_running('bsR',100,db_path=bs_path) and not bh.bkp_running('bsS',100,db_path=bs_path)
+        check("bkp_running : vrai pendant un Bkp, faux une fois fini ou bloqué au-delà du timeout",_bs_running)
         def _bs_claim_cas():
             bh.store_bkp_status_start('bsC','runC',db_path=bs_path)
             bh.store_bkp_status_finish('bsC','runC','success',db_path=bs_path)

@@ -1,5 +1,24 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.24.0 / borgHelper 1.0.119 / UI 1.13.2 / borgHelperWWW_sw.js 1.2.0 — notification « sauvegarde en retard » — 2026-09-26
+
+Demande utilisateur : un serveur non sauvegardé depuis plus de `MAX_AGE_BKP` heures est une erreur —
+pas seulement affichée (Report le marquait déjà), mais notifiée.
+
+- Le watcher de borgHelperWWW compare à chaque passage l'âge de la dernière archive connue de chaque
+  serveur à son `MAX_AGE_BKP` (heures, défaut 25 — même règle que Report). Au-delà : notification push
+  de type **Échec** — « ⏰ Sauvegarde en retard — nick / Dernière sauvegarde il y a 31 h (seuil : 25 h) ».
+- **Rappel** à chaque période supplémentaire (2×, 3× le seuil…) — « ⏰ Toujours aucune sauvegarde » —
+  jusqu'à la prochaine archive. Aucun doublon, y compris avec plusieurs workers (réservation atomique,
+  table `overdue_alerts` de `push.db`, schéma 2).
+- Silence pendant un Bkp en cours et pour un serveur sans archive connue. Sans abonné aux échecs de ce
+  host, l'alerte n'est pas consommée : un abonnement pris pendant le retard la reçoit aussitôt.
+- UI : colonne « ❌ Échec / retard » dans les réglages de notification.
+- borgHelper 1.0.119 : `last_archive_stat` / `bkp_running` (lectures pour le watcher, jamais de
+  création de base).
+- `CodecSelfTest` 327/327, `push_selftest` 63/63 ; essai réel de bout en bout (démo,
+  `MAX_AGE_BKP = 0.5`) : notification reçue et déchiffrée, aucun doublon sur ~5 passages.
+
 ## borgHelper 1.0.118 / borgHelperWWW 1.23.0 / borgHelperWWW_sw.js 1.1.0 — avertissements dans la notification de fin — 2026-09-26
 
 - La notification de fin de sauvegarde mentionne les fichiers modifiés pendant la sauvegarde et les
