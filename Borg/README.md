@@ -1521,6 +1521,8 @@ montrer exactement ce dont on parle.
   adresse remplacée par `/`. Un client API (curl…) reçoit toujours le `404` JSON habituel.
 - Non reflétés dans l'adresse : la recherche de l'explorateur et l'action ouverte dans la page détail.
 - L'interface doit être publiée à la racine du site (pas sous un sous-chemin `https://host/borg/…`).
+- Test du routeur (Node, sans dépendance) : `node borgHelperWWW_ui_test.js` — à lancer après toute
+  modification de `routePath`/`parseRoute` dans `borgHelperWWW_ui.html`. Inutile au déploiement.
 
 Cette page HTML elle-même n'est pas protégée par `X-API-Key` (elle ne contient aucun secret — la clé et
 les passphrases ne sont saisies et envoyées que depuis le navigateur, via `fetch()`) ; c'est l'API qui

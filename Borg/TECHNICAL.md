@@ -1654,10 +1654,11 @@ l'adresse (la connexion suivante y revient).
 routage : `/serveur/a%2Fb` ne correspond pas à `/serveur/{nick}` (repli 404 → liste). Sans objet pour
 les nicks réels (noms d'hôtes).
 
-**Vérification.** `push_selftest` (routes, non-masquage, repli 404) ; ponctuellement, par des scripts
-non versionnés (pas de framework de test JS dans ce dépôt) : test Node des fonctions pures (aller-retour
-d'encodage espace/`é`/`#`/`?`/`&`/`%`, archive, adresses invalides) et parcours complet dans Chrome
-headless piloté par CDP, avec `api_prefix` `/api` puis `/v1` (lien sans session → connexion →
+**Vérification.** `push_selftest` (routes, non-masquage, repli 404) ; `borgHelperWWW_ui_test.js`
+(versionné, Node sans dépendance ni DOM) : extrait `routePath`/`parseRoute` du HTML par appariement
+d'accolades et vérifie la matrice — analyse, adresses invalides, aller-retour d'encodage
+espace/`é`/`#`/`?`/`&`/`=`/`%`/`:`, archive — code de sortie 1 au moindre échec. Ponctuellement (script
+non versionné) : parcours complet dans Chrome headless piloté par CDP, avec `api_prefix` `/api` puis `/v1` (lien sans session → connexion →
 répertoire, rechargement, navigation, 4× Précédent + Suivant sans nouvelle entrée, refus, adresses
 inconnues, archive encodée, copie du lien, adresse non canonique, `/notifications`,
 déconnexion/reconnexion, clé expirée).

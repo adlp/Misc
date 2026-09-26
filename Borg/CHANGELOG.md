@@ -1,5 +1,15 @@
 # Changelog — borgHelper
 
+## borgHelperWWW_ui.html 1.14.0 — test du routeur versionné — 2026-09-27
+
+Demande utilisateur : versionner le test du routeur des adresses partageables.
+
+- Nouveau `borgHelperWWW_ui_test.js` : `node borgHelperWWW_ui_test.js [chemin du HTML]`. Node seul, sans
+  dépendance ni navigateur ; extrait `routePath`/`parseRoute` de `borgHelperWWW_ui.html` et vérifie 25
+  cas (analyse, adresses invalides, aller-retour d'encodage, archive épinglée). Code de sortie 1 en cas
+  d'échec. Aucune modification de l'UI ni du serveur (versions inchangées) ; fichier inutile au
+  déploiement.
+
 ## borgHelperWWW 1.26.0 / borgHelperWWW_ui.html 1.14.0 — adresses partageables — 2026-09-27
 
 Demande utilisateur : l'adresse doit suivre les menus (`https://host/explorer/<serveur>/<répertoire>`,
