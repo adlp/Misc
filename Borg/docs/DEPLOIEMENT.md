@@ -114,6 +114,9 @@ Réglages les plus importants pour un premier déploiement :
 | `allow_destructive` / `--allow-destructive` | Autorise `Prune`/`DelBkp` (irréversible) — **interdit par défaut** |
 | `allow_downloads` / `--allow-downloads` | Autorise `/download/file`/`/download/tar` — **autorisé par défaut** |
 | `groups_header` / `--groups-header` | Active le RBAC par groupes (voir [TECHNIQUE.md](TECHNIQUE.md#auth--rbac)) — désactivé par défaut, `X-API-Key` seul fait foi |
+| `user_header` / `--user-header` | Header de l'email/utilisateur posé par le reverse proxy — journalisé, enregistré avec les abonnements aux notifications |
+| `require_user` / `--require-user` | Refuse (403) les requêtes sans ce header (sauf `/healthz`) — désactivé par défaut |
+| `trusted_proxies` / `--trusted-proxies` | IP/CIDR du reverse proxy : l'IP journalisée est celle du navigateur (`X-Forwarded-For`), dans les deux modes de lancement — défaut `127.0.0.1` |
 | `push_db` / `--push-db` | Fichier SQLite dédié aux clés VAPID/abonnements push — **jamais reconstructible**, à sauvegarder comme une vraie donnée |
 | `push_prefs` / `--push-prefs` | Fichier JSON des préférences de notification (défaut à côté de `push_db`) — éditable à la main, à sauvegarder avec `push_db` |
 
@@ -129,7 +132,7 @@ Lancement, deux méthodes équivalentes :
 python3 borgHelperWWW --conf /etc/borghelperwww.conf
 
 # Via uvicorn (production — requiert borgHelperWWW.py, le symlink) :
-BORGHELPERWWW_CONF=/etc/borghelperwww.conf uvicorn borgHelperWWW:app --host 0.0.0.0 --port 8000
+BORGHELPERWWW_CONF=/etc/borghelperwww.conf uvicorn borgHelperWWW:app --host 0.0.0.0 --port 8000 --no-access-log   # journal propre à borgHelperWWW (IP du navigateur, utilisateur)
 ```
 
 Vérification du démarrage :

@@ -1050,11 +1050,13 @@ première requête — voir `docs/borghelperrc.example`.
 | `BORGHELPERWWW_TIMEOUT` | `--timeout` | `timeout` | Timeout en secondes par commande (défaut 3600 ; 0 = illimité) |
 | `BORGHELPERWWW_HOST` | `--host` | `host` | Bind — adresse (défaut `127.0.0.1`) |
 | `BORGHELPERWWW_PORT` | `--port` | `port` | Bind — port (défaut `8000`) |
-| `BORGHELPERWWW_TRUSTED_PROXIES` | `--trusted-proxies` | `trusted_proxies` | IP/CIDR des reverse proxies de confiance, séparées par des virgules, ou `*` pour toutes (défaut `127.0.0.1` — voir ci-dessous) |
+| `BORGHELPERWWW_TRUSTED_PROXIES` | `--trusted-proxies` | `trusted_proxies` | IP/CIDR des reverse proxies de confiance, séparées par des virgules, ou `*` pour toutes (défaut `127.0.0.1`) — IP du navigateur dans le journal des requêtes, dans les deux modes de lancement (voir ci-dessous) |
 | `BORGHELPERWWW_ALLOW_DESTRUCTIVE` | `--allow-destructive`, `--no-allow-destructive` | `allow_destructive` | Autorise `Prune`/`DelBkp` (destruction de sauvegardes) — **interdit par défaut** (voir ci-dessous) |
 | `BORGHELPERWWW_ALLOW_DOWNLOADS` | `--allow-downloads`, `--no-downloads` | `allow_downloads` | Autorise `/download/file` et `/download/tar` (vue d'une restauration) — **autorisé par défaut** (voir ci-dessous) |
 | `BORGHELPERWWW_API_PREFIX` | `--api-prefix` | `api_prefix` | Préfixe de toutes les routes API — défaut `/api` (voir ci-dessous) |
 | `BORGHELPERWWW_GROUPS_HEADER` | `--groups-header` | `groups_header` | Header HTTP contenant les groupes de l'utilisateur (reverse proxy OIDC) — absent : **désactivé** (voir ci-dessous) |
+| `BORGHELPERWWW_USER_HEADER` | `--user-header` | `user_header` | Header HTTP portant l'email/le nom de l'utilisateur (reverse proxy) — journalisé et enregistré avec les abonnements aux notifications (≥ 1.25.0) |
+| `BORGHELPERWWW_REQUIRE_USER` | `--require-user` / `--no-require-user` | `require_user` | Refuse (403) les requêtes sans ce header, sauf `/healthz` — défaut non ; exige `user_header` |
 | `BORGHELPERWWW_SCOPE_CACHE_DB` | `--scope-cache-db` | `scope_cache_db` | Chemin du fichier SQLite du cache de réponses **filtrées** par périmètre (Story 1.5) — défaut : co-localisé avec `cache.db`/`diff.db` (voir [Cache de réponses](#cache-de-réponses)) |
 | `BORGHELPERWWW_BKP_WATCHER_INTERVAL` | — | — | Intervalle (secondes) d'interrogation `bkp_status` par le watcher — défaut 30 (voir `POST /bkp` asynchrone ci-dessus) |
 | `BORGHELPERWWW_BKP_STATUS_TIMEOUT` | — | — | Délai (secondes) avant qu'une sauvegarde démarrée mais jamais terminée soit traitée comme un échec (AD-7) — défaut 21600 (6h) |
@@ -1323,37 +1325,50 @@ header.
 
 `GET /version` renvoie `groups_auth_enabled` (booléen — jamais le nom du header ni les groupes eux-mêmes).
 
-#### Derrière un reverse proxy — IP client réelle dans les logs
+#### Derrière un reverse proxy — IP du navigateur et utilisateur dans les logs
 
-`uvicorn.run(..., proxy_headers=True, forwarded_allow_ips=...)` (exécution directe
-`python3 borgHelperWWW ...`) : l'IP client des logs d'accès (`INFO: <ip>:<port> - "GET ..."`) est prise
-depuis l'en-tête `X-Forwarded-For` **plutôt que** l'IP de connexion TCP brute — mais **seulement** si
-cette connexion TCP brute (le reverse proxy lui-même) figure dans `BORGHELPERWWW_TRUSTED_PROXIES` /
-`--trusted-proxies` (défaut `127.0.0.1`, comme uvicorn lui-même — couvre le cas le plus courant : proxy
-sur la même machine). Un client qui ne passe pas par une IP de confiance ne peut donc pas usurper son IP
-en forgeant lui-même ce header. Élargir avec l'IP (ou le CIDR) réel du reverse proxy si celui-ci
-n'écoute pas sur `127.0.0.1` (conteneur séparé, load-balancer distant, etc.) ; `*` fait confiance à
-n'importe quelle IP amont (à réserver aux réseaux internes fermés).
+**Journal des requêtes** (borgHelperWWW ≥ 1.25.0) : une ligne par requête sur stderr, produite par
+borgHelperWWW lui-même (plus le journal d'accès d'uvicorn, désactivé en exécution directe) :
 
-Avec `uvicorn borgHelperWWW:app ...` (lancement externe) : `borgHelperWWW` ne construit plus le
-serveur lui-même — `BORGHELPERWWW_TRUSTED_PROXIES` (CLI, variable, ou clé `trusted_proxies` du fichier
-de conf) est **sans effet** dans ce mode. C'est le mécanisme natif d'uvicorn qui s'applique
-directement : `--proxy-headers` (activé par défaut) et
-`--forwarded-allow-ips <ip/cidr[,ip/cidr...]|*>`, sinon la variable d'environnement **native**
-`FORWARDED_ALLOW_IPS` (sans préfixe `BORGHELPERWWW_`), sinon `127.0.0.1` par défaut — même défaut que
-le mode d'exécution directe, donc même comportement dans les deux modes sans réglage supplémentaire
-tant que le reverse proxy tourne sur la même machine.
+```
+[req] 203.0.113.9 alice@example.org "POST /api/login?servername=x&repo=y&repo_passphrase=***" 200 213ms
+       │           │                  │                                                         │   └ durée
+       │           │                  └ requête — paramètres sensibles masqués (passphrase, clé, secret, token)
+       │           └ utilisateur (header BORGHELPERWWW_USER_HEADER), « - » si absent/non configuré
+       └ IP du navigateur
+```
+
+**IP du navigateur** : si la connexion vient d'un reverse proxy listé dans
+`BORGHELPERWWW_TRUSTED_PROXIES` / `--trusted-proxies` / `trusted_proxies` (IP ou CIDR séparés par des
+virgules, `*` = toutes ; défaut `127.0.0.1`, proxy sur la même machine), l'IP journalisée est lue dans
+`X-Forwarded-For`, parcouru de droite à gauche en sautant les proxies de confiance : la première IP non
+fiable est le navigateur (jamais la plus à gauche d'emblée, qu'un client peut forger). Une connexion qui
+ne vient pas d'un proxy de confiance est journalisée avec son IP réelle, `X-Forwarded-For` ignoré.
+Élargir `trusted_proxies` à l'IP réelle du reverse proxy s'il n'écoute pas sur `127.0.0.1` (conteneur,
+load-balancer distant…) ; `*` à réserver aux réseaux fermés. **Même comportement dans les deux modes de
+lancement** : ce réglage est lu par borgHelperWWW lui-même, y compris sous `uvicorn borgHelperWWW:app`
+(avant 1.25.0 il était sans effet dans ce mode). Sous uvicorn externe, ajouter `--no-access-log` pour ne
+pas doubler chaque ligne avec le journal d'uvicorn.
 
 ```bash
 # reverse proxy sur un hôte distinct (10.0.0.5)
-export FORWARDED_ALLOW_IPS=10.0.0.5
-uvicorn borgHelperWWW:app --host 0.0.0.0 --port 8000 --workers 2
-# équivalent sans variable d'environnement :
-uvicorn borgHelperWWW:app --host 0.0.0.0 --port 8000 --workers 2 --forwarded-allow-ips 10.0.0.5
+BORGHELPERWWW_TRUSTED_PROXIES=10.0.0.5 uvicorn borgHelperWWW:app --host 0.0.0.0 --port 8000 --workers 2 --no-access-log
 ```
 
-Détail de la résolution (code source uvicorn) et exemples supplémentaires : voir
-[TECHNICAL.md](TECHNICAL.md), section « borgHelperWWW — IP client réelle derrière un reverse proxy ».
+**Identité de l'utilisateur** : `BORGHELPERWWW_USER_HEADER` / `--user-header` / `user_header` = nom du
+header dans lequel le reverse proxy (OIDC, `auth_request`…) transmet l'email ou le nom de l'utilisateur
+(ex. `X-Email`, `X-Forwarded-User`). S'il est configuré et présent, sa valeur est journalisée avec chaque
+requête et enregistrée avec les abonnements aux notifications (champ `user` du fichier JSON des
+préférences, mis à jour à chaque abonnement ou modification, conservé si le header manque) — pour savoir
+qui reçoit quoi et accompagner les utilisateurs. Caractères de contrôle retirés, 256 caractères max.
+`BORGHELPERWWW_REQUIRE_USER` / `--require-user` / `require_user = true` : **refuse (403)** toute requête
+sans ce header (sauf `/healthz`, pour la supervision) ; exige `user_header` (sinon borgHelperWWW refuse
+de démarrer). ⚠️ Comme `groups_header` : le reverse proxy doit être la seule voie d'accès et **écraser**
+tout header de même nom envoyé par le navigateur — sinon n'importe qui peut s'attribuer une identité.
+C'est une identification, pas une authentification (qui reste `X-API-Key` + groupes).
+
+Détail de la résolution : voir [TECHNICAL.md](TECHNICAL.md), section « borgHelperWWW — IP client réelle
+derrière un reverse proxy ».
 
 - **`uvicorn borgHelperWWW:app`** : uvicorn importe le module et possède seul `sys.argv` — seules les
   variables d'environnement sont lues, pas d'options CLI possibles ici.

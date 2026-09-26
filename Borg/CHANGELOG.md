@@ -1,5 +1,25 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.25.0 — identité de l'utilisateur, IP du navigateur, journal des requêtes — 2026-09-26
+
+Demande utilisateur : enregistrer l'email/le nom transmis par le reverse proxy (notifications et
+journaux), pouvoir bloquer l'accès sans lui, et journaliser l'IP du navigateur plutôt que celle du proxy.
+
+- **`user_header`** (`BORGHELPERWWW_USER_HEADER` / `--user-header`) : nom du header portant l'email ou
+  le nom de l'utilisateur. S'il est présent : journalisé avec chaque requête, et enregistré avec
+  l'abonnement aux notifications (champ `user` du fichier JSON des préférences — à l'abonnement et à
+  chaque modification, conservé si le header manque).
+- **`require_user`** (`BORGHELPERWWW_REQUIRE_USER` / `--require-user`, défaut non) : 403 pour toute
+  requête sans ce header, sauf `/healthz`. Sans `user_header`, borgHelperWWW refuse de démarrer.
+- **Journal des requêtes** propre à borgHelperWWW : `[req] <IP navigateur> <utilisateur> "<requête>"
+  <statut> <durée>`. Remplace le journal d'accès d'uvicorn en exécution directe (sous uvicorn externe :
+  `--no-access-log`). **Paramètres sensibles masqués** : `/login?repo_passphrase=…` apparaissait en
+  clair dans le journal d'uvicorn.
+- **IP du navigateur** : lue dans `X-Forwarded-For` quand la connexion vient d'un proxy listé dans
+  `trusted_proxies` (IP forgée par un client ignorée), **dans les deux modes de lancement** — le réglage
+  était sans effet sous `uvicorn borgHelperWWW:app`. `trusted_proxies` invalide → refus de démarrer.
+- `push_selftest` 69/69 ; essai réel en exécution directe et sous uvicorn externe.
+
 ## borgHelperWWW_ui.html 1.13.4 — explorateur : étiquette du serveur à la place de « ← Retour au serveur » — 2026-09-26
 
 - Page Explorer (arborescence) : le bouton « ← Retour au serveur » est remplacé par la même étiquette

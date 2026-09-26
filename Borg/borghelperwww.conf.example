@@ -37,9 +37,9 @@ cfgfile = /etc/borghelperrc-www
 ; Bind — port d'écoute (exécution directe uniquement) — BORGHELPERWWW_PORT / --port (défaut 8000)
 ;port = 8000
 
-; IP/CIDR des reverse proxies de confiance pour l'IP client réelle dans les logs (X-Forwarded-For),
-; séparées par des virgules, ou '*' pour toutes — BORGHELPERWWW_TRUSTED_PROXIES / --trusted-proxies
-; (exécution directe uniquement ; défaut 127.0.0.1, comme uvicorn lui-même — voir README.md,
+; IP/CIDR des reverse proxies de confiance pour l'IP du navigateur dans le journal des requêtes
+; (X-Forwarded-For), séparées par des virgules, ou '*' pour toutes — BORGHELPERWWW_TRUSTED_PROXIES /
+; --trusted-proxies (les deux modes de lancement depuis 1.25.0 ; défaut 127.0.0.1 — voir README.md,
 ; section « Derrière un reverse proxy »)
 ;trusted_proxies = 127.0.0.1
 
@@ -64,6 +64,16 @@ cfgfile = /etc/borghelperrc-www
 ; Chaque nick porte alors GROUPS_ADMIN/GROUPS_WRITE/GROUPS_READ dans le .borghelperrc (voir README.md
 ; du dépôt principal — pas ce fichier, qui ne configure QUE borgHelperWWW lui-même).
 ;groups_header = X-Groups
+
+; Header portant l'identité de l'utilisateur (email ou nom), posé par le reverse proxy — journalisé avec
+; chaque requête et enregistré avec les abonnements aux notifications — BORGHELPERWWW_USER_HEADER /
+; --user-header. ⚠️ Même mise en garde que groups_header : le reverse proxy doit écraser tout header de
+; même nom envoyé par le navigateur.
+;user_header = X-Email
+
+; Refuse (403) toute requête sans ce header, sauf /healthz — BORGHELPERWWW_REQUIRE_USER /
+; --require-user. Défaut false ; exige user_header.
+;require_user = false
 
 ; Chemin du fichier SQLite du cache de réponses FILTRÉES par périmètre (Story 1.5, distinct de
 ; cache.db/diff.db) — BORGHELPERWWW_SCOPE_CACHE_DB / --scope-cache-db. Défaut : co-localisé avec

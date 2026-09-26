@@ -6,7 +6,7 @@
 #* See <http://www.gnu.org/licenses/>
 #*/
 
-import os,re,sys,io,json,sqlite3,secrets,subprocess,configparser,tarfile,hmac,hashlib,asyncio,contextlib,datetime,urllib.parse
+import os,re,sys,io,json,sqlite3,secrets,subprocess,configparser,tarfile,hmac,hashlib,asyncio,contextlib,datetime,urllib.parse,time,ipaddress
 from pathlib import Path
 from typing import Optional, Dict
 from collections import defaultdict
@@ -62,7 +62,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.24.0"
+WWW_VERSION="1.25.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -111,6 +111,14 @@ if __name__=='__main__':
                      "l'utilisateur, liste séparée par des virgules (ex. X-Groups). Vide/absent : "
                      "fonctionnalité désactivée, seule X-API-Key fait foi (déf. BORGHELPERWWW_GROUPS_HEADER)."
                      " Voir GROUPS_ADMIN/GROUPS_WRITE/GROUPS_READ dans le .borghelperrc — README.md")
+    _p.add_argument('--user-header',help="Nom du header HTTP portant l'identité de l'utilisateur (email ou "
+                     "nom, posé par le reverse proxy OIDC/auth_request, ex. X-Email) : journalisé avec chaque "
+                     "requête et enregistré avec les abonnements aux notifications (déf. BORGHELPERWWW_USER_HEADER)")
+    _p.add_argument('--require-user',dest='require_user',action='store_true',default=None,
+                     help="Refuse (403) toute requête sans ce header, sauf /healthz — requiert --user-header "
+                     "(déf. BORGHELPERWWW_REQUIRE_USER, sinon non)")
+    _p.add_argument('--no-require-user',dest='require_user',action='store_false',
+                     help="Annule un require_user venant de la conf/l'env")
     _p.add_argument('--scope-cache-db',help="Chemin du fichier SQLite du cache de réponses filtrées "
                      "par périmètre (Story 1.5, distinct de cache.db/diff.db) — déf. "
                      "BORGHELPERWWW_SCOPE_CACHE_DB, sinon co-localisé avec cache.db/diff.db")
@@ -136,6 +144,8 @@ if __name__=='__main__':
     if _args.port is not None: os.environ['BORGHELPERWWW_PORT']=str(_args.port)
     if _args.trusted_proxies: os.environ['BORGHELPERWWW_TRUSTED_PROXIES']=_args.trusted_proxies
     if _args.groups_header: os.environ['BORGHELPERWWW_GROUPS_HEADER']=_args.groups_header
+    if _args.user_header: os.environ['BORGHELPERWWW_USER_HEADER']=_args.user_header
+    if _args.require_user is not None: os.environ['BORGHELPERWWW_REQUIRE_USER']=str(_args.require_user)
     if _args.scope_cache_db: os.environ['BORGHELPERWWW_SCOPE_CACHE_DB']=_args.scope_cache_db
     if _args.push_db: os.environ['BORGHELPERWWW_PUSH_DB']=_args.push_db
     if _args.push_prefs: os.environ['BORGHELPERWWW_PUSH_PREFS']=_args.push_prefs
@@ -156,7 +166,8 @@ _CONF_KEYS={'cfgfile':'BORGHELPERWWW_CFGFILE','api_key':'BORGHELPERWWW_API_KEY',
             'allow_destructive':'BORGHELPERWWW_ALLOW_DESTRUCTIVE','allow_downloads':'BORGHELPERWWW_ALLOW_DOWNLOADS',
             'api_prefix':'BORGHELPERWWW_API_PREFIX','groups_header':'BORGHELPERWWW_GROUPS_HEADER',
             'scope_cache_db':'BORGHELPERWWW_SCOPE_CACHE_DB','push_db':'BORGHELPERWWW_PUSH_DB',
-            'push_prefs':'BORGHELPERWWW_PUSH_PREFS'}
+            'push_prefs':'BORGHELPERWWW_PUSH_PREFS',
+            'user_header':'BORGHELPERWWW_USER_HEADER','require_user':'BORGHELPERWWW_REQUIRE_USER'}
 
 def _apply_conf_section(sect):
     """Comble os.environ depuis une SectionProxy configparser selon _CONF_KEYS — ne touche jamais une
@@ -233,6 +244,74 @@ if GROUPS_HEADER is not None and not _is_valid_http_token(GROUPS_HEADER):
               "n'accepte que lettres/chiffres/'-' (RFC 7230 token). Un commentaire est-il resté "
               "collé à la valeur sur la même ligne dans le fichier de conf ? (toujours sur sa "
               "propre ligne, jamais après une valeur — voir docs/borghelperrc.example)")
+
+# Identité de l'utilisateur (1.25.0) : header posé par le reverse proxy (email ou nom), journalisé avec
+# chaque requête et enregistré avec les abonnements aux notifications. REQUIRE_USER : refus (403) de
+# toute requête sans ce header (sauf /healthz). ⚠️ Comme GROUPS_HEADER, forgeable par n'importe quel
+# client si borgHelperWWW est joignable autrement que via le reverse proxy (qui doit aussi écraser un
+# header de même nom envoyé par le navigateur) — identification, pas authentification.
+USER_HEADER=os.environ.get('BORGHELPERWWW_USER_HEADER','').strip() or None
+if USER_HEADER is not None and not _is_valid_http_token(USER_HEADER):
+    sys.exit(f"BORGHELPERWWW_USER_HEADER invalide : {USER_HEADER!r} — un nom de header HTTP n'accepte que "
+             "lettres/chiffres/'-' (RFC 7230 token). Un commentaire est-il resté collé à la valeur ?")
+REQUIRE_USER=_env_bool('BORGHELPERWWW_REQUIRE_USER',False)
+if REQUIRE_USER and USER_HEADER is None:
+    sys.exit("BORGHELPERWWW_REQUIRE_USER actif sans BORGHELPERWWW_USER_HEADER : aucun header à exiger — "
+             "renseigner user_header (nom du header portant l'email/l'utilisateur) ou désactiver require_user")
+
+def _parse_trusted_proxies(raw):
+    """'127.0.0.1, 10.0.0.0/8' -> liste d'ip_network ; '*' -> None (toute IP de confiance). Entrée
+    invalide -> ValueError (message explicite au démarrage, jamais une IP client fausse en silence)."""
+    raw=(raw or '').strip()
+    if raw=='*': return None
+    nets=[]
+    for part in raw.split(','):
+        part=part.strip()
+        if not part: continue
+        try: nets.append(ipaddress.ip_network(part,strict=False))
+        except ValueError: raise ValueError(f"trusted_proxies : {part!r} n'est ni une IP ni un CIDR")
+    return nets
+
+try:
+    _TRUSTED_PROXY_NETS=_parse_trusted_proxies(os.environ.get('BORGHELPERWWW_TRUSTED_PROXIES','127.0.0.1'))
+except ValueError as _e:
+    sys.exit(f"BORGHELPERWWW_TRUSTED_PROXIES invalide — {_e}")
+
+def _ip_trusted(ip,nets):
+    if nets is None: return True
+    try: a=ipaddress.ip_address(ip)
+    except ValueError: return False
+    return any(a in n for n in nets)
+
+def _client_ip(peer,xff,nets):
+    """IP du navigateur (1.25.0) : si la connexion vient d'un proxy de confiance (trusted_proxies),
+    remonte X-Forwarded-For de droite à gauche en sautant les proxies de confiance — la première IP
+    non fiable est le client (jamais la plus à gauche d'emblée : un client peut la forger). Sinon, l'IP
+    de la connexion. Indépendant du mode de lancement (direct ou uvicorn externe)."""
+    if not peer: return '-'
+    if not xff or not _ip_trusted(peer,nets): return peer
+    hops=[h.strip() for h in xff.split(',') if h.strip()]
+    for h in reversed(hops):
+        if not _ip_trusted(h,nets): return h
+    return hops[0] if hops else peer
+
+def _clean_user(value):
+    """Valeur du header d'identité : caractères non imprimables retirés (jamais d'injection de ligne
+    dans les logs ou le fichier JSON), 256 caractères max ; vide -> None."""
+    if value is None: return None
+    v=''.join(c for c in value if c.isprintable()).strip()[:256]
+    return v or None
+
+def _request_user(request):
+    return _clean_user(request.headers.get(USER_HEADER)) if USER_HEADER else None
+
+_SENSITIVE_PARAM=re.compile(r'pass|secret|token|key|pwd',re.I)
+def _loggable_path(path,query):
+    """Chemin + paramètres pour le journal, valeurs sensibles masquées (ex. /login?repo_passphrase=…,
+    que le journal d'accès d'uvicorn affichait en clair)."""
+    if not query: return path
+    pairs=urllib.parse.parse_qsl(query,keep_blank_values=True)
+    return path+'?'+urllib.parse.urlencode([(k,'***' if _SENSITIVE_PARAM.search(k) else v) for k,v in pairs],safe='/:*')
 # Watcher bkp_status (Story 1, spec-notifications-push) — AD-3/AD-7 : période d'interrogation et
 # délai avant qu'une ligne started_at sans finished_at (processus tué, SIGKILL/OOM) soit traitée
 # comme un échec. Le timeout doit rester largement supérieur à la durée normale d'un Bkp (6h par
@@ -445,6 +524,29 @@ app=FastAPI(
         f"{CFGFILE} — à réserver au provisioning, pas à un usage courant."
     ),
 )
+
+# Journal des requêtes + garde d'identité (1.25.0). Remplace le journal d'accès d'uvicorn (désactivé en
+# exécution directe ; sous uvicorn externe : --no-access-log pour éviter le doublon) : IP du navigateur
+# (_client_ip, trusted_proxies), utilisateur (USER_HEADER), requête (paramètres sensibles masqués),
+# statut, durée. Une ligne par requête sur stderr.
+@app.middleware("http")
+async def _access_log_and_user_guard(request: Request, call_next):
+    t0=time.monotonic()
+    user=_request_user(request)
+    ip=_client_ip(request.client.host if request.client else None,
+                  request.headers.get('x-forwarded-for'),_TRUSTED_PROXY_NETS)
+    status=500
+    try:
+        if REQUIRE_USER and user is None and request.url.path!='/healthz':
+            response=JSONResponse(status_code=403,content={'detail':
+                f"Identité utilisateur absente (header {USER_HEADER}) — accès refusé (require_user)"})
+        else:
+            response=await call_next(request)
+        status=response.status_code
+        return response
+    finally:
+        print(f"[req] {ip} {user or '-'} \"{request.method} {_loggable_path(request.url.path,request.url.query)}\" "
+              f"{status} {int((time.monotonic()-t0)*1000)}ms",file=sys.stderr,flush=True)
 
 _bkp_watcher_task=None
 
@@ -1161,8 +1263,11 @@ def _prefs_entry(raw):
         for n in nicks:
             h=raw_hosts.get(n); h=h if isinstance(h,dict) else {}
             hosts[n]={k:h.get(k) is True for k in _PUSH_KINDS}
+    # user (1.25.0) : identité (USER_HEADER) de la personne lors de sa dernière action sur l'abonnement —
+    # pour l'accompagner (qui reçoit quoi), jamais utilisée pour décider d'un envoi.
     return {'scope_nicks':nicks,'hosts':hosts,'expires_at':exp,
-            'updated_at':e.get('updated_at') if isinstance(e.get('updated_at'),str) else None}
+            'updated_at':e.get('updated_at') if isinstance(e.get('updated_at'),str) else None,
+            'user':_clean_user(e.get('user')) if isinstance(e.get('user'),str) else None}
 
 def _push_sub_dict(row,raw_prefs):
     """Vue API d'un abonnement : identité/clés depuis push.db, préférences depuis le fichier JSON.
@@ -1170,7 +1275,7 @@ def _push_sub_dict(row,raw_prefs):
     aucune notification ne part alors (scope_nicks vide), un réabonnement (POST) la recrée."""
     p=_prefs_entry(raw_prefs)
     return {'id':row['id'],'endpoint':row['endpoint'],'scope_nicks':p['scope_nicks'],
-            'hosts':p['hosts'],'expires_at':p['expires_at'],
+            'hosts':p['hosts'],'expires_at':p['expires_at'],'user':p['user'],
             'created_at':row['created_at'],'updated_at':p['updated_at'],'prefs_missing':raw_prefs is None}
 
 def _migrate_push_prefs_from_db():
@@ -2615,8 +2720,12 @@ def push_subscribe(request: Request, body: PushSubscribeBody, x_api_key: Optiona
         if body.notify_end is not None: base['success']=base['error']=body.notify_end
     hosts={n:(body.hosts[n].dict() if n in body.hosts else dict(base)) for n in scope_nicks}
     prefs={'scope_nicks':scope_nicks,'hosts':hosts,
-           'expires_at':_expires_at_value(days),'updated_at':_utc_now_str()}
-    def _set(subs): subs[body.endpoint]=prefs
+           'expires_at':_expires_at_value(days),'updated_at':_utc_now_str(),'user':_request_user(request)}
+    def _set(subs):
+        # Réabonnement sans header d'identité : garde l'utilisateur déjà connu pour cet endpoint.
+        if prefs['user'] is None and body.endpoint in subs:
+            prefs['user']=_prefs_entry(subs[body.endpoint])['user']
+        subs[body.endpoint]=prefs
     _prefs_or_500(lambda: _push_prefs_update(_set))
     row=_push_row(body.endpoint)
     if row is None:
@@ -2626,7 +2735,7 @@ def push_subscribe(request: Request, body: PushSubscribeBody, x_api_key: Optiona
 
 @router.patch("/push/subscribe",tags=["mutation"],
               summary="Modifier les préférences (par host : début/succès/échec ; expiration) d'un abonnement existant — jamais scope_nicks (AD-4)")
-def push_subscribe_patch(body: PushPatchBody, x_api_key: Optional[str]=Header(default=None)):
+def push_subscribe_patch(request: Request, body: PushPatchBody, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     row=_push_row(body.endpoint)
     if row is None:
@@ -2657,6 +2766,7 @@ def push_subscribe_patch(body: PushPatchBody, x_api_key: Optional[str]=Header(de
             # sort de « à vie », renouvelle, ou y repasse
             p['expires_at']=_expires_at_value(_resolve_push_expiry_days(body.expires_in_days))
         p['updated_at']=_utc_now_str()
+        p['user']=_request_user(request) or p['user']
         subs[body.endpoint]=p
         return p
     return _push_sub_dict(row,_prefs_or_500(lambda: _push_prefs_update(_patch)))
@@ -3266,6 +3376,64 @@ def push_selftest():
     check("Accès direct GROUPS_PATHS (lecture) / GROUPS_PATHS_RESTORE (+téléchargement) sans GROUPS_ADMIN/WRITE/READ",
           _direct_path_access_ok)
 
+    # ── Identité utilisateur, IP du navigateur, journal des requêtes (1.25.0) ──
+    def _trusted_ok():
+        nets=_parse_trusted_proxies('127.0.0.1, 10.0.0.0/8')
+        try: _parse_trusted_proxies('10.0.0.0/8, pas-une-ip'); bad=False
+        except ValueError: bad=True
+        return (_parse_trusted_proxies('*') is None and _ip_trusted('10.2.3.4',nets)
+                and not _ip_trusted('192.0.2.1',nets) and not _ip_trusted('testclient',nets) and bad)
+    check("trusted_proxies : IP/CIDR/'*' acceptés, entrée invalide refusée",_trusted_ok)
+    def _client_ip_ok():
+        nets=_parse_trusted_proxies('127.0.0.1, 10.0.0.0/8')
+        return (_client_ip('198.51.100.7','6.6.6.6',nets)=='198.51.100.7'        # connexion directe : XFF ignoré (forgeable)
+                and _client_ip('10.0.0.5','203.0.113.9',nets)=='203.0.113.9'     # via proxy de confiance
+                and _client_ip('10.0.0.5','1.1.1.1, 203.0.113.9',nets)=='203.0.113.9'  # 1.1.1.1 forgée par le client
+                and _client_ip('10.0.0.5','203.0.113.9, 10.0.0.4',nets)=='203.0.113.9' # chaîne de proxies
+                and _client_ip('10.0.0.5',None,nets)=='10.0.0.5' and _client_ip(None,None,nets)=='-')
+    check("IP du navigateur : X-Forwarded-For suivi seulement via un proxy de confiance, jamais l'IP forgée",_client_ip_ok)
+    check("identité : caractères de contrôle retirés (pas d'injection de ligne), 256 max, vide -> None",
+          lambda: _clean_user('alice@x.org\n[req] faux') == 'alice@x.org[req] faux' and _clean_user('  ') is None
+                  and len(_clean_user('a'*500))==256 and _clean_user(None) is None)
+    check("journal : paramètres sensibles masqués (passphrase, clé), autres conservés",
+          lambda: _loggable_path('/api/login','servername=s&repo_passphrase=secret&api_key=k')
+                  =='/api/login?servername=s&repo_passphrase=***&api_key=***'
+                  and _loggable_path('/api/report','nick=srv')=='/api/report?nick=srv' and _loggable_path('/x','')=='/x')
+    try:
+        from fastapi.testclient import TestClient as _TC
+    except Exception as e:
+        print(f"SKIP require_user/identité de bout en bout (TestClient indisponible : {e})")
+    else:
+        def _require_user_ok():
+            c=_TC(app); err=io.StringIO()
+            with mock.patch(f"{__name__}.USER_HEADER",'X-Email'), mock.patch(f"{__name__}.REQUIRE_USER",True), \
+                 contextlib.redirect_stderr(err):
+                no=c.get('/version').status_code
+                hz=c.get('/healthz').status_code
+                yes=c.get('/version',headers={'X-Email':'alice@example.org'}).status_code
+            log=err.getvalue()
+            return no==403 and hz==200 and yes==200 and 'alice@example.org "GET /version" 200' in log
+        check("require_user : 403 sans header d'identité (sauf /healthz), 200 avec ; utilisateur journalisé",_require_user_ok)
+        def _prefs_user_ok():
+            global PUSH_PREFS_FILE
+            old=PUSH_PREFS_FILE; PUSH_PREFS_FILE=os.path.join(tempfile.mkdtemp(prefix='bhw-user-'),'prefs.json')
+            c=_TC(app); H={'X-API-Key':API_KEY}; P=API_PREFIX; ep='https://push.example.invalid/ep-user'
+            body={'endpoint':ep,'keys':{'p256dh':'p','auth':'a'}}
+            try:
+                with mock.patch(f"{__name__}.USER_HEADER",'X-Email'), contextlib.redirect_stderr(io.StringIO()):
+                    c.post(f"{P}/push/subscribe",headers={**H,'X-Email':'alice@example.org'},json=body)
+                    u1=_push_prefs_load()['subscriptions'][ep].get('user')
+                    c.post(f"{P}/push/subscribe",headers=H,json=body)            # sans header : conservé
+                    u2=_push_prefs_load()['subscriptions'][ep].get('user')
+                    r=c.patch(f"{P}/push/subscribe",headers={**H,'X-Email':'bob@example.org'},json={'endpoint':ep})
+                    u3=_push_prefs_load()['subscriptions'][ep].get('user')
+                    c.delete(f"{P}/push/subscribe",headers=H,params={'endpoint':ep})
+                return (u1=='alice@example.org' and u2=='alice@example.org' and u3=='bob@example.org'
+                        and r.json().get('user')=='bob@example.org')
+            finally:
+                PUSH_PREFS_FILE=old
+        check("notifications : utilisateur enregistré à l'abonnement, conservé sans header, mis à jour au PATCH",_prefs_user_ok)
+
     fails=results.count(False)
     print(f"push selftest : {len(results)-fails}/{len(results)} OK"+(f", {fails} FAIL" if fails else ""))
     return fails
@@ -3280,4 +3448,7 @@ if __name__=='__main__':
     uvicorn.run(app,host=os.environ.get('BORGHELPERWWW_HOST','127.0.0.1'),
                 port=int(os.environ.get('BORGHELPERWWW_PORT','8000')),
                 proxy_headers=True,
-                forwarded_allow_ips=os.environ.get('BORGHELPERWWW_TRUSTED_PROXIES','127.0.0.1'))
+                forwarded_allow_ips=os.environ.get('BORGHELPERWWW_TRUSTED_PROXIES','127.0.0.1'),
+                # journal d'accès propre à borgHelperWWW (middleware _access_log_and_user_guard) :
+                # IP du navigateur, utilisateur, paramètres sensibles masqués — pas de doublon uvicorn
+                access_log=False)

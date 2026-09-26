@@ -2767,6 +2767,23 @@ IF NOT EXISTS`, base 1 inchangée). Service Worker 1.2.0 : « ⏰ Sauvegarde en 
 aucune sauvegarde » (rappel). `push_selftest` 63/63 ; essai réel (démo, `MAX_AGE_BKP = 0.5`) : une
 notification reçue et déchiffrée sur ~5 passages du watcher, aucun doublon.
 
+**Journal des requêtes, identité, IP du navigateur (1.25.0)** : middleware HTTP
+`_access_log_and_user_guard`, une ligne `[req] <ip> <user|-> "<méthode> <chemin>" <statut> <ms>ms` par
+requête (dans un `finally` : statut 500 journalisé si une exception remonte). IP : `_client_ip(peer,
+xff, nets)` — `X-Forwarded-For` n'est lu que si l'IP de connexion est dans `_TRUSTED_PROXY_NETS`
+(`_parse_trusted_proxies`, IP/CIDR via `ipaddress`, `*` = toutes, entrée invalide → refus de démarrer),
+parcouru de droite à gauche en sautant les proxies de confiance. Lu par borgHelperWWW lui-même :
+effectif sous uvicorn externe (auparavant seul `forwarded_allow_ips` d'uvicorn, en exécution directe).
+En exécution directe, uvicorn a déjà remplacé `request.client` par l'IP du navigateur (non fiable) → prise
+telle quelle. `access_log=False` en exécution directe (pas de doublon). Chemin : `_loggable_path` masque
+les valeurs des paramètres dont le nom contient pass/secret/token/key/pwd (`/login?repo_passphrase=`
+apparaissait en clair dans le journal d'uvicorn). Identité : `USER_HEADER` (validé comme
+`GROUPS_HEADER`), `_clean_user` (non imprimables retirés, 256 max) ; `REQUIRE_USER` → 403 avant routage
+sauf `/healthz` ; `REQUIRE_USER` sans `USER_HEADER` → refus de démarrer. Préférences push : champ `user`
+(`_prefs_entry`), écrit par `POST` (conservé si absent au réabonnement) et `PATCH`, exposé dans les
+réponses `/push/*`. `push_selftest` 69/69 ; essai réel dans les deux modes de lancement (403 sans
+identité, `/healthz` 200, IP `X-Forwarded-For` et utilisateur journalisés, passphrase masquée).
+
 **Fichiers statiques (1.22.0)** : `/static/chart.umd.min.js` — `vendor/chartjs/chart.umd.min.js` lu
 une fois au démarrage (`_CHARTJS`, `[WARN]` si absent → 404), `Cache-Control: public, max-age=86400` ;
 l'UI le charge avec `integrity` (même SRI que le CDN) et `onerror` → injection de la balise CDN.
