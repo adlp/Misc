@@ -116,24 +116,39 @@ BORG_RELOCATED_REPO_ACCESS_IS_OK = yes
 # reconnu uniquement par borgHelperWWW quand l'autorisation par groupes y est activée (voir sa propre
 # section « Autorisation par groupes »). Listes de noms de groupes séparés par des virgules,
 # hiérarchiques (admin ⊇ écriture ⊇ lecture — pas besoin de répéter un groupe dans les trois clefs).
-GROUPS_ADMIN     = ops-admins                    # Prune/DelBkp/IdxPurge/Init/Key/Login sur ce nick
-GROUPS_WRITE     = ops-admins,ops-writers        # Bkp/Index/Restore/CacheClean (+ lecture)
-GROUPS_READ      = ops-admins,ops-writers,ops-readers  # tout le reste (+ téléchargements)
+# ⚠️ Un commentaire va toujours sur sa propre ligne, jamais après une valeur : configparser ne le
+# coupe pas, il ferait partie du nom de groupe (qui ne correspondrait alors jamais).
+# Un tier donne accès à TOUTES les sauvegardes du nick (équivalent d'un accès racine).
+# GROUPS_ADMIN : Prune/DelBkp/IdxPurge/Init/Key/Login sur ce nick
+GROUPS_ADMIN     = ops-admins
+# GROUPS_WRITE : Bkp/Index/Restore/CacheClean (+ lecture)
+GROUPS_WRITE     = ops-admins,ops-writers
+# GROUPS_READ : tout le reste (+ téléchargements)
+GROUPS_READ      = ops-admins,ops-writers,ops-readers
 
-# Périmètre de chemin par groupe (facultatif, orthogonal au tier ci-dessus — ne l'étend jamais,
-# ne peut que le restreindre) : un groupe absent de cette clef garde un accès chemin illimité
-# dans la limite du tier qu'il détient déjà via GROUPS_ADMIN/WRITE/READ. Syntaxe :
+# Périmètre de chemin par groupe (facultatif). Syntaxe :
 # 'groupe:/chemin/a|/chemin/b, groupe2:/chemin/c' — ':' sépare groupe et chemin(s), '|' sépare
 # plusieurs chemins pour un même groupe, ',' sépare les groupes. Ces trois caractères sont donc
 # réservés : un nom de groupe ou un chemin qui en contient fait échouer le chargement de la
 # config avec une erreur explicite (jamais un résultat silencieusement mal découpé).
-GROUPS_PATHS     = ops-readers:/var/www/client-x
+#
+# Deux usages selon que le groupe a déjà un tier ci-dessus ou non :
+#   - groupe AVEC tier (ops-readers) : restriction — il ne voit plus que ce chemin. Un groupe à
+#     tier absent de GROUPS_PATHS garde un accès chemin illimité (ops-admins, ops-writers).
+#   - groupe SANS tier (borgHelperWWW ≥ 1.20.0, accès direct) : dba-lecture et dba ne sont dans
+#     aucun GROUPS_ADMIN/WRITE/READ — être cité ici leur donne directement la LECTURE de ces
+#     chemins seulement (arborescence, recherche, historique), sans téléchargement.
+GROUPS_PATHS     = ops-readers:/var/www/client-x, dba-lecture:/opt/backups/mysql, dba:/opt/backups/mysql
 
-# Périmètre de RESTAURATION (facultatif, spec-groups-paths-restore) : même syntaxe exacte que
-# GROUPS_PATHS ci-dessus, mais pour Restore/RestorePerms/DownloadFile/DownloadTar uniquement — un
-# groupe absent d'ici reprend simplement son entrée GROUPS_PATHS (lecture ET restauration alors
-# identiques, comportement inchangé si cette clef n'est pas utilisée).
-GROUPS_PATHS_RESTORE = ops-readers:/var/www/client-x/archives
+# Périmètre de RESTAURATION/téléchargement (facultatif, même syntaxe) — Restore/RestorePerms/
+# DownloadFile/DownloadTar :
+#   - groupe AVEC tier : absent d'ici, il reprend son entrée GROUPS_PATHS (lecture et
+#     restauration identiques) ; présent (ops-readers), ce périmètre remplace le sien pour la
+#     restauration seulement.
+#   - groupe SANS tier : seul moyen de télécharger (aucun repli sur GROUPS_PATHS). dba peut
+#     télécharger les dumps MySQL et PostgreSQL (et donc aussi parcourir /opt/backups/postgresql) ;
+#     dba-lecture, absent d'ici, ne télécharge rien. Jamais POST /restore/Bkp/Prune (tier requis).
+GROUPS_PATHS_RESTORE = ops-readers:/var/www/client-x/archives, dba:/opt/backups/mysql|/opt/backups/postgresql
 ```
 
 Le nickname (nom de section) sert d'identifiant partout avec `-n`.
@@ -172,7 +187,8 @@ par défaut pour tous les nicks qui ne les surchargent pas individuellement) :
 ```ini
 [DEFAULT]
 CACHE_DIR = /data/borgcache
-GROUPS_READ = ops-readers,ops-writers,ops-admins   # défaut : tout le monde peut au moins lire
+# défaut : tout le monde peut au moins lire
+GROUPS_READ = ops-readers,ops-writers,ops-admins
 ```
 
 ---

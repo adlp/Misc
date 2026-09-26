@@ -19,6 +19,9 @@ sauvegardes d'un host ; devoir en donner un pour ensuite le restreindre n'a pas 
   ambiguë en cours d'exécution renvoie 500 aussi à un appelant sans tier.
 - Docs : README (tableau), `docs/borghelperrc.example` (nouvel host `[dbserver01]`), DEPLOIEMENT,
   TECHNIQUE, TECHNICAL. `push_selftest` 48/48.
+- README, exemple `.borghelperrc` : `GROUPS_PATHS`/`GROUPS_PATHS_RESTORE` illustrent les deux usages
+  (restriction d'un groupe à tier, accès direct sans tier) ; commentaires des lignes `GROUPS_*`
+  déplacés sur leur propre ligne (en fin de ligne, `configparser` les intégrait au nom de groupe).
 
 ## borgHelperWWW 1.19.1 / borgHelperWWW_ui.html 1.10.1 — répertoires parents du périmètre navigables — 2026-09-26
 
