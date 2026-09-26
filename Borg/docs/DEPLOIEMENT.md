@@ -1,0 +1,157 @@
+# Déploiement et installation
+
+Ce document couvre l'installation et le premier démarrage de `borgHelper` (CLI) et `borgHelperWWW`
+(API HTTP). Pour l'usage courant une fois en place, voir [USAGE.md](USAGE.md) ; pour l'architecture,
+les bases SQLite et l'API en détail, voir [TECHNIQUE.md](TECHNIQUE.md).
+
+## 1. Prérequis système
+
+`borgHelper` (CLI) est **stdlib-only** — aucune dépendance Python externe. Il lui faut seulement
+`borg` lui-même dans le `PATH` (ou `BORG_EXE` réglé dans la conf).
+
+`borgHelperWWW` (API HTTP, optionnelle) ajoute :
+
+```bash
+pip install fastapi uvicorn pydantic
+```
+
+Pour les **notifications push** (optionnelles) :
+
+```bash
+apt install python3-aiohttp python3-requests python3-cryptography
+```
+
+`pywebpush`/`py_vapid`/`http_ece` eux-mêmes ne sont packagés dans aucun dépôt apt (PyPI-only) — ils
+sont **vendorisés** dans `vendor/` (voir `vendor/README.md`), donc **aucun `pip install`/venv requis
+pour eux** : un `git pull`/déploiement du dépôt complet suffit une fois les trois paquets apt
+ci-dessus installés. Si l'admin ne fait pas cet `apt install`, `borgHelperWWW` démarre quand même —
+les notifications push sont simplement désactivées (avertissement au démarrage).
+
+## 2. Récupérer le projet
+
+Déployer l'arborescence `Borg/` complète (y compris `vendor/`) à l'emplacement choisi, par exemple
+`/opt/borghelper/`. Fichiers/dossiers dont dépend l'exécution :
+
+- `borgHelper` — CLI, exécutable seul.
+- `borgHelperWWW` + `borgHelperWWW_ui.html` + `vendor/` — API HTTP, seulement si utilisée.
+- `borgHelperWWW.py` — symlink vers `borgHelperWWW`, **requis uniquement** pour
+  `uvicorn borgHelperWWW:app` (uvicorn importe le module par son nom et échoue sans l'extension
+  `.py` — inutile en exécution directe `python3 borgHelperWWW ...`).
+
+## 3. Configurer borgHelper (CLI)
+
+Copier [`docs/borghelperrc.example`](borghelperrc.example) — fichier `.borghelperrc` complet et
+commenté, une section par nick (= un dépôt borg / une machine sauvegardée) — vers l'emplacement de
+votre choix (ex. `/etc/borghelperrc`), puis l'adapter : `BORG_REPO`/`BORG_PASSPHRASE`, `EXCLUDE`
+(obligatoire), `KEEP_*` (rétention). `demo.borghelperrc` (à la racine du dépôt) est un second exemple
+fonctionnel — dépôts locaux jetables sous `/tmp`, pratique pour vérifier une installation sans toucher
+à de vraies données, mais pas pensé comme référence commentée (voir `docs/borghelperrc.example` pour
+ça).
+
+**Permissions obligatoires** : `chmod 600` sur le fichier de conf — il contient les passphrases en
+clair. `borgHelper` avertit (sans bloquer) si le fichier reste accessible au groupe/autres.
+
+## 4. Premier lancement — borgHelper
+
+```bash
+# Vérifie que l'installation elle-même est saine (aucune conf requise) :
+borgHelper -c CodecSelfTest
+
+# Initialise un dépôt borg pour un nick (une fois par nick, si le dépôt n'existe pas déjà) :
+borgHelper -C /etc/borghelperrc -c Init -n mon-serveur
+
+# Premier backup :
+borgHelper -C /etc/borghelperrc -c Bkp -n mon-serveur
+
+# Vérifie l'état sans toucher au réseau :
+borgHelper -C /etc/borghelperrc -c Status -n mon-serveur
+```
+
+`CodecSelfTest` doit afficher `OK` pour tous les contrôles (300+, code de sortie 0) — sinon
+l'installation elle-même (permissions, version Python, `borg` introuvable...) a un problème à
+corriger avant d'aller plus loin.
+
+## 5. Configurer et lancer borgHelperWWW (optionnel)
+
+Deux façons de fournir ses réglages, au choix :
+
+- **Fichier séparé** `borghelperwww.conf.example` (racine du dépôt, déjà complet et commenté) —
+  adapter au minimum `cfgfile` (le `.borghelperrc` **dédié à l'API**, généralement distinct de celui
+  de l'admin CLI) et `api_key`, puis lancer avec `--conf`/`BORGHELPERWWW_CONF`.
+- **Fichier unique** (borgHelperWWW ≥ 1.18.4) — poser les mêmes réglages directement dans une section
+  `[DEFAULT.borghelperwww]` du `.borghelperrc` dédié à l'API (voir
+  [`docs/borghelperrc.example`](borghelperrc.example)) : pas de second fichier à gérer. Dernier repli
+  (priorité : CLI > env > `borghelperwww.conf` > cette section > défauts) — `borghelperwww.conf`,
+  quand présent, garde la main.
+
+⚠️ **Jamais** une clé `BORGHELPERWWW_*` (majuscule, préfixée) posée nue dans `[DEFAULT]` du
+`.borghelperrc` — piège réel constaté (RBAC silencieusement inactif, accès total pour tout
+`X-API-Key` valide) : `borgHelperWWW` ≥ 1.18.3 avertit (`[WARN]` au démarrage) si ça arrive, mais
+n'active jamais le réglage pour autant. Utiliser `[DEFAULT.borghelperwww]` (minuscule, sans préfixe)
+ci-dessus à la place.
+
+Réglages les plus importants pour un premier déploiement :
+
+| Réglage (fichier conf / variable env / option CLI) | Rôle |
+|---|---|
+| `cfgfile` / `BORGHELPERWWW_CFGFILE` / `-C` | `.borghelperrc` dédié à l'API |
+| `api_key` / `BORGHELPERWWW_API_KEY` / `-K` | Clé attendue dans `X-API-Key` — absente : générée aléatoirement au démarrage (affichée sur stderr, perdue au redémarrage) |
+| `host`/`port` | Adresse d'écoute (défaut `127.0.0.1:8000`, exécution directe uniquement) |
+| `allow_destructive` / `--allow-destructive` | Autorise `Prune`/`DelBkp` (irréversible) — **interdit par défaut** |
+| `allow_downloads` / `--allow-downloads` | Autorise `/download/file`/`/download/tar` — **autorisé par défaut** |
+| `groups_header` / `--groups-header` | Active le RBAC par groupes (voir [TECHNIQUE.md](TECHNIQUE.md#auth--rbac)) — désactivé par défaut, `X-API-Key` seul fait foi |
+| `push_db` / `--push-db` | Fichier SQLite dédié aux clés VAPID/abonnements push — **jamais reconstructible**, à sauvegarder comme une vraie donnée |
+
+Lancement, deux méthodes équivalentes :
+
+```bash
+# Exécution directe (lit les options CLI ci-dessus) :
+python3 borgHelperWWW --conf /etc/borghelperwww.conf
+
+# Via uvicorn (production — requiert borgHelperWWW.py, le symlink) :
+BORGHELPERWWW_CONF=/etc/borghelperwww.conf uvicorn borgHelperWWW:app --host 0.0.0.0 --port 8000
+```
+
+Vérification du démarrage :
+
+```bash
+curl -s http://127.0.0.1:8000/healthz   # liveness, non protégé
+curl -s http://127.0.0.1:8000/version   # versions + postures de sécurité chargées, non protégé
+python3 borgHelperWWW -C /etc/borghelperrc-www -K <api_key> --selftest   # contrôles internes push (VAPID/CRUD/expiration), 0 si tout OK
+```
+
+## 6. Derrière un reverse proxy (production)
+
+`borgHelperWWW` lie par défaut `127.0.0.1` — pour un accès distant, le placer derrière un reverse
+proxy (nginx, Caddy...) qui gère TLS. Réglage `trusted_proxies`/`--trusted-proxies` pour que l'IP
+client réelle (`X-Forwarded-For`) remonte correctement dans les logs — défaut `127.0.0.1`, même
+comportement qu'`uvicorn` lui-même sans ce réglage.
+
+## 7. RBAC par groupes — restreindre l'accès à un répertoire (ex. restaurations)
+
+`groups_header` (voir tableau ci-dessus) active le RBAC par groupes : un reverse proxy OIDC/
+`auth_request` en amont pose un header (ex. `X-Groups`) listant les groupes de l'utilisateur, chaque
+nick du `.borghelperrc` porte `GROUPS_ADMIN`/`GROUPS_WRITE`/`GROUPS_READ` (quelles routes/commandes)
+et, orthogonalement, `GROUPS_PATHS` (quel sous-répertoire, restriction jamais un tier de plus).
+
+Cas d'usage type : un fileserver sauvegardé en un seul dépôt, où deux services doivent pouvoir
+chercher/restaurer chacun **uniquement dans son propre répertoire**, sans voir celui de l'autre ni le
+reste du serveur — les admins IT gardant, eux, un accès complet. Exemple complet et commenté (nick
+fictif `[fileserver01]`, groupes `AD-Borg-Restore-RH`/`AD-Borg-Restore-Compta`) :
+[`docs/borghelperrc.example`](borghelperrc.example), section « EXEMPLE COMPLET » en bas de fichier.
+
+Le périmètre de chemin est vérifié **côté serveur** à chaque requête (`_resolve_path_scope`,
+`TECHNICAL.md`) — jamais une simple restriction d'affichage côté UI, un `Restore` visant un chemin
+hors périmètre est refusé même en connaissant le chemin exact.
+
+⚠️ Le header n'est vérifié que pour sa **valeur**, pas sa provenance — ce mécanisme suppose que
+`borgHelperWWW` n'est atteignable QUE via le reverse proxy de confiance qui pose ce header (bind
+`127.0.0.1` + reverse proxy local, ou pare-feu équivalent), même hypothèse que pour
+`X-Forwarded-For` (§6).
+
+## Voir aussi
+
+- [TECHNIQUE.md](TECHNIQUE.md) — architecture, bases SQLite, référence API.
+- [USAGE.md](USAGE.md) — commandes CLI du quotidien.
+- `README.md` (racine du dépôt) — référence exhaustive CLI + API HTTP.
+- `TECHNICAL.md` (racine du dépôt) — mécanique interne détaillée, historique des décisions.

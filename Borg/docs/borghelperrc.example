@@ -1,0 +1,164 @@
+; borgHelper — fichier de conf EXEMPLE pour la CLI, entièrement commenté (docs/DEPLOIEMENT.md).
+; Copier vers le chemin de votre choix (ex. /etc/borghelperrc ou ~/.borghelperrc), l'adapter, puis
+; le passer à borgHelper via -C/--cfgfile.
+;
+; ⚠️ Contient des passphrases en clair : chmod 600 obligatoire (borgHelper avertit sinon au
+; démarrage — "accessible au groupe/autres... chmod 600 conseillé" — sans bloquer).
+;
+; Structure : une section [DEFAULT] (réglages communs à tous les nicks, surchargeables par nick) et
+; une section par "nick" (nom court identifiant une sauvegarde = un dépôt borg = une machine/un
+; périmètre). Un nick = tout ce que borgHelper manipule par -n.
+
+[DEFAULT]
+
+; Répertoire des caches SQLite (cache.db/diff.db par nick, scopecache.db/push.db si borgHelperWWW
+; les colocalise ici) — créé avec les droits 0700 s'il n'existe pas.
+CACHE_DIR = /var/cache/borghelper
+
+; Chiffrement des chemins/valeurs stockés dans diff.db (pas cache.db, qui ne contient aucun chemin).
+; Protège contre la lecture directe du fichier SQLite (accès disque, sauvegarde de la sauvegarde,
+; etc.) — n'est PAS un chiffrement des données borg elles-mêmes (déjà chiffrées par borg côté dépôt).
+; Défaut si absent : true (borgHelper avertit sur une base restée "plain" si ce défaut s'applique
+; et qu'une passphrase est disponible — DbEncrypt ne se lance jamais tout seul, toujours explicite).
+;DB_ENCRYPT = true
+; false/no/off/0 pour désactiver explicitement (par nick ou ici en global) :
+;DB_ENCRYPT = false
+
+; Niveau de dérivation de clé (KDF) pour le chiffrement ci-dessus — light|standard|strong (défaut
+; standard si absent ; toute autre valeur = arrêt avec message d'erreur). "strong" coûte plus cher en
+; CPU à chaque ouverture de base, à réserver si le modèle de menace le justifie.
+;DB_KDF = standard
+
+; Chemin du binaire borg si non trouvé automatiquement dans le PATH.
+;BORG_EXE = /usr/bin/borg
+
+; ── borgHelperWWW : réglages du serveur lui-même (optionnel, borgHelperWWW 1.18.4) ──────────
+; Section ORDINAIRE (le nom "DEFAULT.borghelperwww" n'a aucun sens spécial pour configparser —
+; choisi simplement pour ne jamais collisionner avec un nom de nick réel). Dernier repli, APRÈS un
+; éventuel --conf/borghelperwww.conf : permet un déploiement à FICHIER UNIQUE, ce .borghelperrc
+; suffit pour la CLI et pour borgHelperWWW, sans second fichier de conf à gérer. Mêmes clés qu'un
+; borghelperwww.conf classique (voir borghelperwww.conf.example à la racine du dépôt pour le jeu
+; complet et leur documentation détaillée) — ici seulement celles les plus courantes.
+;
+; ⚠️ Ne JAMAIS poser une clé BORGHELPERWWW_* (majuscules, préfixée) directement dans [DEFAULT]
+; ci-dessus en pensant configurer borgHelperWWW — silencieusement ignorée (borgHelperWWW avertit au
+; démarrage si ça arrive, mais ne le fait JAMAIS). Les clés ci-dessous sont en minuscule, sans préfixe.
+[DEFAULT.borghelperwww]
+;api_key       = une-cle-api-longue-et-aleatoire   ; attendue dans le header X-API-Key
+;host          = 127.0.0.1                          ; adresse d'écoute (exécution directe uniquement)
+;port          = 8000
+;groups_header = X-Groups   ; active le RBAC par groupes (reverse proxy OIDC/auth_request) — voir
+                             ; l'exemple [fileserver-rh]/[fileserver-compta] plus bas pour GROUPS_PATHS
+
+[mon-serveur]
+; ── Dépôt borg ──────────────────────────────────────────────────────────────
+BORG_REPO       = /srv/backups/mon-serveur                ; chemin LOCAL du dépôt borg
+BORG_PASSPHRASE = change-moi-une-vraie-passphrase-longue   ; passphrase du dépôt (borg, pas DB_ENCRYPT)
+
+; Pour un dépôt distant via SSH plutôt que local, remplacer BORG_REPO ci-dessus par SSH_REPO et
+; ajouter SER_NAME/SER_LOGIN (borgHelper construit la commande ssh lui-même — jamais besoin de
+; préfixer soi-même "ssh://" dans SSH_REPO) :
+;SSH_REPO   = /srv/backups/mon-serveur    ; chemin du dépôt COTE DISTANT
+;SER_NAME   = backup-host.example.org     ; hôte SSH
+;SER_LOGIN  = backupuser                  ; utilisateur SSH
+;SSH_KEY    = /home/backupuser/.ssh/id_ed25519   ; clé privée si pas celle par défaut de l'agent
+;SSH_REMFO  = 2222                        ; port distant à forwarder (-R), rare — laisser absent sinon
+
+; ── Identification et sélection des archives ───────────────────────────────
+SER_NAME   = mon-serveur      ; nom court affiché/utilisé (sert aussi à dériver GLOB_ARCH si absent)
+GLOB_ARCH  = mon-serveur-*    ; motif borg --glob-archives pour ne lister QUE les archives de ce nick
+                                ; dans ce dépôt (utile si plusieurs nicks partagent un même BORG_REPO)
+BORG_ARCHNAME = mon-serveur   ; préfixe du nom d'archive généré à chaque Bkp (mon-serveur-YYYY-MM-DD...)
+BORG_ROOTBKP  = /              ; chemin racine à sauvegarder
+
+; ── Exclusions borg (obligatoire — borgHelper refuse Bkp sans EXCLUDE défini) ──
+EXCLUDE = --exclude /media --exclude /dev --exclude /proc --exclude /sys --exclude /var/run --exclude /run --exclude /lost+found --exclude /mnt --exclude /var/lib/lxcfs --exclude /tmp --exclude /var/lib/docker --exclude-if-present .nobackup --exclude-caches --exclude-nodump --keep-exclude-tags
+; Exclusions additionnelles pour CE nick uniquement, ajoutées après EXCLUDE (ex. surcharge depuis
+; [DEFAULT] sans dupliquer toute la liste) :
+;EXCLUDE_NEXT = --exclude /home/*/Downloads
+
+; ── Rétention (Prune) ───────────────────────────────────────────────────────
+KEEP_DAILY   = 7
+KEEP_WEEKLY  = 4
+KEEP_MONTHLY = 6
+;KEEP_YEARLY  = 2
+;KEEP_HOURLY  = 24
+
+; ── Rapport (Report) ────────────────────────────────────────────────────────
+MAX_AGE_BKP  = 25   ; âge (heures) au-delà duquel le dernier backup est signalé comme "en retard"
+DISPLAY_BKP  = 5    ; nb d'archives affichées par défaut dans Report (surchargeable par -N)
+
+; ── Indexation (diff.db — recherche/historique, TreeFind/Search/FileHist/TreeHist) ──
+;IDX_WORKERS   = 4          ; nb de "borg diff" en parallèle lors d'un Index (défaut 4)
+;IDX_SNAP_KEEP = 3          ; nb de snapshots complets conservés pour la purge rétroactive (IdxPurge)
+;NOIDX         = 1          ; 1 = ce nick n'est JAMAIS indexé (Bkp saute l'étape Index automatiquement)
+; Restreint l'indexation à des sous-arbres (accélère Index sur un gros dépôt peu consulté par
+; chemin) — motifs glob (*, ?, [...]) ou préfixe littéral, un par ligne séparé par un espace :
+;IDX_INCLUDE = /etc /home
+;IDX_EXCLUDE = /var/lib/docker/*
+
+; ── borgHelperWWW uniquement : RBAC par groupes (sans effet si borgHelperWWW n'est pas lancé avec
+; --groups-header/BORGHELPERWWW_GROUPS_HEADER — voir docs/TECHNIQUE.md et README.md) ──
+;GROUPS_ADMIN = ops-admins                          ; accès admin sur CE nick (implique write+read)
+;GROUPS_WRITE = ops-admins,ops-writers               ; accès écriture (Bkp/Restore/Prune si autorisé...)
+;GROUPS_READ  = ops-admins,ops-writers,ops-readers   ; accès lecture seule
+; Restreint un groupe donné à un sous-répertoire de ce nick (les groupes absents d'ici gardent un
+; accès chemin illimité) :
+;GROUPS_PATHS = ops-readers:/home/alice
+
+; ── Métadonnées internes (rarement nécessaire de les régler à la main) ─────
+;DB_NAME = mon-serveur-alt   ; nom de fichier DB alternatif si le nick contient des caractères à éviter
+;DIFF_KEEP = 30              ; nb de paires d'archives les PLUS RÉCENTES à garder indexées dans
+                              ; diff_index — purge auto les plus anciennes à chaque Index si réglé
+;STATS_RETENTION_MONTHS = 13 ; ancienneté (mois) au-delà de laquelle les points repo_stats (gain
+                              ; Prune, graphiques d'évolution) sont purgés — défaut 13, valeur
+                              ; non numérique ou <1 retombe silencieusement sur ce défaut
+
+
+; ═══════════════════════════════════════════════════════════════════════════════════════════
+; EXEMPLE COMPLET — hôte fictif avec accès restreint par répertoire pour des restaurations
+; ═══════════════════════════════════════════════════════════════════════════════════════════
+; Cas d'usage réel : un fileserver d'entreprise sauvegardé une fois pour tout le monde (un seul
+; nick, un seul dépôt), mais où le service RH et le service Compta doivent chacun pouvoir CHERCHER
+; et RESTAURER (via borgHelperWWW + reverse proxy OIDC posant X-Groups) uniquement DANS LEUR PROPRE
+; répertoire — jamais voir/toucher les fichiers de l'autre service, ni le reste du serveur. Les
+; admins IT gardent un accès complet, sans restriction de chemin.
+;
+; Mécanique : GROUPS_ADMIN/WRITE/READ donnent le TIER d'accès (quelles routes/commandes) ;
+; GROUPS_PATHS restreint ENSUITE le PÉRIMÈTRE DE CHEMIN pour un groupe qui a déjà un tier — c'est
+; orthogonal, jamais un tier de plus. Un groupe absent de GROUPS_PATHS mais présent dans
+; GROUPS_ADMIN/WRITE/READ garde un accès chemin illimité sur tout le nick.
+
+[fileserver01]
+BORG_REPO       = /srv/backups/fileserver01
+BORG_PASSPHRASE = change-moi-une-vraie-passphrase-longue
+SER_NAME        = fileserver01
+GLOB_ARCH       = fileserver01-*
+BORG_ARCHNAME   = fileserver01
+BORG_ROOTBKP    = /srv/data   ; racine sauvegardée : /srv/data/rh, /srv/data/compta, /srv/data/commun...
+
+EXCLUDE = --exclude-caches --exclude-nodump --keep-exclude-tags
+KEEP_DAILY  = 14
+KEEP_WEEKLY = 8
+
+; ── RBAC : tiers d'accès (routes autorisées) ────────────────────────────────
+; IT garde un accès admin complet (Prune/DelBkp inclus) — jamais listé dans GROUPS_PATHS plus bas,
+; donc aucune restriction de chemin pour ce groupe.
+GROUPS_ADMIN = AD-Borg-Admin-IT
+; RH et Compta n'ont besoin que de chercher/restaurer dans LEUR répertoire — accès écriture
+; (Restore est classé "écriture" côté routes HTTP, voir docs/TECHNIQUE.md), jamais admin (pas de
+; Prune/DelBkp pour eux). Un même utilisateur peut appartenir aux deux groupes AD sans que ça
+; élargisse son périmètre : chaque groupe reste borné à SON propre chemin ci-dessous.
+GROUPS_WRITE = AD-Borg-Restore-RH,AD-Borg-Restore-Compta
+
+; ── RBAC : périmètre de chemin (restriction, PAS un tier de plus) ──────────
+; Syntaxe : 'groupe:/chemin1|/chemin2, groupe2:/chemin3' — ':' sépare le groupe de ses chemins, '|'
+; sépare plusieurs chemins pour un même groupe, ',' sépare les groupes. Chemins toujours ABSOLUS.
+; AD-Borg-Restore-RH ne voit/restaure QUE sous /srv/data/rh ; AD-Borg-Restore-Compta QUE sous
+; /srv/data/compta — même s'ils ont techniquement un tier "écriture" sur tout le nick fileserver01.
+GROUPS_PATHS = AD-Borg-Restore-RH:/srv/data/rh, AD-Borg-Restore-Compta:/srv/data/compta
+
+; Résultat concret pour un membre de AD-Borg-Restore-RH (jamais AD-Borg-Admin-IT) interrogeant
+; borgHelperWWW sur ce nick : TreeFind/Search/Restore fonctionnent normalement SOUS /srv/data/rh,
+; mais un Restore visant /srv/data/compta/paie.xlsx (même en connaissant le chemin exact) est
+; refusé — le périmètre est vérifié côté serveur, jamais seulement caché côté UI.
