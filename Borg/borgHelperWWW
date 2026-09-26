@@ -13,7 +13,7 @@ from collections import defaultdict
 
 from fastapi import FastAPI, APIRouter, Header, HTTPException, Query, Request, Depends
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail,
@@ -22,7 +22,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.16.0"
+WWW_VERSION="1.17.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -30,6 +30,11 @@ WWW_VERSION="1.16.0"
 # En exécution directe (`python3 borgHelperWWW ...`), les options CLI ci-dessous sont
 # converties en variables d'environnement avant la résolution de conf plus bas — elles
 # priment donc sur l'environnement déjà présent.
+
+# Défaut hors du bloc __main__ : sous uvicorn (import du module), _args n'existe jamais — voir
+# note ci-dessus. --selftest n'a de sens qu'en exécution directe (revue de code, corrigé avant
+# commit : un `else:` mal placé faisait planter tout import du module en NameError).
+_SELFTEST_REQUESTED=False
 
 if __name__=='__main__':
     import argparse
@@ -69,6 +74,14 @@ if __name__=='__main__':
     _p.add_argument('--scope-cache-db',help="Chemin du fichier SQLite du cache de réponses filtrées "
                      "par périmètre (Story 1.5, distinct de cache.db/diff.db) — déf. "
                      "BORGHELPERWWW_SCOPE_CACHE_DB, sinon co-localisé avec cache.db/diff.db")
+    _p.add_argument('--push-db',help="Chemin du fichier SQLite dédié aux abonnements push et clés VAPID "
+                     "(Story 2a, spec-notifications-push, AD-6 — jamais scopecache.db, jamais reconstructible) "
+                     "— déf. BORGHELPERWWW_PUSH_DB, sinon co-localisé avec cache.db/diff.db")
+    _p.add_argument('--selftest',action='store_true',help="Lance les contrôles internes dédiés à la "
+                     "story push (génération VAPID, CRUD abonnement, calcul d'expiration, clamp de "
+                     "BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS) sur des fichiers SQLite TEMPORAIRES, puis "
+                     "quitte (code 0 si tout OK, 1 sinon) — nécessite quand même -C/--cfgfile comme un "
+                     "démarrage normal (le reste du module s'initialise identiquement)")
     _args=_p.parse_args()
     if _args.conf: os.environ['BORGHELPERWWW_CONF']=_args.conf
     if _args.cfgfile: os.environ['BORGHELPERWWW_CFGFILE']=_args.cfgfile
@@ -81,6 +94,8 @@ if __name__=='__main__':
     if _args.trusted_proxies: os.environ['BORGHELPERWWW_TRUSTED_PROXIES']=_args.trusted_proxies
     if _args.groups_header: os.environ['BORGHELPERWWW_GROUPS_HEADER']=_args.groups_header
     if _args.scope_cache_db: os.environ['BORGHELPERWWW_SCOPE_CACHE_DB']=_args.scope_cache_db
+    if _args.push_db: os.environ['BORGHELPERWWW_PUSH_DB']=_args.push_db
+    _SELFTEST_REQUESTED=_args.selftest
     if _args.allow_destructive is not None: os.environ['BORGHELPERWWW_ALLOW_DESTRUCTIVE']=str(_args.allow_destructive)
     if _args.allow_downloads is not None: os.environ['BORGHELPERWWW_ALLOW_DOWNLOADS']=str(_args.allow_downloads)
     if _args.api_prefix is not None: os.environ['BORGHELPERWWW_API_PREFIX']=_args.api_prefix
@@ -96,7 +111,7 @@ _CONF_KEYS={'cfgfile':'BORGHELPERWWW_CFGFILE','api_key':'BORGHELPERWWW_API_KEY',
             'trusted_proxies':'BORGHELPERWWW_TRUSTED_PROXIES',
             'allow_destructive':'BORGHELPERWWW_ALLOW_DESTRUCTIVE','allow_downloads':'BORGHELPERWWW_ALLOW_DOWNLOADS',
             'api_prefix':'BORGHELPERWWW_API_PREFIX','groups_header':'BORGHELPERWWW_GROUPS_HEADER',
-            'scope_cache_db':'BORGHELPERWWW_SCOPE_CACHE_DB'}
+            'scope_cache_db':'BORGHELPERWWW_SCOPE_CACHE_DB','push_db':'BORGHELPERWWW_PUSH_DB'}
 _conf_path=os.environ.get('BORGHELPERWWW_CONF')
 if _conf_path:
     if not os.path.isfile(_conf_path):
@@ -143,6 +158,22 @@ try:
     if BKP_STATUS_TIMEOUT<1: BKP_STATUS_TIMEOUT=21600
 except ValueError:
     BKP_STATUS_TIMEOUT=21600
+
+# Story 2a (spec-notifications-push) : durée d'expiration par défaut (jours) d'un abonnement push
+# quand expires_in_days est absent de POST /push/subscribe. Env var seule, même patron simple que
+# BKP_WATCHER_INTERVAL/BKP_STATUS_TIMEOUT ci-dessus (pas de CLI arg/fichier de conf, Boundaries du
+# spec) — extrait en fonction pure (_clamp_push_default_expiry) plutôt qu'un try/except inline pour
+# rester testable indépendamment par push_selftest() ci-dessous.
+def _clamp_push_default_expiry(raw):
+    """Repli sur 30 si `raw` n'est pas un entier, ou si l'entier est <1 (même patron de clamp que
+    BKP_STATUS_TIMEOUT/_stats_retention_months) — jamais de crash serveur sur une valeur invalide."""
+    try:
+        v=int(raw)
+    except (TypeError,ValueError):
+        return 30
+    return v if v>=1 else 30
+
+PUSH_DEFAULT_EXPIRY_DAYS=_clamp_push_default_expiry(os.environ.get('BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS','30'))
 
 if not CFGFILE:
     sys.exit("Fichier de conf manquant — -C/--cfgfile ou BORGHELPERWWW_CFGFILE (chemin du .borghelperrc dédié à l'API)")
@@ -274,6 +305,12 @@ _ROUTE_LEVELS={
     '/restore/perms':1,'/download/file':1,'/download/tar':1,
     '/bkp':2,'/index':2,'/restore':2,'/cacheclean':2,
     '/prune':3,'/delbkp':3,'/idxpurge':3,'/init':3,'/key':3,
+    # Story 2a (spec-notifications-push) : ces routes n'ont PAS de paramètre de requête `nick` (un
+    # abonnement porte plusieurs nicks, figés dans scope_nicks à la création — jamais un nick unique
+    # en paramètre) — _check_group_access (voir plus haut, `nick_param is None: return`) les laisse
+    # donc passer sans jamais consulter cette entrée, exactement comme /access. Cataloguées ici pour
+    # la documentation/cohérence uniquement, jamais consultées en pratique pour ces chemins.
+    '/push/subscribe':1,'/push/subscriptions':1,
 }
 
 def _parse_groups(header_value):
@@ -646,6 +683,142 @@ def ensure_scope_cache_db():
         sys.exit(1)
 
 ensure_scope_cache_db()
+
+# ── push.db (Story 2a, spec-notifications-push) ────────────────────────────
+# Fichier SQLite DÉDIÉ, jamais scopecache.db (AD-6) : contrairement à ce dernier (cache reconstructible
+# à volonté depuis cache.db/diff.db), push.db porte les clés VAPID (générées une seule fois, jamais
+# régénérées — les régénérer invaliderait tous les abonnements existants) et les abonnements push
+# eux-mêmes (endpoint/keys du navigateur) — une perte de ce fichier n'est PAS récupérable. Même
+# gabarit exact que SCOPE_CACHE_DB/ensure_scope_cache_db() ci-dessus (db_meta/_check_set_meta,
+# sqlite3.DatabaseError -> message + sys.exit(1)), appelé une fois au module-level au démarrage.
+PUSH_DB=os.environ.get('BORGHELPERWWW_PUSH_DB') or \
+    os.path.join(_bh_paths.db.cache_dir,f"{_bh_paths.db.db_prefix}-push.db")
+PUSH_DB_SCHEMA_VERSION=1
+PUSH_DB_BASE_SCHEMA_VERSION=1
+
+_PUSH_DB_SCHEMA_SCRIPT="""
+    CREATE TABLE IF NOT EXISTS db_meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT
+    );
+    CREATE TABLE IF NOT EXISTS push_vapid_keys (
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        private_key TEXT NOT NULL, public_key TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        endpoint TEXT NOT NULL UNIQUE, p256dh TEXT NOT NULL, auth TEXT NOT NULL,
+        scope_nicks TEXT NOT NULL,        -- JSON, figé à la création (AD-4), jamais recalculé
+        notify_start INTEGER NOT NULL DEFAULT 0,
+        notify_end INTEGER NOT NULL DEFAULT 1,
+        expires_at TEXT,                  -- NULL = « à vie »
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+"""
+
+def ensure_push_db():
+    """Créé/valide le schéma de PUSH_DB — même convention que ensure_scope_cache_db() ci-dessus
+    (table db_meta + _check_set_meta pour schema_version/borghelper_version, échec bruyant
+    SchemaVersionError si le schéma stocké est plus récent que PUSH_DB_SCHEMA_VERSION, 'DB corrompue'
+    + sys.exit si le fichier est illisible/corrompu). Appelée une fois au démarrage — le fichier
+    n'est ensuite plus jamais recréé/migré en cours de route par ce process.
+
+    ⚠️ Contrairement à SCOPE_CACHE_DB (simple cache, reconstructible), une corruption ici ne doit
+    JAMAIS suggérer de supprimer le fichier — message d'erreur délibérément différent (AD-6)."""
+    db=_bh_paths.db
+    try:
+        try: conn=_open_db(PUSH_DB,nick=None,role='admin')
+        except sqlite3.OperationalError as e: _db_open_fail(PUSH_DB,e)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(_PUSH_DB_SCHEMA_SCRIPT)
+        db._check_set_meta(conn,PUSH_DB_SCHEMA_VERSION,PUSH_DB,PUSH_DB_BASE_SCHEMA_VERSION)
+        conn.commit(); conn.close()
+    except sqlite3.DatabaseError as e:
+        print(f"DB corrompue : {PUSH_DB}",file=sys.stderr)
+        print(f"  -> {e}",file=sys.stderr)
+        print("  ⚠️  NE PAS supprimer ce fichier : clés VAPID et abonnements push n'y sont pas",file=sys.stderr)
+        print("  reconstructibles (AD-6) — restaurer une sauvegarde de push.db si disponible.",file=sys.stderr)
+        sys.exit(1)
+
+ensure_push_db()
+
+def _generate_and_store_vapid_keys(conn):
+    """Génère une nouvelle paire de clés VAPID (courbe EC P-256) et la persiste dans push_vapid_keys
+    (id=1). Format de stockage : brut base64url (b64urlencode d'un entier 32 octets pour la privée,
+    du point non compressé pour la publique) — compatible tel quel avec `py_vapid.Vapid.from_string()`/
+    `from_raw()` (Story 2b, envoi réel via pywebpush) ET avec `applicationServerKey` côté navigateur
+    pour la clé publique (`PushManager.subscribe()`, Story 2b) — pas de PEM, pas de ré-encodage requis
+    dans un sens comme dans l'autre.
+
+    N'est JAMAIS appelée si une ligne existe déjà (voir _load_or_generate_vapid_keys) — Non-goal du
+    spec : aucune régénération automatique (une rotation invaliderait tous les abonnements existants).
+    `INSERT ... ON CONFLICT(id) DO NOTHING` : filet en cas de course entre deux workers uvicorn qui
+    démarreraient exactement en même temps sur un push.db tout neuf — le perdant relit simplement la
+    ligne gagnante plutôt que d'écraser une paire déjà en usage."""
+    from py_vapid import Vapid
+    from py_vapid.utils import b64urlencode, num_to_bytes
+    from cryptography.hazmat.primitives import serialization
+    v=Vapid(); v.generate_keys()
+    priv=b64urlencode(num_to_bytes(v.private_key.private_numbers().private_value,32))
+    pub=b64urlencode(v.public_key.public_bytes(serialization.Encoding.X962,serialization.PublicFormat.UncompressedPoint))
+    conn.execute("INSERT INTO push_vapid_keys (id,private_key,public_key) VALUES (1,?,?) "
+                 "ON CONFLICT(id) DO NOTHING",(priv,pub))
+    conn.commit()
+    row=conn.execute("SELECT private_key,public_key FROM push_vapid_keys WHERE id=1").fetchone()
+    return row[0],row[1]
+
+def _load_or_generate_vapid_keys(conn):
+    """Réutilise la paire déjà présente (id=1) sans y toucher ; en génère une seule fois si absente."""
+    row=conn.execute("SELECT private_key,public_key FROM push_vapid_keys WHERE id=1").fetchone()
+    if row is not None: return row[0],row[1]
+    return _generate_and_store_vapid_keys(conn)
+
+def _init_vapid_keys():
+    conn=_open_db(PUSH_DB,nick=None,role='admin')
+    try: return _load_or_generate_vapid_keys(conn)
+    finally: conn.close()
+
+PUSH_VAPID_PRIVATE_KEY,PUSH_VAPID_PUBLIC_KEY=_init_vapid_keys()
+
+def _push_conn(role):
+    """Ouvre PUSH_DB avec un row_factory par nom de colonne (jamais nick= : push.db n'est jamais
+    chiffré par nick, il est hors du périmètre par-nick de cache.db/diff.db — AD-6)."""
+    conn=_open_db(PUSH_DB,nick=None,role=role)
+    conn.row_factory=sqlite3.Row
+    return conn
+
+def _push_row_to_dict(row):
+    return {'id':row['id'],'endpoint':row['endpoint'],
+            'scope_nicks':json.loads(row['scope_nicks']),
+            'notify_start':bool(row['notify_start']),'notify_end':bool(row['notify_end']),
+            'expires_at':row['expires_at'],'created_at':row['created_at']}
+
+def _scope_nicks_for_groups(user_groups,nick_cfgs):
+    """Cœur pur de _current_scope_nicks, sans dépendance à Request ni à cfgread() — testable
+    directement par push_selftest() avec des `cfg` synthétiques (voir plus bas), ce que la fonction
+    Request-only ne permettait pas (d'où cette branche eff>=1 jamais réellement exercée par aucun
+    test). `nick_cfgs` : itérable de `(nick, cfg)`, `cfg` étant un SectionProxy .borghelperrc[nick]
+    (ou tout dict-like équivalent exposant `.get(clé, défaut)`, ex. un dict simple en test) ou None
+    si le nick n'existe pas. Retourne la liste des nicks où `user_groups` a au moins un accès en
+    lecture (eff>=1, via _effective_level)."""
+    result=[]
+    for n,cfg in nick_cfgs:
+        eff=_effective_level(user_groups,cfg) if cfg is not None else 0
+        if eff>=1: result.append(n)
+    return result
+
+def _current_scope_nicks(request: Request):
+    """Périmètre RBAC figé à la souscription (AD-4) — même mécanisme que GET /access
+    (`_effective_level`/`_parse_groups`/`_nick_list('ALL')`) : tout nick où l'appelant a au moins un
+    accès en lecture (eff>=1). GROUPS_HEADER désactivé (autorisation par groupes éteinte) -> tous les
+    nicks connus, cohérent avec /access qui reflète alors 'admin'/illimité partout. Boucle eff>=1
+    elle-même déléguée à _scope_nicks_for_groups (voir sa docstring — extraite pour rester testable
+    sans Request réelle)."""
+    nicks=_nick_list('ALL')
+    if not GROUPS_HEADER: return nicks
+    user_groups=_parse_groups(request.headers.get(GROUPS_HEADER))
+    return _scope_nicks_for_groups(user_groups,((n,_bh_paths.borg.cfgread(n)) for n in nicks))
 
 def _scope_signature(scope):
     """AD-5 : signature canonique et univoque d'un périmètre déjà résolu/canonicalisé par
@@ -1381,7 +1554,12 @@ def ui_index():
 def version():
     return {'borghelperwww_version':WWW_VERSION,'borghelper_version':BORGHELPER_VERSION,'ui_version':UI_VERSION,
             'allow_destructive':ALLOW_DESTRUCTIVE,'allow_downloads':ALLOW_DOWNLOADS,'api_prefix':API_PREFIX,
-            'groups_auth_enabled':GROUPS_HEADER is not None}
+            'groups_auth_enabled':GROUPS_HEADER is not None,
+            # Story 2a (spec-notifications-push) : clé publique VAPID, nécessaire côté client pour
+            # PushManager.subscribe({applicationServerKey}) — publique par nature (jamais la privée),
+            # exposée ici plutôt que sur une route dédiée car /version est déjà non protégée et lue
+            # au chargement de l'UI, exactement le moment où le Service Worker en a besoin (Story 2b).
+            'vapid_public_key':PUSH_VAPID_PUBLIC_KEY}
 
 @app.get("/healthz",tags=["lecture"],summary="Liveness — le processus répond, rien de plus (pas d'accès borg/DB) — non protégé")
 def healthz():
@@ -1741,9 +1919,253 @@ def idxpurge(nick: str="ALL", pattern: Optional[str]=None, dryrun: bool=False,
     if pattern: extra+=['-x',pattern]
     return run_borghelper('idxpurge',nick=nick,extra_args=extra)
 
+# ── Notifications push — abonnements (Story 2a, spec-notifications-push) ────────────────────
+# Stocke/expose uniquement (jamais d'envoi réel — Story 2b) : clés VAPID (générées plus haut, une
+# fois) et abonnements PushSubscription du navigateur (endpoint/keys.p256dh/keys.auth, forme standard
+# jamais réinventée). Gérés par `endpoint` (identité stable du navigateur abonné via
+# pushManager.getSubscription(), Story 2b) — pas de compte séparé (voir Design Notes du spec).
+
+class PushKeysBody(BaseModel):
+    p256dh: str=Field(min_length=1)
+    auth: str=Field(min_length=1)
+
+class PushSubscribeBody(BaseModel):
+    endpoint: str=Field(min_length=1)
+    keys: PushKeysBody
+    notify_start: bool=False
+    notify_end: bool=True
+    expires_in_days: Optional[int]=None  # absent -> défaut serveur ; null explicite -> « à vie »
+
+class PushPatchBody(BaseModel):
+    endpoint: str=Field(min_length=1)
+    notify_start: Optional[bool]=None
+    notify_end: Optional[bool]=None
+    expires_in_days: Optional[int]=None  # absent -> inchangé ; null explicite -> « à vie »
+
+def _expires_at_expr(days):
+    """`days` déjà résolu (None = « à vie », sinon entier >=1) -> fragment SQL pour la colonne
+    expires_at. Jamais d'entrée utilisateur brute interpolée : `days` est toujours soit None, soit un
+    int déjà validé/clampé par l'appelant (jamais une chaîne)."""
+    return "NULL" if days is None else f"datetime('now','+{int(days)} days')"
+
+# Borne haute d'expires_in_days (jours) — sans elle, une valeur absurde (ex. 999999999999) fait
+# silencieusement déborder `datetime('now','+N days')` côté SQLite vers NULL (« à vie »), au lieu du
+# repli documenté sur le défaut serveur. Bornes symétriques : [1, PUSH_MAX_EXPIRY_DAYS].
+PUSH_MAX_EXPIRY_DAYS=3650
+
+def _resolve_push_expiry_days(expires_in_days):
+    """Résout un `expires_in_days` PRÉSENT dans la requête (POST ou PATCH — l'appelant ne l'invoque
+    que quand le champ est dans `__fields_set__`, l'absence ayant une sémantique différente selon la
+    route) en `days` final pour `_expires_at_expr` : None (valeur explicite) -> « à vie » ; hors bornes
+    [1, PUSH_MAX_EXPIRY_DAYS] (y compris valeurs qui feraient déborder SQLite, ex. 999999999999) ->
+    repli sur le défaut serveur, jamais un « à vie » accidentel ; sinon la valeur telle quelle.
+    Logique partagée entre push_subscribe et push_subscribe_patch (auparavant dupliquée, ce qui avait
+    laissé passer l'absence de borne haute dans une des deux copies)."""
+    if expires_in_days is None:
+        return None  # « à vie », explicitement demandé
+    if not (1<=expires_in_days<=PUSH_MAX_EXPIRY_DAYS):
+        return PUSH_DEFAULT_EXPIRY_DAYS  # valeur absurde fournie -> même repli que le défaut serveur
+    return expires_in_days
+
+@router.post("/push/subscribe",tags=["mutation"],
+             summary="Créer/rafraîchir un abonnement push — scope_nicks recalculé à chaque appel (réabonnement explicite, AD-4/Design Notes)")
+def push_subscribe(request: Request, body: PushSubscribeBody, x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    scope_nicks=_current_scope_nicks(request)
+    fields_set=body.__fields_set__
+    if 'expires_in_days' not in fields_set:
+        days=PUSH_DEFAULT_EXPIRY_DAYS  # absent de la requête -> défaut serveur (BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS)
+    else:
+        days=_resolve_push_expiry_days(body.expires_in_days)
+    conn=_push_conn('write')
+    try:
+        conn.execute(f"""INSERT INTO push_subscriptions
+                (endpoint,p256dh,auth,scope_nicks,notify_start,notify_end,expires_at)
+                VALUES (?,?,?,?,?,?,{_expires_at_expr(days)})
+                ON CONFLICT(endpoint) DO UPDATE SET
+                    p256dh=excluded.p256dh, auth=excluded.auth, scope_nicks=excluded.scope_nicks,
+                    notify_start=excluded.notify_start, notify_end=excluded.notify_end,
+                    expires_at=excluded.expires_at""",
+            (body.endpoint,body.keys.p256dh,body.keys.auth,json.dumps(scope_nicks),
+             int(body.notify_start),int(body.notify_end)))
+        conn.commit()
+        row=conn.execute("SELECT * FROM push_subscriptions WHERE endpoint=?",(body.endpoint,)).fetchone()
+        if row is None:
+            # TOCTOU : un DELETE concurrent (autre connexion) entre le commit ci-dessus et ce SELECT
+            # a supprimé la ligne — jamais un TypeError 500 brut depuis _push_row_to_dict(None).
+            raise HTTPException(410,detail="Abonnement supprimé entre-temps")
+        return _push_row_to_dict(row)
+    finally:
+        conn.close()
+
+@router.patch("/push/subscribe",tags=["mutation"],
+              summary="Modifier les préférences (notify_start/notify_end/expiration) d'un abonnement existant — jamais scope_nicks (AD-4)")
+def push_subscribe_patch(body: PushPatchBody, x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    conn=_push_conn('write')
+    try:
+        row=conn.execute("SELECT * FROM push_subscriptions WHERE endpoint=?",(body.endpoint,)).fetchone()
+        if row is None:
+            raise HTTPException(404,detail=f"Aucun abonnement pour cet endpoint — pas de création silencieuse (PATCH != POST)")
+        fields_set=body.__fields_set__
+        # notify_start/notify_end n'ont pas d'état « null » significatif (un type de notification est
+        # actif ou non) — contrairement à expires_in_days, où null explicite a une sémantique claire
+        # (« à vie ») : un null explicite ici est rejeté plutôt que traité comme absent (silencieux et
+        # asymétrique avec expires_in_days).
+        if 'notify_start' in fields_set and body.notify_start is None:
+            raise HTTPException(422,detail="notify_start ne peut pas être explicitement null — "
+                "omettre le champ pour ne pas le modifier, ou fournir true/false")
+        if 'notify_end' in fields_set and body.notify_end is None:
+            raise HTTPException(422,detail="notify_end ne peut pas être explicitement null — "
+                "omettre le champ pour ne pas le modifier, ou fournir true/false")
+        sets=[]; params=[]
+        if 'notify_start' in fields_set:
+            sets.append("notify_start=?"); params.append(int(body.notify_start))
+        if 'notify_end' in fields_set:
+            sets.append("notify_end=?"); params.append(int(body.notify_end))
+        if 'expires_in_days' in fields_set:
+            days=_resolve_push_expiry_days(body.expires_in_days)
+            sets.append(f"expires_at={_expires_at_expr(days)}")  # sort de « à vie », renouvelle, ou y repasse
+        if sets:
+            conn.execute(f"UPDATE push_subscriptions SET {','.join(sets)} WHERE endpoint=?",
+                          (*params,body.endpoint))
+            conn.commit()
+        row=conn.execute("SELECT * FROM push_subscriptions WHERE endpoint=?",(body.endpoint,)).fetchone()
+        if row is None:
+            # TOCTOU : un DELETE concurrent entre le commit ci-dessus et ce SELECT a supprimé la
+            # ligne — jamais un TypeError 500 brut depuis _push_row_to_dict(None).
+            raise HTTPException(410,detail="Abonnement supprimé entre-temps")
+        return _push_row_to_dict(row)
+    finally:
+        conn.close()
+
+@router.delete("/push/subscribe",tags=["mutation"],
+                summary="Désabonner — endpoint déjà absent : pas d'erreur bruyante (choix d'implémentation documenté, README)")
+def push_subscribe_delete(endpoint: str, x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    conn=_push_conn('write')
+    try:
+        cur=conn.execute("DELETE FROM push_subscriptions WHERE endpoint=?",(endpoint,))
+        conn.commit()
+        return {'deleted':cur.rowcount>0}
+    finally:
+        conn.close()
+
+@router.get("/push/subscriptions",tags=["lecture"],summary="Abonnement(s) connus pour un endpoint donné")
+def push_subscriptions(endpoint: str, x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    conn=_push_conn('read')
+    try:
+        rows=conn.execute("SELECT * FROM push_subscriptions WHERE endpoint=?",(endpoint,)).fetchall()
+        return {'subscriptions':[_push_row_to_dict(r) for r in rows]}
+    finally:
+        conn.close()
+
 app.include_router(router,prefix=API_PREFIX)
 
+def push_selftest():
+    """Équivalent, pour la story push, de `CodecSelfTest` (borgHelper) — convention existante de ce
+    projet pour toute vérification DB, adaptée ici car la logique testée (push.db, VAPID, py_vapid)
+    est confinée à borgHelperWWW (AD-5 : borgHelper reste stdlib-only, ne peut donc pas l'héberger).
+    Vérifie : génération VAPID (une fois, jamais régénérée), CRUD abonnement (création, mise à jour
+    des préférences, suppression), calcul d'expires_at (fournie/absente=défaut/« à vie »), clamp de
+    BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS. Opère uniquement sur un fichier SQLite TEMPORAIRE dédié
+    (jamais PUSH_DB réel) — nettoyé en `finally`, comme codec_selftest(). Retourne le nombre de
+    contrôles en échec (0 = tout OK), affiche OK/FAIL par contrôle.
+
+    ⚠️ Isolation partielle, à la différence de codec_selftest() : par construction de ce fichier
+    (tout le module s'initialise au chargement, pas de dispatch de commande précoce comme le `-c
+    CodecSelfTest` de borgHelper), le PUSH_DB réel du -C/--cfgfile fourni a déjà été créé/ouvert
+    (ensure_push_db()/VAPID) avant que ce flag ne soit lu dans le bloc __main__ ci-dessous — sans
+    conséquence (ensure_push_db()/_init_vapid_keys() sont idempotents, jamais destructifs sur un
+    fichier existant), mais ce n'est donc pas un self-test qui s'exécute "avant" toute I/O réelle."""
+    import tempfile,shutil,datetime as _dt
+    results=[]
+    def check(name,fn):
+        try: ok=bool(fn()); err=''
+        except Exception as e: ok=False; err=f" ({type(e).__name__}: {e})"
+        print(f"{'OK  ' if ok else 'FAIL'} {name}{err}"); results.append(ok)
+
+    tmpdir=tempfile.mkdtemp(prefix='borghelperwww-push-selftest-')
+    test_db=os.path.join(tmpdir,'push-selftest.db')
+    try:
+        conn=_open_db(test_db,nick=None,role='admin')
+        conn.row_factory=sqlite3.Row
+        conn.executescript(_PUSH_DB_SCHEMA_SCRIPT)
+        conn.commit()
+        try:
+            # ── VAPID : génération une fois, jamais régénérée ──
+            priv1,pub1=_generate_and_store_vapid_keys(conn)
+            check("VAPID : clés générées (non vides, distinctes)",lambda: bool(priv1) and bool(pub1) and priv1!=pub1)
+            priv2,pub2=_load_or_generate_vapid_keys(conn)
+            check("VAPID : réutilisées si déjà présentes (jamais régénérées)",lambda: (priv1,pub1)==(priv2,pub2))
+
+            # ── CRUD abonnement ──
+            conn.execute("""INSERT INTO push_subscriptions
+                    (endpoint,p256dh,auth,scope_nicks,notify_start,notify_end,expires_at)
+                    VALUES ('ep1','p256','auth1',?,0,1,datetime('now','+30 days'))""",(json.dumps(['n1','n2']),))
+            conn.commit()
+            row=conn.execute("SELECT * FROM push_subscriptions WHERE endpoint='ep1'").fetchone()
+            check("CRUD : création lisible",lambda: row is not None and json.loads(row['scope_nicks'])==['n1','n2'])
+            conn.execute("UPDATE push_subscriptions SET notify_start=1,notify_end=0 WHERE endpoint='ep1'")
+            conn.commit()
+            row=conn.execute("SELECT * FROM push_subscriptions WHERE endpoint='ep1'").fetchone()
+            check("CRUD : préférences mises à jour, scope_nicks intact (AD-4)",
+                  lambda: bool(row['notify_start']) and not bool(row['notify_end']) and json.loads(row['scope_nicks'])==['n1','n2'])
+            conn.execute("DELETE FROM push_subscriptions WHERE endpoint='ep1'")
+            conn.commit()
+            row=conn.execute("SELECT * FROM push_subscriptions WHERE endpoint='ep1'").fetchone()
+            check("CRUD : suppression effective",lambda: row is None)
+
+            # ── scope_nicks via GROUPS_HEADER (_scope_nicks_for_groups, eff>=1) — jamais exercé
+            # jusqu'ici : le CRUD ci-dessus insère scope_nicks en SQL brut, et la vérif manuelle
+            # (demo.borghelperrc) tourne sans GROUPS_HEADER (court-circuit "return nicks" de
+            # _current_scope_nicks, jamais la boucle) ──
+            check("scope_nicks (GROUPS_HEADER) : nick accessible inclus, nick sans accès exclu",
+                  lambda: _scope_nicks_for_groups(
+                      {'grp-lecture'},
+                      [('nick-ok',{'GROUPS_READ':'grp-lecture'}),
+                       ('nick-refuse',{'GROUPS_READ':'autre-groupe'})])==['nick-ok'])
+
+            # ── expires_at : fournie / absente (défaut) / « à vie » ──
+            def _expires_matches(days_value):
+                r=conn.execute(f"SELECT {_expires_at_expr(days_value)} AS v").fetchone()
+                val=_dt.datetime.strptime(r['v'],'%Y-%m-%d %H:%M:%S')
+                delta=(val-_dt.datetime.utcnow()).total_seconds()
+                return abs(delta-days_value*86400)<60
+            check("expires_at : valeur fournie (5 jours) -> date cohérente",lambda: _expires_matches(5))
+            check("expires_at : absente -> défaut serveur (PUSH_DEFAULT_EXPIRY_DAYS)",lambda: _expires_matches(PUSH_DEFAULT_EXPIRY_DAYS))
+            check("expires_at : « à vie » -> NULL",lambda: _expires_at_expr(None)=='NULL')
+
+            # ── clamp BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS ──
+            check("clamp : valeur négative -> repli 30",lambda: _clamp_push_default_expiry('-5')==30)
+            check("clamp : valeur non numérique -> repli 30",lambda: _clamp_push_default_expiry('abc')==30)
+            check("clamp : zéro -> repli 30",lambda: _clamp_push_default_expiry('0')==30)
+            check("clamp : valeur valide -> conservée",lambda: _clamp_push_default_expiry('7')==7)
+
+            # ── _resolve_push_expiry_days : borne haute (999999999999 fait déborder SQLite vers NULL
+            # sans elle — bug corrigé, voir PUSH_MAX_EXPIRY_DAYS) ──
+            check("expiry : None explicite -> à vie",lambda: _resolve_push_expiry_days(None) is None)
+            check("expiry : valeur dans les bornes -> conservée",lambda: _resolve_push_expiry_days(5)==5)
+            check("expiry : valeur absurde (999999999999) -> repli défaut, jamais « à vie »",
+                  lambda: _resolve_push_expiry_days(999999999999)==PUSH_DEFAULT_EXPIRY_DAYS)
+            check("expiry : zéro -> repli défaut",lambda: _resolve_push_expiry_days(0)==PUSH_DEFAULT_EXPIRY_DAYS)
+            check("expiry : au-delà de PUSH_MAX_EXPIRY_DAYS -> repli défaut",
+                  lambda: _resolve_push_expiry_days(PUSH_MAX_EXPIRY_DAYS+1)==PUSH_DEFAULT_EXPIRY_DAYS)
+            check("expiry : PUSH_MAX_EXPIRY_DAYS exactement -> conservée (borne incluse)",
+                  lambda: _resolve_push_expiry_days(PUSH_MAX_EXPIRY_DAYS)==PUSH_MAX_EXPIRY_DAYS)
+        finally:
+            conn.close()
+    finally:
+        shutil.rmtree(tmpdir,ignore_errors=True)
+
+    fails=results.count(False)
+    print(f"push selftest : {len(results)-fails}/{len(results)} OK"+(f", {fails} FAIL" if fails else ""))
+    return fails
+
 if __name__=='__main__':
+    if _SELFTEST_REQUESTED:
+        sys.exit(1 if push_selftest() else 0)
     import uvicorn
     # proxy_headers=True (déjà le défaut uvicorn) : IP client réelle (X-Forwarded-For) dans les logs
     # d'accès et scope["client"], mais seulement si la connexion vient d'une IP de confiance —

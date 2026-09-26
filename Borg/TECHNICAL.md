@@ -2242,3 +2242,142 @@ uniquement par `bkp_status`.
   `finished_at`/`result='success'` à la fin réelle du `Bkp` (~12s plus tard sur ce jeu de données) ;
   log serveur `[watcher] bkp_status réclamé : nick=demo-modules run_id=... result=success` dans le
   balayage suivant.
+
+## `push.db` — clés VAPID et abonnements push (`borgHelperWWW` 1.17.0, Story 2a de `spec-notifications-push`)
+
+Préalable à l'envoi réel (Story 2b, qui câblera le watcher `bkp_status` ci-dessus à `pywebpush`) :
+stocke/expose seulement, n'envoie jamais de vrai push. Fichier SQLite **dédié**, jamais
+`scopecache.db` (AD-6) : contrairement à ce dernier (cache reconstructible à volonté), `push.db` porte
+les clés VAPID et les abonnements eux-mêmes — une perte n'est **pas** récupérable.
+
+### Fichier et schéma
+
+`PUSH_DB` (réglage `BORGHELPERWWW_PUSH_DB`/`--push-db`, défaut `<cache_dir>/<db_prefix>-push.db`,
+co-localisé avec `cache.db`/`diff.db`/`scopecache.db`). `ensure_push_db()` : **même gabarit exact** que
+`ensure_scope_cache_db()` (`db_meta`/`_check_set_meta`/`PUSH_DB_SCHEMA_VERSION`(1)/
+`PUSH_DB_BASE_SCHEMA_VERSION`(1), `sqlite3.DatabaseError` → message + `sys.exit(1)`) — seul le message
+d'erreur diffère délibérément (jamais « supprimez le fichier », toujours « ne pas supprimer, restaurer
+une sauvegarde » — AD-6). Appelée une fois au module-level au démarrage.
+
+```mermaid
+erDiagram
+    db_meta {
+        TEXT key PK "schema_version | borghelper_version"
+        TEXT value
+    }
+    push_vapid_keys {
+        INTEGER id PK "CHECK(id=1) — une seule paire, jamais régénérée"
+        TEXT private_key "brut base64url (32 octets)"
+        TEXT public_key "brut base64url (point EC non compressé, 65 octets)"
+        TEXT created_at
+    }
+    push_subscriptions {
+        INTEGER id PK
+        TEXT endpoint "UNIQUE — identité PushSubscription du navigateur"
+        TEXT p256dh
+        TEXT auth
+        TEXT scope_nicks "JSON, figé à la création/au réabonnement (AD-4)"
+        INTEGER notify_start
+        INTEGER notify_end
+        TEXT expires_at "NULL = à vie"
+        TEXT created_at
+    }
+```
+
+### Clés VAPID (EC P-256, générées une fois)
+
+`_generate_and_store_vapid_keys(conn)`/`_load_or_generate_vapid_keys(conn)` : génération via
+`py_vapid.Vapid().generate_keys()` (dépendance transitive de `pywebpush`, confinée à `borgHelperWWW`
+— AD-5, `borgHelper` reste stdlib-only). Format de stockage choisi : **brut base64url**
+(`b64urlencode(num_to_bytes(private_value,32))` pour la privée, `b64urlencode(public_bytes(X962,
+UncompressedPoint))` pour la publique) plutôt que PEM — compatible tel quel avec
+`py_vapid.Vapid.from_string()`/`from_raw()` (Story 2b, signature des requêtes push) **et** avec
+`applicationServerKey` côté navigateur pour la clé publique (`PushManager.subscribe()`, Story 2b) :
+aucun ré-encodage requis dans un sens comme dans l'autre.
+
+`INSERT INTO push_vapid_keys (id,...) VALUES (1,...) ON CONFLICT(id) DO NOTHING` : filet contre une
+course entre deux workers uvicorn démarrant simultanément sur un `push.db` tout neuf — le perdant relit
+simplement la ligne gagnante (`CHECK(id=1)` garantit qu'il ne peut jamais y avoir deux paires). Jamais
+régénérées ensuite (Non-goal du spec — une rotation invaliderait tous les abonnements existants).
+Clé publique exposée sur `GET /version` (déjà public, sans clé API — investigué à l'implémentation :
+c'est le point où le futur Service Worker (Story 2b) en a besoin, au chargement de l'UI) :
+`{"vapid_public_key": "..."}`.
+
+### Abonnement : `scope_nicks` figé au calcul RBAC courant (AD-4)
+
+`_current_scope_nicks(request)` : même mécanisme que `GET /access`
+(`_effective_level`/`_parse_groups`/`_nick_list('ALL')`) — tout nick où l'appelant a au moins un accès
+en **lecture** (`eff>=1`). `GROUPS_HEADER` désactivé (autorisation par groupes éteinte) → tous les
+nicks connus (cohérent avec `/access`, qui reflète alors `admin`/illimité partout).
+
+`POST /push/subscribe` : `INSERT ... ON CONFLICT(endpoint) DO UPDATE` — un ré-abonnement avec le même
+`endpoint` **recalcule** `scope_nicks` (et `p256dh`/`auth`/préférences) plutôt que de créer un doublon
+ou de laisser le périmètre figé à la toute première souscription (Design Notes du spec : AD-4 « jamais
+recalculé dynamiquement » s'applique **entre deux souscriptions**, pas à un réabonnement explicite —
+une personne dont les groupes ont changé doit pouvoir rafraîchir son périmètre sans d'abord se
+désabonner). `PATCH /push/subscribe` ne touche en revanche **jamais** `scope_nicks` — seules
+`notify_start`/`notify_end`/`expires_at` sont modifiables après création, sur un `endpoint` déjà connu
+(404 explicite sinon — jamais de création silencieuse).
+
+### `expires_in_days` — absent/fourni/« à vie »
+
+Distinction cruciale entre **absent** du corps JSON (→ défaut serveur) et **présent, valeur `null`**
+(→ « à vie ») : impossible à distinguer avec un simple `Optional[int]=None` côté Pydantic (les deux
+donnent `None`). Résolue via `body.__fields_set__` (Pydantic 1.8, présent dans cet environnement) —
+peuplé par le nom des clés effectivement présentes dans le JSON reçu, y compris quand leur valeur est
+`null` (vérifié : `{}` → `set()`, `{"x": null}` → `{"x"}`, comportement stable sur cette version).
+`expires_in_days` absent → `PUSH_DEFAULT_EXPIRY_DAYS` ; présent + `null` → `None` (« à vie ») ; présent
++ entier `<1` → même repli que le défaut serveur (valeur absurde, jamais un crash) ; présent + entier
+valide → utilisé tel quel. `_expires_at_expr(days)` traduit ce `days` déjà résolu en fragment SQL
+(`NULL` ou `datetime('now','+{N} days')`, `N` toujours un `int()` déjà validé — jamais d'entrée brute
+interpolée).
+
+`BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS` (déf. 30) : env var **seule** (pas de CLI arg ni de clé de
+fichier de conf — même patron que `BKP_WATCHER_INTERVAL`/`BKP_STATUS_TIMEOUT`), clampée par
+`_clamp_push_default_expiry(raw)` (extrait en fonction pure plutôt qu'un `try/except` inline, pour
+rester testable indépendamment par `push_selftest()`) : valeur non numérique ou `<1` → repli sur 30.
+
+### Routes (`_check_group_access` : catalogage inerte par construction)
+
+| Méthode | Route | Rôle |
+|---------|-------|------|
+| POST | `/push/subscribe` | Créer/rafraîchir (upsert par `endpoint`, `scope_nicks` recalculé) |
+| PATCH | `/push/subscribe` | Préférences + expiration seules (404 si `endpoint` inconnu) |
+| DELETE | `/push/subscribe?endpoint=...` | Désabonnement — idempotent (`{"deleted": bool}`, jamais 404) |
+| GET | `/push/subscriptions?endpoint=...` | Abonnement(s) connus pour cet `endpoint` |
+
+Aucune de ces routes n'a de paramètre de requête `nick` (un abonnement porte **plusieurs** nicks,
+figés dans `scope_nicks`, jamais un nick unique en paramètre) — `_check_group_access` (`nick_param is
+None: return`, déjà vérifié permissif pour une route sans nick) les laisse donc **toujours** passer
+sans jamais consulter `_ROUTE_LEVELS['/push/subscribe']`/`['/push/subscriptions']` : ces deux entrées
+existent uniquement pour la cohérence du catalogue, exactement comme `/access` avant elles. La
+véritable restriction (RBAC par nick) se fait **à l'intérieur** de la route, via `_current_scope_nicks`
+ci-dessus, jamais via ce mécanisme.
+
+`DELETE` : choix délibéré, documenté (README) — un `endpoint` déjà absent renvoie `{"deleted": false}`
+avec un `200`, jamais un `404` bruyant (« déjà absent = objectif du désabonnement atteint »).
+
+### Vérification
+
+`push_selftest()` (`borgHelperWWW --selftest`, équivalent de `CodecSelfTest` adapté : la logique
+testée — `push.db`, `py_vapid` — est confinée à `borgHelperWWW`, AD-5, donc ne peut pas vivre dans
+`codec_selftest()` de `borgHelper` sans violer le stdlib-only de ce dernier) : génération VAPID (une
+fois, jamais régénérée), CRUD abonnement (création, mise à jour des préférences avec `scope_nicks`
+intact, suppression), calcul `expires_at` (fournie/absente=défaut/« à vie »), clamp de
+`BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS` (négatif, non numérique, zéro, valide) — opère sur un fichier
+SQLite temporaire dédié, jamais le `PUSH_DB` réel — 12/12 `OK`.
+
+⚠️ Isolation partielle par rapport à `codec_selftest()` : ce fichier s'initialise entièrement à
+l'import (pas de dispatch de commande précoce comme `-c CodecSelfTest`), donc le `PUSH_DB` réel du
+`-C`/`--cfgfile` fourni est déjà créé/ouvert (clés VAPID générées si absentes) avant que `--selftest`
+ne soit lu dans le bloc `__main__` — sans conséquence pratique (idempotent, jamais destructif), mais à
+garder en tête : ce n'est pas un self-test qui s'exécute avant toute I/O réelle.
+
+Test manuel réel sur `demo.borghelperrc` (`borgHelperWWW -C demo.borghelperrc -K testkey --push-db
+/tmp/.../push.db --port 8991`) : `POST /push/subscribe` sans `expires_in_days` → `expires_at` à +30
+jours, `scope_nicks` = tous les nicks connus (`GROUPS_HEADER` désactivé dans `demo.borghelperrc`) ;
+`GET /push/subscriptions?endpoint=...` retrouve la ligne ; `PATCH` avec `expires_in_days:null` bascule
+`expires_at` à `null` (« à vie ») sans toucher `scope_nicks` ; `PATCH` sur un `endpoint` inconnu → 404 ;
+réabonnement sur le même `endpoint` met à jour la ligne existante (même `id`, pas de doublon) ; `DELETE`
+puis `DELETE` à nouveau sur le même `endpoint` → `{"deleted":true}` puis `{"deleted":false}`, jamais
+d'erreur. `GET /version` expose bien `vapid_public_key`.

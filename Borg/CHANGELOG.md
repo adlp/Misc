@@ -1,5 +1,67 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.17.0 — `push.db`, clés VAPID, abonnements push (`POST`/`PATCH`/`DELETE /push/subscribe`, `GET /push/subscriptions`) — 2026-09-26
+
+Story 2a de `spec-notifications-push` : préalable indispensable à l'envoi réel de notifications push
+(Story 2b, qui câblera le watcher `bkp_status` de la story précédente à `pywebpush`) — cette story ne
+fait que stocker/exposer les abonnements navigateur et générer les clés VAPID, aucun vrai push envoyé.
+
+### `push.db` : nouveau fichier dédié (jamais `scopecache.db`, AD-6)
+
+`ensure_push_db()` : même gabarit exact que `ensure_scope_cache_db()` (`db_meta`/`_check_set_meta`,
+`PUSH_DB_SCHEMA_VERSION`=1, `sqlite3.DatabaseError` → message + `sys.exit(1)`, appelée une fois au
+démarrage) — réglage `BORGHELPERWWW_PUSH_DB`/`--push-db`, défaut co-localisé avec `cache.db`/`diff.db`.
+Deux tables : `push_vapid_keys` (`id` unique, `CHECK(id=1)`) et `push_subscriptions` (`endpoint`
+`UNIQUE`, `scope_nicks` JSON figé, `notify_start`/`notify_end`, `expires_at` nullable = « à vie »).
+
+### Clés VAPID (EC P-256), générées une fois au premier démarrage
+
+Via `py_vapid` (dépendance transitive de `pywebpush`, confinée à `borgHelperWWW` — AD-5, `borgHelper`
+reste stdlib-only). Stockées en brut base64url (compatible `py_vapid.Vapid.from_string()` pour la
+Story 2b **et** `applicationServerKey` navigateur pour la clé publique, sans ré-encodage). Jamais
+régénérées ensuite. Clé publique exposée sur `GET /version` (déjà public) : `vapid_public_key`.
+
+### Routes `/push/*`
+
+`POST /push/subscribe` : upsert par `endpoint` (`INSERT ... ON CONFLICT DO UPDATE`) — `scope_nicks`
+calculé à chaque appel via le même mécanisme que `GET /access` (tout nick où `eff>=1`), recalculé à
+chaque réabonnement explicite (jamais entre-temps, AD-4). `expires_in_days` absent → défaut serveur
+(`BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS`, déf. 30, clampé) ; `null` explicite → « à vie » ; hors
+bornes `[1, PUSH_MAX_EXPIRY_DAYS=3650]` (y compris une valeur absurde comme `999999999999`, qui ferait
+sinon déborder silencieusement `datetime('now','+N days')` côté SQLite vers `NULL`, donc « à vie » par
+accident) → même repli que l'absence. Logique de résolution (`_resolve_push_expiry_days`) partagée
+entre `POST` et `PATCH`, plus de copie dupliquée. `PATCH /push/subscribe` : préférences + expiration
+seules, jamais `scope_nicks` — 404 explicite si `endpoint` inconnu (pas de création silencieuse) ;
+`notify_start`/`notify_end` explicitement `null` → `422` (pas d'état « null » significatif, contraire
+à `expires_in_days`, jamais un no-op silencieux). `DELETE /push/subscribe` : idempotent,
+`{"deleted": bool}`, jamais 404 bruyant. `GET /push/subscriptions` : abonnement(s) connus pour un
+`endpoint`. Toutes protégées par `X-API-Key` uniquement ; cataloguées dans `_ROUTE_LEVELS` par
+cohérence mais `_check_group_access` les laisse toujours passer (pas de paramètre `nick`, comme
+`/access`) — le RBAC réel se fait dans le corps de la route via `scope_nicks`, et `endpoint` agit de
+facto comme un jeton de capacité (README) : quiconque détient une clé API valide et connaît/devine un
+`endpoint` peut lire/modifier/supprimer l'abonnement correspondant, quel que soit son propre périmètre
+par groupes — compromis de conception assumé, pas un oubli.
+
+`endpoint`/`keys.p256dh`/`keys.auth` : `Field(min_length=1)` — une chaîne vide n'occupe plus
+silencieusement le créneau `UNIQUE` de `endpoint`. Après le commit d'un `POST`/`PATCH`, un garde
+défensif (`row is None` → `410`) couvre le cas, rare mais réel, d'un `DELETE` concurrent (autre
+connexion) entre le commit et le `SELECT` final construisant la réponse — jamais un `TypeError` 500
+brut depuis `_push_row_to_dict(None)`.
+
+### Vérification
+
+`push_selftest()` (`borgHelperWWW --selftest`, équivalent `CodecSelfTest` adapté — la logique testée
+est confinée à `borgHelperWWW`, AD-5) : génération VAPID (une fois), CRUD abonnement, calcul
+`expires_at` (fourni/absent/« à vie »), clamp de `BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS`, bornes de
+`_resolve_push_expiry_days`, et désormais aussi la boucle `eff>=1` de calcul de `scope_nicks` sous
+`GROUPS_HEADER` (`_scope_nicks_for_groups`, cœur de `_current_scope_nicks` extrait pour rester
+testable sans `Request` réelle — cette branche n'était exercée par aucun test jusqu'ici, le CRUD
+insérant `scope_nicks` en SQL brut et la vérif manuelle tournant `GROUPS_HEADER` désactivé) — 19/19
+`OK`, sur fichiers temporaires uniquement. Testé en direct sur `demo.borghelperrc` (`curl` : création,
+lecture, modification des préférences et de l'expiration, suppression idempotente, réabonnement =
+mise à jour sans doublon, et les cas d'erreur ci-dessus : endpoint vide `422`, `expires_in_days`
+absurde replié sur le défaut, `notify_start:null` rejeté `422`).
+
 ## borgHelper 1.0.109 / borgHelperWWW 1.16.0 / borgHelperWWW_ui.html 1.9.1 — détection de fin de sauvegarde (`bkp_status`), `POST /bkp` asynchrone — 2026-09-25
 
 Story 1 de `spec-notifications-push` : préalable indispensable à l'envoi de notifications push

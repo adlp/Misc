@@ -891,6 +891,11 @@ Toutes les commandes sont exposées **sauf `Mount`/`UMount`** (accès FUSE local
 
 ```bash
 pip install fastapi uvicorn pydantic
+pip install pywebpush   # Story 2a (spec-notifications-push) : clés VAPID (py_vapid, dépendance
+                        # transitive) et abonnements push — confiné à borgHelperWWW (AD-5),
+                        # borgHelper (CLI) reste stdlib-only. `cryptography` (transitive elle aussi)
+                        # est en plus importée et utilisée directement (sérialisation de la clé
+                        # publique VAPID en format X962 non compressé) — pas seulement transitive.
 ```
 
 `borgHelperWWW.py` (symlink vers `borgHelperWWW`, même principe que `borgHelper.py`) doit être présent
@@ -926,6 +931,8 @@ Trois façons de configurer, cumulables — par ordre de priorité (la première
 | `BORGHELPERWWW_SCOPE_CACHE_DB` | `--scope-cache-db` | `scope_cache_db` | Chemin du fichier SQLite du cache de réponses **filtrées** par périmètre (Story 1.5) — défaut : co-localisé avec `cache.db`/`diff.db` (voir [Cache de réponses](#cache-de-réponses)) |
 | `BORGHELPERWWW_BKP_WATCHER_INTERVAL` | — | — | Intervalle (secondes) d'interrogation `bkp_status` par le watcher — défaut 30 (voir `POST /bkp` asynchrone ci-dessus) |
 | `BORGHELPERWWW_BKP_STATUS_TIMEOUT` | — | — | Délai (secondes) avant qu'une sauvegarde démarrée mais jamais terminée soit traitée comme un échec (AD-7) — défaut 21600 (6h) |
+| `BORGHELPERWWW_PUSH_DB` | `--push-db` | `push_db` | Chemin du fichier SQLite **dédié** aux clés VAPID et abonnements push (Story 2a, `spec-notifications-push`, AD-6 — jamais `scopecache.db`) — défaut : co-localisé avec `cache.db`/`diff.db` (voir [Notifications push](#notifications-push)) |
+| `BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS` | — | — | Durée d'expiration par défaut (jours) d'un abonnement push quand `expires_in_days` est absent de `POST /push/subscribe` — défaut 30, repli sur 30 si valeur invalide/négative |
 
 Le serveur refuse de démarrer si le fichier de conf `.borghelperrc` (`cfgfile`) est absent (aucun des
 trois moyens ne l'a fourni). La clé API, elle, n'est **pas requise** : si absente partout,
@@ -1449,6 +1456,10 @@ servi comme une réponse obsolète.
 | GET | `/repohistory` | RepoHistory | ✓ |
 | GET | `/archivehistory` | ArchiveHistory | ✓ |
 | POST | `/idxpurge` | IdxPurge ⚡ | |
+| POST | `/push/subscribe` | *(aucune — spécifique à borgHelperWWW, voir [Notifications push](#notifications-push))* | |
+| PATCH | `/push/subscribe` | *(idem)* | |
+| DELETE | `/push/subscribe` | *(idem)* | |
+| GET | `/push/subscriptions` | *(idem)* | |
 
 `DelBkp` et `Prune` (destruction de sauvegardes) reçoivent `403 Forbidden` tant que
 `BORGHELPERWWW_ALLOW_DESTRUCTIVE` n'est pas activé (interdit par défaut — voir
@@ -1507,6 +1518,87 @@ reflète l'absence de restriction par groupes, sans forme de réponse différent
 C'est sur cette route que s'appuient à la fois l'affinage des badges de sécurité de l'interface web
 (après connexion) et le filtrage de la liste des serveurs (voir [Autorisation par
 groupes](#autorisation-par-groupes-reverse-proxy-oidcauth_request) ci-dessus).
+
+### Notifications push
+
+**Story 2a de `spec-notifications-push`** — stocke/expose les abonnements push navigateur et les clés
+VAPID ; n'envoie **aucun** vrai push (Story 2b, à venir, câblera le watcher `bkp_status` ci-dessus à
+`pywebpush`). Fichier dédié `push.db` (jamais `scopecache.db` — voir `BORGHELPERWWW_PUSH_DB` dans
+[Configuration](#configuration)), clés VAPID (EC P-256) générées **une seule fois** au premier
+démarrage, jamais régénérées ensuite. Clé publique VAPID exposée sur `GET /version` (déjà public, sans
+clé API) : `{"vapid_public_key": "..."}` — nécessaire côté client pour
+`PushManager.subscribe({applicationServerKey})` (Story 2b).
+
+Gestion par `endpoint` (la `PushSubscription` du navigateur, retrouvable via
+`pushManager.getSubscription()`) plutôt que par compte : pas de couche d'authentification
+supplémentaire au-delà de `X-API-Key`/groupes déjà en place.
+
+⚠️ **`endpoint` agit comme un jeton de capacité** (même principe qu'un lien de désabonnement
+classique) : les quatre routes `/push/subscribe*`/`/push/subscriptions` ne sont protégées que par
+`X-API-Key` — `_check_group_access` les laisse passer sans consulter le périmètre RBAC de
+l'appelant (voir la note sur `_ROUTE_LEVELS` plus haut : ces routes n'ont pas de paramètre `nick`).
+Concrètement, tout détenteur d'une clé API valide qui connaît/devine un `endpoint` donné peut lire
+(`GET /push/subscriptions`), modifier (`PATCH`) ou supprimer (`DELETE`) l'abonnement correspondant,
+quel que soit son propre périmètre par groupes — `scope_nicks` filtre ce que l'abonnement *notifie*,
+pas qui peut *gérer* l'abonnement lui-même. C'est un compromis de conception assumé (pas de couche
+compte séparée, voir Design Notes du spec), pas un oubli.
+
+```bash
+# Créer/rafraîchir un abonnement — endpoint/keys.p256dh/keys.auth = forme standard PushSubscription
+curl -X POST http://localhost:8000/api/push/subscribe -H "X-API-Key: $KEY" -H "Content-Type: application/json" -d '{
+  "endpoint": "https://push.example.com/ep1",
+  "keys": {"p256dh": "...", "auth": "..."},
+  "notify_start": true, "notify_end": true,
+  "expires_in_days": 30
+}'
+```
+
+| Paramètre | Défaut si absent | `null` explicite |
+|-----------|-------------------|-------------------|
+| `notify_start` | `false` | rejeté (`422`) — pas d'état « null » significatif pour un type de notification |
+| `notify_end` | `true` | rejeté (`422`) — idem |
+| `expires_in_days` | `BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS` (déf. 30) | « à vie » (`expires_at` = `NULL`, jamais d'expiration automatique) |
+
+`expires_in_days` est borné à `[1, 3650]` jours (`PUSH_MAX_EXPIRY_DAYS`) — une valeur hors bornes
+(y compris une valeur absurde comme `999999999999`, qui ferait sinon silencieusement déborder
+`datetime('now','+N days')` côté SQLite vers `NULL`, soit « à vie » par accident) retombe sur le
+même défaut serveur que l'absence du champ, jamais sur « à vie ». Logique de résolution partagée
+entre `POST`/`PATCH` (`_resolve_push_expiry_days`).
+
+`scope_nicks` (périmètre RBAC de l'appelant, même mécanisme que `GET /access` : tout nick où l'appelant
+a au moins un accès lecture) est calculé et **figé** à chaque appel `POST /push/subscribe` — un
+ré-abonnement sur le **même** `endpoint` (`endpoint` `UNIQUE`) met à jour la ligne existante (jamais de
+doublon) et **recalcule** `scope_nicks` à ce nouveau moment : une personne qui se réabonne
+explicitement après un changement de ses groupes rafraîchit ainsi son périmètre sans devoir d'abord se
+désabonner. Entre deux souscriptions, `scope_nicks` n'est en revanche **jamais** recalculé
+dynamiquement (AD-4) — seule `PATCH /push/subscribe` peut ensuite modifier les préférences
+(`notify_start`/`notify_end`/`expires_in_days`, jamais `scope_nicks`) :
+
+```bash
+curl -X PATCH http://localhost:8000/api/push/subscribe -H "X-API-Key: $KEY" -H "Content-Type: application/json" -d '{
+  "endpoint": "https://push.example.com/ep1", "notify_end": false, "expires_in_days": null
+}'
+# 404 explicite si l'endpoint est inconnu — jamais de création silencieuse (PATCH != POST)
+
+curl -X DELETE "http://localhost:8000/api/push/subscribe?endpoint=https://push.example.com/ep1" -H "X-API-Key: $KEY"
+# {"deleted": true} — un endpoint déjà absent renvoie {"deleted": false}, jamais un 404 bruyant
+# (désabonnement explicite : « déjà absent » atteint déjà l'objectif)
+
+curl "http://localhost:8000/api/push/subscriptions?endpoint=https://push.example.com/ep1" -H "X-API-Key: $KEY"
+# {"subscriptions": [{...}]} — permet à l'UI d'afficher « vos abonnements actuels »
+```
+
+Réponse commune à `POST`/`PATCH`/`GET` (un ou plusieurs objets de cette forme) :
+
+```json
+{"id": 1, "endpoint": "...", "scope_nicks": ["demo-modules"],
+ "notify_start": true, "notify_end": true,
+ "expires_at": "2026-10-26 07:48:45", "created_at": "2026-09-26 07:48:45"}
+```
+
+Vérification interne dédiée : `borgHelperWWW -C ... --selftest` (voir `TECHNICAL.md` — génération
+VAPID, CRUD, calcul d'expiration, clamp de `BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS`, sur des fichiers
+temporaires uniquement).
 
 ### `/download/file` et `/download/tar` — téléchargements binaires
 

@@ -73,3 +73,14 @@ cfgfile = /etc/borghelperrc-www
 ; (quelques os.path.getmtime) a lieu à chaque requête indépendamment de ce réglage (AD-5 : elle
 ; doit précéder la résolution du périmètre, donc avant de savoir si l'appelant est restreint).
 ;scope_cache_db = /var/cache/borghelper/borghelperrc-www-scopecache.db
+
+; Chemin du fichier SQLite DÉDIÉ aux clés VAPID et abonnements push navigateur (Story 2a,
+; spec-notifications-push, AD-6 — jamais scopecache.db ci-dessus : celui-ci n'est PAS reconstructible,
+; une perte est définitive) — BORGHELPERWWW_PUSH_DB / --push-db. Défaut : co-localisé avec
+; cache.db/diff.db (voir README.md, section « Notifications push »).
+;push_db = /var/cache/borghelper/borghelperrc-www-push.db
+
+; Durée d'expiration par défaut (jours) d'un abonnement push quand expires_in_days est absent de
+; POST /push/subscribe — BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS (env var SEULE, pas de clé de conf
+; ni d'option CLI pour ce réglage — même patron que les deux réglages du watcher bkp_status). Défaut
+; 30 ; valeur non numérique ou <1 : repli silencieux sur 30, jamais un crash serveur.
