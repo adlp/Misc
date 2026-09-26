@@ -39,7 +39,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.19.0"
+WWW_VERSION="1.19.1"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -1460,6 +1460,45 @@ def _filter_per_nick_listkey(results,scopes,list_key,item_path_key='full_path'):
         out[n]=val
     return out
 
+def _path_is_scope_ancestor(path,scope):
+    """True si `path` est un répertoire PARENT strict d'au moins un préfixe de `scope` (ex. 'opt' et
+    'opt/backups' pour le périmètre ['/opt/backups/mysql']) — jamais un chemin dans le périmètre
+    lui-même (voir `_path_in_scope`), jamais un simple préfixe de chaîne ('op' n'est pas parent de
+    'opt/...'). `scope=None` -> False (illimité : rien à rendre navigable en plus). Même
+    normalisation du '/' initial que `_path_in_scope`."""
+    if scope is None: return False
+    path=(path or '').strip('/')
+    for prefix in scope:
+        p=prefix.strip('/')
+        if not p: continue
+        if path=='' or p.startswith(path+'/'): return True
+    return False
+
+def _filter_treehist(results,scopes):
+    """TreeHist (navigation de l'UI) : comme `_filter_per_nick_listkey(...,'entries')`, mais garde
+    aussi les répertoires PARENTS du périmètre (`_path_is_scope_ancestor`), sinon un appelant borné
+    à '/opt/backups/mysql' voit une racine vide et ne peut jamais descendre jusqu'à son périmètre.
+    Un parent est réduit à une entrée de navigation nue : nom/chemin/is_dir seulement — droits,
+    propriétaire, historique (`events`) et marque de suppression retirés (ces métadonnées décrivent
+    un objet HORS périmètre ; `events` d'un répertoire agrège en plus les mouvements de toute sa
+    sous-arborescence, donc de fichiers hors périmètre). Réservé à TreeHist : Search/TreeFind/
+    rapports/restauration gardent le filtrage strict."""
+    if not isinstance(results,dict): return results
+    out={}
+    for n,val in results.items():
+        scope=scopes.get(n)
+        if isinstance(val,dict) and 'entries' in val:
+            val=dict(val); kept=[]
+            for item in val['entries']:
+                fp=item.get('full_path') or ''
+                if _path_in_scope(fp,scope): kept.append(item)
+                elif _path_is_scope_ancestor(fp,scope):
+                    kept.append({'name':item.get('name'),'full_path':item.get('full_path'),'genre':'répertoire',
+                        'mode':None,'owner':None,'is_dir':True,'events':[],'scope_ancestor':True})
+            val['entries']=kept
+        out[n]=val
+    return out
+
 # ── Filtrage a posteriori DuIdx/IdxTop/DiffTop (Story 1.4) ──────────────────
 # Contrairement à Search/FileHist/LstBkpFls/DiffBkp/TreeHist/TreeFind (Story 1.3), ces trois
 # commandes groupent/agrègent déjà en Python (voire en SQL, pour DuIdx) AVANT de produire leur JSON
@@ -2175,9 +2214,11 @@ def treehist(nick: str, request: Request, prefix: Optional[str]=None, archive_fr
     nicks=_nick_list(nick)
     scopes=_resolve_scopes_for_request(request,nicks)
     if _any_scoped(scopes):
-        params={'prefix':prefix,'archive_from':archive_from,'archive_to':archive_to}
+        # 'ancestors' : fait partie de la clé du cache par périmètre — invalide les réponses mises en
+        # cache avant 1.19.1 (filtrage strict, sans les répertoires parents du périmètre).
+        params={'prefix':prefix,'archive_from':archive_from,'archive_to':archive_to,'ancestors':1}
         return _scoped_cached_multi('treehist',nick,nicks,scopes,fingerprints,params,
-            lambda:_run_scoped('treehist',nick,extra,lambda data:_filter_per_nick_listkey(data,scopes,'entries')))
+            lambda:_run_scoped('treehist',nick,extra,lambda data:_filter_treehist(data,scopes)))
     if json_output: extra.append('-j')
     return run_borghelper('treehist',nick=nick,extra_args=extra,cacheable=True)
 
@@ -2828,6 +2869,31 @@ def push_selftest():
             _bh_paths.borg.cfgread=old_cfgread
     check("require_path_in_scope (Restore/téléchargements) applique GROUPS_PATHS_RESTORE, pas le périmètre de lecture",
           _require_path_in_scope_uses_restore_ok)
+
+    def _treehist_scope_ancestors_ok():
+        """TreeHist garde les répertoires parents du périmètre (réduits à une entrée nue), jamais un
+        voisin hors périmètre ni un faux parent par simple préfixe de chaîne ; filtrage strict
+        inchangé pour Search/TreeFind (_filter_per_nick_listkey)."""
+        scope=_canonicalize_scope(['/opt/backups/mysql/'])
+        ent=lambda fp,d=True:{'name':fp.rsplit('/',1)[-1],'full_path':fp,'genre':'répertoire','mode':'drwx------',
+            'owner':'root','is_dir':d,'events':[{'type':'modified','archive':'a1','date':'2026-01-01'}]}
+        def names(prefix,fps):
+            data={'h':{'path':prefix,'entries':[ent(fp,not fp.endswith('.sql')) for fp in fps]}}
+            return data,_filter_treehist(data,{'h':scope})['h']['entries']
+        _,root=names(None,['opt','etc','op'])
+        _,opt=names('opt',['opt/backups','opt/other'])
+        _,bk=names('opt/backups',['opt/backups/mysql','opt/backups/mysqlx'])
+        _,my=names('opt/backups/mysql',['opt/backups/mysql/db.sql'])
+        strict=_filter_per_nick_listkey({'h':{'entries':[ent('opt')]}},{'h':scope},'entries')['h']['entries']
+        a=root[0] if root else {}
+        return ([e['full_path'] for e in root]==['opt'] and a.get('scope_ancestor') is True
+                and a['mode'] is None and a['owner'] is None and a['events']==[]
+                and [e['full_path'] for e in opt]==['opt/backups']
+                and [e['full_path'] for e in bk]==['opt/backups/mysql'] and not bk[0].get('scope_ancestor')
+                and bk[0]['events'] and [e['full_path'] for e in my]==['opt/backups/mysql/db.sql']
+                and strict==[] and _filter_treehist({'h':{'entries':[ent('etc')]}},{'h':None})['h']['entries'][0]['mode']=='drwx------')
+    check("TreeHist : répertoires parents du périmètre GROUPS_PATHS navigables (entrée nue), rien d'autre hors périmètre",
+          _treehist_scope_ancestors_ok)
 
     fails=results.count(False)
     print(f"push selftest : {len(results)-fails}/{len(results)} OK"+(f", {fails} FAIL" if fails else ""))

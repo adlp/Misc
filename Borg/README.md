@@ -1124,6 +1124,16 @@ groupe**, rétro-compatible : une config qui n'utilise que `GROUPS_PATHS`, comme
 restreint la restauration de la même façon que la lecture). Le reste de cette section décrit
 `GROUPS_PATHS` — `GROUPS_PATHS_RESTORE` suit exactement les mêmes règles, sur sa propre clef.
 
+Navigation (borgHelperWWW ≥ 1.19.1) : dans l'arborescence de l'UI (`/treehist`), les répertoires
+**parents** d'un périmètre (ex. `opt` et `opt/backups` pour `groupe:/opt/backups/mysql`) restent
+affichés, marqués « accès partiel », pour pouvoir descendre jusqu'au périmètre — nom seul, sans
+droits/propriétaire/historique, sans téléchargement, et sans aucun de leurs autres enfants. Les autres
+commandes (Search/TreeFind/rapports/restauration) restent strictement limitées au périmètre.
+
+⚠️ `GROUPS_PATHS` **n'accorde jamais** l'accès à un nick : il restreint un accès déjà donné par
+`GROUPS_ADMIN`/`GROUPS_WRITE`/`GROUPS_READ` (du nick ou de `[DEFAULT]`). Un groupe cité seulement dans
+`GROUPS_PATHS` ne voit pas le nick — vérifier avec `GET /access`.
+
 Raffinement orthogonal au tier ci-dessus —
 il ne fait jamais qu'un nick est accordé, seulement *quelle partie* de ce nick l'est. Un groupe
 absent de `GROUPS_PATHS` conserve un accès chemin illimité dans la limite du tier qu'il détient

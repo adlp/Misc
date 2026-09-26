@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.10.0 -->
+<!-- UI_VERSION: 1.10.1 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -1150,8 +1150,11 @@ async function loadBrowse(){
     const evText=e.deleted ? `supprimé (dernière présence : ${escapeHtml(e.last_seen_archive||'?')})`
       : (lastEv ? `${escapeHtml(lastEv.type)} (${escapeHtml(lastEv.archive)})` : '—');
     const icon=e.is_dir?'📁':'📄';
-    return `<tr class="browse-row" style="cursor:pointer" data-full="${escapeAttr(e.full_path)}" data-isdir="${e.is_dir}">
-      <td>${icon} ${escapeHtml(e.name)} ${e.deleted?'<span class="badge warn">supprimé</span>':''}</td><td>${escapeHtml(e.genre)}</td>
+    // scope_ancestor : répertoire parent de votre périmètre RBAC (GROUPS_PATHS), affiché pour pouvoir
+    // descendre jusqu'à lui — sans droits/propriétaire/historique, jamais téléchargeable.
+    const anc=e.scope_ancestor?' <span class="badge" title="Répertoire parent de votre périmètre : navigation seulement">accès partiel</span>':'';
+    return `<tr class="browse-row" style="cursor:pointer" data-full="${escapeAttr(e.full_path)}" data-isdir="${e.is_dir}" data-ancestor="${e.scope_ancestor?'true':'false'}">
+      <td>${icon} ${escapeHtml(e.name)}${anc} ${e.deleted?'<span class="badge warn">supprimé</span>':''}</td><td>${escapeHtml(e.genre)}</td>
       <td style="font-family:var(--mono)">${escapeHtml(e.mode||'—')}</td>
       <td style="font-family:var(--mono)">${escapeHtml(e.owner||'—')}</td><td>${evText}</td>
     </tr>`;
@@ -1165,6 +1168,7 @@ document.getElementById('browseBody').addEventListener('click', e=>{
 });
 document.getElementById('browseBody').addEventListener('contextmenu', e=>{
   const tr=e.target.closest('.browse-row'); if(!tr) return;
+  if(tr.dataset.ancestor==='true') return;
   if(tr.dataset.isdir==='true'){ e.preventDefault(); openDownloadDialog(tr.dataset.full,true); }
 });
 

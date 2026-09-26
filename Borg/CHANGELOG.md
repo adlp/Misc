@@ -1,5 +1,21 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.19.1 / borgHelperWWW_ui.html 1.10.1 — répertoires parents du périmètre navigables — 2026-09-26
+
+Bug rapporté : un groupe borné par `GROUPS_PATHS = AD-Borg admin:/opt/backups/mysql/` voyait une
+racine vide dans l'arborescence de l'UI — `opt` et `opt/backups`, parents du périmètre mais pas dans
+le périmètre, étaient filtrés, rendant `mysql/` inatteignable.
+
+- `/treehist` (appelant à périmètre restreint) : les répertoires parents d'un préfixe du périmètre sont
+  gardés comme entrées de navigation nues (`scope_ancestor: true`, sans droits/propriétaire/
+  historique). Leurs autres enfants restent masqués. Search/TreeFind/FileHist/rapports/restauration
+  inchangés (filtrage strict).
+- Cache par périmètre de TreeHist : clé enrichie, les réponses mises en cache avant la mise à jour ne
+  sont pas resservies.
+- UI : badge « accès partiel » sur ces entrées, pas de téléchargement au clic droit.
+- README : rappel que `GROUPS_PATHS` restreint un accès, n'en accorde jamais.
+- `push_selftest` 47/47 (nouveau contrôle TreeHist/parents du périmètre).
+
 ## borgHelperWWW 1.19.0 / borgHelperWWW_ui.html 1.10.0 — paramétrage des notifications dans l'UI + préférences en JSON — 2026-09-26
 
 `spec-push-ui-prefs-json` (Story 2c de `spec-notifications-push`), demande directe utilisateur :

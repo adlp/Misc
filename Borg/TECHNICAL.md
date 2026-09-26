@@ -1694,6 +1694,21 @@ list`/`borg extract` contre l'**archive** (`borgHelper:2957` `listperms`, `borgH
 `os.stat`/`os.access` sur l'host distant ni sur le serveur `borgHelperWWW`. Le RBAC
 (`GROUPS_PATHS`/`GROUPS_PATHS_RESTORE`) est le **seul** filtre d'autorisation sur toute cette chaîne.
 
+### Répertoires parents du périmètre navigables dans TreeHist (`borgHelperWWW` 1.19.1)
+
+Bug réel rapporté : groupe borné à `/opt/backups/mysql/` → racine de l'arborescence UI vide, `opt` et
+`opt/backups` n'étant pas *dans* le périmètre (`_path_in_scope`), seulement ses parents — impossible
+de descendre jusqu'au périmètre. `/treehist` (scopé) filtre désormais via `_filter_treehist` au lieu
+de `_filter_per_nick_listkey(...,'entries')` : une entrée hors périmètre mais **parent strict** d'un
+préfixe (`_path_is_scope_ancestor`, comparaison par segments complets — `op` n'est pas parent de
+`opt/...`) est gardée, réduite à une entrée de navigation nue (`name`/`full_path`, `is_dir:true`,
+`mode`/`owner` `null`, `events` vide, `scope_ancestor:true`, jamais `deleted`) : ses métadonnées
+décrivent un objet hors périmètre et ses `events` agrègent toute sa sous-arborescence. Seule
+information supplémentaire exposée : le nom des répertoires parents, déjà implicite dans la config.
+Search/TreeFind/FileHist/rapports/restauration inchangés (filtrage strict). Clé du cache par périmètre
+de TreeHist enrichie (`'ancestors':1`) pour ne pas resservir une réponse filtrée strictement avant la
+mise à jour. UI 1.10.1 : badge « accès partiel », pas de téléchargement au clic droit sur ces entrées.
+
 ### Filtrage a posteriori par périmètre — Search/FileHist/LstBkpFls/DiffBkp/TreeHist/TreeFind (Story 1.3)
 
 Applique le périmètre résolu par Story 1.1 (`_resolve_path_scope`) aux six commandes de lecture qui
