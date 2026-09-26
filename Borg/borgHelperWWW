@@ -807,9 +807,21 @@ def _load_or_generate_vapid_keys(conn):
     return _generate_and_store_vapid_keys(conn)
 
 def _init_vapid_keys():
+    """None,None si py_vapid est absent ET qu'aucune paire n'est encore stockée (premier démarrage) —
+    py_vapid n'est requis QUE pour générer une première paire ; une paire déjà en base
+    (_load_or_generate_vapid_keys) se relit sans jamais importer py_vapid. Dépendance optionnelle,
+    même raison que pywebpush (PyPI-only, pas de paquet apt) : un admin qui n'utilise pas les
+    notifications push ne doit pas voir tout borgHelperWWW planter au démarrage pour ça."""
     conn=_open_db(PUSH_DB,nick=None,role='admin')
-    try: return _load_or_generate_vapid_keys(conn)
-    finally: conn.close()
+    try:
+        return _load_or_generate_vapid_keys(conn)
+    except ImportError as e:
+        print(f"[WARN] py_vapid absent — impossible de générer les clés VAPID (notifications push "
+              f"désactivées tant que la lib n'est pas installée). 'pip3 install pywebpush' (qui "
+              f"l'inclut en dépendance transitive) pour les activer. ({e})",file=sys.stderr,flush=True)
+        return None,None
+    finally:
+        conn.close()
 
 PUSH_VAPID_PRIVATE_KEY,PUSH_VAPID_PUBLIC_KEY=_init_vapid_keys()
 
@@ -865,7 +877,8 @@ def _send_bkp_push(nick,event,result):
     abonnement mort côté navigateur) -> désabonnement automatique ; toute autre erreur (réseau,
     autre code HTTP, exception non-WebPushException) -> journalisée seule, abonnement conservé,
     jamais de retry (voir Design Notes du spec — la ligne bkp_status est déjà réclamée par CAS)."""
-    if not _PYWEBPUSH_AVAILABLE: return  # dépendance optionnelle absente — voir avertissement au démarrage
+    if not _PYWEBPUSH_AVAILABLE or PUSH_VAPID_PRIVATE_KEY is None:
+        return  # dépendance optionnelle (pywebpush/py_vapid) absente — voir avertissement au démarrage
     notify_col='notify_start' if event=='start' else 'notify_end'
     try:
         subs=_push_subscriptions_for(nick,notify_col)

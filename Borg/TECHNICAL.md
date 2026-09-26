@@ -2337,6 +2337,15 @@ recommande `pip3 install pywebpush`. Raison : `pywebpush` n'est un paquet d'aucu
 (PyPI-only), donc pas forcément présent sur un hôte de production qui n'a jamais eu besoin d'installer
 de dépendances Python hors stdlib pour `borgHelper` (CLI) lui-même.
 
+Même traitement pour `py_vapid` (dépendance transitive de `pywebpush`, mais importée directement dans
+`_generate_and_store_vapid_keys` — pas garanti co-présent si quelqu'un installe les deux séparément) :
+`_init_vapid_keys()` (appelée sans garde au niveau module, `PUSH_VAPID_PRIVATE_KEY,PUSH_VAPID_PUBLIC_KEY
+=_init_vapid_keys()`) capture `ImportError` et retourne `None,None`. **Nuance importante** :
+`_load_or_generate_vapid_keys` relit une paire déjà stockée dans `push_vapid_keys` (id=1) sans jamais
+importer `py_vapid` — seule la toute première génération (aucune ligne encore en base) l'exige. Un
+serveur qui a déjà démarré une fois avec `py_vapid` présent continue donc de fonctionner sans, même si
+la lib disparaît ensuite (désinstallation, changement d'environnement).
+
 ### Fichier et schéma
 
 `PUSH_DB` (réglage `BORGHELPERWWW_PUSH_DB`/`--push-db`, défaut `<cache_dir>/<db_prefix>-push.db`,

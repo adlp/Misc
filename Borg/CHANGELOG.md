@@ -1,21 +1,27 @@
 # Changelog — borgHelper
 
-## borgHelperWWW 1.18.1 — pywebpush devient une dépendance optionnelle — 2026-09-26
+## borgHelperWWW 1.18.1 — pywebpush et py_vapid deviennent des dépendances optionnelles — 2026-09-26
 
-`pywebpush` n'est un paquet d'aucun dépôt apt (PyPI-only) et n'est donc pas forcément installé sur un
-hôte de production. Jusqu'ici, `from pywebpush import ...` en tête de fichier faisait planter tout
-`borgHelperWWW` (y compris `uvicorn borgHelperWWW:app`) si la lib était absente, même pour un admin qui
-n'utilise pas du tout les notifications push.
+Ni `pywebpush` ni `py_vapid` (sa dépendance transitive) ne sont des paquets d'un dépôt apt (PyPI-only)
+— pas forcément installés sur un hôte de production. Jusqu'ici, deux points faisaient planter tout
+`borgHelperWWW` (y compris `uvicorn borgHelperWWW:app`) si l'une des deux libs était absente, même pour
+un admin n'utilisant pas du tout les notifications push :
 
-- Import de `pywebpush` mis en `try/except ImportError` : si absent, `_PYWEBPUSH_AVAILABLE=False`,
-  `webpush=None`. Le reste de `borgHelperWWW` (toutes les routes, y compris `/push/subscribe` en
-  CRUD) démarre et fonctionne normalement.
-- `_send_bkp_push` (watcher) court-circuite immédiatement (`return`) si `_PYWEBPUSH_AVAILABLE` est
-  faux — aucun envoi réel n'a lieu, mais aucune exception non plus.
-- Avertissement au démarrage (`[WARN]`, stderr) si `pywebpush` est absent, invitant explicitement à
-  `pip3 install pywebpush` (ou dans un venv dédié).
-- Aucun changement de comportement quand `pywebpush` est installé (cas actuel de `demo.borghelperrc`) —
-  26/26 `push_selftest` toujours OK.
+- Import de `pywebpush` en tête de fichier — mis en `try/except ImportError` : si absent,
+  `_PYWEBPUSH_AVAILABLE=False`, `webpush=None`.
+- Génération de la première paire de clés VAPID (`_init_vapid_keys()`, appelée sans garde au niveau
+  module) — importait `py_vapid` sans filet. Mis en `try/except ImportError` : si absent, `None,None`
+  (une paire déjà en base, cas courant après un premier démarrage réussi, se relit sans jamais
+  ré-importer `py_vapid` — seule la toute première génération l'exige).
+
+Dans les deux cas : le reste de `borgHelperWWW` (toutes les routes, y compris `/push/subscribe` en
+CRUD et `GET /version`) démarre et fonctionne normalement ; `_send_bkp_push` (watcher) court-circuite
+immédiatement (`return`, aucune exception) si l'une des deux dépendances manque. Avertissement `[WARN]`
+au démarrage (stderr) dans chaque cas, invitant à `pip3 install pywebpush` (inclut `py_vapid` en
+dépendance transitive). Vérifié en simulant l'absence des deux libs sur un `push.db` tout neuf (premier
+démarrage, aucune paire encore stockée) : démarrage complet sans exception. Aucun changement de
+comportement quand les deux sont installées (cas actuel de `demo.borghelperrc`) — 26/26
+`push_selftest` toujours OK.
 
 ## borgHelper 1.0.111 — commande Status : état rapide par nick, 100% local — 2026-09-26
 
