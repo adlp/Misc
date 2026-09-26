@@ -262,7 +262,10 @@ borgHelper -c Login -n mon-serveur -p motdepasse -r /mnt/borg/local -k /root/bor
 
 ### `Bkp`
 Lance une sauvegarde selon la configuration du dépôt.  
-Par défaut, capture les fichiers modifiés pendant le backup (`--list`) et indexe automatiquement dans le SQLite (`diff_index` + snapshot + tailles via `borg diff`).
+Par défaut, indexe automatiquement la nouvelle archive dans le SQLite juste après la sauvegarde :
+`borg diff` avec l'archive précédente (`diff_index`), puis snapshot incrémental (borgHelper ≥ 1.0.116 —
+auparavant, les changements étaient déduits de `borg create --list`, qui prenait chaque répertoire pour
+un fichier supprimé et ne voyait aucune suppression réelle, voir CHANGELOG).
 
 ```bash
 borgHelper -c Bkp -n mon-serveur        # backup + indexation automatique
@@ -272,14 +275,18 @@ borgHelper -c Bkp -n mon-serveur -I     # backup seul, sans indexation
 Nécessite : `EXCLUDE`, `SER_LOGIN`, `SER_NAME`.  
 Code retour 0 si succès ou warnings, 2 si erreur borg.
 
-> `-I` désactive `--list`, toute écriture SQLite et l'appel automatique à `Index` — utile si l'indexation est gérée séparément.
+> `-I` désactive toute écriture de changements/snapshot et l'appel automatique à `Index` — utile si l'indexation est gérée séparément (les statistiques de l'archive et la taille du dépôt restent enregistrées).
 
 > **Priorité sur Index :** `Bkp` est prioritaire sur `Index` à tout moment — même si `Index` est en cours à n'importe quelle étape :
 > - Si `Index` démarre alors que `Bkp` est déjà actif → annulation immédiate avant même le premier `borg diff`.
 > - Si `Bkp` démarre pendant un `Index` → les `borg diff` actifs reçoivent SIGKILL, `Index` s'arrête complètement (borg info et indexsnap inclus).
 > - Dans les deux cas, `Index` pose un flag de reprise (`index-pending.lock`) : `Bkp` le détecte en fin d'exécution et relance automatiquement `Index` complet.
 
-**Sortie stdout (JSON)** — si exit 0, le JSON borg est enrichi de deux clefs borgHelper :
+**Sortie stdout (JSON)** — stdout ne contient que ce JSON, imprimé à la fin (après l'indexation ; ses
+messages partent sur stderr). Si exit 0, le JSON borg est enrichi de deux clefs borgHelper, calculées à
+partir du vrai `borg diff` de la paire (types de changement borg : `added`, `modified`, `removed`,
+`added directory`, `removed directory`, `ctime`, `mode`...). Absentes si la paire n'est pas indexée
+(première archive, `-I`, `NOIDX=1`, Index post-Bkp interrompu) :
 
 ```json
 {

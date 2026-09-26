@@ -7,10 +7,10 @@
 #*/
 
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading,uuid
-import hmac,hashlib,secrets,base64,stat,functools,shutil
+import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.115"
+Version="1.0.116"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -47,7 +47,6 @@ class DbTamperError(Exception): pass   # en-tête incohérent (ex. enc_header av
 class DbCodecError(Exception): pass    # chemin/blob stocké non canonique, tag ou MAC invalide
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-_BKP_STATUS_MAP={'A':'added','M':'modified','C':'C','B':'B','T':'T','d':'removed'}
 _TREEHIST_GENRES={'d':'répertoire','-':'fichier','l':'lien symbolique','p':'fifo',
                    's':'socket','b':'périph. bloc','c':'périph. caractère'}
 _DUIDX_TYPE_ORDER=['added','modified','removed','C','B','T','présent']
@@ -122,6 +121,11 @@ def parse_diff_line(line):
     if m: return {'change_type':m.group(1),'size_before':None,'size_after':None,'path':m.group(2)}
     return None
 
+# Types de changement borg diff (--json-lines) qui ajoutent / suppriment une entrée — fichier,
+# répertoire ou lien (parse_diff_line_json garde le type borg brut hors added/removed/modified).
+_DIFF_ADDED_TYPES=('added','added directory','added link')
+_DIFF_REMOVED_TYPES=('removed','removed directory','removed link')
+
 def parse_diff_line_json(line):
     line=line.strip()
     if not line: return None
@@ -143,32 +147,6 @@ def parse_diff_line_json(line):
     if change_type is None:
         change_type=changes[0].get('type','?')
     return {'change_type':change_type,'size_before':size_before,'size_after':size_after,'path':path}
-
-def _bkp_parse_list(stderr):
-    entries=[]
-    for i in stderr:
-        if isinstance(i,dict):
-            if i.get('name')=='borg.output.list' or i.get('type')=='file_status':
-                if i.get('type')=='file_status':
-                    status=i.get('status',''); path=i.get('path','')
-                else:
-                    msg=i.get('message','')
-                    if len(msg)>=3 and msg[1]==' ': status,path=msg[0],msg[2:]
-                    else: continue
-                ct=_BKP_STATUS_MAP.get(status)
-                if ct and path: entries.append({'change_type':ct,'path':path,'size_before':None,'size_after':None})
-        elif isinstance(i,str):
-            s=i.strip()
-            if len(s)>=3 and s[1]==' ' and s[0] in _BKP_STATUS_MAP:
-                entries.append({'change_type':_BKP_STATUS_MAP[s[0]],'path':s[2:],'size_before':None,'size_after':None})
-    return entries
-
-def _bkp_is_list_entry(i):
-    if isinstance(i,dict): return i.get('name')=='borg.output.list' or i.get('type')=='file_status'
-    if isinstance(i,str):
-        s=i.strip()
-        return len(s)>=3 and s[1]==' ' and s[0] in _BKP_STATUS_MAP
-    return False
 
 def _borg_extract_args(bid,ftor):
     base=['extract','--numeric-owner','--exclude','*/log/*',f'::{bid}']
@@ -1917,15 +1895,16 @@ class BorgHelperDB:
             conn.close()
             zero=lambda: {'added':0,'removed':0,'modified':0,'added_sz':0,'removed_sz':0,'modified_sz':0}
             stats={arch:zero() for (arch,) in indexed}
+            # 1.0.116 : répertoires/liens ajoutés ou supprimés comptés comme tels (étaient « modifiés »).
             for arch,ctype,cnt,sz_after,sz_before in rows:
                 if arch not in stats: stats[arch]=zero()
-                if ctype=='added': stats[arch]['added']+=cnt; stats[arch]['added_sz']+=(sz_after or 0)
-                elif ctype=='removed': stats[arch]['removed']+=cnt; stats[arch]['removed_sz']+=(sz_before or 0)
+                if ctype in _DIFF_ADDED_TYPES: stats[arch]['added']+=cnt; stats[arch]['added_sz']+=(sz_after or 0)
+                elif ctype in _DIFF_REMOVED_TYPES: stats[arch]['removed']+=cnt; stats[arch]['removed_sz']+=(sz_before or 0)
                 else: stats[arch]['modified']+=cnt; stats[arch]['modified_sz']+=(sz_after or 0)
             for arch,ctype,cnt,sz in exclu_rows:
                 if arch not in stats: stats[arch]=zero()
-                if ctype=='added': stats[arch]['added']+=cnt; stats[arch]['added_sz']+=(sz or 0)
-                elif ctype=='removed': stats[arch]['removed']+=cnt; stats[arch]['removed_sz']+=(sz or 0)
+                if ctype in _DIFF_ADDED_TYPES: stats[arch]['added']+=cnt; stats[arch]['added_sz']+=(sz or 0)
+                elif ctype in _DIFF_REMOVED_TYPES: stats[arch]['removed']+=cnt; stats[arch]['removed_sz']+=(sz or 0)
                 else: stats[arch]['modified']+=cnt; stats[arch]['modified_sz']+=(sz or 0)
             return stats
         except Exception: return {}
@@ -3061,6 +3040,32 @@ class BorgHelper:
         ret=self.borg.boex(nick,"init --encryption repokey".split(' '),debug=debug)
         print(ret)
 
+    def _pair_file_counts(self,nick,archive_old,archive_new,db_path,with_files=False):
+        """Comptages par type de changement (added/modified/removed/C/B/T) de la paire
+        archive_old -> archive_new, depuis diff_index (+ diff_excluded_stats : fichiers exclus de
+        l'indexation, comptés comme dans Report). None si la paire n'est pas (encore) indexée — ex.
+        Index post-Bkp interrompu. with_files : liste {change_type,path} (chemins décodés, mode -d)."""
+        try:
+            conn=_open_db(db_path,nick=nick,role='read')
+            try:
+                if not conn.execute("SELECT 1 FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=?",
+                                    (nick,archive_old,archive_new)).fetchone():
+                    return None
+                counts={}
+                for ct,n in conn.execute("SELECT change_type,COUNT(*) FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=? GROUP BY change_type",
+                                         (nick,archive_old,archive_new)):
+                    counts[ct]=counts.get(ct,0)+n
+                for ct,n in conn.execute("SELECT change_type,SUM(file_count) FROM diff_excluded_stats WHERE nick=? AND archive_old=? AND archive_new=? GROUP BY change_type",
+                                         (nick,archive_old,archive_new)):
+                    counts[ct]=counts.get(ct,0)+(n or 0)
+                files=[{'change_type':ct,'path':_path_decode(conn,p)} for p,ct in conn.execute(
+                    "SELECT path,change_type FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=? ORDER BY id",
+                    (nick,archive_old,archive_new))] if with_files else None
+                return counts,files
+            finally: conn.close()
+        except (sqlite3.Error,DbCodecError) as e:
+            printer(f"  [WARN] {nick}: comptage des fichiers de la paire impossible : {e}"); return None
+
     def backup(self,nick,no_index=False,debug=0):
         cfg=self.borg.cfgreaded(nick,debug=debug)
         if not no_index and self._nick_noidx(nick): no_index=True
@@ -3083,9 +3088,10 @@ class BorgHelper:
                 archive_old=prev[0] if prev else None
             except Exception: archive_old=None
         create=['create']
-        base_flags='--log-json --json --debug -v --stats'
-        if not no_index: base_flags+=' --list --filter AMCBTd'
-        create.extend(base_flags.split(' '))
+        # Jamais --list (1.0.116) : ses statuts ne décrivent pas un diff — 'd' = répertoire (était pris
+        # pour « supprimé » : tous les répertoires marqués supprimés à chaque Bkp), aucun fichier
+        # supprimé n'y figure jamais. Les changements de la paire viennent de l'Index post-Bkp (borg diff).
+        create.extend('--log-json --json --debug -v --stats'.split(' '))
         archname='root'
         if 'BORG_ARCHNAME' in cfg.keys(): archname=cfg['BORG_ARCHNAME']
         if archname[:2]=="::": create.append(archname+'-{now:%Y-%m-%dT%H%M%S}')
@@ -3119,20 +3125,14 @@ class BorgHelper:
                 for i in anaRet['stderr']:
                     if isinstance(i,dict) and i.get('levelname') in ('ERROR','CRITICAL'):
                         newretC=2; break
+            # JSON de sortie imprimé APRÈS l'indexation (1.0.116) : borgHelper_file_counts vient du vrai
+            # borg diff de la paire (Index post-Bkp), plus de la sortie --list de borg create.
+            out=None
             if 'stdout' in anaRet.keys() and len(anaRet['stdout']):
                 out=dict(anaRet['stdout'][0])
                 out['borghelper_version']=Version
-                if newretC==0:
-                    all_entries=_bkp_parse_list(anaRet.get('stderr',[]))
-                    counts={}
-                    for e in all_entries:
-                        counts[e['change_type']]=counts.get(e['change_type'],0)+1
-                    out['borgHelper_file_counts']=counts
-                    if debug: out['borgHelper_files']=all_entries
-                print(json.dumps(out,indent=4),file=sys.stdout,flush=True)
             if 'stderr' in anaRet.keys() and len(anaRet['stderr']):
                 for i in anaRet['stderr']:
-                    if _bkp_is_list_entry(i): continue
                     if isinstance(i,dict):
                         lvl=i.get('levelname','INFO'); msg=i.get('message',str(i))
                         if lvl=='DEBUG' and not debug: continue
@@ -3155,30 +3155,29 @@ class BorgHelper:
                         if cst.get('unique_csize') is not None:
                             self.db.store_repo_stats(nick,'bkp',cst['unique_csize'],cst.get('total_size'),cst.get('total_csize'),db_path)
                     if not no_index and archive_new and archive_old:
-                        all_bkp=_bkp_parse_list(anaRet['stderr'])
-                        entries=[]; exclu={}
-                        for e in all_bkp:
-                            if self._idx_path_ok(e['path'],cfg):
-                                entries.append(e)
-                            else:
-                                ct=e['change_type']
-                                if ct not in exclu: exclu[ct]={'count':0,'size':0}
-                                exclu[ct]['count']+=1
-                        self.db.store_diff_entries(nick,archive_old,archive_new,archive_new_date,entries,db_path)
-                        if exclu:
-                            self.db.store_excluded_diff_stats(nick,archive_old,archive_new,exclu,db_path)
-                        exclu_msg=f" ({sum(s['count'] for s in exclu.values())} exclus)" if exclu else ""
-                        print(f"Index : {len(entries)} entrée(s) stockée(s) ({archive_old} → {archive_new}){exclu_msg}",file=sys.stderr,flush=True)
-                    if not no_index: self.indexsnap(nick,debug=debug)
-                    if not no_index and archive_new and archive_old:
+                        # borg diff réel de la nouvelle paire, PUIS snapshot incrémental (index() finit par
+                        # indexsnap) — jamais l'inverse : le snapshot s'appuie sur le diff de la paire.
+                        # Messages d'Index sur stderr : le stdout de Bkp reste le seul JSON de sortie.
                         self.db.clear_priority_lock(nick)
-                        self.index(nick,debug=debug,target_archive=archive_new,set_pending=False)
+                        with contextlib.redirect_stdout(sys.stderr):
+                            self.index(nick,debug=debug,target_archive=archive_new,set_pending=False)
+                        if out is not None:
+                            fc=self._pair_file_counts(nick,archive_old,archive_new,db_path,with_files=bool(debug))
+                            if fc is not None:
+                                out['borgHelper_file_counts']=fc[0]
+                                if debug: out['borgHelper_files']=fc[1]
+                    elif not no_index:
+                        with contextlib.redirect_stdout(sys.stderr):
+                            self.indexsnap(nick,debug=debug)  # première archive : pas de paire, snapshot complet
                     if not no_index and self.db.check_index_pending_lock(nick):
                         self.db.clear_index_pending_lock(nick)
                         printer(f"{nick}: reprise de l'Index interrompu...")
-                        self.index(nick,debug=debug,set_pending=False)
+                        with contextlib.redirect_stdout(sys.stderr):
+                            self.index(nick,debug=debug,set_pending=False)
                 except Exception as e:
                     printer(f"[WARN] indexation post-backup échouée : {e}")
+            if out is not None:
+                print(json.dumps(out,indent=4),file=sys.stdout,flush=True)
             self.db.store_bkp_status_finish(nick,run_id,'success' if newretC==0 else 'error',bkp_status_db)
             sys.exit(newretC)
         finally:
@@ -3254,9 +3253,12 @@ class BorgHelper:
             diffs=conn.execute(
                 "SELECT path,change_type,size_after FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",
                 (nick,prev_archive,archive_name)).fetchall()
-            removed=[p for p,ct,_ in diffs if ct=='removed' and self._idx_path_ok(p,cfg)]
+            # borg diff distingue fichiers, répertoires et liens ('removed directory', 'added link'...) :
+            # tous appliqués (1.0.116 — seuls 'removed'/'added' l'étaient, un répertoire supprimé
+            # restait dans le snapshot).
+            removed=[p for p,ct,_ in diffs if ct in _DIFF_REMOVED_TYPES and self._idx_path_ok(p,cfg)]
             modified=[(sz,p) for p,ct,sz in diffs if ct=='modified' and self._idx_path_ok(p,cfg)]
-            added=[p for p,ct,_ in diffs if ct=='added' and self._idx_path_ok(p,cfg)]
+            added=[p for p,ct,_ in diffs if ct in _DIFF_ADDED_TYPES and self._idx_path_ok(p,cfg)]
             exclu_count=sum(1 for p,ct,_ in diffs if not self._idx_path_ok(p,cfg))
             exclu_size=sum(sz or 0 for p,ct,sz in diffs if not self._idx_path_ok(p,cfg))
             if len(added)>5000:
@@ -5194,11 +5196,14 @@ def codec_selftest():
             bh_rh.db.store_diff_entries('rhA','A1','A2','2026-02-01T00:00:00',[
                 {'change_type':'added','path':'a/x','size_after':1},{'change_type':'added','path':'a/y','size_after':1},
                 {'change_type':'modified','path':'a/z','size_before':1,'size_after':2},
-                {'change_type':'removed','path':'a/w','size_before':3}],p)
+                {'change_type':'removed','path':'a/w','size_before':3},
+                {'change_type':'added directory','path':'a/nd'},{'change_type':'removed directory','path':'a/od'},
+                {'change_type':'ctime','path':'a'}],p)
             bh_rh.db.store_excluded_diff_stats('rhA','A1','A2',{'modified':{'count':1,'size':5}},p)
             rows={r['archive']:r for r in _rh_run(bh_rh.archive_history,'rhA',as_json=True)['rows']}
             a1,a2=rows['A1'],rows['A2']
-            return (a2['files_added']==2 and a2['files_modified']==2 and a2['files_removed']==1
+            # répertoires ajoutés/supprimés comptés comme tels (1.0.116), ctime (métadonnées) en modifié
+            return (a2['files_added']==3 and a2['files_modified']==3 and a2['files_removed']==2
                     and a1['files_added'] is None and a1['files_modified'] is None and a1['files_removed'] is None)
         check("ArchiveHistory -j : files_added/modified/removed = comptages de Report, null si paire non indexée",_rh_arch_file_counts)
         check("ArchiveHistory -j : table vide -> rows=[]",

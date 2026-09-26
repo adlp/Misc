@@ -356,24 +356,38 @@ erDiagram
 ```
 set_priority_lock(nick)                                  → <nick>-priority.lock (PID)
     ↓
-borg create --list --filter AMCBTd
+borg create --json --stats (jamais --list depuis 1.0.116)
     ↓
-stderr parsé → _bkp_parse_list() → entrées de type added/modified/removed/C/B/T
-    ↓
-filtre IDX_INCLUDE/IDX_EXCLUDE par fichier (en RAM)
-    ├── inclus  → store_diff_entries()       → diff_index + diff_indexed_pairs
-    └── exclus  → store_excluded_diff_stats() → diff_excluded_stats (count seul, taille = 0)
 store_archive_stats(nick, archive_new, ...)              → archive_stats
-indexsnap(nick)                                          → voir flux IndexSnap ci-dessous
+store_repo_stats(nick, 'bkp', ...)                       → repo_stats
     ↓
 clear_priority_lock(nick)                                → priority.lock supprimé (Bkp terminé)
     ↓
-index(nick, target_archive=archive_new, set_pending=False) → borg diff pour remplir les tailles
+index(nick, target_archive=archive_new, set_pending=False) → borg diff réel de la nouvelle paire,
+                                                           puis indexsnap (incrémental sur CE diff)
+    (première archive : indexsnap seul, snapshot complet)
+_pair_file_counts()                                      → borgHelper_file_counts du JSON stdout
     ↓
 si index-pending.lock présent → clear + index(nick, set_pending=False)  ← reprise Index externe interrompu
     ↓
 finally: clear_priority_lock(nick)                       → no-op (déjà supprimé)
 ```
+
+**Correctif 1.0.116 — Bkp n'indexe plus depuis `borg create --list`.** Les statuts de `--list` ne
+décrivent pas un diff : `d` = répertoire (mappé à `removed` par l'ancien `_BKP_STATUS_MAP` — chaque
+répertoire marqué supprimé à chaque Bkp), `C` = fichier modifié PENDANT la sauvegarde (pas un changement
+de droits), et aucun fichier supprimé n'y figure. La paire, marquée indexée, était ensuite recalculée
+par `index(target_archive=…)` (purge + `borg diff`), mais `indexsnap()` tournait **avant**, sur ces
+fausses données : snapshot incrémental privé de tous ses répertoires, fichiers réellement supprimés
+conservés, snapshot marqué fait (jamais recalculé), erreur propagée aux snapshots suivants (clonés).
+Désormais : `borg create` sans `--list`, `index(target_archive)` d'abord, snapshot ensuite.
+`_bkp_parse_list`/`_bkp_is_list_entry`/`_BKP_STATUS_MAP` supprimés. Même version :
+`_DIFF_ADDED_TYPES`/`_DIFF_REMOVED_TYPES` (`added|removed` + `directory`/`link`) appliqués par
+`_indexsnap_incremental` (un répertoire supprimé restait dans le snapshot) et par
+`_diff_stats_for_nick` (comptés ajoutés/supprimés au lieu de modifiés — colonne « Modifs » de Report et
+graphique des fichiers modifiés). Réparation des snapshots existants : `Index -S -F` (reconstruit le
+dernier snapshot par `borg list` complet ; les suivants repartent de lui). Vérifié sur un dépôt de test
+(fichier ajouté/modifié/supprimé, répertoire ajouté/supprimé) : diff, snapshot et compteurs exacts.
 
 ### `Index` (indexation manuelle, parallèle)
 

@@ -1,5 +1,29 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.116 — Bkp : indexation par le vrai borg diff (répertoires faussement « supprimés ») — 2026-09-26
+
+Défaut présent depuis borgHelper 0.45, trouvé en ajoutant le graphique des fichiers modifiés.
+
+- **Bkp n'utilise plus `borg create --list`** pour enregistrer les changements. Ses statuts ne
+  décrivent pas un diff : `d` (répertoire) était enregistré comme « supprimé » — **tous les
+  répertoires marqués supprimés à chaque Bkp** — et aucune suppression réelle n'y figure. Surtout, le
+  snapshot incrémental de la nouvelle archive était calculé sur ces données : **répertoires retirés
+  du snapshot, fichiers réellement supprimés conservés**, erreur propagée aux snapshots suivants
+  (TreeHist/TreeFind/Search sur le dernier état connu).
+- Désormais : `borg create` sans `--list`, puis `borg diff` réel de la nouvelle paire (Index post-Bkp,
+  déjà en place), puis snapshot incrémental sur ce diff. Coût : un `borg diff` par Bkp (déjà exécuté
+  auparavant pour « remplir les tailles »), toujours interruptible par un Bkp/Restore.
+- **Répertoires et liens** ajoutés/supprimés (`added directory`, `removed directory`...) : appliqués au
+  snapshot incrémental (un répertoire supprimé y restait) et comptés comme ajoutés/supprimés dans la
+  colonne « Modifs » de Report et le graphique des fichiers modifiés (étaient « modifiés »).
+- **Sortie JSON de Bkp** : stdout ne contient plus que le JSON, imprimé après l'indexation (messages
+  d'Index sur stderr) ; `borgHelper_file_counts`/`borgHelper_files` (`-d`) calculés à partir du vrai
+  diff, avec les types de changement de `borg diff` ; absents si la paire n'est pas indexée.
+- **Réparation recommandée** (une fois, au moment opportun) : `borgHelper -c Index -n ALL -S -F`
+  reconstruit le dernier snapshot de chaque serveur par un `borg list` complet.
+- `CodecSelfTest` 321/321 ; essai réel sur un dépôt de test (fichier ajouté/modifié/supprimé,
+  répertoire ajouté/supprimé) : diff, snapshot, compteurs et JSON exacts.
+
 ## borgHelper 1.0.115 / borgHelperWWW_ui.html 1.13.0 — graphiques : fichiers modifiés, durée, taille dédupliquée — 2026-09-26
 
 Demande utilisateur : graphiques du nombre de fichiers modifiés par archive, de la durée de sauvegarde
