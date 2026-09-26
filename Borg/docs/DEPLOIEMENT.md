@@ -140,11 +140,14 @@ comportement qu'`uvicorn` lui-même sans ce réglage.
 nick du `.borghelperrc` porte `GROUPS_ADMIN`/`GROUPS_WRITE`/`GROUPS_READ` (quelles routes/commandes)
 et, orthogonalement, `GROUPS_PATHS` (quel sous-répertoire, restriction jamais un tier de plus).
 
-Cas d'usage type : un fileserver sauvegardé en un seul dépôt, où deux services doivent pouvoir
-chercher/restaurer chacun **uniquement dans son propre répertoire**, sans voir celui de l'autre ni le
-reste du serveur — les admins IT gardant, eux, un accès complet. Exemple complet et commenté (nick
-fictif `[fileserver01]`, groupes `AD-Borg-Restore-RH`/`AD-Borg-Restore-Compta`) :
-[`docs/borghelperrc.example`](borghelperrc.example), section « EXEMPLE COMPLET » en bas de fichier.
+Cas d'usage type : un fileserver sauvegardé en un seul dépôt, où plusieurs groupes doivent pouvoir
+chercher/restaurer chacun **uniquement dans son propre périmètre**, sans voir le reste du serveur —
+les admins IT gardant, eux, un accès complet. Exemple complet et commenté (nick fictif
+`[fileserver01]`) illustrant la diversité de syntaxe possible : un groupe borné à un seul répertoire
+(`AD-Borg-Restore-RH`), un groupe borné à plusieurs répertoires à la fois (`AD-Borg-Restore-Direction`,
+`|`), et deux groupes distincts partageant le même répertoire (`AD-Borg-Restore-Compta`/
+`AD-Borg-Restore-Audit`) : [`docs/borghelperrc.example`](borghelperrc.example), section
+« EXEMPLE COMPLET » en bas de fichier.
 
 Le périmètre de chemin est vérifié **côté serveur** à chaque requête (`_resolve_path_scope`,
 `TECHNICAL.md`) — jamais une simple restriction d'affichage côté UI, un `Restore` visant un chemin

@@ -178,20 +178,30 @@ KEEP_WEEKLY = 8
 ; IT garde un accès admin complet (Prune/DelBkp inclus) — jamais listé dans GROUPS_PATHS plus bas,
 ; donc aucune restriction de chemin pour ce groupe.
 GROUPS_ADMIN = AD-Borg-Admin-IT
-; RH et Compta n'ont besoin que de chercher/restaurer dans LEUR répertoire — accès écriture
-; (Restore est classé "écriture" côté routes HTTP, voir docs/TECHNIQUE.md), jamais admin (pas de
-; Prune/DelBkp pour eux). Un même utilisateur peut appartenir aux deux groupes AD sans que ça
-; élargisse son périmètre : chaque groupe reste borné à SON propre chemin ci-dessous.
-GROUPS_WRITE = AD-Borg-Restore-RH,AD-Borg-Restore-Compta
+; RH, Compta, Direction et Audit n'ont besoin que de chercher/restaurer dans LEUR périmètre —
+; accès écriture (Restore est classé "écriture" côté routes HTTP, voir docs/TECHNIQUE.md), jamais
+; admin (pas de Prune/DelBkp pour eux). Un même utilisateur peut appartenir à plusieurs de ces
+; groupes AD sans que ça élargisse artificiellement son périmètre : chaque groupe reste borné à SON
+; propre périmètre ci-dessous (l'UNION de tous ses groupes s'applique si l'appelant en cumule
+; plusieurs — voir docs/TECHNIQUE.md).
+GROUPS_WRITE = AD-Borg-Restore-RH,AD-Borg-Restore-Compta,AD-Borg-Restore-Direction,AD-Borg-Restore-Audit
 
 ; ── RBAC : périmètre de chemin (restriction, PAS un tier de plus) ──────────
 ; Syntaxe : 'groupe:/chemin1|/chemin2, groupe2:/chemin3' — ':' sépare le groupe de ses chemins, '|'
 ; sépare plusieurs chemins pour un même groupe, ',' sépare les groupes. Chemins toujours ABSOLUS.
-; AD-Borg-Restore-RH ne voit/restaure QUE sous /srv/data/rh ; AD-Borg-Restore-Compta QUE sous
-; /srv/data/compta — même s'ils ont techniquement un tier "écriture" sur tout le nick fileserver01.
-GROUPS_PATHS = AD-Borg-Restore-RH:/srv/data/rh, AD-Borg-Restore-Compta:/srv/data/compta
+; Quatre cas de figure pour montrer la diversité de syntaxe possible :
+;   - AD-Borg-Restore-RH       : UN SEUL répertoire, /srv/data/rh.
+;   - AD-Borg-Restore-Compta   : UN SEUL répertoire, /srv/data/compta.
+;   - AD-Borg-Restore-Direction: PLUSIEURS répertoires pour LE MÊME groupe ('|') — supervise RH ET
+;                                Compta, mais rien d'autre sur ce nick (pas /srv/data/commun).
+;   - AD-Borg-Restore-Audit    : MÊME répertoire qu'un autre groupe (/srv/data/compta, comme
+;                                Compta) — deux groupes distincts peuvent tout à fait partager le
+;                                même périmètre, ce n'est pas un raccourci réservé à un seul groupe.
+GROUPS_PATHS = AD-Borg-Restore-RH:/srv/data/rh, AD-Borg-Restore-Compta:/srv/data/compta, AD-Borg-Restore-Direction:/srv/data/rh|/srv/data/compta, AD-Borg-Restore-Audit:/srv/data/compta
 
 ; Résultat concret pour un membre de AD-Borg-Restore-RH (jamais AD-Borg-Admin-IT) interrogeant
 ; borgHelperWWW sur ce nick : TreeFind/Search/Restore fonctionnent normalement SOUS /srv/data/rh,
 ; mais un Restore visant /srv/data/compta/paie.xlsx (même en connaissant le chemin exact) est
-; refusé — le périmètre est vérifié côté serveur, jamais seulement caché côté UI.
+; refusé — le périmètre est vérifié côté serveur, jamais seulement caché côté UI. Un membre de
+; AD-Borg-Restore-Direction, lui, accède aux DEUX (/srv/data/rh ET /srv/data/compta) mais reste
+; refusé sur /srv/data/commun, absent de sa liste.

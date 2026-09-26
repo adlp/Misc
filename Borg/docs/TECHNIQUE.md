@@ -107,9 +107,10 @@ accessibles sans préfixe).
 - **`X-API-Key`** (header) — obligatoire sur toute route protégée, comparaison à temps constant.
 - **RBAC par groupes** (optionnel, `groups_header`) — un reverse proxy (OIDC/`auth_request`) injecte
   un header listant les groupes de l'appelant ; chaque nick porte `GROUPS_ADMIN`/`GROUPS_WRITE`/
-  `GROUPS_READ` (niveaux hiérarchiques) et optionnellement `GROUPS_PATHS` (restriction à un
-  sous-répertoire, orthogonale au niveau — jamais un tier de plus) dans son `.borghelperrc`. Exemple
-  complet (deux services restreints chacun à son propre répertoire pour des restaurations) :
+  `GROUPS_READ` (niveaux hiérarchiques) et optionnellement `GROUPS_PATHS` (restriction à un ou
+  plusieurs sous-répertoires, orthogonale au niveau — jamais un tier de plus) dans son
+  `.borghelperrc`. Exemple complet (un groupe borné à un seul répertoire, un groupe borné à plusieurs
+  répertoires à la fois, deux groupes distincts partageant le même répertoire) :
   [`docs/borghelperrc.example`](borghelperrc.example) et [DEPLOIEMENT.md §7](DEPLOIEMENT.md#7-rbac-par-groupes--restreindre-laccès-à-un-répertoire-ex-restaurations).
   Mécanique complète et avertissement de sécurité (le header est forgeable si le reverse proxy n'est
   pas la seule voie d'accès) : voir `TECHNICAL.md` et `README.md`, section RBAC.
