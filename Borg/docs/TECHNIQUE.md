@@ -99,7 +99,8 @@ vraie donnée, contrairement à `scopecache.db`.
 ### `<prefixe>-push-prefs.json` — préférences de notification (borgHelperWWW ≥ 1.19.0)
 
 Fichier : réglage `push_prefs`/`BORGHELPERWWW_PUSH_PREFS`, défaut à côté de `push.db`. Un objet par
-endpoint : nicks suivis (figés à l'abonnement), `notify_start`/`notify_end`, `expires_at` (`null` = à
+endpoint : hosts autorisés (figés à l'abonnement), réglages **par host** début/succès/échec
+(≥ 1.21.0), `expires_at` (`null` = à
 vie). Réglé depuis la vue 🔔 Notifications de l'UI, **éditable à la main** (pris en compte à chaud).
 Écritures atomiques sous verrou, mode `0600` ; un fichier corrompu n'est jamais écrasé (les routes
 `/push/*` répondent 500 tant qu'il n'est pas corrigé). À sauvegarder avec `push.db`.

@@ -1,5 +1,22 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.21.0 / borgHelperWWW_ui.html 1.12.0 — notifications réglables par host, type « échec » distinct — 2026-09-26
+
+Demande utilisateur : notifications paramétrables par host, et notifications en cas d'erreur.
+
+- **Par host, trois types** : début de sauvegarde, **succès**, **échec** (Bkp en erreur, ou bloqué
+  au-delà de `BORGHELPERWWW_BKP_STATUS_TIMEOUT`). Remplace le couple global début/fin. Défaut d'un
+  nouvel abonnement : succès + échec sur chaque host.
+- **UI** : tableau host × Début/Succès/Échec, ligne « Tous » par colonne. Les cases non enregistrées
+  ne sont plus effacées par un message de statut (ex. « Envoyer un test »).
+- **API** : `POST /push/subscribe` accepte `hosts` et `defaults` ; `PATCH` accepte `hosts` (host hors
+  périmètre de l'abonnement → 422) ; réponses : champ `hosts` au lieu de `notify_start`/`notify_end`.
+  `notify_start`/`notify_end` restent acceptés en entrée (compatibilité).
+- **Fichier JSON** : format 2 (`hosts`). Les entrées existantes sont converties à la lecture (début =
+  ancien début, succès et échec = ancienne fin), sans action requise.
+- `push_selftest` 54/54 ; essai réel : Bkp réussi sur un host réglé « échec seul » → aucune
+  notification ; Bkp en échec forcé → notification ❌ reçue.
+
 ## borgHelperWWW 1.20.2 / borgHelperWWW_ui.html 1.11.1 — envoi push : délai, TTL, diagnostic — 2026-09-26
 
 Rapport utilisateur : « Envoyer un test » ne provoque aucun affichage dans Firefox.

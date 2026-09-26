@@ -8,7 +8,7 @@
 
 import os,re,sys,io,json,sqlite3,secrets,subprocess,configparser,tarfile,hmac,hashlib,asyncio,contextlib,datetime,urllib.parse
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
 from collections import defaultdict
 
 from fastapi import FastAPI, APIRouter, Header, HTTPException, Query, Request, Depends
@@ -62,7 +62,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.20.2"
+WWW_VERSION="1.21.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -1027,7 +1027,7 @@ def _push_prefs_load():
     try:
         with open(PUSH_PREFS_FILE,encoding='utf-8') as f: data=json.load(f)
     except FileNotFoundError:
-        return {'version':1,'subscriptions':{}}
+        return {'version':2,'subscriptions':{}}
     except (OSError,ValueError) as e:
         raise PushPrefsError(f"{PUSH_PREFS_FILE} illisible ou JSON invalide ({e}) — jamais écrasé "
                              "automatiquement : corriger ou restaurer ce fichier") from e
@@ -1056,24 +1056,42 @@ def _push_prefs_update(fn):
     with _push_prefs_locked():
         data=_push_prefs_load()
         result=fn(data['subscriptions'])
-        data['version']=1
+        data['version']=2
         _push_prefs_save(data)
         return result
+
+# Types de notification, réglables PAR HOST (borgHelperWWW 1.21.0) : début de sauvegarde, fin en succès,
+# fin en échec (Bkp en erreur, ou bloqué au-delà de BKP_STATUS_TIMEOUT — AD-7).
+_PUSH_KINDS=('start','success','error')
+_PUSH_DEFAULT_HOST={'start':False,'success':True,'error':True}
 
 def _prefs_entry(raw):
     """Normalise une entrée (le fichier est éditable à la main) : jamais de crash sur une clé absente ou
     mal typée. Fail-closed : scope_nicks invalide -> [] (aucune notification) ; expires_at non nul mais
-    illisible -> considéré expiré, jamais « à vie » par accident. expires_at null/absent = « à vie »."""
+    illisible -> considéré expiré, jamais « à vie » par accident. expires_at null/absent = « à vie ».
+
+    `hosts` (format 2, 1.21.0) : {nick: {start,success,error}} — uniquement pour les nicks de
+    `scope_nicks` (périmètre figé à l'abonnement, AD-4 : un host ajouté à la main hors de ce périmètre
+    est ignoré) ; host du périmètre absent de `hosts`, ou valeur non booléenne -> False (rien envoyé).
+    Entrée au format 1 (sans clé `hosts` : notify_start/notify_end globaux, abonnements < 1.21.0) ->
+    convertie à la lecture : start=notify_start, success=error=notify_end, pour chaque nick."""
     e=raw if isinstance(raw,dict) else {}
     nicks=e.get('scope_nicks')
+    nicks=[n for n in nicks if isinstance(n,str)] if isinstance(nicks,list) else []
     exp=e.get('expires_at')
     if exp is not None:
         try: datetime.datetime.strptime(exp,_PUSH_TS_FMT)
         except (TypeError,ValueError): exp='1970-01-01 00:00:00'
-    return {'scope_nicks':[n for n in nicks if isinstance(n,str)] if isinstance(nicks,list) else [],
-            'notify_start':e.get('notify_start') is True,
-            'notify_end':e.get('notify_end',True) is True,
-            'expires_at':exp,
+    hosts={}
+    if 'hosts' not in e:
+        end=e.get('notify_end',True) is True
+        for n in nicks: hosts[n]={'start':e.get('notify_start') is True,'success':end,'error':end}
+    else:
+        raw_hosts=e['hosts'] if isinstance(e['hosts'],dict) else {}
+        for n in nicks:
+            h=raw_hosts.get(n); h=h if isinstance(h,dict) else {}
+            hosts[n]={k:h.get(k) is True for k in _PUSH_KINDS}
+    return {'scope_nicks':nicks,'hosts':hosts,'expires_at':exp,
             'updated_at':e.get('updated_at') if isinstance(e.get('updated_at'),str) else None}
 
 def _push_sub_dict(row,raw_prefs):
@@ -1082,7 +1100,7 @@ def _push_sub_dict(row,raw_prefs):
     aucune notification ne part alors (scope_nicks vide), un réabonnement (POST) la recrée."""
     p=_prefs_entry(raw_prefs)
     return {'id':row['id'],'endpoint':row['endpoint'],'scope_nicks':p['scope_nicks'],
-            'notify_start':p['notify_start'],'notify_end':p['notify_end'],'expires_at':p['expires_at'],
+            'hosts':p['hosts'],'expires_at':p['expires_at'],
             'created_at':row['created_at'],'updated_at':p['updated_at'],'prefs_missing':raw_prefs is None}
 
 def _migrate_push_prefs_from_db():
@@ -1140,17 +1158,18 @@ def _push_delete_endpoint(endpoint):
     prefs_deleted=_push_prefs_update(lambda subs: subs.pop(endpoint,None) is not None)
     return db_deleted or prefs_deleted
 
-def _push_subscriptions_for(nick,notify_col):
-    """Abonnements à notifier pour cet événement : entrée du fichier JSON avec le type demandé actif
-    (`notify_col` = 'notify_start'|'notify_end'), non expirée (expires_at null = « à vie », sinon
-    comparée en chaîne au format UTC commun), dont scope_nicks contient `nick` — puis clés p256dh/auth
-    lues dans push.db pour ces seuls endpoints (un endpoint sans ligne push.db est ignoré)."""
-    assert notify_col in ('notify_start','notify_end')
+def _push_subscriptions_for(nick,kind):
+    """Abonnements à notifier pour cet événement : entrée du fichier JSON avec le type `kind`
+    ('start'|'success'|'error') actif POUR CE HOST (`hosts[nick][kind]`, jamais un réglage global),
+    non expirée (expires_at null = « à vie », sinon comparée en chaîne au format UTC commun) — puis
+    clés p256dh/auth lues dans push.db pour ces seuls endpoints (un endpoint sans ligne push.db est
+    ignoré). `hosts` ne contient que des nicks de scope_nicks (voir _prefs_entry)."""
+    assert kind in _PUSH_KINDS
     now=_utc_now_str()
     wanted=[]
     for ep,raw in _push_prefs_load()['subscriptions'].items():
         p=_prefs_entry(raw)
-        if p[notify_col] and (p['expires_at'] is None or p['expires_at']>now) and nick in p['scope_nicks']:
+        if p['hosts'].get(nick,{}).get(kind) and (p['expires_at'] is None or p['expires_at']>now):
             wanted.append(ep)
     if not wanted: return []
     conn=_push_conn('read')
@@ -1168,9 +1187,10 @@ def _send_bkp_push(nick,event,result):
     jamais de retry (voir Design Notes du spec — la ligne bkp_status est déjà réclamée par CAS)."""
     if not _PYWEBPUSH_AVAILABLE or PUSH_VAPID_PRIVATE_KEY is None:
         return  # dépendance optionnelle (pywebpush/py_vapid) absente — voir avertissement au démarrage
-    notify_col='notify_start' if event=='start' else 'notify_end'
+    # Toute fin autre qu'un succès (erreur, timeout AD-7) est un échec — type 'error'.
+    kind='start' if event=='start' else ('success' if result=='success' else 'error')
     try:
-        subs=_push_subscriptions_for(nick,notify_col)
+        subs=_push_subscriptions_for(nick,kind)
     except (sqlite3.Error,PushPrefsError) as e:
         print(f"[watcher] push: erreur lecture abonnements nick={nick} : {e}",file=sys.stderr,flush=True)
         return
@@ -2404,15 +2424,31 @@ class PushKeysBody(BaseModel):
     p256dh: str=Field(min_length=1)
     auth: str=Field(min_length=1)
 
+class PushHostPrefs(BaseModel):
+    """Réglages d'un host : un champ omis prend la valeur par défaut d'un nouvel abonnement."""
+    start: bool=_PUSH_DEFAULT_HOST['start']
+    success: bool=_PUSH_DEFAULT_HOST['success']
+    error: bool=_PUSH_DEFAULT_HOST['error']
+
 class PushSubscribeBody(BaseModel):
     endpoint: str=Field(min_length=1)
     keys: PushKeysBody
-    notify_start: bool=False
-    notify_end: bool=True
+    # 1.21.0 : réglages par host. `defaults` s'applique à chaque host du périmètre absent de `hosts` ;
+    # un host de `hosts` hors du périmètre de l'appelant est ignoré (la réponse montre l'effectif).
+    defaults: Optional[PushHostPrefs]=None
+    hosts: Dict[str,PushHostPrefs]={}
+    # Hérités (API < 1.21.0), utilisés seulement si `defaults` est absent : notify_start -> start,
+    # notify_end -> success ET error.
+    notify_start: Optional[bool]=None
+    notify_end: Optional[bool]=None
     expires_in_days: Optional[int]=None  # absent -> défaut serveur ; null explicite -> « à vie »
 
 class PushPatchBody(BaseModel):
     endpoint: str=Field(min_length=1)
+    # Hosts fournis : réglages REMPLACÉS pour ces hosts seulement (les autres inchangés) ; un host hors
+    # du périmètre de l'abonnement -> 422.
+    hosts: Optional[Dict[str,PushHostPrefs]]=None
+    # Hérités (API < 1.21.0) : appliqués à TOUS les hosts de l'abonnement.
     notify_start: Optional[bool]=None
     notify_end: Optional[bool]=None
     expires_in_days: Optional[int]=None  # absent -> inchangé ; null explicite -> « à vie »
@@ -2465,7 +2501,14 @@ def push_subscribe(request: Request, body: PushSubscribeBody, x_api_key: Optiona
         conn.commit()
     finally:
         conn.close()
-    prefs={'scope_nicks':scope_nicks,'notify_start':body.notify_start,'notify_end':body.notify_end,
+    if body.defaults is not None:
+        base=body.defaults.dict()
+    else:
+        base=dict(_PUSH_DEFAULT_HOST)
+        if body.notify_start is not None: base['start']=body.notify_start
+        if body.notify_end is not None: base['success']=base['error']=body.notify_end
+    hosts={n:(body.hosts[n].dict() if n in body.hosts else dict(base)) for n in scope_nicks}
+    prefs={'scope_nicks':scope_nicks,'hosts':hosts,
            'expires_at':_expires_at_value(days),'updated_at':_utc_now_str()}
     def _set(subs): subs[body.endpoint]=prefs
     _prefs_or_500(lambda: _push_prefs_update(_set))
@@ -2476,7 +2519,7 @@ def push_subscribe(request: Request, body: PushSubscribeBody, x_api_key: Optiona
     return _push_sub_dict(row,prefs)
 
 @router.patch("/push/subscribe",tags=["mutation"],
-              summary="Modifier les préférences (notify_start/notify_end/expiration) d'un abonnement existant — jamais scope_nicks (AD-4)")
+              summary="Modifier les préférences (par host : début/succès/échec ; expiration) d'un abonnement existant — jamais scope_nicks (AD-4)")
 def push_subscribe_patch(body: PushPatchBody, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     row=_push_row(body.endpoint)
@@ -2486,17 +2529,24 @@ def push_subscribe_patch(body: PushPatchBody, x_api_key: Optional[str]=Header(de
     # notify_start/notify_end n'ont pas d'état « null » significatif (un type de notification est
     # actif ou non) — contrairement à expires_in_days, où null explicite a une sémantique claire
     # (« à vie ») : un null explicite ici est rejeté plutôt que traité comme absent.
-    for f in ('notify_start','notify_end'):
+    for f in ('notify_start','notify_end','hosts'):
         if f in fields_set and getattr(body,f) is None:
             raise HTTPException(422,detail=f"{f} ne peut pas être explicitement null — "
-                "omettre le champ pour ne pas le modifier, ou fournir true/false")
+                "omettre le champ pour ne pas le modifier")
     def _patch(subs):
         if body.endpoint not in subs:
             raise HTTPException(409,detail="Préférences absentes du fichier JSON pour cet endpoint "
                 "(fichier supprimé/édité ?) — se réabonner (POST /push/subscribe) pour les recréer")
         p=_prefs_entry(subs[body.endpoint])
-        for f in ('notify_start','notify_end'):
-            if f in fields_set: p[f]=getattr(body,f)
+        if body.hosts:
+            outside=sorted(n for n in body.hosts if n not in p['scope_nicks'])
+            if outside:
+                raise HTTPException(422,detail=f"Host(s) hors du périmètre de cet abonnement : "
+                    f"{', '.join(outside)} — périmètre figé à l'abonnement (se réabonner pour le rafraîchir)")
+            for n,h in body.hosts.items(): p['hosts'][n]=h.dict()
+        for h in p['hosts'].values():
+            if 'notify_start' in fields_set: h['start']=body.notify_start
+            if 'notify_end' in fields_set: h['success']=h['error']=body.notify_end
         if 'expires_in_days' in fields_set:
             # sort de « à vie », renouvelle, ou y repasse
             p['expires_at']=_expires_at_value(_resolve_push_expiry_days(body.expires_in_days))
@@ -2614,14 +2664,16 @@ def push_selftest():
             _push_prefs_update(lambda s: s.clear())
 
             # ── CRUD abonnement (préférences JSON) ──
-            _push_prefs_update(lambda s: s.__setitem__('ep1',{'scope_nicks':['n1','n2'],'notify_start':False,
-                'notify_end':True,'expires_at':_expires_at_value(30),'updated_at':_utc_now_str()}))
+            _push_prefs_update(lambda s: s.__setitem__('ep1',{'scope_nicks':['n1','n2'],
+                'hosts':{'n1':dict(_PUSH_DEFAULT_HOST),'n2':dict(_PUSH_DEFAULT_HOST)},
+                'expires_at':_expires_at_value(30),'updated_at':_utc_now_str()}))
             check("CRUD : création lisible",lambda: _push_prefs_load()['subscriptions']['ep1']['scope_nicks']==['n1','n2'])
-            def _upd(s): s['ep1']['notify_start']=True; s['ep1']['notify_end']=False
+            def _upd(s): s['ep1']['hosts']['n2']={'start':True,'success':False,'error':True}
             _push_prefs_update(_upd)
             def _upd_ok():
                 p=_prefs_entry(_push_prefs_load()['subscriptions']['ep1'])
-                return p['notify_start'] and not p['notify_end'] and p['scope_nicks']==['n1','n2']
+                return (p['hosts']['n2']=={'start':True,'success':False,'error':True}
+                        and p['hosts']['n1']==_PUSH_DEFAULT_HOST and p['scope_nicks']==['n1','n2'])
             check("CRUD : préférences mises à jour, scope_nicks intact (AD-4)",_upd_ok)
             _push_prefs_update(lambda s: s.pop('ep1',None))
             check("CRUD : suppression effective",lambda: 'ep1' not in _push_prefs_load()['subscriptions'])
@@ -2638,9 +2690,18 @@ def push_selftest():
             def _normalize_ok():
                 bad=_prefs_entry({'scope_nicks':'n1','notify_start':'yes','expires_at':'demain'})
                 missing=_prefs_entry(None)
-                return (bad['scope_nicks']==[] and bad['notify_start'] is False
+                # format 2 édité à la main : host hors périmètre ignoré, host du périmètre absent ou
+                # valeur non booléenne -> False (rien envoyé)
+                v2=_prefs_entry({'scope_nicks':['a','b','c'],'hosts':{'a':{'start':'oui','success':True,'error':1},
+                                 'b':'n/a','intrus':{'start':True,'success':True,'error':True}}})
+                # format 1 (< 1.21.0) : notify_start/notify_end globaux -> convertis par host
+                v1=_prefs_entry({'scope_nicks':['a'],'notify_start':True,'notify_end':False})
+                off={'start':False,'success':False,'error':False}
+                return (bad['scope_nicks']==[] and bad['hosts']=={}
                         and bad['expires_at']=='1970-01-01 00:00:00'  # illisible -> expiré, jamais « à vie »
-                        and missing['scope_nicks']==[] and missing['expires_at'] is None)
+                        and missing['scope_nicks']==[] and missing['expires_at'] is None
+                        and v2['hosts']=={'a':{'start':False,'success':True,'error':False},'b':off,'c':off}
+                        and v1['hosts']=={'a':{'start':True,'success':False,'error':False}})
             check("JSON : entrée mal formée -> normalisée fail-closed (aucun nick, expirée, jamais « à vie »)",
                   _normalize_ok)
 
@@ -2652,11 +2713,11 @@ def push_selftest():
                     except PushPrefsError: raised=True
                     else: raised=False
                     intact=open(PUSH_PREFS_FILE,encoding='utf-8').read()=='{ceci n\'est pas du json'
-                    try: _push_subscriptions_for('nickPush','notify_end'); sel_raised=False
+                    try: _push_subscriptions_for('nickPush','success'); sel_raised=False
                     except PushPrefsError: sel_raised=True
                     return raised and intact and sel_raised
                 finally:
-                    _push_prefs_save({'version':1,'subscriptions':{}})
+                    _push_prefs_save({'version':2,'subscriptions':{}})
             check("JSON : fichier corrompu -> PushPrefsError, jamais écrasé ni lu comme vide",_corrupt_never_overwritten)
 
             # ── scope_nicks via GROUPS_HEADER (_scope_nicks_for_groups, eff>=1) — jamais exercé
@@ -2756,6 +2817,31 @@ def push_selftest():
             check("push : événement 'start' n'envoie qu'aux abonnements notify_start=1 (jamais notify_end seul)",
                   lambda: {e for e,_ in sent_to}=={'push-ep-notifystart-only'})
 
+            # ── Réglages PAR HOST + type 'error' (1.21.0) — hosts hA/hB dédiés, sans interférence avec
+            # les abonnements nickPush ci-dessus (réutilisés plus bas) ──
+            def _insert_v2(endpoint,hosts):
+                conn.execute("INSERT INTO push_subscriptions (endpoint,p256dh,auth,scope_nicks) VALUES (?,?,?,'[]')",
+                             (endpoint,'p256','auth')); conn.commit()
+                _push_prefs_update(lambda s: s.__setitem__(endpoint,{'scope_nicks':sorted(hosts),'hosts':hosts,
+                    'expires_at':None}))
+            T,F=True,False
+            _insert_v2('ep-err-only',{'hA':{'start':F,'success':F,'error':T},'hB':{'start':T,'success':T,'error':T}})
+            _insert_v2('ep-success-only',{'hA':{'start':F,'success':T,'error':F}})
+            _insert_v2('ep-hB-only',{'hA':{'start':F,'success':F,'error':F},'hB':{'start':F,'success':T,'error':T}})
+            def _sent(nick,event,result):
+                sent_to.clear()
+                with mock.patch(f"{__name__}.webpush",side_effect=_fake_webpush): _send_bkp_push(nick,event,result)
+                return {e for e,_ in sent_to}
+            check("push par host : échec sur hA -> seuls les abonnés « échec » de hA",
+                  lambda: _sent('hA','end','error')=={'ep-err-only'})
+            check("push par host : succès sur hA -> seuls les abonnés « succès » de hA",
+                  lambda: _sent('hA','end','success')=={'ep-success-only'})
+            check("push par host : début sur hA -> personne ; début sur hB -> abonné « début » de hB seul",
+                  lambda: _sent('hA','start',None)==set() and _sent('hB','start',None)=={'ep-err-only'})
+            check("push par host : fin non-succès (timeout, autre) traitée comme un échec",
+                  lambda: _sent('hB','end',None)=={'ep-err-only','ep-hB-only'})
+            for _ep in ('ep-err-only','ep-success-only','ep-hB-only'): _push_delete_endpoint(_ep)
+
             # ── Routes HTTP de bout en bout (TestClient, sans lifespan : le watcher ne démarre pas) ──
             # httpx (requis par TestClient) n'est pas forcément installé en production : contrôles
             # sautés et signalés plutôt qu'un FAIL trompeur.
@@ -2766,22 +2852,37 @@ def push_selftest():
             else:
                 client=TestClient(app); H={'X-API-Key':API_KEY}; P=API_PREFIX
                 ep='https://push.example.invalid/ep-route'
+                all_nicks=_nick_list('ALL'); h0=all_nicks[0]
                 r=client.post(f"{P}/push/subscribe",headers=H,json={'endpoint':ep,'keys':{'p256dh':'p','auth':'a'},
-                              'notify_start':True,'notify_end':False,'expires_in_days':None})
+                              'defaults':{'start':False,'success':False,'error':True},
+                              'hosts':{h0:{'start':True,'success':True,'error':False},'nick-hors-perimetre':{'start':True}},
+                              'expires_in_days':None})
                 def _post_ok():
-                    e=_push_prefs_load()['subscriptions'].get(ep)
-                    return (r.status_code==200 and r.json()['notify_start'] is True and r.json()['expires_at'] is None
-                            and e is not None and e['notify_end'] is False and e['expires_at'] is None
+                    e=_prefs_entry(_push_prefs_load()['subscriptions'].get(ep))
+                    others=[n for n in all_nicks if n!=h0]
+                    return (r.status_code==200 and r.json()['expires_at'] is None
+                            and e['hosts'][h0]=={'start':True,'success':True,'error':False}
+                            and all(e['hosts'][n]=={'start':False,'success':False,'error':True} for n in others)
+                            and 'nick-hors-perimetre' not in e['hosts'] and r.json()['hosts']==e['hosts']
                             and conn.execute("SELECT 1 FROM push_subscriptions WHERE endpoint=?",(ep,)).fetchone())
-                check("route POST /push/subscribe : clés -> push.db, préférences -> JSON (« à vie »)",_post_ok)
-                r=client.patch(f"{P}/push/subscribe",headers=H,json={'endpoint':ep,'notify_end':True,'expires_in_days':7})
-                check("route PATCH /push/subscribe : préférences modifiées dans le JSON, scope_nicks intact",
-                      lambda: r.status_code==200 and _push_prefs_load()['subscriptions'][ep]['notify_end'] is True
+                check("route POST /push/subscribe : clés -> push.db, réglages par host (defaults + hosts, hors périmètre ignoré) -> JSON",_post_ok)
+                r=client.patch(f"{P}/push/subscribe",headers=H,json={'endpoint':ep,
+                               'hosts':{h0:{'start':False,'success':False,'error':True}},'expires_in_days':7})
+                check("route PATCH /push/subscribe : réglages du host modifiés dans le JSON, autres hosts et scope_nicks intacts",
+                      lambda: r.status_code==200
+                              and _prefs_entry(_push_prefs_load()['subscriptions'][ep])['hosts'][h0]=={'start':False,'success':False,'error':True}
                               and _push_prefs_load()['subscriptions'][ep]['expires_at'] is not None
                               and r.json()['scope_nicks']==_push_prefs_load()['subscriptions'][ep]['scope_nicks'])
+                before=open(PUSH_PREFS_FILE,encoding='utf-8').read()
+                r=client.patch(f"{P}/push/subscribe",headers=H,json={'endpoint':ep,'hosts':{'nick-hors-perimetre':{'start':True}}})
+                check("route PATCH : host hors périmètre -> 422, rien écrit",
+                      lambda: r.status_code==422 and open(PUSH_PREFS_FILE,encoding='utf-8').read()==before)
+                r=client.patch(f"{P}/push/subscribe",headers=H,json={'endpoint':ep,'notify_end':True})
+                check("route PATCH hérité (notify_end) : succès+échec activés sur tous les hosts",
+                      lambda: r.status_code==200 and all(h['success'] and h['error'] for h in r.json()['hosts'].values()))
                 r=client.get(f"{P}/push/subscriptions",headers=H,params={'endpoint':ep})
                 check("route GET /push/subscriptions : fusion push.db + JSON",
-                      lambda: r.status_code==200 and r.json()['subscriptions'][0]['notify_end'] is True
+                      lambda: r.status_code==200 and r.json()['subscriptions'][0]['hosts'][h0]['error'] is True
                               and r.json()['subscriptions'][0]['prefs_missing'] is False)
                 _push_prefs_update(lambda s: s.pop(ep))
                 r=client.patch(f"{P}/push/subscribe",headers=H,json={'endpoint':ep,'notify_end':False})

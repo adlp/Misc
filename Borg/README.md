@@ -1651,8 +1651,11 @@ groupes](#autorisation-par-groupes-reverse-proxy-oidcauth_request) ci-dessus).
 **Depuis l'UI (Story 2c, `spec-push-ui-prefs-json`)** : bouton **🔔 Notifications** dans l'en-tête
 (affiché une fois connecté, si `GET /version` indique `push_available: true` — `pywebpush`/`py_vapid`
 disponibles et Service Worker déployé). La vue permet de s'abonner (le navigateur demande la
-permission), de cocher début et/ou fin de sauvegarde, de choisir la durée (défaut serveur, 7/30/90/365
-jours, ou « à vie »), d'**envoyer un test**, de modifier ses réglages et de se désabonner. Réglages
+permission), de régler **host par host** trois types de notification — **début** de sauvegarde,
+**succès**, **échec** (Bkp en erreur, ou bloqué au-delà de `BORGHELPERWWW_BKP_STATUS_TIMEOUT`) — avec
+une ligne « Tous » pour cocher une colonne entière (défaut d'un nouvel abonnement : succès + échec),
+de choisir la durée (défaut serveur, 7/30/90/365 jours, ou « à vie »), d'**envoyer un test**, de
+modifier ses réglages et de se désabonner (borgHelperWWW ≥ 1.21.0 / UI ≥ 1.12.0). Réglages
 propres à chaque navigateur. **Exige HTTPS** (ou `localhost`) : un navigateur refuse les notifications
 push sur une page non sécurisée. Service Worker : fichier statique `borgHelperWWW_sw.js` (à côté de
 l'UI), servi sur `GET /sw.js` sans `X-API-Key` (un navigateur ne peut pas ajouter d'en-tête à
@@ -1668,15 +1671,23 @@ abonné, indexés par `endpoint`, **éditable à la main** et pris en compte à 
   "subscriptions": {
     "https://fcm.googleapis.com/fcm/send/...": {
       "expires_at": null,
-      "notify_end": true,
-      "notify_start": false,
-      "scope_nicks": ["srv-web", "srv-db"],
+      "hosts": {
+        "srv-db":  {"error": true, "start": false, "success": false},
+        "srv-web": {"error": true, "start": true,  "success": true}
+      },
+      "scope_nicks": ["srv-db", "srv-web"],
       "updated_at": "2026-09-26 18:28:06"
     }
   },
-  "version": 1
+  "version": 2
 }
 ```
+
+`scope_nicks` : hosts autorisés, figés à l'abonnement (droits de l'appelant à ce moment-là) — un host
+ajouté à la main dans `hosts` hors de cette liste est ignoré ; un host de la liste absent de `hosts`,
+ou une valeur non booléenne, ne produit aucune notification. Une entrée à l'ancien format (≤ 1.20,
+`notify_start`/`notify_end` globaux) est convertie à la lecture : début = `notify_start`, succès et
+échec = `notify_end`, pour chaque host.
 
 `expires_at` : `null` = « à vie », sinon date UTC `AAAA-MM-JJ HH:MM:SS`. Écritures atomiques (fichier
 temporaire + renommage, mode `0600`) sous verrou (`<fichier>.lock`, plusieurs workers uvicorn). Une
@@ -1713,15 +1724,17 @@ compte séparée, voir Design Notes du spec), pas un oubli.
 curl -X POST http://localhost:8000/api/push/subscribe -H "X-API-Key: $KEY" -H "Content-Type: application/json" -d '{
   "endpoint": "https://push.example.com/ep1",
   "keys": {"p256dh": "...", "auth": "..."},
-  "notify_start": true, "notify_end": true,
+  "defaults": {"start": false, "success": false, "error": true},
+  "hosts": {"srv-web": {"start": true, "success": true, "error": true}},
   "expires_in_days": 30
 }'
 ```
 
 | Paramètre | Défaut si absent | `null` explicite |
 |-----------|-------------------|-------------------|
-| `notify_start` | `false` | rejeté (`422`) — pas d'état « null » significatif pour un type de notification |
-| `notify_end` | `true` | rejeté (`422`) — idem |
+| `hosts` | `{}` — `{nick: {start, success, error}}` ; un host hors du périmètre de l'appelant est ignoré (la réponse montre les réglages effectifs) ; un champ omis prend sa valeur par défaut | — |
+| `defaults` | `{"start": false, "success": true, "error": true}` — appliqué à chaque host du périmètre absent de `hosts` | — |
+| `notify_start` / `notify_end` | hérités (API ≤ 1.20), utilisés seulement sans `defaults` : début / succès+échec pour tous les hosts | rejeté (`422`) en `PATCH` |
 | `expires_in_days` | `BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS` (déf. 30) | « à vie » (`expires_at` = `NULL`, jamais d'expiration automatique) |
 
 `expires_in_days` est borné à `[1, 3650]` jours (`PUSH_MAX_EXPIRY_DAYS`) — une valeur hors bornes
@@ -1737,11 +1750,15 @@ doublon) et **recalcule** `scope_nicks` à ce nouveau moment : une personne qui 
 explicitement après un changement de ses groupes rafraîchit ainsi son périmètre sans devoir d'abord se
 désabonner. Entre deux souscriptions, `scope_nicks` n'est en revanche **jamais** recalculé
 dynamiquement (AD-4) — seule `PATCH /push/subscribe` peut ensuite modifier les préférences
-(`notify_start`/`notify_end`/`expires_in_days`, jamais `scope_nicks`) :
+(`hosts`, `expires_in_days`, jamais `scope_nicks`). Les hosts fournis voient leurs réglages
+**remplacés**, les autres restent inchangés ; un host hors du périmètre de l'abonnement → `422`, rien
+n'est écrit :
 
 ```bash
 curl -X PATCH http://localhost:8000/api/push/subscribe -H "X-API-Key: $KEY" -H "Content-Type: application/json" -d '{
-  "endpoint": "https://push.example.com/ep1", "notify_end": false, "expires_in_days": null
+  "endpoint": "https://push.example.com/ep1",
+  "hosts": {"srv-db": {"start": false, "success": false, "error": true}},
+  "expires_in_days": null
 }'
 # 404 explicite si l'endpoint est inconnu — jamais de création silencieuse (PATCH != POST)
 # 409 si l'endpoint est connu de push.db mais sans entrée dans le fichier JSON (fichier supprimé/édité)
@@ -1764,7 +1781,7 @@ Réponse commune à `POST`/`PATCH`/`GET` (un ou plusieurs objets de cette forme)
 
 ```json
 {"id": 1, "endpoint": "...", "scope_nicks": ["demo-modules"],
- "notify_start": true, "notify_end": true,
+ "hosts": {"demo-modules": {"start": false, "success": true, "error": true}},
  "expires_at": "2026-10-26 07:48:45", "created_at": "2026-09-26 07:48:45",
  "updated_at": "2026-09-26 07:48:45", "prefs_missing": false}
 ```
@@ -1796,8 +1813,9 @@ sur des fichiers temporaires uniquement).
 Le watcher `bkp_status` (voir `POST /bkp` asynchrone ci-dessus) ne se contente plus de journaliser :
 à chaque réclamation CAS gagnée — **début** de sauvegarde (`started_at` écrit, aucun délai à
 attendre) **et** fin (succès, échec, ou timeout AD-7) — il envoie un push réel (`pywebpush`) à chaque
-abonnement dont les préférences (fichier JSON) contiennent le nick concerné dans `scope_nicks`, non
-expiré, avec le type correspondant actif (`notify_start`/`notify_end`). Payload JSON (affiché par le
+abonnement non expiré dont les préférences (fichier JSON) activent, **pour ce host**, le type
+correspondant : `start` pour un début, `success` pour une fin réussie, `error` pour toute autre fin
+(erreur, timeout AD-7). Payload JSON (affiché par le
 Service Worker) : `{"nick":..., "event":"start"|"end"|"test", "result":"success"|"error"|null,
 "timestamp":...}` — `result` toujours `null` pour un début ou un test.
 

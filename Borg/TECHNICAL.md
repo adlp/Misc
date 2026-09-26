@@ -2697,6 +2697,22 @@ n'envoie aucun en-tête personnalisé à l'enregistrement d'un Service Worker), 
 `Service-Worker-Allowed: /`. Contenu : `push` → `showNotification` (tag `bkp-<nick>`, une fin remplace
 le début), `notificationclick` → focus d'un onglet existant ou `openWindow('/')`. Aucun cache hors-ligne.
 
+**Réglages par host (1.21.0, format 2)** : entrée `{"scope_nicks":[...],"hosts":{nick:{"start","success",
+"error"}},"expires_at","updated_at"}`. `_prefs_entry` ne garde `hosts` que pour les nicks de
+`scope_nicks` (AD-4 : un host ajouté à la main hors périmètre est ignoré) ; host absent/valeur non
+booléenne → `False`. Entrée format 1 (sans clé `hosts`) convertie à la lecture (start=`notify_start`,
+success=error=`notify_end`) — aucune migration de fichier, réécrite au format 2 à la prochaine
+modification. `_push_subscriptions_for(nick, kind)` (`kind` ∈ `_PUSH_KINDS`) teste
+`hosts[nick][kind]` ; `_send_bkp_push` : `start` si début, `success` si `result=='success'`, sinon
+`error` (erreur, timeout AD-7). `POST` : `defaults` (sinon `_PUSH_DEFAULT_HOST` = succès+échec, ou
+champs hérités `notify_*`) appliqués aux hosts du périmètre absents de `hosts` ; hosts hors périmètre
+ignorés. `PATCH` : hosts fournis remplacés, hors périmètre → 422 levé dans la fonction de mise à jour
+(aucune écriture) ; `notify_*` hérités appliqués à tous les hosts. UI 1.12.0 : tableau host ×
+{Début, Succès, Échec} + ligne « Tous » (indéterminée si colonne mixte) ; formulaire redessiné
+seulement à l'ouverture/après enregistrement (`renderNotifForm`), jamais par un message de statut.
+Vérifié : `push_selftest` 54/54 ; essai réel (Bkp réussi sur un host « échec seul » → rien ; Bkp en
+échec forcé → push `result:error` reçu et déchiffré).
+
 **Envoi (1.20.2)** : `webpush(..., timeout=PUSH_SEND_TIMEOUT, ttl=...)` — sans `timeout`, pywebpush
 transmet `timeout=None` à `requests` (attente infinie si le service push est injoignable : bouton de
 test sans réponse) ; sans `ttl`, il envoie `TTL: 0`, le service push acceptant (201) puis jetant le

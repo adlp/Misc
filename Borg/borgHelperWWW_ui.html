@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.11.1 -->
+<!-- UI_VERSION: 1.12.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -249,13 +249,23 @@
     <button class="secondary" onclick="showMachines()">← Serveurs</button>
     <div class="card" style="max-width:640px">
       <h2 style="margin-top:0">Notifications de sauvegarde</h2>
-      <p class="hint">Notifications de ce navigateur au début et/ou à la fin des sauvegardes des serveurs
-        auxquels vous avez accès. Réglages propres à ce navigateur (un autre navigateur ou appareil
-        s'abonne séparément).</p>
+      <p class="hint">Notifications de ce navigateur au début des sauvegardes, à leur réussite et à leur
+        échec (erreur, ou sauvegarde bloquée), réglables host par host. Réglages propres à ce navigateur
+        (un autre navigateur ou appareil s'abonne séparément).</p>
       <div id="notifStatus" style="margin-bottom:12px"></div>
       <div id="notifForm" hidden>
-        <div class="field"><label style="display:inline;font-weight:500;color:var(--text)"><input type="checkbox" id="notifStart"> Début de sauvegarde</label></div>
-        <div class="field"><label style="display:inline;font-weight:500;color:var(--text)"><input type="checkbox" id="notifEnd" checked> Fin de sauvegarde (succès ou échec)</label></div>
+        <div class="field" style="overflow-x:auto">
+          <table id="notifHosts" style="width:auto">
+            <thead>
+              <tr><th style="text-align:left">Host</th><th>Début</th><th>Succès</th><th>❌ Échec</th></tr>
+              <tr><td><em>Tous</em></td>
+                <td style="text-align:center"><input type="checkbox" data-all="start" title="Cocher/décocher la colonne"></td>
+                <td style="text-align:center"><input type="checkbox" data-all="success" title="Cocher/décocher la colonne"></td>
+                <td style="text-align:center"><input type="checkbox" data-all="error" title="Cocher/décocher la colonne"></td></tr>
+            </thead>
+            <tbody id="notifHostsBody"></tbody>
+          </table>
+        </div>
         <div class="field" style="max-width:360px">
           <label for="notifExpiry">Durée de l'abonnement</label>
           <select id="notifExpiry"></select>
@@ -1434,8 +1444,60 @@ function expiryPayload(forPatch){
   if(v==='life') return null;
   return parseInt(v,10);
 }
-function notifTypesChecked(){
-  return document.getElementById('notifStart').checked || document.getElementById('notifEnd').checked;
+// Réglages par host (borgHelperWWW ≥ 1.21.0) : {nick: {start, success, error}}.
+const NOTIF_KINDS=['start','success','error'];
+const NOTIF_DEFAULT_HOST={start:false, success:true, error:true}; // = _PUSH_DEFAULT_HOST serveur
+
+// Hosts proposés : abonné -> périmètre figé côté serveur ; sinon hosts auxquels on a accès (/access).
+function notifHostList(){
+  if(notifServer && !notifServer.prefs_missing) return (notifServer.scope_nicks||[]).slice();
+  if(!myAccess||!myAccess.nicks) return [];
+  return Object.keys(myAccess.nicks).filter(n=>myAccess.nicks[n].level!=='none').sort();
+}
+function renderHostsTable(prefs){
+  const hosts=notifHostList();
+  const body=document.getElementById('notifHostsBody');
+  if(!hosts.length){ body.innerHTML='<tr><td colspan="4" class="hint">Aucun host accessible.</td></tr>'; updateNotifAll(); return; }
+  body.innerHTML=hosts.map(n=>{
+    const h=(prefs&&prefs[n])||NOTIF_DEFAULT_HOST;
+    return `<tr><td>${escapeHtml(n)}</td>`+NOTIF_KINDS.map(k=>
+      `<td style="text-align:center"><input type="checkbox" data-nick="${escapeAttr(n)}" data-kind="${k}"${h[k]?' checked':''}></td>`).join('')+'</tr>';
+  }).join('');
+  updateNotifAll();
+}
+function notifBoxes(kind){
+  return [...document.querySelectorAll('#notifHostsBody input[data-kind'+(kind?`="${kind}"`:'')+']')];
+}
+// Case « Tous » d'une colonne : cochée si toute la colonne l'est, indéterminée si mélange.
+function updateNotifAll(){
+  NOTIF_KINDS.forEach(k=>{
+    const all=document.querySelector(`#notifHosts input[data-all="${k}"]`), boxes=notifBoxes(k);
+    const on=boxes.filter(b=>b.checked).length;
+    all.checked=boxes.length>0 && on===boxes.length; all.indeterminate=on>0 && on<boxes.length;
+  });
+}
+document.getElementById('notifHosts').addEventListener('change', e=>{
+  const k=e.target.dataset.all;
+  if(k) notifBoxes(k).forEach(b=>{ b.checked=e.target.checked; });
+  updateNotifAll();
+});
+function collectHosts(){
+  const out={};
+  notifBoxes().forEach(b=>{ (out[b.dataset.nick]=out[b.dataset.nick]||{})[b.dataset.kind]=b.checked; });
+  return out;
+}
+function notifTypesChecked(){ return notifBoxes().some(b=>b.checked); }
+
+// Formulaire (tableau des hosts + durée) — redessiné seulement à l'ouverture et après un
+// enregistrement serveur, jamais par un simple message de statut (sinon des cases cochées mais pas
+// encore enregistrées seraient perdues, ex. en cliquant « Envoyer un test »).
+function renderNotifForm(){
+  const subscribed=!!(notifSub && notifServer && !notifServer.prefs_missing);
+  renderHostsTable(subscribed ? notifServer.hosts : null);
+  fillExpiry(subscribed ? notifServer.expires_at : undefined);
+  document.getElementById('notifDetails').textContent = subscribed
+    ? 'Liste des hosts figée à l\'abonnement (vos droits à ce moment-là) — se désabonner puis se réabonner pour la rafraîchir.'
+    : 'Hosts auxquels vous avez accès. Un host non coché ne produit aucune notification.';
 }
 
 async function openNotifications(){
@@ -1456,7 +1518,7 @@ async function openNotifications(){
     if(r.httpStatus!==200){ st.textContent=''; err.textContent=apiErr(r); return; }
     notifServer=(r.subscriptions||[])[0]||null;
   }
-  renderNotif();
+  renderNotif(); renderNotifForm();
 }
 
 function renderNotif(message){
@@ -1471,19 +1533,6 @@ function renderNotif(message){
   else if(subscribed) st.innerHTML='<span class="badge ok">✅ Abonné</span>'+(message?' '+escapeHtml(message):'');
   else if(notifSub && notifServer) st.innerHTML='<span class="badge warn">⚠️ Préférences absentes côté serveur</span> — se réabonner pour les recréer.';
   else st.innerHTML='<span class="badge warn">Non abonné</span>'+(message?' '+escapeHtml(message):'');
-  if(subscribed){
-    document.getElementById('notifStart').checked=notifServer.notify_start;
-    document.getElementById('notifEnd').checked=notifServer.notify_end;
-    fillExpiry(notifServer.expires_at);
-    const nicks=notifServer.scope_nicks||[];
-    document.getElementById('notifDetails').innerHTML=
-      'Serveurs suivis ('+nicks.length+') : '+(nicks.length?nicks.map(n=>escapeHtml(n)).join(', '):'<em>aucun</em>')+
-      '. Liste figée à l\'abonnement (vos droits à ce moment-là) — se désabonner puis se réabonner pour la rafraîchir.';
-  } else {
-    fillExpiry(undefined);
-    document.getElementById('notifDetails').textContent=
-      'Vous serez notifié pour tous les serveurs auxquels vous avez accès au moment de l\'abonnement.';
-  }
 }
 
 async function notifSubscribe(){
@@ -1506,32 +1555,30 @@ async function notifSubscribe(){
       sub=await reg.pushManager.subscribe({userVisibleOnly:true, applicationServerKey:key});
     }
     const j=sub.toJSON();
-    const body={endpoint:j.endpoint, keys:{p256dh:j.keys.p256dh, auth:j.keys.auth},
-                notify_start:document.getElementById('notifStart').checked,
-                notify_end:document.getElementById('notifEnd').checked};
+    // hosts : réglages des hosts affichés ; un host du périmètre serveur absent de l'affichage reçoit
+    // les réglages par défaut (defaults omis -> défaut serveur).
+    const body={endpoint:j.endpoint, keys:{p256dh:j.keys.p256dh, auth:j.keys.auth}, hosts:collectHosts()};
     const exp=expiryPayload(false); if(exp!==undefined) body.expires_in_days=exp;
     const r=await apiJson('POST','/push/subscribe',body);
     if(r.httpStatus!==200){ err.textContent=apiErr(r); return; }
     notifSub=sub; notifServer=r;
-    renderNotif('Abonnement enregistré — « Envoyer un test » pour vérifier.');
+    renderNotif('Abonnement enregistré — « Envoyer un test » pour vérifier.'); renderNotifForm();
   }catch(e){ err.textContent='Abonnement impossible : '+e.message; }
   finally{ btn.disabled=false; }
 }
 
 async function notifSave(){
   const err=document.getElementById('notifError'); err.textContent='';
-  if(!notifTypesChecked()){ err.textContent='Aucun type coché : utiliser plutôt « Se désabonner ».'; return; }
-  const body={endpoint:notifSub.endpoint,
-              notify_start:document.getElementById('notifStart').checked,
-              notify_end:document.getElementById('notifEnd').checked};
+  if(!notifTypesChecked()){ err.textContent='Aucune case cochée : utiliser plutôt « Se désabonner ».'; return; }
+  const body={endpoint:notifSub.endpoint, hosts:collectHosts()};
   const exp=expiryPayload(true); if(exp!==undefined) body.expires_in_days=exp;
   const r=await apiJson('PATCH','/push/subscribe',body);
   if(r.httpStatus!==200){
     err.textContent=apiErr(r);
-    if(r.httpStatus===404||r.httpStatus===409){ notifServer=null; renderNotif(); }
+    if(r.httpStatus===404||r.httpStatus===409){ notifServer=null; renderNotif(); renderNotifForm(); }
     return;
   }
-  notifServer=r; renderNotif('Réglages enregistrés.');
+  notifServer=r; renderNotif('Réglages enregistrés.'); renderNotifForm();
 }
 
 async function notifTest(){
@@ -1549,7 +1596,7 @@ async function notifTest(){
   }
   renderNotif();
   err.textContent=apiErr(r);
-  if(r.httpStatus===410){ notifSub=null; notifServer=null; renderNotif(); }
+  if(r.httpStatus===410){ notifSub=null; notifServer=null; renderNotif(); renderNotifForm(); }
 }
 
 async function notifLocalTest(){
@@ -1572,7 +1619,7 @@ async function notifUnsubscribe(){
   if(r.httpStatus!==200) err.textContent='Serveur : '+apiErr(r);
   try{ await notifSub.unsubscribe(); }catch(e){ /* déjà désabonné côté navigateur */ }
   notifSub=null; notifServer=null;
-  renderNotif('Désabonné.');
+  renderNotif('Désabonné.'); renderNotifForm();
 }
 
 // ── Utils ─────────────────────────────────────────────────────────────────
