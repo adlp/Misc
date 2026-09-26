@@ -1,5 +1,13 @@
 # Changelog — borgHelper
 
+## borgHelperWWW_ui.html 1.13.3 — étiquette du serveur en cours à la place de « ← Serveurs » — 2026-09-26
+
+- Pages « détail d'un serveur » et « Historique complet » : le bouton « ← Serveurs » est remplacé par
+  une étiquette **🖥 nom du serveur**. Le retour à la liste reste possible par le bouton **Serveurs** de
+  l'en-tête (déjà présent sur toutes les pages). Page 🔔 Notifications inchangée (pas propre à un
+  serveur) ; explorateur inchangé (son bouton « ← Retour au serveur » ramène au détail ou à
+  l'Historique).
+
 ## borgHelperWWW 1.24.0 / borgHelper 1.0.119 / UI 1.13.2 / borgHelperWWW_sw.js 1.2.0 — notification « sauvegarde en retard » — 2026-09-26
 
 Demande utilisateur : un serveur non sauvegardé depuis plus de `MAX_AGE_BKP` heures est une erreur —

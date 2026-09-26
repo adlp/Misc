@@ -1408,6 +1408,8 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
    actions qui en ont besoin (repérées par 🔑) ; les actions destructives (`Prune`, `DelBkp`, `Restore`,
    `IdxPurge`, `Init`) demandent une confirmation avant exécution. Le résultat brut (`exitcode`, `stdout`,
    `stderr`) s'affiche tel quel. Bouton **🗂 Explorer l'arborescence** dans le bandeau du serveur.
+   En haut de cette page et de l'Historique complet (UI ≥ 1.13.3), une étiquette **🖥 nom du serveur**
+   rappelle le serveur en cours ; retour à la liste par le bouton **Serveurs** de l'en-tête.
 4. **Explorateur d'arborescence** (`TreeHist -j`) : navigation façon gestionnaire de fichiers. Colonnes
    **Droits** (ls-style, `drwxr-xr-x`…) et **Propriétaire** (`user:group (uid:gid)`) affichées pour
    chaque entrée — dernier état connu. Chaque navigation (clic sur un dossier, sur le fil d'Ariane, sur
