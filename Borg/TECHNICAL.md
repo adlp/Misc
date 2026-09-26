@@ -493,9 +493,14 @@ IDX_EXCLUDE = */.git/* */.git
 
 ---
 
-## Priorité Bkp/Restore sur Index
+## Priorité Bkp/Restore/Prune sur Index
 
-`Bkp` et `Restore` sont prioritaires sur `Index` à tout moment — quelle que soit l'étape en cours.
+`Bkp`, `Restore` et (depuis `spec-status-cli-etat-rapide`, `borgHelper` 1.0.111) `Prune` sont
+prioritaires sur `Index` à tout moment — quelle que soit l'étape en cours. `prune()` ne posait aucun
+`priority.lock` jusqu'ici, contrairement à `backup()`/`restore()` — corrigé pour que la commande
+`Status` (ci-dessous) puisse détecter un Prune en cours ; même patron exact (`set_priority_lock` avant
+tout appel `boex`, `clear_priority_lock` dans un `finally` couvrant tout le corps, y compris
+`--dry-run` et le cas d'exception).
 
 ### Mécanisme — lock PID
 
@@ -2265,6 +2270,55 @@ uniquement par `bkp_status`.
   `finished_at`/`result='success'` à la fin réelle du `Bkp` (~12s plus tard sur ce jeu de données) ;
   log serveur `[watcher] bkp_status (fin) réclamé : nick=demo-modules run_id=... result=success` dans
   le balayage suivant.
+
+## `Status` — état rapide par nick (`borgHelper` 1.0.111, `spec-status-cli-etat-rapide`)
+
+Commande CLI en lecture seule, **100% locale — jamais d'appel `boex`/`borg`** (contrairement à
+`LstBkp`/`GetLastBkp`, qui interrogent le dépôt en direct). Trois sources, toutes déjà en base :
+
+1. **Dernier backup connu** : `SELECT archive,archive_date FROM archive_stats WHERE nick=? ORDER BY
+   archive_date DESC LIMIT 1` — gabarit exact de `list_files()` (`borgHelper:2735` avant cette story).
+2. **Bkp en cours** : `BorgHelperDB.get_running_bkp_status(nick, db_path=None)` (nouvelle méthode,
+   voisine de `list_pending_bkp_status`/`claim_bkp_status`, même style) — `SELECT run_id,started_at
+   FROM bkp_status WHERE nick=? AND finished_at IS NULL ORDER BY started_at DESC LIMIT 1`. Lecture
+   seule, aucune réclamation (`notified_at` intact).
+3. **Opération prioritaire en cours** : `check_priority_lock(nick)` (déjà existant, réutilisé tel
+   quel) — voir la nouvelle section « Priorité Bkp/Restore/Prune sur Index » ci-dessus pour le
+   changement sur `prune()`.
+
+### Ambiguïté Restore/Prune assumée
+
+`priority.lock` ne porte aucune information sur l'opération qui le tient — seulement qu'une opération
+prioritaire (Bkp/Restore/Prune) est active. `Status` ne tente donc jamais de distinguer Restore de
+Prune : si `check_priority_lock(nick)` est vrai et qu'aucun Bkp n'est détecté par `bkp_status`,
+le message est « Opération prioritaire en cours (Restore ou Prune) ». Une seconde table de statut par
+opération résoudrait l'ambiguïté mais est hors périmètre (chantier futur si le besoin se confirme).
+
+### Affichage texte vs JSON
+
+En texte, l'opération prioritaire n'est **jamais affichée si un Bkp est aussi détecté** — redondant,
+puisque c'est le Bkp lui-même qui tient ce lock. En JSON (`-j`), `priority_op_running` reste le
+booléen **brut** de `check_priority_lock(nick)`, indépendamment de `bkp_running` — c'est au
+consommateur machine de corréler les deux s'il le souhaite ; la sortie JSON est toujours une **liste**
+`[{nick,last_backup,bkp_running,priority_op_running}, ...]`, même à un seul nick, pour une forme
+homogène (contrairement à `RepoHistory`/`ArchiveHistory`, qui renvoient un objet unique et rejettent
+le multi-nick).
+
+### Vérification
+
+- `CodecSelfTest` : `prune()` pose/relâche bien `priority.lock` (succès et exception, `boex`
+  monkeypatché — `check_priority_lock` a une exception self-PID, voir `_check_pid_lock` ci-dessus,
+  donc le test lit directement l'existence du fichier de lock plutôt que d'appeler
+  `check_priority_lock` depuis le même process) ; `get_running_bkp_status` (aucune ligne / une ligne en
+  cours / une ligne déjà terminée exclue) ; `Status` sur un jeu de nicks à états mélangés (dernier
+  backup présent/absent, Bkp en cours détecté, opération prioritaire seule simulée via un PID externe
+  vivant écrit directement dans le fichier de lock — `set_priority_lock` avec le PID du process de
+  test aurait été vu comme « non tenu » par la même exception self-PID) — 317/317 `OK`.
+- Vérification manuelle réelle sur `demo.borghelperrc` : `Bkp` réel lancé en arrière-plan, `Status`
+  interrogé en boucle depuis un autre process pendant l'exécution — capture « Bkp en cours depuis
+  HH:MM (XhYYmin) » pendant la fenêtre d'exécution, dernier backup + âge après coup ; idem avec un
+  `Prune` réel — capture « Opération prioritaire en cours (Restore ou Prune) » pendant l'exécution,
+  disparu après coup.
 
 ## `push.db` — clés VAPID et abonnements push (`borgHelperWWW` 1.17.0 Story 2a / 1.18.0 Story 2b de `spec-notifications-push`)
 

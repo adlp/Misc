@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.110"
+Version="1.0.111"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -192,6 +192,26 @@ def d2DateNSince(datepourrie):
     datelisible=datetime.strptime(datepourrie,"%Y-%m-%dT%H:%M:%S.%f")
     since=(now-datelisible).total_seconds()/60/60
     return {'since':since,'date':datelisible.strftime("%Y/%m/%d %H:%M:%S")}
+
+def _age_readable(since_hours):
+    """'il y a XhYY' depuis un nombre d'heures (float, voir d2DateNSince) — utilisé par Status pour
+    l'âge du dernier backup connu."""
+    total_min=int(round(since_hours*60))
+    h,m=divmod(max(total_min,0),60)
+    return f"il y a {h}h{m:02d}"
+
+def _bkp_running_readable(started_at):
+    """'HH:MM (XhYYmin)' depuis un started_at bkp_status (écrit via sqlite datetime('now'), donc UTC —
+    voir borgHelperWWW _expires_matches pour le même constat). Conversion UTC->local par offset naïf
+    (pas de zoneinfo dans ce projet), uniquement pour l'affichage de l'heure de début ; l'écoulé est
+    calculé en UTC des deux côtés (pas d'offset possible dessus)."""
+    from datetime import datetime
+    started_utc=datetime.strptime(started_at,"%Y-%m-%d %H:%M:%S")
+    now_utc=datetime.utcnow()
+    started_local=started_utc+(datetime.now()-now_utc)
+    total_min=int((now_utc-started_utc).total_seconds()//60)
+    h,m=divmod(max(total_min,0),60)
+    return f"{started_local.strftime('%H:%M')} ({h}h{m:02d}min)"
 
 def prettyTabelise(tab):
     from prettytable import PrettyTable
@@ -418,6 +438,9 @@ def usage(doc=None,debug=0):
         printer("   -c ArchiveHistory -n nick -j")
         printer("       Historique brut archive_stats (archive/archive_date/duration/tailles/nfiles), ordre chronologique")
         printer("       Un seul nick à la fois  |  destiné à l'API (borgHelperWWW /archivehistory)")
+        printer("   -c Status [-n nick1,nick2/ALL] [-j]")
+        printer("       État rapide par nick : dernier backup connu, Bkp en cours, opération prioritaire")
+        printer("       (Restore/Prune, ambigu) — 100% local, jamais d'appel borg  |  -n ALL/multi-nick natif  |  -j : JSON")
         printer("⚡️ -c IdxPurge [-x <pattern>] [-n nick/ALL] [-D]")
         printer("       Purge rétroactive de diff_index + anciens snapshots + VACUUM  (-D : dry-run)")
         printer("       Sans -x : lit IDX_EXCLUDE/IDX_INCLUDE depuis le borghelperrc")
@@ -562,6 +585,15 @@ def usage(doc=None,debug=0):
         printer("   -c ArchiveHistory -n nick -j")
         printer("       Historique brut archive_stats (colonnes brutes, ordre chronologique par archive_date) — un seul nick")
         printer("       Sans -j : message court, pas de crash (commande destinée à l'API)")
+    elif doc=='status':
+        printer("   -c Status [-n nick1,nick2/ALL] [-j]")
+        printer("       État rapide (dernier backup connu + âge, Bkp en cours depuis quand, opération")
+        printer("       prioritaire Restore/Prune en cours) par nick — 100% local, lit archive_stats/")
+        printer("       bkp_status/priority.lock, jamais d'appel borg (rapide, hors ligne)")
+        printer("       -n nick1,nick2 ou ALL : plusieurs nicks nativement (contrairement à RepoHistory/")
+        printer("       ArchiveHistory)  |  -j : JSON, toujours une liste [{nick,last_backup,bkp_running,")
+        printer("       priority_op_running}, ...]")
+        printer("       Restore et Prune ne sont pas distingués (priority.lock ne porte pas cette info)")
     elif doc=='idxpurge':
         printer("   -c IdxPurge [-x <pattern>] [-n nick/servername/ALL] [-D]")
         printer("       Purge rétroactive des entrées diff_index + anciens snapshots + VACUUM")
@@ -1712,6 +1744,32 @@ class BorgHelperDB:
             finally: conn.close()
         try: return self._with_lock_retry(_do)
         except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
+
+    def get_running_bkp_status(self,nick,db_path=None):
+        """Ligne bkp_status la plus récente encore en cours (finished_at IS NULL) pour ce nick, s'il y
+        en a une (normalement 0 ou 1, jamais plus — un seul Bkp actif à la fois par nick via
+        priority.lock). Lecture seule, aucune réclamation — utilisée par la commande Status (100%
+        locale, jamais d'appel boex)."""
+        if db_path is None: db_path=self.get_diff_db(nick)
+        # Garde AD-12 (même patron que archive_stats dans _status_one) : _open_db crée le fichier
+        # (os.O_CREAT) s'il n'existe pas — sans cette garde, une commande Status en lecture seule
+        # créerait un diff.db vide 0600 pour tout nick jamais indexé, effet de bord inacceptable pour
+        # une commande explicitement "100% locale".
+        if not (os.path.exists(db_path) and _db_has_schema(db_path)): return None
+        conn=None
+        try:
+            conn=_open_db(db_path,nick=nick,role='read')
+            row=conn.execute(
+                "SELECT run_id,started_at FROM bkp_status WHERE nick=? AND finished_at IS NULL "
+                "ORDER BY started_at DESC LIMIT 1",(nick,)).fetchone()
+            return {'run_id':row[0],'started_at':row[1]} if row else None
+        except (sqlite3.Error,DbKeyError,DbModeError,DbCodecError):
+            # base absente/jamais indexée, migrating (AD-11), chiffrée sans passphrase résolue, etc. —
+            # Status reste 100% best-effort : une anomalie sur bkp_status ne doit jamais faire échouer
+            # tout l'appel multi-nick.
+            return None
+        finally:
+            if conn is not None: conn.close()
 
     def list_pending_bkp_status_start(self,nick,db_path=None):
         """Lignes bkp_status prêtes pour la réclamation de DÉBUT (Story 2b, spec-notifications-push) :
@@ -3134,37 +3192,45 @@ class BorgHelper:
         # Prune ne passait jusqu'ici par aucun ensure_*_db(), contrairement à Bkp/Index/Report.
         self.db.ensure_cache_db(self.db.get_cache_db(nick))
         self.db.ensure_diff_db(self.db.get_diff_db(nick))
-        cmd=['prune']
-        for i in list(cfg.keys()):
-            if 'KEEP_DAILY'==i: cmd.extend(['--keep-daily',cfg[i]])
-            elif 'KEEP_WEEKLY'==i: cmd.extend(['--keep-weekly',cfg[i]])
-            elif 'KEEP_MONTHLY'==i: cmd.extend(['--keep-monthly',cfg[i]])
-            elif 'KEEP_YEARLY'==i: cmd.extend(['--keep-yearly',cfg[i]])
-            elif 'KEEP_HOURLY'==i: cmd.extend(['--keep-hourly',cfg[i]])
-        if len(cmd)>1:
-            if dryrun: cmd.append('--dry-run')
-            else: cmd.append('--stats')
-            cmd.extend(f'--save-space --info --list --glob-archives={cfg["GLOB_ARCH"]}'.split(' '))
-            ret=self.borg.boex(nick,cmd,debug=debug)['stderr']
-            if not dryrun:
-                rb=self.borg.boex(nick,['compact','--cleanup-commits'],debug=debug)
-                self.db.clear_cache_nick(nick)
-                self._cleanup_index_after_prune(nick,debug=debug)
-                # Gain Prune (spine AD-3) : borg info --json APRÈS compact --cleanup-commits — c'est
-                # compact, pas prune --stats, qui libère réellement l'espace disque (sinon delta faux/
-                # quasi nul). Appel léger (métadonnées seulement), jamais en --dry-run.
-                try:
-                    rbi=self.borg.boex(nick,['info','--json'],debug=debug)
-                    self.borg._boex_check_stdout(rbi,nick,'borg info')
-                    cst=rbi['stdout'][0].get('cache',{}).get('stats',{})
-                    if cst.get('unique_csize') is not None:
-                        self.db.store_repo_stats(nick,'prune',cst['unique_csize'],cst.get('total_size'),cst.get('total_csize'))
-                except (RuntimeError,KeyError,TypeError,IndexError): pass
-                return rb
+        # priority.lock (spec-status-cli-etat-rapide) : posé avant tout appel boex(), relâché dans un
+        # finally couvrant tout le corps — même patron que backup()/restore() — pour que Status()
+        # puisse détecter un Prune en cours (ambiguïté assumée avec Restore, priority.lock ne
+        # distingue pas l'opération).
+        self.db.set_priority_lock(nick)
+        try:
+            cmd=['prune']
+            for i in list(cfg.keys()):
+                if 'KEEP_DAILY'==i: cmd.extend(['--keep-daily',cfg[i]])
+                elif 'KEEP_WEEKLY'==i: cmd.extend(['--keep-weekly',cfg[i]])
+                elif 'KEEP_MONTHLY'==i: cmd.extend(['--keep-monthly',cfg[i]])
+                elif 'KEEP_YEARLY'==i: cmd.extend(['--keep-yearly',cfg[i]])
+                elif 'KEEP_HOURLY'==i: cmd.extend(['--keep-hourly',cfg[i]])
+            if len(cmd)>1:
+                if dryrun: cmd.append('--dry-run')
+                else: cmd.append('--stats')
+                cmd.extend(f'--save-space --info --list --glob-archives={cfg["GLOB_ARCH"]}'.split(' '))
+                ret=self.borg.boex(nick,cmd,debug=debug)['stderr']
+                if not dryrun:
+                    rb=self.borg.boex(nick,['compact','--cleanup-commits'],debug=debug)
+                    self.db.clear_cache_nick(nick)
+                    self._cleanup_index_after_prune(nick,debug=debug)
+                    # Gain Prune (spine AD-3) : borg info --json APRÈS compact --cleanup-commits — c'est
+                    # compact, pas prune --stats, qui libère réellement l'espace disque (sinon delta faux/
+                    # quasi nul). Appel léger (métadonnées seulement), jamais en --dry-run.
+                    try:
+                        rbi=self.borg.boex(nick,['info','--json'],debug=debug)
+                        self.borg._boex_check_stdout(rbi,nick,'borg info')
+                        cst=rbi['stdout'][0].get('cache',{}).get('stats',{})
+                        if cst.get('unique_csize') is not None:
+                            self.db.store_repo_stats(nick,'prune',cst['unique_csize'],cst.get('total_size'),cst.get('total_csize'))
+                    except (RuntimeError,KeyError,TypeError,IndexError): pass
+                    return rb
+                else:
+                    return ret
             else:
-                return ret
-        else:
-            usage('prune')
+                usage('prune')
+        finally:
+            self.db.clear_priority_lock(nick)
 
     def _indexsnap_incremental(self,nick,archive_name,archive_date,cfg,db_path,debug=0):
         """Mise à jour incrémentale du snapshot via diff_index.
@@ -4130,6 +4196,85 @@ class BorgHelper:
         except sqlite3.Error as e:
             print(json.dumps({'error':f"SQLite error ({db_path}): {e}"},ensure_ascii=False,indent=2)); return
         print(json.dumps({'borghelper_version':Version,'nick':nick,'rows':rows},ensure_ascii=False,indent=2))
+
+    def _status_one(self,nick,debug=0):
+        """État rapide d'un seul nick — 100% local (spec-status-cli-etat-rapide) : jamais d'appel
+        boex()/borg, uniquement archive_stats (dernier backup), bkp_status (Bkp en cours,
+        get_running_bkp_status) et priority.lock (check_priority_lock, Restore/Prune ambigu)."""
+        db_path=self.db.get_diff_db(nick)
+        last_backup=None
+        if os.path.exists(db_path) and _db_has_schema(db_path):
+            conn=None
+            try:
+                conn=_open_db(db_path,nick=nick,role='read')
+                row=conn.execute(
+                    "SELECT archive,archive_date FROM archive_stats WHERE nick=? ORDER BY archive_date DESC LIMIT 1",
+                    (nick,)).fetchone()
+                if row: last_backup={'archive':row[0],'date':row[1]}
+            except DbCodecError as e:
+                last_backup={'error':_codec_fail(nick,e,conn)}
+            except sqlite3.OperationalError as e:
+                if 'no such table' not in str(e): raise
+            except sqlite3.Error:
+                pass
+            finally:
+                if conn is not None: conn.close()
+        bkp_running=self.db.get_running_bkp_status(nick,db_path=db_path)
+        return {
+            'nick':nick,
+            'last_backup':last_backup,
+            'bkp_running':{'started_at':bkp_running['started_at']} if bkp_running else None,
+            'priority_op_running':bool(self.db.check_priority_lock(nick)),
+        }
+
+    def _status_print_one(self,st):
+        printer(f"{st['nick']}:")
+        if st.get('error'):
+            printer(f"  Erreur : {st['error']}")
+            return
+        lb=st['last_backup']
+        if lb and 'error' in lb:
+            printer(f"  Dernier backup : {lb['error']}")
+        elif lb:
+            try: age=_age_readable(d2DateNSince(lb['date'])['since'])
+            except (ValueError,TypeError): age=''
+            printer(f"  Dernier backup : {lb['archive']} ({lb['date']}) {age}".rstrip())
+        else:
+            printer("  Dernier backup : aucune archive indexée")
+        if st['bkp_running']:
+            try: readable=_bkp_running_readable(st['bkp_running']['started_at'])
+            except (ValueError,TypeError): readable=st['bkp_running']['started_at']
+            printer(f"  Bkp en cours depuis {readable}")
+        elif st['priority_op_running']:
+            # Ambiguïté assumée (Boundaries spec-status-cli-etat-rapide) : priority.lock ne distingue
+            # pas Restore de Prune. Affiché seulement si aucun Bkp détecté (sinon redondant : le Bkp
+            # lui-même tient ce lock).
+            printer("  Opération prioritaire en cours (Restore ou Prune)")
+
+    def status(self,nick,debug=0,as_json=False):
+        """Commande CLI Status (spec-status-cli-etat-rapide) : état rapide (dernier backup connu, Bkp
+        en cours, opération prioritaire Restore/Prune ambiguë) par nick, 100% local — jamais d'appel
+        boex()/borg (contrairement à getlastbkp/list_backups). Supporte -n nick1,nick2 et ALL nativement
+        (contrairement à RepoHistory/ArchiveHistory qui rejettent le multi-nick)."""
+        nicks=nick.split(',') if nick and nick!='ALL' else self.borg.cfgreadnicks(debug).split(',')
+        nicks=[n for n in nicks if n]
+        results=[]
+        for n in nicks:
+            try:
+                results.append(self._status_one(n,debug=debug))
+            except Exception as e:
+                # Isolation par nick : une anomalie sur UN nick (base chiffrée sans passphrase, base
+                # 'migrating' AD-11, erreur SQLite non prévue…) ne doit jamais faire échouer tout
+                # l'appel -n ALL/multi-nick — c'est précisément le cas d'usage principal de Status.
+                results.append({'nick':n,'last_backup':None,'bkp_running':None,
+                                 'priority_op_running':False,'error':str(e)})
+        if as_json:
+            # Toujours une liste (même à un seul nick) : Status supporte nativement ALL/multi-nick,
+            # forme homogène pour les consommateurs machine (contrairement à RepoHistory/ArchiveHistory
+            # qui rejettent le multi-nick et renvoient donc un objet unique).
+            print(json.dumps(results,ensure_ascii=False,indent=2))
+            return
+        for st in results: self._status_print_one(st)
 
     def difftop(self,nick,bkp=None,depth=3,topn=10,debug=0,as_json=False):
         from collections import defaultdict
@@ -5727,6 +5872,138 @@ def codec_selftest():
             finally:
                 bhq.borg.boex=orig_boex; _q_rc()
         check("nick jamais indexé/jamais mis en cache : DiffBkp/CacheClean/CachePruneDryrun/CacheJsonBoexWithLM -> aucun schéma créé avant l'échec borg (create=False + guard purge_stale_cache)",_never_indexed_borg_sites_ok)
+        # ── Status / get_running_bkp_status / priority.lock de prune() (spec-status-cli-etat-rapide) ──
+        def _prune_priority_lock_ok():
+            """prune() : priority.lock posé avant tout appel boex(), relâché dans un finally couvrant
+            tout le corps (succès ET exception) — même patron que backup()/restore(). Simulé (boex
+            monkeypatché sur bhq), aucun vrai borg invoqué."""
+            with open(qrc,'a') as f:
+                f.write("[qprune]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\nKEEP_DAILY=7\n\n")
+            os.chmod(qrc,0o600)
+            # check_priority_lock a une exception self-PID (voir _check_pid_lock/AGENTS.md : un
+            # processus ne voit jamais son propre lock comme tenu) — inutilisable ici puisque le
+            # self-test tourne dans le même process que prune(). On vérifie donc l'existence brute
+            # du fichier de lock pendant boex(), pas check_priority_lock().
+            lock_path=bhq.db._priority_lock_path('qprune')
+            nick='qprune'
+            held_during=[]
+            def _fake_boex(nk,args,debug=0):
+                held_during.append(os.path.exists(lock_path))
+                if args[0]=='info': return {'exitcode':0,'stdout':[{'cache':{'stats':{}}}],'stderr':[]}
+                if args[0]=='list': return {'exitcode':0,'stdout':[{'archives':[]}],'stderr':[]}
+                return {'exitcode':0,'stdout':[],'stderr':[]}
+            orig_boex=bhq.borg.boex; bhq.borg.boex=_fake_boex
+            try:
+                bhq.db.clear_priority_lock(nick)
+                bhq.prune(nick,debug=0)
+                held_after_success=not os.path.exists(lock_path)
+                held_during_ok=len(held_during)>=2 and all(held_during)
+                held_during.clear()
+                bhq.borg.boex=lambda nk,args,debug=0: (_ for _ in ()).throw(RuntimeError('simulated: boex échoue'))
+                raised=raises(Exception,lambda: bhq.prune(nick,debug=0))
+                released_after_exception=not os.path.exists(lock_path)
+                return held_during_ok and held_after_success and raised and released_after_exception
+            finally:
+                bhq.borg.boex=orig_boex; bhq.db.clear_priority_lock(nick); _q_rc()
+        check("prune() : priority.lock posé avant boex()/relâché en finally (succès et exception, simulé)",_prune_priority_lock_ok)
+        def _get_running_bkp_status_ok():
+            """get_running_bkp_status (BorgHelperDB) : aucune ligne -> None ; une ligne en cours
+            (finished_at NULL) -> {run_id,started_at} ; une ligne déjà terminée -> exclue (None)."""
+            none_ok=bh.get_running_bkp_status('grbA',db_path=bs_path) is None
+            bh.store_bkp_status_start('grbA','runG1',db_path=bs_path)
+            running=bh.get_running_bkp_status('grbA',db_path=bs_path)
+            running_ok=running is not None and running['run_id']=='runG1' and running['started_at'] is not None
+            bh.store_bkp_status_finish('grbA','runG1','success',db_path=bs_path)
+            finished_excluded_ok=bh.get_running_bkp_status('grbA',db_path=bs_path) is None
+            return none_ok and running_ok and finished_excluded_ok
+        check("get_running_bkp_status : aucune ligne -> None, une ligne en cours -> {run_id,started_at}, une ligne terminée -> exclue",_get_running_bkp_status_ok)
+        def _status_mixed_states_ok():
+            """Commande Status : nick indexé (dernier backup présent) / jamais indexé (« aucune archive
+            indexée ») / Bkp en cours (bkp_status) / opération prioritaire seule (priority.lock sans
+            bkp_status, cas Restore/Prune ambigu, pas de message redondant si un Bkp couvre déjà le lock)."""
+            with open(qrc,'a') as f:
+                f.write("[qstnone]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n\n"
+                         "[qstbkp]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n\n"
+                         "[qstlock]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n\n")
+            os.chmod(qrc,0o600)
+            try:
+                st_indexed=bhq._status_one('qp')
+                indexed_ok=(st_indexed['last_backup'] is not None and st_indexed['last_backup']['archive']==A3
+                            and st_indexed['bkp_running'] is None and st_indexed['priority_op_running'] is False)
+                st_none=bhq._status_one('qstnone')
+                none_ok=(st_none['last_backup'] is None and st_none['bkp_running'] is None
+                         and st_none['priority_op_running'] is False)
+                # check_priority_lock a une exception self-PID (voir prune() ci-dessus) : un lock écrit
+                # avec notre propre PID via set_priority_lock() serait vu comme "non tenu" par ce même
+                # process. On simule donc un vrai lock externe en écrivant le PID du process parent
+                # (vivant, différent du nôtre) directement dans le fichier de lock.
+                def _fake_external_lock(nk):
+                    with open(bhq.db._priority_lock_path(nk),'w') as f: f.write(str(os.getppid()))
+                bp=bhq.db.get_diff_db('qstbkp'); bhq.db.ensure_diff_db(bp)
+                bhq.db.store_bkp_status_start('qstbkp','runS1',db_path=bp)
+                _fake_external_lock('qstbkp')  # cohérent : le Bkp lui-même tient ce lock
+                st_bkp=bhq._status_one('qstbkp')
+                bkp_ok=(st_bkp['bkp_running']=={'started_at':st_bkp['bkp_running']['started_at']}
+                        and st_bkp['bkp_running']['started_at'] is not None and st_bkp['priority_op_running'] is True)
+                bhq.db.clear_priority_lock('qstbkp')
+                _fake_external_lock('qstlock')  # Restore/Prune en cours, ambigu, sans bkp_status
+                st_lock=bhq._status_one('qstlock')
+                lock_ok=st_lock['bkp_running'] is None and st_lock['priority_op_running'] is True
+                bhq.db.clear_priority_lock('qstlock')
+                # -n ALL (multi-nick) natif, contrairement à RepoHistory/ArchiveHistory
+                out=_q_run(bhq.status,'qp,qstnone,qstbkp',as_json=True)
+                arr=json.loads(out)
+                multi_ok=(isinstance(arr,list) and len(arr)==3
+                          and {r['nick'] for r in arr}=={'qp','qstnone','qstbkp'})
+                # -n ALL doit s'étendre à tous les nicks configurés (régression connue, cf. DbStatus
+                # ci-dessus) — pas être traité comme un nick littéral 'ALL' qui n'existe dans aucun rc.
+                out_all=_q_run(bhq.status,'ALL',as_json=True)
+                arr_all=json.loads(out_all)
+                expected_all=set(bhq.borg.cfgreadnicks(0).split(','))
+                all_ok=(isinstance(arr_all,list) and 'ALL' not in {r['nick'] for r in arr_all}
+                        and {r['nick'] for r in arr_all}==expected_all)
+                return indexed_ok and none_ok and bkp_ok and lock_ok and multi_ok and all_ok
+            finally:
+                bhq.db.clear_priority_lock('qstbkp'); bhq.db.clear_priority_lock('qstlock'); _q_rc()
+        check("Status : dernier backup présent/absent, Bkp en cours, opération prioritaire seule (sans redondance), -n multi/ALL en JSON",_status_mixed_states_ok)
+        def _status_formatters_and_isolation_ok():
+            """Chemin texte de Status (jamais exercé par _status_mixed_states_ok, qui ne teste que le
+            JSON/_status_one) : formatage exact de _age_readable/_bkp_running_readable, garde AD-12 sur
+            get_running_bkp_status (pas de création de diff.db pour un nick jamais indexé), isolation
+            par nick dans status() (une exception sur un nick n'abat pas tout l'appel -n multi/ALL)."""
+            from datetime import datetime,timedelta
+            age_ok=_age_readable(3.5)=="il y a 3h30" and _age_readable(0)=="il y a 0h00"
+            started_utc=datetime.utcnow()-timedelta(minutes=90,seconds=5)
+            started_at=started_utc.strftime("%Y-%m-%d %H:%M:%S")
+            readable=_bkp_running_readable(started_at)
+            elapsed_ok="1h30min" in readable
+            expected_hhmm={(datetime.now()-timedelta(minutes=90,seconds=5)).strftime('%H:%M'),
+                           (datetime.now()-timedelta(minutes=90,seconds=6)).strftime('%H:%M')}
+            hhmm_ok=any(h in readable for h in expected_hhmm)
+            with open(qrc,'a') as f:
+                f.write("[qstnocreate]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n\n")
+            os.chmod(qrc,0o600)
+            nocreate_path=bhq.db.get_diff_db('qstnocreate')
+            if os.path.exists(nocreate_path): os.remove(nocreate_path)
+            bhq.db.get_running_bkp_status('qstnocreate')
+            nocreate_ok=not os.path.exists(nocreate_path)
+            out=io.StringIO()
+            with contextlib.redirect_stderr(out): bhq._status_print_one({'nick':'qerr','error':'boom'})
+            err_print_ok="Erreur : boom" in out.getvalue()
+            orig_one=bhq._status_one
+            def _flaky(n,debug=0):
+                if n=='qstboom': raise RuntimeError('boom simulé')
+                return orig_one(n,debug=debug)
+            bhq._status_one=_flaky
+            try:
+                out2=_q_run(bhq.status,'qp,qstboom',as_json=True)
+                arr2=json.loads(out2)
+                isolation_ok=(len(arr2)==2 and any(r.get('error')=='boom simulé' and r['nick']=='qstboom' for r in arr2)
+                              and any(r['nick']=='qp' and 'error' not in r for r in arr2))
+            finally:
+                bhq._status_one=orig_one
+            return age_ok and elapsed_ok and hhmm_ok and nocreate_ok and err_print_ok and isolation_ok
+        check("Status : formatage texte (_age_readable/_bkp_running_readable exacts), get_running_bkp_status ne crée jamais diff.db (AD-12), isolation par nick (une exception sur un nick n'abat pas -n multi/ALL)",_status_formatters_and_isolation_ok)
         # ── Sentry before_send/_sentry_scrub (AD-15) — sans ce contrôle, une régression ici fuiterait
         # des passphrases/DEK/chemins vers Sentry avec l'ensemble des autres contrôles toujours au vert.
         def _sentry_scrub_ok():
@@ -6380,7 +6657,7 @@ def _cli_main():
            'filehist':'CcdnfbBj','cacheinfo':'Ccdn','cacheclean':'Ccdn','duidx':'CcdnfbBsjR',
            'idxtop':'CcdnNpj','difftop':'CcdnNpbj','idxpurge':'CcdnxD','treehist':'CcdnfbBj',
            'treefind':'Ccdnfmj','dbencrypt':'CcdnDy','dbdecrypt':'CcdnDy','dbrekey':'Ccdny','dbstatus':'Ccdn',
-           'repohistory':'Ccdnj','archivehistory':'Ccdnj'}
+           'repohistory':'Ccdnj','archivehistory':'Ccdnj','status':'Ccdnj'}
     optab={k:v+'P' for k,v in optab.items()}
 
     if cmd is None or cmd not in optab.keys():
@@ -6519,6 +6796,8 @@ def _cli_main():
             usage(cmd)
         for n in nick.split(','):
             bh.archive_history(n,debug=debug,as_json=('-j' in options))
+    elif cmd=='status':
+        bh.status(nick,debug=debug,as_json=('-j' in options))
     elif cmd=='difftop':
         _depth=int(options.get('-p','3'))
         _topn=int(options.get('-N','10'))

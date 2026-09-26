@@ -694,6 +694,38 @@ comportement que `IdxTop -j`).
 
 ---
 
+### `Status`
+État rapide (dernier backup connu, Bkp en cours, opération prioritaire en cours) par nick — **100%
+local, jamais d'appel `borg`** (contrairement à `LstBkp`/`GetLastBkp` qui interrogent le dépôt en
+direct) : rapide, fonctionne hors ligne, ne bloque jamais sur un dépôt distant injoignable.
+
+```bash
+borgHelper -c Status -n mon-serveur          # un seul nick, texte
+borgHelper -c Status -n a,b                  # plusieurs nicks
+borgHelper -c Status -n ALL -j               # tous les nicks configurés, JSON
+```
+
+| Option | Description |
+|--------|-------------|
+| `-n <nick1,nick2>` / `-n ALL` | Un ou plusieurs nicks nativement (contrairement à `RepoHistory`/`ArchiveHistory` qui rejettent le multi-nick) — c'est le cas d'usage principal de `Status` |
+| `-j` | Sortie JSON — toujours une **liste**, même à un seul nick : `[{nick,last_backup,bkp_running,priority_op_running}, ...]` |
+
+Par nick :
+- **Dernier backup connu** : archive + date depuis `archive_stats` (déjà indexée localement) + âge
+  lisible (« il y a 3h12 ») ; « aucune archive indexée » si le nick n'a jamais été indexé.
+- **Bkp en cours** : si une ligne `bkp_status` non terminée existe, « Bkp en cours depuis HH:MM
+  (XhYYmin) ».
+- **Opération prioritaire en cours** : si `priority.lock` est tenu et qu'aucun Bkp n'est détecté,
+  « Opération prioritaire en cours (Restore ou Prune) » — **ambiguïté assumée**, `priority.lock` ne
+  distingue pas laquelle des deux le tient. Si un Bkp est aussi détecté, pas de message redondant (le
+  Bkp lui-même tient ce lock).
+
+En JSON : `last_backup` est `{archive,date}` ou `null` ; `bkp_running` est `{started_at}` ou `null` ;
+`priority_op_running` est un booléen brut (reflète `priority.lock`, indépendamment de `bkp_running` —
+c'est au consommateur de corréler les deux, comme pour l'affichage texte).
+
+---
+
 ### `IdxPurge`
 Supprime rétroactivement des entrées de `diff_index`, purge les snapshots anciens et compacte le `diff.db`.
 

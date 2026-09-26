@@ -1,5 +1,44 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.111 — commande Status : état rapide par nick, 100% local — 2026-09-26
+
+`spec-status-cli-etat-rapide` : nouvelle commande CLI en lecture seule pour obtenir rapidement l'état
+d'un ou plusieurs nicks (dernier backup, Bkp en cours, opération prioritaire) sans jamais appeler
+`borg` — utile quand le dépôt distant est lent/injoignable et que `getlastbkp`/`list_backups`
+bloqueraient.
+
+### `prune()` pose désormais `priority.lock`
+
+- `prune()` ne posait jusqu'ici aucun `priority.lock`, contrairement à `backup()`/`restore()` — corrigé :
+  `self.db.set_priority_lock(nick)` juste après `cfgreaded`/`ensure_*_db` (avant tout appel `boex`),
+  `self.db.clear_priority_lock(nick)` dans un `finally` couvrant tout le corps de la fonction (succès
+  et exception, y compris `--dry-run`). Sans ce changement, `Status` ne pouvait pas détecter un Prune
+  en cours.
+
+### `BorgHelperDB.get_running_bkp_status(nick, db_path=None)`
+
+- Nouvelle méthode lecture seule : dernière ligne `bkp_status` non terminée (`finished_at IS NULL`)
+  pour ce nick, s'il y en a une (normalement 0 ou 1). Voisine de `list_pending_bkp_status`/
+  `claim_bkp_status`, même style.
+
+### Commande CLI `Status`
+
+- `-c Status [-n nick1,nick2/ALL] [-j]` : pour chaque nick, affiche le dernier backup connu
+  (`archive_stats`, avec âge lisible), le Bkp en cours (`bkp_status`, depuis quand) et une opération
+  prioritaire en cours (`priority.lock`, Restore **ou** Prune — ambiguïté assumée, `priority.lock` ne
+  distingue pas laquelle ; non affichée si un Bkp est déjà détecté, pour éviter un message redondant).
+- Supporte nativement `-n nick1,nick2` et `ALL` (contrairement à `RepoHistory`/`ArchiveHistory` qui
+  rejettent le multi-nick) — c'est le cas d'usage principal de `Status`.
+- `-j` : JSON, toujours une liste de `{nick,last_backup,bkp_running,priority_op_running}`, même à un
+  seul nick, pour une forme homogène côté consommateurs machine.
+- 100% local : jamais d'appel `boex`/`borg` — rapide, fonctionne hors ligne, dépôt distant injoignable
+  sans bloquer.
+- Correctif (revue avant commit) : `-n ALL` était traité comme un nick littéral `'ALL'` au lieu de
+  s'étendre à tous les nicks configurés (régression du même type que celle déjà connue pour
+  `DbStatus`/`DbEncrypt`) — `status()` applique désormais le même patron
+  `nick.split(',') if nick and nick!='ALL' else cfgreadnicks(...).split(',')` que les autres commandes
+  multi-nick. Test de non-régression ajouté au `CodecSelfTest`.
+
 ## borgHelper 1.0.110 / borgHelperWWW 1.18.0 — envoi push réel (début+fin), watcher étendu — 2026-09-26
 
 Story 2b de `spec-notifications-push` : le watcher `bkp_status` (Story 1) ne se contente plus de
