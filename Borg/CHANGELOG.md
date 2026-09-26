@@ -1,5 +1,11 @@
 # Changelog — borgHelper
 
+## borgHelperWWW_ui.html 1.13.4 — explorateur : étiquette du serveur à la place de « ← Retour au serveur » — 2026-09-26
+
+- Page Explorer (arborescence) : le bouton « ← Retour au serveur » est remplacé par la même étiquette
+  **🖥 nom du serveur** que le détail et l'Historique complet. Retour à la liste : bouton **Serveurs**
+  de l'en-tête. `closeBrowse()` (plus aucun appelant) supprimée.
+
 ## borgHelperWWW_ui.html 1.13.3 — étiquette du serveur en cours à la place de « ← Serveurs » — 2026-09-26
 
 - Pages « détail d'un serveur » et « Historique complet » : le bouton « ← Serveurs » est remplacé par

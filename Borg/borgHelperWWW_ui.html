@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.13.3 -->
+<!-- UI_VERSION: 1.13.4 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -62,8 +62,8 @@
   .pass-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
   .pass-row input{max-width:260px}
   .pill{font-size:11px;color:var(--muted)}
-  /* Étiquette du serveur en cours (détail, Historique complet) — remplace l'ancien bouton « ← Serveurs »,
-     redondant avec le bouton « Serveurs » de l'en-tête. */
+  /* Étiquette du serveur en cours (détail, Historique complet, explorateur) — remplace les anciens
+     boutons « ← Serveurs » / « ← Retour au serveur » ; retour à la liste : bouton « Serveurs » de l'en-tête. */
   .nick-label{display:inline-block;margin-bottom:12px;padding:6px 12px;border-radius:14px;
     background:#eef1f5;color:var(--text);font-weight:600}
   .actions-layout{display:flex;gap:20px;flex-wrap:wrap}
@@ -180,7 +180,7 @@
 
   <!-- VIEW 4 : TREE BROWSER -->
   <section id="view-browse" hidden>
-    <button class="secondary" onclick="closeBrowse()">← Retour au serveur</button>
+    <span class="nick-label" title="Serveur en cours — « Serveurs » (en-tête) pour revenir à la liste"></span>
     <div class="card">
       <div class="machine-head">
         <h2 id="browseTitle" style="margin:0"></h2>
@@ -1187,10 +1187,6 @@ function openBrowseAtArchive(nick,archive){
   browseArchive=archive;
   showView('view-browse');
   loadBrowse();
-}
-function closeBrowse(){
-  if(browseArchive){ browseArchive=null; showView('view-history'); }
-  else{ showView('view-detail'); }
 }
 
 function renderBreadcrumb(){

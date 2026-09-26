@@ -1408,8 +1408,9 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
    actions qui en ont besoin (repérées par 🔑) ; les actions destructives (`Prune`, `DelBkp`, `Restore`,
    `IdxPurge`, `Init`) demandent une confirmation avant exécution. Le résultat brut (`exitcode`, `stdout`,
    `stderr`) s'affiche tel quel. Bouton **🗂 Explorer l'arborescence** dans le bandeau du serveur.
-   En haut de cette page et de l'Historique complet (UI ≥ 1.13.3), une étiquette **🖥 nom du serveur**
-   rappelle le serveur en cours ; retour à la liste par le bouton **Serveurs** de l'en-tête.
+   En haut de cette page, de l'explorateur et de l'Historique complet (UI ≥ 1.13.4), une étiquette
+   **🖥 nom du serveur** rappelle le serveur en cours ; retour à la liste par le bouton **Serveurs** de
+   l'en-tête (plus de bouton « ← Serveurs » / « ← Retour au serveur »).
 4. **Explorateur d'arborescence** (`TreeHist -j`) : navigation façon gestionnaire de fichiers. Colonnes
    **Droits** (ls-style, `drwxr-xr-x`…) et **Propriétaire** (`user:group (uid:gid)`) affichées pour
    chaque entrée — dernier état connu. Chaque navigation (clic sur un dossier, sur le fil d'Ariane, sur
@@ -1454,8 +1455,7 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
      seuls les événements propres à cette sauvegarde sont affichés (`TreeHist -b <archive> -B
      <archive>`), pas ceux des autres archives. Les colonnes droits/genre/propriétaire restent, comme
      toujours, le **dernier état connu** (pas forcément celui de cette archive précise — limitation
-     documentée de `TreeHist`). Le bouton retour ramène à cette vue Historique plutôt qu'à la page de
-     détail.
+     documentée de `TreeHist`).
    - **🗑 Supprimer** (`DelBkp`) : supprime définitivement cette archive — confirmation, 🔑 passphrase.
    - Bouton **⚡ Lancer Prune** en haut de la vue (portée sur tout le dépôt, pas une archive précise,
      selon `KEEP_*` de la conf) — confirmation, 🔑 passphrase.
