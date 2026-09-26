@@ -1,5 +1,19 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.120 — exploration plus rapide des bases chiffrées — 2026-09-26
+
+Demande utilisateur : accélérer l'exploration d'une archive une fois la base chiffrée (étude, piste 1).
+
+- Décodage des chemins chiffrés mémorisé **par segment** partout (auparavant réservé à TreeHist à la
+  racine) : lister un sous-répertoire ne redécode plus son préfixe pour chacun des chemins du
+  sous-arbre. Chaque segment reste vérifié — aucune concession sur la détection d'altération.
+- Décodage base64 et XOR du codec réécrits (regex compilée, XOR par entier) — résultats identiques.
+- Démo chiffrée, depuis un processus neuf comme chaque clic web : ouverture de `…/kernel` **1,2 s →
+  0,36 s**, recherche `*.ko` **1,6 s → 0,54 s**. `PerfBench` (250k lignes) : TreeFind racine **~8 s →
+  ~1,8 s**, décodage à froid de 20 000 chemins **1,15 s → 0,06 s** ; aucune régression sur les autres
+  commandes.
+- `CodecSelfTest` 330/330 (dont équivalence `_b64d`/`_xor` et altération profonde détectée malgré le mémo).
+
 ## borgHelperWWW 1.25.0 — identité de l'utilisateur, IP du navigateur, journal des requêtes — 2026-09-26
 
 Demande utilisateur : enregistrer l'email/le nom transmis par le reverse proxy (notifications et

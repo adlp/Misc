@@ -1005,6 +1005,39 @@ après correctif.
 
 ---
 
+### Accélération du décodage des chemins (1.0.120)
+
+Étude du parcours réel de l'explorateur depuis l'interface web (un sous-processus `borgHelper` par
+clic) sur base chiffrée : 90 % du temps passé à décoder les chemins — un répertoire de 15 entrées
+(`…/kernel` de la démo) décodait intégralement les 7 484 chemins de son sous-arbre, sans le mémo par
+segment réservé jusqu'ici à `TreeHist` racine ; et `_b64d` testait l'alphabet caractère par caractère
+en Python (~la moitié du coût). Trois changements, **aucune concession sur la vérification** :
+
+- `DbCodec.decode_path` (utilisé par `_path_decode`, donc par TOUS les sites : TreeHist hors racine,
+  TreeFind, Search, DuIdx…) décode ses défauts de mémo par `decode_path_verified` au lieu de
+  `PathCodec.decode` : chaque segment reste vérifié (tag), mais le travail des répertoires communs est
+  mémorisé par segment. Clé du mémo = `(tag précédent, segment chiffré)` : un segment altéré a une autre
+  clé et est vérifié à neuf — contrôle `CodecSelfTest` dédié (altération d'un 3e segment après
+  mémorisation du préfixe → `DbCodecError`).
+- `_b64d` : alphabet validé par une regex compilée `_B64_RE` (égalité avec `_B64_ALPHABET` contrôlée sur
+  les 256 octets).
+- `_xor` : XOR par entier (`int.from_bytes`) au lieu d'un générateur d'octets — résultat identique
+  (contrôlé : longueurs différentes, octets nuls en tête, vide).
+
+Mesures (sorties identiques clair/chiffré vérifiées) — démo, processus neuf par appel comme depuis le
+web : `TreeHist …/kernel -b ALL` **1 203 → 357 ms**, `…/kernel/drivers/net` 489 → 294 ms, racine 514 →
+470 ms, `TreeFind *.ko` **1 626 → 543 ms**. `PerfBench` (250k lignes, chiffré, deux exécutions par
+version, en alternance sur la même machine — bruit important) : `decode_path` 20 000 chemins à froid
+**1 150 → 62 ms** ; `TreeFind *.log` racine **8,5/7,6 s → 1,6/1,9 s** ; `TreeHist` racine 3,0/3,2 s →
+2,7/2,4 s ; Search, DuIdx, IdxTop, DiffTop, IdxPurge dans la marge de bruit (plages qui se recouvrent),
+aucune régression.
+
+Pistes étudiées, **non réalisées** (décision utilisateur requise) : (2) ne décoder que les enfants
+directs du répertoire listé (coût proportionnel au nombre d'entrées affichées, plus à la taille du
+sous-arbre — mais une altération d'un chemin profond n'est alors détectée qu'en y descendant) ;
+(3) processus `borgHelper` persistant interrogé par borgHelperWWW (supprime ~250 ms de démarrage + KDF
+par clic, mémo de décodage chaud d'un clic à l'autre).
+
 ## Écriture des chemins et barrière de migration (1.0.102, chiffrement story 3)
 
 Toute écriture de chemin est, comme les lectures (story 2), indépendante du mode : elle passe par `_path_stored(conn,

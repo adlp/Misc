@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.119"
+Version="1.0.120"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -662,9 +662,13 @@ def _b64e(b):
     """base64 standard sans padding, '+'->'.' et '/'->'-' (alphabet A-Za-z0-9.-)."""
     return base64.b64encode(bytes(b)).decode('ascii').rstrip('=').replace('+','.').replace('/','-')
 
+# Même alphabet que _B64_ALPHABET (CodecSelfTest vérifie l'égalité) : une regex compilée remplace le
+# test caractère par caractère en Python, qui représentait ~la moitié du coût de décodage (1.0.120).
+_B64_RE=re.compile(r'[A-Za-z0-9.\-]*')
+
 def _b64d(s):
     """Décodage strict : alphabet exact, longueur != 1 mod 4, forme canonique (bits de bourrage nuls)."""
-    if not isinstance(s,str) or any(c not in _B64_ALPHABET for c in s):
+    if not isinstance(s,str) or not _B64_RE.fullmatch(s):
         raise DbCodecError("caractère hors alphabet")
     if len(s)%4==1:
         raise DbCodecError("longueur invalide")
@@ -676,7 +680,11 @@ def _b64d(s):
         raise DbCodecError("encodage non canonique")
     return raw
 
-def _xor(a,b): return bytes(x^y for x,y in zip(a,b))
+def _xor(a,b):
+    """XOR octet à octet, tronqué à la plus courte (comme zip) — par entier (1.0.120) plutôt que
+    par générateur d'octets Python : même résultat, bien plus rapide."""
+    n=min(len(a),len(b))
+    return (int.from_bytes(a[:n],'big')^int.from_bytes(b[:n],'big')).to_bytes(n,'big')
 def _hmac(key,*parts): return hmac.new(key,b''.join(parts),hashlib.sha256).digest()
 def _lp(b): return len(b).to_bytes(4,'big')+b
 def _pw_bytes(pw):
@@ -754,10 +762,13 @@ class DbCodec:
         self._seg_memo={}  # (prev_tag,segment_chiffré) -> (segment_clair,tag) -- voir decode_path_verified
 
     def decode_path(self,stored):
-        """PathCodec.decode avec mémo borné (vidé quand plein) : les mêmes chemins reviennent d'une requête à l'autre."""
+        """PathCodec.decode avec mémo borné (vidé quand plein) : les mêmes chemins reviennent d'une requête à l'autre.
+        Sur un défaut du mémo : decode_path_verified (1.0.120, était PathCodec.decode) — même vérification
+        de chaque segment, mais le travail des répertoires communs est mémorisé par segment : lister un
+        sous-répertoire ne redécode plus son préfixe pour chacun des milliers de chemins du sous-arbre."""
         v=self._memo.get(stored)
         if v is None:
-            v=self.path.decode(stored)
+            v=self.decode_path_verified(stored)
             if len(self._memo)>=_DEC_MEMO_MAX: self._memo.clear()
             self._memo[stored]=v
         return v
@@ -5073,6 +5084,22 @@ def codec_selftest():
         check("chemin : tag altéré -> DbCodecError",lambda: raises(DbCodecError,lambda:pc.decode('/'.join([_flip(segs[0])]+segs[1:]))))
         check("chemin : segments permutés (autre parent) -> DbCodecError",lambda: raises(DbCodecError,lambda:pc.decode('/'.join([segs[0],segs[2],segs[1]]))))
         check("chemin : longueur = 1 mod 4 -> DbCodecError",lambda: raises(DbCodecError,lambda:pc.decode(segs[0]+'A')))
+        # ── Accélération du décodage (1.0.120) : mêmes résultats, mêmes refus ──
+        check("_b64d : regex d'alphabet identique à _B64_ALPHABET",
+              lambda: all(bool(_B64_RE.fullmatch(chr(c)))==(chr(c) in _B64_ALPHABET) for c in range(256)))
+        def _xor_ref(a,b): return bytes(x^y for x,y in zip(a,b))
+        check("_xor : identique à l'XOR octet à octet (longueurs différentes, octets nuls en tête, vide)",
+              lambda: all(_xor(a,b)==_xor_ref(a,b) for a,b in ((b'',b'x'),(b'\x00\x00\x01',b'\x00\xff'),
+                          (secrets.token_bytes(37),secrets.token_bytes(64)),(b'\x00'*5,b'\x00'*5))))
+        def _deep_tamper_after_memo():
+            # Préfixe commun déjà décodé et mémorisé, puis chemin voisin dont le 3e segment est altéré :
+            # le mémo par segment ne doit jamais masquer l'altération (clé = segment chiffré lui-même).
+            dc=DbCodec(b'\x05'*32)
+            e1=dc.path.encode('a/b/c'); e2=dc.path.encode('a/b/d')
+            ok=dc.decode_path(e1)=='a/b/c' and dc.decode_path(e2)=='a/b/d'
+            s2=e2.split('/'); s2[2]=_flip(s2[2])
+            return ok and raises(DbCodecError,lambda:dc.decode_path('/'.join(s2)))
+        check("décodage mémorisé par segment : altération profonde détectée même préfixe déjà en mémoire",_deep_tamper_after_memo)
         _A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-'
         def _noncanon():
             # 'alpha' -> 17 octets -> 23 caractères : les 2 derniers bits du dernier caractère sont du bourrage nul
