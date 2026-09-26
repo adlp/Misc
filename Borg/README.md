@@ -600,6 +600,12 @@ Pour descendre dans un sous-répertoire, relancer `TreeHist` avec `-f` pointant 
 `IdxPurge -x préfixe`) : `-f /Etc` ne trouve pas `/etc`, et `%`/`_` n'y sont pas des jokers (un dossier `a%b` n'inclut jamais
 son frère `aXYZb`). Auparavant la comparaison ignorait la casse ASCII.
 
+**Base chiffrée — vérification limitée au niveau affiché** (depuis 1.0.121) : `TreeHist` ne décode, et donc ne
+vérifie, que le répertoire listé et ses enfants directs, plus chaque chemin de toute la sous-arborescence —
+l'explorateur ne paie plus le coût d'un sous-arbre entier pour afficher quelques entrées. Une altération de la
+base sur un chemin plus profond n'est signalée qu'en descendant jusqu'à lui (ou par `TreeFind`/`Search`, qui
+vérifient tout). Sans effet sur une base non chiffrée.
+
 **Fichiers/répertoires supprimés** : les enfants directs supprimés depuis (mais toujours
 récupérables — l'archive de dernière présence existe encore) apparaissent aussi, marqués
 distinctement (colonne `type`=`supprimé`, colonne `archive`=archive à restaurer). Un répertoire

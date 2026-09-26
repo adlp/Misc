@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.120"
+Version="1.0.121"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -781,7 +781,9 @@ class DbCodec:
         le travail crypto déjà fait pour ce préfixe -- accélère un balayage de beaucoup de chemins voisins
         SANS relâcher la détection d'altération sur AUCUN segment, à AUCUNE profondeur (contrairement à un
         décodage volontairement limité au premier niveau, qui laisserait une altération plus profonde
-        passer inaperçue — voir Story 6/CHANGELOG pour l'historique de ce choix)."""
+        passer inaperçue — voir Story 6/CHANGELOG pour l'historique de ce choix). NB : depuis 1.0.121
+        (piste 2), TreeHist sur base chiffrée ne l'appelle plus que pour le répertoire listé et ses enfants
+        directs (via decode_path) — c'est TreeHist qui limite la profondeur vérifiée, pas cette méthode."""
         if stored=='': return ''
         p=self.path
         prev=b'\0'*_PATH_TAG_LEN; segs=[]
@@ -3887,27 +3889,40 @@ class BorgHelper:
         mode_by_name={}    # name -> droits unix (dernier état connu) de SA PROPRE entrée
         owner_by_name={}   # name -> propriétaire (dernier état connu) de SA PROPRE entrée
         own_type=None; own_mode=None; own_owner=None
-        snap_cursor=conn.execute("SELECT path,type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=?"+_wh(psql),[n,latest]+pprm)
-        if not prefix and conn.codec is not None:
-            # Racine, base chiffrée : à la racine, `psql` ne borne rien (AD-8, aucun prédicat sur le nom
-            # en SQL) -- l'instantané ENTIER est lu, et décoder le chemin complet de chaque ligne (83k sur
-            # le jeu PerfBench) dominait `TreeHist` à la racine (mesuré Story 6, ~3,7-6,6 s). Un premier
-            # correctif (décoder SEULEMENT le premier segment) faisait perdre la détection d'altération sur
-            # les segments plus profonds — une régression de sécurité réelle par rapport au comportement
-            # d'avant cette story (revue post-implémentation). `decode_path_verified` valide chaque segment
-            # de chaque chemin, comme avant, mais mémoïse par SEGMENT PARTAGÉ entre chemins de même
-            # préfixe de répertoires (cas courant) : la profondeur/structure d'un chemin reste de toute
-            # façon une fuite déjà acceptée (Deferred de la spine) — seule la répétition du calcul crypto
-            # déjà fait pour un préfixe commun est évitée, jamais la vérification elle-même.
-            for path,ftype,fmode,fowner in snap_cursor:
-                lp=conn.codec.decode_path_verified(path)
-                if not lp: continue
-                seg=lp.split('/',1)
-                name=seg[0]; is_dir=len(seg)>1
-                children[name]=children.get(name,False) or is_dir
-                if not is_dir: type_by_name[name]=ftype; mode_by_name[name]=fmode; owner_by_name[name]=fowner
+        if conn.codec is not None:
+            # Base chiffrée — « piste 2 » (1.0.121, choix utilisateur) : SEULS le répertoire listé et ses
+            # enfants DIRECTS sont décodés (donc vérifiés), plus chaque chemin du sous-arbre. AD-3 ne
+            # chiffre pas le séparateur '/' : la structure se lit sur la valeur STOCKÉE (même nombre de
+            # '/' que le chemin logique, alphabet base64 ASCII — substr/instr de SQLite y sont exacts au
+            # caractère près). SQLite sépare donc lui-même les lignes des enfants directs (reste sans '/')
+            # des descendants plus profonds, dont il ne renvoie que le segment chiffré de l'enfant direct
+            # (DISTINCT) : Python décode une valeur par entrée affichée, pas une par ligne du sous-arbre
+            # (…/kernel de la démo : 6 474 -> 15). Compromis accepté : un segment altéré PLUS PROFOND
+            # qu'un enfant direct n'est détecté qu'en descendant jusqu'à lui (ou par TreeFind/Search, qui
+            # décodent tout) — le répertoire listé et ses enfants restent vérifiés à chaque affichage.
+            enc_prefix=conn.codec.path.encode(prefix) if prefix else ''
+            skip=len(enc_prefix)+1 if enc_prefix else 0
+            usql,uprm,_=_psel_under(conn,prefix)
+            rest=f"substr(path,{skip+1})"
+            if prefix:
+                own=conn.execute("SELECT type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=? AND path=?",
+                                 (n,latest,enc_prefix)).fetchone()
+                if own: own_type,own_mode,own_owner=own
+            def _child(stored_child):
+                lp=conn.codec.decode_path(stored_child)  # préfixe (mémo) + segment de l'enfant, vérifiés
+                return lp[plen:] if prefix else lp
+            for path,ftype,fmode,fowner in conn.execute(
+                    f"SELECT path,type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=?{_wh(usql)} AND instr({rest},'/')=0",
+                    [n,latest]+uprm):
+                name=_child(path)
+                children.setdefault(name,False)
+                type_by_name[name]=ftype; mode_by_name[name]=fmode; owner_by_name[name]=fowner
+            for (seg,) in conn.execute(
+                    f"SELECT DISTINCT substr({rest},1,instr({rest},'/')-1) FROM archive_snapshot_v WHERE nick=? AND archive=?{_wh(usql)} AND instr({rest},'/')>0",
+                    [n,latest]+uprm):
+                children[_child(f"{enc_prefix}/{seg}" if enc_prefix else seg)]=True
         else:
-            for path,ftype,fmode,fowner in snap_cursor:
+            for path,ftype,fmode,fowner in conn.execute("SELECT path,type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=?"+_wh(psql),[n,latest]+pprm):
                 lp=_path_decode(conn,path)
                 if prefix and lp==prefix:
                     own_type=ftype; own_mode=fmode; own_owner=fowner; continue
@@ -5779,34 +5794,41 @@ def codec_selftest():
                 _q_build('qe',True)  # restaure une base saine pour la suite du self-test
                 return isinstance(v,dict) and 'error' in v
             check("Search sur base altérée : DbCodecError attrapée, message par nick, pas de traceback",_tamper_search)
-            def _tamper_treehist_root_deep():
-                """TreeHist À LA RACINE (base chiffrée) doit détecter une altération à N'IMPORTE QUELLE
-                profondeur, pas seulement sur le premier segment (revue post-implémentation Story 6 :
-                `decode_path_verified` valide chaque segment, contrairement à un décodage qui se serait
-                limité au premier niveau) -- corrompt le DEUXIÈME segment (pas le premier) d'un chemin
-                imbriqué ('etc/sub/app.log') et vérifie que `TreeHist` à la racine échoue proprement
-                (DbCodecError attrapée, pas de traceback), même garantie que `Search` (`_tamper_search`)."""
-                _q_build('qe',True)
-                c=_open_db(bhq.db.get_diff_db('qe'),nick='qe',role='write')
-                # cible un chemin CONNU (2 segments, présent dans A3 -- pas un `_gone`, jamais dans
-                # archive_snapshot_v) : un `SELECT ... WHERE nick=?` sans ORDER BY peut être satisfait par
-                # l'index (nick,path), donc trié sur la valeur STOCKÉE (chiffrée) -- piocher "le premier
-                # avec un '/'" y est non déterministe et peut tomber sur un `_gone`, jamais visité par la
-                # racine -> détection manquée silencieusement (constaté : reproductible en isolation).
-                target=c.codec.path.encode('etc/sub')
-                parts=target.split('/')
-                seg=parts[1]; parts[1]='B'+seg[1:] if seg[0]!='B' else 'C'+seg[1:]  # altère le TAG du 2e segment seulement
-                n=c.execute("UPDATE snapshot_file SET path=? WHERE nick='qe' AND path=?",('/'.join(parts),target)).rowcount
-                c.commit(); c.close()
-                if n!=1: return False  # la cible attendue doit exister exactement une fois
-                out=io.StringIO()
-                with contextlib.redirect_stdout(out): bhq.treehist('qe',None,archive_from='ALL',as_json=True)
-                try: v=json.loads(out.getvalue())['qe']
-                except ValueError: return False
-                _q_build('qe',True)  # restaure une base saine pour la suite du self-test
-                return isinstance(v,dict) and 'error' in v
-            check("TreeHist racine sur base altérée (2e segment d'un chemin imbriqué, 1er segment intact) : "
-                  "DbCodecError attrapée, pas de traceback",_tamper_treehist_root_deep)
+            def _tamper_treehist_depth():
+                """Contrat de TreeHist sur base chiffrée depuis la « piste 2 » (1.0.121, choix utilisateur) :
+                SEULS le répertoire listé et ses enfants DIRECTS sont décodés/vérifiés. (a) 2e segment de
+                'etc/sub' altéré : la racine s'affiche (compromis accepté, l'altération est plus profonde
+                qu'un enfant direct) et lister 'etc' — où il devient enfant direct — échoue proprement
+                (DbCodecError attrapée, pas de traceback). (b) 1er segment altéré : la racine échoue.
+                Cible un chemin CONNU (présent dans A3, jamais un `_gone`) : un SELECT sans ORDER BY trié
+                sur la valeur stockée chiffrée piocherait un chemin non déterministe."""
+                def _alter(seg_index):
+                    _q_build('qe',True)
+                    c=_open_db(bhq.db.get_diff_db('qe'),nick='qe',role='write')
+                    target=c.codec.path.encode('etc/sub')
+                    parts=target.split('/')
+                    seg=parts[seg_index]; parts[seg_index]='B'+seg[1:] if seg[0]!='B' else 'C'+seg[1:]  # altère le TAG
+                    n=c.execute("UPDATE snapshot_file SET path=? WHERE nick='qe' AND path=?",('/'.join(parts),target)).rowcount
+                    c.commit(); c.close()
+                    return n==1  # la cible attendue doit exister exactement une fois
+                def _listing(prefix):
+                    out=io.StringIO()
+                    with contextlib.redirect_stdout(out): bhq.treehist('qe',prefix,archive_from='ALL',as_json=True)
+                    return json.loads(out.getvalue())['qe']
+                try:
+                    if not _alter(1): return False
+                    root,etc=_listing(None),_listing('etc')
+                    deep_ok=('error' not in root and any(e['name']=='etc' for e in root['entries'])
+                             and isinstance(etc,dict) and 'error' in etc)
+                    if not _alter(0): return False
+                    root2=_listing(None)
+                    return deep_ok and isinstance(root2,dict) and 'error' in root2
+                except ValueError:
+                    return False
+                finally:
+                    _q_build('qe',True)  # restaure une base saine pour la suite du self-test
+            check("TreeHist chiffré, altération : 2e segment -> racine affichée, détectée en listant 'etc' ; "
+                  "1er segment -> détectée à la racine (DbCodecError attrapée, pas de traceback)",_tamper_treehist_depth)
             check("plans (etc) sur connexion chiffrée : aucun LIKE/GLOB, aucun ORDER BY portant sur un chemin",
                   lambda: traced and not [q for q in traced if re.search(r'\bLIKE\b|\bGLOB\b|ORDER BY[^\n]*\bpath\b',q)])
         finally:

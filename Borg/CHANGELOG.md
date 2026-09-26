@@ -1,5 +1,21 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.121 — explorateur des bases chiffrées : décodage limité aux enfants directs — 2026-09-27
+
+Demande utilisateur : réaliser la « piste 2 » de l'étude d'accélération de l'exploration des bases chiffrées.
+
+- `TreeHist` sur base chiffrée ne décode plus que le répertoire listé et ses enfants directs, au lieu de chaque
+  chemin de la sous-arborescence : SQLite sépare enfants directs et descendants sur la valeur stockée (le `/` n'est
+  pas chiffré), Python ne décode qu'une valeur par entrée affichée (`…/kernel` de la démo : 6 474 → 15).
+- **Compromis accepté** : une altération de la base sur un chemin plus profond qu'un enfant direct n'est signalée
+  qu'en descendant jusqu'à lui (ou par `TreeFind`/`Search`, qui vérifient tout). Le répertoire affiché et ses
+  enfants restent vérifiés.
+- Mesures : listing seul ~330 → ~90 ms (`…/kernel/drivers`) ; `PerfBench` 250k, `TreeHist` racine chiffré
+  2,9–4,2 s → 1,4–1,6 s, au niveau d'une base claire. Sorties identiques (14 cas, clair/chiffré, avant/après).
+- `CodecSelfTest` 330/330 : le contrôle d'altération profonde à la racine est remplacé par le nouveau contrat
+  (2e segment altéré → racine affichée, détecté en descendant ; 1er segment → détecté à la racine).
+- Base non chiffrée : inchangé.
+
 ## borgHelperWWW_ui.html 1.15.0 / borgHelperWWW_sw.js 1.3.0 — clic de notification vers le serveur, titre par page — 2026-09-27
 
 Demande utilisateur : clic de notification vers `/serveur/<nick>` ; titre de la page/onglet propre à

@@ -985,6 +985,10 @@ seuil ; seul le filtre structurel de `del_rows` s'y applique aussi (voir ci-dess
 Aucune régression : `CodecSelfTest` toujours au vert après ce correctif (280/280, dont le nouveau contrôle
 d'altération à 2 niveaux de profondeur et la parité `TreeHist` plain/chiffré sur plusieurs préfixes dont la racine).
 
+> **Remplacé en 1.0.121** (« piste 2 », choix explicite de l'utilisateur) : `TreeHist` sur base chiffrée ne vérifie
+> plus que le répertoire listé et ses enfants directs — voir « Décodage limité aux enfants directs » ci-dessous. Le
+> compromis refusé ici (détection d'une altération profonde repoussée) est désormais accepté, pour `TreeHist` seulement.
+
 **Sites mesurés et non problématiques** (sous le seuil, ou dégradation attendue/modérée) : `TreeHist` sous-répertoire
 profond, `Search`, `DiffTop`, `_find_last_archive_with_file`, `IdxPurge -D` (498 ms en chiffré reste sous le seuil,
 mais x10 par rapport au `plain` — à re-surveiller si un motif glob large est utilisé sur une base de plusieurs Go, cf.
@@ -1032,11 +1036,41 @@ version, en alternance sur la même machine — bruit important) : `decode_path`
 2,7/2,4 s ; Search, DuIdx, IdxTop, DiffTop, IdxPurge dans la marge de bruit (plages qui se recouvrent),
 aucune régression.
 
-Pistes étudiées, **non réalisées** (décision utilisateur requise) : (2) ne décoder que les enfants
-directs du répertoire listé (coût proportionnel au nombre d'entrées affichées, plus à la taille du
-sous-arbre — mais une altération d'un chemin profond n'est alors détectée qu'en y descendant) ;
-(3) processus `borgHelper` persistant interrogé par borgHelperWWW (supprime ~250 ms de démarrage + KDF
-par clic, mémo de décodage chaud d'un clic à l'autre).
+Pistes étudiées : (2) ne décoder que les enfants directs du répertoire listé — **réalisée en 1.0.121**,
+section suivante ; (3) processus `borgHelper` persistant interrogé par borgHelperWWW (supprime ~250 ms de
+démarrage + KDF par clic, mémo de décodage chaud d'un clic à l'autre) — **non réalisée**.
+
+### Décodage limité aux enfants directs (`TreeHist`, 1.0.121, piste 2)
+
+**Contrat (choix utilisateur).** Sur base chiffrée, `_treehist_listing` ne décode — donc ne vérifie — que le
+répertoire listé (son entrée propre, requête `path=?` sur la valeur stockée) et ses **enfants directs**. Un segment
+altéré plus profond n'est détecté qu'en descendant jusqu'à ce qu'il devienne enfant direct, ou par
+`TreeFind`/`Search`/`DuIdx`… (inchangés : décodage complet via `decode_path`). Le répertoire listé et ses enfants
+restent vérifiés à chaque affichage (préfixe décodé par le mémo par segment, puis un segment par enfant).
+
+**Mécanique.** AD-3 ne chiffre pas le séparateur `/` et l'alphabet stocké est ASCII (`A-Za-z0-9.-` + `/`) :
+`substr`/`instr` de SQLite y sont exacts au caractère près. Avec `skip = len(enc(préfixe))+1` (0 à la racine) et
+`rest = substr(path, skip+1)`, sous l'intervalle `_psel_under` :
+
+- `instr(rest,'/')=0` → lignes des enfants directs (type/droits/propriétaire), décodées une par une ;
+- `SELECT DISTINCT substr(rest,1,instr(rest,'/')-1)` pour `instr(rest,'/')>0` → segment chiffré de chaque enfant
+  ayant des descendants (répertoire, même sans ligne propre — ex. `lib` quand seul `/lib/modules` est sauvegardé),
+  décodé une fois : `children[nom]=True`.
+
+SQLite fait le tri structurel en C ; Python décode une valeur par entrée affichée au lieu d'une par ligne du
+sous-arbre (`…/kernel` de la démo : 6 474 → 15). Base `plain` : boucle Python d'origine, inchangée.
+
+**Mesures.** Sorties JSON identiques (14 cas : 7 préfixes de la racine à `…/drivers/net/ethernet`, avec et sans
+`-b ALL`) entre ancienne et nouvelle version, et entre base claire et copie chiffrée de la démo. Listing seul
+(profil, `…/kernel/drivers -b ALL`) : ~330 → ~90 ms ; de bout en bout, un processus par appel, le reste est le
+démarrage + KDF (piste 3). `PerfBench` 250k, deux paires en ordre alterné (machine bruitée : code clair inchangé
+variant de ±30 %) : `TreeHist` racine chiffré **2,85/4,15 s → 1,40/1,64 s**, désormais au niveau du clair
+(1,86–2,20 s) ; sous-répertoire profond : clair et chiffré équivalents, le coût restant (requêtes d'événements
+`_events_for`) est commun aux deux modes.
+
+**Contrôle.** `CodecSelfTest` « TreeHist chiffré, altération » (remplace le contrôle d'altération profonde à la
+racine) : 2e segment de `etc/sub` altéré → racine affichée avec `etc`, `TreeHist etc` en erreur propre ; 1er segment
+altéré → racine en erreur propre.
 
 ## Écriture des chemins et barrière de migration (1.0.102, chiffrement story 3)
 
