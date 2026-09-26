@@ -1,5 +1,24 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.117 / borgHelperWWW_ui.html 1.13.1 — fichiers modifiés pendant la sauvegarde, erreurs de lecture — 2026-09-26
+
+Suite de 1.0.116 (abandon de `borg create --list` comme source des changements) : on en garde le seul
+signal que `borg diff` ne fournit pas.
+
+- `borg create --list --filter CE` : statuts **C** (fichier modifié pendant sa sauvegarde — copie
+  possiblement incohérente) et **E** (erreur de lecture — fichier non ou partiellement sauvegardé).
+  Jamais utilisés comme un diff ; volume quasi nul ; actifs même avec `-I`.
+- Signalés par un `[WARN]` récapitulatif (stderr), dans le JSON de sortie du Bkp
+  (`borgHelper_backup_warnings`), et **enregistrés par archive** — visibles depuis l'interface web,
+  où un Bkp lancé en tâche de fond n'a pas de sortie consultable.
+- Schéma `diff.db` palier 8 : `archive_stats.changed_during_backup` / `read_errors` (ajout de colonnes,
+  NULL = inconnu). `store_archive_stats` devient un upsert : un rattrapage par `Index -F` ne les efface
+  jamais.
+- `ArchiveHistory -j` : champs `changed_during_backup` / `read_errors`.
+- UI : deux séries de points dans le graphique « Fichiers modifiés par archive ».
+- `CodecSelfTest` 324/324 ; essai réel : fichier illisible (`E`) et gros fichier modifié en continu
+  pendant la sauvegarde (`C`) détectés, signalés et enregistrés.
+
 ## borgHelper 1.0.116 — Bkp : indexation par le vrai borg diff (répertoires faussement « supprimés ») — 2026-09-26
 
 Défaut présent depuis borgHelper 0.45, trouvé en ajoutant le graphique des fichiers modifiés.

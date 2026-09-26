@@ -10,13 +10,13 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.116"
+Version="1.0.117"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
 #                           continue de l'ouvrir). Seule la future DbEncrypt écrira la maximale,
 #                           ce qui exclut les anciens binaires des SEULES bases chiffrées.
-DIFF_DB_SCHEMA_VERSION  = 7
+DIFF_DB_SCHEMA_VERSION  = 8
 CACHE_DB_SCHEMA_VERSION = 2
 DIFF_DB_BASE_SCHEMA_VERSION  = 4
 CACHE_DB_BASE_SCHEMA_VERSION = 1
@@ -36,6 +36,8 @@ CACHE_DB_BASE_SCHEMA_VERSION = 1
 #       une comparaison de schema_version)
 #   7 : bkp_status.start_notified_at (réclamation de début de sauvegarde, Story 2b
 #       spec-notifications-push — ALTER TABLE ADD COLUMN, même auto-réparation que les paliers 2-4)
+#   8 : archive_stats.changed_during_backup / read_errors (statuts C/E de borg create --list,
+#       1.0.117 — ALTER TABLE ADD COLUMN, NULL = inconnu : archives antérieures ou rattrapées par Index)
 # Ne concerne QUE diff.db, appelé par ensure_diff_db() — désormais garanti avant tout accès
 # depuis Bkp, Index, Prune (voir prune()) et tous les autres consommateurs de diff.db/cache.db.
 
@@ -119,6 +121,22 @@ def parse_diff_line(line):
     if m: return {'change_type':'modified','size_before':parse_borg_size(m.group(2)),'size_after':parse_borg_size(m.group(1)),'path':m.group(3)}
     m=re.match(r'^([A-Z])\s+(.+)$',line)
     if m: return {'change_type':m.group(1),'size_before':None,'size_after':None,'path':m.group(2)}
+    return None
+
+# Statuts de borg create --list conservés (1.0.117) — PAS un diff (voir backup()) : signal de qualité.
+#   C : fichier modifié PENDANT sa sauvegarde (copie possiblement incohérente : base, journal actif)
+#   E : erreur de lecture (fichier non sauvegardé ou partiellement)
+_BKP_WARN_STATUSES={'C':'changed_during_backup','E':'read_errors'}
+_BKP_WARN_PATHS_MAX=100  # chemins listés dans la sortie JSON/stderr (le compteur reste exact)
+
+def _bkp_file_status(i):
+    """(status, path) si `i` (entrée stderr de boex, dict --log-json ou chaîne) est une ligne
+    borg create --list, sinon None."""
+    if isinstance(i,dict):
+        if i.get('type')=='file_status': return i.get('status',''),i.get('path','')
+        if i.get('name')=='borg.output.list':
+            m=i.get('message','')
+            if len(m)>=3 and m[1]==' ': return m[0],m[2:]
     return None
 
 # Types de changement borg diff (--json-lines) qui ajoutent / suppriment une entrée — fichier,
@@ -1466,6 +1484,8 @@ class BorgHelperDB:
                     compressed_size    INTEGER,
                     deduplicated_size  INTEGER,
                     nfiles             INTEGER,
+                    changed_during_backup INTEGER,
+                    read_errors        INTEGER,
                     PRIMARY KEY (nick, archive)
                 );
                 CREATE INDEX IF NOT EXISTS idx_astats_nick ON archive_stats(nick);
@@ -1513,6 +1533,11 @@ class BorgHelperDB:
                 conn.execute("ALTER TABLE snapshot_file ADD COLUMN mode TEXT")
             if 'owner' not in sf_cols:
                 conn.execute("ALTER TABLE snapshot_file ADD COLUMN owner TEXT")
+            astats_cols=[r[1] for r in conn.execute("PRAGMA table_info(archive_stats)").fetchall()]
+            if 'changed_during_backup' not in astats_cols:
+                conn.execute("ALTER TABLE archive_stats ADD COLUMN changed_during_backup INTEGER")
+            if 'read_errors' not in astats_cols:
+                conn.execute("ALTER TABLE archive_stats ADD COLUMN read_errors INTEGER")
             bkps_cols=[r[1] for r in conn.execute("PRAGMA table_info(bkp_status)").fetchall()]
             if 'start_notified_at' not in bkps_cols:
                 conn.execute("ALTER TABLE bkp_status ADD COLUMN start_notified_at TEXT")
@@ -1635,13 +1660,22 @@ class BorgHelperDB:
         try: return self._with_lock_retry(_do)
         except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
 
-    def store_archive_stats(self,nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles,db_path=None):
+    def store_archive_stats(self,nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles,db_path=None,
+                            changed_during_backup=None,read_errors=None):
+        """Upsert (1.0.117, était INSERT OR REPLACE) : changed_during_backup/read_errors (statuts C/E
+        de borg create --list, connus seulement au Bkp) ne sont jamais remis à NULL par un appel qui ne
+        les fournit pas — ex. rattrapage des statistiques par Index -F."""
         if db_path is None: db_path=self.get_diff_db(nick)
         def _do():
             conn=_open_db(db_path,nick=nick,role='write')
             try:
-                conn.execute("INSERT OR REPLACE INTO archive_stats (nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles) VALUES (?,?,?,?,?,?,?,?)",
-                             (nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles))
+                conn.execute("INSERT INTO archive_stats (nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles,changed_during_backup,read_errors) "
+                             "VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(nick,archive) DO UPDATE SET "
+                             "archive_date=excluded.archive_date,duration=excluded.duration,original_size=excluded.original_size,"
+                             "compressed_size=excluded.compressed_size,deduplicated_size=excluded.deduplicated_size,nfiles=excluded.nfiles,"
+                             "changed_during_backup=COALESCE(excluded.changed_during_backup,archive_stats.changed_during_backup),"
+                             "read_errors=COALESCE(excluded.read_errors,archive_stats.read_errors)",
+                             (nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles,changed_during_backup,read_errors))
                 conn.commit(); return True
             finally: conn.close()
         try: return self._with_lock_retry(_do)
@@ -3088,10 +3122,10 @@ class BorgHelper:
                 archive_old=prev[0] if prev else None
             except Exception: archive_old=None
         create=['create']
-        # Jamais --list (1.0.116) : ses statuts ne décrivent pas un diff — 'd' = répertoire (était pris
-        # pour « supprimé » : tous les répertoires marqués supprimés à chaque Bkp), aucun fichier
-        # supprimé n'y figure jamais. Les changements de la paire viennent de l'Index post-Bkp (borg diff).
-        create.extend('--log-json --json --debug -v --stats'.split(' '))
+        # --list limité aux statuts C/E (1.0.117) : signal de qualité seulement, jamais un diff — les
+        # changements de la paire viennent de l'Index post-Bkp (borg diff, voir 1.0.116 : 'd' =
+        # répertoire, pris pour « supprimé »). Volume quasi nul ; actif même avec -I (pas de l'indexation).
+        create.extend('--log-json --json --debug -v --stats --list --filter CE'.split(' '))
         archname='root'
         if 'BORG_ARCHNAME' in cfg.keys(): archname=cfg['BORG_ARCHNAME']
         if archname[:2]=="::": create.append(archname+'-{now:%Y-%m-%dT%H%M%S}')
@@ -3131,8 +3165,14 @@ class BorgHelper:
             if 'stdout' in anaRet.keys() and len(anaRet['stdout']):
                 out=dict(anaRet['stdout'][0])
                 out['borghelper_version']=Version
+            warn={k:[] for k in _BKP_WARN_STATUSES.values()}
             if 'stderr' in anaRet.keys() and len(anaRet['stderr']):
                 for i in anaRet['stderr']:
+                    fs=_bkp_file_status(i)
+                    if fs is not None:
+                        key=_BKP_WARN_STATUSES.get(fs[0])
+                        if key and fs[1]: warn[key].append(fs[1])
+                        continue
                     if isinstance(i,dict):
                         lvl=i.get('levelname','INFO'); msg=i.get('message',str(i))
                         if lvl=='DEBUG' and not debug: continue
@@ -3140,6 +3180,14 @@ class BorgHelper:
                         if debug: printer(i)
                     elif isinstance(i,str) and i.strip():
                         print(i,file=sys.stderr,flush=True)
+            for key,label in (('changed_during_backup','fichier(s) modifié(s) PENDANT la sauvegarde — copie possiblement incohérente'),
+                              ('read_errors','erreur(s) de lecture — fichier(s) non ou partiellement sauvegardé(s)')):
+                if warn[key]:
+                    lst=warn[key][:_BKP_WARN_PATHS_MAX]
+                    more=f" (+{len(warn[key])-len(lst)} autres)" if len(warn[key])>len(lst) else ""
+                    printer(f"[WARN] {nick}: {len(warn[key])} {label} : {', '.join(lst)}{more}")
+            if out is not None:
+                out['borgHelper_backup_warnings']={k:{'count':len(v),'paths':v[:_BKP_WARN_PATHS_MAX]} for k,v in warn.items()}
             if newretC==0 and anaRet['stdout']:
                 try:
                     arch_info=anaRet['stdout'][0].get('archive',{})
@@ -3150,7 +3198,8 @@ class BorgHelper:
                     if archive_new:
                         st=arch_info.get('stats',{})
                         self.db.store_archive_stats(nick,archive_new,archive_new_date,arch_info.get('duration'),
-                            st.get('original_size'),st.get('compressed_size'),st.get('deduplicated_size'),st.get('nfiles'),db_path)
+                            st.get('original_size'),st.get('compressed_size'),st.get('deduplicated_size'),st.get('nfiles'),db_path,
+                            changed_during_backup=len(warn['changed_during_backup']),read_errors=len(warn['read_errors']))
                         cst=anaRet['stdout'][0].get('cache',{}).get('stats',{})
                         if cst.get('unique_csize') is not None:
                             self.db.store_repo_stats(nick,'bkp',cst['unique_csize'],cst.get('total_size'),cst.get('total_csize'),db_path)
@@ -4233,9 +4282,11 @@ class BorgHelper:
         try:
             conn=_open_db(db_path,nick=nick,role='read')
             rows=[{'archive':r[0],'archive_date':r[1],'duration':r[2],'original_size':r[3],
-                   'compressed_size':r[4],'deduplicated_size':r[5],'nfiles':r[6]}
+                   'compressed_size':r[4],'deduplicated_size':r[5],'nfiles':r[6],
+                   'changed_during_backup':r[7],'read_errors':r[8]}
                   for r in conn.execute(
-                      "SELECT archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles "
+                      "SELECT archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles,"
+                      "changed_during_backup,read_errors "
                       "FROM archive_stats WHERE nick=? ORDER BY archive_date",
                       (nick,)).fetchall()]
             conn.close()
@@ -5206,6 +5257,36 @@ def codec_selftest():
             return (a2['files_added']==3 and a2['files_modified']==3 and a2['files_removed']==2
                     and a1['files_added'] is None and a1['files_modified'] is None and a1['files_removed'] is None)
         check("ArchiveHistory -j : files_added/modified/removed = comptages de Report, null si paire non indexée",_rh_arch_file_counts)
+        # ── Statuts C/E de borg create --list (1.0.117) ──
+        check("Bkp --list C/E : lignes file_status (--log-json) et borg.output.list reconnues, autres ignorées",
+              lambda: (_bkp_file_status({'type':'file_status','status':'C','path':'var/lib/db'})==('C','var/lib/db')
+                       and _bkp_file_status({'name':'borg.output.list','message':'E etc/shadow'})==('E','etc/shadow')
+                       and _bkp_file_status({'levelname':'INFO','message':'x'}) is None
+                       and _bkp_file_status('texte libre') is None))
+        def _rh_arch_warn_counts():
+            p=bh_rh.db.get_diff_db('rhA')
+            bh_rh.db.store_archive_stats('rhA','A3','2026-03-01T00:00:00',7,30,24,18,120,db_path=p,changed_during_backup=2,read_errors=1)
+            # rattrapage des statistiques (Index -F) : ne fournit pas C/E -> jamais remis à NULL
+            bh_rh.db.store_archive_stats('rhA','A3','2026-03-01T00:00:00',7,31,25,19,121,db_path=p)
+            try:
+                rows={r['archive']:r for r in _rh_run(bh_rh.archive_history,'rhA',as_json=True)['rows']}
+                return (rows['A3']['changed_during_backup']==2 and rows['A3']['read_errors']==1 and rows['A3']['original_size']==31
+                        and rows['A1']['changed_during_backup'] is None and rows['A1']['read_errors'] is None)
+            finally:  # A3 retirée : les contrôles suivants comptent exactement A1/A2 pour rhA
+                c=sqlite3.connect(p); c.execute("DELETE FROM archive_stats WHERE nick='rhA' AND archive='A3'"); c.commit(); c.close()
+        check("archive_stats C/E : exposés par ArchiveHistory, conservés par un rattrapage Index, NULL si inconnus",_rh_arch_warn_counts)
+        def _astats_migration():
+            d=os.path.join(tmp,'astats-mig'); os.makedirs(d); dbp=os.path.join(d,'old.db')
+            c=sqlite3.connect(dbp)
+            c.execute("CREATE TABLE archive_stats (nick TEXT NOT NULL, archive TEXT NOT NULL, archive_date TEXT, duration REAL, "
+                      "original_size INTEGER, compressed_size INTEGER, deduplicated_size INTEGER, nfiles INTEGER, PRIMARY KEY (nick, archive))")
+            c.execute("INSERT INTO archive_stats VALUES ('m','X','2026-01-01',1,2,3,4,5)"); c.commit(); c.close()
+            bh_rh.db.ensure_diff_db(dbp)
+            c=sqlite3.connect(dbp)
+            cols=[r[1] for r in c.execute("PRAGMA table_info(archive_stats)").fetchall()]
+            row=c.execute("SELECT nfiles,changed_during_backup,read_errors FROM archive_stats WHERE archive='X'").fetchone(); c.close()
+            return 'changed_during_backup' in cols and 'read_errors' in cols and row==(5,None,None)
+        check("archive_stats : migration palier 8 (colonnes C/E ajoutées, lignes existantes intactes, NULL)",_astats_migration)
         check("ArchiveHistory -j : table vide -> rows=[]",
               lambda: _rh_run(bh_rh.archive_history,'rhEmpty',as_json=True)['rows']==[])
         check("ArchiveHistory -j : diff.db absent -> {'error':...}, pas une exception",

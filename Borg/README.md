@@ -288,6 +288,15 @@ partir du vrai `borg diff` de la paire (types de changement borg : `added`, `mod
 `added directory`, `removed directory`, `ctime`, `mode`...). Absentes si la paire n'est pas indexée
 (première archive, `-I`, `NOIDX=1`, Index post-Bkp interrompu) :
 
+**Fichiers modifiés pendant la sauvegarde / erreurs de lecture** (borgHelper ≥ 1.0.117) : `borg create`
+tourne avec `--list --filter CE` — seuls deux statuts sont retenus, jamais utilisés comme un diff :
+`C` (fichier modifié *pendant* sa lecture : copie possiblement incohérente — base de données, journal
+actif…) et `E` (erreur de lecture : fichier non ou partiellement sauvegardé). Signalés par un `[WARN]`
+récapitulatif sur stderr (100 chemins au plus, compteur exact), dans le JSON de sortie
+(`borgHelper_backup_warnings`: `{changed_during_backup: {count, paths}, read_errors: {count, paths}}`),
+et enregistrés par archive (`archive_stats`) : exposés par `ArchiveHistory -j` et visibles dans le
+graphique « Fichiers modifiés par archive » de l'interface web. Actif aussi avec `-I`.
+
 ```json
 {
   "archive": {
@@ -744,7 +753,9 @@ Depuis 1.0.115, en plus : `files_added`/`files_modified`/`files_removed` — nom
 modifiés (types `C`/`B`/`T` inclus) et supprimés par rapport à l'archive précédente, même source que la
 colonne « Modifs » de `Report` (fichiers exclus de l'indexation compris) ; `null` si cette paire
 d'archives n'est pas indexée (première archive, purgée par `DIFF_KEEP`, `NOIDX=1`, Index pas encore
-passé).
+passé). Et `changed_during_backup`/`read_errors` (1.0.117) : fichiers modifiés pendant la sauvegarde /
+erreurs de lecture, relevés par le Bkp — `null` si inconnus (archive antérieure, ou statistiques
+rattrapées par Index).
 
 `diff.db` jamais indexé : `{'error':'diff.db absent pour <nick>'}`, jamais une exception (même
 comportement que `IdxTop -j`).

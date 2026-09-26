@@ -356,9 +356,12 @@ erDiagram
 ```
 set_priority_lock(nick)                                  → <nick>-priority.lock (PID)
     ↓
-borg create --json --stats (jamais --list depuis 1.0.116)
+borg create --json --stats --list --filter CE   (1.0.117 : --list limité aux statuts C/E)
     ↓
-store_archive_stats(nick, archive_new, ...)              → archive_stats
+_bkp_file_status() sur stderr → C (modifié pendant la sauvegarde) / E (erreur de lecture)
+    → [WARN] résumé stderr + borgHelper_backup_warnings (JSON stdout)
+    ↓
+store_archive_stats(nick, archive_new, ..., changed_during_backup, read_errors) → archive_stats
 store_repo_stats(nick, 'bkp', ...)                       → repo_stats
     ↓
 clear_priority_lock(nick)                                → priority.lock supprimé (Bkp terminé)
@@ -1432,6 +1435,8 @@ sans risque même après une migration partielle ou un `schema_version` désynch
 | 3 | `snapshot_file.mode` | colonne `mode` absente sur `snapshot_file` | `ALTER TABLE snapshot_file ADD COLUMN mode TEXT` — droits unix ls-style (`{mode}` de `borg list`), colonne « droits » de `TreeHist` |
 | 4 | `snapshot_file.owner` | colonne `owner` absente sur `snapshot_file` | `ALTER TABLE snapshot_file ADD COLUMN owner TEXT` — `{user}:{group} ({uid}:{gid})` de `borg list`, colonne « propriétaire » de `TreeHist` |
 | 6 | `repo_stats` historique | colonne `op` absente sur `repo_stats` | `_migrate_repo_stats()` : ligne unique par nick (`INSERT OR REPLACE`) → historique append-only (`id` AUTOINCREMENT, `op`) — la ligne existante devient la première ligne `op='bkp'`, aucune valeur perdue |
+| 7 | `bkp_status.start_notified_at` | colonne absente | `ALTER TABLE ADD COLUMN` + backfill (lignes existantes marquées déjà notifiées) |
+| 8 | `archive_stats.changed_during_backup` / `read_errors` (1.0.117) | colonnes absentes | `ALTER TABLE ADD COLUMN` — NULL = inconnu (archives antérieures, ou rattrapées par Index : ces statuts ne sont connus qu'au Bkp). `store_archive_stats` devient un upsert (`ON CONFLICT DO UPDATE`, `COALESCE`) : un appel sans ces compteurs (rattrapage `Index -F`) ne les remet jamais à NULL |
 
 `ensure_diff_db()` est désormais garanti appelé (donc les migrations garanties appliquées) avant tout
 accès à `diff.db`/`cache.db` depuis **Bkp**, **Index**, **Prune** et tous les autres consommateurs —

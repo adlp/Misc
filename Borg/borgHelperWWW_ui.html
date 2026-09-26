@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.13.0 -->
+<!-- UI_VERSION: 1.13.1 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -887,12 +887,18 @@ function _renderArchiveExtraChart(id,r){
   const num=v=>(v===null||v===undefined)?null:v;
   let cfg, empty;
   if(id==='chartFileChanges'){
-    empty=!rows.some(row=>row.files_added!=null||row.files_modified!=null||row.files_removed!=null);
+    empty=!rows.some(row=>row.files_added!=null||row.files_modified!=null||row.files_removed!=null
+                          ||row.changed_during_backup!=null||row.read_errors!=null);
     cfg={type:'bar',
       data:{labels,datasets:[
         {label:'Ajoutés',data:rows.map(row=>num(row.files_added)),backgroundColor:'#1e7d3a',stack:'f'},
         {label:'Modifiés',data:rows.map(row=>num(row.files_modified)),backgroundColor:'#b8860b',stack:'f'},
-        {label:'Supprimés',data:rows.map(row=>num(row.files_removed)),backgroundColor:'#c0392b',stack:'f'}]},
+        {label:'Supprimés',data:rows.map(row=>num(row.files_removed)),backgroundColor:'#c0392b',stack:'f'},
+        // Signal de qualité de borg create (borgHelper ≥ 1.0.117), pas un diff : points hors barres.
+        {type:'line',label:'⚠ Modifiés pendant la sauvegarde',data:rows.map(row=>num(row.changed_during_backup)),
+         borderColor:'#6b46c1',backgroundColor:'#6b46c1',showLine:false,pointRadius:5,pointStyle:'rectRot',stack:'w1'},
+        {type:'line',label:'⚠ Erreurs de lecture',data:rows.map(row=>num(row.read_errors)),
+         borderColor:'#1a202c',backgroundColor:'#1a202c',showLine:false,pointRadius:6,pointStyle:'crossRot',stack:'w2'}]},
       options:{responsive:true,scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,ticks:{precision:0}}},
         plugins:{tooltip:{callbacks:{label:ctx=>ctx.dataset.label+' : '+(ctx.parsed.y??'—').toLocaleString()+' fichier(s)'}}}}};
   } else if(id==='chartDuration'){
