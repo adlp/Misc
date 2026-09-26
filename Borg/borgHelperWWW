@@ -62,7 +62,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.21.0"
+WWW_VERSION="1.22.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -2035,6 +2035,36 @@ def service_worker():
     return Response(content=_SW_JS,media_type='application/javascript',
                     headers={'Cache-Control':'no-cache','Service-Worker-Allowed':'/'})
 
+# Chart.js vendorisé (1.22.0) : graphiques de l'Historique complet sans accès Internet côté navigateur
+# (intranet, proxy restrictif). Copie fidèle de chart.umd.min.js (même empreinte SRI que le CDN, voir
+# vendor/README.md), lue une fois au démarrage. Absent -> [WARN], 404, et l'UI se replie sur le CDN.
+# Sur `app`, sans X-API-Key : chargé par une balise <script>, qui n'envoie aucun en-tête personnalisé.
+_CHARTJS_FILE=_VENDOR_DIR/'chartjs'/'chart.umd.min.js'
+_CHARTJS=_CHARTJS_FILE.read_bytes() if _CHARTJS_FILE.is_file() else None
+if _CHARTJS is None:
+    print(f"[WARN] Chart.js local introuvable ({_CHARTJS_FILE}) — graphiques chargés depuis le CDN "
+          "(cdn.jsdelivr.net), indisponibles si le navigateur n'y a pas accès",file=sys.stderr,flush=True)
+
+@app.get("/static/chart.umd.min.js",include_in_schema=False)
+def chartjs():
+    if _CHARTJS is None: raise HTTPException(404,detail="Chart.js absent de ce déploiement (vendor/chartjs/)")
+    # Version figée dans le nom de fichier côté vendor/ : cache navigateur d'une journée sans risque.
+    return Response(content=_CHARTJS,media_type='application/javascript',
+                    headers={'Cache-Control':'public, max-age=86400'})
+
+# favicon.ico (1.22.0) : servi s'il existe un fichier favicon.ico à côté de l'UI, sinon à côté de
+# borgHelperWWW — cherché à CHAQUE requête (déposer/retirer le fichier ne demande aucun redémarrage).
+# Chemins fixes, aucune entrée utilisateur. Absent -> 404, comme avant.
+_FAVICON_CANDIDATES=list(dict.fromkeys([_UI_FILE.parent/'favicon.ico',Path(__file__).resolve().parent/'favicon.ico']))
+
+@app.get("/favicon.ico",include_in_schema=False)
+def favicon():
+    for f in _FAVICON_CANDIDATES:
+        try: data=f.read_bytes()
+        except OSError: continue
+        return Response(content=data,media_type='image/x-icon',headers={'Cache-Control':'public, max-age=86400'})
+    raise HTTPException(404,detail="favicon.ico absent")
+
 @app.get("/version",tags=["lecture"],summary="Versions + postures de sécurité chargées au démarrage de borgHelperWWW — non protégé, aucune donnée sensible")
 def version():
     return {'borghelperwww_version':WWW_VERSION,'borghelper_version':BORGHELPER_VERSION,'ui_version':UI_VERSION,
@@ -2902,6 +2932,26 @@ def push_selftest():
                       lambda: (r.status_code==200 and 'javascript' in r.headers['content-type']
                                and r.headers.get('service-worker-allowed')=='/') if _SW_JS is not None
                               else r.status_code==404)
+                r=client.get("/static/chart.umd.min.js")
+                check("route /static/chart.umd.min.js : Chart.js local servi sans X-API-Key, identique au fichier vendor/",
+                      lambda: (r.status_code==200 and 'javascript' in r.headers['content-type']
+                               and r.content==_CHARTJS_FILE.read_bytes()) if _CHARTJS is not None
+                              else r.status_code==404)
+                def _favicon_ok():
+                    # Candidats redirigés vers un dossier temporaire : jamais de favicon.ico écrit à côté
+                    # du vrai borgHelperWWW par ce test.
+                    global _FAVICON_CANDIDATES
+                    old=_FAVICON_CANDIDATES; fav=os.path.join(tmpdir,'favicon.ico')
+                    _FAVICON_CANDIDATES=[Path(fav)]
+                    try:
+                        absent=client.get("/favicon.ico").status_code
+                        with open(fav,'wb') as f: f.write(b'\x00\x00\x01\x00ico')
+                        r2=client.get("/favicon.ico")
+                        return (absent==404 and r2.status_code==200 and r2.content==b'\x00\x00\x01\x00ico'
+                                and r2.headers['content-type']=='image/x-icon')
+                    finally:
+                        _FAVICON_CANDIDATES=old
+                check("route /favicon.ico : 404 si absent, fichier local servi dès qu'il existe (sans redémarrage)",_favicon_ok)
                 r=client.get("/version")
                 check("route /version : push_available + bornes d'expiration exposées",
                       lambda: {'push_available','push_default_expiry_days','push_max_expiry_days'}<=set(r.json()))

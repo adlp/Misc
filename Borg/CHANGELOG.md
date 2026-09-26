@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.22.0 / borgHelperWWW_ui.html 1.12.2 — Chart.js embarqué, favicon.ico local — 2026-09-26
+
+- **Chart.js embarqué** : copie de Chart.js 4.5.1 dans `vendor/chartjs/` (licence MIT), servie par
+  borgHelperWWW sur `/static/chart.umd.min.js` — les graphiques de l'Historique complet ne demandent
+  plus d'accès Internet au navigateur (intranet, proxy restrictif). Fichier absent du déploiement :
+  `[WARN]` au démarrage et repli automatique de l'UI sur le CDN. Même empreinte d'intégrité (SRI)
+  vérifiée dans les deux cas.
+- **`/favicon.ico`** : un fichier `favicon.ico` posé à côté de `borgHelperWWW_ui.html` (sinon à côté
+  de `borgHelperWWW`) est servi, sans clé API ; pris en compte sans redémarrage ; absent → 404.
+- `push_selftest` 56/56 ; essai réel : Chart.js servi à l'identique (empreinte vérifiée), favicon
+  absent → 404, déposé → servi, retiré → 404, sans redémarrage.
+
 ## borgHelper 1.0.114 / borgHelperWWW_ui.html 1.12.1 — graphiques d'évolution visibles, alimentés par Index — 2026-09-26
 
 Rapport utilisateur : graphiques d'évolution invisibles, chargement sans fin sur certains, et besoin

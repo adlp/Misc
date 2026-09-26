@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.12.1 -->
+<!-- UI_VERSION: 1.12.2 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -305,7 +305,10 @@
 
 <footer><a href="/">borgHelperWWW</a><span id="footerVersions"></span> — interface web — <a href="/docs" target="_blank" rel="noopener">Swagger / API</a></footer>
 
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ" crossorigin="anonymous"></script>
+<!-- Chart.js : copie locale servie par borgHelperWWW (vendor/chartjs/, fonctionne sans Internet) ;
+     repli sur le CDN si elle est absente. Même fichier, même empreinte SRI dans les deux cas. -->
+<script src="/static/chart.umd.min.js" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ"
+  onerror="(function(){var s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js';s.integrity='sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ';s.crossOrigin='anonymous';document.head.appendChild(s);})()"></script>
 <script>
 'use strict';
 
@@ -704,7 +707,7 @@ async function loadCharts(nick){
   if(seq!==chartsLoadSeq) return; // navigation plus récente entre-temps — ne jamais dessiner sur le nick actuel
 
   if(typeof Chart==='undefined'){
-    const msg='Bibliothèque de graphiques indisponible — CDN inaccessible ?';
+    const msg='Bibliothèque de graphiques indisponible — ni copie locale (vendor/chartjs/ sur le serveur), ni CDN accessible.';
     ['chartRepoSize','chartPruneGain','chartArchiveSize'].forEach(id=>_showChartMsg(id+'Msg',id,msg,true));
     return;
   }

@@ -39,7 +39,9 @@ Déployer l'arborescence `Borg/` complète (y compris `vendor/`) à l'emplacemen
 
 - `borgHelper` — CLI, exécutable seul.
 - `borgHelperWWW` + `borgHelperWWW_ui.html` + `borgHelperWWW_sw.js` + `vendor/` — API HTTP, seulement
-  si utilisée.
+  si utilisée. `vendor/` contient aussi Chart.js (graphiques, servi localement : aucun accès Internet
+  requis côté navigateur).
+- `favicon.ico` (optionnel) — à côté de `borgHelperWWW_ui.html`, servi sur `/favicon.ico`.
 - `borgHelperWWW.py` — symlink vers `borgHelperWWW`, **requis uniquement** pour
   `uvicorn borgHelperWWW:app` (uvicorn importe le module par son nom et échoue sans l'extension
   `.py` — inutile en exécution directe `python3 borgHelperWWW ...`).

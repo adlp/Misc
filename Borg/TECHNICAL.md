@@ -2730,6 +2730,14 @@ seulement à l'ouverture/après enregistrement (`renderNotifForm`), jamais par u
 Vérifié : `push_selftest` 54/54 ; essai réel (Bkp réussi sur un host « échec seul » → rien ; Bkp en
 échec forcé → push `result:error` reçu et déchiffré).
 
+**Fichiers statiques (1.22.0)** : `/static/chart.umd.min.js` — `vendor/chartjs/chart.umd.min.js` lu
+une fois au démarrage (`_CHARTJS`, `[WARN]` si absent → 404), `Cache-Control: public, max-age=86400` ;
+l'UI le charge avec `integrity` (même SRI que le CDN) et `onerror` → injection de la balise CDN.
+`/favicon.ico` — `_FAVICON_CANDIDATES` (à côté de l'UI, puis de `borgHelperWWW`), relu à chaque requête
+(pas de cache mémoire : dépôt/retrait sans redémarrage), `image/x-icon`, 404 sinon. Tous deux sur `app`
+(sans préfixe API ni `X-API-Key` : balises `<script>`/requête d'icône implicite du navigateur).
+`push_selftest` 56/56 (deux contrôles `TestClient` dédiés, favicon testé dans un dossier temporaire).
+
 **Envoi (1.20.2)** : `webpush(..., timeout=PUSH_SEND_TIMEOUT, ttl=...)` — sans `timeout`, pywebpush
 transmet `timeout=None` à `requests` (attente infinie si le service push est injoignable : bouton de
 test sans réponse) ; sans `ttl`, il envoie `TTL: 0`, le service push acceptant (201) puis jetant le

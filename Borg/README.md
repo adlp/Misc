@@ -1433,17 +1433,21 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
    - **🗑 Supprimer** (`DelBkp`) : supprime définitivement cette archive — confirmation, 🔑 passphrase.
    - Bouton **⚡ Lancer Prune** en haut de la vue (portée sur tout le dépôt, pas une archive précise,
      selon `KEEP_*` de la conf) — confirmation, 🔑 passphrase.
-   - Sous le tableau, une carte **Évolution** avec trois graphiques Chart.js (chargés via
-     `/repohistory`/`/archivehistory`, en plus du tableau `/report` ci-dessus) : taille du dépôt dans
-     le temps (`unique_csize`/`total_size`/`total_csize`, un point par Bkp/Prune), gain Prune (delta
+   - Au-dessus du tableau (UI ≥ 1.12.1), une carte **Évolution** avec trois graphiques Chart.js
+     (chargés via `/repohistory`/`/archivehistory`) : taille du dépôt dans le temps
+     (`unique_csize`/`total_size`/`total_csize`, un point par Bkp, Prune ou Index), gain Prune (delta
      calculé côté navigateur, jamais stocké), et métriques par archive dans le temps
      (`original_size`/`compressed_size`/`deduplicated_size`). Nick sans historique ou sans Prune :
-     message à la place du graphique concerné.
-     **Dépendance réseau** : ces graphiques chargent Chart.js depuis un CDN externe
-     (`cdn.jsdelivr.net`) — contrairement au reste du projet, conçu pour fonctionner entièrement
-     hors-ligne/en local, cette carte **Évolution** nécessite un accès réseau sortant vers ce CDN ; si
-     le CDN est inaccessible, un message d'erreur s'affiche à la place des graphiques (le reste de la
-     page reste fonctionnel).
+     message à la place du graphique concerné — un `Index` complète les données manquantes.
+     **Chart.js embarqué** (borgHelperWWW ≥ 1.22.0) : copie locale `vendor/chartjs/`, servie par
+     borgHelperWWW sur `/static/chart.umd.min.js` — aucun accès Internet requis côté navigateur. Si
+     elle est absente du déploiement (`[WARN]` au démarrage), l'UI se replie sur le CDN
+     (`cdn.jsdelivr.net`) ; ni l'une ni l'autre : message à la place des graphiques, le reste de la
+     page reste fonctionnel. Même empreinte d'intégrité (SRI) vérifiée dans les deux cas.
+
+**Icône du site** (borgHelperWWW ≥ 1.22.0) : un fichier `favicon.ico` posé à côté de
+`borgHelperWWW_ui.html` (sinon à côté de `borgHelperWWW`) est servi sur `/favicon.ico`, sans clé API —
+pris en compte immédiatement, sans redémarrage. Absent : `404`, comme avant.
 
 Cette page HTML elle-même n'est pas protégée par `X-API-Key` (elle ne contient aucun secret — la clé et
 les passphrases ne sont saisies et envoyées que depuis le navigateur, via `fetch()`) ; c'est l'API qui

@@ -182,6 +182,8 @@ accessibles sans préfixe).
 | POST/PATCH/GET/DELETE | `/push/subscribe`, `/push/subscriptions` | Gestion des abonnements push | voir `push.db` et fichier JSON ci-dessus |
 | POST | `/push/test` | Envoie une notification de test à un abonnement | |
 | GET | `/sw.js` | Service Worker des notifications | Non protégé (contrainte navigateur) |
+| GET | `/static/chart.umd.min.js` | Chart.js embarqué (`vendor/chartjs/`) | Non protégé |
+| GET | `/favicon.ico` | Icône, si un `favicon.ico` local existe | Non protégé |
 
 Format de réponse : la plupart des routes GET/POST retournent un `CommandResult` (JSON structuré,
 même schéma qu'une commande CLI `-j`) — la commande sous-jacente exacte et son mapping vers l'option
