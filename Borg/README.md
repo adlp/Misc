@@ -1858,7 +1858,12 @@ abonnement non expiré dont les préférences (fichier JSON) activent, **pour ce
 correspondant : `start` pour un début, `success` pour une fin réussie, `error` pour toute autre fin
 (erreur, timeout AD-7). Payload JSON (affiché par le
 Service Worker) : `{"nick":..., "event":"start"|"end"|"test", "result":"success"|"error"|null,
-"timestamp":...}` — `result` toujours `null` pour un début ou un test.
+"timestamp":...}` — `result` toujours `null` pour un début ou un test. Fin de sauvegarde
+(borgHelperWWW ≥ 1.23.0 / borgHelper ≥ 1.0.118) : en plus `changed_during_backup` / `read_errors`
+(fichiers modifiés pendant la sauvegarde / erreurs de lecture, voir `Bkp`) quand ils sont connus. Une
+sauvegarde réussie avec avertissements s'affiche « ⚠️ Sauvegarde terminée avec avertissements — nick »
+(ex. « Bkp réussi — 2 fichiers modifiés pendant la sauvegarde, 1 erreur de lecture ») ; un échec
+mentionne aussi ces compteurs. Le type reste « succès » ou « échec » pour les réglages par host.
 
 Un abonnement mort côté navigateur (le service de push répond `404`/`410`) est désabonné
 automatiquement (même requête que `DELETE /push/subscribe`). Toute autre erreur (réseau, autre code

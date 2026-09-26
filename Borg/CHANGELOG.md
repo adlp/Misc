@@ -1,5 +1,19 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.118 / borgHelperWWW 1.23.0 / borgHelperWWW_sw.js 1.1.0 — avertissements dans la notification de fin — 2026-09-26
+
+- La notification de fin de sauvegarde mentionne les fichiers modifiés pendant la sauvegarde et les
+  erreurs de lecture (statuts C/E, 1.0.117) : « ⚠️ Sauvegarde terminée avec avertissements — nick /
+  Bkp réussi — 2 fichiers modifiés pendant la sauvegarde, 1 erreur de lecture ». Un échec les
+  mentionne aussi. Sans avertissement : notification inchangée (✅).
+- Le type de notification (succès/échec) et donc le filtrage par host ne changent pas.
+- Schéma `diff.db` palier 9 : `bkp_status.changed_during_backup` / `read_errors`, écrits par le Bkp
+  avec son résultat et relus par le watcher ; payload push enrichi des deux compteurs quand ils sont
+  connus.
+- `CodecSelfTest` 325/325, `push_selftest` 58/58 ; essai réel de bout en bout (watcher, faux service
+  push déchiffrant) : Bkp réussi et Bkp en échec, tous deux avec un fichier modifié pendant la
+  sauvegarde et un fichier illisible → notification reçue avec les deux compteurs.
+
 ## borgHelper 1.0.117 / borgHelperWWW_ui.html 1.13.1 — fichiers modifiés pendant la sauvegarde, erreurs de lecture — 2026-09-26
 
 Suite de 1.0.116 (abandon de `borg create --list` comme source des changements) : on en garde le seul

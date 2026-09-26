@@ -10,13 +10,13 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.117"
+Version="1.0.118"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
 #                           continue de l'ouvrir). Seule la future DbEncrypt écrira la maximale,
 #                           ce qui exclut les anciens binaires des SEULES bases chiffrées.
-DIFF_DB_SCHEMA_VERSION  = 8
+DIFF_DB_SCHEMA_VERSION  = 9
 CACHE_DB_SCHEMA_VERSION = 2
 DIFF_DB_BASE_SCHEMA_VERSION  = 4
 CACHE_DB_BASE_SCHEMA_VERSION = 1
@@ -38,6 +38,8 @@ CACHE_DB_BASE_SCHEMA_VERSION = 1
 #       spec-notifications-push — ALTER TABLE ADD COLUMN, même auto-réparation que les paliers 2-4)
 #   8 : archive_stats.changed_during_backup / read_errors (statuts C/E de borg create --list,
 #       1.0.117 — ALTER TABLE ADD COLUMN, NULL = inconnu : archives antérieures ou rattrapées par Index)
+#   9 : bkp_status.changed_during_backup / read_errors (mêmes compteurs, portés jusqu'à la
+#       notification push de fin de sauvegarde, 1.0.118 — ALTER TABLE ADD COLUMN, NULL = inconnu)
 # Ne concerne QUE diff.db, appelé par ensure_diff_db() — désormais garanti avant tout accès
 # depuis Bkp, Index, Prune (voir prune()) et tous les autres consommateurs de diff.db/cache.db.
 
@@ -1496,6 +1498,8 @@ class BorgHelperDB:
                     finished_at TEXT,
                     result      TEXT,
                     notified_at TEXT,
+                    changed_during_backup INTEGER,
+                    read_errors INTEGER,
                     PRIMARY KEY (nick, run_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_bkpstatus_pending ON bkp_status(nick, notified_at, finished_at);
@@ -1539,6 +1543,8 @@ class BorgHelperDB:
             if 'read_errors' not in astats_cols:
                 conn.execute("ALTER TABLE archive_stats ADD COLUMN read_errors INTEGER")
             bkps_cols=[r[1] for r in conn.execute("PRAGMA table_info(bkp_status)").fetchall()]
+            for col in ('changed_during_backup','read_errors'):
+                if col not in bkps_cols: conn.execute(f"ALTER TABLE bkp_status ADD COLUMN {col} INTEGER")
             if 'start_notified_at' not in bkps_cols:
                 conn.execute("ALTER TABLE bkp_status ADD COLUMN start_notified_at TEXT")
                 # Backfill obligatoire (revue de code) : sans lui, chaque ligne bkp_status déjà
@@ -1697,14 +1703,16 @@ class BorgHelperDB:
         try: return self._with_lock_retry(_do)
         except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
 
-    def store_bkp_status_finish(self,nick,run_id,result,db_path=None):
+    def store_bkp_status_finish(self,nick,run_id,result,db_path=None,changed_during_backup=None,read_errors=None):
         """Écrite par backup() à la fin normale, avant sys.exit(newretC) — result dérivé du même
-        newretC qu'aujourd'hui ('success' si 0, sinon 'error')."""
+        newretC qu'aujourd'hui ('success' si 0, sinon 'error'). changed_during_backup/read_errors
+        (1.0.118) : statuts C/E de borg create --list, repris dans la notification push de fin."""
         if db_path is None: db_path=self.get_diff_db(nick)
         def _do():
             conn=_open_db(db_path,nick=nick,role='write')
             try:
-                conn.execute("UPDATE bkp_status SET finished_at=datetime('now'),result=? WHERE nick=? AND run_id=?",(result,nick,run_id))
+                conn.execute("UPDATE bkp_status SET finished_at=datetime('now'),result=?,changed_during_backup=?,read_errors=? "
+                             "WHERE nick=? AND run_id=?",(result,changed_during_backup,read_errors,nick,run_id))
                 conn.commit(); return True
             finally: conn.close()
         try: return self._with_lock_retry(_do)
@@ -1735,11 +1743,12 @@ class BorgHelperDB:
         try:
             conn=_open_db(db_path,nick=nick,role='read')
             rows=conn.execute(
-                "SELECT run_id,started_at,finished_at,result FROM bkp_status WHERE nick=? AND notified_at IS NULL "
+                "SELECT run_id,started_at,finished_at,result,changed_during_backup,read_errors FROM bkp_status WHERE nick=? AND notified_at IS NULL "
                 f"AND (finished_at IS NOT NULL OR started_at < datetime('now','-{int(timeout_s)} seconds'))",
                 (nick,)).fetchall()
             conn.close()
-            return [{'run_id':r[0],'started_at':r[1],'finished_at':r[2],'result':r[3]} for r in rows]
+            return [{'run_id':r[0],'started_at':r[1],'finished_at':r[2],'result':r[3],
+                     'changed_during_backup':r[4],'read_errors':r[5]} for r in rows]
         except sqlite3.Error: return []
 
     def claim_bkp_status(self,nick,run_id,db_path=None):
@@ -3227,7 +3236,8 @@ class BorgHelper:
                     printer(f"[WARN] indexation post-backup échouée : {e}")
             if out is not None:
                 print(json.dumps(out,indent=4),file=sys.stdout,flush=True)
-            self.db.store_bkp_status_finish(nick,run_id,'success' if newretC==0 else 'error',bkp_status_db)
+            self.db.store_bkp_status_finish(nick,run_id,'success' if newretC==0 else 'error',bkp_status_db,
+                changed_during_backup=len(warn['changed_during_backup']),read_errors=len(warn['read_errors']))
             sys.exit(newretC)
         finally:
             self.db.clear_priority_lock(nick)
@@ -5377,6 +5387,12 @@ def codec_selftest():
             pending={r['run_id'] for r in bh.list_pending_bkp_status('bsB',100,db_path=bs_path)}
             return pending=={'runFinished','runStale'}
         check("bkp_status : list_pending_bkp_status -> lignes finies + bloquées > timeout (AD-7), jamais les récentes",_bs_pending_query)
+        def _bs_warn_counts():
+            bh.store_bkp_status_start('bsW','runW',db_path=bs_path)
+            bh.store_bkp_status_finish('bsW','runW','success',db_path=bs_path,changed_during_backup=3,read_errors=0)
+            r=[x for x in bh.list_pending_bkp_status('bsW',100,db_path=bs_path) if x['run_id']=='runW'][0]
+            return r['changed_during_backup']==3 and r['read_errors']==0
+        check("bkp_status : compteurs C/E écrits à la fin et relus par list_pending_bkp_status (notification)",_bs_warn_counts)
         def _bs_claim_cas():
             bh.store_bkp_status_start('bsC','runC',db_path=bs_path)
             bh.store_bkp_status_finish('bsC','runC','success',db_path=bs_path)

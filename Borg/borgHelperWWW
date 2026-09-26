@@ -62,7 +62,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.22.0"
+WWW_VERSION="1.23.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -343,9 +343,11 @@ def _bkp_status_watcher_pass():
                 if not _bh_paths.db.claim_bkp_status(nick,row['run_id'],db_path):
                     continue  # déjà réclamée par un autre worker (CAS perdu) — jamais de double traitement
                 result=row['result'] if row['finished_at'] else 'error'  # AD-7 : jamais fini = échec
-                print(f"[watcher] bkp_status (fin) réclamé : nick={nick} run_id={row['run_id']} result={result}",
-                      file=sys.stderr,flush=True)
-                _send_bkp_push(nick,'end',result)
+                # borgHelper >= 1.0.118 : statuts C/E de borg create (absents = inconnus).
+                warnings={k:row.get(k) for k in ('changed_during_backup','read_errors')}
+                print(f"[watcher] bkp_status (fin) réclamé : nick={nick} run_id={row['run_id']} result={result}"
+                      +''.join(f" {k}={v}" for k,v in warnings.items() if v),file=sys.stderr,flush=True)
+                _send_bkp_push(nick,'end',result,warnings)
             for row in _bh_paths.db.list_pending_bkp_status_start(nick,db_path):
                 if not _bh_paths.db.claim_bkp_status_start(nick,row['run_id'],db_path):
                     continue  # déjà réclamée par un autre worker (CAS perdu) — jamais de double traitement
@@ -1179,7 +1181,7 @@ def _push_subscriptions_for(nick,kind):
     finally:
         conn.close()
 
-def _send_bkp_push(nick,event,result):
+def _send_bkp_push(nick,event,result,warnings=None):
     """Envoie un push réel à chaque abonnement matché pour cet événement (`event`: 'start'|'end',
     `result`: None pour un début, 'success'/'error' pour une fin). Erreur définitive (404/410,
     abonnement mort côté navigateur) -> désabonnement automatique ; toute autre erreur (réseau,
@@ -1195,8 +1197,13 @@ def _send_bkp_push(nick,event,result):
         print(f"[watcher] push: erreur lecture abonnements nick={nick} : {e}",file=sys.stderr,flush=True)
         return
     if not subs: return
-    payload=json.dumps({'nick':nick,'event':event,'result':result,
-                         'timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat()})
+    # warnings (fin de sauvegarde, 1.23.0) : {'changed_during_backup': n|None, 'read_errors': n|None} —
+    # fichiers modifiés pendant la sauvegarde / erreurs de lecture, affichés par le Service Worker.
+    # N'influe jamais sur le type de notification (succès/échec) ni donc sur le filtrage par host.
+    data={'nick':nick,'event':event,'result':result,
+          'timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    if warnings: data.update({k:v for k,v in warnings.items() if v is not None})
+    payload=json.dumps(data)
     for row in subs:
         endpoint=row['endpoint']
         subscription_info={'endpoint':endpoint,'keys':{'p256dh':row['p256dh'],'auth':row['auth']}}
@@ -2832,7 +2839,16 @@ def push_selftest():
                   lambda: all(json.loads(d)['nick']=='nickPush' and json.loads(d)['event']=='end'
                               and json.loads(d)['result']=='success' and 'timestamp' in json.loads(d)
                               for _,d in sent_to))
+            check("push : sans avertissements -> aucun compteur C/E dans le payload",
+                  lambda: all('changed_during_backup' not in json.loads(d) and 'read_errors' not in json.loads(d) for _,d in sent_to))
             check("push : envoi réussi -> abonnement conservé",lambda: _sub_exists('push-ep-ok'))
+            def _payload_warnings_ok():
+                sent_to.clear()
+                with mock.patch(f"{__name__}.webpush",side_effect=_fake_webpush):
+                    _send_bkp_push('nickPush','end','success',{'changed_during_backup':2,'read_errors':None})
+                ds=[json.loads(d) for _,d in sent_to]
+                return bool(ds) and all(d['changed_during_backup']==2 and 'read_errors' not in d and d['result']=='success' for d in ds)
+            check("push : avertissements C/E transmis dans le payload (inconnus omis), type succès inchangé",_payload_warnings_ok)
             check("push : WebPushException status_code=410 -> abonnement désabonné automatiquement (push.db ET JSON)",
                   lambda: conn.execute("SELECT 1 FROM push_subscriptions WHERE endpoint='push-ep-410'").fetchone() is None
                           and 'push-ep-410' not in _push_prefs_load()['subscriptions'])
