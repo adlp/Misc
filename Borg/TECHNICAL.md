@@ -1658,6 +1658,42 @@ tel quel en `500` non catché. C'est la seule route du projet où le contrat hab
 0` ⇒ 400, sinon 200 » (voir plus bas) ne s'applique pas : une config invalide en cours d'exécution
 produit un `500` FastAPI standard (exception non gérée), pas un `CommandResult` avec `exitcode`.
 
+### Scission lecture/restauration du périmètre (`GROUPS_PATHS_RESTORE`, `spec-groups-paths-restore`)
+
+Demande utilisateur directe : `GROUPS_PATHS` (ci-dessus) restreignait un même périmètre pour la
+lecture ET la restauration — un seul réglage pour deux besoins distincts. `_resolve_path_scope` gagne
+un paramètre `for_restore=False` : si `True`, résout `groups_paths={**_parse_groups_paths(GROUPS_PATHS),
+**_parse_groups_paths(GROUPS_PATHS_RESTORE)}` — **override par groupe**, jamais un remplacement
+global des deux dicts l'un par l'autre. Un groupe présent dans `GROUPS_PATHS_RESTORE` utilise ce
+périmètre-là ; un groupe absent de `GROUPS_PATHS_RESTORE` mais présent dans `GROUPS_PATHS` garde son
+entrée lecture (repli rétro-compatible — une config qui n'utilise que `GROUPS_PATHS`, comme avant
+cette scission, restreint la restauration de la même façon que la lecture, sans rien changer pour les
+déploiements existants).
+
+**Frontière d'implémentation, trouvée par investigation avant tout code** : `require_path_in_scope()`
+(garde pré-appel Story 2.1, voir plus bas) n'a que **quatre appelants dans tout `borgHelperWWW`** —
+`download_file`, `download_tar`, `restore_perms`, `restore` — et ce sont, sans exception, les quatre
+seules routes de restauration/téléchargement du fichier. Aucune route de lecture ne passe par
+`require_path_in_scope` (toutes appellent `_resolve_scopes_for_request`/`_resolve_single_scope`/
+`_resolve_path_scope` directement). Conséquence : `require_path_in_scope` passe désormais
+inconditionnellement `for_restore=True` à `_resolve_scopes_for_request` — **aucun des ~10 call sites
+de lecture n'a eu besoin d'être touché**, la frontière existante dans le code correspondait déjà
+exactement à la distinction lecture/restauration demandée.
+
+`GET /access` (informationnel) expose désormais `read_scope`/`restore_scope` séparément par nick
+(remplace l'ancien champ unique `scope`) — appelle `_resolve_path_scope` deux fois (`for_restore=False`
+puis `True`), cohérent avec le reste : `_effective_level`/le tier restent inchangés, seule la
+restriction de chemin se scinde.
+
+⚠️ **Aucune permission UNIX de l'host sauvegardé n'entre en jeu, à aucun moment** — investigué à la
+demande explicite de l'utilisateur, confirmé par lecture directe du code : `Search`/`TreeFind`/
+`FileHist`/`TreeHist` (Story 1.3 ci-dessous) lisent exclusivement `archive_snapshot_v`/`diff_index`
+(SQLite, alimenté une fois pour toutes par `Index`) ; `Restore`/`listperms` (`-L`) appellent `borg
+list`/`borg extract` contre l'**archive** (`borgHelper:2957` `listperms`, `borgHelper:2973`
+`restore` — métadonnées `mode`/`user`/`group` figées au moment du `Bkp`, immuables), jamais un
+`os.stat`/`os.access` sur l'host distant ni sur le serveur `borgHelperWWW`. Le RBAC
+(`GROUPS_PATHS`/`GROUPS_PATHS_RESTORE`) est le **seul** filtre d'autorisation sur toute cette chaîne.
+
 ### Filtrage a posteriori par périmètre — Search/FileHist/LstBkpFls/DiffBkp/TreeHist/TreeFind (Story 1.3)
 
 Applique le périmètre résolu par Story 1.1 (`_resolve_path_scope`) aux six commandes de lecture qui

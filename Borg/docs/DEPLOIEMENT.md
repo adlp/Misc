@@ -138,20 +138,28 @@ comportement qu'`uvicorn` lui-même sans ce réglage.
 `groups_header` (voir tableau ci-dessus) active le RBAC par groupes : un reverse proxy OIDC/
 `auth_request` en amont pose un header (ex. `X-Groups`) listant les groupes de l'utilisateur, chaque
 nick du `.borghelperrc` porte `GROUPS_ADMIN`/`GROUPS_WRITE`/`GROUPS_READ` (quelles routes/commandes)
-et, orthogonalement, `GROUPS_PATHS` (quel sous-répertoire, restriction jamais un tier de plus).
+et, orthogonalement, un périmètre de chemin **scindé lecture/restauration** (`spec-
+groups-paths-restore`, restriction jamais un tier de plus) : `GROUPS_PATHS` pour la lecture
+(`Search`/`TreeFind`/`FileHist`/...), `GROUPS_PATHS_RESTORE` pour la restauration/téléchargement
+(`Restore`/`DownloadFile`/`DownloadTar`) — un groupe sans entrée dans `GROUPS_PATHS_RESTORE` reprend
+simplement son entrée `GROUPS_PATHS` (repli rétro-compatible).
 
 Cas d'usage type : un fileserver sauvegardé en un seul dépôt, où plusieurs groupes doivent pouvoir
 chercher/restaurer chacun **uniquement dans son propre périmètre**, sans voir le reste du serveur —
 les admins IT gardant, eux, un accès complet. Exemple complet et commenté (nick fictif
 `[fileserver01]`) illustrant la diversité de syntaxe possible : un groupe borné à un seul répertoire
 (`AD-Borg-Restore-RH`), un groupe borné à plusieurs répertoires à la fois (`AD-Borg-Restore-Direction`,
-`|`), et deux groupes distincts partageant le même répertoire (`AD-Borg-Restore-Compta`/
-`AD-Borg-Restore-Audit`) : [`docs/borghelperrc.example`](borghelperrc.example), section
+`|`), deux groupes distincts partageant le même répertoire (`AD-Borg-Restore-Compta`/
+`AD-Borg-Restore-Audit`), et un groupe avec une lecture large mais une restauration restreinte
+(`AD-Borg-Restore-Audit` peut chercher partout sous `/srv/data/compta` mais ne restaure que depuis
+`/srv/data/compta/archives`) : [`docs/borghelperrc.example`](borghelperrc.example), section
 « EXEMPLE COMPLET » en bas de fichier.
 
 Le périmètre de chemin est vérifié **côté serveur** à chaque requête (`_resolve_path_scope`,
 `TECHNICAL.md`) — jamais une simple restriction d'affichage côté UI, un `Restore` visant un chemin
-hors périmètre est refusé même en connaissant le chemin exact.
+hors périmètre est refusé même en connaissant le chemin exact. **Aucune permission UNIX de l'host
+sauvegardé n'intervient jamais** dans cette décision — être dans le périmètre RBAC suffit strictement
+(voir `docs/TECHNIQUE.md`, section Auth, pour la preuve détaillée).
 
 ⚠️ Le header n'est vérifié que pour sa **valeur**, pas sa provenance — ce mécanisme suppose que
 `borgHelperWWW` n'est atteignable QUE via le reverse proxy de confiance qui pose ce header (bind

@@ -107,13 +107,26 @@ accessibles sans préfixe).
 - **`X-API-Key`** (header) — obligatoire sur toute route protégée, comparaison à temps constant.
 - **RBAC par groupes** (optionnel, `groups_header`) — un reverse proxy (OIDC/`auth_request`) injecte
   un header listant les groupes de l'appelant ; chaque nick porte `GROUPS_ADMIN`/`GROUPS_WRITE`/
-  `GROUPS_READ` (niveaux hiérarchiques) et optionnellement `GROUPS_PATHS` (restriction à un ou
-  plusieurs sous-répertoires, orthogonale au niveau — jamais un tier de plus) dans son
-  `.borghelperrc`. Exemple complet (un groupe borné à un seul répertoire, un groupe borné à plusieurs
-  répertoires à la fois, deux groupes distincts partageant le même répertoire) :
-  [`docs/borghelperrc.example`](borghelperrc.example) et [DEPLOIEMENT.md §7](DEPLOIEMENT.md#7-rbac-par-groupes--restreindre-laccès-à-un-répertoire-ex-restaurations).
+  `GROUPS_READ` (niveaux hiérarchiques) et optionnellement un périmètre de chemin, orthogonal au
+  niveau (jamais un tier de plus), **scindé lecture/restauration** (`spec-groups-paths-restore`) :
+  `GROUPS_PATHS` pour la lecture (`Search`/`TreeFind`/`FileHist`/`TreeHist`/`Report`/`DiffBkp`/
+  `DuIdx`/`IdxTop`/`DiffTop`), `GROUPS_PATHS_RESTORE` pour la restauration/téléchargement
+  (`Restore`/`RestorePerms`/`DownloadFile`/`DownloadTar`) — un groupe sans entrée dans
+  `GROUPS_PATHS_RESTORE` reprend son entrée `GROUPS_PATHS` (repli rétro-compatible). Exemple complet
+  (un groupe borné à un seul répertoire, un groupe borné à plusieurs répertoires à la fois, deux
+  groupes distincts partageant le même répertoire, un groupe avec lecture large et restauration
+  restreinte) : [`docs/borghelperrc.example`](borghelperrc.example) et
+  [DEPLOIEMENT.md §7](DEPLOIEMENT.md#7-rbac-par-groupes--restreindre-laccès-à-un-répertoire-ex-restaurations).
   Mécanique complète et avertissement de sécurité (le header est forgeable si le reverse proxy n'est
   pas la seule voie d'accès) : voir `TECHNICAL.md` et `README.md`, section RBAC.
+- **Aucune permission UNIX de l'host sauvegardé n'intervient jamais dans ces décisions** — vérifié
+  directement dans le code : `Search`/`TreeFind`/`FileHist`/`TreeHist` lisent exclusivement l'index
+  SQLite (`archive_snapshot_v`/`diff_index`, alimenté une fois pour toutes par `Index`, jamais un
+  accès live à l'host) ; `Restore`/`RestorePerms` (`-L`) appellent `borg list`/`borg extract` contre
+  l'**archive** (métadonnées `mode`/`user`/`group` figées au moment du `Bkp`, immuables), jamais un
+  `os.stat`/`os.access` sur l'host distant ou sur le serveur `borgHelperWWW`. Être dans le périmètre
+  RBAC (`GROUPS_PATHS`/`GROUPS_PATHS_RESTORE`) suffit strictement — aucun droit supplémentaire requis
+  sur quelque machine que ce soit pour voir ou restaurer ce qui est dans son périmètre.
 - `groups_header` (et les autres réglages `borgHelperWWW`) se configurent par CLI, variable
   d'environnement, `borghelperwww.conf` (`--conf`), ou — depuis 1.18.4 — une section
   `[_borgHelperWWW]` du `.borghelperrc` lui-même (déploiement à fichier unique, voir

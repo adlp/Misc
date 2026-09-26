@@ -39,7 +39,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.18.6"
+WWW_VERSION="1.18.7"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -399,11 +399,17 @@ def require_downloads_allowed():
 # la même hypothèse que le déploiement documenté pour X-Forwarded-For (voir README.md).
 _LEVEL_KEYS={3:'GROUPS_ADMIN',2:'GROUPS_WRITE',1:'GROUPS_READ'}
 _LEVEL_NAMES={1:'lecture',2:'écriture',3:'admin'}
-# Clef .borghelperrc du périmètre de chemin par groupe (Story 1.1) — mêmes conventions per-nick/
-# repli [DEFAULT] que GROUPS_ADMIN/WRITE/READ, mais pas hiérarchique : c'est une restriction
-# orthogonale au tier, jamais un tier de plus. Caractères réservés (séparateurs de la syntaxe
-# 'groupe:/a|/b, groupe2:/c') — voir _parse_groups_paths.
+# Clefs .borghelperrc du périmètre de chemin par groupe (Story 1.1 ; scission lecture/restauration :
+# spec-groups-paths-restore) — mêmes conventions per-nick/repli [DEFAULT] que GROUPS_ADMIN/WRITE/READ,
+# mais pas hiérarchiques : une restriction orthogonale au tier, jamais un tier de plus.
+# GROUPS_PATHS régit la LECTURE (Search/TreeFind/FileHist/TreeHist/Report/DiffBkp/DuIdx/IdxTop/
+# DiffTop) ; GROUPS_PATHS_RESTORE régit la RESTAURATION (Restore/RestorePerms/DownloadFile/
+# DownloadTar) — repli PAR GROUPE sur GROUPS_PATHS si un groupe n'a pas d'entrée dans
+# GROUPS_PATHS_RESTORE (rétro-compatible : une config qui n'utilise que GROUPS_PATHS restreint la
+# restauration de la même façon que la lecture, comme avant cette scission). Caractères réservés
+# (séparateurs de la syntaxe 'groupe:/a|/b, groupe2:/c') — voir _parse_groups_paths.
 _GROUPS_PATHS_KEY='GROUPS_PATHS'
+_GROUPS_PATHS_RESTORE_KEY='GROUPS_PATHS_RESTORE'
 _GP_RESERVED_CHARS=(':','|',',')
 _ROUTE_LEVELS={
     '/stats':1,'/lstbkp':1,'/lstbkpfls':1,'/report':1,'/diffbkp':1,'/search':1,'/filehist':1,
@@ -493,11 +499,12 @@ def _canonicalize_scope(prefixes):
             kept.append(p)
     return kept
 
-def _resolve_path_scope(user_groups,cfg):
+def _resolve_path_scope(user_groups,cfg,for_restore=False):
     """cfg : SectionProxy (.borghelperrc[nick], repli [DEFAULT] natif à configparser) ou None (nick
-    inexistant). Miroir de _effective_level, mais pour le périmètre de chemin (GROUPS_PATHS) —
-    strictement par nick, jamais une vue fusionnée/globale de la config. Retourne None (illimité)
-    ou une liste de préfixes canonicalisés.
+    inexistant). Miroir de _effective_level, mais pour le périmètre de chemin (GROUPS_PATHS ou, si
+    for_restore, GROUPS_PATHS_RESTORE avec repli PAR GROUPE sur GROUPS_PATHS — spec-
+    groups-paths-restore) — strictement par nick, jamais une vue fusionnée/globale de la config.
+    Retourne None (illimité) ou une liste de préfixes canonicalisés.
 
     'Groupes correspondants' = les groupes de l'appelant qui détiennent un accès (n'importe quel
     tier) sur ce nick, càd l'union GROUPS_ADMIN ∪ GROUPS_WRITE ∪ GROUPS_READ intersectée avec
@@ -532,6 +539,11 @@ def _resolve_path_scope(user_groups,cfg):
     matching=user_groups & tier_groups
     if not matching: return None
     groups_paths=_parse_groups_paths(cfg.get(_GROUPS_PATHS_KEY,'') or '')
+    if for_restore:
+        # Override PAR GROUPE : un groupe présent dans GROUPS_PATHS_RESTORE utilise ce périmètre-là ;
+        # un groupe absent d'ici mais présent dans GROUPS_PATHS ci-dessus garde son entrée lecture
+        # (repli rétro-compatible) — jamais un remplacement global des deux dicts l'un par l'autre.
+        groups_paths={**groups_paths,**_parse_groups_paths(cfg.get(_GROUPS_PATHS_RESTORE_KEY,'') or '')}
     prefixes=[]
     for g in matching:
         if g not in groups_paths: return None  # groupe correspondant non scopé -> illimité
@@ -558,11 +570,14 @@ def _path_in_scope(path,scope):
         if p=='' or path==p or path.startswith(p+'/'): return True
     return False
 
-def _resolve_scopes_for_request(request,nicks):
+def _resolve_scopes_for_request(request,nicks,for_restore=False):
     """Résout le périmètre (Story 1.1, `_resolve_path_scope`) de chaque nick de `nicks` pour
-    l'appelant HTTP courant -> {nick: scope|None}. `GROUPS_HEADER` désactivé (autorisation par
-    groupes éteinte) -> illimité pour tous, sans même lire `.borghelperrc` (comportement
-    inchangé/rapide, même court-circuit que partout ailleurs dans ce fichier).
+    l'appelant HTTP courant -> {nick: scope|None}. `for_restore` (spec-groups-paths-restore) : périmètre
+    de RESTAURATION (GROUPS_PATHS_RESTORE, repli par groupe sur GROUPS_PATHS) plutôt que de lecture —
+    seul `require_path_in_scope` ci-dessous le passe à True, tous ses appelants étant des routes de
+    restauration/téléchargement ; aucune route de lecture n'a besoin de ce paramètre. `GROUPS_HEADER`
+    désactivé (autorisation par groupes éteinte) -> illimité pour tous, sans même lire `.borghelperrc`
+    (comportement inchangé/rapide, même court-circuit que partout ailleurs dans ce fichier).
 
     ⚠️ Par construction, cette fonction n'est appelée que depuis le corps d'un endpoint du routeur
     (après la dépendance `_check_group_access`, qui a déjà validé le tier requis pour tous les
@@ -573,7 +588,7 @@ def _resolve_scopes_for_request(request,nicks):
     out={}
     for n in nicks:
         cfg=_bh_paths.borg.cfgread(n)
-        out[n]=_resolve_path_scope(user_groups,cfg) if cfg is not None else None
+        out[n]=_resolve_path_scope(user_groups,cfg,for_restore=for_restore) if cfg is not None else None
     return out
 
 def _any_scoped(scopes):
@@ -603,8 +618,13 @@ def require_path_in_scope(request: Request, nick: str, path: Optional[str]) -> b
     après `_check_group_access` (dépendance de routeur, déjà passée pour atteindre le corps de
     l'endpoint), donc un scope résolu à `None` ici signifie toujours "illimité", jamais "aucun
     tier" (précondition documentée par `_resolve_path_scope`, déjà appliquée par tout appelant
-    Epic 1 existant)."""
-    scope=_resolve_scopes_for_request(request,[nick]).get(nick)
+    Epic 1 existant).
+
+    `for_restore=True` toujours (spec-groups-paths-restore) : les 4 seuls appelants de cette fonction
+    (`download_file`, `download_tar`, `restore_perms`, `restore`) sont tous des routes de
+    restauration/téléchargement — le périmètre appliqué est donc `GROUPS_PATHS_RESTORE` (repli par
+    groupe sur `GROUPS_PATHS`), jamais celui de lecture."""
+    scope=_resolve_scopes_for_request(request,[nick],for_restore=True).get(nick)
     return _path_in_scope(path,scope)
 
 def _default_section_groups():
@@ -1763,7 +1783,7 @@ def healthz():
 # ── Endpoints ────────────────────────────────────────────────────────────────
 # Un endpoint par commande CLI de borgHelper (voir README.md), sauf Mount/UMount.
 
-@router.get("/access",tags=["lecture"],summary="Niveau d'accès (lecture/écriture/admin) ET périmètre de chemin de l'appelant sur chaque nick, d'après ses groupes — 200 pour un appel authentifié, SAUF 500 (non catché, par construction) si GROUPS_PATHS a été rendu ambigu dans .borghelperrc depuis le démarrage du process — voir README.md")
+@router.get("/access",tags=["lecture"],summary="Niveau d'accès (lecture/écriture/admin) ET périmètres de chemin lecture+restauration de l'appelant sur chaque nick, d'après ses groupes — 200 pour un appel authentifié, SAUF 500 (non catché, par construction) si GROUPS_PATHS/GROUPS_PATHS_RESTORE a été rendu ambigu dans .borghelperrc depuis le démarrage du process — voir README.md")
 def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     nicks=_nick_list('ALL')
@@ -1772,7 +1792,8 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
         # allow_destructive/allow_downloads (globaux) s'appliquent — 'admin'/scope:null partout
         # reflète cette absence de restriction par groupes pour que l'UI n'ait qu'une seule forme
         # de réponse à traiter, sans cas particulier côté client.
-        return {'groups_auth_enabled':False,'nicks':{n:{'level':'admin','scope':None} for n in nicks}}
+        return {'groups_auth_enabled':False,
+                'nicks':{n:{'level':'admin','read_scope':None,'restore_scope':None} for n in nicks}}
     user_groups=_parse_groups(request.headers.get(GROUPS_HEADER))
     level_names={0:'none',1:'read',2:'write',3:'admin'}
     result={}
@@ -1780,9 +1801,12 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
         cfg=_bh_paths.borg.cfgread(n)
         eff=_effective_level(user_groups,cfg) if cfg is not None else 0
         # _resolve_path_scope (donc _parse_groups_paths) n'est JAMAIS catché ici — une config
-        # GROUPS_PATHS ambiguë doit remonter en 500 non catché, pas être dégradée en silence.
-        scope=_resolve_path_scope(user_groups,cfg) if cfg is not None else None
-        result[n]={'level':level_names[eff],'scope':scope}
+        # GROUPS_PATHS(_RESTORE) ambiguë doit remonter en 500 non catché, pas être dégradée en
+        # silence. Deux périmètres distincts depuis spec-groups-paths-restore : lecture (GROUPS_PATHS)
+        # et restauration (GROUPS_PATHS_RESTORE, repli par groupe sur GROUPS_PATHS).
+        read_scope=_resolve_path_scope(user_groups,cfg) if cfg is not None else None
+        restore_scope=_resolve_path_scope(user_groups,cfg,for_restore=True) if cfg is not None else None
+        result[n]={'level':level_names[eff],'read_scope':read_scope,'restore_scope':restore_scope}
     return {'groups_auth_enabled':True,'nicks':result}
 
 @router.get("/stats",response_model=CommandResult,tags=["lecture"])
@@ -2472,6 +2496,58 @@ def push_selftest():
                 and not _is_valid_http_token(''))
     check("_is_valid_http_token : accepte un nom de header RFC 7230, rejette un commentaire inline resté collé/un espace/vide",
           _is_valid_http_token_ok)
+
+    # ── GROUPS_PATHS scindé lecture/restauration (spec-groups-paths-restore) ──
+    def _groups_paths_restore_split_ok():
+        """_resolve_path_scope(...,for_restore=True) applique GROUPS_PATHS_RESTORE avec repli PAR
+        GROUPE sur GROUPS_PATHS quand for_restore=False utilise GROUPS_PATHS seule — jamais l'un
+        pour l'autre. cfg synthétique = simple dict (voir _scope_nicks_for_groups), pas besoin d'un
+        vrai .borghelperrc sur disque."""
+        cfg={'GROUPS_READ':'compta,audit,direction',
+             'GROUPS_PATHS':'compta:/srv/data/compta, audit:/srv/data/compta, direction:/srv/data/rh|/srv/data/compta',
+             'GROUPS_PATHS_RESTORE':'compta:/srv/data/compta/archives'}
+        # compta : lecture large (racine compta), restauration restreinte à un sous-dossier (a une
+        # entrée GROUPS_PATHS_RESTORE dédiée) :
+        read_compta=_resolve_path_scope({'compta'},cfg,for_restore=False)
+        restore_compta=_resolve_path_scope({'compta'},cfg,for_restore=True)
+        compta_ok=(read_compta==['/srv/data/compta'] and restore_compta==['/srv/data/compta/archives'])
+        # audit : aucune entrée GROUPS_PATHS_RESTORE -> repli sur son entrée GROUPS_PATHS (identique
+        # en lecture et en restauration) :
+        read_audit=_resolve_path_scope({'audit'},cfg,for_restore=False)
+        restore_audit=_resolve_path_scope({'audit'},cfg,for_restore=True)
+        audit_ok=(read_audit==restore_audit==['/srv/data/compta'])
+        # direction : plusieurs répertoires en lecture ('|'), même repli qu'audit en restauration
+        # (pas d'entrée GROUPS_PATHS_RESTORE dédiée) :
+        read_direction=_resolve_path_scope({'direction'},cfg,for_restore=False)
+        restore_direction=_resolve_path_scope({'direction'},cfg,for_restore=True)
+        direction_ok=(sorted(read_direction)==sorted(restore_direction)==['/srv/data/compta','/srv/data/rh'])
+        return compta_ok and audit_ok and direction_ok
+    check("GROUPS_PATHS_RESTORE : périmètre distinct par groupe, repli sur GROUPS_PATHS si absent (jamais l'inverse)",
+          _groups_paths_restore_split_ok)
+    def _require_path_in_scope_uses_restore_ok():
+        """require_path_in_scope (Restore/RestorePerms/DownloadFile/DownloadTar) applique bien le
+        périmètre de RESTAURATION, pas celui de lecture — un chemin autorisé en lecture mais hors du
+        périmètre de restauration doit être refusé ici."""
+        cfg={'GROUPS_READ':'compta','GROUPS_PATHS':'compta:/srv/data/compta',
+             'GROUPS_PATHS_RESTORE':'compta:/srv/data/compta/archives'}
+        old_gh,old_cfgread=GROUPS_HEADER,_bh_paths.borg.cfgread
+        try:
+            globals()['GROUPS_HEADER']='X-Test-Groups'
+            _bh_paths.borg.cfgread=lambda n,debug=0: cfg if n=='rbactest' else None
+            class _FakeReq:
+                headers={'X-Test-Groups':'compta'}
+            req=_FakeReq()
+            # /srv/data/compta/courrier : dans le périmètre de LECTURE mais hors du périmètre de
+            # RESTAURATION (sous-dossier 'archives' uniquement) -> refusé :
+            denied=not require_path_in_scope(req,'rbactest','srv/data/compta/courrier')
+            # /srv/data/compta/archives/2024 : dans le périmètre de restauration -> autorisé :
+            allowed=require_path_in_scope(req,'rbactest','srv/data/compta/archives/2024')
+            return denied and allowed
+        finally:
+            globals()['GROUPS_HEADER']=old_gh
+            _bh_paths.borg.cfgread=old_cfgread
+    check("require_path_in_scope (Restore/téléchargements) applique GROUPS_PATHS_RESTORE, pas le périmètre de lecture",
+          _require_path_in_scope_uses_restore_ok)
 
     fails=results.count(False)
     print(f"push selftest : {len(results)-fails}/{len(results)} OK"+(f", {fails} FAIL" if fails else ""))

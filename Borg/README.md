@@ -128,6 +128,12 @@ GROUPS_READ      = ops-admins,ops-writers,ops-readers  # tout le reste (+ télé
 # réservés : un nom de groupe ou un chemin qui en contient fait échouer le chargement de la
 # config avec une erreur explicite (jamais un résultat silencieusement mal découpé).
 GROUPS_PATHS     = ops-readers:/var/www/client-x
+
+# Périmètre de RESTAURATION (facultatif, spec-groups-paths-restore) : même syntaxe exacte que
+# GROUPS_PATHS ci-dessus, mais pour Restore/RestorePerms/DownloadFile/DownloadTar uniquement — un
+# groupe absent d'ici reprend simplement son entrée GROUPS_PATHS (lecture ET restauration alors
+# identiques, comportement inchangé si cette clef n'est pas utilisée).
+GROUPS_PATHS_RESTORE = ops-readers:/var/www/client-x/archives
 ```
 
 Le nickname (nom de section) sert d'identifiant partout avec `-n`.
@@ -1107,7 +1113,17 @@ comportement inchangé, seule `X-API-Key` fait foi. Une fois activée (nom du he
   configurés — un badge ne minimise donc jamais le niveau de restriction réellement subi par
   l'utilisateur connecté.
 
-**Périmètre de chemin par groupe (`GROUPS_PATHS`)** : raffinement orthogonal au tier ci-dessus —
+**Périmètre de chemin par groupe (`GROUPS_PATHS` / `GROUPS_PATHS_RESTORE`, `spec-groups-paths-restore`)**
+: depuis borgHelperWWW 1.18.7, le périmètre de chemin est **scindé lecture/restauration** —
+`GROUPS_PATHS` régit la lecture (`Search`/`FileHist`/`TreeHist`/`TreeFind`/`DiffBkp`/`LstBkpFls`/
+`DuIdx`/`IdxTop`/`DiffTop`), `GROUPS_PATHS_RESTORE` régit la restauration/téléchargement
+(`Restore`/`RestorePerms`/`DownloadFile`/`DownloadTar`) — **même syntaxe exacte** pour les deux clefs.
+Un groupe sans entrée dans `GROUPS_PATHS_RESTORE` reprend son entrée `GROUPS_PATHS` (repli **par
+groupe**, rétro-compatible : une config qui n'utilise que `GROUPS_PATHS`, comme avant cette scission,
+restreint la restauration de la même façon que la lecture). Le reste de cette section décrit
+`GROUPS_PATHS` — `GROUPS_PATHS_RESTORE` suit exactement les mêmes règles, sur sa propre clef.
+
+Raffinement orthogonal au tier ci-dessus —
 il ne fait jamais qu'un nick est accordé, seulement *quelle partie* de ce nick l'est. Un groupe
 absent de `GROUPS_PATHS` conserve un accès chemin illimité dans la limite du tier qu'il détient
 déjà (comportement rétro-compatible : c'est déjà ce qui se passe aujourd'hui pour un groupe
@@ -1550,19 +1566,20 @@ soit traitée comme un échec : `BORGHELPERWWW_BKP_WATCHER_INTERVAL` (déf. 30s)
 
 `GET /access` : protégée par `X-API-Key` (contrairement à `/version`), mais **jamais** par
 l'autorisation par groupes elle-même — son seul but est de la refléter. Renvoie, pour **chaque**
-nick connu, le niveau d'accès effectif de l'appelant (`level`) **et** son périmètre de chemin
-résolu (`scope` — `null` = illimité, sinon liste de préfixes canonicalisés ; voir
+nick connu, le niveau d'accès effectif de l'appelant (`level`) **et** ses deux périmètres de chemin
+résolus séparément depuis `spec-groups-paths-restore` (`read_scope`/`restore_scope` — `null` =
+illimité, sinon liste de préfixes canonicalisés ; voir
 [Autorisation par groupes](#autorisation-par-groupes-reverse-proxy-oidcauth_request)) :
 
 ```json
 {"groups_auth_enabled": true, "nicks": {
-  "demo-modules": {"level": "admin", "scope": null},
-  "demo-usrlocal": {"level": "read", "scope": ["/var/www/client-x"]}
+  "demo-modules": {"level": "admin", "read_scope": null, "restore_scope": null},
+  "demo-usrlocal": {"level": "read", "read_scope": ["/var/www/client-x"], "restore_scope": ["/var/www/client-x"]}
 }}
 ```
 
 `groups_auth_enabled: false` (autorisation par groupes désactivée) : `level:"admin"` et
-`scope:null` pour chaque nick, sans cas particulier côté client.
+`read_scope:null`/`restore_scope:null` pour chaque nick, sans cas particulier côté client.
 
 ⚠️ **Exception à la règle générale "toujours 200 pour un appel authentifié"** — mais **seulement
 pour un appelant qui détient un tier (lecture/écriture/admin) sur le nick concerné** : `GROUPS_PATHS`

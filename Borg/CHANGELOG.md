@@ -1,5 +1,35 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.18.7 — GROUPS_PATHS scindé lecture/restauration — 2026-09-26
+
+`spec-groups-paths-restore`, demande directe utilisateur : `GROUPS_PATHS` restreignait un même
+périmètre de chemin pour la lecture (`Search`/`TreeFind`/...) ET la restauration
+(`Restore`/téléchargements) — un seul réglage pour deux besoins distincts.
+
+- Nouvelle clé `.borghelperrc` : `GROUPS_PATHS_RESTORE` (même syntaxe exacte que `GROUPS_PATHS`),
+  régissant désormais spécifiquement `Restore`/`RestorePerms`/`DownloadFile`/`DownloadTar`. Repli
+  **par groupe** sur `GROUPS_PATHS` si absent de `GROUPS_PATHS_RESTORE` — rétro-compatible, une
+  config existante qui n'utilise que `GROUPS_PATHS` continue de restreindre la restauration comme
+  avant.
+- `_resolve_path_scope(user_groups, cfg, for_restore=False)` : nouveau paramètre. Frontière
+  d'implémentation trouvée par investigation avant tout code : `require_path_in_scope()` n'a que 4
+  appelants dans tout `borgHelperWWW` (`download_file`, `download_tar`, `restore_perms`, `restore`)
+  — tous des routes de restauration, aucune route de lecture — donc `for_restore=True` y est
+  systématique et **aucun des ~10 call sites de lecture n'a eu besoin d'être touché**.
+  `_resolve_scopes_for_request()` propage le paramètre.
+- `GET /access` : `scope` remplacé par `read_scope`/`restore_scope` séparés (changement de contrat
+  JSON, `/access` n'est consommé par aucun code fonctionnel de l'UI actuellement).
+- **Confirmé et documenté** (demande explicite utilisateur) : aucune permission UNIX de l'host
+  sauvegardé n'intervient jamais dans ces décisions — `Search`/`TreeFind`/`FileHist` lisent
+  exclusivement l'index SQLite, `Restore`/`listperms` appellent `borg list`/`borg extract` contre
+  l'archive (métadonnées figées au moment du `Bkp`), jamais un `os.stat`/`os.access` sur l'host
+  distant ni sur le serveur `borgHelperWWW`. Voir `docs/TECHNIQUE.md`/`TECHNICAL.md`.
+- `docs/borghelperrc.example` : exemple `[fileserver01]` étendu — `AD-Borg-Restore-Audit` peut
+  désormais chercher partout sous `/srv/data/compta` mais ne restaure que depuis
+  `/srv/data/compta/archives`, démontrant concrètement la scission. Vérifié contre le vrai parser.
+- `push_selftest` : 2 nouveaux contrôles dédiés (repli par groupe, `require_path_in_scope` applique
+  bien le périmètre de restauration) — 31/31 OK.
+
 ## borgHelper 1.0.113 / borgHelperWWW 1.18.6 — section renommée [_borgHelperWWW] + borgHelper l'ignore — 2026-09-26
 
 Révision de `spec-borghelperrc-www-section` (1.18.4, `fa88c38`) à la demande de l'utilisateur : la
