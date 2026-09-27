@@ -698,6 +698,15 @@ Contrôle `CodecSelfTest` dédié (base `delete` + écrivain actif : le `PRAGMA`
 Reste hors de ce correctif : un lecteur resté ouvert pendant le remplacement du fichier (protocole complet de
 bascule, chantier « reconstruction progressive », AD-6).
 
+**`SystemExit` dans borgHelperWWW (1.27.6 / 1.27.7).** borgHelper est aussi importé comme bibliothèque par
+borgHelperWWW, et plusieurs de ses fonctions font `sys.exit` (rc invalide, base occupée ou corrompue). Dans le
+processus du serveur, un `SystemExit` non intercepté arrête la boucle asyncio (watcher : serveur arrêté) ou rend le
+serveur muet (route HTTP). Le watcher intercepte `(Exception, SystemExit)` par nick et dans sa boucle. Les routes
+passent par `_ExitGuardRoute` (classe de route FastAPI de `app` et `router`), qui convertit le `SystemExit` en 500
+autour du traitement de la route, dépendances comprises. Intercepter plus haut ne marche pas : le middleware http
+exécute la route dans une tâche séparée. Toute nouvelle route déclarée sur `app` ou `router` hérite de la
+protection ; `push_selftest` vérifie qu'aucune route n'y échappe.
+
 **Pourquoi `VACUUM INTO` et pas `VACUUM` ?** `VACUUM` écrit son fichier temporaire dans `/tmp`, qui peut être sur une partition séparée et pleine même si le filesystem du `diff.db` a de l'espace. `VACUUM INTO chemin` crée la copie compacte dans le même répertoire, utilisant l'espace libre du bon filesystem.
 
 **Préfixe vs glob :**

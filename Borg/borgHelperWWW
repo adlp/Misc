@@ -12,6 +12,7 @@ from typing import Optional, Dict
 from collections import defaultdict
 
 from fastapi import FastAPI, APIRouter, Header, HTTPException, Query, Request, Depends
+from fastapi.routing import APIRoute
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse, Response
 from pydantic import BaseModel, Field
 
@@ -64,7 +65,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.27.6"
+WWW_VERSION="1.27.7"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -663,6 +664,27 @@ async def _bkp_status_watcher():
                 print(f"[watcher] erreur du contrôle de schéma : {e}",file=sys.stderr,flush=True)
         await asyncio.sleep(BKP_WATCHER_INTERVAL)
 
+class _ExitGuardRoute(APIRoute):
+    """Route qui convertit un SystemExit en réponse 500 (1.27.6). Les fonctions de borgHelper appelées en
+    bibliothèque (cfgread, ensure_*_db…) font sys.exit sur un rc invalide ou une base occupée/corrompue.
+    Dans une route, ce SystemExit arrêtait le serveur : il ne répondait plus à aucune requête (vérifié sous
+    uvicorn, route sync et async). Un filet posé autour de l'application viendrait trop tard, car le
+    middleware http exécute la route dans une tâche asyncio séparée, où SystemExit arrête la boucle. Il faut
+    donc l'attraper ici, autour du traitement de chaque route (dépendances comprises). Appliquée à `app` et
+    à `router`."""
+    def get_route_handler(self):
+        handler=super().get_route_handler()
+        async def guarded(request):
+            try:
+                return await handler(request)
+            except SystemExit as e:
+                print(f"[ERREUR] sortie de borgHelper (sys.exit {e.code}) pendant {request.method} "
+                      f"{request.url.path} — message juste au-dessus ; serveur maintenu",file=sys.stderr,flush=True)
+                return JSONResponse(status_code=500,content={'detail':
+                    "borgHelper s'est arrêté pendant cette requête (configuration invalide, base occupée ou "
+                    "corrompue) — détails dans le journal de borgHelperWWW"})
+        return guarded
+
 app=FastAPI(
     title="borgHelperWWW",
     version=BORGHELPER_VERSION,
@@ -678,6 +700,7 @@ app=FastAPI(
         f"{CFGFILE} — à réserver au provisioning, pas à un usage courant."
     ),
 )
+app.router.route_class=_ExitGuardRoute  # avant toute déclaration @app.get (1.27.6)
 
 # Journal des requêtes + garde d'identité (1.25.0). Remplace le journal d'accès d'uvicorn (désactivé en
 # exécution directe ; sous uvicorn externe : --no-access-log pour éviter le doublon) : IP du navigateur
@@ -1054,7 +1077,7 @@ def _check_group_access(request: Request):
 # apprend ce préfixe doivent être joignables sans le connaître à l'avance).
 # dependencies=[Depends(_check_group_access)] : appliqué à CHAQUE route du routeur, en plus de
 # require_api_key (appelé individuellement dans chaque fonction).
-router=APIRouter(dependencies=[Depends(_check_group_access)])
+router=APIRouter(dependencies=[Depends(_check_group_access)],route_class=_ExitGuardRoute)
 
 # ── Exécution borgHelper ────────────────────────────────────────────────────
 
@@ -3439,6 +3462,18 @@ def push_selftest():
                 print(f"SKIP routes /push/* de bout en bout (TestClient indisponible : {e})")
             else:
                 client=TestClient(app); H={'X-API-Key':API_KEY}; P=API_PREFIX
+                def _routes_guarded():
+                    """1.27.6 : toute route (app et router) convertit un SystemExit de borgHelper en 500 — sous
+                    uvicorn, un sys.exit dans une route arrêtait sinon tout le serveur."""
+                    api_routes=[r for r in app.routes if isinstance(r,APIRoute)]
+                    unguarded=[r.path for r in api_routes if not isinstance(r,_ExitGuardRoute)]
+                    with mock.patch(f"{__name__}._nick_list",side_effect=SystemExit(1)), \
+                         contextlib.redirect_stderr(io.StringIO()):
+                        bad=client.get(f"{P}/access",headers=H)
+                    after=client.get("/healthz")
+                    return (len(api_routes)>40 and unguarded==[] and bad.status_code==500 and 'borgHelper' in bad.json()['detail']
+                            and after.status_code==200)
+                check("routes : sys.exit de borgHelper -> 500, serveur maintenu ; toutes les routes protégées",_routes_guarded)
                 ep='https://push.example.invalid/ep-route'
                 all_nicks=_nick_list('ALL'); h0=all_nicks[0]
                 r=client.post(f"{P}/push/subscribe",headers=H,json={'endpoint':ep,'keys':{'p256dh':'p','auth':'a'},

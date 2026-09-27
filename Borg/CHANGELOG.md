@@ -1,5 +1,19 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.27.7 — un `sys.exit` de borgHelper dans une route n'arrête plus le serveur — 2026-09-27
+
+Suite de 1.27.6, qui protégeait le watcher.
+
+- Les fonctions de borgHelper appelées dans le processus de borgHelperWWW (`cfgread`, `ensure_*_db`…) font
+  `sys.exit` sur un rc invalide ou une base occupée ou corrompue. Dans une route HTTP, ce `SystemExit` rendait le
+  serveur muet : processus vivant mais plus aucune connexion acceptée (vérifié sous uvicorn, route sync et async).
+- Toutes les routes (`app` et `router`) utilisent désormais une classe de route qui convertit ce `SystemExit` en
+  réponse 500 (« borgHelper s'est arrêté pendant cette requête… »), journalisée sur stderr, et le serveur continue.
+  Un filet autour de toute l'application ne suffisait pas : le middleware http exécute la route dans une tâche
+  asyncio séparée, où `SystemExit` arrête la boucle.
+- `push_selftest` 87/87 : un `sys.exit` pendant `GET /access` donne un 500, `/healthz` répond ensuite, et aucune
+  route n'échappe à la protection (contrôle sur toutes les routes).
+
 ## borgHelper 1.0.137 / borgHelperWWW 1.27.6 — « DB corrompue : database is locked » qui arrêtait borgHelperWWW — 2026-09-27
 
 Symptôme constaté en production (borgHelperWWW 1.27.5) : `DB corrompue : …-diff.db -> database is locked — Supprimez le
