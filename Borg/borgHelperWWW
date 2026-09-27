@@ -63,7 +63,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.26.4"
+WWW_VERSION="1.26.5"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -1544,7 +1544,23 @@ def _nick_owner_codec(nick):
             except sqlite3.Error: pass
     if len(_NICK_CODEC_MEMO)>=_NICK_CODEC_MEMO_MAX: _NICK_CODEC_MEMO.clear()
     _NICK_CODEC_MEMO[ck]=(header,result)
+    if result is not None and result is not _CACHE_LOCKED: _scope_cache_purge_plain(nick)
     return result
+
+def _scope_cache_purge_plain(nick):
+    """Nick chiffré : supprime ses lignes scopecache.db restées EN CLAIR (1.26.4) — écrites avant un
+    DbEncrypt par un processus qui le croyait encore en clair (voir _diff_db_header). Une ligne chiffrée
+    est un jeton base64, une ligne en clair un JSON ('{'). Appelé seulement quand le codec est
+    (re)calculé, jamais à chaque requête ; erreur SQLite ignorée (pur cache)."""
+    pfx=json.dumps([nick],ensure_ascii=False)[:-1]+','   # début de _scope_cache_key : ["<nick>",
+    try:
+        conn=_open_db(SCOPE_CACHE_DB,nick=None,role='write')
+        try:
+            conn.execute("DELETE FROM scope_cache WHERE substr(cache_key,1,?)=? AND substr(result_json,1,1)='{'",(len(pfx),pfx))
+            conn.commit()
+        finally: conn.close()
+    except sqlite3.Error:
+        pass
 
 def _diff_db_header(diff_db):
     """En-tête de chiffrement brut du diff.db (None si base en clair), lu en LECTURE SEULE sans
@@ -3343,18 +3359,31 @@ def push_selftest():
                     DbEncrypt CLI) -> le codec suivant est un DbCodec, jamais le None mémorisé (sinon lignes
                     scopecache.db écrites en clair). Base temporaire, jamais le vrai diff.db du nick."""
                     import borgHelper as _bhm
+                    global SCOPE_CACHE_DB
                     nk=_nick_list('ALL')[0]; tmpdb=os.path.join(tmpdir,'memo-diff.db')
                     old=_bh_paths.db.get_diff_db; _bh_paths.db.get_diff_db=lambda n: tmpdb
+                    old_sc=SCOPE_CACHE_DB; SCOPE_CACHE_DB=os.path.join(tmpdir,'memo-scopecache.db')  # jamais le vrai
                     try:
+                        ensure_scope_cache_db()
                         _bh_paths.db.ensure_diff_db(tmpdb)
                         before=_nick_owner_codec(nk)
                         pw=(_bh_paths.borg.cfgread(nk) or {}).get('BORG_PASSPHRASE')
+                        # ligne scopecache écrite en clair pendant que le nick était « en clair » + ligne d'un autre nick
+                        sc=_open_db(SCOPE_CACHE_DB,nick=None,role='write')
+                        sc.execute("INSERT OR REPLACE INTO scope_cache (cache_key,fingerprint,result_json) VALUES (?,?,?)",
+                                   (_scope_cache_key(nk,'treehist',{},'s'),'f','{"clair":1}'))
+                        sc.execute("INSERT OR REPLACE INTO scope_cache (cache_key,fingerprint,result_json) VALUES (?,?,?)",
+                                   (_scope_cache_key(nk+'-autre','treehist',{},'s'),'f','{"clair":1}'))
+                        sc.commit(); sc.close()
                         c=sqlite3.connect(tmpdb); _bhm._enc_header_write(c,_bhm._enc_header_build(pw,'siv1','light')[0]); c.close()
                         after=_nick_owner_codec(nk)
-                        return before is None and after is not None and after is not _CACHE_LOCKED
+                        sc=_open_db(SCOPE_CACHE_DB,nick=None,role='read')
+                        left={r[0] for r in sc.execute("SELECT cache_key FROM scope_cache WHERE result_json='{\"clair\":1}'")}; sc.close()
+                        return (before is None and after is not None and after is not _CACHE_LOCKED
+                                and left=={_scope_cache_key(nk+'-autre','treehist',{},'s')})
                     finally:
-                        _bh_paths.db.get_diff_db=old; _NICK_CODEC_MEMO.clear()
-                check("memo de codec : en-tête de chiffrement posé en cours de route (DbEncrypt CLI) -> pris en compte sans redémarrage",
+                        _bh_paths.db.get_diff_db=old; SCOPE_CACHE_DB=old_sc; _NICK_CODEC_MEMO.clear()
+                check("memo de codec : en-tête chiffré posé en cours de route (DbEncrypt CLI) -> pris en compte sans redémarrage, lignes scopecache en clair de ce nick purgées",
                       _codec_memo_follows_header)
                 r=client.get("/version")
                 check("route /version : push_available + bornes d'expiration exposées",

@@ -1057,6 +1057,11 @@ valide, seul le cas « verrouillé » était concerné. En-tête illisible → s
 lui-même `_CACHE_LOCKED`). `_DEK_CACHE`/`_CODEC_CACHE` de borgHelper, clés incluant le MAC de l'en-tête, étaient déjà
 invalidés par construction.
 
+**Nettoyage (1.26.5).** Quand le codec d'un nick est (re)calculé et qu'il est chiffré, `_scope_cache_purge_plain`
+supprime ses lignes `scopecache.db` restées en clair (clé commençant par `["<nick>",`, `result_json` JSON `{…}` au lieu
+d'un jeton base64) : couvre les lignes écrites par une version antérieure avant un `DbEncrypt`, y compris après un
+redémarrage. Jamais à chaque requête ; erreur SQLite ignorée (pur cache).
+
 ### Mémo de décodage : éviction de moitié (1.0.128)
 
 `DbCodec._memo` (chemin complet) et `_seg_memo` (segment) sont bornés à `_DEC_MEMO_MAX` (262 144). À saturation,

@@ -1,5 +1,14 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.26.5 — purge des lignes de cache restées en clair — 2026-09-27
+
+Complément du correctif de sécurité de 1.26.4.
+
+- Les lignes de `scopecache.db` écrites en clair pour un serveur avant son `DbEncrypt` (par une version antérieure
+  qui le croyait encore en clair) sont supprimées dès que borgHelperWWW constate que la base est chiffrée — y compris
+  après un redémarrage. Aucune action manuelle nécessaire.
+- `push_selftest` 74/74 (contrôle étendu, désormais sur un `scopecache.db` temporaire).
+
 ## borgHelperWWW 1.26.4 / borgHelper 1.0.129 — chiffrement modifié en CLI pris en compte sans redémarrage — 2026-09-27
 
 Issu de `deferred-work.md` (point B8).
