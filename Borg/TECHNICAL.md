@@ -1082,6 +1082,16 @@ redémarrage. Jamais à chaque requête ; erreur SQLite ignorée (pur cache).
 balayage plus grand que la borne, le vidage complet jetait aussi les préfixes chauds, recalculés aussitôt. Coût
 amorti O(1) par insertion ; aucune incidence sur la vérification (une entrée n'est mémorisée qu'après validation).
 
+### Abonnements push : réalignement des hosts (borgHelperWWW 1.27.4 / UI 1.17.2)
+
+Remplace le gel strict d'AD-4 (`scope_nicks` recalculé seulement au réabonnement). `_push_realign_entry(raw, nicks)`
+(entrée normalisée par `_prefs_entry`, écrite au format 2) : `scope_nicks = nicks`, réglages conservés pour les hosts
+gardés, `{start,success,error: false}` pour un host nouveau. Deux déclencheurs : `POST /push/subscribe/sync`
+(`_current_scope_nicks(request)` — mêmes droits que `POST /push/subscribe`, seul moment où les groupes de l'abonné sont
+connus), appelé par la page Notifications avant `GET /push/subscriptions` ; et le watcher
+(`_push_prune_unknown_nicks`, à la cadence de la purge des expirés) qui retire les nicks absents du rc. Limite : un
+abonné qui a perdu des droits sans revenir sur la page reste notifié jusqu'à expiration de l'abonnement.
+
 ### `/cacheinfo` / `/cacheclean` et `scopecache.db` (borgHelperWWW 1.27.3)
 
 Les deux routes restent déléguées à borgHelper (`cache.db`), puis borgHelperWWW ajoute au `stdout` la partie

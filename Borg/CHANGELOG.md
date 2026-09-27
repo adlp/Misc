@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.27.4 / borgHelperWWW_ui.html 1.17.2 — abonnements push réalignés sur les droits — 2026-09-27
+
+Issu de l'entretien `deferred-work.md` (point 4, option B).
+
+- À chaque visite de la page Notifications, la liste des hosts de l'abonnement est réalignée sur les droits
+  **actuels** : un host devenu inaccessible est retiré (plus aucune notification), un host nouvellement accessible est
+  ajouté **décoché** ; message « Liste des hosts mise à jour… » quand quelque chose change. Nouvelle route
+  `POST /push/subscribe/sync`.
+- Le watcher retire des abonnements, toutes les heures, les serveurs qui n'existent plus dans le rc.
+- Limite : un abonné qui a perdu des droits sans revenir sur la page reste notifié jusqu'à l'expiration de son
+  abonnement (30 jours par défaut). `push_selftest` 84/84.
+
 ## borgHelperWWW 1.27.3 — `/cacheinfo` et `/cacheclean` couvrent le cache par périmètre — 2026-09-27
 
 Issu de l'entretien `deferred-work.md` (point 3, option A).

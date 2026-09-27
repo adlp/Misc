@@ -64,7 +64,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.27.3"
+WWW_VERSION="1.27.4"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -547,6 +547,33 @@ def _push_purge_expired():
 
 PUSH_PURGE_INTERVAL=3600  # secondes entre deux purges des abonnements expirés (par le watcher)
 
+_PUSH_HOST_OFF={'start':False,'success':False,'error':False}
+
+def _push_realign_entry(raw,nicks):
+    """Entrée d'abonnement réalignée sur la liste `nicks` (1.27.4) : scope_nicks = nicks ; réglages par host
+    conservés pour les nicks gardés, retirés pour les autres, TOUT DÉCOCHÉ pour un nick nouvellement accessible
+    (jamais d'envoi non demandé). -> (entrée format 2, ajoutés, retirés)."""
+    e=_prefs_entry(raw)
+    old=list(e['scope_nicks'])
+    hosts={n:(dict(e['hosts'][n]) if n in e['hosts'] else dict(_PUSH_HOST_OFF)) for n in nicks}
+    new=dict(raw) if isinstance(raw,dict) else {}
+    new.update({'scope_nicks':list(nicks),'hosts':hosts})
+    new.pop('notify_start',None); new.pop('notify_end',None)  # format 1 converti par _prefs_entry
+    return new,[n for n in nicks if n not in old],[n for n in old if n not in nicks]
+
+def _push_prune_unknown_nicks():
+    """Watcher (1.27.4) : retire des abonnements les nicks qui n'existent plus dans le rc. -> nb d'abonnements modifiés."""
+    known=set(_nick_list('ALL'))
+    def _prune(subs):
+        changed=0
+        for ep,raw in list(subs.items()):
+            cur=_prefs_entry(raw)['scope_nicks']
+            keep=[n for n in cur if n in known]
+            if keep!=cur:
+                subs[ep],_a,_r=_push_realign_entry(raw,keep); subs[ep]['updated_at']=_utc_now_str(); changed+=1
+        return changed
+    return _push_prefs_update(_prune)
+
 # Coupe-circuit des envois push (1.27.2) — journalisation seule, détection et réservations inchangées :
 #  - global : BORGHELPERWWW_PUSH_DISABLED=1 (lu au démarrage) ;
 #  - par nick : PUSH_MUTE = true dans le rc (section du nick ou [DEFAULT]), relu à chaque envoi, sans redémarrage.
@@ -620,6 +647,8 @@ async def _bkp_status_watcher():
             try:
                 n=await asyncio.to_thread(_push_purge_expired)
                 if n: print(f"[watcher] push: {n} abonnement(s) expiré(s) retiré(s)",file=sys.stderr,flush=True)
+                n=await asyncio.to_thread(_push_prune_unknown_nicks)
+                if n: print(f"[watcher] push: {n} abonnement(s) nettoyé(s) de serveurs retirés du rc",file=sys.stderr,flush=True)
             except Exception as e:
                 print(f"[watcher] push: erreur de purge des abonnements expirés : {e}",file=sys.stderr,flush=True)
         if time.monotonic()>=next_schema:
@@ -742,7 +771,7 @@ _ROUTE_LEVELS={
     # en paramètre) — _check_group_access (voir plus haut, `nick_param is None: return`) les laisse
     # donc passer sans jamais consulter cette entrée, exactement comme /access. Cataloguées ici pour
     # la documentation/cohérence uniquement, jamais consultées en pratique pour ces chemins.
-    '/push/subscribe':1,'/push/subscriptions':1,'/push/test':1,
+    '/push/subscribe':1,'/push/subscribe/sync':1,'/push/subscriptions':1,'/push/test':1,
 }
 
 def _parse_groups(header_value):
@@ -2983,6 +3012,23 @@ def push_subscribe(request: Request, body: PushSubscribeBody, x_api_key: Optiona
         raise HTTPException(410,detail="Abonnement supprimé entre-temps")
     return _push_sub_dict(row,prefs)
 
+@router.post("/push/subscribe/sync",tags=["mutation"],
+             summary="Réaligner la liste des hosts d'un abonnement sur les droits ACTUELS de l'appelant (appelé par la page Notifications)")
+def push_subscribe_sync(request: Request, endpoint: str, x_api_key: Optional[str]=Header(default=None)):
+    """1.27.4 (remplace le gel strict d'AD-4) : les groupes de l'abonné ne sont connus qu'à ses requêtes (en-tête
+    HTTP), jamais du watcher — la liste est donc réalignée quand il revient sur la page Notifications : hosts devenus
+    inaccessibles retirés (plus aucune notification), nouveaux hosts ajoutés TOUT DÉCOCHÉS. Entrée absente -> 404."""
+    require_api_key(x_api_key)
+    nicks=_current_scope_nicks(request)
+    def _sync(subs):
+        if endpoint not in subs: return None
+        subs[endpoint],added,removed=_push_realign_entry(subs[endpoint],nicks)
+        if added or removed: subs[endpoint]['updated_at']=_utc_now_str()
+        return {'added':added,'removed':removed}
+    res=_prefs_or_500(lambda: _push_prefs_update(_sync))
+    if res is None: raise HTTPException(404,detail="Aucun abonnement pour cet endpoint")
+    return res
+
 @router.patch("/push/subscribe",tags=["mutation"],
               summary="Modifier les préférences (par host : début/succès/échec ; expiration) d'un abonnement existant — jamais scope_nicks (AD-4)")
 def push_subscribe_patch(request: Request, body: PushPatchBody, x_api_key: Optional[str]=Header(default=None)):
@@ -3645,6 +3691,27 @@ def push_selftest():
                      mock.patch(f"{__name__}.PUSH_VAPID_PRIVATE_KEY",PUSH_VAPID_PRIVATE_KEY or 'k'):
                     r=client.post(f"{P}/push/test",headers=H,params={'endpoint':'nimporte'})
                     rv=client.get("/version")
+                def _push_realign_ok():
+                    """1.27.4 : POST /push/subscribe/sync réaligne sur les droits actuels (host disparu/inaccessible retiré,
+                    nouveau host ajouté TOUT DÉCOCHÉ, réglages des autres conservés) ; le watcher retire les nicks absents
+                    du rc ; endpoint inconnu -> 404."""
+                    e2='https://push.example.invalid/ep-realign'; nicks=_nick_list('ALL'); h0,h1=nicks[0],nicks[1]
+                    client.post(f"{P}/push/subscribe",headers=H,json={'endpoint':e2,'keys':{'p256dh':'p','auth':'a'},
+                                'hosts':{h0:{'start':True,'success':True,'error':True}},'expires_in_days':None})
+                    def _tweak(subs):  # simule : h1 pas encore accessible à l'abonnement, un nick disparu y figure
+                        e=subs[e2]; e['scope_nicks']=[h0,'nick-disparu']; e['hosts']={h0:e['hosts'][h0],'nick-disparu':{'start':True,'success':True,'error':True}}
+                    _push_prefs_update(_tweak)
+                    rr=client.post(f"{P}/push/subscribe/sync",headers=H,params={'endpoint':e2}).json()
+                    ent=_prefs_entry(_push_prefs_load()['subscriptions'][e2])
+                    sync_ok=(h1 in rr['added'] and rr['removed']==['nick-disparu'] and ent['hosts'][h0]=={'start':True,'success':True,'error':True}
+                             and ent['hosts'][h1]=={'start':False,'success':False,'error':False} and 'nick-disparu' not in ent['scope_nicks'])
+                    _push_prefs_update(_tweak); n=_push_prune_unknown_nicks()
+                    ent=_prefs_entry(_push_prefs_load()['subscriptions'][e2])
+                    prune_ok=n>=1 and ent['scope_nicks']==[h0] and ent['hosts'][h0]['start'] is True
+                    unknown=client.post(f"{P}/push/subscribe/sync",headers=H,params={'endpoint':'inconnu'}).status_code
+                    client.delete(f"{P}/push/subscribe",headers=H,params={'endpoint':e2})
+                    return sync_ok and prune_ok and unknown==404
+                check("abonnements push : réalignement sur les droits (ajout décoché, retrait), nicks disparus nettoyés par le watcher",_push_realign_ok)
                 def _cache_routes_scopecache():
                     """1.27.3 : /cacheinfo montre les lignes scopecache.db du nick ; /cacheclean les supprime (celles des
                     autres nicks intactes). scopecache.db temporaire, jamais le vrai."""

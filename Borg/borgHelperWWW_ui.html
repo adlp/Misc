@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.17.1 -->
+<!-- UI_VERSION: 1.17.2 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -1714,7 +1714,7 @@ function renderNotifForm(){
   renderHostsTable(subscribed ? notifServer.hosts : null);
   fillExpiry(subscribed ? notifServer.expires_at : undefined);
   document.getElementById('notifDetails').textContent = subscribed
-    ? 'Liste des hosts figée à l\'abonnement (vos droits à ce moment-là) — se désabonner puis se réabonner pour la rafraîchir.'
+    ? 'Liste des hosts réalignée sur vos droits à chaque visite de cette page (nouveaux hosts ajoutés décochés).'
     : 'Hosts auxquels vous avez accès. Un host non coché ne produit aucune notification.';
 }
 
@@ -1732,12 +1732,21 @@ async function openNotifications(){
     notifSub=await reg.pushManager.getSubscription();
   }catch(e){ st.textContent=''; err.textContent='Service Worker indisponible : '+e.message; return; }
   notifServer=null;
+  let syncMsg='';
   if(notifSub){
+    // Réalignement sur vos droits actuels (borgHelperWWW >= 1.27.4) : hosts devenus inaccessibles retirés,
+    // nouveaux hosts ajoutés décochés. 404 (pas encore d'entrée côté serveur) : rien à réaligner.
+    const sy=await apiJson('POST','/push/subscribe/sync',undefined,{endpoint:notifSub.endpoint});
+    if(sy.httpStatus===200 && ((sy.added||[]).length || (sy.removed||[]).length)){
+      syncMsg='Liste des hosts mise à jour selon vos droits actuels'
+        +((sy.added||[]).length?' — ajoutés (décochés) : '+sy.added.join(', '):'')
+        +((sy.removed||[]).length?' — retirés : '+sy.removed.join(', '):'')+'.';
+    }
     const r=await apiJson('GET','/push/subscriptions',undefined,{endpoint:notifSub.endpoint});
     if(r.httpStatus!==200){ st.textContent=''; err.textContent=apiErr(r); return; }
     notifServer=(r.subscriptions||[])[0]||null;
   }
-  renderNotif(); renderNotifForm();
+  renderNotif(syncMsg||undefined); renderNotifForm();
 }
 
 function renderNotif(message){

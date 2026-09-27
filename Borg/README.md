@@ -1847,7 +1847,8 @@ abonné, indexés par `endpoint`, **éditable à la main** et pris en compte à 
 }
 ```
 
-`scope_nicks` : hosts autorisés, figés à l'abonnement (droits de l'appelant à ce moment-là) — un host
+`scope_nicks` : hosts autorisés — droits de l'appelant à l'abonnement, réalignés à chaque visite de la page
+Notifications (≥ 1.27.4) et nettoyés des serveurs retirés du rc par le watcher — un host
 ajouté à la main dans `hosts` hors de cette liste est ignoré ; un host de la liste absent de `hosts`,
 ou une valeur non booléenne, ne produit aucune notification. Une entrée à l'ancien format (≤ 1.20,
 `notify_start`/`notify_end` globaux) est convertie à la lecture : début = `notify_start`, succès et
@@ -1914,8 +1915,12 @@ a au moins un accès lecture) est calculé et **figé** à chaque appel `POST /p
 ré-abonnement sur le **même** `endpoint` (`endpoint` `UNIQUE`) met à jour la ligne existante (jamais de
 doublon) et **recalcule** `scope_nicks` à ce nouveau moment : une personne qui se réabonne
 explicitement après un changement de ses groupes rafraîchit ainsi son périmètre sans devoir d'abord se
-désabonner. Entre deux souscriptions, `scope_nicks` n'est en revanche **jamais** recalculé
-dynamiquement (AD-4) — seule `PATCH /push/subscribe` peut ensuite modifier les préférences
+désabonner. Depuis 1.27.4, `POST /push/subscribe/sync?endpoint=…` (appelé par la page Notifications à chaque
+visite) **réaligne** `scope_nicks` sur les droits actuels de l'appelant : hosts devenus inaccessibles retirés (plus
+aucune notification), nouveaux hosts ajoutés **tout décochés** (jamais d'envoi non demandé), réglages des autres
+conservés ; réponse `{added, removed}`. Les groupes n'étant connus qu'aux requêtes de l'abonné (en-tête HTTP), un
+abonné qui ne revient pas garde sa liste jusqu'à l'expiration de l'abonnement. Le watcher retire en outre, toutes
+les heures, les serveurs qui n'existent plus dans le rc. `PATCH /push/subscribe` modifie les préférences
 (`hosts`, `expires_in_days`, jamais `scope_nicks`). Les hosts fournis voient leurs réglages
 **remplacés**, les autres restent inchangés ; un host hors du périmètre de l'abonnement → `422`, rien
 n'est écrit :
