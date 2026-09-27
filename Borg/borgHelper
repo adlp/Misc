@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.128"
+Version="1.0.129"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -668,8 +668,8 @@ def usage(doc=None,debug=0):
         printer("       nouveau nonce, DB_KDF courant du nick) — AUCUNE ligne de donnée n'est rechiffrée.")
         printer("       Refuse si la base n'est pas siv1 (rien à re-clé) ou si une opération est en cours.")
         printer("       -y : exécution réelle (sinon refus)")
-        printer("       ⚠️  borgHelperWWW n'est notifié d'aucun DbRekey CLI — redémarrer son process pour")
-        printer("       ce nick (son memo de codec reste périmé sinon, voir TECHNICAL.md)")
+        printer("       borgHelperWWW >= 1.26.4 le prend en compte seul (relit l'en-tête de chiffrement) ;")
+        printer("       versions antérieures : redémarrer son process")
     elif doc=='dbstatus':
         printer("   -c DbStatus [-n nick/ALL]")
         printer("       Affiche le mode (plain/siv1/migrating) de cache.db et diff.db pour chaque nick")
@@ -2769,9 +2769,8 @@ class BorgHelper:
         """Ré-enveloppe la DEK existante de diff.db avec une nouvelle KEK (nouveau sel, nouveau nonce,
         DB_KDF courant) — AUCUNE ligne de donnée touchée (AD-4). Ne concerne QUE diff.db : cache.db est
         purgé/recréé par DbEncrypt, sa DEK n'a pas besoin d'être ré-enveloppée séparément.
-        Limitation connue, documentée (pas comblée, cf Design Notes) : borgHelperWWW n'a aucun mécanisme
-        pour être notifié d'un DbRekey exécuté en CLI — son memo de codec (_NICK_CODEC_MEMO, Story 4)
-        reste périmé jusqu'à son redémarrage."""
+        borgHelperWWW >= 1.26.4 relit l'en-tête de chiffrement à chaque usage de son memo de codec
+        (_NICK_CODEC_MEMO) : un DbRekey/DbEncrypt/DbDecrypt CLI est pris en compte sans redémarrage."""
         db_path=self.db.get_diff_db(nick)
         if not os.path.exists(db_path):
             printer(f"  {nick}: diff.db absent"); return 1
@@ -2805,7 +2804,7 @@ class BorgHelper:
                 printer(f"  [ERREUR] {nick}: {e}"); return 2
             ck=(os.path.realpath(db_path),header['mac'],hashlib.sha256(_pw_bytes(passphrase)).digest())
             _DEK_CACHE.pop(ck,None); _CODEC_CACHE.pop(ck,None)  # ancienne enveloppe : mémo de ce processus purgé par prudence
-            printer(f"  {nick}: DEK ré-enveloppée (nouvelle KEK) — redémarrer borgHelperWWW pour ce nick (memo de codec périmé)")
+            printer(f"  {nick}: DEK ré-enveloppée (nouvelle KEK) — pris en compte par borgHelperWWW >= 1.26.4 sans redémarrage")
             return 0
         finally:
             conn.close()

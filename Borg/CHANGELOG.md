@@ -1,5 +1,18 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.26.4 / borgHelper 1.0.129 — chiffrement modifié en CLI pris en compte sans redémarrage — 2026-09-27
+
+Issu de `deferred-work.md` (point B8).
+
+- borgHelperWWW relit l'en-tête de chiffrement d'une base à chaque usage de son memo de codec : un `DbEncrypt`,
+  `DbDecrypt` ou `DbRekey` lancé en CLI pendant qu'il tourne est pris en compte immédiatement.
+- **Correctif de sécurité** trouvé en traitant ce point : après un `DbEncrypt` CLI, borgHelperWWW continuait (jusqu'à
+  son redémarrage) de considérer la base comme non chiffrée et **écrivait en clair** les lignes de son cache de
+  périmètre (`scopecache.db`, chemins compris) pour ce serveur. Reproduit sur la version précédente, corrigé.
+- borgHelper 1.0.129 : messages et aide de `DbRekey` sans consigne de redémarrage (texte seulement).
+- Vérifié : base en clair → `DbEncrypt` CLI → chiffrée → `DbDecrypt` CLI → en clair, sans redémarrage ;
+  `push_selftest` 74/74 (nouveau contrôle : en-tête chiffré posé pendant que le memo est chaud).
+
 ## borgHelper 1.0.128 — mémo de décodage : éviction de moitié — 2026-09-27
 
 Issu de `deferred-work.md` (lot A).

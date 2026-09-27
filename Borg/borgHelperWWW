@@ -58,12 +58,12 @@ def _push_deps_hint(err):
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail,
                          DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec,
-                         _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES)
+                         _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES, _enc_header_read)
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.26.3"
+WWW_VERSION="1.26.4"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -1494,7 +1494,7 @@ def _scope_cache_key(nick,cmd,params,scope_signature):
 # la colonne result_json est chiffrée, avec la DEK du nick PROPRIÉTAIRE de la ligne (jamais celle
 # de l'appelant), obtenue en ouvrant le diff.db de ce nick via le point d'ouverture unique
 # `_open_db` (AD-1) — jamais une seconde implémentation du déchiffrement.
-_NICK_CODEC_MEMO={}          # (nick, empreinte de passphrase) -> DbCodec | None | _CACHE_LOCKED
+_NICK_CODEC_MEMO={}          # (nick, empreinte de passphrase) -> (en-tête brut, DbCodec | None | _CACHE_LOCKED)
 _NICK_CODEC_MEMO_MAX=256     # borné, mémoire du processus uniquement, jamais persisté (Boundaries)
 _CACHE_LOCKED=object()       # sentinel : nick chiffré mais passphrase absente/incorrecte pour CE nick
 _MEMO_MISS=object()          # sentinel local : distingue "pas encore mémoïsé" de "mémoïsé à None"
@@ -1522,8 +1522,14 @@ def _nick_owner_codec(nick):
         print(f"[WARN] _nick_owner_codec({nick!r}): cfgread a levé {type(e).__name__}: {e} — traité comme passphrase absente",file=sys.stderr)
     pw=cfg.get('BORG_PASSPHRASE') if cfg else None
     ck=(nick,hashlib.sha256((pw or '').encode('utf-8','surrogateescape')).hexdigest())
+    # 1.26.4 : l'entrée n'est valable que pour l'en-tête de chiffrement vu au calcul. DbEncrypt/DbDecrypt/
+    # DbRekey lancés en CLI pendant que ce processus tourne changent cet en-tête : sans cette relecture, un
+    # nick mémorisé « en clair » (None) le restait après DbEncrypt — ses lignes de scopecache.db étaient
+    # alors ÉCRITES EN CLAIR — et un nick mémorisé verrouillé le restait après un DbRekey réparateur,
+    # jusqu'au redémarrage. Relecture en lecture seule, sans passphrase ni KDF (< 1 ms).
+    header=_diff_db_header(diff_db)
     cached=_NICK_CODEC_MEMO.get(ck,_MEMO_MISS)
-    if cached is not _MEMO_MISS: return cached
+    if cached is not _MEMO_MISS and cached[0]==header: return cached[1]
     conn=None
     try:
         conn=_open_db(diff_db,nick=nick,role='read',passphrase=pw)
@@ -1537,8 +1543,19 @@ def _nick_owner_codec(nick):
             try: conn.close()
             except sqlite3.Error: pass
     if len(_NICK_CODEC_MEMO)>=_NICK_CODEC_MEMO_MAX: _NICK_CODEC_MEMO.clear()
-    _NICK_CODEC_MEMO[ck]=result
+    _NICK_CODEC_MEMO[ck]=(header,result)
     return result
+
+def _diff_db_header(diff_db):
+    """En-tête de chiffrement brut du diff.db (None si base en clair), lu en LECTURE SEULE sans
+    passphrase — clé de validité de _NICK_CODEC_MEMO. Illisible -> sentinelle unique (jamais égale à un
+    en-tête mémorisé : recalcul, qui conclura lui-même à _CACHE_LOCKED)."""
+    try:
+        c=sqlite3.connect(f"file:{urllib.parse.quote(diff_db)}?mode=ro",uri=True)
+        try: return _enc_header_read(c)
+        finally: c.close()
+    except Exception:
+        return object()
 
 def _scope_cache_get(nick,cmd,params,scope_signature,fingerprint):
     """Retourne le CommandResult (dict) en cache pour (nick, cmd, params, scope_signature) si son
@@ -3321,6 +3338,24 @@ def push_selftest():
                             and raised.status_code==404 and raised.json()=={'detail':'favicon.ico absent'}
                             and post.status_code in (404,405) and 'UI_VERSION' not in post.text)
                 check("adresse inconnue : page UI (404) pour un navigateur seulement ; clients API et 404 de route intacts",_ui_fallback_ok)
+                def _codec_memo_follows_header():
+                    """1.26.4 : memo de codec chaud « en clair », puis en-tête siv1 posé sur la base (comme un
+                    DbEncrypt CLI) -> le codec suivant est un DbCodec, jamais le None mémorisé (sinon lignes
+                    scopecache.db écrites en clair). Base temporaire, jamais le vrai diff.db du nick."""
+                    import borgHelper as _bhm
+                    nk=_nick_list('ALL')[0]; tmpdb=os.path.join(tmpdir,'memo-diff.db')
+                    old=_bh_paths.db.get_diff_db; _bh_paths.db.get_diff_db=lambda n: tmpdb
+                    try:
+                        _bh_paths.db.ensure_diff_db(tmpdb)
+                        before=_nick_owner_codec(nk)
+                        pw=(_bh_paths.borg.cfgread(nk) or {}).get('BORG_PASSPHRASE')
+                        c=sqlite3.connect(tmpdb); _bhm._enc_header_write(c,_bhm._enc_header_build(pw,'siv1','light')[0]); c.close()
+                        after=_nick_owner_codec(nk)
+                        return before is None and after is not None and after is not _CACHE_LOCKED
+                    finally:
+                        _bh_paths.db.get_diff_db=old; _NICK_CODEC_MEMO.clear()
+                check("memo de codec : en-tête de chiffrement posé en cours de route (DbEncrypt CLI) -> pris en compte sans redémarrage",
+                      _codec_memo_follows_header)
                 r=client.get("/version")
                 check("route /version : push_available + bornes d'expiration exposées",
                       lambda: {'push_available','push_default_expiry_days','push_max_expiry_days'}<=set(r.json()))

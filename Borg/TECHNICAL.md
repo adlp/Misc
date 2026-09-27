@@ -1045,6 +1045,18 @@ Pistes étudiées : (2) ne décoder que les enfants directs du répertoire list�
 section suivante ; (3) processus `borgHelper` persistant interrogé par borgHelperWWW (supprime ~250 ms de
 démarrage + KDF par clic, mémo de décodage chaud d'un clic à l'autre) — **non réalisée**.
 
+### Memo de codec de borgHelperWWW indexé sur l'en-tête de chiffrement (borgHelperWWW 1.26.4)
+
+`_NICK_CODEC_MEMO[(nick, empreinte de passphrase)] = (en-tête brut, codec|None|_CACHE_LOCKED)`. À chaque appel de
+`_nick_owner_codec`, `_diff_db_header` relit `db_meta.enc_header` en lecture seule (`mode=ro`, sans passphrase ni
+KDF, < 1 ms) ; en-tête différent de celui mémorisé → recalcul. Avant : l'entrée était définitive pour la vie du
+processus — **après un `DbEncrypt` CLI, un nick mémorisé « en clair » (None) voyait ses lignes `scopecache.db` écrites
+en clair** (reproduit sur la version précédente : `_nick_owner_codec` restait « clair » après `DbEncrypt`), et un nick
+mémorisé verrouillé le restait après un `DbRekey` réparateur. `DbRekey` garde la DEK : un codec déjà mémorisé restait
+valide, seul le cas « verrouillé » était concerné. En-tête illisible → sentinelle unique, donc recalcul (qui conclut
+lui-même `_CACHE_LOCKED`). `_DEK_CACHE`/`_CODEC_CACHE` de borgHelper, clés incluant le MAC de l'en-tête, étaient déjà
+invalidés par construction.
+
 ### Mémo de décodage : éviction de moitié (1.0.128)
 
 `DbCodec._memo` (chemin complet) et `_seg_memo` (segment) sont bornés à `_DEC_MEMO_MAX` (262 144). À saturation,

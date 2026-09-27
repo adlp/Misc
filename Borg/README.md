@@ -915,8 +915,9 @@ borgHelper -c DbRekey -n mon-serveur -y
 
 Refuse (rien changé) si la base n'est pas déjà `siv1` (rien à re-clé). Ce n'est **pas** un mécanisme de
 changement de `BORG_PASSPHRASE` — voir la note sur `DbRekey` plus haut ([Chiffrement des bases](#fichier-de-configuration)).
-**Limitation connue :** `borgHelperWWW` n'a aucun moyen d'être notifié d'un `DbRekey` exécuté en CLI ; son memo
-de codec par nick reste périmé jusqu'à son redémarrage.
+`borgHelperWWW` ≥ 1.26.4 prend en compte un `DbRekey`, `DbEncrypt` ou `DbDecrypt` exécuté en CLI **sans
+redémarrage** (il relit l'en-tête de chiffrement de la base à chaque usage). Versions antérieures : redémarrer son
+process — faute de quoi, après un `DbEncrypt`, son cache de périmètre continuait d'écrire ce nick en clair.
 
 ### `DbStatus`
 
