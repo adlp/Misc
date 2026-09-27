@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.129"
+Version="1.0.130"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -6488,6 +6488,24 @@ def codec_selftest():
         check("Sentry before_send : clés sensibles (passphrase/k_path/pw/chemin) redactées dans extra/contexts/vars de frame, clé non sensible conservée telle quelle (AD-15)",_sentry_scrub_ok)
         check("Sentry _sentry_scrub : au-delà de la profondeur bornée -> '[truncated]', jamais la valeur brute non scrubbée",
               lambda: _sentry_scrub({'a':{'b':{'c':{'d':{'e':{'f':{'g':{'h':'secret'}}}}}}}})['a']['b']['c']['d']['e']['f']['g']=='[truncated]')
+        def _sentry_text_ok():
+            """1.0.130 : texte libre (message d'exception, message, logentry, fils d'Ariane) — chemins -> '<chemin>',
+            passphrase du processus -> '[redacted]', texte sans chemin intact."""
+            saved=os.environ.get('BORG_PASSPHRASE'); os.environ['BORG_PASSPHRASE']='pw-selftest-42'
+            try:
+                event={'exception':{'values':[{'value':"[Errno 2] No such file or directory: '/home/n/repo/x.db'"},
+                                              {'value':'illisible : etc/nginx/x.conf (pw-selftest-42)'}]},
+                       'message':'ssh://u@h:22/./backups indisponible','logentry':{'message':'ouverture de %s','params':['/srv/a']},
+                       'breadcrumbs':{'values':[{'message':'lecture ~/.borghelperrc'},{'message':'division by zero'}]}}
+                out=_sentry_before_send(event,None)
+                v=[x['value'] for x in out['exception']['values']]
+                return (v==["[Errno 2] No such file or directory: '<chemin>'",'illisible : <chemin> ([redacted])']
+                        and out['message']=='<chemin> indisponible' and out['logentry']['params']==['[redacted]']
+                        and [b['message'] for b in out['breadcrumbs']['values']]==['lecture <chemin>','division by zero'])
+            finally:
+                if saved is None: os.environ.pop('BORG_PASSPHRASE',None)
+                else: os.environ['BORG_PASSPHRASE']=saved
+        check("Sentry before_send : chemins et passphrase masqués aussi dans le texte libre (exception, message, logentry, fils d'Ariane)",_sentry_text_ok)
         # ── Story 5 : DbEncrypt / DbDecrypt / DbRekey / DbStatus, curseur/reprise, AD-6, AD-7 ──────
         def _cas_primitives_ok():
             p=os.path.join(tmp,'cas.db')
@@ -7123,9 +7141,8 @@ _SENTRY_SENSITIVE_KEYS=('passphrase','password','pw','dek','secret','k_path','k_
 
 def _sentry_scrub(obj,depth=0):
     """Retire récursivement toute valeur dont la clé évoque un chemin ou un secret (AD-15).
-    Portée : extra/contexts/vars de frame (avant_send) — ne touche PAS le texte libre d'un message
-    d'exception (`exception.values[*].value`), qui peut contenir un chemin en clair (ex.
-    `FileNotFoundError: /home/nick/repo/...`) ; hors périmètre de cette story (deferred-work.md)."""
+    Portée : extra/contexts/vars de frame (before_send). Le texte libre (message d'exception, message,
+    fils d'Ariane) passe par _sentry_scrub_text (1.0.130)."""
     if depth>6: return '[truncated]'
     if isinstance(obj,dict):
         return {k:('[redacted]' if isinstance(k,str) and any(s in k.lower() for s in _SENTRY_SENSITIVE_KEYS)
@@ -7134,16 +7151,46 @@ def _sentry_scrub(obj,depth=0):
         return [_sentry_scrub(v,depth+1) for v in obj]
     return obj
 
+_SENTRY_PATH_SEG=r"[^\s/'\"`()\[\]{}<>,;=|]+"
+_SENTRY_PATH_RE=re.compile(
+    r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"`<>]*"                                  # URL entière (ssh://h/dépôt)
+    r"|(?:~|\.{1,2})?(?:/"+_SENTRY_PATH_SEG+r")+/?"                              # /abs/olu, ~/x, ./x
+    r"|(?:"+_SENTRY_PATH_SEG+r"/)+(?:"+_SENTRY_PATH_SEG+r")?")                   # rel/at/if (groupe : jamais « +? » paresseux)
+_SENTRY_SECRET_ENVS=('BORG_PASSPHRASE','BORGHELPERC_RUNTIME_PASSPHRASE')
+
+def _sentry_scrub_text(text):
+    """Texte libre envoyé à Sentry (1.0.130, AD-15 étendu) : toute suite qui ressemble à un chemin (au moins
+    un '/' : absolu, relatif, ~/, URL de dépôt ssh://…) devient '<chemin>', toute passphrase connue du
+    processus devient '[redacted]'. Volontairement large (faux positifs acceptés : « a/b », dates
+    2026/09/27) — un chemin de sauvegarde ne doit jamais sortir du processus."""
+    if not isinstance(text,str) or not text: return text
+    for env in _SENTRY_SECRET_ENVS:
+        v=os.environ.get(env)
+        if v and len(v)>=4: text=text.replace(v,'[redacted]')
+    return _SENTRY_PATH_RE.sub('<chemin>',text)
+
 def _sentry_before_send(event,hint):
-    """before_send Sentry : purge chemins/passphrase/DEK des extra/contexts/frames avant envoi (AD-15)."""
+    """before_send Sentry : purge chemins/passphrase/DEK des extra/contexts/frames (AD-15) et, depuis 1.0.130,
+    des textes libres (message d'exception, message, logentry, fils d'Ariane)."""
     if 'extra' in event: event['extra']=_sentry_scrub(event['extra'])
     if 'contexts' in event: event['contexts']=_sentry_scrub(event['contexts'])
     exc=event.get('exception')
     if isinstance(exc,dict):
         for val in exc.get('values') or []:
+            if 'value' in val: val['value']=_sentry_scrub_text(val['value'])
             frames=((val.get('stacktrace') or {}).get('frames')) or []
             for fr in frames:
                 if 'vars' in fr: fr['vars']=_sentry_scrub(fr['vars'])
+    if isinstance(event.get('message'),str): event['message']=_sentry_scrub_text(event['message'])
+    le=event.get('logentry')
+    if isinstance(le,dict):
+        for k in ('message','formatted'):
+            if k in le: le[k]=_sentry_scrub_text(le[k])
+        if 'params' in le: le['params']=['[redacted]' for _ in (le['params'] or [])]
+    bc=event.get('breadcrumbs')
+    for b in (bc.get('values') if isinstance(bc,dict) else bc if isinstance(bc,list) else []) or []:
+        if isinstance(b,dict) and 'message' in b: b['message']=_sentry_scrub_text(b['message'])
+        if isinstance(b,dict) and 'data' in b: b['data']=_sentry_scrub(b['data'])
     return event
 
 def _cli_main():

@@ -1,5 +1,15 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.130 — Sentry : chemins masqués aussi dans le texte des erreurs — 2026-09-27
+
+Issu de `deferred-work.md` (point B9).
+
+- Avant envoi à Sentry, le texte libre des événements (message d'exception, message, journal, fils d'Ariane) est
+  filtré : tout ce qui ressemble à un chemin devient `<chemin>` (absolu, relatif, `~/`, URL de dépôt `ssh://…`), et la
+  passphrase du processus `[redacted]`. Auparavant seuls les champs structurés l'étaient : un
+  `FileNotFoundError: /home/…` partait tel quel. Filtre volontairement large (« 3/4 » est aussi masqué).
+- `CodecSelfTest` 338/338.
+
 ## borgHelperWWW 1.26.5 — purge des lignes de cache restées en clair — 2026-09-27
 
 Complément du correctif de sécurité de 1.26.4.

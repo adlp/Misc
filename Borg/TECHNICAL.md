@@ -1323,15 +1323,17 @@ insensible à la casse dans `_SENTRY_SENSITIVE_KEYS` : `passphrase`, `pw`, `dek`
 (régression du CHANGELOG 1.0.98 : `default_integrations=False` désactiverait aussi l'excepthook, coupant toute
 capture d'exception — `borgHelper` n'appelle jamais `capture_exception()` explicitement).
 
-**Portée précise — ne pas surestimer.** `_sentry_scrub` ne touche que `extra`/`contexts`/les `vars` de frame. Il ne
-touche PAS le **texte libre** du message d'exception (`event['exception']['values'][*]['value']`, ce que
-`sentry_sdk` construit à partir de `str(exception)`) : une exception dont le message contient un chemin en clair (ex.
-`FileNotFoundError: /home/nick/repo/cache.db`) part vers Sentry telle quelle. Aucun site actuel de `borgHelper`
-n'insère volontairement un chemin dans un message d'exception, mais rien ne l'empêche structurellement. Limitation
-connue, consignée dans `deferred-work.md` : la fermer proprement demanderait un filtrage par motif (heuristique de
-chemin, ou liste de valeurs secrètes connues à ce moment du process) sur le texte libre, hors périmètre de cette
-story. `CodecSelfTest` couvre `_sentry_before_send`/`_sentry_scrub` directement (clés sensibles redactées, clé non
-sensible conservée, troncature au-delà de la profondeur bornée).
+**Texte libre (1.0.130).** `_sentry_scrub` ne traite que `extra`/`contexts`/les `vars` de frame ; le texte libre —
+message d'exception (`exception.values[*].value`, construit par `sentry_sdk` depuis `str(exception)`, ex.
+`FileNotFoundError: /home/nick/repo/cache.db`), `message`, `logentry.message|formatted` (`params` remplacés en bloc),
+messages des fils d'Ariane (`data` via `_sentry_scrub`) — passe par `_sentry_scrub_text` : toute suite ressemblant à
+un chemin (au moins un `/` : absolu, relatif, `~/`, `./`, URL entière comme `ssh://h/dépôt`) → `<chemin>`, valeurs de
+`BORG_PASSPHRASE`/`BORGHELPERC_RUNTIME_PASSPHRASE` du processus → `[redacted]`. Heuristique volontairement large :
+faux positifs acceptés (« 3/4 », dates « 2026/09/27 »), l'inverse — un chemin qui sort — ne l'est pas. Piège évité :
+le dernier segment optionnel est un groupe `(?:SEG)?`, jamais `SEG?` (qui rendrait le `+` de SEG paresseux et
+couperait `x.conf` en `x`). Non couvert : les événements de **performance** (`traces_sample_rate=1.0` — une trace par
+invocation), qui ne passent pas par `before_send` ; sans intégration automatique, ils ne portent que le nom de la
+transaction. `CodecSelfTest` couvre les deux niveaux (clés sensibles, texte libre).
 
 ### Vérification manuelle (`borgHelperWWW`, pas de framework de test)
 
