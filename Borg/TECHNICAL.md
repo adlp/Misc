@@ -114,14 +114,17 @@ selon `IDX_SNAP_KEEP` (fenêtre glissante fixe, sans rapport avec l'existence r�
 alors qu'une ligne `diff_index` survivante référence toujours une archive encore restaurable
 (`_cleanup_index_after_prune` ne la purge qu'au prune réel de l'archive référencée). Détection d'un
 chemin « supprimé » : son événement `diff_index` le PLUS RÉCENT (`archive_new_date`/`id` max) a
-`change_type='removed'` — un chemin réajouté depuis n'est jamais marqué. `size_before IS NULL` sur
-la ligne de suppression sert d'heuristique `is_dir` (`diff_index` n'a pas de colonne de type ; `borg
-diff` n'inclut pas de taille pour une entrée répertoire, voir `parse_diff_line_json()`) — limitation
-connue : `borg diff` n'inclut pas non plus de taille pour un lien symbolique, donc un lien symbolique
-supprimé est actuellement classé `répertoire`/`is_dir=true` par erreur (genre affiché `répertoire` au
-lieu du vrai type). `genre` d'une entrée supprimée est toujours `fichier`/`répertoire` selon cette
-heuristique, jamais le type réel détaillé (fifo/socket/périphérique) faute de colonne `type` dans
-`diff_index`. Coût : la requête `TreeFind` sur les chemins supprimés n'est bornée par aucun préfixe
+un `change_type` de suppression (`_DIFF_REMOVED_TYPES` : `removed`, `removed directory|link|fifo|chrdev|blkdev`)
+— un chemin réajouté depuis n'est jamais marqué. **Type réel depuis 1.0.126** : `borg diff --json-lines` (1.2) qualifie
+tout ce qui n'est pas un fichier ordinaire par un suffixe (`removed directory`, `removed link`, `removed fifo`…,
+vérifié sur un dépôt de test), conservé tel quel dans `change_type` par `parse_diff_line_json()` ;
+`_diff_entry_type(change_type, size_before)` en tire le type borg (`-`/`d`/`l`/`p`/`c`/`b`, clés de
+`_TREEHIST_GENRES`) — aucune colonne `type` n'est nécessaire, et les lignes déjà indexées en bénéficient sans
+réindexation. Avant 1.0.126, seul `change_type='removed'` (fichier ordinaire) était reconnu : répertoires, liens et
+fifos supprimés n'apparaissaient **pas du tout** dans `TreeHist`/`TreeFind`, et `removed fifo|chrdev|blkdev`
+manquaient à `_DIFF_REMOVED_TYPES` (entrée jamais retirée du snapshot incrémental). Repli conservé : `removed` sans
+taille -> répertoire (lignes anciennes/synthétiques ; borg donne toujours une taille à un fichier supprimé). Sockets :
+non archivées par borg. Coût : la requête `TreeFind` sur les chemins supprimés n'est bornée par aucun préfixe
 littéral à la racine (motif `%`) — elle balaie alors tout l'historique `diff_index` du nick ; acceptable
 tant que ce n'est pas mesuré comme un problème réel (feature récente, pas encore observée en pratique
 sur un historique volumineux).

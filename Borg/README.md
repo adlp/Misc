@@ -612,7 +612,8 @@ distinctement (colonne `type`=`supprimé`, colonne `archive`=archive à restaure
 entièrement supprimé reste explorable : `TreeHist` dessus affiche son ancien contenu au lieu d'une
 erreur. Un chemin réajouté depuis sa suppression réapparaît normalement, sans marque. JSON (`-j`) :
 ces entrées portent `"deleted":true,"last_seen_archive":"<archive>"` en plus des clés habituelles
-(`mode`/`owner` à `null`, `is_dir` déduit par heuristique — voir TECHNICAL.md) ; les entrées non
+(`mode`/`owner` à `null` ; `genre`/`is_dir` = vrai type — répertoire, lien symbolique, fifo, périphérique — depuis
+1.0.126, auparavant seuls les fichiers supprimés apparaissaient) ; les entrées non
 supprimées gardent une forme JSON strictement inchangée.
 
 ```bash

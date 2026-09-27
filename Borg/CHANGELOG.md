@@ -1,5 +1,23 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.126 / borgHelperWWW 1.26.2 — entrées supprimées : tous les types, avec leur vrai genre — 2026-09-27
+
+Issu de `deferred-work.md` (point B5, « rajout du type »). En le traitant : **bug plus large que prévu**.
+
+- **Répertoires, liens symboliques, fifos, périphériques supprimés n'apparaissaient pas du tout** dans `TreeHist`
+  (explorateur web compris) ni dans `TreeFind` : seul `change_type='removed'` (fichier ordinaire) était reconnu,
+  alors que borg diff émet `removed directory`, `removed link`, `removed fifo`… Ils sont désormais listés comme
+  supprimés, avec leur **vrai genre** (plus d'heuristique « pas de taille = répertoire », qui classait un lien en
+  répertoire). Un répertoire supprimé reste explorable.
+- Aucune colonne ni migration : le type est déjà dans `change_type` — les données déjà indexées sont corrigées
+  immédiatement, sans réindexation.
+- `removed fifo|chrdev|blkdev` et `added fifo|chrdev|blkdev` manquaient aux listes de types : l'index incrémental ne
+  retirait pas une fifo/un périphérique supprimé du snapshot.
+- `DiffBkp` : suppressions et ajouts de répertoires/liens/fifos comptés en `-`/`+` (étaient en `=`), type affiché
+  (`[removed directory]`) ; `DiffTop` et borgHelperWWW (DiffBkp/DiffTop filtrés par périmètre) : même comptage.
+- Vérifié sur un dépôt borg de test (fichier, répertoire vide et non vide, lien, fifo créés puis supprimés, puis
+  archive incrémentale). `CodecSelfTest` 335/335, `push_selftest` 71/71.
+
 ## borgHelper 1.0.125 / borgHelperWWW 1.26.1 — DuIdx : motif groupé honoré en entier — 2026-09-27
 
 Issu de `deferred-work.md` (point B1, passé en lot A : « honorer le motif »).

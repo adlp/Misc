@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.125"
+Version="1.0.126"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -143,8 +143,25 @@ def _bkp_file_status(i):
 
 # Types de changement borg diff (--json-lines) qui ajoutent / suppriment une entrée — fichier,
 # répertoire ou lien (parse_diff_line_json garde le type borg brut hors added/removed/modified).
-_DIFF_ADDED_TYPES=('added','added directory','added link')
-_DIFF_REMOVED_TYPES=('removed','removed directory','removed link')
+# borg diff (1.2) qualifie par un suffixe tout ce qui n'est pas un fichier ordinaire : 'added directory',
+# 'removed link', 'added fifo', 'removed chrdev'/'blkdev', 'changed link' ; un fichier ordinaire est
+# 'added'/'removed' (avec taille) ou 'modified'. Le type de l'entrée est donc DÉJÀ dans change_type,
+# y compris pour les lignes indexées avant 1.0.126 — aucune colonne de type n'est nécessaire (1.0.126 :
+# fifo/chrdev/blkdev ajoutés ici, ils manquaient ; supprimés ignorés par TreeHist/TreeFind, voir _diff_entry_type).
+_DIFF_TYPE_OF_SUFFIX={'directory':'d','link':'l','fifo':'p','chrdev':'c','blkdev':'b'}
+_DIFF_ADDED_TYPES=('added',)+tuple('added '+x for x in _DIFF_TYPE_OF_SUFFIX)
+_DIFF_REMOVED_TYPES=('removed',)+tuple('removed '+x for x in _DIFF_TYPE_OF_SUFFIX)
+
+def _diff_entry_type(change_type,size_before=None):
+    """Type borg ('-','d','l','p','c','b', clés de _TREEHIST_GENRES) d'une ligne diff_index d'après son
+    change_type ; None si l'événement ne le dit pas (changement de mode/propriétaire/dates seul). Repli
+    historique : 'removed' SANS taille -> 'd' (lignes synthétiques/anciennes ; borg donne toujours une
+    taille, même 0, à un fichier supprimé)."""
+    if change_type in ('added','modified'): return '-'
+    if change_type=='removed': return 'd' if size_before is None else '-'
+    head,_,suffix=(change_type or '').partition(' ')
+    if head in ('added','removed','changed'): return _DIFF_TYPE_OF_SUFFIX.get(suffix)
+    return None
 
 def parse_diff_line_json(line):
     line=line.strip()
@@ -2862,7 +2879,7 @@ class BorgHelper:
             for arch,p in conn.execute("SELECT archive,path FROM archive_snapshot_v WHERE nick=?"+_wh(psql)+" ORDER BY archive DESC"+lim,[nick]+pprm):
                 if pyf is None or pyf(_path_decode(conn,p)): found=arch; break
             if found is None:
-                for arch,p in conn.execute("SELECT archive_new,path FROM diff_index WHERE nick=?"+_wh(psql)+" AND change_type!='removed' ORDER BY archive_new_date DESC"+lim,[nick]+pprm):
+                for arch,p in conn.execute("SELECT archive_new,path FROM diff_index WHERE nick=?"+_wh(psql)+" AND change_type NOT IN ("+','.join('?'*len(_DIFF_REMOVED_TYPES))+") ORDER BY archive_new_date DESC"+lim,[nick]+pprm+list(_DIFF_REMOVED_TYPES)):
                     if pyf is None or pyf(_path_decode(conn,p)): found=arch; break
             conn.close(); return found
         except DbCodecError as e: _codec_fail(nick,e,conn); return None
@@ -3080,8 +3097,8 @@ class BorgHelper:
                 if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(3)
                 printer(msg); sys.exit(3)
             display_entries=[{'change_type':ct,'path':path,'size_before':sb,'size_after':sa} for ct,path,sb,sa in rows]
-        n_add=sum(1 for p in display_entries if p['change_type']=='added')
-        n_rem=sum(1 for p in display_entries if p['change_type']=='removed')
+        n_add=sum(1 for p in display_entries if p['change_type'] in _DIFF_ADDED_TYPES)
+        n_rem=sum(1 for p in display_entries if p['change_type'] in _DIFF_REMOVED_TYPES)
         n_mod=len(display_entries)-n_add-n_rem
         if as_json:
             print(json.dumps({'archive_old':bidun,'archive_new':bideux,'entries':display_entries,
@@ -3091,12 +3108,14 @@ class BorgHelper:
         if not display_entries: print("Aucune différence."); sys.exit(0)
         for p in display_entries:
             ct,path,sb,sa=p['change_type'],p['path'],p.get('size_before'),p.get('size_after')
-            if ct=='added':
+            if ct in _DIFF_ADDED_TYPES:
                 sym='+'
                 tail=f"  {convert_octets_readable(sa)}" if sa else ''
-            elif ct=='removed':
+                if ct!='added': tail+=f"  [{ct}]"
+            elif ct in _DIFF_REMOVED_TYPES:
                 sym='-'
                 tail=f"  {convert_octets_readable(sb)}" if sb else ''
+                if ct!='removed': tail+=f"  [{ct}]"
             else:
                 sym='='
                 if sb and sa:
@@ -4054,17 +4073,17 @@ class BorgHelper:
             nm=lp[plen:] if prefix else lp
             if not nm or nm in children: continue
             last=conn.execute("SELECT change_type,archive_old,size_before FROM diff_index WHERE nick=? AND path=? ORDER BY archive_new_date DESC,id DESC LIMIT 1",(n,stored)).fetchone()
-            if last and last[0]=='removed': del_rows.append((lp,last[1],last[2]))
-        deleted_children={}   # name -> (archive_old,is_dir) — sélectionne, par chemin, l'événement
+            if last and last[0] in _DIFF_REMOVED_TYPES: del_rows.append((lp,last[1],_diff_entry_type(last[0],last[2])))
+        deleted_children={}   # name -> (archive_old,type) — sélectionne, par chemin, l'événement
                                # diff_index le PLUS RÉCENT (archive_new_date max) ; ne garde que ceux
-                               # dont ce dernier événement est 'removed' (jamais "supprimé un jour").
-                               # is_dir = heuristique size_before IS NULL : borg diff n'inclut pas de
-                               # taille pour une entrée répertoire (diff_index n'a pas de colonne de
-                               # type — voir parse_diff_line_json), donc size_before NULL == répertoire.
-        for path,archive_old,size_before in del_rows:
+                               # dont ce dernier événement est une suppression, quel que soit le type
+                               # ('removed', 'removed directory|link|fifo|…' — avant 1.0.126 seul
+                               # 'removed' comptait : répertoires, liens, fifos supprimés invisibles).
+                               # type = _diff_entry_type (tiré de change_type, plus d'heuristique de taille).
+        for path,archive_old,etype in del_rows:
             name=path[plen:] if prefix else path
             if not name or name in children: continue
-            deleted_children[name]=(archive_old,size_before is None)
+            deleted_children[name]=(archive_old,etype)
         if not children and not deleted_children and (not prefix or own_type is None):
             msg=f"{prefix or '/'} vide ou introuvable dans le snapshot ({latest})"
             if as_json: return {'error':msg}
@@ -4121,8 +4140,8 @@ class BorgHelper:
                 is_dir=children[name]
                 _add_rows(name,_genre(is_dir,type_by_name.get(name)),mode_by_name.get(name),owner_by_name.get(name),full,is_dir,recursive=is_dir)
             else:
-                archive_old,is_dir=deleted_children[name]
-                _add_deleted_row(name,'répertoire' if is_dir else 'fichier',full,is_dir,archive_old)
+                archive_old,etype=deleted_children[name]
+                _add_deleted_row(name,_TREEHIST_GENRES.get(etype,'inconnu'),full,etype=='d',archive_old)
         if as_json:
             return {'path':prefix,'archive':latest,'entries':entries}
         print(f"{n}: {prefix or '/'} (snapshot {latest})")
@@ -4193,20 +4212,20 @@ class BorgHelper:
         # (purgé selon IDX_SNAP_KEEP, pas fiable ici) : même détection "dernier événement = removed"
         # que _treehist_listing, mais sans restriction à un seul niveau de profondeur.
         del_rows=[(_path_decode(conn,r[0]),)+tuple(r[1:]) for r in conn.execute("""
-            SELECT path,archive_old,archive_new,archive_new_date,size_before FROM (
+            SELECT path,archive_old,archive_new,archive_new_date,size_before,change_type FROM (
                 SELECT path,change_type,archive_old,archive_new,archive_new_date,size_before,
                        ROW_NUMBER() OVER (PARTITION BY path ORDER BY archive_new_date DESC,id DESC) AS rn
                 FROM diff_index WHERE nick=?"""+_wh(psql)+"""
-            ) WHERE rn=1 AND change_type='removed'
-        """,[n]+pprm)]
-        for path,archive_old,archive_new,archive_new_date,size_before in del_rows:
+            ) WHERE rn=1 AND change_type IN ("""+','.join('?'*len(_DIFF_REMOVED_TYPES))+""")
+        """,[n]+pprm+list(_DIFF_REMOVED_TYPES))]
+        for path,archive_old,archive_new,archive_new_date,size_before,change_type in del_rows:
             if prefix and path==prefix: continue
             if path in present_paths: continue  # présent dans le dernier snapshot -> jamais listé deux fois
             name=path.rsplit('/',1)[-1]
             if not fnmatch.fnmatchcase(name.casefold(),pat_cf): continue
-            is_dir=size_before is None  # heuristique : diff_index n'a pas de colonne de type, borg diff
-                                         # n'inclut pas de taille pour une entrée répertoire
-            genre='répertoire' if is_dir else 'fichier'
+            etype=_diff_entry_type(change_type,size_before)  # type tiré de change_type (1.0.126)
+            is_dir=etype=='d'
+            genre=_TREEHIST_GENRES.get(etype,'inconnu')
             parent=path.rsplit('/',1)[0] if '/' in path else ''
             matches.append({'name':name,'full_path':path,'parent':parent,'is_dir':is_dir,
                              'genre':genre,'mode':None,'owner':None,
@@ -4618,8 +4637,8 @@ class BorgHelper:
                     s['total']+=1
                     sz=(sa or sb or 0)
                     s['size']+=sz
-                    if ct=='added':    s['added_n']+=1;    s['added_s']+=(sa or 0); total_added+=1
-                    elif ct=='removed': s['removed_n']+=1; s['removed_s']+=(sb or 0)
+                    if ct in _DIFF_ADDED_TYPES:     s['added_n']+=1;   s['added_s']+=(sa or 0); total_added+=1
+                    elif ct in _DIFF_REMOVED_TYPES: s['removed_n']+=1; s['removed_s']+=(sb or 0)
                     else:              s['modified_n']+=1; total_modified+=1
                     total_count+=1; total_size+=sz
             conn.close()
@@ -6783,6 +6802,13 @@ def codec_selftest():
                     and sel5==('under','foo') and d5==2 and m5('foo/x/bar/f') and not m5('foo/x/y/bar') and not m5('foo/bar')
                     and m6('a/b1/[x]%_.c/z') and not m6('a/b12/[x]%_.c/z') and not m6('a/b1/x%_.c/z') and not m6('a/b1/[x]%_Xc/z'))
         check("DuIdx groupé : _duidx_group_spec honore le motif composant par composant, 'foo/*' et '*' inchangés",_duidx_spec)
+        check("_diff_entry_type (1.0.126) : type tiré de change_type (borg diff 1.2), tous les types de suppression reconnus",
+              lambda: [_diff_entry_type(c,sb) for c,sb in (('added',None),('modified',1),('removed',3),('removed',0),('removed',None),
+                       ('removed directory',None),('added link',None),('changed link',None),('removed fifo',None),
+                       ('added chrdev',None),('removed blkdev',None),('mode',None),('ctime',None))]
+                      ==['-','-','-','-','d','d','l','l','p','c','b',None,None]
+                      and {'removed fifo','removed chrdev','removed blkdev','removed link','removed directory','removed'}<=set(_DIFF_REMOVED_TYPES)
+                      and {'added fifo','added chrdev','added blkdev','added link','added directory','added'}<=set(_DIFF_ADDED_TYPES))
     finally:
         shutil.rmtree(tmp,ignore_errors=True)
         _DB_CFG_READERS.clear(); _DB_CFG_READERS.update(saved_readers)

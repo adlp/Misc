@@ -57,12 +57,13 @@ def _push_deps_hint(err):
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail,
-                         DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec)
+                         DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec,
+                         _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES)
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.26.1"
+WWW_VERSION="1.26.2"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -1696,8 +1697,8 @@ def _filter_diffbkp(result,scope):
     if isinstance(result,dict) and 'entries' in result:
         result=dict(result)
         entries=[e for e in result['entries'] if _path_in_scope(e.get('path',''),scope)]
-        n_add=sum(1 for e in entries if e['change_type']=='added')
-        n_rem=sum(1 for e in entries if e['change_type']=='removed')
+        n_add=sum(1 for e in entries if e['change_type'] in _DIFF_ADDED_TYPES)    # tous types (répertoire,
+        n_rem=sum(1 for e in entries if e['change_type'] in _DIFF_REMOVED_TYPES)  # lien, fifo…), 1.26.2
         result['entries']=entries; result['n_add']=n_add; result['n_rem']=n_rem; result['n_mod']=len(entries)-n_add-n_rem
     return result
 
@@ -1991,8 +1992,8 @@ def _recompute_difftop(parsed,scope,depth,topn):
         sz=sa or sb or 0
         s['size']+=sz
         ct=r.get('type')
-        if ct=='added': s['added_n']+=1; s['added_s']+=sa
-        elif ct=='removed': s['removed_n']+=1; s['removed_s']+=sb
+        if ct in _DIFF_ADDED_TYPES: s['added_n']+=1; s['added_s']+=sa
+        elif ct in _DIFF_REMOVED_TYPES: s['removed_n']+=1; s['removed_s']+=sb
         else: s['modified_n']+=1
         total_count+=1; total_size+=sz
     top=sorted(stats.items(),key=lambda x:x[1]['total'],reverse=True)[:topn]
