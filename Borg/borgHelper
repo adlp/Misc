@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.126"
+Version="1.0.127"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -1811,6 +1811,9 @@ class BorgHelperDB:
             conn=_open_db(db_path,nick=nick,role='write')
             try:
                 conn.execute("INSERT INTO bkp_status (nick,run_id,started_at) VALUES (?,?,datetime('now'))",(nick,run_id))
+                # Rétention (1.0.127) : même STATS_RETENTION_MONTHS que les historiques — une sauvegarde
+                # démarrée il y a plus de N mois est forcément terminée et notifiée depuis longtemps.
+                conn.execute(f"DELETE FROM bkp_status WHERE nick=? AND started_at < datetime('now','-{int(self._stats_retention_months(nick))} months')",(nick,))
                 conn.commit(); return True
             finally: conn.close()
         try: return self._with_lock_retry(_do)
@@ -2947,7 +2950,7 @@ class BorgHelper:
         self.db.ensure_diff_db(db_path,create=False)
         conn=_open_db(db_path,nick=nick,role='read')
         try:
-            rows=conn.execute("SELECT archive,archive_date FROM archive_stats WHERE nick=? ORDER BY archive_date",(nick,)).fetchall()
+            rows=conn.execute("SELECT archive,archive_date FROM archive_stats WHERE nick=? ORDER BY archive_date,archive",(nick,)).fetchall()
         except sqlite3.OperationalError as e:
             if 'no such table' not in str(e): raise
             rows=[]  # base absente/jamais indexée (create=False, AD-12) : comme un index vide
@@ -4428,9 +4431,13 @@ class BorgHelper:
             return
         try:
             conn=_open_db(db_path,nick=nick,role='read')
+            # Bornage (1.0.127) : STATS_RETENTION_MONTHS aussi à la LECTURE — la purge n'a lieu qu'à
+            # l'écriture (fin de Bkp/Prune) : une valeur abaissée s'applique ainsi dès le prochain affichage.
+            months=self.db._stats_retention_months(nick)
             rows=[{'id':r[0],'op':r[1],'unique_csize':r[2],'total_size':r[3],'total_csize':r[4],'updated_at':r[5]}
                   for r in conn.execute(
-                      "SELECT id,op,unique_csize,total_size,total_csize,updated_at FROM repo_stats WHERE nick=? ORDER BY id",
+                      "SELECT id,op,unique_csize,total_size,total_csize,updated_at FROM repo_stats WHERE nick=? "
+                      f"AND updated_at >= datetime('now','-{int(months)} months') ORDER BY id",
                       (nick,)).fetchall()]
             conn.close()
         except DbCodecError as e:
@@ -4468,7 +4475,13 @@ class BorgHelper:
                   for r in conn.execute(
                       "SELECT archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles,"
                       "changed_during_backup,read_errors "
-                      "FROM archive_stats WHERE nick=? ORDER BY archive_date",
+                      # Bornage (1.0.127) : la série des graphiques s'arrête à STATS_RETENTION_MONTHS (13 par
+                      # défaut) — les lignes plus anciennes restent en base (Report/Historique complet en ont
+                      # besoin tant que l'archive existe ; purgées au Prune réel de l'archive). Format
+                      # archive_date ISO 'T' : borne au même format. Départage stable à date égale.
+                      "FROM archive_stats WHERE nick=? AND (archive_date IS NULL OR "
+                      f"archive_date >= strftime('%Y-%m-%dT%H:%M:%S','now','-{int(self.db._stats_retention_months(nick))} months')) "
+                      "ORDER BY archive_date,archive",
                       (nick,)).fetchall()]
             conn.close()
         except DbCodecError as e:
@@ -5409,11 +5422,14 @@ def codec_selftest():
         rh_dir=os.path.join(tmp,'rhist'); os.makedirs(rh_dir)
         rh_rc=os.path.join(rh_dir,'rc')
         with open(rh_rc,'w') as f:
-            for nk in ('rhA','rhB','rhEmpty'):
-                f.write(f"[{nk}]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw-{nk}\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n\n")
+            for nk in ('rhA','rhB','rhEmpty','rhOld'):
+                # dates fixes des fixtures rhA/rhB (2026) : rétention très longue, sinon le bornage des
+                # séries (1.0.127, 13 mois par défaut) les ferait disparaître avec le temps. rhOld : défaut.
+                ret="" if nk=='rhOld' else "STATS_RETENTION_MONTHS=1200\n"
+                f.write(f"[{nk}]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw-{nk}\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n{ret}\n")
         os.chmod(rh_rc,0o600)
         bh_rh=BorgHelper(cfgfile=rh_rc,cache_dir=os.path.join(rh_dir,'cache'))
-        for nk in ('rhA','rhB','rhEmpty'):
+        for nk in ('rhA','rhB','rhEmpty','rhOld'):
             bh_rh.db.ensure_diff_db(bh_rh.db.get_diff_db(nk))
         bh_rh.db.store_repo_stats('rhA','bkp',100,200,300,db_path=bh_rh.db.get_diff_db('rhA'))
         bh_rh.db.store_repo_stats('rhA','prune',90,190,290,db_path=bh_rh.db.get_diff_db('rhA'))
@@ -5504,6 +5520,36 @@ def codec_selftest():
             b=_rh_run(bh_rh.archive_history,'rhB',as_json=True)['rows']
             return len(a)==2 and len(b)==1 and b[0]['archive']=='B1'
         check("ArchiveHistory -j : plusieurs nicks isolés correctement (rhA/rhB)",_rh_arch_isolation)
+        def _rh_bounded():
+            """1.0.127 : séries des graphiques bornées à STATS_RETENTION_MONTHS (défaut 13) — archive de
+            -2 ans et point repo_stats de -2 ans absents de ArchiveHistory/RepoHistory mais TOUJOURS en base
+            (archive_stats sert à Report tant que l'archive existe) ; départage stable à date égale."""
+            from datetime import datetime,timedelta
+            iso=lambda d: d.strftime('%Y-%m-%dT%H:%M:%S')
+            p=bh_rh.db.get_diff_db('rhOld'); now=datetime.utcnow()
+            bh_rh.db.store_archive_stats('rhOld','O-old',iso(now-timedelta(days=730)),1,1,1,1,1,db_path=p)
+            for a in ('O-b','O-a'):  # même date, insérées dans le désordre
+                bh_rh.db.store_archive_stats('rhOld',a,iso(now-timedelta(days=1)),1,1,1,1,1,db_path=p)
+            bh_rh.db.store_repo_stats('rhOld','bkp',5,5,5,db_path=p)
+            c=sqlite3.connect(p)
+            c.execute("INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize,updated_at) "
+                      "VALUES ('rhOld','bkp',1,1,1,datetime('now','-730 days'))"); c.commit()
+            in_db=c.execute("SELECT COUNT(*) FROM archive_stats WHERE nick='rhOld'").fetchone()[0]; c.close()
+            arch=[r['archive'] for r in _rh_run(bh_rh.archive_history,'rhOld',as_json=True)['rows']]
+            repo=[r['unique_csize'] for r in _rh_run(bh_rh.repo_history,'rhOld',as_json=True)['rows']]
+            return arch==['O-a','O-b'] and repo==[5] and in_db==3
+        check("RepoHistory/ArchiveHistory : séries bornées à STATS_RETENTION_MONTHS (13 par défaut), lignes anciennes gardées en base",_rh_bounded)
+        def _bkp_status_retention():
+            """1.0.127 : une ligne bkp_status démarrée il y a plus de STATS_RETENTION_MONTHS est purgée au
+            démarrage de la sauvegarde suivante ; les récentes restent."""
+            p=bh_rh.db.get_diff_db('rhOld'); c=sqlite3.connect(p)
+            c.execute("INSERT INTO bkp_status (nick,run_id,started_at,finished_at) VALUES "
+                      "('rhOld','vieux',datetime('now','-730 days'),datetime('now','-730 days')),"
+                      "('rhOld','recent',datetime('now','-2 days'),datetime('now','-2 days'))"); c.commit(); c.close()
+            bh_rh.db.store_bkp_status_start('rhOld','nouveau',db_path=p)
+            c=sqlite3.connect(p); runs={r[0] for r in c.execute("SELECT run_id FROM bkp_status WHERE nick='rhOld'")}; c.close()
+            return runs=={'recent','nouveau'}
+        check("bkp_status : rétention STATS_RETENTION_MONTHS appliquée au démarrage d'une sauvegarde",_bkp_status_retention)
         def _rh_text_mode_no_crash():
             out=io.StringIO(); err=io.StringIO()
             with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):

@@ -63,7 +63,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.26.2"
+WWW_VERSION="1.26.3"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -351,6 +351,11 @@ PUSH_DEFAULT_EXPIRY_DAYS=_clamp_push_default_expiry(os.environ.get('BORGHELPERWW
 # même esprit que API_KEY générée aléatoirement plus haut (fonctionnel par défaut, à durcir en prod).
 PUSH_VAPID_SUB=os.environ.get('BORGHELPERWWW_PUSH_VAPID_SUB','mailto:admin@example.invalid').strip() \
     or 'mailto:admin@example.invalid'
+# RFC 8292 : `sub` = URI `mailto:` ou `https:` — sinon les services push refusent chaque envoi, et l'erreur
+# n'apparaissait qu'au premier push réel (1.26.3 : signalée dès le démarrage, jamais bloquante).
+if not re.match(r'^(mailto:[^@\s]+@[^@\s]+|https://\S+)$',PUSH_VAPID_SUB):
+    print(f"[WARN] BORGHELPERWWW_PUSH_VAPID_SUB={PUSH_VAPID_SUB!r} invalide (RFC 8292 : 'mailto:adresse' ou "
+          "'https://…') — les services push refuseront les notifications",file=sys.stderr,flush=True)
 
 # Paramètres d'envoi au service push du navigateur (1.20.2). Sans `timeout`, pywebpush transmet
 # timeout=None à requests : un service push injoignable (pare-feu/proxy sortant) bloquait l'appel
@@ -500,14 +505,43 @@ def _check_overdue(nick,db_path):
     _send_bkp_push(nick,'overdue','error',{'age_hours':round(age,1),'max_age_hours':max_age,
                                            'last_backup':str(archive_date),'reminder':level>1})
 
+def _push_purge_expired():
+    """Abonnements push expirés (`expires_at` dépassé dans le fichier de préférences, qui fait foi) :
+    retirés du fichier ET de push.db (1.26.3 — auparavant jamais nettoyés, seulement ignorés à l'envoi).
+    Retourne le nombre d'abonnements retirés. « À vie » (expires_at null) : jamais touché."""
+    now=_utc_now_str()
+    def _pop_expired(subs):
+        gone=[ep for ep,raw in subs.items()
+              if (lambda e: e['expires_at'] is not None and e['expires_at']<=now)(_prefs_entry(raw))]
+        for ep in gone: subs.pop(ep,None)
+        return gone
+    gone=_push_prefs_update(_pop_expired)
+    if gone:
+        conn=_push_conn('write')
+        try:
+            conn.executemany("DELETE FROM push_subscriptions WHERE endpoint=?",[(ep,) for ep in gone]); conn.commit()
+        finally:
+            conn.close()
+    return len(gone)
+
+PUSH_PURGE_INTERVAL=3600  # secondes entre deux purges des abonnements expirés (par le watcher)
+
 async def _bkp_status_watcher():
     print(f"[watcher] bkp_status démarré — interrogation toutes les {BKP_WATCHER_INTERVAL}s, "
           f"timeout AD-7 {BKP_STATUS_TIMEOUT}s",file=sys.stderr,flush=True)
+    next_purge=0.0
     while True:
         try:
             await asyncio.to_thread(_bkp_status_watcher_pass)
         except Exception as e:
             print(f"[watcher] erreur pendant l'interrogation bkp_status : {e}",file=sys.stderr,flush=True)
+        if time.monotonic()>=next_purge:
+            next_purge=time.monotonic()+PUSH_PURGE_INTERVAL
+            try:
+                n=await asyncio.to_thread(_push_purge_expired)
+                if n: print(f"[watcher] push: {n} abonnement(s) expiré(s) retiré(s)",file=sys.stderr,flush=True)
+            except Exception as e:
+                print(f"[watcher] push: erreur de purge des abonnements expirés : {e}",file=sys.stderr,flush=True)
         await asyncio.sleep(BKP_WATCHER_INTERVAL)
 
 app=FastAPI(
@@ -3200,6 +3234,34 @@ def push_selftest():
                 check("route DELETE /push/subscribe : push.db et JSON nettoyés",
                       lambda: r.status_code==200 and r.json()['deleted'] is True
                               and conn.execute("SELECT 1 FROM push_subscriptions WHERE endpoint=?",(ep,)).fetchone() is None)
+                def _expiry_low_bound_route():
+                    """expires_in_days<1 via la ROUTE (jamais seulement la fonction pure) : repli sur le défaut
+                    serveur, jamais « à vie »."""
+                    e2='https://push.example.invalid/ep-low'
+                    rr=client.post(f"{P}/push/subscribe",headers=H,json={'endpoint':e2,'keys':{'p256dh':'p','auth':'a'},
+                                   'expires_in_days':0})
+                    ok=rr.status_code==200 and rr.json()['expires_at'] is not None
+                    client.delete(f"{P}/push/subscribe",headers=H,params={'endpoint':e2})
+                    return ok
+                check("route POST /push/subscribe : expires_in_days=0 -> défaut serveur, jamais « à vie »",_expiry_low_bound_route)
+                def _purge_expired_ok():
+                    """1.26.3 : _push_purge_expired retire du JSON ET de push.db les seuls abonnements expirés."""
+                    eps={'exp':'https://push.example.invalid/ep-expired','fut':'https://push.example.invalid/ep-future',
+                         'vie':'https://push.example.invalid/ep-lifetime'}
+                    for k,e2 in eps.items():
+                        client.post(f"{P}/push/subscribe",headers=H,json={'endpoint':e2,'keys':{'p256dh':'p','auth':'a'},
+                                    'expires_in_days':None if k=='vie' else 5})
+                    _push_prefs_update(lambda s: s[eps['exp']].__setitem__('expires_at','2000-01-01 00:00:00'))
+                    n=_push_purge_expired()
+                    subs=_push_prefs_load()['subscriptions']
+                    in_db={e2 for e2 in eps.values()
+                           if conn.execute("SELECT 1 FROM push_subscriptions WHERE endpoint=?",(e2,)).fetchone()}
+                    for e2 in eps.values(): client.delete(f"{P}/push/subscribe",headers=H,params={'endpoint':e2})
+                    now=_utc_now_str()
+                    still_expired=[x for x,raw in subs.items() if (lambda e: e['expires_at'] is not None and e['expires_at']<=now)(_prefs_entry(raw))]
+                    return (n>=1 and not still_expired and eps['exp'] not in subs and eps['fut'] in subs and eps['vie'] in subs
+                            and in_db=={eps['fut'],eps['vie']})
+                check("purge des abonnements expirés : retirés du JSON et de push.db, futurs et « à vie » intacts",_purge_expired_ok)
                 with open(PUSH_PREFS_FILE,'w',encoding='utf-8') as f: f.write('pas du json')
                 r=client.get(f"{P}/push/subscriptions",headers=H,params={'endpoint':'push-ep-ok'})
                 check("route GET : fichier JSON corrompu -> 500 explicite (jamais une liste vide trompeuse)",

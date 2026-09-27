@@ -1045,6 +1045,22 @@ Pistes étudiées : (2) ne décoder que les enfants directs du répertoire list�
 section suivante ; (3) processus `borgHelper` persistant interrogé par borgHelperWWW (supprime ~250 ms de
 démarrage + KDF par clic, mémo de décodage chaud d'un clic à l'autre) — **non réalisée**.
 
+### Rétention et bornage des historiques (1.0.127 / borgHelperWWW 1.26.3)
+
+`STATS_RETENTION_MONTHS` (13 par défaut, par nick) gouverne désormais trois choses : purge de `repo_stats` à
+l'écriture (inchangé) ; **bornage à la lecture** de `RepoHistory` (même borne, pour qu'une valeur abaissée s'applique
+dès l'affichage suivant) et d'`ArchiveHistory` (`archive_date >= strftime('%Y-%m-%dT%H:%M:%S','now','-N months')`,
+format ISO `T` des dates d'archive ; `archive_date` NULL conservé ; départage `ORDER BY archive_date,archive`) ; purge
+de `bkp_status` au démarrage d'un Bkp (`started_at` plus vieux que N mois). **`archive_stats` n'est jamais purgée par
+âge** : Report et l'Historique complet en ont besoin tant que l'archive existe (archives mensuelles/annuelles
+conservées par `KEEP_*`) ; elle suit déjà la rétention réelle du dépôt (`_cleanup_index_after_prune` supprime les
+lignes des archives prunées) — seule la série des graphiques est bornée. Fixtures `CodecSelfTest` à dates fixes :
+`STATS_RETENTION_MONTHS=1200` dans leur rc, pour ne pas devenir fausses avec le temps.
+
+borgHelperWWW : `_push_purge_expired()` (watcher, toutes les `PUSH_PURGE_INTERVAL`=3600 s, première passe au
+démarrage) retire du fichier de préférences (qui fait foi) les entrées dont `expires_at` est dépassé, puis leurs
+lignes `push.db`. `PUSH_VAPID_SUB` validé au démarrage (`mailto:x@y` ou `https://…`), `[WARN]` jamais bloquant.
+
 ### DuIdx groupé : motif honoré composant par composant (1.0.125)
 
 `_duidx_group_spec(pattern)` -> `(sel, depth, match)`, source unique (borgHelperWWW l'importe pour

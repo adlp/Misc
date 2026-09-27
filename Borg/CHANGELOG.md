@@ -1,5 +1,20 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.127 / borgHelperWWW 1.26.3 — historiques bornés à 13 mois, purges manquantes — 2026-09-27
+
+Issu de `deferred-work.md` (point B4 « bornage par défaut surchargeable, 13 mois », plus lot A).
+
+- Graphiques : les séries `RepoHistory`/`ArchiveHistory` couvrent les `STATS_RETENTION_MONTHS` derniers mois (13 par
+  défaut — une vue annuelle complète —, surchargeable par nick dans le rc). Les statistiques des archives plus
+  anciennes restent en base tant que l'archive existe (Report, Historique complet) ; elles partent au Prune réel.
+- `bkp_status` (suivi des sauvegardes pour les notifications) : purgé au-delà de `STATS_RETENTION_MONTHS`, au
+  démarrage d'une sauvegarde (croissance auparavant illimitée).
+- Ordre stable à date d'archive égale (ArchiveHistory, Report).
+- borgHelperWWW : abonnements push expirés retirés du fichier de préférences et de `push.db` (au plus tard une heure
+  après expiration ; auparavant jamais nettoyés) ; `BORGHELPERWWW_PUSH_VAPID_SUB` invalide signalé dès le démarrage.
+- `CodecSelfTest` 337/337, `push_selftest` 73/73 (nouveaux : bornage des séries, rétention `bkp_status`, purge push,
+  `expires_in_days=0` via la route).
+
 ## borgHelper 1.0.126 / borgHelperWWW 1.26.2 — entrées supprimées : tous les types, avec leur vrai genre — 2026-09-27
 
 Issu de `deferred-work.md` (point B5, « rajout du type »). En le traitant : **bug plus large que prévu**.

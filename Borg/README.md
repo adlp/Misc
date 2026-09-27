@@ -106,9 +106,14 @@ IDX_WORKERS      = 4
 # Non défini = pas de limite (tout l'historique conservé)
 DIFF_KEEP        = 30
 
-# Rétention de l'historique repo_stats (taille du dépôt dans le temps, un point par Bkp/Prune)
-# en mois. Purgé à chaque écriture (fin de Bkp ou de Prune réel). Défaut 13 mois si absent,
-# non numérique, ou < 1 (0 ou négatif sont ramenés au défaut de 13 mois).
+# Rétention des historiques, en mois (défaut 13 : une vue annuelle complète pour repérer les motifs
+# saisonniers). Défaut 13 si absent, non numérique ou < 1. S'applique à :
+#  - repo_stats (taille du dépôt dans le temps) : purgé à chaque écriture (fin de Bkp/Prune réel) ;
+#  - séries des graphiques (RepoHistory/ArchiveHistory, depuis 1.0.127) : bornées à cette durée à
+#    l'affichage — les statistiques par archive restent en base tant que l'archive existe (Report,
+#    Historique complet) et partent au Prune réel de l'archive ;
+#  - bkp_status (suivi des sauvegardes pour les notifications, depuis 1.0.127) : purgé au démarrage
+#    d'une sauvegarde.
 STATS_RETENTION_MONTHS = 13
 
 # Clef explicite (keyfile mode, utile si plusieurs nicks partagent le même dépôt)
@@ -1075,7 +1080,7 @@ première requête — voir `docs/borghelperrc.example`.
 | `BORGHELPERWWW_PUSH_DB` | `--push-db` | `push_db` | Chemin du fichier SQLite **dédié** aux clés VAPID et abonnements push (Story 2a, `spec-notifications-push`, AD-6 — jamais `scopecache.db`) — défaut : co-localisé avec `cache.db`/`diff.db` (voir [Notifications push](#notifications-push)) |
 | `BORGHELPERWWW_PUSH_PREFS` | `--push-prefs` | `push_prefs` | Fichier **JSON** des préférences de notification par abonné (début/fin, nicks suivis, expiration — `spec-push-ui-prefs-json`), éditable à la main — défaut : à côté de `push.db` (`<prefixe>-push-prefs.json`) |
 | `BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS` | — | — | Durée d'expiration par défaut (jours) d'un abonnement push quand `expires_in_days` est absent de `POST /push/subscribe` — défaut 30, repli sur 30 si valeur invalide/négative |
-| `BORGHELPERWWW_PUSH_VAPID_SUB` | — | — | Contact (`vapid_claims['sub']`, ex. `mailto:...`) requis par le protocole Web Push (RFC 8292) pour l'envoi réel (Story 2b) — défaut générique `mailto:admin@example.invalid`, à définir en production |
+| `BORGHELPERWWW_PUSH_VAPID_SUB` | — | — | Contact (`vapid_claims['sub']`, ex. `mailto:...`) requis par le protocole Web Push (RFC 8292) pour l'envoi réel (Story 2b) — défaut générique `mailto:admin@example.invalid`, à définir en production. Valeur qui n'est ni `mailto:adresse` ni `https://…` : `[WARN]` au démarrage (1.26.3), les services push la refuseraient |
 
 Le serveur refuse de démarrer si le fichier de conf `.borghelperrc` (`cfgfile`) est absent (aucun des
 trois moyens ne l'a fourni). La clé API, elle, n'est **pas requise** : si absente partout,
@@ -1797,7 +1802,9 @@ ou une valeur non booléenne, ne produit aucune notification. Une entrée à l'a
 `notify_start`/`notify_end` globaux) est convertie à la lecture : début = `notify_start`, succès et
 échec = `notify_end`, pour chaque host.
 
-`expires_at` : `null` = « à vie », sinon date UTC `AAAA-MM-JJ HH:MM:SS`. Écritures atomiques (fichier
+`expires_at` : `null` = « à vie », sinon date UTC `AAAA-MM-JJ HH:MM:SS`. Un abonnement expiré est retiré du fichier et
+de `push.db` par le watcher, au plus tard une heure après son expiration (1.26.3 ; auparavant seulement ignoré à
+l'envoi, jamais nettoyé). Écritures atomiques (fichier
 temporaire + renommage, mode `0600`) sous verrou (`<fichier>.lock`, plusieurs workers uvicorn). Une
 entrée mal formée est normalisée **fail-closed** (nicks invalides -> aucun, date illisible -> expiré,
 jamais « à vie » par accident) ; un fichier **corrompu n'est jamais écrasé** : les routes `/push/*`
