@@ -59,12 +59,12 @@ sys.path.insert(0,str(Path(__file__).resolve().parent))
 from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail,
                          DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec,
                          _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES, _enc_header_read, sentry_alert,
-                         _sentry_alert_kinds, db_plain_anomalies, _cfg_bool)
+                         _sentry_alert_kinds, db_plain_anomalies, _cfg_bool, convert_octets_readable)
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.27.2"
+WWW_VERSION="1.27.3"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -2755,10 +2755,45 @@ def duidx(nick: str, request: Request, pattern: Optional[str]=None, sort: str="c
     if archive_to: extra+=['-B',archive_to]
     return run_borghelper('duidx',nick=nick,extra_args=extra,cacheable=True)
 
+def _scope_cache_nick_prefix(n):
+    return json.dumps([n],ensure_ascii=False)[:-1]+','   # début de _scope_cache_key : ["<nick>",
+
+def _scope_cache_stats(nicks):
+    """{nick: (lignes, plus ancienne written_at)} dans SCOPE_CACHE_DB — jamais d'exception (pur cache)."""
+    out={}
+    try:
+        conn=_open_db(SCOPE_CACHE_DB,nick=None,role='read')
+        try:
+            for n in nicks:
+                pfx=_scope_cache_nick_prefix(n)
+                out[n]=tuple(conn.execute("SELECT COUNT(*),MIN(written_at) FROM scope_cache WHERE substr(cache_key,1,?)=?",
+                                          (len(pfx),pfx)).fetchone())
+        finally: conn.close()
+    except sqlite3.Error:
+        pass
+    return out
+
+def _with_extra_stdout(resp,text):
+    """Ajoute `text` au stdout d'une réponse CommandResult (sans toucher au cache de réponses de run_borghelper)."""
+    try: data=json.loads(resp.body)
+    except ValueError: return resp
+    data['stdout']=(data.get('stdout') or '')+text
+    return JSONResponse(status_code=resp.status_code,content=data)
+
 @router.get("/cacheinfo",response_model=CommandResult,tags=["lecture"])
 def cacheinfo(nick: str="ALL", x_api_key: Optional[str]=Header(default=None)):
+    """Caches de borgHelper (cache.db) + depuis 1.27.3 le cache par périmètre de borgHelperWWW (scopecache.db) :
+    lignes et plus ancienne ligne par nick, taille du fichier. Partie scopecache calculée à chaque appel."""
     require_api_key(x_api_key)
-    return run_borghelper('cacheinfo',nick=nick,cacheable=True)
+    resp=run_borghelper('cacheinfo',nick=nick,cacheable=True)
+    nicks=_nick_list(nick); st=_scope_cache_stats(nicks)
+    try: size=convert_octets_readable(os.path.getsize(SCOPE_CACHE_DB))
+    except OSError: size='absent'
+    lines=[f"\nscopecache.db (borgHelperWWW, réponses filtrées par périmètre) — {SCOPE_CACHE_DB} ({size}) :"]
+    for n in nicks:
+        cnt,oldest=st.get(n,(None,None))
+        lines.append(f"  {n}: " + ("illisible" if cnt is None else f"{cnt} ligne(s)"+(f", plus ancienne {oldest}" if oldest else '')))
+    return _with_extra_stdout(resp,'\n'.join(lines)+'\n')
 
 @router.get("/repohistory",response_model=CommandResult,tags=["lecture"])
 def repohistory(nick: str, x_api_key: Optional[str]=Header(default=None)):
@@ -2778,8 +2813,24 @@ def archivehistory(nick: str, x_api_key: Optional[str]=Header(default=None)):
 
 @router.post("/cacheclean",response_model=CommandResult,tags=["mutation"])
 def cacheclean(nick: str="ALL", x_api_key: Optional[str]=Header(default=None)):
+    """Caches de borgHelper + depuis 1.27.3 les lignes de ces nicks dans scopecache.db (pur cache : recalculées
+    à la prochaine requête filtrée)."""
     require_api_key(x_api_key)
-    return run_borghelper('cacheclean',nick=nick)
+    resp=run_borghelper('cacheclean',nick=nick)
+    removed=0; err=None
+    try:
+        conn=_open_db(SCOPE_CACHE_DB,nick=None,role='write')
+        try:
+            for n in _nick_list(nick):
+                pfx=_scope_cache_nick_prefix(n)
+                removed+=conn.execute("DELETE FROM scope_cache WHERE substr(cache_key,1,?)=?",(len(pfx),pfx)).rowcount
+            conn.commit()
+        finally: conn.close()
+    except sqlite3.Error as e:
+        err=str(e)
+    text=(f"\nscopecache.db : {removed} ligne(s) supprimée(s)\n" if err is None
+          else f"\nscopecache.db : purge impossible ({err})\n")
+    return _with_extra_stdout(resp,text)
 
 @router.get("/idxtop",response_model=CommandResult,tags=["lecture"])
 def idxtop(request: Request, nick: str="ALL", topn: int=20, depth: int=3, x_api_key: Optional[str]=Header(default=None)):
@@ -3594,6 +3645,26 @@ def push_selftest():
                      mock.patch(f"{__name__}.PUSH_VAPID_PRIVATE_KEY",PUSH_VAPID_PRIVATE_KEY or 'k'):
                     r=client.post(f"{P}/push/test",headers=H,params={'endpoint':'nimporte'})
                     rv=client.get("/version")
+                def _cache_routes_scopecache():
+                    """1.27.3 : /cacheinfo montre les lignes scopecache.db du nick ; /cacheclean les supprime (celles des
+                    autres nicks intactes). scopecache.db temporaire, jamais le vrai."""
+                    global SCOPE_CACHE_DB
+                    old_sc=SCOPE_CACHE_DB; SCOPE_CACHE_DB=os.path.join(tmpdir,'routes-scopecache.db')
+                    try:
+                        ensure_scope_cache_db(); nk=_nick_list('ALL')[0]
+                        sc=_open_db(SCOPE_CACHE_DB,nick=None,role='write')
+                        for n2,k in ((nk,'a'),(nk,'b'),('autre-nick','c')):
+                            sc.execute("INSERT INTO scope_cache (cache_key,fingerprint,result_json) VALUES (?,?,?)",
+                                       (_scope_cache_key(n2,'treehist',{'k':k},'s'),'f','{}'))
+                        sc.commit(); sc.close()
+                        info=client.get(f"{P}/cacheinfo",headers=H,params={'nick':nk}).json()['stdout']
+                        clean=client.post(f"{P}/cacheclean",headers=H,params={'nick':nk}).json()['stdout']
+                        after=_scope_cache_stats([nk,'autre-nick'])
+                        return (f"{nk}: 2 ligne(s)" in info and 'scopecache.db : 2 ligne(s) supprimée(s)' in clean
+                                and after[nk][0]==0 and after['autre-nick'][0]==1)
+                    finally:
+                        SCOPE_CACHE_DB=old_sc
+                check("/cacheinfo et /cacheclean couvrent scopecache.db (par nick, autres nicks intacts)",_cache_routes_scopecache)
                 check("PUSH_DISABLED : POST /push/test -> 503 explicite, /version push_suspended=true",
                       lambda: r.status_code==503 and 'suspendu' in r.json()['detail'] and rv.json().get('push_suspended') is True)
                 r=client.get(f"{P}/access",headers=H)

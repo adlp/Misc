@@ -1737,8 +1737,8 @@ servi comme une réponse obsolète.
 | GET | `/treehist` | TreeHist (`changes=true` → `-X`, changements entre `archive_from` exclue et `archive_to`, borgHelperWWW ≥ 1.27.0) | ✓ |
 | GET | `/treefind` | TreeFind | ✓ |
 | GET | `/duidx` | DuIdx | ✓ |
-| GET | `/cacheinfo` | CacheInfo | ✓ |
-| POST | `/cacheclean` | CacheClean | |
+| GET | `/cacheinfo` | CacheInfo + (≥ 1.27.3) lignes du cache par périmètre `scopecache.db` par serveur, plus ancienne ligne, taille du fichier | ✓ |
+| POST | `/cacheclean` | CacheClean + (≥ 1.27.3) purge des lignes de ces serveurs dans `scopecache.db` | |
 | GET | `/idxtop` | IdxTop | ✓ |
 | GET | `/difftop` | DiffTop | ✓ |
 | GET | `/repohistory` | RepoHistory | ✓ |

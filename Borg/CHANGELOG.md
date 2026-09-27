@@ -1,5 +1,14 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.27.3 — `/cacheinfo` et `/cacheclean` couvrent le cache par périmètre — 2026-09-27
+
+Issu de l'entretien `deferred-work.md` (point 3, option A).
+
+- `GET /cacheinfo` : en plus des caches de borgHelper, lignes de `scopecache.db` (réponses filtrées par
+  `GROUPS_PATHS`) par serveur, date de la plus ancienne, taille du fichier.
+- `POST /cacheclean` : purge aussi les lignes de ces serveurs dans `scopecache.db` (les autres restent). Plus besoin de
+  supprimer le fichier à la main. `push_selftest` 83/83.
+
 ## borgHelperWWW 1.27.2 / borgHelperWWW_ui.html 1.17.1 — coupe-circuit des notifications push — 2026-09-27
 
 Issu de l'entretien `deferred-work.md` (point 2, options A + C).

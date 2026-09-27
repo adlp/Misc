@@ -1082,6 +1082,14 @@ redémarrage. Jamais à chaque requête ; erreur SQLite ignorée (pur cache).
 balayage plus grand que la borne, le vidage complet jetait aussi les préfixes chauds, recalculés aussitôt. Coût
 amorti O(1) par insertion ; aucune incidence sur la vérification (une entrée n'est mémorisée qu'après validation).
 
+### `/cacheinfo` / `/cacheclean` et `scopecache.db` (borgHelperWWW 1.27.3)
+
+Les deux routes restent déléguées à borgHelper (`cache.db`), puis borgHelperWWW ajoute au `stdout` la partie
+`scopecache.db`, qu'il possède seul : par nick, lignes dont la clé commence par `["<nick>",` (`_scope_cache_key`),
+`COUNT(*)`/`MIN(written_at)`, taille du fichier ; `/cacheclean` supprime ces lignes (celles des autres nicks restent).
+Partie calculée à chaque appel, hors du cache de réponses de `run_borghelper` (`_with_extra_stdout`). Erreur SQLite :
+signalée dans le texte, jamais une erreur HTTP (pur cache).
+
 ### Coupe-circuit des notifications push (borgHelperWWW 1.27.2 / UI 1.17.1)
 
 `_push_muted(nick)` → raison ou `None` : `PUSH_DISABLED` (env `BORGHELPERWWW_PUSH_DISABLED`, lue au démarrage,
