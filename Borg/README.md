@@ -361,7 +361,7 @@ borgHelper -c Prune -n ALL
 ```
 
 Requiert au moins une clef `KEEP_*` dans la conf.  
-Enchaîne automatiquement `borg compact`, invalide le cache SQLite, et retire des bases les archives disparues
+Attend qu'un `Index` en cours se mette en pause (1.0.141), enchaîne automatiquement `borg compact`, invalide le cache SQLite, et retire des bases les archives disparues
 (rapprochement, voir `Index`) — leurs lignes de graphique restent affichées pendant `STATS_RETENTION_MONTHS`.
 Met aussi à jour le schéma de `cache.db`/`diff.db` si nécessaire avant toute opération (comme `Bkp`/`Index`)
 — voir [Schéma de base de données](TECHNICAL.md#migrations-diffdb--table-de-correspondance-version--action).
@@ -547,6 +547,8 @@ borgHelper -c Index -n mon-serveur -F        # force la réindexation complète
 borgHelper -c Index -n mon-serveur -S        # snapshot seul
 borgHelper -c Index -n mon-serveur -S -F     # force le snapshot seul (borg list complet)
 borgHelper -c Index -n mon-serveur -A <archive>  # indexe uniquement la paire terminant par <archive>
+borgHelper -c Index -n ALL -t 1m             # tranche d'une minute par nick (cron)
+borgHelper -c Index -n mon-serveur -T diff -b 2026-09-01   # diffs seuls, archives depuis le 1er septembre
 ```
 
 | Option | Description |
@@ -554,6 +556,21 @@ borgHelper -c Index -n mon-serveur -A <archive>  # indexe uniquement la paire te
 | `-F` | Supprime et recalcule toutes les paires existantes (snapshot : force `borg list` complet) |
 | `-S` | Snapshot seul — indexe uniquement le listing de la dernière archive |
 | `-A <archive>` | Restreint l'indexation à la paire dont `archive_new` correspond à `<archive>` |
+| `-t <durée>` | Tranche (1.0.141) : budget par nick — `90`, `90s`, `5m`, `1h` |
+| `-T <natures>` | Tranche : parmi `stats,snap,diff` (défaut : les trois) |
+| `-b` / `-B` | Tranche : période — nom d'archive, date `AAAA-MM-JJ[THH:MM:SS]` (borne haute : toute la journée incluse) ou `ALL` (sans borne) ; toute autre valeur est refusée — restreint stats et diffs |
+
+**Index par tranches** (borgHelper ≥ 1.0.141) : `-t`, `-T`, `-b` ou `-B` (jamais avec `-F`, `-S` ou `-A`)
+construisent ou complètent la base par petits morceaux, pensés pour une ligne cron. Ordre : statistiques des archives
+(un `borg info` par archive, la plus récente d'abord), snapshot de la dernière archive, puis diffs du plus récent au
+plus ancien. À l'échéance, le `borg` en cours est tué et son morceau jeté ; les morceaux finis ne sont jamais refaits :
+le lancement suivant reprend. La tranche tourne en priorité basse (`nice` 10, `ionice` idle). Choisir un budget
+qui couvre le `borg list` du début de chaque tranche plus un `borg info` ou un `borg diff` de deux archives
+consécutives, sinon rien n'aboutit (un avertissement le signale). L'avancement (`partielle` / `terminée`, paires,
+statistiques, snapshot) s'affiche en fin de tranche et dans `Status`. `-S` passe aussi par le verrou et la pause.
+
+**`DIFF_KEEP`** (corrigé en 1.0.141, pour tout Index) : seules les N paires les plus récentes sont calculées et gardées.
+Avant, chaque Index recalculait les paires purgées au précédent, et la paire gardée changeait d'un Index à l'autre.
 
 Types d'événements : `added`, `removed`, `modified`, `C` (permissions), `B` (lien cassé), `T` (type changé).
 
@@ -582,7 +599,12 @@ diffs et snapshots sont retirés (reconstruits si l'on revient à l'ancien motif
 `Index` ne compacte jamais `diff.db` : si le dépôt est élagué par `borg prune` hors borgHelper, lancer `IdxPurge` de
 temps en temps pour rendre la place libérée (le `Prune` de borgHelper compacte lui-même).
 
-> **Interruptible et reprise automatique :** si `Bkp` ou `Restore` démarre pendant `Index`, l'indexation s'arrête immédiatement (diffs tués + borg info + indexsnap annulés). `Index` pose un flag de reprise ; `Bkp` le détecte à la fin de son exécution et relance automatiquement `Index` complet. Les paires déjà indexées sont sautées (incrémental).
+> **Pause et reprise automatiques** (1.0.141) : si `Bkp`, `Restore`, `Prune` ou `Report` démarre pendant `Index`
+> (quelle que soit l'étape : diffs, statistiques, snapshot), le `borg` en cours est tué et `Index` se met en pause en
+> une seconde environ (quelques secondes si une écriture SQL est en cours) — l'opération prioritaire ne l'attend plus. Il attend la fin de l'opération (Index de fin de Bkp
+> compris), puis reprend seul là où il en était : ce qui était fini est gardé, la nouvelle archive est prise en compte.
+> Un seul `Index` à la fois par dépôt : un second (un cron, par exemple) s'arrête aussitôt avec « Index déjà en cours ».
+> Une tranche (`-t`) compte la pause dans son budget et sort à l'échéance ; le cron suivant reprend.
 
 ---
 
@@ -848,7 +870,7 @@ borgHelper -c Status -n ALL -j               # tous les nicks configurés, JSON
 | Option | Description |
 |--------|-------------|
 | `-n <nick1,nick2>` / `-n ALL` | Un ou plusieurs nicks nativement (contrairement à `RepoHistory`/`ArchiveHistory` qui rejettent le multi-nick) — c'est le cas d'usage principal de `Status` |
-| `-j` | Sortie JSON — toujours une **liste**, même à un seul nick : `[{nick,last_backup,bkp_running,priority_op_running}, ...]` |
+| `-j` | Sortie JSON — toujours une **liste**, même à un seul nick : `[{nick,last_backup,bkp_running,priority_op_running,build}, ...]` |
 
 Par nick :
 - **Dernier backup connu** : archive + date depuis `archive_stats` (déjà indexée localement) + âge
@@ -862,7 +884,11 @@ Par nick :
 
 En JSON : `last_backup` est `{archive,date}` ou `null` ; `bkp_running` est `{started_at}` ou `null` ;
 `priority_op_running` est un booléen brut (reflète `priority.lock`, indépendamment de `bkp_running` —
-c'est au consommateur de corréler les deux, comme pour l'affichage texte).
+c'est au consommateur de corréler les deux, comme pour l'affichage texte). `build` (1.0.141) : état de construction
+de la base, `{state:'partial'|'complete', pairs_done, pairs_total, archives_total, stats_done, snapshot, updated_at}` écrit par les
+tranches d'Index ; `{state:'complete'}` pour une base jamais construite par tranches. En texte, une ligne
+« Construction partielle : X/Y paires, statistiques A/B » tant qu'elle n'est pas finie ; `null` si le nick est en
+erreur (champ `error`).
 
 ---
 
@@ -2131,6 +2157,10 @@ raisonnement (indiscernabilité d'un chemin qui n'existe simplement pas dans l'a
 
 # Prune hebdomadaire le dimanche à 3h
 0 3 * * 0  borgHelper -c Prune -n mon-serveur
+
+# Construction / complétion des bases par tranches d'une minute PAR NICK, toutes les 10 minutes (1.0.141) :
+# au-delà de 10 nicks, un lancement dure plus de 10 min — le suivant sort aussitôt (« Index déjà en cours »)
+*/10 * * * *  borgHelper -c Index -n ALL -t 1m
 
 # Rapport HTML envoyé par mail
 30 6 * * *  borgHelper -c Report -n ALL -l | mail -s "Borg $(date +\%F)" admin@domaine.com

@@ -1,5 +1,41 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.141 — Index par tranches, pause/reprise de l'Index, correction de DIFF_KEEP — 2026-09-27
+
+Chantier « reconstruction progressive », story 4 (spine AD-1, AD-3, AD-4 amendé, AD-10).
+
+- **Index par tranches** : `-t <durée>` (budget par nick : `90`, `5m`, `1h`), `-T stats,snap,diff`, `-b`/`-B`
+  (période). Ordre : statistiques (un `borg info` par archive, la plus récente d'abord), snapshot de la dernière
+  archive, diffs du plus récent au plus ancien. Chaque morceau est une transaction avec sa sentinelle : jamais refait,
+  jamais à moitié écrit. À l'échéance, le `borg` en cours est tué. Priorité basse (`nice` 10, `ionice` idle). Pensé
+  pour le cron : `*/10 * * * * borgHelper -c Index -n ALL -t 1m`. Incompatible avec `-F`, `-S`, `-A`.
+- **État de construction** (`build_state` dans `diff.db`) : `Status -j` gagne un champ `build`
+  (`partial`/`complete`, paires faites/visées) ; `Status` affiche « Construction partielle : X/Y paires ».
+- **Surveillance croisée** : Bkp, Restore, Prune et Report mettent un Index en cours en pause, à toute étape (avant :
+  seulement pendant les diffs), en une seconde environ au lieu d'attendre jusqu'à 120 s. L'Index reprend seul après
+  la fin de l'opération (Index de fin du Bkp compris) : avant, il s'arrêtait et seul le Bkp suivant le relançait.
+  Un seul Index par dépôt : un second sort aussitôt (« Index déjà en cours »), au lieu de tourner en parallèle.
+  Prune attend désormais l'Index comme Bkp et Restore.
+- **Corrigé : `DIFF_KEEP`** relançait à chaque Index le `borg diff` des paires qu'il venait de purger, et gardait la
+  paire indexée en dernier plutôt que la plus récente (la paire gardée changeait d'un Index à l'autre). Seules les N
+  paires les plus récentes sont désormais calculées et gardées.
+- Snapshot incrémental : le `borg list` des fichiers ajoutés passe avant toute écriture (plus de lignes sans
+  sentinelle après une interruption) ; lignes orphelines d'un arrêt brutal retirées avant de refaire le snapshot.
+- `-S` passe aussi par le verrou d'Index et la pause. Période `-b`/`-B` validée (archive, date `AAAA-MM-JJ…` ou
+  `ALL`) : une faute de frappe est refusée au lieu de ne rien sélectionner en silence.
+- Revue en trois couches, correctifs : `-F` repris après une pause ne refait plus les paires déjà recalculées ; borg
+  arrêté par SIGTERM puis SIGKILL (verrou du dépôt relâché) et `break-lock` réservé aux opérations prioritaires (jamais
+  à l'échéance d'une tranche) ; verrou orphelin retiré sans pouvoir voler celui d'un autre processus, repli sans liens
+  physiques, PID d'un autre utilisateur jamais pris pour mort ; demande d'arrêt vérifiée aussi entre les phases SQL et
+  reprise même si elle a déjà disparu ; Bkp sans tour d'Index → `index-pending` ; `build_state` par nick (`DB_NAME`
+  partagé), avec statistiques et snapshot ; avertissement quand une tranche ne progresse pas ; DbEncrypt refuse aussi
+  pendant une pause ; `-t` démesuré refusé.
+- **Changement de comportement (bibliothèque, cron)** : un Index sans budget lancé pendant une opération prioritaire
+  attend sa fin (sans limite) au lieu de sortir aussitôt ; `pause=False` garde l'ancien comportement.
+- Bibliothèque (LIBRARY.md) : `index()` gagne `budget`, `natures`, `period`, `pause`, `snap_only` ; `indexsnap()` gagne
+  `archives` ; verrous `acquire_index_running_lock`, `release_index_running_lock`, `index_running_owned`,
+  `acquire_index_paused_lock`, `release_index_paused_lock`, `check_index_paused`.
+
 ## borgHelper 1.0.140 / UI 1.18.0 — archives supprimées hors borgHelper retirées, graphiques gardés 13 mois — 2026-09-27
 
 Chantier « reconstruction progressive », story 3 (spine AD-9, AD-7 amendé).

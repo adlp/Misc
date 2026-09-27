@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.140"
+Version="1.0.141"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -405,6 +405,23 @@ def _duidx_print(totals,label,grouped,sort_by='chemin',reverse=False,as_json=Fal
     if label: print(f"Pattern : {label}")
     print(t)
 
+def _parse_duration(v):
+    """'90' / '90s' / '5m' / '1h' -> secondes (> 0), sinon None."""
+    m=re.fullmatch(r'\s*(\d+)\s*([smh]?)\s*',v or '')
+    if not m: return None
+    n=int(m.group(1))*{'':1,'s':1,'m':60,'h':3600}[m.group(2)]
+    return n if 0<n<=10**7 else None
+
+def _lower_priority():
+    """Priorité basse d'une tranche (AD-4) : nice 10 et ionice classe idle pour ce processus — hérités par les borg
+    lancés ensuite. ionice absent ou refusé : sans effet."""
+    try: os.nice(10)
+    except OSError: pass
+    exe=shutil.which('ionice')
+    if exe:
+        try: subprocess.run([exe,'-c','3','-p',str(os.getpid())],capture_output=True,timeout=10)
+        except (OSError,subprocess.SubprocessError): pass
+
 def usage(doc=None,debug=0):
     if doc is None:
         printer("   -H <Stats|Login|Mount|UMount|ListBkp|ListBkpFiles|Restore> [-C /root/.borghelperrc]")
@@ -448,6 +465,8 @@ def usage(doc=None,debug=0):
         printer("       Parallèle par défaut (IDX_WORKERS=4 dans borghelperrc)")
         printer("       -F : force la réindexation  |  -S : snapshot seul (sans recalculer les diffs)")
         printer("       -A <archive> : réindexe uniquement la paire dont archive_new=<archive>")
+        printer("       [-t durée] [-T stats,snap,diff] [-b archive|date] [-B archive|date] : tranche pour cron")
+        printer("       (budget par nick, reprenable, priorité basse) — voir -H Index")
         printer("       IndexSnap s'auto-répare : un type manquant (colonne snapshot_file.type) force un")
         printer("       resnapshot complet automatique une fois (au prochain Bkp/Index), sans -F manuel")
         printer("   -c Search -f <pattern> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-j]")
@@ -561,9 +580,14 @@ def usage(doc=None,debug=0):
         printer('      Initialise un nouveau dépôt borg (chiffrement repokey)')
     elif doc=='index':
         printer("   -c Index [-n nickname/servername/ALL] [-F] [-S] [-A archive]")
+        printer("   -c Index [-n nickname/servername/ALL] [-t durée] [-T stats,snap,diff] [-b archive|date] [-B archive|date]")
         printer("       Indexe les diffs entre archives consécutives (incrémental, parallèle)")
         printer("       -F : force la réindexation  -S : snapshot seul")
         printer("       -A <archive> : réindexe uniquement la paire dont archive_new=<archive>")
+        printer("       Tranche (pour cron) : -t budget par nick (90, 90s, 5m, 1h), -T natures, -b/-B période ;")
+        printer("       stats puis snapshot de la dernière archive puis diffs du plus récent au plus ancien,")
+        printer("       reprenable, priorité basse (nice/ionice) ; avancement dans Status -j (build)")
+        printer("       Bkp/Restore/Prune/Report mettent l'Index en pause ; il reprend seul après leur fin")
         printer("       Auto-réparation : un type manquant (snapshot_file.type) force un resnapshot")
         printer("       complet une fois, automatiquement, sans besoin de -F (voir TreeHist)")
         printer("       IDX_WORKERS dans borghelperrc : nb de borg diff parallèles (défaut 4)")
@@ -767,6 +791,10 @@ _RECONCILE_ERRORS=(sqlite3.Error,SystemExit,DbKeyError,DbModeError,DbTamperError
 # Gardée STATS_RETENTION_MONTHS, que l'archive existe encore ou non. Ajout pur : HISTORY_DB_SCHEMA_VERSION inchangé.
 _CHART_FIELDS=('duration','original_size','compressed_size','deduplicated_size','nfiles',
                'files_added','files_modified','files_removed','changed_during_backup','read_errors')
+
+def _build_state_key(nick):
+    """Clé db_meta de l'état de construction d'un nick (1.0.141, AD-10) — par nick : DB_NAME peut partager une diff.db."""
+    return f'build_state:{nick}'
 
 def _history_path_for(diff_path):
     """history.db jumelle d'une diff.db : '<conf>-<nick>-diff.db' -> '<conf>-<nick>-history.db' (autre nom de
@@ -1602,16 +1630,30 @@ class BorgHelperDB:
         try: os.unlink(path)
         except OSError: pass
 
-    def _check_pid_lock(self,path):
-        if not os.path.exists(path): return False
+    @staticmethod
+    def _lock_holder(path):
+        """'me' | 'alive' | 'dead' | 'gone' (1.0.141). Fichier vide ou illisible de moins de 2 s : 'alive' (en cours
+        d'écriture par son créateur) ; PID d'un autre utilisateur (PermissionError) : 'alive' — jamais pris pour mort."""
         try:
-            with open(path) as f: pid=int(f.read().strip())
-            if pid==os.getpid(): return False
-            os.kill(pid,0); return True
-        except (OSError,ValueError):
+            with open(path) as f: txt=f.read().strip()
+        except FileNotFoundError: return 'gone'
+        except OSError: return 'alive'
+        try: pid=int(txt)
+        except ValueError:
+            try: return 'alive' if time.time()-os.path.getmtime(path)<2 else 'dead'
+            except OSError: return 'gone'
+        if pid==os.getpid(): return 'me'
+        try: os.kill(pid,0); return 'alive'
+        except PermissionError: return 'alive'
+        except OSError: return 'dead'
+
+    def _check_pid_lock(self,path):
+        h=self._lock_holder(path)
+        if h=='alive': return True
+        if h=='dead':
             try: os.unlink(path)
             except OSError: pass
-            return False
+        return False
 
     def _priority_lock_path(self,nick): return self._pid_lock_path(nick,'priority')
     def set_priority_lock(self,nick): self._set_pid_lock(self._priority_lock_path(nick))
@@ -1630,21 +1672,83 @@ class BorgHelperDB:
     def clear_index_running_lock(self,nick): self._clear_pid_lock(self._index_running_lock_path(nick))
     def check_index_running(self,nick): return self._check_pid_lock(self._index_running_lock_path(nick))
 
+    # Prise exclusive (1.0.141, AD-4 amendé) : un seul Index par dépôt. os.link d'un fichier temporaire déjà rempli :
+    # création atomique ET contenu complet (jamais un fichier vide lu par un autre processus). Verrou d'un PID mort
+    # ou illisible : retiré, nouvel essai. Réentrant pour le même processus (Index de fin de Bkp).
+    def _acquire_pid_lock_excl(self,path):
+        me=str(os.getpid())
+        for _ in range(4):
+            tmp=f"{path}.{me}.tmp"
+            try:
+                with open(tmp,'w') as f: f.write(me)
+                try: os.link(tmp,path); return True
+                except FileExistsError: pass
+                except OSError:
+                    # Système de fichiers sans liens physiques : création exclusive puis PID écrit aussitôt (un fichier
+                    # vide de moins de 2 s est vu 'alive' par _lock_holder, jamais retiré).
+                    try:
+                        fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+                        with os.fdopen(fd,'w') as f: f.write(me)
+                        return True
+                    except FileExistsError: pass
+            except OSError: return False
+            finally:
+                try: os.unlink(tmp)
+                except OSError: pass
+            h=self._lock_holder(path)
+            if h=='me': return True
+            if h=='alive': return False
+            if h=='gone': continue
+            # Verrou orphelin : mis de côté par rename (atomique) puis revérifié, jamais un unlink du chemin — un autre
+            # processus peut l'avoir repris entre la lecture et le retrait ; dans ce cas on le lui rend.
+            aside=f"{path}.stale.{me}"
+            try: os.rename(path,aside)
+            except OSError: continue
+            if self._lock_holder(aside) in ('alive','me'):
+                try: os.link(aside,path)
+                except OSError: pass
+                try: os.unlink(aside)
+                except OSError: pass
+                return False
+            try: os.unlink(aside)
+            except OSError: pass
+        return False
+
+    def _release_own_lock(self,path):
+        """Retire le verrou seulement s'il est à ce processus (jamais celui d'un autre, pris depuis)."""
+        try:
+            with open(path) as f:
+                if f.read().strip()!=str(os.getpid()): return
+            os.unlink(path)
+        except OSError: pass
+
+    def _owns_lock(self,path):
+        try:
+            with open(path) as f: return f.read().strip()==str(os.getpid())
+        except OSError: return False
+
+    def acquire_index_running_lock(self,nick,wait=0):
+        """Tour d'Index exclusif ; wait : secondes d'attente maximale si un autre le tient (Index de fin de Bkp)."""
+        end=time.monotonic()+wait
+        while True:
+            if self._acquire_pid_lock_excl(self._index_running_lock_path(nick)): return True
+            if time.monotonic()>=end: return False
+            time.sleep(0.5)
+    def release_index_running_lock(self,nick): self._release_own_lock(self._index_running_lock_path(nick))
+    def index_running_owned(self,nick): return self._owns_lock(self._index_running_lock_path(nick))
+
+    def _index_paused_lock_path(self,nick): return self._pid_lock_path(nick,'index-paused')
+    def acquire_index_paused_lock(self,nick): return self._acquire_pid_lock_excl(self._index_paused_lock_path(nick))
+    def release_index_paused_lock(self,nick): self._release_own_lock(self._index_paused_lock_path(nick))
+    def check_index_paused(self,nick): return self._check_pid_lock(self._index_paused_lock_path(nick))
+
     def wait_index_idle(self,nick,timeout=120):
         """Attend que l'Index en cours sur ce dépôt libère ses verrous borg (max timeout s)."""
-        p=self._index_running_lock_path(nick)
         waited=0
         while waited<timeout:
-            if not os.path.exists(p): return
-            try:
-                with open(p) as f: pid=int(f.read().strip())
-                os.kill(pid,0)
-                if waited==0: printer(f"  {nick}: indexation en cours — report en attente (max {timeout}s)...")
-                time.sleep(1); waited+=1
-            except (OSError,ValueError):
-                try: os.unlink(p)
-                except OSError: pass
-                return
+            if not self.check_index_running(nick): return   # 1.0.141 : même lecture que les autres (_lock_holder)
+            if waited==0: printer(f"  {nick}: indexation en cours — report en attente (max {timeout}s)...")
+            time.sleep(1); waited+=1
         printer(f"  [WARN] Timeout attente Index ({timeout}s) — lancement quand même")
 
     def _index_pending_lock_path(self,nick):
@@ -2457,12 +2561,20 @@ class BorgHelperDB:
         try: return self._with_lock_retry(_do)
         except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
 
-    def _diff_keep_purge(self,nick,keep,db_path):
+    def _diff_keep_purge(self,nick,keep,db_path,archives=None):
+        """Garde les `keep` paires les plus récentes (1.0.141, bug DIFF_KEEP) : dans l'ordre de la liste d'archives
+        (archives, celle de borg list) ; sans liste, par date d'archive (archive_stats) puis nom — jamais indexed_at
+        (à la seconde, et réécrit par chaque re-diff : la paire gardée changeait d'un Index à l'autre)."""
         def _do():
             conn=_open_db(db_path,nick=nick,role='write')
             try:
-                rows=conn.execute("SELECT archive_old,archive_new FROM diff_indexed_pairs WHERE nick=? ORDER BY indexed_at DESC",(nick,)).fetchall()
-                to_delete=rows[keep:]
+                rows=conn.execute("SELECT p.archive_old,p.archive_new FROM diff_indexed_pairs p LEFT JOIN archive_stats s "
+                                  "ON s.nick=p.nick AND s.archive=p.archive_new WHERE p.nick=? "
+                                  "ORDER BY s.archive_date DESC,p.archive_new DESC",(nick,)).fetchall()
+                if archives is not None:
+                    kept={(o,n) for o,n,_ in BorgHelper._diff_keep_pairs(archives,keep)}
+                    to_delete=[r for r in rows if tuple(r) not in kept]
+                else: to_delete=rows[keep:]
                 if not to_delete: return
                 # 1.0.140 : comptages des archives restantes figés avant de retirer leur paire (graphiques sur
                 # STATS_RETENTION_MONTHS) ; échec du figeage -> sqlite3.Error, rien purgé.
@@ -2709,6 +2821,17 @@ class BorgHelperDB:
 
 class BorgRunner:
     """Borg subprocess wrapper and borghelperrc configuration layer."""
+    # Demande d'arrêt (1.0.141, moteur d'Index) : callable -> True quand le borg lancé par boex() doit être arrêté
+    # (opération prioritaire, échéance de tranche). Sondé toutes les 0,5 s ; le résultat porte alors 'killed': True.
+    # Propre à chaque thread (deux Index dans un même processus ne se volent pas leur condition) ; _kills compte les
+    # borg arrêtés, pour que l'appelant sache qu'une unité a été jetée.
+    _tls=threading.local()
+    @property
+    def _stop(self): return getattr(BorgRunner._tls,'stop',None)
+    @_stop.setter
+    def _stop(self,v): BorgRunner._tls.stop=v
+    @property
+    def _kills(self): return getattr(BorgRunner._tls,'kills',0)
 
     def __init__(self,cfgfile=None,passphrase=None):
         self.cfgfile=cfgfile or os.path.expanduser("~/.borghelperrc")
@@ -2826,8 +2949,21 @@ class BorgRunner:
             if arg[1] in "extract": sys.exit(4)
         ps=subprocess.Popen(commande,encoding='utf-8',env=varfut,cwd=rep,bufsize=8192,
                             stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        killed=False
         try:
-            inf,errs=ps.communicate()
+            stop=self._stop
+            if stop is None: inf,errs=ps.communicate()
+            else:
+                while True:
+                    try: inf,errs=ps.communicate(timeout=0.5); break
+                    except subprocess.TimeoutExpired:
+                        if stop():
+                            # SIGTERM d'abord : borg relâche son verrou de dépôt (et ferme proprement un borg serve
+                            # distant) ; SIGKILL seulement s'il ne s'arrête pas en 5 s.
+                            ps.terminate()
+                            try: inf,errs=ps.communicate(timeout=5)
+                            except subprocess.TimeoutExpired: ps.kill(); inf,errs=ps.communicate()
+                            killed=True; BorgRunner._tls.kills=self._kills+1; break
         except KeyboardInterrupt:
             ps.kill(); ps.wait()
             import glob as _glob, shutil as _shutil
@@ -2839,6 +2975,7 @@ class BorgRunner:
             printer("\n[INTERRUPTED] Opération annulée par l'utilisateur.")
             sys.exit(130)
         ret={'stdout':[],'stderr':[]}
+        if killed: inf=''   # sortie tronquée d'un borg tué : jamais parsée
         if len(inf):
             if inf[0] in '[{' and retjson: ret['stdout'].append(json.loads(inf))
             else:
@@ -2851,6 +2988,7 @@ class BorgRunner:
                     except json.JSONDecodeError: ret['stderr'].append(_line)
                 else: ret['stderr'].append(_line)
         ret['exitcode']=ps.returncode
+        if killed: ret['killed']=True
         if debug: printer(json.dumps(ret,indent=4))
         return ret
 
@@ -3053,6 +3191,7 @@ class BorgHelper:
         if self.db.check_priority_lock(nick): return f"{nick}: Bkp/Restore en cours (priority lock)"
         if self.db.check_report_running(nick): return f"{nick}: Report en cours"
         if self.db.check_index_running(nick): return f"{nick}: Index en cours"
+        if self.db.check_index_paused(nick): return f"{nick}: Index en pause (reprise imminente)"
         return None
 
     def _db_migrate_run(self,nick,db_path,direction,passphrase,cfg,debug=0):
@@ -4000,26 +4139,36 @@ class BorgHelper:
                         cst=anaRet['stdout'][0].get('cache',{}).get('stats',{})
                         if cst.get('unique_csize') is not None:
                             self.db.store_repo_stats(nick,'bkp',cst['unique_csize'],cst.get('total_size'),cst.get('total_csize'),bkp_status_db)
-                    if not no_index and archive_new and archive_old:
-                        # borg diff réel de la nouvelle paire, PUIS snapshot incrémental (index() finit par
-                        # indexsnap) — jamais l'inverse : le snapshot s'appuie sur le diff de la paire.
-                        # Messages d'Index sur stderr : le stdout de Bkp reste le seul JSON de sortie.
-                        self.db.clear_priority_lock(nick)
-                        with contextlib.redirect_stdout(sys.stderr):
-                            self.index(nick,debug=debug,target_archive=archive_new,set_pending=False)
-                        if out is not None:
-                            fc=self._pair_file_counts(nick,archive_old,archive_new,db_path,with_files=bool(debug))
-                            if fc is not None:
-                                out['borgHelper_file_counts']=fc[0]
-                                if debug: out['borgHelper_files']=fc[1]
-                    elif not no_index:
-                        with contextlib.redirect_stdout(sys.stderr):
-                            self.indexsnap(nick,debug=debug)  # première archive : pas de paire, snapshot complet
-                    if not no_index and self.db.check_index_pending_lock(nick):
-                        self.db.clear_index_pending_lock(nick)
-                        printer(f"{nick}: reprise de l'Index interrompu...")
-                        with contextlib.redirect_stdout(sys.stderr):
-                            self.index(nick,debug=debug,set_pending=False)
+                    # Tour d'Index pris AVANT de relâcher priority.lock (1.0.141, AD-4 amendé) : un Index en pause ne
+                    # reprend qu'après l'Index de fin de ce Bkp, et aucun autre ne s'intercale. Cet Index ne se met
+                    # jamais en pause (pause=False implicite, verrou tenu par l'appelant) : la fin du Bkp n'attend pas.
+                    idx_turn=(not no_index) and self.db.acquire_index_running_lock(nick,wait=120)
+                    if not no_index and not idx_turn:
+                        self.db.set_index_pending_lock(nick)   # le prochain Bkp relancera l'Index
+                        printer(f"[WARN] {nick}: Index occupé — indexation de fin de Bkp reportée (index-pending)")
+                    try:
+                        if idx_turn and archive_new and archive_old:
+                            # borg diff réel de la nouvelle paire, PUIS snapshot incrémental (index() finit par
+                            # indexsnap) — jamais l'inverse : le snapshot s'appuie sur le diff de la paire.
+                            # Messages d'Index sur stderr : le stdout de Bkp reste le seul JSON de sortie.
+                            self.db.clear_priority_lock(nick)
+                            with contextlib.redirect_stdout(sys.stderr):
+                                self.index(nick,debug=debug,target_archive=archive_new,set_pending=False)
+                            if out is not None:
+                                fc=self._pair_file_counts(nick,archive_old,archive_new,db_path,with_files=bool(debug))
+                                if fc is not None:
+                                    out['borgHelper_file_counts']=fc[0]
+                                    if debug: out['borgHelper_files']=fc[1]
+                        elif idx_turn:
+                            with contextlib.redirect_stdout(sys.stderr):
+                                self.indexsnap(nick,debug=debug)  # première archive : pas de paire, snapshot complet
+                        if idx_turn and self.db.check_index_pending_lock(nick):
+                            self.db.clear_index_pending_lock(nick)
+                            printer(f"{nick}: reprise de l'Index interrompu...")
+                            with contextlib.redirect_stdout(sys.stderr):
+                                self.index(nick,debug=debug,set_pending=False)
+                    finally:
+                        if idx_turn: self.db.release_index_running_lock(nick)
                 except Exception as e:
                     printer(f"[WARN] indexation post-backup échouée : {e}")
             if out is not None:
@@ -4051,6 +4200,8 @@ class BorgHelper:
         # distingue pas l'opération).
         self.db.set_priority_lock(nick)
         try:
+            # 1.0.141 (AD-4 amendé) : comme Bkp/Restore, attend qu'un Index en cours se mette en pause.
+            self.db.wait_index_idle(nick)
             cmd=['prune']
             for i in list(cfg.keys()):
                 if 'KEEP_DAILY'==i: cmd.extend(['--keep-daily',cfg[i]])
@@ -4114,6 +4265,30 @@ class BorgHelper:
             exclu_size=sum(sz or 0 for p,ct,sz in diffs if not self._idx_path_ok(p,cfg))
             if len(added)>5000:
                 conn.close(); return None
+            # 1.0.141 : borg list des ajouts AVANT toute écriture (arrêt possible par le moniteur d'Index : rien
+            # d'écrit), puis clone + suppressions + modifications + ajouts + sentinelle en une seule transaction.
+            add_rows=[]
+            if added:
+                rb=self.borg.boex(nick,
+                    ['list','--format','{mode} {type} {user} {group} {uid} {gid} {size} {isomtime} {path}{NL}',f'::{archive_name}']+added,
+                    debug=debug,retjson=False)
+                if rb.get('killed'):
+                    conn.close(); return 'killed'
+                if rb['exitcode']!=0:
+                    conn.close(); return None
+                for line in rb['stdout']:
+                    line=line.strip()
+                    if not line: continue
+                    parts=line.split(' ',8)
+                    if len(parts)==9:
+                        mode,ftype,user,group,uid,gid,sz_s,mtime,path=parts
+                        try: sz2=int(sz_s)
+                        except ValueError: sz2=None
+                        owner=f"{user}:{group} ({uid}:{gid})"
+                        # (nick,path,size,mtime,type,mode,owner) — ordre exact des colonnes de l'INSERT ci-dessous
+                        # path stocké (_path_stored) : borg list renvoie un chemin logique, jamais écrit tel quel
+                        add_rows.append((nick,_path_stored(conn,path),sz2,mtime,ftype,mode,owner))
+                _write_mode_check(conn)  # AD-11 : revérifié après le sous-processus borg list, avant d'écrire
             # Clone prev snapshot → archive_name
             conn.execute(
                 "INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,file_id) "
@@ -4131,36 +4306,12 @@ class BorgHelper:
             for sz,path in modified:
                 if sz is not None:
                     conn.execute("UPDATE snapshot_file SET size=? WHERE nick=? AND path=?",(sz,nick,path))
-            conn.commit()
-            # Fetch added via targeted borg list (avec mtime, type, mode et propriétaire)
-            if added:
-                rb=self.borg.boex(nick,
-                    ['list','--format','{mode} {type} {user} {group} {uid} {gid} {size} {isomtime} {path}{NL}',f'::{archive_name}']+added,
-                    debug=debug,retjson=False)
-                if rb['exitcode']!=0:
-                    conn.execute("DELETE FROM archive_snapshot WHERE nick=? AND archive=?",(nick,archive_name))
-                    self.db._cleanup_snapshot_file_orphans(nick,conn)
-                    conn.commit(); conn.close(); return None
-                add_rows=[]
-                for line in rb['stdout']:
-                    line=line.strip()
-                    if not line: continue
-                    parts=line.split(' ',8)
-                    if len(parts)==9:
-                        mode,ftype,user,group,uid,gid,sz_s,mtime,path=parts
-                        try: sz2=int(sz_s)
-                        except ValueError: sz2=None
-                        owner=f"{user}:{group} ({uid}:{gid})"
-                        # (nick,path,size,mtime,type,mode,owner) — ordre exact des colonnes de l'INSERT ci-dessous
-                        # path stocké (_path_stored) : borg list renvoie un chemin logique, jamais écrit tel quel
-                        add_rows.append((nick,_path_stored(conn,path),sz2,mtime,ftype,mode,owner))
-                if add_rows:
-                    _write_mode_check(conn)  # AD-11 : revérifié après le sous-processus borg list, avant la 2e phase d'écriture
-                    conn.executemany("INSERT OR REPLACE INTO snapshot_file (nick,path,size,mtime,type,mode,owner) VALUES (?,?,?,?,?,?,?)",add_rows)
-                    conn.executemany(
-                        "INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,file_id) "
-                        "SELECT ?,?,?,id FROM snapshot_file WHERE nick=? AND path=?",
-                        [(nick,archive_name,archive_date,nick,r[1]) for r in add_rows])
+            if add_rows:
+                conn.executemany("INSERT OR REPLACE INTO snapshot_file (nick,path,size,mtime,type,mode,owner) VALUES (?,?,?,?,?,?,?)",add_rows)
+                conn.executemany(
+                    "INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,file_id) "
+                    "SELECT ?,?,?,id FROM snapshot_file WHERE nick=? AND path=?",
+                    [(nick,archive_name,archive_date,nick,r[1]) for r in add_rows])
             nfiles=conn.execute(
                 "SELECT COUNT(*) FROM archive_snapshot WHERE nick=? AND archive=?",(nick,archive_name)).fetchone()[0]
             conn.execute(
@@ -4178,18 +4329,22 @@ class BorgHelper:
             except: pass
             raise
 
-    def indexsnap(self,nick,debug=0,db_path=None,force=False):
+    def indexsnap(self,nick,debug=0,db_path=None,force=False,archives=None):
+        """Snapshot de la dernière archive. archives (1.0.141) : liste borg list déjà obtenue (moteur d'Index). Retourne
+        0/code d'erreur, ou 'killed' si un borg a été tué par une demande d'arrêt (BorgRunner._stop) — rien d'écrit."""
         if self._nick_noidx(nick):
             printer(f"{nick}: indexation désactivée (NOIDX=1)"); return 0
         if db_path is None: db_path=self.db.get_diff_db(nick)
         self.db.ensure_diff_db(db_path)
         cfg=self.borg.cfgreaded(nick,debug=debug)
-        rb=self.borg.boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
-        try:
-            self.borg._boex_check_stdout(rb,nick,'borg list')
-        except RuntimeError as e:
-            printer(f"{nick}: {e}"); return 1
-        archives=rb['stdout'][0]['archives']
+        if archives is None:
+            rb=self.borg.boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+            if rb.get('killed'): return 'killed'
+            try:
+                self.borg._boex_check_stdout(rb,nick,'borg list')
+            except RuntimeError as e:
+                printer(f"{nick}: {e}"); return 1
+            archives=rb['stdout'][0]['archives']
         if not archives:
             printer(f"{nick}: aucune archive"); return 0
         latest=archives[-1]
@@ -4203,6 +4358,17 @@ class BorgHelper:
                 conn.execute("DELETE FROM archive_snapshot_indexed WHERE nick=? AND archive=?",(nick,archive_name))
                 self.db._cleanup_snapshot_file_orphans(nick,conn)
                 conn.commit(); conn.close()
+            except sqlite3.Error as e:
+                printer(f"SQLite error ({db_path}): {e}")
+        else:
+            # Lignes sans sentinelle laissées par un arrêt brutal (kill -9, versions < 1.0.141 qui écrivaient le clone
+            # incrémental avant leur borg list) : retirées avant de refaire l'unité (AD-1 : unité = sentinelle).
+            try:
+                conn=_open_db(db_path,nick=nick,role='write')
+                if conn.execute("DELETE FROM archive_snapshot WHERE nick=? AND archive=?",(nick,archive_name)).rowcount:
+                    self.db._cleanup_snapshot_file_orphans(nick,conn)
+                    conn.commit()
+                conn.close()
             except sqlite3.Error as e:
                 printer(f"SQLite error ({db_path}): {e}")
         print(f"  {nick}: snapshot {archive_name}...",flush=True)
@@ -4226,6 +4392,7 @@ class BorgHelper:
             inc=None
             if not force and not auto_repair:
                 inc=self._indexsnap_incremental(nick,archive_name,archive_date,cfg,db_path,debug)
+            if inc=='killed': return 'killed'
             if inc is not None:
                 nfiles,exclu_count,exclu_size,n_add,n_rem,n_mod=inc
                 suffix=f" (+{n_add} -{n_rem} ~{n_mod}, incrémental)"
@@ -4236,6 +4403,7 @@ class BorgHelper:
             else:
                 # Fallback : borg list complet
                 rb2=self.borg.boex(nick,['list','--format','{mode} {type} {user} {group} {uid} {gid} {size} {isomtime} {path}{NL}',f"::{archive_name}"],debug=debug,retjson=False)
+                if rb2.get('killed'): return 'killed'
                 if rb2['exitcode']!=0:
                     printer(f"borg list a échoué (code {rb2['exitcode']})")
                     for i in rb2['stderr']:
@@ -4305,6 +4473,7 @@ class BorgHelper:
         missing=archive_names-existing
         if missing or (force and archive_names):
             rbi=self.borg.boex(nick,['info','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+            if rbi.get('killed'): return   # demande d'arrêt (1.0.141) : rien d'écrit, l'appelant met en pause
             try:
                 self.borg._boex_check_stdout(rbi,nick,'borg info')
                 n=0
@@ -4317,7 +4486,12 @@ class BorgHelper:
                 if n: print(f"{nick}: statistiques de {n} archive(s) enregistrées (graphiques)")
             except (RuntimeError,KeyError,TypeError,IndexError,AttributeError,ValueError) as e:
                 printer(f"{nick}: statistiques d'archives (graphiques) non récupérées : {e}")
+        self._refresh_repo_point(nick,db_path,debug)
+
+    def _refresh_repo_point(self,nick,db_path,debug=0):
+        """Point repo_stats op='index' (borg info du dépôt, métadonnées seulement) si les tailles ont changé."""
         rbr=self.borg.boex(nick,['info','--json'],debug=debug)
+        if rbr.get('killed'): return
         try:
             self.borg._boex_check_stdout(rbr,nick,'borg info')
             cst=rbr['stdout'][0].get('cache',{}).get('stats',{})
@@ -4329,15 +4503,150 @@ class BorgHelper:
         except (RuntimeError,KeyError,TypeError,IndexError,AttributeError,ValueError) as e:
             printer(f"{nick}: taille du dépôt (graphiques) non récupérée : {e}")
 
-    def index(self,nick,debug=0,db_path=None,force=False,target_archive=None,set_pending=True):
+    # ── Moteur d'Index (1.0.141, story 4 : tranches + surveillance croisée ; spine AD-1, AD-3, AD-4, AD-10) ──────
+
+    def _index_stop_reason(self,nick,deadline):
+        """Demande d'arrêt vue par le moniteur (AD-4 amendé) : 'priority' (Bkp/Restore/Prune — priority.lock — ou Report),
+        'deadline' (budget de tranche épuisé), sinon None. Jamais son propre verrou (exception self-lock des PID locks)."""
+        if self.db.check_priority_lock(nick) or self.db.check_report_running(nick): return 'priority'
+        if deadline is not None and time.monotonic()>=deadline: return 'deadline'
+        return None
+
+    @staticmethod
+    def _kill_outcome(deadline):
+        """Issue d'une unité dont le borg a été arrêté : 'deadline' si l'échéance est passée, sinon 'interrupted' —
+        même si la demande prioritaire a déjà disparu quand on la relit (elle a bien eu lieu : on reprend)."""
+        return 'deadline' if deadline is not None and time.monotonic()>=deadline else 'interrupted'
+
+    def _index_checkpoint(self,nick,deadline):
+        """Entre deux phases sans borg (rapprochement, purge, écriture) : None, 'interrupted' ou 'deadline'."""
+        r=self._index_stop_reason(nick,deadline)
+        return None if r is None else ('interrupted' if r=='priority' else 'deadline')
+
+    def _index_turn(self,nick,deadline,pause,set_pending,noidx,resume=False):
+        """Tour d'Index exclusif par dépôt (AD-4 amendé). Retour : 'ok' (index-running.lock tenu), 'busy' (un autre Index
+        tourne ou attend déjà : rien à faire), 'deadline' (échéance atteinte en attente), 'cancel' (opération prioritaire
+        et pause=False : comportement d'avant 1.0.141, index-pending selon set_pending).
+        Attente : marqueur exclusif index-paused.lock (un seul Index en attente par dépôt — jamais d'empilement de crons),
+        index-running.lock relâché ; reprise quand plus aucune demande d'arrêt ET index-running libre (l'Index de fin d'un
+        Bkp, qui le prend avant de relâcher priority.lock, passe d'abord). Sans limite de durée hors budget de tranche."""
+        paused=resume   # resume : index() a déjà pris le marqueur de pause avant de relâcher index-running
+        try:
+            if not resume and (self.db.check_index_running(nick) or self.db.check_index_paused(nick)):
+                printer(f"{nick}: Index déjà en cours sur ce dépôt — rien à faire"); return 'busy'
+            while True:
+                if self._index_stop_reason(nick,None)!='priority':
+                    if self.db.acquire_index_running_lock(nick): return 'ok'
+                    if not paused:
+                        printer(f"{nick}: Index déjà en cours sur ce dépôt — rien à faire"); return 'busy'
+                elif not pause:
+                    if set_pending and not noidx: self.db.set_index_pending_lock(nick)
+                    printer(f"{nick}: opération prioritaire (Bkp/Restore) en cours — Index annulé"); return 'cancel'
+                elif not paused:
+                    if not self.db.acquire_index_paused_lock(nick):
+                        printer(f"{nick}: Index déjà en attente sur ce dépôt — rien à faire"); return 'busy'
+                    paused=True
+                    printer(f"{nick}: opération prioritaire en cours — Index en attente de sa fin")
+                if deadline is not None and time.monotonic()>=deadline:
+                    printer(f"{nick}: échéance atteinte pendant l'attente — la prochaine tranche reprendra"); return 'deadline'
+                time.sleep(1)
+        finally:
+            if paused: self.db.release_index_paused_lock(nick)
+
+    def index(self,nick,debug=0,db_path=None,force=False,target_archive=None,set_pending=True,
+              budget=None,natures=None,period=None,pause=True,snap_only=False):
+        """Index d'un nick (voir README). Sans budget/natures/period : Index historique (diffs, stats, DIFF_KEEP,
+        snapshot). Avec l'une d'elles : tranche (AD-3) — rapprochement, stats (un borg info par archive, de la plus
+        récente à la plus ancienne), snapshot de la dernière archive, diffs du plus récent au plus ancien ; budget en
+        secondes (échéance : borg en cours tué, unité jetée) ; natures ⊂ {'stats','snap','diff'} ; period=(de, à),
+        archive ou date ISO, restreint stats et diffs. db_path = cible (AD-1 : le moteur ne sait pas si c'est un fantôme).
+        Surveillance croisée (AD-4 amendé) : une opération prioritaire met l'Index en pause (borg tué, unité jetée,
+        index-running relâché), puis il reprend seul après sa fin — pause=False (Index de fin de Bkp) : arrêt comme
+        avant 1.0.141 (index-pending selon set_pending). Verrou réentrant : l'appelant (Bkp) peut déjà le tenir.
+        snap_only : snapshot seul (Index -S), sous le même verrou et la même pause.
+        Retour : 0 (fini, rien à faire, Index déjà en cours, échéance), 1 (erreur, ou annulé avec pause=False).
+        Un appel sans budget peut attendre sans limite la fin d'une opération prioritaire (décision story 4)."""
+        if budget is not None and not budget>0: raise ValueError("budget : durée > 0 attendue")
+        if natures is not None and (not natures or set(natures)-{'stats','snap','diff'}):
+            raise ValueError("natures : sous-ensemble non vide de stats, snap, diff")
         noidx=self._nick_noidx(nick)
-        if self.db.check_priority_lock(nick):
-            if set_pending and not noidx: self.db.set_index_pending_lock(nick)
-            printer(f"{nick}: opération prioritaire (Bkp/Restore) en cours — Index annulé"); return 1
+        tranche=budget is not None or natures is not None or period is not None
+        deadline=(time.monotonic()+budget) if budget else None
         if db_path is None: db_path=self.db.get_diff_db(nick)
+        own=self.db.index_running_owned(nick)
+        if own: pause=False   # l'appelant tient le tour (Index de fin de Bkp) : jamais de pause dans son processus
+        else:
+            st=self._index_turn(nick,deadline,pause,set_pending,noidx)
+            if st=='cancel': return 1
+            if st!='ok': return 0
+        # done : paires recalculées pendant cet appel — une reprise après pause ne les refait pas, même avec force (-F).
+        plan={'tranche':tranche,'deadline':deadline,'natures':set(natures or ('stats','snap','diff')),'period':period,
+              'snap_only':snap_only,'done':set()}
+        try:
+            while True:
+                r=self._index_pass(nick,debug,db_path,force,target_archive,plan)
+                if r=='deadline': r=0
+                if r!='interrupted': return r
+                if not pause:
+                    if set_pending: self.db.set_index_pending_lock(nick)
+                    printer(f"{nick}: indexation interrompue — reprise automatique après le backup"); return 1
+                # Pause : marqueur pris AVANT de relâcher le tour (aucun autre Index ne s'intercale), puis attente.
+                if not self.db.acquire_index_paused_lock(nick):
+                    printer(f"{nick}: indexation interrompue — un autre Index attend déjà, il reprendra"); return 0
+                self.db.release_index_running_lock(nick)
+                printer(f"{nick}: opération prioritaire — Index en pause, reprise après sa fin")
+                st=self._index_turn(nick,deadline,True,False,noidx,resume=True)
+                if st!='ok': return 0
+                printer(f"{nick}: reprise de l'Index")
+        finally:
+            if not own: self.db.release_index_running_lock(nick)
+
+    @staticmethod
+    def _period_bounds(period,archives):
+        """(de, à) -> dates ISO : nom d'archive de la liste -> sa date ; date AAAA-MM-JJ[THH:MM[:SS]] telle quelle ;
+        ALL ou vide -> sans borne. La borne haute englobe tout ce qui commence par elle ('2026-09-10' inclut ce jour).
+        ValueError sur toute autre valeur (faute de frappe, archive absente) ou une période inversée."""
+        if not period: return None,None
+        by_name={a['name']:a.get('start') or '' for a in archives}
+        out=[]
+        for v in period:
+            if not v or v=='ALL': out.append(None)
+            elif v in by_name: out.append(by_name[v])
+            elif re.fullmatch(r'\d{4}-\d{2}-\d{2}([T ]\d{2}(:\d{2}(:\d{2}(\.\d+)?)?)?)?',v): out.append(v.replace(' ','T'))
+            else: raise ValueError(f"période : {v!r} n'est ni une archive de la liste, ni une date AAAA-MM-JJ[THH:MM:SS], ni ALL")
+        lo,hi=out
+        if lo and hi and lo[:len(hi)]>hi: raise ValueError(f"période inversée : {period[0]!r} après {period[1]!r}")
+        return lo,hi
+
+    @staticmethod
+    def _in_period(date,lo,hi):
+        date=date or ''
+        return (lo is None or date>=lo) and (hi is None or date[:len(hi)]<=hi)
+
+    @staticmethod
+    def _diff_keep_pairs(archives,keep):
+        """Paires visées (décision story 4, bug DIFF_KEEP) : les `keep` paires consécutives les plus récentes dans
+        l'ordre des archives ; keep None = toutes."""
+        pairs=[(archives[i]['name'],archives[i+1]['name'],archives[i+1].get('start')) for i in range(len(archives)-1)]
+        return pairs if keep is None else pairs[max(0,len(pairs)-keep):]
+
+    def _index_pass(self,nick,debug,db_path,force,target_archive,plan):
+        """Une passe du moteur. Retour : 0/1 (fin, comme l'ancien index()), 'interrupted' (demande d'arrêt prioritaire :
+        index() met en pause puis relance une passe complète — les sentinelles évitent de refaire le travail)."""
+        noidx=self._nick_noidx(nick)
+        deadline=plan['deadline']; tranche=plan['tranche']; natures=plan['natures']
         self.db.ensure_diff_db(db_path)
         cfg=self.borg.cfgreaded(nick,debug=debug)
-        rb=self.borg.boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+        stop=lambda: self._index_stop_reason(nick,deadline) is not None
+        prev_stop=self.borg._stop; self.borg._stop=stop
+        try:
+            rb=self.borg.boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+        finally: self.borg._stop=prev_stop
+        if rb.get('killed'):
+            o=self._kill_outcome(deadline)
+            if o=='interrupted': return o
+            printer(f"[WARN] {nick}: échéance atteinte pendant le borg list initial — rien fait (budget -t trop court ?)")
+            return 0
         try:
             self.borg._boex_check_stdout(rb,nick,'borg list')
         except RuntimeError as e:
@@ -4345,20 +4654,57 @@ class BorgHelper:
         archives=rb['stdout'][0]['archives']
         # Rapprochement (1.0.140, AD-9) : archives supprimées hors borgHelper retirées, sur la liste déjà obtenue.
         self._reconcile_archives(nick,db_path,[a['name'] for a in archives])
+        keep=cfg.get('DIFF_KEEP','').strip()
+        keep=int(keep) if keep.isdigit() else None
+        cp=self._index_checkpoint(nick,deadline)   # demande d'arrêt pendant le rapprochement (SQL seul)
+        if cp=='interrupted': return cp
+        if cp=='deadline': return self._index_finish(nick,db_path,archives,keep,tranche,noidx)
+        try: lo,hi=self._period_bounds(plan['period'],archives)
+        except ValueError as e:
+            printer(f"{nick}: {e}"); return 1
+        if plan['snap_only']:
+            r=self._index_snap(nick,debug,db_path,force,archives,stop,deadline)
+            return r if r=='interrupted' else self._index_finish(nick,db_path,archives,keep,False,noidx)
+        if tranche:
+            return self._index_tranche(nick,debug,db_path,cfg,archives,keep,lo,hi,natures,deadline,noidx,plan['done'])
         if noidx:
-            self._refresh_chart_stats(nick,cfg,db_path,archives,force=force,debug=debug)
-            printer(f"{nick}: indexation des chemins désactivée (NOIDX=1) — statistiques des graphiques seules"); return 0
+            r=self._index_stats(nick,cfg,db_path,archives,force,debug,stop)
+            if r: return r
+            printer(f"{nick}: indexation des chemins désactivée (NOIDX=1) — statistiques des graphiques seules")
+            return self._index_finish(nick,db_path,archives,keep,False,noidx)
         if len(archives)<2:
-            self._refresh_chart_stats(nick,cfg,db_path,archives,force=force,debug=debug)
-            printer(f"{nick}: moins de 2 archives, rien à indexer"); return 0
-        # Phase 1 : paires à indexer + purge groupée si force
+            r=self._index_stats(nick,cfg,db_path,archives,force,debug,stop)
+            if r: return r
+            printer(f"{nick}: moins de 2 archives, rien à indexer")
+            return self._index_finish(nick,db_path,archives,keep,False,noidx)
+        # Phase 1 : paires visées (DIFF_KEEP : les N plus récentes seulement) + purge groupée si force
+        pairs_todo,skipped=self._index_select_pairs(nick,db_path,archives,keep,force,target_archive,None,None,plan['done'])
+        if self._index_checkpoint(nick,deadline): return 'interrupted'
+        # Phase 2 : borg diff en parallèle
+        r=self._index_diffs(nick,cfg,db_path,pairs_todo,skipped,deadline,plan['done'])
+        if r is not None: return r
+        # Stats d'abord (1.0.140) : DIFF_KEEP fige les comptages des paires qu'il retire, datés par archive_stats —
+        # au premier Index d'un dépôt, sans cet ordre, les archives n'auraient pas encore de date.
+        r=self._index_stats(nick,cfg,db_path,archives,force,debug,stop)
+        if r: return r
+        if keep is not None: self.db._diff_keep_purge(nick,keep,db_path,archives)
+        if self._index_checkpoint(nick,deadline): return 'interrupted'
+        r=self._index_snap(nick,debug,db_path,force,archives,stop)
+        if r: return r
+        return self._index_finish(nick,db_path,archives,keep,False,noidx)
+
+    def _index_select_pairs(self,nick,db_path,archives,keep,force,target_archive,lo,hi,done=None):
+        """Phase 1 : (paires à diffuser [(old,new,date)], nombre déjà en cache). Purge groupée des paires forcées ou
+        indexées sans tailles (post-backup). target_archive : la seule paire qui se termine par elle, hors DIFF_KEEP."""
         pairs_todo=[]; skipped=0; pairs_to_purge=[]
-        for i in range(len(archives)-1):
-            a_old=archives[i]['name']; a_new=archives[i+1]['name']; date_new=archives[i+1]['start']
+        cands=self._diff_keep_pairs(archives,None if target_archive is not None else keep)
+        for a_old,a_new,date_new in cands:
+            if done and (a_old,a_new) in done: skipped+=1; continue   # déjà recalculée dans cet appel (reprise)
             if target_archive is not None:
                 if a_new!=target_archive: skipped+=1; continue
                 pairs_to_purge.append((a_old,a_new))
                 pairs_todo.append((a_old,a_new,date_new)); continue
+            if not self._in_period(date_new,lo,hi): continue
             already=self.db.is_diff_pair_indexed(nick,a_old,a_new,db_path)
             if already and not force:
                 if self.db.diff_pair_has_sizes(nick,a_old,a_new,db_path): skipped+=1; continue
@@ -4375,7 +4721,12 @@ class BorgHelper:
                 conn.commit(); conn.close()
             except sqlite3.Error as e:
                 printer(f"SQLite error ({db_path}): {e}")
-        # Phase 2 : borg diff en parallèle
+        return pairs_todo,skipped
+
+    def _index_diffs(self,nick,cfg,db_path,pairs_todo,skipped,deadline,done=None):
+        """Phase 2 : borg diff en parallèle (IDX_WORKERS), une paire = une transaction avec sa sentinelle. Moniteur :
+        demande d'arrêt prioritaire ou échéance -> borg tués, paires en attente annulées, paires en cours jetées.
+        Retour : None (terminé), 'interrupted' (prioritaire), 'deadline' (échéance de tranche)."""
         workers=max(1,int(cfg.get('IDX_WORKERS','4')))
         borg_exe=cfg.get('BORG_EXE','borg')
         varcur=os.environ.copy()
@@ -4407,12 +4758,12 @@ class BorgHelper:
             ok=ps.returncode in (0,1)
             if not ok: entries=[]; exclu={}
             return (a_old,a_new,date_new,entries,exclu,ok)
-        interrupted_event=threading.Event()  # UNIQUEMENT : opération prioritaire détectée (vraie interruption)
+        interrupted_event=threading.Event()  # demande d'arrêt détectée (prioritaire ou échéance), raison dans why[0]
         monitor_stop=threading.Event()       # fin normale : arrête le thread de surveillance, sans rien signaler
+        why=[None]
         results=[]
         mode_changed=False  # AD-11 : une fois DbModeError vue, mode durablement changé pour le reste du run
         if pairs_todo:
-            self.db.set_index_running_lock(nick)
             db_conn=None
             try:
                 try: db_conn=_open_db(db_path,nick=nick,role='read')
@@ -4421,8 +4772,11 @@ class BorgHelper:
                     futs={ex.submit(_run_diff,p):p for p in pairs_todo}
                     def _priority_monitor():
                         while not interrupted_event.is_set() and not monitor_stop.is_set():
-                            if self.db.check_priority_lock(nick) or self.db.check_report_running(nick):
-                                printer(f"  {nick}: opération prioritaire (Bkp/Restore/Report) détectée — arrêt des diffs en cours")
+                            reason=self._index_stop_reason(nick,deadline)
+                            if reason:
+                                why[0]=reason
+                                printer(f"  {nick}: "+("opération prioritaire (Bkp/Restore/Prune/Report) détectée" if reason=='priority'
+                                                       else "échéance de la tranche atteinte")+" — arrêt des diffs en cours")
                                 interrupted_event.set()
                                 for f in list(futs):
                                     if not f.done(): f.cancel()
@@ -4431,8 +4785,8 @@ class BorgHelper:
                                         try: ps.kill()
                                         except OSError: pass
                                 # Attendre que les _run_diff aient reap leurs processus (plus de zombies)
-                                deadline=time.time()+15
-                                while time.time()<deadline:
+                                reap=time.time()+15
+                                while time.time()<reap:
                                     with running_procs_lock:
                                         if not running_procs: break
                                     time.sleep(0.1)
@@ -4443,8 +4797,10 @@ class BorgHelper:
                                         if subprocess.run(['fuser',_d],capture_output=True).returncode!=0:
                                             _shutil.rmtree(_d,ignore_errors=True)
                                     except Exception: pass
-                                # Purger les stale locks borg laissés par les process tués
-                                if 'BORG_REPO' in cfg:
+                                # Purger les stale locks borg laissés par les process tués — seulement pour laisser passer
+                                # une opération prioritaire : à l'échéance d'une tranche, un break-lock casserait aussi
+                                # les verrous d'un borg mount, d'un create externe ou d'un autre hôte.
+                                if reason=='priority' and 'BORG_REPO' in cfg:
                                     printer(f"  {nick}: purge des locks borg (break-lock)...")
                                     try:
                                         bl=subprocess.run([borg_exe,'break-lock',cfg['BORG_REPO']],
@@ -4481,6 +4837,7 @@ class BorgHelper:
                                                 "(nick,archive_old,archive_new,change_type,file_count,total_size) VALUES (?,?,?,?,?,?)",
                                                 [(nick,a_old,a_new,ct,s['count'],s['size']) for ct,s in exclu.items()])
                                     db_conn.commit()
+                                    if ok and done is not None: done.add((a_old,a_new))
                             except CancelledError: pass
                             except DbModeError:
                                 # AD-11 : mode de la base changé depuis l'ouverture — la paire n'est ni marquée
@@ -4497,30 +4854,141 @@ class BorgHelper:
                             except Exception as e: printer(f"[WARN] borg diff échoué : {e}")
                     finally:
                         # Jamais interrupted_event ici : le tester plus bas ferait passer TOUT Index ayant
-                        # traité au moins une paire pour « interrompu » (return 1, index_pending posé,
-                        # statistiques/snapshot/DIFF_KEEP jamais atteints) — bug corrigé en 1.0.114.
+                        # traité au moins une paire pour « interrompu » (index_pending posé, statistiques/
+                        # snapshot/DIFF_KEEP jamais atteints) — bug corrigé en 1.0.114.
                         monitor_stop.set()
                         monitor.join(timeout=2)
             finally:
-                self.db.clear_index_running_lock(nick)
                 if db_conn:
                     try: db_conn.close()
                     except: pass
-        if interrupted_event.is_set():
-            if set_pending: self.db.set_index_pending_lock(nick)
-            printer(f"{nick}: indexation interrompue — reprise automatique après le backup"); return 1
         ok_results=[r for r in results if r[5]]
-        new_pairs=len(ok_results)
         total_exclu=sum(sum(s['count'] for s in exclu.values()) for _,_,_,_,exclu,_ in ok_results)
         exclu_suffix=f", {total_exclu:,} exclus" if total_exclu else ""
-        print(f"{nick}: {new_pairs} paires indexées (+{skipped} déjà en cache{exclu_suffix})")
-        # Stats d'abord (1.0.140) : DIFF_KEEP fige les comptages des paires qu'il retire, datés par archive_stats —
-        # au premier Index d'un dépôt, sans cet ordre, les archives n'auraient pas encore de date.
-        self._refresh_chart_stats(nick,cfg,db_path,archives,force=force,debug=debug)
-        diff_keep=cfg.get('DIFF_KEEP','')
-        if diff_keep.strip().isdigit():
-            self.db._diff_keep_purge(nick,int(diff_keep),db_path)
-        self.indexsnap(nick,debug=debug,db_path=db_path,force=force)
+        if interrupted_event.is_set():
+            if ok_results: print(f"{nick}: {len(ok_results)} paires indexées avant l'arrêt{exclu_suffix}")
+            return 'interrupted' if why[0]=='priority' else 'deadline'
+        print(f"{nick}: {len(ok_results)} paires indexées (+{skipped} déjà en cache{exclu_suffix})")
+        return None
+
+    def _index_stats(self,nick,cfg,db_path,archives,force,debug,stop):
+        """Statistiques des graphiques (Index sans option : un borg info global, inchangé) sous demande d'arrêt :
+        'interrupted' si un borg a été tué pour une opération prioritaire, sinon None."""
+        prev=self.borg._stop; self.borg._stop=stop; k0=self.borg._kills
+        try: self._refresh_chart_stats(nick,cfg,db_path,archives,force=force,debug=debug)
+        finally: self.borg._stop=prev
+        return 'interrupted' if self.borg._kills>k0 or self._index_checkpoint(nick,None) else None
+
+    def _index_snap(self,nick,debug,db_path,force,archives,stop,deadline=None):
+        """Snapshot de la dernière archive (indexsnap) sous demande d'arrêt : 'interrupted'/'deadline' si son borg a été
+        tué (rien d'écrit : jamais de ligne de snapshot sans sentinelle), sinon None."""
+        prev=self.borg._stop; self.borg._stop=stop
+        try: r=self.indexsnap(nick,debug=debug,db_path=db_path,force=force,archives=archives)
+        finally: self.borg._stop=prev
+        if r!='killed': return None
+        return self._kill_outcome(deadline)
+
+    def _index_tranche(self,nick,debug,db_path,cfg,archives,keep,lo,hi,natures,deadline,noidx,done=None):
+        """Tranche (AD-3) : stats (plus récente d'abord, un borg info par archive = une unité), snapshot de la dernière
+        archive, diffs du plus récent au plus ancien ; échéance vérifiée entre unités, borg en cours tué à l'échéance."""
+        reason=lambda: self._index_stop_reason(nick,deadline)
+        stop=lambda: reason() is not None
+        def _halt():
+            o=self._kill_outcome(deadline)
+            return o if o=='interrupted' else self._index_finish(nick,db_path,archives,keep,True,noidx)
+        if 'stats' in natures:
+            try:
+                conn=_open_db(db_path,nick=nick,role='read')
+                try: have={r[0] for r in conn.execute("SELECT archive FROM archive_stats WHERE nick=?",(nick,))}
+                finally: conn.close()
+            except sqlite3.Error: have=set()
+            todo=[a for a in reversed(archives) if a['name'] not in have and self._in_period(a.get('start'),lo,hi)]
+            n=0; prev=self.borg._stop; self.borg._stop=stop
+            try:
+                for a in todo:
+                    if stop(): break
+                    rbi=self.borg.boex(nick,['info','--json',f"::{a['name']}"],debug=debug)
+                    if rbi.get('killed'):
+                        self.borg._stop=prev
+                        if n: print(f"{nick}: statistiques de {n} archive(s) enregistrées (graphiques)")
+                        return _halt()
+                    try:
+                        self.borg._boex_check_stdout(rbi,nick,'borg info')
+                        info=rbi['stdout'][0]['archives'][0]; st=info.get('stats',{})
+                        self.db.store_archive_stats(nick,info['name'],info.get('start'),info.get('duration'),
+                            st.get('original_size'),st.get('compressed_size'),st.get('deduplicated_size'),st.get('nfiles'),db_path)
+                        n+=1
+                    except (RuntimeError,KeyError,TypeError,IndexError,AttributeError,ValueError) as e:
+                        printer(f"{nick}: statistiques de {a['name']} non récupérées : {e}")
+            finally: self.borg._stop=prev
+            if n: print(f"{nick}: statistiques de {n} archive(s) enregistrées (graphiques)")
+            if stop(): return _halt()
+        if 'snap' in natures and not noidx and archives:
+            r=self._index_snap(nick,debug,db_path,False,archives,stop,deadline)
+            if r or stop(): return _halt()
+        if 'diff' in natures and not noidx and len(archives)>=2:
+            pairs_todo,skipped=self._index_select_pairs(nick,db_path,archives,keep,False,None,lo,hi,done)
+            pairs_todo.reverse()   # du plus récent au plus ancien (AD-3)
+            r=self._index_diffs(nick,cfg,db_path,pairs_todo,skipped,deadline,done)
+            if r=='interrupted': return r
+            if keep is not None: self.db._diff_keep_purge(nick,keep,db_path,archives)
+        # Point de taille du dépôt en dernier, seulement s'il reste du temps : placé avant les diffs, son borg info
+        # mangeait le budget de chaque tranche et pouvait empêcher toute paire d'aboutir.
+        if 'stats' in natures and not stop():
+            prev=self.borg._stop; self.borg._stop=stop
+            try: self._refresh_repo_point(nick,db_path,debug)
+            finally: self.borg._stop=prev
+        return self._index_finish(nick,db_path,archives,keep,True,noidx)
+
+    def _build_state(self,nick,db_path,archives,keep,noidx):
+        """État de construction de la cible (AD-10) d'après ses sentinelles : paires visées (DIFF_KEEP), stats de toutes
+        les archives, snapshot de la dernière. -> dict ou None (base illisible)."""
+        try:
+            conn=_open_db(db_path,nick=nick,role='read')
+            try:
+                stats={r[0] for r in conn.execute("SELECT archive FROM archive_stats WHERE nick=?",(nick,))}
+                pairs={(o,n) for o,n in conn.execute("SELECT archive_old,archive_new FROM diff_indexed_pairs WHERE nick=?",(nick,))}
+                snaps={r[0] for r in conn.execute("SELECT archive FROM archive_snapshot_indexed WHERE nick=?",(nick,))}
+            finally: conn.close()
+        except sqlite3.Error: return None
+        target=[] if noidx else self._diff_keep_pairs(archives,keep)
+        done=sum(1 for o,n,_ in target if (o,n) in pairs)
+        names=[a['name'] for a in archives]
+        stats_done=sum(1 for n in names if n in stats)
+        snap=bool(noidx or not names or names[-1] in snaps)
+        complete=done==len(target) and stats_done==len(names) and snap
+        return {'state':'complete' if complete else 'partial','pairs_done':done,'pairs_total':len(target),
+                'archives_total':len(names),'stats_done':stats_done,'snapshot':snap,
+                'updated_at':time.strftime('%Y-%m-%dT%H:%M:%S')}
+
+    def _index_finish(self,nick,db_path,archives,keep,tranche,noidx):
+        """Fin de passe : build_state dans db_meta de la cible (AD-10), clé 'build_state:<nick>' (une diff.db peut être
+        partagée par DB_NAME). Tranche : toujours écrit. Index sans option : mis à jour seulement s'il existe déjà et a
+        changé (jamais créé : base sans build_state = complete). Tranche sans aucune progression : avertissement."""
+        if archives is None: return 0
+        bs=self._build_state(nick,db_path,archives,keep,noidx)
+        if bs is None: return 0
+        key=('state','pairs_done','pairs_total','archives_total','stats_done','snapshot')
+        old=None
+        try:
+            conn=_open_db(db_path,nick=nick,role='write')
+            try:
+                row=conn.execute("SELECT value FROM db_meta WHERE key=?",(_build_state_key(nick),)).fetchone()
+                if row:
+                    try: old=json.loads(row[0])
+                    except ValueError: old={}
+                if tranche or (old is not None and tuple(old.get(k) for k in key)!=tuple(bs[k] for k in key)):
+                    conn.execute("INSERT OR REPLACE INTO db_meta VALUES(?,?)",(_build_state_key(nick),json.dumps(bs)))
+                    conn.commit()
+            finally: conn.close()
+        except sqlite3.Error as e: printer(f"{nick}: état de construction non écrit ({e})")
+        if tranche:
+            print(f"{nick}: construction {'terminée' if bs['state']=='complete' else 'partielle'} — "
+                  f"{bs['pairs_done']}/{bs['pairs_total']} paires, statistiques {bs['stats_done']}/{bs['archives_total']}, "
+                  f"snapshot {'fait' if bs['snapshot'] else 'à faire'}")
+            if (bs['state']=='partial' and old and all(old.get(k)==bs[k] for k in ('pairs_done','stats_done','snapshot'))):
+                printer(f"[WARN] {nick}: aucune progression dans cette tranche — budget (-t) trop court ? Il doit couvrir "
+                        "le borg list initial plus un borg info ou un borg diff de deux archives consécutives")
         return 0
 
     def search(self,nick,pattern,archive_from=None,archive_to=None,debug=0,as_json=False):
@@ -5287,10 +5755,15 @@ class BorgHelper:
         get_running_bkp_status) et priority.lock (check_priority_lock, Restore/Prune ambigu)."""
         db_path=self.db.get_diff_db(nick)
         last_backup=None
+        build={'state':'complete'}   # AD-10 : base sans build_state (antérieure au chantier) = complète
         if os.path.exists(db_path) and _db_has_schema(db_path):
             conn=None
             try:
                 conn=_open_db(db_path,nick=nick,role='read')
+                bs=conn.execute("SELECT value FROM db_meta WHERE key=?",(_build_state_key(nick),)).fetchone()
+                if bs:
+                    try: build=json.loads(bs[0])
+                    except ValueError: pass
                 row=conn.execute(
                     "SELECT archive,archive_date FROM archive_stats WHERE nick=? ORDER BY archive_date DESC LIMIT 1",
                     (nick,)).fetchone()
@@ -5309,6 +5782,7 @@ class BorgHelper:
             'last_backup':last_backup,
             'bkp_running':{'started_at':bkp_running['started_at']} if bkp_running else None,
             'priority_op_running':bool(self.db.check_priority_lock(nick)),
+            'build':build,
         }
 
     def _status_print_one(self,st):
@@ -5334,6 +5808,12 @@ class BorgHelper:
             # pas Restore de Prune. Affiché seulement si aucun Bkp détecté (sinon redondant : le Bkp
             # lui-même tient ce lock).
             printer("  Opération prioritaire en cours (Restore ou Prune)")
+        b=st.get('build') or {}
+        if b.get('state')=='partial':
+            extra=''
+            if b.get('stats_done') is not None: extra+=f", statistiques {b['stats_done']}/{b.get('archives_total')}"
+            if b.get('snapshot') is False: extra+=", snapshot à faire"
+            printer(f"  Construction partielle : {b.get('pairs_done')}/{b.get('pairs_total')} paires{extra} (Index par tranches)")
 
     def status(self,nick,debug=0,as_json=False):
         """Commande CLI Status (spec-status-cli-etat-rapide) : état rapide (dernier backup connu, Bkp
@@ -5351,7 +5831,7 @@ class BorgHelper:
                 # 'migrating' AD-11, erreur SQLite non prévue…) ne doit jamais faire échouer tout
                 # l'appel -n ALL/multi-nick — c'est précisément le cas d'usage principal de Status.
                 results.append({'nick':n,'last_backup':None,'bkp_running':None,
-                                 'priority_op_running':False,'error':str(e)})
+                                 'priority_op_running':False,'build':None,'error':str(e)})
         if as_json:
             # Toujours une liste (même à un seul nick) : Status supporte nativement ALL/multi-nick,
             # forme homogène pour les consommateurs machine (contrairement à RepoHistory/ArchiveHistory
@@ -8476,6 +8956,452 @@ def codec_selftest():
             finally: b.db.clear_priority_lock('rzp')
             return _rz_cites(dp,'rzp','A1')==s0 and 'reporté' in out
         check("rapprochement : opération prioritaire d'un autre processus -> reporté, rien retiré",_rz_priority)
+        # ── Index par tranches + surveillance croisée (1.0.141, story 4, AD-1/AD-3/AD-4/AD-10) ──
+        check("_parse_duration : 90 / 90s / 5m / 1h ; invalide ou nul -> None",
+              lambda: [_parse_duration(v) for v in ('90','90s','5m','1h','0','x','1d','','9'*30)]==[90,90,300,3600,None,None,None,None,None])
+        def _ix_lower_priority():
+            """nice 10 + ionice idle dans un processus à part (jamais le selftest lui-même)."""
+            code=("import sys,os,subprocess,shutil,importlib.util as u,importlib.machinery as m;"
+                  "l=m.SourceFileLoader('bh',sys.argv[2]);sp=u.spec_from_loader('bh',l);b=u.module_from_spec(sp);l.exec_module(b);"
+                  "b._lower_priority();print(os.nice(0));"
+                  "e=shutil.which('ionice');print(subprocess.run([e,'-p',str(os.getpid())],capture_output=True,text=True).stdout.strip() if e else 'absent')")
+            me=os.path.realpath(__file__)
+            r=subprocess.run([sys.executable,'-c',code,os.path.dirname(me),me],capture_output=True,text=True,timeout=60,
+                             env=dict(os.environ))
+            lines=r.stdout.strip().splitlines()
+            base=os.nice(0)
+            return len(lines)>=2 and int(lines[-2])==min(base+10,19) and ('idle' in lines[-1] or lines[-1]=='absent')
+        check("tranche : priorité basse -> nice 10 et ionice idle (processus à part)",_ix_lower_priority)
+        ix_dir=os.path.join(tmp,'tranches')
+        def _ix_setup():
+            """Vrai dépôt, 6 archives '{fqdn}-t-*' (fichiers modifiés entre chaque), borg appelé via un script qui
+            journalise ses arguments et peut ralentir un sous-commande (_ix_slow). Sections : ix (plain),
+            ixk (DIFF_KEEP=2), ixk1 (DIFF_KEEP=1), ixb/ixc (autres cibles), toutes sur le même dépôt."""
+            os.makedirs(ix_dir,exist_ok=True)
+            src=os.path.join(ix_dir,'src'); os.makedirs(src,exist_ok=True)
+            repo=os.path.join(ix_dir,'repo'); bb=os.path.join(ix_dir,'borgbase'); log=os.path.join(ix_dir,'borg.log')
+            w=os.path.join(ix_dir,'borgw')
+            env=dict(os.environ,BORG_PASSPHRASE='pw-ix',BORG_RELOCATED_REPO_ACCESS_IS_OK='yes',BORG_BASE_DIR=bb)
+            r=subprocess.run([shutil.which('borg'),'init','-e','repokey',repo],env=env,capture_output=True,text=True,timeout=120)
+            if r.returncode!=0: raise RuntimeError(f"borg init : {r.stderr[-300:]}")
+            pre=f"{socket.getfqdn()}-t-"
+            names=[]
+            for i in range(6):
+                with open(os.path.join(src,f'f{i}.txt'),'w') as f: f.write(f'fichier {i} '*50)
+                with open(os.path.join(src,'commun.txt'),'a') as f: f.write(f'modif {i}\n')
+                if i==3: os.unlink(os.path.join(src,'f1.txt'))
+                n=f"{pre}2026-09-0{i+1}T10:00:00"; names.append(n)
+                r=subprocess.run([shutil.which('borg'),'create','--timestamp',f"2026-09-0{i+1}T10:00:00",f'{repo}::{n}',src],
+                                 env=env,capture_output=True,text=True,timeout=120)
+                if r.returncode!=0: raise RuntimeError(f"borg create : {r.stderr[-300:]}")
+            rc=os.path.join(ix_dir,'rc')
+            common=(f"BORG_REPO={repo}\nBORG_PASSPHRASE=pw-ix\nSER_NAME=ix\nSER_LOGIN=x\nGLOB_ARCH={pre}*\n"
+                    f"MOUNTPOINT={os.path.join(ix_dir,'mnt')}\nBORG_ARCHNAME=t\nBORG_ROOTBKP={src}\nDB_ENCRYPT=false\n"
+                    f"EXCLUDE=--exclude-caches\nIDX_WORKERS=1\nBORG_EXE={w}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\n")
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(ix_dir,'cache')}\n\n")
+                for nk,extra in (('ix',''),('ixk','DIFF_KEEP=2\n'),('ixk1','DIFF_KEEP=1\n'),('ixb',''),('ixc',''),('ixd',''),('ixe',''),('ixf','')):
+                    f.write(f"[{nk}]\n{common}{extra}\n")
+            os.chmod(rc,0o600)
+            ctx={'dir':ix_dir,'src':src,'repo':repo,'bb':bb,'log':log,'w':w,'rc':rc,'names':names,'env':env}
+            _ix_slow(ctx,None,0)
+            return ctx
+        def _ix_slow(ctx,match,secs):
+            """Script borg : journalise, attend `secs` si la sous-commande vaut `match` (sleep sans hériter des tubes :
+            tuer le script rend la main aussitôt), puis exec borg avec le BORG_BASE_DIR du test."""
+            with open(ctx['w'],'w') as f:
+                f.write(f"#!/bin/bash\necho \"$*\" >> {ctx['log']}\n"
+                        +(f"sleep {secs} </dev/null >/dev/null 2>&1\n" if match=='ALL' else
+                          f"if [ \"$1\" = \"{match}\" ]; then sleep {secs} </dev/null >/dev/null 2>&1; fi\n" if match else "")
+                        +f"export BORG_BASE_DIR={ctx['bb']}\nexec {shutil.which('borg')} \"$@\"\n")
+            os.chmod(ctx['w'],0o700)
+        def _ix_log(ctx,clear=False):
+            try:
+                with open(ctx['log']) as f: lines=[l.rstrip('\n') for l in f]
+            except OSError: lines=[]
+            if clear:
+                try: os.unlink(ctx['log'])
+                except OSError: pass
+            return lines
+        def _ix_bh(ctx,cache):
+            return BorgHelper(cfgfile=ctx['rc'],cache_dir=os.path.join(ctx['dir'],cache))
+        def _ix_pairs(b,nk):
+            c=sqlite3.connect(b.db.get_diff_db(nk))
+            try: return {(o,n):i for i,o,n in c.execute("SELECT id,archive_old,archive_new FROM diff_indexed_pairs")}
+            finally: c.close()
+        def _ix_state(b,nk):
+            c=sqlite3.connect(b.db.get_diff_db(nk))
+            try:
+                r=c.execute("SELECT value FROM db_meta WHERE key=?",(_build_state_key(nk),)).fetchone()
+                return json.loads(r[0]) if r else None
+            finally: c.close()
+        ix_ctx={}
+        def _ix_ctx():
+            if not ix_ctx: ix_ctx.update(_ix_setup())
+            return ix_ctx
+        def _ix_order_budget_resume():
+            """Tranche 1 (budget 6 s, chaque borg ralenti de 0,3 s) : ordre stats (plus récente d'abord) -> snapshot de
+            la dernière -> diffs du plus récent au plus ancien ; durée ≤ budget + arrêt d'un borg ; 'partial'.
+            Tranches suivantes : paires déjà faites jamais réécrites (mêmes id), jusqu'à 'complete'."""
+            ctx=_ix_ctx(); _ix_slow(ctx,None,0); _ix_log(ctx,clear=True)
+            b=_ix_bh(ctx,'c-order'); names=ctx['names']
+            # ordre (sans budget) : natures complètes, journal
+            out=_q_run(b.index,'ix',budget=None,natures=['stats','snap','diff'])
+            lg=[l for l in _ix_log(ctx,clear=True) if not l.startswith('list --json')]
+            info=[l.split('::')[-1] for l in lg if l.startswith('info --json ::')]
+            first_snap=next(i for i,l in enumerate(lg) if l.startswith('list --format'))
+            first_diff=next(i for i,l in enumerate(lg) if l.startswith('diff '))
+            last_info=max(i for i,l in enumerate(lg) if l.startswith('info --json ::'))
+            diffs=[l.split()[-1] for l in lg if l.startswith('diff ')]
+            order_ok=(info==list(reversed(names)) and last_info<first_snap<first_diff and diffs==list(reversed(names[1:]))
+                      and _ix_state(b,'ix')['state']=='complete')
+            if not order_ok: print(f"  ordre : {lg}")
+            # budget + reprise
+            # Budget ≥ borg list + une unité (sinon aucune progression : voir README).
+            _ix_slow(ctx,'ALL',0.3)
+            b2=_ix_bh(ctx,'c-budget'); t0=time.monotonic()
+            _q_run(b2.index,'ix',budget=6); t1=time.monotonic()-t0
+            st1=_ix_state(b2,'ix'); p1=_ix_pairs(b2,'ix')
+            mono=True; runs=1
+            while (_ix_state(b2,'ix') or {}).get('state')!='complete' and runs<40:
+                prev=_ix_pairs(b2,'ix'); _q_run(b2.index,'ix',budget=6); runs+=1
+                cur=_ix_pairs(b2,'ix'); mono=mono and all(cur.get(k)==v for k,v in prev.items())
+            _ix_slow(ctx,None,0)
+            mono=mono and not any(l.startswith('break-lock') for l in _ix_log(ctx,clear=True))   # jamais à l'échéance
+            ok=(order_ok and t1<=6+3 and st1['state']=='partial' and mono and runs>1
+                and (_ix_state(b2,'ix') or {}).get('state')=='complete' and len(_ix_pairs(b2,'ix'))==5)
+            if not ok: print(f"  budget : durée {t1:.1f}s, état1 {st1}, tranches {runs}, monotone {mono}, final {_ix_state(b2,'ix')}")
+            return ok
+        def _ix_same_as_full():
+            """Base construite par tranches == Index complet : Report -o -j, TreeHist -j, DiffBkp -j identiques."""
+            ctx=_ix_ctx(); _ix_slow(ctx,None,0)
+            bt=_ix_bh(ctx,'c-budget'); bf=_ix_bh(ctx,'c-full')
+            _q_run(bt.index,'ix',budget=60)   # tranche cron suivante : point de taille du dépôt (budget restant)
+            _q_run(bf.index,'ix')
+            if _ix_state(bf,'ix') is not None: print("  Index sans option : build_state créé"); return False
+            def outs(b):
+                r=[]
+                for fn,a,k in ((b.report_offline,('ix',),{'as_json':True}),(b.treehist,('ix',),{'as_json':True}),
+                               (b.diffbkp,('ix',),{'as_json':True})):
+                    o=_q_run(fn,*a,**k)
+                    o=re.sub(r'"(borghelper_version|generated_at|reste|depuis|age[^"]*|since[^"]*)":\s*("[^"]*"|[\d.]+)','',o)
+                    o=re.sub(r'/[^"]*/c-(budget|full)/','/C/',o)
+                    r.append(o)
+                return r
+            a,b_=outs(bt),outs(bf)
+            if a!=b_:
+                for x,y in zip(a,b_):
+                    if x!=y: print(f"  tranches : {x[:400]}\n  complet  : {y[:400]}")
+            return a==b_ and all(len(x)>20 for x in a)
+        def _ix_period_nature_keep():
+            """-T diff -b <A4> : seules les paires se terminant à A4..A6, ni stats ni snapshot ; DIFF_KEEP=2 en tranche :
+            pairs_total=2, seules les 2 plus récentes."""
+            ctx=_ix_ctx(); _ix_slow(ctx,None,0); names=ctx['names']
+            b=_ix_bh(ctx,'c-period')
+            _q_run(b.index,'ix',natures=['diff'],period=(names[3],None))
+            p=set(_ix_pairs(b,'ix'))
+            c=sqlite3.connect(b.db.get_diff_db('ix'))
+            ns=c.execute("SELECT count(*) FROM archive_stats").fetchone()[0]; nsnap=c.execute("SELECT count(*) FROM archive_snapshot_indexed").fetchone()[0]; c.close()
+            period_ok=p=={(names[2],names[3]),(names[3],names[4]),(names[4],names[5])} and ns==0 and nsnap==0
+            _q_run(b.index,'ixk',natures=['diff'])
+            st=_ix_state(b,'ixk'); pk=set(_ix_pairs(b,'ixk'))
+            keep_ok=pk=={(names[3],names[4]),(names[4],names[5])} and st['pairs_total']==2 and st['pairs_done']==2
+            if not (period_ok and keep_ok): print(f"  période {p} stats {ns} snap {nsnap} ; keep {pk} {st}")
+            # Sélection pure (sans borg) : dates, borne haute « journée entière », ALL, stats, refus.
+            arch=[{'name':n,'start':f"2026-09-0{i+1}T10:00:00.000000"} for i,n in enumerate(names)]
+            be=_ix_bh(ctx,'c-sel'); dp=be.db.get_diff_db('ix'); be.db.ensure_diff_db(dp)
+            def sel(per):
+                lo,hi=BorgHelper._period_bounds(per,arch)
+                return {(o,n) for o,n,_ in be._index_select_pairs('ix',dp,arch,None,False,None,lo,hi)[0]}
+            pairs=lambda idx: {(names[i-1],names[i]) for i in idx}
+            lo4,hi4=BorgHelper._period_bounds((names[2],names[3]),arch)
+            stats_sel=[a['name'] for a in arch if BorgHelper._in_period(a['start'],lo4,hi4)]
+            errs=[]
+            for bad in (('2026-13-99x',None),(names[4],names[1]),('archive-inconnue',None)):
+                try: BorgHelper._period_bounds(bad,arch); errs.append(None)
+                except ValueError as e: errs.append(str(e))
+            more=(sel(('2026-09-04',None))==pairs((3,4,5)) and sel((None,'2026-09-05'))==pairs((1,2,3,4))
+                  and sel(('ALL',names[2]))==pairs((1,2)) and sel(('2026-09-03 10:00',None))==pairs((2,3,4,5))
+                  and stats_sel==[names[2],names[3]] and all(errs) and 'inversée' in errs[1])
+            # Un refus en conditions réelles : message, rien d'indexé.
+            bb=_ix_bh(ctx,'c-per5'); o5=_q_run(bb.index,'ix',natures=['diff','stats'],period=('2026-13-99x',None))
+            more=more and 'période' in o5 and not _ix_pairs(bb,'ix')
+            if not more: print(f"  périodes : {errs} {stats_sel} {o5[-200:]!r}")
+            return period_ok and keep_ok and more
+        def _ix_snap_deadline():
+            """Échéance pendant le borg list du snapshot : borg tué, aucune ligne de snapshot sans sentinelle."""
+            ctx=_ix_ctx(); _ix_slow(ctx,'list',6)
+            b=_ix_bh(ctx,'c-snap')
+            # borg list du moteur (--json) ralenti aussi : budget au-delà, puis snapshot tué.
+            t0=time.monotonic(); _q_run(b.index,'ix',natures=['snap'],budget=8); dt=time.monotonic()-t0
+            _ix_slow(ctx,None,0)
+            c=sqlite3.connect(b.db.get_diff_db('ix'))
+            rows=c.execute("SELECT count(*) FROM archive_snapshot").fetchone()[0]; ind=c.execute("SELECT count(*) FROM archive_snapshot_indexed").fetchone()[0]; c.close()
+            if not (rows==0 and ind==0 and dt<8+3): print(f"  snapshot : {rows} lignes, {ind} sentinelles, {dt:.1f}s")
+            return rows==0 and ind==0 and dt<8+3
+        def _ix_diff_keep_plain():
+            """Bug DIFF_KEEP corrigé pour Index sans option : 2e Index sans aucun borg diff, paire gardée = la plus récente."""
+            ctx=_ix_ctx(); _ix_slow(ctx,None,0); names=ctx['names']
+            b=_ix_bh(ctx,'c-keep1')
+            _q_run(b.index,'ixk1'); _ix_log(ctx,clear=True)
+            _q_run(b.index,'ixk1'); lg=_ix_log(ctx,clear=True)
+            p=set(_ix_pairs(b,'ixk1'))
+            ok=not any(l.startswith('diff ') for l in lg) and p=={(names[4],names[5])}
+            if not ok: print(f"  DIFF_KEEP=1 : paires {p}, borg 2e Index {lg}")
+            return ok
+        def _ix_status():
+            """Status -j : build partiel avec compteurs ; texte : ligne « Construction partielle » ; sans build_state : complete."""
+            ctx=_ix_ctx(); _ix_slow(ctx,None,0)
+            b=_ix_bh(ctx,'c-status')
+            _q_run(b.index,'ixb',natures=['diff'],period=(ctx['names'][5],None))
+            st=b._status_one('ixb'); txt=_q_run(b.status,'ixb')
+            st0=b._status_one('ixc')
+            _q_run(b.index,'ixb'); st2=b._status_one('ixb')   # Index sans option : met à jour l'état existant
+            ok=(st['build']['state']=='partial' and st['build']['pairs_done']==1 and st['build']['pairs_total']==5
+                and 'Construction partielle : 1/5' in txt and st0['build']=={'state':'complete'}
+                and st2['build']['state']=='complete' and st2['build']['pairs_done']==5)
+            if not ok: print(f"  status : {st} / {txt!r} / {st0} / {st2}")
+            return ok
+        def _ix_fake_lock(path,pid=None):
+            with open(path,'w') as f: f.write(str(pid or os.getppid()))
+        def _ix_two_indexes():
+            """Index déjà en cours (ou en attente) sur le dépôt : le second sort sans rien écrire."""
+            ctx=_ix_ctx(); b=_ix_bh(ctx,'c-two')
+            outs=[]; busy=None
+            for lp in (b.db._index_running_lock_path('ixd'),b.db._index_paused_lock_path('ixd')):
+                _ix_fake_lock(lp)
+                try:
+                    outs.append((_q_run(b.index,'ixd'),os.path.exists(b.db.get_diff_db('ixd'))))
+                    outs.append((_q_run(b.index,'ixd',snap_only=True),os.path.exists(b.db.get_diff_db('ixd'))))   # Index -S
+                    if 'paused' in lp: busy=b._db_locks_busy('ixd')
+                finally: os.unlink(lp)
+            return all('déjà' in o and not created for o,created in outs) and busy and 'pause' in busy
+        def _ix_pause_resume():
+            """Demande d'arrêt (priority.lock d'un autre processus, puis verrou de Report) pendant les diffs : borg tué,
+            index-running relâché en ≤ 3 s (un Bkp n'attend pas), marqueur de pause pris ; fin de la demande -> reprise
+            seule, base complète, aucun index-pending."""
+            ctx=_ix_ctx(); _ix_slow(ctx,'diff',1)
+            b=_ix_bh(ctx,'c-pause'); res={}
+            ok=True
+            for lockfn in (b.db._priority_lock_path,b.db._report_running_lock_path):
+                b.db.clear_index_pending_lock('ixe')
+                # 2e passe (Report) : seules les 2 paires les plus récentes à refaire, pour qu'une pause survienne vite.
+                c=sqlite3.connect(b.db.get_diff_db('ixe')) if os.path.exists(b.db.get_diff_db('ixe')) else None
+                if c:
+                    for o,n in ((ctx['names'][3],ctx['names'][4]),(ctx['names'][4],ctx['names'][5])):
+                        c.execute("DELETE FROM diff_indexed_pairs WHERE archive_old=? AND archive_new=?",(o,n))
+                        c.execute("DELETE FROM diff_index WHERE archive_old=? AND archive_new=?",(o,n))
+                    c.commit(); c.close()
+                out=io.StringIO(); _ix_log(ctx,clear=True)
+                def run():
+                    with contextlib.redirect_stdout(out),contextlib.redirect_stderr(out): res['r']=b.index('ixe')
+                th=threading.Thread(target=run); th.start()
+                t0=time.monotonic()
+                while time.monotonic()-t0<60 and not any(l.startswith('diff ') for l in _ix_log(ctx)): time.sleep(0.1)
+                lp=lockfn('ixe'); _ix_fake_lock(lp); t1=time.monotonic()
+                while time.monotonic()-t1<10 and os.path.exists(b.db._index_running_lock_path('ixe')): time.sleep(0.1)
+                released=time.monotonic()-t1
+                paused=b.db._owns_lock(b.db._index_paused_lock_path('ixe'))
+                time.sleep(1); os.unlink(lp)
+                th.join(120); _ix_log(ctx,clear=True)
+                this=(not th.is_alive() and res.get('r')==0 and released<3 and paused and 'pause' in out.getvalue()
+                      and 'reprise' in out.getvalue() and len(_ix_pairs(b,'ixe'))==5 and not b.db.check_index_pending_lock('ixe')
+                      and not os.path.exists(b.db._index_paused_lock_path('ixe')))
+                if not this: print(f"  pause ({lockfn.__name__}) : relâché {released:.1f}s, pause {paused}, r {res.get('r')}, "
+                                   f"paires {len(_ix_pairs(b,'ixe'))}, sortie {out.getvalue()[-400:]!r}")
+                ok=ok and this
+            _ix_slow(ctx,None,0)
+            return ok
+        def _ix_deadline_in_pause():
+            """Échéance pendant l'attente d'une opération prioritaire : sortie à l'échéance, sans index-pending."""
+            ctx=_ix_ctx(); b=_ix_bh(ctx,'c-dlpause')
+            lp=b.db._priority_lock_path('ixf'); _ix_fake_lock(lp)
+            try:
+                t0=time.monotonic(); out=_q_run(b.index,'ixf',budget=2); dt=time.monotonic()-t0
+            finally: os.unlink(lp)
+            return (dt<5 and 'échéance' in out and not b.db.check_index_pending_lock('ixf')
+                    and not os.path.exists(b.db._index_paused_lock_path('ixf')))
+        def _ix_kill_in_pause():
+            """kill -9 d'un Index (processus CLI) en pause : base intacte, marqueur orphelin ; l'Index suivant le nettoie
+            et finit."""
+            ctx=_ix_ctx(); _ix_slow(ctx,None,0)
+            b=_ix_bh(ctx,'cache')   # CACHE_DIR du rc : même base que le processus CLI
+            lp=b.db._priority_lock_path('ixf'); _ix_fake_lock(lp,os.getpid())   # un autre PID pour le processus CLI
+            me=os.path.realpath(__file__)
+            ps=subprocess.Popen([me,'-C',ctx['rc'],'-c','Index','-n','ixf'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            try:
+                pl=b.db._index_paused_lock_path('ixf'); t0=time.monotonic()
+                while time.monotonic()-t0<30 and not os.path.exists(pl): time.sleep(0.1)
+                waiting=os.path.exists(pl)
+                ps.kill(); ps.wait(10)
+            finally:
+                os.unlink(lp)
+            out=_q_run(b.index,'ixf')
+            c=sqlite3.connect(b.db.get_diff_db('ixf')); integ=c.execute("PRAGMA integrity_check").fetchone()[0]; c.close()
+            ok=waiting and integ=='ok' and len(_ix_pairs(b,'ixf'))==5 and not os.path.exists(pl)
+            if not ok: print(f"  kill en pause : attente {waiting}, intégrité {integ}, paires {len(_ix_pairs(b,'ixf'))}, {out[-300:]!r}")
+            return ok
+        def _ix_real_bkp_during_index():
+            """Index long (processus CLI, diffs ralentis) + vrai Bkp ici : le Bkp n'attend pas l'Index (verrou relâché
+            en quelques secondes), l'Index se met en pause puis reprend après l'Index de fin du Bkp et finit, nouvelle
+            archive comprise, sans index-pending."""
+            ctx=_ix_ctx(); _ix_slow(ctx,'diff',1.2); _ix_log(ctx,clear=True)
+            b=_ix_bh(ctx,'cache')
+            me=os.path.realpath(__file__)
+            outp=os.path.join(ctx['dir'],'idx.out')
+            with open(outp,'w') as fo:
+                ps=subprocess.Popen([me,'-C',ctx['rc'],'-c','Index','-n','ix'],stdout=fo,stderr=subprocess.STDOUT)
+            try:
+                t0=time.monotonic()
+                while time.monotonic()-t0<60 and not any(l.startswith('diff ') for l in _ix_log(ctx)): time.sleep(0.1)
+                with open(os.path.join(ctx['src'],'commun.txt'),'a') as f: f.write('bkp\n')
+                t1=time.monotonic()
+                orig=b.db.wait_index_idle; waited=[0]
+                def _w(nk,timeout=120):
+                    s=time.monotonic(); orig(nk,timeout); waited[0]=time.monotonic()-s
+                b.db.wait_index_idle=_w
+                _q_run(b.backup,'ix',no_index=False)
+                bkp_t=time.monotonic()-t1
+                rc=ps.wait(180)
+            finally:
+                if ps.poll() is None: ps.kill()
+                _ix_slow(ctx,None,0)
+            with open(outp) as f: out=f.read()
+            names=[a['name'] for a in json.loads(subprocess.run([shutil.which('borg'),'list','--json',ctx['repo']],
+                   env=ctx['env'],capture_output=True,text=True,timeout=60).stdout)['archives']]
+            pairs=set(_ix_pairs(b,'ix'))
+            want={(names[i],names[i+1]) for i in range(len(names)-1)}
+            ok=(rc==0 and waited[0]<5 and 'pause' in out and 'reprise' in out and len(names)>=7 and want<=pairs
+                and not b.db.check_index_pending_lock('ix'))
+            if not ok: print(f"  Bkp pendant Index : rc {rc}, attente Bkp {waited[0]:.1f}s (Bkp {bkp_t:.1f}s), archives {len(names)}, "
+                             f"paires manquantes {want-pairs}, sortie {out[-500:]!r}")
+            return ok
+        def _ix_prune_waits():
+            """Prune attend l'Index (wait_index_idle) comme Bkp et Restore."""
+            ctx=_ix_ctx(); b=_ix_bh(ctx,'c-prune'); called=[]
+            b.db.wait_index_idle=lambda nk,timeout=120: called.append(nk if os.path.exists(b.db._priority_lock_path(nk)) else None)
+            b.borg.boex=lambda *a,**k: {'exitcode':0,'stdout':[],'stderr':[]}
+            b.borg.cfgreaded=lambda nk,debug=0: {'GLOB_ARCH':'x-*'}
+            _q_run(b.prune,'ix')
+            return called==['ix']
+        def _ix_cli_usage():
+            """CLI : -t avec -S -> erreur d'usage (code non nul) ; -T inconnu -> erreur ; -n a,b -t 3 : budget par nick."""
+            ctx=_ix_ctx(); me=os.path.realpath(__file__)
+            r1=subprocess.run([me,'-C',ctx['rc'],'-c','Index','-n','ix','-t','1m','-S'],capture_output=True,text=True,timeout=60)
+            r2=subprocess.run([me,'-C',ctx['rc'],'-c','Index','-n','ix','-T','tout'],capture_output=True,text=True,timeout=60)
+            _ix_slow(ctx,'diff',30)
+            try:
+                t0=time.monotonic()
+                r3=subprocess.run([me,'-C',ctx['rc'],'-c','Index','-n','ixb,ixc','-T','diff','-t','3'],capture_output=True,text=True,timeout=120)
+                dt=time.monotonic()-t0
+            finally: _ix_slow(ctx,None,0)
+            both=r3.stdout.count('construction partielle')==2
+            ok=(r1.returncode!=0 and 'incompatibles' in r1.stdout+r1.stderr and r2.returncode!=0 and both and 5<dt<3*2+10)
+            if not ok: print(f"  CLI : {r1.returncode} {r2.returncode} durée {dt:.1f}s {r3.stdout[-300:]!r}")
+            return ok
+        def _ix_pause_on(ctx,b,nk,trigger,**kw):
+            """Lance b.index(nk,**kw) dans un thread, pose un priority.lock (autre PID) dès que le journal borg montre
+            `trigger`, le retire 1 s après -> (retour, sortie, verrou relâché en s, en pause ?)."""
+            res={}; out=io.StringIO(); _ix_log(ctx,clear=True)
+            def run():
+                with contextlib.redirect_stdout(out),contextlib.redirect_stderr(out): res['r']=b.index(nk,**kw)
+            th=threading.Thread(target=run); th.start(); t0=time.monotonic()
+            while time.monotonic()-t0<60 and not any(l.startswith(trigger) for l in _ix_log(ctx)): time.sleep(0.05)
+            lp=b.db._priority_lock_path(nk); _ix_fake_lock(lp); t1=time.monotonic()
+            while time.monotonic()-t1<10 and os.path.exists(b.db._index_running_lock_path(nk)): time.sleep(0.05)
+            rel=time.monotonic()-t1; paused=b.db._owns_lock(b.db._index_paused_lock_path(nk))
+            time.sleep(1); os.unlink(lp); th.join(120)
+            return res.get('r'),out.getvalue(),rel,paused
+        def _ix_pause_other_phases():
+            """Index sans option arrêté pendant le borg list du snapshot, puis pendant le borg info des statistiques :
+            pause, reprise seule, snapshot/statistiques faits, aucun index-pending."""
+            ctx=_ix_ctx(); ok=True
+            for trig,slow,cache in (('list --format','list','c-ph1'),('info --json','info','c-ph2')):
+                _ix_slow(ctx,slow,1.5); b=_ix_bh(ctx,cache)
+                r,out,rel,paused=_ix_pause_on(ctx,b,'ixe',trig)
+                _ix_slow(ctx,None,0)
+                c=sqlite3.connect(b.db.get_diff_db('ixe'))
+                snap=c.execute("SELECT count(*) FROM archive_snapshot_indexed").fetchone()[0]
+                stats=c.execute("SELECT count(*) FROM archive_stats").fetchone()[0]; c.close()
+                this=(r==0 and rel<4 and paused and 'pause' in out and 'reprise' in out and snap==1 and stats==6
+                      and not b.db.check_index_pending_lock('ixe'))
+                if not this: print(f"  pause ({trig}) : r {r}, relâché {rel:.1f}s, pause {paused}, snap {snap}, stats {stats}, {out[-300:]!r}")
+                ok=ok and this
+            return ok
+        def _ix_force_resume():
+            """Index -F interrompu pendant ses diffs : à la reprise, les paires déjà recalculées dans cet appel ne sont pas
+            refaites (au plus une paire, celle tuée, deux fois)."""
+            ctx=_ix_ctx(); _ix_slow(ctx,None,0); b=_ix_bh(ctx,'c-pause')   # base complète (test de pause)
+            _q_run(b.index,'ixe')                                  # déjà complète : rien à diffuser
+            _ix_slow(ctx,'diff',0.6)
+            _ix_log(ctx,clear=True)
+            res={}; out=io.StringIO()
+            def run():
+                with contextlib.redirect_stdout(out),contextlib.redirect_stderr(out): res['r']=b.index('ixe',force=True)
+            th=threading.Thread(target=run); th.start(); t0=time.monotonic()
+            while time.monotonic()-t0<60 and sum(l.startswith('diff ') for l in _ix_log(ctx))<3: time.sleep(0.05)
+            lp=b.db._priority_lock_path('ixe'); _ix_fake_lock(lp); time.sleep(1.5); os.unlink(lp); th.join(120)
+            _ix_slow(ctx,None,0)
+            diffs=[l for l in _ix_log(ctx,clear=True) if l.startswith('diff ')]
+            per={d:diffs.count(d) for d in set(diffs)}
+            ok=res.get('r')==0 and 'reprise' in out.getvalue() and len(per)==5 and sum(per.values())<=6 and max(per.values())<=2
+            if not ok: print(f"  -F + pause : r {res.get('r')}, {per}")
+            return ok
+        def _ix_incremental_snapshot():
+            """Snapshot incrémental avec fichiers ajoutés (vrai borg) : identique à un snapshot complet ; son borg list des
+            ajouts arrêté par l'échéance -> aucune ligne ni sentinelle pour l'archive, puis reprise correcte."""
+            ctx=_ix_ctx(); _ix_slow(ctx,None,0); b=_ix_bh(ctx,'c-inc')
+            _q_run(b.index,'ixc')                                   # snapshot complet de la dernière archive
+            with open(os.path.join(ctx['src'],'nouveau-1.txt'),'w') as f: f.write('neuf')
+            with open(os.path.join(ctx['src'],'nouveau-2.txt'),'w') as f: f.write('neuf aussi')
+            n7=f"{socket.getfqdn()}-t-2026-09-07T10:00:00"
+            r=subprocess.run([shutil.which('borg'),'create','--timestamp','2026-09-07T10:00:00',f"{ctx['repo']}::{n7}",ctx['src']],
+                             env=ctx['env'],capture_output=True,text=True,timeout=120)
+            if r.returncode!=0: print(f"  borg create : {r.stderr[-200:]}"); return False
+            dp=b.db.get_diff_db('ixc')
+            def rows():
+                c=sqlite3.connect(dp)
+                try:
+                    return (sorted(p for (p,) in c.execute("SELECT f.path FROM archive_snapshot s JOIN snapshot_file f ON f.id=s.file_id "
+                                                           "WHERE s.archive=?",(n7,))),
+                            c.execute("SELECT count(*) FROM archive_snapshot_indexed WHERE archive=?",(n7,)).fetchone()[0])
+                finally: c.close()
+            # 1) borg list des ajouts ralenti, tranche snap : arrêté à l'échéance -> rien d'écrit
+            _q_run(b.index,'ixc',natures=['diff'])                  # paire A6->A7 (le snapshot incrémental s'appuie dessus)
+            _ix_slow(ctx,'list',4)
+            _q_run(b.index,'ixc',natures=['snap'],budget=6)
+            _ix_slow(ctx,None,0)
+            killed=rows()
+            lg=_ix_log(ctx,clear=True)
+            incr=any(l.startswith('list --format') and 'nouveau-' in l for l in lg)
+            # 2) sans ralentissement : incrémental complet, comparé à un snapshot complet forcé
+            _q_run(b.index,'ixc',natures=['snap'])
+            inc=rows()
+            _q_run(b.indexsnap,'ixc',force=True)
+            full=rows()
+            ok=(killed==([],0) and incr and inc[1]==1 and inc[0]==full[0] and any('nouveau-1.txt' in p for p in inc[0]))
+            if not ok: print(f"  snapshot incrémental : tué {killed[1]} sentinelle(s) / {len(killed[0])} lignes, incr {incr}, "
+                             f"{len(inc[0])} vs {len(full[0])} chemins")
+            return ok
+        if shutil.which('borg') is None:
+            skip("Index par tranches et surveillance croisée sur un vrai dépôt borg","borg absent")
+        else:
+            check("tranche : ordre stats -> snapshot -> diffs récents d'abord ; budget respecté ; reprise sans refaire ; complete",_ix_order_budget_resume)
+            check("tranche : base finie par tranches == Index complet (Report -o, TreeHist, DiffBkp)",_ix_same_as_full)
+            check("tranche : nature + période ; DIFF_KEEP borne les paires visées (pairs_total)",_ix_period_nature_keep)
+            check("tranche : échéance pendant le snapshot -> borg tué, aucune ligne sans sentinelle",_ix_snap_deadline)
+            check("DIFF_KEEP (Index sans option) : paires purgées plus jamais re-diffées, paire gardée = la plus récente",_ix_diff_keep_plain)
+            check("Status : build partial/complete, ligne texte « Construction partielle »",_ix_status)
+            check("surveillance croisée : Index déjà en cours ou en attente -> le second sort sans rien écrire",_ix_two_indexes)
+            check("surveillance croisée : Bkp/Restore/Prune ou Report -> pause (verrou relâché ≤ 3 s), reprise seule, complet",_ix_pause_resume)
+            check("surveillance croisée : échéance pendant la pause -> sortie, sans index-pending",_ix_deadline_in_pause)
+            check("surveillance croisée : kill -9 en pause -> base intacte, l'Index suivant reprend et finit",_ix_kill_in_pause)
+            check("Prune attend l'Index comme Bkp et Restore",_ix_prune_waits)
+            check("surveillance croisée : Index sans option arrêté pendant le snapshot ou les statistiques -> pause, reprise, fini",_ix_pause_other_phases)
+            check("surveillance croisée : Index -F repris après pause -> paires déjà recalculées non refaites",_ix_force_resume)
+            check("snapshot incrémental (ajouts) : identique à un complet ; borg list des ajouts arrêté -> rien d'écrit",_ix_incremental_snapshot)
+            check("CLI Index : -t avec -S refusé, -T invalide refusé, budget par nick avec plusieurs nicks",_ix_cli_usage)
+            check("surveillance croisée : vrai Bkp pendant un Index long -> Bkp sans attente, Index en pause puis reprise, nouvelle archive indexée",_ix_real_bkp_during_index)
         def _repo_stats_real_borg():
             """1.0.136 (deferred-work point 9) : capture repo_stats de backup()/prune() sur un VRAI dépôt borg jetable —
             vérifie l'enchaînement réel (borg create/prune/compact/info --json, format de la réponse de CETTE
@@ -8957,7 +9883,7 @@ def _cli_main():
         _sentry_init(sentryid)
 
     try:
-        opts,args=getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILC:FSN:ox:DP:RyKX",["help"])
+        opts,args=getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILC:FSN:ox:DP:RyKXt:T:",["help"])
     except getopt.GetoptError as err:
         print(err); usage(); sys.exit(2)
     if args:
@@ -8993,7 +9919,7 @@ def _cli_main():
     optab={'stats':'Ccdn','login':'Ccdsnkprm','mount':'Ccdnb','umount':'Ccdn',
            'lstbkp':'Ccdn','lstbkpfls':'Ccdnbj','restore':'CcdnbfwWL','diffbkp':'Ccdnbwj',
            'delbkp':'Ccdnb','bkp':'CcdnI','prune':'Ccdn','report':'CcdnlNjo',
-           'init':'Ccdn','key':'Ccdn','index':'CcdnFSA','search':'CcdnfbBj',
+           'init':'Ccdn','key':'Ccdn','index':'CcdnFSAtTbB','search':'CcdnfbBj',
            'filehist':'CcdnfbBj','cacheinfo':'Ccdn','cacheclean':'Ccdn','duidx':'CcdnfbBsjR',
            'idxtop':'CcdnNpj','difftop':'CcdnNpbj','idxpurge':'CcdnxD','treehist':'CcdnfbBjX',
            'treefind':'Ccdnfmj','dbencrypt':'CcdnDy','dbdecrypt':'CcdnDy','dbrekey':'Ccdny','dbstatus':'Ccdn',
@@ -9094,8 +10020,23 @@ def _cli_main():
         bh.cache_clean(nick,debug=debug)
     elif cmd=='index':
         _force='-F' in options; _snaponly='-S' in options; _target=options.get('-A',None)
+        # Tranche (1.0.141, AD-3) : -t budget, -T natures, -b/-B période ; jamais avec -F/-S/-A.
+        _tranche=any(o in options for o in ('-t','-T','-b','-B'))
+        if _tranche and (_force or _snaponly or _target is not None):
+            printer("Index : -t/-T/-b/-B (tranche) incompatibles avec -F, -S et -A"); usage(cmd)
+        _budget=_parse_duration(options['-t']) if '-t' in options else None
+        if '-t' in options and _budget is None:
+            printer(f"Index : durée -t invalide : {options['-t']!r} (ex. 90, 90s, 5m, 1h)"); usage(cmd)
+        _natures=None
+        if '-T' in options:
+            _natures=[x.strip() for x in options['-T'].split(',') if x.strip()]
+            if not _natures or any(x not in ('stats','snap','diff') for x in _natures):
+                printer(f"Index : -T invalide : {options['-T']!r} (parmi stats,snap,diff)"); usage(cmd)
+        _period=(options.get('-b'),options.get('-B')) if ('-b' in options or '-B' in options) else None
+        if _tranche: _lower_priority()   # AD-4 : nice 10 + ionice idle, hérités par borg
         for n in nick.split(','):
-            if _snaponly: bh.indexsnap(n,debug=debug,force=_force)
+            if _snaponly: bh.index(n,debug=debug,force=_force,snap_only=True)   # même verrou et même pause (1.0.141)
+            elif _tranche: bh.index(n,debug=debug,budget=_budget,natures=_natures,period=_period)   # budget par nick
             else: bh.index(n,debug=debug,force=_force,target_archive=_target)
     elif cmd=='search':
         if '-f' not in options: usage(cmd)

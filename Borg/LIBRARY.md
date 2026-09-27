@@ -618,9 +618,9 @@ sys.exit(0)
 | Méthode | Description |
 |---------|-------------|
 | `backup(nick, no_index, debug)` | Lance `borg create` + indexation automatique (indexsnap + index ciblé sur la nouvelle archive) ; si un `Index` externe avait été interrompu, le relance en fin d'exécution ; écrit une ligne `bkp_status` (diff.db) à son début et à sa fin (`'success'`/`'error'` dérivé de `sys.exit()` — voir `bh.db.list_pending_bkp_status`/`claim_bkp_status` ci-dessous) |
-| `prune(nick, dryrun, debug)` | `borg prune` + compact + rapprochement (archives disparues figées puis retirées, 1.0.140) |
-| `index(nick, debug, db_path, force, target_archive, set_pending)` | Rapproche d'abord les bases de `borg list` (archives disparues retirées, 1.0.140), puis indexe les diffs, parallèle ; `target_archive` restreint à une paire ; `set_pending=True` (défaut) pose `index-pending.lock` si interrompu par priorité — mettre `False` pour les appels internes |
-| `indexsnap(nick, debug, db_path, force)` | Snapshot de la dernière archive — incrémental par défaut (force=True pour `borg list` complet) ; purge auto des snapshots anciens (IDX_SNAP_KEEP) |
+| `prune(nick, dryrun, debug)` | Attend qu'un Index se mette en pause (1.0.141), `borg prune` + compact + rapprochement (archives disparues figées puis retirées, 1.0.140) |
+| `index(nick, debug, db_path, force, target_archive, set_pending, budget=None, natures=None, period=None, pause=True, snap_only=False)` | Rapproche d'abord les bases de `borg list` (archives disparues retirées, 1.0.140), puis indexe. 1.0.141 : `budget` (s, > 0), `natures` (sous-ensemble non vide de `stats`,`snap`,`diff`) ou `period` (`(de, à)` : archive, date `AAAA-MM-JJ[THH:MM:SS]` ou `ALL`) → tranche (stats, snapshot, diffs du plus récent au plus ancien, reprenable, `build_state` écrit) ; `snap_only` : snapshot seul (`-S`). Tout Index prend un verrou exclusif par dépôt et se met en pause si Bkp/Restore/Prune/Report démarre, puis reprend seul — **changement de comportement** : sans budget, l'appel peut attendre sans limite la fin de l'opération prioritaire ; `pause=False` : arrêt immédiat comme avant (`index-pending` si `set_pending`, retour 1). Retour : 0 (fini, déjà en cours, échéance), 1 (erreur, période invalide, annulé) ; `ValueError` sur budget/natures invalides. N'abaisse jamais la priorité du processus appelant (seule la CLI le fait) |
+| `indexsnap(nick, debug, db_path, force, archives=None)` | Snapshot de la dernière archive — incrémental par défaut (force=True pour `borg list` complet) ; purge auto des snapshots anciens (IDX_SNAP_KEEP) ; `archives` (1.0.141) : liste `borg list` déjà obtenue ; retourne `'killed'` si son borg a été tué par une demande d'arrêt (rien d'écrit) |
 | `report(nicks, htrep, debug, maxp, as_json)` | Rapport avec appels borg |
 | `report_offline(nicks, htrep, debug, maxp, as_json)` | Rapport depuis diff.db uniquement — même résumé que `report`, toutes machines affichées même sans index |
 | `idxtop(nick, depth, topn, debug, as_json)` | Top N arborescences par nb d'entrées dans diff_index — diagnostiquer un diff.db volumineux ; `as_json` (Story 1.4) : mode brut, une ligne par chemin (`{'nick','rows':[{'chemin','taille'}]}`), **sans** regroupement/top-N ni Exclus/Inchangés — `depth`/`topn` ignorés dans ce mode |
@@ -666,7 +666,10 @@ sys.exit(0)
 | `set_priority_lock(nick)` | Pose le lock prioritaire (écrit le PID) — appelé par `Bkp`/`Restore` |
 | `clear_priority_lock(nick)` | Supprime le lock prioritaire |
 | `check_priority_lock(nick)` | `True` si un processus prioritaire vivant tient le lock (stale → auto-supprimé) |
-| `set_index_running_lock(nick)` | Pose le lock "Index actif" pendant Phase 2 — appelé par `Index` |
+| `set_index_running_lock(nick)` | Pose le lock "Index actif" (écrasement, non exclusif) — `Index` utilise `acquire_index_running_lock` depuis 1.0.141 |
+| `acquire_index_running_lock(nick, wait=0)` | 1.0.141 — prise exclusive (un seul Index par dépôt), réentrante pour le même processus ; verrou d'un PID mort retiré ; `wait` : attente maximale en secondes |
+| `release_index_running_lock(nick)` / `index_running_owned(nick)` | 1.0.141 — relâche le verrou s'il est à ce processus / vrai s'il l'est |
+| `acquire_index_paused_lock(nick)` / `release_index_paused_lock(nick)` / `check_index_paused(nick)` | 1.0.141 — marqueur exclusif de l'Index en pause (un seul en attente par dépôt) |
 | `clear_index_running_lock(nick)` | Supprime le lock "Index actif" |
 | `check_index_running(nick)` | `True` si un Index vivant tient le running lock (stale → auto-supprimé) |
 | `wait_index_idle(nick, timeout=120)` | Attend jusqu'à `timeout` s que `Index` libère ses verrous borg |

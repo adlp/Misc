@@ -544,6 +544,52 @@ DIFF_KEEP : purge des paires au-delà de la limite (comptages figés d'abord, ex
 indexsnap() → voir flux IndexSnap ci-dessous
 ```
 
+### `Index` par tranches (1.0.141, story 4, AD-1/AD-3/AD-10)
+
+`index(nick, budget=, natures=, period=)` — CLI `-t` / `-T` / `-b` / `-B` ; au moins l'un active la tranche,
+incompatible avec `-F`/`-S`/`-A`. Budget compté par nick (`-n ALL -t 1m` : 1 min par nick). Le processus CLI passe
+en `nice` 10 + `ionice -c3` (`_lower_priority`, hérité par borg) ; une bibliothèque appelante garde sa priorité.
+
+```
+borg list --json → _reconcile_archives
+    ↓
+stats   : archives sans archive_stats (période), de la plus récente à la plus ancienne,
+          un `borg info --json ::archive` par archive = une unité (store_archive_stats)
+    ↓
+snap    : indexsnap(archives=liste) de la dernière archive — incrémental : borg list des ajouts AVANT toute
+          écriture puis une seule transaction (clone + retraits + modifs + ajouts + sentinelle) ; complet : une
+          transaction ; lignes sans sentinelle d'un arrêt brutal retirées avant de refaire l'unité
+    ↓
+diffs   : paires visées (_diff_keep_pairs : les DIFF_KEEP plus récentes, période) non indexées, de la plus récente à
+          la plus ancienne, IDX_WORKERS en parallèle ; puis DIFF_KEEP
+    ↓
+point de taille du dépôt (repo_stats op='index') seulement s'il reste du budget — placé avant les diffs, il
+mangeait le budget de chaque tranche et pouvait empêcher toute paire d'aboutir
+    ↓
+build_state (db_meta, clé 'build_state:<nick>', JSON) : {state: partial|complete, pairs_done, pairs_total,
+          archives_total, stats_done, snapshot, updated_at}
+```
+
+- Échéance vérifiée entre deux unités et entre les phases SQL (rapprochement, purge) ; à l'échéance, le borg en cours
+  est arrêté (`BorgRunner._stop` : SIGTERM puis SIGKILL après 5 s, pour que borg relâche son verrou de dépôt ; ou
+  moniteur des diffs) et son unité jetée. `break-lock` seulement pour une opération prioritaire, jamais à
+  l'échéance (il casserait aussi les verrous d'un borg mount ou d'un autre hôte). Tranche terminée sans aucune
+  progression : avertissement (budget trop court). Un budget plus court que la plus longue unité ne progresse jamais : le choisir au-dessus
+  de la durée d'un `borg diff` de deux archives consécutives.
+- `complete` = toutes les paires visées indexées, `archive_stats` pour toutes les archives, snapshot de la dernière
+  (NOIDX : stats seules). Tranche : `build_state` toujours écrit. Index sans option : mis à jour seulement s'il existe
+  et a changé, jamais créé (base sans `build_state` = `complete`, AD-10). `Status -j` : champ `build`.
+- **DIFF_KEEP (1.0.141)** : les paires visées sont les N plus récentes dans l'ordre des archives, pour Index sans
+  option aussi ; `_diff_keep_purge(archives=)` garde exactement ces paires (sans liste : date d'archive puis nom).
+  Avant, chaque Index re-diffait les paires purgées et la purge (tri `indexed_at`, à la seconde) gardait la paire
+  indexée en dernier : la paire gardée changeait d'un Index à l'autre.
+- Le moteur reçoit `db_path` comme cible (AD-1) : la story 6 lui passera le fichier fantôme.
+- Période : `_period_bounds` accepte un nom d'archive de la liste, une date `AAAA-MM-JJ[THH:MM:SS]` ou `ALL` ; toute
+  autre valeur ou une période inversée -> erreur (retour 1), jamais une comparaison de chaînes silencieuse.
+- `-S` (`index(snap_only=True)`) et `-F` passent par le même tour et la même pause ; `plan['done']` garde les paires
+  recalculées dans l'appel : une reprise après pause ne les refait pas, même avec `-F`.
+- `BorgRunner._stop` / `_kills` sont propres à chaque thread (`threading.local`).
+
 ### `IndexSnap` (snapshot de la dernière archive)
 
 ```
@@ -670,7 +716,7 @@ tout appel `boex`, `clear_priority_lock` dans un `finally` couvrant tout le corp
 Le lock est keyed sur `BORG_REPO` (sanitisé), pas sur le nick. Tous les nicks pointant le même dépôt borg partagent donc le même fichier de lock — `Bkp` sur `nick-A` interrompt `Index` sur `nick-B` si `BORG_REPO` identique.
 
 ```
-Bkp / Restore démarre
+Bkp / Restore / Prune démarre
     ↓
 set_priority_lock(nick)    → <repo>-priority.lock (PID)  ← signal à Index de s'arrêter
     ↓
@@ -683,39 +729,47 @@ opération borg (create / extract)   ← plus de conflit de verrou borg
 finally: clear_priority_lock(nick)  → supprime priority.lock
 ```
 
+### Surveillance croisée : pause et reprise de l'Index (1.0.141, story 4, AD-4 amendé)
+
+Avant 1.0.141, un Index interrompu sortait (`index-pending`) et seul le Bkp suivant le relançait ; le moniteur ne
+couvrait que les diffs et `index-running.lock` n'était ni tenu hors diffs ni exclusif.
+
 ```
-Index — démarrage
+Index — démarrage (_index_turn)
     ↓
-check_priority_lock(nick)
-    ├── True (Bkp/Restore déjà actif) → set_index_pending_lock() + annulation immédiate
-    └── False → continue
+index-running.lock ou index-paused.lock tenu par un autre PID vivant → « Index déjà en cours », sortie (rien écrit)
     ↓
-set_index_running_lock(nick)  → <repo>-index-running.lock (PID)
+demande d'arrêt (priority.lock d'un autre PID, ou report-running.lock) ?
+    ├── pause=False (Index de fin de Bkp) → comportement d'avant : index-pending (selon set_pending), return 1
+    └── sinon → index-paused.lock (exclusif : un seul Index en attente par dépôt) + attente, sans limite de durée
     ↓
-ThreadPoolExecutor — borg diff en parallèle (Popen direct, running_procs dict)
-    thread moniteur daemon (_priority_monitor) — poll 0.5 s
-    ├── priority lock absent  → continue à surveiller
-    └── priority lock détecté → interrupted_event.set()
-                                 cancel() futures en attente
-                                 ps.kill() (SIGKILL) sur chaque Popen actif
-                                 poll running_procs jusqu'à vide (zombies reapés, PIDs disparus)
-                                 borg break-lock <BORG_REPO> → supprime les stale lock files
-    as_completed() collecte les résultats (CancelledError ignoré)
+acquire_index_running_lock : os.link d'un fichier temporaire contenant le PID (création atomique, jamais vide ;
+repli O_CREAT|O_EXCL sans liens physiques), verrou d'un PID mort mis de côté par rename puis revérifié (jamais
+l'unlink d'un verrou repris entre-temps) ; PID d'un autre utilisateur = vivant ; tenu pendant TOUTES les phases
     ↓
-finally: interrupted_event.set() → arrête le moniteur
-         monitor.join(timeout=2)
-         clear_index_running_lock(nick)  → <repo>-index-running.lock supprimé
-         ← Bkp/Restore débloqué ici (wait_index_idle retourne)
+passe (_index_pass) : borg list → rapprochement → diffs / stats / snapshot (ou tranche)
+    moniteur : BorgRunner._stop (boex : communicate(timeout=0.5) en boucle, borg tué → 'killed': True) pour
+    borg list / info / list du snapshot ; thread _priority_monitor pour les diffs (futures annulées, borg tués,
+    break-lock) ; unité en cours jetée, unités finies gardées (sentinelles)
     ↓
-si interrupted_event.is_set() → set_index_pending_lock() + return 1
-                                 ← borg info et indexsnap sont sautés
+demande prioritaire vue → index-paused.lock pris AVANT de relâcher index-running.lock → attente
+    → plus de demande ET index-running libre → reprise : nouvelle passe complète (borg list, rapprochement,
+      unités restantes seulement ; l'archive du Bkp est vue), sans index-pending
 ```
 
-### Reprise automatique après Bkp
-
-Quand `Index` est interrompu (early-exit ou mid-run), `index-pending.lock` est posé. `Bkp` le détecte en fin d'exécution (après son `index` ciblé) et relance automatiquement un `Index` complet (`set_pending=False` pour éviter toute boucle récursive).
-
-`Index` est incrémental : `diff_indexed_pairs` garde la sentinelle de chaque paire indexée. La reprise saute les paires déjà traitées et n'indexe que les suivantes.
+- Bkp : `acquire_index_running_lock(wait=120)` **avant** `clear_priority_lock`, pour son Index de fin (`index()`
+  réentrant : même PID, jamais de pause dans le processus du Bkp) ; relâché après la relance éventuelle d'un
+  `index-pending`. L'Index en pause ne reprend qu'après. `index-pending` ne sert plus qu'aux sorties sans pause
+  (Index de fin de Bkp interrompu, changement de mode de la base).
+- Prune appelle `wait_index_idle` comme Bkp/Restore ; Report s'annonce par `report-running.lock` (déjà vu par le
+  moniteur). Tous n'attendent plus que le temps que le moniteur (0,5 s) tue le borg en cours.
+- Tranche : la pause compte dans le budget ; échéance pendant la pause → sortie sans `index-pending`.
+- Demande d'arrêt aussi vérifiée entre les phases SQL ; une unité arrêtée compte comme une pause même si la demande a
+  déjà disparu quand on la relit (`_kill_outcome`). Bkp qui n'obtient pas le tour d'Index en 120 s : `index-pending`.
+- DbEncrypt/DbDecrypt/DbRekey refusent aussi de démarrer si un Index est en pause (`_db_locks_busy`).
+- kill -9 d'un Index en pause : `index-paused.lock` orphelin, retiré par le prochain Index (PID mort).
+- `Index` est incrémental : `diff_indexed_pairs` garde la sentinelle de chaque paire ; une reprise saute les paires
+  déjà traitées.
 
 ---
 
