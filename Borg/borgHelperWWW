@@ -64,7 +64,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.27.5"
+WWW_VERSION="1.27.6"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -451,10 +451,13 @@ def _bkp_status_watcher_pass():
                       file=sys.stderr,flush=True)
                 _send_bkp_push(nick,'start',None)
             _check_overdue(nick,db_path)
-        except Exception as e:
+        except (Exception,SystemExit) as e:
             # Un nick en erreur (DB corrompue, etc.) ne doit jamais aveugler les autres nicks de ce
-            # passage — isolation par nick, le passage suivant réessaiera.
-            print(f"[watcher] nick={nick} erreur : {e}",file=sys.stderr,flush=True)
+            # passage — isolation par nick, le passage suivant réessaiera. SystemExit inclus (1.27.6) :
+            # les ensure_*_db de borgHelper font sys.exit(1) sur une base occupée/corrompue ; hors de ce
+            # filet, il traversait le watcher et arrêtait tout le serveur (boucle asyncio).
+            print(f"[watcher] nick={nick} erreur : {'sortie borgHelper (voir message ci-dessus)' if isinstance(e,SystemExit) else e}",
+                  file=sys.stderr,flush=True)
             continue
 
 def _max_age_bkp(cfg):
@@ -638,9 +641,11 @@ async def _bkp_status_watcher():
           f"timeout AD-7 {BKP_STATUS_TIMEOUT}s",file=sys.stderr,flush=True)
     next_purge=0.0; next_schema=0.0
     while True:
+        # (Exception,SystemExit) sur les trois passages (1.27.6) : un sys.exit de borgHelper appelé en
+        # bibliothèque ne doit jamais sortir de la tâche, sinon il arrête la boucle asyncio donc le serveur.
         try:
             await asyncio.to_thread(_bkp_status_watcher_pass)
-        except Exception as e:
+        except (Exception,SystemExit) as e:
             print(f"[watcher] erreur pendant l'interrogation bkp_status : {e}",file=sys.stderr,flush=True)
         if time.monotonic()>=next_purge:
             next_purge=time.monotonic()+PUSH_PURGE_INTERVAL
@@ -649,12 +654,12 @@ async def _bkp_status_watcher():
                 if n: print(f"[watcher] push: {n} abonnement(s) expiré(s) retiré(s)",file=sys.stderr,flush=True)
                 n=await asyncio.to_thread(_push_prune_unknown_nicks)
                 if n: print(f"[watcher] push: {n} abonnement(s) nettoyé(s) de serveurs retirés du rc",file=sys.stderr,flush=True)
-            except Exception as e:
+            except (Exception,SystemExit) as e:
                 print(f"[watcher] push: erreur de purge des abonnements expirés : {e}",file=sys.stderr,flush=True)
         if time.monotonic()>=next_schema:
             next_schema=time.monotonic()+SCHEMA_CHECK_INTERVAL
             try: await asyncio.to_thread(_schema_watch_pass)
-            except Exception as e:
+            except (Exception,SystemExit) as e:
                 print(f"[watcher] erreur du contrôle de schéma : {e}",file=sys.stderr,flush=True)
         await asyncio.sleep(BKP_WATCHER_INTERVAL)
 
@@ -3346,6 +3351,24 @@ def push_selftest():
                 state['cfg']={'MAX_AGE_BKP':'25'}; _run('nickSansReglage')  # réglage absent : rien
                 return sent==[('overdue','nickSentry',1),('overdue','nickSentry',2)]
             check("retard : SENTRY_ALERTS=overdue -> alerte Sentry indépendante du push, dédupliquée, rappel ; rien sans le réglage",_overdue_sentry)
+            def _watcher_survives_exit():
+                """1.27.6 : ensure_diff_db fait sys.exit(1) sur une base occupée/corrompue — le passage du watcher
+                l'absorbe pour ce nick et traite les suivants ; auparavant SystemExit traversait le watcher et
+                arrêtait tout borgHelperWWW."""
+                seen=[]
+                def _ensure(p,create=True):
+                    if 'nBad' in p: raise SystemExit(1)
+                with mock.patch(f"{__name__}._nick_list",lambda x:['nBad','nGood']), \
+                     mock.patch.object(_bh_paths.db,'get_diff_db',lambda n:f"/nonexistent/{n}-diff.db"), \
+                     mock.patch.object(_bh_paths.db,'ensure_diff_db',_ensure), \
+                     mock.patch.object(_bh_paths.db,'list_pending_bkp_status',lambda n,t,p=None:[]), \
+                     mock.patch.object(_bh_paths.db,'list_pending_bkp_status_start',lambda n,p=None:[]), \
+                     mock.patch(f"{__name__}._check_overdue",lambda n,p:seen.append(n)), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    try: _bkp_status_watcher_pass()
+                    except SystemExit: return False
+                return seen==['nGood']
+            check("watcher : sys.exit de borgHelper sur un nick absorbé, les autres nicks traités, serveur jamais arrêté",_watcher_survives_exit)
             def _push_mute_flow():
                 """1.27.2 : PUSH_MUTE=true (rc, relu à chaque envoi) -> rien envoyé, alerte de retard NON consommée
                 (part à la reprise) ; BORGHELPERWWW_PUSH_DISABLED -> rien envoyé (fin de sauvegarde comprise)."""

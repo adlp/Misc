@@ -1,5 +1,28 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.137 / borgHelperWWW 1.27.6 — « DB corrompue : database is locked » qui arrêtait borgHelperWWW — 2026-09-27
+
+Symptôme constaté en production (borgHelperWWW 1.27.5) : `DB corrompue : …-diff.db -> database is locked — Supprimez le
+fichier…`, puis arrêt complet de borgHelperWWW (`SystemExit: 1` depuis le watcher `bkp_status`).
+
+- **Cause** : `VACUUM INTO`, utilisé par le compactage après `Prune`/`IdxPurge`, produit une base en mode journal
+  `delete`, et `diff.db` restait ainsi hors WAL. L'ouverture suivante relançait `PRAGMA journal_mode=WAL`, qui exige un
+  accès exclusif et échoue immédiatement quand un autre processus (Index, Bkp, lecture) a la base ouverte.
+- **borgHelper** : le compactage remet la base en WAL (et vide le WAL avant la copie). Le passage en WAL n'est plus
+  demandé que si nécessaire ; s'il est refusé pour cause de verrou, la base reste utilisable dans son mode courant et
+  repasse en WAL à la prochaine ouverture sans concurrent. Une base déjà hors WAL après une ancienne version se répare
+  donc seule. `ensure_diff_db`/`ensure_cache_db` attendent jusqu'à 60 s un verrou, comme les autres ouvertures (5 s
+  auparavant).
+- **borgHelper** : un verrou n'est plus présenté comme une corruption. Nouveau message « DB occupée … réessayer plus
+  tard (ne PAS supprimer le fichier) ». Supprimer `diff.db` sur ce conseil faisait perdre l'historique mesuré
+  (tailles du dépôt, compteurs C/E).
+- **borgHelperWWW** : le watcher (passage par nick et boucle) absorbe aussi `SystemExit`, que borgHelper lève sur une
+  base occupée ou corrompue. Le nick concerné est sauté et réessayé au passage suivant, les autres sont traités, et le
+  serveur ne s'arrête plus.
+- Contrôles : `CodecSelfTest` 345/345 (compactage qui garde le WAL ; base hors WAL + écrivain actif : le `PRAGMA` brut
+  échoue, `ensure_diff_db` passe ; verrou ≠ corruption), `push_selftest` 86/86 (le watcher survit à un `sys.exit` sur
+  un nick et traite les suivants).
+
 ## borgHelperWWW 1.27.5 — hors périmètre : vraie réponse « introuvable » au lieu d'une imitation — 2026-09-27
 
 Issu de l'entretien `deferred-work.md` (point 8, option D).

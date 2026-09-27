@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.136"
+Version="1.0.137"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -1060,6 +1060,36 @@ def _db_open_fail(db_path,e):
         printer(f"  -> {e}")
     sys.exit(1)
 
+def _db_busy(e):
+    """Vrai si l'erreur SQLite est un verrou tenu par un autre processus (locked/busy), pas une corruption."""
+    return isinstance(e,sqlite3.OperationalError) and any(w in str(e).lower() for w in ('locked','busy'))
+
+def _db_schema_fail(db_path,e,what):
+    """Diagnostic + sys.exit(1) des ensure_*_db. Un verrou n'est JAMAIS présenté comme une corruption :
+    conseiller de supprimer diff.db sur un simple « database is locked » ferait perdre l'historique."""
+    if _db_busy(e):
+        printer(f"DB occupée : {db_path}")
+        printer(f"  -> {e}")
+        printer("  Un autre processus tient un verrou sur la base : réessayer plus tard (ne PAS supprimer le fichier).")
+    else:
+        printer(f"DB corrompue : {db_path}")
+        printer(f"  -> {e}")
+        printer(f"  Supprimez le fichier et relancez pour reconstruire {what}.")
+    sys.exit(1)
+
+def _ensure_wal(conn):
+    """Passe la base en WAL si elle n'y est pas déjà (1.0.137). Changer de mode exige un accès exclusif :
+    base ouverte par un autre processus -> SQLITE_BUSY immédiat (le délai d'attente ne s'applique pas à ce
+    PRAGMA). On laisse alors la base dans son mode courant, qui reste utilisable ; le prochain ouvreur sans
+    concurrent la repassera en WAL. Avant 1.0.137 : PRAGMA inconditionnel -> « database is locked » sur
+    une base sortie de _vacuum_db (mode delete) dès qu'un Index/Bkp y écrivait, pris pour une corruption."""
+    try:
+        if str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()=='wal': return True
+        return str(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()=='wal'
+    except sqlite3.OperationalError as e:
+        if _db_busy(e): return False
+        raise
+
 def _open_db(db_path,nick=None,role='read',passphrase=None,**kw):
     """Point d'ouverture UNIQUE des bases SQLite (AD-1). kw -> sqlite3 (timeout=60, ...).
     role : read|write|admin (validé et mémorisé, sans effet fonctionnel pour l'instant).
@@ -1523,9 +1553,9 @@ class BorgHelperDB:
         le défaut create=True (créateurs légitimes, AD-12)."""
         if not create and not _db_has_schema(db_path): return
         try:
-            try: conn=_open_db(db_path,nick=None,role='admin')
+            try: conn=_open_db(db_path,nick=None,role='admin',timeout=60)
             except sqlite3.OperationalError as e: _db_open_fail(db_path,e)
-            conn.execute("PRAGMA journal_mode=WAL")
+            _ensure_wal(conn)
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS db_meta (
                     key   TEXT PRIMARY KEY,
@@ -1543,10 +1573,7 @@ class BorgHelperDB:
             self._check_set_meta(conn,CACHE_DB_SCHEMA_VERSION,db_path,CACHE_DB_BASE_SCHEMA_VERSION)
             conn.commit(); conn.close()
         except sqlite3.DatabaseError as e:
-            printer(f"DB corrompue : {db_path}")
-            printer(f"  -> {e}")
-            printer("  Supprimez le fichier et relancez pour reconstruire le cache.")
-            sys.exit(1)
+            _db_schema_fail(db_path,e,'le cache')
 
     @staticmethod
     def _executescript_atomic(conn,script):
@@ -1605,9 +1632,9 @@ class BorgHelperDB:
         """create=False (AD-12) : voir ensure_cache_db — même contrat, réservé aux lecteurs."""
         if not create and not _db_has_schema(db_path): return
         try:
-            try: conn=_open_db(db_path,nick=None,role='admin')
+            try: conn=_open_db(db_path,nick=None,role='admin',timeout=60)
             except sqlite3.OperationalError as e: _db_open_fail(db_path,e)
-            conn.execute("PRAGMA journal_mode=WAL")
+            _ensure_wal(conn)
             conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS db_meta (
@@ -1766,10 +1793,7 @@ class BorgHelperDB:
             self._check_set_meta(conn,DIFF_DB_SCHEMA_VERSION,db_path,DIFF_DB_BASE_SCHEMA_VERSION)
             conn.commit(); conn.close()
         except sqlite3.DatabaseError as e:
-            printer(f"DB corrompue : {db_path}")
-            printer(f"  -> {e}")
-            printer("  Supprimez le fichier et relancez pour reconstruire l'index.")
-            sys.exit(1)
+            _db_schema_fail(db_path,e,"l'index")
 
     def purge_stale_cache(self,nick,current_lm,db_path=None):
         if db_path is None: db_path=self.get_cache_db(nick)
@@ -2569,8 +2593,19 @@ class BorgHelper:
         try:
             conn=_open_db(db_path,nick=nick,role='write',timeout=60)
             if verbose: printer(f"  compactage en cours...")
+            # Vide le WAL avant la copie (1.0.137) : un -wal resté plein après le remplacement du fichier
+            # pourrait être rejoué sur la nouvelle base. Sans effet bloquant si un lecteur est ouvert.
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             conn.execute(f"VACUUM INTO '{tmp_path}'")
             conn.close()
+            # VACUUM INTO produit une base en mode journal « delete » (vérifié, SQLite 3.37) : la remettre
+            # en WAL tant qu'elle est privée (1.0.137). Avant : diff.db restait en « delete » après chaque
+            # Prune/IdxPurge, et le PRAGMA journal_mode=WAL de l'ouverture suivante échouait en « database
+            # is locked » dès qu'un autre processus avait la base ouverte (prise pour une corruption,
+            # arrêt de borgHelperWWW par son watcher).
+            tconn=_open_db(tmp_path,nick=None,role='admin')
+            try: tconn.execute("PRAGMA journal_mode=WAL")
+            finally: tconn.close()
             try: os.chmod(tmp_path,stat.S_IMODE(os.stat(db_path).st_mode))  # VACUUM INTO crée avec l'umask : garder les droits d'origine
             except OSError: pass
             os.replace(tmp_path,db_path)
@@ -7101,6 +7136,28 @@ def codec_selftest():
             c=sqlite3.connect(p); kept=c.execute("SELECT sql FROM sqlite_master WHERE name='archive_snapshot_v'").fetchone()[0]; c.close()
             return ok0 and mis=='mismatch' and fixed=='ok' and newer=='newer' and 'SELECT 1 AS x' in kept
         check("vue archive_snapshot_v : divergente -> recréée par ensure_diff_db ; base plus récente -> jamais touchée",_view_check)
+        def _vacuum_wal():
+            """1.0.137 : _vacuum_db rend une base en WAL (VACUUM INTO produit du « delete ») ; une base restée en
+            « delete » avec un écrivain actif s'ouvre quand même (le PRAGMA brut, lui, échoue en « locked ») ;
+            un verrou n'est jamais annoncé comme une corruption."""
+            bdb=BorgHelperDB(tmp,'vwal'); p=os.path.join(tmp,'vwal-diff.db'); bdb.ensure_diff_db(p)
+            BorgHelper._vacuum_db(None,p,verbose=False)
+            jm=lambda: sqlite3.connect(p).execute("PRAGMA journal_mode").fetchone()[0]
+            wal_after=jm()=='wal'
+            c=sqlite3.connect(p); c.execute("PRAGMA journal_mode=DELETE"); c.close()   # base héritée d'avant 1.0.137
+            w=sqlite3.connect(p,isolation_level=None); w.execute("BEGIN IMMEDIATE")
+            w.execute("INSERT INTO db_meta VALUES('vw','1') ON CONFLICT DO NOTHING")
+            try:
+                raw=raises(sqlite3.OperationalError,lambda: sqlite3.connect(p,timeout=0.2).execute("PRAGMA journal_mode=WAL").fetchone())
+                out=io.StringIO()
+                with contextlib.redirect_stderr(out): survived=not raises(SystemExit,lambda: bdb.ensure_diff_db(p,create=False))
+            finally: w.execute("ROLLBACK"); w.close()
+            bdb.ensure_diff_db(p,create=False); back=jm()=='wal'
+            msg=io.StringIO()
+            with contextlib.redirect_stderr(msg):  # printer écrit sur stderr
+                with contextlib.suppress(SystemExit): _db_schema_fail(p,sqlite3.OperationalError('database is locked'),"l'index")
+            return wal_after and raw and survived and back and 'DB occupée' in msg.getvalue() and 'Supprimez' not in msg.getvalue()
+        check("_vacuum_db garde le WAL ; base « delete » + écrivain : ensure_diff_db ne s'arrête pas ; verrou != corruption",_vacuum_wal)
         def _plain_anomaly():
             """db_plain_anomalies (1.0.134, badge UI) : base en clair + DB_ENCRYPT actif + passphrase -> anomalie ;
             DB_ENCRYPT=false, sans passphrase, base chiffrée, base absente -> jamais."""

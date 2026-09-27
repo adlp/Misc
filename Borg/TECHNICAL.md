@@ -671,10 +671,32 @@ DELETE FROM diff_index WHERE nick=? AND path GLOB ?                          # g
     ↓
 UPDATE diff_indexed_pairs SET entry_count = (SELECT COUNT(*) ...)    # recalcul
     ↓
+PRAGMA wal_checkpoint(TRUNCATE)     (1.0.137 : WAL vidé avant la copie)
 VACUUM INTO 'diff.db.vacuum_tmp'  (même répertoire → évite /tmp saturé)
+PRAGMA journal_mode=WAL sur la copie (1.0.137 : VACUUM INTO produit du mode « delete »)
 os.replace('diff.db.vacuum_tmp', 'diff.db')
     └── si échec : entrées supprimées, message avec commande manuelle
 ```
+
+**Mode WAL conservé (1.0.137).** `VACUUM INTO` produit une base en mode journal `delete` (vérifié sur SQLite
+3.37.2 : octets 18-19 de l'en-tête à `01 01`). Avant 1.0.137, `diff.db` restait donc hors WAL après chaque `Prune` ou
+`IdxPurge`, et l'ouverture suivante relançait `PRAGMA journal_mode=WAL`. Ce changement de mode exige un accès
+exclusif et échoue **immédiatement** (le délai d'attente ne s'y applique pas) dès qu'un autre processus a la base
+ouverte : « database is locked ». `ensure_diff_db` l'affichait comme « DB corrompue… Supprimez le fichier », puis
+faisait `sys.exit(1)`. Appelé par le watcher de borgHelperWWW, ce `SystemExit` passait au travers du
+`except Exception` et arrêtait le serveur. Trois corrections :
+
+- `_vacuum_db` remet la copie en WAL avant de la mettre en place (elle est encore privée, aucun concurrent) et vide
+  le WAL avant la copie (un `-wal` resté plein pourrait sinon être rejoué sur la nouvelle base) ;
+- `_ensure_wal` (dans `ensure_diff_db`/`ensure_cache_db`) ne demande le passage en WAL que si la base n'y est pas, et
+  s'il est refusé pour cause de verrou, garde la base dans son mode courant (utilisable) : le prochain ouvreur sans
+  concurrent la repassera en WAL. Ces deux fonctions ouvrent désormais avec `timeout=60` comme les autres sites ;
+- `_db_schema_fail` : un verrou (`locked`/`busy`) s'affiche « DB occupée … ne PAS supprimer le fichier », jamais
+  comme une corruption (supprimer `diff.db` ferait perdre l'historique mesuré).
+
+Contrôle `CodecSelfTest` dédié (base `delete` + écrivain actif : le `PRAGMA` brut échoue, `ensure_diff_db` passe).
+Reste hors de ce correctif : un lecteur resté ouvert pendant le remplacement du fichier (protocole complet de
+bascule, chantier « reconstruction progressive », AD-6).
 
 **Pourquoi `VACUUM INTO` et pas `VACUUM` ?** `VACUUM` écrit son fichier temporaire dans `/tmp`, qui peut être sur une partition séparée et pleine même si le filesystem du `diff.db` a de l'espace. `VACUUM INTO chemin` crée la copie compacte dans le même répertoire, utilisant l'espace libre du bon filesystem.
 

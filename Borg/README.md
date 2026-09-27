@@ -870,6 +870,10 @@ Sans `-x`, lit `IDX_EXCLUDE`/`IDX_INCLUDE` depuis la configuration du nick et pu
 
 Après suppression, `IdxPurge` recalcule `diff_indexed_pairs.entry_count` et compacte le fichier via `VACUUM INTO` (dans le même répertoire, évite les problèmes de `/tmp` plein). Si le compactage échoue, les entrées sont quand même supprimées et la commande manuelle est affichée.
 
+Le compactage laisse la base en mode WAL (1.0.137). Si une base est momentanément verrouillée par un autre processus,
+borgHelper affiche `DB occupée : … réessayer plus tard (ne PAS supprimer le fichier)`. Seul `DB corrompue : …` invite
+à supprimer le fichier pour reconstruire.
+
 > **Workflow recommandé :**  
 > `IdxTop` → identifier les arborescences volumineuses → ajouter à `IDX_EXCLUDE` dans borghelperrc → `IdxPurge` (sans `-x`) pour purger l'historique existant.
 
