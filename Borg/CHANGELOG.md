@@ -1,5 +1,15 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.123 — réécriture atomique du rc — 2026-09-27
+
+Issu de `deferred-work.md` (lot A).
+
+- `Login` (`cfgwrite`) réécrivait le `.borghelperrc` en place (troncature puis écriture) : un crash au milieu perdait
+  le fichier qui contient les passphrases. Désormais fichier temporaire dans le même répertoire, `fsync`, puis
+  remplacement atomique. Droits et propriétaire du rc existant conservés (0600 à la création) ; si le rc est un
+  lien symbolique, c'est sa cible qui est remplacée.
+- `CodecSelfTest` 331/331 (nouveau : crash simulé en cours d'écriture → rc intact, aucun temporaire résiduel).
+
 ## borgHelper 1.0.122 — restauration par joker réparée — 2026-09-27
 
 Issu de `deferred-work.md` (lot A, traité avec l'utilisateur).

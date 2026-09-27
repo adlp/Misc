@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.122"
+Version="1.0.123"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -1244,6 +1244,35 @@ def _db_has_schema(db_path):
 
 # ── BorgHelperDB — all SQLite operations ──────────────────────────────────────
 
+def _atomic_write_rc(cfgfile,config):
+    """Réécrit le rc sans jamais le laisser tronqué (1.0.123) : il contient les passphrases, un crash en
+    cours d'écriture (ancien `O_TRUNC` en place) le perdait. Fichier temporaire dans le MÊME répertoire
+    (même système de fichiers, `os.replace` atomique), `fsync`, puis remplacement. Droits : ceux du rc
+    existant (0600 s'il n'existe pas) ; propriétaire conservé si possible (root réécrivant le rc d'un
+    autre compte). Lien symbolique : c'est sa CIBLE qui est remplacée, le lien reste en place."""
+    import tempfile
+    target=os.path.realpath(cfgfile)
+    try: st=os.stat(target)
+    except FileNotFoundError: st=None
+    fd,tmp=tempfile.mkstemp(dir=os.path.dirname(target),prefix='.'+os.path.basename(target)+'.')
+    try:
+        os.fchmod(fd,(st.st_mode&0o7777) if st else 0o600)
+        if st and (st.st_uid,st.st_gid)!=(os.getuid(),os.getgid()):
+            try: os.fchown(fd,st.st_uid,st.st_gid)
+            except PermissionError: pass  # non-root : le rc devient le sien, droits identiques
+        with os.fdopen(fd,'w') as f:
+            config.write(f); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp,target)
+    except BaseException:
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+        raise
+    try:  # rend le renommage durable (métadonnées du répertoire)
+        dfd=os.open(os.path.dirname(target),os.O_RDONLY)
+        try: os.fsync(dfd)
+        finally: os.close(dfd)
+    except OSError: pass
+
 class BorgHelperDB:
     """SQLite layer: cache.db and diff.db operations. No borg calls."""
 
@@ -2186,9 +2215,7 @@ class BorgRunner:
         config[nick]['SER_NAME']=serna
         config[nick]['GLOB_ARCH']=serna+'-root-*'
         config[nick]['MOUNTPOINT']="/mnt/borg/"+nick if mountpoint is None else mountpoint
-        # 0600 à la création (le rc contient des passphrases) ; un rc existant garde ses droits
-        with os.fdopen(os.open(self.cfgfile,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600),'w') as fd:
-            config.write(fd)
+        _atomic_write_rc(self.cfgfile,config)
 
     def _boex_check_stdout(self,rb,nick,cmd='borg'):
         if rb['exitcode']!=0 or not rb['stdout']:
@@ -6618,6 +6645,23 @@ def codec_selftest():
             r=b.db_encrypt('m16',confirm=True)  # reprise : la corruption est dans table1, déjà migrée avant l'interruption
             return r==2 and _db5_mode(b,'m16')=='migrating'  # jamais commitée en siv1 malgré la corruption
         check("DbEncrypt repris après interruption : la validation finale relit aussi les lignes migrées AVANT la reprise (échantillon 'legacy'), détecte une corruption qui y a été introduite",_db_migrate_resume_validates_legacy_rows)
+        def _rc_atomic_write():
+            """cfgwrite (1.0.123) : un crash pendant l'écriture laisse le rc INTACT (plus de troncature en
+            place), aucun temporaire résiduel ; droits du rc existant conservés, 0600 à la création."""
+            rc=os.path.join(tmp,'atomic.rc'); new=os.path.join(tmp,'atomic-new.rc')
+            with open(rc,'w') as f: f.write('[a]\nBORG_PASSPHRASE=origine\n')
+            os.chmod(rc,0o640)
+            class _Boom:
+                def write(self,f): f.write('partiel'); raise RuntimeError('crash simulé')
+            try: _atomic_write_rc(rc,_Boom())
+            except RuntimeError: pass
+            intact=open(rc).read()=='[a]\nBORG_PASSPHRASE=origine\n'
+            no_tmp=not [f for f in os.listdir(tmp) if f.startswith('.atomic.rc.')]
+            c=configparser.ConfigParser(); c.optionxform=str; c['a']={'BORG_PASSPHRASE':'nouvelle'}
+            _atomic_write_rc(rc,c); _atomic_write_rc(new,c)
+            return (intact and no_tmp and 'nouvelle' in open(rc).read()
+                    and stat.S_IMODE(os.stat(rc).st_mode)==0o640 and stat.S_IMODE(os.stat(new).st_mode)==0o600)
+        check("cfgwrite atomique : crash en cours d'écriture -> rc intact, pas de temporaire ; droits conservés (0600 à la création)",_rc_atomic_write)
     finally:
         shutil.rmtree(tmp,ignore_errors=True)
         _DB_CFG_READERS.clear(); _DB_CFG_READERS.update(saved_readers)

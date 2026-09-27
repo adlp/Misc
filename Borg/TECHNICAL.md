@@ -757,7 +757,9 @@ Règle : le code métier ne manipule que des chemins logiques, seul le chemin st
   paramètres réels stockés dans l'en-tête. Sous-clés `k_path`, `k_enc`, `k_blob`, `k_hdr` = `HMAC(DEK, étiquette)`.
 - **`enc_header`** : une ligne JSON `db_meta`, `INSERT … ON CONFLICT DO NOTHING` dans `BEGIN IMMEDIATE` (jamais
   `INSERT OR REPLACE`). Aucun chemin de production n'en crée encore.
-- **Permissions** : rc `0600` à la création (`cfgwrite`), avertissement unique à la lecture si groupe/autres y ont accès,
+- **Permissions** : rc `0600` à la création (`cfgwrite`) ; réécriture **atomique** depuis 1.0.123 (`_atomic_write_rc` :
+  temporaire dans le même répertoire, `fsync`, `os.replace`, droits/propriétaire du rc existant repris, cible d'un lien
+  symbolique remplacée — un crash ne laisse jamais un rc tronqué, contrôlé par `CodecSelfTest`), avertissement unique à la lecture si groupe/autres y ont accès,
   cache `0700`, `.db` `0600` ; l'existant n'est jamais chmodé.
 - **Config** : `db_encrypt_enabled(nick)` (`DB_ENCRYPT`, défaut vrai) et `db_kdf_level(nick)` (`DB_KDF`).
 
