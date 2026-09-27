@@ -550,17 +550,23 @@ Procédure complète :
 DB=~/.cache/borghelper/borghelperrc-mon-serveur-diff.db
 
 # 1. Créer une copie compacte dans le même répertoire
-#    Note : les apostrophes AUTOUR de ${DB}.compact font partie du SQL
-sqlite3 "$DB" "VACUUM INTO '${DB}.compact'"
+python3 -c 'import sqlite3,sys; sqlite3.connect(sys.argv[1]).execute("VACUUM INTO ?",(sys.argv[2],))' "$DB" "${DB}.compact"
 
-# 2. Remplacer l'original (garder .bak le temps de vérifier)
-mv "$DB" "${DB}.bak"
-mv "${DB}.compact" "$DB"
+# 2. Recopier la version compacte DANS la base (API backup de SQLite, sûre même si la base est ouverte),
+#    puis vider le WAL et supprimer la copie
+python3 -c 'import sqlite3,sys; s=sqlite3.connect(sys.argv[2]); d=sqlite3.connect(sys.argv[1],timeout=60); s.backup(d); d.execute("PRAGMA wal_checkpoint(TRUNCATE)"); d.close(); s.close()' "$DB" "${DB}.compact"
+rm "${DB}.compact"
 
-# 3. Vérifier que la taille a bien diminué, puis supprimer le backup
-ls -lh "${DB}.bak" "$DB"
-rm "${DB}.bak"
+# 3. Vérifier que la taille a bien diminué
+ls -lh "$DB"
 ```
+
+> ⚠️ **Jamais `mv` pour remplacer une base ouverte** (borgHelperWWW, un Bkp, un Index…) : avec un `-wal` non vide, les
+> connexions suivantes rejouent l'ancien WAL sur le nouveau fichier (lectures en erreur, ancien contenu réapparu), et
+> les connexions déjà ouvertes continuent d'écrire dans l'ancien fichier (écritures perdues) — mesuré en 1.0.138.
+> L'étape 2 passe par les verrous de SQLite, comme `_swap_db` que `borgHelper` utilise lui-même depuis 1.0.138 ; la base
+> reste en mode WAL (vérifié).
+> Écrire une modification entre l'étape 1 et l'étape 2 la ferait écraser : faire les deux étapes à la suite, hors Bkp.
 
 Le fichier résultant est immédiatement utilisable par borgHelper :
 - `journal_mode=WAL` et `auto_vacuum=INCREMENTAL` sont réappliqués automatiquement à la prochaine connexion borgHelper.

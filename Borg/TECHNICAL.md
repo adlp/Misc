@@ -671,11 +671,13 @@ DELETE FROM diff_index WHERE nick=? AND path GLOB ?                          # g
     ↓
 UPDATE diff_indexed_pairs SET entry_count = (SELECT COUNT(*) ...)    # recalcul
     ↓
-PRAGMA wal_checkpoint(TRUNCATE)     (1.0.137 : WAL vidé avant la copie)
+PRAGMA wal_checkpoint(TRUNCATE) ; PRAGMA data_version → v0
 VACUUM INTO 'diff.db.vacuum_tmp'  (même répertoire → évite /tmp saturé)
 PRAGMA journal_mode=WAL sur la copie (1.0.137 : VACUUM INTO produit du mode « delete »)
-os.replace('diff.db.vacuum_tmp', 'diff.db')
-    └── si échec : entrées supprimées, message avec commande manuelle
+_swap_db('diff.db', 'diff.db.vacuum_tmp')   (1.0.138 : API backup, jamais os.replace)
+    ├── opération prioritaire (priority.lock d'un autre processus) → reporté, base intacte
+    ├── data_version ≠ v0 (écriture après la copie) → nouvel essai, puis reporté, base intacte
+    └── erreur SQLite : entrées supprimées, espace non récupéré, message
 ```
 
 **Mode WAL conservé (1.0.137).** `VACUUM INTO` produit une base en mode journal `delete` (vérifié sur SQLite
@@ -695,8 +697,37 @@ faisait `sys.exit(1)`. Appelé par le watcher de borgHelperWWW, ce `SystemExit` 
   comme une corruption (supprimer `diff.db` ferait perdre l'historique mesuré).
 
 Contrôle `CodecSelfTest` dédié (base `delete` + écrivain actif : le `PRAGMA` brut échoue, `ensure_diff_db` passe).
-Reste hors de ce correctif : un lecteur resté ouvert pendant le remplacement du fichier (protocole complet de
-bascule, chantier « reconstruction progressive », AD-6).
+
+**Bascule `_swap_db` (1.0.138).** Remplacer une base servie par un autre fichier passe par une seule fonction,
+`_swap_db(live, new, nick, abort, changed)`, qui utilise l'API backup de SQLite : le contenu de `new` est recopié par
+tranches de pages dans `live`, puis `wal_checkpoint(TRUNCATE)`, et `new` est supprimé. Mesures qui ont fixé ce choix
+(SQLite 3.37.2, 4 lecteurs dont 2 persistants, 1 écrivain, WAL servi non vide) :
+
+| Méthode | Résultat |
+|---|---|
+| `os.replace` seul (avant 1.0.138) | les nouvelles connexions rejouent l'ancien `-wal` sur la nouvelle base : environ 286 000 erreurs « no such table », ancien contenu réapparu |
+| connexion exclusive puis rename | `database is locked` immédiat dès qu'une autre connexion est ouverte : impossible |
+| `os.replace` + suppression `-wal`/`-shm` | pas d'erreur, mais les connexions ouvertes restent sur l'ancien fichier et y perdent leurs écritures |
+| API backup | aucune erreur ni mélange, toutes les connexions voient la nouvelle base, écritures conservées |
+
+Les verrous de SQLite font le travail : un lecteur voit l'ancienne base ou la nouvelle, jamais un mélange ; les
+écrivains attendent la fin de la copie (100 Mo : 0,3 s de copie + 0,2 s de checkpoint). Pic disque : base servie +
+WAL (taille de la nouvelle) + nouvelle base. `abort()` est évalué entre deux tranches (opération prioritaire : la
+copie est annulée, la base reste l'ancienne). `changed()` est évalué après la première tranche, quand la copie tient
+déjà le verrou d'écriture : s'il est faux, aucune écriture ne peut plus être écrasée. Au moins deux tranches, car
+CPython appelle le rappel de progression aussi après la dernière tranche, copie déjà validée. `_vacuum_db` s'en sert
+avec `changed` = `PRAGMA data_version` différent de celui relevé avant `VACUUM INTO` ; auparavant, une écriture faite
+entre la copie et le remplacement (par exemple `bkp_status` d'un Bkp) était écrasée sans message. Face à un écrivain
+continu, le compactage est reporté (mesuré, sans perte). La copie de compactage porte le PID (`.vacuum_tmp.<pid>`) ;
+`_vacuum_leftovers` ne supprime que les restes orphelins (processus disparu, ou ancien nom sans PID). `_swap_db`
+refuse une copie absente, vide ou d'une seule page (`invalid`, jamais `_open_db` qui la créerait vide). Sa connexion à
+la base servie a un délai de 1 s : une tranche bloquée par un écrivain rend la main (`SQLITE_BUSY`), `abort()` est
+sondé et l'attente totale bornée (`busy_limit`, 120 s). Rappel de CPython : il passe aussi sur `SQLITE_BUSY` (rien
+copié) et sur `SQLITE_DONE` (copie validée) ; seul le premier appel sur une tranche réussie teste `changed()`. Les
+`wal_checkpoint(TRUNCATE)` sont lancés avec `busy_timeout=0` : en attente de lecteurs, TRUNCATE bloque les nouveaux
+écrivains. `_set_pid_lock` écrit le verrou par fichier temporaire + `os.replace` : lu vide pendant son écriture, il
+était pris pour orphelin et supprimé. Contrôles `CodecSelfTest` multi-processus : lecteurs, écrivain pendant 5 compactages, annulation,
+compactage sous `priority.lock`, kill -9 au milieu de la copie, base chiffrée.
 
 **`SystemExit` dans borgHelperWWW (1.27.6 / 1.27.7).** borgHelper est aussi importé comme bibliothèque par
 borgHelperWWW, et plusieurs de ses fonctions font `sys.exit` (rc invalide, base occupée ou corrompue). Dans le

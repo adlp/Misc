@@ -868,9 +868,9 @@ Sans `-x`, lit `IDX_EXCLUDE`/`IDX_INCLUDE` depuis la configuration du nick et pu
 
 **Purge automatique des snapshots :** en fin d'opération, `IdxPurge` purge aussi les snapshots (`archive_snapshot`) au-delà du seuil `IDX_SNAP_KEEP`. Si `IDX_SNAP_KEEP` n'est pas défini, le seuil est calculé comme `sum(KEEP_DAILY + KEEP_WEEKLY + KEEP_MONTHLY + KEEP_YEARLY + KEEP_HOURLY)`, ou 10 si aucune règle KEEP_* n'est configurée. Le dry-run `-D` affiche également les snapshots qui seraient purgés.
 
-Après suppression, `IdxPurge` recalcule `diff_indexed_pairs.entry_count` et compacte le fichier via `VACUUM INTO` (dans le même répertoire, évite les problèmes de `/tmp` plein). Si le compactage échoue, les entrées sont quand même supprimées et la commande manuelle est affichée.
+Après suppression, `IdxPurge` recalcule `diff_indexed_pairs.entry_count` et compacte le fichier via `VACUUM INTO` (dans le même répertoire, évite les problèmes de `/tmp` plein). Si le compactage échoue ou est reporté, les entrées sont quand même supprimées (message `[WARN] compactage impossible` ou `[WARN] compactage reporté : <raison>`) ; relancer `IdxPurge` plus tard, ou la procédure manuelle de LIBRARY.md.
 
-Le compactage laisse la base en mode WAL (1.0.137). Si une base est momentanément verrouillée par un autre processus,
+Le compactage laisse la base en mode WAL (1.0.137) et ne remplace plus jamais le fichier sous les processus qui l'ont ouvert (1.0.138) : il est reporté, base intacte, si un Bkp/Restore/Prune est en cours ou démarre, si la base est modifiée pendant la copie, ou si elle reste verrouillée en écriture par un autre processus. Si une base est momentanément verrouillée par un autre processus,
 borgHelper affiche `DB occupée : … réessayer plus tard (ne PAS supprimer le fichier)`. Seul `DB corrompue : …` invite
 à supprimer le fichier pour reconstruire.
 

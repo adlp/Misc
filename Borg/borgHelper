@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.137"
+Version="1.0.138"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -1090,6 +1090,65 @@ def _ensure_wal(conn):
         if _db_busy(e): return False
         raise
 
+class _SwapAbort(Exception):
+    """Levée par le rappel de progression de _swap_db pour annuler la copie (base servie inchangée)."""
+
+def _swap_db(live,new,nick=None,abort=None,changed=None,pages=4096,busy_limit=120):
+    """Remplace le contenu de la base servie `live` par celui de `new` (1.0.138, story 1 du chantier
+    reconstruction, AD-6 amendé), puis supprime `new`. Retourne 'ok', 'abort' (abort() vrai : opération
+    prioritaire), 'changed' (changed() vrai : `live` modifiée depuis la préparation de `new`), 'busy' (`live`
+    verrouillée en écriture par un autre processus plus de `busy_limit` s) ou 'invalid' (`new` absente, vide ou
+    d'une seule page : jamais copiée, elle viderait la base servie).
+
+    Mécanisme : API backup de SQLite, par tranches de `pages` pages, puis wal_checkpoint(TRUNCATE). Les
+    verrous de SQLite garantissent qu'un lecteur voit l'ancienne base ou la nouvelle, jamais un mélange, et
+    que les connexions déjà ouvertes (persistantes comprises) voient la nouvelle à leur transaction suivante.
+    Les écrivains attendent la fin de la copie. Jamais os.replace sur une base servie : mesuré, un -wal non
+    vide est alors rejoué sur la nouvelle base (lecteurs « no such table », ancien contenu réapparu) ; et
+    supprimer -wal/-shm laisse les connexions ouvertes écrire dans l'ancien fichier (écritures perdues).
+
+    abort() est évalué après chaque tranche, y compris quand la tranche attend un verrou (SQLITE_BUSY) ;
+    changed() après la première tranche réussie : le verrou d'écriture de `live` est alors tenu par la copie
+    jusqu'à la fin, donc un changed() faux garantit qu'aucune écriture ne sera écrasée. Le rappel de CPython
+    passe aussi après la dernière tranche (SQLITE_DONE, copie validée) : jamais d'annulation à ce moment, et au
+    moins deux tranches pour que changed() précède toujours la validation. Annulation ou erreur : `live` reste
+    l'ancienne base. Coût : `live` + WAL (taille de `new`) + `new` sur le disque pendant la copie."""
+    _DONE,_BUSY,_LOCKED=101,5,6
+    if not os.path.isfile(new) or os.path.getsize(new)==0: return 'invalid'  # jamais _open_db (O_CREAT) sur un absent
+    src=dst=None; state={'first':True}; t0=time.monotonic()
+    def _prog(status,remaining,total):
+        if status==_DONE: return
+        if abort is not None and abort(): raise _SwapAbort('abort')
+        if status in (_BUSY,_LOCKED):
+            if time.monotonic()-t0>busy_limit: raise _SwapAbort('busy')
+            return
+        if state['first'] and changed is not None and changed(): raise _SwapAbort('changed')
+        state['first']=False
+    try:
+        src=_open_db(new,nick=None,role='admin')
+        n=src.execute("PRAGMA page_count").fetchone()[0]
+        if n<2: return 'invalid'
+        # timeout court : une tranche bloquée rend la main vite (SQLITE_BUSY), abort() et busy_limit sont sondés
+        dst=_open_db(live,nick=None,role='admin',timeout=1)
+        try:
+            src.backup(dst,pages=max(1,min(pages,n//2)),progress=_prog)
+            return 'ok'
+        except _SwapAbort as e:
+            return str(e)
+    finally:
+        if dst is not None:
+            # Récupère le WAL (copie validée, annulée ou en erreur) sans attendre : busy_timeout=0, sinon un lecteur
+            # en cours ferait patienter TRUNCATE — qui bloque les nouveaux écrivains pendant l'attente — jusqu'à 60 s.
+            try: dst.execute("PRAGMA busy_timeout=0"); dst.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error: pass
+        for c in (src,dst):
+            if c is not None:
+                try: c.close()
+                except sqlite3.Error: pass
+        for f in (new,new+'-wal',new+'-shm'):
+            try: os.unlink(f)
+            except OSError: pass
+
 def _open_db(db_path,nick=None,role='read',passphrase=None,**kw):
     """Point d'ouverture UNIQUE des bases SQLite (AD-1). kw -> sqlite3 (timeout=60, ...).
     role : read|write|admin (validé et mémorisé, sans effet fonctionnel pour l'instant).
@@ -1426,9 +1485,16 @@ class BorgHelperDB:
         return os.path.join(self.cache_dir,f"{self.db_prefix}-{self._repo_key(nick)}-{suffix}.lock")
 
     def _set_pid_lock(self,path):
+        # Écriture atomique (1.0.138) : open('w') tronque puis écrit ; un lecteur (_check_pid_lock, sondé à chaque
+        # tranche de _swap_db et par le moniteur d'Index) pouvait lire un fichier vide entre les deux, le prendre
+        # pour un verrou orphelin et le supprimer — la protection d'un Bkp tombait.
+        tmp=f"{path}.{os.getpid()}.tmp"
         try:
-            with open(path,'w') as f: f.write(str(os.getpid()))
-        except OSError: pass
+            with open(tmp,'w') as f: f.write(str(os.getpid()))
+            os.replace(tmp,path)
+        except OSError:
+            try: os.unlink(tmp)
+            except OSError: pass
 
     def _clear_pid_lock(self,path):
         try: os.unlink(path)
@@ -2585,40 +2651,77 @@ class BorgHelper:
         if type(details) is list: return details[0]
         return details
 
+    @staticmethod
+    def _vacuum_leftovers(db_path):
+        """Supprime les copies de compactage orphelines de db_path : '<db>.vacuum_tmp.<pid>' dont le processus n'existe
+        plus (compactage tué), et l'ancien nom sans pid (<= 1.0.137). Jamais la copie d'un compactage en cours."""
+        d=os.path.dirname(os.path.abspath(db_path)); base=os.path.basename(db_path)+'.vacuum_tmp'
+        try: names=os.listdir(d)
+        except OSError: return
+        for name in names:
+            if not name.startswith(base): continue
+            stem=name
+            for suf in ('-wal','-shm'):
+                if stem.endswith(suf): stem=stem[:-len(suf)]
+            pid=stem[len(base)+1:] if stem.startswith(base+'.') else ''
+            if pid:
+                if not pid.isdigit(): continue
+                try: os.kill(int(pid),0); continue   # processus vivant : compactage en cours, on n'y touche pas
+                except ProcessLookupError: pass
+                except OSError: continue
+            elif stem!=base: continue
+            try: os.unlink(os.path.join(d,name))
+            except OSError: pass
+
     def _vacuum_db(self,db_path,verbose=True,nick=None):
-        """VACUUM INTO dans le même répertoire que db_path (évite de saturer /tmp).
-        verbose=True : imprime 'compactage en cours/terminé' + hint manuel en cas d'échec.
-        Retourne True si succès, False sinon."""
-        tmp_path=db_path+'.vacuum_tmp'
-        try:
-            conn=_open_db(db_path,nick=nick,role='write',timeout=60)
-            if verbose: printer(f"  compactage en cours...")
-            # Vide le WAL avant la copie (1.0.137) : un -wal resté plein après le remplacement du fichier
-            # pourrait être rejoué sur la nouvelle base. Sans effet bloquant si un lecteur est ouvert.
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            conn.execute(f"VACUUM INTO '{tmp_path}'")
-            conn.close()
-            # VACUUM INTO produit une base en mode journal « delete » (vérifié, SQLite 3.37) : la remettre
-            # en WAL tant qu'elle est privée (1.0.137). Avant : diff.db restait en « delete » après chaque
-            # Prune/IdxPurge, et le PRAGMA journal_mode=WAL de l'ouverture suivante échouait en « database
-            # is locked » dès qu'un autre processus avait la base ouverte (prise pour une corruption,
-            # arrêt de borgHelperWWW par son watcher).
-            tconn=_open_db(tmp_path,nick=None,role='admin')
-            try: tconn.execute("PRAGMA journal_mode=WAL")
-            finally: tconn.close()
-            try: os.chmod(tmp_path,stat.S_IMODE(os.stat(db_path).st_mode))  # VACUUM INTO crée avec l'umask : garder les droits d'origine
-            except OSError: pass
-            os.replace(tmp_path,db_path)
-            if verbose: printer(f"  compactage terminé")
-            return True
-        except sqlite3.Error as ve:
+        """Compacte db_path : VACUUM INTO une copie propre à ce processus dans le même répertoire (évite de saturer
+        /tmp ; deux compactages simultanés — IdxPurge et Prune ne partagent aucun verrou — ne se marchent plus dessus),
+        puis _swap_db (1.0.138) — jamais os.replace sur la base servie (voir _swap_db). Reporté, base intacte, si une
+        opération prioritaire est en cours ou démarre (priority.lock d'un autre processus), si la base est modifiée
+        entre la copie et la bascule (une écriture serait sinon écrasée ; une nouvelle tentative), ou si elle reste
+        verrouillée en écriture. verbose=True : imprime 'compactage en cours/terminé' + conseil en cas d'échec.
+        Retourne True si compactée, False sinon."""
+        tmp_path=f"{db_path}.vacuum_tmp.{os.getpid()}"
+        abort=(lambda: self.db.check_priority_lock(nick)) if nick else None  # le verrou de ce processus (Prune) ne compte pas
+        def _reported(why):
+            printer(f"  [WARN] compactage reporté : {why} — base intacte, relancer plus tard"); return False
+        if abort is not None and abort(): return _reported("opération prioritaire (Bkp/Restore/Prune) en cours")
+        if verbose: printer(f"  compactage en cours...")
+        BorgHelper._vacuum_leftovers(db_path)
+        for attempt in (1,2):
+            conn=None
             try:
-                if os.path.exists(tmp_path): os.unlink(tmp_path)
-            except OSError: pass
-            printer(f"  [WARN] compactage impossible ({ve}) — entrées purgées mais espace non récupéré")
-            if verbose:
-                printer(f"  [WARN] relancer manuellement : sqlite3 '{db_path}' \"VACUUM INTO '{db_path}.tmp'\" && mv '{db_path}.tmp' '{db_path}'")
-            return False
+                conn=_open_db(db_path,nick=nick,role='write',timeout=60)
+                conn.execute("PRAGMA busy_timeout=0")   # TRUNCATE en attente bloquerait les nouveaux écrivains : sans attendre
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.execute("PRAGMA busy_timeout=60000")
+                v0=conn.execute("PRAGMA data_version").fetchone()[0]  # change si un AUTRE processus écrit dans la base
+                conn.execute("VACUUM INTO ?",(tmp_path,))
+                # VACUUM INTO produit une base en mode « delete » (1.0.137) : la copie repasse en WAL avant la bascule.
+                tconn=_open_db(tmp_path,nick=None,role='admin')
+                try: tconn.execute("PRAGMA journal_mode=WAL")
+                finally: tconn.close()
+                changed=lambda: conn.execute("PRAGMA data_version").fetchone()[0]!=v0
+                result=_swap_db(db_path,tmp_path,nick=nick,abort=abort,changed=changed)
+            except (sqlite3.Error,OSError) as ve:
+                for f in (tmp_path,tmp_path+'-wal',tmp_path+'-shm'):
+                    try: os.unlink(f)
+                    except OSError: pass
+                printer(f"  [WARN] compactage impossible ({ve}) — entrées purgées mais espace non récupéré")
+                if verbose:
+                    printer("  [WARN] relancer plus tard (IdxPurge), jamais en remplaçant le fichier à la main pendant que la base est ouverte")
+                return False
+            finally:
+                if conn is not None:
+                    try: conn.close()
+                    except sqlite3.Error: pass
+            if result=='ok':
+                if verbose: printer(f"  compactage terminé")
+                return True
+            if result=='abort': return _reported("opération prioritaire (Bkp/Restore/Prune) en cours")
+            if result=='busy': return _reported("base verrouillée en écriture par un autre processus")
+            if result=='invalid': return _reported("copie de compactage invalide")
+        return _reported("base modifiée pendant la copie")
 
     # ── DbEncrypt / DbDecrypt / DbRekey / DbStatus (chiffrement des chemins — story 5) ──────────
     # Migration en place, reprenable, sans copie complète (AD-7). 'migrating' est un état partagé par
@@ -7158,6 +7261,216 @@ def codec_selftest():
                 with contextlib.suppress(SystemExit): _db_schema_fail(p,sqlite3.OperationalError('database is locked'),"l'index")
             return wal_after and raw and survived and back and 'DB occupée' in msg.getvalue() and 'Supprimez' not in msg.getvalue()
         check("_vacuum_db garde le WAL ; base « delete » + écrivain : ensure_diff_db ne s'arrête pas ; verrou != corruption",_vacuum_wal)
+        # ── Bascule (1.0.138, _swap_db, AD-6 amendé) : preuve multi-processus avant tout usage ──
+        import multiprocessing as _mp
+        _fork=_mp.get_context('fork')
+        def _swap_mk(p,gen,n):
+            for f in (p,p+'-wal',p+'-shm'):
+                if os.path.exists(f): os.unlink(f)
+            c=_open_db(p,nick=None,role='admin'); c.execute("PRAGMA journal_mode=WAL")
+            c.executescript("CREATE TABLE t(k INTEGER PRIMARY KEY,v TEXT); CREATE TABLE meta(gen TEXT); CREATE TABLE w(x INTEGER);")
+            c.executemany("INSERT INTO t(v) VALUES(?)",[(gen*40,)]*n); c.execute("INSERT INTO meta VALUES(?)",(gen,)); c.commit()
+            return c
+        def _swap_reader(live,out,persistent,stop_file):
+            """Processus lecteur : chaque lecture doit être une base complète, A (3000 lignes) ou B (9000)."""
+            r={'A':0,'B':0,'bad':0,'err':[]}
+            c=sqlite3.connect(live,timeout=20) if persistent else None
+            while not os.path.exists(stop_file):
+                try:
+                    cc=c or sqlite3.connect(live,timeout=20); cc.execute("BEGIN")
+                    n,dv,v=cc.execute("SELECT count(*),count(DISTINCT v),min(v) FROM t").fetchone(); g=cc.execute("SELECT gen FROM meta").fetchone()[0]
+                    cc.execute("COMMIT")
+                    if not persistent: cc.close()
+                    good=dv==1 and v==g*40 and ((g=='A' and n==3000) or (g=='B' and n==9000))
+                    r[g if good else 'bad']+=1
+                except Exception as e: r['err'].append(str(e)[:60])
+            with open(out,'w') as f: json.dump(r,f)
+            os._exit(0)
+        def _swap_writer(live,out,stop_file):
+            """Processus écrivain persistant : compte ses commits réussis (aucun ne doit disparaître)."""
+            c=sqlite3.connect(live,timeout=20); ok=0; err=[]; i=0
+            while not os.path.exists(stop_file):
+                try: c.execute("INSERT INTO w VALUES(?)",(i,)); c.commit(); ok+=1
+                except Exception as e: err.append(str(e)[:60])
+                # Un commit toutes les ~150 ms : des compactages réussissent pendant qu'il écrit. Face à un écrivain
+                # continu (commit toutes les ~50 ms sous contention), le compactage est reporté à chaque essai, sans
+                # perte (mesuré). Les vrais écrivains de diff.db hors verrou (bkp_status) sont bien plus rares.
+                i+=1; time.sleep(0.15)
+            with open(out,'w') as f: json.dump({'ok':ok,'err':err},f)
+            os._exit(0)
+        def _swap_run(fn,readers=4,writer=False):
+            """Lance lecteurs (moitié persistants) [+ écrivain], exécute fn(), arrête tout, rend les résultats."""
+            d=tempfile.mkdtemp(dir=tmp); stop=os.path.join(d,'stop'); live=os.path.join(tmp,'sw-live.db')
+            ps=[_fork.Process(target=_swap_reader,args=(live,os.path.join(d,f'r{i}'),i%2==0,stop)) for i in range(readers)]
+            if writer: ps.append(_fork.Process(target=_swap_writer,args=(live,os.path.join(d,'w'),stop)))
+            for p in ps: p.start()
+            try: time.sleep(0.5); res=fn(); time.sleep(0.5)
+            finally: open(stop,'w').close()   # même si fn() lève : jamais d'enfants laissés en boucle
+            for p in ps:
+                p.join(30)
+                if p.is_alive(): p.kill(); p.join(5)   # jamais d'orphelin qui garderait sw-live.db ouverte
+            def _load(name):
+                try:
+                    with open(os.path.join(d,name)) as f: return json.load(f)
+                except (OSError,ValueError) as e: return {'A':0,'B':0,'bad':1,'err':[f'résultat absent : {e}'],'ok':0}
+            rs=[_load(f'r{i}') for i in range(readers)]
+            wr=_load('w') if writer else None
+            return res,rs,wr
+        def _swap_readers():
+            """Lecteurs éphémères et persistants, WAL servi non vide : jamais de mélange ni d'erreur ; tous
+            (persistants compris) voient la nouvelle base ensuite ; integrity_check ok."""
+            live=os.path.join(tmp,'sw-live.db'); new=os.path.join(tmp,'sw-new.db')
+            lc=_swap_mk(live,'A',3000); lc.execute("PRAGMA wal_autocheckpoint=0")
+            lc.executemany("INSERT INTO w VALUES(?)",[(i,) for i in range(1500)]); lc.commit()  # frames laissés dans le WAL
+            nc=_swap_mk(new,'B',9000); nc.execute("PRAGMA wal_checkpoint(TRUNCATE)"); nc.close()
+            wal_before=os.path.getsize(live+'-wal')
+            res,rs,_=_swap_run(lambda: _swap_db(live,new,pages=64)); lc.close()
+            c=sqlite3.connect(live); fin=c.execute("SELECT count(*),(SELECT gen FROM meta) FROM t").fetchone()
+            ic=c.execute("PRAGMA integrity_check").fetchone()[0]; c.close()
+            return (wal_before>0 and res=='ok' and all(r['bad']==0 and not r['err'] and r['B']>0 for r in rs)
+                    and fin==(9000,'B') and ic=='ok' and not os.path.exists(new))
+        check("bascule : lecteurs éphémères et persistants, WAL non vide -> jamais de mélange, tous sur la nouvelle base",_swap_readers)
+        def _swap_writer_kept():
+            """Écrivain persistant actif pendant des compactages répétés : aucun commit perdu (changed() annule
+            une bascule qui écraserait une écriture faite après la copie)."""
+            live=os.path.join(tmp,'sw-live.db'); lc=_swap_mk(live,'A',3000)
+            lc.executemany("INSERT INTO t(v) VALUES(?)",[('X'*40,)]*6000); lc.commit()
+            lc.execute("DELETE FROM t WHERE v=?",('X'*40,)); lc.commit()   # pages libres : le compactage a du travail
+            lc.execute("PRAGMA wal_autocheckpoint=0"); lc.execute("INSERT INTO meta VALUES('A')"); lc.execute("DELETE FROM meta WHERE rowid>1"); lc.commit()
+            wal0=os.path.getsize(live+'-wal')   # WAL servi non vide au départ (lc reste ouverte jusqu'à la fin)
+            outs=[]
+            def _vacs():
+                for _ in range(5): outs.append(BorgHelper._vacuum_db(None,live,verbose=False))
+                return outs
+            err=io.StringIO()
+            with contextlib.redirect_stderr(err): _,rs,wr=_swap_run(_vacs,readers=4,writer=True)
+            lc.close(); c=sqlite3.connect(live); n=c.execute("SELECT count(*) FROM w").fetchone()[0]; ic=c.execute("PRAGMA integrity_check").fetchone()[0]
+            jm=c.execute("PRAGMA journal_mode").fetchone()[0]; c.close()
+            ok=(wal0>0 and wr['ok']>0 and not wr['err'] and n==wr['ok'] and ic=='ok' and jm=='wal' and any(outs)
+                and all(r['bad']==0 and not r['err'] for r in rs))
+            if not ok: print(f"     détail : commits={wr['ok']} en base={n} erreurs écrivain={wr['err'][:2]} integrity={ic} "
+                             f"mode={jm} compactages={outs} lecteurs={[(r['bad'],r['err'][:1]) for r in rs]} "
+                             f"messages={err.getvalue().strip().splitlines()[:3]}")
+            return ok
+        check("bascule : WAL non vide, 4 lecteurs + écrivain persistant, 5 compactages -> aucun commit perdu, lecteurs cohérents",_swap_writer_kept)
+        def _swap_abort():
+            """abort() vrai (priority.lock) -> copie annulée : ancienne base intacte, fichier de travail supprimé."""
+            live=os.path.join(tmp,'sw-live.db'); new=os.path.join(tmp,'sw-new.db')
+            _swap_mk(live,'A',3000).close(); _swap_mk(new,'B',9000).close()
+            calls=[0]
+            def _ab(): calls[0]+=1; return calls[0]>=2
+            res=_swap_db(live,new,pages=16,abort=_ab)
+            c=sqlite3.connect(live); g=c.execute("SELECT gen FROM meta").fetchone()[0]; ic=c.execute("PRAGMA integrity_check").fetchone()[0]; c.close()
+            return res=='abort' and g=='A' and ic=='ok' and not os.path.exists(new)
+        check("bascule : annulation (opération prioritaire) -> ancienne base intacte, fichier de travail supprimé",_swap_abort)
+        def _swap_kill():
+            """kill -9 au milieu de la copie (tranches ralenties : > 1 s au total, kill à 0,3 s) -> base servie
+            intacte (ancienne, complète) ; un reste .vacuum_tmp est nettoyé par le compactage suivant."""
+            live=os.path.join(tmp,'sw-live.db'); new=os.path.join(tmp,'sw-new.db')
+            _swap_mk(live,'A',3000).close(); _swap_mk(new,'B',9000).close()
+            marker=live+'.started'
+            if os.path.exists(marker): os.unlink(marker)
+            def _child():
+                def _slow():   # appelé après chaque tranche : marque le début réel de la copie, puis la ralentit
+                    open(marker,'a').close(); time.sleep(0.05); return False
+                _swap_db(live,new,pages=4,abort=_slow); os._exit(0)
+            p=_fork.Process(target=_child); p.start(); time.sleep(0.3); os.kill(p.pid,9); p.join(10)
+            started=os.path.exists(marker) and os.path.exists(new)  # copie commencée (1re tranche passée), pas finie (new pas encore supprimée)
+            c=sqlite3.connect(live); g=c.execute("SELECT gen FROM meta").fetchone()[0]; n=c.execute("SELECT count(*) FROM t").fetchone()[0]
+            ic=c.execute("PRAGMA integrity_check").fetchone()[0]; c.close()
+            coherent=started and (g,n)==('A',3000) and ic=='ok'
+            with open(live+'.vacuum_tmp','w') as f: f.write('reste')   # reste d'un compactage tué (ancien nom <= 1.0.137)
+            with open(f"{live}.vacuum_tmp.999999999",'w') as f: f.write('reste')   # reste d'un processus disparu
+            ok_vac=BorgHelper._vacuum_db(None,live,verbose=False)
+            return coherent and ok_vac and not os.path.exists(live+'.vacuum_tmp') and not os.path.exists(f"{live}.vacuum_tmp.999999999")
+        check("bascule : kill -9 pendant la copie -> base servie cohérente ; reste .vacuum_tmp nettoyé ensuite",_swap_kill)
+        def _swap_vacuum_enc():
+            """Compactage d'une base chiffrée : fichier plus petit, WAL, en-tête de chiffrement intact."""
+            bdb=BorgHelperDB(tmp,'swe'); p=os.path.join(tmp,'swe-diff.db'); bdb.ensure_diff_db(p)
+            c=_open_db(p,nick=None,role='admin'); _enc_header_write(c,_enc_header_build('pw','siv1','light')[0]); c.commit()
+            h0=_enc_header_read(c)
+            c.executemany("INSERT INTO db_meta VALUES(?,?)",[(f'pad{i}','x'*2000) for i in range(3000)]); c.commit()
+            c.execute("DELETE FROM db_meta WHERE key LIKE 'pad%'"); c.commit(); c.close()
+            s0=os.path.getsize(p); ok=BorgHelper._vacuum_db(None,p,verbose=False)
+            c=_open_db(p,nick=None,role='admin'); h1=_enc_header_read(c); jm=c.execute("PRAGMA journal_mode").fetchone()[0]; c.close()
+            return ok and os.path.getsize(p)<s0//2 and jm=='wal' and h1==h0 and h0 is not None
+        check("bascule : compactage d'une base chiffrée -> plus petite, WAL, en-tête intact",_swap_vacuum_enc)
+        def _swap_vacuum_priority():
+            """_vacuum_db avec un priority.lock d'un autre processus -> compactage reporté, False, message, base
+            intacte (même taille, même contenu), aucun reste .vacuum_tmp."""
+            import types as _types
+            p=os.path.join(tmp,'swp-diff.db'); c=_swap_mk(p,'A',3000)
+            c.executemany("INSERT INTO t(v) VALUES(?)",[('X'*40,)]*6000); c.commit(); c.execute("DELETE FROM t WHERE v=?",('X'*40,)); c.commit(); c.close()
+            s0=os.path.getsize(p)
+            fake=_types.SimpleNamespace(db=_types.SimpleNamespace(check_priority_lock=lambda n: True))
+            out=io.StringIO()
+            with contextlib.redirect_stderr(out): ok=BorgHelper._vacuum_db(fake,p,verbose=False,nick='swp')
+            c=sqlite3.connect(p); n=c.execute("SELECT count(*) FROM t").fetchone()[0]; c.close()
+            return (ok is False and 'opération prioritaire' in out.getvalue() and os.path.getsize(p)==s0 and n==3000
+                    and not os.path.exists(p+'.vacuum_tmp'))
+        check("bascule : _vacuum_db sous priority.lock d'un autre processus -> reporté, message, base intacte",_swap_vacuum_priority)
+        def _swap_changed():
+            """Écriture d'une autre connexion après la préparation de la copie -> 'changed', ligne conservée,
+            copie supprimée ; _vacuum_db qui voit toujours un changement -> deux essais puis False + message."""
+            live=os.path.join(tmp,'sw-live.db'); new=os.path.join(tmp,'sw-new.db')
+            _swap_mk(live,'A',3000).close(); _swap_mk(new,'B',9000).close()
+            watch=sqlite3.connect(live); v0=watch.execute("PRAGMA data_version").fetchone()[0]
+            def _chg():
+                w=sqlite3.connect(live,timeout=0.2)
+                try: w.execute("INSERT INTO w VALUES(42)"); w.commit()
+                except sqlite3.OperationalError: pass   # verrou déjà tenu par la copie : écriture impossible, donc rien d'écrasé
+                finally: w.close()
+                return watch.execute("PRAGMA data_version").fetchone()[0]!=v0
+            # l'écriture doit passer AVANT la copie pour prouver la détection : faite ici, puis contrôle au 1er rappel
+            w=sqlite3.connect(live); w.execute("INSERT INTO w VALUES(42)"); w.commit(); w.close()
+            res=_swap_db(live,new,pages=16,changed=lambda: watch.execute("PRAGMA data_version").fetchone()[0]!=v0)
+            watch.close()
+            c=sqlite3.connect(live); kept=c.execute("SELECT count(*) FROM w WHERE x=42").fetchone()[0]; g=c.execute("SELECT gen FROM meta").fetchone()[0]; c.close()
+            calls=[]; saved=globals()['_swap_db']
+            globals()['_swap_db']=lambda *a,**k: (calls.append(1), os.unlink(a[1]), 'changed')[2]
+            out=io.StringIO()
+            try:
+                with contextlib.redirect_stderr(out): okv=BorgHelper._vacuum_db(None,live,verbose=False)
+            finally: globals()['_swap_db']=saved
+            return (res=='changed' and kept==1 and g=='A' and not os.path.exists(new)
+                    and okv is False and len(calls)==2 and 'base modifiée' in out.getvalue())
+        check("bascule : écriture après préparation -> 'changed', rien d'écrasé ; _vacuum_db : 2 essais puis reporté",_swap_changed)
+        def _swap_self_lock():
+            """Situation de Prune : ce processus tient priority.lock du nick -> _vacuum_db compacte quand même (verrou
+            réel, exception du PID courant), sans message « opération prioritaire »."""
+            import types as _types
+            dbx=BorgHelperDB(tmp,'psl',cfg_reader=lambda n: {'BORG_REPO':'/r-psl'})
+            p=os.path.join(tmp,'psl-diff.db'); c=_swap_mk(p,'A',3000)
+            c.executemany("INSERT INTO t(v) VALUES(?)",[('X'*40,)]*6000); c.commit(); c.execute("DELETE FROM t WHERE v=?",('X'*40,)); c.commit(); c.close()
+            s0=os.path.getsize(p); dbx.set_priority_lock('psl')
+            try:
+                held=os.path.exists(dbx._priority_lock_path('psl'))
+                out=io.StringIO()
+                with contextlib.redirect_stderr(out): ok=BorgHelper._vacuum_db(_types.SimpleNamespace(db=dbx),p,verbose=False,nick='psl')
+            finally: dbx.clear_priority_lock('psl')
+            return held and ok is True and os.path.getsize(p)<s0 and 'opération prioritaire' not in out.getvalue()
+        check("bascule : priority.lock de ce processus (Prune) -> compactage effectué, pas de report",_swap_self_lock)
+        def _swap_invalid_busy():
+            """Copie absente ou vide -> 'invalid', base servie intacte et jamais vidée ; base verrouillée en écriture
+            -> abort() sondé pendant l'attente ('abort' en quelques secondes) et busy_limit respecté ('busy')."""
+            live=os.path.join(tmp,'sw-live.db'); new=os.path.join(tmp,'sw-new.db')
+            _swap_mk(live,'A',3000).close()
+            for f in (new,new+'-wal',new+'-shm'):
+                if os.path.exists(f): os.unlink(f)
+            r_missing=_swap_db(live,new); created=os.path.exists(new)
+            open(new,'w').close(); r_empty=_swap_db(live,new)
+            c=sqlite3.connect(live); intact=c.execute("SELECT count(*),(SELECT gen FROM meta) FROM t").fetchone()==(3000,'A'); c.close()
+            _swap_mk(new,'B',9000).close()
+            hold=sqlite3.connect(live,isolation_level=None); hold.execute("BEGIN IMMEDIATE")
+            try:
+                calls=[0]; t0=time.monotonic()
+                r_abort=_swap_db(live,new,pages=16,abort=lambda: (calls.__setitem__(0,calls[0]+1) or calls[0]>=2)); t_abort=time.monotonic()-t0
+                _swap_mk(new,'B',9000).close(); t0=time.monotonic()
+                r_busy=_swap_db(live,new,pages=16,busy_limit=2); t_busy=time.monotonic()-t0
+            finally: hold.execute("ROLLBACK"); hold.close()
+            return (r_missing=='invalid' and not created and r_empty=='invalid' and intact
+                    and r_abort=='abort' and t_abort<10 and r_busy=='busy' and t_busy<10)
+        check("bascule : copie absente/vide -> refusée, base intacte ; base verrouillée -> annulable, busy_limit respecté",_swap_invalid_busy)
         def _plain_anomaly():
             """db_plain_anomalies (1.0.134, badge UI) : base en clair + DB_ENCRYPT actif + passphrase -> anomalie ;
             DB_ENCRYPT=false, sans passphrase, base chiffrée, base absente -> jamais."""

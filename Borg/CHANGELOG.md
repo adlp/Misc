@@ -1,5 +1,41 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.138 — bascule de base sûre (API backup), compactage sans perte d'écriture — 2026-09-27
+
+Chantier « reconstruction progressive », story 1 (AD-6 amendé).
+
+- Nouvelle fonction unique `_swap_db` pour remplacer une base servie : copie par l'API backup de SQLite, par tranches,
+  puis checkpoint. Un lecteur voit l'ancienne base ou la nouvelle, jamais un mélange ; les connexions déjà ouvertes
+  voient la nouvelle ; les écritures sont conservées. Annulable si un Bkp/Restore/Prune démarre.
+- `_vacuum_db` (après `Prune` et `IdxPurge`) l'utilise au lieu de `os.replace`. Mesuré : avec un WAL non vide,
+  `os.replace` faisait rejouer l'ancien WAL sur la nouvelle base (lectures en erreur, ancien contenu réapparu).
+- Correction au passage : une écriture faite par un autre processus entre la copie et le remplacement était écrasée
+  sans message. Le compactage est désormais reporté (une nouvelle tentative) si la base a changé entre-temps.
+- La copie de compactage porte le PID (`.vacuum_tmp.<pid>`) : deux compactages simultanés (IdxPurge et Prune ne
+  partagent aucun verrou) ne peuvent plus supprimer la copie l'un de l'autre, ce qui aurait fait recopier une base
+  vide sur la base servie. `_swap_db` refuse de toute façon une copie absente, vide ou d'une seule page. Les restes
+  orphelins (processus disparu, ancien nom `.vacuum_tmp`) sont nettoyés au compactage suivant.
+- Base verrouillée par un écrivain au moment de la copie : l'annulation (Bkp qui démarre) reste sondée pendant
+  l'attente, et l'attente est bornée (`busy`, 120 s). Les checkpoints de fin et de début de compactage n'attendent plus
+  (un `TRUNCATE` en attente bloque les nouveaux écrivains, jusqu'à 60 s si un lecteur était en cours).
+- Compactage reporté d'emblée si une opération prioritaire est déjà en cours (pas de copie inutile). Chemin passé en
+  paramètre à `VACUUM INTO` (un répertoire de cache contenant une apostrophe faisait échouer le compactage).
+- `priority.lock` est écrit de façon atomique : lu pile entre sa troncature et son écriture, il pouvait être pris pour
+  un verrou orphelin et supprimé, faisant perdre sa protection à un Bkp (défaut ancien, exposé davantage par la bascule
+  qui le sonde à chaque tranche).
+- Erreurs de fichier (`OSError`) du compactage rattrapées : elles ne font plus échouer Prune/IdxPurge après la purge.
+- Procédure manuelle de LIBRARY.md corrigée : le `mv` (dangereux sur une base ouverte) est remplacé par une recopie
+  par l'API backup ; le conseil « mv » affiché en cas d'échec est retiré.
+- Coût : pendant la copie, le disque porte la base servie + son WAL + la copie ; les écritures attendent la fin
+  (100 Mo : environ 0,5 s).
+- `CodecSelfTest` 354/354 : lecteurs éphémères et persistants avec WAL non vide ; WAL non vide + 4 lecteurs + écrivain
+  persistant pendant 5 compactages (aucun commit perdu) ; écriture après préparation → `changed`, rien d'écrasé, deux
+  essais puis report ; annulation ; compactage sous `priority.lock` d'un autre processus (reporté) et de ce processus
+  (effectué, cas de Prune) ; copie absente ou vide refusée ; base verrouillée : annulable, attente bornée ; kill -9 au
+  milieu de la copie ; compactage d'une base chiffrée. Revue en trois couches (29 constats triés, voir la spec de story). Vérifié aussi en
+  fonctionnement : borgHelperWWW interrogé en boucle pendant un `IdxPurge` de 200 000 entrées (75 → 21 Mo), 20/20
+  réponses correctes.
+
 ## borgHelperWWW 1.27.7 — un `sys.exit` de borgHelper dans une route n'arrête plus le serveur — 2026-09-27
 
 Suite de 1.27.6, qui protégeait le watcher.
