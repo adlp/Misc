@@ -643,8 +643,15 @@ ces entrées portent `"deleted":true,"last_seen_archive":"<archive>"` en plus de
 1.0.126, auparavant seuls les fichiers supprimés apparaissaient) ; les entrées non
 supprimées gardent une forme JSON strictement inchangée.
 
+**Changements entre deux sauvegardes (`-X`, depuis 1.0.133)** : seules les entrées qui ont changé **après** `-b` (exclue :
+c'est l'état de départ) et **jusqu'à** `-B` (incluse) — fichier ajouté, modifié ou supprimé (type réel : fichier,
+répertoire, lien, fifo…), répertoire dès qu'un changement a eu lieu n'importe où en dessous. Une entrée supprimée dans la
+plage est marquée `supprimé` (JSON : `deleted`, `last_seen_archive` = archive à restaurer). Sans `-b` : depuis le début ;
+sans `-B` : jusqu'à la dernière archive. Source : l'index des différences (`Index`) — une paire non indexée n'y figure pas.
+
 ```bash
 borgHelper -c TreeHist -n mon-serveur                        # contenu direct de la racine
+borgHelper -c TreeHist -f /etc -n mon-serveur -b srv-2026-09-01 -B srv-2026-09-27 -X   # ce qui a changé sous /etc
 borgHelper -c TreeHist -f /etc -n mon-serveur -b ALL          # contenu direct de /etc, tout l'historique
 borgHelper -c TreeHist -f /var/lib/docker -n ALL -b ALL
 ```
@@ -1482,6 +1489,12 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
      « dernière archive », qui échouerait — le fichier n'y est plus). Un dossier entièrement supprimé
      reste explorable normalement (son ancien contenu s'affiche).
    - **Clic sur un dossier** : l'ouvre (contenu direct, comme `TreeHist -f <dossier>`).
+   - **Affichage « Changements entre deux sauvegardes »** (UI ≥ 1.16.0) : sélecteur au-dessus de la liste, puis deux
+     listes d'archives — « Depuis » (état de départ, exclue) et « Jusqu'à » (incluse). Seules les entrées ajoutées,
+     modifiées ou supprimées entre les deux s'affichent (`TreeHist -X`) ; un dossier apparaît dès qu'un changement a
+     eu lieu en dessous, et on y descend en restant dans ce mode. Par défaut : de l'avant-dernière à la dernière
+     sauvegarde. Raccourci : bouton **🔀 Changements** de l'Historique complet (depuis la sauvegarde précédente jusqu'à
+     celle-là). Téléchargement d'une entrée supprimée : archive de dernière présence présélectionnée.
    - **Clic droit sur un dossier** : télécharge un `.tar` de cette arborescence, à une archive
      choisissable dans une liste déroulante (`borg export-tar`, streamé directement au navigateur).
    - **Clic sur un fichier** : le télécharge, à une archive choisissable (streamé directement, jamais
@@ -1547,6 +1560,7 @@ montrer exactement ce dont on parle.
 | `/explorer/<nick>` | Explorateur, racine |
 | `/explorer/<nick>/<chemin…>` | Explorateur, répertoire `<chemin>` |
 | `/explorer/<nick>/<chemin…>?archive=<nom>` | Explorateur épinglé sur une archive (depuis l'Historique) |
+| `/explorer/<nick>/<chemin…>?depuis=<A>&jusqua=<B>` | Explorateur, changements entre deux sauvegardes (UI ≥ 1.16.0) |
 | `/historique/<nick>` | Historique complet |
 | `/notifications` | Réglages des notifications |
 
@@ -1707,7 +1721,7 @@ servi comme une réponse obsolète.
 | POST | `/index` | Index | |
 | GET | `/search` | Search | ✓ |
 | GET | `/filehist` | FileHist | ✓ |
-| GET | `/treehist` | TreeHist | ✓ |
+| GET | `/treehist` | TreeHist (`changes=true` → `-X`, changements entre `archive_from` exclue et `archive_to`, borgHelperWWW ≥ 1.27.0) | ✓ |
 | GET | `/treefind` | TreeFind | ✓ |
 | GET | `/duidx` | DuIdx | ✓ |
 | GET | `/cacheinfo` | CacheInfo | ✓ |

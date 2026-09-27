@@ -64,7 +64,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.26.8"
+WWW_VERSION="1.27.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -2652,6 +2652,7 @@ def filehist(nick: str, path: str, request: Request, archive_from: Optional[str]
 
 @router.get("/treehist",response_model=CommandResult,tags=["lecture"],summary="Pour chaque objet sous un préfixe : archives où il a changé")
 def treehist(nick: str, request: Request, prefix: Optional[str]=None, archive_from: Optional[str]=None, archive_to: Optional[str]=None,
+             changes: bool=False,
              json_output: bool=Query(default=False,alias="json"), x_api_key: Optional[str]=Header(default=None)):
     """Réponse filtrée par périmètre, par nick, sur `full_path`, si au moins un nick de `nick` a un
     périmètre restreint pour l'appelant (force JSON même sans `?json=true`) ; identique à avant
@@ -2663,12 +2664,13 @@ def treehist(nick: str, request: Request, prefix: Optional[str]=None, archive_fr
     if prefix: extra+=['-f',prefix]
     if archive_from: extra+=['-b',archive_from]
     if archive_to: extra+=['-B',archive_to]
+    if changes: extra.append('-X')  # 1.27.0 : seulement ce qui a changé entre archive_from (exclue) et archive_to
     nicks=_nick_list(nick)
     scopes=_resolve_scopes_for_request(request,nicks)
     if _any_scoped(scopes):
         # 'ancestors' : fait partie de la clé du cache par périmètre — invalide les réponses mises en
         # cache avant 1.19.1 (filtrage strict, sans les répertoires parents du périmètre).
-        params={'prefix':prefix,'archive_from':archive_from,'archive_to':archive_to,'ancestors':1}
+        params={'prefix':prefix,'archive_from':archive_from,'archive_to':archive_to,'changes':changes,'ancestors':1}
         return _scoped_cached_multi('treehist',nick,nicks,scopes,fingerprints,params,
             lambda:_run_scoped('treehist',nick,extra,lambda data:_filter_treehist(data,scopes)))
     if json_output: extra.append('-j')

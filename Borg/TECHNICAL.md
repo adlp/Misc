@@ -1082,6 +1082,33 @@ redémarrage. Jamais à chaque requête ; erreur SQLite ignorée (pur cache).
 balayage plus grand que la borne, le vidage complet jetait aussi les préfixes chauds, recalculés aussitôt. Coût
 amorti O(1) par insertion ; aucune incidence sur la vérification (une entrée n'est mémorisée qu'après validation).
 
+### TreeHist -X : changements entre deux archives (1.0.133 / borgHelperWWW 1.27.0 / UI 1.16.0)
+
+`_treehist_changes(n, prefix, conn, archive_from, archive_to)` — source : `diff_index` seul (les paires indexées),
+jamais le snapshot (qui ne donne que droits/propriétaire, dernier état connu). Plage `archive_new_date > date(A)` et
+`<= date(B)` : A est l'état de départ, ses propres changements (paire qui la produit) sont exclus. `_archive_date` lit
+la date de l'archive ELLE-MÊME (archive_stats, sinon diff_index.archive_new, sinon archive_snapshot) — pas
+`_diff_archive_filter._date_of`, qui peut renvoyer la date de l'archive suivante (ligne où elle est `archive_old`).
+Archive inconnue ou A non antérieure à B : `{'error': …}`.
+
+Mêmes principes que la piste 2 : valeur stockée, `skip = len(préfixe stocké)+1`, `rest = substr(path, skip+1)`. Deux
+requêtes : enfants directs (`instr(rest,'/')=0`) avec leurs événements propres (chronologiques), et
+`substr(rest,1,instr(rest,'/')-1), archive_new, MIN(date) … GROUP BY 1,2` pour les enfants ayant des changements
+plus profonds (événements synthétiques `modified` pour les archives sans événement propre, comme TreeHist). Un
+décodage par enfant affiché. Type : snapshot si l'entrée existe encore, sinon `_diff_entry_type` du dernier
+événement propre ; `deleted`/`last_seen_archive` si ce dernier événement est une suppression. Parité clair/chiffré
+contrôlée par `CodecSelfTest`.
+
+borgHelperWWW : `/treehist?changes=true` → `-X`, `changes` dans la clé du cache par périmètre (le contrôle de
+couverture de 1.26.7 l'impose). Filtrage par périmètre inchangé (`_filter_treehist`, sur `full_path`) ; un
+répertoire parent du périmètre apparaît en mode changements s'il a eu un changement en dessous (éventuellement hors
+périmètre), réduit à une entrée de navigation nue comme en mode normal.
+
+UI : état `browseChanges={from,to}` (exclusif de `browseArchive`), adresse `?depuis=A&jusqua=B` (les deux bornes ou
+rien ; prioritaire sur `?archive=`), titre `🗂 nick:/chemin (A → B)`. Archives proposées : clés du `Report` hors
+ligne (index, ordre chronologique), en cache par serveur. Tests : routeur Node (39 cas), parcours Chrome headless
+(10 contrôles) sur un dépôt borg de test.
+
 ### Sentry : erreurs logicielles et alertes opérationnelles seulement (1.0.132 / borgHelperWWW 1.26.8)
 
 `_sentry_init(dsn, release)` (source unique, CLI et borgHelperWWW) : plus de `traces_sample_rate` — le `1.0` précédent

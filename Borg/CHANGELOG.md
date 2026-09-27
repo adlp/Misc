@@ -1,5 +1,22 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.133 / borgHelperWWW 1.27.0 / borgHelperWWW_ui.html 1.16.0 — explorateur : changements entre deux sauvegardes — 2026-09-27
+
+Demande utilisateur : dans l'explorateur, n'afficher que les fichiers qui ont changé (ou disparu) entre deux
+sauvegardes choisies.
+
+- Explorateur web : affichage **« Changements entre deux sauvegardes »**, avec « Depuis » (état de départ, exclue) et
+  « Jusqu'à » (incluse). Seules les entrées ajoutées, modifiées ou supprimées s'affichent, avec leurs événements ; un
+  dossier apparaît dès qu'un changement a eu lieu en dessous et on y descend en restant dans ce mode. Par défaut :
+  avant-dernière → dernière sauvegarde. Bouton **🔀 Changements** dans l'Historique complet (depuis la sauvegarde
+  précédente). Mode reflété dans l'adresse (`?depuis=A&jusqua=B`) et le titre de l'onglet.
+- CLI : `TreeHist -X` (avec `-b`/`-B`), même résultat. Rapide aussi en base chiffrée (un décodage par entrée
+  affichée). Erreur claire si une archive est inconnue ou si les bornes sont inversées.
+- borgHelperWWW : `/treehist?changes=true`, compris dans la clé du cache par périmètre.
+- Vérifié : `CodecSelfTest` 342/342 (sémantique + parité clair/chiffré), `push_selftest` 79/79, routeur UI 39/39,
+  parcours Chrome headless 10/10 sur un dépôt borg de test (fichier, répertoire, lien, fifo), non-régression des
+  parcours précédents.
+
 ## borgHelper 1.0.132 / borgHelperWWW 1.26.8 — Sentry : erreurs logicielles et alertes demandées seulement — 2026-09-27
 
 Demande utilisateur : Sentry ne doit recevoir que les erreurs logicielles, plus un réglage pour être alerté d'une

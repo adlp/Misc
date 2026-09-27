@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.15.0 -->
+<!-- UI_VERSION: 1.16.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -189,6 +189,23 @@
         <h2 id="browseTitle" style="margin:0"></h2>
       </div>
       <div id="browseBreadcrumb" class="pill" style="margin-bottom:10px"></div>
+      <div class="row" style="margin-bottom:10px;align-items:flex-end">
+        <div class="field" style="margin-bottom:0">
+          <label for="browseModeSelect">Affichage</label>
+          <select id="browseModeSelect">
+            <option value="all">Tout le contenu</option>
+            <option value="changes">Changements entre deux sauvegardes</option>
+          </select>
+        </div>
+        <div class="field" id="browseFromField" style="margin-bottom:0" hidden>
+          <label for="browseFromSelect">Depuis (état de départ)</label>
+          <select id="browseFromSelect"></select>
+        </div>
+        <div class="field" id="browseToField" style="margin-bottom:0" hidden>
+          <label for="browseToSelect">Jusqu'à (incluse)</label>
+          <select id="browseToSelect"></select>
+        </div>
+      </div>
       <div class="row" style="margin-bottom:10px;align-items:flex-end">
         <div class="field" style="flex:1;min-width:220px;margin-bottom:0">
           <label for="browseSearchInput">Rechercher (à partir d'ici, récursif — <code>*</code> = n'importe quoi, <code>.</code> = littéral ; sans <code>*</code> = sous-chaîne)</label>
@@ -631,6 +648,7 @@ function _renderHistoryRows(backups,withActions){
     const deleteBtn=allowDestructive?`<button class="danger hist-delete-btn" data-archive="${escapeAttr(a)}">🗑 Supprimer</button>`:'';
     const actionsTd=withActions?`<td class="hist-actions">
         <button class="secondary hist-explore-btn" data-archive="${escapeAttr(a)}">🗂 Explorer</button>
+        <button class="secondary hist-changes-btn" data-archive="${escapeAttr(a)}" title="Explorer seulement ce qui a changé depuis la sauvegarde précédente">🔀 Changements</button>
         ${deleteBtn}
       </td>`:'';
     return `<tr><td>${escapeHtml(a)}</td><td>${escapeHtml(b.duration||'—')}</td>`
@@ -942,6 +960,11 @@ function _renderArchiveExtraChart(id,r){
 document.getElementById('historyBody').addEventListener('click', e=>{
   const exBtn=e.target.closest('.hist-explore-btn');
   if(exBtn){ openBrowseAtArchive(currentNick,exBtn.dataset.archive); return; }
+  const chBtn=e.target.closest('.hist-changes-btn');
+  if(chBtn){  // depuis la sauvegarde précédente jusqu'à celle-ci (UI 1.16.0)
+    currentNick=currentNick; browseNick=currentNick; browsePath=''; browseArchive=null; browseChanges=null;
+    showView('view-browse'); enterChangesMode(null,chBtn.dataset.archive); return;
+  }
   const delBtn=e.target.closest('.hist-delete-btn');
   if(delBtn){ deleteArchive(currentNick,delBtn.dataset.archive,delBtn); return; }
 });
@@ -1181,11 +1204,13 @@ let browseNick=null;
 let browsePath='';
 let browseEntriesByPath={};
 let browseArchive=null;
+let browseChanges=null;  // mode « changements » (UI 1.16.0) : {from,to} — exclusif de browseArchive
 
 function openBrowse(){
   browseNick=currentNick;
   browsePath='';
   browseArchive=null;
+  browseChanges=null;
   showView('view-browse');
   loadBrowse();
 }
@@ -1194,9 +1219,63 @@ function openBrowseAtArchive(nick,archive){
   browseNick=nick;
   browsePath='';
   browseArchive=archive;
+  browseChanges=null;
   showView('view-browse');
   loadBrowse();
 }
+
+// ── Mode « changements entre deux sauvegardes » (UI 1.16.0) ─────────────────────────────────
+// Archives proposées : celles de l'index (Report hors ligne, comme l'Historique — pas borg en direct),
+// ordre chronologique, mises en cache par serveur pour la session de la page.
+const browseArchivesCache={};
+async function browseArchiveList(nick){
+  if(browseArchivesCache[nick]) return browseArchivesCache[nick];
+  const r=await apiCall('GET','/report',{nick,json:'true',offline:'true'},false);
+  let list=[];
+  try{ list=Object.keys((JSON.parse(r.stdout).backups||{})[nick]||{}).filter(k=>k!=='Prunable'&&k!=='Totaux'); }catch(e){}
+  if(list.length) browseArchivesCache[nick]=list;
+  return list;
+}
+function _fillArchiveSelect(sel,list,value){
+  sel.innerHTML=list.slice().reverse().map(a=>`<option value="${escapeAttr(a)}">${escapeHtml(a)}</option>`).join('');
+  if(value && !list.includes(value)){  // archive venue d'une adresse, absente de la liste : la garder visible
+    const o=document.createElement('option'); o.value=value; o.textContent=value; sel.insertBefore(o,sel.firstChild);
+  }
+  if(value) sel.value=value;
+}
+function syncBrowseModeControls(){
+  const on=!!browseChanges;
+  document.getElementById('browseModeSelect').value=on?'changes':'all';
+  document.getElementById('browseFromField').hidden=!on;
+  document.getElementById('browseToField').hidden=!on;
+  if(!on) return;
+  const nick=browseNick;
+  browseArchiveList(nick).then(list=>{
+    if(nick!==browseNick || !browseChanges) return;
+    _fillArchiveSelect(document.getElementById('browseFromSelect'),list,browseChanges.from);
+    _fillArchiveSelect(document.getElementById('browseToSelect'),list,browseChanges.to);
+  });
+}
+// Ouvre (ou garde) le mode changements ; sans bornes fournies : de l'avant-dernière à la dernière archive.
+async function enterChangesMode(from,to){
+  const list=await browseArchiveList(browseNick);
+  if(list.length<2 && !(from&&to)){
+    document.getElementById('browseError').textContent="Au moins deux archives indexées sont nécessaires pour comparer.";
+    syncBrowseModeControls(); return;
+  }
+  to=to||list[list.length-1];
+  if(!from){ const i=list.indexOf(to); from=list[Math.max(0,(i>0?i:list.length-1)-1)]; }
+  browseArchive=null; browseChanges={from,to}; loadBrowse();
+}
+document.getElementById('browseModeSelect').addEventListener('change',e=>{
+  if(e.target.value==='changes') enterChangesMode();
+  else{ browseChanges=null; loadBrowse(); }
+});
+['browseFromSelect','browseToSelect'].forEach(id=>document.getElementById(id).addEventListener('change',()=>{
+  const from=document.getElementById('browseFromSelect').value, to=document.getElementById('browseToSelect').value;
+  if(from===to){ document.getElementById('browseError').textContent='Choisir deux sauvegardes différentes.'; return; }
+  browseChanges={from,to}; loadBrowse();
+}));
 
 function renderBreadcrumb(){
   const el=document.getElementById('browseBreadcrumb');
@@ -1222,10 +1301,16 @@ async function loadBrowse(){
   // retour à un autre serveur) — sans ça, une réponse tardive peut afficher le contenu d'un AUTRE
   // répertoire ou d'un AUTRE serveur que celui actuellement affiché à l'écran.
   const seq=++browseLoadSeq;
-  const reqNick=browseNick, reqPath=browsePath, reqArchive=browseArchive;
+  const reqNick=browseNick, reqPath=browsePath, reqArchive=browseArchive, reqChanges=browseChanges;
   syncUrl();
+  syncBrowseModeControls();
   const hint=document.getElementById('browsePinnedHint');
-  if(reqArchive){
+  if(reqChanges){
+    document.getElementById('browseTitle').textContent=reqNick+' — changements '+reqChanges.from+' → '+reqChanges.to+' — '+(reqPath||'/');
+    hint.hidden=false;
+    hint.textContent="Changements entre deux sauvegardes : seules les entrées ajoutées, modifiées ou supprimées APRÈS « "
+      +reqChanges.from+" » et jusqu'à « "+reqChanges.to+" » (incluse) sont affichées ; un dossier apparaît dès qu'un changement a eu lieu en dessous. Droits/propriétaire = dernier état connu.";
+  }else if(reqArchive){
     document.getElementById('browseTitle').textContent=reqNick+' — archive '+reqArchive+' — '+(reqPath||'/');
     hint.hidden=false;
     hint.textContent="Vue épinglée sur l'archive "+reqArchive+" : seuls les événements de cette sauvegarde sont affichés (droits/genre/propriétaire = dernier état connu, pas forcément celui de cette archive).";
@@ -1239,7 +1324,8 @@ async function loadBrowse(){
   // archive_from=ALL (sauf vue épinglée) : pour que chaque entrée porte son historique complet
   // (nécessaire pour ne proposer au téléchargement que les archives où le fichier a réellement bougé).
   const params={nick:reqNick,prefix:reqPath,json:'true'};
-  if(reqArchive){ params.archive_from=reqArchive; params.archive_to=reqArchive; }
+  if(reqChanges){ params.archive_from=reqChanges.from; params.archive_to=reqChanges.to; params.changes='true'; }
+  else if(reqArchive){ params.archive_from=reqArchive; params.archive_to=reqArchive; }
   else{ params.archive_from='ALL'; }
   const r=await apiCall('GET','/treehist',params,false);
   if(seq!==browseLoadSeq) return; // une navigation plus récente a eu lieu entre-temps : on ignore
@@ -1260,12 +1346,20 @@ async function loadBrowse(){
   browseEntriesByPath={};
   entries.forEach(e=>{ browseEntriesByPath[e.full_path]=e; });
   const tbody=document.getElementById('browseBody');
-  if(entries.length===0){ tbody.innerHTML='<tr><td colspan="5" class="hint">Répertoire vide</td></tr>'; return; }
+  if(entries.length===0){
+    tbody.innerHTML=`<tr><td colspan="5" class="hint">${reqChanges?'Aucun changement ici entre ces deux sauvegardes.':'Répertoire vide'}</td></tr>`;
+    return;
+  }
   tbody.innerHTML=entries.map(e=>{
     // Entrée supprimée (diff_index, plus dans le dernier snapshot) : toujours affichée — jamais
     // "recoverable" ailleurs que via l'archive last_seen_archive — mais marquée distinctement.
     const lastEv=e.events && e.events.length ? e.events[e.events.length-1] : null;
-    const evText=e.deleted ? `supprimé (dernière présence : ${escapeHtml(e.last_seen_archive||'?')})`
+    // Mode changements : tous les événements de la plage (3 au plus, puis « … »), suppression en tête.
+    const evList=(e.events||[]).slice(-3).map(v=>`${escapeHtml(v.type)} (${escapeHtml(v.archive)})`).join(', ')
+      +((e.events||[]).length>3?' …':'');
+    const evText=reqChanges
+      ? (e.deleted ? `supprimé (dernière présence : ${escapeHtml(e.last_seen_archive||'?')}) — ` : '')+evList
+      : e.deleted ? `supprimé (dernière présence : ${escapeHtml(e.last_seen_archive||'?')})`
       : (lastEv ? `${escapeHtml(lastEv.type)} (${escapeHtml(lastEv.archive)})` : '—');
     const icon=e.is_dir?'📁':'📄';
     // scope_ancestor : répertoire parent de votre périmètre RBAC (GROUPS_PATHS), affiché pour pouvoir
@@ -1750,7 +1844,8 @@ function routePath(st){
     case 'view-browse':
       return '/explorer/'+e(st.nick)
         +(st.path?'/'+String(st.path).split('/').filter(Boolean).map(e).join('/'):'')
-        +(st.archive?'?archive='+e(st.archive):'');
+        +(st.changes?'?depuis='+e(st.changes.from)+'&jusqua='+e(st.changes.to)
+          :st.archive?'?archive='+e(st.archive):'');
     default: return null;  // connexion : l'adresse ne change pas
   }
 }
@@ -1766,7 +1861,7 @@ function pageTitle(st){
     case 'view-notifications': return '🔔 Notifications — '+app;
     case 'view-browse':
       return '🗂 '+st.nick+':/'+String(st.path||'').split('/').filter(Boolean).join('/')
-        +(st.archive?' @ '+st.archive:'')+' — '+app;
+        +(st.changes?' ('+st.changes.from+' → '+st.changes.to+')':st.archive?' @ '+st.archive:'')+' — '+app;
     default: return app;
   }
 }
@@ -1779,8 +1874,11 @@ function parseRoute(pathname,search){
   if(head==='serveur' && nick && segs.length===2) return {view:'view-detail',nick};
   if(head==='historique' && nick && segs.length===2) return {view:'view-history',nick};
   if(head==='notifications' && segs.length===1) return {view:'view-notifications'};
-  if(head==='explorer' && nick)
-    return {view:'view-browse',nick,path:rest.join('/'),archive:new URLSearchParams(search||'').get('archive')||null};
+  if(head==='explorer' && nick){
+    const q=new URLSearchParams(search||''), from=q.get('depuis'), to=q.get('jusqua');
+    const changes=(from&&to)?{from,to}:null;   // les deux bornes ou rien (UI 1.16.0)
+    return {view:'view-browse',nick,path:rest.join('/'),archive:changes?null:(q.get('archive')||null),changes};
+  }
   return {view:'view-machines',invalid:true};
 }
 
@@ -1788,7 +1886,7 @@ let routeApplying=false;  // vrai pendant qu'une adresse est rejouée : aucune n
 let routeSeq=0;           // numéro de la dernière application d'adresse / navigation utilisateur
 function currentRouteState(){
   return {view:currentViewId,nick:currentViewId==='view-browse'?browseNick:currentNick,
-          path:browsePath,archive:browseArchive};
+          path:browsePath,archive:browseArchive,changes:browseChanges};
 }
 function currentRoutePath(){ return routePath(currentRouteState()); }
 function syncUrl(){
@@ -1838,7 +1936,7 @@ async function applyRoute(){
       case 'view-history': openHistory(r.nick); break;
       case 'view-notifications': openNotifications(); break;
       case 'view-browse':
-        currentNick=r.nick; browseNick=r.nick; browsePath=r.path; browseArchive=r.archive;
+        currentNick=r.nick; browseNick=r.nick; browsePath=r.path; browseArchive=r.archive; browseChanges=r.changes;
         showView('view-browse'); loadBrowse(); break;
       default: showMachines();
     }

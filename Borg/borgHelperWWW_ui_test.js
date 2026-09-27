@@ -39,8 +39,8 @@ function roundTrip(name,st){
   const u=routePath(st);
   const url=new URL(u,'https://h');
   const p=parseRoute(url.pathname,url.search);
-  eq(name+' ['+u+']',{view:p.view,nick:p.nick,path:p.path,archive:p.archive},
-     {view:st.view,nick:st.nick,path:st.path,archive:st.archive});
+  eq(name+' ['+u+']',{view:p.view,nick:p.nick,path:p.path,archive:p.archive,changes:p.changes??null},
+     {view:st.view,nick:st.nick,path:st.path,archive:st.archive,changes:st.changes??null});
 }
 
 // État -> adresse
@@ -54,10 +54,17 @@ eq('racine',parseRoute('/',''),{view:'view-machines'});
 eq('serveur',parseRoute('/serveur/srv',''),{view:'view-detail',nick:'srv'});
 eq('historique',parseRoute('/historique/secret',''),{view:'view-history',nick:'secret'});
 eq('notifications',parseRoute('/notifications',''),{view:'view-notifications'});
-eq('explorateur, racine',parseRoute('/explorer/srv',''),{view:'view-browse',nick:'srv',path:'',archive:null});
-eq('explorateur, répertoire',parseRoute('/explorer/srv/etc/nginx',''),{view:'view-browse',nick:'srv',path:'etc/nginx',archive:null});
+eq('explorateur, racine',parseRoute('/explorer/srv',''),{view:'view-browse',nick:'srv',path:'',archive:null,changes:null});
+eq('explorateur, répertoire',parseRoute('/explorer/srv/etc/nginx',''),{view:'view-browse',nick:'srv',path:'etc/nginx',archive:null,changes:null});
 eq('archive épinglée',parseRoute('/explorer/srv/etc','?archive=srv-2026-09-01T0200'),
-   {view:'view-browse',nick:'srv',path:'etc',archive:'srv-2026-09-01T0200'});
+   {view:'view-browse',nick:'srv',path:'etc',archive:'srv-2026-09-01T0200',changes:null});
+// Mode changements (UI >= 1.16.0)
+eq('changements : adresse',routePath({view:'view-browse',nick:'srv',path:'etc',archive:null,changes:{from:'a 1',to:'a#2'}}),
+   '/explorer/srv/etc?depuis=a%201&jusqua=a%232');
+eq('changements : lecture',parseRoute('/explorer/srv/etc','?depuis=a%201&jusqua=a%232'),
+   {view:'view-browse',nick:'srv',path:'etc',archive:null,changes:{from:'a 1',to:'a#2'}});
+eq('changements prioritaires sur archive',parseRoute('/explorer/srv','?archive=x&depuis=a&jusqua=b').changes,{from:'a',to:'b'});
+eq('changements : une seule borne ignorée',parseRoute('/explorer/srv','?depuis=a').changes,null);
 eq('nick avec / relu',parseRoute('/serveur/a%2Fb',''),{view:'view-detail',nick:'a/b'});
 
 // Adresses invalides -> liste (l'UI remplace l'adresse par /)
@@ -68,6 +75,7 @@ for(const bad of ['/xyz','/explorer','/explorer/','/serveur','/serveur/a/b','/hi
 // Aller-retour d'encodage (espace, é, #, ?, &, =, %)
 roundTrip('encodage explorateur',{view:'view-browse',nick:'srv é #1',path:'mes docs/été #?/a&b=c%20',archive:'arch #?&=é'});
 roundTrip('encodage historique',{view:'view-history',nick:'n ?#é'});
+roundTrip('encodage changements',{view:'view-browse',nick:'s é',path:'a b/c#',archive:null,changes:{from:'x&y=z ?',to:'é/2'}});
 roundTrip('encodage serveur',{view:'view-detail',nick:'n:x %'});
 roundTrip('explorateur racine sans archive',{view:'view-browse',nick:'srv',path:'',archive:null});
 
@@ -80,6 +88,7 @@ eq('titre historique',pageTitle({view:'view-history',nick:'srv'}),'📜 srv — 
 eq('titre notifications',pageTitle({view:'view-notifications'}),'🔔 Notifications'+T);
 eq('titre explorateur racine',pageTitle({view:'view-browse',nick:'srv',path:'',archive:null}),'🗂 srv:/'+T);
 eq('titre explorateur répertoire',pageTitle({view:'view-browse',nick:'srv',path:'/etc//nginx/',archive:null}),'🗂 srv:/etc/nginx'+T);
+eq('titre explorateur changements',pageTitle({view:'view-browse',nick:'srv',path:'etc',archive:null,changes:{from:'a1',to:'a2'}}),'🗂 srv:/etc (a1 → a2)'+T);
 eq('titre explorateur archive',pageTitle({view:'view-browse',nick:'srv',path:'etc',archive:'srv-2026'}),'🗂 srv:/etc @ srv-2026'+T);
 
 console.log(fail?fail+' FAIL':'TOUT OK');

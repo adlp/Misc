@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.132"
+Version="1.0.133"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -446,7 +446,7 @@ def usage(doc=None,debug=0):
         printer("       -b : depuis archive X  |  -B : jusqu'à archive Y  |  -b ALL : tout l'index  |  -j : JSON")
         printer("   -c FileHist -f <chemin> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-j]")
         printer("       Historique des changements d'un chemin exact  |  -j : JSON")
-        printer("   -c TreeHist [-f <préfixe>] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-j]")
+        printer("   -c TreeHist [-f <préfixe>] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-X] [-j]")
         printer("       Un seul tableau : contenu DIRECT de <préfixe> (racine si omis, lui-même en '.'),")
         printer("       toujours en entier — pas de descente dans les sous-répertoires. Colonnes genre")
         printer("       (répertoire/fichier/lien symbolique/…) + droits unix + propriétaire (dernier état")
@@ -567,7 +567,7 @@ def usage(doc=None,debug=0):
         printer("       Historique complet des changements d'un chemin exact")
         printer("       -j : sortie JSON {nick:[{date,archive_before,archive_after,type,size_before,size_after},...]} par nick")
     elif doc=='treehist':
-        printer("   -c TreeHist [-f <préfixe>] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-j]")
+        printer("   -c TreeHist [-f <préfixe>] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-X] [-j]")
         printer("       Un seul tableau : contenu DIRECT de <préfixe> (racine entière si omis) uniquement —")
         printer("       jamais le contenu d'un sous-répertoire (relancer avec -f pointant dessus pour y")
         printer("       descendre). Le répertoire courant apparaît lui-même en '.'. Toujours l'intégralité")
@@ -586,6 +586,8 @@ def usage(doc=None,debug=0):
         printer("       added/removed sur un répertoire ne concernent QUE son entrée à lui (ex. 'added")
         printer("       directory') — un mouvement interne quelconque remonte en 'modified' générique")
         printer("       -j : sortie JSON {nick:{path,archive,entries:[{name,full_path,genre,mode,owner,is_dir,events}]}}")
+        printer("       -X : SEULEMENT ce qui a changé entre -b (exclue) et -B (incluse) — ajouté, modifié,")
+        printer("            supprimé (deleted/last_seen_archive) ; répertoire si un changement a eu lieu dessous")
     elif doc=='treefind':
         printer("   -c TreeFind [-f <préfixe>] -m <motif> [-n nickname/servername/ALL] [-j]")
         printer("       Recherche récursive PAR NOM (pas le chemin complet) sous <préfixe> (racine entière")
@@ -4191,7 +4193,102 @@ class BorgHelper:
         print(t)
         return None
 
-    def treehist(self,nick,prefix=None,archive_from=None,archive_to=None,debug=0,as_json=False):
+    @staticmethod
+    def _archive_date(conn,n,archive):
+        """Date d'UNE archive (sa propre date, jamais celle de l'archive suivante — contrairement au
+        _date_of de _diff_archive_filter, qui peut renvoyer la date de la paire dont elle est l'ancienne) :
+        archive_stats, sinon diff_index (archive_new), sinon archive_snapshot. None si inconnue."""
+        for sql in ("SELECT archive_date FROM archive_stats WHERE nick=? AND archive=?",
+                    "SELECT archive_new_date FROM diff_index WHERE nick=? AND archive_new=? LIMIT 1",
+                    "SELECT archive_date FROM archive_snapshot WHERE nick=? AND archive=? LIMIT 1"):
+            row=conn.execute(sql,(n,archive)).fetchone()
+            if row and row[0]: return row[0]
+        return None
+
+    def _treehist_changes(self,n,prefix,conn,archive_from=None,archive_to=None,as_json=False):
+        """Mode « changements » de TreeHist (-X, 1.0.133) : SEULS les enfants directs de <prefix> qui ont changé
+        entre archive_from (EXCLUE : on compare depuis son contenu) et archive_to (INCLUSE) — fichier ajouté,
+        modifié ou supprimé ; répertoire dès qu'un changement a eu lieu n'importe où en dessous (événements
+        synthétiques 'modified' comme TreeHist). Sans archive_from (ou ALL) : depuis le début ; sans archive_to :
+        jusqu'à la dernière archive. Source : diff_index seul (paires indexées) — jamais le snapshot, qui ne sert
+        qu'aux droits/propriétaire (dernier état connu). Base chiffrée : même mécanique que la piste 2 (SQLite
+        sépare enfants directs et descendants sur la valeur stockée, un décodage par entrée affichée).
+        Entrée supprimée dans la plage (dernier événement propre = suppression) : deleted/last_seen_archive."""
+        prefix=_norm_lp(prefix)
+        rng=[]; rprm=[]
+        for label,arch,op in (('depuis',archive_from,'>'),('jusqu\'à',archive_to,'<=')):
+            if arch and arch!='ALL':
+                d=self._archive_date(conn,n,arch)
+                if d is None:
+                    msg=f"archive inconnue de l'index ({label}) : {arch}"
+                    if as_json: return {'error':msg}
+                    print(f"{n}: {msg}"); return None
+                rng.append(f"archive_new_date{op}?"); rprm.append(d)
+        if len(rprm)==2 and rprm[0]>=rprm[1]:
+            msg=f"{archive_from} n'est pas antérieure à {archive_to}"
+            if as_json: return {'error':msg}
+            print(f"{n}: {msg}"); return None
+        rsql=''.join(' AND '+c for c in rng)
+        stored_prefix=(conn.codec.path.encode(prefix) if conn.codec else prefix) if prefix else ''
+        skip=len(stored_prefix)+1 if stored_prefix else 0
+        usql,uprm,_=_psel_under(conn,prefix)
+        rest=f"substr(path,{skip+1})"
+        base=f"FROM diff_index WHERE nick=?{_wh(usql)}{rsql}"
+        bprm=[n]+uprm+rprm
+        def _name(stored_child):
+            lp=_path_decode(conn,stored_child)
+            return lp[len(prefix)+1:] if prefix else lp
+        own={}   # stored -> [(change_type,archive_old,archive_new,date,size_before)] (chronologique)
+        for stored,ct,a_old,a_new,d,sb in conn.execute(
+                f"SELECT path,change_type,archive_old,archive_new,archive_new_date,size_before {base} AND instr({rest},'/')=0 "
+                "ORDER BY archive_new_date,id",bprm):
+            own.setdefault(stored,[]).append((ct,a_old,a_new,d,sb))
+        deep={}  # segment stocké de l'enfant -> {archive_new: date}
+        for seg,a_new,d in conn.execute(
+                f"SELECT substr({rest},1,instr({rest},'/')-1),archive_new,MIN(archive_new_date) {base} AND instr({rest},'/')>0 "
+                "GROUP BY 1,2",bprm):
+            deep.setdefault(seg,{})[a_new]=d
+        row=conn.execute("SELECT archive FROM archive_snapshot_v WHERE nick=? ORDER BY archive_date DESC LIMIT 1",(n,)).fetchone()
+        latest=row[0] if row else None
+        def _snap(full):
+            if latest is None: return None
+            return conn.execute("SELECT type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=? AND path=?",
+                                (n,latest,_path_stored(conn,full))).fetchone()
+        entries=[]
+        for key in set(own)|{(f"{stored_prefix}/{g}" if stored_prefix else g) for g in deep}:
+            name=_name(key)
+            if not name: continue
+            full=f"{prefix}/{name}" if prefix else name
+            seg=key[skip:]
+            evs=[{'type':ct,'archive':a_new,'date':(d or '')[:19]} for ct,_o,a_new,d,_s in own.get(key,[])]
+            seen={e['archive'] for e in evs}
+            evs+=[{'type':'modified','archive':a,'date':(d or '')[:19]} for a,d in deep.get(seg,{}).items() if a not in seen]
+            evs.sort(key=lambda e:e['date'])
+            last_own=own[key][-1] if key in own else None
+            snap=_snap(full)
+            etype=(snap[0] if snap and snap[0] else None) or (_diff_entry_type(last_own[0],last_own[4]) if last_own else None)
+            is_dir=seg in deep or etype=='d'
+            if is_dir and etype is None: etype='d'
+            e={'name':name,'full_path':full,'genre':_TREEHIST_GENRES.get(etype,'inconnu'),
+               'mode':snap[1] if snap else None,'owner':snap[2] if snap else None,'is_dir':is_dir,'events':evs}
+            if last_own and last_own[0] in _DIFF_REMOVED_TYPES:
+                e['deleted']=True; e['last_seen_archive']=last_own[1]
+            entries.append(e)
+        entries.sort(key=lambda e:e['name'])
+        if as_json:
+            return {'path':prefix,'archive':latest,'changes':{'from':archive_from,'to':archive_to},'entries':entries}
+        from prettytable import PrettyTable
+        t=PrettyTable(['nom','genre','type','archive','date']); t.align['nom']='l'; t.align['archive']='l'
+        for e in entries:
+            for ev in e['events']:
+                t.add_row([e['name']+('/' if e['is_dir'] else ''),e['genre'],
+                           ev['type']+(' (supprimé)' if e.get('deleted') and ev is e['events'][-1] else ''),ev['archive'],ev['date']])
+        print(f"{n}: {prefix or '/'} — changements {archive_from or 'début'} → {archive_to or 'dernière archive'} "
+              f"({len(entries)} entrée(s))")
+        if entries: print(t)
+        return None
+
+    def treehist(self,nick,prefix=None,archive_from=None,archive_to=None,debug=0,as_json=False,changes=False):
         # Contenu DIRECT de <prefix> (racine si omis) uniquement — jamais le contenu d'un
         # sous-répertoire. Liste toujours tout le répertoire courant (fichiers/sous-répertoires
         # présents, même sans événement dans la plage demandée), pas seulement ce qui a changé.
@@ -4207,7 +4304,10 @@ class BorgHelper:
                 continue
             try:
                 conn=_open_db(db_path,nick=n,role='read')
-                result=self._treehist_listing(n,prefix,conn,archive_from=archive_from,archive_to=archive_to,debug=debug,as_json=as_json)
+                if changes:  # -X (1.0.133) : seulement ce qui a changé entre -b (exclue) et -B (incluse)
+                    result=self._treehist_changes(n,prefix,conn,archive_from=archive_from,archive_to=archive_to,as_json=as_json)
+                else:
+                    result=self._treehist_listing(n,prefix,conn,archive_from=archive_from,archive_to=archive_to,debug=debug,as_json=as_json)
                 if as_json: results[n]=result
                 conn.close()
             except DbCodecError as e:
@@ -6060,6 +6160,25 @@ def codec_selftest():
                 return True
             check("CLI, base chiffrée + passphrase fausse : code 2 + [ERREUR] DbKeyError avec le nick, aucune trace Python",
                   _cli_wrong_passphrase)
+            def _treehist_changes_ok():
+                """TreeHist -X (1.0.133) : seulement ce qui a changé APRÈS -b et jusqu'à -B ; supprimé = deleted +
+                last_seen_archive ; répertoire si changement dessous ; sorties identiques en clair et chiffré."""
+                _q_build('qe',True)
+                def get(nick,prefix,a,b):
+                    out=_q_run(bhq.treehist,nick,prefix,archive_from=a,archive_to=b,as_json=True,changes=True)
+                    return json.loads(out)[nick]
+                cases=[(None,A1,A2),('etc',A1,A2),('etc',A2,A3),('etc',A1,A3),('a%b',A1,A3),('home/u',A1,A2),('etc',A3,A1),('etc','inconnue',A3)]
+                same=all(json.dumps(get('qp',*c),sort_keys=True)==json.dumps(get('qe',*c),sort_keys=True) for c in cases)
+                e12={x['name']:x for x in get('qp','etc',A1,A2)['entries']}
+                e23={x['name']:x for x in get('qp','etc',A2,A3)['entries']}
+                root={x['name']:x for x in get('qp',None,A1,A2)['entries']}
+                return (same and set(e12)=={'gone.conf','new.LOG','passwd'}
+                        and e12['gone.conf'].get('deleted') and e12['gone.conf']['last_seen_archive']==A1
+                        and [v['type'] for v in e12['passwd']['events']]==['modified'] and not e12['new.LOG'].get('deleted')
+                        and set(e23)=={'passwd'} and 'a%b' not in root and root['etc']['is_dir']
+                        and root['a_b'].get('deleted') and root['a_b']['is_dir']
+                        and 'error' in get('qp','etc',A3,A1) and 'error' in get('qp','etc','inconnue',A3))
+            check("TreeHist -X : changements entre deux archives (bornes, supprimés, répertoires, erreurs), identique clair/chiffré",_treehist_changes_ok)
             check("plans (etc) sur connexion chiffrée : aucun LIKE/GLOB, aucun ORDER BY portant sur un chemin",
                   lambda: traced and not [q for q in traced if re.search(r'\bLIKE\b|\bGLOB\b|ORDER BY[^\n]*\bpath\b',q)])
         finally:
@@ -7342,7 +7461,7 @@ def _cli_main():
         _sentry_init(sentryid)
 
     try:
-        opts,args=getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILC:FSN:ox:DP:RyK",["help"])
+        opts,args=getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILC:FSN:ox:DP:RyKX",["help"])
     except getopt.GetoptError as err:
         print(err); usage(); sys.exit(2)
     if args:
@@ -7380,7 +7499,7 @@ def _cli_main():
            'delbkp':'Ccdnb','bkp':'CcdnI','prune':'Ccdn','report':'CcdnlNjo',
            'init':'Ccdn','key':'Ccdn','index':'CcdnFSA','search':'CcdnfbBj',
            'filehist':'CcdnfbBj','cacheinfo':'Ccdn','cacheclean':'Ccdn','duidx':'CcdnfbBsjR',
-           'idxtop':'CcdnNpj','difftop':'CcdnNpbj','idxpurge':'CcdnxD','treehist':'CcdnfbBj',
+           'idxtop':'CcdnNpj','difftop':'CcdnNpbj','idxpurge':'CcdnxD','treehist':'CcdnfbBjX',
            'treefind':'Ccdnfmj','dbencrypt':'CcdnDy','dbdecrypt':'CcdnDy','dbrekey':'Ccdny','dbstatus':'Ccdn',
            'repohistory':'Ccdnj','archivehistory':'Ccdnj','status':'Ccdnj'}
     optab={k:v+'P' for k,v in optab.items()}
@@ -7489,7 +7608,8 @@ def _cli_main():
         if '-f' not in options: usage(cmd)
         bh.filehist(nick,options['-f'],archive_from=options.get('-b',None),archive_to=options.get('-B',None),debug=debug,as_json=('-j' in options))
     elif cmd=='treehist':
-        bh.treehist(nick,options.get('-f',None),archive_from=options.get('-b',None),archive_to=options.get('-B',None),debug=debug,as_json=('-j' in options))
+        bh.treehist(nick,options.get('-f',None),archive_from=options.get('-b',None),archive_to=options.get('-B',None),debug=debug,as_json=('-j' in options),
+                    changes=('-X' in options))
     elif cmd=='treefind':
         bh.treefind(nick,options.get('-f',None),options.get('-m',None),debug=debug,as_json=('-j' in options))
     elif cmd=='duidx':
