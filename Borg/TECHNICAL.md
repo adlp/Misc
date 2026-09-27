@@ -2528,6 +2528,16 @@ tant que le vrai continue d'émettre cet avertissement). Un futur nettoyage natu
 `--numeric-owner` de `_borg_extract_args` (déprécié par `borg` lui-même) — hors périmètre de cette
 story, non traité ici.
 
+> **Remplacé en borgHelperWWW 1.27.5** (deferred-work, point 8, option D) : plus aucune réponse synthétique ni
+> constante recopiée (`_synth_*`, `_oos_last_archive_line`, `_RESTORE_NUMERIC_OWNER_WARNING`, `_empty_tar_bytes`
+> supprimés). Hors périmètre, les quatre routes exécutent la vraie commande sur un leurre (`_oos_decoy` : `.bh-absent-`
+> + 64 bits aléatoires, `/*` ajouté si le chemin demandé contient un joker, pour emprunter la même branche de
+> `_borg_extract_args`), puis `_oos_swap` remplace le leurre par le chemin demandé dans `stdout`/`stderr`
+> (téléchargements : nom de fichier toujours tiré du chemin demandé). Indiscernable par construction, temps compris.
+> Constat qui l'a motivé : pour un joker, depuis la réparation de 1.0.122, la vraie réponse est code 0 sans
+> « never matched », l'imitation code 1 avec — la dérive redoutée ci-dessus s'était produite. Contrôle
+> `push_selftest` : vraie réponse d'un chemin absent vs hors périmètre (chemin existant), 4 routes, avec/sans joker.
+
 ## `bkp_status` et watcher — détection de fin de sauvegarde (`borgHelper` 1.0.110 / `borgHelperWWW` 1.18.0, Story 1 + Story 2b de `spec-notifications-push`)
 
 Préalable à l'envoi de notifications push (Story 2b, câblée — voir [Envoi push réel](#envoi-push-réel-story-2b) plus bas) :
