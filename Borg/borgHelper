@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.139"
+Version="1.0.140"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -740,7 +740,33 @@ _HISTORY_SCHEMA="""
         read_errors           INTEGER,
         PRIMARY KEY (nick, archive, archive_date)
     );
+    CREATE TABLE IF NOT EXISTS archive_chart (
+        nick                  TEXT NOT NULL,
+        archive               TEXT NOT NULL,
+        archive_date          TEXT NOT NULL,
+        duration              REAL,
+        original_size         INTEGER,
+        compressed_size       INTEGER,
+        deduplicated_size     INTEGER,
+        nfiles                INTEGER,
+        files_added           INTEGER,
+        files_modified        INTEGER,
+        files_removed         INTEGER,
+        changed_during_backup INTEGER,
+        read_errors           INTEGER,
+        gone                  INTEGER NOT NULL DEFAULT 0,
+        frozen_at             TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (nick, archive, archive_date)
+    );
 """
+# Erreurs d'une base qui font renoncer au rapprochement sans arrêter Index (rien retiré) : SQLite, codec (chiffrée sans
+# clé, mode changé par DbEncrypt en cours), et SystemExit de _db_open_fail/_db_schema_fail sur history.db.
+_RECONCILE_ERRORS=(sqlite3.Error,SystemExit,DbKeyError,DbModeError,DbTamperError,DbCodecError)
+# archive_chart (1.0.140, AD-7 amendé) : ligne de graphique figée d'une archive par le rapprochement avant sa purge
+# (gone=1), ou seuls les comptages de fichiers d'une archive restante dont la paire entrante est retirée (gone=0).
+# Gardée STATS_RETENTION_MONTHS, que l'archive existe encore ou non. Ajout pur : HISTORY_DB_SCHEMA_VERSION inchangé.
+_CHART_FIELDS=('duration','original_size','compressed_size','deduplicated_size','nfiles',
+               'files_added','files_modified','files_removed','changed_during_backup','read_errors')
 
 def _history_path_for(diff_path):
     """history.db jumelle d'une diff.db : '<conf>-<nick>-diff.db' -> '<conf>-<nick>-history.db' (autre nom de
@@ -2164,6 +2190,47 @@ class BorgHelperDB:
         try: return self._with_lock_retry(_do)
         except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return 0
 
+    def freeze_archive_chart(self,nick,rows,db_path=None):
+        """Fige des lignes de graphique dans history.db (1.0.140, AD-7 amendé) — rows : dicts avec 'archive',
+        'archive_date' (non vide, sinon ignorée), 'gone' (bool) et tout ou partie de _CHART_FIELDS. Une valeur
+        figée non nulle n'est jamais écrasée par une valeur nulle ; gone ne repasse jamais à 0. Purge ensuite les
+        lignes plus anciennes que STATS_RETENTION_MONTHS. Lève sqlite3.Error : l'appelant ne purge rien si le figeage
+        a échoué (ordre figer puis purger, AD-9). Retourne le nombre de lignes écrites."""
+        rows=[r for r in rows if r.get('archive_date')]
+        if not rows: return 0
+        db_path=self._hist(nick,db_path,create=True)
+        cols=','.join(_CHART_FIELDS)
+        upd=','.join(f"{c}=COALESCE(excluded.{c},{c})" for c in _CHART_FIELDS)
+        months=int(self._stats_retention_months(nick))
+        def _do():
+            conn=_open_db(db_path,nick=None,role='write')
+            try:
+                conn.executemany(
+                    f"INSERT INTO archive_chart (nick,archive,archive_date,{cols},gone) VALUES (?,?,?,{','.join('?'*len(_CHART_FIELDS))},?) "
+                    f"ON CONFLICT(nick,archive,archive_date) DO UPDATE SET {upd},gone=MAX(gone,excluded.gone),frozen_at=datetime('now')",
+                    [(nick,r['archive'],r['archive_date'])+tuple(r.get(c) for c in _CHART_FIELDS)+(1 if r.get('gone') else 0,) for r in rows])
+                conn.execute("DELETE FROM archive_chart WHERE nick=? AND archive_date < "
+                             f"strftime('%Y-%m-%dT%H:%M:%S','now','-{months} months')",(nick,))
+                conn.commit(); return len(rows)
+            finally: conn.close()
+        return self._with_lock_retry(_do)
+
+    def get_archive_chart(self,nick,db_path=None):
+        """Lignes figées d'archive_chart dans la rétention STATS_RETENTION_MONTHS (bornée aussi à la lecture) :
+        [{'archive','archive_date',*_CHART_FIELDS,'gone'}], [] si history.db ou la table est absente."""
+        db_path=self._hist(nick,db_path)
+        if db_path is None: return []
+        try:
+            conn=_open_db(db_path,nick=None,role='read')
+            try:
+                rows=conn.execute(f"SELECT archive,archive_date,{','.join(_CHART_FIELDS)},gone FROM archive_chart WHERE nick=? AND "
+                                  f"archive_date >= strftime('%Y-%m-%dT%H:%M:%S','now','-{int(self._stats_retention_months(nick))} months')",
+                                  (nick,)).fetchall()
+            finally: conn.close()
+        except sqlite3.Error: return []
+        keys=('archive','archive_date')+_CHART_FIELDS+('gone',)
+        return [dict(zip(keys,r)) for r in rows]
+
     # ── bkp_status (Story 1, spec-notifications-push) : exclusif à backup(), jamais Restore/Index/
     # Prune (AD-3). Aucune colonne `path` -> hors du périmètre du codec de chiffrement des chemins,
     # écritures/lectures directes, sans _write_mode_check ni _path_stored.
@@ -2397,9 +2464,17 @@ class BorgHelperDB:
                 rows=conn.execute("SELECT archive_old,archive_new FROM diff_indexed_pairs WHERE nick=? ORDER BY indexed_at DESC",(nick,)).fetchall()
                 to_delete=rows[keep:]
                 if not to_delete: return
+                # 1.0.140 : comptages des archives restantes figés avant de retirer leur paire (graphiques sur
+                # STATS_RETENTION_MONTHS) ; échec du figeage -> sqlite3.Error, rien purgé.
+                try: self.freeze_archive_chart(nick,self._chart_counts(nick,conn,{a_new for _,a_new in to_delete}),
+                                               _history_path_for(db_path))
+                except SystemExit: raise sqlite3.OperationalError("history.db indisponible — DIFF_KEEP reporté")
                 for a_old,a_new in to_delete:
                     conn.execute("DELETE FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
                     conn.execute("DELETE FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
+                    # 1.0.140 : exclus de la paire aussi — restés seuls, ils donnaient des comptages partiels non nuls
+                    # qui masquaient les comptages figés.
+                    conn.execute("DELETE FROM diff_excluded_stats WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
                 conn.commit()
                 print(f"{nick}: DIFF_KEEP={keep} — {len(to_delete)} paire(s) ancienne(s) purgées")
             finally: conn.close()
@@ -2439,15 +2514,26 @@ class BorgHelperDB:
     def _cleanup_snapshot_file_orphans(self,nick,conn):
         conn.execute("DELETE FROM snapshot_file WHERE nick=? AND id NOT IN (SELECT file_id FROM archive_snapshot WHERE nick=?)",(nick,nick))
 
-    def _diff_stats_for_nick(self,nick):
+    def _diff_stats_for_nick(self,nick,archives=None,conn=None):
+        """archives (1.0.140) : restreint aux archives nouvelles données (index (nick, archive_new)) — figeage du
+        rapprochement. conn : connexion de l'appelant, les erreurs SQLite remontent alors au lieu de rendre {}."""
+        own=conn is None
         try:
-            db_path=self.get_diff_db(nick)
-            conn=_open_db(db_path,nick=nick,role='read')
-            # Paires indexées (même si entries=0 — tous exclus ou aucun changement)
-            indexed=conn.execute("SELECT DISTINCT archive_new FROM diff_indexed_pairs WHERE nick=?",(nick,)).fetchall()
-            rows=conn.execute("SELECT archive_new,change_type,COUNT(*),SUM(size_after),SUM(size_before) FROM diff_index WHERE nick=? GROUP BY archive_new,change_type",(nick,)).fetchall()
-            exclu_rows=conn.execute("SELECT archive_new,change_type,SUM(file_count),SUM(total_size) FROM diff_excluded_stats WHERE nick=? GROUP BY archive_new,change_type",(nick,)).fetchall()
-            conn.close()
+            if own: conn=_open_db(self.get_diff_db(nick),nick=nick,role='read')
+            try:
+                if archives is None:
+                    # Paires indexées (même si entries=0 — tous exclus ou aucun changement)
+                    indexed=conn.execute("SELECT DISTINCT archive_new FROM diff_indexed_pairs WHERE nick=?",(nick,)).fetchall()
+                    rows=conn.execute("SELECT archive_new,change_type,COUNT(*),SUM(size_after),SUM(size_before) FROM diff_index WHERE nick=? GROUP BY archive_new,change_type",(nick,)).fetchall()
+                    exclu_rows=conn.execute("SELECT archive_new,change_type,SUM(file_count),SUM(total_size) FROM diff_excluded_stats WHERE nick=? GROUP BY archive_new,change_type",(nick,)).fetchall()
+                else:
+                    indexed=[]; rows=[]; exclu_rows=[]
+                    for a in archives:
+                        indexed+=conn.execute("SELECT DISTINCT archive_new FROM diff_indexed_pairs WHERE nick=? AND archive_new=?",(nick,a)).fetchall()
+                        rows+=conn.execute("SELECT archive_new,change_type,COUNT(*),SUM(size_after),SUM(size_before) FROM diff_index WHERE nick=? AND archive_new=? GROUP BY archive_new,change_type",(nick,a)).fetchall()
+                        exclu_rows+=conn.execute("SELECT archive_new,change_type,SUM(file_count),SUM(total_size) FROM diff_excluded_stats WHERE nick=? AND archive_new=? GROUP BY archive_new,change_type",(nick,a)).fetchall()
+            finally:
+                if own: conn.close()
             zero=lambda: {'added':0,'removed':0,'modified':0,'added_sz':0,'removed_sz':0,'modified_sz':0}
             stats={arch:zero() for (arch,) in indexed}
             # 1.0.116 : répertoires/liens ajoutés ou supprimés comptés comme tels (étaient « modifiés »).
@@ -2462,7 +2548,23 @@ class BorgHelperDB:
                 elif ctype in _DIFF_REMOVED_TYPES: stats[arch]['removed']+=cnt; stats[arch]['removed_sz']+=(sz or 0)
                 else: stats[arch]['modified']+=cnt; stats[arch]['modified_sz']+=(sz or 0)
             return stats
-        except Exception: return {}
+        except Exception:
+            if not own: raise
+            return {}
+
+    def _chart_counts(self,nick,conn,archives):
+        """Comptages ajoutés/modifiés/supprimés figeables (mêmes règles qu'ArchiveHistory) d'archives encore en base,
+        datés par archive_stats : [{'archive','archive_date','gone':False,'files_*'}] — archives sans date ignorées."""
+        archives=list(archives)
+        if not archives: return []
+        st=self._diff_stats_for_nick(nick,archives=archives,conn=conn)
+        out=[]
+        for a in archives:
+            if a not in st: continue
+            d=conn.execute("SELECT archive_date FROM archive_stats WHERE nick=? AND archive=?",(nick,a)).fetchone()
+            if d and d[0]: out.append({'archive':a,'archive_date':d[0],'gone':False,'files_added':st[a]['added'],
+                                       'files_modified':st[a]['modified'],'files_removed':st[a]['removed']})
+        return out
 
     def _is_index_empty(self,nick,db_path):
         try:
@@ -3244,49 +3346,157 @@ class BorgHelper:
         hist=self.db.get_history_db(nick)
         printer(f"  {nick}: history.db: {'plain (aucun chemin, jamais chiffrée)' if os.path.exists(hist) else 'absent'}")
 
+    @staticmethod
+    def _known_archives(nick,conn):
+        """Archives citées par diff.db (rapprochement, AD-9). Petites tables lues entières ; diff_index et
+        archive_snapshot par saut d'index (MIN successifs sur (nick, archive_new) / (nick, archive)) : jamais de
+        balayage des grosses tables quand rien n'a disparu."""
+        known=set()
+        for sql in ("SELECT archive FROM archive_stats WHERE nick=?","SELECT archive FROM archive_snapshot_indexed WHERE nick=?",
+                    "SELECT archive FROM snap_excluded_stats WHERE nick=?"):
+            known|={r[0] for r in conn.execute(sql,(nick,))}
+        for sql in ("SELECT archive_old,archive_new FROM diff_indexed_pairs WHERE nick=?",
+                    "SELECT archive_old,archive_new FROM diff_excluded_stats WHERE nick=?"):
+            for o,n in conn.execute(sql,(nick,)): known|={o,n}
+        for tbl,col in (('diff_index','archive_new'),('archive_snapshot','archive')):
+            known|={r[0] for r in conn.execute(
+                f"WITH RECURSIVE s(a) AS (SELECT (SELECT MIN({col}) FROM {tbl} WHERE nick=?1) UNION ALL "
+                f"SELECT (SELECT MIN({col}) FROM {tbl} WHERE nick=?1 AND {col}>s.a) FROM s WHERE s.a IS NOT NULL) "
+                "SELECT a FROM s WHERE a IS NOT NULL",(nick,))}
+        known.discard(None)
+        return known
+
+    def _reconcile_archives(self,nick,db_path,current):
+        """Rapprochement de la base avec la liste courante des archives (CAP-5, AD-9, 1.0.140) — Index (liste déjà
+        obtenue, aucun appel borg de plus) et nettoyage après Prune. Tous les nicks, NOIDX compris.
+        - Liste vide : rien retiré (GLOB_ARCH erroné, dépôt vidé), avertissement si la base connaît des archives.
+        - Archive disparue : retirée de toutes les tables de diff.db (ancienne OU nouvelle archive d'une paire), et ses
+          mesures de history.db ; rien de disparu -> aucune écriture (mtime de diff.db intacte, cache WWW valide).
+        - Figer avant de purger (AD-7 amendé) : ligne de graphique des disparues (gone) et comptages des restantes dont
+          la paire entrante part, dans history.db.archive_chart. Échec du figeage -> rien purgé ; purge interrompue ->
+          rejouée au passage suivant (clé primaire : pas de doublon).
+        - Une seule fois par base et par nick (db_meta 'reconcile_sweep:<nick>', DB_NAME partagée possible) : lignes
+          diff_index héritées sans paire dont une archive a disparu (ancien nettoyage : seule archive_new était testée).
+        - Mesures retirées par liste explicite des disparues (jamais NOT IN la liste : la mesure d'un Bkp écrite après
+          borg list survit).
+        Jamais de compactage ici (Prune/IdxPurge s'en chargent). Base illisible, occupée ou chiffrée sans clé : message,
+        rien retiré, Index continue. Retourne le nombre de lignes retirées de diff.db (décision de compactage)."""
+        current=set(current)
+        hist=_history_path_for(db_path)
+        diff_ok=os.path.exists(db_path) and _db_has_schema(db_path)
+        measures=self.db.get_archive_measures(nick,hist) if os.path.exists(hist) else {}
+        known={k[0] for k in measures}; sweep=False; flag=f'reconcile_sweep:{nick}'
+        try:
+            if diff_ok:
+                conn=_open_db(db_path,nick=nick,role='read')
+                try:
+                    known|=self._known_archives(nick,conn)
+                    sweep=not conn.execute("SELECT 1 FROM db_meta WHERE key=?",(flag,)).fetchone()
+                finally: conn.close()
+        except _RECONCILE_ERRORS as e:
+            printer(f"{nick}: rapprochement impossible ({db_path}) : {e}"); return 0
+        if not current:
+            if known: printer(f"{nick}: borg list ne rend aucune archive alors que la base en connaît {len(known)} — rien retiré (GLOB_ARCH ?)")
+            return 0
+        gone=known-current
+        if not gone and not sweep: return 0
+        # Bkp démarré entre borg list et ici : ses nouvelles archives passeraient pour disparues. Jamais vrai pour
+        # Prune (verrou tenu par ce processus, ignoré par check_priority_lock) ni pour l'Index lancé par Bkp (relâché).
+        if gone and self.db.check_priority_lock(nick):
+            printer(f"{nick}: opération prioritaire en cours — rapprochement reporté"); return 0
+        frozen=[]; orphans=set()
+        try:
+            conn=_open_db(db_path,nick=nick,role='read') if diff_ok else None
+            try:
+                if conn is not None and sweep:
+                    orphans={(o,n) for o,n in conn.execute(
+                        "SELECT DISTINCT archive_old,archive_new FROM diff_index d WHERE nick=? AND NOT EXISTS (SELECT 1 FROM "
+                        "diff_indexed_pairs p WHERE p.nick=d.nick AND p.archive_old=d.archive_old AND p.archive_new=d.archive_new)",
+                        (nick,)) if o not in current or n not in current}
+                counts=self.db._diff_stats_for_nick(nick,archives=gone,conn=conn) if conn is not None and gone else {}
+                for a in sorted(gone):
+                    st=conn.execute("SELECT archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles "
+                                    "FROM archive_stats WHERE nick=? AND archive=?",(nick,a)).fetchone() if conn is not None else None
+                    date=st[0] if st and st[0] else next((k[1] for k in measures if k[0]==a and k[1]),None)
+                    if not date: continue   # ni stats ni mesure datée : aucune place dans un graphique
+                    m=measures.get((a,date)) or measures.get((a,None))
+                    row={'archive':a,'archive_date':date,'gone':True}
+                    if st: row.update(zip(('duration','original_size','compressed_size','deduplicated_size','nfiles'),st[1:]))
+                    if m:
+                        if m['deduplicated_size'] is not None: row['deduplicated_size']=m['deduplicated_size']
+                        row['changed_during_backup']=m['changed_during_backup']; row['read_errors']=m['read_errors']
+                    if a in counts:
+                        row.update(files_added=counts[a]['added'],files_modified=counts[a]['modified'],files_removed=counts[a]['removed'])
+                    frozen.append(row)
+                if conn is not None:
+                    heirs={n for o,n in conn.execute("SELECT archive_old,archive_new FROM diff_indexed_pairs WHERE nick=?",(nick,))
+                           if o in gone and n in current}
+                    heirs|={n for _,n in orphans if n in current}
+                    frozen+=self.db._chart_counts(nick,conn,heirs)
+            finally:
+                if conn is not None: conn.close()
+            self.db.freeze_archive_chart(nick,frozen,hist)
+        except _RECONCILE_ERRORS as e:   # SystemExit : history.db illisible (_db_schema_fail) — Index continue
+            printer(f"{nick}: lignes de graphique non figées ({e}) — rien retiré, nouvel essai au prochain Index"); return 0
+        r=[0]*6
+        if diff_ok and (gone or sweep):
+            def _do():
+                conn=_open_db(db_path,nick=nick,role='write')
+                try:
+                    conn.execute("CREATE TEMP TABLE IF NOT EXISTS _gone (a TEXT PRIMARY KEY)"); conn.execute("DELETE FROM _gone")
+                    conn.executemany("INSERT INTO _gone VALUES (?)",[(a,) for a in gone])
+                    G="(SELECT a FROM _gone)"
+                    pairs=set(conn.execute(f"SELECT archive_old,archive_new FROM diff_indexed_pairs WHERE nick=? AND "
+                                           f"(archive_old IN {G} OR archive_new IN {G})",(nick,)).fetchall())
+                    c=[0]*6
+                    # Lignes par paire (index (nick, archive_new)) : aucun balayage de diff_index sur archive_old.
+                    for o,n in pairs|orphans:
+                        c[0]+=conn.execute("DELETE FROM diff_index WHERE nick=? AND archive_new=? AND archive_old=?",(nick,n,o)).rowcount
+                    c[0]+=conn.execute(f"DELETE FROM diff_index WHERE nick=? AND archive_new IN {G}",(nick,)).rowcount
+                    c[1]=conn.execute(f"DELETE FROM diff_indexed_pairs WHERE nick=? AND (archive_old IN {G} OR archive_new IN {G})",(nick,)).rowcount
+                    c[2]=conn.execute(f"DELETE FROM archive_snapshot WHERE nick=? AND archive IN {G}",(nick,)).rowcount
+                    c[3]=conn.execute(f"DELETE FROM archive_snapshot_indexed WHERE nick=? AND archive IN {G}",(nick,)).rowcount
+                    c[4]=conn.execute(f"DELETE FROM archive_stats WHERE nick=? AND archive IN {G}",(nick,)).rowcount
+                    c[5]=conn.execute(f"DELETE FROM diff_excluded_stats WHERE nick=? AND (archive_old IN {G} OR archive_new IN {G})",(nick,)).rowcount
+                    c[5]+=conn.execute(f"DELETE FROM snap_excluded_stats WHERE nick=? AND archive IN {G}",(nick,)).rowcount
+                    if c[2]: self.db._cleanup_snapshot_file_orphans(nick,conn)
+                    if sweep: conn.execute("INSERT OR REPLACE INTO db_meta VALUES(?,'1')",(flag,))
+                    conn.execute("DROP TABLE _gone")
+                    conn.commit(); return c
+                finally: conn.close()
+            try: r=self.db._with_lock_retry(_do)
+            except _RECONCILE_ERRORS as e:
+                printer(f"{nick}: rapprochement interrompu ({db_path}) : {e} — repris au prochain Index"); return 0
+        nm=0
+        if gone and measures:
+            def _del_measures():
+                c=_open_db(hist,nick=None,role='write')
+                try:
+                    n=sum(c.execute("DELETE FROM archive_measure WHERE nick=? AND archive=?",(nick,a)).rowcount for a in gone)
+                    c.commit(); return n
+                finally: c.close()
+            try: nm=self.db._with_lock_retry(_del_measures)
+            except sqlite3.Error as e: printer(f"{nick}: mesures des archives disparues non retirées ({hist}) : {e}")
+        if gone:
+            print(f"{nick}: {len(gone)} archive(s) disparue(s) retirée(s) ({r[0]} diff, {r[1]} paires, {r[2]}+{r[3]} snapshots, "
+                  f"{r[4]} stats, {nm} mesure(s) ; {sum(1 for f in frozen if f['gone'])} ligne(s) de graphique figée(s))")
+        elif r[0]:
+            print(f"{nick}: {r[0]} ligne(s) de diff orpheline(s) laissée(s) par une version antérieure retirée(s) (nettoyage unique)")
+        return sum(r)
+
     def _cleanup_index_after_prune(self,nick,debug=0):
+        """Nettoyage après Prune : borg list + rapprochement (1.0.140, AD-9), puis compactage si des lignes sont parties.
+        Tous les nicks, NOIDX compris ; une liste vide ne retire plus rien (effaçait tout l'index avant 1.0.140)."""
         db_path=self.db.get_diff_db(nick)
-        index_ok=not self._nick_noidx(nick) and os.path.exists(db_path)
-        # Mesures (history.db, 1.0.139) : purgées aussi pour un nick NOIDX ou sans diff.db (jetable) — rétention AD-7.
-        if not index_ok and not os.path.exists(self.db.get_history_db(nick)): return
-        if index_ok: self.db.ensure_diff_db(db_path)
+        if not os.path.exists(db_path) and not os.path.exists(self.db.get_history_db(nick)): return
+        if os.path.exists(db_path): self.db.ensure_diff_db(db_path)
         cfg=self.borg.cfgreaded(nick,debug=debug)
         rb=self.borg.boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
         try:
             self.borg._boex_check_stdout(rb,nick,'borg list')
         except RuntimeError: return
-        current=set(a['name'] for a in rb['stdout'][0]['archives'])
-        # Jamais de purge des mesures (non régénérables) sur une liste vide : GLOB_ARCH erroné ou dépôt vidé -> rien retiré.
-        if current: self.db.delete_archive_measures(nick,keep=current)
-        if not index_ok: return
-        try:
-            conn=_open_db(db_path,nick=nick,role='write')
-            if current:
-                ph=','.join('?'*len(current)); lst=list(current)
-                r1=conn.execute(f"DELETE FROM diff_index WHERE nick=? AND archive_new NOT IN ({ph})",[nick]+lst).rowcount
-                r2=conn.execute(f"DELETE FROM diff_indexed_pairs WHERE nick=? AND (archive_old NOT IN ({ph}) OR archive_new NOT IN ({ph}))",[nick]+lst+lst).rowcount
-                r3=conn.execute(f"DELETE FROM archive_snapshot WHERE nick=? AND archive NOT IN ({ph})",[nick]+lst).rowcount
-                r4=conn.execute(f"DELETE FROM archive_snapshot_indexed WHERE nick=? AND archive NOT IN ({ph})",[nick]+lst).rowcount
-                conn.execute(f"DELETE FROM archive_stats WHERE nick=? AND archive NOT IN ({ph})",[nick]+lst)
-                conn.execute(f"DELETE FROM diff_excluded_stats WHERE nick=? AND (archive_old NOT IN ({ph}) OR archive_new NOT IN ({ph}))",[nick]+lst+lst)
-                conn.execute(f"DELETE FROM snap_excluded_stats WHERE nick=? AND archive NOT IN ({ph})",[nick]+lst)
-            else:
-                r1=conn.execute("DELETE FROM diff_index WHERE nick=?",(nick,)).rowcount
-                r2=conn.execute("DELETE FROM diff_indexed_pairs WHERE nick=?",(nick,)).rowcount
-                r3=conn.execute("DELETE FROM archive_snapshot WHERE nick=?",(nick,)).rowcount
-                r4=conn.execute("DELETE FROM archive_snapshot_indexed WHERE nick=?",(nick,)).rowcount
-                conn.execute("DELETE FROM archive_stats WHERE nick=?",(nick,))
-                conn.execute("DELETE FROM diff_excluded_stats WHERE nick=?",(nick,))
-                conn.execute("DELETE FROM snap_excluded_stats WHERE nick=?",(nick,))
-            self.db._cleanup_snapshot_file_orphans(nick,conn)
-            conn.commit(); conn.close()
-            total=r1+r2+r3+r4
-            if total>0: print(f"{nick}: index nettoyé ({r1} diff, {r2} paires, {r3}+{r4} snapshots)")
+        if self._reconcile_archives(nick,db_path,[a['name'] for a in rb['stdout'][0]['archives']]) and os.path.exists(db_path):
             self._vacuum_db(db_path,verbose=False,nick=nick)
-        except sqlite3.Error as e:
-            printer(f"SQLite cleanup error ({db_path}): {e}")
-            try: conn.close()
-            except: pass
 
     def _find_last_archive_with_file(self,nick,path,debug=0):
         db_path=self.db.get_diff_db(nick)
@@ -4133,6 +4343,8 @@ class BorgHelper:
         except RuntimeError as e:
             printer(f"{nick}: {e}"); return 1
         archives=rb['stdout'][0]['archives']
+        # Rapprochement (1.0.140, AD-9) : archives supprimées hors borgHelper retirées, sur la liste déjà obtenue.
+        self._reconcile_archives(nick,db_path,[a['name'] for a in archives])
         if noidx:
             self._refresh_chart_stats(nick,cfg,db_path,archives,force=force,debug=debug)
             printer(f"{nick}: indexation des chemins désactivée (NOIDX=1) — statistiques des graphiques seules"); return 0
@@ -4302,10 +4514,12 @@ class BorgHelper:
         total_exclu=sum(sum(s['count'] for s in exclu.values()) for _,_,_,_,exclu,_ in ok_results)
         exclu_suffix=f", {total_exclu:,} exclus" if total_exclu else ""
         print(f"{nick}: {new_pairs} paires indexées (+{skipped} déjà en cache{exclu_suffix})")
+        # Stats d'abord (1.0.140) : DIFF_KEEP fige les comptages des paires qu'il retire, datés par archive_stats —
+        # au premier Index d'un dépôt, sans cet ordre, les archives n'auraient pas encore de date.
+        self._refresh_chart_stats(nick,cfg,db_path,archives,force=force,debug=debug)
         diff_keep=cfg.get('DIFF_KEEP','')
         if diff_keep.strip().isdigit():
             self.db._diff_keep_purge(nick,int(diff_keep),db_path)
-        self._refresh_chart_stats(nick,cfg,db_path,archives,force=force,debug=debug)
         self.indexsnap(nick,debug=debug,db_path=db_path,force=force)
         return 0
 
@@ -4992,7 +5206,11 @@ class BorgHelper:
         diff_index (+ diff_excluded_stats) pour la paire se terminant par cette archive, EXACTEMENT
         la source de la colonne « Modifs » de Report (_diff_stats_for_nick, types C/B/T comptés en
         modifiés). null (jamais 0) si cette paire n'est pas indexée : première archive, paire purgée
-        par DIFF_KEEP, NOIDX=1, ou Index pas encore passé."""
+        par DIFF_KEEP, NOIDX=1, ou Index pas encore passé.
+
+        1.0.140 : + archives disparues encore dans STATS_RETENTION_MONTHS (lignes figées de history.db,
+        pruned=true), et comptages figés d'une archive présente dont la paire a été retirée (DIFF_KEEP,
+        rapprochement) ; champ pruned sur chaque ligne."""
         db_path=self.db.get_diff_db(nick)
         if not os.path.exists(db_path):
             if as_json: print(json.dumps({'error':f"diff.db absent pour {nick}"},ensure_ascii=False,indent=2)); return
@@ -5037,6 +5255,30 @@ class BorgHelper:
             r['files_added']=st['added'] if st else None
             r['files_modified']=st['modified'] if st else None
             r['files_removed']=st['removed'] if st else None
+        # Lignes figées (history.db.archive_chart, 1.0.140) : graphiques sur STATS_RETENTION_MONTHS même quand les
+        # archives vivent moins longtemps. Archive présente : valeur vivante si non nulle, sinon figée (comptages d'une
+        # paire retirée). Archive disparue (gone) : sa ligne figée, pruned=true — jamais restaurable.
+        frozen=self.db.get_archive_chart(nick)
+        # Correspondance exacte (archive, date) : les deux dates viennent d'archive_stats ; un nom réutilisé par une
+        # nouvelle archive (autre date) n'hérite jamais des valeurs de l'ancienne, qui reste affichée à part.
+        fz={(f['archive'],f['archive_date']):f for f in frozen}
+        live=set()
+        for r in rows:
+            live.add((r['archive'],r['archive_date'] or ''))
+            f=fz.get((r['archive'],r['archive_date'] or ''))
+            if f:
+                for k in _CHART_FIELDS:
+                    if r[k] is None and f[k] is not None: r[k]=f[k]
+            r['pruned']=False
+        for f in frozen:
+            if f['gone'] and (f['archive'],f['archive_date']) not in live:
+                rows.append({'archive':f['archive'],'archive_date':f['archive_date'],'duration':f['duration'],
+                             'original_size':f['original_size'],'compressed_size':f['compressed_size'],
+                             'deduplicated_size':f['deduplicated_size'],'nfiles':f['nfiles'],
+                             'changed_during_backup':f['changed_during_backup'],'read_errors':f['read_errors'],
+                             'files_added':f['files_added'],'files_modified':f['files_modified'],
+                             'files_removed':f['files_removed'],'pruned':True})
+        rows.sort(key=lambda r:(r['archive_date'] is not None,r['archive_date'] or '',r['archive']))
         print(json.dumps({'borghelper_version':Version,'nick':nick,'rows':rows},ensure_ascii=False,indent=2))
 
     def _status_one(self,nick,debug=0):
@@ -8015,6 +8257,225 @@ def codec_selftest():
                     and db_plain_anomalies('n',[('diff.db',plain)],{'BORG_PASSPHRASE':'pw','DB_ENCRYPT':'false'})==[]
                     and db_plain_anomalies('n',[('diff.db',plain)],{})==[] and db_plain_anomalies('n',[('diff.db',plain)],None)==[])
         check("base non chiffrée : anomalie seulement si DB_ENCRYPT actif + passphrase + base en clair",_plain_anomaly)
+        # ── Rapprochement de la liste des archives + lignes de graphique figées (1.0.140, story 3, AD-9/AD-7) ──
+        rz_dir=os.path.join(tmp,'reconcile'); os.makedirs(rz_dir)
+        def _rz_date(days):
+            from datetime import datetime,timedelta
+            return (datetime.now()-timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%S.000000')
+        def _rz_mk(nk,extra=''):
+            """Nick plain (sans passphrase) : A1(40 j) A2(25 j) A3(20 j) A4(10 j) indexées — paires A1→A2 (2 ajoutés,
+            1 modifié, 1 exclu), A2→A3 (1 supprimé), A3→A4 (3 ajoutés) ; snapshots A2 et A4 ; stats partout ;
+            mesures A2 (C/E 5/1, dédup 777) et A3. Rend (BorgHelper, diff.db, liste mutable pour borg list)."""
+            rc=os.path.join(rz_dir,f'rc-{nk}')
+            with open(rc,'w') as f: f.write(f"[{nk}]\nBORG_REPO=/r\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n{extra}\n")
+            os.chmod(rc,0o600)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(rz_dir,f'cache-{nk}'))
+            dp=b.db.get_diff_db(nk); b.db.ensure_diff_db(dp)
+            # A1 toujours hors d'une rétention d'un mois (≤ 31 j), A2 toujours dedans (≥ 28 j) — test de rétention stable.
+            dates={f'A{i}':_rz_date(d) for i,d in ((1,40),(2,25),(3,20),(4,10))}
+            for i,(a,dt) in enumerate(sorted(dates.items())):
+                b.db.store_archive_stats(nk,a,dt,10.0+i,1000+i,500+i,100+i,50+i,dp)
+            ent=lambda *l: [{'change_type':c,'path':p,'size_before':1,'size_after':2} for c,p in l]
+            b.db.store_diff_entries(nk,'A1','A2',dates['A2'],ent(('added','/a'),('added','/b'),('modified','/c')),dp)
+            b.db.store_excluded_diff_stats(nk,'A1','A2',{'added':{'count':1,'size':9}},dp)
+            b.db.store_diff_entries(nk,'A2','A3',dates['A3'],ent(('removed','/a')),dp)
+            b.db.store_diff_entries(nk,'A3','A4',dates['A4'],ent(('added','/x'),('added','/y'),('added','/z')),dp)
+            c=_open_db(dp,nick=nk,role='write')
+            for a in ('A2','A4'):
+                for p in ('/c','/x'):
+                    c.execute("INSERT OR IGNORE INTO snapshot_file (nick,path,size) VALUES (?,?,1)",(nk,_path_stored(c,p)))
+                    fid=c.execute("SELECT id FROM snapshot_file WHERE nick=? AND path=?",(nk,_path_stored(c,p))).fetchone()[0]
+                    c.execute("INSERT INTO archive_snapshot (nick,archive,archive_date,file_id) VALUES (?,?,?,?)",(nk,a,dates[a],fid))
+                c.execute("INSERT INTO archive_snapshot_indexed (nick,archive,entry_count) VALUES (?,?,2)",(nk,a))
+            c.execute("INSERT INTO snap_excluded_stats (nick,archive,file_count,total_size) VALUES (?,'A2',1,1)",(nk,))
+            c.commit(); c.close()
+            b.db.store_archive_measure(nk,'A2',dates['A2'],777,5,1)
+            b.db.store_archive_measure(nk,'A3',dates['A3'],888,0,0)
+            listing=list(dates)
+            def _boex(n,args,debug=0,**k):
+                if args[0]=='list': return {'exitcode':0,'stdout':[{'archives':[{'name':a,'start':dates.get(a)} for a in listing]}],'stderr':[]}
+                if args[0]=='info': return {'exitcode':0,'stdout':[{'archives':[],'cache':{'stats':{}}}],'stderr':[]}
+                return {'exitcode':0,'stdout':[],'stderr':[]}
+            b.borg.boex=_boex
+            return b,dp,listing
+        def _rz_cites(dp,nk,arch):
+            """Lignes de diff.db qui citent arch (toutes tables)."""
+            c=sqlite3.connect(dp); n=0
+            for t,cols in (('diff_index',('archive_old','archive_new')),('diff_indexed_pairs',('archive_old','archive_new')),
+                           ('diff_excluded_stats',('archive_old','archive_new')),('archive_snapshot',('archive',)),
+                           ('archive_snapshot_indexed',('archive',)),('archive_stats',('archive',)),('snap_excluded_stats',('archive',))):
+                n+=c.execute(f"SELECT count(*) FROM {t} WHERE nick=? AND ("+' OR '.join(f"{x}=?" for x in cols)+")",(nk,)+(arch,)*len(cols)).fetchone()[0]
+            c.close(); return n
+        def _rz_ah(b,nk):
+            return {r['archive']:r for r in json.loads(_q_run(b.archive_history,nk,as_json=True))['rows']}
+        def _rz_sig(p): return tuple((os.stat(f).st_mtime_ns,os.path.getsize(f)) if os.path.exists(f) else None for f in (p,p+'-wal'))
+        def _rz_middle():
+            """Archive du milieu (A2) supprimée : aucune ligne ne la cite, paires A1→A2/A2→A3 parties (A3 sans doublon
+            à venir), ligne figée gone avec mesure (dédup 777, C/E 5/1) et comptages, mesure retirée, A3 garde ses
+            comptages (1 supprimé) via le figeage ; snapshot_file orphelins nettoyés."""
+            b,dp,lst=_rz_mk('rzm'); before=_rz_ah(b,'rzm'); lst.remove('A2')
+            out=_q_run(b._reconcile_archives,'rzm',dp,lst)
+            after=_rz_ah(b,'rzm')
+            c=sqlite3.connect(dp); pairs=sorted(c.execute("SELECT archive_old,archive_new FROM diff_indexed_pairs").fetchall())
+            sf=c.execute("SELECT count(*) FROM snapshot_file").fetchone()[0]; c.close()
+            meas=[k for k in b.db.get_archive_measures('rzm') if k[1] is not None]
+            a2=after['A2']
+            return (_rz_cites(dp,'rzm','A2')==0 and pairs==[('A3','A4')] and sf==2
+                    and a2['pruned'] is True and a2['deduplicated_size']==777 and a2['changed_during_backup']==5
+                    and {k:v for k,v in a2.items() if k!='pruned'}=={k:v for k,v in before['A2'].items() if k!='pruned'}
+                    and after['A3']['files_removed']==1 and after['A3']['pruned'] is False
+                    and sorted(k[0] for k in meas)==['A3'] and 'disparue' in out)
+        check("rapprochement : archive du milieu supprimée -> plus aucune ligne ne la cite, ligne de graphique figée (mesures comprises), comptages de la suivante gardés",_rz_middle)
+        def _rz_oldest():
+            """Plus ancienne (A1, 40 j) supprimée : ArchiveHistory rend toujours 4 lignes, A1 pruned=true avec EXACTEMENT
+            ses valeurs d'avant ; A2 (plus ancienne restante) garde ses comptages 3 ajoutés (dont 1 exclu) / 1 modifié."""
+            b,dp,lst=_rz_mk('rzo'); before=_rz_ah(b,'rzo'); lst.remove('A1')
+            _q_run(b._reconcile_archives,'rzo',dp,lst); after=_rz_ah(b,'rzo')
+            same=all({k:v for k,v in after[a].items() if k!='pruned'}=={k:v for k,v in before[a].items() if k!='pruned'} for a in before)
+            return (len(after)==4 and same and after['A1']['pruned'] is True and all(not after[a]['pruned'] for a in ('A2','A3','A4'))
+                    and after['A2']['files_added']==3 and after['A2']['files_modified']==1 and _rz_cites(dp,'rzo','A1')==0
+                    and list(after)==['A1','A2','A3','A4'])
+        check("rapprochement : plus ancienne archive (40 j) supprimée -> ArchiveHistory la garde, pruned=true, valeurs identiques ; comptages de la suivante gardés",_rz_oldest)
+        def _rz_nothing():
+            """Rien de disparu : aucune écriture (diff.db et history.db intactes, octet et date) au 2e passage."""
+            b,dp,lst=_rz_mk('rzn')
+            _q_run(b._reconcile_archives,'rzn',dp,lst)   # 1er passage : balayage unique des orphelins hérités
+            h=_history_path_for(dp); s0=(_rz_sig(dp),_rz_sig(h)); time.sleep(0.05)
+            n=b._reconcile_archives('rzn',dp,lst)
+            c=sqlite3.connect(dp); flag=c.execute("SELECT value FROM db_meta WHERE key='reconcile_sweep:rzn'").fetchone(); c.close()
+            return n==0 and (_rz_sig(dp),_rz_sig(h))==s0 and flag==('1',)
+        check("rapprochement : rien de disparu -> aucune écriture (diff.db/history.db inchangées)",_rz_nothing)
+        def _rz_empty_and_fail():
+            """Liste vide -> rien retiré + avertissement ; borg list en échec (Index et nettoyage de Prune) -> rien retiré."""
+            b,dp,lst=_rz_mk('rze'); s0=_rz_cites(dp,'rze','A1')+_rz_cites(dp,'rze','A2')
+            out=_q_run(b._reconcile_archives,'rze',dp,[])
+            ok_empty=_rz_cites(dp,'rze','A1')+_rz_cites(dp,'rze','A2')==s0 and 'rien retiré' in out
+            b.borg.boex=lambda n,args,debug=0,**k: {'exitcode':2,'stdout':[],'stderr':[{'message':'Repository does not exist'}]}
+            _q_run(b.index,'rze'); _q_run(b._cleanup_index_after_prune,'rze')
+            meas=[k for k in b.db.get_archive_measures('rze') if k[1] is not None]
+            return ok_empty and _rz_cites(dp,'rze','A1')+_rz_cites(dp,'rze','A2')==s0 and len(meas)==2
+        check("rapprochement : liste vide -> rien retiré, avertissement ; borg list en échec -> rien retiré",_rz_empty_and_fail)
+        def _rz_noidx():
+            """Nick NOIDX, via index() : archive disparue -> archive_stats et mesure retirées, ligne figée (comptages null)."""
+            b,dp,lst=_rz_mk('rzx','NOIDX=1'); lst.remove('A2')
+            _q_run(b.index,'rzx'); after=_rz_ah(b,'rzx')
+            c=sqlite3.connect(dp); st=c.execute("SELECT count(*) FROM archive_stats WHERE archive='A2'").fetchone()[0]; c.close()
+            return (st==0 and after['A2']['pruned'] is True and after['A2']['deduplicated_size']==777
+                    and not [k for k in b.db.get_archive_measures('rzx') if k[0]=='A2'])
+        check("rapprochement : nick NOIDX via Index -> archive_stats et mesures retirées, ligne de graphique figée",_rz_noidx)
+        def _rz_freeze_fail():
+            """Figeage impossible (lecture de diff.db ou écriture de history.db en échec) -> rien retiré nulle part."""
+            b,dp,lst=_rz_mk('rzf'); lst.remove('A1'); s0=_rz_cites(dp,'rzf','A1')
+            def _boom(*a,**k): raise sqlite3.OperationalError('disk I/O error')
+            with mock.patch.object(b.db,'_diff_stats_for_nick',_boom): o1=_q_run(b._reconcile_archives,'rzf',dp,lst)
+            with mock.patch.object(b.db,'freeze_archive_chart',_boom): o2=_q_run(b._reconcile_archives,'rzf',dp,lst)
+            meas=[k for k in b.db.get_archive_measures('rzf') if k[1] is not None]
+            return _rz_cites(dp,'rzf','A1')==s0 and len(meas)==2 and 'rien retiré' in o1 and 'rien retiré' in o2 and not b.db.get_archive_chart('rzf')
+        check("rapprochement : figeage en échec -> rien retiré (diff.db, mesures)",_rz_freeze_fail)
+        def _rz_retention():
+            """STATS_RETENTION_MONTHS=1 : A1 (40 j) disparue -> jamais rendue ni gardée ; ligne figée devenue trop vieille
+            retirée à l'écriture suivante."""
+            b,dp,lst=_rz_mk('rzr','STATS_RETENTION_MONTHS=1'); lst.remove('A1')
+            _q_run(b._reconcile_archives,'rzr',dp,lst)
+            h=_history_path_for(dp); c=sqlite3.connect(h)
+            c.execute("INSERT INTO archive_chart (nick,archive,archive_date,gone) VALUES ('rzr','OLD','2020-01-01T00:00:00',1)"); c.commit()
+            lst.remove('A2'); _q_run(b._reconcile_archives,'rzr',dp,lst)
+            names=[r[0] for r in c.execute("SELECT archive FROM archive_chart WHERE nick='rzr' AND gone=1")]; c.close()
+            return 'A1' not in _rz_ah(b,'rzr') and names==['A2'] and _rz_ah(b,'rzr')['A2']['pruned'] is True
+        check("rapprochement : ligne figée au-delà de STATS_RETENTION_MONTHS -> retirée à l'écriture, jamais rendue",_rz_retention)
+        def _rz_legacy_orphans():
+            """Base de 1.0.139 : lignes diff_index d'une paire A0→A1 déjà retirée (A0 disparue, ancien nettoyage). Premier
+            rapprochement : lignes retirées, comptages de A1 figés, drapeau posé ; FileHist ne cite plus A0."""
+            b,dp,lst=_rz_mk('rzl')
+            b.db.store_diff_entries('rzl','A0','A1',_rz_date(40),[{'change_type':'added','path':'/c','size_before':None,'size_after':4}],dp)
+            c=_open_db(dp,nick='rzl',role='write'); c.execute("DELETE FROM diff_indexed_pairs WHERE archive_old='A0'"); c.commit(); c.close()
+            before=_q_run(b.filehist,'rzl','/c',archive_from='ALL',as_json=True)
+            _q_run(b._reconcile_archives,'rzl',dp,lst)
+            after=_q_run(b.filehist,'rzl','/c',archive_from='ALL',as_json=True)
+            ah=_rz_ah(b,'rzl')
+            c=sqlite3.connect(dp); left=c.execute("SELECT count(*) FROM diff_index WHERE archive_old='A0'").fetchone()[0]; c.close()
+            return '"A0"' in before and '"A0"' not in after and left==0 and ah['A1']['files_added']==1 and 'A0' not in ah
+        check("rapprochement : lignes orphelines héritées (paire déjà retirée) -> retirées une fois, comptages figés, FileHist sans archive absente",_rz_legacy_orphans)
+        def _rz_keep_order(dp):
+            """indexed_at distincts (à la seconde, sinon ex æquo) : DIFF_KEEP=1 garde A3→A4, retire A1→A2 (avec exclus) et A2→A3."""
+            c=sqlite3.connect(dp)
+            for o,t in (('A1','2020-01-01 00:00:01'),('A2','2020-01-01 00:00:02'),('A3','2020-01-01 00:00:03')):
+                c.execute("UPDATE diff_indexed_pairs SET indexed_at=? WHERE archive_old=?",(t,o))
+            c.commit(); c.close()
+        def _rz_diff_keep():
+            """DIFF_KEEP : paires retirées (dont celle qui a des exclus) -> comptages figés, les trois champs files_*
+            identiques ; exclus de la paire retirés ; puis archive disparue -> sa ligne pruned garde les comptages figés
+            par DIFF_KEEP (COALESCE : jamais écrasés par NULL)."""
+            b,dp,lst=_rz_mk('rzk'); _rz_keep_order(dp); before=_rz_ah(b,'rzk')
+            _q_run(b.db._diff_keep_purge,'rzk',1,dp)
+            after=_rz_ah(b,'rzk')
+            c=sqlite3.connect(dp); pairs=c.execute("SELECT archive_old FROM diff_indexed_pairs").fetchall()
+            ex=c.execute("SELECT count(*) FROM diff_excluded_stats").fetchone()[0]; c.close()
+            F=('files_added','files_modified','files_removed')
+            same=all(after[a][k]==before[a][k] for a in before for k in F)
+            lst.remove('A2'); _q_run(b._reconcile_archives,'rzk',dp,lst); gone=_rz_ah(b,'rzk')
+            return (pairs==[('A3',)] and ex==0 and same and before['A2']['files_added']==3
+                    and gone['A2']['pruned'] is True and [gone['A2'][k] for k in F]==[before['A2'][k] for k in F])
+        check("DIFF_KEEP : comptages des paires retirées figés (exclus compris), gardés quand l'archive disparaît ensuite",_rz_diff_keep)
+        def _rz_diff_keep_fail():
+            """DIFF_KEEP : figeage en échec (sqlite3.Error ou history.db illisible -> SystemExit) -> aucune paire retirée."""
+            b,dp,lst=_rz_mk('rzq'); _rz_keep_order(dp)
+            def _boom(*a,**k): raise sqlite3.OperationalError('disk I/O error')
+            def _exit(*a,**k): raise SystemExit(2)
+            for f in (_boom,_exit):
+                with mock.patch.object(b.db,'freeze_archive_chart',f): _q_run(b.db._diff_keep_purge,'rzq',1,dp)
+            c=sqlite3.connect(dp); np=c.execute("SELECT count(*) FROM diff_indexed_pairs").fetchone()[0]; c.close()
+            return np==3
+        check("DIFF_KEEP : figeage en échec -> rien purgé, jamais de sortie du processus",_rz_diff_keep_fail)
+        def _rz_concurrent_measure():
+            """Mesure d'un Bkp écrite après borg list (archive inconnue du rapprochement) : jamais retirée."""
+            b,dp,lst=_rz_mk('rzc'); lst.remove('A1')
+            orig=b.db.freeze_archive_chart
+            def _freeze_then_bkp(*a,**k):
+                b.db.store_archive_measure('rzc','A9',_rz_date(0),9,0,0); return orig(*a,**k)
+            with mock.patch.object(b.db,'freeze_archive_chart',_freeze_then_bkp): _q_run(b._reconcile_archives,'rzc',dp,lst)
+            names=sorted(k[0] for k in b.db.get_archive_measures('rzc') if k[1] is not None)
+            return names==['A2','A3','A9']
+        check("rapprochement : mesure d'un Bkp écrite pendant le rapprochement -> gardée (retrait par liste des disparues)",_rz_concurrent_measure)
+        def _rz_shared_db():
+            """Deux nicks sur une même diff.db (DB_NAME) : le balayage unique des orphelins a lieu pour chacun."""
+            b,dp,lst=_rz_mk('rzs',"DB_NAME=shr\n\n[rzs2]\nBORG_REPO=/r\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\nDB_NAME=shr")
+            same=b.db.get_diff_db('rzs2')==dp
+            for nk in ('rzs','rzs2'):
+                b.db.store_diff_entries(nk,'A0','A1',_rz_date(40),[{'change_type':'added','path':'/o','size_before':None,'size_after':1}],dp)
+            c=sqlite3.connect(dp); c.execute("DELETE FROM diff_indexed_pairs WHERE archive_old='A0'"); c.commit(); c.close()
+            b.db.store_archive_stats('rzs2','A1',_rz_date(40),1,1,1,1,1,dp)
+            _q_run(b._reconcile_archives,'rzs',dp,lst); _q_run(b._reconcile_archives,'rzs2',dp,['A1'])
+            c=sqlite3.connect(dp); left=c.execute("SELECT nick FROM diff_index WHERE archive_old='A0'").fetchall(); c.close()
+            return same and left==[]
+        check("rapprochement : diff.db partagée (DB_NAME) -> balayage unique fait pour chaque nick",_rz_shared_db)
+        def _rz_name_reuse():
+            """Nom d'archive réutilisé (autre date) après disparition : deux lignes, la nouvelle n'hérite de rien."""
+            b,dp,lst=_rz_mk('rzu'); lst.remove('A1'); _q_run(b._reconcile_archives,'rzu',dp,lst)
+            b.db.store_archive_stats('rzu','A1',_rz_date(5),99.0,9,9,9,9,dp)
+            rows=[r for r in json.loads(_q_run(b.archive_history,'rzu',as_json=True))['rows'] if r['archive']=='A1']
+            old=[r for r in rows if r['pruned']]; new=[r for r in rows if not r['pruned']]
+            return (len(rows)==2 and len(old)==1 and old[0]['duration']==10.0 and new[0]['duration']==99.0
+                    and new[0]['files_added'] is None)
+        check("ArchiveHistory : nom d'archive réutilisé -> ancienne ligne pruned gardée, nouvelle sans valeurs héritées",_rz_name_reuse)
+        def _rz_codec_error():
+            """Base chiffrée sans clé / mode changé (DbKeyError, DbModeError) : message, rien retiré, pas d'exception."""
+            b,dp,lst=_rz_mk('rzy'); lst.remove('A1'); s0=_rz_cites(dp,'rzy','A1')
+            outs=[]
+            for exc in (DbKeyError('passphrase absente'),DbModeError('mode changé')):
+                def _raise(*a,_e=exc,**k): raise _e
+                with mock.patch.object(b,'_known_archives',_raise): outs.append(_q_run(b._reconcile_archives,'rzy',dp,lst))
+            return _rz_cites(dp,'rzy','A1')==s0 and all('rapprochement impossible' in o for o in outs)
+        check("rapprochement : base chiffrée sans clé ou mode changé -> rien retiré, Index continue",_rz_codec_error)
+        def _rz_priority():
+            """Bkp d'un autre processus en cours (priority.lock) -> rapprochement reporté, rien retiré."""
+            b,dp,lst=_rz_mk('rzp'); lst.remove('A1'); s0=_rz_cites(dp,'rzp','A1')
+            lp=b.db._priority_lock_path('rzp')
+            with open(lp,'w') as f: f.write(str(os.getppid()))
+            try: out=_q_run(b._reconcile_archives,'rzp',dp,lst)
+            finally: b.db.clear_priority_lock('rzp')
+            return _rz_cites(dp,'rzp','A1')==s0 and 'reporté' in out
+        check("rapprochement : opération prioritaire d'un autre processus -> reporté, rien retiré",_rz_priority)
         def _repo_stats_real_borg():
             """1.0.136 (deferred-work point 9) : capture repo_stats de backup()/prune() sur un VRAI dépôt borg jetable —
             vérifie l'enchaînement réel (borg create/prune/compact/info --json, format de la réponse de CETTE
@@ -8054,6 +8515,61 @@ def codec_selftest():
                 return ops==['bkp','bkp','prune'] and all(u and t for _o,u,t in rows) and meas_ok
             finally:
                 os.environ.pop('BORG_BASE_DIR',None)
+        def _reconcile_real_borg():
+            """1.0.140 (story 3) : vrai dépôt, 3 Bkp indexés, `borg delete` de l'archive du milieu puis de la plus
+            ancienne, Index après chacun. Paires sans archive absente ni doublon, FileHist ne cite plus l'archive
+            supprimée, ArchiveHistory garde 3 lignes (supprimées : pruned=true, valeurs identiques à avant)."""
+            d=os.path.join(tmp,'realreconcile'); src=os.path.join(d,'src'); os.makedirs(src)
+            fp=os.path.join(src,'f.txt')
+            with open(fp,'w') as f: f.write('contenu '*200)
+            repo=os.path.join(d,'repo'); rc=os.path.join(d,'rc')
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n\n[rr]\nBORG_REPO={repo}\nBORG_PASSPHRASE=pw-rr\n"
+                        f"SER_NAME=rr\nSER_LOGIN=x\nGLOB_ARCH={socket.getfqdn()}-t-*\nMOUNTPOINT={os.path.join(d,'mnt')}\n"
+                        f"BORG_ARCHNAME=t\nBORG_ROOTBKP={src}\nDB_ENCRYPT=false\nEXCLUDE=--exclude-caches\n")
+            os.chmod(rc,0o600)
+            env=dict(os.environ,BORG_PASSPHRASE='pw-rr',BORG_RELOCATED_REPO_ACCESS_IS_OK='yes',
+                     BORG_BASE_DIR=os.path.join(d,'borgbase'))
+            os.environ['BORG_BASE_DIR']=env['BORG_BASE_DIR']
+            try:
+                r=subprocess.run([shutil.which('borg'),'init','-e','repokey',repo],env=env,capture_output=True,text=True,timeout=120)
+                if r.returncode!=0: print(f"  borg init : {r.stderr[-300:]}"); return False
+                b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+                for i in range(3):
+                    if i:
+                        time.sleep(1.1)
+                        with open(fp,'a') as f: f.write(f'modif {i}\n')
+                    _q_run(b.backup,'rr')
+                dp=b.db.get_diff_db('rr')
+                def pairs():
+                    c=sqlite3.connect(dp); p=sorted(c.execute("SELECT archive_old,archive_new FROM diff_indexed_pairs").fetchall()); c.close(); return p
+                ah0=_rz_ah(b,'rr'); names=sorted(ah0,key=lambda a:ah0[a]['archive_date'])
+                if len(names)!=3 or pairs()!=[(names[0],names[1]),(names[1],names[2])]:
+                    print(f"  préparation : archives {names}, paires {pairs()}"); return False
+                def delete(a):
+                    r=subprocess.run([shutil.which('borg'),'delete',f'{repo}::{a}'],env=env,capture_output=True,text=True,timeout=120)
+                    if r.returncode!=0: print(f"  borg delete : {r.stderr[-300:]}")
+                    _q_run(b.index,'rr')
+                strip=lambda row:{k:v for k,v in row.items() if k!='pruned'}
+                delete(names[1])
+                ah1=_rz_ah(b,'rr')
+                fh=json.loads(_q_run(b.filehist,'rr',fp,archive_from='ALL',as_json=True)).get('rr',[])
+                hops=[(x['archive_before'],x['archive_after']) for x in fh if x['archive_before']]
+                ok1=(pairs()==[(names[0],names[2])] and _rz_cites(dp,'rr',names[1])==0 and len(hops)==len(set(hops))
+                     and names[1] not in json.dumps(fh) and len(ah1)==3 and ah1[names[1]]['pruned'] is True
+                     and strip(ah1[names[1]])==strip(ah0[names[1]]) and ah1[names[2]]['files_modified'])
+                if not ok1: print(f"  milieu : paires {pairs()} filehist {fh} archivehistory {ah1}")
+                delete(names[0])
+                ah2=_rz_ah(b,'rr')
+                ok2=(pairs()==[] and _rz_cites(dp,'rr',names[0])==0 and len(ah2)==3
+                     and [ah2[a]['pruned'] for a in names]==[True,True,False]
+                     and strip(ah2[names[0]])==strip(ah0[names[0]]) and strip(ah2[names[2]])==strip(ah1[names[2]]))
+                if not ok2: print(f"  plus ancienne : paires {pairs()} archivehistory {ah2}")
+                return ok1 and ok2
+            finally:
+                os.environ.pop('BORG_BASE_DIR',None)
+        if shutil.which('borg') is None: skip("rapprochement sur un vrai dépôt borg","borg absent")
+        else: check("rapprochement réel : borg delete du milieu puis de la plus ancienne + Index -> paires/FileHist sans archive absente, graphiques gardés (pruned)",_reconcile_real_borg)
         if shutil.which('borg') is None: skip("repo_stats capturé par Bkp/Prune sur un vrai dépôt borg","borg absent")
         else: check("repo_stats + mesures par archive : Bkp (avec et sans Index) puis Prune réels -> points bkp/bkp/prune, mesures écrites puis purgées",_repo_stats_real_borg)
         check("_diff_entry_type (1.0.126) : type tiré de change_type (borg diff 1.2), tous les types de suppression reconnus",

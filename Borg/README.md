@@ -121,7 +121,8 @@ DIFF_KEEP        = 30
 #  - repo_stats (taille du dépôt dans le temps) : purgé à chaque écriture (fin de Bkp/Prune réel) ;
 #  - séries des graphiques (RepoHistory/ArchiveHistory, depuis 1.0.127) : bornées à cette durée à
 #    l'affichage — les statistiques par archive restent en base tant que l'archive existe (Report,
-#    Historique complet) et partent au Prune réel de l'archive ;
+#    Historique complet) ; quand elle disparaît, sa ligne de graphique est figée dans history.db et
+#    reste affichée (marquée supprimée) jusqu'à cette durée (1.0.140) ;
 #  - bkp_status (suivi des sauvegardes pour les notifications, depuis 1.0.127) : purgé au démarrage
 #    d'une sauvegarde.
 STATS_RETENTION_MONTHS = 13
@@ -360,7 +361,8 @@ borgHelper -c Prune -n ALL
 ```
 
 Requiert au moins une clef `KEEP_*` dans la conf.  
-Enchaîne automatiquement `borg compact`, invalide le cache SQLite, et purge les entrées orphelines du `diff.db`.
+Enchaîne automatiquement `borg compact`, invalide le cache SQLite, et retire des bases les archives disparues
+(rapprochement, voir `Index`) — leurs lignes de graphique restent affichées pendant `STATS_RETENTION_MONTHS`.
 Met aussi à jour le schéma de `cache.db`/`diff.db` si nécessaire avant toute opération (comme `Bkp`/`Index`)
 — voir [Schéma de base de données](TECHNICAL.md#migrations-diffdb--table-de-correspondance-version--action).
 
@@ -521,6 +523,8 @@ Supprime une archive précise. **Opération destructive.**
 borgHelper -c DelBkp -n mon-serveur -b archive-id
 ```
 
+L'archive supprimée quitte les bases au prochain `Index` (rapprochement, 1.0.140).
+
 ---
 
 ### `Init`
@@ -564,6 +568,19 @@ graphiques d'évolution de borgHelperWWW :
   (jamais de doublon juste après un `Bkp`).
 
 Le snapshot (`-S`) est **incrémental par défaut** : si un snapshot précédent et le diff correspondant existent, seules les entrées `added/removed/modified` sont appliquées par SQL, et `borg list` est appelé uniquement sur les fichiers ajoutés (pour leur mtime). Fallback vers `borg list` complet si : pas de snapshot précédent, diff absent, > 5 000 ajouts, ou erreur borg. `-F` force le `borg list` complet.
+
+**Archives supprimées hors borgHelper** (1.0.140) : chaque `Index` rapproche les bases de la liste `borg list` qu'il
+obtient déjà (aucun appel borg de plus). Une archive disparue — `borg prune`/`borg delete` bruts, `DelBkp`, archive
+devenue hors `GLOB_ARCH` — est retirée des diffs, snapshots, statistiques et mesures : `TreeHist`, `FileHist`,
+`Search` et la restauration ne la proposent plus. Sa ligne de graphique est d'abord figée dans `history.db`, pour que
+les graphiques par archive couvrent `STATS_RETENTION_MONTHS` (13 mois) même avec une rétention d'archives de quelques
+semaines. Une liste d'archives vide (`GLOB_ARCH` erroné, dépôt vidé) ne retire rien et affiche un avertissement.
+Aucune écriture quand rien n'a disparu. Le premier `Index` de 1.0.140 retire aussi, une fois, les lignes de diff
+orphelines laissées par l'ancien nettoyage (archive du milieu supprimée : doublons, archive absente proposée).
+⚠️ Modifier `GLOB_ARCH` fait passer pour disparues les archives hors du nouveau motif dès l'`Index` suivant : leurs
+diffs et snapshots sont retirés (reconstruits si l'on revient à l'ancien motif), leurs lignes de graphique figées.
+`Index` ne compacte jamais `diff.db` : si le dépôt est élagué par `borg prune` hors borgHelper, lancer `IdxPurge` de
+temps en temps pour rendre la place libérée (le `Prune` de borgHelper compacte lui-même).
 
 > **Interruptible et reprise automatique :** si `Bkp` ou `Restore` démarre pendant `Index`, l'indexation s'arrête immédiatement (diffs tués + borg info + indexsnap annulés). `Index` pose un flag de reprise ; `Bkp` le détecte à la fin de son exécution et relance automatiquement `Index` complet. Les paires déjà indexées sont sautées (incrémental).
 
@@ -807,6 +824,10 @@ d'archives n'est pas indexée (première archive, purgée par `DIFF_KEEP`, `NOID
 passé). Et `changed_during_backup`/`read_errors` (1.0.117) : fichiers modifiés pendant la sauvegarde /
 erreurs de lecture, relevés par le Bkp — `null` si inconnus (archive antérieure, ou statistiques
 rattrapées par Index).
+Depuis 1.0.140 : `pruned` (booléen) sur chaque ligne. `true` = archive disparue du dépôt, ligne figée dans
+`history.db` au moment de sa disparition et gardée `STATS_RETENTION_MONTHS` (graphiques sur 13 mois même avec une
+rétention d'archives courte) — jamais restaurable. Pour une archive présente dont la paire précédente a été retirée
+(archive précédente disparue, `DIFF_KEEP`), `files_*` reprend les comptages figés au lieu de `null`.
 
 `diff.db` jamais indexé : `{'error':'diff.db absent pour <nick>'}`, jamais une exception (même
 comportement que `IdxTop -j`).
@@ -961,7 +982,8 @@ process — faute de quoi, après un `DbEncrypt`, son cache de périmètre conti
 Chaque nick a trois bases dans `CACHE_DIR` : `cache.db` et `diff.db` se reconstruisent depuis le dépôt borg (on peut
 les supprimer), mais `<conf>-<nick>-history.db` garde ce qu'aucun appel borg ne redonne : l'historique des tailles du
 dépôt (graphiques, gain de Prune), le suivi des sauvegardes (notifications) et, par archive, les compteurs C/E et la
-taille dédupliquée mesurés au Bkp. Elle est créée automatiquement à la mise à jour (migration depuis `diff.db`).
+taille dédupliquée mesurés au Bkp, et (1.0.140) les lignes de graphique figées des archives disparues. Elle est créée
+automatiquement à la mise à jour (migration depuis `diff.db`).
 
 - **La sauvegarder** : `CACHE_DIR` (par défaut `~/.cache/borghelper`) est souvent exclu des sauvegardes. Copie cohérente
   (WAL compris) : `python3 -c 'import sqlite3,sys; sqlite3.connect(sys.argv[1]).execute("VACUUM INTO ?",(sys.argv[2],))' <history.db> <copie>`.
@@ -1570,7 +1592,8 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
      par archive : **fichiers modifiés** (barres empilées ajoutés/modifiés/supprimés), **durée de
      sauvegarde**, **taille dédupliquée** seule (lisible, contrairement au graphique précédent où
      l'échelle de la taille originale l'écrase). Une archive sans valeur reste vide, jamais comptée à
-     zéro. Nick sans historique ou sans Prune :
+     zéro. UI ≥ 1.18.0 (borgHelper ≥ 1.0.140) : les archives supprimées du dépôt restent dans ces
+     graphiques par archive pendant `STATS_RETENTION_MONTHS`, atténuées, infobulle « (supprimée) ». Nick sans historique ou sans Prune :
      message à la place du graphique concerné — un `Index` complète les données manquantes.
      **Chart.js embarqué** (borgHelperWWW ≥ 1.22.0) : copie locale `vendor/chartjs/`, servie par
      borgHelperWWW sur `/static/chart.umd.min.js` — aucun accès Internet requis côté navigateur. Si

@@ -1,5 +1,48 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.140 / UI 1.18.0 — archives supprimées hors borgHelper retirées, graphiques gardés 13 mois — 2026-09-27
+
+Chantier « reconstruction progressive », story 3 (spine AD-9, AD-7 amendé).
+
+- **Rapprochement à chaque Index** (sur la liste `borg list` qu'Index obtient déjà, aucun appel borg de plus) et au
+  nettoyage après Prune : une archive absente du dépôt (`borg prune`/`borg delete` bruts, `DelBkp`, archive devenue
+  hors `GLOB_ARCH`) est retirée de toutes les tables de `diff.db` et ses mesures de `history.db`. Tous les nicks,
+  `NOIDX` compris (leur `archive_stats` n'était jamais nettoyée).
+- Corrigé : le nettoyage après Prune ne retirait une paire de diff que si l'archive **nouvelle** avait disparu. Une
+  archive du milieu supprimée laissait ses événements, et `TreeHist`/`FileHist` proposaient une archive absente. Les
+  lignes orphelines héritées sont retirées une seule fois par base au premier Index de cette version.
+- Corrigé : une liste d'archives vide effaçait tout l'index. Désormais rien n'est retiré, avec un avertissement.
+- **Graphiques sur `STATS_RETENTION_MONTHS` (13 mois) même avec une rétention d'archives courte** : avant de purger
+  une archive disparue, sa ligne de graphique (tailles, durée, nombre de fichiers, ajoutés/modifiés/supprimés, C/E,
+  taille dédupliquée affichée) est figée dans `history.db` (nouvelle table `archive_chart`). Les comptages de fichiers
+  d'une archive restante dont la paire entrante est retirée (archive précédente disparue, `DIFF_KEEP`) sont figés
+  aussi. `ArchiveHistory -j` rend les archives présentes et les archives disparues encore dans la rétention, avec un
+  nouveau champ `pruned` (booléen) sur chaque ligne.
+- UI : les archives supprimées sont atténuées dans les graphiques par archive, infobulle « (supprimée) ».
+- Aucune écriture quand rien n'a disparu (cache par périmètre de borgHelperWWW intact). Jamais de compactage lancé par
+  Index. Rapprochement reporté si un Bkp d'un autre processus a démarré entre `borg list` et la purge.
+- `DIFF_KEEP` retire aussi les `diff_excluded_stats` de la paire purgée (restés seuls, ils donnaient des comptages
+  partiels).
+- Une archive disparue pendant que `diff.db` était absente n'a rien à figer (hors C/E et taille dédupliquée
+  mesurées) : trou dans les graphiques, jamais d'erreur. `HISTORY_DB_SCHEMA_VERSION` inchangée (table ajoutée,
+  ignorée sans dommage par 1.0.139).
+- `Index` : le refresh des statistiques passe avant `DIFF_KEEP` (dates nécessaires pour figer les comptages au
+  premier Index d'un dépôt).
+- ⚠️ Modifier `GLOB_ARCH` : les archives hors du nouveau motif sont traitées comme disparues dès l'Index suivant.
+  `Index` ne compacte jamais `diff.db` : dépôt élagué hors borgHelper → `IdxPurge` de temps en temps.
+- Bibliothèque (LIBRARY.md) : nouvelles méthodes `freeze_archive_chart`, `get_archive_chart` ; `_diff_stats_for_nick`
+  accepte `archives=` et `conn=`.
+- Revue en trois couches, correctifs : mesures retirées par liste explicite des disparues (la mesure d'un Bkp écrite
+  pendant le rapprochement survit) ; balayage unique des orphelins par nick (`diff.db` partagée par `DB_NAME`) ; base
+  chiffrée sans clé, mode changé ou `history.db` illisible → message, rien retiré, Index continue (plus de sortie
+  du processus) ; `DIFF_KEEP` ne purge rien si le figeage échoue ; nom d'archive réutilisé → jamais de valeurs
+  héritées ; compactage après Prune seulement si `diff.db` a perdu des lignes ; message dédié au nettoyage unique ;
+  test de rétention indépendant de la longueur du mois.
+- Tests : `CodecSelfTest` 384/384 (16 contrôles nouveaux : archive du milieu, plus ancienne, rien de disparu sans
+  écriture, liste vide ou `borg list` en échec, `NOIDX`, figeage en échec, rétention, orphelins hérités, `DIFF_KEEP`
+  puis disparition, `DIFF_KEEP` en échec, verrou prioritaire d'un autre processus, Bkp concurrent, `DB_NAME` partagé, nom réutilisé, base sans clé, et
+  scénario sur vrai dépôt borg) ; `push_selftest` 89/89 ; `ArchiveHistory -j` identique à 1.0.139 hors `pruned`.
+
 ## borgHelper 1.0.139 / borgHelperWWW 1.27.8 — `history.db` : les mesures quittent `diff.db`, qui devient jetable — 2026-09-27
 
 Chantier « reconstruction progressive », story 2 (spine AD-7, AD-8, AD-14).

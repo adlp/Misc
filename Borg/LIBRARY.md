@@ -618,8 +618,8 @@ sys.exit(0)
 | Méthode | Description |
 |---------|-------------|
 | `backup(nick, no_index, debug)` | Lance `borg create` + indexation automatique (indexsnap + index ciblé sur la nouvelle archive) ; si un `Index` externe avait été interrompu, le relance en fin d'exécution ; écrit une ligne `bkp_status` (diff.db) à son début et à sa fin (`'success'`/`'error'` dérivé de `sys.exit()` — voir `bh.db.list_pending_bkp_status`/`claim_bkp_status` ci-dessous) |
-| `prune(nick, dryrun, debug)` | `borg prune` + compact + nettoyage index |
-| `index(nick, debug, db_path, force, target_archive, set_pending)` | Indexe les diffs, parallèle ; `target_archive` restreint à une paire ; `set_pending=True` (défaut) pose `index-pending.lock` si interrompu par priorité — mettre `False` pour les appels internes |
+| `prune(nick, dryrun, debug)` | `borg prune` + compact + rapprochement (archives disparues figées puis retirées, 1.0.140) |
+| `index(nick, debug, db_path, force, target_archive, set_pending)` | Rapproche d'abord les bases de `borg list` (archives disparues retirées, 1.0.140), puis indexe les diffs, parallèle ; `target_archive` restreint à une paire ; `set_pending=True` (défaut) pose `index-pending.lock` si interrompu par priorité — mettre `False` pour les appels internes |
 | `indexsnap(nick, debug, db_path, force)` | Snapshot de la dernière archive — incrémental par défaut (force=True pour `borg list` complet) ; purge auto des snapshots anciens (IDX_SNAP_KEEP) |
 | `report(nicks, htrep, debug, maxp, as_json)` | Rapport avec appels borg |
 | `report_offline(nicks, htrep, debug, maxp, as_json)` | Rapport depuis diff.db uniquement — même résumé que `report`, toutes machines affichées même sans index |
@@ -655,11 +655,11 @@ sys.exit(0)
 | `store_archive_measure(nick, archive, archive_date, deduplicated_size, changed_during_backup, read_errors)` | Mesures d'une archive prises au Bkp (history.db) |
 | `get_archive_measures(nick)` | `{(archive, archive_date): {deduplicated_size, changed_during_backup, read_errors}}` (+ clé `(archive, None)` si le nom est unique) ; `{}` si aucune |
 | `delete_archive_measures(nick, keep=None)` | Retire les mesures des archives absentes de `keep` (toutes si `keep` vide) |
-
-> ⚠️ **Changement cassant (1.0.139)** : `store_archive_stats(...)` n'accepte plus `changed_during_backup=` / `read_errors=` (`TypeError`) — ces mesures passent par `store_archive_measure(...)` dans `history.db`. Les fonctions `bkp_status`/`repo_stats` (`store_bkp_status_*`, `list_pending_bkp_status*`, `claim_bkp_status*`, `bkp_running`, `get_running_bkp_status`, `store_repo_stats`, `get_repo_stats`) visent désormais la `history.db` du nick par défaut ; un `db_path` explicite doit être un chemin de `history.db`.
+| `freeze_archive_chart(nick, rows, db_path=None)` | 1.0.140 — fige des lignes de graphique dans `history.db.archive_chart` (dicts `archive`, `archive_date`, `gone`, champs de graphique) ; jamais une valeur non nulle écrasée par `None` ; purge au-delà de `STATS_RETENTION_MONTHS` ; lève `sqlite3.Error` |
+| `get_archive_chart(nick, db_path=None)` | 1.0.140 — lignes figées dans la rétention : `[{archive, archive_date, duration, …, read_errors, gone}]` ; `[]` si aucune |
 | `is_diff_pair_indexed(nick, a_old, a_new)` | Vérifie si une paire est indexée |
 | `is_archive_snapshot_indexed(nick, archive)` | Vérifie si le snapshot est indexé |
-| `_diff_stats_for_nick(nick)` | Stats de mouvement par archive (used by Report) |
+| `_diff_stats_for_nick(nick, archives=None, conn=None)` | Stats de mouvement par archive (used by Report) ; `archives` (1.0.140) restreint aux archives nouvelles données, `conn` : erreurs SQLite remontées |
 | `store_excluded_diff_stats(nick, a_old, a_new, exclu, db_path)` | Stocke stats fichiers exclus d'une paire |
 | `store_excluded_snap_stats(nick, archive, count, size, db_path)` | Stocke stats fichiers exclus d'un snapshot |
 | `_with_lock_retry(fn, max_wait=300)` | Exécute `fn()`, retente toutes les 2 s si `OperationalError: database is locked`, jusqu'à `max_wait` secondes |
@@ -673,3 +673,5 @@ sys.exit(0)
 | `set_index_pending_lock(nick)` | Pose le flag de reprise — appelé par `Index` quand interrompu par priorité (`set_pending=True`) |
 | `clear_index_pending_lock(nick)` | Supprime le flag de reprise |
 | `check_index_pending_lock(nick)` | `True` si un `Index` interrompu attend d'être repris |
+
+> ⚠️ **Changement cassant (1.0.139)** : `store_archive_stats(...)` n'accepte plus `changed_during_backup=` / `read_errors=` (`TypeError`) — ces mesures passent par `store_archive_measure(...)` dans `history.db`. Les fonctions `bkp_status`/`repo_stats` (`store_bkp_status_*`, `list_pending_bkp_status*`, `claim_bkp_status*`, `bkp_running`, `get_running_bkp_status`, `store_repo_stats`, `get_repo_stats`) visent désormais la `history.db` du nick par défaut ; un `db_path` explicite doit être un chemin de `history.db`.

@@ -26,7 +26,7 @@ borgHelper est structuré en trois couches :
 | `~/.borghelperrc` | Configuration des dépôts (INI) |
 | `~/.cache/borghelper/<conf>-<nick>-cache.db` | Cache des appels `borg info/list` (SQLite) |
 | `~/.cache/borghelper/<conf>-<nick>-diff.db` | Index des diffs, snapshots et stats d'archives (SQLite) — entièrement régénérable depuis le dépôt (1.0.139) |
-| `~/.cache/borghelper/<conf>-<nick>-history.db` | Mesures NON régénérables (1.0.139) : `repo_stats`, `bkp_status`, `archive_measure` — en clair, sans chemin ; **la seule base à sauvegarder** |
+| `~/.cache/borghelper/<conf>-<nick>-history.db` | Mesures NON régénérables (1.0.139) : `repo_stats`, `bkp_status`, `archive_measure`, `archive_chart` (1.0.140) — en clair, sans chemin ; **la seule base à sauvegarder** |
 | `~/.cache/borghelper/<conf>-<repo_sanitisé>-priority.lock` | Lock PID posé par `Bkp`/`Restore` — signal d'interruption pour `Index` sur le même dépôt |
 | `~/.cache/borghelper/<conf>-<repo_sanitisé>-index-running.lock` | Lock PID posé par `Index` pendant Phase 2 — `Bkp`/`Restore` attendent sa disparition avant `borg create`/`borg extract` |
 | `~/.cache/borghelper/<conf>-<nick>-index-pending.lock` | Flag (vide) posé par `Index` quand interrompu par `Bkp`/`Restore` — `Bkp` le détecte en fin d'exécution et relance `Index` complet automatiquement |
@@ -113,7 +113,7 @@ Stocke chaque événement de fichier entre deux archives consécutives.
 Design Notes ci-dessous) : jamais `archive_snapshot_v`/`archive_snapshot`, purgées indépendamment
 selon `IDX_SNAP_KEEP` (fenêtre glissante fixe, sans rapport avec l'existence réelle des archives),
 alors qu'une ligne `diff_index` survivante référence toujours une archive encore restaurable
-(`_cleanup_index_after_prune` ne la purge qu'au prune réel de l'archive référencée). Détection d'un
+(le rapprochement `_reconcile_archives`, 1.0.140, ne la purge que quand l'archive ancienne ou nouvelle a disparu). Détection d'un
 chemin « supprimé » : son événement `diff_index` le PLUS RÉCENT (`archive_new_date`/`id` max) a
 un `change_type` de suppression (`_DIFF_REMOVED_TYPES` : `removed`, `removed directory|link|fifo|chrdev|blkdev`)
 — un chemin réajouté depuis n'est jamais marqué. **Type réel depuis 1.0.126** : `borg diff --json-lines` (1.2) qualifie
@@ -387,7 +387,8 @@ avertissement « base non chiffrée »). `DbStatus` l'affiche `plain (aucun chem
 |---|---|---|---|
 | `repo_stats` | historique des tailles du dépôt (`op` bkp/prune/index) | Bkp, Prune, refresh d'Index | `STATS_RETENTION_MONTHS` |
 | `bkp_status` | cycle de vie des Bkp (watcher push, `Status`) | Bkp seul ; réclamations CAS du watcher | `STATS_RETENTION_MONTHS` |
-| `archive_measure` | par `(nick, archive, archive_date)` : taille dédupliquée à la création, C/E | Bkp seul | tant que l'archive existe (retrait au nettoyage après Prune) |
+| `archive_measure` | par `(nick, archive, archive_date)` : taille dédupliquée à la création, C/E | Bkp seul | tant que l'archive existe (retirée par le rapprochement, après figeage) |
+| `archive_chart` (1.0.140) | par `(nick, archive, archive_date)` : ligne de graphique figée (`_CHART_FIELDS` + `gone`) | rapprochement de la base servie, `DIFF_KEEP` | `STATS_RETENTION_MONTHS`, que l'archive existe ou non |
 
 - **Lecture** : `history_path(nick)` / `_hist(nick)` ouvrent d'abord `diff.db` (`ensure_diff_db`, sans la créer), ce
   qui migre une base antérieure ; une lecture ne crée jamais `history.db` (fichier absent = aucune mesure : `[]`,
@@ -429,6 +430,50 @@ avertissement « base non chiffrée »). `DbStatus` l'affiche `plain (aucun chem
   recréées par un ancien binaire, `diff.db` jetée puis reconstruite, lecture sans historique, base chiffrée,
   base `migrating`) ; parité des sorties `RepoHistory -j`, `ArchiveHistory -j`, `Report -o -j` entre 1.0.138 et
   1.0.139 sur des bases construites par de vrais Bkp/Prune (en clair et chiffrée).
+
+**Lignes de graphique figées (1.0.140, story 3, AD-7 amendé)** — les graphiques par archive doivent couvrir
+`STATS_RETENTION_MONTHS` même quand les archives vivent moins longtemps. `_reconcile_archives` fige, **avant** de
+purger : pour chaque archive disparue, sa ligne telle qu'`ArchiveHistory` l'affichait (`archive_stats`, comptages de
+`_diff_stats_for_nick`, mesure prioritaire pour la taille dédupliquée et C/E), `gone=1` ; pour chaque archive restante
+dont la paire entrante part, ses seuls comptages, `gone=0`. `_diff_keep_purge` fige de même les comptages des paires
+qu'il retire. `freeze_archive_chart` : upsert `COALESCE(nouvelle, ancienne)` (une valeur figée n'est jamais écrasée
+par `NULL`), `gone=MAX(...)`, puis purge des lignes plus vieilles que la rétention ; ligne sans date ignorée.
+`ArchiveHistory` : archives présentes (valeur vivante non nulle, sinon figée ; correspondance `(archive, date)` puis
+nom unique) + lignes `gone` absentes d'`archive_stats`, triées par date, champ `pruned`. `Report`, `TreeHist`,
+`FileHist` et la restauration ne lisent jamais `archive_chart`. Table ajoutée par `CREATE TABLE IF NOT EXISTS` :
+`HISTORY_DB_SCHEMA_VERSION` reste 1.
+
+### Rapprochement de la liste des archives (1.0.140, story 3, AD-9)
+
+`_reconcile_archives(nick, db_path, current)` — appelé par `index()` juste après `borg list` (avant les branches
+`NOIDX` et « moins de 2 archives », aucun appel borg de plus) et par `_cleanup_index_after_prune` (`borg list` +
+rapprochement + `_vacuum_db` seulement si des lignes sont parties). Jamais de compactage depuis Index.
+
+1. Archives connues (`_known_archives`) : petites tables lues entières (`archive_stats`, `archive_snapshot_indexed`,
+   `snap_excluded_stats`, `diff_indexed_pairs` et `diff_excluded_stats` des deux côtés) + `diff_index.archive_new` et
+   `archive_snapshot.archive` par **saut d'index** (CTE récursive de `MIN` successifs sur `(nick, archive_new)` /
+   `(nick, archive)` : un accès par archive, jamais un balayage) + noms d'`archive_measure`.
+2. Liste vide : rien retiré, avertissement si la base connaît des archives. Aucune disparue et balayage déjà fait :
+   retour sans aucune écriture.
+3. `priority.lock` d'un autre processus : reporté (un Bkp démarré après `borg list` ferait passer sa nouvelle archive
+   pour disparue ; Prune tient le verrou lui-même, l'Index de fin de Bkp passe après l'avoir relâché).
+4. Figeage (`archive_chart`, voir plus haut) ; un échec (`sqlite3.Error`) arrête tout, rien n'est purgé.
+5. Purge dans une transaction `diff.db` : table temporaire `_gone`, lignes `diff_index` retirées **par paire** (index
+   `(nick, archive_new)` : jamais de balayage sur `archive_old`, sans index), puis paires, snapshots, stats, exclus,
+   orphelins de `snapshot_file` si des snapshots sont partis. Puis mesures, par liste explicite des disparues (jamais
+   `NOT IN` la liste : la mesure d'un Bkp écrite après `borg list` survit).
+   Interrompue après le figeage : rejouée au passage suivant, sans doublon (clé primaire d'`archive_chart`).
+6. Balayage unique par base (`db_meta.reconcile_sweep`) : lignes `diff_index` héritées sans paire dont une archive a
+   disparu (l'ancien nettoyage ne testait qu'`archive_new` : paire retirée, lignes restées). Leurs comptages sont figés
+   pour l'archive restante avant retrait. Seul balayage complet de `diff_index`, une fois ; une `diff.db` reconstruite
+   le refait (rapide, base neuve). Drapeau par nick (`reconcile_sweep:<nick>`) : plusieurs nicks peuvent partager une
+   `diff.db` (`DB_NAME`).
+
+Changement de `GLOB_ARCH` : les archives hors du nouveau motif sont traitées comme disparues (figées puis retirées).
+Erreurs (`_RECONCILE_ERRORS` : SQLite, codec — base chiffrée sans clé, mode changé par `DbEncrypt` —, `SystemExit` de
+`history.db` illisible) : message, rien retiré, Index continue. Retour : lignes retirées de `diff.db` (le nettoyage
+après Prune ne compacte que si ce nombre est non nul). `DIFF_KEEP` passe après le refresh des statistiques (dates
+nécessaires au figeage au premier Index d'un dépôt).
 
 ## Flux d'indexation
 
@@ -479,6 +524,8 @@ dernier snapshot par `borg list` complet ; les suivants repartent de lui). Véri
 ```
 borg list --json
     ↓
+_reconcile_archives (1.0.140) : archives disparues figées (history.db.archive_chart) puis retirées
+    ↓
 Phase 1 : déterminer les paires manquantes (diff_indexed_pairs)
           si force : purge diff_index + diff_indexed_pairs + diff_excluded_stats
     ↓
@@ -490,9 +537,9 @@ Phase 3 : insert groupé (connexion SQLite unique)
           → diff_index + diff_indexed_pairs
           → diff_excluded_stats (count + total_size par change_type)
     ↓
-DIFF_KEEP : purge des paires au-delà de la limite
-    ↓
 borg info --json (seulement si archive_stats manquantes) → archive_stats
+    ↓
+DIFF_KEEP : purge des paires au-delà de la limite (comptages figés d'abord, exclus de la paire retirés, 1.0.140)
     ↓
 indexsnap() → voir flux IndexSnap ci-dessous
 ```
@@ -1308,7 +1355,8 @@ format ISO `T` des dates d'archive ; `archive_date` NULL conservé ; départage 
 de `bkp_status` au démarrage d'un Bkp (`started_at` plus vieux que N mois). **`archive_stats` n'est jamais purgée par
 âge** : Report et l'Historique complet en ont besoin tant que l'archive existe (archives mensuelles/annuelles
 conservées par `KEEP_*`) ; elle suit déjà la rétention réelle du dépôt (`_cleanup_index_after_prune` supprime les
-lignes des archives prunées) — seule la série des graphiques est bornée. Fixtures `CodecSelfTest` à dates fixes :
+lignes des archives disparues, rapprochement 1.0.140) — seule la série des graphiques est bornée. Depuis 1.0.140, la
+série garde aussi les archives disparues dans la rétention (lignes figées de `history.db.archive_chart`, `pruned=true`). Fixtures `CodecSelfTest` à dates fixes :
 `STATS_RETENTION_MONTHS=1200` dans leur rc, pour ne pas devenir fausses avec le temps.
 
 borgHelperWWW : `_push_purge_expired()` (watcher, toutes les `PUSH_PURGE_INTERVAL`=3600 s, première passe au
