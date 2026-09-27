@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.16.0 -->
+<!-- UI_VERSION: 1.16.1 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -218,11 +218,15 @@
       <div id="browseSearchResults" hidden></div>
       <div id="browseNormalView">
         <table id="browseTableEl">
-          <thead><tr><th>Nom</th><th>Genre</th><th>Droits</th><th>Propriétaire</th><th>Dernier événement</th></tr></thead>
+          <thead><tr><th>Nom</th><th>Genre</th><th title="Dernier état connu : celui de la plus récente sauvegarde indexée contenant l'entrée — pas forcément celui de la sauvegarde épinglée ou comparée. Entrée supprimée : inconnu (—).">Droits ⓘ</th><th title="Dernier état connu : celui de la plus récente sauvegarde indexée contenant l'entrée — pas forcément celui de la sauvegarde épinglée ou comparée. Entrée supprimée : inconnu (—).">Propriétaire ⓘ</th><th>Dernier événement</th></tr></thead>
           <tbody id="browseBody"></tbody>
         </table>
         <p class="hint">Clic sur un dossier : ouvrir. Clic droit sur un dossier : télécharger un .tar.
           Clic sur un fichier : le télécharger.</p>
+        <p class="hint" id="browseRightsNotice">ⓘ <strong>Droits et propriétaire</strong> : dernier état connu, c'est-à-dire
+          celui de la plus récente sauvegarde indexée qui contient l'entrée — pas forcément celui de la sauvegarde
+          épinglée ou des sauvegardes comparées. Inconnus (—) pour une entrée supprimée. Pour les droits exacts d'une
+          sauvegarde donnée : télécharger au format .tar (« préserve les droits d'accès »).</p>
         <p class="hint" id="browsePinnedHint" hidden></p>
       </div>
     </div>
@@ -1309,11 +1313,11 @@ async function loadBrowse(){
     document.getElementById('browseTitle').textContent=reqNick+' — changements '+reqChanges.from+' → '+reqChanges.to+' — '+(reqPath||'/');
     hint.hidden=false;
     hint.textContent="Changements entre deux sauvegardes : seules les entrées ajoutées, modifiées ou supprimées APRÈS « "
-      +reqChanges.from+" » et jusqu'à « "+reqChanges.to+" » (incluse) sont affichées ; un dossier apparaît dès qu'un changement a eu lieu en dessous. Droits/propriétaire = dernier état connu.";
+      +reqChanges.from+" » et jusqu'à « "+reqChanges.to+" » (incluse) sont affichées ; un dossier apparaît dès qu'un changement a eu lieu en dessous (droits et propriétaire : voir la notice ci-dessous).";
   }else if(reqArchive){
     document.getElementById('browseTitle').textContent=reqNick+' — archive '+reqArchive+' — '+(reqPath||'/');
     hint.hidden=false;
-    hint.textContent="Vue épinglée sur l'archive "+reqArchive+" : seuls les événements de cette sauvegarde sont affichés (droits/genre/propriétaire = dernier état connu, pas forcément celui de cette archive).";
+    hint.textContent="Vue épinglée sur l'archive "+reqArchive+" : seuls les événements de cette sauvegarde sont affichés (genre, droits et propriétaire : voir la notice ci-dessous).";
   }else{
     document.getElementById('browseTitle').textContent=reqNick+' — '+(reqPath||'/');
     hint.hidden=true;

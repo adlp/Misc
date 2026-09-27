@@ -1,5 +1,16 @@
 # Changelog — borgHelper
 
+## borgHelperWWW_ui.html 1.16.1 — notice sur les droits dans l'explorateur — 2026-09-27
+
+Demande utilisateur : ajouter une notice quant aux droits.
+
+- Explorateur : notice permanente (tous modes : normal, archive épinglée, changements) et bulle ⓘ sur les colonnes
+  Droits et Propriétaire — elles montrent le **dernier état connu** (plus récente sauvegarde indexée contenant
+  l'entrée), pas forcément celui de la sauvegarde épinglée ou comparée ; inconnus (—) pour une entrée supprimée ;
+  pour les droits exacts d'une sauvegarde : téléchargement `.tar` « préserve les droits d'accès ». Auparavant, seuls
+  les modes épinglé et changements le mentionnaient, en fin de phrase.
+- Vérifié : notice visible dans les trois modes (Chrome headless), routeur UI 39/39.
+
 ## borgHelper 1.0.133 / borgHelperWWW 1.27.0 / borgHelperWWW_ui.html 1.16.0 — explorateur : changements entre deux sauvegardes — 2026-09-27
 
 Demande utilisateur : dans l'explorateur, n'afficher que les fichiers qui ont changé (ou disparu) entre deux
