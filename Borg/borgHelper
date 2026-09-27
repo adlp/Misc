@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.121"
+Version="1.0.122"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -168,9 +168,16 @@ def parse_diff_line_json(line):
         change_type=changes[0].get('type','?')
     return {'change_type':change_type,'size_before':size_before,'size_after':size_after,'path':path}
 
+def _borg_glob_args(ftor):
+    """Sélection par joker (`*`/`?`) pour borg extract/list (1.0.122). borg exige un opérateur en tête de
+    --pattern (`sh:X` seul -> ArgumentTypeError, la restauration par joker n'a jamais fonctionné), et un
+    `+` seul ne restreint rien (le défaut reste « inclure tout ») : inclure le motif PUIS exclure le reste.
+    Vérifié sur borg 1.2.6 (démo : motif e1000 -> 4 fichiers sur 15 244 ; `/` de tête accepté)."""
+    return [f'--pattern=+sh:{ftor}','--pattern=-sh:**']
+
 def _borg_extract_args(bid,ftor):
     base=['extract','--numeric-owner','--exclude','*/log/*',f'::{bid}']
-    if '*' in ftor or '?' in ftor: base+=[f'--pattern=sh:{ftor}']
+    if '*' in ftor or '?' in ftor: base+=_borg_glob_args(ftor)
     else: base.append(ftor)
     return base
 
@@ -3028,7 +3035,7 @@ class BorgHelper:
                 print(f"Archive (dernière) : {bid}",flush=True)
         fmt='{mode} {user:8} {group:8} {size:>12} {isomtime} {path}{NL}'
         args=['list','--format',fmt,f'::{bid}']
-        if '*' in ftor or '?' in ftor: args+=[f'--pattern=sh:{ftor}']
+        if '*' in ftor or '?' in ftor: args+=_borg_glob_args(ftor)
         else: args.append(ftor)
         rb=self.borg.boex(nick,args,debug=debug,retjson=False)
         for line in rb['stdout']:

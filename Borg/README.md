@@ -449,7 +449,7 @@ borgHelper -c Restore -n mon-serveur -f 'home/user' -w - \
 | Option | Description |
 |--------|-------------|
 | `-b` | Nom de l'archive — si absent : dernière archive SQLite contenant `-f` |
-| `-f` | Chemin exact ou glob (`*`, `?`) |
+| `-f` | Chemin exact ou glob (`*`, `?`) — glob réellement fonctionnel depuis 1.0.122 ; style shell de borg : `*` ne franchit pas `/`, `**` si (`'home/*/*.log'`, `'var/**/*.conf'`) |
 | `-w <dest>` | Restauration avec sous-répertoires (répertoire ou `.tar`/`.tgz`) |
 | `-w -` | Tar non-compressé vers stdout (pipeable) |
 | `-W <dest>` | Restauration plate — fichiers à la racine |

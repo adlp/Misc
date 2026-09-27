@@ -1,5 +1,14 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.122 — restauration par joker réparée — 2026-09-27
+
+Issu de `deferred-work.md` (lot A, traité avec l'utilisateur).
+
+- `Restore -f` avec `*`/`?` (et `Restore -L`) **n'avait jamais fonctionné** : borg 1.2 refuse `--pattern=sh:X` (un
+  opérateur `+`/`-` est obligatoire) et plantait. Désormais `--pattern=+sh:X --pattern=-sh:**` : inclure le motif puis
+  exclure le reste — un `+` seul ne restreindrait rien. Vérifié sur la démo : motif
+  `lib/modules/*/kernel/drivers/net/ethernet/intel/e1000*/*` → 4 fichiers restaurés sur 15 244 ; `modules.de?` → 1.
+
 ## borgHelper 1.0.121 — explorateur des bases chiffrées : décodage limité aux enfants directs — 2026-09-27
 
 Demande utilisateur : réaliser la « piste 2 » de l'étude d'accélération de l'exploration des bases chiffrées.
