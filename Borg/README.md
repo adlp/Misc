@@ -60,6 +60,12 @@ BORG_ROOTBKP     = /
 # alerte si dernière sauvegarde > N heures (défaut 25) : serveur en erreur dans Report, et
 # notification push « sauvegarde en retard » (borgHelperWWW >= 1.24.0, type Échec)
 MAX_AGE_BKP      = 25
+# Alertes Sentry opérationnelles (borgHelper >= 1.0.132, désactivées par défaut ; voir « Sentry » plus bas) :
+#   bkp_error : sauvegarde en échec (ou bloquée au-delà du délai du watcher de borgHelperWWW)
+#   overdue   : dernière sauvegarde plus vieille que MAX_AGE_BKP (détectée par borgHelperWWW, rappel à
+#               chaque période supplémentaire)
+# liste séparée par des virgules, ou all ; utilisable dans [DEFAULT] pour tous les serveurs
+SENTRY_ALERTS    = bkp_error,overdue
 # nombre de sauvegardes affichées dans Report
 DISPLAY_BKP      = 5
 
@@ -208,6 +214,22 @@ CACHE_DIR = /data/borgcache
 # défaut : tout le monde peut au moins lire
 GROUPS_READ = ops-readers,ops-writers,ops-admins
 ```
+
+### Sentry
+
+DSN lu dans `BORGHELPERC_SENTRY_DSN`, sinon dans le fichier désigné par `BORGHELPERC_SENTRY_FILE`, sinon dans
+`/usr/local/etc/borghelper-sentry` (première ligne) ; absent = Sentry désactivé. Depuis 1.0.132, Sentry ne reçoit que :
+
+- les **erreurs logicielles** (exception non prévue, bug) — plus aucune trace de performance (auparavant une par
+  invocation, donc une par clic de l'interface web) ; les erreurs de données ou de configuration (passphrase fausse,
+  base altérée…) affichent un message et ne partent pas ;
+- les **alertes opérationnelles** demandées par `SENTRY_ALERTS` (par serveur ou dans `[DEFAULT]`) : `bkp_error` —
+  sauvegarde en échec, envoyée par borgHelper à la fin du `Bkp`, ou sauvegarde bloquée constatée par borgHelperWWW ;
+  `overdue` — dernière sauvegarde plus vieille que `MAX_AGE_BKP`, constatée par le watcher de borgHelperWWW (qui doit
+  donc tourner), une alerte au franchissement puis un rappel à chaque période supplémentaire, indépendamment des
+  notifications push. Événements de niveau `error`, étiquetés `alert`/`nick`, regroupés par (type, serveur).
+
+Chemins et passphrase sont masqués dans tout ce qui part (voir TECHNICAL.md, AD-15).
 
 ---
 

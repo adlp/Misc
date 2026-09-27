@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.131"
+Version="1.0.132"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -3428,6 +3428,10 @@ class BorgHelper:
                 print(json.dumps(out,indent=4),file=sys.stdout,flush=True)
             self.db.store_bkp_status_finish(nick,run_id,'success' if newretC==0 else 'error',bkp_status_db,
                 changed_during_backup=len(warn['changed_during_backup']),read_errors=len(warn['read_errors']))
+            if newretC!=0:  # même règle que la notification push d'échec ; SENTRY_ALERTS=bkp_error requis
+                sentry_alert('bkp_error',nick,f"Sauvegarde en échec — {nick} (code {newretC})",cfg,
+                             extra={'exitcode':newretC,'changed_during_backup':len(warn['changed_during_backup']),
+                                    'read_errors':len(warn['read_errors'])})
             sys.exit(newretC)
         finally:
             self.db.clear_priority_lock(nick)
@@ -6537,6 +6541,43 @@ def codec_selftest():
                 if saved is None: os.environ.pop('BORG_PASSPHRASE',None)
                 else: os.environ['BORG_PASSPHRASE']=saved
         check("Sentry before_send : chemins et passphrase masqués aussi dans le texte libre (exception, message, logentry, fils d'Ariane)",_sentry_text_ok)
+        check("SENTRY_ALERTS : analyse (liste, 'all', casse, valeurs inconnues ignorées, absent = aucune)",
+              lambda: _sentry_alert_kinds({'SENTRY_ALERTS':'bkp_error'})=={'bkp_error'}
+                      and _sentry_alert_kinds({'SENTRY_ALERTS':' Overdue , BKP_ERROR x'})=={'overdue','bkp_error'}
+                      and _sentry_alert_kinds({'SENTRY_ALERTS':'all'})=={'bkp_error','overdue'}
+                      and _sentry_alert_kinds({})==set() and _sentry_alert_kinds(None)==set()
+                      and _sentry_alert_kinds({'SENTRY_ALERTS':'none'})==set())
+        def _sentry_alert_ok():
+            """1.0.132 : sentry_alert n'envoie que si le type est actif pour le nick ; événement 'error', étiquettes
+            alert/nick, empreinte (type, nick), texte filtré (before_send) ; client initialisé SANS trace de
+            performance. Faux transport : rien ne part vers un vrai Sentry ; client d'origine restauré."""
+            try: import sentry_sdk
+            except ImportError: return True  # sentry-sdk absent : sentry_alert renvoie False, rien à vérifier
+            hub=sentry_sdk.Hub.current; old_client=hub.client; saved=os.environ.get('BORGHELPERC_SENTRY_DSN')
+            got=[]
+            try:
+                os.environ['BORGHELPERC_SENTRY_DSN']='https://cle@o0.ingest.sentry.io/0'
+                hub.bind_client(None)
+                _orig=sentry_sdk.init
+                def _init(**kw): kw['transport']=lambda ev: got.append(ev); return _orig(**kw)
+                sentry_sdk.init=_init
+                try:
+                    off=sentry_alert('overdue','nA','x',{'SENTRY_ALERTS':'bkp_error'})
+                    on=sentry_alert('bkp_error','nA','Sauvegarde en échec — nA (/srv/secret)',{'SENTRY_ALERTS':'bkp_error'},extra={'exitcode':2})
+                    no_traces=not hub.client.options.get('traces_sample_rate')
+                finally:
+                    sentry_sdk.init=_orig
+                ev=got[0] if got else {}
+                msg=(ev.get('logentry') or {}).get('message') or ev.get('message')
+                return (off is False and on is True and len(got)==1 and ev.get('level')=='error'
+                        and ev.get('tags',{}).get('alert')=='bkp_error' and ev.get('tags',{}).get('nick')=='nA'
+                        and ev.get('fingerprint')==['borghelper-alert','bkp_error','nA']
+                        and msg=='Sauvegarde en échec — nA (<chemin>)' and no_traces)
+            finally:
+                hub.bind_client(old_client)
+                if saved is None: os.environ.pop('BORGHELPERC_SENTRY_DSN',None)
+                else: os.environ['BORGHELPERC_SENTRY_DSN']=saved
+        check("sentry_alert : envoi seulement si activé, niveau error, étiquettes/empreinte, texte filtré, aucune trace de performance",_sentry_alert_ok)
         # ── Story 5 : DbEncrypt / DbDecrypt / DbRekey / DbStatus, curseur/reprise, AD-6, AD-7 ──────
         def _cas_primitives_ok():
             p=os.path.join(tmp,'cas.db')
@@ -7237,28 +7278,68 @@ def _sentry_before_send(event,hint):
         if isinstance(b,dict) and 'data' in b: b['data']=_sentry_scrub(b['data'])
     return event
 
-def _cli_main():
-    sentryid=getDataFromEnvOrFile(env="BORGHELPERC_SENTRY_DSN",envpath="BORGHELPERC_SENTRY_FILE",paths="/usr/local/etc/borghelper-sentry")
-    if sentryid is not None:
+def _sentry_dsn():
+    return getDataFromEnvOrFile(env="BORGHELPERC_SENTRY_DSN",envpath="BORGHELPERC_SENTRY_FILE",paths="/usr/local/etc/borghelper-sentry")
+
+def _sentry_init(dsn,release=None):
+    """Initialise Sentry (CLI au démarrage ; borgHelperWWW à la première alerte). Aucune trace de
+    performance (1.0.132 : plus de traces_sample_rate — auparavant 1.0, une transaction envoyée à CHAQUE
+    invocation, donc à chaque clic de l'interface web) : seules partent les erreurs logicielles
+    (exceptions non prévues, via l'excepthook) et les alertes SENTRY_ALERTS explicites (sentry_alert).
+    auto_enabling_integrations=False : évite la découverte automatique d'intégrations tierces (boto3,
+    frameworks web…), ~100-180 ms par invocation. Ne JAMAIS ajouter default_integrations=False : ça
+    désactive aussi excepthook/logging/dedupe/atexit — plus aucune exception ne remonterait (borgHelper
+    n'appelle jamais capture_exception() lui-même). include_local_variables=False + before_send : aucun
+    chemin/passphrase/DEK ne sort du processus (AD-15), y compris via les variables locales des frames."""
+    import sentry_sdk
+    kw=dict(dsn=dsn,environment="production",release=release or f"borgHelper@{Version}",
+            auto_enabling_integrations=False,before_send=_sentry_before_send)
+    try:
+        sentry_sdk.init(include_local_variables=False,**kw)
+    except TypeError as e:
+        # sentry-sdk < 1.26 : option renommée (with_locals). Ne rattraper QUE ce cas précis — toute autre
+        # TypeError (mauvais usage, autre kwarg) doit remonter plutôt que d'être masquée par ce repli.
+        if 'include_local_variables' not in str(e): raise
+        sentry_sdk.init(with_locals=False,**kw)
+
+_SENTRY_ALERT_KINDS=('bkp_error','overdue')
+
+def _sentry_alert_kinds(cfg):
+    """SENTRY_ALERTS du nick (rc, [DEFAULT] hérité) -> ensemble de types d'alerte actifs. Liste séparée par
+    des virgules/espaces : bkp_error (sauvegarde en échec), overdue (dernière sauvegarde plus vieille que
+    MAX_AGE_BKP) ; 'all' = les deux ; absent/vide/'none' = aucune (défaut). Valeur inconnue ignorée."""
+    raw=(cfg.get('SENTRY_ALERTS','') if cfg is not None else '') or ''
+    toks={t.strip().lower() for t in re.split(r'[,\s]+',raw) if t.strip()}
+    if 'all' in toks: return set(_SENTRY_ALERT_KINDS)
+    return toks & set(_SENTRY_ALERT_KINDS)
+
+def sentry_alert(kind,nick,message,cfg,extra=None,release=None):
+    """Alerte opérationnelle vers Sentry (1.0.132) — pas une erreur logicielle : SEULEMENT si `kind` figure
+    dans SENTRY_ALERTS du nick et qu'un DSN est configuré. Événement de niveau 'error', regroupé par
+    (type, nick) dans Sentry (empreinte), étiquettes alert/nick, texte filtré par before_send comme le reste.
+    Initialise Sentry si le processus ne l'a pas encore fait (borgHelperWWW). True si l'événement est parti.
+    Ne lève jamais : une alerte ne doit pas faire échouer la sauvegarde ni le watcher."""
+    if kind not in _sentry_alert_kinds(cfg): return False
+    try:
+        dsn=_sentry_dsn()
+        if not dsn: return False
         import sentry_sdk
-        # auto_enabling_integrations=False : évite la découverte automatique d'intégrations tierces
-        # (boto3, frameworks web, etc. — sans rapport avec cet outil CLI), qui coûte ~100-180ms à
-        # elle seule sur CHAQUE invocation. Ne JAMAIS ajouter default_integrations=False à côté :
-        # ça désactive aussi excepthook/logging/dedupe/atexit — plus aucune exception ne remonterait
-        # à Sentry (vérifié : borgHelper n'appelle jamais capture_exception() explicitement, tout
-        # repose sur l'excepthook par défaut).
-        # include_local_variables=False + before_send : aucun chemin/passphrase/DEK ne doit sortir du
-        # processus vers Sentry (AD-15), y compris via les variables locales des frames capturées.
-        try:
-            sentry_sdk.init(dsn=sentryid,environment="production",release=f"borgHelper@{Version}",traces_sample_rate=1.0,
-                             auto_enabling_integrations=False,include_local_variables=False,before_send=_sentry_before_send)
-        except TypeError as e:
-            # sentry-sdk < 1.26 : option renommée (with_locals), avant include_local_variables. Ne
-            # rattraper QUE ce cas précis — toute autre TypeError (mauvais usage, autre kwarg) doit
-            # remonter normalement plutôt que d'être masquée par ce repli de compatibilité.
-            if 'include_local_variables' not in str(e): raise
-            sentry_sdk.init(dsn=sentryid,environment="production",release=f"borgHelper@{Version}",traces_sample_rate=1.0,
-                             auto_enabling_integrations=False,with_locals=False,before_send=_sentry_before_send)
+        if sentry_sdk.Hub.current.client is None: _sentry_init(dsn,release=release)
+        with sentry_sdk.push_scope() as scope:
+            scope.set_tag('alert',kind); scope.set_tag('nick',nick)
+            scope.fingerprint=['borghelper-alert',kind,nick]
+            for k,v in (extra or {}).items(): scope.set_extra(k,v)
+            sentry_sdk.capture_message(message,level='error')
+        sentry_sdk.flush(timeout=5)
+        return True
+    except Exception as e:
+        print(f"[WARN] alerte Sentry {kind} ({nick}) non envoyée : {type(e).__name__}: {e}",file=sys.stderr,flush=True)
+        return False
+
+def _cli_main():
+    sentryid=_sentry_dsn()
+    if sentryid is not None:
+        _sentry_init(sentryid)
 
     try:
         opts,args=getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILC:FSN:ox:DP:RyK",["help"])

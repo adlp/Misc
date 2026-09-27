@@ -58,12 +58,13 @@ def _push_deps_hint(err):
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail,
                          DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec,
-                         _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES, _enc_header_read)
+                         _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES, _enc_header_read, sentry_alert,
+                         _sentry_alert_kinds)
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.26.7"
+WWW_VERSION="1.26.8"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -437,6 +438,12 @@ def _bkp_status_watcher_pass():
                 print(f"[watcher] bkp_status (fin) réclamé : nick={nick} run_id={row['run_id']} result={result}"
                       +''.join(f" {k}={v}" for k,v in warnings.items() if v),file=sys.stderr,flush=True)
                 _send_bkp_push(nick,'end',result,warnings)
+                if not row['finished_at']:
+                    # Bloquée au-delà de BKP_STATUS_TIMEOUT (AD-7) : seul le watcher le constate. Un échec
+                    # ordinaire est déjà signalé à Sentry par borgHelper lui-même (même réglage) — pas de doublon.
+                    sentry_alert('bkp_error',nick,f"Sauvegarde bloquée ou interrompue — {nick} "
+                                 f"(sans fin après {BKP_STATUS_TIMEOUT} s)",_bh_paths.borg.cfgread(nick),
+                                 extra={'run_id':row['run_id'],'timeout_s':BKP_STATUS_TIMEOUT},release=f"borgHelperWWW@{WWW_VERSION}")
             for row in _bh_paths.db.list_pending_bkp_status_start(nick,db_path):
                 if not _bh_paths.db.claim_bkp_status_start(nick,row['run_id'],db_path):
                     continue  # déjà réclamée par un autre worker (CAS perdu) — jamais de double traitement
@@ -485,7 +492,8 @@ def _overdue_claim(nick,last_archive,level):
         conn.close()
 
 def _check_overdue(nick,db_path):
-    """Sauvegarde en retard (1.24.0) : dernière archive connue plus vieille que MAX_AGE_BKP heures
+    """(1.26.8 : alerte Sentry SENTRY_ALERTS=overdue en tête, indépendante de tout ce qui suit sur le push.)
+    Sauvegarde en retard (1.24.0) : dernière archive connue plus vieille que MAX_AGE_BKP heures
     (même règle que Report, qui marque déjà ce nick en erreur) -> notification push de type ÉCHEC.
     Une alerte au franchissement du seuil, puis un rappel à chaque période MAX_AGE_BKP supplémentaire
     (2x, 3x...), jusqu'à la prochaine archive. Rien si aucune archive connue, si un Bkp est en cours
@@ -493,16 +501,24 @@ def _check_overdue(nick,db_path):
     échec), si l'envoi push est indisponible, ou si personne n'est abonné aux échecs de ce host —
     dans ces trois derniers cas l'alerte n'est PAS consommée : un abonnement pris pendant le retard
     reçoit l'alerte au passage suivant, pas seulement au rappel d'après."""
-    if not _PYWEBPUSH_AVAILABLE or PUSH_VAPID_PRIVATE_KEY is None: return
     last=_bh_paths.db.last_archive_stat(nick,db_path)
     if last is None: return
     archive,archive_date=last
     age=_archive_age_hours(archive_date)
-    max_age=_max_age_bkp(_bh_paths.borg.cfgread(nick))
+    cfg=_bh_paths.borg.cfgread(nick)
+    max_age=_max_age_bkp(cfg)
     if age is None or age<=max_age: return
     if _bh_paths.db.bkp_running(nick,BKP_STATUS_TIMEOUT,db_path): return
-    if not _push_subscriptions_for(nick,'error'): return
     level=int(age//max_age)
+    # Alerte Sentry (1.26.8, SENTRY_ALERTS=overdue) : canal indépendant du push — réservation propre
+    # ('<nick>#sentry' dans overdue_alerts), mêmes rappels à chaque période MAX_AGE_BKP.
+    if 'overdue' in _sentry_alert_kinds(cfg) and _overdue_claim(f"{nick}#sentry",archive,level):
+        sentry_alert('overdue',nick,f"Sauvegarde en retard — {nick} : dernière il y a {age:.0f} h "
+                     f"(seuil MAX_AGE_BKP {max_age:g} h{', rappel' if level>1 else ''})",cfg,
+                     extra={'age_hours':round(age,1),'max_age_hours':max_age,'level':level},
+                     release=f"borgHelperWWW@{WWW_VERSION}")
+    if not _PYWEBPUSH_AVAILABLE or PUSH_VAPID_PRIVATE_KEY is None: return
+    if not _push_subscriptions_for(nick,'error'): return
     if not _overdue_claim(nick,archive,level): return
     print(f"[watcher] sauvegarde en retard : nick={nick} dernière archive il y a {age:.1f} h "
           f"(MAX_AGE_BKP={max_age:g} h, alerte n°{level})",file=sys.stderr,flush=True)
@@ -3229,6 +3245,27 @@ def push_selftest():
                     _check_overdue('nickSansAbonne',None)
                 return _overdue_claim('nickSansAbonne','Z1',1)   # toujours disponible : jamais consommée
             check("retard : sans abonné aux échecs de ce host, l'alerte n'est pas consommée",_overdue_no_subscriber)
+            def _overdue_sentry():
+                """1.26.8 : SENTRY_ALERTS=overdue -> alerte Sentry même sans abonné push ni pywebpush, une fois par
+                niveau (rappel à la période suivante) ; sans le réglage -> aucune alerte (sentry_alert jamais appelé
+                avec un type actif). sentry_alert remplacé par un enregistreur : rien ne part vers un vrai Sentry."""
+                state={'date':(_dt.datetime.now()-_dt.timedelta(hours=30)).isoformat(),'cfg':{'MAX_AGE_BKP':'25','SENTRY_ALERTS':'overdue'}}
+                sent=[]
+                def _rec(kind,nick,msg,cfg,extra=None,release=None):
+                    if kind in _sentry_alert_kinds(cfg): sent.append((kind,nick,extra['level']))
+                    return True
+                def _run(nick):
+                    with mock.patch.object(_bh_paths.db,'last_archive_stat',lambda n,p=None:('S1',state['date'])), \
+                         mock.patch.object(_bh_paths.db,'bkp_running',lambda n,t,p=None:False), \
+                         mock.patch.object(_bh_paths.borg,'cfgread',lambda n:state['cfg']), \
+                         mock.patch(f"{__name__}.sentry_alert",side_effect=_rec), \
+                         mock.patch(f"{__name__}._PYWEBPUSH_AVAILABLE",False):
+                        _check_overdue(nick,None)
+                _run('nickSentry'); _run('nickSentry')                       # 30 h : une alerte, pas de doublon
+                state['date']=(_dt.datetime.now()-_dt.timedelta(hours=51)).isoformat(); _run('nickSentry')  # rappel
+                state['cfg']={'MAX_AGE_BKP':'25'}; _run('nickSansReglage')  # réglage absent : rien
+                return sent==[('overdue','nickSentry',1),('overdue','nickSentry',2)]
+            check("retard : SENTRY_ALERTS=overdue -> alerte Sentry indépendante du push, dédupliquée, rappel ; rien sans le réglage",_overdue_sentry)
             check("push : WebPushException status_code=410 -> abonnement désabonné automatiquement (push.db ET JSON)",
                   lambda: conn.execute("SELECT 1 FROM push_subscriptions WHERE endpoint='push-ep-410'").fetchone() is None
                           and 'push-ep-410' not in _push_prefs_load()['subscriptions'])

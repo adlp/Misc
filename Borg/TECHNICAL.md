@@ -1082,6 +1082,23 @@ redémarrage. Jamais à chaque requête ; erreur SQLite ignorée (pur cache).
 balayage plus grand que la borne, le vidage complet jetait aussi les préfixes chauds, recalculés aussitôt. Coût
 amorti O(1) par insertion ; aucune incidence sur la vérification (une entrée n'est mémorisée qu'après validation).
 
+### Sentry : erreurs logicielles et alertes opérationnelles seulement (1.0.132 / borgHelperWWW 1.26.8)
+
+`_sentry_init(dsn, release)` (source unique, CLI et borgHelperWWW) : plus de `traces_sample_rate` — le `1.0` précédent
+envoyait une transaction de performance à chaque invocation. Restent : l'excepthook (erreurs logicielles ; les
+erreurs de base chiffrée sont interceptées avant, voir 1.0.124) et `sentry_alert(kind, nick, message, cfg, extra,
+release)` : n'envoie que si `kind` ∈ `_sentry_alert_kinds(cfg)` (`SENTRY_ALERTS`, liste ou `all`, défaut vide) et
+qu'un DSN existe ; initialise Sentry s'il ne l'est pas (borgHelperWWW n'a pas de Sentry par ailleurs) ;
+`capture_message(level='error')` dans un `push_scope` (étiquettes `alert`/`nick`, empreinte
+`['borghelper-alert', kind, nick]` : une issue Sentry par type et serveur), `flush(5)` ; ne lève jamais.
+
+Émetteurs : `backup()` (borgHelper) si `newretC != 0`, même règle que la notification push d'échec ; watcher
+borgHelperWWW pour une ligne `bkp_status` jamais terminée au-delà de `BKP_STATUS_TIMEOUT` (AD-7 — un échec ordinaire
+est déjà signalé par borgHelper, pas de doublon) ; `_check_overdue` pour `overdue`, réservation propre
+`_overdue_claim('<nick>#sentry', archive, niveau)` — même rappel par période, **indépendante** du push (émise même sans
+pywebpush ni abonné). Tests : faux transport Sentry (`CodecSelfTest`), `sentry_alert` remplacé par un enregistreur
+(`push_selftest`) — aucun envoi réel.
+
 ### Contrôles de la clé du cache par périmètre (borgHelperWWW 1.26.7)
 
 `push_selftest` analyse (`ast`) le source de chaque route qui appelle `_scoped_cached_mono`/`_multi` : tout paramètre

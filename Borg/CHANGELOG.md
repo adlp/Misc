@@ -1,5 +1,19 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.132 / borgHelperWWW 1.26.8 — Sentry : erreurs logicielles et alertes demandées seulement — 2026-09-27
+
+Demande utilisateur : Sentry ne doit recevoir que les erreurs logicielles, plus un réglage pour être alerté d'une
+sauvegarde en échec ou trop ancienne.
+
+- Plus aucune trace de performance envoyée (auparavant une par invocation de borgHelper, donc à chaque clic de
+  l'interface web). Restent les erreurs logicielles (exceptions non prévues).
+- Nouveau réglage `SENTRY_ALERTS` dans le rc (par serveur ou `[DEFAULT]`, désactivé par défaut) : `bkp_error`
+  (sauvegarde en échec — envoyée par borgHelper ; ou bloquée — constatée par borgHelperWWW), `overdue` (dernière
+  sauvegarde plus vieille que `MAX_AGE_BKP` — constatée par borgHelperWWW, rappel à chaque période, indépendamment
+  des notifications push), `all` pour les deux. Événement Sentry de niveau `error`, étiqueté `alert`/`nick`, une issue
+  par type et par serveur.
+- `CodecSelfTest` 341/341, `push_selftest` 79/79 (faux transport Sentry, aucun envoi réel).
+
 ## borgHelperWWW 1.26.7 — contrôles automatiques manquants — 2026-09-27
 
 Issu de `deferred-work.md` (lot A : vérifications absentes). Aucun changement de comportement.
