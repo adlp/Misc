@@ -7,10 +7,10 @@
 #*/
 
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading,uuid
-import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib
+import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.127"
+Version="1.0.128"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -690,6 +690,12 @@ _PATH_TAG_LEN=12
 _KDF_LEVELS=('light','standard','strong')
 _PATH_ENC_MODES=('siv1','migrating')
 _DEC_MEMO_MAX=262144  # entrées du mémo de décodage (DbCodec.decode_path)
+
+def _memo_evict(memo):
+    """Mémo plein : retire la MOITIÉ la plus ancienne (ordre d'insertion des dict) au lieu de tout vider
+    (1.0.128). Un balayage d'une grosse base dépassait sans cesse la borne : le vidage complet jetait aussi
+    les entrées chaudes (préfixes communs), recalculées aussitôt. Coût amorti : O(1) par insertion."""
+    for k in list(itertools.islice(memo,len(memo)//2)): del memo[k]
 # ── Migration (story 5) ──
 _MIGRATE_TABLES=('snapshot_file','diff_index')  # ordre figé (AD-7) : archive_snapshot n'a pas de
 # colonne path propre (jointure sur snapshot_file, rien à y migrer directement) ; les tables de
@@ -814,7 +820,7 @@ class DbCodec:
         v=self._memo.get(stored)
         if v is None:
             v=self.decode_path_verified(stored)
-            if len(self._memo)>=_DEC_MEMO_MAX: self._memo.clear()
+            if len(self._memo)>=_DEC_MEMO_MAX: _memo_evict(self._memo)
             self._memo[stored]=v
         return v
 
@@ -842,7 +848,7 @@ class DbCodec:
                 seg=_xor(ct,p._ks(tag,len(ct)))
                 if not hmac.compare_digest(_hmac(p._kp,prev,seg)[:_PATH_TAG_LEN],tag):
                     raise DbCodecError("tag de segment invalide")
-                if len(self._seg_memo)>=_DEC_MEMO_MAX: self._seg_memo.clear()
+                if len(self._seg_memo)>=_DEC_MEMO_MAX: _memo_evict(self._seg_memo)
                 hit=(seg,tag); self._seg_memo[key]=hit
             seg,tag=hit
             segs.append(seg); prev=tag
@@ -5804,10 +5810,11 @@ def codec_selftest():
         check("préfixe par intervalle (chiffré) : descendants stricts, jamais un frère ni %/_ joker",lambda: _bounds_ok(cq))
         check("racine/préfixe vide : aucune borne, aucune condition",lambda: _psel_under(cq,'')[0]=='' and _closing(lambda c:_psel_under(c,'')[0]==''))
         cq.close()
-        check("décodage mémoïsé borné : vidé à saturation, résultat inchangé",lambda: (lambda cd:(
+        check("décodage mémoïsé borné : à saturation, la moitié la plus ancienne est retirée (1.0.128), résultat inchangé",lambda: (lambda cd:(
               cd.decode_path(cd.path.encode('a/b'))=='a/b' and cd.decode_path(cd.path.encode('a/b'))=='a/b' and
               (setattr(cd,'_memo',{str(i):'x' for i in range(_DEC_MEMO_MAX)}) or True) and
-              cd.decode_path(cd.path.encode('c/d'))=='c/d' and len(cd._memo)==1))(DbCodec(cq_dek)))
+              cd.decode_path(cd.path.encode('c/d'))=='c/d' and len(cd._memo)==_DEC_MEMO_MAX//2+1
+              and '0' not in cd._memo and str(_DEC_MEMO_MAX-1) in cd._memo and cd.path.encode('c/d') in cd._memo))(DbCodec(cq_dek)))
         # base de test : mêmes lignes en plain ('qp') et chiffré ('qe'), écrites via le codec de chaque base
         qcache=os.path.join(tmp,'qcache'); qrc=os.path.join(tmp,'qrc'); os.makedirs(qcache)
         bhq=BorgHelper(cfgfile=qrc,cache_dir=qcache)

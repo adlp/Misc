@@ -1045,6 +1045,13 @@ Pistes étudiées : (2) ne décoder que les enfants directs du répertoire list�
 section suivante ; (3) processus `borgHelper` persistant interrogé par borgHelperWWW (supprime ~250 ms de
 démarrage + KDF par clic, mémo de décodage chaud d'un clic à l'autre) — **non réalisée**.
 
+### Mémo de décodage : éviction de moitié (1.0.128)
+
+`DbCodec._memo` (chemin complet) et `_seg_memo` (segment) sont bornés à `_DEC_MEMO_MAX` (262 144). À saturation,
+`_memo_evict` retire la moitié la plus ancienne (ordre d'insertion des `dict`) au lieu de tout vider : sur un
+balayage plus grand que la borne, le vidage complet jetait aussi les préfixes chauds, recalculés aussitôt. Coût
+amorti O(1) par insertion ; aucune incidence sur la vérification (une entrée n'est mémorisée qu'après validation).
+
 ### Rétention et bornage des historiques (1.0.127 / borgHelperWWW 1.26.3)
 
 `STATS_RETENTION_MONTHS` (13 par défaut, par nick) gouverne désormais trois choses : purge de `repo_stats` à

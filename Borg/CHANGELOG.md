@@ -1,5 +1,13 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.128 — mémo de décodage : éviction de moitié — 2026-09-27
+
+Issu de `deferred-work.md` (lot A).
+
+- Bases chiffrées : le mémo de décodage des chemins (262 144 entrées) était vidé d'un seul coup une fois plein —
+  sur une grosse base, les répertoires les plus fréquents étaient recalculés sans cesse. Il retire désormais la
+  moitié la plus ancienne. Aucune incidence sur la vérification des chemins. `CodecSelfTest` 337/337.
+
 ## borgHelper 1.0.127 / borgHelperWWW 1.26.3 — historiques bornés à 13 mois, purges manquantes — 2026-09-27
 
 Issu de `deferred-work.md` (point B4 « bornage par défaut surchargeable, 13 mois », plus lot A).
