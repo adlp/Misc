@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.26.7 — contrôles automatiques manquants — 2026-09-27
+
+Issu de `deferred-work.md` (lot A : vérifications absentes). Aucun changement de comportement.
+
+- `push_selftest` 78/78, nouveaux contrôles :
+  - chaque paramètre des 9 routes servies par le cache de périmètre figure dans la clé de cache (analyse du code des
+    routes — un paramètre oublié ferait servir le résultat d'une autre requête, ex. IdxTop `topn=5` pour `topn=50`) ;
+    vérifié par mutation (retirer `topn` de la clé d'IdxTop est détecté). `json_output` exempté : sans effet dans la
+    branche à périmètre, toujours en JSON ;
+  - cache : paramètres différents → miss, identiques → hit ; `scopecache.db` impossible à ouvrir → miss silencieux ;
+  - routes `/repohistory` et `/archivehistory` de bout en bout en HTTP.
+
 ## borgHelper 1.0.131 / borgHelperWWW 1.26.6 — structure des bases contrôlée, y compris en continu — 2026-09-27
 
 Issu de `deferred-work.md` (point B10 : « comparaison régulière, borgHelperWWW restant tout le temps démarré »).

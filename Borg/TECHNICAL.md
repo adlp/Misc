@@ -1082,6 +1082,15 @@ redémarrage. Jamais à chaque requête ; erreur SQLite ignorée (pur cache).
 balayage plus grand que la borne, le vidage complet jetait aussi les préfixes chauds, recalculés aussitôt. Coût
 amorti O(1) par insertion ; aucune incidence sur la vérification (une entrée n'est mémorisée qu'après validation).
 
+### Contrôles de la clé du cache par périmètre (borgHelperWWW 1.26.7)
+
+`push_selftest` analyse (`ast`) le source de chaque route qui appelle `_scoped_cached_mono`/`_multi` : tout paramètre
+de sa signature (hors `request`, `nick`, `x_api_key`, `x_borg_passphrase`, `json_output`) doit apparaître comme clé du
+dict `params` (affecté à `params=` ou passé en argument). `json_output` est exempté parce que la branche à périmètre
+répond toujours en JSON (`_run_scoped`), le paramètre n'y change rien. Un nouveau paramètre de route non ajouté à la
+clé fait échouer le contrôle. Complété par un contrôle comportemental de `_scoped_cached_mono` (miss/hit selon
+`params`) et de la dégradation silencieuse quand `SCOPE_CACHE_DB` ne s'ouvre pas.
+
 ### Rétention et bornage des historiques (1.0.127 / borgHelperWWW 1.26.3)
 
 `STATS_RETENTION_MONTHS` (13 par défaut, par nick) gouverne désormais trois choses : purge de `repo_stats` à

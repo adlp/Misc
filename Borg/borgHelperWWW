@@ -63,7 +63,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.26.6"
+WWW_VERSION="1.26.7"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -3434,6 +3434,67 @@ def push_selftest():
                                 and left=={_scope_cache_key(nk+'-autre','treehist',{},'s')})
                     finally:
                         _bh_paths.db.get_diff_db=old; SCOPE_CACHE_DB=old_sc; _NICK_CODEC_MEMO.clear()
+                def _cache_key_covers_route_params():
+                    """deferred-work (Story 1.5) : chaque paramètre d'une route servie par le cache de périmètre doit
+                    figurer dans la clé (`params`) — sinon deux requêtes différentes partagent la même ligne et
+                    l'une reçoit le résultat de l'autre (ex. IdxTop topn=5 servi pour topn=50). Analyse du source
+                    de chaque route utilisant _scoped_cached_mono/_multi. Exempté : json_output (branche à
+                    périmètre toujours en JSON, le paramètre n'y a aucun effet)."""
+                    import ast,inspect,textwrap
+                    exempt={'request','nick','x_api_key','x_borg_passphrase','json_output'}
+                    bad=[]; seen=0
+                    for route in app.routes:
+                        fn=getattr(route,'endpoint',None)
+                        try: src=textwrap.dedent(inspect.getsource(fn))
+                        except Exception: continue
+                        if '_scoped_cached_' not in src: continue
+                        seen+=1; keys=set()
+                        for node in ast.walk(ast.parse(src)):
+                            if (isinstance(node,ast.Assign) and isinstance(node.value,ast.Dict)
+                                    and any(isinstance(t,ast.Name) and t.id=='params' for t in node.targets)):
+                                keys|={k.value for k in node.value.keys if isinstance(k,ast.Constant)}
+                            if isinstance(node,ast.Call) and getattr(node.func,'id','') in ('_scoped_cached_mono','_scoped_cached_multi'):
+                                i=4 if node.func.id=='_scoped_cached_mono' else 5
+                                if len(node.args)>i and isinstance(node.args[i],ast.Dict):
+                                    keys|={k.value for k in node.args[i].keys if isinstance(k,ast.Constant)}
+                        missing=[p for p in inspect.signature(fn).parameters if p not in exempt and p not in keys]
+                        if missing: bad.append((route.path,missing))
+                    if bad: print(f"  clé de cache incomplète : {bad}")
+                    return seen>=9 and not bad
+                check("cache par périmètre : chaque paramètre des 9 routes cachées figure dans la clé (json_output exempté, sans effet)",
+                      _cache_key_covers_route_params)
+                def _scope_cache_params_and_open_failure():
+                    """Clé : même nick/commande/périmètre, params différents -> miss (jamais le résultat d'un autre
+                    topn) ; mêmes params -> hit. scopecache.db impossible à ouvrir -> get=None, put sans exception
+                    (pur cache, jamais une erreur visible). Base temporaire."""
+                    global SCOPE_CACHE_DB
+                    old_sc=SCOPE_CACHE_DB; SCOPE_CACHE_DB=os.path.join(tmpdir,'keys-scopecache.db')
+                    try:
+                        ensure_scope_cache_db(); calls=[]
+                        def run(tag): calls.append(tag); return JSONResponse(content={'exitcode':0,'stdout':tag,'stderr':''})
+                        nk='nick-sans-diffdb'  # aucun diff.db -> codec None, ligne en clair (sans objet ici)
+                        a=_scoped_cached_mono('idxtop',nk,['x'],'fp',{'topn':5,'depth':3},lambda: run('t5'))
+                        b=_scoped_cached_mono('idxtop',nk,['x'],'fp',{'topn':50,'depth':3},lambda: run('t50'))
+                        c=_scoped_cached_mono('idxtop',nk,['x'],'fp',{'topn':5,'depth':3},lambda: run('t5-bis'))
+                        keys_ok=(calls==['t5','t50'] and json.loads(b.body)['stdout']=='t50' and json.loads(c.body)['stdout']=='t5')
+                        SCOPE_CACHE_DB=os.path.join(tmpdir,'pas-un-fichier'); os.makedirs(SCOPE_CACHE_DB,exist_ok=True)
+                        g=_scope_cache_get(nk,'idxtop',{'topn':5},'s','fp')
+                        _scope_cache_put(nk,'idxtop',{'topn':5},'s','fp',{'exitcode':0})
+                        return keys_ok and g is None
+                    finally:
+                        SCOPE_CACHE_DB=old_sc
+                check("cache par périmètre : params différents -> miss, identiques -> hit ; scopecache.db inouvrable -> miss silencieux",
+                      _scope_cache_params_and_open_failure)
+                def _history_routes_ok():
+                    """/repohistory et /archivehistory de bout en bout (HTTP) : 200, CommandResult, stdout JSON {rows:[…]}."""
+                    nk=_nick_list('ALL')[0]; ok=True
+                    for path in ('/repohistory','/archivehistory'):
+                        rr=client.get(f"{P}{path}",headers=H,params={'nick':nk})
+                        try: body=json.loads(rr.json()['stdout'])
+                        except Exception: return False
+                        ok=ok and rr.status_code==200 and rr.json()['exitcode']==0 and isinstance(body.get('rows'),list)
+                    return ok
+                check("routes /repohistory et /archivehistory (HTTP) : 200, JSON {rows:[…]}",_history_routes_ok)
                 def _schema_watch_ok():
                     """1.26.6 : vue divergente réparée par la passe périodique ; code en mémoire périmé (borgHelper
                     mis à jour sur disque) -> jamais réparée, avertissement « redémarrer » une seule fois.
