@@ -1,5 +1,16 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.27.2 / borgHelperWWW_ui.html 1.17.1 — coupe-circuit des notifications push — 2026-09-27
+
+Issu de l'entretien `deferred-work.md` (point 2, options A + C).
+
+- `BORGHELPERWWW_PUSH_DISABLED=1` : suspend l'envoi de toutes les notifications push (journal seulement) ;
+  `POST /push/test` répond `503`, la page Notifications affiche un bandeau, les réglages des abonnés sont conservés.
+- `PUSH_MUTE = true` dans le rc (par serveur ou `[DEFAULT]`) : pause des notifications de ce serveur, prise en compte
+  sans redémarrage — pour une maintenance. Une alerte « sauvegarde en retard » n'est pas perdue : elle part à la
+  reprise si le retard persiste. Les fins de sauvegarde pendant la pause ne sont pas rejouées (pas de rafale).
+- Sentry non concerné (réglage `SENTRY_ALERTS`). `push_selftest` 82/82.
+
 ## borgHelper 1.0.134 / borgHelperWWW 1.27.1 / borgHelperWWW_ui.html 1.17.0 — badge « base non chiffrée » — 2026-09-27
 
 Issu de l'entretien `deferred-work.md` (point 1, story 5b) : badge seulement pour les anomalies.

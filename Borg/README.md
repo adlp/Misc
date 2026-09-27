@@ -66,6 +66,10 @@ MAX_AGE_BKP      = 25
 #               chaque période supplémentaire)
 # liste séparée par des virgules, ou all ; utilisable dans [DEFAULT] pour tous les serveurs
 SENTRY_ALERTS    = bkp_error,overdue
+# Pause des notifications push de ce serveur (borgHelperWWW >= 1.27.2), ex. pendant une maintenance :
+# relu à chaque envoi, sans redémarrage ; journal seulement. Une alerte « en retard » n'est pas perdue :
+# elle part à la reprise si le retard persiste. Ne touche pas Sentry (SENTRY_ALERTS).
+PUSH_MUTE        = false
 # nombre de sauvegardes affichées dans Report
 DISPLAY_BKP      = 5
 
@@ -1106,6 +1110,7 @@ première requête — voir `docs/borghelperrc.example`.
 | `BORGHELPERWWW_REQUIRE_USER` | `--require-user` / `--no-require-user` | `require_user` | Refuse (403) les requêtes sans ce header, sauf `/healthz` — défaut non ; exige `user_header` |
 | `BORGHELPERWWW_SCOPE_CACHE_DB` | `--scope-cache-db` | `scope_cache_db` | Chemin du fichier SQLite du cache de réponses **filtrées** par périmètre (Story 1.5) — défaut : co-localisé avec `cache.db`/`diff.db` (voir [Cache de réponses](#cache-de-réponses)) |
 | `BORGHELPERWWW_BKP_WATCHER_INTERVAL` | — | — | Intervalle (secondes) d'interrogation `bkp_status` par le watcher — défaut 30 (voir `POST /bkp` asynchrone ci-dessus) |
+| `BORGHELPERWWW_PUSH_DISABLED` | — | — | `1` : **suspend l'envoi** de toutes les notifications push (1.27.2) — détection et journal inchangés, `POST /push/test` en `503`, bandeau sur la page Notifications ; lu au démarrage. Par serveur et sans redémarrage : `PUSH_MUTE = true` dans le rc |
 | `BORGHELPERWWW_SCHEMA_CHECK_INTERVAL` | — | — | Intervalle (secondes, défaut 3600, min. 60) du contrôle périodique des bases (1.26.6) : structure de la vue `archive_snapshot_v` de chaque serveur, remise à jour si elle diffère ; `[WARN] … redémarrer borgHelperWWW` si borgHelper a été mis à jour sur disque depuis le démarrage (rien n'est alors modifié) |
 | `BORGHELPERWWW_BKP_STATUS_TIMEOUT` | — | — | Délai (secondes) avant qu'une sauvegarde démarrée mais jamais terminée soit traitée comme un échec (AD-7) — défaut 21600 (6h) |
 | `BORGHELPERWWW_PUSH_DB` | `--push-db` | `push_db` | Chemin du fichier SQLite **dédié** aux clés VAPID et abonnements push (Story 2a, `spec-notifications-push`, AD-6 — jamais `scopecache.db`) — défaut : co-localisé avec `cache.db`/`diff.db` (voir [Notifications push](#notifications-push)) |

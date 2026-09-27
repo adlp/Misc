@@ -59,12 +59,12 @@ sys.path.insert(0,str(Path(__file__).resolve().parent))
 from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail,
                          DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec,
                          _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES, _enc_header_read, sentry_alert,
-                         _sentry_alert_kinds, db_plain_anomalies)
+                         _sentry_alert_kinds, db_plain_anomalies, _cfg_bool)
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.27.1"
+WWW_VERSION="1.27.2"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -518,6 +518,7 @@ def _check_overdue(nick,db_path):
                      extra={'age_hours':round(age,1),'max_age_hours':max_age,'level':level},
                      release=f"borgHelperWWW@{WWW_VERSION}")
     if not _PYWEBPUSH_AVAILABLE or PUSH_VAPID_PRIVATE_KEY is None: return
+    if _push_muted(nick): return  # pause : alerte NON consommée, envoyée à la reprise si le retard persiste
     if not _push_subscriptions_for(nick,'error'): return
     if not _overdue_claim(nick,archive,level): return
     print(f"[watcher] sauvegarde en retard : nick={nick} dernière archive il y a {age:.1f} h "
@@ -545,6 +546,23 @@ def _push_purge_expired():
     return len(gone)
 
 PUSH_PURGE_INTERVAL=3600  # secondes entre deux purges des abonnements expirés (par le watcher)
+
+# Coupe-circuit des envois push (1.27.2) — journalisation seule, détection et réservations inchangées :
+#  - global : BORGHELPERWWW_PUSH_DISABLED=1 (lu au démarrage) ;
+#  - par nick : PUSH_MUTE = true dans le rc (section du nick ou [DEFAULT]), relu à chaque envoi, sans redémarrage.
+# N'agit que sur le push : les alertes Sentry ont leur propre réglage (SENTRY_ALERTS).
+PUSH_DISABLED=os.environ.get('BORGHELPERWWW_PUSH_DISABLED','').strip().lower() in ('1','true','yes','on')
+if PUSH_DISABLED:
+    print("[WARN] BORGHELPERWWW_PUSH_DISABLED : envoi des notifications push SUSPENDU (journalisation seule)",file=sys.stderr,flush=True)
+
+def _push_muted(nick):
+    """Raison de la suspension de l'envoi push pour ce nick, ou None."""
+    if PUSH_DISABLED: return 'BORGHELPERWWW_PUSH_DISABLED'
+    try:
+        if _cfg_bool(_bh_paths.borg.cfgread(nick),'PUSH_MUTE',False): return 'PUSH_MUTE'
+    except (Exception,SystemExit):
+        pass
+    return None
 
 _SCHEMA_WARNED=set()  # avertissements déjà émis (une fois par cause, pas à chaque passe)
 
@@ -1465,6 +1483,11 @@ def _send_bkp_push(nick,event,result,warnings=None):
     jamais de retry (voir Design Notes du spec — la ligne bkp_status est déjà réclamée par CAS)."""
     if not _PYWEBPUSH_AVAILABLE or PUSH_VAPID_PRIVATE_KEY is None:
         return  # dépendance optionnelle (pywebpush/py_vapid) absente — voir avertissement au démarrage
+    muted=_push_muted(nick)
+    if muted:
+        print(f"[watcher] push suspendu ({muted}) : nick={nick} event={event} result={result} — non envoyé",
+              file=sys.stderr,flush=True)
+        return
     # Toute fin autre qu'un succès (erreur, timeout AD-7) est un échec — type 'error' ; un retard de
     # sauvegarde (event 'overdue', 1.24.0) aussi.
     kind='start' if event=='start' else ('success' if event=='end' and result=='success' else 'error')
@@ -2424,6 +2447,7 @@ def version():
             # spec-push-ui-prefs-json : l'UI n'affiche la vue Notifications que si l'envoi est réellement
             # possible (pywebpush/py_vapid présents + Service Worker déployé), et propose ces bornes.
             'push_available':bool(_PYWEBPUSH_AVAILABLE and PUSH_VAPID_PUBLIC_KEY and _SW_JS is not None),
+            'push_suspended':PUSH_DISABLED,
             'push_default_expiry_days':PUSH_DEFAULT_EXPIRY_DAYS,'push_max_expiry_days':PUSH_MAX_EXPIRY_DAYS}
 
 @app.get("/healthz",tags=["lecture"],summary="Liveness — le processus répond, rien de plus (pas d'accès borg/DB) — non protégé")
@@ -2966,6 +2990,8 @@ def push_test(endpoint: str, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     if not _PYWEBPUSH_AVAILABLE or PUSH_VAPID_PRIVATE_KEY is None:
         raise HTTPException(503,detail="Envoi push indisponible sur ce serveur (voir le [WARN] au démarrage de borgHelperWWW)")
+    if PUSH_DISABLED:
+        raise HTTPException(503,detail="Envoi des notifications suspendu par l'administrateur (BORGHELPERWWW_PUSH_DISABLED)")
     row=_push_row(endpoint)
     if row is None:
         raise HTTPException(404,detail="Aucun abonnement pour cet endpoint")
@@ -3276,6 +3302,28 @@ def push_selftest():
                 state['cfg']={'MAX_AGE_BKP':'25'}; _run('nickSansReglage')  # réglage absent : rien
                 return sent==[('overdue','nickSentry',1),('overdue','nickSentry',2)]
             check("retard : SENTRY_ALERTS=overdue -> alerte Sentry indépendante du push, dédupliquée, rappel ; rien sans le réglage",_overdue_sentry)
+            def _push_mute_flow():
+                """1.27.2 : PUSH_MUTE=true (rc, relu à chaque envoi) -> rien envoyé, alerte de retard NON consommée
+                (part à la reprise) ; BORGHELPERWWW_PUSH_DISABLED -> rien envoyé (fin de sauvegarde comprise)."""
+                cfg={'MAX_AGE_BKP':'25','PUSH_MUTE':'true'}
+                def _run(fn):
+                    sent_to.clear()
+                    with mock.patch.object(_bh_paths.db,'last_archive_stat',lambda n,p=None:('M1',(_dt.datetime.now()-_dt.timedelta(hours=30)).isoformat())), \
+                         mock.patch.object(_bh_paths.db,'bkp_running',lambda n,t,p=None:False), \
+                         mock.patch.object(_bh_paths.borg,'cfgread',lambda n:cfg), \
+                         mock.patch(f"{__name__}.webpush",side_effect=_fake_webpush), \
+                         mock.patch(f"{__name__}._PYWEBPUSH_AVAILABLE",True), \
+                         mock.patch(f"{__name__}.PUSH_VAPID_PRIVATE_KEY",PUSH_VAPID_PRIVATE_KEY or 'k'):
+                        fn()
+                    return [e for e,d in sent_to if e=='push-ep-over']
+                muted=_run(lambda: _check_overdue('nickOver',None))
+                muted_end=_run(lambda: _send_bkp_push('nickOver','end','error'))
+                cfg.pop('PUSH_MUTE')
+                resumed=_run(lambda: _check_overdue('nickOver',None))
+                with mock.patch(f"{__name__}.PUSH_DISABLED",True):
+                    disabled=_run(lambda: _send_bkp_push('nickOver','end','error'))
+                return muted==[] and muted_end==[] and len(resumed)==1 and disabled==[]
+            check("coupe-circuit push : PUSH_MUTE (par nick, sans redémarrage) et PUSH_DISABLED -> rien envoyé ; retard non consommé pendant la pause",_push_mute_flow)
             check("push : WebPushException status_code=410 -> abonnement désabonné automatiquement (push.db ET JSON)",
                   lambda: conn.execute("SELECT 1 FROM push_subscriptions WHERE endpoint='push-ep-410'").fetchone() is None
                           and 'push-ep-410' not in _push_prefs_load()['subscriptions'])
@@ -3542,6 +3590,12 @@ def push_selftest():
                         ok=ok and rr.status_code==200 and rr.json()['exitcode']==0 and isinstance(body.get('rows'),list)
                     return ok
                 check("routes /repohistory et /archivehistory (HTTP) : 200, JSON {rows:[…]}",_history_routes_ok)
+                with mock.patch(f"{__name__}.PUSH_DISABLED",True), mock.patch(f"{__name__}._PYWEBPUSH_AVAILABLE",True), \
+                     mock.patch(f"{__name__}.PUSH_VAPID_PRIVATE_KEY",PUSH_VAPID_PRIVATE_KEY or 'k'):
+                    r=client.post(f"{P}/push/test",headers=H,params={'endpoint':'nimporte'})
+                    rv=client.get("/version")
+                check("PUSH_DISABLED : POST /push/test -> 503 explicite, /version push_suspended=true",
+                      lambda: r.status_code==503 and 'suspendu' in r.json()['detail'] and rv.json().get('push_suspended') is True)
                 r=client.get(f"{P}/access",headers=H)
                 check("route /access : champ db_plain (liste) pour chaque nick (badge « base non chiffrée »)",
                       lambda: r.status_code==200 and all(isinstance(v.get('db_plain'),list) for v in r.json()['nicks'].values()))

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.17.0 -->
+<!-- UI_VERSION: 1.17.1 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -296,6 +296,8 @@
         échec (erreur, sauvegarde bloquée, ou <strong>aucune sauvegarde depuis plus de MAX_AGE_BKP
         heures</strong> — alerte puis rappel à chaque période supplémentaire), réglables host par host. Réglages propres à ce navigateur
         (un autre navigateur ou appareil s'abonne séparément).</p>
+      <p class="error" id="notifSuspended" hidden>⏸ Envoi des notifications suspendu par l'administrateur
+        (<code>BORGHELPERWWW_PUSH_DISABLED</code>) : vos réglages sont conservés, rien n'est envoyé pour l'instant.</p>
       <div id="notifStatus" style="margin-bottom:12px"></div>
       <div id="notifForm" hidden>
         <div class="field" style="overflow-x:auto">
@@ -367,7 +369,7 @@ let allowDestructive=true; // état réel connu après résolution de loadFooter
 let allowDownloads=true;
 let API_PREFIX='/api'; // idem — appris depuis /version (seule route jamais préfixée, avec / et /healthz)
 let myAccess=null; // {groups_auth_enabled, nicks:{nick:{level:'none'|'read'|'write'|'admin',read_scope:null|string[],restore_scope:null|string[]}}} — appris via /access, après connexion
-let pushInfo={available:false,vapidKey:null,defaultDays:30,maxDays:3650}; // appris depuis /version
+let pushInfo={available:false,suspended:false,vapidKey:null,defaultDays:30,maxDays:3650}; // appris depuis /version
 let currentViewId='view-login';
 const LEVEL_RANK={none:0,read:1,write:2,admin:3};
 
@@ -401,7 +403,7 @@ const versionsReady=(async function loadFooterVersions(){
     if(typeof v.api_prefix==='string') API_PREFIX=v.api_prefix;
     allowDestructive=!!v.allow_destructive;
     allowDownloads=!!v.allow_downloads;
-    pushInfo={available:!!(v.push_available&&v.vapid_public_key),vapidKey:v.vapid_public_key||null,
+    pushInfo={available:!!(v.push_available&&v.vapid_public_key),suspended:!!v.push_suspended,vapidKey:v.vapid_public_key||null,
               defaultDays:v.push_default_expiry_days||30,maxDays:v.push_max_expiry_days||3650};
     applyBadges();
     updateNotifBtn();
@@ -1718,6 +1720,7 @@ function renderNotifForm(){
 
 async function openNotifications(){
   showView('view-notifications');
+  document.getElementById('notifSuspended').hidden=!pushInfo.suspended;
   const st=document.getElementById('notifStatus'), err=document.getElementById('notifError');
   err.textContent=''; document.getElementById('notifForm').hidden=true;
   const unsupported=notifUnsupported();

@@ -1082,6 +1082,16 @@ redémarrage. Jamais à chaque requête ; erreur SQLite ignorée (pur cache).
 balayage plus grand que la borne, le vidage complet jetait aussi les préfixes chauds, recalculés aussitôt. Coût
 amorti O(1) par insertion ; aucune incidence sur la vérification (une entrée n'est mémorisée qu'après validation).
 
+### Coupe-circuit des notifications push (borgHelperWWW 1.27.2 / UI 1.17.1)
+
+`_push_muted(nick)` → raison ou `None` : `PUSH_DISABLED` (env `BORGHELPERWWW_PUSH_DISABLED`, lue au démarrage,
+`[WARN]`), sinon `PUSH_MUTE` du nick (`_cfg_bool` sur `cfgread`, donc `[DEFAULT]` hérité, relu à chaque appel —
+aucun redémarrage). Consulté dans `_send_bkp_push` après la réservation CAS de la ligne `bkp_status` (un événement
+de pause est donc consommé et jamais rejoué à la reprise — pas de rafale) et, pour le retard, AVANT
+`_overdue_claim` : l'alerte n'est pas consommée et part au premier passage après la reprise si le retard persiste.
+`POST /push/test` : `503` si suspendu globalement. `/version.push_suspended` → bandeau de la page Notifications.
+Sentry n'est jamais concerné (`SENTRY_ALERTS`).
+
 ### Badge « base non chiffrée » (1.0.134 / borgHelperWWW 1.27.1 / UI 1.17.0)
 
 `db_plain_anomalies(nick, [(libellé, chemin)], cfg)` : même condition que l'avertissement AD-6 (`_warn_plain_db`) —
