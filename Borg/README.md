@@ -677,6 +677,8 @@ Résumé `du -sh`-like depuis le SQLite.
 borgHelper -c DuIdx -n mon-serveur                         # résumé global par type
 borgHelper -c DuIdx -f '*' -n mon-serveur                  # détail par répertoire racine
 borgHelper -c DuIdx -f 'home/*' -n mon-serveur             # détail sous home/
+borgHelper -c DuIdx -f 'home/*_old' -n mon-serveur         # seulement les home/…_old (depuis 1.0.125)
+borgHelper -c DuIdx -f 'home/*/.cache' -n mon-serveur      # un .cache par utilisateur (depuis 1.0.125)
 borgHelper -c DuIdx -f '*.log' -n ALL                      # résumé global sur les .log
 borgHelper -c DuIdx -f '*' -s présent:desc -n mon-serveur  # trié par taille présent desc
 borgHelper -c DuIdx -f '*' -j -n mon-serveur               # sortie JSON
@@ -684,7 +686,10 @@ borgHelper -c DuIdx -n mon-serveur -R                      # sortie brute, une l
 ```
 
 Le préfixe (`-f 'préfixe/*'`) est sensible à la casse et littéral (`%`/`_` n'y sont pas des jokers) ; un `/`
-initial/final ou un `//` interne y est normalisé avant comparaison. Le motif de nom (`-f motif` sans `/*`) reste
+initial/final ou un `//` interne y est normalisé avant comparaison. **Motif groupé complet** (depuis 1.0.125) : chaque
+composant du motif filtre le composant de même rang du chemin (`*` et `?` ne franchissent jamais `/`) et le
+regroupement se fait à la profondeur du motif — `home/*_old`, `home/*/.cache`, `var/lib/*/data/*` sont honorés.
+Auparavant, tout ce qui suivait le dernier `/*` était ignoré sans prévenir (`home/*_old` agissait comme `home/*`). Le motif de nom (`-f motif` sans `/*`) reste
 insensible à la casse ASCII, comme `Search`.
 
 `-R` (Story 1.4) : mode brut, une ligne `{chemin,type,taille}` par chemin, **jamais groupée** —

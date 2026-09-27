@@ -1042,6 +1042,18 @@ Pistes étudiées : (2) ne décoder que les enfants directs du répertoire list�
 section suivante ; (3) processus `borgHelper` persistant interrogé par borgHelperWWW (supprime ~250 ms de
 démarrage + KDF par clic, mémo de décodage chaud d'un clic à l'autre) — **non réalisée**.
 
+### DuIdx groupé : motif honoré composant par composant (1.0.125)
+
+`_duidx_group_spec(pattern)` -> `(sel, depth, match)`, source unique (borgHelperWWW l'importe pour
+`_recompute_duidx`, jamais recopiée) : composants non vides du motif ; `sel` = `('under', plus long préfixe
+littéral)` (ou `('all',)`) pour borner le SQL ; `depth` = nb de composants - 1 (clé `_duidx_path_key`) ; `match` =
+regex ancrée, un composant par rang (`*`→`[^/]*`, `?`→`[^/]`, le reste `re.escape`), suivie de `(?:/.*)?` pour
+compter la sous-arborescence dans son groupe — `None` quand le reste du motif est exactement `*` (cas historique
+`foo/*`, sortie strictement identique, vérifiée sur 36 combinaisons clair/chiffré × texte/`-j`/`-R`). Mode texte/`-j` :
+`key_fn` renvoie `None` hors motif et `_duidx_collect` ignore ces lignes ; `-R` : lignes brutes filtrées par `match`
+avant sortie, donc borgHelperWWW ne regroupe que des lignes déjà dans le motif. Le filtre est appliqué en Python
+après décodage : même résultat en base chiffrée.
+
 ### Erreurs de base chiffrée au niveau CLI (1.0.124)
 
 `DbKeyError`/`DbModeError`/`DbTamperError`/`DbCodecError` ne sont pas des `sqlite3.Error` : les `except

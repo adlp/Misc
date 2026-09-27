@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.125 / borgHelperWWW 1.26.1 — DuIdx : motif groupé honoré en entier — 2026-09-27
+
+Issu de `deferred-work.md` (point B1, passé en lot A : « honorer le motif »).
+
+- `DuIdx -f 'home/*_old'` agissait comme `home/*` (tout ce qui suivait le dernier `/*` était ignoré sans prévenir) ;
+  `a/b*/c/*` échouait. Désormais chaque composant du motif filtre le composant de même rang du chemin (`*`/`?` ne
+  franchissent pas `/`), regroupement à la profondeur du motif : `home/*_old`, `home/*/.cache`, `lib/modules/*/kernel`.
+- `foo/*` et `*` : sortie strictement identique (36 combinaisons comparées à la version précédente).
+- borgHelperWWW 1.26.1 : même règle pour le regroupement après filtrage par périmètre (fonction importée de
+  borgHelper, plus de recopie) ; résultat identique au CLI sur 5 motifs. `push_selftest` 71/71.
+- `CodecSelfTest` 334/334.
+
 ## borgHelper 1.0.124 — robustesse des bases (erreurs de chiffrement, migrations, connexions) — 2026-09-27
 
 Issu de `deferred-work.md` (lot A).

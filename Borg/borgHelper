@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.124"
+Version="1.0.125"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -280,6 +280,27 @@ def _snap_params(af_params,archive_from,archive_to):
     if archive_from and archive_from!='ALL' and af_params: date_from=af_params[0]
     if archive_to and len(af_params)>=(2 if date_from else 1): date_to=af_params[-1]
     return date_from,date_to
+
+def _duidx_group_spec(pattern):
+    """Mode groupé de DuIdx (motif contenant '/*', ou '*') -> (sel, depth, match) — 1.0.125.
+    Chaque composant du motif filtre le composant de même rang du chemin (`*`/`?` ne franchissent
+    jamais '/', tout autre caractère est littéral) ; regroupement à la profondeur du motif
+    (_duidx_path_key(p,depth), depth = nb de composants - 1). `sel` borne la requête SQL au plus long
+    préfixe littéral ; `match` (None si inutile) filtre le reste en Python. `foo/*` : exactement le
+    comportement d'avant (match None) ; `foo/*bar`, `foo/*/bar`, `a/b*/c/*` sont désormais honorés —
+    auparavant tout ce qui suivait le dernier '/*' était ignoré (`foo/*bar` traité comme `foo/*`).
+    Utilisé tel quel par borgHelperWWW (_recompute_duidx) : une seule définition."""
+    comps=[c for c in pattern.split('/') if c] or ['*']
+    lit=[]
+    for c in comps:
+        if '*' in c or '?' in c: break
+        lit.append(c)
+    prefix='/'.join(lit)
+    sel=('under',prefix) if prefix else ('all',)
+    depth=len(comps)-1
+    if comps[len(lit):]==['*']: return sel,depth,None
+    rx=re.compile('/'.join(re.escape(c).replace(r'\*','[^/]*').replace(r'\?','[^/]') for c in comps)+'(?:/.*)?',re.S)
+    return sel,depth,(lambda p: rx.fullmatch(p) is not None)
 
 def _duidx_path_key(path,depth):
     parts=path.split('/')
@@ -2096,13 +2117,15 @@ class BorgHelperDB:
                 for ct,path,sz in conn.execute("SELECT change_type,path,CASE WHEN change_type='removed' THEN size_before ELSE size_after END FROM diff_index WHERE nick=?"+_wh(psql)+af_sql,[n]+pprm+af_params):
                     path=_path_decode(conn,path)
                     if pyf and not pyf(path): continue
-                    _duidx_add(totals,key_fn(path),ct,sz)
+                    k=key_fn(path)
+                    if k is not None: _duidx_add(totals,k,ct,sz)  # None : hors motif (_duidx_group_spec)
                 df,dt=_snap_params(af_params,archive_from,archive_to)
                 snap_extra=[x for x in [df,dt] if x]
                 for path,sz in conn.execute("SELECT path,size FROM archive_snapshot_v WHERE nick=?"+_wh(psql)+" "+_snap_notin(df,dt),[n]+pprm+snap_extra):
                     path=_path_decode(conn,path)
                     if pyf and not pyf(path): continue
-                    _duidx_add(totals,key_fn(path),'présent',sz)
+                    k=key_fn(path)
+                    if k is not None: _duidx_add(totals,k,'présent',sz)
                 conn.close()
             except DbCodecError as e: _codec_fail(n,e,conn)
             except sqlite3.Error as e:
@@ -4235,26 +4258,27 @@ class BorgHelper:
             # le mode groupé historique, dont le texte/JSON doit rester byte-identique. Même calcul de
             # sql_pat que les branches ci-dessous (dupliqué exprès pour ne jamais risquer de modifier
             # leur comportement existant).
+            match=None
             if pattern is None:
                 sel=('all',)
             elif '/*' in pattern or pattern=='*':
-                prefix=pattern.rsplit('/*',1)[0] if '/*' in pattern else ''
-                sel=('under',_norm_lp(prefix)) if _norm_lp(prefix) else ('all',)
+                sel,_depth,match=_duidx_group_spec(pattern)
             else:
                 sql_pat=pattern.replace('*','%').replace('?','_')
                 if '%' not in sql_pat and '_' not in sql_pat: sql_pat='%'+sql_pat+'%'
                 sel=('like',sql_pat)
             rows=self.db._duidx_collect_raw(nick,sel,archive_from,archive_to)
+            if match: rows=[r for r in rows if match(r['chemin'])]
             print(json.dumps({'borghelper_version':Version,'pattern':pattern,'rows':rows},ensure_ascii=False,indent=2))
             return
         if pattern is None:
             totals=self.db._duidx_collect_global(nick,('all',),archive_from,archive_to)
             _duidx_print(totals,None,False,sort_by,reverse,as_json); return
         if '/*' in pattern or pattern=='*':
-            prefix=pattern.rsplit('/*',1)[0] if '/*' in pattern else ''
-            depth=_norm_lp(prefix).count('/')+1 if _norm_lp(prefix) else 0
-            sel=('under',_norm_lp(prefix)) if _norm_lp(prefix) else ('all',)
-            totals=self.db._duidx_collect(nick,sel,lambda p:_duidx_path_key(p,depth),archive_from,archive_to)
+            sel,depth,match=_duidx_group_spec(pattern)
+            key=(lambda p:_duidx_path_key(p,depth)) if match is None else \
+                (lambda p:_duidx_path_key(p,depth) if match(p) else None)
+            totals=self.db._duidx_collect(nick,sel,key,archive_from,archive_to)
             _duidx_print(totals,pattern,True,sort_by,reverse,as_json)
         else:
             sql_pat=pattern.replace('*','%').replace('?','_')
@@ -6748,6 +6772,17 @@ def codec_selftest():
             finally:
                 c.close()
         check("migration de schéma atomique : erreur après DROP TABLE -> ROLLBACK, table et données intactes",_migration_atomic)
+        def _duidx_spec():
+            """_duidx_group_spec (1.0.125) : 'foo/*' et '*' inchangés (match None) ; suffixe après le dernier
+            '/*' honoré ; '*'/'?' ne franchissent pas '/' ; autres caractères littéraux (%, _, ., [)."""
+            s1=_duidx_group_spec('foo/*'); s2=_duidx_group_spec('*'); s3=_duidx_group_spec('/a/b/*/')
+            _,d4,m4=_duidx_group_spec('foo/*bar'); sel5,d5,m5=_duidx_group_spec('foo/*/bar')
+            _,_,m6=_duidx_group_spec('a/b?/[x]%_.c/*')
+            return (s1==(('under','foo'),1,None) and s2==(('all',),0,None) and s3==(('under','a/b'),2,None)
+                    and d4==1 and m4('foo/xbar') and m4('foo/xbar/deep/f') and not m4('foo/xbaz') and not m4('foo/a/bar')
+                    and sel5==('under','foo') and d5==2 and m5('foo/x/bar/f') and not m5('foo/x/y/bar') and not m5('foo/bar')
+                    and m6('a/b1/[x]%_.c/z') and not m6('a/b12/[x]%_.c/z') and not m6('a/b1/x%_.c/z') and not m6('a/b1/[x]%_Xc/z'))
+        check("DuIdx groupé : _duidx_group_spec honore le motif composant par composant, 'foo/*' et '*' inchangés",_duidx_spec)
     finally:
         shutil.rmtree(tmp,ignore_errors=True)
         _DB_CFG_READERS.clear(); _DB_CFG_READERS.update(saved_readers)

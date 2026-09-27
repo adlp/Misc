@@ -57,12 +57,12 @@ def _push_deps_hint(err):
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail,
-                         DbKeyError, DbTamperError, DbCodecError)
+                         DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec)
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.26.0"
+WWW_VERSION="1.26.1"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -1910,8 +1910,9 @@ def _recompute_duidx(parsed,scope,pattern,sort):
     rows=[r for r in parsed['rows'] if _path_in_scope(r.get('chemin',''),scope)]
     grouped=pattern is not None and ('/*' in pattern or pattern=='*')
     if grouped:
-        prefix=pattern.rsplit('/*',1)[0] if '/*' in pattern else ''
-        depth=prefix.count('/')+1 if prefix else 0
+        # Même règle que borgHelper (importée, jamais recopiée) : profondeur du motif ; les lignes brutes
+        # reçues sont déjà filtrées par le motif composant par composant (`foo/*bar`, borgHelper >= 1.0.125).
+        _sel,depth,_match=_duidx_group_spec(pattern)
         sort_by,reverse=_parse_duidx_sort(sort)
         merged={}
         for r in rows:
