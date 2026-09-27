@@ -1,5 +1,15 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.134 / borgHelperWWW 1.27.1 / borgHelperWWW_ui.html 1.17.0 — badge « base non chiffrée » — 2026-09-27
+
+Issu de l'entretien `deferred-work.md` (point 1, story 5b) : badge seulement pour les anomalies.
+
+- Liste des serveurs et page d'un serveur : **🔓 base non chiffrée** quand `diff.db` ou `cache.db` est en clair alors que
+  `DB_ENCRYPT` est actif et qu'une passphrase est disponible (même condition que l'avertissement du CLI) ; la bulle
+  donne la commande `borgHelper -c DbEncrypt -n <serveur> -y`. Rien pour une base chiffrée ni pour `DB_ENCRYPT=false`.
+- `GET /access` : champ `db_plain` par serveur (vide pour un serveur sans droit).
+- `CodecSelfTest` 343/343, `push_selftest` 80/80, badge vérifié dans Chrome headless (liste et page serveur).
+
 ## borgHelperWWW_ui.html 1.16.2 — notice sur les droits : seule sous l'explorateur — 2026-09-27
 
 - Retour utilisateur : la notice sous l'explorateur suffit — bulles ⓘ des en-têtes Droits/Propriétaire retirées.

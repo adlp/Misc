@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.16.2 -->
+<!-- UI_VERSION: 1.17.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -161,7 +161,7 @@
     <button class="secondary copy-link-btn" title="Copier l'adresse de cette page (à partager : un collègue ayant les droits arrive directement ici)">🔗 Copier le lien</button>
     <div class="card">
       <div class="machine-head">
-        <h2 id="detailTitle" style="margin:0"></h2>
+        <h2 style="margin:0"><span id="detailTitle"></span> <span id="detailPlainBadge"></span></h2>
         <button onclick="openBrowse()">🗂 Explorer l'arborescence</button>
       </div>
       <div class="pass-row">
@@ -527,6 +527,16 @@ document.getElementById('apiKeyInput').addEventListener('keydown', e=>{ if(e.key
 
 // ── Machines list ─────────────────────────────────────────────────────────
 
+// Base restée en clair alors qu'elle devrait être chiffrée (UI 1.17.0, /access -> db_plain) : badge d'anomalie
+// seulement — rien pour une base chiffrée ni pour DB_ENCRYPT=false volontaire.
+function plainDbBadge(nick){
+  const bad=myAccess && myAccess.nicks[nick] && myAccess.nicks[nick].db_plain;
+  if(!bad || !bad.length) return '';
+  const tip=`Base(s) ${bad.join(', ')} non chiffrée(s) alors que DB_ENCRYPT est actif — les noms de fichiers y sont en clair. `
+    +`Chiffrer : borgHelper -c DbEncrypt -n ${nick} -y (sur le serveur borgHelper).`;
+  return `<span class="badge warn" title="${escapeAttr(tip)}">🔓 base non chiffrée</span>`;
+}
+
 function badgeFor(depuisStr){
   // "12.34 h" or "—"
   if(!depuisStr || depuisStr==='—') return '<span class="badge warn">aucune archive</span>';
@@ -588,7 +598,7 @@ async function loadMachines(){
     return `
       <div class="machine-card card" style="margin-bottom:14px">
         <div class="machine-head">
-          <h3${isErr?' class="nick-err"':''}>${escapeHtml(nick)} ${badgeFor(s['depuis'])}</h3>
+          <h3${isErr?' class="nick-err"':''}>${escapeHtml(nick)} ${badgeFor(s['depuis'])} ${plainDbBadge(nick)}</h3>
           <div>
             <button class="secondary bkp-now-btn" data-nick="${escapeAttr(nick)}">▶ Backup</button>
             <button class="secondary explore-btn" data-nick="${escapeAttr(nick)}">🗂 Explorer</button>
@@ -1120,6 +1130,7 @@ const ACTIONS=[
 function openMachine(nick){
   currentNick=nick;
   document.getElementById('detailTitle').textContent=nick;
+  document.getElementById('detailPlainBadge').innerHTML=plainDbBadge(nick);
   document.getElementById('detailPass').value=getPassphrase(nick);
   updateDetailPassStatus();
   renderActionList();

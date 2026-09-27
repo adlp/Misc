@@ -1082,6 +1082,14 @@ redémarrage. Jamais à chaque requête ; erreur SQLite ignorée (pur cache).
 balayage plus grand que la borne, le vidage complet jetait aussi les préfixes chauds, recalculés aussitôt. Coût
 amorti O(1) par insertion ; aucune incidence sur la vérification (une entrée n'est mémorisée qu'après validation).
 
+### Badge « base non chiffrée » (1.0.134 / borgHelperWWW 1.27.1 / UI 1.17.0)
+
+`db_plain_anomalies(nick, [(libellé, chemin)], cfg)` : même condition que l'avertissement AD-6 (`_warn_plain_db`) —
+`DB_ENCRYPT` effectif vrai et passphrase présente dans la config — et base existante (`_db_has_schema`) sans
+`enc_header`, lue en `mode=ro` (rien d'écrit, aucune passphrase ni KDF). Base illisible : ignorée (ce n'est pas « en
+clair »). `/access` ajoute `db_plain` (liste des libellés) à chaque nick, vide pour un nick sans droit (rien révélé).
+UI : `plainDbBadge(nick)` sur la carte serveur et la page détail (`detailPlainBadge`), à partir de `myAccess`.
+
 ### TreeHist -X : changements entre deux archives (1.0.133 / borgHelperWWW 1.27.0 / UI 1.16.0)
 
 `_treehist_changes(n, prefix, conn, archive_from, archive_to)` — source : `diff_index` seul (les paires indexées),

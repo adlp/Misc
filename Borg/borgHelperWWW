@@ -59,12 +59,12 @@ sys.path.insert(0,str(Path(__file__).resolve().parent))
 from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail,
                          DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec,
                          _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES, _enc_header_read, sentry_alert,
-                         _sentry_alert_kinds)
+                         _sentry_alert_kinds, db_plain_anomalies)
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.27.0"
+WWW_VERSION="1.27.1"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -2437,13 +2437,20 @@ def healthz():
 def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     nicks=_nick_list('ALL')
+    def _plain(n):
+        # 1.27.1 : bases restées en clair alors qu'elles devraient être chiffrées (badge de l'UI, anomalies seulement)
+        try:
+            return db_plain_anomalies(n,[('diff.db',_bh_paths.db.get_diff_db(n)),('cache.db',_bh_paths.db.get_cache_db(n))],
+                                      _bh_paths.borg.cfgread(n))
+        except Exception:
+            return []
     if not GROUPS_HEADER:
         # Fonctionnalité désactivée : pas de restriction par nick ni de périmètre, seuls
         # allow_destructive/allow_downloads (globaux) s'appliquent — 'admin'/scope:null partout
         # reflète cette absence de restriction par groupes pour que l'UI n'ait qu'une seule forme
         # de réponse à traiter, sans cas particulier côté client.
         return {'groups_auth_enabled':False,
-                'nicks':{n:{'level':'admin','read_scope':None,'restore_scope':None} for n in nicks}}
+                'nicks':{n:{'level':'admin','read_scope':None,'restore_scope':None,'db_plain':_plain(n)} for n in nicks}}
     user_groups=_parse_groups(request.headers.get(GROUPS_HEADER))
     level_names={0:'none',1:'read',2:'write',3:'admin'}
     result={}
@@ -2456,7 +2463,8 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
         # et restauration (GROUPS_PATHS_RESTORE, repli par groupe sur GROUPS_PATHS).
         read_scope=_resolve_path_scope(user_groups,cfg) if cfg is not None else None
         restore_scope=_resolve_path_scope(user_groups,cfg,for_restore=True) if cfg is not None else None
-        result[n]={'level':level_names[eff],'read_scope':read_scope,'restore_scope':restore_scope}
+        result[n]={'level':level_names[eff],'read_scope':read_scope,'restore_scope':restore_scope,
+                   'db_plain':_plain(n) if eff>0 else []}  # rien révélé d'un nick sans droit
     return {'groups_auth_enabled':True,'nicks':result}
 
 @router.get("/stats",response_model=CommandResult,tags=["lecture"])
@@ -3534,6 +3542,9 @@ def push_selftest():
                         ok=ok and rr.status_code==200 and rr.json()['exitcode']==0 and isinstance(body.get('rows'),list)
                     return ok
                 check("routes /repohistory et /archivehistory (HTTP) : 200, JSON {rows:[…]}",_history_routes_ok)
+                r=client.get(f"{P}/access",headers=H)
+                check("route /access : champ db_plain (liste) pour chaque nick (badge « base non chiffrée »)",
+                      lambda: r.status_code==200 and all(isinstance(v.get('db_plain'),list) for v in r.json()['nicks'].values()))
                 def _schema_watch_ok():
                     """1.26.6 : vue divergente réparée par la passe périodique ; code en mémoire périmé (borgHelper
                     mis à jour sur disque) -> jamais réparée, avertissement « redémarrer » une seule fois.

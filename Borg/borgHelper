@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.133"
+Version="1.0.134"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -1154,6 +1154,27 @@ def _warn_rc_perms(path):
 
 _PLAIN_WARNED=set()
 _PLAIN_WARNED_LOCK=threading.Lock()
+def db_plain_anomalies(nick,db_paths,cfg):
+    """Bases restées EN CLAIR alors qu'elles devraient être chiffrées (DB_ENCRYPT actif + passphrase disponible) —
+    même condition que l'avertissement AD-6 (_warn_plain_db), sans rien écrire (1.0.134, badge de l'UI).
+    db_paths : [(libellé, chemin)] ; -> libellés en anomalie. Base absente/vide : ignorée ; illisible : ignorée
+    (ce n'est pas « en clair »). DB_ENCRYPT=false volontaire : jamais une anomalie."""
+    try:
+        if cfg is None or not db_encrypt_enabled(nick,cfg) or not cfg.get('BORG_PASSPHRASE'): return []
+    except (Exception,SystemExit):
+        return []
+    out=[]
+    for label,p in db_paths:
+        if not _db_has_schema(p): continue
+        try:
+            import pathlib; c=sqlite3.connect(pathlib.Path(p).resolve().as_uri()+'?mode=ro',uri=True)
+            try: raw=_enc_header_read(c)
+            finally: c.close()
+        except (sqlite3.Error,DbTamperError,OSError):
+            continue
+        if raw is None: out.append(label)
+    return out
+
 def _warn_plain_db(nick,db_path):
     """AD-6 : avertit une fois (stderr, par nick+base) qu'une base restée 'plain' pourrait être
     chiffrée. Précédent : _warn_rc_perms. Appelé seulement quand DB_ENCRYPT est actif pour ce nick et
@@ -7076,6 +7097,18 @@ def codec_selftest():
             c=sqlite3.connect(p); kept=c.execute("SELECT sql FROM sqlite_master WHERE name='archive_snapshot_v'").fetchone()[0]; c.close()
             return ok0 and mis=='mismatch' and fixed=='ok' and newer=='newer' and 'SELECT 1 AS x' in kept
         check("vue archive_snapshot_v : divergente -> recréée par ensure_diff_db ; base plus récente -> jamais touchée",_view_check)
+        def _plain_anomaly():
+            """db_plain_anomalies (1.0.134, badge UI) : base en clair + DB_ENCRYPT actif + passphrase -> anomalie ;
+            DB_ENCRYPT=false, sans passphrase, base chiffrée, base absente -> jamais."""
+            bdb=BorgHelperDB(tmp,'pa'); plain=os.path.join(tmp,'pa-plain.db'); enc=os.path.join(tmp,'pa-enc.db')
+            bdb.ensure_diff_db(plain); bdb.ensure_diff_db(enc)
+            c=_open_db(enc,nick=None,role='admin'); _enc_header_write(c,_enc_header_build('pw','siv1','light')[0]); c.close()
+            on={'BORG_PASSPHRASE':'pw'}
+            return (db_plain_anomalies('n',[('diff.db',plain),('cache.db',os.path.join(tmp,'absente.db'))],on)==['diff.db']
+                    and db_plain_anomalies('n',[('diff.db',enc)],on)==[]
+                    and db_plain_anomalies('n',[('diff.db',plain)],{'BORG_PASSPHRASE':'pw','DB_ENCRYPT':'false'})==[]
+                    and db_plain_anomalies('n',[('diff.db',plain)],{})==[] and db_plain_anomalies('n',[('diff.db',plain)],None)==[])
+        check("base non chiffrée : anomalie seulement si DB_ENCRYPT actif + passphrase + base en clair",_plain_anomaly)
         check("_diff_entry_type (1.0.126) : type tiré de change_type (borg diff 1.2), tous les types de suppression reconnus",
               lambda: [_diff_entry_type(c,sb) for c,sb in (('added',None),('modified',1),('removed',3),('removed',0),('removed',None),
                        ('removed directory',None),('added link',None),('changed link',None),('removed fifo',None),

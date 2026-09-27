@@ -1467,6 +1467,10 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
    dédupliquée, nb fichiers, modifications) affiché **automatiquement** sous chaque carte — `Report -o
    -N 10 -j` hors-ligne, aucune passphrase requise, chargé au rendu de la liste, aucun clic requis.
    Bouton **📜 Historique complet** juste à côté pour ouvrir la vue Historique (point 5) de ce serveur.
+   Badge **🔓 base non chiffrée** (UI ≥ 1.17.0) sur la carte et la page d'un serveur dont une base (`diff.db`,
+   `cache.db`) est restée en clair alors que `DB_ENCRYPT` est actif et qu'une passphrase est disponible — noms de
+   fichiers en clair sur disque ; la bulle donne la commande `DbEncrypt`. Aucun badge pour une base chiffrée ni pour
+   `DB_ENCRYPT=false` volontaire. Source : champ `db_plain` de `GET /access`.
 3. **Détail d'un serveur** : champ **BORG_PASSPHRASE** à enregistrer pour la session (`sessionStorage`,
    par nick) — c'est ici, et seulement ici, qu'elle se saisit. Envoyée en `X-Borg-Passphrase` pour les
    actions qui en ont besoin (repérées par 🔑) ; les actions destructives (`Prune`, `DelBkp`, `Restore`,
