@@ -1,5 +1,13 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.136 — test de la capture `repo_stats` sur un vrai borg — 2026-09-27
+
+Issu de l'entretien `deferred-work.md` (point 9, option B).
+
+- `CodecSelfTest` crée un dépôt borg jetable, lance deux Bkp puis un Prune réels et vérifie les points `repo_stats`
+  (`bkp`, `bkp`, `prune`, tailles renseignées) : l'enchaînement réel et le format de `borg info --json` de la version
+  installée sont désormais couverts. `BORG_BASE_DIR` temporaire ; sauté sans borg. 344/344.
+
 ## borgHelper 1.0.135 — recherche (TreeFind) deux fois plus rapide à la racine — 2026-09-27
 
 Issu de l'entretien `deferred-work.md` (point 7 : mesurer puis optimiser).

@@ -987,6 +987,9 @@ Vérifie enfin la migration (story 5) : `DbEncrypt`/`DbDecrypt` aller simple et 
 duplication), les trois refus (`DB_ENCRYPT=false`, verrou d'opération en cours, espace disque insuffisant simulé),
 `DbRekey` (DEK inchangée, enveloppe renouvelée) et son refus sur une base `plain`, et l'avertissement AD-6 émis une
 fois par base.
+Vérifie enfin (1.0.136), si `borg` est installé, la capture de la taille du dépôt par un Bkp puis un Prune **réels**
+sur un dépôt borg jetable (`BORG_BASE_DIR` temporaire : ni le cache ni les clés borg de l'utilisateur ne sont touchés) ;
+sauté (`SKIP`) sans borg.
 Travaille uniquement sur des bases temporaires : aucune vraie base ni aucun vrai rc n'est lu. Une ligne `OK`/`FAIL` par
 contrôle ; code de sortie non nul au moindre échec.
 

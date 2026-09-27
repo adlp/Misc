@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.135"
+Version="1.0.136"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -7113,6 +7113,39 @@ def codec_selftest():
                     and db_plain_anomalies('n',[('diff.db',plain)],{'BORG_PASSPHRASE':'pw','DB_ENCRYPT':'false'})==[]
                     and db_plain_anomalies('n',[('diff.db',plain)],{})==[] and db_plain_anomalies('n',[('diff.db',plain)],None)==[])
         check("base non chiffrée : anomalie seulement si DB_ENCRYPT actif + passphrase + base en clair",_plain_anomaly)
+        def _repo_stats_real_borg():
+            """1.0.136 (deferred-work point 9) : capture repo_stats de backup()/prune() sur un VRAI dépôt borg jetable —
+            vérifie l'enchaînement réel (borg create/prune/compact/info --json, format de la réponse de CETTE
+            version de borg), pas seulement l'écriture en base. Deux Bkp (même jour) puis Prune KEEP_DAILY=1 :
+            deux points 'bkp' puis un point 'prune', tailles renseignées."""
+            d=os.path.join(tmp,'realborg'); src=os.path.join(d,'src'); os.makedirs(src)
+            with open(os.path.join(src,'f.txt'),'w') as f: f.write('contenu '*200)
+            repo=os.path.join(d,'repo'); rc=os.path.join(d,'rc')
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n\n[rb]\nBORG_REPO={repo}\nBORG_PASSPHRASE=pw-rb\n"
+                        f"SER_NAME=rb\nSER_LOGIN=x\nGLOB_ARCH=rb-t-*\nMOUNTPOINT={os.path.join(d,'mnt')}\n"
+                        f"BORG_ARCHNAME=t\nBORG_ROOTBKP={src}\nKEEP_DAILY=1\nDB_ENCRYPT=false\nEXCLUDE=--exclude-caches\n")
+            os.chmod(rc,0o600)
+            env=dict(os.environ,BORG_PASSPHRASE='pw-rb',BORG_RELOCATED_REPO_ACCESS_IS_OK='yes',
+                     BORG_BASE_DIR=os.path.join(d,'borgbase'))
+            os.environ['BORG_BASE_DIR']=env['BORG_BASE_DIR']  # jamais le cache/les clés borg de l'utilisateur
+            try:
+                r=subprocess.run([shutil.which('borg'),'init','-e','repokey',repo],env=env,capture_output=True,text=True,timeout=120)
+                if r.returncode!=0: print(f"  borg init : {r.stderr[-300:]}"); return False
+                b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+                for step in (lambda: b.backup('rb',no_index=True),lambda: (time.sleep(1.1),b.backup('rb',no_index=True)),
+                             lambda: b.prune('rb')):
+                    try: _q_run(step)
+                    except SystemExit: pass
+                c=sqlite3.connect(b.db.get_diff_db('rb'))
+                rows=c.execute("SELECT op,unique_csize,total_size FROM repo_stats WHERE nick='rb' ORDER BY id").fetchall(); c.close()
+                ops=[o for o,_u,_t in rows]
+                if ops!=['bkp','bkp','prune']: print(f"  repo_stats : {rows}")
+                return ops==['bkp','bkp','prune'] and all(u and t for _o,u,t in rows)
+            finally:
+                os.environ.pop('BORG_BASE_DIR',None)
+        if shutil.which('borg') is None: skip("repo_stats capturé par Bkp/Prune sur un vrai dépôt borg","borg absent")
+        else: check("repo_stats : capturé par Bkp puis Prune réels (dépôt borg jetable, format réel de borg info --json)",_repo_stats_real_borg)
         check("_diff_entry_type (1.0.126) : type tiré de change_type (borg diff 1.2), tous les types de suppression reconnus",
               lambda: [_diff_entry_type(c,sb) for c,sb in (('added',None),('modified',1),('removed',3),('removed',0),('removed',None),
                        ('removed directory',None),('added link',None),('changed link',None),('removed fifo',None),
