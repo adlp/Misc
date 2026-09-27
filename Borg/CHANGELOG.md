@@ -1,5 +1,14 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.135 — recherche (TreeFind) deux fois plus rapide à la racine — 2026-09-27
+
+Issu de l'entretien `deferred-work.md` (point 7 : mesurer puis optimiser).
+
+- Mesure (250 000 lignes d'historique) : à la racine, la détection des fichiers supprimés prenait ~1,0 s sur 1,3 s.
+  Nouvelle requête (seules les suppressions sont examinées, chacune par une recherche indexée) : mêmes résultats,
+  recherche 🔍 de l'explorateur **1,18 → 0,60 s** en clair, **1,24 → 0,85 s** en base chiffrée.
+- Sorties identiques à la version précédente sur 48 cas ; `CodecSelfTest` 343/343.
+
 ## borgHelperWWW 1.27.4 / borgHelperWWW_ui.html 1.17.2 — abonnements push réalignés sur les droits — 2026-09-27
 
 Issu de l'entretien `deferred-work.md` (point 4, option B).

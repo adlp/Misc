@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.134"
+Version="1.0.135"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -4375,12 +4375,16 @@ class BorgHelper:
         # Chemins supprimés (diff_index), récursivement sous le préfixe — jamais archive_snapshot_v
         # (purgé selon IDX_SNAP_KEEP, pas fiable ici) : même détection "dernier événement = removed"
         # que _treehist_listing, mais sans restriction à un seul niveau de profondeur.
+        # 1.0.135 : « suppression sans événement plus récent pour ce chemin » (NOT EXISTS sur idx_diff_nick_path)
+        # au lieu d'un fenêtrage ROW_NUMBER() sur TOUT diff_index du périmètre — mêmes lignes (vérifié sur le jeu
+        # PerfBench 250k : 12 281 lignes identiques), ~970 -> ~360 ms : seules les suppressions sont examinées,
+        # chacune par une recherche indexée. Départage à date égale par id, comme le fenêtrage.
         del_rows=[(_path_decode(conn,r[0]),)+tuple(r[1:]) for r in conn.execute("""
-            SELECT path,archive_old,archive_new,archive_new_date,size_before,change_type FROM (
-                SELECT path,change_type,archive_old,archive_new,archive_new_date,size_before,
-                       ROW_NUMBER() OVER (PARTITION BY path ORDER BY archive_new_date DESC,id DESC) AS rn
-                FROM diff_index WHERE nick=?"""+_wh(psql)+"""
-            ) WHERE rn=1 AND change_type IN ("""+','.join('?'*len(_DIFF_REMOVED_TYPES))+""")
+            SELECT d.path,d.archive_old,d.archive_new,d.archive_new_date,d.size_before,d.change_type
+            FROM diff_index d WHERE d.nick=?"""+_wh(_psel_under(conn,prefix,col='d.path')[0])+"""
+              AND d.change_type IN ("""+','.join('?'*len(_DIFF_REMOVED_TYPES))+""")
+              AND NOT EXISTS (SELECT 1 FROM diff_index e WHERE e.nick=d.nick AND e.path=d.path
+                    AND (e.archive_new_date>d.archive_new_date OR (e.archive_new_date=d.archive_new_date AND e.id>d.id)))
         """,[n]+pprm+list(_DIFF_REMOVED_TYPES))]
         for path,archive_old,archive_new,archive_new_date,size_before,change_type in del_rows:
             if prefix and path==prefix: continue

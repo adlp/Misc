@@ -124,10 +124,13 @@ réindexation. Avant 1.0.126, seul `change_type='removed'` (fichier ordinaire) �
 fifos supprimés n'apparaissaient **pas du tout** dans `TreeHist`/`TreeFind`, et `removed fifo|chrdev|blkdev`
 manquaient à `_DIFF_REMOVED_TYPES` (entrée jamais retirée du snapshot incrémental). Repli conservé : `removed` sans
 taille -> répertoire (lignes anciennes/synthétiques ; borg donne toujours une taille à un fichier supprimé). Sockets :
-non archivées par borg. Coût : la requête `TreeFind` sur les chemins supprimés n'est bornée par aucun préfixe
-littéral à la racine (motif `%`) — elle balaie alors tout l'historique `diff_index` du nick ; acceptable
-tant que ce n'est pas mesuré comme un problème réel (feature récente, pas encore observée en pratique
-sur un historique volumineux).
+non archivées par borg. Coût (mesuré en 1.0.135, jeu PerfBench 250k) : à la racine, la détection des supprimés de
+`TreeFind` représentait ~1,0 s sur ~1,3 s (fenêtrage `ROW_NUMBER() OVER (PARTITION BY path …)` sur tout
+`diff_index`). Remplacée par « suppression sans événement plus récent pour ce chemin » (`NOT EXISTS` corrélé sur
+`idx_diff_nick_path`, départage par `id` à date égale) : mêmes lignes (12 281, vérifié), requête ~970 → ~360 ms ;
+`TreeFind *.log` racine 1,18 → 0,60 s en clair, 1,24 → 0,85 s en chiffré (le reste, en chiffré, est le décodage
+des chemins du snapshot, nécessaire pour tester le nom). Sorties identiques à la version précédente (48 cas,
+clair/chiffré/dépôt de test).
 
 #### `diff_indexed_pairs`
 Sentinelle d'idempotence pour les diffs — une ligne par paire (archive_old, archive_new) indexée.  
