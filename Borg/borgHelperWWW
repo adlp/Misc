@@ -64,7 +64,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.27.4"
+WWW_VERSION="1.27.5"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -977,8 +977,8 @@ def require_path_in_scope(request: Request, nick: str, path: Optional[str]) -> b
     sur le disque du serveur ou streament des octets directement : un filtre APRÈS l'appel serait
     déjà une fuite, le temps qu'il s'applique l'action est faite. Retourne True si l'appel peut
     procéder (périmètre illimité, autorisation par groupes désactivée, ou `path` dans le périmètre
-    résolu de l'appelant sur `nick`), False si l'appelant doit recevoir la réponse SYNTHÉTIQUE
-    "introuvable" propre à sa route (jamais un 403 distinct/uniforme — voir les `_synth_*`
+    résolu de l'appelant sur `nick`), False si l'appelant doit recevoir la réponse
+    "introuvable" propre à sa route (depuis 1.27.5 : la vraie commande sur un leurre inexistant) (jamais un 403 distinct/uniforme — voir `_oos_decoy`
     ci-dessous : un 403 permettrait de distinguer "hors périmètre" de "n'existe pas" par le seul
     code de statut, cassant FR9/le Prevents d'AD-2). C'est un raffinement délibéré du pattern
     `require_destructive_allowed()`/`require_downloads_allowed()` évoqué par ARCHITECTURE-SPINE.md
@@ -2259,95 +2259,43 @@ def _stream_proc(proc):
 #      toujours un enregistrement complet en mode stream, même vide), jamais 1024 (deux blocs de
 #      512 zéros) — vérifié byte-pour-byte identique à un `borg export-tar` réel sans le moindre
 #      membre.
-# Connu, non corrigé : `POST /restore` sur ce dépôt/cette version de borg ajoute une ligne
-# "Warning: \"--numeric-owner\" has been deprecated..." AVANT "Include pattern... never matched." —
-# présente sur TOUT appel réel de `borg extract` (montré, pas seulement le cas introuvable),
-# reproduite ici à l'identique pour l'indiscernabilité mais couplée à la version de borg installée ;
-# à re-vérifier si `borg`/le flag `--numeric-owner` de `_borg_extract_args` changent (voir
-# CHANGELOG.md, Story 2.1). Même risque, même absence de source de vérité partagée, pour les libellés
-# de ligne d'archive codés en dur ci-dessous ("Archive sélectionnée (dernière)", "Archive (dernière)")
-# : ils recopient à l'identique ce qu'impriment aujourd'hui `borgHelper.restore()`/`listperms()` — si
-# ces prints changent de formulation côté `borgHelper` sans qu'on pense à répercuter le changement
-# ici, la synthèse dérive silencieusement du comportement réel qu'elle est censée imiter.
-_RESTORE_NUMERIC_OWNER_WARNING='Warning: "--numeric-owner" has been deprecated. Use --numeric-ids instead.\n'
+# 1.27.5 (deferred-work point 8, option D) : plus AUCUNE imitation. Les réponses « introuvable » étaient
+# fabriquées en recopiant les libellés de borgHelper et de borg (avertissement --numeric-owner, « Include pattern
+# … never matched. ») : elles dérivaient dès qu'une version changeait — constaté : pour un joker, la vraie réponse
+# est code 0 sans « never matched » depuis borgHelper 1.0.122, l'imitation code 1 avec — et elles étaient
+# instantanées alors qu'une vraie recherche parcourt l'archive. Deux oracles d'existence (texte, temps) pour un
+# appelant restreint. Désormais la VRAIE commande est exécutée sur un LEURRE garanti inexistant, de même forme
+# (joker ou non), et le leurre est remplacé par le chemin demandé dans le texte : réponse identique à celle d'un
+# chemin réellement absent par construction, quelles que soient les versions, temps compris. Rien n'est extrait
+# (le leurre n'existe pas) ; noms de fichier des téléchargements = ceux du chemin demandé.
+def _oos_decoy(path):
+    """Leurre hors périmètre : nom aléatoire (64 bits) sous la racine, joker conservé si `path` en contient un."""
+    decoy='.bh-absent-'+secrets.token_hex(8)
+    return decoy+'/*' if path and ('*' in path or '?' in path) else decoy
 
-def _oos_last_archive_line(nick,bid,passphrase,label):
-    """Construit la ligne d'archive (`"<label> : <bid>\\n"`) que `borgHelper` imprimerait pour un
-    chemin introuvable — UNIQUEMENT quand `bid` est omis (borgHelper.restore()/listperms() n'impriment
-    cette ligne QUE dans ce cas ; `bid` explicite -> aucune ligne du tout, chaîne vide ici aussi).
-    Réutilise `_borg_cfg`/`_borg_env`/`_latest_archive` (déjà utilisés par download_file/download_tar
-    ci-dessous) pour déterminer la dernière archive exactement comme `self.borg.getlastbkp()` le
-    ferait côté borgHelper. Ceci appelle bien `borg list --short` en sous-processus — mais ce n'est
-    PAS l'appel que le Boundaries "jamais d'appel borg/borgHelper" du spec 2.1 interdit : celui-ci ne
-    porte que sur les NOMS D'ARCHIVE du nick (métadonnée déjà accessible à tout appelant qui détient
-    ne serait-ce qu'un tier lecture sur ce nick, ex. via /lstbkp — jamais sur le CHEMIN hors périmètre
-    demandé, qui seul est protégé ici).
-
-    `_latest_archive()` peut lever `HTTPException` (404 : nick sans aucune archive ; 502/504 : `borg
-    list` a échoué/timeout) — dans ce cas la ligne d'archive est simplement omise (chaîne vide) plutôt
-    que de laisser l'exception se propager : la synthèse "introuvable" doit rester construite quel que
-    soit l'état du dépôt, jamais un 404/502/504 qui serait une troisième forme de réponse distincte
-    des deux promises par cette story (voir Review Triage Log du spec 2.1)."""
-    if not bid:
-        cfg=_borg_cfg(nick,passphrase)
-        env=_borg_env(cfg)
-        try:
-            archive=_latest_archive(cfg,env)
-        except HTTPException:
-            return ''
-        return f"{label} : {archive}\n"
-    return ''
-
-def _synth_restore_out_of_scope(nick,ftor,bid,passphrase):
-    stdout=_oos_last_archive_line(nick,bid,passphrase,"Archive sélectionnée (dernière)")
-    stderr=_RESTORE_NUMERIC_OWNER_WARNING+f"Include pattern '{ftor}' never matched.\n"
-    return JSONResponse(status_code=400,content=CommandResult(exitcode=1,stdout=stdout,stderr=stderr).dict())
-
-def _synth_restore_perms_out_of_scope(nick,ftor,bid,passphrase):
-    stdout=_oos_last_archive_line(nick,bid,passphrase,"Archive (dernière)")
-    return JSONResponse(status_code=200,content=CommandResult(exitcode=0,stdout=stdout,stderr='').dict())
-
-_EMPTY_TAR_CACHE=None
-
-def _empty_tar_bytes():
-    """Tar minimal valide vide — vérifié byte-pour-byte identique (live, demo.borghelperrc) à ce que
-    produit `borg export-tar` pour un export sans le moindre membre. Recalculé une fois via
-    `tarfile` plutôt que codé en dur en octets, pour rester correct si RECORDSIZE change un jour
-    côté bibliothèque standard."""
-    global _EMPTY_TAR_CACHE
-    if _EMPTY_TAR_CACHE is None:
-        buf=io.BytesIO()
-        tf=tarfile.open(fileobj=buf,mode='w|')
-        tf.close()
-        _EMPTY_TAR_CACHE=buf.getvalue()
-    return _EMPTY_TAR_CACHE
-
-def _synth_download_file_out_of_scope(path):
-    return StreamingResponse(iter(()),media_type='application/octet-stream',
-        headers={'Content-Disposition':f'attachment; filename="{_safe_filename(path)}"'})
+def _oos_swap(result_resp,decoy,path):
+    """Remplace le leurre par le chemin demandé dans stdout/stderr d'une réponse CommandResult."""
+    try: data=json.loads(result_resp.body)
+    except ValueError: return result_resp
+    for k in ('stdout','stderr'):
+        if isinstance(data.get(k),str): data[k]=data[k].replace(decoy,path or '')
+    return JSONResponse(status_code=result_resp.status_code,content=data)
 
 def _download_tar_filename(nick,prefix):
-    """Nom de fichier `.tar` — partagé entre `download_tar()` (corps réel) et
-    `_synth_download_tar_out_of_scope` (synthèse hors périmètre) pour que les deux restent
-    identiques par construction (voir AGENTS.md : pitfall `_fmt_stats`, même risque ici)."""
+    """Nom de fichier `.tar` — celui du préfixe DEMANDÉ, y compris hors périmètre (leurre invisible)."""
     return (_safe_filename(prefix) if prefix else nick)+'.tar'
-
-def _synth_download_tar_out_of_scope(nick,prefix):
-    return StreamingResponse(iter((_empty_tar_bytes(),)),media_type='application/x-tar',
-        headers={'Content-Disposition':f'attachment; filename="{_download_tar_filename(nick,prefix)}"'})
 
 @router.get("/download/file",tags=["téléchargement"],summary="Télécharge un fichier depuis une archive (borg extract --stdout)")
 def download_file(nick: str, path: str, request: Request, bid: Optional[str]=None,
                    x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     require_downloads_allowed()
-    if not require_path_in_scope(request,nick,path):
-        return _synth_download_file_out_of_scope(path)
+    target=path if require_path_in_scope(request,nick,path) else _oos_decoy(None)  # hors périmètre : leurre (1.27.5)
     cfg=_borg_cfg(nick,x_borg_passphrase)
     env=_borg_env(cfg)
     archive=bid or _latest_archive(cfg,env)
     borg_exe=cfg.get('BORG_EXE','borg')
-    proc=subprocess.Popen([borg_exe,'extract','--stdout',f"{cfg['BORG_REPO']}::{archive}",path],
+    proc=subprocess.Popen([borg_exe,'extract','--stdout',f"{cfg['BORG_REPO']}::{archive}",target],
                           stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env)
     return StreamingResponse(_stream_proc(proc),media_type='application/octet-stream',
         headers={'Content-Disposition':f'attachment; filename="{_safe_filename(path)}"'})
@@ -2361,14 +2309,13 @@ def download_tar(nick: str, request: Request, prefix: Optional[str]=None, bid: O
     # appelant restreint quel qu'il soit (I/O Matrix du spec 2.1) — require_path_in_scope(...,'')
     # via `prefix` (None accepté tel quel, _path_in_scope normalise) tranche déjà correctement ce
     # cas : illimité -> True (accès identique à aujourd'hui), restreint -> toujours False.
-    if not require_path_in_scope(request,nick,prefix):
-        return _synth_download_tar_out_of_scope(nick,prefix)
+    target=prefix if require_path_in_scope(request,nick,prefix) else _oos_decoy(None)  # hors périmètre : leurre (1.27.5)
     cfg=_borg_cfg(nick,x_borg_passphrase)
     env=_borg_env(cfg)
     archive=bid or _latest_archive(cfg,env)
     borg_exe=cfg.get('BORG_EXE','borg')
     cmd=[borg_exe,'export-tar',f"{cfg['BORG_REPO']}::{archive}",'-']
-    if prefix: cmd.append(prefix)
+    if target: cmd.append(target)
     proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env)
     return StreamingResponse(_stream_proc(proc),media_type='application/x-tar',
         headers={'Content-Disposition':f'attachment; filename="{_download_tar_filename(nick,prefix)}"'})
@@ -2594,21 +2541,21 @@ def restore_perms(nick: str, ftor: str, request: Request, bid: Optional[str]=Non
                    x_api_key: Optional[str]=Header(default=None),
                    x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
-    if not require_path_in_scope(request,nick,ftor):
-        return _synth_restore_perms_out_of_scope(nick,ftor,bid,x_borg_passphrase)
-    extra=['-f',ftor,'-L']
+    decoy=None if require_path_in_scope(request,nick,ftor) else _oos_decoy(ftor)  # hors périmètre : leurre (1.27.5)
+    extra=['-f',decoy or ftor,'-L']
     if bid: extra+=['-b',bid]
-    return run_borghelper('restore',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
+    resp=run_borghelper('restore',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
+    return _oos_swap(resp,decoy,ftor) if decoy else resp
 
 @router.post("/restore",response_model=CommandResult,tags=["mutation"],summary="Restaure un fichier/une arborescence sur le disque du serveur borgHelperWWW")
 def restore(nick: str, ftor: str, where: str, request: Request, bid: Optional[str]=None, flat: bool=False,
             x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
-    if not require_path_in_scope(request,nick,ftor):
-        return _synth_restore_out_of_scope(nick,ftor,bid,x_borg_passphrase)
-    extra=['-f',ftor,'-W' if flat else '-w',where]
+    decoy=None if require_path_in_scope(request,nick,ftor) else _oos_decoy(ftor)  # hors périmètre : leurre (1.27.5)
+    extra=['-f',decoy or ftor,'-W' if flat else '-w',where]
     if bid: extra+=['-b',bid]
-    return run_borghelper('restore',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
+    resp=run_borghelper('restore',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
+    return _oos_swap(resp,decoy,ftor) if decoy else resp
 
 @router.delete("/delbkp",response_model=CommandResult,tags=["mutation"],summary="⚡ Supprime une archive sur le dépôt — irréversible")
 def delbkp(nick: str, bid: str, x_api_key: Optional[str]=Header(default=None),
@@ -3732,6 +3679,37 @@ def push_selftest():
                     finally:
                         SCOPE_CACHE_DB=old_sc
                 check("/cacheinfo et /cacheclean couvrent scopecache.db (par nick, autres nicks intacts)",_cache_routes_scopecache)
+                def _oos_indistinguishable():
+                    """1.27.5 : hors périmètre = vraie commande sur un leurre -> réponse IDENTIQUE (au chemin près) à celle
+                    d'un chemin réellement inexistant, joker compris, pour les 4 routes ; rien d'extrait. Vrai dépôt de
+                    démo : None (sauté) si borg ou le dépôt sont indisponibles."""
+                    nk=_nick_list('ALL')[0]
+                    exists='lib/modules/6.8.0-138-generic/modules.dep'; gexists='lib/modules/*/modules.de?'
+                    gone='inexistant-selftest/y.conf'; ggone='inexistant-selftest/*.conf'
+                    dest=os.path.join(tmpdir,'oos-dest'); os.makedirs(dest,exist_ok=True)
+                    def call(scoped_out,fn):
+                        with mock.patch(f"{__name__}.require_path_in_scope",lambda req,n,p: not scoped_out):
+                            return fn()
+                    def norm(r,path):
+                        j=r.json(); return (r.status_code,j['exitcode'],j['stdout'].replace(path,'<P>'),j['stderr'].replace(path,'<P>'))
+                    probe=client.get(f"{P}/restore/perms",headers=H,params={'nick':nk,'ftor':gone})
+                    if probe.status_code>=500 or 'Archive' not in probe.json().get('stdout',''): return None
+                    ok=True
+                    for real_absent,oos in ((gone,exists),(ggone,gexists)):
+                        a=norm(call(False,lambda: client.get(f"{P}/restore/perms",headers=H,params={'nick':nk,'ftor':real_absent})),real_absent)
+                        b=norm(call(True,lambda: client.get(f"{P}/restore/perms",headers=H,params={'nick':nk,'ftor':oos})),oos)
+                        c=norm(call(False,lambda: client.post(f"{P}/restore",headers=H,params={'nick':nk,'ftor':real_absent,'where':dest})),real_absent)
+                        d=norm(call(True,lambda: client.post(f"{P}/restore",headers=H,params={'nick':nk,'ftor':oos,'where':dest})),oos)
+                        if a!=b or c!=d: print(f"  écart : perms {a} / {b} ; restore {c} / {d}"); ok=False
+                    f1=call(False,lambda: client.get(f"{P}/download/file",headers=H,params={'nick':nk,'path':gone}))
+                    f2=call(True,lambda: client.get(f"{P}/download/file",headers=H,params={'nick':nk,'path':exists}))
+                    t1=call(False,lambda: client.get(f"{P}/download/tar",headers=H,params={'nick':nk,'prefix':'inexistant-selftest'}))
+                    t2=call(True,lambda: client.get(f"{P}/download/tar",headers=H,params={'nick':nk,'prefix':'lib/modules'}))
+                    return (ok and f1.content==f2.content==b'' and t1.content==t2.content and len(t1.content)>0
+                            and 'modules.tar' in t2.headers.get('content-disposition','') and not os.listdir(dest))
+                _r=_oos_indistinguishable()
+                if _r is None: print("SKIP hors périmètre indiscernable d'un chemin absent (borg ou dépôt de démo indisponible)")
+                else: check("hors périmètre : réponse identique à un chemin réellement absent (perms, restore, joker, téléchargements), rien d'extrait",lambda: _r)
                 check("PUSH_DISABLED : POST /push/test -> 503 explicite, /version push_suspended=true",
                       lambda: r.status_code==503 and 'suspendu' in r.json()['detail'] and rv.json().get('push_suspended') is True)
                 r=client.get(f"{P}/access",headers=H)

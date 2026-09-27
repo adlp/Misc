@@ -1324,19 +1324,17 @@ réutilise telle quelle la même résolution de périmètre (`_resolve_path_scop
 les commandes ci-dessus, mais tranche AVANT tout appel `borg`/`borgHelper` : chemin hors périmètre
 ⇒ aucun appel n'est fait, jamais.
 
-Sur un chemin hors périmètre, chaque route répond avec une forme SYNTHÉTIQUE qui imite exactement
-sa propre réponse « chemin introuvable » (vérifiée en direct contre `demo.borghelperrc`) —
-**jamais un `403` distinct** : un `403` permettrait à l'appelant de distinguer « hors périmètre »
-de « n'existe pas » par le seul code de statut, ce qui confirmerait indirectement qu'un chemin
-existe quelque part dans l'archive même si l'appelant n'a pas le droit de le voir (voir
-[Codes retour](#codes-retour)).
-
-| Route | Hors périmètre | Forme imitée (chemin réellement introuvable) |
-|---|---|---|
-| `POST /restore` | `400`, `{"exitcode":1,"stdout":"","stderr":"Include pattern '<ftor>' never matched.\n"}` (`stdout` porte `"Archive sélectionnée (dernière) : <dernière archive>\n"` si `bid` est omis) | identique |
-| `GET /restore/perms` | `200`, `{"exitcode":0,"stdout":"","stderr":""}` (`stdout` porte `"Archive (dernière) : <dernière archive>\n"` si `bid` est omis) | identique |
-| `GET /download/file` | `200`, corps **vide** (0 octet), `Content-Disposition` présent (nom de fichier dérivé de `path`, inchangé) | identique |
-| `GET /download/tar` | `200`, tar minimal valide **vide** (`Content-Disposition` présent, nom dérivé de `prefix`/`nick`) | identique |
+Sur un chemin hors périmètre, chaque route répond **exactement comme pour un chemin qui n'existe pas** —
+**jamais un `403` distinct** : un `403` permettrait à l'appelant de distinguer « hors périmètre » de « n'existe pas »
+par le seul code de statut, ce qui confirmerait indirectement qu'un chemin existe quelque part dans l'archive même si
+l'appelant n'a pas le droit de le voir (voir [Codes retour](#codes-retour)). Depuis borgHelperWWW 1.27.5, cette réponse
+n'est plus une imitation écrite à la main : la **vraie commande** est exécutée sur un **leurre** garanti inexistant (nom
+aléatoire, joker conservé si le chemin en contient un), puis le leurre est remplacé par le chemin demandé dans le texte
+renvoyé. Résultat identique par construction — texte, code de sortie, contenu téléchargé (vide, ou `.tar` vide),
+nom de fichier, **et temps de réponse** — quelles que soient les versions de borg et de borgHelper ; rien n'est
+extrait. Auparavant l'imitation avait dérivé : pour un joker, code 1 et « never matched » alors que la vraie réponse
+est code 0 sans ce message, et elle était instantanée. Contrôlé par `push_selftest` sur le dépôt de démo (quatre
+routes, avec et sans joker).
 
 `GET /download/tar` sans `prefix` (export de l'archive entière) est traité comme hors périmètre pour
 tout appelant dont le périmètre résolu ne couvre pas déjà l'ensemble de l'arborescence (`prefix` omis
@@ -2066,12 +2064,9 @@ raisonnement (indiscernabilité d'un chemin qui n'existe simplement pas dans l'a
 - **`DuIdx`/`IdxTop`/`DiffTop` filtrés par périmètre depuis la Story 1.4** : voir « Autorisation par
   groupes » ci-dessus pour le mécanisme (mode brut par-chemin + recalcul côté `borgHelperWWW`,
   traitement mono-nick, omission des figures Exclus/Inchangés non scopables pour un appelant scopé).
-- **`POST /restore`/`GET /restore/perms` hors périmètre sans `bid` déclenchent encore un `borg list
-  --short` par requête** (Story 2.1, `_oos_last_archive_line`/`_latest_archive`, pour construire la
-  ligne d'archive de la réponse synthétique) : moins coûteux qu'avant cette story (qui exécutait
-  l'extraction/le listing complet quel que soit le périmètre), mais un appel répété reste un vrai
-  sous-processus `borg` par requête, pas gratuit — un appelant hors périmètre qui martèle ces deux
-  routes sans `bid` continue de générer de la charge côté dépôt borg.
+- **Une requête hors périmètre coûte autant qu'une vraie requête introuvable** (1.27.5 : vraie commande sur un
+  leurre, voir « Autorisation par groupes ») — c'est le prix de l'indiscernabilité, temps de réponse compris : un
+  appelant qui martèle ces routes génère la même charge côté dépôt borg qu'avec des chemins inexistants.
 
 ---
 

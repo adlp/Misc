@@ -1,5 +1,20 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.27.5 — hors périmètre : vraie réponse « introuvable » au lieu d'une imitation — 2026-09-27
+
+Issu de l'entretien `deferred-work.md` (point 8, option D).
+
+- Pour un utilisateur limité par `GROUPS_PATHS`, une restauration ou un téléchargement hors de son périmètre doit
+  répondre comme pour un chemin inexistant (sans révéler que le chemin existe). Cette réponse était **imitée** à la
+  main, et avait dérivé : pour un **joker**, l'imitation renvoyait code 1 et « Include pattern … never matched. »
+  alors que la vraie réponse est code 0 sans ce message ; elle était aussi instantanée. On pouvait donc distinguer
+  « hors périmètre » de « n'existe pas ».
+- Désormais la vraie commande est exécutée sur un **leurre** inexistant de même forme, et le leurre est remplacé par
+  le chemin demandé : réponse identique par construction (texte, code, contenu, nom de fichier, temps), quelles que
+  soient les versions. Rien n'est extrait. Imitations et libellés recopiés supprimés.
+- `push_selftest` 85/85 : les quatre routes (restauration, droits, fichier, `.tar`), avec et sans joker, comparées à
+  la vraie réponse d'un chemin absent sur le dépôt de démo.
+
 ## borgHelper 1.0.136 — test de la capture `repo_stats` sur un vrai borg — 2026-09-27
 
 Issu de l'entretien `deferred-work.md` (point 9, option B).
