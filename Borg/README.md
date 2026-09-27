@@ -1489,7 +1489,7 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
      « dernière archive », qui échouerait — le fichier n'y est plus). Un dossier entièrement supprimé
      reste explorable normalement (son ancien contenu s'affiche).
    - **Clic sur un dossier** : l'ouvre (contenu direct, comme `TreeHist -f <dossier>`).
-   - **Notice « Droits et propriétaire »** (UI ≥ 1.16.1), visible dans tous les modes, et bulle ⓘ sur ces colonnes :
+   - **Notice « Droits et propriétaire »** sous l'explorateur (UI ≥ 1.16.1), visible dans tous les modes :
      ils montrent le dernier état connu (plus récente sauvegarde indexée contenant l'entrée), pas forcément celui de
      la sauvegarde épinglée ou comparée ; inconnus (—) pour une entrée supprimée ; droits exacts d'une sauvegarde
      donnée : téléchargement `.tar` « préserve les droits d'accès ».

@@ -1,5 +1,9 @@
 # Changelog — borgHelper
 
+## borgHelperWWW_ui.html 1.16.2 — notice sur les droits : seule sous l'explorateur — 2026-09-27
+
+- Retour utilisateur : la notice sous l'explorateur suffit — bulles ⓘ des en-têtes Droits/Propriétaire retirées.
+
 ## borgHelperWWW_ui.html 1.16.1 — notice sur les droits dans l'explorateur — 2026-09-27
 
 Demande utilisateur : ajouter une notice quant aux droits.
