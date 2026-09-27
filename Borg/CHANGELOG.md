@@ -1,5 +1,24 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.124 — robustesse des bases (erreurs de chiffrement, migrations, connexions) — 2026-09-27
+
+Issu de `deferred-work.md` (lot A).
+
+- **Base chiffrée, passphrase fausse ou absente** : toutes les commandes de lecture (TreeHist, Search, DuIdx, IdxTop,
+  DiffTop, RepoHistory, ArchiveHistory, FileHist, TreeFind…) plantaient avec une trace Python — **envoyée à Sentry**
+  quand il est configuré. Désormais `[ERREUR] DbKeyError : <nick>: passphrase incorrecte ou en-tête altéré`, code 2,
+  jamais de trace ni d'événement Sentry. Même traitement pour `DbModeError` (migration en cours), `DbTamperError`,
+  `DbCodecError`.
+- **Base illisible** (fichier corrompu, pas une base SQLite) : auparavant ouverte comme « non chiffrée » faute de
+  pouvoir lire l'en-tête ; désormais refusée (`DbTamperError : <nick>: base illisible, mode de chiffrement
+  invérifiable`). `DbStatus` l'affiche comme en-tête invalide et continue avec les autres bases.
+- **Migrations de schéma atomiques** (`repo_stats`, `archive_snapshot`) : une seule transaction, ROLLBACK sur erreur —
+  un crash entre `DROP TABLE` et `RENAME` ne peut plus laisser `diff.db` sans la table.
+- Connexions SQLite fermées sur erreur dans DuIdx, IdxTop, DiffTop (10 sites).
+- Prune/Report : un JSON `borg info` tronqué ou inattendu n'est plus une exception non attrapée.
+- `CodecSelfTest` 333/333 (nouveaux : migration interrompue après `DROP TABLE`, passphrase fausse en vrai
+  processus CLI). Sorties inchangées (IdxTop, DiffTop, DuIdx, Report, clair et chiffré, comparées à 1.0.120).
+
 ## borgHelper 1.0.123 — réécriture atomique du rc — 2026-09-27
 
 Issu de `deferred-work.md` (lot A).

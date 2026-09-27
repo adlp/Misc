@@ -1042,6 +1042,25 @@ Pistes étudiées : (2) ne décoder que les enfants directs du répertoire list�
 section suivante ; (3) processus `borgHelper` persistant interrogé par borgHelperWWW (supprime ~250 ms de
 démarrage + KDF par clic, mémo de décodage chaud d'un clic à l'autre) — **non réalisée**.
 
+### Erreurs de base chiffrée au niveau CLI (1.0.124)
+
+`DbKeyError`/`DbModeError`/`DbTamperError`/`DbCodecError` ne sont pas des `sqlite3.Error` : les `except
+sqlite3.Error` des commandes ne les voyaient pas, et `_open_db` est appelé très tôt (`_is_index_empty`…) — une
+passphrase fausse faisait planter toutes les commandes de lecture (trace + événement Sentry par l'excepthook). Filet
+unique dans le bloc `__main__` : `[ERREUR] <Type> : <message>`, code 2 (Sentry ne voit plus rien : l'excepthook n'est
+pas atteint). `_open_db` préfixe le message par le nick (`DbKeyError`, `DbTamperError` de lecture d'en-tête). Les
+traitements par nick existants (`_codec_fail`, Report) restent prioritaires. Limite : avec `-n ALL`, un nick en
+erreur arrête la commande (pas de reprise par nick au niveau du filet).
+
+`_enc_header_read` : `sqlite3.DatabaseError` (hors « no such table ») → `DbTamperError` au lieu de `None` — un
+fichier illisible n'est plus pris pour une base `plain`. Non traité : une base chiffrée dont la ligne `enc_header`
+aurait été supprimée reste indiscernable d'une base `plain` (aucun marqueur indépendant du mode).
+
+`_executescript_atomic(conn, script)` : `BEGIN IMMEDIATE; … COMMIT;` dans le même `executescript`, `ROLLBACK` si
+erreur (`executescript` valide sinon chaque instruction séparément). Utilisé par `_migrate_archive_snapshot` et
+`_migrate_repo_stats`. `_close_quiet(conn)` : fermeture sur les chemins `except sqlite3.Error` (connexion initialisée à
+`None` avant chaque `try`).
+
 ### Décodage limité aux enfants directs (`TreeHist`, 1.0.121, piste 2)
 
 **Contrat (choix utilisateur).** Sur base chiffrée, `_treehist_listing` ne décode — donc ne vérifie — que le

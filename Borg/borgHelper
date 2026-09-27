@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.123"
+Version="1.0.124"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -894,8 +894,11 @@ def _enc_header_read(conn):
     except sqlite3.OperationalError as e:
         if 'no such table' in str(e): return None
         raise
-    except sqlite3.DatabaseError:
-        return None  # fichier corrompu : l'appelant le constatera à sa première requête, comme avant
+    except sqlite3.DatabaseError as e:
+        # Fichier illisible (corrompu, pas une base SQLite) : AVANT 1.0.124, traité comme « pas d'en-tête »
+        # -> une base chiffrée dont la page d'en-tête est abîmée s'ouvrait en 'plain' (un écrivain non
+        # chiffré aurait pu y mêler des chemins en clair). Refus net : on ne sait pas vérifier le mode.
+        raise DbTamperError(f"base illisible, mode de chiffrement invérifiable ({e})") from None
     return row[0] if row else None
 
 def _enc_header_write(conn,header):
@@ -1017,7 +1020,8 @@ def _open_db(db_path,nick=None,role='read',passphrase=None,**kw):
     conn.role=role; conn.nick=nick
     try:
         if nick is not None:
-            raw=_enc_header_read(conn)
+            try: raw=_enc_header_read(conn)
+            except DbTamperError as e: raise DbTamperError(f"{nick}: {e}") from None
             if raw is not None:
                 header=_enc_header_parse(raw)
                 if header['path_enc']=='migrating' and role!='admin':
@@ -1030,7 +1034,9 @@ def _open_db(db_path,nick=None,role='read',passphrase=None,**kw):
                 ck=(os.path.realpath(db_path),header['mac'],hashlib.sha256(_pw_bytes(pw)).digest())
                 dek=_DEK_CACHE.get(ck)
                 if dek is None:
-                    dek=_enc_header_unlock(header,pw); _DEK_CACHE[ck]=dek
+                    try: dek=_enc_header_unlock(header,pw)
+                    except DbKeyError as e: raise DbKeyError(f"{nick}: {e}") from None  # nick dans le message
+                    _DEK_CACHE[ck]=dek
                 codec=_CODEC_CACHE.get(ck)
                 if codec is None: codec=_CODEC_CACHE[ck]=DbCodec(dek)
                 conn.codec=codec; conn.mode=header['path_enc']
@@ -1213,6 +1219,13 @@ def _psel_duidx(conn,sel):
     if sel[0]=='under': return _psel_under(conn,sel[1])
     if sel[0]=='like': return _psel_like(conn,sel[1])
     return '',[],None
+
+def _close_quiet(conn):
+    """Ferme une connexion sur un chemin d'erreur (1.0.124) : sqlite3.Error au milieu d'une requête ne
+    doit pas laisser la connexion ouverte. None (échec à l'ouverture) ou déjà fermée : sans effet."""
+    if conn is None: return
+    try: conn.close()
+    except Exception: pass
 
 def _codec_fail(label,e,conn=None):
     """Valeur de chemin stockée illisible (DbCodecError, pas une sqlite3.Error) : ferme la connexion, message par nick."""
@@ -1428,9 +1441,22 @@ class BorgHelperDB:
             printer("  Supprimez le fichier et relancez pour reconstruire le cache.")
             sys.exit(1)
 
+    @staticmethod
+    def _executescript_atomic(conn,script):
+        """Migration de schéma en UNE transaction (1.0.124) : `executescript` seul valide chaque
+        instruction à part — un crash entre `DROP TABLE x` et `ALTER TABLE x_new RENAME TO x` laissait
+        diff.db sans la table. DDL SQLite transactionnel : tout ou rien, ROLLBACK sur erreur."""
+        try:
+            conn.executescript("BEGIN IMMEDIATE;\n"+script+"\nCOMMIT;")
+        except BaseException:
+            if conn.in_transaction:
+                try: conn.execute("ROLLBACK")
+                except sqlite3.Error: pass
+            raise
+
     def _migrate_archive_snapshot(self,conn):
         print("  Migration snapshot → schéma déduplication...",file=sys.stderr,flush=True)
-        conn.executescript("""
+        self._executescript_atomic(conn,"""
             INSERT OR IGNORE INTO snapshot_file (nick, path, size, mtime)
                 SELECT nick, path, size, mtime FROM archive_snapshot;
             CREATE TABLE archive_snapshot_new (
@@ -1451,7 +1477,7 @@ class BorgHelperDB:
 
     def _migrate_repo_stats(self,conn):
         print("  Migration repo_stats → historique...",file=sys.stderr,flush=True)
-        conn.executescript("""
+        self._executescript_atomic(conn,"""
             CREATE TABLE repo_stats_new (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
                 nick           TEXT,
@@ -2062,6 +2088,7 @@ class BorgHelperDB:
             self.ensure_diff_db(db_path,create=False)
             if self._is_index_empty(n,db_path):
                 printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
+            conn=None
             try:
                 conn=_open_db(db_path,nick=n,role='read')
                 af_sql,af_params=self._diff_archive_filter(n,archive_from,conn,archive_to)
@@ -2079,6 +2106,7 @@ class BorgHelperDB:
                 conn.close()
             except DbCodecError as e: _codec_fail(n,e,conn)
             except sqlite3.Error as e:
+                _close_quiet(conn)
                 printer(f"SQLite error ({db_path}): {e}")
         return totals
 
@@ -2089,6 +2117,7 @@ class BorgHelperDB:
             self.ensure_diff_db(db_path,create=False)
             if self._is_index_empty(n,db_path):
                 printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
+            conn=None
             try:
                 conn=_open_db(db_path,nick=n,role='read')
                 af_sql,af_params=self._diff_archive_filter(n,archive_from,conn,archive_to)
@@ -2111,6 +2140,7 @@ class BorgHelperDB:
                 conn.close()
             except DbCodecError as e: _codec_fail(n,e,conn)
             except sqlite3.Error as e:
+                _close_quiet(conn)
                 printer(f"SQLite error ({db_path}): {e}")
         return totals
 
@@ -2128,6 +2158,7 @@ class BorgHelperDB:
             self.ensure_diff_db(db_path,create=False)
             if self._is_index_empty(n,db_path):
                 printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
+            conn=None
             try:
                 conn=_open_db(db_path,nick=n,role='read')
                 af_sql,af_params=self._diff_archive_filter(n,archive_from,conn,archive_to)
@@ -2145,6 +2176,7 @@ class BorgHelperDB:
                 conn.close()
             except DbCodecError as e: _codec_fail(n,e,conn)
             except sqlite3.Error as e:
+                _close_quiet(conn)
                 printer(f"SQLite error ({db_path}): {e}")
         return rows
 
@@ -2740,9 +2772,9 @@ class BorgHelper:
             if not os.path.exists(path):
                 printer(f"  {nick}: {label}: absent"); continue
             peek=sqlite3.connect(path)
-            try: raw=_enc_header_read(peek)
-            finally: peek.close()
             try:
+                try: raw=_enc_header_read(peek)
+                finally: peek.close()
                 mode='plain' if raw is None else _enc_header_parse(raw)['path_enc']
             except DbTamperError as e:
                 printer(f"  {nick}: {label}: en-tête invalide ({e})"); continue
@@ -3361,7 +3393,7 @@ class BorgHelper:
                         cst=rbi['stdout'][0].get('cache',{}).get('stats',{})
                         if cst.get('unique_csize') is not None:
                             self.db.store_repo_stats(nick,'prune',cst['unique_csize'],cst.get('total_size'),cst.get('total_csize'))
-                    except (RuntimeError,KeyError,TypeError,IndexError): pass
+                    except (RuntimeError,KeyError,TypeError,IndexError,AttributeError,ValueError): pass
                     return rb
                 else:
                     return ret
@@ -3600,7 +3632,7 @@ class BorgHelper:
                             st.get('original_size'),st.get('compressed_size'),st.get('deduplicated_size'),st.get('nfiles'),db_path)
                         n+=1
                 if n: print(f"{nick}: statistiques de {n} archive(s) enregistrées (graphiques)")
-            except (RuntimeError,KeyError,TypeError,IndexError) as e:
+            except (RuntimeError,KeyError,TypeError,IndexError,AttributeError,ValueError) as e:
                 printer(f"{nick}: statistiques d'archives (graphiques) non récupérées : {e}")
         rbr=self.borg.boex(nick,['info','--json'],debug=debug)
         try:
@@ -3610,7 +3642,7 @@ class BorgHelper:
                 cur={'unique_csize':cst['unique_csize'],'total_size':cst.get('total_size'),'total_csize':cst.get('total_csize')}
                 if self.db.get_repo_stats(nick,db_path)!=cur:
                     self.db.store_repo_stats(nick,'index',cur['unique_csize'],cur['total_size'],cur['total_csize'],db_path)
-        except (RuntimeError,KeyError,TypeError,IndexError) as e:
+        except (RuntimeError,KeyError,TypeError,IndexError,AttributeError,ValueError) as e:
             printer(f"{nick}: taille du dépôt (graphiques) non récupérée : {e}")
 
     def index(self,nick,debug=0,db_path=None,force=False,target_archive=None,set_pending=True):
@@ -4241,6 +4273,7 @@ class BorgHelper:
             # après filtrage par périmètre), lignes disponibles avant tout regroupement Python, comme
             # pour duidx()/_duidx_collect_raw().
             rows=[]
+            conn=None
             try:
                 conn=_open_db(db_path,nick=nick,role='read')
                 cur=conn.execute("SELECT path,COALESCE(size_after,size_before,0) FROM diff_index WHERE nick=?",(nick,))
@@ -4253,6 +4286,7 @@ class BorgHelper:
             except DbCodecError as e:
                 print(json.dumps({'error':_codec_fail(nick,e,conn)},ensure_ascii=False,indent=2)); return
             except sqlite3.Error as e:
+                _close_quiet(conn)
                 print(json.dumps({'error':f"SQLite error ({db_path}): {e}"},ensure_ascii=False,indent=2)); return
             print(json.dumps({'borghelper_version':Version,'nick':nick,'rows':rows},ensure_ascii=False,indent=2))
             return
@@ -4264,6 +4298,7 @@ class BorgHelper:
             return leading+'/'.join(parts[:d])
         stats=defaultdict(lambda:{'count':0,'size':0})
         total_count=0; total_size=0
+        conn=None
         try:
             conn=_open_db(db_path,nick=nick,role='read')
             cur=conn.execute("SELECT path,COALESCE(size_after,size_before,0) FROM diff_index WHERE nick=?",(nick,))
@@ -4278,9 +4313,11 @@ class BorgHelper:
         except DbCodecError as e:
             _codec_fail(nick,e,conn); return
         except sqlite3.Error as e:
+            _close_quiet(conn)
             printer(f"  SQLite error ({db_path}): {e}"); return
         if not total_count:
             printer(f"  {nick}: diff_index vide"); return
+        conn2=None
         try:
             conn2=_open_db(db_path,nick=nick,role='read')
             exclu_rows=conn2.execute("SELECT change_type,SUM(file_count),SUM(total_size) FROM diff_excluded_stats WHERE nick=? GROUP BY change_type",(nick,)).fetchall()
@@ -4304,7 +4341,8 @@ class BorgHelper:
             idx_am_d={r[0]:(r[1] or 0,r[2] or 0) for r in idx_am}
             exclu_am_d={r[0]:(r[1] or 0,r[2] or 0) for r in exclu_am}
             nfiles_d={r[0]:r[1] for r in nfiles_rows if r[1]}
-        except sqlite3.Error: exclu_by_ct={}; exclu_n=0; exclu_sz=0; idx_am_d={}; exclu_am_d={}; nfiles_d={}
+        except sqlite3.Error:
+            _close_quiet(conn2); exclu_by_ct={}; exclu_n=0; exclu_sz=0; idx_am_d={}; exclu_am_d={}; nfiles_d={}
         top=sorted(stats.items(),key=lambda x:x[1]['count'],reverse=True)[:topn]
         from prettytable import PrettyTable
         t=PrettyTable(); t.field_names=['arborescence','entrées','taille','% total']
@@ -4494,6 +4532,7 @@ class BorgHelper:
                 if as_json: print(json.dumps({'error':"-b attend 'archive-old,archive-new'"},ensure_ascii=False,indent=2)); return
                 printer(f"  {nick}: -b attend 'archive-old,archive-new'"); return
         else:
+            conn=None
             try:
                 conn=_open_db(db_path,nick=nick,role='read',timeout=60)
                 row=conn.execute(
@@ -4501,6 +4540,7 @@ class BorgHelper:
                     (nick,)).fetchone()
                 conn.close()
             except sqlite3.Error as e:
+                _close_quiet(conn)
                 if as_json: print(json.dumps({'error':f"SQLite error ({db_path}): {e}"},ensure_ascii=False,indent=2)); return
                 printer(f"  SQLite error ({db_path}): {e}"); return
             if not row:
@@ -4511,6 +4551,7 @@ class BorgHelper:
             # Story 1.4 : mode brut par-chemin (jamais groupé/top-N — borgHelperWWW s'en charge après
             # filtrage par périmètre), même paire d'archives que le mode texte ci-dessous.
             rows=[]
+            conn=None
             try:
                 conn=_open_db(db_path,nick=nick,role='read',timeout=60)
                 cur=conn.execute(
@@ -4525,6 +4566,7 @@ class BorgHelper:
             except DbCodecError as e:
                 print(json.dumps({'error':_codec_fail(nick,e,conn)},ensure_ascii=False,indent=2)); return
             except sqlite3.Error as e:
+                _close_quiet(conn)
                 print(json.dumps({'error':f"SQLite error ({db_path}): {e}"},ensure_ascii=False,indent=2)); return
             print(json.dumps({'borghelper_version':Version,'nick':nick,'archive_old':arch_old,'archive_new':arch_new,
                                'rows':rows},ensure_ascii=False,indent=2))
@@ -4537,6 +4579,7 @@ class BorgHelper:
             return leading+'/'.join(parts[:d])
         stats=defaultdict(lambda:{'total':0,'added_n':0,'added_s':0,'removed_n':0,'removed_s':0,'modified_n':0,'size':0})
         total_count=0; total_size=0; total_added=0; total_modified=0
+        conn=None
         try:
             conn=_open_db(db_path,nick=nick,role='read',timeout=60)
             cur=conn.execute(
@@ -4559,9 +4602,11 @@ class BorgHelper:
         except DbCodecError as e:
             _codec_fail(nick,e,conn); return
         except sqlite3.Error as e:
+            _close_quiet(conn)
             printer(f"  SQLite error ({db_path}): {e}"); return
         if not total_count:
             printer(f"  {nick}: aucune entrée pour cette paire ({arch_old} → {arch_new})"); return
+        conn3=None
         try:
             conn3=_open_db(db_path,nick=nick,role='read',timeout=60)
             exclu_rows3=conn3.execute("SELECT change_type,SUM(file_count),SUM(total_size) FROM diff_excluded_stats WHERE nick=? AND archive_old=? AND archive_new=? GROUP BY change_type",(nick,arch_old,arch_new)).fetchall()
@@ -4570,7 +4615,8 @@ class BorgHelper:
             exclu_by_ct3={r[0]:(r[1] or 0,r[2] or 0) for r in exclu_rows3}
             exclu_n=sum(v[0] for v in exclu_by_ct3.values()); exclu_sz=sum(v[1] for v in exclu_by_ct3.values())
             nfiles_new=nfiles_row[0] if nfiles_row and nfiles_row[0] else None
-        except sqlite3.Error: exclu_by_ct3={}; exclu_n=0; exclu_sz=0; nfiles_new=None
+        except sqlite3.Error:
+            _close_quiet(conn3); exclu_by_ct3={}; exclu_n=0; exclu_sz=0; nfiles_new=None
         top=sorted(stats.items(),key=lambda x:x[1]['total'],reverse=True)[:topn]
         from prettytable import PrettyTable
         t=PrettyTable()
@@ -5863,6 +5909,27 @@ def codec_selftest():
                     _q_build('qe',True)  # restaure une base saine pour la suite du self-test
             check("TreeHist chiffré, altération : 2e segment -> racine affichée, détectée en listant 'etc' ; "
                   "1er segment -> détectée à la racine (DbCodecError attrapée, pas de traceback)",_tamper_treehist_depth)
+            def _cli_wrong_passphrase():
+                """1.0.124 : base chiffrée + passphrase fausse -> toute commande de lecture sort proprement
+                (code 2, `[ERREUR] DbKeyError : <nick>: …`), jamais une trace Python (qui partait aussi vers
+                Sentry). Vrai processus CLI, Sentry neutralisé (DSN vide). rc dédié portant le même nom
+                ('qrc', d'où le même nom de base) avec CACHE_DIR explicite : sans lui, le CLI utiliserait
+                le cache par défaut de l'utilisateur (~/.cache/borghelper)."""
+                _q_build('qe',True)
+                d=os.path.join(tmp,'cli'); os.makedirs(d,exist_ok=True); rc=os.path.join(d,'qrc')
+                with open(qrc) as f: body=f.read()
+                with open(rc,'w') as f: f.write(f"[DEFAULT]\nCACHE_DIR={qcache}\n\n"+body)
+                os.chmod(rc,0o600)
+                nodsn=os.path.join(tmp,'sentry-vide'); open(nodsn,'w').close()
+                env=dict(os.environ,BORGHELPERC_SENTRY_FILE=nodsn); env.pop('BORGHELPERC_SENTRY_DSN',None)
+                for cmd in (['-c','TreeHist','-j'],['-c','IdxTop','-j'],['-c','RepoHistory','-j']):
+                    r=subprocess.run([sys.executable,os.path.realpath(__file__),'-C',rc,'-n','qe','-P','fausse']+cmd,
+                                     capture_output=True,text=True,env=env,timeout=120)
+                    if not (r.returncode==2 and 'Traceback' not in r.stderr and '[ERREUR] DbKeyError : qe:' in r.stderr):
+                        return False
+                return True
+            check("CLI, base chiffrée + passphrase fausse : code 2 + [ERREUR] DbKeyError avec le nick, aucune trace Python",
+                  _cli_wrong_passphrase)
             check("plans (etc) sur connexion chiffrée : aucun LIKE/GLOB, aucun ORDER BY portant sur un chemin",
                   lambda: traced and not [q for q in traced if re.search(r'\bLIKE\b|\bGLOB\b|ORDER BY[^\n]*\bpath\b',q)])
         finally:
@@ -6662,6 +6729,25 @@ def codec_selftest():
             return (intact and no_tmp and 'nouvelle' in open(rc).read()
                     and stat.S_IMODE(os.stat(rc).st_mode)==0o640 and stat.S_IMODE(os.stat(new).st_mode)==0o600)
         check("cfgwrite atomique : crash en cours d'écriture -> rc intact, pas de temporaire ; droits conservés (0600 à la création)",_rc_atomic_write)
+        def _migration_atomic():
+            """_executescript_atomic (1.0.124) : échec APRÈS un DROP TABLE -> ROLLBACK, table et données
+            intactes, aucune table temporaire laissée ; succès -> tout appliqué."""
+            c=sqlite3.connect(os.path.join(tmp,'migr.db'))
+            try:
+                c.executescript("CREATE TABLE t(a); INSERT INTO t VALUES (1),(2);")
+                try:
+                    BorgHelperDB._executescript_atomic(c,"CREATE TABLE t_new(a); INSERT INTO t_new SELECT a FROM t;"
+                                                         " DROP TABLE t; SELECT fonction_inexistante();")
+                    return False
+                except sqlite3.OperationalError: pass
+                names={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                kept=names=={'t'} and c.execute("SELECT COUNT(*) FROM t").fetchone()[0]==2 and not c.in_transaction
+                BorgHelperDB._executescript_atomic(c,"CREATE TABLE t_new(a); INSERT INTO t_new SELECT a FROM t;"
+                                                     " DROP TABLE t; ALTER TABLE t_new RENAME TO t;")
+                return kept and c.execute("SELECT COUNT(*) FROM t").fetchone()[0]==2
+            finally:
+                c.close()
+        check("migration de schéma atomique : erreur après DROP TABLE -> ROLLBACK, table et données intactes",_migration_atomic)
     finally:
         shutil.rmtree(tmp,ignore_errors=True)
         _DB_CFG_READERS.clear(); _DB_CFG_READERS.update(saved_readers)
@@ -7198,3 +7284,8 @@ if __name__=='__main__':
         _cli_main()
     except SchemaVersionError as e:
         printer(f"Erreur schéma DB : {e}"); sys.exit(1)
+    except (DbKeyError,DbModeError,DbTamperError,DbCodecError) as e:
+        # Base chiffrée inutilisable (passphrase absente/fausse, migration en cours, en-tête ou chemin
+        # altéré) : erreur de données/configuration, pas un bug — message clair, code 2, jamais de trace
+        # Python ni d'événement Sentry (1.0.124 ; auparavant toutes les commandes de lecture plantaient).
+        printer(f"[ERREUR] {type(e).__name__} : {e}"); sys.exit(2)
