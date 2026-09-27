@@ -65,7 +65,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.27.7"
+WWW_VERSION="1.27.8"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -429,9 +429,10 @@ def _bkp_status_watcher_pass():
     for nick in _nick_list('ALL'):
         try:
             db_path=_bh_paths.db.get_diff_db(nick)
-            _bh_paths.db.ensure_diff_db(db_path,create=False)  # AD-12 : jamais créer pour un nick sans historique
-            for row in _bh_paths.db.list_pending_bkp_status(nick,BKP_STATUS_TIMEOUT,db_path):
-                if not _bh_paths.db.claim_bkp_status(nick,row['run_id'],db_path):
+            _bh_paths.db.ensure_diff_db(db_path,create=False)  # AD-12 : jamais créer pour un nick sans historique ; migre une base antérieure (1.0.139)
+            hist=_bh_paths.db.get_history_db(nick)              # bkp_status vit dans history.db (borgHelper 1.0.139) ; absente -> rien
+            for row in _bh_paths.db.list_pending_bkp_status(nick,BKP_STATUS_TIMEOUT,hist):
+                if not _bh_paths.db.claim_bkp_status(nick,row['run_id'],hist):
                     continue  # déjà réclamée par un autre worker (CAS perdu) — jamais de double traitement
                 result=row['result'] if row['finished_at'] else 'error'  # AD-7 : jamais fini = échec
                 # borgHelper >= 1.0.118 : statuts C/E de borg create (absents = inconnus).
@@ -445,8 +446,8 @@ def _bkp_status_watcher_pass():
                     sentry_alert('bkp_error',nick,f"Sauvegarde bloquée ou interrompue — {nick} "
                                  f"(sans fin après {BKP_STATUS_TIMEOUT} s)",_bh_paths.borg.cfgread(nick),
                                  extra={'run_id':row['run_id'],'timeout_s':BKP_STATUS_TIMEOUT},release=f"borgHelperWWW@{WWW_VERSION}")
-            for row in _bh_paths.db.list_pending_bkp_status_start(nick,db_path):
-                if not _bh_paths.db.claim_bkp_status_start(nick,row['run_id'],db_path):
+            for row in _bh_paths.db.list_pending_bkp_status_start(nick,hist):
+                if not _bh_paths.db.claim_bkp_status_start(nick,row['run_id'],hist):
                     continue  # déjà réclamée par un autre worker (CAS perdu) — jamais de double traitement
                 print(f"[watcher] bkp_status (début) réclamé : nick={nick} run_id={row['run_id']}",
                       file=sys.stderr,flush=True)
@@ -512,7 +513,7 @@ def _check_overdue(nick,db_path):
     cfg=_bh_paths.borg.cfgread(nick)
     max_age=_max_age_bkp(cfg)
     if age is None or age<=max_age: return
-    if _bh_paths.db.bkp_running(nick,BKP_STATUS_TIMEOUT,db_path): return
+    if _bh_paths.db.bkp_running(nick,BKP_STATUS_TIMEOUT,_bh_paths.db.get_history_db(nick)): return  # history.db (1.0.139)
     level=int(age//max_age)
     # Alerte Sentry (1.26.8, SENTRY_ALERTS=overdue) : canal indépendant du push — réservation propre
     # ('<nick>#sentry' dans overdue_alerts), mêmes rappels à chaque période MAX_AGE_BKP.
@@ -1151,6 +1152,7 @@ def _cache_db_paths(nick: Optional[str]):
         if not n: continue
         paths.append(_bh_paths.db.get_diff_db(n))
         paths.append(_bh_paths.db.get_cache_db(n))
+        paths.append(_bh_paths.db.get_history_db(n))   # mesures (RepoHistory, ArchiveHistory, Report -o) : 1.0.139
     return paths
 
 def _cache_fingerprint(nick: Optional[str]) -> str:
@@ -3392,6 +3394,60 @@ def push_selftest():
                     except SystemExit: return False
                 return seen==['nGood']
             check("watcher : sys.exit de borgHelper sur un nick absorbé, les autres nicks traités, serveur jamais arrêté",_watcher_survives_exit)
+            def _watcher_migrates_legacy():
+                """borgHelper 1.0.139 (history.db) : sur une diff.db d'avant la migration, le passage du watcher migre les
+                mesures (ensure_diff_db) puis trouve la fin de Bkp en attente dans history.db — une seule notification,
+                C/E compris, réclamée dans history.db ; le passage suivant n'envoie rien."""
+                d=tempfile.mkdtemp(prefix='bhwww-hist-'); dp=os.path.join(d,'rc-wm-diff.db'); sent=[]
+                try:
+                    c=sqlite3.connect(dp)
+                    c.executescript("""
+                        CREATE TABLE db_meta (key TEXT PRIMARY KEY, value TEXT); INSERT INTO db_meta VALUES('schema_version','4');
+                        CREATE TABLE archive_stats (nick TEXT NOT NULL, archive TEXT NOT NULL, archive_date TEXT, duration REAL,
+                            original_size INTEGER, compressed_size INTEGER, deduplicated_size INTEGER, nfiles INTEGER,
+                            changed_during_backup INTEGER, read_errors INTEGER, PRIMARY KEY (nick, archive));
+                        CREATE TABLE repo_stats (id INTEGER PRIMARY KEY AUTOINCREMENT, nick TEXT, op TEXT, unique_csize INTEGER,
+                            total_size INTEGER, total_csize INTEGER, updated_at TEXT DEFAULT (datetime('now')));
+                        CREATE TABLE bkp_status (nick TEXT NOT NULL, run_id TEXT NOT NULL, started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                            finished_at TEXT, result TEXT, notified_at TEXT, changed_during_backup INTEGER, read_errors INTEGER,
+                            start_notified_at TEXT, PRIMARY KEY (nick, run_id));
+                        INSERT INTO bkp_status VALUES ('wm','run1',datetime('now'),datetime('now'),'success',NULL,1,0,datetime('now'));
+                    """); c.commit(); c.close()
+                    with mock.patch(f"{__name__}._nick_list",lambda x:['wm']), \
+                         mock.patch.object(_bh_paths.db,'get_diff_db',lambda n: dp), \
+                         mock.patch(f"{__name__}._send_bkp_push",lambda n,ev,res,w=None: sent.append((n,ev,res,w))), \
+                         mock.patch(f"{__name__}._check_overdue",lambda n,p: None), \
+                         contextlib.redirect_stderr(io.StringIO()):
+                        _bkp_status_watcher_pass(); _bkp_status_watcher_pass()
+                    c=sqlite3.connect(dp); left={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}; c.close()
+                    h=sqlite3.connect(os.path.join(d,'rc-wm-history.db'))
+                    claimed=h.execute("SELECT notified_at FROM bkp_status WHERE run_id='run1'").fetchone()[0]; h.close()
+                    return (sent==[('wm','end','success',{'changed_during_backup':1,'read_errors':0})]
+                            and 'bkp_status' not in left and claimed is not None)
+                finally: shutil.rmtree(d,ignore_errors=True)
+            check("watcher : diff.db d'avant history.db -> migrée au passage, fin de Bkp notifiée une fois (C/E compris)",_watcher_migrates_legacy)
+            def _overdue_real_bkp_running():
+                """borgHelper 1.0.139 : « Bkp en cours » lu pour de vrai dans history.db (bkp_running non simulé) — un Bkp
+                en cours suspend l'alerte de retard ; fini, l'alerte part (Sentry simulé, rien n'est envoyé)."""
+                d=tempfile.mkdtemp(prefix='bhwww-ovd-'); dp=os.path.join(d,'rc-ovr-diff.db'); sent=[]
+                def _rec(kind,nick,msg,cfg,extra=None,release=None):
+                    if kind in _sentry_alert_kinds(cfg): sent.append((kind,nick))
+                    return True
+                try:
+                    with mock.patch.object(_bh_paths.db,'get_diff_db',lambda n: dp), \
+                         mock.patch.object(_bh_paths.db,'last_archive_stat',lambda n,p=None:('OV1',(_dt.datetime.now()-_dt.timedelta(hours=30)).isoformat())), \
+                         mock.patch.object(_bh_paths.borg,'cfgread',lambda n:{'MAX_AGE_BKP':'25','SENTRY_ALERTS':'overdue'}), \
+                         mock.patch(f"{__name__}.sentry_alert",side_effect=_rec), \
+                         mock.patch(f"{__name__}._PYWEBPUSH_AVAILABLE",False), \
+                         contextlib.redirect_stderr(io.StringIO()):
+                        hist=_bh_paths.db.get_history_db('ovr')
+                        _bh_paths.db.store_bkp_status_start('ovr','runO',hist)
+                        _check_overdue('ovr',dp); during=list(sent)
+                        _bh_paths.db.store_bkp_status_finish('ovr','runO','success',hist)
+                        _check_overdue('ovr',dp)
+                    return during==[] and sent==[('overdue','ovr')] and hist.endswith('rc-ovr-history.db')
+                finally: shutil.rmtree(d,ignore_errors=True)
+            check("retard : Bkp en cours lu dans history.db (non simulé) -> alerte suspendue, puis envoyée une fois fini",_overdue_real_bkp_running)
             def _push_mute_flow():
                 """1.27.2 : PUSH_MUTE=true (rc, relu à chaque envoi) -> rien envoyé, alerte de retard NON consommée
                 (part à la reprise) ; BORGHELPERWWW_PUSH_DISABLED -> rien envoyé (fin de sauvegarde comprise)."""

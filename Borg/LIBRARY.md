@@ -332,10 +332,11 @@ from borgHelper import BorgHelper
 
 bh = BorgHelper()
 
-# bh.backup(nick) écrit désormais une ligne bkp_status (diff.db, exclusif à backup()) à son début
-# et à sa fin — 'success'/'error' dérivé du même code retour que sys.exit(). Lecture/réclamation
+# bh.backup(nick) écrit une ligne bkp_status (history.db depuis 1.0.139, exclusif à backup()) à son
+# début et à sa fin — 'success'/'error' dérivé du même code retour que sys.exit(). Lecture/réclamation
 # directes via bh.db, sans passer par sqlite3 : mêmes méthodes que le watcher borgHelperWWW.
-db_path = bh.db.get_diff_db('mon-serveur')
+# db_path facultatif : par défaut, la history.db du nick (une lecture ne la crée jamais).
+db_path = bh.db.get_history_db('mon-serveur')
 
 # Lignes prêtes à être traitées : terminées, ou bloquées depuis plus de timeout_s secondes sans fin
 # (processus tué avant sa fin normale — AD-7). Ne modifie rien (lecture seule).
@@ -648,6 +649,14 @@ sys.exit(0)
 |---------|-------------|
 | `get_diff_db(nick)` | Chemin du diff.db d'un nick |
 | `get_cache_db(nick)` | Chemin du cache.db d'un nick |
+| `get_history_db(nick)` | Chemin de la history.db d'un nick (1.0.139 : mesures non régénérables, en clair, sans chemin) |
+| `history_path(nick)` | Idem, après migration éventuelle de la diff.db du nick (lecteurs) ; ne crée jamais le fichier |
+| `ensure_history_db(path, create=True)` | Schéma de history.db ; `create=False` : ne rien créer si absente |
+| `store_archive_measure(nick, archive, archive_date, deduplicated_size, changed_during_backup, read_errors)` | Mesures d'une archive prises au Bkp (history.db) |
+| `get_archive_measures(nick)` | `{(archive, archive_date): {deduplicated_size, changed_during_backup, read_errors}}` (+ clé `(archive, None)` si le nom est unique) ; `{}` si aucune |
+| `delete_archive_measures(nick, keep=None)` | Retire les mesures des archives absentes de `keep` (toutes si `keep` vide) |
+
+> ⚠️ **Changement cassant (1.0.139)** : `store_archive_stats(...)` n'accepte plus `changed_during_backup=` / `read_errors=` (`TypeError`) — ces mesures passent par `store_archive_measure(...)` dans `history.db`. Les fonctions `bkp_status`/`repo_stats` (`store_bkp_status_*`, `list_pending_bkp_status*`, `claim_bkp_status*`, `bkp_running`, `get_running_bkp_status`, `store_repo_stats`, `get_repo_stats`) visent désormais la `history.db` du nick par défaut ; un `db_path` explicite doit être un chemin de `history.db`.
 | `is_diff_pair_indexed(nick, a_old, a_new)` | Vérifie si une paire est indexée |
 | `is_archive_snapshot_indexed(nick, archive)` | Vérifie si le snapshot est indexé |
 | `_diff_stats_for_nick(nick)` | Stats de mouvement par archive (used by Report) |

@@ -25,7 +25,8 @@ borgHelper est structuré en trois couches :
 |---------|---------|
 | `~/.borghelperrc` | Configuration des dépôts (INI) |
 | `~/.cache/borghelper/<conf>-<nick>-cache.db` | Cache des appels `borg info/list` (SQLite) |
-| `~/.cache/borghelper/<conf>-<nick>-diff.db` | Index des diffs, snapshots et stats d'archives (SQLite) |
+| `~/.cache/borghelper/<conf>-<nick>-diff.db` | Index des diffs, snapshots et stats d'archives (SQLite) — entièrement régénérable depuis le dépôt (1.0.139) |
+| `~/.cache/borghelper/<conf>-<nick>-history.db` | Mesures NON régénérables (1.0.139) : `repo_stats`, `bkp_status`, `archive_measure` — en clair, sans chemin ; **la seule base à sauvegarder** |
 | `~/.cache/borghelper/<conf>-<repo_sanitisé>-priority.lock` | Lock PID posé par `Bkp`/`Restore` — signal d'interruption pour `Index` sur le même dépôt |
 | `~/.cache/borghelper/<conf>-<repo_sanitisé>-index-running.lock` | Lock PID posé par `Index` pendant Phase 2 — `Bkp`/`Restore` attendent sa disparition avant `borg create`/`borg extract` |
 | `~/.cache/borghelper/<conf>-<nick>-index-pending.lock` | Flag (vide) posé par `Index` quand interrompu par `Bkp`/`Restore` — `Bkp` le détecte en fin d'exécution et relance `Index` complet automatiquement |
@@ -171,6 +172,10 @@ Une ligne par (nick, archive) : `file_count` + `total_size`.
 Peuplée par `IndexSnap` (`-S`) et en fin d'`Index` normal.
 
 #### `repo_stats`
+
+> **1.0.139 : déplacée dans `history.db`** (voir « Base de données `history.db` »). Règles d'écriture, de lecture et
+> de rétention inchangées ; seul l'emplacement change.
+
 Statistiques globales du dépôt borg dans le temps (niveau cache, pas par archive) — historique, une
 ligne par événement (`id INTEGER PRIMARY KEY AUTOINCREMENT`, jamais écrasée).  
 Colonnes : `id`, `nick`, `op` (`'bkp'|'prune'|'index'`), `unique_csize` (taille dédupliquée totale du dépôt),
@@ -256,6 +261,9 @@ périmé, il réécrirait une définition plus récente avec l'ancienne) — `[W
 fois par cause.
 
 ### Schéma complet
+
+> Schéma d'avant 1.0.139 : `repo_stats`, `bkp_status` et les colonnes C/E d'`archive_stats` sont depuis dans `history.db`.
+
 
 ```mermaid
 erDiagram
@@ -368,6 +376,60 @@ erDiagram
 
 ---
 
+## Base de données `history.db` (1.0.139)
+
+Mesures prises au Bkp (ou au Prune) qu'aucun appel borg ne redonne ensuite — chantier « reconstruction progressive »,
+story 2, spine AD-7/AD-8. Une base par nick (`<conf>-<nick>-history.db`, même nom que `diff.db`), en clair (aucune
+colonne de chemin, jamais d'`enc_header`), `0600`, WAL, ouverte sans nick (`_open_db(..., nick=None)` : ni codec ni
+avertissement « base non chiffrée »). `DbStatus` l'affiche `plain (aucun chemin, jamais chiffrée)`.
+
+| Table | Contenu | Écrivains | Rétention |
+|---|---|---|---|
+| `repo_stats` | historique des tailles du dépôt (`op` bkp/prune/index) | Bkp, Prune, refresh d'Index | `STATS_RETENTION_MONTHS` |
+| `bkp_status` | cycle de vie des Bkp (watcher push, `Status`) | Bkp seul ; réclamations CAS du watcher | `STATS_RETENTION_MONTHS` |
+| `archive_measure` | par `(nick, archive, archive_date)` : taille dédupliquée à la création, C/E | Bkp seul | tant que l'archive existe (retrait au nettoyage après Prune) |
+
+- **Lecture** : `history_path(nick)` / `_hist(nick)` ouvrent d'abord `diff.db` (`ensure_diff_db`, sans la créer), ce
+  qui migre une base antérieure ; une lecture ne crée jamais `history.db` (fichier absent = aucune mesure : `[]`,
+  `None`, `{}`). Les mesures sont lues par une requête à part et fusionnées en Python (jamais d'`ATTACH`, qui
+  créerait le fichier). `ArchiveHistory -j` et `Report -o` affichent la taille dédupliquée **mesurée** si elle existe,
+  sinon celle d'`archive_stats` (`borg info`) — sorties identiques à avant la migration.
+- **Migration automatique** (`_migrate_to_history`, appelée par `ensure_diff_db` à chaque ouverture, détectée par la
+  présence des tables ou de C/E non `NULL`) : le verrou d'écriture de `diff.db` (`BEGIN IMMEDIATE`) est tenu de bout
+  en bout et l'état relu sous ce verrou — aucun écrivain ne peut écrire entre la copie et le retrait, et un processus
+  arrivé en second voit la migration faite (revue : sans cela, « no such table » pris pour une corruption). Ordre des
+  verrous : `diff.db` puis `history.db`. Étape 1, copie + marqueur `migrated_from_diff='copied'` dans une transaction
+  de `history.db` ; étape 2, `DROP TABLE repo_stats/bkp_status` et `ALTER TABLE archive_stats DROP COLUMN` des C/E
+  (SQLite < 3.35 : colonnes vidées, donc plus jamais détectées), puis marqueur `done`. Tuée entre les deux : la relance
+  ne fait que l'étape 2. Une `diff.db` d'un schéma plus récent n'est jamais touchée. Une erreur de `history.db` pendant
+  la migration n'invite jamais à supprimer `diff.db` (elle porte encore les seules copies).
+  Tables réapparues après `done` (un binaire antérieur les recrée : son `ensure_diff_db` exécute le schéma avant de
+  refuser la version, et Bkp avale ce refus) : lignes recopiées (`repo_stats` sans imposer d'id), puis retirées. Base
+  `migrating` (DbEncrypt/DbDecrypt en cours) : rien. Mesures par archive reprises seulement pour les lignes dont C/E
+  n'est pas `NULL` (seule preuve d'un Bkp, ≥ 1.0.117) ; `archive_stats.deduplicated_size` reste dans `diff.db`.
+- **Version** : `DIFF_DB_SCHEMA_VERSION` et `DIFF_DB_BASE_SCHEMA_VERSION` passent à 10 (aussi pour les bases en
+  clair) : un binaire d'avant refuse une `diff.db` migrée dès qu'il passe par `ensure_diff_db` (Bkp, Index, Report…) ;
+  ses lectures directes (`RepoHistory`) répondent « no such table » sans rien écrire. Retour arrière : restaurer une
+  copie de `diff.db` faite avant la migration — les mesures écrites depuis dans `history.db` (tailles, suivi des Bkp,
+  C/E) sont alors perdues pour cette ancienne version.
+- **Limites connues** : une taille dédupliquée reprise comme « mesurée » (lignes avec C/E) a pu être écrasée avant
+  1.0.139 par un rattrapage `Index -F` (valeur `borg info`, même C/E conservés) — indiscernable, affichage inchangé.
+  Des lignes écrites par un binaire d'avant pendant la migration elle-même peuvent se perdre : arrêter les anciens
+  processus (Bkp, borgHelperWWW) avant de mettre à jour.
+- **Emplacement et sauvegarde** : `history.db` est dans `CACHE_DIR` (par défaut `~/.cache/borghelper`, souvent exclu
+  des sauvegardes). Pour la sauvegarder sans perdre les écritures récentes du WAL, en faire une copie cohérente :
+  `python3 -c 'import sqlite3,sys; sqlite3.connect(sys.argv[1]).execute("VACUUM INTO ?",(sys.argv[2],))' <history.db> <copie>`.
+- **Lecteurs** : `history_path` absorbe la sortie d'`ensure_diff_db` (base occupée/corrompue, message déjà affiché) —
+  un lecteur de mesures (`Status -n ALL`…) continue sur `history.db` telle quelle. Mesures par archive recherchées par
+  `(archive, archive_date)` puis par nom seul s'il est unique (date formatée autrement dans une `archive_stats`
+  reconstruite). `RepoHistory` sert `history.db` même si `diff.db` a été supprimée. Purge des mesures au nettoyage
+  après Prune, aussi pour un nick `NOIDX` ou sans `diff.db`, jamais sur une liste d'archives vide.
+- **Cache par périmètre** de borgHelperWWW : la clé inclut la date de modification de `history.db`.
+- Vérifié : `CodecSelfTest` (migration, reprise après kill, trois processus concurrents, ancien binaire refusé, tables
+  recréées par un ancien binaire, `diff.db` jetée puis reconstruite, lecture sans historique, base chiffrée,
+  base `migrating`) ; parité des sorties `RepoHistory -j`, `ArchiveHistory -j`, `Report -o -j` entre 1.0.138 et
+  1.0.139 sur des bases construites par de vrais Bkp/Prune (en clair et chiffrée).
+
 ## Flux d'indexation
 
 ### `Bkp` (indexation automatique)
@@ -380,8 +442,9 @@ borg create --json --stats --list --filter CE   (1.0.117 : --list limité aux st
 _bkp_file_status() sur stderr → C (modifié pendant la sauvegarde) / E (erreur de lecture)
     → [WARN] résumé stderr + borgHelper_backup_warnings (JSON stdout)
     ↓
-store_archive_stats(nick, archive_new, ..., changed_during_backup, read_errors) → archive_stats
-store_repo_stats(nick, 'bkp', ...)                       → repo_stats
+store_archive_stats(nick, archive_new, ...)              → diff.db archive_stats (régénérable)
+store_archive_measure(nick, archive_new, date, dédup, C, E) → history.db archive_measure (1.0.139)
+store_repo_stats(nick, 'bkp', ...)                       → history.db repo_stats
     ↓
 clear_priority_lock(nick)                                → priority.lock supprimé (Bkp terminé)
     ↓
@@ -1749,7 +1812,8 @@ sans risque même après une migration partielle ou un `schema_version` désynch
 | 6 | `repo_stats` historique | colonne `op` absente sur `repo_stats` | `_migrate_repo_stats()` : ligne unique par nick (`INSERT OR REPLACE`) → historique append-only (`id` AUTOINCREMENT, `op`) — la ligne existante devient la première ligne `op='bkp'`, aucune valeur perdue |
 | 7 | `bkp_status.start_notified_at` | colonne absente | `ALTER TABLE ADD COLUMN` + backfill (lignes existantes marquées déjà notifiées) |
 | 9 | `bkp_status.changed_during_backup` / `read_errors` (1.0.118) | colonnes absentes | `ALTER TABLE ADD COLUMN` — écrites par `store_bkp_status_finish`, relues par `list_pending_bkp_status` : le watcher de borgHelperWWW les joint au payload de la notification de fin (`_send_bkp_push(..., warnings)`) ; NULL (Bkp antérieur) = omis du payload |
-| 8 | `archive_stats.changed_during_backup` / `read_errors` (1.0.117) | colonnes absentes | `ALTER TABLE ADD COLUMN` — NULL = inconnu (archives antérieures, ou rattrapées par Index : ces statuts ne sont connus qu'au Bkp). `store_archive_stats` devient un upsert (`ON CONFLICT DO UPDATE`, `COALESCE`) : un appel sans ces compteurs (rattrapage `Index -F`) ne les remet jamais à NULL |
+| 8 | `archive_stats.changed_during_backup` / `read_errors` (1.0.117) | colonnes absentes | `ALTER TABLE ADD COLUMN` — NULL = inconnu (archives antérieures, ou rattrapées par Index : ces statuts ne sont connus qu'au Bkp). *Depuis 1.0.139 : colonnes retirées (palier 10), mesures dans `history.db` `archive_measure` ; `store_archive_stats` ne porte plus C/E* |
+| 10 | mesures → `history.db` (1.0.139) | tables `repo_stats`/`bkp_status` ou C/E non NULL présentes dans `diff.db` | `_migrate_to_history` (voir « Base de données `history.db` ») ; version de schéma **et** version de base à 10 |
 
 `ensure_diff_db()` est désormais garanti appelé (donc les migrations garanties appliquées) avant tout
 accès à `diff.db`/`cache.db` depuis **Bkp**, **Index**, **Prune** et tous les autres consommateurs —
@@ -2609,7 +2673,7 @@ source par `backup()`, jamais un signal existant détourné (`priority.lock` est
 et keyé par dépôt, pas par nick ; `archive_stats` est aussi écrit par `Index` — ni l'un ni l'autre n'a
 la précision requise).
 
-### Table `bkp_status` (`diff.db`, exclusive à `Bkp`)
+### Table `bkp_status` (`history.db` depuis 1.0.139 — `diff.db` avant ; exclusive à `Bkp`)
 
 ```sql
 CREATE TABLE IF NOT EXISTS bkp_status (

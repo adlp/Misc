@@ -81,7 +81,7 @@ SSH_REMFO        = 8022:localhost:22
 SSH_KEY          = /root/.ssh/id_borg
 
 # Identifiant SQLite (optionnel — surcharge le nick dans le nom des fichiers DB)
-# -> borghelperrc-mon-serveur-home-cache.db / -diff.db
+# -> borghelperrc-mon-serveur-home-cache.db / -diff.db / -history.db
 DB_NAME          = mon-serveur-home
 
 # Désactiver l'indexation pour ce dépôt (Search/FileHist/DuIdx non disponibles)
@@ -956,6 +956,20 @@ changement de `BORG_PASSPHRASE` — voir la note sur `DbRekey` plus haut ([Chiff
 redémarrage** (il relit l'en-tête de chiffrement de la base à chaque usage). Versions antérieures : redémarrer son
 process — faute de quoi, après un `DbEncrypt`, son cache de périmètre continuait d'écrire ce nick en clair.
 
+### `history.db` : la seule base à sauvegarder (1.0.139)
+
+Chaque nick a trois bases dans `CACHE_DIR` : `cache.db` et `diff.db` se reconstruisent depuis le dépôt borg (on peut
+les supprimer), mais `<conf>-<nick>-history.db` garde ce qu'aucun appel borg ne redonne : l'historique des tailles du
+dépôt (graphiques, gain de Prune), le suivi des sauvegardes (notifications) et, par archive, les compteurs C/E et la
+taille dédupliquée mesurés au Bkp. Elle est créée automatiquement à la mise à jour (migration depuis `diff.db`).
+
+- **La sauvegarder** : `CACHE_DIR` (par défaut `~/.cache/borghelper`) est souvent exclu des sauvegardes. Copie cohérente
+  (WAL compris) : `python3 -c 'import sqlite3,sys; sqlite3.connect(sys.argv[1]).execute("VACUUM INTO ?",(sys.argv[2],))' <history.db> <copie>`.
+- **Pas de retour arrière** : une `diff.db` migrée est refusée par les versions antérieures. Arrêter les anciens
+  processus (Bkp, borgHelperWWW) avant la mise à jour ; pour revenir en arrière, restaurer une copie de `diff.db`
+  d'avant la mise à jour (les mesures écrites depuis dans `history.db` seront ignorées par l'ancienne version).
+- `history.db` est toujours en clair (aucun nom de fichier) ; `RepoHistory` la lit donc même sans passphrase.
+
 ### `DbStatus`
 
 ```bash
@@ -963,7 +977,8 @@ borgHelper -c DbStatus -n mon-serveur
 borgHelper -c DbStatus -n ALL
 ```
 
-Affiche le mode (`plain`/`siv1`/`migrating`) de `cache.db` et de `diff.db` pour chaque nick. Ne lit que
+Affiche le mode (`plain`/`siv1`/`migrating`) de `cache.db` et de `diff.db` pour chaque nick, puis `history.db`
+(toujours `plain` : elle ne contient aucun chemin). Ne lit que
 l'en-tête (`db_meta.enc_header`) : aucune passphrase n'est nécessaire pour simplement connaître le mode d'une
 base chiffrée. Si une base reste `plain` alors que `DB_ENCRYPT` est actif et qu'une passphrase est
 disponible, avertit (comme `_open_db`, une fois par base et par invocation) et cite la commande `DbEncrypt`.
@@ -1663,7 +1678,7 @@ Les endpoints marqués **✓** dans la colonne Cache ci-dessous ne lisent (ou n'
 lors de son tout premier appel sur une paire non indexée) que `cache.db`/`diff.db` — jamais l'état live
 du dépôt
 indépendamment de ces fichiers. `borgHelperWWW` retient leur dernière réponse en mémoire, avec une
-empreinte = date de modification de tous les `cache.db`/`diff.db` concernés (tous les nicks connus si
+empreinte = date de modification de tous les `cache.db`/`diff.db`/`history.db` concernés (tous les nicks connus si
 le nick demandé est vide ou `ALL`). Un appel identique est servi depuis le cache **sans relancer
 `borgHelper`** tant que cette empreinte n'a pas changé ; dès qu'un `Bkp`/`Index`/`Prune`/`DelBkp`/… a
 modifié ces fichiers, l'empreinte change et l'appel suivant recalcule (et remet en cache) une réponse
@@ -1686,7 +1701,7 @@ co-localisé avec eux — voir [Configuration](#configuration)), stocke le résu
 pour chaque `(nick, commande, paramètres, périmètre)` — une ligne **par nick réel**, même pour une
 requête multi-nick (`Search`/`FileHist`/`TreeHist`/`TreeFind`) : deux nicks scopés différemment dans
 la même requête ne partagent jamais une ligne. Empreinte d'invalidation capturée **avant** la
-résolution du périmètre (mtimes `cache.db`/`diff.db` du nick **et** mtime de `.borghelperrc` lui-même
+résolution du périmètre (mtimes `cache.db`/`diff.db`/`history.db` du nick **et** mtime de `.borghelperrc` lui-même
 — un `GROUPS_PATHS` resserré/relâché invalide donc le cache sans attendre une nouvelle sauvegarde) ;
 un appel identique est servi sans relancer `borgHelper` tant que cette empreinte n'a pas changé. Pour
 les quatre routes multi-nick, un hit **partiel** (certains nicks en cache, d'autres non) relance
@@ -1773,7 +1788,7 @@ sous-processus (`start_new_session=True` — survit à un redémarrage de `borgH
 sauvegarde) et répond dès son lancement confirmé, pas à la fin de la sauvegarde. `exitcode: 0` signifie
 donc **« lancement réussi »**, jamais « sauvegarde réussie » — `stdout` contient un message
 informatif (`"Sauvegarde démarrée pour <nick> (pid <pid>) — ..."`), jamais la sortie de `borgHelper`
-lui-même. Le résultat réel (succès/échec) est capté par une table dédiée `bkp_status` (`diff.db`,
+lui-même. Le résultat réel (succès/échec) est capté par une table dédiée `bkp_status` (`history.db` depuis borgHelper 1.0.139,
 exclusive à `Bkp`) et réclamé périodiquement par une tâche de fond (« watcher », un par worker
 uvicorn) — début **et** fin de sauvegarde — qui envoie une notification push réelle à chaque
 abonnement concerné (voir [Envoi réel](#envoi-réel-story-2b) sous [Notifications

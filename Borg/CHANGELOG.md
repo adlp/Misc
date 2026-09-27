@@ -1,5 +1,44 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.139 / borgHelperWWW 1.27.8 — `history.db` : les mesures quittent `diff.db`, qui devient jetable — 2026-09-27
+
+Chantier « reconstruction progressive », story 2 (spine AD-7, AD-8, AD-14).
+
+- Nouveau fichier par nick `<conf>-<nick>-history.db`, en clair (aucun chemin), `0600` : il reçoit tout ce qu'aucun
+  appel borg ne redonne ensuite — `repo_stats` (tailles du dépôt dans le temps), `bkp_status` (suivi des Bkp pour les
+  notifications et `Status`) et, par archive, les compteurs C/E et la taille dédupliquée mesurés au Bkp.
+  **C'est désormais la seule base à sauvegarder** : `diff.db` et `cache.db` se reconstruisent depuis le dépôt.
+- Migration automatique à la première ouverture de `diff.db` par cette version (commande, route ou watcher), sans
+  rien à faire : copie, puis retrait de `diff.db`. Sûre si elle est interrompue ou lancée par plusieurs processus à la
+  fois. Seules les mesures prouvées d'un Bkp (C/E connus, ≥ 1.0.117) sont reprises comme telles.
+- **Pas de retour arrière** : la `diff.db` migrée passe en version de schéma 10, qu'une version antérieure de
+  borgHelper refuse. Pour revenir en arrière, restaurer une copie de `diff.db` faite avant la mise à jour.
+- Sorties inchangées (JSON comparés entre 1.0.138 et 1.0.139, hors numéro de version, sur des bases construites par
+  de vrais Bkp et Prune, en clair et chiffrée) : `RepoHistory -j`, `ArchiveHistory -j`, `Report -o -j`. La taille dédupliquée affichée
+  est la mesure du Bkp si elle existe, sinon celle de `borg info` (comme avant). Un rattrapage d'`Index -F` n'écrase
+  plus jamais une mesure.
+- `RepoHistory` ne lit plus que `history.db` : elle répond même sans passphrase pour une base chiffrée (aucun chemin
+  n'y figure).
+- `DbStatus` affiche aussi `history.db` (toujours `plain`, jamais d'avertissement).
+- borgHelperWWW : le watcher (notifications de début/fin, alerte « dépassé ») lit `bkp_status` dans `history.db` ; la
+  clé du cache par périmètre tient compte de `history.db`.
+- Sauvegarder `history.db` (voir README « `history.db` : la seule base à sauvegarder ») : `CACHE_DIR` est souvent
+  exclu des sauvegardes. Arrêter les anciens processus (Bkp, borgHelperWWW) avant la mise à jour.
+- Bibliothèque (LIBRARY.md) : `store_archive_stats` n'accepte plus `changed_during_backup`/`read_errors` (changement
+  cassant) ; nouvelles méthodes `get_history_db`, `store_archive_measure`, `get_archive_measures`,
+  `delete_archive_measures`.
+- Revue en trois couches, correctifs : migration tenue sous le verrou d'écriture de `diff.db` et état relu sous ce
+  verrou (sinon un second processus concurrent sortait sur un faux « DB corrompue ») ; base d'un schéma plus récent
+  jamais migrée ; SQLite < 3.35 : colonnes C/E vidées (la migration ne se relance plus) ; mesures des archives
+  disparues purgées aussi pour un nick `NOIDX` ou sans `diff.db`, jamais sur une liste d'archives vide ; lecteurs de
+  mesures qui ne quittent plus le processus sur une `diff.db` occupée ; `RepoHistory` servie sans `diff.db` ; repli
+  par nom d'archive si la date diffère ; filet de `backup()` réparé (variable non définie si l'ouverture échouait).
+- Tests : `CodecSelfTest` 368/368 (migration, reprise après kill réaliste, 3 processus concurrents sans échec,
+  processus en retard, SQLite < 3.35, schéma plus récent, ancien binaire refusé, tables recréées par un ancien binaire,
+  purge après Prune, `diff.db` jetée puis reconstruite, `RepoHistory` sans `diff.db`, `Report -o`, lecture sans
+  historique, base chiffrée et `migrating`, Bkp/Prune réels avec mesures) ; `push_selftest` 89/89 (watcher sur une
+  base non migrée, alerte de retard avec le vrai « Bkp en cours »).
+
 ## borgHelper 1.0.138 — bascule de base sûre (API backup), compactage sans perte d'écriture — 2026-09-27
 
 Chantier « reconstruction progressive », story 1 (AD-6 amendé).
