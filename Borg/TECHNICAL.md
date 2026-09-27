@@ -239,6 +239,19 @@ migration versionnée déjà suivie par le reste du schéma. Ce correctif est le
 nécessaires (avec `_check_set_meta()` ci-dessus) pour que le cache SQLite par périmètre de
 `borgHelperWWW` (Story 1.5) puisse produire un hit en pratique.
 
+**Définition comparée (1.0.131 / borgHelperWWW 1.26.6)** — remplace le simple contrôle d'existence :
+`_ARCHIVE_SNAPSHOT_V_SQL` est la définition de référence (source unique) ; `_archive_view_state(conn)` compare le texte
+que SQLite stocke **verbatim** dans `sqlite_master.sql` (pas de reformatage : la crainte ci-dessus était infondée),
+espaces et casse normalisés (`_sql_norm`) → `ok` | `absent` | `mismatch` | `newer` (schéma de la base > code : rien
+à comparer, jamais touchée). `ensure_diff_db` recrée la vue (transaction `_executescript_atomic`) seulement sur
+`absent`/`mismatch` : le mtime n'avance toujours pas quand rien ne change (vérifié), et une évolution du `SELECT`
+s'applique désormais d'elle-même aux bases existantes. borgHelperWWW, qui tourne en continu, refait le contrôle au
+démarrage puis toutes les `BORGHELPERWWW_SCHEMA_CHECK_INTERVAL` secondes (3600 par défaut, min. 60) via
+`_schema_watch_pass` (watcher) : `archive_view_check(repair=True)` par nick ; **jamais de réparation si borgHelper a
+été mis à jour sur disque depuis le démarrage** (`_borghelper_disk_version` ≠ version en mémoire : le code chargé est
+périmé, il réécrirait une définition plus récente avec l'ancienne) — `[WARN] … redémarrer borgHelperWWW` une seule
+fois par cause.
+
 ### Schéma complet
 
 ```mermaid

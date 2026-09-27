@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.131 / borgHelperWWW 1.26.6 — structure des bases contrôlée, y compris en continu — 2026-09-27
+
+Issu de `deferred-work.md` (point B10 : « comparaison régulière, borgHelperWWW restant tout le temps démarré »).
+
+- La vue `archive_snapshot_v` de chaque base est comparée à la définition du code et recréée si elle diffère (avant :
+  seulement si elle manquait — une évolution de sa définition ne se serait jamais appliquée aux bases existantes).
+  Rien n'est réécrit quand elle est identique ; une base d'une version plus récente n'est jamais touchée.
+- borgHelperWWW refait ce contrôle au démarrage puis toutes les heures (`BORGHELPERWWW_SCHEMA_CHECK_INTERVAL`), et
+  signale une fois `[WARN] … redémarrer borgHelperWWW` si borgHelper a été mis à jour sur disque depuis son démarrage
+  (il ne répare alors rien : son code en mémoire est périmé).
+- `CodecSelfTest` 339/339, `push_selftest` 75/75.
+
 ## borgHelper 1.0.130 — Sentry : chemins masqués aussi dans le texte des erreurs — 2026-09-27
 
 Issu de `deferred-work.md` (point B9).

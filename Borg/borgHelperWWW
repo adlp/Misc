@@ -63,7 +63,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.26.5"
+WWW_VERSION="1.26.6"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -319,6 +319,10 @@ def _loggable_path(path,query):
 # défaut) — un délai trop court déclencherait de fausses alertes d'échec sur une sauvegarde encore
 # en cours.
 BKP_WATCHER_INTERVAL=int(os.environ.get('BORGHELPERWWW_BKP_WATCHER_INTERVAL','30'))
+# Contrôle périodique des bases (1.26.6) : borgHelperWWW tourne en continu pendant que les bases évoluent
+# (Bkp/Index en CLI) et que borgHelper peut être mis à jour sur disque. Secondes ; défaut 1 h, min. 60.
+try: SCHEMA_CHECK_INTERVAL=max(60,int(os.environ.get('BORGHELPERWWW_SCHEMA_CHECK_INTERVAL','3600')))
+except ValueError: SCHEMA_CHECK_INTERVAL=3600
 # Une valeur non numérique planterait au démarrage, et une valeur <1 produit un modificateur SQLite
 # datetime invalide (NULL silencieux -> la branche timeout AD-7 ne matche jamais) : repli sur le
 # défaut dans les deux cas, même motif que _stats_retention_months (borgHelper).
@@ -526,10 +530,52 @@ def _push_purge_expired():
 
 PUSH_PURGE_INTERVAL=3600  # secondes entre deux purges des abonnements expirés (par le watcher)
 
+_SCHEMA_WARNED=set()  # avertissements déjà émis (une fois par cause, pas à chaque passe)
+
+def _borghelper_disk_version():
+    """Version= du borgHelper sur DISQUE (le module importé par ce processus au démarrage peut être plus
+    ancien, s'il a été mis à jour depuis). None si illisible."""
+    try:
+        path=sys.modules[BorgHelper.__module__].__file__
+        with open(path,encoding='utf-8') as f: head=f.read(8192)
+        m=re.search(r'^Version="([^"]+)"',head,re.M)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+def _schema_watch_pass():
+    """Passe du contrôle périodique (1.26.6) : (1) borgHelper mis à jour sur disque depuis le démarrage ->
+    [WARN] « redémarrer » (le code en mémoire est périmé) ; (2) pour chaque nick, vue archive_snapshot_v
+    comparée à la définition du code : réparée si elle diffère — SAUF si le code en mémoire est périmé ou
+    plus ancien que la base (jamais réécrire une définition plus récente avec une plus ancienne). Retourne
+    {nick: état avant réparation} (tests)."""
+    def _warn(key,msg):
+        if key in _SCHEMA_WARNED: return
+        _SCHEMA_WARNED.add(key); print(f"[WARN] {msg}",file=sys.stderr,flush=True)
+    disk=_borghelper_disk_version()
+    stale=disk is not None and disk!=BORGHELPER_VERSION
+    if stale:
+        _warn(('version',disk),f"borgHelper v{disk} sur disque, mais borgHelperWWW exécute v{BORGHELPER_VERSION} "
+              "chargée à son démarrage — redémarrer borgHelperWWW pour l'appliquer à ses traitements internes")
+    states={}
+    for n in _nick_list('ALL'):
+        p=_bh_paths.db.get_diff_db(n)
+        if not os.path.exists(p): continue
+        st=_bh_paths.db.archive_view_check(p,repair=not stale)
+        states[n]=st
+        if st in ('mismatch','absent'):
+            if stale: _warn(('view',n,disk),f"{n}: vue archive_snapshot_v différente du code — non réparée (code en mémoire périmé), redémarrer borgHelperWWW")
+            else: print(f"[schema] {n}: vue archive_snapshot_v {'recréée' if st=='absent' else 'remise à jour'}",file=sys.stderr,flush=True)
+        elif st=='newer':
+            _warn(('newer',n),f"{n}: diff.db d'un schéma plus récent que borgHelper v{BORGHELPER_VERSION} en mémoire — redémarrer borgHelperWWW")
+        elif st.startswith('error'):
+            _warn(('error',n,st),f"{n}: contrôle de schéma impossible ({st})")
+    return states
+
 async def _bkp_status_watcher():
     print(f"[watcher] bkp_status démarré — interrogation toutes les {BKP_WATCHER_INTERVAL}s, "
           f"timeout AD-7 {BKP_STATUS_TIMEOUT}s",file=sys.stderr,flush=True)
-    next_purge=0.0
+    next_purge=0.0; next_schema=0.0
     while True:
         try:
             await asyncio.to_thread(_bkp_status_watcher_pass)
@@ -542,6 +588,11 @@ async def _bkp_status_watcher():
                 if n: print(f"[watcher] push: {n} abonnement(s) expiré(s) retiré(s)",file=sys.stderr,flush=True)
             except Exception as e:
                 print(f"[watcher] push: erreur de purge des abonnements expirés : {e}",file=sys.stderr,flush=True)
+        if time.monotonic()>=next_schema:
+            next_schema=time.monotonic()+SCHEMA_CHECK_INTERVAL
+            try: await asyncio.to_thread(_schema_watch_pass)
+            except Exception as e:
+                print(f"[watcher] erreur du contrôle de schéma : {e}",file=sys.stderr,flush=True)
         await asyncio.sleep(BKP_WATCHER_INTERVAL)
 
 app=FastAPI(
@@ -3383,6 +3434,30 @@ def push_selftest():
                                 and left=={_scope_cache_key(nk+'-autre','treehist',{},'s')})
                     finally:
                         _bh_paths.db.get_diff_db=old; SCOPE_CACHE_DB=old_sc; _NICK_CODEC_MEMO.clear()
+                def _schema_watch_ok():
+                    """1.26.6 : vue divergente réparée par la passe périodique ; code en mémoire périmé (borgHelper
+                    mis à jour sur disque) -> jamais réparée, avertissement « redémarrer » une seule fois.
+                    Base temporaire, jamais le vrai diff.db."""
+                    global _borghelper_disk_version
+                    tmpdb=os.path.join(tmpdir,'schema-diff.db')
+                    old=_bh_paths.db.get_diff_db; _bh_paths.db.get_diff_db=lambda n: tmpdb
+                    old_ver=_borghelper_disk_version
+                    alter="DROP VIEW archive_snapshot_v; CREATE VIEW archive_snapshot_v AS SELECT 1 AS x;"
+                    try:
+                        _bh_paths.db.ensure_diff_db(tmpdb)
+                        c=sqlite3.connect(tmpdb); c.executescript(alter); c.close()
+                        first=set(_schema_watch_pass().values()); second=set(_schema_watch_pass().values())
+                        c=sqlite3.connect(tmpdb); c.executescript(alter); c.close()
+                        _borghelper_disk_version=lambda: '0.0.0-autre'; _SCHEMA_WARNED.clear()
+                        err=io.StringIO()
+                        with contextlib.redirect_stderr(err): stale1=set(_schema_watch_pass().values()); stale2=set(_schema_watch_pass().values())
+                        warns=err.getvalue().count('redémarrer borgHelperWWW pour')
+                        # tous les nicks pointent vers la même base temporaire : le 1er la répare, les suivants la voient 'ok'
+                        return 'mismatch' in first and first<={'mismatch','ok'} and second=={'ok'} and stale1==stale2=={'mismatch'} and warns==1
+                    finally:
+                        _bh_paths.db.get_diff_db=old; _borghelper_disk_version=old_ver; _SCHEMA_WARNED.clear()
+                check("contrôle périodique : vue archive_snapshot_v divergente réparée ; code en mémoire périmé -> non réparée, un seul avertissement",
+                      _schema_watch_ok)
                 check("memo de codec : en-tête chiffré posé en cours de route (DbEncrypt CLI) -> pris en compte sans redémarrage, lignes scopecache en clair de ce nick purgées",
                       _codec_memo_follows_header)
                 r=client.get("/version")

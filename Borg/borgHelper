@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.130"
+Version="1.0.131"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (inchangée : un ancien binaire
@@ -690,6 +690,16 @@ _PATH_TAG_LEN=12
 _KDF_LEVELS=('light','standard','strong')
 _PATH_ENC_MODES=('siv1','migrating')
 _DEC_MEMO_MAX=262144  # entrées du mémo de décodage (DbCodec.decode_path)
+
+# Définition de référence de la vue archive_snapshot_v (1.0.131 : source unique, comparée aux bases existantes).
+_ARCHIVE_SNAPSHOT_V_SQL=("CREATE VIEW archive_snapshot_v AS\n"
+    "    SELECT s.nick, s.archive, s.archive_date, sf.path, sf.size, sf.mtime, sf.type, sf.mode, sf.owner\n"
+    "    FROM archive_snapshot s\n"
+    "    JOIN snapshot_file sf ON sf.id=s.file_id")
+
+def _sql_norm(sql):
+    """Texte SQL comparable : espaces fusionnés, casse ignorée, ';' final retiré."""
+    return ' '.join((sql or '').split()).rstrip(';').strip().lower()
 
 def _memo_evict(memo):
     """Mémo plein : retire la MOITIÉ la plus ancienne (ordre d'insertion des dict) au lieu de tout vider
@@ -1431,6 +1441,36 @@ class BorgHelperDB:
     def check_index_pending_lock(self,nick):
         return os.path.exists(self._index_pending_lock_path(nick))
 
+    @staticmethod
+    def _archive_view_state(conn):
+        """'ok' | 'absent' | 'mismatch' | 'newer' (schéma de la base > DIFF_DB_SCHEMA_VERSION : code plus ancien
+        que la base, rien à comparer). Comparaison du texte stocké par SQLite (sqlite_master.sql, verbatim)
+        à _ARCHIVE_SNAPSHOT_V_SQL, espaces et casse normalisés."""
+        try: row=conn.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()
+        except sqlite3.OperationalError: row=None
+        if row and int(row[0])>DIFF_DB_SCHEMA_VERSION: return 'newer'
+        v=conn.execute("SELECT sql FROM sqlite_master WHERE type='view' AND name='archive_snapshot_v'").fetchone()
+        if v is None: return 'absent'
+        return 'ok' if _sql_norm(v[0])==_sql_norm(_ARCHIVE_SNAPSHOT_V_SQL) else 'mismatch'
+
+    @classmethod
+    def _repair_archive_view(cls,conn):
+        cls._executescript_atomic(conn,"DROP VIEW IF EXISTS archive_snapshot_v;\n"+_ARCHIVE_SNAPSHOT_V_SQL+";")
+
+    def archive_view_check(self,db_path,repair=False):
+        """Contrôle (et réparation si repair=True et 'mismatch'/'absent') de la vue d'une base existante,
+        sans passphrase (la vue ne porte aucun chemin). Pour borgHelperWWW, qui tourne en continu : -> état
+        AVANT réparation, ou 'error: …'."""
+        try:
+            conn=_open_db(db_path,nick=None,role='admin' if repair else 'read')
+            try:
+                st=self._archive_view_state(conn)
+                if repair and st in ('mismatch','absent'): self._repair_archive_view(conn)
+                return st
+            finally: conn.close()
+        except sqlite3.Error as e:
+            return f"error: {e}"
+
     def _check_set_meta(self,conn,schema_version,db_path,base_version=None):
         """schema_version = version maximale comprise ; base_version = version écrite dans une base
         plain (défaut : schema_version). Une base plain n'est JAMAIS réécrite à la version maximale."""
@@ -1692,23 +1732,14 @@ class BorgHelperDB:
             if 'op' not in rstats_cols:
                 self._migrate_repo_stats(conn)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_rstats_nick ON repo_stats(nick, id)")
-            # Story 1.5 : ne (re)créer la vue que si elle n'existe pas déjà — un DROP/CREATE
-            # inconditionnel avance le mtime du fichier DB à chaque appel (checkpoint WAL à la
-            # fermeture de connexion), même sans le moindre changement de données, ce qui
-            # invaliderait à tort le cache par périmètre de borgHelperWWW. Simple contrôle
-            # d'existence (pas de diff textuelle du SQL, fragile face au stockage/formatage propre
-            # de SQLite) — une future évolution du SELECT de cette vue passera par une migration
-            # explicite gated sur DIFF_DB_SCHEMA_VERSION, comme _migrate_archive_snapshot.
-            view_row=conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='view' AND name='archive_snapshot_v'").fetchone()
-            if view_row is None:
-                conn.executescript("""
-                    DROP VIEW IF EXISTS archive_snapshot_v;
-                    CREATE VIEW archive_snapshot_v AS
-                        SELECT s.nick, s.archive, s.archive_date, sf.path, sf.size, sf.mtime, sf.type, sf.mode, sf.owner
-                        FROM archive_snapshot s
-                        JOIN snapshot_file sf ON sf.id=s.file_id;
-                """)
+            # Vue archive_snapshot_v : (re)créée si absente OU si sa définition diffère de celle du code
+            # (1.0.131, _archive_view_state) — auparavant simple contrôle d'existence : une évolution du
+            # SELECT ne s'appliquait jamais aux bases existantes. Jamais de DROP/CREATE inconditionnel
+            # (Story 1.5 : avancerait le mtime, donc invaliderait à tort le cache par périmètre de
+            # borgHelperWWW) : réécrite seulement en cas d'écart réel. Base d'un schéma PLUS RÉCENT que
+            # ce code : jamais touchée (sa définition est la bonne, _check_set_meta lève ensuite).
+            if self._archive_view_state(conn) in ('mismatch','absent'):
+                self._repair_archive_view(conn)
             self._check_set_meta(conn,DIFF_DB_SCHEMA_VERSION,db_path,DIFF_DB_BASE_SCHEMA_VERSION)
             conn.commit(); conn.close()
         except sqlite3.DatabaseError as e:
@@ -6872,6 +6903,19 @@ def codec_selftest():
                     and sel5==('under','foo') and d5==2 and m5('foo/x/bar/f') and not m5('foo/x/y/bar') and not m5('foo/bar')
                     and m6('a/b1/[x]%_.c/z') and not m6('a/b12/[x]%_.c/z') and not m6('a/b1/x%_.c/z') and not m6('a/b1/[x]%_Xc/z'))
         check("DuIdx groupé : _duidx_group_spec honore le motif composant par composant, 'foo/*' et '*' inchangés",_duidx_spec)
+        def _view_check():
+            """1.0.131 : vue archive_snapshot_v divergente -> recréée par ensure_diff_db ; base d'un schéma plus
+            récent -> jamais touchée ('newer') ; définition identique -> 'ok' sans réécriture."""
+            bdb=BorgHelperDB(tmp,'vw'); p=os.path.join(tmp,'view.db'); bdb.ensure_diff_db(p)
+            ok0=bdb.archive_view_check(p)=='ok'
+            c=sqlite3.connect(p); c.executescript("DROP VIEW archive_snapshot_v; CREATE VIEW archive_snapshot_v AS SELECT 1 AS x;"); c.close()
+            mis=bdb.archive_view_check(p); bdb.ensure_diff_db(p,create=False); fixed=bdb.archive_view_check(p)
+            c=sqlite3.connect(p); c.executescript("DROP VIEW archive_snapshot_v; CREATE VIEW archive_snapshot_v AS SELECT 1 AS x;")
+            c.execute("UPDATE db_meta SET value=? WHERE key='schema_version'",(str(DIFF_DB_SCHEMA_VERSION+1),)); c.commit(); c.close()
+            newer=bdb.archive_view_check(p,repair=True)
+            c=sqlite3.connect(p); kept=c.execute("SELECT sql FROM sqlite_master WHERE name='archive_snapshot_v'").fetchone()[0]; c.close()
+            return ok0 and mis=='mismatch' and fixed=='ok' and newer=='newer' and 'SELECT 1 AS x' in kept
+        check("vue archive_snapshot_v : divergente -> recréée par ensure_diff_db ; base plus récente -> jamais touchée",_view_check)
         check("_diff_entry_type (1.0.126) : type tiré de change_type (borg diff 1.2), tous les types de suppression reconnus",
               lambda: [_diff_entry_type(c,sb) for c,sb in (('added',None),('modified',1),('removed',3),('removed',0),('removed',None),
                        ('removed directory',None),('added link',None),('changed link',None),('removed fifo',None),
