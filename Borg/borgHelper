@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.145"
+Version="1.0.146"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -3671,9 +3671,10 @@ class BorgHelper:
         known.discard(None)
         return known
 
-    def _reconcile_archives(self,nick,db_path,current):
+    def _reconcile_archives(self,nick,db_path,current,repo=None):
         """Rapprochement de la base avec la liste courante des archives (CAP-5, AD-9, 1.0.140) — Index (liste déjà
-        obtenue, aucun appel borg de plus) et nettoyage après Prune. Tous les nicks, NOIDX compris.
+        obtenue ; borg list du dépôt entier seulement si une archive manque, voir Périmètre) et nettoyage après Prune et
+        DelBkp. Tous les nicks, NOIDX compris.
         - Liste vide : rien retiré (GLOB_ARCH erroné, dépôt vidé), avertissement si la base connaît des archives.
         - Archive disparue : retirée de toutes les tables de diff.db (ancienne OU nouvelle archive d'une paire), et ses
           mesures de history.db ; rien de disparu -> aucune écriture (mtime de diff.db intacte, cache WWW valide).
@@ -3684,6 +3685,11 @@ class BorgHelper:
           diff_index héritées sans paire dont une archive a disparu (ancien nettoyage : seule archive_new était testée).
         - Mesures retirées par liste explicite des disparues (jamais NOT IN la liste : la mesure d'un Bkp écrite après
           borg list survit).
+        - Périmètre du nick (1.0.146, story 9 R6) : repo = callable -> noms de TOUT le dépôt (borg list sans GLOB_ARCH,
+          None si en échec), appelé seulement si une archive a quitté la liste filtrée. Présente dans le dépôt = autre
+          machine (hors motif) : retirée de diff.db, AUCUNE écriture dans history.db (ni figeage, ni héritière, ni
+          mesure). Absente du dépôt = disparue (ci-dessus). Liste complète indisponible : reporté, rien retiré.
+          repo None : `current` est le dépôt entier (nick sans filtre).
         Jamais de compactage ici (Prune/IdxPurge s'en chargent). Base illisible, occupée ou chiffrée sans clé : message,
         rien retiré, Index continue. Retourne le nombre de lignes retirées de diff.db (décision de compactage)."""
         current=set(current)
@@ -3691,12 +3697,12 @@ class BorgHelper:
         shadow=_is_shadow(db_path)   # fantôme (1.0.143) : purge de ses tables seulement — ni figeage, ni mesures (AD-7)
         diff_ok=os.path.exists(db_path) and _db_has_schema(db_path)
         measures=self.db.get_archive_measures(nick,hist) if not shadow and os.path.exists(hist) else {}
-        known={k[0] for k in measures}; sweep=False; flag=f'reconcile_sweep:{nick}'
+        known={k[0] for k in measures}; known_diff=set(); sweep=False; flag=f'reconcile_sweep:{nick}'
         try:
             if diff_ok:
                 conn=_open_db(db_path,nick=nick,role='read')
                 try:
-                    known|=self._known_archives(nick,conn)
+                    known_diff=self._known_archives(nick,conn); known|=known_diff
                     sweep=not conn.execute("SELECT 1 FROM db_meta WHERE key=?",(flag,)).fetchone()
                 finally: conn.close()
         except _RECONCILE_ERRORS as e:
@@ -3710,6 +3716,15 @@ class BorgHelper:
         # Prune (verrou tenu par ce processus, ignoré par check_priority_lock) ni pour l'Index lancé par Bkp (relâché).
         if gone and self.db.check_priority_lock(nick):
             printer(f"{nick}: opération prioritaire en cours — rapprochement reporté"); return 0
+        foreign=set()
+        if gone and repo is not None and not shadow:
+            whole=repo()
+            if whole is None or whole is False:
+                printer(f"{nick}: liste complète du dépôt "+("interrompue (échéance ou opération prioritaire)" if whole is False
+                        else "indisponible")+" — rapprochement reporté (archives hors GLOB_ARCH et disparues non distinguées)")
+                return 0
+            foreign=gone&set(whole)
+        vanished=gone-foreign   # figeage, héritières et mesures : disparues seulement
         frozen=[]; orphans=set()
         try:
             conn=_open_db(db_path,nick=nick,role='read') if diff_ok else None
@@ -3721,8 +3736,8 @@ class BorgHelper:
                         (nick,)) if o not in current or n not in current}
                 if shadow and conn is not None:
                     conn.close(); conn=None   # fantôme : rien à figer — saute le calcul des lignes et freeze_archive_chart
-                counts=self.db._diff_stats_for_nick(nick,archives=gone,conn=conn) if conn is not None and gone else {}
-                for a in sorted(gone):
+                counts=self.db._diff_stats_for_nick(nick,archives=vanished,conn=conn) if conn is not None and vanished else {}
+                for a in sorted(vanished):
                     st=conn.execute("SELECT archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles "
                                     "FROM archive_stats WHERE nick=? AND archive=?",(nick,a)).fetchone() if conn is not None else None
                     date=st[0] if st and st[0] else next((k[1] for k in measures if k[0]==a and k[1]),None)
@@ -3738,8 +3753,8 @@ class BorgHelper:
                     frozen.append(row)
                 if conn is not None:
                     heirs={n for o,n in conn.execute("SELECT archive_old,archive_new FROM diff_indexed_pairs WHERE nick=?",(nick,))
-                           if o in gone and n in current}
-                    heirs|={n for _,n in orphans if n in current}
+                           if o in vanished and n in current}
+                    heirs|={n for o,n in orphans if n in current and o not in foreign}   # R6 : jamais pour une autre machine
                     frozen+=self.db._chart_counts(nick,conn,heirs)
             finally:
                 if conn is not None: conn.close()
@@ -3776,21 +3791,42 @@ class BorgHelper:
             except _RECONCILE_ERRORS as e:
                 printer(f"{nick}: rapprochement interrompu ({db_path}) : {e} — repris au prochain Index"); return 0
         nm=0
-        if gone and measures:
+        if vanished and measures:
             def _del_measures():
                 c=_open_db(hist,nick=None,role='write')
                 try:
-                    n=sum(c.execute("DELETE FROM archive_measure WHERE nick=? AND archive=?",(nick,a)).rowcount for a in gone)
+                    n=sum(c.execute("DELETE FROM archive_measure WHERE nick=? AND archive=?",(nick,a)).rowcount for a in vanished)
                     c.commit(); return n
                 finally: c.close()
             try: nm=self.db._with_lock_retry(_del_measures)
             except sqlite3.Error as e: printer(f"{nick}: mesures des archives disparues non retirées ({hist}) : {e}")
-        if gone:
-            print(f"{nick}: {len(gone)} archive(s) disparue(s) retirée(s) ({r[0]} diff, {r[1]} paires, {r[2]}+{r[3]} snapshots, "
+        if foreign&known_diff:
+            print(f"{nick}: {len(foreign&known_diff)} archive(s) hors GLOB_ARCH (autre machine) retirée(s) de la base — history.db inchangée")
+        if foreign-known_diff:
+            # Mesures d'un Bkp de CE nick sorties du motif : gardées ; le borg list complet est refait à chaque passe.
+            printer(f"{nick}: {len(foreign-known_diff)} archive(s) du dépôt hors GLOB_ARCH connue(s) seulement par leurs mesures, "
+                    "gardées dans history.db — GLOB_ARCH exclut-il des archives de ce nick ?")
+        if vanished:
+            print(f"{nick}: {len(vanished)} archive(s) disparue(s) retirée(s) ({r[0]} diff, {r[1]} paires, {r[2]}+{r[3]} snapshots, "
                   f"{r[4]} stats, {nm} mesure(s) ; {sum(1 for f in frozen if f['gone'])} ligne(s) de graphique figée(s))")
-        elif r[0]:
+        elif not gone and r[0]:
             print(f"{nick}: {r[0]} ligne(s) de diff orpheline(s) laissée(s) par une version antérieure retirée(s) (nettoyage unique)")
         return sum(r)
+
+    def _repo_archive_names(self,nick,cfg,debug=0):
+        """repo= pour _reconcile_archives (1.0.146, R6) : None pour un nick sans filtre (glob_args vide : la liste filtrée
+        EST le dépôt, aucun borg de plus) ; sinon callable -> noms de toutes les archives (borg list --json sans GLOB_ARCH,
+        borg reste seul juge du motif, AD-11), False si tué (échéance, opération prioritaire), None si en échec."""
+        if not glob_args(cfg): return None
+        def _all():
+            try:
+                rb=self.borg.boex(nick,['list','--json'],debug=debug)
+                if rb.get('killed'): return False
+                self.borg._boex_check_stdout(rb,nick,'borg list (dépôt entier)')
+                return {a['name'] for a in rb['stdout'][0]['archives']}
+            except (RuntimeError,KeyError,IndexError,TypeError,ValueError) as e:
+                printer(f"{nick}: {e}"); return None
+        return _all
 
     def _cleanup_index_after_prune(self,nick,debug=0):
         """Nettoyage après Prune : borg list + rapprochement (1.0.140, AD-9), puis compactage si des lignes sont parties.
@@ -3803,7 +3839,8 @@ class BorgHelper:
         try:
             self.borg._boex_check_stdout(rb,nick,'borg list')
         except RuntimeError: return
-        if self._reconcile_archives(nick,db_path,[a['name'] for a in rb['stdout'][0]['archives']]) and os.path.exists(db_path):
+        names=[a['name'] for a in rb['stdout'][0]['archives']]
+        if self._reconcile_archives(nick,db_path,names,repo=self._repo_archive_names(nick,cfg,debug)) and os.path.exists(db_path):
             self._vacuum_db(db_path,verbose=False,nick=nick)
 
     def _find_last_archive_with_file(self,nick,path,debug=0):
@@ -4751,8 +4788,8 @@ class BorgHelper:
     def index(self,nick,debug=0,db_path=None,force=False,target_archive=None,set_pending=True,
               budget=None,natures=None,period=None,pause=True,snap_only=False,rebuild=False):
         """Index d'un nick (voir README). Sans budget/natures/period : Index historique (diffs, stats, DIFF_KEEP,
-        snapshot). Avec l'une d'elles : tranche (AD-3) — rapprochement, stats (un borg info par archive, de la plus
-        récente à la plus ancienne), snapshot de la dernière archive, diffs du plus récent au plus ancien ; budget en
+        snapshot). Avec l'une d'elles : tranche (AD-3 amendé, 1.0.146) — rapprochement, snapshot de la dernière archive, stats (un
+        borg info par archive, de la plus récente à la plus ancienne), diffs du plus récent au plus ancien ; budget en
         secondes (échéance : borg en cours tué, unité jetée) ; natures ⊂ {'stats','snap','diff'} ; period=(de, à),
         archive ou date ISO, restreint stats et diffs. db_path = cible (AD-1 : le moteur ne sait pas si c'est un fantôme).
         Surveillance croisée (AD-4 amendé) : une opération prioritaire met l'Index en pause (borg tué, unité jetée,
@@ -4863,7 +4900,10 @@ class BorgHelper:
             printer(f"{nick}: {e}"); return 1
         archives=rb['stdout'][0]['archives']
         # Rapprochement (1.0.140, AD-9) : archives supprimées hors borgHelper retirées, sur la liste déjà obtenue.
-        self._reconcile_archives(nick,db_path,[a['name'] for a in archives])
+        names=[a['name'] for a in archives]
+        prev_stop=self.borg._stop; self.borg._stop=stop   # borg list du dépôt entier (R6) : cède comme les autres borg
+        try: self._reconcile_archives(nick,db_path,names,repo=self._repo_archive_names(nick,cfg,debug))
+        finally: self.borg._stop=prev_stop
         keep=cfg.get('DIFF_KEEP','').strip()
         keep=int(keep) if keep.isdigit() else None
         cp=self._index_checkpoint(nick,deadline)   # demande d'arrêt pendant le rapprochement (SQL seul)
@@ -5095,13 +5135,18 @@ class BorgHelper:
         return self._kill_outcome(deadline)
 
     def _index_tranche(self,nick,debug,db_path,cfg,archives,keep,lo,hi,natures,deadline,noidx,done=None):
-        """Tranche (AD-3) : stats (plus récente d'abord, un borg info par archive = une unité), snapshot de la dernière
-        archive, diffs du plus récent au plus ancien ; échéance vérifiée entre unités, borg en cours tué à l'échéance."""
+        """Tranche (AD-3 amendé) : snapshot de la dernière archive, stats (plus récente d'abord, un borg info par archive =
+        une unité), diffs du plus récent au plus ancien ; échéance vérifiée entre unités, borg en cours tué à l'échéance."""
         reason=lambda: self._index_stop_reason(nick,deadline)
         stop=lambda: reason() is not None
         def _halt():
             o=self._kill_outcome(deadline)
             return o if o=='interrupted' else self._index_finish(nick,db_path,archives,keep,True,noidx)
+        # Snapshot d'abord (1.0.146, story 9 R7, CAP-8) : la dernière archive est explorable dès la première tranche,
+        # avant les borg info de toutes les archives d'un gros dépôt.
+        if 'snap' in natures and not noidx and archives:
+            r=self._index_snap(nick,debug,db_path,False,archives,stop,deadline)
+            if r or stop(): return _halt()
         if 'stats' in natures:
             try:
                 conn=_open_db(db_path,nick=nick,role='read')
@@ -5129,9 +5174,6 @@ class BorgHelper:
             finally: self.borg._stop=prev
             if n: print(f"{nick}: statistiques de {n} archive(s) enregistrées (graphiques)")
             if stop(): return _halt()
-        if 'snap' in natures and not noidx and archives:
-            r=self._index_snap(nick,debug,db_path,False,archives,stop,deadline)
-            if r or stop(): return _halt()
         if 'diff' in natures and not noidx and len(archives)>=2:
             pairs_todo,skipped=self._index_select_pairs(nick,db_path,archives,keep,False,None,lo,hi,done)
             pairs_todo.reverse()   # du plus récent au plus ancien (AD-3)
@@ -5195,7 +5237,8 @@ class BorgHelper:
                   f"snapshot {'fait' if bs['snapshot'] else 'à faire'}")
             if (bs['state']=='partial' and old and all(old.get(k)==bs[k] for k in ('pairs_done','stats_done','snapshot'))):
                 printer(f"[WARN] {nick}: aucune progression dans cette tranche — budget (-t) trop court ? Il doit couvrir "
-                        "le borg list initial plus un borg info ou un borg diff de deux archives consécutives")
+                        "le borg list initial, puis le snapshot de la dernière archive (1.0.146 : première unité), un borg info ou un borg "
+                        "diff de deux archives consécutives")
         return 0
 
     # ── Reconstruction dans un fichier fantôme (1.0.143, story 6 ; spine AD-2, AD-3, AD-5, AD-6) ─────────────────────
@@ -5298,7 +5341,7 @@ class BorgHelper:
         return sp,None
 
     def _index_shadow(self,nick,debug,cfg,archives,keep,lo,hi,plan):
-        """Étapes 2 et 3 d'une tranche (AD-3) : rapprochement du fantôme (purge seule), stats, snapshot, diffs avec le
+        """Étapes 2 et 3 d'une tranche (AD-3) : rapprochement du fantôme (purge seule), snapshot, stats, diffs avec le
         budget restant, puis bascule s'il est complet. Mêmes sentinelles que la base servie (AD-1)."""
         sp=plan['shadow']; deadline=plan['deadline']; noidx=self._nick_noidx(nick)
         if not os.path.exists(sp):   # abandonné (fichier supprimé) pendant l'appel : jamais recréé en passant
@@ -9517,8 +9560,8 @@ def codec_selftest():
             if not ix_ctx: ix_ctx.update(_ix_setup())
             return ix_ctx
         def _ix_order_budget_resume():
-            """Tranche 1 (budget 6 s, chaque borg ralenti de 0,3 s) : ordre stats (plus récente d'abord) -> snapshot de
-            la dernière -> diffs du plus récent au plus ancien ; durée ≤ budget + arrêt d'un borg ; 'partial'.
+            """Tranche 1 (budget 6 s, chaque borg ralenti de 0,3 s) : ordre snapshot de la dernière (1.0.146, R7) -> stats
+            (plus récente d'abord) -> diffs du plus récent au plus ancien ; durée ≤ budget + arrêt d'un borg ; 'partial'.
             Tranches suivantes : paires déjà faites jamais réécrites (mêmes id), jusqu'à 'complete'."""
             ctx=_ix_ctx(); _ix_slow(ctx,None,0); _ix_log(ctx,clear=True)
             b=_ix_bh(ctx,'c-order'); names=ctx['names']
@@ -9528,9 +9571,10 @@ def codec_selftest():
             info=[l.split('::')[-1] for l in lg if l.startswith('info --json ::')]
             first_snap=next(i for i,l in enumerate(lg) if l.startswith('list --format'))
             first_diff=next(i for i,l in enumerate(lg) if l.startswith('diff '))
+            first_info=min(i for i,l in enumerate(lg) if l.startswith('info --json ::'))
             last_info=max(i for i,l in enumerate(lg) if l.startswith('info --json ::'))
             diffs=[l.split()[-1] for l in lg if l.startswith('diff ')]
-            order_ok=(info==list(reversed(names)) and last_info<first_snap<first_diff and diffs==list(reversed(names[1:]))
+            order_ok=(info==list(reversed(names)) and first_snap<first_info and last_info<first_diff and diffs==list(reversed(names[1:]))
                       and _ix_state(b,'ix')['state']=='complete')
             if not order_ok: print(f"  ordre : {lg}")
             # budget + reprise
@@ -9545,7 +9589,7 @@ def codec_selftest():
                 cur=_ix_pairs(b2,'ix'); mono=mono and all(cur.get(k)==v for k,v in prev.items())
             _ix_slow(ctx,None,0)
             mono=mono and not any(l.startswith('break-lock') for l in _ix_log(ctx,clear=True))   # jamais à l'échéance
-            ok=(order_ok and t1<=6+3 and st1['state']=='partial' and mono and runs>1
+            ok=(order_ok and t1<=6+3 and st1['state']=='partial' and st1.get('snapshot') is True and mono and runs>1
                 and (_ix_state(b2,'ix') or {}).get('state')=='complete' and len(_ix_pairs(b2,'ix'))==5)
             if not ok: print(f"  budget : durée {t1:.1f}s, état1 {st1}, tranches {runs}, monotone {mono}, final {_ix_state(b2,'ix')}")
             return ok
@@ -9866,6 +9910,95 @@ def codec_selftest():
             ok=bool(rb.get('killed')) and gone and kept
             if not ok: print(f"  _MEI : tué {rb.get('killed')}, orphelin retiré {gone}, mappé et récent gardés {kept}")
             return ok
+        def _sc_scope():
+            """1.0.146 (story 9 R6), dépôt neuf partagé par deux machines (a-*, b-*) :
+            sans filtre, archive supprimée -> disparue (un seul borg list) ; GLOB_ARCH restreint à a-* -> archives b
+            retirées de la base, history.db (archive_chart, archive_measure) identique ; liste complète en échec ->
+            reporté, rien retiré ; hors motif + disparue dans la même passe -> seule la disparue touche history.db."""
+            d=os.path.join(tmp,'scope'); src=os.path.join(d,'src'); os.makedirs(src)
+            repo=os.path.join(d,'repo'); bb=os.path.join(d,'bb'); log=os.path.join(d,'borg.log'); fail=os.path.join(d,'fail')
+            w=os.path.join(d,'borgw'); rc=os.path.join(d,'rc'); borg=shutil.which('borg')
+            env=dict(os.environ,BORG_PASSPHRASE='pw-sc',BORG_RELOCATED_REPO_ACCESS_IS_OK='yes',BORG_BASE_DIR=bb)
+            r=subprocess.run([borg,'init','-e','repokey',repo],env=env,capture_output=True,text=True,timeout=120)
+            if r.returncode!=0: print(f"  borg init : {r.stderr[-200:]}"); return False
+            for i,m in enumerate(('a','b','a','b','a'),1):
+                with open(os.path.join(src,'f.txt'),'a') as f: f.write(f'{m}{i}\n')
+                subprocess.run([borg,'create','--timestamp',f'2026-09-0{i}T10:00:00',f'{repo}::{m}-2026-09-0{i}',src],
+                               env=env,capture_output=True,timeout=120,check=True)
+            with open(w,'w') as f:
+                f.write(f"#!/bin/bash\necho \"$*\" >> {log}\n"
+                        f"if [ -f {fail} ] && [ \"$1\" = list ] && [[ \"$*\" != *glob-archives* ]]; then exit 2; fi\n"
+                        f"export BORG_BASE_DIR={bb}\nexec {borg} \"$@\"\n")
+            os.chmod(w,0o700)
+            def cfg(glob_):
+                with open(rc,'w') as f:
+                    f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n\n[sc]\nBORG_REPO={repo}\nBORG_PASSPHRASE=pw-sc\nSER_NAME=sc\n"
+                            f"SER_LOGIN=x\n{'GLOB_ARCH='+glob_+chr(10) if glob_ else ''}BORG_ARCHNAME=a\nBORG_ROOTBKP={src}\n"
+                            f"DB_ENCRYPT=false\nIDX_WORKERS=1\nBORG_EXE={w}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\n")
+                os.chmod(rc,0o600)
+                return BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            def logs(clear=True):
+                try:
+                    with open(log) as f: lines=f.read().splitlines()
+                except OSError: lines=[]
+                if clear and os.path.exists(log): os.unlink(log)
+                return lines
+            def hist(b):
+                c=sqlite3.connect(b.db.get_history_db('sc'))
+                try: return (sorted(c.execute("SELECT * FROM archive_chart").fetchall(),key=repr),
+                             sorted(c.execute("SELECT * FROM archive_measure").fetchall(),key=repr))
+                finally: c.close()
+            def stats(b):
+                c=sqlite3.connect(b.db.get_diff_db('sc'))
+                try: return {r[0] for r in c.execute("SELECT archive FROM archive_stats")}
+                finally: c.close()
+            def delete(n): subprocess.run([borg,'delete',f'{repo}::{n}'],env=env,capture_output=True,timeout=120,check=True)
+            res={}
+            # S1 : sans filtre, 5 archives ; mesures des Bkp de la machine a (b mesure les siennes dans son nick)
+            b=cfg(None); _q_run(b.index,'sc')
+            starts={a['name']:a['start'] for a in json.loads(subprocess.run([borg,'list','--json',repo],env=env,capture_output=True,
+                    text=True,timeout=60).stdout)['archives']}
+            for n,st in starts.items():
+                if n.startswith('a-'): b.db.store_archive_measure('sc',n,st,1000,1,0)
+            # S2 : sans filtre, b-02 supprimée -> disparue ; un seul borg list
+            delete('b-2026-09-02'); logs()
+            out=_q_run(b.index,'sc'); lg=logs(); h=hist(b)
+            res['sans_filtre']=(sum(l.startswith('list --json') for l in lg)==1 and 'disparue' in out
+                                and any(r[1]=='b-2026-09-02' and r[13]==1 for r in h[0])
+                                and not any(r[1]=='b-2026-09-02' for r in h[1]))
+            # S3 : GLOB_ARCH a-* -> b-04 hors motif ; history.db identique
+            b=cfg('a-*'); h0=hist(b); logs()
+            out=_q_run(b.index,'sc'); lg=logs()
+            out2=_q_run(b.index,'sc'); lg2=logs()   # rien ne manque : ni borg list complet, ni message
+            res['motif']=('b-2026-09-04' not in stats(b) and hist(b)==h0 and 'hors GLOB_ARCH' in out
+                          and any(l=='list --json' for l in lg) and 'b-2026' not in _q_run(b.report_offline,'sc',as_json=True)
+                          and not any(l=='list --json' for l in lg2) and 'GLOB_ARCH' not in out2)
+            # S4 : liste complète en échec -> reporté, rien retiré
+            b=cfg(None); _q_run(b.index,'sc'); back='b-2026-09-04' in stats(b)
+            b=cfg('a-*'); h0=hist(b); open(fail,'w').close()
+            try: out=_q_run(b.index,'sc')
+            finally: os.unlink(fail)
+            res['echec']=back and 'reporté' in out and 'b-2026-09-04' in stats(b) and hist(b)==h0
+            # S5 : hors motif (b-04) + disparue (a-01) dans la même passe
+            delete('a-2026-09-01'); h0=hist(b)
+            out=_q_run(b.index,'sc'); h1=hist(b)
+            b_rows=lambda h: ([r for r in h[0] if r[1].startswith('b-')],[r for r in h[1] if r[1].startswith('b-')])
+            res['les_deux']=('b-2026-09-04' not in stats(b) and 'a-2026-09-01' not in stats(b) and b_rows(h1)==b_rows(h0)
+                             and not any(r[1]=='a-2026-09-01' for r in h1[1]) and any(r[1]=='a-2026-09-01' and r[13]==1 for r in h1[0])
+                             and 'hors GLOB_ARCH' in out and 'disparue' in out)
+            # S6 : DelBkp d'une archive a pendant que b-04 (hors motif) est dans la base : seule la supprimée est figée
+            b=cfg(None); _q_run(b.index,'sc'); b=cfg('a-*'); h0=hist(b)
+            out=_q_run(b.delbkp,'sc','a-2026-09-03'); h1=hist(b)
+            res['delbkp']=('b-2026-09-04' not in stats(b) and b_rows(h1)==b_rows(h0) and 'hors GLOB_ARCH' in out
+                           and any(r[1]=='a-2026-09-03' and r[13]==1 for r in h1[0])
+                           and not any(r[1]=='a-2026-09-03' for r in h1[1]))
+            # S7 : archive hors motif connue seulement par sa mesure -> gardée, message dédié
+            b.db.store_archive_measure('sc','b-2026-09-04',starts['b-2026-09-04'],1000,0,0); h0=hist(b)
+            out=_q_run(b.index,'sc')
+            res['mesure_seule']=hist(b)==h0 and 'seulement par leurs mesures' in out and 'retirée(s) de la base' not in out
+            ok=all(res.values()) and len(res)==6
+            if not ok: print(f"  périmètre : {res} {out[-400:]!r}")
+            return ok
         def _ix_prune_waits():
             """Prune attend l'Index (wait_index_idle) comme Bkp et Restore."""
             ctx=_ix_ctx(); b=_ix_bh(ctx,'c-prune'); called=[]
@@ -9983,7 +10116,7 @@ def codec_selftest():
         if shutil.which('borg') is None:
             skip("Index par tranches et surveillance croisée sur un vrai dépôt borg","borg absent")
         else:
-            check("tranche : ordre stats -> snapshot -> diffs récents d'abord ; budget respecté ; reprise sans refaire ; complete",_ix_order_budget_resume)
+            check("tranche : ordre snapshot -> stats -> diffs récents d'abord ; budget respecté ; reprise sans refaire ; complete",_ix_order_budget_resume)
             check("tranche : base finie par tranches == Index complet (Report -o, TreeHist, DiffBkp)",_ix_same_as_full)
             check("tranche : nature + période ; DIFF_KEEP borne les paires visées (pairs_total)",_ix_period_nature_keep)
             check("tranche : échéance pendant le snapshot -> borg tué, aucune ligne sans sentinelle",_ix_snap_deadline)
@@ -10003,6 +10136,7 @@ def codec_selftest():
             check("CLI Index : code 1 sur erreur, 0 si rien à faire ou Index déjà en cours",_ix_cli_exit_codes)
             check("Restore fini pendant un Bkp -> Index toujours en pause ; diffs arrêtés sans break-lock, borg suivant passe ; reprise",_ix_restore_during_bkp)
             check("DelBkp -> archive retirée des bases et du rapport sans nouvel Index",_ix_delbkp_reconcile)
+            check("périmètre GLOB_ARCH : hors motif retirée sans toucher history.db ; disparue figée ; liste complète en échec -> reporté ; sans filtre -> un seul borg list",_sc_scope)
             check("borg arrêté à l'échéance -> _MEI* orphelin retiré ; celui d'un processus vivant (mappé) ou récent gardé",_ix_mei_purge)
         # ── Reconstruction dans un fichier fantôme (1.0.143, story 6, AD-2/AD-5/AD-6) ──
         rb_ctx={}

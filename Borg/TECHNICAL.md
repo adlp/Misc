@@ -389,7 +389,7 @@ avertissement « base non chiffrée »). `DbStatus` l'affiche `plain (aucun chem
 |---|---|---|---|
 | `repo_stats` | historique des tailles du dépôt (`op` bkp/prune/index) | Bkp, Prune, refresh d'Index | `STATS_RETENTION_MONTHS` |
 | `bkp_status` | cycle de vie des Bkp (watcher push, `Status`) | Bkp seul ; réclamations CAS du watcher | `STATS_RETENTION_MONTHS` |
-| `archive_measure` | par `(nick, archive, archive_date)` : taille dédupliquée à la création, C/E | Bkp seul | tant que l'archive existe (retirée par le rapprochement, après figeage) |
+| `archive_measure` | par `(nick, archive, archive_date)` : taille dédupliquée à la création, C/E | Bkp seul | tant que l'archive existe dans le dépôt (retirée par le rapprochement, après figeage ; jamais pour une archive seulement hors `GLOB_ARCH`, 1.0.146) |
 | `archive_chart` (1.0.140) | par `(nick, archive, archive_date)` : ligne de graphique figée (`_CHART_FIELDS` + `gone`) | rapprochement de la base servie, `DIFF_KEEP` | `STATS_RETENTION_MONTHS`, que l'archive existe ou non |
 
 - **Lecture** : `history_path(nick)` / `_hist(nick)` ouvrent d'abord `diff.db` (`ensure_diff_db`, sans la créer), ce
@@ -447,9 +447,10 @@ nom unique) + lignes `gone` absentes d'`archive_stats`, triées par date, champ 
 
 ### Rapprochement de la liste des archives (1.0.140, story 3, AD-9)
 
-`_reconcile_archives(nick, db_path, current)` — appelé par `index()` juste après `borg list` (avant les branches
-`NOIDX` et « moins de 2 archives », aucun appel borg de plus) et par `_cleanup_index_after_prune` (`borg list` +
-rapprochement + `_vacuum_db` seulement si des lignes sont parties). Jamais de compactage depuis Index.
+`_reconcile_archives(nick, db_path, current, repo=None)` — appelé par `index()` juste après `borg list` (avant les
+branches `NOIDX` et « moins de 2 archives » ; un `borg list` du dépôt entier en plus seulement si une archive manque à
+la liste filtrée, étape 4) et par `_cleanup_index_after_prune` (Prune et DelBkp : `borg list` + rapprochement +
+`_vacuum_db` seulement si des lignes sont parties). Jamais de compactage depuis Index.
 
 1. Archives connues (`_known_archives`) : petites tables lues entières (`archive_stats`, `archive_snapshot_indexed`,
    `snap_excluded_stats`, `diff_indexed_pairs` et `diff_excluded_stats` des deux côtés) + `diff_index.archive_new` et
@@ -459,13 +460,20 @@ rapprochement + `_vacuum_db` seulement si des lignes sont parties). Jamais de co
    retour sans aucune écriture.
 3. `priority.lock` d'un autre processus : reporté (un Bkp démarré après `borg list` ferait passer sa nouvelle archive
    pour disparue ; Prune tient le verrou lui-même, l'Index de fin de Bkp passe après l'avoir relâché).
-4. Figeage (`archive_chart`, voir plus haut) ; un échec (`sqlite3.Error`) arrête tout, rien n'est purgé.
-5. Purge dans une transaction `diff.db` : table temporaire `_gone`, lignes `diff_index` retirées **par paire** (index
+4. Périmètre (1.0.146, story 9 R6) : `repo=` (`_repo_archive_names`) est `None` pour un nick sans filtre (`current`
+   vaut le dépôt entier, aucun appel), sinon un callable → noms du dépôt entier (`borg list --json` sans `glob_args`,
+   sous la demande d'arrêt de l'Index), `False` si tué, `None` si en échec → reporté, rien retiré. Appelé seulement si
+   une archive manque. `gone ∩ dépôt` = hors motif (autre machine) : purgées de `diff.db` avec les autres (étape 6),
+   **aucune écriture dans `history.db`** (ni ligne figée, ni héritière — balayage compris —, ni mesure). Hors motif
+   connue seulement par ses mesures (Bkp de ce nick exclu par le motif) : mesures gardées, message dédié, `borg list`
+   complet refait à chaque passe. `gone − dépôt` = disparues : étapes 5 et 6 complètes. Fantôme : purge seule.
+5. Figeage (`archive_chart`, voir plus haut) des seules disparues ; un échec (`sqlite3.Error`) arrête tout, rien n'est purgé.
+6. Purge dans une transaction `diff.db` : table temporaire `_gone`, lignes `diff_index` retirées **par paire** (index
    `(nick, archive_new)` : jamais de balayage sur `archive_old`, sans index), puis paires, snapshots, stats, exclus,
    orphelins de `snapshot_file` si des snapshots sont partis. Puis mesures, par liste explicite des disparues (jamais
    `NOT IN` la liste : la mesure d'un Bkp écrite après `borg list` survit).
    Interrompue après le figeage : rejouée au passage suivant, sans doublon (clé primaire d'`archive_chart`).
-6. Balayage unique par base (`db_meta.reconcile_sweep`) : lignes `diff_index` héritées sans paire dont une archive a
+7. Balayage unique par base (`db_meta.reconcile_sweep`) : lignes `diff_index` héritées sans paire dont une archive a
    disparu (l'ancien nettoyage ne testait qu'`archive_new` : paire retirée, lignes restées). Leurs comptages sont figés
    pour l'archive restante avant retrait. Seul balayage complet de `diff_index`, une fois ; une `diff.db` reconstruite
    le refait (rapide, base neuve). Drapeau par nick (`reconcile_sweep:<nick>`) : plusieurs nicks peuvent partager une
@@ -588,12 +596,13 @@ en `nice` 10 + `ionice -c3` (`_lower_priority`, hérité par borg) ; une bibliot
 ```
 borg list --json → _reconcile_archives
     ↓
-stats   : archives sans archive_stats (période), de la plus récente à la plus ancienne,
-          un `borg info --json ::archive` par archive = une unité (store_archive_stats)
-    ↓
-snap    : indexsnap(archives=liste) de la dernière archive — incrémental : borg list des ajouts AVANT toute
+snap    : (1.0.146, R7 : avant les stats — dernière archive explorable dès la 1re tranche, CAP-8)
+          indexsnap(archives=liste) de la dernière archive — incrémental : borg list des ajouts AVANT toute
           écriture puis une seule transaction (clone + retraits + modifs + ajouts + sentinelle) ; complet : une
           transaction ; lignes sans sentinelle d'un arrêt brutal retirées avant de refaire l'unité
+    ↓
+stats   : archives sans archive_stats (période), de la plus récente à la plus ancienne,
+          un `borg info --json ::archive` par archive = une unité (store_archive_stats)
     ↓
 diffs   : paires visées (_diff_keep_pairs : les DIFF_KEEP plus récentes, période) non indexées, de la plus récente à
           la plus ancienne, IDX_WORKERS en parallèle ; puis DIFF_KEEP

@@ -1,5 +1,27 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.146 — périmètre du nick et ordre des tranches — 2026-09-28
+
+Chantier « reconstruction progressive », story 9 (rétrospective : R6, R7 ; SPEC CAP-6 et spine AD-3 amendés).
+
+- **Périmètre du nick (`GLOB_ARCH`)** : une archive sortie du motif mais encore présente dans le dépôt appartient à une
+  autre machine (dépôt partagé). Elle quitte la base du nick **sans aucune écriture dans `history.db`**. Avant, elle
+  passait pour disparue : ligne de graphique figée « supprimée » et mesures (non régénérables) retirées.
+  - Seule une archive absente du dépôt entier est une disparition.
+  - Pour le savoir, un `borg list` sans filtre n'est lancé que si une archive a quitté la liste filtrée, jamais pour un
+    nick sans `GLOB_ARCH`. S'il échoue ou est interrompu, le rapprochement est reporté.
+  - Vaut pour l'Index, le fantôme, et le nettoyage après Prune et DelBkp. Les lignes figées à tort avant 1.0.146
+    restent en place.
+- **Tranche** : le snapshot de la dernière archive passe avant les statistiques. Sur un gros dépôt, la dernière archive
+  est explorable dès la première tranche (avant : après les `borg info` de toutes les archives).
+  C'est la première unité : le budget `-t` doit la couvrir (message « aucune progression » mis à jour).
+- ⚠️ Un `GLOB_ARCH` qui exclut des archives de **ce** nick les traite aussi en « autre machine » : elles quittent ses
+  graphiques sans y être figées. Si le nick n'en connaît plus que les mesures, celles-ci sont gardées, avec un message
+  dédié (« GLOB_ARCH exclut-il des archives de ce nick ? »), et le `borg list` complet est refait à chaque passe.
+- Revue : la liste complète interrompue (échéance, opération prioritaire) est distinguée d'une liste en échec ; le
+  balayage unique des orphelins ne fige plus d'héritière d'une autre machine ; aucun `borg list` en plus quand rien ne
+  manque (contrôlé), ni pour un nick sans filtre ; DelBkp couvert.
+
 ## borgHelper 1.0.145 / borgHelperWWW 1.28.1 / UI 1.19.1 — robustesse des verrous, de l'état et des codes de sortie — 2026-09-28
 
 Chantier « reconstruction progressive », story 8 (rétrospective : A3, R1 à R5, R9).

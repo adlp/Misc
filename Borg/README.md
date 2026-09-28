@@ -607,19 +607,21 @@ borgHelper -c Index -n mon-serveur --rebuild -t 20m        # reconstruction dans
 | `-b` / `-B` | Tranche : période — nom d'archive, date `AAAA-MM-JJ[THH:MM:SS]` (borne haute : toute la journée incluse) ou `ALL` (sans borne) ; toute autre valeur est refusée — restreint stats et diffs |
 
 **Index par tranches** (borgHelper ≥ 1.0.141) : `-t`, `-T`, `-b` ou `-B` (jamais avec `-F`, `-S` ou `-A`)
-construisent ou complètent la base par petits morceaux, pensés pour une ligne cron. Ordre : statistiques des archives
-(un `borg info` par archive, la plus récente d'abord), snapshot de la dernière archive, puis diffs du plus récent au
-plus ancien. À l'échéance, le `borg` en cours est tué et son morceau jeté ; les morceaux finis ne sont jamais refaits :
-le lancement suivant reprend. La tranche tourne en priorité basse (`nice` 10, `ionice` idle). Choisir un budget
-qui couvre le `borg list` du début de chaque tranche plus un `borg info` ou un `borg diff` de deux archives
-consécutives, sinon rien n'aboutit (un avertissement le signale). L'avancement (`partielle` / `terminée`, paires,
+construisent ou complètent la base par petits morceaux, pensés pour une ligne cron. Ordre (1.0.146) : snapshot de la
+dernière archive (explorable dès la première tranche), statistiques des archives (un `borg info` par archive, la plus
+récente d'abord), puis diffs du plus récent au plus ancien. À l'échéance, le `borg` en cours est tué et son morceau
+jeté ; les morceaux finis ne sont jamais refaits : le lancement suivant reprend. La tranche tourne en priorité basse
+(`nice` 10, `ionice` idle). Choisir un budget qui couvre le `borg list` du début de chaque tranche, puis le snapshot
+de la dernière archive (un `borg list` complet de l'archive la première fois : c'est la première unité, rien d'autre
+n'avance tant qu'il ne tient pas dans le budget), un `borg info` ou un `borg diff` de deux archives consécutives,
+sinon rien n'aboutit (un avertissement le signale). L'avancement (`partielle` / `terminée`, paires,
 statistiques, snapshot) s'affiche en fin de tranche et dans `Status`. `-S` passe aussi par le verrou et la pause.
 
 **Reconstruction dans un fichier fantôme** (borgHelper ≥ 1.0.143) : `Index --rebuild` reconstruit la base d'un nick
 dans `<conf>-<nick>-diff.db.rebuild` (même `CACHE_DIR`, `0600`) pendant que l'ancienne base reste servie — CLI et
 borgHelperWWW continuent de lire l'ancienne, sans changement. Il lance une première tranche (`-t` facultatif) ; ensuite,
 toute tranche (`Index` avec `-t`, `-T`, `-b` ou `-B`, comme la ligne cron conseillée `Index -n ALL -t 20m`) fait d'abord l'incrémental de la base servie, puis avance le
-fantôme avec le budget restant, dans le même ordre (statistiques, snapshot, diffs récents d'abord). Quand il est
+fantôme avec le budget restant, dans le même ordre (snapshot, statistiques, diffs récents d'abord). Quand il est
 complet, il remplace la base servie d'un coup, après avoir vérifié par un `borg list` que rien n'est arrivé entre-temps.
 Un Bkp, Restore, Prune ou Report met la reconstruction en pause comme tout Index ; pendant la bascule, il l'annule
 (base servie intacte, fantôme gardé, nouvel essai à la tranche suivante). L'Index sans option et celui de fin de Bkp ne
@@ -665,15 +667,27 @@ graphiques d'évolution de borgHelperWWW :
 Le snapshot (`-S`) est **incrémental par défaut** : si un snapshot précédent et le diff correspondant existent, seules les entrées `added/removed/modified` sont appliquées par SQL, et `borg list` est appelé uniquement sur les fichiers ajoutés (pour leur mtime). Fallback vers `borg list` complet si : pas de snapshot précédent, diff absent, > 5 000 ajouts, ou erreur borg. `-F` force le `borg list` complet.
 
 **Archives supprimées hors borgHelper** (1.0.140) : chaque `Index` rapproche les bases de la liste `borg list` qu'il
-obtient déjà (aucun appel borg de plus). Une archive disparue — `borg prune`/`borg delete` bruts, `DelBkp`, archive
-devenue hors `GLOB_ARCH` — est retirée des diffs, snapshots, statistiques et mesures : `TreeHist`, `FileHist`,
+obtient déjà (un `borg list` du dépôt entier en plus seulement pour un nick à `GLOB_ARCH` dont une archive manque, voir
+Périmètre ci-dessous). Une archive disparue du dépôt — `borg prune`/`borg delete` bruts, `DelBkp` —
+est retirée des diffs, snapshots, statistiques et mesures : `TreeHist`, `FileHist`,
 `Search` et la restauration ne la proposent plus. Sa ligne de graphique est d'abord figée dans `history.db`, pour que
 les graphiques par archive couvrent `STATS_RETENTION_MONTHS` (13 mois) même avec une rétention d'archives de quelques
 semaines. Une liste d'archives vide (`GLOB_ARCH` erroné, dépôt vidé) ne retire rien et affiche un avertissement.
 Aucune écriture quand rien n'a disparu. Le premier `Index` de 1.0.140 retire aussi, une fois, les lignes de diff
 orphelines laissées par l'ancien nettoyage (archive du milieu supprimée : doublons, archive absente proposée).
-⚠️ Modifier `GLOB_ARCH` fait passer pour disparues les archives hors du nouveau motif dès l'`Index` suivant : leurs
-diffs et snapshots sont retirés (reconstruits si l'on revient à l'ancien motif), leurs lignes de graphique figées.
+
+**Périmètre du nick** (1.0.146) : `GLOB_ARCH` désigne les archives de la machine dans un dépôt que plusieurs machines
+peuvent partager. Une archive sortie du motif mais encore présente dans le dépôt appartient à une autre machine : elle
+quitte la base du nick (diffs, snapshots, statistiques ; reconstruits si l'on revient à l'ancien motif) **sans aucune
+écriture dans `history.db`** — ni ligne de graphique figée, ni mesure retirée (« N archive(s) hors GLOB_ARCH (autre
+machine) retirée(s) de la base — history.db inchangée »). Pour les distinguer d'une vraie disparition, un `borg list`
+du dépôt entier est lancé, seulement quand une archive a quitté la liste filtrée (et jamais pour un nick sans
+`GLOB_ARCH`) ; s'il échoue ou est interrompu, le rapprochement est reporté. Les lignes figées à tort avant 1.0.146
+restent en place.
+⚠️ Restreindre ou renommer `GLOB_ARCH` au point d'exclure des archives de **ce** nick les traite aussi en « autre
+machine » : elles quittent ses rapports et ses graphiques sans y être figées, leurs mesures restent dans `history.db`
+(message « connue(s) seulement par leurs mesures… GLOB_ARCH exclut-il des archives de ce nick ? », et un `borg list`
+complet à chaque passe tant que le motif les exclut). Revenir à l'ancien motif les reconstruit.
 `Index` ne compacte jamais `diff.db` : si le dépôt est élagué par `borg prune` hors borgHelper, lancer `IdxPurge` de
 temps en temps pour rendre la place libérée (le `Prune` de borgHelper compacte lui-même).
 
