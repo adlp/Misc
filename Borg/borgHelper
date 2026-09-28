@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.142"
+Version="1.0.143"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -467,6 +467,7 @@ def usage(doc=None,debug=0):
         printer("       -A <archive> : réindexe uniquement la paire dont archive_new=<archive>")
         printer("       [-t durée] [-T stats,snap,diff] [-b archive|date] [-B archive|date] : tranche pour cron")
         printer("       (budget par nick, reprenable, priorité basse) — voir -H Index")
+        printer("       --rebuild [-F] : reconstruction dans un fichier fantôme, bascule à la fin — voir -H Index")
         printer("       IndexSnap s'auto-répare : un type manquant (colonne snapshot_file.type) force un")
         printer("       resnapshot complet automatique une fois (au prochain Bkp/Index), sans -F manuel")
         printer("   -c Search -f <pattern> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-j]")
@@ -588,6 +589,11 @@ def usage(doc=None,debug=0):
         printer("       stats puis snapshot de la dernière archive puis diffs du plus récent au plus ancien,")
         printer("       reprenable, priorité basse (nice/ionice) ; avancement dans Status -j (build)")
         printer("       Bkp/Restore/Prune/Report mettent l'Index en pause ; il reprend seul après leur fin")
+        printer("   -c Index --rebuild [-F] [-n nick] [-t durée] [-T ...] [-b ...] [-B ...]")
+        printer("       Reconstruit diff.db dans <diff.db>.rebuild pendant que l'ancienne base sert ; les tranches")
+        printer("       suivantes (-t...) le poursuivent, puis il remplace la base servie d'un coup. -F : repart de zéro.")
+        printer("       Refusé (code 3) : DB_NAME partagé, espace disque < 2,2 × la base, migration de chiffrement.")
+        printer("       Abandon (hors Index en cours) : supprimer .rebuild, .rebuild-wal, .rebuild-shm. Avancement : Status")
         printer("       Auto-réparation : un type manquant (snapshot_file.type) force un resnapshot")
         printer("       complet une fois, automatiquement, sans besoin de -F (voir TreeHist)")
         printer("       IDX_WORKERS dans borghelperrc : nb de borg diff parallèles (défaut 4)")
@@ -860,9 +866,19 @@ def _build_state_key(nick):
     """Clé db_meta de l'état de construction d'un nick (1.0.141, AD-10) — par nick : DB_NAME peut partager une diff.db."""
     return f'build_state:{nick}'
 
+_SHADOW_SUFFIX='.rebuild'   # fichier fantôme d'une diff.db en reconstruction (1.0.143, story 6, AD-5)
+_SHADOW_SPACE_MARGIN=2.2    # libre exigé à la création : fantôme (≈ base servie) puis WAL de la bascule (AD-5)
+_SWAP_SPACE_MARGIN=1.1      # libre exigé à la bascule : WAL de la base servie ≈ taille du fantôme (AD-6)
+
+def _is_shadow(path):
+    """Vrai pour un fichier fantôme '<diff.db>.rebuild'. Le moteur écrit dans sa cible sans savoir laquelle (AD-1) ; seuls
+    les écrivains de history.db le distinguent : un fantôme n'y écrit jamais (AD-2, AD-7)."""
+    return isinstance(path,str) and path.endswith(_SHADOW_SUFFIX)
+
 def _history_path_for(diff_path):
     """history.db jumelle d'une diff.db : '<conf>-<nick>-diff.db' -> '<conf>-<nick>-history.db' (autre nom de
-    fichier, ex. bases de test : '<fichier>.history.db')."""
+    fichier, ex. bases de test : '<fichier>.history.db'). Un fantôme a la même jumelle que sa base servie."""
+    if _is_shadow(diff_path): diff_path=diff_path[:-len(_SHADOW_SUFFIX)]
     return diff_path[:-len('-diff.db')]+'-history.db' if diff_path.endswith('-diff.db') else diff_path+'.history.db'
 
 _ARCHIVE_SNAPSHOT_V_SQL=("CREATE VIEW archive_snapshot_v AS\n"
@@ -1268,7 +1284,7 @@ def _ensure_wal(conn):
 class _SwapAbort(Exception):
     """Levée par le rappel de progression de _swap_db pour annuler la copie (base servie inchangée)."""
 
-def _swap_db(live,new,nick=None,abort=None,changed=None,pages=4096,busy_limit=120):
+def _swap_db(live,new,nick=None,abort=None,changed=None,pages=4096,busy_limit=120,keep_new=False):
     """Remplace le contenu de la base servie `live` par celui de `new` (1.0.138, story 1 du chantier
     reconstruction, AD-6 amendé), puis supprime `new`. Retourne 'ok', 'abort' (abort() vrai : opération
     prioritaire), 'changed' (changed() vrai : `live` modifiée depuis la préparation de `new`), 'busy' (`live`
@@ -1287,9 +1303,17 @@ def _swap_db(live,new,nick=None,abort=None,changed=None,pages=4096,busy_limit=12
     jusqu'à la fin, donc un changed() faux garantit qu'aucune écriture ne sera écrasée. Le rappel de CPython
     passe aussi après la dernière tranche (SQLITE_DONE, copie validée) : jamais d'annulation à ce moment, et au
     moins deux tranches pour que changed() précède toujours la validation. Annulation ou erreur : `live` reste
-    l'ancienne base. Coût : `live` + WAL (taille de `new`) + `new` sur le disque pendant la copie."""
+    l'ancienne base. Coût : `live` + WAL (taille de `new`) + `new` sur le disque pendant la copie.
+    keep_new=True (fantôme, 1.0.143) : `new` n'est supprimée qu'après 'ok' ou 'invalid' ; annulation ou erreur la
+    gardent pour une nouvelle tentative (sinon toute la reconstruction serait perdue)."""
     _DONE,_BUSY,_LOCKED=101,5,6
-    if not os.path.isfile(new) or os.path.getsize(new)==0: return 'invalid'  # jamais _open_db (O_CREAT) sur un absent
+    res=None
+    if not os.path.isfile(new) or os.path.getsize(new)==0:   # jamais _open_db (O_CREAT) sur un absent
+        if keep_new:
+            for f in (new,new+'-wal',new+'-shm'):
+                try: os.unlink(f)
+                except OSError: pass
+        return 'invalid'
     src=dst=None; state={'first':True}; t0=time.monotonic()
     def _prog(status,remaining,total):
         if status==_DONE: return
@@ -1302,14 +1326,14 @@ def _swap_db(live,new,nick=None,abort=None,changed=None,pages=4096,busy_limit=12
     try:
         src=_open_db(new,nick=None,role='admin')
         n=src.execute("PRAGMA page_count").fetchone()[0]
-        if n<2: return 'invalid'
+        if n<2: res='invalid'; return res
         # timeout court : une tranche bloquée rend la main vite (SQLITE_BUSY), abort() et busy_limit sont sondés
         dst=_open_db(live,nick=None,role='admin',timeout=1)
         try:
             src.backup(dst,pages=max(1,min(pages,n//2)),progress=_prog)
-            return 'ok'
+            res='ok'; return res
         except _SwapAbort as e:
-            return str(e)
+            res=str(e); return res
     finally:
         if dst is not None:
             # Récupère le WAL (copie validée, annulée ou en erreur) sans attendre : busy_timeout=0, sinon un lecteur
@@ -1320,9 +1344,10 @@ def _swap_db(live,new,nick=None,abort=None,changed=None,pages=4096,busy_limit=12
             if c is not None:
                 try: c.close()
                 except sqlite3.Error: pass
-        for f in (new,new+'-wal',new+'-shm'):
-            try: os.unlink(f)
-            except OSError: pass
+        if not keep_new or res in ('ok','invalid'):
+            for f in (new,new+'-wal',new+'-shm'):
+                try: os.unlink(f)
+                except OSError: pass
 
 def _open_db(db_path,nick=None,role='read',passphrase=None,**kw):
     """Point d'ouverture UNIQUE des bases SQLite (AD-1). kw -> sqlite3 (timeout=60, ...).
@@ -1369,7 +1394,8 @@ def _open_db(db_path,nick=None,role='read',passphrase=None,**kw):
                 # db_encrypt_enabled peut lever SystemExit sur une config invalide : n'importe pas ici,
                 # ce n'est qu'un avertissement — la commande réelle lèvera la même erreur à son tour.
                 try:
-                    if db_encrypt_enabled(nick) and (passphrase if passphrase is not None else _resolve_passphrase(nick,db_path)):
+                    if (not _is_shadow(db_path) and db_encrypt_enabled(nick)   # fantôme : même mode que sa base, déjà signalée
+                            and (passphrase if passphrase is not None else _resolve_passphrase(nick,db_path))):
                         _warn_plain_db(nick,db_path)
                 except SystemExit: pass
     except BaseException:
@@ -2642,9 +2668,11 @@ class BorgHelperDB:
                 if not to_delete: return
                 # 1.0.140 : comptages des archives restantes figés avant de retirer leur paire (graphiques sur
                 # STATS_RETENTION_MONTHS) ; échec du figeage -> sqlite3.Error, rien purgé.
-                try: self.freeze_archive_chart(nick,self._chart_counts(nick,conn,{a_new for _,a_new in to_delete}),
-                                               _history_path_for(db_path))
-                except SystemExit: raise sqlite3.OperationalError("history.db indisponible — DIFF_KEEP reporté")
+                # Fantôme (1.0.143) : jamais d'écriture dans history.db — la base servie fige ses propres paires (AD-7).
+                if not _is_shadow(db_path):
+                    try: self.freeze_archive_chart(nick,self._chart_counts(nick,conn,{a_new for _,a_new in to_delete}),
+                                                   _history_path_for(db_path))
+                    except SystemExit: raise sqlite3.OperationalError("history.db indisponible — DIFF_KEEP reporté")
                 for a_old,a_new in to_delete:
                     conn.execute("DELETE FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
                     conn.execute("DELETE FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
@@ -3589,8 +3617,9 @@ class BorgHelper:
         rien retiré, Index continue. Retourne le nombre de lignes retirées de diff.db (décision de compactage)."""
         current=set(current)
         hist=_history_path_for(db_path)
+        shadow=_is_shadow(db_path)   # fantôme (1.0.143) : purge de ses tables seulement — ni figeage, ni mesures (AD-7)
         diff_ok=os.path.exists(db_path) and _db_has_schema(db_path)
-        measures=self.db.get_archive_measures(nick,hist) if os.path.exists(hist) else {}
+        measures=self.db.get_archive_measures(nick,hist) if not shadow and os.path.exists(hist) else {}
         known={k[0] for k in measures}; sweep=False; flag=f'reconcile_sweep:{nick}'
         try:
             if diff_ok:
@@ -3619,6 +3648,8 @@ class BorgHelper:
                         "SELECT DISTINCT archive_old,archive_new FROM diff_index d WHERE nick=? AND NOT EXISTS (SELECT 1 FROM "
                         "diff_indexed_pairs p WHERE p.nick=d.nick AND p.archive_old=d.archive_old AND p.archive_new=d.archive_new)",
                         (nick,)) if o not in current or n not in current}
+                if shadow and conn is not None:
+                    conn.close(); conn=None   # fantôme : rien à figer — saute le calcul des lignes et freeze_archive_chart
                 counts=self.db._diff_stats_for_nick(nick,archives=gone,conn=conn) if conn is not None and gone else {}
                 for a in sorted(gone):
                     st=conn.execute("SELECT archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles "
@@ -3641,7 +3672,7 @@ class BorgHelper:
                     frozen+=self.db._chart_counts(nick,conn,heirs)
             finally:
                 if conn is not None: conn.close()
-            self.db.freeze_archive_chart(nick,frozen,hist)
+            if not shadow: self.db.freeze_archive_chart(nick,frozen,hist)
         except _RECONCILE_ERRORS as e:   # SystemExit : history.db illisible (_db_schema_fail) — Index continue
             printer(f"{nick}: lignes de graphique non figées ({e}) — rien retiré, nouvel essai au prochain Index"); return 0
         r=[0]*6
@@ -4574,7 +4605,9 @@ class BorgHelper:
         self._refresh_repo_point(nick,db_path,debug)
 
     def _refresh_repo_point(self,nick,db_path,debug=0):
-        """Point repo_stats op='index' (borg info du dépôt, métadonnées seulement) si les tailles ont changé."""
+        """Point repo_stats op='index' (borg info du dépôt, métadonnées seulement) si les tailles ont changé. Jamais pour
+        un fantôme (1.0.143, AD-7) : la tranche de la base servie relève déjà ce point."""
+        if _is_shadow(db_path): return
         rbr=self.borg.boex(nick,['info','--json'],debug=debug)
         if rbr.get('killed'): return
         try:
@@ -4639,7 +4672,7 @@ class BorgHelper:
             if paused: self.db.release_index_paused_lock(nick)
 
     def index(self,nick,debug=0,db_path=None,force=False,target_archive=None,set_pending=True,
-              budget=None,natures=None,period=None,pause=True,snap_only=False):
+              budget=None,natures=None,period=None,pause=True,snap_only=False,rebuild=False):
         """Index d'un nick (voir README). Sans budget/natures/period : Index historique (diffs, stats, DIFF_KEEP,
         snapshot). Avec l'une d'elles : tranche (AD-3) — rapprochement, stats (un borg info par archive, de la plus
         récente à la plus ancienne), snapshot de la dernière archive, diffs du plus récent au plus ancien ; budget en
@@ -4649,13 +4682,17 @@ class BorgHelper:
         index-running relâché), puis il reprend seul après sa fin — pause=False (Index de fin de Bkp) : arrêt comme
         avant 1.0.141 (index-pending selon set_pending). Verrou réentrant : l'appelant (Bkp) peut déjà le tenir.
         snap_only : snapshot seul (Index -S), sous le même verrou et la même pause.
-        Retour : 0 (fini, rien à faire, Index déjà en cours, échéance), 1 (erreur, ou annulé avec pause=False).
+        rebuild (1.0.143, story 6, AD-2/AD-5/AD-6) : tranche qui crée ou poursuit le fantôme '<diff.db>.rebuild' (force :
+        fantôme jeté, reprise de zéro). Toute tranche poursuit un fantôme existant après l'incrémental de la base servie ;
+        complet et rattrapé, il remplace la base servie (_swap_db). Jamais l'Index sans option ni celui d'un Bkp.
+        Retour : 0 (fini, rien à faire, Index déjà en cours, échéance), 1 (erreur, ou annulé avec pause=False),
+        3 (--rebuild refusé : DB_NAME partagé, espace disque, base en migration de chiffrement).
         Un appel sans budget peut attendre sans limite la fin d'une opération prioritaire (décision story 4)."""
         if budget is not None and not budget>0: raise ValueError("budget : durée > 0 attendue")
         if natures is not None and (not natures or set(natures)-{'stats','snap','diff'}):
             raise ValueError("natures : sous-ensemble non vide de stats, snap, diff")
         noidx=self._nick_noidx(nick)
-        tranche=budget is not None or natures is not None or period is not None
+        tranche=rebuild or budget is not None or natures is not None or period is not None
         deadline=(time.monotonic()+budget) if budget else None
         if db_path is None: db_path=self.db.get_diff_db(nick)
         own=self.db.index_running_owned(nick)
@@ -4666,8 +4703,14 @@ class BorgHelper:
             if st!='ok': return 0
         # done : paires recalculées pendant cet appel — une reprise après pause ne les refait pas, même avec force (-F).
         plan={'tranche':tranche,'deadline':deadline,'natures':set(natures or ('stats','snap','diff')),'period':period,
-              'snap_only':snap_only,'done':set()}
+              'snap_only':snap_only,'done':set(),'shadow':None,'sdone':set()}
         try:
+            if tranche:
+                # Fantôme préparé sous index-running.lock (jamais deux créateurs). Tranche ordinaire : un refus (DB_NAME
+                # partagé...) laisse faire la base servie ; seul --rebuild en fait une erreur.
+                plan['shadow'],err=self._shadow_prepare(nick,db_path,create=rebuild,force=force and rebuild)
+                if err and rebuild: return err
+                if err: printer(f"{nick}: reconstruction suspendue — régler le problème ci-dessus puis relancer Index --rebuild")
             while True:
                 r=self._index_pass(nick,debug,db_path,force,target_archive,plan)
                 if r=='deadline': r=0
@@ -4756,7 +4799,11 @@ class BorgHelper:
             r=self._index_snap(nick,debug,db_path,force,archives,stop,deadline)
             return r if r=='interrupted' else self._index_finish(nick,db_path,archives,keep,False,noidx)
         if tranche:
-            return self._index_tranche(nick,debug,db_path,cfg,archives,keep,lo,hi,natures,deadline,noidx,plan['done'])
+            r=self._index_tranche(nick,debug,db_path,cfg,archives,keep,lo,hi,natures,deadline,noidx,plan['done'])
+            if r=='interrupted' or not plan.get('shadow'): return r
+            st=self._index_stop_reason(nick,deadline)   # échéance ou demande prioritaire pendant la base servie
+            if st: return 'interrupted' if st=='priority' else 0
+            return self._index_shadow(nick,debug,cfg,archives,keep,lo,hi,plan)
         if noidx:
             r=self._index_stats(nick,cfg,db_path,archives,force,debug,stop)
             if r: return r
@@ -5073,13 +5120,190 @@ class BorgHelper:
             finally: conn.close()
         except sqlite3.Error as e: printer(f"{nick}: état de construction non écrit ({e})")
         if tranche:
-            print(f"{nick}: construction {'terminée' if bs['state']=='complete' else 'partielle'} — "
+            what='reconstruction (fantôme)' if _is_shadow(db_path) else 'construction'
+            print(f"{nick}: {what} {'terminée' if bs['state']=='complete' else 'partielle'} — "
                   f"{bs['pairs_done']}/{bs['pairs_total']} paires, statistiques {bs['stats_done']}/{bs['archives_total']}, "
                   f"snapshot {'fait' if bs['snapshot'] else 'à faire'}")
             if (bs['state']=='partial' and old and all(old.get(k)==bs[k] for k in ('pairs_done','stats_done','snapshot'))):
                 printer(f"[WARN] {nick}: aucune progression dans cette tranche — budget (-t) trop court ? Il doit couvrir "
                         "le borg list initial plus un borg info ou un borg diff de deux archives consécutives")
         return 0
+
+    # ── Reconstruction dans un fichier fantôme (1.0.143, story 6 ; spine AD-2, AD-3, AD-5, AD-6) ─────────────────────
+
+    @staticmethod
+    def _shadow_discard(sp):
+        for f in (sp,sp+'-wal',sp+'-shm'):
+            try: os.unlink(f)
+            except OSError: pass
+
+    @staticmethod
+    def _header_fp(raw):
+        """Empreinte de l'en-tête de chiffrement brut d'une base : 'plain' sans en-tête, sinon son sha256."""
+        return 'plain' if raw is None else hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+    @staticmethod
+    def _db_meta_value(db_path,key):
+        """Valeur db_meta d'une base existante (sans codec : db_meta n'est jamais chiffrée), None si absente/illisible."""
+        if not os.path.exists(db_path): return None
+        try:
+            c=_open_db(db_path,nick=None,role='read')
+            try:
+                row=c.execute("SELECT value FROM db_meta WHERE key=?",(key,)).fetchone()
+                return row[0] if row else None
+            finally: c.close()
+        except sqlite3.Error: return None
+
+    def _live_header(self,live):
+        """En-tête brut de la base servie (None : en clair). sqlite3.Error si illisible."""
+        c=_open_db(live,nick=None,role='read')
+        try: return _enc_header_read(c)
+        finally: c.close()
+
+    def _shadow_shared(self,nick,live):
+        """Autres nicks du rc qui écrivent dans le même fichier (DB_NAME partagé) : --rebuild refusé (décision story 6)."""
+        out=[]
+        for n in (self.borg.cfgreadnicks() or '').split(','):
+            if n and n!=nick:
+                try:
+                    if os.path.abspath(self.db.get_diff_db(n))==os.path.abspath(live): out.append(n)
+                except Exception: pass
+        return out
+
+    def _shadow_prepare(self,nick,live,create,force=False):
+        """Fantôme de la base servie (AD-5), sous index-running.lock. -> (chemin, None) prêt ; (None, None) aucun
+        (create=False et absent, ou base servie absente : construction directe) ; (None, 3) refus, message affiché.
+        Existant : gardé si son empreinte d'en-tête est celle de la base servie ; sinon (DbEncrypt/DbDecrypt/DbRekey passé,
+        ou création tuée avant l'empreinte) jeté puis recréé. Fichier vide ou sans schéma (artefact d'une ouverture
+        concurrente) : jeté, jamais recréé sans --rebuild. -F : jeté seulement si la création est possible."""
+        sp=live+_SHADOW_SUFFIX
+        exists=os.path.exists(sp)
+        if exists and not _db_has_schema(sp):
+            self._shadow_discard(sp); exists=False
+        if not exists and not create: return None,None
+        if not os.path.exists(live) or os.path.getsize(live)==0:
+            if exists:
+                self._shadow_discard(sp); printer(f"{nick}: base servie absente — fantôme jeté")
+            if create: printer(f"{nick}: base servie absente — construction directe, sans fantôme")
+            return None,None
+        def _refuse(msg):
+            printer(f"{nick}: {msg}")
+            if exists: printer(f"{nick}: fantôme gardé, sans être avancé")
+            return None,3
+        if not _db_has_schema(live): return _refuse("base servie illisible (verrou ou corruption) — pas de reconstruction")
+        shared=self._shadow_shared(nick,live)
+        if shared:
+            return _refuse(f"base partagée avec {', '.join(shared)} (DB_NAME) — reconstruction par fantôme refusée ; "
+                           "supprimer la base puis relancer Index pour la reconstruire")
+        try:
+            raw=self._live_header(live)
+            migrating=raw is not None and _enc_header_parse(raw).get('path_enc')=='migrating'
+        except (sqlite3.Error,DbTamperError,ValueError,KeyError,TypeError) as e:
+            return _refuse(f"en-tête de la base servie illisible ({e}) — pas de reconstruction")
+        if migrating: return _refuse("DbEncrypt/DbDecrypt en cours sur la base servie — terminer la migration avant la reconstruction")
+        fp=self._header_fp(raw)
+        old=self._db_meta_value(sp,'rebuild_header_fp') if exists else None
+        if exists and not force and old==fp: return sp,None
+        if not _check_disk_space(live,_SHADOW_SPACE_MARGIN):
+            return _refuse(f"espace disque insuffisant — le fantôme demande {_SHADOW_SPACE_MARGIN} × la taille de la base "
+                           "servie de libre (fantôme puis WAL de la bascule) ; rien créé")
+        if exists:
+            printer(f"{nick}: "+("fantôme jeté (-F) — reconstruction repartie de zéro" if force else
+                    "fantôme incomplet (création interrompue) — recréé" if old is None else
+                    "chiffrement de la base servie changé (DbEncrypt/DbDecrypt/DbRekey) — fantôme jeté, reconstruction repartie de zéro"))
+        self._shadow_discard(sp)   # aussi un -wal/-shm orphelin : jamais rejoué dans le nouveau fichier
+        self.db.ensure_diff_db(sp)
+        try:
+            c=_open_db(sp,nick=None,role='admin')
+            try:
+                # En-tête recopié tel quel (même DEK) et empreinte dans la même transaction : sans empreinte, le fichier
+                # est une création interrompue.
+                c.execute("BEGIN IMMEDIATE")
+                if raw is not None: c.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES('enc_header',?)",(raw,))
+                c.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES('rebuild_header_fp',?)",(fp,))
+                c.commit()
+            finally: c.close()
+        except sqlite3.Error as e:
+            self._shadow_discard(sp); printer(f"{nick}: fantôme non créé ({e})"); return None,3
+        printer(f"{nick}: reconstruction dans un fichier fantôme — la base actuelle reste servie jusqu'à la bascule")
+        return sp,None
+
+    def _index_shadow(self,nick,debug,cfg,archives,keep,lo,hi,plan):
+        """Étapes 2 et 3 d'une tranche (AD-3) : rapprochement du fantôme (purge seule), stats, snapshot, diffs avec le
+        budget restant, puis bascule s'il est complet. Mêmes sentinelles que la base servie (AD-1)."""
+        sp=plan['shadow']; deadline=plan['deadline']; noidx=self._nick_noidx(nick)
+        if not os.path.exists(sp):   # abandonné (fichier supprimé) pendant l'appel : jamais recréé en passant
+            plan['shadow']=None; printer(f"{nick}: fantôme supprimé — reconstruction abandonnée"); return 0
+        if not archives:   # comme le rapprochement : une liste vide ne remplace jamais une base qui connaît des archives
+            printer(f"{nick}: borg list ne rend aucune archive — fantôme ni avancé ni basculé (GLOB_ARCH ?)"); return 0
+        self._reconcile_archives(nick,sp,[a['name'] for a in archives])
+        cp=self._index_checkpoint(nick,deadline)
+        if cp: return cp if cp=='interrupted' else self._index_finish(nick,sp,archives,keep,True,noidx)
+        r=self._index_tranche(nick,debug,sp,cfg,archives,keep,lo,hi,plan['natures'],deadline,noidx,plan['sdone'])
+        if r=='interrupted': return r
+        st=self._index_stop_reason(nick,deadline)
+        if st: return 'interrupted' if st=='priority' else 0
+        bs=self._build_state(nick,sp,archives,keep,noidx)
+        if not bs or bs['state']!='complete': return 0
+        return self._shadow_swap(nick,debug,cfg,sp,archives,plan)
+
+    def _shadow_swap(self,nick,debug,cfg,sp,archives,plan):
+        """Bascule du fantôme complet (AD-2, AD-6), sous index-running.lock (tenu par index()). Purge IDX_* du fantôme,
+        borg list frais identique à celui de la passe (archive d'un outil externe arrivée entre-temps : reportée),
+        empreinte d'en-tête, espace pour le WAL, puis _swap_db(keep_new=True) : annulée, le fantôme reste pour la tranche
+        suivante. Retour : 0, ou 'interrupted' (opération prioritaire : pause puis nouvelle passe)."""
+        deadline=plan['deadline']; live=sp[:-len(_SHADOW_SUFFIX)]
+        def _later(why):
+            printer(f"{nick}: bascule reportée ({why}) — fantôme gardé, nouvel essai à la prochaine tranche"); return 0
+        stop=lambda: self._index_stop_reason(nick,deadline) is not None
+        prev=self.borg._stop; self.borg._stop=stop
+        try: rb=self.borg.boex(nick,['list','--json']+glob_args(cfg),debug=debug)
+        finally: self.borg._stop=prev
+        if rb.get('killed'):
+            o=self._kill_outcome(deadline); return o if o=='interrupted' else 0
+        try:
+            self.borg._boex_check_stdout(rb,nick,'borg list')
+            now=[a['name'] for a in rb['stdout'][0]['archives']]
+        except (RuntimeError,KeyError,IndexError,TypeError) as e: return _later(f"borg list : {e}")
+        if not now: return _later("borg list ne rend aucune archive")
+        if now!=[a['name'] for a in archives]: return _later("liste des archives changée depuis le début de la tranche")
+        try: fp=self._header_fp(self._live_header(live))
+        except (sqlite3.Error,DbTamperError) as e: return _later(f"base servie illisible : {e}")
+        if self._db_meta_value(sp,'rebuild_header_fp')!=fp:   # la tranche suivante (_shadow_prepare) le jette et repart de zéro
+            printer(f"{nick}: chiffrement de la base servie changé (DbEncrypt/DbDecrypt/DbRekey) — pas de bascule ; "
+                    "la prochaine tranche jette le fantôme et repart de zéro"); return 0
+        if (cfg.get('IDX_INCLUDE') or '').strip() or (cfg.get('IDX_EXCLUDE') or '').strip():
+            # Décision story 6. Index filtre déjà IDX_* à l'écriture : rattrape les lignes d'avant un changement de motif.
+            printer(f"{nick}: purge IDX_INCLUDE/IDX_EXCLUDE du fantôme avant la bascule")
+            self.idxpurge(nick,debug=debug,db_path=sp)
+            cp=self._index_checkpoint(nick,deadline)
+            if cp: return cp if cp=='interrupted' else 0
+        if not _check_disk_space(sp,_SWAP_SPACE_MARGIN): return _later("espace disque insuffisant pour le WAL de la bascule")
+        try:
+            watch=_open_db(live,nick=None,role='read')
+            try:
+                watch.execute("SELECT count(*) FROM db_meta").fetchone()
+                v0=watch.execute("PRAGMA data_version").fetchone()[0]   # change si un AUTRE processus écrit
+                print(f"{nick}: bascule du fantôme vers la base servie...",flush=True)
+                res=_swap_db(live,sp,nick=nick,keep_new=True,
+                             abort=lambda: self._index_stop_reason(nick,None)=='priority',
+                             changed=lambda: watch.execute("PRAGMA data_version").fetchone()[0]!=v0)
+            finally: watch.close()
+        except sqlite3.Error as e: return _later(f"erreur SQLite : {e}")
+        if res=='ok':
+            plan['shadow']=None
+            try:
+                c=_open_db(live,nick=None,role='write')
+                try: c.execute("DELETE FROM db_meta WHERE key='rebuild_header_fp'"); c.commit()
+                finally: c.close()
+            except sqlite3.Error: pass
+            print(f"{nick}: reconstruction terminée — nouvelle base en service")
+            return 0
+        if res=='invalid':
+            plan['shadow']=None; printer(f"{nick}: fantôme invalide — jeté ; relancer Index --rebuild"); return 0
+        _later({'abort':'opération prioritaire','changed':'base servie modifiée par un autre processus',
+                'busy':'base servie verrouillée en écriture'}.get(res,res))
+        return 'interrupted' if res=='abort' else 0
 
     def search(self,nick,pattern,archive_from=None,archive_to=None,debug=0,as_json=False):
         """as_json=True : imprime {nick: [...lignes]} par nick réussi, {nick: {'error': msg}} par
@@ -5867,12 +6091,19 @@ class BorgHelper:
             finally:
                 if conn is not None: conn.close()
         bkp_running=self.db.get_running_bkp_status(nick)   # history.db (1.0.139)
+        rebuild=None   # fantôme (1.0.143, AD-10) : son build_state, lu sans codec ni borg ; {'state':'partial'} s'il n'en a pas
+        sp=db_path+_SHADOW_SUFFIX
+        if _db_has_schema(sp):   # jamais _open_db (O_CREAT) sur un fantôme que la bascule vient de supprimer
+            v=self._db_meta_value(sp,_build_state_key(nick))
+            try: rebuild=json.loads(v) if v else {'state':'partial'}
+            except ValueError: rebuild={'state':'partial'}
         return {
             'nick':nick,
             'last_backup':last_backup,
             'bkp_running':{'started_at':bkp_running['started_at']} if bkp_running else None,
             'priority_op_running':bool(self.db.check_priority_lock(nick)),
             'build':build,
+            'rebuild':rebuild,
         }
 
     def _status_print_one(self,st):
@@ -5904,6 +6135,13 @@ class BorgHelper:
             if b.get('stats_done') is not None: extra+=f", statistiques {b['stats_done']}/{b.get('archives_total')}"
             if b.get('snapshot') is False: extra+=", snapshot à faire"
             printer(f"  Construction partielle : {b.get('pairs_done')}/{b.get('pairs_total')} paires{extra} (Index par tranches)")
+        rb=st.get('rebuild')
+        if rb:
+            if rb.get('pairs_total') is None: printer("  Reconstruction (fantôme) : démarrée")
+            else:
+                done='prête à basculer' if rb.get('state')=='complete' else 'en cours'
+                printer(f"  Reconstruction (fantôme) {done} : {rb.get('pairs_done')}/{rb.get('pairs_total')} paires, "
+                        f"statistiques {rb.get('stats_done')}/{rb.get('archives_total')}")
 
     def status(self,nick,debug=0,as_json=False):
         """Commande CLI Status (spec-status-cli-etat-rapide) : état rapide (dernier backup connu, Bkp
@@ -5921,7 +6159,7 @@ class BorgHelper:
                 # 'migrating' AD-11, erreur SQLite non prévue…) ne doit jamais faire échouer tout
                 # l'appel -n ALL/multi-nick — c'est précisément le cas d'usage principal de Status.
                 results.append({'nick':n,'last_backup':None,'bkp_running':None,
-                                 'priority_op_running':False,'build':None,'error':str(e)})
+                                 'priority_op_running':False,'build':None,'rebuild':None,'error':str(e)})
         if as_json:
             # Toujours une liste (même à un seul nick) : Status supporte nativement ALL/multi-nick,
             # forme homogène pour les consommateurs machine (contrairement à RepoHistory/ArchiveHistory
@@ -6080,8 +6318,8 @@ class BorgHelper:
         conn.execute(f"DELETE FROM snap_excluded_stats WHERE nick=? AND archive IN ({ph})",[nick]+to_delete)
         self.db._cleanup_snapshot_file_orphans(nick,conn)
 
-    def idxpurge(self,nick,pattern=None,dryrun=False,debug=0):
-        db_path=self.db.get_diff_db(nick)
+    def idxpurge(self,nick,pattern=None,dryrun=False,debug=0,db_path=None):
+        if db_path is None: db_path=self.db.get_diff_db(nick)   # db_path : fantôme avant bascule (1.0.143)
         if not os.path.exists(db_path):
             printer(f"  {nick}: diff.db absent"); return
         cfg=self.borg.cfgread(nick)
@@ -9500,6 +9738,408 @@ def codec_selftest():
             check("snapshot incrémental (ajouts) : identique à un complet ; borg list des ajouts arrêté -> rien d'écrit",_ix_incremental_snapshot)
             check("CLI Index : -t avec -S refusé, -T invalide refusé, budget par nick avec plusieurs nicks",_ix_cli_usage)
             check("surveillance croisée : vrai Bkp pendant un Index long -> Bkp sans attente, Index en pause puis reprise, nouvelle archive indexée",_ix_real_bkp_during_index)
+        # ── Reconstruction dans un fichier fantôme (1.0.143, story 6, AD-2/AD-5/AD-6) ──
+        rb_ctx={}
+        def _rb_ctx():
+            """Vrai dépôt (4 archives, f2.txt et commun.txt modifiés à chaque fois), borg journalisé/ralentissable
+            (_ix_slow). Sections : rb (plain), rbe (chiffrée, KDF light), rbx (IDX_EXCLUDE f2.txt), rbs1/rbs2 (DB_NAME
+            partagé)."""
+            if rb_ctx: return rb_ctx
+            d=os.path.join(tmp,'rebuild'); src=os.path.join(d,'src'); os.makedirs(src)
+            repo=os.path.join(d,'repo'); bb=os.path.join(d,'borgbase')
+            env=dict(os.environ,BORG_PASSPHRASE='pw-rb',BORG_RELOCATED_REPO_ACCESS_IS_OK='yes',BORG_BASE_DIR=bb)
+            r=subprocess.run([shutil.which('borg'),'init','-e','repokey',repo],env=env,capture_output=True,text=True,timeout=120)
+            if r.returncode!=0: raise RuntimeError(f"borg init : {r.stderr[-300:]}")
+            pre=f"{socket.getfqdn()}-r-"
+            for i in range(4):
+                with open(os.path.join(src,f'f{i}.txt'),'w') as f: f.write(f'fichier {i} '*40)
+                for nm in ('f2.txt','commun.txt'):
+                    with open(os.path.join(src,nm),'a') as f: f.write(f'modif {i}\n')
+                r=subprocess.run([shutil.which('borg'),'create','--timestamp',f"2026-09-1{i}T10:00:00",f'{repo}::{pre}2026-09-1{i}',src],
+                                 env=env,capture_output=True,text=True,timeout=120)
+                if r.returncode!=0: raise RuntimeError(f"borg create : {r.stderr[-300:]}")
+            ctx={'dir':d,'src':src,'repo':repo,'bb':bb,'env':env,'pre':pre,'log':os.path.join(d,'borg.log'),
+                 'w':os.path.join(d,'borgw'),'rc':os.path.join(d,'rc')}
+            _ix_slow(ctx,None,0)
+            common=(f"BORG_REPO={repo}\nBORG_PASSPHRASE=pw-rb\nSER_NAME=rb\nSER_LOGIN=x\nGLOB_ARCH={pre}*\n"
+                    f"BORG_ARCHNAME=r\nBORG_ROOTBKP={src}\nIDX_WORKERS=1\nBORG_EXE={ctx['w']}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\n")
+            with open(ctx['rc'],'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n\n")
+                for nk,extra in (('rb','DB_ENCRYPT=false\n'),('rbe','DB_ENCRYPT=true\nDB_KDF=light\n'),
+                                 ('rbx',f"DB_ENCRYPT=false\nIDX_EXCLUDE={src.lstrip('/')}/f2.txt\n"),
+                                 ('rbs1','DB_ENCRYPT=false\nDB_NAME=rbshared\n'),('rbs2','DB_ENCRYPT=false\nDB_NAME=rbshared\n'),
+                                 ('rbk','DB_ENCRYPT=false\nDIFF_KEEP=2\n')):
+                    f.write(f"[{nk}]\n{common}{extra}\n")
+            os.chmod(ctx['rc'],0o600)
+            rb_ctx.update(ctx); return rb_ctx
+        def _rb_bh(cache): return BorgHelper(cfgfile=_rb_ctx()['rc'],cache_dir=os.path.join(_rb_ctx()['dir'],cache))
+        def _rb_sp(b,nk): return b.db.get_diff_db(nk)+_SHADOW_SUFFIX
+        def _rb_outs(b,nk):
+            """Sorties comparées à un Index complet : Report -o, TreeHist, DiffBkp, ArchiveHistory (JSON, champs volatils ôtés)."""
+            r=[]
+            for fn,k in ((b.report_offline,{'as_json':True}),(b.treehist,{'as_json':True}),(b.diffbkp,{'as_json':True}),
+                         (b.archive_history,{'as_json':True})):
+                o=_q_run(fn,nk,**k)
+                o=re.sub(r'"(borghelper_version|generated_at|reste|depuis|age[^"]*|since[^"]*)":\s*("[^"]*"|[\d.]+)','',o)
+                r.append(re.sub(r'/[^"]*/rb-[a-z0-9]+/','/C/',o))
+            return r
+        def _rb_rows(p,tables):
+            if not os.path.exists(p): return None
+            c=sqlite3.connect(p)
+            try:
+                out={}
+                for t in tables:
+                    try: out[t]=sorted(map(tuple,c.execute(f"SELECT * FROM {t}").fetchall()),key=repr)
+                    except sqlite3.OperationalError: out[t]=None
+                return out
+            finally: c.close()
+        _RB_HIST=('repo_stats','archive_measure','archive_chart','bkp_status')
+        _RB_LIVE=('diff_indexed_pairs','archive_stats','archive_snapshot_indexed')
+        def _rb_pair_ids(p):
+            c=sqlite3.connect(p)
+            try: return {(o,n):(i,t) for i,o,n,t in c.execute("SELECT id,archive_old,archive_new,indexed_at FROM diff_indexed_pairs")}
+            finally: c.close()
+        def _rb_full():
+            """Reconstruction complète : base servie abîmée (lignes d'une paire retirées, sentinelle gardée) -> --rebuild
+            la refait ; sorties == avant l'abîme ; fantôme disparu ; history.db inchangée ; empreinte ôtée de la base."""
+            ctx=_rb_ctx(); _ix_slow(ctx,None,0); b=_rb_bh('rb-a')
+            _q_run(b.index,'rb'); _q_run(b.index,'rb',budget=60)   # tranche : point de taille du dépôt déjà relevé
+            ref=_rb_outs(b,'rb'); live=b.db.get_diff_db('rb')
+            h0=_rb_rows(_history_path_for(live),_RB_HIST)
+            c=sqlite3.connect(live); o,n=c.execute("SELECT archive_old,archive_new FROM diff_indexed_pairs LIMIT 1").fetchone()
+            c.execute("DELETE FROM diff_index WHERE archive_old=? AND archive_new=?",(o,n)); c.commit(); c.close()
+            damaged=_rb_outs(b,'rb')!=ref
+            out=io.StringIO()
+            with contextlib.redirect_stdout(out),contextlib.redirect_stderr(out): r=b.index('rb',rebuild=True)
+            after=_rb_outs(b,'rb'); h1=_rb_rows(_history_path_for(live),_RB_HIST)
+            ok=(r==0 and damaged and after==ref and not os.path.exists(_rb_sp(b,'rb')) and h0==h1 and 'nouvelle base en service' in out.getvalue()
+                and b._db_meta_value(live,'rebuild_header_fp') is None and all(len(x)>20 for x in ref))
+            if not ok: print(f"  complète : r {r}, abîmée {damaged}, identique {after==ref}, history {h0==h1}, {out.getvalue()[-400:]!r}")
+            return ok
+        def _rb_tranches():
+            """Par tranches (borg ralenti) : --rebuild -t puis tranches -t ; entre deux tranches la base servie est
+            inchangée et lisible, Status montre le fantôme ; paires du fantôme jamais refaites ; bascule ; sorties == avant."""
+            ctx=_rb_ctx(); _ix_slow(ctx,None,0); b=_rb_bh('rb-b')
+            _q_run(b.index,'rb'); ref=_rb_outs(b,'rb'); live=b.db.get_diff_db('rb'); sp=_rb_sp(b,'rb')
+            l0=_rb_rows(live,_RB_LIVE)
+            _ix_slow(ctx,'ALL',0.4)
+            runs=0; same=True; mono=True; seen=False; prev={}; st_ok=False
+            try:
+                while runs<40:
+                    _q_run(b.index,'rb',budget=3,rebuild=(runs==0)); runs+=1
+                    if not os.path.exists(sp): break
+                    same=same and _rb_rows(live,_RB_LIVE)==l0 and len(_q_run(b.treehist,'rb',as_json=True))>20
+                    cur=_rb_pair_ids(sp); mono=mono and all(cur.get(k)==v for k,v in prev.items()); prev=cur
+                    st=b._status_one('rb').get('rebuild'); seen=True
+                    st_ok=st_ok or bool(st and st.get('state')=='partial')
+            finally: _ix_slow(ctx,None,0)
+            st_after=b._status_one('rb').get('rebuild')
+            ok=(runs>1 and seen and same and mono and st_ok and st_after is None and not os.path.exists(sp) and _rb_outs(b,'rb')==ref)
+            if not ok: print(f"  tranches : {runs} tranches, servie intacte {same}, monotone {mono}, Status {st_ok}/{st_after}, "
+                             f"fantôme {os.path.exists(sp)}, identique {_rb_outs(b,'rb')==ref}")
+            return ok
+        def _rb_bkp_during():
+            """Bkp pendant la reconstruction : priority.lock (autre PID) pendant un diff du fantôme, borg create d'une
+            nouvelle archive, retrait -> reprise ; la nouvelle archive (paire, stats, snapshot) est dans la base basculée."""
+            ctx=_rb_ctx(); b=_rb_bh('rb-c'); _ix_slow(ctx,None,0)
+            _q_run(b.index,'rb'); _ix_slow(ctx,'diff',1.5); _ix_log(ctx,clear=True)
+            res={}; out=io.StringIO()
+            def run():
+                with contextlib.redirect_stdout(out),contextlib.redirect_stderr(out): res['r']=b.index('rb',rebuild=True)
+            th=threading.Thread(target=run); th.start(); t0=time.monotonic()
+            while time.monotonic()-t0<60 and not any(l.startswith('diff ') for l in _ix_log(ctx)): time.sleep(0.05)
+            lp=b.db._priority_lock_path('rb'); _ix_fake_lock(lp)
+            try:
+                t1=time.monotonic()
+                while time.monotonic()-t1<10 and os.path.exists(b.db._index_running_lock_path('rb')): time.sleep(0.05)
+                with open(os.path.join(ctx['src'],'f2.txt'),'a') as f: f.write('bkp\n')
+                new=f"{ctx['pre']}2026-09-20"
+                subprocess.run([shutil.which('borg'),'create','--timestamp','2026-09-20T10:00:00',f"{ctx['repo']}::{new}",ctx['src']],
+                               env=ctx['env'],capture_output=True,text=True,timeout=120)
+            finally: os.unlink(lp)
+            th.join(180); _ix_slow(ctx,None,0)
+            live=b.db.get_diff_db('rb'); c=sqlite3.connect(live)
+            pair=c.execute("SELECT count(*) FROM diff_indexed_pairs WHERE archive_new=?",(new,)).fetchone()[0]
+            stat=c.execute("SELECT count(*) FROM archive_stats WHERE archive=?",(new,)).fetchone()[0]
+            snap=c.execute("SELECT count(*) FROM archive_snapshot_indexed WHERE archive=?",(new,)).fetchone()[0]; c.close()
+            o=out.getvalue()
+            ok=(res.get('r')==0 and pair==1 and stat==1 and snap==1 and 'pause' in o and 'nouvelle base en service' in o
+                and not os.path.exists(_rb_sp(b,'rb')))
+            if not ok: print(f"  Bkp pendant : r {res.get('r')}, paire {pair}, stats {stat}, snapshot {snap}, {o[-500:]!r}")
+            return ok
+        def _rb_swap_abort():
+            """Bkp pendant la bascule : priority.lock posé juste avant _swap_db -> 'abort', base servie inchangée, fantôme
+            gardé ; retrait -> pause puis nouvelle passe qui bascule."""
+            ctx=_rb_ctx(); _ix_slow(ctx,None,0); b=_rb_bh('rb-d')
+            _q_run(b.index,'rb'); live=b.db.get_diff_db('rb'); sp=_rb_sp(b,'rb')
+            orig=globals()['_swap_db']; seen=[]
+            def wrap(live_,new,**kw):
+                if not seen:
+                    lp=b.db._priority_lock_path('rb'); _ix_fake_lock(lp)
+                    threading.Timer(1.5,lambda: os.path.exists(lp) and os.unlink(lp)).start()
+                pre=_rb_rows(live_,_RB_LIVE)
+                r=orig(live_,new,**kw); seen.append((r,_rb_rows(live_,_RB_LIVE)==pre,os.path.exists(new))); return r
+            globals()['_swap_db']=wrap
+            try: out=_q_run(b.index,'rb',rebuild=True)
+            finally: globals()['_swap_db']=orig
+            c=sqlite3.connect(live); snaps=c.execute("SELECT count(*) FROM archive_snapshot_indexed").fetchone()[0]; c.close()
+            ok=(len(seen)==2 and seen[0]==('abort',True,True) and seen[1][0]=='ok' and not os.path.exists(sp) and snaps>=1
+                and 'bascule reportée' in out)
+            if not ok: print(f"  bascule annulée : {seen}, snapshots {snaps}, {out[-400:]!r}")
+            return ok
+        def _rb_new_archive():
+            """Nouvelle archive (outil externe) entre la liste de la passe et la bascule : pas de bascule (fantôme gardé,
+            base servie inchangée) ; la tranche suivante rattrape puis bascule."""
+            ctx=_rb_ctx(); _ix_slow(ctx,None,0); b=_rb_bh('rb-e')
+            _q_run(b.index,'rb'); live=b.db.get_diff_db('rb'); sp=_rb_sp(b,'rb'); l0=_rb_rows(live,_RB_LIVE)
+            orig=b._index_shadow; new=f"{ctx['pre']}2026-09-21"
+            def wrap(*a,**k):
+                if not os.path.exists(os.path.join(ctx['dir'],'e-done')):
+                    open(os.path.join(ctx['dir'],'e-done'),'w').close()
+                    subprocess.run([shutil.which('borg'),'create','--timestamp','2026-09-21T10:00:00',f"{ctx['repo']}::{new}",ctx['src']],
+                                   env=ctx['env'],capture_output=True,text=True,timeout=120)
+                return orig(*a,**k)
+            b._index_shadow=wrap
+            out1=_q_run(b.index,'rb',rebuild=True)
+            kept=os.path.exists(sp) and _rb_rows(live,_RB_LIVE)==l0
+            out2=_q_run(b.index,'rb',budget=120)
+            c=sqlite3.connect(live); pair=c.execute("SELECT count(*) FROM diff_indexed_pairs WHERE archive_new=?",(new,)).fetchone()[0]; c.close()
+            ok=kept and 'liste des archives changée' in out1 and pair==1 and not os.path.exists(sp) and 'nouvelle base en service' in out2
+            if not ok: print(f"  nouvelle archive : gardé {kept}, paire {pair}, {out1[-300:]!r} / {out2[-300:]!r}")
+            return ok
+        def _rb_rekey():
+            """Base chiffrée : fantôme créé avec l'en-tête recopié (même DEK) ; DbRekey entre deux tranches -> fantôme jeté
+            puis recréé à la tranche suivante ; la base basculée se lit avec la passphrase (codec) et == Index complet."""
+            ctx=_rb_ctx(); _ix_slow(ctx,None,0); b=_rb_bh('rb-f')
+            _q_run(b.index,'rbe'); _q_run(b.db_encrypt,'rbe',confirm=True)
+            live=b.db.get_diff_db('rbe'); sp=_rb_sp(b,'rbe'); ref=_rb_outs(b,'rbe')
+            enc=b._db_meta_value(live,'enc_header') is not None
+            _q_run(b.index,'rbe',rebuild=True,natures=['stats'])
+            same_hdr=os.path.exists(sp) and b._db_meta_value(sp,'enc_header')==b._db_meta_value(live,'enc_header')
+            _q_run(b.db_rekey,'rbe',confirm=True)
+            out=_q_run(b.index,'rbe',budget=120)
+            ok=(enc and same_hdr and 'fantôme jeté' in out and 'nouvelle base en service' in out and not os.path.exists(sp)
+                and b._db_meta_value(live,'enc_header') is not None and _rb_outs(b,'rbe')==ref)
+            if not ok: print(f"  DbRekey : chiffrée {enc}, en-tête recopié {same_hdr}, {out[-500:]!r}")
+            return ok
+        def _rb_refusals():
+            """Refus (code 3, rien créé) : espace disque < 2,2 × base servie ; DB_NAME partagé. Base servie absente :
+            construction directe sans fantôme."""
+            ctx=_rb_ctx(); _ix_slow(ctx,None,0); b=_rb_bh('rb-g')
+            _q_run(b.index,'rb'); sp=_rb_sp(b,'rb'); size=os.path.getsize(b.db.get_diff_db('rb'))
+            real=shutil.disk_usage
+            shutil.disk_usage=lambda p: type('U',(),{'free':int(size*2.1),'total':0,'used':0})()
+            try:
+                out=io.StringIO()
+                with contextlib.redirect_stdout(out),contextlib.redirect_stderr(out): r_space=b.index('rb',rebuild=True)
+            finally: shutil.disk_usage=real
+            space=r_space==3 and not os.path.exists(sp) and 'espace disque' in out.getvalue()
+            _q_run(b.index,'rbs1')
+            out=io.StringIO()
+            with contextlib.redirect_stdout(out),contextlib.redirect_stderr(out): r_sh=b.index('rbs1',rebuild=True)
+            shared=r_sh==3 and not os.path.exists(_rb_sp(b,'rbs1')) and 'DB_NAME' in out.getvalue()
+            b2=_rb_bh('rb-h'); o3=_q_run(b2.index,'rb',rebuild=True)
+            absent=('construction directe' in o3 and not os.path.exists(_rb_sp(b2,'rb'))
+                    and (b2._status_one('rb').get('build') or {}).get('state')=='complete')
+            if not (space and shared and absent): print(f"  refus : espace {space} ({r_space}), DB_NAME {shared} ({r_sh}), absente {absent} {o3[-200:]!r}")
+            return space and shared and absent
+        def _rb_idx_exclude():
+            """IDX_EXCLUDE : Index l'applique déjà à l'écriture (base servie sans f2.txt) ; une ligne exclue présente dans
+            le fantôme (indexée avant l'ajout du motif) est purgée juste avant la bascule (idxpurge(db_path=fantôme))."""
+            ctx=_rb_ctx(); _ix_slow(ctx,None,0); b=_rb_bh('rb-i')
+            _q_run(b.index,'rbx'); live=b.db.get_diff_db('rbx')
+            def n_f2(p):
+                c=sqlite3.connect(p)
+                try: return c.execute("SELECT count(*) FROM diff_index WHERE path LIKE '%/f2.txt'").fetchone()[0]
+                finally: c.close()
+            before=n_f2(live); orig=b._shadow_swap; planted=[]
+            def wrap(nick,debug,cfg,sp,archives,plan):
+                c=sqlite3.connect(sp)
+                o,n=c.execute("SELECT archive_old,archive_new FROM diff_indexed_pairs LIMIT 1").fetchone()
+                c.execute("INSERT INTO diff_index(nick,archive_old,archive_new,change_type,path) VALUES(?,?,?,?,?)",
+                          (nick,o,n,'modified',f"{ctx['src'].lstrip('/')}/f2.txt")); c.commit(); c.close()
+                planted.append(n_f2(sp)); return orig(nick,debug,cfg,sp,archives,plan)
+            b._shadow_swap=wrap
+            out=_q_run(b.index,'rbx',rebuild=True); after=n_f2(live)
+            ok=before==0 and planted==[1] and after==0 and 'nouvelle base en service' in out
+            if not ok: print(f"  IDX_EXCLUDE : servie {before}, plantée {planted}, après {after}, {out[-300:]!r}")
+            return ok
+        def _rb_kill():
+            """kill -9 : pendant une unité du fantôme (CLI, diff ralenti), pendant la bascule (copie ralentie), et création
+            interrompue (fichier sans empreinte) -> base servie intacte (intégrité, contenu) ; la tranche suivante reprend,
+            bascule, sorties == Index complet."""
+            ctx=_rb_ctx(); _ix_slow(ctx,None,0); b=_rb_bh('cache')   # CACHE_DIR du rc : base partagée avec le CLI
+            _q_run(b.index,'rb'); live=b.db.get_diff_db('rb'); sp=_rb_sp(b,'rb'); ref=_rb_outs(b,'rb'); l0=_rb_rows(live,_RB_LIVE)
+            me=os.path.realpath(__file__); ok=True
+            def intact():
+                c=sqlite3.connect(live); i=c.execute("PRAGMA integrity_check").fetchone()[0]; c.close()
+                return i=='ok' and _rb_rows(live,_RB_LIVE)==l0
+            # 1) pendant une unité
+            _ix_slow(ctx,'diff',3); _ix_log(ctx,clear=True)
+            ps=subprocess.Popen([me,'-C',ctx['rc'],'-c','Index','-n','rb','--rebuild'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            t0=time.monotonic()
+            while time.monotonic()-t0<60 and not any(l.startswith('diff ') for l in _ix_log(ctx)): time.sleep(0.05)
+            time.sleep(0.5); ps.kill(); ps.wait(10); _ix_slow(ctx,None,0)
+            u=intact() and os.path.exists(sp)
+            # 2) pendant la bascule : copie par page, chaque tranche ralentie
+            script=(f"import sys,time\nsys.argv=[{me!r}]\nimport importlib.machinery as m\n"
+                    f"B=m.SourceFileLoader('bhk',{me!r}).load_module()\n"
+                    "o=B._swap_db\n"
+                    "def w(live,new,**kw):\n"
+                    "    a=kw.get('abort'); kw['pages']=1\n"
+                    "    kw['abort']=lambda: (time.sleep(0.3),(a() if a else False))[1]\n"
+                    "    print('SWAP',flush=True); return o(live,new,**kw)\n"
+                    "B._swap_db=w\n"
+                    f"b=B.BorgHelper(cfgfile={ctx['rc']!r})\nb.index('rb',budget=300)\n")
+            outp=os.path.join(ctx['dir'],'kill.out')
+            with open(outp,'w') as fo:
+                ps=subprocess.Popen([sys.executable,'-c',script],stdout=fo,stderr=subprocess.STDOUT,env=dict(os.environ,BORGHELPERC_SENTRY_FILE=os.devnull))
+            t0=time.monotonic()
+            while time.monotonic()-t0<120 and 'SWAP' not in open(outp).read(): time.sleep(0.05)
+            time.sleep(1); ps.kill(); ps.wait(10)
+            sw='SWAP' in open(outp).read() and intact() and os.path.exists(sp)
+            # 3) création interrompue : fantôme sans empreinte
+            b.db.ensure_diff_db(sp+'.x'); BorgHelper._shadow_discard(sp); os.rename(sp+'.x',sp)
+            out=_q_run(b.index,'rb',budget=120)
+            cr='création interrompue' in out and 'nouvelle base en service' in out and not os.path.exists(sp)
+            same=_rb_outs(b,'rb')==ref
+            ok=u and sw and cr and same
+            if not ok: print(f"  kill : unité {u}, bascule {sw}, création {cr}, identique {same}, {out[-300:]!r} / {open(outp).read()[-300:]!r}")
+            return ok
+        def _rb_plain_ignores():
+            """Index sans option pendant une reconstruction : fantôme inchangé (paires, build_state), base servie indexée."""
+            ctx=_rb_ctx(); _ix_slow(ctx,None,0); b=_rb_bh('rb-k')
+            _q_run(b.index,'rb'); sp=_rb_sp(b,'rb')
+            _q_run(b.index,'rb',rebuild=True,natures=['stats'])
+            k=_build_state_key('rb'); p0=_rb_pair_ids(sp) if os.path.exists(sp) else None; s0=b._db_meta_value(sp,k)
+            out=_q_run(b.index,'rb')
+            ok=(p0=={} and s0 is not None and os.path.exists(sp) and _rb_pair_ids(sp)==p0 and b._db_meta_value(sp,k)==s0
+                and 'bascule' not in out and 'fantôme' not in out)
+            BorgHelper._shadow_discard(sp)
+            if not ok: print(f"  Index sans option : paires {p0}, état {s0}, {out[-300:]!r}")
+            return ok
+        def _rb_empty_list():
+            """borg list vide (GLOB_ARCH erroné, dépôt vidé) avec un fantôme : ni avancé ni basculé, base servie intacte."""
+            ctx=_rb_ctx(); _ix_slow(ctx,None,0); b=_rb_bh('rb-l')
+            _q_run(b.index,'rb'); sp=_rb_sp(b,'rb'); live=b.db.get_diff_db('rb')
+            _q_run(b.index,'rb',rebuild=True,natures=['stats']); l0=_rb_rows(live,_RB_LIVE)
+            orig=b.borg.boex
+            def empty(nick,arg,**k):
+                r=orig(nick,arg,**k)
+                if arg[:2]==['list','--json'] and r.get('stdout'):
+                    try: r['stdout'][0]['archives']=[]
+                    except (KeyError,IndexError,TypeError): pass
+                return r
+            b.borg.boex=empty
+            try: out=_q_run(b.index,'rb',budget=60)
+            finally: b.borg.boex=orig
+            ok=('aucune archive' in out and 'nouvelle base en service' not in out and os.path.exists(sp)
+                and _rb_rows(live,_RB_LIVE)==l0)
+            BorgHelper._shadow_discard(sp)
+            if not ok: print(f"  liste vide : fantôme {os.path.exists(sp)}, {out[-300:]!r}")
+            return ok
+        def _rb_swap_keep_new():
+            """_swap_db(keep_new=True) : 'changed' et 'busy' gardent la nouvelle base ; 'invalid' (vide) la retire ; la base
+            servie reste l'ancienne."""
+            d=os.path.join(_rb_ctx()['dir'],'kn'); os.makedirs(d,exist_ok=True)
+            live=os.path.join(d,'live.db'); new=os.path.join(d,'new.db')
+            def mk(p,v):
+                c=sqlite3.connect(p); c.execute("CREATE TABLE IF NOT EXISTS t(x)"); c.execute("DELETE FROM t")
+                c.executemany("INSERT INTO t VALUES(?)",[(v*500,)]*200); c.commit(); c.close()
+            def val(p):
+                c=sqlite3.connect(p)
+                try: return c.execute("SELECT x FROM t LIMIT 1").fetchone()[0][:1]
+                finally: c.close()
+            mk(live,'a'); mk(new,'b')
+            r1=_swap_db(live,new,keep_new=True,changed=lambda: True); k1=os.path.exists(new) and val(live)=='a'
+            hold=sqlite3.connect(live,timeout=0); hold.execute("BEGIN IMMEDIATE")
+            try: r2=_swap_db(live,new,keep_new=True,busy_limit=1)
+            finally: hold.rollback(); hold.close()
+            k2=os.path.exists(new) and val(live)=='a'
+            open(new+'.vide','w').close()
+            r3=_swap_db(live,new+'.vide',keep_new=True); k3=not os.path.exists(new+'.vide')
+            r4=_swap_db(live,new,keep_new=True); k4=not os.path.exists(new) and val(live)=='b'
+            ok=(r1,r2,r3,r4)==('changed','busy','invalid','ok') and k1 and k2 and k3 and k4
+            if not ok: print(f"  keep_new : {(r1,r2,r3,r4)} {(k1,k2,k3,k4)}")
+            return ok
+        def _rb_cli():
+            """CLI : --rebuild refusé -> code 3 (DB_NAME partagé) ; --rebuild -F jette le fantôme existant ; -F -t refusé ;
+            --rebuild hors Index refusé."""
+            ctx=_rb_ctx(); _ix_slow(ctx,None,0); b=_rb_bh('cache'); me=os.path.realpath(__file__)
+            env=dict(os.environ,BORGHELPERC_SENTRY_FILE=os.devnull)
+            def cli(*a):
+                p=subprocess.run([me,'-C',ctx['rc'],'-c',*a],capture_output=True,text=True,timeout=300,env=env)
+                return p.returncode,p.stdout+p.stderr
+            _q_run(b.index,'rbs1')
+            c1,o1=cli('Index','-n','rbs1','--rebuild')
+            sp=_rb_sp(b,'rb'); _q_run(b.index,'rb',rebuild=True,natures=['stats']); m0=os.path.getmtime(sp) if os.path.exists(sp) else None
+            time.sleep(0.05)
+            c2,o2=cli('Index','-n','rb','--rebuild','-F','-T','stats')
+            c3,o3=cli('Index','-n','rb','-F','-t','1m')
+            c4,o4=cli('Status','-n','rb','--rebuild')
+            ok=(c1==3 and 'DB_NAME' in o1 and m0 is not None and c2==0 and 'jeté (-F)' in o2 and os.path.exists(sp)
+                and c3!=0 and 'incompatibles' in o3 and c4!=0 and 'réservé à Index' in o4)
+            BorgHelper._shadow_discard(sp)
+            if not ok: print(f"  CLI : {c1} {o1[-150:]!r} | {c2} {o2[-150:]!r} | {c3} {o3[-120:]!r} | {c4} {o4[-120:]!r}")
+            return ok
+        def _rb_prune_during():
+            """Archive supprimée (borg delete) et nouvelle archive pendant une reconstruction, DIFF_KEEP=2 : le fantôme
+            purge l'archive disparue et la paire sortie de la fenêtre sans jamais écrire history.db (figeage, mesures,
+            point de taille) ; la base basculée n'a plus aucune ligne de l'archive supprimée et garde 2 paires."""
+            ctx=_rb_ctx(); _ix_slow(ctx,None,0); b=_rb_bh('rb-m'); sp=_rb_sp(b,'rbk'); live=b.db.get_diff_db('rbk')
+            _q_run(b.index,'rbk')
+            _q_run(b.index,'rbk',rebuild=True,natures=['stats','diff'])
+            env=ctx['env']
+            names=[a['name'] for a in json.loads(subprocess.run([shutil.which('borg'),'list','--json',ctx['repo']],env=env,
+                   capture_output=True,text=True,timeout=60).stdout)['archives']]
+            old=names[0]; new=f"{ctx['pre']}2026-09-22"
+            subprocess.run([shutil.which('borg'),'delete',f"{ctx['repo']}::{old}"],env=env,capture_output=True,text=True,timeout=120)
+            with open(os.path.join(ctx['src'],'f2.txt'),'a') as f: f.write('22\n')
+            subprocess.run([shutil.which('borg'),'create','--timestamp','2026-09-22T10:00:00',f"{ctx['repo']}::{new}",ctx['src']],
+                           env=env,capture_output=True,text=True,timeout=120)
+            calls=[]; flag=[False]
+            def spy(fn,name):
+                def w(*a,**k):
+                    if flag[0]: calls.append(name)
+                    return fn(*a,**k)
+                return w
+            for n in ('freeze_archive_chart','store_repo_stats','get_archive_measures'): setattr(b.db,n,spy(getattr(b.db,n),n))
+            orig=b._index_shadow
+            def shadow(*a,**k):
+                flag[0]=True
+                try: return orig(*a,**k)
+                finally: flag[0]=False
+            b._index_shadow=shadow
+            prev=_rb_pair_ids(sp) if os.path.exists(sp) else {}
+            out=_q_run(b.index,'rbk',budget=120)
+            c=sqlite3.connect(live)
+            left=sum(c.execute(f"SELECT count(*) FROM {t} WHERE {col}=?",(old,)).fetchone()[0]
+                     for t,col in (('archive_stats','archive'),('diff_indexed_pairs','archive_old'),('diff_indexed_pairs','archive_new'),
+                                   ('diff_index','archive_old'),('archive_snapshot_indexed','archive')))
+            npairs=c.execute("SELECT count(*) FROM diff_indexed_pairs").fetchone()[0]
+            hasnew=c.execute("SELECT count(*) FROM diff_indexed_pairs WHERE archive_new=?",(new,)).fetchone()[0]; c.close()
+            ok=(len(prev)==2 and not calls and 'nouvelle base en service' in out and left==0 and npairs==2 and hasnew==1
+                and not os.path.exists(sp))
+            if not ok: print(f"  suppression pendant : paires avant {len(prev)}, appels history {calls}, restes {left}, "
+                             f"paires {npairs}, nouvelle {hasnew}, {out[-400:]!r}")
+            return ok
+        if shutil.which('borg') is None:
+            skip("reconstruction dans un fichier fantôme sur un vrai dépôt borg","borg absent")
+        else:
+            check("fantôme : --rebuild refait une base abîmée ; sorties == Index complet ; history.db intacte ; fichier disparu",_rb_full)
+            check("fantôme : par tranches, base servie inchangée et lue, Status rebuild, paires jamais refaites, bascule",_rb_tranches)
+            check("fantôme : Bkp pendant la reconstruction -> pause, nouvelle archive dans la base basculée",_rb_bkp_during)
+            check("fantôme : opération prioritaire pendant la bascule -> annulée, base intacte, fantôme gardé, puis bascule",_rb_swap_abort)
+            check("fantôme : nouvelle archive avant la bascule -> reportée, rattrapée à la tranche suivante",_rb_new_archive)
+            check("fantôme : base chiffrée (en-tête recopié) ; DbRekey entre deux tranches -> fantôme jeté puis refait",_rb_rekey)
+            check("fantôme : refus espace disque et DB_NAME partagé (code 3, rien créé) ; base absente -> construction directe",_rb_refusals)
+            check("fantôme : IDX_EXCLUDE — ligne exclue du fantôme purgée avant la bascule",_rb_idx_exclude)
+            check("fantôme : kill -9 pendant une unité, pendant la bascule, création interrompue -> base intacte, reprise",_rb_kill)
+            check("fantôme : Index sans option pendant une reconstruction -> fantôme inchangé",_rb_plain_ignores)
+            check("fantôme : borg list vide -> ni avancé ni basculé, base servie intacte",_rb_empty_list)
+            check("fantôme : _swap_db(keep_new=True) garde la nouvelle base sur changed/busy, la retire sur invalid",_rb_swap_keep_new)
+            check("fantôme : CLI --rebuild refusé -> code 3 ; --rebuild -F jette le fantôme ; -F -t et --rebuild hors Index refusés",_rb_cli)
+            check("fantôme : archive supprimée + nouvelle pendant la reconstruction (DIFF_KEEP) -> purgées, history.db jamais écrite par le fantôme",_rb_prune_during)
         # ── Dépôts borg externes (1.0.142, story 5, AD-11/AD-12) ──
         check("glob_args : motif -> ['--glob-archives', m] / ['--glob-archives=m'] ; absent ou vide -> aucun argument",
               lambda: glob_args({'GLOB_ARCH':'h-t-*'})==['--glob-archives','h-t-*'] and glob_args({'GLOB_ARCH':'h-*'},'eq')==['--glob-archives=h-*']
@@ -10136,7 +10776,7 @@ def _cli_main():
         _sentry_init(sentryid)
 
     try:
-        opts,args=getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILC:FSN:ox:DP:RyKXt:T:",["help"])
+        opts,args=getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILC:FSN:ox:DP:RyKXt:T:",["help","rebuild"])
     except getopt.GetoptError as err:
         print(err); usage(); sys.exit(2)
     if args:
@@ -10184,6 +10824,9 @@ def _cli_main():
 
     options={}; nick=socket.gethostname()
     for opt,arg in opts:
+        if opt=='--rebuild':   # seule option longue de commande (1.0.143) : Index seulement
+            if cmd!='index': printer("--rebuild : réservé à Index"); usage(cmd)
+            options[opt]=arg; continue
         if opt[1] not in optab[cmd]:
             printer("step2"+opt[1]); usage(cmd)
         else:
@@ -10290,10 +10933,11 @@ def _cli_main():
         bh.cache_clean(nick,debug=debug)
     elif cmd=='index':
         _force='-F' in options; _snaponly='-S' in options; _target=options.get('-A',None)
+        _rebuild='--rebuild' in options   # 1.0.143 : fantôme (-F : jeté, reprise de zéro)
         # Tranche (1.0.141, AD-3) : -t budget, -T natures, -b/-B période ; jamais avec -F/-S/-A.
-        _tranche=any(o in options for o in ('-t','-T','-b','-B'))
-        if _tranche and (_force or _snaponly or _target is not None):
-            printer("Index : -t/-T/-b/-B (tranche) incompatibles avec -F, -S et -A"); usage(cmd)
+        _tranche=_rebuild or any(o in options for o in ('-t','-T','-b','-B'))
+        if _tranche and (_snaponly or _target is not None or (_force and not _rebuild)):
+            printer("Index : -t/-T/-b/-B/--rebuild (tranche) incompatibles avec -S et -A, et avec -F sauf --rebuild -F"); usage(cmd)
         _budget=_parse_duration(options['-t']) if '-t' in options else None
         if '-t' in options and _budget is None:
             printer(f"Index : durée -t invalide : {options['-t']!r} (ex. 90, 90s, 5m, 1h)"); usage(cmd)
@@ -10304,10 +10948,13 @@ def _cli_main():
                 printer(f"Index : -T invalide : {options['-T']!r} (parmi stats,snap,diff)"); usage(cmd)
         _period=(options.get('-b'),options.get('-B')) if ('-b' in options or '-B' in options) else None
         if _tranche: _lower_priority()   # AD-4 : nice 10 + ionice idle, hérités par borg
+        _irc=0
         for n in nick.split(','):
             if _snaponly: bh.index(n,debug=debug,force=_force,snap_only=True)   # même verrou et même pause (1.0.141)
-            elif _tranche: bh.index(n,debug=debug,budget=_budget,natures=_natures,period=_period)   # budget par nick
+            elif _tranche:   # budget par nick
+                if bh.index(n,debug=debug,budget=_budget,natures=_natures,period=_period,rebuild=_rebuild,force=_force)==3: _irc=3
             else: bh.index(n,debug=debug,force=_force,target_archive=_target)
+        if _irc: sys.exit(_irc)   # --rebuild refusé (DB_NAME partagé, espace, migration de chiffrement)
     elif cmd=='search':
         if '-f' not in options: usage(cmd)
         bh.search(nick,options['-f'],archive_from=options.get('-b',None),archive_to=options.get('-B',None),debug=debug,as_json=('-j' in options))

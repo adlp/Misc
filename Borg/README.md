@@ -591,6 +591,7 @@ borgHelper -c Index -n mon-serveur -S -F     # force le snapshot seul (borg list
 borgHelper -c Index -n mon-serveur -A <archive>  # indexe uniquement la paire terminant par <archive>
 borgHelper -c Index -n ALL -t 1m             # tranche d'une minute par nick (cron)
 borgHelper -c Index -n mon-serveur -T diff -b 2026-09-01   # diffs seuls, archives depuis le 1er septembre
+borgHelper -c Index -n mon-serveur --rebuild -t 20m        # reconstruction dans un fichier fantôme (1.0.143)
 ```
 
 | Option | Description |
@@ -600,6 +601,7 @@ borgHelper -c Index -n mon-serveur -T diff -b 2026-09-01   # diffs seuls, archiv
 | `-A <archive>` | Restreint l'indexation à la paire dont `archive_new` correspond à `<archive>` |
 | `-t <durée>` | Tranche (1.0.141) : budget par nick — `90`, `90s`, `5m`, `1h` |
 | `-T <natures>` | Tranche : parmi `stats,snap,diff` (défaut : les trois) |
+| `--rebuild` | Reconstruction dans un fichier fantôme (1.0.143) : tranche qui crée ou poursuit `<diff.db>.rebuild` ; avec `-F`, repart de zéro |
 | `-b` / `-B` | Tranche : période — nom d'archive, date `AAAA-MM-JJ[THH:MM:SS]` (borne haute : toute la journée incluse) ou `ALL` (sans borne) ; toute autre valeur est refusée — restreint stats et diffs |
 
 **Index par tranches** (borgHelper ≥ 1.0.141) : `-t`, `-T`, `-b` ou `-B` (jamais avec `-F`, `-S` ou `-A`)
@@ -610,6 +612,38 @@ le lancement suivant reprend. La tranche tourne en priorité basse (`nice` 10, `
 qui couvre le `borg list` du début de chaque tranche plus un `borg info` ou un `borg diff` de deux archives
 consécutives, sinon rien n'aboutit (un avertissement le signale). L'avancement (`partielle` / `terminée`, paires,
 statistiques, snapshot) s'affiche en fin de tranche et dans `Status`. `-S` passe aussi par le verrou et la pause.
+
+**Reconstruction dans un fichier fantôme** (borgHelper ≥ 1.0.143) : `Index --rebuild` reconstruit la base d'un nick
+dans `<conf>-<nick>-diff.db.rebuild` (même `CACHE_DIR`, `0600`) pendant que l'ancienne base reste servie — CLI et
+borgHelperWWW continuent de lire l'ancienne, sans changement. Il lance une première tranche (`-t` facultatif) ; ensuite,
+toute tranche (`Index` avec `-t`, `-T`, `-b` ou `-B`, comme la ligne cron conseillée `Index -n ALL -t 20m`) fait d'abord l'incrémental de la base servie, puis avance le
+fantôme avec le budget restant, dans le même ordre (statistiques, snapshot, diffs récents d'abord). Quand il est
+complet, il remplace la base servie d'un coup, après avoir vérifié par un `borg list` que rien n'est arrivé entre-temps.
+Un Bkp, Restore, Prune ou Report met la reconstruction en pause comme tout Index ; pendant la bascule, il l'annule
+(base servie intacte, fantôme gardé, nouvel essai à la tranche suivante). L'Index sans option et celui de fin de Bkp ne
+touchent jamais au fantôme : une ligne cron `Index` **sans option** ne fait pas avancer la reconstruction.
+
+```bash
+borgHelper -c Index -n mon-serveur --rebuild -t 20m   # démarre (ou poursuit)
+# cron existant, inchangé : 0 * * * * borgHelper -c Index -n ALL -t 20m   -> poursuit puis bascule
+borgHelper -c Index -n mon-serveur --rebuild -F       # jette le fantôme et repart de zéro
+borgHelper -c Status -n mon-serveur                   # « Reconstruction (fantôme) en cours : 3/6 paires… »
+```
+
+- Refusé (code 3, rien créé) : moins de 2,2 × la taille de la base servie de libre (le fantôme, puis le WAL de la
+  bascule), `diff.db` partagée entre plusieurs nicks par `DB_NAME` (la supprimer puis relancer `Index`), base en cours
+  de `DbEncrypt`/`DbDecrypt`, base servie ou son en-tête illisible. Pendant une tranche ordinaire, le même refus laisse
+  la base servie avancer et affiche « reconstruction suspendue ».
+- `borg list` vide (`GLOB_ARCH` erroné, dépôt vidé) : le fantôme n'est ni avancé ni basculé.
+- Base chiffrée : le fantôme reprend l'en-tête de la base servie (même clé). Un `DbEncrypt`/`DbDecrypt`/`DbRekey`
+  lancé entre deux tranches fait jeter le fantôme, qui repart de zéro.
+- `IDX_EXCLUDE`/`IDX_INCLUDE` : déjà appliqués par `Index` ; la purge d'`IdxPurge` passe aussi sur le fantôme juste
+  avant la bascule (lignes indexées avant un changement de motif).
+- Abandonner : hors de tout `Index` en cours, supprimer `<diff.db>.rebuild` et ses `-wal`/`-shm` (jamais servis) ; un
+  fantôme supprimé pendant une tranche est abandonné par celle-ci. Base servie absente : `--rebuild` la construit
+  directement, sans fantôme.
+- La base reconstruite ne garde que le snapshot de la dernière archive, comme un `Index` complet : les snapshots
+  d'archives plus anciennes (gardés jusqu'à `IDX_SNAP_KEEP`) ne sont pas refaits. `history.db` (mesures) n'est jamais touchée.
 
 **`DIFF_KEEP`** (corrigé en 1.0.141, pour tout Index) : seules les N paires les plus récentes sont calculées et gardées.
 Avant, chaque Index recalculait les paires purgées au précédent, et la paire gardée changeait d'un Index à l'autre.
@@ -912,7 +946,7 @@ borgHelper -c Status -n ALL -j               # tous les nicks configurés, JSON
 | Option | Description |
 |--------|-------------|
 | `-n <nick1,nick2>` / `-n ALL` | Un ou plusieurs nicks nativement (contrairement à `RepoHistory`/`ArchiveHistory` qui rejettent le multi-nick) — c'est le cas d'usage principal de `Status` |
-| `-j` | Sortie JSON — toujours une **liste**, même à un seul nick : `[{nick,last_backup,bkp_running,priority_op_running,build}, ...]` |
+| `-j` | Sortie JSON — toujours une **liste**, même à un seul nick : `[{nick,last_backup,bkp_running,priority_op_running,build,rebuild}, ...]` — `rebuild` (1.0.143) : état du fichier fantôme (`build_state`), `null` sans reconstruction |
 
 Par nick :
 - **Dernier backup connu** : archive + date depuis `archive_stats` (déjà indexée localement) + âge

@@ -1,5 +1,32 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.143 — reconstruction dans un fichier fantôme — 2026-09-28
+
+Chantier « reconstruction progressive », story 6 (spine AD-1, AD-2, AD-3, AD-5, AD-6).
+
+- **`Index --rebuild`** : reconstruit `diff.db` dans `<diff.db>.rebuild` pendant que l'ancienne base reste servie
+  (explorateur, recherche, rapports, borgHelperWWW inchangés). Les tranches suivantes (`Index -t …`, la ligne cron)
+  font d'abord l'incrémental de la base servie, puis avancent le fantôme avec le budget restant. Complet, il remplace
+  la base servie d'un coup (`_swap_db`, API backup de SQLite). `--rebuild -F` repart de zéro ; abandon = supprimer le
+  fichier `.rebuild`, jamais servi. Base servie absente : construction directe.
+- Bascule seulement si un `borg list` frais rend la même liste que la tranche (archive d'un outil externe arrivée
+  entre-temps : reportée, rattrapée à la tranche suivante). Opération prioritaire, écriture d'un autre processus ou
+  verrou pendant la copie : bascule annulée, base servie intacte, **fantôme gardé** (`_swap_db(keep_new=True)`).
+- Chiffrement : l'en-tête de la base servie est recopié tel quel (même DEK), son empreinte notée ; un
+  `DbEncrypt`/`DbDecrypt`/`DbRekey` passé entre deux tranches fait jeter le fantôme, qui est refait.
+- Refus (code 3, rien créé) : espace libre < 2,2 × la base servie, `diff.db` partagée par `DB_NAME`, base en migration
+  de chiffrement.
+- `IDX_EXCLUDE`/`IDX_INCLUDE` : `Index` les applique déjà à l'écriture ; juste avant la bascule, la purge d'`IdxPurge`
+  passe aussi sur le fantôme (`idxpurge(db_path=)`) pour les lignes indexées avant un changement de motif.
+- Le fantôme n'écrit jamais dans `history.db` (ni figeage de graphique, ni retrait de mesures, ni point de taille).
+- `Status` : état du fantôme par nick (texte et champ `rebuild` de `-j`).
+- Kill -9 à tout moment : base servie intacte, la tranche suivante reprend (unités finies jamais refaites).
+- Garde-fous (revue) : `borg list` vide -> fantôme ni avancé ni basculé ; fantôme supprimé pendant une tranche ->
+  abandonné ; `-F` ne jette le fantôme que si la création est possible ; `-wal`/`-shm` orphelins supprimés avant la
+  création ; base servie illisible -> refus sans jeter le fantôme ; tranche ordinaire refusée -> « reconstruction
+  suspendue ».
+- Limite : la base reconstruite ne garde que le snapshot de la dernière archive, comme un Index complet.
+
 ## borgHelper 1.0.142 / borgHelperWWW 1.27.9 — dépôts borg externes — 2026-09-28
 
 Chantier « reconstruction progressive », story 5 (spine AD-11, AD-12, AD-13, AD-14).

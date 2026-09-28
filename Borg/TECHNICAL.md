@@ -603,12 +603,56 @@ build_state (db_meta, clé 'build_state:<nick>', JSON) : {state: partial|complet
   option aussi ; `_diff_keep_purge(archives=)` garde exactement ces paires (sans liste : date d'archive puis nom).
   Avant, chaque Index re-diffait les paires purgées et la purge (tri `indexed_at`, à la seconde) gardait la paire
   indexée en dernier : la paire gardée changeait d'un Index à l'autre.
-- Le moteur reçoit `db_path` comme cible (AD-1) : la story 6 lui passera le fichier fantôme.
+- Le moteur reçoit `db_path` comme cible (AD-1) : la base servie, ou le fichier fantôme (1.0.143, ci-dessous).
 - Période : `_period_bounds` accepte un nom d'archive de la liste, une date `AAAA-MM-JJ[THH:MM:SS]` ou `ALL` ; toute
   autre valeur ou une période inversée -> erreur (retour 1), jamais une comparaison de chaînes silencieuse.
 - `-S` (`index(snap_only=True)`) et `-F` passent par le même tour et la même pause ; `plan['done']` garde les paires
   recalculées dans l'appel : une reprise après pause ne les refait pas, même avec `-F`.
 - `BorgRunner._stop` / `_kills` sont propres à chaque thread (`threading.local`).
+
+### Reconstruction dans un fichier fantôme (1.0.143, story 6, AD-2/AD-3/AD-5/AD-6)
+
+`index(nick, rebuild=True)` (CLI `--rebuild`) est une tranche qui crée ou poursuit `<diff.db>.rebuild`. Toute tranche
+poursuit un fantôme existant ; l'Index sans option et l'Index ciblé de fin de Bkp ne le touchent jamais.
+
+```
+index() : tour exclusif (index-running.lock)
+    → _shadow_prepare(create=rebuild, force=-F)      une fois par appel, sous le verrou
+    → passe : borg list → rapprochement + tranche de la base servie (plan['done'])
+            → s'il reste du budget : _index_shadow
+                  rapprochement du fantôme (purge seule) → tranche sur le fantôme (plan['sdone'], ensembles distincts)
+                  → build_state du fantôme 'complete' → _shadow_swap
+_shadow_swap : purge IDX_* (idxpurge(db_path=fantôme) — Index filtre déjà à l'écriture ; rattrape un motif changé) → borg list frais == liste de la passe
+             → empreinte d'en-tête inchangée → libre ≥ 1,1 × fantôme → data_version relevé sur la base servie
+             → _swap_db(live, fantôme, keep_new=True, abort=opération prioritaire, changed=data_version changé)
+```
+
+- **Création** (`_shadow_prepare`) : refus (retour 3, message) si `DB_NAME` partagé (un autre nick du rc a le même
+  fichier : le fantôme ne contiendrait que ce nick), base servie en `migrating`, libre < `_SHADOW_SPACE_MARGIN` (2,2) ×
+  base servie. Sinon `ensure_diff_db`, puis dans une transaction : `enc_header` brut de la base servie (aucun si plain)
+  et `rebuild_header_fp` (`sha256` de l'en-tête brut, ou `plain`). Un fichier sans empreinte est une création tuée :
+  jeté puis recréé. Empreinte différente de celle de la base servie (DbEncrypt/DbDecrypt/DbRekey passé) : jeté puis
+  recréé ; à la bascule, pas de bascule et la tranche suivante le jette. Refus pendant une tranche ordinaire : la base
+  servie est traitée, sans fantôme ; seul `--rebuild` en fait une erreur (code 3 en CLI).
+- **Un seul écrivain par fichier** : Bkp, Prune, DelBkp, IdxPurge et les lecteurs ne voient que la base servie. Le
+  fantôme n'écrit jamais `history.db` (`_is_shadow` : `_reconcile_archives` ne fige rien et ne retire aucune mesure,
+  `_diff_keep_purge` ne fige rien, `_refresh_repo_point` ne relève rien). `_history_path_for` d'un fantôme rend la
+  `history.db` de sa base.
+- **Rattrapage** : une opération prioritaire met la tranche en pause (story 4) ; la passe suivante repart d'un `borg
+  list` frais, donc l'archive d'un Bkp entre dans le fantôme avant toute bascule. Les archives d'un outil externe
+  arrivent sans verrou : le `borg list` final les voit (bascule reportée).
+- **Bascule** : `_swap_db(..., keep_new=True)` garde le fantôme sur `abort`/`changed`/`busy`/erreur et ne le supprime
+  qu'après `ok` ou `invalid`. `abort` → la passe rend `'interrupted'` (pause puis nouvelle passe, qui rebascule).
+  Réussie : `rebuild_header_fp` retiré de la base servie. Kill -9 pendant la copie : transaction non validée, base
+  servie intacte, fantôme reprenable.
+- Garde-fous (revue) : `borg list` vide -> fantôme ni avancé ni basculé ; fantôme supprimé pendant l'appel -> abandonné
+  (jamais recréé par `ensure_diff_db` en passant) ; fichier vide ou sans schéma (ouverture concurrente) -> jeté sans être
+  recréé hors `--rebuild` ; `-F` ne jette le fantôme que si la création est possible ; `-wal`/`-shm` orphelins supprimés
+  avant la création ; purge `IDX_*` après les contrôles bon marché (liste, empreinte).
+- Snapshots : le fantôme n'a que celui de la dernière archive (comme un Index complet) ; les snapshots plus anciens de la
+  base servie (`IDX_SNAP_KEEP`) sont perdus à la bascule (report : deferred-work).
+- `Status` : `rebuild` = `build_state` du fantôme lu dans son `db_meta` (sans codec), `{'state':'partial'}` avant la
+  première fin de tranche, `null` sans fantôme.
 
 ### `IndexSnap` (snapshot de la dernière archive)
 
@@ -883,7 +927,8 @@ faisait `sys.exit(1)`. Appelé par le watcher de borgHelperWWW, ce `SystemExit` 
 Contrôle `CodecSelfTest` dédié (base `delete` + écrivain actif : le `PRAGMA` brut échoue, `ensure_diff_db` passe).
 
 **Bascule `_swap_db` (1.0.138).** Remplacer une base servie par un autre fichier passe par une seule fonction,
-`_swap_db(live, new, nick, abort, changed)`, qui utilise l'API backup de SQLite : le contenu de `new` est recopié par
+`_swap_db(live, new, nick, abort, changed, keep_new=False)` (`keep_new`, 1.0.143 : fantôme gardé si la copie est
+annulée), qui utilise l'API backup de SQLite : le contenu de `new` est recopié par
 tranches de pages dans `live`, puis `wal_checkpoint(TRUNCATE)`, et `new` est supprimé. Mesures qui ont fixé ce choix
 (SQLite 3.37.2, 4 lecteurs dont 2 persistants, 1 écrivain, WAL servi non vide) :
 
@@ -2988,7 +3033,8 @@ En texte, l'opération prioritaire n'est **jamais affichée si un Bkp est aussi 
 puisque c'est le Bkp lui-même qui tient ce lock. En JSON (`-j`), `priority_op_running` reste le
 booléen **brut** de `check_priority_lock(nick)`, indépendamment de `bkp_running` — c'est au
 consommateur machine de corréler les deux s'il le souhaite ; la sortie JSON est toujours une **liste**
-`[{nick,last_backup,bkp_running,priority_op_running}, ...]`, même à un seul nick, pour une forme
+`[{nick,last_backup,bkp_running,priority_op_running,build,rebuild}, ...]` (`build` 1.0.141, `rebuild` 1.0.143 : état du
+fantôme, `null` sans reconstruction), même à un seul nick, pour une forme
 homogène (contrairement à `RepoHistory`/`ArchiveHistory`, qui renvoient un objet unique et rejettent
 le multi-nick).
 
