@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.149"
+Version="1.0.150"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -1266,13 +1266,13 @@ def _db_open_fail(db_path,e):
     """Diagnostic + sys.exit(1) sur échec d'ouverture ; à appeler par les créateurs de base."""
     parent=os.path.dirname(os.path.abspath(db_path))
     if not os.path.exists(parent):
-        printer(f"DB : répertoire introuvable : {parent}")
+        printer(f"[ERREUR] DB : répertoire introuvable : {parent}")
     elif not os.access(parent,os.W_OK):
-        printer(f"DB : permission refusée sur le répertoire : {parent}")
+        printer(f"[ERREUR] DB : permission refusée sur le répertoire : {parent}")
     elif os.path.exists(db_path) and not os.access(db_path,os.R_OK|os.W_OK):
-        printer(f"DB : fichier inaccessible : {db_path}")
+        printer(f"[ERREUR] DB : fichier inaccessible : {db_path}")
     else:
-        printer(f"DB : impossible d'ouvrir {db_path}")
+        printer(f"[ERREUR] DB : impossible d'ouvrir {db_path}")
         printer(f"  -> {e}")
     sys.exit(1)
 
@@ -1284,15 +1284,15 @@ def _db_schema_fail(db_path,e,what,regenerable=True):
     """Diagnostic + sys.exit(1) des ensure_*_db. Un verrou n'est JAMAIS présenté comme une corruption :
     conseiller de supprimer diff.db sur un simple « database is locked » ferait perdre l'historique."""
     if _db_busy(e):
-        printer(f"DB occupée : {db_path}")
+        printer(f"[ERREUR] DB occupée : {db_path}")
         printer(f"  -> {e}")
         printer("  Un autre processus tient un verrou sur la base : réessayer plus tard (ne PAS supprimer le fichier).")
     elif not regenerable:
-        printer(f"DB corrompue : {db_path}")
+        printer(f"[ERREUR] DB corrompue : {db_path}")
         printer(f"  -> {e}")
         printer(f"  {what} : données NON régénérables — restaurer le fichier depuis une sauvegarde plutôt que le supprimer.")
     else:
-        printer(f"DB corrompue : {db_path}")
+        printer(f"[ERREUR] DB corrompue : {db_path}")
         printer(f"  -> {e}")
         printer(f"  Supprimez le fichier et relancez pour reconstruire {what}.")
     sys.exit(1)
@@ -4898,7 +4898,8 @@ class BorgHelper:
     def _record_index_last(self,nick,started,mark,code,exc=None):
         """Résultat du dernier Index de ce nick (1.0.149, story 12 A4), écrit par la CLI après index() : issue (ok, error,
         refused, busy, deadline), code, origine (via=http si borgHelperWWW l'a lancé, BORGHELPER_VIA), message (exception,
-        texte de sys.exit, ou dernières lignes affichées depuis `mark`). SystemExit : issue selon son code, comme la sortie
+        texte de sys.exit, ou lignes affichées depuis `mark` : pour un échec ou un refus, la dernière [ERREUR] et son détail
+        indenté (1.0.150), sinon les dernières lignes sans [WARN]). SystemExit : issue selon son code, comme la sortie
         du processus. busy/deadline reportent l'échec précédent (last_failure) : « ⚠ » jusqu'au prochain ok. Échec
         d'écriture : avertissement seulement."""
         out=getattr(self,'_index_outcome',{}).pop(nick,None)
@@ -4914,9 +4915,14 @@ class BorgHelper:
         else: outcome='ok' if code==0 else 'refused' if code==3 else 'error'
         if outcome!='ok' and not msg:
             seen=_print_since(mark)
-            errs=[l for l in seen if '[ERREUR]' in l] if outcome in ('error','refused') else []
-            lines=errs or [l for l in seen if l.startswith(f"{nick}:") or '[WARN]' in l] or seen
-            msg=' | '.join(l.strip() for l in lines[-3:])
+            if outcome in ('error','refused'):   # 1.0.150 (story 13) : dernière [ERREUR] + son détail indenté (2 lignes)
+                k=max((i for i,l in enumerate(seen) if l.lstrip().startswith('[ERREUR]')),default=None)
+                if k is not None: lines=[seen[k]]+list(itertools.takewhile(lambda l: l[:1].isspace(),seen[k+1:k+3]))
+                else:   # sans [ERREUR] : lignes non vides sans [WARN], celles du nick d'abord, sinon toutes
+                    cand=[l for l in seen if l.strip() and '[WARN]' not in l]
+                    lines=([l for l in cand if l.startswith(f"{nick}:")] or cand or seen)[-3:]
+            else: lines=([l for l in seen if l.startswith(f"{nick}:") or '[WARN]' in l] or seen)[-3:]
+            msg=' | '.join(l.strip() for l in lines)
         rec={'nick':nick,'started_at':started,'finished_at':_iso_now(),'outcome':outcome,'code':code,
              'via':'http' if os.environ.get('BORGHELPER_VIA')=='http' else 'cli','message':msg[:500]}
         try:
@@ -4977,7 +4983,7 @@ class BorgHelper:
         try:
             self.borg._boex_check_stdout(rb,nick,'borg list')
         except RuntimeError as e:
-            printer(f"{nick}: {e}"); return 1
+            printer(f"[ERREUR] {nick}: {e}"); return 1
         archives=rb['stdout'][0]['archives']
         # Rapprochement (1.0.140, AD-9) : archives supprimées hors borgHelper retirées, sur la liste déjà obtenue.
         names=[a['name'] for a in archives]
@@ -4991,7 +4997,7 @@ class BorgHelper:
         if cp=='deadline': return self._index_finish(nick,db_path,archives,keep,tranche,noidx)
         try: lo,hi=self._period_bounds(plan['period'],archives)
         except ValueError as e:
-            printer(f"{nick}: {e}"); return 1
+            printer(f"[ERREUR] {nick}: {e}"); return 1
         if plan['snap_only']:
             r=self._index_snap(nick,debug,db_path,force,archives,stop,deadline)
             return r if r=='interrupted' else self._index_finish(nick,db_path,archives,keep,False,noidx)
@@ -5375,8 +5381,9 @@ class BorgHelper:
                 self._shadow_discard(sp); printer(f"{nick}: base servie absente — fantôme jeté")
             if create: printer(f"{nick}: base servie absente — construction directe, sans fantôme")
             return None,None
+        tag='[ERREUR] ' if create else ''   # 1.0.150 : erreur seulement pour --rebuild (code 3) ; une tranche continue
         def _refuse(msg):
-            printer(f"{nick}: {msg}")
+            printer(f"{tag}{nick}: {msg}")
             if exists: printer(f"{nick}: fantôme gardé, sans être avancé")
             return None,3
         if not _db_has_schema(live): return _refuse("base servie illisible (verrou ou corruption) — pas de reconstruction")
@@ -5413,7 +5420,7 @@ class BorgHelper:
                 c.commit()
             finally: c.close()
         except sqlite3.Error as e:
-            self._shadow_discard(sp); printer(f"{nick}: fantôme non créé ({e})"); return None,3
+            self._shadow_discard(sp); printer(f"{tag}{nick}: fantôme non créé ({e})"); return None,3
         printer(f"{nick}: reconstruction dans un fichier fantôme — la base actuelle reste servie jusqu'à la bascule")
         return sp,None
 
@@ -10211,8 +10218,37 @@ def codec_selftest(pattern=None,list_only=False):
             sx={}
             for k,e in (('3',SystemExit(3)),('txt',SystemExit('texte-s12')),('0',SystemExit(0))):
                 b._record_index_last(nk,'2026-01-01T00:00:00',_print_mark(),1,e); sx[k]=last()
-            m=_print_mark(); _q_run(printer,"DB occupée : s12 — ne PAS supprimer le fichier")
+            m=_print_mark(); _q_run(_db_schema_fail,os.path.join(tmp,'s13.db'),sqlite3.OperationalError('database is locked'),'test')
             b._record_index_last(nk,'2026-01-01T00:00:00',m,1,SystemExit(1)); sx['db']=last()
+            # 1.0.150 (story 13) : erreurs marquées [ERREUR] ; message = dernière [ERREUR] + détail indenté, jamais un [WARN]
+            s13={}
+            m=_print_mark(); _q_run(printer,f"[WARN] {nk}: bruit-s13"); _q_run(b.index,nk,period=('inconnue',None))
+            b._record_index_last(nk,'2026-01-01T00:00:00',m,1); s13['période']=last().get('message','')
+            m=_print_mark()
+            with mock.patch.object(b.borg,'boex',return_value={'exitcode':2,'stdout':[],'stderr':['s13-boom']}): _q_run(b.index,nk)
+            b._record_index_last(nk,'2026-01-01T00:00:00',m,1); s13['borg list']=last().get('message','')
+            m=_print_mark()
+            for l in (f"[WARN] {nk}: w-s13",f"[ERREUR] {nk}: x-s13","  -> détail-s13",f"{nk}: suite-s13"): _q_run(printer,l)
+            b._record_index_last(nk,'2026-01-01T00:00:00',m,1); s13['détail']=last().get('message','')
+            m=_print_mark()
+            for l in (f"[WARN] {nk}: w2-s13",f"{nk}: ligne-s13"): _q_run(printer,l)
+            b._record_index_last(nk,'2026-01-01T00:00:00',m,1); s13['repli']=last().get('message','')
+            def msg13(*ls):
+                m=_print_mark()
+                for l in ls: _q_run(printer,l)
+                b._record_index_last(nk,'2026-01-01T00:00:00',m,1); return last().get('message','')
+            s13['dernière']=msg13(f"[ERREUR] {nk}: première-s13",f"[ERREUR] {nk}: dernière-s13")
+            s13['limite']=msg13(f"[ERREUR] {nk}: e-s13","  -> d1","  -> d2","  -> d3")
+            s13['repli3']=msg13(f"[WARN] {nk}: w","  -> détail-warn",*(f"{nk}: l{i}" for i in range(1,5)),"")
+            s13['sans nick']=msg13(f"[WARN] {nk}: w","autre-s13")
+            s13['toutes']=msg13(f"[WARN] {nk}: seul-s13")
+            s13['citée']=msg13(f"[ERREUR] {nk}: vraie-s13",f"[WARN] {nk}: cite [ERREUR] x")
+            dbl={}
+            for k,f,a in (('corrompue',_db_schema_fail,(os.path.join(tmp,'s13c.db'),sqlite3.DatabaseError('file is not a database'),'t')),
+                          ('corrompue mesurée',_db_schema_fail,(os.path.join(tmp,'s13c.db'),sqlite3.DatabaseError('file is not a database'),'t',False)),
+                          ('répertoire',_db_open_fail,(os.path.join(tmp,'absent-s13','x.db'),sqlite3.OperationalError('x'))),
+                          ('ouverture',_db_open_fail,(os.path.join(tmp,'s13o.db'),sqlite3.OperationalError('x')))):
+                dbl[k]=(_q_run(f,*a).splitlines() or [''])[0]
             with mock.patch.object(BorgHelper,'index',side_effect=RuntimeError('boom-s12')), \
                  mock.patch.object(sys,'argv',[me,'-C',ctx['rc'],'-c','Index','-n',nk]):
                 raised=raises(RuntimeError,lambda: _q_run(_cli_main))
@@ -10256,11 +10292,22 @@ def codec_selftest(pattern=None,list_only=False):
                  and (ref.get('outcome'),ref.get('code'))==('refused',3)
                  and (sx['3'].get('outcome'),sx['3'].get('code'))==('refused',3)
                  and (sx['txt'].get('outcome'),sx['txt'].get('code'),sx['txt'].get('message'))==('error',1,'texte-s12')
-                 and (sx['0'].get('outcome'),sx['0'].get('code'))==('ok',0) and 'DB occupée' in sx['db'].get('message','')
+                 and (sx['0'].get('outcome'),sx['0'].get('code'))==('ok',0)
+                 and sx['db'].get('message','')==(f"[ERREUR] DB occupée : {os.path.join(tmp,'s13.db')} | -> database is locked | Un autre "
+                                                  "processus tient un verrou sur la base : réessayer plus tard (ne PAS supprimer le fichier).")
+                 and s13['période'].startswith(f"[ERREUR] {nk}: période : 'inconnue'") and 'bruit-s13' not in s13['période']
+                 and s13['borg list'].startswith(f"[ERREUR] {nk}: ") and s13['détail']==f"[ERREUR] {nk}: x-s13 | -> détail-s13"
+                 and s13['repli']==f"{nk}: ligne-s13" and s13['dernière']==f"[ERREUR] {nk}: dernière-s13"
+                 and s13['limite']==f"[ERREUR] {nk}: e-s13 | -> d1 | -> d2" and s13['repli3']==f"{nk}: l2 | {nk}: l3 | {nk}: l4"
+                 and s13['sans nick']=="autre-s13" and s13['toutes']==f"[WARN] {nk}: seul-s13" and s13['citée']==f"[ERREUR] {nk}: vraie-s13"
+                 and 's13-boom' in s13['borg list'] and err.get('message','').startswith(f"[ERREUR] {nk}: période : 'inconnue'")
+                 and [dbl[k].split(' : ')[0] if ' : ' in dbl[k] else dbl[k] for k in ('corrompue','corrompue mesurée','répertoire')]
+                     ==['[ERREUR] DB corrompue','[ERREUR] DB corrompue','[ERREUR] DB']
+                 and dbl['ouverture'].startswith("[ERREUR] DB : impossible d'ouvrir ")
                  and raised and exc.get('outcome')=='error' and 'boom-s12' in exc.get('message','')
                  and wf==[True,True] and bad is None and gone and mode==0o600 and tr_ok and vac)
             if not res: print(f"  résultat d'Index : ok {ok} | err {err} | busy {busy} | ok2 {ok2} | multi {multi} | tour {turn} | "
-                              f"échéance {dl} | refus {ref} | sys.exit {sx} | exc {raised} {exc} | écriture ratée {wf} | "
+                              f"échéance {dl} | refus {ref} | sys.exit {sx} | marquage {s13} {dbl} | exc {raised} {exc} | écriture ratée {wf} | "
                               f"illisible {bad} | unlink {gone} | mode {oct(mode)} | troncature {tr} | vacuum {vac} {vo[-200:]!r}")
             return res
         def _ix_prune_waits():
@@ -10402,7 +10449,7 @@ def codec_selftest(pattern=None,list_only=False):
             check("DelBkp -> archive retirée des bases et du rapport sans nouvel Index",_ix_delbkp_reconcile)
             check("périmètre GLOB_ARCH : hors motif retirée sans toucher history.db ; disparue figée ; liste complète en échec -> reporté ; sans filtre -> un seul borg list",_sc_scope)
             check("borg arrêté à l'échéance -> _MEI* orphelin retiré ; celui d'un processus vivant (mappé) ou récent gardé",_ix_mei_purge)
-            check("résultat du dernier Index par nick : ok, erreur via HTTP, déjà en cours (échec reporté), plusieurs nicks, échéance, refus, sys.exit, exception, écriture ratée ; fichier illisible ; _unlink_db, _vacuum_db en échec",_ix_index_last)
+            check("résultat du dernier Index par nick : ok, erreur via HTTP, déjà en cours (échec reporté), plusieurs nicks, échéance, refus, sys.exit, exception, écriture ratée ; erreurs [ERREUR] reprises sans [WARN] ; fichier illisible ; _unlink_db, _vacuum_db en échec",_ix_index_last)
         # ── Reconstruction dans un fichier fantôme (1.0.143, story 6, AD-2/AD-5/AD-6) ──
         rb_ctx={}
         def _rb_ctx():
@@ -10760,15 +10807,20 @@ def codec_selftest(pattern=None,list_only=False):
             _q_run(b.index,'rbs1')
             c1,o1=cli('Index','-n','rbs1','--rebuild')
             il1=b.db.read_index_last('rbs1') or {}   # 1.0.149 (story 12) : refus enregistré
+            live1=b.db.get_diff_db('rbs1'); sp1=live1+_SHADOW_SUFFIX; shutil.copyfile(live1,sp1)   # fichier SQLite, pas un dépôt
+            try: o_tr=_q_run(b._shadow_prepare,'rbs1',live1,False); o_rb=_q_run(b._shadow_prepare,'rbs1',live1,True)
+            finally: BorgHelper._shadow_discard(sp1)
+            tag_ok=('rbs1: base partagée' in o_tr and '[ERREUR]' not in o_tr and '[ERREUR] rbs1: base partagée' in o_rb)
             sp=_rb_sp(b,'rb'); _q_run(b.index,'rb',rebuild=True,natures=['stats']); m0=os.path.getmtime(sp) if os.path.exists(sp) else None
             time.sleep(0.05)
             c2,o2=cli('Index','-n','rb','--rebuild','-F','-T','stats')
             c3,o3=cli('Index','-n','rb','-F','-t','1m')
             c4,o4=cli('Status','-n','rb','--rebuild')
-            ok=(c1==3 and 'DB_NAME' in o1 and (il1.get('outcome'),il1.get('code'))==('refused',3) and m0 is not None and c2==0 and 'jeté (-F)' in o2 and os.path.exists(sp)
+            ok=(c1==3 and 'DB_NAME' in o1 and (il1.get('outcome'),il1.get('code'))==('refused',3)
+                and il1.get('message','').startswith('[ERREUR] rbs1: base partagée') and tag_ok and m0 is not None and c2==0 and 'jeté (-F)' in o2 and os.path.exists(sp)
                 and c3!=0 and 'incompatibles' in o3 and c4!=0 and 'réservé à Index' in o4)
             BorgHelper._shadow_discard(sp)
-            if not ok: print(f"  CLI : {c1} {o1[-150:]!r} {il1} | {c2} {o2[-150:]!r} | {c3} {o3[-120:]!r} | {c4} {o4[-120:]!r}")
+            if not ok: print(f"  CLI : {c1} {o1[-150:]!r} {il1} {o_tr[-120:]!r} {o_rb[-120:]!r} | {c2} {o2[-150:]!r} | {c3} {o3[-120:]!r} | {c4} {o4[-120:]!r}")
             return ok
         def _rb_prune_during():
             """Archive supprimée (borg delete) et nouvelle archive pendant une reconstruction, DIFF_KEEP=2 : le fantôme

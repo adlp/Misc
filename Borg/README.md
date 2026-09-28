@@ -1031,7 +1031,7 @@ Sans `-x`, lit `IDX_EXCLUDE`/`IDX_INCLUDE` depuis la configuration du nick et pu
 Après suppression, `IdxPurge` recalcule `diff_indexed_pairs.entry_count` et compacte le fichier via `VACUUM INTO` (dans le même répertoire, évite les problèmes de `/tmp` plein). Si le compactage échoue ou est reporté, les entrées sont quand même supprimées (message `[WARN] compactage impossible` ou `[WARN] compactage reporté : <raison>`) ; relancer `IdxPurge` plus tard, ou la procédure manuelle de LIBRARY.md.
 
 Le compactage laisse la base en mode WAL (1.0.137) et ne remplace plus jamais le fichier sous les processus qui l'ont ouvert (1.0.138) : il est reporté, base intacte, si un Bkp/Restore/Prune est en cours ou démarre, si la base est modifiée pendant la copie, ou si elle reste verrouillée en écriture par un autre processus. Si une base est momentanément verrouillée par un autre processus,
-borgHelper affiche `DB occupée : … réessayer plus tard (ne PAS supprimer le fichier)`. Seul `DB corrompue : …` invite
+borgHelper affiche `[ERREUR] DB occupée : … réessayer plus tard (ne PAS supprimer le fichier)`. Seul `[ERREUR] DB corrompue : …` invite
 à supprimer le fichier pour reconstruire.
 
 > **Workflow recommandé :**  

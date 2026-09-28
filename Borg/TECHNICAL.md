@@ -906,10 +906,16 @@ passage dans `CACHE_DIR/<conf>-<nick>-index-last.json` (0600, fichier temporaire
   `error` ou `refused` n'en a pas. Le badge « ⚠ Index en échec » tient ainsi jusqu'au prochain `ok`.
 - `via` : `http` si `BORGHELPER_VIA=http` (posé par `_launch_bkp_detached` de borgHelperWWW pour `cmd='index'`
   seulement), sinon `cli`.
-- `message` : vide pour `ok` ; sinon le texte de l'exception (ou de `sys.exit`), ou les 3 dernières lignes affichées
-  depuis le début du nick — `[ERREUR]` d'abord (échec, refus), sinon celles commençant par `<nick>:` ou contenant
-  `[WARN]`, sinon toutes (« DB occupée … ») (file `_PRINT_TAIL` de `printer`, 200 lignes au plus, marque absolue `_print_mark` : la troncature de la file ne décale pas le début du nick), tronqué à
-  500 caractères.
+- `message` : vide pour `ok` ; sinon le texte de l'exception (ou de `sys.exit`), ou des lignes affichées depuis le
+  début du nick, tronqué à 500 caractères. Ces lignes viennent de la file `_PRINT_TAIL` de `printer` (200 lignes au
+  plus, marque absolue `_print_mark` : la troncature de la file ne décale pas le début du nick).
+  - Échec ou refus (1.0.150) : la dernière ligne qui commence par `[ERREUR]`, et jusqu'à 2 lignes de détail indentées
+    qui la suivent (`[ERREUR] DB occupée : … | -> database is locked | Un autre processus tient un verrou …`). Sans
+    `[ERREUR]` : les 3 dernières lignes non vides sans `[WARN]` (celles du nick d'abord), sinon toutes.
+  - `busy`/`deadline` : les 3 dernières commençant par `<nick>:` ou contenant `[WARN]`, sinon toutes.
+  - Erreurs marquées `[ERREUR]` depuis 1.0.150 : `borg list` en échec, période `-b`/`-B` invalide, refus `--rebuild`
+    (pas le même refus dans une tranche ordinaire, qui continue), première ligne des diagnostics de base
+    (`_db_open_fail`, `_db_schema_fail`) pour toutes les commandes.
 - Une exception d'`index()` (y compris `KeyboardInterrupt`) est écrite en `error` puis relancée. Une écriture ratée
   (disque, encodage : UTF-8 imposé) n'est qu'un `[WARN]`, jamais l'échec de l'Index. Un Index tué (SIGKILL) ne laisse
   que le résultat précédent.

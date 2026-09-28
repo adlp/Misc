@@ -1,5 +1,27 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.150 — erreurs d'Index marquées — 2026-09-28
+
+Chantier « reconstruction progressive », story 13 (rétrospective : A13 ; F23).
+
+- **Erreurs marquées `[ERREUR]`** (préfixe ajouté en tête de ligne, avec le suffixe de version sur stderr) :
+  - `Index` : `borg list` en échec et période `-b`/`-B` invalide (code 1) ; refus de `--rebuild` (code 3 : base
+    partagée, illisible, espace disque, migration, fantôme non créé). Le même refus dans une tranche ordinaire, qui
+    continue sur la base servie, reste un message simple ;
+  - toutes les commandes (décision de l'utilisateur) : première ligne des diagnostics de base, `[ERREUR] DB occupée :
+    …`, `[ERREUR] DB corrompue : …`, `[ERREUR] DB : …` (répertoire introuvable, permission, fichier inaccessible,
+    impossible d'ouvrir). Elle s'affiche aussi quand l'appelant continue en mode dégradé (purge DIFF_KEEP reportée,
+    lecture des mesures, DelBkp), et l'Index de fin de Bkp peut afficher `[ERREUR]` (`borg list` en échec) alors que le
+    Bkp sort en 0. Codes de sortie et issue inchangés ; seules les lignes gagnent le préfixe.
+- **Message du résultat d'Index** (`index_last.message`) : pour un échec ou un refus, la dernière ligne `[ERREUR]` et son
+  détail indenté (2 lignes au plus) ; sans `[ERREUR]`, les 3 dernières lignes non vides sans `[WARN]` (celles du nick
+  d'abord), sinon toutes. Avant, un avertissement sans
+  rapport pouvait passer en tête (« [WARN] int: GLOB_ARCH absent … | int: période : 'inconnue' … »), et une base
+  occupée pouvait donner un message sans l'erreur.
+- Tests : `CodecSelfTest` (période après un `[WARN]`, par la CLI et en direct ; `borg list` en échec ; dernière
+  `[ERREUR]` et 2 lignes de détail au plus ; repli ; base occupée, corrompue, impossible à ouvrir ; refus `--rebuild`
+  réel par la CLI, refus non marqué dans une tranche ordinaire).
+
 ## borgHelper 1.0.149 / borgHelperWWW 1.28.2 / UI 1.19.2 — résultat du dernier Index, suppression de base unifiée — 2026-09-28
 
 Chantier « reconstruction progressive », story 12 (rétrospective : A4, A6 ; F11, F3).
