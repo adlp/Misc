@@ -352,6 +352,10 @@ for row in pending:
 for row in pending:
     if bh.db.claim_bkp_status('mon-serveur', row['run_id'], db_path=db_path):
         print('réclamée :', row['run_id'])
+
+# Bkp en cours (1.0.145) : True (démarré depuis moins de timeout_s, sans fin), False (aucun, ou bloqué
+# au-delà), None (history.db illisible — ne jamais le prendre pour une fin de Bkp).
+state = bh.db.bkp_running_state('mon-serveur', timeout_s=21600)
 ```
 
 ### Consulter les fichiers exclus des filtres d'indexation
@@ -617,8 +621,8 @@ sys.exit(0)
 
 | Méthode | Description |
 |---------|-------------|
-| `backup(nick, no_index, debug)` | Lance `borg create` + indexation automatique (indexsnap + index ciblé sur la nouvelle archive) ; si un `Index` externe avait été interrompu, le relance en fin d'exécution ; écrit une ligne `bkp_status` (diff.db) à son début et à sa fin (`'success'`/`'error'` dérivé de `sys.exit()` — voir `bh.db.list_pending_bkp_status`/`claim_bkp_status` ci-dessous) |
-| `prune(nick, dryrun, debug)` | Attend qu'un Index se mette en pause (1.0.141), `borg prune` + compact + rapprochement (archives disparues figées puis retirées, 1.0.140) |
+| `backup(nick, no_index, debug)` | Lance `borg create` + indexation automatique (indexsnap + index ciblé sur la nouvelle archive) ; opération prioritaire : un `Index` externe se met en pause pendant le Bkp et reprend seul après l'Index de fin de Bkp (1.0.141) ; écrit une ligne `bkp_status` (history.db depuis 1.0.139) à son début et à sa fin (`'success'`/`'error'` dérivé de `sys.exit()` — voir `bh.db.list_pending_bkp_status`/`claim_bkp_status` ci-dessous) |
+| `prune(nick, dryrun, debug)` | Opération prioritaire : attend qu'un Index se mette en pause (1.0.141), `borg prune` + compact + rapprochement (archives disparues figées puis retirées, 1.0.140) |
 | `index(nick, debug, db_path, force, target_archive, set_pending, budget=None, natures=None, period=None, pause=True, snap_only=False, rebuild=False)` | Rapproche d'abord les bases de `borg list` (archives disparues retirées, 1.0.140), puis indexe. 1.0.141 : `budget` (s, > 0), `natures` (sous-ensemble non vide de `stats`,`snap`,`diff`) ou `period` (`(de, à)` : archive, date `AAAA-MM-JJ[THH:MM:SS]` ou `ALL`) → tranche (stats, snapshot, diffs du plus récent au plus ancien, reprenable, `build_state` écrit) ; `snap_only` : snapshot seul (`-S`). Tout Index prend un verrou exclusif par dépôt et se met en pause si Bkp/Restore/Prune/Report démarre, puis reprend seul — **changement de comportement** : sans budget, l'appel peut attendre sans limite la fin de l'opération prioritaire ; `pause=False` : arrêt immédiat comme avant (`index-pending` si `set_pending`, retour 1). Retour : 0 (fini, déjà en cours, échéance), 1 (erreur, période invalide, annulé) ; `ValueError` sur budget/natures invalides. N'abaisse jamais la priorité du processus appelant (seule la CLI le fait). 1.0.143 : `rebuild=True` → tranche qui crée ou poursuit le fichier fantôme `<db_path>.rebuild` (`force=True` : le jette d'abord) ; toute tranche poursuit un fantôme existant et bascule quand il est complet ; retour 3 si `rebuild` est refusé (`DB_NAME` partagé, espace disque, migration de chiffrement) |
 | `indexsnap(nick, debug, db_path, force, archives=None)` | Snapshot de la dernière archive — incrémental par défaut (force=True pour `borg list` complet) ; purge auto des snapshots anciens (IDX_SNAP_KEEP) ; `archives` (1.0.141) : liste `borg list` déjà obtenue ; retourne `'killed'` si son borg a été tué par une demande d'arrêt (rien d'écrit) |
 | `report(nicks, htrep, debug, maxp, as_json)` | Rapport avec appels borg |
@@ -635,7 +639,7 @@ sys.exit(0)
 | `listperms(nick, bid, ftor, debug)` | Liste droits fichiers sans restaurer |
 | `list_backups(nick, debug)` | Liste les archives |
 | `list_files(nick, bid, debug, as_json)` | Liste fichiers d'une archive — `as_json` : `{nick,archive,files:[chemin,...]}` |
-| `delbkp(nick, bid, debug)` | Supprime une archive |
+| `delbkp(nick, bid, debug)` | Supprime une archive : opération prioritaire (un Index se met en pause, 1.0.142), `borg delete` + compact, puis rapprochement des bases comme `prune` (1.0.145) ; termine par `sys.exit` |
 | `mount(nick, bid, debug)` | Monte via FUSE |
 | `umount(nick, debug)` | Démonte |
 | `key(nicks, debug)` | Exporte la clef |
@@ -679,9 +683,9 @@ sys.exit(0)
 | `store_excluded_diff_stats(nick, a_old, a_new, exclu, db_path)` | Stocke stats fichiers exclus d'une paire |
 | `store_excluded_snap_stats(nick, archive, count, size, db_path)` | Stocke stats fichiers exclus d'un snapshot |
 | `_with_lock_retry(fn, max_wait=300)` | Exécute `fn()`, retente toutes les 2 s si `OperationalError: database is locked`, jusqu'à `max_wait` secondes |
-| `set_priority_lock(nick)` | Pose le lock prioritaire (écrit le PID) — appelé par `Bkp`/`Restore` |
-| `clear_priority_lock(nick)` | Supprime le lock prioritaire |
-| `check_priority_lock(nick)` | `True` si un processus prioritaire vivant tient le lock (stale → auto-supprimé) |
+| `set_priority_lock(nick)` | Pose le lock prioritaire de CE processus (`<…>-priority.lock.<pid>`, 1.0.145) — appelé par `backup`/`restore`/`prune`/`delbkp` |
+| `clear_priority_lock(nick)` | Supprime le lock prioritaire de CE processus seulement (1.0.145 : ceux des autres porteurs restent) |
+| `check_priority_lock(nick)` | `True` si un AUTRE processus prioritaire vivant tient le lock (jamais le sien ; porteur mort → fichier retiré ; ancien fichier unique encore lu) |
 | `set_index_running_lock(nick)` | Pose le lock "Index actif" (écrasement, non exclusif) — `Index` utilise `acquire_index_running_lock` depuis 1.0.141 |
 | `acquire_index_running_lock(nick, wait=0)` | 1.0.141 — prise exclusive (un seul Index par dépôt), réentrante pour le même processus ; verrou d'un PID mort retiré ; `wait` : attente maximale en secondes |
 | `release_index_running_lock(nick)` / `index_running_owned(nick)` | 1.0.141 — relâche le verrou s'il est à ce processus / vrai s'il l'est |
@@ -693,4 +697,4 @@ sys.exit(0)
 | `clear_index_pending_lock(nick)` | Supprime le flag de reprise |
 | `check_index_pending_lock(nick)` | `True` si un `Index` interrompu attend d'être repris |
 
-> ⚠️ **Changement cassant (1.0.139)** : `store_archive_stats(...)` n'accepte plus `changed_during_backup=` / `read_errors=` (`TypeError`) — ces mesures passent par `store_archive_measure(...)` dans `history.db`. Les fonctions `bkp_status`/`repo_stats` (`store_bkp_status_*`, `list_pending_bkp_status*`, `claim_bkp_status*`, `bkp_running`, `get_running_bkp_status`, `store_repo_stats`, `get_repo_stats`) visent désormais la `history.db` du nick par défaut ; un `db_path` explicite doit être un chemin de `history.db`.
+> ⚠️ **Changement cassant (1.0.139)** : `store_archive_stats(...)` n'accepte plus `changed_during_backup=` / `read_errors=` (`TypeError`) — ces mesures passent par `store_archive_measure(...)` dans `history.db`. Les fonctions `bkp_status`/`repo_stats` (`store_bkp_status_*`, `list_pending_bkp_status*`, `claim_bkp_status*`, `bkp_running`, `bkp_running_state` (1.0.145), `get_running_bkp_status`, `store_repo_stats`, `get_repo_stats`) visent désormais la `history.db` du nick par défaut ; un `db_path` explicite doit être un chemin de `history.db`.

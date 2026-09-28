@@ -1,5 +1,43 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.145 / borgHelperWWW 1.28.1 / UI 1.19.1 — robustesse des verrous, de l'état et des codes de sortie — 2026-09-28
+
+Chantier « reconstruction progressive », story 8 (rétrospective : A3, R1 à R5, R9).
+
+- **Code de sortie d'`Index`** : la CLI sort avec le pire code rendu sur les nicks traités (1 = erreur : `borg list` en
+  échec, période refusée… ; 3 = `--rebuild` refusé), tranches et `-S` compris. Index déjà en cours, échéance ou pause :
+  0. Avant : 0 sauf pour le code 3, donc un cron ne voyait pas une tranche qui ne pouvait pas démarrer.
+- **`priority.lock` par processus** : chaque Bkp, Restore, Prune ou DelBkp tient son propre fichier
+  `<…>-priority.lock.<pid>`. Un Restore qui finit pendant un Bkp du même dépôt ne retire plus le verrou du Bkp :
+  l'Index en pause attend vraiment la fin du Bkp. Les fichiers de processus morts sont retirés à la lecture.
+  L'ancien fichier unique est encore lu (processus d'avant la mise à jour). L'API est inchangée. Un fichier dont le PID
+  a été repris par un processus plus récent (porteur tué par SIGKILL) compte comme mort.
+  **Mise à jour** : l'inverse n'est pas vrai — un processus d'avant 1.0.145 ne voit pas les nouveaux fichiers.
+  Mettre à jour hors de tout `Index` en cours et redémarrer borgHelperWWW (il lit l'état par borgHelper importé).
+- **Plus de `borg break-lock`** quand une opération prioritaire interrompt les diffs d'un Index. Il cassait aussi le
+  verrou d'un `borg create` externe, d'un `borg mount` ou d'un autre hôte. Les diffs sont maintenant arrêtés par
+  SIGTERM (borg rend son verrou), puis SIGKILL après 5 s, comme `boex`.
+- **`/tmp/_MEI*`** : un borg (binaire PyInstaller) arrêté par SIGKILL, ou par SIGTERM pendant son démarrage, laisse
+  environ 60 Mo dans `/tmp`. Ces répertoires orphelins sont maintenant retirés après tout arrêt de borg, y compris par
+  `boex` à l'échéance d'une tranche (depuis 1.0.141, ils s'accumulaient : un CodecSelfTest en laissait 2 Go).
+  « Orphelin » = à nous, inchangé depuis 2 min et utilisé par aucun processus d'après `/proc` (bibliothèques mappées,
+  répertoire courant, descripteurs). Avant, `fuser` seul jugeait, et un borg vivant lui semblait inutilisé : son
+  répertoire pouvait être supprimé.
+- CodecSelfTest : budget du contrôle « fantôme par tranches » porté de 3 à 6 s (3 s ne couvraient plus `borg list`,
+  le point de taille et une unité sur une machine chargée).
+- **DelBkp** : l'archive supprimée disparaît aussitôt des rapports, de l'historique et de l'explorateur
+  (rapprochement comme après Prune), sans attendre le prochain Index — sauf si une autre opération prioritaire tourne
+  sur le dépôt (reporté au prochain Index). Un rapprochement en échec n'est qu'un avertissement.
+- **`Status`** : une base chiffrée sans passphrase (ou en migration) affiche l'erreur sans perdre « Bkp en cours »,
+  la reconstruction et l'opération prioritaire, lisibles sans clé.
+- borgHelper : `BorgHelperDB.bkp_running_state(nick, timeout_s)` → `True` / `False` / `None` (lecture impossible) ;
+  `bkp_running` s'appuie dessus (une seule requête).
+- borgHelperWWW 1.28.1 : `/access` `bkp_running` vaut `true` seulement pour un Bkp démarré depuis moins de
+  `BKP_STATUS_TIMEOUT`. Un Bkp tué n'est plus affiché « en cours » pour toujours. `null` si la lecture échoue, jamais
+  pris pour une fin.
+- UI 1.19.1 : le Bkp lancé par ▶ Backup est suivi à part (`loadMachines` écrasait l'indication). Sa fin recharge la
+  carte une fois, y compris un Bkp fini avant la première relecture (au bout de 60 s).
+
 ## borgHelperWWW 1.28.0 / UI 1.19.0 / borgHelper 1.0.144 — état de construction et dépôts externes dans le web — 2026-09-28
 
 Chantier « reconstruction progressive », story 7 (spine AD-10, AD-12).

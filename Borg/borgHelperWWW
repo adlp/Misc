@@ -66,7 +66,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.28.0"
+WWW_VERSION="1.28.1"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -2517,10 +2517,14 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
             if cfg is not None: out.update(external=is_external(cfg),ops=allowed_ops(cfg,n))
         except SystemExit: out.update(external=None,ops=['read'])   # EXTERNAL invalide : les routes d'action refusent
         except Exception: pass
-        try:   # bkp_running None = inconnu (base illisible…) : l'UI n'y voit jamais une fin de Bkp
+        try:
             st=_bh_paths._status_one(n)
-            out.update(build=st.get('build'),rebuild=st.get('rebuild'),bkp_running=bool(st.get('bkp_running')))
+            out.update(build=st.get('build'),rebuild=st.get('rebuild'))
         except (Exception,SystemExit): pass
+        # 1.28.1 (story 8 R3) : Bkp en cours depuis moins de BKP_STATUS_TIMEOUT (au-delà : bloqué, le watcher le traite
+        # en échec) ; None = lecture impossible — l'UI n'y voit jamais une fin de Bkp.
+        try: out['bkp_running']=_bh_paths.db.bkp_running_state(n,BKP_STATUS_TIMEOUT)
+        except (Exception,SystemExit): out['bkp_running']=None
         return out
     if not GROUPS_HEADER:
         # Fonctionnalité désactivée : pas de restriction par nick ni de périmètre, seuls
@@ -3981,15 +3985,41 @@ def push_selftest():
                     inconnu (None), jamais « fini » ; EXTERNAL invalide -> external None, ops ['read']."""
                     st={'build':{'state':'partial','pairs_done':1,'pairs_total':3},'rebuild':{'state':'partial'},
                         'bkp_running':{'started_at':'2026-09-28T10:00:00'}}
-                    with mock.patch.object(_bh_paths,'_status_one',return_value=st):
+                    with mock.patch.object(_bh_paths,'_status_one',return_value=st), \
+                         mock.patch.object(_bh_paths.db,'bkp_running_state',return_value=True):
                         a=client.get(f"{P}/access",headers=H).json()['nicks'][_internal]
-                    with mock.patch.object(_bh_paths,'_status_one',side_effect=sqlite3.OperationalError('database is locked')):
+                    with mock.patch.object(_bh_paths,'_status_one',side_effect=sqlite3.OperationalError('database is locked')), \
+                         mock.patch.object(_bh_paths.db,'bkp_running_state',side_effect=sqlite3.OperationalError('database is locked')):
                         b=client.get(f"{P}/access",headers=H).json()['nicks'][_internal]
                     with mock.patch.object(_bh_paths.borg,'cfgread',side_effect=lambda n,*x,**k: _fake['xi'] if n==_internal else _orig_cfgread(n,*x,**k)):
                         c=client.get(f"{P}/access",headers=H).json()['nicks'][_internal]
                     return (a['bkp_running'] is True and a['build']==st['build'] and a['rebuild']==st['rebuild']
                             and b['bkp_running'] is None and b['build'] is None and c['external'] is None and c['ops']==['read'])
                 if _internal: check("/access : valeurs de Status relayées ; lecture en échec -> bkp_running inconnu ; EXTERNAL invalide -> ops read",_access_values)
+                def _access_bkp_timeout():
+                    """1.28.1 (story 8 R3), vraie history.db jetable : Bkp sans fin plus vieux que BKP_STATUS_TIMEOUT (tué)
+                    -> false ; récent -> true ; aucune ligne -> false ; base illisible -> null, jamais « fini »."""
+                    hp=os.path.join(tempfile.mkdtemp(prefix='bhw-s8-'),'h.db')
+                    db=_bh_paths.db; db.ensure_history_db(hp,create=True)
+                    def get():
+                        with mock.patch.object(db,'history_path',return_value=hp):
+                            return client.get(f"{P}/access",headers=H).json()['nicks'][_internal]['bkp_running']
+                    try:
+                        none=get()
+                        db.store_bkp_status_start(_internal,'s8-run',db_path=hp)
+                        fresh=get()
+                        c=sqlite3.connect(hp)
+                        c.execute(f"UPDATE bkp_status SET started_at=datetime('now','-{BKP_STATUS_TIMEOUT+60} seconds')"); c.commit(); c.close()
+                        stale=get()
+                        for f in (hp+'-wal',hp+'-shm'):
+                            with contextlib.suppress(OSError): os.unlink(f)
+                        with open(hp,'wb') as f: f.write(b'pas une base sqlite '*64)
+                        broken=get()
+                    finally: shutil.rmtree(os.path.dirname(hp),ignore_errors=True)
+                    ok=(none,fresh,stale,broken)==(False,True,False,None)
+                    if not ok: print(f"  /access bkp_running : aucune {none}, récent {fresh}, tué {stale}, illisible {broken}")
+                    return ok
+                if _internal: check("/access : Bkp tué (plus vieux que BKP_STATUS_TIMEOUT) -> false, récent -> true, base illisible -> null",_access_bkp_timeout)
                 def _index_async():
                     """POST /index asynchrone : lancement détaché (cmd index, options transmises), réponse immédiate ; nick inconnu 404."""
                     with mock.patch(f"{__name__}._launch_bkp_detached",return_value=4242) as launch:

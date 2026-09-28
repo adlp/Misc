@@ -27,9 +27,11 @@ borgHelper est structuré en trois couches :
 | `~/.cache/borghelper/<conf>-<nick>-cache.db` | Cache des appels `borg info/list` (SQLite) |
 | `~/.cache/borghelper/<conf>-<nick>-diff.db` | Index des diffs, snapshots et stats d'archives (SQLite) — entièrement régénérable depuis le dépôt (1.0.139) |
 | `~/.cache/borghelper/<conf>-<nick>-history.db` | Mesures NON régénérables (1.0.139) : `repo_stats`, `bkp_status`, `archive_measure`, `archive_chart` (1.0.140) — en clair, sans chemin ; **la seule base à sauvegarder** |
-| `~/.cache/borghelper/<conf>-<repo_sanitisé>-priority.lock` | Lock PID posé par `Bkp`/`Restore` — signal d'interruption pour `Index` sur le même dépôt |
-| `~/.cache/borghelper/<conf>-<repo_sanitisé>-index-running.lock` | Lock PID posé par `Index` pendant Phase 2 — `Bkp`/`Restore` attendent sa disparition avant `borg create`/`borg extract` |
-| `~/.cache/borghelper/<conf>-<nick>-index-pending.lock` | Flag (vide) posé par `Index` quand interrompu par `Bkp`/`Restore` — `Bkp` le détecte en fin d'exécution et relance `Index` complet automatiquement |
+| `~/.cache/borghelper/<conf>-<repo_sanitisé>-priority.lock.<pid>` | Verrou prioritaire (1.0.145) : un fichier par processus `Bkp`/`Restore`/`Prune`/`DelBkp` — signal d'interruption pour `Index` sur le même dépôt ; l'ancien fichier unique `…-priority.lock` (sans `.<pid>`) est encore lu, jamais plus écrit |
+| `~/.cache/borghelper/<conf>-<repo_sanitisé>-index-paused.lock` | Marqueur exclusif (1.0.141) : un seul `Index` en attente par dépôt |
+| `~/.cache/borghelper/<conf>-<repo_sanitisé>-report-running.lock` | Lock PID posé par `Report` — met aussi un `Index` en pause |
+| `~/.cache/borghelper/<conf>-<repo_sanitisé>-index-running.lock` | Lock PID exclusif tenu par `Index` pendant toutes ses phases (1.0.141) — `Bkp`/`Restore`/`Prune`/`DelBkp` attendent qu'il se mette en pause avant d'appeler borg |
+| `~/.cache/borghelper/<conf>-<nick>-index-pending.lock` | Flag (vide) posé par l'Index de fin de Bkp quand il est interrompu (`pause=False`), ou par un Index annulé — `Bkp` le détecte en fin d'exécution et relance `Index` complet ; depuis 1.0.141, un Index externe interrompu se met en pause et reprend seul |
 
 - `<conf>` = basename sanitisé du fichier de configuration (ex : `borghelperrc` pour `~/.borghelperrc`)
 - `<nick>` = identifiant du dépôt (ou valeur de `DB_NAME` si définie dans la section) — un fichier par dépôt
@@ -480,7 +482,7 @@ nécessaires au figeage au premier Index d'un dépôt).
 ### `Bkp` (indexation automatique)
 
 ```
-set_priority_lock(nick)                                  → <nick>-priority.lock (PID)
+set_priority_lock(nick)                                  → <repo>-priority.lock.<pid> (1.0.145)
     ↓
 borg create --json --stats --list --filter CE   (1.0.117 : --list limité aux statuts C/E)
     ↓
@@ -491,7 +493,7 @@ store_archive_stats(nick, archive_new, ...)              → diff.db archive_sta
 store_archive_measure(nick, archive_new, date, dédup, C, E) → history.db archive_measure (1.0.139)
 store_repo_stats(nick, 'bkp', ...)                       → history.db repo_stats
     ↓
-clear_priority_lock(nick)                                → priority.lock supprimé (Bkp terminé)
+clear_priority_lock(nick)                                → son fichier supprimé (Bkp terminé ; ceux des autres restent)
     ↓
 index(nick, target_archive=archive_new, set_pending=False) → borg diff réel de la nouvelle paire,
                                                            puis indexsnap (incrémental sur CE diff)
@@ -566,13 +568,15 @@ indexsnap() → voir flux IndexSnap ci-dessous
   `ALL_OPS`), `build`/`rebuild`/`bkp_running` (`BorgHelper._status_one` : SQLite local, jamais borg). `POST /index` :
   `_launch_bkp_detached(..., cmd='index')`, comme `/bkp`. UI 1.19.0 : `opAllowed`/`stateBadges`, `ACTIONS[].op`,
   relecture `/access` toutes les 30 s (`pollAccess`, sans chevauchement ; `bkp_running` `null` = inconnu, jamais
-  une fin) et `reloadMachineCard` à la fin d'un Bkp (▶ Backup marque le nick en cours : un Bkp de moins de 30 s est
-  vu). `borgHelperWWW_ui_test.js` exécute les vraies fonctions de la page (DOM et API simulés) : `opAllowed`,
+  une fin) et `reloadMachineCard` à la fin d'un Bkp. 1.28.1 / UI 1.19.1 (story 8 R3/R4) : `bkp_running` vient de
+  `BorgHelperDB.bkp_running_state(nick, BKP_STATUS_TIMEOUT)` (ligne sans fin plus vieille que le délai → `false`,
+  lecture impossible → `null`) ; ▶ Backup inscrit le nick dans `pendingBkp` (`{t, seen}`, hors de `myAccess` que
+  `loadMachines` remplace) : fin vue en cours puis finie, ou jamais vue en cours après 60 s → une seule recharge. `borgHelperWWW_ui_test.js` exécute les vraies fonctions de la page (DOM et API simulés) : `opAllowed`,
   `stateBadges`, `pollAccess`, `renderActionList` (+ `ACTIONS`), `_renderHistoryRows`, `machineCardHtml`,
   `reloadMachineCard`.
 - `prune()` rend `{'exitcode': 3}` (au lieu de `sys.exit`) pour un nick interne sans `GLOB_ARCH` ou sans aucune
   `KEEP_*` : la boucle `-n ALL` passe au nick suivant.
-- `Prune` : nick interne sans `GLOB_ARCH` refusé (code 3). `DelBkp` pose `priority.lock` et appelle `wait_index_idle`.
+- `Prune` : nick interne sans `GLOB_ARCH` refusé (code 3). `DelBkp` pose `priority.lock` et appelle `wait_index_idle` ; depuis 1.0.145, il rapproche ensuite les bases comme `Prune` (`_cleanup_index_after_prune`). CLI `Index` (1.0.145) : sort avec le pire code rendu par `index()` (1, 3). `Status` : `DbKeyError`/`DbModeError`/`DbTamperError` sur `diff.db` → `last_backup.error`, `build: null`, le reste lu.
 - `Stats`/`Mount`/`UMount` : `MOUNTPOINT` lu par `cfg.get`, message si absent.
 
 ### `Index` par tranches (1.0.141, story 4, AD-1/AD-3/AD-10)
@@ -603,8 +607,9 @@ build_state (db_meta, clé 'build_state:<nick>', JSON) : {state: partial|complet
 
 - Échéance vérifiée entre deux unités et entre les phases SQL (rapprochement, purge) ; à l'échéance, le borg en cours
   est arrêté (`BorgRunner._stop` : SIGTERM puis SIGKILL après 5 s, pour que borg relâche son verrou de dépôt ; ou
-  moniteur des diffs) et son unité jetée. `break-lock` seulement pour une opération prioritaire, jamais à
-  l'échéance (il casserait aussi les verrous d'un borg mount ou d'un autre hôte). Tranche terminée sans aucune
+  moniteur des diffs, même séquence depuis 1.0.145) et son unité jetée. Plus jamais de `break-lock` (1.0.145 ; il
+  cassait aussi les verrous d'un borg create externe, d'un borg mount ou d'un autre hôte) : borg arrêté par SIGTERM
+  rend son verrou, et borg 1.2 retire lui-même celui d'un processus local mort. Tranche terminée sans aucune
   progression : avertissement (budget trop court). Un budget plus court que la plus longue unité ne progresse jamais : le choisir au-dessus
   de la durée d'un `borg diff` de deux archives consécutives.
 - `complete` = toutes les paires visées indexées, `archive_stats` pour toutes les archives, snapshot de la dernière
@@ -791,18 +796,24 @@ tout appel `boex`, `clear_priority_lock` dans un `finally` couvrant tout le corp
 Le lock est keyed sur `BORG_REPO` (sanitisé), pas sur le nick. Tous les nicks pointant le même dépôt borg partagent donc le même fichier de lock — `Bkp` sur `nick-A` interrompt `Index` sur `nick-B` si `BORG_REPO` identique.
 
 ```
-Bkp / Restore / Prune démarre
+Bkp / Restore / Prune / DelBkp démarre
     ↓
-set_priority_lock(nick)    → <repo>-priority.lock (PID)  ← signal à Index de s'arrêter
+set_priority_lock(nick)    → <repo>-priority.lock.<pid> (1.0.145 : un fichier par processus)  ← signal à Index de s'arrêter
     ↓
 wait_index_idle(nick)      → poll 1s jusqu'à 120s
     ├── <repo>-index-running.lock absent / PID mort → continue
     └── PID vivant → attente... (Index en cours de s'arrêter)
     ↓
-opération borg (create / extract)   ← plus de conflit de verrou borg
+opération borg (create / extract / prune / delete)   ← plus de conflit de verrou borg
     ↓
-finally: clear_priority_lock(nick)  → supprime priority.lock
+finally: clear_priority_lock(nick)  → supprime le fichier de CE processus seulement (1.0.145)
 ```
+
+**Porteurs multiples** (1.0.145, story 8 R1) : `check_priority_lock` = au moins un porteur vivant autre que soi parmi
+`<repo>-priority.lock.<pid>` (hors `.tmp` d'écriture) et l'ancien fichier unique `<repo>-priority.lock` (processus
+d'avant la mise à jour : lu, jamais écrit ; retiré par `clear` seulement s'il porte le PID courant). Fichier d'un PID
+mort : retiré à la lecture. Avant, un Restore qui finissait pendant un Bkp du même dépôt supprimait le verrou du Bkp
+et l'Index en pause reprenait à côté de lui.
 
 ### Surveillance croisée : pause et reprise de l'Index (1.0.141, story 4, AD-4 amendé)
 
@@ -824,8 +835,10 @@ l'unlink d'un verrou repris entre-temps) ; PID d'un autre utilisateur = vivant ;
     ↓
 passe (_index_pass) : borg list → rapprochement → diffs / stats / snapshot (ou tranche)
     moniteur : BorgRunner._stop (boex : communicate(timeout=0.5) en boucle, borg tué → 'killed': True) pour
-    borg list / info / list du snapshot ; thread _priority_monitor pour les diffs (futures annulées, borg tués,
-    break-lock) ; unité en cours jetée, unités finies gardées (sentinelles)
+    borg list / info / list du snapshot ; thread _priority_monitor pour les diffs (futures annulées, SIGTERM puis
+    SIGKILL après 5 s, jamais de break-lock — 1.0.145) ; unité en cours jetée, unités finies gardées (sentinelles) ;
+    après tout arrêt de borg (boex compris), _purge_mei_orphans retire les <TMPDIR>/_MEI* à nous, inchangés depuis
+    2 min et absents de /proc/*/maps, cwd et fd (fuser ne voit pas les bibliothèques mappées d'un borg vivant)
     ↓
 demande prioritaire vue → index-paused.lock pris AVANT de relâcher index-running.lock → attente
     → plus de demande ET index-running libre → reprise : nouvelle passe complète (borg list, rapprochement,
@@ -3032,7 +3045,7 @@ Commande CLI en lecture seule, **100% locale — jamais d'appel `boex`/`borg`** 
 
 ### Ambiguïté Restore/Prune assumée
 
-`priority.lock` ne porte aucune information sur l'opération qui le tient — seulement qu'une opération
+`priority.lock` (un fichier `.<pid>` par porteur depuis 1.0.145) ne porte aucune information sur l'opération qui le tient — seulement qu'une opération
 prioritaire (Bkp/Restore/Prune) est active. `Status` ne tente donc jamais de distinguer Restore de
 Prune : si `check_priority_lock(nick)` est vrai et qu'aucun Bkp n'est détecté par `bkp_status`,
 le message est « Opération prioritaire en cours (Restore ou Prune) ». Une seconde table de statut par

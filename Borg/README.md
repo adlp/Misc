@@ -565,7 +565,9 @@ borgHelper -c DelBkp -n mon-serveur -b archive-id
 
 Opération prioritaire (1.0.142) : un `Index` en cours se met en pause, comme pour `Prune`.
 
-L'archive supprimée quitte les bases au prochain `Index` (rapprochement, 1.0.140).
+L'archive supprimée quitte aussitôt les bases (rapports, historique, explorateur) : même rapprochement qu'après
+`Prune` (1.0.145 ; avant, il fallait attendre le prochain `Index`). Si un autre Bkp, Restore ou Prune tourne sur le même
+dépôt, ou si le rapprochement échoue (avertissement, jamais un échec de `DelBkp`), il est fait au prochain `Index`.
 
 ---
 
@@ -681,6 +683,15 @@ temps en temps pour rendre la place libérée (le `Prune` de borgHelper compacte
 > compris), puis reprend seul là où il en était : ce qui était fini est gardé, la nouvelle archive est prise en compte.
 > Un seul `Index` à la fois par dépôt : un second (un cron, par exemple) s'arrête aussitôt avec « Index déjà en cours ».
 > Une tranche (`-t`) compte la pause dans son budget et sort à l'échéance ; le cron suivant reprend.
+> Depuis 1.0.145, les `borg diff` en cours sont arrêtés par SIGTERM (borg rend lui-même son verrou de dépôt), SIGKILL
+> après 5 s seulement ; plus aucun `borg break-lock`, qui cassait aussi le verrou d'un `borg create` externe, d'un
+> `borg mount` ou d'un autre hôte. L'Index attend la fin de **toutes** les opérations prioritaires du dépôt : un
+> Restore qui finit pendant un Bkp ne le fait plus reprendre à côté du Bkp.
+
+**Code de sortie** (1.0.145) : le pire rendu sur les nicks traités — `0` (fini, rien à faire, Index déjà en cours,
+échéance, pause), `1` (erreur : `borg list` en échec, période `-b`/`-B` refusée…), `3` (`--rebuild` refusé). Une
+ligne cron voit donc une tranche qui n'a pas pu démarrer. Un `borg diff` ou `borg info` en échec au milieu d'une passe
+reste un avertissement (unité refaite au passage suivant), sans changer le code.
 
 ---
 
@@ -953,9 +964,9 @@ Par nick :
   lisible (« il y a 3h12 ») ; « aucune archive indexée » si le nick n'a jamais été indexé.
 - **Bkp en cours** : si une ligne `bkp_status` non terminée existe, « Bkp en cours depuis HH:MM
   (XhYYmin) ».
-- **Opération prioritaire en cours** : si `priority.lock` est tenu et qu'aucun Bkp n'est détecté,
-  « Opération prioritaire en cours (Restore ou Prune) » — **ambiguïté assumée**, `priority.lock` ne
-  distingue pas laquelle des deux le tient. Si un Bkp est aussi détecté, pas de message redondant (le
+- **Opération prioritaire en cours** : si un autre processus tient le verrou prioritaire (`priority.lock.<pid>`) et qu'aucun Bkp n'est détecté,
+  « Opération prioritaire en cours (Restore, Prune ou DelBkp) » — **ambiguïté assumée**, `priority.lock` ne
+  distingue pas laquelle le tient. Si un Bkp est aussi détecté, pas de message redondant (le
   Bkp lui-même tient ce lock).
 
 En JSON : `last_backup` est `{archive,date}` ou `null` ; `bkp_running` est `{started_at}` ou `null` ;
@@ -964,7 +975,8 @@ c'est au consommateur de corréler les deux, comme pour l'affichage texte). `bui
 de la base, `{state:'partial'|'complete', pairs_done, pairs_total, archives_total, stats_done, snapshot, updated_at}` écrit par les
 tranches d'Index ; `{state:'complete'}` pour une base jamais construite par tranches. En texte, une ligne
 « Construction partielle : X/Y paires, statistiques A/B » tant qu'elle n'est pas finie ; `null` si le nick est en
-erreur (champ `error`).
+erreur (champ `error`). Base chiffrée sans passphrase ou en migration (1.0.145) : `last_backup` porte l'erreur, `build`
+vaut `null`, mais `bkp_running`, `rebuild` et `priority_op_running` (lisibles sans clé) restent renseignés.
 
 ---
 
@@ -1963,12 +1975,15 @@ Depuis 1.28.0, chaque nick lisible par l'appelant porte aussi (lectures locales 
   "pairs_total","archives_total","stats_done","snapshot","updated_at"}` ;
 - `rebuild` : même forme pour le fichier fantôme (`{"state":"partial"}` avant sa première fin de tranche), `null` sans
   reconstruction ;
-- `bkp_running` : Bkp en cours (`null` = inconnu, base illisible).
+- `bkp_running` : `true` si un Bkp a démarré depuis moins de `BORGHELPERWWW_BKP_STATUS_TIMEOUT` (6 h par défaut) sans finir, `false` sinon
+  (un Bkp tué au-delà n'est plus « en cours » : le watcher le traite en échec), `null` si `history.db` est illisible
+  (1.28.1 ; jamais pris pour une fin de Bkp).
 
 Un nick sans droit n'en porte aucun. L'interface web (UI ≥ 1.19.0) s'en sert pour ses badges
 (🔗 externe, ⏳ Bkp en cours, 🏗 construction partielle, ♻ reconstruction), pour masquer les actions interdites sur
 un dépôt externe, et la relit toutes les 30 s (liste et page serveur, onglet visible) : à la fin d'un Bkp, la carte du
-serveur est rechargée.
+serveur est rechargée. Un Bkp lancé par ▶ Backup est suivi à part (UI 1.19.1) : même fini avant la première relecture,
+sa carte est rechargée une fois (au bout de 60 s au plus tard).
 
 ⚠️ **Exception à la règle générale "toujours 200 pour un appel authentifié"** — mais **seulement
 pour tout appelant** (depuis 1.20.0, accès direct par périmètre) : `GROUPS_PATHS`

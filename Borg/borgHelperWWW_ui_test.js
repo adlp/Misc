@@ -98,14 +98,17 @@ eq('titre explorateur archive',pageTitle({view:'view-browse',nick:'srv',path:'et
   const env={document:{get hidden(){ return hidden; }},getApiKey:()=>'k',escapeAttr:s=>String(s),
     refreshStateBadges:()=>{ calls.badges++; },reloadMachineCard:n=>{ calls.reload.push(n); },
     renderActionList:()=>{ calls.actions++; }};
+  let now=1e6;
   const ui=new Function('env',`let {document,getApiKey,escapeAttr,refreshStateBadges,reloadMachineCard,renderActionList}=env;
     let myAccess=null, currentViewId='view-machines', currentNick=null, pollBusy=false;
+    const pendingBkp={}, Date={now:()=>env.now()};
     const loadMyAccess=async()=>{ myAccess=env.next(); return myAccess; };
     ${grab('opAllowed')}
 ${grab('stateBadges')}
+${grab('notePendingBkp')}
 async ${grab('pollAccess')}
-    return {opAllowed,stateBadges,pollAccess,set:(a,v,n)=>{ myAccess=a; if(v) currentViewId=v; if(n!==undefined) currentNick=n; }};`)(
-    Object.assign(env,{next:()=>next}));
+    return {opAllowed,stateBadges,pollAccess,notePendingBkp,set:(a,v,n)=>{ myAccess=a; if(v) currentViewId=v; if(n!==undefined) currentNick=n; }};`)(
+    Object.assign(env,{next:()=>next,now:()=>now}));
   const acc=(o)=>({groups_auth_enabled:false,nicks:o});
   ui.set(null); eq('opAllowed sans /access : tout proposé',ui.opAllowed('x','bkp'),true);
   ui.set(acc({ext:{ops:['read','restore'],external:true},old:{}}));
@@ -137,6 +140,31 @@ async ${grab('pollAccess')}
   ui.set(acc({a:{bkp_running:true}}),'view-machines'); next=acc({a:{bkp_running:null}});
   await ui.pollAccess();
   eq('bkp_running inconnu (null) : jamais pris pour une fin de Bkp',calls.reload.length,1);
+  // Bkp lancé par ▶ Backup (UI 1.19.1) : myAccess remplacé (loadMachines) sans perdre le suivi
+  ui.notePendingBkp('s'); ui.set(acc({s:{bkp_running:false}}),'view-machines'); next=acc({s:{bkp_running:false}});
+  now+=30000; await ui.pollAccess();
+  eq('Bkp court, 30 s, jamais vu en cours : on attend',calls.reload.length,1);
+  now+=31000; await ui.pollAccess();
+  eq('Bkp court fini avant la 1re relecture : carte rechargée au bout de 60 s',calls.reload.slice(1),['s']);
+  await ui.pollAccess();
+  eq('Bkp court : une seule recharge',calls.reload.length,2);
+  ui.notePendingBkp('t'); ui.set(acc({t:{bkp_running:false}}),'view-machines');
+  next=acc({t:{bkp_running:true}}); await ui.pollAccess();
+  ui.set(acc({t:{bkp_running:false}})); next=acc({t:{bkp_running:null}}); await ui.pollAccess();
+  next=acc({t:{bkp_running:false}}); await ui.pollAccess();
+  eq('Bkp vu en cours, myAccess écrasé entre-temps, puis fini (null ignoré) : rechargé une fois',calls.reload.slice(2),['t']);
+  // ▶ Backup (vraie runBackupNow) : lancement réussi -> suivi ; échec -> rien
+  const rb=new Function('env',`const pendingBkp={}, Date={now:()=>1};
+    const confirm=()=>true, getPassphrase=()=>'pw', alert=()=>{}, loadMachines=()=>{ env.loads++; };
+    const apiCall=async()=>env.resp;
+    ${grab('notePendingBkp')}
+async ${grab('runBackupNow')}
+    return {runBackupNow,pendingBkp};`);
+  const rbEnv={loads:0,resp:{exitcode:0,httpStatus:200}}, rbUi=rb(rbEnv), btn={textContent:'▶',disabled:false};
+  await rbUi.runBackupNow('ok',btn);
+  rbEnv.resp={exitcode:1,httpStatus:403,detail:'refusé'}; await rbUi.runBackupNow('ko',btn);
+  eq('runBackupNow : lancement réussi suivi, échec non suivi, bouton rendu',
+     [!!rbUi.pendingBkp.ok,'ko' in rbUi.pendingBkp,btn.disabled,btn.textContent,rbEnv.loads],[true,false,false,'▶',2]);
   // Actions, historique et carte (UI 1.19.0) : vraies fonctions de la page, DOM minimal simulé.
   const grabConst=name=>{ const i=src.indexOf('const '+name+'=['); let d=0,j=src.indexOf('[',i);
     for(;;j++){ if(src[j]==='[') d++; else if(src[j]===']' && --d===0) break; } return src.slice(i,j+1)+';'; };

@@ -7,10 +7,10 @@
 #*/
 
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading,uuid
-import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools
+import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.144"
+Version="1.0.145"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -1752,12 +1752,33 @@ class BorgHelperDB:
             except OSError: pass
         return False
 
+    # Verrou prioritaire à porteurs multiples (1.0.145, story 8 R1) : un fichier par processus '<priority.lock>.<pid>'.
+    # Un Restore qui finit pendant un Bkp du même dépôt ne retire que le sien — celui du Bkp reste. L'ancien fichier
+    # unique '<priority.lock>' est encore lu (processus d'avant la mise à jour), jamais plus écrit.
     def _priority_lock_path(self,nick): return self._pid_lock_path(nick,'priority')
-    def set_priority_lock(self,nick): self._set_pid_lock(self._priority_lock_path(nick))
-    def clear_priority_lock(self,nick): self._clear_pid_lock(self._priority_lock_path(nick))
+    def _priority_holder_path(self,nick,pid=None): return f"{self._priority_lock_path(nick)}.{pid or os.getpid()}"
+    def set_priority_lock(self,nick): self._set_pid_lock(self._priority_holder_path(nick))
+    def clear_priority_lock(self,nick):
+        self._clear_pid_lock(self._priority_holder_path(nick))
+        legacy=self._priority_lock_path(nick)
+        if self._lock_holder(legacy)=='me': self._clear_pid_lock(legacy)
     def check_priority_lock(self,nick):
-        """True si un processus prioritaire (Bkp/Restore) tient le lock et est encore vivant."""
-        return self._check_pid_lock(self._priority_lock_path(nick))
+        """True si un autre processus prioritaire (Bkp/Restore/Prune/DelBkp) vivant tient le verrou — jamais le sien.
+        Fichiers de porteurs morts retirés au passage."""
+        legacy=self._priority_lock_path(nick)
+        held=self._check_pid_lock(legacy)
+        for p in glob.glob(glob.escape(legacy)+'.*'):
+            if not p[len(legacy)+1:].isdigit(): continue   # '.tmp' de _set_pid_lock
+            # PID réutilisé (porteur tué par SIGKILL, numéro repris par un processus plus récent que le fichier) :
+            # porteur mort — sinon l'Index resterait en pause tant que vit ce processus sans rapport.
+            started=_pid_start_time(int(p[len(legacy)+1:]))
+            try: reused=started is not None and started>os.path.getmtime(p)+2
+            except OSError: continue
+            if reused:
+                with contextlib.suppress(OSError): os.unlink(p)
+                continue
+            if self._check_pid_lock(p): held=True
+        return held
 
     def _report_running_lock_path(self,nick): return self._pid_lock_path(nick,'report-running')
     def set_report_running_lock(self,nick): self._set_pid_lock(self._report_running_lock_path(nick))
@@ -2502,16 +2523,22 @@ class BorgHelperDB:
     def bkp_running(self,nick,timeout_s,db_path=None):
         """True si un Bkp de ce nick est en cours : ligne bkp_status sans finished_at, démarrée depuis
         moins de timeout_s secondes (au-delà : bloquée, traitée en échec par le watcher, AD-7).
-        Jamais de création de base (AD-12)."""
-        db_path=self._hist(nick,db_path)
-        if db_path is None: return False
+        Jamais de création de base (AD-12). Lecture impossible : False (voir bkp_running_state)."""
+        return self.bkp_running_state(nick,timeout_s,db_path) is True
+
+    def bkp_running_state(self,nick,timeout_s,db_path=None):
+        """Comme bkp_running, à trois états (1.0.145, story 8 R3) : True (Bkp en cours depuis moins de timeout_s),
+        False (aucun, ou bloqué au-delà : traité en échec par le watcher), None (lecture impossible — jamais
+        confondue avec une fin de Bkp). history.db absente : False. Jamais de création de base (AD-12)."""
         try:
+            db_path=self._hist(nick,db_path)
+            if db_path is None: return False
             conn=_open_db(db_path,nick=None,role='read')
             try:
                 return conn.execute("SELECT 1 FROM bkp_status WHERE nick=? AND finished_at IS NULL "
                     f"AND started_at >= datetime('now','-{int(timeout_s)} seconds') LIMIT 1",(nick,)).fetchone() is not None
             finally: conn.close()
-        except sqlite3.Error: return False
+        except (sqlite3.Error,OSError,DbKeyError,DbModeError,DbTamperError,DbCodecError,SchemaVersionError): return None
 
     def list_pending_bkp_status(self,nick,timeout_s,db_path=None):
         """Lignes bkp_status prêtes à être réclamées par le watcher (borgHelperWWW) : terminées
@@ -2918,6 +2945,48 @@ class BorgHelperDB:
 
 # ── BorgRunner — borg subprocess + borghelperrc config ────────────────────────
 
+def _pid_start_time(pid):
+    """Heure de démarrage (epoch) d'un processus, d'après /proc (champ 22 de stat + btime) ; None si inconnue."""
+    try:
+        with open(f'/proc/{pid}/stat') as f: ticks=int(f.read().rsplit(')',1)[1].split()[19])
+        with open('/proc/stat') as f: btime=next(int(l.split()[1]) for l in f if l.startswith('btime '))
+        return btime+ticks/os.sysconf('SC_CLK_TCK')
+    except (OSError,ValueError,IndexError,StopIteration): return None
+
+def _mei_in_use(d):
+    """Vrai si un processus lisible mappe un fichier de d, y a son répertoire courant ou un descripteur ouvert
+    dedans. fuser ne suffit pas : un borg vivant ne fait que mapper ses bibliothèques (fuser rc=1). Le moindre doute
+    (lecture de /proc impossible) compte comme « utilisé »."""
+    pre=os.path.realpath(d)+'/'
+    try: pids=[p for p in os.listdir('/proc') if p.isdigit()]
+    except OSError: return True
+    for pid in pids:
+        try:
+            with open(f'/proc/{pid}/maps') as f:
+                if pre in f.read(): return True
+            if (os.readlink(f'/proc/{pid}/cwd')+'/').startswith(pre): return True
+            for fd in os.listdir(f'/proc/{pid}/fd'):
+                try:
+                    if os.readlink(f'/proc/{pid}/fd/{fd}').startswith(pre): return True
+                except OSError: pass
+        except (FileNotFoundError,ProcessLookupError): pass   # processus fini entre-temps
+        except PermissionError: pass   # autre utilisateur : ne peut pas ouvrir nos répertoires 0700
+        except OSError: return True
+    return False
+
+def _purge_mei_orphans(min_age=120):
+    """Répertoires PyInstaller (<TMPDIR>/_MEI*, ~60 Mo chacun) laissés par un borg arrêté par SIGKILL, ou par SIGTERM
+    pendant son démarrage : retirés s'ils sont à nous, plus modifiés depuis min_age s (jamais une extraction en cours)
+    et utilisés par aucun processus (_mei_in_use). Appelé après tout arrêt de borg (1.0.145 : boex à l'échéance
+    compris — un selftest en laissait 2 Go dans /tmp)."""
+    import tempfile
+    for d in glob.glob(os.path.join(tempfile.gettempdir(),'_MEI*')):
+        try:
+            st=os.lstat(d)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or time.time()-st.st_mtime<min_age: continue
+            if not _mei_in_use(d): shutil.rmtree(d,ignore_errors=True)
+        except Exception: pass
+
 class BorgRunner:
     """Borg subprocess wrapper and borghelperrc configuration layer."""
     # Demande d'arrêt (1.0.141, moteur d'Index) : callable -> True quand le borg lancé par boex() doit être arrêté
@@ -3068,16 +3137,11 @@ class BorgRunner:
                             killed=True; BorgRunner._tls.kills=self._kills+1; break
         except KeyboardInterrupt:
             ps.kill(); ps.wait()
-            import glob as _glob, shutil as _shutil
-            for _d in _glob.glob('/tmp/_MEI*'):
-                try:
-                    if subprocess.run(['fuser',_d],capture_output=True).returncode!=0:
-                        _shutil.rmtree(_d,ignore_errors=True)
-                except Exception: pass
+            _purge_mei_orphans()
             printer("\n[INTERRUPTED] Opération annulée par l'utilisateur.")
             sys.exit(130)
         ret={'stdout':[],'stderr':[]}
-        if killed: inf=''   # sortie tronquée d'un borg tué : jamais parsée
+        if killed: inf=''; _purge_mei_orphans()   # sortie tronquée d'un borg tué : jamais parsée
         if len(inf):
             if inf[0] in '[{' and retjson: ret['stdout'].append(json.loads(inf))
             else:
@@ -4112,7 +4176,13 @@ class BorgHelper:
             rb=self.borg.boex(nick,['delete','::'+bid],debug=debug)
             if rb['exitcode']!=0: print(rb); sys.exit(rb['exitcode'])
             self.borg.boex(nick,['compact','--cleanup-commits'],debug=debug)
-            self.db.clear_cache_nick(nick); sys.exit(rb['exitcode'])
+            self.db.clear_cache_nick(nick)
+            # 1.0.145 (story 8 R5) : archive retirée des bases tout de suite (rapports, historique, explorateur), comme
+            # après Prune — plus d'attente du prochain Index.
+            try: self._cleanup_index_after_prune(nick,debug=debug)
+            except (Exception,SystemExit) as e:   # archive déjà supprimée : jamais un échec de DelBkp
+                printer(f"[WARN] {nick}: rapprochement des bases reporté au prochain Index ({e})")
+            sys.exit(rb['exitcode'])
         finally:
             self.db.clear_priority_lock(nick)
 
@@ -4884,6 +4954,7 @@ class BorgHelper:
             ps=subprocess.Popen(cmd,encoding='utf-8',env=diff_env,cwd=os.getcwd(),
                                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
             with running_procs_lock: running_procs[pair]=ps
+            if interrupted_event.is_set(): ps.terminate()   # lancé pendant l'arrêt : le moniteur ne l'a pas vu
             entries=[]; exclu={}
             try:
                 for line in ps.stdout:          # streaming — parse au fil de l'eau
@@ -4924,35 +4995,26 @@ class BorgHelper:
                                 interrupted_event.set()
                                 for f in list(futs):
                                     if not f.done(): f.cancel()
-                                with running_procs_lock:
-                                    for ps in list(running_procs.values()):
-                                        try: ps.kill()
-                                        except OSError: pass
-                                # Attendre que les _run_diff aient reap leurs processus (plus de zombies)
-                                reap=time.time()+15
-                                while time.time()<reap:
+                                # 1.0.145 (story 8 R2) : SIGTERM d'abord — borg rend son verrou de dépôt en sortant —,
+                                # SIGKILL après 5 s seulement (comme boex). Plus jamais de borg break-lock : il cassait
+                                # aussi le verrou d'un borg create externe, d'un borg mount ou d'un autre hôte.
+                                def _signal_all(kill):
                                     with running_procs_lock:
-                                        if not running_procs: break
-                                    time.sleep(0.1)
-                                # Purger les répertoires PyInstaller orphelins (_MEI*) laissés par SIGKILL
-                                import glob as _glob, shutil as _shutil
-                                for _d in _glob.glob('/tmp/_MEI*'):
-                                    try:
-                                        if subprocess.run(['fuser',_d],capture_output=True).returncode!=0:
-                                            _shutil.rmtree(_d,ignore_errors=True)
-                                    except Exception: pass
-                                # Purger les stale locks borg laissés par les process tués — seulement pour laisser passer
-                                # une opération prioritaire : à l'échéance d'une tranche, un break-lock casserait aussi
-                                # les verrous d'un borg mount, d'un create externe ou d'un autre hôte.
-                                if reason=='priority' and 'BORG_REPO' in cfg:
-                                    printer(f"  {nick}: purge des locks borg (break-lock)...")
-                                    try:
-                                        bl=subprocess.run([borg_exe,'break-lock',cfg['BORG_REPO']],
-                                                          env=diff_env,timeout=30,capture_output=True)
-                                        if bl.returncode!=0:
-                                            printer(f"  [WARN] borg break-lock : {bl.stderr.decode(errors='replace')[:200]}")
-                                    except Exception as e:
-                                        printer(f"  [WARN] borg break-lock échoué : {e}")
+                                        for ps in list(running_procs.values()):
+                                            try: ps.kill() if kill else ps.terminate()
+                                            except OSError: pass
+                                def _wait_reaped(secs):
+                                    end=time.time()+secs
+                                    while time.time()<end:
+                                        with running_procs_lock:
+                                            if not running_procs: return True
+                                        time.sleep(0.1)
+                                    return False
+                                _signal_all(False)
+                                if not _wait_reaped(5):
+                                    _signal_all(True)
+                                    _wait_reaped(15)   # _run_diff reap ses processus (plus de zombies)
+                                _purge_mei_orphans()   # aussi après SIGTERM : un borg arrêté en démarrage laisse le sien
                                 return
                             time.sleep(0.5)
                     monitor=threading.Thread(target=_priority_monitor,daemon=True)
@@ -6091,6 +6153,10 @@ class BorgHelper:
                 if row: last_backup={'archive':row[0],'date':row[1]}
             except DbCodecError as e:
                 last_backup={'error':_codec_fail(nick,e,conn)}
+            except (DbKeyError,DbModeError,DbTamperError) as e:
+                # 1.0.145 (story 8 R9) : clé absente ou base en migration — bkp_running, rebuild et priority_op_running,
+                # lisibles sans clé, restent renseignés.
+                last_backup={'error':f"base illisible ({type(e).__name__}: {e})"}; build=None
             except sqlite3.OperationalError as e:
                 if 'no such table' not in str(e): raise
             except sqlite3.Error:
@@ -6132,10 +6198,10 @@ class BorgHelper:
             except (ValueError,TypeError): readable=st['bkp_running']['started_at']
             printer(f"  Bkp en cours depuis {readable}")
         elif st['priority_op_running']:
-            # Ambiguïté assumée (Boundaries spec-status-cli-etat-rapide) : priority.lock ne distingue
-            # pas Restore de Prune. Affiché seulement si aucun Bkp détecté (sinon redondant : le Bkp
+            # Ambiguïté assumée (Boundaries spec-status-cli-etat-rapide) : les fichiers priority.lock ne disent
+            # pas quelle opération (Restore, Prune ou DelBkp) les tient. Affiché seulement si aucun Bkp détecté (sinon redondant : le Bkp
             # lui-même tient ce lock).
-            printer("  Opération prioritaire en cours (Restore ou Prune)")
+            printer("  Opération prioritaire en cours (Restore, Prune ou DelBkp)")
         b=st.get('build') or {}
         if b.get('state')=='partial':
             extra=''
@@ -8259,7 +8325,7 @@ def codec_selftest():
             # processus ne voit jamais son propre lock comme tenu) — inutilisable ici puisque le
             # self-test tourne dans le même process que prune(). On vérifie donc l'existence brute
             # du fichier de lock pendant boex(), pas check_priority_lock().
-            lock_path=bhq.db._priority_lock_path('qprune')
+            lock_path=bhq.db._priority_holder_path('qprune')   # fichier de ce processus (1.0.145)
             nick='qprune'
             held_during=[]
             def _fake_boex(nk,args,debug=0):
@@ -8320,11 +8386,11 @@ def codec_selftest():
                 st_bkp=bhq._status_one('qstbkp')
                 bkp_ok=(st_bkp['bkp_running']=={'started_at':st_bkp['bkp_running']['started_at']}
                         and st_bkp['bkp_running']['started_at'] is not None and st_bkp['priority_op_running'] is True)
-                bhq.db.clear_priority_lock('qstbkp')
+                os.unlink(bhq.db._priority_lock_path('qstbkp'))   # faux verrou externe : jamais retiré par clear (1.0.145)
                 _fake_external_lock('qstlock')  # Restore/Prune en cours, ambigu, sans bkp_status
                 st_lock=bhq._status_one('qstlock')
                 lock_ok=st_lock['bkp_running'] is None and st_lock['priority_op_running'] is True
-                bhq.db.clear_priority_lock('qstlock')
+                os.unlink(bhq.db._priority_lock_path('qstlock'))
                 # -n ALL (multi-nick) natif, contrairement à RepoHistory/ArchiveHistory
                 out=_q_run(bhq.status,'qp,qstnone,qstbkp',as_json=True)
                 arr=json.loads(out)
@@ -8339,8 +8405,44 @@ def codec_selftest():
                         and {r['nick'] for r in arr_all}==expected_all)
                 return indexed_ok and none_ok and bkp_ok and lock_ok and multi_ok and all_ok
             finally:
-                bhq.db.clear_priority_lock('qstbkp'); bhq.db.clear_priority_lock('qstlock'); _q_rc()
+                for nk in ('qstbkp','qstlock'):
+                    with contextlib.suppress(OSError): os.unlink(bhq.db._priority_lock_path(nk))
+                _q_rc()
         check("Status : dernier backup présent/absent, Bkp en cours, opération prioritaire seule (sans redondance), -n multi/ALL en JSON",_status_mixed_states_ok)
+        def _status_nokey():
+            """1.0.145 (story 8 R9) : diff.db chiffrée sans clé (DbKeyError) ou en migration (DbModeError) -> last_backup
+            {error}, build None, mais bkp_running, rebuild et priority_op_running toujours lus (sans clé)."""
+            nk='qs8k'
+            with open(qrc,'a') as f:
+                f.write(f"[{nk}]\nBORG_REPO=/r-s8k\nBORG_PASSPHRASE=pw\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n\n")
+            os.chmod(qrc,0o600)
+            dp=bhq.db.get_diff_db(nk); bhq.db.ensure_diff_db(dp)
+            shutil.copy(dp,dp+_SHADOW_SUFFIX)
+            lp=bhq.db._priority_lock_path(nk)
+            real=_open_db
+            try:
+                bhq.db.store_bkp_status_start(nk,'runS8k')
+                with open(lp,'w') as f: f.write(str(os.getppid()))
+                outs=[]
+                for exc in (DbKeyError('passphrase absente'),DbModeError('mode changé')):
+                    def _fake(path,*a,_e=exc,**k):
+                        if path==dp and k.get('nick'): raise _e
+                        return real(path,*a,**k)
+                    with mock.patch.dict(globals(),{'_open_db':_fake}): outs.append(bhq._status_one(nk))
+                ok=all(st['last_backup'] and 'error' in st['last_backup'] and st['build'] is None
+                       and st['bkp_running'] and st['bkp_running'].get('started_at') and st['priority_op_running'] is True
+                       and st['rebuild']=={'state':'partial'} for st in outs)
+                txt=''
+                with mock.patch.dict(globals(),{'_open_db':lambda path,*a,**k: (_ for _ in ()).throw(DbKeyError('x')) if path==dp and k.get('nick') else real(path,*a,**k)}):
+                    txt=_q_run(bhq.status,nk)
+                ok=ok and 'base illisible' in txt and 'Bkp en cours' in txt
+                if not ok: print(f"  Status sans clé : {outs} {txt[-300:]!r}")
+                return ok
+            finally:
+                for f in (lp,dp+_SHADOW_SUFFIX):
+                    with contextlib.suppress(OSError): os.unlink(f)
+                _q_rc()
+        check("Status : base chiffrée sans clé ou en migration -> erreur, mais Bkp en cours, reconstruction et opération prioritaire lus",_status_nokey)
         def _status_formatters_and_isolation_ok():
             """Chemin texte de Status (jamais exercé par _status_mixed_states_ok, qui ne teste que le
             JSON/_status_one) : formatage exact de _age_readable/_bkp_running_readable, garde AD-12 sur
@@ -9033,12 +9135,52 @@ def codec_selftest():
             c.executemany("INSERT INTO t(v) VALUES(?)",[('X'*40,)]*6000); c.commit(); c.execute("DELETE FROM t WHERE v=?",('X'*40,)); c.commit(); c.close()
             s0=os.path.getsize(p); dbx.set_priority_lock('psl')
             try:
-                held=os.path.exists(dbx._priority_lock_path('psl'))
+                held=os.path.exists(dbx._priority_holder_path('psl'))
                 out=io.StringIO()
                 with contextlib.redirect_stderr(out): ok=BorgHelper._vacuum_db(_types.SimpleNamespace(db=dbx),p,verbose=False,nick='psl')
             finally: dbx.clear_priority_lock('psl')
             return held and ok is True and os.path.getsize(p)<s0 and 'opération prioritaire' not in out.getvalue()
         check("bascule : priority.lock de ce processus (Prune) -> compactage effectué, pas de report",_swap_self_lock)
+        def _priority_holders():
+            """1.0.145 (story 8 R1) : un fichier par porteur. Bkp (autre processus vivant) + Restore (ce processus) qui
+            prend et rend le verrou -> Bkp toujours vu ; porteur mort -> ignoré puis retiré ; ancien fichier unique d'un
+            processus vivant -> vu, jamais retiré par clear ; '.tmp' d'écriture -> ignoré ; son propre verrou jamais vu."""
+            dbx=BorgHelperDB(tmp,'phl',cfg_reader=lambda n: {'BORG_REPO':'/r-phl'})
+            legacy=dbx._priority_lock_path('phl'); other=os.getppid()
+            p=subprocess.Popen(['true']); p.wait(); dead=p.pid
+            bkp=dbx._priority_holder_path('phl',other)
+            try:
+                with open(bkp,'w') as f: f.write(str(other))
+                dbx.set_priority_lock('phl'); own=dbx.check_priority_lock('phl')
+                dbx.clear_priority_lock('phl')
+                two=(own is True and dbx.check_priority_lock('phl') is True and os.path.exists(bkp)
+                     and not os.path.exists(dbx._priority_holder_path('phl')))
+                os.unlink(bkp)
+                dp=dbx._priority_holder_path('phl',dead)
+                with open(dp,'w') as f: f.write(str(dead))
+                gone=dbx.check_priority_lock('phl') is False and not os.path.exists(dp)
+                with open(legacy,'w') as f: f.write(str(other))
+                dbx.set_priority_lock('phl'); dbx.clear_priority_lock('phl')
+                old=dbx.check_priority_lock('phl') is True and os.path.exists(legacy)
+                os.unlink(legacy)
+                with open(f"{legacy}.{other}.tmp",'w') as f: f.write(str(other))
+                tmpf=dbx.check_priority_lock('phl') is False
+                dbx.set_priority_lock('phl'); mine=dbx.check_priority_lock('phl') is False; dbx.clear_priority_lock('phl')
+                # PID réutilisé : fichier d'hier, numéro repris par un processus lancé à l'instant -> mort, retiré
+                young=subprocess.Popen(['sleep','30'])
+                try:
+                    rp=dbx._priority_holder_path('phl',young.pid)
+                    with open(rp,'w') as f: f.write(str(young.pid))
+                    os.utime(rp,(time.time()-86400,)*2)
+                    reuse=dbx.check_priority_lock('phl') is False and not os.path.exists(rp)
+                finally: young.kill(); young.wait()
+                ok=two and gone and old and tmpf and mine and reuse
+                if not ok: print(f"  porteurs : deux {two}, mort {gone}, ancien {old}, tmp {tmpf}, soi {mine}, PID réutilisé {reuse}")
+                return ok
+            finally:
+                for f in glob.glob(glob.escape(legacy)+'*'):
+                    with contextlib.suppress(OSError): os.unlink(f)
+        check("priority.lock par porteur : Restore fini pendant un Bkp -> Bkp toujours vu ; mort ou PID réutilisé retiré ; ancien fichier lu",_priority_holders)
         def _swap_invalid_busy():
             """Copie absente ou vide -> 'invalid', base servie intacte et jamais vidée ; base verrouillée en écriture
             -> abort() sondé pendant l'attente ('abort' en quelques secondes) et busy_limit respecté ('busy')."""
@@ -9288,7 +9430,7 @@ def codec_selftest():
             lp=b.db._priority_lock_path('rzp')
             with open(lp,'w') as f: f.write(str(os.getppid()))
             try: out=_q_run(b._reconcile_archives,'rzp',dp,lst)
-            finally: b.db.clear_priority_lock('rzp')
+            finally: os.unlink(lp)
             return _rz_cites(dp,'rzp','A1')==s0 and 'reporté' in out
         check("rapprochement : opération prioritaire d'un autre processus -> reporté, rien retiré",_rz_priority)
         # ── Index par tranches + surveillance croisée (1.0.141, story 4, AD-1/AD-3/AD-4/AD-10) ──
@@ -9611,10 +9753,123 @@ def codec_selftest():
             if not ok: print(f"  Bkp pendant Index : rc {rc}, attente Bkp {waited[0]:.1f}s (Bkp {bkp_t:.1f}s), archives {len(names)}, "
                              f"paires manquantes {want-pairs}, sortie {out[-500:]!r}")
             return ok
+        def _ix_cli_exit_codes():
+            """1.0.145 (story 8 A3) : CLI Index — erreur (période inconnue) -> code 1 ; rien à faire -> 0 ; Index déjà en
+            cours sur le dépôt -> 0."""
+            ctx=_ix_ctx(); _ix_slow(ctx,None,0); me=os.path.realpath(__file__); b=_ix_bh(ctx,'cache')
+            run=lambda *a: subprocess.run([me,'-C',ctx['rc'],'-c','Index',*a],capture_output=True,text=True,timeout=300)
+            r_err=run('-n','ixf','-b','inconnue')
+            r_ok=run('-n','ixf')
+            lp=b.db._index_running_lock_path('ixf'); _ix_fake_lock(lp)
+            try: r_busy=run('-n','ixf')
+            finally: os.unlink(lp)
+            # plusieurs nicks (erreur avant ou après un nick sain) et -S : le pire code, jamais le dernier
+            with open(ctx['rc']) as f: rc0=f.read()
+            try:
+                with open(ctx['rc'],'a') as f: f.write(rc0[rc0.index('[ixf]')+5:].split('\n[')[0].replace(f"BORG_EXE={ctx['w']}","BORG_EXE=/bin/false").join(('[ixbad]','\n')))
+                multi=[run('-n',n).returncode for n in ('ixbad,ixf','ixf,ixbad')]+[run('-n','ixbad','-S').returncode]
+            finally:
+                with open(ctx['rc'],'w') as f: f.write(rc0)
+            ok=(r_err.returncode==1 and 'inconnue' in r_err.stdout+r_err.stderr and r_ok.returncode==0
+                and r_busy.returncode==0 and 'déjà' in r_busy.stdout+r_busy.stderr and multi==[1,1,1])
+            if not ok: print(f"  codes Index : erreur {r_err.returncode}, ok {r_ok.returncode}, occupé {r_busy.returncode}, "
+                             f"plusieurs nicks / -S {multi} {(r_err.stdout+r_err.stderr)[-200:]!r}")
+            return ok
+        def _ix_restore_during_bkp():
+            """1.0.145 (story 8 R1/R2, critère d'acceptation) : Index (CLI, diffs ralentis) interrompu par un Bkp (autre
+            processus) ; diffs arrêtés sans borg break-lock, un borg with-lock passe aussitôt ; un Restore (ce processus)
+            prend puis rend le verrou -> l'Index reste en pause ; fin du Bkp -> reprise, base complète."""
+            ctx=_ix_ctx(); _ix_slow(ctx,'diff',1.2); _ix_log(ctx,clear=True)
+            b=_ix_bh(ctx,'cache'); nk='ixd'; me=os.path.realpath(__file__); outp=os.path.join(ctx['dir'],'s8.out')
+            bkp=b.db._priority_holder_path(nk,os.getppid()); pl=b.db._index_paused_lock_path(nk)
+            with open(outp,'w') as fo:
+                ps=subprocess.Popen([me,'-C',ctx['rc'],'-c','Index','-n',nk],stdout=fo,stderr=subprocess.STDOUT)
+            paused=wl_ok=still=False; rc=None; wl_err=''
+            try:
+                t0=time.monotonic()
+                while time.monotonic()-t0<90 and not any(l.startswith('diff ') for l in _ix_log(ctx)): time.sleep(0.1)
+                time.sleep(1.5)   # dans le borg diff lui-même, après la pause du script
+                _ix_fake_lock(bkp); t1=time.monotonic()
+                while time.monotonic()-t1<15 and not os.path.exists(pl): time.sleep(0.1)
+                paused=os.path.exists(pl)
+                wl=subprocess.run([shutil.which('borg'),'with-lock','--lock-wait','3',ctx['repo'],'true'],
+                                  env=ctx['env'],capture_output=True,text=True,timeout=60)
+                wl_ok=wl.returncode==0; wl_err=wl.stderr[-200:]
+                n_diff=sum(l.startswith('diff ') for l in _ix_log(ctx))
+                b.db.set_priority_lock(nk); time.sleep(1); b.db.clear_priority_lock(nk)   # Restore
+                time.sleep(3)
+                still=os.path.exists(pl) and ps.poll() is None and sum(l.startswith('diff ') for l in _ix_log(ctx))==n_diff
+                os.unlink(bkp)   # fin du Bkp
+                rc=ps.wait(240)
+            finally:
+                if ps.poll() is None: ps.kill()
+                with contextlib.suppress(OSError): os.unlink(bkp)
+                _ix_slow(ctx,None,0)
+            with open(outp) as f: out=f.read()
+            lg=_ix_log(ctx,clear=True)
+            names=[a['name'] for a in json.loads(subprocess.run([shutil.which('borg'),'list','--json',ctx['repo']],
+                   env=ctx['env'],capture_output=True,text=True,timeout=60).stdout)['archives']]
+            want={(names[i],names[i+1]) for i in range(len(names)-1)}; pairs=set(_ix_pairs(b,nk))
+            ok=(rc==0 and paused and wl_ok and still and 'reprise' in out and not any(l.startswith('break-lock') for l in lg)
+                and want<=pairs)
+            if not ok: print(f"  Restore pendant Bkp : rc {rc}, pause {paused}, with-lock {wl_ok} {wl_err!r}, toujours en pause "
+                             f"{still}, paires manquantes {len(want-pairs)}, break-lock {[l for l in lg if 'break' in l]}, {out[-400:]!r}")
+            return ok
+        def _ix_delbkp_reconcile():
+            """1.0.145 (story 8 R5) : vrai DelBkp -> archive absente des bases (stats, paires, snapshot) et du rapport
+            sans nouvel Index."""
+            ctx=_ix_ctx(); _ix_slow(ctx,None,0); b=_ix_bh(ctx,'c-s8del'); nk='ixb'; borg=shutil.which('borg')
+            ts=f"{time.localtime().tm_year+1}-12-31T10:00:00"   # toujours la plus récente : son snapshot est indexé
+            n8=f"{socket.getfqdn()}-t-{ts}"
+            with open(os.path.join(ctx['src'],'s8.txt'),'w') as f: f.write('s8')
+            r=subprocess.run([borg,'create','--timestamp',ts,f"{ctx['repo']}::{n8}",ctx['src']],
+                             env=ctx['env'],capture_output=True,text=True,timeout=120)
+            if r.returncode!=0: print(f"  borg create : {r.stderr[-200:]}"); return False
+            _q_run(b.index,nk); dp=b.db.get_diff_db(nk)
+            def cites():
+                c=sqlite3.connect(dp)
+                try:
+                    return (c.execute("SELECT count(*) FROM archive_stats WHERE archive=?",(n8,)).fetchone()[0],
+                            c.execute("SELECT count(*) FROM diff_indexed_pairs WHERE archive_old=? OR archive_new=?",(n8,n8)).fetchone()[0],
+                            c.execute("SELECT count(*) FROM archive_snapshot_indexed WHERE archive=?",(n8,)).fetchone()[0])
+                finally: c.close()
+            before=cites(); rep0=_q_run(b.report_offline,nk,as_json=True)
+            _q_run(b.delbkp,nk,n8)
+            after=cites(); rep=_q_run(b.report_offline,nk,as_json=True)
+            listed=n8 in subprocess.run([borg,'list','--short',ctx['repo']],env=ctx['env'],capture_output=True,text=True,timeout=60).stdout
+            ok=(before==(1,1,1) and n8 in rep0 and after==(0,0,0) and n8 not in rep and not listed
+                and not os.path.exists(b.db._priority_holder_path(nk)))
+            if not ok: print(f"  DelBkp : avant {before}, après {after}, rapport avant {n8 in rep0} après {n8 in rep}, dépôt {listed}")
+            return ok
+        def _ix_mei_purge():
+            """1.0.145 : borg arrêté par boex (échéance) -> répertoire PyInstaller orphelin (<TMPDIR>/_MEI*) retiré ;
+            gardés : celui qu'un processus vivant mappe (comme un borg : bibliothèques mappées, répertoire courant ailleurs
+            — fuser ne le voit pas) et celui d'une extraction récente."""
+            ctx=_ix_ctx(); b=_ix_bh(ctx,'c-mei'); td=tempfile.gettempdir()
+            orphan,used,fresh=(tempfile.mkdtemp(prefix=f'_MEIs8{k}',dir=td) for k in 'oun')
+            lib=os.path.join(used,'lib.so')
+            with open(lib,'wb') as f: f.write(b'\0'*4096)
+            holder=subprocess.Popen([sys.executable,'-c',"import mmap,sys,time; f=open(sys.argv[1],'rb'); "
+                                     "m=mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ); f.close(); print(1,flush=True); time.sleep(60)",lib],
+                                    cwd=tmp,stdout=subprocess.PIPE)
+            holder.stdout.readline()   # fichier mappé, descripteur fermé
+            for d in (orphan,used): os.utime(d,(time.time()-600,)*2)
+            _ix_slow(ctx,'ALL',5)
+            try:
+                b.borg._stop=lambda: True
+                rb=b.borg.boex('ix',['list','--json'])
+            finally:
+                b.borg._stop=None; _ix_slow(ctx,None,0); holder.kill(); holder.wait()
+                kept=os.path.isdir(used) and os.path.isdir(fresh)
+                for d in (used,fresh): shutil.rmtree(d,ignore_errors=True)
+            gone=not os.path.exists(orphan); shutil.rmtree(orphan,ignore_errors=True)
+            ok=bool(rb.get('killed')) and gone and kept
+            if not ok: print(f"  _MEI : tué {rb.get('killed')}, orphelin retiré {gone}, mappé et récent gardés {kept}")
+            return ok
         def _ix_prune_waits():
             """Prune attend l'Index (wait_index_idle) comme Bkp et Restore."""
             ctx=_ix_ctx(); b=_ix_bh(ctx,'c-prune'); called=[]
-            b.db.wait_index_idle=lambda nk,timeout=120: called.append(nk if os.path.exists(b.db._priority_lock_path(nk)) else None)
+            b.db.wait_index_idle=lambda nk,timeout=120: called.append(nk if os.path.exists(b.db._priority_holder_path(nk)) else None)
             b.borg.boex=lambda *a,**k: {'exitcode':0,'stdout':[],'stderr':[]}
             b.borg.cfgreaded=lambda nk,debug=0: {'GLOB_ARCH':'x-*','KEEP_DAILY':'7'}
             _q_run(b.prune,'ix')
@@ -9622,10 +9877,10 @@ def codec_selftest():
         def _ix_delbkp_waits():
             """DelBkp (1.0.142) : priority.lock posé avant d'attendre l'Index, retiré ensuite (même via son sys.exit)."""
             ctx=_ix_ctx(); b=_ix_bh(ctx,'c-delbkp'); called=[]
-            b.db.wait_index_idle=lambda nk,timeout=120: called.append(nk if os.path.exists(b.db._priority_lock_path(nk)) else None)
+            b.db.wait_index_idle=lambda nk,timeout=120: called.append(nk if os.path.exists(b.db._priority_holder_path(nk)) else None)
             b.borg.boex=lambda *a,**k: {'exitcode':0,'stdout':[],'stderr':[]}
             _q_run(b.delbkp,'ix','une-archive')
-            return called==['ix'] and not os.path.exists(b.db._priority_lock_path('ix'))
+            return called==['ix'] and not os.path.exists(b.db._priority_holder_path('ix'))
         def _ix_cli_usage():
             """CLI : -t avec -S -> erreur d'usage (code non nul) ; -T inconnu -> erreur ; -n a,b -t 3 : budget par nick."""
             ctx=_ix_ctx(); me=os.path.realpath(__file__)
@@ -9745,6 +10000,10 @@ def codec_selftest():
             check("snapshot incrémental (ajouts) : identique à un complet ; borg list des ajouts arrêté -> rien d'écrit",_ix_incremental_snapshot)
             check("CLI Index : -t avec -S refusé, -T invalide refusé, budget par nick avec plusieurs nicks",_ix_cli_usage)
             check("surveillance croisée : vrai Bkp pendant un Index long -> Bkp sans attente, Index en pause puis reprise, nouvelle archive indexée",_ix_real_bkp_during_index)
+            check("CLI Index : code 1 sur erreur, 0 si rien à faire ou Index déjà en cours",_ix_cli_exit_codes)
+            check("Restore fini pendant un Bkp -> Index toujours en pause ; diffs arrêtés sans break-lock, borg suivant passe ; reprise",_ix_restore_during_bkp)
+            check("DelBkp -> archive retirée des bases et du rapport sans nouvel Index",_ix_delbkp_reconcile)
+            check("borg arrêté à l'échéance -> _MEI* orphelin retiré ; celui d'un processus vivant (mappé) ou récent gardé",_ix_mei_purge)
         # ── Reconstruction dans un fichier fantôme (1.0.143, story 6, AD-2/AD-5/AD-6) ──
         rb_ctx={}
         def _rb_ctx():
@@ -9832,7 +10091,7 @@ def codec_selftest():
             _ix_slow(ctx,'ALL',0.4)
             runs=0; same=True; mono=True; seen=False; prev={}; st_ok=False
             try:
-                bud=3
+                bud=6   # 1.0.145 : 3 s ne couvrent plus borg list + point de taille + une unité (~1,1 s par borg ralenti sous charge)
                 while runs<40:
                     _q_run(b.index,'rb',budget=bud,rebuild=(runs==0)); runs+=1
                     if not os.path.exists(sp): break
@@ -10960,13 +11219,16 @@ def _cli_main():
                 printer(f"Index : -T invalide : {options['-T']!r} (parmi stats,snap,diff)"); usage(cmd)
         _period=(options.get('-b'),options.get('-B')) if ('-b' in options or '-B' in options) else None
         if _tranche: _lower_priority()   # AD-4 : nice 10 + ionice idle, hérités par borg
+        # Code de sortie (1.0.145, story 8 A3) : le pire rendu par index() sur les nicks traités — 1 (erreur), 3 (--rebuild
+        # refusé : DB_NAME partagé, espace, migration de chiffrement) ; déjà en cours, échéance ou pause : 0.
         _irc=0
         for n in nick.split(','):
-            if _snaponly: bh.index(n,debug=debug,force=_force,snap_only=True)   # même verrou et même pause (1.0.141)
+            if _snaponly: r=bh.index(n,debug=debug,force=_force,snap_only=True)   # même verrou et même pause (1.0.141)
             elif _tranche:   # budget par nick
-                if bh.index(n,debug=debug,budget=_budget,natures=_natures,period=_period,rebuild=_rebuild,force=_force)==3: _irc=3
-            else: bh.index(n,debug=debug,force=_force,target_archive=_target)
-        if _irc: sys.exit(_irc)   # --rebuild refusé (DB_NAME partagé, espace, migration de chiffrement)
+                r=bh.index(n,debug=debug,budget=_budget,natures=_natures,period=_period,rebuild=_rebuild,force=_force)
+            else: r=bh.index(n,debug=debug,force=_force,target_archive=_target)
+            if isinstance(r,int) and r>_irc: _irc=r
+        if _irc: sys.exit(_irc)
     elif cmd=='search':
         if '-f' not in options: usage(cmd)
         bh.search(nick,options['-f'],archive_from=options.get('-b',None),archive_to=options.get('-B',None),debug=debug,as_json=('-j' in options))
