@@ -1,5 +1,27 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.28.0 / UI 1.19.0 / borgHelper 1.0.144 — état de construction et dépôts externes dans le web — 2026-09-28
+
+Chantier « reconstruction progressive », story 7 (spine AD-10, AD-12).
+
+- **Refus en amont** : borgHelperWWW vérifie `EXTERNAL_OPS` avant tout borg ou sous-processus (fonction `op_allowed`
+  de borgHelper, jamais une liste recopiée) : `403` sur `/bkp`, `/init`, `/login` ; sur `/restore`,
+  `/download/file`, `/download/tar` sans `restore` ; sur `/prune`, `/delbkp` sans `prune`/`delete`. `/download/*` et
+  `/bkp`, qui ne passent pas par la CLI, sont couverts.
+- Code de sortie 4 de la CLI ⇒ **HTTP 403** (au lieu de 400), réponses en cache comprises.
+- `GET /access` : par nick lisible, `external`, `ops`, `build`, `rebuild`, `bkp_running` (lectures locales).
+- **⚠️ `POST /index` asynchrone** (rupture de compatibilité) : lancement détaché comme `/bkp`, réponse immédiate
+  (`stdout` = message de lancement, jamais la sortie de l'Index) ; plus de requête bloquée jusqu'au délai d'expiration
+  quand l'Index se met en pause pendant un Bkp. `ALL` et listes acceptés, nick inconnu ⇒ 404.
+- Revue : clé API vérifiée avant le refus `EXTERNAL_OPS` (401, jamais un 403 révélateur) ; `nick=ALL` laissé à la
+  CLI (nicks refusés écartés) ; configuration illisible ⇒ 500 ; `/access` : `bkp_running` `null` si inconnu, `EXTERNAL`
+  invalide ⇒ `external:null`, `ops:["read"]` ; UI : relectures sans chevauchement, fin d'un Bkp court lancé par
+  ▶ Backup vue, motif d'un 403 affiché.
+- UI 1.19.0 : badges 🔗 externe, ⏳ Bkp en cours, 🏗 construction partielle x/y, ♻ reconstruction ; actions interdites
+  masquées (▶ Backup, Bkp/Init/Restore/Prune/DelBkp, 🗑 et ⚡ Prune de l'historique, téléchargements) ; relecture de
+  `/access` toutes les 30 s et **rechargement de la carte d'un serveur à la fin de son Bkp** (demande du 2026-09-27).
+- borgHelper 1.0.144 : `allowed_ops(cfg, nick)` et `ALL_OPS` (liste des opérations permises pour `/access`).
+
 ## borgHelper 1.0.143 — reconstruction dans un fichier fantôme — 2026-09-28
 
 Chantier « reconstruction progressive », story 6 (spine AD-1, AD-2, AD-3, AD-5, AD-6).

@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.143"
+Version="1.0.144"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -855,6 +855,13 @@ def op_allowed(cfg,op,nick=''):
     if not is_external(cfg): return True
     if op=='bkp': return False
     return op in external_ops(cfg,nick)
+
+ALL_OPS=('read','restore','prune','delete','bkp')   # natures d'opération, dans l'ordre d'affichage (1.0.144)
+
+def allowed_ops(cfg,nick=''):
+    """Opérations permises sur ce nick, parmi ALL_OPS, d'après op_allowed (1.0.144) — /access de borgHelperWWW et son UI
+    s'en servent au lieu de recopier la liste (AD-12)."""
+    return [op for op in ALL_OPS if op_allowed(cfg,op,nick)]
 
 def require_op(cfg,op,nick=''):
     """OpNotAllowed si l'opération est refusée — appelé avant tout appel borg."""
@@ -9825,13 +9832,16 @@ def codec_selftest():
             _ix_slow(ctx,'ALL',0.4)
             runs=0; same=True; mono=True; seen=False; prev={}; st_ok=False
             try:
+                bud=3
                 while runs<40:
-                    _q_run(b.index,'rb',budget=3,rebuild=(runs==0)); runs+=1
+                    _q_run(b.index,'rb',budget=bud,rebuild=(runs==0)); runs+=1
                     if not os.path.exists(sp): break
                     same=same and _rb_rows(live,_RB_LIVE)==l0 and len(_q_run(b.treehist,'rb',as_json=True))>20
                     cur=_rb_pair_ids(sp); mono=mono and all(cur.get(k)==v for k,v in prev.items()); prev=cur
                     st=b._status_one('rb').get('rebuild'); seen=True
                     st_ok=st_ok or bool(st and st.get('state')=='partial')
+                    # fantôme complet : budget large pour la bascule (sous charge, 3 s ne couvrent plus le borg list final)
+                    if st and st.get('state')=='complete': bud=60
             finally: _ix_slow(ctx,None,0)
             st_after=b._status_one('rb').get('rebuild')
             ok=(runs>1 and seen and same and mono and st_ok and st_after is None and not os.path.exists(sp) and _rb_outs(b,'rb')==ref)
@@ -10172,11 +10182,13 @@ def codec_selftest():
             with contextlib.redirect_stderr(out),contextlib.redirect_stdout(out):
                 got={n:tuple(op_allowed(cp[n],o,n) for o in ops) for n in ('i','e','w')}
                 raised=raises(OpNotAllowed,lambda: require_op(cp['e'],'bkp','e'))
+                listed={n:allowed_ops(cp[n],n) for n in ('i','e','w')}   # 1.0.144 : /access de borgHelperWWW
             return (got=={'i':(True,)*5,'e':(True,True,False,False,False),'w':(True,False,True,True,False)}
+                    and ALL_OPS==ops and listed=={'i':list(ops),'e':['read','restore'],'w':['read','prune','delete']}
                     and raised and "'bkp'" in out.getvalue() and "'zut'" in out.getvalue()
                     and [command_op(c) for c in ('bkp','init','login','restore','prune','delbkp','index','report','mount')]
                         ==['bkp','bkp','bkp','restore','prune','delete','read','read','read'])
-        check("op_allowed : interne tout permis ; externe read+restore par défaut ; EXTERNAL_OPS élargie ; bkp jamais",_ex_ops_matrix)
+        check("op_allowed/allowed_ops : interne tout permis ; externe read+restore par défaut ; EXTERNAL_OPS élargie ; bkp jamais",_ex_ops_matrix)
         def _ex_real():
             """Vrai dépôt externe (archives par borg create brut, sans GLOB_ARCH ni clé de Bkp) : Index puis commandes de
             lecture, Restore ; Bkp/Prune/DelBkp refusés (code 4) sans aucun borg create/prune/delete ; -n ALL écarte

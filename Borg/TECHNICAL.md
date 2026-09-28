@@ -556,9 +556,20 @@ indexsnap() → voir flux IndexSnap ci-dessous
   vrai, externe jamais `bkp`) et `require_op` (lève `OpNotAllowed`).
 - Contrôle au dispatch CLI, juste après l'expansion de `-n ALL` et avant toute commande : nick nommé et refusé → code
   4 ; `-n ALL` → nick écarté (information). Classement : `command_op(cmd)`, sauf `Restore -L` (lecture) ; `Login`
-  vise le nick de `-s` quand `-n` manque. borgHelperWWW importera `op_allowed` pour `/access` et ses routes (story 7) ;
-  aujourd'hui les routes qui appellent la CLI héritent du refus, mais `/download` (borg direct) et `/bkp` (lancement
-  détaché) ne vérifient rien encore.
+  vise le nick de `-s` quand `-n` manque.
+- **borgHelperWWW (1.28.0, story 7)** : dépendance de routeur `_check_external_ops` (à côté de `_check_group_access`,
+  active même sans `GROUPS_HEADER`). Seule la table `_ROUTE_OPS` (route → nature) vit dans WWW ; la décision vient de
+  `op_allowed`. Clé API vérifiée en premier (401 avant tout 403). `/login` vise `nickname`, sinon `servername` ; nick
+  inconnu (nouveau Login) : non vérifié ; `nick=ALL` : laissé à la CLI (nicks refusés écartés) ; liste explicite : 403
+  au premier refus ; configuration illisible : 500 ; `EXTERNAL` invalide : refus (jamais d'action à l'aveugle). `_http_status` : exitcode 4 → 403 (run_borghelper, cache compris,
+  `_run_scoped`, `_run_scoped_raw`). `/access` ajoute par nick lisible `external`, `ops` (`allowed_ops`, parmi
+  `ALL_OPS`), `build`/`rebuild`/`bkp_running` (`BorgHelper._status_one` : SQLite local, jamais borg). `POST /index` :
+  `_launch_bkp_detached(..., cmd='index')`, comme `/bkp`. UI 1.19.0 : `opAllowed`/`stateBadges`, `ACTIONS[].op`,
+  relecture `/access` toutes les 30 s (`pollAccess`, sans chevauchement ; `bkp_running` `null` = inconnu, jamais
+  une fin) et `reloadMachineCard` à la fin d'un Bkp (▶ Backup marque le nick en cours : un Bkp de moins de 30 s est
+  vu). `borgHelperWWW_ui_test.js` exécute les vraies fonctions de la page (DOM et API simulés) : `opAllowed`,
+  `stateBadges`, `pollAccess`, `renderActionList` (+ `ACTIONS`), `_renderHistoryRows`, `machineCardHtml`,
+  `reloadMachineCard`.
 - `prune()` rend `{'exitcode': 3}` (au lieu de `sys.exit`) pour un nick interne sans `GLOB_ARCH` ou sans aucune
   `KEEP_*` : la boucle `-n ALL` passe au nick suivant.
 - `Prune` : nick interne sans `GLOB_ARCH` refusé (code 3). `DelBkp` pose `priority.lock` et appelle `wait_index_idle`.

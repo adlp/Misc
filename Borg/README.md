@@ -1876,7 +1876,7 @@ servi comme une réponse obsolète.
 | POST | `/bkp` | Bkp *(asynchrone — voir ci-dessous)* | |
 | GET | `/key` | Key | |
 | POST | `/prune` | Prune ⚡ | |
-| POST | `/index` | Index | |
+| POST | `/index` | Index *(asynchrone depuis 1.28.0 — voir ci-dessous)* | |
 | GET | `/search` | Search | ✓ |
 | GET | `/filehist` | FileHist | ✓ |
 | GET | `/treehist` | TreeHist (`changes=true` → `-X`, changements entre `archive_from` exclue et `archive_to`, borgHelperWWW ≥ 1.27.0) | ✓ |
@@ -1905,7 +1905,23 @@ Réponse (`CommandResult`) commune à tous les endpoints ci-dessus :
 {"exitcode": 0, "stdout": "...", "stderr": "..."}
 ```
 
-`exitcode != 0` ⇒ HTTP 400 (le détail reste dans le corps JSON — voir [Codes retour](#codes-retour)).
+`exitcode != 0` ⇒ HTTP 400 (le détail reste dans le corps JSON — voir [Codes retour](#codes-retour)), sauf le code 4
+(opération refusée sur un dépôt externe) ⇒ **HTTP 403** (borgHelperWWW ≥ 1.28.0).
+
+**Dépôts externes** (borgHelperWWW ≥ 1.28.0) : les routes d'action vérifient `EXTERNAL_OPS` **avant** tout borg ou
+sous-processus, avec la fonction de borgHelper (`op_allowed`), et répondent `403` « dépôt externe — opération non
+permise » : `POST /bkp`, `POST /init`, `POST /login` (jamais permis) ; `POST /restore`, `GET /download/file`,
+`GET /download/tar` (si `restore` manque) ; `POST /prune` et `DELETE /delbkp` (si `prune`/`delete` manquent). Actif
+même sans autorisation par groupes ; les groupes s'appliquent en plus. Clé API vérifiée d'abord (401, jamais un 403
+qui révélerait un nick). `nick=ALL` : laissé à la CLI, qui écarte les nicks refusés comme `-n ALL` ; une liste
+explicite contenant un nick refusé ⇒ 403 (comme le code 4 de la CLI).
+
+**⚠️ `POST /index` est asynchrone** (rupture de compatibilité, depuis 1.28.0) : comme `POST /bkp`, elle détache
+`borgHelper -c Index` et répond dès le lancement (`exitcode: 0` = lancé, `stdout` = message de lancement, jamais la
+sortie de l'Index ; `ALL` et les listes de nicks acceptés, nick inconnu ⇒ 404). Le résultat d'un Index lancé ainsi
+n'est pas remonté. Un Index se met en pause sans limite pendant un Bkp/Restore/Prune (borgHelper
+1.0.141) : la requête synchrone restait bloquée jusqu'au délai d'expiration. L'avancement se lit dans `GET /access`
+(`build`).
 
 **⚠️ `POST /bkp` est asynchrone** (rupture de compatibilité, depuis 1.16.0) : contrairement à toutes
 les autres routes ci-dessus, elle ne lance jamais `borgHelper -c Bkp` en l'attendant. Elle détache le
@@ -1937,6 +1953,22 @@ illimité, sinon liste de préfixes canonicalisés ; voir
 
 `groups_auth_enabled: false` (autorisation par groupes désactivée) : `level:"admin"` et
 `read_scope:null`/`restore_scope:null` pour chaque nick, sans cas particulier côté client.
+
+Depuis 1.28.0, chaque nick lisible par l'appelant porte aussi (lectures locales comme `Status`, jamais borg) :
+
+- `external` : dépôt externe (`null` si `EXTERNAL` est invalide — les actions sont alors refusées, `ops` vaut `["read"]`) ;
+- `ops` : opérations permises parmi `read`, `restore`, `prune`, `delete`, `bkp`, calculées par borgHelper ; `null`
+  si la configuration n'a pu être lue (l'UI ne masque alors rien, le serveur refuse toujours) ;
+- `build` : état de la base servie comme `Status -j` — `{"state":"complete"}` ou `{"state":"partial","pairs_done",
+  "pairs_total","archives_total","stats_done","snapshot","updated_at"}` ;
+- `rebuild` : même forme pour le fichier fantôme (`{"state":"partial"}` avant sa première fin de tranche), `null` sans
+  reconstruction ;
+- `bkp_running` : Bkp en cours (`null` = inconnu, base illisible).
+
+Un nick sans droit n'en porte aucun. L'interface web (UI ≥ 1.19.0) s'en sert pour ses badges
+(🔗 externe, ⏳ Bkp en cours, 🏗 construction partielle, ♻ reconstruction), pour masquer les actions interdites sur
+un dépôt externe, et la relit toutes les 30 s (liste et page serveur, onglet visible) : à la fin d'un Bkp, la carte du
+serveur est rechargée.
 
 ⚠️ **Exception à la règle générale "toujours 200 pour un appel authentifié"** — mais **seulement
 pour tout appelant** (depuis 1.20.0, accès direct par périmètre) : `GROUPS_PATHS`

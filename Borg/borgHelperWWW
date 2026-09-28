@@ -60,12 +60,13 @@ sys.path.insert(0,str(Path(__file__).resolve().parent))
 from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail, glob_args,
                          DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec,
                          _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES, _enc_header_read, sentry_alert,
-                         _sentry_alert_kinds, db_plain_anomalies, _cfg_bool, convert_octets_readable)
+                         _sentry_alert_kinds, db_plain_anomalies, _cfg_bool, convert_octets_readable,
+                         op_allowed, allowed_ops, is_external)
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.27.9"
+WWW_VERSION="1.28.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -1071,6 +1072,34 @@ def _check_group_access(request: Request):
             raise HTTPException(403,detail=f"Groupe insuffisant pour '{n}' — accès {_LEVEL_NAMES[required]} requis "
                 f"({GROUPS_HEADER}: {', '.join(sorted(user_groups)) or '(vide)'})")
 
+# ── Dépôts externes : opérations permises (1.28.0, story 7, AD-12) ──────────────────────────────────
+# Seule la table route -> nature d'opération vit ici ; ce qui est permis sur un nick vient toujours de op_allowed
+# (borgHelper), jamais d'une liste recopiée. Active même sans GROUPS_HEADER : EXTERNAL_OPS n'est pas du RBAC.
+_ROUTE_OPS={'/bkp':'bkp','/init':'bkp','/login':'bkp','/restore':'restore','/download/file':'restore',
+            '/download/tar':'restore','/prune':'prune','/delbkp':'delete'}
+
+def _check_external_ops(request: Request):
+    path=request.url.path
+    if API_PREFIX and path.startswith(API_PREFIX): path=path[len(API_PREFIX):]
+    op=_ROUTE_OPS.get(path)
+    if op is None: return   # lecture
+    # Clé API d'abord : un appelant non authentifié reçoit 401, jamais un 403 qui révélerait qu'un nick est externe.
+    require_api_key(request.headers.get('X-API-Key'))
+    qp=request.query_params
+    target=(qp.get('nickname') or qp.get('servername')) if path=='/login' else qp.get('nick')
+    # ALL : comme la CLI (-n ALL), les nicks refusés sont écartés par borgHelper lui-même, les autres traités.
+    if not target or target=='ALL': return
+    for n in _nick_list(target):
+        try: cfg=_bh_paths.borg.cfgread(n)
+        except (Exception,SystemExit) as e:
+            raise HTTPException(500,detail=f"{n} : configuration illisible ({e}) — action refusée")
+        if cfg is None: continue   # nick inconnu (Login d'un nouveau nick) : la route répond comme avant
+        try: ok=op_allowed(cfg,op,n)
+        except SystemExit: ok=False   # EXTERNAL invalide (code 2 en CLI) : jamais d'action à l'aveugle
+        if not ok:
+            raise HTTPException(403,detail=f"{n} : dépôt externe — opération « {op} » non permise"
+                                +("" if op=='bkp' else " (EXTERNAL_OPS)"))
+
 # Toutes les routes API métier sont déclarées sur ce routeur (préfixe appliqué en fin de fichier via
 # app.include_router) — seuls '/', '/version', '/healthz' (plus les fichiers statiques /sw.js,
 # /static/…, /favicon.ico et les adresses de l'UI /serveur/…, /explorer/…, /historique/…,
@@ -1078,7 +1107,7 @@ def _check_group_access(request: Request):
 # apprend ce préfixe doivent être joignables sans le connaître à l'avance).
 # dependencies=[Depends(_check_group_access)] : appliqué à CHAQUE route du routeur, en plus de
 # require_api_key (appelé individuellement dans chaque fonction).
-router=APIRouter(dependencies=[Depends(_check_group_access)],route_class=_ExitGuardRoute)
+router=APIRouter(dependencies=[Depends(_check_group_access),Depends(_check_external_ops)],route_class=_ExitGuardRoute)
 
 # ── Exécution borgHelper ────────────────────────────────────────────────────
 
@@ -1827,16 +1856,21 @@ def _exec_borghelper(cmd: str, nick: Optional[str], extra_args, passphrase: Opti
         raise HTTPException(504,detail=f"Commande {cmd} : timeout après {TIMEOUT}s")
     return CommandResult(exitcode=proc.returncode,stdout=proc.stdout,stderr=proc.stderr)
 
-def _launch_bkp_detached(nick: str, extra_args, passphrase: Optional[str]=None) -> int:
-    """Lance `borgHelper -c Bkp` en sous-processus détaché (AD-2) : jamais attendu par la requête
+def _launch_bkp_detached(nick: str, extra_args, passphrase: Optional[str]=None, cmd: str='bkp') -> int:
+    """Lance `borgHelper -c Bkp` (ou `cmd`, 'index' pour POST /index depuis 1.28.0 : aucun suivi de résultat, seul
+    l'avancement se lit dans /access) en sous-processus détaché (AD-2) : jamais attendu par la requête
     HTTP — le résultat réel est capté par `bkp_status` (borgHelper) et réclamé par le watcher, pas
     par le stdout/stderr/exitcode de ce sous-processus (jamais lus ici, `DEVNULL`).
     `start_new_session=True` : le sous-processus survit à un redémarrage de borgHelperWWW pendant la
     sauvegarde (AD-2) — sans ça, un redémarrage pendant un Bkp le tuerait avec le worker parent."""
-    argv,env=_build_borghelper_argv_env('bkp',nick,extra_args,passphrase)
+    argv,env=_build_borghelper_argv_env(cmd,nick,extra_args,passphrase)   # cmd='index' : POST /index (1.28.0)
     proc=subprocess.Popen(argv,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,stdin=subprocess.DEVNULL,
                            env=env,start_new_session=True)
     return proc.pid
+
+def _http_status(exitcode) -> int:
+    """Statut HTTP d'un résultat CLI : 0 -> 200, 4 (opération refusée sur un dépôt externe, 1.28.0) -> 403, sinon 400."""
+    return 200 if exitcode==0 else 403 if exitcode==4 else 400
 
 def run_borghelper(cmd: str, nick: Optional[str]=None, extra_args=(), passphrase: Optional[str]=None,
                     cacheable: bool=False) -> JSONResponse:
@@ -1847,12 +1881,12 @@ def run_borghelper(cmd: str, nick: Optional[str]=None, extra_args=(), passphrase
         cached=_RESPONSE_CACHE.get(key)
         if cached is not None and cached[0]==_cache_fingerprint(nick):
             result_dict=cached[1]
-            return JSONResponse(status_code=200 if result_dict['exitcode']==0 else 400,content=result_dict)
+            return JSONResponse(status_code=_http_status(result_dict['exitcode']),content=result_dict)
     result=_exec_borghelper(cmd,nick,extra_args,passphrase)
     if key is not None and not _is_db_key_error(result):
         if len(_RESPONSE_CACHE)>500: _RESPONSE_CACHE.clear()  # garde-fou anti-croissance illimitée
         _RESPONSE_CACHE[key]=(_cache_fingerprint(nick),result.dict())
-    return JSONResponse(status_code=200 if result.exitcode==0 else 400,content=result.dict())
+    return JSONResponse(status_code=_http_status(result.exitcode),content=result.dict())
 
 # ── Filtrage a posteriori par périmètre (Story 1.3) ─────────────────────────
 # _run_scoped() : variante non-cacheable de run_borghelper() pour les 6 routes Search/FileHist/
@@ -1874,7 +1908,7 @@ def _run_scoped(cmd: str, nick: str, extra_args, filter_fn, passphrase: Optional
             # stdout non-JSON malgré -j : ne devrait jamais arriver, mais un appelant a un périmètre
             # restreint ici — fail-closed (jamais relayer du stdout non filtré), pas fail-open.
             result.exitcode=1; result.stdout=''; result.stderr=(result.stderr or '')+"\n[borgHelperWWW] réponse non-JSON reçue pour un appelant à périmètre restreint — requête refusée."
-    return JSONResponse(status_code=200 if result.exitcode==0 else 400,content=result.dict())
+    return JSONResponse(status_code=_http_status(result.exitcode),content=result.dict())
 
 def _filter_per_nick_list(results,scopes,path_key='path'):
     """Search : `results` = {nick: [{...,path_key:...}, ...] | {'error':msg}}. Filtre chaque liste
@@ -2024,7 +2058,7 @@ def _run_scoped_raw(cmd,nick,extra_args,raw_flag,filter_fn,passphrase=None):
             result.stdout=json.dumps(filter_fn(parsed),ensure_ascii=False,indent=2)
         except ValueError:
             result.exitcode=1; result.stdout=''; result.stderr=(result.stderr or '')+"\n[borgHelperWWW] réponse non-JSON reçue pour un appelant à périmètre restreint — requête refusée."
-    return JSONResponse(status_code=200 if result.exitcode==0 else 400,content=result.dict())
+    return JSONResponse(status_code=_http_status(result.exitcode),content=result.dict())
 
 # ── Enveloppes de cache par périmètre autour de _run_scoped/_run_scoped_raw (Story 1.5) ────────
 # Jamais à l'intérieur de _run_scoped()/_run_scoped_raw() elles-mêmes (Code Map du spec 1.5 : ces
@@ -2474,13 +2508,27 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
                                       _bh_paths.borg.cfgread(n))
         except Exception:
             return []
+    def _state(n):
+        """1.28.0 (story 7, AD-10/AD-12) : dépôt externe, opérations permises (allowed_ops de borgHelper), état de
+        construction et Bkp en cours — lectures locales comme Status (jamais borg, rien créé)."""
+        out={'external':False,'ops':None,'build':None,'rebuild':None,'bkp_running':None}
+        try:
+            cfg=_bh_paths.borg.cfgread(n)
+            if cfg is not None: out.update(external=is_external(cfg),ops=allowed_ops(cfg,n))
+        except SystemExit: out.update(external=None,ops=['read'])   # EXTERNAL invalide : les routes d'action refusent
+        except Exception: pass
+        try:   # bkp_running None = inconnu (base illisible…) : l'UI n'y voit jamais une fin de Bkp
+            st=_bh_paths._status_one(n)
+            out.update(build=st.get('build'),rebuild=st.get('rebuild'),bkp_running=bool(st.get('bkp_running')))
+        except (Exception,SystemExit): pass
+        return out
     if not GROUPS_HEADER:
         # Fonctionnalité désactivée : pas de restriction par nick ni de périmètre, seuls
         # allow_destructive/allow_downloads (globaux) s'appliquent — 'admin'/scope:null partout
         # reflète cette absence de restriction par groupes pour que l'UI n'ait qu'une seule forme
         # de réponse à traiter, sans cas particulier côté client.
         return {'groups_auth_enabled':False,
-                'nicks':{n:{'level':'admin','read_scope':None,'restore_scope':None,'db_plain':_plain(n)} for n in nicks}}
+                'nicks':{n:{'level':'admin','read_scope':None,'restore_scope':None,'db_plain':_plain(n),**_state(n)} for n in nicks}}
     user_groups=_parse_groups(request.headers.get(GROUPS_HEADER))
     level_names={0:'none',1:'read',2:'write',3:'admin'}
     result={}
@@ -2495,6 +2543,7 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
         restore_scope=_resolve_path_scope(user_groups,cfg,for_restore=True) if cfg is not None else None
         result[n]={'level':level_names[eff],'read_scope':read_scope,'restore_scope':restore_scope,
                    'db_plain':_plain(n) if eff>0 else []}  # rien révélé d'un nick sans droit
+        if eff>0: result[n].update(_state(n))
     return {'groups_auth_enabled':True,'nicks':result}
 
 @router.get("/stats",response_model=CommandResult,tags=["lecture"])
@@ -2637,15 +2686,28 @@ def prune(nick: str, x_api_key: Optional[str]=Header(default=None), x_borg_passp
     require_destructive_allowed()
     return run_borghelper('prune',nick=nick,passphrase=x_borg_passphrase)
 
-@router.post("/index",response_model=CommandResult,tags=["mutation"])
+@router.post("/index",response_model=CommandResult,tags=["mutation"],
+    summary="Lance un Index en tâche de fond — répond dès le lancement (1.28.0)",
+    description="⚠️ Asynchrone depuis 1.28.0 : détache `borgHelper -c Index` et répond dès son lancement. Un Index se "
+        "met en pause sans limite pendant un Bkp/Restore/Prune (borgHelper 1.0.141) : la requête synchrone restait "
+        "bloquée jusqu'au délai d'expiration. `exitcode=0` = lancement réussi ; l'avancement se lit dans /access "
+        "(`build`).")
 def index(nick: str, force: bool=False, snapshot_only: bool=False, archive: Optional[str]=None,
           x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
+    unknown=[n for n in ([] if nick=='ALL' else _nick_list(nick)) if _bh_paths.borg.cfgread(n) is None]
+    if unknown or not nick:
+        raise HTTPException(404,detail=f"Nick inconnu : {', '.join(unknown) or nick}")   # ALL et listes : comme la CLI
     extra=[]
     if force: extra.append('-F')
     if snapshot_only: extra.append('-S')
     if archive: extra+=['-A',archive]
-    return run_borghelper('index',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
+    try:
+        pid=_launch_bkp_detached(nick,extra,x_borg_passphrase,cmd='index')
+    except OSError as e:
+        raise HTTPException(500,detail=f"Échec du lancement d'Index pour {nick} : {e}")
+    return CommandResult(exitcode=0,stdout=f"Index lancé pour {nick} (pid {pid}) — asynchrone, avancement dans /access (build)",
+                         stderr="")
 
 @router.get("/search",response_model=CommandResult,tags=["lecture"])
 def search(nick: str, pattern: str, request: Request, archive_from: Optional[str]=None, archive_to: Optional[str]=None,
@@ -3841,6 +3903,114 @@ def push_selftest():
                 r=client.get(f"{P}/access",headers=H)
                 check("route /access : champ db_plain (liste) pour chaque nick (badge « base non chiffrée »)",
                       lambda: r.status_code==200 and all(isinstance(v.get('db_plain'),list) for v in r.json()['nicks'].values()))
+                # ── Dépôts externes et état de construction (1.28.0, story 7, AD-10/AD-12) ──
+                from starlette.requests import Request as _Rq
+                _orig_cfgread=_bh_paths.borg.cfgread
+                def _ext_cfg(ops=None):
+                    d={'EXTERNAL':'true','BORG_REPO':'/inexistant-selftest','BORG_PASSPHRASE':'x'}
+                    if ops is not None: d['EXTERNAL_OPS']=ops
+                    return d
+                _fake={'xd':_ext_cfg(),'xr':_ext_cfg('read'),'xp':_ext_cfg('read,prune'),'xb':_ext_cfg('read,restore,prune,delete,bkp'),
+                       'xi':{'EXTERNAL':'peut-etre','BORG_REPO':'/inexistant-selftest'}}
+                def _fake_cfg():
+                    return mock.patch.object(_bh_paths.borg,'cfgread',
+                        side_effect=lambda n,*a,**k: _fake[n] if n in _fake else _orig_cfgread(n,*a,**k))
+                _internal=next((n for n in _nick_list('ALL') if not is_external(_orig_cfgread(n))),None)
+                def _dep(path,qs,key=API_KEY):
+                    hdr=[(b'x-api-key',key.encode())] if key else []
+                    req=_Rq({'type':'http','method':'POST','path':P+path,'query_string':qs.encode(),'headers':hdr})
+                    try: _check_external_ops(req); return 200
+                    except HTTPException as e: return e.status_code
+                def _ext_dep_matrix():
+                    """Refus en amont : table route -> opération, décision par op_allowed (borgHelper). Défaut read,restore ;
+                    EXTERNAL_OPS élargie ; bkp jamais ; lecture toujours ; nick interne et nick inconnu (Login) inchangés."""
+                    with _fake_cfg():
+                        got={k:_dep(p,q) for k,(p,q) in {
+                            'bkp':('/bkp','nick=xd'),'init':('/init','nick=xd'),'login':('/login','servername=s&nickname=xd'),
+                            'login_srv':('/login','servername=xd'),'restore':('/restore','nick=xd'),'dl':('/download/file','nick=xd'),
+                            'dl_read':('/download/tar','nick=xr'),'restore_read':('/restore','nick=xr'),'prune':('/prune','nick=xd'),
+                            'prune_p':('/prune','nick=xp'),'del_p':('/delbkp','nick=xp'),'bkp_listed':('/bkp','nick=xb'),
+                            'perms':('/restore/perms','nick=xr'),'index':('/index','nick=xr'),'new':('/login','servername=nouveau-selftest'),
+                            'int_bkp':('/bkp',f'nick={_internal}'),'int_del':('/delbkp',f'nick={_internal}'),
+                            'all':('/prune','nick=ALL'),'list':('/prune',f'nick={_internal},xd'),'invalid':('/download/file','nick=xi')}.items()}
+                        got['no_key']=_dep('/bkp','nick=xd',key=None)
+                    want={'bkp':403,'init':403,'login':403,'login_srv':403,'restore':200,'dl':200,'dl_read':403,'restore_read':403,
+                          'prune':403,'prune_p':200,'del_p':403,'bkp_listed':403,'perms':200,'index':200,'new':200,'int_bkp':200,'int_del':200,
+                          'all':200,'list':403,'invalid':403,'no_key':401}
+                    if got!=want: print(f"  écarts : { {k:(got[k],want[k]) for k in want if got[k]!=want[k]} }")
+                    return got==want
+                if _internal is None: print("SKIP dépôts externes : aucun nick interne dans ce rc")
+                else: check("EXTERNAL_OPS en amont : 403 sur Bkp/Init/Login, Restore et téléchargements selon EXTERNAL_OPS, Prune/DelBkp si listés, "
+                            "lecture et nick interne libres ; ALL laissé à la CLI, liste refusée ; EXTERNAL invalide refusé ; sans clé 401",_ext_dep_matrix)
+                def _ext_http():
+                    """HTTP : POST /bkp et GET /download/file refusés (403, message « dépôt externe ») sans lancer ni processus ni borg."""
+                    with _fake_cfg(), mock.patch(f"{__name__}._launch_bkp_detached") as launch, \
+                         mock.patch.object(subprocess,'Popen') as popen:
+                        rb=client.post(f"{P}/bkp",headers=H,params={'nick':'xd'})
+                        rd=client.get(f"{P}/download/file",headers=H,params={'nick':'xr','path':'etc/x'})
+                        return (rb.status_code==403 and 'dépôt externe' in rb.json()['detail'] and rd.status_code==403
+                                and not launch.called and not popen.called)
+                check("POST /bkp et /download/file sur un dépôt externe : 403 sans aucun processus lancé",_ext_http)
+                def _code4():
+                    """Code de sortie 4 de la CLI -> HTTP 403, y compris servi depuis le cache ; 0 -> 200, autre -> 400."""
+                    res=CommandResult(exitcode=4,stdout='',stderr="x: dépôt externe — opération « prune » non permise")
+                    with mock.patch(f"{__name__}._exec_borghelper",return_value=res):
+                        a=run_borghelper('selftest-code4',nick=_internal,cacheable=True)
+                        b=run_borghelper('selftest-code4',nick=_internal,cacheable=True)
+                    for k in [k for k in _RESPONSE_CACHE if k and k[0]=='selftest-code4']: _RESPONSE_CACHE.pop(k,None)
+                    return a.status_code==b.status_code==403 and (_http_status(0),_http_status(1),_http_status(4))==(200,400,403)
+                check("code de sortie 4 de la CLI -> HTTP 403 (cache compris)",_code4)
+                def _access_state():
+                    """/access : external, ops (allowed_ops de borgHelper), build, rebuild, bkp_running par nick lisible ; nick
+                    sans droit : rien de plus."""
+                    r=client.get(f"{P}/access",headers=H); nk=r.json()['nicks']
+                    keys={'external','ops','build','rebuild','bkp_running'}
+                    ok=r.status_code==200 and all(keys<=set(v) for v in nk.values())
+                    if _internal: ok=ok and nk[_internal]['external'] is False and nk[_internal]['ops']==list(sys.modules['borgHelper'].ALL_OPS)
+                    if 'demo-externe' in nk:
+                        ok=ok and nk['demo-externe']['external'] is True and nk['demo-externe']['ops']==['read','restore']
+                    with mock.patch(f"{__name__}.GROUPS_HEADER",'X-Groups'):
+                        rn=client.get(f"{P}/access",headers={**H,'X-Groups':'aucun-groupe-selftest'})
+                    none=[v for v in rn.json()['nicks'].values() if v['level']=='none']
+                    ok=ok and none and all(not (keys & set(v)) for v in none)
+                    if not ok: print(f"  /access : {r.status_code} {json.dumps(nk,ensure_ascii=False)[:400]}")
+                    return bool(ok)
+                check("/access : external, ops, build, rebuild, bkp_running par nick lisible ; rien pour un nick sans droit",_access_state)
+                def _access_values():
+                    """/access relaie les VALEURS de Status (Bkp en cours, construction, fantôme) ; lecture en échec -> bkp_running
+                    inconnu (None), jamais « fini » ; EXTERNAL invalide -> external None, ops ['read']."""
+                    st={'build':{'state':'partial','pairs_done':1,'pairs_total':3},'rebuild':{'state':'partial'},
+                        'bkp_running':{'started_at':'2026-09-28T10:00:00'}}
+                    with mock.patch.object(_bh_paths,'_status_one',return_value=st):
+                        a=client.get(f"{P}/access",headers=H).json()['nicks'][_internal]
+                    with mock.patch.object(_bh_paths,'_status_one',side_effect=sqlite3.OperationalError('database is locked')):
+                        b=client.get(f"{P}/access",headers=H).json()['nicks'][_internal]
+                    with mock.patch.object(_bh_paths.borg,'cfgread',side_effect=lambda n,*x,**k: _fake['xi'] if n==_internal else _orig_cfgread(n,*x,**k)):
+                        c=client.get(f"{P}/access",headers=H).json()['nicks'][_internal]
+                    return (a['bkp_running'] is True and a['build']==st['build'] and a['rebuild']==st['rebuild']
+                            and b['bkp_running'] is None and b['build'] is None and c['external'] is None and c['ops']==['read'])
+                if _internal: check("/access : valeurs de Status relayées ; lecture en échec -> bkp_running inconnu ; EXTERNAL invalide -> ops read",_access_values)
+                def _index_async():
+                    """POST /index asynchrone : lancement détaché (cmd index, options transmises), réponse immédiate ; nick inconnu 404."""
+                    with mock.patch(f"{__name__}._launch_bkp_detached",return_value=4242) as launch:
+                        r=client.post(f"{P}/index",headers=H,params={'nick':_internal,'force':'true'})
+                        args=launch.call_args
+                        u=client.post(f"{P}/index",headers=H,params={'nick':'inconnu-selftest'})
+                        ul=client.post(f"{P}/index",headers=H,params={'nick':f"{_internal},inconnu-selftest"})
+                        al=client.post(f"{P}/index",headers=H,params={'nick':'ALL'})
+                    return (r.status_code==200 and r.json()['exitcode']==0 and 'lancé' in r.json()['stdout'] and u.status_code==404
+                            and ul.status_code==404 and al.status_code==200 and launch.call_count==2
+                            and args.kwargs.get('cmd')=='index' and args.args[1]==['-F'] and launch.call_args.args[0]=='ALL')
+                if _internal: check("POST /index asynchrone : lancé détaché, réponse immédiate ; ALL lancé ; nick inconnu (seul ou en liste) 404",_index_async)
+                def _no_ops_list():
+                    """Autorité unique (AD-12) : aucune liste d'opérations permises recopiée — WWW ne tient que _ROUTE_OPS (natures
+                    connues de borgHelper), l'UI lit ops de /access."""
+                    src=Path(__file__).read_text(encoding='utf-8'); src=src[:src.index('def push_selftest(')]   # hors contrôles
+                    www_ok=(set(_ROUTE_OPS.values())<=set(sys.modules['borgHelper'].ALL_OPS)
+                            and not re.search(r"""['"]EXTERNAL_OPS['"]\s*\]|get\(\s*['"]EXTERNAL_OPS""",src))
+                    ui_ok=not re.search(r"""\[\s*['"](read|restore|prune|delete|bkp)['"]\s*,\s*['"](read|restore|prune|delete|bkp)['"]""",_UI_HTML)
+                    return www_ok and ui_ok and 'opAllowed(' in _UI_HTML
+                check("aucune liste d'opérations permises recopiée dans borgHelperWWW ni dans l'UI (op_allowed/allowed_ops seuls)",_no_ops_list)
                 def _schema_watch_ok():
                     """1.26.6 : vue divergente réparée par la passe périodique ; code en mémoire périmé (borgHelper
                     mis à jour sur disque) -> jamais réparée, avertissement « redémarrer » une seule fois.

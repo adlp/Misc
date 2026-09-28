@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.18.0 -->
+<!-- UI_VERSION: 1.19.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -385,7 +385,39 @@ function applyBadges(){
   document.getElementById('destructiveBadge').hidden = allowDestructive && (myAccess?userMax>=3:true);
   document.getElementById('downloadsBadge').hidden = allowDownloads && hasAnyAccess;
   document.getElementById('fullAccessBadge').hidden = !(allowDestructive && allowDownloads && allAdmin);
-  document.getElementById('historyPruneBtn').hidden = !(allowDestructive && (myAccess?userMax>=3:true));
+  document.getElementById('historyPruneBtn').hidden = !(allowDestructive && (myAccess?userMax>=3:true)
+    && (currentViewId!=='view-history' || opAllowed(currentNick,'prune')));
+}
+
+// Opérations permises par nick (UI 1.19.0, /access -> ops, calculées par borgHelper : jamais de liste ici).
+// Sans ops (borgHelperWWW < 1.28.0, ou nick sans droit), rien n'est masqué : le serveur refuse de toute façon.
+function opAllowed(nick,op){
+  const a=myAccess && myAccess.nicks && myAccess.nicks[nick];
+  if(!a || !Array.isArray(a.ops)) return true;
+  return a.ops.includes(op);
+}
+// Badges d'état (UI 1.19.0) : dépôt externe, Bkp en cours, construction partielle, reconstruction (fichier fantôme).
+function stateBadges(nick){
+  const a=myAccess && myAccess.nicks && myAccess.nicks[nick];
+  if(!a) return '';
+  let h='';
+  if(a.external) h+=`<span class="badge" title="${escapeAttr('Dépôt externe : archives créées hors borgHelper. Opérations permises : '+(a.ops||[]).join(', '))}">🔗 externe</span> `;
+  if(a.bkp_running) h+='<span class="badge warn" title="Sauvegarde en cours">⏳ Bkp en cours</span> ';
+  const b=a.build;
+  if(b && b.state==='partial'){
+    const st=(b.stats_done!=null)?`, statistiques ${b.stats_done}/${b.archives_total}`:'';
+    h+=`<span class="badge warn" title="${escapeAttr('Historique partiel — Index par tranches en cours'+st)}">🏗 construction partielle ${b.pairs_done}/${b.pairs_total}</span> `;
+  }
+  const rb=a.rebuild;
+  if(rb){
+    const txt=rb.pairs_total==null?'démarrée':(rb.state==='complete'?'prête à basculer':`en cours ${rb.pairs_done}/${rb.pairs_total}`);
+    h+=`<span class="badge" title="Reconstruction dans un fichier fantôme : la base actuelle reste servie jusqu'à la bascule">♻ reconstruction ${txt}</span> `;
+  }
+  return h;
+}
+function refreshStateBadges(){
+  document.querySelectorAll('.state-badges[data-nick]').forEach(el=>{ el.innerHTML=stateBadges(el.dataset.nick); });
+  const d=document.getElementById('detailStateBadges'); if(d && currentNick) d.innerHTML=stateBadges(currentNick);
 }
 
 // Versions + postures de sécurité chargées au démarrage de borgHelperWWW (endpoint public, non
@@ -594,15 +626,28 @@ async function loadMachines(){
   const errFlags={};
   listEl.innerHTML=nicks.map(nick=>{
     const s=summary[nick];
-    const hasPass=!!passes[nick];
     const isErr=(s['nom']||'').startsWith('***');
     errFlags[nick]=isErr;
+    return machineCardHtml(nick,s,!!passes[nick],isErr);
+  }).join('');
+  machineCardsByNick={};
+  Array.from(listEl.querySelectorAll('.machine-card')).forEach((card,i)=>{
+    machineCardsByNick[nicks[i]]=card;
+    loadHistoryInline(nicks[i],card.querySelector('.history-panel'));
+  });
+  jumpEl.innerHTML=nicks.map(nick=>
+    `<a href="#" class="jump-link${errFlags[nick]?' jump-err':''}" data-nick="${escapeAttr(nick)}">${escapeHtml(nick)}</a>`
+  ).join(' · ');
+}
+
+// Carte d'un serveur (liste) — aussi utilisée pour recharger UNE carte à la fin d'un Bkp (UI 1.19.0).
+function machineCardHtml(nick,s,hasPass,isErr){
     return `
       <div class="machine-card card" style="margin-bottom:14px">
         <div class="machine-head">
-          <h3${isErr?' class="nick-err"':''}>${escapeHtml(nick)} ${badgeFor(s['depuis'])} ${plainDbBadge(nick)}</h3>
+          <h3${isErr?' class="nick-err"':''}>${escapeHtml(nick)} ${badgeFor(s['depuis'])} ${plainDbBadge(nick)} <span class="state-badges" data-nick="${escapeAttr(nick)}">${stateBadges(nick)}</span></h3>
           <div>
-            <button class="secondary bkp-now-btn" data-nick="${escapeAttr(nick)}">▶ Backup</button>
+            ${opAllowed(nick,'bkp')?`<button class="secondary bkp-now-btn" data-nick="${escapeAttr(nick)}">▶ Backup</button>`:''}
             <button class="secondary explore-btn" data-nick="${escapeAttr(nick)}">🗂 Explorer</button>
             <button class="secondary history-btn" data-nick="${escapeAttr(nick)}">📜 Historique complet</button>
             <button class="open-machine-btn" data-nick="${escapeAttr(nick)}">Ouvrir →</button>
@@ -626,16 +671,43 @@ async function loadMachines(){
           <span class="pill">🔑 passphrase : ${hasPass?'✓ enregistrée pour la session':'non renseignée — à saisir sur la page du serveur'}</span>
         </div>
       </div>`;
-  }).join('');
-  machineCardsByNick={};
-  Array.from(listEl.querySelectorAll('.machine-card')).forEach((card,i)=>{
-    machineCardsByNick[nicks[i]]=card;
-    loadHistoryInline(nicks[i],card.querySelector('.history-panel'));
-  });
-  jumpEl.innerHTML=nicks.map(nick=>
-    `<a href="#" class="jump-link${errFlags[nick]?' jump-err':''}" data-nick="${escapeAttr(nick)}">${escapeHtml(nick)}</a>`
-  ).join(' · ');
 }
+
+// Fin de Bkp (UI 1.19.0) : recharge la carte d'un seul serveur (rapport hors ligne + 10 dernières sauvegardes).
+async function reloadMachineCard(nick){
+  const old=machineCardsByNick[nick]; if(!old || !old.isConnected) return;
+  const r=await apiCall('GET','/report',{nick,offline:'true',json:'true'},false);
+  let s=null;
+  try{ s=(JSON.parse(r.stdout).summary||{})[nick]; }catch(e){}
+  if(!s || !old.isConnected) return;
+  const isErr=(s['nom']||'').startsWith('***');
+  const tmp=document.createElement('div'); tmp.innerHTML=machineCardHtml(nick,s,!!getPassphrase(nick),isErr).trim();
+  const card=tmp.firstElementChild; old.replaceWith(card); machineCardsByNick[nick]=card;
+  loadHistoryInline(nick,card.querySelector('.history-panel'));
+  document.querySelectorAll('#machinesJump .jump-link').forEach(a=>{ if(a.dataset.nick===nick) a.classList.toggle('jump-err',isErr); });
+}
+
+// Relecture de /access toutes les 30 s (UI 1.19.0) sur la liste et la page d'un serveur, onglet visible :
+// badges d'état à jour (tranches cron, reconstruction) ; Bkp passé de « en cours » à « fini » -> carte rechargée
+// (liste) ou badges/actions de la page serveur rafraîchis.
+let pollBusy=false;
+async function pollAccess(){
+  if(pollBusy || document.hidden || !getApiKey() || !myAccess) return;   // jamais deux relectures qui se chevauchent
+  if(currentViewId!=='view-machines' && currentViewId!=='view-detail') return;
+  const before={}; Object.entries(myAccess.nicks||{}).forEach(([n,a])=>{ before[n]=!!a.bkp_running; });
+  pollBusy=true;
+  let r;
+  try{ r=await loadMyAccess(); } finally{ pollBusy=false; }
+  if(!r) return;
+  refreshStateBadges();
+  Object.entries(r.nicks||{}).forEach(([n,a])=>{
+    // seulement la fin d'un Bkp vu en cours ; null = inconnu (base illisible), jamais pris pour une fin
+    if(!before[n] || a.bkp_running || a.bkp_running==null) return;
+    if(currentViewId==='view-machines') reloadMachineCard(n);
+    else if(currentViewId==='view-detail' && n===currentNick) renderActionList();
+  });
+}
+setInterval(pollAccess,30000);
 
 let machineCardsByNick={};
 document.getElementById('machinesJump').addEventListener('click', e=>{
@@ -661,7 +733,7 @@ function _renderHistoryRows(backups,withActions){
   if(archives.length===0) return {archives,html:''};
   const html=archives.map(a=>{
     const b=backups[a];
-    const deleteBtn=allowDestructive?`<button class="danger hist-delete-btn" data-archive="${escapeAttr(a)}">🗑 Supprimer</button>`:'';
+    const deleteBtn=(allowDestructive&&opAllowed(currentNick,'delete'))?`<button class="danger hist-delete-btn" data-archive="${escapeAttr(a)}">🗑 Supprimer</button>`:'';
     const actionsTd=withActions?`<td class="hist-actions">
         <button class="secondary hist-explore-btn" data-archive="${escapeAttr(a)}">🗂 Explorer</button>
         <button class="secondary hist-changes-btn" data-archive="${escapeAttr(a)}" title="Explorer seulement ce qui a changé depuis la sauvegarde précédente">🔀 Changements</button>
@@ -699,6 +771,7 @@ function openHistory(nick){
   document.getElementById('historyTitle').textContent='Historique complet — '+nick;
   document.getElementById('historyError').textContent='';
   showView('view-history');
+  applyBadges();   // ⚡ Prune masqué si le dépôt externe ne le permet pas (UI 1.19.0)
   loadHistoryFull(nick);
   loadCharts(nick);
 }
@@ -1031,9 +1104,11 @@ async function runBackupNow(nick,btn){
   btn.disabled=false; btn.textContent=orig;
   if(r.httpStatus===401) return;
   if(r.exitcode===0){
+    // Fin de ce Bkp repérée par la relecture de /access même s'il dure moins de 30 s (UI 1.19.0)
+    const a=myAccess && myAccess.nicks && myAccess.nicks[nick]; if(a) a.bkp_running=true;
     alert(`Backup ${nick} démarré — sauvegarde en cours en arrière-plan (résultat non affiché ici pour l'instant).`);
   }else{
-    alert(`Échec du lancement du backup ${nick} (exitcode ${r.exitcode}) :\n`+(r.stderr||r.stdout||'(pas de détail)'));
+    alert(`Échec du lancement du backup ${nick} (HTTP ${r.httpStatus}) :\n`+(r.detail||r.stderr||r.stdout||'(pas de détail)'));
   }
   loadMachines();
 }
@@ -1110,16 +1185,16 @@ const ACTIONS=[
   {id:'restoreperms', label:"Droits d'un fichier (sans restaurer)", method:'GET', path:'/restore/perms', needsPass:true,
     params:[{name:'ftor',label:'Chemin ou glob',type:'text',required:true},
             {name:'bid',label:'Archive (vide = dernière)',type:'text'}]},
-  {id:'bkp', label:'Lancer un backup (asynchrone — répond dès le lancement)', method:'POST', path:'/bkp', needsPass:true,
+  {id:'bkp', op:'bkp', label:'Lancer un backup (asynchrone — répond dès le lancement)', method:'POST', path:'/bkp', needsPass:true,
     params:[{name:'no_index',label:"Désactiver l'indexation",type:'bool'}]},
-  {id:'index', label:'Indexer', method:'POST', path:'/index', needsPass:true,
+  {id:'index', label:'Indexer (asynchrone — répond dès le lancement)', method:'POST', path:'/index', needsPass:true,
     params:[{name:'force',label:'Forcer la réindexation',type:'bool'},
             {name:'snapshot_only',label:'Snapshot seul',type:'bool'},
             {name:'archive',label:'Archive spécifique (vide = toutes)',type:'text'}]},
-  {id:'init', label:'Initialiser le dépôt', method:'POST', path:'/init', needsPass:true,
+  {id:'init', op:'bkp', label:'Initialiser le dépôt', method:'POST', path:'/init', needsPass:true,
     params:[], destructive:true, confirmMsg:'Initialiser un nouveau dépôt borg pour ce serveur ?'},
   {id:'cacheclean', label:'Nettoyer le cache', method:'POST', path:'/cacheclean', needsPass:false, params:[]},
-  {id:'restore', label:'Restaurer (écrit sur le disque du serveur borgHelperWWW)', method:'POST', path:'/restore', needsPass:true,
+  {id:'restore', op:'restore', label:'Restaurer (écrit sur le disque du serveur borgHelperWWW)', method:'POST', path:'/restore', needsPass:true,
     params:[{name:'ftor',label:'Chemin ou glob à restaurer',type:'text',required:true},
             {name:'where',label:'Destination (chemin local au serveur borgHelperWWW)',type:'text',required:true},
             {name:'bid',label:'Archive (vide = dernière)',type:'text'},
@@ -1129,9 +1204,9 @@ const ACTIONS=[
     params:[{name:'pattern',label:'Motif explicite (vide = IDX_EXCLUDE/IDX_INCLUDE de la conf)',type:'text'},
             {name:'dryrun',label:'Dry-run (aucune suppression)',type:'bool'}],
     destructive:true, confirmMsg:'Purger rétroactivement diff_index et les anciens snapshots ?'},
-  {id:'prune', label:'⚡ Purger les vieux backups (Prune)', method:'POST', path:'/prune', needsPass:true,
+  {id:'prune', op:'prune', label:'⚡ Purger les vieux backups (Prune)', method:'POST', path:'/prune', needsPass:true,
     params:[], destructive:true, requiresDestructive:true, confirmMsg:'DANGER : supprime les archives selon KEEP_*. Irréversible. Continuer ?'},
-  {id:'delbkp', label:'⚡ Supprimer une archive (DelBkp)', method:'DELETE', path:'/delbkp', needsPass:true,
+  {id:'delbkp', op:'delete', label:'⚡ Supprimer une archive (DelBkp)', method:'DELETE', path:'/delbkp', needsPass:true,
     params:[{name:'bid',label:'Archive à supprimer',type:'text',required:true}],
     destructive:true, requiresDestructive:true, confirmMsg:'DANGER : suppression définitive de cette archive. Continuer ?'},
 ];
@@ -1139,7 +1214,7 @@ const ACTIONS=[
 function openMachine(nick){
   currentNick=nick;
   document.getElementById('detailTitle').textContent=nick;
-  document.getElementById('detailPlainBadge').innerHTML=plainDbBadge(nick);
+  document.getElementById('detailPlainBadge').innerHTML=plainDbBadge(nick)+` <span id="detailStateBadges">${stateBadges(nick)}</span>`;
   document.getElementById('detailPass').value=getPassphrase(nick);
   updateDetailPassStatus();
   renderActionList();
@@ -1161,8 +1236,9 @@ function updateDetailPassStatus(){
 
 function renderActionList(){
   const ul=document.getElementById('actionList');
-  ul.innerHTML=ACTIONS.filter(a=>!a.requiresDestructive||allowDestructive)
-    .map(a=>`<li><button class="${a.destructive?'danger-item':''}" id="abtn_${a.id}" onclick="selectAction('${a.id}')">${a.needsPass?'🔑 ':''}${escapeHtml(a.label)}</button></li>`).join('');
+  // a.op : nature d'opération (UI 1.19.0) — action interdite sur un dépôt externe (EXTERNAL_OPS) jamais proposée
+  ul.innerHTML=ACTIONS.filter(a=>(!a.requiresDestructive||allowDestructive) && opAllowed(currentNick,a.op||'read'))
+    .map(a=>`<li><button class="${a.destructive?'danger-item':''}${a.id===currentActionId?' active':''}" id="abtn_${a.id}" onclick="selectAction('${a.id}')">${a.needsPass?'🔑 ':''}${escapeHtml(a.label)}</button></li>`).join('');
 }
 
 function selectAction(id){
@@ -1217,7 +1293,7 @@ async function runAction(){
   if(r.httpStatus===401) return;
   box.hidden=false;
   document.getElementById('resultStdout').textContent=r.stdout||'(vide)';
-  document.getElementById('resultStderr').textContent=r.stderr||'(vide)';
+  document.getElementById('resultStderr').textContent=r.stderr||(typeof r.detail==='string'?r.detail:'')||'(vide)';   // 403 : {detail}
   const okBadge = r.exitcode===0 ? '<span class="badge ok">exitcode 0</span>' : `<span class="badge err">exitcode ${r.exitcode}</span>`;
   meta.innerHTML=okBadge+` <span class="pill">HTTP ${r.httpStatus}</span>`;
 }
@@ -1440,7 +1516,7 @@ async function runBrowseSearch(){
     +matches.map(m=>{
       const icon=m.is_dir?'📁':'📄';
       const gotoTarget=m.is_dir?m.full_path:m.parent;
-      const dlBtn=(allowDownloads&&downloadInScope(browseNick,m.full_path))?`<button class="secondary sr-dl-btn" data-full="${escapeAttr(m.full_path)}" data-isdir="${m.is_dir}">⬇ Télécharger</button>`:'';
+      const dlBtn=(allowDownloads&&opAllowed(browseNick,'restore')&&downloadInScope(browseNick,m.full_path))?`<button class="secondary sr-dl-btn" data-full="${escapeAttr(m.full_path)}" data-isdir="${m.is_dir}">⬇ Télécharger</button>`:'';
       const delBadge=m.deleted?' <span class="badge warn">supprimé</span>':'';
       return `<tr>
         <td>${icon} ${escapeHtml(m.name)}${delBadge}</td><td>${escapeHtml(m.genre)}</td>
@@ -1495,9 +1571,11 @@ async function openDownloadDialog(fullPath,isDir){
   const dlLastSeenArchive=dlEntry&&dlEntry.deleted?dlEntry.last_seen_archive:null;
   document.getElementById('dlModalTitle').textContent=(isDir?'Télécharger un .tar de ':'Télécharger ')+fullPath+(dlLastSeenArchive?' (supprimé)':'');
   const dlInScope=downloadInScope(browseNick,fullPath);
-  document.getElementById('dlConfirmBtn').hidden=!(allowDownloads&&dlInScope);
+  const dlOpOk=opAllowed(browseNick,'restore');   // dépôt externe sans restore (UI 1.19.0)
+  document.getElementById('dlConfirmBtn').hidden=!(allowDownloads&&dlInScope&&dlOpOk);
   document.getElementById('dlModalError').textContent=!allowDownloads?
     'Téléchargements désactivés sur ce serveur (BORGHELPERWWW_ALLOW_DOWNLOADS).':
+    !dlOpOk?'Dépôt externe : restauration non permise (EXTERNAL_OPS) — consultation seulement.':
     (!dlInScope?'Hors de votre périmètre de téléchargement (GROUPS_PATHS_RESTORE) — consultation seulement.':'');
   const formatField=document.getElementById('dlFormatField');
   const tarCheck=document.getElementById('dlTarFormat');

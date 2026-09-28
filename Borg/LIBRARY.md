@@ -653,6 +653,7 @@ sys.exit(0)
 | `external_ops(cfg, nick='')` | Opérations permises sur un externe (`read` toujours, défaut `read,restore`) |
 | `command_op(cmd)` | Nature d'une commande CLI : `bkp`, `restore`, `prune`, `delete` ou `read` |
 | `op_allowed(cfg, op, nick='')` | Autorité unique : l'opération est-elle permise sur ce nick ? |
+| `allowed_ops(cfg, nick='')`, `ALL_OPS` | (1.0.144) Opérations permises parmi `ALL_OPS` (`read`, `restore`, `prune`, `delete`, `bkp`) — `GET /access` de borgHelperWWW |
 | `require_op(cfg, op, nick='')` | Lève `OpNotAllowed` si refusée (la CLI sort alors avec le code 4) |
 
 > Les méthodes de `BorgHelper` (`backup`, `prune`, `delbkp`, `restore`…) ne vérifient pas `EXTERNAL_OPS` : le contrôle
