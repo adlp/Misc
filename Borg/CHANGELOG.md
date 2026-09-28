@@ -1,5 +1,19 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.147 — CodecSelfTest par groupe — 2026-09-28
+
+Chantier « reconstruction progressive », story 10 (rétrospective : A5 ; F2, F12, F14).
+
+- `CodecSelfTest -f <motif>` n'exécute que les contrôles dont le nom correspond (expression régulière, sans casse).
+  - Le bilan annonce un run **PARTIEL**, avec le nombre de contrôles écartés. Le run complet reste exigé avant commit.
+  - Code de sortie 2 si le motif est invalide, vide (il sélectionnerait tout) ou ne sélectionne rien, `-l` compris.
+  - Un contrôle SKIP (borg absent) compte comme sélectionné. Un échec en run partiel rappelle qu'il peut venir d'un
+    contrôle écarté.
+  - Exemple : `-f 'tranche|surveillance'`, 15 contrôles en ~4 min au lieu de ~12 min pour 429.
+- `CodecSelfTest -l` liste les noms des contrôles sans les exécuter, filtrés par `-f`.
+- Sans option : sortie et code de sortie inchangés.
+- Nouveau contrôle : `-f` et `-l` en sous-processus (groupe, rien sélectionné, motif invalide, liste).
+
 ## borgHelper 1.0.146 — périmètre du nick et ordre des tranches — 2026-09-28
 
 Chantier « reconstruction progressive », story 9 (rétrospective : R6, R7 ; SPEC CAP-6 et spine AD-3 amendés).

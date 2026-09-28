@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.146"
+Version="1.0.147"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -496,8 +496,9 @@ def usage(doc=None,debug=0):
         printer("       Affiche le contenu du cache SQLite")
         printer("   -c CacheClean [-n nickname/servername/ALL]")
         printer("       Supprime les entrées périmées du cache")
-        printer("   -c CodecSelfTest")
+        printer("   -c CodecSelfTest [-f <motif>] [-l]")
         printer("       Auto-test du codec de chiffrement (bases temporaires, aucune vraie base touchée) ; code de sortie non nul si un contrôle échoue")
+        printer("       -f : groupe de contrôles (run PARTIEL) ; -l : liste des noms sans exécuter")
         printer("   -c PerfBench [-n <taille>] [-K]")
         printer("       Mesure les temps des commandes de lecture sur un jeu synthétique (bases temporaires, plain et chiffré)")
         printer("       -n <taille> : nb de lignes diff_index visé par mode (défaut 250000)  |  -K : + coût KDF/DbEncrypt/DbDecrypt")
@@ -642,9 +643,13 @@ def usage(doc=None,debug=0):
         printer("   -c CacheInfo [-n nickname/servername/ALL]")
         printer("       Affiche le contenu du cache SQLite")
     elif doc=='codecselftest':
-        printer("   -c CodecSelfTest")
+        printer("   -c CodecSelfTest [-f <motif>] [-l]")
         printer("       Vérifie codec de chemins/blobs, enveloppe de clés, en-tête, versions de schéma, DB_ENCRYPT/DB_KDF")
         printer("       et permissions, sur des bases temporaires. OK/FAIL par contrôle ; code de sortie non nul au moindre échec.")
+        printer("       -f : seulement les contrôles dont le nom correspond (expression régulière, sans casse) — run PARTIEL,")
+        printer("            viser un groupe ('tranche|surveillance'), le run complet reste exigé avant commit ; code 2 si")
+        printer("            le motif est invalide ou ne sélectionne rien")
+        printer("       -l : liste les noms des contrôles (sélectionnés par -f) sans les exécuter")
     elif doc=='perfbench':
         printer("   -c PerfBench [-n <taille>] [-K]")
         printer("       Génère un jeu de données synthétique (SQL direct, PAS de vrai borg) sur des bases temporaires")
@@ -6903,16 +6908,24 @@ class BorgHelper:
 
 _ST_PATH_VECTOR='Bzlli9DHwb7cerehZg/QIH8kVKtaTDqGJoDFQ/HBn.TTx6SCURAOpcPg'  # k_path=0x01*32, k_enc=0x02*32, 'a/b/c' (recalculé indépendamment)
 
-def codec_selftest():
-    """Retourne le nombre de contrôles en échec (0 = tout OK). Affiche OK/FAIL par contrôle."""
+def codec_selftest(pattern=None,list_only=False):
+    """Retourne le nombre de contrôles en échec (0 = tout OK), ou None si un filtre ne sélectionne aucun contrôle.
+    Affiche OK/FAIL par contrôle. 1.0.147 (story 10, A5) : pattern = re.Pattern compilé -> seuls les contrôles dont le
+    nom correspond s'exécutent (run PARTIEL, jamais suffisant avant commit) ; list_only -> noms affichés, rien exécuté.
+    Le code hors contrôles (bases temporaires) tourne toujours ; un groupe peut dépendre d'un contrôle précédent."""
     import tempfile,shutil,contextlib,io
     from unittest import mock
-    results=[]
+    if isinstance(pattern,str): pattern=re.compile(pattern,re.IGNORECASE)
+    results=[]; left_out=[0]; skipped=[0]
+    def _selected(name): return pattern is None or bool(pattern.search(name))
     def check(name,fn):
+        if not _selected(name): left_out[0]+=1; return
+        if list_only: print(f"LIST {name}"); results.append(True); return
         try: ok=bool(fn()); err=''
         except Exception as e: ok=False; err=f" ({type(e).__name__}: {e})"
         print(f"{'OK  ' if ok else 'FAIL'} {name}{err}"); results.append(ok)
-    def skip(name,why): print(f"SKIP {name} ({why})")
+    def skip(name,why):
+        if _selected(name): skipped[0]+=1; print(f"SKIP {name} ({why})")
     def raises(exc,fn):
         try: fn()
         except exc: return True
@@ -6931,6 +6944,36 @@ def codec_selftest():
         if hasattr(hashlib,'scrypt'):
             check("scrypt (RFC 7914 §11)",lambda: hashlib.scrypt(b'',salt=b'',n=16,r=1,p=1,dklen=64).hex()==
                   '77d6576238657b203b19ca42c18a0497f16b4844e3074ae8dfdffa3fede21442fcd0069ded0948f8326a753a0fc81f17e8d3e0fb2e0d3628cf35e20c38d18906')
+        def _selftest_filter():
+            """1.0.147 (story 10, A5) : CodecSelfTest -f/-l en sous-processus — groupe (1 exécuté, PARTIEL, code 0), rien
+            sélectionné (code 2), motif invalide (code 2, rien exécuté), liste ancrée (2 LIST, rien exécuté, code 0)."""
+            me=os.path.realpath(__file__)
+            def run(*a):   # TMPDIR du parent : un enfant tué au délai ne laisse rien hors de tmp
+                p=subprocess.run([sys.executable,me,'-c','CodecSelfTest',*a],capture_output=True,text=True,timeout=300,
+                                 env=dict(os.environ,TMPDIR=tmp))
+                return p.returncode,p.stdout+p.stderr
+            g=run('-f','^HMAC'); z=run('-f','zzz-aucun'); i=run('-f','['); l=run('-l','-f','^HMAC|^PBKDF2')
+            total=run('-l'); lz=run('-l','-f','zzz-aucun'); lr=run('-l','-f','rfc 4231'); e=run('-f','')
+            n=int(re.search(r'^(\d+) contrôle\(s\)$',total[1],re.M).group(1))
+            # code 1 sur un échec (run complet ou filtré) : dispatch en processus, codec_selftest simulé
+            codes=[]
+            for ret in (3,0,None):
+                with mock.patch.dict(globals(),{'codec_selftest':lambda *a,_r=ret: _r}), \
+                     mock.patch.object(sys,'argv',[me,'-c','CodecSelfTest']):
+                    try: _cli_main()
+                    except SystemExit as x: codes.append(x.code)
+            ok=(g[0]==0 and 'OK   HMAC-SHA256' in g[1] and '1/1 OK' in g[1] and 'PARTIEL' in g[1]
+                and f"{n-1} contrôle(s) écarté(s)" in g[1] and codes==[1,0,2]
+                and lz[0]==2 and 'aucun contrôle' in lz[1] and 'LIST' not in lz[1]
+                and lr[0]==0 and sum(x.startswith('LIST ') for x in lr[1].splitlines())==1
+                and e[0]==2 and 'motif vide' in e[1]
+                and z[0]==2 and 'aucun contrôle' in z[1] and not any(x.startswith(('OK ','FAIL')) for x in z[1].splitlines())
+                and i[0]==2 and 'motif invalide' in i[1] and not any(x.startswith(('OK ','FAIL','LIST')) for x in i[1].splitlines())
+                and l[0]==0 and sum(x.startswith('LIST ') for x in l[1].splitlines())==2
+                and not any(x.startswith(('OK ','FAIL')) for x in l[1].splitlines()) and '2 contrôle(s)' in l[1])
+            if not ok: print(f"  filtre : {g[0]} {z[0]} {i[0]} {l[0]} {lz[0]} {lr[0]} {e[0]} {codes} {g[1][-200:]!r} {l[1][-200:]!r}")
+            return ok
+        check("sélection : -f groupe (PARTIEL), rien sélectionné ou motif invalide -> code 2, -l liste sans exécuter",_selftest_filter)
         # ── alphabet / base64 strict ──
         check("alphabet : +->'.' /->'-' sans padding",lambda: _b64e(bytes([0xfb,0xff,0xbf]))=='.-.-' and _b64e(b'\x00')=='AA')
         check("_b64d : longueur = 1 mod 4 rejetée",lambda: raises(DbCodecError,lambda:_b64d('AAAAA')))
@@ -10813,7 +10856,15 @@ def codec_selftest():
         shutil.disk_usage=saved_disk_usage
         if saved_scrypt is not None: hashlib.scrypt=saved_scrypt
     fails=results.count(False)
-    print(f"CodecSelfTest : {len(results)-fails}/{len(results)} OK"+(f", {fails} FAIL" if fails else ""))
+    if pattern is not None and not results and not skipped[0]:
+        print(f"CodecSelfTest : aucun contrôle ne correspond au filtre « {pattern.pattern} »"); return None
+    if list_only:
+        print(f"{len(results)} contrôle(s)"); return 0
+    print(f"CodecSelfTest : {len(results)-fails}/{len(results)} OK"+(f", {fails} FAIL" if fails else "")
+          +(f" — run PARTIEL (filtre « {pattern.pattern} », {left_out[0]} contrôle(s) écarté(s)) : le run complet reste "
+            "exigé avant commit" if pattern is not None else "")
+          +(" — un échec peut venir d'un contrôle écarté dont celui-ci dépend : relancer le run complet"
+            if pattern is not None and fails else ""))
     return fails
 
 # ── PerfBench — mesures de performance sur jeu de données synthétique (story 6) ─
@@ -11202,7 +11253,15 @@ def _cli_main():
         elif opt=='-c': cmd=arg.lower()
 
     if cmd=='codecselftest':  # avant BorgHelper() : ne doit créer ni cache ni lire le vrai rc
-        sys.exit(1 if codec_selftest() else 0)
+        _st_pat=None; _st_list=False   # 1.0.147 (A5) : -f motif (re, sans casse), -l liste sans exécuter
+        for opt,arg in opts:
+            if opt=='-f':
+                if not arg.strip(): print("CodecSelfTest : motif vide refusé (il sélectionnerait tout : lancer sans -f)"); sys.exit(2)
+                try: _st_pat=re.compile(arg,re.IGNORECASE)
+                except re.error as e: print(f"CodecSelfTest : motif invalide {arg!r} ({e})"); sys.exit(2)
+            elif opt=='-l': _st_list=True
+        _st=codec_selftest(_st_pat,_st_list)
+        sys.exit(2 if _st is None else (1 if _st else 0))
 
     if cmd=='perfbench':  # avant BorgHelper() : bases temporaires uniquement, jamais le vrai rc/cache
         _pb_size=None

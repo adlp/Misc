@@ -1139,7 +1139,17 @@ disponible, avertit (comme `_open_db`, une fois par base et par invocation) et c
 
 ```bash
 borgHelper -c CodecSelfTest
+borgHelper -c CodecSelfTest -f 'tranche|surveillance'   # un groupe seulement (1.0.147) : run PARTIEL
+borgHelper -c CodecSelfTest -l -f fantôme               # noms des contrôles sélectionnés, rien exécuté
 ```
+
+**Par groupe** (1.0.147) : `-f <motif>` n'exécute que les contrôles dont le nom correspond (expression régulière, sans
+casse). Le bilan l'annonce : « run PARTIEL (filtre …, N contrôle(s) écarté(s)) : le run complet reste exigé avant
+commit ». Code de sortie 2 si le motif est invalide, vide ou ne sélectionne rien, 1 si un contrôle échoue. `-l` affiche
+les noms sans exécuter les contrôles (seule la préparation des bases temporaires tourne, ~2 s) — pour choisir un motif.
+Les contrôles d'un même groupe partagent un dépôt de test que les précédents modifient (archives ajoutées, bases déjà
+construites) : viser un groupe entier plutôt qu'un contrôle isolé, et relancer le run complet en cas d'échec — le bilan
+le rappelle. Ne jamais lancer deux `CodecSelfTest` en même temps : les contrôles de minutage échouent sous charge.
 
 Auto-test du codec de chiffrement des chemins (vecteurs officiels HMAC/PBKDF2/scrypt, aller-retour, rejets
 `DbCodecError`/`DbKeyError`/`DbTamperError`, versions de schéma, `DB_ENCRYPT`/`DB_KDF`, permissions) et des requêtes de
