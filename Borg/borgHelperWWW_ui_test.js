@@ -101,14 +101,14 @@ eq('titre explorateur archive',pageTitle({view:'view-browse',nick:'srv',path:'et
   let now=1e6;
   const ui=new Function('env',`let {document,getApiKey,escapeAttr,refreshStateBadges,reloadMachineCard,renderActionList}=env;
     let myAccess=null, currentViewId='view-machines', currentNick=null, pollBusy=false;
-    const pendingBkp={}, Date={now:()=>env.now()};
+    const pendingBkp={}, Date={now:()=>env.now(),parse:x=>env.parse(x)};
     const loadMyAccess=async()=>{ myAccess=env.next(); return myAccess; };
     ${grab('opAllowed')}
 ${grab('stateBadges')}
 ${grab('notePendingBkp')}
 async ${grab('pollAccess')}
     return {opAllowed,stateBadges,pollAccess,notePendingBkp,set:(a,v,n)=>{ myAccess=a; if(v) currentViewId=v; if(n!==undefined) currentNick=n; }};`)(
-    Object.assign(env,{next:()=>next,now:()=>now}));
+    Object.assign(env,{next:()=>next,now:()=>now,parse:x=>globalThis.Date.parse(x)}));
   const acc=(o)=>({groups_auth_enabled:false,nicks:o});
   ui.set(null); eq('opAllowed sans /access : tout proposé',ui.opAllowed('x','bkp'),true);
   ui.set(acc({ext:{ops:['read','restore'],external:true},old:{}}));
@@ -122,6 +122,30 @@ async ${grab('pollAccess')}
      ['🔗 externe','⏳ Bkp en cours','construction partielle 1/5','prête à basculer'].every(t=>be.includes(t)),true);
   eq('badge reconstruction démarrée (sans build_state)',ui.stateBadges('f').includes('reconstruction démarrée'),true);
   eq('base complète interne : aucun badge',ui.stateBadges('g'),'');
+  // résultat du dernier Index (UI 1.19.2) : échec/refus toujours ; « déjà en cours » seulement via HTTP, moins d'1 h
+  // Heures écrites par borgHelper ≥ 1.0.149 : ISO avec décalage ; « now » absolu (Date.UTC) : juste dans tout fuseau.
+  const fin='2026-09-28T10:00:05+02:00', T0=globalThis.Date.UTC(2026,8,28,8,0,5); now=T0+60000;
+  const lf={outcome:'error',code:1,via:'cli',finished_at:'2026-09-28T09:00:00+02:00',message:'x: borg list en échec'};
+  ui.set(acc({x:{index_last:{outcome:'error',code:1,via:'http',finished_at:fin,message:"x: période refusée"}},
+              r:{index_last:{outcome:'refused',code:3,via:'cli',finished_at:fin,message:''}},
+              h:{index_last:{outcome:'busy',code:0,via:'http',finished_at:fin,message:'x: Index déjà en cours'}},
+              c:{index_last:{outcome:'busy',code:0,via:'cli',finished_at:fin,message:''}},
+              k:{index_last:{outcome:'ok',code:0,via:'cli',finished_at:fin,message:''}},
+              hb:{index_last:{outcome:'busy',code:0,via:'http',finished_at:fin,message:'x: Index déjà en cours',last_failure:lf}},
+              d:{index_last:{outcome:'deadline',code:0,via:'cli',finished_at:fin,message:'',last_failure:lf}}}));
+  const bx=ui.stateBadges('x');
+  eq('index_last error : badge ⚠ avec heure et message',[bx.includes('⚠ Index en échec'),bx.includes('2026-09-28 10:00'),bx.includes('période refusée')],[true,true,true]);
+  eq('index_last refused : badge ⚠ (refusé, code 3)',ui.stateBadges('r').includes('refusé (code 3)'),true);
+  eq('index_last busy via http récent : « rien lancé »',ui.stateBadges('h').includes('rien lancé'),true);
+  eq('index_last busy via cron, ok : aucun badge',[ui.stateBadges('c'),ui.stateBadges('k')],['','']);
+  const hb=ui.stateBadges('hb');
+  eq('error puis busy HTTP : ⚠ gardé (last_failure) + « rien lancé »',[hb.includes('⚠ Index en échec'),hb.includes('borg list en échec'),hb.includes('2026-09-28 09:00'),hb.includes('rien lancé')],[true,true,true,true]);
+  eq('error puis échéance : ⚠ gardé jusqu\'au prochain ok',ui.stateBadges('d').includes('⚠ Index en échec'),true);
+  now=T0-60000;
+  eq('busy HTTP, horloge du navigateur en retard d\'1 min : badge montré',ui.stateBadges('h').includes('rien lancé'),true);
+  now=T0+2*3600000;
+  eq('index_last busy via http de plus d\'1 h : plus de badge',ui.stateBadges('h'),'');
+  now=1e6;
   // fin de Bkp sur la liste : seule la carte du nick dont le Bkp vient de finir est rechargée
   ui.set(acc({a:{bkp_running:true},b:{bkp_running:false},c:{bkp_running:true}}),'view-machines');
   next=acc({a:{bkp_running:false},b:{bkp_running:false},c:{bkp_running:true}});

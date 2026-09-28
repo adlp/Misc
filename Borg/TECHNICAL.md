@@ -882,6 +882,42 @@ demande prioritaire vue → index-paused.lock pris AVANT de relâcher index-runn
 - `Index` est incrémental : `diff_indexed_pairs` garde la sentinelle de chaque paire ; une reprise saute les paires
   déjà traitées.
 
+### Résultat du dernier Index par nick (1.0.149, story 12)
+
+Un Index détaché (`POST /index`, cron) écrit sa sortie nulle part : un échec ou un « Index déjà en cours » était
+invisible. Chaque `Index` CLI (toutes options, `-n ALL` compris) écrit donc, après chaque nick, le résultat de son
+passage dans `CACHE_DIR/<conf>-<nick>-index-last.json` (0600, fichier temporaire puis `os.replace`) :
+
+```json
+{"nick": "srv", "started_at": "2026-09-28T10:00:00+02:00", "finished_at": "2026-09-28T10:02:13+02:00",
+ "outcome": "busy", "code": 0, "via": "http", "message": "srv: Index déjà en cours …",
+ "last_failure": {"finished_at": "2026-09-28T09:00:41+02:00", "outcome": "error", "code": 1, "via": "cli",
+                  "message": "[ERREUR] srv: borg list en échec …"}}
+```
+
+- Heures : locales, ISO avec décalage (`_iso_now`) : l'UI calcule l'âge juste quel que soit le fuseau du navigateur.
+- `outcome` : `ok` (code 0), `error` (code 1 ou exception), `refused` (code 3), `busy` (« Index déjà en cours » au
+  démarrage : code 0, rien fait), `deadline` (échéance atteinte pendant l'attente du tour, code 0). `busy`/`deadline`
+  sont notés par `index()` dans `_index_outcome[nick]`, le code de retour ne les distingue pas. Un Index qui a
+  travaillé puis passé la main (pause refusée, tour repris par un autre) est `ok`.
+- `SystemExit` (`sys.exit` dans `index()` : base occupée, schéma…) : issue selon son code, comme la sortie du
+  processus (3 → `refused`, 0/`None` → `ok`, texte → `error` avec ce texte en message).
+- `last_failure` : un `busy`/`deadline` recopie l'échec précédent (`error`/`refused`, ou son `last_failure`) ; un `ok`,
+  `error` ou `refused` n'en a pas. Le badge « ⚠ Index en échec » tient ainsi jusqu'au prochain `ok`.
+- `via` : `http` si `BORGHELPER_VIA=http` (posé par `_launch_bkp_detached` de borgHelperWWW pour `cmd='index'`
+  seulement), sinon `cli`.
+- `message` : vide pour `ok` ; sinon le texte de l'exception (ou de `sys.exit`), ou les 3 dernières lignes affichées
+  depuis le début du nick — `[ERREUR]` d'abord (échec, refus), sinon celles commençant par `<nick>:` ou contenant
+  `[WARN]`, sinon toutes (« DB occupée … ») (file `_PRINT_TAIL` de `printer`, 200 lignes au plus, marque absolue `_print_mark` : la troncature de la file ne décale pas le début du nick), tronqué à
+  500 caractères.
+- Une exception d'`index()` (y compris `KeyboardInterrupt`) est écrite en `error` puis relancée. Une écriture ratée
+  (disque, encodage : UTF-8 imposé) n'est qu'un `[WARN]`, jamais l'échec de l'Index. Un Index tué (SIGKILL) ne laisse
+  que le résultat précédent.
+- Seul le dispatch CLI `Index` écrit : l'Index de fin de Bkp (`backup()`) et un `index()` appelé en bibliothèque
+  n'écrivent rien. Un ⚠ reste donc affiché après un Bkp réussi jusqu'au prochain `Index` CLI réussi (cron horaire).
+- Fichier jetable, hors `history.db` : aucun schéma, aucune migration ; `read_index_last` rend `None` s'il est absent
+  ou illisible. `/access` le relaie tel quel (`index_last`), l'UI en tire ses badges.
+
 ---
 
 ## Gestion du volume de `diff_index`
@@ -1004,6 +1040,11 @@ copié) et sur `SQLITE_DONE` (copie validée) ; seul le premier appel sur une tr
 écrivains. `_set_pid_lock` écrit le verrou par fichier temporaire + `os.replace` : lu vide pendant son écriture, il
 était pris pour orphelin et supprimé. Contrôles `CodecSelfTest` multi-processus : lecteurs, écrivain pendant 5 compactages, annulation,
 compactage sous `priority.lock`, kill -9 au milieu de la copie, base chiffrée.
+
+**Suppression d'une base : `_unlink_db` (1.0.149).** Retirer une base et ses `-wal`/`-shm` passe par une seule
+fonction, `_unlink_db(path)` (fichiers absents ignorés), appelée par `_swap_db` (nouvelle base après copie ou
+refusée), `_vacuum_db` (copie de compactage) et `_shadow_discard` (fantôme jeté). Avant, ces trois lignes étaient
+écrites quatre fois (F3 de la rétrospective).
 
 **`SystemExit` dans borgHelperWWW (1.27.6 / 1.27.7).** borgHelper est aussi importé comme bibliothèque par
 borgHelperWWW, et plusieurs de ses fonctions font `sys.exit` (rc invalide, base occupée ou corrompue). Dans le

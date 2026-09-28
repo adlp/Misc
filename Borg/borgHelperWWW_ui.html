@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.19.1 -->
+<!-- UI_VERSION: 1.19.2 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -412,6 +412,22 @@ function stateBadges(nick){
   if(rb){
     const txt=rb.pairs_total==null?'démarrée':(rb.state==='complete'?'prête à basculer':`en cours ${rb.pairs_done}/${rb.pairs_total}`);
     h+=`<span class="badge" title="Reconstruction dans un fichier fantôme : la base actuelle reste servie jusqu'à la bascule">♻ reconstruction ${txt}</span> `;
+  }
+  // Résultat du dernier Index (UI 1.19.2, index_last de /access) : échec ou refus jusqu'au prochain succès (un « déjà en
+  // cours » ou une échéance le reportent dans last_failure) ; « déjà en cours » seulement s'il vient d'un lancement HTTP
+  // de moins d'une heure (un chevauchement cron est normal). Heures ISO avec décalage : âge juste quel que soit le fuseau.
+  const il=a.index_last;
+  if(il && il.outcome){
+    const when=x=>(x||'').replace('T',' ').slice(0,16), via=x=>x==='http'?'lancé depuis l\'interface':'CLI/cron';
+    const msg=x=>x?` — ${x}`:'';
+    const f=(il.outcome==='error'||il.outcome==='refused')?il:(il.last_failure&&il.last_failure.outcome?il.last_failure:null);
+    if(f){
+      h+=`<span class="badge warn" title="${escapeAttr(`Dernier Index en échec (${via(f.via)}) le ${when(f.finished_at)} : ${f.outcome==='refused'?'refusé':'en échec'} (code ${f.code})${msg(f.message)}`)}">⚠ Index en échec</span> `;
+    }
+    if(il.outcome==='busy' && il.via==='http'){
+      const age=Date.now()-Date.parse(il.finished_at);
+      if(age>-300000 && age<3600000) h+=`<span class="badge" title="${escapeAttr(`Index lancé depuis l'interface le ${when(il.finished_at)} : un autre Index tournait déjà sur ce dépôt, rien n'a été lancé${msg(il.message)}`)}">⏸ Index déjà en cours — rien lancé</span> `;
+    }
   }
   return h;
 }

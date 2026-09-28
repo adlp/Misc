@@ -1,5 +1,30 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.149 / borgHelperWWW 1.28.2 / UI 1.19.2 — résultat du dernier Index, suppression de base unifiée — 2026-09-28
+
+Chantier « reconstruction progressive », story 12 (rétrospective : A4, A6 ; F11, F3).
+
+- **Résultat du dernier Index par nick** (borgHelper) : chaque `Index` CLI (toutes options, cron, lancé par
+  `POST /index`) écrit, après chaque nick, `CACHE_DIR/<conf>-<nick>-index-last.json` (0600, écriture atomique) :
+  `{nick, started_at, finished_at, outcome, code, via, message}` (heures ISO avec décalage). `outcome` ∈ `ok`,
+  `error` (code 1 ou exception, relancée après écriture), `refused` (code 3, `sys.exit(3)` compris), `busy`
+  (« Index déjà en cours »), `deadline` (échéance atteinte pendant l'attente) ; `via` = `http` ou `cli` ; `message` =
+  texte de l'exception ou de `sys.exit`, ou dernières lignes d'erreur du nick (500 caractères au plus), vide si `ok`.
+  Un `busy`/`deadline` reporte l'échec précédent (`last_failure`) jusqu'au prochain `ok`. Une écriture ratée (disque,
+  encodage) n'est qu'un `[WARN]`. Fichier jetable, jamais dans `history.db` ; l'Index de fin de Bkp n'en écrit pas. Nouveaux `BorgHelperDB.index_last_path`, `write_index_last`, `read_index_last`.
+  Avant, le résultat d'un Index détaché (sortie vers `DEVNULL`) ou d'un Index cron n'était visible nulle part.
+- **`GET /access`** (borgHelperWWW) : nouveau champ `index_last` par nick lisible (ce fichier, `null` s'il est absent ou
+  illisible ; lecture locale). `POST /index` pose `BORGHELPER_VIA=http` pour le sous-processus (pas `POST /bkp`).
+- **Badges** (UI) : « ⚠ Index en échec » (`error`, `refused`, ou `last_failure`) avec l'heure et le message en
+  infobulle, jusqu'au prochain Index réussi ; « ⏸ Index déjà en cours — rien lancé » pour un `busy` venu de `POST /index` il y a moins d'une heure.
+- **`_unlink_db`** (borgHelper) : une seule fonction retire une base et ses `-wal`/`-shm` (`_swap_db`, `_vacuum_db`,
+  `_shadow_discard`) ; auparavant écrit quatre fois. Aucun changement de comportement.
+- Tests : `CodecSelfTest` (ok, erreur via HTTP, déjà en cours avec échec reporté, plusieurs nicks, échéance, refus
+  réel par la CLI, `sys.exit`, exception, écriture ratée, fichier illisible, 0600 sous umask 0, file de messages
+  tronquée, `_unlink_db`, `_vacuum_db` en échec), push_selftest (`BORGHELPER_VIA` posé pour l'Index seul, `/access`
+  `index_last`, JSON invalide ⇒ `null`, vrai fichier du nick remis en place), `borgHelperWWW_ui_test.js` (badges,
+  `last_failure`, fuseaux horaires).
+
 ## borgHelper 1.0.148 — petits correctifs de fin de chantier — 2026-09-28
 
 Chantier « reconstruction progressive », story 11 (rétrospective : A9, A10, A11 ; F15, R8, D1).

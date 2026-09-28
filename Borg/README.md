@@ -710,6 +710,14 @@ temps en temps pour rendre la place libérée (le `Prune` de borgHelper compacte
 ligne cron voit donc une tranche qui n'a pas pu démarrer. Un `borg diff` ou `borg info` en échec au milieu d'une passe
 reste un avertissement (unité refaite au passage suivant), sans changer le code.
 
+**Résultat du dernier Index** (1.0.149) : après chaque nick, `Index` écrit son résultat dans
+`CACHE_DIR/<conf>-<nick>-index-last.json` (0600) : `outcome` (`ok`, `error`, `refused`, `busy` = « Index déjà en
+cours », `deadline` = échéance atteinte pendant l'attente), `code`, heures de début et de fin (ISO avec décalage),
+`via` (`http` pour un Index lancé par `POST /index`, sinon `cli`) et les dernières lignes d'erreur. Seul le dernier
+passage est gardé, mais un `busy`/`deadline` reporte l'échec précédent (`last_failure`) jusqu'au prochain `ok` ;
+fichier jetable. L'Index de fin de Bkp n'écrit rien. borgHelperWWW le montre (`GET /access`, badge « ⚠ Index en échec ») : un Index cron ou détaché en
+échec n'est plus invisible.
+
 ---
 
 ### `Search`
@@ -1958,9 +1966,10 @@ explicite contenant un nick refusé ⇒ 403 (comme le code 4 de la CLI).
 **⚠️ `POST /index` est asynchrone** (rupture de compatibilité, depuis 1.28.0) : comme `POST /bkp`, elle détache
 `borgHelper -c Index` et répond dès le lancement (`exitcode: 0` = lancé, `stdout` = message de lancement, jamais la
 sortie de l'Index ; `ALL` et les listes de nicks acceptés, nick inconnu ⇒ 404). Le résultat d'un Index lancé ainsi
-n'est pas remonté. Un Index se met en pause sans limite pendant un Bkp/Restore/Prune (borgHelper
+n'est pas remonté dans la réponse. Un Index se met en pause sans limite pendant un Bkp/Restore/Prune (borgHelper
 1.0.141) : la requête synchrone restait bloquée jusqu'au délai d'expiration. L'avancement se lit dans `GET /access`
-(`build`).
+(`build`), et depuis 1.28.2 (borgHelper ≥ 1.0.149) le résultat aussi (`index_last`, `via: "http"`) : échec, refus ou
+« Index déjà en cours — rien lancé ».
 
 **⚠️ `POST /bkp` est asynchrone** (rupture de compatibilité, depuis 1.16.0) : contrairement à toutes
 les autres routes ci-dessus, elle ne lance jamais `borgHelper -c Bkp` en l'attendant. Elle détache le
@@ -2005,9 +2014,17 @@ Depuis 1.28.0, chaque nick lisible par l'appelant porte aussi (lectures locales 
 - `bkp_running` : `true` si un Bkp a démarré depuis moins de `BORGHELPERWWW_BKP_STATUS_TIMEOUT` (6 h par défaut) sans finir, `false` sinon
   (un Bkp tué au-delà n'est plus « en cours » : le watcher le traite en échec), `null` si `history.db` est illisible
   (1.28.1 ; jamais pris pour une fin de Bkp).
+- `index_last` (1.28.2, borgHelper ≥ 1.0.149) : résultat du dernier `Index` de ce nick, quel que soit son lanceur
+  (CLI, cron, `POST /index`) — `{"nick","started_at","finished_at","outcome","code","via","message"}` avec `outcome`
+  ∈ `ok`, `error`, `refused` (code 3), `busy` (« Index déjà en cours », rien fait), `deadline` (échéance atteinte
+  pendant l'attente) et `via` ∈ `cli`, `http` ; heures ISO avec décalage ; `last_failure` (même forme, sans `nick` ni
+  `started_at`) sur un `busy`/`deadline` qui suit un échec ; `null` si aucun Index n'a encore écrit de résultat ou si
+  le fichier est illisible. L'Index de fin de Bkp n'en écrit pas.
 
 Un nick sans droit n'en porte aucun. L'interface web (UI ≥ 1.19.0) s'en sert pour ses badges
-(🔗 externe, ⏳ Bkp en cours, 🏗 construction partielle, ♻ reconstruction), pour masquer les actions interdites sur
+(🔗 externe, ⏳ Bkp en cours, 🏗 construction partielle, ♻ reconstruction ; UI ≥ 1.19.2 : ⚠ Index en échec,
+jusqu'au prochain Index réussi, avec l'heure et le message en infobulle, et ⏸ Index déjà en cours — rien lancé, pour
+un `POST /index` refusé ainsi depuis moins d'une heure), pour masquer les actions interdites sur
 un dépôt externe, et la relit toutes les 30 s (liste et page serveur, onglet visible) : à la fin d'un Bkp, la carte du
 serveur est rechargée. Un Bkp lancé par ▶ Backup est suivi à part (UI 1.19.1) : même fini avant la première relecture,
 sa carte est rechargée une fois (au bout de 60 s au plus tard).

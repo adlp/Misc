@@ -358,6 +358,25 @@ for row in pending:
 state = bh.db.bkp_running_state('mon-serveur', timeout_s=21600)
 ```
 
+### Résultat du dernier Index (1.0.149)
+
+```python
+from borgHelper import BorgHelper
+
+bh = BorgHelper()
+
+# Écrit par le dispatch CLI `Index` après chaque nick (pas par bh.index() appelé en bibliothèque, ni par l'Index de
+# fin de Bkp) : CACHE_DIR/<conf>-<nick>-index-last.json. Heures ISO avec décalage ; last_failure = échec précédent
+# reporté par un busy/deadline. dict ou None (absent, illisible) — jamais d'exception, rien créé.
+last = bh.db.read_index_last('mon-serveur')
+fail = last if last and last['outcome'] in ('error', 'refused') else (last or {}).get('last_failure')
+if fail:
+    print(fail['finished_at'], fail['code'], fail['message'])
+
+bh.db.index_last_path('mon-serveur')    # chemin du fichier
+# write_index_last(nick, rec) : écriture atomique 0600 ; lève OSError (la CLI n'en fait qu'un avertissement).
+```
+
 ### Consulter les fichiers exclus des filtres d'indexation
 
 ```python

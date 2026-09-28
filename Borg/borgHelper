@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.148"
+Version="1.0.149"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -68,7 +68,24 @@ _DUIDX_COL_NAMES=['added/modif','removed','présent']
 
 # ── Module-level utilities (pure functions) ────────────────────────────────────
 
+_PRINT_TAIL=[]   # 1.0.149 (story 12) : dernières lignes de printer, pour le message du résultat d'Index
+_PRINT_DROPPED=[0]   # lignes retirées du début de _PRINT_TAIL : une marque (_print_mark) reste absolue
+_PRINT_LOCK=threading.Lock()   # printer est aussi appelé par les threads de diffs
+
+def _print_mark():
+    with _PRINT_LOCK: return _PRINT_DROPPED[0]+len(_PRINT_TAIL)
+def _print_since(mark):
+    with _PRINT_LOCK: return _PRINT_TAIL[max(0,mark-_PRINT_DROPPED[0]):]
+def _iso_now():
+    """Heure locale ISO avec décalage (2026-09-28T10:00:00+02:00) : relue juste dans tout fuseau (UI)."""
+    from datetime import datetime
+    return datetime.now().astimezone().isoformat(timespec='seconds')
+
 def printer(data,debug=0):
+    if isinstance(data,str):
+        with _PRINT_LOCK:
+            _PRINT_TAIL.append(data)
+            if len(_PRINT_TAIL)>200: del _PRINT_TAIL[:100]; _PRINT_DROPPED[0]+=100
     if isinstance(data,str) and ('[ERREUR]' in data or '[WARN]' in data):
         print(f"{data}  [borgHelper v{Version}]",file=sys.stderr)
     else:
@@ -1296,6 +1313,12 @@ def _ensure_wal(conn):
 class _SwapAbort(Exception):
     """Levée par le rappel de progression de _swap_db pour annuler la copie (base servie inchangée)."""
 
+def _unlink_db(path):
+    """Retire une base SQLite et ses -wal/-shm (1.0.149, story 12 A6 : seul helper) ; absents ignorés."""
+    for f in (path,path+'-wal',path+'-shm'):
+        try: os.unlink(f)
+        except OSError: pass
+
 def _swap_db(live,new,nick=None,abort=None,changed=None,pages=4096,busy_limit=120,keep_new=False):
     """Remplace le contenu de la base servie `live` par celui de `new` (1.0.138, story 1 du chantier
     reconstruction, AD-6 amendé), puis supprime `new`. Retourne 'ok', 'abort' (abort() vrai : opération
@@ -1321,10 +1344,7 @@ def _swap_db(live,new,nick=None,abort=None,changed=None,pages=4096,busy_limit=12
     _DONE,_BUSY,_LOCKED=101,5,6
     res=None
     if not os.path.isfile(new) or os.path.getsize(new)==0:   # jamais _open_db (O_CREAT) sur un absent
-        if keep_new:
-            for f in (new,new+'-wal',new+'-shm'):
-                try: os.unlink(f)
-                except OSError: pass
+        if keep_new: _unlink_db(new)
         return 'invalid'
     src=dst=None; state={'first':True}; t0=time.monotonic()
     def _prog(status,remaining,total):
@@ -1356,10 +1376,7 @@ def _swap_db(live,new,nick=None,abort=None,changed=None,pages=4096,busy_limit=12
             if c is not None:
                 try: c.close()
                 except sqlite3.Error: pass
-        if not keep_new or res in ('ok','invalid'):
-            for f in (new,new+'-wal',new+'-shm'):
-                try: os.unlink(f)
-                except OSError: pass
+        if not keep_new or res in ('ok','invalid'): _unlink_db(new)
 
 def _open_db(db_path,nick=None,role='read',passphrase=None,**kw):
     """Point d'ouverture UNIQUE des bases SQLite (AD-1). kw -> sqlite3 (timeout=60, ...).
@@ -1782,6 +1799,27 @@ class BorgHelperDB:
             if not p[len(legacy)+1:].isdigit(): continue   # '.tmp' de _set_pid_lock
             if self._check_pid_lock(p): held=True   # PID repris : 'dead' par _lock_holder (1.0.148), fichier retiré
         return held
+
+    # Résultat du dernier Index par nick (1.0.149, story 12 A4) : fichier JSON jetable dans CACHE_DIR, jamais history.db.
+    def index_last_path(self,nick):
+        return os.path.join(self.cache_dir,f"{self.db_prefix}-{re.sub(r'[^a-zA-Z0-9_-]','_',nick)}-index-last.json")
+    def write_index_last(self,nick,rec):
+        """Écriture atomique (fichier temporaire 0600 puis os.replace). Lève OSError : l'appelant n'en fait qu'un
+        avertissement."""
+        path=self.index_last_path(nick); tmp=f"{path}.{os.getpid()}.tmp"
+        try:
+            fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+            with os.fdopen(fd,'w',encoding='utf-8') as f: json.dump(rec,f,ensure_ascii=False)
+            os.replace(tmp,path)
+        except (OSError,ValueError):
+            with contextlib.suppress(OSError): os.unlink(tmp)
+            raise
+    def read_index_last(self,nick):
+        """dict ou None (absent, illisible, JSON invalide ou pas un objet) — jamais d'exception, rien créé."""
+        try:
+            with open(self.index_last_path(nick),encoding='utf-8') as f: rec=json.load(f)
+        except (OSError,ValueError): return None
+        return rec if isinstance(rec,dict) else None
 
     def _report_running_lock_path(self,nick): return self._pid_lock_path(nick,'report-running')
     def set_report_running_lock(self,nick): self._set_pid_lock(self._report_running_lock_path(nick))
@@ -3329,9 +3367,7 @@ class BorgHelper:
                 changed=lambda: conn.execute("PRAGMA data_version").fetchone()[0]!=v0
                 result=_swap_db(db_path,tmp_path,nick=nick,abort=abort,changed=changed)
             except (sqlite3.Error,OSError) as ve:
-                for f in (tmp_path,tmp_path+'-wal',tmp_path+'-shm'):
-                    try: os.unlink(f)
-                    except OSError: pass
+                _unlink_db(tmp_path)
                 printer(f"  [WARN] compactage impossible ({ve}) — entrées purgées mais espace non récupéré")
                 if verbose:
                     printer("  [WARN] relancer plus tard (IdxPurge), jamais en remplaçant le fichier à la main pendant que la base est ouverte")
@@ -4812,12 +4848,13 @@ class BorgHelper:
         tranche=rebuild or budget is not None or natures is not None or period is not None
         deadline=(time.monotonic()+budget) if budget else None
         if db_path is None: db_path=self.db.get_diff_db(nick)
+        self.__dict__.setdefault('_index_outcome',{}).pop(nick,None)   # issue d'un code 0 sans travail (story 12)
         own=self.db.index_running_owned(nick)
         if own: pause=False   # l'appelant tient le tour (Index de fin de Bkp) : jamais de pause dans son processus
         else:
             st=self._index_turn(nick,deadline,pause,set_pending,noidx)
             if st=='cancel': return 1
-            if st!='ok': return 0
+            if st!='ok': self._index_outcome[nick]='deadline' if st=='deadline' else 'busy'; return 0
         # done : paires recalculées pendant cet appel — une reprise après pause ne les refait pas, même avec force (-F).
         plan={'tranche':tranche,'deadline':deadline,'natures':set(natures or ('stats','snap','diff')),'period':period,
               'snap_only':snap_only,'done':set(),'shadow':None,'sdone':set()}
@@ -4846,14 +4883,50 @@ class BorgHelper:
                     printer(f"{nick}: indexation interrompue — reprise automatique après le backup"); return 1
                 # Pause : marqueur pris AVANT de relâcher le tour (aucun autre Index ne s'intercale), puis attente.
                 if not self.db.acquire_index_paused_lock(nick):
-                    printer(f"{nick}: indexation interrompue — un autre Index attend déjà, il reprendra"); return 0
+                    printer(f"{nick}: indexation interrompue — un autre Index attend déjà, il reprendra")
+                    return 0   # travail fait puis relayé : pas « rien lancé » (busy)
                 self.db.release_index_running_lock(nick)
                 printer(f"{nick}: opération prioritaire — Index en pause, reprise après sa fin")
                 st=self._index_turn(nick,deadline,True,False,noidx,resume=True)
-                if st!='ok': return 0
+                if st!='ok':
+                    if st=='deadline': self._index_outcome[nick]='deadline'
+                    return 0
                 printer(f"{nick}: reprise de l'Index")
         finally:
             if not own: self.db.release_index_running_lock(nick)
+
+    def _record_index_last(self,nick,started,mark,code,exc=None):
+        """Résultat du dernier Index de ce nick (1.0.149, story 12 A4), écrit par la CLI après index() : issue (ok, error,
+        refused, busy, deadline), code, origine (via=http si borgHelperWWW l'a lancé, BORGHELPER_VIA), message (exception,
+        texte de sys.exit, ou dernières lignes affichées depuis `mark`). SystemExit : issue selon son code, comme la sortie
+        du processus. busy/deadline reportent l'échec précédent (last_failure) : « ⚠ » jusqu'au prochain ok. Échec
+        d'écriture : avertissement seulement."""
+        out=getattr(self,'_index_outcome',{}).pop(nick,None)
+        msg=''
+        if isinstance(exc,SystemExit):
+            code=exc.code
+            if code is None: code=0
+            elif not isinstance(code,int): msg=str(code); code=1
+        elif exc is not None:
+            code=1; msg=f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        if not isinstance(code,int): code=0   # index() rend toujours un entier (défensif)
+        if exc is None and out: outcome=out
+        else: outcome='ok' if code==0 else 'refused' if code==3 else 'error'
+        if outcome!='ok' and not msg:
+            seen=_print_since(mark)
+            errs=[l for l in seen if '[ERREUR]' in l] if outcome in ('error','refused') else []
+            lines=errs or [l for l in seen if l.startswith(f"{nick}:") or '[WARN]' in l] or seen
+            msg=' | '.join(l.strip() for l in lines[-3:])
+        rec={'nick':nick,'started_at':started,'finished_at':_iso_now(),'outcome':outcome,'code':code,
+             'via':'http' if os.environ.get('BORGHELPER_VIA')=='http' else 'cli','message':msg[:500]}
+        try:
+            if outcome in ('busy','deadline'):
+                prev=self.db.read_index_last(nick) or {}
+                lf=prev if prev.get('outcome') in ('error','refused') else prev.get('last_failure')
+                if isinstance(lf,dict) and lf.get('outcome') in ('error','refused'):
+                    rec['last_failure']={k:lf.get(k) for k in ('finished_at','outcome','code','via','message')}
+            self.db.write_index_last(nick,rec)
+        except Exception as e: printer(f"[WARN] {nick}: résultat d'Index non enregistré ({e})")
 
     @staticmethod
     def _period_bounds(period,archives):
@@ -5251,10 +5324,7 @@ class BorgHelper:
     # ── Reconstruction dans un fichier fantôme (1.0.143, story 6 ; spine AD-2, AD-3, AD-5, AD-6) ─────────────────────
 
     @staticmethod
-    def _shadow_discard(sp):
-        for f in (sp,sp+'-wal',sp+'-shm'):
-            try: os.unlink(f)
-            except OSError: pass
+    def _shadow_discard(sp): _unlink_db(sp)
 
     @staticmethod
     def _header_fp(raw):
@@ -10105,6 +10175,94 @@ def codec_selftest(pattern=None,list_only=False):
             ok=all(res.values()) and len(res)==6
             if not ok: print(f"  périmètre : {res} {out[-400:]!r}")
             return ok
+        def _ix_index_last():
+            """1.0.149 (story 12 A4/A6) : résultat du dernier Index par nick — CLI : ok (via cli, heures ISO avec décalage,
+            message vide), erreur lancée par HTTP (code 1, message, via http), déjà en cours (busy, échec reporté dans
+            last_failure, effacé par l'ok suivant), plusieurs nicks ; index() note deadline/busy ; refus (code 3) ;
+            SystemExit (3 -> refused, texte -> message, 0 -> ok, lignes « DB occupée » reprises) ; exception dans le dispatch
+            (error + message, relancée) ; écriture ratée (OSError, UnicodeEncodeError) -> [WARN] ; fichier illisible (None) ;
+            0600 sous umask 0 ; file de messages tronquée ; _unlink_db (base, -wal, -shm) et _vacuum_db en échec."""
+            ctx=_ix_ctx(); _ix_slow(ctx,None,0); me=os.path.realpath(__file__); b=_ix_bh(ctx,'cache'); nk='ixf'
+            http=dict(os.environ,BORGHELPER_VIA='http')
+            def cli(*a,env=None,n=nk):
+                return subprocess.run([me,'-C',ctx['rc'],'-c','Index','-n',n,*a],capture_output=True,text=True,timeout=300,
+                                      env=env or dict(os.environ))
+            last=lambda n=nk: b.db.read_index_last(n) or {}
+            def tz(x):
+                from datetime import datetime as _dt
+                try: return _dt.fromisoformat(x).utcoffset() is not None
+                except (TypeError,ValueError): return False
+            cli(); ok=last()
+            cli('-b','inconnue',env=http); err=last()
+            lp=b.db._index_running_lock_path(nk); _ix_fake_lock(lp)
+            try: cli(env=http); busy=last()
+            finally: os.unlink(lp)
+            cli(); ok2=last()
+            with contextlib.suppress(OSError): os.unlink(b.db.index_last_path('ixe'))
+            cli(n='ixe,ixf'); multi=(last('ixe').get('outcome'),last().get('outcome'))
+            turn={}
+            for st in ('deadline','busy'):
+                with mock.patch.object(b,'_index_turn',return_value=st): _q_run(b.index,nk)
+                turn[st]=b._index_outcome.pop(nk,None)
+            b.db.write_index_last(nk,{'nick':nk,'outcome':'error','code':1,'via':'cli','finished_at':'2026-01-01T00:00:00+00:00',
+                                      'message':'m-s12'})
+            b._index_outcome[nk]='deadline'; b._record_index_last(nk,'2026-01-01T00:00:00',_print_mark(),0); dl=last()
+            b._record_index_last(nk,'2026-01-01T00:00:00',_print_mark(),3); ref=last()
+            sx={}
+            for k,e in (('3',SystemExit(3)),('txt',SystemExit('texte-s12')),('0',SystemExit(0))):
+                b._record_index_last(nk,'2026-01-01T00:00:00',_print_mark(),1,e); sx[k]=last()
+            m=_print_mark(); _q_run(printer,"DB occupée : s12 — ne PAS supprimer le fichier")
+            b._record_index_last(nk,'2026-01-01T00:00:00',m,1,SystemExit(1)); sx['db']=last()
+            with mock.patch.object(BorgHelper,'index',side_effect=RuntimeError('boom-s12')), \
+                 mock.patch.object(sys,'argv',[me,'-C',ctx['rc'],'-c','Index','-n',nk]):
+                raised=raises(RuntimeError,lambda: _q_run(_cli_main))
+            exc=last()
+            wf=[]
+            for e in (OSError('s12-ro'),UnicodeEncodeError('utf-8','x',0,1,'s12')):
+                with mock.patch.object(b.db,'write_index_last',side_effect=e):
+                    wf.append('[WARN]' in _q_run(b._record_index_last,nk,'2026-01-01T00:00:00',_print_mark(),0))
+            with open(b.db.index_last_path(nk),'w') as f: f.write('{pas du json')
+            bad=b.db.read_index_last(nk)
+            os.unlink(b.db.index_last_path(nk)); um=os.umask(0)
+            try: b.db.write_index_last(nk,{'outcome':'ok'})
+            finally: os.umask(um)
+            mode=stat.S_IMODE(os.stat(b.db.index_last_path(nk)).st_mode)
+            m=_print_mark()   # marque absolue : la file tronquée (plus de 200 lignes) ne décale pas le message
+            _q_run(lambda: [printer(f"{nk}: s12-trunc-{i}") for i in range(250)])
+            m2=_print_mark(); _q_run(printer,f"[ERREUR] {nk}: s12-fin")
+            b._record_index_last(nk,'2026-01-01T00:00:00',m,1); tr=last()
+            tr_ok=tr.get('message')==f"[ERREUR] {nk}: s12-fin" and _print_since(m2)==[f"[ERREUR] {nk}: s12-fin"]
+            p=os.path.join(tmp,'s12-unlink.db')
+            for f in (p,p+'-wal',p+'-shm'): open(f,'w').close()
+            _unlink_db(p); _unlink_db(p)
+            gone=not any(os.path.exists(f) for f in (p,p+'-wal',p+'-shm'))
+            vp=os.path.join(tmp,'s12-vac.db'); c=sqlite3.connect(vp); c.execute("CREATE TABLE t(x)"); c.execute("INSERT INTO t VALUES(1)")
+            c.commit(); c.close()
+            def _swap_ko(*a,**k): raise OSError('s12-swap')
+            with mock.patch.dict(globals(),{'_swap_db':_swap_ko}): vo=_q_run(b._vacuum_db,vp)
+            c=sqlite3.connect(vp)
+            try: vrows=c.execute("SELECT x FROM t").fetchall()
+            finally: c.close()
+            vac=('compactage impossible' in vo and vrows==[(1,)] and not glob.glob(vp+'.vacuum_tmp*'))
+            res=((ok.get('outcome'),ok.get('code'),ok.get('via'),ok.get('nick'),ok.get('message'))==('ok',0,'cli',nk,'')
+                 and tz(ok.get('started_at')) and tz(ok.get('finished_at')) and 'last_failure' not in ok
+                 and (err.get('outcome'),err.get('code'),err.get('via'))==('error',1,'http') and 'inconnue' in err.get('message','')
+                 and (busy.get('outcome'),busy.get('via'))==('busy','http') and 'déjà' in busy.get('message','')
+                 and (busy.get('last_failure') or {}).get('outcome')=='error'
+                 and (busy.get('last_failure') or {}).get('finished_at')==err.get('finished_at')
+                 and ok2.get('outcome')=='ok' and 'last_failure' not in ok2 and multi==('ok','ok')
+                 and turn=={'deadline':'deadline','busy':'busy'}
+                 and dl.get('outcome')=='deadline' and (dl.get('last_failure') or {}).get('message')=='m-s12'
+                 and (ref.get('outcome'),ref.get('code'))==('refused',3)
+                 and (sx['3'].get('outcome'),sx['3'].get('code'))==('refused',3)
+                 and (sx['txt'].get('outcome'),sx['txt'].get('code'),sx['txt'].get('message'))==('error',1,'texte-s12')
+                 and (sx['0'].get('outcome'),sx['0'].get('code'))==('ok',0) and 'DB occupée' in sx['db'].get('message','')
+                 and raised and exc.get('outcome')=='error' and 'boom-s12' in exc.get('message','')
+                 and wf==[True,True] and bad is None and gone and mode==0o600 and tr_ok and vac)
+            if not res: print(f"  résultat d'Index : ok {ok} | err {err} | busy {busy} | ok2 {ok2} | multi {multi} | tour {turn} | "
+                              f"échéance {dl} | refus {ref} | sys.exit {sx} | exc {raised} {exc} | écriture ratée {wf} | "
+                              f"illisible {bad} | unlink {gone} | mode {oct(mode)} | troncature {tr} | vacuum {vac} {vo[-200:]!r}")
+            return res
         def _ix_prune_waits():
             """Prune attend l'Index (wait_index_idle) comme Bkp et Restore."""
             ctx=_ix_ctx(); b=_ix_bh(ctx,'c-prune'); called=[]
@@ -10244,6 +10402,7 @@ def codec_selftest(pattern=None,list_only=False):
             check("DelBkp -> archive retirée des bases et du rapport sans nouvel Index",_ix_delbkp_reconcile)
             check("périmètre GLOB_ARCH : hors motif retirée sans toucher history.db ; disparue figée ; liste complète en échec -> reporté ; sans filtre -> un seul borg list",_sc_scope)
             check("borg arrêté à l'échéance -> _MEI* orphelin retiré ; celui d'un processus vivant (mappé) ou récent gardé",_ix_mei_purge)
+            check("résultat du dernier Index par nick : ok, erreur via HTTP, déjà en cours (échec reporté), plusieurs nicks, échéance, refus, sys.exit, exception, écriture ratée ; fichier illisible ; _unlink_db, _vacuum_db en échec",_ix_index_last)
         # ── Reconstruction dans un fichier fantôme (1.0.143, story 6, AD-2/AD-5/AD-6) ──
         rb_ctx={}
         def _rb_ctx():
@@ -10600,15 +10759,16 @@ def codec_selftest(pattern=None,list_only=False):
                 return p.returncode,p.stdout+p.stderr
             _q_run(b.index,'rbs1')
             c1,o1=cli('Index','-n','rbs1','--rebuild')
+            il1=b.db.read_index_last('rbs1') or {}   # 1.0.149 (story 12) : refus enregistré
             sp=_rb_sp(b,'rb'); _q_run(b.index,'rb',rebuild=True,natures=['stats']); m0=os.path.getmtime(sp) if os.path.exists(sp) else None
             time.sleep(0.05)
             c2,o2=cli('Index','-n','rb','--rebuild','-F','-T','stats')
             c3,o3=cli('Index','-n','rb','-F','-t','1m')
             c4,o4=cli('Status','-n','rb','--rebuild')
-            ok=(c1==3 and 'DB_NAME' in o1 and m0 is not None and c2==0 and 'jeté (-F)' in o2 and os.path.exists(sp)
+            ok=(c1==3 and 'DB_NAME' in o1 and (il1.get('outcome'),il1.get('code'))==('refused',3) and m0 is not None and c2==0 and 'jeté (-F)' in o2 and os.path.exists(sp)
                 and c3!=0 and 'incompatibles' in o3 and c4!=0 and 'réservé à Index' in o4)
             BorgHelper._shadow_discard(sp)
-            if not ok: print(f"  CLI : {c1} {o1[-150:]!r} | {c2} {o2[-150:]!r} | {c3} {o3[-120:]!r} | {c4} {o4[-120:]!r}")
+            if not ok: print(f"  CLI : {c1} {o1[-150:]!r} {il1} | {c2} {o2[-150:]!r} | {c3} {o3[-120:]!r} | {c4} {o4[-120:]!r}")
             return ok
         def _rb_prune_during():
             """Archive supprimée (borg delete) et nouvelle archive pendant une reconstruction, DIFF_KEEP=2 : le fantôme
@@ -11499,10 +11659,17 @@ def _cli_main():
         # refusé : DB_NAME partagé, espace, migration de chiffrement) ; déjà en cours, échéance ou pause : 0.
         _irc=0
         for n in nick.split(','):
-            if _snaponly: r=bh.index(n,debug=debug,force=_force,snap_only=True)   # même verrou et même pause (1.0.141)
-            elif _tranche:   # budget par nick
-                r=bh.index(n,debug=debug,budget=_budget,natures=_natures,period=_period,rebuild=_rebuild,force=_force)
-            else: r=bh.index(n,debug=debug,force=_force,target_archive=_target)
+            # Résultat par nick (1.0.149, story 12 A4) : fichier <conf>-<nick>-index-last.json, lu par /access.
+            _t0=_iso_now(); _mark=_print_mark()
+            try:
+                if _snaponly: r=bh.index(n,debug=debug,force=_force,snap_only=True)   # même verrou et même pause (1.0.141)
+                elif _tranche:   # budget par nick
+                    r=bh.index(n,debug=debug,budget=_budget,natures=_natures,period=_period,rebuild=_rebuild,force=_force)
+                else: r=bh.index(n,debug=debug,force=_force,target_archive=_target)
+            except BaseException as _e:   # exception, sys.exit, Ctrl-C : enregistrée puis relancée
+                bh._record_index_last(n,_t0,_mark,1,_e)
+                raise
+            bh._record_index_last(n,_t0,_mark,r)
             if isinstance(r,int) and r>_irc: _irc=r
         if _irc: sys.exit(_irc)
     elif cmd=='search':
