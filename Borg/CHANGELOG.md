@@ -1,5 +1,21 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.151 — _MEI orphelins en fin de selftest — 2026-09-29
+
+Chantier « reconstruction progressive », story 14 (rétrospective : A15 ; F24).
+
+- **`CodecSelfTest`** retire en fin de run (même en échec ou filtré, pas avec `-l`) les `_MEI*` laissés par les borg
+  tués pendant le run, dans `/tmp` et le `TMPDIR` de Python. Seulement ceux apparus pendant le run, à l'utilisateur
+  courant, utilisés par aucun processus (`_mei_in_use`) et dont rien, arborescence comprise, n'a changé depuis 10 s ;
+  un plus récent est attendu (15 s au plus en tout), puis revérifié. Fait après la restauration de l'état global (un
+  Ctrl-C pendant l'attente ne laisse rien de modifié). Ligne `/tmp/_MEI* : N orphelin(s) du run retiré(s)` si N > 0 ;
+  bilan et code de sortie inchangés. Avant, `_purge_mei_orphans` (après un arrêt de borg, au-delà de 2 min) laissait
+  le dernier d'un run (~60 Mo). Production inchangée : le prochain arrêt de borg le retire.
+- Tests : contrôle sur de faux répertoires uniquement (orphelin du run retiré ; présent avant, borg vivant, autre
+  propriétaire, récent, sous-répertoire actif, modifié pendant l'attente gardés ; récent retiré après attente) ;
+  branchement (codec_selftest imbriqué, nettoyage espionné : relevé avant le run, 10 s / 15 s, ligne si N > 0, rien
+  avec `-l`).
+
 ## borgHelper 1.0.150 — erreurs d'Index marquées — 2026-09-28
 
 Chantier « reconstruction progressive », story 13 (rétrospective : A13 ; F23).

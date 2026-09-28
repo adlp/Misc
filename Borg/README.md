@@ -1162,6 +1162,12 @@ Les contrôles d'un même groupe partagent un dépôt de test que les précéden
 construites) : viser un groupe entier plutôt qu'un contrôle isolé, et relancer le run complet en cas d'échec — le bilan
 le rappelle. Ne jamais lancer deux `CodecSelfTest` en même temps : les contrôles de minutage échouent sous charge.
 
+**Fichiers temporaires** (1.0.151) : en fin de run (même en échec ou filtré, pas avec `-l`), les `_MEI*` (~60 Mo
+chacun, dans `/tmp` ou `TMPDIR`) laissés par les borg tués pendant le run sont retirés : seulement ceux apparus pendant
+le run, à l'utilisateur courant, utilisés par aucun processus et dont rien (arborescence comprise) n'a changé depuis
+10 s (15 s d'attente au plus pour un plus récent). Une ligne
+`/tmp/_MEI* : N orphelin(s) du run retiré(s)` le signale ; bilan et code de sortie inchangés.
+
 Auto-test du codec de chiffrement des chemins (vecteurs officiels HMAC/PBKDF2/scrypt, aller-retour, rejets
 `DbCodecError`/`DbKeyError`/`DbTamperError`, versions de schéma, `DB_ENCRYPT`/`DB_KDF`, permissions) et des requêtes de
 chemin : mêmes résultats sur une base `plain` et sur une base chiffrée pour `TreeHist`, `TreeFind`, `Search`, `FileHist`,

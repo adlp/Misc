@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.150"
+Version="1.0.151"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -3027,6 +3027,41 @@ def _purge_mei_orphans(min_age=120):
             if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or time.time()-st.st_mtime<min_age: continue
             if not _mei_in_use(d): shutil.rmtree(d,ignore_errors=True)
         except Exception: pass
+
+def _mei_dirs():
+    """_MEI* de tempfile.gettempdir() et de /tmp : boex reconstruit l'environnement de borg sans TMPDIR."""
+    import tempfile
+    return set().union(*(glob.glob(os.path.join(x,'_MEI*')) for x in {tempfile.gettempdir(),'/tmp'}))
+
+def _mei_newest(d):
+    """mtime le plus récent de d et de son arborescence (lstat) : une extraction écrit dans les sous-répertoires."""
+    m=os.lstat(d).st_mtime
+    for root,dirs,files in os.walk(d):
+        for x in dirs+files:
+            try: m=max(m,os.lstat(os.path.join(root,x)).st_mtime)
+            except OSError: pass
+    return m
+
+def _purge_run_mei(before,min_age=10,wait=15):
+    """Fin de CodecSelfTest (1.0.151, story 14 A15) : retire les _MEI* apparus pendant le run (absents de `before`), à
+    nous, utilisés par aucun processus et dont rien (arborescence comprise) n'a changé depuis min_age s. Un candidat
+    plus récent est attendu, `wait` s au plus pour tout le nettoyage, puis tout est revérifié : modifié pendant
+    l'attente (extraction en cours) -> gardé. Rend le nombre retiré ; toute erreur est ignorée. _purge_mei_orphans
+    (après un arrêt de borg, 2 min) laisse le dernier d'un run."""
+    n=0; end=time.monotonic()+wait; uid=os.getuid()
+    def mine(d):
+        st=os.lstat(d); return stat.S_ISDIR(st.st_mode) and st.st_uid==uid
+    for d in sorted(_mei_dirs()-set(before)):
+        try:
+            if not mine(d) or _mei_in_use(d): continue   # borg vivant : jamais d'attente pour lui
+            m=_mei_newest(d); pause=min_age-(time.time()-m)
+            if pause>0:
+                if time.monotonic()+pause>end: continue
+                time.sleep(pause)
+                if not mine(d) or _mei_newest(d)!=m or _mei_in_use(d): continue
+            shutil.rmtree(d,ignore_errors=True); n+=not os.path.exists(d)
+        except Exception: pass
+    return n
 
 class BorgRunner:
     """Borg subprocess wrapper and borghelperrc configuration layer."""
@@ -7010,6 +7045,7 @@ def codec_selftest(pattern=None,list_only=False):
         except exc: return True
         except BaseException: return False
         return False
+    mei_before=_mei_dirs()   # 1.0.151 (story 14) : _MEI* du run retirés en fin de run
     tmp=tempfile.mkdtemp(prefix='borghelper-selftest-')
     # état global restauré à la fin : le self-test ne doit rien laisser derrière lui
     saved_readers=dict(_DB_CFG_READERS); saved_deks=dict(_DEK_CACHE); saved_codecs=dict(_CODEC_CACHE); saved_scrypt=getattr(hashlib,'scrypt',None)
@@ -7053,6 +7089,36 @@ def codec_selftest(pattern=None,list_only=False):
             if not ok: print(f"  filtre : {g[0]} {z[0]} {i[0]} {l[0]} {lz[0]} {lr[0]} {e[0]} {codes} {g[1][-200:]!r} {l[1][-200:]!r}")
             return ok
         check("sélection : -f groupe (PARTIEL), rien sélectionné ou motif invalide -> code 2, -l liste sans exécuter",_selftest_filter)
+        def _mei_run_hook():
+            """1.0.151 (story 14 A15) : branchement du nettoyage _MEI — relevé avant le run (un _MEI créé avant y est, un
+            créé pendant n'y est pas), appel avec les valeurs par défaut (10 s, 15 s), ligne seulement si N > 0 et avant
+            le bilan, code inchangé ; rien avec -l. codec_selftest imbriqué (^HMAC), _purge_run_mei espionné."""
+            import inspect
+            real=_purge_run_mei; sig=inspect.signature(real).parameters
+            x=os.path.join(tempfile.gettempdir(),f'_MEIs14h-{os.getpid()}-avant'); y=x[:-5]+'pendant'
+            calls=[]; out={}
+            def spy(before,*a,**k): calls.append((x in before,y in before,a,k)); return spy.ret
+            mkd=tempfile.mkdtemp
+            def mkd_spy(*a,**k): os.makedirs(y,exist_ok=True); return mkd(*a,**k)
+            os.makedirs(x,exist_ok=True)
+            try:
+                for ret,lst in ((2,False),(0,False),(2,True)):
+                    spy.ret=ret; calls.clear(); buf=io.StringIO(); shutil.rmtree(y,ignore_errors=True)   # créé pendant CHAQUE run
+                    with mock.patch.dict(globals(),{'_purge_run_mei':spy}), mock.patch.object(tempfile,'mkdtemp',mkd_spy), \
+                         contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                        rc=codec_selftest(re.compile('^HMAC'),list_only=lst)
+                    out[(ret,lst)]=(rc,list(calls),buf.getvalue())
+            finally:
+                for d in (x,y): shutil.rmtree(d,ignore_errors=True)
+            o2=out[(2,False)][2]; line="  /tmp/_MEI* : 2 orphelin(s) du run retiré(s)"
+            ok=(sig['min_age'].default==10 and sig['wait'].default==15
+                and out[(2,False)][:2]==(0,[(True,False,(),{})]) and line in o2.splitlines()
+                and o2.index(line)<o2.index('CodecSelfTest : 1/1 OK')
+                and out[(0,False)][:2]==(0,[(True,False,(),{})]) and '_MEI' not in out[(0,False)][2]
+                and out[(2,True)][1]==[] and '_MEI' not in out[(2,True)][2])
+            if not ok: print(f"  branchement _MEI : {[(k,v[0],v[1]) for k,v in out.items()]} {o2[-300:]!r}")
+            return ok
+        check("fin de selftest : nettoyage _MEI* branché (relevé avant le run, 10 s / 15 s, ligne si N > 0, rien avec -l)",_mei_run_hook)
         # ── alphabet / base64 strict ──
         check("alphabet : +->'.' /->'-' sans padding",lambda: _b64e(bytes([0xfb,0xff,0xbf]))=='.-.-' and _b64e(b'\x00')=='AA')
         check("_b64d : longueur = 1 mod 4 rejetée",lambda: raises(DbCodecError,lambda:_b64d('AAAAA')))
@@ -10449,6 +10515,44 @@ def codec_selftest(pattern=None,list_only=False):
             check("DelBkp -> archive retirée des bases et du rapport sans nouvel Index",_ix_delbkp_reconcile)
             check("périmètre GLOB_ARCH : hors motif retirée sans toucher history.db ; disparue figée ; liste complète en échec -> reporté ; sans filtre -> un seul borg list",_sc_scope)
             check("borg arrêté à l'échéance -> _MEI* orphelin retiré ; celui d'un processus vivant (mappé) ou récent gardé",_ix_mei_purge)
+            def _mei_run_purge():
+                """1.0.151 (story 14 A15) : fin de run, sur de faux répertoires seulement (_mei_dirs limité au préfixe du
+                contrôle, jamais un vrai _MEI) — autre propriétaire gardé ; orphelin du run retiré ; présent avant, borg
+                vivant (cwd dedans), récent sans attente et sous-répertoire actif gardés ; récent modifié pendant
+                l'attente gardé ; récent retiré après l'attente."""
+                import tempfile
+                base=os.path.join(tempfile.gettempdir(),f'_MEIs14-{os.getpid()}-'); real=_mei_dirs
+                own=lambda: {d for d in real() if d.startswith(base)}
+                def mk(s,age,sub_age=None):
+                    os.makedirs(os.path.join(base+s,'sub'),exist_ok=True)
+                    os.utime(os.path.join(base+s,'sub'),(time.time()-(age if sub_age is None else sub_age),)*2)
+                    os.utime(base+s,(time.time()-age,)*2); return base+s
+                p=None; r={}
+                try:
+                    with mock.patch.dict(globals(),{'_mei_dirs':own}):
+                        pre=mk('pre',60); before=own()
+                        orph=mk('orph',60); live=mk('live',60); fresh=mk('fresh',0); other=mk('other',60)
+                        deep=mk('deep',60,sub_age=0)
+                        p=subprocess.Popen(['sleep','60'],cwd=live)
+                        with mock.patch.object(os,'getuid',return_value=os.getuid()+1):
+                            r['autre']=(_purge_run_mei(own()-{other},min_age=10,wait=0),os.path.exists(other))
+                        r['n1']=_purge_run_mei(before|{other},min_age=10,wait=0)
+                        r['st1']={k:os.path.exists(v) for k,v in (('pre',pre),('orph',orph),('live',live),('fresh',fresh),('deep',deep))}
+                        def touch(): time.sleep(0.6); open(os.path.join(fresh,'sub','x'),'w').close()
+                        os.utime(os.path.join(fresh,'sub'))   # « récent » juste avant l'appel : /proc est lent à lire
+                        th=threading.Thread(target=touch); th.start()
+                        r['modifié']=(_purge_run_mei(own()-{fresh},min_age=3,wait=5),os.path.exists(fresh)); th.join()
+                        r['attente']=(_purge_run_mei(own()-{fresh},min_age=4,wait=5),os.path.exists(fresh))   # attente réelle (~1,5 s)
+                finally:
+                    if p: p.kill(); p.wait()
+                    for d in real():
+                        if d.startswith(base): shutil.rmtree(d,ignore_errors=True)
+                ok=(r.get('autre')==(0,True) and r.get('n1')==1
+                    and r.get('st1')=={'pre':True,'orph':False,'live':True,'fresh':True,'deep':True}
+                    and r.get('modifié')==(0,True) and r.get('attente')==(1,False))
+                if not ok: print(f"  _MEI fin de run : {r}")
+                return ok
+            check("fin de selftest : _MEI* orphelin du run retiré ; présent avant, borg vivant, autre propriétaire, récent ou modifié gardés ; récent retiré après attente",_mei_run_purge)
             check("résultat du dernier Index par nick : ok, erreur via HTTP, déjà en cours (échec reporté), plusieurs nicks, échéance, refus, sys.exit, exception, écriture ratée ; erreurs [ERREUR] reprises sans [WARN] ; fichier illisible ; _unlink_db, _vacuum_db en échec",_ix_index_last)
         # ── Reconstruction dans un fichier fantôme (1.0.143, story 6, AD-2/AD-5/AD-6) ──
         rb_ctx={}
@@ -11150,6 +11254,10 @@ def codec_selftest(pattern=None,list_only=False):
         globals()['_MIGRATE_BATCH']=saved_batch
         shutil.disk_usage=saved_disk_usage
         if saved_scrypt is not None: hashlib.scrypt=saved_scrypt
+        if not list_only:   # en dernier : un Ctrl-C pendant l'attente laisse l'état global restauré
+            try: n_mei=_purge_run_mei(mei_before)
+            except Exception: n_mei=0
+            if n_mei: print(f"  /tmp/_MEI* : {n_mei} orphelin(s) du run retiré(s)")
     fails=results.count(False)
     if pattern is not None and not results and not skipped[0]:
         print(f"CodecSelfTest : aucun contrôle ne correspond au filtre « {pattern.pattern} »"); return None

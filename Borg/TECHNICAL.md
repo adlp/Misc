@@ -861,7 +861,11 @@ passe (_index_pass) : borg list → rapprochement → diffs / stats / snapshot (
     borg list / info / list du snapshot ; thread _priority_monitor pour les diffs (futures annulées, SIGTERM puis
     SIGKILL après 5 s, jamais de break-lock — 1.0.145) ; unité en cours jetée, unités finies gardées (sentinelles) ;
     après tout arrêt de borg (boex compris), _purge_mei_orphans retire les <TMPDIR>/_MEI* à nous, inchangés depuis
-    2 min et absents de /proc/*/maps, cwd et fd (fuser ne voit pas les bibliothèques mappées d'un borg vivant)
+    2 min et absents de /proc/*/maps, cwd et fd (fuser ne voit pas les bibliothèques mappées d'un borg vivant) ;
+    le dernier borg tué garde le sien jusqu'au prochain arrêt — en fin de CodecSelfTest, _purge_run_mei (1.0.151)
+    retire ceux apparus pendant le run, dans /tmp et TMPDIR (à nous, non utilisés, arborescence inchangée depuis
+    10 s — une extraction écrit dans les sous-répertoires ; 15 s d'attente au plus, puis tout revérifié), après la
+    restauration de l'état global du selftest
     ↓
 demande prioritaire vue → index-paused.lock pris AVANT de relâcher index-running.lock → attente
     → plus de demande ET index-running libre → reprise : nouvelle passe complète (borg list, rapprochement,
