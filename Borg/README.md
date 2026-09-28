@@ -591,7 +591,7 @@ borgHelper -c Index -n mon-serveur -F        # force la réindexation complète
 borgHelper -c Index -n mon-serveur -S        # snapshot seul
 borgHelper -c Index -n mon-serveur -S -F     # force le snapshot seul (borg list complet)
 borgHelper -c Index -n mon-serveur -A <archive>  # indexe uniquement la paire terminant par <archive>
-borgHelper -c Index -n ALL -t 1m             # tranche d'une minute par nick (cron)
+borgHelper -c Index -n ALL -t 20m            # tranche de 20 min par nick (ligne cron conseillée, horaire)
 borgHelper -c Index -n mon-serveur -T diff -b 2026-09-01   # diffs seuls, archives depuis le 1er septembre
 borgHelper -c Index -n mon-serveur --rebuild -t 20m        # reconstruction dans un fichier fantôme (1.0.143)
 ```
@@ -639,6 +639,9 @@ borgHelper -c Status -n mon-serveur                   # « Reconstruction (fant�
   de `DbEncrypt`/`DbDecrypt`, base servie ou son en-tête illisible. Pendant une tranche ordinaire, le même refus laisse
   la base servie avancer et affiche « reconstruction suspendue ».
 - `borg list` vide (`GLOB_ARCH` erroné, dépôt vidé) : le fantôme n'est ni avancé ni basculé.
+- Tranche limitée par `-T` ou `-b/-B` (une borne autre que `ALL`) : le fantôme n'avance que dans ces limites ; il ne
+  devient complet et ne bascule que lorsque le reste a été couvert (par d'autres tranches, limitées ou non). Un
+  avertissement le signale (1.0.148). La ligne cron conseillée n'a pas de limite.
 - Base chiffrée : le fantôme reprend l'en-tête de la base servie (même clé). Un `DbEncrypt`/`DbDecrypt`/`DbRekey`
   lancé entre deux tranches fait jeter le fantôme, qui repart de zéro.
 - `IDX_EXCLUDE`/`IDX_INCLUDE` : déjà appliqués par `Index` ; la purge d'`IdxPurge` passe aussi sur le fantôme juste
@@ -2306,9 +2309,13 @@ raisonnement (indiscernabilité d'un chemin qui n'existe simplement pas dans l'a
 # Prune hebdomadaire le dimanche à 3h
 0 3 * * 0  borgHelper -c Prune -n mon-serveur
 
-# Construction / complétion des bases par tranches d'une minute PAR NICK, toutes les 10 minutes (1.0.141) :
-# au-delà de 10 nicks, un lancement dure plus de 10 min — le suivant sort aussitôt (« Index déjà en cours »)
-*/10 * * * *  borgHelper -c Index -n ALL -t 1m
+# Construction / complétion / reconstruction des bases par tranches de 20 min PAR NICK, toutes les heures (ligne
+# conseillée, 1.0.148) : couvre le snapshot d'un gros dépôt, première unité d'une tranche. Au-delà de 3 nicks, un
+# lancement peut dépasser l'heure (jusqu'à 20 min × nombre de nicks si chacun use son budget) : le suivant saute
+# seulement le nick en cours (« Index déjà en cours ») et traite les autres en parallèle — plusieurs lancements peuvent
+# alors se cumuler. Pour n'en garder qu'un : flock -n /tmp/borghelper-index.lock borgHelper -c Index -n ALL -t 20m
+# Remplace l'ancienne ligne conseillée `*/10 * * * * … Index -n ALL -t 1m` (avant 1.0.148).
+0 * * * *  borgHelper -c Index -n ALL -t 20m
 
 # Rapport HTML envoyé par mail
 30 6 * * *  borgHelper -c Report -n ALL -l | mail -s "Borg $(date +\%F)" admin@domaine.com

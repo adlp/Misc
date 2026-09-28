@@ -590,7 +590,7 @@ indexsnap() → voir flux IndexSnap ci-dessous
 ### `Index` par tranches (1.0.141, story 4, AD-1/AD-3/AD-10)
 
 `index(nick, budget=, natures=, period=)` — CLI `-t` / `-T` / `-b` / `-B` ; au moins l'un active la tranche,
-incompatible avec `-F`/`-S`/`-A`. Budget compté par nick (`-n ALL -t 1m` : 1 min par nick). Le processus CLI passe
+incompatible avec `-F`/`-S`/`-A`. Budget compté par nick (`-n ALL -t 20m`, ligne cron conseillée : 20 min par nick). Le processus CLI passe
 en `nice` 10 + `ionice -c3` (`_lower_priority`, hérité par borg) ; une bibliothèque appelante garde sa priorité.
 
 ```
@@ -638,7 +638,9 @@ build_state (db_meta, clé 'build_state:<nick>', JSON) : {state: partial|complet
 ### Reconstruction dans un fichier fantôme (1.0.143, story 6, AD-2/AD-3/AD-5/AD-6)
 
 `index(nick, rebuild=True)` (CLI `--rebuild`) est une tranche qui crée ou poursuit `<diff.db>.rebuild`. Toute tranche
-poursuit un fantôme existant ; l'Index sans option et l'Index ciblé de fin de Bkp ne le touchent jamais.
+poursuit un fantôme existant, avec ses propres limites `-T`/`-b`/`-B` : il ne se complète (et ne bascule) que lorsque
+le reste a été couvert, et une tranche limitée l'avertit (1.0.148, R8) ; l'Index sans option et l'Index ciblé de fin de
+Bkp ne le touchent jamais.
 
 ```
 index() : tour exclusif (index-running.lock)
@@ -821,7 +823,18 @@ finally: clear_priority_lock(nick)  → supprime le fichier de CE processus seul
 **Porteurs multiples** (1.0.145, story 8 R1) : `check_priority_lock` = au moins un porteur vivant autre que soi parmi
 `<repo>-priority.lock.<pid>` (hors `.tmp` d'écriture) et l'ancien fichier unique `<repo>-priority.lock` (processus
 d'avant la mise à jour : lu, jamais écrit ; retiré par `clear` seulement s'il porte le PID courant). Fichier d'un PID
-mort : retiré à la lecture. Avant, un Restore qui finissait pendant un Bkp du même dépôt supprimait le verrou du Bkp
+mort : retiré à la lecture.
+
+**Verdict commun `_lock_holder`** (tous les verrous à PID : prioritaire, `index-running`, `index-paused`,
+`report-running`) : `gone` (absent) ; `alive` pour un fichier vide de moins de 2 s ou un PID vivant, **y compris d'un
+autre utilisateur** (`PermissionError`) ; `me` pour le PID courant ; `dead` pour un PID mort, ≤ 0 ou hors plage, et
+(1.0.148) pour un **PID repris** : processus démarré plus de 60 s après la dernière écriture du fichier (PID et date
+lus dans la même ouverture), même d'un autre utilisateur ou du processus courant. `_owns_lock` suit ce verdict (un
+ancien fichier à notre PID n'est pas à nous). La date de démarrage vient de `btime` + ticks (`_pid_start_time`) : elle
+suit l'horloge murale, d'où la marge de 60 s ; un saut d'horloge plus grand (VM suspendue puis resynchronisée, machine
+sans horloge matérielle, `CACHE_DIR` sur un NFS au serveur décalé) peut encore faire prendre un verrou vivant pour
+mort — risque résiduel accepté (changer le format du verrou ferait lire les nouveaux verrous comme morts par un
+binaire plus ancien). Avant, un Restore qui finissait pendant un Bkp du même dépôt supprimait le verrou du Bkp
 et l'Index en pause reprenait à côté de lui.
 
 ### Surveillance croisée : pause et reprise de l'Index (1.0.141, story 4, AD-4 amendé)
@@ -840,7 +853,8 @@ demande d'arrêt (priority.lock d'un autre PID, ou report-running.lock) ?
     ↓
 acquire_index_running_lock : os.link d'un fichier temporaire contenant le PID (création atomique, jamais vide ;
 repli O_CREAT|O_EXCL sans liens physiques), verrou d'un PID mort mis de côté par rename puis revérifié (jamais
-l'unlink d'un verrou repris entre-temps) ; PID d'un autre utilisateur = vivant ; tenu pendant TOUTES les phases
+l'unlink d'un verrou repris entre-temps) ; verdict de `_lock_holder` (voir « Porteurs multiples ») ; tenu pendant
+TOUTES les phases
     ↓
 passe (_index_pass) : borg list → rapprochement → diffs / stats / snapshot (ou tranche)
     moniteur : BorgRunner._stop (boex : communicate(timeout=0.5) en boucle, borg tué → 'killed': True) pour

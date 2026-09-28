@@ -1,5 +1,30 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.148 — petits correctifs de fin de chantier — 2026-09-28
+
+Chantier « reconstruction progressive », story 11 (rétrospective : A9, A10, A11 ; F15, R8, D1).
+
+- **Verrous à PID** : la garde contre un PID repris vaut maintenant pour tous (`index-running`, `index-paused`,
+  `report-running`, prioritaire), dans `_lock_holder`. Un verrou plus ancien que le processus qui porte son PID compte
+  comme mort, y compris quand c'est le processus courant ou un autre utilisateur ; `_owns_lock` suit ce verdict ; un
+  PID ≤ 0 compte comme mort. Avant, seul le verrou prioritaire l'était (1.0.145) : un Index tué par SIGKILL dont le PID
+  était repris bloquait tout Index du dépôt (« Index déjà en cours »).
+  - Marge portée de 2 s (1.0.145) à **1 min** : l'heure de démarrage vient de `btime`, qui suit l'horloge murale.
+    Avant, un saut d'horloge de quelques secondes (correction NTP) pouvait faire prendre un verrou vivant pour mort ;
+    un saut de plus d'une minute (VM suspendue puis resynchronisée, machine sans horloge matérielle) le peut encore —
+    risque accepté. En contrepartie, un PID repris moins d'une minute après l'écriture du verrou n'est pas détecté.
+- **Reconstruction limitée** : une tranche `-T` (sans les trois natures) ou `-b/-B` (avec une borne) qui fait avancer
+  un fantôme l'avertit : elle ne l'avance que dans ses limites, et il ne sera complet (puis basculé) que lorsque le
+  reste aura été couvert (R8). `-b ALL` ne compte pas comme une limite.
+- **README** : une seule ligne cron conseillée, `0 * * * * borgHelper -c Index -n ALL -t 20m`, dans les exemples de
+  crontab, le bloc Index et la section reconstruction. L'ancien `*/10 … -t 1m` pouvait ne pas couvrir le snapshot
+  d'un gros dépôt, première unité depuis 1.0.146. **À faire** : remplacer dans sa crontab une ligne
+  `*/10 * * * * … Index -n ALL -t 1m` par la nouvelle ; les lancements qui se chevauchent tournent sur des nicks
+  différents (`flock -n` pour n'en garder qu'un).
+- Contrôles : verrous à PID repris (`index-running`, `index-paused`, `report-running`, processus courant, autre
+  utilisateur, PID 0) ; avertissement du fantôme limité (`-T`, `-b`, `-B` seul, `-b ALL`), bascule quand des tranches
+  limitées couvrent tout ; diagnostic « base finie par tranches » montrant le premier écart.
+
 ## borgHelper 1.0.147 — CodecSelfTest par groupe — 2026-09-28
 
 Chantier « reconstruction progressive », story 10 (rétrospective : A5 ; F2, F12, F14).

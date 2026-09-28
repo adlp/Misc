@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.147"
+Version="1.0.148"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -1735,19 +1735,25 @@ class BorgHelperDB:
     @staticmethod
     def _lock_holder(path):
         """'me' | 'alive' | 'dead' | 'gone' (1.0.141). Fichier vide ou illisible de moins de 2 s : 'alive' (en cours
-        d'écriture par son créateur) ; PID d'un autre utilisateur (PermissionError) : 'alive' — jamais pris pour mort."""
+        d'écriture par son créateur) ; PID d'un autre utilisateur (PermissionError) : vivant, sauf PID repris.
+        PID repris (1.0.148, story 11 A9) : processus démarré plus de 60 s après la dernière écriture du fichier (porteur
+        tué par SIGKILL, numéro réattribué, y compris au processus courant) -> 'dead' ; démarrage inconnu : inchangé.
+        Marge de 60 s : _pid_start_time suit l'horloge murale (btime), un saut de quelques secondes ne tue aucun verrou
+        vivant. PID ≤ 0 : 'dead'."""
         try:
-            with open(path) as f: txt=f.read().strip()
+            with open(path) as f: txt=f.read().strip(); mt=os.fstat(f.fileno()).st_mtime   # PID et date du même fichier
         except FileNotFoundError: return 'gone'
         except OSError: return 'alive'
         try: pid=int(txt)
-        except ValueError:
-            try: return 'alive' if time.time()-os.path.getmtime(path)<2 else 'dead'
-            except OSError: return 'gone'
-        if pid==os.getpid(): return 'me'
-        try: os.kill(pid,0); return 'alive'
-        except PermissionError: return 'alive'
-        except OSError: return 'dead'
+        except ValueError: return 'alive' if time.time()-mt<2 else 'dead'
+        if pid<=0 or pid>=2**31: return 'dead'   # os.kill(0|-1) viserait un groupe ; au-delà : OverflowError
+        if pid!=os.getpid():
+            try: os.kill(pid,0)
+            except PermissionError: pass
+            except OSError: return 'dead'
+        started=_pid_start_time(pid)
+        if started is not None and started>mt+60: return 'dead'
+        return 'me' if pid==os.getpid() else 'alive'
 
     def _check_pid_lock(self,path):
         h=self._lock_holder(path)
@@ -1774,15 +1780,7 @@ class BorgHelperDB:
         held=self._check_pid_lock(legacy)
         for p in glob.glob(glob.escape(legacy)+'.*'):
             if not p[len(legacy)+1:].isdigit(): continue   # '.tmp' de _set_pid_lock
-            # PID réutilisé (porteur tué par SIGKILL, numéro repris par un processus plus récent que le fichier) :
-            # porteur mort — sinon l'Index resterait en pause tant que vit ce processus sans rapport.
-            started=_pid_start_time(int(p[len(legacy)+1:]))
-            try: reused=started is not None and started>os.path.getmtime(p)+2
-            except OSError: continue
-            if reused:
-                with contextlib.suppress(OSError): os.unlink(p)
-                continue
-            if self._check_pid_lock(p): held=True
+            if self._check_pid_lock(p): held=True   # PID repris : 'dead' par _lock_holder (1.0.148), fichier retiré
         return held
 
     def _report_running_lock_path(self,nick): return self._pid_lock_path(nick,'report-running')
@@ -1846,9 +1844,9 @@ class BorgHelperDB:
         except OSError: pass
 
     def _owns_lock(self,path):
-        try:
-            with open(path) as f: return f.read().strip()==str(os.getpid())
-        except OSError: return False
+        # 1.0.148 : même verdict que _lock_holder — un fichier ancien portant notre PID (repris) n'est pas à nous, sinon
+        # index() sauterait le tour d'Index pendant qu'un autre processus, qui le voit mort, le prend.
+        return self._lock_holder(path)=='me'
 
     def acquire_index_running_lock(self,nick,wait=0):
         """Tour d'Index exclusif ; wait : secondes d'attente maximale si un autre le tient (Index de fin de Bkp)."""
@@ -4830,6 +4828,10 @@ class BorgHelper:
                 plan['shadow'],err=self._shadow_prepare(nick,db_path,create=rebuild,force=force and rebuild)
                 if err and rebuild: return err
                 if err: printer(f"{nick}: reconstruction suspendue — régler le problème ci-dessus puis relancer Index --rebuild")
+                # R8 (1.0.148, story 11 A10) : le fantôme avance avec les mêmes limites — jamais complet, jamais basculé.
+                if plan['shadow'] and (plan['natures']!={'stats','snap','diff'} or any(v and v!='ALL' for v in (period or ()))):
+                    printer(f"[WARN] {nick}: reconstruction (fantôme) limitée par -T/-b/-B : elle n'avance le fantôme que dans "
+                            f"ces limites — il sera complet et basculera quand le reste aura été couvert (ex. Index -n {nick} -t 20m)")
             while True:
                 r=self._index_pass(nick,debug,db_path,force,target_archive,plan)
                 if r=='deadline': r=0
@@ -9267,6 +9269,63 @@ def codec_selftest(pattern=None,list_only=False):
                 for f in glob.glob(glob.escape(legacy)+'*'):
                     with contextlib.suppress(OSError): os.unlink(f)
         check("priority.lock par porteur : Restore fini pendant un Bkp -> Bkp toujours vu ; mort ou PID réutilisé retiré ; ancien fichier lu",_priority_holders)
+        def _pid_locks_reused():
+            """1.0.148 (story 11 A9) : garde « PID repris » commune (_lock_holder). index-running d'hier au PID d'un
+            processus lancé à l'instant -> pas « Index en cours », fichier retiré, verrou repris ; idem index-paused ;
+            fichier d'hier au PID courant -> 'dead', jamais 'me' ; porteurs légitimes (fichier écrit après le démarrage)
+            -> 'alive' / 'me'."""
+            if _pid_start_time(os.getpid()) is None:
+                print("  /proc illisible : garde « PID repris » inactive par conception, contrôle sans objet"); return True
+            dbx=BorgHelperDB(tmp,'plr',cfg_reader=lambda n: {'BORG_REPO':'/r-plr'})
+            run_p=dbx._index_running_lock_path('plr'); pau_p=dbx._index_paused_lock_path('plr')
+            rep_p=dbx._report_running_lock_path('plr')
+            young=subprocess.Popen(['sleep','30'])
+            try:
+                time.sleep(0.2)
+                def plant(path,pid,old):
+                    with open(path,'w') as f: f.write(str(pid))
+                    if old: os.utime(path,(time.time()-86400,)*2)
+                plant(run_p,young.pid,True)
+                run_ok=dbx.check_index_running('plr') is False and not os.path.exists(run_p)
+                plant(run_p,young.pid,True)
+                took=dbx.acquire_index_running_lock('plr') and dbx.index_running_owned('plr')
+                dbx.release_index_running_lock('plr')
+                plant(pau_p,young.pid,True)
+                pau_ok=dbx.check_index_paused('plr') is False and not os.path.exists(pau_p)
+                plant(rep_p,young.pid,True)
+                rep_ok=dbx.check_report_running('plr') is False and not os.path.exists(rep_p)
+                plant(run_p,os.getpid(),True); me_old=BorgHelperDB._lock_holder(run_p)
+                owned_old=dbx.index_running_owned('plr')   # ancien fichier à notre PID : jamais « à nous »
+                plant(run_p,young.pid,False); alive=BorgHelperDB._lock_holder(run_p)
+                plant(run_p,os.getpid(),False); me=BorgHelperDB._lock_holder(run_p); owned=dbx.index_running_owned('plr')
+                plant(run_p,0,False); zero=BorgHelperDB._lock_holder(run_p)
+                plant(run_p,10**20,False); huge=BorgHelperDB._lock_holder(run_p)
+                # bornes de la marge (60 s) : démarré 30 s après l'écriture -> vivant ; 120 s après -> mort
+                st_y=_pid_start_time(young.pid)
+                plant(run_p,young.pid,False); os.utime(run_p,(st_y-30,)*2)
+                m30=(BorgHelperDB._lock_holder(run_p),dbx.check_index_running('plr'))
+                plant(run_p,young.pid,False); os.utime(run_p,(st_y-120,)*2); m120=BorgHelperDB._lock_holder(run_p)
+                other=('alive','dead')
+                try: uid1=os.stat('/proc/1').st_uid
+                except OSError: uid1=None
+                if os.getuid()!=0 and os.getpid()!=1 and uid1 is not None and uid1!=os.getuid():
+                    # PID 1 d'un autre utilisateur : vivant si le fichier est récent, mort s'il précède son démarrage
+                    plant(run_p,1,False); o_new=BorgHelperDB._lock_holder(run_p)
+                    st1=_pid_start_time(1)
+                    if st1 is not None: os.utime(run_p,(st1-3600,)*2)
+                    other=(o_new,BorgHelperDB._lock_holder(run_p) if st1 is not None else 'dead')
+            finally:
+                young.kill(); young.wait()
+                for f in glob.glob(glob.escape(run_p)+'*')+glob.glob(glob.escape(pau_p)+'*')+glob.glob(glob.escape(rep_p)+'*'):
+                    with contextlib.suppress(OSError): os.unlink(f)
+            ok=(run_ok and took and pau_ok and rep_ok and me_old=='dead' and owned_old is False and alive=='alive' and me=='me'
+                and owned is True and zero=='dead' and huge=='dead' and m30==('alive',True) and m120=='dead'
+                and other==('alive','dead'))
+            if not ok: print(f"  PID repris : running {run_ok}, repris {took}, paused {pau_ok}, report {rep_ok}, soi ancien {me_old}/"
+                             f"{owned_old}, vivant {alive}, soi {me}/{owned}, zéro {zero}, énorme {huge}, marge 30 s {m30}, "
+                             f"120 s {m120}, autre utilisateur {other}")
+            return ok
+        check("verrous à PID : PID repris (index-running, index-paused, report-running, soi, autre utilisateur) -> mort ; porteurs légitimes inchangés",_pid_locks_reused)
         def _swap_invalid_busy():
             """Copie absente ou vide -> 'invalid', base servie intacte et jamais vidée ; base verrouillée en écriture
             -> abort() sondé pendant l'attente ('abort' en quelques secondes) et busy_limit respecté ('busy')."""
@@ -9654,19 +9713,23 @@ def codec_selftest(pattern=None,list_only=False):
                 return r
             a,b_=outs(bt),outs(bf)
             if a!=b_:
+                if len(a)!=len(b_): print(f"  sorties : {len(a)} (tranches) contre {len(b_)} (complet)")
                 for x,y in zip(a,b_):
-                    if x!=y: print(f"  tranches : {x[:400]}\n  complet  : {y[:400]}")
+                    if x!=y:   # autour du premier écart (1.0.148 : le début seul masquait la différence)
+                        i=next((k for k,(u,v) in enumerate(zip(x,y)) if u!=v),min(len(x),len(y)))
+                        print(f"  écart à {i} : tranches …{x[max(0,i-200):i+200]!r}\n  complet  …{y[max(0,i-200):i+200]!r}")
             return a==b_ and all(len(x)>20 for x in a)
         def _ix_period_nature_keep():
             """-T diff -b <A4> : seules les paires se terminant à A4..A6, ni stats ni snapshot ; DIFF_KEEP=2 en tranche :
             pairs_total=2, seules les 2 plus récentes."""
             ctx=_ix_ctx(); _ix_slow(ctx,None,0); names=ctx['names']
             b=_ix_bh(ctx,'c-period')
-            _q_run(b.index,'ix',natures=['diff'],period=(names[3],None))
+            out=_q_run(b.index,'ix',natures=['diff'],period=(names[3],None))   # sans fantôme : aucun avertissement R8
             p=set(_ix_pairs(b,'ix'))
             c=sqlite3.connect(b.db.get_diff_db('ix'))
             ns=c.execute("SELECT count(*) FROM archive_stats").fetchone()[0]; nsnap=c.execute("SELECT count(*) FROM archive_snapshot_indexed").fetchone()[0]; c.close()
-            period_ok=p=={(names[2],names[3]),(names[3],names[4]),(names[4],names[5])} and ns==0 and nsnap==0
+            period_ok=(p=={(names[2],names[3]),(names[3],names[4]),(names[4],names[5])} and ns==0 and nsnap==0
+                       and 'limitée par -T/-b/-B' not in out)
             _q_run(b.index,'ixk',natures=['diff'])
             st=_ix_state(b,'ixk'); pk=set(_ix_pairs(b,'ixk'))
             keep_ok=pk=={(names[3],names[4]),(names[4],names[5])} and st['pairs_total']==2 and st['pairs_done']==2
@@ -10284,6 +10347,25 @@ def codec_selftest(pattern=None,list_only=False):
             if not ok: print(f"  tranches : {runs} tranches, servie intacte {same}, monotone {mono}, Status {st_ok}/{st_after}, "
                              f"fantôme {os.path.exists(sp)}, identique {_rb_outs(b,'rb')==ref}")
             return ok
+        def _rb_restricted_warn():
+            """1.0.148 (story 11 A10, R8) : --rebuild -T stats et tranche -b sur un fantôme -> avertissement ; tranche
+            complète -> aucun."""
+            ctx=_rb_ctx(); _ix_slow(ctx,None,0); b=_rb_bh('rb-w'); sp=_rb_sp(b,'rb')
+            # bornes tirées du dépôt réel : d'autres contrôles du groupe y ajoutent ou retirent des archives
+            names=[x['name'] for x in json.loads(subprocess.run([shutil.which('borg'),'list','--json',ctx['repo']],env=ctx['env'],
+                   capture_output=True,text=True,timeout=60).stdout)['archives']]
+            if len(names)<3: print(f"  fantôme limité : {len(names)} archive(s), 3 requises"); return False
+            _q_run(b.index,'rb'); ref=_rb_outs(b,'rb')
+            o1=_q_run(b.index,'rb',rebuild=True,natures=['stats'],budget=60)           # -T stats
+            o2=_q_run(b.index,'rb',period=(names[-1],None),budget=60)                  # -b <dernière> : la dernière paire
+            alive=os.path.exists(sp)                                                    # pas encore complet
+            o3=_q_run(b.index,'rb',period=(None,names[-2]))                            # -B <avant-dernière> : le reste
+            swapped=not os.path.exists(sp) and _rb_outs(b,'rb')==ref   # complet, basculé, identique à un Index complet
+            o4=_q_run(b.index,'rb',rebuild=True,period=('ALL',None),budget=60)        # nouveau fantôme, -b ALL : aucune limite
+            w='limitée par -T/-b/-B'
+            ok=alive and swapped and w in o1 and w in o2 and w in o3 and w not in o4 and 'fantôme' in o4
+            if not ok: print(f"  fantôme limité : fantôme {alive}, basculé {swapped}, {w in o1} {w in o2} {w in o3} {w in o4} {o4[-300:]!r}")
+            return ok
         def _rb_bkp_during():
             """Bkp pendant la reconstruction : priority.lock (autre PID) pendant un diff du fantôme, borg create d'une
             nouvelle archive, retrait -> reprise ; la nouvelle archive (paire, stats, snapshot) est dans la base basculée."""
@@ -10586,6 +10668,7 @@ def codec_selftest(pattern=None,list_only=False):
             check("fantôme : _swap_db(keep_new=True) garde la nouvelle base sur changed/busy, la retire sur invalid",_rb_swap_keep_new)
             check("fantôme : CLI --rebuild refusé -> code 3 ; --rebuild -F jette le fantôme ; -F -t et --rebuild hors Index refusés",_rb_cli)
             check("fantôme : archive supprimée + nouvelle pendant la reconstruction (DIFF_KEEP) -> purgées, history.db jamais écrite par le fantôme",_rb_prune_during)
+            check("fantôme : tranche limitée par -T, -b ou -B seul -> avertissement (et bascule quand le reste est couvert) ; -b ALL -> aucun",_rb_restricted_warn)
         # ── Dépôts borg externes (1.0.142, story 5, AD-11/AD-12) ──
         check("glob_args : motif -> ['--glob-archives', m] / ['--glob-archives=m'] ; absent ou vide -> aucun argument",
               lambda: glob_args({'GLOB_ARCH':'h-t-*'})==['--glob-archives','h-t-*'] and glob_args({'GLOB_ARCH':'h-*'},'eq')==['--glob-archives=h-*']
