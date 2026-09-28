@@ -1,5 +1,32 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.142 / borgHelperWWW 1.27.9 — dépôts borg externes — 2026-09-28
+
+Chantier « reconstruction progressive », story 5 (spine AD-11, AD-12, AD-13, AD-14).
+
+- **Dépôts externes** : une section `EXTERNAL = true` déclare un dépôt dont les archives sont créées hors borgHelper.
+  Construit et suivi par `Index` (et la ligne cron par tranches), il est listé, exploré, cherché, comparé, tracé et
+  surveillé pour l'âge maximal comme les autres. Aucune clé de Bkp exigée ; `GLOB_ARCH` facultatif (absent = toutes
+  les archives du dépôt) ; mesures du passé absentes (trous, jamais d'erreur).
+- **`EXTERNAL_OPS`** : lecture toujours permise, `Restore` par défaut, `Prune`/`DelBkp` si listés, `Bkp`/`Init`/`Login`
+  jamais. Refus au dispatch, avant tout borg, **code de sortie 4** ; `-n ALL` écarte simplement les nicks refusés.
+- Un seul helper (`glob_args`) produit le filtre d'archives, dans borgHelper comme dans borgHelperWWW ; une
+  garde du selftest interdit toute autre lecture de `GLOB_ARCH`.
+- `Prune` d'un nick interne sans `GLOB_ARCH` refusé (il aurait élagué les archives de tous les hôtes du dépôt).
+- `DelBkp` devient une opération prioritaire (verrou, pause de l'Index en cours) comme `Prune`.
+- `Stats`/`Mount`/`UMount` sans `MOUNTPOINT` : message au lieu d'une erreur Python.
+- `demo.borghelperrc` : section `demo-externe`, remplie par `borg create` brut.
+- borgHelperWWW 1.27.9 : téléchargement de la dernière archive via `glob_args` (plus d'erreur sans `GLOB_ARCH`).
+  Refus `EXTERNAL_OPS` côté HTTP et UI : story 7 — les routes qui appellent la CLI héritent du refus (code 4) ;
+  `/download` et `/bkp` n'y passent pas et ne refusent pas encore.
+- Revue : `Prune -n ALL` continue après un nick refusé (`GLOB_ARCH`/`KEEP_*` absent, message) ; `Prune` externe sans
+  `KEEP_*` refusé avec message ; `Login` vers un nick externe refusé (code 4) ; `Restore -L` classé lecture ;
+  `EXTERNAL` invalide = code 2 ; dépôt vide sans archive : message (code 3) au lieu d'une erreur Python
+  (`getlastbkp(..., strict=False)` rend `[]`, utilisé par le premier `Bkp`) ; un Index
+  complet sans option efface la demande d'Index en attente ; avertissement si un nick interne n'a pas de `GLOB_ARCH`.
+- Bibliothèque (LIBRARY.md) : `glob_args`, `is_external`, `external_ops`, `command_op`, `op_allowed`, `require_op`,
+  `OpNotAllowed`.
+
 ## borgHelper 1.0.141 — Index par tranches, pause/reprise de l'Index, correction de DIFF_KEEP — 2026-09-27
 
 Chantier « reconstruction progressive », story 4 (spine AD-1, AD-3, AD-4 amendé, AD-10).

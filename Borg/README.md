@@ -220,6 +220,46 @@ CACHE_DIR = /data/borgcache
 GROUPS_READ = ops-readers,ops-writers,ops-admins
 ```
 
+### Dépôts borg externes (1.0.142)
+
+Un dépôt dont les archives sont créées **hors borgHelper** (autre outil, `borg create` à la main) se déclare avec
+`EXTERNAL = true`. borgHelper le construit et le suit depuis le dépôt seul, par `Index` (et sa ligne cron par
+tranches) ; il est listé, exploré, cherché, comparé, tracé en graphique et surveillé (`MAX_AGE_BKP`, notification
+« dépassé », alerte Sentry `overdue`) comme les autres. borgHelper n'y crée jamais d'archive.
+
+```ini
+[autre-outil]
+EXTERNAL         = true
+# BORG_REPO : local ou ssh://, même accès borg qu'aujourd'hui
+BORG_REPO        = user@repo01:/mnt/borg/autre-outil
+BORG_PASSPHRASE  = motdepasse-du-repo
+# GLOB_ARCH facultatif : absent = toutes les archives du dépôt
+# GLOB_ARCH      = srv-*
+# EXTERNAL_OPS : défaut read,restore ; parmi read, restore, prune, delete — bkp jamais permis
+# EXTERNAL_OPS   = read,restore
+# KEEP_* : exigé seulement si prune figure dans EXTERNAL_OPS
+# KEEP_DAILY     = 7
+MAX_AGE_BKP      = 25
+```
+
+- Aucune clé de Bkp n'est exigée (`SER_NAME`, `SER_LOGIN`, `BORG_ARCHNAME`, `BORG_ROOTBKP`, `EXCLUDE*`, `SSH_*`,
+  `MOUNTPOINT`). Sans `MOUNTPOINT`, `Mount`/`UMount` répondent par un message (code 3), `Stats` l'indique.
+- `EXTERNAL`, `EXTERNAL_OPS` et `GLOB_ARCH` se mettent dans la section du dépôt, jamais dans `[DEFAULT]` (ils
+  s'appliqueraient à tous les nicks). `EXTERNAL` n'accepte que true/yes/on/1 ou false/no/off/0 (sinon code 2).
+- **Opérations permises** : lecture (listes, exploration, recherche, rapports, `Index`, `Mount`, `Key`, maintenance
+  des bases) toujours ; `Restore` par défaut ; `Prune` et `DelBkp` seulement si `EXTERNAL_OPS` les liste ; `Bkp`,
+  `Init` et `Login` jamais. Une opération refusée sort avec le **code 4**, sans lancer borg. Avec `-n ALL`, les nicks
+  où elle est refusée sont écartés (une ligne d'information), les autres continuent — un cron `Bkp -n ALL` existant
+  reste valable. Une liste explicite (`-n int,ext`) contenant un nick refusé sort avec le code 4 avant tout
+  traitement, nick permis compris. `Restore -L` (liste des droits) est une lecture.
+- `Prune -n ALL` ne s'arrête pas au premier nick refusé par sa configuration (`GLOB_ARCH` ou `KEEP_*` absent) :
+  message, puis nick suivant.
+- Mesures prises au Bkp (C/E, taille dédupliquée à la création) : absentes pour un dépôt externe (`null`, trous dans
+  les graphiques) ; la taille du dépôt dans le temps vient des points relevés par `Index`.
+- `Prune` d'un nick **interne** sans `GLOB_ARCH` est refusé (il porterait sur toutes les archives du dépôt, celles
+  des autres hôtes comprises) ; sur un nick externe, il porte volontairement sur tout le dépôt.
+- `demo.borghelperrc` contient une section `demo-externe` (commandes de remplissage en commentaire).
+
 ### Sentry
 
 DSN lu dans `BORGHELPERC_SENTRY_DSN`, sinon dans le fichier désigné par `BORGHELPERC_SENTRY_FILE`, sinon dans
@@ -522,6 +562,8 @@ Supprime une archive précise. **Opération destructive.**
 ```bash
 borgHelper -c DelBkp -n mon-serveur -b archive-id
 ```
+
+Opération prioritaire (1.0.142) : un `Index` en cours se met en pause, comme pour `Prune`.
 
 L'archive supprimée quitte les bases au prochain `Index` (rapprochement, 1.0.140).
 
@@ -2145,7 +2187,8 @@ raisonnement (indiscernabilité d'un chemin qui n'existe simplement pas dans l'a
 | 0 | Succès |
 | 1 | Avertissement (rapport : sauvegarde trop ancienne) |
 | 2 | Erreur borg |
-| 3 | État incohérent (déjà monté, serveur inconnu…) |
+| 3 | État incohérent (déjà monté, serveur inconnu, `MOUNTPOINT`/`GLOB_ARCH` absent…) |
+| 4 | Opération non permise sur ce nick (dépôt externe, `EXTERNAL_OPS`) — aucun borg lancé |
 
 ---
 

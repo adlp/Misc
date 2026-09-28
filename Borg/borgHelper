@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.141"
+Version="1.0.142"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -791,6 +791,70 @@ _RECONCILE_ERRORS=(sqlite3.Error,SystemExit,DbKeyError,DbModeError,DbTamperError
 # Gardée STATS_RETENTION_MONTHS, que l'archive existe encore ou non. Ajout pur : HISTORY_DB_SCHEMA_VERSION inchangé.
 _CHART_FIELDS=('duration','original_size','compressed_size','deduplicated_size','nfiles',
                'files_added','files_modified','files_removed','changed_during_backup','read_errors')
+
+# ── Dépôts externes (1.0.142, story 5, spine AD-11/AD-12) ────────────────────────────────────────────────────────
+
+def glob_args(cfg,form='list',archives=False):
+    """Arguments de filtre d'archives d'un nick — SEUL lecteur de GLOB_ARCH (AD-11). GLOB_ARCH absent ou vide : aucun
+    argument (toutes les archives du dépôt), sauf archives=True -> motif '*' : `borg info` sans filtre ne décrit que le
+    dépôt, sans la liste 'archives'. form='list' -> ['--glob-archives', motif] ; 'eq' -> ['--glob-archives=motif']."""
+    g=(cfg.get('GLOB_ARCH') or '').strip() if cfg is not None else ''
+    if not g:
+        name=getattr(cfg,'name',None)
+        if name and not is_external(cfg) and name not in _GLOB_WARNED:
+            _GLOB_WARNED.add(name)
+            printer(f"[WARN] {name}: GLOB_ARCH absent pour un nick interne — toutes les archives du dépôt, y compris celles "
+                    "d'autres hôtes (Prune refusé)")
+        if not archives: return []
+        g='*'
+    return [f'--glob-archives={g}'] if form=='eq' else ['--glob-archives',g]
+
+class OpNotAllowed(Exception):
+    """Opération refusée sur un nick (EXTERNAL_OPS) — code de sortie 4, aucun borg lancé."""
+
+_EXT_OPS=('read','restore','prune','delete')
+# Commandes qui modifient le dépôt, par nature d'opération ; toutes les autres sont 'read' (listes, exploration,
+# recherche, rapports, Index, Mount, Key, maintenance des bases locales).
+_CMD_OPS={'bkp':'bkp','init':'bkp','login':'bkp','restore':'restore','prune':'prune','delbkp':'delete'}
+_EXT_OPS_WARNED=set()
+_GLOB_WARNED=set()
+
+def is_external(cfg):
+    """Section EXTERNAL = true : dépôt dont les archives sont créées hors borgHelper (rc-keys.md). Lecture stricte
+    (_cfg_bool) : une valeur invalide (faute de frappe) arrête avec le code 2, jamais un nick interne par défaut."""
+    return cfg is not None and _cfg_bool(cfg,'EXTERNAL',False)
+
+def command_op(cmd):
+    """Nature d'une commande CLI : 'bkp' | 'restore' | 'prune' | 'delete' | 'read'."""
+    return _CMD_OPS.get((cmd or '').lower(),'read')
+
+def external_ops(cfg,nick=''):
+    """Opérations permises sur un nick externe : 'read' toujours ; EXTERNAL_OPS absente = read,restore ; 'bkp' et toute
+    valeur inconnue ignorés (avertissement une fois par nick et par valeur)."""
+    raw=cfg.get('EXTERNAL_OPS') if cfg is not None else None
+    if raw is None: return {'read','restore'}
+    ops={'read'}
+    for x in re.split(r'[,\s]+',raw.strip().lower()):
+        if not x: continue
+        if x in _EXT_OPS: ops.add(x)
+        elif (nick,x) not in _EXT_OPS_WARNED:
+            _EXT_OPS_WARNED.add((nick,x))
+            printer(f"[WARN] {nick}: EXTERNAL_OPS : {x!r} ignoré"+(" (Bkp jamais permis sur un dépôt externe)" if x=='bkp'
+                    else f" (valeurs : {', '.join(_EXT_OPS)})"))
+    return ops
+
+def op_allowed(cfg,op,nick=''):
+    """Autorité unique (AD-12) : l'opération op est-elle permise sur ce nick ? Nick interne : toujours ; externe :
+    jamais 'bkp', sinon selon external_ops. borgHelperWWW importe cette fonction (story 7)."""
+    if not is_external(cfg): return True
+    if op=='bkp': return False
+    return op in external_ops(cfg,nick)
+
+def require_op(cfg,op,nick=''):
+    """OpNotAllowed si l'opération est refusée — appelé avant tout appel borg."""
+    if not op_allowed(cfg,op,nick):
+        raise OpNotAllowed(f"{nick}: dépôt externe — opération « {op} » non permise"
+                           +("" if op=='bkp' else " (ajouter à EXTERNAL_OPS pour l'autoriser)"))
 
 def _build_state_key(nick):
     """Clé db_meta de l'état de construction d'un nick (1.0.141, AD-10) — par nick : DB_NAME peut partager une diff.db."""
@@ -2905,11 +2969,14 @@ class BorgRunner:
             raise RuntimeError('; '.join(msgs[:3]) or f"borg info failed (code {rb['exitcode']})")
         return rb['stdout'][0]['repository']['last_modified']
 
-    def getlastbkp(self,nick,nbl=1,debug=0):
+    def getlastbkp(self,nick,nbl=1,debug=0,strict=True):
         cfg=self.cfgreaded(nick,debug=debug)
-        rb=self.boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+        rb=self.boex(nick,['list','--json']+glob_args(cfg),debug=debug)
         self._boex_check_stdout(rb,nick,'borg list')
         lines=rb['stdout'][0]['archives']
+        if len(lines)<nbl:
+            if not strict: return []   # appelant qui tolère un dépôt encore vide (1er Bkp)
+            printer(f"{nick}: {len(lines)} archive(s) dans le dépôt, {nbl} nécessaire(s)"); sys.exit(3)
         return [lines[i]['name'] for i in range(nbl*-1,0)]
 
     def dfRepo(self,nick,debug=0):
@@ -3057,7 +3124,7 @@ class BorgHelper:
                          ('KEEP_MONTHLY','--keep-monthly'),('KEEP_YEARLY','--keep-yearly'),
                          ('KEEP_HOURLY','--keep-hourly')]:
             if key in cfg: cmd.extend([flag,cfg[key]])
-        cmd.append(f'--glob-archives={cfg["GLOB_ARCH"]}')
+        cmd.extend(glob_args(cfg,'eq'))
         ret=self.borg.boex(nick,cmd,debug=debug)['stderr']
         pruneme=[]
         for i in ret:
@@ -3630,7 +3697,7 @@ class BorgHelper:
         if not os.path.exists(db_path) and not os.path.exists(self.db.get_history_db(nick)): return
         if os.path.exists(db_path): self.db.ensure_diff_db(db_path)
         cfg=self.borg.cfgreaded(nick,debug=debug)
-        rb=self.borg.boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+        rb=self.borg.boex(nick,['list','--json']+glob_args(cfg),debug=debug)
         try:
             self.borg._boex_check_stdout(rb,nick,'borg list')
         except RuntimeError: return
@@ -3667,6 +3734,7 @@ class BorgHelper:
             def _affconf(n):
                 cfg=self.borg.cfgreaded(n)
                 print(n+': ',end='')
+                if not cfg.get('MOUNTPOINT'): print('pas de MOUNTPOINT'); return
                 print('**Mounted**' if mountedornot(cfg['MOUNTPOINT'],debug=debug) else 'Not Mounted')
             if nick is None:
                 for n in config.keys():
@@ -3692,6 +3760,7 @@ class BorgHelper:
 
     def mount(self,nick,bid='ALL',debug=0):
         cfg=self.borg.cfgreaded(nick)
+        if not cfg.get('MOUNTPOINT'): printer(f"{nick}: MOUNTPOINT absent de la configuration — Mount impossible"); sys.exit(3)
         if bid is None or bid=='last': bid=self.borg.getlastbkp(nick,debug=debug)[0]
         repo=cfg['BORG_REPO']+"::"+bid
         if bid=="ALL": repo=cfg['BORG_REPO']
@@ -3707,6 +3776,7 @@ class BorgHelper:
 
     def umount(self,nick,debug=0):
         cfg=self.borg.cfgreaded(nick,debug=debug)
+        if not cfg.get('MOUNTPOINT'): printer(f"{nick}: MOUNTPOINT absent de la configuration — rien à démonter"); sys.exit(3)
         if mountedornot(cfg['MOUNTPOINT'],debug=debug):
             rb=self.borg.boex(nick,['umount',cfg['MOUNTPOINT']],debug=debug)
             if rb['exitcode']!=0 or len(rb['stdout'])!=0 or len(rb['stderr']): print(rb)
@@ -3827,7 +3897,7 @@ class BorgHelper:
         if not self.db.is_diff_pair_indexed(nick,bidun,bideux,db_path):
             if as_json: printer("Paire non indexée — calcul en cours...")
             else: print(f"Paire non indexée — calcul en cours...",flush=True)
-            rb=self.borg.boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+            rb=self.borg.boex(nick,['list','--json']+glob_args(cfg),debug=debug)
             try:
                 self.borg._boex_check_stdout(rb,nick,'borg list')
             except RuntimeError as e:
@@ -3996,10 +4066,17 @@ class BorgHelper:
         sys.exit(rb['exitcode'])
 
     def delbkp(self,nick,bid,debug=0):
-        rb=self.borg.boex(nick,['delete','::'+bid],debug=debug)
-        if rb['exitcode']!=0: print(rb); sys.exit(rb['exitcode'])
-        self.borg.boex(nick,['compact','--cleanup-commits'],debug=debug)
-        self.db.clear_cache_nick(nick); sys.exit(rb['exitcode'])
+        # 1.0.142 : opération prioritaire comme Prune — un Index en cours se met en pause au lieu de disputer le verrou
+        # du dépôt à borg delete/compact.
+        self.db.set_priority_lock(nick)
+        try:
+            self.db.wait_index_idle(nick)
+            rb=self.borg.boex(nick,['delete','::'+bid],debug=debug)
+            if rb['exitcode']!=0: print(rb); sys.exit(rb['exitcode'])
+            self.borg.boex(nick,['compact','--cleanup-commits'],debug=debug)
+            self.db.clear_cache_nick(nick); sys.exit(rb['exitcode'])
+        finally:
+            self.db.clear_priority_lock(nick)
 
     def init_repo(self,nick,debug=0):
         cfg=self.borg.cfgreaded(nick,debug=debug)
@@ -4050,7 +4127,7 @@ class BorgHelper:
         archive_old=None
         if not no_index:
             try:
-                prev=self.borg.getlastbkp(nick,1,debug=debug)
+                prev=self.borg.getlastbkp(nick,1,debug=debug,strict=False)
                 archive_old=prev[0] if prev else None
             except Exception: archive_old=None
         create=['create']
@@ -4190,6 +4267,14 @@ class BorgHelper:
 
     def prune(self,nick,dryrun=False,debug=0):
         cfg=self.borg.cfgreaded(nick,debug=debug)
+        if not (cfg.get('GLOB_ARCH') or '').strip() and not is_external(cfg):
+            # 1.0.142 : sans filtre, borg prune élaguerait toutes les archives du dépôt, celles des autres hôtes comprises.
+            # Retour (pas sys.exit) : Prune -n ALL continue avec les nicks suivants.
+            printer(f"{nick}: GLOB_ARCH absent — Prune refusé (il porterait sur toutes les archives du dépôt)")
+            return {'exitcode':3,'stdout':[],'stderr':[]}
+        if not any(k in cfg for k in ('KEEP_DAILY','KEEP_WEEKLY','KEEP_MONTHLY','KEEP_YEARLY','KEEP_HOURLY')):
+            printer(f"{nick}: aucune clé KEEP_* — Prune impossible (règles de rétention requises)")
+            return {'exitcode':3,'stdout':[],'stderr':[]}
         # Garantit que cache.db/diff.db sont à jour (migrations auto) avant que Prune n'y touche —
         # Prune ne passait jusqu'ici par aucun ensure_*_db(), contrairement à Bkp/Index/Report.
         self.db.ensure_cache_db(self.db.get_cache_db(nick))
@@ -4212,7 +4297,7 @@ class BorgHelper:
             if len(cmd)>1:
                 if dryrun: cmd.append('--dry-run')
                 else: cmd.append('--stats')
-                cmd.extend(f'--save-space --info --list --glob-archives={cfg["GLOB_ARCH"]}'.split(' '))
+                cmd.extend(['--save-space','--info','--list']+glob_args(cfg,'eq'))
                 ret=self.borg.boex(nick,cmd,debug=debug)['stderr']
                 if not dryrun:
                     rb=self.borg.boex(nick,['compact','--cleanup-commits'],debug=debug)
@@ -4338,7 +4423,7 @@ class BorgHelper:
         self.db.ensure_diff_db(db_path)
         cfg=self.borg.cfgreaded(nick,debug=debug)
         if archives is None:
-            rb=self.borg.boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+            rb=self.borg.boex(nick,['list','--json']+glob_args(cfg),debug=debug)
             if rb.get('killed'): return 'killed'
             try:
                 self.borg._boex_check_stdout(rb,nick,'borg list')
@@ -4472,7 +4557,7 @@ class BorgHelper:
         except sqlite3.Error: existing=set()
         missing=archive_names-existing
         if missing or (force and archive_names):
-            rbi=self.borg.boex(nick,['info','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+            rbi=self.borg.boex(nick,['info','--json']+glob_args(cfg,archives=True),debug=debug)
             if rbi.get('killed'): return   # demande d'arrêt (1.0.141) : rien d'écrit, l'appelant met en pause
             try:
                 self.borg._boex_check_stdout(rbi,nick,'borg info')
@@ -4586,7 +4671,12 @@ class BorgHelper:
             while True:
                 r=self._index_pass(nick,debug,db_path,force,target_archive,plan)
                 if r=='deadline': r=0
-                if r!='interrupted': return r
+                if r!='interrupted':
+                    # 1.0.142 : un Index complet abouti solde un index-pending (sinon seul Bkp le consomme : jamais pour
+                    # un dépôt externe). Jamais l'Index ciblé d'un Bkp : sa relance complète en dépend.
+                    if r==0 and not tranche and target_archive is None and not snap_only:
+                        self.db.clear_index_pending_lock(nick)
+                    return r
                 if not pause:
                     if set_pending: self.db.set_index_pending_lock(nick)
                     printer(f"{nick}: indexation interrompue — reprise automatique après le backup"); return 1
@@ -4640,7 +4730,7 @@ class BorgHelper:
         stop=lambda: self._index_stop_reason(nick,deadline) is not None
         prev_stop=self.borg._stop; self.borg._stop=stop
         try:
-            rb=self.borg.boex(nick,['list','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug)
+            rb=self.borg.boex(nick,['list','--json']+glob_args(cfg),debug=debug)
         finally: self.borg._stop=prev_stop
         if rb.get('killed'):
             o=self._kill_outcome(deadline)
@@ -6204,7 +6294,7 @@ class BorgHelper:
         cfg=self.borg.cfgreaded(nick,debug=debug)
         last_modified=self.borg._boex_last_modified(nick,debug=debug)
         pruneme=self.cache_prune_dryrun(nick,last_modified,debug=debug)
-        r=self.cacheJsonBoexWithLM(nick,['info','--json','--glob-archives',cfg['GLOB_ARCH']],debug=debug,last_modified=last_modified)
+        r=self.cacheJsonBoexWithLM(nick,['info','--json']+glob_args(cfg,archives=True),debug=debug,last_modified=last_modified)
         resume={}
         for i in ['duration','compressed_size','deduplicated_size','nfiles','original_size','prunable','prunable_os','prunable_cs']:
             resume[i]=0
@@ -9281,9 +9371,16 @@ def codec_selftest():
             ctx=_ix_ctx(); b=_ix_bh(ctx,'c-prune'); called=[]
             b.db.wait_index_idle=lambda nk,timeout=120: called.append(nk if os.path.exists(b.db._priority_lock_path(nk)) else None)
             b.borg.boex=lambda *a,**k: {'exitcode':0,'stdout':[],'stderr':[]}
-            b.borg.cfgreaded=lambda nk,debug=0: {'GLOB_ARCH':'x-*'}
+            b.borg.cfgreaded=lambda nk,debug=0: {'GLOB_ARCH':'x-*','KEEP_DAILY':'7'}
             _q_run(b.prune,'ix')
             return called==['ix']
+        def _ix_delbkp_waits():
+            """DelBkp (1.0.142) : priority.lock posé avant d'attendre l'Index, retiré ensuite (même via son sys.exit)."""
+            ctx=_ix_ctx(); b=_ix_bh(ctx,'c-delbkp'); called=[]
+            b.db.wait_index_idle=lambda nk,timeout=120: called.append(nk if os.path.exists(b.db._priority_lock_path(nk)) else None)
+            b.borg.boex=lambda *a,**k: {'exitcode':0,'stdout':[],'stderr':[]}
+            _q_run(b.delbkp,'ix','une-archive')
+            return called==['ix'] and not os.path.exists(b.db._priority_lock_path('ix'))
         def _ix_cli_usage():
             """CLI : -t avec -S -> erreur d'usage (code non nul) ; -T inconnu -> erreur ; -n a,b -t 3 : budget par nick."""
             ctx=_ix_ctx(); me=os.path.realpath(__file__)
@@ -9397,11 +9494,167 @@ def codec_selftest():
             check("surveillance croisée : échéance pendant la pause -> sortie, sans index-pending",_ix_deadline_in_pause)
             check("surveillance croisée : kill -9 en pause -> base intacte, l'Index suivant reprend et finit",_ix_kill_in_pause)
             check("Prune attend l'Index comme Bkp et Restore",_ix_prune_waits)
+            check("DelBkp attend l'Index (priority.lock posé puis retiré)",_ix_delbkp_waits)
             check("surveillance croisée : Index sans option arrêté pendant le snapshot ou les statistiques -> pause, reprise, fini",_ix_pause_other_phases)
             check("surveillance croisée : Index -F repris après pause -> paires déjà recalculées non refaites",_ix_force_resume)
             check("snapshot incrémental (ajouts) : identique à un complet ; borg list des ajouts arrêté -> rien d'écrit",_ix_incremental_snapshot)
             check("CLI Index : -t avec -S refusé, -T invalide refusé, budget par nick avec plusieurs nicks",_ix_cli_usage)
             check("surveillance croisée : vrai Bkp pendant un Index long -> Bkp sans attente, Index en pause puis reprise, nouvelle archive indexée",_ix_real_bkp_during_index)
+        # ── Dépôts borg externes (1.0.142, story 5, AD-11/AD-12) ──
+        check("glob_args : motif -> ['--glob-archives', m] / ['--glob-archives=m'] ; absent ou vide -> aucun argument",
+              lambda: glob_args({'GLOB_ARCH':'h-t-*'})==['--glob-archives','h-t-*'] and glob_args({'GLOB_ARCH':'h-*'},'eq')==['--glob-archives=h-*']
+                      and glob_args({})==[] and glob_args({'GLOB_ARCH':'  '})==[] and glob_args(None)==[]
+                      and glob_args({},archives=True)==['--glob-archives','*'] and glob_args({'GLOB_ARCH':'h-*'},archives=True)==['--glob-archives','h-*'])
+        def _ex_no_direct_glob():
+            """Garde AD-11 : aucune lecture directe de GLOB_ARCH hors glob_args, dans borgHelper et borgHelperWWW."""
+            me=os.path.realpath(__file__); bad=[]
+            for f in (me,os.path.join(os.path.dirname(me),'borgHelperWWW')):
+                if not os.path.exists(f): continue
+                with open(f,encoding='utf-8') as fh: txt=fh.read()
+                lines=txt.split(chr(10))
+                for m in re.finditer(r"""\[\s*['"]GLOB_ARCH['"]\s*\]|\.get\(\s*['"]GLOB_ARCH['"]""",txt):
+                    ln=txt[:m.start()].count(chr(10))
+                    ctx_=chr(10).join(lines[max(0,ln-12):ln+1])
+                    # permis : le corps de glob_args, l'écrivain de Login (cfgwrite) et ce garde lui-même
+                    if 'def glob_args' in ctx_ or "=serna+'-root-*'" in lines[ln] or 'def _ex_no_direct_glob' in ctx_: continue
+                    if "(cfg.get('GLOB_ARCH') or '').strip() and not is_external(cfg)" in lines[ln]: continue   # garde de Prune
+                    bad.append(f"{os.path.basename(f)}:{ln+1}")
+            if bad: print(f"  lectures directes : {bad}")
+            return not bad
+        check("garde AD-11 : aucune lecture directe de GLOB_ARCH hors glob_args (borgHelper, borgHelperWWW)",_ex_no_direct_glob)
+        def _ex_ops_matrix():
+            """op_allowed : interne -> tout ; externe par défaut -> read+restore ; EXTERNAL_OPS élargie ; bkp jamais."""
+            cp=configparser.ConfigParser(); cp.optionxform=str
+            cp.read_string("[i]\nBORG_REPO=/r\n[e]\nEXTERNAL=true\nBORG_REPO=/r\n[w]\nEXTERNAL=yes\nBORG_REPO=/r\nEXTERNAL_OPS=read, prune,delete bkp zut\n")
+            ops=('read','restore','prune','delete','bkp')
+            _EXT_OPS_WARNED.clear()   # avertissements « une fois » : indépendants d'une exécution précédente
+            out=io.StringIO()
+            with contextlib.redirect_stderr(out),contextlib.redirect_stdout(out):
+                got={n:tuple(op_allowed(cp[n],o,n) for o in ops) for n in ('i','e','w')}
+                raised=raises(OpNotAllowed,lambda: require_op(cp['e'],'bkp','e'))
+            return (got=={'i':(True,)*5,'e':(True,True,False,False,False),'w':(True,False,True,True,False)}
+                    and raised and "'bkp'" in out.getvalue() and "'zut'" in out.getvalue()
+                    and [command_op(c) for c in ('bkp','init','login','restore','prune','delbkp','index','report','mount')]
+                        ==['bkp','bkp','bkp','restore','prune','delete','read','read','read'])
+        check("op_allowed : interne tout permis ; externe read+restore par défaut ; EXTERNAL_OPS élargie ; bkp jamais",_ex_ops_matrix)
+        def _ex_real():
+            """Vrai dépôt externe (archives par borg create brut, sans GLOB_ARCH ni clé de Bkp) : Index puis commandes de
+            lecture, Restore ; Bkp/Prune/DelBkp refusés (code 4) sans aucun borg create/prune/delete ; -n ALL écarte
+            l'externe ; EXTERNAL_OPS élargie ; Mount sans MOUNTPOINT ; Prune interne sans GLOB_ARCH refusé ; âge maximal."""
+            d=os.path.join(tmp,'externe'); src=os.path.join(d,'src'); os.makedirs(src)
+            repo=os.path.join(d,'repo'); bb=os.path.join(d,'bb'); log=os.path.join(d,'borg.log'); w=os.path.join(d,'borgw')
+            env=dict(os.environ,BORG_PASSPHRASE='pw-ex',BORG_RELOCATED_REPO_ACCESS_IS_OK='yes',BORG_BASE_DIR=bb)
+            r=subprocess.run([shutil.which('borg'),'init','-e','repokey',repo],env=env,capture_output=True,text=True,timeout=120)
+            if r.returncode!=0: print(f"  borg init : {r.stderr[-200:]}"); return False
+            names=[]
+            for i in range(3):
+                with open(os.path.join(src,f'doc{i}.txt'),'w') as f: f.write(f'document {i}\n'*20)
+                n=f"autre-outil-{i}"; names.append(n)
+                r=subprocess.run([shutil.which('borg'),'create','--timestamp',f"2026-09-1{i}T08:00:00",f'{repo}::{n}',src],
+                                 env=env,capture_output=True,text=True,timeout=120)
+                if r.returncode!=0: print(f"  borg create : {r.stderr[-200:]}"); return False
+            with open(w,'w') as f:
+                f.write(f"#!/bin/bash\necho \"$*\" >> {log}\nexport BORG_BASE_DIR={bb}\nexec {shutil.which('borg')} \"$@\"\n")
+            os.chmod(w,0o700)
+            rc=os.path.join(d,'rc')
+            base=f"BORG_REPO={repo}\nBORG_PASSPHRASE=pw-ex\nBORG_EXE={w}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\n"
+            r=subprocess.run([shutil.which('borg'),'init','-e','repokey',repo+'-vide'],env=env,capture_output=True,text=True,timeout=120)
+            if r.returncode!=0: print(f"  borg init vide : {r.stderr[-200:]}"); return False
+            head=f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n\n"
+            # Ordre voulu pour Prune -n ALL : nog (refusé, GLOB_ARCH absent) puis ext3 (KEEP_* absent) AVANT ext2 (permis).
+            with open(rc,'w') as f:
+                f.write(head+f"[ext]\nEXTERNAL=true\n{base}MAX_AGE_BKP=25\n\n"
+                        f"[nog]\n{base}SER_NAME=s\nMOUNTPOINT={os.path.join(d,'mnt')}\nKEEP_DAILY=7\n\n"
+                        f"[ext3]\nEXTERNAL=true\n{base}EXTERNAL_OPS=prune\n\n"
+                        f"[ext2]\nEXTERNAL=true\n{base}EXTERNAL_OPS=read,prune,delete,bkp\nKEEP_DAILY=100\n\n"
+                        f"[vide]\nEXTERNAL=true\nBORG_REPO={repo}-vide\nBORG_PASSPHRASE=pw-ex\nBORG_EXE={w}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\n\n")
+            os.chmod(rc,0o600)
+            rc_ext=os.path.join(d,'rc-ext'); rc_typo=os.path.join(d,'rc-typo')
+            with open(rc_ext,'w') as f: f.write(head+f"[ext]\nEXTERNAL=true\n{base}\n[ext2]\nEXTERNAL=true\n{base}EXTERNAL_OPS=prune,bkp\nKEEP_DAILY=100\n")
+            with open(rc_typo,'w') as f: f.write(head+f"[typo]\nEXTERNAL=ture\n{base}")
+            for x in (rc_ext,rc_typo): os.chmod(x,0o600)
+            me=os.path.realpath(__file__)
+            nodsn=os.path.join(d,'nodsn'); open(nodsn,'w').close()
+            cenv={k:v for k,v in os.environ.items() if k not in ('BORGHELPERC_SENTRY_DSN','BORGHELPERC_RUNTIME_PASSPHRASE')}
+            cenv['BORGHELPERC_SENTRY_FILE']=nodsn   # jamais d'envoi Sentry réel, jamais de passphrase d'exécution héritée
+            def cli(*a,out_only=False,cfgf=None):
+                p=subprocess.run([me,'-C',cfgf or rc,'-c',*a],capture_output=True,text=True,timeout=300,env=cenv)
+                return p.returncode,(p.stdout if out_only else p.stdout+p.stderr)
+            def logged(clear=True):
+                try:
+                    with open(log) as f: l=f.read().splitlines()
+                except OSError: l=[]
+                if clear:
+                    try: os.unlink(log)
+                    except OSError: pass
+                return l
+            fails=[]
+            rc_idx,o=cli('Index','-n','ext','-t','1m')
+            lg=logged()
+            if rc_idx!=0 or any('--glob-archives' in l for l in lg) or 'terminée' not in o: fails.append(f"Index {rc_idx} {o[-300:]!r}")
+            # Index sans option sur une base neuve : le borg info global (motif '*') remplit les statistiques
+            bx=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache2'))
+            _q_run(bx.index,'ext')
+            c2=sqlite3.connect(bx.db.get_diff_db('ext')); nst=c2.execute("SELECT count(*) FROM archive_stats").fetchone()[0]; c2.close()
+            if nst!=3: fails.append(f"Index sans option : {nst} statistiques d'archives (3 attendues)")
+            logged()
+            dest=os.path.join(d,'restaure'); os.makedirs(dest)
+            reads=[('LstBkp','-n','ext'),('TreeHist','-n','ext','-j'),('Search','-n','ext','-f','doc1','-j'),
+                   ('FileHist','-n','ext','-f',os.path.join(src,'doc2.txt').lstrip('/'),'-j'),('DiffBkp','-n','ext','-j'),
+                   ('Report','-n','ext','-o','-j'),('ArchiveHistory','-n','ext','-j'),('RepoHistory','-n','ext','-j'),
+                   ('Status','-n','ext','-j'),('Restore','-n','ext','-b',names[-1],'-f',os.path.join(src,'doc0.txt').lstrip('/'),'-W',dest)]
+            for a in reads:
+                c,o=cli(*a)
+                ok_codes=(0,1) if a[0]=='Report' else (0,)   # Report : 1 = dernière archive plus vieille que MAX_AGE_BKP
+                if c not in ok_codes or 'Traceback' in o or 'KeyError' in o or '[ERREUR]' in o: fails.append(f"{a[0]} {c} {o[-300:]!r}")
+            c,o=cli('ArchiveHistory','-n','ext','-j',out_only=True)
+            try:
+                rows=json.loads(o[o.index('{'):])['rows']
+                if len(rows)!=3 or any(r['changed_during_backup'] is not None or r['read_errors'] is not None for r in rows):
+                    fails.append(f"ArchiveHistory mesures {rows}")
+            except (ValueError,KeyError) as e: fails.append(f"ArchiveHistory JSON {e}")
+            if not os.path.exists(os.path.join(dest,'doc0.txt')): fails.append("Restore : fichier absent")
+            c,o=cli('Report','-n','ext','-j')
+            if c!=1 or '[ERREUR]' in o: fails.append(f"Report âge max : code {c} {o[-200:]!r}")
+            logged()
+            for a in (('Bkp','-n','ext'),('Prune','-n','ext'),('DelBkp','-n','ext','-b',names[0]),('Bkp','-n','ext2'),
+                      ('Restore','-n','ext2','-b',names[-1],'-f','x','-W',dest)):
+                c,o=cli(*a)
+                if c!=4 or 'non permise' not in o: fails.append(f"refus {a} : {c} {o[-200:]!r}")
+            lg=logged()
+            if any(l.split()[0] in ('create','prune','delete','extract') for l in lg if l): fails.append(f"borg lancé malgré le refus : {lg}")
+            c,o=cli('Bkp','-n','ALL',cfgf=rc_ext)
+            lg=logged()
+            if c!=0 or o.count('écarté')!=2 or any(l.startswith('create') for l in lg) or 'Traceback' in o:
+                fails.append(f"Bkp -n ALL (externes seuls) : {c} {o[-300:]!r} {lg}")
+            # Prune -n ALL : ext écarté ; nog refusé (GLOB_ARCH) et ext3 refusé (KEEP_*) sans arrêter la boucle ; ext2 élagué
+            c,o=cli('Prune','-n','ALL')
+            lg=logged()
+            if ('écarté' not in o or 'GLOB_ARCH absent' not in o or 'KEEP_' not in o or "'bkp'" not in o
+                    or not any(l.startswith('prune') for l in lg) or 'Traceback' in o):
+                fails.append(f"Prune -n ALL : {c} {o[-400:]!r} {lg}")
+            for a in (('Mount','-n','ext'),('UMount','-n','ext')):
+                c,o=cli(*a)
+                if c!=3 or 'MOUNTPOINT' not in o or 'KeyError' in o: fails.append(f"{a[0]} : {c} {o[-200:]!r}")
+            c,o=cli('Stats',cfgf=rc_ext)
+            if c!=0 or o.count('pas de MOUNTPOINT')!=2 or 'KeyError' in o: fails.append(f"Stats : {c} {o[-200:]!r}")
+            c,o=cli('Restore','-n','ext2','-b',names[-1],'-f',os.path.join(src,'doc0.txt').lstrip('/'),'-L')   # lecture
+            if c!=0 or 'non permise' in o: fails.append(f"Restore -L (lecture) : {c} {o[-200:]!r}")
+            c,o=cli('Restore','-n','vide','-b','last','-f','x','-W',dest)
+            if c!=3 or 'IndexError' in o or 'Traceback' in o: fails.append(f"dépôt vide : {c} {o[-200:]!r}")
+            c,o=cli('Login','-s','ext','-p','x','-r','/r')
+            cp=configparser.ConfigParser(); cp.read(rc)
+            if c!=4 or cp['ext'].get('EXTERNAL')!='true': fails.append(f"Login sur un externe : {c} {o[-200:]!r}")
+            c,o=cli('Bkp','-n','typo',cfgf=rc_typo)
+            if c!=2 or 'EXTERNAL' not in o: fails.append(f"EXTERNAL invalide : {c} {o[-200:]!r}")
+            logged()
+            c,o=cli('DelBkp','-n','ext2','-b',names[0])
+            lst=subprocess.run([shutil.which('borg'),'list','--short',repo],env=env,capture_output=True,text=True,timeout=60).stdout.split()
+            if c!=0 or names[0] in lst: fails.append(f"DelBkp ext2 (permis) : {c} {lst} {o[-200:]!r}")
+            for x in fails: print(f"  externe : {x}")
+            return not fails
+        if shutil.which('borg') is None: skip("dépôt externe sur un vrai dépôt borg","borg absent")
+        else: check("dépôt externe réel : Index + lecture + Restore ; Bkp/Prune/DelBkp refusés (code 4, aucun borg) ; -n ALL ; EXTERNAL_OPS élargie ; Mount/Prune sans clés",_ex_real)
         def _repo_stats_real_borg():
             """1.0.136 (deferred-work point 9) : capture repo_stats de backup()/prune() sur un VRAI dépôt borg jetable —
             vérifie l'enchaînement réel (borg create/prune/compact/info --json, format de la réponse de CETTE
@@ -9937,8 +10190,25 @@ def _cli_main():
             options[opt]=arg
         if opt=='-n': nick=arg
 
+    if cmd=='login' and '-n' not in options:
+        nick=options.get('-s',socket.gethostname())   # cible réelle de Login, contrôlée ci-dessous (1.0.142)
+    _all_nicks=(nick=="ALL")
     if nick=="ALL":
         nick=bh.borg.cfgreadnicks(debug)
+
+    # Autorité des opérations (1.0.142, AD-12) : avant tout appel borg. -n ALL écarte les nicks refusés (information) ;
+    # un nick nommé et refusé -> code 4.
+    _op='read' if cmd=='restore' and '-L' in options else command_op(cmd)   # Restore -L : liste des droits, lecture
+    if _op!='read' and nick:
+        _kept=[]
+        for _n in nick.split(','):
+            _c=bh.borg.cfgread(_n)
+            if _c is None or op_allowed(_c,_op,_n): _kept.append(_n); continue
+            if _all_nicks: printer(f"{_n}: dépôt externe — {cmd} non permis, nick écarté"); continue
+            try: require_op(_c,_op,_n)
+            except OpNotAllowed as e: printer(str(e)); sys.exit(4)
+        if not _kept: sys.exit(0)
+        nick=','.join(_kept)
 
     if debug!=0:
         printer(f'La commande fume {cmd}')

@@ -55,3 +55,18 @@ KEEP_DAILY      = 7
 KEEP_WEEKLY     = 4
 MAX_AGE_BKP     = 25
 DISPLAY_BKP     = 5
+
+; Dépôt EXTERNE (borgHelper ≥ 1.0.142) : archives créées hors borgHelper (ici par `borg create` brut), jamais de Bkp.
+; Seules EXTERNAL, BORG_REPO et la passphrase sont nécessaires ; GLOB_ARCH absent = toutes les archives du dépôt.
+; Remplissage (à refaire après un reboot, /tmp étant vidé) :
+;   export BORG_PASSPHRASE=demo-passphrase-externe
+;   borg init -e repokey /tmp/demo_borghelper/repo-externe
+;   borg create /tmp/demo_borghelper/repo-externe::etc-$(date +%Y-%m-%dT%H%M%S) /etc/default
+;   (relancer le borg create pour avoir plusieurs archives, puis : borgHelper -C demo.borghelperrc -c Index -n demo-externe -t 1m)
+[demo-externe]
+EXTERNAL        = true
+BORG_REPO       = /tmp/demo_borghelper/repo-externe
+BORG_PASSPHRASE = demo-passphrase-externe
+; EXTERNAL_OPS  = read,restore           ; défaut ; ajouter prune (avec KEEP_*) et/ou delete pour les autoriser
+MAX_AGE_BKP     = 25
+DISPLAY_BKP     = 5

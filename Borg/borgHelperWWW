@@ -57,7 +57,7 @@ def _push_deps_hint(err):
             f"python3-requests python3-cryptography' ; vendor/ attendu dans {_VENDOR_DIR}")
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
-from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail,
+from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail, glob_args,
                          DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec,
                          _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES, _enc_header_read, sentry_alert,
                          _sentry_alert_kinds, db_plain_anomalies, _cfg_bool, convert_octets_readable)
@@ -65,7 +65,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.27.8"
+WWW_VERSION="1.27.9"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -2249,7 +2249,7 @@ def _borg_env(cfg):
 def _latest_archive(cfg,env):
     borg_exe=cfg.get('BORG_EXE','borg')
     try:
-        proc=subprocess.run([borg_exe,'list','--short','--glob-archives',cfg['GLOB_ARCH'],cfg['BORG_REPO']],
+        proc=subprocess.run([borg_exe,'list','--short']+glob_args(cfg)+[cfg['BORG_REPO']],
                              capture_output=True,text=True,env=env,timeout=60)
     except subprocess.TimeoutExpired:
         raise HTTPException(504,detail="borg list : timeout")
@@ -3114,6 +3114,18 @@ def push_selftest():
         try: ok=bool(fn()); err=''
         except Exception as e: ok=False; err=f" ({type(e).__name__}: {e})"
         print(f"{'OK  ' if ok else 'FAIL'} {name}{err}"); results.append(ok)
+
+    def _latest_archive_glob():
+        """1.27.9 (story 5, AD-11) : borg list sans --glob-archives quand GLOB_ARCH est absent (dépôt externe), avec le
+        motif sinon — filtre produit par glob_args de borgHelper, jamais une lecture directe."""
+        seen=[]
+        def _run(cmd,**k):
+            seen.append(cmd); return subprocess.CompletedProcess(cmd,0,stdout='a1\na2\n',stderr='')
+        with mock.patch(f"{__name__}.subprocess.run",side_effect=_run):
+            r1=_latest_archive({'BORG_REPO':'/r'},{}); r2=_latest_archive({'BORG_REPO':'/r','GLOB_ARCH':'h-*'},{})
+        return (seen[0]==['borg','list','--short','/r'] and seen[1]==['borg','list','--short','--glob-archives','h-*','/r']
+                and r1==r2=='a2')
+    check("_latest_archive : sans GLOB_ARCH -> aucun filtre ; avec -> --glob-archives (glob_args)",_latest_archive_glob)
 
     tmpdir=tempfile.mkdtemp(prefix='borghelperwww-push-selftest-')
     test_db=os.path.join(tmpdir,'push-selftest.db')

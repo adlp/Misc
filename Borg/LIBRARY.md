@@ -288,7 +288,7 @@ for a in archives:
 lm = bh.borg._boex_last_modified('mon-serveur')
 print('Dernière modification :', lm)
 
-# Dernières N archives
+# Dernières N archives (moins de N dans le dépôt : message + SystemExit(3) ; strict=False rend [] à la place)
 last2 = bh.borg.getlastbkp('mon-serveur', nbl=2)
 print('Avant-dernière :', last2[0])
 print('Dernière :', last2[1])
@@ -642,6 +642,20 @@ sys.exit(0)
 | `stats(nick, debug)` | État de montage |
 | `cache_info(nick, debug)` | Affiche le cache |
 | `cache_clean(nick, debug)` | Nettoie le cache |
+
+### Dépôts externes (1.0.142)
+
+| Fonction (module `borgHelper`) | Description |
+|---------|-------------|
+| `glob_args(cfg, form='list', archives=False)` | Arguments de filtre d'archives (`--glob-archives`) ; aucun si `GLOB_ARCH` absent (motif `*` avec `archives=True`, pour `borg info`) — seul lecteur de la clé |
+| `is_external(cfg)` | Vrai si la section déclare `EXTERNAL = true` |
+| `external_ops(cfg, nick='')` | Opérations permises sur un externe (`read` toujours, défaut `read,restore`) |
+| `command_op(cmd)` | Nature d'une commande CLI : `bkp`, `restore`, `prune`, `delete` ou `read` |
+| `op_allowed(cfg, op, nick='')` | Autorité unique : l'opération est-elle permise sur ce nick ? |
+| `require_op(cfg, op, nick='')` | Lève `OpNotAllowed` si refusée (la CLI sort alors avec le code 4) |
+
+> Les méthodes de `BorgHelper` (`backup`, `prune`, `delbkp`, `restore`…) ne vérifient pas `EXTERNAL_OPS` : le contrôle
+> se fait au dispatch CLI. Un script qui les appelle directement doit appeler `require_op` lui-même.
 
 ### Méthodes `BorgHelperDB` utiles en lecture
 

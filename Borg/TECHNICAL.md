@@ -544,6 +544,26 @@ DIFF_KEEP : purge des paires au-delà de la limite (comptages figés d'abord, ex
 indexsnap() → voir flux IndexSnap ci-dessous
 ```
 
+### Dépôts externes : filtre d'archives et autorité des opérations (1.0.142, story 5, AD-11/AD-12)
+
+- `glob_args(cfg, form)` est le **seul** lecteur de `GLOB_ARCH` (borgHelper et borgHelperWWW) : `['--glob-archives',
+  m]` (form `list`) ou `['--glob-archives=m']` (`eq`), aucun argument si la clé est absente ou vide — sauf
+  `archives=True` (appels `borg info`) : motif `*`, car `borg info --json` sans filtre ne rend pas la liste `archives`. Un contrôle de
+  `CodecSelfTest` refuse toute lecture directe `cfg['GLOB_ARCH']` dans les deux fichiers.
+- `is_external(cfg)` (`EXTERNAL` vrai), `external_ops(cfg, nick)` (défaut `read,restore` ; `read` toujours ; `bkp`
+  et valeurs inconnues ignorés avec un avertissement unique), `command_op(cmd)` (`bkp` : Bkp/Init/Login, `restore`,
+  `prune`, `delete` : DelBkp ; tout le reste `read`), `op_allowed(cfg, op, nick)` (autorité unique : interne toujours
+  vrai, externe jamais `bkp`) et `require_op` (lève `OpNotAllowed`).
+- Contrôle au dispatch CLI, juste après l'expansion de `-n ALL` et avant toute commande : nick nommé et refusé → code
+  4 ; `-n ALL` → nick écarté (information). Classement : `command_op(cmd)`, sauf `Restore -L` (lecture) ; `Login`
+  vise le nick de `-s` quand `-n` manque. borgHelperWWW importera `op_allowed` pour `/access` et ses routes (story 7) ;
+  aujourd'hui les routes qui appellent la CLI héritent du refus, mais `/download` (borg direct) et `/bkp` (lancement
+  détaché) ne vérifient rien encore.
+- `prune()` rend `{'exitcode': 3}` (au lieu de `sys.exit`) pour un nick interne sans `GLOB_ARCH` ou sans aucune
+  `KEEP_*` : la boucle `-n ALL` passe au nick suivant.
+- `Prune` : nick interne sans `GLOB_ARCH` refusé (code 3). `DelBkp` pose `priority.lock` et appelle `wait_index_idle`.
+- `Stats`/`Mount`/`UMount` : `MOUNTPOINT` lu par `cfg.get`, message si absent.
+
 ### `Index` par tranches (1.0.141, story 4, AD-1/AD-3/AD-10)
 
 `index(nick, budget=, natures=, period=)` — CLI `-t` / `-T` / `-b` / `-B` ; au moins l'un active la tranche,
