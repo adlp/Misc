@@ -66,7 +66,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.28.2"
+WWW_VERSION="1.28.3"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -2512,7 +2512,7 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
     def _state(n):
         """1.28.0 (story 7, AD-10/AD-12) : dépôt externe, opérations permises (allowed_ops de borgHelper), état de
         construction et Bkp en cours — lectures locales comme Status (jamais borg, rien créé)."""
-        out={'external':False,'ops':None,'build':None,'rebuild':None,'bkp_running':None,'index_last':None}
+        out={'external':False,'ops':None,'build':None,'rebuild':None,'bkp_running':None,'index_last':None,'bkp_last':None}
         try:
             cfg=_bh_paths.borg.cfgread(n)
             if cfg is not None: out.update(external=is_external(cfg),ops=allowed_ops(cfg,n))
@@ -2529,6 +2529,10 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
         # 1.28.2 (story 12 A4) : résultat du dernier Index du nick (CLI, cron ou POST /index) ; None si absent/illisible.
         try: out['index_last']=_bh_paths.db.read_index_last(n)
         except (Exception,SystemExit): out['index_last']=None
+        # 1.28.3 (story 15) : dernier Bkp du nick (run_id, début, fin, résultat) — l'UI suit un ▶ Backup par run_id, sans
+        # minutage ; None si aucune ligne ou lecture impossible (history.db jamais créée).
+        try: out['bkp_last']=_bh_paths.db.last_bkp_status(n)
+        except (Exception,SystemExit): out['bkp_last']=None
         return out
     if not GROUPS_HEADER:
         # Fonctionnalité désactivée : pas de restriction par nick ni de périmètre, seuls
@@ -3970,10 +3974,10 @@ def push_selftest():
                     return a.status_code==b.status_code==403 and (_http_status(0),_http_status(1),_http_status(4))==(200,400,403)
                 check("code de sortie 4 de la CLI -> HTTP 403 (cache compris)",_code4)
                 def _access_state():
-                    """/access : external, ops (allowed_ops de borgHelper), build, rebuild, bkp_running par nick lisible ; nick
+                    """/access : external, ops (allowed_ops de borgHelper), build, rebuild, bkp_running, index_last, bkp_last par nick lisible ; nick
                     sans droit : rien de plus."""
                     r=client.get(f"{P}/access",headers=H); nk=r.json()['nicks']
-                    keys={'external','ops','build','rebuild','bkp_running','index_last'}
+                    keys={'external','ops','build','rebuild','bkp_running','index_last','bkp_last'}
                     ok=r.status_code==200 and all(keys<=set(v) for v in nk.values())
                     if _internal: ok=ok and nk[_internal]['external'] is False and nk[_internal]['ops']==list(sys.modules['borgHelper'].ALL_OPS)
                     if 'demo-externe' in nk:
@@ -4025,6 +4029,31 @@ def push_selftest():
                     if not ok: print(f"  /access bkp_running : aucune {none}, récent {fresh}, tué {stale}, illisible {broken}")
                     return ok
                 if _internal: check("/access : Bkp tué (plus vieux que BKP_STATUS_TIMEOUT) -> false, récent -> true, base illisible -> null",_access_bkp_timeout)
+                def _access_bkp_last():
+                    """1.28.3 (story 15), vraie history.db jetable : bkp_last = dernier Bkp du nick (en cours puis fini, run_id
+                    relayé) ; aucune ligne -> null ; base illisible -> null (200) ; base absente jamais créée."""
+                    d=tempfile.mkdtemp(prefix='bhw-s15-'); hp=os.path.join(d,'h.db'); absent=os.path.join(d,'absent.db')
+                    db=_bh_paths.db; db.ensure_history_db(hp,create=True)
+                    def get(path):
+                        with mock.patch.object(db,'history_path',return_value=path):
+                            r=client.get(f"{P}/access",headers=H); v=r.json()['nicks'][_internal].get('bkp_last','absent')
+                            return r.status_code,(v if v is None or isinstance(v,dict) else {'absent':v})
+                    try:
+                        none=get(hp)
+                        db.store_bkp_status_start(_internal,'s15-run',db_path=hp); running=get(hp)
+                        db.store_bkp_status_finish(_internal,'s15-run','success',db_path=hp); done=get(hp)
+                        miss=get(absent); created=os.path.exists(absent)
+                        for f in (hp+'-wal',hp+'-shm'):
+                            with contextlib.suppress(OSError): os.unlink(f)
+                        with open(hp,'wb') as f: f.write(b'pas une base sqlite '*64)
+                        broken=get(hp)
+                    finally: shutil.rmtree(d,ignore_errors=True)
+                    ok=(none==(200,None) and running[0]==200 and (running[1] or {}).get('run_id')=='s15-run'
+                        and running[1].get('finished_at') is None and (done[1] or {}).get('result')=='success'
+                        and bool(done[1].get('finished_at')) and miss==(200,None) and not created and broken==(200,None))
+                    if not ok: print(f"  /access bkp_last : {none} {running} {done} {miss} {created} {broken}")
+                    return ok
+                if _internal: check("/access : bkp_last = dernier Bkp du nick (en cours puis fini) ; aucune ligne, absente ou illisible -> null, rien créé",_access_bkp_last)
                 def _index_async():
                     """POST /index asynchrone : lancement détaché (cmd index, options transmises), réponse immédiate ; nick inconnu 404."""
                     with mock.patch(f"{__name__}._launch_bkp_detached",return_value=4242) as launch:

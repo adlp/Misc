@@ -356,6 +356,10 @@ for row in pending:
 # Bkp en cours (1.0.145) : True (démarré depuis moins de timeout_s, sans fin), False (aucun, ou bloqué
 # au-delà), None (history.db illisible — ne jamais le prendre pour une fin de Bkp).
 state = bh.db.bkp_running_state('mon-serveur', timeout_s=21600)
+
+# Dernier Bkp du nick (1.0.152) : {'run_id','started_at','finished_at','result'} (finished_at None s'il tourne),
+# None sans ligne ou sans history.db (jamais créée) ; lève si la base est illisible.
+last = bh.db.last_bkp_status('mon-serveur')
 ```
 
 ### Résultat du dernier Index (1.0.149)

@@ -2026,6 +2026,9 @@ Depuis 1.28.0, chaque nick lisible par l'appelant porte aussi (lectures locales 
   pendant l'attente) et `via` ∈ `cli`, `http` ; heures ISO avec décalage ; `last_failure` (même forme, sans `nick` ni
   `started_at`) sur un `busy`/`deadline` qui suit un échec ; `null` si aucun Index n'a encore écrit de résultat ou si
   le fichier est illisible. L'Index de fin de Bkp n'en écrit pas.
+- `bkp_last` (1.28.3, borgHelper ≥ 1.0.152) : dernier Bkp du nick dans `history.db` — `{"run_id","started_at",
+  "finished_at","result"}` (`finished_at`/`result` `null` tant qu'il tourne ; heures UTC de SQLite) ; `null` si aucun
+  Bkp enregistré ou lecture impossible. L'UI s'en sert pour suivre un ▶ Backup.
 
 Un nick sans droit n'en porte aucun. L'interface web (UI ≥ 1.19.0) s'en sert pour ses badges
 (🔗 externe, ⏳ Bkp en cours, 🏗 construction partielle, ♻ reconstruction ; UI ≥ 1.19.2 : ⚠ Index en échec,
@@ -2033,7 +2036,9 @@ jusqu'au prochain Index réussi, avec l'heure et le message en infobulle, et ⏸
 un `POST /index` refusé ainsi depuis moins d'une heure), pour masquer les actions interdites sur
 un dépôt externe, et la relit toutes les 30 s (liste et page serveur, onglet visible) : à la fin d'un Bkp, la carte du
 serveur est rechargée. Un Bkp lancé par ▶ Backup est suivi à part (UI 1.19.1) : même fini avant la première relecture,
-sa carte est rechargée une fois (au bout de 60 s au plus tard).
+sa carte est rechargée une fois. Depuis UI 1.19.3, ce suivi se fait par `run_id` (`bkp_last`) : la carte est rechargée
+dès qu'un Bkp différent de celui connu au clic apparaît comme fini, quel que soit le temps que `backup()` a mis à
+démarrer (attente de l'Index, `borg list` SSH).
 
 ⚠️ **Exception à la règle générale "toujours 200 pour un appel authentifié"** — mais **seulement
 pour tout appelant** (depuis 1.20.0, accès direct par périmètre) : `GROUPS_PATHS`

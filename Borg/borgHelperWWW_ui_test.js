@@ -105,9 +105,10 @@ eq('titre explorateur archive',pageTitle({view:'view-browse',nick:'srv',path:'et
     const loadMyAccess=async()=>{ myAccess=env.next(); return myAccess; };
     ${grab('opAllowed')}
 ${grab('stateBadges')}
+${grab('bkpRef')}
 ${grab('notePendingBkp')}
 async ${grab('pollAccess')}
-    return {opAllowed,stateBadges,pollAccess,notePendingBkp,set:(a,v,n)=>{ myAccess=a; if(v) currentViewId=v; if(n!==undefined) currentNick=n; }};`)(
+    return {opAllowed,stateBadges,pollAccess,notePendingBkp,pending:pendingBkp,set:(a,v,n)=>{ myAccess=a; if(v) currentViewId=v; if(n!==undefined) currentNick=n; }};`)(
     Object.assign(env,{next:()=>next,now:()=>now,parse:x=>globalThis.Date.parse(x)}));
   const acc=(o)=>({groups_auth_enabled:false,nicks:o});
   ui.set(null); eq('opAllowed sans /access : tout proposé',ui.opAllowed('x','bkp'),true);
@@ -164,31 +165,88 @@ async ${grab('pollAccess')}
   ui.set(acc({a:{bkp_running:true}}),'view-machines'); next=acc({a:{bkp_running:null}});
   await ui.pollAccess();
   eq('bkp_running inconnu (null) : jamais pris pour une fin de Bkp',calls.reload.length,1);
-  // Bkp lancé par ▶ Backup (UI 1.19.1) : myAccess remplacé (loadMachines) sans perdre le suivi
-  ui.notePendingBkp('s'); ui.set(acc({s:{bkp_running:false}}),'view-machines'); next=acc({s:{bkp_running:false}});
-  now+=30000; await ui.pollAccess();
-  eq('Bkp court, 30 s, jamais vu en cours : on attend',calls.reload.length,1);
-  now+=31000; await ui.pollAccess();
-  eq('Bkp court fini avant la 1re relecture : carte rechargée au bout de 60 s',calls.reload.slice(1),['s']);
+  // Bkp lancé par ▶ Backup (UI 1.19.3) : suivi par run_id (bkp_last de /access), sans minutage ; myAccess remplacé
+  // (loadMachines) sans perdre le suivi ; une seule recharge par Bkp.
+  const B=(run,fin,running=false)=>({bkp_running:running,bkp_last:run?{run_id:run,finished_at:fin||null,result:fin?'success':null}:null});
+  const R=()=>calls.reload.length, T=now;
+  let n0=R(); ui.set(acc({s:B('old','x')}),'view-machines'); ui.notePendingBkp('s');
+  eq('clic : dernier Bkp connu noté (prev, fini)',[ui.pending.s.prev,ui.pending.s.prevFin,ui.pending.s.known],['old',true,true]);
+  next=acc({s:B('old','x')}); now=T+400000; await ui.pollAccess();
+  eq('pas encore écrit, 400 s : aucune recharge, suivi gardé',[R()-n0,!!ui.pending.s],[0,true]);
+  next=acc({s:B('new',null,true)}); await ui.pollAccess();
+  eq('nouveau Bkp en cours : pas de recharge',R()-n0,0);
+  next=acc({s:B('new','y')}); await ui.pollAccess();
+  eq('nouveau Bkp fini : une recharge',calls.reload.slice(n0),['s']);
   await ui.pollAccess();
-  eq('Bkp court : une seule recharge',calls.reload.length,2);
-  ui.notePendingBkp('t'); ui.set(acc({t:{bkp_running:false}}),'view-machines');
-  next=acc({t:{bkp_running:true}}); await ui.pollAccess();
-  ui.set(acc({t:{bkp_running:false}})); next=acc({t:{bkp_running:null}}); await ui.pollAccess();
-  next=acc({t:{bkp_running:false}}); await ui.pollAccess();
-  eq('Bkp vu en cours, myAccess écrasé entre-temps, puis fini (null ignoré) : rechargé une fois',calls.reload.slice(2),['t']);
-  // ▶ Backup (vraie runBackupNow) : lancement réussi -> suivi ; échec -> rien
-  const rb=new Function('env',`const pendingBkp={}, Date={now:()=>1};
+  eq('une seule recharge (suivi terminé)',[R()-n0,'s' in ui.pending],[1,false]);
+  // critère d'acceptation : démarrage à 200 s, 10 s de Bkp entre deux relectures, jamais vu en cours
+  n0=R(); ui.set(acc({q:B('old','x')})); ui.notePendingBkp('q');
+  for(const s of [30,60,90,120,150,180,210]){ next=acc({q:B('old','x')}); now=T+s*1000; await ui.pollAccess(); }
+  eq('démarrage tardif : rien jusqu\'à 210 s',R()-n0,0);
+  next=acc({q:B('late','z')}); now=T+240000; await ui.pollAccess();
+  eq('démarrage tardif, fin rapide jamais vue en cours : rechargé à la relecture qui la montre',calls.reload.slice(n0),['q']);
+  n0=R(); ui.set(acc({f:{bkp_running:false,bkp_last:null}})); ui.notePendingBkp('f');
+  eq('premier Bkp du nick : prev null, connu',[ui.pending.f.prev,ui.pending.f.known],[null,true]);
+  next=acc({f:B('r1','z')}); await ui.pollAccess();
+  eq('premier Bkp du nick fini : une recharge',calls.reload.slice(n0),['f']);
+  // null jamais pris pour une fin (ni pour « vu en cours ») ; chemin « vu en cours puis fini » (bkp_last en retard)
+  n0=R(); ui.set(acc({n:B('old','x')})); ui.notePendingBkp('n');
+  next=acc({n:{bkp_running:null,bkp_last:null}}); await ui.pollAccess();
+  next=acc({n:B('old','x')}); await ui.pollAccess();
+  eq('null puis false sans Bkp nouveau : aucune recharge, suivi gardé',[R()-n0,!!ui.pending.n],[0,true]);
+  next=acc({n:{bkp_running:null,bkp_last:{run_id:'new',finished_at:null}}}); await ui.pollAccess();
+  next=acc({n:{bkp_running:false,bkp_last:{run_id:'new',finished_at:null}}}); await ui.pollAccess();
+  eq('bkp_running null avec un Bkp nouveau : jamais « vu en cours » (pas de recharge ensuite)',R()-n0,0);
+  delete ui.pending.n;
+  n0=R(); ui.set(acc({t:B('old','x')})); ui.notePendingBkp('t');
+  next=acc({t:B('new',null,true)}); await ui.pollAccess();
+  ui.set(acc({t:B('old','x')})); next=acc({t:{bkp_running:null,bkp_last:null}}); await ui.pollAccess();
+  eq('vu en cours, myAccess écrasé, puis null : pas une fin',R()-n0,0);
+  next=acc({t:B('new',null,false)}); await ui.pollAccess();
+  eq('vu en cours puis bkp_running false (bkp_last en retard) : rechargé une fois',calls.reload.slice(n0),['t']);
+  await ui.pollAccess();
+  eq('vu en cours : une seule recharge',R()-n0,1);
+  // Bkp cron déjà en cours au clic : sa fin recharge la carte SANS terminer le suivi du nôtre
+  n0=R(); ui.set(acc({c:B('cron',null,true)})); ui.notePendingBkp('c');
+  eq('clic pendant un Bkp cron : prev = cron, non fini',[ui.pending.c.prev,ui.pending.c.prevFin],['cron',false]);
+  next=acc({c:B('cron','f')}); await ui.pollAccess();
+  eq('Bkp cron fini : carte rechargée, suivi gardé',[calls.reload.slice(n0),!!ui.pending.c],[['c'],true]);
+  next=acc({c:B('cron','f')}); await ui.pollAccess();
+  eq('Bkp cron déjà compté : pas de seconde recharge',R()-n0,1);
+  next=acc({c:B('mine','g')}); await ui.pollAccess();
+  eq('puis le nôtre fini : rechargé, suivi terminé',[calls.reload.slice(n0),'c' in ui.pending],[['c','c'],false]);
+  // état illisible au clic (pas de /access, nick absent) : première lecture lisible = référence, sans recharge
+  n0=R(); ui.set(acc({})); ui.notePendingBkp('u');
+  eq('état inconnu au clic',[ui.pending.u.known,ui.pending.u.prev],[false,null]);
+  next=acc({u:{bkp_running:null,bkp_last:null}}); await ui.pollAccess();
+  next=acc({u:B('old','x')}); await ui.pollAccess();
+  eq('première lecture lisible : référence, pas de recharge',[R()-n0,(ui.pending.u||{}).known,(ui.pending.u||{}).prev],[0,true,'old']);
+  next=acc({u:B('new','y')}); await ui.pollAccess();
+  eq('puis Bkp nouveau fini : une recharge',calls.reload.slice(n0),['u']);
+  // deux ▶ Backup avant la fin du premier : deux fins suivies
+  n0=R(); ui.set(acc({d:B('old','x')})); ui.notePendingBkp('d'); ui.notePendingBkp('d');
+  next=acc({d:B('a1','y')}); await ui.pollAccess();
+  eq('deux lancements, premier fini : rechargé, suivi gardé',[R()-n0,!!ui.pending.d,(ui.pending.d||{}).prev],[1,true,'a1']);
+  next=acc({d:B('a1','y')}); await ui.pollAccess();
+  next=acc({d:B('a2','z')}); await ui.pollAccess();
+  eq('second fini : rechargé, suivi terminé',[R()-n0,'d' in ui.pending],[2,false]);
+  // ▶ Backup (vraie runBackupNow) : /access relu puis dernier Bkp relevé AVANT le lancement ; réussi -> suivi ; échec -> rien
+  const rb=new Function('env',`const pendingBkp={}; let myAccess=env.acc;
     const confirm=()=>true, getPassphrase=()=>'pw', alert=()=>{}, loadMachines=()=>{ env.loads++; };
-    const apiCall=async()=>env.resp;
+    const loadMyAccess=async()=>{ env.fetched++; myAccess=env.fresh; return myAccess; };
+    const apiCall=async()=>{ myAccess=env.after; return env.resp; };
+    ${grab('bkpRef')}
     ${grab('notePendingBkp')}
 async ${grab('runBackupNow')}
     return {runBackupNow,pendingBkp};`);
-  const rbEnv={loads:0,resp:{exitcode:0,httpStatus:200}}, rbUi=rb(rbEnv), btn={textContent:'▶',disabled:false};
+  const rbEnv={loads:0,fetched:0,resp:{exitcode:0,httpStatus:200},acc:acc({ok:B('périmé','x')}),
+               fresh:acc({ok:B('frais','x'),ko:B('frais','x')}),after:acc({ok:B('pendant',null,true)})};
+  const rbUi=rb(rbEnv), btn={textContent:'▶',disabled:false};
   await rbUi.runBackupNow('ok',btn);
   rbEnv.resp={exitcode:1,httpStatus:403,detail:'refusé'}; await rbUi.runBackupNow('ko',btn);
-  eq('runBackupNow : lancement réussi suivi, échec non suivi, bouton rendu',
-     [!!rbUi.pendingBkp.ok,'ko' in rbUi.pendingBkp,btn.disabled,btn.textContent,rbEnv.loads],[true,false,false,'▶',2]);
+  eq('runBackupNow : /access relu, prev relevé avant le lancement, réussi suivi, échec non suivi, bouton rendu',
+     [rbEnv.fetched,rbUi.pendingBkp.ok&&rbUi.pendingBkp.ok.prev,'ko' in rbUi.pendingBkp,btn.disabled,btn.textContent,rbEnv.loads],
+     [2,'frais',false,false,'▶',2]);
   // Actions, historique et carte (UI 1.19.0) : vraies fonctions de la page, DOM minimal simulé.
   const grabConst=name=>{ const i=src.indexOf('const '+name+'=['); let d=0,j=src.indexOf('[',i);
     for(;;j++){ if(src[j]==='[') d++; else if(src[j]===']' && --d===0) break; } return src.slice(i,j+1)+';'; };

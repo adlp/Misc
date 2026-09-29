@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.19.2 -->
+<!-- UI_VERSION: 1.19.3 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -706,11 +706,28 @@ async function reloadMachineCard(nick){
 // Relecture de /access toutes les 30 s (UI 1.19.0) sur la liste et la page d'un serveur, onglet visible :
 // badges d'état à jour (tranches cron, reconstruction) ; Bkp passé de « en cours » à « fini » -> carte rechargée
 // (liste) ou badges/actions de la page serveur rafraîchis.
-// Bkp lancé par ▶ Backup (UI 1.19.1) : suivi à part de myAccess, que loadMachines remplace aussitôt. Fin = vu « en
-// cours » puis « fini », ou jamais vu en cours au bout de 60 s (Bkp plus court qu'une relecture) : une seule recharge.
+// Bkp lancé par ▶ Backup (UI 1.19.1) : suivi à part de myAccess, que loadMachines remplace aussitôt. UI 1.19.3 : suivi
+// par run_id, sans minutage (backup() peut attendre l'Index, un borg list SSH… avant d'écrire bkp_status). Au clic, /access
+// est relu puis le dernier Bkp du nick noté (bkp_last, WWW ≥ 1.28.3) : prev (run_id), prevFin (était-il fini ?). Fin = un
+// Bkp DIFFÉRENT et fini, ou un Bkp différent vu « en cours » puis bkp_running false. Un Bkp déjà en cours au clic (cron)
+// qui finit : carte rechargée, suivi gardé. État illisible au clic : la première lecture lisible sert de référence, sans
+// recharge. Deux ▶ Backup avant la fin du premier : suivi prolongé d'un Bkp (left). Jamais de bkp_status : entrée inerte.
+// Avant (1.19.1-1.19.2) : 60 s sans le voir en cours -> recharge et abandon.
 let pollBusy=false;
 const pendingBkp={};
-function notePendingBkp(nick){ pendingBkp[nick]={t:Date.now(),seen:false}; }
+function bkpRef(nick){
+  const a=myAccess && myAccess.nicks && myAccess.nicks[nick];
+  if(!a || a.bkp_running==null || !('bkp_last' in a)) return null;   // inconnu : pas de /access, lecture impossible
+  const bl=a.bkp_last;
+  return {prev:(bl && bl.run_id)||null, prevFin:!bl || !!bl.finished_at};
+}
+function notePendingBkp(nick,ref){
+  if(ref===undefined) ref=bkpRef(nick);
+  const p=pendingBkp[nick];
+  if(p){ p.left++; return; }
+  pendingBkp[nick]=ref ? {prev:ref.prev,prevFin:ref.prevFin,known:true,seen:false,left:1}
+                       : {prev:null,prevFin:true,known:false,seen:false,left:1};
+}
 async function pollAccess(){
   if(pollBusy || document.hidden || !getApiKey() || !myAccess) return;   // jamais deux relectures qui se chevauchent
   if(currentViewId!=='view-machines' && currentViewId!=='view-detail') return;
@@ -722,12 +739,31 @@ async function pollAccess(){
   refreshStateBadges();
   Object.entries(r.nicks||{}).forEach(([n,a])=>{
     const p=pendingBkp[n];
-    // null = inconnu (base illisible), jamais pris pour une fin
-    if(a.bkp_running || a.bkp_running==null){ if(p && a.bkp_running) p.seen=true; return; }
     if(p){
-      if(!p.seen && Date.now()-p.t<60000) return;   // pas encore démarré, ou déjà fini : on attend encore
-      delete pendingBkp[n];
-    }else if(!before[n]) return;   // seulement la fin d'un Bkp vu en cours
+      const bl=a.bkp_last;   // null = aucun ou lecture impossible : jamais une fin
+      if(!p.known){   // état inconnu au clic : première lecture lisible = référence, sans recharge
+        if(a.bkp_running!=null && bl!==undefined){ p.prev=(bl && bl.run_id)||null; p.prevFin=!bl || !!bl.finished_at; p.known=true; }
+        return;
+      }
+      let reload=false, end=false;
+      if(bl && bl.run_id && bl.run_id!==p.prev){
+        if(bl.finished_at) end=true;                      // Bkp nouveau et fini
+        else if(a.bkp_running===true) p.seen=true;        // Bkp nouveau en cours
+      }else if(bl && bl.run_id && bl.run_id===p.prev && !p.prevFin && bl.finished_at){
+        p.prevFin=true; reload=true;                      // Bkp déjà en cours au clic (cron) fini : carte à jour, suivi gardé
+      }
+      if(!end && p.seen && a.bkp_running===false) end=true;   // vu en cours puis fini
+      if(end){
+        reload=true;
+        if(--p.left>0){ p.prev=(bl && bl.run_id)||p.prev; p.prevFin=true; p.seen=false; }   // un autre ▶ Backup attendu
+        else delete pendingBkp[n];
+      }
+      if(!reload) return;
+    }else{
+      // null = inconnu (base illisible), jamais pris pour une fin
+      if(a.bkp_running || a.bkp_running==null) return;
+      if(!before[n]) return;   // seulement la fin d'un Bkp vu en cours
+    }
     if(currentViewId==='view-machines') reloadMachineCard(n);
     else if(currentViewId==='view-detail' && n===currentNick) renderActionList();
   });
@@ -1125,11 +1161,15 @@ async function runBackupNow(nick,btn){
   if(!getPassphrase(nick) && !confirm("Aucune passphrase enregistrée pour ce serveur — continuer sans (utilisera celle du .borghelperrc si présente) ?")) return;
   const orig=btn.textContent;
   btn.disabled=true; btn.textContent='Lancement…';
+  // UI 1.19.3 : état frais AVANT le lancement (myAccess peut dater, onglet caché) — un Bkp cron fini entre-temps n'est
+  // pas pris pour le nôtre ; illisible -> référence prise à la première relecture lisible.
+  try{ await loadMyAccess(); }catch(e){}
+  const ref=bkpRef(nick);
   const r=await apiCall('POST','/bkp',{nick},true,nick);
   btn.disabled=false; btn.textContent=orig;
   if(r.httpStatus===401) return;
   if(r.exitcode===0){
-    notePendingBkp(nick);   // fin de ce Bkp repérée par pollAccess même s'il dure moins de 30 s (UI 1.19.1)
+    notePendingBkp(nick,ref);   // fin repérée par pollAccess (run_id nouveau et fini), même courte ou tardive
     alert(`Backup ${nick} démarré — sauvegarde en cours en arrière-plan (résultat non affiché ici pour l'instant).`);
   }else{
     alert(`Échec du lancement du backup ${nick} (HTTP ${r.httpStatus}) :\n`+(r.detail||r.stderr||r.stdout||'(pas de détail)'));

@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.151"
+Version="1.0.152"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -2580,6 +2580,20 @@ class BorgHelperDB:
                     f"AND started_at >= datetime('now','-{int(timeout_s)} seconds') LIMIT 1",(nick,)).fetchone() is not None
             finally: conn.close()
         except (sqlite3.Error,OSError,DbKeyError,DbModeError,DbTamperError,DbCodecError,SchemaVersionError): return None
+
+    def last_bkp_status(self,nick,db_path=None):
+        """Dernière ligne bkp_status du nick (1.0.152, story 15) : {run_id, started_at, finished_at, result} (plus récent
+        started_at, puis ordre d'écriture) ; None si aucune ligne ou history.db absente — jamais de création (AD-12).
+        Lecture impossible : lève (l'appelant, /access, en fait null). Sert au suivi d'un Bkp lancé depuis l'UI : un
+        run_id différent de celui noté au clic, et fini, signale la fin."""
+        db_path=self._hist(nick,db_path)
+        if db_path is None: return None
+        conn=_open_db(db_path,nick=None,role='read')
+        try:
+            r=conn.execute("SELECT run_id,started_at,finished_at,result FROM bkp_status WHERE nick=? "
+                           "ORDER BY started_at DESC, rowid DESC LIMIT 1",(nick,)).fetchone()
+        finally: conn.close()
+        return dict(zip(('run_id','started_at','finished_at','result'),r)) if r else None
 
     def list_pending_bkp_status(self,nick,timeout_s,db_path=None):
         """Lignes bkp_status prêtes à être réclamées par le watcher (borgHelperWWW) : terminées
@@ -7499,6 +7513,37 @@ def codec_selftest(pattern=None,list_only=False):
             c.close()
             return row is not None and row[0] is not None and row[1] is None and row[2] is None and row[3] is None
         check("bkp_status : store_bkp_status_start -> started_at posé, le reste NULL",_bs_start_check)
+        def _bs_last():
+            """1.0.152 (story 15) : last_bkp_status — aucune ligne -> None ; la plus récente (started_at, puis ordre
+            d'écriture) ; en cours -> finished_at None ; autre nick ignoré ; base absente -> None sans création ; base
+            illisible -> lève."""
+            lp=os.path.join(tmp,'s15-history.db'); bh.ensure_history_db(lp)
+            none=bh.last_bkp_status('s15',db_path=lp)
+            bh.store_bkp_status_start('s15','r1',db_path=lp); bh.store_bkp_status_finish('s15','r1','success',db_path=lp)
+            c=sqlite3.connect(lp); c.execute("UPDATE bkp_status SET started_at=datetime('now','-1 hour') WHERE run_id='r1'")
+            c.commit(); c.close()
+            done=bh.last_bkp_status('s15',db_path=lp) or {}
+            bh.store_bkp_status_start('s15','r2',db_path=lp); running=bh.last_bkp_status('s15',db_path=lp) or {}
+            bh.store_bkp_status_start('s15','r3',db_path=lp)
+            c=sqlite3.connect(lp); c.execute("UPDATE bkp_status SET started_at=(SELECT started_at FROM bkp_status WHERE run_id='r2') "
+                                             "WHERE run_id='r3'"); c.commit(); c.close()   # même seconde : ordre d'écriture
+            tie=bh.last_bkp_status('s15',db_path=lp) or {}
+            bh.store_bkp_status_start('s15','r0',db_path=lp)   # écrite après, démarrée avant : started_at l'emporte
+            c=sqlite3.connect(lp); c.execute("UPDATE bkp_status SET started_at=datetime('now','-2 hours') WHERE run_id='r0'")
+            c.commit(); c.close()
+            older=bh.last_bkp_status('s15',db_path=lp) or {}
+            bh.store_bkp_status_start('autre15','x9',db_path=lp); other=bh.last_bkp_status('s15',db_path=lp) or {}
+            absent=os.path.join(tmp,'s15-absent-history.db')
+            with mock.patch.object(bh,'history_path',return_value=absent): miss=bh.last_bkp_status('s15')
+            bad=os.path.join(tmp,'s15-bad-history.db')
+            with open(bad,'wb') as f: f.write(b'pas une base sqlite '*64)
+            broke=raises(Exception,lambda: bh.last_bkp_status('s15',db_path=bad))
+            ok=(none is None and done.get('run_id')=='r1' and bool(done.get('finished_at')) and done.get('result')=='success'
+                and running.get('run_id')=='r2' and running.get('finished_at') is None and set(running)=={'run_id','started_at','finished_at','result'}
+                and tie.get('run_id')=='r3' and older.get('run_id')=='r3' and other.get('run_id')=='r3' and miss is None and not os.path.exists(absent) and broke)
+            if not ok: print(f"  last_bkp_status : {none} {done} {running} {tie} {older} {other} {miss} {broke}")
+            return ok
+        check("bkp_status : last_bkp_status -> dernier Bkp du nick (en cours ou fini), None sans ligne ni base, rien créé, illisible lève",_bs_last)
         def _bs_finish_success():
             bh.store_bkp_status_finish('bsA','run1','success',db_path=bs_path)
             c=_open_db(bs_path,nick='bsA',role='read')

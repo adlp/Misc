@@ -578,8 +578,13 @@ indexsnap() → voir flux IndexSnap ci-dessous
   relecture `/access` toutes les 30 s (`pollAccess`, sans chevauchement ; `bkp_running` `null` = inconnu, jamais
   une fin) et `reloadMachineCard` à la fin d'un Bkp. 1.28.1 / UI 1.19.1 (story 8 R3/R4) : `bkp_running` vient de
   `BorgHelperDB.bkp_running_state(nick, BKP_STATUS_TIMEOUT)` (ligne sans fin plus vieille que le délai → `false`,
-  lecture impossible → `null`) ; ▶ Backup inscrit le nick dans `pendingBkp` (`{t, seen}`, hors de `myAccess` que
-  `loadMachines` remplace) : fin vue en cours puis finie, ou jamais vue en cours après 60 s → une seule recharge. `borgHelperWWW_ui_test.js` exécute les vraies fonctions de la page (DOM et API simulés) : `opAllowed`,
+  lecture impossible → `null`) ; ▶ Backup (UI 1.19.3) relit `/access`, puis inscrit le nick dans `pendingBkp` (hors de `myAccess` que
+  `loadMachines` remplace) : `{prev, prevFin, known, seen, left}` — `prev` = `bkp_last.run_id` relevé AVANT l'appel
+  `POST /bkp`, `prevFin` = ce Bkp était-il fini, `known` = état lisible au clic (sinon la première lecture lisible sert de
+  référence, sans recharge), `left` = ▶ Backup en attente. Fin = `bkp_last` d'un `run_id` ≠ `prev` et `finished_at` posé,
+  ou un Bkp nouveau vu en cours puis `bkp_running: false` → une recharge (le suivi continue si `left` > 1) ; le Bkp déjà en
+  cours au clic (cron) qui finit recharge aussi la carte, sans terminer le suivi ; `null` n'est jamais une fin ni un
+  « en cours ». Aucun minutage : `backup()` n'a pas de délai borné avant `store_bkp_status_start` (`getlastbkp` par SSH, `wait_index_idle` 120 s, verrous SQLite) ; les 60 s d'avant (1.19.1-1.19.2) rataient un Bkp démarré tard et fini entre deux relectures. `borgHelperWWW_ui_test.js` exécute les vraies fonctions de la page (DOM et API simulés) : `opAllowed`,
   `stateBadges`, `pollAccess`, `renderActionList` (+ `ACTIONS`), `_renderHistoryRows`, `machineCardHtml`,
   `reloadMachineCard`.
 - `prune()` rend `{'exitcode': 3}` (au lieu de `sys.exit`) pour un nick interne sans `GLOB_ARCH` ou sans aucune

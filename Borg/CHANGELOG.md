@@ -1,5 +1,29 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.152 / borgHelperWWW 1.28.3 / UI 1.19.3 — suivi d'un Bkp lancé depuis l'UI — 2026-09-29
+
+Chantier « reconstruction progressive », story 15 (report de la story 8).
+
+- **▶ Backup suivi par `run_id`, sans minutage** (UI) : au clic, l'UI note le dernier Bkp connu du nick ; elle recharge
+  la carte une fois dès qu'un Bkp différent apparaît comme fini dans `/access`, ou quand le Bkp vu « en cours » est
+  fini. Avant, sans le voir « en cours » au bout de 60 s, elle rechargeait et abandonnait : un Bkp démarré tard
+  (`backup()` attend jusqu'à 120 s l'Index, un `borg list` SSH sans délai, des verrous SQLite) puis fini entre deux
+  relectures (30 s) n'était jamais rechargé. Une fenêtre fixe plus longue a été écartée en revue : aucun délai ne borne
+  le démarrage. Un lancement qui n'écrit jamais `bkp_status` laisse une entrée inerte, sans recharge. Le clic relit
+  d'abord `/access` (un Bkp cron fini pendant que l'onglet dormait n'est pas pris pour le nôtre) ; un Bkp cron en cours au
+  clic qui finit recharge la carte sans terminer le suivi ; état illisible au clic : la première lecture lisible sert de
+  référence ; deux ▶ Backup de suite : deux fins suivies.
+- **`GET /access`** (borgHelperWWW) : nouveau champ `bkp_last` par nick lisible — dernier Bkp du nick
+  (`run_id`, `started_at`, `finished_at`, `result`), `null` si aucun ou si la lecture est impossible ; jamais de
+  création de `history.db`.
+- **`BorgHelperDB.last_bkp_status(nick)`** (borgHelper) : cette lecture ; `None` sans ligne ni base, lève si la base
+  est illisible.
+- Tests : CodecSelfTest (`last_bkp_status`), push_selftest (`/access` `bkp_last` : en cours puis fini, sans ligne,
+  base absente jamais créée, illisible → `null`), `borgHelperWWW_ui_test.js` (Bkp non encore écrit après 400 s, en
+  cours, fini ; démarrage à 200 s jamais vu en cours ; premier Bkp du nick ; `null` jamais pris pour une fin ni pour
+  « en cours » ; Bkp cron en cours au clic ; état illisible au clic ; deux ▶ Backup ; une seule recharge ; `/access` relu
+  et relevé avant le lancement ; vérifiés par mutation).
+
 ## borgHelper 1.0.151 — _MEI orphelins en fin de selftest — 2026-09-29
 
 Chantier « reconstruction progressive », story 14 (rétrospective : A15 ; F24).
