@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.19.3 -->
+<!-- UI_VERSION: 1.19.4 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -258,15 +258,10 @@
         <div id="chartFileChangesMsg" class="hint" hidden></div>
         <canvas id="chartFileChanges" height="90"></canvas>
       </div>
-      <div style="margin-bottom:24px">
+      <div>
         <h3 style="margin:0 0 8px">Durée de sauvegarde</h3>
         <div id="chartDurationMsg" class="hint" hidden></div>
         <canvas id="chartDuration" height="90"></canvas>
-      </div>
-      <div>
-        <h3 style="margin:0 0 8px">Taille dédupliquée par archive</h3>
-        <div id="chartDedupSizeMsg" class="hint" hidden></div>
-        <canvas id="chartDedupSize" height="90"></canvas>
       </div>
     </div>
     <div class="card">
@@ -872,7 +867,9 @@ function _fmtBytes(n){
 
 let chartRepoSizeInstance=null, chartPruneGainInstance=null, chartArchiveSizeInstance=null;
 // Graphiques par archive supplémentaires (UI 1.13.0), tous alimentés par les mêmes lignes /archivehistory.
-const ARCHIVE_EXTRA_CHARTS=['chartFileChanges','chartDuration','chartDedupSize'];
+// UI 1.19.4 : « Taille dédupliquée par archive » retiré — doublon de la série deduplicated_size de chartArchiveSize
+// (légende cliquable : masquer original_size/compressed_size recadre l'axe).
+const ARCHIVE_EXTRA_CHARTS=['chartFileChanges','chartDuration'];
 const chartExtraInstances={};
 
 function _fmtDuration(sec){
@@ -1063,7 +1060,7 @@ function _renderArchiveSizeChart(r){
   });
 }
 
-// Un graphique par archive (fichiers modifiés / durée / taille dédupliquée) — archives sans valeur
+// Un graphique par archive (fichiers modifiés / durée) — archives sans valeur
 // (null : paire non indexée, statistique absente) laissées vides plutôt que comptées à zéro.
 function _renderArchiveExtraChart(id,r){
   if(chartExtraInstances[id]){ chartExtraInstances[id].destroy(); delete chartExtraInstances[id]; }
@@ -1096,17 +1093,10 @@ function _renderArchiveExtraChart(id,r){
       data:{labels,datasets:[{label:'Durée',data:rows.map(row=>num(row.duration)),backgroundColor:_fadeFor(rows,'#2b6cb0')}]},
       options:{responsive:true,scales:{y:{beginAtZero:true,ticks:{callback:v=>_fmtDuration(v)}}},
         plugins:{tooltip:{callbacks:{title:_prunedTitle(rows),label:ctx=>'Durée : '+_fmtDuration(ctx.parsed.y)}}}}};
-  } else {
-    empty=!rows.some(row=>row.deduplicated_size!=null);
-    cfg={type:'bar',
-      data:{labels,datasets:[{label:'Taille dédupliquée',data:rows.map(row=>num(row.deduplicated_size)),backgroundColor:_fadeFor(rows,'#b8860b')}]},
-      options:{responsive:true,scales:{y:{beginAtZero:true,ticks:{callback:v=>_fmtBytes(v)}}},
-        plugins:{tooltip:{callbacks:{title:_prunedTitle(rows),label:ctx=>'Dédupliquée : '+_fmtBytes(ctx.parsed.y)}}}}};
-  }
+  } else throw new Error('graphique par archive inconnu : '+id);   // jamais dessiné en « Durée » par défaut
   if(empty){
     const what={chartFileChanges:'Aucun comptage de fichiers modifiés enregistré — lancer un Index.',
-                chartDuration:'Aucune durée de sauvegarde enregistrée — lancer un Index.',
-                chartDedupSize:'Aucune taille dédupliquée enregistrée — lancer un Index.'}[id];
+                chartDuration:'Aucune durée de sauvegarde enregistrée — lancer un Index.'}[id];
     _showChartMsg(id+'Msg',id,what,false);
     return;
   }

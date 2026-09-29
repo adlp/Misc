@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.156"
+Version="1.0.157"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -11860,6 +11860,84 @@ def codec_selftest(pattern=None,list_only=False):
         else: check("rapprochement réel : borg delete du milieu puis de la plus ancienne + Index -> paires/FileHist sans archive absente, graphiques gardés (pruned)",_reconcile_real_borg)
         if shutil.which('borg') is None: skip("repo_stats capturé par Bkp/Prune sur un vrai dépôt borg","borg absent")
         else: check("repo_stats + mesures par archive : Bkp (avec et sans Index) puis Prune réels -> points bkp/bkp/prune, mesures écrites puis purgées",_repo_stats_real_borg)
+        def _inchanges_real_borg():
+            """1.0.157 (story 20, A25) : garde sur un VRAI dépôt borg jetable (jamais une copie) des faits de borg sur lesquels
+            repose « Inchangés » : nfiles (borg create --json) = entrées '-' de borg list (ni répertoires, ni lien, ni fifo) ;
+            un chmod seul -> 'modified' dans borg diff ; « Inchangés » de DiffTop = IdxTop = fichiers '-' de la nouvelle
+            archive sans added/modified dans borg diff ; exclus IDX_EXCLUDE comptés (5 : modifié, ajouté, supprimé,
+            répertoire ajouté et son fichier). Sans liens physiques (limite documentée). Isolé : variables BORG_* de
+            l'environnement retirées (BORG_CACHE_DIR… primeraient sur BORG_BASE_DIR), TMPDIR du selftest."""
+            d=os.path.join(tmp,'inchanges-reel'); src=os.path.join(d,'src'); bb=os.path.join(d,'bb'); repo=os.path.join(d,'repo')
+            for sub in ('a','a/b','logs'): os.makedirs(os.path.join(src,sub),exist_ok=True)
+            base={k:v for k,v in os.environ.items() if not k.startswith('BORG_')}
+            env=dict(base,BORG_PASSPHRASE='pw-in',BORG_RELOCATED_REPO_ACCESS_IS_OK='yes',BORG_BASE_DIR=bb,TMPDIR=tmp)
+            borg=shutil.which('borg'); errs=[]
+            def bg(*a,ok_codes=(0,)):
+                r=subprocess.run([borg,*a],env=env,capture_output=True,text=True,timeout=120)
+                if r.returncode not in ok_codes: raise RuntimeError(f"borg {a[0]} (code {r.returncode}) : {r.stderr[-300:]}")
+                if r.returncode: errs.append(r.stderr[-200:])
+                return r.stdout
+            bg('init','-e','repokey',repo)
+            for i in range(12):
+                with open(os.path.join(src,'a',f'f{i}'),'w') as f: f.write(f'{i}\n')
+            for pth,txt in (('a/b/g','g'),('logs/l0.log','0'),('logs/l1.log','l')):
+                with open(os.path.join(src,pth),'w') as f: f.write(txt)
+            os.chmod(os.path.join(src,'a/f2'),0o644)   # vrai changement de droits ensuite, quel que soit l'umask
+            try: os.symlink('a/f1',os.path.join(src,'lnk')); os.mkfifo(os.path.join(src,'fifo'))
+            except OSError as e: raise RuntimeError(f"lien ou fifo impossible sur ce système de fichiers ({tmp}) : {e}")
+            bg('create','--timestamp','2026-09-01T10:00:00',f'{repo}::t-1',src,ok_codes=(0,1))
+            time.sleep(1.1)   # ctime à la seconde sur certains systèmes de fichiers : le chmod doit le changer
+            with open(os.path.join(src,'a/f1'),'w') as f: f.write('changé\n')          # contenu modifié
+            os.chmod(os.path.join(src,'a/f2'),0o600)                                     # droits seuls
+            os.makedirs(os.path.join(src,'n')); os.makedirs(os.path.join(src,'logs/sub'))
+            for pth,txt in (('n/new','n'),('logs/l1.log','mod'),('logs/l2.log','new'),('logs/sub/x','x')):
+                with open(os.path.join(src,pth),'w') as f: f.write(txt)
+            os.remove(os.path.join(src,'logs/l0.log'))                                   # exclu supprimé
+            os.remove(os.path.join(src,'a/b/g')); os.rmdir(os.path.join(src,'a/b'))    # fichier et répertoire supprimés
+            os.remove(os.path.join(src,'lnk')); os.symlink('a/f3',os.path.join(src,'lnk'))   # lien changé
+            nfiles=json.loads(bg('create','--json','--timestamp','2026-09-02T10:00:00',f'{repo}::t-2',src,ok_codes=(0,1)))['archive']['stats']['nfiles']
+            listed=[json.loads(l) for l in bg('list','--json-lines',f'{repo}::t-2').splitlines()]
+            reg=[e['path'] for e in listed if e['type']=='-']
+            kinds={e['type'] for e in listed}
+            chg={}
+            for l in bg('diff','--json-lines',f'{repo}::t-1','t-2').splitlines():
+                o=json.loads(l); t=[c.get('type','') for c in o.get('changes',[])]
+                chg[o['path']]=next((x for x in ('added','removed','modified') if x in t),t[0] if t else '')
+            attendu=sum(1 for p in reg if chg.get(p) not in ('added','modified'))
+            chmod_mod=chg.get(os.path.join(src,'a/f2').lstrip('/'))=='modified'
+            w=os.path.join(d,'borgw')
+            with open(w,'w') as f:
+                f.write(f"#!/bin/bash\nunset BORG_CACHE_DIR BORG_CONFIG_DIR BORG_SECURITY_DIR BORG_KEYS_DIR\n"
+                        f"export BORG_BASE_DIR='{bb}'\nexec '{borg}' \"$@\"\n")
+            os.chmod(w,0o700)
+            rc=os.path.join(d,'rc')
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n\n[inr]\nBORG_REPO={repo}\nBORG_PASSPHRASE=pw-in\nSER_NAME=inr\n"
+                        f"SER_LOGIN=x\nGLOB_ARCH=t-*\nBORG_ARCHNAME=t\nBORG_ROOTBKP={src}\nEXCLUDE=--exclude-caches\nDB_ENCRYPT=false\n"
+                        f"BORG_EXE={w}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\nIDX_EXCLUDE=*/logs/*\n")
+            os.chmod(rc,0o600)
+            nodsn=os.path.join(d,'nodsn'); open(nodsn,'w').close()
+            cenv={k:v for k,v in base.items() if k not in ('BORGHELPERC_SENTRY_DSN','BORGHELPERC_RUNTIME_PASSPHRASE')}
+            cenv.update(BORGHELPERC_SENTRY_FILE=nodsn,BORG_BASE_DIR=bb,TMPDIR=tmp)   # jamais de Sentry réel ni de passphrase héritée
+            me=os.path.realpath(__file__)
+            def cli(*a):
+                p=subprocess.run([me,'-C',rc,'-c',*a],capture_output=True,text=True,timeout=300,env=cenv)
+                return p.returncode,p.stdout+p.stderr
+            ci,oi=cli('Index','-n','inr')
+            cd_,dt=cli('DiffTop','-n','inr','-b','t-1,t-2'); ct,it=cli('IdxTop','-n','inr')
+            m1=re.search(r'^Inchangés: (\d+)',dt,re.M); m2=re.search(r'^Inchangés par archive :\n(?:  .*\n)*?  t-2 : (\d+)',it,re.M)
+            got=(int(m1.group(1)) if m1 else None,int(m2.group(1)) if m2 else None)
+            ex=(re.search(r'^Exclus  : 5 entrées',dt,re.M) is not None,re.search(r'^Exclus  : 5 entrées',it,re.M) is not None)
+            ok=((ci,cd_,ct)==(0,0,0) and {'d','l','p'}<=kinds and nfiles==len(reg) and chmod_mod and 0<attendu<len(reg)
+                and got==(attendu,attendu) and ex==(True,True))
+            if not ok:
+                ver=subprocess.run([borg,'--version'],capture_output=True,text=True).stdout.strip()
+                print(f"  Inchangés réel ({borg}, {ver}) : codes Index/DiffTop/IdxTop {(ci,cd_,ct)} types {sorted(kinds)} nfiles {nfiles} "
+                      f"'-' {len(reg)} chmod->modified {chmod_mod} attendu {attendu} DiffTop/IdxTop {got} Exclus=5 {ex} "
+                      f"avertissements borg {errs} ; Index {oi[-150:]!r} ; DiffTop {dt[-300:]!r} ; IdxTop {it[-300:]!r}")
+            return ok
+        if shutil.which('borg') is None: skip("Inchangés sur vrai borg : nfiles = fichiers ordinaires, chmod seul = modified, DiffTop = IdxTop = décompte borg list et borg diff","borg absent")
+        else: check("Inchangés sur vrai borg : nfiles = fichiers ordinaires, chmod seul = modified, DiffTop = IdxTop = décompte borg list et borg diff",_inchanges_real_borg)
         check("_diff_entry_type (1.0.126) : type tiré de change_type (borg diff 1.2), tous les types de suppression reconnus",
               lambda: [_diff_entry_type(c,sb) for c,sb in (('added',None),('modified',1),('removed',3),('removed',0),('removed',None),
                        ('removed directory',None),('added link',None),('changed link',None),('removed fifo',None),

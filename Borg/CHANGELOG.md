@@ -1,5 +1,25 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.157 / UI 1.19.4 — garde « Inchangés » sur vrai borg, bargraphe retiré — 2026-09-29
+
+Chantier « reconstruction progressive », story 20 (actions de rétrospective A25, A26).
+
+- **UI : bargraphe « Taille dédupliquée par archive » retiré** (demande de l'utilisateur) : la série
+  `deduplicated_size` est déjà dans la courbe des tailles par archive. Il avait été ajouté (UI 1.13.0) parce que
+  l'échelle de la taille originale l'écrase sur cette courbe : cliquer sur `original_size` et `compressed_size` dans
+  la légende les masque et recadre l'axe (README).
+- **CodecSelfTest : garde sur un vrai dépôt borg jetable** (sauté sans borg) des faits dont dépend « Inchangés »
+  (1.0.156) : `nfiles` ne compte que les fichiers ordinaires (ni répertoires, ni lien, ni fifo) ; un `chmod` seul est
+  `modified` dans `borg diff` ; « Inchangés » de DiffTop et d'IdxTop égale le décompte `borg list` / `borg diff`
+  (répertoire ajouté et supprimé, lien changé, 5 exclus `IDX_EXCLUDE` : modifié, ajouté, supprimé, répertoire ajouté et
+  son fichier). Une nouvelle version de borg qui changerait ces comptes fait échouer le contrôle, avec le chemin et la
+  version du borg testé, et les sorties de DiffTop et IdxTop. Retour au comptage par familles dans DiffTop ou IdxTop
+  (indexés ou exclus) : détecté. Isolé : variables `BORG_*` de l'environnement retirées (`BORG_CACHE_DIR`… primeraient
+  sur `BORG_BASE_DIR`), `TMPDIR` du selftest, archives datées (`--timestamp`), attente d'une seconde avant le `chmod`
+  (ctime à la seconde sur certains systèmes de fichiers).
+- UI : une entrée inconnue de la liste des graphiques par archive lève une erreur (attrapée) au lieu d'être dessinée en
+  « Durée ».
+
 ## borgHelper 1.0.156 — Inchangés en fichiers ordinaires — 2026-09-29
 
 Chantier « reconstruction progressive », story 19 (actions de rétrospective A21, A23).

@@ -1760,10 +1760,11 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
      (chargés via `/repohistory`/`/archivehistory`) : taille du dépôt dans le temps
      (`unique_csize`/`total_size`/`total_csize`, un point par Bkp, Prune ou Index), gain Prune (delta
      calculé côté navigateur, jamais stocké), métriques par archive dans le temps
-     (`original_size`/`compressed_size`/`deduplicated_size`), et — UI ≥ 1.13.0 — trois graphiques
+     (`original_size`/`compressed_size`/`deduplicated_size` — cliquer sur `original_size` et `compressed_size`
+     dans la légende les masque et recadre l'axe sur la taille dédupliquée), et — UI ≥ 1.13.0 — deux graphiques
      par archive : **fichiers modifiés** (barres empilées ajoutés/modifiés/supprimés), **durée de
-     sauvegarde**, **taille dédupliquée** seule (lisible, contrairement au graphique précédent où
-     l'échelle de la taille originale l'écrase). Une archive sans valeur reste vide, jamais comptée à
+     sauvegarde** (UI 1.19.4 : le bargraphe « taille dédupliquée par archive », doublon de la courbe
+     précédente, est retiré). Une archive sans valeur reste vide, jamais comptée à
      zéro. UI ≥ 1.18.0 (borgHelper ≥ 1.0.140) : les archives supprimées du dépôt restent dans ces
      graphiques par archive pendant `STATS_RETENTION_MONTHS`, atténuées, infobulle « (supprimée) ». Nick sans historique ou sans Prune :
      message à la place du graphique concerné — un `Index` complète les données manquantes.
