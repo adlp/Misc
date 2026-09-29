@@ -357,6 +357,11 @@ for row in pending:
 # au-delà), None (history.db illisible — ne jamais le prendre pour une fin de Bkp).
 state = bh.db.bkp_running_state('mon-serveur', timeout_s=21600)
 
+# Dernière ligne du nick si elle est sans fin (Status) : {'run_id','started_at'}, sinon None (1.0.154 : un Bkp tué suivi
+# d'autres Bkp n'est plus rendu) ; avec timeout_s, clé 'stale' en plus — True au-delà du délai (Bkp tenu pour
+# interrompu, même condition que bkp_running_state) ; timeout_s < 1 : 21600, plafonné à 10 ans.
+row = bh.db.get_running_bkp_status('mon-serveur', timeout_s=21600)
+
 # Dernier Bkp du nick (1.0.152) : {'run_id','started_at','finished_at','result'} (finished_at None s'il tourne),
 # None sans ligne ou sans history.db (jamais créée) ; lève si la base est illisible.
 last = bh.db.last_bkp_status('mon-serveur')

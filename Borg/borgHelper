@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.153"
+Version="1.0.154"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -259,7 +259,20 @@ def _bkp_running_readable(started_at):
     started_local=started_utc+(datetime.now()-now_utc)
     total_min=int((now_utc-started_utc).total_seconds()//60)
     h,m=divmod(max(total_min,0),60)
-    return f"{started_local.strftime('%H:%M')} ({h}h{m:02d}min)"
+    fmt='%Y-%m-%d %H:%M' if total_min>=24*60 else '%H:%M'   # 1.0.154 : date au-delà de 24 h (Bkp interrompu ancien)
+    return f"{started_local.strftime(fmt)} ({h}h{m:02d}min)"
+
+_BKP_STATUS_TIMEOUT_MAX=10*365*86400   # au-delà, datetime('now','-N seconds') rend NULL (ligne tenue pour interrompue)
+
+def _bkp_status_timeout(value=None):
+    """Délai (s) au-delà duquel un Bkp sans fin est tenu pour interrompu (1.0.154, story 17) : même variable et même
+    lecture que BKP_STATUS_TIMEOUT de borgHelperWWW (AD-7), plafonnée à 10 ans. Le watcher, /access et Status disent la
+    même chose tant qu'ils voient la même valeur : la variable se lit dans l'environnement de chaque processus (celui du
+    service pour borgHelperWWW, celui du shell ou du cron pour Status). value : valeur à valider au lieu de la variable."""
+    try:
+        t=int(os.environ.get('BORGHELPERWWW_BKP_STATUS_TIMEOUT','21600') if value is None else value)
+        return min(t,_BKP_STATUS_TIMEOUT_MAX) if t>=1 else 21600
+    except (ValueError,TypeError): return 21600
 
 def prettyTabelise(tab):
     from prettytable import PrettyTable
@@ -2628,21 +2641,29 @@ class BorgHelperDB:
         try: return self._with_lock_retry(_do)
         except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
 
-    def get_running_bkp_status(self,nick,db_path=None):
+    def get_running_bkp_status(self,nick,db_path=None,timeout_s=None):
         """Ligne bkp_status la plus récente encore en cours (finished_at IS NULL) pour ce nick, s'il y
         en a une (normalement 0 ou 1, jamais plus — un seul Bkp actif à la fois par nick via
         priority.lock). Lecture seule, aucune réclamation — utilisée par la commande Status (100%
-        locale, jamais d'appel boex)."""
+        locale, jamais d'appel boex). 1.0.154 (story 17) : seulement si c'est la dernière ligne du nick (même ordre que
+        last_bkp_status) — un Bkp tué suivi d'autres Bkp n'est plus rendu. timeout_s : ajoute 'stale' — True si la ligne
+        a démarré depuis plus de timeout_s secondes (même condition que bkp_running_state : Bkp tenu pour interrompu) ;
+        validé comme la variable (< 1 : 21600, plafond 10 ans)."""
         db_path=self._hist(nick,db_path)
         if db_path is None: return None
         # Garde AD-12 : _hist rend None si history.db n'existe pas — _open_db créerait sinon le fichier (O_CREAT).
         conn=None
         try:
             conn=_open_db(db_path,nick=None,role='read')
+            t=_bkp_status_timeout(timeout_s) if timeout_s is not None else 0
             row=conn.execute(
-                "SELECT run_id,started_at FROM bkp_status WHERE nick=? AND finished_at IS NULL "
-                "ORDER BY started_at DESC LIMIT 1",(nick,)).fetchone()
-            return {'run_id':row[0],'started_at':row[1]} if row else None
+                "SELECT run_id,started_at,finished_at,COALESCE(started_at >= datetime('now',?),0) FROM bkp_status "
+                "WHERE nick=? ORDER BY started_at DESC, rowid DESC LIMIT 1",(f"-{t} seconds",nick)).fetchone()
+            if not row or row[2] is not None: return None
+            row=(row[0],row[1],row[3])
+            r={'run_id':row[0],'started_at':row[1]}
+            if timeout_s is not None: r['stale']=not row[2]
+            return r
         except (sqlite3.Error,DbKeyError,DbModeError,DbCodecError):
             # base absente/jamais indexée, migrating (AD-11), chiffrée sans passphrase résolue, etc. —
             # Status reste 100% best-effort : une anomalie sur bkp_status ne doit jamais faire échouer
@@ -5028,7 +5049,7 @@ class BorgHelper:
         un borg diff tué à l'échéance qui sortait en code 1 sans sortie. Marqueur db_meta zero_pairs_rechecked:<nick>
         (bases partagées par DB_NAME) ; base occupée (une tentative, 2 s au plus : jamais d'attente sous le budget d'une
         tranche ni devant un Bkp) ou illisible : reporté, jamais l'échec de l'Index. Rend N. Une paire vidée par un
-        IdxPurge -x d'avant 1.0.153 (sans exclu enregistré) est refaite aussi : relancer l'IdxPurge."""
+        IdxPurge -x d'avant 1.0.154 (sans exclu enregistré) est refaite aussi : relancer l'IdxPurge."""
         key=f"zero_pairs_rechecked:{nick}"
         if self._db_meta_value(db_path,key): return 0
         def _do():
@@ -6221,7 +6242,7 @@ class BorgHelper:
         printer(f"Indexés : {total_count:,} entrées · {convert_octets_readable(total_size)}")
         if exclu_n:
             exclu_detail=' · '.join(f"{s}{exclu_by_ct[ct][0]:,}" for ct,s in [('added','+'),('removed','-'),('modified','=')] if ct in exclu_by_ct)
-            printer(f"Exclus  : {exclu_n:,} entrées · {convert_octets_readable(exclu_sz)} (IDX_EXCLUDE) — {exclu_detail}")
+            printer(f"Exclus  : {exclu_n:,} entrées · {convert_octets_readable(exclu_sz)} (IDX_* / IdxPurge) — {exclu_detail}")
         archives_with_nfiles=sorted(arch for arch in nfiles_d if arch in idx_am_d or arch in exclu_am_d)
         if archives_with_nfiles:
             printer("Inchangés par archive :")
@@ -6387,7 +6408,10 @@ class BorgHelper:
                 pass
             finally:
                 if conn is not None: conn.close()
-        bkp_running=self.db.get_running_bkp_status(nick)   # history.db (1.0.139)
+        # history.db (1.0.139). 1.0.154 (story 17) : au-delà du délai de /access, Bkp interrompu (bkp_stale), plus « en cours »
+        bkp_row=self.db.get_running_bkp_status(nick,timeout_s=_bkp_status_timeout())
+        bkp_running=bkp_row if bkp_row and not bkp_row['stale'] else None
+        bkp_stale=bkp_row if bkp_row and bkp_row['stale'] else None
         rebuild=None   # fantôme (1.0.143, AD-10) : son build_state, lu sans codec ni borg ; {'state':'partial'} s'il n'en a pas
         sp=db_path+_SHADOW_SUFFIX
         if _db_has_schema(sp):   # jamais _open_db (O_CREAT) sur un fantôme que la bascule vient de supprimer
@@ -6398,6 +6422,7 @@ class BorgHelper:
             'nick':nick,
             'last_backup':last_backup,
             'bkp_running':{'started_at':bkp_running['started_at']} if bkp_running else None,
+            'bkp_stale':{'started_at':bkp_stale['started_at']} if bkp_stale else None,
             'priority_op_running':bool(self.db.check_priority_lock(nick)),
             'build':build,
             'rebuild':rebuild,
@@ -6421,11 +6446,18 @@ class BorgHelper:
             try: readable=_bkp_running_readable(st['bkp_running']['started_at'])
             except (ValueError,TypeError): readable=st['bkp_running']['started_at']
             printer(f"  Bkp en cours depuis {readable}")
-        elif st['priority_op_running']:
+        elif st.get('bkp_stale'):
+            try: readable=_bkp_running_readable(st['bkp_stale']['started_at'])
+            except (ValueError,TypeError): readable=st['bkp_stale']['started_at']
+            t=_bkp_status_timeout()
+            printer(f"  Bkp sans fin depuis {readable} — probablement interrompu "
+                    f"(délai {f'{t//3600} h' if t%3600==0 else f'{t} s'} dépassé)")
+        if st['priority_op_running'] and not st['bkp_running']:
             # Ambiguïté assumée (Boundaries spec-status-cli-etat-rapide) : les fichiers priority.lock ne disent
             # pas quelle opération (Restore, Prune ou DelBkp) les tient. Affiché seulement si aucun Bkp détecté (sinon redondant : le Bkp
             # lui-même tient ce lock).
-            printer("  Opération prioritaire en cours (Restore, Prune ou DelBkp)")
+            printer("  Opération prioritaire en cours (Bkp peut-être toujours actif, Restore, Prune ou DelBkp)" if st.get('bkp_stale')
+                    else "  Opération prioritaire en cours (Restore, Prune ou DelBkp)")
         b=st.get('build') or {}
         if b.get('state')=='partial':
             extra=''
@@ -6455,7 +6487,7 @@ class BorgHelper:
                 # Isolation par nick : une anomalie sur UN nick (base chiffrée sans passphrase, base
                 # 'migrating' AD-11, erreur SQLite non prévue…) ne doit jamais faire échouer tout
                 # l'appel -n ALL/multi-nick — c'est précisément le cas d'usage principal de Status.
-                results.append({'nick':n,'last_backup':None,'bkp_running':None,
+                results.append({'nick':n,'last_backup':None,'bkp_running':None,'bkp_stale':None,
                                  'priority_op_running':False,'build':None,'rebuild':None,'error':str(e)})
         if as_json:
             # Toujours une liste (même à un seul nick) : Status supporte nativement ALL/multi-nick,
@@ -6550,8 +6582,6 @@ class BorgHelper:
         except sqlite3.Error as e:
             _close_quiet(conn)
             printer(f"  SQLite error ({db_path}): {e}"); return
-        if not total_count:
-            printer(f"  {nick}: aucune entrée pour cette paire ({arch_old} → {arch_new})"); return
         conn3=None
         try:
             conn3=_open_db(db_path,nick=nick,role='read',timeout=60)
@@ -6563,6 +6593,8 @@ class BorgHelper:
             nfiles_new=nfiles_row[0] if nfiles_row and nfiles_row[0] else None
         except sqlite3.Error:
             _close_quiet(conn3); exclu_by_ct3={}; exclu_n=0; exclu_sz=0; nfiles_new=None
+        if not total_count and not exclu_n:   # 1.0.154 : paire vidée par IdxPurge -> ses exclus restent affichés
+            printer(f"  {nick}: aucune entrée pour cette paire ({arch_old} → {arch_new})"); return
         top=sorted(stats.items(),key=lambda x:x[1]['total'],reverse=True)[:topn]
         from prettytable import PrettyTable
         t=PrettyTable()
@@ -6590,11 +6622,11 @@ class BorgHelper:
         printer(f"Indexés : {total_count:,} changements · {convert_octets_readable(total_size)}")
         if exclu_n:
             exclu_detail3=' · '.join(f"{s}{exclu_by_ct3[ct][0]:,}" for ct,s in [('added','+'),('removed','-'),('modified','=')] if ct in exclu_by_ct3)
-            printer(f"Exclus  : {exclu_n:,} entrées · {convert_octets_readable(exclu_sz)} (IDX_EXCLUDE) — {exclu_detail3}")
+            printer(f"Exclus  : {exclu_n:,} entrées · {convert_octets_readable(exclu_sz)} (IDX_* / IdxPurge) — {exclu_detail3}")
         if unchanged is not None:
             pct_unch=f" ({100*unchanged//nfiles_new}%)" if nfiles_new>0 else ""
             printer(f"Inchangés: {unchanged:,}{pct_unch} sur {nfiles_new:,} fichiers dans {arch_new}")
-        printer(str(t))
+        if total_count: printer(str(t))
 
     def _snapurge_check(self,nick,conn,keep):
         archives=sorted([r[0] for r in conn.execute(
@@ -6698,11 +6730,13 @@ class BorgHelper:
                 elif includes:
                     inc=_py_match(includes); pred=lambda p: not inc(p); nar=None
                 else: pred=_py_match(excludes); nar=_narrow(conn,excludes)
-                q="SELECT id,path,COALESCE(size_after,size_before,0) FROM diff_index WHERE nick=?"; qa=[nick]
+                q=("SELECT id,path,COALESCE(size_after,size_before,0),archive_old,archive_new,change_type,"
+                   "COALESCE(NULLIF(size_after,0),size_before,0) FROM diff_index WHERE nick=?"); qa=[nick]
                 if nar is not None: q+=" AND ("+nar[0]+")"; qa+=nar[1]
-                ids=[]
-                for rid,sp,sz in conn.execute(q,qa):
-                    if pred(_path_decode(conn,sp)): ids.append(rid); size+=sz or 0
+                ids=[]; meta={}
+                for rid,sp,sz,a_old,a_new,ct,xsz in conn.execute(q,qa):
+                    if pred(_path_decode(conn,sp)):
+                        ids.append(rid); size+=sz or 0; meta[rid]=(a_old,a_new,ct,xsz or 0,sp)
                 count=len(ids)
             if sql_where:
                 row=conn.execute(
@@ -6725,8 +6759,30 @@ class BorgHelper:
                 printer(f"  {nick}: dry-run — aucune modification")
                 conn.close(); return
             if count:
-                if ids is not None: conn.executemany("DELETE FROM diff_index WHERE id=?",[(rid,) for rid in ids])  # chiffré : suppression par id
-                else: conn.execute(f"DELETE FROM diff_index WHERE {sql_where}",params)
+                # Agrégat des exclus et DELETE sous le même verrou d'écriture (revue story 17) : un Index ou un autre IdxPurge
+                # concurrent ne fait ni compter une ligne non supprimée, ni supprimer une ligne non comptée.
+                conn.execute("BEGIN IMMEDIATE")
+                if ids is None:   # plain : agrégat SQL, puis DELETE
+                    exclu={(a_old,a_new,ct):[n,xsz or 0] for a_old,a_new,ct,n,xsz in conn.execute(
+                        "SELECT archive_old,archive_new,change_type,COUNT(*),SUM(COALESCE(NULLIF(size_after,0),size_before,0)) "
+                        f"FROM diff_index WHERE {sql_where} GROUP BY archive_old,archive_new,change_type",params)}
+                    count=conn.execute(f"DELETE FROM diff_index WHERE {sql_where}",params).rowcount
+                else:             # chiffré : suppression par id ; seules les lignes réellement supprimées comptent
+                    exclu={}; count=0
+                    for rid in ids:   # même ligne qu'à la sélection (un id libéré peut être réattribué entre-temps)
+                        a_old,a_new,ct,xsz,sp=meta[rid]
+                        if conn.execute("DELETE FROM diff_index WHERE id=? AND nick=? AND archive_old=? AND archive_new=? "
+                                        "AND change_type=? AND path=?",(rid,nick,a_old,a_new,ct,sp)).rowcount:
+                            count+=1
+                            e=exclu.setdefault((a_old,a_new,ct),[0,0]); e[0]+=1; e[1]+=xsz
+                # 1.0.154 (story 17) : les entrées retirées rejoignent les exclus de leur paire (nombre + taille par type,
+                # taille comme à l'Index : size_after or size_before) — stats de Report et IdxStats inchangées, et une paire
+                # vidée n'est plus « 0 entrée sans exclu » (indiscernable d'une paire vide à tort, révision de 1.0.153).
+                conn.executemany(
+                    "INSERT INTO diff_excluded_stats (nick,archive_old,archive_new,change_type,file_count,total_size) "
+                    "VALUES (?,?,?,?,?,?) ON CONFLICT(nick,archive_old,archive_new,change_type) DO UPDATE SET "
+                    "file_count=file_count+excluded.file_count,total_size=total_size+excluded.total_size",
+                    [(nick,a_old,a_new,ct,n,xsz) for (a_old,a_new,ct),(n,xsz) in exclu.items()])
                 conn.execute("""UPDATE diff_indexed_pairs SET entry_count=(
                     SELECT COUNT(*) FROM diff_index di
                     WHERE di.nick=diff_indexed_pairs.nick
@@ -8358,14 +8414,28 @@ def codec_selftest(pattern=None,list_only=False):
             c=_open_db(bhq.db.get_diff_db(nick),nick=nick)
             r=sorted((_path_decode(c,p),an,ct) for p,an,ct in c.execute("SELECT path,archive_new,change_type FROM diff_index WHERE nick=?",(nick,)))
             c.close(); return r
+        def _purge_exclu(nick):
+            c=_open_db(bhq.db.get_diff_db(nick),nick=nick)
+            r=sorted(c.execute("SELECT archive_old,archive_new,change_type,file_count,total_size FROM diff_excluded_stats WHERE nick=?",(nick,)))
+            c.close(); return r
         def _purge_same(pattern=None,extra='',dry=False):
-            _q_rc(extra); outs=[]; rows=[]
+            # 1.0.154 (story 17) : les entrées retirées rejoignent les exclus de leur paire (taille comme à l'Index), mêmes
+            # lignes en plain et chiffré, rien en dry-run ; stats de Report (_diff_stats_for_nick) inchangées par la purge.
+            _q_rc(extra); outs=[]; rows=[]; exs=[]; stats_ok=True
             for nk,enc_ in (('qp',False),('qe',True)):
-                _q_build(nk,enc_)
+                _q_build(nk,enc_); st0=bhq.db._diff_stats_for_nick(nk)
                 outs.append(re.sub(r'compactage[^\n]*','',_q_run(bhq.idxpurge,nk,pattern,dry).replace(nk,'NICK')))
-                rows.append(_purge_rows(nk))
+                rows.append(_purge_rows(nk)); exs.append(_purge_exclu(nk))
+                stats_ok=stats_ok and bool(st0) and bhq.db._diff_stats_for_nick(nk)==st0
             _q_rc()
-            return outs[0]==outs[1] and rows[0]==rows[1] and (dry or len(rows[0])<len(_diff)) and 'aucune entrée' not in outs[0]
+            left=list(rows[0]); exp={}
+            for ao,an,dn,ct,p,sb,sa in _diff:
+                if (p,an,ct) in left: left.remove((p,an,ct)); continue
+                e=exp.setdefault((ao,an,ct),[0,0]); e[0]+=1; e[1]+=sa or sb or 0
+            exclu_ok=stats_ok and exs[0]==exs[1]==([] if dry else sorted((ao,an,ct,n,z) for (ao,an,ct),(n,z) in exp.items()))
+            if not exclu_ok: print(f"  IdxPurge exclus {pattern!r} {extra!r} : stats={stats_ok} {exs} attendu {exp}")
+            return (outs[0]==outs[1] and rows[0]==rows[1] and (dry or len(rows[0])<len(_diff)) and 'aucune entrée' not in outs[0]
+                    and exclu_ok)
         for pat in ('home/*','*.tmp','etc','home/u','a%b','*/x/*','x','éa/*','[eh]*','bin/*'):
             check(f"parité IdxPurge -x {pat!r}",lambda pat=pat: _purge_same(pat))
         check("parité IdxPurge -x etc -D (dry-run : rien supprimé)",lambda: _purge_same('etc',dry=True))
@@ -8375,6 +8445,77 @@ def codec_selftest(pattern=None,list_only=False):
                   (_q_build('qe',True) or _q_run(bhq.idxpurge,'qe','/etc',False).replace('qe','NICK')),_purge_rows('qe')))()))
         for ex in ('IDX_EXCLUDE=*.tmp etc/sub','IDX_INCLUDE=etc home','IDX_INCLUDE=etc home/*\nIDX_EXCLUDE=*.tmp Etc','IDX_EXCLUDE=a%%b','IDX_EXCLUDE=/etc *.tmp'):
             check(f"parité IdxPurge IDX_* ({ex.splitlines()[0]}…)",lambda ex=ex: _purge_same(None,ex))
+        def _purge_exclu_merge():
+            """1.0.154 (story 17) : exclus existants additionnés (jamais remplacés) ; paire entièrement vidée : entry_count 0,
+            exclus = entrées retirées, jamais reprise par la révision des paires vides de 1.0.153 (plain et chiffré)."""
+            ok=True
+            for nk,enc_ in (('qp',False),('qe',True)):
+                _q_build(nk,enc_)
+                c=_open_db(bhq.db.get_diff_db(nk),nick=nk,role='write')
+                c.execute("INSERT INTO diff_excluded_stats VALUES(?,?,?,'removed',3,30)",(nk,A1,A2)); c.commit(); c.close()
+                _q_run(bhq.idxpurge,nk,'x',False)                      # x/gone : removed, A1->A2, 1 octet
+                merged=_purge_exclu(nk)==[(A1,A2,'removed',4,31)]
+                c=_open_db(bhq.db.get_diff_db(nk),nick=nk,role='write')   # taille après nulle : taille avant, comme à l'Index
+                c.execute("INSERT INTO diff_index(nick,archive_old,archive_new,archive_new_date,change_type,path,size_before,size_after) "
+                          "VALUES(?,?,?,?,'modified',?,5,0)",(nk,A1,A2,D2,c.codec.path.encode('zz/zero') if c.codec else 'zz/zero'))
+                # paire (A1,A3) au même archive_new qu'une autre (A2,A3) : sa propre ligne d'exclus (GROUP BY complet)
+                c.execute("INSERT INTO diff_index(nick,archive_old,archive_new,archive_new_date,change_type,path,size_before,size_after) "
+                          "VALUES(?,?,?,?,'added',?,NULL,7)",(nk,A1,A3,D3,c.codec.path.encode('zz/a13') if c.codec else 'zz/a13'))
+                c.execute("INSERT INTO diff_index(nick,archive_old,archive_new,archive_new_date,change_type,path,size_before,size_after) "
+                          "VALUES(?,?,?,?,'added',?,NULL,9)",(nk,A2,A3,D3,c.codec.path.encode('zz/a23') if c.codec else 'zz/a23'))
+                c.commit(); c.close()
+                sz0=bhq.db._diff_stats_for_nick(nk)[A2]['modified_sz']
+                _q_run(bhq.idxpurge,nk,'zz',False)
+                # exception documentée : modified à taille après nulle -> taille avant comptée (formule de l'Index)
+                merged=(merged and _purge_exclu(nk)==[(A1,A2,'modified',1,5),(A1,A2,'removed',4,31),(A1,A3,'added',1,7),(A2,A3,'added',1,9)]
+                        and bhq.db._diff_stats_for_nick(nk)[A2]['modified_sz']==sz0+5)
+                _q_rc('IDX_INCLUDE=zzz'); _q_run(bhq.idxpurge,nk,None,False); _q_rc()   # tout retiré : les deux paires vidées
+                c=_open_db(bhq.db.get_diff_db(nk),nick=nk)
+                pairs=sorted(c.execute("SELECT archive_old,archive_new,entry_count FROM diff_indexed_pairs WHERE nick=?",(nk,)))
+                left=c.execute("SELECT COUNT(*) FROM diff_index WHERE nick=?",(nk,)).fetchone()[0]; c.close()
+                tot={}
+                for ao,an,dn,ct,p,sb,sa in _diff: tot[(an,ct)]=tot.get((an,ct),0)+1
+                tot[(A2,'removed')]+=3; tot[(A2,'modified')]+=1; tot[(A3,'added')]+=2   # exclus posés à la main, zz/zero, zz/a13, zz/a23
+                ex={}
+                for ao,an,ct,n,z in _purge_exclu(nk): ex[(an,ct)]=ex.get((an,ct),0)+n
+                dt=_q_run(bhq.difftop,nk,f"{A1},{A2}")   # paire vidée : exclus affichés, jamais « aucune entrée »
+                dt_ok='aucune entrée' not in dt and re.search(r'Exclus  : 1[45] entrées .*\(IDX_\* / IdxPurge\)',dt) is not None
+                n_re=bhq._recheck_zero_pairs(nk,bhq.db.get_diff_db(nk))
+                c=_open_db(bhq.db.get_diff_db(nk),nick=nk)
+                kept=c.execute("SELECT COUNT(*) FROM diff_indexed_pairs WHERE nick=?",(nk,)).fetchone()[0]; c.close()
+                one=(merged and left==0 and pairs==[(A1,A2,0),(A2,A3,0)] and ex==tot and n_re==0 and kept==2 and dt_ok)
+                if not one: print(f"  IdxPurge exclus {nk} : merged={merged} left={left} {pairs} {ex} / {tot} recheck={n_re} kept={kept} {dt!r}")
+                ok=ok and one
+            return ok
+        check("IdxPurge : exclus existants additionnés, paire vidée = exclus des entrées retirées, jamais reprise par la révision (1.0.153)",_purge_exclu_merge)
+        def _purge_race():
+            """Revue story 17 : une ligne visée supprimée par un autre processus entre la sélection et la purge n'est ni
+            comptée en exclu ni annoncée supprimée (agrégat et DELETE sous BEGIN IMMEDIATE ; chiffré : lignes réellement
+            supprimées seulement) — plain et chiffré."""
+            real=_open_db; ok=True
+            class _Race:
+                def __init__(self,c,hook): self._c=c; self._h=hook
+                def __getattr__(self,k): return getattr(self._c,k)
+                def execute(self,q,*a):
+                    if q=="BEGIN IMMEDIATE" and self._h: h=self._h; self._h=None; h()
+                    return self._c.execute(q,*a)
+            for nk,enc_ in (('qp',False),('qe',True)):
+                _q_build(nk,enc_); dp=bhq.db.get_diff_db(nk); fired=[]
+                def _other():
+                    c=real(dp,nick=nk,role='write')
+                    c.execute("DELETE FROM diff_index WHERE nick=? AND archive_new=? AND change_type='removed' AND path=?",
+                              (nk,A2,c.codec.path.encode('etc/gone.conf') if c.codec else 'etc/gone.conf'))
+                    c.commit(); c.close(); fired.append(1)
+                def _fake(path,*a,**k):
+                    c=real(path,*a,**k)
+                    return _Race(c,_other) if path==dp and k.get('role')=='write' and not fired else c
+                with mock.patch.dict(globals(),{'_open_db':_fake}): out=_q_run(bhq.idxpurge,nk,'etc',False)
+                one=(bool(fired) and '3 entrées diff supprimées' in out
+                     and _purge_exclu(nk)==[(A1,A2,'added',1,4),(A1,A2,'modified',1,2),(A2,A3,'modified',1,3)])
+                if not one: print(f"  IdxPurge concurrent {nk} : fired={fired} {_purge_exclu(nk)} {out[-300:]!r}")
+                ok=ok and one
+            return ok
+        check("IdxPurge : ligne retirée par un autre processus entre sélection et purge -> ni comptée en exclu ni annoncée (plain et chiffré)",_purge_race)
         def _tamper():
             _q_build('qe',True)
             c=_open_db(bhq.db.get_diff_db('qe'),nick='qe',role='write')
@@ -8733,6 +8874,70 @@ def codec_selftest(pattern=None,list_only=False):
                     with contextlib.suppress(OSError): os.unlink(bhq.db._priority_lock_path(nk))
                 _q_rc()
         check("Status : dernier backup présent/absent, Bkp en cours, opération prioritaire seule (sans redondance), -n multi/ALL en JSON",_status_mixed_states_ok)
+        def _status_stale_ok():
+            """1.0.154 (story 17) : Bkp sans fin plus vieux que BORGHELPERWWW_BKP_STATUS_TIMEOUT (défaut 6 h, invalide ou < 1 :
+            défaut — même lecture que /access) -> bkp_running null, bkp_stale {started_at}, « probablement interrompu », jamais
+            « en cours » ; l'opération prioritaire reste affichée (texte et JSON)."""
+            nk='qstold'
+            with open(qrc,'a') as f:
+                f.write(f"[{nk}]\nBORG_REPO=/r-old\nBORG_PASSPHRASE=pw\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n\n")
+            os.chmod(qrc,0o600)
+            lp=bhq.db._priority_lock_path(nk); hp=bhq.db.get_history_db(nk); V='BORGHELPERWWW_BKP_STATUS_TIMEOUT'
+            def _age(sec):
+                c=sqlite3.connect(hp)
+                c.execute(f"UPDATE bkp_status SET started_at=datetime('now','-{sec} seconds') WHERE nick=?",(nk,)); c.commit(); c.close()
+            def _env(var):
+                env={k:v for k,v in os.environ.items() if k!=V}
+                if var is not None: env[V]=var
+                return mock.patch.dict(os.environ,env,clear=True)
+            try:
+                bhq.db.ensure_diff_db(bhq.db.get_diff_db(nk)); bhq.db.store_bkp_status_start(nk,'runOld')
+                bad=[]
+                for var,sec,stale,delai in ((None,600,False,''),(None,7*3600,True,'délai 6 h dépassé'),('60',120,True,'délai 60 s dépassé'),
+                                            ('60',30,False,''),('7200',3*3600,True,'délai 2 h dépassé'),('abc',7*3600,True,'délai 6 h'),
+                                            ('abc',3600,False,''),('0',3600,False,''),('-5',3600,False,''),('-5',7*3600,True,'délai 6 h'),
+                                            (str(10**12),7*3600,False,'')):
+                    _age(sec)
+                    with _env(var): st=bhq._status_one(nk); txt=_q_run(bhq.status,nk)
+                    if not ((st['bkp_stale'] is not None)==stale and (st['bkp_running'] is None)==stale
+                            and ('probablement interrompu' in txt)==stale and ('Bkp en cours' in txt)!=stale
+                            and delai in txt): bad.append((var,sec,st,txt))
+                # API : timeout_s validé comme la variable (négatif -> 6 h, démesuré -> plafonné, jamais « tout interrompu »)
+                _age(3600)
+                api_ok=(bhq.db.get_running_bkp_status(nk,timeout_s=-5)['stale'] is False
+                        and bhq.db.get_running_bkp_status(nk,timeout_s=10**12)['stale'] is False)
+                with open(lp,'w') as f: f.write(str(os.getppid()))
+                _age(600)   # Bkp vivant qui tient le verrou : pas de ligne « opération prioritaire » redondante
+                with _env(None): txt_live=_q_run(bhq.status,nk)
+                live_ok='Bkp en cours depuis' in txt_live and 'Opération prioritaire' not in txt_live
+                _age(7*3600)
+                with _env(None): txt=_q_run(bhq.status,nk); js=json.loads(_q_run(bhq.status,nk,as_json=True))[0]
+                both=('probablement interrompu (délai 6 h dépassé)' in txt
+                      and 'Opération prioritaire en cours (Bkp peut-être toujours actif' in txt
+                      and txt.index('probablement interrompu')<txt.index('Opération prioritaire')
+                      and re.search(r'Bkp sans fin depuis \d\d:\d\d \(7h0\dmin\)',txt) is not None)
+                json_ok=(js['bkp_running'] is None and bool((js.get('bkp_stale') or {}).get('started_at'))
+                         and js['priority_op_running'] is True)
+                os.unlink(lp)
+                _age(30*3600)   # au-delà de 24 h : date affichée
+                with _env(None): txt30=_q_run(bhq.status,nk)
+                date_ok=re.search(r'Bkp sans fin depuis \d{4}-\d\d-\d\d \d\d:\d\d \(30h0\dmin\)',txt30) is not None
+                # Bkp tué suivi d'un Bkp fini : plus rien (ni en cours ni interrompu) ; suivi d'un Bkp qui tourne : en cours
+                bhq.db.store_bkp_status_start(nk,'runNext'); bhq.db.store_bkp_status_finish(nk,'runNext','success')
+                with _env(None): st_n=bhq._status_one(nk); txt_n=_q_run(bhq.status,nk)
+                next_ok=(st_n['bkp_running'] is None and st_n['bkp_stale'] is None and 'Bkp' not in txt_n
+                         and bhq.db.get_running_bkp_status(nk) is None)
+                bhq.db.store_bkp_status_start(nk,'runLive')
+                with _env(None): st_l=bhq._status_one(nk)
+                next_ok=next_ok and st_l['bkp_running'] is not None and st_l['bkp_stale'] is None
+                ok=not bad and api_ok and live_ok and both and json_ok and date_ok and next_ok
+                if not ok: print(f"  Status interrompu : api={api_ok} live={live_ok} {txt_live!r} date={date_ok} {txt30!r} next={next_ok} {txt_n!r}")
+                if not ok: print(f"  Status interrompu : {bad} {txt!r} {js}")
+                return ok
+            finally:
+                with contextlib.suppress(OSError): os.unlink(lp)
+                _q_rc()
+        check("Status : Bkp sans fin au-delà de BORGHELPERWWW_BKP_STATUS_TIMEOUT -> interrompu (bkp_stale), jamais en cours ; délai réglé/invalide ; opération prioritaire affichée",_status_stale_ok)
         def _status_nokey():
             """1.0.145 (story 8 R9) : diff.db chiffrée sans clé (DbKeyError) ou en migration (DbModeError) -> last_backup
             {error}, build None, mais bkp_running, rebuild et priority_op_running toujours lus (sans clé)."""
@@ -8800,7 +9005,8 @@ def codec_selftest(pattern=None,list_only=False):
                 out2=_q_run(bhq.status,'qp,qstboom',as_json=True)
                 arr2=json.loads(out2)
                 isolation_ok=(len(arr2)==2 and any(r.get('error')=='boom simulé' and r['nick']=='qstboom' for r in arr2)
-                              and any(r['nick']=='qp' and 'error' not in r for r in arr2))
+                              and any(r['nick']=='qp' and 'error' not in r for r in arr2)
+                              and {k for r in arr2 for k in r if r['nick']=='qstboom'}=={k for r in arr2 for k in r if r['nick']=='qp'}|{'error'})
             finally:
                 bhq._status_one=orig_one
             return age_ok and elapsed_ok and hhmm_ok and nocreate_ok and err_print_ok and isolation_ok

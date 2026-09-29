@@ -1,5 +1,37 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.154 — Status sans Bkp fantôme, IdxPurge trace ses exclus — 2026-09-29
+
+Chantier « reconstruction progressive », story 17 (reports des stories 8 et 16).
+
+- **`Status` : un Bkp tué n'est plus « en cours »**. Une ligne `bkp_status` sans fin, démarrée depuis plus de
+  `BORGHELPERWWW_BKP_STATUS_TIMEOUT` (défaut 6 h, même lecture que borgHelperWWW : invalide ou < 1 → défaut), s'affiche
+  `Bkp sans fin depuis HH:MM (XhYYmin) — probablement interrompu (délai 6 h dépassé)`. Avant, `Status` affichait
+  « Bkp en cours » sans limite, alors que `/access` (1.28.1) et le watcher le tenaient déjà pour fini en échec. JSON :
+  `bkp_running` vaut alors `null` et le nouveau champ `bkp_stale` porte `{started_at}` (`null` sinon). Un Bkp interrompu
+  n'empêche plus la ligne « Opération prioritaire en cours » (libellée « Bkp peut-être toujours actif, Restore, Prune ou
+  DelBkp »). Un vrai Bkp de plus de 6 h est affiché « probablement interrompu », comme le watcher le notifie en échec au
+  même moment. Seule la dernière ligne du nick compte : un Bkp tué suivi d'autres Bkp n'est plus affiché du tout. Date
+  affichée au-delà de 24 h. La variable se lit dans l'environnement de `Status` (shell, cron), pas dans celui du
+  service. `get_running_bkp_status` ne rend plus que la dernière ligne du nick si elle est ouverte, et prend un
+  `timeout_s` optionnel (clé `stale`, validé comme la variable, plafonné à 10 ans).
+- **`IdxPurge` enregistre ce qu'il retire** : les entrées supprimées de `diff_index` rejoignent les exclus de leur paire
+  (`diff_excluded_stats`, nombre et taille par type de changement, taille comme à l'Index : taille après, sinon taille
+  avant), ajoutés aux exclus déjà présents. Conséquences : la colonne `modifications` de Report, ArchiveHistory et
+  IdxStats ne changent plus après une purge (les fichiers purgés comptent comme exclus ; seule exception, un fichier
+  `modified` dont la taille après vaut 0 compte ensuite sa taille avant) ; une paire entièrement vidée par `IdxPurge`
+  n'est plus « 0 entrée sans exclu », donc plus confondue avec une paire vide à tort (révision de 1.0.153) ; DiffTop
+  affiche ses exclus au lieu de « aucune entrée », libellés « IDX_* / IdxPurge » (DiffTop, IdxStats). Agrégat et
+  suppression se font sous le même verrou d'écriture (`BEGIN IMMEDIATE`) : une purge ou un Index concurrent ne fait
+  jamais compter une ligne non supprimée. Rien n'est écrit en dry-run (`-D`). Les purges faites avant 1.0.154 ne sont
+  pas rattrapées.
+- Tests : Status (Bkp récent, tué, délai réglé, invalide, nul, négatif ou démesuré, texte du délai, Bkp vivant avec
+  verrou sans ligne redondante, interrompu avec opération prioritaire, date au-delà de 24 h, Bkp tué suivi d'un Bkp
+  fini ou en cours, JSON, clés de la branche d'erreur) ; IdxPurge (exclus attendus pour chaque motif et chaque règle
+  `IDX_*`, identiques en clair et chiffré, rien en dry-run, stats de Report égales avant et après ; exclus existants
+  additionnés ; taille après nulle ; deux paires au même `archive_new` ; paire vidée jamais reprise par la révision ;
+  ligne retirée par un autre processus pendant la purge). Gardes vérifiées par mutation.
+
 ## borgHelper 1.0.153 — diffs tués jamais gardés, paires vides revues — 2026-09-29
 
 Chantier « reconstruction progressive », story 16 (contrôle intermittent `_ix_same_as_full`, reporté en story 14).
