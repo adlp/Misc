@@ -865,6 +865,11 @@ passe (_index_pass) : borg list → rapprochement → diffs / stats / snapshot (
     moniteur : BorgRunner._stop (boex : communicate(timeout=0.5) en boucle, borg tué → 'killed': True) pour
     borg list / info / list du snapshot ; thread _priority_monitor pour les diffs (futures annulées, SIGTERM puis
     SIGKILL après 5 s, jamais de break-lock — 1.0.145) ; unité en cours jetée, unités finies gardées (sentinelles) ;
+    1.0.153 : une paire dont le borg a reçu un signal du moniteur est TOUJOURS jetée — borg diff 1.2.6 tué par SIGTERM
+    peut sortir en code 1 sans sortie, que le code 0/1 faisait garder vide pour toujours ; une fois par nick et par base
+    (db_meta zero_pairs_rechecked:<nick>), la première passe qui refait des paires (après borg list et rapprochement ;
+    ni -S, ni NOIDX, ni période -b/-B, ni Index lancé par un Bkp — plan['recheck'], _recheck_wanted) retire la
+    sentinelle des paires à 0 entrée sans ligne ni exclu, qui sont refaites ; base occupée : une tentative de 2 s ;
     après tout arrêt de borg (boex compris), _purge_mei_orphans retire les <TMPDIR>/_MEI* à nous, inchangés depuis
     2 min et absents de /proc/*/maps, cwd et fd (fuser ne voit pas les bibliothèques mappées d'un borg vivant) ;
     le dernier borg tué garde le sien jusqu'au prochain arrêt — en fin de CodecSelfTest, _purge_run_mei (1.0.151)

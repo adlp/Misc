@@ -1,5 +1,31 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.153 — diffs tués jamais gardés, paires vides revues — 2026-09-29
+
+Chantier « reconstruction progressive », story 16 (contrôle intermittent `_ix_same_as_full`, reporté en story 14).
+
+- **Défaut du moteur de tranches corrigé** (depuis 1.0.141) : `borg diff` (borg 1.2.6) tué par SIGTERM pendant qu'il
+  tourne peut sortir en **code 1 sans aucune sortie** (mesuré). Le moteur acceptait 0 et 1 comme succès : quand
+  l'échéance d'une tranche (ou une opération prioritaire) tuait un diff à ce moment, la paire était enregistrée comme
+  faite avec 0 changement, et jamais refaite (rapport « 0%nb / — », historique et explorateur incomplets pour cette
+  archive). Désormais, une paire dont le borg a reçu un signal du moniteur est toujours jetée et refaite ensuite.
+- **Bases en service** (décision de l'utilisateur) : une seule fois par nick et par base (servie ou fantôme), la première
+  passe d'`Index` qui refait les paires (diffs dans les natures, après un `borg list` et un rapprochement réussis) retire
+  la sentinelle des paires à 0 entrée sans ligne ni exclu ; elles sont refaites (un `borg diff` chacune, sans budget
+  pour un Index sans option ; une paire vraiment vide est simplement recalculée). Message
+  `<nick>: N paire(s) de diff vide(s) à refaire (1.0.153)`. Jamais avec `-S`, NOIDX, une période `-b`/`-B`, ni dans un
+  Index lancé par un Bkp. Base occupée : une tentative de 2 s, puis reporté à la passe suivante. Les paires vides qui
+  ont des exclus sont gardées. Limites : une paire vidée par un `IdxPurge -x` d'avant 1.0.153 est refaite aussi
+  (relancer l'`IdxPurge`) ; une paire tronquée (code 1 après une sortie partielle, jamais observé) ou tuée hors du
+  moniteur (kill externe) n'est pas détectée — `Index --rebuild` reconstruit la base au besoin.
+- Tests : `borg diff` simulé qui sort en 1 sans sortie sous SIGTERM (échéance de tranche) : paire jamais marquée, puis
+  refaite comme un Index complet (sans le correctif : paire vide gardée — vérifié) ; code 1 non signalé toujours
+  gardé ; révision unique (paire refaite avec ses entrées, paire à exclus gardée ; `-S`, `-T stats`, période, Index
+  lancé par un Bkp et base verrouillée sans révision ; DB_NAME partagé ; deuxième passe sans révision) ; révision dans
+  un fantôme ; `_ix_same_as_full` exige zéro paire vide et affiche l'état de la base par tranches en cas d'écart. Sous forte charge (12 boucles CPU), aucune paire vide ; les contrôles de
+  minutage du groupe tranche peuvent alors échouer par base incomplète (budgets de 6 s) — le contrôle d'ordre l'affiche
+  au lieu de lever `TypeError`.
+
 ## borgHelper 1.0.152 / borgHelperWWW 1.28.3 / UI 1.19.3 — suivi d'un Bkp lancé depuis l'UI — 2026-09-29
 
 Chantier « reconstruction progressive », story 15 (report de la story 8).

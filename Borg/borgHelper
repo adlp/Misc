@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.152"
+Version="1.0.153"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -4906,7 +4906,10 @@ class BorgHelper:
             if st!='ok': self._index_outcome[nick]='deadline' if st=='deadline' else 'busy'; return 0
         # done : paires recalculées pendant cet appel — une reprise après pause ne les refait pas, même avec force (-F).
         plan={'tranche':tranche,'deadline':deadline,'natures':set(natures or ('stats','snap','diff')),'period':period,
-              'snap_only':snap_only,'done':set(),'shadow':None,'sdone':set()}
+              'snap_only':snap_only,'done':set(),'shadow':None,'sdone':set(),
+              # 1.0.153 (story 16) : révision unique des paires vides — jamais pour -S, un Index ciblé ou un Index lancé
+              # par un Bkp (tour déjà tenu : pas de borg diff en série dans le processus du Bkp)
+              'recheck':not own and not snap_only and target_archive is None}
         try:
             if tranche:
                 # Fantôme préparé sous index-running.lock (jamais deux créateurs). Tranche ordinaire : un refus (DB_NAME
@@ -5012,6 +5015,42 @@ class BorgHelper:
         pairs=[(archives[i]['name'],archives[i+1]['name'],archives[i+1].get('start')) for i in range(len(archives)-1)]
         return pairs if keep is None else pairs[max(0,len(pairs)-keep):]
 
+    @staticmethod
+    def _recheck_wanted(plan,noidx):
+        """Révision des paires vides (1.0.153) seulement si cette passe refait les paires retirées : diffs dans les natures,
+        pas de NOIDX, pas de période -b/-B (les paires hors période resteraient sans sentinelle), et plan['recheck']."""
+        return (bool(plan.get('recheck')) and 'diff' in plan['natures'] and not noidx
+                and not any(v and v!='ALL' for v in (plan.get('period') or ())))
+
+    def _recheck_zero_pairs(self,nick,db_path):
+        """1.0.153 (story 16) : une fois par nick et par base, les paires de diff enregistrées vides (entry_count 0, sans
+        ligne dans diff_index ni diff_excluded_stats) perdent leur sentinelle : la passe les refait. L'ancien moteur gardait
+        un borg diff tué à l'échéance qui sortait en code 1 sans sortie. Marqueur db_meta zero_pairs_rechecked:<nick>
+        (bases partagées par DB_NAME) ; base occupée (une tentative, 2 s au plus : jamais d'attente sous le budget d'une
+        tranche ni devant un Bkp) ou illisible : reporté, jamais l'échec de l'Index. Rend N. Une paire vidée par un
+        IdxPurge -x d'avant 1.0.153 (sans exclu enregistré) est refaite aussi : relancer l'IdxPurge."""
+        key=f"zero_pairs_rechecked:{nick}"
+        if self._db_meta_value(db_path,key): return 0
+        def _do():
+            conn=_open_db(db_path,nick=nick,role='write')
+            try:
+                conn.execute("PRAGMA busy_timeout=2000")
+                conn.execute("BEGIN IMMEDIATE")
+                if conn.execute("SELECT 1 FROM db_meta WHERE key=?",(key,)).fetchone(): conn.rollback(); return 0
+                n=conn.execute("DELETE FROM diff_indexed_pairs WHERE nick=? AND entry_count=0 AND NOT EXISTS "
+                    "(SELECT 1 FROM diff_index d WHERE d.nick=diff_indexed_pairs.nick AND d.archive_new=diff_indexed_pairs.archive_new "
+                    "AND d.archive_old=diff_indexed_pairs.archive_old) AND NOT EXISTS (SELECT 1 FROM diff_excluded_stats x WHERE "
+                    "x.nick=diff_indexed_pairs.nick AND x.archive_old=diff_indexed_pairs.archive_old AND "
+                    "x.archive_new=diff_indexed_pairs.archive_new)",(nick,)).rowcount
+                conn.execute("INSERT OR REPLACE INTO db_meta VALUES(?,'1')",(key,))
+                conn.commit(); return n
+            finally: conn.close()
+        try: n=_do()
+        except (Exception,SystemExit) as e:
+            printer(f"[WARN] {nick}: révision des paires de diff vides reportée ({e})"); return 0
+        if n: printer(f"{nick}: {n} paire(s) de diff vide(s) à refaire (1.0.153)")
+        return n
+
     def _index_pass(self,nick,debug,db_path,force,target_archive,plan):
         """Une passe du moteur. Retour : 0/1 (fin, comme l'ancien index()), 'interrupted' (demande d'arrêt prioritaire :
         index() met en pause puis relance une passe complète — les sentinelles évitent de refaire le travail)."""
@@ -5047,6 +5086,7 @@ class BorgHelper:
         try: lo,hi=self._period_bounds(plan['period'],archives)
         except ValueError as e:
             printer(f"[ERREUR] {nick}: {e}"); return 1
+        if self._recheck_wanted(plan,noidx): self._recheck_zero_pairs(nick,db_path)   # borg list et rapprochement faits
         if plan['snap_only']:
             r=self._index_snap(nick,debug,db_path,force,archives,stop,deadline)
             return r if r=='interrupted' else self._index_finish(nick,db_path,archives,keep,False,noidx)
@@ -5122,6 +5162,9 @@ class BorgHelper:
         diff_env={k:cfg[k] for k in cfg.keys() if k in ('BORG_REPO','BORG_PASSPHRASE','BORG_REMOTE_PATH','BORG_RSH','BORG_SHOW_SYSINFO','BORG_RELOCATED_REPO_ACCESS_IS_OK','BORG_KEY_FILE')}
         diff_env['PATH']=varcur['PATH']; diff_env['LC_ALL']='fr_FR.UTF-8'
         running_procs={}; running_procs_lock=threading.Lock()
+        # 1.0.153 (story 16) : paires dont le borg a reçu un signal du moniteur. borg diff tué par SIGTERM peut sortir en
+        # code 1 SANS sortie (mesuré, borg 1.2.6) : sans ce relevé, la paire était gardée vide pour toujours.
+        signaled=set()
         def _run_diff(pair):
             a_old,a_new,date_new=pair
             print(f"  {nick}: {a_old} → {a_new}",flush=True)
@@ -5129,7 +5172,9 @@ class BorgHelper:
             ps=subprocess.Popen(cmd,encoding='utf-8',env=diff_env,cwd=os.getcwd(),
                                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
             with running_procs_lock: running_procs[pair]=ps
-            if interrupted_event.is_set(): ps.terminate()   # lancé pendant l'arrêt : le moniteur ne l'a pas vu
+            if interrupted_event.is_set():   # lancé pendant l'arrêt : le moniteur ne l'a pas vu
+                with running_procs_lock: signaled.add(pair)
+                ps.terminate()
             entries=[]; exclu={}
             try:
                 for line in ps.stdout:          # streaming — parse au fil de l'eau
@@ -5144,8 +5189,9 @@ class BorgHelper:
                         exclu[ct]['count']+=1; exclu[ct]['size']+=sz
                 ps.wait()
             finally:
-                with running_procs_lock: running_procs.pop(pair,None)
-            ok=ps.returncode in (0,1)
+                with running_procs_lock:
+                    running_procs.pop(pair,None); killed=pair in signaled
+            ok=ps.returncode in (0,1) and not killed   # tué par le moniteur : jamais gardé, quel que soit le code
             if not ok: entries=[]; exclu={}
             return (a_old,a_new,date_new,entries,exclu,ok)
         interrupted_event=threading.Event()  # demande d'arrêt détectée (prioritaire ou échéance), raison dans why[0]
@@ -5175,7 +5221,8 @@ class BorgHelper:
                                 # aussi le verrou d'un borg create externe, d'un borg mount ou d'un autre hôte.
                                 def _signal_all(kill):
                                     with running_procs_lock:
-                                        for ps in list(running_procs.values()):
+                                        for pr,ps in list(running_procs.items()):
+                                            signaled.add(pr)
                                             try: ps.kill() if kill else ps.terminate()
                                             except OSError: pass
                                 def _wait_reaped(secs):
@@ -5482,6 +5529,7 @@ class BorgHelper:
         if not archives:   # comme le rapprochement : une liste vide ne remplace jamais une base qui connaît des archives
             printer(f"{nick}: borg list ne rend aucune archive — fantôme ni avancé ni basculé (GLOB_ARCH ?)"); return 0
         self._reconcile_archives(nick,sp,[a['name'] for a in archives])
+        if self._recheck_wanted(plan,noidx): self._recheck_zero_pairs(nick,sp)   # 1.0.153 : fantôme construit avant le correctif
         cp=self._index_checkpoint(nick,deadline)
         if cp: return cp if cp=='interrupted' else self._index_finish(nick,sp,archives,keep,True,noidx)
         r=self._index_tranche(nick,debug,sp,cfg,archives,keep,lo,hi,plan['natures'],deadline,noidx,plan['sdone'])
@@ -9865,8 +9913,8 @@ def codec_selftest(pattern=None,list_only=False):
             last_info=max(i for i,l in enumerate(lg) if l.startswith('info --json ::'))
             diffs=[l.split()[-1] for l in lg if l.startswith('diff ')]
             order_ok=(info==list(reversed(names)) and first_snap<first_info and last_info<first_diff and diffs==list(reversed(names[1:]))
-                      and _ix_state(b,'ix')['state']=='complete')
-            if not order_ok: print(f"  ordre : {lg}")
+                      and (_ix_state(b,'ix') or {}).get('state')=='complete')   # 1.0.153 : état absent -> échec lisible
+            if not order_ok: print(f"  ordre : état {_ix_state(b,'ix')} ; {lg}")
             # budget + reprise
             # Budget ≥ borg list + une unité (sinon aucune progression : voir README).
             _ix_slow(ctx,'ALL',0.3)
@@ -9879,7 +9927,8 @@ def codec_selftest(pattern=None,list_only=False):
                 cur=_ix_pairs(b2,'ix'); mono=mono and all(cur.get(k)==v for k,v in prev.items())
             _ix_slow(ctx,None,0)
             mono=mono and not any(l.startswith('break-lock') for l in _ix_log(ctx,clear=True))   # jamais à l'échéance
-            ok=(order_ok and t1<=6+3 and st1['state']=='partial' and st1.get('snapshot') is True and mono and runs>1
+            st1=st1 or {}
+            ok=(order_ok and t1<=6+3 and st1.get('state')=='partial' and st1.get('snapshot') is True and mono and runs>1
                 and (_ix_state(b2,'ix') or {}).get('state')=='complete' and len(_ix_pairs(b2,'ix'))==5)
             if not ok: print(f"  budget : durée {t1:.1f}s, état1 {st1}, tranches {runs}, monotone {mono}, final {_ix_state(b2,'ix')}")
             return ok
@@ -9906,7 +9955,116 @@ def codec_selftest(pattern=None,list_only=False):
                     if x!=y:   # autour du premier écart (1.0.148 : le début seul masquait la différence)
                         i=next((k for k,(u,v) in enumerate(zip(x,y)) if u!=v),min(len(x),len(y)))
                         print(f"  écart à {i} : tranches …{x[max(0,i-200):i+200]!r}\n  complet  …{y[max(0,i-200):i+200]!r}")
-            return a==b_ and all(len(x)>20 for x in a)
+            # 1.0.153 (story 16) : aucune paire vide (sans exclu) dans la base par tranches, toujours exigé ; en cas d'écart,
+            # état de la base par tranches (sous forte charge, une base incomplète est l'autre cause possible)
+            c=sqlite3.connect(bt.db.get_diff_db('ix'))
+            try: z=c.execute("SELECT archive_old,archive_new FROM diff_indexed_pairs p WHERE entry_count=0 AND NOT EXISTS "
+                             "(SELECT 1 FROM diff_excluded_stats x WHERE x.archive_old=p.archive_old AND x.archive_new=p.archive_new)").fetchall()
+            finally: c.close()
+            if a!=b_ or z: print(f"  base par tranches : build_state {_ix_state(bt,'ix')} ; paires à 0 entrée {z}")
+            return a==b_ and all(len(x)>20 for x in a) and not z
+        def _ix_killed_diff_rc1():
+            """1.0.153 (story 16) : borg diff tué à l'échéance qui sort en code 1 SANS sortie (borg 1.2.6 le fait sous
+            SIGTERM) -> paire jamais marquée, aucune ligne ; passe suivante (borg normal) -> toutes les paires avec leurs
+            entrées, comme un Index complet."""
+            ctx=_ix_ctx(); b=_ix_bh(ctx,'c-kill1'); ref=_ix_bh(ctx,'c-kill1-ref'); _ix_slow(ctx,None,0)
+            with open(ctx['w'],'w') as f:
+                f.write(f"#!/bin/bash\necho \"$*\" >> {ctx['log']}\n"
+                        "if [ \"$1\" = \"diff\" ]; then trap 'kill $p 2>/dev/null; exit 1' TERM; "
+                        "sleep 30 </dev/null >/dev/null 2>&1 & p=$!; wait $p; exit 1; fi\n"
+                        f"export BORG_BASE_DIR={ctx['bb']}\nexec {shutil.which('borg')} \"$@\"\n")
+            os.chmod(ctx['w'],0o700)
+            _ix_log(ctx,clear=True)
+            try:
+                t0=time.monotonic(); ko=_q_run(b.index,'ix',budget=6,natures=['diff']); dt=time.monotonic()-t0
+                ran=any(l.startswith('diff ') for l in _ix_log(ctx,clear=True)) and 'arrêt des diffs en cours' in ko
+                c=sqlite3.connect(b.db.get_diff_db('ix'))
+                try: after_kill=(c.execute("SELECT count(*) FROM diff_indexed_pairs").fetchone()[0],
+                                 c.execute("SELECT count(*) FROM diff_index").fetchone()[0])
+                finally: c.close()
+            finally: _ix_slow(ctx,None,0)
+            _q_run(b.index,'ix'); _q_run(ref.index,'ix')
+            def counts(x):
+                c=sqlite3.connect(x.db.get_diff_db('ix'))
+                try: return dict(((o,n),k) for o,n,k in c.execute("SELECT archive_old,archive_new,entry_count FROM diff_indexed_pairs"))
+                finally: c.close()
+            got,want=counts(b),counts(ref)
+            ok=ran and after_kill==(0,0) and dt<30 and got==want and len(want)==5 and all(v>0 for v in want.values())
+            if not ok: print(f"  diff tué code 1 : lancé+arrêté {ran}, après arrêt {after_kill} en {dt:.1f}s ; tranches {got} ; complet {want}")
+            return ok
+        def _ix_rc1_warning_kept():
+            """1.0.153 (story 16) : borg diff NON signalé qui sort en code 1 (avertissement) avec sa sortie -> paire gardée
+            avec ses entrées (comme un Index complet) : la garde ne vise que les borg tués par le moniteur."""
+            ctx=_ix_ctx(); _ix_slow(ctx,None,0); b=_ix_bh(ctx,'c-rc1'); ref=_ix_bh(ctx,'c-rc1-ref'); _q_run(ref.index,'ix')
+            with open(ctx['w'],'w') as f:
+                f.write(f"#!/bin/bash\necho \"$*\" >> {ctx['log']}\nexport BORG_BASE_DIR={ctx['bb']}\n"
+                        f"if [ \"$1\" = \"diff\" ]; then {shutil.which('borg')} \"$@\"; exit 1; fi\n"
+                        f"exec {shutil.which('borg')} \"$@\"\n")
+            os.chmod(ctx['w'],0o700)
+            try: _q_run(b.index,'ix')
+            finally: _ix_slow(ctx,None,0)
+            def counts(x):
+                c=sqlite3.connect(x.db.get_diff_db('ix'))
+                try: return dict(((o,n),k) for o,n,k in c.execute("SELECT archive_old,archive_new,entry_count FROM diff_indexed_pairs"))
+                finally: c.close()
+            got,want=counts(b),counts(ref)
+            ok=got==want and len(want)==5 and all(v>0 for v in got.values())
+            if not ok: print(f"  code 1 non signalé : {got} ; complet {want}")
+            return ok
+        def _ix_zero_pairs_recheck():
+            """1.0.153 (story 16) : révision unique des paires vides d'une base ancienne — paire vide sans ligne ni exclu
+            refaite avec ses entrées ; vide avec exclus gardée (même id) ; -S sans révision ; marqueur posé ; message ;
+            deuxième passe sans révision."""
+            ctx=_ix_ctx(); _ix_slow(ctx,None,0); b=_ix_bh(ctx,'c-zero'); _q_run(b.index,'ix')
+            dbp=b.db.get_diff_db('ix'); key="zero_pairs_rechecked:ix"
+            def sql(q,a=()):
+                c=sqlite3.connect(dbp)
+                try: r=c.execute(q,a).fetchall(); c.commit(); return r
+                finally: c.close()
+            prs=sql("SELECT id,archive_old,archive_new,entry_count FROM diff_indexed_pairs ORDER BY id")
+            (ia,ao,an,ka),(ib,bo,bn,_)=prs[0],prs[1]
+            def zero(o,n):
+                sql("DELETE FROM diff_excluded_stats WHERE nick='ix' AND archive_old=? AND archive_new=?",(o,n))
+                sql("DELETE FROM diff_index WHERE nick='ix' AND archive_old=? AND archive_new=?",(o,n))
+                sql("UPDATE diff_indexed_pairs SET entry_count=0 WHERE nick='ix' AND archive_old=? AND archive_new=?",(o,n))
+            marker0=bool(sql("SELECT 1 FROM db_meta WHERE key=?",(key,)))   # posé dès la première passe (base neuve)
+            sql("DELETE FROM db_meta WHERE key=?",(key,)); zero(ao,an); zero(bo,bn)
+            sql("INSERT OR REPLACE INTO diff_excluded_stats (nick,archive_old,archive_new,change_type,file_count,total_size) "
+                "VALUES ('ix',?,?,'modified',1,1)",(bo,bn))
+            untouched=lambda: (not sql("SELECT 1 FROM db_meta WHERE key=?",(key,))
+                               and sql("SELECT entry_count FROM diff_indexed_pairs WHERE archive_old=? AND archive_new=?",(ao,an))==[(0,)])
+            skip={}
+            _q_run(b.index,'ix',snap_only=True); skip['-S']=untouched()
+            _q_run(b.index,'ix',natures=['stats'],budget=60); skip['-T stats']=untouched()
+            _q_run(b.index,'ix',natures=['diff'],period=(ctx['names'][3],None)); skip['période']=untouched()
+            if b.db.acquire_index_running_lock('ix'):   # Index lancé par un Bkp (tour déjà tenu, pause=False)
+                try: _q_run(b.index,'ix')
+                finally: b.db.release_index_running_lock('ix')
+                skip['tour tenu']=untouched()
+            else: skip['tour tenu']=False
+            lk=sqlite3.connect(dbp); lk.execute("BEGIN IMMEDIATE")   # base verrouillée : reporté, sans attendre
+            try:
+                t0=time.monotonic(); lo=_q_run(lambda: skip.__setitem__('n',b._recheck_zero_pairs('ix',dbp))); ldt=time.monotonic()-t0
+            finally: lk.rollback(); lk.close()
+            skip['verrou']=untouched() and skip.pop('n')==0 and ldt<5 and 'reportée' in lo
+            sql("INSERT INTO diff_indexed_pairs (nick,archive_old,archive_new,entry_count) VALUES ('autre16','x1','x2',0)")
+            s_ok=all(skip.values())
+            out=_q_run(b.index,'ix')
+            ka2=sql("SELECT entry_count FROM diff_indexed_pairs WHERE archive_old=? AND archive_new=?",(ao,an))
+            rows=sql("SELECT count(*) FROM diff_index WHERE archive_old=? AND archive_new=?",(ao,an))[0][0]
+            kept=sql("SELECT id,entry_count FROM diff_indexed_pairs WHERE archive_old=? AND archive_new=?",(bo,bn))
+            marker=bool(sql("SELECT 1 FROM db_meta WHERE key=?",(key,)))
+            other_kept=sql("SELECT count(*) FROM diff_indexed_pairs WHERE nick='autre16'")==[(1,)]   # DB_NAME partagé : autre nick intact
+            other_n=[]; _q_run(lambda: other_n.append(b._recheck_zero_pairs('autre16',dbp)))
+            shared=(other_kept and other_n==[1] and sql("SELECT count(*) FROM diff_indexed_pairs WHERE nick='autre16'")==[(0,)]
+                    and bool(sql("SELECT 1 FROM db_meta WHERE key='zero_pairs_rechecked:autre16'")))
+            zero(ao,an); out2=_q_run(b.index,'ix')
+            again=sql("SELECT entry_count FROM diff_indexed_pairs WHERE archive_old=? AND archive_new=?",(ao,an))
+            ok=(marker0 and s_ok and shared and ka2==[(ka,)] and ka>0 and rows==ka and kept==[(ib,0)] and marker
+                and "1 paire(s) de diff vide(s) à refaire" in out and 'paire(s) de diff vide' not in out2 and again==[(0,)])
+            if not ok: print(f"  paires vides : marqueur {marker0}, sans révision {skip}, partagée {shared}, refaite {ka2}/{ka} lignes {rows}, gardée {kept}, "
+                             f"marqueur {marker}, 2e passe {again} ; {out[-200:]!r}")
+            return ok
         def _ix_period_nature_keep():
             """-T diff -b <A4> : seules les paires se terminant à A4..A6, ni stats ni snapshot ; DIFF_KEEP=2 en tranche :
             pairs_total=2, seules les 2 plus récentes."""
@@ -10421,6 +10579,32 @@ def codec_selftest(pattern=None,list_only=False):
                               f"échéance {dl} | refus {ref} | sys.exit {sx} | marquage {s13} {dbl} | exc {raised} {exc} | écriture ratée {wf} | "
                               f"illisible {bad} | unlink {gone} | mode {oct(mode)} | troncature {tr} | vacuum {vac} {vo[-200:]!r}")
             return res
+        def _ix_zero_pairs_shadow():
+            """1.0.153 (story 16) : fantôme commencé avant le correctif (paire vide, sans marqueur) -> la tranche suivante
+            le révise et refait la paire dans le fantôme ; base servie inchangée."""
+            ctx=_ix_ctx(); _ix_slow(ctx,None,0); b=_ix_bh(ctx,'c-zsh'); _q_run(b.index,'ix')
+            sp=b.db.get_diff_db('ix')+_SHADOW_SUFFIX
+            _q_run(b.index,'ix',rebuild=True,natures=['diff'],budget=60)   # fantôme limité aux diffs : gardé (R8)
+            if not os.path.exists(sp): print("  fantôme absent"); return False
+            try:
+                c=sqlite3.connect(sp)
+                try:
+                    o,n,k=c.execute("SELECT archive_old,archive_new,entry_count FROM diff_indexed_pairs ORDER BY id").fetchone()
+                    c.execute("DELETE FROM diff_index WHERE archive_old=? AND archive_new=?",(o,n))
+                    c.execute("DELETE FROM diff_excluded_stats WHERE archive_old=? AND archive_new=?",(o,n))
+                    c.execute("UPDATE diff_indexed_pairs SET entry_count=0 WHERE archive_old=? AND archive_new=?",(o,n))
+                    c.execute("DELETE FROM db_meta WHERE key='zero_pairs_rechecked:ix'"); c.commit()
+                finally: c.close()
+                out=_q_run(b.index,'ix',natures=['diff'],budget=60)
+                c=sqlite3.connect(sp)
+                try:
+                    k2=c.execute("SELECT entry_count FROM diff_indexed_pairs WHERE archive_old=? AND archive_new=?",(o,n)).fetchall()
+                    mk=c.execute("SELECT 1 FROM db_meta WHERE key='zero_pairs_rechecked:ix'").fetchone()
+                finally: c.close()
+                ok=k>0 and k2==[(k,)] and bool(mk) and "1 paire(s) de diff vide(s) à refaire" in out
+                if not ok: print(f"  fantôme : {k} -> {k2}, marqueur {mk} ; {out[-200:]!r}")
+                return ok
+            finally: BorgHelper._shadow_discard(sp)
         def _ix_prune_waits():
             """Prune attend l'Index (wait_index_idle) comme Bkp et Restore."""
             ctx=_ix_ctx(); b=_ix_bh(ctx,'c-prune'); called=[]
@@ -10540,6 +10724,10 @@ def codec_selftest(pattern=None,list_only=False):
         else:
             check("tranche : ordre snapshot -> stats -> diffs récents d'abord ; budget respecté ; reprise sans refaire ; complete",_ix_order_budget_resume)
             check("tranche : base finie par tranches == Index complet (Report -o, TreeHist, DiffBkp)",_ix_same_as_full)
+            check("tranche : borg diff tué à l'échéance sortant en code 1 sans sortie -> paire jamais marquée, refaite ensuite",_ix_killed_diff_rc1)
+            check("tranche : paires de diff vides d'une base ancienne revues une fois (exclus gardés ; -S, -T stats, période, tour tenu, verrou sans révision ; DB_NAME partagé)",_ix_zero_pairs_recheck)
+            check("tranche : borg diff non signalé en code 1 (avertissement) -> paire gardée avec ses entrées",_ix_rc1_warning_kept)
+            check("fantôme : paire vide d'un fantôme commencé avant 1.0.153 revue et refaite à la tranche suivante",_ix_zero_pairs_shadow)
             check("tranche : nature + période ; DIFF_KEEP borne les paires visées (pairs_total)",_ix_period_nature_keep)
             check("tranche : échéance pendant le snapshot -> borg tué, aucune ligne sans sentinelle",_ix_snap_deadline)
             check("DIFF_KEEP (Index sans option) : paires purgées plus jamais re-diffées, paire gardée = la plus récente",_ix_diff_keep_plain)
