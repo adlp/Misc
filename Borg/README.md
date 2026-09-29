@@ -934,7 +934,7 @@ Inchangés par archive :
   archive-2024-01-02 : 96 200 (96%) / 100 000 fichiers
 ```
 
-Calcul : `nfiles − added_total − modified_total` (indexés + exclus). Seules les archives présentes dans `archive_stats` et `diff_index` sont affichées.
+Calcul : `nfiles − added_total − modified_total` (indexés + exclus). `nfiles` de borg ne compte que les fichiers ordinaires (ni répertoires, ni liens, ni fifos) : seuls les types exacts `added` et `modified` (fichiers) sont retranchés, jamais les répertoires, liens ni entrées `ctime`/`mtime` d'un répertoire (1.0.156, même calcul que DiffTop ; IdxTop cumule toutes les paires qui aboutissent à l'archive, DiffTop une seule paire — valeurs égales quand une seule paire y aboutit). Le détail « Exclus » compte toutes les entrées ; « Inchangés », seulement les fichiers. Limites (mesurées sur borg 1.2.6) : borg signale `modified` (+0/−0) dès que le ctime d'un fichier change (droits, propriétaire, dates, même `touch -a`) — un tel fichier compte comme **modifié** ; un fichier à plusieurs liens physiques n'est compté qu'une fois dans `nfiles` mais chaque nom a sa ligne `added`/`modified` — « Inchangés » est alors sous-estimé (0 au plus bas) ; un lien ou un répertoire remplacé par un fichier ne donne qu'une ligne `mode` — ce nouveau fichier compte comme inchangé. Seules les archives présentes dans `archive_stats` (avec `nfiles` non nul) et dans `diff_index` ou ses exclus sont affichées.
 
 ---
 
@@ -1087,7 +1087,7 @@ Exclus   :   800 entrées · 1.2 GB (IDX_* / IdxPurge) — +300 · -50 · =450
 Inchangés: 96 000 (97%) sur 99 500 fichiers dans archive-new
 ```
 
-Calcul : `nfiles_new − added_total − modified_total` (indexés + exclus). Ligne omise si `archive_stats` ne contient pas `nfiles` pour l'archive cible.
+Calcul : `nfiles_new − added_total − modified_total` (indexés + exclus), en fichiers ordinaires comme `nfiles` : types exacts `added` et `modified` seulement (1.0.156 ; avant, les répertoires ajoutés, liens changés et entrées `ctime` de répertoires indexés étaient aussi retranchés — « Inchangés » sous-estimé, et différent d'IdxTop). Le tableau et le détail des exclus comptent toutes les entrées ; « Inchangés », seulement les fichiers. Mêmes limites qu'IdxTop (fichier dont le ctime change compté modifié, liens physiques, changement de type). Ligne omise si `archive_stats` ne contient pas `nfiles` pour l'archive cible.
 
 ---
 

@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.155"
+Version="1.0.156"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -2694,8 +2694,10 @@ class BorgHelperDB:
 
     def get_running_bkp_status(self,nick,db_path=None,timeout_s=None):
         """Ligne bkp_status la plus récente encore en cours (finished_at IS NULL) pour ce nick, s'il y
-        en a une (normalement 0 ou 1, jamais plus — un seul Bkp actif à la fois par nick via
-        priority.lock). Lecture seule, aucune réclamation — utilisée par la commande Status (100%
+        en a une. Plusieurs lignes ouvertes sont possibles (1.0.156, story 19 : l'ancienne mention « un seul Bkp actif à
+        la fois via priority.lock » était fausse) : priority.lock admet plusieurs porteurs et backup() ne refuse pas un
+        second Bkp — il échoue en général sur le verrou du dépôt, mais peut réussir s'il démarre pendant l'Index de fin du
+        premier (borg create déjà fini) —, et un Bkp tué laisse sa ligne ouverte. Lecture seule, aucune réclamation — utilisée par la commande Status (100%
         locale, jamais d'appel boex). 1.0.154 (story 17) : un Bkp tué suivi d'autres Bkp n'est plus rendu ; 1.0.155 (story 18) :
         la plus récente des lignes ouvertes au sens de _BKP_OPEN_WHERE (effacée seulement par un Bkp plus récent réussi :
         un Bkp vivant suivi d'un Bkp en échec sur le verrou du dépôt reste rendu). timeout_s : ajoute 'stale' — True si la ligne
@@ -6617,7 +6619,7 @@ class BorgHelper:
             if len(parts)<=d: return path
             return leading+'/'.join(parts[:d])
         stats=defaultdict(lambda:{'total':0,'added_n':0,'added_s':0,'removed_n':0,'removed_s':0,'modified_n':0,'size':0})
-        total_count=0; total_size=0; total_added=0; total_modified=0
+        total_count=0; total_size=0; file_added=0; file_modified=0
         conn=None
         try:
             conn=_open_db(db_path,nick=nick,role='read',timeout=60)
@@ -6633,9 +6635,14 @@ class BorgHelper:
                     s['total']+=1
                     sz=(sa or sb or 0)
                     s['size']+=sz
-                    if ct in _DIFF_ADDED_TYPES:     s['added_n']+=1;   s['added_s']+=(sa or 0); total_added+=1
+                    if ct in _DIFF_ADDED_TYPES:     s['added_n']+=1;   s['added_s']+=(sa or 0)
                     elif ct in _DIFF_REMOVED_TYPES: s['removed_n']+=1; s['removed_s']+=(sb or 0)
-                    else:              s['modified_n']+=1; total_modified+=1
+                    else:              s['modified_n']+=1
+                    # « Inchangés » (1.0.156, story 19) : nfiles de borg ne compte que les fichiers ordinaires — seuls les
+                    # types exacts added/modified (fichiers) sont retranchés, comme IdxTop ; pas les répertoires, liens,
+                    # ni les entrées ctime/mtime d'un répertoire dont le contenu change.
+                    if ct=='added': file_added+=1
+                    elif ct=='modified': file_modified+=1
                     total_count+=1; total_size+=sz
             conn.close()
         except DbCodecError as e:
@@ -6677,8 +6684,8 @@ class BorgHelper:
         printer(f"\n{nick} — top {topn} par changements (profondeur {depth})")
         printer(f"  {arch_old}")
         printer(f"→ {arch_new}")
-        added_total=total_added+exclu_by_ct3.get('added',(0,0))[0]
-        modified_total=total_modified+exclu_by_ct3.get('modified',(0,0))[0]
+        added_total=file_added+exclu_by_ct3.get('added',(0,0))[0]
+        modified_total=file_modified+exclu_by_ct3.get('modified',(0,0))[0]
         unchanged=max(0,nfiles_new-added_total-modified_total) if nfiles_new is not None else None
         printer(f"Indexés : {total_count:,} changements · {convert_octets_readable(total_size)}")
         if exclu_n:
@@ -8633,6 +8640,29 @@ def codec_selftest(pattern=None,list_only=False):
                 ok=ok and one
             return ok
         check("IdxPurge : exclus existants additionnés, paire vidée = exclus des entrées retirées, jamais reprise par la révision (1.0.153)",_purge_exclu_merge)
+        def _inchanges_twins():
+            """1.0.156 (story 19) : « Inchangés » = nfiles (fichiers ordinaires seuls chez borg) − fichiers ajoutés − fichiers
+            modifiés (types exacts added/modified, indexés et exclus) — même valeur dans DiffTop et IdxTop ; répertoires
+            ajoutés, entrées ctime de répertoires, liens changés jamais retranchés (plain et chiffré)."""
+            ok=True
+            for nk,enc_ in (('qp',False),('qe',True)):
+                _q_build(nk,enc_)
+                c=_open_db(bhq.db.get_diff_db(nk),nick=nk,role='write'); E=(lambda p: c.codec.path.encode(p)) if c.codec else (lambda p: p)
+                c.execute("UPDATE archive_stats SET nfiles=100 WHERE nick=? AND archive=?",(nk,A2))
+                for p,ct in (('zz/d1','added directory'),('zz/d2','added directory'),('etc','ctime'),('home','ctime'),('bin','mtime'),
+                             ('zz/l1','changed link'),('zz/d3','removed directory'),('zz/l2','added link'),('x0','mode'),('x-y','owner')):
+                    c.execute("INSERT INTO diff_index(nick,archive_old,archive_new,archive_new_date,change_type,path,size_before,size_after) "
+                              "VALUES(?,?,?,?,?,?,NULL,NULL)",(nk,A1,A2,D2,ct,E(p)))
+                for ct,n in (('added',2),('modified',1),('added directory',5),('changed link',3),('removed',4),('removed directory',2)):
+                    c.execute("INSERT INTO diff_excluded_stats VALUES(?,?,?,?,?,0)",(nk,A1,A2,ct,n))
+                c.commit(); c.close()
+                dt=_q_run(bhq.difftop,nk,f"{A1},{A2}"); it=_q_run(bhq.idxtop,nk)
+                # fixture A1->A2 : 1 added (etc/new.LOG), 1 modified (etc/passwd) ; exclus 2 added, 1 modified -> 100-5
+                one=(f"Inchangés: 95 (95%) sur 100 fichiers dans {A2}" in dt and f"  {A2} : 95 (95%) / 100 fichiers" in it)
+                if not one: print(f"  Inchangés {nk} : {[l for l in (dt+it).splitlines() if 'nchang' in l or A2+' :' in l]}")
+                ok=ok and one
+            return ok
+        check("Inchangés (DiffTop, IdxTop) : fichiers ordinaires seuls (added/modified exacts, indexés et exclus), même valeur dans les deux",_inchanges_twins)
         def _purge_race():
             """Revue story 17 : une ligne visée supprimée par un autre processus entre la sélection et la purge n'est ni
             comptée en exclu ni annoncée supprimée (agrégat et DELETE sous BEGIN IMMEDIATE ; chiffré : lignes réellement

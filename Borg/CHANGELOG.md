@@ -1,5 +1,27 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.156 — Inchangés en fichiers ordinaires — 2026-09-29
+
+Chantier « reconstruction progressive », story 19 (actions de rétrospective A21, A23).
+
+- **DiffTop : « Inchangés » en fichiers ordinaires**, comme IdxTop. Mesuré sur borg 1.2.6 : `nfiles` ne compte que les
+  fichiers ordinaires (ni répertoires, ni liens, ni fifos), alors que `borg diff` liste aussi `added directory`,
+  `removed directory`, `changed link` et des entrées `ctime`/`mtime` pour un répertoire dont le contenu change. DiffTop
+  retranchait tout ajout et toute « modification » indexés, répertoires compris : « Inchangés » était sous-estimé et
+  différait d'IdxTop. Désormais, seuls les types exacts `added` et `modified` (indexés et exclus) sont retranchés,
+  dans les deux commandes. Le détail des exclus (familles, 1.0.155) et le tableau de DiffTop ne changent pas.
+  Limites mesurées, documentées dans le README : borg 1.2.6 signale `modified` (+0/−0) dès que le ctime d'un fichier
+  change (droits, dates) — compté modifié ; liens physiques comptés une fois dans `nfiles` mais une ligne par nom
+  (« Inchangés » sous-estimé) ; lien ou répertoire remplacé par un fichier : ligne `mode` seule, compté inchangé.
+  IdxTop cumule les paires qui aboutissent à une même archive, DiffTop n'en lit qu'une.
+- La colonne `modifications` de Report mêle aussi répertoires et liens (`XX%nb`, `prev_nf`) : reporté (story à part).
+- Docstring de `get_running_bkp_status` corrigée : plusieurs lignes `bkp_status` ouvertes sont possibles
+  (`priority.lock` a plusieurs porteurs ; un Bkp tué laisse sa ligne ouverte).
+- Tests : même « Inchangés » dans DiffTop et IdxTop sur une paire avec répertoires ajoutés ou supprimés, entrées
+  `ctime`/`mode`/`owner`, liens ajoutés ou changés, et exclus de types variés, suppressions comprises (clair et
+  chiffré) ; mutations détectées. Vrai dépôt : 32 inchangés sur 37 fichiers, égal au
+  décompte réel (`borg list` / `borg diff`).
+
 ## borgHelper 1.0.155 / borgHelperWWW 1.28.4 — délai des Bkp par nick, détail des exclus — 2026-09-29
 
 Chantier « reconstruction progressive », story 18 (actions de rétrospective A18, A19, A20).
