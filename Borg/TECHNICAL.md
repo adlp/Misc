@@ -1101,7 +1101,7 @@ IDX_INCLUDE seul  → DELETE WHERE nick=? AND NOT (p1 OR p2 OR ...)
 Les deux          → DELETE WHERE nick=? AND (NOT (includes) OR (excludes))
 ```
 
-**Exclus (1.0.154) :** `BEGIN IMMEDIATE`, puis agrégat (clair : SQL ; chiffré : lignes réellement supprimées par id, même paire, type et chemin stocké qu'à la sélection) et `DELETE`, puis l'agrégat est ajouté à `diff_excluded_stats` par upsert qui additionne (`ON CONFLICT … DO UPDATE SET file_count=file_count+excluded.file_count, …`). Les stats (`_diff_stats_for_nick`, IdxStats) ne bougent donc pas (sauf `modified` à taille après nulle : taille avant comptée), DiffTop affiche les exclus d'une paire vidée, et une paire vidée garde des exclus : la révision des paires vides de 1.0.153 (`_recheck_zero_pairs`, paires à 0 entrée **sans exclu**) ne la reprend pas.
+**Exclus (1.0.154) :** `BEGIN IMMEDIATE`, puis agrégat (clair : SQL ; chiffré : lignes réellement supprimées par id, même paire, type et chemin stocké qu'à la sélection) et `DELETE`, puis l'agrégat est ajouté à `diff_excluded_stats` par upsert qui additionne (`ON CONFLICT … DO UPDATE SET file_count=file_count+excluded.file_count, …`). Les stats (`_diff_stats_for_nick`, IdxTop) ne bougent donc pas (sauf `modified` à taille après nulle : taille avant comptée), DiffTop affiche les exclus d'une paire vidée, et une paire vidée garde des exclus : la révision des paires vides de 1.0.153 (`_recheck_zero_pairs`, paires à 0 entrée **sans exclu**) ne la reprend pas.
 
 **Purge snapshots intégrée :** en fin d'opération (même s'il n'y avait rien à purger dans `diff_index`), `IdxPurge` appelle `_snapurge_check`/`_snapurge_exec` et supprime les snapshots (`archive_snapshot` + `archive_snapshot_indexed` + `snap_excluded_stats`) dont l'archive dépasse `IDX_SNAP_KEEP`. Un seul commit SQLite et un seul VACUUM pour les deux opérations.
 
@@ -3073,9 +3073,11 @@ désormais un envoi push réel via `_send_bkp_push(nick, event, result)` (Story 
 journalisation de la Story 1 — voir [Envoi push réel](#envoi-push-réel-story-2b) plus bas).
 
 `BORGHELPERWWW_BKP_WATCHER_INTERVAL` (déf. 30s) : période entre deux balayages.
-`BORGHELPERWWW_BKP_STATUS_TIMEOUT` (déf. 21600s = 6h, AD-7) : délai au-delà duquel une ligne
+`BORGHELPERWWW_BKP_STATUS_TIMEOUT` (déf. 21600s = 6h, AD-7 ; 1.28.4 : la clé rc `BKP_STATUS_TIMEOUT` du nick ou de
+`[DEFAULT]` l'emporte — `_bkp_timeout(nick)` → `BorgHelper.bkp_status_timeout(nick)`, utilisé par `/access`,
+`list_pending_bkp_status` du watcher, son message et son alerte Sentry, et l'alerte de retard) : délai au-delà duquel une ligne
 `started_at` sans `finished_at` est traitée comme un échec par `list_pending_bkp_status` (et, depuis 1.0.154, affichée
-« probablement interrompu » par `borgHelper -c Status`, qui lit la même variable) — **le
+« probablement interrompu » par `borgHelper -c Status`, avec le même délai du nick lu dans son propre rc) — **le
 résultat en base reste `NULL`** dans ce cas précis (le watcher ne réécrit que `notified_at`, jamais
 `finished_at`/`result` d'une ligne qu'il n'a pas lui-même terminée) : le `'error'` de la journalisation
 est dérivé en mémoire (`row['result'] if row['finished_at'] else 'error'`), pas persisté — cohérent
@@ -3129,10 +3131,19 @@ Commande CLI en lecture seule, **100% locale — jamais d'appel `boex`/`borg`** 
    voisine de `list_pending_bkp_status`/`claim_bkp_status`, même style) — `SELECT run_id,started_at
    FROM bkp_status WHERE nick=? AND finished_at IS NULL ORDER BY started_at DESC LIMIT 1`. Lecture
    seule, aucune réclamation (`notified_at` intact). 1.0.154 (story 17) : `timeout_s` optionnel → clé `stale`
-   (`COALESCE(started_at >= datetime('now','-N seconds'),0)` faux, même condition que `bkp_running_state` de
-   `/access`) ; seulement si c'est la dernière ligne du nick (`ORDER BY started_at DESC, rowid DESC`, comme
-   `last_bkp_status`) — un Bkp tué suivi d'autres Bkp n'est plus rendu ; `timeout_s` validé comme la variable (< 1 :
-   21600, plafond 10 ans : au-delà `datetime()` rend NULL) ; `Status` passe `_bkp_status_timeout()` (`BORGHELPERWWW_BKP_STATUS_TIMEOUT`, lu comme borgHelperWWW) et
+   (`COALESCE(started_at >= datetime('now','-N seconds'),0)` faux, même condition que `bkp_running_state` de `/access`).
+   1.0.155 (story 18) : ligne « ouverte » au sens de `_BKP_OPEN_WHERE`, partagé avec `bkp_running_state` — sans fin, et
+   aucun Bkp démarré après elle (ordre `started_at` puis `rowid`, celui de `last_bkp_status`) n'a fini en succès ; Status
+   montre la plus récente. Un Bkp tué suivi d'un Bkp réussi n'est plus rendu ; un Bkp vivant suivi d'un Bkp en échec
+   (second Bkp arrêté par le verrou du dépôt tenu par le premier : `priority.lock` admet plusieurs porteurs) l'est
+   toujours ; un Bkp tué suivi d'un échec reste rendu jusqu'au délai (« probablement interrompu » ensuite). Délai :
+   `bkp_status_timeout(nick)` → `_bkp_status_timeout(cfg, nick)` : clé rc `BKP_STATUS_TIMEOUT` (lecture `raw`, section
+   ou `[DEFAULT]` ; une clé vide dans la section masque `[DEFAULT]`), sinon la variable, sinon 21600 ;
+   `_bkp_timeout_parse` : `N`, `Ns`, `Nm`, `Nh` ou un nombre, ≥ 1 s, plafond 10 ans (au-delà `datetime()` rend NULL),
+   invalide → 21600 ; `[WARN]` une fois par (nick, source, valeur) si invalide ou < 300 s. Relu à chaque appel : un
+   abaissement s'applique aussi aux Bkp en cours. Limites : horloge qui recule (une ligne datée dans le futur reste la
+   plus récente) ; CLI et service ne lisent le même délai que s'ils lisent le même rc (`-C` et
+   `BORGHELPERWWW_CFGFILE`). `Status`
    range une ligne périmée dans `bkp_stale` (« probablement interrompu »), jamais dans `bkp_running`. Délai et non
    verrou : `backup()` relâche `priority.lock` avant son Index de fin, ligne encore ouverte, et un Index externe peut tenir
    `index-running.lock` — aucun verrou ne prouve qu'un Bkp vit.

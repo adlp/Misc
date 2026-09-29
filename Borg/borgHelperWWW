@@ -59,14 +59,14 @@ def _push_deps_hint(err):
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail, glob_args,
                          DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec,
-                         _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES, _enc_header_read, sentry_alert,
+                         _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES, _enc_header_read, sentry_alert, _bkp_status_timeout,
                          _sentry_alert_kinds, db_plain_anomalies, _cfg_bool, convert_octets_readable,
                          op_allowed, allowed_ops, is_external)
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.28.3"
+WWW_VERSION="1.28.4"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -328,12 +328,10 @@ try: SCHEMA_CHECK_INTERVAL=max(60,int(os.environ.get('BORGHELPERWWW_SCHEMA_CHECK
 except ValueError: SCHEMA_CHECK_INTERVAL=3600
 # Une valeur non numérique planterait au démarrage, et une valeur <1 produit un modificateur SQLite
 # datetime invalide (NULL silencieux -> la branche timeout AD-7 ne matche jamais) : repli sur le
-# défaut dans les deux cas, même motif que _stats_retention_months (borgHelper).
-try:
-    BKP_STATUS_TIMEOUT=int(os.environ.get('BORGHELPERWWW_BKP_STATUS_TIMEOUT','21600'))
-    if BKP_STATUS_TIMEOUT<1: BKP_STATUS_TIMEOUT=21600
-except ValueError:
-    BKP_STATUS_TIMEOUT=21600
+# défaut dans les deux cas, même motif que _stats_retention_months (borgHelper). 1.28.4 : lecture de borgHelper
+# (_bkp_status_timeout : suffixes s/m/h, plafond 10 ans, [WARN] si invalide ou < 300 s) — défaut global, la clé rc
+# BKP_STATUS_TIMEOUT d'un nick l'emporte (_bkp_timeout).
+BKP_STATUS_TIMEOUT=_bkp_status_timeout()
 
 # Story 2a (spec-notifications-push) : durée d'expiration par défaut (jours) d'un abonnement push
 # quand expires_in_days est absent de POST /push/subscribe. Env var seule, même patron simple que
@@ -422,6 +420,13 @@ print(f"Actions destructrices (Prune/DelBkp) : {'AUTORISÉES' if ALLOW_DESTRUCTI
 # jamais qu'un seul (l'autre voit 0 ligne affectée et passe). Story 2b : la réclamation (début ET
 # fin) déclenche désormais un envoi push réel (`_send_bkp_push`, pywebpush) en plus du log serveur
 # — remplace la simple journalisation de la Story 1.
+def _bkp_timeout(nick):
+    """Délai du nick (1.28.4, story 18) : clé rc BKP_STATUS_TIMEOUT du nick ou [DEFAULT], sinon BKP_STATUS_TIMEOUT
+    (variable BORGHELPERWWW_BKP_STATUS_TIMEOUT, sinon 6 h) — le même que Status (BorgHelper.bkp_status_timeout).
+    Jamais d'exception (watcher, /access)."""
+    try: return _bh_paths.bkp_status_timeout(nick)
+    except (Exception,SystemExit): return BKP_STATUS_TIMEOUT
+
 def _bkp_status_watcher_pass():
     """Un passage d'interrogation : parcourt chaque nick connu, réclame les lignes bkp_status prêtes
     — à la fois le passage de FIN (terminées, ou bloquées depuis plus de BKP_STATUS_TIMEOUT secondes,
@@ -432,7 +437,8 @@ def _bkp_status_watcher_pass():
             db_path=_bh_paths.db.get_diff_db(nick)
             _bh_paths.db.ensure_diff_db(db_path,create=False)  # AD-12 : jamais créer pour un nick sans historique ; migre une base antérieure (1.0.139)
             hist=_bh_paths.db.get_history_db(nick)              # bkp_status vit dans history.db (borgHelper 1.0.139) ; absente -> rien
-            for row in _bh_paths.db.list_pending_bkp_status(nick,BKP_STATUS_TIMEOUT,hist):
+            timeout_s=_bkp_timeout(nick)   # 1.28.4 : délai du nick (clé rc, sinon variable, sinon 6 h)
+            for row in _bh_paths.db.list_pending_bkp_status(nick,timeout_s,hist):
                 if not _bh_paths.db.claim_bkp_status(nick,row['run_id'],hist):
                     continue  # déjà réclamée par un autre worker (CAS perdu) — jamais de double traitement
                 result=row['result'] if row['finished_at'] else 'error'  # AD-7 : jamais fini = échec
@@ -445,8 +451,8 @@ def _bkp_status_watcher_pass():
                     # Bloquée au-delà de BKP_STATUS_TIMEOUT (AD-7) : seul le watcher le constate. Un échec
                     # ordinaire est déjà signalé à Sentry par borgHelper lui-même (même réglage) — pas de doublon.
                     sentry_alert('bkp_error',nick,f"Sauvegarde bloquée ou interrompue — {nick} "
-                                 f"(sans fin après {BKP_STATUS_TIMEOUT} s)",_bh_paths.borg.cfgread(nick),
-                                 extra={'run_id':row['run_id'],'timeout_s':BKP_STATUS_TIMEOUT},release=f"borgHelperWWW@{WWW_VERSION}")
+                                 f"(sans fin après {timeout_s} s)",_bh_paths.borg.cfgread(nick),
+                                 extra={'run_id':row['run_id'],'timeout_s':timeout_s},release=f"borgHelperWWW@{WWW_VERSION}")
             for row in _bh_paths.db.list_pending_bkp_status_start(nick,hist):
                 if not _bh_paths.db.claim_bkp_status_start(nick,row['run_id'],hist):
                     continue  # déjà réclamée par un autre worker (CAS perdu) — jamais de double traitement
@@ -514,7 +520,7 @@ def _check_overdue(nick,db_path):
     cfg=_bh_paths.borg.cfgread(nick)
     max_age=_max_age_bkp(cfg)
     if age is None or age<=max_age: return
-    if _bh_paths.db.bkp_running(nick,BKP_STATUS_TIMEOUT,_bh_paths.db.get_history_db(nick)): return  # history.db (1.0.139)
+    if _bh_paths.db.bkp_running(nick,_bkp_status_timeout(cfg=cfg,nick=nick),_bh_paths.db.get_history_db(nick)): return  # history.db (1.0.139) ; délai du nick, cfg déjà lu (1.28.4)
     level=int(age//max_age)
     # Alerte Sentry (1.26.8, SENTRY_ALERTS=overdue) : canal indépendant du push — réservation propre
     # ('<nick>#sentry' dans overdue_alerts), mêmes rappels à chaque période MAX_AGE_BKP.
@@ -641,7 +647,7 @@ def _schema_watch_pass():
 
 async def _bkp_status_watcher():
     print(f"[watcher] bkp_status démarré — interrogation toutes les {BKP_WATCHER_INTERVAL}s, "
-          f"timeout AD-7 {BKP_STATUS_TIMEOUT}s",file=sys.stderr,flush=True)
+          f"timeout AD-7 {BKP_STATUS_TIMEOUT}s par défaut (clé rc BKP_STATUS_TIMEOUT par nick)",file=sys.stderr,flush=True)
     next_purge=0.0; next_schema=0.0
     while True:
         # (Exception,SystemExit) sur les trois passages (1.27.6) : un sys.exit de borgHelper appelé en
@@ -2524,7 +2530,8 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
         except (Exception,SystemExit): pass
         # 1.28.1 (story 8 R3) : Bkp en cours depuis moins de BKP_STATUS_TIMEOUT (au-delà : bloqué, le watcher le traite
         # en échec) ; None = lecture impossible — l'UI n'y voit jamais une fin de Bkp.
-        try: out['bkp_running']=_bh_paths.db.bkp_running_state(n,BKP_STATUS_TIMEOUT)
+        # 1.28.4 (story 18) : délai du nick ; dernière ligne du nick seulement (borgHelper 1.0.155, comme Status).
+        try: out['bkp_running']=_bh_paths.db.bkp_running_state(n,_bkp_timeout(n))
         except (Exception,SystemExit): out['bkp_running']=None
         # 1.28.2 (story 12 A4) : résultat du dernier Index du nick (CLI, cron ou POST /index) ; None si absent/illisible.
         try: out['index_last']=_bh_paths.db.read_index_last(n)
@@ -3535,6 +3542,30 @@ def push_selftest():
                     return during==[] and sent==[('overdue','ovr')] and hist.endswith('rc-ovr-history.db')
                 finally: shutil.rmtree(d,ignore_errors=True)
             check("retard : Bkp en cours lu dans history.db (non simulé) -> alerte suspendue, puis envoyée une fois fini",_overdue_real_bkp_running)
+            def _overdue_key():
+                """1.28.4 (story 18) : délai du nick pour l'alerte de retard — ligne ouverte de 2 min : alerte suspendue sans clé
+                (6 h), envoyée avec BKP_STATUS_TIMEOUT=60 dans la section du nick (Bkp tenu pour interrompu)."""
+                d=tempfile.mkdtemp(prefix='bhwww-ovk-'); dp=os.path.join(d,'rc-ovk-diff.db'); sent=[]
+                base={'MAX_AGE_BKP':'25','SENTRY_ALERTS':'overdue'}; cfg=dict(base)
+                def _rec(kind,nick,msg,c,extra=None,release=None):
+                    if kind in _sentry_alert_kinds(c): sent.append((kind,nick))
+                    return True
+                try:
+                    with mock.patch.object(_bh_paths.db,'get_diff_db',lambda n: dp), \
+                         mock.patch.object(_bh_paths.db,'last_archive_stat',lambda n,p=None:('OK1',(_dt.datetime.now()-_dt.timedelta(hours=30)).isoformat())), \
+                         mock.patch.object(_bh_paths.borg,'cfgread',lambda n,*a,**k: cfg), \
+                         mock.patch(f"{__name__}.sentry_alert",side_effect=_rec), \
+                         mock.patch(f"{__name__}._PYWEBPUSH_AVAILABLE",False), \
+                         contextlib.redirect_stderr(io.StringIO()):
+                        hist=_bh_paths.db.get_history_db('ovk')
+                        _bh_paths.db.store_bkp_status_start('ovk','runK',hist)
+                        c=sqlite3.connect(hist); c.execute("UPDATE bkp_status SET started_at=datetime('now','-120 seconds')"); c.commit(); c.close()
+                        _check_overdue('ovk',dp); without=list(sent)
+                        cfg['BKP_STATUS_TIMEOUT']='60'
+                        _check_overdue('ovk',dp)
+                    return without==[] and sent==[('overdue','ovk')]
+                finally: shutil.rmtree(d,ignore_errors=True)
+            check("retard : délai du nick (clé BKP_STATUS_TIMEOUT) — ligne ouverte de 2 min suspend l'alerte à 6 h, pas à 60 s",_overdue_key)
             def _push_mute_flow():
                 """1.27.2 : PUSH_MUTE=true (rc, relu à chaque envoi) -> rien envoyé, alerte de retard NON consommée
                 (part à la reprise) ; BORGHELPERWWW_PUSH_DISABLED -> rien envoyé (fin de sauvegarde comprise)."""
@@ -4029,6 +4060,60 @@ def push_selftest():
                     if not ok: print(f"  /access bkp_running : aucune {none}, récent {fresh}, tué {stale}, illisible {broken}")
                     return ok
                 if _internal: check("/access : Bkp tué (plus vieux que BKP_STATUS_TIMEOUT) -> false, récent -> true, base illisible -> null",_access_bkp_timeout)
+                def _access_bkp_last_row_key():
+                    """1.28.4 (story 18), vraie history.db jetable : seule la dernière ligne du nick compte (Bkp tué puis Bkp
+                    fini -> false ; puis Bkp en cours -> true) ; clé rc BKP_STATUS_TIMEOUT du nick (60 s) appliquée par /access
+                    et par le watcher (réclamation en échec, message « sans fin après 60 s »), 6 h sans la clé."""
+                    hp=os.path.join(tempfile.mkdtemp(prefix='bhw-s18-'),'h.db')
+                    db=_bh_paths.db; db.ensure_history_db(hp,create=True)
+                    base=_orig_cfgread(_internal)
+                    cp=configparser.ConfigParser(interpolation=None); cp.optionxform=str
+                    cp.read_dict({_internal:{**({k:base.get(k,raw=True) for k in base} if base is not None else {}),'BKP_STATUS_TIMEOUT':'60'}})
+                    keyed=lambda: mock.patch.object(_bh_paths.borg,'cfgread',side_effect=lambda n,*x,**k: cp[_internal] if n==_internal else _orig_cfgread(n,*x,**k))
+                    def age(run,sec):
+                        c=sqlite3.connect(hp); c.execute(f"UPDATE bkp_status SET started_at=datetime('now','-{sec} seconds') WHERE run_id=?",(run,)); c.commit(); c.close()
+                    def get(n=None):
+                        with mock.patch.object(db,'history_path',return_value=hp):
+                            return client.get(f"{P}/access",headers=H).json()['nicks'][n or _internal]['bkp_running']
+                    with mock.patch.object(db,'history_path',return_value=hp):
+                        nk_all=client.get(f"{P}/access",headers=H).json()['nicks']
+                    other=next((n for n,v in nk_all.items() if n!=_internal and 'bkp_running' in v),None)   # garde 6 h
+                    try:
+                        db.store_bkp_status_start(_internal,'s18-tue',db_path=hp); age('s18-tue',3600)
+                        killed=get()
+                        db.store_bkp_status_start(_internal,'s18-fini',db_path=hp); db.store_bkp_status_finish(_internal,'s18-fini','success',db_path=hp)
+                        age('s18-fini',1800)
+                        after_done=get()
+                        db.store_bkp_status_start(_internal,'s18-cours',db_path=hp)
+                        running=get()
+                        age('s18-cours',120)
+                        no_key=get()
+                        if other: db.store_bkp_status_start(other,'s18-autre',db_path=hp); age('s18-autre',120)
+                        with keyed(): with_key=get(); other_keyed=get(other) if other else True
+                        # watcher : délai du nick passé à list_pending_bkp_status, repris dans le message Sentry
+                        seen=[]; msgs=[]; extras=[]
+                        row={'run_id':'s18-w','started_at':'x','finished_at':None,'result':None,'changed_during_backup':None,'read_errors':None}
+                        def _pending(n,t,p=None): seen.append((n,t)); return [row] if n==_internal else []
+                        with mock.patch(f"{__name__}._nick_list",lambda x:[n for n in (other,_internal) if n]), \
+                             mock.patch.object(db,'ensure_diff_db',lambda p,create=True: None), \
+                             mock.patch.object(db,'list_pending_bkp_status',_pending), \
+                             mock.patch.object(db,'claim_bkp_status',lambda n,r,p=None: True), \
+                             mock.patch.object(db,'list_pending_bkp_status_start',lambda n,p=None:[]), \
+                             mock.patch(f"{__name__}._send_bkp_push",lambda *a,**k: None), \
+                             mock.patch(f"{__name__}._check_overdue",lambda n,p: None), \
+                             mock.patch(f"{__name__}.sentry_alert",lambda kind,n,msg,*a,**k: (msgs.append(msg),extras.append(k.get('extra')))), \
+                             contextlib.redirect_stderr(io.StringIO()):
+                            _bkp_status_watcher_pass()
+                            with keyed(): _bkp_status_watcher_pass()
+                    finally: shutil.rmtree(os.path.dirname(hp),ignore_errors=True)
+                    o=[(other,BKP_STATUS_TIMEOUT)] if other else []
+                    ok=(other is not None and (killed,after_done,running,no_key,with_key,other_keyed)==(True,False,True,True,False,True)
+                        and seen==o+[(_internal,BKP_STATUS_TIMEOUT)]+o+[(_internal,60)]
+                        and len(msgs)==2 and f"sans fin après {BKP_STATUS_TIMEOUT} s" in msgs[0] and "sans fin après 60 s" in msgs[1]
+                        and [e.get('timeout_s') for e in extras]==[BKP_STATUS_TIMEOUT,60])
+                    if not ok: print(f"  /access dernière ligne / clé : {(killed,after_done,running,no_key,with_key,other_keyed)} {other} {seen} {msgs} {extras}")
+                    return ok
+                if _internal: check("/access et watcher : ligne effacée par un Bkp plus récent réussi (tué puis réussi -> false) ; clé rc BKP_STATUS_TIMEOUT par nick, autre nick à 6 h",_access_bkp_last_row_key)
                 def _access_bkp_last():
                     """1.28.3 (story 15), vraie history.db jetable : bkp_last = dernier Bkp du nick (en cours puis fini, run_id
                     relayé) ; aucune ligne -> null ; base illisible -> null (200) ; base absente jamais créée."""

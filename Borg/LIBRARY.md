@@ -354,8 +354,15 @@ for row in pending:
         print('réclamée :', row['run_id'])
 
 # Bkp en cours (1.0.145) : True (démarré depuis moins de timeout_s, sans fin), False (aucun, ou bloqué
-# au-delà), None (history.db illisible — ne jamais le prendre pour une fin de Bkp).
-state = bh.db.bkp_running_state('mon-serveur', timeout_s=21600)
+# au-delà), None (history.db illisible — ne jamais le prendre pour une fin de Bkp). 1.0.155 : une ligne ouverte n'est
+# effacée que par un Bkp plus récent réussi (tué puis réussi -> False ; vivant puis échec -> True) ; timeout_s < 1 s ou
+# invalide : 21600, plafond 10 ans.
+state = bh.db.bkp_running_state('mon-serveur', timeout_s=bh.bkp_status_timeout('mon-serveur'))
+
+# Délai du nick (1.0.155) : clé rc BKP_STATUS_TIMEOUT (section ou [DEFAULT] ; secondes ou suffixe s/m/h), sinon
+# BORGHELPERWWW_BKP_STATUS_TIMEOUT, sinon 21600 ; valeur invalide : 21600 ; [WARN] si invalide ou < 300 s ; jamais
+# d'exception (nick absent, rc illisible).
+timeout_s = bh.bkp_status_timeout('mon-serveur')
 
 # Dernière ligne du nick si elle est sans fin (Status) : {'run_id','started_at'}, sinon None (1.0.154 : un Bkp tué suivi
 # d'autres Bkp n'est plus rendu) ; avec timeout_s, clé 'stale' en plus — True au-delà du délai (Bkp tenu pour

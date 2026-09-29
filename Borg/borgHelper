@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.154"
+Version="1.0.155"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -178,6 +178,15 @@ _DIFF_TYPE_OF_SUFFIX={'directory':'d','link':'l','fifo':'p','chrdev':'c','blkdev
 _DIFF_ADDED_TYPES=('added',)+tuple('added '+x for x in _DIFF_TYPE_OF_SUFFIX)
 _DIFF_REMOVED_TYPES=('removed',)+tuple('removed '+x for x in _DIFF_TYPE_OF_SUFFIX)
 
+def _exclu_detail(by_ct):
+    """Détail des exclus d'IdxTop/DiffTop (1.0.155, story 18) : {change_type: (nombre, taille)} -> '+N · -N · =N', par
+    familles comme Report (_diff_stats_for_nick) : ajouts (_DIFF_ADDED_TYPES), suppressions (_DIFF_REMOVED_TYPES), tout le
+    reste (modified, changed link, mode…) ; la somme vaut toujours le total. Avant, seuls added/removed/modified."""
+    fam={'+':0,'-':0,'=':0}
+    for ct,(n,_sz) in by_ct.items():
+        fam['+' if ct in _DIFF_ADDED_TYPES else '-' if ct in _DIFF_REMOVED_TYPES else '=']+=n or 0
+    return ' · '.join(f"{k}{v:,}" for k,v in fam.items() if v)
+
 def _diff_entry_type(change_type,size_before=None):
     """Type borg ('-','d','l','p','c','b', clés de _TREEHIST_GENRES) d'une ligne diff_index d'après son
     change_type ; None si l'événement ne le dit pas (changement de mode/propriétaire/dates seul). Repli
@@ -264,15 +273,50 @@ def _bkp_running_readable(started_at):
 
 _BKP_STATUS_TIMEOUT_MAX=10*365*86400   # au-delà, datetime('now','-N seconds') rend NULL (ligne tenue pour interrompue)
 
-def _bkp_status_timeout(value=None):
-    """Délai (s) au-delà duquel un Bkp sans fin est tenu pour interrompu (1.0.154, story 17) : même variable et même
-    lecture que BKP_STATUS_TIMEOUT de borgHelperWWW (AD-7), plafonnée à 10 ans. Le watcher, /access et Status disent la
-    même chose tant qu'ils voient la même valeur : la variable se lit dans l'environnement de chaque processus (celui du
-    service pour borgHelperWWW, celui du shell ou du cron pour Status). value : valeur à valider au lieu de la variable."""
-    try:
-        t=int(os.environ.get('BORGHELPERWWW_BKP_STATUS_TIMEOUT','21600') if value is None else value)
-        return min(t,_BKP_STATUS_TIMEOUT_MAX) if t>=1 else 21600
-    except (ValueError,TypeError): return 21600
+# 1.0.155 (story 18) : ligne bkp_status « ouverte » du nick — sans fin, et aucun Bkp démarré après elle (ordre started_at
+# puis rowid, celui de last_bkp_status) n'a fini en succès. Un Bkp tué suivi d'un Bkp réussi n'est plus « en cours » ; un
+# Bkp vivant suivi d'un Bkp en échec (verrou du dépôt tenu par le premier) l'est toujours. Alias de table : b.
+_BKP_OPEN_WHERE=("b.nick=? AND b.finished_at IS NULL AND NOT EXISTS (SELECT 1 FROM bkp_status s WHERE s.nick=b.nick "
+                 "AND s.result='success' AND (s.started_at>b.started_at OR (s.started_at=b.started_at AND s.rowid>b.rowid)))")
+_BKP_TIMEOUT_WARNED=set()
+
+def _bkp_timeout_parse(v):
+    """'90' / '90s' / '5m' / '12h' (ou un nombre) -> secondes, >= 1, plafonnées à 10 ans ; sinon None (1.0.155)."""
+    if isinstance(v,bool): return None
+    if isinstance(v,(int,float)):
+        try: n=int(v)
+        except (ValueError,OverflowError): return None   # nan, inf
+    else:
+        m=re.fullmatch(r'\s*(\d+)\s*([smhSMH]?)\s*',str(v))
+        if not m: return None
+        n=int(m.group(1))*{'':1,'s':1,'m':60,'h':3600}[m.group(2).lower()]
+    return min(n,_BKP_STATUS_TIMEOUT_MAX) if n>=1 else None
+
+def _bkp_status_timeout(value=None,cfg=None,nick=None):
+    """Délai (s) au-delà duquel un Bkp sans fin est tenu pour interrompu (1.0.154, story 17), plafonné à 10 ans.
+    1.0.155 (story 18) : cfg (section rc du nick) — clé BKP_STATUS_TIMEOUT (section ou [DEFAULT]) si présente et non
+    vide, sinon la variable BORGHELPERWWW_BKP_STATUS_TIMEOUT (environnement de chaque processus), sinon 21600. Valeur :
+    secondes, ou suffixe s/m/h ; invalide -> 21600. [WARN] une fois par nick et par valeur si elle est invalide ou sous
+    300 s (un Bkp plus long serait notifié en échec). value : valeur à valider telle quelle (ni clé ni variable)."""
+    if value is not None:
+        t=_bkp_timeout_parse(value); return t if t is not None else 21600
+    src=v=None
+    if cfg is not None:
+        try: v=cfg.get('BKP_STATUS_TIMEOUT',raw=True) if hasattr(cfg,'parser') else cfg.get('BKP_STATUS_TIMEOUT')
+        except Exception: v='?'   # section illisible : clé invalide
+        v=str(v or '').strip()
+        if v: src='BKP_STATUS_TIMEOUT'
+    if not src:
+        v=(os.environ.get('BORGHELPERWWW_BKP_STATUS_TIMEOUT') or '').strip()
+        if not v: return 21600
+        src='BORGHELPERWWW_BKP_STATUS_TIMEOUT'
+    t=_bkp_timeout_parse(v)
+    if (t is None or t<300) and (nick,src,v) not in _BKP_TIMEOUT_WARNED:
+        _BKP_TIMEOUT_WARNED.add((nick,src,v))
+        who=f"{nick}: " if nick else ''
+        printer(f"[WARN] {who}{src}={v!r} invalide — 6 h appliquées (secondes, ou suffixe s/m/h : 90s, 5m, 12h)" if t is None else
+                f"[WARN] {who}{src}={v!r} : {t} s, très court — un Bkp plus long sera notifié en échec (suffixe h pour des heures)")
+    return t if t is not None else 21600
 
 def prettyTabelise(tab):
     from prettytable import PrettyTable
@@ -707,12 +751,16 @@ def usage(doc=None,debug=0):
     elif doc=='status':
         printer("   -c Status [-n nick1,nick2/ALL] [-j]")
         printer("       État rapide (dernier backup connu + âge, Bkp en cours depuis quand, opération")
-        printer("       prioritaire Restore/Prune en cours) par nick — 100% local, lit archive_stats/")
+        printer("       prioritaire Restore/Prune/DelBkp en cours) par nick — 100% local, lit archive_stats/")
         printer("       bkp_status/priority.lock, jamais d'appel borg (rapide, hors ligne)")
         printer("       -n nick1,nick2 ou ALL : plusieurs nicks nativement (contrairement à RepoHistory/")
         printer("       ArchiveHistory)  |  -j : JSON, toujours une liste [{nick,last_backup,bkp_running,")
-        printer("       priority_op_running}, ...]")
-        printer("       Restore et Prune ne sont pas distingués (priority.lock ne porte pas cette info)")
+        printer("       bkp_stale,priority_op_running,build,rebuild}, ...]")
+        printer("       Bkp sans fin au-delà du délai : « probablement interrompu » (bkp_stale {started_at,timeout_s},")
+        printer("       bkp_running null) ; délai = clé rc BKP_STATUS_TIMEOUT du nick ou [DEFAULT] (90s, 5m, 12h),")
+        printer("       sinon variable BORGHELPERWWW_BKP_STATUS_TIMEOUT, sinon 6 h — le même que borgHelperWWW")
+        printer("       build/rebuild : état de construction de la base servie / du fantôme (Index par tranches)")
+        printer("       Restore, Prune et DelBkp ne sont pas distingués (priority.lock ne porte pas cette info)")
     elif doc=='idxpurge':
         printer("   -c IdxPurge [-x <pattern>] [-n nick/servername/ALL] [-D]")
         printer("       Purge rétroactive des entrées diff_index + anciens snapshots + VACUUM")
@@ -2575,7 +2623,7 @@ class BorgHelperDB:
         except sqlite3.Error: return None
 
     def bkp_running(self,nick,timeout_s,db_path=None):
-        """True si un Bkp de ce nick est en cours : ligne bkp_status sans finished_at, démarrée depuis
+        """True si un Bkp de ce nick est en cours : ligne bkp_status ouverte du nick (_BKP_OPEN_WHERE), démarrée depuis
         moins de timeout_s secondes (au-delà : bloquée, traitée en échec par le watcher, AD-7).
         Jamais de création de base (AD-12). Lecture impossible : False (voir bkp_running_state)."""
         return self.bkp_running_state(nick,timeout_s,db_path) is True
@@ -2583,14 +2631,17 @@ class BorgHelperDB:
     def bkp_running_state(self,nick,timeout_s,db_path=None):
         """Comme bkp_running, à trois états (1.0.145, story 8 R3) : True (Bkp en cours depuis moins de timeout_s),
         False (aucun, ou bloqué au-delà : traité en échec par le watcher), None (lecture impossible — jamais
-        confondue avec une fin de Bkp). history.db absente : False. Jamais de création de base (AD-12)."""
+        confondue avec une fin de Bkp). history.db absente : False. Jamais de création de base (AD-12).
+        1.0.155 (story 18, A18) : ligne ouverte au sens de _BKP_OPEN_WHERE (effacée par un Bkp plus récent réussi, comme
+        Status) — un Bkp tué suivi d'un Bkp réussi n'est plus « en cours » jusqu'au délai, un Bkp vivant suivi d'un Bkp en
+        échec l'est toujours ; timeout_s validé (_bkp_timeout_parse : < 1 s ou invalide -> 21600, plafond 10 ans)."""
         try:
             db_path=self._hist(nick,db_path)
             if db_path is None: return False
             conn=_open_db(db_path,nick=None,role='read')
             try:
-                return conn.execute("SELECT 1 FROM bkp_status WHERE nick=? AND finished_at IS NULL "
-                    f"AND started_at >= datetime('now','-{int(timeout_s)} seconds') LIMIT 1",(nick,)).fetchone() is not None
+                return conn.execute(f"SELECT 1 FROM bkp_status b WHERE {_BKP_OPEN_WHERE} "
+                    "AND b.started_at >= datetime('now',?) LIMIT 1",(nick,f"-{_bkp_status_timeout(timeout_s)} seconds")).fetchone() is not None
             finally: conn.close()
         except (sqlite3.Error,OSError,DbKeyError,DbModeError,DbTamperError,DbCodecError,SchemaVersionError): return None
 
@@ -2645,8 +2696,9 @@ class BorgHelperDB:
         """Ligne bkp_status la plus récente encore en cours (finished_at IS NULL) pour ce nick, s'il y
         en a une (normalement 0 ou 1, jamais plus — un seul Bkp actif à la fois par nick via
         priority.lock). Lecture seule, aucune réclamation — utilisée par la commande Status (100%
-        locale, jamais d'appel boex). 1.0.154 (story 17) : seulement si c'est la dernière ligne du nick (même ordre que
-        last_bkp_status) — un Bkp tué suivi d'autres Bkp n'est plus rendu. timeout_s : ajoute 'stale' — True si la ligne
+        locale, jamais d'appel boex). 1.0.154 (story 17) : un Bkp tué suivi d'autres Bkp n'est plus rendu ; 1.0.155 (story 18) :
+        la plus récente des lignes ouvertes au sens de _BKP_OPEN_WHERE (effacée seulement par un Bkp plus récent réussi :
+        un Bkp vivant suivi d'un Bkp en échec sur le verrou du dépôt reste rendu). timeout_s : ajoute 'stale' — True si la ligne
         a démarré depuis plus de timeout_s secondes (même condition que bkp_running_state : Bkp tenu pour interrompu) ;
         validé comme la variable (< 1 : 21600, plafond 10 ans)."""
         db_path=self._hist(nick,db_path)
@@ -2657,10 +2709,9 @@ class BorgHelperDB:
             conn=_open_db(db_path,nick=None,role='read')
             t=_bkp_status_timeout(timeout_s) if timeout_s is not None else 0
             row=conn.execute(
-                "SELECT run_id,started_at,finished_at,COALESCE(started_at >= datetime('now',?),0) FROM bkp_status "
-                "WHERE nick=? ORDER BY started_at DESC, rowid DESC LIMIT 1",(f"-{t} seconds",nick)).fetchone()
-            if not row or row[2] is not None: return None
-            row=(row[0],row[1],row[3])
+                "SELECT run_id,started_at,COALESCE(started_at >= datetime('now',?),0) FROM bkp_status b "
+                f"WHERE {_BKP_OPEN_WHERE} ORDER BY b.started_at DESC, b.rowid DESC LIMIT 1",(f"-{t} seconds",nick)).fetchone()
+            if not row: return None
             r={'run_id':row[0],'started_at':row[1]}
             if timeout_s is not None: r['stale']=not row[2]
             return r
@@ -6202,8 +6253,6 @@ class BorgHelper:
         except sqlite3.Error as e:
             _close_quiet(conn)
             printer(f"  SQLite error ({db_path}): {e}"); return
-        if not total_count:
-            printer(f"  {nick}: diff_index vide"); return
         conn2=None
         try:
             conn2=_open_db(db_path,nick=nick,role='read')
@@ -6230,6 +6279,8 @@ class BorgHelper:
             nfiles_d={r[0]:r[1] for r in nfiles_rows if r[1]}
         except sqlite3.Error:
             _close_quiet(conn2); exclu_by_ct={}; exclu_n=0; exclu_sz=0; idx_am_d={}; exclu_am_d={}; nfiles_d={}
+        if not total_count and not exclu_n:   # 1.0.155 : diff_index vidé par IdxPurge -> ses exclus restent affichés
+            printer(f"  {nick}: diff_index vide"); return
         top=sorted(stats.items(),key=lambda x:x[1]['count'],reverse=True)[:topn]
         from prettytable import PrettyTable
         t=PrettyTable(); t.field_names=['arborescence','entrées','taille','% total']
@@ -6241,7 +6292,7 @@ class BorgHelper:
         printer(f"\n{nick} — top {topn} arborescences dans diff_index (profondeur {depth})")
         printer(f"Indexés : {total_count:,} entrées · {convert_octets_readable(total_size)}")
         if exclu_n:
-            exclu_detail=' · '.join(f"{s}{exclu_by_ct[ct][0]:,}" for ct,s in [('added','+'),('removed','-'),('modified','=')] if ct in exclu_by_ct)
+            exclu_detail=_exclu_detail(exclu_by_ct)
             printer(f"Exclus  : {exclu_n:,} entrées · {convert_octets_readable(exclu_sz)} (IDX_* / IdxPurge) — {exclu_detail}")
         archives_with_nfiles=sorted(arch for arch in nfiles_d if arch in idx_am_d or arch in exclu_am_d)
         if archives_with_nfiles:
@@ -6253,7 +6304,7 @@ class BorgHelper:
                 unch=max(0,nf-add_t-mod_t)
                 pct=f" ({100*unch//nf}%)" if nf>0 else ""
                 printer(f"  {arch} : {unch:,}{pct} / {nf:,} fichiers")
-        printer(str(t))
+        if total_count: printer(str(t))
 
     def repo_history(self,nick,debug=0,as_json=False):
         """Story 2 (spec-charts-evolution-sauvegardes) : historique brut repo_stats (colonnes brutes,
@@ -6408,8 +6459,10 @@ class BorgHelper:
                 pass
             finally:
                 if conn is not None: conn.close()
-        # history.db (1.0.139). 1.0.154 (story 17) : au-delà du délai de /access, Bkp interrompu (bkp_stale), plus « en cours »
-        bkp_row=self.db.get_running_bkp_status(nick,timeout_s=_bkp_status_timeout())
+        # history.db (1.0.139). 1.0.154 (story 17) : au-delà du délai de /access, Bkp interrompu (bkp_stale), plus « en cours ».
+        # 1.0.155 (story 18) : délai du nick (clé rc BKP_STATUS_TIMEOUT, puis variable, puis 6 h), le même que borgHelperWWW
+        timeout_s=self.bkp_status_timeout(nick)
+        bkp_row=self.db.get_running_bkp_status(nick,timeout_s=timeout_s)
         bkp_running=bkp_row if bkp_row and not bkp_row['stale'] else None
         bkp_stale=bkp_row if bkp_row and bkp_row['stale'] else None
         rebuild=None   # fantôme (1.0.143, AD-10) : son build_state, lu sans codec ni borg ; {'state':'partial'} s'il n'en a pas
@@ -6422,11 +6475,19 @@ class BorgHelper:
             'nick':nick,
             'last_backup':last_backup,
             'bkp_running':{'started_at':bkp_running['started_at']} if bkp_running else None,
-            'bkp_stale':{'started_at':bkp_stale['started_at']} if bkp_stale else None,
+            'bkp_stale':{'started_at':bkp_stale['started_at'],'timeout_s':timeout_s} if bkp_stale else None,
             'priority_op_running':bool(self.db.check_priority_lock(nick)),
             'build':build,
             'rebuild':rebuild,
         }
+
+    def bkp_status_timeout(self,nick):
+        """Délai (s) au-delà duquel un Bkp sans fin de ce nick est tenu pour interrompu (1.0.155, story 18) : clé rc
+        BKP_STATUS_TIMEOUT du nick (section ou [DEFAULT]), sinon BORGHELPERWWW_BKP_STATUS_TIMEOUT, sinon 21600. Lu par Status
+        et par borgHelperWWW (/access, watcher, alerte de retard). Nick absent ou rc illisible : variable, sinon 21600."""
+        try: cfg=self.borg.cfgread(nick)
+        except Exception: cfg=None   # rc illisible : jamais d'exception (watcher, /access)
+        return _bkp_status_timeout(cfg=cfg,nick=nick)
 
     def _status_print_one(self,st):
         printer(f"{st['nick']}:")
@@ -6449,7 +6510,7 @@ class BorgHelper:
         elif st.get('bkp_stale'):
             try: readable=_bkp_running_readable(st['bkp_stale']['started_at'])
             except (ValueError,TypeError): readable=st['bkp_stale']['started_at']
-            t=_bkp_status_timeout()
+            t=st['bkp_stale'].get('timeout_s') or _bkp_status_timeout()
             printer(f"  Bkp sans fin depuis {readable} — probablement interrompu "
                     f"(délai {f'{t//3600} h' if t%3600==0 else f'{t} s'} dépassé)")
         if st['priority_op_running'] and not st['bkp_running']:
@@ -6621,7 +6682,7 @@ class BorgHelper:
         unchanged=max(0,nfiles_new-added_total-modified_total) if nfiles_new is not None else None
         printer(f"Indexés : {total_count:,} changements · {convert_octets_readable(total_size)}")
         if exclu_n:
-            exclu_detail3=' · '.join(f"{s}{exclu_by_ct3[ct][0]:,}" for ct,s in [('added','+'),('removed','-'),('modified','=')] if ct in exclu_by_ct3)
+            exclu_detail3=_exclu_detail(exclu_by_ct3)
             printer(f"Exclus  : {exclu_n:,} entrées · {convert_octets_readable(exclu_sz)} (IDX_* / IdxPurge) — {exclu_detail3}")
         if unchanged is not None:
             pct_unch=f" ({100*unchanged//nfiles_new}%)" if nfiles_new>0 else ""
@@ -6776,7 +6837,7 @@ class BorgHelper:
                             count+=1
                             e=exclu.setdefault((a_old,a_new,ct),[0,0]); e[0]+=1; e[1]+=xsz
                 # 1.0.154 (story 17) : les entrées retirées rejoignent les exclus de leur paire (nombre + taille par type,
-                # taille comme à l'Index : size_after or size_before) — stats de Report et IdxStats inchangées, et une paire
+                # taille comme à l'Index : size_after or size_before) — stats de Report et IdxTop inchangées, et une paire
                 # vidée n'est plus « 0 entrée sans exclu » (indiscernable d'une paire vide à tort, révision de 1.0.153).
                 conn.executemany(
                     "INSERT INTO diff_excluded_stats (nick,archive_old,archive_new,change_type,file_count,total_size) "
@@ -7705,6 +7766,80 @@ def codec_selftest(pattern=None,list_only=False):
             c.commit(); c.close()
             return running and not bh.bkp_running('bsR',100,db_path=bs_path) and not bh.bkp_running('bsS',100,db_path=bs_path)
         check("bkp_running : vrai pendant un Bkp, faux une fois fini ou bloqué au-delà du timeout",_bs_running)
+        def _bs_running_last_row():
+            """1.0.155 (story 18, A18 + revue) : ligne ouverte effacée seulement par un Bkp plus récent réussi — tué puis réussi
+            -> False ; puis en cours -> True ; Bkp vivant puis Bkp en échec (verrou du dépôt) -> True ; tué puis échec -> False
+            au-delà du délai ; égalité de started_at départagée par rowid ; timeout_s validé sur une ligne d'1 h (-5, 0 : 6 h ;
+            10**12 : plafonné ; inf : 6 h). get_running_bkp_status (Status) suit la même règle."""
+            def ins(nk,run,sec,res=None):
+                c=_open_db(bs_path,nick=nk,role='write'); fin="datetime('now')" if res else 'NULL'
+                c.execute("INSERT INTO bkp_status (nick,run_id,started_at,finished_at,result) VALUES "
+                          f"(?,?,datetime('now','-{sec} seconds'),{fin},?)",(nk,run,res))
+                c.commit(); c.close()
+            st=lambda nk: bh.bkp_running_state(nk,21600,db_path=bs_path)
+            ins('bsL','tue',3600); killed=st('bsL')
+            ins('bsL','fini',1800,'success'); done=st('bsL'); done_b=bh.bkp_running('bsL',21600,db_path=bs_path)
+            ins('bsL','cours',60); run=st('bsL')
+            c=_open_db(bs_path,nick='bsL',role='write')   # égalité : 'cours' au même started_at que 'fini', rowid plus grand
+            c.execute("UPDATE bkp_status SET started_at=(SELECT started_at FROM bkp_status WHERE run_id='fini') WHERE run_id='cours'")
+            c.commit(); c.close(); tie=st('bsL')
+            ins('bsO','vivant',3600); ins('bsO','bloque',1800,'error')          # chevauchement : B échoue sur le verrou de A
+            overlap=st('bsO'); g=bh.get_running_bkp_status('bsO',db_path=bs_path,timeout_s=21600)
+            ins('bsE','tue',7*3600); ins('bsE','echec',3600,'error')            # tué puis échec : délai
+            late=st('bsE'); gE=bh.get_running_bkp_status('bsE',db_path=bs_path,timeout_s=21600)   # Status : interrompu
+            ins('bsV','cours',3600)
+            val=tuple(bh.bkp_running_state('bsV',t,db_path=bs_path) for t in (-5,0,10**12,float('inf')))
+            g2=bh.get_running_bkp_status('bsL',db_path=bs_path)
+            res=(killed,done,done_b,run,tie,overlap,late,val)
+            exp=(True,False,False,True,True,True,False,(True,True,True,True))
+            ok=(res==exp and g and g['run_id']=='vivant' and not g['stale'] and g2 and g2['run_id']=='cours'
+                and gE and gE['run_id']=='tue' and gE['stale'])
+            if not ok: print(f"  bkp_running_state : {res} {g} {g2} {gE}")
+            return ok
+        check("bkp_running_state : ligne ouverte effacée par un Bkp plus récent réussi seulement (tué puis réussi -> faux ; chevauchement -> vrai) ; délai invalide validé",_bs_running_last_row)
+        def _bkp_timeout_key():
+            """1.0.155 (story 18, A19) : délai du nick — clé rc BKP_STATUS_TIMEOUT (section, sinon [DEFAULT]) avant la variable,
+            clé vide -> variable, clé invalide/0/négative -> 21600, '%' (interpolation) ou nick absent -> variable, sinon 21600."""
+            d=tempfile.mkdtemp(prefix='bh-s18-'); rc=os.path.join(d,'rc')
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={d}\nBKP_STATUS_TIMEOUT=120\n\n[k1]\nBORG_REPO=/r\nBKP_STATUS_TIMEOUT=60\n\n[k2]\nBORG_REPO=/r\n\n"
+                        "[k3]\nBKP_STATUS_TIMEOUT=\n\n[k4]\nBKP_STATUS_TIMEOUT=abc\n\n[k5]\nBKP_STATUS_TIMEOUT=0\n\n[k6]\nBKP_STATUS_TIMEOUT=-5\n\n"
+                        "[k7]\nBKP_STATUS_TIMEOUT=%\n\n[k8]\nBKP_STATUS_TIMEOUT= 90 \n\n[k9]\nBKP_STATUS_TIMEOUT=12h\n\n"
+                        "[k10]\nBKP_STATUS_TIMEOUT=5m\n\n[k11]\nBKP_STATUS_TIMEOUT=12\n\n[k12]\nBKP_STATUS_TIMEOUT=12 h\n")
+            os.chmod(rc,0o600)
+            try:
+                b=BorgHelper(cfgfile=rc,cache_dir=d); V='BORGHELPERWWW_BKP_STATUS_TIMEOUT'; got={}
+                err=io.StringIO()
+                for env in ('300',None,'2h'):
+                    e={k:v for k,v in os.environ.items() if k!=V}
+                    if env: e[V]=env
+                    with mock.patch.dict(os.environ,e,clear=True), contextlib.redirect_stderr(err):
+                        got[env]=[b.bkp_status_timeout(n) for n in ('k1','k2','k3','k4','k5','k6','k7','k8','k9','k10','k11','k12','absent')]
+                        got[env].append(b.bkp_status_timeout('k11'))   # deuxième lecture : pas de second [WARN]
+                exp={'300':[60,120,300,21600,21600,21600,21600,90,43200,300,12,43200,300,12],
+                     None:[60,120,21600,21600,21600,21600,21600,90,43200,300,12,43200,21600,12],
+                     '2h':[60,120,7200,21600,21600,21600,21600,90,43200,300,12,43200,7200,12]}
+                w=err.getvalue()
+                # [WARN] une fois par nick et par valeur : invalides (k4 abc, k5 0, k6 -5, k7 %) et courts (k1 60, k2 120 [DEFAULT], k8 90, k11 12)
+                warn_ok=(all(w.count(f"[WARN] {n}: BKP_STATUS_TIMEOUT=")==1 for n in ('k1','k2','k4','k5','k6','k7','k8','k11'))
+                         and w.count('[WARN] k9:')==0 and w.count('[WARN] k10:')==0 and w.count('[WARN] k12:')==0
+                         and "k4: BKP_STATUS_TIMEOUT='abc' invalide" in w and "k11: BKP_STATUS_TIMEOUT='12' : 12 s, très court" in w)
+                # rc illisible (section en double) : jamais d'exception, la variable
+                bad=os.path.join(d,'bad'); open(bad,'w').write(f"[DEFAULT]\nCACHE_DIR={d}\n[k1]\nBORG_REPO=/r\n"); os.chmod(bad,0o600)
+                bb=BorgHelper(cfgfile=bad,cache_dir=d)
+                with open(bad,'a') as f: f.write("[k1]\nBORG_REPO=/s\n")   # devenu illisible après le démarrage (section en double)
+                e={k:v for k,v in os.environ.items() if k!=V}; e[V]='300'
+                with mock.patch.dict(os.environ,e,clear=True), contextlib.redirect_stderr(io.StringIO()):
+                    unreadable=bb.bkp_status_timeout('k1')
+                ok=got==exp and warn_ok and unreadable==300
+                if not ok: print(f"  délai par nick : {got} warn={warn_ok} illisible={unreadable} {w!r}")
+                return ok
+            finally: shutil.rmtree(d,ignore_errors=True)
+        check("délai des Bkp par nick : clé rc BKP_STATUS_TIMEOUT (section, [DEFAULT]) > variable > 6 h ; suffixes s/m/h ; vide, invalide, %, rc illisible ou nick absent ; [WARN] une fois",_bkp_timeout_key)
+        check("détail des exclus par familles (+ ajouts, - suppressions, = le reste), somme = total",
+              lambda: _exclu_detail({'added':(11,0),'added directory':(1,0),'mode':(1,0)})=='+12 · =1'
+                      and _exclu_detail({'removed link':(2,5),'changed link':(3,0),'modified':(1,1)})=='-2 · =4'
+                      and _exclu_detail({})=='')
         def _bs_claim_cas():
             bh.store_bkp_status_start('bsC','runC',db_path=bs_path)
             bh.store_bkp_status_finish('bsC','runC','success',db_path=bs_path)
@@ -8478,13 +8613,23 @@ def codec_selftest(pattern=None,list_only=False):
                 tot[(A2,'removed')]+=3; tot[(A2,'modified')]+=1; tot[(A3,'added')]+=2   # exclus posés à la main, zz/zero, zz/a13, zz/a23
                 ex={}
                 for ao,an,ct,n,z in _purge_exclu(nk): ex[(an,ct)]=ex.get((an,ct),0)+n
+                c=_open_db(bhq.db.get_diff_db(nk),nick=nk,role='write')   # types hors added/removed/modified (1.0.155)
+                c.execute("INSERT INTO diff_excluded_stats VALUES(?,?,?,'changed link',2,0)",(nk,A1,A2))
+                c.execute("INSERT INTO diff_excluded_stats VALUES(?,?,?,'added directory',1,0)",(nk,A1,A2)); c.commit(); c.close()
+                def _sum_ok(txt):
+                    m=re.search(r'Exclus  : ([\d,]+) entrées .*\(IDX_\* / IdxPurge\) — (.*)',txt)
+                    return bool(m) and sum(int(x.replace(',','')) for x in re.findall(r'[-+=]([\d,]+)',m.group(2)))==int(m.group(1).replace(',',''))
                 dt=_q_run(bhq.difftop,nk,f"{A1},{A2}")   # paire vidée : exclus affichés, jamais « aucune entrée »
-                dt_ok='aucune entrée' not in dt and re.search(r'Exclus  : 1[45] entrées .*\(IDX_\* / IdxPurge\)',dt) is not None
+                it=_q_run(bhq.idxtop,nk)
+                dt_ok=('aucune entrée' not in dt and _sum_ok(dt) and re.search(r'— \+2 · -11 · =4',dt) is not None
+                       and _sum_ok(it) and '| arborescence' not in dt and '| arborescence' not in it)
                 n_re=bhq._recheck_zero_pairs(nk,bhq.db.get_diff_db(nk))
+                c=_open_db(bhq.db.get_diff_db(nk),nick=nk,role='write'); c.execute("DELETE FROM diff_excluded_stats WHERE nick=?",(nk,)); c.commit(); c.close()
+                dt_ok=dt_ok and 'diff_index vide' in _q_run(bhq.idxtop,nk)   # ni entrée ni exclu : message inchangé
                 c=_open_db(bhq.db.get_diff_db(nk),nick=nk)
                 kept=c.execute("SELECT COUNT(*) FROM diff_indexed_pairs WHERE nick=?",(nk,)).fetchone()[0]; c.close()
                 one=(merged and left==0 and pairs==[(A1,A2,0),(A2,A3,0)] and ex==tot and n_re==0 and kept==2 and dt_ok)
-                if not one: print(f"  IdxPurge exclus {nk} : merged={merged} left={left} {pairs} {ex} / {tot} recheck={n_re} kept={kept} {dt!r}")
+                if not one: print(f"  IdxPurge exclus {nk} : merged={merged} left={left} {pairs} {ex} / {tot} recheck={n_re} kept={kept} dt={dt_ok} {[l for l in (dt+it).splitlines() if 'Exclus' in l]}")
                 ok=ok and one
             return ok
         check("IdxPurge : exclus existants additionnés, paire vidée = exclus des entrées retirées, jamais reprise par la révision (1.0.153)",_purge_exclu_merge)
@@ -8930,6 +9075,14 @@ def codec_selftest(pattern=None,list_only=False):
                 bhq.db.store_bkp_status_start(nk,'runLive')
                 with _env(None): st_l=bhq._status_one(nk)
                 next_ok=next_ok and st_l['bkp_running'] is not None and st_l['bkp_stale'] is None
+                # 1.0.155 (story 18) : clé rc BKP_STATUS_TIMEOUT du nick (60 s) l'emporte sur la variable (6 h)
+                with open(qrc,'a') as f: f.write("BKP_STATUS_TIMEOUT=60\n")   # dernière section du fichier : [qstold]
+                _age(120)
+                with _env('21600'): st_k=bhq._status_one(nk); txt_k=_q_run(bhq.status,nk)
+                key_ok=((st_k.get('bkp_stale') or {}).get('timeout_s')==60 and st_k['bkp_running'] is None
+                        and 'délai 60 s dépassé' in txt_k)
+                next_ok=next_ok and key_ok
+                if not key_ok: print(f"  Status clé du nick : {st_k} {txt_k!r}")
                 ok=not bad and api_ok and live_ok and both and json_ok and date_ok and next_ok
                 if not ok: print(f"  Status interrompu : api={api_ok} live={live_ok} {txt_live!r} date={date_ok} {txt30!r} next={next_ok} {txt_n!r}")
                 if not ok: print(f"  Status interrompu : {bad} {txt!r} {js}")

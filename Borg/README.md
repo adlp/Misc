@@ -66,6 +66,13 @@ MAX_AGE_BKP      = 25
 #               chaque période supplémentaire)
 # liste séparée par des virgules, ou all ; utilisable dans [DEFAULT] pour tous les serveurs
 SENTRY_ALERTS    = bkp_error,overdue
+# Délai au-delà duquel un Bkp démarré mais jamais fini est tenu pour interrompu (borgHelper >= 1.0.155,
+# borgHelperWWW >= 1.28.4) : Status « probablement interrompu », /access bkp_running false, échec notifié par le
+# watcher (définitif : la vraie fin d'un Bkp plus long n'est plus notifiée). SECONDES, ou suffixe s/m/h (12h,
+# pas 12 : contrairement à MAX_AGE_BKP, un nombre seul est en secondes). [WARN] si invalide ou < 300 s.
+# Défaut : variable BORGHELPERWWW_BKP_STATUS_TIMEOUT, sinon 6 h ; utilisable dans [DEFAULT] (vide dans la section du
+# nick : [DEFAULT] ignoré, la variable s'applique). À poser aussi dans le rc de borgHelperWWW s'il en a un dédié.
+# BKP_STATUS_TIMEOUT = 12h
 # Pause des notifications push de ce serveur (borgHelperWWW >= 1.27.2), ex. pendant une maintenance :
 # relu à chaque envoi, sans redémarrage ; journal seulement. Une alerte « en retard » n'est pas perdue :
 # elle part à la reprise si le retard persiste. Ne touche pas Sentry (SENTRY_ALERTS).
@@ -988,18 +995,21 @@ Par nick :
 - **Dernier backup connu** : archive + date depuis `archive_stats` (déjà indexée localement) + âge
   lisible (« il y a 3h12 ») ; « aucune archive indexée » si le nick n'a jamais été indexé.
 - **Bkp en cours** : si une ligne `bkp_status` non terminée existe, « Bkp en cours depuis HH:MM
-  (XhYYmin) ». Démarrée depuis plus de `BORGHELPERWWW_BKP_STATUS_TIMEOUT` (défaut 6 h, comme `/access` et le watcher,
-  1.0.154) : « Bkp sans fin depuis HH:MM (XhYYmin) — probablement interrompu (délai 6 h dépassé) », jamais « en cours »
-  (date affichée au-delà de 24 h). Seule la dernière ligne du nick compte : un Bkp tué suivi d'autres Bkp n'est plus
-  affiché. La variable se lit dans l'environnement de `Status` : l'exporter aussi dans le shell ou le cron si elle est
-  réglée dans le service borgHelperWWW.
+  (XhYYmin) ». Démarrée depuis plus que le délai du nick (1.0.154) : « Bkp sans fin depuis HH:MM (XhYYmin) — probablement
+  interrompu (délai 6 h dépassé) », jamais « en cours » (date affichée au-delà de 24 h). Seule la dernière ligne du nick
+  compte : un Bkp tué suivi d'autres Bkp n'est plus affiché (1.0.155 : effacé seulement par un Bkp plus récent réussi ;
+  un Bkp vivant suivi d'un Bkp arrêté en échec par le verrou du dépôt reste « en cours »). Délai (1.0.155) : clé rc
+  `BKP_STATUS_TIMEOUT` du nick ou de `[DEFAULT]` (secondes, ou `90s`/`5m`/`12h`), sinon la variable
+  `BORGHELPERWWW_BKP_STATUS_TIMEOUT`, sinon 6 h — le même que `/access` et le watcher à condition qu'ils lisent le même
+  rc (`-C` et `BORGHELPERWWW_CFGFILE`), ou que les deux rc portent la même clé. La variable se lit dans l'environnement
+  de chaque processus : préférer la clé rc.
 - **Opération prioritaire en cours** : si un autre processus tient le verrou prioritaire (`priority.lock.<pid>`) et qu'aucun Bkp en cours n'est détecté (un Bkp interrompu ne la masque pas),
   « Opération prioritaire en cours (Restore, Prune ou DelBkp) » (« Bkp peut-être toujours actif, … » si un Bkp interrompu est affiché) — **ambiguïté assumée**, `priority.lock` ne
   distingue pas laquelle le tient. Si un Bkp est aussi détecté, pas de message redondant (le
   Bkp lui-même tient ce lock).
 
 En JSON : `last_backup` est `{archive,date}` ou `null` ; `bkp_running` est `{started_at}` ou `null` ; `bkp_stale`
-(1.0.154) est `{started_at}` pour un Bkp sans fin au-delà du délai (alors `bkp_running` vaut `null`), sinon `null` ;
+(1.0.154) est `{started_at,timeout_s}` (`timeout_s` 1.0.155 : délai du nick) pour un Bkp sans fin au-delà du délai (alors `bkp_running` vaut `null`), sinon `null` ;
 `priority_op_running` est un booléen brut (reflète `priority.lock`, indépendamment de `bkp_running` —
 c'est au consommateur de corréler les deux, comme pour l'affichage texte). `build` (1.0.141) : état de construction
 de la base, `{state:'partial'|'complete', pairs_done, pairs_total, archives_total, stats_done, snapshot, updated_at}` écrit par les
@@ -1033,7 +1043,7 @@ Sans `-x`, lit `IDX_EXCLUDE`/`IDX_INCLUDE` depuis la configuration du nick et pu
 
 **Purge automatique des snapshots :** en fin d'opération, `IdxPurge` purge aussi les snapshots (`archive_snapshot`) au-delà du seuil `IDX_SNAP_KEEP`. Si `IDX_SNAP_KEEP` n'est pas défini, le seuil est calculé comme `sum(KEEP_DAILY + KEEP_WEEKLY + KEEP_MONTHLY + KEEP_YEARLY + KEEP_HOURLY)`, ou 10 si aucune règle KEEP_* n'est configurée. Le dry-run `-D` affiche également les snapshots qui seraient purgés.
 
-Les entrées supprimées rejoignent les exclus de leur paire (`diff_excluded_stats`, nombre et taille par type de changement, 1.0.154) : `modifications` de Report, ArchiveHistory et IdxStats sont inchangés par la purge (les fichiers purgés y comptent comme exclus — seule exception, un fichier `modified` dont la taille après vaut 0 compte alors sa taille avant, comme un exclu de l'Index), une paire entièrement vidée n'est pas prise pour une paire vide à tort, et DiffTop affiche encore ses exclus (« IDX_* / IdxPurge »).
+Les entrées supprimées rejoignent les exclus de leur paire (`diff_excluded_stats`, nombre et taille par type de changement, 1.0.154) : `modifications` de Report, ArchiveHistory et IdxTop sont inchangés par la purge (les fichiers purgés y comptent comme exclus — seule exception, un fichier `modified` dont la taille après vaut 0 compte alors sa taille avant, comme un exclu de l'Index), une paire entièrement vidée n'est pas prise pour une paire vide à tort, et DiffTop comme IdxTop affichent encore ses exclus (« IDX_* / IdxPurge », 1.0.155 pour IdxTop : plus de « diff_index vide » s'il reste des exclus). Détail des exclus par familles, comme Report (1.0.155) : `+` tous les ajouts (fichiers, répertoires, liens…), `-` toutes les suppressions, `=` tout le reste (`modified`, `changed link`, `mode`…) — la somme vaut le total.
 
 Après suppression, `IdxPurge` recalcule `diff_indexed_pairs.entry_count` et compacte le fichier via `VACUUM INTO` (dans le même répertoire, évite les problèmes de `/tmp` plein). Si le compactage échoue ou est reporté, les entrées sont quand même supprimées (message `[WARN] compactage impossible` ou `[WARN] compactage reporté : <raison>`) ; relancer `IdxPurge` plus tard, ou la procédure manuelle de LIBRARY.md.
 
@@ -1318,7 +1328,7 @@ première requête — voir `docs/borghelperrc.example`.
 | `BORGHELPERWWW_BKP_WATCHER_INTERVAL` | — | — | Intervalle (secondes) d'interrogation `bkp_status` par le watcher — défaut 30 (voir `POST /bkp` asynchrone ci-dessus) |
 | `BORGHELPERWWW_PUSH_DISABLED` | — | — | `1` : **suspend l'envoi** de toutes les notifications push (1.27.2) — détection et journal inchangés, `POST /push/test` en `503`, bandeau sur la page Notifications ; lu au démarrage. Par serveur et sans redémarrage : `PUSH_MUTE = true` dans le rc |
 | `BORGHELPERWWW_SCHEMA_CHECK_INTERVAL` | — | — | Intervalle (secondes, défaut 3600, min. 60) du contrôle périodique des bases (1.26.6) : structure de la vue `archive_snapshot_v` de chaque serveur, remise à jour si elle diffère ; `[WARN] … redémarrer borgHelperWWW` si borgHelper a été mis à jour sur disque depuis le démarrage (rien n'est alors modifié) |
-| `BORGHELPERWWW_BKP_STATUS_TIMEOUT` | — | — | Délai (secondes) avant qu'une sauvegarde démarrée mais jamais terminée soit traitée comme un échec (AD-7) — défaut 21600 (6h). Lu aussi par `borgHelper -c Status` (1.0.154), dans son propre environnement : au-delà, « probablement interrompu » |
+| `BORGHELPERWWW_BKP_STATUS_TIMEOUT` | — | — | Délai (secondes, ou suffixe `s`/`m`/`h` depuis 1.28.4) avant qu'une sauvegarde démarrée mais jamais terminée soit traitée comme un échec (AD-7) — défaut 21600 (6h). Lu aussi par `borgHelper -c Status` (1.0.154), dans son propre environnement : au-delà, « probablement interrompu ». La clé rc `BKP_STATUS_TIMEOUT` du nick ou de `[DEFAULT]` l'emporte (1.28.4 / 1.0.155) |
 | `BORGHELPERWWW_PUSH_DB` | `--push-db` | `push_db` | Chemin du fichier SQLite **dédié** aux clés VAPID et abonnements push (Story 2a, `spec-notifications-push`, AD-6 — jamais `scopecache.db`) — défaut : co-localisé avec `cache.db`/`diff.db` (voir [Notifications push](#notifications-push)) |
 | `BORGHELPERWWW_PUSH_PREFS` | `--push-prefs` | `push_prefs` | Fichier **JSON** des préférences de notification par abonné (début/fin, nicks suivis, expiration — `spec-push-ui-prefs-json`), éditable à la main — défaut : à côté de `push.db` (`<prefixe>-push-prefs.json`) |
 | `BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS` | — | — | Durée d'expiration par défaut (jours) d'un abonnement push quand `expires_in_days` est absent de `POST /push/subscribe` — défaut 30, repli sur 30 si valeur invalide/négative |
@@ -1996,7 +2006,8 @@ uvicorn) — début **et** fin de sauvegarde — qui envoie une notification pus
 abonnement concerné (voir [Envoi réel](#envoi-réel-story-2b) sous [Notifications
 push](#notifications-push)). Intervalle d'interrogation et délai avant qu'une sauvegarde bloquée
 soit traitée comme un échec : `BORGHELPERWWW_BKP_WATCHER_INTERVAL` (déf. 30s) et
-`BORGHELPERWWW_BKP_STATUS_TIMEOUT` (déf. 21600s = 6h) — voir [Configuration](#configuration).
+`BORGHELPERWWW_BKP_STATUS_TIMEOUT` (déf. 21600s = 6h), ou par nick la clé rc `BKP_STATUS_TIMEOUT` (1.28.4, prioritaire)
+— voir [Configuration](#configuration).
 
 `GET /access` : protégée par `X-API-Key` (contrairement à `/version`), mais **jamais** par
 l'autorisation par groupes elle-même — son seul but est de la refléter. Renvoie, pour **chaque**
@@ -2024,9 +2035,10 @@ Depuis 1.28.0, chaque nick lisible par l'appelant porte aussi (lectures locales 
   "pairs_total","archives_total","stats_done","snapshot","updated_at"}` ;
 - `rebuild` : même forme pour le fichier fantôme (`{"state":"partial"}` avant sa première fin de tranche), `null` sans
   reconstruction ;
-- `bkp_running` : `true` si un Bkp a démarré depuis moins de `BORGHELPERWWW_BKP_STATUS_TIMEOUT` (6 h par défaut) sans finir, `false` sinon
-  (un Bkp tué au-delà n'est plus « en cours » : le watcher le traite en échec), `null` si `history.db` est illisible
-  (1.28.1 ; jamais pris pour une fin de Bkp).
+- `bkp_running` : `true` si un Bkp du nick sans fin, non suivi d'un Bkp réussi, a démarré depuis moins que son délai (clé rc `BKP_STATUS_TIMEOUT`,
+  sinon `BORGHELPERWWW_BKP_STATUS_TIMEOUT`, sinon 6 h) sans finir, `false` sinon (un Bkp tué au-delà n'est plus « en
+  cours » : le watcher le traite en échec ; 1.28.4 : un Bkp tué suivi d'un Bkp réussi non plus), `null` si `history.db` est
+  illisible (1.28.1 ; jamais pris pour une fin de Bkp).
 - `index_last` (1.28.2, borgHelper ≥ 1.0.149) : résultat du dernier `Index` de ce nick, quel que soit son lanceur
   (CLI, cron, `POST /index`) — `{"nick","started_at","finished_at","outcome","code","via","message"}` avec `outcome`
   ∈ `ok`, `error`, `refused` (code 3), `busy` (« Index déjà en cours », rien fait), `deadline` (échéance atteinte
@@ -2067,7 +2079,7 @@ groupes](#autorisation-par-groupes-reverse-proxy-oidcauth_request) ci-dessus).
 (affiché une fois connecté, si `GET /version` indique `push_available: true` — `pywebpush`/`py_vapid`
 disponibles et Service Worker déployé). La vue permet de s'abonner (le navigateur demande la
 permission), de régler **host par host** trois types de notification — **début** de sauvegarde,
-**succès**, **échec** (Bkp en erreur, ou bloqué au-delà de `BORGHELPERWWW_BKP_STATUS_TIMEOUT`) — avec
+**succès**, **échec** (Bkp en erreur, ou bloqué au-delà du délai du nick, `BKP_STATUS_TIMEOUT`) — avec
 une ligne « Tous » pour cocher une colonne entière (défaut d'un nouvel abonnement : succès + échec),
 de choisir la durée (défaut serveur, 7/30/90/365 jours, ou « à vie »), d'**envoyer un test**, de
 modifier ses réglages et de se désabonner (borgHelperWWW ≥ 1.21.0 / UI ≥ 1.12.0). Réglages
