@@ -1,5 +1,13 @@
 # Changelog — Tools
 
+## checkssl 1.4 — version TLS affichée — 2026-09-30
+
+- Pour un serveur, ligne `Version TLS : TLSv1.3` après les jours restants ; en dessous de TLS 1.2 (SSLv3, TLSv1,
+  TLSv1.1), ligne `ATTENTION : TLSv1 est obsolète (inférieur à TLS 1.2)`. Le code retour reste celui de l'expiration
+  du certificat. Rien pour `file://`.
+- Version lue dans `Protocol :` de `s_client` (jusqu'à TLS 1.2), sinon dans `New, TLSv1.3, …` (TLS 1.3, où
+  `Protocol :` est absent ; en TLS 1.0 cette ligne indique à tort `SSLv3`).
+
 ## checkssl 1.3 — serveurs en TLS 1.0 / 1.1 — 2026-09-30
 
 - **Serveur en TLS ancien** : OpenSSL 3 refuse par défaut les connexions en dessous de TLS 1.2 ; face à un serveur

@@ -18,7 +18,8 @@
 #* along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #*/
 
-Version="1.3"
+Version="1.4"
+# 1.4 version TLS negociee affichee, avertissement si inferieure a TLS 1.2 (code retour inchange)
 # 1.3 serveurs en TLS 1.0 / 1.1 lus (OpenSSL 3 refusait la connexion : "unsupported protocol")
 # 1.2 smtp:// (STARTTLS, port 25 par defaut, 587 pour la soumission) et smtps:// (TLS direct, port 465)
 # 1.1 plus d'eval (l'URL pouvait injecter des commandes), SNI envoye aussi en imap/pop3/imaps/pop3s,
@@ -61,7 +62,8 @@ days_remaining() {
 
 # Affiche CN, SAN, fin de validite et jours restants du certificat PEM lu sur
 # stdin, puis sort : 2 si l'expiration est a threshold jours ou moins, 0 sinon,
-# 1 (avec le message $1) si aucun certificat n'est lisible
+# 1 (avec le message $1) si aucun certificat n'est lisible.
+# $2 : version TLS negociee (vide pour file://), affichee avec un avertissement si < TLS 1.2
 report_cert() {
     local pem cn dns end_date days_left
     pem=$(cat)
@@ -79,6 +81,13 @@ report_cert() {
     echo "X509v3 Subject Alternative Name: $dns"
     echo "Date de fin de validité : $end_date"
     echo "Jours restants : $days_left"
+    if [[ -n "$2" ]]; then
+        echo "Version TLS : $2"
+        # Avertissement seulement : le code retour ne parle que de l'expiration du certificat
+        case "$2" in
+            SSLv*|TLSv1|TLSv1.1) echo "ATTENTION : $2 est obsolète (inférieur à TLS 1.2)" ;;
+        esac
+    fi
 
     # Sortie avec code 2 si threshold jours ou moins (un certificat expire est toujours en 2)
     if [[ $days_left -le $threshold ]]; then
@@ -155,7 +164,13 @@ host_ip="${ip:-$host}"
 # SNI envoye pour tous les protocoles : sinon un serveur a plusieurs certificats renvoie celui par defaut
 # SECLEVEL=0 et TLSv1 minimum : on veut lire le certificat, pas juger la connexion ; sans eux OpenSSL 3 refuse
 # les serveurs restes en TLS 1.0 / 1.1 ("unsupported protocol"). Un serveur recent negocie toujours TLS 1.2 / 1.3
-echo | timeout "$connect_timeout" openssl s_client -connect "$host_ip:$port" -servername "$host" "${starttls[@]}" \
-        -cipher 'DEFAULT:@SECLEVEL=0' -min_protocol TLSv1 2>/dev/null \
-    | sed -n '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' \
-    | report_cert "Impossible de récupérer le certificat."
+server_out=$(echo | timeout "$connect_timeout" openssl s_client -connect "$host_ip:$port" -servername "$host" "${starttls[@]}" \
+        -cipher 'DEFAULT:@SECLEVEL=0' -min_protocol TLSv1 2>/dev/null)
+
+# Version TLS negociee : "Protocol  : TLSv1.2" jusqu'a TLS 1.2 ; en TLS 1.3 seule la ligne
+# "New, TLSv1.3, Cipher is ..." la donne (en TLS 1.0 cette ligne dit "SSLv3", d'ou cet ordre)
+tls_version=$(sed -n 's/^ *Protocol *: *//p' <<<"$server_out" | head -1)
+[[ -n "$tls_version" ]] || tls_version=$(sed -n 's/^New, \(TLSv[0-9.]*\),.*/\1/p' <<<"$server_out" | head -1)
+
+sed -n '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' <<<"$server_out" \
+    | report_cert "Impossible de récupérer le certificat." "$tls_version"
