@@ -1,5 +1,10 @@
 # Changelog — Tools
 
+## Tools — README.md — 2026-09-30
+
+- Création du `README.md` de Tools : tableau des outils, options et codes retour de `checkssl`, `sleepUntil`,
+  `whosshkey`, et pour `cronMutt` les options, les règles d'envoi du mail, les en-têtes et des exemples.
+
 ## cronMutt 0.23 — en-tête References — 2026-09-30
 
 - **References** : ajouté, même valeur que `In-Reply-To` (`<md5@cronMutt>` ou `-i`). Thunderbird et Gmail regroupent
