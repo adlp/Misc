@@ -1,5 +1,16 @@
 # Changelog — Tools
 
+## whosshkey 1.4 — comptes d'annuaire (LDAP, SSSD) — 2026-09-30
+
+- **Comptes d'annuaire** : la liste des comptes venait de `getent passwd` sans argument, qu'un annuaire (SSSD avec
+  `enumerate = false`, le défaut ; LDAP, FreeIPA, AD) ne remplit pas. Ses comptes n'avaient aucun fichier de clefs
+  lu : leurs connexions sortaient en « clef inconnue », avec « compte sans répertoire personnel connu » alors que le
+  répertoire existe. Les comptes vus dans les logs sshd sont maintenant demandés un par un (`getent passwd <compte>`),
+  ce à quoi l'annuaire répond.
+- Compte introuvable même ainsi : message « compte inconnu de getent passwd : répertoire personnel introuvable ».
+- Un chemin de clefs qui est un répertoire est signalé (`pas un fichier`) ; avant, la redirection échouait et
+  `set -e` arrêtait la lecture de tous les comptes suivants sans rien dire.
+
 ## whosshkey 1.3 — fichiers lus pour une clef inconnue — 2026-09-30
 
 - Quand une connexion sort en `clef inconnue (SHA256:…)`, une section après le tableau liste, pour chaque compte

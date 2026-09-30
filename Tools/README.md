@@ -7,7 +7,7 @@ Petits outils d'administration indépendants, sous licence GPL v3.
 | `checkssl` | bash | 1.4 | État d'un certificat TLS (serveur ou fichier) et jours restants avant expiration |
 | `cronMutt` | Python 3 | 0.24.2 | Lance une commande (ou lit un pipe) et envoie sa sortie par mail (mutt) et/ou sur Nextcloud, selon le résultat |
 | `sleepUntil` | bash | 1.1 | Comme `at`, mais bloquant : attend une heure donnée puis lance une commande |
-| `whosshkey` | bash | 1.3 | Comme `last`, avec en plus la clef SSH utilisée pour chaque connexion |
+| `whosshkey` | bash | 1.4 | Comme `last`, avec en plus la clef SSH utilisée pour chaque connexion |
 
 Voir `CHANGELOG.md` pour l'historique des versions.
 
@@ -138,14 +138,15 @@ whosshkey [-H hôte] [-w secondes] [-V] [options de last…]
 
 Sortie de `last -Fiw`, avec une colonne de plus : le commentaire de la clef SSH utilisée, retrouvé en croisant les
 `Accepted publickey` de sshd (`/var/log/auth.log` et ses rotations, compressées comprises, sinon `journalctl`) avec
-les fichiers de clefs de tous les comptes (`AuthorizedKeysFile` de `sshd -T`, à défaut `.ssh/authorized_keys` et
+les fichiers de clefs de tous les comptes — ceux de `getent passwd`, plus ceux vus dans les logs sshd, demandés un
+par un pour les annuaires LDAP/SSSD non énumérés — (`AuthorizedKeysFile` de `sshd -T`, à défaut `.ssh/authorized_keys` et
 `.ssh/authorized_keys2`). Clef absente de ces fichiers : `clef inconnue (empreinte)` ; clef sans commentaire :
 `no comment`. Fonctionne avec gawk comme avec mawk.
 
 L'empreinte (`SHA256:…`) est un résumé de la clef publique : c'est ce que sshd note dans ses logs, et
 `ssh-keygen -lf ~/.ssh/authorized_keys` donne celle de chaque clef d'un fichier. Pour une clef inconnue, whosshkey
 liste après le tableau, pour chaque compte concerné, les fichiers de clefs essayés (`N clef(s)`, `absent`,
-`inaccessible (droits)`, `illisible`), signale si `sshd -T` n'a pas pu être lu (lancé sans root : chemins par défaut)
+`inaccessible (droits)`, `illisible`, `pas un fichier`, ou compte inconnu de `getent passwd`), signale si `sshd -T` n'a pas pu être lu (lancé sans root : chemins par défaut)
 et si sshd prend aussi des clefs d'un `AuthorizedKeysCommand` (LDAP, FreeIPA…), que whosshkey n'interroge pas.
 
 | Option | Rôle | Défaut |
