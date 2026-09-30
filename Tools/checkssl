@@ -18,7 +18,8 @@
 #* along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #*/
 
-Version="1.1"
+Version="1.2"
+# 1.2 smtp:// (STARTTLS, port 25 par defaut, 587 pour la soumission) et smtps:// (TLS direct, port 465)
 # 1.1 plus d'eval (l'URL pouvait injecter des commandes), SNI envoye aussi en imap/pop3/imaps/pop3s,
 #     CN lu aussi avec OpenSSL >= 1.1 en file://, fichier illisible ou non PEM = erreur (et non "0 jour"),
 #     URL sans protocole = message clair, delai de 30 s sur la connexion, -t verifie, -V,
@@ -35,7 +36,7 @@ connect_timeout=30
 # Fonction d'affichage d'aide
 usage() {
     echo "Usage: $0 -u <url> [-i <ip>] [-h] [-d] [-t <threshold>] [-V]"
-    echo "  -u: URL du serveur ou fichier (https, imap, imaps, pop3, pop3s, file)"
+    echo "  -u: URL du serveur ou fichier (https, imap, imaps, pop3, pop3s, smtp, smtps, file)"
     echo "  -i: IP pour forcer la résolution DNS (non applicable pour file://)"
     echo "  -t: DAYS restant avant exitcode a 2 (defaut: 15)"
     echo "  -d mode debug"
@@ -105,7 +106,7 @@ if [[ -z "$url" ]]; then
 fi
 # Entier positif : sinon [[ -le ]] lit "abc" comme 0, et un seuil negatif laisserait passer un certificat expire
 [[ "$threshold" =~ ^[0-9]+$ ]] || die "-t attend un nombre de jours (entier positif), pas « $threshold »."
-[[ "$url" == *://* ]] || die "protocole manquant dans l'URL « $url » (https://, imap://, imaps://, pop3://, pop3s://, file://)."
+[[ "$url" == *://* ]] || die "protocole manquant dans l'URL « $url » (https://, imap://, imaps://, pop3://, pop3s://, smtp://, smtps://, file://)."
 
 # Extraction du protocole (jusqu'au premier ://) et du reste
 protocol="${url%%://*}://"
@@ -139,6 +140,9 @@ case $protocol in
     imaps://)  port=${port:-993} ;;
     pop3://)   port=${port:-110}; starttls=(-starttls pop3) ;;
     pop3s://)  port=${port:-995} ;;
+    # smtp:// : STARTTLS, port 25 (MX) par defaut, smtp://hote:587 pour la soumission
+    smtp://)   port=${port:-25}; starttls=(-starttls smtp) ;;
+    smtps://)  port=${port:-465} ;;
     *) die "Protocole non supporté : $protocol" ;;
 esac
 

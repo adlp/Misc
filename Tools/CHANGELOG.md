@@ -1,5 +1,12 @@
 # Changelog — Tools
 
+## checkssl 1.2 — SMTP — 2026-09-30
+
+- **`smtp://`** : certificat présenté en STARTTLS par un serveur SMTP, port 25 par défaut (MX), `smtp://hôte:587`
+  pour la soumission.
+- **`smtps://`** : TLS direct, port 465.
+- Vérifié sur `smtp.gmail.com:587`, `smtps://smtp.gmail.com` et le MX `gmail-smtp-in.l.google.com` (port 25).
+
 ## whosshkey 1.2 — mawk, fichiers de clefs, logs tournés, -H avec mot de passe sudo — 2026-09-30
 
 Premier numéro de version : 1.0 = version initiale (2024-10-01), 1.1 = analyse distante `-H` (2026-09-23) ; `-V`
