@@ -1,5 +1,26 @@
 # Changelog — Tools
 
+## sleepUntil 1.1 — arguments intacts, heure invalide signalée, réveil fiable — 2026-09-30
+
+Premier numéro de version : 1.0 = version initiale (2024-10-08), `-V` l'affiche.
+
+Corrections :
+
+- **Arguments de la commande** : regroupés dans une chaîne puis relancés sans guillemets, ils étaient redécoupés et
+  leurs jokers développés : `touch "a b"` créait `a` et `b`, `echo '*'` listait le répertoire. Plusieurs arguments
+  sont maintenant transmis tels quels (`exec "$@"`).
+- **Commande en un seul argument** : elle était découpée sur les espaces (donc `"cmd1 && cmd2"` ou une redirection ne
+  marchaient pas). Elle passe maintenant par `/bin/sh -c`, comme `-e` de cronMutt ; `"ls -l"` marche toujours.
+- **Heure invalide** (`abc`, `25:00`) : erreur de `date` puis « déjà passée pour aujourd'hui ». Message
+  « Heure invalide » ; code retour `1` inchangé.
+- **`-h`** était pris pour une heure (« déjà passée ») : il affiche l'aide ; `-V` ajouté.
+- **Réveil en retard** : un seul `sleep` de la durée totale ne compte pas le temps de mise en veille et ignore un
+  changement d'heure système. Attente par tranches de 60 s au plus en relisant l'horloge.
+- « Déjà passée » et « Heure invalide » vont sur stderr ; coquilles de l'aide corrigées.
+
+Code mort retiré : `command="exit 0"` exécuté comme commande quand aucune n'était donnée, `exit $?` final
+inatteignable dans ce cas, variable `current_seconds` lue une seule fois.
+
 ## checkssl 1.1 — sans eval, SNI partout, erreurs fiables — 2026-09-30
 
 Premier numéro de version : 1.0 = version initiale (2024-10-08), `-V` l'affiche.

@@ -18,45 +18,62 @@
 #* along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #*/
 
+Version="1.1"
+# 1.1 arguments de la commande transmis tels quels (espaces, *, guillemets), une commande en un seul argument
+#     passe par le shell, heure invalide signalee (et non "deja passee"), -h / -V, reveil a la bonne heure
+#     meme apres une mise en veille ou un changement d'heure systeme, erreurs sur stderr
+# 1.0 version initiale
+
 # Fonction d'affichage d'aide
 usage() {
-    echo "Usage: $0 <HH:MM:SS> [commande|commande arguments]"
-    echo "  HH:MM:SS    Heure ou le sleep relachera le lock"
-    echo "  commande    Commande qui sera executée a l'heure donnée (avec les arguments"
-    echo "Si le timout s'execute coorectement alors l'exit code sera a 0, sinon il sera a 1"
+    echo "Usage: $0 <HH:MM[:SS]> [commande [arguments...]]"
+    echo "  HH:MM:SS    Heure (aujourd'hui) a laquelle le sleep relachera le lock"
+    echo "  commande    Commande executee a l'heure donnee, avec ses arguments tels quels"
+    echo "              Un seul argument (\"cmd1 && cmd2\") est passe a /bin/sh -c"
+    echo "  -h          Aide"
+    echo "  -V          Version"
+    echo "Code retour : celui de la commande (0 sans commande), 1 si l'heure est deja passee ou invalide"
     exit 1
 }
 
-command="exit 0"
+case "$1" in
+    ""|-h|--help) usage;;
+    -V) echo "Version $Version"; exit 0;;
+esac
 
-case "$#" in
-    "0") usage;;
-    "1") target_time=$1;;
-    *)  target_time=$1
-        shift
-        command=$*;;
-    esac
+target_time=$1
+shift
 
-# Obtenir l'heure actuelle en secondes depuis minuit
-current_seconds=$(date +%s)
-
-# Obtenir la date actuelle et remplacer l'heure par l'heure cible
-target_seconds=$(date -d "$(date +%Y-%m-%d) $target_time" +%s)
+# Heure cible aujourd'hui, en secondes depuis l'epoch ; date refuse une heure illisible
+if ! target_seconds=$(date -d "$(date +%Y-%m-%d) $target_time" +%s 2>/dev/null); then
+    echo "Heure invalide : « $target_time » (attendu HH:MM ou HH:MM:SS)." >&2
+    exit 1
+fi
 
 # Calculer la différence de temps (en secondes)
-sleep_seconds=$((target_seconds - current_seconds))
+sleep_seconds=$((target_seconds - $(date +%s)))
 
 # Si l'heure cible est dans le futur, attendre jusqu'à cette heure
 if [[ $sleep_seconds -gt 0 ]]; then
     echo "Attente jusqu'à $target_time... soit $sleep_seconds secondes d'attente"
-    sleep $sleep_seconds
 else
-    echo "L'heure spécifiée est déjà passée pour aujourd'hui."
+    echo "L'heure spécifiée est déjà passée pour aujourd'hui." >&2
     exit 1
 fi
+
+# Attente par tranches d'au plus 60 s, en relisant l'horloge : un seul long sleep
+# se reveillerait en retard apres une mise en veille ou un changement d'heure systeme
+while (( (remaining = target_seconds - $(date +%s)) > 0 )); do
+    sleep $(( remaining < 60 ? remaining : 60 ))
+done
 
 # Le script continue ici après l'attente
 echo "Il est maintenant $target_time."
 
-$command
-exit $?
+case $# in
+    0) exit 0;;
+    # Une seule chaine : ligne de commande shell ("cmd arg", "cmd1 && cmd2", redirections)
+    1) exec /bin/sh -c "$1";;
+    # Plusieurs arguments : commande et arguments transmis tels quels
+    *) exec "$@";;
+esac

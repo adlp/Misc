@@ -6,7 +6,7 @@ Petits outils d'administration indépendants, sous licence GPL v3.
 |---|---|---|---|
 | `checkssl` | bash | 1.1 | État d'un certificat TLS (serveur ou fichier) et jours restants avant expiration |
 | `cronMutt` | Python 3 | 0.24.2 | Lance une commande (ou lit un pipe) et envoie sa sortie par mail (mutt) et/ou sur Nextcloud, selon le résultat |
-| `sleepUntil` | bash | — | Comme `at`, mais bloquant : attend une heure donnée puis lance une commande |
+| `sleepUntil` | bash | 1.1 | Comme `at`, mais bloquant : attend une heure donnée puis lance une commande |
 | `whosshkey` | bash | — | Comme `last`, avec en plus la clef SSH utilisée pour chaque connexion |
 
 Voir `CHANGELOG.md` pour l'historique des versions.
@@ -112,11 +112,17 @@ Dépendances : Python ≥ 3.6, `requests`, `mutt` configuré pour envoyer.
 ## sleepUntil
 
 ```bash
-sleepUntil HH:MM:SS [commande [arguments]]
+sleepUntil HH:MM[:SS] [commande [arguments...]]
+sleepUntil -h | -V
 ```
 
-Attend l'heure donnée (aujourd'hui) puis lance la commande et rend son code retour. Heure déjà passée : message et code
-retour `1`, la commande n'est pas lancée.
+Attend l'heure donnée (aujourd'hui) puis lance la commande et rend son code retour (`0` sans commande). Heure déjà
+passée ou invalide : message sur stderr et code retour `1`, la commande n'est pas lancée.
+
+- Plusieurs arguments : commande et arguments transmis tels quels (`sleepUntil 10:00 touch "a b"` crée `a b`).
+- Un seul argument : ligne de commande passée à `/bin/sh -c` (`sleepUntil 10:00 "backup && rapport > log"`).
+- L'horloge est relue au moins toutes les 60 s : le réveil se fait à la bonne heure même après une mise en veille ou un
+  changement d'heure système.
 
 ## whosshkey
 
