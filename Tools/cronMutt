@@ -46,9 +46,10 @@ from datetime import datetime
 import requests
 from requests.auth import HTTPBasicAuth
 
-Version="0.24"
+Version="0.24.1"
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
+# 0.24.1 noms de variables et de fonctions explicites, sans changement de comportement
 # 0.24 nextcloud en echec (injoignable, timeout, erreur HTTP, -n/-N incomplet) : mail a tous (-d et -o),
 #      sujet "**Output non sauvé**", l'output en piece jointe sous le nom prevu sur le nextcloud
 # 0.23 en-tete References (meme valeur que In-Reply-To), utilise en premier par Thunderbird et Gmail pour les fils
@@ -86,55 +87,55 @@ Version="0.24"
 # 0.2 On rajoute le versionning a cronMutt
 # 0.1  Un outils pour mieux gerer l'envoie des mails a partir des corns
 
-def nextcloudput(urldav,lopa,datas):
+def nextcloudUpload(webdavUrl,credentials,output):
     # Prepare auth (le mot de passe peut contenir des ':')
-    lopata=lopa.split(':',1)
-    auth = HTTPBasicAuth(lopata[0],lopata[1] if len(lopata) > 1 else '')
+    loginPassword=credentials.split(':',1)
+    auth = HTTPBasicAuth(loginPassword[0],loginPassword[1] if len(loginPassword) > 1 else '')
     # Envoyer le fichier au partage Nextcloud
     # Renvoie None si le depot a reussi, sinon la raison de l'echec
     try:
         # 15 s pour se connecter, 120 s sans reponse
-        response = requests.put(urldav, data=datas, auth=auth, timeout=(15,120))
+        response = requests.put(webdavUrl, data=output, auth=auth, timeout=(15,120))
     except requests.Timeout as err:
-        ret=f"pas de reponse (timeout) : {err}"
+        failureReason=f"pas de reponse (timeout) : {err}"
     except requests.RequestException as err:
-        ret=f"injoignable : {err}"
+        failureReason=f"injoignable : {err}"
     else:
         # Vérifier le succès de l'opération
         if response.status_code in [200, 201, 204]:
             return(None)
-        ret=f"HTTP {response.status_code} {response.reason}"
-    print(f"cronMutt: depot nextcloud en echec, {ret}",file=sys.stderr)
-    return(ret)
+        failureReason=f"HTTP {response.status_code} {response.reason}"
+    print(f"cronMutt: depot nextcloud en echec, {failureReason}",file=sys.stderr)
+    return(failureReason)
 
-def ncFileName(urldav):
+def nextcloudFileName(webdavUrl):
     # Nom du fichier tel qu'il aurait du etre depose sur le nextcloud
     name=None
-    if urldav is not None:
-        name=os.path.basename(unquote(urlsplit(urldav).path).rstrip('/'))
+    if webdavUrl is not None:
+        name=os.path.basename(unquote(urlsplit(webdavUrl).path).rstrip('/'))
     return(name if name else "cronMutt-output.txt")
 
-def subprosend(cmd,datas):
-    mutt=subprocess.Popen(cmd,encoding ='utf-8',
+def sendMail(muttCommand,body):
+    muttProcess=subprocess.Popen(muttCommand,encoding ='utf-8',
                          stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE)
-    stdoutdata,stderrdata=mutt.communicate(input=datas)
-    if mutt.returncode != 0:
-        print(f"cronMutt: mutt a echoue (exit={mutt.returncode}) : {stderrdata.strip()}",file=sys.stderr)
-    return(mutt.returncode)
+    _,muttStderr=muttProcess.communicate(input=body)
+    if muttProcess.returncode != 0:
+        print(f"cronMutt: mutt a echoue (exit={muttProcess.returncode}) : {muttStderr.strip()}",file=sys.stderr)
+    return(muttProcess.returncode)
 
-def muttEscape(value):
+def escapeMuttValue(value):
     # mutt interprete la valeur d'un my_hdr : ; et # la coupent, ` execute, $ expanse
     value=value.replace('\r',' ').replace('\n',' ')
     return(re.sub(r'([\\;#`$])',r'\\\1',value))
 
 
-def version():
+def printVersion():
     print(f"Version {Version}")
     sys.exit(0)
 
-def usage():
+def printUsage():
     print("     E       Mail even empty data")
     print("     i:      in-reply-to")
     print("     s:      Mail subject")
@@ -156,257 +157,257 @@ def usage():
     print("     V       Version")
     sys.exit(123)
 
-def read_stream(stream, output_list, stream_name):
+def readStream(stream, capturedLines, streamName):
     for line in stream:
-        output_list[stream_name].append(line.rstrip())
+        capturedLines[streamName].append(line.rstrip())
         if teeMode:
-            if stream_name == 'stderr':
+            if streamName == 'stderr':
                 print("[STDERR]:",end='',flush=True)
             print(line,end="",flush=True)
     stream.close()
 
 try:
-    opts, args = getopt.getopt(sys.argv[1:], "hVDEi:s:d:o:r:f:m:e:ct:XTp:n:N:", ["help"])
+    options, _ = getopt.getopt(sys.argv[1:], "hVDEi:s:d:o:r:f:m:e:ct:XTp:n:N:", ["help"])
 except getopt.GetoptError as err:
     print(err)  # will print something like "option -a not recognized"
-    usage()
+    printUsage()
 
 debug=False
-emptySend=False
-subject=f"//cron//{os.path.basename(__file__)}"
+sendEvenIfEmpty=False
+mailSubject=f"//cron//{os.path.basename(__file__)}"
 inReplyTo=None
-dest=os.getenv('LOGNAME','nobody')
-destok=None
+recipients=os.getenv('LOGNAME','nobody')
+recipientsIfOk=None
 messageId=None
-cmd=None
-mailType=None
+command=None
+mailContentType=None
 replyTo=os.getenv("LOGNAME",'nobody')
-replyToSet=False
-exitReact=True
+replyToGiven=False
+markSubjectOnError=True
 if sys.stdin.isatty():
     teeMode=True
 else:
     teeMode=False
 mailFrom=None
 #-e "set content_type=text/html" 
-cmdCache=False
-encoding="utf-8"
-nextcloud=None
-nextauth=None
+hideCommandHeader=False
+outputEncoding="utf-8"
+nextcloudUrl=None
+nextcloudCredentials=None
 
-for opt,arg in opts:
-    if   opt in ('-h','--help'):
-        usage()
-    elif opt in '-V':
-        version()
-    elif opt in '-D':
+for option,value in options:
+    if   option in ('-h','--help'):
+        printUsage()
+    elif option in '-V':
+        printVersion()
+    elif option in '-D':
         debug=True
-    elif opt in '-E':
-        emptySend=True
-    elif opt in '-i':
-        inReplyTo=arg
-    elif opt in '-s':
-        subject=arg
-    elif opt in "-d":
-        dest=arg
-    elif opt in '-o':
-        destok=arg
-    elif opt in '-f':
-        mailFrom=arg
-    elif opt in "-r":
-        replyTo=arg
-        replyToSet=True
-    elif opt in "-m":
-        messageId=arg
-    elif opt in "-e":
-        cmd=arg
-    elif opt in '-t':
-        mailType=arg
-    elif opt in '-X':
-        exitReact=False
-    elif opt in '-T':
+    elif option in '-E':
+        sendEvenIfEmpty=True
+    elif option in '-i':
+        inReplyTo=value
+    elif option in '-s':
+        mailSubject=value
+    elif option in "-d":
+        recipients=value
+    elif option in '-o':
+        recipientsIfOk=value
+    elif option in '-f':
+        mailFrom=value
+    elif option in "-r":
+        replyTo=value
+        replyToGiven=True
+    elif option in "-m":
+        messageId=value
+    elif option in "-e":
+        command=value
+    elif option in '-t':
+        mailContentType=value
+    elif option in '-X':
+        markSubjectOnError=False
+    elif option in '-T':
         teeMode=True
-    elif opt in '-c':
-        cmdCache=True
-    elif opt in '-p':
-        encoding=arg
-    elif opt in '-n':
-        nextcloud=arg
-    elif opt in "-N":
-        nextauth=arg
+    elif option in '-c':
+        hideCommandHeader=True
+    elif option in '-p':
+        outputEncoding=value
+    elif option in '-n':
+        nextcloudUrl=value
+    elif option in "-N":
+        nextcloudCredentials=value
     
 
-host=os.uname()[1]
+hostname=os.uname()[1]
 # Message-ID : unique par defaut (un id fixe fait dedoublonner les mails), toujours au format <id@host>
 if messageId is None:
-    messageId=f'<{datetime.now().strftime("%Y%m%d%H%M%S")}.{os.getpid()}.{uuid.uuid4().hex[:12]}.cronMutt@{host}>'
+    messageId=f'<{datetime.now().strftime("%Y%m%d%H%M%S")}.{os.getpid()}.{uuid.uuid4().hex[:12]}.cronMutt@{hostname}>'
 elif "<" not in messageId:
-    messageId=f'<{messageId}>' if "@" in messageId else f'<{messageId}@{host}>'
-ncUsed=nextcloud is not None and nextauth is not None
-ncIncomplet=(nextcloud is None) != (nextauth is None)
-if ncIncomplet:
+    messageId=f'<{messageId}>' if "@" in messageId else f'<{messageId}@{hostname}>'
+nextcloudEnabled=nextcloudUrl is not None and nextcloudCredentials is not None
+nextcloudIncomplete=(nextcloudUrl is None) != (nextcloudCredentials is None)
+if nextcloudIncomplete:
     print("cronMutt: -n et -N vont ensemble, pas de depot nextcloud, envoi par mail",file=sys.stderr)
 
 if inReplyTo is None:
-    inReplyTo=hashlib.md5(subject.encode('utf-8')).hexdigest()
+    inReplyTo=hashlib.md5(mailSubject.encode('utf-8')).hexdigest()
 # In-Reply-To : format <id@droite> sinon les clients l'ignorent pour les fils
 if "<" not in inReplyTo:
     inReplyTo=f'<{inReplyTo}>' if "@" in inReplyTo else f'<{inReplyTo}@cronMutt>'
 if mailFrom is None:
     mailFrom=replyTo
 if "<" not in mailFrom:
-    tmp=mailFrom
-    mailFrom=f'{tmp.split("@")[0]} <{tmp}>'
+    fromAddress=mailFrom
+    mailFrom=f'{fromAddress.split("@")[0]} <{fromAddress}>'
     if debug:
-        print(f"{tmp} ET {mailFrom}")
-        print(f'{tmp.split("@")}')
+        print(f"{fromAddress} ET {mailFrom}")
+        print(f'{fromAddress.split("@")}')
 
 # Preparation Ouverture du mail 1/2
-muttcmd=['mutt','-e',f'my_hdr X-cronMutt: cronMutt-{Version}','-e',f'my_hdr X-cronMuttStart: {str(datetime.now())}','-e',f'my_hdr X-cronMuttHost: {host}','-e',f'my_hdr From:{muttEscape(mailFrom)}','-e',f'my_hdr In-Reply-To: {muttEscape(inReplyTo)}','-e',f'my_hdr References: {muttEscape(inReplyTo)}','-e',f'my_hdr Message-ID: {muttEscape(messageId)}']
-if replyToSet:
-    muttcmd.append('-e')
-    muttcmd.append(f'my_hdr Reply-To: {muttEscape(replyTo)}')
+muttCommand=['mutt','-e',f'my_hdr X-cronMutt: cronMutt-{Version}','-e',f'my_hdr X-cronMuttStart: {str(datetime.now())}','-e',f'my_hdr X-cronMuttHost: {hostname}','-e',f'my_hdr From:{escapeMuttValue(mailFrom)}','-e',f'my_hdr In-Reply-To: {escapeMuttValue(inReplyTo)}','-e',f'my_hdr References: {escapeMuttValue(inReplyTo)}','-e',f'my_hdr Message-ID: {escapeMuttValue(messageId)}']
+if replyToGiven:
+    muttCommand.append('-e')
+    muttCommand.append(f'my_hdr Reply-To: {escapeMuttValue(replyTo)}')
 
 
 # Ouverture du process a suivre
-exitCode=0
-retstd={}
-retstd['stdout']=[]
-retstd['stderr']=[]
+commandExitCode=0
+capturedOutput={}
+capturedOutput['stdout']=[]
+capturedOutput['stderr']=[]
 
-if cmd is not None:
-    if not cmdCache:
-        muttcmd.append('-e')
-        muttcmd.append(f'my_hdr X-cronMuttCmd: {muttEscape(cmd)}')
+if command is not None:
+    if not hideCommandHeader:
+        muttCommand.append('-e')
+        muttCommand.append(f'my_hdr X-cronMuttCmd: {escapeMuttValue(command)}')
 
-    ps=subprocess.Popen(['/bin/sh','-c',cmd],encoding =encoding,errors='replace',
+    commandProcess=subprocess.Popen(['/bin/sh','-c',command],encoding =outputEncoding,errors='replace',
                          stdin=subprocess.DEVNULL,
                          stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE)
 
     # Creation puis demarrage des threads de lecture du stdout et stderr
-    tstdout = threading.Thread(target=read_stream, args=(ps.stdout, retstd, "stdout"))
-    tstderr = threading.Thread(target=read_stream, args=(ps.stderr, retstd, "stderr"))
-    tstdout.start()
-    tstderr.start()
+    stdoutReader = threading.Thread(target=readStream, args=(commandProcess.stdout, capturedOutput, "stdout"))
+    stderrReader = threading.Thread(target=readStream, args=(commandProcess.stderr, capturedOutput, "stderr"))
+    stdoutReader.start()
+    stderrReader.start()
 
     #Attente de la fin d'exec des thread et process (les thread affichent en tps reel)
-    tstdout.join()
-    tstderr.join()
-    ps.wait()
+    stdoutReader.join()
+    stderrReader.join()
+    commandProcess.wait()
 
-    exitCode=ps.returncode
+    commandExitCode=commandProcess.returncode
 
-    muttcmd.append('-e')
-    muttcmd.append(f'my_hdr X-cronMuttExitCode: {str(ps.returncode)}')
+    muttCommand.append('-e')
+    muttCommand.append(f'my_hdr X-cronMuttExitCode: {str(commandProcess.returncode)}')
 
-    if exitReact and exitCode != 0:
-        subject="*** "+subject
+    if markSubjectOnError and commandExitCode != 0:
+        mailSubject="*** "+mailSubject
         if debug:
-            print(f"exit={ps.returncode}")
+            print(f"exit={commandProcess.returncode}")
 else:
     # Mode pipe : les donnees arrivent sur notre stdin
-    read_stream(io.TextIOWrapper(sys.stdin.buffer,encoding=encoding,errors='replace'), retstd, "stdout")
+    readStream(io.TextIOWrapper(sys.stdin.buffer,encoding=outputEncoding,errors='replace'), capturedOutput, "stdout")
 
 # Traitement des donnees
-datas=""
-for line in retstd['stdout']:
-    datas+=line+"\n"
-if len(retstd['stderr']):
-    datas+="\n=============================================================================\n"
-    for line in retstd['stderr']:
-        datas+=line+"\n"
+output=""
+for line in capturedOutput['stdout']:
+    output+=line+"\n"
+if len(capturedOutput['stderr']):
+    output+="\n=============================================================================\n"
+    for line in capturedOutput['stderr']:
+        output+=line+"\n"
 
 # Depot de la donnee sur le nextcloud
-ncErreur=None
-if ncIncomplet:
-    ncErreur="-n et -N vont ensemble, aucun depot tente"
-elif ncUsed:
+nextcloudFailure=None
+if nextcloudIncomplete:
+    nextcloudFailure="-n et -N vont ensemble, aucun depot tente"
+elif nextcloudEnabled:
     if debug:
-        print(f'Depose sur nc {nextcloud}')
-    ncErreur=nextcloudput(nextcloud,nextauth,datas.encode('utf-8'))
+        print(f'Depose sur nc {nextcloudUrl}')
+    nextcloudFailure=nextcloudUpload(nextcloudUrl,nextcloudCredentials,output.encode('utf-8'))
 
 # Nextcloud en echec : l'output n'est sauve nulle part, tout le monde est prevenu et l'a en piece jointe
-ncEchec=ncErreur is not None
-mailDatas=datas
-attachDir=None
-if ncEchec:
-    subject="**Output non sauvé** "+subject
-    mailDatas=f"Output non sauvé, dépôt Nextcloud en échec : {ncErreur}\nIl est en pièce jointe.\n"
-    mailDatas+="\n=============================================================================\n"+datas
-    attachDir=tempfile.mkdtemp(prefix="cronMutt.")
-    attachFile=os.path.join(attachDir,ncFileName(nextcloud))
-    with open(attachFile,'w',encoding='utf-8') as f:
-        f.write(datas)
+nextcloudFailed=nextcloudFailure is not None
+mailBody=output
+attachmentDir=None
+if nextcloudFailed:
+    mailSubject="**Output non sauvé** "+mailSubject
+    mailBody=f"Output non sauvé, dépôt Nextcloud en échec : {nextcloudFailure}\nIl est en pièce jointe.\n"
+    mailBody+="\n=============================================================================\n"+output
+    attachmentDir=tempfile.mkdtemp(prefix="cronMutt.")
+    attachmentFile=os.path.join(attachmentDir,nextcloudFileName(nextcloudUrl))
+    with open(attachmentFile,'w',encoding='utf-8') as attachment:
+        attachment.write(output)
 
 # Preparation Ouverture du mail 2/2
-muttcmd.append('-s')
-muttcmd.append(subject)
+muttCommand.append('-s')
+muttCommand.append(mailSubject)
 
-if mailType is not None:
-    muttcmd.append('-e')
-    muttcmd.append(f'set content_type=text/{mailType}')
-if exitCode != 0 or ncEchec:
-    muttcmd.append('-e')
-    muttcmd.append('my_hdr X-Priority:1')
-if ncEchec:
-    muttcmd.append('-a')
-    muttcmd.append(attachFile)
-muttcmd.append('--')
+if mailContentType is not None:
+    muttCommand.append('-e')
+    muttCommand.append(f'set content_type=text/{mailContentType}')
+if commandExitCode != 0 or nextcloudFailed:
+    muttCommand.append('-e')
+    muttCommand.append('my_hdr X-Priority:1')
+if nextcloudFailed:
+    muttCommand.append('-a')
+    muttCommand.append(attachmentFile)
+muttCommand.append('--')
 
 # Destinataires : -o seul quand tout va bien, sinon -d et -o
-if destok is not None and destok != "no" and exitCode == 0 and not ncEchec:
-    muttcmd.append(destok)
+if recipientsIfOk is not None and recipientsIfOk != "no" and commandExitCode == 0 and not nextcloudFailed:
+    muttCommand.append(recipientsIfOk)
 else:
-    if destok is not None and destok != "no":
-        dest+=","+destok
-    muttcmd.append(dest)
+    if recipientsIfOk is not None and recipientsIfOk != "no":
+        recipients+=","+recipientsIfOk
+    muttCommand.append(recipients)
 
 if debug:
-    print(f"{' '.join(muttcmd)}")
+    print(f"{' '.join(muttCommand)}")
 
 # Je veux envoyer le mail si
 #   * Le nextcloud n'a pas marché (ou -n/-N incomplet)
 #   * il y a une errere
 #   * sauf -o no, quand tout va bien
-#   * avec nextcloud : il y a un empty ou un destok (la data est deja sur le nc)
-#   * sans nextcloud : il y a un empty ou de la data
+#   * avec nextcloud : il y a un -E ou un -o (l'output est deja sur le nc)
+#   * sans nextcloud : il y a un -E ou de l'output
 
-sendit=False
-if ncEchec:
-    sendit=True
+mustSendMail=False
+if nextcloudFailed:
+    mustSendMail=True
     if debug:
         print('Not Sended')
-elif exitCode != 0:
-    sendit=True
+elif commandExitCode != 0:
+    mustSendMail=True
     if debug:
-        print(f'ExitCode-{exitCode}')
-elif destok == "no":
-    sendit=False
+        print(f'ExitCode-{commandExitCode}')
+elif recipientsIfOk == "no":
+    mustSendMail=False
     if debug:
         print('destok no')
-elif ncUsed:
-    sendit=emptySend or destok is not None
+elif nextcloudEnabled:
+    mustSendMail=sendEvenIfEmpty or recipientsIfOk is not None
     if debug:
-        print(f'nc ok, send={sendit}')
-elif emptySend or len(datas):
-    sendit=True
+        print(f'nc ok, send={mustSendMail}')
+elif sendEvenIfEmpty or len(output):
+    mustSendMail=True
     if debug:
         print('Send empty if empty en full if len')
 else:
     if debug:
         print('Fall back')
-    sendit=False
+    mustSendMail=False
 
-if sendit:
-    subprosend(muttcmd,mailDatas)
+if mustSendMail:
+    sendMail(muttCommand,mailBody)
     if debug:
-        print(f"Sended-{len(mailDatas)}")
-if attachDir is not None:
-    shutil.rmtree(attachDir,ignore_errors=True)
+        print(f"Sended-{len(mailBody)}")
+if attachmentDir is not None:
+    shutil.rmtree(attachmentDir,ignore_errors=True)
 
 if debug:
-    print(len(datas))
+    print(len(output))
 
 # Tue par un signal : returncode negatif, on rend 128+signal comme le shell
-sys.exit(128-exitCode if exitCode < 0 else exitCode)
+sys.exit(128-commandExitCode if commandExitCode < 0 else commandExitCode)

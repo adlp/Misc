@@ -1,5 +1,16 @@
 # Changelog — Tools
 
+## cronMutt 0.24.1 — noms explicites — 2026-09-30
+
+- Variables et fonctions renommées, sans changement de comportement : `subprosend` → `sendMail`, `nextcloudput` →
+  `nextcloudUpload`, `read_stream` → `readStream`, `muttEscape` → `escapeMuttValue`, `usage`/`version` →
+  `printUsage`/`printVersion` ; `dest`/`destok` → `recipients`/`recipientsIfOk`, `datas` → `output`, `muttcmd` →
+  `muttCommand`, `retstd` → `capturedOutput`, `ps` → `commandProcess`, `exitCode` → `commandExitCode`, `emptySend` →
+  `sendEvenIfEmpty`, `exitReact` → `markSubjectOnError`, `cmdCache` → `hideCommandHeader`, `nextcloud`/`nextauth` →
+  `nextcloudUrl`/`nextcloudCredentials`, `sendit` → `mustSendMail`, etc.
+- Vérifié : 27 scénarios (pipe, `-e`, `-o`, `-E`, `-X`, Nextcloud OK / en échec / incomplet, signal, encodage, aide)
+  donnent les mêmes arguments mutt, corps, pièces jointes, sorties et codes retour qu'en 0.24.
+
 ## cronMutt 0.24 — dépôt Nextcloud en échec : « Output non sauvé » et pièce jointe — 2026-09-30
 
 Quand le dépôt Nextcloud échoue — injoignable, pas de connexion en 15 s, pas de réponse en 120 s (délai de connexion
