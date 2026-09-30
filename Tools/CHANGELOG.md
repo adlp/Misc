@@ -1,0 +1,65 @@
+# Changelog — Tools
+
+## cronMutt 0.20 — mode pipe réparé, en-têtes mutt échappés, logique d'envoi Nextcloud restaurée — 2026-09-30
+
+Corrections :
+
+- **Mode pipe** (`commande | cronMutt …`) : stdin n'était plus lu depuis la 0.15 (passage aux threads), aucun mail ne
+  partait jamais (ou un mail vide avec `-E`). stdin est relu, décodé selon `-p`.
+- **Indentation** : chaque ligne était `strip()`ée, les espaces de début disparaissaient du mail. Seule la fin de ligne
+  est retirée (`\r` compris).
+- **En-têtes mutt** : mutt interprète la valeur d'un `my_hdr` — `;` et `#` la coupent (le reste part comme commande
+  mutt), `` ` `` exécute une commande (la commande `-e` pouvait donc tourner une seconde fois, lancée par mutt), `$`
+  expanse une variable d'environnement. `X-cronMuttCmd`, `From`, `In-Reply-To`, `Message-ID` et `Reply-To` sont
+  échappés, sauts de ligne remplacés par un espace.
+- **Envoi avec Nextcloud** : la réécriture de la 0.17.3 envoyait le mail dès qu'il y avait des données, même quand le
+  dépôt Nextcloud avait réussi. Retour au comportement 0.16 / 0.17.1 : Nextcloud OK et commande OK ⇒ mail seulement
+  avec `-E` ou `-o`.
+- **`-o no`** : si le dépôt Nextcloud échouait alors que la commande avait réussi, le mail partait à l'adresse « no ».
+  Il part maintenant à `-d`.
+- **Nextcloud** : un mot de passe contenant `:` était tronqué (`split(':',2)`) ; une erreur réseau faisait planter
+  cronMutt sans mail ni code retour de la commande. L'erreur est affichée sur stderr et le mail part en secours ;
+  délai d'attente de 120 s par opération réseau.
+- **`-e`** : le stdin de la commande était un tube jamais fermé — une commande qui lit stdin bloquait indéfiniment. Il
+  est maintenant `/dev/null`.
+- **Décodage** : un octet invalide pour l'encodage `-p` tuait le thread de lecture (sortie perdue, commande pouvant
+  bloquer sur un tube plein). Les octets invalides sont remplacés.
+- **Code retour** : commande tuée par un signal ⇒ cronMutt rend 128+signal (comme le shell) au lieu d'un code négatif
+  tronqué (-9 donnait 247).
+- **`-r`** : documenté « ReplyTo » mais ne posait aucun en-tête `Reply-To` (ne servait que de `From` par défaut).
+  Donné explicitement, il pose maintenant `Reply-To`.
+- **`--help`** : déclaré mais ignoré, il affiche l'aide.
+- **mutt en échec** : son code retour et son stderr étaient jetés ; l'échec est signalé sur stderr.
+- Message de debug Nextcloud : `$` parasite retiré.
+
+Code mort retiré : `sys.exit(2)` inatteignable après `usage()`, `errs`, `inf`, `global teeMode`, blocs commentés
+d'avant la 0.15, variable `tmp` du sujet.
+
+## cronMutt — historique antérieur
+
+- 0.19 — en-tête de licence GPL.
+- 0.18.3 — correction UTF-8 sur la poussée des données vers Nextcloud.
+- 0.18.2 — coquille sur les stderr par mail.
+- 0.18.1 — initialisation des variables déplacée.
+- 0.18 — correctif en l'absence d'environnement.
+- 0.17.4 — points de debug.
+- 0.17.3 — `-o no` : pas de mail quand tout va bien.
+- 0.17.2 — debug des envois vides ou non.
+- 0.17.1 — `-o` force le mail malgré Nextcloud.
+- 0.17 — `-o` : destinataires du mail quand tout va bien.
+- 0.16 — dépôt Nextcloud (`-n`, `-N`) ; mail si erreur, échec Nextcloud ou `-E`.
+- 0.15 — affichage stdout en direct (threads).
+- 0.14 — code retour de la commande exécutée.
+- 0.13 — hostname dans les en-têtes.
+- 0.12 — autodétection du mode tee.
+- 0.11 — caractères espace Microsoft.
+- 0.10 — mode pipe fonctionnel (flush).
+- 0.9 — en-têtes date de début, commande, code retour.
+- 0.8.1 — en-tête `X-cronMutt`.
+- 0.7 — priorité.
+- 0.6 — `From` embelli.
+- 0.5 — mode tee sans saut de ligne.
+- 0.4 — `-X`, changement du `From`, mode tee.
+- 0.3 — traitement des erreurs.
+- 0.2 — versionnage.
+- 0.1 — première version.
