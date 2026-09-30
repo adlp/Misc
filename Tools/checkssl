@@ -18,7 +18,8 @@
 #* along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #*/
 
-Version="1.2"
+Version="1.3"
+# 1.3 serveurs en TLS 1.0 / 1.1 lus (OpenSSL 3 refusait la connexion : "unsupported protocol")
 # 1.2 smtp:// (STARTTLS, port 25 par defaut, 587 pour la soumission) et smtps:// (TLS direct, port 465)
 # 1.1 plus d'eval (l'URL pouvait injecter des commandes), SNI envoye aussi en imap/pop3/imaps/pop3s,
 #     CN lu aussi avec OpenSSL >= 1.1 en file://, fichier illisible ou non PEM = erreur (et non "0 jour"),
@@ -152,6 +153,9 @@ host_ip="${ip:-$host}"
 
 # Récupérer le certificat : tableau d'arguments, pas d'eval (l'URL ne doit jamais etre executee).
 # SNI envoye pour tous les protocoles : sinon un serveur a plusieurs certificats renvoie celui par defaut
-echo | timeout "$connect_timeout" openssl s_client -connect "$host_ip:$port" -servername "$host" "${starttls[@]}" 2>/dev/null \
+# SECLEVEL=0 et TLSv1 minimum : on veut lire le certificat, pas juger la connexion ; sans eux OpenSSL 3 refuse
+# les serveurs restes en TLS 1.0 / 1.1 ("unsupported protocol"). Un serveur recent negocie toujours TLS 1.2 / 1.3
+echo | timeout "$connect_timeout" openssl s_client -connect "$host_ip:$port" -servername "$host" "${starttls[@]}" \
+        -cipher 'DEFAULT:@SECLEVEL=0' -min_protocol TLSv1 2>/dev/null \
     | sed -n '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' \
     | report_cert "Impossible de récupérer le certificat."

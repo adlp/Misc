@@ -4,7 +4,7 @@ Petits outils d'administration indépendants, sous licence GPL v3.
 
 | Outil | Langage | Version | Description |
 |---|---|---|---|
-| `checkssl` | bash | 1.2 | État d'un certificat TLS (serveur ou fichier) et jours restants avant expiration |
+| `checkssl` | bash | 1.3 | État d'un certificat TLS (serveur ou fichier) et jours restants avant expiration |
 | `cronMutt` | Python 3 | 0.24.2 | Lance une commande (ou lit un pipe) et envoie sa sortie par mail (mutt) et/ou sur Nextcloud, selon le résultat |
 | `sleepUntil` | bash | 1.1 | Comme `at`, mais bloquant : attend une heure donnée puis lance une commande |
 | `whosshkey` | bash | 1.2 | Comme `last`, avec en plus la clef SSH utilisée pour chaque connexion |
@@ -27,6 +27,8 @@ checkssl -u <url> [-i <ip>] [-t <jours>] [-d] [-V]
 
 Ports par défaut : https 443, imap 143, imaps 993, pop3 110, pop3s 995, smtp 25 (MX ; `smtp://hôte:587` pour la
 soumission), smtps 465.
+
+Les serveurs restés en TLS 1.0 / 1.1 sont lus aussi : checkssl lit le certificat, il ne juge pas la connexion.
 
 Affiche le CN, les SAN, la date de fin et les jours restants (négatifs si le certificat a expiré). Code retour : `0`
 OK, `2` expiration dans `-t` jours ou moins (certificat expiré compris), `1` erreur (message sur stderr : URL sans

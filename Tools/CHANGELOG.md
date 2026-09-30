@@ -1,5 +1,14 @@
 # Changelog — Tools
 
+## checkssl 1.3 — serveurs en TLS 1.0 / 1.1 — 2026-09-30
+
+- **Serveur en TLS ancien** : OpenSSL 3 refuse par défaut les connexions en dessous de TLS 1.2 ; face à un serveur
+  resté en TLS 1.0 (ex. `smtp://mail3.francecreation.com`, STARTTLS port 25), `s_client` échouait avant de recevoir le
+  certificat (« unsupported protocol ») et checkssl répondait « Impossible de récupérer le certificat ». `s_client`
+  reçoit `-cipher 'DEFAULT:@SECLEVEL=0' -min_protocol TLSv1` : le but est de lire le certificat, pas de juger la
+  connexion. Les serveurs récents négocient toujours TLS 1.2 / 1.3 (vérifié : Gmail en TLS 1.3). Vaut pour tous les
+  protocoles.
+
 ## checkssl 1.2 — SMTP — 2026-09-30
 
 - **`smtp://`** : certificat présenté en STARTTLS par un serveur SMTP, port 25 par défaut (MX), `smtp://hôte:587`
