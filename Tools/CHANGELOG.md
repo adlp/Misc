@@ -1,5 +1,33 @@
 # Changelog — Tools
 
+## checkssl 1.1 — sans eval, SNI partout, erreurs fiables — 2026-09-30
+
+Premier numéro de version : 1.0 = version initiale (2024-10-08), `-V` l'affiche.
+
+Corrections :
+
+- **Injection de commande** : la commande openssl était construite en texte puis passée à `eval` ; un `;` dans l'URL
+  exécutait la suite (`-u "https://x;touch F;"` créait `F`). Arguments passés en tableau, plus d'`eval`.
+- **SNI** : envoyé seulement en `https`. En `imap`, `pop3`, `imaps`, `pop3s`, un serveur à plusieurs certificats
+  renvoyait son certificat par défaut, pas celui du nom demandé. `-servername` est passé pour tous les protocoles.
+- **`file://` avec OpenSSL ≥ 1.1** : le CN restait vide (sujet écrit `CN = x`, le script cherchait `CN=`). Sujet lu en
+  RFC 2253, identique pour toutes les versions ; les SAN sont aussi affichés en `file://`.
+- **Fichier qui n'est pas un certificat** : `date -d ""` donnait minuit aujourd'hui, d'où « Jours restants : 0 » et
+  code `2` au lieu d'une erreur. Sans date de fin lisible : message et code `1`.
+- **Serveur muet** : sans délai, openssl pouvait attendre indéfiniment (constaté sur un port IMAP filtré). Délai de
+  30 s, puis erreur code `1`.
+- **URL sans protocole** : `sed: no previous regular expression` puis « Protocole non supporté ». Message explicite.
+  Le protocole s'arrête au premier `://` (une URL contenant `https://` dans sa requête était refusée) et accepte les
+  majuscules (`HTTPS://`).
+- **`-t`** : `-t abc` valait 0 sans prévenir, un seuil négatif laissait passer un certificat expiré. Entier positif
+  exigé.
+- **`-i` en IPv6** : mis entre crochets pour `-connect`.
+- Messages d'erreur sur stderr ; commentaire « code 2 si moins de 15 jours » faux avec `-t`, corrigé.
+
+Code mort ou en double retiré : `sed` qui retirait une seconde fois `file://`, ligne `cert_info` commentée, traitement
+et affichage du certificat écrits deux fois (fichier et serveur) regroupés dans `report_cert`, protocole non supporté
+testé deux fois, variable `exit_code`.
+
 ## cronMutt 0.24.2 — commentaires et docstrings — 2026-09-30
 
 - Docstring de module (rôle de cronMutt) et de chaque fonction (paramètres, valeur rendue, pourquoi : pas d'exception

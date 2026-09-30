@@ -4,7 +4,7 @@ Petits outils d'administration indépendants, sous licence GPL v3.
 
 | Outil | Langage | Version | Description |
 |---|---|---|---|
-| `checkssl` | bash | — | État d'un certificat TLS (serveur ou fichier) et jours restants avant expiration |
+| `checkssl` | bash | 1.1 | État d'un certificat TLS (serveur ou fichier) et jours restants avant expiration |
 | `cronMutt` | Python 3 | 0.24.2 | Lance une commande (ou lit un pipe) et envoie sa sortie par mail (mutt) et/ou sur Nextcloud, selon le résultat |
 | `sleepUntil` | bash | — | Comme `at`, mais bloquant : attend une heure donnée puis lance une commande |
 | `whosshkey` | bash | — | Comme `last`, avec en plus la clef SSH utilisée pour chaque connexion |
@@ -14,18 +14,21 @@ Voir `CHANGELOG.md` pour l'historique des versions.
 ## checkssl
 
 ```bash
-checkssl -u <url> [-i <ip>] [-t <jours>] [-d]
+checkssl -u <url> [-i <ip>] [-t <jours>] [-d] [-V]
 ```
 
 | Option | Rôle |
 |---|---|
 | `-u` | `https://`, `imap://` / `pop3://` (STARTTLS), `imaps://`, `pop3s://` (port par défaut du protocole, ou `hôte:port`), ou `file:///chemin/cert.pem` |
-| `-i` | IP à contacter à la place de la résolution DNS (en `https`, le SNI garde le nom de l'URL) |
-| `-t` | Seuil en jours, 15 par défaut |
+| `-i` | IP (v4 ou v6) à contacter à la place de la résolution DNS ; le SNI garde le nom de l'URL |
+| `-t` | Seuil en jours (entier positif), 15 par défaut |
 | `-d` | Debug (`set -x`) |
+| `-V` | Version |
 
-Affiche le CN, les SAN, la date de fin et les jours restants. Code retour : `0` OK, `2` expiration dans `-t` jours ou
-moins, `1` erreur. Dépend de `openssl`.
+Affiche le CN, les SAN, la date de fin et les jours restants (négatifs si le certificat a expiré). Code retour : `0`
+OK, `2` expiration dans `-t` jours ou moins (certificat expiré compris), `1` erreur (message sur stderr : URL sans
+protocole, fichier absent ou sans certificat PEM, serveur injoignable ou muet plus de 30 s). Dépend de `openssl` et
+`timeout` (coreutils).
 
 ## cronMutt
 

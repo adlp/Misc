@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #/*
-#* checkssl is an helper to chech an certificate status
+#* checkssl is an helper to check a certificate status
 #* Copyright (C) 2024 Antoine DELAPORTE
 #*
 #* This program is free software: you can redistribute it and/or modify
@@ -18,23 +18,38 @@
 #* along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #*/
 
+Version="1.1"
+# 1.1 plus d'eval (l'URL pouvait injecter des commandes), SNI envoye aussi en imap/pop3/imaps/pop3s,
+#     CN lu aussi avec OpenSSL >= 1.1 en file://, fichier illisible ou non PEM = erreur (et non "0 jour"),
+#     URL sans protocole = message clair, delai de 30 s sur la connexion, -t verifie, -V,
+#     SAN affiches aussi en file://, erreurs sur stderr, code en double retire
+# 1.0 version initiale
+
 # Initialisation des variables
 url=""
 ip=""
 threshold=15
-exit_code=0
+# Delai maximal pour recuperer le certificat d'un serveur
+connect_timeout=30
 
 # Fonction d'affichage d'aide
 usage() {
-    echo "Usage: $0 -u <url> [-i <ip>] [-h] [-d] [-t <threshold>]"
+    echo "Usage: $0 -u <url> [-i <ip>] [-h] [-d] [-t <threshold>] [-V]"
     echo "  -u: URL du serveur ou fichier (https, imap, imaps, pop3, pop3s, file)"
     echo "  -i: IP pour forcer la résolution DNS (non applicable pour file://)"
-    echo "  -t: DAYS restant avant exitcode a 2"
+    echo "  -t: DAYS restant avant exitcode a 2 (defaut: 15)"
     echo "  -d mode debug"
+    echo "  -V version"
     exit 1
 }
 
-# Fonction pour calculer les jours restants
+# Message d'erreur sur stderr, puis sortie en code 1
+die() {
+    echo "Erreur : $*" >&2
+    exit 1
+}
+
+# Fonction pour calculer les jours restants (negatif si deja expire)
 days_remaining() {
     local end_date="$1"
     local end_epoch=$(date -d "$end_date" +%s)
@@ -42,130 +57,97 @@ days_remaining() {
     echo $(( ($end_epoch - $now_epoch) / 86400 ))
 }
 
+# Affiche CN, SAN, fin de validite et jours restants du certificat PEM lu sur
+# stdin, puis sort : 2 si l'expiration est a threshold jours ou moins, 0 sinon,
+# 1 (avec le message $1) si aucun certificat n'est lisible
+report_cert() {
+    local pem cn dns end_date days_left
+    pem=$(cat)
+    end_date=$(openssl x509 -noout -enddate <<<"$pem" 2>/dev/null | cut -d= -f2)
+    # Sans date de fin, date -d "" donnerait minuit aujourd'hui : "0 jour" trompeur
+    [[ -n "$end_date" ]] || die "$1"
+
+    # RFC2253 : "CN=x,O=y" quelle que soit la version d'OpenSSL
+    cn=$(openssl x509 -noout -subject -nameopt RFC2253 <<<"$pem" | sed 's/^subject=//' | tr ',' '\n' | sed -n 's/^CN=//p' | head -1)
+    dns=$(openssl x509 -noout -text <<<"$pem" | grep "DNS:" | sed 's/DNS://g' | tr -s "\t " " " | sed 's/^ //')
+    days_left=$(days_remaining "$end_date")
+
+    # Affichage des informations
+    echo "CN du certificat : $cn"
+    echo "X509v3 Subject Alternative Name: $dns"
+    echo "Date de fin de validité : $end_date"
+    echo "Jours restants : $days_left"
+
+    # Sortie avec code 2 si threshold jours ou moins (un certificat expire est toujours en 2)
+    if [[ $days_left -le $threshold ]]; then
+        exit 2
+    fi
+    exit 0
+}
+
 # Lecture des arguments
-while getopts "u:i:hdt:" opt; do
+while getopts "u:i:hdt:V" opt; do
     case $opt in
         u) url="$OPTARG" ;;
         i) ip="$OPTARG" ;;
         d) set -x;;
         t) threshold="$OPTARG" ;;
+        V) echo "Version $Version"; exit 0 ;;
         h) usage ;;
         *) usage ;;
     esac
 done
 
-# Vérification de l'URL
+# Vérification des arguments
 if [[ -z "$url" ]]; then
-    echo "Erreur : L'URL est requise."
+    echo "Erreur : L'URL est requise." >&2
     usage
 fi
+# Entier positif : sinon [[ -le ]] lit "abc" comme 0, et un seuil negatif laisserait passer un certificat expire
+[[ "$threshold" =~ ^[0-9]+$ ]] || die "-t attend un nombre de jours (entier positif), pas « $threshold »."
+[[ "$url" == *://* ]] || die "protocole manquant dans l'URL « $url » (https://, imap://, imaps://, pop3://, pop3s://, file://)."
 
-# Extraction du protocole et de l'hôte/port
-protocol=$(echo "$url" | grep :// | sed -e 's,^\(.*://\).*,\1,g')
-url_no_proto=$(echo "$url" | sed -e s,$protocol,,g)
+# Extraction du protocole (jusqu'au premier ://) et du reste
+protocol="${url%%://*}://"
+protocol="${protocol,,}"
+url_no_proto="${url#*://}"
 
 # Gestion spécifique des fichiers locaux (file://)
 if [[ "$protocol" == "file://" ]]; then
-    crt_file=$(echo "$url_no_proto" | sed 's,^file://,,g')
+    crt_file="$url_no_proto"
 
     # Vérification que le fichier existe
-    if [[ ! -f "$crt_file" ]]; then
-        echo "Erreur : Le fichier $crt_file n'existe pas."
-        exit 1
-    fi
+    [[ -f "$crt_file" ]] || die "Le fichier $crt_file n'existe pas."
+    [[ -r "$crt_file" ]] || die "Le fichier $crt_file n'est pas lisible."
 
-    # Récupérer les informations du certificat à partir du fichier
-    cert_info=$(openssl x509 -in "$crt_file" -noout -subject -enddate)
-
-    # Extraction des CN et de la date de fin
-    cn=$(echo "$cert_info" | grep "subject=" | sed -n 's/.*CN=\(.*\)/\1/p')
-    end_date=$(echo "$cert_info" | grep "notAfter=" | cut -d= -f2)
-
-    # Calcul des jours restants
-    days_left=$(days_remaining "$end_date")
-
-    # Affichage des informations
-    echo "CN du certificat : $cn"
-    echo "Date de fin de validité : $end_date"
-    echo "Jours restants : $days_left"
-
-    # Sortie avec code 2 si moins de 15 jours
-    if [[ $days_left -le $threshold ]]; then
-        exit_code=2
-    fi
-
-    exit $exit_code
+    report_cert "Le fichier $crt_file ne contient pas de certificat PEM lisible." < "$crt_file"
 fi
 
 # Extraction de l'hôte et du port si l'URL n'est pas file://
-host=$(echo "$url_no_proto" | cut -d/ -f1)
-port=$(echo "$host" | awk -F: '{print $2}')
-host=$(echo "$host" | awk -F: '{print $1}')
-
-# Définir le port par défaut selon le protocole
-if [[ -z "$port" ]]; then
-    case $protocol in
-        https://) port=443 ;;
-        imap://) port=143 ;;
-        imaps://) port=993 ;;
-        pop3://) port=110 ;;
-        pop3s://) port=995 ;;
-        *) echo "Protocole non supporté"; exit 1 ;;
-    esac
+host="${url_no_proto%%/*}"
+port=""
+if [[ "$host" == *:* ]]; then
+    port="${host##*:}"
+    host="${host%%:*}"
 fi
 
-# Utiliser l'IP forcée si fournie
-if [[ -n "$ip" ]]; then
-    host_ip="$ip"
-else
-    host_ip="$host"
-fi
-
-# Choix de la commande openssl en fonction du protocole
+# Définir le port par défaut selon le protocole, et STARTTLS le cas echeant
+starttls=()
 case $protocol in
-    https://)
-        openssl_cmd="openssl s_client -connect $host_ip:$port -servername $host 2>/dev/null"
-        ;;
-    imap://|pop3://)
-        openssl_cmd="openssl s_client -connect $host_ip:$port -starttls ${protocol%://} 2>/dev/null"
-        ;;
-    imaps://|pop3s://)
-        openssl_cmd="openssl s_client -connect $host_ip:$port 2>/dev/null"
-        ;;
-    *)
-        echo "Protocole non supporté"
-        exit 1
-        ;;
+    https://)  port=${port:-443} ;;
+    imap://)   port=${port:-143}; starttls=(-starttls imap) ;;
+    imaps://)  port=${port:-993} ;;
+    pop3://)   port=${port:-110}; starttls=(-starttls pop3) ;;
+    pop3s://)  port=${port:-995} ;;
+    *) die "Protocole non supporté : $protocol" ;;
 esac
 
-# Récupérer les informations du certificat
-#cert_info=$(echo | eval $openssl_cmd | openssl x509 -noout -subject -enddate)
-cert_info=$(echo | eval $openssl_cmd | openssl x509 -noout -subject -enddate -text)
+# Utiliser l'IP forcée si fournie (IPv6 entre crochets pour -connect)
+host_ip="${ip:-$host}"
+[[ "$host_ip" == *:* ]] && host_ip="[$host_ip]"
 
-# Vérification si le certificat est récupéré
-if [[ -z "$cert_info" ]]; then
-    echo "Erreur : Impossible de récupérer le certificat."
-    exit 1
-fi
-
-# Extraction des CN et de la date de fin
-cn=$(echo "$cert_info" | grep "subject=" | sed -n 's/.*CN =\(.*\)/\1/p')
-dns=$(echo "$cert_info" | grep "DNS:" | sed 's/DNS://g' | tr -s "\t " " ")
-end_date=$(echo "$cert_info" | grep "notAfter=" | cut -d= -f2)
-
-# Calcul des jours restants
-days_left=$(days_remaining "$end_date")
-
-# Affichage des informations
-echo "CN du certificat : $cn"
-echo "X509v3 Subject Alternative Name: $dns"
-echo "Date de fin de validité : $end_date"
-echo "Jours restants : $days_left"
-
-# Sortie avec code 2 si moins de 15 jours
-if [[ $days_left -le $threshold ]]; then
-    exit_code=2
-fi
-
-exit $exit_code
-
+# Récupérer le certificat : tableau d'arguments, pas d'eval (l'URL ne doit jamais etre executee).
+# SNI envoye pour tous les protocoles : sinon un serveur a plusieurs certificats renvoie celui par defaut
+echo | timeout "$connect_timeout" openssl s_client -connect "$host_ip:$port" -servername "$host" "${starttls[@]}" 2>/dev/null \
+    | sed -n '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' \
+    | report_cert "Impossible de récupérer le certificat."
