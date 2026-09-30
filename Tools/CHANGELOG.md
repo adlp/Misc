@@ -1,5 +1,14 @@
 # Changelog — Tools
 
+## cronMutt 0.21 — Message-ID unique, `-n` sans `-N` signalé — 2026-09-30
+
+- **Message-ID** : par défaut la constante `cronMutt`, identique pour tous les mails et hors format RFC 5322 (certains
+  serveurs, Gmail notamment, suppriment les doublons de Message-ID). Il est maintenant unique à chaque mail :
+  `<AAAAMMJJhhmmss.pid.aléa.cronMutt@hôte>`. Un `-m` sans `<…>` est complété : `-m foo` → `<foo@hôte>`,
+  `-m foo@bar` → `<foo@bar>` ; un `-m` fixe reste fixe (choix de l'utilisateur).
+- **`-n` sans `-N`** (ou l'inverse) : le dépôt Nextcloud était ignoré sans rien dire. Avertissement sur stderr et envoi
+  par mail comme pour un dépôt en échec, sortie vide comprise.
+
 ## cronMutt 0.20 — mode pipe réparé, en-têtes mutt échappés, logique d'envoi Nextcloud restaurée — 2026-09-30
 
 Corrections :
