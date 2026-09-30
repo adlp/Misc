@@ -1,5 +1,14 @@
 # Changelog — Tools
 
+## cronMutt 0.24.2 — commentaires et docstrings — 2026-09-30
+
+- Docstring de module (rôle de cronMutt) et de chaque fonction (paramètres, valeur rendue, pourquoi : pas d'exception
+  qui remonte de `nextcloudUpload`, caractères interprétés par mutt dans `escapeMuttValue`, threads de `readStream`).
+- Code découpé en sections (fonctions, options, valeurs dérivées, capture, dépôt Nextcloud, mail), valeurs par défaut
+  annotées de leur option, commentaires sur les points non évidents (fil calculé avant le marquage du sujet, stdin
+  `/dev/null`, `errors='replace'`, `--` avant les destinataires, ordre des règles d'envoi, code retour).
+- Sans changement de comportement : arbre syntaxique identique à la 0.24.1 hors docstrings et numéro de version.
+
 ## cronMutt 0.24.1 — noms explicites — 2026-09-30
 
 - Variables et fonctions renommées, sans changement de comportement : `subprosend` → `sendMail`, `nextcloudput` →

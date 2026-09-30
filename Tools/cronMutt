@@ -31,6 +31,20 @@
 ### pip install future-fstrings
 ### -*- coding: future_fstrings -*-
 
+"""cronMutt : lance une commande (ou lit un pipe) et décide quoi faire de sa sortie.
+
+Pensé pour cron : au lieu du mail systématique de cron, cronMutt
+  * capture stdout et stderr de la commande (-e) ou lit son stdin (mode pipe) ;
+  * dépose cette sortie sur un Nextcloud si demandé (-n / -N) ;
+  * n'envoie un mail (via mutt) que quand c'est utile : échec de la commande,
+    dépôt Nextcloud en échec, sortie non vide, ou demande explicite (-E, -o) ;
+  * regroupe les mails d'une même tâche en fil (In-Reply-To / References),
+    marque le sujet en cas d'échec ("*** ", "**Output non sauvé**") ;
+  * rend le code retour de la commande (128+signal si elle est tuée).
+
+Les options et les règles d'envoi sont détaillées dans le README.md de Tools.
+"""
+
 import getopt,sys
 import io
 import re
@@ -46,9 +60,10 @@ from datetime import datetime
 import requests
 from requests.auth import HTTPBasicAuth
 
-Version="0.24.1"
+Version="0.24.2"
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
+# 0.24.2 commentaires et docstrings, sans changement de comportement
 # 0.24.1 noms de variables et de fonctions explicites, sans changement de comportement
 # 0.24 nextcloud en echec (injoignable, timeout, erreur HTTP, -n/-N incomplet) : mail a tous (-d et -o),
 #      sujet "**Output non sauvé**", l'output en piece jointe sous le nom prevu sur le nextcloud
@@ -87,7 +102,22 @@ Version="0.24.1"
 # 0.2 On rajoute le versionning a cronMutt
 # 0.1  Un outils pour mieux gerer l'envoie des mails a partir des corns
 
+################################################################################
+# Fonctions
+################################################################################
+
 def nextcloudUpload(webdavUrl,credentials,output):
+    """Dépose l'output sur le Nextcloud par un PUT WebDAV.
+
+    webdavUrl   : URL WebDAV complète, nom du fichier compris (option -n)
+    credentials : "login:motdepasse" (option -N) ; seul le premier ':' sépare,
+                  le mot de passe peut donc en contenir
+    output      : contenu à déposer, en octets
+
+    Renvoie None si le dépôt a réussi, sinon la raison de l'échec (texte),
+    qui est aussi affichée sur stderr. Aucune exception ne remonte : un
+    Nextcloud en panne ne doit pas empêcher l'envoi du mail de secours.
+    """
     # Prepare auth (le mot de passe peut contenir des ':')
     loginPassword=credentials.split(':',1)
     auth = HTTPBasicAuth(loginPassword[0],loginPassword[1] if len(loginPassword) > 1 else '')
@@ -97,11 +127,13 @@ def nextcloudUpload(webdavUrl,credentials,output):
         # 15 s pour se connecter, 120 s sans reponse
         response = requests.put(webdavUrl, data=output, auth=auth, timeout=(15,120))
     except requests.Timeout as err:
+        # Serveur qui ne répond pas (connexion ou lecture)
         failureReason=f"pas de reponse (timeout) : {err}"
     except requests.RequestException as err:
+        # DNS, connexion refusée, TLS, etc.
         failureReason=f"injoignable : {err}"
     else:
-        # Vérifier le succès de l'opération
+        # Vérifier le succès de l'opération : 201 création, 204 écrasement
         if response.status_code in [200, 201, 204]:
             return(None)
         failureReason=f"HTTP {response.status_code} {response.reason}"
@@ -109,6 +141,12 @@ def nextcloudUpload(webdavUrl,credentials,output):
     return(failureReason)
 
 def nextcloudFileName(webdavUrl):
+    """Nom du fichier tel qu'il aurait dû être déposé sur le Nextcloud.
+
+    Dernier élément du chemin de l'URL, décodé (%20 → espace), sans la
+    requête ni le fragment. Sert de nom à la pièce jointe quand le dépôt
+    échoue ; "cronMutt-output.txt" si l'URL est absente ou sans nom.
+    """
     # Nom du fichier tel qu'il aurait du etre depose sur le nextcloud
     name=None
     if webdavUrl is not None:
@@ -116,6 +154,16 @@ def nextcloudFileName(webdavUrl):
     return(name if name else "cronMutt-output.txt")
 
 def sendMail(muttCommand,body):
+    """Envoie le mail en passant le corps à mutt sur son stdin.
+
+    muttCommand : ligne de commande mutt complète (en-têtes, sujet, pièce
+                  jointe, "--" puis destinataires)
+    body        : corps du mail (texte)
+
+    Un échec de mutt est signalé sur stderr ; il ne change pas le code
+    retour de cronMutt, qui reste celui de la commande surveillée.
+    Renvoie le code retour de mutt.
+    """
     muttProcess=subprocess.Popen(muttCommand,encoding ='utf-8',
                          stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE,
@@ -126,16 +174,26 @@ def sendMail(muttCommand,body):
     return(muttProcess.returncode)
 
 def escapeMuttValue(value):
+    """Protège une valeur placée dans un "my_hdr" passé à mutt par -e.
+
+    mutt relit la valeur comme une ligne de muttrc : ';' termine la commande
+    (la suite serait exécutée comme commande mutt), '#' ouvre un
+    commentaire, '`' exécute une commande shell, '$' remplace une variable
+    d'environnement et '\\' échappe. Chacun est précédé d'un '\\'. Les
+    sauts de ligne deviennent des espaces : un en-tête tient sur une ligne.
+    """
     # mutt interprete la valeur d'un my_hdr : ; et # la coupent, ` execute, $ expanse
     value=value.replace('\r',' ').replace('\n',' ')
     return(re.sub(r'([\\;#`$])',r'\\\1',value))
 
 
 def printVersion():
+    """Affiche la version de cronMutt et quitte (code 0)."""
     print(f"Version {Version}")
     sys.exit(0)
 
 def printUsage():
+    """Affiche l'aide des options et quitte (code 123, aussi sur option inconnue)."""
     print("     E       Mail even empty data")
     print("     i:      in-reply-to")
     print("     s:      Mail subject")
@@ -158,6 +216,19 @@ def printUsage():
     sys.exit(123)
 
 def readStream(stream, capturedLines, streamName):
+    """Lit un flux ligne à ligne jusqu'à sa fin, puis le ferme.
+
+    stream        : flux texte à lire (stdout/stderr de la commande, ou stdin
+                    en mode pipe)
+    capturedLines : dict {"stdout": [...], "stderr": [...]} complété ici
+    streamName    : "stdout" ou "stderr", clef de capturedLines
+
+    Chaque ligne est gardée sans sa fin (\\n, \\r, espaces finaux) mais avec
+    son indentation. En mode tee (-T, ou stdin sur un terminal), elle est
+    aussi affichée tout de suite, stderr préfixé de "[STDERR]:".
+    Appelée dans un thread par flux en mode -e : lire stdout et stderr en
+    parallèle évite que la commande bloque sur un tube plein.
+    """
     for line in stream:
         capturedLines[streamName].append(line.rstrip())
         if teeMode:
@@ -166,34 +237,40 @@ def readStream(stream, capturedLines, streamName):
             print(line,end="",flush=True)
     stream.close()
 
+################################################################################
+# Lecture des options
+################################################################################
+
 try:
     options, _ = getopt.getopt(sys.argv[1:], "hVDEi:s:d:o:r:f:m:e:ct:XTp:n:N:", ["help"])
 except getopt.GetoptError as err:
     print(err)  # will print something like "option -a not recognized"
     printUsage()
 
+# Valeurs par defaut
 debug=False
-sendEvenIfEmpty=False
-mailSubject=f"//cron//{os.path.basename(__file__)}"
-inReplyTo=None
-recipients=os.getenv('LOGNAME','nobody')
-recipientsIfOk=None
-messageId=None
-command=None
-mailContentType=None
-replyTo=os.getenv("LOGNAME",'nobody')
-replyToGiven=False
-markSubjectOnError=True
+sendEvenIfEmpty=False                           # -E
+mailSubject=f"//cron//{os.path.basename(__file__)}"   # -s
+inReplyTo=None                                  # -i, defaut : md5 du sujet
+recipients=os.getenv('LOGNAME','nobody')        # -d
+recipientsIfOk=None                             # -o, "no" = pas de mail si tout va bien
+messageId=None                                  # -m, defaut : unique a chaque mail
+command=None                                    # -e, None = mode pipe
+mailContentType=None                            # -t
+replyTo=os.getenv("LOGNAME",'nobody')           # -r
+replyToGiven=False                              # Reply-To pose seulement si -r est donne
+markSubjectOnError=True                         # -X le desactive
+# Mode tee (affichage en direct) actif d'office quand on est lance a la main
 if sys.stdin.isatty():
     teeMode=True
 else:
     teeMode=False
-mailFrom=None
-#-e "set content_type=text/html" 
-hideCommandHeader=False
-outputEncoding="utf-8"
-nextcloudUrl=None
-nextcloudCredentials=None
+mailFrom=None                                   # -f, defaut : -r
+#-e "set content_type=text/html"
+hideCommandHeader=False                         # -c
+outputEncoding="utf-8"                          # -p
+nextcloudUrl=None                               # -n
+nextcloudCredentials=None                       # -N
 
 for option,value in options:
     if   option in ('-h','--help'):
@@ -235,7 +312,11 @@ for option,value in options:
         nextcloudUrl=value
     elif option in "-N":
         nextcloudCredentials=value
-    
+
+
+################################################################################
+# Valeurs derivees des options
+################################################################################
 
 hostname=os.uname()[1]
 # Message-ID : unique par defaut (un id fixe fait dedoublonner les mails), toujours au format <id@host>
@@ -243,16 +324,20 @@ if messageId is None:
     messageId=f'<{datetime.now().strftime("%Y%m%d%H%M%S")}.{os.getpid()}.{uuid.uuid4().hex[:12]}.cronMutt@{hostname}>'
 elif "<" not in messageId:
     messageId=f'<{messageId}>' if "@" in messageId else f'<{messageId}@{hostname}>'
+# Nextcloud : -n et -N vont ensemble ; un seul des deux compte comme un depot en echec
 nextcloudEnabled=nextcloudUrl is not None and nextcloudCredentials is not None
 nextcloudIncomplete=(nextcloudUrl is None) != (nextcloudCredentials is None)
 if nextcloudIncomplete:
     print("cronMutt: -n et -N vont ensemble, pas de depot nextcloud, envoi par mail",file=sys.stderr)
 
+# Identifiant du fil : calcule sur le sujet AVANT l'ajout eventuel de "*** " ou
+# "**Output non sauvé**", pour que succes et echecs d'une meme tache restent dans le meme fil
 if inReplyTo is None:
     inReplyTo=hashlib.md5(mailSubject.encode('utf-8')).hexdigest()
 # In-Reply-To : format <id@droite> sinon les clients l'ignorent pour les fils
 if "<" not in inReplyTo:
     inReplyTo=f'<{inReplyTo}>' if "@" in inReplyTo else f'<{inReplyTo}@cronMutt>'
+# From : "adresse" devient "partie-locale <adresse>"
 if mailFrom is None:
     mailFrom=replyTo
 if "<" not in mailFrom:
@@ -262,12 +347,17 @@ if "<" not in mailFrom:
         print(f"{fromAddress} ET {mailFrom}")
         print(f'{fromAddress.split("@")}')
 
-# Preparation Ouverture du mail 1/2
+# Preparation Ouverture du mail 1/2 : en-tetes connus avant l'execution
+# (chaque valeur libre passe par escapeMuttValue, mutt la relit comme du muttrc)
 muttCommand=['mutt','-e',f'my_hdr X-cronMutt: cronMutt-{Version}','-e',f'my_hdr X-cronMuttStart: {str(datetime.now())}','-e',f'my_hdr X-cronMuttHost: {hostname}','-e',f'my_hdr From:{escapeMuttValue(mailFrom)}','-e',f'my_hdr In-Reply-To: {escapeMuttValue(inReplyTo)}','-e',f'my_hdr References: {escapeMuttValue(inReplyTo)}','-e',f'my_hdr Message-ID: {escapeMuttValue(messageId)}']
 if replyToGiven:
     muttCommand.append('-e')
     muttCommand.append(f'my_hdr Reply-To: {escapeMuttValue(replyTo)}')
 
+
+################################################################################
+# Capture de l'output : commande lancee (-e) ou stdin (mode pipe)
+################################################################################
 
 # Ouverture du process a suivre
 commandExitCode=0
@@ -280,6 +370,8 @@ if command is not None:
         muttCommand.append('-e')
         muttCommand.append(f'my_hdr X-cronMuttCmd: {escapeMuttValue(command)}')
 
+    # stdin /dev/null : une commande qui lit stdin recoit EOF au lieu de bloquer
+    # errors='replace' : un octet invalide pour -p ne tue pas le thread de lecture
     commandProcess=subprocess.Popen(['/bin/sh','-c',command],encoding =outputEncoding,errors='replace',
                          stdin=subprocess.DEVNULL,
                          stdout=subprocess.PIPE,
@@ -296,6 +388,7 @@ if command is not None:
     stderrReader.join()
     commandProcess.wait()
 
+    # Negatif si la commande a ete tuee par un signal (-9 pour SIGKILL)
     commandExitCode=commandProcess.returncode
 
     muttCommand.append('-e')
@@ -309,7 +402,7 @@ else:
     # Mode pipe : les donnees arrivent sur notre stdin
     readStream(io.TextIOWrapper(sys.stdin.buffer,encoding=outputEncoding,errors='replace'), capturedOutput, "stdout")
 
-# Traitement des donnees
+# Traitement des donnees : stdout, puis stderr apres une ligne de separation
 output=""
 for line in capturedOutput['stdout']:
     output+=line+"\n"
@@ -317,6 +410,10 @@ if len(capturedOutput['stderr']):
     output+="\n=============================================================================\n"
     for line in capturedOutput['stderr']:
         output+=line+"\n"
+
+################################################################################
+# Depot Nextcloud
+################################################################################
 
 # Depot de la donnee sur le nextcloud
 nextcloudFailure=None
@@ -335,12 +432,18 @@ if nextcloudFailed:
     mailSubject="**Output non sauvé** "+mailSubject
     mailBody=f"Output non sauvé, dépôt Nextcloud en échec : {nextcloudFailure}\nIl est en pièce jointe.\n"
     mailBody+="\n=============================================================================\n"+output
+    # Repertoire temporaire : la piece jointe doit porter le nom prevu sur le Nextcloud,
+    # sans risque de collision entre deux cronMutt lances en meme temps
     attachmentDir=tempfile.mkdtemp(prefix="cronMutt.")
     attachmentFile=os.path.join(attachmentDir,nextcloudFileName(nextcloudUrl))
     with open(attachmentFile,'w',encoding='utf-8') as attachment:
         attachment.write(output)
 
-# Preparation Ouverture du mail 2/2
+################################################################################
+# Mail
+################################################################################
+
+# Preparation Ouverture du mail 2/2 : sujet, type, priorite, piece jointe
 muttCommand.append('-s')
 muttCommand.append(mailSubject)
 
@@ -353,6 +456,7 @@ if commandExitCode != 0 or nextcloudFailed:
 if nextcloudFailed:
     muttCommand.append('-a')
     muttCommand.append(attachmentFile)
+# "--" separe les options mutt des destinataires (obligatoire apres -a)
 muttCommand.append('--')
 
 # Destinataires : -o seul quand tout va bien, sinon -d et -o
@@ -372,6 +476,7 @@ if debug:
 #   * sauf -o no, quand tout va bien
 #   * avec nextcloud : il y a un -E ou un -o (l'output est deja sur le nc)
 #   * sans nextcloud : il y a un -E ou de l'output
+# L'ordre des tests compte : la premiere regle qui s'applique decide
 
 mustSendMail=False
 if nextcloudFailed:
@@ -403,11 +508,13 @@ if mustSendMail:
     sendMail(muttCommand,mailBody)
     if debug:
         print(f"Sended-{len(mailBody)}")
+# La piece jointe n'est plus utile une fois mutt termine
 if attachmentDir is not None:
     shutil.rmtree(attachmentDir,ignore_errors=True)
 
 if debug:
     print(len(output))
 
+# Code retour de la commande surveillee (0 en mode pipe)
 # Tue par un signal : returncode negatif, on rend 128+signal comme le shell
 sys.exit(128-commandExitCode if commandExitCode < 0 else commandExitCode)

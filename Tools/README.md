@@ -5,7 +5,7 @@ Petits outils d'administration indépendants, sous licence GPL v3.
 | Outil | Langage | Version | Description |
 |---|---|---|---|
 | `checkssl` | bash | — | État d'un certificat TLS (serveur ou fichier) et jours restants avant expiration |
-| `cronMutt` | Python 3 | 0.24.1 | Lance une commande (ou lit un pipe) et envoie sa sortie par mail (mutt) et/ou sur Nextcloud, selon le résultat |
+| `cronMutt` | Python 3 | 0.24.2 | Lance une commande (ou lit un pipe) et envoie sa sortie par mail (mutt) et/ou sur Nextcloud, selon le résultat |
 | `sleepUntil` | bash | — | Comme `at`, mais bloquant : attend une heure donnée puis lance une commande |
 | `whosshkey` | bash | — | Comme `last`, avec en plus la clef SSH utilisée pour chaque connexion |
 
