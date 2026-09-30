@@ -1,5 +1,37 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.158 — harnais vrai borg isolé, tests des graphiques — 2026-09-30
+
+Chantier « reconstruction progressive », story 21 (actions de rétrospective A27, A28). Aucun changement du code de
+production ; UI et borgHelperWWW inchangés.
+
+- **CodecSelfTest : les contrôles sur un vrai borg n'écrivent plus chez l'utilisateur.** Deux fuites mesurées (borg
+  1.2.6) :
+  - les contrôles « repo_stats » et « rapprochement » lançaient borg par `boex`, qui ne transmet que les clés du rc,
+    `PATH` et `LC_ALL` (ni `HOME` ni `BORG_BASE_DIR`) : chaque run complet laissait deux entrées dans
+    `~/.config/borg/security` et `~/.cache/borg` (dépôts `/tmp/borghelper-selftest-*/realborg` et `realreconcile`) ;
+  - `BORG_CACHE_DIR` et `BORG_SECURITY_DIR` exportés priment sur `BORG_BASE_DIR`.
+
+  Un seul jeu d'aides pour les sept familles de contrôles (tranche, périmètre, fantôme, dépôt externe, rapprochement,
+  repo_stats, Inchangés) : sous-processus borg sans aucune `BORG_*` ; tout `BorgHelper` du selftest passe par un script
+  `BORG_EXE` qui retire `BORG_CACHE_DIR`, `BORG_CONFIG_DIR`, `BORG_SECURITY_DIR`, `BORG_KEYS_DIR` et pose le
+  `BORG_BASE_DIR` du test (chemins entre guillemets) ; borgHelper enfants sans DSN Sentry ni passphrase d'exécution
+  héritée (jamais le fichier DSN réel). Plus de `os.environ['BORG_BASE_DIR']` posé puis retiré (une valeur de
+  l'utilisateur était effacée).
+- Chaque contrôle sur un vrai borg échoue s'il laisse une entrée de sécurité borg chez l'utilisateur (dossier personnel,
+  `HOME`, `XDG_CONFIG_HOME`, `BORG_*` de l'utilisateur) pour un dépôt du selftest.
+- Nouveau contrôle : dossiers `BORG_*` factices dans l'environnement ; un dépôt neuf par chemin (sous-processus, script
+  `BORG_EXE` avec et sans `exec`, `boex`, CLI) -> dossiers factices vides, cache et sécurité sous le `BORG_BASE_DIR` du
+  test.
+- Sans borg, chaque contrôle est sauté sous son propre nom (`-f` montre le `SKIP` du contrôle filtré, `-l` le liste) ;
+  le bilan compte les `SKIP` (« 0/0 OK, 2 SKIP »). Garde sur un selftest imbriqué sans borg.
+- **Test de l'UI** (`borgHelperWWW_ui_test.js`) : graphiques de la page Historique, sur les vraies fonctions de la page,
+  un DOM limité aux `id` du balisage et un faux Chart.js — les cinq graphiques construits et eux seuls, `/repohistory`
+  et `/archivehistory` demandés pour le nick affiché, séries `original_size`/`compressed_size`/`deduplicated_size` et
+  leurs données, aucun indicateur de chargement laissé, message propre à chaque graphique sans données, archive
+  supprimée atténuée et « (supprimée) » dans l'infobulle, bloc HTML (canvas et message) de chaque graphique, filet
+  « Aucune donnée. ».
+
 ## borgHelper 1.0.157 / UI 1.19.4 — garde « Inchangés » sur vrai borg, bargraphe retiré — 2026-09-29
 
 Chantier « reconstruction progressive », story 20 (actions de rétrospective A25, A26).

@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.157"
+Version="1.0.158"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -7305,6 +7305,28 @@ def codec_selftest(pattern=None,list_only=False):
             if not ok: print(f"  branchement _MEI : {[(k,v[0],v[1]) for k,v in out.items()]} {o2[-300:]!r}")
             return ok
         check("fin de selftest : nettoyage _MEI* branché (relevé avant le run, 10 s / 15 s, ligne si N > 0, rien avec -l)",_mei_run_hook)
+        def _rbc_without_borg():
+            """1.0.158 (story 21, A27) : sans borg (shutil.which simulé), des contrôles « vrai borg » filtrés par -f sont sautés
+            sous leur propre nom (SKIP, comptés au bilan, code 0, aucun OK/FAIL) et listés par -l (LIST, pas de SKIP).
+            codec_selftest imbriqué, nettoyage _MEI neutralisé."""
+            real=shutil.which; out={}
+            def which(n,*a,**k): return None if n=='borg' else real(n,*a,**k)
+            names=('harnais vrai borg','rapprochement réel')
+            for lst in (False,True):
+                buf=io.StringIO()
+                with mock.patch.object(shutil,'which',which), mock.patch.dict(globals(),{'_purge_run_mei':lambda *a,**k:0}), \
+                     contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                    rc=codec_selftest(re.compile('^harnais vrai borg|^rapprochement réel'),list_only=lst)
+                out[lst]=(rc,buf.getvalue().splitlines())
+            (r0,o0),(r1,o1)=out[False],out[True]
+            pref=lambda o,p: sorted(x[len(p):].split(' :')[0] for x in o if x.startswith(p))
+            ok=(r0==0 and pref(o0,'SKIP ')==sorted(names) and all(x.endswith('(borg absent)') for x in o0 if x.startswith('SKIP '))
+                and not any(x.startswith(('OK ','FAIL','LIST')) for x in o0) and any('0/0 OK, 2 SKIP' in x for x in o0)
+                and r1==0 and pref(o1,'LIST ')==sorted(names) and not any(x.startswith(('SKIP','OK ','FAIL')) for x in o1)
+                and '2 contrôle(s)' in o1)
+            if not ok: print(f"  sans borg : -f {r0} {o0[-6:]} ; -l {r1} {o1[-4:]}")
+            return ok
+        check("sans borg : contrôle « vrai borg » filtré -> SKIP sous son nom (compté au bilan, code 0), -l le liste",_rbc_without_borg)
         # ── alphabet / base64 strict ──
         check("alphabet : +->'.' /->'-' sans padding",lambda: _b64e(bytes([0xfb,0xff,0xbf]))=='.-.-' and _b64e(b'\x00')=='AA')
         check("_b64d : longueur = 1 mod 4 rejetée",lambda: raises(DbCodecError,lambda:_b64d('AAAAA')))
@@ -10219,6 +10241,121 @@ def codec_selftest(pattern=None,list_only=False):
             base=os.nice(0)
             return len(lines)>=2 and int(lines[-2])==min(base+10,19) and ('idle' in lines[-1] or lines[-1]=='absent')
         check("tranche : priorité basse -> nice 10 et ionice idle (processus à part)",_ix_lower_priority)
+        # ── Harnais « vrai borg » (1.0.158, story 21, A27) : un borg lancé par le selftest n'écrit jamais hors du dossier de
+        # son test. Deux fuites mesurées (borg 1.2.6) : BORG_CACHE_DIR / BORG_SECURITY_DIR… de l'utilisateur priment sur
+        # BORG_BASE_DIR ; et boex ne passe à borg que les clés du rc, PATH et LC_ALL (ni HOME ni BORG_BASE_DIR) — un borg
+        # lancé par boex sans BORG_EXE écrit dans le dossier personnel (~/.cache/borg, ~/.config/borg/security).
+        # D'où : sous-processus -> _rb_env ; tout BorgHelper du selftest -> BORG_EXE=_rb_wrapper ; _rbc scrute ensuite
+        # les dossiers de sécurité borg de l'utilisateur.
+        import shlex
+        def _rb_env(bb,**kw):
+            """Environnement d'un sous-processus borg ou borgHelper : os.environ sans aucune clé BORG_*, BORG_BASE_DIR du test,
+            TMPDIR du selftest, BORG_RELOCATED_REPO_ACCESS_IS_OK, puis les clés propres au test."""
+            e={k:v for k,v in os.environ.items() if not k.startswith('BORG_')}
+            e.update(BORG_BASE_DIR=bb,TMPDIR=tmp,BORG_RELOCATED_REPO_ACCESS_IS_OK='yes'); e.update(kw)
+            return e
+        def _rb_cli_env(bb=None,**kw):
+            """Environnement d'un borgHelper enfant : _rb_env (si bb) ou os.environ, sans DSN Sentry ni passphrase
+            d'exécution héritée, Sentry neutralisé (fichier DSN vide : jamais le /usr/local/etc/borghelper-sentry réel)."""
+            e=_rb_env(bb,**kw) if bb else dict(os.environ,**kw)
+            for k in ('BORGHELPERC_SENTRY_DSN','BORGHELPERC_RUNTIME_PASSPHRASE'): e.pop(k,None)
+            e['BORGHELPERC_SENTRY_FILE']=_rb_nodsn
+            return e
+        _rb_nodsn=os.path.join(tmp,'rb-nodsn'); open(_rb_nodsn,'w').close()
+        def _rb_wrapper(path,bb,pre='',mid=''):
+            """Script BORG_EXE : lignes propres au test (pre : avant, mid : après l'isolation, pour un borg lancé sans exec ;
+            chemins déjà entre guillemets), variables de dossier borg héritées retirées, BORG_BASE_DIR du test, exec du
+            borg — chemins entre guillemets. Seule isolation d'un borg lancé par boex (qui ne passe pas BORG_BASE_DIR)."""
+            with open(path,'w') as f:
+                f.write("#!/bin/bash\n"+pre+"unset BORG_CACHE_DIR BORG_CONFIG_DIR BORG_SECURITY_DIR BORG_KEYS_DIR\n"
+                        f"export BORG_BASE_DIR={shlex.quote(bb)}\n"+mid+f"exec {shlex.quote(shutil.which('borg'))} \"$@\"\n")
+            os.chmod(path,0o700)
+        def _rb_user_sec_dirs():
+            """Dossiers de sécurité borg de l'utilisateur, relevés avant tout contrôle : dossier personnel (pwd — celui d'un
+            borg lancé par boex, sans HOME), HOME, XDG_CONFIG_HOME, BORG_BASE_DIR / BORG_CONFIG_DIR / BORG_SECURITY_DIR."""
+            import pwd
+            env=os.environ; out=set()
+            for h in (pwd.getpwuid(os.getuid()).pw_dir,env.get('HOME'),env.get('BORG_BASE_DIR')):
+                if h: out.add(os.path.join(h,'.config','borg','security'))
+            if env.get('XDG_CONFIG_HOME'): out.add(os.path.join(env['XDG_CONFIG_HOME'],'borg','security'))
+            if env.get('BORG_CONFIG_DIR'): out.add(os.path.join(env['BORG_CONFIG_DIR'],'security'))
+            if env.get('BORG_SECURITY_DIR'): out.add(env['BORG_SECURITY_DIR'])
+            return sorted(out)
+        _rb_user_sec=_rb_user_sec_dirs(); _rb_seen=set()
+        def _rb_home_leaks():
+            """Entrées de sécurité borg de l'utilisateur dont le dépôt est dans le dossier du selftest (location sous tmp)."""
+            out=[]
+            for sd in _rb_user_sec:
+                try: ents=os.listdir(sd)
+                except OSError: continue
+                for e in ents:
+                    try:
+                        with open(os.path.join(sd,e,'location')) as f: loc=f.read().strip()
+                    except OSError: continue
+                    if loc==tmp or loc.startswith(tmp+os.sep): out.append(f"{os.path.join(sd,e)} ({loc})")
+            return out
+        def _rbc(name,fn):
+            """Contrôle « vrai borg » : sauté sous son propre nom sans borg (-f montre le SKIP du contrôle filtré, -l le
+            liste) ; échoue s'il a laissé une entrée de sécurité borg chez l'utilisateur (dépôt du selftest)."""
+            if shutil.which('borg') is None and not list_only: skip(name,"borg absent"); return
+            def run():
+                ok=fn(); new=[x for x in _rb_home_leaks() if x not in _rb_seen]; _rb_seen.update(new)
+                if new: print(f"  écrit dans le dossier borg de l'utilisateur : {new[:3]}")
+                return ok and not new
+            check(name,run)
+        def _rb_isolation():
+            """1.0.158 (story 21, A27) : garde du harnais. BORG_BASE_DIR, BORG_CACHE_DIR, BORG_CONFIG_DIR, BORG_SECURITY_DIR
+            et BORG_KEYS_DIR factices dans os.environ (comme chez un utilisateur qui les exporte) ; un dépôt neuf par chemin :
+            sous-processus _rb_env, wrapper lancé avec l'environnement de l'utilisateur (exec, et borg lancé depuis mid),
+            BorgHelper de ce processus (boex, BORG_EXE=wrapper), borgHelper enfant (CLI, _rb_cli_env) -> dossiers factices
+            vides, cache et sécurité du dépôt sous le BORG_BASE_DIR de son chemin, rien dans le dossier borg de
+            l'utilisateur (_rbc), os.environ restauré."""
+            d=os.path.join(tmp,'rb-isolation'); src=os.path.join(d,'src'); os.makedirs(src)
+            with open(os.path.join(src,'f'),'w') as f: f.write('x')
+            fake={k:os.path.join(d,'faux',k) for k in ('BORG_BASE_DIR','BORG_CACHE_DIR','BORG_CONFIG_DIR','BORG_SECURITY_DIR','BORG_KEYS_DIR')}
+            for x in fake.values(): os.makedirs(x)
+            count=lambda top: sum(len(ds)+len(fs) for _r,ds,fs in os.walk(top))
+            borg=shutil.which('borg'); saved=dict(os.environ); errs=[]; placed={}
+            me=os.path.realpath(__file__)
+            def run(way,cmd,env):
+                r=subprocess.run(cmd,env=env,capture_output=True,text=True,timeout=120)
+                if r.returncode not in (0,1): errs.append(f"{way} {os.path.basename(cmd[0])} {cmd[1:3]} : code {r.returncode} {(r.stdout+r.stderr)[-200:]!r}")
+            def rc_for(way,repo,w):
+                rc=os.path.join(d,way+'.rc')
+                with open(rc,'w') as f:
+                    f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,way+'-cache')}\n\n[iso]\nBORG_REPO={repo}\nBORG_PASSPHRASE=pw-iso\n"
+                            f"SER_NAME=iso\nSER_LOGIN=x\nGLOB_ARCH=a*\nBORG_ARCHNAME=a\nBORG_ROOTBKP={src}\nDB_ENCRYPT=false\n"
+                            f"EXCLUDE=--exclude-caches\nBORG_EXE={w}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\n")
+                os.chmod(rc,0o600); return rc
+            os.environ.update(fake)
+            try:
+                for way in ('sous-processus','wrapper','wrapper-mid','boex','cli'):
+                    bb=os.path.join(d,way,'bb'); repo=os.path.join(d,way,'repo'); w=os.path.join(d,way+'.sh'); os.makedirs(bb)
+                    uenv=dict(os.environ,BORG_PASSPHRASE='pw-iso',BORG_RELOCATED_REPO_ACCESS_IS_OK='yes')   # tel quel : seul le wrapper isole
+                    _rb_wrapper(w,bb,mid=(f"if [ \"$1\" = create ]; then {shlex.quote(borg)} \"$@\"; exit $?; fi\n" if way=='wrapper-mid' else ''))
+                    if way=='sous-processus':
+                        for cmd in (('init','-e','repokey',repo),('create',f'{repo}::a',src)): run(way,[borg,*cmd],_rb_env(bb,BORG_PASSPHRASE='pw-iso'))
+                    elif way.startswith('wrapper'):
+                        for cmd in (('init','-e','repokey',repo),('create',f'{repo}::a',src)): run(way,[w,*cmd],uenv)
+                    else:
+                        run(way,[w,'init','-e','repokey',repo],uenv); rc=rc_for(way,repo,w)
+                        if way=='boex':
+                            r=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,way+'-cache')).borg.boex('iso',['create','--json',f'{repo}::a',src])
+                            if r.get('exitcode') not in (0,1): errs.append(f"boex create : {r.get('exitcode')} {str(r.get('stderr'))[-200:]}")
+                        else: run(way,[me,'-C',rc,'-c','Index','-n','iso'],_rb_cli_env())   # environnement de l'utilisateur, BORG_* compris
+                    try:
+                        cp=configparser.ConfigParser(); cp.read(os.path.join(repo,'config')); rid=cp['repository']['id']
+                        placed[way]=(os.path.isdir(os.path.join(bb,'.config','borg','security',rid)),os.path.isdir(os.path.join(bb,'.cache','borg',rid)))
+                    except (KeyError,OSError) as e: placed[way]=f"id illisible : {e}"
+            finally:
+                os.environ.clear(); os.environ.update(saved)
+            leaked={k:count(x) for k,x in fake.items()}
+            ok=(not errs and not any(leaked.values()) and all(v==(True,True) for v in placed.values()) and len(placed)==5
+                and dict(os.environ)==saved)
+            if not ok: print(f"  isolation : erreurs {errs} ; entrées dans les dossiers factices {leaked} ; sécurité/cache sous le "
+                             f"BORG_BASE_DIR du chemin {placed}")
+            return ok
+        _rbc("harnais vrai borg : BORG_* factices de l'utilisateur jamais écrits (sous-processus, wrapper, boex, CLI), dossier borg de l'utilisateur intact",_rb_isolation)
         ix_dir=os.path.join(tmp,'tranches')
         def _ix_setup():
             """Vrai dépôt, 6 archives '{fqdn}-t-*' (fichiers modifiés entre chaque), borg appelé via un script qui
@@ -10228,7 +10365,7 @@ def codec_selftest(pattern=None,list_only=False):
             src=os.path.join(ix_dir,'src'); os.makedirs(src,exist_ok=True)
             repo=os.path.join(ix_dir,'repo'); bb=os.path.join(ix_dir,'borgbase'); log=os.path.join(ix_dir,'borg.log')
             w=os.path.join(ix_dir,'borgw')
-            env=dict(os.environ,BORG_PASSPHRASE='pw-ix',BORG_RELOCATED_REPO_ACCESS_IS_OK='yes',BORG_BASE_DIR=bb)
+            env=_rb_env(bb,BORG_PASSPHRASE='pw-ix')   # 1.0.158 : isolé des BORG_* de l'utilisateur
             r=subprocess.run([shutil.which('borg'),'init','-e','repokey',repo],env=env,capture_output=True,text=True,timeout=120)
             if r.returncode!=0: raise RuntimeError(f"borg init : {r.stderr[-300:]}")
             pre=f"{socket.getfqdn()}-t-"
@@ -10256,12 +10393,9 @@ def codec_selftest(pattern=None,list_only=False):
         def _ix_slow(ctx,match,secs):
             """Script borg : journalise, attend `secs` si la sous-commande vaut `match` (sleep sans hériter des tubes :
             tuer le script rend la main aussitôt), puis exec borg avec le BORG_BASE_DIR du test."""
-            with open(ctx['w'],'w') as f:
-                f.write(f"#!/bin/bash\necho \"$*\" >> {ctx['log']}\n"
+            _rb_wrapper(ctx['w'],ctx['bb'],f"echo \"$*\" >> {shlex.quote(ctx['log'])}\n"
                         +(f"sleep {secs} </dev/null >/dev/null 2>&1\n" if match=='ALL' else
-                          f"if [ \"$1\" = \"{match}\" ]; then sleep {secs} </dev/null >/dev/null 2>&1; fi\n" if match else "")
-                        +f"export BORG_BASE_DIR={ctx['bb']}\nexec {shutil.which('borg')} \"$@\"\n")
-            os.chmod(ctx['w'],0o700)
+                          f"if [ \"$1\" = \"{match}\" ]; then sleep {secs} </dev/null >/dev/null 2>&1; fi\n" if match else ""))
         def _ix_log(ctx,clear=False):
             try:
                 with open(ctx['log']) as f: lines=[l.rstrip('\n') for l in f]
@@ -10357,12 +10491,9 @@ def codec_selftest(pattern=None,list_only=False):
             SIGTERM) -> paire jamais marquée, aucune ligne ; passe suivante (borg normal) -> toutes les paires avec leurs
             entrées, comme un Index complet."""
             ctx=_ix_ctx(); b=_ix_bh(ctx,'c-kill1'); ref=_ix_bh(ctx,'c-kill1-ref'); _ix_slow(ctx,None,0)
-            with open(ctx['w'],'w') as f:
-                f.write(f"#!/bin/bash\necho \"$*\" >> {ctx['log']}\n"
+            _rb_wrapper(ctx['w'],ctx['bb'],f"echo \"$*\" >> {shlex.quote(ctx['log'])}\n"
                         "if [ \"$1\" = \"diff\" ]; then trap 'kill $p 2>/dev/null; exit 1' TERM; "
-                        "sleep 30 </dev/null >/dev/null 2>&1 & p=$!; wait $p; exit 1; fi\n"
-                        f"export BORG_BASE_DIR={ctx['bb']}\nexec {shutil.which('borg')} \"$@\"\n")
-            os.chmod(ctx['w'],0o700)
+                        "sleep 30 </dev/null >/dev/null 2>&1 & p=$!; wait $p; exit 1; fi\n")
             _ix_log(ctx,clear=True)
             try:
                 t0=time.monotonic(); ko=_q_run(b.index,'ix',budget=6,natures=['diff']); dt=time.monotonic()-t0
@@ -10385,11 +10516,8 @@ def codec_selftest(pattern=None,list_only=False):
             """1.0.153 (story 16) : borg diff NON signalé qui sort en code 1 (avertissement) avec sa sortie -> paire gardée
             avec ses entrées (comme un Index complet) : la garde ne vise que les borg tués par le moniteur."""
             ctx=_ix_ctx(); _ix_slow(ctx,None,0); b=_ix_bh(ctx,'c-rc1'); ref=_ix_bh(ctx,'c-rc1-ref'); _q_run(ref.index,'ix')
-            with open(ctx['w'],'w') as f:
-                f.write(f"#!/bin/bash\necho \"$*\" >> {ctx['log']}\nexport BORG_BASE_DIR={ctx['bb']}\n"
-                        f"if [ \"$1\" = \"diff\" ]; then {shutil.which('borg')} \"$@\"; exit 1; fi\n"
-                        f"exec {shutil.which('borg')} \"$@\"\n")
-            os.chmod(ctx['w'],0o700)
+            _rb_wrapper(ctx['w'],ctx['bb'],f"echo \"$*\" >> {shlex.quote(ctx['log'])}\n",
+                        mid=f"if [ \"$1\" = \"diff\" ]; then {shlex.quote(shutil.which('borg'))} \"$@\"; exit 1; fi\n")
             try: _q_run(b.index,'ix')
             finally: _ix_slow(ctx,None,0)
             def counts(x):
@@ -10590,7 +10718,7 @@ def codec_selftest(pattern=None,list_only=False):
             b=_ix_bh(ctx,'cache')   # CACHE_DIR du rc : même base que le processus CLI
             lp=b.db._priority_lock_path('ixf'); _ix_fake_lock(lp,os.getpid())   # un autre PID pour le processus CLI
             me=os.path.realpath(__file__)
-            ps=subprocess.Popen([me,'-C',ctx['rc'],'-c','Index','-n','ixf'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            ps=subprocess.Popen([me,'-C',ctx['rc'],'-c','Index','-n','ixf'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,env=_rb_cli_env())
             try:
                 pl=b.db._index_paused_lock_path('ixf'); t0=time.monotonic()
                 while time.monotonic()-t0<30 and not os.path.exists(pl): time.sleep(0.1)
@@ -10612,7 +10740,7 @@ def codec_selftest(pattern=None,list_only=False):
             me=os.path.realpath(__file__)
             outp=os.path.join(ctx['dir'],'idx.out')
             with open(outp,'w') as fo:
-                ps=subprocess.Popen([me,'-C',ctx['rc'],'-c','Index','-n','ix'],stdout=fo,stderr=subprocess.STDOUT)
+                ps=subprocess.Popen([me,'-C',ctx['rc'],'-c','Index','-n','ix'],stdout=fo,stderr=subprocess.STDOUT,env=_rb_cli_env())
             try:
                 t0=time.monotonic()
                 while time.monotonic()-t0<60 and not any(l.startswith('diff ') for l in _ix_log(ctx)): time.sleep(0.1)
@@ -10642,7 +10770,7 @@ def codec_selftest(pattern=None,list_only=False):
             """1.0.145 (story 8 A3) : CLI Index — erreur (période inconnue) -> code 1 ; rien à faire -> 0 ; Index déjà en
             cours sur le dépôt -> 0."""
             ctx=_ix_ctx(); _ix_slow(ctx,None,0); me=os.path.realpath(__file__); b=_ix_bh(ctx,'cache')
-            run=lambda *a: subprocess.run([me,'-C',ctx['rc'],'-c','Index',*a],capture_output=True,text=True,timeout=300)
+            run=lambda *a: subprocess.run([me,'-C',ctx['rc'],'-c','Index',*a],capture_output=True,text=True,timeout=300,env=_rb_cli_env())
             r_err=run('-n','ixf','-b','inconnue')
             r_ok=run('-n','ixf')
             lp=b.db._index_running_lock_path('ixf'); _ix_fake_lock(lp)
@@ -10668,7 +10796,7 @@ def codec_selftest(pattern=None,list_only=False):
             b=_ix_bh(ctx,'cache'); nk='ixd'; me=os.path.realpath(__file__); outp=os.path.join(ctx['dir'],'s8.out')
             bkp=b.db._priority_holder_path(nk,os.getppid()); pl=b.db._index_paused_lock_path(nk)
             with open(outp,'w') as fo:
-                ps=subprocess.Popen([me,'-C',ctx['rc'],'-c','Index','-n',nk],stdout=fo,stderr=subprocess.STDOUT)
+                ps=subprocess.Popen([me,'-C',ctx['rc'],'-c','Index','-n',nk],stdout=fo,stderr=subprocess.STDOUT,env=_rb_cli_env())
             paused=wl_ok=still=False; rc=None; wl_err=''
             try:
                 t0=time.monotonic()
@@ -10759,18 +10887,15 @@ def codec_selftest(pattern=None,list_only=False):
             d=os.path.join(tmp,'scope'); src=os.path.join(d,'src'); os.makedirs(src)
             repo=os.path.join(d,'repo'); bb=os.path.join(d,'bb'); log=os.path.join(d,'borg.log'); fail=os.path.join(d,'fail')
             w=os.path.join(d,'borgw'); rc=os.path.join(d,'rc'); borg=shutil.which('borg')
-            env=dict(os.environ,BORG_PASSPHRASE='pw-sc',BORG_RELOCATED_REPO_ACCESS_IS_OK='yes',BORG_BASE_DIR=bb)
+            env=_rb_env(bb,BORG_PASSPHRASE='pw-sc')   # 1.0.158 : isolé des BORG_* de l'utilisateur
             r=subprocess.run([borg,'init','-e','repokey',repo],env=env,capture_output=True,text=True,timeout=120)
             if r.returncode!=0: print(f"  borg init : {r.stderr[-200:]}"); return False
             for i,m in enumerate(('a','b','a','b','a'),1):
                 with open(os.path.join(src,'f.txt'),'a') as f: f.write(f'{m}{i}\n')
                 subprocess.run([borg,'create','--timestamp',f'2026-09-0{i}T10:00:00',f'{repo}::{m}-2026-09-0{i}',src],
                                env=env,capture_output=True,timeout=120,check=True)
-            with open(w,'w') as f:
-                f.write(f"#!/bin/bash\necho \"$*\" >> {log}\n"
-                        f"if [ -f {fail} ] && [ \"$1\" = list ] && [[ \"$*\" != *glob-archives* ]]; then exit 2; fi\n"
-                        f"export BORG_BASE_DIR={bb}\nexec {borg} \"$@\"\n")
-            os.chmod(w,0o700)
+            _rb_wrapper(w,bb,f"echo \"$*\" >> {shlex.quote(log)}\n"
+                        f"if [ -f {shlex.quote(fail)} ] && [ \"$1\" = list ] && [[ \"$*\" != *glob-archives* ]]; then exit 2; fi\n")
             def cfg(glob_):
                 with open(rc,'w') as f:
                     f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n\n[sc]\nBORG_REPO={repo}\nBORG_PASSPHRASE=pw-sc\nSER_NAME=sc\n"
@@ -10848,10 +10973,10 @@ def codec_selftest(pattern=None,list_only=False):
             (error + message, relancée) ; écriture ratée (OSError, UnicodeEncodeError) -> [WARN] ; fichier illisible (None) ;
             0600 sous umask 0 ; file de messages tronquée ; _unlink_db (base, -wal, -shm) et _vacuum_db en échec."""
             ctx=_ix_ctx(); _ix_slow(ctx,None,0); me=os.path.realpath(__file__); b=_ix_bh(ctx,'cache'); nk='ixf'
-            http=dict(os.environ,BORGHELPER_VIA='http')
+            http=_rb_cli_env(BORGHELPER_VIA='http')
             def cli(*a,env=None,n=nk):
                 return subprocess.run([me,'-C',ctx['rc'],'-c','Index','-n',n,*a],capture_output=True,text=True,timeout=300,
-                                      env=env or dict(os.environ))
+                                      env=env or _rb_cli_env())
             last=lambda n=nk: b.db.read_index_last(n) or {}
             def tz(x):
                 from datetime import datetime as _dt
@@ -11012,12 +11137,12 @@ def codec_selftest(pattern=None,list_only=False):
         def _ix_cli_usage():
             """CLI : -t avec -S -> erreur d'usage (code non nul) ; -T inconnu -> erreur ; -n a,b -t 3 : budget par nick."""
             ctx=_ix_ctx(); me=os.path.realpath(__file__)
-            r1=subprocess.run([me,'-C',ctx['rc'],'-c','Index','-n','ix','-t','1m','-S'],capture_output=True,text=True,timeout=60)
-            r2=subprocess.run([me,'-C',ctx['rc'],'-c','Index','-n','ix','-T','tout'],capture_output=True,text=True,timeout=60)
+            r1=subprocess.run([me,'-C',ctx['rc'],'-c','Index','-n','ix','-t','1m','-S'],capture_output=True,text=True,timeout=60,env=_rb_cli_env())
+            r2=subprocess.run([me,'-C',ctx['rc'],'-c','Index','-n','ix','-T','tout'],capture_output=True,text=True,timeout=60,env=_rb_cli_env())
             _ix_slow(ctx,'diff',30)
             try:
                 t0=time.monotonic()
-                r3=subprocess.run([me,'-C',ctx['rc'],'-c','Index','-n','ixb,ixc','-T','diff','-t','3'],capture_output=True,text=True,timeout=120)
+                r3=subprocess.run([me,'-C',ctx['rc'],'-c','Index','-n','ixb,ixc','-T','diff','-t','3'],capture_output=True,text=True,timeout=120,env=_rb_cli_env())
                 dt=time.monotonic()-t0
             finally: _ix_slow(ctx,None,0)
             both=r3.stdout.count('construction partielle')==2
@@ -11108,74 +11233,71 @@ def codec_selftest(pattern=None,list_only=False):
             if not ok: print(f"  snapshot incrémental : tué {killed[1]} sentinelle(s) / {len(killed[0])} lignes, incr {incr}, "
                              f"{len(inc[0])} vs {len(full[0])} chemins")
             return ok
-        if shutil.which('borg') is None:
-            skip("Index par tranches et surveillance croisée sur un vrai dépôt borg","borg absent")
-        else:
-            check("tranche : ordre snapshot -> stats -> diffs récents d'abord ; budget respecté ; reprise sans refaire ; complete",_ix_order_budget_resume)
-            check("tranche : base finie par tranches == Index complet (Report -o, TreeHist, DiffBkp)",_ix_same_as_full)
-            check("tranche : borg diff tué à l'échéance sortant en code 1 sans sortie -> paire jamais marquée, refaite ensuite",_ix_killed_diff_rc1)
-            check("tranche : paires de diff vides d'une base ancienne revues une fois (exclus gardés ; -S, -T stats, période, tour tenu, verrou sans révision ; DB_NAME partagé)",_ix_zero_pairs_recheck)
-            check("tranche : borg diff non signalé en code 1 (avertissement) -> paire gardée avec ses entrées",_ix_rc1_warning_kept)
-            check("fantôme : paire vide d'un fantôme commencé avant 1.0.153 revue et refaite à la tranche suivante",_ix_zero_pairs_shadow)
-            check("tranche : nature + période ; DIFF_KEEP borne les paires visées (pairs_total)",_ix_period_nature_keep)
-            check("tranche : échéance pendant le snapshot -> borg tué, aucune ligne sans sentinelle",_ix_snap_deadline)
-            check("DIFF_KEEP (Index sans option) : paires purgées plus jamais re-diffées, paire gardée = la plus récente",_ix_diff_keep_plain)
-            check("Status : build partial/complete, ligne texte « Construction partielle »",_ix_status)
-            check("surveillance croisée : Index déjà en cours ou en attente -> le second sort sans rien écrire",_ix_two_indexes)
-            check("surveillance croisée : Bkp/Restore/Prune ou Report -> pause (verrou relâché ≤ 3 s), reprise seule, complet",_ix_pause_resume)
-            check("surveillance croisée : échéance pendant la pause -> sortie, sans index-pending",_ix_deadline_in_pause)
-            check("surveillance croisée : kill -9 en pause -> base intacte, l'Index suivant reprend et finit",_ix_kill_in_pause)
-            check("Prune attend l'Index comme Bkp et Restore",_ix_prune_waits)
-            check("DelBkp attend l'Index (priority.lock posé puis retiré)",_ix_delbkp_waits)
-            check("surveillance croisée : Index sans option arrêté pendant le snapshot ou les statistiques -> pause, reprise, fini",_ix_pause_other_phases)
-            check("surveillance croisée : Index -F repris après pause -> paires déjà recalculées non refaites",_ix_force_resume)
-            check("snapshot incrémental (ajouts) : identique à un complet ; borg list des ajouts arrêté -> rien d'écrit",_ix_incremental_snapshot)
-            check("CLI Index : -t avec -S refusé, -T invalide refusé, budget par nick avec plusieurs nicks",_ix_cli_usage)
-            check("surveillance croisée : vrai Bkp pendant un Index long -> Bkp sans attente, Index en pause puis reprise, nouvelle archive indexée",_ix_real_bkp_during_index)
-            check("CLI Index : code 1 sur erreur, 0 si rien à faire ou Index déjà en cours",_ix_cli_exit_codes)
-            check("Restore fini pendant un Bkp -> Index toujours en pause ; diffs arrêtés sans break-lock, borg suivant passe ; reprise",_ix_restore_during_bkp)
-            check("DelBkp -> archive retirée des bases et du rapport sans nouvel Index",_ix_delbkp_reconcile)
-            check("périmètre GLOB_ARCH : hors motif retirée sans toucher history.db ; disparue figée ; liste complète en échec -> reporté ; sans filtre -> un seul borg list",_sc_scope)
-            check("borg arrêté à l'échéance -> _MEI* orphelin retiré ; celui d'un processus vivant (mappé) ou récent gardé",_ix_mei_purge)
-            def _mei_run_purge():
-                """1.0.151 (story 14 A15) : fin de run, sur de faux répertoires seulement (_mei_dirs limité au préfixe du
-                contrôle, jamais un vrai _MEI) — autre propriétaire gardé ; orphelin du run retiré ; présent avant, borg
-                vivant (cwd dedans), récent sans attente et sous-répertoire actif gardés ; récent modifié pendant
-                l'attente gardé ; récent retiré après l'attente."""
-                import tempfile
-                base=os.path.join(tempfile.gettempdir(),f'_MEIs14-{os.getpid()}-'); real=_mei_dirs
-                own=lambda: {d for d in real() if d.startswith(base)}
-                def mk(s,age,sub_age=None):
-                    os.makedirs(os.path.join(base+s,'sub'),exist_ok=True)
-                    os.utime(os.path.join(base+s,'sub'),(time.time()-(age if sub_age is None else sub_age),)*2)
-                    os.utime(base+s,(time.time()-age,)*2); return base+s
-                p=None; r={}
-                try:
-                    with mock.patch.dict(globals(),{'_mei_dirs':own}):
-                        pre=mk('pre',60); before=own()
-                        orph=mk('orph',60); live=mk('live',60); fresh=mk('fresh',0); other=mk('other',60)
-                        deep=mk('deep',60,sub_age=0)
-                        p=subprocess.Popen(['sleep','60'],cwd=live)
-                        with mock.patch.object(os,'getuid',return_value=os.getuid()+1):
-                            r['autre']=(_purge_run_mei(own()-{other},min_age=10,wait=0),os.path.exists(other))
-                        r['n1']=_purge_run_mei(before|{other},min_age=10,wait=0)
-                        r['st1']={k:os.path.exists(v) for k,v in (('pre',pre),('orph',orph),('live',live),('fresh',fresh),('deep',deep))}
-                        def touch(): time.sleep(0.6); open(os.path.join(fresh,'sub','x'),'w').close()
-                        os.utime(os.path.join(fresh,'sub'))   # « récent » juste avant l'appel : /proc est lent à lire
-                        th=threading.Thread(target=touch); th.start()
-                        r['modifié']=(_purge_run_mei(own()-{fresh},min_age=3,wait=5),os.path.exists(fresh)); th.join()
-                        r['attente']=(_purge_run_mei(own()-{fresh},min_age=4,wait=5),os.path.exists(fresh))   # attente réelle (~1,5 s)
-                finally:
-                    if p: p.kill(); p.wait()
-                    for d in real():
-                        if d.startswith(base): shutil.rmtree(d,ignore_errors=True)
-                ok=(r.get('autre')==(0,True) and r.get('n1')==1
-                    and r.get('st1')=={'pre':True,'orph':False,'live':True,'fresh':True,'deep':True}
-                    and r.get('modifié')==(0,True) and r.get('attente')==(1,False))
-                if not ok: print(f"  _MEI fin de run : {r}")
-                return ok
-            check("fin de selftest : _MEI* orphelin du run retiré ; présent avant, borg vivant, autre propriétaire, récent ou modifié gardés ; récent retiré après attente",_mei_run_purge)
-            check("résultat du dernier Index par nick : ok, erreur via HTTP, déjà en cours (échec reporté), plusieurs nicks, échéance, refus, sys.exit, exception, écriture ratée ; erreurs [ERREUR] reprises sans [WARN] ; fichier illisible ; _unlink_db, _vacuum_db en échec",_ix_index_last)
+        _rbc("tranche : ordre snapshot -> stats -> diffs récents d'abord ; budget respecté ; reprise sans refaire ; complete",_ix_order_budget_resume)
+        _rbc("tranche : base finie par tranches == Index complet (Report -o, TreeHist, DiffBkp)",_ix_same_as_full)
+        _rbc("tranche : borg diff tué à l'échéance sortant en code 1 sans sortie -> paire jamais marquée, refaite ensuite",_ix_killed_diff_rc1)
+        _rbc("tranche : paires de diff vides d'une base ancienne revues une fois (exclus gardés ; -S, -T stats, période, tour tenu, verrou sans révision ; DB_NAME partagé)",_ix_zero_pairs_recheck)
+        _rbc("tranche : borg diff non signalé en code 1 (avertissement) -> paire gardée avec ses entrées",_ix_rc1_warning_kept)
+        _rbc("fantôme : paire vide d'un fantôme commencé avant 1.0.153 revue et refaite à la tranche suivante",_ix_zero_pairs_shadow)
+        _rbc("tranche : nature + période ; DIFF_KEEP borne les paires visées (pairs_total)",_ix_period_nature_keep)
+        _rbc("tranche : échéance pendant le snapshot -> borg tué, aucune ligne sans sentinelle",_ix_snap_deadline)
+        _rbc("DIFF_KEEP (Index sans option) : paires purgées plus jamais re-diffées, paire gardée = la plus récente",_ix_diff_keep_plain)
+        _rbc("Status : build partial/complete, ligne texte « Construction partielle »",_ix_status)
+        _rbc("surveillance croisée : Index déjà en cours ou en attente -> le second sort sans rien écrire",_ix_two_indexes)
+        _rbc("surveillance croisée : Bkp/Restore/Prune ou Report -> pause (verrou relâché ≤ 3 s), reprise seule, complet",_ix_pause_resume)
+        _rbc("surveillance croisée : échéance pendant la pause -> sortie, sans index-pending",_ix_deadline_in_pause)
+        _rbc("surveillance croisée : kill -9 en pause -> base intacte, l'Index suivant reprend et finit",_ix_kill_in_pause)
+        _rbc("Prune attend l'Index comme Bkp et Restore",_ix_prune_waits)
+        _rbc("DelBkp attend l'Index (priority.lock posé puis retiré)",_ix_delbkp_waits)
+        _rbc("surveillance croisée : Index sans option arrêté pendant le snapshot ou les statistiques -> pause, reprise, fini",_ix_pause_other_phases)
+        _rbc("surveillance croisée : Index -F repris après pause -> paires déjà recalculées non refaites",_ix_force_resume)
+        _rbc("snapshot incrémental (ajouts) : identique à un complet ; borg list des ajouts arrêté -> rien d'écrit",_ix_incremental_snapshot)
+        _rbc("CLI Index : -t avec -S refusé, -T invalide refusé, budget par nick avec plusieurs nicks",_ix_cli_usage)
+        _rbc("surveillance croisée : vrai Bkp pendant un Index long -> Bkp sans attente, Index en pause puis reprise, nouvelle archive indexée",_ix_real_bkp_during_index)
+        _rbc("CLI Index : code 1 sur erreur, 0 si rien à faire ou Index déjà en cours",_ix_cli_exit_codes)
+        _rbc("Restore fini pendant un Bkp -> Index toujours en pause ; diffs arrêtés sans break-lock, borg suivant passe ; reprise",_ix_restore_during_bkp)
+        _rbc("DelBkp -> archive retirée des bases et du rapport sans nouvel Index",_ix_delbkp_reconcile)
+        _rbc("périmètre GLOB_ARCH : hors motif retirée sans toucher history.db ; disparue figée ; liste complète en échec -> reporté ; sans filtre -> un seul borg list",_sc_scope)
+        _rbc("borg arrêté à l'échéance -> _MEI* orphelin retiré ; celui d'un processus vivant (mappé) ou récent gardé",_ix_mei_purge)
+        def _mei_run_purge():
+            """1.0.151 (story 14 A15) : fin de run, sur de faux répertoires seulement (_mei_dirs limité au préfixe du
+            contrôle, jamais un vrai _MEI) — autre propriétaire gardé ; orphelin du run retiré ; présent avant, borg
+            vivant (cwd dedans), récent sans attente et sous-répertoire actif gardés ; récent modifié pendant
+            l'attente gardé ; récent retiré après l'attente."""
+            import tempfile
+            base=os.path.join(tempfile.gettempdir(),f'_MEIs14-{os.getpid()}-'); real=_mei_dirs
+            own=lambda: {d for d in real() if d.startswith(base)}
+            def mk(s,age,sub_age=None):
+                os.makedirs(os.path.join(base+s,'sub'),exist_ok=True)
+                os.utime(os.path.join(base+s,'sub'),(time.time()-(age if sub_age is None else sub_age),)*2)
+                os.utime(base+s,(time.time()-age,)*2); return base+s
+            p=None; r={}
+            try:
+                with mock.patch.dict(globals(),{'_mei_dirs':own}):
+                    pre=mk('pre',60); before=own()
+                    orph=mk('orph',60); live=mk('live',60); fresh=mk('fresh',0); other=mk('other',60)
+                    deep=mk('deep',60,sub_age=0)
+                    p=subprocess.Popen(['sleep','60'],cwd=live)
+                    with mock.patch.object(os,'getuid',return_value=os.getuid()+1):
+                        r['autre']=(_purge_run_mei(own()-{other},min_age=10,wait=0),os.path.exists(other))
+                    r['n1']=_purge_run_mei(before|{other},min_age=10,wait=0)
+                    r['st1']={k:os.path.exists(v) for k,v in (('pre',pre),('orph',orph),('live',live),('fresh',fresh),('deep',deep))}
+                    def touch(): time.sleep(0.6); open(os.path.join(fresh,'sub','x'),'w').close()
+                    os.utime(os.path.join(fresh,'sub'))   # « récent » juste avant l'appel : /proc est lent à lire
+                    th=threading.Thread(target=touch); th.start()
+                    r['modifié']=(_purge_run_mei(own()-{fresh},min_age=3,wait=5),os.path.exists(fresh)); th.join()
+                    r['attente']=(_purge_run_mei(own()-{fresh},min_age=4,wait=5),os.path.exists(fresh))   # attente réelle (~1,5 s)
+            finally:
+                if p: p.kill(); p.wait()
+                for d in real():
+                    if d.startswith(base): shutil.rmtree(d,ignore_errors=True)
+            ok=(r.get('autre')==(0,True) and r.get('n1')==1
+                and r.get('st1')=={'pre':True,'orph':False,'live':True,'fresh':True,'deep':True}
+                and r.get('modifié')==(0,True) and r.get('attente')==(1,False))
+            if not ok: print(f"  _MEI fin de run : {r}")
+            return ok
+        check("fin de selftest : _MEI* orphelin du run retiré ; présent avant, borg vivant, autre propriétaire, récent ou modifié gardés ; récent retiré après attente",_mei_run_purge)
+        _rbc("résultat du dernier Index par nick : ok, erreur via HTTP, déjà en cours (échec reporté), plusieurs nicks, échéance, refus, sys.exit, exception, écriture ratée ; erreurs [ERREUR] reprises sans [WARN] ; fichier illisible ; _unlink_db, _vacuum_db en échec",_ix_index_last)
         # ── Reconstruction dans un fichier fantôme (1.0.143, story 6, AD-2/AD-5/AD-6) ──
         rb_ctx={}
         def _rb_ctx():
@@ -11185,7 +11307,7 @@ def codec_selftest(pattern=None,list_only=False):
             if rb_ctx: return rb_ctx
             d=os.path.join(tmp,'rebuild'); src=os.path.join(d,'src'); os.makedirs(src)
             repo=os.path.join(d,'repo'); bb=os.path.join(d,'borgbase')
-            env=dict(os.environ,BORG_PASSPHRASE='pw-rb',BORG_RELOCATED_REPO_ACCESS_IS_OK='yes',BORG_BASE_DIR=bb)
+            env=_rb_env(bb,BORG_PASSPHRASE='pw-rb')   # 1.0.158 : isolé des BORG_* de l'utilisateur
             r=subprocess.run([shutil.which('borg'),'init','-e','repokey',repo],env=env,capture_output=True,text=True,timeout=120)
             if r.returncode!=0: raise RuntimeError(f"borg init : {r.stderr[-300:]}")
             pre=f"{socket.getfqdn()}-r-"
@@ -11436,7 +11558,7 @@ def codec_selftest(pattern=None,list_only=False):
                 return i=='ok' and _rb_rows(live,_RB_LIVE)==l0
             # 1) pendant une unité
             _ix_slow(ctx,'diff',3); _ix_log(ctx,clear=True)
-            ps=subprocess.Popen([me,'-C',ctx['rc'],'-c','Index','-n','rb','--rebuild'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            ps=subprocess.Popen([me,'-C',ctx['rc'],'-c','Index','-n','rb','--rebuild'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,env=_rb_cli_env())
             t0=time.monotonic()
             while time.monotonic()-t0<60 and not any(l.startswith('diff ') for l in _ix_log(ctx)): time.sleep(0.05)
             time.sleep(0.5); ps.kill(); ps.wait(10); _ix_slow(ctx,None,0)
@@ -11453,7 +11575,7 @@ def codec_selftest(pattern=None,list_only=False):
                     f"b=B.BorgHelper(cfgfile={ctx['rc']!r})\nb.index('rb',budget=300)\n")
             outp=os.path.join(ctx['dir'],'kill.out')
             with open(outp,'w') as fo:
-                ps=subprocess.Popen([sys.executable,'-c',script],stdout=fo,stderr=subprocess.STDOUT,env=dict(os.environ,BORGHELPERC_SENTRY_FILE=os.devnull))
+                ps=subprocess.Popen([sys.executable,'-c',script],stdout=fo,stderr=subprocess.STDOUT,env=_rb_cli_env())
             t0=time.monotonic()
             while time.monotonic()-t0<120 and 'SWAP' not in open(outp).read(): time.sleep(0.05)
             time.sleep(1); ps.kill(); ps.wait(10)
@@ -11526,7 +11648,7 @@ def codec_selftest(pattern=None,list_only=False):
             """CLI : --rebuild refusé -> code 3 (DB_NAME partagé) ; --rebuild -F jette le fantôme existant ; -F -t refusé ;
             --rebuild hors Index refusé."""
             ctx=_rb_ctx(); _ix_slow(ctx,None,0); b=_rb_bh('cache'); me=os.path.realpath(__file__)
-            env=dict(os.environ,BORGHELPERC_SENTRY_FILE=os.devnull)
+            env=_rb_cli_env()
             def cli(*a):
                 p=subprocess.run([me,'-C',ctx['rc'],'-c',*a],capture_output=True,text=True,timeout=300,env=env)
                 return p.returncode,p.stdout+p.stderr
@@ -11589,24 +11711,21 @@ def codec_selftest(pattern=None,list_only=False):
             if not ok: print(f"  suppression pendant : paires avant {len(prev)}, appels history {calls}, restes {left}, "
                              f"paires {npairs}, nouvelle {hasnew}, {out[-400:]!r}")
             return ok
-        if shutil.which('borg') is None:
-            skip("reconstruction dans un fichier fantôme sur un vrai dépôt borg","borg absent")
-        else:
-            check("fantôme : --rebuild refait une base abîmée ; sorties == Index complet ; history.db intacte ; fichier disparu",_rb_full)
-            check("fantôme : par tranches, base servie inchangée et lue, Status rebuild, paires jamais refaites, bascule",_rb_tranches)
-            check("fantôme : Bkp pendant la reconstruction -> pause, nouvelle archive dans la base basculée",_rb_bkp_during)
-            check("fantôme : opération prioritaire pendant la bascule -> annulée, base intacte, fantôme gardé, puis bascule",_rb_swap_abort)
-            check("fantôme : nouvelle archive avant la bascule -> reportée, rattrapée à la tranche suivante",_rb_new_archive)
-            check("fantôme : base chiffrée (en-tête recopié) ; DbRekey entre deux tranches -> fantôme jeté puis refait",_rb_rekey)
-            check("fantôme : refus espace disque et DB_NAME partagé (code 3, rien créé) ; base absente -> construction directe",_rb_refusals)
-            check("fantôme : IDX_EXCLUDE — ligne exclue du fantôme purgée avant la bascule",_rb_idx_exclude)
-            check("fantôme : kill -9 pendant une unité, pendant la bascule, création interrompue -> base intacte, reprise",_rb_kill)
-            check("fantôme : Index sans option pendant une reconstruction -> fantôme inchangé",_rb_plain_ignores)
-            check("fantôme : borg list vide -> ni avancé ni basculé, base servie intacte",_rb_empty_list)
-            check("fantôme : _swap_db(keep_new=True) garde la nouvelle base sur changed/busy, la retire sur invalid",_rb_swap_keep_new)
-            check("fantôme : CLI --rebuild refusé -> code 3 ; --rebuild -F jette le fantôme ; -F -t et --rebuild hors Index refusés",_rb_cli)
-            check("fantôme : archive supprimée + nouvelle pendant la reconstruction (DIFF_KEEP) -> purgées, history.db jamais écrite par le fantôme",_rb_prune_during)
-            check("fantôme : tranche limitée par -T, -b ou -B seul -> avertissement (et bascule quand le reste est couvert) ; -b ALL -> aucun",_rb_restricted_warn)
+        _rbc("fantôme : --rebuild refait une base abîmée ; sorties == Index complet ; history.db intacte ; fichier disparu",_rb_full)
+        _rbc("fantôme : par tranches, base servie inchangée et lue, Status rebuild, paires jamais refaites, bascule",_rb_tranches)
+        _rbc("fantôme : Bkp pendant la reconstruction -> pause, nouvelle archive dans la base basculée",_rb_bkp_during)
+        _rbc("fantôme : opération prioritaire pendant la bascule -> annulée, base intacte, fantôme gardé, puis bascule",_rb_swap_abort)
+        _rbc("fantôme : nouvelle archive avant la bascule -> reportée, rattrapée à la tranche suivante",_rb_new_archive)
+        _rbc("fantôme : base chiffrée (en-tête recopié) ; DbRekey entre deux tranches -> fantôme jeté puis refait",_rb_rekey)
+        _rbc("fantôme : refus espace disque et DB_NAME partagé (code 3, rien créé) ; base absente -> construction directe",_rb_refusals)
+        _rbc("fantôme : IDX_EXCLUDE — ligne exclue du fantôme purgée avant la bascule",_rb_idx_exclude)
+        _rbc("fantôme : kill -9 pendant une unité, pendant la bascule, création interrompue -> base intacte, reprise",_rb_kill)
+        _rbc("fantôme : Index sans option pendant une reconstruction -> fantôme inchangé",_rb_plain_ignores)
+        _rbc("fantôme : borg list vide -> ni avancé ni basculé, base servie intacte",_rb_empty_list)
+        _rbc("fantôme : _swap_db(keep_new=True) garde la nouvelle base sur changed/busy, la retire sur invalid",_rb_swap_keep_new)
+        _rbc("fantôme : CLI --rebuild refusé -> code 3 ; --rebuild -F jette le fantôme ; -F -t et --rebuild hors Index refusés",_rb_cli)
+        _rbc("fantôme : archive supprimée + nouvelle pendant la reconstruction (DIFF_KEEP) -> purgées, history.db jamais écrite par le fantôme",_rb_prune_during)
+        _rbc("fantôme : tranche limitée par -T, -b ou -B seul -> avertissement (et bascule quand le reste est couvert) ; -b ALL -> aucun",_rb_restricted_warn)
         # ── Dépôts borg externes (1.0.142, story 5, AD-11/AD-12) ──
         check("glob_args : motif -> ['--glob-archives', m] / ['--glob-archives=m'] ; absent ou vide -> aucun argument",
               lambda: glob_args({'GLOB_ARCH':'h-t-*'})==['--glob-archives','h-t-*'] and glob_args({'GLOB_ARCH':'h-*'},'eq')==['--glob-archives=h-*']
@@ -11652,7 +11771,7 @@ def codec_selftest(pattern=None,list_only=False):
             l'externe ; EXTERNAL_OPS élargie ; Mount sans MOUNTPOINT ; Prune interne sans GLOB_ARCH refusé ; âge maximal."""
             d=os.path.join(tmp,'externe'); src=os.path.join(d,'src'); os.makedirs(src)
             repo=os.path.join(d,'repo'); bb=os.path.join(d,'bb'); log=os.path.join(d,'borg.log'); w=os.path.join(d,'borgw')
-            env=dict(os.environ,BORG_PASSPHRASE='pw-ex',BORG_RELOCATED_REPO_ACCESS_IS_OK='yes',BORG_BASE_DIR=bb)
+            env=_rb_env(bb,BORG_PASSPHRASE='pw-ex')   # 1.0.158 : isolé des BORG_* de l'utilisateur
             r=subprocess.run([shutil.which('borg'),'init','-e','repokey',repo],env=env,capture_output=True,text=True,timeout=120)
             if r.returncode!=0: print(f"  borg init : {r.stderr[-200:]}"); return False
             names=[]
@@ -11662,9 +11781,7 @@ def codec_selftest(pattern=None,list_only=False):
                 r=subprocess.run([shutil.which('borg'),'create','--timestamp',f"2026-09-1{i}T08:00:00",f'{repo}::{n}',src],
                                  env=env,capture_output=True,text=True,timeout=120)
                 if r.returncode!=0: print(f"  borg create : {r.stderr[-200:]}"); return False
-            with open(w,'w') as f:
-                f.write(f"#!/bin/bash\necho \"$*\" >> {log}\nexport BORG_BASE_DIR={bb}\nexec {shutil.which('borg')} \"$@\"\n")
-            os.chmod(w,0o700)
+            _rb_wrapper(w,bb,f"echo \"$*\" >> {shlex.quote(log)}\n")
             rc=os.path.join(d,'rc')
             base=f"BORG_REPO={repo}\nBORG_PASSPHRASE=pw-ex\nBORG_EXE={w}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\n"
             r=subprocess.run([shutil.which('borg'),'init','-e','repokey',repo+'-vide'],env=env,capture_output=True,text=True,timeout=120)
@@ -11683,9 +11800,7 @@ def codec_selftest(pattern=None,list_only=False):
             with open(rc_typo,'w') as f: f.write(head+f"[typo]\nEXTERNAL=ture\n{base}")
             for x in (rc_ext,rc_typo): os.chmod(x,0o600)
             me=os.path.realpath(__file__)
-            nodsn=os.path.join(d,'nodsn'); open(nodsn,'w').close()
-            cenv={k:v for k,v in os.environ.items() if k not in ('BORGHELPERC_SENTRY_DSN','BORGHELPERC_RUNTIME_PASSPHRASE')}
-            cenv['BORGHELPERC_SENTRY_FILE']=nodsn   # jamais d'envoi Sentry réel, jamais de passphrase d'exécution héritée
+            cenv=_rb_cli_env(bb)   # jamais d'envoi Sentry réel, jamais de passphrase d'exécution héritée
             def cli(*a,out_only=False,cfgf=None):
                 p=subprocess.run([me,'-C',cfgf or rc,'-c',*a],capture_output=True,text=True,timeout=300,env=cenv)
                 return p.returncode,(p.stdout if out_only else p.stdout+p.stderr)
@@ -11762,8 +11877,7 @@ def codec_selftest(pattern=None,list_only=False):
             if c!=0 or names[0] in lst: fails.append(f"DelBkp ext2 (permis) : {c} {lst} {o[-200:]!r}")
             for x in fails: print(f"  externe : {x}")
             return not fails
-        if shutil.which('borg') is None: skip("dépôt externe sur un vrai dépôt borg","borg absent")
-        else: check("dépôt externe réel : Index + lecture + Restore ; Bkp/Prune/DelBkp refusés (code 4, aucun borg) ; -n ALL ; EXTERNAL_OPS élargie ; Mount/Prune sans clés",_ex_real)
+        _rbc("dépôt externe réel : Index + lecture + Restore ; Bkp/Prune/DelBkp refusés (code 4, aucun borg) ; -n ALL ; EXTERNAL_OPS élargie ; Mount/Prune sans clés",_ex_real)
         def _repo_stats_real_borg():
             """1.0.136 (deferred-work point 9) : capture repo_stats de backup()/prune() sur un VRAI dépôt borg jetable —
             vérifie l'enchaînement réel (borg create/prune/compact/info --json, format de la réponse de CETTE
@@ -11772,37 +11886,33 @@ def codec_selftest(pattern=None,list_only=False):
             d=os.path.join(tmp,'realborg'); src=os.path.join(d,'src'); os.makedirs(src)
             with open(os.path.join(src,'f.txt'),'w') as f: f.write('contenu '*200)
             repo=os.path.join(d,'repo'); rc=os.path.join(d,'rc')
+            bb=os.path.join(d,'borgbase'); w=os.path.join(d,'borgw'); _rb_wrapper(w,bb)   # 1.0.158 : boex ne passe pas BORG_BASE_DIR
             with open(rc,'w') as f:
-                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n\n[rb]\nBORG_REPO={repo}\nBORG_PASSPHRASE=pw-rb\n"
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n\n[rb]\nBORG_REPO={repo}\nBORG_PASSPHRASE=pw-rb\nBORG_EXE={w}\n"
                         f"SER_NAME=rb\nSER_LOGIN=x\nGLOB_ARCH={socket.getfqdn()}-t-*\nMOUNTPOINT={os.path.join(d,'mnt')}\n"
                         f"BORG_ARCHNAME=t\nBORG_ROOTBKP={src}\nKEEP_DAILY=1\nDB_ENCRYPT=false\nEXCLUDE=--exclude-caches\n")
             os.chmod(rc,0o600)
-            env=dict(os.environ,BORG_PASSPHRASE='pw-rb',BORG_RELOCATED_REPO_ACCESS_IS_OK='yes',
-                     BORG_BASE_DIR=os.path.join(d,'borgbase'))
-            os.environ['BORG_BASE_DIR']=env['BORG_BASE_DIR']  # jamais le cache/les clés borg de l'utilisateur
-            try:
-                r=subprocess.run([shutil.which('borg'),'init','-e','repokey',repo],env=env,capture_output=True,text=True,timeout=120)
-                if r.returncode!=0: print(f"  borg init : {r.stderr[-300:]}"); return False
-                b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
-                meas={}
-                for step in (lambda: b.backup('rb',no_index=True),
-                             lambda: (time.sleep(1.1),b.backup('rb')),   # avec Index (refresh) : pas de point 'index' en double
-                             lambda: meas.update(b.db.get_archive_measures('rb')),
-                             lambda: b.prune('rb')):
-                    try: _q_run(step)
-                    except SystemExit: pass
-                exact=[(k,v) for k,v in meas.items() if k[1] is not None]
-                after=[k for k in b.db.get_archive_measures('rb') if k[1] is not None]
-                meas_ok=(len(exact)==2 and all(v['changed_during_backup']==0 and v['read_errors']==0 and v['deduplicated_size'] for _k,v in exact)
-                         and len(after)==1)
-                if not meas_ok: print(f"  archive_measure : avant Prune {meas} ; après {after}")
-                c=sqlite3.connect(b.db.get_history_db('rb'))   # repo_stats dans history.db (1.0.139)
-                rows=c.execute("SELECT op,unique_csize,total_size FROM repo_stats WHERE nick='rb' ORDER BY id").fetchall(); c.close()
-                ops=[o for o,_u,_t in rows]
-                if ops!=['bkp','bkp','prune']: print(f"  repo_stats : {rows}")
-                return ops==['bkp','bkp','prune'] and all(u and t for _o,u,t in rows) and meas_ok
-            finally:
-                os.environ.pop('BORG_BASE_DIR',None)
+            env=_rb_env(bb,BORG_PASSPHRASE='pw-rb')
+            r=subprocess.run([shutil.which('borg'),'init','-e','repokey',repo],env=env,capture_output=True,text=True,timeout=120)
+            if r.returncode!=0: print(f"  borg init : {r.stderr[-300:]}"); return False
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            meas={}
+            for step in (lambda: b.backup('rb',no_index=True),
+                         lambda: (time.sleep(1.1),b.backup('rb')),   # avec Index (refresh) : pas de point 'index' en double
+                         lambda: meas.update(b.db.get_archive_measures('rb')),
+                         lambda: b.prune('rb')):
+                try: _q_run(step)
+                except SystemExit: pass
+            exact=[(k,v) for k,v in meas.items() if k[1] is not None]
+            after=[k for k in b.db.get_archive_measures('rb') if k[1] is not None]
+            meas_ok=(len(exact)==2 and all(v['changed_during_backup']==0 and v['read_errors']==0 and v['deduplicated_size'] for _k,v in exact)
+                     and len(after)==1)
+            if not meas_ok: print(f"  archive_measure : avant Prune {meas} ; après {after}")
+            c=sqlite3.connect(b.db.get_history_db('rb'))   # repo_stats dans history.db (1.0.139)
+            rows=c.execute("SELECT op,unique_csize,total_size FROM repo_stats WHERE nick='rb' ORDER BY id").fetchall(); c.close()
+            ops=[o for o,_u,_t in rows]
+            if ops!=['bkp','bkp','prune']: print(f"  repo_stats : {rows}")
+            return ops==['bkp','bkp','prune'] and all(u and t for _o,u,t in rows) and meas_ok
         def _reconcile_real_borg():
             """1.0.140 (story 3) : vrai dépôt, 3 Bkp indexés, `borg delete` de l'archive du milieu puis de la plus
             ancienne, Index après chacun. Paires sans archive absente ni doublon, FileHist ne cite plus l'archive
@@ -11811,66 +11921,59 @@ def codec_selftest(pattern=None,list_only=False):
             fp=os.path.join(src,'f.txt')
             with open(fp,'w') as f: f.write('contenu '*200)
             repo=os.path.join(d,'repo'); rc=os.path.join(d,'rc')
+            bb=os.path.join(d,'borgbase'); w=os.path.join(d,'borgw'); _rb_wrapper(w,bb)   # 1.0.158 : boex ne passe pas BORG_BASE_DIR
             with open(rc,'w') as f:
-                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n\n[rr]\nBORG_REPO={repo}\nBORG_PASSPHRASE=pw-rr\n"
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n\n[rr]\nBORG_REPO={repo}\nBORG_PASSPHRASE=pw-rr\nBORG_EXE={w}\n"
                         f"SER_NAME=rr\nSER_LOGIN=x\nGLOB_ARCH={socket.getfqdn()}-t-*\nMOUNTPOINT={os.path.join(d,'mnt')}\n"
                         f"BORG_ARCHNAME=t\nBORG_ROOTBKP={src}\nDB_ENCRYPT=false\nEXCLUDE=--exclude-caches\n")
             os.chmod(rc,0o600)
-            env=dict(os.environ,BORG_PASSPHRASE='pw-rr',BORG_RELOCATED_REPO_ACCESS_IS_OK='yes',
-                     BORG_BASE_DIR=os.path.join(d,'borgbase'))
-            os.environ['BORG_BASE_DIR']=env['BORG_BASE_DIR']
-            try:
-                r=subprocess.run([shutil.which('borg'),'init','-e','repokey',repo],env=env,capture_output=True,text=True,timeout=120)
-                if r.returncode!=0: print(f"  borg init : {r.stderr[-300:]}"); return False
-                b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
-                for i in range(3):
-                    if i:
-                        time.sleep(1.1)
-                        with open(fp,'a') as f: f.write(f'modif {i}\n')
-                    _q_run(b.backup,'rr')
-                dp=b.db.get_diff_db('rr')
-                def pairs():
-                    c=sqlite3.connect(dp); p=sorted(c.execute("SELECT archive_old,archive_new FROM diff_indexed_pairs").fetchall()); c.close(); return p
-                ah0=_rz_ah(b,'rr'); names=sorted(ah0,key=lambda a:ah0[a]['archive_date'])
-                if len(names)!=3 or pairs()!=[(names[0],names[1]),(names[1],names[2])]:
-                    print(f"  préparation : archives {names}, paires {pairs()}"); return False
-                def delete(a):
-                    r=subprocess.run([shutil.which('borg'),'delete',f'{repo}::{a}'],env=env,capture_output=True,text=True,timeout=120)
-                    if r.returncode!=0: print(f"  borg delete : {r.stderr[-300:]}")
-                    _q_run(b.index,'rr')
-                strip=lambda row:{k:v for k,v in row.items() if k!='pruned'}
-                delete(names[1])
-                ah1=_rz_ah(b,'rr')
-                fh=json.loads(_q_run(b.filehist,'rr',fp,archive_from='ALL',as_json=True)).get('rr',[])
-                hops=[(x['archive_before'],x['archive_after']) for x in fh if x['archive_before']]
-                ok1=(pairs()==[(names[0],names[2])] and _rz_cites(dp,'rr',names[1])==0 and len(hops)==len(set(hops))
-                     and names[1] not in json.dumps(fh) and len(ah1)==3 and ah1[names[1]]['pruned'] is True
-                     and strip(ah1[names[1]])==strip(ah0[names[1]]) and ah1[names[2]]['files_modified'])
-                if not ok1: print(f"  milieu : paires {pairs()} filehist {fh} archivehistory {ah1}")
-                delete(names[0])
-                ah2=_rz_ah(b,'rr')
-                ok2=(pairs()==[] and _rz_cites(dp,'rr',names[0])==0 and len(ah2)==3
-                     and [ah2[a]['pruned'] for a in names]==[True,True,False]
-                     and strip(ah2[names[0]])==strip(ah0[names[0]]) and strip(ah2[names[2]])==strip(ah1[names[2]]))
-                if not ok2: print(f"  plus ancienne : paires {pairs()} archivehistory {ah2}")
-                return ok1 and ok2
-            finally:
-                os.environ.pop('BORG_BASE_DIR',None)
-        if shutil.which('borg') is None: skip("rapprochement sur un vrai dépôt borg","borg absent")
-        else: check("rapprochement réel : borg delete du milieu puis de la plus ancienne + Index -> paires/FileHist sans archive absente, graphiques gardés (pruned)",_reconcile_real_borg)
-        if shutil.which('borg') is None: skip("repo_stats capturé par Bkp/Prune sur un vrai dépôt borg","borg absent")
-        else: check("repo_stats + mesures par archive : Bkp (avec et sans Index) puis Prune réels -> points bkp/bkp/prune, mesures écrites puis purgées",_repo_stats_real_borg)
+            env=_rb_env(bb,BORG_PASSPHRASE='pw-rr')
+            r=subprocess.run([shutil.which('borg'),'init','-e','repokey',repo],env=env,capture_output=True,text=True,timeout=120)
+            if r.returncode!=0: print(f"  borg init : {r.stderr[-300:]}"); return False
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            for i in range(3):
+                if i:
+                    time.sleep(1.1)
+                    with open(fp,'a') as f: f.write(f'modif {i}\n')
+                _q_run(b.backup,'rr')
+            dp=b.db.get_diff_db('rr')
+            def pairs():
+                c=sqlite3.connect(dp); p=sorted(c.execute("SELECT archive_old,archive_new FROM diff_indexed_pairs").fetchall()); c.close(); return p
+            ah0=_rz_ah(b,'rr'); names=sorted(ah0,key=lambda a:ah0[a]['archive_date'])
+            if len(names)!=3 or pairs()!=[(names[0],names[1]),(names[1],names[2])]:
+                print(f"  préparation : archives {names}, paires {pairs()}"); return False
+            def delete(a):
+                r=subprocess.run([shutil.which('borg'),'delete',f'{repo}::{a}'],env=env,capture_output=True,text=True,timeout=120)
+                if r.returncode!=0: print(f"  borg delete : {r.stderr[-300:]}")
+                _q_run(b.index,'rr')
+            strip=lambda row:{k:v for k,v in row.items() if k!='pruned'}
+            delete(names[1])
+            ah1=_rz_ah(b,'rr')
+            fh=json.loads(_q_run(b.filehist,'rr',fp,archive_from='ALL',as_json=True)).get('rr',[])
+            hops=[(x['archive_before'],x['archive_after']) for x in fh if x['archive_before']]
+            ok1=(pairs()==[(names[0],names[2])] and _rz_cites(dp,'rr',names[1])==0 and len(hops)==len(set(hops))
+                 and names[1] not in json.dumps(fh) and len(ah1)==3 and ah1[names[1]]['pruned'] is True
+                 and strip(ah1[names[1]])==strip(ah0[names[1]]) and ah1[names[2]]['files_modified'])
+            if not ok1: print(f"  milieu : paires {pairs()} filehist {fh} archivehistory {ah1}")
+            delete(names[0])
+            ah2=_rz_ah(b,'rr')
+            ok2=(pairs()==[] and _rz_cites(dp,'rr',names[0])==0 and len(ah2)==3
+                 and [ah2[a]['pruned'] for a in names]==[True,True,False]
+                 and strip(ah2[names[0]])==strip(ah0[names[0]]) and strip(ah2[names[2]])==strip(ah1[names[2]]))
+            if not ok2: print(f"  plus ancienne : paires {pairs()} archivehistory {ah2}")
+            return ok1 and ok2
+        _rbc("rapprochement réel : borg delete du milieu puis de la plus ancienne + Index -> paires/FileHist sans archive absente, graphiques gardés (pruned)",_reconcile_real_borg)
+        _rbc("repo_stats + mesures par archive : Bkp (avec et sans Index) puis Prune réels -> points bkp/bkp/prune, mesures écrites puis purgées",_repo_stats_real_borg)
         def _inchanges_real_borg():
             """1.0.157 (story 20, A25) : garde sur un VRAI dépôt borg jetable (jamais une copie) des faits de borg sur lesquels
             repose « Inchangés » : nfiles (borg create --json) = entrées '-' de borg list (ni répertoires, ni lien, ni fifo) ;
             un chmod seul -> 'modified' dans borg diff ; « Inchangés » de DiffTop = IdxTop = fichiers '-' de la nouvelle
             archive sans added/modified dans borg diff ; exclus IDX_EXCLUDE comptés (5 : modifié, ajouté, supprimé,
             répertoire ajouté et son fichier). Sans liens physiques (limite documentée). Isolé : variables BORG_* de
-            l'environnement retirées (BORG_CACHE_DIR… primeraient sur BORG_BASE_DIR), TMPDIR du selftest."""
+            l'environnement retirées (BORG_CACHE_DIR… primeraient sur BORG_BASE_DIR), TMPDIR du selftest — aides _rb_* (1.0.158)."""
             d=os.path.join(tmp,'inchanges-reel'); src=os.path.join(d,'src'); bb=os.path.join(d,'bb'); repo=os.path.join(d,'repo')
             for sub in ('a','a/b','logs'): os.makedirs(os.path.join(src,sub),exist_ok=True)
-            base={k:v for k,v in os.environ.items() if not k.startswith('BORG_')}
-            env=dict(base,BORG_PASSPHRASE='pw-in',BORG_RELOCATED_REPO_ACCESS_IS_OK='yes',BORG_BASE_DIR=bb,TMPDIR=tmp)
+            env=_rb_env(bb,BORG_PASSPHRASE='pw-in')
             borg=shutil.which('borg'); errs=[]
             def bg(*a,ok_codes=(0,)):
                 r=subprocess.run([borg,*a],env=env,capture_output=True,text=True,timeout=120)
@@ -11906,19 +12009,14 @@ def codec_selftest(pattern=None,list_only=False):
             attendu=sum(1 for p in reg if chg.get(p) not in ('added','modified'))
             chmod_mod=chg.get(os.path.join(src,'a/f2').lstrip('/'))=='modified'
             w=os.path.join(d,'borgw')
-            with open(w,'w') as f:
-                f.write(f"#!/bin/bash\nunset BORG_CACHE_DIR BORG_CONFIG_DIR BORG_SECURITY_DIR BORG_KEYS_DIR\n"
-                        f"export BORG_BASE_DIR='{bb}'\nexec '{borg}' \"$@\"\n")
-            os.chmod(w,0o700)
+            _rb_wrapper(w,bb)
             rc=os.path.join(d,'rc')
             with open(rc,'w') as f:
                 f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n\n[inr]\nBORG_REPO={repo}\nBORG_PASSPHRASE=pw-in\nSER_NAME=inr\n"
                         f"SER_LOGIN=x\nGLOB_ARCH=t-*\nBORG_ARCHNAME=t\nBORG_ROOTBKP={src}\nEXCLUDE=--exclude-caches\nDB_ENCRYPT=false\n"
                         f"BORG_EXE={w}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\nIDX_EXCLUDE=*/logs/*\n")
             os.chmod(rc,0o600)
-            nodsn=os.path.join(d,'nodsn'); open(nodsn,'w').close()
-            cenv={k:v for k,v in base.items() if k not in ('BORGHELPERC_SENTRY_DSN','BORGHELPERC_RUNTIME_PASSPHRASE')}
-            cenv.update(BORGHELPERC_SENTRY_FILE=nodsn,BORG_BASE_DIR=bb,TMPDIR=tmp)   # jamais de Sentry réel ni de passphrase héritée
+            cenv=_rb_cli_env(bb)   # jamais de Sentry réel ni de passphrase héritée
             me=os.path.realpath(__file__)
             def cli(*a):
                 p=subprocess.run([me,'-C',rc,'-c',*a],capture_output=True,text=True,timeout=300,env=cenv)
@@ -11936,8 +12034,7 @@ def codec_selftest(pattern=None,list_only=False):
                       f"'-' {len(reg)} chmod->modified {chmod_mod} attendu {attendu} DiffTop/IdxTop {got} Exclus=5 {ex} "
                       f"avertissements borg {errs} ; Index {oi[-150:]!r} ; DiffTop {dt[-300:]!r} ; IdxTop {it[-300:]!r}")
             return ok
-        if shutil.which('borg') is None: skip("Inchangés sur vrai borg : nfiles = fichiers ordinaires, chmod seul = modified, DiffTop = IdxTop = décompte borg list et borg diff","borg absent")
-        else: check("Inchangés sur vrai borg : nfiles = fichiers ordinaires, chmod seul = modified, DiffTop = IdxTop = décompte borg list et borg diff",_inchanges_real_borg)
+        _rbc("Inchangés sur vrai borg : nfiles = fichiers ordinaires, chmod seul = modified, DiffTop = IdxTop = décompte borg list et borg diff",_inchanges_real_borg)
         check("_diff_entry_type (1.0.126) : type tiré de change_type (borg diff 1.2), tous les types de suppression reconnus",
               lambda: [_diff_entry_type(c,sb) for c,sb in (('added',None),('modified',1),('removed',3),('removed',0),('removed',None),
                        ('removed directory',None),('added link',None),('changed link',None),('removed fifo',None),
@@ -11963,7 +12060,7 @@ def codec_selftest(pattern=None,list_only=False):
         print(f"CodecSelfTest : aucun contrôle ne correspond au filtre « {pattern.pattern} »"); return None
     if list_only:
         print(f"{len(results)} contrôle(s)"); return 0
-    print(f"CodecSelfTest : {len(results)-fails}/{len(results)} OK"+(f", {fails} FAIL" if fails else "")
+    print(f"CodecSelfTest : {len(results)-fails}/{len(results)} OK"+(f", {fails} FAIL" if fails else "")+(f", {skipped[0]} SKIP" if skipped[0] else "")
           +(f" — run PARTIEL (filtre « {pattern.pattern} », {left_out[0]} contrôle(s) écarté(s)) : le run complet reste "
             "exigé avant commit" if pattern is not None else "")
           +(" — un échec peut venir d'un contrôle écarté dont celui-ci dépend : relancer le run complet"

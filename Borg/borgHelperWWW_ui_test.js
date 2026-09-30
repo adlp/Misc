@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-// Test du routeur de l'UI (spec-ui-deep-links, UI >= 1.14.0) — sans dépendance, sans DOM.
+// Test de l'UI (spec-ui-deep-links, UI >= 1.14.0) — sans dépendance ; DOM et API simulés pour les parties interactives.
 // Extrait les fonctions pures routePath/parseRoute/pageTitle de borgHelperWWW_ui.html et vérifie la
 // matrice d'adresses (analyse, adresses invalides, aller-retour d'encodage état -> adresse -> état) et
-// le titre de l'onglet de chaque page (UI >= 1.15.0).
+// le titre de l'onglet de chaque page (UI >= 1.15.0). Puis, DOM et API simulés : badges, fin de Bkp, actions, carte,
+// et graphiques de la page Historique (tous construits, séries, archives supprimées, sans lignes, blocs HTML).
 //
 //   node borgHelperWWW_ui_test.js [chemin/vers/borgHelperWWW_ui.html]
 //
@@ -248,7 +249,8 @@ async ${grab('runBackupNow')}
      [rbEnv.fetched,rbUi.pendingBkp.ok&&rbUi.pendingBkp.ok.prev,'ko' in rbUi.pendingBkp,btn.disabled,btn.textContent,rbEnv.loads],
      [2,'frais',false,false,'▶',2]);
   // Actions, historique et carte (UI 1.19.0) : vraies fonctions de la page, DOM minimal simulé.
-  const grabConst=name=>{ const i=src.indexOf('const '+name+'=['); let d=0,j=src.indexOf('[',i);
+  const grabConst=name=>{ const i=src.indexOf('const '+name+'=[');
+    if(i<0) throw new Error('const '+name+'=[ introuvable dans '+htmlPath); let d=0,j=src.indexOf('[',i);
     for(;;j++){ if(src[j]==='[') d++; else if(src[j]===']' && --d===0) break; } return src.slice(i,j+1)+';'; };
   const dom={els:{},byId(id){ return this.els[id]||(this.els[id]={innerHTML:'',textContent:'',classList:{toggle(){}}}); }};
   let reportStdout='', histLoads=[];
@@ -293,6 +295,86 @@ async ${grab('reloadMachineCard')}
   eq('fin de Bkp : carte remplacée avec le nouveau rapport, historique relu, sans ▶ Backup',
      [!!replaced && replaced.html.includes('2026-09-28 10:00'), histLoads.join(), !!replaced && replaced.html.includes('bkp-now-btn'),
       !!replaced && replaced.html.includes('🔗 externe')],[true,'ext',false,true]);
+  // Graphiques de la page Historique (borgHelper 1.0.158, story 21) : vraies fonctions de la page ; faux DOM limité aux
+  // id="…" du HTML (getElementById rend null pour un id absent, comme un navigateur) ; faux Chart qui garde canvas et
+  // configuration ; apiCall simulé (/repohistory, /archivehistory).
+  const markup=src.replace(/<script\b[\s\S]*?<\/script>/g,'');   // balises seulement, jamais les chaînes du script
+  const htmlIds=new Set([...markup.matchAll(/\sid="([^"]+)"/g)].map(m=>m[1]));
+  const grabLine=name=>{ const m=src.match(new RegExp('^(?:let|const) '+name+'=.*$','m'));
+    if(!m) throw new Error(name+' introuvable dans '+htmlPath); return m[0]; };
+  const chartIds=['chartRepoSize','chartPruneGain','chartArchiveSize','chartFileChanges','chartDuration'];
+  const cdom={els:{},byId(id){
+    if(!htmlIds.has(id)) return null;
+    return this.els[id]||(this.els[id]={id,hidden:false,className:'',_h:'',
+      get innerHTML(){ return this._h; }, set innerHTML(h){ this._h=String(h); },
+      get textContent(){ return this._h; }, set textContent(t){ this._h=String(t); },
+      querySelector(sel){ return sel==='.spinner' && this._h.includes('class="spinner"') ? {} : null; }});
+  }};
+  const built=[], apiCalls=[]; let resp={};
+  const charts=new Function('cdom','hooks',`
+    const document={getElementById:id=>cdom.byId(id)};
+    class Chart{ constructor(canvas,cfg){ hooks.built.push({id:canvas.id,cfg}); } destroy(){} }
+    const apiCall=async(m,p,q)=>{ hooks.calls.push([m,p,q&&q.nick]); return hooks.resp()[p]; };
+    ${grabLine('SPINNER')}
+    ${grabLine('chartRepoSizeInstance')}
+    ${grabConst('ARCHIVE_EXTRA_CHARTS')}
+    ${grabLine('chartExtraInstances')}
+    ${grabLine('chartsLoadSeq')}
+${grab('_fmtBytes')}
+${grab('_fmtDuration')}
+${grab('_showChartMsg')}
+${grab('_hideChartMsg')}
+async ${grab('loadCharts')}
+${grab('_safeRender')}
+${grab('_parseHistoryResponse')}
+${grab('_renderRepoSizeAndPruneGainCharts')}
+${grab('_fadeFor')}
+${grab('_prunedTitle')}
+${grab('_renderArchiveSizeChart')}
+${grab('_renderArchiveExtraChart')}
+    return {loadCharts,_safeRender,extra:ARCHIVE_EXTRA_CHARTS,SPINNER};`)(cdom,{built,calls:apiCalls,resp:()=>resp});
+  const ok=rows=>({exitcode:0,httpStatus:200,stdout:JSON.stringify({rows}),stderr:''});
+  const allIds=['chartRepoSize','chartPruneGain','chartArchiveSize',...charts.extra];
+  eq('graphiques : chaque id a son bloc HTML (canvas et message)',
+     allIds.filter(id=>!new RegExp('<canvas id="'+id+'"').test(markup)||!htmlIds.has(id+'Msg')),[]);
+  const spinners=()=>allIds.filter(id=>{ const m=cdom.byId(id+'Msg'); return !m||(!m.hidden&&m.querySelector('.spinner')); });
+  const tryLoad=async()=>{ try{ await charts.loadCharts('n'); return null; } catch(e){ return String(e); } };
+  resp={'/repohistory':ok([{updated_at:'t1',op:'bkp',unique_csize:100,total_size:300,total_csize:200},
+                           {updated_at:'t2',op:'prune',unique_csize:60,total_size:250,total_csize:150}]),
+        '/archivehistory':ok([{archive_date:'d1',original_size:1000,compressed_size:600,deduplicated_size:50,files_added:1,
+                               files_modified:2,files_removed:0,changed_during_backup:0,read_errors:0,duration:12,pruned:true},
+                              {archive_date:'d2',original_size:1100,compressed_size:650,deduplicated_size:40,files_added:0,
+                               files_modified:3,files_removed:1,changed_during_backup:0,read_errors:0,duration:15,pruned:false}])};
+  const err1=await tryLoad();
+  eq('graphiques avec lignes : sans exception, les 5 construits et eux seuls',[err1,built.map(b=>b.id).sort()],[null,[...chartIds].sort()]);
+  eq('graphiques : /repohistory et /archivehistory demandés en GET pour le nick affiché',apiCalls.slice().sort(),
+     [['GET','/archivehistory','n'],['GET','/repohistory','n']]);
+  eq('graphiques avec lignes : aucun indicateur de chargement laissé',spinners(),[]);
+  const cfgOf=id=>(built.find(b=>b.id===id)||{cfg:{data:{datasets:[]},options:{plugins:{tooltip:{callbacks:{}}}}}}).cfg;
+  const as=cfgOf('chartArchiveSize');
+  eq('courbe des tailles : original_size, compressed_size, deduplicated_size, chacune avec sa donnée',
+     as.data.datasets.map(d=>[d.label,d.data]),
+     [['original_size',[1000,1100]],['compressed_size',[600,650]],['deduplicated_size',[50,40]]]);
+  const faded=cfg=>cfg.data.datasets.length>0 && cfg.data.datasets.every(d=>{ const c=d.pointBackgroundColor||d.backgroundColor;
+    return Array.isArray(c) && c[0].endsWith('4D') && !c[1].endsWith('4D'); });
+  const titled=cfg=>{ const t=cfg.options.plugins.tooltip.callbacks.title;
+    return !!t && t([{label:'d1',dataIndex:0}])==='d1 (supprimée)' && t([{label:'d2',dataIndex:1}])==='d2'; };
+  eq('archive supprimée (pruned) : atténuée (…4D) et « (supprimée) » dans l\'infobulle, graphiques par archive',
+     ['chartArchiveSize',...charts.extra].map(id=>[id,faded(cfgOf(id)),titled(cfgOf(id))]),
+     ['chartArchiveSize',...charts.extra].map(id=>[id,true,true]));
+  built.length=0;
+  resp={'/repohistory':ok([]),'/archivehistory':ok([])};
+  const err2=await tryLoad();
+  const msgs=allIds.map(id=>{ const m=cdom.byId(id+'Msg'), c=cdom.byId(id);
+    return !!m && !m.hidden && m.textContent.length>0 && m.textContent!=='Aucune donnée.' && !m.querySelector('.spinner') && !!c && c.hidden; });
+  const texts=allIds.map(id=>(cdom.byId(id+'Msg')||{}).textContent);
+  eq('graphiques sans lignes (rows: []) : sans exception, rien construit, le message propre à chaque graphique',
+     [err2,built.length,msgs,new Set(texts).size],[null,0,allIds.map(()=>true),allIds.length]);
+  // Filet de _safeRender : un rendu qui ne dessine rien ni n'affiche de message -> « Aucune donnée. », jamais un spinner
+  const dm=cdom.byId('chartDurationMsg'); dm.innerHTML=charts.SPINNER; dm.hidden=false;
+  eq('faux DOM : l\'indicateur de chargement de la page est bien reconnu',!!dm.querySelector('.spinner'),true);
+  charts._safeRender(()=>{},['chartDuration']);
+  eq('filet : rendu muet -> « Aucune donnée. » à la place du spinner',[dm.textContent,!!dm.querySelector('.spinner')],['Aucune donnée.',false]);
   console.log(fail?fail+' FAIL':'TOUT OK');
   process.exit(fail?1:0);
 })();

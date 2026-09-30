@@ -1201,8 +1201,14 @@ duplication), les trois refus (`DB_ENCRYPT=false`, verrou d'opération en cours,
 `DbRekey` (DEK inchangée, enveloppe renouvelée) et son refus sur une base `plain`, et l'avertissement AD-6 émis une
 fois par base.
 Vérifie enfin (1.0.136), si `borg` est installé, la capture de la taille du dépôt par un Bkp puis un Prune **réels**
-sur un dépôt borg jetable (`BORG_BASE_DIR` temporaire : ni le cache ni les clés borg de l'utilisateur ne sont touchés) ;
-sauté (`SKIP`) sans borg.
+sur un dépôt borg jetable. Sans borg, chaque contrôle sur un vrai borg est sauté sous son propre nom (`SKIP`, compté au
+bilan ; `-f` le montre, `-l` le liste).
+Contrôles sur un vrai borg isolés (1.0.158) : ni le cache, ni la sécurité, ni les clés, ni la configuration borg de
+l'utilisateur ne sont touchés, même avec `BORG_CACHE_DIR`, `BORG_SECURITY_DIR`, `BORG_CONFIG_DIR`, `BORG_KEYS_DIR` ou
+`BORG_BASE_DIR` exportés (variables `BORG_*` retirées, dossier borg propre à chaque famille de contrôles) ; chaque
+contrôle échoue s'il laisse une entrée dans le dossier borg de l'utilisateur. Les runs d'avant 1.0.158 ont pu laisser
+des entrées dans `~/.config/borg/security` et `~/.cache/borg` (fichier `location` sous `/tmp/borghelper-selftest-*`) :
+sans valeur, supprimables.
 Travaille uniquement sur des bases temporaires : aucune vraie base ni aucun vrai rc n'est lu. Une ligne `OK`/`FAIL` par
 contrôle ; code de sortie non nul au moindre échec.
 
@@ -1809,8 +1815,10 @@ montrer exactement ce dont on parle.
   distinguent les pages.
 - Non reflétés dans l'adresse : la recherche de l'explorateur et l'action ouverte dans la page détail.
 - L'interface doit être publiée à la racine du site (pas sous un sous-chemin `https://host/borg/…`).
-- Test du routeur (Node, sans dépendance) : `node borgHelperWWW_ui_test.js` — à lancer après toute
-  modification de `routePath`/`parseRoute` dans `borgHelperWWW_ui.html`. Inutile au déploiement.
+- Test de l'UI (Node, sans dépendance) : `node borgHelperWWW_ui_test.js` — routeur, badges, fin de Bkp, actions et
+  graphiques de la page Historique (tous construits, séries de la courbe des tailles, archives supprimées atténuées,
+  message sans données, bloc HTML de chaque graphique). À lancer après toute modification de ces parties de
+  `borgHelperWWW_ui.html`. Inutile au déploiement.
 
 Cette page HTML elle-même n'est pas protégée par `X-API-Key` (elle ne contient aucun secret — la clé et
 les passphrases ne sont saisies et envoyées que depuis le navigateur, via `fetch()`) ; c'est l'API qui
