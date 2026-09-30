@@ -10,6 +10,9 @@
 
 ## gitconfig
 
+### 1.6.0 — 2026-10-01
+- Ajout de l'alias `tar` : `git tar <archive.tar|.tgz> <depot> <repertoire> <message>` clone `<depot>`, remplace entierement le contenu de `<repertoire>` par celui de l'archive (ajouts, modifs et suppressions), commit avec `<message>` et pousse. Equivalent inline de `gitar`, integre a `.gitconfig`. Chemin d'archive relatif au repertoire d'invocation (via `$GIT_PREFIX`, comme `addco`/`addcom`). Rien commite si l'archive ne change rien au sous-repertoire.
+
 ### 1.5.0 — 2026-09-30
 - Ajout de l'alias `mirror` : equivalent simplifie de `git2git_mirror` (clone --mirror + push --mirror) integre directement dans `.gitconfig`, un seul fichier pour tout gerer git. Pas de `--subdir` (contrairement au script) : uniquement `[-n|--dry-run] <src> <dest>`. Le script `git2git_mirror` est conserve en parallele pour le cas `--subdir`.
 
