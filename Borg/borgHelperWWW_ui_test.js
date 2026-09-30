@@ -4,7 +4,7 @@
 // matrice d'adresses (analyse, adresses invalides, aller-retour d'encodage état -> adresse -> état) et
 // le titre de l'onglet de chaque page (UI >= 1.15.0). Puis, DOM et API simulés : badges, fin de Bkp, actions, carte,
 // et graphiques de la page Historique (tous construits, séries, archives supprimées, sans lignes, blocs HTML ;
-// chargements croisés, rechargement, réponses en erreur, échec partiel, bibliothèque absente).
+// chargements croisés, rechargement, réponses en erreur, échec partiel, bibliothèque absente) ; bandeau de nettoyage.
 //
 //   node borgHelperWWW_ui_test.js [chemin/vers/borgHelperWWW_ui.html]
 //
@@ -433,6 +433,41 @@ ${grab('_renderArchiveExtraChart')}
   eq('bibliothèque de graphiques absente : message sur les cinq, rien construit, sans exception',
      [e4,built.length,allIds.map(id=>{ const m=cdom.byId(id+'Msg'); return !m.hidden && m.className==='error' && cdom.byId(id).hidden
        && m.textContent.startsWith('Bibliothèque de graphiques indisponible'); }),spinners()],[null,0,allIds.map(()=>true),[]]);
+  // Bandeau de nettoyage (UI 1.19.5, story 23) : /access borg_cleanup -> texte sur la page des machines, masqué sinon.
+  eq('bandeau de nettoyage : bloc HTML présent',htmlIds.has('borgCleanupNotice'),true);
+  const note=new Function('cdom','hooks',`
+    const document={getElementById:id=>cdom.byId(id)};
+    let myAccess=null;
+${grab('_fmtBytes')}
+${grab('cleanupNoticeText')}
+${grab('renderCleanupNotice')}
+    return {render:a=>{ myAccess=a; renderCleanupNotice(); }};`)(cdom,{});
+  const nel=cdom.byId('borgCleanupNotice');
+  note.render({nicks:{},borg_cleanup:null});
+  const hid1=[nel.hidden,nel.textContent];
+  note.render({nicks:{},borg_cleanup:{borg_entries:26,borg_size:6300000,keys:1,keys_size:500,bh_files:2,bh_size:2048,history:1,history_size:4096}});
+  const t=nel.textContent;
+  note.render({nicks:{}});
+  eq('bandeau de nettoyage : absent sans données, texte complet avec, sans chemin, masqué à nouveau',
+     [hid1,[t.includes('26 entrée(s) borg'),t.includes('6.30 MB'),t.includes('1 clé(s)'),t.includes('2 fichier(s) borgHelper'),
+       t.includes('1 historique(s)'),t.includes('borgHelper -c BorgCleanup'),t.includes('/')&&/\/(tmp|home)\//.test(t)],nel.hidden],
+     [[true,''],[true,true,true,true,true,true,false],true]);
+  // Chemin réel : loadMyAccess (relue à chaque liste des serveurs et par pollAccess) affiche le bandeau.
+  const lma=new Function('cdom','hooks',`
+    const document={getElementById:id=>cdom.byId(id)};
+    let myAccess=null; const applyBadges=()=>{};
+    const apiCall=async()=>hooks.resp;
+${grab('_fmtBytes')}
+${grab('cleanupNoticeText')}
+${grab('renderCleanupNotice')}
+async ${grab('loadMyAccess')}
+    return {loadMyAccess,set:r=>{ hooks.resp=r; }};`)(cdom,{resp:{nicks:{},borg_cleanup:{borg_entries:3,borg_size:1000,keys:0,bh_files:0,history:0},httpStatus:200}});
+  nel.hidden=true; nel.textContent='';
+  await lma.loadMyAccess();
+  const shown=[nel.hidden,nel.textContent.includes('3 entrée(s) borg')];
+  lma.set({httpStatus:500,stderr:'x'}); await lma.loadMyAccess();
+  eq('bandeau de nettoyage : affiché par loadMyAccess (/access borg_cleanup), masqué si /access échoue ensuite',
+     [shown,nel.hidden],[[false,true],true]);
   console.log(fail?fail+' FAIL':'TOUT OK');
   process.exit(fail?1:0);
 })();

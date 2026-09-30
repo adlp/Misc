@@ -37,6 +37,31 @@ borgHelper est structuré en trois couches :
 - `<nick>` = identifiant du dépôt (ou valeur de `DB_NAME` si définie dans la section) — un fichier par dépôt
 - Répertoire configurable via `CACHE_DIR` dans la section `[DEFAULT]` du borghelperrc
 
+### Restes de dépôts disparus et de nicks retirés (1.0.160, story 23)
+
+`cleanup_scan` (lecture seule, jamais `borg`) :
+- **borg** (`_borg_leftovers`) : dossier personnel pwd de l'utilisateur (borg lancé par `boex` n'a ni `HOME` ni
+  `BORG_BASE_DIR`), ou `BORGHELPERC_CLEANUP_HOME` (le selftest et le push selftest y mettent un dossier vide).
+  Emplacement : `security/<id>/location`, sinon `previous_location` de `cache/<id>/config` (cache sans entrée de
+  sécurité). Signalé si c'est un chemin absolu dont `stat` lève `FileNotFoundError`/`NotADirectoryError` (tout autre
+  échec compte comme présent) et hors des `BORG_REPO` locaux du rc (`normpath` et `realpath`). Clés : 1re ligne
+  `BORG_KEY <id>` des fichiers de `keys/`.
+- **borgHelper** : fichiers de `CACHE_DIR` au préfixe du rc et de forme connue (`_BH_ORPHAN_RE` : bases et leurs
+  `-wal`/`-shm`/`.rebuild`/`.vacuum_tmp.<pid>`, `index-last.json`, verrous) dont le nom ne commence par aucun
+  `<prefix>-<clé>-` d'un nick actuel (clé : `get_db_nick`, nick nettoyé, `_repo_key`) ; verrou dont `_lock_holder`
+  dit le porteur vivant : jamais.
+
+`BorgCleanup` (seule voie de suppression, CLI, `-y` puis confirmation sur l'entrée standard, « oui » pour les clés et
+historiques) revérifie chaque emplacement et chaque verrou avant de supprimer ; sans `--keys`, garde l'élément qui porte
+l'emplacement d'un dépôt dont la clé est gardée (cache seul : son `config`). Tronc exact d'un fichier borgHelper : ce
+qui précède le premier `-<forme connue>` (`web` ne protège pas `web-old`) ; un verrou vivant protège tout son tronc.
+`_local_absent` : `stat` dans un fil, 2 s au plus. Selftest : `_rb_popen` enregistre chaque enfant (propre groupe),
+`_rb_killtree` le retire du registre une fois son groupe vide, le `finally` global tue le reste ; SIGTERM/SIGHUP ->
+`KeyboardInterrupt` pendant le selftest ; `BORGHELPERC_SELFTEST_SIGCHILD` : crochet de test (contrôle enfant long, dans
+un selftest imbriqué seulement). `cleanup_summary` (nombres et tailles,
+jamais de chemin) alimente la ligne finale de `Status`/`Report` (texte) et `GET /access` `borg_cleanup`
+(borgHelperWWW, cache 5 min, admin seulement quand les groupes sont actifs).
+
 ---
 
 ## Base de données `cache.db`

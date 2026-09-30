@@ -432,6 +432,11 @@ borgHelper -c Report -n ALL -o -N 10       # offline + 10 dernières archives
 Code retour 1 si un dépôt dépasse `MAX_AGE_BKP` heures depuis la dernière sauvegarde.  
 Code retour 2 si un dépôt est inaccessible.
 
+En texte seulement (ni `-j` ni `-l`), en ligne de commande, une ligne finale signale les restes à nettoyer sur la
+machine (1.0.160) : « Nettoyage possible : N entrée(s) borg de dépôts disparus (taille), … — aperçu : borgHelper -c
+BorgCleanup ». Jamais dans `GET /report` (borgHelperWWW pose `BORGHELPERC_NO_CLEANUP_NOTICE`). Voir
+[`BorgCleanup`](#borgcleanup).
+
 **Variation de taille** — colonne `size_delta` : pourcentage de variation de `original_size` par rapport à l'archive précédente (`+11%`, `-5%`, `—` pour la première). `original_size` est stable dans le temps (indépendant de la déduplication inter-archives). Dans le résumé (ligne par hôte), ce delta de la dernière archive est aussi affiché entre parenthèses dans la colonne `derniere` — ex. `1.37 GB (+11%)`.
 
 **Statistiques de mouvement** (si l'index SQLite est disponible) — colonne `modifications` :
@@ -991,6 +996,9 @@ borgHelper -c Status -n ALL -j               # tous les nicks configurés, JSON
 | `-n <nick1,nick2>` / `-n ALL` | Un ou plusieurs nicks nativement (contrairement à `RepoHistory`/`ArchiveHistory` qui rejettent le multi-nick) — c'est le cas d'usage principal de `Status` |
 | `-j` | Sortie JSON — toujours une **liste**, même à un seul nick : `[{nick,last_backup,bkp_running,bkp_stale,priority_op_running,build,rebuild}, ...]` — `rebuild` (1.0.143) : état du fichier fantôme (`build_state`), `null` sans reconstruction |
 
+En texte, en ligne de commande, une ligne finale signale les restes à nettoyer sur la machine, comme `Report`
+(1.0.160 ; JSON inchangé ; jamais via borgHelperWWW) — voir [`BorgCleanup`](#borgcleanup).
+
 Par nick :
 - **Dernier backup connu** : archive + date depuis `archive_stats` (déjà indexée localement) + âge
   lisible (« il y a 3h12 ») ; « aucune archive indexée » si le nick n'a jamais été indexé.
@@ -1160,6 +1168,46 @@ Affiche le mode (`plain`/`siv1`/`migrating`) de `cache.db` et de `diff.db` pour 
 l'en-tête (`db_meta.enc_header`) : aucune passphrase n'est nécessaire pour simplement connaître le mode d'une
 base chiffrée. Si une base reste `plain` alors que `DB_ENCRYPT` est actif et qu'une passphrase est
 disponible, avertit (comme `_open_db`, une fois par base et par invocation) et cite la commande `DbEncrypt`.
+
+### `BorgCleanup`
+
+```bash
+borgHelper -c BorgCleanup                    # aperçu : rien n'est supprimé
+borgHelper -c BorgCleanup -D                 # aperçu explicite (comme IdxPurge -D) ; l'emporte sur -y
+borgHelper -c BorgCleanup -y                 # retire entrées borg (sécurité, cache) et fichiers régénérables
+borgHelper -c BorgCleanup -y --keys --history   # retire aussi les clés et les historiques mesurés
+```
+
+Avec `-y`, confirmation lue sur l'entrée standard : « o » pour supprimer ; avec `--keys` ou `--history`, taper en plus
+« oui » (perte définitive). Sans réponse (entrée fermée, cron) : rien supprimé, code 2.
+
+Restes laissés sur la machine (1.0.160), repérés **sans appel `borg`** et **seulement supprimés par cette commande,
+avec `-y`** — jamais par `borgHelperWWW` ni l'interface :
+
+- **borg**, dans le dossier personnel de l'utilisateur qui lance borgHelper (celui qu'utilise borg lancé par
+  borgHelper, sans `HOME`) : entrées `~/.config/borg/security/<id>` et caches `~/.cache/borg/<id>` d'un dépôt
+  **local** dont le chemin n'existe plus et qu'aucun `BORG_REPO` du rc ne désigne (un disque démonté configuré n'est
+  jamais proposé ; un chemin inaccessible compte comme présent ; un dépôt distant, jamais). Les clés
+  `~/.config/borg/keys` de ces dépôts (mode keyfile) sont listées à part : **leur suppression est irréversible** (le
+  dépôt, s'il existe encore ailleurs, devient illisible) — seulement avec `--keys` ; sans `--keys`, l'entrée qui porte
+  l'emplacement du dépôt est gardée avec la clé.
+- **borgHelper**, dans `CACHE_DIR` : bases, `index-last.json` et verrous morts de nicks retirés du rc — seulement si
+  **aucun** nick actuel ne les produit (dépôts et `DB_NAME` partagés gardés ; verrou tenu par un processus vivant
+  jamais proposé, ni aucun fichier de ce nick tant que le verrou vit). `history.db` (historique mesuré, non
+  régénérable) : seulement avec `--history`. rc sans nick ou illisible : rien proposé.
+
+Chaque emplacement et chaque verrou sont revérifiés juste avant la suppression (dépôt réapparu, verrou repris :
+gardés). Un chemin inaccessible, ou dont l'état ne répond pas en 2 s (montage réseau bloqué), compte comme présent.
+Code 1 si une suppression échoue. `Status`, `Report` (texte, CLI) et l'interface (bandeau sur la page des serveurs)
+signalent ces restes ; une entrée réduite à une clé gardée (et à ce qui porte son emplacement) n'y est plus comptée,
+mais reste dans l'aperçu.
+
+Variables d'environnement : `BORGHELPERC_CLEANUP_HOME` (autre dossier personnel à scruter ; les selftests y mettent
+un dossier vide), `BORGHELPERC_NO_CLEANUP_NOTICE` (pas de notice ; posée par borgHelperWWW pour ses appels).
+
+Limites : un dépôt recréé au même chemin (nouvel identifiant) laisse l'entrée de l'ancien, non signalée (le chemin
+existe) ; un autre rc dont le nom commence par celui-ci et qui partage `CACHE_DIR` verrait ses fichiers proposés —
+lire l'aperçu avant `-y`.
 
 ---
 
@@ -1696,6 +1744,11 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
    `cache.db`) est restée en clair alors que `DB_ENCRYPT` est actif et qu'une passphrase est disponible — noms de
    fichiers en clair sur disque ; la bulle donne la commande `DbEncrypt`. Aucun badge pour une base chiffrée ni pour
    `DB_ENCRYPT=false` volontaire. Source : champ `db_plain` de `GET /access`.
+   Bandeau **🧹 Nettoyage possible sur le serveur** (UI ≥ 1.19.5) quand la machine garde des restes de dépôts borg
+   disparus ou de nicks retirés : nombres et tailles seulement, avec la commande `borgHelper -c BorgCleanup` —
+   l'interface ne supprime rien. Source : champ `borg_cleanup` de `GET /access` (borgHelperWWW ≥ 1.28.5 ; `null` s'il
+   n'y a rien, ou pour un appelant sans droit admin quand les groupes sont actifs ; recalculé au plus toutes les 5 min ;
+   masqué si `/access` échoue).
 3. **Détail d'un serveur** : champ **BORG_PASSPHRASE** à enregistrer pour la session (`sessionStorage`,
    par nick) — c'est ici, et seulement ici, qu'elle se saisit. Envoyée en `X-Borg-Passphrase` pour les
    actions qui en ont besoin (repérées par 🔑) ; les actions destructives (`Prune`, `DelBkp`, `Restore`,
@@ -1840,7 +1893,7 @@ clair sur le réseau sinon.
 
 ### Endpoints
 
-Un endpoint par commande CLI (voir [Commandes](#commandes) ci-dessus pour le détail de chaque
+Un endpoint par commande CLI, sauf `BorgCleanup` (suppression en ligne de commande seulement) (voir [Commandes](#commandes) ci-dessus pour le détail de chaque
 comportement) — `GET` pour les commandes en lecture, `POST`/`DELETE` pour celles qui modifient un état.
 Toutes les routes du tableau ci-dessous sont montées sous `api_prefix` (`/api` par défaut — voir
 [Configuration](#configuration)) : `GET /lstbkp` du tableau signifie concrètement

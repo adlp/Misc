@@ -66,7 +66,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.28.4"
+WWW_VERSION="1.28.5"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -1848,6 +1848,9 @@ def _build_borghelper_argv_env(cmd: str, nick: Optional[str], extra_args, passph
     argv+=list(extra_args)
     env=os.environ.copy()
     if passphrase: env['BORGHELPERC_RUNTIME_PASSPHRASE']=passphrase
+    # 1.28.5 (story 23) : jamais la notice de nettoyage dans /report ou /status texte (état de la machine) — elle ne
+    # passe que par /access borg_cleanup, réservé aux admins quand les groupes sont actifs
+    env['BORGHELPERC_NO_CLEANUP_NOTICE']='1'
     return argv,env
 
 def _exec_borghelper(cmd: str, nick: Optional[str], extra_args, passphrase: Optional[str]=None) -> CommandResult:
@@ -2502,7 +2505,22 @@ def healthz():
     return {'status':'ok'}
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
-# Un endpoint par commande CLI de borgHelper (voir README.md), sauf Mount/UMount.
+# Un endpoint par commande CLI de borgHelper (voir README.md), sauf Mount/UMount et BorgCleanup (suppression en CLI seulement).
+
+_CLEANUP_CACHE={'t':None,'v':None}
+def _borg_cleanup_summary():
+    """1.28.5 (story 23, A30) : restes de dépôts borg disparus et fichiers de nicks retirés (borgHelper cleanup_scan,
+    lecture seule) — nombres et tailles seulement, jamais de chemin ; None s'il n'y a rien ou si la lecture échoue.
+    Recalculé au plus toutes les 5 min (/access est relu par l'UI toutes les 30 s). Aucune suppression ici : seulement
+    la CLI (borgHelper -c BorgCleanup -y)."""
+    now=time.monotonic()
+    if _CLEANUP_CACHE['t'] is not None and now-_CLEANUP_CACHE['t']<300: return _CLEANUP_CACHE['v']
+    try:
+        s=_bh_paths.cleanup_summary(_bh_paths.cleanup_scan())
+        v=s if (s['borg_entries'] or s['keys'] or s['bh_files'] or s['history']) else None
+    except (Exception,SystemExit): v=None
+    _CLEANUP_CACHE.update(t=now,v=v)
+    return v
 
 @router.get("/access",tags=["lecture"],summary="Niveau d'accès (lecture/écriture/admin) ET périmètres de chemin lecture+restauration de l'appelant sur chaque nick, d'après ses groupes — 200 pour un appel authentifié, SAUF 500 (non catché, par construction) si GROUPS_PATHS/GROUPS_PATHS_RESTORE a été rendu ambigu dans .borghelperrc depuis le démarrage du process — voir README.md")
 def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
@@ -2546,7 +2564,7 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
         # allow_destructive/allow_downloads (globaux) s'appliquent — 'admin'/scope:null partout
         # reflète cette absence de restriction par groupes pour que l'UI n'ait qu'une seule forme
         # de réponse à traiter, sans cas particulier côté client.
-        return {'groups_auth_enabled':False,
+        return {'groups_auth_enabled':False,'borg_cleanup':_borg_cleanup_summary(),
                 'nicks':{n:{'level':'admin','read_scope':None,'restore_scope':None,'db_plain':_plain(n),**_state(n)} for n in nicks}}
     user_groups=_parse_groups(request.headers.get(GROUPS_HEADER))
     level_names={0:'none',1:'read',2:'write',3:'admin'}
@@ -2563,7 +2581,9 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
         result[n]={'level':level_names[eff],'read_scope':read_scope,'restore_scope':restore_scope,
                    'db_plain':_plain(n) if eff>0 else []}  # rien révélé d'un nick sans droit
         if eff>0: result[n].update(_state(n))
-    return {'groups_auth_enabled':True,'nicks':result}
+    # 1.28.5 : état de la machine (pas d'un nick) — seulement pour un admin d'au moins un nick
+    admin=any(v['level']=='admin' for v in result.values())
+    return {'groups_auth_enabled':True,'borg_cleanup':_borg_cleanup_summary() if admin else None,'nicks':result}
 
 @router.get("/stats",response_model=CommandResult,tags=["lecture"])
 def stats(nick: Optional[str]=None, x_api_key: Optional[str]=Header(default=None)):
@@ -3216,6 +3236,10 @@ def push_selftest():
     # temporaire, jamais le PUSH_DB réel — restauré dans le `finally` externe. Idem pour le fichier de
     # préférences JSON (spec-push-ui-prefs-json).
     PUSH_PREFS_FILE=os.path.join(tmpdir,'push-prefs-selftest.json')
+    # 1.28.5 (story 23) : /access ne scrute jamais le vrai dossier borg de l'utilisateur pendant le selftest
+    old_cleanup_home=os.environ.get('BORGHELPERC_CLEANUP_HOME')
+    os.environ['BORGHELPERC_CLEANUP_HOME']=os.path.join(tmpdir,'home-vide'); os.makedirs(os.environ['BORGHELPERC_CLEANUP_HOME'])
+    _CLEANUP_CACHE.update(t=None,v=None)
     try:
         conn=_open_db(test_db,nick=None,role='admin')
         conn.row_factory=sqlite3.Row
@@ -4020,6 +4044,28 @@ def push_selftest():
                     if not ok: print(f"  /access : {r.status_code} {json.dumps(nk,ensure_ascii=False)[:400]}")
                     return bool(ok)
                 check("/access : external, ops, build, rebuild, bkp_running par nick lisible ; rien pour un nick sans droit",_access_state)
+                def _access_cleanup():
+                    """1.28.5 (story 23, A30) : /access borg_cleanup — une entrée de dépôt disparu ajoutée au dossier de bac à sable
+                    -> +1 entrée borg (nombres et tailles, jamais de chemin), invisible tant que le calcul est gardé (5 min) ;
+                    null pour un appelant sans droit admin quand les groupes sont actifs ; aucune suppression."""
+                    home=os.environ['BORGHELPERC_CLEANUP_HOME']; _CLEANUP_CACHE.update(t=None,v=None)
+                    a=client.get(f"{P}/access",headers=H).json().get('borg_cleanup','absent')
+                    sd=os.path.join(home,'.config','borg','security','7'*64); os.makedirs(sd)
+                    with open(os.path.join(sd,'location'),'w') as f: f.write(os.path.join(tmpdir,'depot-disparu'))
+                    b=client.get(f"{P}/access",headers=H).json().get('borg_cleanup')   # encore en cache : null
+                    _CLEANUP_CACHE.update(t=None,v=None)
+                    c=client.get(f"{P}/access",headers=H).json().get('borg_cleanup')
+                    with mock.patch(f"{__name__}.GROUPS_HEADER",'X-Groups'):
+                        n=client.get(f"{P}/access",headers={**H,'X-Groups':'aucun-groupe-selftest'}).json().get('borg_cleanup','absent')
+                        with mock.patch(f"{__name__}._effective_level",lambda g,c: 3):   # admin de chaque nick
+                            ad=client.get(f"{P}/access",headers={**H,'X-Groups':'admins-selftest'}).json().get('borg_cleanup','absent')
+                    still=os.path.isdir(sd); shutil.rmtree(sd,ignore_errors=True); _CLEANUP_CACHE.update(t=None,v=None)
+                    base=(a or {}).get('borg_entries',0) if a!='absent' else None   # la copie démo peut avoir ses propres restes
+                    ok=(base is not None and b==a and isinstance(c,dict) and c.get('borg_entries')==base+1 and '/' not in json.dumps(c)
+                        and n is None and ad==c and still)
+                    if not ok: print(f"  /access borg_cleanup : vide {a!r}, en cache {b!r}, recalculé {c!r}, sans droit {n!r}, admin (groupes) {ad!r}, entrée gardée {still}")
+                    return ok
+                check("/access borg_cleanup : +1 entrée de dépôt disparu, nombres sans chemin, cache 5 min, admin seulement avec groupes, aucune suppression",_access_cleanup)
                 def _access_values():
                     """/access relaie les VALEURS de Status (Bkp en cours, construction, fantôme) ; lecture en échec -> bkp_running
                     inconnu (None), jamais « fini » ; EXTERNAL invalide -> external None, ops ['read']."""
@@ -4225,6 +4271,9 @@ def push_selftest():
             conn.close()
     finally:
         PUSH_DB,PUSH_PREFS_FILE=old_push_db,old_prefs
+        if old_cleanup_home is None: os.environ.pop('BORGHELPERC_CLEANUP_HOME',None)
+        else: os.environ['BORGHELPERC_CLEANUP_HOME']=old_cleanup_home
+        _CLEANUP_CACHE.update(t=None,v=None)
         shutil.rmtree(tmpdir,ignore_errors=True)
 
     # ── Garde BORGHELPERWWW_* égarée dans .borghelperrc[DEFAULT] (piège réel constaté en prod) ──

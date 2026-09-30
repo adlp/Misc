@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.159"
+Version="1.0.160"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -122,6 +122,80 @@ def convert_octets_readable(size_in_bytes,sib=1000):
     while size_in_bytes>=sib and index<len(suffixes)-1:
         size_in_bytes/=sib; index+=1
     return f"{size_in_bytes:.2f} {suffixes[index]}"
+
+def _dir_size(path):
+    """Taille en octets des fichiers sous `path` (ou du fichier seul), liens non suivis ; 0 si absent ou illisible."""
+    if not os.path.isdir(path) or os.path.islink(path):
+        try: return os.lstat(path).st_size
+        except OSError: return 0
+    t=0
+    for r,_ds,fs in os.walk(path):
+        for f in fs:
+            try: t+=os.lstat(os.path.join(r,f)).st_size
+            except OSError: pass
+    return t
+
+def _local_absent(path,timeout=2):
+    """True seulement si `path` n'existe certainement pas (FileNotFoundError / NotADirectoryError) ; un accès refusé,
+    une autre erreur ou un stat qui ne répond pas en `timeout` s (montage réseau bloqué : Status, Report et /access ne
+    doivent jamais y rester pendus) compte comme présent : jamais proposé au nettoyage sur un doute."""
+    res=[]
+    def _st():
+        try: os.stat(path); res.append(False)
+        except (FileNotFoundError,NotADirectoryError): res.append(True)
+        except (OSError,ValueError): res.append(False)
+    th=threading.Thread(target=_st,daemon=True); th.start(); th.join(timeout)
+    return bool(res) and res[0]
+
+def _borg_leftovers(home,repos):
+    """1.0.160 (story 23, A30) : entrées borg d'un dossier personnel `home` pour des dépôts LOCAUX disparus — lecture
+    seule, jamais borg. Emplacement : fichier `location` de .config/borg/security/<id>, sinon `previous_location` du
+    cache .cache/borg/<id>/config (cache sans entrée de sécurité). Signalé si c'est un chemin absolu absent et hors de
+    `repos` (BORG_REPO locaux du rc, normalisés) ; distant (ssh://, user@host:) ou forme inconnue : jamais. Clés
+    (.config/borg/keys, 1re ligne 'BORG_KEY <id>') rattachées par id, à part : irréversibles. Entrée illisible : ignorée.
+    Rend [{'id','location','paths','anchor','size','keys','key_size'}]."""
+    sec=os.path.join(home,'.config','borg','security'); cache=os.path.join(home,'.cache','borg')
+    keysd=os.path.join(home,'.config','borg','keys'); idre=re.compile(r'^[0-9a-f]{64}$')
+    def _ls(d):
+        try: return sorted(os.listdir(d))
+        except OSError: return []
+    locs={}
+    for i in _ls(sec):
+        if not idre.match(i): continue
+        try:
+            with open(os.path.join(sec,i,'location')) as f: locs[i]=f.read().strip()
+        except (OSError,UnicodeDecodeError): continue
+    for i in _ls(cache):
+        if not idre.match(i) or i in locs or os.path.isdir(os.path.join(sec,i)): continue
+        cp=configparser.ConfigParser(interpolation=None)
+        try:
+            cp.read(os.path.join(cache,i,'config')); locs[i]=cp['cache']['previous_location'].strip()
+        except (configparser.Error,KeyError,OSError,UnicodeDecodeError): continue
+    keyof={}
+    for k in _ls(keysd):
+        kp=os.path.join(keysd,k)
+        try:
+            with open(kp) as f: first=f.readline().split()
+        except (OSError,UnicodeDecodeError): continue
+        if len(first)==2 and first[0]=='BORG_KEY' and idre.match(first[1]): keyof.setdefault(first[1],[]).append(kp)
+    out=[]
+    for i,loc in sorted(locs.items()):
+        if not loc.startswith('/'): continue
+        if os.path.normpath(loc) in repos or os.path.realpath(loc) in repos or not _local_absent(loc): continue
+        sp=os.path.join(sec,i) if os.path.lexists(os.path.join(sec,i)) else None
+        cp=os.path.join(cache,i) if os.path.lexists(os.path.join(cache,i)) else None
+        paths=[x for x in (sp,cp) if x]
+        ks=keyof.get(i,[])
+        # anchor : ce qui porte l'emplacement (sécurité, sinon cache) — gardé tant que la clé l'est, sinon la clé
+        # deviendrait introuvable (plus rien ne dirait à quel dépôt elle appartient)
+        out.append({'id':i,'location':loc,'paths':paths,'anchor':sp or cp,'size':sum(_dir_size(x) for x in paths),
+                    'keys':ks,'key_size':sum(_dir_size(x) for x in ks)})
+    return out
+
+_BH_KIND=(r'(?:(?:cache|diff|history)\.db(?:\.rebuild)?(?:-wal|-shm|\.vacuum_tmp\.\d+(?:-wal|-shm)?)?'
+          r'|index-last\.json(?:\.\d+\.tmp)?'
+          r'|(?:priority|index-running|index-paused|index-pending|report-running)\.lock(?:\.\d+)?(?:\.\d+\.tmp|\.stale\.\d+)?)')
+_BH_ORPHAN_RE=re.compile(r'-'+_BH_KIND+r'$')   # 1er '-' dont la suite est une forme connue : ce qui précède = le « tronc »
 
 def mountedornot(mountpoint,debug=0):
     founded=False
@@ -602,6 +676,8 @@ def usage(doc=None,debug=0):
         printer("       Ré-enveloppe la DEK avec une nouvelle KEK (aucune donnée rechiffrée) ; refuse sur base plain")
         printer("🔍 -c DbStatus [-n nick/ALL]")
         printer("       Mode (plain/siv1/migrating) de cache.db et diff.db pour chaque nick")
+        printer("🧹 -c BorgCleanup [-D] [-y] [--keys] [--history]")
+        printer("       Restes de dépôts borg locaux disparus et fichiers de nicks retirés : aperçu ; -y retire (clés, historiques à part)")
         printer("  Sentry configuration : BORGHELPERC_SENTRY_ID BORGHELPERC_SENTRY_FILE ou /usr/local/etc/borghelper-sentry")
     elif doc=='key':
         printer("   -c Key [-n nickname/servername/ALL]")
@@ -794,6 +870,13 @@ def usage(doc=None,debug=0):
         printer("       -y : exécution réelle (sinon refus)")
         printer("       borgHelperWWW >= 1.26.4 le prend en compte seul (relit l'en-tête de chiffrement) ;")
         printer("       versions antérieures : redémarrer son process")
+    elif doc=='borgcleanup':
+        printer("   -c BorgCleanup [-D] [-y] [--keys] [--history]")
+        printer("       Restes de dépôts borg LOCAUX disparus (hors rc ; ~/.config/borg/security, ~/.cache/borg, clés)")
+        printer("       et fichiers borgHelper de nicks retirés du rc (CACHE_DIR) — jamais un dépôt distant ou configuré")
+        printer("       Sans -y, ou -D : aperçu (chemins, tailles), rien supprimé  |  -y : retire sécurité, cache et fichiers régénérables")
+        printer("       -y : confirmation sur l'entrée standard (« o », puis « oui » pour clés et historiques) ; sans réponse : code 2")
+        printer("       -y --keys : aussi les clés (irréversible)  |  -y --history : aussi les historiques mesurés (history.db)")
     elif doc=='dbstatus':
         printer("   -c DbStatus [-n nick/ALL]")
         printer("       Affiche le mode (plain/siv1/migrating) de cache.db et diff.db pour chaque nick")
@@ -6560,6 +6643,160 @@ class BorgHelper:
             return
         for st in results: self._status_print_one(st)
 
+    # ── Nettoyage des restes de dépôts disparus et de nicks retirés (1.0.160, story 23, A30) ──
+    def cleanup_scan(self,home=None):
+        """Lecture seule, jamais borg. borg : _borg_leftovers du dossier personnel (pwd par défaut : celui qu'utilise
+        borg lancé par boex, sans HOME) contre les BORG_REPO du rc. borgHelper : fichiers de CACHE_DIR au préfixe du rc,
+        de forme connue (_BH_ORPHAN_RE), qu'AUCUN nick actuel ne produit (base par nick ou DB_NAME, index-last par nick,
+        verrous par dépôt : dépôts et DB_NAME partagés gardés) ; verrou tenu par un processus vivant jamais proposé.
+        BORGHELPERC_CLEANUP_HOME (env) : autre dossier à scruter (le selftest y met un dossier vide : jamais les vraies
+        entrées de l'utilisateur). Rend {'borg':[…], 'bh':[{'path','size','kind':'history'|'regen'}]}."""
+        import pwd
+        home=home or os.environ.get('BORGHELPERC_CLEANUP_HOME') or pwd.getpwuid(os.getuid()).pw_dir
+        try: nicks=[n for n in (self.borg.cfgreadnicks(0) or '').split(',') if n]
+        except (Exception,SystemExit): nicks=[]
+        if not nicks: return {'borg':[],'bh':[]}   # rc vide ou illisible : rien proposé sur un doute
+        repos=set(); stems=set()
+        for n in nicks:
+            try:
+                r=((self.borg.cfgread(n) or {}).get('BORG_REPO') or '').strip()
+                if r.startswith('file://'): r=r[len('file://'):]
+                if r and ('://' not in r) and not re.match(r'^[^/]+@[^/]+:',r) and not re.match(r'^[^/]+:[^/]',r):
+                    r=os.path.abspath(os.path.expanduser(r))   # ~ ou relatif : chemin local
+                if r.startswith('/'): repos.update({os.path.normpath(r),os.path.realpath(r)})
+                stems.update({self.db.get_db_nick(n),re.sub(r'[^a-zA-Z0-9_-]','_',n),self.db._repo_key(n)})
+            except (Exception,SystemExit): return {'borg':[],'bh':[]}   # rc illisible : rien proposé sur un doute
+        borg=_borg_leftovers(home,repos)
+        bh=[]; pre=self.db.db_prefix+'-'
+        try: names=sorted(os.listdir(self.db.cache_dir))
+        except OSError: names=[]
+        cand=[]; busy=set()
+        for f in names:
+            fp=os.path.join(self.db.cache_dir,f)
+            m=_BH_ORPHAN_RE.search(f[len(pre)-1:]) if f.startswith(pre) else None
+            if not m or m.start()==0 or not os.path.isfile(fp) or os.path.islink(fp): continue
+            stem=f[len(pre):len(pre)-1+m.start()]   # tronc exact : 'web' ne protège pas 'web-old'
+            if stem in stems: continue
+            if '.lock' in f and self._cleanup_lock_alive(fp): busy.add(stem); continue
+            cand.append((stem,fp,f))
+        for stem,fp,f in cand:
+            if stem in busy: continue   # un verrou vivant de ce tronc : aucun de ses fichiers (processus en cours)
+            bh.append({'path':fp,'size':_dir_size(fp),'kind':'history' if '-history.db' in f else 'regen'})
+        return {'borg':borg,'bh':bh}
+
+    def _cleanup_lock_alive(self,fp):
+        """Porteur vivant (ou fichier illisible) : jamais proposé, et son tronc protégé."""
+        try: return self.db._lock_holder(fp) in ('alive','me')
+        except (Exception,SystemExit): return True
+
+    @staticmethod
+    def _cleanup_kept_key(x):
+        """Entrée borg réduite à sa clé gardée et à l'élément qui porte l'emplacement (après -y sans --keys) : hors notice
+        (choix de l'utilisateur), toujours dans l'aperçu de BorgCleanup."""
+        if not x['keys'] or x['paths']!=[x['anchor']]: return False
+        if os.sep+'.config'+os.sep in x['anchor']: return True
+        try: return set(os.listdir(x['anchor']))<={'config'}
+        except OSError: return False
+
+    @staticmethod
+    def cleanup_summary(scan):
+        """Nombres et tailles seulement (jamais de chemin) : notice, /access. Entrées réduites à une clé gardée : à part."""
+        b=[x for x in scan.get('borg',[]) if not BorgHelper._cleanup_kept_key(x)]; h=scan.get('bh',[])
+        reg=[x for x in h if x['kind']!='history']; his=[x for x in h if x['kind']=='history']
+        return {'borg_entries':len(b),'borg_size':sum(x['size'] for x in b),
+                'keys':sum(len(x['keys']) for x in b),'keys_size':sum(x['key_size'] for x in b),
+                'bh_files':len(reg),'bh_size':sum(x['size'] for x in reg),
+                'history':len(his),'history_size':sum(x['size'] for x in his),
+                'kept_keys':sum(len(x['keys']) for x in scan.get('borg',[]) if BorgHelper._cleanup_kept_key(x))}
+
+    def cleanup_notice(self,home=None):
+        """Une ligne pour la fin de Status et de Report (texte, CLI), ou None — jamais d'exception. Jamais pour un appel
+        lancé par borgHelperWWW (BORGHELPERC_NO_CLEANUP_NOTICE) : l'état de la machine n'y passe que par /access, réservé
+        aux admins quand les groupes sont actifs."""
+        if os.environ.get('BORGHELPERC_NO_CLEANUP_NOTICE'): return None
+        try: s=self.cleanup_summary(self.cleanup_scan(home))
+        except (Exception,SystemExit): return None
+        parts=[]
+        if s['borg_entries']: parts.append(f"{s['borg_entries']} entrée(s) borg de dépôts disparus ({convert_octets_readable(s['borg_size'])})")
+        if s['keys']: parts.append(f"{s['keys']} clé(s) borg de ces dépôts")
+        if s['bh_files']: parts.append(f"{s['bh_files']} fichier(s) borgHelper de nicks retirés ({convert_octets_readable(s['bh_size'])})")
+        if s['history']: parts.append(f"{s['history']} historique(s) mesuré(s) de nicks retirés")
+        return ("Nettoyage possible : "+", ".join(parts)+" — aperçu : borgHelper -c BorgCleanup") if parts else None
+
+    @staticmethod
+    def _cleanup_ask(prompt,want):
+        """Confirmation lue sur l'entrée standard (décision de l'utilisateur, story 23) : 'o' -> o/oui/y/yes ; 'oui' ->
+        le mot « oui » exactement. Fin de l'entrée (cron, script sans réponse) : refus."""
+        sys.stderr.write(prompt); sys.stderr.flush()
+        try: ans=sys.stdin.readline() if sys.stdin else ''
+        except (OSError,ValueError): ans=''
+        a=ans.strip().lower()
+        return a=='oui' if want=='oui' else a in ('o','oui','y','yes')
+
+    def borg_cleanup(self,confirm=False,keys=False,history=False,home=None,ask=None):
+        """Commande CLI BorgCleanup : aperçu par défaut ; -y retire les entrées borg (sécurité, cache) et les fichiers
+        borgHelper régénérables ; --keys (avec -y) les clés borg — irréversible ; --history (avec -y) les history.db.
+        Avec -y : confirmation sur l'entrée standard (« o »), puis, pour les clés et historiques, le mot « oui » ;
+        refus ou fin de l'entrée -> code 2, rien supprimé. `ask(prompt,want)` : autre source de réponse (tests).
+        Jamais depuis borgHelperWWW. Emplacement et verrous revérifiés juste avant de supprimer. Code 1 si une
+        suppression échoue."""
+        scan=self.cleanup_scan(home); b=scan['borg']; h=scan['bh']
+        if not b and not h:
+            printer("Rien à nettoyer : aucune entrée borg de dépôt local disparu, aucun fichier borgHelper de nick retiré."); return 0
+        if b:
+            printer("Entrées borg de dépôts locaux disparus (hors rc) :")
+            for x in b:
+                printer(f"  {x['location']}  ({convert_octets_readable(x['size'])})")
+                for q in x['paths']: printer(f"    {q}")
+                for k in x['keys']: printer(f"    ⚠ clé {k} — suppression irréversible (dépôt illisible s'il existe encore ailleurs) : --keys ;"
+                                            " sans --keys, l'entrée qui porte l'emplacement est gardée avec elle")
+        if h:
+            printer("Fichiers borgHelper de nicks absents du rc :")
+            for x in h:
+                printer(f"  {x['path']}  ({convert_octets_readable(x['size'])})"
+                        +("  ⚠ historique mesuré, non régénérable : --history" if x['kind']=='history' else ""))
+        if not confirm:
+            printer("Aperçu seulement. -y : retire les entrées borg (sécurité, cache) et les fichiers régénérables ; "
+                    "-y --keys : aussi les clés ; -y --history : aussi les historiques mesurés.")
+            return 0
+        ask=ask or self._cleanup_ask
+        nk=sum(len(x['keys']) for x in b) if keys else 0; nh=sum(1 for x in h if x['kind']=='history') if history else 0
+        nr=len(b)+sum(1 for x in h if x['kind']!='history')
+        if not ask(f"Supprimer {nr} élément(s) régénérable(s) (entrées borg, caches, fichiers borgHelper) ? [o/N] ",'o'):
+            printer("Rien supprimé (non confirmé)."); return 2
+        if (nk or nh) and not ask(f"⚠ Perte définitive : {nk} clé(s) borg, {nh} historique(s) mesuré(s). Taper « oui » pour confirmer : ",'oui'):
+            printer("Rien supprimé (perte définitive non confirmée)."); return 2
+        done=errs=0
+        def _rm(q):
+            nonlocal done,errs
+            try:
+                if os.path.isdir(q) and not os.path.islink(q): shutil.rmtree(q)
+                else: os.unlink(q)
+                done+=1
+            except FileNotFoundError: pass
+            except OSError as e: errs+=1; printer(f"  [ERREUR] {q} : {e}")
+        for x in b:
+            if not _local_absent(x['location']): printer(f"  {x['location']} est réapparu — gardé"); continue
+            keep_anchor=bool(x['keys']) and not keys   # clé gardée : son emplacement aussi, pour la retrouver ensuite
+            for q in x['paths']:
+                if keep_anchor and q==x['anchor']:
+                    if os.sep+'.cache'+os.sep in q and os.path.isdir(q):   # cache seul : garder son config (emplacement)
+                        for e in os.listdir(q):
+                            if e!='config': _rm(os.path.join(q,e))
+                    continue
+                _rm(q)
+            if keys:
+                for k in x['keys']: _rm(k)
+        for x in h:
+            if '.lock' in x['path'] and self._cleanup_lock_alive(x['path']):
+                printer(f"  {x['path']} : verrou repris entre-temps — gardé"); continue
+            if x['kind']!='history' or history: _rm(x['path'])
+        kept=([f"{sum(len(x['keys']) for x in b)} clé(s)"] if not keys and any(x['keys'] for x in b) else [])+\
+             ([f"{sum(1 for x in h if x['kind']=='history')} historique(s)"] if not history and any(x['kind']=='history' for x in h) else [])
+        printer(f"{done} élément(s) retiré(s)"+(f", {errs} en échec" if errs else "")+(f" ; gardés : {', '.join(kept)}" if kept else "")
+                +" — relancer borgHelper -c BorgCleanup pour l'aperçu")
+        return 1 if errs else 0
+
     def difftop(self,nick,bkp=None,depth=3,topn=10,debug=0,as_json=False):
         from collections import defaultdict
         db_path=self.db.get_diff_db(nick)
@@ -7213,7 +7450,7 @@ def codec_selftest(pattern=None,list_only=False):
     Affiche OK/FAIL par contrôle. 1.0.147 (story 10, A5) : pattern = re.Pattern compilé -> seuls les contrôles dont le
     nom correspond s'exécutent (run PARTIEL, jamais suffisant avant commit) ; list_only -> noms affichés, rien exécuté.
     Le code hors contrôles (bases temporaires) tourne toujours ; un groupe peut dépendre d'un contrôle précédent."""
-    import tempfile,shutil,contextlib,io
+    import tempfile,shutil,contextlib,io,signal
     from unittest import mock
     if isinstance(pattern,str): pattern=re.compile(pattern,re.IGNORECASE)
     results=[]; left_out=[0]; skipped=[0]
@@ -7229,6 +7466,7 @@ def codec_selftest(pattern=None,list_only=False):
     def raises(exc,fn):
         try: fn()
         except exc: return True
+        except KeyboardInterrupt: raise   # 1.0.160 : Ctrl-C, SIGTERM/SIGHUP (A32) arrêtent le selftest, jamais « False »
         except BaseException: return False
         return False
     mei_before=_mei_dirs()   # 1.0.151 (story 14) : _MEI* du run retirés en fin de run
@@ -7236,7 +7474,70 @@ def codec_selftest(pattern=None,list_only=False):
     # état global restauré à la fin : le self-test ne doit rien laisser derrière lui
     saved_readers=dict(_DB_CFG_READERS); saved_deks=dict(_DEK_CACHE); saved_codecs=dict(_CODEC_CACHE); saved_scrypt=getattr(hashlib,'scrypt',None)
     saved_warned=set(_PLAIN_WARNED); saved_batch=_MIGRATE_BATCH; saved_disk_usage=shutil.disk_usage
+    # 1.0.159-1.0.160 (stories 22-23, A29/A32) : enfants tués par groupe de processus. Registre des groupes lancés ;
+    # SIGTERM/SIGHUP pendant le selftest -> KeyboardInterrupt (les finally tournent : un enfant de sa propre session ne
+    # reçoit ni le SIGHUP du terminal ni le signal envoyé au selftest) ; groupes restants tués par le finally global.
+    _rb_live=[]
+    def _rb_popen(cmd,**kw):
+        """borgHelper enfant destiné à être tué : son propre groupe de processus (wrapper et borg compris). 1.0.160 : inscrit
+        dans _rb_live, dont les groupes encore vivants sont tués par le finally du selftest (SIGTERM/SIGHUP compris)."""
+        ps=subprocess.Popen(cmd,start_new_session=True,**kw); _rb_live.append(ps); return ps
+    def _rb_group(pgid):
+        """PID des processus du groupe `pgid` (champ 5 de /proc/<pid>/stat, après le nom entre parenthèses)."""
+        out=[]
+        for pid in os.listdir('/proc'):
+            if not pid.isdigit(): continue
+            try:
+                with open(f'/proc/{pid}/stat') as f: st=f.read()
+                if int(st[st.rindex(')')+2:].split()[2])==pgid and st[st.rindex(')')+2]!='Z': out.append(int(pid))
+            except (OSError,ValueError,IndexError): continue
+        return out
+    def _rb_killtree(ps,wait=1):
+        """Tue tout le groupe d'un enfant de _rb_popen (SIGKILL), même si le chef est déjà sorti : ni wrapper ni borg
+        orphelin. Seulement si le groupe a encore des membres (un groupe vide n'est jamais visé : PID réutilisé) ; repli
+        ps.kill() pour un enfant qui n'est pas chef de groupe. Attend au plus `wait` s que le groupe soit vide ; rend
+        les survivants. Fenêtre courte exprès : un SIGKILL tue en quelques ms, alors qu'un orphelin non tué (wrapper en
+        sleep de _rb_kill : ~2,5 s restantes) finirait seul dans une fenêtre longue et ne serait jamais vu."""
+        if _rb_group(ps.pid):
+            with contextlib.suppress(ProcessLookupError,PermissionError): os.killpg(ps.pid,signal.SIGKILL)
+        if ps.poll() is None: ps.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired): ps.wait(10)
+        t0=time.monotonic()
+        while (left:=_rb_group(ps.pid)) and time.monotonic()-t0<wait: time.sleep(0.1)
+        if not left and ps.returncode is not None and ps in _rb_live:
+            _rb_live.remove(ps)   # groupe vidé et chef récolté : plus jamais visé (son PID peut être réattribué)
+        return left
+    def _rb_run(cmd,timeout,input=None,**kw):
+        """subprocess.run(cmd,capture_output=True,text=True,timeout=…) pour un borgHelper ou un wrapper (1.0.160, story 23
+        A32) : sur délai dépassé, subprocess.run ne tue que l'enfant direct et attend que ses descendants (wrapper, borg)
+        libèrent le tube ; ici tout le groupe est tué, puis TimeoutExpired levée. Groupe tué aussi à la sortie normale."""
+        ps=_rb_popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
+                     stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,**kw)
+        try: out,err=ps.communicate(input=input,timeout=timeout)
+        except subprocess.TimeoutExpired as e:
+            _rb_killtree(ps)
+            try: e.stdout,e.stderr=ps.communicate(timeout=5)   # sortie gardée pour le diagnostic ; vidange bornée
+            except subprocess.TimeoutExpired: pass   # un descendant hors du groupe tient encore le tube
+            raise
+        finally: _rb_killtree(ps)
+        return subprocess.CompletedProcess(cmd,ps.returncode,out,err)
+    def _rb_sig(sig,_frame): raise KeyboardInterrupt(f"signal {sig}")
+    saved_sigs={}; saved_cleanup_home=os.environ.get('BORGHELPERC_CLEANUP_HOME')
     try:
+        for _sg in (signal.SIGTERM,signal.SIGHUP):
+            try: saved_sigs[_sg]=signal.signal(_sg,_rb_sig)
+            except ValueError: pass   # hors du fil principal : gestionnaire impossible, rien changé
+        # 1.0.160 (story 23) : Status/Report ne scrutent jamais le vrai dossier borg de l'utilisateur pendant le selftest
+        os.environ['BORGHELPERC_CLEANUP_HOME']=os.path.join(tmp,'home-vide'); os.makedirs(os.environ['BORGHELPERC_CLEANUP_HOME'])
+        # 1.0.160 (story 23, A32) : contrôle présent SEULEMENT dans le selftest imbriqué de _rb_signals (variable posée par
+        # lui) — un enfant long de sa propre session, dont le PID est écrit dans le fichier nommé par la variable.
+        if os.environ.get('BORGHELPERC_SELFTEST_SIGCHILD'):
+            def _rb_sig_child():
+                ps=_rb_popen(['sleep','60'])
+                with open(os.environ['BORGHELPERC_SELFTEST_SIGCHILD']+'.tmp','w') as f: f.write(str(ps.pid))
+                os.replace(os.environ['BORGHELPERC_SELFTEST_SIGCHILD']+'.tmp',os.environ['BORGHELPERC_SELFTEST_SIGCHILD'])
+                time.sleep(60); return True
+            check("harnais enfant long (selftest imbriqué, signaux)",_rb_sig_child)
         # ── primitives : vecteurs officiels ──
         check("HMAC-SHA256 (RFC 4231 cas 1)",lambda: hmac.new(b'\x0b'*20,b'Hi There',hashlib.sha256).hexdigest()==
               'b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7')
@@ -10247,7 +10548,7 @@ def codec_selftest(pattern=None,list_only=False):
         # lancé par boex sans BORG_EXE écrit dans le dossier personnel (~/.cache/borg, ~/.config/borg/security).
         # D'où : sous-processus -> _rb_env ; tout BorgHelper du selftest -> BORG_EXE=_rb_wrapper ; _rbc scrute ensuite
         # les dossiers de sécurité borg de l'utilisateur.
-        import shlex,signal
+        import shlex
         def _rb_env(bb,**kw):
             """Environnement d'un sous-processus borg ou borgHelper : os.environ sans aucune clé BORG_*, BORG_BASE_DIR du test,
             TMPDIR du selftest, BORG_RELOCATED_REPO_ACCESS_IS_OK, puis les clés propres au test."""
@@ -10272,32 +10573,6 @@ def codec_selftest(pattern=None,list_only=False):
                 f.write("#!/bin/bash\n"+pre+"unset BORG_CACHE_DIR BORG_CONFIG_DIR BORG_SECURITY_DIR BORG_KEYS_DIR\n"
                         f"export BORG_BASE_DIR={shlex.quote(bb)}\n"+mid+f"exec {shlex.quote(shutil.which('borg'))} \"$@\"\n")
             os.chmod(path+'.tmp',0o700); os.replace(path+'.tmp',path)
-        def _rb_popen(cmd,**kw):
-            """borgHelper enfant destiné à être tué : son propre groupe de processus (wrapper et borg compris)."""
-            return subprocess.Popen(cmd,start_new_session=True,**kw)
-        def _rb_group(pgid):
-            """PID des processus du groupe `pgid` (champ 5 de /proc/<pid>/stat, après le nom entre parenthèses)."""
-            out=[]
-            for pid in os.listdir('/proc'):
-                if not pid.isdigit(): continue
-                try:
-                    with open(f'/proc/{pid}/stat') as f: st=f.read()
-                    if int(st[st.rindex(')')+2:].split()[2])==pgid and st[st.rindex(')')+2]!='Z': out.append(int(pid))
-                except (OSError,ValueError,IndexError): continue
-            return out
-        def _rb_killtree(ps,wait=1):
-            """Tue tout le groupe d'un enfant de _rb_popen (SIGKILL), même si le chef est déjà sorti : ni wrapper ni borg
-            orphelin. Seulement si le groupe a encore des membres (un groupe vide n'est jamais visé : PID réutilisé) ; repli
-            ps.kill() pour un enfant qui n'est pas chef de groupe. Attend au plus `wait` s que le groupe soit vide ; rend
-            les survivants. Fenêtre courte exprès : un SIGKILL tue en quelques ms, alors qu'un orphelin non tué (wrapper en
-            sleep de _rb_kill : ~2,5 s restantes) finirait seul dans une fenêtre longue et ne serait jamais vu."""
-            if _rb_group(ps.pid):
-                with contextlib.suppress(ProcessLookupError,PermissionError): os.killpg(ps.pid,signal.SIGKILL)
-            if ps.poll() is None: ps.kill()
-            with contextlib.suppress(subprocess.TimeoutExpired): ps.wait(10)
-            t0=time.monotonic()
-            while (left:=_rb_group(ps.pid)) and time.monotonic()-t0<wait: time.sleep(0.1)
-            return left
         def _rb_procs(needle):
             """Processus (hors celui-ci) dont la ligne de commande contient `needle` (wrapper, dépôt du test)."""
             out=[]
@@ -10356,7 +10631,7 @@ def codec_selftest(pattern=None,list_only=False):
             borg=shutil.which('borg'); saved=dict(os.environ); errs=[]; placed={}
             me=os.path.realpath(__file__)
             def run(way,cmd,env):
-                r=subprocess.run(cmd,env=env,capture_output=True,text=True,timeout=120)
+                r=_rb_run(cmd,120,env=env)
                 if r.returncode not in (0,1): errs.append(f"{way} {os.path.basename(cmd[0])} {cmd[1:3]} : code {r.returncode} {(r.stdout+r.stderr)[-200:]!r}")
             def rc_for(way,repo,w):
                 rc=os.path.join(d,way+'.rc')
@@ -10435,6 +10710,196 @@ def codec_selftest(pattern=None,list_only=False):
                              f"{bad[:5]} (bac à sable attendu non vide) ; {good[5]!r}")
             return ok
         _rbc("harnais vrai borg : wrapper réécrit pendant qu'une copie tourne -> export jamais sauté (bac à sable vide)",_rb_wrapper_rewrite)
+        def _rb_signals():
+            """1.0.160 (story 23, A32) : selftest imbriqué (processus à part) dont un contrôle a lancé un enfant long dans sa
+            propre session ; SIGTERM puis SIGHUP au selftest -> l'enfant est tué (gestionnaire -> KeyboardInterrupt ->
+            finally -> groupes de _rb_live tués). Témoin : SIGKILL (aucun finally possible) -> l'enfant survit (puis tué
+            ici). Fenêtre de 1 s : l'enfant dort 60 s, il ne disparaît jamais seul pendant l'attente."""
+            me=os.path.realpath(__file__); res={}; td=os.path.join(tmp,'sig-tmp'); os.makedirs(td,exist_ok=True)
+            for name,sg in (('SIGTERM',signal.SIGTERM),('SIGHUP',signal.SIGHUP),('SIGKILL',signal.SIGKILL)):
+                mk=os.path.join(td,f'enfant-{name}'); pid=None
+                ch=_rb_popen([sys.executable,me,'-c','CodecSelfTest','-f','^harnais enfant long'],stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,env=_rb_cli_env(BORGHELPERC_SELFTEST_SIGCHILD=mk,TMPDIR=td))
+                try:
+                    t0=time.monotonic()
+                    while not os.path.exists(mk) and time.monotonic()-t0<60 and ch.poll() is None: time.sleep(0.05)
+                    pid=int(open(mk).read()); time.sleep(0.2)
+                    os.kill(ch.pid,sg); ch.wait(30)
+                    t1=time.monotonic(); alive=bool(_rb_group(pid))
+                    while alive and time.monotonic()-t1<1: time.sleep(0.05); alive=bool(_rb_group(pid))
+                    res[name]=alive
+                except (OSError,ValueError,subprocess.TimeoutExpired) as e: res[name]=f"{type(e).__name__}: {e}"
+                finally:
+                    _rb_killtree(ch)
+                    if pid:
+                        with contextlib.suppress(ProcessLookupError,PermissionError): os.killpg(pid,signal.SIGKILL)
+            ok=res=={'SIGTERM':False,'SIGHUP':False,'SIGKILL':True}
+            if not ok: print(f"  signaux : enfant encore vivant après {res} (attendu : mort sur SIGTERM et SIGHUP, vivant sur SIGKILL)")
+            return ok
+        check("harnais signaux : SIGTERM et SIGHUP au selftest -> enfants de leur propre session tués ; témoin SIGKILL",_rb_signals)
+        def _rb_run_timeout():
+            """1.0.160 (story 23, A32) : _rb_run sur un enfant dont un petit-fils tient le tube -> TimeoutExpired en ~1 s,
+            groupe vide. Témoin : un kill de l'enfant seul (ce que fait subprocess.run sur délai dépassé) laisse vivants
+            les descendants (dorment 30 s : jamais finis seuls pendant l'attente de 1 s)."""
+            pf=os.path.join(tmp,'delai.pid')
+            cmd=['bash','-c',f'echo $$ > {shlex.quote(pf)}; echo debut; sleep 30 & sleep 30']   # $$ : chef du groupe
+            t0=time.monotonic(); kept_out=''
+            try: _rb_run(cmd,1); to=False
+            except subprocess.TimeoutExpired as e: to=True; kept_out=e.stdout or ''
+            dt=time.monotonic()-t0
+            try: left=_rb_group(int(open(pf).read()))
+            except (OSError,ValueError) as e: left=[f"pid illisible : {e}"]
+            cmd=['bash','-c','sleep 30 & sleep 30']
+            w=_rb_popen(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            try:
+                time.sleep(1); w.kill(); w.wait(10); time.sleep(0.3)
+                orphans=_rb_group(w.pid)
+            finally: _rb_killtree(w)
+            ok=to and dt<3 and not left and bool(orphans) and 'debut' in kept_out
+            if not ok: print(f"  délai : TimeoutExpired {to}, {dt:.1f} s, restants {left}, sortie gardée {kept_out!r} ; témoin (enfant seul tué) orphelins {orphans}")
+            return ok
+        check("harnais délai : _rb_run tue tout le groupe sur délai dépassé, sortie gardée ; témoin kill de l'enfant seul",_rb_run_timeout)
+        def _rb_raises_interrupt():
+            """1.0.160 (story 23, A32) : raises() laisse passer KeyboardInterrupt (Ctrl-C, SIGTERM/SIGHUP du selftest)."""
+            def boom(): raise KeyboardInterrupt("signal 15")
+            try: raises(ValueError,boom); return False
+            except KeyboardInterrupt: return True
+        check("harnais interruption : raises laisse passer KeyboardInterrupt",_rb_raises_interrupt)
+        def _cleanup_sandbox():
+            """1.0.160 (story 23, A30) : repérage et BorgCleanup sur un dossier personnel et un CACHE_DIR de bac à sable
+            (jamais les vraies entrées). borg : dépôt local absent (+ cache, + clé) et cache seul (+ clé) signalés ;
+            présent, configuré absent (chemin ou file://), distant, sans location, accès refusé, clé illisible : jamais.
+            borgHelper : fichiers de nicks retirés (régénérables, historique à part, tronc exact : n3-old n'est pas n3) ;
+            DB_NAME partagé, nick actuel, verrou de dépôt actuel, verrou tenu (ce processus ou un autre, et tout son tronc),
+            fichiers étrangers : jamais. Aperçu : rien touché ; -y refusé -> code 2, rien touché ; -y : régénérable, clé et
+            son emplacement gardés (cache seul : config gardé), hors notice ; -y --keys --history : le reste ; dépôt
+            réapparu : gardé ; suppression en échec : code 1. CLI : -y avec réponse sur l'entrée standard, notices de
+            Status et Report texte (pas en -j, pas pour borgHelperWWW), --keys refusé hors BorgCleanup."""
+            root=os.geteuid()==0   # root ignore le mode 000 : cas « accès refusé » et « échec » sans objet
+            d=os.path.join(tmp,'cleanup'); H=os.path.join(d,'home'); cd=os.path.join(d,'cache'); rc=os.path.join(d,'clrc')
+            sec=os.path.join(H,'.config','borg','security'); cac=os.path.join(H,'.cache','borg'); ky=os.path.join(H,'.config','borg','keys')
+            for x in (sec,cac,ky,cd,os.path.join(d,'present'),os.path.join(d,'repo-a'),os.path.join(d,'ferme')): os.makedirs(x)
+            I={k:(c*64) for k,c in (('A','a'),('P','b'),('C','c'),('R','d'),('U','e'),('X','f'),('D','0'),('F','1'))}
+            locs={'A':os.path.join(d,'gone-a'),'P':os.path.join(d,'present'),'C':os.path.join(d,'repo-n3'),'R':'ssh://u@h/r',
+                  'D':os.path.join(d,'ferme','repo'),'F':os.path.join(d,'repo-n5')}   # D : accès refusé ; F : rc en file://
+            for k,loc in locs.items():
+                os.makedirs(os.path.join(sec,I[k]))
+                with open(os.path.join(sec,I[k],'location'),'w') as f: f.write(loc)
+                os.makedirs(os.path.join(cac,I[k])); open(os.path.join(cac,I[k],'chunks'),'w').write('x'*100)
+            os.makedirs(os.path.join(sec,I['U']))                                   # entrée sans location : ignorée
+            os.makedirs(os.path.join(cac,I['X']))                                   # cache seul, dépôt disparu, avec clé
+            with open(os.path.join(cac,I['X'],'config'),'w') as f: f.write(f"[cache]\nprevious_location = {os.path.join(d,'gone-x')}\n")
+            open(os.path.join(cac,I['X'],'chunks'),'w').write('x'*100)
+            for nm,k in (('gone_a','A'),('gone_x','X')):
+                with open(os.path.join(ky,nm),'w') as f: f.write(f"BORG_KEY {I[k]}\nxxx\n")
+            with open(os.path.join(ky,'illisible'),'w') as f: f.write("pas une clé\n")
+            common="BORG_PASSPHRASE=pw\nSER_LOGIN=x\nGLOB_ARCH=t-*\nBORG_ARCHNAME=t\nBORG_ROOTBKP=/nulle/part\nDB_ENCRYPT=false\nEXCLUDE=--exclude-caches\n"
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={cd}\n\n[n1]\nBORG_REPO={os.path.join(d,'repo-a')}\nDB_NAME=shared\nSER_NAME=n1\n{common}\n"
+                        f"[n2]\nBORG_REPO={os.path.join(d,'repo-a')}\nDB_NAME=shared\nSER_NAME=n2\n{common}\n"
+                        f"[n3]\nBORG_REPO={locs['C']}\nSER_NAME=n3\n{common}\n[n4]\nBORG_REPO=ssh://u@h/r\nSER_NAME=n4\n{common}\n"
+                        f"[n5]\nBORG_REPO=file://{locs['F']}\nSER_NAME=n5\n{common}")
+            os.chmod(rc,0o600)
+            b=BorgHelper(cfgfile=rc,cache_dir=cd); pre=b.db.db_prefix
+            os.chmod(os.path.join(d,'ferme'),0)
+            other=_rb_popen(['sleep','120'])   # porteur vivant d'un autre processus
+            dead=str(2**22+7)                   # au-delà de pid_max : jamais un processus vivant
+            files={'keep':[f"{pre}-shared-diff.db",f"{pre}-n3-history.db",f"{pre}-n3-index-last.json",
+                           f"{pre}-{b.db._repo_key('n1')}-priority.lock",'notes.txt','autre-gone-diff.db'],
+                   'regen':[f"{pre}-gone-diff.db",f"{pre}-gone-diff.db-wal",f"{pre}-gone-cache.db",f"{pre}-gone-index-last.json",
+                            f"{pre}-vieux-index-running.lock",f"{pre}-vieux-report-running.lock",f"{pre}-n3-old-diff.db"],
+                   'hist':[f"{pre}-gone-history.db"],
+                   'held':[f"{pre}-vieux2-priority.lock.{os.getpid()}",f"{pre}-vieux3-index-running.lock",f"{pre}-vieux3-diff.db"]}
+            content={f"{pre}-vieux2-priority.lock.{os.getpid()}":str(os.getpid()),f"{pre}-vieux3-index-running.lock":str(other.pid)}
+            for k,names in files.items():
+                for n in names:
+                    with open(os.path.join(cd,n),'w') as f: f.write(content.get(n,dead if n.endswith('.lock') else 'x'*10))
+            tree=lambda: sorted(os.path.relpath(os.path.join(r,f),d) for top in (H,cd) for r,_ds,fs in os.walk(top) for f in fs)
+            gone=lambda rel: not os.path.exists(os.path.join(d,rel))
+            yes=lambda _p,_w: True
+            try:
+                rc0=os.path.join(d,'vide-rc')
+                with open(rc0,'w') as f: f.write(f"[DEFAULT]\nCACHE_DIR={cd}\n")
+                os.chmod(rc0,0o600)
+                try: empty=BorgHelper(cfgfile=rc0,cache_dir=cd).cleanup_scan(home=H)=={'borg':[],'bh':[]}   # rc sans nick : rien
+                except (Exception,SystemExit) as e: empty=f"{type(e).__name__}: {e}"
+                sc=b.cleanup_scan(home=H); sm=b.cleanup_summary(sc)
+                ids=sorted(x['id'] for x in sc['borg']); bhn=sorted(os.path.basename(x['path']) for x in sc['bh'])
+                note=b.cleanup_notice(home=H) or ''
+                t0=tree(); o=io.StringIO()
+                asked=[]
+                with contextlib.redirect_stderr(o):   # l'aperçu ne demande jamais rien
+                    r0=b.borg_cleanup(home=H,ask=lambda _p,_w: asked.append(_p) or False)
+                    rno=b.borg_cleanup(confirm=True,home=H,ask=lambda _p,_w: False)
+                same=tree()==t0 and rno==2 and not asked
+                with contextlib.redirect_stderr(o): r1=b.borg_cleanup(confirm=True,home=H,ask=yes)
+                step1=(all(gone(os.path.relpath(p,d)) for p in (os.path.join(cac,I['A']),os.path.join(cac,I['X'],'chunks')))
+                       and os.path.isdir(os.path.join(sec,I['A'])) and os.path.exists(os.path.join(cac,I['X'],'config'))
+                       and all(gone(os.path.join('cache',n)) for n in files['regen'])
+                       and os.path.exists(os.path.join(ky,'gone_a')) and all(os.path.exists(os.path.join(cd,n)) for n in files['hist']))
+                sm1=b.cleanup_summary(b.cleanup_scan(home=H))   # clés gardées : hors notice
+                quiet=(sm1['borg_entries'],sm1['keys'],sm1['kept_keys'])==(0,0,2)
+                with contextlib.redirect_stderr(o):   # « o » mais pas « oui » : perte définitive refusée, rien touché
+                    rpart=b.borg_cleanup(confirm=True,keys=True,history=True,home=H,ask=lambda _p,w: w=='o')
+                half=rpart==2 and os.path.exists(os.path.join(ky,'gone_a')) and all(os.path.exists(os.path.join(cd,n)) for n in files['hist'])
+                with contextlib.redirect_stderr(o): r2=b.borg_cleanup(confirm=True,keys=True,history=True,home=H,ask=yes)
+                step2=(not os.path.exists(os.path.join(ky,'gone_a')) and not os.path.exists(os.path.join(ky,'gone_x'))
+                       and not os.path.exists(os.path.join(sec,I['A'])) and not os.path.exists(os.path.join(cac,I['X']))
+                       and all(gone(os.path.join('cache',n)) for n in files['hist']))
+                # dépôt qui réapparaît entre le repérage et la suppression (disque remonté) : revérifié, gardé
+                ys=os.path.join(sec,'8'*64); os.makedirs(ys)
+                with open(os.path.join(ys,'location'),'w') as f: f.write(os.path.join(d,'gone-y'))
+                orig=b.cleanup_scan
+                def _scan_puis_retour(home=None):
+                    r=orig(home); os.makedirs(os.path.join(d,'gone-y')); return r
+                with mock.patch.object(b,'cleanup_scan',_scan_puis_retour), contextlib.redirect_stderr(o):
+                    r3=b.borg_cleanup(confirm=True,home=H,ask=yes)
+                back=os.path.isdir(ys) and 'est réapparu' in o.getvalue() and r3==0
+                # suppression en échec -> code 1, [ERREUR]
+                if root: failed=True
+                else:
+                    fx=os.path.join(cd,f"{pre}-echec-diff.db"); open(fx,'w').close(); os.chmod(cd,0o500); o2=io.StringIO()
+                    try:
+                        with contextlib.redirect_stderr(o2): r4=b.borg_cleanup(confirm=True,home=H,ask=yes)
+                    finally: os.chmod(cd,0o700)
+                    failed=r4==1 and '[ERREUR]' in o2.getvalue() and os.path.exists(fx); os.unlink(fx)
+                kept=(all(os.path.exists(os.path.join(cd,n)) for n in files['keep']+files['held'])
+                      and all(os.path.isdir(os.path.join(sec,I[k])) for k in ('P','C','R','U','F')+(() if root else ('D',)))
+                      and os.path.exists(os.path.join(ky,'illisible')))
+                # CLI (nouvelle entrée disparue) : aperçu, -y confirmé sur l'entrée standard, notices, option refusée ailleurs
+                def _new(i,name):
+                    os.makedirs(os.path.join(sec,i))
+                    with open(os.path.join(sec,i,'location'),'w') as f: f.write(os.path.join(d,name))
+                _new('9'*64,'gone-cli')
+                me=os.path.realpath(__file__); cenv=_rb_cli_env(BORGHELPERC_CLEANUP_HOME=H)
+                c1=_rb_run([me,'-C',rc,'-c','BorgCleanup'],120,env=cenv)
+                c2=_rb_run([me,'-C',rc,'-c','Status','-n','n3'],120,env=cenv)
+                c3=_rb_run([me,'-C',rc,'-c','Status','-n','n3','--keys'],120,env=cenv)
+                c4=_rb_run([me,'-C',rc,'-c','Report','-n','n3','-o'],120,env=cenv)
+                c5=_rb_run([me,'-C',rc,'-c','Report','-n','n3','-o','-j'],120,env=cenv)
+                c6=_rb_run([me,'-C',rc,'-c','Status','-n','n3'],120,env=_rb_cli_env(BORGHELPERC_CLEANUP_HOME=H,BORGHELPERC_NO_CLEANUP_NOTICE='1'))
+                c7=_rb_run([me,'-C',rc,'-c','BorgCleanup','-y'],120,env=cenv,input='')        # pas de réponse : refus
+                c9=_rb_run([me,'-C',rc,'-c','BorgCleanup','-D','-y'],120,env=cenv,input='o\n')   # -D l'emporte : aperçu
+                there=os.path.isdir(os.path.join(sec,'9'*64))
+                c8=_rb_run([me,'-C',rc,'-c','BorgCleanup','-y'],120,env=cenv,input='o\n')
+                O=lambda c: c.stdout+c.stderr; N='Nettoyage possible : 1 entrée(s) borg'
+                cli=(c1.returncode==0 and os.path.join(d,'gone-cli') in O(c1) and 'Aperçu seulement' in O(c1)
+                     and N in O(c2) and 'borgHelper -c BorgCleanup' in O(c2) and 'fichier(s) borgHelper' not in O(c2)
+                     and c3.returncode!=0 and 'réservé à BorgCleanup' in O(c3) and N in O(c4) and 'Nettoyage' not in O(c5)
+                     and 'Nettoyage' not in O(c6) and c7.returncode==2 and there and 'Rien supprimé' in O(c7)
+                     and c9.returncode==0 and 'Aperçu seulement' in O(c9) and 'Supprimer' not in O(c9)
+                     and c8.returncode==0 and not os.path.exists(os.path.join(sec,'9'*64)))
+            finally:
+                os.chmod(os.path.join(d,'ferme'),0o700); _rb_killtree(other)
+            ok=(ids==sorted([I['A'],I['X']]) and bhn==sorted(files['regen']+files['hist'])
+                and (sm['borg_entries'],sm['keys'],sm['bh_files'],sm['history'])==(2,2,7,1)
+                and all(t in note for t in ('2 entrée(s) borg','2 clé(s)','7 fichier(s) borgHelper','1 historique(s)'))
+                and (r0,r1,r2)==(0,0,0) and same and step1 and quiet and step2 and kept and cli and back and failed and empty is True and half)
+            if not ok: print(f"  nettoyage : ids {ids} bh {bhn} résumé {sm} notice {note!r} codes {(r0,r1,r2)} aperçu/refus intacts {same} "
+                             f"-y {step1} hors notice {quiet} {sm1} seconde confirmation {half} --keys --history {step2} gardés {kept} réapparu {back} échec {failed} rc vide {empty} "
+                             f"CLI {cli} {[c.returncode for c in (c1,c2,c3,c4,c5,c6,c7,c8,c9)]} {O(c7)[-200:]!r} {O(c8)[-200:]!r} {O(c4)[-200:]!r}")
+            return ok
+        check("nettoyage borg : restes de dépôts disparus et de nicks retirés — aperçu (-D), -y confirmé, --keys, --history, notices (bac à sable)",_cleanup_sandbox)
         ix_dir=os.path.join(tmp,'tranches')
         def _ix_setup():
             """Vrai dépôt, 6 archives '{fqdn}-t-*' (fichiers modifiés entre chaque), borg appelé via un script qui
@@ -10849,7 +11314,7 @@ def codec_selftest(pattern=None,list_only=False):
             """1.0.145 (story 8 A3) : CLI Index — erreur (période inconnue) -> code 1 ; rien à faire -> 0 ; Index déjà en
             cours sur le dépôt -> 0."""
             ctx=_ix_ctx(); _ix_slow(ctx,None,0); me=os.path.realpath(__file__); b=_ix_bh(ctx,'cache')
-            run=lambda *a: subprocess.run([me,'-C',ctx['rc'],'-c','Index',*a],capture_output=True,text=True,timeout=300,env=_rb_cli_env())
+            run=lambda *a: _rb_run([me,'-C',ctx['rc'],'-c','Index',*a],300,env=_rb_cli_env())
             r_err=run('-n','ixf','-b','inconnue')
             r_ok=run('-n','ixf')
             lp=b.db._index_running_lock_path('ixf'); _ix_fake_lock(lp)
@@ -11054,7 +11519,7 @@ def codec_selftest(pattern=None,list_only=False):
             ctx=_ix_ctx(); _ix_slow(ctx,None,0); me=os.path.realpath(__file__); b=_ix_bh(ctx,'cache'); nk='ixf'
             http=_rb_cli_env(BORGHELPER_VIA='http')
             def cli(*a,env=None,n=nk):
-                return subprocess.run([me,'-C',ctx['rc'],'-c','Index','-n',n,*a],capture_output=True,text=True,timeout=300,
+                return _rb_run([me,'-C',ctx['rc'],'-c','Index','-n',n,*a],300,
                                       env=env or _rb_cli_env())
             last=lambda n=nk: b.db.read_index_last(n) or {}
             def tz(x):
@@ -11216,12 +11681,12 @@ def codec_selftest(pattern=None,list_only=False):
         def _ix_cli_usage():
             """CLI : -t avec -S -> erreur d'usage (code non nul) ; -T inconnu -> erreur ; -n a,b -t 3 : budget par nick."""
             ctx=_ix_ctx(); me=os.path.realpath(__file__)
-            r1=subprocess.run([me,'-C',ctx['rc'],'-c','Index','-n','ix','-t','1m','-S'],capture_output=True,text=True,timeout=60,env=_rb_cli_env())
-            r2=subprocess.run([me,'-C',ctx['rc'],'-c','Index','-n','ix','-T','tout'],capture_output=True,text=True,timeout=60,env=_rb_cli_env())
+            r1=_rb_run([me,'-C',ctx['rc'],'-c','Index','-n','ix','-t','1m','-S'],60,env=_rb_cli_env())
+            r2=_rb_run([me,'-C',ctx['rc'],'-c','Index','-n','ix','-T','tout'],60,env=_rb_cli_env())
             _ix_slow(ctx,'diff',30)
             try:
                 t0=time.monotonic()
-                r3=subprocess.run([me,'-C',ctx['rc'],'-c','Index','-n','ixb,ixc','-T','diff','-t','3'],capture_output=True,text=True,timeout=120,env=_rb_cli_env())
+                r3=_rb_run([me,'-C',ctx['rc'],'-c','Index','-n','ixb,ixc','-T','diff','-t','3'],120,env=_rb_cli_env())
                 dt=time.monotonic()-t0
             finally: _ix_slow(ctx,None,0)
             both=r3.stdout.count('construction partielle')==2
@@ -11735,7 +12200,7 @@ def codec_selftest(pattern=None,list_only=False):
             ctx=_rb_ctx(); _ix_slow(ctx,None,0); b=_rb_bh('cache'); me=os.path.realpath(__file__)
             env=_rb_cli_env()
             def cli(*a):
-                p=subprocess.run([me,'-C',ctx['rc'],'-c',*a],capture_output=True,text=True,timeout=300,env=env)
+                p=_rb_run([me,'-C',ctx['rc'],'-c',*a],300,env=env)
                 return p.returncode,p.stdout+p.stderr
             _q_run(b.index,'rbs1')
             c1,o1=cli('Index','-n','rbs1','--rebuild')
@@ -11887,7 +12352,7 @@ def codec_selftest(pattern=None,list_only=False):
             me=os.path.realpath(__file__)
             cenv=_rb_cli_env(bb)   # jamais d'envoi Sentry réel, jamais de passphrase d'exécution héritée
             def cli(*a,out_only=False,cfgf=None):
-                p=subprocess.run([me,'-C',cfgf or rc,'-c',*a],capture_output=True,text=True,timeout=300,env=cenv)
+                p=_rb_run([me,'-C',cfgf or rc,'-c',*a],300,env=cenv)
                 return p.returncode,(p.stdout if out_only else p.stdout+p.stderr)
             def logged(clear=True):
                 try:
@@ -12104,7 +12569,7 @@ def codec_selftest(pattern=None,list_only=False):
             cenv=_rb_cli_env(bb)   # jamais de Sentry réel ni de passphrase héritée
             me=os.path.realpath(__file__)
             def cli(*a):
-                p=subprocess.run([me,'-C',rc,'-c',*a],capture_output=True,text=True,timeout=300,env=cenv)
+                p=_rb_run([me,'-C',rc,'-c',*a],300,env=cenv)
                 return p.returncode,p.stdout+p.stderr
             ci,oi=cli('Index','-n','inr')
             cd_,dt=cli('DiffTop','-n','inr','-b','t-1,t-2'); ct,it=cli('IdxTop','-n','inr')
@@ -12128,7 +12593,12 @@ def codec_selftest(pattern=None,list_only=False):
                       and {'removed fifo','removed chrdev','removed blkdev','removed link','removed directory','removed'}<=set(_DIFF_REMOVED_TYPES)
                       and {'added fifo','added chrdev','added blkdev','added link','added directory','added'}<=set(_DIFF_ADDED_TYPES))
     finally:
+        for _sg,_old in saved_sigs.items():   # None : gestionnaire posé hors de Python -> défaut
+            with contextlib.suppress(ValueError,TypeError): signal.signal(_sg,_old if _old is not None else signal.SIG_DFL)
+        for _ps in _rb_live: _rb_killtree(_ps)   # 1.0.160 : aucun groupe d'enfant laissé (interruption comprise)
         shutil.rmtree(tmp,ignore_errors=True)
+        if saved_cleanup_home is None: os.environ.pop('BORGHELPERC_CLEANUP_HOME',None)
+        else: os.environ['BORGHELPERC_CLEANUP_HOME']=saved_cleanup_home
         _DB_CFG_READERS.clear(); _DB_CFG_READERS.update(saved_readers)
         _DEK_CACHE.clear(); _DEK_CACHE.update(saved_deks)
         _CODEC_CACHE.clear(); _CODEC_CACHE.update(saved_codecs)
@@ -12517,7 +12987,7 @@ def _cli_main():
         _sentry_init(sentryid)
 
     try:
-        opts,args=getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILC:FSN:ox:DP:RyKXt:T:",["help","rebuild"])
+        opts,args=getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILC:FSN:ox:DP:RyKXt:T:",["help","rebuild","keys","history"])
     except getopt.GetoptError as err:
         print(err); usage(); sys.exit(2)
     if args:
@@ -12565,7 +13035,7 @@ def _cli_main():
            'filehist':'CcdnfbBj','cacheinfo':'Ccdn','cacheclean':'Ccdn','duidx':'CcdnfbBsjR',
            'idxtop':'CcdnNpj','difftop':'CcdnNpbj','idxpurge':'CcdnxD','treehist':'CcdnfbBjX',
            'treefind':'Ccdnfmj','dbencrypt':'CcdnDy','dbdecrypt':'CcdnDy','dbrekey':'Ccdny','dbstatus':'Ccdn',
-           'repohistory':'Ccdnj','archivehistory':'Ccdnj','status':'Ccdnj'}
+           'repohistory':'Ccdnj','archivehistory':'Ccdnj','status':'Ccdnj','borgcleanup':'CcdyD'}
     optab={k:v+'P' for k,v in optab.items()}
 
     if cmd is None or cmd not in optab.keys():
@@ -12573,8 +13043,11 @@ def _cli_main():
 
     options={}; nick=socket.gethostname()
     for opt,arg in opts:
-        if opt=='--rebuild':   # seule option longue de commande (1.0.143) : Index seulement
+        if opt=='--rebuild':   # option longue de commande (1.0.143) : Index seulement
             if cmd!='index': printer("--rebuild : réservé à Index"); usage(cmd)
+            options[opt]=arg; continue
+        if opt in ('--keys','--history'):   # 1.0.160 : BorgCleanup seulement
+            if cmd!='borgcleanup': printer(f"{opt} : réservé à BorgCleanup"); usage(cmd)
             options[opt]=arg; continue
         if opt[1] not in optab[cmd]:
             printer("step2"+opt[1]); usage(cmd)
@@ -12635,6 +13108,9 @@ def _cli_main():
             errcmd=bh.report(nick,htrep=True,maxp=_maxp,debug=debug)
         else:
             errcmd=bh.report(nick,maxp=_maxp,debug=debug)
+        if '-j' not in options and '-l' not in options:   # 1.0.160 : texte seulement (JSON et HTML inchangés)
+            _note=bh.cleanup_notice()
+            if _note: printer(_note)
         sys.exit(errcmd)
     elif cmd=='diffbkp':
         if '-b' not in options:
@@ -12756,6 +13232,9 @@ def _cli_main():
             bh.archive_history(n,debug=debug,as_json=('-j' in options))
     elif cmd=='status':
         bh.status(nick,debug=debug,as_json=('-j' in options))
+        if '-j' not in options:   # 1.0.160 : notice de nettoyage, texte et CLI seulement
+            _note=bh.cleanup_notice()
+            if _note: printer(_note)
     elif cmd=='difftop':
         _depth=int(options.get('-p','3'))
         _topn=int(options.get('-N','10'))
@@ -12793,6 +13272,9 @@ def _cli_main():
         _nicks=nick.split(',') if nick and nick!='ALL' else bh.borg.cfgreadnicks(debug).split(',')
         for n in _nicks:
             bh.db_status(n,debug=debug)
+    elif cmd=='borgcleanup':   # 1.0.160 (story 23) : seule voie de suppression (jamais borgHelperWWW)
+        # -D : aperçu explicite (comme IdxPurge/DbEncrypt), l'emporte sur -y — rien supprimé, aucune question
+        sys.exit(bh.borg_cleanup(confirm='-y' in options and '-D' not in options,keys='--keys' in options,history='--history' in options))
     else:
         printer("Mais comment on peut en arriver la ?"); usage()
 

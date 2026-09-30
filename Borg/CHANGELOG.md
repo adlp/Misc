@@ -1,5 +1,31 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.160 / borgHelperWWW 1.28.5 / UI 1.19.5 — nettoyage des restes borg, signaux du selftest — 2026-09-30
+
+Chantier « reconstruction progressive », story 23 (actions de rétrospective A30, demande de l'utilisateur, et A32).
+
+- **Nouvelle commande `BorgCleanup`** : restes de dépôts borg **locaux** disparus (hors rc) dans le dossier personnel
+  de l'utilisateur de borgHelper — entrées `~/.config/borg/security`, caches `~/.cache/borg`, clés
+  `~/.config/borg/keys` — et fichiers borgHelper de nicks retirés du rc dans `CACHE_DIR`. Aperçu par défaut ; `-y`
+  retire les entrées borg et les fichiers régénérables (`-D` : aperçu explicite, l'emporte sur `-y`) ; `--keys`
+  (irréversible) et `--history` (historique mesuré) à
+  part, avec confirmation sur l'entrée standard (« o », puis « oui » pour les clés et historiques ; sans réponse : rien
+  supprimé, code 2). Jamais un dépôt distant ou configuré (`~`, relatif et `file://` compris), jamais un fichier encore
+  produit par un nick (tronc exact ; dépôts et `DB_NAME` partagés), jamais un verrou tenu ni les fichiers de son nick ;
+  rc vide ou illisible : rien ; chemin inaccessible ou montage bloqué (2 s) compté présent ; emplacements et verrous
+  revérifiés avant suppression ; clé gardée : son emplacement aussi, hors notice.
+  Mesuré sur cette machine : 26 entrées de dépôts locaux absents (6,3 Mo), toutes dans `/tmp`.
+- **Notice** : ligne finale de `Status` et `Report` en texte, en ligne de commande (JSON et HTML inchangés ; jamais
+  pour borgHelperWWW, qui pose `BORGHELPERC_NO_CLEANUP_NOTICE`) ; `GET /access` `borg_cleanup`
+  (nombres et tailles, jamais de chemin ; admin seulement quand les groupes sont actifs ; recalculé au plus toutes les
+  5 min) ; UI : bandeau sur la page des serveurs. Seule la CLI supprime.
+- **CodecSelfTest** : SIGTERM et SIGHUP pendant le selftest lèvent `KeyboardInterrupt` (les `finally` tournent) ; tous
+  les groupes d'enfants lancés sont tués en fin de selftest ; les 9 lancements de borgHelper avec délai passent par
+  `_rb_run`, qui tue tout le groupe (wrapper, borg) si le délai expire, en gardant la sortie ; `raises()` laisse passer
+  l'interruption ; registre élagué (jamais un `killpg` sur un PID réattribué). Gardes avec témoins (SIGKILL ; kill de
+  l'enfant seul). `Status`/`Report` et `/access` ne lisent jamais le vrai dossier borg pendant les selftests
+  (`BORGHELPERC_CLEANUP_HOME`).
+
 ## borgHelper 1.0.159 — wrapper atomique, tests de chargement des graphiques — 2026-09-30
 
 Chantier « reconstruction progressive », story 22 (actions de rétrospective A29, A31). Aucun changement du code de

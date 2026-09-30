@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.19.4 -->
+<!-- UI_VERSION: 1.19.5 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -133,6 +133,7 @@
       <p class="hint">Rapport hors-ligne (base SQLite uniquement, aucune passphrase requise pour cette liste).</p>
       <div id="machinesJump"></div>
       <div id="machinesError" class="error"></div>
+      <div id="borgCleanupNotice" class="hint" hidden></div>
       <div id="machinesList">Chargement…</div>
     </div>
 
@@ -458,6 +459,7 @@ const versionsReady=(async function loadFooterVersions(){
 // les nicks sans aucun droit hors des listes ET pour affiner les badges d'en-tête (applyBadges).
 async function loadMyAccess(){
   const r=await apiCall('GET','/access',{},false);
+  if(r.httpStatus===401 || r.httpStatus>=500 || r.exitcode!==undefined || !r.nicks) renderCleanupNotice(null);   // jamais un bandeau périmé
   if(r.httpStatus===401) return null;
   if(r.httpStatus>=500){
     // Cas volontaire (Story 1.1) : GROUPS_PATHS rendu ambigu dans .borghelperrc pendant que le
@@ -469,7 +471,25 @@ async function loadMyAccess(){
   if(r.exitcode!==undefined || !r.nicks) return null; // forme inattendue : ne pas casser l'affichage
   myAccess=r;
   applyBadges();
+  renderCleanupNotice();
   return r;
+}
+
+// Restes de dépôts borg disparus et fichiers de nicks retirés sur la machine du serveur (UI 1.19.5, borgHelperWWW
+// 1.28.5 : /access borg_cleanup, nombres et tailles seulement). Information seule : le nettoyage se fait en CLI.
+function cleanupNoticeText(c){
+  if(!c) return '';
+  const parts=[];
+  if(c.borg_entries) parts.push(`${c.borg_entries} entrée(s) borg de dépôts disparus (${_fmtBytes(c.borg_size||0)})`);
+  if(c.keys) parts.push(`${c.keys} clé(s) borg de ces dépôts`);
+  if(c.bh_files) parts.push(`${c.bh_files} fichier(s) borgHelper de nicks retirés (${_fmtBytes(c.bh_size||0)})`);
+  if(c.history) parts.push(`${c.history} historique(s) mesuré(s) de nicks retirés`);
+  return parts.length ? '🧹 Nettoyage possible sur le serveur : '+parts.join(', ')+' — aperçu en ligne de commande : borgHelper -c BorgCleanup' : '';
+}
+function renderCleanupNotice(c){
+  const el=document.getElementById('borgCleanupNotice'); if(!el) return;
+  const t=cleanupNoticeText(c===undefined ? (myAccess && myAccess.borg_cleanup) : c);
+  el.textContent=t; el.hidden=!t;
 }
 
 function getApiKey(){ return sessionStorage.getItem(SS_KEY)||''; }

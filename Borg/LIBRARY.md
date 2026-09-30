@@ -255,6 +255,21 @@ base déjà dans le mode cible). Les erreurs de chiffrement (`DbKeyError`, `DbMo
 interruption externe (kill, crash du process) laisse la base en `path_enc='migrating'`, reprise automatiquement par
 un nouvel appel de la **même** méthode sur le même nick.
 
+### Restes de dépôts disparus et de nicks retirés (depuis 1.0.160)
+
+```python
+scan = bh.cleanup_scan()                    # lecture seule : {'borg': [...], 'bh': [...]}, chemins compris
+bh.cleanup_summary(scan)                    # nombres et tailles seulement (borg_entries, keys, bh_files, history…)
+bh.cleanup_notice()                         # ligne de Status/Report, ou None — jamais d'exception
+bh.borg_cleanup()                           # aperçu imprimé (stderr), code 0
+bh.borg_cleanup(confirm=True)               # demande confirmation sur stdin, puis supprime le régénérable
+bh.borg_cleanup(confirm=True, keys=True, history=True, ask=lambda prompt, want: True)   # réponse fournie par l'appelant
+```
+
+`cleanup_scan(home=None)` : dossier personnel pwd par défaut, ou `BORGHELPERC_CLEANUP_HOME`. `borg_cleanup` rend 0, 1
+(suppression en échec) ou 2 (non confirmé). La notice n'est imprimée que par le CLI (`Status`, `Report` texte) ;
+`status()` n'imprime rien de plus. Critères et limites : README, `BorgCleanup`.
+
 ---
 
 ## Exemples — accès direct aux couches
