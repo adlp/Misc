@@ -3,7 +3,8 @@
 // Extrait les fonctions pures routePath/parseRoute/pageTitle de borgHelperWWW_ui.html et vérifie la
 // matrice d'adresses (analyse, adresses invalides, aller-retour d'encodage état -> adresse -> état) et
 // le titre de l'onglet de chaque page (UI >= 1.15.0). Puis, DOM et API simulés : badges, fin de Bkp, actions, carte,
-// et graphiques de la page Historique (tous construits, séries, archives supprimées, sans lignes, blocs HTML).
+// et graphiques de la page Historique (tous construits, séries, archives supprimées, sans lignes, blocs HTML ;
+// chargements croisés, rechargement, réponses en erreur, échec partiel, bibliothèque absente).
 //
 //   node borgHelperWWW_ui_test.js [chemin/vers/borgHelperWWW_ui.html]
 //
@@ -310,11 +311,16 @@ async ${grab('reloadMachineCard')}
       get textContent(){ return this._h; }, set textContent(t){ this._h=String(t); },
       querySelector(sel){ return sel==='.spinner' && this._h.includes('class="spinner"') ? {} : null; }});
   }};
-  const built=[], apiCalls=[]; let resp={};
-  const charts=new Function('cdom','hooks',`
+  // Faux Chart (story 22) : refuse un canvas encore utilisé, comme Chart.js (« Canvas is already in use ») ; compte les destroy().
+  // hooks.noChart : page sans bibliothèque (typeof Chart === 'undefined').
+  const built=[], apiCalls=[], live=new Set(), destroyed=[]; let resp={};
+  const mkCharts=noChart=>new Function('cdom','hooks',`
     const document={getElementById:id=>cdom.byId(id)};
-    class Chart{ constructor(canvas,cfg){ hooks.built.push({id:canvas.id,cfg}); } destroy(){} }
-    const apiCall=async(m,p,q)=>{ hooks.calls.push([m,p,q&&q.nick]); return hooks.resp()[p]; };
+    class FakeChart{ constructor(canvas,cfg){ if(hooks.live.has(canvas.id)) throw new Error('Canvas is already in use');
+      hooks.live.add(canvas.id); this.id=canvas.id; hooks.built.push({id:canvas.id,cfg}); }
+      destroy(){ hooks.live.delete(this.id); hooks.destroyed.push(this.id); } }
+    const Chart=hooks.noChart?undefined:FakeChart;
+    const apiCall=async(m,p,q)=>{ hooks.calls.push([m,p,q&&q.nick]); const r=hooks.resp(); return (r[q&&q.nick]||r)[p]; };
     ${grabLine('SPINNER')}
     ${grabLine('chartRepoSizeInstance')}
     ${grabConst('ARCHIVE_EXTRA_CHARTS')}
@@ -332,19 +338,21 @@ ${grab('_fadeFor')}
 ${grab('_prunedTitle')}
 ${grab('_renderArchiveSizeChart')}
 ${grab('_renderArchiveExtraChart')}
-    return {loadCharts,_safeRender,extra:ARCHIVE_EXTRA_CHARTS,SPINNER};`)(cdom,{built,calls:apiCalls,resp:()=>resp});
+    return {loadCharts,_safeRender,extra:ARCHIVE_EXTRA_CHARTS,SPINNER};`)(cdom,{built,live,destroyed,noChart,calls:apiCalls,resp:()=>resp});
+  const charts=mkCharts(false);
   const ok=rows=>({exitcode:0,httpStatus:200,stdout:JSON.stringify({rows}),stderr:''});
   const allIds=['chartRepoSize','chartPruneGain','chartArchiveSize',...charts.extra];
   eq('graphiques : chaque id a son bloc HTML (canvas et message)',
      allIds.filter(id=>!new RegExp('<canvas id="'+id+'"').test(markup)||!htmlIds.has(id+'Msg')),[]);
   const spinners=()=>allIds.filter(id=>{ const m=cdom.byId(id+'Msg'); return !m||(!m.hidden&&m.querySelector('.spinner')); });
   const tryLoad=async()=>{ try{ await charts.loadCharts('n'); return null; } catch(e){ return String(e); } };
-  resp={'/repohistory':ok([{updated_at:'t1',op:'bkp',unique_csize:100,total_size:300,total_csize:200},
-                           {updated_at:'t2',op:'prune',unique_csize:60,total_size:250,total_csize:150}]),
-        '/archivehistory':ok([{archive_date:'d1',original_size:1000,compressed_size:600,deduplicated_size:50,files_added:1,
-                               files_modified:2,files_removed:0,changed_during_backup:0,read_errors:0,duration:12,pruned:true},
-                              {archive_date:'d2',original_size:1100,compressed_size:650,deduplicated_size:40,files_added:0,
-                               files_modified:3,files_removed:1,changed_during_backup:0,read_errors:0,duration:15,pruned:false}])};
+  const repoRows=[{updated_at:'t1',op:'bkp',unique_csize:100,total_size:300,total_csize:200},
+                   {updated_at:'t2',op:'prune',unique_csize:60,total_size:250,total_csize:150}];
+  const archRows=k=>[{archive_date:'d1',original_size:1000*k,compressed_size:600,deduplicated_size:50,files_added:1,
+                      files_modified:2,files_removed:0,changed_during_backup:0,read_errors:0,duration:12,pruned:true},
+                     {archive_date:'d2',original_size:1100*k,compressed_size:650,deduplicated_size:40,files_added:0,
+                      files_modified:3,files_removed:1,changed_during_backup:0,read_errors:0,duration:15,pruned:false}];
+  resp={'/repohistory':ok(repoRows),'/archivehistory':ok(archRows(1))};
   const err1=await tryLoad();
   eq('graphiques avec lignes : sans exception, les 5 construits et eux seuls',[err1,built.map(b=>b.id).sort()],[null,[...chartIds].sort()]);
   eq('graphiques : /repohistory et /archivehistory demandés en GET pour le nick affiché',apiCalls.slice().sort(),
@@ -375,6 +383,56 @@ ${grab('_renderArchiveExtraChart')}
   eq('faux DOM : l\'indicateur de chargement de la page est bien reconnu',!!dm.querySelector('.spinner'),true);
   charts._safeRender(()=>{},['chartDuration']);
   eq('filet : rendu muet -> « Aucune donnée. » à la place du spinner',[dm.textContent,!!dm.querySelector('.spinner')],['Aucune donnée.',false]);
+  // Rechargement (story 22) : les instances précédentes sont détruites avant de redessiner, sinon Chart.js refuse le canvas.
+  resp={'/repohistory':ok(repoRows),'/archivehistory':ok(archRows(1))};
+  await tryLoad(); built.length=0; destroyed.length=0;
+  const err3=await tryLoad();
+  eq('rechargement avec lignes : sans exception, 5 destroy() puis 5 graphiques',[err3,destroyed.slice().sort(),built.length],
+     [null,[...chartIds].sort(),5]);
+  // Chargements qui se croisent : le premier (nick a) répond après le second (nick b) -> seul b est dessiné, a ignoré.
+  // Réponses par nick (a : 7x, b : 3x) : un dessin tardif de a se verrait à ses données, quel que soit l'ordre des appels.
+  let release; const gate=new Promise(r=>{ release=r; });
+  resp={a:{'/repohistory':gate.then(()=>ok(repoRows)),'/archivehistory':gate.then(()=>ok(archRows(7)))},
+        b:{'/repohistory':ok(repoRows),'/archivehistory':ok(archRows(3))}};
+  built.length=0; apiCalls.length=0; let e5=null;
+  try{ const first=charts.loadCharts('a'); await charts.loadCharts('b'); release(); await first; } catch(e){ e5=String(e); }
+  eq('chargements croisés : seul le dernier dessine, avec ses données, page finale propre',
+     [e5,built.length,cfgOf('chartArchiveSize').data.datasets[0].data,spinners(),
+      allIds.map(id=>!cdom.byId(id).hidden && cdom.byId(id+'Msg').hidden),apiCalls.filter(c=>c[2]==='b').length],
+     [null,5,[3000,3300],[],allIds.map(()=>true),2]);
+  // Erreurs de /repohistory et /archivehistory : un message d'erreur par graphique, rien construit, aucune exception.
+  for(const [name,r,want] of [['HTTP 500',{httpStatus:500,stdout:'',stderr:''},'HTTP 500'],
+      ['HTTP 502 avec code 0',{exitcode:0,httpStatus:502,stdout:'',stderr:''},'HTTP 502'],
+      ['code 0, stderr seul',{exitcode:0,httpStatus:200,stdout:'',stderr:'dépôt verrouillé'},'dépôt verrouillé'],
+      ['champ error',{exitcode:0,httpStatus:200,stdout:'{"error":"nick inconnu"}',stderr:''},'nick inconnu'],
+      ['sans champ rows',{exitcode:0,httpStatus:200,stdout:'{}',stderr:''},'Réponse inattendue'],
+      ['exitcode 1, sortie JSON lisible',{exitcode:1,httpStatus:200,stdout:'{"rows":[]}',stderr:'borg en échec'},'borg en échec'],
+      ['JSON illisible',{exitcode:0,httpStatus:200,stdout:'pas du json',stderr:''},'Réponse illisible'],
+      ['401',{httpStatus:401},'Session expirée — reconnectez-vous.']]){
+    resp={'/repohistory':r,'/archivehistory':r}; built.length=0;
+    const e=await tryLoad();
+    const shown=allIds.map(id=>{ const m=cdom.byId(id+'Msg'), c=cdom.byId(id);
+      return !m.hidden && m.className==='error' && m.textContent.includes(want) && c.hidden; });
+    eq('graphiques, réponse en erreur ('+name+') : message d\'erreur sur les cinq, rien construit, anciennes instances détruites',
+       [e,built.length,shown,spinners(),live.size],[null,0,allIds.map(()=>true),[],0]);
+  }
+  // Échec partiel : dépôt lisible, archives en erreur -> deux graphiques du dépôt, erreur sur les trois par archive.
+  resp={'/repohistory':ok(repoRows),'/archivehistory':{httpStatus:500,stdout:'',stderr:''}}; built.length=0;
+  const e6=await tryLoad();
+  eq('échec partiel : graphiques du dépôt dessinés, erreur sur ceux des archives',
+     [e6,built.map(b=>b.id).sort(),['chartArchiveSize',...charts.extra].map(id=>cdom.byId(id+'Msg').className==='error'
+       && !cdom.byId(id+'Msg').hidden)],[null,['chartPruneGain','chartRepoSize'],[true,true,true]]);
+  // Reprise après une erreur : les messages d'erreur disparaissent, les cinq canvas sont réaffichés.
+  resp={'/repohistory':ok(repoRows),'/archivehistory':ok(archRows(1))}; built.length=0;
+  const e7=await tryLoad();
+  eq('reprise après erreur : cinq graphiques, canvas visibles, messages masqués',
+     [e7,built.length,allIds.map(id=>!cdom.byId(id).hidden && cdom.byId(id+'Msg').hidden)],[null,5,allIds.map(()=>true)]);
+  // Bibliothèque absente (ni copie locale ni CDN) : message sur les cinq graphiques, rien construit.
+  resp={'/repohistory':ok(repoRows),'/archivehistory':ok(archRows(1))}; built.length=0;
+  let e4=null; try{ await mkCharts(true).loadCharts('n'); } catch(e){ e4=String(e); }
+  eq('bibliothèque de graphiques absente : message sur les cinq, rien construit, sans exception',
+     [e4,built.length,allIds.map(id=>{ const m=cdom.byId(id+'Msg'); return !m.hidden && m.className==='error' && cdom.byId(id).hidden
+       && m.textContent.startsWith('Bibliothèque de graphiques indisponible'); }),spinners()],[null,0,allIds.map(()=>true),[]]);
   console.log(fail?fail+' FAIL':'TOUT OK');
   process.exit(fail?1:0);
 })();

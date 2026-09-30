@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.158"
+Version="1.0.159"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -7316,7 +7316,7 @@ def codec_selftest(pattern=None,list_only=False):
                 buf=io.StringIO()
                 with mock.patch.object(shutil,'which',which), mock.patch.dict(globals(),{'_purge_run_mei':lambda *a,**k:0}), \
                      contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
-                    rc=codec_selftest(re.compile('^harnais vrai borg|^rapprochement réel'),list_only=lst)
+                    rc=codec_selftest(re.compile('^harnais vrai borg : BORG|^rapprochement réel'),list_only=lst)
                 out[lst]=(rc,buf.getvalue().splitlines())
             (r0,o0),(r1,o1)=out[False],out[True]
             pref=lambda o,p: sorted(x[len(p):].split(' :')[0] for x in o if x.startswith(p))
@@ -10247,7 +10247,7 @@ def codec_selftest(pattern=None,list_only=False):
         # lancé par boex sans BORG_EXE écrit dans le dossier personnel (~/.cache/borg, ~/.config/borg/security).
         # D'où : sous-processus -> _rb_env ; tout BorgHelper du selftest -> BORG_EXE=_rb_wrapper ; _rbc scrute ensuite
         # les dossiers de sécurité borg de l'utilisateur.
-        import shlex
+        import shlex,signal
         def _rb_env(bb,**kw):
             """Environnement d'un sous-processus borg ou borgHelper : os.environ sans aucune clé BORG_*, BORG_BASE_DIR du test,
             TMPDIR du selftest, BORG_RELOCATED_REPO_ACCESS_IS_OK, puis les clés propres au test."""
@@ -10265,11 +10265,49 @@ def codec_selftest(pattern=None,list_only=False):
         def _rb_wrapper(path,bb,pre='',mid=''):
             """Script BORG_EXE : lignes propres au test (pre : avant, mid : après l'isolation, pour un borg lancé sans exec ;
             chemins déjà entre guillemets), variables de dossier borg héritées retirées, BORG_BASE_DIR du test, exec du
-            borg — chemins entre guillemets. Seule isolation d'un borg lancé par boex (qui ne passe pas BORG_BASE_DIR)."""
-            with open(path,'w') as f:
+            borg — chemins entre guillemets. Seule isolation d'un borg lancé par boex (qui ne passe pas BORG_BASE_DIR).
+            1.0.159 (story 22, A29) : écrit à côté puis os.replace — jamais en place : bash lit un script par position,
+            une copie en cours (sleep, orpheline après un kill) reprendrait dans le nouveau contenu et sauterait l'export."""
+            with open(path+'.tmp','w') as f:
                 f.write("#!/bin/bash\n"+pre+"unset BORG_CACHE_DIR BORG_CONFIG_DIR BORG_SECURITY_DIR BORG_KEYS_DIR\n"
                         f"export BORG_BASE_DIR={shlex.quote(bb)}\n"+mid+f"exec {shlex.quote(shutil.which('borg'))} \"$@\"\n")
-            os.chmod(path,0o700)
+            os.chmod(path+'.tmp',0o700); os.replace(path+'.tmp',path)
+        def _rb_popen(cmd,**kw):
+            """borgHelper enfant destiné à être tué : son propre groupe de processus (wrapper et borg compris)."""
+            return subprocess.Popen(cmd,start_new_session=True,**kw)
+        def _rb_group(pgid):
+            """PID des processus du groupe `pgid` (champ 5 de /proc/<pid>/stat, après le nom entre parenthèses)."""
+            out=[]
+            for pid in os.listdir('/proc'):
+                if not pid.isdigit(): continue
+                try:
+                    with open(f'/proc/{pid}/stat') as f: st=f.read()
+                    if int(st[st.rindex(')')+2:].split()[2])==pgid and st[st.rindex(')')+2]!='Z': out.append(int(pid))
+                except (OSError,ValueError,IndexError): continue
+            return out
+        def _rb_killtree(ps,wait=1):
+            """Tue tout le groupe d'un enfant de _rb_popen (SIGKILL), même si le chef est déjà sorti : ni wrapper ni borg
+            orphelin. Seulement si le groupe a encore des membres (un groupe vide n'est jamais visé : PID réutilisé) ; repli
+            ps.kill() pour un enfant qui n'est pas chef de groupe. Attend au plus `wait` s que le groupe soit vide ; rend
+            les survivants. Fenêtre courte exprès : un SIGKILL tue en quelques ms, alors qu'un orphelin non tué (wrapper en
+            sleep de _rb_kill : ~2,5 s restantes) finirait seul dans une fenêtre longue et ne serait jamais vu."""
+            if _rb_group(ps.pid):
+                with contextlib.suppress(ProcessLookupError,PermissionError): os.killpg(ps.pid,signal.SIGKILL)
+            if ps.poll() is None: ps.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired): ps.wait(10)
+            t0=time.monotonic()
+            while (left:=_rb_group(ps.pid)) and time.monotonic()-t0<wait: time.sleep(0.1)
+            return left
+        def _rb_procs(needle):
+            """Processus (hors celui-ci) dont la ligne de commande contient `needle` (wrapper, dépôt du test)."""
+            out=[]
+            for pid in os.listdir('/proc'):
+                if not pid.isdigit() or int(pid)==os.getpid(): continue
+                try:
+                    with open(f'/proc/{pid}/cmdline','rb') as f: cl=f.read().replace(b'\0',b' ').decode(errors='replace')
+                except OSError: continue
+                if needle in cl: out.append(f"{pid} {cl[:120]}")
+            return out
         def _rb_user_sec_dirs():
             """Dossiers de sécurité borg de l'utilisateur, relevés avant tout contrôle : dossier personnel (pwd — celui d'un
             borg lancé par boex, sans HOME), HOME, XDG_CONFIG_HOME, BORG_BASE_DIR / BORG_CONFIG_DIR / BORG_SECURITY_DIR."""
@@ -10356,6 +10394,47 @@ def codec_selftest(pattern=None,list_only=False):
                              f"BORG_BASE_DIR du chemin {placed}")
             return ok
         _rbc("harnais vrai borg : BORG_* factices de l'utilisateur jamais écrits (sous-processus, wrapper, boex, CLI), dossier borg de l'utilisateur intact",_rb_isolation)
+        def _rb_wrapper_rewrite():
+            """1.0.159 (story 22, A29) : un wrapper réécrit par _rb_wrapper pendant qu'une copie tourne (sleep) ne lui fait
+            jamais sauter son export. bash lit un script par position : la ligne de ralentissement a la longueur exacte, en
+            octets, des lignes unset + export, la reprise d'une réécriture en place tomberait donc sur la ligne exec. Elle
+            écrit un marqueur avant son sleep : réécriture seulement quand la copie dort, copie encore vivante exigée.
+            HOME d'un bac à sable, aucune BORG_* (environnement de boex) -> borg init écrit sous le BORG_BASE_DIR du test,
+            rien ailleurs. Témoin : la même séquence avec une réécriture en place écrit dans le bac à sable (garde
+            discriminante)."""
+            def run(way,rewrite):
+                d=os.path.join(tmp,'rb-rewrite',way); bb=os.path.join(d,'bb'); home=os.path.join(d,'home')
+                repo=os.path.join(d,'repo'); mk=os.path.join(d,'dort')
+                for x in (bb,home): os.makedirs(x)
+                w=os.path.join(d,'borgw'); _rb_wrapper(w,bb)
+                with open(w,'rb') as f: ref=f.read()
+                tail=ref.index(b'\nexec ')+1-len(b"#!/bin/bash\n")   # octets de unset + export
+                sl=f": >{shlex.quote(mk)}; sleep 2 #"; sl=(sl+'x'*(tail-len(sl.encode())-1)+"\n") if tail>len(sl.encode())+1 else None
+                if sl is None: return (False,f"ligne de ralentissement trop longue pour {tail} octets",None,None,None)
+                _rb_wrapper(w,bb,pre=sl)
+                env={'PATH':os.environ.get('PATH',''),'HOME':home,'BORG_PASSPHRASE':'pw-rw','BORG_RELOCATED_REPO_ACCESS_IS_OK':'yes'}
+                ps=_rb_popen([w,'init','-e','repokey',repo],env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+                try:
+                    t0=time.monotonic()
+                    while not os.path.exists(mk) and time.monotonic()-t0<20: time.sleep(0.02)
+                    asleep=os.path.exists(mk) and ps.poll() is None   # la copie est dans son sleep
+                    rewrite(w,bb,ref)
+                    out=ps.communicate(timeout=120)[0]
+                finally: _rb_killtree(ps)
+                count=sum(len(ds)+len(fs) for _r,ds,fs in os.walk(home))
+                try:
+                    cp=configparser.ConfigParser(); cp.read(os.path.join(repo,'config')); rid=cp['repository']['id']
+                    placed=os.path.isdir(os.path.join(bb,'.config','borg','security',rid))
+                except (KeyError,OSError): placed=False
+                return (len(sl.encode())==tail,ps.returncode,asleep,count,placed,out[-200:])
+            def in_place(w,bb,ref):   # l'ancien défaut : le même script, réécrit en place (sans os.replace)
+                with open(w,'r+b') as f: f.write(ref); f.truncate()
+            good=run('atomique',lambda w,bb,ref: _rb_wrapper(w,bb)); bad=run('en-place',in_place)
+            ok=(good[:5]==(True,0,True,0,True) and bad[2] is True and bad[3]>0)
+            if not ok: print(f"  wrapper réécrit : atomique (calage, code, endormi, bac à sable, sécurité) {good[:5]} ; témoin en place "
+                             f"{bad[:5]} (bac à sable attendu non vide) ; {good[5]!r}")
+            return ok
+        _rbc("harnais vrai borg : wrapper réécrit pendant qu'une copie tourne -> export jamais sauté (bac à sable vide)",_rb_wrapper_rewrite)
         ix_dir=os.path.join(tmp,'tranches')
         def _ix_setup():
             """Vrai dépôt, 6 archives '{fqdn}-t-*' (fichiers modifiés entre chaque), borg appelé via un script qui
@@ -10718,18 +10797,18 @@ def codec_selftest(pattern=None,list_only=False):
             b=_ix_bh(ctx,'cache')   # CACHE_DIR du rc : même base que le processus CLI
             lp=b.db._priority_lock_path('ixf'); _ix_fake_lock(lp,os.getpid())   # un autre PID pour le processus CLI
             me=os.path.realpath(__file__)
-            ps=subprocess.Popen([me,'-C',ctx['rc'],'-c','Index','-n','ixf'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,env=_rb_cli_env())
+            ps=_rb_popen([me,'-C',ctx['rc'],'-c','Index','-n','ixf'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,env=_rb_cli_env())
             try:
                 pl=b.db._index_paused_lock_path('ixf'); t0=time.monotonic()
                 while time.monotonic()-t0<30 and not os.path.exists(pl): time.sleep(0.1)
                 waiting=os.path.exists(pl)
-                ps.kill(); ps.wait(10)
             finally:
+                left=_rb_killtree(ps)   # 1.0.159 : groupe entier, jamais d'orphelin (Ctrl-C compris)
                 os.unlink(lp)
             out=_q_run(b.index,'ixf')
             c=sqlite3.connect(b.db.get_diff_db('ixf')); integ=c.execute("PRAGMA integrity_check").fetchone()[0]; c.close()
-            ok=waiting and integ=='ok' and len(_ix_pairs(b,'ixf'))==5 and not os.path.exists(pl)
-            if not ok: print(f"  kill en pause : attente {waiting}, intégrité {integ}, paires {len(_ix_pairs(b,'ixf'))}, {out[-300:]!r}")
+            ok=waiting and integ=='ok' and len(_ix_pairs(b,'ixf'))==5 and not os.path.exists(pl) and not left
+            if not ok: print(f"  kill en pause : attente {waiting}, intégrité {integ}, paires {len(_ix_pairs(b,'ixf'))}, restants {left}, {out[-300:]!r}")
             return ok
         def _ix_real_bkp_during_index():
             """Index long (processus CLI, diffs ralentis) + vrai Bkp ici : le Bkp n'attend pas l'Index (verrou relâché
@@ -10740,7 +10819,7 @@ def codec_selftest(pattern=None,list_only=False):
             me=os.path.realpath(__file__)
             outp=os.path.join(ctx['dir'],'idx.out')
             with open(outp,'w') as fo:
-                ps=subprocess.Popen([me,'-C',ctx['rc'],'-c','Index','-n','ix'],stdout=fo,stderr=subprocess.STDOUT,env=_rb_cli_env())
+                ps=_rb_popen([me,'-C',ctx['rc'],'-c','Index','-n','ix'],stdout=fo,stderr=subprocess.STDOUT,env=_rb_cli_env())
             try:
                 t0=time.monotonic()
                 while time.monotonic()-t0<60 and not any(l.startswith('diff ') for l in _ix_log(ctx)): time.sleep(0.1)
@@ -10754,7 +10833,7 @@ def codec_selftest(pattern=None,list_only=False):
                 bkp_t=time.monotonic()-t1
                 rc=ps.wait(180)
             finally:
-                if ps.poll() is None: ps.kill()
+                _rb_killtree(ps)   # groupe : wrapper et borg compris
                 _ix_slow(ctx,None,0)
             with open(outp) as f: out=f.read()
             names=[a['name'] for a in json.loads(subprocess.run([shutil.which('borg'),'list','--json',ctx['repo']],
@@ -10796,7 +10875,7 @@ def codec_selftest(pattern=None,list_only=False):
             b=_ix_bh(ctx,'cache'); nk='ixd'; me=os.path.realpath(__file__); outp=os.path.join(ctx['dir'],'s8.out')
             bkp=b.db._priority_holder_path(nk,os.getppid()); pl=b.db._index_paused_lock_path(nk)
             with open(outp,'w') as fo:
-                ps=subprocess.Popen([me,'-C',ctx['rc'],'-c','Index','-n',nk],stdout=fo,stderr=subprocess.STDOUT,env=_rb_cli_env())
+                ps=_rb_popen([me,'-C',ctx['rc'],'-c','Index','-n',nk],stdout=fo,stderr=subprocess.STDOUT,env=_rb_cli_env())
             paused=wl_ok=still=False; rc=None; wl_err=''
             try:
                 t0=time.monotonic()
@@ -10815,7 +10894,7 @@ def codec_selftest(pattern=None,list_only=False):
                 os.unlink(bkp)   # fin du Bkp
                 rc=ps.wait(240)
             finally:
-                if ps.poll() is None: ps.kill()
+                _rb_killtree(ps)   # groupe : wrapper et borg compris
                 with contextlib.suppress(OSError): os.unlink(bkp)
                 _ix_slow(ctx,None,0)
             with open(outp) as f: out=f.read()
@@ -11549,7 +11628,7 @@ def codec_selftest(pattern=None,list_only=False):
         def _rb_kill():
             """kill -9 : pendant une unité du fantôme (CLI, diff ralenti), pendant la bascule (copie ralentie), et création
             interrompue (fichier sans empreinte) -> base servie intacte (intégrité, contenu) ; la tranche suivante reprend,
-            bascule, sorties == Index complet."""
+            bascule, sorties == Index complet. 1.0.159 (story 22) : groupe de processus tué, aucun wrapper ni borg restant."""
             ctx=_rb_ctx(); _ix_slow(ctx,None,0); b=_rb_bh('cache')   # CACHE_DIR du rc : base partagée avec le CLI
             _q_run(b.index,'rb'); live=b.db.get_diff_db('rb'); sp=_rb_sp(b,'rb'); ref=_rb_outs(b,'rb'); l0=_rb_rows(live,_RB_LIVE)
             me=os.path.realpath(__file__); ok=True
@@ -11558,10 +11637,13 @@ def codec_selftest(pattern=None,list_only=False):
                 return i=='ok' and _rb_rows(live,_RB_LIVE)==l0
             # 1) pendant une unité
             _ix_slow(ctx,'diff',3); _ix_log(ctx,clear=True)
-            ps=subprocess.Popen([me,'-C',ctx['rc'],'-c','Index','-n','rb','--rebuild'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,env=_rb_cli_env())
-            t0=time.monotonic()
-            while time.monotonic()-t0<60 and not any(l.startswith('diff ') for l in _ix_log(ctx)): time.sleep(0.05)
-            time.sleep(0.5); ps.kill(); ps.wait(10); _ix_slow(ctx,None,0)
+            ps=_rb_popen([me,'-C',ctx['rc'],'-c','Index','-n','rb','--rebuild'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,env=_rb_cli_env())
+            try:
+                t0=time.monotonic()
+                while time.monotonic()-t0<60 and not any(l.startswith('diff ') for l in _ix_log(ctx)): time.sleep(0.05)
+                time.sleep(0.5)
+            finally: grp=_rb_killtree(ps)   # 1.0.159 : wrapper en sleep et borg tués avec lui (Ctrl-C compris)
+            left=grp+_rb_procs(ctx['w'])+_rb_procs(ctx['repo']); _ix_slow(ctx,None,0)
             u=intact() and os.path.exists(sp)
             # 2) pendant la bascule : copie par page, chaque tranche ralentie
             script=(f"import sys,time\nsys.argv=[{me!r}]\nimport importlib.machinery as m\n"
@@ -11575,18 +11657,21 @@ def codec_selftest(pattern=None,list_only=False):
                     f"b=B.BorgHelper(cfgfile={ctx['rc']!r})\nb.index('rb',budget=300)\n")
             outp=os.path.join(ctx['dir'],'kill.out')
             with open(outp,'w') as fo:
-                ps=subprocess.Popen([sys.executable,'-c',script],stdout=fo,stderr=subprocess.STDOUT,env=_rb_cli_env())
-            t0=time.monotonic()
-            while time.monotonic()-t0<120 and 'SWAP' not in open(outp).read(): time.sleep(0.05)
-            time.sleep(1); ps.kill(); ps.wait(10)
+                ps=_rb_popen([sys.executable,'-c',script],stdout=fo,stderr=subprocess.STDOUT,env=_rb_cli_env())
+            try:
+                t0=time.monotonic()
+                while time.monotonic()-t0<120 and 'SWAP' not in open(outp).read(): time.sleep(0.05)
+                time.sleep(1)
+            finally: grp=_rb_killtree(ps)
+            left+=grp+_rb_procs(ctx['w'])+_rb_procs(ctx['repo'])
             sw='SWAP' in open(outp).read() and intact() and os.path.exists(sp)
             # 3) création interrompue : fantôme sans empreinte
             b.db.ensure_diff_db(sp+'.x'); BorgHelper._shadow_discard(sp); os.rename(sp+'.x',sp)
             out=_q_run(b.index,'rb',budget=120)
             cr='création interrompue' in out and 'nouvelle base en service' in out and not os.path.exists(sp)
             same=_rb_outs(b,'rb')==ref
-            ok=u and sw and cr and same
-            if not ok: print(f"  kill : unité {u}, bascule {sw}, création {cr}, identique {same}, {out[-300:]!r} / {open(outp).read()[-300:]!r}")
+            ok=u and sw and cr and same and not left
+            if not ok: print(f"  kill : unité {u}, bascule {sw}, création {cr}, identique {same}, restants {left}, {out[-300:]!r} / {open(outp).read()[-300:]!r}")
             return ok
         def _rb_plain_ignores():
             """Index sans option pendant une reconstruction : fantôme inchangé (paires, build_state), base servie indexée."""

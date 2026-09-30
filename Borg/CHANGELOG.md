@@ -1,5 +1,27 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.159 — wrapper atomique, tests de chargement des graphiques — 2026-09-30
+
+Chantier « reconstruction progressive », story 22 (actions de rétrospective A29, A31). Aucun changement du code de
+production ; UI et borgHelperWWW inchangés.
+
+- **CodecSelfTest : plus de borg orphelin hors de son dossier.** Le contrôle « fantôme : kill -9 » tuait un borgHelper
+  enfant pendant un `borg diff` ralenti ; le script `BORG_EXE` (en attente) et son borg survivaient, puis le script
+  était réécrit en place. bash lit un script par position : la copie en cours reprenait dans le nouveau contenu, sautait
+  `export BORG_BASE_DIR`, et le borg orphelin écrivait dans `~/.config/borg/security` (mesuré sur 1.0.157 : une entrée
+  par run ; 1.0.158 n'y échappait que par hasard de position). Désormais :
+  - le script `BORG_EXE` est écrit à côté puis remplacé (`os.replace`), jamais réécrit en place ;
+  - les borgHelper enfants tués par le selftest ont leur propre groupe de processus, tué en entier (wrapper et borg
+    compris), y compris sur Ctrl-C ; le contrôle vérifie qu'aucun processus du wrapper ni du dépôt ne reste.
+- Nouveau contrôle : un wrapper réécrit pendant qu'une copie dort (marqueur avant son `sleep`), avec une reprise calée
+  sur la ligne `exec`, garde son `BORG_BASE_DIR` (`HOME` d'un bac à sable, qui reste vide) ; témoin : la même séquence
+  avec une réécriture en place écrit dans le bac à sable.
+- Test de l'UI, réponses en erreur : aussi HTTP 502 avec code 0, `stderr` seul, champ `error`, réponse sans `rows` ;
+  échec partiel (dépôt lisible, archives en erreur) et reprise après une erreur.
+- **Test de l'UI** : chargement des graphiques — deux chargements qui se croisent (seul le dernier dessine), instances
+  détruites avant de redessiner (faux Chart.js qui refuse un canvas encore utilisé), réponses en erreur (HTTP 500,
+  code 1, JSON illisible, 401 : message sur les cinq graphiques), bibliothèque absente.
+
 ## borgHelper 1.0.158 — harnais vrai borg isolé, tests des graphiques — 2026-09-30
 
 Chantier « reconstruction progressive », story 21 (actions de rétrospective A27, A28). Aucun changement du code de

@@ -1817,7 +1817,8 @@ montrer exactement ce dont on parle.
 - L'interface doit être publiée à la racine du site (pas sous un sous-chemin `https://host/borg/…`).
 - Test de l'UI (Node, sans dépendance) : `node borgHelperWWW_ui_test.js` — routeur, badges, fin de Bkp, actions et
   graphiques de la page Historique (tous construits, séries de la courbe des tailles, archives supprimées atténuées,
-  message sans données, bloc HTML de chaque graphique). À lancer après toute modification de ces parties de
+  message sans données, bloc HTML de chaque graphique, chargements qui se croisent, rechargement, réponses en erreur,
+  bibliothèque absente). À lancer après toute modification de ces parties de
   `borgHelperWWW_ui.html`. Inutile au déploiement.
 
 Cette page HTML elle-même n'est pas protégée par `X-API-Key` (elle ne contient aucun secret — la clé et
