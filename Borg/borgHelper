@@ -10,16 +10,16 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.163"
+Version="1.0.164"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
 #                           tant qu'elle est inférieure à sa maximale). diff.db : égale à la maximale depuis
 #                           10 (1.0.139) — une diff.db migrée vers history.db doit être refusée par TOUS les
 #                           anciens binaires, en clair comme chiffrée.
-DIFF_DB_SCHEMA_VERSION  = 10
+DIFF_DB_SCHEMA_VERSION  = 11
 CACHE_DB_SCHEMA_VERSION = 2
-DIFF_DB_BASE_SCHEMA_VERSION  = 10  # 10 (1.0.139) : écrite aussi dans les bases 'plain' — les anciens binaires doivent
+DIFF_DB_BASE_SCHEMA_VERSION  = 11  # 11 (1.0.164) : ancien binaire -> ON CONFLICT(nick,path) sans contrainte ; 10 (1.0.139) : écrite aussi dans les bases 'plain' — les anciens binaires doivent
                                    # refuser une diff.db dont les mesures sont parties dans history.db (sinon ils
                                    # recréeraient repo_stats/bkp_status dans diff.db et y écriraient)
 HISTORY_DB_SCHEMA_VERSION = 1
@@ -49,6 +49,10 @@ CACHE_DB_BASE_SCHEMA_VERSION = 1
 #       mesurée au Bkp, table archive_measure) quittent diff.db, qui devient entièrement régénérable.
 #       Migration automatique à la première ouverture (BorgHelperDB._migrate_to_history), détectée par la
 #       présence des tables/colonnes, jamais par schema_version.
+#  11 : snapshot_file par VERSION (1.0.164, story 27, A39) : plus de UNIQUE(nick,path) — une ligne par chemin ET
+#       attributs (size, mtime, type, mode, owner, égalité IS), partagée par les archives où elle est identique ; une
+#       archive ancienne garde ses propres valeurs. Reconstruction de la table (ids gardés, vue recréée) détectée par
+#       l'index unique (BorgHelperDB._migrate_snapshot_versions), jamais par schema_version.
 # Ne concerne QUE diff.db, appelé par ensure_diff_db() — désormais garanti avant tout accès
 # depuis Bkp, Index, Prune (voir prune()) et tous les autres consommateurs de diff.db/cache.db.
 
@@ -450,10 +454,21 @@ def _diff_entry_of(obj):
         change_type=changes[0].get('type','?')
     return {'change_type':change_type,'size_before':size_before,'size_after':size_after,'path':path}
 
-# snapshot_file : une ligne par chemin, partagée par les snapshots de toutes les archives — mise à jour sur place
-_SNAPFILE_UPSERT=("INSERT INTO snapshot_file (nick,path,size,mtime,type,mode,owner) VALUES (?,?,?,?,?,?,?) "
-                  "ON CONFLICT(nick,path) DO UPDATE SET size=excluded.size,mtime=excluded.mtime,type=excluded.type,"
-                  "mode=excluded.mode,owner=excluded.owner")
+# snapshot_file par VERSION (1.0.164, story 27, A39) : une ligne par chemin ET attributs, partagée par les archives où elle
+# est identique (égalité IS, NULL compris) ; jamais mise à jour sur place — une archive ancienne garde ses valeurs.
+_SNAPFILE_MATCH=("f.nick=? AND f.path=? AND f.size IS ? AND f.mtime IS ? AND f.type IS ? AND f.mode IS ? AND f.owner IS ?")
+_SNAPFILE_INSERT=("INSERT INTO snapshot_file (nick,path,size,mtime,type,mode,owner) SELECT ?,?,?,?,?,?,? "
+                  "WHERE NOT EXISTS (SELECT 1 FROM snapshot_file f WHERE "+_SNAPFILE_MATCH+")")
+_SNAPFILE_LINK=("INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,file_id) "
+                "SELECT ?,?,?,(SELECT f.id FROM snapshot_file f WHERE "+_SNAPFILE_MATCH+" ORDER BY f.id LIMIT 1)")
+
+def _snap_link_versions(conn,archive,archive_date,rows):
+    """Lie à `archive` la version exacte de chaque ligne rows=(nick,path stocké,size,mtime,type,mode,owner), créée si
+    absente. Aucune écriture sur une version existante."""
+    # un chemin rendu deux fois par borg list (racines BORG_ROOTBKP imbriquées) : une seule version liée, la dernière lue
+    rows=list({(r[0],r[1]):tuple(r) for r in rows}.values())
+    conn.executemany(_SNAPFILE_INSERT,[r+r for r in rows])
+    conn.executemany(_SNAPFILE_LINK,[(r[0],archive,archive_date)+r for r in rows])
 _MODE_TYPE_SUFFIX={'-':''}|{v:k for k,v in _DIFF_TYPE_OF_SUFFIX.items()}   # 1er caractère d'un mode ls -> suffixe de type
 
 def parse_diff_entries_json(line):
@@ -2346,11 +2361,50 @@ class BorgHelperDB:
                 except sqlite3.Error: pass
             raise
 
+    def _migrate_snapshot_versions(self,conn):
+        """Palier 11 (1.0.164, story 27, A39) : snapshot_file sans UNIQUE(nick,path) — une ligne par version. SQL seul, une
+        transaction BEGIN IMMEDIATE qui relit l'état (deux processus : un seul reconstruit ; base plus récente que ce code :
+        jamais touchée, _check_set_meta refuse ensuite). Ids, liens archive_snapshot et compteur AUTOINCREMENT gardés (table
+        vide comprise) ; chemins copiés tels quels (base chiffrée : sans passphrase). Vue retirée — ALTER TABLE … RENAME
+        refuse une vue qui cite la table supprimée (mesuré, SQLite 3.37.2) — et recréée ensuite par la réparation de la vue
+        d'ensure_diff_db (jamais ici : archive_snapshot peut être encore à l'ancien format, palier 2). Les lignes existantes
+        restent partagées : le passé n'est pas reconstitué."""
+        if conn.in_transaction: conn.commit()   # ALTER … ADD COLUMN (paliers 2-4) juste avant
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row=conn.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()
+            if ((row and str(row[0]).isdigit() and int(row[0])>DIFF_DB_SCHEMA_VERSION)
+                    or not any(r[2] for r in conn.execute("PRAGMA index_list(snapshot_file)").fetchall())):
+                conn.rollback(); return
+            print("  Migration snapshot → une ligne par version...",file=sys.stderr,flush=True)
+            for q in ("DROP VIEW IF EXISTS archive_snapshot_v",
+                      "CREATE TABLE snapshot_file_new (id INTEGER PRIMARY KEY AUTOINCREMENT, nick TEXT NOT NULL, path TEXT NOT NULL, "
+                      "size INTEGER, mtime TEXT, type TEXT, mode TEXT, owner TEXT)",
+                      "INSERT INTO snapshot_file_new (id,nick,path,size,mtime,type,mode,owner) "
+                      "SELECT id,nick,path,size,mtime,type,mode,owner FROM snapshot_file",
+                      # compteur gardé, table vide comprise : INSERT … SELECT crée la ligne sqlite_sequence de la nouvelle table
+                      # même sans ligne copiée (seq 0 ; mesuré, SQLite 3.37.2), relevée ici au compteur de l'ancienne
+                      "UPDATE sqlite_sequence SET seq=(SELECT seq FROM sqlite_sequence WHERE name='snapshot_file') "
+                      "WHERE name='snapshot_file_new' AND seq<(SELECT seq FROM sqlite_sequence WHERE name='snapshot_file')",
+                      "DROP TABLE snapshot_file",
+                      "ALTER TABLE snapshot_file_new RENAME TO snapshot_file",
+                      "CREATE INDEX IF NOT EXISTS idx_snapfile_nick_path ON snapshot_file(nick, path)"):
+                conn.execute(q)
+            conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                try: conn.rollback()
+                except sqlite3.Error: pass
+            raise
+
     def _migrate_archive_snapshot(self,conn):
         print("  Migration snapshot → schéma déduplication...",file=sys.stderr,flush=True)
+        # 1.0.164 : une ligne par version (nick,path,size,mtime) — l'ancienne table porte la valeur de chaque archive
         self._executescript_atomic(conn,"""
             INSERT OR IGNORE INTO snapshot_file (nick, path, size, mtime)
-                SELECT nick, path, size, mtime FROM archive_snapshot;
+                SELECT DISTINCT a.nick, a.path, a.size, a.mtime FROM archive_snapshot a
+                WHERE NOT EXISTS (SELECT 1 FROM snapshot_file f WHERE f.nick=a.nick AND f.path=a.path
+                                  AND f.size IS a.size AND f.mtime IS a.mtime);
             CREATE TABLE archive_snapshot_new (
                 nick         TEXT NOT NULL,
                 archive      TEXT NOT NULL,
@@ -2358,10 +2412,11 @@ class BorgHelperDB:
                 file_id      INTEGER NOT NULL,
                 PRIMARY KEY (nick, archive, file_id)
             );
-            INSERT INTO archive_snapshot_new (nick, archive, archive_date, file_id)
-                SELECT a.nick, a.archive, a.archive_date, sf.id
-                FROM archive_snapshot a
-                JOIN snapshot_file sf ON sf.nick=a.nick AND sf.path=a.path;
+            INSERT OR IGNORE INTO archive_snapshot_new (nick, archive, archive_date, file_id)
+                SELECT a.nick, a.archive, a.archive_date,
+                       (SELECT MIN(sf.id) FROM snapshot_file sf WHERE sf.nick=a.nick AND sf.path=a.path
+                        AND sf.size IS a.size AND sf.mtime IS a.mtime)
+                FROM archive_snapshot a;
             DROP TABLE archive_snapshot;
             ALTER TABLE archive_snapshot_new RENAME TO archive_snapshot;
             CREATE INDEX IF NOT EXISTS idx_snap_nick_archive ON archive_snapshot(nick, archive);
@@ -2433,8 +2488,7 @@ class BorgHelperDB:
                     mtime TEXT,
                     type  TEXT,
                     mode  TEXT,
-                    owner TEXT,
-                    UNIQUE(nick, path)
+                    owner TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_snapfile_nick_path ON snapshot_file(nick, path);
                 CREATE TABLE IF NOT EXISTS archive_snapshot_indexed (
@@ -2481,6 +2535,8 @@ class BorgHelperDB:
                 conn.execute("ALTER TABLE snapshot_file ADD COLUMN mode TEXT")
             if 'owner' not in sf_cols:
                 conn.execute("ALTER TABLE snapshot_file ADD COLUMN owner TEXT")
+            if any(r[2] for r in conn.execute("PRAGMA index_list(snapshot_file)").fetchall()):
+                self._migrate_snapshot_versions(conn)   # palier 11 (1.0.164) : UNIQUE(nick,path) encore là (relu sous verrou)
             # Paliers 7/9 (bkp_status) et 6 (repo_stats) : ne s'appliquent plus qu'à une base d'avant 1.0.139, pour
             # normaliser ses tables avant de les copier dans history.db (_migrate_to_history) — ces tables ne sont
             # plus créées dans diff.db.
@@ -3069,12 +3125,9 @@ class BorgHelperDB:
             try:
                 _write_mode_check(conn)
                 if files:
-                    # 1.0.163 : mise à jour sur place (id gardé) — INSERT OR REPLACE changeait l'id et les snapshots plus anciens
-                    # qui citaient ce chemin perdaient leur ligne
-                    conn.executemany(_SNAPFILE_UPSERT,
-                                     [(nick,_path_stored(conn,f['path']),f.get('size'),f.get('mtime'),f.get('type'),f.get('mode'),f.get('owner')) for f in files])
-                    conn.executemany("INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,file_id) SELECT ?,?,?,id FROM snapshot_file WHERE nick=? AND path=?",
-                                     [(nick,archive,archive_date,nick,_path_stored(conn,f['path'])) for f in files])
+                    # 1.0.164 (A39) : version exacte de chaque chemin — jamais de mise à jour d'une ligne liée à d'autres archives
+                    _snap_link_versions(conn,archive,archive_date,
+                                        [(nick,_path_stored(conn,f['path']),f.get('size'),f.get('mtime'),f.get('type'),f.get('mode'),f.get('owner')) for f in files])
                 conn.execute("INSERT OR IGNORE INTO archive_snapshot_indexed (nick,archive,entry_count) VALUES (?,?,?)",(nick,archive,len(files)))
                 conn.commit(); return True
             finally: conn.close()
@@ -4939,40 +4992,60 @@ class BorgHelper:
                 "SELECT 1 FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=?",
                 (nick,prev_archive,archive_name)).fetchone():
                 conn.close(); return None
-            diffs=conn.execute(
+            # 1.0.164 (story 27) : chemins LOGIQUES — en base chiffrée, les chemins stockés partaient tels quels à borg list
+            # (aucune ligne rendue : ajouts perdus) et à IDX_INCLUDE/IDX_EXCLUDE.
+            diffs=[(_path_decode(conn,p),ct,sz) for p,ct,sz in conn.execute(
                 "SELECT path,change_type,size_after FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",
-                (nick,prev_archive,archive_name)).fetchall()
+                (nick,prev_archive,archive_name))]
+            ok={p:self._idx_path_ok(p,cfg) for p,_,_ in diffs}
             # borg diff distingue fichiers, répertoires et liens ('removed directory', 'added link'...) :
             # tous appliqués (1.0.116 — seuls 'removed'/'added' l'étaient, un répertoire supprimé
             # restait dans le snapshot).
-            removed=[p for p,ct,_ in diffs if ct in _DIFF_REMOVED_TYPES and self._idx_path_ok(p,cfg)]
-            modified=[(sz,p) for p,ct,sz in diffs if ct=='modified' and self._idx_path_ok(p,cfg)]
-            added=[p for p,ct,_ in diffs if ct in _DIFF_ADDED_TYPES and self._idx_path_ok(p,cfg)]
-            exclu_count=sum(1 for p,ct,_ in diffs if not self._idx_path_ok(p,cfg))
-            exclu_size=sum(sz or 0 for p,ct,sz in diffs if not self._idx_path_ok(p,cfg))
-            if len(added)>5000:
+            removed=sorted({p for p,ct,_ in diffs if ct in _DIFF_REMOVED_TYPES and ok[p]})
+            # 1.0.164 (A39) : TOUT chemin changé et toujours présent (ajout, contenu, mode, propriétaire, ctime/mtime, nouveau
+            # type après une scission) relu par borg list -> sa version exacte dans cette archive ; l'archive précédente garde
+            # la sienne (avant : seuls les ajouts relus, 'modified' ne changeait que la taille d'une ligne partagée).
+            changed=sorted({_norm_lp(p) for p,ct,_ in diffs if ct not in _DIFF_REMOVED_TYPES and ok[p]})
+            want_all=set(changed)
+            n_added=sum(1 for p,ct,_ in diffs if ct in _DIFF_ADDED_TYPES and ok[p])
+            n_modified=sum(1 for p,ct,_ in diffs if ct=='modified' and ok[p])
+            exclu_count=sum(1 for p,ct,_ in diffs if not ok[p])
+            exclu_size=sum(sz or 0 for p,ct,sz in diffs if not ok[p])
+            # 1.0.164 : borne aussi la taille de la ligne de commande (motifs pf:) — au-delà d'ARG_MAX (2 Mo, variables
+            # d'environnement comprises), Popen lève E2BIG : repli sur le snapshot complet
+            if len(changed)>5000 or sum(len(p)+4 for p in changed)>1_000_000:
                 conn.close(); return None
-            # 1.0.141 : borg list des ajouts AVANT toute écriture (arrêt possible par le moniteur d'Index : rien
-            # d'écrit), puis clone + suppressions + modifications + ajouts + sentinelle en une seule transaction.
-            add_rows=[]
-            if added:
-                rb=self.borg.boex(nick,
-                    ['list','--format','{mode} {type} {user} {group} {uid} {gid} {size} {isomtime} {path}{NL}',f'::{archive_name}']+added,
-                    debug=debug,retjson=False)
+            # 1.0.141 : borg list des chemins changés AVANT toute écriture (arrêt possible par le moniteur d'Index : rien
+            # d'écrit), puis clone + suppressions + versions + sentinelle en une seule transaction.
+            add_rows=[]; got=set()
+            if changed:
+                # pf: = ce chemin seul (mesuré, borg 1.2.6 : un chemin simple liste tout son sous-arbre, enfants exclus compris ;
+                # chemin absent : code 0, aucune ligne)
+                try:
+                    rb=self.borg.boex(nick,
+                        ['list','--format','{mode} {type} {user} {group} {uid} {gid} {size} {isomtime} {path}{NL}',f'::{archive_name}']
+                        +['pf:'+p for p in changed],
+                        debug=debug,retjson=False)
+                except OSError as e:   # E2BIG malgré la borne, borg introuvable… : snapshot complet
+                    printer(f"  [WARN] {nick}: borg list des chemins changés impossible ({e}) — snapshot complet")
+                    conn.close(); return None
                 if rb.get('killed'):
                     conn.close(); return 'killed'
                 if rb['exitcode']!=0:
                     conn.close(); return None
+                want=set(changed)
                 for line in rb['stdout']:
-                    line=line.strip()
-                    if not line: continue
+                    # jamais strip() : un nom qui finit par une espace serait tronqué (lignes déjà coupées sur '\n')
+                    if not line.strip(): continue
                     parts=line.split(' ',8)
                     if len(parts)==9:
                         mode,ftype,user,group,uid,gid,sz_s,mtime,path=parts
+                        if _norm_lp(path) not in want: continue
+                        got.add(_norm_lp(path))
                         try: sz2=int(sz_s)
                         except ValueError: sz2=None
                         owner=f"{user}:{group} ({uid}:{gid})"
-                        # (nick,path,size,mtime,type,mode,owner) — ordre exact des colonnes de l'INSERT ci-dessous
+                        # (nick,path,size,mtime,type,mode,owner) — ordre de _snap_link_versions
                         # path stocké (_path_stored) : borg list renvoie un chemin logique, jamais écrit tel quel
                         add_rows.append((nick,_path_stored(conn,path),sz2,mtime,ftype,mode,owner))
                 _write_mode_check(conn)  # AD-11 : revérifié après le sous-processus borg list, avant d'écrire
@@ -4981,32 +5054,26 @@ class BorgHelper:
                 "INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,file_id) "
                 "SELECT nick,?,?,file_id FROM archive_snapshot WHERE nick=? AND archive=?",
                 (archive_name,archive_date,nick,prev_archive))
-            # Apply removed
-            for path in removed:
-                conn.execute(
-                    "DELETE FROM archive_snapshot WHERE nick=? AND archive=? AND file_id="
-                    "(SELECT id FROM snapshot_file WHERE nick=? AND path=?)",
-                    (nick,archive_name,nick,path))
-            if removed:
-                self.db._cleanup_snapshot_file_orphans(nick,conn)
-            # Apply modified (update size, keep mtime)
-            for sz,path in modified:
-                if sz is not None:
-                    conn.execute("UPDATE snapshot_file SET size=? WHERE nick=? AND path=?",(sz,nick,path))
+            # Suppressions puis chemins relus : la ligne clonée (version de l'archive précédente) retirée, la version relue liée.
+            # Chemin changé que borg list ne rend pas : ligne clonée gardée. IN : plusieurs versions par chemin.
+            unlink=("DELETE FROM archive_snapshot WHERE nick=? AND archive=? AND file_id IN "
+                    "(SELECT id FROM snapshot_file WHERE nick=? AND path=?)")
+            # supprimé ET changé (changement de type) mais non rendu par borg list : ligne clonée gardée, comme tout changé non rendu
+            removed_apply=[p for p in removed if not (_norm_lp(p) in want_all and _norm_lp(p) not in got)]
+            conn.executemany(unlink,[(nick,archive_name,nick,_path_stored(conn,p)) for p in removed_apply])
             if add_rows:
-                conn.executemany(_SNAPFILE_UPSERT,add_rows)   # 1.0.163 : id gardé (snapshots plus anciens intacts)
-                conn.executemany(
-                    "INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,file_id) "
-                    "SELECT ?,?,?,id FROM snapshot_file WHERE nick=? AND path=?",
-                    [(nick,archive_name,archive_date,nick,r[1]) for r in add_rows])
+                conn.executemany(unlink,[(nick,archive_name,nick,r[1]) for r in add_rows])
+                _snap_link_versions(conn,archive_name,archive_date,add_rows)
+            if removed_apply or add_rows:
+                self.db._cleanup_snapshot_file_orphans(nick,conn)
             nfiles=conn.execute(
                 "SELECT COUNT(*) FROM archive_snapshot WHERE nick=? AND archive=?",(nick,archive_name)).fetchone()[0]
             conn.execute(
                 "INSERT OR IGNORE INTO archive_snapshot_indexed (nick,archive,entry_count) VALUES (?,?,?)",
                 (nick,archive_name,nfiles))
             conn.commit(); conn.close()
-            return nfiles,exclu_count,exclu_size,len(added),len(removed),len(modified)
-        except sqlite3.Error as e:
+            return nfiles,exclu_count,exclu_size,n_added,len(removed_apply),n_modified
+        except (sqlite3.Error,DbCodecError) as e:   # DbCodecError (1.0.164) : chemin de diff_index illisible -> complet
             printer(f"  [WARN] indexsnap incrémental échoué ({e}) — fallback borg list")
             try: conn.close()
             except: pass
@@ -5068,7 +5135,12 @@ class BorgHelper:
         if not force:
             try:
                 rconn=_open_db(db_path,nick=nick,role='read')
-                has_null=rconn.execute("SELECT 1 FROM snapshot_file WHERE nick=? AND (type IS NULL OR mode IS NULL OR owner IS NULL) LIMIT 1",(nick,)).fetchone()
+                # 1.0.164 : versions de l'archive que l'incrémental clonerait seulement — des versions NULL restent liées aux
+                # archives plus anciennes (plus jamais réécrites) et forçaient sinon un snapshot complet à chaque Index
+                has_null=rconn.execute(
+                    "SELECT 1 FROM archive_snapshot s JOIN snapshot_file f ON f.id=s.file_id WHERE s.nick=? AND s.archive="
+                    "(SELECT archive FROM archive_snapshot_indexed WHERE nick=? AND archive<? ORDER BY archive DESC LIMIT 1) "
+                    "AND (f.type IS NULL OR f.mode IS NULL OR f.owner IS NULL) LIMIT 1",(nick,nick,archive_name)).fetchone()
                 rconn.close()
                 if has_null:
                     auto_repair=True
@@ -5099,8 +5171,7 @@ class BorgHelper:
                     return rb2['exitcode']
                 files=[]; exclu_count=0; exclu_size=0
                 for line in rb2['stdout']:
-                    line=line.strip()
-                    if not line: continue
+                    if not line.strip(): continue   # 1.0.164 : jamais strip() (nom finissant par une espace tronqué)
                     parts=line.split(' ',8)
                     if len(parts)==9:
                         mode,ftype,user,group,uid,gid,size_s,mtime,path=parts
@@ -8649,12 +8720,19 @@ def codec_selftest(pattern=None,list_only=False):
                     and os.path.getmtime(hp)==m0 and 'Migration' not in err.getvalue())
         check("history.db : SQLite < 3.35 -> C/E vidées, migration jamais relancée ensuite",_hm_old_sqlite)
         def _hm_newer_schema():
-            """diff.db d'un schéma plus récent (11) portant encore repo_stats : jamais touchée, refusée."""
+            """diff.db d'un schéma plus récent que ce code (DIFF_DB_SCHEMA_VERSION+1 ; 11 jusqu'à 1.0.163) portant encore
+            repo_stats et UNIQUE(nick,path) : jamais touchée (ni mesures, ni palier 11), refusée."""
             dp=_hm_legacy('m11')
-            c=sqlite3.connect(dp); c.execute("UPDATE db_meta SET value='11' WHERE key='schema_version'"); c.commit(); c.close()
+            c=sqlite3.connect(dp); c.execute("UPDATE db_meta SET value=? WHERE key='schema_version'",(str(DIFF_DB_SCHEMA_VERSION+1),))
+            c.execute("CREATE TABLE snapshot_file (id INTEGER PRIMARY KEY AUTOINCREMENT, nick TEXT NOT NULL, path TEXT NOT NULL, "
+                      "size INTEGER, mtime TEXT, type TEXT, mode TEXT, owner TEXT, UNIQUE(nick, path))"); c.commit()
+            uniq0=[(r[1],r[2]) for r in c.execute("PRAGMA index_list(snapshot_file)") if r[2]]; c.close()
             refused=raises(SchemaVersionError,lambda: bh.ensure_diff_db(dp,create=False))
-            c=sqlite3.connect(dp); left={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}; c.close()
-            return refused and {'repo_stats','bkp_status'}<=left and not os.path.exists(_history_path_for(dp))
+            c=sqlite3.connect(dp); left={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            uniq=[(r[1],r[2]) for r in c.execute("PRAGMA index_list(snapshot_file)") if r[2]]; c.close()
+            if not (len(uniq0)==1 and uniq==uniq0): print(f"  index unique {uniq0} -> {uniq}")
+            return (refused and {'repo_stats','bkp_status'}<=left and not os.path.exists(_history_path_for(dp))
+                    and len(uniq0)==1 and uniq==uniq0)
         check("history.db : diff.db d'un schéma plus récent -> refusée sans rien migrer ni supprimer",_hm_newer_schema)
         def _hm_old_binary():
             """Base migrée : un binaire d'avant 1.0.139 (version maximale 9) la refuse (SchemaVersionError)."""
@@ -9133,6 +9211,253 @@ def codec_selftest(pattern=None,list_only=False):
             c.close(); return r
         check("plan : intervalle de préfixe utilise idx_diff_nick_path (plain et chiffré)",lambda: all('idx_diff_nick_path' in _plan(n,'diff_index') for n in ('qp','qe')))
         check("plan : intervalle de préfixe utilise idx_snapfile_nick_path (plain et chiffré)",lambda: all('idx_snapfile_nick_path' in _plan(n,'snapshot_file') for n in ('qp','qe')))
+        def _snapv_v10(nk):
+            """1.0.164 (story 27, A39) : copie de la base de test de `nk` ramenée au schéma 10 (UNIQUE(nick,path), version
+            10, compteur AUTOINCREMENT à 1000) -> (chemin, lignes snapshot_file, liens archive_snapshot) d'avant migration."""
+            src=bhq.db.get_diff_db(nk); dst=os.path.join(tmp,f'snapv-{nk}.db')
+            for suf in ('','-wal','-shm'):
+                if os.path.exists(dst+suf): os.unlink(dst+suf)
+            c=sqlite3.connect(src); c.execute("PRAGMA wal_checkpoint(TRUNCATE)"); c.close(); shutil.copy(src,dst)
+            c=sqlite3.connect(dst)
+            c.executescript("DROP VIEW archive_snapshot_v;"
+                "CREATE TABLE sf10 (id INTEGER PRIMARY KEY AUTOINCREMENT, nick TEXT NOT NULL, path TEXT NOT NULL, size INTEGER,"
+                " mtime TEXT, type TEXT, mode TEXT, owner TEXT, UNIQUE(nick, path));"
+                "INSERT INTO sf10 SELECT id,nick,path,size,mtime,type,mode,owner FROM snapshot_file;"
+                "DROP TABLE snapshot_file; ALTER TABLE sf10 RENAME TO snapshot_file;"
+                "CREATE INDEX idx_snapfile_nick_path ON snapshot_file(nick, path);"
+                "UPDATE sqlite_sequence SET seq=1000 WHERE name='snapshot_file';"
+                "UPDATE db_meta SET value='10' WHERE key='schema_version';"+_ARCHIVE_SNAPSHOT_V_SQL+";")
+            sf=c.execute("SELECT * FROM snapshot_file ORDER BY id").fetchall(); ln=c.execute("SELECT * FROM archive_snapshot ORDER BY 1,2,4").fetchall()
+            c.close(); return dst,sf,ln
+        def _snapv_migration():
+            """Base v10 (clair et chiffrée) -> ensure_diff_db : plus d'index unique, mêmes lignes (ids compris), mêmes liens,
+            vue conforme, version 11, compteur gardé (1000), lecture par la vue avec le codec ; rejouée : fichier inchangé.
+            Attentes en dur."""
+            ok=True
+            for nk in ('qp','qe'):
+                dp,sf,ln=_snapv_v10(nk)
+                c=sqlite3.connect(dp); uniq0=[r for r in c.execute("PRAGMA index_list(snapshot_file)") if r[2]]; c.close()
+                err=io.StringIO()
+                try:
+                    with contextlib.redirect_stderr(err): bhq.db.ensure_diff_db(dp)
+                except SystemExit: print(f"  {nk} : ensure_diff_db a quitté — {err.getvalue()[-300:]!r}"); return False
+                c=sqlite3.connect(dp)
+                uniq=[r for r in c.execute("PRAGMA index_list(snapshot_file)") if r[2]]
+                idx=[r[1] for r in c.execute("PRAGMA index_list(snapshot_file)")]
+                sf2=c.execute("SELECT * FROM snapshot_file ORDER BY id").fetchall(); ln2=c.execute("SELECT * FROM archive_snapshot ORDER BY 1,2,4").fetchall()
+                ver=c.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()[0]
+                seq=c.execute("SELECT seq FROM sqlite_sequence WHERE name='snapshot_file'").fetchone()
+                tabs=sorted(r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE name LIKE 'snapshot_file%' AND type='table'"))
+                c.close()
+                cv=_open_db(dp,nick=nk,role='read',passphrase='pw')
+                try:
+                    view=BorgHelperDB._archive_view_state(cv)
+                    got=sorted(_path_decode(cv,p) for (p,) in cv.execute("SELECT path FROM archive_snapshot_v WHERE nick=? AND archive=?",(nk,'h-a3')))
+                finally: cv.close()
+                st=os.stat(dp).st_mtime_ns; err2=io.StringIO()
+                with contextlib.redirect_stderr(err2): bhq.db.ensure_diff_db(dp)
+                again=os.stat(dp).st_mtime_ns==st and 'Migration' not in err2.getvalue()
+                # détection par l'index, jamais par la version : base sans index unique mais étiquetée 10 -> rien reconstruit
+                c=sqlite3.connect(dp); c.execute("UPDATE db_meta SET value='10' WHERE key='schema_version'"); c.commit(); c.close()
+                err3=io.StringIO()
+                with contextlib.redirect_stderr(err3): bhq.db.ensure_diff_db(dp)
+                c=sqlite3.connect(dp); sf3=c.execute("SELECT * FROM snapshot_file ORDER BY id").fetchall(); c.close()
+                again=again and 'une ligne par version' not in err3.getvalue() and sf3==sf
+                # relecture sous verrou : un autre processus a migré entre le contrôle d'ensure_diff_db et le verrou -> rien
+                c=_open_db(dp,nick=None,role='admin'); err4=io.StringIO()
+                try:
+                    with contextlib.redirect_stderr(err4): bhq.db._migrate_snapshot_versions(c)
+                    sch=c.execute("SELECT sql FROM sqlite_master WHERE name='archive_snapshot_v'").fetchone()
+                finally: c.close()
+                again=again and 'une ligne par version' not in err4.getvalue() and sch is not None
+                r=(len(uniq0)==1 and uniq==[] and idx==['idx_snapfile_nick_path'] and sf2==sf and ln2==ln and len(sf)==35 and ver=='11'
+                   and seq==(1000,) and tabs==['snapshot_file'] and view=='ok' and len(got)==28 and 'etc/passwd' in got
+                   and 'une ligne par version' in err.getvalue() and again)
+                if not r: print(f"  {nk} : unique {uniq0}->{uniq} index {idx} lignes {len(sf)}->{len(sf2)} égales {sf2==sf} liens {ln2==ln} "
+                                f"version {ver} compteur {seq} tables {tabs} vue {view} vue lue {len(got)} message {err.getvalue()[-80:]!r} rejouée {again}")
+                ok=ok and r
+            return ok
+        check("snapshot par version : base v10 migrée (clair et chiffrée) — ids, liens, vue, version 11, compteur ; rejouée sans écriture",_snapv_migration)
+        def _snapv_old_binary():
+            """Base 11 ouverte par un binaire qui ne comprend que 10 : SchemaVersionError (v11 > v10), base intacte."""
+            dp=os.path.join(tmp,'snapv-qp.db')
+            g=globals(); orig=g['DIFF_DB_SCHEMA_VERSION']; g['DIFF_DB_SCHEMA_VERSION']=10
+            try:
+                try: bhq.db.ensure_diff_db(dp); return False
+                except SchemaVersionError as e: msg=str(e)
+            finally: g['DIFF_DB_SCHEMA_VERSION']=orig
+            c=sqlite3.connect(dp); ver=c.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()[0]; c.close()
+            if 'v11 > attendu v10' not in msg or ver!='11': print(f"  {msg!r} {ver}")
+            return 'v11 > attendu v10' in msg and ver=='11'
+        check("snapshot par version : base 11 refusée par un binaire de schéma 10",_snapv_old_binary)
+        def _snapv_empty_seq():
+            """Base v10 dont snapshot_file est vide mais a déjà servi (compteur 500) : compteur gardé après migration, id
+            suivant 501 (jamais un id déjà cité par un lien orphelin)."""
+            dp=os.path.join(tmp,'snapv-empty.db')
+            for suf in ('','-wal','-shm'):
+                if os.path.exists(dp+suf): os.unlink(dp+suf)
+            c=sqlite3.connect(dp)
+            c.executescript("CREATE TABLE db_meta (key TEXT PRIMARY KEY, value TEXT); INSERT INTO db_meta VALUES('schema_version','10');"
+                "CREATE TABLE snapshot_file (id INTEGER PRIMARY KEY AUTOINCREMENT, nick TEXT NOT NULL, path TEXT NOT NULL, size INTEGER,"
+                " mtime TEXT, type TEXT, mode TEXT, owner TEXT, UNIQUE(nick, path));"
+                "INSERT INTO snapshot_file(id,nick,path) VALUES(500,'e','x'); DELETE FROM snapshot_file;")
+            c.close()
+            try:
+                with contextlib.redirect_stderr(io.StringIO()): bhq.db.ensure_diff_db(dp)
+            except SystemExit: print("  ensure_diff_db a quitté"); return False
+            c=sqlite3.connect(dp); c.execute("INSERT INTO snapshot_file(nick,path) VALUES('e','y')"); c.commit()
+            nid=c.execute("SELECT id FROM snapshot_file").fetchone()[0]
+            uniq=[r for r in c.execute("PRAGMA index_list(snapshot_file)") if r[2]]; c.close()
+            if (nid,uniq)!=(501,[]): print(f"  id suivant {nid}, index unique {uniq}")
+            return (nid,uniq)==(501,[])
+        check("snapshot par version : table vide, compteur AUTOINCREMENT gardé par la migration",_snapv_empty_seq)
+        def _snapv_legacy():
+            """Base d'avant le palier 2 (archive_snapshot avec path/size/mtime) : une version par (chemin, taille, date),
+            chaque archive liée à la sienne, une version identique partagée (p en a2 et a3), même taille et autre date = autre
+            version (q). Attendu en dur : 4 versions."""
+            dp=os.path.join(tmp,'snapv-legacy.db')
+            for suf in ('','-wal','-shm'):
+                if os.path.exists(dp+suf): os.unlink(dp+suf)
+            c=sqlite3.connect(dp)
+            c.executescript("CREATE TABLE archive_snapshot (nick TEXT, archive TEXT, archive_date TEXT, path TEXT, size INTEGER, mtime TEXT);"
+                            "INSERT INTO archive_snapshot VALUES ('lg','a1','d1','p',1,'m1'),('lg','a2','d2','p',2,'m2'),('lg','a2','d2','q',3,'m2'),"
+                            "('lg','a3','d3','p',2,'m2'),('lg','a3','d3','q',3,'m3');")
+            c.close()
+            try:
+                with contextlib.redirect_stderr(io.StringIO()): bhq.db.ensure_diff_db(dp)
+            except SystemExit: print("  ensure_diff_db a quitté"); return False
+            c=sqlite3.connect(dp)
+            n=c.execute("SELECT count(*) FROM snapshot_file").fetchone()[0]
+            got=sorted(c.execute("SELECT s.archive,f.path,f.size,f.mtime FROM archive_snapshot s JOIN snapshot_file f ON f.id=s.file_id").fetchall())
+            shared=c.execute("SELECT count(DISTINCT file_id) FROM archive_snapshot s JOIN snapshot_file f ON f.id=s.file_id "
+                             "WHERE f.path='p' AND s.archive IN ('a2','a3')").fetchone()[0]
+            c.close()
+            want=[('a1','p',1,'m1'),('a2','p',2,'m2'),('a2','q',3,'m2'),('a3','p',2,'m2'),('a3','q',3,'m3')]
+            if (n,got,shared)!=(4,want,1): print(f"  {n} versions, {got}, p partagé {shared}")
+            return (n,got,shared)==(4,want,1)
+        check("snapshot par version : base d'avant le palier 2 — une version par taille et date, chaque archive la sienne",_snapv_legacy)
+        def _snapv_incr_db(name,rows,diffs):
+            """Base simulée : snapshot de a1 (rows : (chemin, taille)), paire a1->a2 indexée avec diffs (type, chemin)."""
+            dp=os.path.join(tmp,name)
+            for suf in ('','-wal','-shm'):
+                if os.path.exists(dp+suf): os.unlink(dp+suf)
+            with contextlib.redirect_stderr(io.StringIO()): bhq.db.ensure_diff_db(dp)
+            c=sqlite3.connect(dp)
+            c.executemany("INSERT INTO snapshot_file(nick,path,size,mtime,type,mode,owner) VALUES('ur',?,?,'m0','-','-rw-r--r--','o:g (1:1)')",rows)
+            c.execute("INSERT INTO archive_snapshot SELECT 'ur','a1','d1',id FROM snapshot_file")
+            c.execute("INSERT INTO archive_snapshot_indexed(nick,archive,entry_count) VALUES('ur','a1',?)",(len(rows),))
+            c.execute("INSERT INTO diff_indexed_pairs(nick,archive_old,archive_new,entry_count) VALUES('ur','a1','a2',?)",(len(diffs),))
+            c.executemany("INSERT INTO diff_index(nick,archive_old,archive_new,archive_new_date,change_type,path) VALUES('ur','a1','a2','d2',?,?)",diffs)
+            c.commit(); c.close()
+            return dp
+        def _snapv_incr_unit():
+            """_indexsnap_incremental, borg simulé. Chemins changés demandés en motifs pf: (attente en dur). Chaque chemin relu ne
+            diffère de sa version précédente que par UN attribut (p1 taille, p4 droits, p5 date, p6 propriétaire, p7 type) ->
+            nouvelle version pour chacun. Changé non rendu (p8 modifié, p10 changé de type) -> ligne de a1 gardée ; ajout non
+            rendu (p3) -> absent ; nom finissant par une espace relu ; ligne hors de la liste ignorée ; ligne en double (p4) ->
+            la dernière. borg list en erreur, chemin de diff_index illisible (DbCodecError) -> None, rien écrit. Comptes rendus
+            en dur."""
+            dp=_snapv_incr_db('snapv-incr.db',[(p,sz) for p,sz in (('r/p1',1),('r/p2',2),('r/p4',4),('r/p5',5),('r/p6',6),('r/p7',7),
+                                                                    ('r/p8',8),('r/p10',10),('r/sp ',11))],
+                              [('modified','r/p1'),('mode','r/p4'),('added','r/p3'),('mtime','r/p5'),('owner','r/p6'),('removed','r/p7'),
+                               ('added link','r/p7'),('modified','r/p8'),('removed','r/p10'),('added link','r/p10'),('modified','r/sp ')])
+            calls=[]; orig=bhq.borg.boex
+            def fake(nick,args,**k):
+                calls.append(list(args))
+                return {'exitcode':rc_[0],'stdout':['-rw-r--r-- - o g 1 1 10 m0 r/p1','-rw------- - o g 1 1 99 m0 r/p4','-rw------- - o g 1 1 4 m0 r/p4',
+                        '-rw-r--r-- - o g 1 1 5 m1 r/p5','-rw-r--r-- - o2 g 2 1 6 m0 r/p6','-rw-r--r-- l o g 1 1 7 m0 r/p7',
+                        '-rw-r--r-- - o g 1 1 12 m0 r/sp ','-rw-r--r-- - o g 1 1 9 m1 r/p9',''],'stderr':[]}
+            def a2n():
+                c=sqlite3.connect(dp); n=c.execute("SELECT count(*) FROM archive_snapshot WHERE archive='a2'").fetchone()[0]; c.close(); return n
+            rc_=[2]; bhq.borg.boex=fake; g=globals(); pd=g['_path_decode']
+            try:
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                    r1=bhq._indexsnap_incremental('ur','a2','d2',{},dp); n1=a2n()
+                    rc_[0]=0; g['_path_decode']=lambda c,s: (_ for _ in ()).throw(DbCodecError('simulée'))
+                    w=io.StringIO()
+                    with contextlib.redirect_stdout(w),contextlib.redirect_stderr(w): r0=bhq._indexsnap_incremental('ur','a2','d2',{},dp)
+                    g['_path_decode']=pd; n0=a2n()
+                    r2=bhq._indexsnap_incremental('ur','a2','d2',{},dp)
+            finally: bhq.borg.boex=orig; g['_path_decode']=pd
+            c=sqlite3.connect(dp)
+            got=sorted(c.execute("SELECT f.path,f.size,f.mtime,f.type,f.mode,f.owner FROM archive_snapshot s JOIN snapshot_file f ON f.id=s.file_id "
+                                 "WHERE s.archive='a2'").fetchall())
+            old=sorted(c.execute("SELECT f.path,f.size FROM archive_snapshot s JOIN snapshot_file f ON f.id=s.file_id WHERE s.archive='a1'").fetchall())
+            c.close()
+            pats=[a for a in calls[-1] if a.startswith('pf:') or a.startswith('r/')] if calls else []
+            R='-rw-r--r--'; O='o:g (1:1)'
+            ok=(r1 is None and n1==0 and r0 is None and n0==0 and 'fallback' in w.getvalue() and r2==(9,0,0,3,1,3)
+                and pats==['pf:r/p1','pf:r/p10','pf:r/p3','pf:r/p4','pf:r/p5','pf:r/p6','pf:r/p7','pf:r/p8','pf:r/sp ']
+                and got==[('r/p1',10,'m0','-',R,O),('r/p10',10,'m0','-',R,O),('r/p2',2,'m0','-',R,O),('r/p4',4,'m0','-','-rw-------',O),
+                          ('r/p5',5,'m1','-',R,O),('r/p6',6,'m0','-',R,'o2:g (2:1)'),('r/p7',7,'m0','l',R,O),('r/p8',8,'m0','-',R,O),
+                          ('r/sp ',12,'m0','-',R,O)]
+                and old==[('r/p1',1),('r/p10',10),('r/p2',2),('r/p4',4),('r/p5',5),('r/p6',6),('r/p7',7),('r/p8',8),('r/sp ',11)])
+            if not ok: print(f"  erreur borg {r1} {n1} ; codec {r0} {n0} {w.getvalue()[-80:]!r} ; {r2} motifs {pats} a2 {got} a1 {old}")
+            return ok
+        check("snapshot par version : incrémental (borg simulé) — motifs pf:, chemin non rendu gardé, ligne hors liste ignorée, erreur borg -> rien écrit",_snapv_incr_unit)
+        def _snapv_bounds_nulls():
+            """Bornes du relu : 5000 chemins changés -> borg list ; 5001 -> None sans borg ; 260 chemins de 4000 caractères
+            (> 1 Mo de motifs, E2BIG au-delà de 2 Mo) -> None sans borg ; borg list non lançable (OSError) -> None, rien écrit. Versions à attributs NULL (taille, date) : une
+            seule ligne pour deux archives (égalité IS)."""
+            res=[]; orig=bhq.borg.boex
+            for n,ln in ((5000,8),(5001,8),(260,4000)):
+                paths=[f"d/{i:0{ln-2}d}" for i in range(n)]
+                dp=_snapv_incr_db('snapv-bound.db',[('d/zz',1)],[('added',p) for p in paths])
+                calls=[]
+                bhq.borg.boex=lambda nick,args,**k: (calls.append(1),{'exitcode':0,'stdout':[],'stderr':[]})[1]
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                        r=bhq._indexsnap_incremental('ur','a2','d2',{},dp)
+                finally: bhq.borg.boex=orig
+                res.append((r is None,len(calls)))
+            dp=_snapv_incr_db('snapv-bound.db',[('d/zz',1)],[('added','d/a')])
+            def boom(nick,args,**k): raise OSError(7,'Argument list too long')
+            bhq.borg.boex=boom; w=io.StringIO()
+            try:
+                with contextlib.redirect_stdout(w),contextlib.redirect_stderr(w): r=bhq._indexsnap_incremental('ur','a2','d2',{},dp)
+            finally: bhq.borg.boex=orig
+            c=sqlite3.connect(dp); na2=c.execute("SELECT count(*) FROM archive_snapshot WHERE archive='a2'").fetchone()[0]; c.close()
+            res.append((r is None,na2,'snapshot complet' in w.getvalue()))
+            dp=os.path.join(tmp,'snapv-null.db')
+            for suf in ('','-wal','-shm'):
+                if os.path.exists(dp+suf): os.unlink(dp+suf)
+            f=[{'path':'x/d','size':None,'mtime':None,'type':'d','mode':'drwxr-xr-x','owner':'o:g (1:1)'}]
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                bhq.db.ensure_diff_db(dp); bhq.db.store_archive_snapshot('nl','a1','d1',f,dp); bhq.db.store_archive_snapshot('nl','a2','d2',f,dp)
+            c=sqlite3.connect(dp)
+            nv=c.execute("SELECT count(*) FROM snapshot_file").fetchone()[0]; nl=c.execute("SELECT count(DISTINCT file_id),count(*) FROM archive_snapshot").fetchone()
+            c.close()
+            ok=res==[(False,1),(True,0),(True,0),(True,0,True)] and nv==1 and nl==(1,2)
+            if not ok: print(f"  bornes {res} ; NULL : {nv} version(s), liens {nl}")
+            return ok
+        check("snapshot par version : bornes du relu (5000 chemins, 1 Mo de motifs) ; versions à attributs NULL partagées",_snapv_bounds_nulls)
+        def _snapv_autorepair():
+            """Auto-réparation (type/mode/owner NULL) : seules les versions de l'archive que l'incrémental clonerait comptent.
+            NULL liés à a1 seul (archive plus ancienne, jamais réécrite depuis 1.0.164) -> a3 en incrémental ; NULL liés à a2
+            (précédente) -> snapshot complet (auto-réparation). indexsnap réel, borg simulé."""
+            out=[]; orig=bhq.borg.boex
+            for null_in in ('a1','a2'):
+                dp=os.path.join(tmp,'snapv-repair.db')
+                for suf in ('','-wal','-shm'):
+                    if os.path.exists(dp+suf): os.unlink(dp+suf)
+                with contextlib.redirect_stderr(io.StringIO()): bhq.db.ensure_diff_db(dp)
+                c=sqlite3.connect(dp)
+                for a in ('a1','a2'):
+                    nul=a==null_in
+                    c.execute("INSERT INTO snapshot_file(nick,path,size,mtime,type,mode,owner) VALUES('qp','r/f',?,?,?,?,?)",
+                              (1 if a=='a1' else 2,'m-'+a,None if nul else '-',None if nul else '-rw-r--r--',None if nul else 'o:g (1:1)'))
+                    c.execute("INSERT INTO archive_snapshot SELECT 'qp',?,?,max(id) FROM snapshot_file",(a,'d'+a[1]))
+                    c.execute("INSERT INTO archive_snapshot_indexed(nick,archive,entry_count) VALUES('qp',?,1)",(a,))
+                c.execute("INSERT INTO diff_indexed_pairs(nick,archive_old,archive_new,entry_count) VALUES('qp','a2','a3',1)")
+                c.execute("INSERT INTO diff_index(nick,archive_old,archive_new,archive_new_date,change_type,path) VALUES('qp','a2','a3','d3','modified','r/f')")
+                c.commit(); c.close()
+                bhq.borg.boex=lambda nick,args,**k: {'exitcode':0,'stdout':['-rw-r--r-- - o g 1 1 3 m-a3 r/f'],'stderr':[]}
+                try: o=_q_run(bhq.indexsnap,'qp',db_path=dp,archives=[{'name':a,'start':'d'+a[1]} for a in ('a1','a2','a3')])
+                finally: bhq.borg.boex=orig
+                out.append(('incrémental)' in o,'auto-réparation' in o))
+            if out!=[(True,False),(False,True)]: print(f"  (incrémental, auto-réparation) : {out}")
+            return out==[(True,False),(False,True)]
+        check("snapshot par version : auto-réparation limitée à l'archive précédente (NULL d'une archive plus ancienne : incrémental)",_snapv_autorepair)
         check("casse du préfixe (AD-16) : /Etc et /etc distincts dans les deux modes",lambda: (lambda p,e:p==e and 'Etc' in json.dumps(p) and 'passwd' not in json.dumps(p))(
               *_q_pair(bhq.treehist,'Etc',as_json=True,key=True)))
         check("préfixe a%b : le frère aXYZb n'apparaît jamais (plain et chiffré)",lambda: all('aXYZb' not in _q_run(bhq.treehist,n,'a%b',as_json=True)+_q_run(bhq.treefind,n,'a%b','*',as_json=True) for n in ('qp','qe')))
@@ -10610,7 +10935,9 @@ def codec_selftest(pattern=None,list_only=False):
             c=_open_db(dp,nick=nk,role='write')
             for a in ('A2','A4'):
                 for p in ('/c','/x'):
-                    c.execute("INSERT OR IGNORE INTO snapshot_file (nick,path,size) VALUES (?,?,1)",(nk,_path_stored(c,p)))
+                    # 1.0.164 : plus d'UNIQUE(nick,path) — une seule version par chemin, réutilisée
+                    c.execute("INSERT INTO snapshot_file (nick,path,size) SELECT ?,?,1 WHERE NOT EXISTS "
+                              "(SELECT 1 FROM snapshot_file WHERE nick=? AND path=?)",(nk,_path_stored(c,p),nk,_path_stored(c,p)))
                     fid=c.execute("SELECT id FROM snapshot_file WHERE nick=? AND path=?",(nk,_path_stored(c,p))).fetchone()[0]
                     c.execute("INSERT INTO archive_snapshot (nick,archive,archive_date,file_id) VALUES (?,?,?,?)",(nk,a,dates[a],fid))
                 c.execute("INSERT INTO archive_snapshot_indexed (nick,archive,entry_count) VALUES (?,?,2)",(nk,a))
@@ -13214,6 +13541,84 @@ def codec_selftest(pattern=None,list_only=False):
                              f"Report {mods} snapshot {types} anciens {older} {sorted(k for k in snap if k[1] in ('f1','p','lk'))} d {dmode} ; DiffBkp {od[-200:]!r}")
             return ok
         _rbc("changement de type d'entrée sur vrai borg : fichier devenu lien, fifo devenu fichier, lien devenu fichier — comptes, snapshot, DiffBkp et Index",_type_change_real_borg)
+        def _snapv_real_borg():
+            """1.0.164 (story 27, A39) : vrai borg, base en clair (sv) et chiffrée (sve, DbEncrypt après le 1er Index). t-1 et t-2 :
+            a (10 o), b, c (644), dl (fichier), d/f ; t-3 : a (20 o), c (600), dl lien, d/f réécrit, x/ ajouté avec x/k et
+            x/skip (IDX_EXCLUDE). Snapshot de t-2 complet (1er Index), de t-3 incrémental. Attendu (en dur) : t-2 garde a 10 o,
+            c -rw-r--r--, dl fichier ; t-3 a 20 o (date différente), c -rw-------, dl lien, x et x/k présents, x/skip jamais
+            lié ; b : même ligne dans les deux archives ; Index -S -F (snapshot complet de t-3) laisse t-2 identique ; t-4 (a
+            supprimé, 2 versions) : a absent de t-4 ; jamais deux versions identiques ni deux lignes d'un chemin par archive."""
+            import datetime as _dtm
+            ts=lambda m: (_dtm.datetime.utcnow()-_dtm.timedelta(minutes=m)).strftime('%Y-%m-%dT%H:%M:%S')
+            borg=shutil.which('borg'); me=os.path.realpath(__file__); ok=True
+            for nk,extra in (('sv','DB_ENCRYPT=false\n'),('sve','DB_ENCRYPT=true\nDB_KDF=light\n')):
+                d=os.path.join(tmp,'snapv-'+nk); src=os.path.join(d,'src'); bb=os.path.join(d,'bb'); repo=os.path.join(d,'repo')
+                os.makedirs(os.path.join(src,'d'))
+                env=_rb_env(bb,BORG_PASSPHRASE='pw-sv')
+                def bg(*a):
+                    r=_rb_run([borg,*a],120,env=env)
+                    if r.returncode not in (0,1): raise RuntimeError(f"borg {a[0]} (code {r.returncode}) : {r.stderr[-300:]}")
+                def wr(q,s,m=0o644):
+                    with open(os.path.join(src,q),'w') as f: f.write(s)
+                    os.chmod(os.path.join(src,q),m)
+                bg('init','-e','repokey',repo)
+                wr('a','0123456789'); wr('b','b'); wr('c','c'); wr('dl','dl'); wr('d/f','f'); wr('e ','e')
+                w=os.path.join(d,'borgw'); _rb_wrapper(w,bb); rc=os.path.join(d,'rc'); cache=os.path.join(d,'cache')
+                with open(rc,'w') as f:
+                    f.write(f"[DEFAULT]\nCACHE_DIR={cache}\n\n[{nk}]\nBORG_REPO={repo}\nBORG_PASSPHRASE=pw-sv\nSER_NAME=sv\n"
+                            f"SER_LOGIN=x\nGLOB_ARCH=t-*\nBORG_ARCHNAME=t\nBORG_ROOTBKP={src}\nEXCLUDE=--exclude-caches\n{extra}"
+                            f"IDX_EXCLUDE=*/x/skip\nBORG_EXE={w}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\n")
+                os.chmod(rc,0o600)
+                cenv=_rb_cli_env(bb)
+                def cli(*a):
+                    p=_rb_run([me,'-C',rc,'-c',*a],300,env=cenv); return p.returncode,p.stdout+p.stderr
+                bg('create','--timestamp',ts(20),f'{repo}::t-1',src); bg('create','--timestamp',ts(15),f'{repo}::t-2',src)
+                c0,_o=cli('Index','-n',nk)
+                ce,oe=cli('DbEncrypt','-n',nk,'-y') if nk=='sve' else (0,'')
+                time.sleep(1.1)
+                wr('a','01234567890123456789'); os.chmod(os.path.join(src,'c'),0o600); wr('e ','ee')
+                os.remove(os.path.join(src,'dl')); os.symlink('b',os.path.join(src,'dl')); wr('d/f','ff')
+                os.makedirs(os.path.join(src,'x')); wr('x/k','k'); wr('x/skip','s')
+                bg('create','--timestamp',ts(10),f'{repo}::t-3',src); c1,o1=cli('Index','-n',nk)
+                dp=BorgHelper(cfgfile=rc,cache_dir=cache).db.get_diff_db(nk)
+                dups=[]
+                def snap():
+                    c=_open_db(dp,nick=nk,role='read',passphrase='pw-sv')
+                    try:
+                        rows={}; n=0
+                        for a,p,sz,mt,ty,mo,fid in c.execute("SELECT s.archive,f.path,f.size,f.mtime,f.type,f.mode,f.id FROM archive_snapshot s "
+                                                            "JOIN snapshot_file f ON f.id=s.file_id WHERE s.nick=?",(nk,)):
+                            lp=_path_decode(c,p); n+=1
+                            if lp.startswith(src.lstrip('/')+'/'): rows[(a,lp[len(src.lstrip('/'))+1:])]=(sz,mt,ty,mo,fid)
+                        same=c.execute("SELECT count(*) FROM (SELECT 1 FROM snapshot_file WHERE nick=? GROUP BY path,size,mtime,type,mode,owner "
+                                       "HAVING count(*)>1)",(nk,)).fetchone()[0]
+                        per=c.execute("SELECT count(*) FROM (SELECT s.archive,f.path FROM archive_snapshot s JOIN snapshot_file f "
+                                      "ON f.id=s.file_id WHERE s.nick=? GROUP BY s.archive,f.path HAVING count(*)>1)",(nk,)).fetchone()[0]
+                        if same or per: dups.append((same,per))
+                        return rows
+                    finally: c.close()
+                s1=snap()
+                c2,_o=cli('Index','-n',nk,'-S','-F'); s2=snap()
+                time.sleep(1.1); os.remove(os.path.join(src,'a'))
+                bg('create','--timestamp',ts(5),f'{repo}::t-4',src); c3,o3=cli('Index','-n',nk); s3=snap()
+                g=lambda s,a,q,i: (s.get((a,q)) or (None,)*5)[i]
+                enc=_open_db(dp,nick=nk,role='read',passphrase='pw-sv'); coded=enc.codec is not None; enc.close()
+                t1=(g(s1,'t-2','a',0),g(s1,'t-2','c',3),g(s1,'t-2','dl',2)); t2=(g(s1,'t-3','a',0),g(s1,'t-3','c',3),g(s1,'t-3','dl',2))
+                new=(('t-3','x') in s1,('t-3','x/k') in s1,('t-3','x/skip') in s1)
+                incr=lambda o: ', incrémental)' in o and 'échoué' not in o and 'auto-réparation' not in o
+                r=((c0,ce,c1,c2,c3)==(0,0,0,0,0) and incr(o1) and incr(o3) and coded==(nk=='sve')
+                   and ('t-4','a') not in s3 and ('t-4','b') in s3 and ('t-3','a') in s3 and not dups
+                   and t1==(10,'-rw-r--r--','-') and t2==(20,'-rw-------','l') and g(s1,'t-2','a',1)!=g(s1,'t-3','a',1)
+                   and new==(True,True,False) and g(s1,'t-2','b',4) is not None and g(s1,'t-2','b',4)==g(s1,'t-3','b',4)
+                   and g(s1,'t-2','d/f',0)==1 and g(s1,'t-3','d/f',0)==2 and g(s1,'t-2','e ',0)==1 and g(s1,'t-3','e ',0)==2
+                   and g(s2,'t-3','e ',0)==2
+                   and {k:v for k,v in s2.items() if k[0]=='t-2'}=={k:v for k,v in s1.items() if k[0]=='t-2'}
+                   and (g(s2,'t-3','a',0),g(s2,'t-3','c',3),g(s2,'t-3','dl',2))==(20,'-rw-------','l'))
+                if not r: print(f"  {nk} : codes {(c0,ce,c1,c2,c3)} doublons {dups} t-4 a {('t-4','a') in s3} b {('t-4','b') in s3} chiffrée {coded} incrémental {incr(o1)}/{incr(o3)} t-2 {t1} t-3 {t2} x {new} "
+                                f"« e  » {g(s1,'t-2','e ',0)}/{g(s1,'t-3','e ',0)}/{g(s2,'t-3','e ',0)} b {g(s1,'t-2','b',4)}/{g(s1,'t-3','b',4)} d/f {g(s1,'t-2','d/f',0)}/{g(s1,'t-3','d/f',0)} ; Index {o1[-300:]!r} {oe[-200:]!r}")
+                ok=ok and r
+            return ok
+        _rbc("snapshot par version sur vrai borg : archive ancienne garde taille, droits et type ; inchangé partagé ; enfant exclu jamais lié ; clair et chiffré",_snapv_real_borg)
         def _diff_type_change_split():
             """1.0.163 (story 26, A38) : parse_diff_entries_json — lignes mesurées sur borg 1.2.6 (m25b, m26b)."""
             L=lambda path,*ch: json.dumps({'path':path,'changes':list(ch)})

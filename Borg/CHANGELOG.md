@@ -1,5 +1,39 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.164 — snapshots par version, convertisseur borgmatic — 2026-09-30
+
+Chantier « reconstruction progressive », story 27 (actions de rétrospective A37, note de l'utilisateur, et A39).
+
+- **Snapshots par version** : `snapshot_file` garde une ligne par chemin **et** attributs (taille, date, type, droits,
+  propriétaire), partagée par les archives où elle est identique et jamais modifiée sur place : la base garde les
+  valeurs de chaque archive (vérifié par la base, vrai borg), que lisent les lecteurs par archive (vue
+  `archive_snapshot_v` : lignes « présent » de `Search`/`FileHist`, `DuIdx`) — avant, une seule ligne par chemin, mise à
+  jour à chaque snapshot, donnait l'état actuel.
+- **Schéma `diff.db` 11** : migration automatique à la première ouverture, SQL seul, une transaction (table reconstruite
+  sans `UNIQUE(nick, path)`, ids, liens et compteur gardés, vue recréée ; 3 s pour un million de chemins, mesuré). Le
+  passé n'est pas reconstitué. Un borgHelper plus ancien refuse ensuite la base (régénérable). La migration des bases
+  d'avant le palier 2 crée une version par taille et date.
+- **Snapshot incrémental** : tout chemin changé (ajouté, modifié, droits, propriétaire, date, changement de type) est
+  relu par `borg list` (motifs `pf:`, ce chemin seul) — avant, seuls les ajouts, et un `modified` ne changeait que la
+  taille. Repli sur le snapshot complet au-delà de 5 000 chemins changés ou de 1 Mo de motifs (ligne de commande), et
+  si `borg list` ne peut être lancé. Un chemin changé que `borg list` ne rend pas garde la ligne de l'archive précédente ;
+  un chemin rendu deux fois (racines imbriquées) n'est lié qu'une fois.
+- **Auto-réparation** (type/droits/propriétaire inconnus) : ne regarde plus que l'archive précédente — les versions
+  anciennes n'étant plus réécrites, elle aurait sinon forcé un snapshot complet à chaque Index.
+- **Corrigé** : un nom de fichier finissant par une espace était tronqué dans le snapshot (complet et incrémental).
+- **Corrigé, base chiffrée** : le snapshot incrémental passait les chemins chiffrés de `diff_index` à `borg list` (aucune
+  ligne rendue : fichiers ajoutés absents du snapshot) et à `IDX_INCLUDE`/`IDX_EXCLUDE`.
+- **Corrigé** : un répertoire ajouté faisait entrer tout son contenu dans le snapshot incrémental, enfants exclus par
+  `IDX_EXCLUDE` compris (`borg list` d'un chemin simple liste son sous-arbre).
+- Snapshot complet : premier snapshot plus lent (mesuré, 300 000 chemins : 11,8 s au lieu de 5,2 s), suivants plus
+  rapides (8,0 s au lieu de 25,4 s).
+- **Nouveau script `borgmatic2borghelper` 1.0.0** (fichier à part, PyYAML requis) : convertit une configuration
+  borgmatic 1.7 (sections) ou 1.8+ (à plat) en sections `.borghelperrc` — aperçu sur stdout, non converti sur stderr
+  (valeurs à `${…}`, `{credential …}`, `~`, valeurs non textuelles au sens de YAML 1.1, clés sans équivalent), `-o` écrit
+  un rc neuf en 0600 (jamais d'écrasement ni de fusion), `-e` nicks externes, `-p` préfixe, `--selftest`.
+- CodecSelfTest : contrôles « snapshot par version » (migration en clair et chiffrée, refus par un binaire de schéma 10,
+  palier 2, incrémental à borg simulé, bornes et attributs NULL, auto-réparation, vrai borg en clair et chiffré).
+
 ## borgHelper 1.0.163 — plusieurs chemins par nick, changement de type d'entrée — 2026-09-30
 
 Chantier « reconstruction progressive », story 26 (actions de rétrospective A36, note de l'utilisateur, et A38).

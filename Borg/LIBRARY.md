@@ -571,12 +571,14 @@ SELECT change_type, SUM(file_count) AS nb, SUM(total_size)/1048576 AS size_MB
 FROM diff_excluded_stats WHERE nick='mon-serveur'
 GROUP BY change_type;"
 
-# Recherche dans le snapshot (dernière archive)
+# Recherche dans le snapshot (dernière archive) — snapshot_file : une ligne par VERSION d'un chemin (1.0.164),
+# toujours filtrer sur l'archive voulue (sans filtre : une ligne par archive et par version)
 sqlite3 -header -column $DB "
 SELECT sf.path, sf.size/1024 AS size_KB, sf.mtime
 FROM snapshot_file sf
 JOIN archive_snapshot s ON s.file_id = sf.id
 WHERE s.nick='mon-serveur' AND sf.path LIKE '%nginx%'
+  AND s.archive=(SELECT archive FROM archive_snapshot WHERE nick='mon-serveur' ORDER BY archive_date DESC LIMIT 1)
 LIMIT 20;"
 ```
 

@@ -197,13 +197,16 @@ Sentinelle d'idempotence pour les diffs — une ligne par paire (archive_old, ar
 Empêche de ré-indexer une paire déjà traitée. Purge des lignes orphelines par `Prune`.
 
 #### `snapshot_file`
-Dictionnaire global des chemins de fichiers avec leur taille, mtime, type, droits et propriétaire.  
-Contrainte `UNIQUE(nick, path)` — le même chemin n'est stocké qu'une seule fois par nick (déduplication).  
+Une ligne par **version** d'un chemin (1.0.164, schéma 11, story 27) : chemin + taille, mtime, type, droits et
+propriétaire. Une version est partagée par toutes les archives où elle est identique (égalité `IS`, `NULL` compris) et
+n'est jamais modifiée sur place : une archive ancienne garde ses propres valeurs (avant : `UNIQUE(nick, path)`, une ligne
+par chemin mise à jour par chaque snapshot — l'archive ancienne montrait l'état actuel). Plus de contrainte d'unicité ;
+index `(nick, path)` gardé. Écriture par `_snap_link_versions` (insertion si absente, puis liaison).  
 `type` : code borg (`{type}` de `borg list --format`) — `d` répertoire, `-` fichier, `l` lien symbolique,
 `p` fifo, `s` socket, `b`/`c` périphérique bloc/caractère.  
-`mode` : droits unix ls-style (`{mode}` de `borg list --format`, ex. `drwxr-xr-x`) — dernier état connu.  
+`mode` : droits unix ls-style (`{mode}` de `borg list --format`, ex. `drwxr-xr-x`).  
 `owner` : propriétaire construit depuis `{user}:{group} ({uid}:{gid})` de `borg list --format` (ex.
-`root:root (0:0)`) — dernier état connu.  
+`root:root (0:0)`).  
 `NULL` pour les lignes écrites avant l'ajout de ces colonnes (migrations `ALTER TABLE` automatiques dans
 `ensure_diff_db()`, ré-indexer pour peupler). Utilisées par `TreeHist` pour les colonnes « genre »/« droits »/« propriétaire ».
 
@@ -356,7 +359,7 @@ erDiagram
     snapshot_file {
         INTEGER id PK
         TEXT nick
-        TEXT path "UNIQUE(nick, path)"
+        TEXT path "une ligne par version (1.0.164)"
         INTEGER size
         TEXT mtime "ISO datetime"
         TEXT type "code borg d/-/l/p/s/b/c, NULL si non réindexé"
@@ -427,7 +430,7 @@ erDiagram
 | `diff_index` | `idx_diff_nick_newtype` | `(nick, archive_new, change_type)` | stats Report |
 | `diff_index` | `idx_diff_nick_date` | `(nick, archive_new_date)` | filtres plage `-b`/`-B` |
 | `diff_indexed_pairs` | `idx_pairs_nick` | `(nick)` | suppressions Prune |
-| `snapshot_file` | `idx_snapfile_nick_path` | `(nick, path)` | insertion / lookup |
+| `snapshot_file` | `idx_snapfile_nick_path` | `(nick, path)` | version existante / lookup |
 | `archive_snapshot` | `idx_snap_nick_archive` | `(nick, archive)` | suppressions Prune |
 | `archive_stats` | `idx_astats_nick` | `(nick)` | Report -o, suppressions Prune |
 | `diff_excluded_stats` | `idx_exclu_nick_arch` | `(nick, archive_new)` | consultation stats exclus |
@@ -591,10 +594,9 @@ l'inverse) que par `mode` avec `old_mode`/`new_mode` (mesuré, borg 1.2.6). `par
 entrées indexées comme exclues) le scinde en deux entrées, `removed[ <type>]` puis `added[ <type>]` (fichier : taille 0,
 inconnue), d'après le 1er caractère des modes ; même type (chmod d'un répertoire) ou type inconnu : `mode` tel quel.
 Le `mode` est cherché dans toute la liste des changements : borg range `owner` avant `mode` (mesuré). `snapshot_file`
-(une ligne par chemin, partagée par les snapshots de toutes les archives) est mis à jour sur place
-(`_SNAPFILE_UPSERT`, `ON CONFLICT … DO UPDATE`) : `INSERT OR REPLACE` changeait l'id, et les snapshots plus anciens qui
-citaient le chemin le perdaient (snapshot incrémental comme complet). FileHist/TreeHist trient à date égale par `id`
-(retrait avant ajout).
+était alors une ligne par chemin mise à jour sur place (`INSERT OR REPLACE` changeait l'id et les snapshots plus anciens
+perdaient le chemin) ; depuis 1.0.164, une ligne par version (voir `snapshot_file`). FileHist/TreeHist trient à date égale
+par `id` (retrait avant ajout).
 Comptes de Report, snapshot incrémental (retrait puis ajout avec `borg list` : nouveau type) et TreeHist suivent sans
 autre changement ; avant, le snapshot gardait l'ancien type. Paires indexées avant : inchangées (`Index -F`).
 
@@ -778,13 +780,21 @@ _shadow_swap : purge IDX_* (idxpurge(db_path=fantôme) — Index filtre déjà �
 Tentative incrémentale (_indexsnap_incremental) — sauf si -F :
     ├── cherche snapshot précédent + diff_indexed_pairs pour la paire prev→new
     ├── si introuvable ou diff absent → fallback borg list complet
-    ├── charge diffs (diff_index) : added / removed / modified
-    ├── si > 5 000 ajouts → fallback borg list complet
+    ├── charge diffs (diff_index), chemins DÉCODÉS (1.0.164 : en base chiffrée, les chemins stockés partaient
+    │   tels quels à borg list — ajouts perdus — et à IDX_INCLUDE/IDX_EXCLUDE)
+    ├── supprimés ; changés = tout chemin non supprimé (ajout, contenu, mode, owner, ctime/mtime, nouveau type)
+    ├── si > 5 000 chemins changés ou > 1 Mo de motifs (E2BIG au-delà d'ARG_MAX) → fallback borg list complet
+    │   (aussi si borg list ne peut être lancé : OSError)
+    ├── changés → borg list --format '{mode} {type} … {path}{NL}' ::<archive> pf:<chemin>…  (AVANT toute écriture)
+    │             pf: = ce chemin seul (mesuré, borg 1.2.6 : un chemin simple liste tout le sous-arbre, enfants
+    │             exclus compris ; chemin absent : code 0, aucune ligne) ; lignes hors de la liste ignorées ;
+    │             jamais strip() (nom finissant par une espace) ; chemin rendu deux fois : une seule version liée
     ├── clone archive_snapshot prev → new (INSERT OR IGNORE)
-    ├── removed → DELETE archive_snapshot + _cleanup_snapshot_file_orphans
-    ├── modified → UPDATE snapshot_file.size (mtime conservé)
-    ├── added   → borg list --format '{size} {isomtime} {path}{NL}' ::<archive> [paths]
-    │             → INSERT OR REPLACE snapshot_file + archive_snapshot
+    ├── supprimés → DELETE archive_snapshot (file_id IN : toutes les versions du chemin) — sauf supprimé ET changé
+    │               (changement de type) non rendu par borg list : ligne clonée gardée
+    ├── relus     → DELETE de la ligne clonée, puis _snap_link_versions (version exacte, créée si absente) ;
+    │               chemin changé non rendu par borg list : ligne clonée gardée
+    ├── _cleanup_snapshot_file_orphans (versions plus liées à aucune archive)
     └── INSERT archive_snapshot_indexed ; commit
     Affichage : "(+N -N ~N, incrémental)"
 
@@ -792,7 +802,7 @@ Fallback borg list complet (si force, ou si incrémental échoue) :
     borg list --format '{size} {isomtime} {path}{NL}' ::<archive>
         ↓
     filtre IDX_INCLUDE/IDX_EXCLUDE
-        ├── inclus → snapshot_file + archive_snapshot + archive_snapshot_indexed
+        ├── inclus → _snap_link_versions (snapshot_file + archive_snapshot) + archive_snapshot_indexed
         └── exclus → snap_excluded_stats
         ↓
     INSERT archive_snapshot_indexed
@@ -2157,7 +2167,7 @@ La `schema_version` ne change **pas** à chaque release — seulement lors d'un 
 
 | Constante | Valeur actuelle |
 |-----------|-----------------|
-| `DIFF_DB_SCHEMA_VERSION` (maximale comprise) | `6` (base écrite : `DIFF_DB_BASE_SCHEMA_VERSION` = `4`) |
+| `DIFF_DB_SCHEMA_VERSION` (maximale comprise) | `11` (base écrite : `DIFF_DB_BASE_SCHEMA_VERSION` = `11`, 1.0.164) |
 | `CACHE_DB_SCHEMA_VERSION` (maximale comprise) | `2` (base écrite : `CACHE_DB_BASE_SCHEMA_VERSION` = `1`) |
 | `SCOPE_CACHE_DB_SCHEMA_VERSION` (borgHelperWWW, maximale comprise) | `2` (base écrite : `SCOPE_CACHE_DB_BASE_SCHEMA_VERSION` = `1`) |
 
@@ -2180,6 +2190,7 @@ sans risque même après une migration partielle ou un `schema_version` désynch
 | 9 | `bkp_status.changed_during_backup` / `read_errors` (1.0.118) | colonnes absentes | `ALTER TABLE ADD COLUMN` — écrites par `store_bkp_status_finish`, relues par `list_pending_bkp_status` : le watcher de borgHelperWWW les joint au payload de la notification de fin (`_send_bkp_push(..., warnings)`) ; NULL (Bkp antérieur) = omis du payload |
 | 8 | `archive_stats.changed_during_backup` / `read_errors` (1.0.117) | colonnes absentes | `ALTER TABLE ADD COLUMN` — NULL = inconnu (archives antérieures, ou rattrapées par Index : ces statuts ne sont connus qu'au Bkp). *Depuis 1.0.139 : colonnes retirées (palier 10), mesures dans `history.db` `archive_measure` ; `store_archive_stats` ne porte plus C/E* |
 | 10 | mesures → `history.db` (1.0.139) | tables `repo_stats`/`bkp_status` ou C/E non NULL présentes dans `diff.db` | `_migrate_to_history` (voir « Base de données `history.db` ») ; version de schéma **et** version de base à 10 |
+| 11 | `snapshot_file` par version (1.0.164, story 27) | index unique sur `snapshot_file` (`PRAGMA index_list`) | `_migrate_snapshot_versions()` : reconstruction sans `UNIQUE(nick, path)` en une transaction, SQL seul (base chiffrée : chemins copiés tels quels, sans passphrase) ; ids, liens `archive_snapshot` et compteur `AUTOINCREMENT` gardés ; vue `archive_snapshot_v` retirée puis recréée (`ALTER TABLE … RENAME` refuse une vue qui cite la table supprimée, mesuré sur SQLite 3.37.2). Les lignes existantes restent partagées : le passé n'est pas reconstitué, seuls les snapshots suivants ont leurs versions. Version de schéma et de base à 11 : un binaire plus ancien refuse la base (`SchemaVersionError`), régénérable. Palier 2 adapté : une version par (chemin, taille, mtime) de l'ancienne table |
 
 `ensure_diff_db()` est désormais garanti appelé (donc les migrations garanties appliquées) avant tout
 accès à `diff.db`/`cache.db` depuis **Bkp**, **Index**, **Prune** et tous les autres consommateurs —
@@ -2189,7 +2200,9 @@ et `clear_cache_nick()` opérer sur un schéma non migré.
 Les lignes `snapshot_file` déjà écrites avant les migrations 2/3/4 gardent `type`/`mode`/`owner` à `NULL` jusqu'à
 réindexation du snapshot — `indexsnap()` s'auto-répare au besoin (voir CHANGELOG 1.0.89/1.0.92/1.0.93) : un
 `type IS NULL OR mode IS NULL OR owner IS NULL` détecté force un resnapshot complet une fois, sans
-intervention manuelle.
+intervention manuelle. Depuis 1.0.164 (versions jamais réécrites), le contrôle ne porte que sur les versions liées à
+l'archive que l'incrémental clonerait (dernière indexée avant la nouvelle) : des versions NULL restées liées à des
+archives plus anciennes forceraient sinon un snapshot complet à chaque Index, jusqu'à leur purge.
 
 ---
 

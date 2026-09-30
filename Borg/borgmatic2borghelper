@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""borgmatic2borghelper — convertit une configuration borgmatic (YAML) en sections de .borghelperrc.
+
+Script tiers de borgHelper (story 27, A37). N'écrit jamais dans un rc existant : aperçu sur stdout (sections rc),
+options non converties sur stderr ; -o FICHIER écrit un rc NEUF (0600, refus si le fichier existe).
+
+Formats lus : borgmatic 1.7 (sections location:/storage:/retention:/consistency:/hooks:/output:) et 1.8+ (à plat) ;
+repositories en chaînes ou en objets (path, label).
+"""
+import os,sys,re,shlex,socket,getpass,argparse,datetime,io,tempfile,subprocess,configparser,contextlib
+
+Version="1.0.0"
+
+# Sections de borgmatic ≤ 1.7 (aplaties en 1.8.0) : leurs clés sont remontées au premier niveau.
+_SECTIONS=('location','storage','retention','consistency','hooks','output')
+# Format d'archive par défaut de borgmatic (1.7 comme 1.8+).
+_DEFAULT_ARCHIVE_FORMAT='{hostname}-{now:%Y-%m-%dT%H:%M:%S.%f}'
+_KEEP={'keep_hourly':'KEEP_HOURLY','keep_daily':'KEEP_DAILY','keep_weekly':'KEEP_WEEKLY','keep_monthly':'KEEP_MONTHLY',
+       'keep_yearly':'KEEP_YEARLY'}
+# Options de borg create reprises dans EXCLUDE (borgHelper la découpe sur les espaces).
+_EXCL_FLAGS={'exclude_caches':'--exclude-caches','keep_exclude_tags':'--keep-exclude-tags','exclude_nodump':'--exclude-nodump',
+             'one_file_system':'--one-file-system'}
+_EXCL_VALUED={'exclude_patterns':'--exclude','exclude_from':'--exclude-from','patterns':'--pattern',
+              'patterns_from':'--patterns-from','exclude_if_present':'--exclude-if-present'}
+# Clés sans usage pour borgHelper, jamais signalées : consommées ici.
+_CONSUMED={'repositories','constants'}
+
+class ConvError(Exception): pass
+
+def _load_yaml(path):
+    try: import yaml
+    except ImportError: raise ConvError("PyYAML absent (paquet python3-yaml) — conversion impossible")
+    try:
+        with open(path) as f: data=yaml.safe_load(f)
+    except OSError as e: raise ConvError(f"{path} : illisible ({e.strerror})")
+    except yaml.YAMLError as e:
+        msg=str(e).splitlines()[0]
+        if '!include' in str(e): msg="balise !include non prise en charge (fusionner les fichiers d'abord)"
+        raise ConvError(f"{path} : YAML invalide — {msg}")
+    if not isinstance(data,dict): raise ConvError(f"{path} : pas une configuration borgmatic (mapping attendu)")
+    return data
+
+def _flatten(data):
+    """1.7 -> 1.8 : clés des sections remontées. -> (options à plat, {clé: section d'origine})."""
+    flat={}; origin={}
+    for k,v in data.items():
+        if k in _SECTIONS and isinstance(v,dict):
+            for k2,v2 in v.items(): flat[k2]=v2; origin[k2]=f"{k}.{k2}"
+        else: flat[k]=v; origin[k]=k
+    return flat,origin
+
+def _constants(flat):
+    """constants: {nom: valeur} -> « {nom} » remplacé dans toutes les chaînes (comme borgmatic)."""
+    consts=flat.get('constants') or {}
+    if not isinstance(consts,dict) or not consts: return flat
+    def sub(v):
+        if isinstance(v,str):
+            for n,c in consts.items(): v=v.replace('{'+str(n)+'}',str(c))
+            return v
+        if isinstance(v,list): return [sub(x) for x in v]
+        if isinstance(v,dict): return {k:sub(x) for k,x in v.items()}
+        return v
+    return {k:(v if k=='constants' else sub(v)) for k,v in flat.items()}
+
+def _as_list(v):
+    if v is None: return []
+    return v if isinstance(v,list) else [v]
+
+def _placeholders(s):
+    """Motif d'archives : marqueurs borg résolus sur CETTE machine, comme borg ({hostname} = nom COURT, {fqdn}, {user}),
+    les autres -> '*'."""
+    vals={'hostname':socket.gethostname().split('.')[0],'fqdn':socket.getfqdn(),'user':getpass.getuser()}
+    return re.sub(r'\{([a-z_]+)(:[^}]*)?\}',lambda m: vals.get(m.group(1),'*'),s)
+
+def _nickname(s):
+    s=re.sub(r'[^A-Za-z0-9._-]+','-',s).strip('-') or 'borgmatic'
+    return 'bm-'+s if s.startswith('_') or s in ('DEFAULT','ALL') else s
+
+def convert(path,externe=False,prefix='',taken=None):
+    """-> ([(nick, [(clé, valeur)])], [texte non converti]). taken : nicks déjà produits (suffixes -2, -3…)."""
+    taken=set() if taken is None else taken
+    flat,origin=_flatten(_load_yaml(path))
+    flat=_constants(flat)
+    notes=[]
+    def note(k,why): notes.append(f"{origin.get(k,k)} : {why}")
+    def text(k,v,tilde=False):
+        """Valeur textuelle recopiable, sinon None + note : YAML 1.1 (PyYAML) lit on/yes/no/12:30 comme booléens ou
+        nombres là où borgmatic (YAML 1.2) garde une chaîne ; ${VAR} et {credential …} sont développés par borgmatic ;
+        ~ aussi (tilde=True : clés où borgmatic le développe, borgHelper passe la valeur telle quelle)."""
+        if not isinstance(v,str):
+            note(k,f"valeur {v!r} non textuelle (YAML : on/yes/no, heures… lus autrement que par borgmatic) — la mettre entre guillemets")
+            return None
+        if re.search(r'\$\{|\{credential ',v):
+            note(k,f"« {v} » : variable ou credential développé par borgmatic — valeur à recopier en clair"); return None
+        if tilde and v.startswith('~'):
+            note(k,f"« {v} » : ~ développé par borgmatic, pas par borgHelper — chemin absolu à écrire"); return None
+        return v
+    repos=[]
+    for i,r in enumerate(_as_list(flat.get('repositories'))):
+        if isinstance(r,dict):
+            for extra in sorted(set(r)-{'path','label'}): note(f"repositories[{i}].{extra}","sans équivalent borgHelper")
+            label=r.get('label')
+            if label is not None and not isinstance(label,str):
+                note(f"repositories[{i}].label",f"valeur {label!r} non textuelle — nom du fichier utilisé"); label=None
+            r=r.get('path')
+        else: label=None
+        if not isinstance(r,str) or not r:
+            raise ConvError(f"{path} : dépôt illisible ({r!r})")
+        if re.search(r'\$\{|\{credential ',r):
+            raise ConvError(f"{path} : dépôt « {r} » : variable développée par borgmatic — à écrire en clair d'abord")
+        repos.append((r,label))
+    if not repos: raise ConvError(f"{path} : aucun dépôt (repositories)")
+    used=set(_CONSUMED)
+    common=[]
+    # Passphrase et accès au dépôt
+    if 'encryption_passphrase' in flat:
+        used.add('encryption_passphrase'); pw=flat['encryption_passphrase']
+        if pw is None or pw=='': pass
+        else:
+            pw=text('encryption_passphrase',pw)
+            if pw is None: pass
+            elif pw!=pw.strip(): note('encryption_passphrase',"espace en début ou fin, perdu par la lecture du rc — à reprendre à la main")
+            else: common.append(('BORG_PASSPHRASE',pw))
+    for k,key in (('ssh_command','BORG_RSH'),('remote_path','BORG_REMOTE_PATH'),('local_path','BORG_EXE')):
+        if flat.get(k) is not None:
+            used.add(k); v=text(k,flat[k],tilde=True)
+            if v: common.append((key,v))
+    if flat.get('relocated_repo_access_is_ok'):
+        used.add('relocated_repo_access_is_ok'); common.append(('BORG_RELOCATED_REPO_ACCESS_IS_OK','yes'))
+    # Noms d'archives
+    used.update({'archive_name_format','match_archives','prefix'})
+    fmt=flat.get('archive_name_format')
+    fmt=(text('archive_name_format',fmt) if fmt is not None else None) or _DEFAULT_ARCHIVE_FORMAT
+    head=fmt.split('{now')[0] if '{now' in fmt else None
+    ma=flat.get('match_archives'); ma=text('match_archives',ma) if ma is not None else None
+    pre=flat.get('prefix'); pre=text('prefix',pre) if pre is not None else None
+    glob=None
+    if ma:
+        if ma.startswith('sh:'): glob=ma[3:]
+        elif re.match(r'^[a-z]{2}:',ma): note('match_archives',f"style « {ma[:3]} » sans équivalent (GLOB_ARCH = motif shell)")
+        else: glob=ma
+        if pre: note('prefix',"ignoré : match_archives prime")
+    elif pre: glob=pre+'*'
+    elif head: glob=_placeholders(head)+'*'
+    if not externe:
+        if head and head.endswith('-') and len(head)>1: common.append(('BORG_ARCHNAME','::'+head[:-1]))
+        else: note('archive_name_format',f"« {fmt} » : préfixe avant {{now}} terminé par « - » attendu — BORG_ARCHNAME à choisir")
+    if glob: common.append(('GLOB_ARCH',glob))
+    else: note('match_archives',"aucun motif d'archives déduit — GLOB_ARCH absent : toutes les archives du dépôt")
+    # Rétention
+    for k,key in _KEEP.items():
+        v=flat.get(k)
+        if v is None: continue
+        used.add(k)
+        if isinstance(v,int) and not isinstance(v,bool): common.append((key,str(v)))
+        else: note(k,f"valeur {v!r} : nombre entier attendu")
+    # Clés de Bkp (nick interne)
+    if not externe:
+        used.add('source_directories')
+        src=[]
+        for v in _as_list(flat.get('source_directories')):
+            v=text('source_directories',v,tilde=True)
+            if v is None: continue
+            if re.search(r'[*?\[]',v): note('source_directories',f"« {v} » : motif développé par borgmatic, passé tel quel par borgHelper")
+            src.append(v)
+        # racines imbriquées (borgmatic les dédoublonne) : la plus haute seule
+        norm=lambda p: p.rstrip('/') or '/'
+        keep=[p for p in src if not any(q!=p and (norm(p)+'/').startswith(norm(q).rstrip('/')+'/') for q in src)]
+        for p in src:
+            if p not in keep: note('source_directories',f"« {p} » : déjà sous une autre racine — retiré (comme borgmatic)")
+        src=list(dict.fromkeys(keep))
+        if src:
+            common.append(('BORG_ROOTBKP',src[0] if len(src)==1 and not re.search(r'[\s"\'\\]',src[0]) else shlex.join(src)))
+        else: note('source_directories',"absent — BORG_ROOTBKP absent : borgHelper sauvegarde /")
+        excl=[]
+        for k,flag in _EXCL_VALUED.items():
+            if k not in flat: continue
+            used.add(k)
+            for v in _as_list(flat[k]):
+                v=text(k,v,tilde=k in ('exclude_patterns','exclude_from','patterns_from'))
+                if v is None: continue
+                if re.search(r'\s',v): note(k,f"« {v} » contient un espace (EXCLUDE est découpé sur les espaces)")
+                else: excl+= [flag,v]
+        for k,flag in _EXCL_FLAGS.items():
+            if k in flat:
+                used.add(k)
+                if flat[k]: excl.append(flag)
+        if excl: common.append(('EXCLUDE',' '.join(excl)))
+        else: note('exclude_patterns',"aucune exclusion — EXCLUDE (exigé par Bkp) à compléter")
+        common+= [('SER_NAME',socket.gethostname()),('SER_LOGIN',getpass.getuser())]
+    else:
+        common.insert(0,('EXTERNAL','true'))
+        used.update({'source_directories'}|set(_EXCL_VALUED)|set(_EXCL_FLAGS))
+    if 'encryption_passcommand' in flat:
+        used.add('encryption_passcommand'); note('encryption_passcommand',"borgHelper lit BORG_PASSPHRASE seule — passphrase à recopier")
+    for k in flat:
+        if k not in used: note(k,"sans équivalent borgHelper")
+    base=os.path.basename(path)
+    base=re.sub(r'\.ya?ml$','',base)
+    out=[]
+    for rpath,label in repos:
+        nick=_nickname(prefix+str(label if label else base))
+        n,i=nick,2
+        while n in taken: n=f"{nick}-{i}"; i+=1
+        taken.add(n)
+        out.append((n,[('BORG_REPO',rpath)]+common))
+    return out,notes
+
+def _value(v):
+    if '\n' in v or '\r' in v: raise ConvError(f"valeur sur plusieurs lignes : {v[:40]!r}")
+    return v.replace('%','%%')   # rc lu par ConfigParser avec interpolation : '%' doublé
+
+def render(paths,sections):
+    stamp=datetime.date.today().isoformat()
+    lines=[f"; Converti par borgmatic2borghelper {Version} le {stamp} depuis : {', '.join(paths)}",
+           "; Relire avant usage : passphrases en clair, fichier à garder en 0600.",""]
+    for nick,kv in sections:
+        lines.append(f"[{nick}]")
+        w=max(len(k) for k,_ in kv)
+        for k,v in kv: lines.append(f"{k.ljust(w)} = {_value(v)}")
+        lines.append("")
+    return '\n'.join(lines)
+
+def run(argv,stdout=sys.stdout,stderr=sys.stderr):
+    ap=argparse.ArgumentParser(prog='borgmatic2borghelper',description="Convertit une configuration borgmatic en sections de .borghelperrc (aperçu sur stdout).")
+    ap.add_argument('configs',nargs='*',metavar='CONFIG.yaml')
+    ap.add_argument('-o',dest='output',metavar='FICHIER',help="écrit un rc NEUF (0600) ; refus si le fichier existe")
+    ap.add_argument('-p',dest='prefix',default='',metavar='PRÉFIXE',help="préfixe des nicks produits")
+    ap.add_argument('-e','--externe',action='store_true',help="nicks externes (EXTERNAL = true : borgmatic continue de sauvegarder)")
+    ap.add_argument('--selftest',action='store_true',help="auto-test (dossier temporaire, aucun rc réel lu ni écrit)")
+    ap.add_argument('-V','--version',action='version',version=f"borgmatic2borghelper {Version}")
+    a=ap.parse_args(argv)
+    if a.selftest: return selftest(stdout)
+    if not a.configs: ap.print_usage(stderr); return 2
+    if a.output and os.path.lexists(a.output):
+        print(f"[ERREUR] {a.output} existe — jamais écrasé ni complété, choisir un fichier neuf",file=stderr); return 2
+    sections=[]; taken=set(); notes=[]
+    try:
+        for p in a.configs:
+            s,n=convert(p,externe=a.externe,prefix=a.prefix,taken=taken)
+            sections+=s; notes+=[f"{p} : {x}" for x in n]
+        text=render(a.configs,sections)
+    except ConvError as e:
+        print(f"[ERREUR] {e}",file=stderr); return 2
+    for n in notes: print(f"[NON CONVERTI] {n}",file=stderr)
+    if a.output:
+        try: fd=os.open(a.output,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        except FileExistsError:
+            print(f"[ERREUR] {a.output} existe — jamais écrasé ni complété",file=stderr); return 2
+        except OSError as e:
+            print(f"[ERREUR] {a.output} : {e.strerror}",file=stderr); return 2
+        with os.fdopen(fd,'w') as f:
+            os.fchmod(f.fileno(),0o600); f.write(text)
+        print(f"{a.output} écrit ({len(sections)} nick(s), 0600)",file=stderr)
+    else: stdout.write(text)
+    return 0
+
+def selftest(out=sys.stdout):
+    """Cas : 1.7 à sections et 1.8 à plat équivalents (mêmes sections), dépôts en chaînes et en objets, labels et suffixes,
+    préfixe, externe, non convertis sur stderr, '%' relu par ConfigParser comme borgHelper, BORG_ROOTBKP relu par
+    shlex, -o (0600, refus d'écraser), PyYAML absent, !include. Attentes en dur (hôte et utilisateur exceptés)."""
+    host=socket.gethostname(); user=getpass.getuser()
+    res=[]
+    def check(name,ok,detail=''):
+        res.append(ok); print(f"{'OK  ' if ok else 'FAIL'} {name}"+('' if ok else f" — {detail}"),file=out)
+    def call(*argv,env=None):
+        o=io.StringIO(); e=io.StringIO()
+        if env is None: rc=run(list(argv),o,e)
+        else:
+            p=subprocess.run([sys.executable,os.path.realpath(__file__),*argv],capture_output=True,text=True,env=env,stdin=subprocess.DEVNULL)
+            return p.returncode,p.stdout,p.stderr
+        return rc,o.getvalue(),e.getvalue()
+    def body(t): return '\n'.join(l for l in t.splitlines() if not l.startswith(';'))
+    def parse(t):
+        """Sections relues par ConfigParser comme borgHelper ; rc illisible (section en double…) -> {'erreur': message}."""
+        cp=configparser.ConfigParser(); cp.optionxform=str
+        try:
+            cp.read_string(t)
+            return {s:dict(cp[s]) for s in cp.sections()}
+        except configparser.Error as e: return {'erreur':str(e).splitlines()[0]}
+    with tempfile.TemporaryDirectory(prefix='b2b-selftest-') as d:
+        def wr(rel,txt):
+            p=os.path.join(d,rel); os.makedirs(os.path.dirname(p),exist_ok=True)
+            with open(p,'w') as f: f.write(txt)
+            return p
+        v17=wr('v17/srv.yaml',"""location:
+  source_directories: [/etc, "/srv/a b"]
+  repositories: [/r/one]
+  exclude_patterns: ['*.tmp', '/x y']
+  exclude_caches: true
+  exclude_if_present: [.nobackup]
+  one_file_system: true
+storage:
+  encryption_passphrase: "p%w"
+  ssh_command: ssh -i /k
+  remote_path: borg1
+  archive_name_format: '{hostname}-{now}'
+retention:
+  keep_daily: 7
+  keep_within: 3H
+consistency:
+  checks: [{name: repository}]
+hooks:
+  before_backup: [echo x]
+""")
+        v18=wr('v18/srv.yaml',"""source_directories: [/etc, "/srv/a b"]
+repositories: [{path: /r/one}]
+exclude_patterns: ['*.tmp', '/x y']
+exclude_caches: true
+exclude_if_present: .nobackup
+one_file_system: true
+encryption_passphrase: "p%w"
+ssh_command: ssh -i /k
+remote_path: borg1
+archive_name_format: '{hostname}-{now}'
+keep_daily: 7
+keep_within: 3H
+checks: [{name: repository}]
+before_backup: [echo x]
+""")
+        want=f"""[srv]
+BORG_REPO        = /r/one
+BORG_PASSPHRASE  = p%%w
+BORG_RSH         = ssh -i /k
+BORG_REMOTE_PATH = borg1
+BORG_ARCHNAME    = ::{{hostname}}
+GLOB_ARCH        = {host}-*
+KEEP_DAILY       = 7
+BORG_ROOTBKP     = /etc '/srv/a b'
+EXCLUDE          = --exclude *.tmp --exclude-if-present .nobackup --exclude-caches --one-file-system
+SER_NAME         = {host}
+SER_LOGIN        = {user}
+"""
+        r17=call(v17); r18=call(v18)
+        check("1.7 à sections : sections rc attendues, code 0",r17[0]==0 and body(r17[1]).strip()==want.strip(),repr(r17[1]))
+        check("1.8 à plat : mêmes sections que 1.7",r18[0]==0 and body(r18[1])==body(r17[1]),repr(r18[1]))
+        want_notes={'storage.archive_name_format' not in r17[2],'exclude_patterns : « /x y » contient un espace' in r17[2],
+                    'retention.keep_within : sans équivalent' in r17[2],'consistency.checks : sans équivalent' in r17[2],
+                    'hooks.before_backup : sans équivalent' in r17[2]}
+        check("non convertis nommés sur stderr (section d'origine en 1.7)",want_notes=={True} and r17[2].count('[NON CONVERTI]')==4,r17[2])
+        s17=parse(r17[1]).get('srv',{})
+        check("rc relu par ConfigParser comme borgHelper : '%' et BORG_ROOTBKP (shlex)",
+              s17.get('BORG_PASSPHRASE')=='p%w' and shlex.split(s17.get('BORG_ROOTBKP',''))==['/etc','/srv/a b'],s17)
+        multi=wr('multi.yaml',"""repositories:
+  - path: /r/a
+    label: A
+  - path: /r/b
+  - /r/c
+encryption_passcommand: pass show borg
+match_archives: 'sh:web-*'
+""")
+        rm=call('-e','-p','x-',multi)
+        secs=parse(rm[1])
+        check("objets et chaînes, label sinon nom du fichier, suffixes, préfixe, externe",
+              rm[0]==0 and list(secs)==['x-A','x-multi','x-multi-2'] and secs['x-multi-2']=={'EXTERNAL':'true','BORG_REPO':'/r/c','GLOB_ARCH':'web-*'}
+              and 'encryption_passcommand : borgHelper lit BORG_PASSPHRASE seule' in rm[2],(rm,secs))
+        rc2=call(v17,v18)
+        check("deux fichiers au même nom : second nick suffixé",rc2[0]==0 and re.findall(r'^\[(.*)\]$',rc2[1],re.M)==['srv','srv-2'],rc2[1])
+        o=os.path.join(d,'out','rc'); os.makedirs(os.path.dirname(o))
+        w1=call('-o',o,v18); mode=os.stat(o).st_mode&0o777
+        with open(o) as f: first=f.read()
+        w2=call('-o',o,v17)
+        with open(o) as f: second=f.read()
+        check("-o : rc neuf en 0600 ; fichier existant refusé (code 2), intact",
+              w1[0]==0 and w1[1]=='' and mode==0o600 and body(first)==body(r18[1]) and w2[0]==2 and 'existe' in w2[2] and second==first,(w1,oct(mode),w2))
+        bad0=wr('bad0.yaml',"repositories: [\n")
+        w3=call('-o',o,bad0)
+        check("-o sur un fichier existant : refusé avant toute lecture des YAML",w3[0]==2 and 'existe' in w3[2] and 'invalide' not in w3[2],w3)
+        bad=wr('bad.yaml',"repositories: [/r]\nlocation: !include base.yaml\n")
+        rb=call(bad)
+        check("!include : refus explicite, code 2, rien sur stdout",rb[0]==2 and '!include' in rb[2] and rb[1]=='',rb)
+        norepo=wr('norepo.yaml',"source_directories: [/etc]\n")
+        rn=call(norepo)
+        check("aucun dépôt : code 2",rn[0]==2 and 'aucun dépôt' in rn[2],rn)
+        full=wr('full.yaml',"""constants:
+  site: lab
+repositories:
+  - path: /r/{site}
+    label: DEFAULT
+    encryption: repokey
+  - path: /r/x
+    label: _cache
+  - path: /r/y
+    label: ALL
+source_directories: [/srv, /srv/sub, /home]
+exclude_from: [/etc/excl]
+patterns: ['+pp:/x']
+patterns_from: [/etc/pat]
+exclude_patterns: ['~/.cache']
+keep_exclude_tags: true
+exclude_nodump: true
+local_path: /usr/local/bin/borg
+keep_hourly: 1
+keep_daily: 2
+keep_weekly: 3
+keep_monthly: 4
+keep_yearly: 5
+keep_minutely: 6
+archive_name_format: '{hostname}-{fqdn}-{user}-{now}'
+prefix: old-
+match_archives: 're:^x'
+""")
+        rf=call(full); sf=parse(rf[1])
+        wantk={'BORG_REPO':'/r/lab','BORG_EXE':'/usr/local/bin/borg','BORG_ARCHNAME':'::{hostname}-{fqdn}-{user}',
+               'KEEP_HOURLY':'1','KEEP_DAILY':'2','KEEP_WEEKLY':'3','KEEP_MONTHLY':'4','KEEP_YEARLY':'5','BORG_ROOTBKP':'/srv /home',
+               'EXCLUDE':'--exclude-from /etc/excl --pattern +pp:/x --patterns-from /etc/pat --keep-exclude-tags --exclude-nodump',
+               'SER_NAME':host,'SER_LOGIN':user}
+        fn=['repositories[0].encryption : sans équivalent','keep_minutely : sans équivalent','« ~/.cache » : ~ développé par borgmatic',
+            '« /srv/sub » : déjà sous une autre racine','prefix : ignoré : match_archives prime','style « re: » sans équivalent',
+            "GLOB_ARCH absent"]
+        check("correspondances : constants, local_path, exclusions et motifs, KEEP_*, racines imbriquées, ~, prefix/match_archives",
+              rf[0]==0 and list(sf)==['bm-DEFAULT','bm-_cache','bm-ALL'] and sf['bm-DEFAULT']==wantk and all(x in rf[2] for x in fn),(rf,sf))
+        gl=wr('gl.yaml',"repositories: [/r]\narchive_name_format: '{hostname}-{fqdn}-{user}-{now}'\n")
+        ghn=socket.gethostname; socket.gethostname=lambda: 'srv.example.com'   # hôte au nom complet (simulé)
+        try: rg=call('-e',gl); fq=socket.getfqdn()
+        finally: socket.gethostname=ghn
+        sg=parse(rg[1]).get('gl',{})
+        check("{hostname} = nom court (comme borg : srv.example.com -> srv), {fqdn}, {user} résolus dans GLOB_ARCH",
+              rg[0]==0 and sg.get('GLOB_ARCH')==f"srv-{fq}-{user}-*",(rg,sg))
+        pw=wr('pw.yaml',"repositories:\n  - path: /r/a\n  - path: /r/b\n    label: no\nencryption_passphrase: on\nssh_command: ssh -i ${HOME}/k\n"
+                        "archive_name_format: 123\nkeep_daily: '7'\n")
+        rp=call('-e',pw); sp=parse(rp[1])
+        pn=["encryption_passphrase : valeur True non textuelle","ssh_command : « ssh -i ${HOME}/k » : variable",
+            "repositories[1].label : valeur False non textuelle","archive_name_format : valeur 123 non textuelle","keep_daily : valeur '7' : nombre entier"]
+        check("valeurs non recopiées, nommées : booléen YAML 1.1 (on/no), ${VAR}, nombre, KEEP_* non entier ; aucun traceback",
+              rp[0]==0 and list(sp)==['pw','pw-2'] and all(k not in sp['pw'] for k in ('BORG_PASSPHRASE','BORG_RSH','KEEP_DAILY'))
+              and all(x in rp[2] for x in pn),(rp,sp))
+        sp2=wr('sp.yaml',"repositories: [/r]\nencryption_passphrase: ' x'\n")
+        rs=call('-e',sp2)
+        check("passphrase à espace de bord : non recopiée, nommée",rs[0]==0 and 'BORG_PASSPHRASE' not in rs[1] and 'espace en début ou fin' in rs[2],rs)
+        ng=wr('ng.yaml',"repositories: [/r]\narchive_name_format: fixe\n")
+        rn2=call('-e',ng)
+        check("-e sans motif d'archives déductible : GLOB_ARCH absent nommé (toutes les archives du dépôt)",
+              rn2[0]==0 and 'GLOB_ARCH' not in rn2[1] and 'GLOB_ARCH absent' in rn2[2],rn2)
+        rv=wr('rv.yaml',"repositories: ['ssh://${H}/./r']\n")
+        rr=call(rv)
+        check("dépôt avec ${VAR} : refus explicite (code 2)",rr[0]==2 and 'variable développée par borgmatic' in rr[2] and rr[1]=='',rr)
+        fake=os.path.join(d,'noyaml'); os.makedirs(fake)
+        with open(os.path.join(fake,'yaml.py'),'w') as f: f.write("raise ImportError('simulé')\n")
+        ry=call(v18,env=dict(os.environ,PYTHONPATH=fake))
+        check("PyYAML absent : message et code 2",ry[0]==2 and 'PyYAML absent' in ry[2] and ry[1]=='',ry)
+    n=len(res); k=sum(res)
+    print(f"borgmatic2borghelper selftest : {k}/{n} OK",file=out)
+    return 0 if k==n else 1
+
+if __name__=='__main__':
+    sys.exit(run(sys.argv[1:]))

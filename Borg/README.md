@@ -272,6 +272,44 @@ MAX_AGE_BKP      = 25
   des autres hôtes comprises) ; sur un nick externe, il porte volontairement sur tout le dépôt.
 - `demo.borghelperrc` contient une section `demo-externe` (commandes de remplissage en commentaire).
 
+### Conversion depuis borgmatic (`borgmatic2borghelper`)
+
+Script à part (`borgmatic2borghelper`, sa propre version, PyYAML requis — paquet `python3-yaml`) : lit une ou plusieurs
+configurations borgmatic (format 1.7 à sections `location:`/`storage:`/`retention:`/…, ou 1.8+ à plat) et produit les
+sections `.borghelperrc` correspondantes. **N'écrit jamais dans un rc existant.**
+
+```bash
+borgmatic2borghelper /etc/borgmatic/config.yaml                 # aperçu : sections rc sur stdout
+borgmatic2borghelper -o ~/nouveau.borghelperrc /etc/borgmatic.d/*.yaml   # rc NEUF, 0600 ; refus si le fichier existe
+borgmatic2borghelper -e -p bm- /etc/borgmatic/config.yaml       # nicks externes (EXTERNAL = true), préfixés « bm- »
+borgmatic2borghelper --selftest                                 # auto-test (dossier temporaire)
+```
+
+- Un nick par dépôt (`repositories`, chaînes ou objets) : son `label`, sinon le nom du fichier sans `.yaml` ; dépôts
+  suivants sans label ou nom déjà pris : `-2`, `-3`… ; `-p` préfixe les noms.
+- Par défaut, nick **interne** (sauvegardé par borgHelper) : `BORG_REPO`, `BORG_PASSPHRASE` (`encryption_passphrase`),
+  `BORG_RSH` (`ssh_command`), `BORG_REMOTE_PATH`, `BORG_EXE` (`local_path`), `BORG_ROOTBKP` (`source_directories`,
+  guillemets si besoin), `EXCLUDE` (`exclude_patterns`, `exclude_from`, `patterns`, `patterns_from`,
+  `exclude_if_present`, `exclude_caches`, `keep_exclude_tags`, `exclude_nodump`, `one_file_system`), `KEEP_HOURLY` à
+  `KEEP_YEARLY`, `SER_NAME` (cette machine), `SER_LOGIN` (utilisateur courant).
+- Noms d'archives : le début d'`archive_name_format` jusqu'à `{now…}` donne `BORG_ARCHNAME = ::<début>` (défaut
+  borgmatic `{hostname}-{now…}` -> `::{hostname}`) et `GLOB_ARCH` (marqueurs `{hostname}` — nom court, comme borg —,
+  `{fqdn}`, `{user}` résolus **sur la machine qui lance la conversion**) : les archives de borgmatic et celles de
+  borgHelper restent dans le même motif. `match_archives` (`sh:` ou sans préfixe) ou `prefix` priment pour `GLOB_ARCH`.
+  Les deux formats de nom se trient différemment (`…T12:00:00.123` / `…T1230…`) : à la transition, un snapshot complet
+  peut être refait une fois.
+- `-e` : nick **externe** (`EXTERNAL = true`, borgmatic continue de sauvegarder ; ni `BORG_ROOTBKP`, ni `EXCLUDE`).
+- Tout ce qui n'a pas d'équivalent est nommé sur stderr (`[NON CONVERTI]`, avec sa section d'origine en 1.7) :
+  `encryption_passcommand` (borgHelper lit `BORG_PASSPHRASE` seule), passphrase en `${VARIABLE}`, `checks`, hooks et
+  commandes, `keep_within`/`keep_minutely`…, motif ou exclusion contenant un espace (`EXCLUDE` est découpé sur les
+  espaces), valeur contenant `${VARIABLE}`, `{credential …}` ou commençant par `~` (développés par borgmatic, pas par
+  borgHelper), valeur non textuelle (YAML : `on`, `yes`, `no`, `12:30` sont lus comme booléens ou nombres par PyYAML, pas
+  par borgmatic — mettre entre guillemets), clés d'un dépôt autres que `path`/`label`, motif dans `source_directories`,
+  aucune exclusion (`EXCLUDE` exigé par Bkp). Racines imbriquées : la plus haute seule (comme borgmatic). `constants:`
+  est appliqué ; `!include` et dépôt contenant `${…}` refusés (code 2).
+- `%` doublé dans les valeurs (le rc est lu avec interpolation). Relire le résultat avant usage : les passphrases y sont
+  en clair.
+
 ### Sentry
 
 DSN lu dans `BORGHELPERC_SENTRY_DSN`, sinon dans le fichier désigné par `BORGHELPERC_SENTRY_FILE`, sinon dans
@@ -696,7 +734,15 @@ graphiques d'évolution de borgHelperWWW :
 - un point de taille du dépôt (`op='index'`), seulement si elle a changé depuis le dernier point
   (jamais de doublon juste après un `Bkp`).
 
-Le snapshot (`-S`) est **incrémental par défaut** : si un snapshot précédent et le diff correspondant existent, seules les entrées `added/removed/modified` sont appliquées par SQL, et `borg list` est appelé uniquement sur les fichiers ajoutés (pour leur mtime). Fallback vers `borg list` complet si : pas de snapshot précédent, diff absent, > 5 000 ajouts, ou erreur borg. `-F` force le `borg list` complet.
+Le snapshot (`-S`) est **incrémental par défaut** : si un snapshot précédent et le diff correspondant existent, il en part, retire les chemins supprimés et relit par `borg list` chaque chemin changé (ajouté, modifié, droits, propriétaire, date, changement de type — 1.0.164 ; avant, seuls les ajouts étaient relus). Fallback vers `borg list` complet si : pas de snapshot précédent, diff absent, > 5 000 chemins changés, ou erreur borg. `-F` force le `borg list` complet.
+
+**Un snapshot par archive, exact (1.0.164)** : chaque archive garde la taille, la date, le type, les droits et le
+propriétaire qu'avaient ses fichiers — un fichier inchangé n'est stocké qu'une fois pour toutes les archives où il est
+identique. Avant, une seule ligne par chemin, mise à jour à chaque snapshot : `LstBkpFls`, `Search`, `FileHist` ou
+`DuIdx` sur une archive plus ancienne lisaient l'état actuel d'un chemin encore présent (ils lisent la vue par archive). La base passe au schéma 11
+automatiquement (mesuré : 3 s pour un million de chemins, sans passphrase) ; les snapshots déjà faits gardent leurs valeurs partagées, seuls
+les suivants sont exacts. Un borgHelper antérieur à 1.0.164 refuse ensuite la base (la supprimer et relancer `Index`
+pour revenir en arrière). En base chiffrée, le snapshot incrémental perdait les fichiers ajoutés (corrigé).
 
 **Archives supprimées hors borgHelper** (1.0.140) : chaque `Index` rapproche les bases de la liste `borg list` qu'il
 obtient déjà (un `borg list` du dépôt entier en plus seulement pour un nick à `GLOB_ARCH` dont une archive manque, voir
