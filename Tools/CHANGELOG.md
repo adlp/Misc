@@ -1,5 +1,18 @@
 # Changelog — Tools
 
+## cronMutt 0.24 — dépôt Nextcloud en échec : « Output non sauvé » et pièce jointe — 2026-09-30
+
+Quand le dépôt Nextcloud échoue — injoignable, pas de connexion en 15 s, pas de réponse en 120 s (délai de connexion
+distinct, 120 s partout avant), erreur HTTP, ou `-n`/`-N` incomplet :
+
+- le mail part à **tous** les destinataires, `-d` et `-o` (sauf `no`), même quand la commande a réussi (avant : `-o`
+  seul) ;
+- sujet préfixé de `**Output non sauvé** `, `X-Priority: 1` ;
+- le corps commence par la raison de l'échec (HTTP 507, timeout, etc.) ;
+- l'output qui aurait dû être déposé est joint au mail, sous le nom du fichier de l'URL `-n` (décodé :
+  `rapport%20du%20jour.txt` ⇒ `rapport du jour.txt`), `cronMutt-output.txt` sans `-n`. Fichier temporaire supprimé
+  après l'envoi.
+
 ## Tools — README.md — 2026-09-30
 
 - Création du `README.md` de Tools : tableau des outils, options et codes retour de `checkssl`, `sleepUntil`,

@@ -38,14 +38,19 @@ import os
 import hashlib
 import subprocess
 import threading
+import tempfile
+import shutil
+from urllib.parse import urlsplit,unquote
 import uuid
 from datetime import datetime
 import requests
 from requests.auth import HTTPBasicAuth
 
-Version="0.23"
+Version="0.24"
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
+# 0.24 nextcloud en echec (injoignable, timeout, erreur HTTP, -n/-N incomplet) : mail a tous (-d et -o),
+#      sujet "**Output non sauvé**", l'output en piece jointe sous le nom prevu sur le nextcloud
 # 0.23 en-tete References (meme valeur que In-Reply-To), utilise en premier par Thunderbird et Gmail pour les fils
 # 0.22 In-Reply-To au format RFC <id@cronMutt> (sans l'hote : le fil reste commun a toutes les machines)
 # 0.21 Message-ID unique et conforme RFC par defaut, -m complete en <id@host> ; -n sans -N (ou l'inverse) signale et bascule sur le mail
@@ -86,18 +91,28 @@ def nextcloudput(urldav,lopa,datas):
     lopata=lopa.split(':',1)
     auth = HTTPBasicAuth(lopata[0],lopata[1] if len(lopata) > 1 else '')
     # Envoyer le fichier au partage Nextcloud
+    # Renvoie None si le depot a reussi, sinon la raison de l'echec
     try:
-        response = requests.put(urldav, data=datas, auth=auth, timeout=120)
+        # 15 s pour se connecter, 120 s sans reponse
+        response = requests.put(urldav, data=datas, auth=auth, timeout=(15,120))
+    except requests.Timeout as err:
+        ret=f"pas de reponse (timeout) : {err}"
     except requests.RequestException as err:
-        print(f"cronMutt: nextcloud injoignable : {err}",file=sys.stderr)
-        return(-1)
-
-    # Vérifier le succès de l'opération
-    if response.status_code in [200, 201, 204]:
-        ret=0
+        ret=f"injoignable : {err}"
     else:
-        ret=response.status_code
+        # Vérifier le succès de l'opération
+        if response.status_code in [200, 201, 204]:
+            return(None)
+        ret=f"HTTP {response.status_code} {response.reason}"
+    print(f"cronMutt: depot nextcloud en echec, {ret}",file=sys.stderr)
     return(ret)
+
+def ncFileName(urldav):
+    # Nom du fichier tel qu'il aurait du etre depose sur le nextcloud
+    name=None
+    if urldav is not None:
+        name=os.path.basename(unquote(urlsplit(urldav).path).rstrip('/'))
+    return(name if name else "cronMutt-output.txt")
 
 def subprosend(cmd,datas):
     mutt=subprocess.Popen(cmd,encoding ='utf-8',
@@ -293,18 +308,6 @@ else:
     # Mode pipe : les donnees arrivent sur notre stdin
     read_stream(io.TextIOWrapper(sys.stdin.buffer,encoding=encoding,errors='replace'), retstd, "stdout")
 
-# Preparation Ouverture du mail 2/2
-muttcmd.append('-s')
-muttcmd.append(subject)
-
-if mailType is not None:
-    muttcmd.append('-e')
-    muttcmd.append(f'set content_type=text/{mailType}')
-if exitCode != 0:
-    muttcmd.append('-e')
-    muttcmd.append('my_hdr X-Priority:1')
-muttcmd.append('--')
-
 # Traitement des donnees
 datas=""
 for line in retstd['stdout']:
@@ -314,7 +317,45 @@ if len(retstd['stderr']):
     for line in retstd['stderr']:
         datas+=line+"\n"
 
-if destok is not None and destok != "no" and exitCode == 0:
+# Depot de la donnee sur le nextcloud
+ncErreur=None
+if ncIncomplet:
+    ncErreur="-n et -N vont ensemble, aucun depot tente"
+elif ncUsed:
+    if debug:
+        print(f'Depose sur nc {nextcloud}')
+    ncErreur=nextcloudput(nextcloud,nextauth,datas.encode('utf-8'))
+
+# Nextcloud en echec : l'output n'est sauve nulle part, tout le monde est prevenu et l'a en piece jointe
+ncEchec=ncErreur is not None
+mailDatas=datas
+attachDir=None
+if ncEchec:
+    subject="**Output non sauvé** "+subject
+    mailDatas=f"Output non sauvé, dépôt Nextcloud en échec : {ncErreur}\nIl est en pièce jointe.\n"
+    mailDatas+="\n=============================================================================\n"+datas
+    attachDir=tempfile.mkdtemp(prefix="cronMutt.")
+    attachFile=os.path.join(attachDir,ncFileName(nextcloud))
+    with open(attachFile,'w',encoding='utf-8') as f:
+        f.write(datas)
+
+# Preparation Ouverture du mail 2/2
+muttcmd.append('-s')
+muttcmd.append(subject)
+
+if mailType is not None:
+    muttcmd.append('-e')
+    muttcmd.append(f'set content_type=text/{mailType}')
+if exitCode != 0 or ncEchec:
+    muttcmd.append('-e')
+    muttcmd.append('my_hdr X-Priority:1')
+if ncEchec:
+    muttcmd.append('-a')
+    muttcmd.append(attachFile)
+muttcmd.append('--')
+
+# Destinataires : -o seul quand tout va bien, sinon -d et -o
+if destok is not None and destok != "no" and exitCode == 0 and not ncEchec:
     muttcmd.append(destok)
 else:
     if destok is not None and destok != "no":
@@ -324,16 +365,6 @@ else:
 if debug:
     print(f"{' '.join(muttcmd)}")
 
-ncsended=0
-if ncIncomplet:
-    ncsended=-1
-
-# Emission du mail de la donnee
-if ncUsed:
-    if debug:
-        print(f'Depose sur nc {nextcloud}')
-    ncsended=nextcloudput(nextcloud,nextauth,datas.encode('utf-8'))
-
 # Je veux envoyer le mail si
 #   * Le nextcloud n'a pas marché (ou -n/-N incomplet)
 #   * il y a une errere
@@ -342,7 +373,7 @@ if ncUsed:
 #   * sans nextcloud : il y a un empty ou de la data
 
 sendit=False
-if ncsended != 0:
+if ncEchec:
     sendit=True
     if debug:
         print('Not Sended')
@@ -368,9 +399,11 @@ else:
     sendit=False
 
 if sendit:
-    subprosend(muttcmd,datas)
+    subprosend(muttcmd,mailDatas)
     if debug:
-        print(f"Sended-{len(datas)}")
+        print(f"Sended-{len(mailDatas)}")
+if attachDir is not None:
+    shutil.rmtree(attachDir,ignore_errors=True)
 
 if debug:
     print(len(datas))

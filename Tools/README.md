@@ -5,7 +5,7 @@ Petits outils d'administration indépendants, sous licence GPL v3.
 | Outil | Langage | Version | Description |
 |---|---|---|---|
 | `checkssl` | bash | — | État d'un certificat TLS (serveur ou fichier) et jours restants avant expiration |
-| `cronMutt` | Python 3 | 0.23 | Lance une commande (ou lit un pipe) et envoie sa sortie par mail (mutt) et/ou sur Nextcloud, selon le résultat |
+| `cronMutt` | Python 3 | 0.24 | Lance une commande (ou lit un pipe) et envoie sa sortie par mail (mutt) et/ou sur Nextcloud, selon le résultat |
 | `sleepUntil` | bash | — | Comme `at`, mais bloquant : attend une heure donnée puis lance une commande |
 | `whosshkey` | bash | — | Comme `last`, avec en plus la clef SSH utilisée pour chaque connexion |
 
@@ -60,19 +60,30 @@ fil. cronMutt rend le code retour de la commande (128+signal si elle est tuée p
 | `-D` | Debug | — |
 | `-V` / `-h`, `--help` | Version / aide | — |
 
-`-n` et `-N` vont ensemble : un seul des deux ⇒ avertissement sur stderr et envoi par mail.
+`-n` et `-N` vont ensemble : un seul des deux ⇒ avertissement sur stderr, traité comme un dépôt en échec.
 
 ### Quand un mail part-il ?
 
 Règles appliquées dans l'ordre, la première qui s'applique décide :
 
-1. Dépôt Nextcloud en échec (réseau, HTTP ≠ 200/201/204, ou `-n`/`-N` incomplet) ⇒ **mail**.
+1. Dépôt Nextcloud en échec ⇒ **mail** à `-d` et `-o` (sauf `no`), voir ci-dessous.
 2. Commande en échec ⇒ **mail** à `-d` (+ `-o`, sauf `no`), sujet `*** …`, `X-Priority: 1`.
 3. `-o no` ⇒ **pas de mail**.
 4. Dépôt Nextcloud réussi ⇒ **mail** seulement avec `-E` ou `-o` (la sortie est déjà sur Nextcloud).
 5. Sans Nextcloud ⇒ **mail** si la sortie n'est pas vide, ou avec `-E`.
 
 Le corps contient stdout puis, s'il y en a, stderr après une ligne de `=`.
+
+### Dépôt Nextcloud en échec
+
+Échec = Nextcloud injoignable, pas de connexion en 15 s, pas de réponse en 120 s, réponse HTTP autre que
+200/201/204, ou `-n`/`-N` incomplet. L'output n'étant sauvé nulle part :
+
+- le mail part à tous les destinataires (`-d` et `-o`, sauf `no`), même si la commande a réussi ou avec `-o no` ;
+- le sujet est préfixé de `**Output non sauvé** ` (avant l'éventuel `*** `), `X-Priority: 1` ;
+- le corps commence par la raison de l'échec ;
+- l'output (ce qui aurait été déposé : stdout, puis stderr s'il y en a) est joint sous le nom du fichier de l'URL `-n`
+  (`…/rapport%20du%20jour.txt` ⇒ `rapport du jour.txt` ; `cronMutt-output.txt` sans `-n`).
 
 ### En-têtes ajoutés
 
