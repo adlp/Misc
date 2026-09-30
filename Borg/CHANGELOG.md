@@ -1,5 +1,23 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.161 — isolation des selftests, dépôt recréé au même chemin — 2026-09-30
+
+Chantier « reconstruction progressive », story 24 (actions de rétrospective A33 et A34).
+
+- **`BorgCleanup`** : signale aussi l'entrée borg d'un **ancien dépôt recréé au même chemin** (dépôt présent, du rc ou
+  non, dont l'identifiant lu dans `<dépôt>/config` diffère) — section à part dans l'aperçu (« disque en rotation ? »),
+  hors notice. Doute (config absente, illisible, sans identifiant, montage bloqué) : jamais proposé ; identifiant relu
+  avant suppression (ancien disque remis : gardé). Clé de l'ancien identifiant : seulement avec `--keys` et « oui »,
+  avertissement « disque en rotation ». Mesuré sur cette machine : 16 entrées périmées pour un dépôt de démo recréé.
+- **`BorgCleanup`, dépôt non chiffré** (`none`, `authenticated`) : borg sans terminal refuse un tel dépôt dont l'entrée
+  de sécurité a disparu (mesuré : code 2). Cette entrée est désormais gardée comme une clé : `-y` ne retire que le
+  cache, `-y --keys` + « oui » l'entrée. Un stat qui ne répond pas (montage bloqué) ne déclenche plus aucune autre
+  lecture.
+- **CodecSelfTest** : crochet d'audit Python (ce processus et les borgHelper enfants) ; dernier contrôle « isolation
+  des selftests » : aucun accès aux vrais dossiers borg et borgHelper de l'utilisateur, témoins par évènement et par
+  dossier à chaque run. Défaut trouvé en le mesurant (strace) et corrigé : trois contrôles RepoHistory/ArchiveHistory
+  lançaient `mkdir ~/.cache/borghelper` (rc de test sans `CACHE_DIR` ; le dossier était créé sur une machine neuve). Contrôles du dépôt recréé en bac à sable et sur vrai borg.
+
 ## borgHelper 1.0.160 / borgHelperWWW 1.28.5 / UI 1.19.5 — nettoyage des restes borg, signaux du selftest — 2026-09-30
 
 Chantier « reconstruction progressive », story 23 (actions de rétrospective A30, demande de l'utilisateur, et A32).

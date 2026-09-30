@@ -62,6 +62,38 @@ un selftest imbriqué seulement). `cleanup_summary` (nombres et tailles,
 jamais de chemin) alimente la ligne finale de `Status`/`Report` (texte) et `GET /access` `borg_cleanup`
 (borgHelperWWW, cache 5 min, admin seulement quand les groupes sont actifs).
 
+**Ancien dépôt recréé au même chemin (1.0.161, story 24).** Emplacement local présent : `_repo_current_id` lit `id`
+dans la section `[repository]` de `<emplacement>/config` (borg 1.2 : 64 hexadécimaux ; configparser, fil, 2 s ; tout
+doute -> `None`). `_local_state` rend `absent`/`present`/`unknown` (stat sans réponse en 2 s : rien d'autre n'est lu,
+entrée gardée). Id différent de celui de l'entrée : reste signalé (`recreated`, `current_id`), que l'emplacement soit
+dans le rc ou non ; même id ou `None` : jamais. Absent et dans le rc : jamais (disque démonté), comme avant.
+`borg_cleanup` relit l'id avant suppression (égal ou illisible : gardé). `cleanup_summary` : anciens ids hors des
+comptes de la notice (`recreated` à part). Mesuré (borg 1.2.6, repokey) : un dépôt dont l'entrée et le cache ont été
+retirés est rouvert sans erreur (`list`, `create` code 0), borg les recrée.
+
+`plain` (1.0.161) : `security/<id>/key-type` vaut 2 (`none`), 6 ou 7 (`authenticated`) — mesuré sur borg 1.2.6 (3
+repokey, 0 keyfile, 4/5 variantes blake2). Mesuré : entrée de sécurité d'un tel dépôt retirée -> `borg create` sans
+terminal refuse (code 2) ; cache seul retiré -> code 0. D'où : l'entrée de sécurité est gardée comme une clé (ancre de
+`keep_anchor` sans `--keys`, « oui » avec), puis hors notice (`_cleanup_kept_key`).
+
+**Isolation des selftests (1.0.161, story 24).** `_audit_roots` (dossier personnel pwd et `HOME` : `.config/borg`,
+`.cache/borg`, `.cache/borghelper`, `.borghelperrc` — jamais lu ; `XDG_CONFIG_HOME/borg`, `XDG_CACHE_HOME/borg` ;
+dossiers borg de `BORG_BASE_DIR`, `BORG_*_DIR` ; racines de moins de deux niveaux, dossier du selftest et du script
+écartés et affichés par le contrôle). `codec_selftest` pose `_audit_hook` (`sys.addaudithook` : `_AUDIT_EVENTS` —
+`open`, `os.mkdir`, `os.listdir`, `os.scandir`, `sqlite3.connect` (URI `file:` décodée), `os.remove`, `os.rename`,
+`os.rmdir`, `shutil.rmtree`, `os.chmod`, `os.chown`, `os.utime`, `os.truncate`, `os.link`, `os.symlink` ; 1er
+argument seulement, les deux premiers pour renommage et liens ; aucune exception ne sort du crochet) vers
+`<tmp>/audit.log` et transmet journal et racines (JSON) par `BORGHELPERC_SELFTEST_AUDIT` et
+`BORGHELPERC_SELFTEST_AUDIT_ROOTS` ; un borgHelper chargé avec ces variables (CLI ou import) pose le même crochet au
+chargement du module. Crochet posé une fois par processus (il ne se retire pas), inactif hors selftest ; selftest
+imbriqué ou enfant : journal du selftest englobant. `_AUDIT_TLS.off` : écriture du journal et garde `_rb_home_leaks`
+(lecture voulue des `security/<id>/location`). Témoins (`_audit_witness`) : sous chaque racine, un appel voué à
+l'échec par évènement sur `<racine>/<_AUDIT_MARK>-<tag>/x` (parent inexistant, l'évènement partant avant l'appel) —
+dans le processus et dans un enfant `-v` (`BORGHELPERC_SELFTEST_AUDIT_WITNESS` = jeton du contrôle) ; chaque couple
+(évènement, racine) doit figurer au journal pour les deux. Mesure qui
+l'a motivé : `strace -f` d'un run complet (1.0.160) — seul accès hors garde, `mkdir ~/.cache/borghelper` par
+`_cli_rh_multi_rejected` (`_cli_main` dans le processus, rc sans `CACHE_DIR`), corrigé.
+
 ---
 
 ## Base de données `cache.db`

@@ -1191,6 +1191,18 @@ avec `-y`** — jamais par `borgHelperWWW` ni l'interface :
   `~/.config/borg/keys` de ces dépôts (mode keyfile) sont listées à part : **leur suppression est irréversible** (le
   dépôt, s'il existe encore ailleurs, devient illisible) — seulement avec `--keys` ; sans `--keys`, l'entrée qui porte
   l'emplacement du dépôt est gardée avec la clé.
+- **borg, ancien dépôt recréé au même chemin** (1.0.161) : entrée d'un dépôt local **présent** (configuré ou non) dont
+  l'identifiant n'est plus celui du dépôt qui s'y trouve (`id` de la section `[repository]` de `<dépôt>/config`, lu sans
+  borg). Listée à part dans l'aperçu (« disque en rotation ? »), **jamais dans la notice** (deux disques montés tour à
+  tour au même chemin la rallumeraient à chaque rotation). Config absente, illisible, sans identifiant valide ou qui ne
+  répond pas en 2 s : jamais proposée. L'identifiant est relu juste avant la suppression : ancien disque remis
+  entre-temps, dépôt parti ou illisible, gardé. Un disque en rotation chiffré monté à ce chemin retrouve seul son entrée
+  et son cache (borg les recrée ; coût : resynchronisation du cache) ; **sa clé (mode keyfile), si elle est retirée
+  avec `--keys`, est perdue** : dépôt illisible.
+- **Dépôt non chiffré** (1.0.161 ; `key-type` 2 `none`, 6 et 7 `authenticated`) : sans son entrée de sécurité, borg
+  lancé sans terminal (cron) **refuse** ce dépôt s'il existe encore (« Do you want to continue? [yN] Aborting », code 2 ;
+  mesuré, borg 1.2.6). L'entrée est donc gardée comme une clé : `-y` ne retire que son cache (sans effet mesuré), puis
+  elle sort de la notice ; retirée seulement avec `-y --keys` et « oui ».
 - **borgHelper**, dans `CACHE_DIR` : bases, `index-last.json` et verrous morts de nicks retirés du rc — seulement si
   **aucun** nick actuel ne les produit (dépôts et `DB_NAME` partagés gardés ; verrou tenu par un processus vivant
   jamais proposé, ni aucun fichier de ce nick tant que le verrou vit). `history.db` (historique mesuré, non
@@ -1205,9 +1217,8 @@ mais reste dans l'aperçu.
 Variables d'environnement : `BORGHELPERC_CLEANUP_HOME` (autre dossier personnel à scruter ; les selftests y mettent
 un dossier vide), `BORGHELPERC_NO_CLEANUP_NOTICE` (pas de notice ; posée par borgHelperWWW pour ses appels).
 
-Limites : un dépôt recréé au même chemin (nouvel identifiant) laisse l'entrée de l'ancien, non signalée (le chemin
-existe) ; un autre rc dont le nom commence par celui-ci et qui partage `CACHE_DIR` verrait ses fichiers proposés —
-lire l'aperçu avant `-y`.
+Limite : un autre rc dont le nom commence par celui-ci et qui partage `CACHE_DIR` verrait ses fichiers proposés — lire
+l'aperçu avant `-y`.
 
 ---
 
@@ -1232,6 +1243,16 @@ chacun, dans `/tmp` ou `TMPDIR`) laissés par les borg tués pendant le run sont
 le run, à l'utilisateur courant, utilisés par aucun processus et dont rien (arborescence comprise) n'a changé depuis
 10 s (15 s d'attente au plus pour un plus récent). Une ligne
 `/tmp/_MEI* : N orphelin(s) du run retiré(s)` le signale ; bilan et code de sortie inchangés.
+
+**Isolation** (1.0.161) : un crochet d'audit Python relève, pendant le run et dans les borgHelper qu'il lance, les
+accès aux vrais dossiers de l'utilisateur — `~/.config/borg`, `~/.cache/borg`, `~/.borghelperrc` (jamais lu par le
+selftest : tout usage du `CACHE_DIR` d'un vrai rc passe par sa lecture), `~/.cache/borghelper`, dossiers `XDG_*`/`BORG_*`
+de borg — par ouverture, liste, création, suppression, renommage, `chmod`/`chown`/`utime`/`truncate`, lien, base
+SQLite. Le dernier contrôle, « isolation des selftests », échoue en listant ces accès (fonction et ligne) ; des témoins
+(un appel voué à l'échec par évènement et par dossier, dans ce processus et dans un enfant) prouvent à chaque run que
+le crochet voit tout ce qu'il doit voir. Non couverts : `stat` et `exists` (pas d'évènement d'audit), copies
+`shutil` hors ouverture, borg lui-même (isolé par son wrapper, garde « vrai borg »). Run filtré (`-f`) : le contrôle ne
+couvre que les contrôles lancés, et seulement s'il est lui-même sélectionné.
 
 Auto-test du codec de chiffrement des chemins (vecteurs officiels HMAC/PBKDF2/scrypt, aller-retour, rejets
 `DbCodecError`/`DbKeyError`/`DbTamperError`, versions de schéma, `DB_ENCRYPT`/`DB_KDF`, permissions) et des requêtes de

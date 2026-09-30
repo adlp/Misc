@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.160"
+Version="1.0.161"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -135,17 +135,37 @@ def _dir_size(path):
             except OSError: pass
     return t
 
-def _local_absent(path,timeout=2):
-    """True seulement si `path` n'existe certainement pas (FileNotFoundError / NotADirectoryError) ; un accès refusé,
-    une autre erreur ou un stat qui ne répond pas en `timeout` s (montage réseau bloqué : Status, Report et /access ne
-    doivent jamais y rester pendus) compte comme présent : jamais proposé au nettoyage sur un doute."""
+def _local_state(path,timeout=2):
+    """'absent' seulement si `path` n'existe certainement pas (FileNotFoundError / NotADirectoryError) ; accès refusé ou
+    autre erreur : 'present' ; stat qui ne répond pas en `timeout` s (montage réseau bloqué : Status, Report et /access ne
+    doivent jamais y rester pendus) : 'unknown' (1.0.161 : rien d'autre n'y est lu ensuite)."""
     res=[]
     def _st():
-        try: os.stat(path); res.append(False)
-        except (FileNotFoundError,NotADirectoryError): res.append(True)
-        except (OSError,ValueError): res.append(False)
+        try: os.stat(path); res.append('present')
+        except (FileNotFoundError,NotADirectoryError): res.append('absent')
+        except (OSError,ValueError): res.append('present')
     th=threading.Thread(target=_st,daemon=True); th.start(); th.join(timeout)
-    return bool(res) and res[0]
+    return res[0] if res else 'unknown'
+
+def _local_absent(path,timeout=2):
+    """True seulement si `path` n'existe certainement pas ; présent, doute ou délai dépassé : False — jamais proposé au
+    nettoyage sur un doute."""
+    return _local_state(path,timeout)=='absent'
+
+def _repo_current_id(path,timeout=2):
+    """1.0.161 (story 24, A34) : identifiant du dépôt borg local `path` — `id` de la section [repository] de
+    <path>/config (borg 1.2 : 64 hexadécimaux), lu sans borg. None sur tout doute : config absente ou illisible, sans
+    id valide, ou lecture qui ne répond pas en `timeout` s (montage bloqué) — jamais un reste proposé sur un doute."""
+    res=[]
+    def _rd():
+        cp=configparser.ConfigParser(interpolation=None)
+        try:
+            with open(os.path.join(path,'config')) as f: cp.read_file(f)
+            v=cp['repository']['id'].strip().lower()
+            res.append(v if re.match(r'^[0-9a-f]{64}$',v) else None)
+        except (OSError,UnicodeDecodeError,configparser.Error,KeyError,ValueError): res.append(None)
+    th=threading.Thread(target=_rd,daemon=True); th.start(); th.join(timeout)
+    return res[0] if res else None
 
 def _borg_leftovers(home,repos):
     """1.0.160 (story 23, A30) : entrées borg d'un dossier personnel `home` pour des dépôts LOCAUX disparus — lecture
@@ -153,7 +173,12 @@ def _borg_leftovers(home,repos):
     cache .cache/borg/<id>/config (cache sans entrée de sécurité). Signalé si c'est un chemin absolu absent et hors de
     `repos` (BORG_REPO locaux du rc, normalisés) ; distant (ssh://, user@host:) ou forme inconnue : jamais. Clés
     (.config/borg/keys, 1re ligne 'BORG_KEY <id>') rattachées par id, à part : irréversibles. Entrée illisible : ignorée.
-    Rend [{'id','location','paths','anchor','size','keys','key_size'}]."""
+    1.0.161 (story 24, A34) : emplacement local PRÉSENT (du rc ou non) dont le dépôt porte un autre identifiant
+    (_repo_current_id) = ancien dépôt recréé au même chemin, signalé aussi (`recreated`) ; même id ou id illisible : jamais.
+    1.0.161 : `plain` = dépôt non chiffré (key-type 2 none, 6/7 authenticated, dans security/<id>/key-type) — sans son
+    entrée de sécurité, borg sans terminal refuse ce dépôt s'il existe encore (mesuré, borg 1.2.6 : « Aborting », code 2) ;
+    son cache seul peut partir sans effet (mesuré : code 0).
+    Rend [{'id','location','paths','anchor','size','keys','key_size','recreated','current_id','plain'}]."""
     sec=os.path.join(home,'.config','borg','security'); cache=os.path.join(home,'.cache','borg')
     keysd=os.path.join(home,'.config','borg','keys'); idre=re.compile(r'^[0-9a-f]{64}$')
     def _ls(d):
@@ -181,21 +206,133 @@ def _borg_leftovers(home,repos):
     out=[]
     for i,loc in sorted(locs.items()):
         if not loc.startswith('/'): continue
-        if os.path.normpath(loc) in repos or os.path.realpath(loc) in repos or not _local_absent(loc): continue
+        cur=None; st=_local_state(loc)
+        if st=='unknown': continue   # montage qui ne répond pas : gardé, rien d'autre lu
+        if st=='absent':
+            if os.path.normpath(loc) in repos or os.path.realpath(loc) in repos: continue   # disque du rc démonté : gardé
+        else:
+            cur=_repo_current_id(loc)
+            if cur is None or cur==i: continue   # dépôt courant, ou doute (config illisible, délai) : gardé
         sp=os.path.join(sec,i) if os.path.lexists(os.path.join(sec,i)) else None
         cp=os.path.join(cache,i) if os.path.lexists(os.path.join(cache,i)) else None
         paths=[x for x in (sp,cp) if x]
-        ks=keyof.get(i,[])
+        ks=keyof.get(i,[]); kt=''
+        if sp:
+            try:
+                with open(os.path.join(sp,'key-type')) as f: kt=f.read().strip()
+            except (OSError,UnicodeDecodeError): kt=''
         # anchor : ce qui porte l'emplacement (sécurité, sinon cache) — gardé tant que la clé l'est, sinon la clé
         # deviendrait introuvable (plus rien ne dirait à quel dépôt elle appartient)
         out.append({'id':i,'location':loc,'paths':paths,'anchor':sp or cp,'size':sum(_dir_size(x) for x in paths),
-                    'keys':ks,'key_size':sum(_dir_size(x) for x in ks)})
+                    'keys':ks,'key_size':sum(_dir_size(x) for x in ks),'recreated':cur is not None,'current_id':cur,
+                    'plain':kt in ('2','6','7')})
     return out
 
 _BH_KIND=(r'(?:(?:cache|diff|history)\.db(?:\.rebuild)?(?:-wal|-shm|\.vacuum_tmp\.\d+(?:-wal|-shm)?)?'
           r'|index-last\.json(?:\.\d+\.tmp)?'
           r'|(?:priority|index-running|index-paused|index-pending|report-running)\.lock(?:\.\d+)?(?:\.\d+\.tmp|\.stale\.\d+)?)')
 _BH_ORPHAN_RE=re.compile(r'-'+_BH_KIND+r'$')   # 1er '-' dont la suite est une forme connue : ce qui précède = le « tronc »
+
+# ── Crochet d'audit du selftest (1.0.161, story 24, A33) ──
+# CodecSelfTest relève tout accès aux vrais dossiers de l'utilisateur (borg, rc, CACHE_DIR par défaut) : dans son propre
+# processus et dans les borgHelper enfants, qui reçoivent le journal et les racines par l'environnement et posent le
+# crochet dès le chargement du module (CLI comme import). sys.addaudithook ne se retire pas : posé une fois par
+# processus, inactif quand _AUDIT['log'] est None. Limites : os.stat n'a pas d'évènement ; borg (binaire) n'est pas vu —
+# il est isolé par le wrapper BORG_EXE et la garde _rbc.
+_AUDIT={'log':None,'roots':(),'installed':False}
+_AUDIT_TLS=threading.local()   # .off : accès voulu (garde _rb_home_leaks) ou écriture du journal en cours
+_AUDIT_EVENTS=('open','os.mkdir','os.listdir','os.scandir','sqlite3.connect','os.remove','os.rename','os.rmdir',
+               'shutil.rmtree','os.chmod','os.chown','os.utime','os.truncate','os.link','os.symlink')
+_AUDIT_TWO=frozenset(('os.rename','os.link','os.symlink'))   # deux chemins (source, destination) ; les autres : le 1er seul
+_AUDIT_MARK='.borghelper-selftest-temoin'   # chemin inexistant visé par les témoins : l'évènement part avant l'appel
+
+def _audit_path(ev,a):
+    """Chemin absolu d'un argument d'évènement, ou None (descripteur, :memory:, type inconnu). sqlite3.connect en URI
+    (file:///chemin?mode=ro, lectures en lecture seule de borgHelper) : chemin extrait."""
+    if a is None or isinstance(a,int): return None
+    try: s=os.fsdecode(a)
+    except (TypeError,ValueError): return None
+    if ev=='sqlite3.connect':
+        if s in ('',':memory:'): return None
+        if s.startswith('file:'):
+            import urllib.parse
+            s=urllib.parse.unquote(s[5:].split('?',1)[0])
+            if s.startswith('//'):   # file://[hôte]/chemin
+                s=s[2:]; s='/'+s.split('/',1)[1] if '/' in s else ''
+            if not s: return None
+    return os.path.abspath(s)
+
+def _audit_hook(ev,args):
+    if ev not in _AUDIT_EVENTS: return
+    log=_AUDIT['log']
+    if not log or getattr(_AUDIT_TLS,'off',False): return
+    for a in (args[:2] if ev in _AUDIT_TWO else args[:1]):
+        try: pth=_audit_path(ev,a)
+        except Exception: continue   # jamais d'exception hors du crochet : l'appel audité échouerait
+        if pth is None: continue
+        if not any(pth==r or pth.startswith(r+os.sep) for r in _AUDIT['roots']): continue
+        _AUDIT_TLS.off=True
+        try:
+            where=[]; f=sys._getframe(1)
+            while f is not None and len(where)<3:
+                if f.f_code.co_filename==__file__: where.append(f"{f.f_code.co_name}:{f.f_lineno}")
+                f=f.f_back
+            with open(log,'a') as fh: fh.write(f"{os.getpid()}\t{ev}\t{pth}\t{' < '.join(where)}\n")
+        except Exception: pass   # (écriture du journal, chemin non encodable…) jamais propagé à l'appel audité
+        finally: _AUDIT_TLS.off=False
+        return
+
+def _audit_witness(tag):
+    """Témoins du contrôle d'isolation : sous chaque racine, un appel voué à l'échec par évènement surveillé, sur
+    <racine>/<_AUDIT_MARK>-<tag>/x (parent inexistant : l'évènement part avant l'appel, rien n'est créé, lu ni modifié)."""
+    for r in _AUDIT['roots']:
+        base=os.path.join(r,f"{_AUDIT_MARK}-{tag}"); x=os.path.join(base,'x')
+        for fn in (lambda: open(x), lambda: os.mkdir(x), lambda: os.listdir(x), lambda: os.scandir(x),
+                   lambda: sqlite3.connect(_audit_uri(x)+'?mode=ro',uri=True), lambda: os.remove(x), lambda: os.rename(x,x+'2'),
+                   lambda: os.rmdir(x), lambda: shutil.rmtree(x), lambda: os.chmod(x,0o600), lambda: os.chown(x,-1,-1),
+                   lambda: os.utime(x), lambda: os.truncate(x,0), lambda: os.link(x,x+'l'), lambda: os.symlink(x,x+'s')):
+            try: fn()
+            except Exception: pass
+
+def _audit_uri(p):
+    import pathlib
+    return pathlib.PurePosixPath(p).as_uri()
+
+def _audit_start(log,roots):
+    """Active le crochet vers le journal `log` pour les racines `roots` (posé au premier appel seulement)."""
+    _AUDIT.update(log=log,roots=tuple(roots))
+    if not _AUDIT['installed']: sys.addaudithook(_audit_hook); _AUDIT['installed']=True
+
+def _audit_roots():
+    """Vrais dossiers de l'utilisateur à ne jamais toucher pendant le selftest : pour le dossier personnel pwd (celui
+    d'un borg lancé par boex) et HOME, .config/borg, .cache/borg, .cache/borghelper (CACHE_DIR par défaut) et
+    .borghelperrc — jamais lu ici (choix de l'utilisateur) : tout usage du CACHE_DIR du vrai rc passe par sa lecture,
+    elle-même relevée ; XDG_CONFIG_HOME/borg,
+    XDG_CACHE_HOME/borg ; dossiers borg de BORG_BASE_DIR et BORG_CACHE_DIR, BORG_CONFIG_DIR, BORG_SECURITY_DIR,
+    BORG_KEYS_DIR de l'environnement. Racine trop large (moins de 2 niveaux, ex. « / ») : écartée."""
+    import pwd
+    env=os.environ; r=set()
+    for h in {pwd.getpwuid(os.getuid()).pw_dir,env.get('HOME') or ''}-{''}:
+        for s in (('.config','borg'),('.cache','borg'),('.cache','borghelper'),('.borghelperrc',)): r.add(os.path.join(h,*s))
+    for k in ('XDG_CONFIG_HOME','XDG_CACHE_HOME'):
+        if env.get(k): r.add(os.path.join(env[k],'borg'))
+    if env.get('BORG_BASE_DIR'):
+        r.update({os.path.join(env['BORG_BASE_DIR'],'.config','borg'),os.path.join(env['BORG_BASE_DIR'],'.cache','borg')})
+    for k in ('BORG_CACHE_DIR','BORG_CONFIG_DIR','BORG_SECURITY_DIR','BORG_KEYS_DIR'):
+        if env.get(k): r.add(env[k])
+    out=set()
+    for x in r:
+        x=os.path.abspath(os.path.expanduser(x))
+        for y in (os.path.normpath(x),os.path.realpath(x)):
+            if len([c for c in y.split(os.sep) if c])>=2: out.add(y)
+    return sorted(out)
+
+if os.environ.get('BORGHELPERC_SELFTEST_AUDIT'):   # borgHelper enfant d'un CodecSelfTest : même journal, mêmes racines
+    try: _roots=[x for x in json.loads(os.environ.get('BORGHELPERC_SELFTEST_AUDIT_ROOTS') or '[]') if isinstance(x,str) and x]
+    except ValueError: _roots=[]
+    _audit_start(os.environ['BORGHELPERC_SELFTEST_AUDIT'],_roots)
+    if os.environ.get('BORGHELPERC_SELFTEST_AUDIT_WITNESS'):   # témoins du contrôle d'isolation (jeton du selftest)
+        _audit_witness('enfant-'+os.environ['BORGHELPERC_SELFTEST_AUDIT_WITNESS'])
 
 def mountedornot(mountpoint,debug=0):
     founded=False
@@ -873,7 +1010,8 @@ def usage(doc=None,debug=0):
     elif doc=='borgcleanup':
         printer("   -c BorgCleanup [-D] [-y] [--keys] [--history]")
         printer("       Restes de dépôts borg LOCAUX disparus (hors rc ; ~/.config/borg/security, ~/.cache/borg, clés)")
-        printer("       et fichiers borgHelper de nicks retirés du rc (CACHE_DIR) — jamais un dépôt distant ou configuré")
+        printer("       et fichiers borgHelper de nicks retirés du rc (CACHE_DIR) — jamais un dépôt distant ou configuré ;")
+        printer("       aussi l'entrée d'un ancien dépôt recréé au même chemin (autre id dans <dépôt>/config ; disque en rotation ?)")
         printer("       Sans -y, ou -D : aperçu (chemins, tailles), rien supprimé  |  -y : retire sécurité, cache et fichiers régénérables")
         printer("       -y : confirmation sur l'entrée standard (« o », puis « oui » pour clés et historiques) ; sans réponse : code 2")
         printer("       -y --keys : aussi les clés (irréversible)  |  -y --history : aussi les historiques mesurés (history.db)")
@@ -6646,7 +6784,8 @@ class BorgHelper:
     # ── Nettoyage des restes de dépôts disparus et de nicks retirés (1.0.160, story 23, A30) ──
     def cleanup_scan(self,home=None):
         """Lecture seule, jamais borg. borg : _borg_leftovers du dossier personnel (pwd par défaut : celui qu'utilise
-        borg lancé par boex, sans HOME) contre les BORG_REPO du rc. borgHelper : fichiers de CACHE_DIR au préfixe du rc,
+        borg lancé par boex, sans HOME) contre les BORG_REPO du rc — dépôts disparus, et (1.0.161) anciens dépôts recréés
+        au même chemin (autre identifiant dans <dépôt>/config). borgHelper : fichiers de CACHE_DIR au préfixe du rc,
         de forme connue (_BH_ORPHAN_RE), qu'AUCUN nick actuel ne produit (base par nick ou DB_NAME, index-last par nick,
         verrous par dépôt : dépôts et DB_NAME partagés gardés) ; verrou tenu par un processus vivant jamais proposé.
         BORGHELPERC_CLEANUP_HOME (env) : autre dossier à scruter (le selftest y met un dossier vide : jamais les vraies
@@ -6692,22 +6831,26 @@ class BorgHelper:
     @staticmethod
     def _cleanup_kept_key(x):
         """Entrée borg réduite à sa clé gardée et à l'élément qui porte l'emplacement (après -y sans --keys) : hors notice
-        (choix de l'utilisateur), toujours dans l'aperçu de BorgCleanup."""
-        if not x['keys'] or x['paths']!=[x['anchor']]: return False
+        (choix de l'utilisateur), toujours dans l'aperçu de BorgCleanup. 1.0.161 : dépôt non chiffré réduit à son entrée de
+        sécurité (gardée comme une clé) : idem."""
+        if not (x['keys'] or x.get('plain')) or x['paths']!=[x['anchor']]: return False
         if os.sep+'.config'+os.sep in x['anchor']: return True
         try: return set(os.listdir(x['anchor']))<={'config'}
         except OSError: return False
 
     @staticmethod
     def cleanup_summary(scan):
-        """Nombres et tailles seulement (jamais de chemin) : notice, /access. Entrées réduites à une clé gardée : à part."""
-        b=[x for x in scan.get('borg',[]) if not BorgHelper._cleanup_kept_key(x)]; h=scan.get('bh',[])
+        """Nombres et tailles seulement (jamais de chemin) : notice, /access. Entrées réduites à une clé gardée : à part.
+        1.0.161 : anciens dépôts recréés au même chemin hors notice (disques en rotation, choix de l'utilisateur) :
+        `recreated` seulement."""
+        b=[x for x in scan.get('borg',[]) if not BorgHelper._cleanup_kept_key(x) and not x.get('recreated')]; h=scan.get('bh',[])
         reg=[x for x in h if x['kind']!='history']; his=[x for x in h if x['kind']=='history']
         return {'borg_entries':len(b),'borg_size':sum(x['size'] for x in b),
                 'keys':sum(len(x['keys']) for x in b),'keys_size':sum(x['key_size'] for x in b),
                 'bh_files':len(reg),'bh_size':sum(x['size'] for x in reg),
                 'history':len(his),'history_size':sum(x['size'] for x in his),
-                'kept_keys':sum(len(x['keys']) for x in scan.get('borg',[]) if BorgHelper._cleanup_kept_key(x))}
+                'kept_keys':sum(len(x['keys']) for x in scan.get('borg',[]) if BorgHelper._cleanup_kept_key(x)),
+                'recreated':sum(1 for x in scan.get('borg',[]) if x.get('recreated'))}
 
     def cleanup_notice(self,home=None):
         """Une ligne pour la fin de Status et de Report (texte, CLI), ou None — jamais d'exception. Jamais pour un appel
@@ -6734,7 +6877,8 @@ class BorgHelper:
         return a=='oui' if want=='oui' else a in ('o','oui','y','yes')
 
     def borg_cleanup(self,confirm=False,keys=False,history=False,home=None,ask=None):
-        """Commande CLI BorgCleanup : aperçu par défaut ; -y retire les entrées borg (sécurité, cache) et les fichiers
+        """Commande CLI BorgCleanup : aperçu par défaut (1.0.161 : anciens dépôts recréés au même chemin listés à part, leur
+        identifiant relu avant suppression) ; -y retire les entrées borg (sécurité, cache) et les fichiers
         borgHelper régénérables ; --keys (avec -y) les clés borg — irréversible ; --history (avec -y) les history.db.
         Avec -y : confirmation sur l'entrée standard (« o »), puis, pour les clés et historiques, le mot « oui » ;
         refus ou fin de l'entrée -> code 2, rien supprimé. `ask(prompt,want)` : autre source de réponse (tests).
@@ -6743,13 +6887,23 @@ class BorgHelper:
         scan=self.cleanup_scan(home); b=scan['borg']; h=scan['bh']
         if not b and not h:
             printer("Rien à nettoyer : aucune entrée borg de dépôt local disparu, aucun fichier borgHelper de nick retiré."); return 0
-        if b:
-            printer("Entrées borg de dépôts locaux disparus (hors rc) :")
-            for x in b:
-                printer(f"  {x['location']}  ({convert_octets_readable(x['size'])})")
+        gone=[x for x in b if not x.get('recreated')]; again=[x for x in b if x.get('recreated')]
+        for title,part in (("Entrées borg de dépôts locaux disparus (hors rc) :",gone),
+                           ("Entrées borg d'anciens dépôts recréés au même chemin (autre identifiant — disque en rotation ? "
+                            "borg recrée seul l'entrée et le cache d'un dépôt qui revient) :",again)):
+            if not part: continue
+            printer(title)
+            for x in part:
+                printer(f"  {x['location']}  ({convert_octets_readable(x['size'])})"
+                        +(f"  ancien id {x['id'][:12]}…, actuel {x['current_id'][:12]}…" if x.get('recreated') else ""))
                 for q in x['paths']: printer(f"    {q}")
-                for k in x['keys']: printer(f"    ⚠ clé {k} — suppression irréversible (dépôt illisible s'il existe encore ailleurs) : --keys ;"
-                                            " sans --keys, l'entrée qui porte l'emplacement est gardée avec elle")
+                if x.get('plain'):
+                    printer("    ⚠ dépôt non chiffré : sans cette entrée de sécurité, borg sans terminal (cron) refuse ce dépôt s'il"
+                            " existe encore — retirée seulement avec --keys ; -y ne retire que son cache")
+                for k in x['keys']:
+                    printer(f"    ⚠ clé {k} — suppression irréversible (dépôt illisible s'il existe encore ailleurs"
+                            +(", par exemple sur un disque en rotation monté à ce chemin" if x.get('recreated') else "")
+                            +") : --keys ; sans --keys, l'entrée qui porte l'emplacement est gardée avec elle")
         if h:
             printer("Fichiers borgHelper de nicks absents du rc :")
             for x in h:
@@ -6761,10 +6915,12 @@ class BorgHelper:
             return 0
         ask=ask or self._cleanup_ask
         nk=sum(len(x['keys']) for x in b) if keys else 0; nh=sum(1 for x in h if x['kind']=='history') if history else 0
+        np_=sum(1 for x in b if x.get('plain')) if keys else 0
         nr=len(b)+sum(1 for x in h if x['kind']!='history')
         if not ask(f"Supprimer {nr} élément(s) régénérable(s) (entrées borg, caches, fichiers borgHelper) ? [o/N] ",'o'):
             printer("Rien supprimé (non confirmé)."); return 2
-        if (nk or nh) and not ask(f"⚠ Perte définitive : {nk} clé(s) borg, {nh} historique(s) mesuré(s). Taper « oui » pour confirmer : ",'oui'):
+        if (nk or nh or np_) and not ask(f"⚠ Perte définitive : {nk} clé(s) borg, {np_} entrée(s) de dépôt non chiffré, {nh} historique(s)"
+                                         " mesuré(s). Taper « oui » pour confirmer : ",'oui'):
             printer("Rien supprimé (perte définitive non confirmée)."); return 2
         done=errs=0
         def _rm(q):
@@ -6776,8 +6932,11 @@ class BorgHelper:
             except FileNotFoundError: pass
             except OSError as e: errs+=1; printer(f"  [ERREUR] {q} : {e}")
         for x in b:
-            if not _local_absent(x['location']): printer(f"  {x['location']} est réapparu — gardé"); continue
-            keep_anchor=bool(x['keys']) and not keys   # clé gardée : son emplacement aussi, pour la retrouver ensuite
+            if x.get('recreated'):   # 1.0.161 : identifiant relu — disque remis, config illisible ou dépôt parti : gardé
+                cur=_repo_current_id(x['location'])
+                if cur is None or cur==x['id']: printer(f"  {x['location']} : ancien dépôt remis, dépôt parti ou identifiant illisible — gardé"); continue
+            elif not _local_absent(x['location']): printer(f"  {x['location']} est réapparu — gardé"); continue
+            keep_anchor=bool(x['keys'] or x.get('plain')) and not keys   # clé gardée : son emplacement aussi ; non chiffré : l'entrée
             for q in x['paths']:
                 if keep_anchor and q==x['anchor']:
                     if os.sep+'.cache'+os.sep in q and os.path.isdir(q):   # cache seul : garder son config (emplacement)
@@ -6792,6 +6951,7 @@ class BorgHelper:
                 printer(f"  {x['path']} : verrou repris entre-temps — gardé"); continue
             if x['kind']!='history' or history: _rm(x['path'])
         kept=([f"{sum(len(x['keys']) for x in b)} clé(s)"] if not keys and any(x['keys'] for x in b) else [])+\
+             ([f"{sum(1 for x in b if x.get('plain'))} entrée(s) de dépôt non chiffré"] if not keys and any(x.get('plain') for x in b) else [])+\
              ([f"{sum(1 for x in h if x['kind']=='history')} historique(s)"] if not history and any(x['kind']=='history' for x in h) else [])
         printer(f"{done} élément(s) retiré(s)"+(f", {errs} en échec" if errs else "")+(f" ; gardés : {', '.join(kept)}" if kept else "")
                 +" — relancer borgHelper -c BorgCleanup pour l'aperçu")
@@ -7523,7 +7683,19 @@ def codec_selftest(pattern=None,list_only=False):
         return subprocess.CompletedProcess(cmd,ps.returncode,out,err)
     def _rb_sig(sig,_frame): raise KeyboardInterrupt(f"signal {sig}")
     saved_sigs={}; saved_cleanup_home=os.environ.get('BORGHELPERC_CLEANUP_HOME')
+    # 1.0.161 (story 24, A33) : crochet d'audit — tout accès aux vrais dossiers de l'utilisateur (_audit_roots) est journalisé,
+    # dans ce processus et dans les borgHelper enfants ; contrôle « isolation des selftests » en fin de run. Selftest
+    # imbriqué, ou enfant d'un selftest : journal du selftest englobant, rien changé.
+    audit_outer=_AUDIT['log'] is not None
+    saved_audit_env={k:os.environ.get(k) for k in ('BORGHELPERC_SELFTEST_AUDIT','BORGHELPERC_SELFTEST_AUDIT_ROOTS')}
     try:
+        if not audit_outer:
+            _here=os.path.dirname(os.path.realpath(__file__))   # ni le dossier du selftest ni celui du script : jamais racines
+            _all=_audit_roots(); _keep=[r for r in _all if not (tmp+os.sep).startswith(r+os.sep) and not (_here+os.sep).startswith(r+os.sep)]
+            _AUDIT['dropped']=[r for r in _all if r not in _keep]
+            _audit_start(os.path.join(tmp,'audit.log'),_keep)
+            os.environ['BORGHELPERC_SELFTEST_AUDIT']=_AUDIT['log']
+            os.environ['BORGHELPERC_SELFTEST_AUDIT_ROOTS']=json.dumps(list(_AUDIT['roots']))
         for _sg in (signal.SIGTERM,signal.SIGHUP):
             try: saved_sigs[_sg]=signal.signal(_sg,_rb_sig)
             except ValueError: pass   # hors du fil principal : gestionnaire impossible, rien changé
@@ -7838,6 +8010,9 @@ def codec_selftest(pattern=None,list_only=False):
         rh_dir=os.path.join(tmp,'rhist'); os.makedirs(rh_dir)
         rh_rc=os.path.join(rh_dir,'rc')
         with open(rh_rc,'w') as f:
+            # 1.0.161 (story 24) : CACHE_DIR explicite — _cli_rh_multi_rejected lance _cli_main dans ce processus ; sans lui,
+            # BorgHelper() créait ~/.cache/borghelper (vu par strace et par le crochet d'audit)
+            f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(rh_dir,'cache')}\n\n")
             for nk in ('rhA','rhB','rhEmpty','rhOld'):
                 # dates fixes des fixtures rhA/rhB (2026) : rétention très longue, sinon le bornage des
                 # séries (1.0.127, 13 mois par défaut) les ferait disparaître avec le temps. rhOld : défaut.
@@ -10596,16 +10771,19 @@ def codec_selftest(pattern=None,list_only=False):
             return sorted(out)
         _rb_user_sec=_rb_user_sec_dirs(); _rb_seen=set()
         def _rb_home_leaks():
-            """Entrées de sécurité borg de l'utilisateur dont le dépôt est dans le dossier du selftest (location sous tmp)."""
-            out=[]
-            for sd in _rb_user_sec:
-                try: ents=os.listdir(sd)
-                except OSError: continue
-                for e in ents:
-                    try:
-                        with open(os.path.join(sd,e,'location')) as f: loc=f.read().strip()
+            """Entrées de sécurité borg de l'utilisateur dont le dépôt est dans le dossier du selftest (location sous tmp).
+            Seule lecture voulue du vrai dossier borg : hors crochet d'audit (1.0.161)."""
+            out=[]; _AUDIT_TLS.off=True
+            try:
+                for sd in _rb_user_sec:
+                    try: ents=os.listdir(sd)
                     except OSError: continue
-                    if loc==tmp or loc.startswith(tmp+os.sep): out.append(f"{os.path.join(sd,e)} ({loc})")
+                    for e in ents:
+                        try:
+                            with open(os.path.join(sd,e,'location')) as f: loc=f.read().strip()
+                        except OSError: continue
+                        if loc==tmp or loc.startswith(tmp+os.sep): out.append(f"{os.path.join(sd,e)} ({loc})")
+            finally: _AUDIT_TLS.off=False
             return out
         def _rbc(name,fn):
             """Contrôle « vrai borg » : sauté sous son propre nom sans borg (-f montre le SKIP du contrôle filtré, -l le
@@ -10900,6 +11078,165 @@ def codec_selftest(pattern=None,list_only=False):
                              f"CLI {cli} {[c.returncode for c in (c1,c2,c3,c4,c5,c6,c7,c8,c9)]} {O(c7)[-200:]!r} {O(c8)[-200:]!r} {O(c4)[-200:]!r}")
             return ok
         check("nettoyage borg : restes de dépôts disparus et de nicks retirés — aperçu (-D), -y confirmé, --keys, --history, notices (bac à sable)",_cleanup_sandbox)
+        def _cleanup_recreated():
+            """1.0.161 (story 24, A34) : entrées borg d'un ancien dépôt recréé au même chemin (bac à sable, jamais borg). Signalées :
+            ancien id sous un dépôt du rc et hors rc, cache seul (previous_location). Jamais : id courant, dossier sans config,
+            config illisible, sans id ou id invalide, config qui ne répond pas (FIFO). Aperçu : section à part, ids,
+            avertissement « disque en rotation » sur la clé ; hors notice (choix de l'utilisateur : disques en rotation). -y : identifiant relu — ancien disque remis entre repérage et suppression : gardé ;
+            clé gardée avec son emplacement ; -y --keys (« oui ») : clé retirée ; config du dépôt jamais touchée."""
+            root=os.geteuid()==0
+            d=os.path.join(tmp,'cleanup-recree'); H=os.path.join(d,'home'); cd=os.path.join(d,'cache'); rc=os.path.join(d,'rrc')
+            sec=os.path.join(H,'.config','borg','security'); cac=os.path.join(H,'.cache','borg'); ky=os.path.join(H,'.config','borg','keys')
+            for x in (sec,cac,ky,cd): os.makedirs(x)
+            I={k:c*64 for k,c in (('old','2'),('cur','3'),('nocfg','4'),('bad','5'),('hors','6'),('horscur','7'),('badid','8'),('cache','9'))}
+            repo=lambda n: os.path.join(d,n)
+            def mkrepo(n,body,mode=0o600):
+                os.makedirs(repo(n),exist_ok=True)
+                with open(os.path.join(repo(n),'config'),'w') as f: f.write(body)
+                os.chmod(os.path.join(repo(n),'config'),mode)
+            cfg=lambda i: f"[repository]\nversion = 1\nid = {i}\nkey = abc\n\tdef\n"
+            mkrepo('repo-r',cfg(I['cur'])); mkrepo('repo-h',cfg(I['horscur'])); os.makedirs(repo('sans-config'))
+            mkrepo('illisible',cfg(I['cur']),0 if not root else 0o600); mkrepo('id-invalide',"[repository]\nid = zz\n")
+            locs={'old':repo('repo-r'),'cur':repo('repo-r'),'nocfg':repo('sans-config'),'hors':repo('repo-h'),'horscur':repo('repo-h'),
+                  'badid':repo('id-invalide')}
+            if not root: locs['bad']=repo('illisible')
+            for k,loc in locs.items():
+                os.makedirs(os.path.join(sec,I[k]))
+                with open(os.path.join(sec,I[k],'location'),'w') as f: f.write(loc)
+                os.makedirs(os.path.join(cac,I[k])); open(os.path.join(cac,I[k],'chunks'),'w').write('x'*100)
+            os.makedirs(os.path.join(cac,I['cache']))   # cache seul d'un ancien id, hors rc
+            with open(os.path.join(cac,I['cache'],'config'),'w') as f: f.write(f"[cache]\nprevious_location = {repo('repo-h')}\n")
+            with open(os.path.join(ky,'old_r'),'w') as f: f.write(f"BORG_KEY {I['old']}\nxxx\n")
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={cd}\n\n[r1]\nBORG_REPO={repo('repo-r')}\nBORG_PASSPHRASE=pw\nSER_NAME=r1\nGLOB_ARCH=t-*\n"
+                        "BORG_ARCHNAME=t\nBORG_ROOTBKP=/nulle/part\nDB_ENCRYPT=false\n")
+            os.chmod(rc,0o600)
+            b=BorgHelper(cfgfile=rc,cache_dir=cd); yes=lambda _p,_w: True; o=io.StringIO()
+            def rd(q):
+                with open(q) as f: return f.read()
+            cfgs_before={n:rd(os.path.join(repo(n),'config')) for n in ('repo-r','repo-h','id-invalide')}
+            sc=b.cleanup_scan(home=H); sm=b.cleanup_summary(sc); note=b.cleanup_notice(home=H) or ''
+            got={x['id']:(x['recreated'],x['current_id']) for x in sc['borg']}
+            want={I['old']:(True,I['cur']),I['hors']:(True,I['horscur']),I['cache']:(True,I['horscur'])}
+            with contextlib.redirect_stderr(o): r0=b.borg_cleanup(home=H,ask=lambda _p,_w: False)
+            pv=o.getvalue()
+            preview=(r0==0 and "anciens dépôts recréés au même chemin" in pv and f"ancien id {I['old'][:12]}…, actuel {I['cur'][:12]}…" in pv
+                     and 'disque en rotation monté à ce chemin' in pv and "dépôts locaux disparus" not in pv)
+            orig=b.cleanup_scan
+            def _scan_puis_remis(home=None):   # l'ancien disque de repo-h revient entre repérage et suppression
+                r=orig(home); os.chmod(os.path.join(repo('repo-h'),'config'),0o600)
+                with open(os.path.join(repo('repo-h'),'config'),'w') as f: f.write(cfg(I['hors']))
+                return r
+            o1=io.StringIO()
+            with mock.patch.object(b,'cleanup_scan',_scan_puis_remis), contextlib.redirect_stderr(o1): r1=b.borg_cleanup(confirm=True,home=H,ask=yes)
+            ex=lambda *p: os.path.exists(os.path.join(*p))
+            step1=(r1==0 and ex(sec,I['old']) and not ex(cac,I['old']) and ex(ky,'old_r')   # clé gardée avec son emplacement
+                   and ex(sec,I['hors']) and ex(cac,I['hors']) and 'ancien dépôt remis' in o1.getvalue()
+                   and not ex(cac,I['cache']))   # cache seul d'un autre ancien id (courant : hors) : retiré
+            with open(os.path.join(repo('repo-h'),'config'),'w') as f: f.write(cfgs_before['repo-h'])   # disque courant revenu
+            with contextlib.redirect_stderr(o1): r2=b.borg_cleanup(confirm=True,keys=True,home=H,ask=yes)
+            step2=r2==0 and not ex(sec,I['old']) and not ex(ky,'old_r') and not ex(sec,I['hors'])
+            kept=(all(ex(sec,I[k]) and ex(cac,I[k]) for k in ('cur','nocfg','horscur','badid')+(() if root else ('bad',)))
+                  and all(rd(os.path.join(repo(n),'config'))==c for n,c in cfgs_before.items()))
+            # config qui ne répond pas (FIFO : l'ouverture en lecture bloque, comme un montage figé) : None dans le délai,
+            # entrée jamais signalée ; lecteurs bloqués libérés ensuite (écrivain ouvert puis fermé : fin de fichier)
+            fifo_ok=True
+            if hasattr(os,'mkfifo'):
+                fr=repo('bloque'); os.makedirs(fr); os.mkfifo(os.path.join(fr,'config')); fi='a'*64
+                os.makedirs(os.path.join(sec,fi))
+                with open(os.path.join(sec,fi,'location'),'w') as f: f.write(fr)
+                got_q=[]; t0=time.monotonic()   # appel dans un fil : un _repo_current_id sans délai ne bloque pas le selftest
+                thq=threading.Thread(target=lambda: got_q.append(_repo_current_id(fr,timeout=0.3)),daemon=True); thq.start(); thq.join(3)
+                quick=got_q[0] if got_q else 'bloqué'; dt=time.monotonic()-t0
+                got_l=[]; thl=threading.Thread(target=lambda: got_l.append(_borg_leftovers(H,set())),daemon=True); thl.start(); thl.join(6)
+                flagged=(fi in {x['id'] for x in got_l[0]}) if got_l else 'bloqué'
+                with contextlib.suppress(OSError): os.close(os.open(os.path.join(fr,'config'),os.O_WRONLY|os.O_NONBLOCK))
+                fifo_ok=quick is None and dt<1.5 and not flagged
+                if not fifo_ok: print(f"  config bloquée : {quick!r} en {dt:.2f} s, signalée {flagged}")
+            # stat qui ne répond pas (montage figé, simulé) : entrée gardée, et plus rien n'est lu dessous (pas d'id)
+            fz=repo('fige'); fzi='b'*64; os.makedirs(os.path.join(sec,fzi))
+            with open(os.path.join(sec,fzi,'location'),'w') as f: f.write(fz)
+            real_stat=os.stat; ids_read=[]
+            def slow_stat(q,*a,**k):
+                if os.fspath(q)==fz: time.sleep(2.5)
+                return real_stat(q,*a,**k)
+            def rec_id(q,timeout=2): ids_read.append(q); return None
+            with mock.patch.object(os,'stat',slow_stat), mock.patch.dict(globals(),{'_repo_current_id':rec_id}):
+                frozen_hit=fzi in {x['id'] for x in _borg_leftovers(H,set())}
+            fige_ok=not frozen_hit and fz not in ids_read
+            if not fige_ok: print(f"  stat figé : signalé {frozen_hit}, id lu {fz in ids_read}")
+            ok=(got==want and (sm['borg_entries'],sm['keys'],sm['recreated'])==(0,0,3) and 'entrée(s) borg' not in note
+                and preview and step1 and step2 and kept and fifo_ok and fige_ok)
+            if not ok: print(f"  recréés : {got} résumé {sm} notice {note!r} aperçu {preview} {pv[-400:]!r} -y {step1} {o1.getvalue()[-300:]!r} "
+                             f"--keys {step2} gardés {kept}")
+            if not root: os.chmod(os.path.join(repo('illisible'),'config'),0o600)
+            return ok
+        check("nettoyage borg : ancien dépôt recréé au même chemin — autre id signalé, id courant et doute jamais, disque remis gardé (bac à sable)",_cleanup_recreated)
+        def _cleanup_recreated_real():
+            """1.0.161 (story 24, A34) : vrai borg, BORG_BASE_DIR du test (jamais le dossier de l'utilisateur) : dépôt créé, supprimé,
+            recréé au même chemin -> seule l'ancienne entrée est signalée (id relu dans config) ; -y la retire ; le dépôt courant
+            reste lisible (borg list code 0) et son entrée intacte."""
+            borg=shutil.which('borg'); d=os.path.join(tmp,'rb-recree'); bb=os.path.join(d,'base'); r=os.path.join(d,'repo')
+            os.makedirs(bb); env=_rb_env(bb,BORG_PASSPHRASE='pw-recree')
+            ids=[]
+            for _ in range(2):
+                p=_rb_run([borg,'init','-e','repokey',r],120,env=env)
+                if p.returncode!=0: print(f"  borg init : {p.returncode} {(p.stdout+p.stderr)[-200:]!r}"); return False
+                ids.append(_repo_current_id(r))
+                if not ids[-1]: print(f"  identifiant illisible : {r}/config"); return False
+                if len(ids)==1: shutil.rmtree(r)
+            rc=os.path.join(d,'rc')
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n\n[rr]\nBORG_REPO={r}\nBORG_PASSPHRASE=pw-recree\nSER_NAME=rr\n"
+                        "GLOB_ARCH=t-*\nBORG_ARCHNAME=t\nBORG_ROOTBKP=/nulle/part\nDB_ENCRYPT=false\n")
+            os.chmod(rc,0o600)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            sc=b.cleanup_scan(home=bb)
+            found=[(x['id'],x['recreated'],x['current_id']) for x in sc['borg']]
+            with contextlib.redirect_stderr(io.StringIO()): rcl=b.borg_cleanup(confirm=True,home=bb,ask=lambda _p,_w: True)
+            ls=_rb_run([borg,'list',r],120,env=env)
+            secd=os.path.join(bb,'.config','borg','security')
+            left=sorted(os.listdir(secd)) if os.path.isdir(secd) else []
+            ok=(ids[0]!=ids[1] and found==[(ids[0],True,ids[1])] and rcl==0 and ls.returncode==0 and left==[ids[1]])
+            if not ok: print(f"  recréé réel : ids {ids} repérés {found} code {rcl} borg list {ls.returncode} {(ls.stdout+ls.stderr)[-200:]!r} sécurité {left}")
+            return ok
+        _rbc("nettoyage borg sur vrai borg : dépôt recréé au même chemin — ancienne entrée retirée, dépôt courant intact",_cleanup_recreated_real)
+        def _cleanup_plain():
+            """1.0.161 (story 24, choix de l'utilisateur) : dépôt NON chiffré disparu (key-type 2 none, 6/7 authenticated) —
+            son entrée de sécurité est gardée comme une clé : -y ne retire que son cache, l'entrée sort alors de la notice ;
+            retirée seulement avec -y --keys et « oui ». Dépôt chiffré (key-type 3) : retiré par -y. Bac à sable."""
+            d=os.path.join(tmp,'cleanup-plain'); H=os.path.join(d,'home'); cd=os.path.join(d,'cache'); rc=os.path.join(d,'prc')
+            sec=os.path.join(H,'.config','borg','security'); cac=os.path.join(H,'.cache','borg')
+            for x in (sec,cac,cd): os.makedirs(x)
+            I={'none':'c'*64,'auth':'d'*64,'blake':'e'*64,'repokey':'f'*64}
+            for k,kt in (('none','2'),('auth','7'),('blake','6'),('repokey','3')):
+                os.makedirs(os.path.join(sec,I[k])); os.makedirs(os.path.join(cac,I[k]))
+                with open(os.path.join(sec,I[k],'location'),'w') as f: f.write(os.path.join(d,'parti-'+k))
+                with open(os.path.join(sec,I[k],'key-type'),'w') as f: f.write(kt+'\n')
+                with open(os.path.join(cac,I[k],'chunks'),'w') as f: f.write('x'*100)
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={cd}\n\n[p1]\nBORG_REPO={os.path.join(d,'repo-p')}\nBORG_PASSPHRASE=pw\nSER_NAME=p1\n"
+                        "GLOB_ARCH=t-*\nBORG_ARCHNAME=t\nBORG_ROOTBKP=/nulle/part\nDB_ENCRYPT=false\n")
+            os.chmod(rc,0o600)
+            b=BorgHelper(cfgfile=rc,cache_dir=cd); o=io.StringIO(); ex=lambda *q: os.path.exists(os.path.join(*q))
+            sc=b.cleanup_scan(home=H); plain={x['id']:x['plain'] for x in sc['borg']}
+            note0=b.cleanup_notice(home=H) or ''
+            with contextlib.redirect_stderr(o): r0=b.borg_cleanup(home=H,ask=lambda _p,_w: False)
+            pv=o.getvalue().count('dépôt non chiffré : sans cette entrée')
+            with contextlib.redirect_stderr(o): r1=b.borg_cleanup(confirm=True,home=H,ask=lambda _p,_w: True)
+            step1=(r1==0 and all(ex(sec,I[k]) and not ex(cac,I[k]) for k in ('none','auth','blake'))
+                   and not ex(sec,I['repokey']) and not ex(cac,I['repokey']))
+            sm1=b.cleanup_summary(b.cleanup_scan(home=H)); note1=b.cleanup_notice(home=H) or ''
+            with contextlib.redirect_stderr(o): rno=b.borg_cleanup(confirm=True,keys=True,home=H,ask=lambda _p,w: w=='o')
+            half=rno==2 and all(ex(sec,I[k]) for k in ('none','auth','blake'))
+            with contextlib.redirect_stderr(o): r2=b.borg_cleanup(confirm=True,keys=True,home=H,ask=lambda _p,_w: True)
+            step2=r2==0 and not any(ex(sec,I[k]) for k in I)
+            ok=(plain=={I['none']:True,I['auth']:True,I['blake']:True,I['repokey']:False} and '4 entrée(s) borg' in note0
+                and r0==0 and pv==3 and step1 and sm1['borg_entries']==0 and 'entrée(s) borg' not in note1 and half and step2)
+            if not ok: print(f"  non chiffré : {plain} notice {note0!r} aperçu {r0} {pv} -y {step1} {sm1} {note1!r} « o » seul {half} --keys {step2} "
+                             f"{o.getvalue()[-300:]!r}")
+            return ok
+        check("nettoyage borg : dépôt non chiffré disparu — entrée de sécurité gardée comme une clé, cache seul retiré par -y (bac à sable)",_cleanup_plain)
         ix_dir=os.path.join(tmp,'tranches')
         def _ix_setup():
             """Vrai dépôt, 6 archives '{fqdn}-t-*' (fichiers modifiés entre chaque), borg appelé via un script qui
@@ -12592,10 +12929,46 @@ def codec_selftest(pattern=None,list_only=False):
                       ==['-','-','-','-','d','d','l','l','p','c','b',None,None]
                       and {'removed fifo','removed chrdev','removed blkdev','removed link','removed directory','removed'}<=set(_DIFF_REMOVED_TYPES)
                       and {'added fifo','added chrdev','added blkdev','added link','added directory','added'}<=set(_DIFF_ADDED_TYPES))
+        def _audit_isolation():
+            """1.0.161 (story 24, A33) : aucun accès aux vrais dossiers de l'utilisateur (_audit_roots) pendant le run, ni dans
+            ce processus ni dans un borgHelper enfant — journal du crochet d'audit, garde _rb_home_leaks exceptée. Témoins
+            (_audit_witness : sous chaque racine, un appel voué à l'échec par évènement surveillé) dans ce processus et dans
+            un enfant (-v, jeton propre à ce contrôle) : chaque couple (évènement, racine) doit figurer au journal, sinon
+            le crochet serait aveugle pour lui et le contrôle passerait à vide ; ~/.cache/borghelper doit être une racine.
+            Placé en dernier ; run filtré (-f) : seuls les contrôles lancés sont couverts."""
+            import pwd
+            log=_AUDIT['log']; roots=_AUDIT['roots']
+            if not log or not roots: print(f"  crochet inactif (journal {log!r}, {len(roots)} racine(s))"); return False
+            if _AUDIT.get('dropped'): print(f"  racines écartées (dossier du selftest ou du script dessous) : {_AUDIT['dropped']}")
+            tok=uuid.uuid4().hex[:12]; _audit_witness('processus-'+tok)
+            r=_rb_run([os.path.realpath(__file__),'-v'],60,env=_rb_cli_env(BORGHELPERC_SELFTEST_AUDIT_WITNESS=tok))
+            try:
+                with open(log) as f: rows=[l.rstrip('\n').split('\t') for l in f if l.strip()]
+            except FileNotFoundError: rows=[]
+            # oracle fixe (jamais _AUDIT_EVENTS : un évènement retiré de la liste en retirerait aussi l'attente)
+            want={(e,x) for e in ('open','os.mkdir','os.listdir','os.scandir','sqlite3.connect','os.remove','os.rename','os.rmdir',
+                                  'shutil.rmtree','os.chmod','os.chown','os.utime','os.truncate','os.link','os.symlink') for x in roots}
+            def seen(tag): return {(x[1],rt) for x in rows if len(x)>=3 for rt in roots
+                                   if x[2].startswith(os.path.join(rt,f"{_AUDIT_MARK}-{tag}"))}
+            miss_p=want-seen('processus-'+tok); miss_c=want-seen('enfant-'+tok)
+            bad=[x for x in rows if len(x)<3 or _AUDIT_MARK not in x[2]]
+            home_ok=os.path.join(pwd.getpwuid(os.getuid()).pw_dir,'.cache','borghelper') in roots
+            if bad: print(f"  accès aux vrais dossiers ({len(bad)}) : {[' '.join(x) for x in bad[:8]]}")
+            if miss_p or miss_c: print(f"  témoins manquants : processus {sorted(miss_p)[:6]} enfant {sorted(miss_c)[:6]}")
+            if r.returncode!=0: print(f"  -v : code {r.returncode} {(r.stdout+r.stderr)[-200:]!r}")
+            if not home_ok: print(f"  ~/.cache/borghelper absent des racines : {roots}")
+            return not miss_p and not miss_c and not bad and r.returncode==0 and home_ok
+        check("isolation des selftests : aucun accès aux vrais dossiers borg et borgHelper de l'utilisateur (crochet d'audit, "
+              "témoins processus et enfant)",_audit_isolation)
     finally:
         for _sg,_old in saved_sigs.items():   # None : gestionnaire posé hors de Python -> défaut
             with contextlib.suppress(ValueError,TypeError): signal.signal(_sg,_old if _old is not None else signal.SIG_DFL)
         for _ps in _rb_live: _rb_killtree(_ps)   # 1.0.160 : aucun groupe d'enfant laissé (interruption comprise)
+        if not audit_outer:   # 1.0.161 : crochet inactif hors selftest (il ne se retire pas), environnement rendu
+            _AUDIT['log']=None
+            for _k,_v in saved_audit_env.items():
+                if _v is None: os.environ.pop(_k,None)
+                else: os.environ[_k]=_v
         shutil.rmtree(tmp,ignore_errors=True)
         if saved_cleanup_home is None: os.environ.pop('BORGHELPERC_CLEANUP_HOME',None)
         else: os.environ['BORGHELPERC_CLEANUP_HOME']=saved_cleanup_home

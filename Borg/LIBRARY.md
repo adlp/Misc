@@ -266,7 +266,10 @@ bh.borg_cleanup(confirm=True)               # demande confirmation sur stdin, pu
 bh.borg_cleanup(confirm=True, keys=True, history=True, ask=lambda prompt, want: True)   # réponse fournie par l'appelant
 ```
 
-`cleanup_scan(home=None)` : dossier personnel pwd par défaut, ou `BORGHELPERC_CLEANUP_HOME`. `borg_cleanup` rend 0, 1
+`cleanup_scan(home=None)` : dossier personnel pwd par défaut, ou `BORGHELPERC_CLEANUP_HOME`. Chaque entrée `borg` porte
+`recreated` (1.0.161 : ancien dépôt recréé au même chemin — hors notice, `cleanup_summary()['recreated']`),
+`current_id` (identifiant du dépôt présent, sinon `None`) et `plain` (dépôt non chiffré : entrée de sécurité gardée
+comme une clé). `borg_cleanup` rend 0, 1
 (suppression en échec) ou 2 (non confirmé). La notice n'est imprimée que par le CLI (`Status`, `Report` texte) ;
 `status()` n'imprime rien de plus. Critères et limites : README, `BorgCleanup`.
 
