@@ -1,5 +1,10 @@
 # Changelog — Tools
 
+## cronMutt 0.23 — en-tête References — 2026-09-30
+
+- **References** : ajouté, même valeur que `In-Reply-To` (`<md5@cronMutt>` ou `-i`). Thunderbird et Gmail regroupent
+  les fils d'abord par `References` ; sans lui, certains clients ne rangeaient pas les mails d'un même sujet ensemble.
+
 ## cronMutt 0.22 — In-Reply-To au format RFC — 2026-09-30
 
 - **In-Reply-To** : le md5 du sujet partait nu (`098f6bcd…`), hors format RFC 5322, et certains clients l'ignoraient
