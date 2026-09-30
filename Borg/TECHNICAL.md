@@ -337,7 +337,7 @@ erDiagram
         TEXT archive_old
         TEXT archive_new
         TEXT archive_new_date "ISO datetime"
-        TEXT change_type "added|removed|modified|C|B|T"
+        TEXT change_type "added|removed|modified|<type> directory|link|…|ctime|mtime|mode (borg diff) ; C|B|T avant 1.0.117"
         TEXT path
         INTEGER size_before "NULL si added"
         INTEGER size_after "NULL si removed"
@@ -585,6 +585,16 @@ Désormais : `borg create` sans `--list`, `index(target_archive)` d'abord, snaps
 graphique des fichiers modifiés). Réparation des snapshots existants : `Index -S -F` (reconstruit le
 dernier snapshot par `borg list` complet ; les suivants repartent de lui). Vérifié sur un dépôt de test
 (fichier ajouté/modifié/supprimé, répertoire ajouté/supprimé) : diff, snapshot et compteurs exacts.
+
+**Comptes en fichiers ordinaires (1.0.162, story 25).** `_diff_stats_for_nick` compte `added`/`removed`/`modified`
+sur les types exacts de fichiers ordinaires (`added` ; `removed` avec taille, `COUNT(size_before)` ; `modified`) et,
+pour les exclus, les mêmes types (`removed` compté en entier). Répertoires, liens, fifo et entrées `ctime`/`mtime`/`mode`
+(mesuré, borg 1.2.6 : un répertoire dont le contenu change donne `ctime`+`mtime`) hors comptes ; tailles `*_sz` par
+familles, inchangées. Source unique de Report (`_fmt_stats` ×2), d'ArchiveHistory et du figeage (`archive_chart`) ;
+lignes figées avant 1.0.162 gardées. `prev_nf = nfiles − added + removed` retombe sur le `nfiles` de l'archive
+précédente (contrôle sur vrai borg). IdxPurge range un `removed` sans taille (ligne ancienne ou synthétique : un
+répertoire) parmi les exclus sous `removed directory` (`_XCT`) : les exclus n'ont pas de taille par ligne, et les
+comptes de Report restent inchangés par la purge.
 
 ### `Index` (indexation manuelle, parallèle)
 
@@ -1158,7 +1168,7 @@ IDX_INCLUDE seul  → DELETE WHERE nick=? AND NOT (p1 OR p2 OR ...)
 Les deux          → DELETE WHERE nick=? AND (NOT (includes) OR (excludes))
 ```
 
-**Exclus (1.0.154) :** `BEGIN IMMEDIATE`, puis agrégat (clair : SQL ; chiffré : lignes réellement supprimées par id, même paire, type et chemin stocké qu'à la sélection) et `DELETE`, puis l'agrégat est ajouté à `diff_excluded_stats` par upsert qui additionne (`ON CONFLICT … DO UPDATE SET file_count=file_count+excluded.file_count, …`). Les stats (`_diff_stats_for_nick`, IdxTop) ne bougent donc pas (sauf `modified` à taille après nulle : taille avant comptée), DiffTop affiche les exclus d'une paire vidée, et une paire vidée garde des exclus : la révision des paires vides de 1.0.153 (`_recheck_zero_pairs`, paires à 0 entrée **sans exclu**) ne la reprend pas.
+**Exclus (1.0.154) :** `BEGIN IMMEDIATE`, puis agrégat (clair : SQL ; chiffré : lignes réellement supprimées par id, même paire, type et chemin stocké qu'à la sélection) et `DELETE`, puis l'agrégat est ajouté à `diff_excluded_stats` par upsert qui additionne (`ON CONFLICT … DO UPDATE SET file_count=file_count+excluded.file_count, …`). Les stats (`_diff_stats_for_nick`, IdxTop) ne bougent donc pas (sauf `modified` à taille après nulle : taille avant comptée), DiffTop affiche les exclus d'une paire vidée, et une paire vidée garde des exclus : la révision des paires vides de 1.0.153 (`_recheck_zero_pairs`, paires à 0 entrée **sans exclu**) ne la reprend pas. 1.0.162 : un `removed` sans taille (répertoire ancien ou synthétique) est rangé sous `removed directory` (`_XCT`), pour que les comptes de Report (fichiers ordinaires) restent inchangés par la purge ; les exclus écrits avant 1.0.162 gardent leur `removed`.
 
 **Purge snapshots intégrée :** en fin d'opération (même s'il n'y avait rien à purger dans `diff_index`), `IdxPurge` appelle `_snapurge_check`/`_snapurge_exec` et supprime les snapshots (`archive_snapshot` + `archive_snapshot_indexed` + `snap_excluded_stats`) dont l'archive dépasse `IDX_SNAP_KEEP`. Un seul commit SQLite et un seul VACUUM pour les deux opérations.
 

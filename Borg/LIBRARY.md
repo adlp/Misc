@@ -322,7 +322,8 @@ bh = BorgHelper()
 # Chemin du diff.db d'un nick
 db_path = bh.db.get_diff_db('mon-serveur')
 
-# Statistiques par archive
+# Statistiques par archive : added/removed/modified = fichiers ordinaires seuls (1.0.162, comme nfiles de borg) ;
+# added_sz/removed_sz/modified_sz par familles (répertoires et liens compris) — un compte peut être 0 avec une taille > 0
 stats = bh.db._diff_stats_for_nick('mon-serveur')
 for archive, s in sorted(stats.items()):
     print(f"{archive}: +{s['added']} -{s['removed']} ~{s['modified']}")
@@ -732,7 +733,7 @@ sys.exit(0)
 | `get_archive_chart(nick, db_path=None)` | 1.0.140 — lignes figées dans la rétention : `[{archive, archive_date, duration, …, read_errors, gone}]` ; `[]` si aucune |
 | `is_diff_pair_indexed(nick, a_old, a_new)` | Vérifie si une paire est indexée |
 | `is_archive_snapshot_indexed(nick, archive)` | Vérifie si le snapshot est indexé |
-| `_diff_stats_for_nick(nick, archives=None, conn=None)` | Stats de mouvement par archive (used by Report) ; `archives` (1.0.140) restreint aux archives nouvelles données, `conn` : erreurs SQLite remontées |
+| `_diff_stats_for_nick(nick, archives=None, conn=None)` | Stats de mouvement par archive (Report, ArchiveHistory, figeage) — comptes en fichiers ordinaires depuis 1.0.162, tailles par familles ; `archives` (1.0.140) restreint aux archives nouvelles données, `conn` : erreurs SQLite remontées |
 | `store_excluded_diff_stats(nick, a_old, a_new, exclu, db_path)` | Stocke stats fichiers exclus d'une paire |
 | `store_excluded_snap_stats(nick, archive, count, size, db_path)` | Stocke stats fichiers exclus d'un snapshot |
 | `_with_lock_retry(fn, max_wait=300)` | Exécute `fn()`, retente toutes les 2 s si `OperationalError: database is locked`, jusqu'à `max_wait` secondes |

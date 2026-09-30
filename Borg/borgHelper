@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.161"
+Version="1.0.162"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -388,6 +388,8 @@ def _bkp_file_status(i):
 _DIFF_TYPE_OF_SUFFIX={'directory':'d','link':'l','fifo':'p','chrdev':'c','blkdev':'b'}
 _DIFF_ADDED_TYPES=('added',)+tuple('added '+x for x in _DIFF_TYPE_OF_SUFFIX)
 _DIFF_REMOVED_TYPES=('removed',)+tuple('removed '+x for x in _DIFF_TYPE_OF_SUFFIX)
+# Type d'une ligne diff_index rangée parmi les exclus (IdxPurge, 1.0.162) : 'removed' sans taille = répertoire.
+_XCT="CASE WHEN change_type='removed' AND size_before IS NULL THEN 'removed directory' ELSE change_type END"
 
 def _exclu_detail(by_ct):
     """Détail des exclus d'IdxTop/DiffTop (1.0.155, story 18) : {change_type: (nombre, taille)} -> '+N · -N · =N', par
@@ -3104,7 +3106,12 @@ class BorgHelperDB:
 
     def _diff_stats_for_nick(self,nick,archives=None,conn=None):
         """archives (1.0.140) : restreint aux archives nouvelles données (index (nick, archive_new)) — figeage du
-        rapprochement. conn : connexion de l'appelant, les erreurs SQLite remontent alors au lieu de rendre {}."""
+        rapprochement. conn : connexion de l'appelant, les erreurs SQLite remontent alors au lieu de rendre {}.
+        1.0.162 (story 25, A24) : comptes added/removed/modified = FICHIERS ORDINAIRES seuls, comme nfiles de borg (mesuré,
+        borg 1.2.6) — types exacts 'added', 'removed' avec taille (sans taille : repli historique « répertoire »),
+        'modified' (contenu ou chmod seul) ; répertoires, liens, fifo…, entrées ctime/mtime/mode : hors comptes. Exclus :
+        mêmes types exacts ('removed' compté en entier, pas de taille par ligne). Source unique de Report (XX%nb, prev_nf),
+        d'ArchiveHistory et du figeage. Tailles *_sz : par familles, inchangées."""
         own=conn is None
         try:
             if own: conn=_open_db(self.get_diff_db(nick),nick=nick,role='read')
@@ -3112,29 +3119,35 @@ class BorgHelperDB:
                 if archives is None:
                     # Paires indexées (même si entries=0 — tous exclus ou aucun changement)
                     indexed=conn.execute("SELECT DISTINCT archive_new FROM diff_indexed_pairs WHERE nick=?",(nick,)).fetchall()
-                    rows=conn.execute("SELECT archive_new,change_type,COUNT(*),SUM(size_after),SUM(size_before) FROM diff_index WHERE nick=? GROUP BY archive_new,change_type",(nick,)).fetchall()
+                    rows=conn.execute("SELECT archive_new,change_type,COUNT(*),SUM(size_after),SUM(size_before),COUNT(size_before) FROM diff_index WHERE nick=? GROUP BY archive_new,change_type",(nick,)).fetchall()
                     exclu_rows=conn.execute("SELECT archive_new,change_type,SUM(file_count),SUM(total_size) FROM diff_excluded_stats WHERE nick=? GROUP BY archive_new,change_type",(nick,)).fetchall()
                 else:
                     indexed=[]; rows=[]; exclu_rows=[]
                     for a in archives:
                         indexed+=conn.execute("SELECT DISTINCT archive_new FROM diff_indexed_pairs WHERE nick=? AND archive_new=?",(nick,a)).fetchall()
-                        rows+=conn.execute("SELECT archive_new,change_type,COUNT(*),SUM(size_after),SUM(size_before) FROM diff_index WHERE nick=? AND archive_new=? GROUP BY archive_new,change_type",(nick,a)).fetchall()
+                        rows+=conn.execute("SELECT archive_new,change_type,COUNT(*),SUM(size_after),SUM(size_before),COUNT(size_before) FROM diff_index WHERE nick=? AND archive_new=? GROUP BY archive_new,change_type",(nick,a)).fetchall()
                         exclu_rows+=conn.execute("SELECT archive_new,change_type,SUM(file_count),SUM(total_size) FROM diff_excluded_stats WHERE nick=? AND archive_new=? GROUP BY archive_new,change_type",(nick,a)).fetchall()
             finally:
                 if own: conn.close()
             zero=lambda: {'added':0,'removed':0,'modified':0,'added_sz':0,'removed_sz':0,'modified_sz':0}
             stats={arch:zero() for (arch,) in indexed}
-            # 1.0.116 : répertoires/liens ajoutés ou supprimés comptés comme tels (étaient « modifiés »).
-            for arch,ctype,cnt,sz_after,sz_before in rows:
+            # Comptes : fichiers ordinaires seuls (1.0.162). Tailles : familles (1.0.116 : répertoires/liens ajoutés ou
+            # supprimés rangés comme tels).
+            for arch,ctype,cnt,sz_after,sz_before,n_sized in rows:
                 if arch not in stats: stats[arch]=zero()
-                if ctype in _DIFF_ADDED_TYPES: stats[arch]['added']+=cnt; stats[arch]['added_sz']+=(sz_after or 0)
-                elif ctype in _DIFF_REMOVED_TYPES: stats[arch]['removed']+=cnt; stats[arch]['removed_sz']+=(sz_before or 0)
-                else: stats[arch]['modified']+=cnt; stats[arch]['modified_sz']+=(sz_after or 0)
+                if ctype=='added': stats[arch]['added']+=cnt
+                elif ctype=='removed': stats[arch]['removed']+=n_sized
+                elif ctype in ('modified','C','B','T'): stats[arch]['modified']+=cnt   # C/B/T : lignes de fichiers d'avant 1.0.117
+                if ctype in _DIFF_ADDED_TYPES: stats[arch]['added_sz']+=(sz_after or 0)
+                elif ctype in _DIFF_REMOVED_TYPES: stats[arch]['removed_sz']+=(sz_before or 0)
+                else: stats[arch]['modified_sz']+=(sz_after or 0)
             for arch,ctype,cnt,sz in exclu_rows:
                 if arch not in stats: stats[arch]=zero()
-                if ctype in _DIFF_ADDED_TYPES: stats[arch]['added']+=cnt; stats[arch]['added_sz']+=(sz or 0)
-                elif ctype in _DIFF_REMOVED_TYPES: stats[arch]['removed']+=cnt; stats[arch]['removed_sz']+=(sz or 0)
-                else: stats[arch]['modified']+=cnt; stats[arch]['modified_sz']+=(sz or 0)
+                if ctype in ('added','removed','modified'): stats[arch][ctype]+=(cnt or 0)
+                elif ctype in ('C','B','T'): stats[arch]['modified']+=(cnt or 0)
+                if ctype in _DIFF_ADDED_TYPES: stats[arch]['added_sz']+=(sz or 0)
+                elif ctype in _DIFF_REMOVED_TYPES: stats[arch]['removed_sz']+=(sz or 0)
+                else: stats[arch]['modified_sz']+=(sz or 0)
             return stats
         except Exception:
             if not own: raise
@@ -6574,8 +6587,10 @@ class BorgHelper:
 
         1.0.115 : + files_added/files_modified/files_removed par archive — comptages bruts de
         diff_index (+ diff_excluded_stats) pour la paire se terminant par cette archive, EXACTEMENT
-        la source de la colonne « Modifs » de Report (_diff_stats_for_nick, types C/B/T comptés en
-        modifiés). null (jamais 0) si cette paire n'est pas indexée : première archive, paire purgée
+        la source de la colonne « Modifs » de Report (_diff_stats_for_nick). 1.0.162 (story 25) : fichiers
+        ordinaires seuls (répertoires, liens, entrées ctime/mtime hors comptes) ; lignes déjà figées avant
+        1.0.162 (archives purgées) gardées telles quelles, comptées par familles (choix de l'utilisateur).
+        null (jamais 0) si cette paire n'est pas indexée : première archive, paire purgée
         par DIFF_KEEP, NOIDX=1, ou Index pas encore passé.
 
         1.0.140 : + archives disparues encore dans STATS_RETENTION_MONTHS (lignes figées de history.db,
@@ -6890,7 +6905,8 @@ class BorgHelper:
         gone=[x for x in b if not x.get('recreated')]; again=[x for x in b if x.get('recreated')]
         for title,part in (("Entrées borg de dépôts locaux disparus (hors rc) :",gone),
                            ("Entrées borg d'anciens dépôts recréés au même chemin (autre identifiant — disque en rotation ? "
-                            "borg recrée seul l'entrée et le cache d'un dépôt qui revient) :",again)):
+                            "borg recrée seul l'entrée et le cache d'un dépôt chiffré qui revient ; non chiffré : entrée "
+                            "gardée sans --keys) :",again)):
             if not part: continue
             printer(title)
             for x in part:
@@ -6916,44 +6932,57 @@ class BorgHelper:
         ask=ask or self._cleanup_ask
         nk=sum(len(x['keys']) for x in b) if keys else 0; nh=sum(1 for x in h if x['kind']=='history') if history else 0
         np_=sum(1 for x in b if x.get('plain')) if keys else 0
-        nr=len(b)+sum(1 for x in h if x['kind']!='history')
+        # 1.0.162 : entrée déjà réduite à sa clé ou à son entrée non chiffrée gardée : rien de régénérable à retirer
+        nr=sum(1 for x in b if keys or not self._cleanup_kept_key(x))+sum(1 for x in h if x['kind']!='history')
+        if not (nr or nk or nh or np_):   # 1.0.162 : tout est déjà réduit à ce qui est gardé — rien à demander
+            printer("Rien de régénérable à retirer (clés, entrées non chiffrées et historiques gardés : --keys, --history).")
+            return 0
         if not ask(f"Supprimer {nr} élément(s) régénérable(s) (entrées borg, caches, fichiers borgHelper) ? [o/N] ",'o'):
             printer("Rien supprimé (non confirmé)."); return 2
         if (nk or nh or np_) and not ask(f"⚠ Perte définitive : {nk} clé(s) borg, {np_} entrée(s) de dépôt non chiffré, {nh} historique(s)"
                                          " mesuré(s). Taper « oui » pour confirmer : ",'oui'):
             printer("Rien supprimé (perte définitive non confirmée)."); return 2
-        done=errs=0
+        # Bilan en éléments (1.0.162, story 25, choix de l'utilisateur) : même unité que la question — une entrée borg
+        # (touchée si au moins un de ses chemins part), un fichier borgHelper ; clés et historiques comptés à part.
+        el=n_keys=n_hist=errs=0
         def _rm(q):
-            nonlocal done,errs
+            nonlocal errs
             try:
                 if os.path.isdir(q) and not os.path.islink(q): shutil.rmtree(q)
                 else: os.unlink(q)
-                done+=1
-            except FileNotFoundError: pass
-            except OSError as e: errs+=1; printer(f"  [ERREUR] {q} : {e}")
+                return True
+            except FileNotFoundError: return False
+            except OSError as e: errs+=1; printer(f"  [ERREUR] {q} : {e}"); return False
         for x in b:
             if x.get('recreated'):   # 1.0.161 : identifiant relu — disque remis, config illisible ou dépôt parti : gardé
                 cur=_repo_current_id(x['location'])
                 if cur is None or cur==x['id']: printer(f"  {x['location']} : ancien dépôt remis, dépôt parti ou identifiant illisible — gardé"); continue
             elif not _local_absent(x['location']): printer(f"  {x['location']} est réapparu — gardé"); continue
             keep_anchor=bool(x['keys'] or x.get('plain')) and not keys   # clé gardée : son emplacement aussi ; non chiffré : l'entrée
+            touched=False
             for q in x['paths']:
                 if keep_anchor and q==x['anchor']:
                     if os.sep+'.cache'+os.sep in q and os.path.isdir(q):   # cache seul : garder son config (emplacement)
                         for e in os.listdir(q):
-                            if e!='config': _rm(os.path.join(q,e))
+                            if e!='config': touched=_rm(os.path.join(q,e)) or touched
                     continue
-                _rm(q)
+                touched=_rm(q) or touched
+            el+=touched
+            if not touched and not (keep_anchor and self._cleanup_kept_key(x)):
+                printer(f"  {x['location']} : rien à retirer (déjà absent)")
             if keys:
-                for k in x['keys']: _rm(k)
+                for k in x['keys']: n_keys+=_rm(k)
         for x in h:
             if '.lock' in x['path'] and self._cleanup_lock_alive(x['path']):
                 printer(f"  {x['path']} : verrou repris entre-temps — gardé"); continue
-            if x['kind']!='history' or history: _rm(x['path'])
+            if x['kind']!='history': el+=_rm(x['path'])
+            elif history: n_hist+=_rm(x['path'])
         kept=([f"{sum(len(x['keys']) for x in b)} clé(s)"] if not keys and any(x['keys'] for x in b) else [])+\
              ([f"{sum(1 for x in b if x.get('plain'))} entrée(s) de dépôt non chiffré"] if not keys and any(x.get('plain') for x in b) else [])+\
              ([f"{sum(1 for x in h if x['kind']=='history')} historique(s)"] if not history and any(x['kind']=='history' for x in h) else [])
-        printer(f"{done} élément(s) retiré(s)"+(f", {errs} en échec" if errs else "")+(f" ; gardés : {', '.join(kept)}" if kept else "")
+        extra=([f"{n_keys} clé(s)"] if n_keys else [])+([f"{n_hist} historique(s)"] if n_hist else [])
+        printer(f"{el} élément(s) retiré(s)"+(f" (+ {', '.join(extra)})" if extra else "")+(f", {errs} en échec" if errs else "")
+                +(f" ; gardés : {', '.join(kept)}" if kept else "")
                 +" — relancer borgHelper -c BorgCleanup pour l'aperçu")
         return 1 if errs else 0
 
@@ -7196,12 +7225,13 @@ class BorgHelper:
                     inc=_py_match(includes); pred=lambda p: not inc(p); nar=None
                 else: pred=_py_match(excludes); nar=_narrow(conn,excludes)
                 q=("SELECT id,path,COALESCE(size_after,size_before,0),archive_old,archive_new,change_type,"
-                   "COALESCE(NULLIF(size_after,0),size_before,0) FROM diff_index WHERE nick=?"); qa=[nick]
+                   "COALESCE(NULLIF(size_after,0),size_before,0),size_before IS NULL FROM diff_index WHERE nick=?"); qa=[nick]
                 if nar is not None: q+=" AND ("+nar[0]+")"; qa+=nar[1]
                 ids=[]; meta={}
-                for rid,sp,sz,a_old,a_new,ct,xsz in conn.execute(q,qa):
+                for rid,sp,sz,a_old,a_new,ct,xsz,sbnull in conn.execute(q,qa):
                     if pred(_path_decode(conn,sp)):
-                        ids.append(rid); size+=sz or 0; meta[rid]=(a_old,a_new,ct,xsz or 0,sp)
+                        ids.append(rid); size+=sz or 0
+                        meta[rid]=(a_old,a_new,ct,xsz or 0,sp,'removed directory' if ct=='removed' and sbnull else ct)
                 count=len(ids)
             if sql_where:
                 row=conn.execute(
@@ -7229,17 +7259,20 @@ class BorgHelper:
                 conn.execute("BEGIN IMMEDIATE")
                 if ids is None:   # plain : agrégat SQL, puis DELETE
                     exclu={(a_old,a_new,ct):[n,xsz or 0] for a_old,a_new,ct,n,xsz in conn.execute(
-                        "SELECT archive_old,archive_new,change_type,COUNT(*),SUM(COALESCE(NULLIF(size_after,0),size_before,0)) "
-                        f"FROM diff_index WHERE {sql_where} GROUP BY archive_old,archive_new,change_type",params)}
+                        f"SELECT archive_old,archive_new,{_XCT},COUNT(*),SUM(COALESCE(NULLIF(size_after,0),size_before,0)) "
+                        f"FROM diff_index WHERE {sql_where} GROUP BY archive_old,archive_new,{_XCT}",params)}
                     count=conn.execute(f"DELETE FROM diff_index WHERE {sql_where}",params).rowcount
                 else:             # chiffré : suppression par id ; seules les lignes réellement supprimées comptent
                     exclu={}; count=0
                     for rid in ids:   # même ligne qu'à la sélection (un id libéré peut être réattribué entre-temps)
-                        a_old,a_new,ct,xsz,sp=meta[rid]
+                        a_old,a_new,ct,xsz,sp,xct=meta[rid]
                         if conn.execute("DELETE FROM diff_index WHERE id=? AND nick=? AND archive_old=? AND archive_new=? "
                                         "AND change_type=? AND path=?",(rid,nick,a_old,a_new,ct,sp)).rowcount:
                             count+=1
-                            e=exclu.setdefault((a_old,a_new,ct),[0,0]); e[0]+=1; e[1]+=xsz
+                            e=exclu.setdefault((a_old,a_new,xct),[0,0]); e[0]+=1; e[1]+=xsz
+                # 1.0.162 (story 25) : un 'removed' SANS taille (ligne ancienne ou synthétique : un répertoire, cf.
+                # _diff_entry_type) rejoint les exclus comme 'removed directory' — les exclus n'ont pas de taille par ligne,
+                # et Report ne compte que les fichiers ordinaires : ses stats restent inchangées par la purge.
                 # 1.0.154 (story 17) : les entrées retirées rejoignent les exclus de leur paire (nombre + taille par type,
                 # taille comme à l'Index : size_after or size_before) — stats de Report et IdxTop inchangées, et une paire
                 # vidée n'est plus « 0 entrée sans exclu » (indiscernable d'une paire vide à tort, révision de 1.0.153).
@@ -7295,6 +7328,7 @@ class BorgHelper:
         if measures: rows=[tuple(r[:5])+(_dedup(r),)+tuple(r[6:]) for r in rows]
         diff_stats=self.db._diff_stats_for_nick(nick)
         def _fmt_stats(s,nf,total_sz=0,summary=False):
+            # 1.0.162 : na/nr/nm = fichiers ordinaires seuls (_diff_stats_for_nick), comme nf -> prev_nf = nfiles précédent
             na,nr,nm=s['added'],s['removed'],s['modified']
             prev_nf=nf-na+nr
             pn_modif=f"{100*(nm+nr)//prev_nf}%nb" if prev_nf>0 else "—"
@@ -7420,6 +7454,7 @@ class BorgHelper:
         tbkps['Totaux']={'name':'Totaux','original_size':resume['total_size'],'compressed_size':resume['total_csize'],'deduplicated_size':resume['unique_csize']}
         diff_stats=self.db._diff_stats_for_nick(nick)
         def _fmt_stats(s,nf,total_sz=0,summary=False):
+            # 1.0.162 : na/nr/nm = fichiers ordinaires seuls (_diff_stats_for_nick), comme nf -> prev_nf = nfiles précédent
             na,nr,nm=s['added'],s['removed'],s['modified']
             prev_nf=nf-na+nr
             pn_modif=f"{100*(nm+nr)//prev_nf}%nb" if prev_nf>0 else "—"
@@ -8061,12 +8096,16 @@ def codec_selftest(pattern=None,list_only=False):
                 {'change_type':'modified','path':'a/z','size_before':1,'size_after':2},
                 {'change_type':'removed','path':'a/w','size_before':3},
                 {'change_type':'added directory','path':'a/nd'},{'change_type':'removed directory','path':'a/od'},
-                {'change_type':'ctime','path':'a'}],p)
-            bh_rh.db.store_excluded_diff_stats('rhA','A1','A2',{'modified':{'count':1,'size':5}},p)
+                {'change_type':'ctime','path':'a'},{'change_type':'removed','path':'a/vieux'},   # removed sans taille : répertoire
+                {'change_type':'C','path':'a/ancien'}],p)   # ancien type de ligne de fichier (avant 1.0.117) : modifié
+            bh_rh.db.store_excluded_diff_stats('rhA','A1','A2',{'modified':{'count':1,'size':5},'added directory':{'count':4,'size':0},
+                                                            'removed directory':{'count':2,'size':0},'C':{'count':1,'size':0}},p)
             rows={r['archive']:r for r in _rh_run(bh_rh.archive_history,'rhA',as_json=True)['rows']}
             a1,a2=rows['A1'],rows['A2']
-            # répertoires ajoutés/supprimés comptés comme tels (1.0.116), ctime (métadonnées) en modifié
-            return (a2['files_added']==3 and a2['files_modified']==3 and a2['files_removed']==2
+            # 1.0.162 (story 25) : fichiers ordinaires seuls — a/x, a/y ajoutés ; a/z, a/ancien (C) + 1 exclu modifié + 1 exclu C
+            # (anciens types de fichier) ; a/w supprimé ; répertoires ajouté/supprimé, ctime de a, removed sans taille
+            # (a/vieux), exclus added/removed directory : hors comptes
+            return (a2['files_added']==2 and a2['files_modified']==4 and a2['files_removed']==1
                     and a1['files_added'] is None and a1['files_modified'] is None and a1['files_removed'] is None)
         check("ArchiveHistory -j : files_added/modified/removed = comptages de Report, null si paire non indexée",_rh_arch_file_counts)
         # ── Statuts C/E de borg create --list (1.0.117) ──
@@ -9071,7 +9110,8 @@ def codec_selftest(pattern=None,list_only=False):
             left=list(rows[0]); exp={}
             for ao,an,dn,ct,p,sb,sa in _diff:
                 if (p,an,ct) in left: left.remove((p,an,ct)); continue
-                e=exp.setdefault((ao,an,ct),[0,0]); e[0]+=1; e[1]+=sa or sb or 0
+                xct='removed directory' if ct=='removed' and sb is None else ct   # 1.0.162 : 'removed' sans taille = répertoire
+                e=exp.setdefault((ao,an,xct),[0,0]); e[0]+=1; e[1]+=sa or sb or 0
             exclu_ok=stats_ok and exs[0]==exs[1]==([] if dry else sorted((ao,an,ct,n,z) for (ao,an,ct),(n,z) in exp.items()))
             if not exclu_ok: print(f"  IdxPurge exclus {pattern!r} {extra!r} : stats={stats_ok} {exs} attendu {exp}")
             return (outs[0]==outs[1] and rows[0]==rows[1] and (dry or len(rows[0])<len(_diff)) and 'aucune entrée' not in outs[0]
@@ -9114,7 +9154,8 @@ def codec_selftest(pattern=None,list_only=False):
                 pairs=sorted(c.execute("SELECT archive_old,archive_new,entry_count FROM diff_indexed_pairs WHERE nick=?",(nk,)))
                 left=c.execute("SELECT COUNT(*) FROM diff_index WHERE nick=?",(nk,)).fetchone()[0]; c.close()
                 tot={}
-                for ao,an,dn,ct,p,sb,sa in _diff: tot[(an,ct)]=tot.get((an,ct),0)+1
+                for ao,an,dn,ct,p,sb,sa in _diff:   # 1.0.162 : 'removed' sans taille rangé comme 'removed directory'
+                    xct='removed directory' if ct=='removed' and sb is None else ct; tot[(an,xct)]=tot.get((an,xct),0)+1
                 tot[(A2,'removed')]+=3; tot[(A2,'modified')]+=1; tot[(A3,'added')]+=2   # exclus posés à la main, zz/zero, zz/a13, zz/a23
                 ex={}
                 for ao,an,ct,n,z in _purge_exclu(nk): ex[(an,ct)]=ex.get((an,ct),0)+n
@@ -11010,18 +11051,27 @@ def codec_selftest(pattern=None,list_only=False):
                     r0=b.borg_cleanup(home=H,ask=lambda _p,_w: asked.append(_p) or False)
                     rno=b.borg_cleanup(confirm=True,home=H,ask=lambda _p,_w: False)
                 same=tree()==t0 and rno==2 and not asked
-                with contextlib.redirect_stderr(o): r1=b.borg_cleanup(confirm=True,home=H,ask=yes)
-                step1=(all(gone(os.path.relpath(p,d)) for p in (os.path.join(cac,I['A']),os.path.join(cac,I['X'],'chunks')))
+                q1=[]; o1=io.StringIO()
+                with contextlib.redirect_stderr(o1): r1=b.borg_cleanup(confirm=True,home=H,ask=lambda _p,_w: q1.append(_p) or True)
+                # 1.0.162 (A35) : question et bilan en éléments — 2 entrées borg (A, X) + 7 fichiers régénérables
+                unit1=bool(q1) and q1[0].startswith('Supprimer 9 élément(s)') and '9 élément(s) retiré(s) ; gardés : 2 clé(s)' in o1.getvalue()
+                step1=unit1 and (all(gone(os.path.relpath(p,d)) for p in (os.path.join(cac,I['A']),os.path.join(cac,I['X'],'chunks')))
                        and os.path.isdir(os.path.join(sec,I['A'])) and os.path.exists(os.path.join(cac,I['X'],'config'))
                        and all(gone(os.path.join('cache',n)) for n in files['regen'])
                        and os.path.exists(os.path.join(ky,'gone_a')) and all(os.path.exists(os.path.join(cd,n)) for n in files['hist']))
+                q1b=[]; o1b=io.StringIO()   # 1.0.162 : entrées réduites à leur clé, historique gardé -> rien à demander
+                with contextlib.redirect_stderr(o1b): r1b=b.borg_cleanup(confirm=True,home=H,ask=lambda _p,_w: q1b.append(_p) or True)
+                step1=step1 and r1b==0 and not q1b and 'Rien de régénérable' in o1b.getvalue()
                 sm1=b.cleanup_summary(b.cleanup_scan(home=H))   # clés gardées : hors notice
                 quiet=(sm1['borg_entries'],sm1['keys'],sm1['kept_keys'])==(0,0,2)
                 with contextlib.redirect_stderr(o):   # « o » mais pas « oui » : perte définitive refusée, rien touché
                     rpart=b.borg_cleanup(confirm=True,keys=True,history=True,home=H,ask=lambda _p,w: w=='o')
                 half=rpart==2 and os.path.exists(os.path.join(ky,'gone_a')) and all(os.path.exists(os.path.join(cd,n)) for n in files['hist'])
-                with contextlib.redirect_stderr(o): r2=b.borg_cleanup(confirm=True,keys=True,history=True,home=H,ask=yes)
-                step2=(not os.path.exists(os.path.join(ky,'gone_a')) and not os.path.exists(os.path.join(ky,'gone_x'))
+                q2=[]; o2=io.StringIO()
+                with contextlib.redirect_stderr(o2): r2=b.borg_cleanup(confirm=True,keys=True,history=True,home=H,ask=lambda _p,_w: q2.append(_p) or True)
+                # entrées réduites à leur clé : comptées avec --keys ; clés et historique à part dans le bilan
+                unit2=bool(q2) and q2[0].startswith('Supprimer 2 élément(s)') and '2 élément(s) retiré(s) (+ 2 clé(s), 1 historique(s))' in o2.getvalue()
+                step2=unit2 and (not os.path.exists(os.path.join(ky,'gone_a')) and not os.path.exists(os.path.join(ky,'gone_x'))
                        and not os.path.exists(os.path.join(sec,I['A'])) and not os.path.exists(os.path.join(cac,I['X']))
                        and all(gone(os.path.join('cache',n)) for n in files['hist']))
                 # dépôt qui réapparaît entre le repérage et la suppression (disque remonté) : revérifié, gardé
@@ -11074,7 +11124,7 @@ def codec_selftest(pattern=None,list_only=False):
                 and all(t in note for t in ('2 entrée(s) borg','2 clé(s)','7 fichier(s) borgHelper','1 historique(s)'))
                 and (r0,r1,r2)==(0,0,0) and same and step1 and quiet and step2 and kept and cli and back and failed and empty is True and half)
             if not ok: print(f"  nettoyage : ids {ids} bh {bhn} résumé {sm} notice {note!r} codes {(r0,r1,r2)} aperçu/refus intacts {same} "
-                             f"-y {step1} hors notice {quiet} {sm1} seconde confirmation {half} --keys --history {step2} gardés {kept} réapparu {back} échec {failed} rc vide {empty} "
+                             f"-y {step1} {q1[:1]} {o1.getvalue()[-160:]!r} {q2[:1]} {o2.getvalue()[-160:]!r} hors notice {quiet} {sm1} seconde confirmation {half} --keys --history {step2} gardés {kept} réapparu {back} échec {failed} rc vide {empty} "
                              f"CLI {cli} {[c.returncode for c in (c1,c2,c3,c4,c5,c6,c7,c8,c9)]} {O(c7)[-200:]!r} {O(c8)[-200:]!r} {O(c4)[-200:]!r}")
             return ok
         check("nettoyage borg : restes de dépôts disparus et de nicks retirés — aperçu (-D), -y confirmé, --keys, --history, notices (bac à sable)",_cleanup_sandbox)
@@ -11120,7 +11170,7 @@ def codec_selftest(pattern=None,list_only=False):
             want={I['old']:(True,I['cur']),I['hors']:(True,I['horscur']),I['cache']:(True,I['horscur'])}
             with contextlib.redirect_stderr(o): r0=b.borg_cleanup(home=H,ask=lambda _p,_w: False)
             pv=o.getvalue()
-            preview=(r0==0 and "anciens dépôts recréés au même chemin" in pv and f"ancien id {I['old'][:12]}…, actuel {I['cur'][:12]}…" in pv
+            preview=(r0==0 and "anciens dépôts recréés au même chemin" in pv and "d'un dépôt chiffré qui revient ; non chiffré" in pv and f"ancien id {I['old'][:12]}…, actuel {I['cur'][:12]}…" in pv
                      and 'disque en rotation monté à ce chemin' in pv and "dépôts locaux disparus" not in pv)
             orig=b.cleanup_scan
             def _scan_puis_remis(home=None):   # l'ancien disque de repo-h revient entre repérage et suppression
@@ -11223,17 +11273,23 @@ def codec_selftest(pattern=None,list_only=False):
             note0=b.cleanup_notice(home=H) or ''
             with contextlib.redirect_stderr(o): r0=b.borg_cleanup(home=H,ask=lambda _p,_w: False)
             pv=o.getvalue().count('dépôt non chiffré : sans cette entrée')
-            with contextlib.redirect_stderr(o): r1=b.borg_cleanup(confirm=True,home=H,ask=lambda _p,_w: True)
+            asked=[]; o1=io.StringIO()
+            with contextlib.redirect_stderr(o1): r1=b.borg_cleanup(confirm=True,home=H,ask=lambda _p,_w: asked.append(_p) or True)
+            # 1.0.162 (A35) : question et bilan dans la même unité (éléments) — 4 entrées, dont 3 non chiffrées réduites à leur entrée
+            same_unit=bool(asked) and asked[0].startswith('Supprimer 4 élément(s)') and '4 élément(s) retiré(s)' in o1.getvalue()
             step1=(r1==0 and all(ex(sec,I[k]) and not ex(cac,I[k]) for k in ('none','auth','blake'))
                    and not ex(sec,I['repokey']) and not ex(cac,I['repokey']))
             sm1=b.cleanup_summary(b.cleanup_scan(home=H)); note1=b.cleanup_notice(home=H) or ''
             with contextlib.redirect_stderr(o): rno=b.borg_cleanup(confirm=True,keys=True,home=H,ask=lambda _p,w: w=='o')
             half=rno==2 and all(ex(sec,I[k]) for k in ('none','auth','blake'))
-            with contextlib.redirect_stderr(o): r2=b.borg_cleanup(confirm=True,keys=True,home=H,ask=lambda _p,_w: True)
+            asked2=[]; o2=io.StringIO()
+            with contextlib.redirect_stderr(o2): r2=b.borg_cleanup(confirm=True,keys=True,home=H,ask=lambda _p,_w: asked2.append(_p) or True)
             step2=r2==0 and not any(ex(sec,I[k]) for k in I)
+            same_unit=same_unit and bool(asked2) and asked2[0].startswith('Supprimer 3 élément(s)') and '3 élément(s) retiré(s)' in o2.getvalue()
             ok=(plain=={I['none']:True,I['auth']:True,I['blake']:True,I['repokey']:False} and '4 entrée(s) borg' in note0
-                and r0==0 and pv==3 and step1 and sm1['borg_entries']==0 and 'entrée(s) borg' not in note1 and half and step2)
+                and r0==0 and pv==3 and step1 and sm1['borg_entries']==0 and 'entrée(s) borg' not in note1 and half and step2 and same_unit)
             if not ok: print(f"  non chiffré : {plain} notice {note0!r} aperçu {r0} {pv} -y {step1} {sm1} {note1!r} « o » seul {half} --keys {step2} "
+                             f"unité {same_unit} {asked[:1]} {asked2[:1]} {o1.getvalue()[-150:]!r} {o2.getvalue()[-150:]!r} "
                              f"{o.getvalue()[-300:]!r}")
             return ok
         check("nettoyage borg : dépôt non chiffré disparu — entrée de sécurité gardée comme une clé, cache seul retiré par -y (bac à sable)",_cleanup_plain)
@@ -12922,6 +12978,55 @@ def codec_selftest(pattern=None,list_only=False):
                       f"avertissements borg {errs} ; Index {oi[-150:]!r} ; DiffTop {dt[-300:]!r} ; IdxTop {it[-300:]!r}")
             return ok
         _rbc("Inchangés sur vrai borg : nfiles = fichiers ordinaires, chmod seul = modified, DiffTop = IdxTop = décompte borg list et borg diff",_inchanges_real_borg)
+        def _report_files_real_borg():
+            """1.0.162 (story 25, A24) : Report -o et ArchiveHistory comptent les FICHIERS ORDINAIRES, comme nfiles (vrai borg,
+            scénario mesuré m25 + un fichier exclu modifié). t-1 : 5 fichiers. t-2 : f1 modifié, d/f2 chmod seul, logs/l
+            (exclu) modifié, d/new et newdir/n ajoutés, gone/x et d/sub/z supprimés ; répertoires gone retiré, newdir ajouté,
+            ctime/mtime de ., d, d/sub ; lien lnk retiré, lnk2 changé. Attendu (en dur) : 3 modifiés, 2 ajoutés, 2 supprimés,
+            prev_nf = 5 = nfiles de t-1 -> « 100%nb » (par familles : 250%nb)."""
+            d=os.path.join(tmp,'report-reel'); src=os.path.join(d,'src'); bb=os.path.join(d,'bb'); repo=os.path.join(d,'repo')
+            for sub in ('d/sub','gone','logs'): os.makedirs(os.path.join(src,sub))
+            env=_rb_env(bb,BORG_PASSPHRASE='pw-rp'); borg=shutil.which('borg')
+            def bg(*a):
+                r=_rb_run([borg,*a],120,env=env)
+                if r.returncode not in (0,1): raise RuntimeError(f"borg {a[0]} (code {r.returncode}) : {r.stderr[-300:]}")
+                return r.stdout
+            def wr(q,s):
+                with open(os.path.join(src,q),'w') as f: f.write(s)
+            bg('init','-e','repokey',repo)
+            for q,s in (('f1','a'),('d/f2','b'),('gone/x','c'),('d/sub/z','z'),('logs/l','l')): wr(q,s)
+            os.chmod(os.path.join(src,'d/f2'),0o644)
+            os.symlink('f1',os.path.join(src,'lnk')); os.symlink('f1',os.path.join(src,'lnk2'))
+            import datetime as _dtm   # archives récentes : Report sort en 0 (sinon « en retard », code 1)
+            ts=lambda m: (_dtm.datetime.utcnow()-_dtm.timedelta(minutes=m)).strftime('%Y-%m-%dT%H:%M:%S')
+            n1=json.loads(bg('create','--json','--timestamp',ts(10),f'{repo}::t-1',src))['archive']['stats']['nfiles']
+            time.sleep(1.1)   # ctime à la seconde : le chmod doit le changer
+            wr('f1','aa'); wr('logs/l','ll'); wr('d/new','n'); os.makedirs(os.path.join(src,'newdir')); wr('newdir/n','n')
+            shutil.rmtree(os.path.join(src,'gone')); os.remove(os.path.join(src,'lnk')); os.remove(os.path.join(src,'lnk2'))
+            os.symlink('d/f2',os.path.join(src,'lnk2')); os.chmod(os.path.join(src,'d/f2'),0o600); os.remove(os.path.join(src,'d/sub/z'))
+            n2=json.loads(bg('create','--json','--timestamp',ts(5),f'{repo}::t-2',src))['archive']['stats']['nfiles']
+            w=os.path.join(d,'borgw'); _rb_wrapper(w,bb); rc=os.path.join(d,'rc')
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n\n[rp]\nBORG_REPO={repo}\nBORG_PASSPHRASE=pw-rp\nSER_NAME=rp\n"
+                        f"SER_LOGIN=x\nGLOB_ARCH=t-*\nBORG_ARCHNAME=t\nBORG_ROOTBKP={src}\nEXCLUDE=--exclude-caches\nDB_ENCRYPT=false\n"
+                        f"BORG_EXE={w}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\nIDX_EXCLUDE=*/logs/*\n")
+            os.chmod(rc,0o600)
+            me=os.path.realpath(__file__); cenv=_rb_cli_env(bb)
+            def cli(*a):
+                p=_rb_run([me,'-C',rc,'-c',*a],300,env=cenv); return p.returncode,p.stdout+p.stderr
+            ci,oi=cli('Index','-n','rp'); cr,orp=cli('Report','-n','rp','-o','-j'); ca,oa=cli('ArchiveHistory','-n','rp','-j')
+            cl,orl=cli('Report','-n','rp','-j')   # live (prep_report) : l'autre copie jumelle de _fmt_stats
+            mods=[m for m in re.findall(r'"modifications":\s*"([^"]*)"',orp) if m!='—']   # t-1 : première archive, jamais indexée
+            mods_l=[m for m in re.findall(r'"modifications":\s*"([^"]*)"',orl) if m!='—']
+            try: row=next(r for r in json.loads(oa)['rows'] if r['archive']=='t-2')
+            except (ValueError,StopIteration,KeyError): row={}
+            got=(row.get('files_added'),row.get('files_modified'),row.get('files_removed'))
+            ok=((ci,cr,ca,cl)==(0,0,0,0) and (n1,n2)==(5,5) and got==(2,3,2)
+                and all(m and all(x.startswith('100%nb / ') for x in m) for m in (mods,mods_l)))
+            if not ok: print(f"  Report réel : codes {(ci,cr,ca,cl)} nfiles {(n1,n2)} modifications -o {mods} live {mods_l} ArchiveHistory t-2 {got} ; "
+                             f"Index {oi[-200:]!r} Report {orp[-300:]!r}")
+            return ok
+        _rbc("Report sur vrai borg : modifications en fichiers ordinaires (répertoires, liens, ctime hors comptes), prev_nf = nfiles précédent",_report_files_real_borg)
         check("_diff_entry_type (1.0.126) : type tiré de change_type (borg diff 1.2), tous les types de suppression reconnus",
               lambda: [_diff_entry_type(c,sb) for c,sb in (('added',None),('modified',1),('removed',3),('removed',0),('removed',None),
                        ('removed directory',None),('added link',None),('changed link',None),('removed fifo',None),

@@ -447,8 +447,17 @@ BorgCleanup ». Jamais dans `GET /report` (borgHelperWWW pose `BORGHELPERC_NO_CL
 | Détail (par archive) | `XX%nb / Y.YY GB` | `5%nb / 890 MB` |
 
 Formule (identique résumé et détail) :
-- dénominateur = état précédent = `nfiles − added + removed` (100%)
-- `XX%nb` = `100 × (modified + removed) / précédent` — % de fichiers modifiés ou supprimés
+- `added`, `modified`, `removed` : **fichiers ordinaires** seulement (1.0.162), comme `nfiles` de borg — répertoires,
+  liens, fifo et entrées `ctime`/`mtime` d'un répertoire dont le contenu change ne comptent pas ; fichiers exclus de
+  l'indexation compris ; un `chmod` seul compte comme modifié (borg le signale ainsi)
+- dénominateur = état précédent = `nfiles − added + removed` (100%) — égal au `nfiles` de l'archive précédente
+- `XX%nb` = `100 × (modified + removed) / précédent` — % de fichiers modifiés ou supprimés. Avant 1.0.162, les
+  comptes incluaient répertoires et liens : pourcentage surestimé dès qu'un répertoire changeait (mesuré : 200 %nb au
+  lieu de 100 %nb)
+- limites : un fichier devenu lien ou répertoire (ou l'inverse) n'est pas compté — borg ne donne alors qu'un changement
+  de `mode` (mesuré, borg 1.2.6), le dénominateur s'écarte d'autant du `nfiles` précédent ; les exclus d'un `IdxPurge`
+  antérieur à 1.0.162 peuvent compter d'anciens répertoires comme fichiers supprimés (pas de taille par ligne pour les
+  distinguer). `DiffBkp`, `DiffTop` et `IdxTop` comptent, eux, des entrées (répertoires et liens compris)
 - `Y.YY GB` = taille absolue lisible (`added_sz + modified_sz + removed_sz`), **pas** un pourcentage — `—` si nulle
 
 - `—` si l'archive n'est pas encore indexée
@@ -964,8 +973,10 @@ borgHelper -c ArchiveHistory -n mon-serveur -j    # historique archive_stats (pa
 `ArchiveHistory -j` : une ligne par archive de `archive_stats` (`archive`,`archive_date`,`duration`,
 `original_size`,`compressed_size`,`deduplicated_size`,`nfiles`), ordonnées par `archive_date`.
 Depuis 1.0.115, en plus : `files_added`/`files_modified`/`files_removed` — nombre de fichiers ajoutés,
-modifiés (types `C`/`B`/`T` inclus) et supprimés par rapport à l'archive précédente, même source que la
-colonne « Modifs » de `Report` (fichiers exclus de l'indexation compris) ; `null` si cette paire
+modifiés et supprimés par rapport à l'archive précédente, même source que la colonne « Modifs » de `Report`
+(fichiers exclus de l'indexation compris) ; fichiers ordinaires seulement depuis 1.0.162 (répertoires, liens et
+entrées `ctime`/`mtime` de répertoires comptés avant) — les lignes figées d'archives déjà purgées gardent leurs
+anciennes valeurs (série mixte sur ce passé) ; `null` si cette paire
 d'archives n'est pas indexée (première archive, purgée par `DIFF_KEEP`, `NOIDX=1`, Index pas encore
 passé). Et `changed_during_backup`/`read_errors` (1.0.117) : fichiers modifiés pendant la sauvegarde /
 erreurs de lecture, relevés par le Bkp — `null` si inconnus (archive antérieure, ou statistiques
@@ -1179,7 +1190,10 @@ borgHelper -c BorgCleanup -y --keys --history   # retire aussi les clés et les 
 ```
 
 Avec `-y`, confirmation lue sur l'entrée standard : « o » pour supprimer ; avec `--keys` ou `--history`, taper en plus
-« oui » (perte définitive). Sans réponse (entrée fermée, cron) : rien supprimé, code 2.
+« oui » (perte définitive). Sans réponse (entrée fermée, cron) : rien supprimé, code 2. Question et bilan comptent en
+**éléments** (1.0.162) : une entrée borg (sécurité et cache d'un même dépôt), un fichier borgHelper ; clés et historiques
+à part — ex. « Supprimer 9 élément(s) » puis « 9 élément(s) retiré(s) », ou « 2 élément(s) retiré(s) (+ 2 clé(s),
+1 historique(s)) ». Une entrée déjà réduite à sa clé (ou à son entrée de dépôt non chiffré) ne compte qu'avec `--keys`.
 
 Restes laissés sur la machine (1.0.160), repérés **sans appel `borg`** et **seulement supprimés par cette commande,
 avec `-y`** — jamais par `borgHelperWWW` ni l'interface :

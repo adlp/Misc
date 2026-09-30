@@ -1,5 +1,20 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.162 — Report en fichiers ordinaires, comptes de BorgCleanup — 2026-09-30
+
+Chantier « reconstruction progressive », story 25 (actions de rétrospective A24 et A35).
+
+- **Report, colonne `modifications`** : `XX%nb` et le dénominateur `nfiles − added + removed` comptent désormais les
+  seuls fichiers ordinaires, comme `nfiles` de borg. Répertoires, liens et entrées `ctime`/`mtime` d'un répertoire dont
+  le contenu change étaient comptés : pourcentage surestimé (mesuré, borg 1.2.6 : 200 %nb au lieu de 100 %nb). Tailles
+  inchangées. Mêmes comptes pour `ArchiveHistory` (`files_added/modified/removed`) et le graphique « Fichiers modifiés
+  par archive » ; lignes figées d'archives déjà purgées gardées telles quelles.
+- **IdxPurge** : un ancien `removed` sans taille (répertoire) rejoint les exclus comme `removed directory` — comptes de
+  Report inchangés par la purge.
+- **BorgCleanup** : la question et le bilan comptent en éléments (entrées borg, fichiers borgHelper ; clés et
+  historiques à part) — « Supprimer 2 élément(s) » puis « 2 élément(s) retiré(s) », plus « 3 » ; titre de la section
+  des anciens identifiants exact pour les dépôts non chiffrés.
+
 ## borgHelper 1.0.161 — isolation des selftests, dépôt recréé au même chemin — 2026-09-30
 
 Chantier « reconstruction progressive », story 24 (actions de rétrospective A33 et A34).
