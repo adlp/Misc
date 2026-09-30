@@ -43,9 +43,10 @@ from datetime import datetime
 import requests
 from requests.auth import HTTPBasicAuth
 
-Version="0.21"
+Version="0.22"
 ### Todo intercepter le keyboard interrupt
 ### Todo ajouter l'usage d'un fichier de donc mode@fichier => muodule mode du fichier fichier
+# 0.22 In-Reply-To au format RFC <id@cronMutt> (sans l'hote : le fil reste commun a toutes les machines)
 # 0.21 Message-ID unique et conforme RFC par defaut, -m complete en <id@host> ; -n sans -N (ou l'inverse) signale et bascule sur le mail
 # 0.20 mode pipe réparé (stdin relu), indentation conservée, échappement des my_hdr pour mutt,
 #      nextcloud : mot de passe avec ':', erreurs réseau et timeout, logique d'envoi de la 0.16/0.17.1 restaurée,
@@ -232,6 +233,9 @@ if ncIncomplet:
 
 if inReplyTo is None:
     inReplyTo=hashlib.md5(subject.encode('utf-8')).hexdigest()
+# In-Reply-To : format <id@droite> sinon les clients l'ignorent pour les fils
+if "<" not in inReplyTo:
+    inReplyTo=f'<{inReplyTo}>' if "@" in inReplyTo else f'<{inReplyTo}@cronMutt>'
 if mailFrom is None:
     mailFrom=replyTo
 if "<" not in mailFrom:

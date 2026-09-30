@@ -1,5 +1,12 @@
 # Changelog — Tools
 
+## cronMutt 0.22 — In-Reply-To au format RFC — 2026-09-30
+
+- **In-Reply-To** : le md5 du sujet partait nu (`098f6bcd…`), hors format RFC 5322, et certains clients l'ignoraient
+  pour regrouper les mails en fils. Il devient `<md5@cronMutt>` ; la partie droite fixe (pas l'hôte) garde un fil
+  commun à toutes les machines pour un même sujet. `-i` est complété de la même façon : `-i foo` → `<foo@cronMutt>`,
+  `-i foo@bar` → `<foo@bar>`. Les mails reçus avant la 0.22 ne sont plus dans le même fil que les nouveaux.
+
 ## cronMutt 0.21 — Message-ID unique, `-n` sans `-N` signalé — 2026-09-30
 
 - **Message-ID** : par défaut la constante `cronMutt`, identique pour tous les mails et hors format RFC 5322 (certains
