@@ -20,7 +20,9 @@
 
 set -euo pipefail
 
-Version="1.2"
+Version="1.3"
+# 1.3 clef inconnue : liste, pour chaque compte concerne, des fichiers de clefs lus (nb de clefs, absent,
+#     illisible), des chemins par defaut faute de sshd -T, et de l'AuthorizedKeysCommand non interroge
 # 1.2 awk sans repetitions {n} (mawk, awk par defaut de Debian/Ubuntu, ne les comprend pas : tout sortait en "-"),
 #     authorized_keys vide ou commentaire avec apostrophe n'arretent plus le script, cles avec options lues par
 #     ssh-keygen, AuthorizedKeysFile de sshd (authorized_keys2 compris), logs sshd tournes et compresses lus,
@@ -85,6 +87,8 @@ trap 'rm -rf "$WORKDIR"' EXIT
 AUTH_EVENTS="$WORKDIR/auth_events"   # epoch<TAB>user<TAB>ip<TAB>fingerprint
 KEYMAP="$WORKDIR/keymap"             # fingerprint<TAB>comment
 LAST_OUT="$WORKDIR/last_out"         # raw last lines, in original order
+AK_FILES="$WORKDIR/ak_files"         # user<TAB>path<TAB>status (N key(s) / absent / unreadable)
+UNKNOWN_USERS="$WORKDIR/unknown"     # users with at least one unknown key, one per line
 
 # ---- 1. collect "Accepted publickey" events, from auth.log or journalctl ----
 extract_accepted() {
@@ -142,10 +146,15 @@ fi
 # ---- 2. build fingerprint -> comment map from every reachable authorized_keys ----
 # Paths from sshd's AuthorizedKeysFile (%h home, %u user, %% %, relative = in home),
 # default .ssh/authorized_keys .ssh/authorized_keys2 when sshd -T is not available
-AK_PATTERNS=$(sshd -T 2>/dev/null | awk '$1 == "authorizedkeysfile" { $1 = ""; print }' || true)
-[ -n "$AK_PATTERNS" ] || AK_PATTERNS=".ssh/authorized_keys .ssh/authorized_keys2"
+SSHD_CONFIG=$(sshd -T 2>/dev/null || true)
+AK_PATTERNS=$(awk '$1 == "authorizedkeysfile" { $1 = ""; print }' <<<"$SSHD_CONFIG")
+AK_DEFAULT=0
+[ -n "$AK_PATTERNS" ] || { AK_PATTERNS=".ssh/authorized_keys .ssh/authorized_keys2"; AK_DEFAULT=1; }
+# Keys given by a command (LDAP, FreeIPA...) are not in any file: only reported for unknown keys
+AK_COMMAND=$(awk '$1 == "authorizedkeyscommand" && $2 != "none" { $1 = ""; sub(/^ /, ""); print }' <<<"$SSHD_CONFIG")
 
 : > "$KEYMAP"
+: > "$AK_FILES"
 {
     echo "root:/root"
     getent passwd | awk -F: '$6 != "" { print $1 ":" $6 }'
@@ -155,10 +164,23 @@ AK_PATTERNS=$(sshd -T 2>/dev/null | awk '$1 == "authorizedkeysfile" { $1 = ""; p
         akfile="${akfile//%h/$akhome}"
         akfile="${akfile//%u/$akuser}"
         [ "${akfile:0:1}" = "/" ] || akfile="$akhome/$akfile"
-        echo "$akfile"
+        printf '%s\t%s\n' "$akuser" "$akfile"
     done
-done | sort -u | while read -r akfile; do
-    [ -r "$akfile" ] || continue
+done | sort -u | while IFS=$'\t' read -r akuser akfile; do
+    # What was read for whom, shown for unknown keys
+    if [ ! -e "$akfile" ]; then
+        # Not visible: really missing, or inside a directory we may not enter (another home as non-root)
+        # (stat error kept in a variable: with pipefail, "stat | grep" would take stat's failure)
+        stat_err=$(LC_ALL=C stat "$akfile" 2>&1 || true)
+        case "$stat_err" in
+            *"Permission denied"*) status="inaccessible (droits)" ;;
+            *) status="absent" ;;
+        esac
+        printf '%s\t%s\t%s\n' "$akuser" "$akfile" "$status" >> "$AK_FILES"; continue
+    elif [ ! -r "$akfile" ]; then
+        printf '%s\t%s\t%s\n' "$akuser" "$akfile" "illisible" >> "$AK_FILES"; continue
+    fi
+    nkeys=0
     # One ssh-keygen per line: on a whole file, ssh-keygen gives a key without comment the previous key's comment.
     # Leading options (from=, command=...) are understood by ssh-keygen itself.
     while read -r keyline || [ -n "$keyline" ]; do
@@ -169,14 +191,16 @@ done | sort -u | while read -r akfile; do
         comment=$(printf '%s\n' "$out" | sed -E 's/^[^ ]+ [^ ]+ ?(.*) \([^)]*\)$/\1/')
         [ -n "$comment" ] || comment="no-comment"
         printf '%s\t%s\n' "$fp" "$comment" >> "$KEYMAP"
+        nkeys=$((nkeys + 1))
     done < "$akfile"
+    printf '%s\t%s\t%s\n' "$akuser" "$akfile" "$nkeys clef(s)" >> "$AK_FILES"
 done
 
 # ---- 3. get last output (keep original order/format) ----
 last -Fiw "$@" > "$LAST_OUT"
 
 # ---- 4. correlate and print ----
-awk -v window="$WINDOW" -v keymapfile="$KEYMAP" -v authfile="$AUTH_EVENTS" '
+awk -v window="$WINDOW" -v keymapfile="$KEYMAP" -v authfile="$AUTH_EVENTS" -v unknownfile="$UNKNOWN_USERS" '
     BEGIN {
         FS="\t"
         while ((getline line < keymapfile) > 0) {
@@ -232,8 +256,26 @@ awk -v window="$WINDOW" -v keymapfile="$KEYMAP" -v authfile="$AUTH_EVENTS" '
                 if (fp != "" && (fp in keymap)) keystr = keymap[fp]
                 else if (fp != "") keystr = "clef inconnue (" fp ")"
                 else keystr = "clef inconnue (no-fp)"
+                if (!(fp in keymap) && !(user in unknown)) { unknown[user] = 1; print user > unknownfile }
             }
         }
         print raw "\t" keystr
     }
 ' "$LAST_OUT" | column -t -s $'\t'
+
+# ---- 5. for unknown keys: which key files were read for these accounts ----
+if [ -s "$UNKNOWN_USERS" ]; then
+    echo
+    echo "Clefs inconnues : aucune clef des fichiers lus n'a cette empreinte (ssh-keygen -lf <fichier> les liste)."
+    while read -r user; do
+        echo "  $user :"
+        awk -F'\t' -v u="$user" '$1 == u { print "    " $2 " : " $3 }' "$AK_FILES"
+        grep -q "^$user"$'\t' "$AK_FILES" 2>/dev/null || echo "    (compte sans répertoire personnel connu)"
+    done < "$UNKNOWN_USERS"
+    if [ "$AK_DEFAULT" -eq 1 ]; then
+        echo "  sshd -T indisponible (pas root ?) : chemins par défaut ; un AuthorizedKeysFile ou AuthorizedKeysCommand de sshd_config n'a pas pu être lu."
+    fi
+    if [ -n "$AK_COMMAND" ]; then
+        echo "  sshd prend aussi des clefs de AuthorizedKeysCommand ($AK_COMMAND), non interrogé."
+    fi
+fi

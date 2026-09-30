@@ -1,5 +1,14 @@
 # Changelog — Tools
 
+## whosshkey 1.3 — fichiers lus pour une clef inconnue — 2026-09-30
+
+- Quand une connexion sort en `clef inconnue (SHA256:…)`, une section après le tableau liste, pour chaque compte
+  concerné, les fichiers de clefs essayés et leur état : `N clef(s)`, `absent`, `inaccessible (droits)` (répertoire
+  d'un autre compte sans root), `illisible`. Rien n'est ajouté quand toutes les clefs sont connues.
+- Signale aussi quand `sshd -T` n'a pas pu être lu (sans root, ou `sshd` hors du PATH) : seuls les chemins par défaut
+  ont été essayés ; et quand sshd prend des clefs d'un `AuthorizedKeysCommand`, que whosshkey n'interroge pas.
+- README : ce qu'est l'empreinte `SHA256:…` et comment la retrouver (`ssh-keygen -lf`).
+
 ## checkssl 1.4 — version TLS affichée — 2026-09-30
 
 - Pour un serveur, ligne `Version TLS : TLSv1.3` après les jours restants ; en dessous de TLS 1.2 (SSLv3, TLSv1,
