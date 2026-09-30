@@ -7,7 +7,7 @@ Petits outils d'administration indépendants, sous licence GPL v3.
 | `checkssl` | bash | 1.1 | État d'un certificat TLS (serveur ou fichier) et jours restants avant expiration |
 | `cronMutt` | Python 3 | 0.24.2 | Lance une commande (ou lit un pipe) et envoie sa sortie par mail (mutt) et/ou sur Nextcloud, selon le résultat |
 | `sleepUntil` | bash | 1.1 | Comme `at`, mais bloquant : attend une heure donnée puis lance une commande |
-| `whosshkey` | bash | — | Comme `last`, avec en plus la clef SSH utilisée pour chaque connexion |
+| `whosshkey` | bash | 1.2 | Comme `last`, avec en plus la clef SSH utilisée pour chaque connexion |
 
 Voir `CHANGELOG.md` pour l'historique des versions.
 
@@ -127,16 +127,19 @@ passée ou invalide : message sur stderr et code retour `1`, la commande n'est p
 ## whosshkey
 
 ```bash
-whosshkey [-H hôte] [-w secondes] [options de last…]
+whosshkey [-H hôte] [-w secondes] [-V] [options de last…]
 ```
 
 Sortie de `last -Fiw`, avec une colonne de plus : le commentaire de la clef SSH utilisée, retrouvé en croisant les
-`Accepted publickey` de sshd (`/var/log/auth.log` ou `journalctl`) avec les `authorized_keys` de tous les comptes.
-Clef absente des `authorized_keys` : `clef inconnue (empreinte)`.
+`Accepted publickey` de sshd (`/var/log/auth.log` et ses rotations, compressées comprises, sinon `journalctl`) avec
+les fichiers de clefs de tous les comptes (`AuthorizedKeysFile` de `sshd -T`, à défaut `.ssh/authorized_keys` et
+`.ssh/authorized_keys2`). Clef absente de ces fichiers : `clef inconnue (empreinte)` ; clef sans commentaire :
+`no comment`. Fonctionne avec gawk comme avec mawk.
 
 | Option | Rôle | Défaut |
 |---|---|---|
-| `-H hôte` | Lance l'analyse sur un hôte distant via `ssh` + `sudo` | local |
+| `-H hôte` | Lance l'analyse sur un hôte distant via `ssh` + `sudo` (qui peut demander son mot de passe) | local |
 | `-w secondes` | Écart maximal entre le log sshd et l'heure de `last` | 10 |
+| `-V` | Version | — |
 
 Doit tourner en root (ou sudo) pour lire les logs et les `authorized_keys` des autres comptes.

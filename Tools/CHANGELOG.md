@@ -1,5 +1,40 @@
 # Changelog — Tools
 
+## whosshkey 1.2 — mawk, fichiers de clefs, logs tournés, -H avec mot de passe sudo — 2026-09-30
+
+Premier numéro de version : 1.0 = version initiale (2024-10-01), 1.1 = analyse distante `-H` (2026-09-23) ; `-V`
+l'affiche.
+
+Corrections :
+
+- **mawk** : les expressions régulières utilisaient des répétitions `{4}` que mawk 1.3.4 20200120 (awk par défaut de
+  Debian et Ubuntu serveur) ne comprend pas : aucun horodatage reconnu, toutes les lignes sortaient en `-`. Classes
+  écrites en entier ; résultat identique avec gawk et mawk.
+- **Arrêt silencieux** : un `authorized_keys` vide (ou seulement des commentaires) faisait échouer un `grep` et, avec
+  `set -e` + `pipefail`, le script sortait en code 1 sans rien afficher. Une apostrophe dans le commentaire d'une clef
+  (« alice's laptop ») faisait échouer `xargs`, même effet. Fichiers lus ligne à ligne, commentaire extrait par `sed`.
+- **Clefs avec options** (`from=…,command="ssh-agent …"`) : un `sed` gourmand découpait la ligne au dernier mot
+  ressemblant à un type de clef, y compris dans les options ou le commentaire. La ligne entière est passée à
+  `ssh-keygen`, qui comprend les options. Une ligne par appel : sur un fichier entier, `ssh-keygen -l` donne à une clef
+  sans commentaire le commentaire de la précédente (OpenSSH 8.9).
+- **Fichiers de clefs** : seul `.ssh/authorized_keys` était lu ; une clef de `.ssh/authorized_keys2` (défaut Debian)
+  sortait en « clef inconnue ». Chemins pris dans `AuthorizedKeysFile` (`sshd -T`, `%h`, `%u`), à défaut les deux
+  fichiers par défaut.
+- **Logs tournés** : seuls `auth.log` et `auth.log.1` étaient lus, alors que `last` couvre souvent plus ; les
+  connexions plus anciennes sortaient en `-`. Tous les `auth.log*` sont lus, compressés compris (`zcat -f`), y compris
+  le nommage `auth.log-AAAAMMJJ.gz`.
+- **Changement d'année** : les horodatages syslog n'ont pas d'année, `date` prenait l'année courante ; un log de
+  décembre lu en janvier tombait dans le futur. Une date à plus d'un jour dans le futur est ramenée d'un an.
+- **Date illisible** : `getline` en échec gardait l'horodatage de la ligne précédente ; la ligne est ignorée.
+- **`-H`** : le script passait sur le stdin de ssh, donc `sudo` ne pouvait pas demander de mot de passe (« a terminal
+  is required ») et `-t` ne servait à rien. Le script voyage dans la commande (base64), stdin reste le terminal. Les
+  options de `last` passées à distance gardent leurs espaces (`-t "2026-09-30 12:00"`).
+- **Options** : `-H` ou `-w` sans valeur donnaient « unbound variable » ; `-w abc` était accepté. Messages clairs.
+
+Code retiré ou renommé : `sed` de découpe des options et `grep` de filtrage (remplacés par ssh-keygen et la lecture
+ligne à ligne), `xargs`, variable `TMPDIR` écrasée (renommée `WORKDIR`, elle était héritée par toutes les commandes
+lancées), commentaires qui annonçaient un epoch par ligne de `last` jamais calculé.
+
 ## sleepUntil 1.1 — arguments intacts, heure invalide signalée, réveil fiable — 2026-09-30
 
 Premier numéro de version : 1.0 = version initiale (2024-10-08), `-V` l'affiche.
