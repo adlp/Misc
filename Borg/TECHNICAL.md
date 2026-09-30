@@ -586,6 +586,25 @@ graphique des fichiers modifiés). Réparation des snapshots existants : `Index 
 dernier snapshot par `borg list` complet ; les suivants repartent de lui). Vérifié sur un dépôt de test
 (fichier ajouté/modifié/supprimé, répertoire ajouté/supprimé) : diff, snapshot et compteurs exacts.
 
+**Changement de type d'entrée (1.0.163, story 26).** borg diff ne signale un fichier devenu lien, répertoire ou fifo (ou
+l'inverse) que par `mode` avec `old_mode`/`new_mode` (mesuré, borg 1.2.6). `parse_diff_entries_json` (Index et DiffBkp,
+entrées indexées comme exclues) le scinde en deux entrées, `removed[ <type>]` puis `added[ <type>]` (fichier : taille 0,
+inconnue), d'après le 1er caractère des modes ; même type (chmod d'un répertoire) ou type inconnu : `mode` tel quel.
+Le `mode` est cherché dans toute la liste des changements : borg range `owner` avant `mode` (mesuré). `snapshot_file`
+(une ligne par chemin, partagée par les snapshots de toutes les archives) est mis à jour sur place
+(`_SNAPFILE_UPSERT`, `ON CONFLICT … DO UPDATE`) : `INSERT OR REPLACE` changeait l'id, et les snapshots plus anciens qui
+citaient le chemin le perdaient (snapshot incrémental comme complet). FileHist/TreeHist trient à date égale par `id`
+(retrait avant ajout).
+Comptes de Report, snapshot incrémental (retrait puis ajout avec `borg list` : nouveau type) et TreeHist suivent sans
+autre changement ; avant, le snapshot gardait l'ancien type. Paires indexées avant : inchangées (`Index -F`).
+
+**Chemins sauvegardés (1.0.163, story 26).** Borg local (`preBorg` absent, sans `SSH_REMFO`) : `_bkp_roots` — absente ou vide :
+`/` ; valeur qui désigne telle quelle un chemin existant : gardée entière (rc d'avant) ; sinon `shlex.split` ;
+illisible : erreur. Après `store_bkp_status_start` : chemin absent (`_local_state`, accès refusé ou délai = présent) :
+`[WARN]` et `borgHelper_missing_roots` dans le JSON ; erreur ou aucun présent : `store_bkp_status_finish('error')`, alerte
+`bkp_error`, code 2 (mesuré : borg aurait créé l'archive des autres chemins, code 1 ; ou une archive vide). Borg distant :
+la valeur passe telle quelle en un argument (ssh la transmet au shell distant, qui la découpe) — comme avant.
+
 **Comptes en fichiers ordinaires (1.0.162, story 25).** `_diff_stats_for_nick` compte `added`/`removed`/`modified`
 sur les types exacts de fichiers ordinaires (`added` ; `removed` avec taille, `COUNT(size_before)` ; `modified`) et,
 pour les exclus, les mêmes types (`removed` compté en entier). Répertoires, liens, fifo et entrées `ctime`/`mtime`/`mode`

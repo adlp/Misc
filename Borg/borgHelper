@@ -7,10 +7,10 @@
 #*/
 
 import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading,uuid
-import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob
+import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.162"
+Version="1.0.163"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -166,6 +166,17 @@ def _repo_current_id(path,timeout=2):
         except (OSError,UnicodeDecodeError,configparser.Error,KeyError,ValueError): res.append(None)
     th=threading.Thread(target=_rd,daemon=True); th.start(); th.join(timeout)
     return res[0] if res else None
+
+def _bkp_roots(raw):
+    """1.0.163 (story 26, A36) : chemins de BORG_ROOTBKP pour un borg local -> (liste, None) ou (None, message d'erreur).
+    Absente ou vide : ['/'] (choix de l'utilisateur). Valeur qui désigne telle quelle un chemin existant : gardée entière
+    (rc d'avant : espace sans guillemets, apostrophe, antislash). Sinon découpage shell (espaces ; guillemets pour un
+    chemin qui en contient). Illisible (guillemet non fermé) : erreur."""
+    s=(raw or '').strip()
+    if not s: return ['/'],None
+    if os.path.lexists(s): return [s],None
+    try: return shlex.split(s),None
+    except ValueError as e: return None,f"BORG_ROOTBKP illisible ({e}) : {raw!r}"
 
 def _borg_leftovers(home,repos):
     """1.0.160 (story 23, A30) : entrées borg d'un dossier personnel `home` pour des dépôts LOCAUX disparus — lecture
@@ -411,15 +422,21 @@ def _diff_entry_type(change_type,size_before=None):
     if head in ('added','removed','changed'): return _DIFF_TYPE_OF_SUFFIX.get(suffix)
     return None
 
-def parse_diff_line_json(line):
+def _diff_obj(line):
+    """Objet JSON d'une ligne borg diff --json-lines, ou None (vide, illisible, sans chemin ni changement)."""
     line=line.strip()
     if not line: return None
     try: obj=json.loads(line)
     except (json.JSONDecodeError,ValueError): return None
-    path=obj.get('path')
-    if not path: return None
-    changes=obj.get('changes',[])
-    if not changes: return None
+    if not isinstance(obj,dict) or not obj.get('path') or not obj.get('changes'): return None
+    return obj
+
+def parse_diff_line_json(line):
+    obj=_diff_obj(line)
+    return _diff_entry_of(obj) if obj else None
+
+def _diff_entry_of(obj):
+    path=obj.get('path'); changes=obj.get('changes',[])
     change_type=None; size_before=None; size_after=None
     for ch in changes:
         t=ch.get('type','')
@@ -432,6 +449,31 @@ def parse_diff_line_json(line):
     if change_type is None:
         change_type=changes[0].get('type','?')
     return {'change_type':change_type,'size_before':size_before,'size_after':size_after,'path':path}
+
+# snapshot_file : une ligne par chemin, partagée par les snapshots de toutes les archives — mise à jour sur place
+_SNAPFILE_UPSERT=("INSERT INTO snapshot_file (nick,path,size,mtime,type,mode,owner) VALUES (?,?,?,?,?,?,?) "
+                  "ON CONFLICT(nick,path) DO UPDATE SET size=excluded.size,mtime=excluded.mtime,type=excluded.type,"
+                  "mode=excluded.mode,owner=excluded.owner")
+_MODE_TYPE_SUFFIX={'-':''}|{v:k for k,v in _DIFF_TYPE_OF_SUFFIX.items()}   # 1er caractère d'un mode ls -> suffixe de type
+
+def parse_diff_entries_json(line):
+    """1.0.163 (story 26, A38) : entrées de diff_index d'une ligne borg diff --json-lines. Un changement de TYPE d'entrée
+    (fichier devenu lien, répertoire, fifo… ou l'inverse) n'arrive de borg que comme 'mode' avec old_mode/new_mode
+    (mesuré, borg 1.2.6) : il devient deux entrées, suppression de l'ancien type puis ajout du nouveau (fichier : taille 0,
+    inconnue) — Report, snapshot et TreeHist les appliquent comme un retrait suivi d'un ajout. Même type (chmod d'un
+    répertoire) ou type inconnu : l'entrée 'mode' telle quelle. [] si la ligne n'est pas une entrée. Le 'mode' est
+    cherché dans toute la liste : borg range 'owner' avant 'mode' (mesuré : fichier devenu lien de groupe différent)."""
+    obj=_diff_obj(line)
+    if not obj: return []
+    p=_diff_entry_of(obj)
+    if p['change_type'] in ('added','removed','modified'): return [p]
+    ch=next((c for c in obj['changes'] if isinstance(c,dict) and c.get('type')=='mode'),None)
+    if ch is None: return [p]
+    o,n=(ch.get('old_mode') or '')[:1],(ch.get('new_mode') or '')[:1]
+    if o==n or o not in _MODE_TYPE_SUFFIX or n not in _MODE_TYPE_SUFFIX: return [p]
+    so,sn=_MODE_TYPE_SUFFIX[o],_MODE_TYPE_SUFFIX[n]
+    return [{'change_type':'removed'+(' '+so if so else ''),'size_before':None if so else 0,'size_after':None,'path':p['path']},
+            {'change_type':'added'+(' '+sn if sn else ''),'size_before':None,'size_after':None if sn else 0,'path':p['path']}]
 
 def _borg_glob_args(ftor):
     """Sélection par joker (`*`/`?`) pour borg extract/list (1.0.122). borg exige un opérateur en tête de
@@ -3027,7 +3069,9 @@ class BorgHelperDB:
             try:
                 _write_mode_check(conn)
                 if files:
-                    conn.executemany("INSERT OR REPLACE INTO snapshot_file (nick,path,size,mtime,type,mode,owner) VALUES (?,?,?,?,?,?,?)",
+                    # 1.0.163 : mise à jour sur place (id gardé) — INSERT OR REPLACE changeait l'id et les snapshots plus anciens
+                    # qui citaient ce chemin perdaient leur ligne
+                    conn.executemany(_SNAPFILE_UPSERT,
                                      [(nick,_path_stored(conn,f['path']),f.get('size'),f.get('mtime'),f.get('type'),f.get('mode'),f.get('owner')) for f in files])
                     conn.executemany("INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,file_id) SELECT ?,?,?,id FROM snapshot_file WHERE nick=? AND path=?",
                                      [(nick,archive,archive_date,nick,_path_stored(conn,f['path'])) for f in files])
@@ -4446,7 +4490,7 @@ class BorgHelper:
                 msg=f"borg diff a échoué (code {rb2['exitcode']})"
                 if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(rb2['exitcode'])
                 printer(msg); sys.exit(rb2['exitcode'])
-            all_entries=[p for line in rb2['stdout'] for p in [parse_diff_line_json(line)] if p and p['path']]
+            all_entries=[p for line in rb2['stdout'] for p in parse_diff_entries_json(line) if p['path']]
             entries_ok=[]; exclu={}
             for p in all_entries:
                 if self._idx_path_ok(p['path'],cfg):
@@ -4680,9 +4724,12 @@ class BorgHelper:
         if 'BORG_ARCHNAME' in cfg.keys(): archname=cfg['BORG_ARCHNAME']
         if archname[:2]=="::": create.append(archname+'-{now:%Y-%m-%dT%H%M%S}')
         else: create.append('::{fqdn}-'+archname+'-{now:%Y-%m-%dT%H%M%S}')
-        rootbkp="/"
-        if 'BORG_ROOTBKP' in cfg.keys(): rootbkp=cfg['BORG_ROOTBKP']
-        create.append(rootbkp)
+        # 1.0.163 (story 26, A36) : BORG_ROOTBKP = liste de chemins (découpage shell : espaces, guillemets pour un chemin
+        # qui en contient) ; absent : '/'. Borg distant (SSH_REMFO) : la valeur passe telle quelle, le shell distant la
+        # découpe (guillemets compris), comme avant. Erreur (vide, illisible) : signalée après bkp_status (en échec).
+        roots,roots_err=_bkp_roots(cfg.get('BORG_ROOTBKP')) if preBorg is None else (None,None)
+        if preBorg is not None: create.append(cfg['BORG_ROOTBKP'] if 'BORG_ROOTBKP' in cfg.keys() else '/')
+        elif roots: create.extend(roots)
         if 'EXCLUDE' not in list(cfg.keys()):
             printer(list(cfg.keys()))
             printer("Il est necessaire que EXCLUDE soit configures dans ~/.borghelperrc")
@@ -4705,6 +4752,19 @@ class BorgHelper:
             self.db.ensure_history_db(bkp_status_db)
             if not self.db.store_bkp_status_start(nick,run_id,bkp_status_db):
                 printer(f"[WARN] store_bkp_status_start a échoué pour {nick} (run_id={run_id})")
+            # 1.0.163 (story 26, choix de l'utilisateur) : borg local seulement (avec SSH_REMFO, borg tourne sur la machine
+            # distante, ses chemins ne se vérifient pas ici). Chemin absent : [WARN], les autres sont sauvegardés (borg
+            # ferait de même, code 1) ; tous absents : aucune archive vide, Bkp en échec (code 2, Status, notifications).
+            missing=[]
+            if preBorg is None:
+                missing=[r for r in (roots or []) if _local_state(r)=='absent']   # accès refusé, délai : présent (borg tranche)
+                for r in missing: printer(f"[WARN] {nick}: chemin à sauvegarder absent : {r} — sauvegarde des autres chemins")
+                if roots_err or len(missing)==len(roots):
+                    msg=roots_err or f"aucun chemin à sauvegarder présent ({' '.join(roots)})"
+                    printer(f"[ERREUR] {nick}: {msg} — rien lancé")
+                    self.db.store_bkp_status_finish(nick,run_id,'error',bkp_status_db)
+                    sentry_alert('bkp_error',nick,f"Sauvegarde en échec — {nick} ({msg})",cfg,extra={'exitcode':2})
+                    sys.exit(2)
             anaRet=self.borg.boex(nick,create,preBorg=preBorg,forceEnv=forceEnv,debug=debug)
             newretC=0
             if anaRet['exitcode']:
@@ -4740,6 +4800,7 @@ class BorgHelper:
                     printer(f"[WARN] {nick}: {len(warn[key])} {label} : {', '.join(lst)}{more}")
             if out is not None:
                 out['borgHelper_backup_warnings']={k:{'count':len(v),'paths':v[:_BKP_WARN_PATHS_MAX]} for k,v in warn.items()}
+                if missing: out['borgHelper_missing_roots']=missing   # 1.0.163 : chemins de BORG_ROOTBKP absents (borg local)
             if newretC==0 and anaRet['stdout']:
                 try:
                     arch_info=anaRet['stdout'][0].get('archive',{})
@@ -4933,7 +4994,7 @@ class BorgHelper:
                 if sz is not None:
                     conn.execute("UPDATE snapshot_file SET size=? WHERE nick=? AND path=?",(sz,nick,path))
             if add_rows:
-                conn.executemany("INSERT OR REPLACE INTO snapshot_file (nick,path,size,mtime,type,mode,owner) VALUES (?,?,?,?,?,?,?)",add_rows)
+                conn.executemany(_SNAPFILE_UPSERT,add_rows)   # 1.0.163 : id gardé (snapshots plus anciens intacts)
                 conn.executemany(
                     "INSERT OR IGNORE INTO archive_snapshot (nick,archive,archive_date,file_id) "
                     "SELECT ?,?,?,id FROM snapshot_file WHERE nick=? AND path=?",
@@ -5486,15 +5547,15 @@ class BorgHelper:
             entries=[]; exclu={}
             try:
                 for line in ps.stdout:          # streaming — parse au fil de l'eau
-                    p=parse_diff_line_json(line)
-                    if not p or not p['path']: continue
-                    if self._idx_path_ok(p['path'],cfg):
-                        entries.append(p)
-                    else:
-                        ct=p['change_type']
-                        sz=p.get('size_after') or p.get('size_before') or 0
-                        if ct not in exclu: exclu[ct]={'count':0,'size':0}
-                        exclu[ct]['count']+=1; exclu[ct]['size']+=sz
+                    for p in parse_diff_entries_json(line):   # 1.0.163 : changement de type -> 2 entrées
+                        if not p['path']: continue
+                        if self._idx_path_ok(p['path'],cfg):
+                            entries.append(p)
+                        else:
+                            ct=p['change_type']
+                            sz=p.get('size_after') or p.get('size_before') or 0
+                            if ct not in exclu: exclu[ct]={'count':0,'size':0}
+                            exclu[ct]['count']+=1; exclu[ct]['size']+=sz
                 ps.wait()
             finally:
                 with running_procs_lock:
@@ -5978,7 +6039,7 @@ class BorgHelper:
                 conn=_open_db(db_path,nick=n,role='read')
                 af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
                 pstored=_path_stored(conn,path)
-                cur=conn.execute("SELECT nick,archive_new_date,archive_old,archive_new,change_type,size_before,size_after FROM diff_index WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date",[n,pstored]+af_params)
+                cur=conn.execute("SELECT nick,archive_new_date,archive_old,archive_new,change_type,size_before,size_after FROM diff_index WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date,id",[n,pstored]+af_params)
                 n_rows=cur.fetchall()
                 df,dt=_snap_params(af_params,archive_from,archive_to)
                 snap_extra=[x for x in [df,dt] if x]
@@ -6124,7 +6185,7 @@ class BorgHelper:
             # de sous-répertoire). added/removed ne concernent QUE l'entrée du répertoire lui-même
             # (ex. 'added directory'/'removed directory') ; un mouvement d'un descendant, quel qu'il
             # soit (added/removed/modified plus bas), remonte comme 'modified' générique.
-            own=conn.execute("SELECT change_type,archive_new,archive_new_date FROM diff_index WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date",[n,_path_stored(conn,full_path)]+af_params).fetchall()
+            own=conn.execute("SELECT change_type,archive_new,archive_new_date FROM diff_index WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date,id",[n,_path_stored(conn,full_path)]+af_params).fetchall()
             if not recursive: return own
             dsql,dprm,_=_psel_under(conn,full_path)
             deep=conn.execute("SELECT DISTINCT archive_new,archive_new_date FROM diff_index WHERE nick=?"+_wh(dsql)+af_sql+" ORDER BY archive_new_date",[n]+dprm+af_params).fetchall()
@@ -12856,6 +12917,75 @@ def codec_selftest(pattern=None,list_only=False):
             ops=[o for o,_u,_t in rows]
             if ops!=['bkp','bkp','prune']: print(f"  repo_stats : {rows}")
             return ops==['bkp','bkp','prune'] and all(u and t for _o,u,t in rows) and meas_ok
+        def _bkp_paths_real_borg():
+            """1.0.163 (story 26, A36) : BORG_ROOTBKP en liste (découpage shell) sur un VRAI dépôt. Deux chemins (dont un avec
+            espace) + un absent : [WARN] nommant l'absent, archive = les deux arbres, pas le troisième dossier. Tous absents :
+            code 2, [ERREUR], aucune archive, bkp_status 'error'. Guillemet non fermé : code 2, rien lancé. Avec SSH_REMFO
+            (borg distant) : aucune vérification locale, les chemins passent tels quels à borg."""
+            d=os.path.join(tmp,'bkp-chemins'); src=os.path.join(d,'src'); repo=os.path.join(d,'repo'); rc=os.path.join(d,'rc')
+            A=os.path.join(src,'a'); BC=os.path.join(src,'b c'); O=os.path.join(src,'autre')
+            for x in (A,BC,O): os.makedirs(x)
+            for x in (A,BC,O):
+                with open(os.path.join(x,'f'),'w') as f: f.write('x')
+            bb=os.path.join(d,'borgbase'); w=os.path.join(d,'borgw'); _rb_wrapper(w,bb)
+            nul=os.path.join(d,'nulle'); fq=socket.getfqdn()
+            common=(f"BORG_REPO={repo}\nBORG_PASSPHRASE=pw-bp\nBORG_EXE={w}\nSER_NAME=bp\nSER_LOGIN=x\nGLOB_ARCH={fq}-t-*\n"
+                    f"BORG_ARCHNAME=t\nDB_ENCRYPT=false\nEXCLUDE=--exclude-caches\n")
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n\n[bp]\n{common}BORG_ROOTBKP={A} \"{BC}\" {nul}\n\n"
+                        f"[vide]\n{common}BORG_ROOTBKP={nul} {nul}2\n\n[casse]\n{common}BORG_ROOTBKP=\"{A}\n\n"
+                        f"[ancien]\n{common}BORG_ROOTBKP={BC}\n\n[ferme]\n{common}BORG_ROOTBKP={A} {os.path.join(d,'ferme','x')}\n\n"
+                        f"[loin]\n{common}BORG_ROOTBKP={nul} \"{nul} 2\"\nSSH_REMFO=2222:localhost:22\n")
+            os.chmod(rc,0o600)
+            env=_rb_env(bb,BORG_PASSPHRASE='pw-bp'); borg=shutil.which('borg')
+            r=_rb_run([borg,'init','-e','repokey',repo],120,env=env)
+            if r.returncode!=0: print(f"  borg init : {r.stderr[-300:]}"); return False
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            def run(nick):
+                o=io.StringIO(); code=0
+                with contextlib.redirect_stdout(o),contextlib.redirect_stderr(o):
+                    try: b.backup(nick,no_index=True)
+                    except SystemExit as e: code=e.code or 0
+                return code,o.getvalue()
+            alerts=[]; lockf=lambda nk: glob.glob(glob.escape(b.db._priority_lock_path(nk))+'*')
+            last=lambda nk: (lambda c: (c.execute("SELECT result FROM bkp_status WHERE nick=? ORDER BY rowid DESC LIMIT 1",(nk,)).fetchone(),c.close())[0])(sqlite3.connect(b.db.get_history_db(nk)))
+            c1,o1=run('bp')
+            names=[l for l in _rb_run([borg,'list','--short',repo],120,env=env).stdout.split()]
+            paths=set(_rb_run([borg,'list','--short',f'{repo}::{names[0]}'],120,env=env).stdout.splitlines()) if names else set()
+            rel=lambda q: q.lstrip('/')
+            one=(c1==0 and len(names)==1 and f"chemin à sauvegarder absent : {nul}" in o1 and last('bp')==('success',)
+                 and '"borgHelper_missing_roots"' in o1
+                 and {rel(os.path.join(A,'f')),rel(os.path.join(BC,'f'))}<=paths and rel(os.path.join(O,'f')) not in paths)
+            rec=lambda kind,nk,msg,cfg,extra=None: alerts.append((kind,nk,(extra or {}).get('exitcode')))
+            with mock.patch.dict(globals(),{'sentry_alert':rec}):
+                c2,o2=run('vide'); c3,o3=run('casse')
+            n2=len(_rb_run([borg,'list','--short',repo],120,env=env).stdout.split())
+            none=(c2==2 and 'aucun chemin à sauvegarder présent' in o2 and n2==1 and last('vide')==('error',) and not lockf('vide')
+                  and ('bkp_error','vide',2) in alerts)
+            broken=c3==2 and 'BORG_ROOTBKP illisible' in o3 and last('casse')==('error',) and ('bkp_error','casse',2) in alerts
+            # vide ou absente : '/' (choix de l'utilisateur) — vérifié sans lancer de Bkp de tout le système
+            empty=_bkp_roots('')==(['/'],None) and _bkp_roots(None)==(['/'],None) and _bkp_roots('  ')==(['/'],None)
+            closed=True
+            if os.geteuid()!=0:   # root traverse un dossier en mode 000 : cas sans objet
+                os.makedirs(os.path.join(d,'ferme','x')); os.chmod(os.path.join(d,'ferme'),0)
+                try: c7,o7=run('ferme')
+                finally: os.chmod(os.path.join(d,'ferme'),0o700)
+                closed='absent' not in o7   # accès refusé : jamais « absent » (borg tranche) ; archive des autres chemins
+            c6,o6=run('ancien')   # rc d'avant : chemin existant avec espace, sans guillemets -> gardé entier
+            n6=_rb_run([borg,'list','--short',repo],120,env=env).stdout.split('\n')
+            old=c6==0 and 'absent' not in o6 and len([x for x in n6 if x.strip()])==(2 if os.geteuid()==0 else 3)
+            seen=[]
+            def fake_boex(nick,cmd,**kw): seen.append(cmd); return {'exitcode':2,'stdout':[],'stderr':[]}
+            with mock.patch.object(b.borg,'boex',fake_boex): c4,o4=run('loin')
+            ai=next((k for k,x in enumerate(seen[0]) if x.startswith('::')),None) if seen else None   # chemins : juste après l'archive
+            # distant : la valeur passe telle quelle (un argument), le shell distant la découpe, guillemets compris (comme avant)
+            remote=ai is not None and seen[0][ai+1]==f'{nul} "{nul} 2"' and 'aucun chemin' not in o4 and 'absent' not in o4
+            ok=one and none and broken and remote and old and empty and closed
+            if not ok: print(f"  chemins : liste {one} ({c1}, {names}, {sorted(paths)[:6]}) tous absents {none} ({c2}, {n2}, {alerts}) ancien {old} ({c6}) "
+                             f"vide {empty} refusé-lecture {closed} {o3[-150:]!r} "
+                             f"illisible {broken} ({c3}) distant {remote} ({seen[:1]}) ; {o1[-200:]!r} {o2[-200:]!r}")
+            return ok
+        _rbc("Bkp sur vrai borg : BORG_ROOTBKP en liste (chemin avec espace), absent signalé, tous absents ou illisible refusés et enregistrés, vide = /, valeur d'avant gardée, distant tel quel",_bkp_paths_real_borg)
         def _reconcile_real_borg():
             """1.0.140 (story 3) : vrai dépôt, 3 Bkp indexés, `borg delete` de l'archive du milieu puis de la plus
             ancienne, Index après chacun. Paires sans archive absente ni doublon, FileHist ne cite plus l'archive
@@ -13027,6 +13157,91 @@ def codec_selftest(pattern=None,list_only=False):
                              f"Index {oi[-200:]!r} Report {orp[-300:]!r}")
             return ok
         _rbc("Report sur vrai borg : modifications en fichiers ordinaires (répertoires, liens, ctime hors comptes), prev_nf = nfiles précédent",_report_files_real_borg)
+        def _type_change_real_borg():
+            """1.0.163 (story 26, A38) : vrai borg — fichier devenu lien et fifo devenu fichier (t-2, paire calculée par DiffBkp
+            en direct), lien devenu fichier (t-3, paire calculée par Index), chmod d'un répertoire (non scindé). Attendu (en
+            dur) : ArchiveHistory t-2 = 1 ajouté / 0 modifié / 1 supprimé, t-3 = 1 / 0 / 0 ; Report -o « 33%nb » et « 0%nb » ;
+            snapshot (incrémental) au NOUVEAU type : f1 lien, p fichier (t-2), lk fichier (t-3)."""
+            d=os.path.join(tmp,'type-reel'); src=os.path.join(d,'src'); bb=os.path.join(d,'bb'); repo=os.path.join(d,'repo')
+            os.makedirs(os.path.join(src,'d'))
+            env=_rb_env(bb,BORG_PASSPHRASE='pw-tc'); borg=shutil.which('borg')
+            def bg(*a):
+                r=_rb_run([borg,*a],120,env=env)
+                if r.returncode not in (0,1): raise RuntimeError(f"borg {a[0]} (code {r.returncode}) : {r.stderr[-300:]}")
+            def wr(q,s):
+                with open(os.path.join(src,q),'w') as f: f.write(s)
+            import datetime as _dtm
+            ts=lambda m: (_dtm.datetime.utcnow()-_dtm.timedelta(minutes=m)).strftime('%Y-%m-%dT%H:%M:%S')
+            bg('init','-e','repokey',repo)
+            for q in ('f1','f2','k'): wr(q,q)
+            os.mkfifo(os.path.join(src,'p')); os.symlink('k',os.path.join(src,'lk'))
+            w=os.path.join(d,'borgw'); _rb_wrapper(w,bb); rc=os.path.join(d,'rc')
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n\n[tc]\nBORG_REPO={repo}\nBORG_PASSPHRASE=pw-tc\nSER_NAME=tc\n"
+                        f"SER_LOGIN=x\nGLOB_ARCH=t-*\nBORG_ARCHNAME=t\nBORG_ROOTBKP={src}\nEXCLUDE=--exclude-caches\nDB_ENCRYPT=false\n"
+                        f"BORG_EXE={w}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\n")
+            os.chmod(rc,0o600)
+            me=os.path.realpath(__file__); cenv=_rb_cli_env(bb)
+            def cli(*a):
+                p=_rb_run([me,'-C',rc,'-c',*a],300,env=cenv); return p.returncode,p.stdout+p.stderr
+            bg('create','--timestamp',ts(15),f'{repo}::t-1',src); c0,_o=cli('Index','-n','tc')
+            time.sleep(1.1)
+            os.remove(os.path.join(src,'f1')); os.symlink('k',os.path.join(src,'f1'))
+            os.remove(os.path.join(src,'p')); wr('p','devenu fichier'); os.chmod(os.path.join(src,'d'),0o700)
+            bg('create','--timestamp',ts(10),f'{repo}::t-2',src)
+            cd_,od=cli('DiffBkp','-n','tc','-b','t-1,t-2','-j'); c1,_o=cli('Index','-n','tc')
+            time.sleep(1.1)
+            os.remove(os.path.join(src,'lk')); wr('lk','lien devenu fichier')
+            bg('create','--timestamp',ts(5),f'{repo}::t-3',src); c2,_o=cli('Index','-n','tc')
+            c2b,_o=cli('Index','-n','tc','-S','-F')   # snapshot complet refait (store_archive_snapshot) : 2e site de mise à jour
+            cr,orp=cli('Report','-n','tc','-o','-j'); ca,oa=cli('ArchiveHistory','-n','tc','-j')
+            mods=sorted(m for m in re.findall(r'"modifications":\s*"([^"]*)"',orp) if m!='—')
+            try: rows={r['archive']:(r['files_added'],r['files_modified'],r['files_removed']) for r in json.loads(oa)['rows']}
+            except (ValueError,KeyError): rows={}
+            c=sqlite3.connect(BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')).db.get_diff_db('tc'))
+            snap={(a,pth.rsplit('/',1)[-1]):ty for a,pth,ty in c.execute(
+                "SELECT s.archive,f.path,f.type FROM archive_snapshot s JOIN snapshot_file f ON f.id=s.file_id WHERE s.nick='tc'")}
+            dmode=c.execute("SELECT change_type FROM diff_index WHERE nick='tc' AND archive_new='t-2' AND path LIKE '%/d'").fetchall()
+            c.close()
+            types=(snap.get(('t-2','f1')),snap.get(('t-2','p')),snap.get(('t-3','lk')))
+            # 1.0.163 : snapshot plus ancien intact (id gardé) — lk, changé de type en t-3 (mise à jour incrémentale), reste
+            # dans le snapshot de t-2 ; t-1 n'a pas de snapshot (1er Index d'une archive seule, t-2 fait en complet)
+            older=('t-2','lk') in snap and ('t-3','lk') in snap
+            ok=((c0,cd_,c1,c2,c2b,cr,ca)==(0,0,0,0,0,0,0) and 'added link' in od
+                and rows.get('t-2')==(1,0,1) and rows.get('t-3')==(1,0,0) and mods==['0%nb / —','0%nb / —','33%nb / —']   # t-3, résumé (t-3), t-2
+                and types==('l','-','-') and dmode==[('mode',)] and older)
+            if not ok: print(f"  type réel : codes {(c0,cd_,c1,c2,c2b,cr,ca)} DiffBkp 'added link' {'added link' in od} ArchiveHistory {rows} "
+                             f"Report {mods} snapshot {types} anciens {older} {sorted(k for k in snap if k[1] in ('f1','p','lk'))} d {dmode} ; DiffBkp {od[-200:]!r}")
+            return ok
+        _rbc("changement de type d'entrée sur vrai borg : fichier devenu lien, fifo devenu fichier, lien devenu fichier — comptes, snapshot, DiffBkp et Index",_type_change_real_borg)
+        def _diff_type_change_split():
+            """1.0.163 (story 26, A38) : parse_diff_entries_json — lignes mesurées sur borg 1.2.6 (m25b, m26b)."""
+            L=lambda path,*ch: json.dumps({'path':path,'changes':list(ch)})
+            M=lambda o,n: {'type':'mode','old_mode':o,'new_mode':n}
+            got=[parse_diff_entries_json(x) for x in (
+                L('f1',M('-rw-rw-r--','lrwxrwxrwx'),{'type':'ctime'}),        # fichier -> lien
+                L('p',M('prw-rw-r--','-rw-rw-r--'),{'type':'ctime'}),         # fifo -> fichier
+                L('d',M('drwxrwxr-x','drwx------'),{'type':'ctime'}),         # chmod de répertoire : pas de scission
+                L('x',M('-rw-rw-r--','drwxrwxr-x')),                          # fichier -> répertoire
+                L('s',M('srwx------','-rw-rw-r--')),                          # type inconnu : tel quel
+                L('m',{'type':'modified','added':5,'removed':2},{'type':'mode','old_mode':'-rw-r--r--','new_mode':'-rw-------'}),
+                L('o',{'type':'owner','old_group':'a','new_group':'b'},M('-rw-rw-r--','lrwxrwxrwx')),   # owner AVANT mode (mesuré)
+                'pas du json','','[1,2]')]
+            want=[[{'change_type':'removed','size_before':0,'size_after':None,'path':'f1'},
+                   {'change_type':'added link','size_before':None,'size_after':None,'path':'f1'}],
+                  [{'change_type':'removed fifo','size_before':None,'size_after':None,'path':'p'},
+                   {'change_type':'added','size_before':None,'size_after':0,'path':'p'}],
+                  [{'change_type':'mode','size_before':None,'size_after':None,'path':'d'}],
+                  [{'change_type':'removed','size_before':0,'size_after':None,'path':'x'},
+                   {'change_type':'added directory','size_before':None,'size_after':None,'path':'x'}],
+                  [{'change_type':'mode','size_before':None,'size_after':None,'path':'s'}],
+                  [{'change_type':'modified','size_before':2,'size_after':5,'path':'m'}],
+                  [{'change_type':'removed','size_before':0,'size_after':None,'path':'o'},
+                   {'change_type':'added link','size_before':None,'size_after':None,'path':'o'}],
+                  [],[],[]]
+            if got!=want: print(f"  scission : {got}")
+            return got==want
+        check("borg diff, changement de type d'entrée : deux entrées (supprimé ancien type, ajouté nouveau) ; chmod de répertoire et type inconnu tels quels",_diff_type_change_split)
         check("_diff_entry_type (1.0.126) : type tiré de change_type (borg diff 1.2), tous les types de suppression reconnus",
               lambda: [_diff_entry_type(c,sb) for c,sb in (('added',None),('modified',1),('removed',3),('removed',0),('removed',None),
                        ('removed directory',None),('added link',None),('changed link',None),('removed fifo',None),

@@ -134,6 +134,8 @@ bh.backup('mon-serveur')
 
 # Backup sans indexation
 bh.backup('mon-serveur', no_index=True)
+# backup() se termine par sys.exit(code) — SystemExit à attraper. 1.0.163 : SystemExit(2) avant tout borg si
+# BORG_ROOTBKP est illisible ou si aucun de ses chemins n'existe (bkp_status 'error', alerte bkp_error)
 
 # Indexation manuelle (après backup sans -I)
 bh.index('mon-serveur')

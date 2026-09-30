@@ -53,7 +53,12 @@ EXCLUDE          = --exclude /proc --exclude /sys --exclude /dev --exclude /tmp 
 EXCLUDE_NEXT     = --exclude /var/cache
 # partie centrale du nom d'archive
 BORG_ARCHNAME    = root
-# répertoire racine sauvegardé
+# chemins sauvegardés (1.0.163 : plusieurs, séparés par des espaces ; guillemets pour un chemin qui en contient)
+#   BORG_ROOTBKP = /etc /home "/srv/mes documents"
+# Chemin absent au Bkp : [WARN] (et « borgHelper_missing_roots » dans le JSON), les autres sont sauvegardés ; aucun
+# présent ou valeur illisible (guillemet non fermé) : Bkp refusé (code 2, enregistré en échec) ; vide : « / ». Une valeur qui
+# désigne telle quelle un chemin existant reste entière (rc d'avant : espace sans guillemets). Avec SSH_REMFO (borg
+# distant) : rien de vérifié ici, la valeur passe telle quelle et le shell distant la découpe (guillemets compris).
 BORG_ROOTBKP     = /
 
 # Affichage rapport
@@ -454,8 +459,11 @@ Formule (identique résumé et détail) :
 - `XX%nb` = `100 × (modified + removed) / précédent` — % de fichiers modifiés ou supprimés. Avant 1.0.162, les
   comptes incluaient répertoires et liens : pourcentage surestimé dès qu'un répertoire changeait (mesuré : 200 %nb au
   lieu de 100 %nb)
-- limites : un fichier devenu lien ou répertoire (ou l'inverse) n'est pas compté — borg ne donne alors qu'un changement
-  de `mode` (mesuré, borg 1.2.6), le dénominateur s'écarte d'autant du `nfiles` précédent ; les exclus d'un `IdxPurge`
+- un fichier devenu lien, répertoire ou fifo (ou l'inverse) compte comme supprimé ou ajouté (1.0.163 : borg ne donne
+  qu'un changement de `mode`, scindé à l'Index en suppression de l'ancien type et ajout du nouveau ; taille comptée 0,
+  inconnue) ; paires indexées avant 1.0.163 : non comptées — `Index -F` refait les paires gardées (`DIFF_KEEP`) et le
+  dernier snapshot, pas les comptes déjà figés
+- limites : les exclus d'un `IdxPurge`
   antérieur à 1.0.162 peuvent compter d'anciens répertoires comme fichiers supprimés (pas de taille par ligne pour les
   distinguer). `DiffBkp`, `DiffTop` et `IdxTop` comptent, eux, des entrées (répertoires et liens compris)
 - `Y.YY GB` = taille absolue lisible (`added_sz + modified_sz + removed_sz`), **pas** un pourcentage — `—` si nulle

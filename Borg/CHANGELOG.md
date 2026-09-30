@@ -1,5 +1,20 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.163 — plusieurs chemins par nick, changement de type d'entrée — 2026-09-30
+
+Chantier « reconstruction progressive », story 26 (actions de rétrospective A36, note de l'utilisateur, et A38).
+
+- **`BORG_ROOTBKP`** accepte plusieurs chemins (séparés par des espaces, guillemets pour un chemin qui en contient) :
+  `BORG_ROOTBKP = /etc /home "/srv/mes documents"`. Une valeur qui désigne un chemin existant reste entière (rc
+  d'avant, espace sans guillemets compris). Chemin absent : `[WARN]`, les autres sont sauvegardés ; aucun présent
+  ou valeur illisible : Bkp refusé (code 2, enregistré en échec, alerte). Borg distant (`SSH_REMFO`) : valeur
+  transmise telle quelle, comme avant.
+- **Snapshot** : `snapshot_file` mis à jour sur place — un chemin retiré puis rajouté (ou changé de type) disparaissait
+  des snapshots plus anciens (l'id de sa ligne changeait).
+- **Changement de type d'entrée** : un fichier devenu lien, répertoire ou fifo (ou l'inverse) compte comme supprimé ou
+  ajouté dans Report, ArchiveHistory et le graphique ; le snapshot (TreeHist) prend le nouveau type — il gardait
+  l'ancien (y compris quand le propriétaire change aussi). Paires indexées avant : non comptées.
+
 ## borgHelper 1.0.162 — Report en fichiers ordinaires, comptes de BorgCleanup — 2026-09-30
 
 Chantier « reconstruction progressive », story 25 (actions de rétrospective A24 et A35).
