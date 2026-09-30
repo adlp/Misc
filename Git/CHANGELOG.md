@@ -10,6 +10,9 @@
 
 ## gitconfig
 
+### 1.5.0 — 2026-09-30
+- Ajout de l'alias `mirror` : equivalent simplifie de `git2git_mirror` (clone --mirror + push --mirror) integre directement dans `.gitconfig`, un seul fichier pour tout gerer git. Pas de `--subdir` (contrairement au script) : uniquement `[-n|--dry-run] <src> <dest>`. Le script `git2git_mirror` est conserve en parallele pour le cas `--subdir`.
+
 ### 1.4.0 — 2026-09-23
 - `addco` et `addcom` fonctionnent désormais comme `git add` : le point de départ est le répertoire courant (retour dans `$GIT_PREFIX` avant d'agir, car les alias shell s'exécutent à la racine), pathspecs relatifs (y compris `../..`), plusieurs arguments possibles, défaut = `.`.
 - `addcom` : périmètre limité au répertoire courant / aux chemins donnés (avant : tout le dépôt) ; boucle `git status | while read` remplacée par `git add -u`.
