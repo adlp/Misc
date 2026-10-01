@@ -10,6 +10,9 @@
 
 ## gitconfig
 
+### 1.8.0 — 2026-10-01
+- Ajout de l'alias `fiput` : `git fiput <depot> <fichier-local> <chemin-destination> <message>` clone `<depot>`, copie `<fichier-local>` vers `<chemin-destination>` (cree les repertoires intermediaires si besoin), commit avec `<message>` et pousse. Rien commite si le contenu est identique. Chemin local relatif au repertoire d'invocation via `$GIT_PREFIX`. Equivalent fichier unique de `git tar`, remplace l'usage ponctuel de `gitoune`.
+
 ### 1.7.0 — 2026-10-01
 - Ajout de l'alias `figet` : `git figet <depot> <chemin-dans-le-depot> <destination>` recupere un fichier ou un repertoire precis d'un depot (clone --depth 1 dans un temp, sans historique) et le depose en local. Fichier -> copie vers `<destination>` (ou dans `<destination>/` si c'est un repertoire existant). Repertoire -> copie locale, ou archive si `<destination>` finit en `.tar`/`.tgz`/`.tar.gz`/`.tar.bz2`/`.tbz2`.
 - Limite connue : le clone recupere tout l'historique courant (HEAD) du depot, pas seulement le chemin demande — git ne permet pas de transfert partiel portable sans support serveur (partial clone/sparse-checkout, ou `git archive --remote` souvent desactive cote hebergeur). Acceptable pour des depots de taille courante (Gitea perso), a eviter sur un gros monorepo distant.
