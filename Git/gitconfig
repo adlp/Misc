@@ -84,11 +84,11 @@
                 case \"$tag\" in \
                     \"committed\") tata=\"✳️ \" ;; \
                     \"untracked\") tata=\"☠️ \" ;; \
-                    \"ignored\")   tata=\"👻\" ;; \
-                    \"modified\")  tata=\"📝\" ;; \
+                    \"ignored\")   tata=\"💤\" ;; \
+                    \"modified\")  tata=\"✏️i\" ;; \
                     \"staged\")    tata=\"🚸\" ;; \
                     \"deleted\")   tata=\"🧨\" ;; \
-                    \"renamed\")   tata=\"✉️ \" ;; \
+                    \"renamed\")   tata=\"📩\" ;; \
                     *)             tata=\"⁉️ \" ;; \
                     esac; \
                 printf \"%s [%s]\\n\" \"$line\" \"$tata$tag\"; \
