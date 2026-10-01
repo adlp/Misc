@@ -10,7 +10,7 @@ Scripts utilitaires pour manipuler des depots git.
 | `git2git_mirror` | 1.1.0 | Synchronise l'integralite d'un depot git (branches, tags, refs) vers un autre, avec option `--dry-run` ; ou extrait un sous-repertoire (`--subdir`) pour l'exposer comme depot independant |
 | `gitar` | 1.0.0 | Pousse une archive tar dans un depot git |
 | `gitoune` | 1.0.0 | Pousse un fichier dans un depot git |
-| `gitconfig` | 1.12.0 | Configuration git personnelle (`~/.gitconfig`) : alias, pager, diff tool, identite pro/perso par repo, mirroring inline (`git mirror`), depot d'archive tar depuis fichier ou stdin (`git tar`), telechargement fichier/repertoire a HEAD ou a un commit precis (`git figet [-G <commit>]`), depot d'un fichier unique depuis fichier ou stdin (`git fiput`), historique d'un fichier distant (`git filog`), diff fichier local vs depot (`git fidiff [-G <commit>]`) |
+| `gitconfig` | 1.13.0 | Configuration git personnelle (`~/.gitconfig`) : alias, pager, diff tool, identite pro/perso par repo, mirroring inline (`git mirror`), depot d'archive tar depuis fichier ou stdin (`git tar`), telechargement fichier/repertoire a HEAD ou a un commit precis (`git figet [-G <commit>]`), depot d'un fichier unique depuis fichier ou stdin (`git fiput`), historique d'un fichier distant (`git filog`), diff fichier local vs depot (`git fidiff [-G <commit>]`), liste des alias avec doc (`git alias`) |
 
 Voir `CHANGELOG.md` pour l'historique des versions.
 

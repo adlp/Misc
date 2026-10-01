@@ -10,6 +10,9 @@
 
 ## gitconfig
 
+### 1.13.0 — 2026-10-01
+- `git alias` affiche desormais le nom de chaque alias avec une courte description (au lieu du nom + definition brute). Table de description codee en dur dans l'alias (a tenir a jour manuellement a chaque ajout/suppression d'alias) ; un alias non documente s'affiche avec une description vide plutot que de planter.
+
 ### 1.12.0 — 2026-10-01
 - `fiput` et `tar` acceptent `-` comme source pour lire depuis **stdin** au lieu d'un fichier local (convention `-`, comme `tar`/`curl`). `fiput - ...` : `cat > destpath` directement. `tar - ...` : stdin bufferise dans un fichier temp avant extraction — `tar` n'autodetecte pas le format de compression (gzip/bzip2) sur un flux non-seekable (pipe), seulement sur un vrai fichier, d'ou le passage par un fichier temporaire pour reutiliser le meme chemin d'extraction fiable.
 
