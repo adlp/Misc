@@ -10,6 +10,9 @@
 
 ## gitconfig
 
+### 1.10.0 — 2026-10-01
+- `figet` accepte `-G <commit>` : `git figet [-G <commit>] <depot> <chemin> <destination>`. Sans `-G`, clone `--depth 1` (HEAD uniquement, inchange). Avec `-G`, clone complet + `git checkout <commit>` pour recuperer le fichier/repertoire a cette version precise. Comble le manque identifie face a `gitoune -G`.
+
 ### 1.9.0 — 2026-10-01
 - Ajout de l'alias `filog` : `git filog <depot> <chemin-dans-le-depot>` clone le depot (historique complet) et affiche `git log` filtre sur ce chemin, meme format que l'alias `logs`. Comble le manque identifie face a `gitoune -l` (historique d'un fichier distant).
 

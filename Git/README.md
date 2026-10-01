@@ -10,7 +10,7 @@ Scripts utilitaires pour manipuler des depots git.
 | `git2git_mirror` | 1.1.0 | Synchronise l'integralite d'un depot git (branches, tags, refs) vers un autre, avec option `--dry-run` ; ou extrait un sous-repertoire (`--subdir`) pour l'exposer comme depot independant |
 | `gitar` | 1.0.0 | Pousse une archive tar dans un depot git |
 | `gitoune` | 1.0.0 | Pousse un fichier dans un depot git |
-| `gitconfig` | 1.9.0 | Configuration git personnelle (`~/.gitconfig`) : alias, pager, diff tool, identite pro/perso par repo, mirroring inline (`git mirror`), depot d'archive tar (`git tar`), telechargement fichier/repertoire (`git figet`), depot d'un fichier unique (`git fiput`), historique d'un fichier distant (`git filog`) |
+| `gitconfig` | 1.10.0 | Configuration git personnelle (`~/.gitconfig`) : alias, pager, diff tool, identite pro/perso par repo, mirroring inline (`git mirror`), depot d'archive tar (`git tar`), telechargement fichier/repertoire a HEAD ou a un commit precis (`git figet [-G <commit>]`), depot d'un fichier unique (`git fiput`), historique d'un fichier distant (`git filog`) |
 
 Voir `CHANGELOG.md` pour l'historique des versions.
 
@@ -37,9 +37,9 @@ Voir `CHANGELOG.md` pour l'historique des versions.
 | | `gitoune` | `git fiput` / `git figet` |
 |---|---|---|
 | Langage | Python (requiert `gitpython`) | shell (alias `!` dans `.gitconfig`), requiert juste `git`+`tar` |
-| Args | flags nommes : `-r -f -m -g -G -d -l` (combinables) | positionnels, un alias par sens : `fiput depot local dest message` / `figet depot chemin destination` |
+| Args | flags nommes : `-r -f -m -g -G -d -l` (combinables) | positionnels, un alias par sens : `fiput depot local dest message` / `figet [-G commit] depot chemin destination` |
 | Entree/sortie fichier | contenu via **stdin/stdout**, ouvert en mode texte (`open(..., 'w')`) — risque de corruption sur binaire/encodage | copie **binaire** (`cp -a`) — fichiers binaires et encodages preserves |
-| Recuperer (`get`) | `-g`/`-G <commit>` affiche le contenu sur stdout, a HEAD ou a un commit precis | `figet` ecrit vers une destination (fichier, repertoire, ou archive `.tar`/`.tgz`) ; HEAD uniquement, pas de commit specifique |
+| Recuperer (`get`) | `-g`/`-G <commit>` affiche le contenu sur stdout, a HEAD ou a un commit precis | `figet` ecrit vers une destination (fichier, repertoire, ou archive `.tar`/`.tgz`) ; `-G <commit>` couvre aussi un commit precis (clone complet + `checkout`, au lieu du `--depth 1` par defaut) |
 | Repertoires | non supporte, fichier unique seulement | `figet` recupere aussi un repertoire entier (copie ou archive) ; `fiput` reste fichier unique |
 | Diff avant envoi | `-d` affiche le diff unifie (stdin vs contenu git) avant de decider | aucun affichage, decision via `git diff --cached --quiet` seulement |
 | Historique du fichier | `-l` affiche le log du fichier dans le depot | couvert separement par `git filog <depot> <chemin>` (meme format que `git logs`) |
