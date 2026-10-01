@@ -261,8 +261,8 @@ MAX_AGE_BKP      = 25
 - **Opérations permises** : lecture (listes, exploration, recherche, rapports, `Index`, `Mount`, `Key`, maintenance
   des bases) toujours ; `Restore` par défaut ; `Prune` et `DelBkp` seulement si `EXTERNAL_OPS` les liste ; `Bkp`,
   `Init` et `Login` jamais. Une opération refusée sort avec le **code 4**, sans lancer borg. Avec `-n ALL`, les nicks
-  où elle est refusée sont écartés (une ligne d'information), les autres continuent — un cron `Bkp -n ALL` existant
-  reste valable. Une liste explicite (`-n int,ext`) contenant un nick refusé sort avec le code 4 avant tout
+  où elle est refusée sont écartés (une ligne d'information), les autres continuent — un cron `Bkp -n ALL` sauvegarde
+  les nicks internes un par un (depuis 1.0.167 ; voir [`Bkp`](#bkp)). Une liste explicite (`-n int,ext`) contenant un nick refusé sort avec le code 4 avant tout
   traitement, nick permis compris. `Restore -L` (liste des droits) est une lecture.
 - `Prune -n ALL` ne s'arrête pas au premier nick refusé par sa configuration (`GLOB_ARCH` ou `KEEP_*` absent) :
   message, puis nick suivant.
@@ -398,6 +398,11 @@ borgHelper -c Bkp -n mon-serveur -I     # backup seul, sans indexation
 Nécessite : `EXCLUDE`, `SER_LOGIN`, `SER_NAME`.  
 Code retour 0 si succès ou warnings, 2 si erreur borg.
 
+Plusieurs nicks (`-n ALL`, `-n a,b` ; 1.0.167) : un Bkp après l'autre, dans l'ordre du fichier de conf pour `-n ALL`,
+dans l'ordre donné pour une liste (dépôts externes écartés) ; un nick en échec n'arrête pas les suivants ; Ctrl-C arrête tout. Code retour : le pire des
+nicks. Sortie : l'objet JSON de chaque nick, à la suite (même forme qu'un nick seul). Avant 1.0.167, plusieurs
+nicks internes donnaient « Ce serveur est inconnu » (code 3) sans aucune sauvegarde.
+
 > `-I` désactive toute écriture de changements/snapshot et l'appel automatique à `Index` — utile si l'indexation est gérée séparément (les statistiques de l'archive et la taille du dépôt restent enregistrées).
 
 > **Priorité sur Index :** `Bkp` est prioritaire sur `Index` à tout moment — même si `Index` est en cours à n'importe quelle étape :
@@ -474,6 +479,10 @@ borgHelper -c Report -n ALL -o -N 10       # offline + 10 dernières archives
 
 Code retour 1 si un dépôt dépasse `MAX_AGE_BKP` heures depuis la dernière sauvegarde.  
 Code retour 2 si un dépôt est inaccessible.
+
+Dépôt local introuvable (disque démonté, chemin faux ; 1.0.167) : colonne `reste` = `⚠ dépôt absent`, nick en
+alerte (`*** nick`, rouge en HTML), code 2 ; archives affichées en hors ligne (avant : aucune archive du nick dans
+`Report -o`). Un dépôt présent mais illisible (droits) n'est jamais dit absent.
 
 Plusieurs nicks (1.0.166) : la base d'un nick tenue par un autre processus (migration, Index) est lue telle quelle,
 sans message, après 2 s d'attente au plus par base (Report direct : `diff.db` et `cache.db`, soit ~4 s par nick occupé) ;
@@ -834,6 +843,13 @@ Plage : `-b <archive>` (depuis), `-B <archive>` (jusqu'à), `-b ALL` (tout), san
 
 Le motif porte sur le chemin complet ; sans `*`/`?`, sous-chaîne implicite. La comparaison ignore la casse des lettres ASCII
 (`%`/`_` restent des jokers LIKE) ; résultats triés par date puis par chemin (ordre octet UTF-8).
+
+Plusieurs nicks (1.0.167 ; même règle pour `FileHist`, `TreeHist`, `TreeFind`, `DuIdx`, `IdxTop`, `DiffTop`) : un nick
+dont la base est inutilisable (passphrase fausse ou absente, base illisible, migration de chiffrement en cours, schéma
+plus récent) n'arrête plus la commande — ligne `[ERREUR]` sur stderr avec le message réel, `{nick: {"error": "…"}}`
+en JSON (DuIdx : totaux des autres nicks seulement, l'échec n'est que sur stderr), code 0 sinon (y compris quand
+l'autre nick répond « Index vide »). Nick seul, ou tous en échec : comme avant (erreur du premier nick, code 2 pour
+une base chiffrée inutilisable).
 
 ---
 

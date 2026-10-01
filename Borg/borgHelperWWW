@@ -66,7 +66,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.28.5"
+WWW_VERSION="1.28.6"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -1175,7 +1175,8 @@ def _is_db_key_error(result: CommandResult) -> bool:
     # Sur-approximation délibérée par sous-chaîne : une sortie borg/borgHelper qui contiendrait par
     # coïncidence l'un de ces mots (jamais vu en pratique, mais pas impossible, ex. dans un nom
     # d'archive ou un chemin) serait aussi exclue du cache — préféré à un faux négatif (AD-13).
-    if result.exitcode==0: return False
+    # 1.28.6 (borgHelper 1.0.167) : quel que soit le code de sortie — un lecteur multi-nicks sort en 0 quand un seul nick
+    # a une base inutilisable ({nick: {'error': 'DbKeyError : …'}}) : jamais mis en cache non plus.
     text=f"{result.stdout or ''}\n{result.stderr or ''}"
     return any(m in text for m in _DB_KEY_ERROR_MARKERS)
 
@@ -1909,15 +1910,23 @@ def run_borghelper(cmd: str, nick: Optional[str]=None, extra_args=(), passphrase
 def _run_scoped(cmd: str, nick: str, extra_args, filter_fn, passphrase: Optional[str]=None) -> JSONResponse:
     args=list(extra_args)
     if '-j' not in args: args=args+['-j']
-    result=_exec_borghelper(cmd,nick,args,passphrase)
-    if result.exitcode==0:
+    return _scoped_filter_result(_exec_borghelper(cmd,nick,args,passphrase),filter_fn)
+
+def _scoped_filter_result(result,filter_fn):
+    """Sortie d'un appelant à périmètre restreint (commune à _run_scoped et _run_scoped_raw, 1.28.6). Filtrée QUEL QUE
+    SOIT le code de sortie (borgHelper 1.0.167, story 30 : un lecteur multi-nicks imprime les résultats des autres nicks
+    même quand l'un échoue) — avant, un code ≠ 0 relayait stdout tel quel. Fail-closed : stdout non-JSON ou d'une forme
+    que le filtre ne connaît pas -> vidé (erreur) ou refusé (code 0, « ne devrait jamais arriver »)."""
+    if result.exitcode==0 or (result.stdout or '').strip():
         try:
             parsed=json.loads(result.stdout)
             result.stdout=json.dumps(filter_fn(parsed),ensure_ascii=False,indent=2)
-        except ValueError:
-            # stdout non-JSON malgré -j : ne devrait jamais arriver, mais un appelant a un périmètre
-            # restreint ici — fail-closed (jamais relayer du stdout non filtré), pas fail-open.
-            result.exitcode=1; result.stdout=''; result.stderr=(result.stderr or '')+"\n[borgHelperWWW] réponse non-JSON reçue pour un appelant à périmètre restreint — requête refusée."
+        except (ValueError,TypeError,KeyError,AttributeError) as e:
+            if not isinstance(e,ValueError):   # JSON valide d'une forme que le filtre ne connaît pas : défaut à voir au journal
+                print(f"[borgHelperWWW] filtre de périmètre en échec ({type(e).__name__}: {e}) — sortie refusée",file=sys.stderr,flush=True)
+            if result.exitcode!=0: result.stdout=''   # erreur : jamais de sortie non filtrée (stderr gardé)
+            else:
+                result.exitcode=1; result.stdout=''; result.stderr=(result.stderr or '')+"\n[borgHelperWWW] réponse non-JSON reçue pour un appelant à périmètre restreint — requête refusée."
     return JSONResponse(status_code=_http_status(result.exitcode),content=result.dict())
 
 def _filter_per_nick_list(results,scopes,path_key='path'):
@@ -2061,14 +2070,7 @@ def _run_scoped_raw(cmd,nick,extra_args,raw_flag,filter_fn,passphrase=None):
     Jamais mis en `_RESPONSE_CACHE` (même règle que `_run_scoped()`, AD-5)."""
     args=list(extra_args)
     if raw_flag not in args: args=args+[raw_flag]
-    result=_exec_borghelper(cmd,nick,args,passphrase)
-    if result.exitcode==0:
-        try:
-            parsed=json.loads(result.stdout)
-            result.stdout=json.dumps(filter_fn(parsed),ensure_ascii=False,indent=2)
-        except ValueError:
-            result.exitcode=1; result.stdout=''; result.stderr=(result.stderr or '')+"\n[borgHelperWWW] réponse non-JSON reçue pour un appelant à périmètre restreint — requête refusée."
-    return JSONResponse(status_code=_http_status(result.exitcode),content=result.dict())
+    return _scoped_filter_result(_exec_borghelper(cmd,nick,args,passphrase),filter_fn)   # 1.28.6 : même garde que _run_scoped
 
 # ── Enveloppes de cache par périmètre autour de _run_scoped/_run_scoped_raw (Story 1.5) ────────
 # Jamais à l'intérieur de _run_scoped()/_run_scoped_raw() elles-mêmes (Code Map du spec 1.5 : ces
@@ -2086,7 +2088,8 @@ def _scoped_cached_mono(cmd,nick,scope,fingerprint,params,run_fn):
     resp=run_fn()
     try: result_dict=json.loads(resp.body)
     except ValueError: result_dict=None
-    if isinstance(result_dict,dict) and result_dict.get('exitcode')==0:
+    if (isinstance(result_dict,dict) and result_dict.get('exitcode')==0
+            and not _is_db_key_error(CommandResult(**{k:result_dict.get(k) for k in ('exitcode','stdout','stderr')}))):   # AD-13
         _scope_cache_put(nick,cmd,params,sig,fingerprint,result_dict)
     return resp
 
@@ -2129,7 +2132,8 @@ def _scoped_cached_multi(cmd,nick,nicks,scopes,fingerprints,params,run_fn):
     resp=run_fn()
     try: result_dict=json.loads(resp.body)
     except ValueError: result_dict=None
-    if isinstance(result_dict,dict) and result_dict.get('exitcode')==0:
+    if (isinstance(result_dict,dict) and result_dict.get('exitcode')==0
+            and not _is_db_key_error(CommandResult(**{k:result_dict.get(k) for k in ('exitcode','stdout','stderr')}))):   # AD-13
         try: parsed=json.loads(result_dict['stdout'])
         except ValueError: parsed=None
         if isinstance(parsed,dict):
@@ -3228,6 +3232,36 @@ def push_selftest():
         return (seen[0]==['borg','list','--short','/r'] and seen[1]==['borg','list','--short','--glob-archives','h-*','/r']
                 and r1==r2=='a2')
     check("_latest_archive : sans GLOB_ARCH -> aucun filtre ; avec -> --glob-archives (glob_args)",_latest_archive_glob)
+    def _scoped_any_code():
+        """1.28.6 (story 30) : sortie d'un appelant restreint filtrée quel que soit le code — code 2 + JSON -> filtré, code
+        gardé ; code 2 + texte -> stdout vidé ; code 0 + texte -> refusé (code 1) ; filtre qui ne connaît pas la forme
+        (TypeError) -> vidé. Attentes en dur."""
+        flt=lambda d: {k:v for k,v in d.items() if k!='hors'}
+        def run(code,out,fn=flt):
+            r=json.loads(_scoped_filter_result(CommandResult(exitcode=code,stdout=out,stderr='e'),fn).body)
+            return r['exitcode'],r['stdout']
+        a=run(2,json.dumps({'qp':['a'],'hors':['secret'],'qe':{'error':'x'}}))
+        b=run(2,'secret en texte'); c=run(0,'secret en texte'); d=run(2,json.dumps(['secret']),fn=lambda d: d['x'])
+        ok=(a[0]==2 and json.loads(a[1])=={'qp':['a'],'qe':{'error':'x'}} and b==(2,'') and c==(1,'') and d==(2,''))
+        if not ok: print(f"  {a} {b} {c} {d}")
+        return ok
+    check("périmètre : sortie filtrée quel que soit le code de sortie (multi-nicks, story 30)",_scoped_any_code)
+    def _dbkey_partial_not_cached():
+        """AD-13 (1.28.6) : réponse multi-nicks en code 0 dont un nick a une base inutilisable — jamais en cache (réponse
+        entière ni fragments par nick) ; réponse sans marqueur : fragments écrits comme avant."""
+        part=CommandResult(exitcode=0,stdout=json.dumps({'qe':{'error':'DbKeyError : qe: passphrase incorrecte'},'qp':['a']}),
+                           stderr='[ERREUR] DbKeyError : qe: passphrase incorrecte')
+        clean=CommandResult(exitcode=0,stdout=json.dumps({'qe':['b'],'qp':['a']}),stderr='')
+        puts=[]
+        def run(r): return lambda: JSONResponse(status_code=200,content=r.dict())
+        with mock.patch(f"{__name__}._scope_cache_get",return_value=None),\
+             mock.patch(f"{__name__}._scope_cache_put",side_effect=lambda *a,**k: puts.append(a[0])):
+            _scoped_cached_multi('search','qe,qp',['qe','qp'],{'qe':None,'qp':None},{},{},run(part)); n_part=len(puts)
+            _scoped_cached_multi('search','qe,qp',['qe','qp'],{'qe':None,'qp':None},{},{},run(clean)); n_clean=len(puts)-n_part
+        ok=_is_db_key_error(part) and not _is_db_key_error(clean) and n_part==0 and n_clean==2
+        if not ok: print(f"  marqueur {_is_db_key_error(part)}/{_is_db_key_error(clean)} ; fragments partiel {n_part}, propre {n_clean}")
+        return ok
+    check("AD-13 : réponse partielle (DbKeyError d'un nick, code 0) jamais mise en cache",_dbkey_partial_not_cached)
 
     tmpdir=tempfile.mkdtemp(prefix='borghelperwww-push-selftest-')
     test_db=os.path.join(tmpdir,'push-selftest.db')

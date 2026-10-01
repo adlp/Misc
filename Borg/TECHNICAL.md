@@ -1831,6 +1831,23 @@ l'ensemble complet — pas un sous-ensemble) passent `create=False` : `_duidx_co
 `treefind`, `filehist`, `prep_report_from_db`, `cache_prune_dryrun`, `cacheJsonBoexWithLM`,
 `BorgHelperDB.get_cache_rows`.
 
+**Lecteurs multi-nicks (1.0.167, story 30, A47).** `search`, `filehist`, `treehist`, `treefind`, les trois collecteurs
+de `duidx` et les boucles texte de `main` (IdxTop, DiffTop, RepoHistory, ArchiveHistory : `_per_nick_main`) isolent
+l'arrêt d'un nick (`_NICK_STOP` : `SystemExit`, `DbKeyError`/`DbModeError`/`DbTamperError`/`DbCodecError`,
+`SchemaVersionError`) : `_nick_stop_msg` donne le message réel (exception affichée comme le gestionnaire global de
+`main`, ou dernière `[ERREUR]` affichée depuis la marque `_print_mark` et son détail indenté), rangé en
+`{nick: {'error': …}}` ; nick seul, tous en échec, Ctrl-C (`sys.exit(130)` de `boex`, `KeyboardInterrupt`) : relancé.
+Mesuré avant : une passphrase fausse pour un nick -> Search/TreeHist/… `-n la,lb` code 2 sans aucune sortie.
+`Bkp` multi-nicks : boucle de `main` autour de `backup()` (inchangé, finit toujours par `sys.exit`), pire code.
+Tous en échec : la première erreur relancée (comme avant). RepoHistory/ArchiveHistory en texte n'ouvrent aucune base :
+câblés sur `_per_nick_main` par cohérence, sans effet. borgHelperWWW 1.28.6 : `_is_db_key_error` regarde les marqueurs
+quel que soit le code (une réponse partielle en code 0 n'entre jamais dans `_RESPONSE_CACHE` ni dans les fragments du
+cache de périmètre, AD-13).
+`dfRepo` : `df --output=avail -- <dépôt>` sans shell, code de `df`, `None` si illisible ou distant (jamais de `df`)
+(avant : code de `| tail -1`, `int('')` sur dépôt absent) ; `repoLocalAbsent` (`os.stat` : introuvable seulement,
+jamais un refus de droits) -> `reste` « ⚠ dépôt absent », nick en alerte, code 2, dans les deux jumelles de Report
+(direct : `borg info` échoue, branche d'erreur, même mention).
+
 **Lecteur et base occupée (1.0.166, story 29).** Un lecteur (`create=False`) écrit encore pour entretenir une base
 existante : paliers de migration, réparation de la vue, tampons `schema_version`/`borghelper_version` de
 `_check_set_meta` — ce dernier à chaque nouvelle version de borgHelper. Avant 1.0.166, si un autre processus tenait le
@@ -2670,8 +2687,11 @@ nicks non scopés de la même requête restent présents dans le JSON, simplemen
 **Exécution** : `_exec_borghelper()` (sous-processus brut, factorisé hors de `run_borghelper()`) et
 `_run_scoped()` (Story 1.3, jamais de passage par `_RESPONSE_CACHE`) — ajoute `-j` aux `extra_args`
 si absent, parse `stdout`, applique une fonction `_filter_*`, ré-sérialise (`json.dumps(...,
-ensure_ascii=False, indent=2)`, même formatage que `borgHelper` lui-même). `exitcode!=0` : relayé
-tel quel, rien à filtrer (pas de tentative de parser un message d'erreur texte comme du JSON).
+ensure_ascii=False, indent=2)`, même formatage que `borgHelper` lui-même). Depuis borgHelperWWW 1.28.6
+(`_scoped_filter_result`, commun à `_run_scoped` et `_run_scoped_raw`) : filtré **quel que soit le code de sortie** —
+un lecteur multi-nicks (borgHelper 1.0.167) imprime les résultats des autres nicks quand l'un échoue ; avant, un code
+≠ 0 relayait stdout tel quel. Fail-closed : sortie non-JSON ou de forme inconnue du filtre -> vidée (code ≠ 0) ou
+refusée (code 0).
 
 **Fonctions `_filter_*`** (une par forme de JSON, jamais une seule fonction générique — les six
 commandes ont des formes différentes, voir Design Notes du spec 1.3 pour le détail champ par champ) :

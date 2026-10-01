@@ -1,5 +1,28 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.167 / borgHelperWWW 1.28.6 — Bkp -n ALL, lecteurs multi-nicks, dépôt absent — 2026-10-01
+
+Chantier « reconstruction progressive », story 30 (tri A46 de deferred-work, A47, A49 ; regroupement demandé par
+l'utilisateur).
+
+- **`Bkp -n ALL`** (ou liste) avec plusieurs nicks internes : un Bkp après l'autre, ordre du rc, un échec n'arrête pas
+  les suivants, Ctrl-C arrête tout ; code = le pire ; objets JSON à la suite. Avant : « Ce serveur est inconnu »,
+  code 3, aucune sauvegarde (le README affirmait le contraire).
+- **Lecteurs multi-nicks** (Search, FileHist, TreeHist, TreeFind, DuIdx, IdxTop, DiffTop) : une base inutilisable pour
+  un nick (passphrase fausse, base illisible, migration de chiffrement, schéma plus récent) n'efface plus les autres ;
+  message réel du nick (stderr ; `{nick: {"error": …}}` en JSON, sauf DuIdx : totaux des autres nicks), code 0. Avant :
+  code 2, aucune sortie. Nick seul ou tous en échec : inchangé (première erreur).
+- **Report, dépôt local absent** : archives affichées (hors ligne), `reste` = `⚠ dépôt absent`, nick en alerte, code 2
+  (avant : `df … | tail -1` lisait le code de `tail`, `ValueError`, aucune archive du nick en hors ligne) ; `dfRepo`
+  sans shell ; dépôt présent mais inaccessible (droits) : jamais « absent ».
+- **borgHelperWWW 1.28.6** : la sortie d'un appelant à périmètre restreint est filtrée quel que soit le code de sortie
+  (`_scoped_filter_result`, commun aux deux chemins filtrés) — avant, un code ≠ 0 relayait stdout non filtré ; une
+  réponse dont un nick a une base chiffrée inutilisable n'est jamais mise en cache, même en code 0 (AD-13 : cache de
+  réponses et fragments par nick du cache de périmètre).
+- CodecSelfTest : contrôles « multi-nicks » (CLI réelle avec passphrase fausse pour chaque lecteur ; message réel,
+  tous en échec, Ctrl-C ; dfRepo et Report jumelles ; Bkp sur vrai borg : deux nicks, premier en échec, Ctrl-C) ;
+  push_selftest : filtrage quel que soit le code.
+
 ## borgHelper 1.0.166 — une base occupée ne masque plus les autres hôtes — 2026-10-01
 
 Chantier « reconstruction progressive », story 29 (demande de l'utilisateur : un verrou pendant une migration faisait

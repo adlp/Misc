@@ -122,6 +122,17 @@ Lecture du borghelperrc, exécution des commandes borg via subprocess.
 runner = BorgRunner(cfgfile=None, passphrase=None)
 ```
 
+`runner.dfRepo(nick)` : place libre (octets) du système de fichiers d'un dépôt local, `None` si distant ou illisible
+(1.0.167 : sans shell, plus de `ValueError` sur un dépôt absent) ; `runner.repoLocalAbsent(nick)` : vrai si le dépôt
+est local et introuvable.
+
+Lecteurs à plusieurs nicks (`search`, `filehist`, `treehist`, `treefind`, `duidx` avec `nick='a,b'` ; 1.0.167) : un nick
+dont la base est inutilisable (`DbKeyError`, `DbModeError`, `DbTamperError`, `DbCodecError`, `SchemaVersionError`,
+`SystemExit` d'une base illisible) ne lève plus : `{nick: {'error': message}}` avec `as_json=True` (search, filehist,
+treehist, treefind), ligne `[ERREUR]` sur stderr sinon ; `duidx` rend les totaux des autres nicks (aucune entrée
+d'erreur). Nick seul ou tous en échec : la première exception est levée comme avant ; `SystemExit(130)` (Ctrl-C)
+toujours relevée.
+
 ---
 
 ## Exemples — `BorgHelper`
@@ -140,6 +151,8 @@ bh.backup('mon-serveur')
 bh.backup('mon-serveur', no_index=True)
 # backup() se termine par sys.exit(code) — SystemExit à attraper. 1.0.163 : SystemExit(2) avant tout borg si
 # BORG_ROOTBKP est illisible ou si aucun de ses chemins n'existe (bkp_status 'error', alerte bkp_error)
+# backup() ne prend qu'UN nick : la boucle multi-nicks (`-n ALL`, 1.0.167 : un nick après l'autre, pire code, Ctrl-C
+# = sys.exit(130) relancé) est dans la CLI — un appelant Python boucle lui-même en attrapant SystemExit par nick.
 
 # Indexation manuelle (après backup sans -I)
 bh.index('mon-serveur')

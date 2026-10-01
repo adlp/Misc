@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.166"
+Version="1.0.167"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -2038,6 +2038,41 @@ def _codec_fail(label,e,conn=None):
     except Exception: pass
     return msg
 
+# 1.0.167 (story 30, A47) : arrêts d'UN nick qu'une commande de lecture multi-nicks isole (les autres nicks gardent leur
+# résultat) ; Ctrl-C (KeyboardInterrupt, sys.exit(130) de boex) n'en fait jamais partie. Nick seul : relancés (inchangé).
+_NICK_STOP=(SystemExit,DbKeyError,DbModeError,DbTamperError,DbCodecError,SchemaVersionError)
+
+def _nick_stop_msg(e,mark,multi):
+    """Message réel de l'arrêt d'un nick dans une commande multi-nicks (décision de l'utilisateur), ou None : l'appelant
+    relance (nick seul, Ctrl-C code 130, sys.exit(0)). Erreur de base chiffrée ou de schéma : affichée ici comme le
+    gestionnaire global de main pour les erreurs de base chiffrée (`[ERREUR] DbKeyError : la: …` ; schéma plus récent :
+    `[ERREUR] SchemaVersionError : …`) ; sys.exit (DB corrompue, occupée…) : son message est
+    déjà affiché, on reprend la dernière ligne [ERREUR] depuis `mark` et son détail indenté."""
+    if not multi: return None
+    if isinstance(e,SystemExit):
+        if e.code in (0,None,130): return None
+        seen=_print_since(mark)
+        k=max((i for i,l in enumerate(seen) if isinstance(l,str) and l.lstrip().startswith('[ERREUR]')),default=None)
+        if k is None: return f"arrêt (code {e.code})"
+        lines=[seen[k].strip()[len('[ERREUR]'):].strip()]+[l.strip() for l in itertools.takewhile(lambda l: l[:1].isspace(),seen[k+1:k+3])]
+        return ' '.join(x for x in lines if x)
+    msg=f"{type(e).__name__} : {e}"
+    printer(f"[ERREUR] {msg}")
+    return msg
+
+def _per_nick_main(nick,fn):
+    """1.0.167 (story 30) : boucle de main d'une lecture qui imprime nick par nick (texte d'IdxTop, DiffTop, RepoHistory,
+    ArchiveHistory) : un nick qui s'arrête est signalé (_nick_stop_msg), les suivants continuent ; tous en échec, ou
+    nick seul : relancé comme avant."""
+    nicks=nick.split(','); multi=len(nicks)>1; ko=0; stop=None
+    for n in nicks:
+        mk=_print_mark()
+        try: fn(n)
+        except _NICK_STOP as e:
+            if _nick_stop_msg(e,mk,multi) is None: raise
+            ko+=1; stop=e if stop is None else stop
+    if stop is not None and ko==len(nicks): raise stop
+
 def _wh(sql):
     """' AND <cond>' ou ''."""
     return f" AND {sql}" if sql else ''
@@ -3413,67 +3448,91 @@ class BorgHelperDB:
 
     def _duidx_collect(self,nick,sel,key_fn,archive_from=None,archive_to=None):
         totals={}
-        for n in nick.split(','):
-            db_path=self.get_diff_db(n)
-            self.ensure_diff_db(db_path,create=False)
-            if self._is_index_empty(n,db_path):
-                printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
-            conn=None
+        # 1.0.167 (story 30, A47) : un nick qui s'arrête (base chiffrée inutilisable, illisible, schéma plus récent) n'arrête
+        # plus les autres ; nick seul ou tous en échec : relancé comme avant ; Ctrl-C jamais avalé (_nick_stop_msg).
+        _nicks=nick.split(','); _multi=len(_nicks)>1; _ko=0; _stop=None
+        for n in _nicks:
+            _mk=_print_mark()
             try:
-                conn=_open_db(db_path,nick=n,role='read')
-                af_sql,af_params=self._diff_archive_filter(n,archive_from,conn,archive_to)
-                psql,pprm,pyf=_psel_duidx(conn,sel)
-                for ct,path,sz in conn.execute("SELECT change_type,path,CASE WHEN change_type='removed' THEN size_before ELSE size_after END FROM diff_index WHERE nick=?"+_wh(psql)+af_sql,[n]+pprm+af_params):
-                    path=_path_decode(conn,path)
-                    if pyf and not pyf(path): continue
-                    k=key_fn(path)
-                    if k is not None: _duidx_add(totals,k,ct,sz)  # None : hors motif (_duidx_group_spec)
-                df,dt=_snap_params(af_params,archive_from,archive_to)
-                snap_extra=[x for x in [df,dt] if x]
-                for path,sz in conn.execute("SELECT path,size FROM archive_snapshot_v WHERE nick=?"+_wh(psql)+" "+_snap_notin(df,dt),[n]+pprm+snap_extra):
-                    path=_path_decode(conn,path)
-                    if pyf and not pyf(path): continue
-                    k=key_fn(path)
-                    if k is not None: _duidx_add(totals,k,'présent',sz)
-                conn.close()
-            except DbCodecError as e: _codec_fail(n,e,conn)
-            except sqlite3.Error as e:
-                _close_quiet(conn)
-                printer(f"SQLite error ({db_path}): {e}")
+                db_path=self.get_diff_db(n)
+                self.ensure_diff_db(db_path,create=False)
+                if self._is_index_empty(n,db_path):
+                    printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
+                conn=None
+                try:
+                    conn=_open_db(db_path,nick=n,role='read')
+                    af_sql,af_params=self._diff_archive_filter(n,archive_from,conn,archive_to)
+                    psql,pprm,pyf=_psel_duidx(conn,sel)
+                    for ct,path,sz in conn.execute("SELECT change_type,path,CASE WHEN change_type='removed' THEN size_before ELSE size_after END FROM diff_index WHERE nick=?"+_wh(psql)+af_sql,[n]+pprm+af_params):
+                        path=_path_decode(conn,path)
+                        if pyf and not pyf(path): continue
+                        k=key_fn(path)
+                        if k is not None: _duidx_add(totals,k,ct,sz)  # None : hors motif (_duidx_group_spec)
+                    df,dt=_snap_params(af_params,archive_from,archive_to)
+                    snap_extra=[x for x in [df,dt] if x]
+                    for path,sz in conn.execute("SELECT path,size FROM archive_snapshot_v WHERE nick=?"+_wh(psql)+" "+_snap_notin(df,dt),[n]+pprm+snap_extra):
+                        path=_path_decode(conn,path)
+                        if pyf and not pyf(path): continue
+                        k=key_fn(path)
+                        if k is not None: _duidx_add(totals,k,'présent',sz)
+                    conn.close()
+                except DbCodecError as e: _codec_fail(n,e,conn)
+                except sqlite3.Error as e:
+                    _close_quiet(conn)
+                    printer(f"SQLite error ({db_path}): {e}")
+            except _NICK_STOP as _e:
+                _msg=_nick_stop_msg(_e,_mk,_multi)
+                if _msg is None: raise
+                try: conn.close()   # connexion du nick arrêté (ou déjà fermée / inexistante)
+                except Exception: pass
+                _ko+=1; _stop=_e if _stop is None else _stop   # tous en échec : la PREMIÈRE erreur, comme avant
+        if _stop is not None and _ko==len(_nicks): raise _stop   # tous en échec : comme un nick seul
         return totals
 
     def _duidx_collect_global(self,nick,sel,archive_from=None,archive_to=None):
         totals={}
-        for n in nick.split(','):
-            db_path=self.get_diff_db(n)
-            self.ensure_diff_db(db_path,create=False)
-            if self._is_index_empty(n,db_path):
-                printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
-            conn=None
+        # 1.0.167 (story 30, A47) : un nick qui s'arrête (base chiffrée inutilisable, illisible, schéma plus récent) n'arrête
+        # plus les autres ; nick seul ou tous en échec : relancé comme avant ; Ctrl-C jamais avalé (_nick_stop_msg).
+        _nicks=nick.split(','); _multi=len(_nicks)>1; _ko=0; _stop=None
+        for n in _nicks:
+            _mk=_print_mark()
             try:
-                conn=_open_db(db_path,nick=n,role='read')
-                af_sql,af_params=self._diff_archive_filter(n,archive_from,conn,archive_to)
-                psql,pprm,pyf=_psel_duidx(conn,sel)
-                df,dt=_snap_params(af_params,archive_from,archive_to)
-                snap_extra=[x for x in [df,dt] if x]
-                def _acc(k,cnt,sz):
-                    if k not in totals: totals[k]=[0,0]
-                    totals[k][0]+=cnt; totals[k][1]+=(sz or 0)
-                if pyf is None:  # agrégation en SQL (aucun prédicat de nom à exécuter en Python)
-                    for ct,cnt,sz in conn.execute("SELECT change_type,COUNT(*),SUM(CASE WHEN change_type='removed' THEN size_before ELSE size_after END) FROM diff_index WHERE nick=?"+_wh(psql)+af_sql+" GROUP BY change_type",[n]+pprm+af_params):
-                        _acc(('',ct),cnt,sz)
-                    row=conn.execute("SELECT COUNT(*),SUM(size) FROM archive_snapshot_v WHERE nick=?"+_wh(psql)+" "+_snap_notin(df,dt),[n]+pprm+snap_extra).fetchone()
-                    if row and row[0]: _acc(('','présent'),row[0],row[1])
-                else:  # prédicat de nom en Python (base chiffrée) : agrégation sur chemins décodés
-                    for ct,path,sz in conn.execute("SELECT change_type,path,CASE WHEN change_type='removed' THEN size_before ELSE size_after END FROM diff_index WHERE nick=?"+_wh(psql)+af_sql,[n]+pprm+af_params):
-                        if pyf(_path_decode(conn,path)): _acc(('',ct),1,sz)
-                    for path,sz in conn.execute("SELECT path,size FROM archive_snapshot_v WHERE nick=?"+_wh(psql)+" "+_snap_notin(df,dt),[n]+pprm+snap_extra):
-                        if pyf(_path_decode(conn,path)): _acc(('','présent'),1,sz)
-                conn.close()
-            except DbCodecError as e: _codec_fail(n,e,conn)
-            except sqlite3.Error as e:
-                _close_quiet(conn)
-                printer(f"SQLite error ({db_path}): {e}")
+                db_path=self.get_diff_db(n)
+                self.ensure_diff_db(db_path,create=False)
+                if self._is_index_empty(n,db_path):
+                    printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
+                conn=None
+                try:
+                    conn=_open_db(db_path,nick=n,role='read')
+                    af_sql,af_params=self._diff_archive_filter(n,archive_from,conn,archive_to)
+                    psql,pprm,pyf=_psel_duidx(conn,sel)
+                    df,dt=_snap_params(af_params,archive_from,archive_to)
+                    snap_extra=[x for x in [df,dt] if x]
+                    def _acc(k,cnt,sz):
+                        if k not in totals: totals[k]=[0,0]
+                        totals[k][0]+=cnt; totals[k][1]+=(sz or 0)
+                    if pyf is None:  # agrégation en SQL (aucun prédicat de nom à exécuter en Python)
+                        for ct,cnt,sz in conn.execute("SELECT change_type,COUNT(*),SUM(CASE WHEN change_type='removed' THEN size_before ELSE size_after END) FROM diff_index WHERE nick=?"+_wh(psql)+af_sql+" GROUP BY change_type",[n]+pprm+af_params):
+                            _acc(('',ct),cnt,sz)
+                        row=conn.execute("SELECT COUNT(*),SUM(size) FROM archive_snapshot_v WHERE nick=?"+_wh(psql)+" "+_snap_notin(df,dt),[n]+pprm+snap_extra).fetchone()
+                        if row and row[0]: _acc(('','présent'),row[0],row[1])
+                    else:  # prédicat de nom en Python (base chiffrée) : agrégation sur chemins décodés
+                        for ct,path,sz in conn.execute("SELECT change_type,path,CASE WHEN change_type='removed' THEN size_before ELSE size_after END FROM diff_index WHERE nick=?"+_wh(psql)+af_sql,[n]+pprm+af_params):
+                            if pyf(_path_decode(conn,path)): _acc(('',ct),1,sz)
+                        for path,sz in conn.execute("SELECT path,size FROM archive_snapshot_v WHERE nick=?"+_wh(psql)+" "+_snap_notin(df,dt),[n]+pprm+snap_extra):
+                            if pyf(_path_decode(conn,path)): _acc(('','présent'),1,sz)
+                    conn.close()
+                except DbCodecError as e: _codec_fail(n,e,conn)
+                except sqlite3.Error as e:
+                    _close_quiet(conn)
+                    printer(f"SQLite error ({db_path}): {e}")
+            except _NICK_STOP as _e:
+                _msg=_nick_stop_msg(_e,_mk,_multi)
+                if _msg is None: raise
+                try: conn.close()   # connexion du nick arrêté (ou déjà fermée / inexistante)
+                except Exception: pass
+                _ko+=1; _stop=_e if _stop is None else _stop   # tous en échec : la PREMIÈRE erreur, comme avant
+        if _stop is not None and _ko==len(_nicks): raise _stop   # tous en échec : comme un nick seul
         return totals
 
     def _duidx_collect_raw(self,nick,sel,archive_from=None,archive_to=None):
@@ -3485,31 +3544,43 @@ class BorgHelperDB:
         d'un groupe existant. Jamais utilisé par le mode texte, qui reste sur les deux méthodes
         existantes ci-dessus."""
         rows=[]
-        for n in nick.split(','):
-            db_path=self.get_diff_db(n)
-            self.ensure_diff_db(db_path,create=False)
-            if self._is_index_empty(n,db_path):
-                printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
-            conn=None
+        # 1.0.167 (story 30, A47) : un nick qui s'arrête (base chiffrée inutilisable, illisible, schéma plus récent) n'arrête
+        # plus les autres ; nick seul ou tous en échec : relancé comme avant ; Ctrl-C jamais avalé (_nick_stop_msg).
+        _nicks=nick.split(','); _multi=len(_nicks)>1; _ko=0; _stop=None
+        for n in _nicks:
+            _mk=_print_mark()
             try:
-                conn=_open_db(db_path,nick=n,role='read')
-                af_sql,af_params=self._diff_archive_filter(n,archive_from,conn,archive_to)
-                psql,pprm,pyf=_psel_duidx(conn,sel)
-                for ct,path,sz in conn.execute("SELECT change_type,path,CASE WHEN change_type='removed' THEN size_before ELSE size_after END FROM diff_index WHERE nick=?"+_wh(psql)+af_sql,[n]+pprm+af_params):
-                    path=_path_decode(conn,path)
-                    if pyf and not pyf(path): continue
-                    rows.append({'chemin':path,'type':ct,'taille':sz or 0})
-                df,dt=_snap_params(af_params,archive_from,archive_to)
-                snap_extra=[x for x in [df,dt] if x]
-                for path,sz in conn.execute("SELECT path,size FROM archive_snapshot_v WHERE nick=?"+_wh(psql)+" "+_snap_notin(df,dt),[n]+pprm+snap_extra):
-                    path=_path_decode(conn,path)
-                    if pyf and not pyf(path): continue
-                    rows.append({'chemin':path,'type':'présent','taille':sz or 0})
-                conn.close()
-            except DbCodecError as e: _codec_fail(n,e,conn)
-            except sqlite3.Error as e:
-                _close_quiet(conn)
-                printer(f"SQLite error ({db_path}): {e}")
+                db_path=self.get_diff_db(n)
+                self.ensure_diff_db(db_path,create=False)
+                if self._is_index_empty(n,db_path):
+                    printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
+                conn=None
+                try:
+                    conn=_open_db(db_path,nick=n,role='read')
+                    af_sql,af_params=self._diff_archive_filter(n,archive_from,conn,archive_to)
+                    psql,pprm,pyf=_psel_duidx(conn,sel)
+                    for ct,path,sz in conn.execute("SELECT change_type,path,CASE WHEN change_type='removed' THEN size_before ELSE size_after END FROM diff_index WHERE nick=?"+_wh(psql)+af_sql,[n]+pprm+af_params):
+                        path=_path_decode(conn,path)
+                        if pyf and not pyf(path): continue
+                        rows.append({'chemin':path,'type':ct,'taille':sz or 0})
+                    df,dt=_snap_params(af_params,archive_from,archive_to)
+                    snap_extra=[x for x in [df,dt] if x]
+                    for path,sz in conn.execute("SELECT path,size FROM archive_snapshot_v WHERE nick=?"+_wh(psql)+" "+_snap_notin(df,dt),[n]+pprm+snap_extra):
+                        path=_path_decode(conn,path)
+                        if pyf and not pyf(path): continue
+                        rows.append({'chemin':path,'type':'présent','taille':sz or 0})
+                    conn.close()
+                except DbCodecError as e: _codec_fail(n,e,conn)
+                except sqlite3.Error as e:
+                    _close_quiet(conn)
+                    printer(f"SQLite error ({db_path}): {e}")
+            except _NICK_STOP as _e:
+                _msg=_nick_stop_msg(_e,_mk,_multi)
+                if _msg is None: raise
+                try: conn.close()   # connexion du nick arrêté (ou déjà fermée / inexistante)
+                except Exception: pass
+                _ko+=1; _stop=_e if _stop is None else _stop   # tous en échec : la PREMIÈRE erreur, comme avant
+        if _stop is not None and _ko==len(_nicks): raise _stop   # tous en échec : comme un nick seul
         return rows
 
     def get_cache_rows(self,nick):
@@ -3702,13 +3773,30 @@ class BorgRunner:
         return [lines[i]['name'] for i in range(nbl*-1,0)]
 
     def dfRepo(self,nick,debug=0):
-        cfg=self.cfgreaded(nick,debug=debug)
-        if ':' not in cfg['BORG_REPO']:
-            process=subprocess.Popen(f'df {cfg["BORG_REPO"]} --output=avail | tail -1',stdout=subprocess.PIPE,stderr=subprocess.PIPE,shell=True)
-            stdout,stderr=process.communicate()
-            if process.returncode==0:
-                return int(stdout.decode('utf-8').split(" ")[-1])*1024
-        return None
+        """Place libre (octets) du système de fichiers d'un dépôt LOCAL ; None : dépôt distant (':' dans BORG_REPO), df en
+        échec ou sortie illisible. 1.0.167 (story 30, A49) : sans shell (chemin passé tel quel) et code de df lui-même —
+        avant, `df … | tail -1` rendait le code de tail (toujours 0) : dépôt absent -> int('') -> ValueError, et Report
+        hors ligne n'affichait plus aucune archive du nick. Délai de 30 s (un df en attente d'E/S non interruptible sur un
+        montage réseau figé peut encore bloquer : limite connue, deferred-work)."""
+        repo=self.cfgreaded(nick,debug=debug)['BORG_REPO']
+        if ':' in repo: return None
+        try:
+            r=subprocess.run(['df','--output=avail','--',repo],capture_output=True,text=True,timeout=30,stdin=subprocess.DEVNULL)
+        except (OSError,subprocess.TimeoutExpired): return None
+        if r.returncode!=0: return None
+        lines=[l.strip() for l in r.stdout.splitlines() if l.strip()]
+        try: return int(lines[-1])*1024
+        except (IndexError,ValueError): return None
+
+    def repoLocalAbsent(self,nick,debug=0):
+        """1.0.167 (story 30) : vrai si le dépôt est local (pas de ':' dans BORG_REPO, comme dfRepo) et introuvable (disque
+        démonté, chemin faux) — colonne `reste` de Report : « ⚠ dépôt absent » (décision de l'utilisateur)."""
+        repo=self.cfgreaded(nick,debug=debug).get('BORG_REPO','')
+        if not repo or ':' in repo: return False
+        try: os.stat(repo)
+        except (FileNotFoundError,NotADirectoryError): return True
+        except OSError: return False   # présent mais inaccessible (droits) : jamais « absent »
+        return False
 
     def boex(self,nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True):
         cfg=self.cfgreaded(nick,debug=debug)
@@ -6231,44 +6319,57 @@ class BorgHelper:
         if '%' not in sql_pat and '_' not in sql_pat: sql_pat='%'+sql_pat+'%'
         rows=[]
         results={} if as_json else None
-        for n in nick.split(','):
-            db_path=self.db.get_diff_db(n)
-            self.db.ensure_diff_db(db_path,create=False)
-            if self.db._is_index_empty(n,db_path):
-                msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
-                if as_json: results[n]={'error':msg}
-                else: printer(f"[ERREUR] {msg}")
-                continue
+        # 1.0.167 (story 30, A47) : un nick qui s'arrête (base chiffrée inutilisable, illisible, schéma plus récent) n'arrête
+        # plus les autres ; nick seul ou tous en échec : relancé comme avant ; Ctrl-C jamais avalé (_nick_stop_msg).
+        _nicks=nick.split(','); _multi=len(_nicks)>1; _ko=0; _stop=None
+        for n in _nicks:
+            _mk=_print_mark()
             try:
-                conn=_open_db(db_path,nick=n,role='read')
-                af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
-                psql,pprm,pyf=_psel_like(conn,sql_pat)
-                def _fetch(q,params,key):
-                    out=[]
-                    for r in conn.execute(q,params):
-                        r=list(r); r[4]=_path_decode(conn,r[4])
-                        if pyf and not pyf(r[4]): continue
-                        out.append(tuple(r))
-                    # ORDER BY <colonne>,path en Python (NULL en premier comme SQLite ; chemin à l'ordre octet UTF-8)
-                    out.sort(key=lambda r:(r[key] is not None,r[key] or '',_path_sort_key(r[4])))
-                    return out
-                n_rows=_fetch("SELECT nick,archive_new_date,archive_new,change_type,path,size_before,size_after FROM diff_index WHERE nick=?"+_wh(psql)+af_sql,[n]+pprm+af_params,1)
-                df,dt=_snap_params(af_params,archive_from,archive_to)
-                snap_extra=[x for x in [df,dt] if x]
-                n_rows+=_fetch("SELECT nick,archive_date,archive,'présent',path,NULL,size FROM archive_snapshot_v WHERE nick=?"+_wh(psql)+" "+_snap_notin(df,dt),[n]+pprm+snap_extra,2)
-                conn.close()
-            except DbCodecError as e:
-                msg=_codec_fail(n,e,conn)
-                if as_json: results[n]={'error':msg}
-                continue
-            except sqlite3.Error as e:
-                if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
-                else: printer(f"SQLite error ({db_path}): {e}")
-                continue
-            rows.extend(n_rows)
-            if as_json:
-                results[n]=[{'date':(d or '')[:19],'archive':a,'type':t,'path':p,'size_before':sb,'size_after':sa}
-                            for _,d,a,t,p,sb,sa in n_rows]
+                db_path=self.db.get_diff_db(n)
+                self.db.ensure_diff_db(db_path,create=False)
+                if self.db._is_index_empty(n,db_path):
+                    msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
+                    if as_json: results[n]={'error':msg}
+                    else: printer(f"[ERREUR] {msg}")
+                    continue
+                try:
+                    conn=_open_db(db_path,nick=n,role='read')
+                    af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
+                    psql,pprm,pyf=_psel_like(conn,sql_pat)
+                    def _fetch(q,params,key):
+                        out=[]
+                        for r in conn.execute(q,params):
+                            r=list(r); r[4]=_path_decode(conn,r[4])
+                            if pyf and not pyf(r[4]): continue
+                            out.append(tuple(r))
+                        # ORDER BY <colonne>,path en Python (NULL en premier comme SQLite ; chemin à l'ordre octet UTF-8)
+                        out.sort(key=lambda r:(r[key] is not None,r[key] or '',_path_sort_key(r[4])))
+                        return out
+                    n_rows=_fetch("SELECT nick,archive_new_date,archive_new,change_type,path,size_before,size_after FROM diff_index WHERE nick=?"+_wh(psql)+af_sql,[n]+pprm+af_params,1)
+                    df,dt=_snap_params(af_params,archive_from,archive_to)
+                    snap_extra=[x for x in [df,dt] if x]
+                    n_rows+=_fetch("SELECT nick,archive_date,archive,'présent',path,NULL,size FROM archive_snapshot_v WHERE nick=?"+_wh(psql)+" "+_snap_notin(df,dt),[n]+pprm+snap_extra,2)
+                    conn.close()
+                except DbCodecError as e:
+                    msg=_codec_fail(n,e,conn)
+                    if as_json: results[n]={'error':msg}
+                    continue
+                except sqlite3.Error as e:
+                    if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
+                    else: printer(f"SQLite error ({db_path}): {e}")
+                    continue
+                rows.extend(n_rows)
+                if as_json:
+                    results[n]=[{'date':(d or '')[:19],'archive':a,'type':t,'path':p,'size_before':sb,'size_after':sa}
+                                for _,d,a,t,p,sb,sa in n_rows]
+            except _NICK_STOP as _e:
+                _msg=_nick_stop_msg(_e,_mk,_multi)
+                if _msg is None: raise
+                if as_json: results[n]={'error':_msg}
+                try: conn.close()   # connexion du nick arrêté (ou déjà fermée / inexistante)
+                except Exception: pass
+                _ko+=1; _stop=_e if _stop is None else _stop   # tous en échec : la PREMIÈRE erreur, comme avant
+        if _stop is not None and _ko==len(_nicks): raise _stop   # tous en échec : comme un nick seul
         if as_json:
             print(json.dumps(results,ensure_ascii=False,indent=2)); return
         if not rows: print("Aucun résultat."); return
@@ -6283,33 +6384,46 @@ class BorgHelper:
         """as_json : voir search() — même forme par-nick, list ou {'error':msg}."""
         rows=[]
         results={} if as_json else None
-        for n in nick.split(','):
-            db_path=self.db.get_diff_db(n)
-            self.db.ensure_diff_db(db_path,create=False)
-            if self.db._is_index_empty(n,db_path):
-                msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
-                if as_json: results[n]={'error':msg}
-                else: printer(f"[ERREUR] {msg}")
-                continue
+        # 1.0.167 (story 30, A47) : un nick qui s'arrête (base chiffrée inutilisable, illisible, schéma plus récent) n'arrête
+        # plus les autres ; nick seul ou tous en échec : relancé comme avant ; Ctrl-C jamais avalé (_nick_stop_msg).
+        _nicks=nick.split(','); _multi=len(_nicks)>1; _ko=0; _stop=None
+        for n in _nicks:
+            _mk=_print_mark()
             try:
-                conn=_open_db(db_path,nick=n,role='read')
-                af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
-                pstored=_path_stored(conn,path)
-                cur=conn.execute("SELECT nick,archive_new_date,archive_old,archive_new,change_type,size_before,size_after FROM diff_index WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date,id",[n,pstored]+af_params)
-                n_rows=cur.fetchall()
-                df,dt=_snap_params(af_params,archive_from,archive_to)
-                snap_extra=[x for x in [df,dt] if x]
-                cur=conn.execute("SELECT nick,archive_date,'',archive,'présent',NULL,size FROM archive_snapshot_v WHERE nick=? AND path=? "+_snap_notin(df,dt),[n,pstored]+snap_extra)
-                n_rows+=cur.fetchall(); conn.close()
-            except sqlite3.Error as e:
-                if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
-                else: printer(f"SQLite error ({db_path}): {e}")
-                continue
-            n_rows.sort(key=lambda r:(r[1] or ''))
-            rows.extend(n_rows)
-            if as_json:
-                results[n]=[{'date':(d or '')[:19],'archive_before':ao,'archive_after':an,'type':t,'size_before':sb,'size_after':sa}
-                            for _,d,ao,an,t,sb,sa in n_rows]
+                db_path=self.db.get_diff_db(n)
+                self.db.ensure_diff_db(db_path,create=False)
+                if self.db._is_index_empty(n,db_path):
+                    msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
+                    if as_json: results[n]={'error':msg}
+                    else: printer(f"[ERREUR] {msg}")
+                    continue
+                try:
+                    conn=_open_db(db_path,nick=n,role='read')
+                    af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
+                    pstored=_path_stored(conn,path)
+                    cur=conn.execute("SELECT nick,archive_new_date,archive_old,archive_new,change_type,size_before,size_after FROM diff_index WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date,id",[n,pstored]+af_params)
+                    n_rows=cur.fetchall()
+                    df,dt=_snap_params(af_params,archive_from,archive_to)
+                    snap_extra=[x for x in [df,dt] if x]
+                    cur=conn.execute("SELECT nick,archive_date,'',archive,'présent',NULL,size FROM archive_snapshot_v WHERE nick=? AND path=? "+_snap_notin(df,dt),[n,pstored]+snap_extra)
+                    n_rows+=cur.fetchall(); conn.close()
+                except sqlite3.Error as e:
+                    if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
+                    else: printer(f"SQLite error ({db_path}): {e}")
+                    continue
+                n_rows.sort(key=lambda r:(r[1] or ''))
+                rows.extend(n_rows)
+                if as_json:
+                    results[n]=[{'date':(d or '')[:19],'archive_before':ao,'archive_after':an,'type':t,'size_before':sb,'size_after':sa}
+                                for _,d,ao,an,t,sb,sa in n_rows]
+            except _NICK_STOP as _e:
+                _msg=_nick_stop_msg(_e,_mk,_multi)
+                if _msg is None: raise
+                if as_json: results[n]={'error':_msg}
+                try: conn.close()   # connexion du nick arrêté (ou déjà fermée / inexistante)
+                except Exception: pass
+                _ko+=1; _stop=_e if _stop is None else _stop   # tous en échec : la PREMIÈRE erreur, comme avant
+        if _stop is not None and _ko==len(_nicks): raise _stop   # tous en échec : comme un nick seul
         if as_json:
             print(json.dumps(results,ensure_ascii=False,indent=2)); return
         if not rows: print(f"Aucune entrée pour : {path}"); return
@@ -6595,28 +6709,41 @@ class BorgHelper:
         # présents, même sans événement dans la plage demandée), pas seulement ce qui a changé.
         prefix=_norm_lp((prefix or '').strip())
         results={}
-        for n in nick.split(','):
-            db_path=self.db.get_diff_db(n)
-            self.db.ensure_diff_db(db_path,create=False)
-            if self.db._is_index_empty(n,db_path):
-                msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
-                if as_json: results[n]={'error':msg}
-                else: printer(f"[ERREUR] {msg}")
-                continue
+        # 1.0.167 (story 30, A47) : un nick qui s'arrête (base chiffrée inutilisable, illisible, schéma plus récent) n'arrête
+        # plus les autres ; nick seul ou tous en échec : relancé comme avant ; Ctrl-C jamais avalé (_nick_stop_msg).
+        _nicks=nick.split(','); _multi=len(_nicks)>1; _ko=0; _stop=None
+        for n in _nicks:
+            _mk=_print_mark()
             try:
-                conn=_open_db(db_path,nick=n,role='read')
-                if changes:  # -X (1.0.133) : seulement ce qui a changé entre -b (exclue) et -B (incluse)
-                    result=self._treehist_changes(n,prefix,conn,archive_from=archive_from,archive_to=archive_to,as_json=as_json)
-                else:
-                    result=self._treehist_listing(n,prefix,conn,archive_from=archive_from,archive_to=archive_to,debug=debug,as_json=as_json)
-                if as_json: results[n]=result
-                conn.close()
-            except DbCodecError as e:
-                msg=_codec_fail(n,e,conn)
-                if as_json: results[n]={'error':msg}
-            except sqlite3.Error as e:
-                if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
-                else: printer(f"SQLite error ({db_path}): {e}")
+                db_path=self.db.get_diff_db(n)
+                self.db.ensure_diff_db(db_path,create=False)
+                if self.db._is_index_empty(n,db_path):
+                    msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
+                    if as_json: results[n]={'error':msg}
+                    else: printer(f"[ERREUR] {msg}")
+                    continue
+                try:
+                    conn=_open_db(db_path,nick=n,role='read')
+                    if changes:  # -X (1.0.133) : seulement ce qui a changé entre -b (exclue) et -B (incluse)
+                        result=self._treehist_changes(n,prefix,conn,archive_from=archive_from,archive_to=archive_to,as_json=as_json)
+                    else:
+                        result=self._treehist_listing(n,prefix,conn,archive_from=archive_from,archive_to=archive_to,debug=debug,as_json=as_json)
+                    if as_json: results[n]=result
+                    conn.close()
+                except DbCodecError as e:
+                    msg=_codec_fail(n,e,conn)
+                    if as_json: results[n]={'error':msg}
+                except sqlite3.Error as e:
+                    if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
+                    else: printer(f"SQLite error ({db_path}): {e}")
+            except _NICK_STOP as _e:
+                _msg=_nick_stop_msg(_e,_mk,_multi)
+                if _msg is None: raise
+                if as_json: results[n]={'error':_msg}
+                try: conn.close()   # connexion du nick arrêté (ou déjà fermée / inexistante)
+                except Exception: pass
+                _ko+=1; _stop=_e if _stop is None else _stop   # tous en échec : la PREMIÈRE erreur, comme avant
+        if _stop is not None and _ko==len(_nicks): raise _stop   # tous en échec : comme un nick seul
         if as_json:
             print(json.dumps(results,ensure_ascii=False,indent=2))
 
@@ -6697,25 +6824,38 @@ class BorgHelper:
     def treefind(self,nick,prefix=None,pattern=None,debug=0,as_json=False):
         prefix=_norm_lp((prefix or '').strip())
         results={}
-        for n in nick.split(','):
-            db_path=self.db.get_diff_db(n)
-            self.db.ensure_diff_db(db_path,create=False)
-            if self.db._is_index_empty(n,db_path):
-                msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
-                if as_json: results[n]={'error':msg}
-                else: printer(f"[ERREUR] {msg}")
-                continue
+        # 1.0.167 (story 30, A47) : un nick qui s'arrête (base chiffrée inutilisable, illisible, schéma plus récent) n'arrête
+        # plus les autres ; nick seul ou tous en échec : relancé comme avant ; Ctrl-C jamais avalé (_nick_stop_msg).
+        _nicks=nick.split(','); _multi=len(_nicks)>1; _ko=0; _stop=None
+        for n in _nicks:
+            _mk=_print_mark()
             try:
-                conn=_open_db(db_path,nick=n,role='read')
-                result=self._treefind_listing(n,prefix,pattern,conn,debug=debug,as_json=as_json)
-                if as_json: results[n]=result
-                conn.close()
-            except DbCodecError as e:
-                msg=_codec_fail(n,e,conn)
-                if as_json: results[n]={'error':msg}
-            except sqlite3.Error as e:
-                if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
-                else: printer(f"SQLite error ({db_path}): {e}")
+                db_path=self.db.get_diff_db(n)
+                self.db.ensure_diff_db(db_path,create=False)
+                if self.db._is_index_empty(n,db_path):
+                    msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
+                    if as_json: results[n]={'error':msg}
+                    else: printer(f"[ERREUR] {msg}")
+                    continue
+                try:
+                    conn=_open_db(db_path,nick=n,role='read')
+                    result=self._treefind_listing(n,prefix,pattern,conn,debug=debug,as_json=as_json)
+                    if as_json: results[n]=result
+                    conn.close()
+                except DbCodecError as e:
+                    msg=_codec_fail(n,e,conn)
+                    if as_json: results[n]={'error':msg}
+                except sqlite3.Error as e:
+                    if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
+                    else: printer(f"SQLite error ({db_path}): {e}")
+            except _NICK_STOP as _e:
+                _msg=_nick_stop_msg(_e,_mk,_multi)
+                if _msg is None: raise
+                if as_json: results[n]={'error':_msg}
+                try: conn.close()   # connexion du nick arrêté (ou déjà fermée / inexistante)
+                except Exception: pass
+                _ko+=1; _stop=_e if _stop is None else _stop   # tous en échec : la PREMIÈRE erreur, comme avant
+        if _stop is not None and _ko==len(_nicks): raise _stop   # tous en échec : comme un nick seul
         if as_json:
             print(json.dumps(results,ensure_ascii=False,indent=2))
 
@@ -7844,6 +7984,11 @@ class BorgHelper:
             for i in ['derniere','taille','recuperable','reste']:
                 if (i in tcmpl[nick].keys()) and not(tcmpl[nick][i] is None): tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
                 else: tcmpl[nick][i]=""
+            if tcmpl[nick]['reste']=="" and self.borg.repoLocalAbsent(nick):   # 1.0.167 (jumelles) : disque démonté, chemin faux
+                tcmpl[nick]['reste']="⚠ dépôt absent"; errcode=2   # code 2 + nick en alerte (décision de l'utilisateur)
+                if htrep:
+                    if nick not in errhost: errhost.append(nick)
+                elif not str(tcmpl[nick]['nom']).startswith('*'): tcmpl[nick]['nom']=f"*** {nick}"
             sd=tcmpl[nick].pop('size_delta_last','—')
             if sd!='—': tcmpl[nick]['derniere']+=f" ({sd})"
             tcmpl[nick]['depuis']=f"{tcmpl[nick]['depuis']:.2f} h"
@@ -7903,6 +8048,7 @@ class BorgHelper:
                     errcode=2; err_msg="base illisible (voir message)"; printer(f"[ERREUR] {nick}: {err_msg}")
                 else:
                     errcode=2; printer(f"[ERREUR] {nick}: {e}"); err_msg=str(e)[:80]
+                if self.borg.repoLocalAbsent(nick): err_msg="dépôt absent"   # 1.0.167 : borg info échoue, cause lisible
                 if htrep:
                     errhost.append(nick)
                     reshos[nick]={'nom':nick,'duree':'—','depuis':'ERREUR','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {err_msg}"}
@@ -7931,6 +8077,11 @@ class BorgHelper:
             for i in ['derniere','taille','recuperable','reste']:
                 if (i in tcmpl[nick].keys()) and not(tcmpl[nick][i] is None): tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
                 else: tcmpl[nick][i]=""
+            if tcmpl[nick]['reste']=="" and self.borg.repoLocalAbsent(nick):   # 1.0.167 (jumelles) : disque démonté, chemin faux
+                tcmpl[nick]['reste']="⚠ dépôt absent"; errcode=2   # code 2 + nick en alerte (décision de l'utilisateur)
+                if htrep:
+                    if nick not in errhost: errhost.append(nick)
+                elif not str(tcmpl[nick]['nom']).startswith('*'): tcmpl[nick]['nom']=f"*** {nick}"
             sd=tcmpl[nick].pop('size_delta_last','—')
             if sd!='—': tcmpl[nick]['derniere']+=f" ({sd})"
             tcmpl[nick]['depuis']=f"{tcmpl[nick]['depuis']:.2f} h"
@@ -10147,6 +10298,199 @@ def codec_selftest(pattern=None,list_only=False):
             if not ok: print(f"  arrêt {stopped} {dt:.1f} s tampon {stamp} mémo {b.db._reader_skip_fresh(q2)} refus bo3 {refused}")
             return ok
         check("base occupée : cache.db tenue lue sans arrêt ni tampon, plus récente refusée",_busy_cache)
+        # 1.0.167 (story 30, A47) : lecteurs multi-nicks — un nick qui s'arrête n'efface plus les autres
+        def _mn_cli(cmd,check_fn):
+            """Vrai processus CLI : `-n qe,qp -P fausse` (qe chiffrée : vraie DbKeyError ; qp en clair : la passphrase ne sert
+            pas). rc au même nom que celui de bhq (bases partagées), CACHE_DIR explicite, Sentry neutralisé."""
+            _q_build('qe',True); _q_build('qp',False)
+            d=os.path.join(tmp,'cli-mn'); os.makedirs(d,exist_ok=True); rc=os.path.join(d,'qrc')
+            with open(qrc) as f: body=f.read()
+            with open(rc,'w') as f: f.write(f"[DEFAULT]\nCACHE_DIR={qcache}\n\n"+body)
+            os.chmod(rc,0o600)
+            nodsn=os.path.join(tmp,'sentry-vide'); open(nodsn,'w').close()
+            env=dict(os.environ,BORGHELPERC_SENTRY_FILE=nodsn); env.pop('BORGHELPERC_SENTRY_DSN',None)
+            r=subprocess.run([sys.executable,os.path.realpath(__file__),'-C',rc,'-n','qe,qp','-P','fausse']+cmd,
+                             capture_output=True,text=True,env=env,timeout=120,stdin=subprocess.DEVNULL)
+            ok=(r.returncode==0 and 'Traceback' not in r.stderr
+                and '[ERREUR] DbKeyError : qe: passphrase incorrecte ou en-tête altéré' in r.stderr and check_fn(r.stdout,r.stderr))
+            if not ok: print(f"  {cmd} : code {r.returncode} ; stdout {r.stdout[:300]!r} ; stderr {r.stderr[-300:]!r}")
+            return ok
+        _MN_ERR={'error':'DbKeyError : qe: passphrase incorrecte ou en-tête altéré'}
+        def _mn_json(out):
+            try: return json.loads(out)
+            except ValueError: return None
+        for _lbl,_cmd,_fn in (
+                ("Search -j",['-c','Search','-j','-f','passwd'],
+                 lambda o,e:(lambda j: j is not None and j.get('qe')==_MN_ERR and isinstance(j.get('qp'),list) and len(j['qp'])>0)(_mn_json(o))),
+                ("FileHist -j",['-c','FileHist','-j','-f','etc/passwd'],
+                 lambda o,e:(lambda j: j is not None and j.get('qe')==_MN_ERR and isinstance(j.get('qp'),list) and len(j['qp'])>0)(_mn_json(o))),
+                ("TreeHist -j",['-c','TreeHist','-j'],
+                 lambda o,e:(lambda j: j is not None and j.get('qe')==_MN_ERR and isinstance(j.get('qp'),dict) and 'error' not in j['qp'])(_mn_json(o))),
+                ("TreeFind -j",['-c','TreeFind','-j','-m','*'],
+                 lambda o,e:(lambda j: j is not None and j.get('qe')==_MN_ERR and isinstance(j.get('qp'),dict) and 'error' not in j['qp'])(_mn_json(o))),
+                ("DuIdx -j (global)",['-c','DuIdx','-j'],lambda o,e: bool(_mn_json(o))),
+                ("DuIdx -j (groupé)",['-c','DuIdx','-j','-f','etc/*'],lambda o,e: bool(_mn_json(o))),
+                ("DuIdx -R (brut)",['-c','DuIdx','-R','-j'],lambda o,e:(lambda j: j is not None and len(j.get('rows') or [])>0)(_mn_json(o))),
+                ("IdxTop texte",['-c','IdxTop'],lambda o,e: 'qp — top' in e),
+                ("DiffTop texte",['-c','DiffTop'],lambda o,e: 'qp — top' in e)):   # ArchiveHistory texte n'ouvre aucune base
+            check(f"multi-nicks : {_lbl}, qe en échec (passphrase fausse), qp gardé, code 0 (CLI)",
+                  (lambda c,f: (lambda: _mn_cli(c,f)))(_cmd,_fn))
+        def _mn_patched(kind,bad):
+            """(open_db, ensure_diff_db) remplacés : les nicks de `bad` s'arrêtent comme en vrai — 'corrupt' : sys.exit de
+            _db_schema_fail ; 'schema' : SchemaVersionError ; 'ctrlc' : sys.exit(130) ; 'key' : DbKeyError à l'ouverture."""
+            g=globals(); orig_open=g['_open_db']; orig_ens=bhq.db.ensure_diff_db
+            paths={bhq.db.get_diff_db(b):b for b in bad}
+            def op(p,*a,**kw):
+                if kind=='key' and kw.get('nick') in bad: raise DbKeyError(f"{kw['nick']}: passphrase incorrecte ou en-tête altéré")
+                return orig_open(p,*a,**kw)
+            def ens(p,create=True):
+                if p in paths:
+                    if kind=='corrupt': _db_schema_fail(p,sqlite3.DatabaseError('database disk image is malformed'),"l'index")
+                    if kind=='schema': raise SchemaVersionError(f"({p}) schéma DB v99 > attendu v{DIFF_DB_SCHEMA_VERSION}")
+                    if kind=='ctrlc': sys.exit(130)
+                return orig_ens(p,create=create)
+            return op,ens
+        def _mn_inproc(kind,bad,nicks):
+            """bhq.search(nicks) avec les arrêts simulés -> (sortie JSON ou None, exception levée ou None)."""
+            _q_build('qe',True); _q_build('qp',False)
+            op,ens=_mn_patched(kind,bad); g=globals(); orig=g['_open_db']; o=io.StringIO(); exc=None
+            g['_open_db']=op
+            try:
+                with mock.patch.object(bhq.db,'ensure_diff_db',ens),contextlib.redirect_stdout(o),contextlib.redirect_stderr(io.StringIO()):
+                    bhq.search(nicks,'passwd',as_json=True)
+            except BaseException as e:
+                if isinstance(e,KeyboardInterrupt): raise
+                exc=e
+            finally: g['_open_db']=orig
+            return _mn_json(o.getvalue()),exc
+        def _mn_corrupt():
+            """qe illisible (DB corrompue, sys.exit) : message réel (dernière [ERREUR] et son détail), qp gardé."""
+            j,exc=_mn_inproc('corrupt',{'qe'},'qe,qp')
+            msg=(j or {}).get('qe',{}).get('error','') if isinstance((j or {}).get('qe'),dict) else ''
+            ok=exc is None and msg.startswith('DB corrompue : ') and 'database disk image is malformed' in msg and len((j or {}).get('qp') or [])>0
+            if not ok: print(f"  exc {exc!r} ; qe {msg!r} ; qp {type((j or {}).get('qp'))}")
+            return ok
+        check("multi-nicks : base illisible (sys.exit) -> message réel par nick, autres gardés",_mn_corrupt)
+        def _mn_schema():
+            j,exc=_mn_inproc('schema',{'qe'},'qe,qp')
+            msg=(j or {}).get('qe',{}).get('error','') if isinstance((j or {}).get('qe'),dict) else ''
+            ok=exc is None and msg.startswith('SchemaVersionError : (') and 'v99 > attendu' in msg and len((j or {}).get('qp') or [])>0
+            if not ok: print(f"  exc {exc!r} ; qe {msg!r}")
+            return ok
+        check("multi-nicks : schéma plus récent -> message réel par nick, autres gardés",_mn_schema)
+        def _mn_all_failed():
+            """Tous les nicks en échec, ou nick seul : l'erreur est relancée comme avant (aucune sortie)."""
+            j1,e1=_mn_inproc('key',{'qe','qp'},'qe,qp'); j2,e2=_mn_inproc('key',{'qe'},'qe')
+            def boom(n): raise DbKeyError(f"{n}: passphrase incorrecte ou en-tête altéré")
+            seen=[]
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                m_all=raises(DbKeyError,lambda: _per_nick_main('qe,qp',boom))       # boucles texte de main : tous en échec
+                m_one=raises(DbKeyError,lambda: _per_nick_main('qe',boom))
+                _per_nick_main('qe,qp',lambda n: boom(n) if n=='qe' else seen.append(n))
+            ok=(isinstance(e1,DbKeyError) and j1 is None and isinstance(e2,DbKeyError) and j2 is None
+                and m_all and m_one and seen==['qp'])
+            if not ok: print(f"  tous : {e1!r} {j1} ; seul : {e2!r} {j2} ; boucle main : tous {m_all} seul {m_one} suivants {seen}")
+            return ok
+        check("multi-nicks : tous en échec ou nick seul -> erreur relancée, aucune sortie",_mn_all_failed)
+        def _mn_ctrlc():
+            j,exc=_mn_inproc('ctrlc',{'qe'},'qe,qp')
+            ok=isinstance(exc,SystemExit) and exc.code==130 and j is None
+            if not ok: print(f"  exc {exc!r} ; sortie {j}")
+            return ok
+        check("multi-nicks : Ctrl-C (130) d'un nick arrête la commande",_mn_ctrlc)
+        def _mn_call(kinds,call):
+            """call() avec des arrêts simulés par nick (kinds : nick -> 'key'|'corrupt'|'schema'|'ctrlc') -> (stdout, exception)."""
+            _q_build('qe',True); _q_build('qp',False)
+            g=globals(); orig_open=g['_open_db']; orig_ens=bhq.db.ensure_diff_db
+            paths={bhq.db.get_diff_db(n):k for n,k in kinds.items()}
+            def op(p,*a,**kw):
+                if kinds.get(kw.get('nick'))=='key': raise DbKeyError(f"{kw['nick']}: passphrase incorrecte ou en-tête altéré")
+                return orig_open(p,*a,**kw)
+            def ens(p,create=True):
+                k=paths.get(p)
+                if k=='corrupt': _db_schema_fail(p,sqlite3.DatabaseError('database disk image is malformed'),"l'index")
+                if k=='schema': raise SchemaVersionError(f"({p}) schéma DB v99 > attendu v{DIFF_DB_SCHEMA_VERSION}")
+                if k=='ctrlc': sys.exit(130)
+                return orig_ens(p,create=create)
+            o=io.StringIO(); exc=None; g['_open_db']=op
+            try:
+                with mock.patch.object(bhq.db,'ensure_diff_db',ens),contextlib.redirect_stdout(o),contextlib.redirect_stderr(io.StringIO()):
+                    call()
+            except BaseException as e:
+                if isinstance(e,KeyboardInterrupt): raise
+                exc=e
+            finally: g['_open_db']=orig_open
+            return o.getvalue(),exc
+        _MN_READERS=(('Search',lambda nk: bhq.search(nk,'passwd',as_json=True)),
+                     ('FileHist',lambda nk: bhq.filehist(nk,'etc/passwd',as_json=True)),
+                     ('TreeHist',lambda nk: bhq.treehist(nk,None,as_json=True)),
+                     ('TreeFind',lambda nk: bhq.treefind(nk,None,'*',as_json=True)),
+                     ('DuIdx global',lambda nk: bhq.duidx(nk,as_json=True)),
+                     ('DuIdx groupé',lambda nk: bhq.duidx(nk,'etc/*',as_json=True)),
+                     ('DuIdx brut',lambda nk: bhq.duidx(nk,as_json=True,raw=True)))
+        for _lbl,_fn in _MN_READERS:
+            def _mn_allfail(fn=_fn):
+                """Tous en échec (qe : DbKeyError, puis qp : DB corrompue) : la PREMIÈRE erreur relancée, aucune sortie."""
+                out,exc=_mn_call({'qe':'key','qp':'corrupt'},lambda: fn('qe,qp'))
+                ok=isinstance(exc,DbKeyError) and out==''
+                if not ok: print(f"  exception {exc!r} ; sortie {out[:200]!r}")
+                return ok
+            check(f"multi-nicks : {_lbl}, tous en échec -> première erreur relancée, aucune sortie",_mn_allfail)
+        for _lbl,_fn in _MN_READERS[4:]:
+            def _mn_du_partial(fn=_fn):
+                """DuIdx, qe en échec : sortie identique à celle de qp seul (totaux des autres nicks seulement)."""
+                part,exc=_mn_call({'qe':'key'},lambda: fn('qe,qp'))
+                alone,exc2=_mn_call({},lambda: fn('qp'))
+                ok=exc is None and exc2 is None and part.strip()!='' and part==alone
+                if not ok: print(f"  {exc!r} {exc2!r} ; partiel {part[:150]!r} ; seul {alone[:150]!r}")
+                return ok
+            check(f"multi-nicks : {_lbl}, qe en échec -> exactement la sortie de qp seul",_mn_du_partial)
+        def _mn_dfrepo():
+            """A49 : dfRepo sans shell — dépôt absent -> None (avant : ValueError) ; présent, avec espace dans le chemin ->
+            octets > 0 ; distant -> None. Report -o : `reste` « ⚠ dépôt absent » et l'archive du nick affichée ; Report direct
+            (jumelle, prep_report simulé) : même mention ; dépôt présent : taille."""
+            d,rc,paths=_busy_env(); b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            shutil.rmtree(os.path.join(d,'r-bo2'))
+            sp=os.path.join(d,'r avec espace'); os.makedirs(sp)
+            with open(rc,'a') as f: f.write(f"[bsp]\nBORG_REPO={sp}\n\n[bss]\nBORG_REPO=u@h:/r\n\n")
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            v=[b.borg.dfRepo(n) for n in ('bo2','bsp','bss')]
+            df_calls=[]; orig_run=subprocess.run
+            with mock.patch.object(subprocess,'run',side_effect=lambda *a,**k: df_calls.append(a[0]) or orig_run(*a,**k)):
+                b.borg.dfRepo('bss')   # dépôt distant : jamais de df
+            priv=os.path.join(d,'priv'); os.makedirs(os.path.join(priv,'repo'))
+            with open(rc,'a') as f: f.write(f"[bpv]\nBORG_REPO={os.path.join(priv,'repo')}\n\n")
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); os.chmod(priv,0)
+            try: denied=b.borg.repoLocalAbsent('bpv') if os.geteuid()!=0 else False   # root traverse tout : cas sans objet
+            finally: os.chmod(priv,0o700)
+            o=io.StringIO()
+            with contextlib.redirect_stdout(o),contextlib.redirect_stderr(io.StringIO()): code_off=b.report_offline('bo1,bo2',as_json=True)
+            rep=json.loads(o.getvalue()[o.getvalue().index('{'):])
+            def fake(nick,debug=0,maxp=None):
+                return ({nick:{'nom':nick,'date derniere':'x','depuis':1.0,'duree':1.0,'derniere':1,'taille':1,'recuperable':0,
+                               'reste':b.borg.dfRepo(nick),'modifications':'—','size_delta_last':'—'}},
+                        {'Prunable':{'name':'Prunable','original_size':0,'compressed_size':0,'deduplicated_size':0},
+                         'Totaux':{'name':'Totaux','original_size':0,'compressed_size':0,'deduplicated_size':0}})
+            o2=io.StringIO()
+            with mock.patch.object(b,'prep_report',fake),contextlib.redirect_stdout(o2),contextlib.redirect_stderr(io.StringIO()):
+                b.report('bo1,bo2',as_json=True)
+            rep2=json.loads(o2.getvalue()[o2.getvalue().index('{'):])
+            def fake_err(nick,debug=0,maxp=None):   # dépôt absent en vrai : borg info échoue (branche d'erreur de report)
+                if nick=='bo2': raise RuntimeError("Repository /x does not exist.")
+                return fake(nick)
+            o3=io.StringIO()
+            with mock.patch.object(b,'prep_report',fake_err),contextlib.redirect_stdout(o3),contextlib.redirect_stderr(io.StringIO()):
+                code_err=b.report('bo1,bo2',as_json=True)
+            rep3=json.loads(o3.getvalue()[o3.getvalue().index('{'):])
+            ok=(v[0] is None and isinstance(v[1],int) and v[1]>0 and v[2] is None and df_calls==[] and denied is False and code_off==2 and code_err==2
+                and rep['summary']['bo2']['reste']=='⚠ dépôt absent' and rep['summary']['bo2']['nom']=='*** bo2' and rep['summary']['bo1']['nom']=='bo1'
+                and rep3['summary']['bo2']['reste']=='⚠ dépôt absent'
+                and [k for k in rep['backups']['bo2'] if k not in ('Prunable','Totaux')]==['bo2-a1']
+                and rep['summary']['bo1']['reste'] not in ('','⚠ dépôt absent')
+                and rep2['summary']['bo2']['reste']=='⚠ dépôt absent' and rep2['summary']['bo1']['reste'] not in ('','⚠ dépôt absent'))
+            if not ok: print(f"  dfRepo {v} ; codes {code_off} {code_err} ; hors ligne {rep['summary'].get('bo2')} {list(rep['backups'].get('bo2',{}))} bo1 {rep['summary'].get('bo1',{}).get('reste')!r} ; direct {rep2['summary'].get('bo2')} ; erreur {rep3['summary'].get('bo2')}")
+            return ok
+        check("multi-nicks : dfRepo sans shell, dépôt local absent « ⚠ dépôt absent », code 2 et alerte dans Report (deux jumelles)",_mn_dfrepo)
         check("casse du préfixe (AD-16) : /Etc et /etc distincts dans les deux modes",lambda: (lambda p,e:p==e and 'Etc' in json.dumps(p) and 'passwd' not in json.dumps(p))(
               *_q_pair(bhq.treehist,'Etc',as_json=True,key=True)))
         check("préfixe a%b : le frère aXYZb n'apparaît jamais (plain et chiffré)",lambda: all('aXYZb' not in _q_run(bhq.treehist,n,'a%b',as_json=True)+_q_run(bhq.treefind,n,'a%b','*',as_json=True) for n in ('qp','qe')))
@@ -14427,6 +14771,71 @@ def codec_selftest(pattern=None,list_only=False):
             if not ok: print(f"  version {ver!r} ; {out} ; direct {live} ; HTML {(ch, want_bs in oh)} ; ArchiveHistory {ah} ; Status {st}")
             return ok
         _rbc("versions de borg sur vrai borg par ssh : serveur différent du créateur, commande forcée, échec du serveur",_bver_real_ssh)
+        # 1.0.167 (story 30) : Bkp -n ALL / liste avec plusieurs nicks internes — un nick après l'autre (vrai borg, CLI)
+        def _mb_env(tag,m1_mid='',m1_roots=None):
+            """Dépôts neufs m1, m2 (+ externe mx, écarté par -n ALL) ; wrapper BORG_EXE isolé ; m1 peut avoir son propre
+            wrapper (m1_mid) ou des racines absentes. -> (cli, compte d'archives par nick)."""
+            borg=shutil.which('borg'); me=os.path.realpath(__file__)
+            d=os.path.join(tmp,'mb-'+tag); bb=os.path.join(d,'bb'); src=os.path.join(d,'src'); os.makedirs(src)
+            with open(os.path.join(src,'f'),'w') as f: f.write('x')
+            rc=os.path.join(d,'rc'); w=os.path.join(d,'borgw'); w1=os.path.join(d,'borgw1')
+            _rb_wrapper(w,bb); _rb_wrapper(w1,bb,mid=m1_mid)
+            env=_rb_env(bb,BORG_PASSPHRASE='pw-mb'); fq=socket.getfqdn()
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n")
+                for nk in ('m1','m2','mx'):
+                    roots=m1_roots if (nk=='m1' and m1_roots) else src
+                    f.write(f"\n[{nk}]\nBORG_REPO={os.path.join(d,'repo-'+nk)}\nBORG_PASSPHRASE=pw-mb\nSER_NAME=mb\nSER_LOGIN=x\n"
+                            f"GLOB_ARCH={fq}-{nk}-*\nBORG_ARCHNAME={nk}\nBORG_ROOTBKP={roots}\nEXCLUDE=--exclude-caches\nDB_ENCRYPT=false\n"
+                            f"BORG_EXE={w1 if nk=='m1' else w}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\n"+("EXTERNAL=yes\n" if nk=='mx' else ""))
+            os.chmod(rc,0o600); cenv=_rb_cli_env(bb)
+            for nk in ('m1','m2','mx'):
+                r=_rb_run([borg,'init','-e','repokey',os.path.join(d,'repo-'+nk)],120,env=env)
+                if r.returncode!=0: raise RuntimeError(f"init {nk} : {r.stderr[-200:]}")
+            def cli(*a):
+                p=_rb_run([me,'-C',rc,'-c',*a],600,env=cenv); return p.returncode,p.stdout,p.stderr
+            def count(nk):
+                r=_rb_run([borg,'list','--short',os.path.join(d,'repo-'+nk)],120,env=env)
+                return len([l for l in r.stdout.splitlines() if l.strip()]) if r.returncode==0 else None
+            return cli,count
+        def _mb_objs(out):
+            """Objets JSON à la suite sur stdout -> noms d'archive, dans l'ordre (None si illisible)."""
+            dec=json.JSONDecoder(); i=0; names=[]
+            try:
+                while True:
+                    s=out[i:].lstrip()
+                    if not s: return names
+                    o,n=dec.raw_decode(s); names.append(o.get('archive',{}).get('name','')); i=len(out)-len(s)+n
+            except ValueError: return None
+        def _mb_all():
+            """Bkp -n ALL : m1 puis m2 sauvegardés (une archive chacun, Index de fin), externe mx écarté (information), code 0,
+            deux objets JSON à la suite dans l'ordre du rc."""
+            cli,count=_mb_env('all')
+            c,o,e=cli('Bkp','-n','ALL'); names=_mb_objs(o); fq=socket.getfqdn()
+            cnt=(count('m1'),count('m2'),count('mx'))
+            ok=(c==0 and cnt==(1,1,0) and names is not None and len(names)==2 and names[0].startswith(f"{fq}-m1-")
+                and names[1].startswith(f"{fq}-m2-") and 'mx: dépôt externe' in e and 'Ce serveur est inconnu' not in e)
+            if not ok: print(f"  code {c} ; archives {cnt} ; objets {names} ; stderr {e[-400:]!r}")
+            return ok
+        _rbc("multi-nicks : Bkp -n ALL, deux nicks internes sauvegardés à la suite, externe écarté (vrai borg)",_mb_all)
+        def _mb_first_fails():
+            """m1 sans aucun chemin à sauvegarder (code 2, rien lancé) : m2 sauvegardé quand même ; code global 2 (le pire) ;
+            un seul objet JSON (celui de m2)."""
+            cli,count=_mb_env('fail',m1_roots='/nulle/part/mb')
+            c,o,e=cli('Bkp','-n','m1,m2','-I'); names=_mb_objs(o)
+            ok=(c==2 and (count('m1'),count('m2'))==(0,1) and names is not None and len(names)==1
+                and '[ERREUR] m1: aucun chemin à sauvegarder présent' in e)
+            if not ok: print(f"  code {c} ; archives {(count('m1'),count('m2'))} ; objets {names} ; stderr {e[-300:]!r}")
+            return ok
+        _rbc("multi-nicks : Bkp, premier nick en échec, suivant sauvegardé, code le pire (vrai borg)",_mb_first_fails)
+        def _mb_ctrlc():
+            """Ctrl-C pendant le borg de m1 (le wrapper envoie SIGINT à borgHelper) : code 130, m2 jamais lancé."""
+            cli,count=_mb_env('int',m1_mid='kill -INT $PPID; sleep 30\n')
+            c,o,e=cli('Bkp','-n','m1,m2','-I')
+            ok=c==130 and (count('m1'),count('m2'))==(0,0)
+            if not ok: print(f"  code {c} ; archives {(count('m1'),count('m2'))} ; stderr {e[-300:]!r}")
+            return ok
+        _rbc("multi-nicks : Bkp, Ctrl-C pendant le premier nick, aucun suivant (vrai borg)",_mb_ctrlc)
         def _diff_type_change_split():
             """1.0.163 (story 26, A38) : parse_diff_entries_json — lignes mesurées sur borg 1.2.6 (m25b, m26b)."""
             L=lambda path,*ch: json.dumps({'path':path,'changes':list(ch)})
@@ -15041,7 +15450,27 @@ def _cli_main():
         if '-b' not in options or 'last' in options['-b']: usage(cmd)
         bh.delbkp(nick,options['-b'],debug=debug)
     elif cmd=='bkp':
-        bh.backup(nick,no_index=('-I' in options),debug=debug)
+        if ',' not in nick: bh.backup(nick,no_index=('-I' in options),debug=debug)
+        else:
+            # 1.0.167 (story 30, décisions de l'utilisateur) : -n ALL / liste -> un Bkp après l'autre, ordre du rc ; un nick
+            # en échec n'arrête pas les suivants ; code = le pire ; stdout = l'objet JSON de chaque nick, à la suite.
+            # backup() finit toujours par sys.exit : son code est celui du nick. Ctrl-C (130, KeyboardInterrupt) : arrêt.
+            _brc=0
+            for n in nick.split(','):
+                try:
+                    bh.backup(n,no_index=('-I' in options),debug=debug); _c=0
+                except SystemExit as _e:
+                    if _e.code==130: raise
+                    _c=_e.code if isinstance(_e.code,int) else (0 if _e.code is None else 1)
+                except (DbKeyError,DbModeError,DbTamperError,DbCodecError) as _e:   # comme le gestionnaire global
+                    printer(f"[ERREUR] {type(_e).__name__} : {_e}"); _c=2; bh.db.clear_priority_lock(n)
+                except SchemaVersionError as _e:   # ensure_diff_db au début du Bkp (hors de son except interne)
+                    printer(f"Erreur schéma DB : {_e}"); _c=1; bh.db.clear_priority_lock(n)
+                except Exception as _e:   # défaut inattendu d'un nick : signalé, les suivants sauvegardés quand même
+                    printer(f"[ERREUR] {n}: Bkp interrompu — {type(_e).__name__}: {_e}"); _c=1
+                    bh.db.clear_priority_lock(n)   # pris avant le try/finally de backup() : jamais gardé pour les suivants
+                if _c>_brc: _brc=_c
+            sys.exit(_brc)
     elif cmd=='prune':
         errcmd=0; ret={}
         if ',' in nick:
@@ -15122,20 +15551,17 @@ def _cli_main():
         if '-j' in options and len(nick.split(','))>1:
             printer("IdxTop -j ne supporte qu'un seul nick à la fois (pas nick=a,b ni ALL avec plusieurs nicks configurés)")
             usage(cmd)
-        for n in nick.split(','):
-            bh.idxtop(n,depth=_depth,topn=_topn,debug=debug,as_json=('-j' in options))
+        _per_nick_main(nick,lambda n: bh.idxtop(n,depth=_depth,topn=_topn,debug=debug,as_json=('-j' in options)))   # 1.0.167 (story 30, A47) : un nick en échec n'arrête plus les autres
     elif cmd=='repohistory':
         if '-j' in options and len(nick.split(','))>1:
             printer("RepoHistory -j ne supporte qu'un seul nick à la fois (pas nick=a,b ni ALL avec plusieurs nicks configurés)")
             usage(cmd)
-        for n in nick.split(','):
-            bh.repo_history(n,debug=debug,as_json=('-j' in options))
+        _per_nick_main(nick,lambda n: bh.repo_history(n,debug=debug,as_json=('-j' in options)))   # 1.0.167 (story 30, A47) : un nick en échec n'arrête plus les autres
     elif cmd=='archivehistory':
         if '-j' in options and len(nick.split(','))>1:
             printer("ArchiveHistory -j ne supporte qu'un seul nick à la fois (pas nick=a,b ni ALL avec plusieurs nicks configurés)")
             usage(cmd)
-        for n in nick.split(','):
-            bh.archive_history(n,debug=debug,as_json=('-j' in options))
+        _per_nick_main(nick,lambda n: bh.archive_history(n,debug=debug,as_json=('-j' in options)))   # 1.0.167 (story 30, A47) : un nick en échec n'arrête plus les autres
     elif cmd=='status':
         bh.status(nick,debug=debug,as_json=('-j' in options))
         if '-j' not in options:   # 1.0.160 : notice de nettoyage, texte et CLI seulement
@@ -15147,8 +15573,7 @@ def _cli_main():
         if '-j' in options and len(nick.split(','))>1:
             printer("DiffTop -j ne supporte qu'un seul nick à la fois (pas nick=a,b ni ALL avec plusieurs nicks configurés)")
             usage(cmd)
-        for n in nick.split(','):
-            bh.difftop(n,bkp=options.get('-b'),depth=_depth,topn=_topn,debug=debug,as_json=('-j' in options))
+        _per_nick_main(nick,lambda n: bh.difftop(n,bkp=options.get('-b'),depth=_depth,topn=_topn,debug=debug,as_json=('-j' in options)))   # 1.0.167 (story 30, A47) : un nick en échec n'arrête plus les autres
     elif cmd=='idxpurge':
         _dryrun='-D' in options
         for n in nick.split(','):
