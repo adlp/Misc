@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.165"
+Version="1.0.166"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -1677,6 +1677,12 @@ def _db_open_fail(db_path,e):
         printer(f"  -> {e}")
     sys.exit(1)
 
+# 1.0.166 (story 29) : attente maximale d'un LECTEUR (ensure_*_db create=False) sur le verrou d'écriture de la base d'un
+# nick (migration, réparation de vue, tampon de version) ; au-delà : base lue telle quelle, sans rien écrire. Les lectures
+# WAL n'attendent jamais : seul ce chemin d'écriture d'un lecteur bloquait (60 s puis sys.exit, Report -n ALL vide).
+_READER_WRITE_WAIT=2
+_READER_SKIP_TTL=60   # s : base trouvée occupée par un lecteur, lue telle quelle sans réessayer d'écrire pendant ce délai
+
 def _db_busy(e):
     """Vrai si l'erreur SQLite est un verrou tenu par un autre processus (locked/busy), pas une corruption."""
     return isinstance(e,sqlite3.OperationalError) and any(w in str(e).lower() for w in ('locked','busy'))
@@ -2092,6 +2098,9 @@ class BorgHelperDB:
         self._cfg_reader=cfg_reader  # callable(nick) -> configparser section | None
         self._hist_migrated=set()   # diff.db déjà ouvertes (migration vers history.db tentée) par ce processus
         self._hist_ready=set()      # history.db dont le schéma est garanti dans ce processus
+        self._reader_skipped={}     # 1.0.166 : base -> instant (monotonic) où un lecteur l'a trouvée occupée — lue telle quelle,
+                                    # sans réattendre _READER_WRITE_WAIT à chaque ouverture (Report : 4 par nick), pendant
+                                    # _READER_SKIP_TTL s (borgHelperWWW garde cet objet pour toute sa vie : nouvel essai ensuite)
         if cfg_reader is not None:
             _DB_CFG_READERS[os.path.realpath(cache_dir)]=cfg_reader  # résolution paresseuse de la passphrase par _open_db
 
@@ -2118,10 +2127,12 @@ class BorgHelperDB:
         diff=self.get_diff_db(nick)
         if diff not in self._hist_migrated:
             if os.path.exists(diff):
-                # Base occupée ou corrompue : ensure_diff_db a déjà affiché son message et fait sys.exit — un LECTEUR de
-                # mesures (Status -n ALL, get_repo_stats…) continue sur history.db telle quelle ; nouvel essai plus tard.
+                # Base corrompue : ensure_diff_db a déjà affiché son message et fait sys.exit ; base occupée (1.0.166) : entretien
+                # sauté sans erreur — un LECTEUR de mesures (Status -n ALL, get_repo_stats…) continue sur history.db telle
+                # quelle ; nouvel essai plus tard dans les deux cas (jamais marquée _hist_migrated).
                 try: self.ensure_diff_db(diff,create=False)
                 except SystemExit: return self.get_history_db(nick)
+                if self._reader_skip_fresh(diff): return self.get_history_db(nick)
             self._hist_migrated.add(diff)
         return self.get_history_db(nick)
 
@@ -2356,6 +2367,29 @@ class BorgHelperDB:
         except sqlite3.Error as e:
             return f"error: {e}"
 
+    def _reader_skip_fresh(self,db_path):
+        t=self._reader_skipped.get(db_path)
+        return t is not None and time.monotonic()-t<_READER_SKIP_TTL
+
+    @staticmethod
+    def _reader_busy_skip(conn,db_path,schema_version):
+        """1.0.166 (story 29) : un LECTEUR (ensure_*_db create=False) a trouvé le verrou d'écriture tenu (migration ou Index
+        d'un autre processus) pendant une écriture d'entretien (palier, vue, tampons de version). La transaction en cours
+        est annulée et l'entretien abandonné — paliers déjà validés gardés (chacun atomique), tampons en dernier, donc jamais
+        de schema_version avancé sur une migration sautée — et la base est lue telle quelle (WAL). Silencieux (décision de
+        l'utilisateur). Seul contrôle gardé : base d'un schéma plus récent que ce code -> SchemaVersionError, comme
+        _check_set_meta (lecture seule)."""
+        try:
+            if conn.in_transaction: conn.rollback()
+            row=conn.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()
+        except sqlite3.Error: row=None
+        finally: conn.close()
+        stored=int(row[0]) if row and str(row[0]).isdigit() else 0
+        if stored>schema_version:
+            raise SchemaVersionError(
+                f"({db_path}) schéma DB v{stored} > attendu v{schema_version} — "
+                "DB créée par une version plus récente de borgHelper, mettez à jour borgHelper.")
+
     def _check_set_meta(self,conn,schema_version,db_path,base_version=None):
         """schema_version = version maximale comprise ; base_version = version écrite dans une base
         plain (défaut : schema_version). Une base plain n'est réécrite qu'à base_version — égale à la maximale
@@ -2384,9 +2418,10 @@ class BorgHelperDB:
         « non indexé »/« cache vide » comme si la base existait mais était vide. Si le fichier existe
         déjà, comportement inchangé (migrations/_check_set_meta). Seuls Index/Bkp/indexsnap gardent
         le défaut create=True (créateurs légitimes, AD-12)."""
-        if not create and not _db_has_schema(db_path): return
+        if not create and (self._reader_skip_fresh(db_path) or not _db_has_schema(db_path)): return
+        conn=None
         try:
-            try: conn=_open_db(db_path,nick=None,role='admin',timeout=60)
+            try: conn=_open_db(db_path,nick=None,role='admin',timeout=60 if create else _READER_WRITE_WAIT)
             except sqlite3.OperationalError as e: _db_open_fail(db_path,e)
             _ensure_wal(conn)
             conn.executescript("""
@@ -2406,6 +2441,8 @@ class BorgHelperDB:
             self._check_set_meta(conn,CACHE_DB_SCHEMA_VERSION,db_path,CACHE_DB_BASE_SCHEMA_VERSION)
             conn.commit(); conn.close()
         except sqlite3.DatabaseError as e:
+            if not create and conn is not None and _db_busy(e):
+                self._reader_busy_skip(conn,db_path,CACHE_DB_SCHEMA_VERSION); self._reader_skipped[db_path]=time.monotonic(); return
             _db_schema_fail(db_path,e,'le cache')
 
     @staticmethod
@@ -2502,10 +2539,12 @@ class BorgHelperDB:
         """)
 
     def ensure_diff_db(self,db_path,create=True):
-        """create=False (AD-12) : voir ensure_cache_db — même contrat, réservé aux lecteurs."""
-        if not create and not _db_has_schema(db_path): return
+        """create=False (AD-12) : voir ensure_cache_db — même contrat, réservé aux lecteurs. Lecteur (1.0.166, story 29) :
+        verrou d'écriture tenu ailleurs plus de _READER_WRITE_WAIT s -> rien écrit, base lue telle quelle (_reader_busy_skip)."""
+        if not create and (self._reader_skip_fresh(db_path) or not _db_has_schema(db_path)): return
+        conn=None
         try:
-            try: conn=_open_db(db_path,nick=None,role='admin',timeout=60)
+            try: conn=_open_db(db_path,nick=None,role='admin',timeout=60 if create else _READER_WRITE_WAIT)
             except sqlite3.OperationalError as e: _db_open_fail(db_path,e)
             _ensure_wal(conn)
             conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
@@ -2642,6 +2681,8 @@ class BorgHelperDB:
             self._check_set_meta(conn,DIFF_DB_SCHEMA_VERSION,db_path,DIFF_DB_BASE_SCHEMA_VERSION)
             conn.commit(); conn.close()
         except sqlite3.DatabaseError as e:
+            if not create and conn is not None and _db_busy(e):
+                self._reader_busy_skip(conn,db_path,DIFF_DB_SCHEMA_VERSION); self._reader_skipped[db_path]=time.monotonic(); return
             _db_schema_fail(db_path,e,"l'index")
 
     def ensure_history_db(self,path,create=True):
@@ -7777,8 +7818,11 @@ class BorgHelper:
             cfg=self.borg.cfgreaded(nick,debug=debug)
             try:
                 (tcmpl,tbkps)=self.prep_report_from_db(nick,maxp=maxp)
-            except Exception as e:
-                errcode=2; err_msg=str(e)[:80]
+            except (Exception,SystemExit) as e:
+                # 1.0.166 (story 29) : base illisible (« DB corrompue » + sys.exit des ensure_*) : ligne du nick en erreur,
+                # les autres hôtes affichés — le message détaillé est déjà sur stderr ; Ctrl-C (code 130) : arrêt
+                if isinstance(e,SystemExit) and e.code==130: raise
+                errcode=2; err_msg="base illisible (voir message)" if isinstance(e,SystemExit) else str(e)[:80]
                 if htrep:
                     errhost.append(nick)
                     reshos[nick]={'nom':nick,'duree':'—','depuis':'—','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {err_msg}"}
@@ -7852,9 +7896,13 @@ class BorgHelper:
             self.db.wait_index_idle(nick,timeout=30)
             try:
                 (tcmpl,tbkps)=self.prep_report(nick,debug=debug,maxp=maxp)
-            except Exception as e:
+            except (Exception,SystemExit) as e:
                 self.db.clear_report_running_lock(nick)
-                errcode=2; printer(f"[ERREUR] {nick}: {e}"); err_msg=str(e)[:80]
+                if isinstance(e,SystemExit) and e.code==130: raise   # Ctrl-C pendant borg (boex -> sys.exit(130)) : arrêt
+                if isinstance(e,SystemExit):   # 1.0.166 (story 29) : jumelle de report_offline (bases, config)
+                    errcode=2; err_msg="base illisible (voir message)"; printer(f"[ERREUR] {nick}: {err_msg}")
+                else:
+                    errcode=2; printer(f"[ERREUR] {nick}: {e}"); err_msg=str(e)[:80]
                 if htrep:
                     errhost.append(nick)
                     reshos[nick]={'nom':nick,'duree':'—','depuis':'ERREUR','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {err_msg}"}
@@ -7943,7 +7991,7 @@ def codec_selftest(pattern=None,list_only=False):
         if not _selected(name): left_out[0]+=1; return
         if list_only: print(f"LIST {name}"); results.append(True); return
         try: ok=bool(fn()); err=''
-        except Exception as e: ok=False; err=f" ({type(e).__name__}: {e})"
+        except (Exception,SystemExit) as e: ok=False; err=f" ({type(e).__name__}: {e})"   # 1.0.166 : un sys.exit = FAIL, jamais la fin du run
         print(f"{'OK  ' if ok else 'FAIL'} {name}{err}"); results.append(ok)
     def skip(name,why):
         if _selected(name): skipped[0]+=1; print(f"SKIP {name} ({why})")
@@ -9822,6 +9870,283 @@ def codec_selftest(pattern=None,list_only=False):
             if not ok: print(f"  {out} ; Report {rep} ; {o.getvalue()[-300:]!r}")
             return ok
         check("versions de borg : Bkp en tunnel inverse simulé (local, autre machine) et SSH_REPO",_bver_tunnel)
+        # 1.0.166 (story 29) : un lecteur ne bloque plus sur la base d'un nick tenue ailleurs (migration, Index)
+        def _busy_env():
+            """rc à 3 nicks sans borg (bo1 : palier 10 + tampon ancien ; bo2 : tampon ancien ; bo3 : schéma plus récent sans
+            snap_excluded_stats) ; cache.db : tampon ancien (bo3 : schéma plus récent sans idx_cache_nom) ; renvoie (dossier,
+            rc, chemins diff.db par nick et cache.db par '<nick>-cache')."""
+            d=os.path.join(tmp,'busy29'); shutil.rmtree(d,ignore_errors=True); os.makedirs(d); rc=os.path.join(d,'rc')
+            for n in ('bo1','bo2','bo3'): os.makedirs(os.path.join(d,'r-'+n))
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nBORG_PASSPHRASE=pw\nSER_NAME=h\nSER_LOGIN=x\nGLOB_ARCH=*\n"
+                        f"BORG_ARCHNAME=t\nEXCLUDE=--exclude-caches\nDB_ENCRYPT=false\nMAX_AGE_BKP=1000000\n\n"
+                        +''.join(f"[{n}]\nBORG_REPO={os.path.join(d,'r-'+n)}\n\n" for n in ('bo1','bo2','bo3')))   # verrous par dépôt : un dépôt par nick
+            os.chmod(rc,0o600)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); paths={}
+            for n in ('bo1','bo2','bo3'):
+                p=paths[n]=b.db.get_diff_db(n)
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db.ensure_diff_db(p)
+                c=sqlite3.connect(p,isolation_level=None)
+                c.execute("INSERT INTO archive_stats VALUES(?,?,?,?,?,?,?,?)",(n,f'{n}-a1','2026-10-01T10:00:00.000000',60,10,10,10,1))
+                c.execute("UPDATE db_meta SET value='1.0.0' WHERE key='borghelper_version'")
+                if n=='bo1':
+                    c.executescript("BEGIN; DROP VIEW IF EXISTS archive_snapshot_v; CREATE TABLE sf_old (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                        " nick TEXT NOT NULL, path TEXT NOT NULL, size INTEGER, mtime TEXT, type TEXT, mode TEXT, owner TEXT, UNIQUE(nick,path));"
+                        " DROP TABLE snapshot_file; ALTER TABLE sf_old RENAME TO snapshot_file;"
+                        " UPDATE db_meta SET value='10' WHERE key='schema_version';"+_ARCHIVE_SNAPSHOT_V_SQL+"; COMMIT;")
+                if n=='bo3':
+                    c.execute("DROP TABLE snap_excluded_stats")
+                    c.execute("UPDATE db_meta SET value=? WHERE key='schema_version'",(str(DIFF_DB_SCHEMA_VERSION+1),))
+                c.close()
+                q=paths[n+'-cache']=b.db.get_cache_db(n)
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db.ensure_cache_db(q)
+                c=sqlite3.connect(q,isolation_level=None)
+                c.execute("UPDATE db_meta SET value='1.0.0' WHERE key='borghelper_version'")
+                if n=='bo3':
+                    c.execute("DROP INDEX idx_cache_nom")
+                    c.execute("UPDATE db_meta SET value=? WHERE key='schema_version'",(str(CACHE_DB_SCHEMA_VERSION+1),))
+                c.close()
+            return d,rc,paths
+        def _busy_hold(paths):
+            """Verrou d'écriture (BEGIN IMMEDIATE) tenu par un autre processus sur chaque base, comme une migration."""
+            code=("import sqlite3,sys,time\ncs=[sqlite3.connect(p,isolation_level=None) for p in sys.argv[1:]]\n"
+                  "[c.execute('BEGIN IMMEDIATE') for c in cs]\nprint('tenu',flush=True)\ntime.sleep(120)\n")
+            p=_rb_popen([sys.executable,'-c',code]+list(paths),stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,text=True)   # groupe à part, tué aussi par le finally du selftest
+            if p.stdout.readline().strip()!='tenu': _rb_killtree(p); raise RuntimeError("verrou non tenu")
+            return p
+        def _busy_meta(p):
+            c=sqlite3.connect(p)
+            try:
+                m=dict(c.execute("SELECT key,value FROM db_meta").fetchall())
+                return (m.get('schema_version'),m.get('borghelper_version'),any(r[2] for r in c.execute("PRAGMA index_list(snapshot_file)")))
+            finally: c.close()
+        def _busy_report(rc,d,nicks):
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); o=io.StringIO(); e=io.StringIO(); t0=time.time()
+            with contextlib.redirect_stdout(o),contextlib.redirect_stderr(e): code=b.report_offline(nicks,as_json=True)
+            out=o.getvalue()
+            return code,json.loads(out[out.index('{'):]),time.time()-t0,e.getvalue()
+        def _busy_fast():
+            """Migration tenue ailleurs sur bo1 (palier 10) et bo2 (tampon ancien) : Report -o des deux en moins de 15 s (défaut :
+            60 s par nick puis arrêt, sortie vide), deux nicks présents, rien sur stderr (silencieux, décision de l'utilisateur)."""
+            d,rc,paths=_busy_env(); h=_busy_hold([paths['bo1'],paths['bo2']])
+            try: code,rep,dt,err=_busy_report(rc,d,'bo1,bo2')
+            finally: _rb_killtree(h)
+            noms=[rep['summary'][n]['nom'] for n in ('bo1','bo2')] if all(n in rep['summary'] for n in ('bo1','bo2')) else None
+            err=''.join(l for l in err.splitlines(True)   # avertissement connu du selftest (registre de config), ligne exacte
+                        if not re.match(r"\[WARN\] bo[12]: base non chiffrée \(\S+/rc-bo[12]-diff\.db\) — lancer 'borgHelper -c DbEncrypt -n bo[12] -y'",l))
+            ok=code==0 and noms==['bo1','bo2'] and dt<15 and err==''
+            if not ok: print(f"  code {code} noms {noms} {dt:.1f} s stderr {err[-300:]!r}")
+            return ok
+        check("base occupée : Report -o multi-nicks rapide, migration tenue ailleurs, deux nicks présents, silencieux",_busy_fast)
+        def _busy_untouched():
+            """Même situation : bo1 ni migrée ni tamponnée (palier 10, index UNIQUE, tampon 1.0.0) ; bo2 non tamponnée."""
+            d,rc,paths=_busy_env(); h=_busy_hold([paths['bo1'],paths['bo2']])
+            try: _busy_report(rc,d,'bo1,bo2')
+            finally: _rb_killtree(h)
+            m1=_busy_meta(paths['bo1']); m2=_busy_meta(paths['bo2'])
+            ok=m1==('10','1.0.0',True) and m2==(str(DIFF_DB_SCHEMA_VERSION),'1.0.0',False)
+            if not ok: print(f"  bo1 {m1} bo2 {m2}")
+            return ok
+        check("base occupée : base sautée ni migrée ni tamponnée",_busy_untouched)
+        def _busy_free():
+            """Bases libres : le lecteur migre bo1 (palier 11, sans UNIQUE) et tamponne bo1 et bo2 (comme avant)."""
+            d,rc,paths=_busy_env(); _busy_report(rc,d,'bo1,bo2')
+            m1=_busy_meta(paths['bo1']); m2=_busy_meta(paths['bo2'])
+            ok=m1==(str(DIFF_DB_SCHEMA_VERSION),Version,False) and m2==(str(DIFF_DB_SCHEMA_VERSION),Version,False)
+            if not ok: print(f"  bo1 {m1} bo2 {m2}")
+            return ok
+        check("base occupée : base libre migrée et tamponnée par le lecteur",_busy_free)
+        def _busy_newer():
+            """bo3 : schéma plus récent que ce code, écriture d'entretien nécessaire (table absente), verrou tenu -> refus
+            (SchemaVersionError), jamais lue en silence."""
+            d,rc,paths=_busy_env(); refused=False
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); h=_busy_hold([paths['bo3']])
+            try:
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                    b.db.ensure_diff_db(paths['bo3'],create=False)
+            except SchemaVersionError: refused=True
+            finally: _rb_killtree(h)
+            if not refused: print("  bo3 lue sans refus")
+            return refused
+        check("base occupée : base d'un schéma plus récent refusée même occupée",_busy_newer)
+        def _busy_waits():
+            """Attente du verrou d'écriture : écrivain (create=True) 60 s comme avant, lecteur 2 s (valeurs en dur)."""
+            d,rc,paths=_busy_env(); seen=[]; g=globals(); orig=g['_open_db']
+            def spy(p,*a,**kw): seen.append(kw.get('timeout')); return orig(p,*a,**kw)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            g['_open_db']=spy
+            try:
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                    b.db.ensure_diff_db(paths['bo2']); w=list(seen); seen.clear()
+                    b.db.ensure_diff_db(paths['bo2'],create=False); r=list(seen); seen.clear()
+                    b.db.ensure_cache_db(b.db.get_cache_db('bo2')); wc=list(seen); seen.clear()
+                    b.db.ensure_cache_db(b.db.get_cache_db('bo2'),create=False); rc_=list(seen)
+            finally: g['_open_db']=orig
+            ok=w[:1]==[60] and r[:1]==[2] and wc[:1]==[60] and rc_[:1]==[2]
+            if not ok: print(f"  diff écrivain {w} lecteur {r} ; cache écrivain {wc} lecteur {rc_}")
+            return ok
+        check("base occupée : attente du verrou 60 s pour un écrivain, 2 s pour un lecteur (diff.db, cache.db)",_busy_waits)
+        def _busy_memo():
+            """bo1 occupée : 1er lecteur abandonne ; 2e ouverture du même processus sans aucune connexion (mémo) ; mémo de plus
+            de 60 s : nouvel essai ; verrou levé : un écrivain (create=True) du même processus migre quand même bo1."""
+            d,rc,paths=_busy_env(); p1=paths['bo1']; seen=[]; g=globals(); orig=g['_open_db']
+            def spy(p,*a,**kw):
+                if p==p1: seen.append(kw.get('timeout'))
+                return orig(p,*a,**kw)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); h=_busy_hold([p1])
+            try:
+                g['_open_db']=spy
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                    b.db.ensure_diff_db(p1,create=False); first=list(seen); seen.clear()
+                    b.db.ensure_diff_db(p1,create=False); second=list(seen); seen.clear()
+                    b.db._reader_skipped[p1]=time.monotonic()-61
+                    b.db.ensure_diff_db(p1,create=False); third=list(seen); seen.clear()
+            finally:
+                g['_open_db']=orig; _rb_killtree(h)
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db.ensure_diff_db(p1)
+            m=_busy_meta(p1)
+            ok=first==[2] and second==[] and third==[2] and m==(str(DIFF_DB_SCHEMA_VERSION),Version,False)
+            if not ok: print(f"  ouvertures {first} {second} {third} ; après écrivain {m}")
+            return ok
+        check("base occupée : abandon mémorisé 60 s par processus, jamais pour un écrivain",_busy_memo)
+        def _busy_writer():
+            """Écrivain (create=True) sur bo2 tenue : arrêt « DB occupée » comme avant (attente ramenée à 1 s pour le test),
+            jamais un abandon silencieux ni une base mémorisée."""
+            d,rc,paths=_busy_env(); p2=paths['bo2']; g=globals(); orig=g['_open_db']; e=io.StringIO()
+            def short(p,*a,**kw):
+                if p==p2 and kw.get('timeout')==60: kw['timeout']=1
+                return orig(p,*a,**kw)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); h=_busy_hold([p2])
+            try:
+                g['_open_db']=short
+                with contextlib.redirect_stdout(e),contextlib.redirect_stderr(e):
+                    stopped=raises(SystemExit,lambda: b.db.ensure_diff_db(p2))
+            finally:
+                g['_open_db']=orig; _rb_killtree(h)
+            ok=stopped and 'DB occupée' in e.getvalue() and not b.db._reader_skip_fresh(p2)
+            if not ok: print(f"  arrêt {stopped} mémo {b.db._reader_skip_fresh(p2)} {e.getvalue()[-200:]!r}")
+            return ok
+        check("base occupée : écrivain sur base tenue toujours arrêté (DB occupée)",_busy_writer)
+        def _busy_hist_retry():
+            """history_path (lecteurs de mesures : Status, /access) sur bo2 tenue : diff.db jamais notée _hist_migrated (nouvel
+            essai d'entretien ensuite) ; verrou levé, mémo expiré : notée après un entretien réel."""
+            d,rc,paths=_busy_env(); p2=paths['bo2']; b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); h=_busy_hold([p2])
+            try:
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db.history_path('bo2')
+                busy=p2 in b.db._hist_migrated
+            finally: _rb_killtree(h)
+            b.db._reader_skipped.clear()
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db.history_path('bo2')
+            free=p2 in b.db._hist_migrated
+            ok=busy is False and free is True
+            if not ok: print(f"  notée pendant le verrou {busy}, après {free}")
+            return ok
+        check("base occupée : mesures (history_path) — entretien sauté jamais noté fait",_busy_hist_retry)
+        def _busy_corrupt():
+            """Lecteur, erreur SQLite qui n'est pas un verrou pendant l'entretien (« malformed ») : arrêt comme avant (DB
+            corrompue), jamais une base lue en silence."""
+            d,rc,paths=_busy_env(); b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); e=io.StringIO()
+            def bad(*a,**kw): raise sqlite3.DatabaseError('database disk image is malformed')
+            with mock.patch.object(b.db,'_check_set_meta',bad),contextlib.redirect_stdout(e),contextlib.redirect_stderr(e):
+                stopped=raises(SystemExit,lambda: b.db.ensure_diff_db(paths['bo2'],create=False))
+            ok=stopped and 'DB corrompue' in e.getvalue()
+            if not ok: print(f"  arrêt {stopped} {e.getvalue()[-200:]!r}")
+            return ok
+        check("base occupée : autre erreur SQLite d'un lecteur toujours fatale (DB corrompue)",_busy_corrupt)
+        def _busy_unreadable():
+            """Report -o bo1,bo2, base de bo1 illisible (« DB corrompue », sys.exit de _db_schema_fail) : ligne de bo1 en erreur,
+            bo2 affiché, code 2 ; Report direct (jumelle) : arrêt de prep_report sur bo1 -> même isolation."""
+            d,rc,paths=_busy_env()
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); orig=b.db.ensure_diff_db
+            def bad(p,create=True):
+                if p==paths['bo1']: _db_schema_fail(p,sqlite3.DatabaseError('database disk image is malformed'),"l'index")
+                return orig(p,create=create)
+            o=io.StringIO()
+            with mock.patch.object(b.db,'ensure_diff_db',bad),contextlib.redirect_stdout(o),contextlib.redirect_stderr(io.StringIO()):
+                code=b.report_offline('bo1,bo2',as_json=True)
+            rep=json.loads(o.getvalue()[o.getvalue().index('{'):])['summary']
+            def fake(nick,debug=0,maxp=None):
+                if nick=='bo1': sys.exit(1)
+                return ({nick:{'nom':nick,'date derniere':'x','depuis':1.0,'duree':1.0,'derniere':1,'taille':1,'recuperable':0,'reste':1,
+                               'modifications':'—','size_delta_last':'—'}},
+                        {'Prunable':{'name':'Prunable','original_size':0,'compressed_size':0,'deduplicated_size':0},
+                         'Totaux':{'name':'Totaux','original_size':0,'compressed_size':0,'deduplicated_size':0}})
+            o2=io.StringIO()
+            with mock.patch.object(b,'prep_report',fake),contextlib.redirect_stdout(o2),contextlib.redirect_stderr(io.StringIO()):
+                code2=b.report('bo1,bo2',as_json=True)
+            rep2=json.loads(o2.getvalue()[o2.getvalue().index('{'):])['summary']
+            ok=(code==2 and rep.get('bo1',{}).get('nom')=='*** bo1' and rep['bo1'].get('reste')=='⚠ base illisible (voir message)'
+                and rep.get('bo2',{}).get('nom')=='bo2'
+                and code2==2 and rep2.get('bo1',{}).get('reste')=='⚠ base illisible (voir message)' and rep2.get('bo2',{}).get('nom')=='bo2')
+            if not ok: print(f"  hors ligne {code} {rep.get('bo1')} {rep.get('bo2',{}).get('nom')} ; direct {code2} {rep2.get('bo1')} {rep2.get('bo2',{}).get('nom')}")
+            return ok
+        check("base occupée : Report multi-nicks, base illisible isolée (hors ligne et direct)",_busy_unreadable)
+        def _busy_report_lock():
+            """Report direct, arrêt (SystemExit) sur bo1 : verrou report-running de bo1 déjà retiré pendant le traitement de bo2,
+            et après."""
+            d,rc,paths=_busy_env(); b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); during=[]
+            def fake(nick,debug=0,maxp=None):
+                if nick=='bo1': sys.exit(1)
+                during.append(os.path.exists(b.db._report_running_lock_path('bo1')))
+                return ({nick:{'nom':nick,'date derniere':'x','depuis':1.0,'duree':1.0,'derniere':1,'taille':1,'recuperable':0,'reste':1,
+                               'modifications':'—','size_delta_last':'—'}},
+                        {'Prunable':{'name':'Prunable','original_size':0,'compressed_size':0,'deduplicated_size':0},
+                         'Totaux':{'name':'Totaux','original_size':0,'compressed_size':0,'deduplicated_size':0}})
+            with mock.patch.object(b,'prep_report',fake),contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                b.report('bo1,bo2',as_json=True)
+            after=os.path.exists(b.db._report_running_lock_path('bo1'))
+            ok=during==[False] and after is False
+            if not ok: print(f"  verrou bo1 pendant bo2 {during}, après {after}")
+            return ok
+        check("base occupée : Report direct, verrou report-running du nick arrêté retiré aussitôt",_busy_report_lock)
+        def _busy_ctrlc():
+            """Ctrl-C pendant borg (boex -> sys.exit(130)) dans Report direct et hors ligne : arrêt du Report (code 130), jamais
+            avalé comme une base illisible ; bo2 jamais traité."""
+            d,rc,paths=_busy_env(); b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); seen=[]; codes=[]
+            def fake(nick,*a,**kw):
+                seen.append(nick)
+                if nick=='bo1': sys.exit(130)
+                raise AssertionError("bo2 traité après Ctrl-C")
+            for meth,call in (('prep_report',lambda: b.report('bo1,bo2',as_json=True)),('prep_report_from_db',lambda: b.report_offline('bo1,bo2',as_json=True))):
+                with mock.patch.object(b,meth,fake),contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                    try: call(); codes.append(None)
+                    except SystemExit as ex: codes.append(ex.code)
+            ok=codes==[130,130] and seen==['bo1','bo1']
+            if not ok: print(f"  codes {codes} nicks {seen}")
+            return ok
+        check("base occupée : Ctrl-C (code 130) arrête Report direct et hors ligne",_busy_ctrlc)
+        def _busy_status():
+            """Status -n bo1,bo2 (lu par /access de borgHelperWWW pour chaque nick), diff.db tenues : moins de 15 s (défaut : 2 × 60 s
+            par nick), deux nicks sans erreur."""
+            d,rc,paths=_busy_env(); b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); o=io.StringIO()
+            h=_busy_hold([paths['bo1'],paths['bo2']]); t0=time.time()
+            try:
+                with contextlib.redirect_stdout(o),contextlib.redirect_stderr(io.StringIO()): b.status('bo1,bo2',as_json=True)
+            finally: _rb_killtree(h)
+            dt=time.time()-t0; st=json.loads(o.getvalue())
+            ok=dt<15 and [x['nick'] for x in st]==['bo1','bo2'] and all(x.get('error') is None for x in st)
+            if not ok: print(f"  {dt:.1f} s {[(x.get('nick'),x.get('error')) for x in st]}")
+            return ok
+        check("base occupée : Status multi-nicks rapide, diff.db tenues",_busy_status)
+        def _busy_cache():
+            """cache.db de bo2 tenue (tampon ancien) : lecteur rendu en moins de 15 s, sans arrêt, tampon inchangé, mémorisée ;
+            cache.db de bo3 (schéma plus récent, index absent) tenue : refusée (SchemaVersionError)."""
+            d,rc,paths=_busy_env(); b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); q2=paths['bo2-cache']; q3=paths['bo3-cache']
+            h=_busy_hold([q2,q3]); t0=time.time(); stopped=False; refused=False
+            try:
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                    try: b.db.ensure_cache_db(q2,create=False)
+                    except SystemExit: stopped=True
+                    dt=time.time()-t0
+                    try: b.db.ensure_cache_db(q3,create=False)
+                    except SchemaVersionError: refused=True
+            finally: _rb_killtree(h)
+            c=sqlite3.connect(q2); stamp=dict(c.execute("SELECT key,value FROM db_meta").fetchall()).get('borghelper_version'); c.close()
+            ok=not stopped and dt<15 and stamp=='1.0.0' and b.db._reader_skip_fresh(q2) and refused
+            if not ok: print(f"  arrêt {stopped} {dt:.1f} s tampon {stamp} mémo {b.db._reader_skip_fresh(q2)} refus bo3 {refused}")
+            return ok
+        check("base occupée : cache.db tenue lue sans arrêt ni tampon, plus récente refusée",_busy_cache)
         check("casse du préfixe (AD-16) : /Etc et /etc distincts dans les deux modes",lambda: (lambda p,e:p==e and 'Etc' in json.dumps(p) and 'passwd' not in json.dumps(p))(
               *_q_pair(bhq.treehist,'Etc',as_json=True,key=True)))
         check("préfixe a%b : le frère aXYZb n'apparaît jamais (plain et chiffré)",lambda: all('aXYZb' not in _q_run(bhq.treehist,n,'a%b',as_json=True)+_q_run(bhq.treefind,n,'a%b','*',as_json=True) for n in ('qp','qe')))

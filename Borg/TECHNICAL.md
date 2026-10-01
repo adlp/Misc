@@ -1831,6 +1831,25 @@ l'ensemble complet — pas un sous-ensemble) passent `create=False` : `_duidx_co
 `treefind`, `filehist`, `prep_report_from_db`, `cache_prune_dryrun`, `cacheJsonBoexWithLM`,
 `BorgHelperDB.get_cache_rows`.
 
+**Lecteur et base occupée (1.0.166, story 29).** Un lecteur (`create=False`) écrit encore pour entretenir une base
+existante : paliers de migration, réparation de la vue, tampons `schema_version`/`borghelper_version` de
+`_check_set_meta` — ce dernier à chaque nouvelle version de borgHelper. Avant 1.0.166, si un autre processus tenait le
+verrou d'écriture (migration en cours, Index), il attendait 60 s puis `_db_schema_fail` -> `sys.exit(1)` : mesuré,
+`Report -o -n la,lb` sortait en code 1 sans aucune sortie (tous les hôtes absents de borgHelperWWW), `Status` 2 × 60 s.
+Désormais la connexion d'entretien d'un lecteur attend au plus `_READER_WRITE_WAIT` (2 s) ; verrou toujours tenu ->
+`_reader_busy_skip` : transaction en cours annulée, entretien abandonné — les paliers déjà validés restent (chacun
+atomique ; les `ALTER … ADD COLUMN` sont validés aussitôt) et les tampons viennent en dernier : jamais de
+`schema_version` avancé sur une migration sautée. Base lue telle quelle (WAL : les lectures n'attendent jamais), en
+silence : mesuré au palier 10 (un palier de retard), lue sans erreur ; une base plus ancienne peut faire échouer les
+requêtes de ce nick (ligne en erreur du Report). Seul contrôle gardé : schéma plus récent que
+le code -> `SchemaVersionError`. La base est notée dans `_reader_skipped` pour `_READER_SKIP_TTL` (60 s) : pas de
+nouvelle attente à chaque ouverture du même processus (borgHelperWWW, qui vit longtemps, réessaie ensuite). Base libre :
+le lecteur migre et tamponne comme avant ; écrivains (`create=True`) inchangés (60 s). `report_offline`/`report`
+isolent en plus tout `SystemExit` d'un nick (base illisible : ligne `*** nick ⚠ base illisible (voir message)`, code 2 ;
+Report direct : verrou `report-running` du nick retiré aussitôt), sauf Ctrl-C (`boex` -> `sys.exit(130)`) qui arrête
+toujours la commande. `history_path` ne marque jamais `_hist_migrated` une base dont l'entretien a été sauté (nouvel
+essai). Non couvert : `_migrate_to_history` (bases d'avant 1.0.139) ouvre encore `history.db` avec 60 s.
+
 `cache_prune_dryrun`, `cacheJsonBoexWithLM` et `diffbkp` ne sont pas de purs lecteurs : sur un cache miss confirmé (les
 deux premières) ou une paire non indexée (`diffbkp`), elles exécutent `borg` puis écrivent le résultat. Le
 `create=False` du début ne couvre que le *lookup* (éviter de créer la base pour répondre « pas en cache »/« pas

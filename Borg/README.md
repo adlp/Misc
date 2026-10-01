@@ -475,6 +475,12 @@ borgHelper -c Report -n ALL -o -N 10       # offline + 10 dernières archives
 Code retour 1 si un dépôt dépasse `MAX_AGE_BKP` heures depuis la dernière sauvegarde.  
 Code retour 2 si un dépôt est inaccessible.
 
+Plusieurs nicks (1.0.166) : la base d'un nick tenue par un autre processus (migration, Index) est lue telle quelle,
+sans message, après 2 s d'attente au plus par base (Report direct : `diff.db` et `cache.db`, soit ~4 s par nick occupé) ;
+une base illisible ne donne qu'une ligne `*** nick ⚠ base illisible (voir message)` (code 2), en direct comme hors
+ligne — les autres dépôts s'affichent toujours (liste des machines de borgHelperWWW comprise). Même attente bornée pour
+`Status`.
+
 En texte seulement (ni `-j` ni `-l`), en ligne de commande, une ligne finale signale les restes à nettoyer sur la
 machine (1.0.160) : « Nettoyage possible : N entrée(s) borg de dépôts disparus (taille), … — aperçu : borgHelper -c
 BorgCleanup ». Jamais dans `GET /report` (borgHelperWWW pose `BORGHELPERC_NO_CLEANUP_NOTICE`). Voir

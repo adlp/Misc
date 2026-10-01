@@ -1,5 +1,23 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.166 — une base occupée ne masque plus les autres hôtes — 2026-10-01
+
+Chantier « reconstruction progressive », story 29 (demande de l'utilisateur : un verrou pendant une migration faisait
+disparaître les autres hôtes de borgHelperWWW).
+
+- **Cause (mesurée)** : un lecteur écrit pour entretenir la base d'un nick (migration de palier, vue, tampon de version
+  réécrit à chaque nouvelle version de borgHelper). Base tenue par un autre processus : 60 s d'attente puis arrêt —
+  `Report -o -n ALL` sans aucune sortie, `Status` 2 × 60 s, `/access` puis la liste des machines bloqués.
+- **Lecteur** : attente du verrou d'écriture 2 s au plus par base ; ensuite la migration et le tampon sont abandonnés
+  (paliers déjà validés gardés) et la base est lue telle quelle, en silence ; plus de nouvelle attente pendant 60 s pour
+  la même base. Base libre : migrée
+  comme avant ; écrivains (Index, Bkp) inchangés ; base d'un schéma plus récent toujours refusée.
+- **Report** (hors ligne et direct) : une base illisible n'arrête plus la commande — ligne
+  `*** nick ⚠ base illisible (voir message)`, autres dépôts affichés, code 2 ; Ctrl-C arrête toujours le Report.
+- CodecSelfTest : contrôles « base occupée » (verrou tenu par un autre processus : Report multi-nicks rapide et
+  silencieux, base ni migrée ni tamponnée ; base libre migrée ; schéma plus récent refusé ; attentes 60 s / 2 s ; mémo ;
+  cache.db ; Status ; base illisible isolée ; verrou report-running retiré ; Ctrl-C).
+
 ## borgHelper 1.0.165 / UI 1.20.0 — versions de borg dans les rapports — 2026-10-01
 
 Chantier « reconstruction progressive », story 28 (actions de rétrospective A44, note de l'utilisateur, et A40/A41).
