@@ -10,6 +10,9 @@
 
 ## gitconfig
 
+### 1.12.0 — 2026-10-01
+- `fiput` et `tar` acceptent `-` comme source pour lire depuis **stdin** au lieu d'un fichier local (convention `-`, comme `tar`/`curl`). `fiput - ...` : `cat > destpath` directement. `tar - ...` : stdin bufferise dans un fichier temp avant extraction — `tar` n'autodetecte pas le format de compression (gzip/bzip2) sur un flux non-seekable (pipe), seulement sur un vrai fichier, d'ou le passage par un fichier temporaire pour reutiliser le meme chemin d'extraction fiable.
+
 ### 1.11.0 — 2026-10-01
 - Ajout de l'alias `fidiff` : `git fidiff [-G <commit>] <depot> <fichier-local> <chemin-dans-le-depot>` affiche le `git diff --no-index` entre un fichier local et sa version dans le depot — HEAD par defaut, ou le commit precise via `-G` (meme mecanisme que `figet -G`). Comble le manque identifie face a `gitoune -d`.
 
