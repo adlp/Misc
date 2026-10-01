@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.164"
+Version="1.0.165"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -382,6 +382,60 @@ def parse_diff_line(line):
 #   E : erreur de lecture (fichier non sauvegardé ou partiellement)
 _BKP_WARN_STATUSES={'C':'changed_during_backup','E':'read_errors'}
 _BKP_WARN_PATHS_MAX=100  # chemins listés dans la sortie JSON/stderr (le compteur reste exact)
+
+# Versions de borg (1.0.165, story 28, A44) — borg n'en enregistre aucune (archive, manifeste, dépôt ; borg serve ne
+# transmet pas la sienne : mesuré, 1.2.6). Créateur : message --show-version du borg create ; serveur : --version.
+_BORG_VERSION_TIMEOUT=15   # s, version côté serveur (ssh ou borg local) ; au-delà : inconnue
+
+def _show_version_of(items):
+    """Version du message `borgbackup version X` (--show-version, logger borg.output.show-version) d'une sortie de boex, ou None."""
+    for i in items or ():
+        if isinstance(i,dict) and i.get('name')=='borg.output.show-version':
+            m=re.match(r'borgbackup version ([0-9A-Za-z.+-]{1,32})\s*$',i.get('message',''))
+            if m: return m.group(1)
+    return None
+
+def _version_from_output(text):
+    """Version d'un borg d'après sa sortie, lignes lues de la fin : `borg --version` (`borg.wrapped 1.2.6`, `borg 1.4.0` :
+    mot commençant par « borg » puis le numéro) ou réponse d'un `borg serve` lancé par une clé à commande forcée, entrée
+    fermée (`Borg 1.2.6: Got connection close before repository was opened.` — mesuré, borg 1.2.6). Sinon None (message
+    sans numéro, ligne étrangère comme « connexion depuis 10.0.0.1 »)."""
+    for l in reversed([l.strip() for l in (text or '').splitlines() if l.strip()]):
+        m=(re.search(r'(?:^|\s)borg\S*\s+(\d+\.\d+[0-9A-Za-z.+-]{0,24})$',l,re.I)
+           or re.match(r'^Borg (\d+\.\d+[0-9A-Za-z.+-]{0,24}): ',l))
+        if m: return m.group(1)
+    return None
+
+def _borg_ver_text(m):
+    """Colonne « borg » (Report, UI ; 1.0.165) depuis une mesure d'archive : « 1.2.6 », « 1.2.6 / srv 1.2.4 » (serveur connu
+    et différent), « — » (inconnue : archive créée hors borgHelper ou avant 1.0.165, version non lue)."""
+    bv=(m or {}).get('borg_version'); sv=(m or {}).get('borg_server_version')
+    return (bv or '—')+(f" / srv {sv}" if sv and sv!=bv else '')
+
+def _measure_of(measures,archive,archive_date):
+    """Mesure d'une archive : (nom, date) exacte, sinon par le seul nom quand il est unique (get_archive_measures)."""
+    return measures.get((archive,archive_date or '')) or measures.get((archive,None))
+
+def _ssh_repo_host(repo):
+    """(user@hôte, port ou None) d'un dépôt ssh (`ssh://[u@]h[:p]/chemin`, `[u@]h:chemin`, IPv6 entre crochets, crochets
+    retirés pour ssh), None pour un dépôt local (chemin, `file://`)."""
+    if not repo or repo.startswith('file://'): return None
+    m=re.match(r'^ssh://(?:([^@/]+)@)?(\[[^\]/]+\]|[^:/\[]+)(?::(\d+))?/',repo)
+    if m: return ((m.group(1)+'@') if m.group(1) else '')+m.group(2).strip('[]'),m.group(3)
+    m=re.match(r'^(?:([^@/:\[]+)@)?(\[[^\]/]+\]|[^/:\[]+):',repo)
+    if m: return ((m.group(1)+'@') if m.group(1) else '')+m.group(2).strip('[]'),None
+    return None
+
+_LOCAL_HOSTS={'localhost','127.0.0.1','::1','ip6-localhost'}
+
+def _remfo_target_local(spec):
+    """Vrai si la redirection inverse SSH_REMFO (`[bind:]port:hôte:port_hôte`, argument de ssh -R) mène à CETTE machine
+    (localhost, 127.0.0.1, ::1, son nom ou son fqdn) : seul cas où le borg serve est le borg local. Autre forme (socket,
+    -R dynamique) : None (inconnu)."""
+    parts=[p for p in re.split(r':(?![^\[]*\])',(spec or '').strip())]
+    if len(parts) not in (3,4): return None
+    host=parts[-2].strip('[]').lower()
+    return host in _LOCAL_HOSTS or host in {socket.gethostname().lower(),socket.getfqdn().lower(),socket.gethostname().split('.')[0].lower()}
 
 def _bkp_file_status(i):
     """(status, path) si `i` (entrée stderr de boex, dict --log-json ou chaîne) est une ligne
@@ -1131,6 +1185,8 @@ _HISTORY_SCHEMA="""
         deduplicated_size     INTEGER,
         changed_during_backup INTEGER,
         read_errors           INTEGER,
+        borg_version          TEXT,
+        borg_server_version   TEXT,
         PRIMARY KEY (nick, archive, archive_date)
     );
     CREATE TABLE IF NOT EXISTS archive_chart (
@@ -1158,6 +1214,10 @@ _RECONCILE_ERRORS=(sqlite3.Error,SystemExit,DbKeyError,DbModeError,DbTamperError
 # archive_chart (1.0.140, AD-7 amendé) : ligne de graphique figée d'une archive par le rapprochement avant sa purge
 # (gone=1), ou seuls les comptages de fichiers d'une archive restante dont la paire entrante est retirée (gone=0).
 # Gardée STATS_RETENTION_MONTHS, que l'archive existe encore ou non. Ajout pur : HISTORY_DB_SCHEMA_VERSION inchangé.
+# archive_measure.borg_version / borg_server_version (1.0.165, story 28, A44) : version du borg qui a créé l'archive (flux
+# --show-version du borg create) et de celui qui a reçu les données, relevées au Bkp — borg ne les enregistre nulle part
+# (mesuré, 1.2.6). Colonnes ajoutées par introspection (ensure_history_db) : ajout pur, version de schéma inchangée.
+_MEASURE_VERSION_COLS=('borg_version','borg_server_version')
 _CHART_FIELDS=('duration','original_size','compressed_size','deduplicated_size','nfiles',
                'files_added','files_modified','files_removed','changed_during_backup','read_errors')
 
@@ -2596,6 +2656,21 @@ class BorgHelperDB:
             try:
                 _ensure_wal(conn)
                 conn.executescript(_HISTORY_SCHEMA)
+                # 1.0.165 : colonnes de versions, relues sous verrou (deux écrivains qui ouvrent ensemble une base d'avant :
+                # un seul les ajoute) ; base d'un schéma plus récent : jamais touchée (_check_set_meta la refuse ensuite)
+                if not {c for c in _MEASURE_VERSION_COLS}<={r[1] for r in conn.execute("PRAGMA table_info(archive_measure)")}:
+                    if conn.in_transaction: conn.commit()
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        row=conn.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()
+                        if not (row and str(row[0]).isdigit() and int(row[0])>HISTORY_DB_SCHEMA_VERSION):
+                            cols=[r[1] for r in conn.execute("PRAGMA table_info(archive_measure)").fetchall()]
+                            for col in _MEASURE_VERSION_COLS:
+                                if col not in cols: conn.execute(f"ALTER TABLE archive_measure ADD COLUMN {col} TEXT")
+                        conn.commit()
+                    except BaseException:
+                        if conn.in_transaction: conn.rollback()
+                        raise
                 self._check_set_meta(conn,HISTORY_DB_SCHEMA_VERSION,path)
                 conn.commit()
             finally: conn.close()
@@ -2785,30 +2860,37 @@ class BorgHelperDB:
             self.ensure_history_db(db_path,create=True); return db_path
         return db_path if os.path.exists(db_path) else None
 
-    def store_archive_measure(self,nick,archive,archive_date,deduplicated_size,changed_during_backup,read_errors,db_path=None):
-        """Mesures d'une archive prises au Bkp (Bkp seul, AD-7) : taille dédupliquée à la création et C/E."""
+    def store_archive_measure(self,nick,archive,archive_date,deduplicated_size,changed_during_backup,read_errors,db_path=None,
+                              borg_version=None,borg_server_version=None):
+        """Mesures d'une archive prises au Bkp (Bkp seul, AD-7) : taille dédupliquée à la création, C/E, versions de borg
+        (1.0.165 : créateur de l'archive, et borg qui a reçu les données ; None = inconnue)."""
         db_path=self._hist(nick,db_path,create=True)
         def _do():
             conn=_open_db(db_path,nick=None,role='write')
             try:
-                conn.execute("INSERT OR REPLACE INTO archive_measure (nick,archive,archive_date,deduplicated_size,changed_during_backup,read_errors) "
-                             "VALUES (?,?,?,?,?,?)",(nick,archive,archive_date or '',deduplicated_size,changed_during_backup,read_errors))
+                conn.execute("INSERT OR REPLACE INTO archive_measure (nick,archive,archive_date,deduplicated_size,changed_during_backup,read_errors,"
+                             "borg_version,borg_server_version) VALUES (?,?,?,?,?,?,?,?)",
+                             (nick,archive,archive_date or '',deduplicated_size,changed_during_backup,read_errors,borg_version,borg_server_version))
                 conn.commit(); return True
             finally: conn.close()
         try: return self._with_lock_retry(_do)
         except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
 
     def get_archive_measures(self,nick,db_path=None):
-        """{(archive, archive_date ou ''): {'deduplicated_size','changed_during_backup','read_errors'}} — {} si aucune."""
+        """{(archive, archive_date ou ''): {'deduplicated_size','changed_during_backup','read_errors','borg_version',
+        'borg_server_version'}} — {} si aucune."""
         db_path=self._hist(nick,db_path)
         if db_path is None: return {}
         try:
             conn=_open_db(db_path,nick=None,role='read')
             try:
-                rows=conn.execute("SELECT archive,archive_date,deduplicated_size,changed_during_backup,read_errors "
+                cols=[r[1] for r in conn.execute("PRAGMA table_info(archive_measure)").fetchall()]
+                ver=','.join(c if c in cols else 'NULL' for c in _MEASURE_VERSION_COLS)   # base d'avant 1.0.165 non rouverte en écriture
+                rows=conn.execute(f"SELECT archive,archive_date,deduplicated_size,changed_during_backup,read_errors,{ver} "
                                   "FROM archive_measure WHERE nick=?",(nick,)).fetchall()
             finally: conn.close()
-            out={(r[0],r[1]):{'deduplicated_size':r[2],'changed_during_backup':r[3],'read_errors':r[4]} for r in rows}
+            out={(r[0],r[1]):{'deduplicated_size':r[2],'changed_during_backup':r[3],'read_errors':r[4],
+                              'borg_version':r[5],'borg_server_version':r[6]} for r in rows}
             # Repli (revue story 2) : clé (archive, None) = mesure retrouvée par le seul nom quand il est unique — une
             # archive_stats reconstruite peut porter une archive_date formatée autrement (ou absente) que celle du Bkp.
             names={}
@@ -4747,6 +4829,59 @@ class BorgHelper:
         except (sqlite3.Error,DbCodecError) as e:
             printer(f"  [WARN] {nick}: comptage des fichiers de la paire impossible : {e}"); return None
 
+    def _bkp_server_version(self,nick,cfg,preBorg,repo,client_version):
+        """1.0.165 (story 28, A44) : version du borg qui a reçu les données d'un Bkp (décision de l'utilisateur, selon le mode).
+        -> (version ou None, raison à signaler ou None). Ne lève JAMAIS (appelée avant les mesures non régénérables).
+        - Tunnel inverse (SSH_REMFO, preBorg) vers CETTE machine : `<BORG_REMOTE_PATH|borg> --version` local ; tunnel vers
+          une autre machine ou forme inconnue : None (jamais devinée).
+        - Dépôt ssh direct : `<BORG_RSH|ssh> [options] [-p port] hôte <BORG_REMOTE_PATH|borg> --version` ; une clé à commande
+          forcée lance borg serve, qui répond `Borg X.Y: Got connection close…` (mesuré) : version lue quand même.
+        - Dépôt local (`/…`, `file://`) : le même borg que le créateur.
+        Environnement du borg du Bkp (boex : clés borg du rc, PATH, LC_ALL — sans agent ssh), entrée fermée, session à part
+        (sans terminal : jamais d'invite de mot de passe), groupe tué au délai et ses _MEI retirés, sortie décodée en
+        tolérant. Réponse sans numéro (code 0) : None sans raison — « — » en silence (décision de l'utilisateur)."""
+        try:
+            try: rp=shlex.split((cfg.get('BORG_REMOTE_PATH') or '').strip()) or ['borg']
+            except ValueError as e: return None,f"BORG_REMOTE_PATH illisible ({e})"
+            if preBorg is not None:
+                loc=_remfo_target_local(cfg.get('SSH_REMFO'))
+                if not loc: return None,f"tunnel SSH_REMFO vers {'une autre machine' if loc is False else 'une cible inconnue'} : version non mesurable d'ici"
+                cmd=rp+['--version']
+            else:
+                hp=_ssh_repo_host(repo)
+                if hp is None: return client_version,None
+                try: rsh=shlex.split(cfg.get('BORG_RSH') or 'ssh')
+                except ValueError as e: return None,f"BORG_RSH illisible ({e})"
+                if not rsh: rsh=['ssh']
+                opts=(['-o','BatchMode=yes','-o','ControlMaster=no','-o','ControlPath=none']
+                      if os.path.basename(rsh[0])=='ssh' else [])
+                cmd=rsh+opts+(['-p',hp[1]] if hp[1] else [])+[hp[0]]+rp+['--version']
+            env={k:v for k,v in cfg.items() if k in ('BORG_REPO','BORG_PASSPHRASE','BORG_REMOTE_PATH','BORG_RSH',
+                                                      'BORG_SHOW_SYSINFO','BORG_RELOCATED_REPO_ACCESS_IS_OK','BORG_KEY_FILE')}
+            env.update(PATH=os.environ.get('PATH',''),LC_ALL='fr_FR.UTF-8')
+            before=_mei_dirs()
+            try:
+                p=subprocess.Popen(cmd,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,
+                                   start_new_session=True)
+            except OSError as e: return None,str(e)
+            try: out,err=p.communicate(timeout=_BORG_VERSION_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                try: os.killpg(p.pid,9)
+                except OSError: pass
+                try: p.communicate(timeout=5)
+                except subprocess.TimeoutExpired: pass
+                for d in _mei_dirs()-before:   # extraits par CE borg tué, plus utilisés
+                    if not _mei_in_use(d): shutil.rmtree(d,ignore_errors=True)
+                return None,f"pas de réponse en {_BORG_VERSION_TIMEOUT} s"
+            out=out.decode('utf-8','replace'); err=err.decode('utf-8','replace')
+            v=_version_from_output(out) or _version_from_output(err)
+            if v: return v,None
+            if p.returncode==0: return None,None
+            why=(err or out).strip().splitlines()
+            return None,f"code {p.returncode}"+(f" : {why[-1][:120]}" if why else "")
+        except Exception as e:   # jamais d'échec du Bkp ni de mesure perdue pour une version
+            return None,f"{type(e).__name__}: {e}"
+
     def backup(self,nick,no_index=False,debug=0):
         cfg=self.borg.cfgreaded(nick,debug=debug)
         if not no_index and self._nick_noidx(nick): no_index=True
@@ -4773,6 +4908,7 @@ class BorgHelper:
         # changements de la paire viennent de l'Index post-Bkp (borg diff, voir 1.0.116 : 'd' =
         # répertoire, pris pour « supprimé »). Volume quasi nul ; actif même avec -I (pas de l'indexation).
         create.extend('--log-json --json --debug -v --stats --list --filter CE'.split(' '))
+        create.append('--show-version')   # 1.0.165 (A44) : version du borg qui crée l'archive, dans le flux --log-json
         archname='root'
         if 'BORG_ARCHNAME' in cfg.keys(): archname=cfg['BORG_ARCHNAME']
         if archname[:2]=="::": create.append(archname+'-{now:%Y-%m-%dT%H%M%S}')
@@ -4865,9 +5001,17 @@ class BorgHelper:
                         st=arch_info.get('stats',{})
                         self.db.store_archive_stats(nick,archive_new,archive_new_date,arch_info.get('duration'),
                             st.get('original_size'),st.get('compressed_size'),st.get('deduplicated_size'),st.get('nfiles'),db_path)
+                        # Versions de borg (1.0.165, A44) : créateur (flux --show-version) et borg qui a reçu les données
+                        bv=_show_version_of(anaRet.get('stderr'))
+                        if bv is None: printer(f"[WARN] {nick}: version de borg de l'archive inconnue (pas de message --show-version)")
+                        repo=(forceEnv or {}).get('BORG_REPO') or cfg.get('BORG_REPO')
+                        sv,why=self._bkp_server_version(nick,cfg,preBorg,repo,bv)
+                        if sv is None and why: printer(f"[WARN] {nick}: version de borg côté serveur inconnue ({why})")
+                        if out is not None: out['borgHelper_borg_versions']={'archive':bv,'server':sv}
                         # Mesures du Bkp (non régénérables) -> history.db (1.0.139, AD-7)
                         self.db.store_archive_measure(nick,archive_new,archive_new_date,st.get('deduplicated_size'),
-                            len(warn['changed_during_backup']),len(warn['read_errors']),bkp_status_db)
+                            len(warn['changed_during_backup']),len(warn['read_errors']),bkp_status_db,
+                            borg_version=bv,borg_server_version=sv)
                         cst=anaRet['stdout'][0].get('cache',{}).get('stats',{})
                         if cst.get('unique_csize') is not None:
                             self.db.store_repo_stats(nick,'bkp',cst['unique_csize'],cst.get('total_size'),cst.get('total_csize'),bkp_status_db)
@@ -6766,6 +6910,9 @@ class BorgHelper:
             if m and m['deduplicated_size'] is not None: r['deduplicated_size']=m['deduplicated_size']
             r['changed_during_backup']=m['changed_during_backup'] if m else None
             r['read_errors']=m['read_errors'] if m else None
+            # 1.0.165 (A44) : versions de borg relevées au Bkp (null : inconnue)
+            r['borg_version']=m.get('borg_version') if m else None
+            r['borg_server_version']=m.get('borg_server_version') if m else None
         diff_stats=self.db._diff_stats_for_nick(nick)
         for r in rows:
             st=diff_stats.get(r['archive'])
@@ -6794,7 +6941,7 @@ class BorgHelper:
                              'deduplicated_size':f['deduplicated_size'],'nfiles':f['nfiles'],
                              'changed_during_backup':f['changed_during_backup'],'read_errors':f['read_errors'],
                              'files_added':f['files_added'],'files_modified':f['files_modified'],
-                             'files_removed':f['files_removed'],'pruned':True})
+                             'files_removed':f['files_removed'],'borg_version':None,'borg_server_version':None,'pruned':True})
         rows.sort(key=lambda r:(r['archive_date'] is not None,r['archive_date'] or '',r['archive']))
         print(json.dumps({'borghelper_version':Version,'nick':nick,'rows':rows},ensure_ascii=False,indent=2))
 
@@ -6829,6 +6976,11 @@ class BorgHelper:
                 pass
             finally:
                 if conn is not None: conn.close()
+        if last_backup and 'error' not in last_backup:
+            # 1.0.165 (A44) : versions de borg du dernier Bkp (history.db ; null : inconnue)
+            m=_measure_of(self.db.get_archive_measures(nick),last_backup['archive'],last_backup['date'])
+            last_backup['borg_version']=m.get('borg_version') if m else None
+            last_backup['borg_server_version']=m.get('borg_server_version') if m else None
         # history.db (1.0.139). 1.0.154 (story 17) : au-delà du délai de /access, Bkp interrompu (bkp_stale), plus « en cours ».
         # 1.0.155 (story 18) : délai du nick (clé rc BKP_STATUS_TIMEOUT, puis variable, puis 6 h), le même que borgHelperWWW
         timeout_s=self.bkp_status_timeout(nick)
@@ -6871,6 +7023,7 @@ class BorgHelper:
             try: age=_age_readable(d2DateNSince(lb['date'])['since'])
             except (ValueError,TypeError): age=''
             printer(f"  Dernier backup : {lb['archive']} ({lb['date']}) {age}".rstrip())
+            printer(f"  borg : {_borg_ver_text(lb)}")   # 1.0.165 (A44)
         else:
             printer("  Dernier backup : aucune archive indexée")
         if st['bkp_running']:
@@ -7506,6 +7659,7 @@ class BorgHelper:
                 for kk,vv in _fmt_stats(s,k['nfiles'],k['original_size']).items(): tbkps[arch][kk]=vv
             else:
                 tbkps[arch]['modifications']='—'
+            tbkps[arch]['borg']=_borg_ver_text(_measure_of(measures,arch,k.get('archive_date')))   # 1.0.165 (jumelle : prep_report)
         total_orig=sum(v['original_size'] for v in kept.values())
         total_compr=sum(v['compressed_size'] for v in kept.values())
         total_dedup2=sum(v['deduplicated_size'] for v in kept.values())
@@ -7602,6 +7756,8 @@ class BorgHelper:
         else:
             tcmpl[nick]['modifications']='—'
         tcmpl[nick]['size_delta_last']=size_delta_map.get(last_arch,'—') if last_arch else '—'
+        measures=self.db.get_archive_measures(nick)
+        starts={a['name']:a.get('start') for a in r['archives']}
         for arch in list(tbkps.keys()):
             if 'nfiles' not in tbkps[arch]: continue
             s=diff_stats.get(arch)
@@ -7610,6 +7766,7 @@ class BorgHelper:
                 for k,v in _fmt_stats(s,nf,sz).items(): tbkps[arch][k]=v
             else:
                 tbkps[arch]['modifications']='—'
+            tbkps[arch]['borg']=_borg_ver_text(_measure_of(measures,arch,starts.get(arch)))   # 1.0.165 (jumelle : prep_report_from_db)
         return tcmpl,tbkps
 
     def report_offline(self,nicks,htrep=False,debug=0,maxp=None,as_json=False):
@@ -7675,7 +7832,7 @@ class BorgHelper:
             print(htmlTabelise(reshos,colnames=['nom','duree','depuis','derniere','taille','recuperable','reste','modifications'],errhost=errhost))
             for nick in nicks.split(','):
                 print('    <br>')
-                print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','size_delta','compressed_size','deduplicated_size','nfiles','modifications'],errhost=errhost))
+                print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','size_delta','compressed_size','deduplicated_size','nfiles','modifications','borg'],errhost=errhost))
             print('  </body>\n</html>')
         else:
             print(prettyTabelise(reshos))
@@ -7758,7 +7915,7 @@ class BorgHelper:
             print(htmlTabelise(reshos,colnames=['nom','duree','depuis','derniere','taille','recuperable','reste','modifications'],errhost=errhost))
             for nick in nicks.split(','):
                 print('    <br>')
-                print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','size_delta','compressed_size','deduplicated_size','nfiles','modifications'],errhost=errhost))
+                print(htmlTabelise(resshortbck[nick],colnames=[nick,'duration','original_size','size_delta','compressed_size','deduplicated_size','nfiles','modifications','borg'],errhost=errhost))
             print('  </body>\n</html>')
         else:
             print(prettyTabelise(reshos))
@@ -9458,6 +9615,213 @@ def codec_selftest(pattern=None,list_only=False):
             if out!=[(True,False),(False,True)]: print(f"  (incrémental, auto-réparation) : {out}")
             return out==[(True,False),(False,True)]
         check("snapshot par version : auto-réparation limitée à l'archive précédente (NULL d'une archive plus ancienne : incrémental)",_snapv_autorepair)
+        def _bver_parse():
+            """1.0.165 (story 28, A44) : lecture des versions — attentes en dur. --show-version (dicts de boex, caractères bornés),
+            sortie de `borg --version` ou réponse de borg serve (commande forcée, mesurée), hôte d'un dépôt ssh (IPv6, file://),
+            cible d'un tunnel SSH_REMFO, texte de la colonne « borg », mesure par (nom, date) exacte."""
+            sv=[_show_version_of(x) for x in (
+                [{'name':'borg.output.list','message':'C f'},{'name':'borg.output.show-version','message':'borgbackup version 1.2.6'}],
+                ['borgbackup version 9.9',{'name':'borg.archiver','message':'borgbackup version 9.9'}],
+                [{'name':'borg.output.show-version','message':'borgbackup version <img/src=x>'}],
+                [{'name':'borg.output.show-version','message':'autre chose'}],[],None)]
+            vo=[_version_from_output(x) for x in ('borg.wrapped 1.2.6\n','borg 1.4.0','borg 1.2.0b3','\n\n','',None,
+                    'This account is restricted','ligne\nborg 1.2.7\n','borg version: inconnue',
+                    'Borg 1.2.6: Got connection close before repository was opened.\n','borg 1.2.8\nau revoir\n',
+                    'connexion depuis 10.0.0.1','motd du serveur borg 0.1\nborg.wrapped 1.2.9\n')]
+            hp=[_ssh_repo_host(x) for x in ('ssh://u@h:2222/./r','ssh://h/r','u@h:/srv/r','h:r','/srv/r','','ssh://u@h/r',
+                                            'file:///srv/r','ssh://u@[::1]:22/r','u@[::1]:/r','[fe80::1]:r')]
+            hn=socket.gethostname()
+            rf=[_remfo_target_local(x) for x in ('2222:localhost:22','0.0.0.0:2222:127.0.0.1:22','2222:nas:22','/tmp/sock','',None,
+                                                 f'2222:{hn}:22','2222:[::1]:22')]
+            tx=[_borg_ver_text(m) for m in ({'borg_version':'1.2.6','borg_server_version':'1.2.6'},{'borg_version':'1.2.6','borg_server_version':'1.2.4'},
+                                            {'borg_version':'1.2.6','borg_server_version':None},{'borg_version':None,'borg_server_version':'1.2.4'},None,{})]
+            ms={('a','d1'):{'borg_version':'1'},('a','d2'):{'borg_version':'2'},('b','d'):{'borg_version':'3'},('b',None):{'borg_version':'3'}}
+            mo=[(_measure_of(ms,a,dd) or {}).get('borg_version') for a,dd in (('a','d2'),('a','d1'),('a','d3'),('b','autre'),('c','d'))]
+            ok=(sv==['1.2.6',None,None,None,None,None]
+                and vo==['1.2.6','1.4.0','1.2.0b3',None,None,None,None,'1.2.7',None,'1.2.6','1.2.8',None,'1.2.9']
+                and hp==[('u@h','2222'),('h',None),('u@h',None),('h',None),None,None,('u@h',None),None,('u@::1','22'),('u@::1',None),('fe80::1',None)]
+                and rf==[True,True,False,None,None,None,True,True]
+                and tx==['1.2.6','1.2.6 / srv 1.2.4','1.2.6','— / srv 1.2.4','—','—'] and mo==['2','1',None,'3',None])
+            if not ok: print(f"  {sv} {vo} {hp} {rf} {tx} {mo}")
+            return ok
+        check("versions de borg : lecture (--show-version, --version, hôte ssh, colonne)",_bver_parse)
+        def _bver_server():
+            """_bkp_server_version, exécutables simulés : tunnel inverse local (BORG_REMOTE_PATH avec argument), tunnel vers une
+            autre machine, ssh direct (argv en dur, port, options ssh seulement pour ssh), sans numéro (« — » silencieux),
+            vraie commande forcée (borg serve, entrée fermée : version lue), échec (code et message), sortie non UTF-8, exécutable
+            absent, délai (1 s : groupe tué), agent ssh jamais transmis, dépôt local, BORG_RSH illisible. Jamais d'exception."""
+            d=os.path.join(tmp,'bver'); os.makedirs(d,exist_ok=True); log=os.path.join(d,'argv'); pidf=os.path.join(d,'pid')
+            borg=shutil.which('borg')
+            def sh(name,body):
+                p=os.path.join(d,name)
+                with open(p,'w') as f: f.write("#!/bin/bash\n"+body+"\n")
+                os.chmod(p,0o700); return p
+            srv=sh('borgsrv','echo "borg.wrapped 1.2.4"')
+            rsh=sh('rsh',f'printf "%s\\n" "$@" > \"{log}\"; echo "borg 1.4.1"')
+            sshd=os.path.join(d,'s'); os.makedirs(sshd,exist_ok=True); fake_ssh=os.path.join(sshd,'ssh')
+            with open(fake_ssh,'w') as f: f.write(f'#!/bin/bash\nprintf "%s\\n" "$@" > \"{log}\"; echo "borg 1.4.2"\n')
+            os.chmod(fake_ssh,0o700)
+            nonum=sh('nonum','exit 0'); fail=sh('fail','echo "Permission denied (publickey)." >&2; exit 255')
+            latin=sh('latin',"printf 'Acc\\xe8s r\\xe9serv\\xe9\\n' >&2; exit 1")
+            slow=sh('slow',f'sleep 30 & echo $! > "{pidf}"; wait')
+            forced=sh('forced',f'unset BORG_CACHE_DIR BORG_CONFIG_DIR BORG_SECURITY_DIR BORG_KEYS_DIR\nexport BORG_BASE_DIR="{d}/bb"\nexec "{borg}" serve')
+            agent=sh('agent','[ -n "$SSH_AUTH_SOCK" ] && echo "borg 2.2.2" || echo "borg 3.3.3"')
+            vr=subprocess.run([borg,'--version'],capture_output=True,text=True,stdin=subprocess.DEVNULL,timeout=60)
+            ver=vr.stdout.strip().split()[-1] if vr.returncode==0 and vr.stdout.strip() else None
+            def argv():
+                with open(log) as f: return f.read().split('\n')[:-1]
+            g=globals(); to=g['_BORG_VERSION_TIMEOUT']; res={}; old_sock=os.environ.get('SSH_AUTH_SOCK')
+            try:
+                res['tunnel']=bhq._bkp_server_version('v',{'BORG_REMOTE_PATH':srv+' -q','SSH_REMFO':'2222:localhost:22'},['ssh','x'],'ssh://localhost:9/r','1.2.6')
+                res['tunnel-loin']=bhq._bkp_server_version('v',{'BORG_REMOTE_PATH':srv,'SSH_REMFO':'2222:nas:22'},['ssh','x'],'ssh://localhost:9/r','1.2.6')
+                res['ssh']=bhq._bkp_server_version('v',{'BORG_RSH':rsh},None,'ssh://u@h:2222/./r','1.2.6'); a1=argv()
+                res['ssh2']=bhq._bkp_server_version('v',{'BORG_RSH':fake_ssh+' -i k','BORG_REMOTE_PATH':'/opt/borg'},None,'u@h:/r','1.2.6'); a2=argv()
+                res['sans numéro']=bhq._bkp_server_version('v',{'BORG_RSH':nonum},None,'u@h:/r','1.2.6')
+                res['forcée']=bhq._bkp_server_version('v',{'BORG_RSH':forced},None,'u@h:/r','1.2.6')
+                res['échec']=bhq._bkp_server_version('v',{'BORG_RSH':fail},None,'u@h:/r','1.2.6')
+                res['latin']=bhq._bkp_server_version('v',{'BORG_RSH':latin},None,'u@h:/r','1.2.6')
+                res['absent']=bhq._bkp_server_version('v',{'BORG_REMOTE_PATH':'/nulle/part/borg','SSH_REMFO':'1:localhost:2'},['ssh'],'r','1.2.6')
+                os.environ['SSH_AUTH_SOCK']='/nulle/agent'
+                res['agent']=bhq._bkp_server_version('v',{'BORG_RSH':agent},None,'u@h:/r','1.2.6')
+                g['_BORG_VERSION_TIMEOUT']=1; t0=time.time()
+                res['délai']=bhq._bkp_server_version('v',{'BORG_RSH':slow},None,'u@h:/r','1.2.6'); dt=time.time()-t0
+                g['_BORG_VERSION_TIMEOUT']=to
+                res['local']=bhq._bkp_server_version('v',{},None,'/srv/r','1.2.6')
+                res['file']=bhq._bkp_server_version('v',{},None,'file:///srv/r','1.2.6')
+                res['illisible']=bhq._bkp_server_version('v',{'BORG_RSH':'"ssh'},None,'u@h:/r','1.2.6')
+            finally:
+                g['_BORG_VERSION_TIMEOUT']=to
+                if old_sock is None: os.environ.pop('SSH_AUTH_SOCK',None)
+                else: os.environ['SSH_AUTH_SOCK']=old_sock
+            try:
+                with open(pidf) as f: spid=int(f.read())
+                os.kill(spid,0); alive=True
+            except (OSError,ValueError): alive=False
+            ok=(res['tunnel']==('1.2.4',None) and res['tunnel-loin'][0] is None and 'autre machine' in (res['tunnel-loin'][1] or '')
+                and res['ssh']==('1.4.1',None) and a1==['-p','2222','u@h','borg','--version']
+                and res['ssh2']==('1.4.2',None)
+                and a2==['-i','k','-o','BatchMode=yes','-o','ControlMaster=no','-o','ControlPath=none','u@h','/opt/borg','--version']
+                and res['sans numéro']==(None,None) and ver is not None and res['forcée']==(ver,None)
+                and res['échec']==(None,'code 255 : Permission denied (publickey).')
+                and res['latin']==(None,'code 1 : Acc\ufffds r\ufffdserv\ufffd')
+                and res['absent'][0] is None and 'No such file' in (res['absent'][1] or '')
+                and res['agent']==('3.3.3',None)
+                and res['délai']==(None,'pas de réponse en 1 s') and dt<4 and not alive
+                and res['local']==('1.2.6',None) and res['file']==('1.2.6',None)
+                and res['illisible'][0] is None and 'BORG_RSH illisible' in (res['illisible'][1] or ''))
+            if not ok: print(f"  {res} ; argv {a1} / {a2} ; délai {dt:.1f} s, sleep vivant {alive} ; borg {ver}")
+            return ok
+        check("versions de borg : serveur selon le mode (tunnel inverse, ssh direct, commande forcée, échec, délai, local)",_bver_server)
+        def _bver_history():
+            """history.db d'avant 1.0.165 (archive_measure sans colonnes) : lue telle quelle par un lecteur (versions null),
+            colonnes ajoutées à l'ouverture par un écrivain, versions écrites puis relues ; mesure existante gardée."""
+            dp=os.path.join(tmp,'bver-history.db')
+            for suf in ('','-wal','-shm'):
+                if os.path.exists(dp+suf): os.unlink(dp+suf)
+            c=sqlite3.connect(dp)
+            c.executescript("CREATE TABLE db_meta (key TEXT PRIMARY KEY, value TEXT); INSERT INTO db_meta VALUES('schema_version','1');"
+                "CREATE TABLE archive_measure (nick TEXT NOT NULL, archive TEXT NOT NULL, archive_date TEXT NOT NULL DEFAULT '',"
+                " deduplicated_size INTEGER, changed_during_backup INTEGER, read_errors INTEGER, PRIMARY KEY (nick, archive, archive_date));"
+                "INSERT INTO archive_measure VALUES('hv','a1','d1',10,0,0);")
+            c.close()
+            before=bhq.db.get_archive_measures('hv',dp)
+            cols0=[r[1] for r in sqlite3.connect(dp).execute("PRAGMA table_info(archive_measure)")]
+            bhq.db._hist_ready.discard(dp)
+            with contextlib.redirect_stdout(io.StringIO()):
+                w=bhq.db.store_archive_measure('hv','a2','d2',20,1,0,dp,borg_version='1.2.6',borg_server_version='1.2.4')
+            cols=[r[1] for r in sqlite3.connect(dp).execute("PRAGMA table_info(archive_measure)")]
+            after=bhq.db.get_archive_measures('hv',dp)
+            ok=(before.get(('a1','d1'),{}).get('borg_version','x') is None and 'borg_version' not in cols0 and w
+                and cols[-2:]==['borg_version','borg_server_version']
+                and after[('a2','d2')]['borg_version']=='1.2.6' and after[('a2','d2')]['borg_server_version']=='1.2.4'
+                and after[('a1','d1')]['deduplicated_size']==10 and after[('a1','d1')]['borg_version'] is None)
+            if not ok: print(f"  avant {before} {cols0} ; écrit {w} ; colonnes {cols} ; après {after}")
+            return ok
+        check("versions de borg : history.db d'avant lue sans colonnes, colonnes ajoutées par un écrivain",_bver_history)
+        def _bver_history_newer():
+            """history.db d'un schéma plus récent que ce code, sans les colonnes : jamais modifiée (refusée)."""
+            dp=os.path.join(tmp,'bver-history-new.db')
+            for suf in ('','-wal','-shm'):
+                if os.path.exists(dp+suf): os.unlink(dp+suf)
+            c=sqlite3.connect(dp)
+            c.executescript("CREATE TABLE db_meta (key TEXT PRIMARY KEY, value TEXT);"
+                "CREATE TABLE archive_measure (nick TEXT NOT NULL, archive TEXT NOT NULL, archive_date TEXT NOT NULL DEFAULT '',"
+                " deduplicated_size INTEGER, changed_during_backup INTEGER, read_errors INTEGER, PRIMARY KEY (nick, archive, archive_date));")
+            c.execute("INSERT INTO db_meta VALUES('schema_version',?)",(str(HISTORY_DB_SCHEMA_VERSION+1),)); c.commit(); c.close()
+            bhq.db._hist_ready.discard(dp); refused=False
+            try:
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): bhq.db.ensure_history_db(dp)
+            except (SchemaVersionError,SystemExit): refused=True
+            cols=[r[1] for r in sqlite3.connect(dp).execute("PRAGMA table_info(archive_measure)")]
+            if not (refused and 'borg_version' not in cols): print(f"  refusée {refused}, colonnes {cols}")
+            return refused and 'borg_version' not in cols
+        check("versions de borg : history.db plus récente jamais modifiée",_bver_history_newer)
+        def _bver_history_half():
+            """history.db où une seule colonne de version existe (forme vue par un second écrivain après l'ALTER du premier) :
+            seule la manquante est ajoutée, colonnes relues sous verrou — jamais d'erreur « duplicate column »."""
+            dp=os.path.join(tmp,'bver-history-half.db')
+            for suf in ('','-wal','-shm'):
+                if os.path.exists(dp+suf): os.unlink(dp+suf)
+            c=sqlite3.connect(dp)
+            c.executescript("CREATE TABLE db_meta (key TEXT PRIMARY KEY, value TEXT); INSERT INTO db_meta VALUES('schema_version','1');"
+                "CREATE TABLE archive_measure (nick TEXT NOT NULL, archive TEXT NOT NULL, archive_date TEXT NOT NULL DEFAULT '',"
+                " deduplicated_size INTEGER, changed_during_backup INTEGER, read_errors INTEGER, borg_version TEXT,"
+                " PRIMARY KEY (nick, archive, archive_date));")
+            c.close()
+            bhq.db._hist_ready.discard(dp); err=None
+            try:
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                    w=bhq.db.store_archive_measure('hh','a1','d1',5,0,0,dp,borg_version='1.2.6',borg_server_version='1.2.4')
+            except (Exception,SystemExit) as e: w=False; err=e
+            cols=[r[1] for r in sqlite3.connect(dp).execute("PRAGMA table_info(archive_measure)")]
+            m=bhq.db.get_archive_measures('hh',dp).get(('a1','d1'),{}) if w else {}
+            ok=(w and cols[-2:]==['borg_version','borg_server_version'] and cols.count('borg_version')==1
+                and m.get('borg_version')=='1.2.6' and m.get('borg_server_version')=='1.2.4')
+            if not ok: print(f"  écrit {w} {err!r} ; colonnes {cols} ; mesure {m}")
+            return ok
+        check("versions de borg : history.db à moitié migrée, seule la colonne manquante ajoutée",_bver_history_half)
+        def _bver_tunnel():
+            """backup() en tunnel inverse (SSH_REMFO), borg simulé : flux du borg create distant « borgbackup version 1.2.4 »,
+            BORG_REMOTE_PATH local « borg.wrapped 1.2.6 » -> mesure (1.2.4, 1.2.6), Report -o « 1.2.4 / srv 1.2.6 » ; tunnel
+            vers une autre machine (nas) -> serveur inconnu, [WARN] ; SSH_REPO (dépôt du Bkp) prioritaire sur BORG_REPO."""
+            d=os.path.join(tmp,'bver-tunnel'); os.makedirs(d,exist_ok=True); rc=os.path.join(d,'rc')
+            srv=os.path.join(d,'borgsrv')
+            with open(srv,'w') as f: f.write('#!/bin/bash\necho "borg.wrapped 1.2.6"\n')
+            os.chmod(srv,0o700)
+            rsh=os.path.join(d,'rsh')
+            with open(rsh,'w') as f: f.write('#!/bin/bash\necho "borg 7.7.7"\n')
+            os.chmod(rsh,0o700)
+            common=(f"BORG_PASSPHRASE=pw\nSER_NAME=h\nSER_LOGIN=x\nGLOB_ARCH=*\nBORG_ARCHNAME=t\nEXCLUDE=--exclude-caches\nDB_ENCRYPT=false\n"
+                    f"BORG_REMOTE_PATH={srv}\nBORG_RSH={rsh}\n")
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n\n[tun]\nBORG_REPO={d}\n{common}SSH_REMFO=2222:localhost:22\n\n"
+                        f"[tunloin]\nBORG_REPO=/nulle/tl\n{common}SSH_REMFO=2222:nas:22\n\n"
+                        f"[sr]\nBORG_REPO=/nulle/locale\nSSH_REPO=u@h:/r\n{common}")
+            os.chmod(rc,0o600)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            def fake_boex(nick,cmd,**kw):
+                if cmd and cmd[0]=='create':
+                    return {'exitcode':0,'stdout':[{'archive':{'name':f'{nick}-a1','start':'2026-10-01T10:00:00.000000','duration':1,
+                            'stats':{'original_size':1,'compressed_size':1,'deduplicated_size':1,'nfiles':1}},'cache':{'stats':{}}}],
+                            'stderr':[{'type':'log_message','name':'borg.output.show-version','message':'borgbackup version 1.2.4','levelname':'INFO'}]}
+                return {'exitcode':0,'stdout':[{}],'stderr':[]}
+            out={}
+            for nk in ('tun','tunloin','sr'):
+                o=io.StringIO()
+                with mock.patch.object(b.borg,'boex',fake_boex),contextlib.redirect_stdout(o),contextlib.redirect_stderr(o):
+                    try: b.backup(nk,no_index=True)
+                    except SystemExit: pass
+                m=_measure_of(b.db.get_archive_measures(nk),f'{nk}-a1','2026-10-01T10:00:00.000000') or {}
+                out[nk]=(m.get('borg_version'),m.get('borg_server_version'),f"[WARN] {nk}: version de borg côté serveur inconnue" in o.getvalue())
+            o=io.StringIO()
+            with contextlib.redirect_stdout(o),contextlib.redirect_stderr(o): b.report_offline('tun',as_json=True)
+            try: rep=[v.get('borg') for k,v in json.loads(o.getvalue()[o.getvalue().index('{'):])['backups']['tun'].items() if k not in ('Prunable','Totaux')]
+            except (ValueError,KeyError): rep=None
+            ok=(out=={'tun':('1.2.4','1.2.6',False),'tunloin':('1.2.4',None,True),'sr':('1.2.4','7.7.7',False)}
+                and rep==['1.2.4 / srv 1.2.6'])
+            if not ok: print(f"  {out} ; Report {rep} ; {o.getvalue()[-300:]!r}")
+            return ok
+        check("versions de borg : Bkp en tunnel inverse simulé (local, autre machine) et SSH_REPO",_bver_tunnel)
         check("casse du préfixe (AD-16) : /Etc et /etc distincts dans les deux modes",lambda: (lambda p,e:p==e and 'Etc' in json.dumps(p) and 'passwd' not in json.dumps(p))(
               *_q_pair(bhq.treehist,'Etc',as_json=True,key=True)))
         check("préfixe a%b : le frère aXYZb n'apparaît jamais (plain et chiffré)",lambda: all('aXYZb' not in _q_run(bhq.treehist,n,'a%b',as_json=True)+_q_run(bhq.treefind,n,'a%b','*',as_json=True) for n in ('qp','qe')))
@@ -13346,7 +13710,8 @@ def codec_selftest(pattern=None,list_only=False):
                 r=subprocess.run([shutil.which('borg'),'delete',f'{repo}::{a}'],env=env,capture_output=True,text=True,timeout=120)
                 if r.returncode!=0: print(f"  borg delete : {r.stderr[-300:]}")
                 _q_run(b.index,'rr')
-            strip=lambda row:{k:v for k,v in row.items() if k!='pruned'}
+            # 1.0.165 : versions de borg hors comparaison — mesures du Bkp non figées (ligne pruned : null, par conception)
+            strip=lambda row:{k:v for k,v in row.items() if k not in ('pruned','borg_version','borg_server_version')}
             delete(names[1])
             ah1=_rz_ah(b,'rr')
             fh=json.loads(_q_run(b.filehist,'rr',fp,archive_from='ALL',as_json=True)).get('rr',[])
@@ -13619,6 +13984,124 @@ def codec_selftest(pattern=None,list_only=False):
                 ok=ok and r
             return ok
         _rbc("snapshot par version sur vrai borg : archive ancienne garde taille, droits et type ; inchangé partagé ; enfant exclu jamais lié ; clair et chiffré",_snapv_real_borg)
+        def _bver_real_borg():
+            """1.0.165 (story 28, A44) : vrai borg, CLI. Version attendue mesurée à part (`borg --version`). Nick bv : archive
+            créée hors borgHelper (ext-1) puis Bkp -> Report -o -j : Bkp « <version> » (dépôt local : serveur = créateur), ext-1
+            « — » ; colonne borg dans Report texte ; ArchiveHistory -j : champs bruts (null pour ext-1) ; Status « borg : <v> » ;
+            JSON du Bkp borgHelper_borg_versions ; Report -j en direct (jumelle prep_report) identique. Nick bw (wrapper qui retire --show-version) : Bkp réussi, [WARN], « — »."""
+            borg=shutil.which('borg'); me=os.path.realpath(__file__)
+            vr=subprocess.run([borg,'--version'],capture_output=True,text=True,stdin=subprocess.DEVNULL,timeout=60)
+            ver=vr.stdout.strip().split()[-1] if vr.returncode==0 and vr.stdout.strip() else None
+            d=os.path.join(tmp,'bver-real'); bb=os.path.join(d,'bb'); src=os.path.join(d,'src'); os.makedirs(src)
+            with open(os.path.join(src,'f'),'w') as f: f.write('x')
+            fq=socket.getfqdn(); rc=os.path.join(d,'rc'); cache=os.path.join(d,'cache'); w=os.path.join(d,'borgw'); w2=os.path.join(d,'borgw2')
+            _rb_wrapper(w,bb)
+            _rb_wrapper(w2,bb,mid='a=(); for x in "$@"; do [ "$x" = --show-version ] || a+=("$x"); done; set -- "${a[@]}"\n')
+            env=_rb_env(bb,BORG_PASSPHRASE='pw-bv')
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={cache}\n")
+                for nk,ww in (('bv',w),('bw',w2)):
+                    f.write(f"\n[{nk}]\nBORG_REPO={os.path.join(d,'repo-'+nk)}\nBORG_PASSPHRASE=pw-bv\nSER_NAME=bv\nSER_LOGIN=x\n"
+                            f"GLOB_ARCH={fq}-*\nBORG_ARCHNAME={nk}\nBORG_ROOTBKP={src}\nEXCLUDE=--exclude-caches\nDB_ENCRYPT=false\n"
+                            f"BORG_EXE={ww}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\n")
+            os.chmod(rc,0o600); cenv=_rb_cli_env(bb)
+            def cli(*a):
+                p=_rb_run([me,'-C',rc,'-c',*a],300,env=cenv); return p.returncode,p.stdout,p.stderr
+            for nk in ('bv','bw'):
+                r=_rb_run([borg,'init','-e','repokey',os.path.join(d,'repo-'+nk)],120,env=env)
+                if r.returncode!=0: print(f"  init {nk} : {r.stderr[-200:]}"); return False
+            r=_rb_run([borg,'create','--timestamp','2026-01-01T00:00:00',f"{os.path.join(d,'repo-bv')}::{fq}-ext-1",src],120,env=env)
+            if r.returncode not in (0,1): print(f"  create ext : {r.stderr[-200:]}"); return False
+            cb,ob,eb=cli('Bkp','-n','bv')
+            try: bj=json.loads(ob[ob.index('{'):]).get('borgHelper_borg_versions')
+            except ValueError: bj=None
+            cr,orp,_e=cli('Report','-n','bv','-o','-j')
+            try: rows=json.loads(orp)['backups']['bv']
+            except (ValueError,KeyError): rows={}
+            got={('ext' if '-ext-' in k else 'bkp'):v.get('borg') for k,v in rows.items() if k not in ('Prunable','Totaux')}
+            cl,ol,_e=cli('Report','-n','bv','-j')   # jumelle prep_report (borg en direct)
+            try: live={('ext' if '-ext-' in k else 'bkp'):v.get('borg') for k,v in json.loads(ol)['backups']['bv'].items() if k not in ('Prunable','Totaux')}
+            except (ValueError,KeyError): live={}
+            ct,ot,_e=cli('Report','-n','bv','-o')
+            ca,oa,_e=cli('ArchiveHistory','-n','bv','-j')
+            try: ah={('ext' if '-ext-' in x['archive'] else 'bkp'):(x.get('borg_version'),x.get('borg_server_version')) for x in json.loads(oa)['rows']}
+            except (ValueError,KeyError): ah={}
+            cs,os_,es=cli('Status','-n','bv'); os_+=es   # Status écrit sur stderr (printer)
+            cw,ow,ew=cli('Bkp','-n','bw')
+            cr2,orp2,_e=cli('Report','-n','bw','-o','-j')
+            try: gw=[v.get('borg') for k,v in json.loads(orp2)['backups']['bw'].items() if k not in ('Prunable','Totaux')]
+            except (ValueError,KeyError): gw=None
+            ok=(ver is not None and re.match(r'^\d+\.\d+',ver) and (cb,cr,cl,ct,ca,cs,cw,cr2)==(0,0,0,0,0,0,0,0)
+                and bj=={'archive':ver,'server':ver} and got=={'bkp':ver,'ext':'—'} and live==got and ' borg ' in ot
+                and ah=={'bkp':(ver,ver),'ext':(None,None)} and f"borg : {ver}" in os_
+                and "version de borg de l'archive inconnue" in ew and gw==['—'])
+            if not ok: print(f"  version {ver!r} ; codes {(cb,cr,cl,ct,ca,cs,cw,cr2)} ; Bkp {bj} ; Report {got} / direct {live} ; texte {' borg ' in ot} ; "
+                             f"ArchiveHistory {ah} ; Status {os_[-200:]!r} ; bw {gw} {ew[-200:]!r} ; Bkp {eb[-300:]!r}")
+            return ok
+        _rbc("versions de borg sur vrai borg : Bkp, Report (texte et JSON), ArchiveHistory, Status ; archive externe « — » ; sans --show-version",_bver_real_borg)
+        def _bver_real_ssh():
+            """1.0.165 (story 28) : vrais Bkp vers des dépôts ssh://, faux ssh (BORG_RSH : retire l'hôte, lance la commande en
+            local). BORG_REMOTE_PATH = wrapper du vrai borg serve : bs répond à --version « borg 9.9.9 » ; bx = vraie commande
+            forcée (borg serve quels que soient les arguments, entrée fermée) ; by échoue sur --version (code 3). Attendu (en
+            dur) : bs « <v> / srv 9.9.9 » (Report -o -j, Report -j en direct, Report -l HTML), ArchiveHistory et Status -j
+            (<v>, 9.9.9) ; bx serveur <v> lu dans la réponse de borg serve, sans [WARN] ; by : [WARN] « côté serveur inconnue
+            (code 3 », Report « <v> »."""
+            borg=shutil.which('borg'); me=os.path.realpath(__file__)
+            vr=subprocess.run([borg,'--version'],capture_output=True,text=True,stdin=subprocess.DEVNULL,timeout=60)
+            ver=vr.stdout.strip().split()[-1] if vr.returncode==0 and vr.stdout.strip() else None
+            d=os.path.join(tmp,'bver-ssh'); bb=os.path.join(d,'bb'); src=os.path.join(d,'src'); os.makedirs(src)
+            with open(os.path.join(src,'f'),'w') as f: f.write('x')
+            def sh(name,body):
+                p=os.path.join(d,name)
+                with open(p+'.tmp','w') as f: f.write("#!/bin/bash\n"+body+"\n")
+                os.chmod(p+'.tmp',0o700); os.replace(p+'.tmp',p); return p
+            rsh=sh('rsh','while [ "${1:0:1}" = "-" ]; do shift; done\nshift\nexec "$@"')
+            iso=('unset BORG_CACHE_DIR BORG_CONFIG_DIR BORG_SECURITY_DIR BORG_KEYS_DIR\n'
+                 f'export BORG_BASE_DIR="{bb}"\n')
+            srvs={'bs':sh('borgsrv','if [ "$1" = "--version" ]; then echo "borg 9.9.9"; exit 0; fi\n'+iso+f'exec "{borg}" "$@"'),
+                  'bx':sh('borgforce',iso+f'exec "{borg}" serve'),
+                  'by':sh('borgfail','if [ "$1" = "--version" ]; then echo "refusé" >&2; exit 3; fi\n'+iso+f'exec "{borg}" "$@"')}
+            w=os.path.join(d,'borgw'); _rb_wrapper(w,bb)
+            fq=socket.getfqdn(); rc=os.path.join(d,'rc'); env=_rb_env(bb,BORG_PASSPHRASE='pw-bs')
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n")
+                for nk,s in srvs.items():
+                    repo=os.path.join(d,'repo-'+nk)
+                    r=_rb_run([borg,'init','-e','repokey',repo],120,env=env)
+                    if r.returncode!=0: print(f"  init {nk} : {r.stderr[-200:]}"); return False
+                    f.write(f"\n[{nk}]\nBORG_REPO=ssh://fake{repo}\nBORG_RSH={rsh}\nBORG_REMOTE_PATH={s}\nBORG_PASSPHRASE=pw-bs\n"
+                            f"SER_NAME=bs\nSER_LOGIN=x\nGLOB_ARCH={fq}-*\nBORG_ARCHNAME={nk}\nBORG_ROOTBKP={src}\nEXCLUDE=--exclude-caches\n"
+                            f"DB_ENCRYPT=false\nBORG_EXE={w}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\n")
+            os.chmod(rc,0o600); cenv=_rb_cli_env(bb)
+            def cli(*a):
+                p=_rb_run([me,'-C',rc,'-c',*a],300,env=cenv); return p.returncode,p.stdout,p.stderr
+            def rows(o,nk):
+                try: return [v.get('borg') for k,v in json.loads(o)['backups'][nk].items() if k not in ('Prunable','Totaux')]
+                except (ValueError,KeyError): return None
+            out={}
+            for nk in srvs:
+                cb,ob,eb=cli('Bkp','-n',nk)
+                try: bj=json.loads(ob[ob.index('{'):]).get('borgHelper_borg_versions')
+                except ValueError: bj=None
+                cr,orp,_e=cli('Report','-n',nk,'-o','-j')
+                out[nk]=(cb,cr,bj,rows(orp,nk),'[WARN] '+nk+': version de borg côté serveur inconnue' in eb,eb[-300:])
+            cl,ol,_e=cli('Report','-n','bs','-j'); live=rows(ol,'bs')
+            ch,oh,_e=cli('Report','-n','bs','-o','-l')
+            ca,oa,_e=cli('ArchiveHistory','-n','bs','-j')
+            try: ah=[(x.get('borg_version'),x.get('borg_server_version')) for x in json.loads(oa)['rows']]
+            except (ValueError,KeyError): ah=None
+            cs,os_,_e=cli('Status','-n','bs','-j')
+            try: st=[(x['last_backup'].get('borg_version'),x['last_backup'].get('borg_server_version')) for x in json.loads(os_)]
+            except (ValueError,KeyError,TypeError): st=None
+            want_bs=f"{ver} / srv 9.9.9"
+            ok=(ver is not None and out['bs'][:5]==(0,0,{'archive':ver,'server':'9.9.9'},[want_bs],False)
+                and out['bx'][:5]==(0,0,{'archive':ver,'server':ver},[ver],False)
+                and out['by'][:5]==(0,0,{'archive':ver,'server':None},[ver],True) and 'code 3' in out['by'][5]
+                and (cl,ch,ca,cs)==(0,0,0,0) and live==[want_bs] and f">{want_bs}</td>" in oh and ">borg</td>" in oh.replace('</th>','</td>')
+                and ah==[(ver,'9.9.9')] and st==[(ver,'9.9.9')])
+            if not ok: print(f"  version {ver!r} ; {out} ; direct {live} ; HTML {(ch, want_bs in oh)} ; ArchiveHistory {ah} ; Status {st}")
+            return ok
+        _rbc("versions de borg sur vrai borg par ssh : serveur différent du créateur, commande forcée, échec du serveur",_bver_real_ssh)
         def _diff_type_change_split():
             """1.0.163 (story 26, A38) : parse_diff_entries_json — lignes mesurées sur borg 1.2.6 (m25b, m26b)."""
             L=lambda path,*ch: json.dumps({'path':path,'changes':list(ch)})

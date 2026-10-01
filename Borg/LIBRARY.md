@@ -730,8 +730,8 @@ sys.exit(0)
 | `get_history_db(nick)` | Chemin de la history.db d'un nick (1.0.139 : mesures non régénérables, en clair, sans chemin) |
 | `history_path(nick)` | Idem, après migration éventuelle de la diff.db du nick (lecteurs) ; ne crée jamais le fichier |
 | `ensure_history_db(path, create=True)` | Schéma de history.db ; `create=False` : ne rien créer si absente |
-| `store_archive_measure(nick, archive, archive_date, deduplicated_size, changed_during_backup, read_errors)` | Mesures d'une archive prises au Bkp (history.db) |
-| `get_archive_measures(nick)` | `{(archive, archive_date): {deduplicated_size, changed_during_backup, read_errors}}` (+ clé `(archive, None)` si le nom est unique) ; `{}` si aucune |
+| `store_archive_measure(nick, archive, archive_date, deduplicated_size, changed_during_backup, read_errors, db_path=None, borg_version=None, borg_server_version=None)` | Mesures d'une archive prises au Bkp (history.db) ; versions de borg (1.0.165, mot-clé, `None` = inconnue) |
+| `get_archive_measures(nick)` | `{(archive, archive_date): {deduplicated_size, changed_during_backup, read_errors, borg_version, borg_server_version}}` (+ clé `(archive, None)` si le nom est unique) ; `{}` si aucune |
 | `delete_archive_measures(nick, keep=None)` | Retire les mesures des archives absentes de `keep` (toutes si `keep` vide) |
 | `freeze_archive_chart(nick, rows, db_path=None)` | 1.0.140 — fige des lignes de graphique dans `history.db.archive_chart` (dicts `archive`, `archive_date`, `gone`, champs de graphique) ; jamais une valeur non nulle écrasée par `None` ; purge au-delà de `STATS_RETENTION_MONTHS` ; lève `sqlite3.Error` |
 | `get_archive_chart(nick, db_path=None)` | 1.0.140 — lignes figées dans la rétention : `[{archive, archive_date, duration, …, read_errors, gone}]` ; `[]` si aucune |

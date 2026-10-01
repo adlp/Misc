@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.19.5 -->
+<!-- UI_VERSION: 1.20.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -275,7 +275,7 @@
       <div style="overflow-x:auto">
       <table id="historyTableEl">
         <thead><tr><th>Archive</th><th>Durée</th><th>Taille orig.</th><th>Δ</th><th>Comp.</th>
-          <th>Dédup.</th><th>Fichiers</th><th>Modifs</th><th>Actions</th></tr></thead>
+          <th>Dédup.</th><th>Fichiers</th><th>Modifs</th><th>borg</th><th>Actions</th></tr></thead>
         <tbody id="historyBody"></tbody>
       </table>
       </div>
@@ -818,7 +818,8 @@ function _renderHistoryRows(backups,withActions){
     return `<tr><td>${escapeHtml(a)}</td><td>${escapeHtml(b.duration||'—')}</td>`
       +`<td>${escapeHtml(b.original_size||'—')}</td><td>${escapeHtml(b.size_delta||'—')}</td>`
       +`<td>${escapeHtml(b.compressed_size||'—')}</td><td>${escapeHtml(b.deduplicated_size||'—')}</td>`
-      +`<td>${escapeHtml(String(b.nfiles??'—'))}</td><td>${escapeHtml(b.modifications||'—')}</td>${actionsTd}</tr>`;
+      +`<td>${escapeHtml(String(b.nfiles??'—'))}</td><td>${escapeHtml(b.modifications||'—')}</td>`
+      +`<td title="version de borg de l'archive (/ srv : borg qui a reçu les données)">${escapeHtml(b.borg||'—')}</td>${actionsTd}</tr>`;
   }).join('');
   return {archives,html};
 }
@@ -837,7 +838,7 @@ async function loadHistoryInline(nick,panel){
   const {archives,html}=_renderHistoryRows(backups,false);
   panel.innerHTML = archives.length===0 ? '<p class="hint">Aucune archive indexée en base.</p>'
     : '<table><thead><tr><th>Archive</th><th>Durée</th><th>Taille orig.</th>'
-      +'<th>Δ</th><th>Comp.</th><th>Dédup.</th><th>Fichiers</th><th>Modifs</th></tr></thead><tbody>'+html+'</tbody></table>';
+      +'<th>Δ</th><th>Comp.</th><th>Dédup.</th><th>Fichiers</th><th>Modifs</th><th>borg</th></tr></thead><tbody>'+html+'</tbody></table>';
 }
 
 // ── Historique complet (toutes les archives + actions) ──────────────────────
@@ -857,7 +858,7 @@ async function loadHistoryFull(nick){
   const seq=++historyLoadSeq;
   const err=document.getElementById('historyError');
   const body=document.getElementById('historyBody');
-  err.textContent=''; body.innerHTML=`<tr><td colspan="9">${SPINNER}</td></tr>`;
+  err.textContent=''; body.innerHTML=`<tr><td colspan="10">${SPINNER}</td></tr>`;
   const r=await apiCall('GET','/report',{nick,json:'true',offline:'true'},false);
   if(seq!==historyLoadSeq) return; // une navigation plus récente a eu lieu entre-temps
   if(r.httpStatus===401) return;
@@ -869,7 +870,7 @@ async function loadHistoryFull(nick){
   catch(e){ err.textContent='Réponse Report illisible : '+r.stdout.slice(0,200); body.innerHTML=''; return; }
   const backups=(parsed.backups&&parsed.backups[nick])||{};
   const {archives,html}=_renderHistoryRows(backups,true);
-  body.innerHTML = archives.length===0 ? '<tr><td colspan="9">Aucune archive indexée en base.</td></tr>' : html;
+  body.innerHTML = archives.length===0 ? '<tr><td colspan="10">Aucune archive indexée en base.</td></tr>' : html;
 }
 
 // ── Graphiques Chart.js (Story 3, spec-charts-evolution-sauvegardes) ────────

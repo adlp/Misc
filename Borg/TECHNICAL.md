@@ -449,7 +449,7 @@ avertissement « base non chiffrée »). `DbStatus` l'affiche `plain (aucun chem
 |---|---|---|---|
 | `repo_stats` | historique des tailles du dépôt (`op` bkp/prune/index) | Bkp, Prune, refresh d'Index | `STATS_RETENTION_MONTHS` |
 | `bkp_status` | cycle de vie des Bkp (watcher push, `Status`) | Bkp seul ; réclamations CAS du watcher | `STATS_RETENTION_MONTHS` |
-| `archive_measure` | par `(nick, archive, archive_date)` : taille dédupliquée à la création, C/E | Bkp seul | tant que l'archive existe dans le dépôt (retirée par le rapprochement, après figeage ; jamais pour une archive seulement hors `GLOB_ARCH`, 1.0.146) |
+| `archive_measure` | par `(nick, archive, archive_date)` : taille dédupliquée à la création, C/E ; `borg_version`, `borg_server_version` (1.0.165 : colonnes ajoutées par introspection dans `ensure_history_db`, ajout pur ; un lecteur d'une base pas encore rouverte en écriture lit `NULL`) | Bkp seul | tant que l'archive existe dans le dépôt (retirée par le rapprochement, après figeage ; jamais pour une archive seulement hors `GLOB_ARCH`, 1.0.146) |
 | `archive_chart` (1.0.140) | par `(nick, archive, archive_date)` : ligne de graphique figée (`_CHART_FIELDS` + `gone`) | rapprochement de la base servie, `DIFF_KEEP` | `STATS_RETENTION_MONTHS`, que l'archive existe ou non |
 
 - **Lecture** : `history_path(nick)` / `_hist(nick)` ouvrent d'abord `diff.db` (`ensure_diff_db`, sans la créer), ce
@@ -552,13 +552,24 @@ nécessaires au figeage au premier Index d'un dépôt).
 ```
 set_priority_lock(nick)                                  → <repo>-priority.lock.<pid> (1.0.145)
     ↓
-borg create --json --stats --list --filter CE   (1.0.117 : --list limité aux statuts C/E)
+borg create --json --stats --list --filter CE --show-version   (1.0.117 : --list limité aux statuts C/E ;
+                                                                1.0.165 : --show-version)
     ↓
 _bkp_file_status() sur stderr → C (modifié pendant la sauvegarde) / E (erreur de lecture)
     → [WARN] résumé stderr + borgHelper_backup_warnings (JSON stdout)
+_show_version_of(stderr) → version du borg qui a créé l'archive (logger borg.output.show-version ; distant SSH_REMFO :
+    borg de la machine sauvegardée) — borg n'enregistre aucune version ailleurs (mesuré, 1.2.6)
+_bkp_server_version() → borg qui a reçu les données (ne lève jamais : appelée avant les mesures non régénérables) :
+    tunnel inverse (preBorg) vers cette machine (_remfo_target_local) = `<BORG_REMOTE_PATH|borg> --version` local, vers
+    une autre : None ; dépôt ssh direct = `<BORG_RSH|ssh> [-o BatchMode=yes -o ControlMaster=no -o ControlPath=none]
+    [-p port] hôte <BORG_REMOTE_PATH|borg> --version` ; dépôt local (chemin, file://) = créateur. Environnement de boex
+    (clés borg du rc, PATH, LC_ALL), stdin fermé, start_new_session (sans terminal), _BORG_VERSION_TIMEOUT 15 s puis
+    killpg + _MEI apparus retirés, décodage tolérant. _version_from_output : « borg… X.Y » ou réponse de borg serve
+    lancé par une clé à commande forcée (« Borg X.Y: Got connection close… », mesuré). Sans numéro, code 0 : None en
+    silence ; échec : [WARN], jamais d'échec ; JSON stdout borgHelper_borg_versions {archive, server}
     ↓
 store_archive_stats(nick, archive_new, ...)              → diff.db archive_stats (régénérable)
-store_archive_measure(nick, archive_new, date, dédup, C, E) → history.db archive_measure (1.0.139)
+store_archive_measure(nick, archive_new, date, dédup, C, E, borg_version, borg_server_version) → history.db archive_measure
 store_repo_stats(nick, 'bkp', ...)                       → history.db repo_stats
     ↓
 clear_priority_lock(nick)                                → son fichier supprimé (Bkp terminé ; ceux des autres restent)

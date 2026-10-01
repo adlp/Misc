@@ -288,6 +288,12 @@ async ${grab('reloadMachineCard')}
   eq('historique externe sans delete : pas de 🗑',page._renderHistoryRows(bk,true).html.includes('hist-delete-btn'),false);
   page.set(acc({ext:{ops:['read','restore','delete']}}),'ext');
   eq('historique avec delete : 🗑 proposé',page._renderHistoryRows(bk,true).html.includes('hist-delete-btn'),true);
+  // UI 1.20.0 (borgHelper 1.0.165, A44) : colonne « borg » = champ borg de Report, « — » si absent
+  const bv={'a-1':{duration:'1s',modifications:'M1',borg:'1.2.6 / srv 1.2.4'},'a-2':{duration:'1s',modifications:'M2'},Totaux:{}};
+  const hv=page._renderHistoryRows(bv,false).html;
+  // ordre : … Modifs puis borg, dernière cellule de la ligne (sans actions)
+  eq('historique : colonne borg après Modifs (version, « — » si inconnue)',
+     [/>M1<\/td><td[^>]*>1\.2\.6 \/ srv 1\.2\.4<\/td><\/tr>/.test(hv),/>M2<\/td><td[^>]*>—<\/td><\/tr>/.test(hv)],[true,true]);
   // Carte rechargée à la fin d'un Bkp : nouveau rapport affiché, historique relu, sans ▶ Backup pour un externe
   let replaced=null; page.cards().ext={isConnected:true,replaceWith(c){ replaced=c; }};
   page.set(acc({ext:{external:true,ops:['read','restore']}}),'ext');

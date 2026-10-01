@@ -508,6 +508,25 @@ Formule (identique résumé et détail) :
 
 - `—` si l'archive n'est pas encore indexée
 
+**Version de borg** (1.0.165) — colonne `borg` du détail par archive (texte, HTML, JSON ; UI 1.20.0 : historiques court
+et complet) : version du borg qui a **créé** l'archive, suivie de `/ srv X` quand le borg qui a **reçu** les données
+est connu et différent (`1.2.6`, `1.2.6 / srv 1.2.4`), `—` si inconnue. borg n'enregistre aucune version (ni dans
+l'archive, ni dans le dépôt, et `borg serve` ne transmet pas la sienne : mesuré, borg 1.2.6) : borgHelper la relève
+lui-même **au Bkp** — archives créées hors borgHelper (dépôts externes) ou avant 1.0.165 : `—`.
+- Créateur : message `borgbackup version X` de `borg create --show-version` (Bkp local comme distant `SSH_REMFO`, où
+  c'est le borg de la machine sauvegardée) — aucune connexion de plus.
+- Serveur, selon le mode :
+  - tunnel inverse `SSH_REMFO` vers cette machine (`port:localhost:22`, `127.0.0.1`, `::1`, son nom) : le `borg serve`
+    tourne ici -> `<BORG_REMOTE_PATH|borg> --version` en local ; tunnel vers une autre machine : `—` et `[WARN]` ;
+  - dépôt ssh direct (`user@hôte:…`, `ssh://…`, IPv6 entre crochets) : `<BORG_RSH|ssh> [-p port] hôte
+    <BORG_REMOTE_PATH|borg> --version`, avec l'environnement du borg du Bkp (sans agent ssh), entrée fermée, sans
+    terminal (jamais d'invite de mot de passe), `BatchMode`/`ControlMaster=no` pour ssh, 15 s ; une clé à commande
+    forcée (`command="borg serve …"` dans `authorized_keys`) lance `borg serve`, dont la réponse porte la version
+    (`Borg 1.2.6: Got connection close…`, mesuré) : lue quand même ;
+  - dépôt local (chemin, `file://`) : celle du créateur.
+- Réponse sans numéro : `—` en silence ; échec (code d'erreur, délai, exécutable absent) : `—` et `[WARN]` ; jamais
+  d'échec du Bkp ni de mesure perdue. JSON du Bkp : `borgHelper_borg_versions` `{archive, server}`.
+
 **Mode offline** (`-o`) — rapport sans appel borg, depuis `diff.db` uniquement :
 - `nfiles` et tailles par archive disponibles si `archive_stats` est peuplée (après `Bkp` ou `Index`)
 - `taille` (taille dédupliquée du dépôt entier) disponible si `repo_stats` est peuplée (après `Bkp` ou `Prune` réel — dernière ligne historique, quel que soit son type)
@@ -1035,6 +1054,9 @@ d'archives n'est pas indexée (première archive, purgée par `DIFF_KEEP`, `NOID
 passé). Et `changed_during_backup`/`read_errors` (1.0.117) : fichiers modifiés pendant la sauvegarde /
 erreurs de lecture, relevés par le Bkp — `null` si inconnus (archive antérieure, ou statistiques
 rattrapées par Index).
+Depuis 1.0.165 : `borg_version` / `borg_server_version` — versions de borg relevées au Bkp (créateur de l'archive,
+borg qui a reçu les données ; voir `Report`, « Version de borg ») — `null` si inconnues (archive créée hors borgHelper
+ou avant 1.0.165, ligne figée).
 Depuis 1.0.140 : `pruned` (booléen) sur chaque ligne. `true` = archive disparue du dépôt, ligne figée dans
 `history.db` au moment de sa disparition et gardée `STATS_RETENTION_MONTHS` (graphiques sur 13 mois même avec une
 rétention d'archives courte) — jamais restaurable. Pour une archive présente dont la paire précédente a été retirée
@@ -1066,7 +1088,9 @@ En texte, en ligne de commande, une ligne finale signale les restes à nettoyer 
 
 Par nick :
 - **Dernier backup connu** : archive + date depuis `archive_stats` (déjà indexée localement) + âge
-  lisible (« il y a 3h12 ») ; « aucune archive indexée » si le nick n'a jamais été indexé.
+  lisible (« il y a 3h12 ») ; « aucune archive indexée » si le nick n'a jamais été indexé. Ligne suivante (1.0.165) :
+  `borg : 1.2.6` (ou `1.2.6 / srv 1.2.4`, `—`), versions relevées au Bkp de cette archive ; JSON : `last_backup`
+  porte `borg_version` et `borg_server_version`.
 - **Bkp en cours** : si une ligne `bkp_status` non terminée existe, « Bkp en cours depuis HH:MM
   (XhYYmin) ». Démarrée depuis plus que le délai du nick (1.0.154) : « Bkp sans fin depuis HH:MM (XhYYmin) — probablement
   interrompu (délai 6 h dépassé) », jamais « en cours » (date affichée au-delà de 24 h). Seule la dernière ligne du nick

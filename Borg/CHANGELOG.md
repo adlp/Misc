@@ -1,5 +1,30 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.165 / UI 1.20.0 — versions de borg dans les rapports — 2026-10-01
+
+Chantier « reconstruction progressive », story 28 (actions de rétrospective A44, note de l'utilisateur, et A40/A41).
+
+- **Versions de borg** : borg n'enregistre aucune version logicielle (archive, manifeste, dépôt ; `borg serve` ne
+  transmet pas la sienne — mesuré, borg 1.2.6). borgHelper les relève désormais **au Bkp** et les garde dans
+  `history.db` (`archive_measure.borg_version`, `borg_server_version`, colonnes ajoutées sans changer la version de
+  schéma) :
+  - créateur de l'archive : `borg create --show-version` (message `borgbackup version X`), local comme distant
+    (`SSH_REMFO` : borg de la machine sauvegardée), sans connexion de plus ;
+  - borg qui a reçu les données : tunnel inverse `SSH_REMFO` vers cette machine -> `borg --version` local (vers une
+    autre machine : inconnue) ; dépôt ssh direct -> `ssh hôte borg --version` (environnement du borg du Bkp, entrée
+    fermée, sans terminal, `BatchMode`, 15 s) — une clé à commande forcée lance `borg serve`, dont la réponse porte la
+    version (mesuré) ; dépôt local -> celle du créateur ;
+  - réponse sans numéro -> « — » en silence ; échec -> `[WARN]` ; jamais d'échec du Bkp ni de mesure perdue ; JSON du
+    Bkp : `borgHelper_borg_versions`.
+- **Affichage** : colonne `borg` de Report (texte, HTML, JSON ; `1.2.6`, `1.2.6 / srv 1.2.4`, `—`), champs
+  `borg_version`/`borg_server_version` d'ArchiveHistory et de `last_backup` dans Status (ligne `borg : …` en texte).
+  Archives créées hors borgHelper ou avant 1.0.165 : `—`.
+- **UI 1.20.0** : colonne « borg » dans les historiques court et complet.
+- CodecSelfTest : contrôles « versions de borg » (lecture, serveur selon le mode avec exécutables simulés — délai,
+  sortie non UTF-8, agent ssh, vrai `borg serve` en commande forcée —, tunnel inverse simulé dans `backup()`, history.db
+  d'avant, à moitié migrée ou plus récente ; vrai borg local et par ssh : Bkp, Report, ArchiveHistory, Status, archive
+  externe, sans `--show-version`).
+
 ## borgHelper 1.0.164 — snapshots par version, convertisseur borgmatic — 2026-09-30
 
 Chantier « reconstruction progressive », story 27 (actions de rétrospective A37, note de l'utilisateur, et A39).
