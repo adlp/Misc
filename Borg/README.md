@@ -210,7 +210,8 @@ DB_KDF     = standard
 `DB_ENCRYPT=true` (défaut) : depuis 1.0.168, une base **neuve** (`diff.db`, `cache.db`) créée par `Bkp`/`Index`/`Prune`/
 `Diff`/`Report` (cache de `borg info`) est chiffrée dès sa création quand la passphrase est disponible — sauf pour une base
 partagée (`DB_NAME` sur ce nick, ou autre nick dont le `DB_NAME` désigne ce nick : en clair, comme avant). Base née d'une
-passphrase fausse et encore sans aucun chemin : le créateur suivant, avec la bonne passphrase, lui pose une nouvelle clé.
+passphrase fausse et encore sans aucun chemin : le créateur suivant, avec la bonne passphrase, lui pose une nouvelle clé ;
+d'ici là (1.0.169), les lectures la voient vide (« Index vide — lancez Index »), sans `DbKeyError`.
 `DbEncrypt -y`/`DbDecrypt -y` mettent aussi `cache.db` dans le mode voulu quand `diff.db` y est déjà. Une base **existante** en clair reste `plain` tant qu'on n'a pas lancé `DbEncrypt`
 dessus (elle ne le devient pas toute seule — pas de migration implicite). Si une base reste `plain` alors que `DB_ENCRYPT` est actif et qu'une passphrase est disponible,
 `borgHelper` avertit une fois par base (par invocation, sur stderr) et cite la commande à lancer. `DbEncrypt`/
@@ -1173,7 +1174,9 @@ Après suppression, `IdxPurge` recalcule `diff_indexed_pairs.entry_count` et com
 
 Le compactage laisse la base en mode WAL (1.0.137) et ne remplace plus jamais le fichier sous les processus qui l'ont ouvert (1.0.138) : il est reporté, base intacte, si un Bkp/Restore/Prune est en cours ou démarre, si la base est modifiée pendant la copie, ou si elle reste verrouillée en écriture par un autre processus. Si une base est momentanément verrouillée par un autre processus,
 borgHelper affiche `[ERREUR] DB occupée : … réessayer plus tard (ne PAS supprimer le fichier)`. Seul `[ERREUR] DB corrompue : …` invite
-à supprimer le fichier pour reconstruire.
+à supprimer le fichier pour reconstruire. Supprimée pendant qu'un Index, un Bkp ou borgHelperWWW la tenait encore ouverte,
+une `diff.db` ou une `cache.db` ne peut pas être recréée tout de suite : `[ERREUR] DB : … recréée alors qu'un autre processus tenait encore
+l'ancienne ouverte` (1.0.169) — attendre la fin de ce processus, puis relancer ; ne rien supprimer de plus.
 
 > **Workflow recommandé :**  
 > `IdxTop` → identifier les arborescences volumineuses → ajouter à `IDX_EXCLUDE` dans borghelperrc → `IdxPurge` (sans `-x`) pour purger l'historique existant.

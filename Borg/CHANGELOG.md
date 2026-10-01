@@ -1,5 +1,34 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.169 / borgHelperWWW 1.28.7 — base vide née d'une autre passphrase, base recréée tenue ailleurs — 2026-10-01
+
+Chantier « reconstruction progressive », story 32 (actions de rétrospective A52, A53 ; regroupement demandé par
+l'utilisateur).
+
+- **Lecteurs, base née d'une passphrase fausse** (premier Index avant que borg ne la refuse) **et passphrase corrigée** :
+  la base n'a aucun chemin, elle se lit désormais comme une base vide — « Index vide pour lb — lancez : borgHelper -c
+  Index -n lb », Report -o comme un nick jamais indexé, UI sans erreur. Avant : `DbKeyError : passphrase incorrecte`
+  (code 2) sur toute lecture jusqu'au prochain Index/Bkp, qui répare (1.0.168). Le lecteur n'écrit rien et garde sa vue
+  vide même si un Index répare la base pendant sa lecture. Base avec données, passphrase absente, KDF indisponible, base
+  hors WAL, Index/Bkp eux-mêmes : `DbKeyError` comme avant (l'Index ne lance jamais de `borg diff` sur une telle base sans
+  la réparer). `cache.db` dans le même état : Report direct n'échoue plus sur la purge du cache ; la base est réparée par
+  le cache manqué qui suit.
+- **Base recréée alors qu'un autre processus tient encore l'ancienne** (supprimée pendant un Index, un Bkp ou une
+  requête borgHelperWWW) : `[ERREUR] DB : … recréée alors qu'un autre processus tenait encore l'ancienne ouverte —
+  attendre la fin de ce processus (ou l'arrêter), puis relancer`. Avant : « DB corrompue … disk I/O error — Supprimez le
+  fichier et relancez » (conseil faux), et le deuxième essai redonnait ce conseil. `diff.db`/`cache.db` seulement. Rien
+  n'est supprimé.
+- Contrôle périodique de borgHelperWWW : plus de vue créée dans un fichier encore sans table (lui donnait un schéma avant
+  sa création : base née en clair).
+- Mesuré, sans correctif : un `-wal`/`-shm` orphelin (processus tué) n'est jamais rejoué à la recréation d'une base
+  supprimée (SQLite 3.37.2) ; KDF dérivée pour rien sur une base corrompue : 0,2 s au plus.
+- **borgHelperWWW 1.28.7** : la sonde de chiffrement d'un nick (`_nick_owner_codec`) garde ce nick verrouillé (aucune
+  ligne de cache de périmètre), jamais pris pour une base en clair.
+- CodecSelfTest : « base vide clé fausse » (10 lecteurs == base vide : sortie, code, rien écrit ; limites du repli ;
+  lecture seule ; vue figée et reprise pendant une réparation ; contrôle de vue ; vrai borg passphrase fausse puis corrigée),
+  « base supprimée tenue » (vrai tenant en sous-processus, deux essais, diff.db, cache.db, création chiffrée ; vraie
+  corruption par `ensure_*`) ; push_selftest : sonde verrouillée.
+
 ## borgHelper 1.0.168 — base neuve chiffrée d'office, message réel du Report — 2026-10-01
 
 Chantier « reconstruction progressive », story 31 (actions de rétrospective A48, A50, A51 ; regroupement demandé par

@@ -75,10 +75,13 @@ borg diff échoué ») ; ailleurs elle se propage à l'appelant.
 
 ```python
 from borgHelper import _open_db, DbKeyError
-conn = _open_db(db_path, nick='mon-serveur', role='read')   # BhConnection ; .codec est None si la base est plain
+conn = _open_db(db_path, nick='mon-serveur', role='read')   # BhConnection ; .codec est None si la base est plain (ou mode 'empty', voir plus bas)
 ```
 
-`_open_db(db_path, nick=None, role='read', passphrase=None, **kw)` est le seul point d'ouverture SQLite (les `kw`,
+`_open_db(db_path, nick=None, role='read', passphrase=None, empty_ok=False, **kw)` est le seul point d'ouverture SQLite
+(1.0.169 : avec `empty_ok=True` en lecture, une base siv1 en WAL sans aucun chemin que la passphrase n'ouvre pas est rendue
+vide — `conn.mode == 'empty'`, `codec None` (ce n'est PAS une base en clair), lecture seule, instantané figé — au lieu de
+`DbKeyError` ; une `DbKeyError` dont `wrong_key` est vrai signale une enveloppe qui refuse la passphrase (même type, même nom affiché) ; les `kw`,
 ex. `timeout=60`, sont transmis à `sqlite3`). `db_encrypt_enabled(nick)` / `db_kdf_level(nick)` lisent `DB_ENCRYPT` /
 `DB_KDF`.
 

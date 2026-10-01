@@ -2180,7 +2180,30 @@ DEK mise en cache. **DbEncrypt/DbDecrypt** : `diff.db` déjà dans le mode cible
 Prune, `indexsnap`, `_index_pass` ; jamais `_shadow_prepare` (le fantôme recopie l'en-tête de sa base servie).
 Base existante, même vide : jamais chiffrée hors `DbEncrypt` (décision de l'utilisateur : une connexion en clair déjà
 ouverte ailleurs y écrirait des chemins en clair). `_open_db` n'avertit plus (AD-6) sur un fichier sans table : un lecteur
-qui cherche dans un cache absent le crée vide (`O_CREAT`) juste avant que son créateur le fasse naître chiffré.
+qui cherche dans un cache absent le crée vide (`O_CREAT`) juste avant que son créateur le fasse naître chiffré ;
+`archive_view_check` (contrôle périodique de borgHelperWWW) n'y crée plus de vue (état `empty`, 1.0.169).
+**Lecteur d'une base vide née d'une autre passphrase (1.0.169, story 32, A53)** : `_open_db(role='read', empty_ok=True)` —
+opt-in des COMMANDES de lecture seulement (Search, FileHist, TreeHist, TreeFind, DuIdx, IdxTop, DiffTop, Report -o et ses
+stats, Status, ArchiveHistory, List, DiffBkp, CacheList, lookups du cache ; 25 ouvertures) ; défaut `False` : moteur
+d'Index/Bkp (il écrit derrière : `is_diff_pair_indexed`, `_index_diffs`, rapprochement…), Restore, bibliothèque, sonde de
+borgHelperWWW. Conditions : en-tête siv1, enveloppe qui refuse la passphrase présente (`DbKeyError` marquée `wrong_key`, MAC — pas « KDF
+indisponible »), base en WAL, aucune ligne dans `_PATH_TABLES` (`snapshot_file`, `diff_index`, `cachejsonboexlm`) -> connexion
+`codec=None`, `mode='empty'`, `PRAGMA query_only`, DANS une transaction de lecture (`_empty_snapshot` : instantané WAL figé à
+la première lecture) : un Index qui répare l'en-tête puis écrit des chemins n'est jamais lu en clair par ce lecteur. En-tête
+changé entre sa lecture et l'instantané (réparé entre-temps) : une reprise (`_retried`). Échec mémorisé (`_DEK_FAIL` : pas
+de KDF refaite pour la même enveloppe et la même passphrase). `purge_stale_cache` : `DbKeyError` `wrong_key` -> rien à purger (Report
+direct sur une `cache.db` née d'une autre passphrase : cache manqué, puis réparation par son créateur). borgHelperWWW 1.28.7 :
+`_nick_owner_codec` passe `empty_ok=False` (nick verrouillé, aucun cache de périmètre).
+**Base recréée tenue ailleurs (1.0.169, A52)** — mesuré (SQLite 3.37.2) : un `-wal`/`-shm` orphelin (processus tué) n'est
+jamais rejoué quand la base est recréée, fichier principal absent ou vide (l'ancien WAL est jeté au passage en WAL) ;
+mais un processus qui tient encore l'ancienne base (trames WAL non reportées) fait échouer la recréation en
+`disk I/O error` (son `-shm` décrit l'ancien fichier). `ensure_*_db` relève l'état avant création (`_held_before` :
+`-shm` présent, principal absent ou vide) ; `_db_schema_fail(held=True)` + `disk I/O error` -> message dédié, jamais
+« Supprimez le fichier ». Rien n'est supprimé : retirer `-wal`/`-shm` répare aussi (mesuré) mais deux créateurs
+simultanés pourraient s'effacer leur journal (décision de l'utilisateur). Revue : le premier essai raté laisse le fichier
+principal à 4096 octets (en-tête écrit par le passage en WAL, sans table) -> `_held_before` le compte aussi (`not
+_db_has_schema`), chemin résolu (`realpath` : SQLite nomme le `-shm` d'après la cible d'un lien). `history.db` non
+couverte (« restaurer depuis une sauvegarde » inchangé).
 
 ### Limitations connues (acceptées, pas de correctif prévu)
 

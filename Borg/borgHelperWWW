@@ -66,7 +66,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.28.6"
+WWW_VERSION="1.28.7"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -1717,7 +1717,9 @@ def _nick_owner_codec(nick):
     if cached is not _MEMO_MISS and cached[0]==header: return cached[1]
     conn=None
     try:
-        conn=_open_db(diff_db,nick=nick,role='read',passphrase=pw)
+        # 1.28.7 : empty_ok=False — base vide née d'une autre passphrase (borgHelper 1.0.169, A53) : jamais prise pour une base
+        # en clair (lignes de cache écrites en clair) ; reste verrouillée jusqu'à la réparation par l'Index suivant
+        conn=_open_db(diff_db,nick=nick,role='read',passphrase=pw,empty_ok=False)
         result=conn.codec  # None (base plain) ou DbCodec (siv1 + passphrase correcte)
     except (DbKeyError,DbTamperError,DbCodecError,sqlite3.Error):
         result=_CACHE_LOCKED
@@ -3863,6 +3865,25 @@ def push_selftest():
                                 and left=={_scope_cache_key(nk+'-autre','treehist',{},'s')})
                     finally:
                         _bh_paths.db.get_diff_db=old; SCOPE_CACHE_DB=old_sc; _NICK_CODEC_MEMO.clear()
+                def _codec_locked_empty_wrong_key():
+                    """1.28.7 (borgHelper 1.0.169, A53) : base VIDE dont l'en-tête siv1 vient d'une autre passphrase (premier Index
+                    avec une passphrase fausse) -> le nick reste verrouillé (_CACHE_LOCKED), jamais pris pour une base en clair
+                    (les lecteurs de borgHelper la voient vide ; la sonde passe empty_ok=False). Base temporaire."""
+                    import borgHelper as _bhm
+                    with_pw=[n for n in _nick_list('ALL') if (_bh_paths.borg.cfgread(n) or {}).get('BORG_PASSPHRASE')]
+                    if not with_pw: print("  (sans objet : aucun nick du rc n'a de passphrase)"); return True
+                    nk=with_pw[0]; tmpdb=os.path.join(tmpdir,'locked-empty-diff.db')
+                    pw=(_bh_paths.borg.cfgread(nk) or {}).get('BORG_PASSPHRASE')
+                    old=_bh_paths.db.get_diff_db; _bh_paths.db.get_diff_db=lambda n: tmpdb
+                    try:
+                        _bh_paths.db.ensure_diff_db(tmpdb)
+                        c=sqlite3.connect(tmpdb); _bhm._enc_header_write(c,_bhm._enc_header_build((pw or '')+'-autre','siv1','light')[0]); c.close()
+                        _NICK_CODEC_MEMO.clear()
+                        got=_nick_owner_codec(nk)
+                        r=_open_db(tmpdb,nick=nk,role='read',passphrase=pw,empty_ok=True); seen=r.mode; r.close()   # lecteur borgHelper : vue vide
+                        return got is _CACHE_LOCKED and seen=='empty'
+                    finally:
+                        _bh_paths.db.get_diff_db=old; _NICK_CODEC_MEMO.clear()
                 def _cache_key_covers_route_params():
                     """deferred-work (Story 1.5) : chaque paramètre d'une route servie par le cache de périmètre doit
                     figurer dans la clé (`params`) — sinon deux requêtes différentes partagent la même ligne et
@@ -4295,6 +4316,8 @@ def push_selftest():
                       _schema_watch_ok)
                 check("memo de codec : en-tête chiffré posé en cours de route (DbEncrypt CLI) -> pris en compte sans redémarrage, lignes scopecache en clair de ce nick purgées",
                       _codec_memo_follows_header)
+                check("memo de codec : base vide née d'une autre passphrase -> nick verrouillé (jamais « en clair »), lecteur borgHelper : vue vide",
+                      _codec_locked_empty_wrong_key)
                 r=client.get("/version")
                 check("route /version : push_available + bornes d'expiration exposées",
                       lambda: {'push_available','push_default_expiry_days','push_max_expiry_days'}<=set(r.json()))
