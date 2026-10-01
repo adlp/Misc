@@ -1,5 +1,37 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.168 — base neuve chiffrée d'office, message réel du Report — 2026-10-01
+
+Chantier « reconstruction progressive », story 31 (actions de rétrospective A48, A50, A51 ; regroupement demandé par
+l'utilisateur).
+
+- **Base neuve chiffrée dès sa création** : `diff.db` ou `cache.db` d'un nick créée par Index, Bkp, Prune, Diff ou un
+  cache de `borg` alors que `DB_ENCRYPT` est actif et la passphrase présente -> en-tête `siv1` posé dans la même
+  transaction que le schéma (KDF `DB_KDF`), sans message. Avant : base créée en clair, `[WARN] base non chiffrée` à
+  chaque commande jusqu'à un `DbEncrypt -y`. Jamais pour une base existante (même vide : `[WARN]` et `DbEncrypt` comme
+  avant), un nick avec `DB_NAME` (base partagée, peut-être d'autres passphrases), un fantôme `.rebuild`, ni sans
+  passphrase / avec `DB_ENCRYPT=false`. Deux créateurs simultanés : une seule clé ; un créateur en clair passé avant :
+  base laissée en clair.
+- `[WARN] base non chiffrée` n'apparaît plus pour un fichier encore sans table (lecture du cache avant sa création,
+  par exemple au premier Report) : ce n'était pas une base en clair ; `DbStatus` l'affiche `absent`.
+- Base partagée vue de l'autre côté (nick sans `DB_NAME` dont le fichier est la cible du `DB_NAME` d'un autre nick) :
+  jamais chiffrée d'office non plus. `DB_ENCRYPT`/`DB_KDF` invalides : base en clair, sans ligne `[ERREUR]` de plus.
+- Base née d'une passphrase fausse (premier Index/Bkp avant que borg ne la refuse) et **sans aucun chemin** : le
+  créateur suivant, avec la bonne passphrase, remplace son en-tête (décision de l'utilisateur) ; base avec données :
+  `DbKeyError` comme avant.
+- `DbEncrypt -y` / `DbDecrypt -y` : `diff.db` déjà dans le mode cible -> `cache.db` mise quand même dans ce mode (avant :
+  « déjà chiffrée » et `cache.db` laissée en clair, `[WARN]` sans issue).
+- **Report, base illisible** : `reste` porte le message réel de l'arrêt (`⚠ DB corrompue : …/rc-nick-diff.db ->
+  database disk image is malformed …`), complet, en texte, HTML et JSON, hors ligne comme en direct — avant
+  `⚠ base illisible (voir message)`. Report direct : plus de ligne `[ERREUR] nick: base illisible (voir message)` en
+  doublon sur stderr.
+- Interne : les 7 lecteurs multi-nicks et la boucle de `main` des lectures texte partagent une seule règle d'isolation
+  par nick (`_PerNick`) au lieu de 8 copies ; sorties inchangées (96 cas comparés à 1.0.167 : 3 configurations ×
+  nick seul/plusieurs × 16 commandes, stdout, stderr et code identiques).
+- CodecSelfTest : « base neuve chiffrée » (création diff/cache, 6 refus, créateur concurrent en clair ou chiffrant,
+  Index réel sans base -> siv1 et sorties == base en clair) ; « base occupée : Report multi-nicks » attend le message
+  réel et l'absence de doublon ; Report HTML (`-l`) : message réel échappé, repli `⚠ arrêt (code N)`.
+
 ## borgHelper 1.0.167 / borgHelperWWW 1.28.6 — Bkp -n ALL, lecteurs multi-nicks, dépôt absent — 2026-10-01
 
 Chantier « reconstruction progressive », story 30 (tri A46 de deferred-work, A47, A49 ; regroupement demandé par

@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.167"
+Version="1.0.168"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -1829,11 +1829,14 @@ def _open_db(db_path,nick=None,role='read',passphrase=None,**kw):
                 # dispo) — avertissement, jamais bloquant (mode plain toujours valide, voir AD-2/AD-5).
                 # db_encrypt_enabled peut lever SystemExit sur une config invalide : n'importe pas ici,
                 # ce n'est qu'un avertissement — la commande réelle lèvera la même erreur à son tour.
+                # 1.0.168 (story 31) : fichier sans table (lookup d'un lecteur avant toute création, O_CREAT ci-dessus) : pas
+                # une base en clair — son créateur la fera naître chiffrée (_new_db_header) ; même règle que db_plain_anomalies.
                 try:
                     if (not _is_shadow(db_path) and db_encrypt_enabled(nick)   # fantôme : même mode que sa base, déjà signalée
-                            and (passphrase if passphrase is not None else _resolve_passphrase(nick,db_path))):
+                            and (passphrase if passphrase is not None else _resolve_passphrase(nick,db_path))
+                            and conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is not None):
                         _warn_plain_db(nick,db_path)
-                except SystemExit: pass
+                except (SystemExit,sqlite3.Error): pass   # avertissement seulement : jamais un échec d'ouverture
     except BaseException:
         conn.close(); raise
     return conn
@@ -2051,27 +2054,64 @@ def _nick_stop_msg(e,mark,multi):
     if not multi: return None
     if isinstance(e,SystemExit):
         if e.code in (0,None,130): return None
-        seen=_print_since(mark)
-        k=max((i for i,l in enumerate(seen) if isinstance(l,str) and l.lstrip().startswith('[ERREUR]')),default=None)
-        if k is None: return f"arrêt (code {e.code})"
-        lines=[seen[k].strip()[len('[ERREUR]'):].strip()]+[l.strip() for l in itertools.takewhile(lambda l: l[:1].isspace(),seen[k+1:k+3])]
-        return ' '.join(x for x in lines if x)
+        return _stop_text(e,mark)
     msg=f"{type(e).__name__} : {e}"
     printer(f"[ERREUR] {msg}")
     return msg
 
+def _html_esc(s):
+    """Texte libre (message d'erreur réel : chemin, « -> ») inséré dans le HTML de Report -l (htmlTabelise n'échappe rien)."""
+    import html
+    return html.escape(str(s),quote=True)
+
+def _stop_text(e,mark):
+    """Message réel d'un sys.exit (DB corrompue, occupée…), déjà affiché : dernière ligne [ERREUR] depuis `mark` et son
+    détail indenté (deux lignes au plus) ; sans ligne [ERREUR] : « arrêt (code N) ». 1.0.168 : partagé par les lecteurs
+    multi-nicks (_nick_stop_msg) et Report (A51)."""
+    seen=_print_since(mark)
+    k=max((i for i,l in enumerate(seen) if isinstance(l,str) and l.lstrip().startswith('[ERREUR]')),default=None)
+    if k is None: return f"arrêt (code {e.code})"
+    lines=[seen[k].strip()[len('[ERREUR]'):].strip()]+[l.strip() for l in itertools.takewhile(lambda l: l[:1].isspace(),seen[k+1:k+3])]
+    return ' '.join(x for x in lines if x)
+
+class _PerNick:
+    """1.0.168 (story 31, A50) : isolation par nick d'une lecture multi-nicks — seule copie de la règle (story 30) :
+        iso=_PerNick(nick,on_stop)
+        for n in iso.nicks:
+            with iso(n,lambda: conn): ...corps du nick (continue permis)...
+        iso.done()
+    Un arrêt _NICK_STOP d'un nick parmi plusieurs est signalé (_nick_stop_msg), passé à on_stop(n,msg) (JSON par nick),
+    la connexion rendue par le lambda (lu à la sortie : celle du nick en cours, une déjà fermée ou inexistante) est
+    fermée, et les nicks suivants continuent. Nick seul, Ctrl-C (130), sys.exit(0) : relancé tel quel. done() : tous en
+    échec -> la PREMIÈRE erreur relancée, comme un nick seul."""
+    def __init__(self,nick,on_stop=None):
+        self.nicks=nick.split(','); self.multi=len(self.nicks)>1; self.on_stop=on_stop
+        self.ko=0; self.stop=None; self.n=None; self.conn=None; self.mark=None
+    def __call__(self,n,conn=None):
+        self.n=n; self.conn=conn; return self
+    def __enter__(self):
+        self.mark=_print_mark(); return self
+    def __exit__(self,et,e,tb):
+        if et is None or not issubclass(et,_NICK_STOP): return False
+        msg=_nick_stop_msg(e,self.mark,self.multi)
+        if msg is None: return False
+        if self.on_stop is not None: self.on_stop(self.n,msg)
+        if self.conn is not None:
+            try: self.conn().close()   # connexion du nick arrêté (ou déjà fermée / inexistante)
+            except Exception: pass
+        self.ko+=1; self.stop=e if self.stop is None else self.stop
+        return True
+    def done(self):
+        if self.stop is not None and self.ko==len(self.nicks): raise self.stop
+
 def _per_nick_main(nick,fn):
     """1.0.167 (story 30) : boucle de main d'une lecture qui imprime nick par nick (texte d'IdxTop, DiffTop, RepoHistory,
     ArchiveHistory) : un nick qui s'arrête est signalé (_nick_stop_msg), les suivants continuent ; tous en échec, ou
-    nick seul : relancé comme avant."""
-    nicks=nick.split(','); multi=len(nicks)>1; ko=0; stop=None
-    for n in nicks:
-        mk=_print_mark()
-        try: fn(n)
-        except _NICK_STOP as e:
-            if _nick_stop_msg(e,mk,multi) is None: raise
-            ko+=1; stop=e if stop is None else stop
-    if stop is not None and ko==len(nicks): raise stop
+    nick seul : relancé comme avant. 1.0.168 : sur _PerNick."""
+    iso=_PerNick(nick)
+    for n in iso.nicks:
+        with iso(n): fn(n)
+    iso.done()
 
 def _wh(sql):
     """' AND <cond>' ou ''."""
@@ -2127,10 +2167,11 @@ def _atomic_write_rc(cfgfile,config):
 class BorgHelperDB:
     """SQLite layer: cache.db and diff.db operations. No borg calls."""
 
-    def __init__(self,cache_dir,db_prefix,cfg_reader=None):
+    def __init__(self,cache_dir,db_prefix,cfg_reader=None,nicks_reader=None):
         self.cache_dir=cache_dir
         self.db_prefix=db_prefix
         self._cfg_reader=cfg_reader  # callable(nick) -> configparser section | None
+        self._nicks_reader=nicks_reader  # 1.0.168 : callable() -> nicks du rc (base partagée jamais chiffrée d'office)
         self._hist_migrated=set()   # diff.db déjà ouvertes (migration vers history.db tentée) par ce processus
         self._hist_ready=set()      # history.db dont le schéma est garanti dans ce processus
         self._reader_skipped={}     # 1.0.166 : base -> instant (monotonic) où un lecteur l'a trouvée occupée — lue telle quelle,
@@ -2447,19 +2488,117 @@ class BorgHelperDB:
         if stored_ver!=Version:
             conn.execute("INSERT OR REPLACE INTO db_meta VALUES('borghelper_version',?)",(Version,))
 
-    def ensure_cache_db(self,db_path,create=True):
+    def _auto_enc_cfg(self,db_path,nick):
+        """(passphrase, niveau KDF) si la base `db_path` du nick peut recevoir d'office un en-tête siv1 (1.0.168, story 31,
+        A48), sinon None. Conditions (décisions de l'utilisateur) : DB_ENCRYPT effectif vrai et DB_KDF valide — lus SANS
+        rien afficher (une valeur invalide est signalée par la commande elle-même, jamais par une création qui la tait) ;
+        passphrase : celle que _open_db résoudra pour ce fichier, et celle du nick ; base jamais partagée : ni DB_NAME pour
+        ce nick, ni autre nick du rc dont la diff.db ou la cache.db est ce fichier (sinon un nick chiffrerait avec sa
+        passphrase une base qu'un autre lit) ; pas un fantôme (il recopie l'en-tête de sa base servie)."""
+        if nick is None or self._cfg_reader is None or _is_shadow(db_path): return None
+        try:
+            cfg=self._cfg_reader(nick)
+            if cfg is None or 'DB_NAME' in cfg: return None
+            if (str(cfg.get('DB_ENCRYPT','true')).strip().lower() not in ('true','yes','on','1')
+                    or str(cfg.get('DB_KDF','standard')).strip().lower() not in _KDF_LEVELS): return None
+            pw=_resolve_passphrase(nick,db_path)
+            if not pw or pw!=cfg.get('BORG_PASSPHRASE'): return None
+            me=os.path.abspath(db_path)
+            for n in (self._nicks_reader() if self._nicks_reader is not None else []):
+                if n and n!=nick and me in (os.path.abspath(self.get_diff_db(n)),os.path.abspath(self.get_cache_db(n))): return None
+            return pw,str(cfg.get('DB_KDF','standard')).strip().lower()
+        except (Exception,SystemExit): return None
+
+    def _new_db_header(self,db_path,nick):
+        """1.0.168 (story 31, A48) : (en-tête siv1, DEK, passphrase) à poser à la CRÉATION de la base du nick, ou None :
+        fichier déjà doté d'un schéma (base existante, même vide : jamais touchée, [WARN] comme avant) ou conditions de
+        _auto_enc_cfg non remplies. KDF dérivée ici, hors de toute transaction ; KDF indisponible : None (en clair)."""
+        if nick is None or _is_shadow(db_path) or _db_has_schema(db_path): return None
+        ac=self._auto_enc_cfg(db_path,nick)
+        if ac is None: return None
+        try: header,dek=_enc_header_build(ac[0],'siv1',ac[1])
+        except Exception: return None   # DbEncrypt échouerait de même
+        return header,dek,ac[0]
+
+    def _heal_empty_header(self,conn,db_path,nick,tables):
+        """1.0.168 (revue story 31, décision de l'utilisateur) : base SANS AUCUNE ligne dans `tables` (chemins de diff.db,
+        cache de cache.db) dont l'en-tête siv1 ne s'ouvre pas avec la passphrase actuelle — née d'une passphrase fausse au
+        premier Index/Bkp, borg ayant refusé ensuite — : en-tête remplacé par un neuf, sous BEGIN IMMEDIATE avec
+        revérification (base toujours vide, en-tête inchangé). Aucune donnée chiffrée n'existe : rien n'est perdu. Base
+        avec données : jamais touchée (DbKeyError comme avant). Passphrase qui ouvre l'en-tête : DEK mise en cache, une
+        seule dérivation par processus (celle que _open_db ferait ensuite)."""
+        try: raw=_enc_header_read(conn)
+        except DbTamperError: return
+        if raw is None: return
+        try: h=_enc_header_parse(raw)
+        except DbTamperError: return
+        if h['path_enc']!='siv1': return
+        pw=_resolve_passphrase(nick,db_path)
+        if not pw: return
+        ck=(os.path.realpath(db_path),h['mac'],hashlib.sha256(_pw_bytes(pw)).digest())
+        if ck in _DEK_CACHE: return
+        try: _DEK_CACHE[ck]=_enc_header_unlock(h,pw); return
+        except (DbKeyError,DbTamperError): pass
+        def _empty(): return all(conn.execute(f"SELECT 1 FROM {t} LIMIT 1").fetchone() is None for t in tables)
+        if not _empty(): return   # données : DbKeyError à l'ouverture, comme avant (aucune KDF de plus)
+        ac=self._auto_enc_cfg(db_path,nick)
+        if ac is None: return
+        try: new,dek=_enc_header_build(ac[0],'siv1',ac[1])
+        except Exception: return
+        if conn.in_transaction: conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            done=(_empty()   # revérifié sous le verrou : un écrivain a pu en ajouter entre-temps
+                  and conn.execute("UPDATE db_meta SET value=? WHERE key='enc_header' AND value=?",
+                                   (json.dumps(new,sort_keys=True),raw)).rowcount==1)
+            conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                try: conn.rollback()
+                except sqlite3.Error: pass
+            raise
+        if done: _DEK_CACHE[(os.path.realpath(db_path),new['mac'],hashlib.sha256(_pw_bytes(ac[0])).digest())]=dek
+
+    @staticmethod
+    def _create_schema(conn,db_path,script,new):
+        """Schéma de base (CREATE … IF NOT EXISTS). new (_new_db_header) : schéma et en-tête dans UNE transaction BEGIN
+        IMMEDIATE (1.0.168, story 31) — aucun ouvreur ne voit la base neuve sans en-tête. En-tête posé seulement si la base
+        n'avait encore aucune table sous ce verrou (un créateur concurrent en clair l'a devancée : laissée en clair) ; deux
+        créateurs chiffrants : ON CONFLICT DO NOTHING, une seule DEK (celle du premier)."""
+        if new is None: conn.executescript(script); return
+        header,dek,pw=new
+        if conn.in_transaction: conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            fresh=conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None
+            for st in script.split(';'):   # executescript validerait la transaction : instructions une à une
+                if st.strip(): conn.execute(st)
+            done=fresh and conn.execute("INSERT INTO db_meta(key,value) VALUES('enc_header',?) ON CONFLICT(key) DO NOTHING",
+                                        (json.dumps(header,sort_keys=True),)).rowcount==1
+            conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                try: conn.rollback()
+                except sqlite3.Error: pass
+            raise
+        if done:   # DEK déjà connue : la première ouverture par _open_db ne redérive pas la KEK
+            _DEK_CACHE[(os.path.realpath(db_path),header['mac'],hashlib.sha256(_pw_bytes(pw)).digest())]=dek
+
+    def ensure_cache_db(self,db_path,create=True,nick=None):
         """create=False (AD-12) : appelants de lecture seule — si le fichier n'existe pas encore,
         ne rien créer (ni fichier, ni schéma, ni en-tête) et retourner tel quel ; l'appelant répond
         « non indexé »/« cache vide » comme si la base existait mais était vide. Si le fichier existe
         déjà, comportement inchangé (migrations/_check_set_meta). Seuls Index/Bkp/indexsnap gardent
-        le défaut create=True (créateurs légitimes, AD-12)."""
+        le défaut create=True (créateurs légitimes, AD-12). nick (1.0.168) : base neuve créée chiffrée
+        si la config du nick le permet (_new_db_header)."""
         if not create and (self._reader_skip_fresh(db_path) or not _db_has_schema(db_path)): return
+        new=self._new_db_header(db_path,nick) if create else None
         conn=None
         try:
             try: conn=_open_db(db_path,nick=None,role='admin',timeout=60 if create else _READER_WRITE_WAIT)
             except sqlite3.OperationalError as e: _db_open_fail(db_path,e)
             _ensure_wal(conn)
-            conn.executescript("""
+            self._create_schema(conn,db_path,"""
                 CREATE TABLE IF NOT EXISTS db_meta (
                     key   TEXT PRIMARY KEY,
                     value TEXT
@@ -2472,7 +2611,8 @@ class BorgHelperDB:
                     UNIQUE(nom, lastmodified)
                 );
                 CREATE INDEX IF NOT EXISTS idx_cache_nom ON cachejsonboexlm(nom);
-            """)
+            """,new)
+            if create and nick is not None and new is None: self._heal_empty_header(conn,db_path,nick,('cachejsonboexlm',))
             self._check_set_meta(conn,CACHE_DB_SCHEMA_VERSION,db_path,CACHE_DB_BASE_SCHEMA_VERSION)
             conn.commit(); conn.close()
         except sqlite3.DatabaseError as e:
@@ -2573,17 +2713,19 @@ class BorgHelperDB:
             CREATE INDEX IF NOT EXISTS idx_rstats_nick ON repo_stats(nick, id);
         """)
 
-    def ensure_diff_db(self,db_path,create=True):
+    def ensure_diff_db(self,db_path,create=True,nick=None):
         """create=False (AD-12) : voir ensure_cache_db — même contrat, réservé aux lecteurs. Lecteur (1.0.166, story 29) :
-        verrou d'écriture tenu ailleurs plus de _READER_WRITE_WAIT s -> rien écrit, base lue telle quelle (_reader_busy_skip)."""
+        verrou d'écriture tenu ailleurs plus de _READER_WRITE_WAIT s -> rien écrit, base lue telle quelle (_reader_busy_skip).
+        nick (1.0.168, story 31) : base neuve créée chiffrée si la config du nick le permet (_new_db_header)."""
         if not create and (self._reader_skip_fresh(db_path) or not _db_has_schema(db_path)): return
+        new=self._new_db_header(db_path,nick) if create else None
         conn=None
         try:
             try: conn=_open_db(db_path,nick=None,role='admin',timeout=60 if create else _READER_WRITE_WAIT)
             except sqlite3.OperationalError as e: _db_open_fail(db_path,e)
             _ensure_wal(conn)
             conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
-            conn.executescript("""
+            self._create_schema(conn,db_path,"""
                 CREATE TABLE IF NOT EXISTS db_meta (
                     key   TEXT PRIMARY KEY,
                     value TEXT
@@ -2661,7 +2803,7 @@ class BorgHelperDB:
                     total_size INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (nick, archive)
                 );
-            """)
+            """,new)
             sf_cols=[r[1] for r in conn.execute("PRAGMA table_info(snapshot_file)").fetchall()]
             if 'type' not in sf_cols:
                 conn.execute("ALTER TABLE snapshot_file ADD COLUMN type TEXT")
@@ -2712,6 +2854,7 @@ class BorgHelperDB:
             if self._archive_view_state(conn) in ('mismatch','absent'):
                 self._repair_archive_view(conn)
             conn.commit()
+            if create and nick is not None and new is None: self._heal_empty_header(conn,db_path,nick,_MIGRATE_TABLES)
             self._migrate_to_history(conn,db_path)   # 1.0.139 (AD-8) : AVANT _check_set_meta (version 10 = migrée)
             self._check_set_meta(conn,DIFF_DB_SCHEMA_VERSION,db_path,DIFF_DB_BASE_SCHEMA_VERSION)
             conn.commit(); conn.close()
@@ -3450,10 +3593,9 @@ class BorgHelperDB:
         totals={}
         # 1.0.167 (story 30, A47) : un nick qui s'arrête (base chiffrée inutilisable, illisible, schéma plus récent) n'arrête
         # plus les autres ; nick seul ou tous en échec : relancé comme avant ; Ctrl-C jamais avalé (_nick_stop_msg).
-        _nicks=nick.split(','); _multi=len(_nicks)>1; _ko=0; _stop=None
-        for n in _nicks:
-            _mk=_print_mark()
-            try:
+        _iso=_PerNick(nick)
+        for n in _iso.nicks:
+            with _iso(n,lambda: conn):
                 db_path=self.get_diff_db(n)
                 self.ensure_diff_db(db_path,create=False)
                 if self._is_index_empty(n,db_path):
@@ -3480,23 +3622,16 @@ class BorgHelperDB:
                 except sqlite3.Error as e:
                     _close_quiet(conn)
                     printer(f"SQLite error ({db_path}): {e}")
-            except _NICK_STOP as _e:
-                _msg=_nick_stop_msg(_e,_mk,_multi)
-                if _msg is None: raise
-                try: conn.close()   # connexion du nick arrêté (ou déjà fermée / inexistante)
-                except Exception: pass
-                _ko+=1; _stop=_e if _stop is None else _stop   # tous en échec : la PREMIÈRE erreur, comme avant
-        if _stop is not None and _ko==len(_nicks): raise _stop   # tous en échec : comme un nick seul
+        _iso.done()
         return totals
 
     def _duidx_collect_global(self,nick,sel,archive_from=None,archive_to=None):
         totals={}
         # 1.0.167 (story 30, A47) : un nick qui s'arrête (base chiffrée inutilisable, illisible, schéma plus récent) n'arrête
         # plus les autres ; nick seul ou tous en échec : relancé comme avant ; Ctrl-C jamais avalé (_nick_stop_msg).
-        _nicks=nick.split(','); _multi=len(_nicks)>1; _ko=0; _stop=None
-        for n in _nicks:
-            _mk=_print_mark()
-            try:
+        _iso=_PerNick(nick)
+        for n in _iso.nicks:
+            with _iso(n,lambda: conn):
                 db_path=self.get_diff_db(n)
                 self.ensure_diff_db(db_path,create=False)
                 if self._is_index_empty(n,db_path):
@@ -3526,13 +3661,7 @@ class BorgHelperDB:
                 except sqlite3.Error as e:
                     _close_quiet(conn)
                     printer(f"SQLite error ({db_path}): {e}")
-            except _NICK_STOP as _e:
-                _msg=_nick_stop_msg(_e,_mk,_multi)
-                if _msg is None: raise
-                try: conn.close()   # connexion du nick arrêté (ou déjà fermée / inexistante)
-                except Exception: pass
-                _ko+=1; _stop=_e if _stop is None else _stop   # tous en échec : la PREMIÈRE erreur, comme avant
-        if _stop is not None and _ko==len(_nicks): raise _stop   # tous en échec : comme un nick seul
+        _iso.done()
         return totals
 
     def _duidx_collect_raw(self,nick,sel,archive_from=None,archive_to=None):
@@ -3546,10 +3675,9 @@ class BorgHelperDB:
         rows=[]
         # 1.0.167 (story 30, A47) : un nick qui s'arrête (base chiffrée inutilisable, illisible, schéma plus récent) n'arrête
         # plus les autres ; nick seul ou tous en échec : relancé comme avant ; Ctrl-C jamais avalé (_nick_stop_msg).
-        _nicks=nick.split(','); _multi=len(_nicks)>1; _ko=0; _stop=None
-        for n in _nicks:
-            _mk=_print_mark()
-            try:
+        _iso=_PerNick(nick)
+        for n in _iso.nicks:
+            with _iso(n,lambda: conn):
                 db_path=self.get_diff_db(n)
                 self.ensure_diff_db(db_path,create=False)
                 if self._is_index_empty(n,db_path):
@@ -3574,13 +3702,7 @@ class BorgHelperDB:
                 except sqlite3.Error as e:
                     _close_quiet(conn)
                     printer(f"SQLite error ({db_path}): {e}")
-            except _NICK_STOP as _e:
-                _msg=_nick_stop_msg(_e,_mk,_multi)
-                if _msg is None: raise
-                try: conn.close()   # connexion du nick arrêté (ou déjà fermée / inexistante)
-                except Exception: pass
-                _ko+=1; _stop=_e if _stop is None else _stop   # tous en échec : la PREMIÈRE erreur, comme avant
-        if _stop is not None and _ko==len(_nicks): raise _stop   # tous en échec : comme un nick seul
+        _iso.done()
         return rows
 
     def get_cache_rows(self,nick):
@@ -3882,7 +4004,8 @@ class BorgHelper:
         if os.path.exists(self.borg.cfgfile): cp.read(self.borg.cfgfile)
         resolved_cache=cache_dir or os.path.expanduser(cp.defaults().get('cache_dir','~/.cache/borghelper'))
         os.makedirs(resolved_cache,mode=0o700,exist_ok=True)  # 0700 à la création seulement
-        self.db=BorgHelperDB(resolved_cache,_db_name_from_cfg(self.borg.cfgfile),cfg_reader=self.borg.cfgread)
+        self.db=BorgHelperDB(resolved_cache,_db_name_from_cfg(self.borg.cfgfile),cfg_reader=self.borg.cfgread,
+                             nicks_reader=lambda: (self.borg.cfgreadnicks() or '').split(','))
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -3937,7 +4060,7 @@ class BorgHelper:
             if 'Would prune:' in line:
                 pruneme.append((re.sub(r'( )*',r'\1',line)).split(' ')[2])
         try:
-            self.db.ensure_cache_db(db_path)  # cache miss confirmé : on écrit -> création légitime (AD-12 ne visait que le lookup)
+            self.db.ensure_cache_db(db_path,nick=nick)  # cache miss confirmé : on écrit -> création légitime (AD-12 ne visait que le lookup)
             conn=_open_db(db_path,nick=nick,role='write')
             details_json=json.dumps(pruneme)
             stored=conn.codec.blob.encrypt(details_json) if conn.codec is not None else details_json
@@ -3965,7 +4088,7 @@ class BorgHelper:
             if debug: print('Cache miss — appel borg')
             details=self.borg.boex(nick,boexarg,debug=debug)[output][0]
             try:
-                self.db.ensure_cache_db(db_path)  # cache miss confirmé : on écrit -> création légitime (AD-12 ne visait que le lookup)
+                self.db.ensure_cache_db(db_path,nick=nick)  # cache miss confirmé : on écrit -> création légitime (AD-12 ne visait que le lookup)
                 conn=_open_db(db_path,nick=nick,role='write')
                 details_json=json.dumps(details)
                 stored=conn.codec.blob.encrypt(details_json) if conn.codec is not None else details_json
@@ -4210,7 +4333,7 @@ class BorgHelper:
         préserver au prix d'une migration en place coûteuse."""
         cache_path=self.db.get_cache_db(nick)
         if not os.path.exists(cache_path): return  # rien à migrer ; créée dans le bon mode au prochain accès (AD-12)
-        self.db.ensure_cache_db(cache_path)
+        self.db.ensure_cache_db(cache_path)   # sans nick : DbEncrypt/DbDecrypt fixent eux-mêmes le mode
         conn=_open_db(cache_path,nick=None,role='admin')
         try:
             raw=_enc_header_read(conn)
@@ -4235,7 +4358,7 @@ class BorgHelper:
         db_path=self.db.get_diff_db(nick)
         if not os.path.exists(db_path):
             printer(f"  {nick}: diff.db absent — rien à faire"); return 0
-        self.db.ensure_diff_db(db_path)  # schéma courant requis avant migration (migrations legacy d'abord, AD-7)
+        self.db.ensure_diff_db(db_path)  # sans nick : schéma courant requis avant migration (migrations legacy d'abord, AD-7)
         cfg=self.borg.cfgread(nick)
         if direction=='encrypt' and not db_encrypt_enabled(nick,cfg=cfg):
             printer(f"  [ERREUR] {nick}: DB_ENCRYPT=false pour ce nick — {verb} refusé explicitement"); return 2
@@ -4248,10 +4371,15 @@ class BorgHelper:
         conn=_open_db(db_path,nick=None,role='admin')
         raw=_enc_header_read(conn)
         cur_mode='plain' if raw is None else _enc_header_parse(raw)['path_enc']
-        if direction=='encrypt' and cur_mode=='siv1':
-            printer(f"  {nick}: déjà chiffrée (siv1)"); conn.close(); return 0
-        if direction=='decrypt' and cur_mode=='plain':
-            printer(f"  {nick}: déjà en clair"); conn.close(); return 0
+        if (direction=='encrypt' and cur_mode=='siv1') or (direction=='decrypt' and cur_mode=='plain'):
+            printer(f"  {nick}: "+("déjà chiffrée (siv1)" if direction=='encrypt' else "déjà en clair")); conn.close()
+            # 1.0.168 (revue story 31, décision de l'utilisateur) : diff.db née chiffrée (A48) à côté d'une cache.db en clair
+            # (ou l'inverse) — la cache.db est quand même mise dans le mode cible (-y seulement : purge du cache)
+            if confirm and not dryrun:
+                try: self._db_migrate_cache(nick,direction,passphrase,cfg,debug=debug)
+                except (DbKeyError,DbModeError,DbTamperError,DbCodecError) as e:
+                    printer(f"  [ERREUR] {nick}: {type(e).__name__}: {e}"); return 2
+            return 0
         if cur_mode=='migrating':
             migrating_dir=_enc_header_parse(raw).get('migrating_dir')
             if migrating_dir not in (None,direction):
@@ -4336,7 +4464,7 @@ class BorgHelper:
         faire sans."""
         cfg=self.borg.cfgread(nick)
         for label,path in (('cache.db',self.db.get_cache_db(nick)),('diff.db',self.db.get_diff_db(nick))):
-            if not os.path.exists(path):
+            if not _db_has_schema(path):   # 1.0.168 : fichier sans table (lookup d'un lecteur, O_CREAT) = pas une base
                 printer(f"  {nick}: {label}: absent"); continue
             peek=sqlite3.connect(path)
             try:
@@ -4537,7 +4665,7 @@ class BorgHelper:
         Tous les nicks, NOIDX compris ; une liste vide ne retire plus rien (effaçait tout l'index avant 1.0.140)."""
         db_path=self.db.get_diff_db(nick)
         if not os.path.exists(db_path) and not os.path.exists(self.db.get_history_db(nick)): return
-        if os.path.exists(db_path): self.db.ensure_diff_db(db_path)
+        if os.path.exists(db_path): self.db.ensure_diff_db(db_path,nick=nick)
         cfg=self.borg.cfgreaded(nick,debug=debug)
         rb=self.borg.boex(nick,['list','--json']+glob_args(cfg),debug=debug)
         try:
@@ -4763,7 +4891,7 @@ class BorgHelper:
                     ct=p['change_type']; sz=p.get('size_after') or p.get('size_before') or 0
                     if ct not in exclu: exclu[ct]={'count':0,'size':0}
                     exclu[ct]['count']+=1; exclu[ct]['size']+=sz
-            self.db.ensure_diff_db(db_path)  # paire non indexée : on écrit -> création légitime (AD-12 ne visait que le lookup ci-dessus)
+            self.db.ensure_diff_db(db_path,nick=nick)  # paire non indexée : on écrit -> création légitime (AD-12 ne visait que le lookup ci-dessus)
             self.db.store_diff_entries(nick,bidun,bideux,date_new,entries_ok,db_path)
             if exclu: self.db.store_excluded_diff_stats(nick,bidun,bideux,exclu,db_path)
             display_entries=all_entries
@@ -5066,7 +5194,7 @@ class BorgHelper:
             run_id=uuid.uuid4().hex
             bkp_status_db=self.db.get_history_db(nick)            # bkp_status vit dans history.db (1.0.139, AD-7) ; défini
                                                                   # AVANT ce qui peut échouer : le finally (filet) s'en sert
-            self.db.ensure_diff_db(self.db.get_diff_db(nick))   # migre les mesures d'une base antérieure
+            self.db.ensure_diff_db(self.db.get_diff_db(nick),nick=nick)   # migre les mesures d'une base antérieure
             self.db.ensure_history_db(bkp_status_db)
             if not self.db.store_bkp_status_start(nick,run_id,bkp_status_db):
                 printer(f"[WARN] store_bkp_status_start a échoué pour {nick} (run_id={run_id})")
@@ -5125,7 +5253,7 @@ class BorgHelper:
                     archive_new=arch_info.get('name')
                     archive_new_date=arch_info.get('start')
                     db_path=self.db.get_diff_db(nick)
-                    self.db.ensure_diff_db(db_path)
+                    self.db.ensure_diff_db(db_path,nick=nick)
                     if archive_new:
                         st=arch_info.get('stats',{})
                         self.db.store_archive_stats(nick,archive_new,archive_new_date,arch_info.get('duration'),
@@ -5205,8 +5333,8 @@ class BorgHelper:
             return {'exitcode':3,'stdout':[],'stderr':[]}
         # Garantit que cache.db/diff.db sont à jour (migrations auto) avant que Prune n'y touche —
         # Prune ne passait jusqu'ici par aucun ensure_*_db(), contrairement à Bkp/Index/Report.
-        self.db.ensure_cache_db(self.db.get_cache_db(nick))
-        self.db.ensure_diff_db(self.db.get_diff_db(nick))
+        self.db.ensure_cache_db(self.db.get_cache_db(nick),nick=nick)
+        self.db.ensure_diff_db(self.db.get_diff_db(nick),nick=nick)
         # priority.lock (spec-status-cli-etat-rapide) : posé avant tout appel boex(), relâché dans un
         # finally couvrant tout le corps — même patron que backup()/restore() — pour que Status()
         # puisse détecter un Prune en cours (ambiguïté assumée avec Restore, priority.lock ne
@@ -5362,7 +5490,7 @@ class BorgHelper:
         if self._nick_noidx(nick):
             printer(f"{nick}: indexation désactivée (NOIDX=1)"); return 0
         if db_path is None: db_path=self.db.get_diff_db(nick)
-        self.db.ensure_diff_db(db_path)
+        self.db.ensure_diff_db(db_path,nick=nick)
         cfg=self.borg.cfgreaded(nick,debug=debug)
         if archives is None:
             rb=self.borg.boex(nick,['list','--json']+glob_args(cfg),debug=debug)
@@ -5769,7 +5897,7 @@ class BorgHelper:
         index() met en pause puis relance une passe complète — les sentinelles évitent de refaire le travail)."""
         noidx=self._nick_noidx(nick)
         deadline=plan['deadline']; tranche=plan['tranche']; natures=plan['natures']
-        self.db.ensure_diff_db(db_path)
+        self.db.ensure_diff_db(db_path,nick=nick)
         cfg=self.borg.cfgreaded(nick,debug=debug)
         stop=lambda: self._index_stop_reason(nick,deadline) is not None
         prev_stop=self.borg._stop; self.borg._stop=stop
@@ -6217,7 +6345,7 @@ class BorgHelper:
                     "fantôme incomplet (création interrompue) — recréé" if old is None else
                     "chiffrement de la base servie changé (DbEncrypt/DbDecrypt/DbRekey) — fantôme jeté, reconstruction repartie de zéro"))
         self._shadow_discard(sp)   # aussi un -wal/-shm orphelin : jamais rejoué dans le nouveau fichier
-        self.db.ensure_diff_db(sp)
+        self.db.ensure_diff_db(sp)   # sans nick : en-tête recopié de la base servie ci-dessous
         try:
             c=_open_db(sp,nick=None,role='admin')
             try:
@@ -6321,10 +6449,9 @@ class BorgHelper:
         results={} if as_json else None
         # 1.0.167 (story 30, A47) : un nick qui s'arrête (base chiffrée inutilisable, illisible, schéma plus récent) n'arrête
         # plus les autres ; nick seul ou tous en échec : relancé comme avant ; Ctrl-C jamais avalé (_nick_stop_msg).
-        _nicks=nick.split(','); _multi=len(_nicks)>1; _ko=0; _stop=None
-        for n in _nicks:
-            _mk=_print_mark()
-            try:
+        _iso=_PerNick(nick,(lambda n,m: results.__setitem__(n,{'error':m})) if as_json else None)
+        for n in _iso.nicks:
+            with _iso(n,lambda: conn):
                 db_path=self.db.get_diff_db(n)
                 self.db.ensure_diff_db(db_path,create=False)
                 if self.db._is_index_empty(n,db_path):
@@ -6362,14 +6489,7 @@ class BorgHelper:
                 if as_json:
                     results[n]=[{'date':(d or '')[:19],'archive':a,'type':t,'path':p,'size_before':sb,'size_after':sa}
                                 for _,d,a,t,p,sb,sa in n_rows]
-            except _NICK_STOP as _e:
-                _msg=_nick_stop_msg(_e,_mk,_multi)
-                if _msg is None: raise
-                if as_json: results[n]={'error':_msg}
-                try: conn.close()   # connexion du nick arrêté (ou déjà fermée / inexistante)
-                except Exception: pass
-                _ko+=1; _stop=_e if _stop is None else _stop   # tous en échec : la PREMIÈRE erreur, comme avant
-        if _stop is not None and _ko==len(_nicks): raise _stop   # tous en échec : comme un nick seul
+        _iso.done()
         if as_json:
             print(json.dumps(results,ensure_ascii=False,indent=2)); return
         if not rows: print("Aucun résultat."); return
@@ -6386,10 +6506,9 @@ class BorgHelper:
         results={} if as_json else None
         # 1.0.167 (story 30, A47) : un nick qui s'arrête (base chiffrée inutilisable, illisible, schéma plus récent) n'arrête
         # plus les autres ; nick seul ou tous en échec : relancé comme avant ; Ctrl-C jamais avalé (_nick_stop_msg).
-        _nicks=nick.split(','); _multi=len(_nicks)>1; _ko=0; _stop=None
-        for n in _nicks:
-            _mk=_print_mark()
-            try:
+        _iso=_PerNick(nick,(lambda n,m: results.__setitem__(n,{'error':m})) if as_json else None)
+        for n in _iso.nicks:
+            with _iso(n,lambda: conn):
                 db_path=self.db.get_diff_db(n)
                 self.db.ensure_diff_db(db_path,create=False)
                 if self.db._is_index_empty(n,db_path):
@@ -6416,14 +6535,7 @@ class BorgHelper:
                 if as_json:
                     results[n]=[{'date':(d or '')[:19],'archive_before':ao,'archive_after':an,'type':t,'size_before':sb,'size_after':sa}
                                 for _,d,ao,an,t,sb,sa in n_rows]
-            except _NICK_STOP as _e:
-                _msg=_nick_stop_msg(_e,_mk,_multi)
-                if _msg is None: raise
-                if as_json: results[n]={'error':_msg}
-                try: conn.close()   # connexion du nick arrêté (ou déjà fermée / inexistante)
-                except Exception: pass
-                _ko+=1; _stop=_e if _stop is None else _stop   # tous en échec : la PREMIÈRE erreur, comme avant
-        if _stop is not None and _ko==len(_nicks): raise _stop   # tous en échec : comme un nick seul
+        _iso.done()
         if as_json:
             print(json.dumps(results,ensure_ascii=False,indent=2)); return
         if not rows: print(f"Aucune entrée pour : {path}"); return
@@ -6711,10 +6823,9 @@ class BorgHelper:
         results={}
         # 1.0.167 (story 30, A47) : un nick qui s'arrête (base chiffrée inutilisable, illisible, schéma plus récent) n'arrête
         # plus les autres ; nick seul ou tous en échec : relancé comme avant ; Ctrl-C jamais avalé (_nick_stop_msg).
-        _nicks=nick.split(','); _multi=len(_nicks)>1; _ko=0; _stop=None
-        for n in _nicks:
-            _mk=_print_mark()
-            try:
+        _iso=_PerNick(nick,(lambda n,m: results.__setitem__(n,{'error':m})) if as_json else None)
+        for n in _iso.nicks:
+            with _iso(n,lambda: conn):
                 db_path=self.db.get_diff_db(n)
                 self.db.ensure_diff_db(db_path,create=False)
                 if self.db._is_index_empty(n,db_path):
@@ -6736,14 +6847,7 @@ class BorgHelper:
                 except sqlite3.Error as e:
                     if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
                     else: printer(f"SQLite error ({db_path}): {e}")
-            except _NICK_STOP as _e:
-                _msg=_nick_stop_msg(_e,_mk,_multi)
-                if _msg is None: raise
-                if as_json: results[n]={'error':_msg}
-                try: conn.close()   # connexion du nick arrêté (ou déjà fermée / inexistante)
-                except Exception: pass
-                _ko+=1; _stop=_e if _stop is None else _stop   # tous en échec : la PREMIÈRE erreur, comme avant
-        if _stop is not None and _ko==len(_nicks): raise _stop   # tous en échec : comme un nick seul
+        _iso.done()
         if as_json:
             print(json.dumps(results,ensure_ascii=False,indent=2))
 
@@ -6826,10 +6930,9 @@ class BorgHelper:
         results={}
         # 1.0.167 (story 30, A47) : un nick qui s'arrête (base chiffrée inutilisable, illisible, schéma plus récent) n'arrête
         # plus les autres ; nick seul ou tous en échec : relancé comme avant ; Ctrl-C jamais avalé (_nick_stop_msg).
-        _nicks=nick.split(','); _multi=len(_nicks)>1; _ko=0; _stop=None
-        for n in _nicks:
-            _mk=_print_mark()
-            try:
+        _iso=_PerNick(nick,(lambda n,m: results.__setitem__(n,{'error':m})) if as_json else None)
+        for n in _iso.nicks:
+            with _iso(n,lambda: conn):
                 db_path=self.db.get_diff_db(n)
                 self.db.ensure_diff_db(db_path,create=False)
                 if self.db._is_index_empty(n,db_path):
@@ -6848,14 +6951,7 @@ class BorgHelper:
                 except sqlite3.Error as e:
                     if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
                     else: printer(f"SQLite error ({db_path}): {e}")
-            except _NICK_STOP as _e:
-                _msg=_nick_stop_msg(_e,_mk,_multi)
-                if _msg is None: raise
-                if as_json: results[n]={'error':_msg}
-                try: conn.close()   # connexion du nick arrêté (ou déjà fermée / inexistante)
-                except Exception: pass
-                _ko+=1; _stop=_e if _stop is None else _stop   # tous en échec : la PREMIÈRE erreur, comme avant
-        if _stop is not None and _ko==len(_nicks): raise _stop   # tous en échec : comme un nick seul
+        _iso.done()
         if as_json:
             print(json.dumps(results,ensure_ascii=False,indent=2))
 
@@ -7956,16 +8052,17 @@ class BorgHelper:
         reshosto['nom']='Totaux'
         for nick in nicks.split(','):
             cfg=self.borg.cfgreaded(nick,debug=debug)
+            mk=_print_mark()
             try:
                 (tcmpl,tbkps)=self.prep_report_from_db(nick,maxp=maxp)
             except (Exception,SystemExit) as e:
                 # 1.0.166 (story 29) : base illisible (« DB corrompue » + sys.exit des ensure_*) : ligne du nick en erreur,
-                # les autres hôtes affichés — le message détaillé est déjà sur stderr ; Ctrl-C (code 130) : arrêt
+                # les autres hôtes affichés ; Ctrl-C (code 130) : arrêt. 1.0.168 (A51) : message réel (_stop_text), complet
                 if isinstance(e,SystemExit) and e.code==130: raise
-                errcode=2; err_msg="base illisible (voir message)" if isinstance(e,SystemExit) else str(e)[:80]
+                errcode=2; err_msg=_stop_text(e,mk) if isinstance(e,SystemExit) else str(e)[:80]
                 if htrep:
                     errhost.append(nick)
-                    reshos[nick]={'nom':nick,'duree':'—','depuis':'—','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {err_msg}"}
+                    reshos[nick]={'nom':nick,'duree':'—','depuis':'—','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {_html_esc(err_msg)}"}
                 else:
                     reshos[nick]={'nom':f"*** {nick}",'duree':'—','depuis':'—','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {err_msg}"}
                 resbck[nick]={}; continue
@@ -8039,19 +8136,20 @@ class BorgHelper:
                 printer(f"  {nick}: Bkp/Restore en cours — borg info sera mis en attente du verrou")
             self.db.set_report_running_lock(nick)
             self.db.wait_index_idle(nick,timeout=30)
+            mk=_print_mark()
             try:
                 (tcmpl,tbkps)=self.prep_report(nick,debug=debug,maxp=maxp)
             except (Exception,SystemExit) as e:
                 self.db.clear_report_running_lock(nick)
                 if isinstance(e,SystemExit) and e.code==130: raise   # Ctrl-C pendant borg (boex -> sys.exit(130)) : arrêt
                 if isinstance(e,SystemExit):   # 1.0.166 (story 29) : jumelle de report_offline (bases, config)
-                    errcode=2; err_msg="base illisible (voir message)"; printer(f"[ERREUR] {nick}: {err_msg}")
+                    errcode=2; err_msg=_stop_text(e,mk)   # 1.0.168 (A51) : message réel, déjà affiché (pas de doublon)
                 else:
                     errcode=2; printer(f"[ERREUR] {nick}: {e}"); err_msg=str(e)[:80]
                 if self.borg.repoLocalAbsent(nick): err_msg="dépôt absent"   # 1.0.167 : borg info échoue, cause lisible
                 if htrep:
                     errhost.append(nick)
-                    reshos[nick]={'nom':nick,'duree':'—','depuis':'ERREUR','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {err_msg}"}
+                    reshos[nick]={'nom':nick,'duree':'—','depuis':'ERREUR','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {_html_esc(err_msg)}"}
                 else:
                     reshos[nick]={'nom':f"*** ERREUR {nick}",'duree':'—','depuis':'ERREUR','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {err_msg}"}
                 resbck[nick]={}; continue
@@ -10218,21 +10316,47 @@ def codec_selftest(pattern=None,list_only=False):
                 code=b.report_offline('bo1,bo2',as_json=True)
             rep=json.loads(o.getvalue()[o.getvalue().index('{'):])['summary']
             def fake(nick,debug=0,maxp=None):
-                if nick=='bo1': sys.exit(1)
+                if nick=='bo1': _db_schema_fail(paths['bo1'],sqlite3.DatabaseError('database disk image is malformed'),"l'index")
                 return ({nick:{'nom':nick,'date derniere':'x','depuis':1.0,'duree':1.0,'derniere':1,'taille':1,'recuperable':0,'reste':1,
                                'modifications':'—','size_delta_last':'—'}},
                         {'Prunable':{'name':'Prunable','original_size':0,'compressed_size':0,'deduplicated_size':0},
                          'Totaux':{'name':'Totaux','original_size':0,'compressed_size':0,'deduplicated_size':0}})
-            o2=io.StringIO()
-            with mock.patch.object(b,'prep_report',fake),contextlib.redirect_stdout(o2),contextlib.redirect_stderr(io.StringIO()):
+            o2=io.StringIO(); e2=io.StringIO()
+            with mock.patch.object(b,'prep_report',fake),contextlib.redirect_stdout(o2),contextlib.redirect_stderr(e2):
                 code2=b.report('bo1,bo2',as_json=True)
             rep2=json.loads(o2.getvalue()[o2.getvalue().index('{'):])['summary']
-            ok=(code==2 and rep.get('bo1',{}).get('nom')=='*** bo1' and rep['bo1'].get('reste')=='⚠ base illisible (voir message)'
+            # 1.0.168 (A51) : message réel complet (ligne [ERREUR] de l'arrêt + détail indenté), plus de doublon sur stderr
+            real=(f"⚠ DB corrompue : {paths['bo1']} -> database disk image is malformed "
+                  "Supprimez le fichier et relancez pour reconstruire l'index.")
+            ok=(code==2 and rep.get('bo1',{}).get('nom')=='*** bo1' and rep['bo1'].get('reste')==real
                 and rep.get('bo2',{}).get('nom')=='bo2'
-                and code2==2 and rep2.get('bo1',{}).get('reste')=='⚠ base illisible (voir message)' and rep2.get('bo2',{}).get('nom')=='bo2')
-            if not ok: print(f"  hors ligne {code} {rep.get('bo1')} {rep.get('bo2',{}).get('nom')} ; direct {code2} {rep2.get('bo1')} {rep2.get('bo2',{}).get('nom')}")
+                and code2==2 and rep2.get('bo1',{}).get('reste')==real and rep2.get('bo2',{}).get('nom')=='bo2'
+                and e2.getvalue().count('DB corrompue')==1 and 'base illisible' not in e2.getvalue())
+            if not ok: print(f"  hors ligne {code} {rep.get('bo1')} {rep.get('bo2',{}).get('nom')} ; direct {code2} {rep2.get('bo1')} {rep2.get('bo2',{}).get('nom')} {e2.getvalue()[-300:]!r}")
             return ok
         check("base occupée : Report multi-nicks, base illisible isolée (hors ligne et direct)",_busy_unreadable)
+        def _busy_unreadable_html():
+            """1.0.168 (A51) : Report -l (HTML), deux jumelles : message réel échappé (`->` -> `-&gt;`) ; sys.exit sans ligne
+            [ERREUR] : `⚠ arrêt (code 1)`."""
+            import html as _h
+            d,rc,paths=_busy_env(); b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); orig=b.db.ensure_diff_db
+            def bad(p,create=True):
+                if p==paths['bo1']: _db_schema_fail(p,sqlite3.DatabaseError('database disk image is malformed'),"l'index")
+                return orig(p,create=create)
+            o=io.StringIO()
+            with mock.patch.object(b.db,'ensure_diff_db',bad),contextlib.redirect_stdout(o),contextlib.redirect_stderr(io.StringIO()):
+                b.report_offline('bo1,bo2',htrep=True)
+            def fake(nick,debug=0,maxp=None):
+                if nick=='bo1': _db_schema_fail(paths['bo1'],sqlite3.DatabaseError('database disk image is malformed'),"l'index")
+                if nick=='bo2': sys.exit(1)
+            o2=io.StringIO()
+            with mock.patch.object(b,'prep_report',fake),contextlib.redirect_stdout(o2),contextlib.redirect_stderr(io.StringIO()):
+                b.report('bo1,bo2',htrep=True)
+            want=f"⚠ DB corrompue : {_h.escape(paths['bo1'])} -&gt; database disk image is malformed"
+            ok=want in o.getvalue() and want in o2.getvalue() and '⚠ arrêt (code 1)' in o2.getvalue() and ' -> database' not in o2.getvalue()
+            if not ok: print(f"  hors ligne {want in o.getvalue()} direct {want in o2.getvalue()} repli {'⚠ arrêt (code 1)' in o2.getvalue()}")
+            return ok
+        check("base occupée : Report multi-nicks HTML, message réel échappé ; arrêt sans [ERREUR] -> « arrêt (code N) »",_busy_unreadable_html)
         def _busy_report_lock():
             """Report direct, arrêt (SystemExit) sur bo1 : verrou report-running de bo1 déjà retiré pendant le traitement de bo2,
             et après."""
@@ -10445,6 +10569,66 @@ def codec_selftest(pattern=None,list_only=False):
                 if not ok: print(f"  {exc!r} {exc2!r} ; partiel {part[:150]!r} ; seul {alone[:150]!r}")
                 return ok
             check(f"multi-nicks : {_lbl}, qe en échec -> exactement la sortie de qp seul",_mn_du_partial)
+        # 1.0.168 (story 31, A50) : chemins de _PerNick non couverts par le JSON — texte (on_stop absent), vrai Ctrl-C, fermeture
+        for _lbl,_cmd in (("Search texte",['-c','Search','-f','passwd']),("FileHist texte",['-c','FileHist','-f','etc/passwd']),
+                          ("TreeHist texte",['-c','TreeHist']),("TreeFind texte",['-c','TreeFind','-m','*'])):
+            check(f"multi-nicks : {_lbl}, qe en échec (passphrase fausse), qp affiché, code 0 (CLI)",
+                  (lambda c: (lambda: _mn_cli(c,lambda o,e: 'qp' in o and e.count('[ERREUR]')==1)))(_cmd))
+        def _mn_kbint():
+            """KeyboardInterrupt (vrai Ctrl-C hors borg) pendant le premier nick : propagé, nick suivant jamais traité — lecteur
+            (search) et boucle texte de main (_per_nick_main)."""
+            _q_build('qe',True); _q_build('qp',False)
+            seen=[]
+            def boom(n):
+                if n=='qe': raise KeyboardInterrupt
+                seen.append(n)
+            try: _per_nick_main('qe,qp',boom); r1='avalée'
+            except KeyboardInterrupt: r1='propagée'
+            orig=bhq.db.ensure_diff_db; called=[]
+            def ens(p,create=True):
+                if p==bhq.db.get_diff_db('qe'): raise KeyboardInterrupt
+                called.append(p); return orig(p,create=create)
+            try:
+                with mock.patch.object(bhq.db,'ensure_diff_db',ens),contextlib.redirect_stdout(io.StringIO()),\
+                     contextlib.redirect_stderr(io.StringIO()):
+                    bhq.search('qe,qp','passwd',as_json=True)
+                r2='avalée'
+            except KeyboardInterrupt: r2='propagée'
+            ok=r1=='propagée' and r2=='propagée' and seen==[] and called==[]
+            if not ok: print(f"  main {r1} {seen} ; lecteur {r2} {called}")
+            return ok
+        check("multi-nicks : Ctrl-C (KeyboardInterrupt) d'un nick arrête lecteur et boucle texte",_mn_kbint)
+        def _mn_conn_closed():
+            """Arrêt d'un nick APRÈS ouverture de sa base (sys.exit pendant la requête) : sa connexion est fermée, pour chaque
+            lecteur qui l'ouvre, et qp est servi."""
+            _q_build('qe',True); _q_build('qp',False)
+            g=globals(); orig_open=g['_open_db']; orig_f=bhq.db._diff_archive_filter; res={}
+            def flt(n,*a,**k):
+                if n=='qe': printer("[ERREUR] arrêt simulé"); sys.exit(2)
+                return orig_f(n,*a,**k)
+            for lbl,fn in _MN_READERS:
+                opened=[]
+                def op(p,*a,**kw):
+                    c=orig_open(p,*a,**kw); opened.append((kw.get('nick'),c)); return c
+                g['_open_db']=op
+                try:
+                    with mock.patch.object(bhq.db,'_diff_archive_filter',flt),contextlib.redirect_stdout(io.StringIO()),\
+                         contextlib.redirect_stderr(io.StringIO()):
+                        fn('qe,qp')
+                    exc=None
+                except BaseException as e:
+                    if isinstance(e,KeyboardInterrupt): raise
+                    exc=e
+                finally: g['_open_db']=orig_open
+                def closed(c):
+                    try: c.execute("SELECT 1"); return False
+                    except sqlite3.ProgrammingError: return True
+                qe=[c for n,c in opened if n=='qe']
+                if qe: res[lbl]=(exc is None and all(closed(c) for c in qe))
+            ok=len(res)>=5 and all(res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("multi-nicks : nick arrêté après ouverture de sa base -> connexion fermée (chaque lecteur)",_mn_conn_closed)
         def _mn_dfrepo():
             """A49 : dfRepo sans shell — dépôt absent -> None (avant : ValueError) ; présent, avec espace dans le chemin ->
             octets > 0 ; distant -> None. Report -o : `reste` « ⚠ dépôt absent » et l'archive du nick affichée ; Report direct
@@ -11942,6 +12126,202 @@ def codec_selftest(pattern=None,list_only=False):
                     and db_plain_anomalies('n',[('diff.db',plain)],{'BORG_PASSPHRASE':'pw','DB_ENCRYPT':'false'})==[]
                     and db_plain_anomalies('n',[('diff.db',plain)],{})==[] and db_plain_anomalies('n',[('diff.db',plain)],None)==[])
         check("base non chiffrée : anomalie seulement si DB_ENCRYPT actif + passphrase + base en clair",_plain_anomaly)
+        def _ne_mode(p):
+            c=sqlite3.connect(p)
+            try: r=c.execute("SELECT value FROM db_meta WHERE key='enc_header'").fetchone()
+            finally: c.close()
+            return 'plain' if r is None else json.loads(r[0])['path_enc']
+        def _ne_env(sub):
+            d=os.path.join(tmp,sub); os.makedirs(d)
+            cfgs={'ne':{'BORG_PASSPHRASE':'pw','DB_KDF':'light'},'nf':{'BORG_PASSPHRASE':'pw','DB_KDF':'light','DB_ENCRYPT':'false'},
+                  'np':{'DB_KDF':'light'},'ns':{'BORG_PASSPHRASE':'pw','DB_KDF':'light','DB_NAME':'shr'}}
+            return d,BorgHelperDB(d,'rc',cfg_reader=lambda n: cfgs.get(n)),cfgs
+        def _new_db_enc():
+            """1.0.168 (story 31, A48) : base neuve d'un nick créée chiffrée (diff.db ET cache.db) ; jamais : DB_ENCRYPT=false,
+            passphrase absente, DB_NAME, base existante (même vide), fantôme, créateur sans nick. Puis écrivain et lecteur :
+            codec actif, chemin stocké chiffré et relu, aucun [WARN] « non chiffrée »."""
+            d,bdb,cfgs=_ne_env('newenc'); res={}
+            for n in cfgs:
+                bdb.ensure_diff_db(bdb.get_diff_db(n),nick=n); bdb.ensure_cache_db(bdb.get_cache_db(n),nick=n)
+                res[n]=(_ne_mode(bdb.get_diff_db(n)),_ne_mode(bdb.get_cache_db(n)))
+            ex=os.path.join(d,'rc-ex-diff.db'); bdb.ensure_diff_db(ex); builds=[]; real_build=_enc_header_build
+            def _spy_build(*a,**k): builds.append(1); return real_build(*a,**k)
+            with mock.patch.object(sys.modules[__name__],'_enc_header_build',_spy_build):   # base existante : aucune KDF
+                bdb.ensure_diff_db(ex,nick='ne'); bdb.ensure_diff_db(bdb.get_diff_db('ne'),nick='ne')
+            res['ex']=_ne_mode(ex) if not builds else f"{len(builds)} KDF"
+            sp=bdb.get_diff_db('ne')+_SHADOW_SUFFIX; bdb.ensure_diff_db(sp,nick='ne'); res['sp']=_ne_mode(sp)
+            nn=os.path.join(d,'rc-nn-diff.db'); bdb.ensure_diff_db(nn); res['nn']=_ne_mode(nn)
+            err=io.StringIO()
+            with contextlib.redirect_stderr(err):
+                c=_open_db(bdb.get_diff_db('ne'),nick='ne',role='write')
+                try:
+                    coded=c.codec is not None
+                    c.execute("INSERT INTO snapshot_file(nick,path) VALUES('ne',?)",(_path_stored(c,'etc/passwd'),)); c.commit()
+                finally: c.close()
+                c=_open_db(bdb.get_diff_db('ne'),nick='ne',role='read')
+                try: back=[_path_decode(c,r[0]) for r in c.execute("SELECT path FROM snapshot_file")]
+                finally: c.close()
+                for n in ('ns',):   # DB_NAME : en clair, [WARN] comme avant
+                    _open_db(bdb.get_diff_db(n),nick=n,role='read').close()
+                _open_db(os.path.join(d,'rc-lk-cache.db'),nick='ne',role='read').close()   # lookup avant création : fichier vide, pas de [WARN]
+            raw=sqlite3.connect(bdb.get_diff_db('ne')); stored=raw.execute("SELECT path FROM snapshot_file").fetchone()[0]; raw.close()
+            ok=(res['ne']==('siv1','siv1') and res['nf']==res['np']==res['ns']==('plain','plain')
+                and res['ex']==res['sp']==res['nn']=='plain' and coded and back==['etc/passwd'] and stored!='etc/passwd'
+                and 'ne: base non chiffrée' not in err.getvalue() and 'ns: base non chiffrée' in err.getvalue())
+            if not ok: print(f"  base neuve : {res}, codec {coded}, relu {back}, stocké {stored[:20]!r}, {err.getvalue()[-300:]!r}")
+            return ok
+        check("base neuve chiffrée : diff.db et cache.db siv1 à la création ; jamais DB_ENCRYPT=false/sans passphrase/DB_NAME/existante/fantôme",_new_db_enc)
+        def _new_db_race():
+            """Créateur en clair (sans nick) passé entre la pré-vérification et la transaction du créateur chiffrant : base laissée
+            en clair (jamais d'en-tête sur une base déjà créée) ; créateur chiffrant concurrent passé avant : son en-tête gardé
+            (une seule DEK), le second écrit et lit avec."""
+            d,bdb,cfgs=_ne_env('newrace'); orig=bdb._new_db_header
+            p1=os.path.join(d,'rc-r1-diff.db'); p2=os.path.join(d,'rc-r2-diff.db')
+            def plain_first(path,nick):
+                h=orig(path,nick); BorgHelperDB(d,'rc').ensure_diff_db(path); return h
+            def enc_first(path,nick):
+                h=orig(path,nick); _ne_env('newrace2')[1].ensure_diff_db(path,nick='ne'); return h
+            with mock.patch.object(bdb,'_new_db_header',plain_first): bdb.ensure_diff_db(p1,nick='ne')
+            got_h=[]
+            def enc_first_spy(path,nick):
+                h=enc_first(path,nick); got_h.append(h); return h
+            with mock.patch.object(bdb,'_new_db_header',enc_first_spy): bdb.ensure_diff_db(p2,nick='ne')
+            c=sqlite3.connect(p2); stored_hdr=json.loads(c.execute("SELECT value FROM db_meta WHERE key='enc_header'").fetchone()[0]); c.close()
+            kept_first=bool(got_h and got_h[0]) and stored_hdr['mac']!=got_h[0][0]['mac']
+            c=_open_db(p2,nick='ne',role='write')
+            try:
+                c.execute("INSERT INTO snapshot_file(nick,path) VALUES('ne',?)",(_path_stored(c,'a/b'),)); c.commit()
+                back=[_path_decode(c,r[0]) for r in c.execute("SELECT path FROM snapshot_file")]
+            finally: c.close()
+            ok=_ne_mode(p1)=='plain' and _ne_mode(p2)=='siv1' and kept_first and back==['a/b']
+            if not ok: print(f"  course : p1 {_ne_mode(p1)}, p2 {_ne_mode(p2)}, premier gardé {kept_first}, relu {back}")
+            return ok
+        check("base neuve chiffrée : créateur concurrent passé avant (en clair -> laissée en clair ; chiffrant -> son en-tête gardé)",_new_db_race)
+        def _new_db_more():
+            """Revue story 31 : passphrase vide, DB_KDF invalide (en clair, rien affiché), niveau KDF du nick (défaut standard),
+            base partagée vue de l'autre côté (nick sans DB_NAME, cible du DB_NAME d'un autre nick), schéma et en-tête dans UNE
+            transaction (un lecteur séparé ne voit aucune table au moment où l'en-tête est écrit), DEK relue sans cache de
+            processus (autre processus)."""
+            d=os.path.join(tmp,'newmore'); os.makedirs(d)
+            cfgs={'nv':{'BORG_PASSPHRASE':'','DB_KDF':'light'},'nk':{'BORG_PASSPHRASE':'pw','DB_KDF':'foo'},
+                  'nd':{'BORG_PASSPHRASE':'pw'},'sa':{'BORG_PASSPHRASE':'pw','DB_KDF':'light'},
+                  'sb':{'BORG_PASSPHRASE':'autre','DB_KDF':'light','DB_NAME':'sa'},'tx':{'BORG_PASSPHRASE':'pw','DB_KDF':'light'}}
+            bdb=BorgHelperDB(d,'rc',cfg_reader=lambda n: cfgs.get(n),nicks_reader=lambda: list(cfgs))
+            levels=[]; real_build=_enc_header_build
+            def _spy_build(pw,path_enc='siv1',kdf_level='standard',dek=None):
+                levels.append(kdf_level); return real_build(pw,path_enc,'light',dek=dek)   # coût : toujours light
+            err=io.StringIO(); res={}
+            with mock.patch.object(sys.modules[__name__],'_enc_header_build',_spy_build),contextlib.redirect_stderr(err),\
+                 contextlib.redirect_stdout(err):
+                for n in ('nv','nk','nd','sa'):
+                    bdb.ensure_diff_db(bdb.get_diff_db(n),nick=n); res[n]=_ne_mode(bdb.get_diff_db(n))
+            seen=[]; real_exec=BhConnection.execute; p=bdb.get_diff_db('tx')
+            def _spy_exec(self,sql,*a):
+                if sql.startswith("INSERT INTO db_meta(key,value) VALUES('enc_header'"):
+                    c=sqlite3.connect(p)
+                    try: seen.append(c.execute("SELECT count(*) FROM sqlite_master").fetchone()[0])
+                    finally: c.close()
+                return real_exec(self,sql,*a)
+            with mock.patch.object(BhConnection,'execute',_spy_exec): bdb.ensure_diff_db(p,nick='tx')
+            c=_open_db(p,nick='tx',role='write')
+            try: c.execute("INSERT INTO snapshot_file(nick,path) VALUES('tx',?)",(_path_stored(c,'x/y'),)); c.commit()
+            finally: c.close()
+            _DEK_CACHE.clear(); _CODEC_CACHE.clear()   # comme un autre processus : DEK redérivée de l'en-tête
+            c=_open_db(p,nick='tx',role='read')
+            try: back=[_path_decode(c,r[0]) for r in c.execute("SELECT path FROM snapshot_file")]
+            finally: c.close()
+            ok=(res=={'nv':'plain','nk':'plain','nd':'siv1','sa':'plain'} and levels==['standard'] and '[ERREUR]' not in err.getvalue()
+                and _ne_mode(p)=='siv1' and seen==[0] and back==['x/y'])
+            if not ok: print(f"  {res} niveaux {levels} transaction {seen} relu {back} {err.getvalue()[-300:]!r}")
+            return ok
+        check("base neuve chiffrée : passphrase vide, DB_KDF invalide, niveau KDF, base partagée vue de l'autre nick, une transaction, autre processus",_new_db_more)
+        def _new_db_threads():
+            """Deux créateurs en vrais threads sur la même base neuve : aucun arrêt, une seule DEK, chacun relit l'écriture de
+            l'autre."""
+            d,bdb,cfgs=_ne_env('newthreads'); p=bdb.get_diff_db('ne'); bar=threading.Barrier(2); errs=[]
+            def run(tag):
+                try:
+                    bar.wait(10); bdb.ensure_diff_db(p,nick='ne')
+                    c=_open_db(p,nick='ne',role='write')
+                    try: c.execute("INSERT INTO snapshot_file(nick,path) VALUES('ne',?)",(_path_stored(c,f'{tag}/f'),)); c.commit()
+                    finally: c.close()
+                except BaseException as e: errs.append(repr(e))
+            ts=[threading.Thread(target=run,args=(t,)) for t in ('a','b')]
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                for t in ts: t.start()
+                for t in ts: t.join(60)
+            _DEK_CACHE.clear(); _CODEC_CACHE.clear()
+            c=_open_db(p,nick='ne',role='read')
+            try: back=sorted(_path_decode(c,r[0]) for r in c.execute("SELECT path FROM snapshot_file"))
+            finally: c.close()
+            ok=not errs and _ne_mode(p)=='siv1' and back==['a/f','b/f']
+            if not ok: print(f"  erreurs {errs} mode {_ne_mode(p)} relu {back}")
+            return ok
+        check("base neuve chiffrée : deux créateurs en threads -> une DEK, chacun relit l'autre",_new_db_threads)
+        def _new_db_heal():
+            """Décision de l'utilisateur (revue) : base née d'une passphrase fausse, SANS chemin -> le créateur suivant (bonne
+            passphrase) remplace l'en-tête (diff.db et cache.db) ; base AVEC chemin : jamais touchée, DbKeyError comme avant ;
+            lecteur (create=False) : jamais de réparation."""
+            d=os.path.join(tmp,'newheal'); os.makedirs(d); cfgs={'h':{'BORG_PASSPHRASE':'fausse','DB_KDF':'light'},
+                                                                   'k':{'BORG_PASSPHRASE':'fausse','DB_KDF':'light'}}
+            bdb=BorgHelperDB(d,'rc',cfg_reader=lambda n: cfgs.get(n),nicks_reader=lambda: list(cfgs))
+            for n in ('h','k'): bdb.ensure_diff_db(bdb.get_diff_db(n),nick=n); bdb.ensure_cache_db(bdb.get_cache_db(n),nick=n)
+            c=_open_db(bdb.get_diff_db('k'),nick='k',role='write')
+            try: c.execute("INSERT INTO snapshot_file(nick,path) VALUES('k',?)",(_path_stored(c,'a/b'),)); c.commit()
+            finally: c.close()
+            def hdr(p):
+                c=sqlite3.connect(p)
+                try: return c.execute("SELECT value FROM db_meta WHERE key='enc_header'").fetchone()[0]
+                finally: c.close()
+            before={n:hdr(bdb.get_diff_db(n)) for n in ('h','k')}; cbefore=hdr(bdb.get_cache_db('h'))
+            for n in ('h','k'): cfgs[n]['BORG_PASSPHRASE']='bonne'
+            _DEK_CACHE.clear(); _CODEC_CACHE.clear()
+            bdb.ensure_diff_db(bdb.get_diff_db('h'),create=False)   # lecteur : rien
+            reader_kept=hdr(bdb.get_diff_db('h'))==before['h']
+            for n in ('h','k'): bdb.ensure_diff_db(bdb.get_diff_db(n),nick=n)
+            bdb.ensure_cache_db(bdb.get_cache_db('h'),nick='h')
+            healed=hdr(bdb.get_diff_db('h'))!=before['h'] and hdr(bdb.get_cache_db('h'))!=cbefore
+            _DEK_CACHE.clear(); _CODEC_CACHE.clear()
+            try: _open_db(bdb.get_diff_db('h'),nick='h',role='read').close(); opens=True
+            except DbKeyError: opens=False
+            kept=hdr(bdb.get_diff_db('k'))==before['k'] and raises(DbKeyError,lambda: _open_db(bdb.get_diff_db('k'),nick='k',role='read'))
+            ok=reader_kept and healed and opens and kept
+            if not ok: print(f"  lecteur {reader_kept} réparée {healed} ouverte {opens} base avec chemin gardée {kept}")
+            return ok
+        check("base neuve chiffrée : passphrase fausse à la création, base sans chemin réparée par le créateur suivant ; avec chemin jamais",_new_db_heal)
+        def _new_db_dbencrypt():
+            """Décision de l'utilisateur (revue) : diff.db déjà dans le mode cible (née chiffrée) et cache.db dans l'autre ->
+            DbEncrypt -y / DbDecrypt -y mettent quand même cache.db dans le mode cible ; sans -y : rien touché. DbStatus : fichier
+            sans table = « absent », sans [WARN]."""
+            d=os.path.join(tmp,'newdbenc'); os.makedirs(d); rc=os.path.join(d,'rc')
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nBORG_PASSPHRASE=pw\nDB_KDF=light\nSER_NAME=h\nSER_LOGIN=x\n"
+                        f"GLOB_ARCH=*\nBORG_REPO={d}/r\n\n[de]\n\n[dz]\n")
+            os.chmod(rc,0o600); b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            q=b.db.get_cache_db('de'); b.db.ensure_cache_db(q)                 # cache.db en clair, existante
+            b.db.ensure_diff_db(b.db.get_diff_db('de'),nick='de')             # diff.db neuve : chiffrée
+            o=_q_run(b.db_encrypt,'de'); kept=_ne_mode(q)=='plain'
+            o2=_q_run(b.db_encrypt,'de',confirm=True); enc=_ne_mode(q)=='siv1'
+            o3=_q_run(b.db_decrypt,'de',confirm=True); dec=_ne_mode(q)=='plain' and _ne_mode(b.db.get_diff_db('de'))=='plain'
+            b.db.ensure_cache_db(q,nick='de')   # cache.db existante : jamais chiffrée d'office
+            c=_open_db(b.db.get_diff_db('de'),nick=None,role='admin'); _enc_header_write(c,_enc_header_build('pw','siv1','light')[0]); c.close()
+            o4=_q_run(b.db_decrypt,'de',confirm=True); dec2=_ne_mode(q)=='plain' and _ne_mode(b.db.get_diff_db('de'))=='plain'
+            open(b.db.get_cache_db('dz'),'w').close()   # fichier vide laissé par un lookup
+            st=_q_run(b.db_status,'dz')
+            ok=(kept and enc and dec and dec2 and 'déjà chiffrée' in o2 and 'dz: cache.db: absent' in st and 'non chiffrée' not in st)
+            if not ok: print(f"  sans -y gardée {kept}, -y chiffrée {enc}, DbDecrypt {dec}/{dec2} ; {o2[-200:]!r} {o4[-200:]!r} ; DbStatus {st!r}")
+            return ok
+        check("base neuve chiffrée : DbEncrypt/DbDecrypt -y finissent cache.db quand diff.db est déjà dans le mode cible ; DbStatus fichier vide = absent",_new_db_dbencrypt)
+        def _new_db_creators():
+            """Chaque appel créateur de BorgHelper (create=True) passe le nick à ensure_*_db, sauf ceux marqués « sans nick »
+            (DbEncrypt/DbDecrypt, fantôme) : un créateur oublié fait naître une base en clair."""
+            src=open(os.path.realpath(__file__),encoding='utf-8').read()
+            body=src[src.index('\nclass BorgHelper:'):src.index('\ndef codec_selftest(')]
+            bad=[l.strip() for l in body.splitlines() if re.search(r'\.ensure_(diff|cache)_db\(',l) and 'create=False' not in l
+                 and 'nick=' not in l and '# sans nick' not in l and not l.lstrip().startswith('#')]
+            if bad: print(f"  créateurs sans nick : {bad}")
+            return not bad
+        check("base neuve chiffrée : tout créateur de BorgHelper passe le nick (sauf exceptions marquées)",_new_db_creators)
         # ── Rapprochement de la liste des archives + lignes de graphique figées (1.0.140, story 3, AD-9/AD-7) ──
         rz_dir=os.path.join(tmp,'reconcile'); os.makedirs(rz_dir)
         def _rz_date(days):
@@ -13862,6 +14242,24 @@ def codec_selftest(pattern=None,list_only=False):
                 and b._db_meta_value(live,'enc_header') is not None and _rb_outs(b,'rbe')==ref)
             if not ok: print(f"  DbRekey : chiffrée {enc}, en-tête recopié {same_hdr}, {out[-500:]!r}")
             return ok
+        def _rb_new_enc():
+            """1.0.168 (story 31, A48) : Index réel de rbe (DB_ENCRYPT, KDF light) sans base -> diff.db siv1 dès la création,
+            aucun [WARN] « non chiffrée », DbEncrypt n'a plus rien à faire ; sorties == base en clair rb (même dépôt) au nom
+            du nick près."""
+            ctx=_rb_ctx(); _ix_slow(ctx,None,0); b=_rb_bh('rb-ne')
+            out=_q_run(b.index,'rbe'); _q_run(b.index,'rb')
+            hdr=b._db_meta_value(b.db.get_diff_db('rbe'),'enc_header')
+            mode=json.loads(hdr)['path_enc'] if hdr else 'plain'
+            enc_out=_q_run(b.db_encrypt,'rbe',confirm=True)
+            same=[o.replace('rbe','rb') for o in _rb_outs(b,'rbe')]==_rb_outs(b,'rb')
+            cache_absent=not os.path.exists(b.db.get_cache_db('rbe'))
+            rep=_q_run(b.report,'rbe',as_json=True)   # cache de borg info / prune -> cache.db neuve
+            cmode=_ne_mode(b.db.get_cache_db('rbe')) if os.path.exists(b.db.get_cache_db('rbe')) else 'absente'
+            ok=(mode=='siv1' and 'non chiffrée' not in out and 'déjà chiffrée' in enc_out and same
+                and cache_absent and cmode=='siv1' and 'non chiffrée' not in rep)
+            if not ok: print(f"  base neuve : mode {mode}, mêmes sorties {same}, cache {cache_absent}/{cmode}, {out[-300:]!r} / "
+                             f"{enc_out[-200:]!r} / {rep[-300:]!r}")
+            return ok
         def _rb_refusals():
             """Refus (code 3, rien créé) : espace disque < 2,2 × base servie ; DB_NAME partagé. Base servie absente :
             construction directe sans fantôme."""
@@ -14081,6 +14479,7 @@ def codec_selftest(pattern=None,list_only=False):
         _rbc("fantôme : opération prioritaire pendant la bascule -> annulée, base intacte, fantôme gardé, puis bascule",_rb_swap_abort)
         _rbc("fantôme : nouvelle archive avant la bascule -> reportée, rattrapée à la tranche suivante",_rb_new_archive)
         _rbc("fantôme : base chiffrée (en-tête recopié) ; DbRekey entre deux tranches -> fantôme jeté puis refait",_rb_rekey)
+        _rbc("base neuve chiffrée : Index réel sans base (DB_ENCRYPT, passphrase) -> siv1 dès la création, aucun [WARN], sorties == base en clair",_rb_new_enc)
         _rbc("fantôme : refus espace disque et DB_NAME partagé (code 3, rien créé) ; base absente -> construction directe",_rb_refusals)
         _rbc("fantôme : IDX_EXCLUDE — ligne exclue du fantôme purgée avant la bascule",_rb_idx_exclude)
         _rbc("fantôme : kill -9 pendant une unité, pendant la bascule, création interrompue -> base intacte, reprise",_rb_kill)

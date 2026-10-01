@@ -1837,6 +1837,9 @@ l'arrêt d'un nick (`_NICK_STOP` : `SystemExit`, `DbKeyError`/`DbModeError`/`DbT
 `SchemaVersionError`) : `_nick_stop_msg` donne le message réel (exception affichée comme le gestionnaire global de
 `main`, ou dernière `[ERREUR]` affichée depuis la marque `_print_mark` et son détail indenté), rangé en
 `{nick: {'error': …}}` ; nick seul, tous en échec, Ctrl-C (`sys.exit(130)` de `boex`, `KeyboardInterrupt`) : relancé.
+1.0.168 (A50) : une seule copie de cette règle, `_PerNick` (gestionnaire de contexte par nick :
+`with iso(n, lambda: conn): …`, `iso.done()` relance la première erreur si tous ont échoué) — les 7 boucles et
+`_per_nick_main` passent par lui ; sorties comparées à 1.0.167 sur 96 cas, identiques.
 Mesuré avant : une passphrase fausse pour un nick -> Search/TreeHist/… `-n la,lb` code 2 sans aucune sortie.
 `Bkp` multi-nicks : boucle de `main` autour de `backup()` (inchangé, finit toujours par `sys.exit`), pire code.
 Tous en échec : la première erreur relancée (comme avant). RepoHistory/ArchiveHistory en texte n'ouvrent aucune base :
@@ -1862,7 +1865,8 @@ requêtes de ce nick (ligne en erreur du Report). Seul contrôle gardé : schém
 le code -> `SchemaVersionError`. La base est notée dans `_reader_skipped` pour `_READER_SKIP_TTL` (60 s) : pas de
 nouvelle attente à chaque ouverture du même processus (borgHelperWWW, qui vit longtemps, réessaie ensuite). Base libre :
 le lecteur migre et tamponne comme avant ; écrivains (`create=True`) inchangés (60 s). `report_offline`/`report`
-isolent en plus tout `SystemExit` d'un nick (base illisible : ligne `*** nick ⚠ base illisible (voir message)`, code 2 ;
+isolent en plus tout `SystemExit` d'un nick (base illisible : ligne `*** nick ⚠ <message réel>`, code 2 — 1.0.168 :
+`_stop_text`, dernière ligne `[ERREUR]` affichée depuis l'appel et son détail indenté, comme les lecteurs ;
 Report direct : verrou `report-running` du nick retiré aussitôt), sauf Ctrl-C (`boex` -> `sys.exit(130)`) qui arrête
 toujours la commande. `history_path` ne marque jamais `_hist_migrated` une base dont l'entretien a été sauté (nouvel
 essai). Non couvert : `_migrate_to_history` (bases d'avant 1.0.139) ouvre encore `history.db` avec 60 s.
@@ -2149,16 +2153,41 @@ passphrase est résolvable, appelle `_warn_plain_db(nick, db_path)` (précédent
 `(nick, realpath(db_path))` dans `_PLAIN_WARNED` — une fois par base et par nick, pas une fois pour tout le
 processus comme `_warn_rc_perms` qui n'a qu'un seul rc à surveiller). `db_encrypt_enabled`/`_resolve_passphrase`
 peuvent lever `SystemExit` sur une config invalide (`DB_ENCRYPT` mal orthographié) : capturé localement (`except
-SystemExit: pass`) — ce n'est qu'un avertissement, la commande réelle qui suit lèvera la même erreur à son tour.
-`DbStatus` déclenche le même avertissement (même fonction) en lisant l'en-tête directement (`sqlite3.connect`, hors
+SystemExit: pass`, 1.0.168 : `sqlite3.Error` aussi) — ce n'est qu'un avertissement, la commande réelle qui suit lèvera la
+même erreur à son tour. 1.0.168 : jamais sur un fichier sans table (`sqlite_master` vide). `DbStatus` déclenche le même
+avertissement, et affiche `absent` pour un fichier sans table (`_db_has_schema`) (même fonction) en lisant l'en-tête directement (`sqlite3.connect`, hors
 `_open_db` — seule exception documentée à AD-1 : aucune ligne de chemin/blob n'est lue, le codec n'entre jamais en
 jeu, donc DbStatus n'a besoin d'aucune passphrase pour simplement annoncer un mode).
+
+### Base neuve créée chiffrée (1.0.168, story 31, A48)
+
+`ensure_diff_db`/`ensure_cache_db(db_path, create=True, nick=n)` : `_new_db_header(db_path, nick)` rend
+`(en-tête siv1, DEK, passphrase)` si la config du nick a `DB_ENCRYPT` effectif vrai, une passphrase, pas de `DB_NAME`,
+et si le fichier n'a encore aucune table (`_db_has_schema`) et n'est pas un fantôme ; KDF (`DB_KDF`) dérivée là, hors
+transaction. `_create_schema` exécute alors le schéma instruction par instruction dans **un** `BEGIN IMMEDIATE` (pas
+`executescript`, qui validerait la transaction) et pose l'en-tête (`ON CONFLICT DO NOTHING`) seulement si `sqlite_master`
+était vide sous ce verrou (c'est ce contrôle qui protège ; `ON CONFLICT DO NOTHING` n'est qu'une ceinture) : aucun ouvreur
+ne voit la base sans en-tête ; un créateur en clair passé avant -> base laissée en clair (`[WARN]` AD-6) ; deux créateurs
+chiffrants -> l'en-tête du premier, une seule DEK. Conditions (`_auto_enc_cfg`, lues sans rien afficher) : `DB_ENCRYPT`
+vrai et `DB_KDF` valide ; passphrase = celle que `_open_db` résoudra pour ce fichier (`_resolve_passphrase`) et celle du
+nick ; base non partagée : ni `DB_NAME` sur ce nick, ni autre nick du rc (`nicks_reader` de `BorgHelperDB`) dont la
+`diff.db`/`cache.db` est ce fichier ; pas un fantôme.
+**Réparation (revue, décision de l'utilisateur)** : `_heal_empty_header`, appelé par les créateurs (`create=True`, nick,
+base existante) : en-tête siv1 qui ne s'ouvre pas avec la passphrase actuelle ET aucune ligne de chemin (`_MIGRATE_TABLES`)
+ou de cache -> en-tête neuf (UPDATE comparé à l'ancien, sous `BEGIN IMMEDIATE`, vide revérifié) ; passphrase qui l'ouvre :
+DEK mise en cache. **DbEncrypt/DbDecrypt** : `diff.db` déjà dans le mode cible -> `_db_migrate_cache` quand même (`-y`). DEK posée dans `_DEK_CACHE`
+(pas de seconde dérivation à la première ouverture). Créateurs qui passent `nick` : cache de `boex` (miss), Diff, Bkp,
+Prune, `indexsnap`, `_index_pass` ; jamais `_shadow_prepare` (le fantôme recopie l'en-tête de sa base servie).
+Base existante, même vide : jamais chiffrée hors `DbEncrypt` (décision de l'utilisateur : une connexion en clair déjà
+ouverte ailleurs y écrirait des chemins en clair). `_open_db` n'avertit plus (AD-6) sur un fichier sans table : un lecteur
+qui cherche dans un cache absent le crée vide (`O_CREAT`) juste avant que son créateur le fasse naître chiffré.
 
 ### Limitations connues (acceptées, pas de correctif prévu)
 
 - **`DbDecrypt` et `cache.db` absent au moment de l'appel.** `_db_migrate_cache` ne fait rien si `cache.db` n'existe
   pas encore pour ce nick (rien à purger/recréer). Si `DB_ENCRYPT` reste `true` pour ce nick, le PROCHAIN processus
-  qui crée `cache.db` (AD-12 : `Bkp`/`Index`/`indexsnap`) le crée `siv1` d'emblée (comportement de création normal,
+  qui crée `cache.db` (AD-12 : cache de `borg` — Report, Prune — et `Prune` ; 1.0.168 : comme toute base neuve) le crée
+`siv1` d'emblée (comportement de création normal,
   indépendant de `DbDecrypt`) — alors que `diff.db` vient d'être repassé `plain`. Incohérence transitoire
   `diff.db=plain` / `cache.db=siv1` jusqu'à ce que l'opérateur mette `DB_ENCRYPT=false` pour ce nick ou relance
   `DbEncrypt`. Sans conséquence fonctionnelle (chaque base a sa propre DEK et son propre mode, lu indépendamment par

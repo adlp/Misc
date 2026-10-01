@@ -207,9 +207,12 @@ DB_ENCRYPT = true
 DB_KDF     = standard
 ```
 
-`DB_ENCRYPT=true` (défaut) ne fait rien tout seul : une base créée par `Bkp`/`Index` reste `plain` tant qu'on n'a pas
-lancé `DbEncrypt` dessus (elle n'était pas chiffrée avant, elle ne le devient pas toute seule — pas de migration
-implicite). Si une base reste `plain` alors que `DB_ENCRYPT` est actif et qu'une passphrase est disponible,
+`DB_ENCRYPT=true` (défaut) : depuis 1.0.168, une base **neuve** (`diff.db`, `cache.db`) créée par `Bkp`/`Index`/`Prune`/
+`Diff`/`Report` (cache de `borg info`) est chiffrée dès sa création quand la passphrase est disponible — sauf pour une base
+partagée (`DB_NAME` sur ce nick, ou autre nick dont le `DB_NAME` désigne ce nick : en clair, comme avant). Base née d'une
+passphrase fausse et encore sans aucun chemin : le créateur suivant, avec la bonne passphrase, lui pose une nouvelle clé.
+`DbEncrypt -y`/`DbDecrypt -y` mettent aussi `cache.db` dans le mode voulu quand `diff.db` y est déjà. Une base **existante** en clair reste `plain` tant qu'on n'a pas lancé `DbEncrypt`
+dessus (elle ne le devient pas toute seule — pas de migration implicite). Si une base reste `plain` alors que `DB_ENCRYPT` est actif et qu'une passphrase est disponible,
 `borgHelper` avertit une fois par base (par invocation, sur stderr) et cite la commande à lancer. `DbEncrypt`/
 `DbDecrypt`/`DbRekey`/`DbStatus` (voir [Commandes](#commandes)) basculent le mode d'une base réelle. La clé de
 chiffrement est dérivée de `BORG_PASSPHRASE`. `DbRekey` ré-enveloppe la DEK existante avec un sel/nonce frais
@@ -217,7 +220,8 @@ chiffrement est dérivée de `BORG_PASSPHRASE`. `DbRekey` ré-enveloppe la DEK e
 une rotation de l'enveloppe, PAS un mécanisme de changement de `BORG_PASSPHRASE` (celui-ci exigerait de connaître
 simultanément l'ancienne et la nouvelle passphrase — hors périmètre de cette commande). Changer `BORG_PASSPHRASE`
 dans le fichier de conf d'un nick dont la base est déjà chiffrée la rend illisible (`DbKeyError`) : ne le faites pas
-sans avoir d'abord `DbDecrypt`é. `DB_ENCRYPT=false`
+sans avoir d'abord `DbDecrypt`é, et passez `DB_ENCRYPT=false` le temps du changement (sinon une base recréée entre-temps
+naîtrait chiffrée avec l'ancienne passphrase). `DB_ENCRYPT=false`
 pour un nick fait refuser `DbEncrypt` dessus explicitement (déchiffrer avec `DbDecrypt` reste toujours permis).
 `borgHelper -c CodecSelfTest` vérifie le codec, la migration et ses refus sur des bases temporaires.
 
@@ -486,8 +490,9 @@ alerte (`*** nick`, rouge en HTML), code 2 ; archives affichées en hors ligne (
 
 Plusieurs nicks (1.0.166) : la base d'un nick tenue par un autre processus (migration, Index) est lue telle quelle,
 sans message, après 2 s d'attente au plus par base (Report direct : `diff.db` et `cache.db`, soit ~4 s par nick occupé) ;
-une base illisible ne donne qu'une ligne `*** nick ⚠ base illisible (voir message)` (code 2), en direct comme hors
-ligne — les autres dépôts s'affichent toujours (liste des machines de borgHelperWWW comprise). Même attente bornée pour
+une base illisible ne donne qu'une ligne `*** nick ⚠ <message réel>` (`*** ERREUR nick` en direct ; code 2 ; 1.0.168 : par exemple
+`⚠ DB corrompue : …/rc-nick-diff.db -> database disk image is malformed …`, avant `⚠ base illisible (voir message)`),
+en direct comme hors ligne — les autres dépôts s'affichent toujours (liste des machines de borgHelperWWW comprise). Même attente bornée pour
 `Status`.
 
 En texte seulement (ni `-j` ni `-l`), en ligne de commande, une ligne finale signale les restes à nettoyer sur la
