@@ -10,6 +10,9 @@
 
 ## gitconfig
 
+### 1.11.0 — 2026-10-01
+- Ajout de l'alias `fidiff` : `git fidiff [-G <commit>] <depot> <fichier-local> <chemin-dans-le-depot>` affiche le `git diff --no-index` entre un fichier local et sa version dans le depot — HEAD par defaut, ou le commit precise via `-G` (meme mecanisme que `figet -G`). Comble le manque identifie face a `gitoune -d`.
+
 ### 1.10.0 — 2026-10-01
 - `figet` accepte `-G <commit>` : `git figet [-G <commit>] <depot> <chemin> <destination>`. Sans `-G`, clone `--depth 1` (HEAD uniquement, inchange). Avec `-G`, clone complet + `git checkout <commit>` pour recuperer le fichier/repertoire a cette version precise. Comble le manque identifie face a `gitoune -G`.
 

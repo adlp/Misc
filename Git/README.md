@@ -10,7 +10,7 @@ Scripts utilitaires pour manipuler des depots git.
 | `git2git_mirror` | 1.1.0 | Synchronise l'integralite d'un depot git (branches, tags, refs) vers un autre, avec option `--dry-run` ; ou extrait un sous-repertoire (`--subdir`) pour l'exposer comme depot independant |
 | `gitar` | 1.0.0 | Pousse une archive tar dans un depot git |
 | `gitoune` | 1.0.0 | Pousse un fichier dans un depot git |
-| `gitconfig` | 1.10.0 | Configuration git personnelle (`~/.gitconfig`) : alias, pager, diff tool, identite pro/perso par repo, mirroring inline (`git mirror`), depot d'archive tar (`git tar`), telechargement fichier/repertoire a HEAD ou a un commit precis (`git figet [-G <commit>]`), depot d'un fichier unique (`git fiput`), historique d'un fichier distant (`git filog`) |
+| `gitconfig` | 1.11.0 | Configuration git personnelle (`~/.gitconfig`) : alias, pager, diff tool, identite pro/perso par repo, mirroring inline (`git mirror`), depot d'archive tar (`git tar`), telechargement fichier/repertoire a HEAD ou a un commit precis (`git figet [-G <commit>]`), depot d'un fichier unique (`git fiput`), historique d'un fichier distant (`git filog`), diff fichier local vs depot (`git fidiff [-G <commit>]`) |
 
 Voir `CHANGELOG.md` pour l'historique des versions.
 
@@ -41,9 +41,9 @@ Voir `CHANGELOG.md` pour l'historique des versions.
 | Entree/sortie fichier | contenu via **stdin/stdout**, ouvert en mode texte (`open(..., 'w')`) — risque de corruption sur binaire/encodage | copie **binaire** (`cp -a`) — fichiers binaires et encodages preserves |
 | Recuperer (`get`) | `-g`/`-G <commit>` affiche le contenu sur stdout, a HEAD ou a un commit precis | `figet` ecrit vers une destination (fichier, repertoire, ou archive `.tar`/`.tgz`) ; `-G <commit>` couvre aussi un commit precis (clone complet + `checkout`, au lieu du `--depth 1` par defaut) |
 | Repertoires | non supporte, fichier unique seulement | `figet` recupere aussi un repertoire entier (copie ou archive) ; `fiput` reste fichier unique |
-| Diff avant envoi | `-d` affiche le diff unifie (stdin vs contenu git) avant de decider | aucun affichage, decision via `git diff --cached --quiet` seulement |
+| Diff avant envoi | `-d` affiche le diff unifie (stdin vs contenu git) avant de decider | couvert separement par `git fidiff [-G <commit>] <depot> <fichier-local> <chemin>` (`git diff --no-index`, HEAD par defaut ou commit precis) |
 | Historique du fichier | `-l` affiche le log du fichier dans le depot | couvert separement par `git filog <depot> <chemin>` (meme format que `git logs`) |
 | Detection "rien a faire" | compare les deux contenus, exit code 2 si diff, 0 si identique | `git diff --cached --quiet` apres `add`, skip le commit si vide |
 | Chemin local | tel que tape (pas de resolution `$GIT_PREFIX`) | resolu via `$GIT_PREFIX` pour `fiput` — fonctionne depuis un sous-repertoire d'un autre repo invoquant |
 | Dependance externe | paquet python `git` (GitPython) installe | aucune |
-| Fichier | script standalone, 165 lignes | trois alias inline dans `.gitconfig`, une ligne chacun |
+| Fichier | script standalone, 165 lignes | quatre alias inline dans `.gitconfig`, une ligne chacun |
