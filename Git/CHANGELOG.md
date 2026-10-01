@@ -10,6 +10,10 @@
 
 ## gitconfig
 
+### 1.7.0 — 2026-10-01
+- Ajout de l'alias `figet` : `git figet <depot> <chemin-dans-le-depot> <destination>` recupere un fichier ou un repertoire precis d'un depot (clone --depth 1 dans un temp, sans historique) et le depose en local. Fichier -> copie vers `<destination>` (ou dans `<destination>/` si c'est un repertoire existant). Repertoire -> copie locale, ou archive si `<destination>` finit en `.tar`/`.tgz`/`.tar.gz`/`.tar.bz2`/`.tbz2`.
+- Limite connue : le clone recupere tout l'historique courant (HEAD) du depot, pas seulement le chemin demande — git ne permet pas de transfert partiel portable sans support serveur (partial clone/sparse-checkout, ou `git archive --remote` souvent desactive cote hebergeur). Acceptable pour des depots de taille courante (Gitea perso), a eviter sur un gros monorepo distant.
+
 ### 1.6.0 — 2026-10-01
 - Ajout de l'alias `tar` : `git tar <archive.tar|.tgz> <depot> <repertoire> <message>` clone `<depot>`, remplace entierement le contenu de `<repertoire>` par celui de l'archive (ajouts, modifs et suppressions), commit avec `<message>` et pousse. Equivalent inline de `gitar`, integre a `.gitconfig`. Chemin d'archive relatif au repertoire d'invocation (via `$GIT_PREFIX`, comme `addco`/`addcom`). Rien commite si l'archive ne change rien au sous-repertoire.
 
