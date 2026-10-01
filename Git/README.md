@@ -29,3 +29,21 @@ Voir `CHANGELOG.md` pour l'historique des versions.
 | Chemin archive | tel que tape (pas de resolution `$GIT_PREFIX`) | resolu via `$GIT_PREFIX` — fonctionne depuis un sous-repertoire d'un autre repo invoquant (meme technique que `addco`/`addcom`) |
 | Dependance externe | paquet python `git` (GitPython) installe | aucune, juste `git`+`tar` deja presents partout |
 | Fichier | script standalone, 137 lignes | alias inline dans `.gitconfig`, une ligne |
+
+## `gitoune` vs `git fiput` / `git figet`
+
+`gitoune` multiplexe get+put d'un fichier unique derriere des flags. `git fiput` (deposer) et `git figet` (recuperer) sont deux alias separes dans `gitconfig` qui couvrent le meme besoin, plus les repertoires pour `figet`.
+
+| | `gitoune` | `git fiput` / `git figet` |
+|---|---|---|
+| Langage | Python (requiert `gitpython`) | shell (alias `!` dans `.gitconfig`), requiert juste `git`+`tar` |
+| Args | flags nommes : `-r -f -m -g -G -d -l` (combinables) | positionnels, un alias par sens : `fiput depot local dest message` / `figet depot chemin destination` |
+| Entree/sortie fichier | contenu via **stdin/stdout**, ouvert en mode texte (`open(..., 'w')`) — risque de corruption sur binaire/encodage | copie **binaire** (`cp -a`) — fichiers binaires et encodages preserves |
+| Recuperer (`get`) | `-g`/`-G <commit>` affiche le contenu sur stdout, a HEAD ou a un commit precis | `figet` ecrit vers une destination (fichier, repertoire, ou archive `.tar`/`.tgz`) ; HEAD uniquement, pas de commit specifique |
+| Repertoires | non supporte, fichier unique seulement | `figet` recupere aussi un repertoire entier (copie ou archive) ; `fiput` reste fichier unique |
+| Diff avant envoi | `-d` affiche le diff unifie (stdin vs contenu git) avant de decider | aucun affichage, decision via `git diff --cached --quiet` seulement |
+| Historique du fichier | `-l` affiche le log du fichier dans le depot | aucun equivalent |
+| Detection "rien a faire" | compare les deux contenus, exit code 2 si diff, 0 si identique | `git diff --cached --quiet` apres `add`, skip le commit si vide |
+| Chemin local | tel que tape (pas de resolution `$GIT_PREFIX`) | resolu via `$GIT_PREFIX` pour `fiput` — fonctionne depuis un sous-repertoire d'un autre repo invoquant |
+| Dependance externe | paquet python `git` (GitPython) installe | aucune |
+| Fichier | script standalone, 165 lignes | deux alias inline dans `.gitconfig`, une ligne chacun |
