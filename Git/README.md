@@ -10,7 +10,7 @@ Scripts utilitaires pour manipuler des depots git.
 | `git2git_mirror` | 1.1.0 | Synchronise l'integralite d'un depot git (branches, tags, refs) vers un autre, avec option `--dry-run` ; ou extrait un sous-repertoire (`--subdir`) pour l'exposer comme depot independant |
 | `gitar` | 1.0.0 | Pousse une archive tar dans un depot git |
 | `gitoune` | 1.0.0 | Pousse un fichier dans un depot git |
-| `gitconfig` | 1.8.0 | Configuration git personnelle (`~/.gitconfig`) : alias, pager, diff tool, identite pro/perso par repo, mirroring inline (`git mirror`), depot d'archive tar (`git tar`), telechargement fichier/repertoire (`git figet`), depot d'un fichier unique (`git fiput`) |
+| `gitconfig` | 1.9.0 | Configuration git personnelle (`~/.gitconfig`) : alias, pager, diff tool, identite pro/perso par repo, mirroring inline (`git mirror`), depot d'archive tar (`git tar`), telechargement fichier/repertoire (`git figet`), depot d'un fichier unique (`git fiput`), historique d'un fichier distant (`git filog`) |
 
 Voir `CHANGELOG.md` pour l'historique des versions.
 
@@ -42,8 +42,8 @@ Voir `CHANGELOG.md` pour l'historique des versions.
 | Recuperer (`get`) | `-g`/`-G <commit>` affiche le contenu sur stdout, a HEAD ou a un commit precis | `figet` ecrit vers une destination (fichier, repertoire, ou archive `.tar`/`.tgz`) ; HEAD uniquement, pas de commit specifique |
 | Repertoires | non supporte, fichier unique seulement | `figet` recupere aussi un repertoire entier (copie ou archive) ; `fiput` reste fichier unique |
 | Diff avant envoi | `-d` affiche le diff unifie (stdin vs contenu git) avant de decider | aucun affichage, decision via `git diff --cached --quiet` seulement |
-| Historique du fichier | `-l` affiche le log du fichier dans le depot | aucun equivalent |
+| Historique du fichier | `-l` affiche le log du fichier dans le depot | couvert separement par `git filog <depot> <chemin>` (meme format que `git logs`) |
 | Detection "rien a faire" | compare les deux contenus, exit code 2 si diff, 0 si identique | `git diff --cached --quiet` apres `add`, skip le commit si vide |
 | Chemin local | tel que tape (pas de resolution `$GIT_PREFIX`) | resolu via `$GIT_PREFIX` pour `fiput` — fonctionne depuis un sous-repertoire d'un autre repo invoquant |
 | Dependance externe | paquet python `git` (GitPython) installe | aucune |
-| Fichier | script standalone, 165 lignes | deux alias inline dans `.gitconfig`, une ligne chacun |
+| Fichier | script standalone, 165 lignes | trois alias inline dans `.gitconfig`, une ligne chacun |

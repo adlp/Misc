@@ -10,6 +10,9 @@
 
 ## gitconfig
 
+### 1.9.0 — 2026-10-01
+- Ajout de l'alias `filog` : `git filog <depot> <chemin-dans-le-depot>` clone le depot (historique complet) et affiche `git log` filtre sur ce chemin, meme format que l'alias `logs`. Comble le manque identifie face a `gitoune -l` (historique d'un fichier distant).
+
 ### 1.8.0 — 2026-10-01
 - Ajout de l'alias `fiput` : `git fiput <depot> <fichier-local> <chemin-destination> <message>` clone `<depot>`, copie `<fichier-local>` vers `<chemin-destination>` (cree les repertoires intermediaires si besoin), commit avec `<message>` et pousse. Rien commite si le contenu est identique. Chemin local relatif au repertoire d'invocation via `$GIT_PREFIX`. Equivalent fichier unique de `git tar`, remplace l'usage ponctuel de `gitoune`.
 
