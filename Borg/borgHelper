@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.169"
+Version="1.0.170"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -2186,6 +2186,24 @@ def _wh(sql):
 def _path_sort_key(path):
     """Ordre octet UTF-8 (celui du tri BINARY de SQLite)."""
     return path.encode('utf-8','surrogateescape')
+
+def _db_absent(db_path):
+    """1.0.170 (story 33) : base ABSENTE pour une commande — fichier inexistant, de 0 octet (laissé par l'O_CREAT d'un lecteur,
+    _open_db ; jamais ouvert : SQLite supprimerait un -wal orphelin, story 32) ou base lisible sans aucune TABLE (une vue
+    seule — contrôle de vue de borgHelperWWW avant 1.0.169 — n'en fait pas une base). Base illisible (corrompue) ou
+    verrouillée : False — jamais présentée comme absente, l'erreur réelle reste visible (à la différence de `not
+    _db_has_schema`, vrai aussi sur une base illisible ou verrouillée). Ouverture mode=rw : ne crée jamais le fichier
+    (supprimé entre-temps) ; délai court : un verrou vaut False de toute façon."""
+    try:
+        if not os.path.exists(db_path) or os.path.getsize(db_path)==0: return True
+    except OSError: return True
+    try:
+        import pathlib
+        conn=sqlite3.connect(pathlib.Path(db_path).absolute().as_uri()+'?mode=rw',uri=True,timeout=_READER_WRITE_WAIT)
+        try: return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone() is None
+        finally: conn.close()
+    except sqlite3.Error:
+        return False
 
 def _db_has_schema(db_path):
     """True si db_path contient au moins une table. _open_db(role='read') touche le fichier (0 octet)
@@ -4407,7 +4425,7 @@ class BorgHelper:
         à ligne (Story 4/spine) — un cache est reconstructible par un simple appel borg, sans valeur à
         préserver au prix d'une migration en place coûteuse."""
         cache_path=self.db.get_cache_db(nick)
-        if not os.path.exists(cache_path): return  # rien à migrer ; créée dans le bon mode au prochain accès (AD-12)
+        if _db_absent(cache_path): return  # rien à migrer (absente ou 0 octet, 1.0.170) ; créée dans le bon mode au prochain accès (AD-12)
         self.db.ensure_cache_db(cache_path)   # sans nick : DbEncrypt/DbDecrypt fixent eux-mêmes le mode
         conn=_open_db(cache_path,nick=None,role='admin')
         try:
@@ -4431,8 +4449,18 @@ class BorgHelper:
     def _db_migrate(self,nick,direction,dryrun=False,confirm=False,debug=0):
         verb='DbEncrypt' if direction=='encrypt' else 'DbDecrypt'
         db_path=self.db.get_diff_db(nick)
-        if not os.path.exists(db_path):
-            printer(f"  {nick}: diff.db absent — rien à faire"); return 0
+        if _db_absent(db_path):   # 1.0.170 (story 33) : fichier 0 octet laissé par l'O_CREAT d'un lecteur = absent
+            busy=self._db_locks_busy(nick)   # un Index du nick peut être en train de la créer : refus, comme avant
+            if busy:
+                printer(f"  [ERREUR] {busy} — {verb} refusé"); return 2
+            printer(f"  {nick}: diff.db absent — rien à faire")
+            # décision de l'utilisateur (revue story 33) : -y -> cache.db existante quand même mise dans le mode cible (story 31)
+            cfg=self.borg.cfgread(nick); passphrase=cfg.get('BORG_PASSPHRASE') if cfg else None
+            if confirm and not dryrun and passphrase and (direction=='decrypt' or db_encrypt_enabled(nick,cfg=cfg)):
+                try: self._db_migrate_cache(nick,direction,passphrase,cfg,debug=debug)
+                except (DbKeyError,DbModeError,DbTamperError,DbCodecError) as e:
+                    printer(f"  [ERREUR] {nick}: {type(e).__name__}: {e}"); return 2
+            return 0
         self.db.ensure_diff_db(db_path)  # sans nick : schéma courant requis avant migration (migrations legacy d'abord, AD-7)
         cfg=self.borg.cfgread(nick)
         if direction=='encrypt' and not db_encrypt_enabled(nick,cfg=cfg):
@@ -4494,7 +4522,10 @@ class BorgHelper:
         borgHelperWWW >= 1.26.4 relit l'en-tête de chiffrement à chaque usage de son memo de codec
         (_NICK_CODEC_MEMO) : un DbRekey/DbEncrypt/DbDecrypt CLI est pris en compte sans redémarrage."""
         db_path=self.db.get_diff_db(nick)
-        if not os.path.exists(db_path):
+        if _db_absent(db_path):   # 1.0.170 (story 33) : fichier 0 octet laissé par l'O_CREAT d'un lecteur = absent
+            busy=self._db_locks_busy(nick)
+            if busy:
+                printer(f"  [ERREUR] {busy} — DbRekey refusé"); return 2
             printer(f"  {nick}: diff.db absent"); return 1
         cfg=self.borg.cfgread(nick)
         passphrase=cfg.get('BORG_PASSPHRASE') if cfg else None
@@ -7067,7 +7098,7 @@ class BorgHelper:
     def idxtop(self,nick,depth=3,topn=20,debug=0,as_json=False):
         from collections import defaultdict
         db_path=self.db.get_diff_db(nick)
-        if not os.path.exists(db_path):
+        if _db_absent(db_path):   # 1.0.170 (story 33) : fichier 0 octet laissé par l'O_CREAT d'un lecteur = absent
             if as_json: print(json.dumps({'error':f"diff.db absent pour {nick}"},ensure_ascii=False,indent=2)); return
             printer(f"  {nick}: diff.db absent — lancez borgHelper -c Index -n {nick}"); return
         if as_json:
@@ -7626,7 +7657,7 @@ class BorgHelper:
     def difftop(self,nick,bkp=None,depth=3,topn=10,debug=0,as_json=False):
         from collections import defaultdict
         db_path=self.db.get_diff_db(nick)
-        if not os.path.exists(db_path):
+        if _db_absent(db_path):   # 1.0.170 (story 33) : fichier 0 octet laissé par l'O_CREAT d'un lecteur = absent
             if as_json: print(json.dumps({'error':f"diff.db absent pour {nick}"},ensure_ascii=False,indent=2)); return
             printer(f"  {nick}: diff.db absent — lancez borgHelper -c Index -n {nick}"); return
         if bkp:
@@ -7780,7 +7811,7 @@ class BorgHelper:
 
     def idxpurge(self,nick,pattern=None,dryrun=False,debug=0,db_path=None):
         if db_path is None: db_path=self.db.get_diff_db(nick)   # db_path : fantôme avant bascule (1.0.143)
-        if not os.path.exists(db_path):
+        if _db_absent(db_path):   # 1.0.170 (story 33) : fichier 0 octet laissé par l'O_CREAT d'un lecteur = absent
             printer(f"  {nick}: diff.db absent"); return
         cfg=self.borg.cfgread(nick)
         keep_snap=int(cfg.get('IDX_SNAP_KEEP',
@@ -12535,6 +12566,117 @@ def codec_selftest(pattern=None,list_only=False):
             if not ok: print(f"  état {st} schéma {_db_has_schema(p)}")
             return ok
         check("base vide clé fausse : contrôle de vue de WWW sur fichier sans table -> rien créé",_wrongkey_view)
+        # 1.0.170 (story 33, A55) : fichier de 0 octet laissé par l'O_CREAT d'un lecteur = base absente
+        def _nb_env(sub):
+            d=os.path.join(tmp,sub); os.makedirs(d); rc=os.path.join(d,'rc')
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nBORG_PASSPHRASE=pw\nDB_KDF=light\nSER_NAME=h\nSER_LOGIN=x\n"
+                        f"GLOB_ARCH=*\nBORG_REPO={d}/r\n\n[zb]\n\n[zr]\nDB_ENCRYPT=false\n\n")
+            os.chmod(rc,0o600)
+            return d,BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+        def _nobase_cmds():
+            """IdxTop, DiffTop (texte, -j), IdxPurge (-D et réel), DbEncrypt/DbDecrypt (-D et -y), DbRekey sur zb, pour chaque état
+            « sans base » — fichier de 0 octet, en-tête seul (WAL, 4096 octets), vue seule (ancien contrôle de vue de WWW), 0 octet avec un
+            -wal orphelin — : même sortie, code et valeur rendue qu'un fichier absent (« absent ») ; jamais « no such table » ; dossier
+            inchangé (rien créé, -wal orphelin intact) ; fichier absent : jamais créé. JSON exact ; codes de la matrice."""
+            d,b=_nb_env('nobase'); p=b.db.get_diff_db('zb'); res={}; outs={}
+            def clear():
+                for f in (p,p+'-wal',p+'-shm'):
+                    if os.path.exists(f): os.unlink(f)
+            def st_empty(): open(p,'w').close()
+            def st_header():
+                c=sqlite3.connect(p); c.execute("PRAGMA journal_mode=WAL"); c.close()
+            def st_view():
+                c=sqlite3.connect(p); c.execute("CREATE VIEW v AS SELECT 1"); c.close()
+            def st_walorphan():
+                open(p,'w').close()
+                with open(p+'-wal','wb') as f: f.write(b'\x37\x7f\x06\x82'+b'x'*60)
+            def snap(): return sorted((f,os.path.getsize(os.path.join(os.path.dirname(p),f)),
+                                       hashlib.sha256(open(os.path.join(os.path.dirname(p),f),'rb').read()).hexdigest())
+                                      for f in os.listdir(os.path.dirname(p)) if f.startswith(os.path.basename(p)))
+            cmds=(('IdxTop',lambda: b.idxtop('zb')),('IdxTop -j',lambda: b.idxtop('zb',as_json=True)),
+                  ('DiffTop',lambda: b.difftop('zb')),('DiffTop -j',lambda: b.difftop('zb',as_json=True)),
+                  ('IdxPurge -D',lambda: b.idxpurge('zb',dryrun=True)),('IdxPurge',lambda: b.idxpurge('zb')),
+                  ('DbEncrypt -D',lambda: b.db_encrypt('zb',dryrun=True)),('DbEncrypt -y',lambda: b.db_encrypt('zb',confirm=True)),
+                  ('DbDecrypt -D',lambda: b.db_decrypt('zb',dryrun=True)),('DbDecrypt -y',lambda: b.db_decrypt('zb',confirm=True)),
+                  ('DbRekey',lambda: b.db_rekey('zb',confirm=True)))
+            for lbl,fn in cmds:
+                clear(); absent=_wk_run(fn); created=os.path.exists(p) or os.path.exists(p+'-wal') or os.path.exists(p+'-shm')
+                outs[lbl]=absent; r=[not created]
+                for name,mk in (('vide',st_empty),('en-tête',st_header),('vue',st_view),('wal orphelin',st_walorphan)):
+                    clear(); mk(); before=snap(); got=_wk_run(fn)
+                    r.append(got==absent and 'absent' in got[0] and 'no such table' not in got[0] and snap()==before)
+                res[lbl]=r
+            clear()
+            codes={'IdxTop':None,'IdxTop -j':None,'DiffTop':None,'DiffTop -j':None,'IdxPurge -D':None,'IdxPurge':None}
+            rets={'DbEncrypt -D':0,'DbEncrypt -y':0,'DbDecrypt -D':0,'DbDecrypt -y':0,'DbRekey':1}
+            js=lambda k: json.loads(outs[k][0][outs[k][0].index('{'):])
+            ok=(all(all(v) for v in res.values()) and all(outs[k][1] is c for k,c in codes.items())
+                and all(outs[k][2]==c for k,c in rets.items())
+                and js('IdxTop -j')=={'error':'diff.db absent pour zb'} and js('DiffTop -j')=={'error':'diff.db absent pour zb'})
+            if not ok: print(f"  {res} ; codes {[(k,outs[k][1],outs[k][2]) for k in outs]}")
+            return ok
+        check("nick sans base : fichier vide, en-tête seul, vue seule, -wal orphelin = absent (IdxTop, DiffTop, IdxPurge, DbEncrypt, DbDecrypt, DbRekey), rien créé",_nobase_cmds)
+        def _nobase_limits():
+            """Base illisible (corrompue) : jamais dite absente — chaque commande garde son erreur réelle ; base réelle (zr, schéma vide) :
+            inchangée ; multi-nicks (boucle texte de main), IdxTop et DiffTop : zr affiché, zb « absent », aucun arrêt."""
+            d,b=_nb_env('nobaselim'); p=b.db.get_diff_db('zb'); os.makedirs(os.path.dirname(p),exist_ok=True)
+            with open(p,'wb') as f: f.write(b'garbage'*600)
+            bad={}
+            for lbl,fn in (('IdxTop',lambda: b.idxtop('zb')),('DiffTop',lambda: b.difftop('zb')),('IdxPurge -D',lambda: b.idxpurge('zb',dryrun=True)),
+                           ('DbEncrypt -D',lambda: b.db_encrypt('zb',dryrun=True)),('DbDecrypt -D',lambda: b.db_decrypt('zb',dryrun=True)),
+                           ('DbRekey',lambda: b.db_rekey('zb',confirm=True))):
+                try: o=_wk_run(fn)[0]
+                except (DbKeyError,DbModeError,DbTamperError,DbCodecError,sqlite3.Error) as e: o=f"{type(e).__name__}: {e}"   # erreur réelle visible (main)
+                bad[lbl]='absent' not in o and ('not a database' in o or 'corrompue' in o or 'illisible' in o)
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db.ensure_diff_db(b.db.get_diff_db('zr'),nick='zr')
+            os.unlink(p); open(p,'w').close(); multi={}
+            for lbl,fn,want in (('IdxTop',b.idxtop,'zr: diff_index vide'),('DiffTop',b.difftop,'zr: aucune paire indexée')):
+                o,code,_=_wk_run(lambda: _per_nick_main('zr,zb',lambda n: fn(n)))
+                multi[lbl]=(want in o and 'zb: diff.db absent' in o and 'no such table' not in o and 'arrêt' not in o and code is None)
+            ok=all(bad.values()) and all(multi.values())
+            if not ok: print(f"  corrompue {bad} ; multi {multi}")
+            return ok
+        check("nick sans base : base corrompue jamais dite absente (6 commandes) ; multi-nicks IdxTop et DiffTop : base réelle affichée, fichier vide « absent »",_nobase_limits)
+        def _nobase_cache():
+            """Décision de l'utilisateur (revue story 33) : diff.db absente ou vide, cache.db existante -> DbEncrypt -y / DbDecrypt -y la
+            mettent quand même dans le mode cible ; -D : rien touché ; DB_ENCRYPT=false : DbEncrypt ne la chiffre pas ; cache.db de
+            0 octet : laissée telle quelle (absente). Verrou d'opération tenu (Index du nick) : refus, code 2, rien touché."""
+            d,b=_nb_env('nobasecache'); p=b.db.get_diff_db('zb'); q=b.db.get_cache_db('zb'); res={}
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db.ensure_cache_db(q)   # en clair
+            open(p,'w').close()
+            _wk_run(lambda: b.db_encrypt('zb',dryrun=True)); res['-D rien']=_ne_mode(q)=='plain'
+            o=_wk_run(lambda: b.db_encrypt('zb',confirm=True)); res['-y chiffre']=_ne_mode(q)=='siv1' and 'absent' in o[0] and o[2]==0
+            os.unlink(p)
+            o=_wk_run(lambda: b.db_decrypt('zb',confirm=True)); res['absente, -y déchiffre']=_ne_mode(q)=='plain' and o[2]==0
+            qr=b.db.get_cache_db('zr')
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db.ensure_cache_db(qr)
+            _wk_run(lambda: b.db_encrypt('zr',confirm=True)); res['DB_ENCRYPT=false']=_ne_mode(qr)=='plain'
+            os.unlink(q); open(q,'w').close(); open(p,'w').close()
+            _wk_run(lambda: b.db_encrypt('zb',confirm=True)); res['cache vide']=os.path.getsize(q)==0 and os.path.getsize(p)==0
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db.ensure_cache_db(q)   # cache en clair
+            with mock.patch.object(b,'_db_locks_busy',lambda n: f"{n}: Index en cours"):
+                o1=_wk_run(lambda: b.db_encrypt('zb',confirm=True)); o2=_wk_run(lambda: b.db_rekey('zb',confirm=True))
+            res['verrou']=(o1[2]==2 and 'refusé' in o1[0] and o2[2]==2 and 'refusé' in o2[0] and _ne_mode(q)=='plain'
+                           and os.path.getsize(p)==0)
+            ok=all(res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("nick sans base : DbEncrypt/DbDecrypt -y finissent cache.db (décision utilisateur), -D rien ; verrou tenu -> refus",_nobase_cache)
+        def _nobase_worst():
+            """CLI DbRekey -n zr,zb (zr : base en clair -> refus code 2 ; zb : fichier vide -> absent code 1) : code de sortie 2, le pire des
+            nicks (avant : le dernier non nul, 1)."""
+            d,b=_nb_env('nobaseworst')
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db.ensure_diff_db(b.db.get_diff_db('zr'),nick='zr')
+            open(b.db.get_diff_db('zb'),'w').close()
+            nodsn=os.path.join(tmp,'sentry-vide'); open(nodsn,'w').close()
+            env=dict(os.environ,BORGHELPERC_SENTRY_FILE=nodsn); env.pop('BORGHELPERC_SENTRY_DSN',None)
+            r=subprocess.run([sys.executable,os.path.realpath(__file__),'-C',os.path.join(d,'rc'),'-c','DbRekey','-n','zr,zb','-y'],
+                             capture_output=True,text=True,env=env,timeout=120,stdin=subprocess.DEVNULL)
+            ok=r.returncode==2 and 'zb: diff.db absent' in r.stdout+r.stderr and 'Traceback' not in r.stderr
+            if not ok: print(f"  code {r.returncode} ; {(r.stdout+r.stderr)[-300:]!r}")
+            return ok
+        check("nick sans base : DbRekey multi-nicks -> code de sortie = le pire des nicks",_nobase_worst)
         # 1.0.169 (story 32, A52) : base supprimée alors qu'un autre processus la tient encore ouverte
         def _held_recreate():
             """Vrai tenant (sous-processus) : base WAL avec trames non reportées, supprimée -> recréation : message dédié (jamais
@@ -16291,21 +16433,21 @@ def _cli_main():
         _nicks=nick.split(',') if nick and nick!='ALL' else bh.borg.cfgreadnicks(debug).split(',')
         for n in _nicks:
             r=bh.db_encrypt(n,dryrun=_dryrun,confirm=_yes,debug=debug)
-            if r: errcmd=r
+            if r: errcmd=max(errcmd,r)   # 1.0.170 : le pire des nicks (comme Index, Bkp)
         sys.exit(errcmd)
     elif cmd=='dbdecrypt':
         _dryrun='-D' in options; _yes='-y' in options; errcmd=0
         _nicks=nick.split(',') if nick and nick!='ALL' else bh.borg.cfgreadnicks(debug).split(',')
         for n in _nicks:
             r=bh.db_decrypt(n,dryrun=_dryrun,confirm=_yes,debug=debug)
-            if r: errcmd=r
+            if r: errcmd=max(errcmd,r)   # 1.0.170 : le pire des nicks (comme Index, Bkp)
         sys.exit(errcmd)
     elif cmd=='dbrekey':
         _yes='-y' in options; errcmd=0
         _nicks=nick.split(',') if nick and nick!='ALL' else bh.borg.cfgreadnicks(debug).split(',')
         for n in _nicks:
             r=bh.db_rekey(n,confirm=_yes,debug=debug)
-            if r: errcmd=r
+            if r: errcmd=max(errcmd,r)   # 1.0.170 : le pire des nicks (comme Index, Bkp)
         sys.exit(errcmd)
     elif cmd=='dbstatus':
         _nicks=nick.split(',') if nick and nick!='ALL' else bh.borg.cfgreadnicks(debug).split(',')

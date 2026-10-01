@@ -2194,6 +2194,13 @@ changé entre sa lecture et l'instantané (réparé entre-temps) : une reprise (
 de KDF refaite pour la même enveloppe et la même passphrase). `purge_stale_cache` : `DbKeyError` `wrong_key` -> rien à purger (Report
 direct sur une `cache.db` née d'une autre passphrase : cache manqué, puis réparation par son créateur). borgHelperWWW 1.28.7 :
 `_nick_owner_codec` passe `empty_ok=False` (nick verrouillé, aucun cache de périmètre).
+**Base absente (1.0.170, story 33)** : `_db_absent(p)` — inexistante, de 0 octet (laissée par l'`O_CREAT` de `_open_db` chez un
+lecteur ; jamais ouverte : SQLite supprimerait un `-wal` orphelin) ou lisible sans aucune TABLE (`type='table'` : une vue
+seule n'en fait pas une base) ; ouverture `mode=rw` (ne crée jamais le fichier), délai `_READER_WRITE_WAIT` ; illisible ou
+verrouillée -> False (erreur réelle visible, à la différence de `not _db_has_schema`). Garde d'IdxTop, DiffTop (jumelles),
+IdxPurge, DbEncrypt/DbDecrypt (`_db_migrate`, avant `ensure_diff_db` qui créerait le schéma ; verrous d'opération d'abord ;
+avec `-y`, `_db_migrate_cache` quand même — décision de l'utilisateur), `_db_migrate_cache` et DbRekey. Boucles Db* de
+`main` : pire code. Report -o reste sur `_db_has_schema` (inchangé).
 **Base recréée tenue ailleurs (1.0.169, A52)** — mesuré (SQLite 3.37.2) : un `-wal`/`-shm` orphelin (processus tué) n'est
 jamais rejoué quand la base est recréée, fichier principal absent ou vide (l'ancien WAL est jeté au passage en WAL) ;
 mais un processus qui tient encore l'ancienne base (trames WAL non reportées) fait échouer la recréation en

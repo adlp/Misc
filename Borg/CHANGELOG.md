@@ -1,5 +1,23 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.170 — base absente : fichier vide laissé par un lecteur — 2026-10-01
+
+Chantier « reconstruction progressive », story 33 (action de rétrospective A55, périmètre élargi après mesure, décision
+de l'utilisateur).
+
+- Un lecteur qui passe sur un nick jamais indexé laisse un `diff.db` de 0 octet (autres formes sans table : en-tête seul
+  d'une création ratée, vue seule posée par le contrôle de vue de borgHelperWWW avant 1.0.169). IdxTop, DiffTop (texte et
+  `-j`) et IdxPurge le prenaient pour une base (« SQLite error … no such table ») ; **DbEncrypt -D / DbDecrypt -D créaient une
+  base en clair pendant un dry-run** (« aucune modification ») — la base n'était plus neuve, le chiffrement d'office
+  (1.0.168) était contourné ; DbRekey répondait « base non chiffrée (plain) », code 2. Désormais : le message « absent » de
+  chaque commande, comme pour un fichier inexistant ; rien n'est créé ni modifié. DbRekey : code 1 (base absente).
+- DbEncrypt -y / DbDecrypt -y, diff.db absente : une cache.db existante est quand même mise dans le mode cible (décision de
+  l'utilisateur, comme la règle de 1.0.168) ; un Index en cours pour le nick : refus (code 2), comme avant.
+- DbEncrypt, DbDecrypt, DbRekey sur plusieurs nicks : code de sortie = le pire des nicks (avant : le dernier non nul).
+- Base corrompue ou verrouillée : jamais dite absente — son erreur réelle reste affichée.
+- CodecSelfTest : « nick sans base » (vide, en-tête seul, vue seule, `-wal` orphelin == absent pour les 6 commandes, rien
+  créé ; base corrompue ; multi-nicks des deux jumelles ; cache.db ; verrou ; pire code en CLI).
+
 ## borgHelper 1.0.169 / borgHelperWWW 1.28.7 — base vide née d'une autre passphrase, base recréée tenue ailleurs — 2026-10-01
 
 Chantier « reconstruction progressive », story 32 (actions de rétrospective A52, A53 ; regroupement demandé par
