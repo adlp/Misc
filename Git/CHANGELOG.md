@@ -18,6 +18,12 @@
 
 ## git-deploy
 
+### 1.2.0 — 2026-10-02
+- Nouvelle refonte du format `.deploy.conf` : introduction des **lots** (`[src "nom"]`, groupe nomme et reutilisable de sources). Un type de deploiement (ex `[prod]`) reference des lots par leur nom (`<lot> = dest`, cle repetable pour plusieurs destinations), au lieu de lister directement des sources individuelles par type. Le meme lot peut etre reutilise par plusieurs types avec des destinations differentes a chaque fois. Remplace le format 1.1.0 (une sous-section `dest` par source individuelle, sans reutilisation possible).
+- Transfert redevenu groupe par destination (comme en 1.0.0, mais par lot plutot que par profil entier) : `git archive` sur tous les membres du lot en une fois, `strip-components` calcule une seule fois (prefixe du sous-projet), chaque membre atterrit sous son propre nom a la racine de la destination.
+- Ajout de `set -o pipefail` : une source manquante dans un lot (`git archive` qui echoue) est desormais correctement detectee comme un echec, au lieu d'etre potentiellement masquee par le code de sortie de `ssh`/`tar` cote distant.
+- `.deploy.conf.example` et README mis a jour avec le nouveau format.
+
 ### 1.1.0 — 2026-10-02
 - Format `.deploy.conf` passe de 2 a 3 etages : type de deploiement (section) / source (sous-section) / cible (cle `dest`, repetable), au lieu d'une liste `file` + d'une liste `url` partagee par toutes les sources. Chaque source (fichier ou repertoire) peut desormais viser une destination differente (chemin/nom different sur le serveur cible), chose impossible avec l'ancien format ou toutes les sources d'un profil allaient au meme repertoire de base sur chaque url.
 - Type de la source determine via `git cat-file -t HEAD:<chemin>` : fichier -> `git show` + `cat >`, repertoire -> `git archive` + `tar x --strip-components` (calcule par source, plus par profil entier).

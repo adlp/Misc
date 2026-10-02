@@ -1,11 +1,12 @@
 #!/bin/bash
 
 #/*
-#* git-deploy deploie le contenu commite (HEAD) de sources (fichiers/repertoires)
-#* vers des destinations ssh/scp, selon un profil defini dans un fichier de
-#* config .deploy.conf (non tracke) pose a cote du sous-projet concerne.
-#* Chaque source a ses propres destinations (une cible peut differer d'une
-#* autre selon le fichier/repertoire deploye).
+#* git-deploy deploie le contenu commite (HEAD) de "lots" (groupes nommes de
+#* fichiers/repertoires) vers des destinations ssh/scp, selon un type de
+#* deploiement defini dans un fichier de config .deploy.conf (non tracke) pose
+#* a cote du sous-projet concerne. Un lot est defini une fois (section [src])
+#* et peut etre reutilise par plusieurs types de deploiement, chacun pouvant
+#* l'envoyer vers des destinations differentes.
 #* Copyright (C) 2026 Antoine DELAPORTE
 #*
 #* This program is free software: you can redistribute it and/or modify
@@ -23,33 +24,40 @@
 #*/
 
 set -u
+set -o pipefail
 
 usage() {
     cat <<EOF
 Usage : git deploy <type-de-deploiement>
 
-Deploie le contenu COMMITE (HEAD, pas la copie de travail) des sources liees
-a <type-de-deploiement> vers leurs destinations ssh respectives. Chaque
-source (fichier ou repertoire) a ses propres destinations : une cible peut
-differer d'une autre.
+Deploie le contenu COMMITE (HEAD, pas la copie de travail) des lots lies a
+<type-de-deploiement> vers leurs destinations ssh respectives.
 
 Cherche un fichier .deploy.conf en remontant depuis le repertoire courant
 jusqu'a la racine du depot (le premier trouve est utilise). Format a 3
-etages (syntaxe git config : section = type, sous-section = source, cle =
-cible) :
+etages (syntaxe git config) :
 
-    [preprod "gitconfig"]
-        dest = user@host1:/opt/git-tools/gitconfig
-        dest = user@host2:/opt/git-tools/gitconfig
+    [src "lot1"]
+        src = fichier1
+        src = un_repertoire
+        src = fichier2
 
-    [preprod "un_sous_repertoire"]
-        dest = user@host1:/opt/git-tools/un_autre_nom/
+    [src "lot2"]
+        src = autre_repertoire
 
-Les sous-sections (sources) sont des chemins relatifs au repertoire contenant
-.deploy.conf, fichier ou repertoire. "dest" (repetable) suit la syntaxe scp
-classique [user@]host:chemin — chemin complet du fichier distant pour une
-source fichier, repertoire distant ou atterrit le contenu pour une source
-repertoire.
+    [prod]
+        lot1 = user@host1:/opt/git-tools/
+        lot1 = user@host2:/alpha/
+        lot2 = user@host1:/un_autre_nom/
+
+Un lot (sous-section de [src]) est un groupe nomme de sources (fichiers ou
+repertoires, chemins relatifs au repertoire contenant .deploy.conf). Un
+meme lot peut etre reutilise par plusieurs types de deploiement (une autre
+section que [prod], ex [preprod]) ; chaque type peut l'envoyer vers des
+destinations differentes, et un lot peut avoir plusieurs destinations (cle
+repetee). La destination (syntaxe scp classique [user@]host:chemin) est le
+repertoire distant ou atterrissent les membres du lot, chacun sous son
+propre nom (comme une copie groupee).
 
 .deploy.conf n'est jamais commite (voir .gitignore racine) : chaque machine
 qui deploie doit avoir le sien.
@@ -92,29 +100,30 @@ fi
 
 if [ "$dir" = "$root" ]; then
     prefix="."
+    strip=0
 else
     prefix=$(realpath --relative-to="$root" "$dir") || exit 1
+    strip=$(awk -F/ '{print NF}' <<< "$prefix")
 fi
 
-mapfile -t lines < <(git config -f "$conf" --get-regexp "^${type}\..*\.dest\$" 2>/dev/null)
+mapfile -t lines < <(git config -f "$conf" --get-regexp "^${type}\..+\$" 2>/dev/null)
 
 if [ ${#lines[@]} -eq 0 ]; then
-    echo "Type de deploiement '$type' introuvable (aucune entree *.dest) dans $conf" >&2
+    echo "Type de deploiement '$type' introuvable (aucune cle) dans $conf" >&2
     exit 1
 fi
 
-declare -A dests_by_source=()
+declare -A dests_by_lot=()
 order=()
 for line in "${lines[@]}"; do
     key=${line%% *}
     val=${line#* }
-    source=${key#"${type}."}
-    source=${source%.dest}
-    if [ -z "${dests_by_source[$source]+x}" ]; then
-        order+=("$source")
-        dests_by_source[$source]=""
+    lot=${key#"${type}."}
+    if [ -z "${dests_by_lot[$lot]+x}" ]; then
+        order+=("$lot")
+        dests_by_lot[$lot]=""
     fi
-    dests_by_source[$source]+="$val"$'\n'
+    dests_by_lot[$lot]+="$val"$'\n'
 done
 
 echo "Config : $conf"
@@ -122,21 +131,24 @@ echo "Type   : $type"
 echo
 
 failed=0
-for source in "${order[@]}"; do
-    if [ "$prefix" = "." ]; then
-        repo_path=$source
-    else
-        repo_path="$prefix/$source"
-    fi
-
-    kind=$(git -C "$root" cat-file -t "HEAD:$repo_path" 2>/dev/null)
-    if [ -z "$kind" ]; then
-        echo "Source introuvable dans HEAD : $repo_path" >&2
+for lot in "${order[@]}"; do
+    mapfile -t srcs < <(git config -f "$conf" --get-all "src.${lot}.src" 2>/dev/null)
+    if [ ${#srcs[@]} -eq 0 ]; then
+        echo "Lot '$lot' reference par '$type' mais non defini (section [src \"$lot\"] absente ou vide)" >&2
         failed=1
         continue
     fi
 
-    echo "== $repo_path ($kind) =="
+    paths=()
+    for s in "${srcs[@]}"; do
+        if [ "$prefix" = "." ]; then
+            paths+=("$s")
+        else
+            paths+=("$prefix/$s")
+        fi
+    done
+
+    echo "== lot $lot : ${srcs[*]} =="
     while IFS= read -r dest; do
         [ -z "$dest" ] && continue
         host=${dest%%:*}
@@ -147,24 +159,12 @@ for source in "${order[@]}"; do
             continue
         fi
         echo "-> $dest"
-        if [ "$kind" = "blob" ]; then
-            if ! git -C "$root" show "HEAD:$repo_path" \
-                | ssh "$host" "mkdir -p -- \"\$(dirname -- '$rpath')\" && cat > '$rpath'"; then
-                echo "Echec du deploiement vers $dest" >&2
-                failed=1
-            fi
-        elif [ "$kind" = "tree" ]; then
-            strip=$(awk -F/ '{print NF}' <<< "$repo_path")
-            if ! git -C "$root" archive HEAD -- "$repo_path" \
-                | ssh "$host" "mkdir -p -- '$rpath' && tar x -C '$rpath' --strip-components=$strip"; then
-                echo "Echec du deploiement vers $dest" >&2
-                failed=1
-            fi
-        else
-            echo "Type d'objet git inattendu ($kind) pour $repo_path" >&2
+        if ! (cd "$root" && git archive HEAD -- "${paths[@]}") \
+            | ssh "$host" "mkdir -p -- '$rpath' && tar x -C '$rpath' --strip-components=$strip"; then
+            echo "Echec du deploiement du lot $lot vers $dest" >&2
             failed=1
         fi
-    done <<< "${dests_by_source[$source]}"
+    done <<< "${dests_by_lot[$lot]}"
 done
 
 exit $failed
