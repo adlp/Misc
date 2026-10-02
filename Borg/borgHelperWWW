@@ -66,7 +66,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.30.0"
+WWW_VERSION="1.30.1"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -2408,9 +2408,13 @@ def _latest_archive(cfg,env):
                              capture_output=True,text=True,env=env,timeout=60)
     except subprocess.TimeoutExpired:
         raise HTTPException(504,detail="borg list : timeout")
-    if proc.returncode!=0:
+    rb={'exitcode':proc.returncode,'stderr':proc.stderr.split('\n')}
+    if proc.returncode not in (0,1):   # 1.30.1 (story 39, A77) : code 1 de borg = avertissement, liste gardée (avant : 502)
         # 1.30.0 (revue story 38) : message réduit (_rb_errmsg) — avant : stderr brut coupé à 300 caractères, trace sans la cause
-        raise HTTPException(502,detail="borg list a échoué : "+_rb_errmsg({'exitcode':proc.returncode,'stderr':proc.stderr.split('\n')},'borg list'))
+        raise HTTPException(502,detail="borg list a échoué : "+_rb_errmsg(rb,'borg list'))
+    if proc.returncode==1:   # avertissement au journal du serveur (dépôt cité : _latest_archive ne connaît pas le nick)
+        msg=_rb_errmsg(rb,'borg list',n=5); msg='code 1 (avertissement)' if msg.startswith('borg list failed') else msg
+        print(f"[WARN] borg list (téléchargement, {cfg.get('BORG_REPO','')}) : {msg}",file=sys.stderr)
     lines=[l for l in proc.stdout.splitlines() if l.strip()]
     if not lines:
         raise HTTPException(404,detail="Aucune archive dans ce dépôt")
@@ -4419,6 +4423,18 @@ def push_selftest():
                         except HTTPException as e:
                             return (e.status_code,e.detail)==(502,"borg list a échoué : Local Exception; ValueError: could not convert string to float: 'x'")
                 check("/download/* : borg list en échec -> 502 avec la cause, ni trace ni bandeau",_latest_archive_msg)
+                def _latest_archive_warn():
+                    """1.30.1 (story 39, A77) : borg list en code 1 (avertissement, liste valide) -> dernière archive rendue, avertissement
+                    au journal du serveur (avant : 502) ; code 2 : 502 (inchangé)."""
+                    e=io.StringIO()
+                    with mock.patch.object(subprocess,'run',lambda *a,**k: subprocess.CompletedProcess(a[0],1,stdout='a\nb\n',stderr='Warning: w1\n')), \
+                         contextlib.redirect_stderr(e):
+                        r=_latest_archive({'BORG_REPO':'ssh://h/r'},{})
+                    with mock.patch.object(subprocess,'run',lambda *a,**k: subprocess.CompletedProcess(a[0],2,stdout='a\n',stderr='x\n')):
+                        try: _latest_archive({'BORG_REPO':'ssh://h/r'},{}); r2=None
+                        except HTTPException as x: r2=x.status_code
+                    return r=='b' and '[WARN] borg list (téléchargement, ssh://h/r) : Warning: w1' in e.getvalue() and r2==502
+                check("/download/* : borg list en code 1 (avertissement) -> dernière archive, avertissement au journal (A77)",_latest_archive_warn)
                 if _internal is None: print("SKIP racine de restauration : aucun nick interne dans ce rc")
                 else: check("POST /restore sous la racine de restauration seulement : 403 sans racine/hors racine/lien, 409 si remplie, chemin résolu transmis, « / » refusé (A68)",
                             _restore_root)

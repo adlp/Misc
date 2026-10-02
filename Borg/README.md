@@ -11,7 +11,7 @@ Utilisable comme CLI ou comme **librairie Python** — voir [LIBRARY.md](LIBRARY
 ## Prérequis
 
 - Python 3.8+
-- `borg` dans le PATH
+- `borg` 1.2 ou plus dans le PATH (`borg compact`, `extract --numeric-ids`)
 - `prettytable` (`pip install prettytable`) — requis pour `Report` et les commandes d'index
 
 ---
@@ -697,6 +697,16 @@ borg restent affichées (trace réduite, bandeau écarté). Erreur SQLite réell
 du délai) : `[ERREUR] SQLite error (<base>): …` sur stderr, sortie partielle, code inchangé ; base absente : silencieux.
 Report en ligne : `borg prune --dry-run` en échec -> récupérable « — » (JSON `null`) et `[WARN] … récupérable inconnu`. Login
 (CLI, `POST /login`) : nom de serveur/nick — lettres, chiffres, `.`, `_`, `-`, ni `ALL` ni `DEFAULT` (code 2 / 400).
+**Code 1 de borg (avertissement) — 1.0.176** : sur les lectures (Index, Report, DiffBkp, Mount `-b last`, Restore/ListPerms sans
+`-b`, CacheClean, rapprochement après Prune/DelBkp), sortie utilisée et avertissements affichés
+`[WARN] <nick>: borg <commande> : <ligne>` (stderr, 5 lignes au plus puis leur nombre), code de la commande inchangé ; DelBkp
+en code 1 : archive supprimée, compact et rapprochement faits, code 0 (avant : « a échoué ») ; Prune : `borg prune`/`borg compact`
+en code 1 -> avertissements, code 0 (avant : compact « a échoué », code 1). Code ≥ 2, borg tué, ou code 1 sans sortie là où une
+sortie est attendue (`borg diff` de DiffBkp, snapshot) : échec. Restore, ListPerms, Mount, Key, Init, Umount, Login : code de borg. **Bkp** : `borg create` tué (OOM, `kill`)
+ou en code 2 sans ligne ERROR -> `[ERREUR] <nick>: borg create a échoué : …`, code 2, `bkp_status` « error » (avant : succès).
+Lecteurs annexes (1.0.176) : notifications du watcher, alerte « en retard », Restore/ListPerms sans `-b`, IdxTop/DiffTop,
+RepoHistory/ArchiveHistory `-j` — même `[ERREUR] SQLite error` ; DiffBkp sur une base illisible : `[ERREUR] … non vérifiable`,
+code 2, rien calculé (une paire réinsérée doublait ses lignes).
 
 ---
 
@@ -846,7 +856,9 @@ temps en temps pour rendre la place libérée (le `Prune` de borgHelper compacte
 échéance, pause), `1` (erreur : période `-b`/`-B` refusée…), `2` (`borg list` en échec ou dépôt local absent, 1.0.175 :
 avant 1), `3` (`--rebuild` refusé). Une
 ligne cron voit donc une tranche qui n'a pas pu démarrer. Un `borg diff` ou `borg info` en échec au milieu d'une passe
-reste un avertissement (unité refaite au passage suivant), sans changer le code.
+reste un avertissement (unité refaite au passage suivant), sans changer le code. Plusieurs nicks (`-n a,b`, `ALL`, 1.0.176) :
+un nick qui s'arrête (base corrompue, exception) n'empêche plus les suivants — son message, son `index_last`, code = le pire.
+Base d'index illisible (verrou au-delà du délai, 1.0.176) : la paire est laissée à la passe suivante, jamais recalculée en double.
 
 **Résultat du dernier Index** (1.0.149) : après chaque nick, `Index` écrit son résultat dans
 `CACHE_DIR/<conf>-<nick>-index-last.json` (0600) : `outcome` (`ok`, `error`, `refused`, `busy` = « Index déjà en
@@ -1092,7 +1104,8 @@ borgHelper -c ArchiveHistory -n mon-serveur -j    # historique archive_stats (pa
 | `-j` | Sortie JSON `{borghelper_version,nick,rows:[...]}` — sans `-j` : message court, pas de crash (mode texte non destiné à un usage interactif élaboré) |
 
 `RepoHistory -j` : une ligne par événement `repo_stats` (`id`,`op` (`'bkp'|'prune'|'index'`),`unique_csize`,
-`total_size`,`total_csize`,`updated_at`), ordonnées par `id` croissant.
+`total_size`,`total_csize`,`updated_at`), ordonnées par `id` croissant. `history.db` sans table `repo_stats` (fichier vide,
+en-tête seul, vue seule) : `rows: []` (1.0.176 ; avant : `{"error": … no such table}`).
 
 `ArchiveHistory -j` : une ligne par archive de `archive_stats` (`archive`,`archive_date`,`duration`,
 `original_size`,`compressed_size`,`deduplicated_size`,`nfiles`), ordonnées par `archive_date`.

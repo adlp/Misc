@@ -331,7 +331,8 @@ archives = rb['stdout'][0]['archives']
 for a in archives:
     print(a['name'], a['start'])
 
-# last_modified du dépôt
+# last_modified du dépôt (1.0.176 : borg en code 1 = avertissement, valeur rendue et « [WARN] » sur stderr ;
+# code >= 2 ou borg tué : RuntimeError — même règle pour getlastbkp)
 lm = bh.borg._boex_last_modified('mon-serveur')
 print('Dernière modification :', lm)
 
@@ -724,7 +725,7 @@ sys.exit(0)
 | `listperms(nick, bid, ftor, debug)` | Liste droits fichiers sans restaurer |
 | `list_backups(nick, debug)` | Liste les archives |
 | `list_files(nick, bid, debug, as_json)` | Liste fichiers d'une archive — `as_json` : `{nick,archive,files:[chemin,...]}` |
-| `delbkp(nick, bid, debug)` | Supprime une archive : opération prioritaire (un Index se met en pause, 1.0.142), `borg delete` + compact, puis rapprochement des bases comme `prune` (1.0.145) ; termine par `sys.exit` |
+| `delbkp(nick, bid, debug)` | Supprime une archive : opération prioritaire (un Index se met en pause, 1.0.142), `borg delete` + compact, puis rapprochement des bases comme `prune` (1.0.145) ; termine par `sys.exit` ; 1.0.176 : `borg delete` en code 1 (avertissement) -> suite complète, `SystemExit(0)` |
 | `mount(nick, bid, debug)` | Monte via FUSE |
 | `umount(nick, debug)` | Démonte |
 | `key(nicks, debug)` | Exporte la clef ; 1.0.172 : rend le pire code des nicks (2 si dépôt absent ou borg en échec, message sur stderr ; avant : rien, 0) |
@@ -763,7 +764,7 @@ sys.exit(0)
 | `delete_archive_measures(nick, keep=None)` | Retire les mesures des archives absentes de `keep` (toutes si `keep` vide) |
 | `freeze_archive_chart(nick, rows, db_path=None)` | 1.0.140 — fige des lignes de graphique dans `history.db.archive_chart` (dicts `archive`, `archive_date`, `gone`, champs de graphique) ; jamais une valeur non nulle écrasée par `None` ; purge au-delà de `STATS_RETENTION_MONTHS` ; lève `sqlite3.Error` |
 | `get_archive_chart(nick, db_path=None)` | 1.0.140 — lignes figées dans la rétention : `[{archive, archive_date, duration, …, read_errors, gone}]` ; `[]` si aucune |
-| `is_diff_pair_indexed(nick, a_old, a_new)` | Vérifie si une paire est indexée |
+| `is_diff_pair_indexed(nick, a_old, a_new)` | Vérifie si une paire est indexée ; 1.0.176 : `None` sur une vraie erreur SQLite (marquée `[ERREUR]`, jamais `False` : la paire serait recalculée en double), `False` si la table est absente |
 | `is_archive_snapshot_indexed(nick, archive)` | Vérifie si le snapshot est indexé |
 | `_diff_stats_for_nick(nick, archives=None, conn=None)` | Stats de mouvement par archive (Report, ArchiveHistory, figeage) — comptes en fichiers ordinaires depuis 1.0.162, tailles par familles ; `archives` (1.0.140) restreint aux archives nouvelles données, `conn` : erreurs SQLite remontées |
 | `store_excluded_diff_stats(nick, a_old, a_new, exclu, db_path)` | Stocke stats fichiers exclus d'une paire |

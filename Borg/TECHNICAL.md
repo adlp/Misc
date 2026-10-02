@@ -2284,6 +2284,31 @@ silencieux ; autre `sqlite3.Error` -> `[ERREUR] SQLite error (<base>): <e>`, une
 `[ERREUR]`, `-j` `{'error'}`), IdxTop/DiffTop (exclus), lecture du cache de `cacheJsonBoexWithLM` (table absente silencieuse) ; RepoHistory,
 ArchiveHistory et Status passent par `_db_probe` (illisible ≠ absent). CodecSelfTest : `_pre(fn)` exécute un décor dont dépendent
 les contrôles suivants même quand `-f` écarte son contrôle (A74).
+**Code 1 de borg, lecteurs annexes, Index multi-nicks (1.0.176, story 39)** : `_borg_ok(rb)` — code 0 ou 1 et non `killed` —
+seule règle des lectures : `_boex_check_stdout` et `_boex_last_modified` (donc getlastbkp, `_lastbkp_or_stop`, Index, Report,
+CacheClean, `_repo_archive_names`, `_cleanup_index_after_prune`, stats d'archive, `_refresh_repo_point`, `_shadow_swap`), indexsnap
+(`pf:` incrémental, repli `--format`), `borg diff` de DiffBkp, `borg delete` de DelBkp (code 1 -> suite complète, `sys.exit(0)`) ;
+`_borg_warn(nick, cmd, rb, limit=5)` affiche en code 1 chaque ligne d'avertissement (`_borg_err_lines`, texte et JSON
+WARNING/ERROR/CRITICAL) en `[WARN] nick: cmd : …`, aussi pour `_run_diff` (paire gardée), `cacheJsonBoexWithLM` (info des
+archives de Report, code 1 jamais mis en cache muet) et Prune (`borg prune` réel et `--dry-run` passent `--log-json` : liste et
+stats en INFO, jamais en `[WARN]` ; prune/compact en code 1 -> Prune réussi, `exitcode` 0). `borg diff` de DiffBkp et repli
+`--format` d'indexsnap : code 1 sans sortie = échec (borg tué par SIGTERM). Restore, ListPerms, Mount, Key, Init, Umount, Login
+gardent leur règle (code de borg). Écrivains de paires (`store_diff_entries`, `_index_diffs`) : `INSERT OR IGNORE` de
+`diff_indexed_pairs` d'abord, lignes de `diff_index` seulement si `rowcount==1` (même transaction : deux écrivains concurrents
+ne doublent plus les lignes). Bkp : `create_mute_fail` — code de `create` hors 0/1, négatif
+ou tué sans enregistrement ERROR/CRITICAL -> `newretC=2` + `[ERREUR] _borg_fail_msg('borg create', _rb_errmsg)` (avant : 0,
+« success »). borgHelperWWW `_latest_archive` : code 1 accepté, avertissement sur stderr du serveur. Lecteurs : `_sqlite_missing(e)`
+(table/colonne absente) partagé ; `is_diff_pair_indexed`/`diff_pair_has_sizes` rendent `None` sur une vraie erreur (marquée) —
+DiffBkp s'arrête (code 2, aucun borg), `_index_select_pairs` saute la paire ; purge des paires en échec -> paires retirées de
+`pairs_todo` (diff_index sans UNIQUE : une paire réinsérée doublait ses lignes, mesuré). `last_archive_stat`,
+`list_pending_bkp_status(_start)` (watcher) : `_reader_sqlite_err(e, base, clé)` + `_reader_sqlite_ok(clé)`, clé = (base, lecteur)
+(marque levée après une lecture réussie DU MÊME lecteur : une ligne par épisode dans un worker long) ; `_find_last_archive_with_file`, IdxTop/DiffTop (`_reader_sqlite_line` en texte : ligne
+`[ERREUR]` pour une vraie erreur pas encore dite, sinon la ligne d'avant — jamais vide ; `-j` : JSON + `_reader_sqlite_err`),
+RepoHistory (`no such table` seulement -> `rows: []`) et ArchiveHistory `-j` marqués. Dispatch Index : plusieurs nicks -> exception,
+`SystemExit` (sauf 130) ou erreur de base d'un nick enregistrée (`_record_index_last`), message par `_nick_stop_msg` (texte d'un
+`sys.exit(str)` affiché), code = le pire (`_exit_code`), nick suivant ; un seul nick : relancée (inchangé). Exception imprévue
+(ni base ni schéma) d'un nick, Index et Bkp multi-nicks : `_sentry_capture(e, nick)` (`capture_exception`, étiquette nick, si
+Sentry est initialisé). `_borg_extract_args` : `--numeric-ids`.
 **Ensure sans création (1.0.172, story 35, A61)** : `_open_db(…, create_file=None)` — `None` : le rôle décide (`read` jamais,
 `write`/`admin` `O_CREAT` 0600) ; `False` : `write`/`admin` en `mode=rw`, fichier absent -> `sqlite3.OperationalError`.
 `ensure_*_db(create=False)` l'utilise après sa sonde : supprimée entre les deux -> `_file_gone` -> retour (base absente) ;
@@ -3240,7 +3265,7 @@ borg installée** — à re-vérifier si `borg` ou `_borg_extract_args` changent
 sinon, dans le sens le moins risqué : le faux deviendrait plus verbeux que le vrai, jamais l'inverse
 tant que le vrai continue d'émettre cet avertissement). Un futur nettoyage naturel serait de retirer
 `--numeric-owner` de `_borg_extract_args` (déprécié par `borg` lui-même) — hors périmètre de cette
-story, non traité ici.
+story, non traité ici. (Fait en borgHelper 1.0.176 : `--numeric-ids`.)
 
 > **Remplacé en borgHelperWWW 1.27.5** (deferred-work, point 8, option D) : plus aucune réponse synthétique ni
 > constante recopiée (`_synth_*`, `_oos_last_archive_line`, `_RESTORE_NUMERIC_OWNER_WARNING`, `_empty_tar_bytes`

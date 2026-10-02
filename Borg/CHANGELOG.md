@@ -1,5 +1,44 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.176 / borgHelperWWW 1.30.1 — code 1 de borg en avertissement, Bkp tué en échec, lecteurs annexes marqués, Index multi-nicks robuste, --numeric-ids — 2026-10-02
+
+Chantier « reconstruction progressive », story 39 (actions de rétrospective A77 à A80 ; regroupement demandé par l'utilisateur).
+
+- **Bkp dont `borg create` est tué ou sort en code 2 sans ligne ERROR -> échec** (décision de l'utilisateur ; trouvé en
+  mesurant) : avant, « success », code 0, ni notification d'échec ni alerte Sentry (OOM, `kill -9`, borg qui sort en 2 sans
+  rien écrire). Désormais `[ERREUR] nick: borg create a échoué : <cause ou code>`, code 2, `bkp_status` « error ». Code 1
+  (avertissements de fichiers) : inchangé.
+- **Code 1 de borg = avertissement, partout** (décision de l'utilisateur) : sur les lectures (Index, Report, DiffBkp, Mount
+  `-b last`, Restore/ListPerms sans `-b`, CacheClean, rapprochement après Prune/DelBkp, snapshot d'Index), un `borg list`/`info`/
+  `diff` en code 1 avec une sortie valide était un échec (« borg list failed (code 1) », code 2, sortie jetée) ; DelBkp en code 1
+  disait « a échoué » alors que l'archive était supprimée, sans compact ni rapprochement ; Prune : `borg compact` en code 1 ->
+  « a échoué », code 1 (WWW : 400) après un élagage réussi. Désormais la sortie est utilisée et les avertissements affichés
+  `[WARN] nick: borg <commande> : <ligne>` (stderr ; 5 lignes au plus, puis leur nombre), code de la commande inchangé (DelBkp,
+  Prune : 0) ; avertissements de `borg diff` d'Index, de `borg prune` (`--log-json` : les lignes « Keeping »/« Would prune » ne
+  sont jamais des avertissements) et du `borg info` des archives de Report dits (avant : jetés). Code ≥ 2, borg tué, ou code 1
+  sans aucune sortie là où une sortie est attendue (`borg diff` de DiffBkp, snapshot : borg tué par SIGTERM sort ainsi) : échec.
+  Restore, ListPerms, Mount, Key, Init, Umount, Login : règle inchangée (code de borg, lignes de borg). borgHelperWWW
+  `/download/*` sans archive : `borg list` en code 1 -> dernière archive (avant : 502), avertissement au journal du serveur.
+- **Lecteurs annexes : vraie erreur SQLite dite** (`[ERREUR] SQLite error (<base>): …`) : watcher de borgHelperWWW
+  (notifications de début/fin, alerte « en retard » — une base corrompue les faisait sauter sans trace ; ligne de nouveau dite
+  après une lecture réussie de ce même lecteur), Restore/ListPerms sans `-b` (repli sur la dernière archive), IdxTop/DiffTop
+  (texte et `-j`), RepoHistory/ArchiveHistory `-j`. **Paire de diff jamais réinsérée en double** : une base verrouillée au-delà
+  du délai faisait lire la paire « non indexée » — DiffBkp relançait `borg diff` et réinsérait ses lignes (doublons mesurés :
+  4 lignes pour 2) ; désormais DiffBkp s'arrête (`[ERREUR] … non vérifiable`, code 2), Index laisse la paire à la passe
+  suivante (aussi quand la purge d'une paire échoue) ; et les deux écrivains (DiffBkp, Index — y compris en même temps, Index de
+  fin de Bkp et Diff demandé dans l'UI) n'ajoutent les lignes que s'ils ont eux-mêmes enregistré la paire.
+- **RepoHistory `-j` sur une history.db sans `repo_stats`** (0 octet, en-tête seul, vue seule, `-wal` orphelin) : `rows: []`
+  (décision de l'utilisateur ; avant : `{"error": "… no such table: repo_stats"}`, rouge sur les graphiques). Colonne absente
+  (schéma abîmé) : erreur, comme avant.
+- **Index sur plusieurs nicks** : une exception ou un arrêt sur un nick (base corrompue…) n'arrête plus les suivants (comme Bkp) :
+  message du nick, `index_last` de chacun, code = le pire ; Ctrl-C arrête. Un seul nick : inchangé. Exception imprévue d'un nick
+  (Index et Bkp multi-nicks) : envoyée à Sentry comme pour un nick seul (décision de l'utilisateur ; Bkp multi-nicks : avant,
+  ligne `[ERREUR]` seule). Alerte Sentry `bkp_error` d'un `borg create` tué : avec la cause.
+- **Restore : `--numeric-ids`** (décision de l'utilisateur) au lieu de `--numeric-owner`, déprécié depuis borg 1.2 (avertissement à
+  chaque extraction). **borg 1.2 ou plus requis** (déjà le cas de fait : `borg compact`).
+- CodecSelfTest : nouveaux contrôles « borg en code 1 », « Bkp : borg create tué », « Index plusieurs nicks », « lecteurs
+  annexes », `--numeric-ids` ; push_selftest : `/download/*` en code 1.
+
 ## borgHelper 1.0.175 / borgHelperWWW 1.30.0 / UI 1.22.0 — sorties de borg lisibles partout, /login sans chemin libre, erreurs SQLite marquées, codes d'Index et d'Init — 2026-10-02
 
 Chantier « reconstruction progressive », story 38 (actions de rétrospective A70 à A75 ; regroupement demandé par
