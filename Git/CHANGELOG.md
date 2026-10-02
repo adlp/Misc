@@ -10,6 +10,15 @@
 
 ## gitconfig
 
+### 1.14.0 — 2026-10-02
+- Ajout de l'alias fin `deploy = !git-deploy`, qui appelle le nouveau script `git-deploy` (voir ci-dessous). `git alias` documente la nouvelle entree.
+
+## git-deploy
+
+### 1.0.0 — 2026-10-02
+- Creation : `git deploy <profil>` deploie le contenu commite (HEAD) de fichiers/repertoires vers des urls ssh/scp, selon un profil lu dans un `.deploy.conf` (non tracke, syntaxe git config) trouve en remontant l'arbo depuis le repertoire d'invocation. Transfert via `git archive | ssh ... tar x --strip-components`. Implemente en script standalone plutot qu'en alias inline : logique jugee trop consequente (recherche de config, calcul de prefixe, boucle multi-urls avec erreur geree par url) pour rester lisible dans un alias `!`.
+- `.gitignore` racine : ajout de `**/.deploy.conf`.
+
 ### 1.13.0 — 2026-10-01
 - `git alias` affiche desormais le nom de chaque alias avec une courte description (au lieu du nom + definition brute). Table de description codee en dur dans l'alias (a tenir a jour manuellement a chaque ajout/suppression d'alias) ; un alias non documente s'affiche avec une description vide plutot que de planter.
 

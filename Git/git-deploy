@@ -1,0 +1,132 @@
+#!/bin/bash
+
+#/*
+#* git-deploy deploie le contenu commite (HEAD) d'une liste de fichiers/repertoires
+#* vers une liste de destinations ssh/scp, selon un profil defini dans un fichier
+#* de config .deploy.conf (non tracke) pose a cote du sous-projet concerne.
+#* Copyright (C) 2026 Antoine DELAPORTE
+#*
+#* This program is free software: you can redistribute it and/or modify
+#* it under the terms of the GNU General Public License as published by
+#* the Free Software Foundation, either version 3 of the License, or
+#* (at your option) any later version.
+#*
+#* This program is distributed in the hope that it will be useful,
+#* but WITHOUT ANY WARRANTY; without even the implied warranty of
+#* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#* GNU General Public License for more details.
+#*
+#* You should have received a copy of the GNU General Public License
+#* along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#*/
+
+set -u
+
+usage() {
+    cat <<EOF
+Usage : git deploy <profil>
+
+Deploie le contenu COMMITE (HEAD, pas la copie de travail) des fichiers/
+repertoires lies a <profil> vers les url ssh associees.
+
+Cherche un fichier .deploy.conf en remontant depuis le repertoire courant
+jusqu'a la racine du depot (le premier trouve est utilise). Format (syntaxe
+git config) :
+
+    [preprod]
+        file = gitconfig
+        file = un_sous_repertoire
+        url = user@host1:/opt/git-tools/
+        url = user@host2:/opt/git-tools/
+
+Les chemins "file" sont relatifs au repertoire contenant .deploy.conf. Les
+"url" suivent la syntaxe scp classique [user@]host:chemin.
+
+.deploy.conf n'est jamais commite (voir .gitignore racine) : chaque machine
+qui deploie doit avoir le sien.
+EOF
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    usage
+    exit 0
+fi
+
+if [ $# -ne 1 ]; then
+    usage >&2
+    exit 1
+fi
+
+profil=$1
+
+cd "${GIT_PREFIX:-.}" || exit 1
+
+root=$(git rev-parse --show-toplevel) || exit 1
+
+dir=$(pwd)
+conf=
+while true; do
+    if [ -f "$dir/.deploy.conf" ]; then
+        conf="$dir/.deploy.conf"
+        break
+    fi
+    if [ "$dir" = "$root" ]; then
+        break
+    fi
+    dir=$(dirname "$dir")
+done
+
+if [ -z "$conf" ]; then
+    echo "Aucun .deploy.conf trouve entre $(pwd) et la racine du depot ($root)." >&2
+    exit 1
+fi
+
+if [ "$dir" = "$root" ]; then
+    prefix="."
+    strip=0
+else
+    prefix=$(realpath --relative-to="$root" "$dir") || exit 1
+    strip=$(awk -F/ '{print NF}' <<< "$prefix")
+fi
+
+mapfile -t files < <(git config -f "$conf" --get-all "${profil}.file" 2>/dev/null)
+mapfile -t urls < <(git config -f "$conf" --get-all "${profil}.url" 2>/dev/null)
+
+if [ ${#files[@]} -eq 0 ] || [ ${#urls[@]} -eq 0 ]; then
+    echo "Profil '$profil' introuvable ou incomplet (file/url manquants) dans $conf" >&2
+    exit 1
+fi
+
+paths=()
+for f in "${files[@]}"; do
+    if [ "$prefix" = "." ]; then
+        paths+=("$f")
+    else
+        paths+=("$prefix/$f")
+    fi
+done
+
+echo "Config  : $conf"
+echo "Profil  : $profil"
+echo "Fichiers: ${files[*]}"
+echo "Prefixe depot: $prefix (strip-components=$strip)"
+echo
+
+failed=0
+for url in "${urls[@]}"; do
+    host=${url%%:*}
+    rpath=${url#*:}
+    if [ "$host" = "$url" ] || [ -z "$rpath" ]; then
+        echo "URL invalide (attendu [user@]host:chemin) : $url" >&2
+        failed=1
+        continue
+    fi
+    echo "-> $url"
+    if ! (cd "$root" && git archive HEAD -- "${paths[@]}") \
+        | ssh "$host" "mkdir -p -- '$rpath' && tar x -C '$rpath' --strip-components=$strip"; then
+        echo "Echec du deploiement vers $url" >&2
+        failed=1
+    fi
+done
+
+exit $failed
