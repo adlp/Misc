@@ -66,7 +66,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.28.7"
+WWW_VERSION="1.28.8"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -1896,7 +1896,10 @@ def run_borghelper(cmd: str, nick: Optional[str]=None, extra_args=(), passphrase
             result_dict=cached[1]
             return JSONResponse(status_code=_http_status(result_dict['exitcode']),content=result_dict)
     result=_exec_borghelper(cmd,nick,extra_args,passphrase)
-    if key is not None and not _is_db_key_error(result):
+    # 1.28.8 (story 36, A62, décisions de l'utilisateur) : codes 0 et 1 seulement — 1 = alerte ou erreur tirée des bases (Report
+    # -o : « diff.db absent », MAX_AGE_BKP ; lecteur : « Aucune archive indexée »), couverte par l'empreinte ; code >= 2 = état
+    # extérieur aux bases (« ⚠ dépôt absent », borg, ssh, dépôt externe) : jamais resservi après remontage.
+    if key is not None and result.exitcode in (0,1) and not _is_db_key_error(result):
         if len(_RESPONSE_CACHE)>500: _RESPONSE_CACHE.clear()  # garde-fou anti-croissance illimitée
         _RESPONSE_CACHE[key]=(_cache_fingerprint(nick),result.dict())
     return JSONResponse(status_code=_http_status(result.exitcode),content=result.dict())
@@ -4075,14 +4078,41 @@ def push_selftest():
                                 and not launch.called and not popen.called)
                 check("POST /bkp et /download/file sur un dépôt externe : 403 sans aucun processus lancé",_ext_http)
                 def _code4():
-                    """Code de sortie 4 de la CLI -> HTTP 403, y compris servi depuis le cache ; 0 -> 200, autre -> 400."""
+                    """Code de sortie 4 de la CLI -> HTTP 403 à chaque appel ; 0 -> 200, autre -> 400. 1.28.8 (A62) : code >= 2 jamais mis
+                    en cache — le 2e appel relance la CLI."""
                     res=CommandResult(exitcode=4,stdout='',stderr="x: dépôt externe — opération « prune » non permise")
-                    with mock.patch(f"{__name__}._exec_borghelper",return_value=res):
+                    with mock.patch(f"{__name__}._exec_borghelper",return_value=res) as ex:
                         a=run_borghelper('selftest-code4',nick=_internal,cacheable=True)
                         b=run_borghelper('selftest-code4',nick=_internal,cacheable=True)
-                    for k in [k for k in _RESPONSE_CACHE if k and k[0]=='selftest-code4']: _RESPONSE_CACHE.pop(k,None)
-                    return a.status_code==b.status_code==403 and (_http_status(0),_http_status(1),_http_status(4))==(200,400,403)
-                check("code de sortie 4 de la CLI -> HTTP 403 (cache compris)",_code4)
+                    cached=[k for k in _RESPONSE_CACHE if k and k[0]=='selftest-code4']
+                    for k in cached: _RESPONSE_CACHE.pop(k,None)
+                    return (a.status_code==b.status_code==403 and ex.call_count==2 and not cached
+                            and (_http_status(0),_http_status(1),_http_status(4))==(200,400,403))
+                check("code de sortie 4 de la CLI -> HTTP 403 à chaque appel, jamais mis en cache",_code4)
+                def _cache_ok_only():
+                    """1.28.8 (story 36, A62, décisions de l'utilisateur) : route cacheable — code 2 (« ⚠ dépôt absent ») et code 0 qui
+                    porte une DbKeyError : jamais resservis (deux appels, deux exécutions) ; code 1 (alerte tirée des bases) et code 0 :
+                    exécutés une fois, resservis depuis le cache (même corps, même statut : 400 / 200)."""
+                    def twice(res):
+                        for k in [k for k in _RESPONSE_CACHE if k and k[0]=='selftest-cache-ok']: _RESPONSE_CACHE.pop(k,None)
+                        with mock.patch(f"{__name__}._exec_borghelper",return_value=res) as ex:
+                            a=run_borghelper('selftest-cache-ok',nick=_internal,cacheable=True); b=run_borghelper('selftest-cache-ok',nick=_internal,cacheable=True)
+                        return ex.call_count,a.status_code,b.status_code,json.loads(a.body)==json.loads(b.body)
+                    r2=twice(CommandResult(exitcode=2,stdout='',stderr="x: ⚠ dépôt absent (/r)"))
+                    rk=twice(CommandResult(exitcode=0,stdout='{}',stderr="[ERREUR] DbKeyError : x: passphrase incorrecte"))
+                    r1=twice(CommandResult(exitcode=1,stdout='',stderr="x: diff.db absent — lancez Index"))
+                    r0=twice(CommandResult(exitcode=0,stdout='{"ok": 1}',stderr=''))
+                    for k in [k for k in _RESPONSE_CACHE if k and k[0]=='selftest-cache-ok']: _RESPONSE_CACHE.pop(k,None)
+                    ok=r2==(2,400,400,True) and rk[0]==2 and r1==(1,400,400,True) and r0==(1,200,200,True)
+                    if not ok: print(f"  {r2} {rk} {r1} {r0}")
+                    return ok
+                check("cache des réponses : code >= 2 et DbKeyError jamais resservis, codes 0 et 1 resservis (A62)",_cache_ok_only)
+                def _cache_single_writer():
+                    """Garde de source (revue story 36) : une seule écriture de _RESPONSE_CACHE (run_borghelper) — une route qui écrirait
+                    le cache elle-même contournerait la règle des codes."""
+                    src=open(os.path.realpath(__file__),encoding='utf-8').read()
+                    return len(re.findall(r'_RESPONSE_CACHE\[[^\]]+\]\s*=',src))==1
+                check("cache des réponses : une seule écriture de _RESPONSE_CACHE (règle des codes appliquée partout)",_cache_single_writer)
                 def _access_state():
                     """/access : external, ops (allowed_ops de borgHelper), build, rebuild, bkp_running, index_last, bkp_last par nick lisible ; nick
                     sans droit : rien de plus."""

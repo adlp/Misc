@@ -670,7 +670,7 @@ indexsnap() → voir flux IndexSnap ci-dessous
   active même sans `GROUPS_HEADER`). Seule la table `_ROUTE_OPS` (route → nature) vit dans WWW ; la décision vient de
   `op_allowed`. Clé API vérifiée en premier (401 avant tout 403). `/login` vise `nickname`, sinon `servername` ; nick
   inconnu (nouveau Login) : non vérifié ; `nick=ALL` : laissé à la CLI (nicks refusés écartés) ; liste explicite : 403
-  au premier refus ; configuration illisible : 500 ; `EXTERNAL` invalide : refus (jamais d'action à l'aveugle). `_http_status` : exitcode 4 → 403 (run_borghelper, cache compris,
+  au premier refus ; configuration illisible : 500 ; `EXTERNAL` invalide : refus (jamais d'action à l'aveugle). `_http_status` : exitcode 4 → 403 (run_borghelper — jamais mis en cache depuis 1.28.8 —,
   `_run_scoped`, `_run_scoped_raw`). `/access` ajoute par nick lisible `external`, `ops` (`allowed_ops`, parmi
   `ALL_OPS`), `build`/`rebuild`/`bkp_running` (`BorgHelper._status_one` : SQLite local, jamais borg). `POST /index` :
   `_launch_bkp_detached(..., cmd='index')`, comme `/bkp`. UI 1.19.0 : `opAllowed`/`stateBadges`, `ACTIONS[].op`,
@@ -1951,6 +1951,12 @@ None` : comportement actuel, `result_json` en clair. `codec` réel : `result_jso
 
 ### `_RESPONSE_CACHE` aligné sur AD-13 (`borgHelperWWW`)
 
+1.28.8 (story 36, A62, décisions de l'utilisateur) : `run_borghelper` ne met en cache que les codes 0 et 1 (et pas
+`_is_db_key_error`) — 1 = alerte ou erreur tirée des bases, couverte par l'empreinte (Report -o « diff.db absent »,
+MAX_AGE_BKP) ; code >= 2 (« ⚠ dépôt absent », borg, ssh, dépôt externe) recalculé à chaque appel. Une seule écriture de
+`_RESPONSE_CACHE` (garde de source push). Limite connue : une réponse en code 0 mise en cache ne voit pas un état
+extérieur qui change sans toucher les bases (disque démonté, MAX_AGE_BKP dépassé sans écriture) — deferred-work.
+
 La clé de `_RESPONSE_CACHE` inclut désormais un condensé de la passphrase de la requête quand `cacheable=True` et
 qu'une passphrase est fournie (`x_borg_passphrase`, ex. route `report -o`) : `_passphrase_digest(passphrase)` =
 HMAC-SHA256(`_RESPONSE_CACHE_SALT`, passphrase), où `_RESPONSE_CACHE_SALT` est un `secrets.token_bytes(32)` tiré une
@@ -2228,6 +2234,15 @@ manque) ; `_db_check_readonly` y garde les arrêts d'`ensure_diff_db` sans écri
 plus récent -> `SchemaVersionError`). Limite (décision de l'utilisateur) : trames WAL non reportées (processus tué) reportées par
 SQLite à la fermeture de toute connexion, -D compris — contenu identique, mtime changé. Contrôle générique « dry-run sans écriture » : IdxPurge -D (tout, `-x`), DbEncrypt/DbDecrypt (-D, sans -y, -D -y),
 DbRekey sans -y × 11 états -> empreintes de CACHE_DIR inchangées. BorgCleanup -D (hors CACHE_DIR) : contrôles BorgCleanup.
+**Restore `-w`/`-W` (1.0.173, story 36, A63)** : `boex(…, rep=where)` lance borg avec `where` comme répertoire de travail.
+`_restore_dest_problem(where)` (sans rien créer, avant la sélection d'archive, le verrou et borg ; `-w` et `-W` hors tar et
+`-`) : vide, pas un dossier (lien cassé, « fichier/ », parent fichier), non traversable, création impossible (premier
+parent existant sans écriture) -> code 3. `-w` : `_makedirs_tracked` juste avant `borg extract`, dossiers créés retirés
+s'ils restent vides après un extract en échec (`_rmdirs_if_empty`) ; `-W` : création après un extract réussi (inchangé),
+dans un `try` (code 3). **Message d'échec
+(A64)** : `_rb_errmsg(rb, cmd, n=2, cut=100)` seule règle (tous ses appelants : `_boex_check_stdout`, Mount, Key, DelBkp,
+Prune…) (lignes ERROR JSON, texte hors bandeau `Platform`/`Borg:`) ;
+`_boex_last_modified` : `n=3, cut=None` (texte inchangé).
 **Ensure sans création (1.0.172, story 35, A61)** : `_open_db(…, create_file=None)` — `None` : le rôle décide (`read` jamais,
 `write`/`admin` `O_CREAT` 0600) ; `False` : `write`/`admin` en `mode=rw`, fichier absent -> `sqlite3.OperationalError`.
 `ensure_*_db(create=False)` l'utilise après sa sonde : supprimée entre les deux -> `_file_gone` -> retour (base absente) ;

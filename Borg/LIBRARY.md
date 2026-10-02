@@ -728,7 +728,7 @@ sys.exit(0)
 | `mount(nick, bid, debug)` | Monte via FUSE |
 | `umount(nick, debug)` | Démonte |
 | `key(nicks, debug)` | Exporte la clef ; 1.0.172 : rend le pire code des nicks (2 si dépôt absent ou borg en échec, message sur stderr ; avant : rien, 0) |
-| `diffbkp`, `restore`, `listperms`, `mount`, `delbkp` | 1.0.172 : dépôt local absent ou `borg list` en échec -> message sur stderr et `SystemExit(2)` (avant : `RuntimeError` non rattrapée pour diffbkp/restore/listperms/mount) ; `prune()` rend `{'exitcode': 2, …, 'annonce': True}` sur dépôt absent, et le résultat de `borg prune` (clé `cmd`) s'il a échoué |
+| `diffbkp`, `restore`, `listperms`, `mount`, `delbkp` | 1.0.172 : dépôt local absent ou `borg list` en échec -> message sur stderr et `SystemExit(2)` (avant : `RuntimeError` non rattrapée pour diffbkp/restore/listperms/mount) ; `prune()` rend `{'exitcode': 2, …, 'annonce': True}` sur dépôt absent, et le résultat de `borg prune` (clé `cmd`) s'il a échoué ; 1.0.173 : `restore(…, where)` (`-w`/`-W`) : `SystemExit(3)` si `where` est vide, n'est pas un dossier, n'est pas traversable ou ne peut être créé (vérifié avant borg) ; `-w` crée `where` s'il manque (retiré s'il reste vide après un échec de borg) |
 | `init_repo(nick, debug)` | Initialise un dépôt |
 | `stats(nick, debug)` | État de montage |
 | `cache_info(nick, debug)` | Affiche le cache |

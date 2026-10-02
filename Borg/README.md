@@ -634,9 +634,9 @@ borgHelper -c Restore -n mon-serveur -f 'home/user' -w - \
 |--------|-------------|
 | `-b` | Nom de l'archive — si absent : dernière archive SQLite contenant `-f` |
 | `-f` | Chemin exact ou glob (`*`, `?`) — glob réellement fonctionnel depuis 1.0.122 ; style shell de borg : `*` ne franchit pas `/`, `**` si (`'home/*/*.log'`, `'var/**/*.conf'`) |
-| `-w <dest>` | Restauration avec sous-répertoires (répertoire ou `.tar`/`.tgz`) |
+| `-w <dest>` | Restauration avec sous-répertoires (répertoire ou `.tar`/`.tgz`) ; 1.0.173 : répertoire absent créé (comme `-W` ; retiré s'il reste vide après un échec de borg) ; destination vide, qui n'est pas un répertoire, non traversable, ou création impossible : `[ERREUR] destination … : …`, code 3, avant tout appel à borg (avant : trace Python). Cible `.tar` : son dossier doit exister |
 | `-w -` | Tar non-compressé vers stdout (pipeable) |
-| `-W <dest>` | Restauration plate — fichiers à la racine |
+| `-W <dest>` | Restauration plate — fichiers à la racine ; 1.0.173 : mêmes refus que `-w`, code 3 (avant : trace Python vers un fichier ou sans droits) |
 | `-W -` | Tar plat non-compressé vers stdout |
 | `-L` | Affiche droits/propriétaires sans restaurer |
 
@@ -2103,7 +2103,9 @@ modifié ces fichiers, l'empreinte change et l'appel suivant recalcule (et remet
 fraîche. Cache en mémoire du processus (perdu au redémarrage), sans limite de durée mais borné à 500
 entrées (purge totale au-delà, garde-fou anti-croissance illimitée). `GET /report` n'est concerné qu'en
 mode `offline=true` (le mode en ligne interroge le dépôt en direct via `borg info`, non couvert par
-cette empreinte).
+cette empreinte). Depuis borgHelperWWW 1.28.8, seules les réponses en code 0 ou 1 (alerte tirée des bases : diff.db
+absent, sauvegarde trop ancienne) sont mises en cache : un code >= 2 (« ⚠ dépôt absent », coupure ssh…) dépend d'un état
+extérieur aux bases et serait resservi après remontage — il est recalculé à chaque appel.
 
 ⚠️ **Périmètre de chemin actif ⇒ jamais servi depuis `_RESPONSE_CACHE`** (Story 1.3, étendu Story
 1.4) : pour `/search`, `/filehist`, `/lstbkpfls`, `/diffbkp`, `/treehist`, `/treefind`, `/duidx`,

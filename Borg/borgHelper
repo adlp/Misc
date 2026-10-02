@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.172"
+Version="1.0.173"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -577,15 +577,44 @@ def _exit_code(c):
     dans un max() de plusieurs nicks (revue story 35)."""
     return c if c>=0 else 256+c
 
-def _rb_errmsg(rb,cmd='borg'):
-    """Message d'échec lisible d'un résultat boex : lignes ERROR (JSON) ou texte de borg, deux au plus ; sinon le code."""
+def _restore_dest_problem(where):
+    """1.0.173 (story 36) : None si `where` est un dossier où écrire, ou peut le devenir ; sinon la raison (« pas un dossier »,
+    « accès refusé », « création impossible … »). Ne crée rien. Lien cassé : pas un dossier. Chemin normalisé (« fichier/ »)."""
+    if not where: return "destination vide"
+    p=os.path.normpath(os.path.abspath(where))
+    if os.path.lexists(p):
+        if not os.path.isdir(p): return "pas un dossier"
+        return None if os.access(p,os.W_OK|os.X_OK) else "accès refusé"
+    a=os.path.dirname(p)
+    while not os.path.lexists(a): a=os.path.dirname(a)   # « / » existe toujours
+    if not os.path.isdir(a): return f"pas un dossier ({a})"
+    if not os.access(a,os.W_OK|os.X_OK): return f"création impossible (accès refusé : {a})"
+    return None
+
+def _makedirs_tracked(where):
+    """os.makedirs qui rend les dossiers qu'il a créés (le plus profond d'abord) — pour les retirer si la suite échoue."""
+    p=os.path.normpath(os.path.abspath(where)); made=[]
+    while not os.path.lexists(p): made.append(p); p=os.path.dirname(p)
+    for d in reversed(made): os.mkdir(d)   # chemin existant qui n'est pas un dossier : refusé avant (_restore_dest_problem)
+    return made
+
+def _rmdirs_if_empty(made):
+    for d in made:   # le plus profond d'abord ; le premier non vide arrête (contenu de borg gardé)
+        try: os.rmdir(d)
+        except OSError: break
+
+def _rb_errmsg(rb,cmd='borg',n=2,cut=100):
+    """Message d'échec lisible d'un résultat boex : lignes ERROR (JSON, 1re ligne) ou texte de borg, `n` au plus, chacune
+    coupée à `cut` caractères (None : entière) ; lignes de bandeau de borg (« Platform: », « Borg: » d'un rapport de plantage)
+    écartées ; sinon le code. 1.0.173 (story 36, A64) : règle UNIQUE — _boex_check_stdout (2, 100) et _boex_last_modified
+    (3, entière) ; avant, _boex_last_modified en gardait une copie et _boex_check_stdout ne retirait pas « Borg: »."""
     msgs=[]
     for i in rb.get('stderr',[]):
         if isinstance(i,dict) and i.get('levelname')=='ERROR':
             msgs.append(i.get('message','').split('\n')[0])
-        elif isinstance(i,str) and i.strip() and not i.startswith('Platform'):
-            msgs.append(i.strip()[:100])
-    return '; '.join(msgs[:2]) or f"{cmd} failed (code {rb['exitcode']})"
+        elif isinstance(i,str) and i.strip() and not i.startswith(('Platform','Borg:')):
+            msgs.append(i.strip()[:cut])
+    return '; '.join(msgs[:n]) or f"{cmd} failed (code {rb['exitcode']})"
 
 def _print_boex_stderr(rb):
     for i in rb['stderr']:
@@ -4052,14 +4081,7 @@ class BorgRunner:
 
     def _boex_last_modified(self,nick,debug=0):
         rb=self.boex(nick,['info','--json'],debug=debug)
-        if rb['exitcode']!=0 or not rb['stdout']:
-            msgs=[]
-            for i in rb['stderr']:
-                if isinstance(i,dict) and i.get('levelname')=='ERROR':
-                    msgs.append(i.get('message','').split('\n')[0])
-                elif isinstance(i,str) and i.strip() and not i.startswith('Platform') and not i.startswith('Borg:'):
-                    msgs.append(i.strip())
-            raise RuntimeError('; '.join(msgs[:3]) or f"borg info failed (code {rb['exitcode']})")
+        if rb['exitcode']!=0 or not rb['stdout']: raise RuntimeError(_rb_errmsg(rb,'borg info',n=3,cut=None))   # 1.0.173 (A64)
         return rb['stdout'][0]['repository']['last_modified']
 
     def getlastbkp(self,nick,nbl=1,debug=0,strict=True):
@@ -5203,6 +5225,13 @@ class BorgHelper:
         stdout_mode=(where=='-')
         out=sys.stderr if stdout_mode else sys.stdout
         if self.borg.repoLocalAbsent(nick): self._borg_stop(nick)   # 1.0.172 (A60) : avant tout verrou
+        # 1.0.173 (story 36, A63 ; revue : -W aussi, décision de l'utilisateur) : destination « dossier » (-w, -W hors tar et
+        # stdout) vérifiée AVANT la sélection d'archive (borg list), le verrou et borg — pas un dossier, non traversable, ou
+        # création impossible : message, code 3, jamais de trace (avant : FileNotFoundError, NotADirectoryError,
+        # PermissionError, FileExistsError envoyées à Sentry)
+        if not (stdout_mode or _is_tar_dest(where)):
+            pb=_restore_dest_problem(where)
+            if pb: printer(f"[ERREUR] destination {where} : {pb}"); sys.exit(3)
         if bid is None:
             bid=self._find_last_archive_with_file(nick,ftor,debug=debug)
             if bid: print(f"Archive sélectionnée depuis l'index : {bid}",file=out,flush=True)
@@ -5220,7 +5249,8 @@ class BorgHelper:
                     rb=self.borg.boex(nick,_borg_extract_args(bid,ftor),rep=tmpdir,debug=debug)
                     _print_boex_stderr(rb)
                     if rb['exitcode'] not in (0,1): sys.exit(rb['exitcode'])
-                    os.makedirs(where,exist_ok=True)
+                    try: os.makedirs(where,exist_ok=True)   # 1.0.173 : course après la vérification -> message, jamais de trace
+                    except OSError as e: printer(f"[ERREUR] destination {where} : création impossible ({e.strerror or e})"); sys.exit(3)
                     try:
                         for root,_,files in os.walk(tmpdir):
                             for f in files: shutil.copy2(os.path.join(root,f),os.path.join(where,f))
@@ -5232,8 +5262,16 @@ class BorgHelper:
                     print(f"Restauré (plat) dans {where}",flush=True)
                 sys.exit(rb['exitcode'])
             else:
+                # 1.0.173 (story 36, A63, décision de l'utilisateur) : dossier absent créé (comme -W), juste avant borg (son
+                # répertoire de travail) ; borg en échec -> dossiers créés ici retirés s'ils sont restés vides (-W ne crée qu'après
+                # un extract réussi : jamais de dossier vide laissé par un échec, /restore de borgHelperWWW compris)
+                try: made=_makedirs_tracked(where)
+                except OSError as e:
+                    printer(f"[ERREUR] destination {where} : création impossible ({e.strerror or e})"); sys.exit(3)
                 rb=self.borg.boex(nick,_borg_extract_args(bid,ftor),rep=where,debug=debug)
-                _print_boex_stderr(rb); sys.exit(rb['exitcode'])
+                _print_boex_stderr(rb)
+                if rb['exitcode'] not in (0,1): _rmdirs_if_empty(made)
+                sys.exit(rb['exitcode'])
         finally:
             self.db.clear_priority_lock(nick)
 
@@ -13113,6 +13151,12 @@ if mode=='prunefail' and sub=='prune': sys.stderr.write('Failed to create/acquir
 if mode=='prunefail': sys.exit(0)
 if mode=='kill' and sub=='prune': os.kill(os.getpid(),signal.SIGKILL)
 if mode=='kill': sys.exit(0)
+if mode=='extract' and sub=='list':
+    print(json.dumps(dict(archives=[dict(name='a',start='2026-01-01T00:00:00'),dict(name='b',start='2026-01-02T00:00:00')]))); sys.exit(0)
+if mode=='extract' and sub=='extract': open('restored','w').write('x'); sys.exit(0)
+if mode=='extractfail' and sub=='list':
+    print(json.dumps(dict(archives=[dict(name='a',start='2026-01-01T00:00:00'),dict(name='b',start='2026-01-02T00:00:00')]))); sys.exit(0)
+if mode=='extractfail' and sub=='extract': sys.stderr.write('Archive b does not exist'+chr(10)); sys.exit(2)
 fail()
 ''')
             os.chmod(fb+'.tmp',0o700); os.replace(fb+'.tmp',fb)
@@ -13121,7 +13165,7 @@ fail()
                 f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nBORG_PASSPHRASE=pw\nDB_KDF=light\nSER_NAME=h\nSER_LOGIN=x\n"
                         f"GLOB_ARCH=*\nBORG_EXE={fb}\nKEEP_DAILY=3\n\n"
                         f"[za]\nBORG_REPO={d}/nulle-part\nMOUNTPOINT={d}/mnt-a\n\n[zr]\nBORG_REPO=ssh://h.invalid/./r\nMOUNTPOINT={d}/mnt-r\n\n"
-                        f"[zk]\nBORG_REPO={d}/nulle-part-k\n\n[zp]\nBORG_REPO={d}/repo-{{hostname}}\n")
+                        f"[zk]\nBORG_REPO={d}/nulle-part-k\n\n[zp]\nBORG_REPO={d}/repo-{{hostname}}\n\n[zw]\nBORG_REPO={d}\n")
             os.chmod(rc,0o600)
             nodsn=os.path.join(tmp,'sentry-vide'); open(nodsn,'w').close()
             env=dict(os.environ,BORGHELPERC_SENTRY_FILE=nodsn); env.pop('BORGHELPERC_SENTRY_DSN',None)
@@ -13231,6 +13275,89 @@ fail()
             if not ok: print(f"  {[(k,v) for k,v in res.items() if not v[0]]}")
             return ok
         check("borg en échec : codes de borg, message JSON, 2e borg list, Key/Mount avertissement, Prune en échec ou tué, marqueur {hostname}",_bf_outputs)
+        # 1.0.173 (story 36, A63, décision de l'utilisateur) : Restore -w vers une destination absente ou qui n'est pas un dossier
+        def _restore_dest():
+            """CLI réelle, borg factice (zw : dépôt local présent, `extract` écrit `restored` dans son répertoire de travail) :
+            -w dossier absent (sans -b : archive par borg list ; avec -b) -> créé, fichier restauré, code 0 ; refusés AVANT la
+            sélection d'archive et borg (fichier `calls` absent, sans -b) : fichier, « fichier/sous », lien cassé, destination vide,
+            et en non-root dossier non traversable, sous un dossier sans droits ; -W (décision de l'utilisateur, revue) : mêmes
+            refus vers un fichier ou sans droits ; -W absent et -w vers un .tar existant (ajout) : inchangés (code 0) ; borg extract
+            en échec -> code de borg, dossiers créés retirés, verrou relâché ; jamais de trace ni de dossier laissé."""
+            d,rc,calls,cli=_bf_env('restdest'); res={}; b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            mode=lambda m: open(os.path.join(d,'mode'),'w').write(m)
+            def run(*a):
+                if os.path.exists(calls): os.unlink(calls)
+                code,out,err=cli('-c','Restore','-n','zw','-f','etc/x',*a); return code,out+err
+            def refused(lbl,dest,want,*extra):
+                code,o=run(*extra,dest) if extra and extra[0] in ('-W','-w') else run('-w',dest)
+                res[lbl]=(code==3 and f"[ERREUR] destination {dest} : {want}" in o and not os.path.exists(calls)
+                          and 'Traceback' not in o,code,o[-180:])
+            mode('extract')
+            for lbl,extra in (('sans -b',[]),('-b',['-b','b'])):
+                dest=os.path.join(d,f'neuf{len(extra)}','sous')
+                code,o=run('-w',dest,*extra)
+                res[f'absent {lbl}']=(code==0 and os.path.isfile(os.path.join(dest,'restored')) and 'Traceback' not in o,code,o[-150:])
+            f=os.path.join(d,'unfichier'); open(f,'w').close()
+            refused('fichier',f,'pas un dossier')
+            refused('fichier/sous',os.path.join(f,'sous'),f'pas un dossier ({f})')
+            lien=os.path.join(d,'lien-casse'); os.symlink(os.path.join(d,'nulle-part-x'),lien); refused('lien cassé',lien,'pas un dossier')
+            code,o=run('-w',''); res['vide']=(code==3 and 'destination vide' in o and 'Traceback' not in o,code,o[-150:])
+            refused('-W fichier',f,'pas un dossier','-W')
+            if os.geteuid()!=0:
+                ro=os.path.join(d,'ro'); os.mkdir(ro); os.chmod(ro,0o500)
+                nt=os.path.join(d,'nontrav'); os.mkdir(nt); os.chmod(nt,0)
+                try:
+                    refused('sans droits',os.path.join(ro,'x'),f'création impossible (accès refusé : {ro})')
+                    refused('-W sans droits',os.path.join(ro,'x'),f'création impossible (accès refusé : {ro})','-W')
+                    refused('non traversable',nt,'accès refusé')
+                finally: os.chmod(ro,0o700); os.chmod(nt,0o700)
+            tarp=os.path.join(d,'ajout.tar'); import tarfile as _tf
+            with _tf.open(tarp,'w'): pass   # cible tar EXISTANTE (mode ajout) : un fichier, jamais « pas un dossier »
+            code,o=run('-w',tarp,'-b','b'); res['tar existant']=(code==0 and 'pas un dossier' not in o,code,o[-150:])
+            flat=os.path.join(d,'plat','x'); code,o=run('-W',flat,'-b','b')
+            res['-W absent']=(code==0 and os.path.isfile(os.path.join(flat,'restored')),code,o[-150:])
+            mode('extractfail'); dest=os.path.join(d,'echec','a','b'); code,o=run('-w',dest,'-b','b')
+            res['extract en échec']=(code==2 and not os.path.exists(os.path.join(d,'echec')) and 'Traceback' not in o
+                                    and not b.db.check_priority_lock('zw'),code,o[-150:])
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {[(k,v) for k,v in res.items() if not v[0]]}")
+            return ok
+        check("destination de Restore : -w absent créé (± -b), refus avant borg (fichier, lien, sans droits, -W aussi), échec -> rien laissé",_restore_dest)
+        # 1.0.173 (story 36, A64) : une seule règle de message d'échec (_rb_errmsg)
+        def _errmsg_rule():
+            """_boex_last_modified (Report, CacheClean) : MÊME texte qu'avant 1.0.173 (copie de l'ancienne règle ci-dessous) sur des
+            sorties de borg réalistes ; _boex_check_stdout : 2 lignes, coupées à 100, bandeau « Borg: » retiré (nouveau)."""
+            def old_lm(rb):   # règle de _boex_last_modified jusqu'à 1.0.172
+                msgs=[]
+                for i in rb['stderr']:
+                    if isinstance(i,dict) and i.get('levelname')=='ERROR': msgs.append(i.get('message','').split('\n')[0])
+                    elif isinstance(i,str) and i.strip() and not i.startswith('Platform') and not i.startswith('Borg:'): msgs.append(i.strip())
+                return '; '.join(msgs[:3]) or f"borg info failed (code {rb['exitcode']})"
+            long='x'*150
+            cases=[{'exitcode':2,'stdout':[],'stderr':[{'levelname':'ERROR','message':'passphrase incorrect.\nsuite'}]},
+                   {'exitcode':2,'stdout':[],'stderr':['Platform: Linux','Borg: 1.2.6  Python: CPython','Repository x does not exist.',long,'troisième','quatrième']},
+                   {'exitcode':2,'stdout':[],'stderr':[]},
+                   {'exitcode':0,'stdout':[],'stderr':['  ',{'levelname':'WARNING','message':'w'}]},
+                   # forme réelle d'un plantage de borg 1.2 (archiver.py) : message, trace, puis bandeau sysinfo
+                   {'exitcode':2,'stdout':[],'stderr':['Local Exception','Traceback (most recent call last):','  File "x", line 1',
+                                                       'Platform: Linux h 6.8','Borg: 1.2.6  Python: CPython 3.10','PID: 1']}]
+            d,b=_nb_env('errmsg'); res=[]
+            for rb in cases:
+                with mock.patch.object(b.borg,'boex',lambda *a,_rb=rb,**k: _rb):
+                    try: b.borg._boex_last_modified('zb'); got=None
+                    except RuntimeError as e: got=str(e)
+                res.append(got==old_lm(rb))
+            want=['passphrase incorrect.',f"Repository x does not exist.; {'x'*100}",'borg list failed (code 2)','borg list failed (code 0)',
+                  'Local Exception; Traceback (most recent call last):']
+            got=[]
+            for rb in cases:
+                try: b.borg._boex_check_stdout(rb,'zb','borg list'); got.append(None)
+                except RuntimeError as e: got.append(str(e))
+            res.append(got==want)
+            ok=all(res)
+            if not ok: print(f"  {res} {got!r}")
+            return ok
+        check("message d'échec borg : règle unique, _boex_last_modified inchangé, bandeau Borg: retiré",_errmsg_rule)
         # 1.0.172 (story 35, A61) : ensure_*(create=False) — fichier supprimé entre la sonde et l'ouverture : jamais recréé
         def _race_ensure():
             """diff.db, cache.db (sonde _db_has_schema) et history.db (sonde _db_probe) : base présente à la sonde, supprimée avant

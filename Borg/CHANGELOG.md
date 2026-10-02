@@ -1,5 +1,28 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.173 / borgHelperWWW 1.28.8 — cache sans erreurs, Restore vers dossier absent, message d'échec unique — 2026-10-02
+
+Chantier « reconstruction progressive », story 36 (actions de rétrospective A62, A63, A64, A65 ; regroupement demandé par
+l'utilisateur ; A65 = outillage de test hors dépôt).
+
+- **borgHelperWWW : plus d'échec « extérieur » mis en cache** (`_RESPONSE_CACHE`, 14 routes : lstbkp, lstbkpfls, report
+  hors ligne, diffbkp, search, filehist, treehist, treefind, duidx, cacheinfo, repohistory, archivehistory, idxtop,
+  difftop). Avant : « ⚠ dépôt absent » ou une coupure ssh restait servi après remontage, tant que diff.db/cache.db ne
+  changeaient pas. Décisions de l'utilisateur : codes 0 et 1 gardés (1 = alerte tirée des bases : Report -o « diff.db
+  absent », sauvegarde trop ancienne — la page d'accueil reste servie du cache), code >= 2 jamais ; forme et statut HTTP
+  inchangés.
+- **Restore `-w` vers un dossier absent** (décision de l'utilisateur) : le dossier est créé, comme avec `-W` (avant :
+  trace Python `FileNotFoundError`, envoyée à Sentry, code 1) ; si `borg extract` échoue ensuite, les dossiers créés
+  restés vides sont retirés. Destination vide, qui n'est pas un dossier (fichier, lien cassé), non traversable, ou
+  création impossible : « [ERREUR] destination … : … », code 3, avant la sélection d'archive et tout appel à borg.
+  **`-W` aussi** (décision de l'utilisateur, revue) : vers un fichier ou sous un dossier sans droits, plus de trace
+  (`FileExistsError`, `PermissionError`), mêmes messages, code 3. Cible tar : inchangée (son dossier n'est pas créé).
+- **Une seule règle de message d'échec de borg** (`_rb_errmsg`) : `_boex_last_modified` (Report, CacheClean) en gardait
+  une copie — même texte qu'avant ; ses autres appelants (`borg list`, Mount, Key, DelBkp, Prune) écartent désormais aussi
+  le bandeau « Borg: … » d'un rapport de plantage (sans effet sur une vraie sortie de borg 1.2, où il suit le message).
+- CodecSelfTest : « destination de Restore », « message d'échec borg » ; push_selftest : « cache des réponses » (codes,
+  DbKeyError, écriture unique).
+
 ## borgHelper 1.0.172 — dépôt absent sans trace, ensure sans création — 2026-10-02
 
 Chantier « reconstruction progressive », story 35 (actions de rétrospective A59, A60, A61 ; regroupement demandé par
