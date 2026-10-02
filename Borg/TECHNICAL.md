@@ -2228,6 +2228,23 @@ manque) ; `_db_check_readonly` y garde les arrêts d'`ensure_diff_db` sans écri
 plus récent -> `SchemaVersionError`). Limite (décision de l'utilisateur) : trames WAL non reportées (processus tué) reportées par
 SQLite à la fermeture de toute connexion, -D compris — contenu identique, mtime changé. Contrôle générique « dry-run sans écriture » : IdxPurge -D (tout, `-x`), DbEncrypt/DbDecrypt (-D, sans -y, -D -y),
 DbRekey sans -y × 11 états -> empreintes de CACHE_DIR inchangées. BorgCleanup -D (hors CACHE_DIR) : contrôles BorgCleanup.
+**Ensure sans création (1.0.172, story 35, A61)** : `_open_db(…, create_file=None)` — `None` : le rôle décide (`read` jamais,
+`write`/`admin` `O_CREAT` 0600) ; `False` : `write`/`admin` en `mode=rw`, fichier absent -> `sqlite3.OperationalError`.
+`ensure_*_db(create=False)` l'utilise après sa sonde : supprimée entre les deux -> `_file_gone` -> retour (base absente) ;
+autre échec -> `_db_open_fail` comme avant. WAL, paliers, tampons, vue : inchangés (fichier existant). `ensure_history_db
+(create=False)` (aucun appelant aujourd'hui) : `_db_probe` comme les deux autres (absent -> False ; illisible -> erreur réelle).
+**Dépôt absent / borg en échec (1.0.172, A60)** : `BorgHelper._borg_fail_msg` (dépôt local introuvable `repoLocalAbsent` ->
+« ⚠ dépôt absent (BORG_REPO) », sinon « borg <cmd> a échoué : … »), `_borg_stop` (message ou `{'error'}` en `-j`, code 2),
+`_lastbkp_or_stop` (appelants stricts de `getlastbkp` : DiffBkp, Restore/`listperms`, Mount) ; `getlastbkp` garde son
+`RuntimeError` (Bkp l'appelle sous `except Exception`, `strict=False`). Test « dépôt absent » en tête de DiffBkp, Restore,
+listperms, Mount, Key, DelBkp, Prune (avant tout verrou et tout `ensure_*`). `_rb_errmsg(rb, cmd)` : message d'un résultat
+boex (même règle que `_boex_check_stdout`, qui l'utilise) ; `_prune_fail` (main, refus `annonce` déjà affichés ; toujours un
+message sinon), `_exit_code` (borg tué : 256+code, jamais 0 dans le pire code). Key rend le pire code ; code 1 de borg
+(avertissement) : clé affichée, comme Mount (lignes de borg, pas « a échoué »). Prune : résultat de `borg prune` s'il a
+échoué (>= 2 ou tué), sinon celui de compact (avant : toujours compact). `repoLocalAbsent` (revue) : `BORG_REPO` avec
+marqueur `{…}` (remplacé par borg) -> jamais absent ; `os.open` au lieu de `stat` (un montage autofs se déclenche,
+lu : `stat` suit `AT_NO_AUTOMOUNT`). `_lastbkp_or_stop` : sortie de `borg list` illisible -> message, jamais de trace.
+`ensure_history_db(create=False)` : base illisible -> erreur réelle comme avant (seul « absent » rend False).
 **Base recréée tenue ailleurs (1.0.169, A52)** — mesuré (SQLite 3.37.2) : un `-wal`/`-shm` orphelin (processus tué) n'est
 jamais rejoué quand la base est recréée, fichier principal absent ou vide (l'ancien WAL est jeté au passage en WAL) ;
 mais un processus qui tient encore l'ancienne base (trames WAL non reportées) fait échouer la recréation en

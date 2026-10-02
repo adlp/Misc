@@ -1,5 +1,28 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.172 — dépôt absent sans trace, ensure sans création — 2026-10-02
+
+Chantier « reconstruction progressive », story 35 (actions de rétrospective A59, A60, A61 ; regroupement demandé par
+l'utilisateur ; A59 = outillage de test hors dépôt).
+
+- **Dépôt absent ou borg en échec** (décisions de l'utilisateur) : DiffBkp (sans `-b`, `-b a,b`, `-j`), Restore sans `-b`
+  (`-L`, `-w`) et Mount `-b last` finissaient en **trace Python** (`RuntimeError` de `borg list`, envoyée à Sentry), code 1 ;
+  Key n'affichait rien (code 0) ; DelBkp, Prune et Mount imprimaient un dictionnaire brut. Désormais : dépôt local
+  introuvable -> « nick: ⚠ dépôt absent (BORG_REPO) », code 2 (comme Report 1.0.167), borg jamais lancé, aucune base créée ;
+  autre échec -> « nick: borg <commande> a échoué : <message de borg> », code 2 (DelBkp, Prune, Mount : code de borg).
+  `DiffBkp -j` : `{"error": …}`. Key et Prune sur plusieurs nicks : le pire code (Prune : avant, le dernier non nul ; borg
+  tué par un signal : jamais 0). Code 1 de borg (avertissement) : Key affiche la clé, Mount ses lignes. Prune : un `borg prune`
+  en échec rend son code et son message (avant : ceux de `compact`, code 0 si compact réussissait).
+- **« ⚠ dépôt absent » à tort** (Report compris, depuis 1.0.167) : `BORG_REPO` avec un marqueur borg (`{hostname}`, `{user}`…)
+  n'est plus jamais dit absent ; test par ouverture (un dépôt autofs se monte, `stat` ne le montait pas).
+- **Lecteur et base supprimée en même temps** : `ensure_diff_db`/`ensure_cache_db(create=False)` ouvraient la base en
+  création après l'avoir sondée — supprimée entre les deux, elle était recréée avec tout son schéma, en clair. Ouverture
+  sans création (`_open_db(create_file=False)`) : la base est vue absente, rien n'est recréé. `ensure_history_db(create=False)`
+  sur le même test d'état que les deux autres.
+- CodecSelfTest : « borg en échec » (11 commandes × dépôt local absent / distant en échec, CLI réelle, borg factice ;
+  plusieurs nicks ; Bkp garde le comportement de `getlastbkp`), « course sonde/ouverture » (diff, cache, history ; palier 10
+  migré par un lecteur ; base illisible intacte).
+
 ## borgHelper 1.0.171 — lecteurs sans création de fichier, état de base unique, dry-run sans écriture — 2026-10-01
 
 Chantier « reconstruction progressive », story 34 (actions de rétrospective A56, A57, A58 ; regroupement demandé par

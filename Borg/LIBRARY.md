@@ -78,13 +78,14 @@ from borgHelper import _open_db, DbKeyError
 conn = _open_db(db_path, nick='mon-serveur', role='read')   # BhConnection ; .codec est None si la base est plain (ou mode 'empty', voir plus bas)
 ```
 
-`_open_db(db_path, nick=None, role='read', passphrase=None, empty_ok=False, **kw)` est le seul point d'ouverture SQLite
+`_open_db(db_path, nick=None, role='read', passphrase=None, empty_ok=False, create_file=None, **kw)` est le seul point d'ouverture SQLite
 (1.0.169 : avec `empty_ok=True` en lecture, une base siv1 en WAL sans aucun chemin que la passphrase n'ouvre pas est rendue
 vide — `conn.mode == 'empty'`, `codec None` (ce n'est PAS une base en clair), lecture seule, instantané figé — au lieu de
 `DbKeyError` ; une `DbKeyError` dont `wrong_key` est vrai signale une enveloppe qui refuse la passphrase (même type, même nom affiché) ; les `kw`,
 ex. `timeout=60`, sont transmis à `sqlite3`). Depuis 1.0.171, `role='read'` ne crée jamais de fichier : base inexistante
 (dossier présent) -> connexion vide en mémoire (`no such table` comme un fichier vide) ; dossier absent ou non traversable,
-fichier sans droits : `sqlite3.OperationalError` comme avant ; `write`/`admin` créent le fichier en 0600. `db_encrypt_enabled(nick)` / `db_kdf_level(nick)` lisent `DB_ENCRYPT` /
+fichier sans droits : `sqlite3.OperationalError` comme avant ; 1.0.172 : `create_file=False` ouvre en `write`/`admin` sans
+créer (`mode=rw`, fichier absent -> `sqlite3.OperationalError`) ; sinon `write`/`admin` créent le fichier en 0600. `db_encrypt_enabled(nick)` / `db_kdf_level(nick)` lisent `DB_ENCRYPT` /
 `DB_KDF`.
 
 Lectures de chemins (depuis 1.0.101) : les méthodes de `BorgHelper` (`treehist`, `treefind`, `search`, `filehist`, `duidx`,
@@ -726,7 +727,8 @@ sys.exit(0)
 | `delbkp(nick, bid, debug)` | Supprime une archive : opération prioritaire (un Index se met en pause, 1.0.142), `borg delete` + compact, puis rapprochement des bases comme `prune` (1.0.145) ; termine par `sys.exit` |
 | `mount(nick, bid, debug)` | Monte via FUSE |
 | `umount(nick, debug)` | Démonte |
-| `key(nicks, debug)` | Exporte la clef |
+| `key(nicks, debug)` | Exporte la clef ; 1.0.172 : rend le pire code des nicks (2 si dépôt absent ou borg en échec, message sur stderr ; avant : rien, 0) |
+| `diffbkp`, `restore`, `listperms`, `mount`, `delbkp` | 1.0.172 : dépôt local absent ou `borg list` en échec -> message sur stderr et `SystemExit(2)` (avant : `RuntimeError` non rattrapée pour diffbkp/restore/listperms/mount) ; `prune()` rend `{'exitcode': 2, …, 'annonce': True}` sur dépôt absent, et le résultat de `borg prune` (clé `cmd`) s'il a échoué |
 | `init_repo(nick, debug)` | Initialise un dépôt |
 | `stats(nick, debug)` | État de montage |
 | `cache_info(nick, debug)` | Affiche le cache |

@@ -680,6 +680,17 @@ L'archive supprimée quitte aussitôt les bases (rapports, historique, explorate
 `Prune` (1.0.145 ; avant, il fallait attendre le prochain `Index`). Si un autre Bkp, Restore ou Prune tourne sur le même
 dépôt, ou si le rapprochement échoue (avertissement, jamais un échec de `DelBkp`), il est fait au prochain `Index`.
 
+### Dépôt absent ou borg en échec (1.0.172)
+
+`DiffBkp`, `Restore`, `Mount`, `Key`, `DelBkp`, `Prune` : dépôt local introuvable (disque démonté, chemin faux) ->
+`<nick>: ⚠ dépôt absent (<BORG_REPO>)`, code 2, borg jamais lancé, aucune base créée (comme `Report`, 1.0.167) ; autre
+échec de borg (passphrase, ssh, dépôt distant) -> `<nick>: borg <commande> a échoué : <message de borg>`, code 2 (DelBkp,
+Prune, Mount : code de borg ; Restore avec `-b` : ligne de `borg extract` telle quelle ; code 1 de borg = avertissement,
+Key et Mount affichent leur résultat). `DiffBkp -j` : `{"error": "…"}` seul sur stdout. `BORG_REPO` avec marqueur borg
+(`{hostname}`…) : jamais dit absent (Report compris). Avant : trace Python (DiffBkp, Restore sans
+`-b`, Mount `-b last`), dictionnaire brut (DelBkp, Prune, Mount), rien du tout et code 0 (Key). `Key` et `Prune` sur
+plusieurs nicks : code de sortie = le pire des nicks.
+
 ---
 
 ### `Init`
