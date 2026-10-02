@@ -82,7 +82,9 @@ conn = _open_db(db_path, nick='mon-serveur', role='read')   # BhConnection ; .co
 (1.0.169 : avec `empty_ok=True` en lecture, une base siv1 en WAL sans aucun chemin que la passphrase n'ouvre pas est rendue
 vide — `conn.mode == 'empty'`, `codec None` (ce n'est PAS une base en clair), lecture seule, instantané figé — au lieu de
 `DbKeyError` ; une `DbKeyError` dont `wrong_key` est vrai signale une enveloppe qui refuse la passphrase (même type, même nom affiché) ; les `kw`,
-ex. `timeout=60`, sont transmis à `sqlite3`). `db_encrypt_enabled(nick)` / `db_kdf_level(nick)` lisent `DB_ENCRYPT` /
+ex. `timeout=60`, sont transmis à `sqlite3`). Depuis 1.0.171, `role='read'` ne crée jamais de fichier : base inexistante
+(dossier présent) -> connexion vide en mémoire (`no such table` comme un fichier vide) ; dossier absent ou non traversable,
+fichier sans droits : `sqlite3.OperationalError` comme avant ; `write`/`admin` créent le fichier en 0600. `db_encrypt_enabled(nick)` / `db_kdf_level(nick)` lisent `DB_ENCRYPT` /
 `DB_KDF`.
 
 Lectures de chemins (depuis 1.0.101) : les méthodes de `BorgHelper` (`treehist`, `treefind`, `search`, `filehist`, `duidx`,
@@ -271,7 +273,7 @@ bh.db_encrypt('mon-serveur', dryrun=True)             # rapport seul, rien chang
 bh.db_encrypt('mon-serveur', confirm=True)             # exécution réelle -> code 0 si OK, non nul sinon
 bh.db_decrypt('mon-serveur', confirm=True)             # sens inverse
 bh.db_rekey('mon-serveur', confirm=True)                # ré-enveloppe la DEK (refuse sur base plain)
-bh.db_status('mon-serveur')                             # imprime le mode de cache.db/diff.db (stderr)
+bh.db_status('mon-serveur')                             # imprime le mode de cache.db/diff.db/history.db (stderr) ; « absent », « illisible (…) » (1.0.171)
 ```
 
 `db_encrypt`/`db_decrypt`/`db_rekey` retournent un entier (0 = succès, non nul = refus/erreur — voir README pour le
@@ -708,7 +710,7 @@ sys.exit(0)
 | `index(nick, debug, db_path, force, target_archive, set_pending, budget=None, natures=None, period=None, pause=True, snap_only=False, rebuild=False)` | Rapproche d'abord les bases de `borg list` (archives disparues retirées, 1.0.140), puis indexe. 1.0.141 : `budget` (s, > 0), `natures` (sous-ensemble non vide de `stats`,`snap`,`diff`) ou `period` (`(de, à)` : archive, date `AAAA-MM-JJ[THH:MM:SS]` ou `ALL`) → tranche (snapshot, stats, diffs du plus récent au plus ancien — ordre 1.0.146 —, reprenable, `build_state` écrit) ; `snap_only` : snapshot seul (`-S`). Tout Index prend un verrou exclusif par dépôt et se met en pause si Bkp/Restore/Prune/Report démarre, puis reprend seul — **changement de comportement** : sans budget, l'appel peut attendre sans limite la fin de l'opération prioritaire ; `pause=False` : arrêt immédiat comme avant (`index-pending` si `set_pending`, retour 1). Retour : 0 (fini, déjà en cours, échéance), 1 (erreur, période invalide, annulé) ; `ValueError` sur budget/natures invalides. N'abaisse jamais la priorité du processus appelant (seule la CLI le fait). 1.0.143 : `rebuild=True` → tranche qui crée ou poursuit le fichier fantôme `<db_path>.rebuild` (`force=True` : le jette d'abord) ; toute tranche poursuit un fantôme existant (dans ses limites `natures`/`period`, avertissement si elles restreignent, 1.0.148) et bascule quand il est complet ; retour 3 si `rebuild` est refusé (`DB_NAME` partagé, espace disque, migration de chiffrement) |
 | `indexsnap(nick, debug, db_path, force, archives=None)` | Snapshot de la dernière archive — incrémental par défaut (force=True pour `borg list` complet) ; purge auto des snapshots anciens (IDX_SNAP_KEEP) ; `archives` (1.0.141) : liste `borg list` déjà obtenue ; retourne `'killed'` si son borg a été tué par une demande d'arrêt (rien d'écrit) |
 | `report(nicks, htrep, debug, maxp, as_json)` | Rapport avec appels borg ; 1.0.166 : un `SystemExit` d'un nick (base illisible) devient sa ligne d'erreur (retour 2), sauf le code 130 (Ctrl-C), relancé ; 1.0.168 : `reste` = message réel de l'arrêt |
-| `report_offline(nicks, htrep, debug, maxp, as_json)` | Rapport depuis diff.db uniquement — même résumé que `report`, toutes machines affichées même sans index ; 1.0.166 : même isolation par nick que `report` ; 1.0.168 : `reste` = message réel de l'arrêt |
+| `report_offline(nicks, htrep, debug, maxp, as_json)` | Rapport depuis diff.db uniquement — même résumé que `report`, toutes machines affichées même sans index ; 1.0.166 : même isolation par nick que `report` ; 1.0.168 : `reste` = message réel de l'arrêt ; 1.0.171 : diff.db illisible = ligne d'erreur (retour 2, jamais « absent »), retour = le pire des nicks (aussi pour `report`) |
 | `idxtop(nick, depth, topn, debug, as_json)` | Top N arborescences par nb d'entrées dans diff_index — diagnostiquer un diff.db volumineux ; `as_json` (Story 1.4) : mode brut, une ligne par chemin (`{'nick','rows':[{'chemin','taille'}]}`), **sans** regroupement/top-N ni Exclus/Inchangés — `depth`/`topn` ignorés dans ce mode |
 | `difftop(nick, bkp, depth, topn, debug, as_json)` | Top N arborescences par changements sur une paire d'archives — diagnostiquer les changements d'un backup ; `as_json` (Story 1.4) : mode brut, une ligne par chemin (`{'nick','archive_old','archive_new','rows':[{'chemin','type','taille_avant','taille_apres'}]}`), **sans** regroupement/top-N ni Exclus/Inchangés — `depth`/`topn` ignorés dans ce mode |
 | `_swap_db(live, new, nick, abort, changed, pages, busy_limit, keep_new=False)` (fonction du module, interne) | Remplace le contenu d'une base servie par celui de `new` (API backup de SQLite) ; `'ok'`/`'abort'`/`'changed'`/`'busy'`/`'invalid'` ; `keep_new=True` (1.0.143) : `new` gardée sauf après `'ok'`/`'invalid'` |

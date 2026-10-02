@@ -489,6 +489,10 @@ Dépôt local introuvable (disque démonté, chemin faux ; 1.0.167) : colonne `r
 alerte (`*** nick`, rouge en HTML), code 2 ; archives affichées en hors ligne (avant : aucune archive du nick dans
 `Report -o`). Un dépôt présent mais illisible (droits) n'est jamais dit absent.
 
+`diff.db` corrompue (1.0.171) : `Report -o` affiche le nick en erreur (`*** nick`) avec le message réel (« ⚠ DB corrompue
+… »), code 2 — jamais « diff.db absent — lancez Index » ; base sans droits : « DB illisible … ne PAS supprimer le fichier ».
+Plusieurs nicks : code de sortie = le pire des nicks.
+
 Plusieurs nicks (1.0.166) : la base d'un nick tenue par un autre processus (migration, Index) est lue telle quelle,
 sans message, après 2 s d'attente au plus par base (Report direct : `diff.db` et `cache.db`, soit ~4 s par nick occupé) ;
 une base illisible ne donne qu'une ligne `*** nick ⚠ <message réel>` (`*** ERREUR nick` en direct ; code 2 ; 1.0.168 : par exemple
@@ -1234,7 +1238,7 @@ borgHelper -c DbDecrypt -n mon-serveur -y
 
 | Option | Description |
 |--------|-------------|
-| `-D` | Dry-run — rapporte les tables/lignes/espace estimé, ne change rien |
+| `-D` | Dry-run — rapporte les tables/lignes/espace estimé, ne change rien (1.0.171 : pas même une migration de schéma ; base ancienne lue telle quelle, « ? » pour une table pas encore créée ; base corrompue, occupée ou d'un schéma plus récent : même arrêt qu'avec `-y`. Limite : des trames WAL d'un processus tué sont reportées par SQLite à la fermeture, contenu identique) |
 | `-y` | Exécute réellement (convention `IdxPurge` : ni `-D` ni `-y` → refus explicite, rien changé) |
 
 `DbEncrypt` refuse (code de sortie non nul, rien changé) si `DB_ENCRYPT=false` pour ce nick, si une opération
@@ -1287,6 +1291,8 @@ Affiche le mode (`plain`/`siv1`/`migrating`) de `cache.db` et de `diff.db` pour 
 l'en-tête (`db_meta.enc_header`) : aucune passphrase n'est nécessaire pour simplement connaître le mode d'une
 base chiffrée. Si une base reste `plain` alors que `DB_ENCRYPT` est actif et qu'une passphrase est
 disponible, avertit (comme `_open_db`, une fois par base et par invocation) et cite la commande `DbEncrypt`.
+Base inexistante, vide ou sans table : `absent` ; base corrompue, verrouillée ou sans droits : `illisible (<erreur SQLite>)`
+(1.0.171, `history.db` comprise). Code de sortie 0 dans tous les cas (affichage d'état).
 
 ### `BorgCleanup`
 

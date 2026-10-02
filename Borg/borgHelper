@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.170"
+Version="1.0.171"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -1692,6 +1692,19 @@ def _db_busy(e):
     """Vrai si l'erreur SQLite est un verrou tenu par un autre processus (locked/busy), pas une corruption."""
     return isinstance(e,sqlite3.OperationalError) and any(w in str(e).lower() for w in ('locked','busy'))
 
+def _db_perm(e):
+    """1.0.171 (revue story 34) : erreur SQLite d'accès (droits du fichier ou du dossier, fichier qui est un répertoire, dossier
+    en lecture seule pour le -shm du WAL) — pas une corruption."""
+    s=str(e).lower()
+    return isinstance(e,sqlite3.OperationalError) and any(w in s for w in ('unable to open database file','readonly database','permission denied'))
+
+def _file_gone(p):
+    """1.0.171 (story 34) : fichier de base sûrement absent — stat « inexistant » ET dossier présent. Dossier absent ou non
+    traversable (droits) : False — l'ouverture rendra l'erreur réelle, comme avant (jamais une base vide qui la masque)."""
+    try: os.stat(p); return False
+    except FileNotFoundError: return os.path.isdir(os.path.dirname(os.path.abspath(p)))
+    except OSError: return False
+
 def _held_before(db_path):
     """1.0.169 (A52) : état AVANT une création — `-shm` présent et fichier principal absent, vide ou sans table (un premier
     essai raté a déjà écrit la page d'en-tête en passant en WAL : 4096 octets, mesuré) : la base a été supprimée alors
@@ -1713,6 +1726,10 @@ def _db_schema_fail(db_path,e,what,regenerable=True,held=False):
         printer(f"[ERREUR] DB : {db_path} recréée alors qu'un autre processus tenait encore l'ancienne ouverte (Index, Bkp, borgHelperWWW…)")
         printer(f"  -> {e}")
         printer("  Attendre la fin de ce processus (ou l'arrêter), puis relancer — ne rien supprimer de plus.")
+    elif _db_perm(e):   # 1.0.171 (revue story 34, décision de l'utilisateur) : base saine, droits refusés — jamais « Supprimez »
+        printer(f"[ERREUR] DB illisible : {db_path}")
+        printer(f"  -> {e}")
+        printer("  Vérifier propriétaire et droits du fichier et de son dossier — ne PAS supprimer le fichier.")
     elif _db_busy(e):
         printer(f"[ERREUR] DB occupée : {db_path}")
         printer(f"  -> {e}")
@@ -1846,13 +1863,28 @@ def _open_db(db_path,nick=None,role='read',passphrase=None,empty_ok=False,_retri
     écrivain, base hors WAL : DbKeyError comme avant. Défaut False : sonde de mode (borgHelperWWW _nick_owner_codec),
     moteur, bibliothèque. Attention : codec None ne veut PAS dire « en clair » quand mode=='empty'."""
     if role not in _DB_ROLES: raise ValueError(f"role invalide : {role!r} (attendu {'|'.join(_DB_ROLES)})")
-    if isinstance(db_path,(str,bytes,os.PathLike)) and str(db_path)!=':memory:':
-        try:
-            fd=os.open(db_path,os.O_RDWR|os.O_CREAT,0o600)  # 0600 à la création, fichier existant intact
-            os.close(fd)
-        except OSError:
-            pass  # sqlite3 rejouera l'erreur avec son propre message (OperationalError)
-    conn=sqlite3.connect(db_path,factory=BhConnection,**kw)
+    if role=='read' and isinstance(db_path,(str,bytes,os.PathLike)) and os.fsdecode(db_path)!=':memory:':
+        # 1.0.171 (story 34, A56) : un LECTEUR ne crée jamais de fichier (avant : O_CREAT ici, un diff.db/cache.db de 0 octet
+        # laissé par chaque lecture d'un nick jamais indexé — cause des gardes des stories 31-33). Base inexistante (ou
+        # supprimée entre le test et l'ouverture) : base vide en mémoire (mêmes « no such table » qu'un fichier vide, même
+        # réponse qu'avant) ; existante : mode=rw, qui ne recrée pas un fichier supprimé entre-temps (repli lecture seule sur
+        # un fichier 0444, mesuré, comme avant).
+        # Dossier absent ou non traversable : l'erreur réelle de l'ouverture, comme avant (_file_gone).
+        import pathlib
+        conn=None; p=os.fsdecode(db_path)
+        if not _file_gone(p):
+            try: conn=sqlite3.connect(pathlib.Path(p).absolute().as_uri()+'?mode=rw',factory=BhConnection,uri=True,**kw)
+            except sqlite3.OperationalError:
+                if not _file_gone(p): raise
+        if conn is None: conn=sqlite3.connect(':memory:',factory=BhConnection,**kw)
+    else:
+        if isinstance(db_path,(str,bytes,os.PathLike)) and str(db_path)!=':memory:':
+            try:
+                fd=os.open(db_path,os.O_RDWR|os.O_CREAT,0o600)  # 0600 à la création, fichier existant intact
+                os.close(fd)
+            except OSError:
+                pass  # sqlite3 rejouera l'erreur avec son propre message (OperationalError)
+        conn=sqlite3.connect(db_path,factory=BhConnection,**kw)
     conn.role=role; conn.nick=nick
     try:
         if nick is not None:
@@ -1900,7 +1932,7 @@ def _open_db(db_path,nick=None,role='read',passphrase=None,empty_ok=False,_retri
                 try:
                     if (not _is_shadow(db_path) and db_encrypt_enabled(nick)   # fantôme : même mode que sa base, déjà signalée
                             and (passphrase if passphrase is not None else _resolve_passphrase(nick,db_path))
-                            and conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is not None):
+                            and _conn_has_table(conn)):
                         _warn_plain_db(nick,db_path)
                 except (SystemExit,sqlite3.Error): pass   # avertissement seulement : jamais un échec d'ouverture
     except BaseException:
@@ -2187,35 +2219,60 @@ def _path_sort_key(path):
     """Ordre octet UTF-8 (celui du tri BINARY de SQLite)."""
     return path.encode('utf-8','surrogateescape')
 
-def _db_absent(db_path):
-    """1.0.170 (story 33) : base ABSENTE pour une commande — fichier inexistant, de 0 octet (laissé par l'O_CREAT d'un lecteur,
-    _open_db ; jamais ouvert : SQLite supprimerait un -wal orphelin, story 32) ou base lisible sans aucune TABLE (une vue
-    seule — contrôle de vue de borgHelperWWW avant 1.0.169 — n'en fait pas une base). Base illisible (corrompue) ou
-    verrouillée : False — jamais présentée comme absente, l'erreur réelle reste visible (à la différence de `not
-    _db_has_schema`, vrai aussi sur une base illisible ou verrouillée). Ouverture mode=rw : ne crée jamais le fichier
-    (supprimé entre-temps) ; délai court : un verrou vaut False de toute façon."""
+def _conn_has_table(conn):
+    """1.0.171 (story 34, A57) : la connexion porte-t-elle au moins une TABLE (une vue, un index seuls n'en font pas une
+    base) ? Test unique des connexions déjà ouvertes (avertissement d'_open_db, archive_view_check, _create_schema)."""
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone() is not None
+
+def _db_probe(db_path,timeout=60):
+    """1.0.171 (story 34, A57) : état d'un fichier de base, sans jamais le créer -> ('absent'|'base'|'illisible', erreur|None).
+    absent : inexistant, de 0 octet (jamais ouvert : SQLite supprimerait un -wal orphelin, story 32) ou sans aucune table
+    (en-tête seul d'une création ratée, vue seule posée par l'ancien contrôle de vue de borgHelperWWW) ; base : au moins une
+    table ; illisible : corrompu, ou verrouillé au-delà de `timeout`. Ouverture mode=rw (ne recrée pas un fichier supprimé
+    entre-temps ; repli lecture seule sur un fichier 0444, mesuré)."""
+    db_path=os.fsdecode(db_path)
     try:
-        if not os.path.exists(db_path) or os.path.getsize(db_path)==0: return True
-    except OSError: return True
+        if os.stat(db_path).st_size==0: return 'absent',None
+    except FileNotFoundError: return 'absent',None
+    except OSError as e: return 'illisible',sqlite3.OperationalError(f"unable to open database file ({e.strerror})")   # dossier non traversable
     try:
         import pathlib
-        conn=sqlite3.connect(pathlib.Path(db_path).absolute().as_uri()+'?mode=rw',uri=True,timeout=_READER_WRITE_WAIT)
-        try: return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone() is None
+        conn=sqlite3.connect(pathlib.Path(db_path).absolute().as_uri()+'?mode=rw',uri=True,timeout=timeout)
+        try: return ('base' if _conn_has_table(conn) else 'absent'),None
         finally: conn.close()
-    except sqlite3.Error:
-        return False
+    except sqlite3.Error as e:
+        return 'illisible',e
+
+def _db_check_readonly(db_path,schema_version,what="l'index"):
+    """1.0.171 (revue story 34) : arrêts d'ensure_*_db sans rien écrire (-D, refus « ajouter -y ») — base illisible :
+    _db_schema_fail (DB corrompue / occupée / illisible, code 1) ; schéma plus récent que ce code : SchemaVersionError."""
+    st,err=_db_probe(db_path)
+    if st=='illisible': _db_schema_fail(db_path,err,what)
+    if st!='base': return
+    import pathlib
+    try:
+        c=sqlite3.connect(pathlib.Path(db_path).absolute().as_uri()+'?mode=rw',uri=True,timeout=60)
+        try: row=c.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()
+        finally: c.close()
+    except sqlite3.Error as e:
+        if 'no such table' in str(e).lower(): return
+        _db_schema_fail(db_path,e,what)
+    stored=int(row[0]) if row and str(row[0]).isdigit() else 0
+    if stored>schema_version:
+        raise SchemaVersionError(f"({db_path}) schéma DB v{stored} > attendu v{schema_version} — "
+                                 "DB créée par une version plus récente de borgHelper, mettez à jour borgHelper.")
+
+def _db_absent(db_path):
+    """1.0.170 (story 33) : base ABSENTE pour une commande (IdxTop, DiffTop, IdxPurge, Db*) ; illisible ou verrouillée :
+    False — jamais présentée comme absente, l'erreur réelle reste visible. Délai court : un verrou vaut False de toute façon.
+    1.0.171 : sur _db_probe."""
+    return _db_probe(db_path,_READER_WRITE_WAIT)[0]=='absent'
 
 def _db_has_schema(db_path):
-    """True si db_path contient au moins une table. _open_db(role='read') touche le fichier (0 octet)
-    même pour une simple lecture (permissions 0600 à la création) ; un fichier existant mais vide n'est
-    donc PAS une base créée — ensure_*_db(create=False) doit s'y fier plutôt qu'à os.path.exists (AD-12)."""
-    if not os.path.exists(db_path): return False
-    try:
-        conn=sqlite3.connect(db_path,timeout=60)
-        try: return conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is not None
-        finally: conn.close()
-    except sqlite3.Error:
-        return False
+    """True si db_path est une base (au moins une table, _db_probe). Un fichier existant mais vide ou sans table n'est pas une
+    base créée — ensure_*_db(create=False) doit s'y fier plutôt qu'à os.path.exists (AD-12). 1.0.171 : tables seulement
+    (une vue seule n'en fait plus une base : sinon née en clair), sans création ; illisible -> False (inchangé)."""
+    return _db_probe(db_path)[0]=='base'
 
 # ── BorgHelperDB — all SQLite operations ──────────────────────────────────────
 
@@ -2522,7 +2579,7 @@ class BorgHelperDB:
             try:
                 # 1.0.169 (revue story 32) : fichier sans table (0 octet laissé par l'O_CREAT d'un lecteur) : jamais de vue créée
                 # dessus — elle donnerait un schéma à une base pas encore née (plus de chiffrement d'office, A52 manqué)
-                if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone() is None: return 'empty'
+                if not _conn_has_table(conn): return 'empty'
                 st=self._archive_view_state(conn)
                 if repair and st in ('mismatch','absent'): self._repair_archive_view(conn)
                 return st
@@ -2657,7 +2714,7 @@ class BorgHelperDB:
         if conn.in_transaction: conn.commit()
         conn.execute("BEGIN IMMEDIATE")
         try:
-            fresh=conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None
+            fresh=not _conn_has_table(conn)   # 1.0.171 : tables seulement (une vue seule n'empêche plus l'en-tête)
             for st in script.split(';'):   # executescript validerait la transaction : instructions une à une
                 if st.strip(): conn.execute(st)
             done=fresh and conn.execute("INSERT INTO db_meta(key,value) VALUES('enc_header',?) ON CONFLICT(key) DO NOTHING",
@@ -3085,6 +3142,7 @@ class BorgHelperDB:
 
     def clear_cache_nick(self,nick,db_path=None):
         if db_path is None: db_path=self.get_cache_db(nick)
+        if _db_absent(db_path): return 0   # 1.0.171 : pas de cache, rien à vider — jamais un cache.db créé (Prune, DelBkp)
         try:
             conn=_open_db(db_path,nick=nick,role='write')
             cur=conn.execute("DELETE FROM cachejsonboexlm WHERE nom=? OR nom=?",(nick,f"{nick}:prune"))
@@ -4461,7 +4519,11 @@ class BorgHelper:
                 except (DbKeyError,DbModeError,DbTamperError,DbCodecError) as e:
                     printer(f"  [ERREUR] {nick}: {type(e).__name__}: {e}"); return 2
             return 0
-        self.db.ensure_diff_db(db_path)  # sans nick : schéma courant requis avant migration (migrations legacy d'abord, AD-7)
+        # sans nick : schéma courant requis avant migration (migrations legacy d'abord, AD-7) ; 1.0.171 (story 34, décision de
+        # l'utilisateur) : seulement avec -y sans -D — un dry-run (ou un refus « ajouter -y ») n'écrit rien, pas même une migration
+        # de schéma (rapport sur la base telle quelle)
+        if confirm and not dryrun: self.db.ensure_diff_db(db_path)   # sans nick
+        else: _db_check_readonly(db_path,DIFF_DB_SCHEMA_VERSION)   # revue : mêmes arrêts qu'ensure_diff_db (corrompue, occupée, schéma plus récent)
         cfg=self.borg.cfgread(nick)
         if direction=='encrypt' and not db_encrypt_enabled(nick,cfg=cfg):
             printer(f"  [ERREUR] {nick}: DB_ENCRYPT=false pour ce nick — {verb} refusé explicitement"); return 2
@@ -4490,13 +4552,16 @@ class BorgHelper:
                 printer(f"  [ERREUR] {nick}: migration en cours dans l'autre sens — relancer {other} pour la terminer"); conn.close(); return 2
         if not _check_disk_space(db_path):
             printer(f"  [ERREUR] {nick}: espace disque insuffisant pour {verb} (marge {_DB_SPACE_MARGIN:.0%} de {os.path.getsize(db_path):,} octets)"); conn.close(); return 2
-        counts={t:conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in _MIGRATE_TABLES}
+        def _count(t):   # 1.0.171 : base non migrée en -D — une table d'un schéma plus récent peut manquer (« ? »)
+            try: return f"{conn.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]:,}"
+            except sqlite3.OperationalError: return '?'
+        counts={t:_count(t) for t in ('snapshot_file','diff_index')}
         size=os.path.getsize(db_path)
         conn.close()
         if dryrun and confirm:
             printer(f"  {nick}: -D et -y sont exclusifs"); return 2
         if dryrun:
-            printer(f"  {nick}: {verb} -D — état actuel={cur_mode} · snapshot_file={counts['snapshot_file']:,} · diff_index={counts['diff_index']:,} · {convert_octets_readable(size)}")
+            printer(f"  {nick}: {verb} -D — état actuel={cur_mode} · snapshot_file={counts['snapshot_file']} · diff_index={counts['diff_index']} · {convert_octets_readable(size)}")
             printer(f"  {nick}: dry-run — aucune modification")
             return 0
         if not confirm:
@@ -4570,9 +4635,13 @@ class BorgHelper:
         faire sans."""
         cfg=self.borg.cfgread(nick)
         for label,path in (('cache.db',self.db.get_cache_db(nick)),('diff.db',self.db.get_diff_db(nick))):
-            if not _db_has_schema(path):   # 1.0.168 : fichier sans table (lookup d'un lecteur, O_CREAT) = pas une base
+            st,err=_db_probe(path,_READER_WRITE_WAIT)
+            if st=='illisible':   # 1.0.171 (story 34, décision de l'utilisateur) : jamais « absent » pour une base corrompue/occupée
+                printer(f"  {nick}: {label}: illisible ({err})"); continue
+            if st=='absent':   # 1.0.168 : fichier sans table (lookup d'un lecteur, O_CREAT) = pas une base
                 printer(f"  {nick}: {label}: absent"); continue
-            peek=sqlite3.connect(path)
+            import pathlib
+            peek=sqlite3.connect(pathlib.Path(path).absolute().as_uri()+'?mode=rw',uri=True)   # 1.0.171 : jamais créée (supprimée entre-temps)
             try:
                 try: raw=_enc_header_read(peek)
                 finally: peek.close()
@@ -4586,8 +4655,8 @@ class BorgHelper:
                         _warn_plain_db(nick,path)
                 except SystemExit: pass
         # history.db (1.0.139) : toujours en clair, par conception (aucun chemin) — jamais d'avertissement.
-        hist=self.db.get_history_db(nick)
-        printer(f"  {nick}: history.db: {'plain (aucun chemin, jamais chiffrée)' if os.path.exists(hist) else 'absent'}")
+        hist=self.db.get_history_db(nick); hst,herr=_db_probe(hist,_READER_WRITE_WAIT)   # 1.0.171 : mêmes états que les deux autres
+        printer(f"  {nick}: history.db: "+{'base':'plain (aucun chemin, jamais chiffrée)','absent':'absent'}.get(hst,f"illisible ({herr})"))
 
     @staticmethod
     def _known_archives(nick,conn):
@@ -4633,7 +4702,10 @@ class BorgHelper:
         current=set(current)
         hist=_history_path_for(db_path)
         shadow=_is_shadow(db_path)   # fantôme (1.0.143) : purge de ses tables seulement — ni figeage, ni mesures (AD-7)
-        diff_ok=os.path.exists(db_path) and _db_has_schema(db_path)
+        dst,derr=_db_probe(db_path,_READER_WRITE_WAIT)
+        if dst=='illisible':   # 1.0.171 (revue story 34) : jamais lue comme absente — sinon mesures de history.db retirées
+            printer(f"{nick}: rapprochement impossible ({db_path}) : {derr}"); return 0
+        diff_ok=dst=='base'
         measures=self.db.get_archive_measures(nick,hist) if not shadow and os.path.exists(hist) else {}
         known={k[0] for k in measures}; known_diff=set(); sweep=False; flag=f'reconcile_sweep:{nick}'
         try:
@@ -4770,8 +4842,10 @@ class BorgHelper:
         """Nettoyage après Prune : borg list + rapprochement (1.0.140, AD-9), puis compactage si des lignes sont parties.
         Tous les nicks, NOIDX compris ; une liste vide ne retire plus rien (effaçait tout l'index avant 1.0.140)."""
         db_path=self.db.get_diff_db(nick)
-        if not os.path.exists(db_path) and not os.path.exists(self.db.get_history_db(nick)): return
-        if os.path.exists(db_path): self.db.ensure_diff_db(db_path,nick=nick)
+        has_db=_db_probe(db_path,_READER_WRITE_WAIT)[0]!='absent'   # 1.0.171 : fichier vide/sans table = pas une base (Prune n'en crée
+        # plus) ; illisible : ensure_diff_db rend l'erreur réelle et arrête, history.db intacte (revue : jamais « absente »)
+        if not has_db and not os.path.exists(self.db.get_history_db(nick)): return
+        if has_db: self.db.ensure_diff_db(db_path,nick=nick)
         cfg=self.borg.cfgreaded(nick,debug=debug)
         rb=self.borg.boex(nick,['list','--json']+glob_args(cfg),debug=debug)
         try:
@@ -7971,8 +8045,10 @@ class BorgHelper:
     def prep_report_from_db(self,nick,maxp=None):
         """Comme prep_report() mais lit uniquement l'index SQLite — utilisé quand le dépôt est occupé."""
         db_path=self.db.get_diff_db(nick)
-        if not _db_has_schema(db_path):  # jamais indexé (AD-12) : _open_db peut avoir touché un fichier
-                                          # 0 octet sans schéma (autre commande de lecture) — pas une base
+        st,err=_db_probe(db_path,_READER_WRITE_WAIT)
+        if st=='illisible':   # 1.0.171 (story 34, décision de l'utilisateur) : erreur réelle, plus jamais « absent » (DB corrompue
+            _db_schema_fail(db_path,err,"l'index")   # ou occupée : _db_schema_fail ; report_offline en fait la ligne du nick, code 2)
+        if st=='absent':  # jamais indexé (AD-12) : fichier inexistant, vide ou sans table (ancienne lecture : 0 octet) — pas une base
             return {nick:{'nom':nick,'_msg':f"diff.db absent — lancez : borgHelper -c Index -n {nick}"}},{}
         self.db.ensure_diff_db(db_path,create=False)
         conn=_open_db(db_path,nick=nick,role='read',empty_ok=True)
@@ -8173,14 +8249,14 @@ class BorgHelper:
                     reshos[nick]={'nom':f"*** {nick}",'duree':'—','depuis':'—','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {err_msg}"}
                 resbck[nick]={}; continue
             if '_msg' in tcmpl.get(nick,{}):
-                errcode=1
+                errcode=max(errcode,1)   # 1.0.171 (revue story 34) : jamais un 2 d'un nick précédent écrasé
                 if htrep: errhost.append(nick)
                 reshos[nick]=tcmpl[nick] if htrep else {'nom':f"*** {nick}",'duree':tcmpl[nick]['_msg'],'depuis':'','derniere':'','taille':'','recuperable':'','reste':'','modifications':''}
                 resbck[nick]={}; continue
             maxage=25
             if "MAX_AGE_BKP" in cfg: maxage=float(cfg["MAX_AGE_BKP"])
             if tcmpl[nick]['depuis']>maxage:
-                errcode=1
+                errcode=max(errcode,1)
                 if htrep: errhost.append(nick)
                 else: tcmpl[nick]['nom']=f"***{nick}"
             for i in ['duree','derniere','taille','recuperable']: reshosto[i]+=(tcmpl[nick][i] or 0)
@@ -8262,7 +8338,7 @@ class BorgHelper:
             self.db.clear_report_running_lock(nick)
             if tcmpl[nick].get('duree')==-1:
                 # dépôt vide (c==0) : aucune archive borg → alerte systématique
-                errcode=1
+                errcode=max(errcode,1)
                 if htrep: errhost.append(nick)
                 else: tcmpl[nick]['nom']=f"*** {nick}"
                 tcmpl[nick]['depuis']='—'; tcmpl[nick]['duree']='—'; tcmpl[nick]['derniere']='—'
@@ -8274,7 +8350,7 @@ class BorgHelper:
             maxage=25
             if "MAX_AGE_BKP" in cfg: maxage=float(cfg["MAX_AGE_BKP"])
             if tcmpl[nick]['depuis']>maxage:
-                errcode=1
+                errcode=max(errcode,1)
                 if htrep: errhost.append(nick)
                 else: tcmpl[nick]['nom']=f"***{nick}"
             for i in ['duree','derniere','taille','recuperable']: reshosto[i]+=(tcmpl[nick][i] or 0)
@@ -9460,7 +9536,7 @@ def codec_selftest(pattern=None,list_only=False):
         def _perm_new():
             b=BorgHelper(cfgfile=rc,cache_dir=cdir)
             b.borg.cfgwrite('n','srv','pw','/repo',None)
-            c=_open_db(os.path.join(cdir,'new.db'),nick=None); c.close()
+            c=_open_db(os.path.join(cdir,'new.db'),nick=None,role='write'); c.close()   # 1.0.171 : un lecteur ne crée plus
             return (_mode(rc),_mode(cdir),_mode(os.path.join(cdir,'new.db')))==(0o600,0o700,0o600)
         check("permissions : rc 0600, cache 0700, .db 0600 à la création",_perm_new)
         def _perm_existing():
@@ -10096,9 +10172,16 @@ def codec_selftest(pattern=None,list_only=False):
                 g['_BORG_VERSION_TIMEOUT']=to
                 if old_sock is None: os.environ.pop('SSH_AUTH_SOCK',None)
                 else: os.environ['SSH_AUTH_SOCK']=old_sock
+            # 1.0.171 (story 34, run complet) : SIGKILL asynchrone et orphelin récolté par init plus tard — mesuré 7/20 « vivants »
+            # juste après le délai (6 zombies), sans charge : attente bornée, un zombie compte comme mort
+            alive=False
             try:
                 with open(pidf) as f: spid=int(f.read())
-                os.kill(spid,0); alive=True
+                for _ in range(30):
+                    try: alive=open(f'/proc/{spid}/stat').read().rsplit(')',1)[1].split()[0]!='Z'
+                    except OSError: alive=False
+                    if not alive: break
+                    time.sleep(0.1)
             except (OSError,ValueError): alive=False
             ok=(res['tunnel']==('1.2.4',None) and res['tunnel-loin'][0] is None and 'autre machine' in (res['tunnel-loin'][1] or '')
                 and res['ssh']==('1.4.1',None) and a1==['-p','2222','u@h','borg','--version']
@@ -12677,6 +12760,255 @@ def codec_selftest(pattern=None,list_only=False):
             if not ok: print(f"  code {r.returncode} ; {(r.stdout+r.stderr)[-300:]!r}")
             return ok
         check("nick sans base : DbRekey multi-nicks -> code de sortie = le pire des nicks",_nobase_worst)
+        # 1.0.171 (story 34, A56/A57/A58) : lecteur sans création, prédicat unique de base, dry-run sans écriture
+        def _cache_snap(d):
+            """Empreinte de CACHE_DIR : {fichier: (taille, sha256)} (les -wal/-shm compris)."""
+            c=os.path.join(d,'cache'); out={}
+            for f in (sorted(os.listdir(c)) if os.path.isdir(c) else ()):
+                fp=os.path.join(c,f)
+                if os.path.isfile(fp): out[f]=(os.path.getsize(fp),hashlib.sha256(open(fp,'rb').read()).hexdigest())
+            return out
+        def _v10(p):
+            """Base courante ramenée au palier 10 (UNIQUE(nick,path), version 10) — schéma qu'un Index/lecteur migre."""
+            c=sqlite3.connect(p,isolation_level=None)
+            c.executescript("BEGIN; DROP VIEW archive_snapshot_v;"
+                "CREATE TABLE sf10 (id INTEGER PRIMARY KEY AUTOINCREMENT, nick TEXT NOT NULL, path TEXT NOT NULL, size INTEGER,"
+                " mtime TEXT, type TEXT, mode TEXT, owner TEXT, UNIQUE(nick, path));"
+                "INSERT INTO sf10 SELECT id,nick,path,size,mtime,type,mode,owner FROM snapshot_file;"
+                "DROP TABLE snapshot_file; ALTER TABLE sf10 RENAME TO snapshot_file;"
+                "UPDATE db_meta SET value='10' WHERE key='schema_version';"+_ARCHIVE_SNAPSHOT_V_SQL+"; COMMIT;")
+            c.close()
+        def _nocreate_readers():
+            """A56 : chaque lecteur sur un nick sans base (fichier inexistant) : sortie, code et valeur rendue identiques à ceux d'un
+            fichier de 0 octet (ce que l'O_CREAT d'avant 1.0.171 créait aussitôt, donc la réponse d'avant ; RepoHistory et
+            ArchiveHistory testaient déjà l'existence : « diff.db absent ») ; aucun fichier créé
+            (diff.db, cache.db, history.db, -wal, -shm) ; _open_db(role='read') direct : chemin str et bytes, fichier supprimé entre le
+            test d'existence et l'ouverture -> base vide en mémoire, rien créé ; écrivain : création 0600 inchangée."""
+            d,b=_nb_env('nocreate'); p=b.db.get_diff_db('zb'); q=b.db.get_cache_db('zb'); os.makedirs(os.path.dirname(p),exist_ok=True)
+            rd=(('Search',lambda: b.search('zb','x')),('Search -j',lambda: b.search('zb','x',as_json=True)),
+                ('FileHist',lambda: b.filehist('zb','/x')),('TreeHist',lambda: b.treehist('zb')),('TreeHist -j',lambda: b.treehist('zb',as_json=True)),
+                ('TreeFind',lambda: b.treefind('zb')),('DuIdx',lambda: b.duidx('zb')),('DuIdx -j',lambda: b.duidx('zb',as_json=True)),
+                ('CacheInfo',lambda: b.cache_info('zb')),('IdxTop',lambda: b.idxtop('zb')),('DiffTop',lambda: b.difftop('zb')),
+                ('RepoHistory',lambda: b.repo_history('zb')),('ArchiveHistory',lambda: b.archive_history('zb')),
+                ('Report -o',lambda: b.report_offline('zb',as_json=True)),('CacheList',lambda: b.db.get_cache_rows('zb')),('Report -o texte',lambda: b.report_offline('zb')),('DbStatus',lambda: b.db_status('zb')))
+            diff={}; made={}
+            for lbl,fn in rd:
+                for f in os.listdir(os.path.dirname(p)): os.unlink(os.path.join(os.path.dirname(p),f))
+                a=_wk_run(fn); made[lbl]=sorted(os.listdir(os.path.dirname(p)))
+                if lbl in ('RepoHistory','ArchiveHistory'):   # testent l'existence avant d'ouvrir : « absent » déjà avant 1.0.171
+                    if 'zb: diff.db absent' not in a[0]: diff[lbl]=(a,a)
+                    continue
+                open(p,'w').close(); open(q,'w').close(); z=_wk_run(fn)
+                if a!=z: diff[lbl]=(a,z)
+            for f in os.listdir(os.path.dirname(p)): os.unlink(os.path.join(os.path.dirname(p),f))
+            ok_direct=[]
+            for path in (p,os.fsencode(p)):
+                c=_open_db(path,role='read')
+                try: ok_direct.append(c.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]==0)
+                finally: c.close()
+            real=os.path.exists; seen=[]
+            def gone(x):   # 1er test : présent, puis supprimé avant l'ouverture
+                if os.fsdecode(x)==p and not seen: seen.append(1); return True
+                return real(x)
+            with mock.patch('os.path.exists',gone):
+                c=_open_db(p,role='read'); c.close()
+            ok_direct.append(not os.listdir(os.path.dirname(p)))
+            w=_open_db(p,role='write'); w.close(); ok_direct.append(stat.S_IMODE(os.stat(p).st_mode)==0o600)
+            # dossier absent : erreur réelle comme avant (jamais une base vide qui la masque)
+            try: _open_db(os.path.join(d,'nulle','x.db'),role='read').close(); ok_direct.append(False)
+            except sqlite3.OperationalError: ok_direct.append(True)
+            # base existante (siv1, WAL) lue : dossier inchangé (mode=rw ; mode=ro y laisserait -wal/-shm)
+            os.unlink(p); e=io.StringIO()
+            with contextlib.redirect_stdout(e),contextlib.redirect_stderr(e): b.db.ensure_diff_db(p,nick='zb')
+            before=_cache_snap(d); _wk_run(lambda: b.search('zb','x')); ok_direct.append(_cache_snap(d)==before)
+            # fichier présent mais illisible (droits, sauté en root) : erreur réelle, jamais une base vide (sonde de mode de WWW)
+            if os.geteuid()!=0:
+                os.chmod(p,0)
+                try:
+                    try: _open_db(p,role='read').close(); ok_direct.append(False)
+                    except sqlite3.OperationalError: ok_direct.append(True)
+                finally: os.chmod(p,0o600)
+            # vue seule : lecteur sans [WARN] « non chiffrée », fichier inchangé
+            os.unlink(p); c=sqlite3.connect(p); c.execute("CREATE VIEW v AS SELECT 1"); c.commit(); c.close()
+            _PLAIN_WARNED.clear(); before=_cache_snap(d); o=_wk_run(lambda: b.search('zb','x'))[0]
+            ok_direct.append('non chiffrée' not in o and _cache_snap(d)==before)
+            ok=not diff and not any(made.values()) and all(ok_direct)
+            if not ok: print(f"  différences {list(diff)} {[(k,v[0][0][-150:],v[1][0][-150:]) for k,v in list(diff.items())[:2]]} ; créés {[(k,v) for k,v in made.items() if v]} ; direct {ok_direct}")
+            return ok
+        check("sans création : lecteurs sur un nick sans base -> même réponse qu'un fichier vide, aucun fichier créé ; _open_db lecture str/bytes/course",_nocreate_readers)
+        def _probe_states():
+            """A57 : _db_probe sur chaque état — absent (inexistant, 0 octet, en-tête seul, vue seule ; dossier absent), base (une table),
+            illisible (corrompu ; verrou exclusif au-delà du délai) ; jamais de fichier créé ; wrappers _db_absent/_db_has_schema
+            alignés ; même réponse « table » d'_held_before, archive_view_check et _create_schema : une vue seule n'empêche pas la base
+            de naître chiffrée (siv1, sans [WARN] « non chiffrée »)."""
+            d,b=_nb_env('probe'); p=b.db.get_diff_db('zb'); os.makedirs(os.path.dirname(p),exist_ok=True); res={}
+            def clear():
+                for f in (p,p+'-wal',p+'-shm'):
+                    if os.path.exists(f): os.unlink(f)
+            def mk(sql=None,wal=False):
+                c=sqlite3.connect(p)
+                if wal: c.execute("PRAGMA journal_mode=WAL")
+                if sql: c.execute(sql)
+                c.commit(); c.close()
+            states=(('inexistant',lambda: None,'absent'),('0 octet',lambda: open(p,'w').close(),'absent'),
+                    ('en-tête',lambda: mk(wal=True),'absent'),('vue seule',lambda: mk("CREATE VIEW v AS SELECT 1"),'absent'),
+                    ('base',lambda: mk("CREATE TABLE t(x)"),'base'),
+                    ('corrompu',lambda: open(p,'wb').write(b'garbage'*600),'illisible'))
+            res['dossier absent']=_db_probe(os.path.join(d,'nulle','x.db'))==('absent',None) and _db_probe(os.fsencode(p+'-x'))==('absent',None)
+            if os.geteuid()!=0:   # dossier non traversable : illisible (sonde), erreur réelle (lecteur) — jamais absent ni base vide
+                nd=os.path.join(d,'ferme'); os.makedirs(nd); open(os.path.join(nd,'x.db'),'w').close(); os.chmod(nd,0)
+                try:
+                    st0=_db_probe(os.path.join(nd,'x.db'))[0]
+                    try: _open_db(os.path.join(nd,'x.db'),role='read').close(); rd0=False
+                    except sqlite3.OperationalError: rd0=True
+                    res['dossier fermé']=st0=='illisible' and rd0
+                finally: os.chmod(nd,0o700)
+            for name,make,want in states:
+                clear(); make(); st,err=_db_probe(p)
+                res[name]=(st==want and (err is None)==(want!='illisible') and _db_absent(p)==(want=='absent')
+                           and _db_has_schema(p)==(want=='base') and (name!='inexistant' or not os.path.exists(p)))
+            clear(); mk("CREATE TABLE t(x)"); h=sqlite3.connect(p); h.execute("BEGIN EXCLUSIVE")   # journal classique : en WAL un lecteur passe
+            try: st,err=_db_probe(p,timeout=0.2); res['verrouillé']=st=='illisible' and 'locked' in str(err)
+            finally: h.rollback(); h.close()
+            clear(); mk("CREATE VIEW v AS SELECT 1"); open(p+'-shm','w').close(); res['held vue']=_held_before(p)
+            res['vue check']=b.db.archive_view_check(p,repair=True)=='empty'
+            os.unlink(p+'-shm'); e=io.StringIO()
+            with contextlib.redirect_stdout(e),contextlib.redirect_stderr(e): b.db.ensure_diff_db(p,nick='zb'); _open_db(p,nick='zb',role='read').close()
+            res['vue -> siv1']=_ne_mode(p)=='siv1' and 'non chiffrée' not in e.getvalue()
+            ok=all(res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("état de base : absent/0 octet/en-tête/vue = absent, table = base, corrompu/verrouillé = illisible ; vue seule -> base née chiffrée",_probe_states)
+        def _probe_corrupt_cmds():
+            """Décision de l'utilisateur (story 34) : diff.db corrompue -> Report -o (CLI, texte et -j) : ligne du nick en erreur au
+            message réel (« DB corrompue … not a database »), code 2, jamais « absent » ; plusieurs nicks (zb corrompue, zr sans base,
+            dans les deux ordres) : code 2, le pire ; DbStatus « diff.db: illisible (…) » ; DbEncrypt -D / sans -y : arrêt d'ensure_diff_db
+            comme avant (« DB corrompue », code 1). Droits refusés (fichier 000 ; sauté en root) : « DB illisible … ne PAS supprimer »,
+            jamais « Supprimez », Report -o code 2 (décision de l'utilisateur, revue)."""
+            d,b=_nb_env('probecorrupt'); p=b.db.get_diff_db('zb'); os.makedirs(os.path.dirname(p),exist_ok=True)
+            with open(p,'wb') as f: f.write(b'garbage'*600)
+            nodsn=os.path.join(tmp,'sentry-vide'); open(nodsn,'w').close()
+            env=dict(os.environ,BORGHELPERC_SENTRY_FILE=nodsn); env.pop('BORGHELPERC_SENTRY_DSN',None); res={}
+            def cli(*a):
+                r=subprocess.run([sys.executable,os.path.realpath(__file__),'-C',os.path.join(d,'rc')]+list(a),
+                                 capture_output=True,text=True,env=env,timeout=120,stdin=subprocess.DEVNULL)
+                return r.returncode,r.stdout+r.stderr
+            for lbl,extra in (('texte',[]),('-j',['-j']),('zb,zr',['-n','zb,zr']),('zr,zb',['-n','zr,zb'])):
+                code,o=cli('-c','Report','-o',*(extra if extra[:1]==['-n'] else ['-n','zb']+extra))
+                res[lbl]=(code==2 and 'DB corrompue' in o and 'not a database' in o and 'zb: diff.db absent' not in o and 'Traceback' not in o,code,o[-200:])
+            st=_wk_run(lambda: b.db_status('zb'))[0]
+            res['DbStatus']=('zb: diff.db: illisible (' in st and 'diff.db: absent' not in st,st)
+            for lbl,fn in (('DbEncrypt -D',lambda: b.db_encrypt('zb',dryrun=True)),('DbDecrypt',lambda: b.db_decrypt('zb'))):
+                o,code,_=_wk_run(fn); res[lbl]=(code==1 and 'DB corrompue' in o and 'Supprimez' in o,code,o[-200:])
+            if os.geteuid()!=0:
+                os.unlink(p); ens=io.StringIO()
+                with contextlib.redirect_stdout(ens),contextlib.redirect_stderr(ens): b.db.ensure_diff_db(p,nick='zb')
+                os.chmod(p,0)
+                try:
+                    code,o=cli('-c','Report','-o','-n','zb'); st=_wk_run(lambda: b.db_status('zb'))[0]
+                    res['droits Report']=(code==2 and 'DB illisible' in o and 'ne PAS supprimer' in o and 'Supprimez' not in o,code,o[-200:])
+                    res['droits DbStatus']=('zb: diff.db: illisible (' in st,st)
+                finally: os.chmod(p,0o600)
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("état de base : diff.db corrompue -> Report -o erreur réelle code 2 (plusieurs nicks : le pire), DbStatus « illisible », Db* -D comme avant ; droits : message dédié",_probe_corrupt_cmds)
+        def _probe_locked_cmds():
+            """Base occupée (verrou tenu au-delà du délai, simulé) : Report -o « DB occupée », jamais « absent » ni « Supprimez » ;
+            DbStatus « illisible (database is locked) » ; DbEncrypt -D « DB occupée », code 1 (avant 1.0.171 : par ensure_diff_db ;
+            sans lui, trace Python). Schéma plus récent que ce code (v99) : DbEncrypt -D et sans -y -> SchemaVersionError, comme -y."""
+            d,b=_nb_env('probelocked'); p=b.db.get_diff_db('zb'); os.makedirs(os.path.dirname(p),exist_ok=True); res={}
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db.ensure_diff_db(p,nick='zb')
+            real=_db_probe
+            fake=lambda path,timeout=60: (('illisible',sqlite3.OperationalError('database is locked')) if os.fsdecode(path)==p else real(path,timeout))
+            with mock.patch.dict(globals(),{'_db_probe':fake}):
+                o=_wk_run(lambda: b.report_offline('zb'))
+                res['Report -o']=('DB occupée' in o[0] and 'absent' not in o[0] and 'Supprimez' not in o[0] and o[2]==2,o[0][-200:],o[2])
+                o=_wk_run(lambda: b.db_status('zb'))[0]; res['DbStatus']=('zb: diff.db: illisible (database is locked)' in o,o)
+                o=_wk_run(lambda: b.db_encrypt('zb',dryrun=True)); res['DbEncrypt -D']=(o[1]==1 and 'DB occupée' in o[0],o[0][-200:])
+            c=sqlite3.connect(p); c.execute("UPDATE db_meta SET value='99' WHERE key='schema_version'"); c.commit(); c.close()
+            for lbl,fn in (('v99 -D',lambda: b.db_encrypt('zb',dryrun=True)),('v99 sans -y',lambda: b.db_decrypt('zb'))):
+                try: _wk_run(fn); res[lbl]=(False,'pas d\'erreur')
+                except SchemaVersionError as e: res[lbl]=('v99' in str(e),str(e))
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("état de base : base occupée (Report -o, DbStatus, DbEncrypt -D) et schéma plus récent (Db* -D, sans -y) -> arrêts réels",_probe_locked_cmds)
+        def _dryrun_nowrite():
+            """A58 (décision de l'utilisateur : un dry-run n'écrit jamais) : chaque commande -D ou aperçu de CACHE_DIR — IdxPurge -D
+            (tout, -x), DbEncrypt/DbDecrypt -D, sans -y, -D -y, DbRekey sans -y — × chaque état de diff.db (absent, 0 octet, en-tête
+            seul, vue seule, courante siv1, courante en clair, palier 10 siv1 et en clair, corrompue, table étrangère, en clair avec lignes ; cache.db
+            courante à côté) :
+            CACHE_DIR inchangé (empreintes avant/après, -wal/-shm compris). Hors contrôle (décision de l'utilisateur, limite
+            documentée) : trames WAL non reportées (processus tué), reportées par SQLite à la fermeture de toute connexion. Une exception (base corrompue) est une erreur réelle,
+            pas une écriture. Rapport -D sur la base telle quelle : palier 10 lu, table absente « ? », code 0."""
+            d,b=_nb_env('dryrun'); p=b.db.get_diff_db('zb'); q=b.db.get_cache_db('zb'); c=os.path.dirname(p); os.makedirs(c,exist_ok=True)
+            quiet=lambda: (contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()))
+            def ens(path,nick):
+                o,e=quiet()
+                with o,e: (b.db.ensure_diff_db if path==p else b.db.ensure_cache_db)(path,**({'nick':nick} if nick else {}))
+            def mk(sql=None,wal=False):
+                x=sqlite3.connect(p)
+                if wal: x.execute("PRAGMA journal_mode=WAL")
+                if sql: x.execute(sql)
+                x.commit(); x.close()
+            states=(('absent',lambda: None),('0 octet',lambda: open(p,'w').close()),('en-tête',lambda: mk(wal=True)),
+                    ('vue',lambda: mk("CREATE VIEW v AS SELECT 1")),('siv1',lambda: ens(p,'zb')),('clair',lambda: ens(p,None)),
+                    ('palier 10 siv1',lambda: (ens(p,'zb'),_v10(p))),('palier 10 clair',lambda: (ens(p,None),_v10(p))),
+                    ('corrompue',lambda: open(p,'wb').write(b'garbage'*600)),('table étrangère',lambda: mk("CREATE TABLE t(x)")),('clair + lignes',lambda: (ens(p,None),mk(
+                        "INSERT INTO diff_index(nick,archive_old,archive_new,change_type,path) VALUES('zb','a','b','added','/v/x.log')"))))
+            cmds=(('IdxPurge -D',lambda: b.idxpurge('zb',dryrun=True)),('IdxPurge -D -x',lambda: b.idxpurge('zb',pattern='*.log',dryrun=True)),
+                  ('DbEncrypt -D',lambda: b.db_encrypt('zb',dryrun=True)),('DbDecrypt -D',lambda: b.db_decrypt('zb',dryrun=True)),
+                  ('DbEncrypt',lambda: b.db_encrypt('zb')),('DbDecrypt',lambda: b.db_decrypt('zb')),
+                  ('DbEncrypt -D -y',lambda: b.db_encrypt('zb',dryrun=True,confirm=True)),('DbDecrypt -D -y',lambda: b.db_decrypt('zb',dryrun=True,confirm=True)),
+                  ('DbRekey',lambda: b.db_rekey('zb')))
+            bad=[]; seen=0; outs={}
+            for sname,make in states:
+                for lbl,fn in cmds:
+                    for f in os.listdir(c): os.unlink(os.path.join(c,f))
+                    ens(q,'zb'); make(); before=_cache_snap(d)
+                    try: outs[(lbl,sname)]=_wk_run(fn)
+                    except (DbKeyError,DbModeError,DbTamperError,DbCodecError,sqlite3.Error) as e: outs[(lbl,sname)]=(f"{type(e).__name__}: {e}",None,None)
+                    seen+=1
+                    if _cache_snap(d)!=before: bad.append(f"{lbl} × {sname}")
+            # rapport sur la base telle quelle (non migrée) : palier 10 lu, table d'un schéma plus récent absente -> « ? », code 0
+            rep={k:(outs[k][2]==0 and 'aucune modification' in outs[k][0] and want in outs[k][0]) for k,want in
+                 ((('DbEncrypt -D','palier 10 clair'),'état actuel=plain'),(('DbDecrypt -D','palier 10 siv1'),'état actuel=siv1'),
+                  (('DbEncrypt -D','table étrangère'),'snapshot_file=? · diff_index=?'))}
+            ok=not bad and seen==len(states)*len(cmds) and all(rep.values())
+            if not ok: print(f"  écritures : {bad} ; rapports {rep} {[outs[k][0][-160:] for k in rep]}")
+            return ok
+        check("dry-run sans écriture : chaque -D/aperçu (IdxPurge, DbEncrypt, DbDecrypt, DbRekey) × chaque état de diff.db -> CACHE_DIR inchangé",_dryrun_nowrite)
+        def _prune_nocreate():
+            """Nettoyage après Prune (_cleanup_index_after_prune) : diff.db de 0 octet ou vue seule, history.db absente -> rien créé ;
+            history.db présente, borg list en échec -> diff.db jamais créée (avant : ensure_diff_db sur un fichier vide = base créée)."""
+            d,b=_nb_env('prunenc'); p=b.db.get_diff_db('zb'); c=os.path.dirname(p); os.makedirs(c,exist_ok=True); res={}
+            for name,make in (('0 octet',lambda: open(p,'w').close()),
+                              ('vue',lambda: (lambda x: (x.execute("CREATE VIEW v AS SELECT 1"),x.commit(),x.close()))(sqlite3.connect(p)))):
+                for f in os.listdir(c): os.unlink(os.path.join(c,f))
+                make(); before=_cache_snap(d); _wk_run(lambda: b._cleanup_index_after_prune('zb')); res[name]=_cache_snap(d)==before
+            for f in os.listdir(c): os.unlink(os.path.join(c,f))
+            open(p,'w').close(); h=b.db.get_history_db('zb')
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db.ensure_history_db(h)
+            with mock.patch.object(b.borg,'boex',lambda *a,**k: {'stdout':[],'stderr':[],'rc':2}), \
+                 mock.patch.object(b.borg,'_boex_check_stdout',mock.Mock(side_effect=RuntimeError('borg list en échec'))):
+                _wk_run(lambda: b._cleanup_index_after_prune('zb'))
+            res['history']=os.path.getsize(p)==0
+            # revue : diff.db corrompue + mesure dans history.db -> arrêt réel (« DB corrompue », code 1), mesure gardée ; rapprochement
+            # direct : « rapprochement impossible », rien retiré (avant correctif : base lue comme absente, mesure de a1 supprimée)
+            with open(p,'wb') as f: f.write(b'garbage'*600)
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                b.db.store_archive_measure('zb','a1','2026-01-01T00:00:00',10,0,0,db_path=h)
+            o=_wk_run(lambda: b._cleanup_index_after_prune('zb'))
+            res['corrompue prune']=o[1]==1 and 'DB corrompue' in o[0]
+            o=_wk_run(lambda: b._reconcile_archives('zb',p,['a2']))
+            res['corrompue rapprochement']=o[2]==0 and 'rapprochement impossible' in o[0] and set(k[0] for k in b.db.get_archive_measures('zb',h))=={'a1'}
+            # clear_cache_nick (Prune, DelBkp) : pas de cache -> rien créé
+            q=b.db.get_cache_db('zb'); res['cache non créé']=b.db.clear_cache_nick('zb')==0 and not os.path.exists(q)
+            ok=all(res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("sans création : nettoyage après Prune sur fichier vide/vue seule -> aucune base créée ; base corrompue -> arrêt, history.db gardée",_prune_nocreate)
         # 1.0.169 (story 32, A52) : base supprimée alors qu'un autre processus la tient encore ouverte
         def _held_recreate():
             """Vrai tenant (sous-processus) : base WAL avec trames non reportées, supprimée -> recréation : message dédié (jamais

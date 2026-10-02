@@ -1885,7 +1885,8 @@ jamais écrit).
 
 **`_db_has_schema(db_path)`** — pourquoi ce n'est pas `os.path.exists`. `_open_db` crée toujours le fichier en `0600`
 (`os.open(..., O_CREAT)`) dès qu'il est appelé, y compris en simple lecture (`role='read'`) — un comportement
-préexistant, hors périmètre de cette story. Un nick jamais indexé peut donc déjà avoir un fichier `.db` de 0 octet
+préexistant, hors périmètre de cette story (corrigé en 1.0.171 : un lecteur ne crée plus rien ; les fichiers déjà laissés
+restent). Un nick jamais indexé peut donc déjà avoir un fichier `.db` de 0 octet
 après une première commande de lecture (ex. `TreeHist`), laissé par cette ouverture. `os.path.exists` seul aurait fait
 prendre ce fichier vide pour une base réelle dès la commande de lecture suivante, et `ensure_*_db(create=False)`
 aurait alors silencieusement recréé tout le schéma — exactement le bug que cette story corrige. `_db_has_schema` teste
@@ -2200,7 +2201,33 @@ seule n'en fait pas une base) ; ouverture `mode=rw` (ne crée jamais le fichier)
 verrouillée -> False (erreur réelle visible, à la différence de `not _db_has_schema`). Garde d'IdxTop, DiffTop (jumelles),
 IdxPurge, DbEncrypt/DbDecrypt (`_db_migrate`, avant `ensure_diff_db` qui créerait le schéma ; verrous d'opération d'abord ;
 avec `-y`, `_db_migrate_cache` quand même — décision de l'utilisateur), `_db_migrate_cache` et DbRekey. Boucles Db* de
-`main` : pire code. Report -o reste sur `_db_has_schema` (inchangé).
+`main` : pire code. Report -o reste sur `_db_has_schema` (1.0.171 : `_db_probe`, ci-dessous).
+**Lecteurs sans création, état de base unique (1.0.171, story 34, A56/A57)** : `_open_db(role='read')` n'ouvre plus en
+`O_CREAT` — fichier inexistant (ou supprimé entre le test et l'ouverture) : connexion `:memory:` (mêmes « no such table »
+qu'un fichier vide : réponse des lecteurs inchangée, mesurée sur 21 commandes) ; fichier existant : URI `mode=rw` (ne
+recrée pas un fichier supprimé ; repli lecture seule sur un fichier 0444, comme avant ; `mode=ro` laisserait `-wal`/`-shm`).
+`write`/`admin` : `O_CREAT` 0600 inchangé. Un seul prédicat : `_db_probe(p, timeout)` -> `absent` (inexistant, 0 octet sans
+ouverture, aucune TABLE), `base` (au moins une table), `illisible` (erreur SQLite : corrompue, verrou au-delà du délai) ; sur
+une connexion déjà ouverte : `_conn_has_table(conn)` (`type='table'`) — avertissement AD-6 d'`_open_db`,
+`archive_view_check` (`empty`), `_create_schema` (`fresh` : une vue seule n'empêche plus l'en-tête siv1). Wrappers gardés :
+`_db_absent` (délai court), `_db_has_schema` (`base` seulement), `_held_before` (via `_db_has_schema`). `prep_report_from_db`
+et `db_status` distinguent `illisible` : Report -o -> `_db_schema_fail` (ligne du nick en erreur, code 2, décision de
+l'utilisateur), DbStatus -> « illisible (…) ». `_cleanup_index_after_prune` : `_db_has_schema` au lieu de `os.path.exists`.
+Gardes 1.0.168-1.0.170 conservées : des fichiers de 0 octet restent sur les disques. Revue : `_file_gone` (stat
+« inexistant » ET dossier présent) décide la base vide en mémoire — dossier absent ou non traversable : l'erreur réelle
+de l'ouverture, comme avant ; fichier présent mais refusé : erreur relancée. `_db_probe` : dossier non traversable ->
+`illisible`. `_db_perm(e)` (« unable to open database file », « readonly database », « permission denied ») -> message
+« DB illisible … ne PAS supprimer » de `_db_schema_fail` (décision de l'utilisateur). Report -o et DbStatus sondent avec
+`_READER_WRITE_WAIT` (2 s, comme les lecteurs). `report`/`report_offline` : `errcode=max(…)`. `_cleanup_index_after_prune` :
+`illisible` passe par `ensure_diff_db` (arrêt réel) ; `_reconcile_archives` : diff.db `illisible` -> « rapprochement
+impossible », rien retiré (sinon mesures de history.db retirées, R1 mesuré). `clear_cache_nick` : `_db_absent` -> 0, rien
+créé. DbStatus : en-tête lu en `mode=rw`, history.db sondée.
+**Dry-run sans écriture (1.0.171, A58, décision de l'utilisateur)** : `_db_migrate` n'appelle `ensure_diff_db` (migration
+de schéma) qu'avec `-y` sans `-D` ; `-D` et le refus « ajouter -y » lisent la base telle quelle (compte `?` si une table
+manque) ; `_db_check_readonly` y garde les arrêts d'`ensure_diff_db` sans écrire (illisible -> `_db_schema_fail`, schéma
+plus récent -> `SchemaVersionError`). Limite (décision de l'utilisateur) : trames WAL non reportées (processus tué) reportées par
+SQLite à la fermeture de toute connexion, -D compris — contenu identique, mtime changé. Contrôle générique « dry-run sans écriture » : IdxPurge -D (tout, `-x`), DbEncrypt/DbDecrypt (-D, sans -y, -D -y),
+DbRekey sans -y × 11 états -> empreintes de CACHE_DIR inchangées. BorgCleanup -D (hors CACHE_DIR) : contrôles BorgCleanup.
 **Base recréée tenue ailleurs (1.0.169, A52)** — mesuré (SQLite 3.37.2) : un `-wal`/`-shm` orphelin (processus tué) n'est
 jamais rejoué quand la base est recréée, fichier principal absent ou vide (l'ancien WAL est jeté au passage en WAL) ;
 mais un processus qui tient encore l'ancienne base (trames WAL non reportées) fait échouer la recréation en

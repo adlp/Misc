@@ -1,5 +1,43 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.171 — lecteurs sans création de fichier, état de base unique, dry-run sans écriture — 2026-10-01
+
+Chantier « reconstruction progressive », story 34 (actions de rétrospective A56, A57, A58 ; regroupement demandé par
+l'utilisateur).
+
+- **Lecteurs** (Search, FileHist, TreeHist, TreeFind, DuIdx, CacheInfo, lookups du cache…) : ne créent plus de fichier.
+  Avant, chaque lecture d'un nick jamais indexé laissait un `diff.db`/`cache.db` de 0 octet (cause des correctifs
+  1.0.168-1.0.170). Réponse inchangée. Les fichiers de 0 octet déjà présents sur les disques restent traités comme une
+  base absente.
+- **Un seul test « est-ce une base ? »** pour toutes les commandes : absente (inexistante, 0 octet, aucune table — en-tête
+  seul, vue seule), base (au moins une table), illisible (corrompue, ou verrouillée au-delà du délai). Un fichier « vue
+  seule » (posé par le contrôle de vue de borgHelperWWW avant 1.0.169) ne fait plus naître une base en clair, et le
+  nettoyage après Prune ne crée plus de base sur un fichier vide.
+- **diff.db corrompue** (décision de l'utilisateur) : `Report -o` affiche la ligne du nick en erreur avec le message réel
+  (« ⚠ DB corrompue … file is not a database »), code 2 — avant : « diff.db absent — lancez Index », code 1. `DbStatus` :
+  « diff.db: illisible (…) » au lieu de « absent » ; history.db suit les mêmes états. Report -o sur plusieurs nicks : code de
+  sortie = le pire (avant : un nick suivant sans base ou en retard ramenait un 2 à 1).
+- **Base illisible pour cause de droits** (fichier ou dossier inaccessible, dossier en lecture seule) : « [ERREUR] DB illisible
+  … Vérifier propriétaire et droits — ne PAS supprimer le fichier » au lieu de « DB corrompue … Supprimez le fichier »
+  (décision de l'utilisateur), pour Report -o comme pour Index, Bkp…
+- **Prune / DelBkp, diff.db corrompue** : arrêt « DB corrompue » comme avant, history.db intacte (le rapprochement ne lit plus
+  jamais une base illisible comme absente : ses mesures d'archives auraient été retirées). Plus de `cache.db` vide créé
+  par le vidage du cache d'un nick sans cache.
+- **Dry-run** (décision de l'utilisateur : `-D` n'écrit jamais) : `DbEncrypt -D` / `DbDecrypt -D` (et sans `-y`)
+  migraient le schéma d'une base ancienne (palier 10) tout en annonçant « aucune modification ». Le rapport est désormais
+  fait sur la base telle quelle (« ? » pour une table qui n'existe pas encore) ; seule l'exécution réelle (`-y`) migre.
+  Mêmes arrêts qu'avant sans rien écrire : base corrompue (« DB corrompue », code 1), occupée (« DB occupée »), schéma plus
+  récent (« Erreur schéma DB »). Limite documentée (décision de l'utilisateur) : des trames WAL laissées par un processus
+  tué sont reportées par SQLite à la fermeture de toute connexion, -D compris (contenu identique).
+- CodecSelfTest : « sans création » (17 lecteurs : même réponse qu'un fichier vide, rien créé ; `_open_db` en lecture,
+  chemin `bytes`, fichier supprimé pendant l'ouverture, dossier absent, fichier sans droits, base existante intacte, vue
+  seule sans avertissement ; nettoyage après Prune, base corrompue), « état de base » (chaque état × prédicat, verrou,
+  dossier fermé, vue seule -> base née chiffrée ; base corrompue, occupée, droits, schéma récent : Report -o CLI multi-nicks,
+  DbStatus, Db* -D), « dry-run sans écriture » (9 commandes -D/aperçu × 11 états de diff.db : empreintes de CACHE_DIR
+  inchangées ; rapport sur la base non migrée).
+- CodecSelfTest « versions de borg : serveur selon le mode » : l'enfant tué au délai pouvait être vu vivant (zombie pas
+  encore récolté, mesuré 7 fois sur 20) — attente bornée, zombie compté mort.
+
 ## borgHelper 1.0.170 — base absente : fichier vide laissé par un lecteur — 2026-10-01
 
 Chantier « reconstruction progressive », story 33 (action de rétrospective A55, périmètre élargi après mesure, décision
