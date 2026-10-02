@@ -10,7 +10,7 @@ Scripts utilitaires pour manipuler des depots git.
 | `git2git_mirror` | 1.1.0 | Synchronise l'integralite d'un depot git (branches, tags, refs) vers un autre, avec option `--dry-run` ; ou extrait un sous-repertoire (`--subdir`) pour l'exposer comme depot independant |
 | `gitar` | 1.0.0 | Pousse une archive tar dans un depot git |
 | `gitoune` | 1.0.0 | Pousse un fichier dans un depot git |
-| `gitconfig` | 1.14.0 | Configuration git personnelle (`~/.gitconfig`) : alias, pager, diff tool, identite pro/perso par repo, mirroring inline (`git mirror`), depot d'archive tar depuis fichier ou stdin (`git tar`), telechargement fichier/repertoire a HEAD ou a un commit precis (`git figet [-G <commit>]`), depot d'un fichier unique depuis fichier ou stdin (`git fiput`), historique d'un fichier distant (`git filog`), diff fichier local vs depot (`git fidiff [-G <commit>]`), liste des alias avec doc (`git alias`), deploiement HEAD vers des urls ssh (`git deploy`) |
+| `gitconfig` | 1.14.1 | Configuration git personnelle (`~/.gitconfig`) : alias, pager, diff tool, identite pro/perso par repo, mirroring inline (`git mirror`), depot d'archive tar depuis fichier ou stdin (`git tar`), telechargement fichier/repertoire a HEAD ou a un commit precis (`git figet [-G <commit>]`), depot d'un fichier unique depuis fichier ou stdin (`git fiput`), historique d'un fichier distant (`git filog`), diff fichier local vs depot (`git fidiff [-G <commit>]`), liste des alias avec doc (`git alias`), deploiement HEAD vers des urls ssh (`git deploy`) |
 | `git-deploy` | 1.0.0 | Script appele par l'alias `git deploy` : deploie le contenu commite (HEAD) de fichiers/repertoires vers des urls ssh/scp, selon un profil defini dans un `.deploy.conf` (non tracke) pose a cote du sous-projet |
 
 Voir `CHANGELOG.md` pour l'historique des versions.
@@ -54,6 +54,8 @@ Voir `CHANGELOG.md` pour l'historique des versions.
 `git deploy <profil>` deploie le contenu **commite** (HEAD, pas la copie de travail meme si elle differe) de fichiers/repertoires vers une ou plusieurs destinations ssh/scp.
 
 Implemente en script standalone (`git-deploy`, appele par l'alias fin `deploy = !git-deploy`) plutot qu'en alias inline : la logique (recherche du fichier de config en remontant l'arbo, calcul du prefixe a retirer cote distant, boucle sur plusieurs urls avec erreur geree url par url) est trop consequente pour un alias `!` lisible.
+
+**Prerequis** : `git-deploy` doit etre dans le `PATH` (pas de chemin absolu dans l'alias). Ex : `ln -s ~/Projets/Misc/Git/git-deploy ~/.local/bin/git-deploy`, ou ajouter `Git/` au `PATH`.
 
 Fonctionnement :
 - Cherche un fichier `.deploy.conf` en remontant depuis le repertoire d'invocation jusqu'a la racine du depot (le premier trouve est utilise) — pose a cote du sous-projet concerne, **jamais commite** (voir `.gitignore` racine : `**/.deploy.conf`), a recreer sur chaque machine qui deploie.

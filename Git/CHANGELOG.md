@@ -10,6 +10,9 @@
 
 ## gitconfig
 
+### 1.14.1 — 2026-10-02
+- `deploy = !git-deploy` au lieu du chemin absolu `!/home/claudia/Projets/Misc/Git/git-deploy`. `git-deploy` doit desormais etre dans le `PATH` (symlink ou ajout au `PATH`) ; sinon `git deploy` echoue proprement (`cannot run git-deploy: No such file or directory`).
+
 ### 1.14.0 — 2026-10-02
 - Ajout de l'alias fin `deploy = !git-deploy`, qui appelle le nouveau script `git-deploy` (voir ci-dessous). `git alias` documente la nouvelle entree.
 
