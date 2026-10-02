@@ -1,19 +1,29 @@
-# Exemple de .deploy.conf pour git-deploy / git deploy <profil>.
+# Exemple de .deploy.conf pour git-deploy / git deploy <type-de-deploiement>.
 #
 # Copier ce fichier en .deploy.conf (jamais commite, voir .gitignore racine :
 # **/.deploy.conf) a cote du sous-projet a deployer, puis l'adapter.
 #
-# Chaque section est un profil (nom passe a "git deploy <profil>").
-#   file = chemin relatif au repertoire de ce fichier (fichier ou repertoire)
-#   url  = destination scp classique [user@]host:chemin (repetable)
+# Format a 3 etages :
+#   1. Type de deploiement : la section, ex [preprod] (nom passe a "git deploy").
+#   2. Source concernee    : la sous-section, un fichier ou repertoire relatif
+#                            au repertoire de ce fichier, ex [preprod "gitconfig"].
+#   3. Cible concernee     : la cle "dest" (repetable), destination scp classique
+#                            [user@]host:chemin. Chemin complet du fichier
+#                            distant pour une source fichier ; repertoire
+#                            distant ou atterrit le contenu pour un repertoire.
+#
+# Chaque source peut viser une cible differente des autres.
 
-[preprod]
-    file = gitconfig
-    file = git-deploy
-    url = adlp@preprod1.adlp.org:/opt/git-tools/
-    url = adlp@preprod2.adlp.org:/opt/git-tools/
+[preprod "gitconfig"]
+    dest = adlp@preprod1.adlp.org:/opt/git-tools/gitconfig
+    dest = adlp@preprod2.adlp.org:/opt/git-tools/gitconfig
 
-[prod]
-    file = gitconfig
-    file = git-deploy
-    url = adlp@prod.adlp.org:/opt/git-tools/
+[preprod "git-deploy"]
+    dest = adlp@preprod1.adlp.org:/usr/local/bin/git-deploy
+    dest = adlp@preprod2.adlp.org:/usr/local/bin/git-deploy
+
+[prod "gitconfig"]
+    dest = adlp@prod.adlp.org:/opt/git-tools/gitconfig
+
+[prod "git-deploy"]
+    dest = adlp@prod.adlp.org:/usr/local/bin/git-deploy

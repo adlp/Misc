@@ -11,7 +11,7 @@ Scripts utilitaires pour manipuler des depots git.
 | `gitar` | 1.0.0 | Pousse une archive tar dans un depot git |
 | `gitoune` | 1.0.0 | Pousse un fichier dans un depot git |
 | `gitconfig` | 1.14.1 | Configuration git personnelle (`~/.gitconfig`) : alias, pager, diff tool, identite pro/perso par repo, mirroring inline (`git mirror`), depot d'archive tar depuis fichier ou stdin (`git tar`), telechargement fichier/repertoire a HEAD ou a un commit precis (`git figet [-G <commit>]`), depot d'un fichier unique depuis fichier ou stdin (`git fiput`), historique d'un fichier distant (`git filog`), diff fichier local vs depot (`git fidiff [-G <commit>]`), liste des alias avec doc (`git alias`), deploiement HEAD vers des urls ssh (`git deploy`) |
-| `git-deploy` | 1.0.0 | Script appele par l'alias `git deploy` : deploie le contenu commite (HEAD) de fichiers/repertoires vers des urls ssh/scp, selon un profil defini dans un `.deploy.conf` (non tracke) pose a cote du sous-projet |
+| `git-deploy` | 1.1.0 | Script appele par l'alias `git deploy` : deploie le contenu commite (HEAD) de sources vers leurs destinations ssh/scp (3 etages : type/source/cible), selon un `.deploy.conf` (non tracke) pose a cote du sous-projet |
 
 Voir `CHANGELOG.md` pour l'historique des versions.
 
@@ -51,24 +51,25 @@ Voir `CHANGELOG.md` pour l'historique des versions.
 
 ## `git deploy` — deploiement vers des serveurs ssh
 
-`git deploy <profil>` deploie le contenu **commite** (HEAD, pas la copie de travail meme si elle differe) de fichiers/repertoires vers une ou plusieurs destinations ssh/scp.
+`git deploy <type-de-deploiement>` deploie le contenu **commite** (HEAD, pas la copie de travail meme si elle differe) de sources (fichiers/repertoires) vers des destinations ssh/scp — chaque source pouvant viser une cible differente des autres.
 
-Implemente en script standalone (`git-deploy`, appele par l'alias fin `deploy = !git-deploy`) plutot qu'en alias inline : la logique (recherche du fichier de config en remontant l'arbo, calcul du prefixe a retirer cote distant, boucle sur plusieurs urls avec erreur geree url par url) est trop consequente pour un alias `!` lisible.
+Implemente en script standalone (`git-deploy`, appele par l'alias fin `deploy = !git-deploy`) plutot qu'en alias inline : la logique (recherche du fichier de config en remontant l'arbo, resolution par source, boucle sur plusieurs destinations avec erreur geree une par une) est trop consequente pour un alias `!` lisible.
 
 **Prerequis** : `git-deploy` doit etre dans le `PATH` (pas de chemin absolu dans l'alias). Ex : `ln -s ~/Projets/Misc/Git/git-deploy ~/.local/bin/git-deploy`, ou ajouter `Git/` au `PATH`.
 
 Fonctionnement :
 - Cherche un fichier `.deploy.conf` en remontant depuis le repertoire d'invocation jusqu'a la racine du depot (le premier trouve est utilise) — pose a cote du sous-projet concerne, **jamais commite** (voir `.gitignore` racine : `**/.deploy.conf`), a recreer sur chaque machine qui deploie.
-- Format `.deploy.conf` (syntaxe `git config`), un profil par section :
+- Format `.deploy.conf` a 3 etages (syntaxe `git config`) : **type de deploiement** (section) / **source concernee** (sous-section, fichier ou repertoire relatif au repertoire du `.deploy.conf`) / **cible concernee** (cle `dest`, repetable) :
   ```ini
-  [preprod]
-      file = gitconfig
-      file = un_sous_repertoire
-      url = user@host1:/opt/git-tools/
-      url = user@host2:/opt/git-tools/
+  [preprod "gitconfig"]
+      dest = user@host1:/opt/git-tools/gitconfig
+      dest = user@host2:/opt/git-tools/gitconfig
+
+  [preprod "un_sous_repertoire"]
+      dest = user@host1:/opt/git-tools/un_autre_nom/
   ```
-  `file` (relatif au repertoire du `.deploy.conf`) peut etre un fichier ou un repertoire. `url` suit la syntaxe scp classique `[user@]host:chemin`.
-- Transfert via `git archive HEAD -- <chemins> | ssh <host> 'tar x -C <chemin> --strip-components=N'` — une seule connexion par url, pas de dependance cote distant hormis `tar`+`ssh`.
+  `dest` suit la syntaxe scp classique `[user@]host:chemin` : chemin complet du fichier distant pour une source fichier, repertoire distant ou atterrit le contenu pour une source repertoire.
+- Type de la source (fichier/repertoire) determine via `git cat-file -t HEAD:<chemin>` : `git show` (pipe vers `cat >`) pour un fichier, `git archive` (pipe vers `tar x --strip-components=N`) pour un repertoire.
+- Une destination en echec (host injoignable, syntaxe invalide, source introuvable) n'empeche pas les autres d'etre tentees ; code de sortie non nul si au moins une a echoue.
 
 Exemple pret a copier : `Git/.deploy.conf.example` (a copier en `.deploy.conf` puis adapter).
-- Une url en echec (host injoignable, url mal formee) n'empeche pas les autres d'etre tentees ; code de sortie non nul si au moins une a echoue.

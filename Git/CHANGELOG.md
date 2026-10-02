@@ -18,6 +18,11 @@
 
 ## git-deploy
 
+### 1.1.0 — 2026-10-02
+- Format `.deploy.conf` passe de 2 a 3 etages : type de deploiement (section) / source (sous-section) / cible (cle `dest`, repetable), au lieu d'une liste `file` + d'une liste `url` partagee par toutes les sources. Chaque source (fichier ou repertoire) peut desormais viser une destination differente (chemin/nom different sur le serveur cible), chose impossible avec l'ancien format ou toutes les sources d'un profil allaient au meme repertoire de base sur chaque url.
+- Type de la source determine via `git cat-file -t HEAD:<chemin>` : fichier -> `git show` + `cat >`, repertoire -> `git archive` + `tar x --strip-components` (calcule par source, plus par profil entier).
+- `.deploy.conf.example` et README mis a jour avec le nouveau format.
+
 ### 1.0.0 — 2026-10-02
 - Creation : `git deploy <profil>` deploie le contenu commite (HEAD) de fichiers/repertoires vers des urls ssh/scp, selon un profil lu dans un `.deploy.conf` (non tracke, syntaxe git config) trouve en remontant l'arbo depuis le repertoire d'invocation. Transfert via `git archive | ssh ... tar x --strip-components`. Implemente en script standalone plutot qu'en alias inline : logique jugee trop consequente (recherche de config, calcul de prefixe, boucle multi-urls avec erreur geree par url) pour rester lisible dans un alias `!`.
 - `.gitignore` racine : ajout de `**/.deploy.conf`.
