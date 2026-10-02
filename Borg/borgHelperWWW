@@ -61,12 +61,12 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
                          DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec,
                          _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES, _enc_header_read, sentry_alert, _bkp_status_timeout,
                          _sentry_alert_kinds, db_plain_anomalies, _cfg_bool, convert_octets_readable,
-                         op_allowed, allowed_ops, is_external)
+                         op_allowed, allowed_ops, is_external, _rb_errmsg, _valid_nick_name)
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.29.0"
+WWW_VERSION="1.30.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -798,6 +798,19 @@ def _restore_where(where: str) -> str:
     if busy:
         raise HTTPException(409,detail=f"Destination déjà remplie : {where} — restaurer dans un dossier absent ou vide")
     return p
+
+# Formes DISTANTES de borg 1.2 (helpers/parseformat.py, Location : ssh_re, scp_re avec hôte) — hôte sans « / » ni « : »
+# (ou [ipv6]) : un chemin qui commence par /, ., ~ ou porte un / avant le « : » est LOCAL pour borg (revue story 38, G1).
+_REPO_SSH_RE=re.compile(r'ssh://(?:[^@:/]+@)?(?:[^:/@\[\]]+|\[[0-9a-fA-F:.]+\])(?::\d+)?/.+')
+_REPO_SCP_RE=re.compile(r'(?:[^@:/]+@)?(?:[^:/@\[\]]+|\[[0-9a-fA-F:.]+\]):(?!:|//|ssh://).+')
+
+def _repo_is_remote(repo: str) -> bool:
+    """1.30.0 (A71) : dépôt borg distant au sens de borg 1.2 — `ssh://[user@]hôte[:port]/chemin` ou `[user@]hôte:chemin` ;
+    refusés : tout le reste (chemin local, `file://`), `::` (nom d'archive : `/srv/x::a` est le dépôt LOCAL /srv/x), `%`
+    (interpolation du rc : `%(MOUNTPOINT)s` relu en chemin local), espaces de bord et caractères de contrôle."""
+    r=repo or ''
+    if r!=r.strip() or '%' in r or any(ord(c)<32 for c in r) or '::' in re.sub(r'\[[^\]]*\]','',r): return False
+    return bool(_REPO_SSH_RE.fullmatch(r) or _REPO_SCP_RE.fullmatch(r))
 
 def require_downloads_allowed():
     if not ALLOW_DOWNLOADS:
@@ -2396,7 +2409,8 @@ def _latest_archive(cfg,env):
     except subprocess.TimeoutExpired:
         raise HTTPException(504,detail="borg list : timeout")
     if proc.returncode!=0:
-        raise HTTPException(502,detail=f"borg list a échoué : {proc.stderr[:300]}")
+        # 1.30.0 (revue story 38) : message réduit (_rb_errmsg) — avant : stderr brut coupé à 300 caractères, trace sans la cause
+        raise HTTPException(502,detail="borg list a échoué : "+_rb_errmsg({'exitcode':proc.returncode,'stderr':proc.stderr.split('\n')},'borg list'))
     lines=[l for l in proc.stdout.splitlines() if l.strip()]
     if not lines:
         raise HTTPException(404,detail="Aucune archive dans ce dépôt")
@@ -2695,12 +2709,24 @@ def stats(nick: Optional[str]=None, x_api_key: Optional[str]=Header(default=None
 @router.post("/login",response_model=CommandResult,tags=["admin"])
 def login(servername: str, nickname: Optional[str]=None, repo: str=Query(...),
           repo_passphrase: str=Query(...,description="Passphrase persistée en clair dans le borghelperrc du serveur, PAS le header X-Borg-Passphrase"),
-          keyfile: Optional[str]=None, mountpoint: Optional[str]=None,
+          keyfile: Optional[str]=Query(default=None,description="Refusé (400) depuis 1.30.0 — CLI seulement"),
+          mountpoint: Optional[str]=Query(default=None,description="Refusé (400) depuis 1.30.0 — CLI seulement"),
           x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
+    # 1.30.0 (story 38, A71, décisions de l'utilisateur) : aucun chemin libre du serveur via l'API — keyfile (borg lisait un
+    # fichier arbitraire : key import) et mountpoint (écrit au rc) refusés ; dépôt distant seulement (un chemin local suivi de
+    # POST /init créait un dépôt n'importe où, droits du service). Refus avant tout appel à borgHelper ; CLI Login inchangée.
+    if keyfile is not None or mountpoint is not None:   # fournis, même vides (revue : « refusés s'ils sont fournis »)
+        raise HTTPException(400,detail="keyfile et mountpoint ne sont pas acceptés via l'API (chemins du serveur) — "
+                            "les configurer avec la CLI : borgHelper -c Login")
+    for what,v in (('servername',servername),('nickname',nickname)):   # revue story 38 (G2) : injection dans le rc par la section
+        if v is not None and not _valid_nick_name(v):
+            raise HTTPException(400,detail=f"{what} invalide : {v!r} — lettres, chiffres, « . », « _ », « - » (début : lettre ou chiffre), "
+                                "ni ALL ni DEFAULT")
+    if not _repo_is_remote(repo):
+        raise HTTPException(400,detail=f"Dépôt local refusé via l'API : {repo} — dépôt distant seulement (ssh://…, "
+                            "utilisateur@hôte:…) ; un dépôt local se configure avec la CLI : borgHelper -c Login")
     extra=['-s',servername,'-r',repo,'-p',repo_passphrase]
-    if keyfile: extra+=['-k',keyfile]
-    if mountpoint: extra+=['-m',mountpoint]
     return run_borghelper('login',nick=nickname,extra_args=extra)
 
 @router.get("/lstbkp",response_model=CommandResult,tags=["lecture"])
@@ -4351,6 +4377,48 @@ def push_selftest():
                     if not ok: print(f"  écarts : { {k:(got[k],want[k]) for k in want if got[k]!=want[k]} } ; exposition {expo} ; "
                                      f"introuvable {v1.get('restore_enabled')} ; « / » {slash} {sl.returncode} {sl.stderr[-200:]!r} ; groupes {(g_ok,g_no)}")
                     return ok
+                def _login_no_free_path():
+                    """1.30.0 (story 38, A71, décisions de l'utilisateur) : POST /login — keyfile, mountpoint, dépôt local (chemin,
+                    file:) -> 400 sans jamais lancer borgHelper ; dépôt distant (ssh://, utilisateur@hôte:, hôte:) -> borgHelper lancé
+                    (simulé : jamais de vrai Login, il écrirait le rc) avec ni -k ni -m."""
+                    base={'servername':'selftest-login','repo':'u@h:/r','repo_passphrase':'pw'}
+                    ok_res=CommandResult(exitcode=0,stdout='ok',stderr='')
+                    def post(**over):
+                        with mock.patch(f"{__name__}._exec_borghelper",return_value=ok_res) as ex:
+                            r=client.post(f"{P}/login",headers=H,params={**base,**over})
+                        return r.status_code,(ex.call_args[0][2] if ex.called else None)
+                    got={'keyfile':post(keyfile='/etc/shadow'),'mountpoint':post(mountpoint='/tmp/x'),'local':post(repo='/srv/borg/r'),
+                         'relatif':post(repo='r'),'file':post(repo='file:///srv/r'),'ssh':post(repo='ssh://u@h:22/./r'),'scp':post(repo='u@h:r'),
+                         'vides':post(keyfile='',mountpoint=''),'hôte':post(repo='h:/r'),'ipv6':post(repo='ssh://u@[::1]:22/r')}
+                    # revue story 38 (G1) : formes LOCALES pour borg 1.2 qui contiennent « : » (parseformat.Location, mesuré)
+                    for k,r in (('archive','/srv/x::a'),('chemin:','/srv/a:b'),('relatif:','x/y:z'),('point','./x:y'),('tilde','~/x:y'),
+                                ('marqueur','/srv/{hostname}:x'),('interpolation','%(MOUNTPOINT)s::x'),('espace',' u@h:/r'),('archive distante','u@h:/r::a')):
+                        got['local '+k]=post(repo=r)
+                    # revue story 38 (G2, décision de l'utilisateur) : noms écrits comme section du rc -> liste blanche
+                    for k,over in (('injection',{'nickname':'evil]\nBORG_RSH=sh -c id #\n[x'}),('injection srv',{'servername':'s]\nBORG_EXE=/bin/sh'}),
+                                   ('ALL',{'nickname':'ALL'}),('DEFAULT',{'servername':'default'}),('virgule',{'nickname':'a,b'}),
+                                   ('espace',{'nickname':'a b'}),('pourcent',{'nickname':'a%b'}),('point en tête',{'nickname':'.x'})):
+                        got['nom '+k]=post(**over)
+                    want={'keyfile':(400,None),'mountpoint':(400,None),'local':(400,None),'relatif':(400,None),'file':(400,None),
+                          'ssh':(200,['-s','selftest-login','-r','ssh://u@h:22/./r','-p','pw']),'scp':(200,['-s','selftest-login','-r','u@h:r','-p','pw']),
+                          'vides':(400,None),'hôte':(200,['-s','selftest-login','-r','h:/r','-p','pw']),
+                          'ipv6':(200,['-s','selftest-login','-r','ssh://u@[::1]:22/r','-p','pw'])}
+                    want.update({k:(400,None) for k in got if k.startswith(('local ','nom '))})
+                    if got!=want: print(f"  écarts : { {k:(got[k],want[k]) for k in want if got[k]!=want[k]} }")
+                    return got==want
+                check("POST /login : keyfile, mountpoint et dépôt local refusés (400) sans lancer borgHelper, dépôt distant accepté (A71)",_login_no_free_path)
+                def _latest_archive_msg():
+                    """Revue story 38 : /download/* sans archive — borg list en échec (plantage réel de borg 1.2.6) -> 502 « borg list a
+                    échoué : <cause> », ni trace ni bandeau (avant : stderr brut coupé à 300 caractères, sans la cause)."""
+                    crash='\n'.join(['Exception ignored in: <function Repository.__del__ at 0x7f>','Traceback (most recent call last):',
+                        '  File "borg/repository.py", line 190, in __del__','AssertionError: cleanup happened in Repository.__del__','Local Exception',
+                        'Traceback (most recent call last):','  File "borg/archiver.py", line 5324, in main',"ValueError: could not convert string to float: 'x'",
+                        '','Platform: Linux h','sys.argv: [\'borg\']',''])
+                    with mock.patch.object(subprocess,'run',lambda *a,**k: subprocess.CompletedProcess(a[0],2,stdout='',stderr=crash)):
+                        try: _latest_archive({'BORG_REPO':'ssh://h/r'},{}); return False
+                        except HTTPException as e:
+                            return (e.status_code,e.detail)==(502,"borg list a échoué : Local Exception; ValueError: could not convert string to float: 'x'")
+                check("/download/* : borg list en échec -> 502 avec la cause, ni trace ni bandeau",_latest_archive_msg)
                 if _internal is None: print("SKIP racine de restauration : aucun nick interne dans ce rc")
                 else: check("POST /restore sous la racine de restauration seulement : 403 sans racine/hors racine/lien, 409 si remplie, chemin résolu transmis, « / » refusé (A68)",
                             _restore_root)

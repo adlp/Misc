@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.174"
+Version="1.0.175"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -607,22 +607,23 @@ _BORG_ALWAYS=('Platform','Borg:')   # écartés de toute ligne (1.0.173, inchang
 _BORG_SYSINFO=('Platform','Linux:','Borg:','PID:','sys.argv:','SSH_ORIGINAL_COMMAND:','Borg server:')   # sysinfo() de borg 1.2 : après une trace
 _TB_CHAIN=('During handling of the above exception','The above exception was the direct cause')
 
-def _borg_err_lines(lines,st=None):
+def _borg_err_lines(lines,st=None,raw=False):
     """Lignes d'erreur de borg -> messages (strip). 1.0.174 (story 37, A69) : chaque trace Python (« Traceback (most recent
     call last): », cadres indentés, chaîne « During handling… »/« The above exception… ») remplacée par sa ligne d'exception
     (la dernière de la chaîne ; suite indentée du message ignorée ; omise si elle répète le message qui précède — erreur borg
     « avec trace » : CheckNeeded…) ; bloc « Exception ignored … » de Python (écrit AVANT « Local Exception » par borg 1.2.6,
     mesuré, texte même sous --log-json ; avec ou sans trace) écarté ; bandeau sysinfo complet écarté après une trace
     (`st['crash']`, partagé par _rb_errmsg entre texte et JSON), `Platform`/`Borg:` partout. Avant : « Local Exception;
-    Traceback (most recent call last): »."""
+    Traceback (most recent call last): ». `raw` (1.0.175, A70) : lignes hors trace gardées telles quelles (indentation), pour
+    un affichage."""
     st={} if st is None else st
     out=[]; blk={'exc':None,'stage':None,'drop':False}
     def close():
         e=blk['exc']
-        if e and not blk['drop'] and not (out and e.endswith(out[-1])): out.append(e)
+        if e and not blk['drop'] and not (out and e.endswith(out[-1].strip())): out.append(e)
         blk.update(exc=None,stage=None,drop=False)
     for l in lines:
-        if not l.strip() or l.startswith(_BORG_SYSINFO if st.get('crash') else _BORG_ALWAYS): continue
+        if not l.strip() or l.startswith(_BORG_SYSINFO if st.get('crash') else (() if raw else _BORG_ALWAYS)): continue   # raw : rien hors trace
         ind=l[0] in ' \t'; stage=blk['stage']
         if l.startswith('Traceback (most recent call last):'):
             if stage not in ('ign','chain'): close()
@@ -636,7 +637,7 @@ def _borg_err_lines(lines,st=None):
             if l.startswith(_TB_CHAIN): blk['stage']='chain'; continue
         if stage=='chain' and l.startswith(_TB_CHAIN): continue
         if stage is not None: close()
-        out.append(l.strip())
+        out.append(l.rstrip() if raw else l.strip())
     close()
     return out
 
@@ -654,14 +655,43 @@ def _rb_errmsg(rb,cmd='borg',n=2,cut=100):
             if m: msgs.append(m[0])
         elif isinstance(i,str): txt.append(i)
     msgs.extend(m[:cut] for m in _borg_err_lines(txt,st))
+    # 1.0.175 (A70) : échec (code >= 2) -> avertissements de borg (« Warning: … », ex. --numeric-owner déprécié d'extract) après
+    # les autres messages : la cause d'abord ; code 0/1 ou avertissements seuls : inchangé
+    if rb.get('exitcode') not in (0,1):
+        msgs=[m for m in msgs if not m.startswith('Warning: ')]+[m for m in msgs if m.startswith('Warning: ')]
     return '; '.join(msgs[:n]) or f"{cmd} failed (code {rb['exitcode']})"
 
-def _print_boex_stderr(rb):
-    for i in rb['stderr']:
+def _print_borg_stderr(entries,debug=0):
+    """Affiche les entrées stderr d'un résultat boex (texte ou --log-json) — 1.0.175 (story 38, A70) : trace Python réduite à
+    son exception, bloc « Exception ignored » et bandeau sysinfo écartés (_borg_err_lines, même règle que _rb_errmsg) ; le reste
+    tel quel (lignes de texte avec leur indentation, enregistrements JSON « [NIVEAU] message », DEBUG seulement avec debug).
+    Avant : tout imprimé brut (Restore, ListPerms, Mount, Key, Bkp)."""
+    st={}; txt=[]
+    def flush():
+        for l in _borg_err_lines(txt,st,raw=True): print(l,file=sys.stderr,flush=True)
+        txt.clear()
+    for i in entries:
         if isinstance(i,dict):
-            lvl=i.get('levelname','INFO')
-            if lvl not in ('DEBUG',): print(f"[{lvl}] {i.get('message',i)}",file=sys.stderr)
-        elif isinstance(i,str) and i.strip(): print(i,file=sys.stderr)
+            flush()
+            lvl=i.get('levelname','INFO'); msg=i.get('message',str(i))
+            if lvl=='DEBUG' and not debug: continue
+            if isinstance(msg,str) and ('Traceback (most recent call last):' in msg or msg.startswith('Exception ignored ')
+                                       or (st.get('crash') and msg.startswith(_BORG_SYSINFO))):   # trace, bloc ignoré, bandeau : réduits
+                for l in _borg_err_lines(msg.split('\n'),st): print(f"[{lvl}] {l}",file=sys.stderr,flush=True)
+            else: print(f"[{lvl}] {msg}",file=sys.stderr,flush=True)
+            if debug: printer(i)
+        elif isinstance(i,str): txt.append(i)
+    flush()
+
+def _print_boex_stderr(rb):
+    _print_borg_stderr(rb['stderr'])
+
+def _print_boex_stdout(rb):
+    """Lignes de stdout d'un résultat boex (texte, ou JSON réimprimé) — 1.0.175 (A70) : remplace print(rb) (dict brut)."""
+    for i in rb.get('stdout',[]):
+        if isinstance(i,str):
+            if i.strip(): print(i)
+        else: print(json.dumps(i,ensure_ascii=False))
 
 def d2DateNSince(datepourrie):
     from datetime import datetime
@@ -2365,6 +2395,26 @@ def _db_absent(db_path):
     1.0.171 : sur _db_probe."""
     return _db_probe(db_path,_READER_WRITE_WAIT)[0]=='absent'
 
+_NICK_NAME_RE=re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
+
+def _valid_nick_name(name):
+    """1.0.175 (revue story 38, G2, décision de l'utilisateur) : nom de serveur/nick écrit comme section du rc par Login (CLI et
+    POST /login) — lettres, chiffres, `.`, `_`, `-`, commençant par une lettre ou un chiffre, 64 caractères au plus ; `ALL` et
+    `DEFAULT` refusés. Avant : section écrite telle quelle — `]` + retour à la ligne injectait des clés (BORG_RSH, BORG_EXE :
+    commande exécutée au prochain Init/Bkp), `ALL`/`a,b` écrasaient ou dupliquaient des sections."""
+    return bool(isinstance(name,str) and _NICK_NAME_RE.fullmatch(name) and name.upper() not in ('ALL','DEFAULT'))
+
+_SQLITE_ERR_SEEN=set()
+
+def _reader_sqlite_err(e,db_path):
+    """1.0.175 (story 38, A72, décision de l'utilisateur) : erreur SQLite d'un LECTEUR — « table/colonne absente » (base pas encore
+    créée, ancien schéma) silencieuse comme avant ; vraie erreur (verrou au-delà du délai, corruption, I/O) -> `[ERREUR] SQLite
+    error (<base>): <erreur>` sur stderr, une fois par base et par processus ; sortie partielle et code inchangés (borgHelperWWW
+    ne met jamais en cache une réponse qui porte [ERREUR]). Avant : avalée, réponse fausse (« — », « Index vide ») en code 0."""
+    if isinstance(e,sqlite3.OperationalError) and str(e).startswith(('no such table','no such column')): return
+    if db_path in _SQLITE_ERR_SEEN: return
+    _SQLITE_ERR_SEEN.add(db_path); printer(f"[ERREUR] SQLite error ({db_path}): {e}")
+
 def _db_has_schema(db_path):
     """True si db_path est une base (au moins une table, _db_probe). Un fichier existant mais vide ou sans table n'est pas une
     base créée — ensure_*_db(create=False) doit s'y fier plutôt qu'à os.path.exists (AD-12). 1.0.171 : tables seulement
@@ -3371,7 +3421,7 @@ class BorgHelperDB:
             for n,rs in names.items():
                 if len(rs)==1: out[(n,None)]=out[(n,rs[0][1])]
             return out
-        except sqlite3.Error: return {}
+        except sqlite3.Error as e: _reader_sqlite_err(e,db_path); return {}   # 1.0.175 (A72)
 
     def delete_archive_measures(self,nick,keep=None,db_path=None):
         """Retire les mesures des archives disparues (keep = noms encore présents ; None ou vide = toutes). Rétention
@@ -3427,7 +3477,7 @@ class BorgHelperDB:
                                   f"archive_date >= strftime('%Y-%m-%dT%H:%M:%S','now','-{int(self._stats_retention_months(nick))} months')",
                                   (nick,)).fetchall()
             finally: conn.close()
-        except sqlite3.Error: return []
+        except sqlite3.Error as e: _reader_sqlite_err(e,db_path); return []   # 1.0.175 (A72)
         keys=('archive','archive_date')+_CHART_FIELDS+('gone',)
         return [dict(zip(keys,r)) for r in rows]
 
@@ -3662,7 +3712,7 @@ class BorgHelperDB:
             row=conn.execute("SELECT unique_csize,total_size,total_csize FROM repo_stats WHERE nick=? ORDER BY id DESC LIMIT 1",(nick,)).fetchone()
             conn.close()
             return {'unique_csize':row[0],'total_size':row[1],'total_csize':row[2]} if row else {}
-        except sqlite3.Error: return {}
+        except sqlite3.Error as e: _reader_sqlite_err(e,db_path); return {}   # 1.0.175 (A72)
 
     def is_archive_snapshot_indexed(self,nick,archive,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
@@ -3801,6 +3851,9 @@ class BorgHelperDB:
                 elif ctype in _DIFF_REMOVED_TYPES: stats[arch]['removed_sz']+=(sz or 0)
                 else: stats[arch]['modified_sz']+=(sz or 0)
             return stats
+        except sqlite3.Error as e:   # 1.0.175 (A72) : vraie erreur marquée, « table absente » silencieuse
+            if not own: raise
+            _reader_sqlite_err(e,self.get_diff_db(nick)); return {}
         except Exception:
             if not own: raise
             return {}
@@ -3825,7 +3878,13 @@ class BorgHelperDB:
             n_diff=conn.execute("SELECT COUNT(*) FROM diff_index WHERE nick=?",(nick,)).fetchone()[0]
             n_snap=conn.execute("SELECT COUNT(*) FROM archive_snapshot WHERE nick=?",(nick,)).fetchone()[0]
             conn.close(); return n_diff==0 and n_snap==0
-        except sqlite3.Error: return True
+        except sqlite3.Error as e:
+            # 1.0.175 (A72) : base absente/sans table = vide (inchangé) ; vraie erreur -> son message (vrai, donc « à signaler ») que
+            # l'appelant affiche à la place d'« Index vide » (texte : [ERREUR] ; -j : {'error'}) — revue : rendre False laissait une
+            # requête passant par un autre index répondre [] en forme de succès
+            if isinstance(e,sqlite3.OperationalError) and str(e).startswith(('no such table','no such column')): return True
+            _SQLITE_ERR_SEEN.add(db_path)   # une seule ligne : celle de l'appelant
+            return f"SQLite error ({db_path}): {e}"
 
     def _diff_archive_filter(self,nick,archive_from,conn,archive_to=None):
         def _date_of(archive):
@@ -3852,8 +3911,9 @@ class BorgHelperDB:
             with _iso(n,lambda: conn):
                 db_path=self.get_diff_db(n)
                 self.ensure_diff_db(db_path,create=False)
-                if self._is_index_empty(n,db_path):
-                    printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
+                ie=self._is_index_empty(n,db_path)   # 1.0.175 (A72) : True (vide) ou message d'erreur SQLite réelle
+                if ie:
+                    printer(f"[ERREUR] {ie if isinstance(ie,str) else f'Index vide pour {n} — lancez : borgHelper -c Index -n {n}'}"); continue
                 conn=None
                 try:
                     conn=_open_db(db_path,nick=n,role='read',empty_ok=True)
@@ -3888,8 +3948,9 @@ class BorgHelperDB:
             with _iso(n,lambda: conn):
                 db_path=self.get_diff_db(n)
                 self.ensure_diff_db(db_path,create=False)
-                if self._is_index_empty(n,db_path):
-                    printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
+                ie=self._is_index_empty(n,db_path)   # 1.0.175 (A72) : True (vide) ou message d'erreur SQLite réelle
+                if ie:
+                    printer(f"[ERREUR] {ie if isinstance(ie,str) else f'Index vide pour {n} — lancez : borgHelper -c Index -n {n}'}"); continue
                 conn=None
                 try:
                     conn=_open_db(db_path,nick=n,role='read',empty_ok=True)
@@ -3934,8 +3995,9 @@ class BorgHelperDB:
             with _iso(n,lambda: conn):
                 db_path=self.get_diff_db(n)
                 self.ensure_diff_db(db_path,create=False)
-                if self._is_index_empty(n,db_path):
-                    printer(f"[ERREUR] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
+                ie=self._is_index_empty(n,db_path)   # 1.0.175 (A72) : True (vide) ou message d'erreur SQLite réelle
+                if ie:
+                    printer(f"[ERREUR] {ie if isinstance(ie,str) else f'Index vide pour {n} — lancez : borgHelper -c Index -n {n}'}"); continue
                 conn=None
                 try:
                     conn=_open_db(db_path,nick=n,role='read',empty_ok=True)
@@ -4108,12 +4170,15 @@ class BorgRunner:
         config=configparser.ConfigParser()
         config.optionxform=str
         config.read(self.cfgfile)
+        # 1.0.175 (revue story 38, M2) : le rc est relu AVEC interpolation (%(…)s) — « % » d'une valeur échappé en « %% » : une
+        # passphrase « a%b » levait ValueError (trace, Sentry), un dépôt « %(MOUNTPOINT)s… » était relu en chemin local
+        esc=lambda v: str(v).replace('%','%%')
         config[nick]={}
-        config[nick]['BORG_REPO']=repo
-        config[nick]['BORG_PASSPHRASE']=passphrase
-        config[nick]['SER_NAME']=serna
-        config[nick]['GLOB_ARCH']=serna+'-root-*'
-        config[nick]['MOUNTPOINT']="/mnt/borg/"+nick if mountpoint is None else mountpoint
+        config[nick]['BORG_REPO']=esc(repo)
+        config[nick]['BORG_PASSPHRASE']=esc(passphrase)
+        config[nick]['SER_NAME']=esc(serna)
+        config[nick]['GLOB_ARCH']=esc(serna)+'-root-*'
+        config[nick]['MOUNTPOINT']=esc("/mnt/borg/"+nick if mountpoint is None else mountpoint)
         _atomic_write_rc(self.cfgfile,config)
 
     def _boex_check_stdout(self,rb,nick,cmd='borg'):
@@ -4294,7 +4359,11 @@ class BorgHelper:
                          ('KEEP_HOURLY','--keep-hourly')]:
             if key in cfg: cmd.extend([flag,cfg[key]])
         cmd.extend(glob_args(cfg,'eq'))
-        ret=self.borg.boex(nick,cmd,debug=debug)['stderr']
+        rbp=self.borg.boex(nick,cmd,debug=debug); ret=rbp['stderr']
+        if rbp['exitcode'] not in (0,1):   # 1.0.175 (story 38, A75, décision de l'utilisateur) : jamais mis en cache (verrou d'un
+            # Bkp, ssh…) — avant, « rien à récupérer » restait servi jusqu'au prochain changement du dépôt
+            printer(f"[WARN] {self._borg_fail_msg(nick,'borg prune --dry-run',_rb_errmsg(rbp,'borg prune --dry-run'))} — récupérable inconnu")
+            return None   # inconnu (revue, décision de l'utilisateur) : Report affiche « — », jamais 0
         pruneme=[]
         for i in ret:
             line=i if isinstance(i,str) else i.get('message','')
@@ -4323,11 +4392,15 @@ class BorgHelper:
                 try: row=(conn.codec.blob.decrypt(row[0]),)
                 except DbCodecError: row=None  # ligne illisible = cache miss (AD-9), jamais une erreur
             conn.close()
-        except sqlite3.Error as e:
-            printer(f"Cache SQLite error ({db_path}): {e}"); row=None
+        except sqlite3.Error as e:   # 1.0.175 (A72) : table absente (cache jamais écrit) silencieuse, vraie erreur dite
+            if not str(e).startswith('no such table'): printer(f"Cache SQLite error ({db_path}): {e}")
+            row=None
         if row is None:
             if debug: print('Cache miss — appel borg')
-            details=self.borg.boex(nick,boexarg,debug=debug)[output][0]
+            rbc=self.borg.boex(nick,boexarg,debug=debug)
+            if rbc['exitcode'] not in (0,1) or not rbc.get(output):   # 1.0.175 (revue story 38) : avant « list index out of range »
+                raise RuntimeError(_rb_errmsg(rbc,'borg '+' '.join(boexarg[:1])))
+            details=rbc[output][0]
             try:
                 self.db.ensure_cache_db(db_path,nick=nick)  # cache miss confirmé : on écrit -> création légitime (AD-12 ne visait que le lookup)
                 conn=_open_db(db_path,nick=nick,role='write')
@@ -4989,12 +5062,18 @@ class BorgHelper:
             printer(f'Fichier {self.borg.cfgfile} absent'); sys.exit(2)
 
     def login(self,serna,nick,keyfile,passphrase,repo,mountpoint,debug=0):
+        for what,v in (('nom de serveur (-s)',serna),('nick (-n)',nick)):
+            if not _valid_nick_name(v):   # 1.0.175 (G2) : jamais écrit tel quel comme section du rc
+                printer(f"[ERREUR] {what} invalide : {v!r} — lettres, chiffres, « . », « _ », « - » (début : lettre ou chiffre), ni ALL ni DEFAULT")
+                sys.exit(2)
         self.borg.cfgwrite(nick,serna,passphrase,repo,mountpoint,debug=debug)
         cfg=self.borg.cfgread(nick,debug=debug)
         if keyfile is not None:
             if os.path.exists(keyfile) and os.path.isfile(keyfile):
                 rb=self.borg.boex(nick,['key','import',repo,keyfile],debug=debug)
-                print(rb); sys.exit(rb['exitcode'])
+                if rb['exitcode'] in (0,1): _print_boex_stdout(rb); _print_boex_stderr(rb)   # 1.0.175 (A70) : plus de dict brut
+                else: printer(self._borg_fail_msg(nick,'borg key import',_rb_errmsg(rb,'borg key import')))
+                sys.exit(rb['exitcode'])
             else:
                 printer("Fichier "+keyfile+" absent, Mais attention, machine "+nick+" integre")
                 sys.exit(2)
@@ -5047,7 +5126,8 @@ class BorgHelper:
         if not cfg.get('MOUNTPOINT'): printer(f"{nick}: MOUNTPOINT absent de la configuration — rien à démonter"); sys.exit(3)
         if mountedornot(cfg['MOUNTPOINT'],debug=debug):
             rb=self.borg.boex(nick,['umount',cfg['MOUNTPOINT']],debug=debug)
-            if rb['exitcode']!=0 or len(rb['stdout'])!=0 or len(rb['stderr']): print(rb)
+            if rb['exitcode'] in (0,1): _print_boex_stdout(rb); _print_boex_stderr(rb)   # 1.0.175 (A70) : plus de dict brut
+            else: printer(self._borg_fail_msg(nick,'borg umount',_rb_errmsg(rb,'borg umount')))
             sys.exit(rb['exitcode'])
         else:
             printer('Pas monte'); sys.exit(3)
@@ -5182,7 +5262,7 @@ class BorgHelper:
             date_new=next((a['start'] for a in archives if a['name']==bideux),None)
             rb2=self.borg.boex(nick,['diff','--json-lines',f"{cfg['BORG_REPO']}::{bidun}",bideux],debug=debug,retjson=False)
             if rb2['exitcode']!=0:
-                msg=f"borg diff a échoué (code {rb2['exitcode']})"
+                msg=self._borg_fail_msg(nick,'borg diff',_rb_errmsg(rb2,'borg diff'))   # 1.0.175 (A70) : avant « code N » seul
                 if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(rb2['exitcode'])
                 printer(msg); sys.exit(rb2['exitcode'])
             all_entries=[p for line in rb2['stdout'] for p in parse_diff_entries_json(line) if p['path']]
@@ -5258,7 +5338,9 @@ class BorgHelper:
         rb=self.borg.boex(nick,args,debug=debug,retjson=False)
         for line in rb['stdout']:
             if line.strip(): print(line)
-        _print_boex_stderr(rb); sys.exit(rb['exitcode'])
+        if rb['exitcode'] in (0,1): _print_boex_stderr(rb)
+        else: printer(self._borg_fail_msg(nick,'borg list',_rb_errmsg(rb,'borg list')))   # 1.0.175 (A70)
+        sys.exit(rb['exitcode'])
 
     def restore(self,nick,bid,ftor,where,flat=False,debug=0):
         cfg=self.borg.cfgreaded(nick,debug=debug)
@@ -5287,8 +5369,8 @@ class BorgHelper:
                 import tempfile,shutil
                 with tempfile.TemporaryDirectory(prefix='borghelper_restore_') as tmpdir:
                     rb=self.borg.boex(nick,_borg_extract_args(bid,ftor),rep=tmpdir,debug=debug)
+                    if rb['exitcode'] not in (0,1): self._extract_fail(nick,rb)
                     _print_boex_stderr(rb)
-                    if rb['exitcode'] not in (0,1): sys.exit(rb['exitcode'])
                     try: os.makedirs(where,exist_ok=True)   # 1.0.173 : course après la vérification -> message, jamais de trace
                     except OSError as e: printer(f"[ERREUR] destination {where} : création impossible ({e.strerror or e})"); sys.exit(3)
                     try:
@@ -5309,19 +5391,24 @@ class BorgHelper:
                 except OSError as e:
                     printer(f"[ERREUR] destination {where} : création impossible ({e.strerror or e})"); sys.exit(3)
                 rb=self.borg.boex(nick,_borg_extract_args(bid,ftor),rep=where,debug=debug)
+                if rb['exitcode'] not in (0,1): _rmdirs_if_empty(made); self._extract_fail(nick,rb)
                 _print_boex_stderr(rb)
-                if rb['exitcode'] not in (0,1): _rmdirs_if_empty(made)
                 sys.exit(rb['exitcode'])
         finally:
             self.db.clear_priority_lock(nick)
+
+    def _extract_fail(self,nick,rb):
+        """1.0.175 (story 38, A70) : borg extract en échec (code >= 2) -> une ligne « nick: borg extract a échoué : … » (cause
+        d'abord, ni trace ni bandeau), code de borg — Restore -w, -W, tar. Avant : stderr brut de borg (20 lignes sur un plantage)."""
+        printer(self._borg_fail_msg(nick,'borg extract',_rb_errmsg(rb,'borg extract'))); sys.exit(rb['exitcode'])
 
     def _restore_to_tar(self,nick,bid,ftor,tarpath,flat=False,debug=0):
         import tempfile,tarfile as tf_mod
         stdout_mode=(tarpath=='-')
         with tempfile.TemporaryDirectory(prefix='borghelper_restore_') as tmpdir:
             rb=self.borg.boex(nick,_borg_extract_args(bid,ftor),rep=tmpdir,debug=debug)
+            if rb['exitcode'] not in (0,1): self._extract_fail(nick,rb)
             _print_boex_stderr(rb)
-            if rb['exitcode'] not in (0,1): sys.exit(rb['exitcode'])
             if stdout_mode:
                 mode='w|'
             else:
@@ -5381,7 +5468,11 @@ class BorgHelper:
     def init_repo(self,nick,debug=0):
         cfg=self.borg.cfgreaded(nick,debug=debug)
         ret=self.borg.boex(nick,"init --encryption repokey".split(' '),debug=debug)
-        print(ret)
+        # 1.0.175 (story 38, A70, décision de l'utilisateur) : plus de dict brut ni de code 0 sur échec — code de borg ; succès :
+        # lignes de borg (conseils de sauvegarde de la clé) gardées
+        if ret['exitcode'] in (0,1): _print_boex_stdout(ret); _print_boex_stderr(ret)
+        else: printer(self._borg_fail_msg(nick,'borg init',_rb_errmsg(ret,'borg init')))
+        return ret['exitcode']
 
     def _pair_file_counts(self,nick,archive_old,archive_new,db_path,with_files=False):
         """Comptages par type de changement (added/modified/removed/C/B/T) de la paire
@@ -5548,19 +5639,15 @@ class BorgHelper:
                 out['borghelper_version']=Version
             warn={k:[] for k in _BKP_WARN_STATUSES.values()}
             if 'stderr' in anaRet.keys() and len(anaRet['stderr']):
+                other=[]
                 for i in anaRet['stderr']:
                     fs=_bkp_file_status(i)
                     if fs is not None:
                         key=_BKP_WARN_STATUSES.get(fs[0])
                         if key and fs[1]: warn[key].append(fs[1])
                         continue
-                    if isinstance(i,dict):
-                        lvl=i.get('levelname','INFO'); msg=i.get('message',str(i))
-                        if lvl=='DEBUG' and not debug: continue
-                        print(f"[{lvl}] {msg}",file=sys.stderr,flush=True)
-                        if debug: printer(i)
-                    elif isinstance(i,str) and i.strip():
-                        print(i,file=sys.stderr,flush=True)
+                    other.append(i)
+                _print_borg_stderr(other,debug)   # 1.0.175 (story 38, A70) : trace et bandeau de borg réduits ; reste tel quel
             for key,label in (('changed_during_backup','fichier(s) modifié(s) PENDANT la sauvegarde — copie possiblement incohérente'),
                               ('read_errors','erreur(s) de lecture — fichier(s) non ou partiellement sauvegardé(s)')):
                 if warn[key]:
@@ -5826,7 +5913,7 @@ class BorgHelper:
             try:
                 self.borg._boex_check_stdout(rb,nick,'borg list')
             except RuntimeError as e:
-                printer(f"{nick}: {e}"); return 1
+                printer(self._borg_fail_msg(nick,'borg list',e)); return 1   # 1.0.175 (A70) : forme commune
             archives=rb['stdout'][0]['archives']
         if not archives:
             printer(f"{nick}: aucune archive"); return 0
@@ -5892,11 +5979,8 @@ class BorgHelper:
                 # Fallback : borg list complet
                 rb2=self.borg.boex(nick,['list','--format','{mode} {type} {user} {group} {uid} {gid} {size} {isomtime} {path}{NL}',f"::{archive_name}"],debug=debug,retjson=False)
                 if rb2.get('killed'): return 'killed'
-                if rb2['exitcode']!=0:
-                    printer(f"borg list a échoué (code {rb2['exitcode']})")
-                    for i in rb2['stderr']:
-                        if isinstance(i,dict): printer(f"  [{i.get('levelname','?')}] {i.get('message',i)}")
-                        elif isinstance(i,str) and i.strip(): printer(f"  {i}")
+                if rb2['exitcode']!=0:   # 1.0.175 (A70) : forme commune, plus de stderr brut (trace, bandeau)
+                    printer(self._borg_fail_msg(nick,'borg list',_rb_errmsg(rb2,'borg list')))
                     return rb2['exitcode']
                 files=[]; exclu_count=0; exclu_size=0
                 for line in rb2['stdout']:
@@ -6056,7 +6140,8 @@ class BorgHelper:
         rebuild (1.0.143, story 6, AD-2/AD-5/AD-6) : tranche qui crée ou poursuit le fantôme '<diff.db>.rebuild' (force :
         fantôme jeté, reprise de zéro). Toute tranche poursuit un fantôme existant après l'incrémental de la base servie ;
         complet et rattrapé, il remplace la base servie (_swap_db). Jamais l'Index sans option ni celui d'un Bkp.
-        Retour : 0 (fini, rien à faire, Index déjà en cours, échéance), 1 (erreur, ou annulé avec pause=False),
+        Retour : 0 (fini, rien à faire, Index déjà en cours, échéance), 1 (erreur, ou annulé avec pause=False), 2 (borg list en
+        échec ou dépôt local absent, 1.0.175),
         3 (--rebuild refusé : DB_NAME partagé, espace disque, base en migration de chiffrement).
         Un appel sans budget peut attendre sans limite la fin d'une opération prioritaire (décision story 4)."""
         if budget is not None and not budget>0: raise ValueError("budget : durée > 0 attendue")
@@ -6225,6 +6310,8 @@ class BorgHelper:
         index() met en pause puis relance une passe complète — les sentinelles évitent de refaire le travail)."""
         noidx=self._nick_noidx(nick)
         deadline=plan['deadline']; tranche=plan['tranche']; natures=plan['natures']
+        if self.borg.repoLocalAbsent(nick):   # 1.0.175 (revue story 38) : comme A60 — ni base créée, ni borg lancé
+            printer(f"[ERREUR] {self._borg_fail_msg(nick,'borg list')}"); return 2
         self.db.ensure_diff_db(db_path,nick=nick)
         cfg=self.borg.cfgreaded(nick,debug=debug)
         stop=lambda: self._index_stop_reason(nick,deadline) is not None
@@ -6240,7 +6327,9 @@ class BorgHelper:
         try:
             self.borg._boex_check_stdout(rb,nick,'borg list')
         except RuntimeError as e:
-            printer(f"[ERREUR] {nick}: {e}"); return 1
+            # 1.0.175 (story 38, A73, décision de l'utilisateur) : comme les autres commandes (A60) — « ⚠ dépôt absent » ou
+            # « borg list a échoué : … », code 2 (avant : 1) ; [ERREUR] gardé (message d'index_last)
+            printer(f"[ERREUR] {self._borg_fail_msg(nick,'borg list',e)}"); return 2
         archives=rb['stdout'][0]['archives']
         # Rapprochement (1.0.140, AD-9) : archives supprimées hors borgHelper retirées, sur la liste déjà obtenue.
         names=[a['name'] for a in archives]
@@ -6341,6 +6430,12 @@ class BorgHelper:
             ps=subprocess.Popen(cmd,encoding='utf-8',env=diff_env,cwd=os.getcwd(),
                                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
             with running_procs_lock: running_procs[pair]=ps
+            # 1.0.175 (story 38, A75) : stderr lu à part — jamais lu avant, borg bloquait au-delà du tampon du tube (~64 Ko)
+            errs=[]
+            def _read_err():
+                try: errs.extend(ps.stderr.read().split('\n'))
+                except (ValueError,OSError): pass   # stderr non UTF-8 (bannière ssh) : message sans cause, jamais une trace de thread
+            err_t=threading.Thread(target=_read_err,daemon=True); err_t.start()
             if interrupted_event.is_set():   # lancé pendant l'arrêt : le moniteur ne l'a pas vu
                 with running_procs_lock: signaled.add(pair)
                 ps.terminate()
@@ -6360,8 +6455,12 @@ class BorgHelper:
             finally:
                 with running_procs_lock:
                     running_procs.pop(pair,None); killed=pair in signaled
+            err_t.join(5)
             ok=ps.returncode in (0,1) and not killed   # tué par le moniteur : jamais gardé, quel que soit le code
             if not ok: entries=[]; exclu={}
+            if not ok and not killed:   # 1.0.175 (A70) : échec de borg diff dit (avant : paire écartée sans un mot)
+                printer(f"[WARN] {self._borg_fail_msg(nick,'borg diff',_rb_errmsg({'exitcode':ps.returncode,'stderr':list(errs)},'borg diff'))}"
+                        f" — paire {a_old} → {a_new} non indexée")
             return (a_old,a_new,date_new,entries,exclu,ok)
         interrupted_event=threading.Event()  # demande d'arrêt détectée (prioritaire ou échéance), raison dans why[0]
         monitor_stop=threading.Event()       # fin normale : arrête le thread de surveillance, sans rien signaler
@@ -6782,8 +6881,9 @@ class BorgHelper:
             with _iso(n,lambda: conn):
                 db_path=self.db.get_diff_db(n)
                 self.db.ensure_diff_db(db_path,create=False)
-                if self.db._is_index_empty(n,db_path):
-                    msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
+                ie=self.db._is_index_empty(n,db_path)   # 1.0.175 (A72) : True (vide) ou message d'erreur SQLite réelle
+                if ie:
+                    msg=ie if isinstance(ie,str) else f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
                     if as_json: results[n]={'error':msg}
                     else: printer(f"[ERREUR] {msg}")
                     continue
@@ -6839,8 +6939,9 @@ class BorgHelper:
             with _iso(n,lambda: conn):
                 db_path=self.db.get_diff_db(n)
                 self.db.ensure_diff_db(db_path,create=False)
-                if self.db._is_index_empty(n,db_path):
-                    msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
+                ie=self.db._is_index_empty(n,db_path)   # 1.0.175 (A72) : True (vide) ou message d'erreur SQLite réelle
+                if ie:
+                    msg=ie if isinstance(ie,str) else f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
                     if as_json: results[n]={'error':msg}
                     else: printer(f"[ERREUR] {msg}")
                     continue
@@ -7156,8 +7257,9 @@ class BorgHelper:
             with _iso(n,lambda: conn):
                 db_path=self.db.get_diff_db(n)
                 self.db.ensure_diff_db(db_path,create=False)
-                if self.db._is_index_empty(n,db_path):
-                    msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
+                ie=self.db._is_index_empty(n,db_path)   # 1.0.175 (A72) : True (vide) ou message d'erreur SQLite réelle
+                if ie:
+                    msg=ie if isinstance(ie,str) else f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
                     if as_json: results[n]={'error':msg}
                     else: printer(f"[ERREUR] {msg}")
                     continue
@@ -7263,8 +7365,9 @@ class BorgHelper:
             with _iso(n,lambda: conn):
                 db_path=self.db.get_diff_db(n)
                 self.db.ensure_diff_db(db_path,create=False)
-                if self.db._is_index_empty(n,db_path):
-                    msg=f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
+                ie=self.db._is_index_empty(n,db_path)   # 1.0.175 (A72) : True (vide) ou message d'erreur SQLite réelle
+                if ie:
+                    msg=ie if isinstance(ie,str) else f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
                     if as_json: results[n]={'error':msg}
                     else: printer(f"[ERREUR] {msg}")
                     continue
@@ -7394,7 +7497,8 @@ class BorgHelper:
             idx_am_d={r[0]:(r[1] or 0,r[2] or 0) for r in idx_am}
             exclu_am_d={r[0]:(r[1] or 0,r[2] or 0) for r in exclu_am}
             nfiles_d={r[0]:r[1] for r in nfiles_rows if r[1]}
-        except sqlite3.Error:
+        except sqlite3.Error as e:
+            _reader_sqlite_err(e,db_path)   # 1.0.175 (A72) : lignes Exclus/Inchangés perdues -> dit
             _close_quiet(conn2); exclu_by_ct={}; exclu_n=0; exclu_sz=0; idx_am_d={}; exclu_am_d={}; nfiles_d={}
         if not total_count and not exclu_n:   # 1.0.155 : diff_index vidé par IdxPurge -> ses exclus restent affichés
             printer(f"  {nick}: diff_index vide"); return
@@ -7433,8 +7537,11 @@ class BorgHelper:
             if not os.path.exists(db_path):
                 if as_json: print(json.dumps({'error':f"diff.db absent pour {nick}"},ensure_ascii=False,indent=2)); return
                 printer(f"  {nick}: diff.db absent — lancez borgHelper -c Index -n {nick}"); return
-            if not _db_has_schema(db_path):
-                msg=f"Aucune archive indexée — lancez : borgHelper -c Index -n {nick}"
+            pr=_db_probe(db_path)   # 1.0.175 (A72) : illisible n'est plus « aucune archive »
+            if pr[0]!='base':
+                if pr[0]=='illisible': _reader_sqlite_err(pr[1],db_path)
+                msg=(f"Aucune archive indexée — lancez : borgHelper -c Index -n {nick}" if pr[0]=='absent'
+                     else f"SQLite error ({db_path}): {pr[1]}")
                 if as_json: print(json.dumps({'error':msg},ensure_ascii=False,indent=2)); return
                 printer(f"  {nick}: {msg}"); return
         if not as_json:
@@ -7481,8 +7588,11 @@ class BorgHelper:
         if not os.path.exists(db_path):
             if as_json: print(json.dumps({'error':f"diff.db absent pour {nick}"},ensure_ascii=False,indent=2)); return
             printer(f"  {nick}: diff.db absent — lancez borgHelper -c Index -n {nick}"); return
-        if not _db_has_schema(db_path):
-            msg=f"Aucune archive indexée — lancez : borgHelper -c Index -n {nick}"
+        pr=_db_probe(db_path)   # 1.0.175 (A72) : illisible n'est plus « aucune archive »
+        if pr[0]!='base':
+            if pr[0]=='illisible': _reader_sqlite_err(pr[1],db_path)
+            msg=(f"Aucune archive indexée — lancez : borgHelper -c Index -n {nick}" if pr[0]=='absent'
+                 else f"SQLite error ({db_path}): {pr[1]}")
             if as_json: print(json.dumps({'error':msg},ensure_ascii=False,indent=2)); return
             printer(f"  {nick}: {msg}"); return
         if not as_json:
@@ -7557,7 +7667,10 @@ class BorgHelper:
         db_path=self.db.get_diff_db(nick)
         last_backup=None
         build={'state':'complete'}   # AD-10 : base sans build_state (antérieure au chantier) = complète
-        if os.path.exists(db_path) and _db_has_schema(db_path):
+        pr=_db_probe(db_path)
+        if pr[0]=='illisible':   # 1.0.175 (A72) : illisible n'est plus « aucune archive indexée »
+            _reader_sqlite_err(pr[1],db_path); last_backup={'error':f"base illisible ({pr[1]})"}
+        if pr[0]=='base':
             conn=None
             try:
                 conn=_open_db(db_path,nick=nick,role='read',empty_ok=True)
@@ -7577,8 +7690,8 @@ class BorgHelper:
                 last_backup={'error':f"base illisible ({type(e).__name__}: {e})"}; build=None
             except sqlite3.OperationalError as e:
                 if 'no such table' not in str(e): raise
-            except sqlite3.Error:
-                pass
+            except sqlite3.Error as e:   # 1.0.175 (A72) : corruption en cours de lecture -> dite
+                _reader_sqlite_err(e,db_path); last_backup={'error':f"base illisible ({e})"}
             finally:
                 if conn is not None: conn.close()
         if last_backup and 'error' not in last_backup:
@@ -7975,7 +8088,8 @@ class BorgHelper:
             exclu_by_ct3={r[0]:(r[1] or 0,r[2] or 0) for r in exclu_rows3}
             exclu_n=sum(v[0] for v in exclu_by_ct3.values()); exclu_sz=sum(v[1] for v in exclu_by_ct3.values())
             nfiles_new=nfiles_row[0] if nfiles_row and nfiles_row[0] else None
-        except sqlite3.Error:
+        except sqlite3.Error as e:
+            _reader_sqlite_err(e,db_path)   # 1.0.175 (A72)
             _close_quiet(conn3); exclu_by_ct3={}; exclu_n=0; exclu_sz=0; nfiles_new=None
         if not total_count and not exclu_n:   # 1.0.154 : paire vidée par IdxPurge -> ses exclus restent affichés
             printer(f"  {nick}: aucune entrée pour cette paire ({arch_old} → {arch_new})"); return
@@ -8277,6 +8391,7 @@ class BorgHelper:
         cfg=self.borg.cfgreaded(nick,debug=debug)
         last_modified=self.borg._boex_last_modified(nick,debug=debug)
         pruneme=self.cache_prune_dryrun(nick,last_modified,debug=debug)
+        prune_unknown=pruneme is None; pruneme=pruneme or []   # 1.0.175 (A75) : prune --dry-run en échec -> « — », jamais 0
         r=self.cacheJsonBoexWithLM(nick,['info','--json']+glob_args(cfg,archives=True),debug=debug,last_modified=last_modified)
         resume={}
         for i in ['duration','compressed_size','deduplicated_size','nfiles','original_size','prunable','prunable_os','prunable_cs']:
@@ -8328,13 +8443,15 @@ class BorgHelper:
             tcmpl[nick]['duree']=kept[resume['lastname']]['durationM']
             tcmpl[nick]['derniere']=kept[resume['lastname']]['deduplicated_size']
         tcmpl[nick]['taille']=resume['unique_csize']
-        tcmpl[nick]['recuperable']=resume['prunable']
+        tcmpl[nick]['recuperable']=None if prune_unknown else resume['prunable']
+        if prune_unknown: tcmpl[nick]['_prune_unknown']=True   # retiré à l'affichage
         tcmpl[nick]['reste']=avail
         all_kept=list(kept.keys())
         size_delta_map={arch:_fmt_dedup_delta(kept[arch]['original_size'],
             kept[all_kept[idx-1]]['original_size'] if idx>0 else None)
             for idx,arch in enumerate(all_kept)}
         tbkps={'Prunable':{'name':'Prunable','original_size':resume['prunable_os'],'compressed_size':resume['prunable_cs'],'deduplicated_size':resume['prunable']}}
+        if prune_unknown: tbkps['Prunable'].update(original_size=None,compressed_size=None,deduplicated_size=None)
         cpt=0
         for i in kept.keys():
             if kept[i]['prunMe']=='No':
@@ -8408,8 +8525,10 @@ class BorgHelper:
                 if htrep: errhost.append(nick)
                 else: tcmpl[nick]['nom']=f"***{nick}"
             for i in ['duree','derniere','taille','recuperable']: reshosto[i]+=(tcmpl[nick][i] or 0)
+            unk=tcmpl[nick].pop('_prune_unknown',False)   # 1.0.175 (A75) ; jumelles report/report_offline
             for i in ['derniere','taille','recuperable','reste']:
                 if (i in tcmpl[nick].keys()) and not(tcmpl[nick][i] is None): tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
+                elif i=='recuperable' and unk: tcmpl[nick][i]=None if as_json else '—'   # récupérable inconnu
                 else: tcmpl[nick][i]=""
             if tcmpl[nick]['reste']=="" and self.borg.repoLocalAbsent(nick):   # 1.0.167 (jumelles) : disque démonté, chemin faux
                 tcmpl[nick]['reste']="⚠ dépôt absent"; errcode=2   # code 2 + nick en alerte (décision de l'utilisateur)
@@ -8422,7 +8541,7 @@ class BorgHelper:
             tcmpl[nick]['duree']=f"{tcmpl[nick]['duree']:.2f} min"
             for i in tbkps.keys():
                 for j in ['original_size','compressed_size','deduplicated_size']:
-                    tbkps[i][j]=convert_octets_readable(tbkps[i][j])
+                    tbkps[i][j]=(None if as_json else '—') if tbkps[i][j] is None else convert_octets_readable(tbkps[i][j])   # A75 : inconnu
                 if 'duration' in tbkps[i].keys():
                     tbkps[i]['duration']=f"{tbkps[i]['duration']:.2f} min"
             reshos[nick]=tcmpl[nick]; resbck[nick]=tbkps
@@ -8502,8 +8621,10 @@ class BorgHelper:
                 if htrep: errhost.append(nick)
                 else: tcmpl[nick]['nom']=f"***{nick}"
             for i in ['duree','derniere','taille','recuperable']: reshosto[i]+=(tcmpl[nick][i] or 0)
+            unk=tcmpl[nick].pop('_prune_unknown',False)   # 1.0.175 (A75) ; jumelles report/report_offline
             for i in ['derniere','taille','recuperable','reste']:
                 if (i in tcmpl[nick].keys()) and not(tcmpl[nick][i] is None): tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
+                elif i=='recuperable' and unk: tcmpl[nick][i]=None if as_json else '—'   # récupérable inconnu
                 else: tcmpl[nick][i]=""
             if tcmpl[nick]['reste']=="" and self.borg.repoLocalAbsent(nick):   # 1.0.167 (jumelles) : disque démonté, chemin faux
                 tcmpl[nick]['reste']="⚠ dépôt absent"; errcode=2   # code 2 + nick en alerte (décision de l'utilisateur)
@@ -8516,7 +8637,7 @@ class BorgHelper:
             tcmpl[nick]['duree']=f"{tcmpl[nick]['duree']:.2f} min"
             for i in tbkps.keys():
                 for j in ['original_size','compressed_size','deduplicated_size']:
-                    tbkps[i][j]=convert_octets_readable(tbkps[i][j])
+                    tbkps[i][j]=(None if as_json else '—') if tbkps[i][j] is None else convert_octets_readable(tbkps[i][j])   # A75 : inconnu
                 if 'duration' in tbkps[i].keys():
                     tbkps[i]['duration']=f"{tbkps[i]['duration']:.2f} min"
             reshos[nick]=tcmpl[nick]; resbck[nick]=tbkps
@@ -8574,6 +8695,14 @@ def codec_selftest(pattern=None,list_only=False):
         print(f"{'OK  ' if ok else 'FAIL'} {name}{err}"); results.append(ok)
     def skip(name,why):
         if _selected(name): skipped[0]+=1; print(f"SKIP {name} ({why})")
+    def _pre(fn):
+        """1.0.175 (story 38, A74) : décor dont dépendent les contrôles SUIVANTS — fn exécutée tout de suite, même si son
+        contrôle est écarté par -f (avant : `-f Key` laissait la base en clair, 2 FAIL) ; rend la fonction du contrôle (résultat,
+        ou l'exception relevée)."""
+        try: r=fn(); return lambda: r
+        except (Exception,SystemExit) as e:
+            def _raise(): raise e
+            return _raise
     def raises(exc,fn):
         try: fn()
         except exc: return True
@@ -8839,7 +8968,7 @@ def codec_selftest(pattern=None,list_only=False):
         check("_open_db : rôle invalide refusé",lambda: raises(ValueError,lambda:_open_db(dbp,role='root')))
         check("_open_db : base plain -> codec None, mode plain, rôle mémorisé",lambda: (lambda k:(k.codec is None and k.mode=='plain' and k.role=='admin'))(c))
         check("erreurs Db* : pas des sqlite3.Error",lambda: not any(issubclass(e,sqlite3.Error) for e in (DbKeyError,DbModeError,DbTamperError,DbCodecError)))
-        check("enc_header : première écriture -> True",lambda: _enc_header_write(c,hdr) is True)
+        check("enc_header : première écriture -> True",_pre(lambda: _enc_header_write(c,hdr) is True))   # A74 : base siv1 des suivants
         _raw1=_enc_header_read(c)
         check("enc_header : 2e écriture (ON CONFLICT DO NOTHING) -> False, en-tête initial intact",
               lambda: _enc_header_write(c,_enc_header_build('x','siv1','light')[0]) is False and _enc_header_read(c)==_raw1
@@ -9137,7 +9266,7 @@ def codec_selftest(pattern=None,list_only=False):
             row=c.execute("SELECT started_at,finished_at,result,notified_at FROM bkp_status WHERE nick='bsA' AND run_id='run1'").fetchone()
             c.close()
             return row is not None and row[0] is not None and row[1] is None and row[2] is None and row[3] is None
-        check("bkp_status : store_bkp_status_start -> started_at posé, le reste NULL",_bs_start_check)
+        check("bkp_status : store_bkp_status_start -> started_at posé, le reste NULL",_pre(_bs_start_check))   # A74 : ligne run1
         def _bs_last():
             """1.0.152 (story 15) : last_bkp_status — aucune ligne -> None ; la plus récente (started_at, puis ordre
             d'écriture) ; en cours -> finished_at None ; autre nick ignoré ; base absente -> None sans création ; base
@@ -9306,7 +9435,7 @@ def codec_selftest(pattern=None,list_only=False):
             with ThreadPoolExecutor(max_workers=2) as ex:
                 results=list(ex.map(lambda _:bh.claim_bkp_status('bsC','runC',db_path=bs_path),[0,1]))
             return sorted(results)==[False,True]
-        check("bkp_status : claim_bkp_status CAS — deux réclamations concurrentes, une seule gagne",_bs_claim_cas)
+        check("bkp_status : claim_bkp_status CAS — deux réclamations concurrentes, une seule gagne",_pre(_bs_claim_cas))   # A74
         check("bkp_status : claim_bkp_status sur ligne déjà réclamée -> False (idempotent)",
               lambda: bh.claim_bkp_status('bsC','runC',db_path=bs_path) is False)
         def _bs_claim_sets_notified_at():
@@ -9360,7 +9489,7 @@ def codec_selftest(pattern=None,list_only=False):
             with ThreadPoolExecutor(max_workers=2) as ex:
                 results=list(ex.map(lambda _:bh.claim_bkp_status_start('bsE','runE',db_path=bs_path),[0,1]))
             return sorted(results)==[False,True]
-        check("bkp_status : claim_bkp_status_start CAS — deux réclamations concurrentes, une seule gagne",_bs_claim_start_cas)
+        check("bkp_status : claim_bkp_status_start CAS — deux réclamations concurrentes, une seule gagne",_pre(_bs_claim_start_cas))   # A74
         check("bkp_status : claim_bkp_status_start sur ligne déjà réclamée -> False (idempotent)",
               lambda: bh.claim_bkp_status_start('bsE','runE',db_path=bs_path) is False)
         def _bs_claim_start_sets_start_notified_at():
@@ -9979,8 +10108,17 @@ def codec_selftest(pattern=None,list_only=False):
                         and root['a_b'].get('deleted') and root['a_b']['is_dir']
                         and 'error' in get('qp','etc',A3,A1) and 'error' in get('qp','etc','inconnue',A3))
             check("TreeHist -X : changements entre deux archives (bornes, supprimés, répertoires, erreurs), identique clair/chiffré",_treehist_changes_ok)
-            check("plans (etc) sur connexion chiffrée : aucun LIKE/GLOB, aucun ORDER BY portant sur un chemin",
-                  lambda: traced and not [q for q in traced if re.search(r'\bLIKE\b|\bGLOB\b|ORDER BY[^\n]*\bpath\b',q)])
+            def _plans_ok():
+                if not traced:   # 1.0.175 (A74) : contrôles de parité écartés par -f -> échantillon des mêmes appels (revue : un
+                    # ÉCHANTILLON — ListBkpFiles, _find_last_archive_with_file, TreeHist -X, jokers non couverts : un mutant de ces chemins
+                    # se juge au run complet, jamais sous -f plans)
+                    for call in (lambda: _q_pair(bhq.treehist,'etc',as_json=True,key=True),lambda: _q_pair(bhq.treefind,'etc','*',as_json=True,key=True),
+                                 lambda: _q_pair(bhq.search,'log',as_json=True,key=True),lambda: _q_pair(bhq.filehist,'/etc/passwd',as_json=True,key=True),
+                                 lambda: _q_pair(bhq.duidx,'etc',as_json=True),lambda: _q_pair(bhq.idxtop,3,20,as_json=True),
+                                 lambda: _q_pair(bhq.difftop,f"{A1},{A2}",3,10,as_json=True)):
+                        call()
+                return traced and not [q for q in traced if re.search(r'\bLIKE\b|\bGLOB\b|ORDER BY[^\n]*\bpath\b',q)]
+            check("plans (etc) sur connexion chiffrée : aucun LIKE/GLOB, aucun ORDER BY portant sur un chemin",_plans_ok)
         finally:
             globals()['_open_db']=_orig_open
         def _pragma_ok():
@@ -10061,7 +10199,7 @@ def codec_selftest(pattern=None,list_only=False):
                                 f"version {ver} compteur {seq} tables {tabs} vue {view} vue lue {len(got)} message {err.getvalue()[-80:]!r} rejouée {again}")
                 ok=ok and r
             return ok
-        check("snapshot par version : base v10 migrée (clair et chiffrée) — ids, liens, vue, version 11, compteur ; rejouée sans écriture",_snapv_migration)
+        check("snapshot par version : base v10 migrée (clair et chiffrée) — ids, liens, vue, version 11, compteur ; rejouée sans écriture",_pre(_snapv_migration))   # A74
         def _snapv_old_binary():
             """Base 11 ouverte par un binaire qui ne comprend que 10 : SchemaVersionError (v11 > v10), base intacte."""
             dp=os.path.join(tmp,'snapv-qp.db')
@@ -13197,6 +13335,23 @@ if mode=='extract' and sub=='extract': open('restored','w').write('x'); sys.exit
 if mode=='extractfail' and sub=='list':
     print(json.dumps(dict(archives=[dict(name='a',start='2026-01-01T00:00:00'),dict(name='b',start='2026-01-02T00:00:00')]))); sys.exit(0)
 if mode=='extractfail' and sub=='extract': sys.stderr.write('Archive b does not exist'+chr(10)); sys.exit(2)
+# 1.0.175 (A70, A73) : stderr RÉEL d'un plantage de borg 1.2.6 (mesuré, bac à sable : config max_segment_size = x), bandeau abrégé
+CRASH=['Exception ignored in: <function Repository.__del__ at 0x7fb13b8fdf70>','Traceback (most recent call last):',
+       '  File "borg/repository.py", line 190, in __del__','AssertionError: cleanup happened in Repository.__del__','Local Exception',
+       'Traceback (most recent call last):','  File "borg/archiver.py", line 5324, in main',
+       '  File "borg/helpers/parseformat.py", line 268, in parse_file_size',"ValueError: could not convert string to float: 'x'",'',
+       'Platform: Linux h 6.8.0 x86_64','Linux: Unknown Linux  ','Borg: 1.2.6  Python: CPython 3.9.18','PID: 42  CWD: /tmp',
+       "sys.argv: ['/usr/local/bin/borg.wrapped', 'secret-argv']",'SSH_ORIGINAL_COMMAND: None','']
+def crash():   # borg extract 1.2.6 avertit d'abord de --numeric-owner (mesuré)
+    w=['Warning: "--numeric-owner" has been deprecated. Use --numeric-ids instead.'] if sub=='extract' else []
+    sys.stderr.write(chr(10).join(w+CRASH)); sys.exit(2)
+if mode=='crash': crash()
+if mode=='diffcrash' and sub=='list' and '--json' in a:
+    print(json.dumps(dict(archives=[dict(name='a',start='2026-01-01T00:00:00'),dict(name='b',start='2026-01-02T00:00:00')]))); sys.exit(0)
+if mode=='diffcrash' and sub=='diff': crash()
+if mode=='initexists' and sub=='init': sys.stderr.write('A repository already exists at ssh://h.invalid/./r.'+chr(10)); sys.exit(2)
+if mode=='initok' and sub=='init':
+    sys.stderr.write('IMPORTANT: you will need both KEY AND PASSPHRASE to access this repo!'+chr(10)+'    borg key export repo'+chr(10)); sys.exit(0)
 fail()
 ''')
             os.chmod(fb+'.tmp',0o700); os.replace(fb+'.tmp',fb)
@@ -13217,7 +13372,7 @@ fail()
         def _bf_cmds():
             """DiffBkp (sans -b, -b a,b, -j), Restore (-L, -w, -b x -w), Mount (ALL, -b last), Key, DelBkp, Prune : dépôt local
             introuvable -> « za: ⚠ dépôt absent (…) », code 2, borg jamais lancé, aucun fichier dans CACHE_DIR ; dépôt distant en
-            échec -> « zr: <commande borg> a échoué : Connection closed by remote host », code 2 (Restore -b : ligne de borg extract,
+            échec -> « zr: <commande borg> a échoué : Connection closed by remote host », code 2 (Restore -b : « borg extract a échoué » depuis 1.0.175,
             inchangée) ; jamais de trace ni de dict brut ;
             -j : {'error': …} seul sur stdout."""
             d,rc,calls,cli=_bf_env('borgfail'); bad={}
@@ -13232,7 +13387,7 @@ fail()
                     code,out,err=cli(*a,'-n',nick); o=out+err
                     want=f"{nick}: ⚠ dépôt absent ({d}/nulle-part)" if nick=='za' else f"{nick}: borg "
                     ok=code==2 and want in o and 'Traceback' not in o and "{'stdout'" not in o and "'exitcode'" not in o
-                    if nick=='zr':   # archive explicite (-b) : ligne de borg extract telle quelle (déjà lisible avant 1.0.172)
+                    if nick=='zr':   # archive explicite (-b) : « borg extract a échoué : … » (1.0.175 ; avant, ligne de borg telle quelle)
                         ok=(code==2 and 'Traceback' not in o and "{'stdout'" not in o and 'Connection closed by remote host' in o
                             and (lbl=='Restore -b -w' or 'zr: borg ' in o and 'a échoué : Connection closed by remote host' in o))
                     else: ok=ok and not os.path.exists(calls)
@@ -13246,6 +13401,208 @@ fail()
             if bad: print(f"  {bad}")
             return not bad
         check("borg en échec : DiffBkp, Restore, Mount, Key, DelBkp, Prune -> « ⚠ dépôt absent » / message réel, code 2, jamais de trace ni de dict brut",_bf_cmds)
+        # 1.0.175 (story 38, A70, A73, décisions de l'utilisateur) : plantage RÉEL de borg relayé à chaque site
+        def _bf_crash():
+            """Borg factice qui rejoue un plantage réel de borg 1.2.6 (bloc « Exception ignored », trace, bandeau) : Restore -w/-W/tar,
+            ListPerms, DiffBkp (borg diff), Key, Init, Index -> « zr: borg <cmd> a échoué : Local Exception; ValueError: … » (Index :
+            « [ERREUR] … borg list … », code 2, index_last code 2), code de borg, ni trace, ni bandeau, ni sys.argv, ni dict brut ;
+            Index d'un dépôt local absent -> « ⚠ dépôt absent », code 2 ; Init : dépôt existant -> code 2 (avant : 0, dict brut),
+            succès -> conseils de borg gardés (indentation comprise), code 0 ; Index : borg diff en échec -> [WARN] dit (avant :
+            muet). Attentes en dur."""
+            d,rc,calls,cli=_bf_env('borgcrash'); bad={}
+            cause="a échoué : Local Exception; ValueError: could not convert string to float: 'x'"
+            def mode(m): open(os.path.join(d,'mode'),'w').write(m)
+            def clean(o): return not any(x in o for x in ('Traceback','Platform:','sys.argv','secret-argv','Exception ignored',"{'stdout'","'exitcode'"))
+            mode('crash')
+            dest=os.path.join(d,'dest')
+            for lbl,a,what in (('Restore -w',['-c','Restore','-f','x','-b','b','-w',os.path.join(dest,'w')],'borg extract'),
+                               ('Restore -W',['-c','Restore','-f','x','-b','b','-W',os.path.join(dest,'W')],'borg extract'),
+                               ('Restore tar',['-c','Restore','-f','x','-b','b','-w',os.path.join(dest,'t.tgz')],'borg extract'),
+                               ('ListPerms',['-c','Restore','-f','x','-b','b','-L'],'borg list'),('Key',['-c','Key'],'borg key export'),
+                               ('Index',['-c','Index'],'borg list')):
+                code,out,err=cli(*a,'-n','zr'); o=out+err
+                want=f"zr: {what} {cause}"
+                if lbl=='Index': want='[ERREUR] '+want
+                if not (code==2 and want in o and clean(o) and o.count('Local Exception')==1 and 'ValueError' not in o.replace(want,'')):
+                    bad[lbl]=(code,o[-260:])   # une seule ligne d'échec : ni stderr réduit en plus, ni avertissement à part
+            il=os.path.join(d,'cache','rc-zr-index-last.json')
+            try: rec=json.load(open(il)); bad.update({} if (rec['code'],rec['outcome'])==(2,'error') and cause in rec['message'] else {'index_last':rec})
+            except (OSError,ValueError,KeyError) as e: bad['index_last']=repr(e)
+            if os.path.exists(os.path.join(dest,'w')): bad['dossier -w laissé']=True
+            if os.path.exists(calls): os.unlink(calls)
+            code,out,err=cli('-c','Index','-n','za')
+            za_files=[f for f in (os.listdir(os.path.join(d,'cache')) if os.path.isdir(os.path.join(d,'cache')) else ()) if '-za-' in f and f.endswith('.db')]
+            if not (code==2 and f"za: ⚠ dépôt absent ({d}/nulle-part)" in out+err and not os.path.exists(calls) and not za_files):
+                bad['Index za']=(code,(out+err)[-200:],os.path.exists(calls),za_files)   # comme A60 : ni borg ni base
+            mode('initexists'); code,out,err=cli('-c','Init','-n','zr')
+            if not (code==2 and 'zr: borg init a échoué : A repository already exists at ssh://h.invalid/./r.' in out+err and clean(out+err)):
+                bad['Init existant']=(code,(out+err)[-200:])
+            mode('initok'); code,out,err=cli('-c','Init','-n','zr')
+            if not (code==0 and 'IMPORTANT: you will need both KEY AND PASSPHRASE' in err and '    borg key export repo' in err and clean(out+err)):
+                bad['Init ok']=(code,(out+err)[-200:])
+            mode('diffcrash'); code,out,err=cli('-c','DiffBkp','-b','a,b','-n','zr')
+            if not (code==2 and f"zr: borg diff {cause}" in out+err and clean(out+err)): bad['DiffBkp']=(code,(out+err)[-220:])
+            code,out,err=cli('-c','Index','-n','zr')
+            if not (code==0 and f"[WARN] zr: borg diff {cause} — paire a → b non indexée" in out+err and clean(out+err)): bad['Index diff']=(code,(out+err)[-300:])
+            if bad: print(f"  {bad}")
+            return not bad
+        check("plantage de borg relayé : Restore (-w, -W, tar), ListPerms, DiffBkp, Key, Init, Index -> cause, code de borg, ni trace ni bandeau",_bf_crash)
+        def _borg_out_sites():
+            """En processus (borg simulé) : _print_borg_stderr (Bkp, Restore, Mount, Key) — trace et bandeau réduits, texte JSON et
+            avertissements gardés (indentation comprise), DEBUG masqué ; Umount et Login (key import) : plus de dict brut, ligne d'échec,
+            code de borg ; prune --dry-run en échec : jamais mis en cache, [WARN] « récupérable inconnu », borg relancé à l'appel
+            suivant ; succès : en cache (A75)."""
+            d,b=_nb_env('borgout'); res={}
+            crash_txt=['Local Exception','Traceback (most recent call last):','  File "x", line 1',"ValueError: v",'Platform: Linux h','PID: 1']
+            def run(fn):
+                o,e=io.StringIO(),io.StringIO(); code=None
+                with contextlib.redirect_stdout(o),contextlib.redirect_stderr(e):
+                    try: fn()
+                    except SystemExit as x: code=x.code
+                return o.getvalue(),e.getvalue(),code
+            _,e,_=run(lambda: _print_borg_stderr(['Platform-tools/adb: Permission denied','Warning: fichier a','  détail indenté']+crash_txt+[
+                {'levelname':'INFO','message':'normal\nsur deux lignes'},{'levelname':'DEBUG','message':'caché'},
+                {'levelname':'ERROR','message':'Local Exception'},{'levelname':'ERROR','message':'Traceback (most recent call last):\n  File "y"\nKeyError: k\n\nPlatform: L'},
+                {'levelname':'ERROR','message':'Borg server: Platform: s'}]))
+            res['affichage']=e==('Platform-tools/adb: Permission denied\nWarning: fichier a\n  détail indenté\nLocal Exception\nValueError: v\n[INFO] normal\nsur deux lignes\n'
+                                 '[ERROR] Local Exception\n[ERROR] KeyError: k\n')
+            rb_crash={'exitcode':2,'stdout':[],'stderr':crash_txt}
+            with mock.patch('{}.mountedornot'.format(__name__),lambda *a,**k: True), \
+                 mock.patch.object(b.borg,'cfgreaded',lambda n,*a,**k: {'MOUNTPOINT':d,'BORG_REPO':'ssh://h/r'}), \
+                 mock.patch.object(b.borg,'repoLocalAbsent',lambda *a,**k: False), mock.patch.object(b.borg,'boex',lambda *a,**k: rb_crash):
+                o,e,code=run(lambda: b.umount('zu'))
+            res['umount']=(code,e.strip())==(2,'zu: borg umount a échoué : Local Exception; ValueError: v') and "{'" not in o
+            kf=os.path.join(d,'kf'); open(kf,'w').write('k')
+            with mock.patch.object(b.borg,'cfgwrite',lambda *a,**k: None), mock.patch.object(b.borg,'cfgread',lambda *a,**k: {}), \
+                 mock.patch.object(b.borg,'repoLocalAbsent',lambda *a,**k: False), mock.patch.object(b.borg,'boex',lambda *a,**k: rb_crash):
+                o,e,code=run(lambda: b.login('s','zl',kf,'pw','ssh://h/r',None))
+            res['key import']=(code,e.strip())==(2,'zl: borg key import a échoué : Local Exception; ValueError: v') and "{'" not in o
+            rb_warn={'exitcode':1,'stdout':['sortie de borg'],'stderr':['Warning: ancienne clé']}   # code 1 : avertissement, lignes gardées
+            with mock.patch('{}.mountedornot'.format(__name__),lambda *a,**k: True), \
+                 mock.patch.object(b.borg,'cfgreaded',lambda n,*a,**k: {'MOUNTPOINT':d,'BORG_REPO':'ssh://h/r'}), \
+                 mock.patch.object(b.borg,'boex',lambda *a,**k: rb_warn):
+                o1,e1,c1=run(lambda: b.umount('zu'))
+            with mock.patch.object(b.borg,'cfgwrite',lambda *a,**k: None), mock.patch.object(b.borg,'cfgread',lambda *a,**k: {}), \
+                 mock.patch.object(b.borg,'boex',lambda *a,**k: rb_warn):
+                o2,e2,c2=run(lambda: b.login('s','zl',kf,'pw','ssh://h/r',None))
+            # revue story 38 (G2, M2) : CLI Login — nom invalide refusé (code 2) sans écrire le rc ; « % » d'une passphrase relu tel quel
+            writes=[]
+            with mock.patch.object(b.borg,'cfgwrite',lambda *a,**k: writes.append(a)):
+                bad_names=[run(lambda n=n: b.login(n,n,None,'pw','ssh://h/r',None))[2] for n in ('evil]\nBORG_RSH=x\n[y','ALL','a,b','a b')]
+            res['nom invalide']=bad_names==[2,2,2,2] and not writes
+            rcp=os.path.join(d,'rc-login'); open(rcp,'w').write('[DEFAULT]\nSER_LOGIN=x\n'); os.chmod(rcp,0o600)
+            bl=BorgHelper(cfgfile=rcp,cache_dir=os.path.join(d,'cache-login'))
+            run(lambda: bl.borg.cfgwrite('zp','zp','a%b%%c','ssh://h/%(x)s',None))
+            cp=configparser.ConfigParser(); cp.optionxform=str; cp.read(rcp)
+            res['% relu tel quel']=(cp['zp']['BORG_PASSPHRASE'],cp['zp']['BORG_REPO'])==('a%b%%c','ssh://h/%(x)s')
+            # cacheJsonBoexWithLM : borg en échec -> RuntimeError avec la cause (avant : IndexError « list index out of range »)
+            with mock.patch.object(b.borg,'boex',lambda *a,**k: rb_crash):
+                try: b.cacheJsonBoexWithLM('zc',['info','--json'],last_modified='LM'); res['info en échec']=False
+                except RuntimeError as x: res['info en échec']=str(x)=='Local Exception; ValueError: v'
+                except Exception: res['info en échec']=False
+            res['code 1 gardé']=all((c,o.strip(),e.strip())==(1,'sortie de borg','Warning: ancienne clé') for c,o,e in ((c1,o1,e1),(c2,o2,e2)))
+            n=[0]
+            def fake(nick,cmd,**k):
+                n[0]+=1
+                if fail[0]: return {'exitcode':2,'stdout':[],'stderr':['Failed to create/acquire the lock /r/lock (timeout).']}
+                return {'exitcode':0,'stdout':[],'stderr':['Would prune:                    a1   Mon, 2026-01-01']}
+            fail=[True]
+            with mock.patch.object(b.borg,'cfgreaded',lambda n,*a,**k: {}), mock.patch.object(b.borg,'repoLocalAbsent',lambda *a,**k: False), \
+                 mock.patch.object(b.borg,'boex',fake):
+                _,e1,_=run(lambda: res.__setitem__('dry1',b.cache_prune_dryrun('zd','LM1'))); run(lambda: b.cache_prune_dryrun('zd','LM1'))
+                after_fail=n[0]; fail[0]=False
+                run(lambda: res.__setitem__('dry ok',b.cache_prune_dryrun('zd','LM2'))); run(lambda: b.cache_prune_dryrun('zd','LM2'))
+            res['dry']=(res.pop('dry1') is None and after_fail==2 and n[0]==3 and res.pop('dry ok')==['a1']
+                        and '[WARN] zd: borg prune --dry-run a échoué : Failed to create/acquire the lock /r/lock (timeout). — récupérable inconnu' in e1)
+            # Report en ligne (revue, décision de l'utilisateur) : récupérable inconnu -> « — » (texte), null (JSON), ligne Prunable idem
+            info={'repository':{'last_modified':'2026-01-02T00:00:00.000000'},'cache':{'stats':{'total_size':20,'total_csize':10,
+                  'unique_csize':5,'unique_size':8,'total_unique_chunks':1,'total_chunks':1}},'archives':[{'name':'a1',
+                  'start':'2026-01-01T00:00:00.000000','duration':60,'stats':{'compressed_size':10,'deduplicated_size':5,'original_size':20,'nfiles':1}}]}
+            def fboex(nick,cmd,**k):
+                if cmd[0]=='info': return {'exitcode':0,'stdout':[info],'stderr':[]}
+                return {'exitcode':2,'stdout':[],'stderr':['Failed to create/acquire the lock /r/lock (timeout).']}
+            with mock.patch.object(b.borg,'boex',fboex), mock.patch.object(b.borg,'dfRepo',lambda *a,**k: 1000), \
+                 mock.patch.object(b.borg,'repoLocalAbsent',lambda *a,**k: False):
+                ot,et,_=run(lambda: b.report('zr')); oj,ej,_=run(lambda: b.report('zr',as_json=True))
+            try:
+                j=json.loads(oj); hdr=next(l for l in ot.splitlines() if 'recuperable' in l); row=next(l for l in ot.splitlines() if 'zr' in l and '|' in l)
+                col=[c.strip() for c in hdr.split('|')].index('recuperable')
+                res['récupérable inconnu']=([c.strip() for c in row.split('|')][col]=='—' and j['summary']['zr']['recuperable'] is None
+                    and j['backups']['zr']['Prunable']['deduplicated_size'] is None and 'récupérable inconnu' in et and 'no such table' not in et+ej)
+            except (ValueError,KeyError,StopIteration) as x: res['récupérable inconnu']=repr(x)=='' 
+            ok=all(res.values())
+            if not ok: print(f"  {res} {e!r}")
+            return ok
+        check("sorties de borg en processus : affichage réduit (Bkp, Restore…), Umount et key import sans dict brut, prune --dry-run en échec jamais en cache",_borg_out_sites)
+        def _sqlite_marked():
+            """1.0.175 (story 38, A72, décision de l'utilisateur) : vraie erreur SQLite d'un lecteur (base corrompue, VÉRIFIÉE illisible
+            avant) -> `[ERREUR] SQLite error (<base>): …` une fois par base, sortie partielle et valeur de repli inchangées :
+            get_archive_measures/get_repo_stats/get_archive_chart (history.db), _is_index_empty (False : la requête du lecteur dit sa
+            cause), ArchiveHistory -j (« SQLite error » au lieu de « Aucune archive »), Status (« base illisible » au lieu de « aucune
+            archive ») ; base ABSENTE : silencieux, valeurs d'avant (« table absente » voulue)."""
+            d,b=_nb_env('sqlmark'); res={}
+            p=b.db.get_diff_db('zr'); h=b.db.get_history_db('zr')
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                b.db.ensure_diff_db(p,nick='zr'); b.db.store_archive_measure('zr','a1','2026-01-01T00:00:00',10,0,0,db_path=h)
+            for f in (p,h):
+                for x in (f+'-wal',f+'-shm'):
+                    if os.path.exists(x): os.unlink(x)
+                cn=sqlite3.connect(f); pg=cn.execute("PRAGMA page_size").fetchone()[0]
+                keep=max([1]+[r[0] for r in cn.execute("SELECT rootpage FROM sqlite_master WHERE name='db_meta'")]); cn.close()
+                raw=open(f,'rb').read(); open(f,'wb').write(raw[:pg*keep])   # fichier tronqué : illisible (la sonde dit « illisible »)
+            def broken(f,t):
+                try: sqlite3.connect(f'file:{f}?mode=ro',uri=True).execute(f"SELECT COUNT(*) FROM {t}").fetchone(); return False
+                except sqlite3.Error: return True
+            res['cible vue']=broken(p,'diff_index') and broken(h,'archive_measure')
+            def run(fn):
+                _SQLITE_ERR_SEEN.clear(); o,e=io.StringIO(),io.StringIO(); r=None
+                with contextlib.redirect_stdout(o),contextlib.redirect_stderr(e):
+                    try: r=fn()
+                    except (Exception,SystemExit) as x: r=('exc',type(x).__name__,str(x)[:120])
+                return r,o.getvalue(),e.getvalue()
+            mark=lambda f,e: e.count(f"[ERREUR] SQLite error ({f}): ")==1
+            for nm,fn,want in (('mesures',lambda: b.db.get_archive_measures('zr',h),{}),('repo_stats',lambda: b.db.get_repo_stats('zr',h),{}),
+                               ('graphique',lambda: b.db.get_archive_chart('zr',h),[])):
+                r,_,e=run(fn); res[nm]=r==want and mark(h,e)
+            # _is_index_empty : l'ouverture avec nick vérifie le mode (une base tronquée lève DbTamperError avant, déjà marquée) et
+            # COUNT(*) passe par un index (page racine abîmée non lue, mesuré) -> erreur réelle simulée à la requête
+            class _Bad:
+                def execute(self,*a,**k): raise sqlite3.DatabaseError('database disk image is malformed')
+                def close(self): pass
+            with mock.patch(f"{__name__}._open_db",lambda *a,**k: _Bad()):
+                r,_,e=run(lambda: b.db._is_index_empty('zr',p))
+            res['index vide']=r==f"SQLite error ({p}): database disk image is malformed" and e==''
+            # appelants (revue story 38 M1) : -j -> {'error': cause réelle}, texte -> une seule ligne [ERREUR] avec la cause
+            with mock.patch.object(b.db,'_is_index_empty',lambda *a,**k: f"SQLite error ({p}): malformed"):
+                _,oj,ej=run(lambda: b.search('zr','passwd',as_json=True))
+                _,ot,et=run(lambda: b.search('zr','passwd'))
+            try: res['Search -j cause']=json.loads(oj)['zr']=={'error':f"SQLite error ({p}): malformed"}
+            except (ValueError,KeyError,TypeError): res['Search -j cause']=False
+            res['Search texte une ligne']=et.count('SQLite error')==1 and '[ERREUR] SQLite error' in et and 'Index vide' not in et
+            r,o,e=run(lambda: b.archive_history('zr',as_json=True))
+            try: res['ArchiveHistory -j']=json.loads(o)['error'].startswith(f"SQLite error ({p}): ") and mark(p,e)
+            except (ValueError,KeyError): res['ArchiveHistory -j']=False
+            hh=h+'.de-côté'; os.replace(h,hh)   # RepoHistory : sans history.db, la garde lit diff.db
+            r,o,e=run(lambda: b.repo_history('zr',as_json=True)); os.replace(hh,h)
+            try: res['RepoHistory -j']=json.loads(o)['error'].startswith(f"SQLite error ({p}): ") and mark(p,e)
+            except (ValueError,KeyError): res['RepoHistory -j']=False
+            r,_,e=run(lambda: b._status_one('zr')); res['Status']=str((r or {}).get('last_backup',{}).get('error','')).startswith('base illisible') and mark(p,e)
+            # une fois par base : deux erreurs sur la même base -> une ligne ; autre base -> sa ligne
+            _SQLITE_ERR_SEEN.clear(); e2=io.StringIO()
+            with contextlib.redirect_stderr(e2):
+                _reader_sqlite_err(sqlite3.DatabaseError('x1'),p); _reader_sqlite_err(sqlite3.DatabaseError('x2'),p); _reader_sqlite_err(sqlite3.DatabaseError('x3'),h)
+            res['une fois par base']=e2.getvalue().count('[ERREUR] SQLite error')==2 and 'x2' not in e2.getvalue()
+            # table absente d'une base EXISTANTE (ancien schéma, base sans cette table) : silencieux (voulu)
+            old=os.path.join(d,'ancien.db'); cn=sqlite3.connect(old); cn.execute("CREATE TABLE autre(x)"); cn.commit(); cn.close()
+            r,o,e=run(lambda: (b.db.get_archive_measures('zr',old),b.db.get_repo_stats('zr',old),b.db.get_archive_chart('zr',old)))
+            res['table absente silencieuse']=r==({},{},[]) and o==e==''
+            ab=os.path.join(d,'absent.db')
+            r,o,e=run(lambda: (b.db.get_archive_measures('zr',ab),b.db._is_index_empty('zr',ab)))
+            res['absent silencieux']=r==({},True) and o==e=='' and not os.path.exists(ab)
+            ok=all(res.values())
+            if not ok: print(f"  {res} {r!r} {e[-300:]!r}")
+            return ok
+        check("erreur SQLite réelle d'un lecteur marquée [ERREUR] (une fois par base), base absente silencieuse (A72)",_sqlite_marked)
         def _bf_multi():
             """Plusieurs nicks : Key -n zr,za et za,zr -> code 2 (le pire), message de chacun ; Prune -n zk,za -> code 3 (le pire :
             avant, le dernier non nul), zk « aucune clé KEEP_* », za « ⚠ dépôt absent » ; aucun dict brut."""
@@ -13566,7 +13923,9 @@ fail()
             1 modifié, 1 exclu), A2→A3 (1 supprimé), A3→A4 (3 ajoutés) ; snapshots A2 et A4 ; stats partout ;
             mesures A2 (C/E 5/1, dédup 777) et A3. Rend (BorgHelper, diff.db, liste mutable pour borg list)."""
             rc=os.path.join(rz_dir,f'rc-{nk}')
-            with open(rc,'w') as f: f.write(f"[{nk}]\nBORG_REPO=/r\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n{extra}\n")
+            # 1.0.175 (story 38) : dépôt PRÉSENT (dossier existant) — Index s'arrête désormais sur un dépôt local absent (A60), le décor
+            # fictif /r arrêtait le rapprochement avant son début
+            with open(rc,'w') as f: f.write(f"[{nk}]\nBORG_REPO={rz_dir}\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n{extra}\n")
             os.chmod(rc,0o600)
             b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(rz_dir,f'cache-{nk}'))
             dp=b.db.get_diff_db(nk); b.db.ensure_diff_db(dp)
@@ -14740,7 +15099,8 @@ fail()
             return ok
         def _ix_cli_exit_codes():
             """1.0.145 (story 8 A3) : CLI Index — erreur (période inconnue) -> code 1 ; rien à faire -> 0 ; Index déjà en
-            cours sur le dépôt -> 0."""
+            cours sur le dépôt -> 0 ; 1.0.175 (story 38, A73, décision de l'utilisateur) : borg list en échec (ixbad) -> 2 (avant 1),
+            le pire code avec plusieurs nicks et -S."""
             ctx=_ix_ctx(); _ix_slow(ctx,None,0); me=os.path.realpath(__file__); b=_ix_bh(ctx,'cache')
             run=lambda *a: _rb_run([me,'-C',ctx['rc'],'-c','Index',*a],300,env=_rb_cli_env())
             r_err=run('-n','ixf','-b','inconnue')
@@ -14756,7 +15116,7 @@ fail()
             finally:
                 with open(ctx['rc'],'w') as f: f.write(rc0)
             ok=(r_err.returncode==1 and 'inconnue' in r_err.stdout+r_err.stderr and r_ok.returncode==0
-                and r_busy.returncode==0 and 'déjà' in r_busy.stdout+r_busy.stderr and multi==[1,1,1])
+                and r_busy.returncode==0 and 'déjà' in r_busy.stdout+r_busy.stderr and multi==[2,2,2])
             if not ok: print(f"  codes Index : erreur {r_err.returncode}, ok {r_ok.returncode}, occupé {r_busy.returncode}, "
                              f"plusieurs nicks / -S {multi} {(r_err.stdout+r_err.stderr)[-200:]!r}")
             return ok
@@ -15226,7 +15586,7 @@ fail()
         _rbc("snapshot incrémental (ajouts) : identique à un complet ; borg list des ajouts arrêté -> rien d'écrit",_ix_incremental_snapshot)
         _rbc("CLI Index : -t avec -S refusé, -T invalide refusé, budget par nick avec plusieurs nicks",_ix_cli_usage)
         _rbc("surveillance croisée : vrai Bkp pendant un Index long -> Bkp sans attente, Index en pause puis reprise, nouvelle archive indexée",_ix_real_bkp_during_index)
-        _rbc("CLI Index : code 1 sur erreur, 0 si rien à faire ou Index déjà en cours",_ix_cli_exit_codes)
+        _rbc("CLI Index : code 1 sur erreur (2 si borg list échoue), 0 si rien à faire ou Index déjà en cours",_ix_cli_exit_codes)
         _rbc("Restore fini pendant un Bkp -> Index toujours en pause ; diffs arrêtés sans break-lock, borg suivant passe ; reprise",_ix_restore_during_bkp)
         _rbc("DelBkp -> archive retirée des bases et du rapport sans nouvel Index",_ix_delbkp_reconcile)
         _rbc("périmètre GLOB_ARCH : hors motif retirée sans toucher history.db ; disparue figée ; liste complète en échec -> reporté ; sans filtre -> un seul borg list",_sc_scope)
@@ -15759,7 +16119,7 @@ fail()
                     ln=txt[:m.start()].count(chr(10))
                     ctx_=chr(10).join(lines[max(0,ln-12):ln+1])
                     # permis : le corps de glob_args, l'écrivain de Login (cfgwrite) et ce garde lui-même
-                    if 'def glob_args' in ctx_ or "=serna+'-root-*'" in lines[ln] or 'def _ex_no_direct_glob' in ctx_: continue
+                    if 'def glob_args' in ctx_ or ('def cfgwrite' in ctx_ and "-root-*'" in lines[ln]) or 'def _ex_no_direct_glob' in ctx_: continue
                     if "(cfg.get('GLOB_ARCH') or '').strip() and not is_external(cfg)" in lines[ln]: continue   # garde de Prune
                     bad.append(f"{os.path.basename(f)}:{ln+1}")
             if bad: print(f"  lectures directes : {bad}")
@@ -17139,7 +17499,7 @@ def _cli_main():
             if errcmd!=0: _prune_fail(bh,nick,ret)
         sys.exit(errcmd)
     elif cmd=='init':
-        bh.init_repo(nick,debug=debug)
+        sys.exit(bh.init_repo(nick,debug=debug))   # 1.0.175 (A70) : code de borg
     elif cmd=='cacheinfo':
         bh.cache_info(nick,debug=debug)
     elif cmd=='cacheclean':
@@ -17161,7 +17521,7 @@ def _cli_main():
                 printer(f"Index : -T invalide : {options['-T']!r} (parmi stats,snap,diff)"); usage(cmd)
         _period=(options.get('-b'),options.get('-B')) if ('-b' in options or '-B' in options) else None
         if _tranche: _lower_priority()   # AD-4 : nice 10 + ionice idle, hérités par borg
-        # Code de sortie (1.0.145, story 8 A3) : le pire rendu par index() sur les nicks traités — 1 (erreur), 3 (--rebuild
+        # Code de sortie (1.0.145, story 8 A3) : le pire rendu par index() sur les nicks traités — 1 (erreur), 2 (borg list en échec, 1.0.175), 3 (--rebuild
         # refusé : DB_NAME partagé, espace, migration de chiffrement) ; déjà en cours, échéance ou pause : 0.
         _irc=0
         for n in nick.split(','):

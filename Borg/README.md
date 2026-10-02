@@ -685,14 +685,18 @@ dépôt, ou si le rapprochement échoue (avertissement, jamais un échec de `Del
 `DiffBkp`, `Restore`, `Mount`, `Key`, `DelBkp`, `Prune` : dépôt local introuvable (disque démonté, chemin faux) ->
 `<nick>: ⚠ dépôt absent (<BORG_REPO>)`, code 2, borg jamais lancé, aucune base créée (comme `Report`, 1.0.167) ; autre
 échec de borg (passphrase, ssh, dépôt distant) -> `<nick>: borg <commande> a échoué : <message de borg>`, code 2 (DelBkp,
-Prune, Mount : code de borg ; Restore avec `-b` : ligne de `borg extract` telle quelle ; code 1 de borg = avertissement,
+Prune, Mount : code de borg ; Restore avec `-b` : « nick: borg extract a échoué : … » depuis 1.0.175 ; code 1 de borg = avertissement,
 Key et Mount affichent leur résultat). `DiffBkp -j` : `{"error": "…"}` seul sur stdout. `BORG_REPO` avec marqueur borg
 (`{hostname}`…) : jamais dit absent (Report compris). Avant : trace Python (DiffBkp, Restore sans
 `-b`, Mount `-b last`), dictionnaire brut (DelBkp, Prune, Mount), rien du tout et code 0 (Key). `Key` et `Prune` sur
 plusieurs nicks : code de sortie = le pire des nicks.
 Plantage de borg (1.0.174) : le message donne l'exception (`… a échoué : Local Exception; ValueError: …`), sans la trace
-ni le bandeau `Platform:`/`Borg:`… de borg (Key, DelBkp, Mount, Prune, Report, `borg list` ; Restore et Bkp affichent la
-sortie de borg complète).
+ni le bandeau `Platform:`/`Borg:`… de borg. 1.0.175 : à **chaque** site — Restore (`-w`, `-W`, tar), ListPerms, Bkp, Umount,
+Login (`key import`), Init (code de borg : dépôt existant -> 2), DiffBkp et Index (`borg diff`) ; en code 0/1, les lignes de
+borg restent affichées (trace réduite, bandeau écarté). Erreur SQLite réelle d'un lecteur (base corrompue, verrouillée au-delà
+du délai) : `[ERREUR] SQLite error (<base>): …` sur stderr, sortie partielle, code inchangé ; base absente : silencieux.
+Report en ligne : `borg prune --dry-run` en échec -> récupérable « — » (JSON `null`) et `[WARN] … récupérable inconnu`. Login
+(CLI, `POST /login`) : nom de serveur/nick — lettres, chiffres, `.`, `_`, `-`, ni `ALL` ni `DEFAULT` (code 2 / 400).
 
 ---
 
@@ -839,7 +843,8 @@ temps en temps pour rendre la place libérée (le `Prune` de borgHelper compacte
 > Restore qui finit pendant un Bkp ne le fait plus reprendre à côté du Bkp.
 
 **Code de sortie** (1.0.145) : le pire rendu sur les nicks traités — `0` (fini, rien à faire, Index déjà en cours,
-échéance, pause), `1` (erreur : `borg list` en échec, période `-b`/`-B` refusée…), `3` (`--rebuild` refusé). Une
+échéance, pause), `1` (erreur : période `-b`/`-B` refusée…), `2` (`borg list` en échec ou dépôt local absent, 1.0.175 :
+avant 1), `3` (`--rebuild` refusé). Une
 ligne cron voit donc une tranche qui n'a pas pu démarrer. Un `borg diff` ou `borg info` en échec au milieu d'une passe
 reste un avertissement (unité refaite au passage suivant), sans changer le code.
 
@@ -1824,7 +1829,7 @@ header.
 borgHelperWWW lui-même (plus le journal d'accès d'uvicorn, désactivé en exécution directe) :
 
 ```
-[req] 203.0.113.9 alice@example.org "POST /api/login?servername=x&repo=y&repo_passphrase=***" 200 213ms
+[req] 203.0.113.9 alice@example.org "POST /api/login?servername=x&repo=u@h:r&repo_passphrase=***" 200 213ms
        │           │                  │                                                         │   └ durée
        │           │                  └ requête — paramètres sensibles masqués (passphrase, clé, secret, token)
        │           └ utilisateur (header BORGHELPERWWW_USER_HEADER), « - » si absent/non configuré
@@ -2175,7 +2180,7 @@ servi comme une réponse obsolète.
 | GET | `/healthz` | *(aucune — liveness, spécifique à borgHelperWWW)* | |
 | GET | `/access` | *(aucune — spécifique à borgHelperWWW)* | |
 | GET | `/stats` | Stats | |
-| POST | `/login` | Login | |
+| POST | `/login` | Login *(1.30.0 : dépôt distant au sens de borg — `ssh://…`, `user@hôte:…`, ni `::`, ni `%` ; `servername`/`nickname` : lettres, chiffres, `.`, `_`, `-`, ni ALL ni DEFAULT ; `keyfile`, `mountpoint` refusés — 400 ; CLI pour le reste)* | |
 | GET | `/lstbkp` | LstBkp | ✓ |
 | GET | `/lstbkpfls` | LstBkpFls | ✓ |
 | GET | `/report` | Report | ✓ *(offline uniquement)* |

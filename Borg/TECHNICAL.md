@@ -688,7 +688,7 @@ indexsnap() → voir flux IndexSnap ci-dessous
   `reloadMachineCard`.
 - `prune()` rend `{'exitcode': 3}` (au lieu de `sys.exit`) pour un nick interne sans `GLOB_ARCH` ou sans aucune
   `KEEP_*` : la boucle `-n ALL` passe au nick suivant.
-- `Prune` : nick interne sans `GLOB_ARCH` refusé (code 3). `DelBkp` pose `priority.lock` et appelle `wait_index_idle` ; depuis 1.0.145, il rapproche ensuite les bases comme `Prune` (`_cleanup_index_after_prune`). CLI `Index` (1.0.145) : sort avec le pire code rendu par `index()` (1, 3). `Status` : `DbKeyError`/`DbModeError`/`DbTamperError` sur `diff.db` → `last_backup.error`, `build: null`, le reste lu.
+- `Prune` : nick interne sans `GLOB_ARCH` refusé (code 3). `DelBkp` pose `priority.lock` et appelle `wait_index_idle` ; depuis 1.0.145, il rapproche ensuite les bases comme `Prune` (`_cleanup_index_after_prune`). CLI `Index` (1.0.145) : sort avec le pire code rendu par `index()` (1, 2 depuis 1.0.175 pour `borg list` en échec, 3). `Status` : `DbKeyError`/`DbModeError`/`DbTamperError` sur `diff.db` → `last_backup.error`, `build: null`, le reste lu.
 - `Stats`/`Mount`/`UMount` : `MOUNTPOINT` lu par `cfg.get`, message si absent.
 
 ### `Index` par tranches (1.0.141, story 4, AD-1/AD-3/AD-10)
@@ -1012,12 +1012,12 @@ passage dans `CACHE_DIR/<conf>-<nick>-index-last.json` (0600, fichier temporaire
 ```json
 {"nick": "srv", "started_at": "2026-09-28T10:00:00+02:00", "finished_at": "2026-09-28T10:02:13+02:00",
  "outcome": "busy", "code": 0, "via": "http", "message": "srv: Index déjà en cours …",
- "last_failure": {"finished_at": "2026-09-28T09:00:41+02:00", "outcome": "error", "code": 1, "via": "cli",
-                  "message": "[ERREUR] srv: borg list en échec …"}}
+ "last_failure": {"finished_at": "2026-09-28T09:00:41+02:00", "outcome": "error", "code": 2, "via": "cli",
+                  "message": "[ERREUR] srv: borg list a échoué : …"}}
 ```
 
 - Heures : locales, ISO avec décalage (`_iso_now`) : l'UI calcule l'âge juste quel que soit le fuseau du navigateur.
-- `outcome` : `ok` (code 0), `error` (code 1 ou exception), `refused` (code 3), `busy` (« Index déjà en cours » au
+- `outcome` : `ok` (code 0), `error` (code 1, 2 — `borg list` en échec depuis 1.0.175 — ou exception), `refused` (code 3), `busy` (« Index déjà en cours » au
   démarrage : code 0, rien fait), `deadline` (échéance atteinte pendant l'attente du tour, code 0). `busy`/`deadline`
   sont notés par `index()` dans `_index_outcome[nick]`, le code de retour ne les distingue pas. Un Index qui a
   travaillé puis passé la main (pause refusée, tour repris par un autre) est `ok`.
@@ -2265,6 +2265,25 @@ le message précédent (erreur borg `traceback=True`) ; bandeau `_BORG_SYSINFO` 
 (`st['crash']`, partagé entre texte et JSON par `_rb_errmsg`), `_BORG_ALWAYS` (`Platform`, `Borg:`) partout comme avant ;
 message `--log-json` multi-lignes : même traitement, 1er message gardé, jamais coupé (Bkp seul passe `--log-json`) ;
 `_boex_last_modified` : `n=3, cut=None` (texte inchangé).
+**Sorties de borg à chaque site (1.0.175, story 38, A70)** : `_print_borg_stderr(entries, debug)` (et `_print_boex_stderr(rb)`)
+— texte réduit par `_borg_err_lines(…, raw=True)` (indentation gardée), enregistrement JSON réduit seulement s'il porte une
+trace, un bloc « Exception ignored » ou commence par le bandeau ; DEBUG masqué sans `debug` ; utilisé par Bkp, Restore, ListPerms,
+Mount, Key, Umount, Login, Init. Échec (code ≥ 2) : `_borg_fail_msg(nick, 'borg <cmd>', _rb_errmsg(rb, …))` (Restore :
+`_extract_fail`) ; `_rb_errmsg` place les « Warning: … » après les autres messages quand le code n'est ni 0 ni 1.
+`_print_boex_stdout` remplace `print(rb)`. `init_repo` rend le code de borg (dispatch : `sys.exit`). Index : `borg list` initial
+en échec -> `[ERREUR] <_borg_fail_msg>`, `return 2` ; `_run_diff` lit le stderr de `borg diff` dans un thread (`err_t`), échec
+non tué -> `[WARN] … paire … non indexée`. `cache_prune_dryrun` : code de borg ≠ 0/1 -> `[WARN] … récupérable inconnu`, `[]`
+rendu, rien écrit ; revue : rend `None` (inconnu) -> `prep_report` : récupérable `None` + marqueur `_prune_unknown` retiré au
+rendu (« — », JSON `null`), ligne Prunable idem (jumelles report/report_offline). Login : `_valid_nick_name` (liste blanche, CLI
+et borgHelperWWW, importée) ; `cfgwrite` échappe `%` en `%%` (rc relu avec interpolation). borgHelperWWW `_repo_is_remote` :
+`_REPO_SSH_RE`/`_REPO_SCP_RE` calquées sur `borg/helpers/parseformat.py` (ssh_re, scp_re avec hôte), `::`/`%`/contrôles refusés.
+**Erreurs SQLite des lecteurs (1.0.175, A72)** : `_reader_sqlite_err(e, db_path)` — `no such table`/`no such column`
+silencieux ; autre `sqlite3.Error` -> `[ERREUR] SQLite error (<base>): <e>`, une fois par base et par processus
+(`_SQLITE_ERR_SEEN`). Appelée par `get_archive_measures`, `get_archive_chart`, `get_repo_stats`, `_diff_stats_for_nick`,
+`_is_index_empty` (vraie erreur -> son message « SQLite error … », affiché par les 7 appelants à la place d'« Index vide » ; texte
+`[ERREUR]`, `-j` `{'error'}`), IdxTop/DiffTop (exclus), lecture du cache de `cacheJsonBoexWithLM` (table absente silencieuse) ; RepoHistory,
+ArchiveHistory et Status passent par `_db_probe` (illisible ≠ absent). CodecSelfTest : `_pre(fn)` exécute un décor dont dépendent
+les contrôles suivants même quand `-f` écarte son contrôle (A74).
 **Ensure sans création (1.0.172, story 35, A61)** : `_open_db(…, create_file=None)` — `None` : le rôle décide (`read` jamais,
 `write`/`admin` `O_CREAT` 0600) ; `False` : `write`/`admin` en `mode=rw`, fichier absent -> `sqlite3.OperationalError`.
 `ensure_*_db(create=False)` l'utilise après sa sonde : supprimée entre les deux -> `_file_gone` -> retour (base absente) ;

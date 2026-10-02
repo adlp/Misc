@@ -296,6 +296,17 @@ async ${grab('reloadMachineCard')}
   const a0=acc({int:{ops:['read','restore']}}); a0.restore_root='/srv/restaurations'; page.set(a0,'int'); const lbl=whereP.labelFn();
   page.selectAction('restore'); const panel=dom.byId('actionPanel').innerHTML;   // vrai formulaire : libellé affiché
   page.set(acc({int:{ops:['read','restore']}}),'int'); const lbl0=whereP.labelFn();
+  // UI 1.22.0 (A71) : refus de POST /login (400, detail) affiché tel quel ; aucun keyfile/mountpoint envoyé
+  const ns=new Function('vals','hooks',`
+    const document={getElementById:id=>vals[id]||(vals[id]={value:'',hidden:true,textContent:''})};
+    const apiCall=async(m,p,params)=>{ hooks.sent=params; return hooks.resp; }, loadMachines=()=>{ hooks.loaded=true; };
+    async ${grab('submitNewServer')}
+    return submitNewServer;`);
+  const nsVals={ns_servername:{value:'srv'},ns_nickname:{value:''},ns_repo:{value:'/srv/r'},ns_passphrase:{value:'pw'}}, nsHooks={resp:{httpStatus:400,detail:'Dépôt local refusé via l\'API : /srv/r'}};
+  await ns(nsVals,nsHooks)();
+  eq('nouveau serveur : refus de l\'API affiché, ni keyfile ni mountpoint envoyés',
+     [nsVals.newServerResult.textContent,'keyfile' in nsHooks.sent,'mountpoint' in nsHooks.sent,!!nsHooks.loaded],
+     ["Refusé (HTTP 400) : Dépôt local refusé via l'API : /srv/r",false,false,false]);
   eq('restauration : masquée sans racine, libellé sous-dossier de la racine',
      [noRoot.includes('id="abtn_restore"'),noRoot.includes('id="abtn_restoreperms"'),withRoot.includes('id="abtn_restore"'),
       panel.includes('Destination (sous-dossier de /srv/restaurations) *'),lbl,lbl0],

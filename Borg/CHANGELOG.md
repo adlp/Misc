@@ -1,5 +1,46 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.175 / borgHelperWWW 1.30.0 / UI 1.22.0 — sorties de borg lisibles partout, /login sans chemin libre, erreurs SQLite marquées, codes d'Index et d'Init — 2026-10-02
+
+Chantier « reconstruction progressive », story 38 (actions de rétrospective A70 à A75 ; regroupement demandé par
+l'utilisateur).
+
+- **Sorties de borg lisibles à chaque site** : Restore (`-w`, `-W`, tar), ListPerms, Mount et Key (code 1), Bkp, Umount,
+  Login (`key import`), Init, DiffBkp et Index. Avant : sur un plantage de borg, 20 lignes brutes (bloc « Exception ignored »,
+  trace Python, bandeau `sys.argv` avec les chemins) ; Umount, Login, Init : dictionnaire Python brut ; `borg diff` : « code N »
+  seul ; `borg diff` d'Index : échec muet. Désormais : échec -> une ligne « nick: borg <commande> a échoué : <cause> »
+  (« ⚠ dépôt absent » pour un dépôt local introuvable), code de borg ; code 0/1 -> lignes de borg gardées (avertissements de
+  fichiers, conseils de `borg init`), trace réduite à son exception, bandeau écarté. Sur un échec, les avertissements
+  (« Warning: … », ex. `--numeric-owner` déprécié) passent après la cause.
+- **Init rend le code de borg** (décision de l'utilisateur) : dépôt existant -> code 2 (avant : 0) ; `POST /init` -> 400.
+- **Index : `borg list` en échec -> code 2** (décision de l'utilisateur ; avant : 1), message commun (« ⚠ dépôt absent » ou
+  « borg list a échoué : … »), `index_last` code 2 ; `borg diff` en échec : `[WARN] … — paire … non indexée` (avant : rien).
+- **borgHelperWWW `POST /login` sans chemin libre du serveur** (décisions de l'utilisateur, **⚠ rupture**) : `keyfile` et
+  `mountpoint` refusés (400, même vides ; `key import` lisait un fichier arbitraire du serveur), dépôt **distant seulement**
+  au sens de borg 1.2 (`ssh://[user@]hôte[:port]/…`, `[user@]hôte:…` — hôte sans `/` ni `:` ; `/srv/a:b`, `./x:y`, `/srv/x::a`,
+  `%(…)s`, `file://` refusés : un chemin local suivi de `POST /init` créait un dépôt n'importe où, droits du service) — refus
+  avant tout lancement de borgHelper. UI : champs retirés, refus affiché.
+- **Noms de serveur/nick de Login : liste blanche** (revue, décision de l'utilisateur ; CLI et `POST /login`) : lettres,
+  chiffres, `.`, `_`, `-`, début lettre ou chiffre, `ALL`/`DEFAULT` refusés (400 / code 2). Avant : écrits tels quels comme
+  section du rc — `]` + retour à la ligne injectait des clés (`BORG_RSH`, `BORG_EXE` : commande exécutée au prochain Init/Bkp),
+  `ALL` ou `a,b` écrasaient ou dupliquaient des sections. **`%` dans une valeur de Login** (passphrase, dépôt) : écrit `%%`
+  (avant : `ValueError`, trace envoyée à Sentry ; `%(…)s` relu par interpolation).
+- **Erreurs SQLite plus jamais muettes** (décision de l'utilisateur) : un lecteur qui rencontrait une vraie erreur (verrou au-delà
+  du délai, corruption, I/O) l'avalait — Report (mesures, tailles, modifications « — »), ArchiveHistory (« Aucune archive
+  indexée »), Status (« aucune archive indexée »), IdxTop/DiffTop (lignes Exclus perdues), lecteurs `-j` (« Index vide »).
+  Désormais `[ERREUR] SQLite error (<base>): <erreur>` sur stderr, une fois par base ; sortie partielle et code inchangés
+  (jamais mise en cache par borgHelperWWW) ; « Index vide » remplacé par la cause réelle. Base ou table absente : silencieux.
+- **Report en ligne : `borg prune --dry-run` en échec jamais mis en cache** (décisions de l'utilisateur) : récupérable et ligne
+  Prunable « — » (JSON : `null`), `[WARN] … — récupérable inconnu` ; avant, « rien à récupérer » restait servi jusqu'au prochain changement du dépôt (une entrée vide déjà en cache le
+  reste jusque-là). `borg diff` d'Index : stderr lu (un stderr de plus de ~64 Ko bloquait borg). Index sur un dépôt local
+  introuvable : ni base créée ni borg lancé (comme les autres commandes). Report : un `borg info` en échec donne sa cause (avant :
+  « list index out of range »). borgHelperWWW `/download/*` sans archive : `borg list` en échec -> message réduit (avant : stderr
+  brut coupé à 300 caractères, trace sans cause).
+- CodecSelfTest : six contrôles dépendaient d'un décor logé dans un autre contrôle — `-f` changeait leur verdict (`-f Key` :
+  2 FAIL) ; décors exécutés hors filtre (`_pre`), contrôle « plans » autonome. Nouveaux : « plantage de borg relayé »
+  (plantage réel rejoué), « sorties de borg en processus », « erreur SQLite réelle d'un lecteur » ; push_selftest :
+  « POST /login ».
+
 ## borgHelper 1.0.174 / borgHelperWWW 1.29.0 / UI 1.21.0 — cache attentif à l'état extérieur, /restore sous une racine, cause des plantages de borg — 2026-10-02
 
 Chantier « reconstruction progressive », story 37 (actions de rétrospective A66, A67, A68, A69 ; regroupement demandé par

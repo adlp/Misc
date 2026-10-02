@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.21.0 -->
+<!-- UI_VERSION: 1.22.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -144,12 +144,9 @@
         <div class="field"><label>Nom d'hôte (servername)</label><input type="text" id="ns_servername"></div>
         <div class="field"><label>Nickname (optionnel, déf. = servername)</label><input type="text" id="ns_nickname"></div>
       </div>
-      <div class="field"><label>Dépôt (repo)</label><input type="text" id="ns_repo" placeholder="/chemin/ou/user@host:/chemin"></div>
+      <div class="field"><label>Dépôt distant (repo)</label><input type="text" id="ns_repo" placeholder="user@host:/chemin ou ssh://user@host/chemin"></div>
       <div class="field"><label>Passphrase du dépôt</label><input type="password" id="ns_passphrase"></div>
-      <div class="row">
-        <div class="field"><label>Keyfile (optionnel)</label><input type="text" id="ns_keyfile"></div>
-        <div class="field"><label>Mountpoint (optionnel)</label><input type="text" id="ns_mountpoint"></div>
-      </div>
+      <p class="hint">Dépôt local, fichier de clé, point de montage : CLI seulement (borgHelper -c Login sur le serveur).</p>
       <button onclick="submitNewServer()">Créer</button>
       <button class="secondary" onclick="toggleNewServer()">Annuler</button>
       <pre id="newServerResult" hidden></pre>
@@ -1200,18 +1197,16 @@ async function submitNewServer(){
   const nickname=document.getElementById('ns_nickname').value.trim();
   const repo=document.getElementById('ns_repo').value.trim();
   const repo_passphrase=document.getElementById('ns_passphrase').value;
-  const keyfile=document.getElementById('ns_keyfile').value.trim();
-  const mountpoint=document.getElementById('ns_mountpoint').value.trim();
   const out=document.getElementById('newServerResult');
   if(!servername || !repo || !repo_passphrase){
     out.hidden=false; out.textContent='servername, repo et passphrase sont requis.'; return;
   }
   const r=await apiCall('POST','/login',{
-    servername, nickname:nickname||undefined, repo, repo_passphrase,
-    keyfile:keyfile||undefined, mountpoint:mountpoint||undefined
+    servername, nickname:nickname||undefined, repo, repo_passphrase   // UI 1.22.0 (A71) : ni keyfile ni mountpoint via l'API
   }, false);
   out.hidden=false;
-  out.textContent=`exitcode: ${r.exitcode}\n\n--- stdout ---\n${r.stdout}\n--- stderr ---\n${r.stderr}`;
+  out.textContent=typeof r.detail==='string' ? `Refusé (HTTP ${r.httpStatus}) : ${r.detail}`   // UI 1.22.0 (A71) : refus de l'API (dépôt local…)
+    : `exitcode: ${r.exitcode}\n\n--- stdout ---\n${r.stdout}\n--- stderr ---\n${r.stderr}`;
   if(r.exitcode===0){ loadMachines(); }
 }
 
