@@ -49,7 +49,8 @@ lui-même gérer l'absence de table (`sqlite3.OperationalError: no such table`) 
 1.0.166 : avec `create=False`, l'entretien d'une base existante (paliers de migration, vue, tampons de version) attend au
 plus 2 s le verrou d'écriture ; s'il est tenu par un autre processus, la fonction rend la main sans erreur, sans migrer ni
 tamponner (base lue telle quelle par l'appelant) et ne réessaie pas pendant 60 s pour ce `BorgHelperDB` ; seule une base
-d'un schéma plus récent lève encore `SchemaVersionError`. `create=True` : inchangé (60 s).
+d'un schéma plus récent lève encore `SchemaVersionError`. `create=True` : inchangé (60 s). 1.0.177 : la sonde d'existence
+du schéma (`_db_has_schema`) attend elle aussi 2 s au plus avec `create=False` (avant : 60 s sous un verrou exclusif).
 
 ### Exceptions du chiffrement de base
 
@@ -439,6 +440,7 @@ if fail:
     print(fail['finished_at'], fail['code'], fail['message'])
 
 bh.db.index_last_path('mon-serveur')    # chemin du fichier
+# code = code de sortie du processus (1.0.177 : erreur de base chiffrée 2, signal N : 256−N, SIGKILL 247 ; Ctrl-C 130)
 # write_index_last(nick, rec) : écriture atomique 0600 ; lève OSError (la CLI n'en fait qu'un avertissement).
 ```
 

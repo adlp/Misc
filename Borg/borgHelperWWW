@@ -66,7 +66,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.30.1"
+WWW_VERSION="1.30.2"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -728,6 +728,18 @@ app.router.route_class=_ExitGuardRoute  # avant toute déclaration @app.get (1.2
 # exécution directe ; sous uvicorn externe : --no-access-log pour éviter le doublon) : IP du navigateur
 # (_client_ip, trusted_proxies), utilisateur (USER_HEADER), requête (paramètres sensibles masqués),
 # statut, durée. Une ligne par requête sur stderr.
+class _AbortableResponse:
+    """1.30.2 (story 40, A83) : réponse relayée par le middleware ; si le corps a posé `request.state.stream_aborted` (borg en
+    échec pendant un téléchargement), le dernier message de corps (fin de transfert) n'est jamais envoyé — uvicorn ferme la
+    connexion sur une réponse incomplète et le client voit une erreur."""
+    def __init__(self,resp): self.resp=resp; self.status_code=resp.status_code
+    async def __call__(self,scope,receive,send):
+        async def send_w(msg):
+            if (msg.get('type')=='http.response.body' and not msg.get('more_body',False)
+                    and (scope.get('state') or {}).get('stream_aborted')): return
+            await send(msg)
+        await self.resp(scope,receive,send_w)
+
 @app.middleware("http")
 async def _access_log_and_user_guard(request: Request, call_next):
     t0=time.monotonic()
@@ -740,7 +752,7 @@ async def _access_log_and_user_guard(request: Request, call_next):
             response=JSONResponse(status_code=403,content={'detail':
                 f"Identité utilisateur absente (header {USER_HEADER}) — accès refusé (require_user)"})
         else:
-            response=await call_next(request)
+            response=_AbortableResponse(await call_next(request))   # 1.30.2 (A83) : flux coupé possible
         status=response.status_code
         return response
     finally:
@@ -2424,16 +2436,64 @@ def _safe_filename(name: str) -> str:
     name=(name or '').strip('/').split('/')[-1] or 'download'
     return _FILENAME_UNSAFE.sub('_',name) or 'download'
 
-def _stream_proc(proc):
-    try:
-        while True:
-            chunk=proc.stdout.read(65536)
-            if not chunk: break
-            yield chunk
-    finally:
+def _borg_stream(request,cmd,env,what,decoy=None,path=None,missing=None):
+    """1.30.2 (story 40, A83, décisions de l'utilisateur) : lance borg (`what` : « borg extract »/« borg export-tar »), lit son
+    stderr dans un thread (200 dernières lignes) et son PREMIER bloc (64 Kio ou la fin) avant de répondre. Fin atteinte dans ce
+    bloc : le code est connu avant la réponse -> code >= 2 ou signal : 502 « <what> a échoué : <cause> » ; code 1 sans sortie :
+    404 `missing` si borg dit « never matched » (chemin introuvable, `/download/file`), 502 si une sortie était attendue
+    (`missing` absent : tar), sinon 200 vide + [WARN]. Leurre (`decoy`) remplacé par le chemin demandé dans chaque ligne de borg
+    AVANT la mise en forme (hors périmètre indiscernable, même coupé). Sinon un corps ASYNCHRONE qui vérifie le code à la fin :
+    >= 2 ou signal -> [ERREUR] au journal et `request.state.stream_aborted` (le middleware retient la fin de transfert : flux
+    coupé, voir _AbortableResponse) ; 1 -> [WARN]. Client parti en cours de route (corps annulé) : borg tué aussitôt — avant,
+    bloqué sur son tube, zombie, verrou de dépôt gardé (revue, mesuré). Avant 1.30.2 : stderr vers DEVNULL, code jamais lu."""
+    import collections
+    from starlette.concurrency import run_in_threadpool
+    proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
+    errs=collections.deque(maxlen=200)
+    def _read_err():
+        try:
+            for l in proc.stderr: errs.append(l.decode('utf-8','replace').rstrip('\n'))
+        except (ValueError,OSError): pass
+    err_t=threading.Thread(target=_read_err,daemon=True); err_t.start()
+    def lines():
+        err_t.join(5)
+        return [l.replace(decoy,path or '') for l in errs] if decoy else list(errs)
+    def cause():
+        return _rb_errmsg({'exitcode':proc.returncode,'stderr':lines()},what)
+    def stop():
+        if proc.poll() is None:
+            try: proc.kill()
+            except OSError: pass
+        proc.wait()
         try: proc.stdout.close()
         except Exception: pass
+    first=proc.stdout.read(65536)
+    if len(first)<65536:   # fin du flux déjà atteinte : code connu avant la réponse
         proc.wait()
+        rc=proc.returncode
+        if rc not in (0,1): stop(); raise HTTPException(502,detail=f"{what} a échoué : {cause()}")
+        if rc==1 and not first:
+            if missing is not None and any('never matched' in l for l in lines()): stop(); raise HTTPException(404,detail=missing)
+            if missing is None: stop(); raise HTTPException(502,detail=f"{what} a échoué : aucune sortie ({cause()})")
+    async def body():
+        done=False
+        try:
+            if first: yield first
+            while True:
+                chunk=await run_in_threadpool(proc.stdout.read,65536)
+                if not chunk: break
+                yield chunk
+            await run_in_threadpool(proc.wait)
+            done=True
+            if proc.returncode not in (0,1):
+                print(f"[ERREUR] {what} a échoué en cours d'envoi : {cause()} — téléchargement interrompu (flux coupé)",file=sys.stderr,flush=True)
+                request.state.stream_aborted=True
+            elif proc.returncode==1: print(f"[WARN] {what} (téléchargement) : {cause()}",file=sys.stderr,flush=True)
+        finally:
+            if not done and proc.poll() is None:
+                print(f"[WARN] {what} : téléchargement abandonné par le client — borg arrêté",file=sys.stderr,flush=True)
+            stop()
+    return body()
 
 # ── Story 2.1 : réponses synthétiques "introuvable" (hors périmètre) ───────────────────────────
 # Chacune des quatre fonctions ci-dessous imite, EXACTEMENT, la forme que sa route produit
@@ -2485,9 +2545,10 @@ def download_file(nick: str, path: str, request: Request, bid: Optional[str]=Non
     env=_borg_env(cfg)
     archive=bid or _latest_archive(cfg,env)
     borg_exe=cfg.get('BORG_EXE','borg')
-    proc=subprocess.Popen([borg_exe,'extract','--stdout',f"{cfg['BORG_REPO']}::{archive}",target],
-                          stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env)
-    return StreamingResponse(_stream_proc(proc),media_type='application/octet-stream',
+    # 1.30.2 (A83) : code de borg lu — introuvable (ou hors périmètre, leurre) 404, échec 502, échec en cours : flux coupé
+    body=_borg_stream(request,[borg_exe,'extract','--stdout',f"{cfg['BORG_REPO']}::{archive}",target],env,'borg extract',
+                      decoy=None if target==path else target,path=path,missing=f"{path} introuvable dans l'archive {archive}")
+    return StreamingResponse(body,media_type='application/octet-stream',
         headers={'Content-Disposition':f'attachment; filename="{_safe_filename(path)}"'})
 
 @router.get("/download/tar",tags=["téléchargement"],summary="Télécharge un .tar d'une arborescence depuis une archive (borg export-tar)")
@@ -2506,8 +2567,9 @@ def download_tar(nick: str, request: Request, prefix: Optional[str]=None, bid: O
     borg_exe=cfg.get('BORG_EXE','borg')
     cmd=[borg_exe,'export-tar',f"{cfg['BORG_REPO']}::{archive}",'-']
     if target: cmd.append(target)
-    proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env)
-    return StreamingResponse(_stream_proc(proc),media_type='application/x-tar',
+    # 1.30.2 (A83) : code de borg lu — échec avant le 1er octet 502, en cours : flux coupé ; préfixe absent : tar vide (inchangé)
+    body=_borg_stream(request,cmd,env,'borg export-tar',decoy=None if target==prefix else target,path=prefix)
+    return StreamingResponse(body,media_type='application/x-tar',
         headers={'Content-Disposition':f'attachment; filename="{_download_tar_filename(nick,prefix)}"'})
 
 # ── Interface web ────────────────────────────────────────────────────────────
@@ -4144,7 +4206,12 @@ def push_selftest():
                     f2=call(True,lambda: client.get(f"{P}/download/file",headers=H,params={'nick':nk,'path':exists}))
                     t1=call(False,lambda: client.get(f"{P}/download/tar",headers=H,params={'nick':nk,'prefix':'inexistant-selftest'}))
                     t2=call(True,lambda: client.get(f"{P}/download/tar",headers=H,params={'nick':nk,'prefix':'lib/modules'}))
-                    return (ok and f1.content==f2.content==b'' and t1.content==t2.content and len(t1.content)>0
+                    # 1.30.2 (story 40, A83, décision de l'utilisateur) : fichier introuvable -> 404 (avant : 200 vide) ; hors périmètre :
+                    # même statut, même détail au chemin près
+                    def fd(r,p):   # corps non JSON (200 + octets) : jamais une trace, comparé tel quel
+                        try: return (r.status_code,r.json().get('detail','').replace(p,'<P>'))
+                        except ValueError: return (r.status_code,r.content)
+                    return (ok and fd(f1,gone)==fd(f2,exists) and f1.status_code==404 and t1.content==t2.content and len(t1.content)>0
                             and 'modules.tar' in t2.headers.get('content-disposition','') and not os.listdir(dest))
                 _r=_oos_indistinguishable()
                 if _r is None: print("SKIP hors périmètre indiscernable d'un chemin absent (borg ou dépôt de démo indisponible)")
@@ -4435,6 +4502,112 @@ def push_selftest():
                         except HTTPException as x: r2=x.status_code
                     return r=='b' and '[WARN] borg list (téléchargement, ssh://h/r) : Warning: w1' in e.getvalue() and r2==502
                 check("/download/* : borg list en code 1 (avertissement) -> dernière archive, avertissement au journal (A77)",_latest_archive_warn)
+                def _borg_stream_codes():
+                    """1.30.2 (story 40, A83, décisions de l'utilisateur ; mesuré : 200 sur échec, borg tué, tar tronqué) : _borg_stream
+                    avec de vrais sous-processus (stderr de borg recopié). Fin dans le 1er bloc (code connu avant la réponse) : succès
+                    -> corps entier ; « never matched » (code 1, rien) -> 404 ; code 1 sans sortie autre -> 200 vide (fichier) ou 502
+                    (tar) ; code 2 ou tué -> 502 « … a échoué : cause », même après quelques octets ; leurre remplacé dans chaque ligne
+                    AVANT la coupe à 100 caractères (même longueur dans et hors périmètre). Fin au-delà du 1er bloc : code 2 -> corps
+                    partiel, [ERREUR], stream_aborted ; code 1 -> corps entier, [WARN]. Client parti (corps fermé en cours) : borg tué."""
+                    import types as _t
+                    def run(code_py,missing=None,decoy=None,path=None,stop_after=None):
+                        req=_t.SimpleNamespace(state=_t.SimpleNamespace())
+                        e=io.StringIO(); out=b''; st=None; det=None; procs=[]
+                        orig=subprocess.Popen
+                        def popen(*a,**k): p_=orig(*a,**k); procs.append(p_); return p_
+                        async def drain(body):
+                            nonlocal out
+                            n=0
+                            async for c in body:
+                                out+=c; n+=1
+                                if stop_after and n>=stop_after: await body.aclose(); break
+                        with contextlib.redirect_stderr(e), mock.patch.object(subprocess,'Popen',popen):
+                            try:
+                                body=_borg_stream(req,[sys.executable,'-c',code_py],dict(os.environ),'borg extract',decoy=decoy,path=path,missing=missing)
+                                asyncio.run(drain(body))
+                            except HTTPException as x: st,det=x.status_code,x.detail
+                        return out,st,det,getattr(req.state,'stream_aborted',False),e.getvalue(),procs
+                    W="import sys,os,signal,time\n"
+                    big="sys.stdout.write('x'*200000); sys.stdout.flush(); "
+                    res={}
+                    res['succès']=run(W+"sys.stdout.write('abc'*30000)")[:4]==(b'abc'*30000,None,None,False)
+                    res['introuvable']=run(W+"sys.stderr.write(\"Include pattern 'p' never matched.\\n\"); sys.exit(1)",missing='p introuvable')[1:4]==(404,'p introuvable',False)
+                    o=run(W+"sys.stderr.write('Warning: w\\n'); sys.exit(1)",missing='p introuvable')
+                    res['code 1 vide sans never matched']=(o[0]==b'' and o[1] is None,o[1:3])
+                    o=run(W+"sys.exit(1)")   # tar (missing absent) : une sortie était attendue
+                    res['tar code 1 vide']=(o[1]==502,o[1:3])
+                    res['code 2']=run(W+"sys.stderr.write('Connection closed by remote host\\n'); sys.exit(2)")[1:3]==(502,'borg extract a échoué : Connection closed by remote host')
+                    res['code 2 après 5 octets']=run(W+"sys.stdout.write('abcde'); sys.stdout.flush(); sys.stderr.write('Connection closed by remote host\\n'); sys.exit(2)")[1]==502
+                    long='E'*90
+                    a=run(W+f"sys.stderr.write('{long} etc/pw\\n'); sys.exit(2)")[2]
+                    b=run(W+f"sys.stderr.write('{long} .bh-absent-0123456789abcdef\\n'); sys.exit(2)",decoy='.bh-absent-0123456789abcdef',path='etc/pw')[2]
+                    res['leurre avant la coupe']=(a==b,a,b)
+                    res['tué']=run(W+"os.kill(os.getpid(),signal.SIGKILL)")[1:3]==(502,'borg extract a échoué : borg extract failed (code -9)')
+                    o=run(W+big+"sys.stderr.write('Connection closed by remote host\\n'); sys.exit(2)")
+                    res['échec après sortie']=(o[0]==b'x'*200000 and o[1] is None and o[3] is True
+                                               and "[ERREUR] borg extract a échoué en cours d'envoi : Connection closed by remote host" in o[4])
+                    o=run(W+big+"sys.stderr.write('Warning: w\\n'); sys.exit(1)")
+                    res['avertissement après sortie']=(o[0]==b'x'*200000 and o[3] is False and '[WARN] borg extract (téléchargement) : Warning: w' in o[4])
+                    o=run(W+big+"time.sleep(60); sys.stdout.write('y')",stop_after=1)
+                    pr=o[5][0] if o[5] else None
+                    res['client parti : borg tué']=(pr is not None and pr.returncode==-9 and 'abandonné par le client' in o[4],pr.returncode if pr else None)
+                    bad={k:v for k,v in res.items() if not (v if isinstance(v,bool) else v[0])}
+                    if bad: print(f"  {bad}")
+                    return not bad
+                check("/download/* : code de borg lu — 404 introuvable, 502 échec ou tué (leurre masqué), flux coupé si échec en cours d'envoi, borg tué si le client part (A83)",_borg_stream_codes)
+                def _abortable_response():
+                    """1.30.2 (A83) : _AbortableResponse — drapeau stream_aborted posé -> la fin de transfert (dernier message de corps)
+                    n'est jamais envoyée (uvicorn ferme la connexion : curl code 18, mesuré) ; sans drapeau : messages relayés tels quels."""
+                    async def go(flag):
+                        sent=[]
+                        async def inner(scope,receive,send):
+                            await send({'type':'http.response.start','status':200,'headers':[]})
+                            await send({'type':'http.response.body','body':b'ab','more_body':True})
+                            if flag: scope.setdefault('state',{})['stream_aborted']=True
+                            await send({'type':'http.response.body','body':b'','more_body':False})
+                        r=_AbortableResponse(type('R',(),{'status_code':200,'__call__':lambda self,s,rc,sd: inner(s,rc,sd)})())
+                        async def send(m): sent.append(m)
+                        await r({'type':'http','state':{}},None,send)
+                        return [(m['type'],m.get('more_body')) for m in sent]
+                    a=asyncio.run(go(True)); b=asyncio.run(go(False))
+                    return (a==[('http.response.start',None),('http.response.body',True)]
+                            and b==[('http.response.start',None),('http.response.body',True),('http.response.body',False)])
+                check("/download/* : flux coupé — fin de transfert retenue par le middleware quand stream_aborted est posé (A83)",_abortable_response)
+                def _download_abort_e2e():
+                    """1.30.2 (revue story 40) : bout en bout par la VRAIE application (middleware de journal, route, _borg_stream) — un
+                    borg factice qui écrit 200 Ko puis sort en 2 : début 200, corps partiel, jamais de fin de transfert ; le même qui sort
+                    en 0 : fin de transfert envoyée. Appel ASGI direct (le client de test reconstruit une réponse complète)."""
+                    fb=os.path.join(tmpdir,'fb-dl.py')
+                    def mk(code):
+                        with open(fb+'.tmp','w') as f:
+                            f.write(f"#!{sys.executable}\nimport sys\nsys.stdout.write('x'*200000); sys.stdout.flush(); sys.stderr.write('Connection closed by remote host\\n'); sys.exit({code})\n")
+                        os.chmod(fb+'.tmp',0o700); os.replace(fb+'.tmp',fb)
+                    async def call():
+                        msgs=[]; got=[False]
+                        async def receive():
+                            if got[0]: await asyncio.sleep(3600)
+                            got[0]=True; return {'type':'http.request','body':b'','more_body':False}
+                        async def send(m): msgs.append(m)
+                        scope={'type':'http','asgi':{'version':'3.0'},'http_version':'1.1','method':'GET','scheme':'http','path':f"{API_PREFIX}/download/tar",
+                               'raw_path':f"{API_PREFIX}/download/tar".encode(),'query_string':b'nick=zz&bid=a1','root_path':'',
+                               'headers':[(b'host',b'test'),(b'x-api-key',API_KEY.encode())],'client':('127.0.0.1',1),'server':('test',80)}
+                        await asyncio.wait_for(app(scope,receive,send),60)
+                        return msgs
+                    out={}
+                    for code in (2,0):
+                        mk(code)
+                        with mock.patch(f"{__name__}._borg_cfg",lambda n,p: {'BORG_REPO':'/r','BORG_EXE':fb}), \
+                             mock.patch(f"{__name__}.require_path_in_scope",lambda *a: True), \
+                             mock.patch(f"{__name__}.require_downloads_allowed",lambda: None), contextlib.redirect_stderr(io.StringIO()):
+                            m=asyncio.run(call())
+                        body=b''.join(x.get('body',b'') for x in m if x['type']=='http.response.body')
+                        st=[x['status'] for x in m if x['type']=='http.response.start']
+                        fin=any(x['type']=='http.response.body' and not x.get('more_body',False) for x in m)
+                        out[code]=(st,len(body),fin)
+                    ok=out[2]==([200],200000,False) and out[0]==([200],200000,True)
+                    if not ok: print(f"  {out}")
+                    return ok
+                check("/download/* : bout en bout par l'application — échec en cours d'envoi = pas de fin de transfert, succès = fin envoyée (A83)",_download_abort_e2e)
                 if _internal is None: print("SKIP racine de restauration : aucun nick interne dans ce rc")
                 else: check("POST /restore sous la racine de restauration seulement : 403 sans racine/hors racine/lien, 409 si remplie, chemin résolu transmis, « / » refusé (A68)",
                             _restore_root)

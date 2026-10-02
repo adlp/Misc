@@ -1,5 +1,29 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.177 / borgHelperWWW 1.30.2 / UI 1.22.1 — /download avec le code de borg, index_last aligné, lecteurs sans attente de 60 s — 2026-10-02
+
+Chantier « reconstruction progressive », story 40 (actions de rétrospective A81 à A84 ; regroupement demandé par l'utilisateur).
+
+- **borgHelperWWW `/download/file` et `/download/tar` lisent le code de borg** (décisions de l'utilisateur ; mesuré sur un vrai
+  serveur : `200` pour borg en échec, borg tué, tar tronqué à 5 octets — le navigateur enregistrait un fichier faux). Échec ou
+  borg tué avant le premier octet -> `502` « borg extract a échoué : <cause> » ; fichier introuvable -> `404` (avant : `200`
+  vide), hors périmètre : même `404` (leurre) ; échec **pendant** l'envoi -> **flux coupé** (connexion fermée sans fin de
+  transfert, `[ERREUR]` au journal) ; code 1 : réponse complète, `[WARN]` au journal. UI : « Téléchargement interrompu » au
+  lieu du message brut du navigateur. **Reverse proxy : HTTP/1.1 requis** (nginx : `proxy_http_version 1.1;`) — en HTTP/1.0 la
+  coupure vaut fin normale (décision de l'utilisateur : documenté). Client qui abandonne un téléchargement : borg arrêté aussitôt
+  (antérieur : borg bloqué, processus zombie, verrou de dépôt gardé, serveur à 100 % CPU — mesuré en revue).
+- **`index_last.code` = code de sortie** : erreur de base chiffrée 2 (avant : 1), borg tué par le signal N 256−N (SIGKILL : 247 ; avant : code négatif), Ctrl-C 130.
+- **Lecteurs sans attente de 60 s** : sur une diff.db tenue par un verrou exclusif, RepoHistory, Status, ArchiveHistory, le
+  watcher, Report (purge du cache) attendaient 60 s (mesuré 60,3 s) avant de lire history.db ou de signaler la base ; sonde
+  lecteur de 2 s, comme le reste des lecteurs (écrivains : 60 s, inchangé).
+- **Message d'échec de borg** : en `--log-json` (Bkp, Prune), un échec (code ≥ 2) sans erreur dite donne « failed (code N) —
+  avertissement de borg : … » (avant : le code seul) ; CRITICAL lu comme ERROR. Bkp et Prune (écrivains) gardent une attente de
+  60 s sur diff.db avant la migration des mesures ; `/access` (bases en clair) et DiffTop n'attendent plus 60 s.
+- Tests : chacun des 567 contrôles de 1.0.176 lancé seul, puis les 18 variantes de casse et les nouveaux avec un filtre sensible
+  à la casse : tous OK (aucune dépendance de décor restante) ; nouveaux contrôles `index_last`, verrou exclusif réel, délai de
+  sonde par site (lecteurs 2 s, écrivains 60 s), `_rb_errmsg` ; push_selftest : `/download/*` (vrais sous-processus, borg tué si
+  le client part, flux coupé de bout en bout par l'application) ; test UI : téléchargement interrompu. CodecSelfTest 571/571.
+
 ## borgHelper 1.0.176 / borgHelperWWW 1.30.1 — code 1 de borg en avertissement, Bkp tué en échec, lecteurs annexes marqués, Index multi-nicks robuste, --numeric-ids — 2026-10-02
 
 Chantier « reconstruction progressive », story 39 (actions de rétrospective A77 à A80 ; regroupement demandé par l'utilisateur).

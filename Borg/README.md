@@ -863,7 +863,8 @@ Base d'index illisible (verrou au-delà du délai, 1.0.176) : la paire est laiss
 **Résultat du dernier Index** (1.0.149) : après chaque nick, `Index` écrit son résultat dans
 `CACHE_DIR/<conf>-<nick>-index-last.json` (0600) : `outcome` (`ok`, `error`, `refused`, `busy` = « Index déjà en
 cours », `deadline` = échéance atteinte pendant l'attente), `code`, heures de début et de fin (ISO avec décalage),
-`via` (`http` pour un Index lancé par `POST /index`, sinon `cli`) et les dernières lignes d'erreur. Seul le dernier
+`via` (`http` pour un Index lancé par `POST /index`, sinon `cli`) et les dernières lignes d'erreur. `code` = code de
+sortie du processus (1.0.177 : erreur de base chiffrée 2, borg tué par le signal N 256−N, SIGKILL 247, Ctrl-C 130 ; avant : 1 et le code négatif). Seul le dernier
 passage est gardé, mais un `busy`/`deadline` reporte l'échec précédent (`last_failure`) jusqu'au prochain `ok` ;
 fichier jetable. L'Index de fin de Bkp n'écrit rien. borgHelperWWW le montre (`GET /access`, badge « ⚠ Index en échec ») : un Index cron ou détaché en
 échec n'est plus invisible.
@@ -1778,7 +1779,7 @@ directement, en contournant `borgHelper`) — un filtre après coup serait déj�
 ayant eu lieu avant qu'un filtre ne puisse s'appliquer. `require_path_in_scope(request, nick, path)`
 réutilise telle quelle la même résolution de périmètre (`_resolve_path_scope`/`_path_in_scope`) que
 les commandes ci-dessus, mais tranche AVANT tout appel `borg`/`borgHelper` : chemin hors périmètre
-⇒ aucun appel n'est fait, jamais.
+⇒ aucun appel sur le chemin demandé, jamais (depuis 1.27.5 : la commande tourne sur un leurre, voir ci-dessous).
 
 Sur un chemin hors périmètre, chaque route répond **exactement comme pour un chemin qui n'existe pas** —
 **jamais un `403` distinct** : un `403` permettrait à l'appelant de distinguer « hors périmètre » de « n'existe pas »
@@ -1786,7 +1787,7 @@ par le seul code de statut, ce qui confirmerait indirectement qu'un chemin exist
 l'appelant n'a pas le droit de le voir (voir [Codes retour](#codes-retour)). Depuis borgHelperWWW 1.27.5, cette réponse
 n'est plus une imitation écrite à la main : la **vraie commande** est exécutée sur un **leurre** garanti inexistant (nom
 aléatoire, joker conservé si le chemin en contient un), puis le leurre est remplacé par le chemin demandé dans le texte
-renvoyé. Résultat identique par construction — texte, code de sortie, contenu téléchargé (vide, ou `.tar` vide),
+renvoyé. Résultat identique par construction — texte, code de sortie, contenu téléchargé (`404` « introuvable » depuis 1.30.2, ou `.tar` vide),
 nom de fichier, **et temps de réponse** — quelles que soient les versions de borg et de borgHelper ; rien n'est
 extrait. Auparavant l'imitation avait dérivé : pour un joker, code 1 et « never matched » alors que la vraie réponse
 est code 0 sans ce message, et elle était instantanée. Contrôlé par `push_selftest` sur le dépôt de démo (quatre
@@ -2559,16 +2560,28 @@ incompatible avec la réponse JSON texte de `CommandResult`. Ces deux routes lis
 
 Passphrase via `X-Borg-Passphrase` comme les autres actions marquées 🔑. Réponse : le flux binaire
 directement (pas de `CommandResult`) ; en cas d'erreur avant le début du stream, `HTTPException` JSON
-classique (404 nick/archive inconnu, 502 `borg list` en échec, 504 timeout, **403** si
+classique (404 nick inconnu, 502 `borg list` en échec ou archive `bid` inconnue, 504 timeout, **403** si
 `BORGHELPERWWW_ALLOW_DOWNLOADS` est désactivé — autorisé par défaut, voir
 [Configuration](#configuration)).
 
+**Code de borg (1.30.2)** : borg en échec (code ≥ 2) ou tué avant le premier octet -> `502` « borg extract a échoué :
+<cause> » ; `/download/file` d'un chemin introuvable -> `404` « <chemin> introuvable dans l'archive <archive> » (avant :
+`200` vide) ; borg en échec **pendant** l'envoi -> **flux coupé** : la connexion se ferme sans fin de transfert (curl :
+code 18 ; l'UI affiche « Téléchargement interrompu ») et `[ERREUR]` au journal du serveur — jamais un fichier tronqué
+servi comme complet (avant : `200`, fichier vide ou tronqué). Code 1 (avertissement) : réponse complète, `[WARN]` au journal.
+Client qui abandonne un téléchargement : borg arrêté aussitôt (avant : resté bloqué, verrou de dépôt gardé).
+
+> **Reverse proxy : HTTP/1.1 obligatoire vers borgHelperWWW.** La coupure n'est visible qu'en HTTP/1.1 (transfert par
+> morceaux) ; en HTTP/1.0, une connexion fermée vaut fin normale et un fichier tronqué repasse pour complet. nginx parle
+> HTTP/1.0 à l'amont par défaut : ajouter `proxy_http_version 1.1;` (et `proxy_set_header Connection "";`) dans le
+> `location` qui mène à borgHelperWWW. Un client qui parle lui-même HTTP/1.0 directement n'est pas protégé (limite connue).
+
 Depuis la Story 2.1 : un `path`/`prefix` hors du périmètre de l'appelant (`GROUPS_PATHS`, voir
-[Autorisation par groupes](#autorisation-par-groupes-reverse-proxy-oidcauth_request)) répond `200`
-avec un corps vide (`/download/file`) ou un tar minimal vide (`/download/tar`), jamais un `403` —
+[Autorisation par groupes](#autorisation-par-groupes-reverse-proxy-oidcauth_request)) répond comme un chemin absent :
+`404` (`/download/file`, 1.30.2 ; avant : `200` vide) ou un tar minimal vide (`/download/tar`), jamais un `403` —
 voir le tableau de la section « Autorisation par groupes » ci-dessus pour la forme exacte et le
-raisonnement (indiscernabilité d'un chemin qui n'existe simplement pas dans l'archive). Aucun appel
-`borg` n'est fait dans ce cas pour le fichier/l'arborescence demandé.
+raisonnement (indiscernabilité d'un chemin qui n'existe simplement pas dans l'archive). Depuis 1.27.5, la vraie
+commande `borg` tourne sur un **leurre** garanti inexistant (jamais sur le fichier/l'arborescence demandé).
 
 ### Limites connues
 

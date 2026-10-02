@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.22.0 -->
+<!-- UI_VERSION: 1.22.1 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -1749,7 +1749,9 @@ async function downloadViaFetch(path,params,nick,fallbackName){
     try{ const body=await res.json(); if(body.detail) detail=body.detail; }catch(e){}
     throw new Error('Téléchargement échoué : '+detail);
   }
-  const blob=await res.blob();
+  let blob;
+  try{ blob=await res.blob(); }   // UI 1.22.1 (A83) : borg en échec pendant l'envoi -> connexion coupée par le serveur
+  catch(e){ throw new Error('Téléchargement interrompu (échec de borg pendant l\'envoi, ou coupure réseau) — fichier non enregistré.'); }
   const dispo=res.headers.get('Content-Disposition')||'';
   const m=/filename="?([^"]+)"?/.exec(dispo);
   const filename=m?m[1]:fallbackName;

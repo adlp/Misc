@@ -502,6 +502,27 @@ async ${grab('loadMyAccess')}
   lma.set({httpStatus:500,stderr:'x'}); await lma.loadMyAccess();
   eq('bandeau de nettoyage : affiché par loadMyAccess (/access borg_cleanup), masqué si /access échoue ensuite',
      [shown,nel.hidden],[[false,true],true]);
+  // UI 1.22.1 (story 40, A83) : flux coupé par le serveur (borg en échec pendant l'envoi) -> res.blob() rejeté -> message clair,
+  // aucun fichier proposé ; erreur HTTP (502/404) -> détail du serveur, inchangé.
+  const dlf=new Function('hooks',`
+    const API_PREFIX='/api'; const location={origin:'http://x'};
+    const getApiKey=()=>'k', getPassphrase=()=>null, logout=()=>{};
+    const fetch=async()=>hooks.res;
+    const document={createElement:()=>{ hooks.saved=true; return {click(){},remove(){}}; },body:{appendChild(){}}};
+    const URL=class extends globalThis.URL{ static createObjectURL(){ return 'blob:x'; } static revokeObjectURL(){} };
+    const setTimeout=()=>{};
+async ${grab('downloadViaFetch')}
+    return downloadViaFetch;`);
+  const hk={}; const dl=dlf(hk); const msgOf=async()=>{ try{ await dl('/download/tar',{nick:'n'},'n','f.tar'); return 'ok'; }catch(e){ return e.message; } };
+  hk.res={status:200,ok:true,headers:{get:()=>''},blob:()=>Promise.reject(new TypeError('network error'))}; hk.saved=false;
+  const cut=[await msgOf(),hk.saved];
+  hk.res={status:502,ok:false,headers:{get:()=>''},json:async()=>({detail:'borg export-tar a échoué : x'})}; hk.saved=false;
+  const e502=[await msgOf(),hk.saved];
+  hk.res={status:200,ok:true,headers:{get:()=>''},blob:async()=>new Blob(['x'])}; hk.saved=false;
+  const okd=[await msgOf(),hk.saved];
+  eq('téléchargement : flux coupé -> « interrompu », rien enregistré ; 502 -> détail du serveur ; succès -> fichier proposé',
+     [cut,e502,okd],[["Téléchargement interrompu (échec de borg pendant l'envoi, ou coupure réseau) — fichier non enregistré.",false],
+                     ['Téléchargement échoué : borg export-tar a échoué : x',false],['ok',true]]);
   console.log(fail?fail+' FAIL':'TOUT OK');
   process.exit(fail?1:0);
 })();

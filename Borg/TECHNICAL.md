@@ -2309,6 +2309,17 @@ RepoHistory (`no such table` seulement -> `rows: []`) et ArchiveHistory `-j` mar
 `sys.exit(str)` affiché), code = le pire (`_exit_code`), nick suivant ; un seul nick : relancée (inchangé). Exception imprévue
 (ni base ni schéma) d'un nick, Index et Bkp multi-nicks : `_sentry_capture(e, nick)` (`capture_exception`, étiquette nick, si
 Sentry est initialisé). `_borg_extract_args` : `--numeric-ids`.
+**Téléchargements, index_last, sondes lecteur (1.0.177 / WWW 1.30.2 / UI 1.22.1, story 40)** : borgHelperWWW `_borg_stream(request,
+cmd, env, what, decoy, path, missing)` remplace `_stream_proc` — stderr de borg lu dans un thread, premier bloc lu AVANT la
+réponse : rien et code 1 + `missing` -> 404, rien et code ≥ 2/signal -> 502 (`_rb_errmsg`, leurre remplacé par le chemin
+demandé dans chaque ligne AVANT la mise en forme) ; premier bloc = 64 Kio ou la fin : fin atteinte -> code connu avant la réponse (≥ 2 : 502 ; code 1 sans sortie : 404 si « never matched », 502 pour un tar, sinon 200 vide) ; stderr : 200 dernières lignes ; sinon corps ASYNCHRONE (`run_in_threadpool`) qui vérifie le code à la fin : ≥ 2/signal -> `[ERREUR]` + `request.state.stream_aborted` ; client parti (corps annulé) -> borg tué (avant : bloqué sur son tube, zombie). Limite : la coupure n'est visible qu'en HTTP/1.1 (transfert par morceaux) — derrière nginx, `proxy_http_version 1.1` (décision de l'utilisateur, documenté). Le
+middleware `_access_log_and_user_guard` enveloppe chaque réponse dans `_AbortableResponse`, qui retient le dernier message de corps
+(fin de transfert) quand le drapeau est posé : uvicorn ferme la connexion (« ASGI callable returned without completing
+response ») — une exception dans le corps ne suffit pas, BaseHTTPMiddleware (Starlette 0.18) la change en fin normale (mesuré).
+`_record_index_last` : `SystemExit` entier -> `_exit_code` (signal N : 256−N, SIGKILL 247), DbKeyError/DbModeError/DbTamperError/DbCodecError -> 2, KeyboardInterrupt -> 130. `history_path(nick, writer)` : écrivain (`_hist(create=True)`) -> sonde de diff.db à 60 s, et jamais marquée faite si la sonde n'aboutit pas (revue : migration sautée, mesures anciennes écrites après une nouvelle) ; `ensure_diff_db(…, probe_wait)`. `db_plain_anomalies` (/access) : sonde 2 s. DiffTop : lectures sans `timeout=60` (jumelle d'IdxTop ; 63 s -> quelques s sous verrou exclusif). Sondes des
+chemins lecteur à `_READER_WRITE_WAIT` : `_db_has_schema(path, timeout=60)` (écrivains : 60 s), `ensure_cache_db`/`ensure_diff_db`
+/`ensure_history_db` en `create=False`, purge du cache de Report, sondes de RepoHistory/ArchiveHistory/Status (mesuré : 60,3 s ->
+2-4 s sous `locking_mode=EXCLUSIVE`). `_rb_errmsg` : CRITICAL lu comme ERROR ; échec (code ≥ 2) sans ERROR ni texte -> « <cmd> failed (code N) — avertissement de borg : <WARNING> » (le code toujours ; code 0/1 inchangé).
 **Ensure sans création (1.0.172, story 35, A61)** : `_open_db(…, create_file=None)` — `None` : le rôle décide (`read` jamais,
 `write`/`admin` `O_CREAT` 0600) ; `False` : `write`/`admin` en `mode=rw`, fichier absent -> `sqlite3.OperationalError`.
 `ensure_*_db(create=False)` l'utilise après sa sonde : supprimée entre les deux -> `_file_gone` -> retour (base absente) ;
@@ -3209,7 +3220,7 @@ résultat `False`, immédiatement après `require_api_key()`/`require_downloads_
 (pré-existants, inchangés), avant tout autre traitement.
 
 **Réponses synthétiques** (`_synth_restore_out_of_scope`, `_synth_restore_perms_out_of_scope`,
-`_synth_download_file_out_of_scope`, `_synth_download_tar_out_of_scope`, juste après `_stream_proc`) —
+`_synth_download_file_out_of_scope`, `_synth_download_tar_out_of_scope`, juste après `_stream_proc` — supprimé en 1.30.2, remplacé par `_borg_stream`) —
 chacune imite EXACTEMENT la forme que sa route produit aujourd'hui pour un chemin qui n'existe dans
 aucune archive :
 
@@ -3221,6 +3232,8 @@ aucune archive :
 | `GET /restore/perms` | oui | `200`, `CommandResult(exitcode=0, stdout="", stderr="")` |
 | `GET /download/file` | — | `200`, corps vide (générateur qui ne produit aucun chunk), `Content-Disposition` dérivé de `path` (`_safe_filename`, inchangée) |
 | `GET /download/tar` | — | `200`, tar minimal vide (`_empty_tar_bytes()`), `Content-Disposition` dérivé de `prefix`/`nick` (même logique que la route réelle) |
+
+*(Historique : formes de la story 2.1, remplacées par le leurre en 1.27.5 ; depuis 1.30.2, `/download/file` d'un chemin introuvable ou hors périmètre répond `404`.)*
 
 `_oos_last_archive_line(nick, bid, passphrase, label)` factorise la ligne d'archive commune à
 `restore`/`restore/perms` : n'imprime **rien** si `bid` est fourni (miroir exact de

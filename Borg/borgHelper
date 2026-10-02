@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.176"
+Version="1.0.177"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -651,7 +651,7 @@ def _rb_errmsg(rb,cmd='borg',n=2,cut=100):
     pas « Borg: »."""
     msgs=[]; txt=[]; st={}
     for i in rb.get('stderr',[]):
-        if isinstance(i,dict) and i.get('levelname')=='ERROR':
+        if isinstance(i,dict) and i.get('levelname') in ('ERROR','CRITICAL'):   # CRITICAL : 1.0.177 (revue), comme Bkp
             msgs.extend(m[:cut] for m in _borg_err_lines(txt,st)); txt=[]   # ordre gardé : texte d'abord
             m=_borg_err_lines(i.get('message','').split('\n'),st)   # --log-json : trace et bandeau = un message multi-lignes
             if m: msgs.append(m[0])
@@ -661,6 +661,15 @@ def _rb_errmsg(rb,cmd='borg',n=2,cut=100):
     # les autres messages : la cause d'abord ; code 0/1 ou avertissements seuls : inchangé
     if rb.get('exitcode') not in (0,1):
         msgs=[m for m in msgs if not m.startswith('Warning: ')]+[m for m in msgs if m.startswith('Warning: ')]
+    if not msgs and rb.get('exitcode') not in (0,1):
+        # 1.0.177 (story 40, A81 ; revue) : échec en --log-json sans ERROR ni texte -> le code TOUJOURS, puis les WARNING de borg
+        # (un avertissement sans rapport — « file changed » d'un borg tué — n'est jamais présenté comme la cause)
+        w=[]
+        for i in rb.get('stderr',[]):
+            if isinstance(i,dict) and i.get('levelname')=='WARNING':
+                m=_borg_err_lines(str(i.get('message','')).split('\n'),st)
+                if m: w.append(m[0][:cut])
+        if w: return f"{cmd} failed (code {rb['exitcode']}) — avertissement de borg : {'; '.join(w[:n])}"
     return '; '.join(msgs[:n]) or f"{cmd} failed (code {rb['exitcode']})"
 
 def _print_borg_stderr(entries,debug=0):
@@ -2143,7 +2152,7 @@ def db_plain_anomalies(nick,db_paths,cfg):
         return []
     out=[]
     for label,p in db_paths:
-        if not _db_has_schema(p): continue
+        if not _db_has_schema(p,_READER_WRITE_WAIT): continue   # 1.0.177 (revue story 40) : lecteur (/access) — avant 60 s par base
         try:
             import pathlib; c=sqlite3.connect(pathlib.Path(p).resolve().as_uri()+'?mode=ro',uri=True)
             try: raw=_enc_header_read(c)
@@ -2459,11 +2468,11 @@ def _reader_sqlite_err(e,db_path,key=None):
     if k in _SQLITE_ERR_SEEN: return
     _SQLITE_ERR_SEEN.add(k); printer(f"[ERREUR] SQLite error ({db_path}): {e}")
 
-def _db_has_schema(db_path):
+def _db_has_schema(db_path,timeout=60):
     """True si db_path est une base (au moins une table, _db_probe). Un fichier existant mais vide ou sans table n'est pas une
     base créée — ensure_*_db(create=False) doit s'y fier plutôt qu'à os.path.exists (AD-12). 1.0.171 : tables seulement
     (une vue seule n'en fait plus une base : sinon née en clair), sans création ; illisible -> False (inchangé)."""
-    return _db_probe(db_path)[0]=='base'
+    return _db_probe(db_path,timeout)[0]=='base'
 
 # ── BorgHelperDB — all SQLite operations ──────────────────────────────────────
 
@@ -2528,17 +2537,22 @@ class BorgHelperDB:
     def get_history_db(self,nick):
         return _history_path_for(self.get_diff_db(nick))
 
-    def history_path(self,nick):
+    def history_path(self,nick,writer=False):
         """Chemin de history.db pour un LECTEUR (1.0.139) : ouvre d'abord diff.db (ensure_diff_db, sans jamais la
         créer), ce qui migre ses mesures si elle vient d'une version antérieure (AD-8 : migration à toute
-        ouverture) — une fois par processus et par base. Ne crée jamais history.db."""
+        ouverture) — une fois par processus et par base. Ne crée jamais history.db. writer (1.0.177, revue story 40) :
+        appelé par un ÉCRIVAIN (_hist create=True : Bkp, Prune) — sonde de diff.db à 60 s comme tout écrivain (lecteur : 2 s) ;
+        sonde sans réponse (base occupée, illisible) : jamais marquée faite (sinon migration sautée puis mesures anciennes
+        écrites derrière une nouvelle, mesuré)."""
         diff=self.get_diff_db(nick)
         if diff not in self._hist_migrated:
             if os.path.exists(diff):
+                wait=60 if writer else _READER_WRITE_WAIT
+                if _db_probe(diff,wait)[0]=='illisible': return self.get_history_db(nick)
                 # Base corrompue : ensure_diff_db a déjà affiché son message et fait sys.exit ; base occupée (1.0.166) : entretien
                 # sauté sans erreur — un LECTEUR de mesures (Status -n ALL, get_repo_stats…) continue sur history.db telle
                 # quelle ; nouvel essai plus tard dans les deux cas (jamais marquée _hist_migrated).
-                try: self.ensure_diff_db(diff,create=False)
+                try: self.ensure_diff_db(diff,create=False,probe_wait=wait)
                 except SystemExit: return self.get_history_db(nick)
                 if self._reader_skip_fresh(diff): return self.get_history_db(nick)
             self._hist_migrated.add(diff)
@@ -2926,7 +2940,7 @@ class BorgHelperDB:
         déjà, comportement inchangé (migrations/_check_set_meta). Seuls Index/Bkp/indexsnap gardent
         le défaut create=True (créateurs légitimes, AD-12). nick (1.0.168) : base neuve créée chiffrée
         si la config du nick le permet (_new_db_header)."""
-        if not create and (self._reader_skip_fresh(db_path) or not _db_has_schema(db_path)): return
+        if not create and (self._reader_skip_fresh(db_path) or not _db_has_schema(db_path,_READER_WRITE_WAIT)): return   # 1.0.177 (A84) : sonde lecteur 2 s (avant 60 s)
         held=create and _held_before(db_path)   # 1.0.169 (A52) : avant toute ouverture (O_CREAT)
         new=self._new_db_header(db_path,nick) if create else None
         conn=None
@@ -3051,11 +3065,11 @@ class BorgHelperDB:
             CREATE INDEX IF NOT EXISTS idx_rstats_nick ON repo_stats(nick, id);
         """)
 
-    def ensure_diff_db(self,db_path,create=True,nick=None):
+    def ensure_diff_db(self,db_path,create=True,nick=None,probe_wait=_READER_WRITE_WAIT):
         """create=False (AD-12) : voir ensure_cache_db — même contrat, réservé aux lecteurs. Lecteur (1.0.166, story 29) :
         verrou d'écriture tenu ailleurs plus de _READER_WRITE_WAIT s -> rien écrit, base lue telle quelle (_reader_busy_skip).
         nick (1.0.168, story 31) : base neuve créée chiffrée si la config du nick le permet (_new_db_header)."""
-        if not create and (self._reader_skip_fresh(db_path) or not _db_has_schema(db_path)): return
+        if not create and (self._reader_skip_fresh(db_path) or not _db_has_schema(db_path,probe_wait)): return   # 1.0.177 (A84) : sonde lecteur 2 s (avant 60 s ; history_path d'un écrivain : 60 s)
         held=create and _held_before(db_path)   # 1.0.169 (A52) : avant toute ouverture (O_CREAT)
         new=self._new_db_header(db_path,nick) if create else None
         conn=None
@@ -3209,7 +3223,7 @@ class BorgHelperDB:
         AD-12). Mémorisé par processus. Ouverte sans nick (nick=None) : jamais de codec ni d'avertissement « base
         non chiffrée » — history.db ne porte aucun chemin et n'est jamais chiffrée."""
         if path in self._hist_ready and os.path.exists(path): return True
-        if not create and _db_probe(path)[0]=='absent': return False   # 1.0.172 : mêmes états que les deux autres bases ; illisible : erreur réelle
+        if not create and _db_probe(path,_READER_WRITE_WAIT)[0]=='absent': return False   # 1.0.172 : mêmes états que les deux autres bases ; illisible : erreur réelle ; 1.0.177 : 2 s
         try:
             try: conn=_open_db(path,nick=None,role='admin',create_file=bool(create),timeout=60)
             except sqlite3.OperationalError as e:
@@ -3430,7 +3444,7 @@ class BorgHelperDB:
         """history.db à utiliser : db_path explicite, sinon celle du nick (après migration éventuelle de diff.db,
         history_path). create=True (écrivain qui crée : Bkp, Prune, refresh d'Index) : schéma garanti. Sinon (lecteur,
         réclamation du watcher) : None si le fichier n'existe pas — jamais de création sur une lecture."""
-        if db_path is None: db_path=self.history_path(nick)
+        if db_path is None: db_path=self.history_path(nick,writer=create)
         if create:
             self.ensure_history_db(db_path,create=True); return db_path
         return db_path if os.path.exists(db_path) else None
@@ -4397,7 +4411,7 @@ class BorgHelper:
         if db_path is None: db_path=self.db.get_cache_db(nick)
         self.db.ensure_cache_db(db_path,create=False)
         nom=f"{nick}:prune"
-        if _db_has_schema(db_path): self.db.purge_stale_cache(nom,last_modified,db_path)  # jamais mis en cache -> rien à purger (AD-12 : ne pas toucher le fichier)
+        if _db_has_schema(db_path,_READER_WRITE_WAIT): self.db.purge_stale_cache(nom,last_modified,db_path)  # jamais mis en cache -> rien à purger (AD-12 : ne pas toucher le fichier)
         try:
             conn=_open_db(db_path,nick=nick,role='read',empty_ok=True)
             row=conn.execute("SELECT details FROM cachejsonboexlm WHERE nom=? AND lastmodified=? LIMIT 1",(nom,last_modified)).fetchone()
@@ -4445,7 +4459,7 @@ class BorgHelper:
         if db_path is None: db_path=self.db.get_cache_db(nick)
         self.db.ensure_cache_db(db_path,create=False)
         if last_modified is None: last_modified=self.borg._boex_last_modified(nick,debug=debug)
-        if _db_has_schema(db_path): self.db.purge_stale_cache(nick,last_modified,db_path)  # jamais mis en cache -> rien à purger (AD-12 : ne pas toucher le fichier)
+        if _db_has_schema(db_path,_READER_WRITE_WAIT): self.db.purge_stale_cache(nick,last_modified,db_path)  # jamais mis en cache -> rien à purger (AD-12 : ne pas toucher le fichier)
         try:
             conn=_open_db(db_path,nick=nick,role='read',empty_ok=True)
             row=conn.execute("SELECT details FROM cachejsonboexlm WHERE nom=? AND lastmodified=? LIMIT 1",(nick,last_modified)).fetchone()
@@ -6294,12 +6308,17 @@ class BorgHelper:
         d'écriture : avertissement seulement."""
         out=getattr(self,'_index_outcome',{}).pop(nick,None)
         msg=''
+        # 1.0.177 (story 40, A84) : code = celui de la sortie du processus — sys.exit négatif (signal) -> 256+c (_exit_code),
+        # erreur de base chiffrée -> 2 (gestionnaire global) ; avant : -9 et 1, la sortie valait 247 et 2
         if isinstance(exc,SystemExit):
             code=exc.code
             if code is None: code=0
             elif not isinstance(code,int): msg=str(code); code=1
+            else: code=_exit_code(code)
+        elif isinstance(exc,KeyboardInterrupt): code=130   # revue story 40 : Ctrl-C hors boex, comme sa sortie
         elif exc is not None:
-            code=1; msg=f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            code=2 if isinstance(exc,(DbKeyError,DbModeError,DbTamperError,DbCodecError)) else 1
+            msg=f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
         if not isinstance(code,int): code=0   # index() rend toujours un entier (défensif)
         if exc is None and out: outcome=out
         else: outcome='ok' if code==0 else 'refused' if code==3 else 'error'
@@ -7629,7 +7648,7 @@ class BorgHelper:
             if not os.path.exists(db_path):
                 if as_json: print(json.dumps({'error':f"diff.db absent pour {nick}"},ensure_ascii=False,indent=2)); return
                 printer(f"  {nick}: diff.db absent — lancez borgHelper -c Index -n {nick}"); return
-            pr=_db_probe(db_path)   # 1.0.175 (A72) : illisible n'est plus « aucune archive »
+            pr=_db_probe(db_path,_READER_WRITE_WAIT)   # 1.0.175 (A72) : illisible n'est plus « aucune archive » ; 1.0.177 : sonde lecteur 2 s
             if pr[0]!='base':
                 if pr[0]=='illisible': _reader_sqlite_err(pr[1],db_path)
                 msg=(f"Aucune archive indexée — lancez : borgHelper -c Index -n {nick}" if pr[0]=='absent'
@@ -7685,7 +7704,7 @@ class BorgHelper:
         if not os.path.exists(db_path):
             if as_json: print(json.dumps({'error':f"diff.db absent pour {nick}"},ensure_ascii=False,indent=2)); return
             printer(f"  {nick}: diff.db absent — lancez borgHelper -c Index -n {nick}"); return
-        pr=_db_probe(db_path)   # 1.0.175 (A72) : illisible n'est plus « aucune archive »
+        pr=_db_probe(db_path,_READER_WRITE_WAIT)   # 1.0.175 (A72) : illisible n'est plus « aucune archive » ; 1.0.177 : sonde lecteur 2 s
         if pr[0]!='base':
             if pr[0]=='illisible': _reader_sqlite_err(pr[1],db_path)
             msg=(f"Aucune archive indexée — lancez : borgHelper -c Index -n {nick}" if pr[0]=='absent'
@@ -7765,7 +7784,7 @@ class BorgHelper:
         db_path=self.db.get_diff_db(nick)
         last_backup=None
         build={'state':'complete'}   # AD-10 : base sans build_state (antérieure au chantier) = complète
-        pr=_db_probe(db_path)
+        pr=_db_probe(db_path,_READER_WRITE_WAIT)   # 1.0.177 (A84) : sonde lecteur 2 s (avant 60 s)
         if pr[0]=='illisible':   # 1.0.175 (A72) : illisible n'est plus « aucune archive indexée »
             _reader_sqlite_err(pr[1],db_path); last_backup={'error':f"base illisible ({pr[1]})"}
         if pr[0]=='base':
@@ -7805,7 +7824,7 @@ class BorgHelper:
         bkp_stale=bkp_row if bkp_row and bkp_row['stale'] else None
         rebuild=None   # fantôme (1.0.143, AD-10) : son build_state, lu sans codec ni borg ; {'state':'partial'} s'il n'en a pas
         sp=db_path+_SHADOW_SUFFIX
-        if _db_has_schema(sp):   # jamais _open_db (O_CREAT) sur un fantôme que la bascule vient de supprimer
+        if _db_has_schema(sp,_READER_WRITE_WAIT):   # jamais _open_db (O_CREAT) sur un fantôme que la bascule vient de supprimer ; 1.0.177 : lecteur 2 s
             v=self._db_meta_value(sp,_build_state_key(nick))
             try: rebuild=json.loads(v) if v else {'state':'partial'}
             except ValueError: rebuild={'state':'partial'}
@@ -8102,7 +8121,7 @@ class BorgHelper:
         else:
             conn=None
             try:
-                conn=_open_db(db_path,nick=nick,role='read',empty_ok=True,timeout=60)
+                conn=_open_db(db_path,nick=nick,role='read',empty_ok=True)
                 row=conn.execute(
                     "SELECT archive_old,archive_new FROM diff_indexed_pairs WHERE nick=? ORDER BY indexed_at DESC LIMIT 1",
                     (nick,)).fetchone()
@@ -8121,7 +8140,7 @@ class BorgHelper:
             rows=[]
             conn=None
             try:
-                conn=_open_db(db_path,nick=nick,role='read',empty_ok=True,timeout=60)
+                conn=_open_db(db_path,nick=nick,role='read',empty_ok=True)
                 cur=conn.execute(
                     "SELECT path,change_type,size_before,size_after FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",
                     (nick,arch_old,arch_new))
@@ -8149,7 +8168,7 @@ class BorgHelper:
         total_count=0; total_size=0; file_added=0; file_modified=0
         conn=None
         try:
-            conn=_open_db(db_path,nick=nick,role='read',empty_ok=True,timeout=60)
+            conn=_open_db(db_path,nick=nick,role='read',empty_ok=True)
             cur=conn.execute(
                 "SELECT path,change_type,size_before,size_after FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",
                 (nick,arch_old,arch_new))
@@ -8179,7 +8198,7 @@ class BorgHelper:
             printer(_reader_sqlite_line(e,db_path)); return   # 1.0.176 (A78) : [ERREUR] pour une vraie erreur
         conn3=None
         try:
-            conn3=_open_db(db_path,nick=nick,role='read',empty_ok=True,timeout=60)
+            conn3=_open_db(db_path,nick=nick,role='read',empty_ok=True)
             exclu_rows3=conn3.execute("SELECT change_type,SUM(file_count),SUM(total_size) FROM diff_excluded_stats WHERE nick=? AND archive_old=? AND archive_new=? GROUP BY change_type",(nick,arch_old,arch_new)).fetchall()
             nfiles_row=conn3.execute("SELECT nfiles FROM archive_stats WHERE nick=? AND archive=?",(nick,arch_new)).fetchone()
             conn3.close()
@@ -10881,9 +10900,9 @@ def codec_selftest(pattern=None,list_only=False):
             bo2 affiché, code 2 ; Report direct (jumelle) : arrêt de prep_report sur bo1 -> même isolation."""
             d,rc,paths=_busy_env()
             b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); orig=b.db.ensure_diff_db
-            def bad(p,create=True):
+            def bad(p,create=True,**kw):   # **kw : probe_wait (1.0.177) transmis — décor fidèle à la signature
                 if p==paths['bo1']: _db_schema_fail(p,sqlite3.DatabaseError('database disk image is malformed'),"l'index")
-                return orig(p,create=create)
+                return orig(p,create=create,**kw)
             o=io.StringIO()
             with mock.patch.object(b.db,'ensure_diff_db',bad),contextlib.redirect_stdout(o),contextlib.redirect_stderr(io.StringIO()):
                 code=b.report_offline('bo1,bo2',as_json=True)
@@ -10913,9 +10932,9 @@ def codec_selftest(pattern=None,list_only=False):
             [ERREUR] : `⚠ arrêt (code 1)`."""
             import html as _h
             d,rc,paths=_busy_env(); b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); orig=b.db.ensure_diff_db
-            def bad(p,create=True):
+            def bad(p,create=True,**kw):   # **kw : probe_wait (1.0.177) transmis — décor fidèle à la signature
                 if p==paths['bo1']: _db_schema_fail(p,sqlite3.DatabaseError('database disk image is malformed'),"l'index")
-                return orig(p,create=create)
+                return orig(p,create=create,**kw)
             o=io.StringIO()
             with mock.patch.object(b.db,'ensure_diff_db',bad),contextlib.redirect_stdout(o),contextlib.redirect_stderr(io.StringIO()):
                 b.report_offline('bo1,bo2',htrep=True)
@@ -11040,12 +11059,12 @@ def codec_selftest(pattern=None,list_only=False):
             def op(p,*a,**kw):
                 if kind=='key' and kw.get('nick') in bad: raise DbKeyError(f"{kw['nick']}: passphrase incorrecte ou en-tête altéré")
                 return orig_open(p,*a,**kw)
-            def ens(p,create=True):
+            def ens(p,create=True,**kw):   # **kw : probe_wait (1.0.177) transmis — décor fidèle à la signature
                 if p in paths:
                     if kind=='corrupt': _db_schema_fail(p,sqlite3.DatabaseError('database disk image is malformed'),"l'index")
                     if kind=='schema': raise SchemaVersionError(f"({p}) schéma DB v99 > attendu v{DIFF_DB_SCHEMA_VERSION}")
                     if kind=='ctrlc': sys.exit(130)
-                return orig_ens(p,create=create)
+                return orig_ens(p,create=create,**kw)
             return op,ens
         def _mn_inproc(kind,bad,nicks):
             """bhq.search(nicks) avec les arrêts simulés -> (sortie JSON ou None, exception levée ou None)."""
@@ -11103,12 +11122,12 @@ def codec_selftest(pattern=None,list_only=False):
             def op(p,*a,**kw):
                 if kinds.get(kw.get('nick'))=='key': raise DbKeyError(f"{kw['nick']}: passphrase incorrecte ou en-tête altéré")
                 return orig_open(p,*a,**kw)
-            def ens(p,create=True):
+            def ens(p,create=True,**kw):   # **kw : probe_wait (1.0.177) transmis — décor fidèle à la signature
                 k=paths.get(p)
                 if k=='corrupt': _db_schema_fail(p,sqlite3.DatabaseError('database disk image is malformed'),"l'index")
                 if k=='schema': raise SchemaVersionError(f"({p}) schéma DB v99 > attendu v{DIFF_DB_SCHEMA_VERSION}")
                 if k=='ctrlc': sys.exit(130)
-                return orig_ens(p,create=create)
+                return orig_ens(p,create=create,**kw)
             o=io.StringIO(); exc=None; g['_open_db']=op
             try:
                 with mock.patch.object(bhq.db,'ensure_diff_db',ens),contextlib.redirect_stdout(o),contextlib.redirect_stderr(io.StringIO()):
@@ -11158,9 +11177,9 @@ def codec_selftest(pattern=None,list_only=False):
             try: _per_nick_main('qe,qp',boom); r1='avalée'
             except KeyboardInterrupt: r1='propagée'
             orig=bhq.db.ensure_diff_db; called=[]
-            def ens(p,create=True):
+            def ens(p,create=True,**kw):   # **kw : probe_wait (1.0.177) transmis — décor fidèle à la signature
                 if p==bhq.db.get_diff_db('qe'): raise KeyboardInterrupt
-                called.append(p); return orig(p,create=create)
+                called.append(p); return orig(p,create=create,**kw)
             try:
                 with mock.patch.object(bhq.db,'ensure_diff_db',ens),contextlib.redirect_stdout(io.StringIO()),\
                      contextlib.redirect_stderr(io.StringIO()):
@@ -14101,6 +14120,119 @@ fail()
             if bad: print(f"  {bad}")
             return not bad
         check("Index et Bkp multi-nicks : exception imprévue d'un nick -> [ERREUR], suivants traités, envoyée à Sentry ; Ctrl-C et nick seul relancés",_multi_nick_sentry)
+        def _index_last_exit_code():
+            """1.0.177 (story 40, A84) : index_last.code = code de sortie du processus — DbKeyError 2 (gestionnaire global),
+            sys.exit(-9) 247 (_exit_code), sys.exit(None) 0, sys.exit(texte) 1, exception imprévue 1, code rendu tel quel."""
+            d,b=_nb_env('ilcode'); got={}
+            for nm,code,exc in (('DbKeyError',1,DbKeyError('clé')),('DbModeError',1,DbModeError('m')),('DbTamperError',1,DbTamperError('t')),
+                                ('DbCodecError',1,DbCodecError('c')),('Ctrl-C',1,KeyboardInterrupt()),('exit -9',1,SystemExit(-9)),
+                                ('exit None',1,SystemExit(None)),('exit texte',1,SystemExit('arrêt')),('imprévue',1,RuntimeError('x')),('rendu 3',3,None)):
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                    b._record_index_last('zr',_iso_now(),_print_mark(),code,exc)
+                got[nm]=(b.db.read_index_last('zr') or {}).get('code')
+            want={'DbKeyError':2,'DbModeError':2,'DbTamperError':2,'DbCodecError':2,'Ctrl-C':130,'exit -9':247,'exit None':0,
+                  'exit texte':1,'imprévue':1,'rendu 3':3}
+            if got!=want: print(f"  {got}")
+            return got==want
+        check("index_last : code = code de sortie (DbKeyError 2, signal 256+c) (A84)",_index_last_exit_code)
+        def _reader_probe_wait():
+            """1.0.177 (story 40, A84 ; mesuré : 60,3 s) : diff.db tenue par un verrou exclusif réel (locking_mode=EXCLUSIVE, autre
+            processus) -> les lecteurs (RepoHistory -j, ensure_diff_db(create=False), Status, ArchiveHistory -j) rendent la main en
+            quelques secondes (sonde lecteur _READER_WRITE_WAIT) ; RepoHistory sert history.db ; l'écrivain garde 60 s (signature)."""
+            d,b=_nb_env('probewait'); p=b.db.get_diff_db('zr'); res={}
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                b.db.ensure_diff_db(p,nick='zr'); b.db.store_repo_stats('zr','bkp',1,2,3)
+            holder=subprocess.Popen([sys.executable,'-c',"import sqlite3,sys,time\nc=sqlite3.connect(sys.argv[1],isolation_level=None)\n"
+                                     "c.execute('PRAGMA locking_mode=EXCLUSIVE'); c.execute('BEGIN EXCLUSIVE')\n"
+                                     "c.execute(\"UPDATE db_meta SET value=value WHERE key='schema_version'\")\nprint('tenu',flush=True); time.sleep(120)",p],
+                                    stdout=subprocess.PIPE,stdin=subprocess.DEVNULL,text=True)
+            try:
+                res['verrou tenu']=holder.stdout.readline().strip()=='tenu' and _db_probe(p,0.2)[0]=='illisible'   # contrôle positif : la base est bien tenue
+                b2=BorgHelper(cfgfile=os.path.join(d,'rc'),cache_dir=os.path.join(d,'cache'))   # processus « neuf » : rien en mémoire
+                for nm,fn in (('ensure lecteur',lambda: b2.db.ensure_diff_db(p,create=False)),('RepoHistory',lambda: b2.repo_history('zr',as_json=True)),
+                              ('DiffTop',lambda: b2.difftop('zr',as_json=True)),('IdxTop',lambda: b2.idxtop('zr',as_json=True)),
+                              ('Status',lambda: b2._status_one('zr')),('ArchiveHistory',lambda: b2.archive_history('zr',as_json=True))):
+                    t0=time.monotonic(); o,c,_r=_wk_run(fn); dt=time.monotonic()-t0
+                    res[nm]=(dt<10,round(dt,1))
+                    if nm=='RepoHistory':
+                        try: res['RepoHistory lignes']=(len(json.loads(o[o.index('{'):])['rows'])==1,o[-120:])
+                        except (ValueError,KeyError): res['RepoHistory lignes']=(False,o[-200:])
+            finally:
+                holder.kill(); holder.wait()
+            import inspect
+            res['écrivain 60 s']=(inspect.signature(_db_has_schema).parameters['timeout'].default==60,)
+            bad={k:v for k,v in res.items() if not (v if isinstance(v,bool) else v[0])}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("lecteurs : diff.db en verrou exclusif -> réponse en quelques secondes (sonde lecteur 2 s, avant 60 s) (A84)",_reader_probe_wait)
+        def _rb_errmsg_warning():
+            """1.0.177 (story 40, A81) : _rb_errmsg — --log-json sans ERROR ni texte : ses WARNING plutôt que « failed (code N) » ;
+            ERROR présent : ERROR seul (inchangé) ; rien : « failed (code N) » (inchangé)."""
+            W={'type':'log_message','levelname':'WARNING','message':'w1'}; E={'type':'log_message','levelname':'ERROR','message':'e1'}
+            C={'type':'log_message','levelname':'CRITICAL','message':'c1'}
+            # revue : le code toujours (avertissement sans rapport d'un borg tué jamais présenté comme la cause) ; code 0/1 inchangé
+            return (_rb_errmsg({'exitcode':2,'stderr':[W]},'borg create')=='borg create failed (code 2) — avertissement de borg : w1'
+                    and _rb_errmsg({'exitcode':-9,'stderr':[W]},'borg create')=='borg create failed (code -9) — avertissement de borg : w1'
+                    and _rb_errmsg({'exitcode':0,'stderr':[W]},'borg list')=='borg list failed (code 0)'
+                    and _rb_errmsg({'exitcode':1,'stderr':[W]},'borg list')=='borg list failed (code 1)'
+                    and _rb_errmsg({'exitcode':2,'stderr':[W,E]},'borg create')=='e1'
+                    and _rb_errmsg({'exitcode':2,'stderr':[W,C]},'borg create')=='c1'
+                    and _rb_errmsg({'exitcode':2,'stderr':[]},'borg create')=='borg create failed (code 2)'
+                    and _rb_errmsg({'exitcode':2,'stderr':['texte'],},'borg create')=='texte')
+        check("_rb_errmsg : WARNING de --log-json repris quand rien d'autre (A81)",_rb_errmsg_warning)
+        def _probe_wait_sites():
+            """1.0.177 (revue story 40) : délai passé à _db_probe par CHAQUE site modifié — lecteurs 2 s (ensure_*_db create=False,
+            history_path lecteur, RepoHistory sans history.db, ArchiveHistory, Status, /access db_plain_anomalies, purge du cache
+            de Report : cache_prune_dryrun et cacheJsonBoexWithLM) ; ÉCRIVAINS 60 s (history_path d'un écrivain : Bkp, Prune ;
+            ensure_diff_db create=True). Enregistrement des appels réels de _db_probe (aucun verrou : toutes les sondes passent)."""
+            d,b=_nb_env('probesites'); p=b.db.get_diff_db('zr'); c=b.db.get_cache_db('zr'); h=b.db.get_history_db('zr'); res={}
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                b.db.ensure_diff_db(p,nick='zr'); b.db.ensure_cache_db(c,nick='zr'); b.db.ensure_history_db(h)
+            seen=[]; orig=_db_probe
+            def rec(path,timeout=60):
+                seen.append((os.path.basename(path),timeout)); return orig(path,timeout)
+            def run(fn):
+                seen.clear()
+                with mock.patch(f"{__name__}._db_probe",rec): _wk_run(fn)
+                return list(seen)
+            fresh=lambda: BorgHelper(cfgfile=os.path.join(d,'rc'),cache_dir=os.path.join(d,'cache'))
+            rd=lambda s: bool(s) and all(x[1]==_READER_WRITE_WAIT for x in s)
+            boex=lambda *a,**k: {'exitcode':0,'stdout':[{'archives':[]}],'stderr':[]}
+            cases=(('ensure_diff_db lecteur',lambda: b.db.ensure_diff_db(p,create=False),rd),
+                   ('ensure_cache_db lecteur',lambda: b.db.ensure_cache_db(c,create=False),rd),
+                   ('ensure_history_db lecteur',lambda: fresh().db.ensure_history_db(h,create=False),rd),   # mémorisé par processus : instance neuve
+                   ('history_path lecteur',lambda: fresh().db.history_path('zr'),rd),
+                   ('ArchiveHistory',lambda: b.archive_history('zr',as_json=True),rd),
+                   ('Status',lambda: b._status_one('zr'),rd),
+                   ('/access (db_plain_anomalies)',lambda: db_plain_anomalies('zr',[('diff.db',p)],{'BORG_PASSPHRASE':'pw','DB_ENCRYPT':'true'}),rd))
+            for nm,fn,ok in cases:
+                s=run(fn); res[nm]=(ok(s),s)
+            bp=fresh()
+            with mock.patch.object(bp.borg,'boex',boex): s=run(lambda: bp.cache_prune_dryrun('zr','LM'))
+            pr=lambda s: len(s)>=2 and rd(s[:2]) and all(x[1]==60 for x in s[2:])   # ensure lecteur, purge : 2 s ; écriture du cache : 60 s
+            res['purge prune dry-run']=(pr(s),s)
+            with mock.patch.object(bp.borg,'boex',boex): s=run(lambda: bp.cacheJsonBoexWithLM('zr',['info','--json'],last_modified='LM2'))
+            res['purge info']=(pr(s),s)
+            hh=h+'.de-côté'; os.replace(h,hh)
+            s=run(lambda: fresh().repo_history('zr',as_json=True)); os.replace(hh,h)
+            res['RepoHistory sans history.db']=(rd(s),s)
+            s=run(lambda: fresh().db.history_path('zr',writer=True))
+            res['history_path écrivain']=(bool(s) and all(x[1]==60 for x in s),s)
+            s=run(lambda: fresh().db._hist('zr',create=True))
+            res['_hist écrivain (Bkp, Prune)']=(bool(s) and all(x[1]==60 for x in s if x[0].endswith('diff.db')) and any(x[0].endswith('diff.db') for x in s),s)
+            s=run(lambda: b.db.ensure_diff_db(p,create=True,nick='zr'))
+            res['ensure_diff_db écrivain']=(bool(s) and all(x[1]==60 for x in s),s)
+            # diff.db sans réponse (occupée au-delà du délai) : la migration des mesures n'est JAMAIS marquée faite (revue : sautée
+            # puis mesures anciennes écrites derrière une nouvelle) — lecteur et écrivain
+            for w in (False,True):
+                f=fresh()
+                with mock.patch(f"{__name__}._db_probe",lambda path,timeout=60: ('illisible',sqlite3.OperationalError('database is locked')) if path==p else orig(path,timeout)):
+                    _wk_run(lambda: f.db.history_path('zr',writer=w))
+                res[f"occupée jamais marquée ({'écrivain' if w else 'lecteur'})"]=(p not in f.db._hist_migrated,)
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("sondes : 2 s à chaque site lecteur, 60 s aux écrivains (history_path de Bkp/Prune, ensure create=True) (A84)",_probe_wait_sites)
         check("Restore : borg extract --numeric-ids (plus --numeric-owner, déprécié depuis borg 1.2) (A80)",
               lambda: _borg_extract_args('a','etc/x')[:2]==['extract','--numeric-ids'] and '--numeric-owner' not in _borg_extract_args('a','*.x'))
         # 1.0.173 (story 36, A63, décision de l'utilisateur) : Restore -w vers une destination absente ou qui n'est pas un dossier
