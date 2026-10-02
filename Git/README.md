@@ -67,4 +67,6 @@ Fonctionnement :
   ```
   `file` (relatif au repertoire du `.deploy.conf`) peut etre un fichier ou un repertoire. `url` suit la syntaxe scp classique `[user@]host:chemin`.
 - Transfert via `git archive HEAD -- <chemins> | ssh <host> 'tar x -C <chemin> --strip-components=N'` — une seule connexion par url, pas de dependance cote distant hormis `tar`+`ssh`.
+
+Exemple pret a copier : `Git/.deploy.conf.example` (a copier en `.deploy.conf` puis adapter).
 - Une url en echec (host injoignable, url mal formee) n'empeche pas les autres d'etre tentees ; code de sortie non nul si au moins une a echoue.

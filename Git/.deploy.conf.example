@@ -1,0 +1,19 @@
+# Exemple de .deploy.conf pour git-deploy / git deploy <profil>.
+#
+# Copier ce fichier en .deploy.conf (jamais commite, voir .gitignore racine :
+# **/.deploy.conf) a cote du sous-projet a deployer, puis l'adapter.
+#
+# Chaque section est un profil (nom passe a "git deploy <profil>").
+#   file = chemin relatif au repertoire de ce fichier (fichier ou repertoire)
+#   url  = destination scp classique [user@]host:chemin (repetable)
+
+[preprod]
+    file = gitconfig
+    file = git-deploy
+    url = adlp@preprod1.adlp.org:/opt/git-tools/
+    url = adlp@preprod2.adlp.org:/opt/git-tools/
+
+[prod]
+    file = gitconfig
+    file = git-deploy
+    url = adlp@prod.adlp.org:/opt/git-tools/
