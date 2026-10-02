@@ -1955,7 +1955,24 @@ None` : comportement actuel, `result_json` en clair. `codec` réel : `result_jso
 `_is_db_key_error`) — 1 = alerte ou erreur tirée des bases, couverte par l'empreinte (Report -o « diff.db absent »,
 MAX_AGE_BKP) ; code >= 2 (« ⚠ dépôt absent », borg, ssh, dépôt externe) recalculé à chaque appel. Une seule écriture de
 `_RESPONSE_CACHE` (garde de source push). Limite connue : une réponse en code 0 mise en cache ne voit pas un état
-extérieur qui change sans toucher les bases (disque démonté, MAX_AGE_BKP dépassé sans écriture) — deferred-work.
+extérieur qui change sans toucher les bases (disque démonté, MAX_AGE_BKP dépassé sans écriture) — levée en 1.29.0 :
+
+1.29.0 (story 37, A66/A67, décisions de l'utilisateur) : `_response_fingerprint(cmd, nick)` — même fonction à la lecture
+et à l'écriture — = `_cache_fingerprint` (mtimes des bases) + `_external_fingerprint(cmd, nick)` : pour les commandes de
+`_CACHE_TTL={'report':300,'diffbkp':300}` (en cache ET lisant un état extérieur : Report -o `repoLocalAbsent`/heure/`dfRepo`,
+DiffBkp `repoLocalAbsent`/`borg list`), `|repos:<nick>:ok|absent|?` par nick de `_nick_list`. `_repo_presence` : sonde dans
+un thread, attente 1 s, montage figé -> `ok`, une seule sonde en attente par nick (`_PRESENCE_PROBES`). Entrée =
+`(empreinte, réponse, time.monotonic())`, rangée seulement si l'empreinte est la même avant et après l'exécution (lecteurs :
+mtimes stables, mesuré). Cache par périmètre : `_capture_fingerprints(nick, 'diffbkp')` (présence) et `written_at` comparé à
+`_CACHE_TTL` dans `_scope_cache_get`. `_never_cache(result)` = `_is_db_key_error`, `[ERREUR]` sur stderr ou « SQLite error »
+(stdout/stderr) — seul prédicat des trois écritures (`run_borghelper`, `_scoped_cached_mono`, `_scoped_cached_multi`) ;
+`[ERREUR]` = arrêt d'un nick (`_nick_stop_msg`, `_db_schema_fail`, « Index vide » texte) : sur-approximation voulue, comme
+AD-13. Restent muets (code 0, aucun marqueur) : `get_cache_rows` (CacheInfo) et les mesures de Report -o sur erreur SQLite.
+
+`POST /restore` (A68) : `_restore_where(where)` en tête de la route (après `require_api_key`, avant le périmètre et tout
+sous-processus) — `RESTORE_ROOT` (realpath au démarrage) absent ou pas un dossier -> 403 ; `realpath(join(racine, where))`
+hors racine (`commonpath`) -> 403 ; vide/NUL -> 400 ; dossier existant non vide -> 409 (aucun lien préexistant sous la
+destination) ; rend le chemin résolu passé à `-w`/`-W`. `RESTORE_ROOT == '/'` -> `sys.exit` au chargement du module.
 
 La clé de `_RESPONSE_CACHE` inclut désormais un condensé de la passphrase de la requête quand `cacheable=True` et
 qu'une passphrase est fournie (`x_borg_passphrase`, ex. route `report -o`) : `_passphrase_digest(passphrase)` =
@@ -2241,7 +2258,12 @@ parent existant sans écriture) -> code 3. `-w` : `_makedirs_tracked` juste avan
 s'ils restent vides après un extract en échec (`_rmdirs_if_empty`) ; `-W` : création après un extract réussi (inchangé),
 dans un `try` (code 3). **Message d'échec
 (A64)** : `_rb_errmsg(rb, cmd, n=2, cut=100)` seule règle (tous ses appelants : `_boex_check_stdout`, Mount, Key, DelBkp,
-Prune…) (lignes ERROR JSON, texte hors bandeau `Platform`/`Borg:`) ;
+Prune…) (lignes ERROR JSON, texte hors bandeau `Platform`/`Borg:`) ; 1.0.174 (story 37, A69) : `_borg_err_lines(lines, st)` —
+machine à états par bloc (`tb` cadres, `exc` ligne d'exception + suite indentée, `chain` « During handling… »/« The above
+exception… », `ign` bloc « Exception ignored … » avec ou sans trace, écarté) ; ligne d'exception omise si elle se termine par
+le message précédent (erreur borg `traceback=True`) ; bandeau `_BORG_SYSINFO` écarté seulement après une trace
+(`st['crash']`, partagé entre texte et JSON par `_rb_errmsg`), `_BORG_ALWAYS` (`Platform`, `Borg:`) partout comme avant ;
+message `--log-json` multi-lignes : même traitement, 1er message gardé, jamais coupé (Bkp seul passe `--log-json`) ;
 `_boex_last_modified` : `n=3, cut=None` (texte inchangé).
 **Ensure sans création (1.0.172, story 35, A61)** : `_open_db(…, create_file=None)` — `None` : le rôle décide (`read` jamais,
 `write`/`admin` `O_CREAT` 0600) ; `False` : `write`/`admin` en `mode=rw`, fichier absent -> `sqlite3.OperationalError`.

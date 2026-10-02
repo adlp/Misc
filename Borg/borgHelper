@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.173"
+Version="1.0.174"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -603,17 +603,57 @@ def _rmdirs_if_empty(made):
         try: os.rmdir(d)
         except OSError: break
 
+_BORG_ALWAYS=('Platform','Borg:')   # écartés de toute ligne (1.0.173, inchangé)
+_BORG_SYSINFO=('Platform','Linux:','Borg:','PID:','sys.argv:','SSH_ORIGINAL_COMMAND:','Borg server:')   # sysinfo() de borg 1.2 : après une trace
+_TB_CHAIN=('During handling of the above exception','The above exception was the direct cause')
+
+def _borg_err_lines(lines,st=None):
+    """Lignes d'erreur de borg -> messages (strip). 1.0.174 (story 37, A69) : chaque trace Python (« Traceback (most recent
+    call last): », cadres indentés, chaîne « During handling… »/« The above exception… ») remplacée par sa ligne d'exception
+    (la dernière de la chaîne ; suite indentée du message ignorée ; omise si elle répète le message qui précède — erreur borg
+    « avec trace » : CheckNeeded…) ; bloc « Exception ignored … » de Python (écrit AVANT « Local Exception » par borg 1.2.6,
+    mesuré, texte même sous --log-json ; avec ou sans trace) écarté ; bandeau sysinfo complet écarté après une trace
+    (`st['crash']`, partagé par _rb_errmsg entre texte et JSON), `Platform`/`Borg:` partout. Avant : « Local Exception;
+    Traceback (most recent call last): »."""
+    st={} if st is None else st
+    out=[]; blk={'exc':None,'stage':None,'drop':False}
+    def close():
+        e=blk['exc']
+        if e and not blk['drop'] and not (out and e.endswith(out[-1])): out.append(e)
+        blk.update(exc=None,stage=None,drop=False)
+    for l in lines:
+        if not l.strip() or l.startswith(_BORG_SYSINFO if st.get('crash') else _BORG_ALWAYS): continue
+        ind=l[0] in ' \t'; stage=blk['stage']
+        if l.startswith('Traceback (most recent call last):'):
+            if stage not in ('ign','chain'): close()
+            st['crash']=True; blk['stage']='tb'; continue
+        if l.startswith('Exception ignored '): close(); blk.update(drop=True,stage='ign'); continue
+        if stage in ('tb','ign'):
+            if ind: continue                                  # cadres File/code de la trace
+            blk.update(exc=l.strip(),stage='exc'); continue   # ligne d'exception (ign : exception sans trace)
+        if stage=='exc':
+            if ind: continue                                  # suite indentée du message de l'exception
+            if l.startswith(_TB_CHAIN): blk['stage']='chain'; continue
+        if stage=='chain' and l.startswith(_TB_CHAIN): continue
+        if stage is not None: close()
+        out.append(l.strip())
+    close()
+    return out
+
 def _rb_errmsg(rb,cmd='borg',n=2,cut=100):
-    """Message d'échec lisible d'un résultat boex : lignes ERROR (JSON, 1re ligne) ou texte de borg, `n` au plus, chacune
-    coupée à `cut` caractères (None : entière) ; lignes de bandeau de borg (« Platform: », « Borg: » d'un rapport de plantage)
-    écartées ; sinon le code. 1.0.173 (story 36, A64) : règle UNIQUE — _boex_check_stdout (2, 100) et _boex_last_modified
-    (3, entière) ; avant, _boex_last_modified en gardait une copie et _boex_check_stdout ne retirait pas « Borg: »."""
-    msgs=[]
+    """Message d'échec lisible d'un résultat boex : lignes ERROR (JSON, 1er message, jamais coupé) ou texte de borg, `n` au
+    plus, celles du texte coupées à `cut` caractères (None : entière) ; trace Python réduite à son exception et bandeau
+    sysinfo écarté (_borg_err_lines) ; sinon le code. 1.0.173 (story 36, A64) : règle UNIQUE — _boex_check_stdout (2, 100)
+    et _boex_last_modified (3, entière) ; avant, _boex_last_modified en gardait une copie et _boex_check_stdout ne retirait
+    pas « Borg: »."""
+    msgs=[]; txt=[]; st={}
     for i in rb.get('stderr',[]):
         if isinstance(i,dict) and i.get('levelname')=='ERROR':
-            msgs.append(i.get('message','').split('\n')[0])
-        elif isinstance(i,str) and i.strip() and not i.startswith(('Platform','Borg:')):
-            msgs.append(i.strip()[:cut])
+            msgs.extend(m[:cut] for m in _borg_err_lines(txt,st)); txt=[]   # ordre gardé : texte d'abord
+            m=_borg_err_lines(i.get('message','').split('\n'),st)   # --log-json : trace et bandeau = un message multi-lignes
+            if m: msgs.append(m[0])
+        elif isinstance(i,str): txt.append(i)
+    msgs.extend(m[:cut] for m in _borg_err_lines(txt,st))
     return '; '.join(msgs[:n]) or f"{cmd} failed (code {rb['exitcode']})"
 
 def _print_boex_stderr(rb):
@@ -13325,39 +13365,68 @@ fail()
         check("destination de Restore : -w absent créé (± -b), refus avant borg (fichier, lien, sans droits, -W aussi), échec -> rien laissé",_restore_dest)
         # 1.0.173 (story 36, A64) : une seule règle de message d'échec (_rb_errmsg)
         def _errmsg_rule():
-            """_boex_last_modified (Report, CacheClean) : MÊME texte qu'avant 1.0.173 (copie de l'ancienne règle ci-dessous) sur des
-            sorties de borg réalistes ; _boex_check_stdout : 2 lignes, coupées à 100, bandeau « Borg: » retiré (nouveau)."""
-            def old_lm(rb):   # règle de _boex_last_modified jusqu'à 1.0.172
+            """_boex_last_modified (3, entière) et _boex_check_stdout (2, 100) : HORS plantage, MÊME texte que la règle de 1.0.173
+            (copie ci-dessous) sur des sorties réalistes, y compris les formes que la règle de 1.0.174 traite (lignes indentées, tabulation,
+            préfixes du bandeau sans trace, JSON long, ordre texte/JSON, ancien « Remote Exception ») ; plantages (1.0.174, A69) :
+            attentes en dur, stderr RÉEL de borg 1.2.6 et formes lues dans archiver.py/errors.py."""
+            def old_rule(rb,cmd,n,cut):   # _rb_errmsg de 1.0.173
                 msgs=[]
                 for i in rb['stderr']:
                     if isinstance(i,dict) and i.get('levelname')=='ERROR': msgs.append(i.get('message','').split('\n')[0])
-                    elif isinstance(i,str) and i.strip() and not i.startswith('Platform') and not i.startswith('Borg:'): msgs.append(i.strip())
-                return '; '.join(msgs[:3]) or f"borg info failed (code {rb['exitcode']})"
+                    elif isinstance(i,str) and i.strip() and not i.startswith(('Platform','Borg:')): msgs.append(i.strip()[:cut])
+                return '; '.join(msgs[:n]) or f"{cmd} failed (code {rb['exitcode']})"
             long='x'*150
-            cases=[{'exitcode':2,'stdout':[],'stderr':[{'levelname':'ERROR','message':'passphrase incorrect.\nsuite'}]},
-                   {'exitcode':2,'stdout':[],'stderr':['Platform: Linux','Borg: 1.2.6  Python: CPython','Repository x does not exist.',long,'troisième','quatrième']},
-                   {'exitcode':2,'stdout':[],'stderr':[]},
-                   {'exitcode':0,'stdout':[],'stderr':['  ',{'levelname':'WARNING','message':'w'}]},
-                   # forme réelle d'un plantage de borg 1.2 (archiver.py) : message, trace, puis bandeau sysinfo
-                   {'exitcode':2,'stdout':[],'stderr':['Local Exception','Traceback (most recent call last):','  File "x", line 1',
-                                                       'Platform: Linux h 6.8','Borg: 1.2.6  Python: CPython 3.10','PID: 1']}]
-            d,b=_nb_env('errmsg'); res=[]
-            for rb in cases:
+            plain=[[{'levelname':'ERROR','message':'passphrase incorrect.\nsuite'}],
+                   ['Platform: Linux','Borg: 1.2.6  Python: CPython','Repository x does not exist.',long,'troisième','quatrième'],
+                   [],['  ',{'levelname':'WARNING','message':'w'}],
+                   ['Error: x','  détail indenté','\tdétail tabulé'],
+                   ['PID: 1234 holds the lock','Linux: welcome to host','Borg server: Repository path not allowed'],
+                   [{'levelname':'ERROR','message':'y'*150}],
+                   ['ssh: connect to host h port 22: Connection refused',{'levelname':'ERROR','message':'Connection closed by remote host'}],
+                   ['Repository path not allowed','Remote Exception (see remote log for the traceback)']]
+            d,b=_nb_env('errmsg'); bad=[]
+            def lm(rb):
                 with mock.patch.object(b.borg,'boex',lambda *a,_rb=rb,**k: _rb):
-                    try: b.borg._boex_last_modified('zb'); got=None
-                    except RuntimeError as e: got=str(e)
-                res.append(got==old_lm(rb))
-            want=['passphrase incorrect.',f"Repository x does not exist.; {'x'*100}",'borg list failed (code 2)','borg list failed (code 0)',
-                  'Local Exception; Traceback (most recent call last):']
-            got=[]
-            for rb in cases:
-                try: b.borg._boex_check_stdout(rb,'zb','borg list'); got.append(None)
-                except RuntimeError as e: got.append(str(e))
-            res.append(got==want)
-            ok=all(res)
-            if not ok: print(f"  {res} {got!r}")
-            return ok
-        check("message d'échec borg : règle unique, _boex_last_modified inchangé, bandeau Borg: retiré",_errmsg_rule)
+                    try: b.borg._boex_last_modified('zb'); return None
+                    except RuntimeError as e: return str(e)
+            def cs(rb):
+                try: b.borg._boex_check_stdout(rb,'zb','borg list'); return None
+                except RuntimeError as e: return str(e)
+            for k,st in enumerate(plain):
+                rb={'exitcode':2 if k!=3 else 0,'stdout':[],'stderr':st}
+                if (cs(rb),lm(rb))!=(old_rule(rb,'borg list',2,100),old_rule(rb,'borg info',3,None)): bad.append(('hors plantage',k,cs(rb),lm(rb)))
+            # plantages : stderr RÉEL de borg 1.2.6 (`borg list` d'un dépôt dont la config porte max_segment_size = x, mesuré ;
+            # bandeau abrégé) : bloc « Exception ignored » d'abord, texte même sous --log-json
+            ign=['Exception ignored in: <function Repository.__del__ at 0x7fb13b8fdf70>','Traceback (most recent call last):',
+                 '  File "borg/repository.py", line 190, in __del__','AssertionError: cleanup happened in Repository.__del__']
+            tb=['Traceback (most recent call last):','  File "borg/archiver.py", line 5324, in main',
+                '  File "borg/helpers/parseformat.py", line 268, in parse_file_size',"ValueError: could not convert string to float: 'x'"]
+            sysinfo=['Platform: Linux h 6.8.0 x86_64','Linux: Unknown Linux  ','Borg: 1.2.6  Python: CPython 3.9.18 msgpack: 1.0.5',
+                     'PID: 2683967  CWD: /tmp','sys.argv: [\'/usr/local/bin/borg.wrapped\', \'list\', \'/r\']','SSH_ORIGINAL_COMMAND: None']
+            val="ValueError: could not convert string to float: 'x'"; L=f"Local Exception; {val}"
+            chk='Inconsistency detected. Please run "borg check ssh://u@h/./b".'
+            pe="configparser.ParsingError: Source contains parsing errors: '/r/config'"
+            crash={   # nom -> (stderr, attendu _boex_check_stdout (2, 100), attendu _boex_last_modified (3, entier))
+             'local texte':(ign+['Local Exception']+tb+sysinfo,L,L),
+             'local --log-json':(ign+[{'levelname':'ERROR','message':'Local Exception'},
+                                      {'levelname':'ERROR','message':'\n'.join(tb+['']+sysinfo+[''])}],L,L),
+             'chaînée (During handling)':(['Local Exception']+tb[:3]+['KeyError: 1','During handling of the above exception, another exception occurred:']+tb+sysinfo,L,L),
+             'chaînée (direct cause)':(['Local Exception']+tb[:3]+['KeyError: 1','The above exception was the direct cause of the following exception:']+tb+sysinfo,L,L),
+             'ignoré sans trace':(["Exception ignored in: <_io.TextIOWrapper name='<stdout>'>",'BrokenPipeError: [Errno 32] Broken pipe','Local Exception']+tb+sysinfo,L,L),
+             'ignoré chaîné':(ign[:3]+['KeyError: 2','During handling of the above exception, another exception occurred:']+ign[1:]+['Local Exception']+tb+sysinfo,L,L),
+             'suite indentée, sans bandeau':(['Local Exception']+tb[:2]+[pe,"\t[line  3]: 'x'",'terminating with error status, rc 2'],
+                                            f"Local Exception; {pe}",f"Local Exception; {pe}; terminating with error status, rc 2"),
+             'erreur borg avec trace':([chk]+tb[:2]+['borg.repository.Repository.CheckNeeded: '+chk]+sysinfo,chk,chk),
+             # RPCError important (archiver.py) : msg = exception_full (trace du serveur), puis bandeau « Borg server: »
+             'distante':(tb+['Borg server: Platform: Linux s','Borg server: Borg: 1.2.6  Python: CPython 3.10']+sysinfo,val,val),
+             'distante --log-json':([{'levelname':'ERROR','message':'\n'.join(tb)},
+                                     {'levelname':'ERROR','message':'Borg server: Platform: Linux s\nBorg server: PID: 9\nPlatform: Linux h'}],val,val)}
+            for k,(st,w2,w3) in crash.items():
+                rb={'exitcode':2,'stdout':[],'stderr':st}
+                if (cs(rb),lm(rb))!=(w2,w3): bad.append((k,cs(rb),lm(rb)))
+            if bad: print(f"  {bad!r}")
+            return not bad
+        check("message d'échec borg : règle unique, inchangé hors plantage (règle 1.0.173), plantage réduit à son exception",_errmsg_rule)
         # 1.0.172 (story 35, A61) : ensure_*(create=False) — fichier supprimé entre la sonde et l'ouverture : jamais recréé
         def _race_ensure():
             """diff.db, cache.db (sonde _db_has_schema) et history.db (sonde _db_probe) : base présente à la sonde, supprimée avant

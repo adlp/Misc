@@ -1,5 +1,46 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.174 / borgHelperWWW 1.29.0 / UI 1.21.0 — cache attentif à l'état extérieur, /restore sous une racine, cause des plantages de borg — 2026-10-02
+
+Chantier « reconstruction progressive », story 37 (actions de rétrospective A66, A67, A68, A69 ; regroupement demandé par
+l'utilisateur).
+
+- **borgHelperWWW : `POST /restore` écrit sous une racine de restauration seulement** (décisions de l'utilisateur).
+  Nouveau réglage **`--restore-root` / `BORGHELPERWWW_RESTORE_ROOT` / `restore_root`** (conf ou `[_borgHelperWWW]`).
+  Avant : `where` passé tel quel à Restore — chemin relatif au répertoire du service, `..`, liens, dossiers créés n'importe
+  où avec les droits du service (root possible), seule la permission « restore » du nick le limitait. Désormais : sans
+  racine (ou racine introuvable) -> `403`, action « Restaurer » masquée dans l'UI ; `where` est **relatif à la racine**
+  (un chemin absolu à l'intérieur reste accepté), résolu (liens et `..` suivis) et doit y rester, sinon `403` ; vide ->
+  `400` ; **destination déjà remplie -> `409`** (revue, décision de l'utilisateur : un lien laissé dessous par une
+  restauration précédente ferait écrire borg hors de la racine — restaurer dans un dossier absent ou vide) — refus avant
+  tout lancement de borgHelper ; Restore reçoit le chemin résolu. Racine `/` : démarrage refusé. **⚠ Rupture** : une
+  instance qui restaurait via l'API doit configurer la racine. `/version` : `restore_enabled` (faux si la racine est
+  introuvable) ; `/access` : `restore_root` (appelant qui peut restaurer sur au moins un nick). `/download/*` et
+  `GET /restore/perms` : inchangés.
+- **borgHelperWWW : Report hors ligne et DiffBkp en cache suivent l'état extérieur** (décisions de l'utilisateur) :
+  l'empreinte ajoute la présence de chaque dépôt local — disque démonté -> recalcul, « ⚠ dépôt absent » plus jamais masqué
+  (remonté : la réponse d'avant, même état, resservie) ; durée de vie de 5 min (Report : « depuis », alerte de sauvegarde
+  trop ancienne, place libre ; DiffBkp : `borg list` en direct, dernière paire d'archives d'un dépôt externe). DiffBkp dans
+  le cache par périmètre aussi. Les 12 autres routes en cache ne lisent que les bases (inchangées). Présence sondée en
+  1 s au plus (montage réseau figé : présumé présent, jamais un thread de requête bloqué) ; réponse calculée pendant un
+  changement d'état : pas mise en cache.
+- **borgHelperWWW : l'arrêt d'un nick n'est plus mis en cache** : un lecteur multi-nicks (Search, IdxTop…) sort en code 0
+  quand un seul nick s'arrête (« DB occupée », base corrompue ou illisible, schéma) — la réponse restait servie après la
+  fin d'une erreur passagère. Toute réponse dont le stderr porte `[ERREUR]`, ou qui porte « SQLite error » (erreur SQLite
+  avalée en code 0 par Search, FileHist, TreeHist, TreeFind, IdxTop, DiffTop), est recalculée à chaque appel, dans les
+  deux caches (comme une DbKeyError) ; « Index vide » en texte l'est aussi (en `-j`, état stable, toujours en cache).
+- **Message d'un plantage de borg** (`Local Exception`, exception distante) : la cause figure (« Local Exception;
+  ValueError: could not convert string to float: 'x' ») — avant, sur borg 1.2.6 (mesuré) « Exception ignored in:
+  <function Repository.__del__ …>; Traceback (most recent call last): », ailleurs « Local Exception; Traceback … ».
+  Trace Python réduite à sa ligne d'exception (dernière d'une chaîne ; omise si elle répète le message d'une erreur borg
+  « avec trace », CheckNeeded…), bandeau sysinfo écarté après une trace, bloc « Exception ignored … » écarté — Key, DelBkp,
+  Mount, Prune, Report en ligne, et le `borg list` de DiffBkp, Restore sans `-b`, Mount et Index. Erreurs
+  ordinaires de borg : inchangées. Restent bruts (sortie de borg complète) : Restore, ListPerms, Bkp, repli
+  `borg list --format` d'Index.
+- UI : « Restaurer » masqué sans racine, libellé « Destination (sous-dossier de <racine>) ».
+- CodecSelfTest : « message d'échec borg » (sorties réelles) ; push_selftest : « cache des réponses » (état extérieur,
+  arrêt d'un nick), « POST /restore sous la racine » ; test UI : « restauration ».
+
 ## borgHelper 1.0.173 / borgHelperWWW 1.28.8 — cache sans erreurs, Restore vers dossier absent, message d'échec unique — 2026-10-02
 
 Chantier « reconstruction progressive », story 36 (actions de rétrospective A62, A63, A64, A65 ; regroupement demandé par

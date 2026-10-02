@@ -51,6 +51,11 @@ cfgfile = /etc/borghelperrc-www
 ; BORGHELPERWWW_ALLOW_DOWNLOADS / --allow-downloads / --no-downloads. AUTORISÉ par défaut (true).
 ;allow_downloads = true
 
+; Racine de restauration de POST /restore (≥ 1.29.0) — BORGHELPERWWW_RESTORE_ROOT / --restore-root. La destination
+; (where) en est un sous-dossier (relatif, ou absolu à l'intérieur ; liens résolus, rien hors racine). ABSENTE par
+; défaut : POST /restore refusé (403), « Restaurer » masqué dans l'UI.
+;restore_root = /srv/restaurations
+
 ; Préfixe des routes API (toutes sauf /, /version, /healthz, /docs, /openapi.json — toujours
 ; accessibles sans préfixe) — BORGHELPERWWW_API_PREFIX / --api-prefix. Défaut '/api'. Vide ou '/'
 ; pour aucun préfixe (routes à la racine, comme avant l'introduction de ce réglage).

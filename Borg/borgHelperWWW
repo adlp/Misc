@@ -6,7 +6,7 @@
 #* See <http://www.gnu.org/licenses/>
 #*/
 
-import os,re,sys,io,json,sqlite3,secrets,subprocess,configparser,tarfile,hmac,hashlib,asyncio,contextlib,datetime,urllib.parse,time,ipaddress
+import os,re,sys,io,json,sqlite3,secrets,subprocess,configparser,tarfile,hmac,hashlib,asyncio,contextlib,datetime,urllib.parse,time,ipaddress,threading
 from pathlib import Path
 from typing import Optional, Dict
 from collections import defaultdict
@@ -66,7 +66,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.28.8"
+WWW_VERSION="1.29.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -107,6 +107,9 @@ if __name__=='__main__':
                      "restauration) — AUTORISÉ par défaut (déf. BORGHELPERWWW_ALLOW_DOWNLOADS)")
     _p.add_argument('--no-downloads',dest='allow_downloads',action='store_false',
                      help="Interdit /download/file et /download/tar")
+    _p.add_argument('--restore-root',help="Racine de restauration de POST /restore : la destination (where) en est un "
+                     "sous-dossier (chemin relatif, ou absolu à l'intérieur), liens résolus — absente : POST /restore "
+                     "refusé (403) (déf. BORGHELPERWWW_RESTORE_ROOT)")
     _p.add_argument('--api-prefix',help="Préfixe des routes API (déf. BORGHELPERWWW_API_PREFIX, sinon "
                      "/api — vide ou '/' pour aucun préfixe ; '/', '/version', '/healthz' et '/docs' "
                      "restent toujours accessibles sans préfixe)")
@@ -156,6 +159,7 @@ if __name__=='__main__':
     _SELFTEST_REQUESTED=_args.selftest
     if _args.allow_destructive is not None: os.environ['BORGHELPERWWW_ALLOW_DESTRUCTIVE']=str(_args.allow_destructive)
     if _args.allow_downloads is not None: os.environ['BORGHELPERWWW_ALLOW_DOWNLOADS']=str(_args.allow_downloads)
+    if _args.restore_root: os.environ['BORGHELPERWWW_RESTORE_ROOT']=_args.restore_root
     if _args.api_prefix is not None: os.environ['BORGHELPERWWW_API_PREFIX']=_args.api_prefix
 
 # ── Fichier de conf borgHelperWWW (BORGHELPERWWW_CONF, optionnel) ──────────────────────────
@@ -168,6 +172,7 @@ _CONF_KEYS={'cfgfile':'BORGHELPERWWW_CFGFILE','api_key':'BORGHELPERWWW_API_KEY',
             'timeout':'BORGHELPERWWW_TIMEOUT','host':'BORGHELPERWWW_HOST','port':'BORGHELPERWWW_PORT',
             'trusted_proxies':'BORGHELPERWWW_TRUSTED_PROXIES',
             'allow_destructive':'BORGHELPERWWW_ALLOW_DESTRUCTIVE','allow_downloads':'BORGHELPERWWW_ALLOW_DOWNLOADS',
+            'restore_root':'BORGHELPERWWW_RESTORE_ROOT',
             'api_prefix':'BORGHELPERWWW_API_PREFIX','groups_header':'BORGHELPERWWW_GROUPS_HEADER',
             'scope_cache_db':'BORGHELPERWWW_SCOPE_CACHE_DB','push_db':'BORGHELPERWWW_PUSH_DB',
             'push_prefs':'BORGHELPERWWW_PUSH_PREFS',
@@ -224,6 +229,13 @@ TIMEOUT=int(os.environ.get('BORGHELPERWWW_TIMEOUT','3600')) or None
 # explicitement autorisée. Les téléchargements (vue d'une restauration), eux, sont autorisés par défaut.
 ALLOW_DESTRUCTIVE=_env_bool('BORGHELPERWWW_ALLOW_DESTRUCTIVE',False)
 ALLOW_DOWNLOADS=_env_bool('BORGHELPERWWW_ALLOW_DOWNLOADS',True)
+# 1.29.0 (story 37, A68, décisions de l'utilisateur) : POST /restore écrit SOUS cette racine seulement (_restore_where) ;
+# absente -> restauration sur le serveur refusée. Résolue une fois (realpath) au démarrage.
+RESTORE_ROOT=os.path.realpath(os.environ['BORGHELPERWWW_RESTORE_ROOT'].strip()) \
+    if os.environ.get('BORGHELPERWWW_RESTORE_ROOT','').strip() else None   # relative : au répertoire de lancement
+if RESTORE_ROOT==os.path.sep:   # revue story 37 (décision de l'utilisateur) : « / » annulerait toute la protection
+    sys.exit("BORGHELPERWWW_RESTORE_ROOT (--restore-root, restore_root) = / refusé : tout chemin serait sous la racine — "
+             "choisir un dossier dédié aux restaurations")
 # Préfixe des routes API — '/', '/version', '/healthz' et les routes FastAPI natives (/docs,
 # /openapi.json) restent toujours accessibles sans préfixe (voir router plus bas).
 API_PREFIX=os.environ.get('BORGHELPERWWW_API_PREFIX','/api').rstrip('/')
@@ -410,7 +422,9 @@ if not API_KEY:
 if not BORGHELPER_BIN.is_file():
     sys.exit(f"borgHelper introuvable ({BORGHELPER_BIN}) — --borghelper-bin ou BORGHELPERWWW_BORGHELPER_BIN pour surcharger")
 print(f"Actions destructrices (Prune/DelBkp) : {'AUTORISÉES' if ALLOW_DESTRUCTIVE else 'interdites (défaut)'}"
-      f" — Téléchargements (restauration) : {'autorisés (défaut)' if ALLOW_DOWNLOADS else 'INTERDITS'}",file=sys.stderr)
+      f" — Téléchargements (restauration) : {'autorisés (défaut)' if ALLOW_DOWNLOADS else 'INTERDITS'}"
+      f" — Restauration sur le serveur : {('sous '+RESTORE_ROOT) if RESTORE_ROOT else 'désactivée (aucune --restore-root)'}",
+      file=sys.stderr)
 
 # ── Watcher bkp_status (Story 1, étendu Story 2b : spec-notifications-push) ────
 # Premier composant de fond de borgHelperWWW : tâche asyncio démarrée via le hook de cycle de vie
@@ -760,6 +774,30 @@ def require_destructive_allowed():
     if not ALLOW_DESTRUCTIVE:
         raise HTTPException(403,detail="Actions destructrices (Prune/DelBkp) désactivées sur ce "
             "serveur — démarrer borgHelperWWW avec --allow-destructive/BORGHELPERWWW_ALLOW_DESTRUCTIVE pour les autoriser")
+
+def _restore_where(where: str) -> str:
+    """1.29.0 (story 37, A68, décisions de l'utilisateur) : destination de POST /restore, SOUS RESTORE_ROOT seulement —
+    `where` relatif à la racine (absolu accepté s'il y est), résolu par realpath (liens et `..` suivis) ; racine non
+    configurée ou introuvable, ou chemin résolu hors racine -> 403 ; vide -> 400 ; dossier non vide -> 409 (revue : aucun lien
+    préexistant sous la destination) — avant tout appel à borgHelper. Rend le chemin résolu, seul transmis à Restore. Reste
+    ouvert : un lien posé dans la racine ENTRE ce contrôle et Restore, par quelqu'un qui peut y écrire."""
+    if RESTORE_ROOT is None:
+        raise HTTPException(403,detail="Restauration sur le serveur désactivée (aucune racine de restauration) — démarrer "
+            "borgHelperWWW avec --restore-root/BORGHELPERWWW_RESTORE_ROOT pour l'autoriser")
+    if not os.path.isdir(RESTORE_ROOT):
+        raise HTTPException(403,detail=f"Racine de restauration introuvable : {RESTORE_ROOT}")
+    if not where.strip() or '\x00' in where:
+        raise HTTPException(400,detail="Destination de restauration vide ou invalide")
+    p=os.path.realpath(os.path.join(RESTORE_ROOT,where))
+    if os.path.commonpath([p,RESTORE_ROOT])!=RESTORE_ROOT:
+        raise HTTPException(403,detail=f"Destination hors de la racine de restauration ({RESTORE_ROOT}) : {where}")
+    # Revue story 37 (décision de l'utilisateur) : un lien laissé sous la destination (restauration précédente) ferait écrire
+    # borg/copy2 hors de la racine — destination absente ou vide seulement, jamais d'arborescence préexistante dessous.
+    try: busy=os.path.isdir(p) and any(True for _ in os.scandir(p))
+    except OSError as e: raise HTTPException(403,detail=f"Destination illisible : {where} ({e.strerror or e})")
+    if busy:
+        raise HTTPException(409,detail=f"Destination déjà remplie : {where} — restaurer dans un dossier absent ou vide")
+    return p
 
 def require_downloads_allowed():
     if not ALLOW_DOWNLOADS:
@@ -1180,6 +1218,16 @@ def _is_db_key_error(result: CommandResult) -> bool:
     text=f"{result.stdout or ''}\n{result.stderr or ''}"
     return any(m in text for m in _DB_KEY_ERROR_MARKERS)
 
+def _never_cache(result: CommandResult) -> bool:
+    """Réponse jamais mise en cache — MÊME prédicat aux trois écritures (_RESPONSE_CACHE, _scoped_cached_mono/_multi) :
+    DbKeyError (AD-13) ou, 1.29.0 (story 37, A67), arrêt d'un nick (`[ERREUR]` sur stderr : base occupée, corrompue,
+    illisible, schéma, index vide — inventaire mesuré) ; un lecteur multi-nicks sort en 0 quand un seul nick s'arrête : une
+    erreur passagère (« DB occupée ») restait servie. Sur-approximation voulue : un index vide est relu à chaque appel. Revue :
+    « SQLite error » (Search/FileHist/TreeHist/TreeFind/IdxTop/DiffTop avalent sqlite3.Error en code 0, sans [ERREUR] ;
+    stdout `-j` ou stderr) exclu aussi."""
+    text=f"{result.stdout or ''}\n{result.stderr or ''}"
+    return _is_db_key_error(result) or '[ERREUR]' in (result.stderr or '') or 'SQLite error' in text
+
 def _cache_db_paths(nick: Optional[str]):
     nicks=[n.strip() for n in nick.split(',')] if (nick and nick!='ALL') else \
         [n.strip() for n in _bh_paths.borg.cfgreadnicks().split(',')]
@@ -1197,6 +1245,38 @@ def _cache_fingerprint(nick: Optional[str]) -> str:
         try: parts.append(f"{p}:{os.path.getmtime(p)}")
         except OSError: parts.append(f"{p}:absent")
     return '|'.join(parts)
+
+# 1.29.0 (story 37, A66, décisions de l'utilisateur) : commandes en cache qui lisent un état extérieur aux bases — Report -o
+# (présence du dépôt, heure : « depuis », MAX_AGE_BKP, place libre) et DiffBkp (présence, `borg list` en direct : dernière paire
+# d'archives) ; empreinte + présence de chaque dépôt local, durée de vie 5 min (secondes ; commande absente = sans limite).
+_CACHE_TTL={'report':300,'diffbkp':300}
+_PRESENCE_PROBES={}   # nick -> sonde encore bloquée (montage figé) : jamais deux en attente pour un même nick
+
+def _repo_presence(n: str) -> str:
+    """'ok' | 'absent' | '?' (nick illisible) — repoLocalAbsent dans un thread, attente 1 s : un montage réseau figé
+    (os.open sans délai) ne bloque jamais un thread de requête ; sans réponse -> 'ok' (présent mais muet, comme
+    repoLocalAbsent pour un dépôt inaccessible), une seule sonde en attente par nick (revue story 37)."""
+    t=_PRESENCE_PROBES.get(n)
+    if t is not None and t.is_alive(): return 'ok'
+    res={}
+    def probe():
+        try: res['v']='absent' if _bh_paths.borg.repoLocalAbsent(n) else 'ok'
+        except (Exception,SystemExit): res['v']='?'
+    t=threading.Thread(target=probe,daemon=True,name=f"presence-{n}"); t.start(); t.join(1.0)
+    if t.is_alive(): _PRESENCE_PROBES[n]=t; return 'ok'
+    _PRESENCE_PROBES.pop(n,None)
+    return res.get('v','?')
+
+def _external_fingerprint(cmd: str, nick: Optional[str]) -> str:
+    """Part « état extérieur » d'une empreinte (les deux caches) : présence de chaque dépôt local des commandes de _CACHE_TTL."""
+    if cmd not in _CACHE_TTL: return ''
+    return '|repos:'+','.join(f"{n}:{_repo_presence(n)}" for n in _nick_list(nick))
+
+def _response_fingerprint(cmd: str, nick: Optional[str]) -> str:
+    """Empreinte d'une entrée de _RESPONSE_CACHE — MÊME fonction à la lecture et à l'écriture : mtimes des bases
+    (_cache_fingerprint) + état extérieur (_external_fingerprint) ; disque démonté -> recalcul, « ⚠ dépôt absent » jamais
+    masqué (remonté : l'entrée d'avant le démontage, même état, resservie)."""
+    return _cache_fingerprint(nick)+_external_fingerprint(cmd,nick)
 
 # ── Cache SQLite par périmètre (Story 1.5) ──────────────────────────────────
 # Depuis Stories 1.3/1.4, tout appelant scopé (au moins un nick à périmètre restreint) rate
@@ -1776,12 +1856,15 @@ def _scope_cache_get(nick,cmd,params,scope_signature,fingerprint):
     try:
         conn=_open_db(SCOPE_CACHE_DB,nick=None,role='read')
         try:
-            row=conn.execute("SELECT fingerprint,result_json FROM scope_cache WHERE cache_key=?",(key,)).fetchone()
+            row=conn.execute("SELECT fingerprint,result_json,(julianday('now')-julianday(written_at))*86400 FROM scope_cache "
+                             "WHERE cache_key=?",(key,)).fetchone()
         finally:
             conn.close()
     except sqlite3.Error:
         return None
     if row is None or row[0]!=fingerprint: return None
+    ttl=_CACHE_TTL.get(cmd)   # 1.29.0 (story 37) : DiffBkp, comme _RESPONSE_CACHE
+    if ttl is not None and (row[2] is None or row[2]>=ttl): return None
     payload=row[1]
     if codec is not None:
         try: payload=codec.blob.decrypt(payload)
@@ -1822,7 +1905,7 @@ def _scope_cache_put(nick,cmd,params,scope_signature,fingerprint,result_dict):
     except sqlite3.Error:
         pass
 
-def _capture_fingerprints(nick):
+def _capture_fingerprints(nick,cmd=None):
     """AD-5, garde-fou TOCTOU : DOIT être appelée en tout premier, juste après `require_api_key`,
     strictement avant que `_resolve_scopes_for_request()`/`_resolve_single_scope()` ne résolvent
     GROUPS_PATHS pour la requête courante — jamais après (capturer après ouvrirait la fenêtre
@@ -1840,7 +1923,7 @@ def _capture_fingerprints(nick):
     if not GROUPS_HEADER: return {}
     try: cfg_mtime=os.path.getmtime(CFGFILE)
     except OSError: cfg_mtime='absent'
-    return {n:f"{_cache_fingerprint(n)}|cfgfile:{cfg_mtime}" for n in _nick_list(nick)}
+    return {n:f"{_cache_fingerprint(n)}{_external_fingerprint(cmd,n)}|cfgfile:{cfg_mtime}" for n in _nick_list(nick)}   # cmd : 1.29.0
 
 def _build_borghelper_argv_env(cmd: str, nick: Optional[str], extra_args, passphrase: Optional[str]=None):
     """argv/env communs à tout lancement de borgHelper en sous-processus — factorisé pour être
@@ -1890,18 +1973,24 @@ def run_borghelper(cmd: str, nick: Optional[str]=None, extra_args=(), passphrase
     pw_digest=_passphrase_digest(passphrase) if cacheable else None
     key=((cmd,nick,tuple(extra_args),pw_digest) if pw_digest is not None else (cmd,nick,tuple(extra_args))) \
         if cacheable else None
+    fp=None
     if key is not None:
-        cached=_RESPONSE_CACHE.get(key)
-        if cached is not None and cached[0]==_cache_fingerprint(nick):
+        fp=_response_fingerprint(cmd,nick)   # avant l'exécution : un changement pendant celle-ci -> pas de mise en cache
+        cached=_RESPONSE_CACHE.get(key); ttl=_CACHE_TTL.get(cmd)
+        if (cached is not None and cached[0]==fp
+                and (ttl is None or time.monotonic()-cached[2]<ttl)):
             result_dict=cached[1]
             return JSONResponse(status_code=_http_status(result_dict['exitcode']),content=result_dict)
     result=_exec_borghelper(cmd,nick,extra_args,passphrase)
     # 1.28.8 (story 36, A62, décisions de l'utilisateur) : codes 0 et 1 seulement — 1 = alerte ou erreur tirée des bases (Report
     # -o : « diff.db absent », MAX_AGE_BKP ; lecteur : « Aucune archive indexée »), couverte par l'empreinte ; code >= 2 = état
     # extérieur aux bases (« ⚠ dépôt absent », borg, ssh, dépôt externe) : jamais resservi après remontage.
-    if key is not None and result.exitcode in (0,1) and not _is_db_key_error(result):
+    # 1.29.0 (story 37) : arrêt d'un nick ([ERREUR]) exclu aussi (A67) ; entrée datée pour _CACHE_TTL (A66).
+    # Revue : empreinte identique avant et après l'exécution (disque démonté pendant un Report -o : jamais rangé sous « absent »).
+    if (key is not None and result.exitcode in (0,1) and not _never_cache(result)
+            and _response_fingerprint(cmd,nick)==fp):
         if len(_RESPONSE_CACHE)>500: _RESPONSE_CACHE.clear()  # garde-fou anti-croissance illimitée
-        _RESPONSE_CACHE[key]=(_cache_fingerprint(nick),result.dict())
+        _RESPONSE_CACHE[key]=(fp,result.dict(),time.monotonic())
     return JSONResponse(status_code=_http_status(result.exitcode),content=result.dict())
 
 # ── Filtrage a posteriori par périmètre (Story 1.3) ─────────────────────────
@@ -2094,7 +2183,7 @@ def _scoped_cached_mono(cmd,nick,scope,fingerprint,params,run_fn):
     try: result_dict=json.loads(resp.body)
     except ValueError: result_dict=None
     if (isinstance(result_dict,dict) and result_dict.get('exitcode')==0
-            and not _is_db_key_error(CommandResult(**{k:result_dict.get(k) for k in ('exitcode','stdout','stderr')}))):   # AD-13
+            and not _never_cache(CommandResult(**{k:result_dict.get(k) for k in ('exitcode','stdout','stderr')}))):   # AD-13, A67
         _scope_cache_put(nick,cmd,params,sig,fingerprint,result_dict)
     return resp
 
@@ -2138,7 +2227,7 @@ def _scoped_cached_multi(cmd,nick,nicks,scopes,fingerprints,params,run_fn):
     try: result_dict=json.loads(resp.body)
     except ValueError: result_dict=None
     if (isinstance(result_dict,dict) and result_dict.get('exitcode')==0
-            and not _is_db_key_error(CommandResult(**{k:result_dict.get(k) for k in ('exitcode','stdout','stderr')}))):   # AD-13
+            and not _never_cache(CommandResult(**{k:result_dict.get(k) for k in ('exitcode','stdout','stderr')}))):   # AD-13, A67
         try: parsed=json.loads(result_dict['stdout'])
         except ValueError: parsed=None
         if isinstance(parsed,dict):
@@ -2497,6 +2586,7 @@ def favicon():
 def version():
     return {'borghelperwww_version':WWW_VERSION,'borghelper_version':BORGHELPER_VERSION,'ui_version':UI_VERSION,
             'allow_destructive':ALLOW_DESTRUCTIVE,'allow_downloads':ALLOW_DOWNLOADS,'api_prefix':API_PREFIX,
+            'restore_enabled':RESTORE_ROOT is not None and os.path.isdir(RESTORE_ROOT),   # 1.29.0 (A68) : racine seulement sur /access
             'groups_auth_enabled':GROUPS_HEADER is not None,
             # Story 2a (spec-notifications-push) : clé publique VAPID, nécessaire côté client pour
             # PushManager.subscribe({applicationServerKey}) — publique par nature (jamais la privée),
@@ -2573,7 +2663,7 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
         # allow_destructive/allow_downloads (globaux) s'appliquent — 'admin'/scope:null partout
         # reflète cette absence de restriction par groupes pour que l'UI n'ait qu'une seule forme
         # de réponse à traiter, sans cas particulier côté client.
-        return {'groups_auth_enabled':False,'borg_cleanup':_borg_cleanup_summary(),
+        return {'groups_auth_enabled':False,'borg_cleanup':_borg_cleanup_summary(),'restore_root':RESTORE_ROOT,
                 'nicks':{n:{'level':'admin','read_scope':None,'restore_scope':None,'db_plain':_plain(n),**_state(n)} for n in nicks}}
     user_groups=_parse_groups(request.headers.get(GROUPS_HEADER))
     level_names={0:'none',1:'read',2:'write',3:'admin'}
@@ -2592,7 +2682,10 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
         if eff>0: result[n].update(_state(n))
     # 1.28.5 : état de la machine (pas d'un nick) — seulement pour un admin d'au moins un nick
     admin=any(v['level']=='admin' for v in result.values())
-    return {'groups_auth_enabled':True,'borg_cleanup':_borg_cleanup_summary() if admin else None,'nicks':result}
+    # 1.29.0 (A68) : racine de restauration (UI : « sous-dossier de … ») — à qui peut restaurer sur au moins un nick
+    can_restore=any(v['level'] in ('write','admin') and (v.get('ops') is None or 'restore' in v['ops']) for v in result.values())
+    return {'groups_auth_enabled':True,'borg_cleanup':_borg_cleanup_summary() if admin else None,
+            'restore_root':RESTORE_ROOT if can_restore else None,'nicks':result}
 
 @router.get("/stats",response_model=CommandResult,tags=["lecture"])
 def stats(nick: Optional[str]=None, x_api_key: Optional[str]=Header(default=None)):
@@ -2652,7 +2745,7 @@ def diffbkp(nick: str, request: Request, bid_old: Optional[str]=None, bid_new: O
     périmètre restreint sur `nick` ; identique à avant Story 1.3 sinon. Story 1.5 : réponse
     filtrée servie depuis le cache SQLite par périmètre si fraîche."""
     require_api_key(x_api_key)
-    fingerprints=_capture_fingerprints(nick)
+    fingerprints=_capture_fingerprints(nick,'diffbkp')   # 1.29.0 : présence du dépôt (borg list en direct)
     extra=[]
     if bid_old and bid_new: extra=['-b',f"{bid_old},{bid_new}"]
     elif bid_old: extra=['-b',bid_old]
@@ -2678,8 +2771,9 @@ def restore_perms(nick: str, ftor: str, request: Request, bid: Optional[str]=Non
 def restore(nick: str, ftor: str, where: str, request: Request, bid: Optional[str]=None, flat: bool=False,
             x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
+    dest=_restore_where(where)   # 1.29.0 (A68) : sous RESTORE_ROOT seulement, avant tout le reste
     decoy=None if require_path_in_scope(request,nick,ftor) else _oos_decoy(ftor)  # hors périmètre : leurre (1.27.5)
-    extra=['-f',decoy or ftor,'-W' if flat else '-w',where]
+    extra=['-f',decoy or ftor,'-W' if flat else '-w',dest]
     if bid: extra+=['-b',bid]
     resp=run_borghelper('restore',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
     return _oos_swap(resp,decoy,ftor) if decoy else resp
@@ -4002,7 +4096,8 @@ def push_selftest():
                     gone='inexistant-selftest/y.conf'; ggone='inexistant-selftest/*.conf'
                     dest=os.path.join(tmpdir,'oos-dest'); os.makedirs(dest,exist_ok=True)
                     def call(scoped_out,fn):
-                        with mock.patch(f"{__name__}.require_path_in_scope",lambda req,n,p: not scoped_out):
+                        with mock.patch(f"{__name__}.require_path_in_scope",lambda req,n,p: not scoped_out), \
+                             mock.patch(f"{__name__}.RESTORE_ROOT",os.path.realpath(tmpdir)):   # 1.29.0 (A68) : racine exigée
                             return fn()
                     def norm(r,path):
                         j=r.json(); return (r.status_code,j['exitcode'],j['stdout'].replace(path,'<P>'),j['stderr'].replace(path,'<P>'))
@@ -4113,6 +4208,152 @@ def push_selftest():
                     src=open(os.path.realpath(__file__),encoding='utf-8').read()
                     return len(re.findall(r'_RESPONSE_CACHE\[[^\]]+\]\s*=',src))==1
                 check("cache des réponses : une seule écriture de _RESPONSE_CACHE (règle des codes appliquée partout)",_cache_single_writer)
+                def _cache_external_state():
+                    """1.29.0 (story 37, A66, décisions de l'utilisateur) : Report -o et DiffBkp en cache — disque démonté : recalculé
+                    (réponse réelle code 2 « ⚠ dépôt absent », jamais rangée) ; remonté : l'entrée d'avant resservie (même état) ;
+                    > 5 min : recalculé ; empreinte changée PENDANT l'exécution : rien rangé ; autre route (lstbkp) : ni présence ni
+                    durée de vie. Attentes en dur."""
+                    def clear():
+                        for k in [k for k in _RESPONSE_CACHE if k and k[0] in ('report','diffbkp','lstbkp') and k[1]==_internal]: _RESPONSE_CACHE.pop(k,None)
+                    ok_r=CommandResult(exitcode=0,stdout='tableau',stderr='')
+                    gone=CommandResult(exitcode=2,stdout='',stderr=f"{_internal}: ⚠ dépôt absent (/r)")
+                    clock=[1000.0]; absent=[False]; flip=[False]
+                    def ex_fn(*a,**k):
+                        if flip[0]: absent[0]=True   # disque démonté pendant l'exécution (réponse calculée avant)
+                        return gone if absent[0] and not flip[0] else ok_r
+                    seq=[]
+                    with mock.patch(f"{__name__}._exec_borghelper",side_effect=ex_fn) as ex, \
+                         mock.patch.object(time,'monotonic',lambda: clock[0]), \
+                         mock.patch.object(_bh_paths.borg,'repoLocalAbsent',lambda n,*a,**k: absent[0]):
+                        call=lambda cmd: run_borghelper(cmd,nick=_internal,extra_args=['-o'],cacheable=True)
+                        for cmd in ('report','diffbkp','lstbkp'):
+                            clear(); clock[0]=1000.0; absent[0]=False; flip[0]=False; n0=ex.call_count
+                            call(cmd); call(cmd)                      # exécuté, resservi
+                            absent[0]=True; call(cmd); call(cmd)      # démonté : code 2 réel, jamais rangé -> 2 exécutions (route à état)
+                            absent[0]=False; call(cmd)                # remonté : entrée d'avant resservie
+                            clock[0]+=299; call(cmd)                  # 4 min 59 : resservi
+                            clock[0]+=2; call(cmd)                    # 5 min 01 : recalculé (route à état)
+                            clear(); flip[0]=True; call(cmd); flip[0]=False; absent[0]=False; call(cmd)   # changé pendant : pas rangé
+                            seq.append(ex.call_count-n0)
+                    clear()
+                    ok=seq==[6,6,2]   # report/diffbkp : 1er, 2 démonté, > 5 min, 2 (changé pendant) ; lstbkp : 1er + changé pendant
+                    if not ok: print(f"  exécutions report/diffbkp/lstbkp : {seq}")
+                    return ok
+                check("cache des réponses : Report -o et DiffBkp recalculés si un dépôt local disparaît ou après 5 min, autres routes inchangées (A66)",
+                      _cache_external_state)
+                def _scope_cache_ttl():
+                    """1.29.0 (story 37, A66) : cache par périmètre — DiffBkp : ligne de plus de 5 min ignorée, empreinte avec la présence
+                    du dépôt (_capture_fingerprints(…,'diffbkp')) ; LstBkpFls : âge sans effet, empreinte sans présence."""
+                    fp='fp-selftest-ttl'; d={'exitcode':0,'stdout':'{}','stderr':''}
+                    for cmd in ('diffbkp','lstbkpfls'): _scope_cache_put(_internal,cmd,{'t':1},'sig-ttl',fp,d)
+                    fresh=[_scope_cache_get(_internal,c,{'t':1},'sig-ttl',fp) is not None for c in ('diffbkp','lstbkpfls')]
+                    conn=_open_db(SCOPE_CACHE_DB,nick=None,role='write')
+                    try: conn.execute("UPDATE scope_cache SET written_at=datetime('now','-301 seconds')"); conn.commit()
+                    finally: conn.close()
+                    old=[_scope_cache_get(_internal,c,{'t':1},'sig-ttl',fp) is not None for c in ('diffbkp','lstbkpfls')]
+                    with mock.patch(f"{__name__}.GROUPS_HEADER",'X-Groups'), \
+                         mock.patch.object(_bh_paths.borg,'repoLocalAbsent',lambda n,*a,**k: False):
+                        f_d=_capture_fingerprints(_internal,'diffbkp')[_internal]; f_l=_capture_fingerprints(_internal)[_internal]
+                    import inspect   # garde de source : chaque route cachée à état extérieur passe sa commande à l'empreinte
+                    guard=all(f"_capture_fingerprints(nick,'{c}')" in inspect.getsource(globals()[c]) for c in _CACHE_TTL if c!='report')
+                    got=(fresh,old,'|repos:' in f_d,'|repos:' in f_l,guard)
+                    if got!=([True,True],[False,True],True,False,True): print(f"  {got}")
+                    return got==([True,True],[False,True],True,False,True)
+                if _internal is None: print("SKIP cache par périmètre (durée de vie) : aucun nick interne dans ce rc")
+                else: check("cache par périmètre : DiffBkp ignoré après 5 min et empreinte avec présence du dépôt, LstBkpFls inchangé (A66)",_scope_cache_ttl)
+                def _presence_bounded():
+                    """Revue story 37 : sonde de présence bornée — montage figé (repoLocalAbsent bloqué) : réponse « ok » en ~1 s, une
+                    seule sonde en attente par nick (2e appel immédiat, aucun 2e thread) ; débloqué : vraie réponse."""
+                    gate=threading.Event(); calls=[]
+                    def hung(n,*a,**k): calls.append(n); gate.wait(10); return True
+                    with mock.patch.object(_bh_paths.borg,'repoLocalAbsent',hung):
+                        t0=time.time(); a=_repo_presence('selftest-pres'); t1=time.time(); b=_repo_presence('selftest-pres'); t2=time.time()
+                        gate.set(); _PRESENCE_PROBES['selftest-pres'].join(5); c=_repo_presence('selftest-pres')
+                    _PRESENCE_PROBES.pop('selftest-pres',None)
+                    got=(a,b,c,len(calls),0.8<t1-t0<3,t2-t1<0.5)
+                    if got!=('ok','ok','absent',2,True,True): print(f"  {got}")
+                    return got==('ok','ok','absent',2,True,True)
+                check("sonde de présence bornée : montage figé -> « ok » en 1 s, une seule sonde en attente par nick",_presence_bounded)
+                def _cache_nick_error():
+                    """1.29.0 (story 37, A67) : réponse code 0 qui porte l'arrêt d'un nick (`[ERREUR]` sur stderr, forme réelle de
+                    _nick_stop_msg) ou une erreur SQLite avalée (« SQLite error », stdout -j) jamais mise en cache — _RESPONSE_CACHE
+                    (deux appels, deux exécutions) et cache par périmètre (mono et multi : aucune ligne écrite) ; sans marqueur : en cache."""
+                    busy=CommandResult(exitcode=0,stdout=json.dumps({'qa':['a'],'qz':{'error':'DB occupée'}}),
+                                       stderr='[ERREUR] DB occupée : /var/cache/borgHelper/rc-qz-diff.db\n  -> database is locked  [borgHelper v1.0.174]')
+                    sqle=CommandResult(exitcode=0,stdout=json.dumps({'qa':['a'],'qz':{'error':'SQLite error (/c/rc-qz-diff.db): database is locked'}}),stderr='')
+                    clean=CommandResult(exitcode=0,stdout=json.dumps({'qa':['a'],'qz':['b']}),stderr='')
+                    def twice(r):
+                        for k in [k for k in _RESPONSE_CACHE if k and k[0]=='selftest-nickerr']: _RESPONSE_CACHE.pop(k,None)
+                        with mock.patch(f"{__name__}._exec_borghelper",return_value=r) as ex:
+                            run_borghelper('selftest-nickerr',nick=_internal,cacheable=True); run_borghelper('selftest-nickerr',nick=_internal,cacheable=True)
+                        for k in [k for k in _RESPONSE_CACHE if k and k[0]=='selftest-nickerr']: _RESPONSE_CACHE.pop(k,None)
+                        return ex.call_count
+                    puts=[]
+                    def run(r): return lambda: JSONResponse(status_code=200,content=r.dict())
+                    with mock.patch(f"{__name__}._scope_cache_get",return_value=None),\
+                         mock.patch(f"{__name__}._scope_cache_put",side_effect=lambda *a,**k: puts.append(a[0])):
+                        _scoped_cached_mono('idxtop','qz',None,'',{},run(busy)); m_busy=len(puts)
+                        _scoped_cached_multi('search','qa,qz',['qa','qz'],{'qa':None,'qz':None},{},{},run(busy)); x_busy=len(puts)-m_busy
+                        _scoped_cached_multi('search','qa,qz',['qa','qz'],{'qa':None,'qz':None},{},{},run(sqle)); x_sql=len(puts)-m_busy-x_busy
+                        _scoped_cached_mono('idxtop','qz',None,'',{},run(clean)); m_clean=len(puts)-m_busy-x_busy-x_sql
+                    got=(twice(busy),twice(sqle),twice(clean),m_busy,x_busy,x_sql,m_clean)
+                    if got!=(2,2,1,0,0,0,1): print(f"  {got}")
+                    return got==(2,2,1,0,0,0,1)
+                check("cache des réponses : arrêt d'un nick ([ERREUR]) ou erreur SQLite en code 0 jamais en cache, trois sites (A67)",_cache_nick_error)
+                def _restore_root():
+                    """1.29.0 (story 37, A68, décisions de l'utilisateur) : POST /restore — sans racine ou racine introuvable : 403 ;
+                    `where` relatif à la racine, absolu dedans accepté, `..` interne accepté ; `..` qui sort, absolu hors racine, lien
+                    qui sort : 403 ; vide : 400 ; dossier existant non vide : 409 (revue, décision de l'utilisateur) — refus sans jamais
+                    lancer borgHelper ; accepté : Restore reçoit le chemin résolu. /version restore_enabled (faux si racine introuvable),
+                    /access restore_root. Racine « / » : démarrage refusé."""
+                    root=os.path.realpath(os.path.join(tmpdir,'restore-root')); os.makedirs(os.path.join(root,'sub'),exist_ok=True)
+                    out=os.path.realpath(os.path.join(tmpdir,'restore-out')); os.makedirs(out,exist_ok=True)
+                    lnk=os.path.join(root,'fuite')
+                    if not os.path.lexists(lnk): os.symlink(out,lnk)
+                    os.makedirs(os.path.join(root,'plein'),exist_ok=True); open(os.path.join(root,'plein','f'),'w').close()
+                    ok_res=CommandResult(exitcode=0,stdout='ok',stderr='')
+                    def post(where,rr=root,flat=False):
+                        with mock.patch(f"{__name__}.RESTORE_ROOT",rr), \
+                             mock.patch(f"{__name__}._exec_borghelper",return_value=ok_res) as ex:
+                            r=client.post(f"{P}/restore",headers=H,params={'nick':_internal,'ftor':'etc/x','where':where,'flat':flat})
+                        a=ex.call_args[0][2] if ex.called else None
+                        return r.status_code,(a[a.index('-W' if flat else '-w')+1] if a else None)
+                    got={'sans racine':post('sub',rr=None),'racine absente':post('sub',rr=root+'-absente'),
+                         'relatif':post('sub/a'),'point':post('.'),'absolu dedans':post(root+'/sub'),'.. interne':post('sub/../b'),
+                         'plat':post('t.tgz',flat=True),
+                         '.. qui sort':post('../restore-out'),'absolu dehors':post(out),'lien qui sort':post('fuite/x'),
+                         'racine voisine':post(root+'-x/y'),'vide':post('  '),'rempli':post('plein'),'rempli plat':post('plein',flat=True)}
+                    want={'sans racine':(403,None),'racine absente':(403,None),'relatif':(200,root+'/sub/a'),'point':(409,None),
+                          'absolu dedans':(200,root+'/sub'),'.. interne':(200,root+'/b'),'plat':(200,root+'/t.tgz'),
+                          '.. qui sort':(403,None),'absolu dehors':(403,None),'lien qui sort':(403,None),'racine voisine':(403,None),
+                          'vide':(400,None),'rempli':(409,None),'rempli plat':(409,None)}
+                    with mock.patch(f"{__name__}.RESTORE_ROOT",root+'-absente'):
+                        v1=client.get("/version").json()
+                    env={**os.environ,'BORGHELPERWWW_RESTORE_ROOT':' / '}
+                    sl=subprocess.run([sys.executable,os.path.realpath(__file__),'-C',CFGFILE,'-K','x','--selftest'],env=env,
+                                      capture_output=True,text=True,timeout=120,stdin=subprocess.DEVNULL)
+                    slash=(sl.returncode!=0 and 'refusé' in sl.stderr and 'push selftest' not in sl.stdout)
+                    with mock.patch(f"{__name__}.RESTORE_ROOT",root):
+                        v=client.get("/version").json(); acc=client.get(f"{P}/access",headers=H).json()
+                    with mock.patch(f"{__name__}.RESTORE_ROOT",None):
+                        v0=client.get("/version").json(); acc0=client.get(f"{P}/access",headers=H).json()
+                    def grp(ops):   # groupes actifs : niveau écriture partout ; racine montrée seulement si un nick permet restore
+                        with mock.patch(f"{__name__}.RESTORE_ROOT",root), mock.patch(f"{__name__}.GROUPS_HEADER",'X-Groups'), \
+                             mock.patch(f"{__name__}._effective_level",lambda g,c: 2), \
+                             mock.patch(f"{__name__}._resolve_path_scope",lambda *a,**k: None), \
+                             mock.patch(f"{__name__}.allowed_ops",lambda cfg,n: ops):
+                            return client.get(f"{P}/access",headers={**H,'X-Groups':'g'}).json().get('restore_root')
+                    g_ok,g_no=grp(['read','restore']),grp(['read'])
+                    expo=(v.get('restore_enabled'),'restore-root' in json.dumps(v),acc.get('restore_root'),v0.get('restore_enabled'),
+                          acc0.get('restore_root'))
+                    ok=(got==want and expo==(True,False,root,False,None) and v1.get('restore_enabled') is False and slash
+                        and (g_ok,g_no)==(root,None) and not os.listdir(out))
+                    if not ok: print(f"  écarts : { {k:(got[k],want[k]) for k in want if got[k]!=want[k]} } ; exposition {expo} ; "
+                                     f"introuvable {v1.get('restore_enabled')} ; « / » {slash} {sl.returncode} {sl.stderr[-200:]!r} ; groupes {(g_ok,g_no)}")
+                    return ok
+                if _internal is None: print("SKIP racine de restauration : aucun nick interne dans ce rc")
+                else: check("POST /restore sous la racine de restauration seulement : 403 sans racine/hors racine/lien, 409 si remplie, chemin résolu transmis, « / » refusé (A68)",
+                            _restore_root)
                 def _access_state():
                     """/access : external, ops (allowed_ops de borgHelper), build, rebuild, bkp_running, index_last, bkp_last par nick lisible ; nick
                     sans droit : rien de plus."""

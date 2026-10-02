@@ -253,12 +253,14 @@ async ${grab('runBackupNow')}
   const grabConst=name=>{ const i=src.indexOf('const '+name+'=[');
     if(i<0) throw new Error('const '+name+'=[ introuvable dans '+htmlPath); let d=0,j=src.indexOf('[',i);
     for(;;j++){ if(src[j]==='[') d++; else if(src[j]===']' && --d===0) break; } return src.slice(i,j+1)+';'; };
-  const dom={els:{},byId(id){ return this.els[id]||(this.els[id]={innerHTML:'',textContent:'',classList:{toggle(){}}}); }};
-  let reportStdout='', histLoads=[];
+  const dom={els:{},byId(id){ return this.els[id]||(this.els[id]={innerHTML:'',textContent:'',classList:{toggle(){},add(){},remove(){}}}); }};
+  let reportStdout='', histLoads=[], versionJson={};
   const page=new Function('dom','hooks',`
     const document={getElementById:id=>dom.byId(id),querySelectorAll:()=>[],
       createElement:()=>{ const el={set innerHTML(h){ this._h=h; this.firstElementChild={html:h,querySelector:()=>'panel'}; }}; return el; }};
-    let myAccess=null, currentNick=null, currentActionId=null, allowDestructive=true, machineCardsByNick={};
+    let myAccess=null, currentNick=null, currentActionId=null, allowDestructive=true, restoreEnabled=true, machineCardsByNick={};
+    let allowDownloads=true, API_PREFIX='/api', pushInfo=null;
+    const fetch=async()=>({ok:true,json:async()=>hooks.version}), applyBadges=()=>{}, updateNotifBtn=()=>{};
     const SPINNER='…';
     const getPassphrase=()=>'', loadHistoryInline=(n,p)=>hooks.hist.push(n), apiCall=async()=>({stdout:hooks.report()});
     ${grab('escapeHtml')}
@@ -269,11 +271,13 @@ ${grab('badgeFor')}
 ${grab('plainDbBadge')}
     ${grabConst('ACTIONS')}
 ${grab('renderActionList')}
+${grab('selectAction')}
+async ${grab('loadFooterVersions')}
 ${grab('_renderHistoryRows')}
 ${grab('machineCardHtml')}
 async ${grab('reloadMachineCard')}
-    return {renderActionList,_renderHistoryRows,reloadMachineCard,
-      set:(a,n)=>{ myAccess=a; currentNick=n; }, cards:()=>machineCardsByNick};`)(dom,{hist:histLoads,report:()=>reportStdout});
+    return {renderActionList,selectAction,loadFooterVersions,_renderHistoryRows,reloadMachineCard,
+      set:(a,n)=>{ myAccess=a; currentNick=n; }, actions:()=>ACTIONS, cards:()=>machineCardsByNick};`)(dom,{hist:histLoads,report:()=>reportStdout,get version(){ return versionJson; }});
   page.set(acc({ext:{external:true,ops:['read','restore']},int:{ops:['read','restore','prune','delete','bkp']}}),'ext');
   page.renderActionList();
   const listExt=dom.byId('actionList').innerHTML;
@@ -283,6 +287,19 @@ async ${grab('reloadMachineCard')}
   page.set(acc({ext:{external:true,ops:['read','restore']},int:{ops:['read','restore','prune','delete','bkp']}}),'int');
   page.renderActionList();
   eq('page serveur interne : toutes les actions',['abtn_bkp','abtn_prune','abtn_delbkp'].every(id=>dom.byId('actionList').innerHTML.includes(id)),true);
+  // UI 1.21.0 (A68) : sans racine de restauration (/version restore_enabled) « Restaurer » masqué ; libellé = racine de /access
+  versionJson={borghelperwww_version:'x',allow_destructive:true,allow_downloads:true,restore_enabled:false}; await page.loadFooterVersions();   // vraie lecture de /version
+  page.renderActionList(); const noRoot=dom.byId('actionList').innerHTML;
+  versionJson={borghelperwww_version:'x',allow_destructive:true,allow_downloads:true,restore_enabled:true}; await page.loadFooterVersions();
+  page.renderActionList(); const withRoot=dom.byId('actionList').innerHTML;
+  const whereP=page.actions().find(a=>a.id==='restore').params.find(p=>p.name==='where');
+  const a0=acc({int:{ops:['read','restore']}}); a0.restore_root='/srv/restaurations'; page.set(a0,'int'); const lbl=whereP.labelFn();
+  page.selectAction('restore'); const panel=dom.byId('actionPanel').innerHTML;   // vrai formulaire : libellé affiché
+  page.set(acc({int:{ops:['read','restore']}}),'int'); const lbl0=whereP.labelFn();
+  eq('restauration : masquée sans racine, libellé sous-dossier de la racine',
+     [noRoot.includes('id="abtn_restore"'),noRoot.includes('id="abtn_restoreperms"'),withRoot.includes('id="abtn_restore"'),
+      panel.includes('Destination (sous-dossier de /srv/restaurations) *'),lbl,lbl0],
+     [false,true,true,true,'Destination (sous-dossier de /srv/restaurations)','Destination (sous-dossier de la racine de restauration du serveur)']);
   const bk={'a-1':{duration:'1s'},Totaux:{}};
   page.set(acc({ext:{ops:['read','restore']}}),'ext');
   eq('historique externe sans delete : pas de 🗑',page._renderHistoryRows(bk,true).html.includes('hist-delete-btn'),false);

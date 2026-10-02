@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.20.0 -->
+<!-- UI_VERSION: 1.21.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -363,6 +363,7 @@ let currentNick=null;
 let currentActionId=null;
 let allowDestructive=true; // état réel connu après résolution de loadFooterVersions() ci-dessous
 let allowDownloads=true;
+let restoreEnabled=true; // UI 1.21.0 (A68) : racine de restauration configurée (/version restore_enabled) — sinon « Restaurer » masqué
 let API_PREFIX='/api'; // idem — appris depuis /version (seule route jamais préfixée, avec / et /healthz)
 let myAccess=null; // {groups_auth_enabled, nicks:{nick:{level:'none'|'read'|'write'|'admin',read_scope:null|string[],restore_scope:null|string[]}}} — appris via /access, après connexion
 let pushInfo={available:false,suspended:false,vapidKey:null,defaultDays:30,maxDays:3650}; // appris depuis /version
@@ -447,6 +448,7 @@ const versionsReady=(async function loadFooterVersions(){
     if(typeof v.api_prefix==='string') API_PREFIX=v.api_prefix;
     allowDestructive=!!v.allow_destructive;
     allowDownloads=!!v.allow_downloads;
+    restoreEnabled=!!v.restore_enabled;
     pushInfo={available:!!(v.push_available&&v.vapid_public_key),suspended:!!v.push_suspended,vapidKey:v.vapid_public_key||null,
               defaultDays:v.push_default_expiry_days||30,maxDays:v.push_max_expiry_days||3650};
     applyBadges();
@@ -1271,10 +1273,12 @@ const ACTIONS=[
   {id:'cacheclean', label:'Nettoyer le cache', method:'POST', path:'/cacheclean', needsPass:false, params:[]},
   {id:'restore', op:'restore', label:'Restaurer (écrit sur le disque du serveur borgHelperWWW)', method:'POST', path:'/restore', needsPass:true,
     params:[{name:'ftor',label:'Chemin ou glob à restaurer',type:'text',required:true},
-            {name:'where',label:'Destination (chemin local au serveur borgHelperWWW)',type:'text',required:true},
+            {name:'where',label:'Destination',type:'text',required:true,
+             // UI 1.21.0 (A68) : sous la racine de restauration du serveur seulement (/access restore_root) — relatif à elle
+             labelFn:()=>'Destination (sous-dossier de '+((myAccess&&myAccess.restore_root)||'la racine de restauration du serveur')+')'},
             {name:'bid',label:'Archive (vide = dernière)',type:'text'},
             {name:'flat',label:'Arborescence plate (tgz)',type:'bool'}],
-    destructive:true, confirmMsg:'Restaurer va écrire des fichiers sur le disque du serveur borgHelperWWW. Continuer ?'},
+    destructive:true, requiresRestoreRoot:true, confirmMsg:'Restaurer va écrire des fichiers sur le disque du serveur borgHelperWWW. Continuer ?'},
   {id:'idxpurge', label:'⚡ Purger index (IdxPurge)', method:'POST', path:'/idxpurge', needsPass:false,
     params:[{name:'pattern',label:'Motif explicite (vide = IDX_EXCLUDE/IDX_INCLUDE de la conf)',type:'text'},
             {name:'dryrun',label:'Dry-run (aucune suppression)',type:'bool'}],
@@ -1312,7 +1316,8 @@ function updateDetailPassStatus(){
 function renderActionList(){
   const ul=document.getElementById('actionList');
   // a.op : nature d'opération (UI 1.19.0) — action interdite sur un dépôt externe (EXTERNAL_OPS) jamais proposée
-  ul.innerHTML=ACTIONS.filter(a=>(!a.requiresDestructive||allowDestructive) && opAllowed(currentNick,a.op||'read'))
+  ul.innerHTML=ACTIONS.filter(a=>(!a.requiresDestructive||allowDestructive) && (!a.requiresRestoreRoot||restoreEnabled)
+                         && opAllowed(currentNick,a.op||'read'))
     .map(a=>`<li><button class="${a.destructive?'danger-item':''}${a.id===currentActionId?' active':''}" id="abtn_${a.id}" onclick="selectAction('${a.id}')">${a.needsPass?'🔑 ':''}${escapeHtml(a.label)}</button></li>`).join('');
 }
 
@@ -1331,7 +1336,7 @@ function selectAction(id){
       const opts=p.options.map(o=>`<option value="${escapeAttr(o)}" ${o===p.default?'selected':''}>${escapeHtml(o)}</option>`).join('');
       return `<div class="field"><label for="${fid}">${escapeHtml(p.label)}</label><select id="${fid}">${opts}</select></div>`;
     }
-    return `<div class="field"><label for="${fid}">${escapeHtml(p.label)}${p.required?' *':''}</label><input type="${p.type}" id="${fid}" ${p.default!==undefined?('value="'+escapeAttr(p.default)+'"'):''}></div>`;
+    return `<div class="field"><label for="${fid}">${escapeHtml(p.labelFn?p.labelFn():p.label)}${p.required?' *':''}</label><input type="${p.type}" id="${fid}" ${p.default!==undefined?('value="'+escapeAttr(p.default)+'"'):''}></div>`;
   }).join('');
   panel.innerHTML=`
     <h3>${a.needsPass?'🔑 ':''}${escapeHtml(a.label)}</h3>

@@ -690,6 +690,9 @@ Key et Mount affichent leur résultat). `DiffBkp -j` : `{"error": "…"}` seul s
 (`{hostname}`…) : jamais dit absent (Report compris). Avant : trace Python (DiffBkp, Restore sans
 `-b`, Mount `-b last`), dictionnaire brut (DelBkp, Prune, Mount), rien du tout et code 0 (Key). `Key` et `Prune` sur
 plusieurs nicks : code de sortie = le pire des nicks.
+Plantage de borg (1.0.174) : le message donne l'exception (`… a échoué : Local Exception; ValueError: …`), sans la trace
+ni le bandeau `Platform:`/`Borg:`… de borg (Key, DelBkp, Mount, Prune, Report, `borg list` ; Restore et Bkp affichent la
+sortie de borg complète).
 
 ---
 
@@ -1534,6 +1537,7 @@ première requête — voir `docs/borghelperrc.example`.
 | `BORGHELPERWWW_TRUSTED_PROXIES` | `--trusted-proxies` | `trusted_proxies` | IP/CIDR des reverse proxies de confiance, séparées par des virgules, ou `*` pour toutes (défaut `127.0.0.1`) — IP du navigateur dans le journal des requêtes, dans les deux modes de lancement (voir ci-dessous) |
 | `BORGHELPERWWW_ALLOW_DESTRUCTIVE` | `--allow-destructive`, `--no-allow-destructive` | `allow_destructive` | Autorise `Prune`/`DelBkp` (destruction de sauvegardes) — **interdit par défaut** (voir ci-dessous) |
 | `BORGHELPERWWW_ALLOW_DOWNLOADS` | `--allow-downloads`, `--no-downloads` | `allow_downloads` | Autorise `/download/file` et `/download/tar` (vue d'une restauration) — **autorisé par défaut** (voir ci-dessous) |
+| `BORGHELPERWWW_RESTORE_ROOT` | `--restore-root` | `restore_root` | Racine de restauration de `POST /restore` : la destination `where` en est un sous-dossier — **absente : `POST /restore` refusé** (≥ 1.29.0, voir ci-dessous) |
 | `BORGHELPERWWW_API_PREFIX` | `--api-prefix` | `api_prefix` | Préfixe de toutes les routes API — défaut `/api` (voir ci-dessous) |
 | `BORGHELPERWWW_GROUPS_HEADER` | `--groups-header` | `groups_header` | Header HTTP contenant les groupes de l'utilisateur (reverse proxy OIDC) — absent : **désactivé** (voir ci-dessous) |
 | `BORGHELPERWWW_USER_HEADER` | `--user-header` | `user_header` | Header HTTP portant l'email/le nom de l'utilisateur (reverse proxy) — journalisé et enregistré avec les abonnements aux notifications (≥ 1.25.0) |
@@ -1608,11 +1612,18 @@ Deux réglages de sécurité au démarrage, affichés sur **stderr** au lancemen
 Les deux réglages sont indépendants l'un de l'autre et des permissions habituelles (`X-API-Key`,
 `X-Borg-Passphrase`) — ils s'y ajoutent, ils ne les remplacent pas.
 
-**`POST /restore` n'a, à ce jour, aucun réglage d'activation/désactivation comparable** à
-`BORGHELPERWWW_ALLOW_DESTRUCTIVE` ou `BORGHELPERWWW_ALLOW_DOWNLOADS` : ni l'un ni l'autre des deux
-réglages ci-dessus ne le couvre (voir les deux bullets ci-dessus), et il n'existe aucun troisième
-réglage dédié. Seuls `X-API-Key`, et — depuis la Story 2.1 — le périmètre de chemin par groupes
-(`require_path_in_scope`, voir « Autorisation par groupes » ci-dessous) le protègent.
+**`POST /restore` — racine de restauration (≥ 1.29.0)** : il n'écrit que sous `BORGHELPERWWW_RESTORE_ROOT`
+(`--restore-root`, `restore_root`). **Sans racine configurée, ou racine introuvable : `403`** (restauration sur le
+serveur désactivée ; l'UI masque « Restaurer »). `where` est relatif à la racine (`sous/dossier`, `.` = la racine) ; un
+chemin absolu est accepté s'il est à l'intérieur ; il est résolu (liens et `..` suivis) et doit y rester : `../x`, un
+absolu hors racine ou un lien qui sort -> `403` ; vide -> `400` ; **dossier existant non vide -> `409`** (un lien laissé
+dessous par une restauration précédente ferait écrire borg hors de la racine : restaurer dans un dossier absent ou vide) —
+tout refus avant de lancer borgHelper, qui reçoit le chemin résolu. Racine `/` : démarrage refusé ; racine relative :
+résolue depuis le répertoire de lancement. Limite : un lien posé dans la racine entre ce contrôle et l'extraction, par
+quelqu'un qui peut y écrire. `/version` donne `restore_enabled` (faux si la racine est introuvable), `/access` la racine
+(`restore_root`, à qui peut restaurer sur au moins un nick).
+S'y ajoutent `X-API-Key` et le périmètre de chemin par groupes (`require_path_in_scope`, voir « Autorisation par
+groupes » ci-dessous) ; `ALLOW_DESTRUCTIVE`/`ALLOW_DOWNLOADS` ne le couvrent pas.
 
 #### Autorisation par groupes (reverse proxy OIDC/auth_request)
 
@@ -2105,7 +2116,12 @@ entrées (purge totale au-delà, garde-fou anti-croissance illimitée). `GET /re
 mode `offline=true` (le mode en ligne interroge le dépôt en direct via `borg info`, non couvert par
 cette empreinte). Depuis borgHelperWWW 1.28.8, seules les réponses en code 0 ou 1 (alerte tirée des bases : diff.db
 absent, sauvegarde trop ancienne) sont mises en cache : un code >= 2 (« ⚠ dépôt absent », coupure ssh…) dépend d'un état
-extérieur aux bases et serait resservi après remontage — il est recalculé à chaque appel.
+extérieur aux bases et serait resservi après remontage — il est recalculé à chaque appel. Depuis 1.29.0 : une réponse
+dont le stderr porte `[ERREUR]` (arrêt d'un nick d'un lecteur multi-nicks en code 0 : base occupée, corrompue,
+illisible ; index vide en texte) ou qui porte « SQLite error » n'est jamais mise en cache, ni ici ni dans le cache par
+périmètre ; `GET /report?offline=true` et `GET /diffbkp` (qui lit le dépôt en direct) ajoutent à l'empreinte la présence
+de chaque dépôt local (disque démonté -> recalcul ; remonté -> la réponse d'avant resservie) et ne sont servis du cache
+que 5 min (« depuis », alerte de sauvegarde trop ancienne, place libre, nouvelle archive).
 
 ⚠️ **Périmètre de chemin actif ⇒ jamais servi depuis `_RESPONSE_CACHE`** (Story 1.3, étendu Story
 1.4) : pour `/search`, `/filehist`, `/lstbkpfls`, `/diffbkp`, `/treehist`, `/treefind`, `/duidx`,
