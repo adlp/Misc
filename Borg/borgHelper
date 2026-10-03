@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.177"
+Version="1.0.178"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -2293,6 +2293,7 @@ def _close_quiet(conn):
 
 def _codec_fail(label,e,conn=None):
     """Valeur de chemin stockée illisible (DbCodecError, pas une sqlite3.Error) : ferme la connexion, message par nick."""
+    _READER_FAILED[0]=True   # 1.0.178 (A87) : nick en échec -> code 1 d'un lecteur
     msg=f"{label}: chemin stocké illisible ({e}) — base altérée ou clé incorrecte"
     printer(f"[ERREUR] {msg}")
     try: conn.close()
@@ -2358,6 +2359,7 @@ class _PerNick:
             try: self.conn().close()   # connexion du nick arrêté (ou déjà fermée / inexistante)
             except Exception: pass
         self.ko+=1; self.stop=e if self.stop is None else self.stop
+        _READER_FAILED[0]=True   # 1.0.178 (A87, décision de l'utilisateur) : un nick arrêté parmi plusieurs -> code 1 d'un lecteur
         return True
     def done(self):
         if self.stop is not None and self.ko==len(self.nicks): raise self.stop
@@ -2438,6 +2440,12 @@ def _valid_nick_name(name):
     return bool(isinstance(name,str) and _NICK_NAME_RE.fullmatch(name) and name.upper() not in ('ALL','DEFAULT'))
 
 _SQLITE_ERR_SEEN=set()
+# 1.0.178 (story 41, A87, décisions de l'utilisateur) : un lecteur de _READER_CODE_CMDS a rencontré une erreur — sqlite3.Error
+# réelle (verrou au-delà du délai, corruption ; jamais « table/colonne absente »), nick arrêté parmi plusieurs (_PerNick), chemin
+# illisible (_codec_fail) -> la commande sort en code 1 (au moins), données des autres nicks gardées. Avant : code 0.
+_READER_FAILED=[False]
+_READER_CODE_CMDS=frozenset(('search','filehist','treehist','treefind','duidx','idxtop','difftop','archivehistory','repohistory',
+                             'cacheinfo','lstbkp','lstbkpfls'))
 
 def _sqlite_missing(e):
     """True : « table/colonne absente » (base pas encore créée, ancien schéma) — état voulu des lecteurs, jamais une erreur."""
@@ -2454,6 +2462,7 @@ def _reader_sqlite_line(e,db_path):
     """1.0.176 (story 39, A78) : ligne d'une erreur SQLite dont le lecteur n'a pas d'autre sortie (IdxTop/DiffTop texte) — vraie
     erreur pas encore dite pour cette base : « [ERREUR] SQLite error … » (marquée, _reader_sqlite_err) ; sinon (table absente,
     déjà dite) : la ligne d'avant, « SQLite error … » sans marque — jamais une sortie vide."""
+    if not _sqlite_missing(e): _READER_FAILED[0]=True   # 1.0.178 (A87) : code 1
     if not _sqlite_missing(e) and db_path not in _SQLITE_ERR_SEEN:
         _SQLITE_ERR_SEEN.add(db_path); return f"[ERREUR] SQLite error ({db_path}): {e}"
     return f"  SQLite error ({db_path}): {e}"
@@ -2464,6 +2473,7 @@ def _reader_sqlite_err(e,db_path,key=None):
     error (<base>): <erreur>` sur stderr, une fois par base et par processus ; sortie partielle et code inchangés (borgHelperWWW
     ne met jamais en cache une réponse qui porte [ERREUR]). Avant : avalée, réponse fausse (« — », « Index vide ») en code 0."""
     if _sqlite_missing(e): return
+    _READER_FAILED[0]=True   # 1.0.178 (A87) : code 1 d'un lecteur de _READER_CODE_CMDS (marque dite ou non)
     k=db_path if key is None else key   # key : marque propre à un lecteur du watcher (_reader_sqlite_ok)
     if k in _SQLITE_ERR_SEEN: return
     _SQLITE_ERR_SEEN.add(k); printer(f"[ERREUR] SQLite error ({db_path}): {e}")
@@ -3953,6 +3963,7 @@ class BorgHelperDB:
             # requête passant par un autre index répondre [] en forme de succès
             if isinstance(e,sqlite3.OperationalError) and str(e).startswith(('no such table','no such column')): return True
             _SQLITE_ERR_SEEN.add(db_path)   # une seule ligne : celle de l'appelant
+            _READER_FAILED[0]=True   # 1.0.178 (A87) : code 1
             return f"SQLite error ({db_path}): {e}"
 
     def _diff_archive_filter(self,nick,archive_from,conn,archive_to=None):
@@ -4004,7 +4015,7 @@ class BorgHelperDB:
                 except DbCodecError as e: _codec_fail(n,e,conn)
                 except sqlite3.Error as e:
                     _close_quiet(conn)
-                    printer(f"SQLite error ({db_path}): {e}")
+                    printer(_reader_sqlite_line(e,db_path))   # 1.0.178 (A87) : marquée, code 1
         _iso.done()
         return totals
 
@@ -4044,7 +4055,7 @@ class BorgHelperDB:
                 except DbCodecError as e: _codec_fail(n,e,conn)
                 except sqlite3.Error as e:
                     _close_quiet(conn)
-                    printer(f"SQLite error ({db_path}): {e}")
+                    printer(_reader_sqlite_line(e,db_path))   # 1.0.178 (A87) : marquée, code 1
         _iso.done()
         return totals
 
@@ -4086,7 +4097,7 @@ class BorgHelperDB:
                 except DbCodecError as e: _codec_fail(n,e,conn)
                 except sqlite3.Error as e:
                     _close_quiet(conn)
-                    printer(f"SQLite error ({db_path}): {e}")
+                    printer(_reader_sqlite_line(e,db_path))   # 1.0.178 (A87) : marquée, code 1
         _iso.done()
         return rows
 
@@ -4099,9 +4110,9 @@ class BorgHelperDB:
             rows=cur.fetchall(); conn.close(); return rows
         except sqlite3.OperationalError as e:
             if 'no such table' in str(e): return []  # jamais mis en cache (create=False, AD-12)
-            printer(f"SQLite error ({db_path}): {e}"); return []
+            printer(_reader_sqlite_line(e,db_path)); return []   # 1.0.178 (A87) : marquée, code 1 (CacheInfo)
         except sqlite3.Error as e:
-            printer(f"SQLite error ({db_path}): {e}"); return []
+            printer(_reader_sqlite_line(e,db_path)); return []
 
 
 # ── BorgRunner — borg subprocess + borghelperrc config ────────────────────────
@@ -5211,14 +5222,16 @@ class BorgHelper:
     def list_backups(self,nick,debug=0):
         db_path=self.db.get_diff_db(nick)
         self.db.ensure_diff_db(db_path,create=False)
-        conn=_open_db(db_path,nick=nick,role='read',empty_ok=True)
+        conn=None
         try:
+            conn=_open_db(db_path,nick=nick,role='read',empty_ok=True)
             rows=conn.execute("SELECT archive,archive_date FROM archive_stats WHERE nick=? ORDER BY archive_date,archive",(nick,)).fetchall()
-        except sqlite3.OperationalError as e:
-            if 'no such table' not in str(e): raise
+        except sqlite3.Error as e:
+            if not _sqlite_missing(e):   # 1.0.178 (A87) : verrou, corruption -> message marqué, code 1 (avant : trace, Sentry)
+                printer(_reader_sqlite_line(e,db_path)); sys.exit(1)
             rows=[]  # base absente/jamais indexée (create=False, AD-12) : comme un index vide
         finally:
-            conn.close()
+            _close_quiet(conn)
         if not rows:
             printer("Aucune archive indexée en base — lancer 'index' ou 'bkp'."); sys.exit(1)
         for name,date in rows:
@@ -5228,11 +5241,17 @@ class BorgHelper:
     def list_files(self,nick,bid,debug=0,as_json=False):
         db_path=self.db.get_diff_db(nick)
         self.db.ensure_diff_db(db_path,create=False)
-        conn=_open_db(db_path,nick=nick,role='read',empty_ok=True)
+        conn=None
+        def _sql_fail(e):   # 1.0.178 (A87) : verrou, corruption -> message marqué (et JSON), code 1 ; avant : trace, Sentry
+            _close_quiet(conn); line=_reader_sqlite_line(e,db_path)
+            if as_json: print(json.dumps({'error':f"SQLite error ({db_path}): {e}"},ensure_ascii=False))
+            printer(line); sys.exit(1)
+        try: conn=_open_db(db_path,nick=nick,role='read',empty_ok=True)
+        except sqlite3.Error as e: _sql_fail(e)
         if bid is None:
             try: row=conn.execute("SELECT archive FROM archive_stats WHERE nick=? ORDER BY archive_date DESC LIMIT 1",(nick,)).fetchone()
-            except sqlite3.OperationalError as e:
-                if 'no such table' not in str(e): conn.close(); raise
+            except sqlite3.Error as e:
+                if not _sqlite_missing(e): _sql_fail(e)
                 row=None  # base absente/jamais indexée (create=False, AD-12)
             if row is None:
                 conn.close()
@@ -5245,8 +5264,8 @@ class BorgHelper:
             msg=_codec_fail(nick,e,conn)
             if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(3)
             sys.exit(3)
-        except sqlite3.OperationalError as e:
-            if 'no such table' not in str(e): conn.close(); raise
+        except sqlite3.Error as e:
+            if not _sqlite_missing(e): _sql_fail(e)
             rows=[]  # base absente/jamais indexée (create=False, AD-12)
         rows.sort(key=lambda r:_path_sort_key(r[0]))  # tri Python (ordre octet UTF-8) : identique en plain et chiffré
         conn.close()
@@ -5277,12 +5296,20 @@ class BorgHelper:
         return worst
 
     def cache_info(self,nick=None,debug=0):
-        nicks=nick.split(',') if nick and nick!='ALL' else self.borg.cfgreadnicks(debug).split(',')
+        nicks=','.join(nick.split(',') if nick and nick!='ALL' else self.borg.cfgreadnicks(debug).split(','))
         rows=[]
-        for n in nicks:
-            rows.extend(self.db.get_cache_rows(n))
+        # 1.0.178 (revue story 41) : un nick dont cache.db s'arrête (passphrase absente, base occupée, en-tête altéré) n'arrête
+        # plus les autres (_PerNick, code 1) ; nick seul ou tous en échec : relancé comme avant
+        prev=_READER_FAILED[0]; _READER_FAILED[0]=False   # erreur de CET appel (un appel précédent en processus ne compte pas)
+        try:
+            _iso=_PerNick(nicks)
+            for n in _iso.nicks:
+                with _iso(n): rows.extend(self.db.get_cache_rows(n))
+            _iso.done()
+        finally: err=_READER_FAILED[0]; _READER_FAILED[0]=prev or err
         if not rows:
-            print("Cache vide."); return
+            if not err: print("Cache vide.")   # erreur : jamais présentée comme un cache vide
+            return
         from prettytable import PrettyTable
         t=PrettyTable(['nick','last_modified','taille'])
         for nom,lm,size in rows:
@@ -6995,7 +7022,9 @@ class BorgHelper:
                 ie=self.db._is_index_empty(n,db_path)   # 1.0.175 (A72) : True (vide) ou message d'erreur SQLite réelle
                 if ie:
                     msg=ie if isinstance(ie,str) else f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
-                    if as_json: results[n]={'error':msg}
+                    if as_json:
+                        results[n]={'error':msg}
+                        if isinstance(ie,str): printer(f"[ERREUR] {msg}")   # 1.0.178 (A87) : erreur aussi sur stderr en -j
                     else: printer(f"[ERREUR] {msg}")
                     continue
                 try:
@@ -7021,8 +7050,8 @@ class BorgHelper:
                     if as_json: results[n]={'error':msg}
                     continue
                 except sqlite3.Error as e:
-                    if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
-                    else: printer(f"SQLite error ({db_path}): {e}")
+                    if as_json: _reader_sqlite_err(e,db_path); results[n]={'error':f"SQLite error ({db_path}): {e}"}   # 1.0.178 (A87)
+                    else: printer(_reader_sqlite_line(e,db_path))
                     continue
                 rows.extend(n_rows)
                 if as_json:
@@ -7053,7 +7082,9 @@ class BorgHelper:
                 ie=self.db._is_index_empty(n,db_path)   # 1.0.175 (A72) : True (vide) ou message d'erreur SQLite réelle
                 if ie:
                     msg=ie if isinstance(ie,str) else f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
-                    if as_json: results[n]={'error':msg}
+                    if as_json:
+                        results[n]={'error':msg}
+                        if isinstance(ie,str): printer(f"[ERREUR] {msg}")   # 1.0.178 (A87) : erreur aussi sur stderr en -j
                     else: printer(f"[ERREUR] {msg}")
                     continue
                 try:
@@ -7067,8 +7098,8 @@ class BorgHelper:
                     cur=conn.execute("SELECT nick,archive_date,'',archive,'présent',NULL,size FROM archive_snapshot_v WHERE nick=? AND path=? "+_snap_notin(df,dt),[n,pstored]+snap_extra)
                     n_rows+=cur.fetchall(); conn.close()
                 except sqlite3.Error as e:
-                    if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
-                    else: printer(f"SQLite error ({db_path}): {e}")
+                    if as_json: _reader_sqlite_err(e,db_path); results[n]={'error':f"SQLite error ({db_path}): {e}"}   # 1.0.178 (A87)
+                    else: printer(_reader_sqlite_line(e,db_path))
                     continue
                 n_rows.sort(key=lambda r:(r[1] or ''))
                 rows.extend(n_rows)
@@ -7371,7 +7402,9 @@ class BorgHelper:
                 ie=self.db._is_index_empty(n,db_path)   # 1.0.175 (A72) : True (vide) ou message d'erreur SQLite réelle
                 if ie:
                     msg=ie if isinstance(ie,str) else f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
-                    if as_json: results[n]={'error':msg}
+                    if as_json:
+                        results[n]={'error':msg}
+                        if isinstance(ie,str): printer(f"[ERREUR] {msg}")   # 1.0.178 (A87) : erreur aussi sur stderr en -j
                     else: printer(f"[ERREUR] {msg}")
                     continue
                 try:
@@ -7386,8 +7419,8 @@ class BorgHelper:
                     msg=_codec_fail(n,e,conn)
                     if as_json: results[n]={'error':msg}
                 except sqlite3.Error as e:
-                    if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
-                    else: printer(f"SQLite error ({db_path}): {e}")
+                    if as_json: _reader_sqlite_err(e,db_path); results[n]={'error':f"SQLite error ({db_path}): {e}"}   # 1.0.178 (A87)
+                    else: printer(_reader_sqlite_line(e,db_path))
         _iso.done()
         if as_json:
             print(json.dumps(results,ensure_ascii=False,indent=2))
@@ -7479,7 +7512,9 @@ class BorgHelper:
                 ie=self.db._is_index_empty(n,db_path)   # 1.0.175 (A72) : True (vide) ou message d'erreur SQLite réelle
                 if ie:
                     msg=ie if isinstance(ie,str) else f"Index vide pour {n} — lancez : borgHelper -c Index -n {n}"
-                    if as_json: results[n]={'error':msg}
+                    if as_json:
+                        results[n]={'error':msg}
+                        if isinstance(ie,str): printer(f"[ERREUR] {msg}")   # 1.0.178 (A87) : erreur aussi sur stderr en -j
                     else: printer(f"[ERREUR] {msg}")
                     continue
                 try:
@@ -7491,8 +7526,8 @@ class BorgHelper:
                     msg=_codec_fail(n,e,conn)
                     if as_json: results[n]={'error':msg}
                 except sqlite3.Error as e:
-                    if as_json: results[n]={'error':f"SQLite error ({db_path}): {e}"}
-                    else: printer(f"SQLite error ({db_path}): {e}")
+                    if as_json: _reader_sqlite_err(e,db_path); results[n]={'error':f"SQLite error ({db_path}): {e}"}   # 1.0.178 (A87)
+                    else: printer(_reader_sqlite_line(e,db_path))
         _iso.done()
         if as_json:
             print(json.dumps(results,ensure_ascii=False,indent=2))
@@ -7680,7 +7715,8 @@ class BorgHelper:
                 # orphelin) -> aucune mesure, rows [] comme ArchiveHistory (avant : {"error": … no such table}, rouge dans l'UI) ;
                 # vraie erreur : [ERREUR] sur stderr en plus du JSON
                 if not str(e).startswith('no such table'):   # revue : « no such column » (schéma abîmé) n'est pas « aucune mesure »
-                    _reader_sqlite_err(e,hist)
+                    if _sqlite_missing(e): _READER_FAILED[0]=True; printer(f"[ERREUR] SQLite error ({hist}): {e}")   # 1.0.178 : marquée, code 1
+                    else: _reader_sqlite_err(e,hist)
                     print(json.dumps({'error':f"SQLite error ({hist}): {e}"},ensure_ascii=False,indent=2)); return
         print(json.dumps({'borghelper_version':Version,'nick':nick,'rows':rows},ensure_ascii=False,indent=2))
 
@@ -11027,7 +11063,8 @@ def codec_selftest(pattern=None,list_only=False):
             env=dict(os.environ,BORGHELPERC_SENTRY_FILE=nodsn); env.pop('BORGHELPERC_SENTRY_DSN',None)
             r=subprocess.run([sys.executable,os.path.realpath(__file__),'-C',rc,'-n','qe,qp','-P','fausse']+cmd,
                              capture_output=True,text=True,env=env,timeout=120,stdin=subprocess.DEVNULL)
-            ok=(r.returncode==0 and 'Traceback' not in r.stderr
+            # 1.0.178 (story 41, A87, décision de l'utilisateur) : un nick arrêté parmi plusieurs -> code 1 (avant : 0)
+            ok=(r.returncode==1 and 'Traceback' not in r.stderr
                 and '[ERREUR] DbKeyError : qe: passphrase incorrecte ou en-tête altéré' in r.stderr and check_fn(r.stdout,r.stderr))
             if not ok: print(f"  {cmd} : code {r.returncode} ; stdout {r.stdout[:300]!r} ; stderr {r.stderr[-300:]!r}")
             return ok
@@ -11049,7 +11086,7 @@ def codec_selftest(pattern=None,list_only=False):
                 ("DuIdx -R (brut)",['-c','DuIdx','-R','-j'],lambda o,e:(lambda j: j is not None and len(j.get('rows') or [])>0)(_mn_json(o))),
                 ("IdxTop texte",['-c','IdxTop'],lambda o,e: 'qp — top' in e),
                 ("DiffTop texte",['-c','DiffTop'],lambda o,e: 'qp — top' in e)):   # ArchiveHistory texte n'ouvre aucune base
-            check(f"multi-nicks : {_lbl}, qe en échec (passphrase fausse), qp gardé, code 0 (CLI)",
+            check(f"multi-nicks : {_lbl}, qe en échec (passphrase fausse), qp gardé, code 1 (CLI)",
                   (lambda c,f: (lambda: _mn_cli(c,f)))(_cmd,_fn))
         def _mn_patched(kind,bad):
             """(open_db, ensure_diff_db) remplacés : les nicks de `bad` s'arrêtent comme en vrai — 'corrupt' : sys.exit de
@@ -11164,7 +11201,7 @@ def codec_selftest(pattern=None,list_only=False):
         # 1.0.168 (story 31, A50) : chemins de _PerNick non couverts par le JSON — texte (on_stop absent), vrai Ctrl-C, fermeture
         for _lbl,_cmd in (("Search texte",['-c','Search','-f','passwd']),("FileHist texte",['-c','FileHist','-f','etc/passwd']),
                           ("TreeHist texte",['-c','TreeHist']),("TreeFind texte",['-c','TreeFind','-m','*'])):
-            check(f"multi-nicks : {_lbl}, qe en échec (passphrase fausse), qp affiché, code 0 (CLI)",
+            check(f"multi-nicks : {_lbl}, qe en échec (passphrase fausse), qp affiché, code 1 (CLI)",
                   (lambda c: (lambda: _mn_cli(c,lambda o,e: 'qp' in o and e.count('[ERREUR]')==1)))(_cmd))
         def _mn_kbint():
             """KeyboardInterrupt (vrai Ctrl-C hors borg) pendant le premier nick : propagé, nick suivant jamais traité — lecteur
@@ -13847,8 +13884,9 @@ fail()
             for x in (h,h+'-wal',h+'-shm'):
                 if os.path.exists(x): os.unlink(x)
             cn=sqlite3.connect(h); cn.execute("CREATE TABLE repo_stats(id INTEGER PRIMARY KEY,nick TEXT,op TEXT)"); cn.execute("INSERT INTO repo_stats(nick,op) VALUES('zr','bkp')"); cn.commit(); cn.close()
-            _SQLITE_ERR_SEEN.clear(); r,o,e=run(lambda: b.repo_history('zr',as_json=True))   # colonne absente : jamais « aucune mesure »
-            try: res['RepoHistory colonne absente']=('no such column' in json.loads(o)['error'],o[-150:],e)
+            _SQLITE_ERR_SEEN.clear(); _READER_FAILED[0]=False; r,o,e=run(lambda: b.repo_history('zr',as_json=True))   # colonne absente : jamais « aucune mesure »
+            # 1.0.178 (revue story 41) : marquée sur stderr et drapeau du code 1 posé
+            try: res['RepoHistory colonne absente']=('no such column' in json.loads(o)['error'] and '[ERREUR] SQLite error' in e and _READER_FAILED[0],o[-150:],e)
             except (ValueError,KeyError): res['RepoHistory colonne absente']=(False,o[-150:],e)
             for x in (h,h+'-wal',h+'-shm'):
                 if os.path.exists(x): os.unlink(x)
@@ -14165,6 +14203,148 @@ fail()
             if bad: print(f"  {bad}")
             return not bad
         check("lecteurs : diff.db en verrou exclusif -> réponse en quelques secondes (sonde lecteur 2 s, avant 60 s) (A84)",_reader_probe_wait)
+        def _reader_exit_code():
+            """1.0.178 (story 41, A87, décisions de l'utilisateur ; mesuré : code 0 avant) : lecteur qui rencontre une erreur SQLite
+            réelle (verrou exclusif réel tenu par un autre processus) -> code 1 et `[ERREUR]` sur stderr, texte comme -j ; multi-nicks :
+            données du nick sain gardées ; nick arrêté parmi plusieurs (_PerNick) -> 1 ; LstBkp/LstBkpFls : message, jamais de trace ;
+            Status : code inchangé (0) ; sans verrou : 0 (contrôle positif) ; dispatch en processus : jamais l'erreur d'un appel précédent."""
+            d,b=_nb_env('readcode'); rc=os.path.join(d,'rc'); res={}
+            with open(rc,'a') as f: f.write("[zs]\nDB_ENCRYPT=false\n\n")
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            p=b.db.get_diff_db('zr'); ps=b.db.get_diff_db('zs'); c=b.db.get_cache_db('zr'); h=b.db.get_history_db('zr')
+            ent=[{'change_type':'added','path':'/etc/x','size_after':5}]
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                for n,q in (('zr',p),('zs',ps)):
+                    b.db.ensure_diff_db(q,nick=n); b.db.store_diff_entries(n,'A1','A2','2026-01-02T00:00:00',ent,q)
+                    b.db.store_archive_stats(n,'A2','2026-01-02T00:00:00',1,1,1,1,1,q)
+                b.db.ensure_cache_db(c,nick='zr'); b.db.store_repo_stats('zr','bkp',1,2,3)
+            nodsn=os.path.join(d,'sentry-vide'); open(nodsn,'w').close()
+            def run(*argv):
+                saved=sys.argv[:]; o,e=io.StringIO(),io.StringIO(); r=None; _SQLITE_ERR_SEEN.clear()
+                try:
+                    sys.argv=['borgHelper','-C',rc]+list(argv)
+                    with contextlib.redirect_stdout(o),contextlib.redirect_stderr(e), \
+                         mock.patch.dict(os.environ,{'BORGHELPERC_SENTRY_FILE':nodsn}):   # revue : jamais le vrai Sentry
+                        try: _cli_main(); r=0
+                        except SystemExit as x: r=x.code
+                        except BaseException as x: r=type(x).__name__
+                finally: sys.argv=saved
+                return r,o.getvalue(),e.getvalue()
+            def hold(path):
+                hp=_rb_popen([sys.executable,'-c',"import sqlite3,sys,time\nc=sqlite3.connect(sys.argv[1],isolation_level=None)\n"
+                                     "c.execute('PRAGMA locking_mode=EXCLUSIVE'); c.execute('BEGIN EXCLUSIVE')\n"
+                                     "c.execute(\"UPDATE db_meta SET value=value WHERE key='schema_version'\")\nprint('tenu',flush=True); time.sleep(300)",path],
+                                    stdout=subprocess.PIPE,stdin=subprocess.DEVNULL,text=True)
+                return hp,hp.stdout.readline().strip()=='tenu' and _db_probe(path,0.2)[0]=='illisible'
+            mark=lambda e,q: f"[ERREUR] SQLite error ({q}): database is locked" in e and 'Traceback' not in e
+            def jerr(o,k=None):   # JSON d'erreur : {nick:{error}} ou {error}
+                try: j=json.loads(o); j=j[k] if k else j; return isinstance(j,dict) and str(j.get('error','')).startswith('SQLite error (')
+                except (ValueError,KeyError,TypeError): return False
+            r,o,e=run('-c','Search','-n','zr','-f','etc','-j')
+            res['sans verrou 0']=(r==0 and json.loads(o)['zr'][0]['path']=='etc/x',r,o[-150:],e[-150:])
+            r,o,e=run('-c','Search','-n','zb','-f','etc','-j')   # nick sans base (table absente) : jamais une erreur
+            res['sans base : 0']=(r==0 and 'SQLite error' not in o+e,r,o[-150:],e[-150:])
+            r,o,e=run('-c','IdxTop','-n','zb')
+            res['IdxTop sans base : 0']=(r==0,r,e[-150:])
+            hp,ok=hold(p); res['verrou diff.db tenu']=(ok,)
+            try:
+                for nm,argv in (('Search -j',('-c','Search','-n','zr','-f','etc','-j')),('Search texte',('-c','Search','-n','zr','-f','etc')),
+                                ('FileHist -j',('-c','FileHist','-n','zr','-f','/etc/x','-j')),('TreeHist -j',('-c','TreeHist','-n','zr','-j')),
+                                ('TreeFind -j',('-c','TreeFind','-n','zr','-f','x','-j')),('DuIdx -R -j',('-c','DuIdx','-n','zr','-R','-j')),
+                                ('IdxTop -j',('-c','IdxTop','-n','zr','-j')),('DiffTop',('-c','DiffTop','-n','zr')),
+                                ('ArchiveHistory -j',('-c','ArchiveHistory','-n','zr','-j')),('LstBkp',('-c','LstBkp','-n','zr')),
+                                ('LstBkpFls -j',('-c','LstBkpFls','-n','zr','-j'))):
+                    r,o,e=run(*argv)
+                    jok=('-j' not in argv) or jerr(o,None if nm in ('IdxTop -j','ArchiveHistory -j','LstBkpFls -j') else 'zr') or nm=='DuIdx -R -j'
+                    res[nm]=(r==1 and mark(e,p) and jok,r,o[-120:],e[-200:])
+                # revue : sans l'échec précoce de _is_index_empty, l'erreur arrive aux `except` internes des lecteurs
+                with mock.patch.object(BorgHelperDB,'_is_index_empty',lambda *a,**k: False):
+                    for nm,argv in (('interne Search -j',('-c','Search','-n','zr','-f','etc','-j')),('interne Search texte',('-c','Search','-n','zr','-f','etc')),
+                                    ('interne FileHist -j',('-c','FileHist','-n','zr','-f','/etc/x','-j')),('interne TreeHist -j',('-c','TreeHist','-n','zr','-j')),
+                                    ('interne TreeFind texte',('-c','TreeFind','-n','zr','-f','x')),('interne DuIdx texte',('-c','DuIdx','-n','zr')),
+                                    ('interne DuIdx -j',('-c','DuIdx','-n','zr','-j')),('interne DuIdx -R -j',('-c','DuIdx','-n','zr','-R','-j'))):
+                        r,o,e=run(*argv)
+                        jok=('-j' not in argv) or 'DuIdx' in nm or jerr(o,'zr')
+                        res[nm]=(r==1 and mark(e,p) and jok,r,o[-120:],e[-200:])
+                r,o,e=run('-c','Search','-n','zr,zs','-f','etc','-j')
+                try: j=json.loads(o); okm=r==1 and 'error' in j['zr'] and j['zs'][0]['path']=='etc/x' and mark(e,p)
+                except (ValueError,KeyError,IndexError,TypeError): okm=False
+                res['Search multi : zs gardé']=(okm,r,o[-200:],e[-200:])
+                r,o,e=run('-c','IdxTop','-n','zr,zs')
+                res['IdxTop multi texte']=(r==1 and mark(e,p),r,e[-200:])
+                r,o,e=run('-c','Status','-n','zr')
+                res['Status inchangé (0)']=(r==0,r,e[-150:])
+            finally: _rb_killtree(hp)
+            r,o,e=run('-c','Search','-n','zs','-f','etc','-j')
+            res['appel suivant 0']=(r==0,r,e[-150:])
+            hp,ok=hold(c); res['verrou cache.db tenu']=(ok,)
+            try: r,o,e=run('-c','CacheInfo','-n','zr'); res['CacheInfo']=(r==1 and mark(e,c) and 'Cache vide' not in o,r,o[-80:],e[-200:])
+            finally: _rb_killtree(hp)
+            def gcr(self,n):
+                if n=='zr': raise DbKeyError('clé')
+                return [('zs','2026-01-01',10)]
+            with mock.patch.object(BorgHelperDB,'get_cache_rows',gcr): r,o,e=run('-c','CacheInfo','-n','zr,zs')
+            res['CacheInfo multi : zs gardé']=(r==1 and 'zs' in o and '[ERREUR] DbKeyError' in e,r,o[-150:],e[-150:])
+            # chemin illisible (DbCodecError) : _codec_fail -> code 1, erreur du nick en JSON
+            def dec(conn,v): raise DbCodecError('valeur illisible')
+            with mock.patch(f"{__name__}._path_decode",dec): r,o,e=run('-c','Search','-n','zr','-f','etc','-j')
+            try: cj=json.loads(o)['zr']['error'].startswith('zr: chemin stocké illisible')
+            except (ValueError,KeyError,TypeError,AttributeError): cj=False
+            res['chemin illisible']=(r==1 and cj,r,o[-150:],e[-150:])
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                b.db.store_archive_measure('zr','A2','2026-01-02T00:00:00',10,0,0,db_path=h)
+            hp,ok=hold(h); res['verrou history.db tenu']=(ok,)
+            try:
+                r,o,e=run('-c','RepoHistory','-n','zr','-j'); res['RepoHistory -j']=(r==1 and mark(e,h) and jerr(o),r,o[-120:],e[-200:])
+                r,o,e=run('-c','ArchiveHistory','-n','zr','-j')   # cas partiel réel : lignes servies, mesures absentes
+                try: rows=json.loads(o).get('rows') or []
+                except ValueError: rows=[]
+                res['ArchiveHistory -j partiel']=(r==1 and mark(e,h) and len(rows)==1,r,o[-150:],e[-200:])
+            finally: _rb_killtree(hp)
+            # base corrompue : page racine d'archive_stats écrasée (en-tête et db_meta intacts — une troncature donne DbTamperError,
+            # code 2 par le gestionnaire global) -> LstBkp/LstBkpFls : message marqué + 1, jamais de trace
+            cn=sqlite3.connect(p); cn.execute("PRAGMA wal_checkpoint(TRUNCATE)"); pg=cn.execute("PRAGMA page_size").fetchone()[0]
+            rps=[x[0] for x in cn.execute("SELECT rootpage FROM sqlite_master WHERE tbl_name='archive_stats' AND rootpage>0")]; cn.close()
+            with open(p,'r+b') as f:   # table ET index (un index couvrant servait la requête sans lire la table)
+                for rp in rps: f.seek(pg*(rp-1)); f.write(b'\xff'*pg)
+            try: sqlite3.connect(p).execute("SELECT archive,archive_date FROM archive_stats WHERE nick='zr' ORDER BY archive_date,archive").fetchall(); vu=False
+            except sqlite3.DatabaseError: vu=True
+            res['archive_stats illisible']=(vu,)
+            for nm,argv in (('LstBkp corrompue',('-c','LstBkp','-n','zr')),('LstBkpFls corrompue',('-c','LstBkpFls','-n','zr','-j'))):
+                r,o,e=run(*argv)
+                res[nm]=(r==1 and '[ERREUR] SQLite error' in e and 'Traceback' not in e,r,o[-120:],e[-200:])
+            def stop(self,n,*a,**k):
+                if n=='zr': raise DbKeyError('clé')
+                print('zs ok')
+            with mock.patch.object(BorgHelper,'idxtop',stop): r,o,e=run('-c','IdxTop','-n','zr,zs')
+            res['nick arrêté parmi plusieurs']=(r==1 and 'zs ok' in o and '[ERREUR] DbKeyError' in e,r,o[-100:],e[-150:])
+            with mock.patch.object(BorgHelper,'idxtop',stop): r,o,e=run('-c','IdxTop','-n','zr')
+            res['nick seul : relancé tel quel']=(r=='DbKeyError',r)   # main : code 2 (gestionnaire global)
+            _READER_FAILED[0]=True; o2=io.StringIO()   # appel en processus après une erreur : « Cache vide. » dit, drapeau gardé
+            with contextlib.redirect_stdout(o2),contextlib.redirect_stderr(io.StringIO()): b.cache_info('zb')
+            res['CacheInfo : erreur d\'un appel précédent ignorée']=('Cache vide.' in o2.getvalue() and _READER_FAILED[0],o2.getvalue())
+            _READER_FAILED[0]=False
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("lecteurs : erreur SQLite réelle ou nick arrêté -> code 1 et [ERREUR], texte et -j, données des autres nicks gardées (A87)",_reader_exit_code)
+        def _filter_exact():
+            """1.0.178 (story 41, A88) : -f '=nom' -> ce nom exact, casse respectée, sans échappement (dispatch réel, -l) ; -f regex
+            inchangé (insensible à la casse) ; « = » seul refusé (code 2)."""
+            nodsn=os.path.join(tmp,'sentry-vide-fx'); open(nodsn,'w').close()
+            env=dict(os.environ,BORGHELPERC_SENTRY_FILE=nodsn,TMPDIR=tmp); env.pop('BORGHELPERC_SENTRY_DSN',None)
+            def run(*argv):   # revue : sous-processus (comme _selftest_filter) — jamais un codec_selftest imbriqué dans ce run
+                r=subprocess.run([sys.executable,os.path.realpath(__file__),'-c','CodecSelfTest','-l']+list(argv),capture_output=True,
+                                 text=True,env=env,timeout=300,stdin=subprocess.DEVNULL)
+                return r.returncode,[l[5:] for l in r.stdout.splitlines() if l.startswith('LIST ')]
+            nm="HMAC-SHA256 (RFC 4231 cas 1)"
+            r1,l1=run('-f','='+nm); r2,l2=run('-f','='+nm.upper()); r3,l3=run('-f','hmac-sha256 \\(rfc'); r4,_=run('-f','=')
+            # le cas d'A88 : noms qui ne diffèrent que par la casse (le filtre regex sans casse les prend tous)
+            ce="parité TreeHist 'Etc' -b None"; r5,l5=run('-f','='+ce); r6,l6=run('-f',"parité TreeHist 'etc' -b None")
+            ok=(r1==0 and l1==[nm] and r2==2 and l2==[] and r3==0 and nm in l3 and r4==2 and r5==0 and l5==[ce] and len(l6)==3)
+            if not ok: print(f"  {(r1,l1,r2,l2,r3,len(l3),r4,r5,l5,len(l6))}")
+            return ok
+        check("CodecSelfTest -f '=nom' : nom exact, casse respectée ; -f regex inchangé (A88)",_filter_exact)
         def _rb_errmsg_warning():
             """1.0.177 (story 40, A81) : _rb_errmsg — --log-json sans ERROR ni texte : ses WARNING plutôt que « failed (code N) » ;
             ERROR présent : ERROR seul (inchangé) ; rien : « failed (code N) » (inchangé)."""
@@ -17890,6 +18070,7 @@ def sentry_alert(kind,nick,message,cfg,extra=None,release=None):
         return False
 
 def _cli_main():
+    _READER_FAILED[0]=False   # 1.0.178 (A87) : appel en processus (selftest) : jamais l'erreur d'un appel précédent
     sentryid=_sentry_dsn()
     if sentryid is not None:
         _sentry_init(sentryid)
@@ -17920,6 +18101,10 @@ def _cli_main():
         for opt,arg in opts:
             if opt=='-f':
                 if not arg.strip(): print("CodecSelfTest : motif vide refusé (il sélectionnerait tout : lancer sans -f)"); sys.exit(2)
+                # 1.0.178 (story 41, A88) : « =nom » = ce nom exact, casse respectée, sans échappement (un contrôle seul)
+                if arg.startswith('='):
+                    if not arg[1:]: print("CodecSelfTest : nom vide refusé après « = »"); sys.exit(2)
+                    _st_pat=re.compile('^'+re.escape(arg[1:])+'$'); continue
                 try: _st_pat=re.compile(arg,re.IGNORECASE)
                 except re.error as e: print(f"CodecSelfTest : motif invalide {arg!r} ({e})"); sys.exit(2)
             elif opt=='-l': _st_list=True
@@ -18215,6 +18400,9 @@ def _cli_main():
         sys.exit(bh.borg_cleanup(confirm='-y' in options and '-D' not in options,keys='--keys' in options,history='--history' in options))
     else:
         printer("Mais comment on peut en arriver la ?"); usage()
+    # 1.0.178 (story 41, A87, décisions de l'utilisateur) : lecteur qui a rencontré une erreur (SQLite réelle, nick arrêté parmi
+    # plusieurs, chemin illisible) -> code 1 ; ses données (autres nicks, lignes partielles) restent affichées. Avant : code 0.
+    if cmd in _READER_CODE_CMDS and _READER_FAILED[0]: sys.exit(1)
 
 
 if __name__=='__main__':

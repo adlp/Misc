@@ -142,7 +142,11 @@ dont la base est inutilisable (`DbKeyError`, `DbModeError`, `DbTamperError`, `Db
 `SystemExit` d'une base illisible) ne lève plus : `{nick: {'error': message}}` avec `as_json=True` (search, filehist,
 treehist, treefind), ligne `[ERREUR]` sur stderr sinon ; `duidx` rend les totaux des autres nicks (aucune entrée
 d'erreur). Nick seul ou tous en échec : la première exception est levée comme avant ; `SystemExit(130)` (Ctrl-C)
-toujours relevée.
+toujours relevée. 1.0.178 : le code 1 de la CLI après une erreur rencontrée (SQLite, nick isolé, chemin illisible) est posé
+par le dispatch (`_READER_FAILED`), jamais par ces méthodes — un appelant Python lit le JSON (`error`) ou stderr. Exception :
+`list_backups`/`list_files` sur une base verrouillée ou dont une page de données est illisible -> `[ERREUR] SQLite error …` et
+`SystemExit(1)` (avant : `sqlite3.Error` levée) ; en-tête altéré : `DbTamperError` levée (inchangé). `cache_info` à plusieurs
+nicks : un nick arrêté n'arrête plus les autres (comme `search`).
 
 ---
 

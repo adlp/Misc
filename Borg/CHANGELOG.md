@@ -1,5 +1,43 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.178 / borgHelperWWW 1.31.0 / UI 1.23.0 — HTTP/1.0 détecté, durée de borg bornée dans /download, code 1 des lecteurs en erreur, filtre -f exact — 2026-10-02
+
+Chantier « reconstruction progressive », story 41 (actions de rétrospective A85 à A88 ; regroupement demandé par l'utilisateur).
+
+- **Lecteurs en erreur : code 1** (décisions de l'utilisateur ; mesuré : code 0 même quand tous les nicks échouent). Search,
+  FileHist, TreeHist, TreeFind, DuIdx, IdxTop, DiffTop, ArchiveHistory, RepoHistory, CacheInfo, LstBkp, LstBkpFls sortent en 1
+  après une erreur SQLite réelle (base verrouillée au-delà du délai, page de données illisible), un nick arrêté parmi plusieurs
+  (base occupée, passphrase absente…, décision de l'utilisateur ; avant : 0) ou un chemin illisible ; données des autres nicks
+  gardées (CacheInfo isolé par nick comme les autres). En-tête de base altéré : `DbTamperError`, code 2 (inchangé) ; LstBkpFls
+  sur un chemin illisible : 3 (inchangé). `[ERREUR] SQLite error` toujours sur stderr,
+  `-j` compris (avant : JSON seul ; sept chemins d'erreur l'imprimaient sans marque). LstBkp/LstBkpFls : message au lieu d'une
+  trace Python envoyée à Sentry. borgHelperWWW : `400` avec le JSON (inchangé) ; UI : l'explorateur montre l'erreur du nick, les
+  graphiques restent dessinés avec « Données partielles : <erreur> » dessous ; CacheInfo n'affiche plus « Cache vide. » après une
+  erreur. Status, Report, Bkp, Index, Prune, Restore, DiffBkp : codes inchangés.
+- **`/download/*` : inactivité bornée** (décision de l'utilisateur : `BORGHELPERWWW_TIMEOUT`, 3600 s ; mesuré : borg muet
+  bloquait un fil sans fin, client parti avant le premier octet = borg orphelin) : aucun octet lu pendant TIMEOUT s -> borg
+  arrêté, `502` « aucune activité depuis N s » ou flux coupé. **borg arrêté par groupe de processus** (revue, mesuré : le vrai
+  borg est un exécutable PyInstaller lancé par `exec nice …` — tuer le seul PID de tête laissait l'enfant vivant, tube ouvert ;
+  touchait aussi l'abandon par le client de 1.30.2) ; dossiers `/tmp/_MEI*` du borg tué retirés. **Arrêt du serveur** (décision
+  de l'utilisateur) : au premier signal, borg sans octet lu depuis 10 s arrêtés, puis tout borg qui le devient ; téléchargements
+  sains servis jusqu'au bout ; second signal : tous (mesuré avant : uvicorn attendait sans limite, borg survivait au SIGKILL).
+  `BORGHELPERWWW_TIMEOUT` négatif refusé au démarrage ; démarrage en échec (port pris) : code 3.
+- **HTTP/1.0 détecté** (note de l'utilisateur, décision : signaler) : `[WARN]` au journal une fois par processus (chemin et
+  client ; `/healthz` ignoré), `http_version` dans `/version` et `/access` (vu sous le préfixe d'API, comme `/download/*`), badge
+  UI « ⚠ Proxy en HTTP/1.0 : téléchargement tronqué non détectable — proxy_http_version 1.1 ». Mesuré sur uvicorn direct (nginx
+  absent du poste de test).
+- **CodecSelfTest `-f '=<nom>'`** : nom exact, casse respectée, sans échappement (le filtre regex, insensible à la casse, ne
+  pouvait pas isoler 10 contrôles) ; `-f` regex inchangé.
+- Tests : CodecSelfTest — verrou exclusif réel (diff.db : Search texte/-j/multi, FileHist, TreeHist, TreeFind, DuIdx -R, IdxTop
+  -j/multi, DiffTop, ArchiveHistory, LstBkp, LstBkpFls ; les `except` internes de Search/FileHist/TreeHist/TreeFind/DuIdx ;
+  cache.db : CacheInfo ; history.db : RepoHistory, ArchiveHistory partielle), page corrompue (LstBkp, LstBkpFls), chemin
+  illisible, nick isolé (IdxTop, CacheInfo), nick sans base et Status : 0 ; les 13 contrôles multi-nicks de la story 30 passent
+  à « code 1 » ; `-f '=nom'` (noms qui ne diffèrent que par la casse). push_selftest — chien de garde (groupe tué derrière un
+  script sans exec, corps jamais lu, registre vidé, lent mais actif après le 1er bloc, corps plus lu), arrêt (`handle_exit` :
+  inactifs puis tous), `/version` complète, `/access` `http_version`. Test UI — graphiques en code 1, explorateur
+  (`_readerJson`), badge HTTP/1.0 par `/version` et `/access`. Mutations : 43, toutes détectées. CodecSelfTest 573/573,
+  push_selftest 121/121.
+
 ## borgHelper 1.0.177 / borgHelperWWW 1.30.2 / UI 1.22.1 — /download avec le code de borg, index_last aligné, lecteurs sans attente de 60 s — 2026-10-02
 
 Chantier « reconstruction progressive », story 40 (actions de rétrospective A81 à A84 ; regroupement demandé par l'utilisateur).

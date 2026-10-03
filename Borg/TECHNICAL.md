@@ -1967,7 +1967,8 @@ mtimes stables, mesuré). Cache par périmètre : `_capture_fingerprints(nick, '
 `_CACHE_TTL` dans `_scope_cache_get`. `_never_cache(result)` = `_is_db_key_error`, `[ERREUR]` sur stderr ou « SQLite error »
 (stdout/stderr) — seul prédicat des trois écritures (`run_borghelper`, `_scoped_cached_mono`, `_scoped_cached_multi`) ;
 `[ERREUR]` = arrêt d'un nick (`_nick_stop_msg`, `_db_schema_fail`, « Index vide » texte) : sur-approximation voulue, comme
-AD-13. Restent muets (code 0, aucun marqueur) : `get_cache_rows` (CacheInfo) et les mesures de Report -o sur erreur SQLite.
+AD-13. Reste muet (code 0, aucun marqueur) : les mesures de Report -o sur erreur SQLite (`get_cache_rows`/CacheInfo : marqué,
+code 1 depuis 1.0.178).
 
 `POST /restore` (A68) : `_restore_where(where)` en tête de la route (après `require_api_key`, avant le périmètre et tout
 sous-processus) — `RESTORE_ROOT` (realpath au démarrage) absent ou pas un dossier -> 403 ; `realpath(join(racine, where))`
@@ -2320,6 +2321,34 @@ response ») — une exception dans le corps ne suffit pas, BaseHTTPMiddleware (
 chemins lecteur à `_READER_WRITE_WAIT` : `_db_has_schema(path, timeout=60)` (écrivains : 60 s), `ensure_cache_db`/`ensure_diff_db`
 /`ensure_history_db` en `create=False`, purge du cache de Report, sondes de RepoHistory/ArchiveHistory/Status (mesuré : 60,3 s ->
 2-4 s sous `locking_mode=EXCLUSIVE`). `_rb_errmsg` : CRITICAL lu comme ERROR ; échec (code ≥ 2) sans ERROR ni texte -> « <cmd> failed (code N) — avertissement de borg : <WARNING> » (le code toujours ; code 0/1 inchangé).
+**Code des lecteurs, téléchargements bornés, HTTP/1.0, filtre exact (1.0.178 / WWW 1.31.0 / UI 1.23.0, story 41)** :
+`_READER_FAILED` (drapeau de processus, remis à faux par `_cli_main`) posé par `_reader_sqlite_err`/`_reader_sqlite_line` (vraie
+erreur, marque dite ou non), `_is_index_empty` (vraie erreur), `_codec_fail` et `_PerNick.__exit__` (nick isolé) ; fin du
+dispatch : commande de `_READER_CODE_CMDS` (liste explicite : search, filehist, treehist, treefind, duidx, idxtop, difftop,
+archivehistory, repohistory, cacheinfo, lstbkp, lstbkpfls — jamais `_CMD_OPS`, qui range tout le reste en « read ») et drapeau
+posé -> `sys.exit(1)` ; une sortie antérieure (`sys.exit`, `usage`) garde son code. Sites passés à l'enregistreur : les trois
+collecteurs de DuIdx et `get_cache_rows` (`_reader_sqlite_line`), Search/FileHist/TreeHist/TreeFind (`-j` : `_reader_sqlite_err`
++ JSON ; texte : `_reader_sqlite_line` ; index illisible en `-j` : `[ERREUR]` aussi sur stderr), LstBkp/LstBkpFls (`_open_db`
+et requêtes : `_reader_sqlite_line`, `sys.exit(1)`, `-j` `{'error'}`), RepoHistory « no such column » (marquée), `cache_info`
+(boucle sous `_PerNick` ; « Cache vide. » seulement sans erreur). borgHelperWWW `_borg_stream` : borg en session propre
+(`start_new_session`) et arrêté par `_borg_killgrp` (`os.killpg`, SIGKILL) — le borg PyInstaller (`exec nice borg.wrapped`)
+a un enfant que tuer le PID de tête laissait vivre, tube ouvert (mesuré) ; `_borg_reap` (seulement si borghelperwww l'a tué :
+`st['why']`) retire les `_MEI*` apparus depuis son lancement et inutilisés (`_mei_dirs`/`_mei_in_use` de borgHelper). Registre
+`_LIVE_BORG` {Popen: état `last`/`why`/`mei`/`reading`}. Lectures par `read1` (`_rd`, chaque lecture — EOF compris — repousse
+`last`). Chien de garde par téléchargement, actif jusqu'au retrait du registre : borg vivant sans octet pendant TIMEOUT s (après
+un arrêt demandé, `_STOPPING` : `_STOP_IDLE`=10 s) -> groupe tué, `[ERREUR]` si vraiment tué par lui ; borg fini mais corps
+jamais lu -> au même délai (3600 s si TIMEOUT=0) tubes fermés et entrée retirée (`reading` : jamais pendant une lecture). Cause :
+code < 0 et `why` 'idle' -> « aucune activité depuis N s », 'stop' -> « arrêt du serveur » ; corps : pas de seconde ligne
+`[ERREUR]` après celle du chien de garde. `_kill_live_borg(idle_only)` : `_make_server(config)` (sous-classe d'`uvicorn.Server`,
+exécution directe) l'appelle à chaque signal — premier : `idle_only` (et `_STOPPING`), second (`should_exit` déjà vrai) : tous ;
+l'événement shutdown, `atexit` et `threading._register_atexit` (avant la jonction des fils non démons d'anyio bloqués dans
+`read1`) : tous. `_srv.started` faux -> code 3. TIMEOUT < 0 refusé au démarrage. `_note_http10(request)` dans le middleware :
+premier `scope['http_version']=='1.0'` hors `/healthz` -> `[WARN]` avec chemin et client (`_HTTP10_WARNED`) ; `http_version` dans
+`/version` et `/access`. UI : `_readerJson(r)` (code 0, ou code 1 avec sortie) pour l'explorateur (`/treehist`, `/treefind`) ;
+`_parseHistoryResponse` accepte le code 1 avec JSON (`error`, ou `rows` + `partial` = `_errLine(stderr)` ; aucune ligne ->
+erreur), `loadCharts` écrit « Données partielles : … » sous un graphique dessiné ; `http10` depuis `/access` (`loadMyAccess`),
+sinon `/version`.
+CodecSelfTest : `-f '=<nom>'` -> `re.compile('^'+re.escape(nom)+'$')`, sans `IGNORECASE`.
 **Ensure sans création (1.0.172, story 35, A61)** : `_open_db(…, create_file=None)` — `None` : le rôle décide (`read` jamais,
 `write`/`admin` `O_CREAT` 0600) ; `False` : `write`/`admin` en `mode=rw`, fichier absent -> `sqlite3.OperationalError`.
 `ensure_*_db(create=False)` l'utilise après sa sonde : supprimée entre les deux -> `_file_gone` -> retour (base absente) ;

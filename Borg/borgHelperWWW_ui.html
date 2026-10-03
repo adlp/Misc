@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.22.1 -->
+<!-- UI_VERSION: 1.23.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -97,6 +97,7 @@
   <div>
     <span class="badge ok" id="destructiveBadge" hidden style="margin-right:8px" title="Prune/DelBkp désactivés sur ce serveur (BORGHELPERWWW_ALLOW_DESTRUCTIVE)">🔒 Destructions désactivées</span>
     <span class="badge warn" id="downloadsBadge" hidden style="margin-right:8px" title="/download/file et /download/tar désactivés sur ce serveur (BORGHELPERWWW_ALLOW_DOWNLOADS)">🚫 Téléchargements désactivés</span>
+    <span class="badge warn" id="http10Badge" hidden style="margin-right:8px" title="Requête reçue en HTTP/1.0 (proxy nginx sans « proxy_http_version 1.1; ») : un téléchargement interrompu par borg y passe pour complet — ajouter proxy_http_version 1.1; et proxy_set_header Connection &quot;&quot;; dans le location de borgHelperWWW">⚠ Proxy en HTTP/1.0 : téléchargement tronqué non détectable — proxy_http_version 1.1</span>
     <span class="badge err" id="fullAccessBadge" hidden style="margin-right:8px" title="Aucune restriction sur ce serveur : Prune/DelBkp et téléchargements sont tous les deux autorisés">⚠️ Tout autorisé</span>
     <button class="secondary" id="notifBtn" hidden onclick="openNotifications()" title="Notifications du navigateur au début/à la fin des sauvegardes">🔔 Notifications</button>
     <button class="secondary" id="serversBtn" hidden onclick="showMachines()">Serveurs</button>
@@ -360,6 +361,7 @@ let currentNick=null;
 let currentActionId=null;
 let allowDestructive=true; // état réel connu après résolution de loadFooterVersions() ci-dessous
 let allowDownloads=true;
+let http10=false; // UI 1.23.0 (A85) : /access (sinon /version) reçu en HTTP/1.0 (proxy) -> badge : un téléchargement coupé y passe pour complet
 let restoreEnabled=true; // UI 1.21.0 (A68) : racine de restauration configurée (/version restore_enabled) — sinon « Restaurer » masqué
 let API_PREFIX='/api'; // idem — appris depuis /version (seule route jamais préfixée, avec / et /healthz)
 let myAccess=null; // {groups_auth_enabled, nicks:{nick:{level:'none'|'read'|'write'|'admin',read_scope:null|string[],restore_scope:null|string[]}}} — appris via /access, après connexion
@@ -378,6 +380,7 @@ function applyBadges(){
   const allAdmin=myAccess?(levels.length>0&&levels.every(l=>l==='admin')):true;
   document.getElementById('destructiveBadge').hidden = allowDestructive && (myAccess?userMax>=3:true);
   document.getElementById('downloadsBadge').hidden = allowDownloads && hasAnyAccess;
+  document.getElementById('http10Badge').hidden = !(http10 && allowDownloads && hasAnyAccess);
   document.getElementById('fullAccessBadge').hidden = !(allowDestructive && allowDownloads && allAdmin);
   document.getElementById('historyPruneBtn').hidden = !(allowDestructive && (myAccess?userMax>=3:true)
     && (currentViewId!=='view-history' || opAllowed(currentNick,'prune')));
@@ -445,6 +448,7 @@ const versionsReady=(async function loadFooterVersions(){
     if(typeof v.api_prefix==='string') API_PREFIX=v.api_prefix;
     allowDestructive=!!v.allow_destructive;
     allowDownloads=!!v.allow_downloads;
+    http10=v.http_version==='1.0';
     restoreEnabled=!!v.restore_enabled;
     pushInfo={available:!!(v.push_available&&v.vapid_public_key),suspended:!!v.push_suspended,vapidKey:v.vapid_public_key||null,
               defaultDays:v.push_default_expiry_days||30,maxDays:v.push_max_expiry_days||3650};
@@ -469,6 +473,7 @@ async function loadMyAccess(){
   }
   if(r.exitcode!==undefined || !r.nicks) return null; // forme inattendue : ne pas casser l'affichage
   myAccess=r;
+  if(typeof r.http_version==='string') http10=r.http_version==='1.0'; // UI 1.23.0 (A85) : vu sous le préfixe d'API, comme /download/*
   applyBadges();
   renderCleanupNotice();
   return r;
@@ -941,6 +946,15 @@ async function loadCharts(nick){
   _safeRender(()=>_renderRepoSizeAndPruneGainCharts(repoR),['chartRepoSize','chartPruneGain']);
   _safeRender(()=>_renderArchiveSizeChart(archR),['chartArchiveSize']);
   ARCHIVE_EXTRA_CHARTS.forEach(id=>_safeRender(()=>_renderArchiveExtraChart(id,archR),[id]));
+  // UI 1.23.0 (A87) : lignes servies malgré une erreur (code 1, ex. history.db illisible : mesures absentes) -> graphique dessiné
+  // ET l'erreur dite dessous — jamais présenté comme complet.
+  [[repoR,['chartRepoSize','chartPruneGain']],[archR,['chartArchiveSize',...ARCHIVE_EXTRA_CHARTS]]].forEach(([r,ids])=>{
+    const p=_parseHistoryResponse(r);
+    if(p.partial) ids.forEach(id=>{
+      if(document.getElementById(id).hidden) return;
+      const m=document.getElementById(id+'Msg'); m.textContent='Données partielles : '+p.partial; m.className='error'; m.hidden=false;
+    });
+  });
 }
 
 function _safeRender(fn,ids){
@@ -954,17 +968,34 @@ function _safeRender(fn,ids){
   });
 }
 
+function _readerJson(r){
+  // UI 1.23.0 (A87) : réponse d'un lecteur à lire en JSON — code 0, ou code 1 (erreur rencontrée : base illisible, nick arrêté)
+  // avec une sortie : l'erreur du nick est dans le JSON ({nick:{error}}) ; sinon : afficher stderr.
+  return r.exitcode===0 || (r.exitcode===1 && !!r.stdout);
+}
+
+function _errLine(stderr){
+  // Première ligne [ERREUR] de stderr, sans la marque ni la version de borgHelper.
+  const l=(stderr||'').split('\n').find(x=>x.includes('[ERREUR]'));
+  return l?l.replace('[ERREUR]','').replace(/\s*\[borgHelper v[^\]]*\]\s*$/,'').trim():'';
+}
+
 function _parseHistoryResponse(r){
   // Renvoie {rows} ou {error} — jamais parsed[nick] (forme différente de /report, voir Boundaries).
   if(r.httpStatus===401) return {error:null}; // apiCall a déjà géré logout(), rien de plus à afficher ici
-  if(r.exitcode===undefined || r.exitcode!==0 || r.httpStatus>=500 || (!r.stdout && r.stderr)){
+  // UI 1.23.0 (A87) : code 1 = erreur rencontrée (base illisible) avec une réponse JSON : son `error`, ou ses lignes + `partial`
+  if(r.exitcode===undefined || (r.exitcode!==0 && r.exitcode!==1) || r.httpStatus>=500 || (!r.stdout && r.stderr)){
     return {error:r.stderr||('HTTP '+r.httpStatus)};
   }
   let parsed;
   try{ parsed=JSON.parse(r.stdout); }
-  catch(e){ return {error:'Réponse illisible : '+r.stdout.slice(0,200)}; }
+  catch(e){ return {error:(r.exitcode!==0&&r.stderr)||('Réponse illisible : '+r.stdout.slice(0,200))}; }
   if(parsed.error) return {error:parsed.error};
   if(!Array.isArray(parsed.rows)) return {error:'Réponse inattendue (pas de champ rows).'};
+  if(r.exitcode===1){   // aucune ligne : l'erreur seule (jamais « aucune statistique ») ; sinon lignes + erreur dite dessous
+    const m=_errLine(r.stderr)||r.stderr||'erreur de lecture';
+    return parsed.rows.length?{rows:parsed.rows,partial:m}:{error:m};
+  }
   return {rows:parsed.rows};
 }
 
@@ -1505,13 +1536,13 @@ async function loadBrowse(){
   const r=await apiCall('GET','/treehist',params,false);
   if(seq!==browseLoadSeq) return; // une navigation plus récente a eu lieu entre-temps : on ignore
   if(r.httpStatus===401) return;
-  if(r.exitcode!==0){
+  if(!_readerJson(r)){
     document.getElementById('browseError').textContent=r.stderr||('exitcode '+r.exitcode);
     document.getElementById('browseBody').innerHTML=''; return;
   }
   let parsed;
   try{ parsed=JSON.parse(r.stdout); }
-  catch(e){ document.getElementById('browseError').textContent='Réponse illisible : '+r.stdout.slice(0,200); return; }
+  catch(e){ document.getElementById('browseError').textContent=(r.exitcode!==0&&r.stderr)||('Réponse illisible : '+r.stdout.slice(0,200)); return; }
   const data=parsed[reqNick];
   if(!data || data.error){
     document.getElementById('browseError').textContent=(data&&data.error)||'Aucune donnée';
@@ -1571,10 +1602,10 @@ async function runBrowseSearch(){
   results.hidden=false; results.innerHTML=SPINNER;
   const r=await apiCall('GET','/treefind',{nick:browseNick,prefix:browsePath,pattern,json:'true'},false);
   if(r.httpStatus===401) return;
-  if(r.exitcode!==0){ err.textContent=r.stderr||('exitcode '+r.exitcode); results.innerHTML=''; return; }
+  if(!_readerJson(r)){ err.textContent=r.stderr||('exitcode '+r.exitcode); results.innerHTML=''; return; }
   let parsed;
   try{ parsed=JSON.parse(r.stdout); }
-  catch(e){ err.textContent='Réponse illisible : '+r.stdout.slice(0,200); results.innerHTML=''; return; }
+  catch(e){ err.textContent=(r.exitcode!==0&&r.stderr)||('Réponse illisible : '+r.stdout.slice(0,200)); results.innerHTML=''; return; }
   const data=parsed[browseNick];
   if(!data || data.error){ err.textContent=(data&&data.error)||'Aucune donnée'; results.innerHTML=''; return; }
   const matches=data.matches||[];

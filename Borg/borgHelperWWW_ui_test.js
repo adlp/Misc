@@ -366,6 +366,7 @@ ${grab('_showChartMsg')}
 ${grab('_hideChartMsg')}
 async ${grab('loadCharts')}
 ${grab('_safeRender')}
+${grab('_errLine')}
 ${grab('_parseHistoryResponse')}
 ${grab('_renderRepoSizeAndPruneGainCharts')}
 ${grab('_fadeFor')}
@@ -456,6 +457,22 @@ ${grab('_renderArchiveExtraChart')}
   eq('échec partiel : graphiques du dépôt dessinés, erreur sur ceux des archives',
      [e6,built.map(b=>b.id).sort(),['chartArchiveSize',...charts.extra].map(id=>cdom.byId(id+'Msg').className==='error'
        && !cdom.byId(id+'Msg').hidden)],[null,['chartPruneGain','chartRepoSize'],[true,true,true]]);
+  // UI 1.23.0 (A87) : code 1 avec des lignes (history.db illisible) -> graphiques dessinés ET erreur dite dessous ; code 1 sans
+  // ligne -> l'erreur seule (jamais « aucune statistique »).
+  const part={exitcode:1,httpStatus:400,stdout:JSON.stringify({rows:archRows(1)}),
+              stderr:'[ERREUR] SQLite error (h.db): database is locked  [borgHelper v1.0.178]\n'};
+  resp={'/repohistory':ok(repoRows),'/archivehistory':part}; built.length=0;
+  const e8=await tryLoad();
+  const archIds=['chartArchiveSize',...charts.extra];
+  eq('code 1 avec lignes : cinq graphiques dessinés, « Données partielles : <erreur> » sous ceux des archives seulement',
+     [e8,built.length,archIds.map(id=>!cdom.byId(id).hidden && !cdom.byId(id+'Msg').hidden && cdom.byId(id+'Msg').className==='error'
+       && cdom.byId(id+'Msg').textContent==='Données partielles : SQLite error (h.db): database is locked'),
+      ['chartRepoSize','chartPruneGain'].map(id=>cdom.byId(id+'Msg').hidden)],[null,5,archIds.map(()=>true),[true,true]]);
+  resp={'/repohistory':ok(repoRows),'/archivehistory':{...part,stdout:'{"rows":[]}'}}; built.length=0;
+  const e9=await tryLoad();
+  eq('code 1 sans ligne : erreur sur les graphiques des archives, jamais « aucune statistique »',
+     [e9,archIds.map(id=>cdom.byId(id+'Msg').className==='error' && cdom.byId(id+'Msg').textContent==='SQLite error (h.db): database is locked')],
+     [null,archIds.map(()=>true)]);
   // Reprise après une erreur : les messages d'erreur disparaissent, les cinq canvas sont réaffichés.
   resp={'/repohistory':ok(repoRows),'/archivehistory':ok(archRows(1))}; built.length=0;
   const e7=await tryLoad();
@@ -467,6 +484,36 @@ ${grab('_renderArchiveExtraChart')}
   eq('bibliothèque de graphiques absente : message sur les cinq, rien construit, sans exception',
      [e4,built.length,allIds.map(id=>{ const m=cdom.byId(id+'Msg'); return !m.hidden && m.className==='error' && cdom.byId(id).hidden
        && m.textContent.startsWith('Bibliothèque de graphiques indisponible'); }),spinners()],[null,0,allIds.map(()=>true),[]]);
+  // UI 1.23.0 (A87) : explorateur (/treehist, /treefind) — code 1 avec JSON lu (erreur du nick), code 1 sans sortie ou >= 2 : stderr
+  {
+    const rj=new Function(grab('_readerJson')+'\nreturn _readerJson;')();
+    eq('explorateur : réponse lue en JSON en code 0 et en code 1 avec sortie seulement',
+       [rj({exitcode:0,stdout:''}),rj({exitcode:1,stdout:'{"n":{"error":"SQLite error"}}'}),rj({exitcode:1,stdout:''}),rj({exitcode:2,stdout:'{}'}),rj({httpStatus:403})],
+       [true,true,false,false,false]);
+    eq('explorateur : les deux appels passent par _readerJson',(src.match(/if\(!_readerJson\(r\)\)/g)||[]).length,2);
+  }
+  // UI 1.23.0 (A85) : /version http_version « 1.0 » (proxy en HTTP/1.0) -> badge, seulement si les téléchargements sont permis.
+  {
+    const bd={els:{},byId(id){ return this.els[id]||(this.els[id]={hidden:false,textContent:''}); }};
+    const b=new Function('bd','hooks',`
+      const document={getElementById:id=>bd.byId(id)};
+      let myAccess=null, currentViewId='', currentNick=null, allowDestructive=false, allowDownloads=true, restoreEnabled=true, API_PREFIX='/api', pushInfo=null;
+      let http10=false;
+      const fetch=async()=>({ok:true,json:async()=>hooks.v}), updateNotifBtn=()=>{}, opAllowed=()=>true;
+      ${grabLine('LEVEL_RANK')}
+${grab('applyBadges')}
+async ${grab('loadFooterVersions')}
+      return {loadFooterVersions,setAccess:a=>{ myAccess=a; }};`);
+    const hooks={v:null}; const pg=b(bd,hooks); const seen=[];
+    for(const [hv,dl] of [['1.0',true],['1.1',true],['1.0',false],[undefined,true]]){
+      hooks.v={borghelperwww_version:'x',allow_downloads:dl,http_version:hv}; await pg.loadFooterVersions();
+      seen.push(bd.byId('http10Badge').hidden);
+    }
+    pg.setAccess({nicks:{n:{level:'none'}}}); hooks.v={borghelperwww_version:'x',allow_downloads:true,http_version:'1.0'}; await pg.loadFooterVersions();
+    seen.push(bd.byId('http10Badge').hidden);
+    eq('badge HTTP/1.0 : visible seulement en 1.0 avec téléchargements permis et un accès',seen,[false,true,true,true,true]);
+    eq('badge HTTP/1.0 : bloc HTML présent',/<span class="badge warn" id="http10Badge" hidden/.test(markup),true);
+  }
   // Bandeau de nettoyage (UI 1.19.5, story 23) : /access borg_cleanup -> texte sur la page des machines, masqué sinon.
   eq('bandeau de nettoyage : bloc HTML présent',htmlIds.has('borgCleanupNotice'),true);
   const note=new Function('cdom','hooks',`
@@ -489,19 +536,23 @@ ${grab('renderCleanupNotice')}
   // Chemin réel : loadMyAccess (relue à chaque liste des serveurs et par pollAccess) affiche le bandeau.
   const lma=new Function('cdom','hooks',`
     const document={getElementById:id=>cdom.byId(id)};
-    let myAccess=null; const applyBadges=()=>{};
+    let myAccess=null, http10=false; const applyBadges=()=>{};
     const apiCall=async()=>hooks.resp;
 ${grab('_fmtBytes')}
 ${grab('cleanupNoticeText')}
 ${grab('renderCleanupNotice')}
 async ${grab('loadMyAccess')}
-    return {loadMyAccess,set:r=>{ hooks.resp=r; }};`)(cdom,{resp:{nicks:{},borg_cleanup:{borg_entries:3,borg_size:1000,keys:0,bh_files:0,history:0},httpStatus:200}});
+    return {loadMyAccess,set:r=>{ hooks.resp=r; },http10:()=>http10};`)(cdom,{resp:{nicks:{},borg_cleanup:{borg_entries:3,borg_size:1000,keys:0,bh_files:0,history:0},httpStatus:200}});
   nel.hidden=true; nel.textContent='';
   await lma.loadMyAccess();
   const shown=[nel.hidden,nel.textContent.includes('3 entrée(s) borg')];
   lma.set({httpStatus:500,stderr:'x'}); await lma.loadMyAccess();
   eq('bandeau de nettoyage : affiché par loadMyAccess (/access borg_cleanup), masqué si /access échoue ensuite',
      [shown,nel.hidden],[[false,true],true]);
+  // UI 1.23.0 (A85) : http_version de /access (vu sous le préfixe d'API, comme /download/*) -> badge
+  const hv10=[];
+  for(const v of ['1.0','1.1',undefined]){ lma.set({nicks:{},borg_cleanup:null,httpStatus:200,http_version:v}); await lma.loadMyAccess(); hv10.push(lma.http10()); }
+  eq('badge HTTP/1.0 : /access http_version lu par loadMyAccess (absent : valeur gardée)',hv10,[true,false,false]);
   // UI 1.22.1 (story 40, A83) : flux coupé par le serveur (borg en échec pendant l'envoi) -> res.blob() rejeté -> message clair,
   // aucun fichier proposé ; erreur HTTP (502/404) -> détail du serveur, inchangé.
   const dlf=new Function('hooks',`

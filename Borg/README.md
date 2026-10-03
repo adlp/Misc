@@ -694,7 +694,13 @@ Plantage de borg (1.0.174) : le message donne l'exception (`… a échoué : Loc
 ni le bandeau `Platform:`/`Borg:`… de borg. 1.0.175 : à **chaque** site — Restore (`-w`, `-W`, tar), ListPerms, Bkp, Umount,
 Login (`key import`), Init (code de borg : dépôt existant -> 2), DiffBkp et Index (`borg diff`) ; en code 0/1, les lignes de
 borg restent affichées (trace réduite, bandeau écarté). Erreur SQLite réelle d'un lecteur (base corrompue, verrouillée au-delà
-du délai) : `[ERREUR] SQLite error (<base>): …` sur stderr, sortie partielle, code inchangé ; base absente : silencieux.
+du délai) : `[ERREUR] SQLite error (<base>): …` sur stderr, sortie partielle ; base absente : silencieux. **Code 1 (1.0.178)** :
+Search, FileHist, TreeHist, TreeFind, DuIdx, IdxTop, DiffTop, ArchiveHistory, RepoHistory, CacheInfo, LstBkp, LstBkpFls
+sortent en **1** quand ils ont rencontré une erreur SQLite réelle, un nick arrêté parmi plusieurs (base occupée, passphrase
+absente…) ou un chemin illisible — données des autres nicks et lignes partielles toujours affichées (en-tête de base altéré :
+`DbTamperError`, code 2 ; LstBkpFls sur un chemin illisible : 3) ; `-j` : l'erreur est dans
+le JSON **et** sur stderr (avant : code 0, JSON seul) ; LstBkp/LstBkpFls : message `[ERREUR]` au lieu d'une trace Python.
+Status, Report, Bkp, Index, Prune, Restore, DiffBkp : codes inchangés.
 Report en ligne : `borg prune --dry-run` en échec -> récupérable « — » (JSON `null`) et `[WARN] … récupérable inconnu`. Login
 (CLI, `POST /login`) : nom de serveur/nick — lettres, chiffres, `.`, `_`, `-`, ni `ALL` ni `DEFAULT` (code 2 / 400).
 **Code 1 de borg (avertissement) — 1.0.176** : sur les lectures (Index, Report, DiffBkp, Mount `-b last`, Restore/ListPerms sans
@@ -889,8 +895,8 @@ Le motif porte sur le chemin complet ; sans `*`/`?`, sous-chaîne implicite. La 
 Plusieurs nicks (1.0.167 ; même règle pour `FileHist`, `TreeHist`, `TreeFind`, `DuIdx`, `IdxTop`, `DiffTop`) : un nick
 dont la base est inutilisable (passphrase fausse ou absente, base illisible, migration de chiffrement en cours, schéma
 plus récent) n'arrête plus la commande — ligne `[ERREUR]` sur stderr avec le message réel, `{nick: {"error": "…"}}`
-en JSON (DuIdx : totaux des autres nicks seulement, l'échec n'est que sur stderr), code 0 sinon (y compris quand
-l'autre nick répond « Index vide »). Nick seul, ou tous en échec : comme avant (erreur du premier nick, code 2 pour
+en JSON (DuIdx : totaux des autres nicks seulement, l'échec n'est que sur stderr), code 1 (1.0.178 ; avant : 0, y compris
+quand l'autre nick répond « Index vide »). Nick seul, ou tous en échec : comme avant (erreur du premier nick, code 2 pour
 une base chiffrée inutilisable).
 
 ---
@@ -1389,6 +1395,7 @@ l'aperçu avant `-y`.
 borgHelper -c CodecSelfTest
 borgHelper -c CodecSelfTest -f 'tranche|surveillance'   # un groupe seulement (1.0.147) : run PARTIEL
 borgHelper -c CodecSelfTest -l -f fantôme               # noms des contrôles sélectionnés, rien exécuté
+borgHelper -c CodecSelfTest -f '=HMAC-SHA256 (RFC 4231 cas 1)'   # ce contrôle seul (1.0.178) : nom exact, casse respectée
 ```
 
 **Par groupe** (1.0.147) : `-f <motif>` n'exécute que les contrôles dont le nom correspond (expression régulière, sans
@@ -1398,6 +1405,9 @@ les noms sans exécuter les contrôles (seule la préparation des bases temporai
 Les contrôles d'un même groupe partagent un dépôt de test que les précédents modifient (archives ajoutées, bases déjà
 construites) : viser un groupe entier plutôt qu'un contrôle isolé, et relancer le run complet en cas d'échec — le bilan
 le rappelle. Ne jamais lancer deux `CodecSelfTest` en même temps : les contrôles de minutage échouent sous charge.
+**Nom exact** (1.0.178) : `-f '=<nom>'` sélectionne le contrôle de ce nom entier, casse respectée, sans échappement (les
+parenthèses et `+` des noms sont pris tels quels) — pour prouver qu'un contrôle tourne seul, quand son nom est le début d'un
+autre ou n'en diffère que par la casse ; `-l -f '=<nom>'` vérifie la sélection. Sans `=` : expression régulière, inchangé.
 
 **Fichiers temporaires** (1.0.151) : en fin de run (même en échec ou filtré, pas avec `-l`), les `_MEI*` (~60 Mo
 chacun, dans `/tmp` ou `TMPDIR`) laissés par les borg tués pendant le run sont retirés : seulement ceux apparus pendant
@@ -1550,7 +1560,7 @@ première requête — voir `docs/borghelperrc.example`.
 | `BORGHELPERWWW_API_KEY` | `-K`, `--api-key` | `api_key` | Clé partagée attendue dans le header `X-API-Key` — absente : **générée aléatoirement** au démarrage (voir ci-dessous) |
 | `BORGHELPERWWW_BORGHELPER_BIN` | `--borghelper-bin` | `borghelper_bin` | Chemin du script `borgHelper` (défaut : à côté de `borgHelperWWW`) |
 | `BORGHELPERWWW_UI_FILE` | `--ui-file` | `ui_file` | Chemin de `borgHelperWWW_ui.html` (défaut : à côté de `borgHelperWWW`) |
-| `BORGHELPERWWW_TIMEOUT` | `--timeout` | `timeout` | Timeout en secondes par commande (défaut 3600 ; 0 = illimité) |
+| `BORGHELPERWWW_TIMEOUT` | `--timeout` | `timeout` | Timeout en secondes par commande (défaut 3600 ; 0 = illimité) ; `/download/*` : inactivité maximale de borg (1.31.0) |
 | `BORGHELPERWWW_HOST` | `--host` | `host` | Bind — adresse (défaut `127.0.0.1`) |
 | `BORGHELPERWWW_PORT` | `--port` | `port` | Bind — port (défaut `8000`) |
 | `BORGHELPERWWW_TRUSTED_PROXIES` | `--trusted-proxies` | `trusted_proxies` | IP/CIDR des reverse proxies de confiance, séparées par des virgules, ou `*` pour toutes (défaut `127.0.0.1`) — IP du navigateur dans le journal des requêtes, dans les deux modes de lancement (voir ci-dessous) |
@@ -2136,7 +2146,7 @@ mode `offline=true` (le mode en ligne interroge le dépôt en direct via `borg i
 cette empreinte). Depuis borgHelperWWW 1.28.8, seules les réponses en code 0 ou 1 (alerte tirée des bases : diff.db
 absent, sauvegarde trop ancienne) sont mises en cache : un code >= 2 (« ⚠ dépôt absent », coupure ssh…) dépend d'un état
 extérieur aux bases et serait resservi après remontage — il est recalculé à chaque appel. Depuis 1.29.0 : une réponse
-dont le stderr porte `[ERREUR]` (arrêt d'un nick d'un lecteur multi-nicks en code 0 : base occupée, corrompue,
+dont le stderr porte `[ERREUR]` (arrêt d'un nick d'un lecteur multi-nicks — code 1 depuis 1.0.178 : base occupée, corrompue,
 illisible ; index vide en texte) ou qui porte « SQLite error » n'est jamais mise en cache, ni ici ni dans le cache par
 périmètre ; `GET /report?offline=true` et `GET /diffbkp` (qui lit le dépôt en direct) ajoutent à l'empreinte la présence
 de chaque dépôt local (disque démonté -> recalcul ; remonté -> la réponse d'avant resservie) et ne sont servis du cache
@@ -2571,10 +2581,26 @@ code 18 ; l'UI affiche « Téléchargement interrompu ») et `[ERREUR]` au journ
 servi comme complet (avant : `200`, fichier vide ou tronqué). Code 1 (avertissement) : réponse complète, `[WARN]` au journal.
 Client qui abandonne un téléchargement : borg arrêté aussitôt (avant : resté bloqué, verrou de dépôt gardé).
 
+**Inactivité bornée (1.31.0)** : aucun octet lu sur la sortie de borg pendant `BORGHELPERWWW_TIMEOUT` secondes (défaut 3600 ;
+0 = aucune limite) — borg muet, client parti avant le premier octet, client qui ne lit plus — -> borg arrêté, `[ERREUR]` au
+journal ; avant la réponse : `502` « … a échoué : aucune activité depuis N s — borg arrêté » ; après : flux coupé. Un borg
+lent qui produit encore n'est jamais arrêté. Limite : un `borg extract` qui parcourt longtemps l'archive sans rien écrire
+avant de trouver le fichier, ou un `export-tar` dont le préfixe ne correspond à rien de longtemps, est arrêté au-delà de ce
+délai. borg est arrêté avec tout son groupe de processus (le borg PyInstaller lance un second processus) ; ses dossiers
+`/tmp/_MEI*` sont retirés. **Arrêt du serveur** (exécution directe) : au premier SIGTERM/Ctrl-C, les borg sans octet lu depuis
+10 s sont arrêtés, puis tout borg qui le devient ; un téléchargement sain va jusqu'au bout pendant qu'uvicorn attend ses
+connexions ; au second signal (arrêt forcé), tous. Avant : uvicorn attendait sans limite et un SIGKILL laissait borg orphelin.
+Sous un uvicorn externe : le premier signal attend (délai d'inactivité seulement), l'arrêt forcé arrête borg (mesuré).
+
 > **Reverse proxy : HTTP/1.1 obligatoire vers borgHelperWWW.** La coupure n'est visible qu'en HTTP/1.1 (transfert par
 > morceaux) ; en HTTP/1.0, une connexion fermée vaut fin normale et un fichier tronqué repasse pour complet. nginx parle
 > HTTP/1.0 à l'amont par défaut : ajouter `proxy_http_version 1.1;` (et `proxy_set_header Connection "";`) dans le
 > `location` qui mène à borgHelperWWW. Un client qui parle lui-même HTTP/1.0 directement n'est pas protégé (limite connue).
+> **Détection (1.31.0)** : une requête reçue en HTTP/1.0 (hors `/healthz`) -> une ligne `[WARN]` au journal, avec chemin et
+> client (une fois par processus) ; `/version` et `/access` renvoient `http_version` de la requête et l'UI affiche le badge
+> « ⚠ Proxy en HTTP/1.0 : téléchargement tronqué non détectable — proxy_http_version 1.1 » quand les téléchargements sont
+> permis (valeur de `/access`, servie sous le préfixe d'API comme `/download/*`). Seul le saut proxy -> borgHelperWWW est visible (un client HTTP/1.0 derrière un nginx en 1.1 ne
+> l'est pas).
 
 Depuis la Story 2.1 : un `path`/`prefix` hors du périmètre de l'appelant (`GROUPS_PATHS`, voir
 [Autorisation par groupes](#autorisation-par-groupes-reverse-proxy-oidcauth_request)) répond comme un chemin absent :

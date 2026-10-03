@@ -61,12 +61,12 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
                          DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec,
                          _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES, _enc_header_read, sentry_alert, _bkp_status_timeout,
                          _sentry_alert_kinds, db_plain_anomalies, _cfg_bool, convert_octets_readable,
-                         op_allowed, allowed_ops, is_external, _rb_errmsg, _valid_nick_name)
+                         op_allowed, allowed_ops, is_external, _rb_errmsg, _valid_nick_name, _mei_dirs, _mei_in_use)
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.30.2"
+WWW_VERSION="1.31.0"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -225,6 +225,8 @@ BORGHELPER_BIN=Path(os.environ.get('BORGHELPERWWW_BORGHELPER_BIN',Path(__file__)
 CFGFILE=os.environ.get('BORGHELPERWWW_CFGFILE')
 API_KEY=os.environ.get('BORGHELPERWWW_API_KEY')
 TIMEOUT=int(os.environ.get('BORGHELPERWWW_TIMEOUT','3600')) or None
+if TIMEOUT is not None and TIMEOUT<0:   # 1.31.0 (revue story 41) : négatif = borg tué à la première vérification
+    print(f"BORGHELPERWWW_TIMEOUT={TIMEOUT} refusé : secondes >= 0 (0 = aucune limite)",file=sys.stderr); sys.exit(2)
 # Sécurité : par défaut, aucune action destructrice sur les sauvegardes (Prune/DelBkp) — doit être
 # explicitement autorisée. Les téléchargements (vue d'une restauration), eux, sont autorisés par défaut.
 ALLOW_DESTRUCTIVE=_env_bool('BORGHELPERWWW_ALLOW_DESTRUCTIVE',False)
@@ -740,9 +742,22 @@ class _AbortableResponse:
             await send(msg)
         await self.resp(scope,receive,send_w)
 
+# 1.31.0 (story 41, A85, décision de l'utilisateur) : requête reçue en HTTP/1.0 (nginx sans `proxy_http_version 1.1`) -> une
+# ligne [WARN] par processus : un /download/* coupé (borg en échec en cours d'envoi) y passe pour complet. /version renvoie aussi
+# `http_version` de la requête (bandeau de l'UI). Seul le saut proxy -> borgHelperWWW est visible.
+_HTTP10_WARNED=[False]
+
+def _note_http10(request):
+    if request.scope.get('http_version')=='1.0' and not _HTTP10_WARNED[0] and request.url.path!='/healthz':   # sondes de proxy
+        _HTTP10_WARNED[0]=True
+        print(f"[WARN] requête reçue en HTTP/1.0 ({request.url.path}, {request.client.host if request.client else '-'}) : un "
+              "téléchargement interrompu (/download/*) y passe pour complet — derrière nginx, "
+              "ajouter `proxy_http_version 1.1;` et `proxy_set_header Connection \"\";` (signalé une seule fois)",file=sys.stderr,flush=True)
+
 @app.middleware("http")
 async def _access_log_and_user_guard(request: Request, call_next):
     t0=time.monotonic()
+    _note_http10(request)
     user=_request_user(request)
     ip=_client_ip(request.client.host if request.client else None,
                   request.headers.get('x-forwarded-for'),_TRUSTED_PROXY_NETS)
@@ -771,6 +786,7 @@ async def _start_bkp_status_watcher():
 
 @app.on_event("shutdown")
 async def _stop_bkp_status_watcher():
+    _kill_live_borg()   # 1.31.0 (A86) : connexions fermées : plus aucun borg de téléchargement après l'arrêt
     if _bkp_watcher_task is None: return
     _bkp_watcher_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
@@ -1238,18 +1254,18 @@ def _is_db_key_error(result: CommandResult) -> bool:
     # Sur-approximation délibérée par sous-chaîne : une sortie borg/borgHelper qui contiendrait par
     # coïncidence l'un de ces mots (jamais vu en pratique, mais pas impossible, ex. dans un nom
     # d'archive ou un chemin) serait aussi exclue du cache — préféré à un faux négatif (AD-13).
-    # 1.28.6 (borgHelper 1.0.167) : quel que soit le code de sortie — un lecteur multi-nicks sort en 0 quand un seul nick
-    # a une base inutilisable ({nick: {'error': 'DbKeyError : …'}}) : jamais mis en cache non plus.
+    # 1.28.6 (borgHelper 1.0.167) : quel que soit le code de sortie — un lecteur multi-nicks dont un seul nick a une base
+    # inutilisable ({nick: {'error': 'DbKeyError : …'}}) sortait en 0 (en 1 depuis borgHelper 1.0.178) : jamais mis en cache.
     text=f"{result.stdout or ''}\n{result.stderr or ''}"
     return any(m in text for m in _DB_KEY_ERROR_MARKERS)
 
 def _never_cache(result: CommandResult) -> bool:
     """Réponse jamais mise en cache — MÊME prédicat aux trois écritures (_RESPONSE_CACHE, _scoped_cached_mono/_multi) :
     DbKeyError (AD-13) ou, 1.29.0 (story 37, A67), arrêt d'un nick (`[ERREUR]` sur stderr : base occupée, corrompue,
-    illisible, schéma, index vide — inventaire mesuré) ; un lecteur multi-nicks sort en 0 quand un seul nick s'arrête : une
-    erreur passagère (« DB occupée ») restait servie. Sur-approximation voulue : un index vide est relu à chaque appel. Revue :
-    « SQLite error » (Search/FileHist/TreeHist/TreeFind/IdxTop/DiffTop avalent sqlite3.Error en code 0, sans [ERREUR] ;
-    stdout `-j` ou stderr) exclu aussi."""
+    illisible, schéma, index vide — inventaire mesuré) ; un lecteur multi-nicks sortait en 0 quand un seul nick s'arrête (en 1
+    depuis borgHelper 1.0.178) : une erreur passagère (« DB occupée ») restait servie. Sur-approximation voulue : un index vide
+    est relu à chaque appel. Revue : « SQLite error » (stdout `-j` ou stderr) exclu aussi — avant borgHelper 1.0.178 les lecteurs
+    l'avalaient en code 0 sans [ERREUR] ; le cache ne retient que les codes 0/1, la règle reste utile pour le code 1."""
     text=f"{result.stdout or ''}\n{result.stderr or ''}"
     return _is_db_key_error(result) or '[ERREUR]' in (result.stderr or '') or 'SQLite error' in text
 
@@ -2436,6 +2452,61 @@ def _safe_filename(name: str) -> str:
     name=(name or '').strip('/').split('/')[-1] or 'download'
     return _FILENAME_UNSAFE.sub('_',name) or 'download'
 
+# 1.31.0 (story 41, A86) : borg des téléchargements en cours {Popen: état} — état : 'last' (dernier octet lu, monotonic),
+# 'why' (None, 'idle' : chien de garde, 'stop' : arrêt du serveur), 'mei' (dossiers _MEI* présents avant son lancement).
+_LIVE_BORG={}; _LIVE_BORG_LOCK=threading.Lock()
+_STOP_IDLE=10   # arrêt demandé : un borg sans octet lu depuis _STOP_IDLE s est tué (décision de l'utilisateur) — au signal, puis
+_STOPPING=[False]   # par le chien de garde dès qu'il le devient (un borg muet depuis 4 s au signal ne survit plus jusqu'au SIGKILL)
+
+def _borg_killgrp(proc,st=None,why=None):
+    """Tue le GROUPE de processus de borg (lancé en session propre) : le vrai borg est un exécutable PyInstaller (chargeur +
+    enfant) derrière un script `exec nice …` — tuer le seul PID de tête laissait l'enfant vivant, tube de sortie ouvert (mesuré,
+    story 41). Ne fait rien pour un borg déjà récolté ; `why` noté dans l'état (cause du message)."""
+    if proc.returncode is not None: return
+    if st is not None and why and st.get('why') is None: st['why']=why
+    try: os.killpg(proc.pid,9)
+    except OSError: pass
+
+def _LIVE_BORG_pop(proc):
+    with _LIVE_BORG_LOCK: _LIVE_BORG.pop(proc,None)
+
+def _borg_reap(proc,st):
+    """Après la fin de borg : groupe tué (un enfant survivant), dossiers _MEI* extraits par CE borg et inutilisés retirés,
+    sortie du registre."""
+    if not st.get('why'): return _LIVE_BORG_pop(proc)   # sorti seul : groupe terminé avec lui, PID peut-être déjà réutilisé
+    try: os.killpg(proc.pid,9)
+    except OSError: pass
+    for d in _mei_dirs()-st['mei']:
+        if not _mei_in_use(d): shutil.rmtree(d,ignore_errors=True)
+    _LIVE_BORG_pop(proc)
+
+def _kill_live_borg(idle_only=False):
+    """Arrêt du serveur : borg des téléchargements tués (groupe) — tous, ou (premier signal, idle_only) seulement ceux sans
+    octet lu depuis _STOP_IDLE s : un téléchargement sain se termine pendant qu'uvicorn attend ses connexions."""
+    _STOPPING[0]=True
+    now=time.monotonic()
+    with _LIVE_BORG_LOCK: items=list(_LIVE_BORG.items())
+    for pr,st in items:
+        if pr.poll() is None and (not idle_only or now-st['last']>=_STOP_IDLE): _borg_killgrp(pr,st,'stop')
+
+def _make_server(config):
+    """1.31.0 (story 41, A86, décision de l'utilisateur) : uvicorn.Server dont le PREMIER signal d'arrêt tue les borg inactifs
+    (sinon uvicorn attend sans limite la connexion d'un borg muet, et le SIGKILL de systemd le laissait orphelin — mesuré) et le
+    second (arrêt forcé) tous les borg de téléchargement."""
+    import uvicorn
+    class _Server(uvicorn.Server):
+        def handle_exit(self,sig,frame):
+            _kill_live_borg(idle_only=not self.should_exit)
+            super().handle_exit(sig,frame)
+    return _Server(config)
+
+import atexit as _atexit, shutil
+_atexit.register(_kill_live_borg)
+# Revue (mesuré par un relecteur) : à la fin de l'interpréteur, les fils NON démons du pool d'anyio (bloqués dans read1 sur un
+# borg muet) sont attendus AVANT les fonctions atexit -> enregistré aussi là où il passe avant cette attente (arrêt forcé d'un
+# uvicorn externe).
+if hasattr(threading,'_register_atexit'): threading._register_atexit(_kill_live_borg)
+
 def _borg_stream(request,cmd,env,what,decoy=None,path=None,missing=None):
     """1.30.2 (story 40, A83, décisions de l'utilisateur) : lance borg (`what` : « borg extract »/« borg export-tar »), lit son
     stderr dans un thread (200 dernières lignes) et son PREMIER bloc (64 Kio ou la fin) avant de répondre. Fin atteinte dans ce
@@ -2445,10 +2516,47 @@ def _borg_stream(request,cmd,env,what,decoy=None,path=None,missing=None):
     AVANT la mise en forme (hors périmètre indiscernable, même coupé). Sinon un corps ASYNCHRONE qui vérifie le code à la fin :
     >= 2 ou signal -> [ERREUR] au journal et `request.state.stream_aborted` (le middleware retient la fin de transfert : flux
     coupé, voir _AbortableResponse) ; 1 -> [WARN]. Client parti en cours de route (corps annulé) : borg tué aussitôt — avant,
-    bloqué sur son tube, zombie, verrou de dépôt gardé (revue, mesuré). Avant 1.30.2 : stderr vers DEVNULL, code jamais lu."""
+    bloqué sur son tube, zombie, verrou de dépôt gardé (revue, mesuré). Avant 1.30.2 : stderr vers DEVNULL, code jamais lu.
+    1.31.0 (story 41, A86, décision de l'utilisateur) : aucun octet lu sur la sortie de borg pendant TIMEOUT s (borg muet, corps
+    jamais lu — client parti avant le 1er octet —, client qui ne consomme plus) -> borg tué par un chien de garde, [ERREUR] au
+    journal ; avant la réponse : 502 « aucune activité depuis N s » ; après : flux coupé. TIMEOUT None (0) : aucune limite."""
     import collections
     from starlette.concurrency import run_in_threadpool
-    proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
+    st={'last':time.monotonic(),'why':None,'mei':_mei_dirs()}
+    proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,start_new_session=True)   # groupe propre (killpg)
+    with _LIVE_BORG_LOCK: _LIVE_BORG[proc]=st
+    def _watchdog():
+        # actif jusqu'au retrait du registre (stop() du corps) : borg vivant inactif TIMEOUT s -> tué ; borg fini mais corps
+        # jamais lu (client parti avant le 1er octet d'un petit fichier) -> au même délai (3600 s si TIMEOUT=0), tubes fermés
+        # et entrée retirée — sinon un Popen et deux descripteurs perdus par téléchargement abandonné (revue).
+        while True:
+            with _LIVE_BORG_LOCK:
+                if proc not in _LIVE_BORG: return
+            lim=TIMEOUT; why='idle'
+            if _STOPPING[0]: lim=min(lim,_STOP_IDLE) if lim else _STOP_IDLE; why='stop'   # arrêt demandé : délai court
+            if proc.poll() is None:
+                if lim and time.monotonic()-st['last']>=lim:
+                    _borg_killgrp(proc,st,why)
+                    proc.wait()   # corps jamais lu : personne d'autre ne l'attendra
+                    if proc.returncode<0 and st['why']=='idle':   # vraiment tué ici (pas sorti seul entre-temps)
+                        print(f"[ERREUR] {what} : aucune activité depuis {lim} s (borg muet ou téléchargement plus lu) — borg arrêté",
+                              file=sys.stderr,flush=True)
+                    if not st.get('reading'): _borg_reap(proc,st); _close_pipes(); return
+            elif time.monotonic()-st['last']>=(lim or 3600) and not st.get('reading'):
+                _borg_reap(proc,st); _close_pipes(); return
+            time.sleep(min(5.0,max(0.1,(lim or 50)/20)))
+    def _close_pipes():
+        for f in (proc.stdout,proc.stderr):
+            try: f.close()
+            except Exception: pass
+    threading.Thread(target=_watchdog,daemon=True).start()
+    def _rd(n=65536):
+        st['reading']=True   # lecture en cours : le chien de garde ne ferme jamais un tube qu'un fil lit
+        try: c=proc.stdout.read1(n)
+        except ValueError: c=b''   # tube fermé par le chien de garde (corps lu trop tard)
+        finally: st['reading']=False
+        st['last']=time.monotonic()   # octet lu, ou fin de sortie : le délai repart (borg qui tarde à sortir après l'EOF)
+        return c
     errs=collections.deque(maxlen=200)
     def _read_err():
         try:
@@ -2459,15 +2567,21 @@ def _borg_stream(request,cmd,env,what,decoy=None,path=None,missing=None):
         err_t.join(5)
         return [l.replace(decoy,path or '') for l in errs] if decoy else list(errs)
     def cause():
+        if proc.returncode is not None and proc.returncode<0:   # tué : par le chien de garde ou l'arrêt du serveur ?
+            if st['why']=='idle': return f"aucune activité depuis {TIMEOUT} s — borg arrêté"
+            if st['why']=='stop': return "arrêt du serveur borgHelperWWW — borg arrêté"
         return _rb_errmsg({'exitcode':proc.returncode,'stderr':lines()},what)
     def stop():
-        if proc.poll() is None:
-            try: proc.kill()
-            except OSError: pass
+        _borg_killgrp(proc)
         proc.wait()
+        _borg_reap(proc,st)
         try: proc.stdout.close()
         except Exception: pass
-    first=proc.stdout.read(65536)
+    first=b''
+    while len(first)<65536:   # 1.31.0 : par morceaux (read1) — chaque octet lu repousse le chien de garde
+        c=_rd(65536-len(first))
+        if not c: break
+        first+=c
     if len(first)<65536:   # fin du flux déjà atteinte : code connu avant la réponse
         proc.wait()
         rc=proc.returncode
@@ -2480,18 +2594,20 @@ def _borg_stream(request,cmd,env,what,decoy=None,path=None,missing=None):
         try:
             if first: yield first
             while True:
-                chunk=await run_in_threadpool(proc.stdout.read,65536)
+                chunk=await run_in_threadpool(_rd)
                 if not chunk: break
                 yield chunk
             await run_in_threadpool(proc.wait)
             done=True
             if proc.returncode not in (0,1):
-                print(f"[ERREUR] {what} a échoué en cours d'envoi : {cause()} — téléchargement interrompu (flux coupé)",file=sys.stderr,flush=True)
+                if st['why']!='idle':   # chien de garde : sa ligne [ERREUR] est déjà au journal
+                    print(f"[ERREUR] {what} a échoué en cours d'envoi : {cause()} — téléchargement interrompu (flux coupé)",file=sys.stderr,flush=True)
                 request.state.stream_aborted=True
             elif proc.returncode==1: print(f"[WARN] {what} (téléchargement) : {cause()}",file=sys.stderr,flush=True)
         finally:
             if not done and proc.poll() is None:
                 print(f"[WARN] {what} : téléchargement abandonné par le client — borg arrêté",file=sys.stderr,flush=True)
+                st['why']=st['why'] or 'client'   # _MEI* du borg tué retirés (_borg_reap)
             stop()
     return body()
 
@@ -2663,8 +2779,10 @@ def favicon():
     raise HTTPException(404,detail="favicon.ico absent")
 
 @app.get("/version",tags=["lecture"],summary="Versions + postures de sécurité chargées au démarrage de borgHelperWWW — non protégé, aucune donnée sensible")
-def version():
-    return {'borghelperwww_version':WWW_VERSION,'borghelper_version':BORGHELPER_VERSION,'ui_version':UI_VERSION,
+def version(request: Request):
+    return {'borghelperwww_version':WWW_VERSION,
+            'borghelper_version':BORGHELPER_VERSION,'ui_version':UI_VERSION,
+            'http_version':request.scope.get('http_version'),   # 1.31.0 (A85) : « 1.0 » -> badge de l'UI (proxy en HTTP/1.0)
             'allow_destructive':ALLOW_DESTRUCTIVE,'allow_downloads':ALLOW_DOWNLOADS,'api_prefix':API_PREFIX,
             'restore_enabled':RESTORE_ROOT is not None and os.path.isdir(RESTORE_ROOT),   # 1.29.0 (A68) : racine seulement sur /access
             'groups_auth_enabled':GROUPS_HEADER is not None,
@@ -2744,6 +2862,7 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
         # reflète cette absence de restriction par groupes pour que l'UI n'ait qu'une seule forme
         # de réponse à traiter, sans cas particulier côté client.
         return {'groups_auth_enabled':False,'borg_cleanup':_borg_cleanup_summary(),'restore_root':RESTORE_ROOT,
+                'http_version':request.scope.get('http_version'),   # 1.31.0 (A85) : vu sous API_PREFIX, comme /download/*
                 'nicks':{n:{'level':'admin','read_scope':None,'restore_scope':None,'db_plain':_plain(n),**_state(n)} for n in nicks}}
     user_groups=_parse_groups(request.headers.get(GROUPS_HEADER))
     level_names={0:'none',1:'read',2:'write',3:'admin'}
@@ -2765,7 +2884,7 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
     # 1.29.0 (A68) : racine de restauration (UI : « sous-dossier de … ») — à qui peut restaurer sur au moins un nick
     can_restore=any(v['level'] in ('write','admin') and (v.get('ops') is None or 'restore' in v['ops']) for v in result.values())
     return {'groups_auth_enabled':True,'borg_cleanup':_borg_cleanup_summary() if admin else None,
-            'restore_root':RESTORE_ROOT if can_restore else None,'nicks':result}
+            'restore_root':RESTORE_ROOT if can_restore else None,'http_version':request.scope.get('http_version'),'nicks':result}
 
 @router.get("/stats",response_model=CommandResult,tags=["lecture"])
 def stats(nick: Optional[str]=None, x_api_key: Optional[str]=Header(default=None)):
@@ -4375,9 +4494,13 @@ def push_selftest():
                     """1.29.0 (story 37, A67) : réponse code 0 qui porte l'arrêt d'un nick (`[ERREUR]` sur stderr, forme réelle de
                     _nick_stop_msg) ou une erreur SQLite avalée (« SQLite error », stdout -j) jamais mise en cache — _RESPONSE_CACHE
                     (deux appels, deux exécutions) et cache par périmètre (mono et multi : aucune ligne écrite) ; sans marqueur : en cache."""
-                    busy=CommandResult(exitcode=0,stdout=json.dumps({'qa':['a'],'qz':{'error':'DB occupée'}}),
-                                       stderr='[ERREUR] DB occupée : /var/cache/borgHelper/rc-qz-diff.db\n  -> database is locked  [borgHelper v1.0.174]')
-                    sqle=CommandResult(exitcode=0,stdout=json.dumps({'qa':['a'],'qz':{'error':'SQLite error (/c/rc-qz-diff.db): database is locked'}}),stderr='')
+                    # 1.31.0 (revue story 41) : formes réelles de borgHelper 1.0.178 — code 1, [ERREUR] sur stderr (-j compris) ;
+                    # sqle0 : forme d'avant 1.0.178 (code 0, erreur dans le JSON seul), gardée pour un borgHelper plus ancien
+                    busy=CommandResult(exitcode=1,stdout=json.dumps({'qa':['a'],'qz':{'error':'DB occupée'}}),
+                                       stderr='[ERREUR] DB occupée : /var/cache/borgHelper/rc-qz-diff.db\n  -> database is locked  [borgHelper v1.0.178]')
+                    sqle=CommandResult(exitcode=1,stdout=json.dumps({'qa':['a'],'qz':{'error':'SQLite error (/c/rc-qz-diff.db): database is locked'}}),
+                                       stderr='[ERREUR] SQLite error (/c/rc-qz-diff.db): database is locked  [borgHelper v1.0.178]')
+                    sqle0=CommandResult(exitcode=0,stdout=json.dumps({'qa':['a'],'qz':{'error':'SQLite error (/c/rc-qz-diff.db): database is locked'}}),stderr='')
                     clean=CommandResult(exitcode=0,stdout=json.dumps({'qa':['a'],'qz':['b']}),stderr='')
                     def twice(r):
                         for k in [k for k in _RESPONSE_CACHE if k and k[0]=='selftest-nickerr']: _RESPONSE_CACHE.pop(k,None)
@@ -4393,9 +4516,9 @@ def push_selftest():
                         _scoped_cached_multi('search','qa,qz',['qa','qz'],{'qa':None,'qz':None},{},{},run(busy)); x_busy=len(puts)-m_busy
                         _scoped_cached_multi('search','qa,qz',['qa','qz'],{'qa':None,'qz':None},{},{},run(sqle)); x_sql=len(puts)-m_busy-x_busy
                         _scoped_cached_mono('idxtop','qz',None,'',{},run(clean)); m_clean=len(puts)-m_busy-x_busy-x_sql
-                    got=(twice(busy),twice(sqle),twice(clean),m_busy,x_busy,x_sql,m_clean)
-                    if got!=(2,2,1,0,0,0,1): print(f"  {got}")
-                    return got==(2,2,1,0,0,0,1)
+                    got=(twice(busy),twice(sqle),twice(clean),m_busy,x_busy,x_sql,m_clean,twice(sqle0))
+                    if got!=(2,2,1,0,0,0,1,2): print(f"  {got}")
+                    return got==(2,2,1,0,0,0,1,2)
                 check("cache des réponses : arrêt d'un nick ([ERREUR]) ou erreur SQLite en code 0 jamais en cache, trois sites (A67)",_cache_nick_error)
                 def _restore_root():
                     """1.29.0 (story 37, A68, décisions de l'utilisateur) : POST /restore — sans racine ou racine introuvable : 403 ;
@@ -4521,11 +4644,19 @@ def push_selftest():
                             async for c in body:
                                 out+=c; n+=1
                                 if stop_after and n>=stop_after: await body.aclose(); break
-                        with contextlib.redirect_stderr(e), mock.patch.object(subprocess,'Popen',popen):
+                        got={}
+                        def _go():   # 1.31.0 (revue story 41) : fil borné — borg jamais tué (défaut) = FAIL, jamais un selftest bloqué
                             try:
                                 body=_borg_stream(req,[sys.executable,'-c',code_py],dict(os.environ),'borg extract',decoy=decoy,path=path,missing=missing)
                                 asyncio.run(drain(body))
-                            except HTTPException as x: st,det=x.status_code,x.detail
+                            except HTTPException as x: got['st'],got['det']=x.status_code,x.detail
+                        with contextlib.redirect_stderr(e), mock.patch.object(subprocess,'Popen',popen):
+                            th=threading.Thread(target=_go,daemon=True); th.start(); th.join(30)
+                            if th.is_alive():
+                                for p_ in procs:
+                                    with contextlib.suppress(OSError): p_.kill()
+                                th.join(10); got['st']='BLOQUÉ'
+                        st,det=got.get('st'),got.get('det')
                         return out,st,det,getattr(req.state,'stream_aborted',False),e.getvalue(),procs
                     W="import sys,os,signal,time\n"
                     big="sys.stdout.write('x'*200000); sys.stdout.flush(); "
@@ -4608,6 +4739,133 @@ def push_selftest():
                     if not ok: print(f"  {out}")
                     return ok
                 check("/download/* : bout en bout par l'application — échec en cours d'envoi = pas de fin de transfert, succès = fin envoyée (A83)",_download_abort_e2e)
+                def _download_idle_watchdog():
+                    """1.31.0 (story 41, A86, décisions de l'utilisateur ; mesuré : borg muet bloquait un fil sans fin, corps jamais lu =
+                    borg orphelin, arrêt du serveur sans effet ; revue : vrai borg = chargeur PyInstaller + enfant, tuer le seul PID de
+                    tête laissait l'enfant) : vrais sous-processus, TIMEOUT 1 s. Muet avant le 1er octet -> 502 « aucune activité »,
+                    [ERREUR], groupe tué (enfant d'un script sans exec compris) ; corps jamais lu -> borg tué, [ERREUR] ; petit fichier
+                    fini dans le 1er bloc puis corps jamais lu -> registre vidé, tubes fermés ; lent mais actif APRÈS le 1er bloc ->
+                    jamais tué ; corps lu puis plus lu -> tué, flux coupé, une seule ligne [ERREUR] ; arrêt du serveur : inactifs seuls
+                    au 1er signal (_make_server.handle_exit), tous au 2e, cause « arrêt du serveur » ; registre vide après chaque cas."""
+                    import types as _t, signal as _sig
+                    res={}; orig=subprocess.Popen; P=sys.executable
+                    def req(): return _t.SimpleNamespace(state=_t.SimpleNamespace())
+                    async def drain(body,n=None,pause=0):
+                        out=b''; k=0
+                        async for c in body:
+                            out+=c; k+=1
+                            if n and k==n and pause: await asyncio.sleep(pause)
+                        return out
+                    def alive(pid): return os.path.exists(f'/proc/{pid}') and open(f'/proc/{pid}/stat').read().split(')')[-1].split()[0]!='Z'
+                    def wait_empty(t=15):
+                        t0=time.monotonic()
+                        while _LIVE_BORG and time.monotonic()-t0<t: time.sleep(0.1)
+                        return not _LIVE_BORG
+                    pidf=os.path.join(tmpdir,'enfant.pid')
+                    with mock.patch(f"{__name__}.TIMEOUT",1):
+                        # muet derrière un script SANS exec (comme un chargeur PyInstaller) : l'enfant garde le tube
+                        e=io.StringIO(); got={}; t0=time.monotonic()
+                        def _muet():   # dans un fil borné : un défaut (enfant survivant, tube ouvert) = FAIL, jamais un run bloqué
+                            try: _borg_stream(req(),['sh','-c',f'{P} -c "import os,time; open({pidf!r},\'w\').write(str(os.getpid())); time.sleep(60)"; true'],
+                                              dict(os.environ),'borg extract')
+                            except HTTPException as x: got['st'],got['det']=x.status_code,x.detail
+                        with contextlib.redirect_stderr(e):
+                            th=threading.Thread(target=_muet,daemon=True); th.start(); th.join(15)
+                        dt=time.monotonic()-t0; time.sleep(0.3); st,det=got.get('st'),got.get('det')
+                        child=int(open(pidf).read()) if os.path.exists(pidf) else None
+                        if th.is_alive() or (child and alive(child)):   # défaut : enfant tué ici, fil libéré
+                            with contextlib.suppress(OSError): os.kill(child,9)
+                            th.join(5)
+                        res['muet, enfant tué']=(st==502 and det=='borg extract a échoué : aucune activité depuis 1 s — borg arrêté' and dt<10
+                                                 and child is not None and not alive(child) and e.getvalue().count('[ERREUR] borg extract : aucune activité depuis 1 s')==1
+                                                 and wait_empty(),st,det,round(dt,1),child)
+                        procs=[]
+                        def popen(*a,**k): p_=orig(*a,**k); procs.append(p_); return p_
+                        e=io.StringIO()
+                        with contextlib.redirect_stderr(e), mock.patch.object(subprocess,'Popen',popen):
+                            body=_borg_stream(req(),[P,'-c',"import sys,time; sys.stdout.write('x'*200000); sys.stdout.flush(); time.sleep(60)"],
+                                              dict(os.environ),'borg extract')
+                            t0=time.monotonic()
+                            while procs[0].poll() is None and time.monotonic()-t0<15: time.sleep(0.1)
+                            emp=wait_empty()
+                        res['corps jamais lu']=(procs[0].returncode==-9 and emp and '[ERREUR] borg extract : aucune activité' in e.getvalue(),procs[0].returncode)
+                        body=None; procs.clear()
+                        with contextlib.redirect_stderr(io.StringIO()), mock.patch.object(subprocess,'Popen',popen):
+                            body=_borg_stream(req(),[P,'-c',"import sys; sys.stdout.write('petit')"],dict(os.environ),'borg extract')
+                            emp=wait_empty()
+                        res['petit fichier, corps jamais lu : registre vidé']=(emp and procs[0].stdout.closed,emp)
+                        body=None
+                        r=req(); e=io.StringIO()
+                        with contextlib.redirect_stderr(e):
+                            out=asyncio.run(drain(_borg_stream(r,[P,'-c',"import sys,time\nsys.stdout.write('x'*70000); sys.stdout.flush()\n"
+                                                                     "for i in range(10): sys.stdout.write('y'); sys.stdout.flush(); time.sleep(0.3)"],
+                                                                 dict(os.environ),'borg extract')))
+                        res['lent mais actif après le 1er bloc']=(out==b'x'*70000+b'y'*10 and not getattr(r.state,'stream_aborted',False)
+                                                                 and 'aucune activité' not in e.getvalue(),len(out),e.getvalue()[-150:])
+                        r=req(); e=io.StringIO()
+                        with contextlib.redirect_stderr(e):
+                            out=asyncio.run(drain(_borg_stream(r,[P,'-c',"import sys,time; sys.stdout.write('x'*300000); sys.stdout.flush(); time.sleep(60)"],
+                                                               dict(os.environ),'borg extract'),n=1,pause=3))
+                        res['corps plus lu : coupé, une ligne']=(len(out)<300000 and getattr(r.state,'stream_aborted',False)
+                                                                 and e.getvalue().count('[ERREUR]')==1 and wait_empty(),len(out),e.getvalue()[-200:])
+                    with mock.patch(f"{__name__}.TIMEOUT",None), mock.patch(f"{__name__}._STOP_IDLE",1):
+                        import uvicorn as _uv
+                        srv=_make_server(_uv.Config(app))
+                        e=io.StringIO(); r1,r2=req(),req()
+                        with contextlib.redirect_stderr(e):
+                            mk=lambda r: _borg_stream(r,[P,'-c',"import sys,time; sys.stdout.write('x'*200000); sys.stdout.flush(); time.sleep(60)"],dict(os.environ),'borg extract')
+                            b_idle=mk(r1); b_live=mk(r2)
+                            with _LIVE_BORG_LOCK: items=list(_LIVE_BORG.items())
+                            (pi,si),(pl,sl)=items
+                            si['last']-=2; sl['last']=time.monotonic()+0.5   # inactif depuis plus de _STOP_IDLE (1 s) ; l'autre vient de lire
+                            try:
+                                srv.handle_exit(_sig.SIGTERM,None); time.sleep(0.3)
+                                first=(pi.poll() is not None,pl.poll() is None,srv.should_exit,srv.force_exit)
+                                t0=time.monotonic()
+                                while pl.poll() is None and time.monotonic()-t0<10: time.sleep(0.1)   # devenu inactif : tué par le chien de garde
+                                later=(pl.poll() is not None,round(time.monotonic()-t0,1))
+                                srv.handle_exit(_sig.SIGTERM,None)
+                                second=(srv.force_exit,)
+                            finally: _STOPPING[0]=False
+                            o1=asyncio.run(drain(b_idle)); o2=asyncio.run(drain(b_live))
+                        res['arrêt : inactifs au 1er signal, puis dès 1 s sans octet, tous au 2e']=(first==(True,True,True,False) and later[0] and 0.5<=later[1]<=5 and second==(True,)
+                            and getattr(r1.state,'stream_aborted',False) and getattr(r2.state,'stream_aborted',False)
+                            and e.getvalue().count("en cours d'envoi : arrêt du serveur borgHelperWWW — borg arrêté")==2 and wait_empty(),first,later,second,e.getvalue()[-200:])
+                    import inspect as _in, ast as _ast
+                    # garde de STRUCTURE : instructions du niveau module (jamais le texte de ce contrôle, qui cite les mêmes appels)
+                    tree=_ast.parse(open(os.path.realpath(__file__),encoding='utf-8').read())
+                    top=[_ast.unparse(n) for n in tree.body if isinstance(n,(_ast.Expr,_ast.If))]
+                    res['filets d\'arrêt présents']=(any(t=='_atexit.register(_kill_live_borg)' for t in top)
+                                                    and any('threading._register_atexit(_kill_live_borg)' in t and t.startswith('if hasattr(threading') for t in top)
+                                                    and '_kill_live_borg()' in _in.getsource(_stop_bkp_status_watcher),)
+                    bad={k:v for k,v in res.items() if not (v if isinstance(v,bool) else v[0])}
+                    if bad: print(f"  {bad}")
+                    return not bad
+                check("/download/* : chien de garde d'inactivité (TIMEOUT) — groupe tué, corps jamais lu, registre vidé, lent mais actif servi, arrêt : inactifs puis tous (A86)",_download_idle_watchdog)
+                def _http10_detect():
+                    """1.31.0 (story 41, A85, décision de l'utilisateur) : requête HTTP/1.0 (appel ASGI direct, vraie application) ->
+                    /version http_version « 1.0 » et une seule ligne [WARN] (deux requêtes) ; HTTP/1.1 -> « 1.1 », aucune ligne."""
+                    async def call(hv):
+                        msgs=[]; got=[False]
+                        async def receive():
+                            if got[0]: await asyncio.sleep(3600)
+                            got[0]=True; return {'type':'http.request','body':b'','more_body':False}
+                        async def send(m): msgs.append(m)
+                        scope={'type':'http','asgi':{'version':'3.0'},'http_version':hv,'method':'GET','scheme':'http','path':'/version',
+                               'raw_path':b'/version','query_string':b'','root_path':'','headers':[(b'host',b'test')],'client':('127.0.0.1',1),'server':('test',80)}
+                        await asyncio.wait_for(app(scope,receive,send),30)
+                        return json.loads(b''.join(x.get('body',b'') for x in msgs if x['type']=='http.response.body'))['http_version']
+                    saved=_HTTP10_WARNED[0]; _HTTP10_WARNED[0]=False; e=io.StringIO()
+                    try:
+                        with contextlib.redirect_stderr(e): a=asyncio.run(call('1.1')); w0=e.getvalue().count('[WARN] requête reçue en HTTP/1.0'); b=asyncio.run(call('1.0')); c=asyncio.run(call('1.0'))
+                    finally: _HTTP10_WARNED[0]=saved
+                    n=e.getvalue().count('[WARN] requête reçue en HTTP/1.0')
+                    v=client.get("/version").json(); acc=client.get(f"{P}/access",headers=H).json()
+                    keys={'borghelperwww_version','borghelper_version','ui_version','http_version'}<=set(v) and v['borghelper_version']==BORGHELPER_VERSION
+                    ok=(a,b,c,w0,n)==('1.1','1.0','1.0',0,1) and 'proxy_http_version 1.1' in e.getvalue() and keys and acc.get('http_version')=='1.1'
+                    if not ok: print(f"  {(a,b,c,w0,n,keys,acc.get('http_version'))}")
+                    return ok
+                check("HTTP/1.0 détecté : /version http_version, [WARN] une seule fois par processus (A85)",_http10_detect)
                 if _internal is None: print("SKIP racine de restauration : aucun nick interne dans ce rc")
                 else: check("POST /restore sous la racine de restauration seulement : 403 sans racine/hors racine/lien, 409 si remplie, chemin résolu transmis, « / » refusé (A68)",
                             _restore_root)
@@ -5095,10 +5353,12 @@ if __name__=='__main__':
     # proxy_headers=True (déjà le défaut uvicorn) : IP client réelle (X-Forwarded-For) dans les logs
     # d'accès et scope["client"], mais seulement si la connexion vient d'une IP de confiance —
     # forwarded_allow_ips, sinon un client pourrait usurper son IP en forgeant ce header lui-même.
-    uvicorn.run(app,host=os.environ.get('BORGHELPERWWW_HOST','127.0.0.1'),
+    _srv=_make_server(uvicorn.Config(app,host=os.environ.get('BORGHELPERWWW_HOST','127.0.0.1'),
                 port=int(os.environ.get('BORGHELPERWWW_PORT','8000')),
                 proxy_headers=True,
                 forwarded_allow_ips=os.environ.get('BORGHELPERWWW_TRUSTED_PROXIES','127.0.0.1'),
                 # journal d'accès propre à borgHelperWWW (middleware _access_log_and_user_guard) :
                 # IP du navigateur, utilisateur, paramètres sensibles masqués — pas de doublon uvicorn
-                access_log=False)
+                access_log=False))
+    _srv.run()
+    if not _srv.started: sys.exit(3)   # démarrage en échec (port pris…) : jamais un code 0 pour systemd
