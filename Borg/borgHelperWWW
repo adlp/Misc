@@ -61,12 +61,13 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
                          DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec,
                          _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES, _enc_header_read, sentry_alert, _bkp_status_timeout,
                          _sentry_alert_kinds, db_plain_anomalies, _cfg_bool, convert_octets_readable,
-                         op_allowed, allowed_ops, is_external, _rb_errmsg, _valid_nick_name, _mei_mapped, _purge_mei_dirs)
+                         op_allowed, allowed_ops, is_external, _rb_errmsg, _valid_nick_name, _mei_mapped, _purge_mei_dirs,
+                         _group_pids, _group_alive, _group_wait)   # 1.31.2 : communs à borgHelper (zombies exclus, /proc illisible)
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.31.1"
+WWW_VERSION="1.31.2"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -1988,23 +1989,52 @@ def _run_group(argv,timeout,env):
     """1.31.1 (story 42, A91, décision de l'utilisateur) : sous-processus (borgHelper, borg) en session propre ; au délai,
     SIGTERM à tout le GROUPE (borgHelper et son borg ; le borg PyInstaller relaie SIGTERM à son enfant et rend son verrou de
     dépôt), SIGKILL 10 s après, puis subprocess.TimeoutExpired. Avant : subprocess.run(timeout) tuait le seul processus lancé —
-    son borg continuait orphelin (verrou gardé, écritures de fin perdues ; un /restore de plus de TIMEOUT finissait en douce)."""
+    son borg continuait orphelin (verrou gardé, écritures de fin perdues ; un /restore de plus de TIMEOUT finissait en douce).
+    1.31.2 (story 43, A93 ; mesuré sur 1.31.1 : SIGKILL sauté) : la fin d'un arrêt est le GROUPE vide (`_group_pids`), jamais la
+    fin des tubes de borgHelper — mort au SIGTERM, il fermait ses tubes et `communicate` rendait la main pendant que l'enfant de
+    borg (tubes vers borgHelper) restait orphelin. Restes du groupe après une sortie de borgHelper SANS délai atteint (tué de
+    l'extérieur, OOM, 1er signal d'arrêt relayé) : SIGTERM, 10 s, SIGKILL, puis réponse (décision de l'utilisateur), une ligne
+    [WARN] au journal. Le groupe reste au registre (`_signal_groups`) jusqu'à vide. Bornes : au délai, la réponse part en général
+    10 s après (SIGKILL), 30 s au plus (tubes encore tenus après le SIGKILL : 10 s de plus pour les lire) ; restes après une
+    sortie sans délai : 10 s, 20 s au plus."""
     import signal as _sg
     proc=subprocess.Popen(argv,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=env,start_new_session=True)
     with _LIVE_GROUPS_LOCK: _LIVE_GROUPS.add(proc)   # revue : relais des signaux d'arrêt du serveur (session propre)
+    timed=False; out=err=None
+    def term():
+        try: os.killpg(proc.pid,_sg.SIGTERM)
+        except OSError: pass
+        return time.monotonic()+10
     try:
-        try:
-            out,err=proc.communicate(timeout=timeout)
+        try: out,err=proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            for sig,wait in ((_sg.SIGTERM,10),(_sg.SIGKILL,10)):
-                try: os.killpg(proc.pid,sig)
-                except OSError: pass
-                try: proc.communicate(timeout=wait); break
-                except subprocess.TimeoutExpired: continue
-            raise
+            timed=True; until=term()
+            try: out,err=proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired: pass   # tubes tenus : SIGKILL plus bas
+        else:
+            until=None
+            if _group_alive(proc.pid):   # restes après une sortie sans délai (décision : tout arrêter), dits au journal
+                print(f"[WARN] {_argv_label(argv)} : processus restés dans le groupe après la sortie de borgHelper "
+                      f"(code {proc.returncode}, pids {_group_pids(proc.pid) or '?'}) — SIGTERM, SIGKILL après 10 s",file=sys.stderr)
+                until=term()
+        if until is not None and not _group_wait(proc.pid,until):   # /proc illisible : sonde killpg(0), jamais « vide » par défaut
+            try: os.killpg(proc.pid,_sg.SIGKILL)
+            except OSError: pass
+            _group_wait(proc.pid,time.monotonic()+10)
+        if out is None:
+            try: out,err=proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired: out,err='',''   # tube tenu hors groupe (démon) : jamais une attente sans fin
     finally:
         with _LIVE_GROUPS_LOCK: _LIVE_GROUPS.discard(proc)
+    if timed: raise subprocess.TimeoutExpired(argv,timeout)
     return subprocess.CompletedProcess(argv,proc.returncode,out,err)
+
+def _argv_label(argv):
+    """Nom court d'une commande lancée par _run_group pour le journal (`borgHelper -c <commande>` ou `borg <sous-commande>`),
+    jamais ses arguments (chemins, motifs)."""
+    a=list(argv)
+    if '-c' in a[:-1]: return f"borgHelper {a[a.index('-c')+1]}"
+    return ' '.join([os.path.basename(str(a[0]))]+[str(x) for x in a[1:2]]) if a else '?'
 
 # 1.31.1 (revue story 42) : groupes lancés par _run_group (borgHelper et son borg, en session propre) — un Ctrl-C au terminal ne
 # les atteint plus directement : _signal_groups relaie le signal d'arrêt du serveur (premier : le même, comme le terminal ou
@@ -2013,7 +2043,7 @@ _LIVE_GROUPS=set(); _LIVE_GROUPS_LOCK=threading.Lock()
 
 def _signal_groups(sig):
     # Jamais conditionné à pr.poll() : le 1er signal tue la tête (borgHelper) et laisse un enfant qui l'ignore — le groupe
-    # vit encore tant que _run_group lit ses tubes (sorti du registre ensuite) ; le 2e (SIGKILL) doit l'atteindre (mesuré).
+    # reste au registre jusqu'à vide (1.31.2, _run_group) ; le 2e (SIGKILL) doit l'atteindre (mesuré).
     with _LIVE_GROUPS_LOCK: procs=list(_LIVE_GROUPS)
     for pr in procs:
         try: os.killpg(pr.pid,sig)
@@ -2505,19 +2535,6 @@ def _borg_killgrp(proc,st=None,why=None):
     if st is not None: st['meis'].update(_mei_mapped(_group_pids(proc.pid)))   # 1.31.1 (story 42) : avant le kill
     try: os.killpg(proc.pid,9)
     except OSError: pass
-
-def _group_pids(pgid):
-    """PID des processus du groupe `pgid` (champ pgrp de /proc/<pid>/stat) ; /proc illisible : []."""
-    out=[]
-    try: ents=os.listdir('/proc')
-    except OSError: return out
-    for d in ents:
-        if not d.isdigit(): continue
-        try:
-            with open(f'/proc/{d}/stat') as f: stt=f.read()
-            if int(stt[stt.rindex(')')+2:].split()[2])==pgid: out.append(int(d))
-        except (OSError,ValueError,IndexError): continue
-    return out
 
 def _LIVE_BORG_pop(proc):
     with _LIVE_BORG_LOCK: _LIVE_BORG.pop(proc,None)
@@ -4921,40 +4938,63 @@ def push_selftest():
                     return not bad
                 check("/download/* : chien de garde d'inactivité (TIMEOUT) — groupe tué, corps jamais lu, registre vidé, lent mais actif servi, arrêt : inactifs puis tous (A86)",_download_idle_watchdog)
                 def _exec_timeout_group():
-                    """1.31.1 (story 42, A91, décision de l'utilisateur ; mesuré : subprocess.run(timeout) tuait borgHelper seul, son borg
-                    continuait orphelin) : groupe simulé = script sans exec (tête : borgHelper, meurt au SIGTERM) dont l'enfant (borg) ignore
-                    SIGTERM. _exec_borghelper au délai (3 s : enfant sûrement lancé) -> 504, tête ET enfant arrêtés (SIGKILL 10 s après) ;
-                    _latest_archive réel (délai 60 s demandé, ramené à 3 s) -> 504 « borg list : timeout », groupe arrêté ; arrêt du
-                    serveur (handle_exit) : 1er signal relayé au groupe (tête arrêtée, enfant vivant), 2e : SIGKILL (enfant arrêté)."""
-                    import signal as _sg, shlex
+                    """1.31.1 (story 42, A91) puis 1.31.2 (story 43, A93 ; mesuré sur 1.31.1 : SIGKILL sauté, enfant orphelin) : groupe à la
+                    STRUCTURE RÉELLE (L93) — « borgHelper » (Python, meurt au SIGTERM) -> « borg » (sh sans exec) -> enfant qui ignore
+                    SIGTERM, dont les TUBES mènent à « borgHelper » (pas au serveur : sa mort ferme les tubes du serveur, l'enfant reste).
+                    _exec_borghelper au délai (3 s) -> 504 après le SIGKILL (10 s), groupe vide ; _latest_archive réel (60 s demandé,
+                    ramené à 3 s) -> 504 « borg list : timeout », groupe vide ; « borgHelper » qui sort seul en laissant son borg (décision
+                    de l'utilisateur) -> SIGTERM, 10 s, SIGKILL, réponse gardée (code 0, sortie) ; arrêt du serveur : 1er signal relayé
+                    (tête arrêtée, enfant vivant), 2e : SIGKILL atteint l'enfant restant."""
+                    import signal as _sg
                     real_run_group=_run_group; res={}
-                    def grp(tag):
-                        hf,cf=(os.path.join(tmpdir,f'grp-{tag}.{x}') for x in ('tete','enfant'))
-                        for f in (hf,cf):
-                            with contextlib.suppress(OSError): os.unlink(f)
-                        script=(f'echo $$ > {shlex.quote(hf)}; {shlex.quote(sys.executable)} -c "import signal,time,os; '
-                                f'signal.signal(signal.SIGTERM,signal.SIG_IGN); open({cf!r},\'w\').write(str(os.getpid())); time.sleep(60)"; true')
+                    fake=os.path.join(tmpdir,'grp43.py')
+                    with open(fake+'.tmp','w') as f:
+                        f.write("import subprocess,sys,os\nmode,d=sys.argv[1],sys.argv[2]\nopen(d+'/tete','w').write(str(os.getpid()))\n"
+                                "child=\"import signal,time,os,sys\\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\\n"
+                                "open(sys.argv[1]+'/enfant','w').write(str(os.getpid()))\\ntime.sleep(60)\"\n"
+                                "p=subprocess.Popen(['sh','-c','\"$2\" -c \"$0\" \"$1\"; true',child,d,sys.executable],stdin=subprocess.DEVNULL,"
+                                "stdout=subprocess.PIPE,stderr=subprocess.PIPE)\nopen(d+'/borg','w').write(str(p.pid))\nprint('lancé',flush=True)\n"
+                                "import time\nwhile mode=='sort' and not os.path.exists(d+'/enfant'): time.sleep(0.05)\n"   # enfant sourd au SIGTERM avant la sortie
+                                "if mode=='sort': sys.exit(0)\np.communicate()\n")
+                    os.replace(fake+'.tmp',fake)
+                    def grp(tag,mode='attend'):
+                        d=os.path.join(tmpdir,f'grp43-{tag}'); shutil.rmtree(d,ignore_errors=True); os.makedirs(d)
                         def pids():
-                            try: return int(open(hf).read()),int(open(cf).read())
-                            except (OSError,ValueError): return None,None
-                        return ['sh','-c',script],pids
+                            out=[]
+                            for x in (('tete','enfant') if mode in ('tiens','meurt') else ('tete','borg','enfant')):
+                                try: out.append(int(open(os.path.join(d,x)).read()))
+                                except (OSError,ValueError): out.append(None)
+                            return out
+                        if mode=='tiens':   # tête sh dont l'enfant (sourd au SIGTERM) HÉRITE des tubes du serveur : vrai borg PyInstaller
+                            ch=("import signal,time,os,sys\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+                                "open(sys.argv[1]+'/enfant','w').write(str(os.getpid()))\ntime.sleep(60)")
+                            return ['sh','-c','echo $$ > "$1/tete"; "$2" -c "$0" "$1"; true',ch,d,sys.executable],pids
+                        if mode=='meurt':   # groupe qui sort au SIGTERM : 504 sans attendre les 10 s
+                            ch=("import os,sys,time\nopen(sys.argv[1]+'/enfant','w').write(str(os.getpid()))\ntime.sleep(60)")
+                            return ['sh','-c','echo $$ > "$1/tete"; "$2" -c "$0" "$1"; true',ch,d,sys.executable],pids
+                        return [sys.executable,fake,mode,d],pids
                     def alive(pid):
                         try: return bool(pid) and open(f'/proc/{pid}/stat').read().split(')')[-1].split()[0]!='Z'
                         except OSError: return False
+                    def started(pids,secs=10):
+                        t0=time.monotonic()
+                        while None in pids() and time.monotonic()-t0<secs: time.sleep(0.05)
+                        return None not in pids()
                     def reap(pids):
+                        started(pids,5)   # enfant pas encore inscrit (code fautif qui rend trop tôt) : jamais un reste
                         for x in pids():
                             if alive(x):
                                 with contextlib.suppress(OSError): os.kill(x,9)
-                    # 1) _exec_borghelper
+                    # 1) _exec_borghelper au délai
                     argv,pids=grp('exec'); st=det=None; t0=time.monotonic()
                     try:
                         with mock.patch(f"{__name__}.TIMEOUT",3), \
                              mock.patch(f"{__name__}._build_borghelper_argv_env",lambda *a,**k: (argv,dict(os.environ))):
                             try: _exec_borghelper('selftest-timeout',None,[])
                             except HTTPException as x: st,det=x.status_code,x.detail
-                        dt=time.monotonic()-t0; time.sleep(0.3); h,c=pids()
-                        res['_exec_borghelper']=(st==504 and 'timeout après 3s' in (det or '') and h and c and not alive(h) and not alive(c)
-                                                 and 10<=dt<20,st,det,h,c,round(dt,1))
+                        dt=time.monotonic()-t0; ps_=pids()
+                        res['_exec_borghelper']=(st==504 and 'timeout après 3s' in (det or '') and None not in ps_ and not any(alive(x) for x in ps_)
+                                                 and 12<=dt<25,st,det,ps_,round(dt,1))
                     finally: reap(pids)
                     # 2) _latest_archive réel, délai ramené à 3 s
                     argv,pids=grp('list'); asked=[]; st=det=None; t0=time.monotonic()
@@ -4963,29 +5003,64 @@ def push_selftest():
                         with mock.patch(f"{__name__}._run_group",short):
                             try: _latest_archive({'BORG_REPO':'/x'},dict(os.environ))
                             except HTTPException as x: st,det=x.status_code,x.detail
-                        dt=time.monotonic()-t0; time.sleep(0.3); h,c=pids()
-                        res['_latest_archive']=(st==504 and det=='borg list : timeout' and asked==[(['list','--short'],60)] and h and c
-                                                and not alive(h) and not alive(c) and dt<20,st,det,asked,h,c,round(dt,1))
+                        dt=time.monotonic()-t0; ps_=pids()
+                        res['_latest_archive']=(st==504 and det=='borg list : timeout' and asked==[(['list','--short'],60)] and None not in ps_
+                                                and not any(alive(x) for x in ps_) and dt<25,st,det,asked,ps_,round(dt,1))
                     finally: reap(pids)
-                    # 3) arrêt du serveur : signaux relayés aux groupes en cours
+                    # 2b) _latest_archive réel, tubes du serveur TENUS par un enfant sourd au SIGTERM (structure du vrai borg PyInstaller)
+                    argv,pids=grp('tiens','tiens'); st=det=None; t0=time.monotonic()
+                    def short2(a,timeout,env): return real_run_group(argv,3,env)
+                    try:
+                        with mock.patch(f"{__name__}._run_group",short2):
+                            try: _latest_archive({'BORG_REPO':'/x'},dict(os.environ))
+                            except HTTPException as x: st,det=x.status_code,x.detail
+                        dt=time.monotonic()-t0; ps_=pids()
+                        reaped=bool(ps_[0]) and not os.path.exists(f'/proc/{ps_[0]}')   # tête récoltée (CPython récolte aussi à la destruction du Popen : mutation W5 équivalente)
+                        res['tubes tenus']=(st==504 and None not in ps_ and not any(alive(x) for x in ps_) and reaped and 12<=dt<20,st,ps_,reaped,round(dt,1))
+                    finally: reap(pids)
+                    # 2c) chemin rapide : groupe qui sort au SIGTERM -> 504 sans les 10 s ; sortie normale sans reste -> aucun délai
+                    argv,pids=grp('meurt','meurt'); st=None; t0=time.monotonic()
+                    try:
+                        with mock.patch(f"{__name__}.TIMEOUT",3), \
+                             mock.patch(f"{__name__}._build_borghelper_argv_env",lambda *a,**k: (argv,dict(os.environ))):
+                            try: _exec_borghelper('selftest-timeout',None,[])
+                            except HTTPException as x: st=x.status_code
+                        dt=time.monotonic()-t0; ps_=pids()
+                        res['groupe sorti au SIGTERM : rapide']=(st==504 and None not in ps_ and not any(alive(x) for x in ps_) and dt<6,st,ps_,round(dt,1))
+                    finally: reap(pids)
+                    e0=io.StringIO(); t0=time.monotonic()
+                    with contextlib.redirect_stderr(e0): r=real_run_group(['sh','-c','echo ok'],60,dict(os.environ))
+                    dt=time.monotonic()-t0
+                    res['sortie normale : aucun délai']=(r.returncode==0 and r.stdout=='ok\n' and dt<2 and '[WARN]' not in e0.getvalue(),r.returncode,round(dt,1),e0.getvalue()[-100:])
+                    # 3) « borgHelper » sort seul, son borg reste (décision : tout arrêter, réponse gardée, dit au journal)
+                    argv,pids=grp('sort','sort'); t0=time.monotonic(); e0=io.StringIO()
+                    try:
+                        with contextlib.redirect_stderr(e0): r=real_run_group(argv,60,dict(os.environ))
+                        dt=time.monotonic()-t0; ps_=pids()
+                        res['restes après sortie']=(r.returncode==0 and 'lancé' in r.stdout and None not in ps_ and not any(alive(x) for x in ps_)
+                                                    and 9<=dt<25 and '[WARN] ' in e0.getvalue() and 'processus restés dans le groupe' in e0.getvalue(),
+                                                    r.returncode,r.stdout[-40:],ps_,round(dt,1),e0.getvalue()[-160:])
+                    finally: reap(pids)
+                    # 4) arrêt du serveur : 1er signal relayé, 2e = SIGKILL des restes
                     argv,pids=grp('stop'); out={}
                     def bg():
                         try: out['r']=real_run_group(argv,60,dict(os.environ))
                         except Exception as x: out['r']=x
                     th=threading.Thread(target=bg,daemon=True)
                     try:
-                        th.start(); t0=time.monotonic()
-                        while None in pids() and time.monotonic()-t0<10: time.sleep(0.05)
+                        th.start(); ok0=started(pids)
                         import uvicorn
-                        srv=_make_server(uvicorn.Config(app)); srv.handle_exit(_sg.SIGTERM,None); time.sleep(1); h,c=pids()
-                        first=(h is not None and not alive(h) and alive(c))
-                        srv.handle_exit(_sg.SIGTERM,None); th.join(10)
-                        res['arrêt du serveur']=(first and not alive(c) and not th.is_alive() and not _LIVE_GROUPS,first,h,c,th.is_alive())
+                        srv=_make_server(uvicorn.Config(app)); srv.handle_exit(_sg.SIGTERM,None); time.sleep(1); h,b,c=pids()
+                        first=ok0 and not alive(h) and alive(c)
+                        t1=time.monotonic(); srv.handle_exit(_sg.SIGTERM,None)
+                        while alive(c) and time.monotonic()-t1<5: time.sleep(0.05)
+                        k_dt=time.monotonic()-t1; th.join(15)
+                        res['arrêt du serveur']=(first and not alive(c) and k_dt<3 and not th.is_alive() and not _LIVE_GROUPS,first,(h,b,c),round(k_dt,1),th.is_alive())
                     finally: reap(pids)
                     bad={k:v for k,v in res.items() if not v[0]}
                     if bad: print(f"  {bad}")
                     return not bad
-                check("délai de borgHelperWWW : 504 et groupe arrêté (borgHelper + borg, enfant qui ignore SIGTERM compris) (A91)",_exec_timeout_group)
+                check("délai de borgHelperWWW : 504 et groupe vide (borgHelper -> borg -> enfant qui ignore SIGTERM, tubes vers borgHelper), restes après sortie, arrêt du serveur (A91, A93)",_exec_timeout_group)
                 def _killgrp_mei():
                     """1.31.1 (story 42, A91 ; mutation W8) : borg de téléchargement tué (chien de garde) — ses _MEI* relevés par mappage
                     AVANT le kill (_borg_killgrp), retirés par _borg_reap ; un _MEI* voisin jamais relevé (un autre borg) intact."""

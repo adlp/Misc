@@ -412,7 +412,7 @@ nicks internes donnaient « Ce serveur est inconnu » (code 3) sans aucune sauve
 
 > **Priorité sur Index :** `Bkp` est prioritaire sur `Index` à tout moment — même si `Index` est en cours à n'importe quelle étape :
 > - Si `Index` démarre alors que `Bkp` est déjà actif → annulation immédiate avant même le premier `borg diff`.
-> - Si `Bkp` démarre pendant un `Index` → les `borg diff` actifs reçoivent SIGKILL, `Index` s'arrête complètement (borg info et indexsnap inclus).
+> - Si `Bkp` démarre pendant un `Index` → les `borg diff` actifs reçoivent SIGTERM, puis SIGKILL de ce qui reste de leur arbre de processus 5 s après, `Index` s'arrête complètement (borg info et indexsnap inclus).
 > - Dans les deux cas, `Index` pose un flag de reprise (`index-pending.lock`) : `Bkp` le détecte en fin d'exécution et relance automatiquement `Index` complet.
 
 **Sortie stdout (JSON)** — stdout ne contient que ce JSON, imprimé à la fin (après l'indexation ; ses
@@ -861,7 +861,8 @@ temps en temps pour rendre la place libérée (le `Prune` de borgHelper compacte
 > Un seul `Index` à la fois par dépôt : un second (un cron, par exemple) s'arrête aussitôt avec « Index déjà en cours ».
 > Une tranche (`-t`) compte la pause dans son budget et sort à l'échéance ; le cron suivant reprend.
 > Depuis 1.0.145, les `borg diff` en cours sont arrêtés par SIGTERM (borg rend lui-même son verrou de dépôt), SIGKILL
-> après 5 s seulement ; plus aucun `borg break-lock`, qui cassait aussi le verrou d'un `borg create` externe, d'un
+> après 5 s seulement (1.0.180 : 5 s pour que borg ET son arbre sortent, puis SIGKILL de l'arbre restant et attente de sa fin —
+> une tranche peut ainsi dépasser son budget d'environ 20 s au plus) ; plus aucun `borg break-lock`, qui cassait aussi le verrou d'un `borg create` externe, d'un
 > `borg mount` ou d'un autre hôte. L'Index attend la fin de **toutes** les opérations prioritaires du dépôt : un
 > Restore qui finit pendant un Bkp ne le fait plus reprendre à côté du Bkp.
 
@@ -1567,7 +1568,7 @@ première requête — voir `docs/borghelperrc.example`.
 | `BORGHELPERWWW_API_KEY` | `-K`, `--api-key` | `api_key` | Clé partagée attendue dans le header `X-API-Key` — absente : **générée aléatoirement** au démarrage (voir ci-dessous) |
 | `BORGHELPERWWW_BORGHELPER_BIN` | `--borghelper-bin` | `borghelper_bin` | Chemin du script `borgHelper` (défaut : à côté de `borgHelperWWW`) |
 | `BORGHELPERWWW_UI_FILE` | `--ui-file` | `ui_file` | Chemin de `borgHelperWWW_ui.html` (défaut : à côté de `borgHelperWWW`) |
-| `BORGHELPERWWW_TIMEOUT` | `--timeout` | `timeout` | Timeout en secondes par commande (défaut 3600 ; 0 = illimité) ; `/download/*` : inactivité maximale de borg (1.31.0) ; au délai (1.31.1) : borgHelper ET son borg arrêtés (SIGTERM au groupe, SIGKILL 10 s après), 504 — toute commande passée à borgHelper (Report, Prune, DelBkp, Init, Key, `/restore`…) : un `/restore` plus long que ce délai est arrêté (fichiers partiels) ; avant : borg continuait seul. Arrêt du serveur : signal relayé aux commandes en cours (2e signal : SIGKILL) |
+| `BORGHELPERWWW_TIMEOUT` | `--timeout` | `timeout` | Timeout en secondes par commande (défaut 3600 ; 0 = illimité) ; `/download/*` : inactivité maximale de borg (1.31.0) ; au délai (1.31.1) : borgHelper ET son borg arrêtés (SIGTERM au groupe, SIGKILL 10 s après), 504 — toute commande passée à borgHelper (Report, Prune, DelBkp, Init, Key, `/restore`…) : un `/restore` plus long que ce délai est arrêté (fichiers partiels) ; avant : borg continuait seul. Arrêt du serveur : signal relayé aux commandes en cours (2e signal : SIGKILL). 1.31.2 : la fin d'un arrêt est le groupe VIDE (avant : un enfant de borg qui ignorait SIGTERM survivait, SIGKILL jamais envoyé) — 504 en général 10 s après le délai dans ce cas (30 s au plus) ; borgHelper sorti sans délai (tué, OOM, arrêt du serveur) en laissant son borg : restes arrêtés (SIGTERM, 10 s, SIGKILL) avant la réponse, ligne `[WARN]` au journal |
 | `BORGHELPERWWW_HOST` | `--host` | `host` | Bind — adresse (défaut `127.0.0.1`) |
 | `BORGHELPERWWW_PORT` | `--port` | `port` | Bind — port (défaut `8000`) |
 | `BORGHELPERWWW_TRUSTED_PROXIES` | `--trusted-proxies` | `trusted_proxies` | IP/CIDR des reverse proxies de confiance, séparées par des virgules, ou `*` pour toutes (défaut `127.0.0.1`) — IP du navigateur dans le journal des requêtes, dans les deux modes de lancement (voir ci-dessous) |

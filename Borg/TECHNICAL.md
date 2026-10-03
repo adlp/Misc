@@ -564,7 +564,7 @@ _bkp_server_version() → borg qui a reçu les données (ne lève jamais : appel
     une autre : None ; dépôt ssh direct = `<BORG_RSH|ssh> [-o BatchMode=yes -o ControlMaster=no -o ControlPath=none]
     [-p port] hôte <BORG_REMOTE_PATH|borg> --version` ; dépôt local (chemin, file://) = créateur. Environnement de boex
     (clés borg du rc, PATH, LC_ALL), stdin fermé, start_new_session (sans terminal), _BORG_VERSION_TIMEOUT 15 s puis
-    killpg + _MEI apparus retirés, décodage tolérant. _version_from_output : « borg… X.Y » ou réponse de borg serve
+    killpg + _MEI de son groupe retirés (1.0.180 : relevés par processus, plus par listing), décodage tolérant. _version_from_output : « borg… X.Y » ou réponse de borg serve
     lancé par une clé à commande forcée (« Borg X.Y: Got connection close… », mesuré). Sans numéro, code 0 : None en
     silence ; échec : [WARN], jamais d'échec ; JSON stdout borgHelper_borg_versions {archive, server}
     ↓
@@ -2337,7 +2337,7 @@ plus borg si l'arrêt est déjà demandé. Vrai borg mesuré : `exec nice borg.w
 ces processus (`/proc/<pid>/maps`), relevés par `_kill_tree` AVANT le signal ; `_purge_mei_dirs(dirs)` les retire ensuite s'ils
 sont à nous et plus utilisés (`_mei_in_use`), même tout juste extraits — jamais l'extraction d'un autre borg (avant/après par
 listing : écarté en revue). Utilisé par boex, `_index_diffs`, borgHelperWWW `_borg_killgrp`/`_borg_reap` (`_group_pids` du
-groupe) ; `_bkp_server_version` inchangé. borgHelperWWW `_run_group` (`_exec_borghelper`, `_latest_archive`) : session propre,
+groupe) ; `_bkp_server_version` : voir story 43 ci-dessous. borgHelperWWW `_run_group` (`_exec_borghelper`, `_latest_archive`) : session propre,
 au délai `killpg` SIGTERM, 10 s, SIGKILL, puis `TimeoutExpired` (504) ; registre `_LIVE_GROUPS` : `_signal_groups(sig)` relaie
 l'arrêt du serveur (`handle_exit` : 1er signal le même, 2e SIGKILL ; atexit et `threading._register_atexit` : SIGKILL) —
 sans condition sur `poll()` (la tête morte au SIGTERM, son enfant vit encore dans le groupe, mesuré). `_cache_fingerprint` :
@@ -2346,6 +2346,20 @@ RepoHistory/ArchiveHistory et `_hist(strict=True)` (RepoHistory ; texte : sonde 
 `_diff_stats_for_nick` ne rattrape plus que `sqlite3.Error` ; Report (`prep_report`/`prep_report_from_db`) rattrape
 DbKeyError/DbModeError/DbTamperError/DbCodecError : `[ERREUR] <nick>: comptes de modifications illisibles`, Modifs « — »,
 marque `_stats_error` retirée par `report`/`report_offline` -> code 1, ligne gardée.
+**Arrêts : l'arbre, jamais la tête (1.0.180 / WWW 1.31.2, story 43)** : `_tree_wait(ps, tree, until, mei)` — relit l'arbre
+(`_kill_tree(…, 0, …)`, signal 0) jusqu'à tête récoltée et plus aucun processus vivant (`_proc_live` : même heure de démarrage,
+pas zombie) ; seul critère de fin de boex (arrêt demandé : `communicate(5)` lit les tubes, puis l'arbre ; Ctrl-C) et de
+`_index_diffs` (borg lancé pendant l'arrêt ; moniteur : `seen` = tous les borg signalés, SIGKILL aux arbres restants, récoltés
+ou non ; `monitor.join(30)` après un arrêt, avant : 2 s). `_group_pids(pgid)` (membres vivants, zombies exclus) vit dans
+borgHelper, importé par borgHelperWWW ; `_bkp_server_version` : `_mei_mapped(_group_pids(p.pid))` avant le `killpg` (mappés, ouverts ou cwd : un chargeur tué pendant
+son extraction ne mappe rien), `_group_wait` après, puis `_purge_mei_dirs` et `_purge_mei_orphans`. Après chaque SIGKILL,
+l'arbre est encore attendu (SIGKILL asynchrone) avant la purge des `_MEI`. `_group_pids` rend None si /proc est illisible ;
+`_group_alive` sonde alors `killpg(pgid, 0)` — jamais « vide » faute d'information.
+borgHelperWWW `_run_group` : fin = `_group_wait(pgid, until)` (groupe vide) ; au délai SIGTERM, 10 s, SIGKILL ; après une sortie
+sans délai avec des restes : idem avant la réponse, une ligne `[WARN] … processus restés dans le groupe` au journal ;
+bornes : réponse en général 10 s après le délai, 30 s au plus (tubes encore tenus après le SIGKILL) ; registre `_LIVE_GROUPS` gardé jusqu'au groupe vide. Mesuré sur 1.31.1 :
+504 en 6,07 s, enfant vivant 12 s après (SIGKILL sauté) ; 1.31.2 : 504 en 16,1 s, groupe vide ; arrêt du serveur : enfant tué
+10,1 s après le 1er signal.
 
 **Code des lecteurs, téléchargements bornés, HTTP/1.0, filtre exact (1.0.178 / WWW 1.31.0 / UI 1.23.0, story 41)** :
 `_READER_FAILED` (drapeau de processus, remis à faux par `_cli_main`) posé par `_reader_sqlite_err`/`_reader_sqlite_line` (vraie

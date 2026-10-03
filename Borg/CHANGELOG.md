@@ -1,5 +1,29 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.180 / borgHelperWWW 1.31.2 — SIGKILL du groupe garanti, arrêts qui attendent l'arbre de borg — 2026-10-03
+
+Chantier « reconstruction progressive », story 43 (actions de rétrospective A93 à A95 ; regroupement demandé par l'utilisateur).
+
+- **borgHelperWWW : SIGKILL du groupe garanti** (défaut de 1.31.1 mesuré sur serveur réel : au délai, borgHelper mourait au
+  SIGTERM, ses tubes se fermaient et le SIGKILL n'était jamais envoyé — un enfant de borg qui ignore SIGTERM restait orphelin).
+  La fin d'un arrêt est désormais le groupe vide : au délai, SIGTERM, 10 s au plus, SIGKILL des restes, puis 504 (en
+  général 10 s plus tard qu'avant dans ce cas, 30 s au plus ; un groupe qui sort au SIGTERM répond toujours aussitôt).
+  borgHelper qui sort sans délai atteint (tué de l'extérieur, OOM, 1er signal d'arrêt du serveur) en laissant son borg :
+  restes arrêtés de même (SIGTERM, 10 s, SIGKILL), ligne `[WARN]` au journal, puis réponse (décision de l'utilisateur). Le
+  2e signal d'arrêt du serveur atteint les groupes encore peuplés. /proc illisible : jamais pris pour « groupe vide ».
+- **borgHelper : chaque arrêt attend l'arbre de borg**, plus la fin de sa tête ni de ses tubes : boex arrêté (arrêt demandé,
+  Ctrl-C), Index (échéance, priorité ; aussi l'arbre d'un borg diff déjà récolté, et l'Index attend désormais la fin du
+  SIGKILL avant de rendre la main ; une tranche peut dépasser son budget d'environ 20 s au plus) — un enfant sans tubes qui
+  restait vivant est attendu 5 s puis tué, et l'arbre est attendu après chaque SIGKILL avant de retirer ses `_MEI*`. Vrai
+  borg (`with-lock … sleep`, mesuré) : arrêt en 0,1 s, inchangé. Version du borg serveur sans réponse : seuls les `_MEI*` de
+  CE borg sont retirés — mappés, ouverts ou dossier courant (un chargeur tué pendant son extraction ne mappe rien) ; avant :
+  listing de /tmp, qui pouvait viser l'extraction d'un autre borg.
+- CodecSelfTest : borg dont la tête sort au SIGTERM et dont l'enfant sans tubes reste (boex, Index, délai de grâce ≥ 4 s) ;
+  petit-enfant né au SIGTERM dont le parent sort ; version muette qui mappe ou tient ouvert un `_MEI*` (voisin né pendant
+  l'appel intact) ; /proc illisible ; garde AST « chaque SIGKILL suivi d'une attente de l'arbre ou du groupe ». push_selftest : délai, `_latest_archive`, borgHelper qui sort en laissant son borg, arrêt du serveur — à la
+  structure réelle borgHelper -> borg -> enfant (tubes de l'enfant vers borgHelper ; l'ancien contrôle donnait à l'enfant
+  les tubes du serveur et cachait le défaut), tubes du serveur tenus par l'enfant (vrai `borg list`), chemins rapides.
+
 ## borgHelper 1.0.179 / borgHelperWWW 1.31.1 — Index vide en avertissement, lecteurs sans résultat dits, borg arrêté par arbre de processus, erreurs avalées dites — 2026-10-03
 
 Chantier « reconstruction progressive », story 42 (actions de rétrospective A89 à A92 ; regroupement demandé par l'utilisateur).
