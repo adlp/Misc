@@ -6,11 +6,11 @@
 #* See <http://www.gnu.org/licenses/>
 #*/
 
-import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading,uuid
+import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,threading,uuid,signal
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.178"
+Version="1.0.179"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -912,9 +912,9 @@ def _duidx_sort_key(pk,merged,sort_by,reverse):
 def _duidx_fmt(cnt,sz):
     return f"{cnt} / {convert_octets_readable(sz)}" if cnt else '—'
 
-def _duidx_print(totals,label,grouped,sort_by='chemin',reverse=False,as_json=False):
-    if not totals:
-        print("Aucune donnée." if not as_json else '{}'); return
+def _duidx_print(totals,label,grouped,sort_by='chemin',reverse=False,as_json=False,failed=False):
+    if not totals:   # 1.0.179 (A89) : failed (une lecture a échoué) -> l'absence n'est pas un résultat ; -j : `{}` gardé
+        print('{}' if as_json else ("Aucune donnée dans les bases lisibles (erreurs ci-dessus)." if failed else "Aucune donnée.")); return
     if grouped:
         merged=_duidx_merge(totals)
         paths=sorted(set(pk for pk,_ in merged),
@@ -2293,7 +2293,7 @@ def _close_quiet(conn):
 
 def _codec_fail(label,e,conn=None):
     """Valeur de chemin stockée illisible (DbCodecError, pas une sqlite3.Error) : ferme la connexion, message par nick."""
-    _READER_FAILED[0]=True   # 1.0.178 (A87) : nick en échec -> code 1 d'un lecteur
+    _READER_FAILED[0]+=1   # 1.0.178 (A87) : nick en échec -> code 1 d'un lecteur
     msg=f"{label}: chemin stocké illisible ({e}) — base altérée ou clé incorrecte"
     printer(f"[ERREUR] {msg}")
     try: conn.close()
@@ -2359,7 +2359,7 @@ class _PerNick:
             try: self.conn().close()   # connexion du nick arrêté (ou déjà fermée / inexistante)
             except Exception: pass
         self.ko+=1; self.stop=e if self.stop is None else self.stop
-        _READER_FAILED[0]=True   # 1.0.178 (A87, décision de l'utilisateur) : un nick arrêté parmi plusieurs -> code 1 d'un lecteur
+        _READER_FAILED[0]+=1   # 1.0.178 (A87, décision de l'utilisateur) : un nick arrêté parmi plusieurs -> code 1 d'un lecteur
         return True
     def done(self):
         if self.stop is not None and self.ko==len(self.nicks): raise self.stop
@@ -2424,6 +2424,14 @@ def _db_check_readonly(db_path,schema_version,what="l'index"):
         raise SchemaVersionError(f"({db_path}) schéma DB v{stored} > attendu v{schema_version} — "
                                  "DB créée par une version plus récente de borgHelper, mettez à jour borgHelper.")
 
+def _path_present(p):
+    """1.0.179 (story 42, A92) : False seulement si le fichier n'existe pas (ENOENT) ; dossier non traversable ou autre
+    OSError -> True : présent mais illisible, la sonde ou l'ouverture qui suit dit l'erreur réelle. os.path.exists rend False
+    pour EACCES (« absent » à tort, mesuré : RepoHistory/ArchiveHistory sur un dossier de cache en 000)."""
+    try: os.stat(p); return True
+    except FileNotFoundError: return False
+    except OSError: return True
+
 def _db_absent(db_path):
     """1.0.170 (story 33) : base ABSENTE pour une commande (IdxTop, DiffTop, IdxPurge, Db*) ; illisible ou verrouillée :
     False — jamais présentée comme absente, l'erreur réelle reste visible. Délai court : un verrou vaut False de toute façon.
@@ -2443,7 +2451,9 @@ _SQLITE_ERR_SEEN=set()
 # 1.0.178 (story 41, A87, décisions de l'utilisateur) : un lecteur de _READER_CODE_CMDS a rencontré une erreur — sqlite3.Error
 # réelle (verrou au-delà du délai, corruption ; jamais « table/colonne absente »), nick arrêté parmi plusieurs (_PerNick), chemin
 # illisible (_codec_fail) -> la commande sort en code 1 (au moins), données des autres nicks gardées. Avant : code 0.
-_READER_FAILED=[False]
+# 1.0.179 (story 42) : COMPTEUR d'erreurs (jamais remis à zéro hors _cli_main) — un lecteur sait s'il en a rencontré une
+# PENDANT son appel (valeur avant / après), sans être trompé par un appel précédent du même processus (selftest, bibliothèque).
+_READER_FAILED=[0]
 _READER_CODE_CMDS=frozenset(('search','filehist','treehist','treefind','duidx','idxtop','difftop','archivehistory','repohistory',
                              'cacheinfo','lstbkp','lstbkpfls'))
 
@@ -2462,7 +2472,7 @@ def _reader_sqlite_line(e,db_path):
     """1.0.176 (story 39, A78) : ligne d'une erreur SQLite dont le lecteur n'a pas d'autre sortie (IdxTop/DiffTop texte) — vraie
     erreur pas encore dite pour cette base : « [ERREUR] SQLite error … » (marquée, _reader_sqlite_err) ; sinon (table absente,
     déjà dite) : la ligne d'avant, « SQLite error … » sans marque — jamais une sortie vide."""
-    if not _sqlite_missing(e): _READER_FAILED[0]=True   # 1.0.178 (A87) : code 1
+    if not _sqlite_missing(e): _READER_FAILED[0]+=1   # 1.0.178 (A87) : code 1
     if not _sqlite_missing(e) and db_path not in _SQLITE_ERR_SEEN:
         _SQLITE_ERR_SEEN.add(db_path); return f"[ERREUR] SQLite error ({db_path}): {e}"
     return f"  SQLite error ({db_path}): {e}"
@@ -2473,7 +2483,7 @@ def _reader_sqlite_err(e,db_path,key=None):
     error (<base>): <erreur>` sur stderr, une fois par base et par processus ; sortie partielle et code inchangés (borgHelperWWW
     ne met jamais en cache une réponse qui porte [ERREUR]). Avant : avalée, réponse fausse (« — », « Index vide ») en code 0."""
     if _sqlite_missing(e): return
-    _READER_FAILED[0]=True   # 1.0.178 (A87) : code 1 d'un lecteur de _READER_CODE_CMDS (marque dite ou non)
+    _READER_FAILED[0]+=1   # 1.0.178 (A87) : code 1 d'un lecteur de _READER_CODE_CMDS (marque dite ou non)
     k=db_path if key is None else key   # key : marque propre à un lecteur du watcher (_reader_sqlite_ok)
     if k in _SQLITE_ERR_SEEN: return
     _SQLITE_ERR_SEEN.add(k); printer(f"[ERREUR] SQLite error ({db_path}): {e}")
@@ -3450,14 +3460,16 @@ class BorgHelperDB:
 
     # ── history.db (1.0.139, AD-7) : mesures non régénérables, ouvertes sans nick (aucun chemin, jamais chiffrée) ──
 
-    def _hist(self,nick,db_path=None,create=False):
+    def _hist(self,nick,db_path=None,create=False,strict=False):
         """history.db à utiliser : db_path explicite, sinon celle du nick (après migration éventuelle de diff.db,
         history_path). create=True (écrivain qui crée : Bkp, Prune, refresh d'Index) : schéma garanti. Sinon (lecteur,
         réclamation du watcher) : None si le fichier n'existe pas — jamais de création sur une lecture."""
         if db_path is None: db_path=self.history_path(nick,writer=create)
         if create:
             self.ensure_history_db(db_path,create=True); return db_path
-        return db_path if os.path.exists(db_path) else None
+        # 1.0.179 (A92) : strict (RepoHistory) — dossier non traversable = présent (l'ouverture dit l'erreur réelle) ; les
+        # autres lecteurs (watcher, Status, /access) gardent « absent » : diff.db du même dossier dit l'erreur, eux non bloqués
+        return db_path if (_path_present(db_path) if strict else os.path.exists(db_path)) else None
 
     def store_archive_measure(self,nick,archive,archive_date,deduplicated_size,changed_during_backup,read_errors,db_path=None,
                               borg_version=None,borg_server_version=None):
@@ -3933,9 +3945,9 @@ class BorgHelperDB:
         except sqlite3.Error as e:   # 1.0.175 (A72) : vraie erreur marquée, « table absente » silencieuse
             if not own: raise
             _reader_sqlite_err(e,self.get_diff_db(nick)); return {}
-        except Exception:
-            if not own: raise
-            return {}
+        # 1.0.179 (story 42, A92) : plus de `except Exception: return {}` — DbModeError/DbKeyError/DbTamperError (base en
+        # migration, passphrase, en-tête altéré) et tout défaut remontent comme partout (_PerNick, gestionnaire global) ; avant :
+        # comptes nuls en code 0 dans ArchiveHistory et Report, sans un mot.
 
     def _chart_counts(self,nick,conn,archives):
         """Comptages ajoutés/modifiés/supprimés figeables (mêmes règles qu'ArchiveHistory) d'archives encore en base,
@@ -3963,7 +3975,7 @@ class BorgHelperDB:
             # requête passant par un autre index répondre [] en forme de succès
             if isinstance(e,sqlite3.OperationalError) and str(e).startswith(('no such table','no such column')): return True
             _SQLITE_ERR_SEEN.add(db_path)   # une seule ligne : celle de l'appelant
-            _READER_FAILED[0]=True   # 1.0.178 (A87) : code 1
+            _READER_FAILED[0]+=1   # 1.0.178 (A87) : code 1
             return f"SQLite error ({db_path}): {e}"
 
     def _diff_archive_filter(self,nick,archive_from,conn,archive_to=None):
@@ -3992,8 +4004,8 @@ class BorgHelperDB:
                 db_path=self.get_diff_db(n)
                 self.ensure_diff_db(db_path,create=False)
                 ie=self._is_index_empty(n,db_path)   # 1.0.175 (A72) : True (vide) ou message d'erreur SQLite réelle
-                if ie:
-                    printer(f"[ERREUR] {ie if isinstance(ie,str) else f'Index vide pour {n} — lancez : borgHelper -c Index -n {n}'}"); continue
+                if ie:   # 1.0.179 (A89, décision de l'utilisateur) : index vide = état d'un nick neuf, [WARN] (code 0) ; erreur : [ERREUR]
+                    printer(f"[ERREUR] {ie}" if isinstance(ie,str) else f"[WARN] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
                 conn=None
                 try:
                     conn=_open_db(db_path,nick=n,role='read',empty_ok=True)
@@ -4029,8 +4041,8 @@ class BorgHelperDB:
                 db_path=self.get_diff_db(n)
                 self.ensure_diff_db(db_path,create=False)
                 ie=self._is_index_empty(n,db_path)   # 1.0.175 (A72) : True (vide) ou message d'erreur SQLite réelle
-                if ie:
-                    printer(f"[ERREUR] {ie if isinstance(ie,str) else f'Index vide pour {n} — lancez : borgHelper -c Index -n {n}'}"); continue
+                if ie:   # 1.0.179 (A89, décision de l'utilisateur) : index vide = état d'un nick neuf, [WARN] (code 0) ; erreur : [ERREUR]
+                    printer(f"[ERREUR] {ie}" if isinstance(ie,str) else f"[WARN] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
                 conn=None
                 try:
                     conn=_open_db(db_path,nick=n,role='read',empty_ok=True)
@@ -4076,8 +4088,8 @@ class BorgHelperDB:
                 db_path=self.get_diff_db(n)
                 self.ensure_diff_db(db_path,create=False)
                 ie=self._is_index_empty(n,db_path)   # 1.0.175 (A72) : True (vide) ou message d'erreur SQLite réelle
-                if ie:
-                    printer(f"[ERREUR] {ie if isinstance(ie,str) else f'Index vide pour {n} — lancez : borgHelper -c Index -n {n}'}"); continue
+                if ie:   # 1.0.179 (A89, décision de l'utilisateur) : index vide = état d'un nick neuf, [WARN] (code 0) ; erreur : [ERREUR]
+                    printer(f"[ERREUR] {ie}" if isinstance(ie,str) else f"[WARN] Index vide pour {n} — lancez : borgHelper -c Index -n {n}"); continue
                 conn=None
                 try:
                     conn=_open_db(db_path,nick=n,role='read',empty_ok=True)
@@ -4145,6 +4157,88 @@ def _mei_in_use(d):
         except PermissionError: pass   # autre utilisateur : ne peut pas ouvrir nos répertoires 0700
         except OSError: return True
     return False
+
+def _proc_kids():
+    """{ppid: [pid…]} lu dans /proc/*/stat ; /proc illisible (chroot, conteneur) : {} — jamais une exception."""
+    kids={}
+    try: ents=os.listdir('/proc')
+    except OSError: return kids
+    for d in ents:
+        if not d.isdigit(): continue
+        try:
+            with open(f'/proc/{d}/stat') as f: st=f.read()
+            kids.setdefault(int(st[st.rindex(')')+2:].split()[1]),[]).append(int(d))
+        except (OSError,ValueError,IndexError): continue
+    return kids
+
+def _proc_descendants(pid,kids=None):
+    """1.0.179 (story 42, A91) : PID des descendants de `pid`, relevés AVANT de tuer : un enfant dont le parent meurt est
+    rattaché à init et ne se retrouve plus."""
+    kids=_proc_kids() if kids is None else kids
+    out=[]; todo=[pid]
+    while todo:
+        for c in kids.get(todo.pop(),[]): out.append(c); todo.append(c)
+    return out
+
+def _proc_start(pid):
+    """Heure de démarrage d'un processus (champ 22 de /proc/<pid>/stat), None s'il n'existe plus : (pid, heure) désigne un
+    processus sans ambiguïté — jamais un PID réattribué entre deux signaux."""
+    try:
+        with open(f'/proc/{pid}/stat') as f: st=f.read()
+        return st[st.rindex(')')+2:].split()[19]
+    except (OSError,ValueError,IndexError): return None
+
+def _mei_mapped(pids):
+    """1.0.179 (A91) : dossiers _MEI* (PyInstaller) mappés par ces processus (/proc/<pid>/maps) — relevés avant de les tuer :
+    seuls ceux-là sont retirés ensuite (jamais l'extraction d'un autre borg)."""
+    out=set()
+    for p in pids:
+        try:
+            with open(f'/proc/{p}/maps') as f:
+                for l in f:
+                    i=l.find('/_MEI')
+                    if i<0: continue
+                    path=l[l.index('/'):].rstrip('\n')
+                    j=path.find('/_MEI'); k=path.find('/',j+1)
+                    out.add(path[:k] if k>0 else path)
+        except (OSError,ValueError): continue
+    return out
+
+def _kill_tree(ps,sig,known=None,mei=None):
+    """1.0.179 (story 42, A91) : signal `sig` à borg ET à ses descendants. Le vrai borg est un script `exec nice borg.wrapped`
+    (chargeur PyInstaller + enfant ; ssh pour un dépôt distant) : SIGTERM à la tête est relayé, SIGKILL ne l'est jamais —
+    l'enfant survivait, tube de sortie ouvert (lecture bloquée), verrou de dépôt et /tmp/_MEI* gardés (mesuré). Même groupe
+    de processus qu'avant : un Ctrl-C au terminal atteint toujours borg. Rend {pid: heure de démarrage} des processus relevés,
+    à repasser (`known`) au signal suivant : une tête morte au premier signal laisse ses enfants rattachés à init ; à chaque
+    appel les descendants de la tête vivante ET de chaque processus connu encore vivant sont relevés à nouveau (un enfant né
+    après le premier signal). `mei` (ensemble) : enrichi des _MEI* mappés par ces processus, avant le signal. Tête déjà
+    récoltée : jamais visée (PID réutilisable) ; un pid connu n'est visé que s'il a la même heure de démarrage."""
+    known=dict(known or {})
+    kids=_proc_kids()
+    alive=lambda: [p for p,st in known.items() if _proc_start(p)==st]
+    roots=([ps.pid] if ps.poll() is None else [])+alive()
+    for r in roots:
+        for p in _proc_descendants(r,kids):
+            st=_proc_start(p)
+            if st is not None: known.setdefault(p,st)
+    targets=alive()
+    if mei is not None: mei.update(_mei_mapped(([ps.pid] if ps.returncode is None else [])+targets))
+    if ps.returncode is None:
+        try: os.kill(ps.pid,sig)
+        except OSError: pass
+    for p in targets:
+        try: os.kill(p,sig)
+        except OSError: pass
+    return known
+
+def _purge_mei_dirs(dirs):
+    """1.0.179 (A91) : retire les dossiers _MEI* donnés (relevés par _kill_tree sur les borg tués), s'ils sont à nous et plus
+    utilisés par aucun processus — même tout juste extraits (que _purge_mei_orphans, 120 s sans modification, garde)."""
+    for d in dirs:
+        try:
+            st=os.lstat(d)
+            if stat.S_ISDIR(st.st_mode) and st.st_uid==os.getuid() and not _mei_in_use(d): shutil.rmtree(d,ignore_errors=True)
+        except Exception: pass
 
 def _purge_mei_orphans(min_age=120):
     """Répertoires PyInstaller (<TMPDIR>/_MEI*, ~60 Mo chacun) laissés par un borg arrêté par SIGKILL, ou par SIGTERM
@@ -4337,7 +4431,7 @@ class BorgRunner:
             if arg[1] in "extract": sys.exit(4)
         ps=subprocess.Popen(commande,encoding='utf-8',env=varfut,cwd=rep,bufsize=8192,
                             stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-        killed=False
+        killed=False; tree=None; meis=set()   # 1.0.179 (A91) : arbre relevé et _MEI* mappés de ce borg (s'il est tué)
         try:
             stop=self._stop
             if stop is None: inf,errs=ps.communicate()
@@ -4348,17 +4442,32 @@ class BorgRunner:
                         if stop():
                             # SIGTERM d'abord : borg relâche son verrou de dépôt (et ferme proprement un borg serve
                             # distant) ; SIGKILL seulement s'il ne s'arrête pas en 5 s.
-                            ps.terminate()
+                            # 1.0.179 (A91) : l'ARBRE de borg (_kill_tree) et des lectures bornées — avant, SIGKILL à la tête
+                            # seule puis communicate() sans délai : un enfant PyInstaller survivant bloquait l'Index
+                            tree=_kill_tree(ps,signal.SIGTERM,tree,meis)
                             try: inf,errs=ps.communicate(timeout=5)
-                            except subprocess.TimeoutExpired: ps.kill(); inf,errs=ps.communicate()
+                            except subprocess.TimeoutExpired:
+                                tree=_kill_tree(ps,signal.SIGKILL,tree,meis)
+                                try: inf,errs=ps.communicate(timeout=10)
+                                except subprocess.TimeoutExpired: inf,errs='',''   # tube tenu par un processus hors arbre (démon)
+                                with contextlib.suppress(subprocess.TimeoutExpired): ps.wait(1)   # code de retour lu
                             killed=True; BorgRunner._tls.kills=self._kills+1; break
         except KeyboardInterrupt:
-            ps.kill(); ps.wait()
-            _purge_mei_orphans()
+            # 1.0.179 (A91 ; revue) : borg a reçu SIGINT du terminal (groupe) — SIGTERM à l'arbre et 5 s pour sortir proprement
+            # (verrou rendu), puis SIGKILL à l'arbre relevé : l'enfant PyInstaller ne meurt pas d'un SIGKILL à la tête (mesuré)
+            try:
+                tree=_kill_tree(ps,signal.SIGTERM,tree,meis)
+                # 5 s pour la tête ET l'arbre relevé (run complet story 42 : une tête morte aussitôt ne laissait aucun délai à
+                # l'enfant qui, lui, rend le verrou)
+                end=time.monotonic()+5
+                while time.monotonic()<end and (ps.poll() is None or any(_proc_start(p)==t for p,t in tree.items())): time.sleep(0.1)
+                _kill_tree(ps,signal.SIGKILL,tree,meis); ps.wait()
+            except KeyboardInterrupt: _kill_tree(ps,signal.SIGKILL,tree,meis); ps.wait()   # second Ctrl-C : tout de suite
+            _purge_mei_dirs(meis); _purge_mei_orphans()
             printer("\n[INTERRUPTED] Opération annulée par l'utilisateur.")
             sys.exit(130)
         ret={'stdout':[],'stderr':[]}
-        if killed: inf=''; _purge_mei_orphans()   # sortie tronquée d'un borg tué : jamais parsée
+        if killed: inf=''; _purge_mei_dirs(meis); _purge_mei_orphans()   # sortie tronquée d'un borg tué : jamais parsée
         if len(inf):
             if inf[0] in '[{' and retjson: ret['stdout'].append(json.loads(inf))
             else:
@@ -5300,15 +5409,13 @@ class BorgHelper:
         rows=[]
         # 1.0.178 (revue story 41) : un nick dont cache.db s'arrête (passphrase absente, base occupée, en-tête altéré) n'arrête
         # plus les autres (_PerNick, code 1) ; nick seul ou tous en échec : relancé comme avant
-        prev=_READER_FAILED[0]; _READER_FAILED[0]=False   # erreur de CET appel (un appel précédent en processus ne compte pas)
-        try:
-            _iso=_PerNick(nicks)
-            for n in _iso.nicks:
-                with _iso(n): rows.extend(self.db.get_cache_rows(n))
-            _iso.done()
-        finally: err=_READER_FAILED[0]; _READER_FAILED[0]=prev or err
+        n0=_READER_FAILED[0]   # erreur de CET appel (compteur : un appel précédent en processus ne compte pas)
+        _iso=_PerNick(nicks)
+        for n in _iso.nicks:
+            with _iso(n): rows.extend(self.db.get_cache_rows(n))
+        _iso.done()
         if not rows:
-            if not err: print("Cache vide.")   # erreur : jamais présentée comme un cache vide
+            if _READER_FAILED[0]==n0: print("Cache vide.")   # erreur : jamais présentée comme un cache vide
             return
         from prettytable import PrettyTable
         t=PrettyTable(['nick','last_modified','taille'])
@@ -6563,6 +6670,8 @@ class BorgHelper:
             a_old,a_new,date_new=pair
             print(f"  {nick}: {a_old} → {a_new}",flush=True)
             cmd=[borg_exe,'diff','--json-lines',f"{cfg['BORG_REPO']}::{a_old}",a_new]
+            if interrupted_event.is_set():   # 1.0.179 (A91, revue) : arrêt déjà demandé — jamais lancé (paire jamais gardée)
+                return (a_old,a_new,date_new,[],{},False)
             ps=subprocess.Popen(cmd,encoding='utf-8',env=diff_env,cwd=os.getcwd(),
                                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
             with running_procs_lock: running_procs[pair]=ps
@@ -6574,7 +6683,12 @@ class BorgHelper:
             err_t=threading.Thread(target=_read_err,daemon=True); err_t.start()
             if interrupted_event.is_set():   # lancé pendant l'arrêt : le moniteur ne l'a pas vu
                 with running_procs_lock: signaled.add(pair)
-                ps.terminate()
+                # 1.0.179 (A91) : arbre de borg — SIGTERM, 5 s, puis SIGKILL de ce qui reste de l'arbre relevé (un enfant qui
+                # ignore SIGTERM tiendrait stdout : la lecture ci-dessous bloquerait)
+                _tree=_kill_tree(ps,signal.SIGTERM,None,meis)
+                end=time.monotonic()+5   # tête ET arbre relevé (comme boex sous Ctrl-C)
+                while time.monotonic()<end and (ps.poll() is None or any(_proc_start(p)==t for p,t in _tree.items())): time.sleep(0.1)
+                _kill_tree(ps,signal.SIGKILL,_tree,meis)
             entries=[]; exclu={}
             try:
                 for line in ps.stdout:          # streaming — parse au fil de l'eau
@@ -6606,6 +6720,7 @@ class BorgHelper:
         mode_changed=False  # AD-11 : une fois DbModeError vue, mode durablement changé pour le reste du run
         if pairs_todo:
             db_conn=None
+            meis=set()   # 1.0.179 (A91) : _MEI* mappés par les borg diff que le moniteur tue
             try:
                 try: db_conn=_open_db(db_path,nick=nick,role='read')
                 except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}")
@@ -6624,12 +6739,15 @@ class BorgHelper:
                                 # 1.0.145 (story 8 R2) : SIGTERM d'abord — borg rend son verrou de dépôt en sortant —,
                                 # SIGKILL après 5 s seulement (comme boex). Plus jamais de borg break-lock : il cassait
                                 # aussi le verrou d'un borg create externe, d'un borg mount ou d'un autre hôte.
+                                trees={}
                                 def _signal_all(kill):
                                     with running_procs_lock:
                                         for pr,ps in list(running_procs.items()):
                                             signaled.add(pr)
-                                            try: ps.kill() if kill else ps.terminate()
-                                            except OSError: pass
+                                            # 1.0.179 (A91) : arbre de borg — SIGKILL n'est jamais relayé à l'enfant PyInstaller,
+                                            # qui gardait stdout ouvert : `for line in ps.stdout` bloquait l'Index entier ;
+                                            # arbre relevé au SIGTERM gardé pour le SIGKILL (tête déjà morte)
+                                            trees[pr]=_kill_tree(ps,signal.SIGKILL if kill else signal.SIGTERM,trees.get(pr),meis)
                                 def _wait_reaped(secs):
                                     end=time.time()+secs
                                     while time.time()<end:
@@ -6641,7 +6759,7 @@ class BorgHelper:
                                 if not _wait_reaped(5):
                                     _signal_all(True)
                                     _wait_reaped(15)   # _run_diff reap ses processus (plus de zombies)
-                                _purge_mei_orphans()   # aussi après SIGTERM : un borg arrêté en démarrage laisse le sien
+                                _purge_mei_dirs(meis); _purge_mei_orphans()   # aussi après SIGTERM : un borg arrêté en démarrage laisse le sien
                                 return
                             time.sleep(0.5)
                     monitor=threading.Thread(target=_priority_monitor,daemon=True)
@@ -7008,6 +7126,7 @@ class BorgHelper:
         """as_json=True : imprime {nick: [...lignes]} par nick réussi, {nick: {'error': msg}} par
         nick en échec (index vide/erreur SQLite) — deux formes par clé, à distinguer par type
         (list vs dict) côté consommateur."""
+        _n0=_READER_FAILED[0]   # 1.0.179 (A89) : erreurs de CET appel (« Aucun résultat » dit l'échec)
         sql_pat=pattern.replace('*','%').replace('?','_')
         if '%' not in sql_pat and '_' not in sql_pat: sql_pat='%'+sql_pat+'%'
         rows=[]
@@ -7025,7 +7144,7 @@ class BorgHelper:
                     if as_json:
                         results[n]={'error':msg}
                         if isinstance(ie,str): printer(f"[ERREUR] {msg}")   # 1.0.178 (A87) : erreur aussi sur stderr en -j
-                    else: printer(f"[ERREUR] {msg}")
+                    else: printer(f"[ERREUR] {msg}" if isinstance(ie,str) else f"[WARN] {msg}")   # 1.0.179 (A89) : index vide = [WARN], code 0
                     continue
                 try:
                     conn=_open_db(db_path,nick=n,role='read',empty_ok=True)
@@ -7060,7 +7179,8 @@ class BorgHelper:
         _iso.done()
         if as_json:
             print(json.dumps(results,ensure_ascii=False,indent=2)); return
-        if not rows: print("Aucun résultat."); return
+        if not rows:   # 1.0.179 (A89, décision de l'utilisateur) : une lecture a échoué -> l'absence n'est pas un résultat
+            print("Aucun résultat." if _READER_FAILED[0]==_n0 else "Aucun résultat dans les bases lisibles (erreurs ci-dessus)."); return
         from prettytable import PrettyTable
         t=PrettyTable(['nick','date','archive','type','chemin','avant','après'])
         t.align['chemin']='l'; t.align['archive']='l'
@@ -7070,6 +7190,7 @@ class BorgHelper:
 
     def filehist(self,nick,path,archive_from=None,archive_to=None,debug=0,as_json=False):
         """as_json : voir search() — même forme par-nick, list ou {'error':msg}."""
+        _n0=_READER_FAILED[0]   # 1.0.179 (A89) : erreurs de CET appel
         rows=[]
         results={} if as_json else None
         # 1.0.167 (story 30, A47) : un nick qui s'arrête (base chiffrée inutilisable, illisible, schéma plus récent) n'arrête
@@ -7085,7 +7206,7 @@ class BorgHelper:
                     if as_json:
                         results[n]={'error':msg}
                         if isinstance(ie,str): printer(f"[ERREUR] {msg}")   # 1.0.178 (A87) : erreur aussi sur stderr en -j
-                    else: printer(f"[ERREUR] {msg}")
+                    else: printer(f"[ERREUR] {msg}" if isinstance(ie,str) else f"[WARN] {msg}")   # 1.0.179 (A89) : index vide = [WARN], code 0
                     continue
                 try:
                     conn=_open_db(db_path,nick=n,role='read',empty_ok=True)
@@ -7109,7 +7230,8 @@ class BorgHelper:
         _iso.done()
         if as_json:
             print(json.dumps(results,ensure_ascii=False,indent=2)); return
-        if not rows: print(f"Aucune entrée pour : {path}"); return
+        if not rows:   # 1.0.179 (A89) : une lecture a échoué -> dit
+            print(f"Aucune entrée pour : {path}" if _READER_FAILED[0]==_n0 else f"Aucune entrée pour : {path} dans les bases lisibles (erreurs ci-dessus)."); return
         rows.sort(key=lambda r:(r[1] or ''))
         from prettytable import PrettyTable
         t=PrettyTable(['nick','date','archive avant','archive après','type','avant','après'])
@@ -7405,7 +7527,7 @@ class BorgHelper:
                     if as_json:
                         results[n]={'error':msg}
                         if isinstance(ie,str): printer(f"[ERREUR] {msg}")   # 1.0.178 (A87) : erreur aussi sur stderr en -j
-                    else: printer(f"[ERREUR] {msg}")
+                    else: printer(f"[ERREUR] {msg}" if isinstance(ie,str) else f"[WARN] {msg}")   # 1.0.179 (A89) : index vide = [WARN], code 0
                     continue
                 try:
                     conn=_open_db(db_path,nick=n,role='read',empty_ok=True)
@@ -7515,7 +7637,7 @@ class BorgHelper:
                     if as_json:
                         results[n]={'error':msg}
                         if isinstance(ie,str): printer(f"[ERREUR] {msg}")   # 1.0.178 (A87) : erreur aussi sur stderr en -j
-                    else: printer(f"[ERREUR] {msg}")
+                    else: printer(f"[ERREUR] {msg}" if isinstance(ie,str) else f"[WARN] {msg}")   # 1.0.179 (A89) : index vide = [WARN], code 0
                     continue
                 try:
                     conn=_open_db(db_path,nick=n,role='read',empty_ok=True)
@@ -7551,20 +7673,21 @@ class BorgHelper:
             if match: rows=[r for r in rows if match(r['chemin'])]
             print(json.dumps({'borghelper_version':Version,'pattern':pattern,'rows':rows},ensure_ascii=False,indent=2))
             return
+        _n0=_READER_FAILED[0]   # 1.0.179 (A89) : erreurs de CET appel (« Aucune donnée » dit l'échec)
         if pattern is None:
             totals=self.db._duidx_collect_global(nick,('all',),archive_from,archive_to)
-            _duidx_print(totals,None,False,sort_by,reverse,as_json); return
+            _duidx_print(totals,None,False,sort_by,reverse,as_json,failed=_READER_FAILED[0]!=_n0); return
         if '/*' in pattern or pattern=='*':
             sel,depth,match=_duidx_group_spec(pattern)
             key=(lambda p:_duidx_path_key(p,depth)) if match is None else \
                 (lambda p:_duidx_path_key(p,depth) if match(p) else None)
             totals=self.db._duidx_collect(nick,sel,key,archive_from,archive_to)
-            _duidx_print(totals,pattern,True,sort_by,reverse,as_json)
+            _duidx_print(totals,pattern,True,sort_by,reverse,as_json,failed=_READER_FAILED[0]!=_n0)
         else:
             sql_pat=pattern.replace('*','%').replace('?','_')
             if '%' not in sql_pat and '_' not in sql_pat: sql_pat='%'+sql_pat+'%'
             totals=self.db._duidx_collect_global(nick,('like',sql_pat),archive_from,archive_to)
-            _duidx_print(totals,pattern,False,sort_by,reverse,as_json)
+            _duidx_print(totals,pattern,False,sort_by,reverse,as_json,failed=_READER_FAILED[0]!=_n0)
 
     def idxtop(self,nick,depth=3,topn=20,debug=0,as_json=False):
         from collections import defaultdict
@@ -7679,8 +7802,10 @@ class BorgHelper:
         dérivée calculée ici (Boundaries)."""
         db_path=self.db.get_diff_db(nick)
         # history.db présente : les mesures se lisent même si diff.db (jetable, 1.0.139) a été supprimée
-        if not os.path.exists(self.db.get_history_db(nick)):
-            if not os.path.exists(db_path):
+        # 1.0.179 (story 42, A92) : _path_present — dossier de cache non traversable = présent mais illisible (la sonde dit
+        # l'erreur réelle, code 1), jamais « diff.db absent » en code 0 (mesuré, règle A61)
+        if not _path_present(self.db.get_history_db(nick)):
+            if not _path_present(db_path):
                 if as_json: print(json.dumps({'error':f"diff.db absent pour {nick}"},ensure_ascii=False,indent=2)); return
                 printer(f"  {nick}: diff.db absent — lancez borgHelper -c Index -n {nick}"); return
             pr=_db_probe(db_path,_READER_WRITE_WAIT)   # 1.0.175 (A72) : illisible n'est plus « aucune archive » ; 1.0.177 : sonde lecteur 2 s
@@ -7691,11 +7816,17 @@ class BorgHelper:
                 if as_json: print(json.dumps({'error':msg},ensure_ascii=False,indent=2)); return
                 printer(f"  {nick}: {msg}"); return
         if not as_json:
+            # 1.0.179 (revue story 42) : history.db illisible (dossier non traversable, corrompue) -> erreur marquée, code 1,
+            # comme en -j — jamais « disponible via -j » en code 0
+            hp=self.db.get_history_db(nick)
+            if _path_present(hp):
+                pr=_db_probe(hp,_READER_WRITE_WAIT)
+                if pr[0]=='illisible': _reader_sqlite_err(pr[1],hp); printer(f"  {nick}: SQLite error ({hp}): {pr[1]}"); return
             printer(f"  {nick}: historique repo_stats disponible via -j (JSON) — destiné à l'API")
             return
         # repo_stats vit dans history.db (1.0.139, AD-7) ; _hist migre d'abord une diff.db antérieure, et rend None
         # (aucune ligne, rien de créé) si ce nick n'a encore aucune mesure.
-        hist=self.db._hist(nick)
+        hist=self.db._hist(nick,strict=True)   # 1.0.179 (A92) : non traversable -> erreur réelle, jamais rows []
         rows=[]
         if hist is not None:
             try:
@@ -7715,7 +7846,7 @@ class BorgHelper:
                 # orphelin) -> aucune mesure, rows [] comme ArchiveHistory (avant : {"error": … no such table}, rouge dans l'UI) ;
                 # vraie erreur : [ERREUR] sur stderr en plus du JSON
                 if not str(e).startswith('no such table'):   # revue : « no such column » (schéma abîmé) n'est pas « aucune mesure »
-                    if _sqlite_missing(e): _READER_FAILED[0]=True; printer(f"[ERREUR] SQLite error ({hist}): {e}")   # 1.0.178 : marquée, code 1
+                    if _sqlite_missing(e): _READER_FAILED[0]+=1; printer(f"[ERREUR] SQLite error ({hist}): {e}")   # 1.0.178 : marquée, code 1
                     else: _reader_sqlite_err(e,hist)
                     print(json.dumps({'error':f"SQLite error ({hist}): {e}"},ensure_ascii=False,indent=2)); return
         print(json.dumps({'borghelper_version':Version,'nick':nick,'rows':rows},ensure_ascii=False,indent=2))
@@ -7737,7 +7868,7 @@ class BorgHelper:
         pruned=true), et comptages figés d'une archive présente dont la paire a été retirée (DIFF_KEEP,
         rapprochement) ; champ pruned sur chaque ligne."""
         db_path=self.db.get_diff_db(nick)
-        if not os.path.exists(db_path):
+        if not _path_present(db_path):   # 1.0.179 (A92) : non traversable -> sonde « illisible », erreur réelle
             if as_json: print(json.dumps({'error':f"diff.db absent pour {nick}"},ensure_ascii=False,indent=2)); return
             printer(f"  {nick}: diff.db absent — lancez borgHelper -c Index -n {nick}"); return
         pr=_db_probe(db_path,_READER_WRITE_WAIT)   # 1.0.175 (A72) : illisible n'est plus « aucune archive » ; 1.0.177 : sonde lecteur 2 s
@@ -8485,7 +8616,12 @@ class BorgHelper:
             m=measures.get((r[0],r[1] or '')) or measures.get((r[0],None))
             return m['deduplicated_size'] if m and m['deduplicated_size'] is not None else r[5]
         if measures: rows=[tuple(r[:5])+(_dedup(r),)+tuple(r[6:]) for r in rows]
-        diff_stats=self.db._diff_stats_for_nick(nick)
+        # 1.0.179 (story 42, A92, décision de l'utilisateur) : base illisible pour les comptes (passphrase, DbEncrypt en cours,
+        # en-tête altéré) -> ligne du nick gardée, « Modifications » vide, erreur dite, code 1 (jumelles prep_report/_from_db)
+        stats_err=False
+        try: diff_stats=self.db._diff_stats_for_nick(nick)
+        except (DbKeyError,DbModeError,DbTamperError,DbCodecError) as e:
+            printer(f"[ERREUR] {nick}: comptes de modifications illisibles — {type(e).__name__} : {e}"); diff_stats={}; stats_err=True
         def _fmt_stats(s,nf,total_sz=0,summary=False):
             # 1.0.162 : na/nr/nm = fichiers ordinaires seuls (_diff_stats_for_nick), comme nf -> prev_nf = nfiles précédent
             na,nr,nm=s['added'],s['removed'],s['modified']
@@ -8538,6 +8674,7 @@ class BorgHelper:
         total_compr=sum(v['compressed_size'] for v in kept.values())
         total_dedup2=sum(v['deduplicated_size'] for v in kept.values())
         tbkps['Totaux']={'name':'Totaux','original_size':total_orig,'compressed_size':total_compr,'deduplicated_size':total_dedup2}
+        if stats_err: tcmpl[nick]['_stats_error']=True   # 1.0.179 (A92) : retiré à l'affichage, code 1
         return tcmpl,tbkps
 
     def prep_report(self,nick,debug=0,maxp=None):
@@ -8615,7 +8752,12 @@ class BorgHelper:
                     tbkps[i].pop('durationM'); tbkps[i].pop('prunMe')
                 cpt+=1
         tbkps['Totaux']={'name':'Totaux','original_size':resume['total_size'],'compressed_size':resume['total_csize'],'deduplicated_size':resume['unique_csize']}
-        diff_stats=self.db._diff_stats_for_nick(nick)
+        # 1.0.179 (story 42, A92, décision de l'utilisateur) : base illisible pour les comptes (passphrase, DbEncrypt en cours,
+        # en-tête altéré) -> ligne du nick gardée, « Modifications » vide, erreur dite, code 1 (jumelles prep_report/_from_db)
+        stats_err=False
+        try: diff_stats=self.db._diff_stats_for_nick(nick)
+        except (DbKeyError,DbModeError,DbTamperError,DbCodecError) as e:
+            printer(f"[ERREUR] {nick}: comptes de modifications illisibles — {type(e).__name__} : {e}"); diff_stats={}; stats_err=True
         def _fmt_stats(s,nf,total_sz=0,summary=False):
             # 1.0.162 : na/nr/nm = fichiers ordinaires seuls (_diff_stats_for_nick), comme nf -> prev_nf = nfiles précédent
             na,nr,nm=s['added'],s['removed'],s['modified']
@@ -8644,6 +8786,7 @@ class BorgHelper:
             else:
                 tbkps[arch]['modifications']='—'
             tbkps[arch]['borg']=_borg_ver_text(_measure_of(measures,arch,starts.get(arch)))   # 1.0.165 (jumelle : prep_report_from_db)
+        if stats_err: tcmpl[nick]['_stats_error']=True   # 1.0.179 (A92) : retiré à l'affichage, code 1
         return tcmpl,tbkps
 
     def report_offline(self,nicks,htrep=False,debug=0,maxp=None,as_json=False):
@@ -8679,6 +8822,7 @@ class BorgHelper:
                 else: tcmpl[nick]['nom']=f"***{nick}"
             for i in ['duree','derniere','taille','recuperable']: reshosto[i]+=(tcmpl[nick][i] or 0)
             unk=tcmpl[nick].pop('_prune_unknown',False)   # 1.0.175 (A75) ; jumelles report/report_offline
+            if tcmpl[nick].pop('_stats_error',False): errcode=max(errcode,1)   # 1.0.179 (A92) : comptes illisibles, ligne gardée
             for i in ['derniere','taille','recuperable','reste']:
                 if (i in tcmpl[nick].keys()) and not(tcmpl[nick][i] is None): tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
                 elif i=='recuperable' and unk: tcmpl[nick][i]=None if as_json else '—'   # récupérable inconnu
@@ -8775,6 +8919,7 @@ class BorgHelper:
                 else: tcmpl[nick]['nom']=f"***{nick}"
             for i in ['duree','derniere','taille','recuperable']: reshosto[i]+=(tcmpl[nick][i] or 0)
             unk=tcmpl[nick].pop('_prune_unknown',False)   # 1.0.175 (A75) ; jumelles report/report_offline
+            if tcmpl[nick].pop('_stats_error',False): errcode=max(errcode,1)   # 1.0.179 (A92) : comptes illisibles, ligne gardée
             for i in ['derniere','taille','recuperable','reste']:
                 if (i in tcmpl[nick].keys()) and not(tcmpl[nick][i] is None): tcmpl[nick][i]=convert_octets_readable(tcmpl[nick][i])
                 elif i=='recuperable' and unk: tcmpl[nick][i]=None if as_json else '—'   # récupérable inconnu
@@ -14246,6 +14391,15 @@ fail()
             res['sans base : 0']=(r==0 and 'SQLite error' not in o+e,r,o[-150:],e[-150:])
             r,o,e=run('-c','IdxTop','-n','zb')
             res['IdxTop sans base : 0']=(r==0,r,e[-150:])
+            # 1.0.179 (A89, décisions de l'utilisateur) : index vide = [WARN] code 0 ; sans erreur, « Aucun résultat. » inchangé
+            for nm,argv,msg in (('Search',('-c','Search','-n','zb','-f','etc'),'Aucun résultat.\n'),('DuIdx',('-c','DuIdx','-n','zb'),'Aucune donnée.\n'),
+                                ('FileHist',('-c','FileHist','-n','zb','-f','/x'),'Aucune entrée pour : /x\n'),('TreeHist',('-c','TreeHist','-n','zb'),None),
+                                ('TreeFind',('-c','TreeFind','-n','zb','-f','x'),None),('DuIdx -f /*',('-c','DuIdx','-n','zb','-f','/*'),None),
+                                ('DuIdx -R -j',('-c','DuIdx','-n','zb','-R','-j'),None)):
+                r,o,e=run(*argv)
+                res[f'{nm} index vide : [WARN] 0']=(r==0 and '[WARN] Index vide pour zb' in e and '[ERREUR]' not in e and (msg is None or o==msg),r,o[-80:],e[-150:])
+            r,o,e=run('-c','Search','-n','zr','-f','introuvable-zzz')
+            res['Search sans résultat : inchangé']=(r==0 and o=='Aucun résultat.\n' and e=='',r,o,e[-100:])
             hp,ok=hold(p); res['verrou diff.db tenu']=(ok,)
             try:
                 for nm,argv in (('Search -j',('-c','Search','-n','zr','-f','etc','-j')),('Search texte',('-c','Search','-n','zr','-f','etc')),
@@ -14253,7 +14407,8 @@ fail()
                                 ('TreeFind -j',('-c','TreeFind','-n','zr','-f','x','-j')),('DuIdx -R -j',('-c','DuIdx','-n','zr','-R','-j')),
                                 ('IdxTop -j',('-c','IdxTop','-n','zr','-j')),('DiffTop',('-c','DiffTop','-n','zr')),
                                 ('ArchiveHistory -j',('-c','ArchiveHistory','-n','zr','-j')),('LstBkp',('-c','LstBkp','-n','zr')),
-                                ('LstBkpFls -j',('-c','LstBkpFls','-n','zr','-j'))):
+                                ('LstBkpFls -j',('-c','LstBkpFls','-n','zr','-j')),('DuIdx -f /*',('-c','DuIdx','-n','zr','-f','/*')),
+                                ('DuIdx -f etc',('-c','DuIdx','-n','zr','-f','etc'))):
                     r,o,e=run(*argv)
                     jok=('-j' not in argv) or jerr(o,None if nm in ('IdxTop -j','ArchiveHistory -j','LstBkpFls -j') else 'zr') or nm=='DuIdx -R -j'
                     res[nm]=(r==1 and mark(e,p) and jok,r,o[-120:],e[-200:])
@@ -14272,6 +14427,13 @@ fail()
                 res['Search multi : zs gardé']=(okm,r,o[-200:],e[-200:])
                 r,o,e=run('-c','IdxTop','-n','zr,zs')
                 res['IdxTop multi texte']=(r==1 and mark(e,p),r,e[-200:])
+                # 1.0.179 (A89) : une lecture a échoué -> l'absence n'est pas présentée comme un résultat ; -j de DuIdx : `{}` gardé
+                for nm,argv,msg in (('Search',('-c','Search','-n','zr,zb','-f','zzz'),'Aucun résultat dans les bases lisibles (erreurs ci-dessus).\n'),
+                                    ('FileHist',('-c','FileHist','-n','zr','-f','/zzz'),'Aucune entrée pour : /zzz dans les bases lisibles (erreurs ci-dessus).\n'),
+                                    ('DuIdx',('-c','DuIdx','-n','zr'),'Aucune donnée dans les bases lisibles (erreurs ci-dessus).\n'),
+                                    ('DuIdx -j',('-c','DuIdx','-n','zr','-j'),'{}\n')):
+                    r,o,e=run(*argv)
+                    res[f'{nm} en erreur : message']=(r==1 and o==msg and mark(e,p),r,o[-90:],e[-120:])
                 r,o,e=run('-c','Status','-n','zr')
                 res['Status inchangé (0)']=(r==0,r,e[-150:])
             finally: _rb_killtree(hp)
@@ -14301,6 +14463,11 @@ fail()
                 except ValueError: rows=[]
                 res['ArchiveHistory -j partiel']=(r==1 and mark(e,h) and len(rows)==1,r,o[-150:],e[-200:])
             finally: _rb_killtree(hp)
+            def mode_err2(self,nick,*a,**k): raise DbModeError('migration en cours')   # bout en bout (matrice) : jamais comptes nuls en 0
+            with mock.patch.object(BorgHelperDB,'_diff_stats_for_nick',mode_err2):
+                rj=run('-c','ArchiveHistory','-n','zr','-j')
+            # ArchiveHistory (un seul nick) : relancée telle quelle (main : gestionnaire global, code 2, message)
+            res['ArchiveHistory : DbModeError dite']=(rj[0]=='DbModeError' and '"rows"' not in rj[1],rj[0],rj[1][-100:])
             # base corrompue : page racine d'archive_stats écrasée (en-tête et db_meta intacts — une troncature donne DbTamperError,
             # code 2 par le gestionnaire global) -> LstBkp/LstBkpFls : message marqué + 1, jamais de trace
             cn=sqlite3.connect(p); cn.execute("PRAGMA wal_checkpoint(TRUNCATE)"); pg=cn.execute("PRAGMA page_size").fetchone()[0]
@@ -14313,6 +14480,12 @@ fail()
             for nm,argv in (('LstBkp corrompue',('-c','LstBkp','-n','zr')),('LstBkpFls corrompue',('-c','LstBkpFls','-n','zr','-j'))):
                 r,o,e=run(*argv)
                 res[nm]=(r==1 and '[ERREUR] SQLite error' in e and 'Traceback' not in e,r,o[-120:],e[-200:])
+            # _diff_stats_for_nick : DbModeError à sa propre ouverture (base en migration) -> remonte (avant : {} en silence)
+            def mode_err(*a,**k): raise DbModeError('migration en cours')
+            with mock.patch(f"{__name__}._open_db",mode_err):
+                try: b.db._diff_stats_for_nick('zr'); got='rendu'
+                except DbModeError: got='DbModeError'
+            res['_diff_stats_for_nick : DbModeError remonte']=(got=='DbModeError',got)
             def stop(self,n,*a,**k):
                 if n=='zr': raise DbKeyError('clé')
                 print('zs ok')
@@ -14320,14 +14493,89 @@ fail()
             res['nick arrêté parmi plusieurs']=(r==1 and 'zs ok' in o and '[ERREUR] DbKeyError' in e,r,o[-100:],e[-150:])
             with mock.patch.object(BorgHelper,'idxtop',stop): r,o,e=run('-c','IdxTop','-n','zr')
             res['nick seul : relancé tel quel']=(r=='DbKeyError',r)   # main : code 2 (gestionnaire global)
-            _READER_FAILED[0]=True; o2=io.StringIO()   # appel en processus après une erreur : « Cache vide. » dit, drapeau gardé
+            _READER_FAILED[0]=1; o2=io.StringIO()   # appel en processus après une erreur : « Cache vide. » dit, drapeau gardé
             with contextlib.redirect_stdout(o2),contextlib.redirect_stderr(io.StringIO()): b.cache_info('zb')
             res['CacheInfo : erreur d\'un appel précédent ignorée']=('Cache vide.' in o2.getvalue() and _READER_FAILED[0],o2.getvalue())
-            _READER_FAILED[0]=False
+            _READER_FAILED[0]=0
             bad={k:v for k,v in res.items() if not v[0]}
             if bad: print(f"  {bad}")
             return not bad
-        check("lecteurs : erreur SQLite réelle ou nick arrêté -> code 1 et [ERREUR], texte et -j, données des autres nicks gardées (A87)",_reader_exit_code)
+        check("lecteurs : erreur SQLite réelle ou nick arrêté -> code 1 et [ERREUR], texte et -j, données des autres nicks gardées (A87) ; index vide [WARN], messages sans résultat, comptes (A89, A92)",_reader_exit_code)
+        def _reader_untraversable():
+            """1.0.179 (story 42, A92 ; mesuré : « diff.db absent » code 0 avant) : dossier de cache non traversable -> RepoHistory et
+            ArchiveHistory, texte et -j : erreur réelle marquée, code 1 — jamais « absent », « disponible via -j » ni rows []."""
+            d,b=_nb_env('untrav'); rc=os.path.join(d,'rc'); p=b.db.get_diff_db('zr'); res={}
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                b.db.ensure_diff_db(p,nick='zr'); b.db.store_diff_entries('zr','A1','A2','2026-01-02T00:00:00',[{'change_type':'added','path':'/x','size_after':1}],p)
+                b.db.store_archive_stats('zr','A2','2026-01-02T00:00:00',1,1,1,1,1,p); b.db.store_repo_stats('zr','bkp',1,2,3)
+            nodsn=os.path.join(d,'sentry-vide'); open(nodsn,'w').close()
+            env=dict(os.environ,BORGHELPERC_SENTRY_FILE=nodsn)
+            def run(*a):
+                r=subprocess.run([sys.executable,os.path.abspath(__file__),'-C',rc]+list(a),capture_output=True,text=True,env=env,
+                                 stdin=subprocess.DEVNULL,timeout=120)
+                return r.returncode,r.stdout,r.stderr
+            ok0={}
+            for c in ('RepoHistory','ArchiveHistory'):   # contrôle positif : dossier traversable -> 0
+                r,o,e=run('-c',c,'-n','zr','-j'); ok0[c]=r==0 and '"rows"' in o
+            res['traversable : 0']=(all(ok0.values()),ok0)
+            cd=os.path.dirname(p); os.chmod(cd,0)
+            try:
+                for c in ('RepoHistory','ArchiveHistory'):
+                    for j in ((),('-j',)):
+                        r,o,e=run('-c',c,'-n','zr',*j)
+                        res[f"{c} {' '.join(j) or 'texte'}"]=(r==1 and 'absent' not in o and '"rows"' not in o and 'disponible via -j' not in o
+                                                            and '[ERREUR] SQLite error' in e and 'Traceback' not in e
+                                                            and f"rc-zr-{'history' if c=='RepoHistory' else 'diff'}.db" in e,r,o[-120:],e[-150:])   # base réellement lue (mutation B14)
+            finally: os.chmod(cd,0o700)
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        _nt="RepoHistory/ArchiveHistory : dossier de cache non traversable -> erreur réelle, code 1, texte et -j (A92)"
+        if os.geteuid()!=0: check(_nt,_reader_untraversable)
+        else: skip(_nt,'root : tout dossier est traversable')
+        def _report_stats_error():
+            """1.0.179 (story 42, A92, décision de l'utilisateur « ligne gardée, erreur dite ») : comptes de modifications illisibles
+            (DbModeError de _diff_stats_for_nick) -> Report -o : ligne du nick gardée, Modifs « — », [ERREUR] dit, code 1 (contrôle
+            positif : 0 sans l'erreur). Avant : {} avalé, code 0."""
+            d,b0=_nb_env('rptstats'); rc=os.path.join(d,'rc'); res={}
+            with open(rc,'a') as f: f.write("[zt]\nDB_ENCRYPT=false\nBORG_REPO=ssh://x@h/r\nMAX_AGE_BKP=1000000\n\n")
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); p=b.db.get_diff_db('zt')
+            from datetime import datetime
+            now=datetime.now().strftime('%Y-%m-%dT%H:%M:%S.%f')
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                b.db.ensure_diff_db(p,nick='zt')
+                b.db.store_diff_entries('zt','A1','A2',now,[{'change_type':'added','path':'/x','size_after':1}],p)
+                b.db.store_archive_stats('zt','A1',now,1,1,1,1,1,p); b.db.store_archive_stats('zt','A2',now,1,1,1,1,1,p)
+            def rpt():
+                o,e=io.StringIO(),io.StringIO()
+                with contextlib.redirect_stdout(o),contextlib.redirect_stderr(e): code=b.report_offline('zt',as_json=True)
+                out=o.getvalue()
+                try: j=json.loads(out[out.index('{'):])
+                except ValueError: j={}
+                return code,j,e.getvalue()
+            c0,j0,e0=rpt()
+            res['sans erreur : 0']=(c0==0 and 'zt' in j0.get('summary',{}) and '[ERREUR]' not in e0,c0,e0[-150:])
+            def mode_err(self,nick): raise DbModeError('migration en cours')
+            with mock.patch.object(BorgHelperDB,'_diff_stats_for_nick',mode_err): c1,j1,e1=rpt()
+            row=j1.get('summary',{}).get('zt',{})
+            res['comptes illisibles : ligne gardée, code 1']=(c1==1 and row.get('nom')=='zt' and '_stats_error' not in row and row.get('modifications')=='—'
+                and '[ERREUR] zt: comptes de modifications illisibles — DbModeError' in e1,c1,row,e1[-200:])
+            # jumelles live (prep_report/report : vrai borg) — garde de structure par AST (L90) : marque posée et retirée des deux côtés
+            import ast,inspect,textwrap
+            def marks(fn):
+                t=ast.parse(textwrap.dedent(inspect.getsource(fn))); put=pop=False
+                for nd in ast.walk(t):
+                    if isinstance(nd,ast.Assign) and any(isinstance(x,ast.Subscript) and isinstance(x.slice,ast.Constant)
+                                                          and x.slice.value=='_stats_error' for x in nd.targets): put=True
+                    if (isinstance(nd,ast.Call) and isinstance(nd.func,ast.Attribute) and nd.func.attr=='pop' and nd.args
+                            and isinstance(nd.args[0],ast.Constant) and nd.args[0].value=='_stats_error'): pop=True
+                return put,pop
+            res['jumelles : marque posée']=(marks(BorgHelper.prep_report)[0] and marks(BorgHelper.prep_report_from_db)[0],)
+            res['jumelles : marque retirée, code 1']=(marks(BorgHelper.report)[1] and marks(BorgHelper.report_offline)[1],)
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("Report -o : comptes de modifications illisibles -> ligne gardée, erreur dite, code 1 (A92)",_report_stats_error)
         def _filter_exact():
             """1.0.178 (story 41, A88) : -f '=nom' -> ce nom exact, casse respectée, sans échappement (dispatch réel, -l) ; -f regex
             inchangé (insensible à la casse) ; « = » seul refusé (code 2)."""
@@ -15586,6 +15834,89 @@ fail()
             ok=ran and after_kill==(0,0) and dt<30 and got==want and len(want)==5 and all(v>0 for v in want.values())
             if not ok: print(f"  diff tué code 1 : lancé+arrêté {ran}, après arrêt {after_kill} en {dt:.1f}s ; tranches {got} ; complet {want}")
             return ok
+        def _ix_kill_tree():
+            """1.0.179 (story 42, A91 ; mesuré : vrai borg = `exec nice borg.wrapped`, chargeur PyInstaller + enfant, SIGKILL jamais
+            relayé à l'enfant) : borg dont l'ENFANT ignore SIGTERM, tient stdout (script sans exec : la tête meurt au SIGTERM, l'enfant
+            passe à init) et lance un petit-enfant en recevant SIGTERM (relevé seulement au second passage : arbre relu depuis les
+            processus déjà connus) — borg diff tué à l'échéance d'une tranche, boex arrêté (stop), boex interrompu (Ctrl-C) : rendu en
+            temps borné, enfants et petits-enfants tués, aucun restant. Avant : SIGKILL à la tête seule, `for line in stdout` /
+            communicate() bloqués jusqu'à la fin de l'enfant (60 s)."""
+            ctx=_ix_ctx(); b=_ix_bh(ctx,'c-ktree'); pidf=os.path.join(ctx['dir'],'enfants-ktree.pid'); res={}
+            kf=os.path.join(ctx['dir'],'enfant-ktree.py')
+            with open(kf+'.tmp','w') as f:   # écrit à part puis os.replace (jamais un script réécrit en place, story 22)
+                f.write("import signal,time,os,subprocess,sys\npf=sys.argv[1]\n"
+                        "gc=\"import signal,time,os,sys\\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\\n"
+                        "open(sys.argv[1],'a').write('g'+str(os.getpid())+chr(10))\\ntime.sleep(60)\"\n"
+                        "signal.signal(signal.SIGTERM,lambda *a: subprocess.Popen([sys.executable,'-c',gc,pf]))\n"
+                        "open(pf,'a').write(str(os.getpid())+chr(10))\nfor _ in range(60): time.sleep(1)\n")
+            os.replace(kf+'.tmp',kf)
+            child=f"{shlex.quote(sys.executable)} {shlex.quote(kf)} {shlex.quote(pidf)}"
+            _rb_wrapper(ctx['w'],ctx['bb'],f"echo \"$*\" >> {shlex.quote(ctx['log'])}\n"
+                        f"if [ \"$1\" = \"diff\" ] || [ \"$1\" = \"debug\" ]; then {child}; exit 1; fi\n")
+            def kids(g=None):
+                try: xs=open(pidf).read().split()
+                except OSError: return []
+                return [int(x.lstrip('g')) for x in xs if g is None or x.startswith('g')==g]
+            def alive(p):
+                try: return open(f'/proc/{p}/stat').read().split(')')[-1].split()[0]!='Z'
+                except OSError: return False
+            def gone(): time.sleep(0.5); k=kids(); return k,bool(kids(False)) and not any(alive(x) for x in k)
+            try:
+                t0=time.monotonic(); ko=_q_run(b.index,'ix',budget=6,natures=['diff']); dt=time.monotonic()-t0; k,ok=gone()
+                res['Index : diff tué, arbre']=(ok and bool(kids(True)) and dt<35 and 'arrêt des diffs en cours' in ko,round(dt,1),k)
+                with contextlib.suppress(OSError): os.unlink(pidf)
+                b.borg._stop=lambda: bool(kids(False))   # armé une fois l'enfant lancé : l'arrêt vise un borg vivant
+                try:
+                    t0=time.monotonic()
+                    with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): r=b.borg.boex('ix',['debug','x'])
+                    dt=time.monotonic()-t0
+                finally: b.borg._stop=None
+                k,ok=gone()
+                res['boex arrêté : arbre']=(bool(r.get('killed')) and ok and bool(kids(True)) and dt<25,round(dt,1),k)
+                with contextlib.suppress(OSError): os.unlink(pidf)
+                # Ctrl-C : SIGINT à ce processus seul (pas au groupe : le run continue), une fois l'enfant lancé -> 130, arbre tué
+                fin=threading.Event()
+                def ctrl_c():
+                    while not fin.is_set():
+                        if kids(False): os.kill(os.getpid(),signal.SIGINT); return
+                        time.sleep(0.1)
+                th=threading.Thread(target=ctrl_c,daemon=True); th.start(); code=None; t0=time.monotonic()
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.borg.boex('ix',['debug','x'])
+                except SystemExit as x: code=x.code
+                finally: fin.set(); th.join(5)
+                dt=time.monotonic()-t0; k,ok=gone()
+                # dt >= 4 : 5 s laissées à l'arbre (l'enfant ignore SIGTERM) avant SIGKILL — pas seulement à la tête, morte aussitôt
+                res['boex Ctrl-C : arbre']=(code==130 and ok and bool(kids(True)) and 4<=dt<25,code,round(dt,1),k)
+            finally:
+                for x in kids():
+                    with contextlib.suppress(OSError): os.kill(x,9)
+                _ix_slow(ctx,None,0)
+            bad={k_:v for k_,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        def _mei_purge_mapped():
+            """1.0.179 (story 42, A91 ; revue) : _MEI* relevé par _mei_mapped sur le processus (fichier mappé, comme les bibliothèques
+            du chargeur PyInstaller) ; _purge_mei_dirs le garde tant qu'un processus le mappe, le retire une fois ce processus tué —
+            même tout juste créé ; un _MEI* voisin jamais relevé (un autre borg) n'est jamais touché."""
+            base=tempfile.mkdtemp(prefix='mei42-',dir=tmp); d=os.path.join(base,'_MEIk42ab'); other=os.path.join(base,'_MEIautre'); res={}
+            os.makedirs(d); os.makedirs(other)
+            with open(os.path.join(d,'lib.so'),'wb') as f: f.write(b'\0'*8192)
+            code=("import mmap,sys,time\nf=open(sys.argv[1],'rb'); m=mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ); f.close()\n"
+                  "print('ok',flush=True); time.sleep(60)")
+            hp=_rb_popen([sys.executable,'-c',code,os.path.join(d,'lib.so')],stdout=subprocess.PIPE,stdin=subprocess.DEVNULL,text=True)
+            try:
+                res['mappé']=(hp.stdout.readline().strip()=='ok',)
+                got=_mei_mapped([hp.pid]); res['relevé']=(got=={d},got)
+                _purge_mei_dirs(got); res['utilisé : gardé']=(os.path.isdir(d),)
+            finally: _rb_killtree(hp)
+            with contextlib.suppress(subprocess.TimeoutExpired): hp.wait(5)
+            _purge_mei_dirs(got); res['tué : retiré']=(not os.path.exists(d),)
+            res['voisin intact']=(os.path.isdir(other),)
+            shutil.rmtree(base,ignore_errors=True)
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
         def _ix_rc1_warning_kept():
             """1.0.153 (story 16) : borg diff NON signalé qui sort en code 1 (avertissement) avec sa sortie -> paire gardée
             avec ses entrées (comme un Index complet) : la garde ne vise que les borg tués par le moniteur."""
@@ -16311,6 +16642,8 @@ fail()
         _rbc("tranche : ordre snapshot -> stats -> diffs récents d'abord ; budget respecté ; reprise sans refaire ; complete",_ix_order_budget_resume)
         _rbc("tranche : base finie par tranches == Index complet (Report -o, TreeHist, DiffBkp)",_ix_same_as_full)
         _rbc("tranche : borg diff tué à l'échéance sortant en code 1 sans sortie -> paire jamais marquée, refaite ensuite",_ix_killed_diff_rc1)
+        _rbc("tranche : borg diff, boex arrêté et boex interrompu (Ctrl-C) dont l'ENFANT ignore SIGTERM, tient stdout et lance un petit-enfant -> arbre tué, rendu en temps borné (A91)",_ix_kill_tree)
+        check("_MEI* d'un borg tué : relevé par son mappage, gardé tant qu'utilisé, retiré ensuite, voisin intact (A91)",_mei_purge_mapped)
         _rbc("tranche : paires de diff vides d'une base ancienne revues une fois (exclus gardés ; -S, -T stats, période, tour tenu, verrou sans révision ; DB_NAME partagé)",_ix_zero_pairs_recheck)
         _rbc("tranche : borg diff non signalé en code 1 (avertissement) -> paire gardée avec ses entrées",_ix_rc1_warning_kept)
         _rbc("fantôme : paire vide d'un fantôme commencé avant 1.0.153 revue et refaite à la tranche suivante",_ix_zero_pairs_shadow)
@@ -18070,7 +18403,7 @@ def sentry_alert(kind,nick,message,cfg,extra=None,release=None):
         return False
 
 def _cli_main():
-    _READER_FAILED[0]=False   # 1.0.178 (A87) : appel en processus (selftest) : jamais l'erreur d'un appel précédent
+    _READER_FAILED[0]=0   # 1.0.178 (A87) : appel en processus (selftest) : jamais l'erreur d'un appel précédent
     sentryid=_sentry_dsn()
     if sentryid is not None:
         _sentry_init(sentryid)

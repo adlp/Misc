@@ -1,5 +1,37 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.179 / borgHelperWWW 1.31.1 — Index vide en avertissement, lecteurs sans résultat dits, borg arrêté par arbre de processus, erreurs avalées dites — 2026-10-03
+
+Chantier « reconstruction progressive », story 42 (actions de rétrospective A89 à A92 ; regroupement demandé par l'utilisateur).
+
+- **« Index vide » en `[WARN]`** (décision de l'utilisateur ; avant : marqué `[ERREUR]` en code 0) : nick jamais indexé ->
+  `[WARN] Index vide pour X — lancez Index`, code 0, aux 7 sites (Search, FileHist, TreeHist, TreeFind, trois collecteurs de
+  DuIdx) ; JSON inchangé (`{nick: {error}}`). borgHelperWWW met cette réponse en cache comme toute réponse saine : l'empreinte
+  des bases change dès qu'un Index crée la base (mesuré) et suit désormais aussi leur journal `-wal`.
+- **Lecteurs sans résultat après une erreur** (décision de l'utilisateur) : quand une lecture a échoué, Search dit « Aucun
+  résultat dans les bases lisibles (erreurs ci-dessus). », FileHist « Aucune entrée pour : … dans les bases lisibles (erreurs
+  ci-dessus). », DuIdx « Aucune donnée dans les bases lisibles (erreurs ci-dessus). » (`-j` : `{}` inchangé) ; sans erreur :
+  messages d'avant.
+- **borg arrêté par arbre de processus** (mesuré : le vrai borg = `exec nice borg.wrapped`, chargeur PyInstaller + enfant ;
+  SIGKILL jamais relayé à l'enfant) : un Index qui arrête un borg diff (échéance de tranche, priorité) ou un borg arrêté sous
+  boex (arrêt demandé, Ctrl-C) reçoit SIGTERM puis SIGKILL sur TOUT son arbre (enfants rattachés à init compris), lectures
+  bornées — avant : un enfant qui ne sortait pas bloquait l'Index jusqu'à sa fin. Ctrl-C au terminal toujours propagé à borg
+  (même groupe) ; `_MEI*` des borg tués retirés (relevés par leur mappage, jamais l'extraction d'un autre borg).
+- **borgHelperWWW : délai = tout arrêter** (décision de l'utilisateur ; avant : `subprocess.run(timeout)` tuait borgHelper
+  seul, son borg continuait orphelin, verrou de dépôt gardé) : commandes borgHelper et `borg list` de `/download/*` en session
+  propre ; au délai SIGTERM au groupe, SIGKILL 10 s après, 504 inchangé — un `/restore` plus long que TIMEOUT est réellement
+  arrêté (fichiers partiels). Arrêt du serveur : signal relayé aux commandes en cours (2e signal : SIGKILL).
+- **Erreurs avalées dites** : RepoHistory/ArchiveHistory sur un dossier de cache non traversable -> erreur réelle et code 1,
+  texte comme `-j` (avant : « diff.db absent » ou « disponible via -j », code 0) ; `_diff_stats_for_nick` ne rattrape plus
+  que les erreurs SQLite (DbModeError, DbKeyError, DbTamperError remontent : ArchiveHistory en erreur) ; Report (et `-o`) :
+  comptes illisibles -> ligne gardée, Modifs « — », `[ERREUR] <nick>: comptes de modifications illisibles — …`, code 1
+  (décision de l'utilisateur).
+- CodecSelfTest : « Index vide » [WARN] (Search, DuIdx `-f`/`-R -j`, FileHist, TreeHist, TreeFind), messages sans résultat,
+  dossier non traversable (SKIP sous root), Report `_stats_error` (+ garde AST des jumelles live), borg dont l'enfant ignore
+  SIGTERM et lance un petit-enfant (Index, boex arrêté, Ctrl-C), `_MEI*` mappé.
+  push_selftest : délai (`_exec_borghelper`, `_latest_archive` réel, arrêt du serveur), cache « Index vide » et `-wal`,
+  `_MEI*` d'un borg de téléchargement tué par le chien de garde.
+
 ## borgHelper 1.0.178 / borgHelperWWW 1.31.0 / UI 1.23.0 — HTTP/1.0 détecté, durée de borg bornée dans /download, code 1 des lecteurs en erreur, filtre -f exact — 2026-10-02
 
 Chantier « reconstruction progressive », story 41 (actions de rétrospective A85 à A88 ; regroupement demandé par l'utilisateur).

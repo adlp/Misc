@@ -61,12 +61,12 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
                          DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec,
                          _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES, _enc_header_read, sentry_alert, _bkp_status_timeout,
                          _sentry_alert_kinds, db_plain_anomalies, _cfg_bool, convert_octets_readable,
-                         op_allowed, allowed_ops, is_external, _rb_errmsg, _valid_nick_name, _mei_dirs, _mei_in_use)
+                         op_allowed, allowed_ops, is_external, _rb_errmsg, _valid_nick_name, _mei_mapped, _purge_mei_dirs)
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.31.0"
+WWW_VERSION="1.31.1"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -1263,8 +1263,8 @@ def _never_cache(result: CommandResult) -> bool:
     """Réponse jamais mise en cache — MÊME prédicat aux trois écritures (_RESPONSE_CACHE, _scoped_cached_mono/_multi) :
     DbKeyError (AD-13) ou, 1.29.0 (story 37, A67), arrêt d'un nick (`[ERREUR]` sur stderr : base occupée, corrompue,
     illisible, schéma, index vide — inventaire mesuré) ; un lecteur multi-nicks sortait en 0 quand un seul nick s'arrête (en 1
-    depuis borgHelper 1.0.178) : une erreur passagère (« DB occupée ») restait servie. Sur-approximation voulue : un index vide
-    est relu à chaque appel. Revue : « SQLite error » (stdout `-j` ou stderr) exclu aussi — avant borgHelper 1.0.178 les lecteurs
+    depuis borgHelper 1.0.178) : une erreur passagère (« DB occupée ») restait servie. « Index vide » : [WARN] depuis borgHelper
+    1.0.179, mis en cache, renouvelé par l'empreinte (mtime et -wal des bases). Revue : « SQLite error » (stdout `-j` ou stderr) exclu aussi — avant borgHelper 1.0.178 les lecteurs
     l'avalaient en code 0 sans [ERREUR] ; le cache ne retient que les codes 0/1, la règle reste utile pour le code 1."""
     text=f"{result.stdout or ''}\n{result.stderr or ''}"
     return _is_db_key_error(result) or '[ERREUR]' in (result.stderr or '') or 'SQLite error' in text
@@ -1285,6 +1285,10 @@ def _cache_fingerprint(nick: Optional[str]) -> str:
     for p in _cache_db_paths(nick):
         try: parts.append(f"{p}:{os.path.getmtime(p)}")
         except OSError: parts.append(f"{p}:absent")
+        # 1.31.1 (revue story 42) : -wal aussi — un Index écrit d'abord dans le journal WAL, le fichier principal ne bouge qu'au
+        # checkpoint ; « Index vide » ([WARN], 1.0.179) est mis en cache et doit être renouvelé dès la 1re tranche (CAP-8)
+        try: w=os.stat(p+'-wal'); parts.append(f"-wal:{w.st_mtime_ns}:{w.st_size}")
+        except OSError: parts.append("-wal:absent")
     return '|'.join(parts)
 
 # 1.29.0 (story 37, A66, décisions de l'utilisateur) : commandes en cache qui lisent un état extérieur aux bases — Report -o
@@ -1980,6 +1984,41 @@ def _build_borghelper_argv_env(cmd: str, nick: Optional[str], extra_args, passph
     env['BORGHELPERC_NO_CLEANUP_NOTICE']='1'
     return argv,env
 
+def _run_group(argv,timeout,env):
+    """1.31.1 (story 42, A91, décision de l'utilisateur) : sous-processus (borgHelper, borg) en session propre ; au délai,
+    SIGTERM à tout le GROUPE (borgHelper et son borg ; le borg PyInstaller relaie SIGTERM à son enfant et rend son verrou de
+    dépôt), SIGKILL 10 s après, puis subprocess.TimeoutExpired. Avant : subprocess.run(timeout) tuait le seul processus lancé —
+    son borg continuait orphelin (verrou gardé, écritures de fin perdues ; un /restore de plus de TIMEOUT finissait en douce)."""
+    import signal as _sg
+    proc=subprocess.Popen(argv,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=env,start_new_session=True)
+    with _LIVE_GROUPS_LOCK: _LIVE_GROUPS.add(proc)   # revue : relais des signaux d'arrêt du serveur (session propre)
+    try:
+        try:
+            out,err=proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            for sig,wait in ((_sg.SIGTERM,10),(_sg.SIGKILL,10)):
+                try: os.killpg(proc.pid,sig)
+                except OSError: pass
+                try: proc.communicate(timeout=wait); break
+                except subprocess.TimeoutExpired: continue
+            raise
+    finally:
+        with _LIVE_GROUPS_LOCK: _LIVE_GROUPS.discard(proc)
+    return subprocess.CompletedProcess(argv,proc.returncode,out,err)
+
+# 1.31.1 (revue story 42) : groupes lancés par _run_group (borgHelper et son borg, en session propre) — un Ctrl-C au terminal ne
+# les atteint plus directement : _signal_groups relaie le signal d'arrêt du serveur (premier : le même, comme le terminal ou
+# systemd le faisaient avant ; second, atexit : SIGKILL).
+_LIVE_GROUPS=set(); _LIVE_GROUPS_LOCK=threading.Lock()
+
+def _signal_groups(sig):
+    # Jamais conditionné à pr.poll() : le 1er signal tue la tête (borgHelper) et laisse un enfant qui l'ignore — le groupe
+    # vit encore tant que _run_group lit ses tubes (sorti du registre ensuite) ; le 2e (SIGKILL) doit l'atteindre (mesuré).
+    with _LIVE_GROUPS_LOCK: procs=list(_LIVE_GROUPS)
+    for pr in procs:
+        try: os.killpg(pr.pid,sig)
+        except OSError: pass
+
 def _exec_borghelper(cmd: str, nick: Optional[str], extra_args, passphrase: Optional[str]=None) -> CommandResult:
     """Sous-processus borgHelper brut, sans cache ni encapsulation JSONResponse — factorisé hors de
     `run_borghelper()` pour être réutilisé tel quel par `_run_scoped()` (Story 1.3), qui a besoin du
@@ -1987,7 +2026,7 @@ def _exec_borghelper(cmd: str, nick: Optional[str], extra_args, passphrase: Opti
     spec 1.3 : le cache reste réservé au cas non restreint)."""
     argv,env=_build_borghelper_argv_env(cmd,nick,extra_args,passphrase)
     try:
-        proc=subprocess.run(argv,capture_output=True,text=True,timeout=TIMEOUT,env=env)
+        proc=_run_group(argv,TIMEOUT,env)   # 1.31.1 (A91) : au délai, borgHelper ET son borg arrêtés (groupe)
     except subprocess.TimeoutExpired:
         raise HTTPException(504,detail=f"Commande {cmd} : timeout après {TIMEOUT}s")
     return CommandResult(exitcode=proc.returncode,stdout=proc.stdout,stderr=proc.stderr)
@@ -2432,8 +2471,7 @@ def _borg_env(cfg):
 def _latest_archive(cfg,env):
     borg_exe=cfg.get('BORG_EXE','borg')
     try:
-        proc=subprocess.run([borg_exe,'list','--short']+glob_args(cfg)+[cfg['BORG_REPO']],
-                             capture_output=True,text=True,env=env,timeout=60)
+        proc=_run_group([borg_exe,'list','--short']+glob_args(cfg)+[cfg['BORG_REPO']],60,env)   # 1.31.1 (A91) : groupe arrêté au délai
     except subprocess.TimeoutExpired:
         raise HTTPException(504,detail="borg list : timeout")
     rb={'exitcode':proc.returncode,'stderr':proc.stderr.split('\n')}
@@ -2464,8 +2502,22 @@ def _borg_killgrp(proc,st=None,why=None):
     story 41). Ne fait rien pour un borg déjà récolté ; `why` noté dans l'état (cause du message)."""
     if proc.returncode is not None: return
     if st is not None and why and st.get('why') is None: st['why']=why
+    if st is not None: st['meis'].update(_mei_mapped(_group_pids(proc.pid)))   # 1.31.1 (story 42) : avant le kill
     try: os.killpg(proc.pid,9)
     except OSError: pass
+
+def _group_pids(pgid):
+    """PID des processus du groupe `pgid` (champ pgrp de /proc/<pid>/stat) ; /proc illisible : []."""
+    out=[]
+    try: ents=os.listdir('/proc')
+    except OSError: return out
+    for d in ents:
+        if not d.isdigit(): continue
+        try:
+            with open(f'/proc/{d}/stat') as f: stt=f.read()
+            if int(stt[stt.rindex(')')+2:].split()[2])==pgid: out.append(int(d))
+        except (OSError,ValueError,IndexError): continue
+    return out
 
 def _LIVE_BORG_pop(proc):
     with _LIVE_BORG_LOCK: _LIVE_BORG.pop(proc,None)
@@ -2474,10 +2526,12 @@ def _borg_reap(proc,st):
     """Après la fin de borg : groupe tué (un enfant survivant), dossiers _MEI* extraits par CE borg et inutilisés retirés,
     sortie du registre."""
     if not st.get('why'): return _LIVE_BORG_pop(proc)   # sorti seul : groupe terminé avec lui, PID peut-être déjà réutilisé
+    st['meis'].update(_mei_mapped(_group_pids(proc.pid)))   # enfant encore vivant (tête morte) : ses _MEI aussi
     try: os.killpg(proc.pid,9)
     except OSError: pass
-    for d in _mei_dirs()-st['mei']:
-        if not _mei_in_use(d): shutil.rmtree(d,ignore_errors=True)
+    # 1.31.1 (story 42) : seuls les _MEI* mappés par CE borg (relevés avant le kill, _borg_killgrp), sans attente : jamais
+    # l'extraction d'un autre borg
+    _purge_mei_dirs(st['meis'])
     _LIVE_BORG_pop(proc)
 
 def _kill_live_borg(idle_only=False):
@@ -2497,15 +2551,19 @@ def _make_server(config):
     class _Server(uvicorn.Server):
         def handle_exit(self,sig,frame):
             _kill_live_borg(idle_only=not self.should_exit)
+            import signal as _sg
+            _signal_groups(sig if not self.should_exit else _sg.SIGKILL)   # revue : commandes borgHelper en cours (session propre)
             super().handle_exit(sig,frame)
     return _Server(config)
 
 import atexit as _atexit, shutil
 _atexit.register(_kill_live_borg)
+_atexit.register(lambda: _signal_groups(9))   # revue story 42 : jamais une commande borgHelper orpheline après le serveur
 # Revue (mesuré par un relecteur) : à la fin de l'interpréteur, les fils NON démons du pool d'anyio (bloqués dans read1 sur un
 # borg muet) sont attendus AVANT les fonctions atexit -> enregistré aussi là où il passe avant cette attente (arrêt forcé d'un
 # uvicorn externe).
-if hasattr(threading,'_register_atexit'): threading._register_atexit(_kill_live_borg)
+if hasattr(threading,'_register_atexit'):
+    threading._register_atexit(_kill_live_borg); threading._register_atexit(lambda: _signal_groups(9))
 
 def _borg_stream(request,cmd,env,what,decoy=None,path=None,missing=None):
     """1.30.2 (story 40, A83, décisions de l'utilisateur) : lance borg (`what` : « borg extract »/« borg export-tar »), lit son
@@ -2522,7 +2580,7 @@ def _borg_stream(request,cmd,env,what,decoy=None,path=None,missing=None):
     journal ; avant la réponse : 502 « aucune activité depuis N s » ; après : flux coupé. TIMEOUT None (0) : aucune limite."""
     import collections
     from starlette.concurrency import run_in_threadpool
-    st={'last':time.monotonic(),'why':None,'mei':_mei_dirs()}
+    st={'last':time.monotonic(),'why':None,'meis':set()}
     proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,start_new_session=True)   # groupe propre (killpg)
     with _LIVE_BORG_LOCK: _LIVE_BORG[proc]=st
     def _watchdog():
@@ -3535,9 +3593,9 @@ def push_selftest():
         """1.27.9 (story 5, AD-11) : borg list sans --glob-archives quand GLOB_ARCH est absent (dépôt externe), avec le
         motif sinon — filtre produit par glob_args de borgHelper, jamais une lecture directe."""
         seen=[]
-        def _run(cmd,**k):
+        def _run(cmd,timeout,env):   # 1.31.1 : doublure de _run_group (sa vraie signature)
             seen.append(cmd); return subprocess.CompletedProcess(cmd,0,stdout='a1\na2\n',stderr='')
-        with mock.patch(f"{__name__}.subprocess.run",side_effect=_run):
+        with mock.patch(f"{__name__}._run_group",side_effect=_run):
             r1=_latest_archive({'BORG_REPO':'/r'},{}); r2=_latest_archive({'BORG_REPO':'/r','GLOB_ARCH':'h-*'},{})
         return (seen[0]==['borg','list','--short','/r'] and seen[1]==['borg','list','--short','--glob-archives','h-*','/r']
                 and r1==r2=='a2')
@@ -4520,6 +4578,26 @@ def push_selftest():
                     if got!=(2,2,1,0,0,0,1,2): print(f"  {got}")
                     return got==(2,2,1,0,0,0,1,2)
                 check("cache des réponses : arrêt d'un nick ([ERREUR]) ou erreur SQLite en code 0 jamais en cache, trois sites (A67)",_cache_nick_error)
+                def _cache_index_empty_wal():
+                    """1.31.1 (story 42, A89 + revue) : « Index vide » ([WARN], code 0 depuis borgHelper 1.0.179) est mis en cache comme
+                    toute réponse saine ; l'empreinte des bases suit aussi leur journal -wal (apparu, grossi, disparu) — un Index écrit
+                    d'abord dans le -wal, le fichier principal ne change qu'au checkpoint : la réponse est renouvelée dès sa 1re écriture."""
+                    warn=CommandResult(exitcode=0,stdout='Aucun résultat.\n',stderr='[WARN] Index vide pour qz — lancez : borgHelper -c Index -n qz  [borgHelper v1.0.179]')
+                    for k in [k for k in _RESPONSE_CACHE if k and k[0]=='selftest-idxvide']: _RESPONSE_CACHE.pop(k,None)
+                    with mock.patch(f"{__name__}._exec_borghelper",return_value=warn) as ex:
+                        run_borghelper('selftest-idxvide',nick=_internal,cacheable=True); run_borghelper('selftest-idxvide',nick=_internal,cacheable=True)
+                    for k in [k for k in _RESPONSE_CACHE if k and k[0]=='selftest-idxvide']: _RESPONSE_CACHE.pop(k,None)
+                    db=os.path.join(tmpdir,'fp-wal.db'); open(db,'w').write('x'); wal=db+'-wal'
+                    with contextlib.suppress(OSError): os.unlink(wal)
+                    with mock.patch(f"{__name__}._cache_db_paths",lambda n: [db]):
+                        f0=_cache_fingerprint('qz')
+                        open(wal,'w').write('a'); f1=_cache_fingerprint('qz')
+                        open(wal,'a').write('b'); f2=_cache_fingerprint('qz')
+                        os.unlink(wal); f3=_cache_fingerprint('qz')
+                    got=(ex.call_count,f1!=f0,f2!=f1,f3==f0)
+                    if got!=(1,True,True,True): print(f"  {got}")
+                    return got==(1,True,True,True)
+                check("cache des réponses : « Index vide » ([WARN], code 0) en cache, empreinte renouvelée par le journal -wal (A89)",_cache_index_empty_wal)
                 def _restore_root():
                     """1.29.0 (story 37, A68, décisions de l'utilisateur) : POST /restore — sans racine ou racine introuvable : 403 ;
                     `where` relatif à la racine, absolu dedans accepté, `..` interne accepté ; `..` qui sort, absolu hors racine, lien
@@ -4608,7 +4686,7 @@ def push_selftest():
                         '  File "borg/repository.py", line 190, in __del__','AssertionError: cleanup happened in Repository.__del__','Local Exception',
                         'Traceback (most recent call last):','  File "borg/archiver.py", line 5324, in main',"ValueError: could not convert string to float: 'x'",
                         '','Platform: Linux h','sys.argv: [\'borg\']',''])
-                    with mock.patch.object(subprocess,'run',lambda *a,**k: subprocess.CompletedProcess(a[0],2,stdout='',stderr=crash)):
+                    with mock.patch(f"{__name__}._run_group",lambda argv,timeout,env: subprocess.CompletedProcess(argv,2,stdout='',stderr=crash)):
                         try: _latest_archive({'BORG_REPO':'ssh://h/r'},{}); return False
                         except HTTPException as e:
                             return (e.status_code,e.detail)==(502,"borg list a échoué : Local Exception; ValueError: could not convert string to float: 'x'")
@@ -4617,10 +4695,10 @@ def push_selftest():
                     """1.30.1 (story 39, A77) : borg list en code 1 (avertissement, liste valide) -> dernière archive rendue, avertissement
                     au journal du serveur (avant : 502) ; code 2 : 502 (inchangé)."""
                     e=io.StringIO()
-                    with mock.patch.object(subprocess,'run',lambda *a,**k: subprocess.CompletedProcess(a[0],1,stdout='a\nb\n',stderr='Warning: w1\n')), \
+                    with mock.patch(f"{__name__}._run_group",lambda argv,timeout,env: subprocess.CompletedProcess(argv,1,stdout='a\nb\n',stderr='Warning: w1\n')), \
                          contextlib.redirect_stderr(e):
                         r=_latest_archive({'BORG_REPO':'ssh://h/r'},{})
-                    with mock.patch.object(subprocess,'run',lambda *a,**k: subprocess.CompletedProcess(a[0],2,stdout='a\n',stderr='x\n')):
+                    with mock.patch(f"{__name__}._run_group",lambda argv,timeout,env: subprocess.CompletedProcess(argv,2,stdout='a\n',stderr='x\n')):
                         try: _latest_archive({'BORG_REPO':'ssh://h/r'},{}); r2=None
                         except HTTPException as x: r2=x.status_code
                     return r=='b' and '[WARN] borg list (téléchargement, ssh://h/r) : Warning: w1' in e.getvalue() and r2==502
@@ -4842,6 +4920,95 @@ def push_selftest():
                     if bad: print(f"  {bad}")
                     return not bad
                 check("/download/* : chien de garde d'inactivité (TIMEOUT) — groupe tué, corps jamais lu, registre vidé, lent mais actif servi, arrêt : inactifs puis tous (A86)",_download_idle_watchdog)
+                def _exec_timeout_group():
+                    """1.31.1 (story 42, A91, décision de l'utilisateur ; mesuré : subprocess.run(timeout) tuait borgHelper seul, son borg
+                    continuait orphelin) : groupe simulé = script sans exec (tête : borgHelper, meurt au SIGTERM) dont l'enfant (borg) ignore
+                    SIGTERM. _exec_borghelper au délai (3 s : enfant sûrement lancé) -> 504, tête ET enfant arrêtés (SIGKILL 10 s après) ;
+                    _latest_archive réel (délai 60 s demandé, ramené à 3 s) -> 504 « borg list : timeout », groupe arrêté ; arrêt du
+                    serveur (handle_exit) : 1er signal relayé au groupe (tête arrêtée, enfant vivant), 2e : SIGKILL (enfant arrêté)."""
+                    import signal as _sg, shlex
+                    real_run_group=_run_group; res={}
+                    def grp(tag):
+                        hf,cf=(os.path.join(tmpdir,f'grp-{tag}.{x}') for x in ('tete','enfant'))
+                        for f in (hf,cf):
+                            with contextlib.suppress(OSError): os.unlink(f)
+                        script=(f'echo $$ > {shlex.quote(hf)}; {shlex.quote(sys.executable)} -c "import signal,time,os; '
+                                f'signal.signal(signal.SIGTERM,signal.SIG_IGN); open({cf!r},\'w\').write(str(os.getpid())); time.sleep(60)"; true')
+                        def pids():
+                            try: return int(open(hf).read()),int(open(cf).read())
+                            except (OSError,ValueError): return None,None
+                        return ['sh','-c',script],pids
+                    def alive(pid):
+                        try: return bool(pid) and open(f'/proc/{pid}/stat').read().split(')')[-1].split()[0]!='Z'
+                        except OSError: return False
+                    def reap(pids):
+                        for x in pids():
+                            if alive(x):
+                                with contextlib.suppress(OSError): os.kill(x,9)
+                    # 1) _exec_borghelper
+                    argv,pids=grp('exec'); st=det=None; t0=time.monotonic()
+                    try:
+                        with mock.patch(f"{__name__}.TIMEOUT",3), \
+                             mock.patch(f"{__name__}._build_borghelper_argv_env",lambda *a,**k: (argv,dict(os.environ))):
+                            try: _exec_borghelper('selftest-timeout',None,[])
+                            except HTTPException as x: st,det=x.status_code,x.detail
+                        dt=time.monotonic()-t0; time.sleep(0.3); h,c=pids()
+                        res['_exec_borghelper']=(st==504 and 'timeout après 3s' in (det or '') and h and c and not alive(h) and not alive(c)
+                                                 and 10<=dt<20,st,det,h,c,round(dt,1))
+                    finally: reap(pids)
+                    # 2) _latest_archive réel, délai ramené à 3 s
+                    argv,pids=grp('list'); asked=[]; st=det=None; t0=time.monotonic()
+                    def short(a,timeout,env): asked.append((a[1:3],timeout)); return real_run_group(argv,3,env)
+                    try:
+                        with mock.patch(f"{__name__}._run_group",short):
+                            try: _latest_archive({'BORG_REPO':'/x'},dict(os.environ))
+                            except HTTPException as x: st,det=x.status_code,x.detail
+                        dt=time.monotonic()-t0; time.sleep(0.3); h,c=pids()
+                        res['_latest_archive']=(st==504 and det=='borg list : timeout' and asked==[(['list','--short'],60)] and h and c
+                                                and not alive(h) and not alive(c) and dt<20,st,det,asked,h,c,round(dt,1))
+                    finally: reap(pids)
+                    # 3) arrêt du serveur : signaux relayés aux groupes en cours
+                    argv,pids=grp('stop'); out={}
+                    def bg():
+                        try: out['r']=real_run_group(argv,60,dict(os.environ))
+                        except Exception as x: out['r']=x
+                    th=threading.Thread(target=bg,daemon=True)
+                    try:
+                        th.start(); t0=time.monotonic()
+                        while None in pids() and time.monotonic()-t0<10: time.sleep(0.05)
+                        import uvicorn
+                        srv=_make_server(uvicorn.Config(app)); srv.handle_exit(_sg.SIGTERM,None); time.sleep(1); h,c=pids()
+                        first=(h is not None and not alive(h) and alive(c))
+                        srv.handle_exit(_sg.SIGTERM,None); th.join(10)
+                        res['arrêt du serveur']=(first and not alive(c) and not th.is_alive() and not _LIVE_GROUPS,first,h,c,th.is_alive())
+                    finally: reap(pids)
+                    bad={k:v for k,v in res.items() if not v[0]}
+                    if bad: print(f"  {bad}")
+                    return not bad
+                check("délai de borgHelperWWW : 504 et groupe arrêté (borgHelper + borg, enfant qui ignore SIGTERM compris) (A91)",_exec_timeout_group)
+                def _killgrp_mei():
+                    """1.31.1 (story 42, A91 ; mutation W8) : borg de téléchargement tué (chien de garde) — ses _MEI* relevés par mappage
+                    AVANT le kill (_borg_killgrp), retirés par _borg_reap ; un _MEI* voisin jamais relevé (un autre borg) intact."""
+                    import tempfile, shutil as _sh
+                    base=tempfile.mkdtemp(prefix='mei42w-',dir=tmpdir); d=os.path.join(base,'_MEIw42ab'); other=os.path.join(base,'_MEIautre')
+                    os.makedirs(d); os.makedirs(other)
+                    with open(os.path.join(d,'lib.so'),'wb') as f: f.write(b'\0'*8192)
+                    code=("import mmap,sys,time\nf=open(sys.argv[1],'rb'); m=mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ); f.close()\n"
+                          "print('ok',flush=True); time.sleep(60)")
+                    proc=subprocess.Popen([sys.executable,'-c',code,os.path.join(d,'lib.so')],stdout=subprocess.PIPE,stdin=subprocess.DEVNULL,
+                                          text=True,start_new_session=True)
+                    try:
+                        mapped=proc.stdout.readline().strip()=='ok'
+                        st={'last':time.monotonic(),'why':None,'meis':set()}
+                        _borg_killgrp(proc,st,'idle'); proc.wait(10); _borg_reap(proc,st)
+                        got=(mapped,st['meis']=={d},os.path.exists(d),os.path.isdir(other),st['why'])
+                    finally:
+                        if proc.poll() is None: proc.kill(); proc.wait()
+                        _sh.rmtree(base,ignore_errors=True)
+                    ok=got==(True,True,False,True,'idle')
+                    if not ok: print(f"  {got}")
+                    return ok
+                check("/download/* : borg tué par le chien de garde -> ses _MEI* relevés avant le kill et retirés, voisin intact (A91)",_killgrp_mei)
                 def _http10_detect():
                     """1.31.0 (story 41, A85, décision de l'utilisateur) : requête HTTP/1.0 (appel ASGI direct, vraie application) ->
                     /version http_version « 1.0 » et une seule ligne [WARN] (deux requêtes) ; HTTP/1.1 -> « 1.1 », aucune ligne."""

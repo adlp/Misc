@@ -700,7 +700,14 @@ sortent en **1** quand ils ont rencontré une erreur SQLite réelle, un nick arr
 absente…) ou un chemin illisible — données des autres nicks et lignes partielles toujours affichées (en-tête de base altéré :
 `DbTamperError`, code 2 ; LstBkpFls sur un chemin illisible : 3) ; `-j` : l'erreur est dans
 le JSON **et** sur stderr (avant : code 0, JSON seul) ; LstBkp/LstBkpFls : message `[ERREUR]` au lieu d'une trace Python.
-Status, Report, Bkp, Index, Prune, Restore, DiffBkp : codes inchangés.
+Status, Bkp, Index, Prune, Restore, DiffBkp : codes inchangés. **1.0.179** : « Index vide pour X — lancez Index »
+(nick jamais indexé) est un `[WARN]` (code 0 ; avant : marqué `[ERREUR]` en code 0) ; quand une lecture a échoué, Search,
+FileHist et DuIdx disent « Aucun résultat dans les bases lisibles (erreurs ci-dessus). » (et équivalents) au lieu de
+« Aucun résultat. » (DuIdx `-j` : `{}`, inchangé) ; RepoHistory/ArchiveHistory sur un dossier de cache non traversable :
+l'erreur réelle et code 1, texte comme `-j` (avant : « diff.db absent » ou « disponible via -j », code 0) ; ArchiveHistory :
+une base en migration, sans passphrase ou à l'en-tête altéré pendant la lecture des comptes de modifications est dite (avant :
+comptes vides, code 0) ; Report (et `-o`) : ligne du nick gardée, Modifs « — », `[ERREUR] <nick>: comptes de modifications
+illisibles — …` et code 1 (décision de l'utilisateur ; avant : « — » en code 0).
 Report en ligne : `borg prune --dry-run` en échec -> récupérable « — » (JSON `null`) et `[WARN] … récupérable inconnu`. Login
 (CLI, `POST /login`) : nom de serveur/nick — lettres, chiffres, `.`, `_`, `-`, ni `ALL` ni `DEFAULT` (code 2 / 400).
 **Code 1 de borg (avertissement) — 1.0.176** : sur les lectures (Index, Report, DiffBkp, Mount `-b last`, Restore/ListPerms sans
@@ -1560,7 +1567,7 @@ première requête — voir `docs/borghelperrc.example`.
 | `BORGHELPERWWW_API_KEY` | `-K`, `--api-key` | `api_key` | Clé partagée attendue dans le header `X-API-Key` — absente : **générée aléatoirement** au démarrage (voir ci-dessous) |
 | `BORGHELPERWWW_BORGHELPER_BIN` | `--borghelper-bin` | `borghelper_bin` | Chemin du script `borgHelper` (défaut : à côté de `borgHelperWWW`) |
 | `BORGHELPERWWW_UI_FILE` | `--ui-file` | `ui_file` | Chemin de `borgHelperWWW_ui.html` (défaut : à côté de `borgHelperWWW`) |
-| `BORGHELPERWWW_TIMEOUT` | `--timeout` | `timeout` | Timeout en secondes par commande (défaut 3600 ; 0 = illimité) ; `/download/*` : inactivité maximale de borg (1.31.0) |
+| `BORGHELPERWWW_TIMEOUT` | `--timeout` | `timeout` | Timeout en secondes par commande (défaut 3600 ; 0 = illimité) ; `/download/*` : inactivité maximale de borg (1.31.0) ; au délai (1.31.1) : borgHelper ET son borg arrêtés (SIGTERM au groupe, SIGKILL 10 s après), 504 — toute commande passée à borgHelper (Report, Prune, DelBkp, Init, Key, `/restore`…) : un `/restore` plus long que ce délai est arrêté (fichiers partiels) ; avant : borg continuait seul. Arrêt du serveur : signal relayé aux commandes en cours (2e signal : SIGKILL) |
 | `BORGHELPERWWW_HOST` | `--host` | `host` | Bind — adresse (défaut `127.0.0.1`) |
 | `BORGHELPERWWW_PORT` | `--port` | `port` | Bind — port (défaut `8000`) |
 | `BORGHELPERWWW_TRUSTED_PROXIES` | `--trusted-proxies` | `trusted_proxies` | IP/CIDR des reverse proxies de confiance, séparées par des virgules, ou `*` pour toutes (défaut `127.0.0.1`) — IP du navigateur dans le journal des requêtes, dans les deux modes de lancement (voir ci-dessous) |

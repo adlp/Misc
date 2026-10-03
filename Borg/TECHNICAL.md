@@ -1966,8 +1966,9 @@ un thread, attente 1 s, montage figé -> `ok`, une seule sonde en attente par ni
 mtimes stables, mesuré). Cache par périmètre : `_capture_fingerprints(nick, 'diffbkp')` (présence) et `written_at` comparé à
 `_CACHE_TTL` dans `_scope_cache_get`. `_never_cache(result)` = `_is_db_key_error`, `[ERREUR]` sur stderr ou « SQLite error »
 (stdout/stderr) — seul prédicat des trois écritures (`run_borghelper`, `_scoped_cached_mono`, `_scoped_cached_multi`) ;
-`[ERREUR]` = arrêt d'un nick (`_nick_stop_msg`, `_db_schema_fail`, « Index vide » texte) : sur-approximation voulue, comme
-AD-13. Reste muet (code 0, aucun marqueur) : les mesures de Report -o sur erreur SQLite (`get_cache_rows`/CacheInfo : marqué,
+`[ERREUR]` = arrêt d'un nick (`_nick_stop_msg`, `_db_schema_fail`) : sur-approximation voulue, comme AD-13 ; « Index vide »
+(1.0.179) : `[WARN]`, réponse cacheable, renouvelée par l'empreinte quand un Index crée la base (mesuré : « absent » -> mtime ;
+1.31.1 : `-wal` compris dans l'empreinte, un Index écrit d'abord dans le journal). Reste muet (code 0, aucun marqueur) : les mesures de Report -o sur erreur SQLite (`get_cache_rows`/CacheInfo : marqué,
 code 1 depuis 1.0.178).
 
 `POST /restore` (A68) : `_restore_where(where)` en tête de la route (après `require_api_key`, avant le périmètre et tout
@@ -2321,6 +2322,31 @@ response ») — une exception dans le corps ne suffit pas, BaseHTTPMiddleware (
 chemins lecteur à `_READER_WRITE_WAIT` : `_db_has_schema(path, timeout=60)` (écrivains : 60 s), `ensure_cache_db`/`ensure_diff_db`
 /`ensure_history_db` en `create=False`, purge du cache de Report, sondes de RepoHistory/ArchiveHistory/Status (mesuré : 60,3 s ->
 2-4 s sous `locking_mode=EXCLUSIVE`). `_rb_errmsg` : CRITICAL lu comme ERROR ; échec (code ≥ 2) sans ERROR ni texte -> « <cmd> failed (code N) — avertissement de borg : <WARNING> » (le code toujours ; code 0/1 inchangé).
+**Index vide, arrêt de borg par arbre, erreurs dites (1.0.179 / WWW 1.31.1, story 42)** : `_READER_FAILED` devient un
+COMPTEUR (`+=1` ; `_cli_main` le remet à 0) — Search, FileHist, DuIdx (`_duidx_print(failed=)`) et CacheInfo comparent sa valeur
+au début et à la fin de leur appel (« … dans les bases lisibles (erreurs ci-dessus). ») ; « Index vide » : `[WARN]` aux 7 sites.
+`_kill_tree(ps, sig, known)` : signal à borg et à ses descendants (`_proc_descendants`, ppid de `/proc/<pid>/stat`), rend
+{pid: heure de démarrage} (`_proc_start`, champ 22) à repasser au signal suivant — la tête morte au SIGTERM, ses enfants sont
+rattachés à init ; un pid n'est visé que si son heure de démarrage est la même (jamais un PID réattribué). Même groupe de
+processus : Ctrl-C au terminal inchangé. `boex` sous arrêt demandé : SIGTERM à l'arbre, 5 s, SIGKILL à l'arbre relevé,
+`communicate` borné (10 s) ; Ctrl-C : SIGTERM à l'arbre, jusqu'à 5 s pour que la tête ET l'arbre relevé sortent (une tête
+morte aussitôt ne coupe plus le délai de l'enfant), SIGKILL à l'arbre relevé (second Ctrl-C : SIGKILL tout de suite), code 130.
+`_index_diffs` : moniteur (`trees` par paire) et borg lancé pendant l'arrêt (SIGTERM, 5 s pour la tête et l'arbre, SIGKILL) ; `_run_diff` ne lance
+plus borg si l'arrêt est déjà demandé. Vrai borg mesuré : `exec nice borg.wrapped` (chargeur PyInstaller + enfant) — SIGTERM relayé
+(1,1 s), SIGINT non (11 s), SIGKILL jamais (enfant survivant, `_MEI` laissé). `_mei_mapped(pids)` : dossiers `_MEI*` mappés par
+ces processus (`/proc/<pid>/maps`), relevés par `_kill_tree` AVANT le signal ; `_purge_mei_dirs(dirs)` les retire ensuite s'ils
+sont à nous et plus utilisés (`_mei_in_use`), même tout juste extraits — jamais l'extraction d'un autre borg (avant/après par
+listing : écarté en revue). Utilisé par boex, `_index_diffs`, borgHelperWWW `_borg_killgrp`/`_borg_reap` (`_group_pids` du
+groupe) ; `_bkp_server_version` inchangé. borgHelperWWW `_run_group` (`_exec_borghelper`, `_latest_archive`) : session propre,
+au délai `killpg` SIGTERM, 10 s, SIGKILL, puis `TimeoutExpired` (504) ; registre `_LIVE_GROUPS` : `_signal_groups(sig)` relaie
+l'arrêt du serveur (`handle_exit` : 1er signal le même, 2e SIGKILL ; atexit et `threading._register_atexit` : SIGKILL) —
+sans condition sur `poll()` (la tête morte au SIGTERM, son enfant vit encore dans le groupe, mesuré). `_cache_fingerprint` :
+`-wal` (mtime_ns, taille) de chaque base en plus du fichier principal. `_path_present(p)` (ENOENT seul = absent) :
+RepoHistory/ArchiveHistory et `_hist(strict=True)` (RepoHistory ; texte : sonde de history.db, illisible -> erreur et code 1).
+`_diff_stats_for_nick` ne rattrape plus que `sqlite3.Error` ; Report (`prep_report`/`prep_report_from_db`) rattrape
+DbKeyError/DbModeError/DbTamperError/DbCodecError : `[ERREUR] <nick>: comptes de modifications illisibles`, Modifs « — »,
+marque `_stats_error` retirée par `report`/`report_offline` -> code 1, ligne gardée.
+
 **Code des lecteurs, téléchargements bornés, HTTP/1.0, filtre exact (1.0.178 / WWW 1.31.0 / UI 1.23.0, story 41)** :
 `_READER_FAILED` (drapeau de processus, remis à faux par `_cli_main`) posé par `_reader_sqlite_err`/`_reader_sqlite_line` (vraie
 erreur, marque dite ou non), `_is_index_empty` (vraie erreur), `_codec_fail` et `_PerNick.__exit__` (nick isolé) ; fin du
