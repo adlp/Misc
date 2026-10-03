@@ -862,7 +862,10 @@ temps en temps pour rendre la place libérée (le `Prune` de borgHelper compacte
 > Une tranche (`-t`) compte la pause dans son budget et sort à l'échéance ; le cron suivant reprend.
 > Depuis 1.0.145, les `borg diff` en cours sont arrêtés par SIGTERM (borg rend lui-même son verrou de dépôt), SIGKILL
 > après 5 s seulement (1.0.180 : 5 s pour que borg ET son arbre sortent, puis SIGKILL de l'arbre restant et attente de sa fin —
-> une tranche peut ainsi dépasser son budget d'environ 20 s au plus) ; plus aucun `borg break-lock`, qui cassait aussi le verrou d'un `borg create` externe, d'un
+> une tranche peut ainsi dépasser son budget d'environ 20 s au plus ; 1.0.181 : un borg diff tué au SIGKILL est dit,
+> `[WARN] <nick>: borg diff <a> → <b> arrêté par SIGKILL — verrou de dépôt possiblement resté` ; un borg diff lancé alors que
+> l'arrêt était déjà demandé voit sa sortie lue pendant l'attente : il sort proprement au SIGTERM au lieu de finir au SIGKILL,
+> et ses `_MEI*` sont retirés) ; plus aucun `borg break-lock`, qui cassait aussi le verrou d'un `borg create` externe, d'un
 > `borg mount` ou d'un autre hôte. L'Index attend la fin de **toutes** les opérations prioritaires du dépôt : un
 > Restore qui finit pendant un Bkp ne le fait plus reprendre à côté du Bkp.
 

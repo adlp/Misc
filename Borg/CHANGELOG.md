@@ -1,5 +1,27 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.181 — borg diff lancé pendant l'arrêt de l'Index : sortie lue pendant l'attente — 2026-10-03
+
+Chantier « reconstruction progressive », story 44 (actions de rétrospective A96, A97 ; regroupement demandé par l'utilisateur).
+
+- **Index : un borg diff lancé alors que l'arrêt était déjà demandé sort proprement** (mesuré sur 1.0.180, vrai borg 1.2.6,
+  `borg diff --json-lines` de 5,9 Mo) : sa sortie n'était pas lue pendant les 5 s d'attente — SIGTERM reçu après 0,5 s ou plus,
+  tube plein, borg ne pouvait pas sortir et finissait au SIGKILL (verrou de dépôt non rendu proprement) ; elle est désormais
+  vidée (et jetée) pendant l'attente, comme boex le fait déjà : sortie propre en 0,13 s (code 143). borgHelper retire aussi
+  les `_MEI*` de ce borg (mesuré : un borg tué au démarrage en laisse un, ~60 Mo).
+- **Un borg diff tué au SIGKILL par l'Index est dit** (décision de l'utilisateur) : `[WARN] <nick>: borg diff <a> → <b> arrêté
+  par SIGKILL — verrou de dépôt possiblement resté`, une ligne par borg réellement tué (borg lui-même, pas un simple
+  descendant ; décidé après le signal), qu'il ait été arrêté par le moniteur (échéance, priorité) ou lancé pendant l'arrêt —
+  chaque borg n'est pris que par un seul des deux chemins (jamais deux lignes) ; code de sortie de l'Index inchangé ; ces
+  lignes ne remplacent jamais la raison de l'arrêt dans le dernier Index (`/access`, Status). Avant : silencieux. En pratique ce SIGTERM part juste après le
+  lancement (sortie immédiate, mesuré à 0,03 s) : seul un arrêt retardé (charge) était touché.
+- CodecSelfTest : faux borg à la structure du vrai (SIGTERM -> exception, nettoyage qui écrit encore sur stdout : bloqué tant
+  que le tube est plein ; témoin sans vidage bloqué), sortie propre, borg sourd tué, `_MEI*` tenu ouvert retiré, jeu partagé
+  modifié pendant la purge ; SIGKILL dit (tête vivante) et jamais dit (borg sorti au SIGTERM, seul un descendant tué) ;
+  dernier Index non masqué ; garde AST de structure de `_run_diff` (inscription et décision sous verrou, exclusivité avec
+  le moniteur, arrêt avant la lecture, avertissement sous le code de borg).
+- Outillage hors dépôt (A96) : serveurs borgHelperWWW de mesure lancés, suivis par leur port et arrêtés avec vérification.
+
 ## borgHelper 1.0.180 / borgHelperWWW 1.31.2 — SIGKILL du groupe garanti, arrêts qui attendent l'arbre de borg — 2026-10-03
 
 Chantier « reconstruction progressive », story 43 (actions de rétrospective A93 à A95 ; regroupement demandé par l'utilisateur).

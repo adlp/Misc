@@ -2361,6 +2361,19 @@ bornes : réponse en général 10 s après le délai, 30 s au plus (tubes encore
 504 en 6,07 s, enfant vivant 12 s après (SIGKILL sauté) ; 1.31.2 : 504 en 16,1 s, groupe vide ; arrêt du serveur : enfant tué
 10,1 s après le 1er signal.
 
+**Borg lancé pendant l'arrêt : sortie vidée, SIGKILL dit (1.0.181, story 44)** : `_stop_fresh_borg(ps, meis, grace=5)` — arrêt d'un borg
+lancé pendant l'arrêt de l'Index (`_run_diff`, dans le `try` dont le `finally` retire la paire de `running_procs` ; sortie jamais
+relue ensuite) —
+SIGTERM à l'arbre, stdout vidé en octets dans un fil (`buffer.read1`, jamais une erreur de décodage) pendant `_tree_wait`,
+SIGKILL et attente si besoin, `_purge_mei_dirs(meis)` (le moniteur a pu purger avant ce lancement) ; mesuré : sortie non lue
+-> tube plein, borg bloqué jusqu'au SIGKILL ; lue -> sortie propre (143) en 0,13 s. Rend True si borg est sorti seul ; sinon
+`_sigkill_warn` (`[WARN] <nick>: borg diff <a> → <b> arrêté par SIGKILL — verrou de dépôt possiblement resté`, décision de
+l'utilisateur) quand borg LUI-MÊME a été tué (`ps.returncode == -SIGKILL`, décidé après le signal ; un descendant seul tué :
+rien), sur les deux chemins. Un seul chemin par borg : `_run_diff` s'inscrit dans `running_procs` et décide `fresh` sous
+`running_procs_lock` (`fresh_taken`), le moniteur ne prend que les borg hors `fresh_taken` (`mon_taken`). Le vidage démarre
+avant le SIGTERM. `_record_index_last` (issue deadline/busy) écarte ces lignes du message. `_purge_mei_dirs` itère une copie
+(`list(dirs)`) : le jeu `meis` est partagé par les fils de l'Index.
+
 **Code des lecteurs, téléchargements bornés, HTTP/1.0, filtre exact (1.0.178 / WWW 1.31.0 / UI 1.23.0, story 41)** :
 `_READER_FAILED` (drapeau de processus, remis à faux par `_cli_main`) posé par `_reader_sqlite_err`/`_reader_sqlite_line` (vraie
 erreur, marque dite ou non), `_is_index_empty` (vraie erreur), `_codec_fail` et `_PerNick.__exit__` (nick isolé) ; fin du

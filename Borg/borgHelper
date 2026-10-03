@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.180"
+Version="1.0.181"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -4228,6 +4228,33 @@ def _group_wait(pgid,until):
         if time.monotonic()>=until: return False
         time.sleep(0.1)
 
+def _sigkill_warn(nick,a_old,a_new):
+    """1.0.181 (story 44, décision de l'utilisateur) : un borg diff tué au SIGKILL par l'Index (pas sorti `grace` s après SIGTERM)
+    a pu ne pas rendre proprement son verrou de dépôt — dit (moniteur et borg lancé pendant l'arrêt), code inchangé."""
+    printer(f"[WARN] {nick}: borg diff {a_old} → {a_new} arrêté par SIGKILL — verrou de dépôt possiblement resté")
+
+def _stop_fresh_borg(ps,meis,grace=5):
+    """1.0.181 (story 44, A97 ; mesuré sur 1.0.180, vrai borg 1.2.6, `borg diff --json-lines` de 5,9 Mo) : arrêt d'un borg lancé
+    alors que l'arrêt était déjà demandé — SIGTERM à l'arbre, stdout VIDÉ pendant l'attente de l'arbre (`grace` s), SIGKILL de
+    ce qui reste, attente, puis retrait de ses _MEI. Mesuré : SIGTERM à 0,5 s ou plus, sortie non lue -> tube plein, borg ne
+    sort pas (« Received SIGTERM » jamais écrit) et finit au SIGKILL ; sortie lue -> sortie propre en 0,13 s (code 143). Jumeau
+    de boex (arrêt demandé : `communicate` lit les tubes). La sortie lue est jetée (paire jamais gardée). Rend True si borg
+    est sorti de lui-même."""
+    def drain():
+        try:
+            src=getattr(ps.stdout,'buffer',ps.stdout)   # octets : jamais une erreur de décodage qui arrêterait le vidage
+            while src.read1(65536): pass
+        except (ValueError,OSError,AttributeError): pass
+    th=threading.Thread(target=drain,daemon=True); th.start()   # revue : AVANT le SIGTERM (gestionnaire jamais bloqué)
+    tree=_kill_tree(ps,signal.SIGTERM,None,meis)
+    tree,done=_tree_wait(ps,tree,time.monotonic()+grace,meis)
+    if not done:
+        tree=_kill_tree(ps,signal.SIGKILL,tree,meis)
+        tree,_=_tree_wait(ps,tree,time.monotonic()+5,meis)   # SIGKILL asynchrone : arbre sorti avant la purge
+    th.join(5)
+    _purge_mei_dirs(meis)   # le moniteur a pu purger AVANT ce lancement : ses _MEI (mesuré : borg tué au démarrage en laisse un)
+    return done
+
 def _tree_wait(ps,tree,until,mei=None):
     """1.0.180 (story 43, A94, L92) : attend que borg ET son arbre soient sortis — tête récoltée et plus aucun processus
     relevé vivant, l'arbre relu à chaque tour (`_kill_tree(…, 0, …)` : signal 0, rien n'est tué ; un enfant né après le
@@ -4294,7 +4321,7 @@ def _kill_tree(ps,sig,known=None,mei=None):
 def _purge_mei_dirs(dirs):
     """1.0.179 (A91) : retire les dossiers _MEI* donnés (relevés par _kill_tree sur les borg tués), s'ils sont à nous et plus
     utilisés par aucun processus — même tout juste extraits (que _purge_mei_orphans, 120 s sans modification, garde)."""
-    for d in dirs:
+    for d in list(dirs or ()):   # 1.0.181 (revue) : copie atomique — le jeu est partagé par les fils de l'Index (mei.update)
         try:
             st=os.lstat(d)
             if stat.S_ISDIR(st.st_mode) and st.st_uid==os.getuid() and not _mei_in_use(d): shutil.rmtree(d,ignore_errors=True)
@@ -6530,7 +6557,8 @@ class BorgHelper:
                 else:   # sans [ERREUR] : lignes non vides sans [WARN], celles du nick d'abord, sinon toutes
                     cand=[l for l in seen if l.strip() and '[WARN]' not in l]
                     lines=([l for l in cand if l.startswith(f"{nick}:")] or cand or seen)[-3:]
-            else: lines=([l for l in seen if l.startswith(f"{nick}:") or '[WARN]' in l] or seen)[-3:]
+            else:   # 1.0.181 (revue) : les [WARN] « arrêté par SIGKILL » (un par borg) ne masquent jamais la raison de l'arrêt
+                lines=([l for l in seen if (l.startswith(f"{nick}:") or '[WARN]' in l) and 'arrêté par SIGKILL' not in l] or seen)[-3:]
             msg=' | '.join(l.strip() for l in lines)
         rec={'nick':nick,'started_at':started,'finished_at':_iso_now(),'outcome':outcome,'code':code,
              'via':'http' if os.environ.get('BORGHELPER_VIA')=='http' else 'cli','message':msg[:500]}
@@ -6732,6 +6760,7 @@ class BorgHelper:
         # 1.0.153 (story 16) : paires dont le borg a reçu un signal du moniteur. borg diff tué par SIGTERM peut sortir en
         # code 1 SANS sortie (mesuré, borg 1.2.6) : sans ce relevé, la paire était gardée vide pour toujours.
         signaled=set()
+        fresh_taken=set(); mon_taken=set()   # 1.0.181 (revue) : chaque borg arrêté par UN seul chemin (moniteur ou « lancé pendant l'arrêt »)
         def _run_diff(pair):
             a_old,a_new,date_new=pair
             print(f"  {nick}: {a_old} → {a_new}",flush=True)
@@ -6740,25 +6769,26 @@ class BorgHelper:
                 return (a_old,a_new,date_new,[],{},False)
             ps=subprocess.Popen(cmd,encoding='utf-8',env=diff_env,cwd=os.getcwd(),
                                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-            with running_procs_lock: running_procs[pair]=ps
+            with running_procs_lock:   # 1.0.181 (revue) : inscription ET décision sous le même verrou que l'instantané du moniteur
+                running_procs[pair]=ps
+                fresh=interrupted_event.is_set() and pair not in mon_taken
+                if fresh: fresh_taken.add(pair); signaled.add(pair)
             # 1.0.175 (story 38, A75) : stderr lu à part — jamais lu avant, borg bloquait au-delà du tampon du tube (~64 Ko)
             errs=[]
             def _read_err():
                 try: errs.extend(ps.stderr.read().split('\n'))
                 except (ValueError,OSError): pass   # stderr non UTF-8 (bannière ssh) : message sans cause, jamais une trace de thread
             err_t=threading.Thread(target=_read_err,daemon=True); err_t.start()
-            if interrupted_event.is_set():   # lancé pendant l'arrêt : le moniteur ne l'a pas vu
-                with running_procs_lock: signaled.add(pair)
-                # 1.0.179 (A91) : arbre de borg — SIGTERM, 5 s, puis SIGKILL de ce qui reste de l'arbre relevé (un enfant qui
-                # ignore SIGTERM tiendrait stdout : la lecture ci-dessous bloquerait)
-                _tree=_kill_tree(ps,signal.SIGTERM,None,meis)
-                _tree,done_=_tree_wait(ps,_tree,time.monotonic()+5,meis)   # tête ET arbre (commun aux arrêts, 1.0.180)
-                if not done_:
-                    _tree=_kill_tree(ps,signal.SIGKILL,_tree,meis)
-                    _tree_wait(ps,_tree,time.monotonic()+5,meis)   # revue : arbre sorti (SIGKILL asynchrone)
             entries=[]; exclu={}
             try:
-                for line in ps.stdout:          # streaming — parse au fil de l'eau
+                if fresh:   # lancé pendant l'arrêt : le moniteur ne l'a pas pris (décidé à l'inscription, sous le verrou)
+                    # 1.0.179 (A91) : arbre de borg — SIGTERM, 5 s, puis SIGKILL de ce qui reste de l'arbre relevé (un enfant qui
+                    # ignore SIGTERM tiendrait stdout : la lecture ci-dessous bloquerait) ; 1.0.181 (A97) : stdout vidé pendant
+                    # l'attente (tube plein : borg ne sortait pas, mesuré), _MEI retirés ici ; dans le try (revue : une
+                    # exception ne laisse jamais la paire dans running_procs) ; sortie jamais relue (le vidage l'a jetée)
+                    _stop_fresh_borg(ps,meis)
+                    if ps.returncode==-signal.SIGKILL: _sigkill_warn(nick,a_old,a_new)   # borg lui-même tué (pas un seul descendant)
+                for line in (() if fresh else ps.stdout):          # streaming — parse au fil de l'eau
                     for p in parse_diff_entries_json(line):   # 1.0.163 : changement de type -> 2 entrées
                         if not p['path']: continue
                         if self._idx_path_ok(p['path'],cfg):
@@ -6811,17 +6841,21 @@ class BorgHelper:
                                     with running_procs_lock:
                                         # 1.0.180 (story 43, A94) : SIGKILL à TOUS les borg signalés, récoltés ou non — un borg
                                         # sorti (tubes fermés, retiré de running_procs) laissait son enfant vivant
-                                        if not kill: seen.update(running_procs)
+                                        if not kill:   # 1.0.181 (revue) : jamais un borg déjà pris par le chemin « lancé pendant l'arrêt »
+                                            for k_,v_ in running_procs.items():
+                                                if k_ not in fresh_taken: seen[k_]=v_; mon_taken.add(k_)
                                         for pr,ps in list(seen.items()):
                                             signaled.add(pr)
                                             # 1.0.179 (A91) : arbre de borg — SIGKILL n'est jamais relayé à l'enfant PyInstaller,
                                             # qui gardait stdout ouvert : `for line in ps.stdout` bloquait l'Index entier ;
                                             # arbre relevé au SIGTERM gardé pour le SIGKILL (tête déjà morte)
                                             trees[pr]=_kill_tree(ps,signal.SIGKILL if kill else signal.SIGTERM,trees.get(pr),meis)
+                                undone=[]
                                 def _trees_done(secs):   # 1.0.180 : l'ARBRE de chaque borg signalé, pas running_procs vide
-                                    end=time.monotonic()+secs; ok=True
+                                    end=time.monotonic()+secs; ok=True; undone.clear()
                                     for pr,ps in list(seen.items()):
                                         trees[pr],d=_tree_wait(ps,trees.get(pr),end,meis); ok=ok and d
+                                        if not d: undone.append(pr)
                                     return ok
                                 def _wait_reaped(secs):
                                     end=time.time()+secs
@@ -6834,6 +6868,9 @@ class BorgHelper:
                                 if not _trees_done(5):
                                     _signal_all(True)
                                     _trees_done(5)   # revue : arbres sortis après le SIGKILL (asynchrone), avant la purge
+                                    # 1.0.181 (décision de l'utilisateur ; revue) : dit APRÈS le SIGKILL, pour chaque borg lui-même tué
+                                    for pr,ps_ in list(seen.items()):
+                                        if ps_.poll()==-signal.SIGKILL: _sigkill_warn(nick,pr[0],pr[1])
                                 _wait_reaped(15)   # _run_diff reap ses processus (plus de zombies)
                                 _purge_mei_dirs(meis); _purge_mei_orphans()   # aussi après SIGTERM : un borg arrêté en démarrage laisse le sien
                                 return
@@ -15933,8 +15970,28 @@ fail()
                 try: return dict(((o,n),k) for o,n,k in c.execute("SELECT archive_old,archive_new,entry_count FROM diff_indexed_pairs"))
                 finally: c.close()
             got,want=counts(b),counts(ref)
-            ok=ran and after_kill==(0,0) and dt<30 and got==want and len(want)==5 and all(v>0 for v in want.values())
-            if not ok: print(f"  diff tué code 1 : lancé+arrêté {ran}, après arrêt {after_kill} en {dt:.1f}s ; tranches {got} ; complet {want}")
+            nowarn='arrêté par SIGKILL' not in ko   # 1.0.181 (revue) : borg sorti au SIGTERM -> jamais « arrêté par SIGKILL »
+            ok=ran and after_kill==(0,0) and dt<30 and got==want and len(want)==5 and all(v>0 for v in want.values()) and nowarn
+            if not ok: print(f"  diff tué code 1 : lancé+arrêté {ran}, après arrêt {after_kill} en {dt:.1f}s ; tranches {got} ; complet {want} ; sans SIGKILL dit {nowarn}")
+            return ok
+        def _ix_sigkill_warn():
+            """1.0.181 (story 44, décision de l'utilisateur) : borg diff dont la TÊTE ne sort pas au SIGTERM (comme le chargeur
+            PyInstaller qui attend son enfant ; ici `trap '' TERM`, hérité par l'enfant) -> SIGKILL de l'arbre à l'échéance et
+            `[WARN] ix: borg diff <a> → <b> arrêté par SIGKILL — verrou de dépôt possiblement resté`, une ligne par paire tuée,
+            jamais en double ; paire jamais marquée."""
+            ctx=_ix_ctx(); b=_ix_bh(ctx,'c-sigkill'); _ix_slow(ctx,None,0)
+            _rb_wrapper(ctx['w'],ctx['bb'],f"echo \"$*\" >> {shlex.quote(ctx['log'])}\n"
+                        "if [ \"$1\" = \"diff\" ]; then trap '' TERM; sleep 60 </dev/null >/dev/null 2>&1 & wait $!; exit 1; fi\n")
+            try:
+                t0=time.monotonic(); ko=_q_run(b.index,'ix',budget=6,natures=['diff']); dt=time.monotonic()-t0
+                c=sqlite3.connect(b.db.get_diff_db('ix'))
+                try: kept=c.execute("SELECT count(*) FROM diff_indexed_pairs").fetchone()[0]
+                finally: c.close()
+            finally: _ix_slow(ctx,None,0)
+            w=[l.strip() for l in ko.splitlines() if 'arrêté par SIGKILL' in l]
+            fmt=all(re.match(r"^\[WARN\] ix: borg diff \S+ → \S+ arrêté par SIGKILL — verrou de dépôt possiblement resté",l) for l in w)
+            ok=bool(w) and fmt and len(set(w))==len(w) and kept==0 and 10<=dt<40
+            if not ok: print(f"  {w} ; format {fmt} ; paires gardées {kept} ; {dt:.1f}s")
             return ok
         def _ix_kill_tree():
             """1.0.179 (story 42, A91 ; mesuré : vrai borg = `exec nice borg.wrapped`, chargeur PyInstaller + enfant, SIGKILL jamais
@@ -15965,7 +16022,9 @@ fail()
             def gone(): time.sleep(0.5); k=kids(); return k,bool(kids(False)) and not any(alive(x) for x in k)
             try:
                 t0=time.monotonic(); ko=_q_run(b.index,'ix',budget=6,natures=['diff']); dt=time.monotonic()-t0; k,ok=gone()
-                res['Index : diff tué, arbre']=(ok and bool(kids(True)) and dt<35 and 'arrêt des diffs en cours' in ko,round(dt,1),k)
+                # 1.0.181 (revue) : tête (borg) morte au SIGTERM, seuls ses descendants tués -> jamais « arrêté par SIGKILL »
+                res['Index : diff tué, arbre']=(ok and bool(kids(True)) and dt<35 and 'arrêt des diffs en cours' in ko
+                                              and 'arrêté par SIGKILL' not in ko,round(dt,1),k)
                 with contextlib.suppress(OSError): os.unlink(pidf)
                 b.borg._stop=lambda: bool(kids(False))   # armé une fois l'enfant lancé : l'arrêt vise un borg vivant
                 try:
@@ -16055,7 +16114,8 @@ fail()
                 with contextlib.suppress(OSError): os.unlink(pidf)
                 t0=time.monotonic(); ko=_q_run(b.index,'ix',budget=6,natures=['diff']); dt=time.monotonic()-t0; k,ok=gone()
                 # budget 6 s + délai de grâce ≥ 4 s avant SIGKILL (revue : borne basse)
-                res['Index : borg récolté, enfant restant']=(ok and 10<=dt<40 and 'arrêt des diffs en cours' in ko,round(dt,1),k)
+                res['Index : borg récolté, enfant restant']=(ok and 10<=dt<40 and 'arrêt des diffs en cours' in ko
+                                                             and 'arrêté par SIGKILL' not in ko,round(dt,1),k)   # borg sorti : pas dit
             finally:
                 for x in kids():
                     with contextlib.suppress(OSError): os.kill(x,9)
@@ -16065,7 +16125,8 @@ fail()
             return not bad
         def _kill_then_wait_guard():
             """1.0.180 (story 43, mutations B4/B13 : un SIGKILL tue en quelques ms, l'attente qui suit n'est visible par aucun test de
-            comportement) — garde de structure par AST (L90) : dans boex, _index_diffs et _bkp_server_version, chaque SIGKILL d'arbre
+            comportement) — garde de structure par AST (L90) : dans boex, _index_diffs, _bkp_server_version et _stop_fresh_borg
+            (1.0.181), chaque SIGKILL d'arbre
             (`_kill_tree(…, signal.SIGKILL, …)`, `_signal_all(True)`) ou de groupe (`os.killpg(…, 9)`) est suivi, dans un bloc
             englobant, d'une attente de l'arbre ou du groupe (`_tree_wait`, `_trees_done`, `_group_wait`) avant la purge des _MEI.
             Exception : le second Ctrl-C (`except KeyboardInterrupt`), tout de suite."""
@@ -16082,7 +16143,7 @@ fail()
                 return False
             def has_wait(stmts): return any(isinstance(x,ast.Call) and cname(x) in WAITS for st in stmts for x in ast.walk(st))
             bad=[]; seen=0
-            for fn in (BorgRunner.boex,BorgHelper._index_diffs,BorgHelper._bkp_server_version):
+            for fn in (BorgRunner.boex,BorgHelper._index_diffs,BorgHelper._bkp_server_version,_stop_fresh_borg):
                 tree=ast.parse(textwrap.dedent(inspect.getsource(fn)))
                 def visit(node,chain,ki):   # chain : [(liste de statements, index)] ; ki : profondeur de gestionnaires KeyboardInterrupt
                     nonlocal seen
@@ -16107,6 +16168,112 @@ fail()
             if not ok: print(f"  SIGKILL sans attente : {bad} ; vus {seen}")
             return ok
         check("arrêts de borg : chaque SIGKILL d'arbre ou de groupe suivi d'une attente de sa fin avant la purge (garde AST, A94)",_kill_then_wait_guard)
+        def _stop_fresh_full_pipe():
+            """1.0.181 (story 44, A97 ; mesuré, vrai borg 1.2.6 : SIGTERM sur tube plein non lu -> borg ne sort pas, SIGKILL à 5 s ;
+            tube vidé -> sortie propre en 0,13 s, code 143) — factice FIDÈLE : SIGTERM -> exception, nettoyage qui écrit encore sur
+            stdout puis sort (143), donc bloqué sur un tube plein comme borg ; il dit « prêt » (gestionnaire posé) et le tube est
+            constaté PLEIN (FIONREAD) avant le signal — jamais un délai fixe (revue : échec sous charge). Témoin sans vidage bloqué
+            (L81) ; avec _stop_fresh_borg : sorti seul, vite, 143 ; sourd : SIGKILL après le délai ; _MEI* tenu ouvert retiré et
+            relevé ; jeu de _MEI partagé modifié pendant la purge : jamais d'erreur. Garde AST : dans _run_diff, sous
+            `if interrupted_event.is_set()` après Popen et AVANT la lecture de ps.stdout, `_stop_fresh_borg(ps, meis)` dont le
+            résultat commande `_sigkill_warn`."""
+            import ast,inspect,textwrap,fcntl,termios,struct
+            code=("import signal,sys,os\nclass SigTerm(Exception): pass\ndef h(*a): raise SigTerm()\nsignal.signal(signal.SIGTERM,h)\n"
+                  "if len(sys.argv)>1: os.chdir(sys.argv[1]); f=open('lib.so','w')\n"
+                  "sys.stderr.write('prêt\\n'); sys.stderr.flush()\n"
+                  "l='x'*1023+'\\n'\ntry:\n    while True: sys.stdout.write(l)\nexcept SigTerm:\n"
+                  "    sys.stderr.write('Received SIGTERM\\n'); sys.stdout.write('{\"fin\":1}\\n'); sys.stdout.flush(); sys.exit(143)\n")
+            deaf=("import signal,sys,time\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nsys.stderr.write('prêt\\n'); sys.stderr.flush()\n"
+                  "sys.stdout.write('x'*200000); sys.stdout.flush()\ntime.sleep(60)\n")
+            def launch(c,*a):
+                p=subprocess.Popen([sys.executable,'-c',c,*a],encoding='utf-8',stdout=subprocess.PIPE,stderr=subprocess.PIPE,stdin=subprocess.DEVNULL)
+                ready=p.stderr.readline().strip()=='prêt'; full=False; end=time.monotonic()+20
+                cap=fcntl.fcntl(p.stdout.fileno(),1032)   # F_GETPIPE_SZ : capacité réelle du tube (revue : pas toujours 64 Kio)
+                while ready and time.monotonic()<end:
+                    n=struct.unpack('i',fcntl.ioctl(p.stdout.fileno(),termios.FIONREAD,b'\0'*4))[0]
+                    if n>=cap: full=True; break
+                    time.sleep(0.05)
+                threading.Thread(target=p.stderr.read,daemon=True).start()
+                return p,ready and full
+            res={}; procs=[]
+            try:
+                p,ok=launch(code); procs.append(p); tree=_kill_tree(p,signal.SIGTERM,None,set())
+                tree,done=_tree_wait(p,tree,time.monotonic()+2,set())
+                res['témoin sans vidage : bloqué']=(ok and not done,ok,done)
+                _kill_tree(p,signal.SIGKILL,tree,set()); p.wait(5)
+                md=tempfile.mkdtemp(prefix='mei44-',dir=tmp); mei=os.path.realpath(os.path.join(md,'_MEIf44ab')); os.makedirs(mei)
+                p,ok=launch(code,mei); procs.append(p); meis=set(); t0=time.monotonic(); done=_stop_fresh_borg(p,meis); dt=time.monotonic()-t0
+                res['vidé : sorti seul, _MEI retiré']=(ok and done and p.returncode==143 and dt<3 and mei in meis and not os.path.exists(mei),
+                                                     ok,done,p.returncode,round(dt,2),sorted(meis),os.path.exists(mei))
+                p,ok=launch(deaf); procs.append(p); t0=time.monotonic(); done=_stop_fresh_borg(p,set(),grace=2); dt=time.monotonic()-t0
+                res['sourd : SIGKILL après le délai']=(ok and not done and p.returncode==-9 and 2<=dt<6,ok,done,p.returncode,round(dt,2))
+            finally:
+                for p in procs:
+                    if p.poll() is None: p.kill(); p.wait()
+            # jeu partagé : un autre fil y ajoute pendant la purge (revue : RuntimeError « Set changed size during iteration »)
+            shared={os.path.join(tmp,f'_MEInx{i:04d}') for i in range(3000)}; stop=threading.Event(); err=[]
+            def adder():   # jeu BORNÉ (ajout + retrait tournants) : la taille change sans cesse, la mémoire non (run tué une fois)
+                k=0
+                while not stop.is_set():
+                    shared.add(os.path.join(tmp,f'_MEIad{k%200}')); shared.discard(os.path.join(tmp,f'_MEIad{(k+100)%200}')); k+=1
+            th=threading.Thread(target=adder,daemon=True); th.start()
+            try:
+                for _ in range(5): _purge_mei_dirs(shared)
+            except RuntimeError as e: err.append(str(e))
+            finally: stop.set(); th.join(5)
+            res['jeu partagé modifié pendant la purge']=(not err,err)
+            # garde AST de STRUCTURE (revue) : dans _run_diff, (1) inscription et décision `fresh` dans le même `with` ; (2) dans un
+            # `try` (dont le `finally` retire la paire), `if fresh:` AVANT la lecture de ps.stdout, qui appelle _stop_fresh_borg(ps,
+            # meis) puis `_sigkill_warn` SOUS un test de ps.returncode ; (3) la lecture saute la sortie quand `fresh`.
+            t=ast.parse(textwrap.dedent(inspect.getsource(BorgHelper._index_diffs)))
+            rd=[n for n in ast.walk(t) if isinstance(n,ast.FunctionDef) and n.name=='_run_diff']
+            names=lambda node: {x.id for x in ast.walk(node) if isinstance(x,ast.Name)}
+            why={}
+            for f in rd:
+                why['with']=any(isinstance(n,ast.With) and any(isinstance(x,ast.Subscript) and isinstance(x.value,ast.Name) and x.value.id=='running_procs'
+                                                             for st in n.body for x in ast.walk(st) if isinstance(st,ast.Assign) and x in st.targets)
+                                and any(isinstance(st,ast.Assign) and any(isinstance(tg,ast.Name) and tg.id=='fresh' for tg in st.targets) for st in n.body)
+                                for n in ast.walk(f))
+                for tr in (n for n in ast.walk(f) if isinstance(n,ast.Try) and n.finalbody):
+                    ifs=[st for st in tr.body if isinstance(st,ast.If) and isinstance(st.test,ast.Name) and st.test.id=='fresh']
+                    fors=[st for st in tr.body if isinstance(st,ast.For) and isinstance(st.iter,ast.IfExp) and 'fresh' in names(st.iter.test)]
+                    if not (ifs and fors and tr.body.index(ifs[0])<tr.body.index(fors[0])): continue
+                    calls=[x for st in ifs[0].body for x in ast.walk(st) if isinstance(x,ast.Call) and isinstance(x.func,ast.Name)]
+                    sf=[x for x in calls if x.func.id=='_stop_fresh_borg']
+                    why['stop']=bool(sf) and len(sf[0].args)>1 and isinstance(sf[0].args[1],ast.Name) and sf[0].args[1].id=='meis'
+                    why['warn sous returncode']=any(isinstance(st,ast.If) and any(isinstance(x,ast.Attribute) and x.attr=='returncode' for x in ast.walk(st.test))
+                                                    and any(isinstance(x,ast.Call) and isinstance(x.func,ast.Name) and x.func.id=='_sigkill_warn'
+                                                            for b_ in st.body for x in ast.walk(b_)) for st in ifs[0].body)
+                    why['warn seulement là']=sum(1 for x in calls if x.func.id=='_sigkill_warn')==sum(
+                        1 for st in ifs[0].body if isinstance(st,ast.If) for b_ in st.body for x in ast.walk(b_)
+                        if isinstance(x,ast.Call) and isinstance(x.func,ast.Name) and x.func.id=='_sigkill_warn')
+            # exclusivité (mutations B7/B8 : course non pilotable) — `fresh` exclut `mon_taken` ; le moniteur exclut `fresh_taken`
+            def notin(node,name): return any(isinstance(x,ast.Compare) and any(isinstance(o,ast.NotIn) for o in x.ops)
+                                             and any(isinstance(c,ast.Name) and c.id==name for c in x.comparators) for x in ast.walk(node))
+            why['fresh exclut le moniteur']=any(isinstance(st,ast.Assign) and any(isinstance(tg,ast.Name) and tg.id=='fresh' for tg in st.targets)
+                                                and notin(st.value,'mon_taken') for f in rd for st in ast.walk(f))
+            why['moniteur exclut fresh']=any(isinstance(n,ast.If) and notin(n.test,'fresh_taken')
+                                             and any(isinstance(x,ast.Attribute) and x.attr=='add' and isinstance(x.value,ast.Name) and x.value.id=='mon_taken'
+                                                     for b_ in n.body for x in ast.walk(b_)) for n in ast.walk(t))
+            ok_ast=all(why.get(k) for k in ('with','stop','warn sous returncode','warn seulement là','fresh exclut le moniteur','moniteur exclut fresh'))
+            res['garde AST _run_diff']=(ok_ast,why)
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("Index : borg lancé pendant l'arrêt — stdout vidé pendant l'attente (tube plein), sortie propre, sourd tué, _MEI retiré (A97)",_stop_fresh_full_pipe)
+        def _index_last_sigkill():
+            """1.0.181 (story 44, revue ; mutation B9) : dernier Index en échéance — les [WARN] « arrêté par SIGKILL » (un par borg)
+            ne remplacent jamais les autres lignes retenues pour le message (raison de l'arrêt, autres avertissements)."""
+            d,b=_nb_env('ilsk'); nk='zr'
+            b._index_outcome={nk:'deadline'}; m=_print_mark()
+            for l in (f"[WARN] {nk}: raison-s44",*(f"[WARN] {nk}: borg diff A{i} → A{i+1} arrêté par SIGKILL — verrou de dépôt possiblement resté"
+                                                  for i in range(4))): _q_run(printer,l)
+            _q_run(b._record_index_last,nk,'2026-01-01T00:00:00',m,0)
+            msg=(b.db.read_index_last(nk) or {}).get('message','')
+            ok='raison-s44' in msg and 'arrêté par SIGKILL' not in msg
+            if not ok: print(f"  message : {msg!r}")
+            return ok
+        check("dernier Index (échéance) : les [WARN] « arrêté par SIGKILL » ne masquent pas la raison (A97)",_index_last_sigkill)
         def _group_proc_unreadable():
             """1.0.180 (story 43, revue) : /proc illisible -> `_group_pids` None (jamais [] = « vide ») ; `_group_alive` sonde alors
             `killpg(pgid, 0)` : groupe vivant -> True, groupe inexistant -> False ; `_group_wait` ne rend True qu'au groupe vide.
@@ -16881,6 +17048,7 @@ fail()
         _rbc("tranche : borg diff tué à l'échéance sortant en code 1 sans sortie -> paire jamais marquée, refaite ensuite",_ix_killed_diff_rc1)
         _rbc("tranche : borg diff, boex arrêté et boex interrompu (Ctrl-C) dont l'ENFANT ignore SIGTERM, tient stdout et lance un petit-enfant -> arbre tué, rendu en temps borné (A91)",_ix_kill_tree)
         _rbc("tranche : borg dont la tête sort au SIGTERM (EOF) et dont l'ENFANT sans tubes reste -> boex arrêté et Index attendent puis tuent l'arbre (A94)",_ix_kill_nopipe)
+        _rbc("tranche : borg diff dont la tête ne sort pas au SIGTERM -> SIGKILL dit, une ligne par paire, jamais en double (A97)",_ix_sigkill_warn)
         check("_MEI* d'un borg tué : relevé par son mappage, gardé tant qu'utilisé, retiré ensuite, voisin intact (A91)",_mei_purge_mapped)
         _rbc("tranche : paires de diff vides d'une base ancienne revues une fois (exclus gardés ; -S, -T stats, période, tour tenu, verrou sans révision ; DB_NAME partagé)",_ix_zero_pairs_recheck)
         _rbc("tranche : borg diff non signalé en code 1 (avertissement) -> paire gardée avec ses entrées",_ix_rc1_warning_kept)
