@@ -28,10 +28,11 @@ set -o pipefail
 
 usage() {
     cat <<EOF
-Usage : git deploy <type-de-deploiement>
+Usage : git deploy [type-de-deploiement]
 
 Deploie le contenu COMMITE (HEAD, pas la copie de travail) des lots lies a
-<type-de-deploiement> vers leurs destinations ssh respectives.
+<type-de-deploiement> vers leurs destinations ssh respectives. Si omis,
+utilise [default] type= dans .deploy.conf.
 
 Cherche un fichier .deploy.conf en remontant depuis le repertoire courant
 jusqu'a la racine du depot (le premier trouve est utilise). Format a 3
@@ -50,6 +51,9 @@ etages (syntaxe git config) :
         lot1 = user@host2:/alpha/
         lot2 = user@host1:/un_autre_nom/
 
+    [default]
+        type = prod
+
 Un lot (sous-section de [src]) est un groupe nomme de sources (fichiers ou
 repertoires, chemins relatifs au repertoire contenant .deploy.conf). Un
 meme lot peut etre reutilise par plusieurs types de deploiement (une autre
@@ -58,6 +62,9 @@ destinations differentes, et un lot peut avoir plusieurs destinations (cle
 repetee). La destination (syntaxe scp classique [user@]host:chemin) est le
 repertoire distant ou atterrissent les membres du lot, chacun sous son
 propre nom (comme une copie groupee).
+
+[default] type= fixe le type utilise quand "git deploy" est appele sans
+argument.
 
 .deploy.conf n'est jamais commite (voir .gitignore racine) : chaque machine
 qui deploie doit avoir le sien.
@@ -69,12 +76,12 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     exit 0
 fi
 
-if [ $# -ne 1 ]; then
+if [ $# -gt 1 ]; then
     usage >&2
     exit 1
 fi
 
-type=$1
+type=${1:-}
 
 cd "${GIT_PREFIX:-.}" || exit 1
 
@@ -96,6 +103,14 @@ done
 if [ -z "$conf" ]; then
     echo "Aucun .deploy.conf trouve entre $(pwd) et la racine du depot ($root)." >&2
     exit 1
+fi
+
+if [ -z "$type" ]; then
+    type=$(git config -f "$conf" --get default.type 2>/dev/null)
+    if [ -z "$type" ]; then
+        echo "Aucun type precise et pas de [default] type= dans $conf" >&2
+        exit 1
+    fi
 fi
 
 if [ "$dir" = "$root" ]; then

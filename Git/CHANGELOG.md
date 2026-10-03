@@ -18,6 +18,10 @@
 
 ## git-deploy
 
+### 1.3.0 — 2026-10-03
+- `git deploy` sans argument utilise desormais `[default] type=` dans `.deploy.conf` (section reservee). Erreur claire si aucun type n'est precise ni par defaut.
+- `.deploy.conf.example` et README mis a jour.
+
 ### 1.2.0 — 2026-10-02
 - Nouvelle refonte du format `.deploy.conf` : introduction des **lots** (`[src "nom"]`, groupe nomme et reutilisable de sources). Un type de deploiement (ex `[prod]`) reference des lots par leur nom (`<lot> = dest`, cle repetable pour plusieurs destinations), au lieu de lister directement des sources individuelles par type. Le meme lot peut etre reutilise par plusieurs types avec des destinations differentes a chaque fois. Remplace le format 1.1.0 (une sous-section `dest` par source individuelle, sans reutilisation possible).
 - Transfert redevenu groupe par destination (comme en 1.0.0, mais par lot plutot que par profil entier) : `git archive` sur tous les membres du lot en une fois, `strip-components` calcule une seule fois (prefixe du sous-projet), chaque membre atterrit sous son propre nom a la racine de la destination.

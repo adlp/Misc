@@ -11,7 +11,7 @@ Scripts utilitaires pour manipuler des depots git.
 | `gitar` | 1.0.0 | Pousse une archive tar dans un depot git |
 | `gitoune` | 1.0.0 | Pousse un fichier dans un depot git |
 | `gitconfig` | 1.14.1 | Configuration git personnelle (`~/.gitconfig`) : alias, pager, diff tool, identite pro/perso par repo, mirroring inline (`git mirror`), depot d'archive tar depuis fichier ou stdin (`git tar`), telechargement fichier/repertoire a HEAD ou a un commit precis (`git figet [-G <commit>]`), depot d'un fichier unique depuis fichier ou stdin (`git fiput`), historique d'un fichier distant (`git filog`), diff fichier local vs depot (`git fidiff [-G <commit>]`), liste des alias avec doc (`git alias`), deploiement HEAD vers des urls ssh (`git deploy`) |
-| `git-deploy` | 1.2.0 | Script appele par l'alias `git deploy` : deploie le contenu commite (HEAD) de lots nommes (`[src "lot"]`) vers leurs destinations ssh/scp par type de deploiement, selon un `.deploy.conf` (non tracke) pose a cote du sous-projet |
+| `git-deploy` | 1.3.0 | Script appele par l'alias `git deploy` : deploie le contenu commite (HEAD) de lots nommes (`[src "lot"]`) vers leurs destinations ssh/scp par type de deploiement (optionnel, defaut via `[default]`), selon un `.deploy.conf` (non tracke) pose a cote du sous-projet |
 
 Voir `CHANGELOG.md` pour l'historique des versions.
 
@@ -51,7 +51,7 @@ Voir `CHANGELOG.md` pour l'historique des versions.
 
 ## `git deploy` — deploiement vers des serveurs ssh
 
-`git deploy <type-de-deploiement>` deploie le contenu **commite** (HEAD, pas la copie de travail meme si elle differe) de "lots" (groupes nommes de fichiers/repertoires) vers des destinations ssh/scp.
+`git deploy [type-de-deploiement]` deploie le contenu **commite** (HEAD, pas la copie de travail meme si elle differe) de "lots" (groupes nommes de fichiers/repertoires) vers des destinations ssh/scp. Le type est optionnel : omis, `git deploy` utilise `[default] type=` de `.deploy.conf`.
 
 Implemente en script standalone (`git-deploy`, appele par l'alias fin `deploy = !git-deploy`) plutot qu'en alias inline : la logique (recherche du fichier de config en remontant l'arbo, resolution des lots, boucle sur plusieurs destinations avec erreur geree une par une) est trop consequente pour un alias `!` lisible.
 
@@ -71,8 +71,11 @@ Fonctionnement :
   [preprod]
       outils = user@host1:/opt/git-tools/
       outils = user@host2:/opt/git-tools/
+
+  [default]
+      type = preprod
   ```
-  `dest` suit la syntaxe scp classique `[user@]host:chemin` : repertoire distant ou atterrissent les membres du lot, chacun sous son propre nom (copie groupee). Un meme lot est reutilisable par plusieurs types, chacun pouvant l'envoyer vers des destinations differentes ; un lot peut aussi avoir plusieurs destinations au sein d'un meme type (cle repetee).
+  `dest` suit la syntaxe scp classique `[user@]host:chemin` : repertoire distant ou atterrissent les membres du lot, chacun sous son propre nom (copie groupee). Un meme lot est reutilisable par plusieurs types, chacun pouvant l'envoyer vers des destinations differentes ; un lot peut aussi avoir plusieurs destinations au sein d'un meme type (cle repetee). `[default] type=` fixe le type utilise quand `git deploy` est appele sans argument — nom de section reserve (ne pas l'utiliser comme nom de type de deploiement).
 - Transfert via `git archive HEAD -- <membres-du-lot> | ssh <host> 'tar x -C <chemin> --strip-components=N'` — une connexion par destination.
 - Une destination en echec (host injoignable, syntaxe invalide, lot non defini) n'empeche pas les autres d'etre tentees ; code de sortie non nul si au moins une a echoue (y compris si une source du lot n'existe pas dans HEAD, detecte grace a `pipefail`).
 

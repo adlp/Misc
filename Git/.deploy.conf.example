@@ -15,6 +15,9 @@
 #
 # Un meme lot peut etre reutilise par plusieurs types, avec des destinations
 # differentes a chaque fois.
+#
+# [default] type= fixe le type utilise par "git deploy" sans argument. Nom
+# de section reserve (ne pas l'utiliser comme nom de type de deploiement).
 
 [src "outils"]
     src = gitconfig
@@ -26,3 +29,6 @@
 [preprod]
     outils = adlp@preprod1.adlp.org:/opt/git-tools/
     outils = adlp@preprod2.adlp.org:/opt/git-tools/
+
+[default]
+    type = preprod
