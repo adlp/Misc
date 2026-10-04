@@ -99,8 +99,8 @@
     addco= "!f() { cd \"${GIT_PREFIX:-.}\" || exit 1; test $# -eq 0 && set -- .; git diff -- \"$@\"; echo -n \"Make an comment for $* (or do CTR-C to stop): \"; read comm; git add -- \"$@\"; git commit -m \"$comm\"; }; f"
     addcom= "!f() { cd \"${GIT_PREFIX:-.}\" || exit 1; test $# -eq 0 && set -- .; git diff -- \"$@\"; git status -sb -- \"$@\" | grep -E '^ [DM]'; echo 'Make a comment or do CTR-C to stop'; read comm; git add -u -- \"$@\"; git commit -m \"$comm\"; }; f"
 #    logs = log --pretty="format:%H;%ci;%cn;%s" --name-status
-    logs = log --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%ci,%cr) %C(bold blue)<%an>%Creset' --abbrev-commit --date=relative --name-only
-	lg = log --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset' --abbrev-commit --date=relative
+    logs = log --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%ci,%cr) %C(bold blue)<%an>%Creset' --abbrev-commit --date=relative --name-only -- .
+	lg = log --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset' --abbrev-commit --date=relative -- .
     g = pull
     p = "!test $(git st | wc -l ) -gt 1 && ( echo Merci de commiter;git st); git push"
     root = rev-parse --show-toplevel

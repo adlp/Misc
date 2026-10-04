@@ -10,6 +10,10 @@
 
 ## gitconfig
 
+### 1.15.1 — 2026-10-04
+- `logs` et `lg` scopes desormais au repertoire courant (`-- .` ajoute en fin d'alias) : depuis un sous-repertoire, n'affichent que les commits touchant ce sous-repertoire (comme `git log` natif le ferait avec un pathspec `.`). Alias simples (non `!`), git traduit `.` relatif au repertoire d'invocation automatiquement.
+- Effet de bord : un argument supplementaire passe a `git logs`/`git lg` (ex un nom de branche) devient un second pathspec plutot qu'une revision — comportement different de l'usage `git logs main` d'avant.
+
 ### 1.15.0 — 2026-10-04
 - Ajout de l'alias fin `syncdir = !git2git_sync`, qui appelle le nouveau script `git2git_sync` (voir ci-dessous). `git alias` documente la nouvelle entree. `git2git_sync` doit etre dans le `PATH` (meme principe que `git-deploy`).
 
