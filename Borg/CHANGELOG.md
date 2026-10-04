@@ -1,5 +1,44 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.182 — Python 3.10 à 3.14 sans plantage ni avertissement — 2026-10-04
+
+Chantier « reconstruction progressive », story 48 (demande de l'utilisateur : avertissement sqlite3 sur un hôte, puis exigence
+« tourner de Python 3.10 à 3.14 sans plantage »). Mesuré par un CodecSelfTest complet sous chaque version — 3.10.12 système
+(SQLite 3.37.2, sentry-sdk 1.4.3), 3.11.15, 3.12.13, 3.13.13, 3.14.5 (SQLite 3.50.4, sentry-sdk 2.71.0) — avec les dépréciations
+attribuées au code de borgHelper levées en erreur dans les CLI que lancent les contrôles, et affichées par le processus du selftest.
+
+- **sqlite3** : `_known_archives` (rapprochement AD-9) passait `?1` avec une séquence — `DeprecationWarning` sous des Python 3.12
+  (« Binding 1 ('?1') is a named parameter… »). Marqueurs `?` anonymes et `(nick, nick)` : même requête, même résultat.
+- **Sentry facultatif, jamais de plantage** : DSN vide ou absent -> `sentry_sdk` n'est plus importé. Sentry inutilisable -> un
+  seul `[WARN] Sentry désactivé : <cause> — erreurs et alertes non envoyées` par processus, la commande continue normalement :
+  `module sentry_sdk absent (DSN configuré)` (avant : plantage au démarrage de toute commande) ; `initialisation impossible
+  (BadDsn)` pour un DSN invalide (avant : plantage, mesuré sous sentry-sdk 1.4.3 et 2.71) ; `import de sentry_sdk impossible
+  (dépendance urllib3 absente)` ou `(<type>)` pour une installation cassée ; `fichier DSN illisible (UnicodeDecodeError)` pour un
+  fichier DSN non UTF-8 (avant : plantage). Une alerte `SENTRY_ALERTS` dans ces cas : plus aucun avertissement par alerte, et
+  jamais « envoyée ». Lancée par borgHelperWWW, la CLI se tait (décision de l'utilisateur) : rien dans le stderr que l'API
+  relaie ; le serveur le dit une fois dans son journal, à sa première alerte. La CLI reconnaît WWW à `BORGHELPERC_NO_CLEANUP_NOTICE=1`
+  (posée par le serveur sur chacun de ses appels) ou `BORGHELPER_VIA=http` — posée à la main, cette variable coupe donc aussi ce
+  `[WARN]`. sentry-sdk 2.x pris par son API (`get_client`, `new_scope`) : plus d'avertissement `Hub`/`push_scope` ; 1.x
+  inchangé (vérifié avec 1.4.3 sous 3.10 seulement).
+- **Avertissements Python** : `datetime.utcnow()` (déprécié 3.12) et `PurePath.as_uri()` (3.14) remplacés.
+- **Connexions SQLite fermées** : depuis Python 3.11, une connexion non fermée reste ouverte jusqu'au ramasse-miettes. Une base
+  recréée pendant qu'un autre processus la tenait laissait ainsi la relance échouer (« disk I/O error ») dans le même processus :
+  toute sortie en erreur d'`ensure_diff_db`/`ensure_cache_db` ferme sa connexion (schéma trop récent, clé, Ctrl-C compris). Un
+  nick en erreur dans un Bkp, un Index, un Report (en ligne ou hors ligne) ou un lecteur multi-nicks libère ses connexions
+  orphelines avant le nick suivant (et en fin de boucle) — hors du bloc `except`, où la trace les retient encore, et après avoir
+  effacé les variables des cadres de l'exception, que Sentry garde (DedupeIntegration) une fois envoyée (mesuré).
+- Contrôles : garde AST (SQL en `?` ; ni `utcnow()`, ni `utcfromtimestamp()`, ni `PurePath.as_uri()` ; `ensure_*` qui ferment ;
+  libérations placées hors des `except` et réellement atteignables) ; `sentry_sdk` absent (CLI réelle) ; Sentry inutilisable
+  (alerte sans module, DSN invalide, import cassé, dépendance absente, fichier DSN illisible, silence sous WWW, marqueur posé par
+  la source de borgHelperWWW) ; `_utcnow_naive` contre un oracle indépendant, fuseau forcé à UTC+5 ; connexion orpheline libérée,
+  par comportement, pour `_PerNick` et pour l'Index et le Bkp multi-nicks avec un Sentry qui garde l'exception ; `sentry_alert`
+  par un transport factice en classe (le transport en fonction est déprécié en sentry-sdk 2.x), sauté (SKIP) si le module manque ;
+  contrôle `_vacuum_wal` corrigé pour 3.11+ (il laissait sa propre connexion ouverte).
+- Limites : Python 3.8/3.9 non vérifiés, ni les 3.12 antérieures à 3.12.13 (seules à avertir sur `?1` : garde AST seulement) ;
+  `ResourceWarning` (connexion fermée implicitement, émis depuis 3.13, masqué par défaut), dépréciations attribuées aux
+  bibliothèques, code de borgHelper importé sous un autre nom (borgHelperWWW, bibliothèque) et dépréciation levée dans un enfant
+  puis avalée par un `except` large : non couverts — audit des 55 ouvertures sans fermeture garantie reporté.
+
 ## borgHelper 1.0.181 — borg diff lancé pendant l'arrêt de l'Index : sortie lue pendant l'attente — 2026-10-03
 
 Chantier « reconstruction progressive », story 44 (actions de rétrospective A96, A97 ; regroupement demandé par l'utilisateur).

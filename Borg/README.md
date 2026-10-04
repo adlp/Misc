@@ -10,9 +10,11 @@ Utilisable comme CLI ou comme **librairie Python** — voir [LIBRARY.md](LIBRARY
 
 ## Prérequis
 
-- Python 3.8+
+- Python 3 — vérifié de **3.10 à 3.14** (1.0.182 : CodecSelfTest complet sous chaque version) ; versions antérieures non vérifiées
 - `borg` 1.2 ou plus dans le PATH (`borg compact`, `extract --numeric-ids`)
 - `prettytable` (`pip install prettytable`) — requis pour `Report` et les commandes d'index
+- `sentry-sdk` — facultatif : seulement si un DSN Sentry est configuré (voir « Sentry ») ; vérifié avec 2.71 (Python 3.11 à 3.14)
+  et 1.4.3 (Python 3.10)
 
 ---
 
@@ -318,7 +320,13 @@ borgmatic2borghelper --selftest                                 # auto-test (dos
 ### Sentry
 
 DSN lu dans `BORGHELPERC_SENTRY_DSN`, sinon dans le fichier désigné par `BORGHELPERC_SENTRY_FILE`, sinon dans
-`/usr/local/etc/borghelper-sentry` (première ligne) ; absent = Sentry désactivé. Depuis 1.0.132, Sentry ne reçoit que :
+`/usr/local/etc/borghelper-sentry` (première ligne) ; absent ou vide = Sentry désactivé (le module n'est même pas importé,
+1.0.182). DSN configuré mais module `sentry_sdk` absent de l'interpréteur : jamais de plantage — `[WARN] Sentry désactivé :
+module sentry_sdk absent (DSN configuré) — erreurs et alertes non envoyées` une fois sur stderr, la commande continue
+normalement (1.0.182) ; de même pour un DSN invalide (`… initialisation impossible (BadDsn) …`), une installation cassée
+(`… import de sentry_sdk impossible (dépendance urllib3 absente) …`) ou un fichier DSN non UTF-8 (`… fichier DSN illisible …`).
+Lancée par borgHelperWWW (reconnue à `BORGHELPERC_NO_CLEANUP_NOTICE=1` ou `BORGHELPER_VIA=http`), la CLI se tait : le serveur le
+dit une fois dans son propre journal, à sa première alerte. Depuis 1.0.132, Sentry ne reçoit que :
 
 - les **erreurs logicielles** (exception non prévue, bug) — plus aucune trace de performance (auparavant une par
   invocation, donc une par clic de l'interface web) ; les erreurs de données ou de configuration (passphrase fausse,
@@ -1393,7 +1401,8 @@ signalent ces restes ; une entrée réduite à une clé gardée (et à ce qui po
 mais reste dans l'aperçu.
 
 Variables d'environnement : `BORGHELPERC_CLEANUP_HOME` (autre dossier personnel à scruter ; les selftests y mettent
-un dossier vide), `BORGHELPERC_NO_CLEANUP_NOTICE` (pas de notice ; posée par borgHelperWWW pour ses appels).
+un dossier vide), `BORGHELPERC_NO_CLEANUP_NOTICE` (pas de notice ; posée par borgHelperWWW pour ses appels — `=1` coupe
+aussi le `[WARN] Sentry désactivé`, voir « Sentry », 1.0.182).
 
 Limite : un autre rc dont le nom commence par celui-ci et qui partage `CACHE_DIR` verrait ses fichiers proposés — lire
 l'aperçu avant `-y`.

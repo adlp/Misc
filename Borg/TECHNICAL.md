@@ -2361,6 +2361,43 @@ bornes : réponse en général 10 s après le délai, 30 s au plus (tubes encore
 504 en 6,07 s, enfant vivant 12 s après (SIGKILL sauté) ; 1.31.2 : 504 en 16,1 s, groupe vide ; arrêt du serveur : enfant tué
 10,1 s après le 1er signal.
 
+**Compatibilité Python 3.10 à 3.14 (1.0.182, story 48)** : vérifiée par un CodecSelfTest complet sous chaque version (3.10.12
+système avec SQLite 3.37.2 et sentry-sdk 1.4.3 ; 3.11.15, 3.12.13, 3.13.13, 3.14.5 d'uv avec SQLite 3.50.4, prettytable 3.18.0 et
+sentry-sdk 2.71.0 en venv ; `tools/make_pyvenvs.sh`, venv-3.10 = système en `--system-site-packages`), par `cst.sh start ALL
+--python X.Y --strict-warnings` : `PYTHONWARNINGS=error::DeprecationWarning` pour `__main__`, `bh`, `bhk` hérité par les CLI que
+lancent les contrôles (une dépréciation attribuée au code de borgHelper y devient une exception, en général un FAIL), processus du
+selftest en `-W default::DeprecationWarning:__main__` (il les affiche : code 13). Non couverts : 3.8/3.9, 3.12 < 3.12.13,
+`ResourceWarning` (connexion fermée implicitement, 3.13+, masqué par défaut), dépréciations attribuées aux bibliothèques, code de
+borgHelper importé sous un autre nom (borgHelperWWW, bibliothèque), exception de dépréciation avalée par un `except` large d'un
+enfant. Règles qui en découlent :
+SQL en marqueurs `?` anonymes seulement — `?NNN` avertit sous des 3.12 (DeprecationWarning, cas de `_known_archives`), et
+`:nom`/`@nom`/`$nom` passés avec une séquence lèvent `ProgrammingError` en 3.14 ; jamais `datetime.utcnow()` (avertit depuis 3.12 :
+`_utcnow_naive()`), ni `utcfromtimestamp()`, ni `PurePath.as_uri()` (3.14) ; **toute connexion sqlite3 est fermée explicitement** — depuis 3.11, une
+connexion que plus rien ne référence n'est fermée qu'au passage du ramasse-miettes (mesuré : `-wal`/`-shm` et verrous gardés),
+d'où `_close_quiet(conn)` avant chaque sortie `_db_schema_fail` des `ensure_*` et dans un `except BaseException` qui relance (sinon
+la relance dans le même processus échouait en « disk I/O error ») et `_release_orphan_connections()` (`gc.collect()`) quand un nick
+en erreur est rattrapé (Bkp, Index, Report, Report hors ligne — seulement après une erreur, et en fin de boucle —, lecteurs
+multi-nicks par `_PerNick`). `_clear_exc_frames(e)` efface les variables des cadres terminés de l'exception et de sa chaîne
+`__cause__`/`__context__` : appelée par `_PerNick.__exit__`, par l'`except` de l'Index et par `_sentry_capture` après l'envoi —
+la DedupeIntegration de Sentry garde la dernière exception (référence forte en 1.x, et en 2.x pour les types natifs), qui
+retiendrait sinon ses connexions. Placement mesuré : un
+`gc.collect()` DANS le bloc `except` ne libère pas une connexion tenue par un cadre de la trace — la libération se fait au nick
+suivant (ou à `_PerNick.done()`, ou après la boucle de l'Index) ; `_PerNick.__exit__` efface les cadres (`traceback.clear_frames`)
+car la première exception, gardée dans `self.stop`, les retiendrait jusqu'à `done()`. Audit des 55 ouvertures sans fermeture
+garantie reporté (deferred-work). Sentry facultatif, jamais de plantage : DSN vide -> aucun import ; module absent ou `init` refusé
+(BadDsn), import qui lève autre chose (installation cassée), dépendance absente (`ImportError.name` ≠ `sentry_sdk` : nommée) ou
+fichier DSN illisible (`_sentry_dsn` : `OSError`/`ValueError`) -> `_sentry_warn_once` : `[WARN]` une fois par processus
+(`_SENTRY_MISSING_WARNED`), muet quand `_via_www()` — `BORGHELPERC_NO_CLEANUP_NOTICE=1`, posé par borgHelperWWW sur TOUT enfant
+(`_build_borghelper_argv_env`, couplage gardé par `_sentry_unusable` qui lit la source de WWW), ou `BORGHELPER_VIA=http` (posé sur
+le seul Index détaché : insuffisant seul, le stderr des appels synchrones est relayé par l'API). Le processus serveur, qui
+importe borgHelper et appelle `sentry_alert` sans ces variables, le dit une fois dans son journal ; le
+message ne cite que le type de l'exception (le texte peut contenir le DSN). sentry-sdk 2.x par `get_client`/`new_scope`
+(`_sentry_client`, `_sentry_scope`), 1.x par `Hub`/`push_scope`. Garde AST `_py_compat_guard` (marqueurs SQL dans borgHelper et
+borgHelperWWW, `.utcnow`/`.utcfromtimestamp`, `PurePath(…).as_uri()`, fermeture dans les `ensure_*`, placement des libérations) ;
+contrôles `_sentry_absent` (CLI réelle sans le module, DSN configuré puis vide), `_sentry_unusable`, `_utcnow_oracle` (fuseau
+forcé à UTC+5), `_pernick_orphans`, `_multi_orphans` (Index et Bkp multi-nicks, faux Sentry qui garde l'exception). `sentry_alert`
+renvoie False quand le module n'a pas pu être importé, même si le repli initialise Sentry (rien n'est parti).
+
 **Borg lancé pendant l'arrêt : sortie vidée, SIGKILL dit (1.0.181, story 44)** : `_stop_fresh_borg(ps, meis, grace=5)` — arrêt d'un borg
 lancé pendant l'arrêt de l'Index (`_run_diff`, dans le `try` dont le `finally` retire la paire de `running_procs` ; sortie jamais
 relue ensuite) —

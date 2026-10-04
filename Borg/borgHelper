@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.181"
+Version="1.0.182"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -316,7 +316,7 @@ def _audit_witness(tag):
 
 def _audit_uri(p):
     import pathlib
-    return pathlib.PurePosixPath(p).as_uri()
+    return pathlib.Path(p).as_uri()   # 1.0.182 (story 48) : PurePath.as_uri() avertit en 3.14
 
 def _audit_start(log,roots):
     """Active le crochet vers le journal `log` pour les racines `roots` (posé au premier appel seulement)."""
@@ -747,7 +747,7 @@ def _bkp_running_readable(started_at):
     calculé en UTC des deux côtés (pas d'offset possible dessus)."""
     from datetime import datetime
     started_utc=datetime.strptime(started_at,"%Y-%m-%d %H:%M:%S")
-    now_utc=datetime.utcnow()
+    now_utc=_utcnow_naive()   # 1.0.182 (story 48) : datetime.utcnow() avertit depuis Python 3.12
     started_local=started_utc+(datetime.now()-now_utc)
     total_min=int((now_utc-started_utc).total_seconds()//60)
     h,m=divmod(max(total_min,0),60)
@@ -1869,6 +1869,31 @@ def _held_before(db_path):
         return os.path.exists(p+'-shm') and (not os.path.exists(p) or os.path.getsize(p)==0 or not _db_has_schema(p))
     except OSError: return False
 
+def _utcnow_naive():
+    """1.0.182 (story 48) : heure UTC naïve (même valeur que datetime.utcnow(), dépréciée depuis Python 3.12 et affichée en
+    DeprecationWarning) — compatible 3.10 à 3.14."""
+    from datetime import datetime,timezone
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+def _clear_exc_frames(e):
+    """1.0.182 (story 48, revue 2) : variables locales des cadres terminés d'une exception effacées, chaîne __cause__/__context__
+    comprise — une exception gardée après son traitement (premier arrêt de _PerNick, DedupeIntegration de Sentry : référence forte
+    en 1.x, et en 2.x pour les types natifs) retiendrait sinon ses connexions sqlite3, que gc.collect() ne peut pas libérer. Les
+    cadres encore en cours d'exécution sont laissés (traceback.clear_frames)."""
+    import traceback
+    seen=set(); todo=[e]
+    while todo:
+        x=todo.pop()
+        if x is None or id(x) in seen: continue
+        seen.add(id(x)); traceback.clear_frames(x.__traceback__); todo+= [x.__cause__,x.__context__]
+
+def _release_orphan_connections():
+    """1.0.182 (story 48, décision de l'utilisateur) : filet de sécurité des commandes multi-nicks — un nick en erreur rattrapé peut
+    laisser des connexions sqlite3 orphelines (Python 3.11+ : fermées seulement par le ramasse-miettes) ; gc.collect() avant le
+    nick suivant. Audit des ouvertures sans fermeture garantie : reporté (deferred-work, story 48)."""
+    import gc
+    gc.collect()
+
 def _db_schema_fail(db_path,e,what,regenerable=True,held=False):
     """Diagnostic + sys.exit(1) des ensure_*_db. Un verrou n'est JAMAIS présenté comme une corruption :
     conseiller de supprimer diff.db sur un simple « database is locked » ferait perdre l'historique.
@@ -2345,10 +2370,11 @@ class _PerNick:
     échec -> la PREMIÈRE erreur relancée, comme un nick seul."""
     def __init__(self,nick,on_stop=None):
         self.nicks=nick.split(','); self.multi=len(self.nicks)>1; self.on_stop=on_stop
-        self.ko=0; self.stop=None; self.n=None; self.conn=None; self.mark=None
+        self.ko=0; self.stop=None; self.n=None; self.conn=None; self.mark=None; self._orph=False
     def __call__(self,n,conn=None):
         self.n=n; self.conn=conn; return self
     def __enter__(self):
+        if self._orph: self._orph=False; _release_orphan_connections()   # revue story 48 : hors de l'except du nick arrêté
         self.mark=_print_mark(); return self
     def __exit__(self,et,e,tb):
         if et is None or not issubclass(et,_NICK_STOP): return False
@@ -2359,9 +2385,14 @@ class _PerNick:
             try: self.conn().close()   # connexion du nick arrêté (ou déjà fermée / inexistante)
             except Exception: pass
         self.ko+=1; self.stop=e if self.stop is None else self.stop
+        # 1.0.182 (story 48, revue) : variables locales des cadres du nick arrêté effacées (la trace gardée dans self.stop les
+        # retiendrait jusqu'à done()) ; connexions orphelines libérées au nick suivant, une fois l'exception sortie (mesuré :
+        # un gc.collect() pendant l'except ne libère pas une connexion tenue par un cadre de la trace)
+        _clear_exc_frames(e); self._orph=True   # revue 2 : chaîne __cause__/__context__ comprise
         _READER_FAILED[0]+=1   # 1.0.178 (A87, décision de l'utilisateur) : un nick arrêté parmi plusieurs -> code 1 d'un lecteur
         return True
     def done(self):
+        if self._orph: self._orph=False; _release_orphan_connections()
         if self.stop is not None and self.ko==len(self.nicks): raise self.stop
 
 def _per_nick_main(nick,fn):
@@ -2990,7 +3021,10 @@ class BorgHelperDB:
         except sqlite3.DatabaseError as e:
             if not create and conn is not None and _db_busy(e):
                 self._reader_busy_skip(conn,db_path,CACHE_DB_SCHEMA_VERSION); self._reader_skipped[db_path]=time.monotonic(); return
+            _close_quiet(conn)   # 1.0.182 (story 48) : sous 3.11+, une connexion non fermée reste ouverte (verrous, -shm)
             _db_schema_fail(db_path,e,'le cache',held=held)
+        except BaseException:   # revue story 48 : SchemaVersionError, Db*Error, SystemExit, Ctrl-C — jamais la connexion laissée ouverte
+            _close_quiet(conn); raise
 
     @staticmethod
     def _executescript_atomic(conn,script):
@@ -3236,7 +3270,10 @@ class BorgHelperDB:
         except sqlite3.DatabaseError as e:
             if not create and conn is not None and _db_busy(e):
                 self._reader_busy_skip(conn,db_path,DIFF_DB_SCHEMA_VERSION); self._reader_skipped[db_path]=time.monotonic(); return
+            _close_quiet(conn)   # 1.0.182 (story 48) : sous 3.11+, une connexion non fermée reste ouverte (verrous, -shm)
             _db_schema_fail(db_path,e,"l'index",held=held)
+        except BaseException:   # revue story 48 : SchemaVersionError, Db*Error, SystemExit, Ctrl-C — jamais la connexion laissée ouverte
+            _close_quiet(conn); raise
 
     def ensure_history_db(self,path,create=True):
         """Schéma de history.db (1.0.139, AD-7). create=False : ne rien créer si le fichier est absent (lecteurs,
@@ -5122,9 +5159,9 @@ class BorgHelper:
             for o,n in conn.execute(sql,(nick,)): known|={o,n}
         for tbl,col in (('diff_index','archive_new'),('archive_snapshot','archive')):
             known|={r[0] for r in conn.execute(
-                f"WITH RECURSIVE s(a) AS (SELECT (SELECT MIN({col}) FROM {tbl} WHERE nick=?1) UNION ALL "
-                f"SELECT (SELECT MIN({col}) FROM {tbl} WHERE nick=?1 AND {col}>s.a) FROM s WHERE s.a IS NOT NULL) "
-                "SELECT a FROM s WHERE a IS NOT NULL",(nick,))}
+                f"WITH RECURSIVE s(a) AS (SELECT (SELECT MIN({col}) FROM {tbl} WHERE nick=?) UNION ALL "
+                f"SELECT (SELECT MIN({col}) FROM {tbl} WHERE nick=? AND {col}>s.a) FROM s WHERE s.a IS NOT NULL) "
+                "SELECT a FROM s WHERE a IS NOT NULL",(nick,nick))}   # 1.0.182 (story 48) : `?` anonymes, jamais ?1 (avertissement 3.12)
         known.discard(None)
         return known
 
@@ -8907,13 +8944,15 @@ class BorgHelper:
     def report_offline(self,nicks,htrep=False,debug=0,maxp=None,as_json=False):
         reshos={}; resbck={}; reshosto={}; errcode=0; errhost=[]
         for i in ['duree','derniere','taille','recuperable']: reshosto[i]=0
-        reshosto['nom']='Totaux'
+        reshosto['nom']='Totaux'; _orph=False
         for nick in nicks.split(','):
+            if _orph: _orph=False; _release_orphan_connections()   # 1.0.182 (story 48) : nick précédent en erreur -> connexions orphelines libérées
             cfg=self.borg.cfgreaded(nick,debug=debug)
             mk=_print_mark()
             try:
                 (tcmpl,tbkps)=self.prep_report_from_db(nick,maxp=maxp)
             except (Exception,SystemExit) as e:
+                _orph=True   # 1.0.182 (story 48) : libérées au nick suivant ou après la boucle, hors de l'except
                 # 1.0.166 (story 29) : base illisible (« DB corrompue » + sys.exit des ensure_*) : ligne du nick en erreur,
                 # les autres hôtes affichés ; Ctrl-C (code 130) : arrêt. 1.0.168 (A51) : message réel (_stop_text), complet
                 if isinstance(e,SystemExit) and e.code==130: raise
@@ -8957,6 +8996,7 @@ class BorgHelper:
                 if 'duration' in tbkps[i].keys():
                     tbkps[i]['duration']=f"{tbkps[i]['duration']:.2f} min"
             reshos[nick]=tcmpl[nick]; resbck[nick]=tbkps
+        if _orph: _release_orphan_connections()
         for i in ['derniere','taille','recuperable']: reshosto[i]=convert_octets_readable(reshosto[i])
         reshosto['duree']=f"{reshosto['duree']:.2f} min"
         reshos['Totaux']=reshosto
@@ -8990,8 +9030,9 @@ class BorgHelper:
     def report(self,nicks,htrep=False,dayback=None,debug=0,maxp=None,as_json=False):
         reshos={}; resbck={}; reshosto={}; errcode=0; errhost=[]
         for i in ['duree','derniere','taille','recuperable']: reshosto[i]=0
-        reshosto['nom']='Totaux'
+        reshosto['nom']='Totaux'; _orph=False
         for nick in nicks.split(','):
+            if _orph: _orph=False; _release_orphan_connections()   # 1.0.182 (story 48) : nick précédent en erreur -> connexions orphelines libérées
             cfg=self.borg.cfgreaded(nick,debug=debug)
             if self.db.check_priority_lock(nick):
                 printer(f"  {nick}: Bkp/Restore en cours — borg info sera mis en attente du verrou")
@@ -9001,6 +9042,7 @@ class BorgHelper:
             try:
                 (tcmpl,tbkps)=self.prep_report(nick,debug=debug,maxp=maxp)
             except (Exception,SystemExit) as e:
+                _orph=True   # 1.0.182 (story 48) : libérées au nick suivant ou après la boucle, hors de l'except
                 self.db.clear_report_running_lock(nick)
                 if isinstance(e,SystemExit) and e.code==130: raise   # Ctrl-C pendant borg (boex -> sys.exit(130)) : arrêt
                 if isinstance(e,SystemExit):   # 1.0.166 (story 29) : jumelle de report_offline (bases, config)
@@ -9054,6 +9096,7 @@ class BorgHelper:
                 if 'duration' in tbkps[i].keys():
                     tbkps[i]['duration']=f"{tbkps[i]['duration']:.2f} min"
             reshos[nick]=tcmpl[nick]; resbck[nick]=tbkps
+        if _orph: _release_orphan_connections()
         for i in ['derniere','taille','recuperable']: reshosto[i]=convert_octets_readable(reshosto[i])
         reshosto['duree']=f"{reshosto['duree']:.2f} min"
         reshos['Totaux']=reshosto
@@ -9106,6 +9149,14 @@ def codec_selftest(pattern=None,list_only=False):
         try: ok=bool(fn()); err=''
         except (Exception,SystemExit) as e: ok=False; err=f" ({type(e).__name__}: {e})"   # 1.0.166 : un sys.exit = FAIL, jamais la fin du run
         print(f"{'OK  ' if ok else 'FAIL'} {name}{err}"); results.append(ok)
+    def _q(path,sql,one=False,**kw):
+        """1.0.182 (story 48) : requête de test sur une connexion fermée aussitôt — une connexion jamais nommée
+        (sqlite3.connect(p).execute(…)) reste ouverte sous Python 3.11+ jusqu'au ramasse-miettes (verrous, -shm)."""
+        c=sqlite3.connect(path,**kw)
+        try:
+            cur=c.execute(sql)
+            return cur.fetchone() if one else cur.fetchall()
+        finally: c.close()
     def skip(name,why):
         if _selected(name): skipped[0]+=1; print(f"SKIP {name} ({why})")
     def _pre(fn):
@@ -9617,7 +9668,7 @@ def codec_selftest(pattern=None,list_only=False):
             (archive_stats sert à Report tant que l'archive existe) ; départage stable à date égale."""
             from datetime import datetime,timedelta
             iso=lambda d: d.strftime('%Y-%m-%dT%H:%M:%S')
-            p=bh_rh.db.get_diff_db('rhOld'); now=datetime.utcnow()
+            p=bh_rh.db.get_diff_db('rhOld'); now=_utcnow_naive()
             bh_rh.db.store_archive_stats('rhOld','O-old',iso(now-timedelta(days=730)),1,1,1,1,1,db_path=p)
             for a in ('O-b','O-a'):  # même date, insérées dans le désordre
                 bh_rh.db.store_archive_stats('rhOld',a,iso(now-timedelta(days=1)),1,1,1,1,1,db_path=p)
@@ -10933,11 +10984,11 @@ def codec_selftest(pattern=None,list_only=False):
                 "INSERT INTO archive_measure VALUES('hv','a1','d1',10,0,0);")
             c.close()
             before=bhq.db.get_archive_measures('hv',dp)
-            cols0=[r[1] for r in sqlite3.connect(dp).execute("PRAGMA table_info(archive_measure)")]
+            cols0=[r[1] for r in _q(dp,"PRAGMA table_info(archive_measure)")]
             bhq.db._hist_ready.discard(dp)
             with contextlib.redirect_stdout(io.StringIO()):
                 w=bhq.db.store_archive_measure('hv','a2','d2',20,1,0,dp,borg_version='1.2.6',borg_server_version='1.2.4')
-            cols=[r[1] for r in sqlite3.connect(dp).execute("PRAGMA table_info(archive_measure)")]
+            cols=[r[1] for r in _q(dp,"PRAGMA table_info(archive_measure)")]
             after=bhq.db.get_archive_measures('hv',dp)
             ok=(before.get(('a1','d1'),{}).get('borg_version','x') is None and 'borg_version' not in cols0 and w
                 and cols[-2:]==['borg_version','borg_server_version']
@@ -10960,7 +11011,7 @@ def codec_selftest(pattern=None,list_only=False):
             try:
                 with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): bhq.db.ensure_history_db(dp)
             except (SchemaVersionError,SystemExit): refused=True
-            cols=[r[1] for r in sqlite3.connect(dp).execute("PRAGMA table_info(archive_measure)")]
+            cols=[r[1] for r in _q(dp,"PRAGMA table_info(archive_measure)")]
             if not (refused and 'borg_version' not in cols): print(f"  refusée {refused}, colonnes {cols}")
             return refused and 'borg_version' not in cols
         check("versions de borg : history.db plus récente jamais modifiée",_bver_history_newer)
@@ -10981,7 +11032,7 @@ def codec_selftest(pattern=None,list_only=False):
                 with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
                     w=bhq.db.store_archive_measure('hh','a1','d1',5,0,0,dp,borg_version='1.2.6',borg_server_version='1.2.4')
             except (Exception,SystemExit) as e: w=False; err=e
-            cols=[r[1] for r in sqlite3.connect(dp).execute("PRAGMA table_info(archive_measure)")]
+            cols=[r[1] for r in _q(dp,"PRAGMA table_info(archive_measure)")]
             m=bhq.db.get_archive_measures('hh',dp).get(('a1','d1'),{}) if w else {}
             ok=(w and cols[-2:]==['borg_version','borg_server_version'] and cols.count('borg_version')==1
                 and m.get('borg_version')=='1.2.6' and m.get('borg_server_version')=='1.2.4')
@@ -12217,7 +12268,7 @@ def codec_selftest(pattern=None,list_only=False):
             par nick dans status() (une exception sur un nick n'abat pas tout l'appel -n multi/ALL)."""
             from datetime import datetime,timedelta
             age_ok=_age_readable(3.5)=="il y a 3h30" and _age_readable(0)=="il y a 0h00"
-            started_utc=datetime.utcnow()-timedelta(minutes=90,seconds=5)
+            started_utc=_utcnow_naive()-timedelta(minutes=90,seconds=5)
             started_at=started_utc.strftime("%Y-%m-%d %H:%M:%S")
             readable=_bkp_running_readable(started_at)
             elapsed_ok="1h30min" in readable
@@ -12292,20 +12343,32 @@ def codec_selftest(pattern=None,list_only=False):
             """1.0.132 : sentry_alert n'envoie que si le type est actif pour le nick ; événement 'error', étiquettes
             alert/nick, empreinte (type, nick), texte filtré (before_send) ; client initialisé SANS trace de
             performance. Faux transport : rien ne part vers un vrai Sentry ; client d'origine restauré."""
-            try: import sentry_sdk
-            except ImportError: return True  # sentry-sdk absent : sentry_alert renvoie False, rien à vérifier
-            hub=sentry_sdk.Hub.current; old_client=hub.client; saved=os.environ.get('BORGHELPERC_SENTRY_DSN')
+            import sentry_sdk   # absent : contrôle sauté (SKIP) à l'enregistrement
+            # 1.0.182 (story 48) : client d'origine lu et remis par l'API de la version installée (2.x : get_client et portée
+            # globale, jamais Hub — déprécié, il avertit ; 1.x : Hub)
+            v2=hasattr(sentry_sdk,'get_client')
+            old_client=sentry_sdk.get_client() if v2 else sentry_sdk.Hub.current.client
+            def bind(c):
+                if v2: sentry_sdk.get_global_scope().set_client(c)
+                else: sentry_sdk.Hub.current.bind_client(c)
+            saved=os.environ.get('BORGHELPERC_SENTRY_DSN')
             got=[]
             try:
                 os.environ['BORGHELPERC_SENTRY_DSN']='https://cle@o0.ingest.sentry.io/0'
-                hub.bind_client(None)
+                bind(None)
                 _orig=sentry_sdk.init
-                def _init(**kw): kw['transport']=lambda ev: got.append(ev); return _orig(**kw)
+                from sentry_sdk.transport import Transport as _Tb
+                class _T(_Tb):   # revue 2 : transport par classe (un transport fonction est déprécié en sentry-sdk 2.x)
+                    def capture_event(self,event): got.append(event)   # 1.x
+                    def capture_envelope(self,envelope):               # 2.x
+                        ev=envelope.get_event()
+                        if ev is not None: got.append(ev)
+                def _init(**kw): kw['transport']=_T(dict(kw)); return _orig(**kw)
                 sentry_sdk.init=_init
                 try:
                     off=sentry_alert('overdue','nA','x',{'SENTRY_ALERTS':'bkp_error'})
                     on=sentry_alert('bkp_error','nA','Sauvegarde en échec — nA (/srv/secret)',{'SENTRY_ALERTS':'bkp_error'},extra={'exitcode':2})
-                    no_traces=not hub.client.options.get('traces_sample_rate')
+                    no_traces=not _sentry_client(sentry_sdk).options.get('traces_sample_rate')
                 finally:
                     sentry_sdk.init=_orig
                 ev=got[0] if got else {}
@@ -12315,10 +12378,13 @@ def codec_selftest(pattern=None,list_only=False):
                         and ev.get('fingerprint')==['borghelper-alert','bkp_error','nA']
                         and msg=='Sauvegarde en échec — nA (<chemin>)' and no_traces)
             finally:
-                hub.bind_client(old_client)
+                bind(old_client)
                 if saved is None: os.environ.pop('BORGHELPERC_SENTRY_DSN',None)
                 else: os.environ['BORGHELPERC_SENTRY_DSN']=saved
-        check("sentry_alert : envoi seulement si activé, niveau error, étiquettes/empreinte, texte filtré, aucune trace de performance",_sentry_alert_ok)
+        _n="sentry_alert : envoi seulement si activé, niveau error, étiquettes/empreinte, texte filtré, aucune trace de performance"
+        import importlib.util
+        if importlib.util.find_spec('sentry_sdk') is None: skip(_n,"sentry_sdk absent de cet interpréteur")   # revue story 48 : jamais un OK vide
+        else: check(_n,_sentry_alert_ok)
         # ── Story 5 : DbEncrypt / DbDecrypt / DbRekey / DbStatus, curseur/reprise, AD-6, AD-7 ──────
         def _cas_primitives_ok():
             p=os.path.join(tmp,'cas.db')
@@ -12704,13 +12770,13 @@ def codec_selftest(pattern=None,list_only=False):
             un verrou n'est jamais annoncé comme une corruption."""
             bdb=BorgHelperDB(tmp,'vwal'); p=os.path.join(tmp,'vwal-diff.db'); bdb.ensure_diff_db(p)
             BorgHelper._vacuum_db(None,p,verbose=False)
-            jm=lambda: sqlite3.connect(p).execute("PRAGMA journal_mode").fetchone()[0]
+            jm=lambda: _q(p,"PRAGMA journal_mode",one=True)[0]
             wal_after=jm()=='wal'
             c=sqlite3.connect(p); c.execute("PRAGMA journal_mode=DELETE"); c.close()   # base héritée d'avant 1.0.137
             w=sqlite3.connect(p,isolation_level=None); w.execute("BEGIN IMMEDIATE")
             w.execute("INSERT INTO db_meta VALUES('vw','1') ON CONFLICT DO NOTHING")
             try:
-                raw=raises(sqlite3.OperationalError,lambda: sqlite3.connect(p,timeout=0.2).execute("PRAGMA journal_mode=WAL").fetchone())
+                raw=raises(sqlite3.OperationalError,lambda: _q(p,"PRAGMA journal_mode=WAL",one=True,timeout=0.2))
                 out=io.StringIO()
                 with contextlib.redirect_stderr(out): survived=not raises(SystemExit,lambda: bdb.ensure_diff_db(p,create=False))
             finally: w.execute("ROLLBACK"); w.close()
@@ -14018,7 +14084,7 @@ fail()
                 keep=max([1]+[r[0] for r in cn.execute("SELECT rootpage FROM sqlite_master WHERE name='db_meta'")]); cn.close()
                 raw=open(f,'rb').read(); open(f,'wb').write(raw[:pg*keep])   # fichier tronqué : illisible (la sonde dit « illisible »)
             def broken(f,t):
-                try: sqlite3.connect(f'file:{f}?mode=ro',uri=True).execute(f"SELECT COUNT(*) FROM {t}").fetchone(); return False
+                try: _q(f'file:{f}?mode=ro',f"SELECT COUNT(*) FROM {t}",one=True,uri=True); return False
                 except sqlite3.Error: return True
             res['cible vue']=broken(p,'diff_index') and broken(h,'archive_measure')
             def run(fn):
@@ -14437,10 +14503,335 @@ fail()
             fs.Hub.current.client=None; fs.capture_exception.reset_mock()
             with mock.patch.dict(sys.modules,{'sentry_sdk':fs}): ok2=_sentry_capture(e,'zw')
             res['sans Sentry']=(ok2 is False and not fs.capture_exception.called,ok2)
+            # 1.0.182 (story 48) : sentry-sdk 2.x — get_client/new_scope, jamais Hub (déprécié) : un faux sans Hub doit marcher
+            sc2=_Scope(); cl=_types.SimpleNamespace(is_active=lambda: True)
+            fs2=_types.SimpleNamespace(get_client=lambda: cl,new_scope=lambda: sc2,capture_exception=mock.Mock(),flush=mock.Mock())
+            with mock.patch.dict(sys.modules,{'sentry_sdk':fs2}): ok3=_sentry_capture(e,'zr')
+            cl.is_active=lambda: False
+            with mock.patch.dict(sys.modules,{'sentry_sdk':fs2}): ok4=_sentry_capture(e,'zr')
+            res['sentry-sdk 2.x']=(ok3 is True and sc2.tags=={'nick':'zr'} and ok4 is False and fs2.capture_exception.call_count==1,ok3,ok4)
             bad={k:v for k,v in res.items() if not v[0]}
             if bad: print(f"  {bad}")
             return not bad
         check("Index et Bkp multi-nicks : exception imprévue d'un nick -> [ERREUR], suivants traités, envoyée à Sentry ; Ctrl-C et nick seul relancés",_multi_nick_sentry)
+        def _multi_orphans():
+            """1.0.182 (story 48, revue 2) — filet de l'Index et du Bkp multi-nicks, par comportement : le nick zw lève alors qu'un
+            cycle d'objets de son cadre tient une connexion sqlite3 ; faux sentry-sdk 2.x actif dont capture_exception GARDE
+            l'exception (comme DedupeIntegration) ; ramasse-miettes automatique coupé. À l'entrée de zr, la connexion doit être
+            libérée : exception imprévue (envoyée à Sentry) pour l'Index et le Bkp, DbKeyError (sans Sentry) pour l'Index."""
+            import gc,weakref,types as _types
+            d,rc,calls,cli=_bf_env('multiorph'); res={}; p=os.path.join(tmp,'orphelins-multi.db')
+            class _H: pass
+            class _Scope:
+                def __enter__(s): return s
+                def __exit__(s,*a): return False
+                def set_tag(s,k,v): pass
+            def run(cmd,exc):
+                refs=[]; freed=[]; kept=[]
+                def fake(self,n,*a,**k):
+                    if n=='zw':
+                        h=_H(); h.cyc=h; h.conn=sqlite3.connect(p); refs.append(weakref.ref(h)); raise exc
+                    freed.append(bool(refs) and refs[0]() is None)
+                    if cmd=='Bkp': sys.exit(0)
+                    return 0
+                cl=_types.SimpleNamespace(is_active=lambda: True)
+                fs=_types.SimpleNamespace(get_client=lambda: cl,new_scope=lambda: _Scope(),capture_exception=lambda e: kept.append(e),
+                                          flush=lambda timeout=None: None)
+                saved=sys.argv[:]; o=io.StringIO(); was=gc.isenabled(); rf=_READER_FAILED[0]
+                gc.disable()
+                try:
+                    sys.argv=['borgHelper','-C',rc,'-c',cmd,'-n','zw,zr']+(['-I'] if cmd=='Bkp' else [])
+                    with mock.patch.object(BorgHelper,'index' if cmd=='Index' else 'backup',fake),mock.patch.dict(sys.modules,{'sentry_sdk':fs}), \
+                         contextlib.redirect_stdout(o),contextlib.redirect_stderr(o):
+                        try: _cli_main()
+                        except SystemExit: pass
+                finally:
+                    sys.argv=saved; _READER_FAILED[0]=rf
+                    if was: gc.enable()
+                return freed==[True],freed,len(kept),o.getvalue()[-150:]
+            res['Index imprévue (Sentry garde)']=run('Index',RuntimeError('boom'))
+            res['Index DbKeyError']=run('Index',DbKeyError('clé'))
+            res['Bkp imprévue (Sentry garde)']=run('Bkp',RuntimeError('boom'))
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("Index et Bkp multi-nicks : connexion orpheline du nick en erreur libérée au suivant, Sentry qui garde l'exception (comportement, 1.0.182)",_multi_orphans)
+        def _sentry_absent():
+            """1.0.182 (story 48, décision de l'utilisateur) : module sentry_sdk absent (interpréteur sans le paquet) -> jamais de
+            plantage. En processus : _sentry_init rend False, [WARN] une seule fois. CLI réelle (sous-processus, sys.modules
+            ['sentry_sdk']=None) : `-v` avec un DSN configuré (hôte local injoignable : rien ne part) -> code 0 et le [WARN] ;
+            DSN vide (fichier neutre) -> code 0, aucun [WARN] (aucun import)."""
+            res={}; saved=_SENTRY_MISSING_WARNED[0]; _SENTRY_MISSING_WARNED[0]=False
+            dsn='https://cle@127.0.0.1:9/0'
+            try:
+                e=io.StringIO()
+                with mock.patch.dict(sys.modules,{'sentry_sdk':None}),mock.patch.dict(os.environ),contextlib.redirect_stderr(e):
+                    os.environ.pop('BORGHELPER_VIA',None); os.environ.pop('BORGHELPERC_NO_CLEANUP_NOTICE',None)
+                    r1=_sentry_init(dsn); r2=_sentry_init(dsn)
+                res['processus']=(r1 is False and r2 is False and e.getvalue().count('sentry_sdk absent')==1,r1,r2,e.getvalue()[-150:])
+            finally: _SENTRY_MISSING_WARNED[0]=saved
+            code="import sys,runpy\nsys.modules['sentry_sdk']=None\np=sys.argv[1]; sys.argv=[p,'-v']\nrunpy.run_path(p,run_name='__main__')\n"
+            vide=os.path.join(tmp,'sentry-vide'); open(vide,'w').close()
+            for k,extra,drop in (('DSN configuré',{'BORGHELPERC_SENTRY_DSN':dsn},()),('DSN vide',{'BORGHELPERC_SENTRY_FILE':vide},('BORGHELPERC_SENTRY_DSN',))):
+                en=dict(os.environ,**extra); en.pop('BORGHELPER_VIA',None); en.pop('BORGHELPERC_NO_CLEANUP_NOTICE',None)
+                for d in drop: en.pop(d,None)
+                r=subprocess.run([sys.executable,'-c',code,os.path.abspath(__file__)],capture_output=True,text=True,env=en,
+                                 stdin=subprocess.DEVNULL,timeout=120)
+                warned='sentry_sdk absent' in r.stderr
+                res[k]=(r.returncode==0 and f"Version {Version}" in r.stdout and warned==(k=='DSN configuré') and 'Traceback' not in r.stderr,
+                        r.returncode,r.stderr[-200:])
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("sentry_sdk absent : jamais de plantage — DSN configuré : [WARN] une fois, commande normale ; DSN vide : aucun import (1.0.182)",_sentry_absent)
+        def _sentry_unusable():
+            """1.0.182 (story 48, revue ; décisions de l'utilisateur : jamais de plantage, muet sous WWW) — Sentry inutilisable :
+            (a) sentry_alert sans module, deux alertes -> False deux fois, un seul [WARN] « sentry_sdk absent », jamais le [WARN] par alerte « alerte Sentry … non envoyée » ;
+            (b) DSN invalide avec le vrai sentry_sdk installé (BadDsn mesuré sous 1.4.3 et 2.71 : plantage au démarrage avant le
+                correctif) -> _sentry_init False, [WARN] « initialisation impossible (BadDsn) » une fois, client inchangé ; module absent
+                -> dit et sauté ;
+            (c) sous borgHelperWWW -> aucun [WARN] : BORGHELPER_VIA=http (Index détaché) et BORGHELPERC_NO_CLEANUP_NOTICE=1 (tout
+                enfant), en processus et en CLI réelle (DSN configuré, module absent : code 0) ; la source de borgHelperWWW pose
+                bien ce second marqueur, sans condition, dans _build_borghelper_argv_env (absente à côté : dit et sauté) ;
+            (d) import de sentry_sdk qui lève autre chose qu'ImportError (installation cassée) -> False, [WARN] une fois ; dépendance
+                absente (ModuleNotFoundError d'urllib3) -> nommée, jamais « module absent » (revue 2) ;
+            (e) fichier DSN non UTF-8 : CLI réelle, code 0, [WARN] « fichier DSN illisible » (revue 2 : plantage au démarrage avant) ;
+            (f) sentry_alert dont le premier import échoue et dont le repli initialise Sentry : False (rien n'est parti, revue 2)."""
+            res={}; saved=_SENTRY_MISSING_WARNED[0]; dsn='https://cle@127.0.0.1:9/0'
+            cfg={'SENTRY_ALERTS':'all'}
+            try:
+                _SENTRY_MISSING_WARNED[0]=False; e=io.StringIO()
+                with mock.patch.dict(sys.modules,{'sentry_sdk':None}),mock.patch.dict(os.environ,{'BORGHELPERC_SENTRY_DSN':dsn}),\
+                        contextlib.redirect_stderr(e):
+                    os.environ.pop('BORGHELPER_VIA',None); os.environ.pop('BORGHELPERC_NO_CLEANUP_NOTICE',None)
+                    a1=sentry_alert('bkp_error','zr','x',cfg); a2=sentry_alert('overdue','zr','y',cfg)
+                t=e.getvalue()
+                res['alerte sans module']=(a1 is False and a2 is False and t.count('sentry_sdk absent')==1 and 'alerte Sentry' not in t,a1,a2,t[-200:])
+                try: import sentry_sdk
+                except ImportError: sentry_sdk=None; print("  sentry_sdk absent de cet interpréteur : cas DSN invalide sauté")
+                if sentry_sdk is not None:
+                    _SENTRY_MISSING_WARNED[0]=False; e=io.StringIO(); before=_sentry_client(sentry_sdk); boom=None
+                    with mock.patch.dict(os.environ),contextlib.redirect_stderr(e):
+                        os.environ.pop('BORGHELPER_VIA',None); os.environ.pop('BORGHELPERC_NO_CLEANUP_NOTICE',None)
+                        try: r1=_sentry_init('pasundsn'); r2=_sentry_init('pasundsn')
+                        except Exception as x: boom=repr(x); r1=r2=None
+                    t=e.getvalue()
+                    res['DSN invalide']=(boom is None and r1 is False and r2 is False and t.count('initialisation impossible (BadDsn)')==1
+                                         and _sentry_client(sentry_sdk) is before,boom,r1,r2,t[-200:])
+                for k,mk in (('BORGHELPER_VIA','http'),('BORGHELPERC_NO_CLEANUP_NOTICE','1')):
+                    _SENTRY_MISSING_WARNED[0]=False; e=io.StringIO()
+                    with mock.patch.dict(sys.modules,{'sentry_sdk':None}),mock.patch.dict(os.environ,{k:mk}),contextlib.redirect_stderr(e):
+                        r=_sentry_init(dsn)
+                    res[f'{k} en processus']=(r is False and e.getvalue()=='',r,e.getvalue()[-150:])
+                _SENTRY_MISSING_WARNED[0]=False; e=io.StringIO(); _imp=__import__
+                def _broken(name,*a,**k):
+                    if name=='sentry_sdk' or name.startswith('sentry_sdk.'): raise RuntimeError('installation cassée (contrôle)')
+                    return _imp(name,*a,**k)
+                with mock.patch('builtins.__import__',_broken),mock.patch.dict(os.environ),contextlib.redirect_stderr(e):
+                    os.environ.pop('BORGHELPER_VIA',None); os.environ.pop('BORGHELPERC_NO_CLEANUP_NOTICE',None)
+                    try: r1=_sentry_init(dsn); r2=_sentry_init(dsn); boom=None
+                    except Exception as x: r1=r2=None; boom=repr(x)
+                t=e.getvalue()
+                res['import cassé']=(boom is None and r1 is False and r2 is False and t.count('import de sentry_sdk impossible (RuntimeError)')==1,
+                                     boom,r1,r2,t[-200:])
+                _SENTRY_MISSING_WARNED[0]=False; e=io.StringIO()
+                def _nodep(name,*a,**k):
+                    if name=='sentry_sdk' or name.startswith('sentry_sdk.'): raise ModuleNotFoundError("No module named 'urllib3'",name='urllib3')
+                    return _imp(name,*a,**k)
+                with mock.patch('builtins.__import__',_nodep),mock.patch.dict(os.environ),contextlib.redirect_stderr(e):
+                    os.environ.pop('BORGHELPER_VIA',None); os.environ.pop('BORGHELPERC_NO_CLEANUP_NOTICE',None)
+                    r1=_sentry_init(dsn)
+                t=e.getvalue()
+                res['dépendance absente']=(r1 is False and 'dépendance urllib3 absente' in t and 'module sentry_sdk absent' not in t,r1,t[-200:])
+                import types as _types
+                inits=[]; fk=_types.SimpleNamespace(init=lambda **kw: inits.append(kw),get_client=lambda: None)
+                first=[True]
+                def _once(name,*a,**k):
+                    if name=='sentry_sdk':
+                        if first[0]: first[0]=False; raise RuntimeError('import transitoire (contrôle)')
+                        return fk
+                    return _imp(name,*a,**k)
+                _SENTRY_MISSING_WARNED[0]=False
+                with mock.patch('builtins.__import__',_once),mock.patch.dict(os.environ,{'BORGHELPERC_SENTRY_DSN':dsn}),\
+                        contextlib.redirect_stderr(io.StringIO()):
+                    a3=sentry_alert('bkp_error','zr','x',cfg)
+                res['repli qui réussit : jamais « parti »']=(a3 is False and len(inits)==1,a3,len(inits))
+            finally: _SENTRY_MISSING_WARNED[0]=saved
+            www=os.path.join(os.path.dirname(os.path.abspath(__file__)),'borgHelperWWW')
+            if not os.path.isfile(www): print("  borgHelperWWW absent à côté de borgHelper : couplage du marqueur non vérifié")
+            else:
+                import ast
+                fn=next((n for n in ast.walk(ast.parse(open(www).read())) if isinstance(n,ast.FunctionDef) and n.name=='_build_borghelper_argv_env'),None)
+                top=[st for st in (fn.body if fn else []) if isinstance(st,ast.Assign) and len(st.targets)==1 and isinstance(st.targets[0],ast.Subscript)
+                     and isinstance(st.targets[0].value,ast.Name) and st.targets[0].value.id=='env' and isinstance(st.value,ast.Constant) and st.value.value=='1'
+                     and isinstance(st.targets[0].slice,ast.Constant) and st.targets[0].slice.value=='BORGHELPERC_NO_CLEANUP_NOTICE']
+                res['WWW pose le marqueur sur tout enfant']=(bool(top),fn is not None)
+            code="import sys,runpy\nsys.modules['sentry_sdk']=None\np=sys.argv[1]; sys.argv=[p,'-v']\nrunpy.run_path(p,run_name='__main__')\n"
+            bad8=os.path.join(tmp,'sentry-latin1'); open(bad8,'wb').write(b'https://cl\xe9@127.0.0.1:9/0\n')
+            en=dict(os.environ,BORGHELPERC_SENTRY_FILE=bad8); en.pop('BORGHELPERC_SENTRY_DSN',None); en.pop('BORGHELPER_VIA',None)
+            en.pop('BORGHELPERC_NO_CLEANUP_NOTICE',None)
+            r=subprocess.run([sys.executable,os.path.abspath(__file__),'-v'],capture_output=True,text=True,env=en,stdin=subprocess.DEVNULL,timeout=120)
+            res['fichier DSN non UTF-8']=(r.returncode==0 and f"Version {Version}" in r.stdout and 'fichier DSN illisible (UnicodeDecodeError)' in r.stderr
+                                          and 'Traceback' not in r.stderr,r.returncode,r.stderr[-200:])
+            for k,mk in (('BORGHELPER_VIA','http'),('BORGHELPERC_NO_CLEANUP_NOTICE','1')):
+                en=dict(os.environ,BORGHELPERC_SENTRY_DSN=dsn); en.pop('BORGHELPER_VIA',None); en.pop('BORGHELPERC_NO_CLEANUP_NOTICE',None); en[k]=mk
+                r=subprocess.run([sys.executable,'-c',code,os.path.abspath(__file__)],capture_output=True,text=True,env=en,
+                                 stdin=subprocess.DEVNULL,timeout=120)
+                res[f'{k} CLI']=(r.returncode==0 and f"Version {Version}" in r.stdout and '[WARN]' not in r.stderr and 'Traceback' not in r.stderr,
+                                 r.returncode,r.stderr[-200:])
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("Sentry inutilisable : sentry_alert sans module, DSN invalide, import cassé sans plantage, [WARN] une fois, muet sous WWW (1.0.182)",_sentry_unusable)
+        def _utcnow_oracle():
+            """1.0.182 (story 48, revue) : _utcnow_naive remplace datetime.utcnow() dans le code ET dans les contrôles — oracle
+            indépendant : naïve, et relue comme UTC (calendar.timegm) elle tombe entre deux time.time()."""
+            import calendar
+            old=os.environ.get('TZ')
+            try:   # revue 2 : fuseau forcé loin d'UTC (UTC+5), sinon un hôte en UTC ne verrait pas une heure locale
+                os.environ['TZ']='Etc/GMT-5'; time.tzset()
+                a=time.time(); u=_utcnow_naive(); b=time.time()
+            finally:
+                if old is None: os.environ.pop('TZ',None)
+                else: os.environ['TZ']=old
+                time.tzset()
+            ts=calendar.timegm(u.timetuple())+u.microsecond/1e6
+            ok=u.tzinfo is None and a-1<=ts<=b+1
+            if not ok: print(f"  {u!r} {a} {ts} {b}")
+            return ok
+        check("_utcnow_naive : heure UTC naïve (oracle calendar.timegm, 1.0.182)",_utcnow_oracle)
+        def _pernick_orphans():
+            """1.0.182 (story 48, revue) — filet des multi-nicks, par comportement (indépendant de la version de Python) : un nick
+            arrêté (DbKeyError) laisse une connexion tenue par un cycle d'objets dans une variable locale ; ramasse-miettes
+            automatique coupé pendant le contrôle. (a) Nick suivant : la connexion est libérée à son __enter__ (cadres effacés
+            par __exit__, gc.collect hors de l'except) ; (b) dernier nick arrêté : libérée par done()."""
+            import gc,weakref
+            class _H: pass
+            p=os.path.join(tmp,'orphelins.db'); res={}; was=gc.isenabled(); rf=_READER_FAILED[0]
+            def fail(refs):
+                h=_H(); h.cyc=h; h.conn=sqlite3.connect(p); refs.append(weakref.ref(h))
+                raise DbKeyError('clé absente (contrôle)')
+            gc.disable()
+            try:
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                    refs=[]; pn=_PerNick('za,zb')
+                    with pn('za'): fail(refs)
+                    with pn('zb'): freed=refs[0]() is None
+                    pn.done()
+                    res['nick suivant']=(freed,)
+                    refs=[]; pn=_PerNick('za,zb')
+                    with pn('za'): pass
+                    with pn('zb'): fail(refs)
+                    held=refs[0]() is not None
+                    pn.done()
+                    res['done']=(held and refs[0]() is None,held)
+            finally:
+                _READER_FAILED[0]=rf
+                if was: gc.enable()
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("multi-nicks : connexion orpheline d'un nick arrêté libérée au nick suivant et par done() (comportement, 1.0.182)",_pernick_orphans)
+        def _py_compat_guard():
+            """1.0.182 (story 48, Python 3.10 à 3.14) — gardes de structure par AST (sources de borgHelper, et de borgHelperWWW s'il
+            est à côté ; sinon cette partie est dite sautée) :
+            (1) SQL en `?` anonymes seulement : ?NNN avertit sous des 3.12, :nom/@nom/$nom avec une séquence = ProgrammingError en
+                3.14 — chaînes SQL (constantes, f-strings) et fragments SQL (mot-clé en capitales + marqueur après = ( , < > IN LIKE
+                AND OR), littéraux '…' retirés ;
+                ?NNN signalé dans toute chaîne après = ( , < > ou une espace ;
+            (2) aucun .utcnow() / .utcfromtimestamp() (DeprecationWarning affiché depuis 3.12), aucun PurePath(…).as_uri() (3.14) ;
+            (3) dans ensure_diff_db et ensure_cache_db, toute sortie _db_schema_fail d'un `except` est précédée de _close_quiet(conn)
+                dans le même bloc, et un `except BaseException` ferme (_close_quiet(conn)) puis relance (Python 3.11+ : une
+                connexion non fermée garde verrous et -shm) ;
+            (4) filet des multi-nicks (invisible sous 3.10, où la fermeture est immédiate) : _release_orphan_connections appelle
+                gc.collect ; jamais appelée dans un `except` (mesuré : n'y libère pas une connexion tenue par la trace) ;
+                _PerNick.__exit__ efface les cadres (_clear_exc_frames, chaîne __cause__/__context__) et marque _orph, __enter__ et
+                done libèrent ; _sentry_capture efface les cadres (Dedupe garde l'exception) ; _cli_main l'appelle au moins trois fois
+                (Index : tour suivant + fin ; Bkp), avec la marque posée dans l'except de l'Index et le test `if _c:` du Bkp ; report
+                et report_offline : marque dans l'except, libération au nick suivant et après la boucle."""
+            import ast,re
+            PH=re.compile(r"\?\d+|(?<![\w:])[:@$][A-Za-z_]\w*")
+            SQLK=re.compile(r"^\s*(SELECT|INSERT|UPDATE|DELETE|WITH|REPLACE|CREATE|PRAGMA)\b",re.I)
+            KW=re.compile(r"\b(SELECT|WHERE|AND|OR|FROM|VALUES|SET|IN|LIKE|JOIN|ON)\b")
+            FRAG=re.compile(r"\?\d+|(?:[=(,<>]|\bIN|\bLIKE|\bAND|\bOR)\s*[:@$][A-Za-z_]\w*")
+            QN=re.compile(r"[=(,<>\s]\?\d+")
+            PURE=('PurePath','PurePosixPath','PureWindowsPath')
+            me=_py_compat_guard.__code__.co_firstlineno
+            here=os.path.dirname(os.path.abspath(__file__)); files=[os.path.abspath(__file__)]; bad=[]
+            www=os.path.join(here,'borgHelperWWW')
+            if os.path.isfile(www): files.append(www)
+            else: print("  borgHelperWWW absent à côté de borgHelper : sa partie de la garde est sautée")
+            for f in files:
+                t=ast.parse(open(f).read()); mine=f==files[0]
+                own=next((n for n in ast.walk(t) if isinstance(n,ast.FunctionDef) and n.name=='_py_compat_guard'),None) if mine else None
+                skip=lambda l: own is not None and own.lineno<=l<=own.end_lineno
+                for n in ast.walk(t):
+                    txt=None
+                    if isinstance(n,ast.JoinedStr): txt=''.join(v.value if isinstance(v,ast.Constant) and isinstance(v.value,str) else ' X ' for v in n.values)
+                    elif isinstance(n,ast.Constant) and isinstance(n.value,str): txt=n.value
+                    if txt is not None and not skip(n.lineno):
+                        body=re.sub(r"'(?:[^']|'')*'","''",txt)
+                        m=(PH.search(body) if SQLK.match(txt) else None) or (FRAG.search(body) if KW.search(body) else None) or QN.search(body)
+                        if m: bad.append(f"{os.path.basename(f)}:{n.lineno} marqueur SQL {m.group(0)!r}")
+                    if isinstance(n,ast.Attribute) and n.attr in ('utcnow','utcfromtimestamp') and not skip(n.lineno):
+                        bad.append(f"{os.path.basename(f)}:{n.lineno} .{n.attr}()")
+                    if (isinstance(n,ast.Attribute) and n.attr=='as_uri' and isinstance(n.value,ast.Call) and not skip(n.lineno)
+                            and ((isinstance(n.value.func,ast.Name) and n.value.func.id in PURE) or
+                                 (isinstance(n.value.func,ast.Attribute) and n.value.func.attr in PURE))):
+                        bad.append(f"{os.path.basename(f)}:{n.lineno} PurePath(…).as_uri()")
+                if not mine: continue
+                closes_conn=lambda c: (isinstance(c,ast.Call) and isinstance(c.func,ast.Name) and c.func.id=='_close_quiet' and
+                                       len(c.args)==1 and isinstance(c.args[0],ast.Name) and c.args[0].id=='conn')
+                for fn in (n for n in ast.walk(t) if isinstance(n,ast.FunctionDef) and n.name in ('ensure_diff_db','ensure_cache_db')):
+                    seen_fail=0; base_ok=False
+                    for h in (x for x in ast.walk(fn) if isinstance(x,ast.ExceptHandler)):
+                        closed=False
+                        for st in h.body:
+                            calls=[c.func.id for c in ast.walk(st) if isinstance(c,ast.Call) and isinstance(c.func,ast.Name)]
+                            if '_db_schema_fail' in calls:
+                                seen_fail+=1
+                                if not closed: bad.append(f"{fn.name}:{st.lineno} _db_schema_fail sans _close_quiet(conn) avant")
+                            if any(closes_conn(c) for c in ast.walk(st)): closed=True
+                        if (isinstance(h.type,ast.Name) and h.type.id=='BaseException' and closed
+                                and any(isinstance(x,ast.Raise) and x.exc is None for x in h.body)): base_ok=True
+                    if not seen_fail: bad.append(f"{fn.name} : aucune sortie _db_schema_fail trouvée (garde à revoir)")
+                    if not base_ok: bad.append(f"{fn.name} : pas d'except BaseException qui ferme (_close_quiet(conn)) puis relance")
+                fns={n.name:n for n in ast.walk(t) if isinstance(n,ast.FunctionDef)}
+                def calls_in(fn,name): return sum(1 for c in ast.walk(fn) if isinstance(c,ast.Call) and
+                                                  ((isinstance(c.func,ast.Name) and c.func.id==name) or (isinstance(c.func,ast.Attribute) and c.func.attr==name)))
+                rel=fns.get('_release_orphan_connections')
+                if rel is None or not calls_in(rel,'collect'): bad.append("_release_orphan_connections n'appelle pas gc.collect")
+                for h in (x for x in ast.walk(t) if isinstance(x,ast.ExceptHandler) and not skip(x.lineno)):
+                    if any(calls_in(st,'_release_orphan_connections') for st in h.body):
+                        bad.append(f"ligne {h.lineno} : _release_orphan_connections dans un except (n'y libère pas la connexion de la trace)")
+                pn={m.name:m for c in ast.walk(t) if isinstance(c,ast.ClassDef) and c.name=='_PerNick' for m in c.body if isinstance(m,ast.FunctionDef)}
+                def sets_orph(node): return any(isinstance(a,ast.Assign) and any((isinstance(g,ast.Attribute) and g.attr=='_orph') or
+                                                 (isinstance(g,ast.Name) and g.id=='_orph') for g in a.targets)
+                                                 and isinstance(a.value,ast.Constant) and a.value.value is True for a in ast.walk(node))
+                ex=pn.get('__exit__')
+                if ex is None or not calls_in(ex,'_clear_exc_frames') or not sets_orph(ex):
+                    bad.append("_PerNick.__exit__ sans _clear_exc_frames + self._orph=True")
+                cf=fns.get('_clear_exc_frames')
+                if cf is None or not calls_in(cf,'clear_frames') or not any(isinstance(a,ast.Attribute) and a.attr in ('__cause__','__context__') for a in ast.walk(cf)):
+                    bad.append("_clear_exc_frames sans clear_frames sur la chaîne __cause__/__context__")
+                if not calls_in(fns['_sentry_capture'],'_clear_exc_frames'): bad.append("_sentry_capture sans _clear_exc_frames (Dedupe garde l'exception)")
+                # revue 2 : chaque libération doit pouvoir s'exécuter — marque posée dans l'except de chaque boucle, test sur _c (Bkp)
+                cm=fns['_cli_main']
+                if not any(sets_orph(h) and calls_in(h,'_clear_exc_frames') for h in ast.walk(cm) if isinstance(h,ast.ExceptHandler)):
+                    bad.append("_cli_main : except de l'Index sans _clear_exc_frames + _orph=True")
+                if not any(isinstance(i,ast.If) and isinstance(i.test,ast.Name) and i.test.id=='_c' and calls_in(i,'_release_orphan_connections')
+                           for i in ast.walk(cm)): bad.append("_cli_main : Bkp sans « if _c: _release_orphan_connections() »")
+                for m in ('__enter__','done'):
+                    if m not in pn or not calls_in(pn[m],'_release_orphan_connections'): bad.append(f"_PerNick.{m} sans _release_orphan_connections")
+                if calls_in(fns['_cli_main'],'_release_orphan_connections')<3:
+                    bad.append("_cli_main : moins de trois _release_orphan_connections (Index : tour suivant + fin ; Bkp)")
+                for m in ('report','report_offline'):
+                    if m not in fns or calls_in(fns[m],'_release_orphan_connections')<2 or not any(
+                            sets_orph(h) for h in ast.walk(fns[m]) if isinstance(h,ast.ExceptHandler)):
+                        bad.append(f"{m} : libération au nick suivant et après la boucle, marque dans l'except, attendues")
+            if bad: print(f"  {bad[:10]}")
+            return not bad
+        check("compatibilité Python 3.10-3.14 : SQL en ? seulement, aucun utcnow(), ensure_* qui ferment avant de sortir (garde AST, 1.0.182)",_py_compat_guard)
         def _index_last_exit_code():
             """1.0.177 (story 40, A84) : index_last.code = code de sortie du processus — DbKeyError 2 (gestionnaire global),
             sys.exit(-9) 247 (_exit_code), sys.exit(None) 0, sys.exit(texte) 1, exception imprévue 1, code rendu tel quel."""
@@ -14612,7 +15003,7 @@ fail()
             rps=[x[0] for x in cn.execute("SELECT rootpage FROM sqlite_master WHERE tbl_name='archive_stats' AND rootpage>0")]; cn.close()
             with open(p,'r+b') as f:   # table ET index (un index couvrant servait la requête sans lire la table)
                 for rp in rps: f.seek(pg*(rp-1)); f.write(b'\xff'*pg)
-            try: sqlite3.connect(p).execute("SELECT archive,archive_date FROM archive_stats WHERE nick='zr' ORDER BY archive_date,archive").fetchall(); vu=False
+            try: _q(p,"SELECT archive,archive_date FROM archive_stats WHERE nick='zr' ORDER BY archive_date,archive"); vu=False
             except sqlite3.DatabaseError: vu=True
             res['archive_stats illisible']=(vu,)
             for nm,argv in (('LstBkp corrompue',('-c','LstBkp','-n','zr')),('LstBkpFls corrompue',('-c','LstBkpFls','-n','zr','-j'))):
@@ -17988,7 +18379,7 @@ fail()
             os.chmod(os.path.join(src,'d/f2'),0o644)
             os.symlink('f1',os.path.join(src,'lnk')); os.symlink('f1',os.path.join(src,'lnk2'))
             import datetime as _dtm   # archives récentes : Report sort en 0 (sinon « en retard », code 1)
-            ts=lambda m: (_dtm.datetime.utcnow()-_dtm.timedelta(minutes=m)).strftime('%Y-%m-%dT%H:%M:%S')
+            ts=lambda m: (_utcnow_naive()-_dtm.timedelta(minutes=m)).strftime('%Y-%m-%dT%H:%M:%S')
             n1=json.loads(bg('create','--json','--timestamp',ts(10),f'{repo}::t-1',src))['archive']['stats']['nfiles']
             time.sleep(1.1)   # ctime à la seconde : le chmod doit le changer
             wr('f1','aa'); wr('logs/l','ll'); wr('d/new','n'); os.makedirs(os.path.join(src,'newdir')); wr('newdir/n','n')
@@ -18031,7 +18422,7 @@ fail()
             def wr(q,s):
                 with open(os.path.join(src,q),'w') as f: f.write(s)
             import datetime as _dtm
-            ts=lambda m: (_dtm.datetime.utcnow()-_dtm.timedelta(minutes=m)).strftime('%Y-%m-%dT%H:%M:%S')
+            ts=lambda m: (_utcnow_naive()-_dtm.timedelta(minutes=m)).strftime('%Y-%m-%dT%H:%M:%S')
             bg('init','-e','repokey',repo)
             for q in ('f1','f2','k'): wr(q,q)
             os.mkfifo(os.path.join(src,'p')); os.symlink('k',os.path.join(src,'lk'))
@@ -18082,7 +18473,7 @@ fail()
             lié ; b : même ligne dans les deux archives ; Index -S -F (snapshot complet de t-3) laisse t-2 identique ; t-4 (a
             supprimé, 2 versions) : a absent de t-4 ; jamais deux versions identiques ni deux lignes d'un chemin par archive."""
             import datetime as _dtm
-            ts=lambda m: (_dtm.datetime.utcnow()-_dtm.timedelta(minutes=m)).strftime('%Y-%m-%dT%H:%M:%S')
+            ts=lambda m: (_utcnow_naive()-_dtm.timedelta(minutes=m)).strftime('%Y-%m-%dT%H:%M:%S')
             borg=shutil.which('borg'); me=os.path.realpath(__file__); ok=True
             for nk,extra in (('sv','DB_ENCRYPT=false\n'),('sve','DB_ENCRYPT=true\nDB_KDF=light\n')):
                 d=os.path.join(tmp,'snapv-'+nk); src=os.path.join(d,'src'); bb=os.path.join(d,'bb'); repo=os.path.join(d,'repo')
@@ -18738,7 +19129,9 @@ def _sentry_before_send(event,hint):
     return event
 
 def _sentry_dsn():
-    return getDataFromEnvOrFile(env="BORGHELPERC_SENTRY_DSN",envpath="BORGHELPERC_SENTRY_FILE",paths="/usr/local/etc/borghelper-sentry")
+    try: return getDataFromEnvOrFile(env="BORGHELPERC_SENTRY_DSN",envpath="BORGHELPERC_SENTRY_FILE",paths="/usr/local/etc/borghelper-sentry")
+    except (OSError,ValueError) as e:   # 1.0.182 (story 48, revue 2) : fichier non UTF-8 ou devenu illisible — jamais de plantage
+        _sentry_warn_once(f"fichier DSN illisible ({type(e).__name__})"); return None
 
 def _sentry_init(dsn,release=None):
     """Initialise Sentry (CLI au démarrage ; borgHelperWWW à la première alerte). Aucune trace de
@@ -18749,17 +19142,60 @@ def _sentry_init(dsn,release=None):
     frameworks web…), ~100-180 ms par invocation. Ne JAMAIS ajouter default_integrations=False : ça
     désactive aussi excepthook/logging/dedupe/atexit — plus aucune exception ne remonterait (borgHelper
     n'appelle jamais capture_exception() lui-même). include_local_variables=False + before_send : aucun
-    chemin/passphrase/DEK ne sort du processus (AD-15), y compris via les variables locales des frames."""
-    import sentry_sdk
+    chemin/passphrase/DEK ne sort du processus (AD-15), y compris via les variables locales des frames.
+    1.0.182 (story 48, décisions de l'utilisateur) : jamais de plantage — module sentry_sdk absent (interpréteur sans le paquet)
+    ou initialisation refusée (DSN invalide : BadDsn, mesuré sous sentry-sdk 1.4.3 et 2.71) -> Sentry désactivé, [WARN] une
+    seule fois par processus (_sentry_warn_once), False. True si initialisé."""
+    try: import sentry_sdk
+    except ImportError as e:   # revue 2 : dépendance absente (urllib3, certifi…) : nommée, jamais « module absent »
+        dep=getattr(e,'name',None)
+        _sentry_warn_once("module sentry_sdk absent (DSN configuré)" if dep in (None,'sentry_sdk') else
+                          f"import de sentry_sdk impossible (dépendance {dep} absente)"); return False
+    except Exception as e:   # revue story 48 : installation cassée (l'import lève autre chose) — jamais de plantage
+        _sentry_warn_once(f"import de sentry_sdk impossible ({type(e).__name__})"); return False
     kw=dict(dsn=dsn,environment="production",release=release or f"borgHelper@{Version}",
             auto_enabling_integrations=False,before_send=_sentry_before_send)
     try:
-        sentry_sdk.init(include_local_variables=False,**kw)
-    except TypeError as e:
-        # sentry-sdk < 1.26 : option renommée (with_locals). Ne rattraper QUE ce cas précis — toute autre
-        # TypeError (mauvais usage, autre kwarg) doit remonter plutôt que d'être masquée par ce repli.
-        if 'include_local_variables' not in str(e): raise
-        sentry_sdk.init(with_locals=False,**kw)
+        try:
+            sentry_sdk.init(include_local_variables=False,**kw)
+        except TypeError as e:
+            # sentry-sdk < 1.26 : option renommée (with_locals). Ne rattraper QUE ce cas précis — toute autre
+            # TypeError (mauvais usage, autre kwarg) part dans le [WARN] ci-dessous plutôt que d'être masquée par ce repli.
+            if 'include_local_variables' not in str(e): raise
+            sentry_sdk.init(with_locals=False,**kw)
+    except Exception as e:   # type seul : le message peut citer le DSN
+        _sentry_warn_once(f"initialisation impossible ({type(e).__name__})"); return False
+    return True
+
+_SENTRY_MISSING_WARNED=[False]
+
+def _via_www():
+    """1.0.182 (story 48) : CLI lancée par borgHelperWWW — BORGHELPERC_NO_CLEANUP_NOTICE=1, posé par WWW sur TOUT enfant
+    (_build_borghelper_argv_env, 1.28.5 ; couplage gardé par le contrôle « Sentry inutilisable »), ou BORGHELPER_VIA=http (Index
+    détaché, 1.28.2 — seul, il ne couvrait pas les appels synchrones dont WWW relaie le stderr)."""
+    return os.environ.get('BORGHELPERC_NO_CLEANUP_NOTICE')=='1' or os.environ.get('BORGHELPER_VIA')=='http'
+
+def _sentry_warn_once(why):
+    """1.0.182 (story 48) : Sentry inutilisable -> [WARN] une seule fois par processus. Muet sous borgHelperWWW (_via_www,
+    décision de l'utilisateur : le serveur le dit une fois dans son propre journal, à sa première alerte — même fonction, dans
+    son processus, qui n'a aucune des deux variables)."""
+    if _SENTRY_MISSING_WARNED[0]: return
+    _SENTRY_MISSING_WARNED[0]=True
+    if _via_www(): return
+    print(f"[WARN] Sentry désactivé : {why} — erreurs et alertes non envoyées",file=sys.stderr,flush=True)
+
+def _sentry_client(sdk):
+    """1.0.182 (story 48) : client Sentry actif ou None — sentry-sdk 2.x (get_client ; Hub y est déprécié et avertit) ou 1.x
+    (Hub.current.client)."""
+    g=getattr(sdk,'get_client',None)
+    if g is None: return sdk.Hub.current.client
+    c=g()
+    return c if c is not None and (c.is_active() if hasattr(c,'is_active') else True) else None
+
+def _sentry_scope(sdk):
+    """1.0.182 (story 48) : portée isolée — new_scope (sentry-sdk 2.x ; push_scope y est déprécié) ou push_scope (1.x)."""
+    n=getattr(sdk,'new_scope',None)
+    return n() if n is not None else sdk.push_scope()
 
 def _sentry_capture(e,nick):
     """1.0.176 (story 39, décision de l'utilisateur) : exception imprévue d'un nick dans une commande multi-nicks (Index, Bkp),
@@ -18767,12 +19203,13 @@ def _sentry_capture(e,nick):
     de la CLI si un DSN est configuré ; sinon rien). True si envoyée. Ne lève jamais."""
     try:
         import sentry_sdk
-        if sentry_sdk.Hub.current.client is None: return False
-        with sentry_sdk.push_scope() as scope:
+        if _sentry_client(sentry_sdk) is None: return False
+        with _sentry_scope(sentry_sdk) as scope:
             scope.set_tag('nick',nick); sentry_sdk.capture_exception(e)
         sentry_sdk.flush(timeout=5)
         return True
     except Exception: return False
+    finally: _clear_exc_frames(e)   # 1.0.182 (story 48, revue 2) : Dedupe garde l'exception -> ses connexions libérables
 
 _SENTRY_ALERT_KINDS=('bkp_error','overdue')
 
@@ -18795,9 +19232,10 @@ def sentry_alert(kind,nick,message,cfg,extra=None,release=None):
     try:
         dsn=_sentry_dsn()
         if not dsn: return False
-        import sentry_sdk
-        if sentry_sdk.Hub.current.client is None: _sentry_init(dsn,release=release)
-        with sentry_sdk.push_scope() as scope:
+        try: import sentry_sdk
+        except Exception: _sentry_init(dsn,release=release); return False   # 1.0.182 (story 48) : [WARN] une fois — jamais « parti »
+        if _sentry_client(sentry_sdk) is None and not _sentry_init(dsn,release=release): return False
+        with _sentry_scope(sentry_sdk) as scope:
             scope.set_tag('alert',kind); scope.set_tag('nick',nick)
             scope.fingerprint=['borghelper-alert',kind,nick]
             for k,v in (extra or {}).items(): scope.set_extra(k,v)
@@ -18811,7 +19249,7 @@ def sentry_alert(kind,nick,message,cfg,extra=None,release=None):
 def _cli_main():
     _READER_FAILED[0]=0   # 1.0.178 (A87) : appel en processus (selftest) : jamais l'erreur d'un appel précédent
     sentryid=_sentry_dsn()
-    if sentryid is not None:
+    if sentryid:   # 1.0.182 (story 48) : DSN vide (fichier neutre) -> aucun import de sentry_sdk
         _sentry_init(sentryid)
 
     try:
@@ -18987,6 +19425,7 @@ def _cli_main():
                     printer(f"[ERREUR] {n}: Bkp interrompu — {type(_e).__name__}: {_e}"); _c=1
                     _sentry_capture(_e,n)   # 1.0.176 (story 39, décision de l'utilisateur) : comme l'excepthook d'un nick seul
                     bh.db.clear_priority_lock(n)   # pris avant le try/finally de backup() : jamais gardé pour les suivants
+                if _c: _release_orphan_connections()   # 1.0.182 (story 48) : nick en erreur -> connexions orphelines libérées
                 if _c>_brc: _brc=_c
             sys.exit(_brc)
     elif cmd=='prune':
@@ -19028,8 +19467,9 @@ def _cli_main():
         if _tranche: _lower_priority()   # AD-4 : nice 10 + ionice idle, hérités par borg
         # Code de sortie (1.0.145, story 8 A3) : le pire rendu par index() sur les nicks traités — 1 (erreur), 2 (borg list en échec, 1.0.175), 3 (--rebuild
         # refusé : DB_NAME partagé, espace, migration de chiffrement) ; déjà en cours, échéance ou pause : 0.
-        _irc=0; _multi=',' in nick
+        _irc=0; _multi=',' in nick; _orph=False
         for n in nick.split(','):
+            if _orph: _orph=False; _release_orphan_connections()   # 1.0.182 (story 48) : nick précédent en erreur, exception sortie
             # Résultat par nick (1.0.149, story 12 A4) : fichier <conf>-<nick>-index-last.json, lu par /access.
             _t0=_iso_now(); _mark=_print_mark()
             try:
@@ -19051,10 +19491,12 @@ def _cli_main():
                     _nick_stop_msg(_e,_mark,True)   # « [ERREUR] Type : message »
                     r=2 if isinstance(_e,(DbKeyError,DbModeError,DbTamperError,DbCodecError)) else 1
                     if not isinstance(_e,(DbKeyError,DbModeError,DbTamperError,DbCodecError,SchemaVersionError)): _sentry_capture(_e,n)
+                _clear_exc_frames(_e); _orph=True   # revue story 48 : libérées au tour suivant, hors de l'except (cadres effacés)
                 if r>_irc: _irc=r
                 continue
             bh._record_index_last(n,_t0,_mark,r)
             if isinstance(r,int) and r>_irc: _irc=r
+        if _orph: _release_orphan_connections()
         if _irc: sys.exit(_irc)
     elif cmd=='search':
         if '-f' not in options: usage(cmd)
