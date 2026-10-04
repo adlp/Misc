@@ -10,6 +10,17 @@
 
 ## gitconfig
 
+### 1.15.0 — 2026-10-04
+- Ajout de l'alias fin `syncdir = !git2git_sync`, qui appelle le nouveau script `git2git_sync` (voir ci-dessous). `git alias` documente la nouvelle entree. `git2git_sync` doit etre dans le `PATH` (meme principe que `git-deploy`).
+
+## git2git_sync
+
+### 1.0.0 — 2026-10-04
+- Creation : `git syncdir <repoSrc> <cheminSrc> <repoDst> <cheminDst> <message>` synchronise (rsync --delete) un chemin d'un depot vers un chemin d'un autre depot, sans toucher au reste de la destination. Id de commit non conserves (contrairement a `git mirror`). Clone source `--depth 1` + destination complete, remplace la cible (rm+cp pour un repertoire, cp simple pour un fichier), `git add -A` + commit + push, rien si identique.
+- Rejouable sans etat : chaque appel repart de HEAD courant des deux depots, donc fonctionne que la source ait evolue, que la destination ait evolue ailleurs, ou les deux.
+- Implemente en script standalone plutot qu'en alias inline (coherent avec `git-deploy`) : deux clones + branchement fichier/repertoire + commit/push, trop pour un alias `!` lisible.
+- Testes : sync initial repertoire, evolution concurrente source (ajout+suppression) et destination (contenu non lie, preserve), idempotence, fichier unique, source introuvable, mauvais nombre d'arguments.
+
 ### 1.14.1 — 2026-10-02
 - `deploy = !git-deploy` au lieu du chemin absolu `!/home/claudia/Projets/Misc/Git/git-deploy`. `git-deploy` doit desormais etre dans le `PATH` (symlink ou ajout au `PATH`) ; sinon `git deploy` echoue proprement (`cannot run git-deploy: No such file or directory`).
 

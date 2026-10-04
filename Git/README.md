@@ -10,8 +10,9 @@ Scripts utilitaires pour manipuler des depots git.
 | `git2git_mirror` | 1.1.0 | Synchronise l'integralite d'un depot git (branches, tags, refs) vers un autre, avec option `--dry-run` ; ou extrait un sous-repertoire (`--subdir`) pour l'exposer comme depot independant |
 | `gitar` | 1.0.0 | Pousse une archive tar dans un depot git |
 | `gitoune` | 1.0.0 | Pousse un fichier dans un depot git |
-| `gitconfig` | 1.14.1 | Configuration git personnelle (`~/.gitconfig`) : alias, pager, diff tool, identite pro/perso par repo, mirroring inline (`git mirror`), depot d'archive tar depuis fichier ou stdin (`git tar`), telechargement fichier/repertoire a HEAD ou a un commit precis (`git figet [-G <commit>]`), depot d'un fichier unique depuis fichier ou stdin (`git fiput`), historique d'un fichier distant (`git filog`), diff fichier local vs depot (`git fidiff [-G <commit>]`), liste des alias avec doc (`git alias`), deploiement HEAD vers des urls ssh (`git deploy`) |
+| `gitconfig` | 1.15.0 | Configuration git personnelle (`~/.gitconfig`) : alias, pager, diff tool, identite pro/perso par repo, mirroring inline (`git mirror`), depot d'archive tar depuis fichier ou stdin (`git tar`), telechargement fichier/repertoire a HEAD ou a un commit precis (`git figet [-G <commit>]`), depot d'un fichier unique depuis fichier ou stdin (`git fiput`), historique d'un fichier distant (`git filog`), diff fichier local vs depot (`git fidiff [-G <commit>]`), liste des alias avec doc (`git alias`), deploiement HEAD vers des urls ssh (`git deploy`), rsync d'un chemin d'un depot vers un chemin d'un autre depot (`git syncdir`) |
 | `git-deploy` | 1.3.0 | Script appele par l'alias `git deploy` : deploie le contenu commite (HEAD) de lots nommes (`[src "lot"]`) vers leurs destinations ssh/scp par type de deploiement (optionnel, defaut via `[default]`), selon un `.deploy.conf` (non tracke) pose a cote du sous-projet |
+| `git2git_sync` | 1.0.0 | Script appele par l'alias `git syncdir` : synchronise (rsync --delete) un chemin (fichier/repertoire) d'un depot vers un chemin d'un autre depot, sans toucher au reste de la destination ; rejouable sans etat, id de commit non conserves |
 
 Voir `CHANGELOG.md` pour l'historique des versions.
 
@@ -80,3 +81,16 @@ Fonctionnement :
 - Une destination en echec (host injoignable, syntaxe invalide, lot non defini) n'empeche pas les autres d'etre tentees ; code de sortie non nul si au moins une a echoue (y compris si une source du lot n'existe pas dans HEAD, detecte grace a `pipefail`).
 
 Exemple pret a copier : `Git/.deploy.conf.example` (a copier en `.deploy.conf` puis adapter).
+
+## `git syncdir` — rsync entre deux depots git
+
+`git syncdir <repoSrc> <cheminSrc> <repoDst> <cheminDst> <message>` synchronise (comme `rsync --delete`) un chemin (fichier ou repertoire) du depot `<repoSrc>` vers un chemin du depot `<repoDst>`, sans toucher au reste de `<repoDst>`. Contrairement a `git mirror`/`git2git_mirror --subdir`, les id de commit ne sont pas conserves et la destination garde sa propre vie (autre contenu, autre historique) : seul le chemin cible est remplace.
+
+Implemente en script standalone (`git2git_sync`, appele par l'alias fin `syncdir = !git2git_sync`), **prerequis** : doit etre dans le `PATH` (meme principe que `git-deploy`).
+
+Fonctionnement :
+- Clone la source (`--depth 1`, juste HEAD) et la destination (clone complet, necessaire pour pousser).
+- Si `<cheminSrc>` est un repertoire : vide `<cheminDst>` puis copie le contenu de `<cheminSrc>` (`cp -a`) — equivalent a `rsync --delete`. Si c'est un fichier : copie simple vers `<cheminDst>` (cree les repertoires intermediaires).
+- `git add -A` sur `<cheminDst>`, commit avec `<message>`, push. Rien n'est commite si le resultat est identique.
+- **Rejouable sans etat** : chaque appel repart de l'etat HEAD courant des deux depots (pas de curseur/checkpoint a maintenir). Fonctionne que la source ait evolue, que la destination ait evolue ailleurs (hors cible), ou les deux — notre commit s'empile naturellement sur le HEAD courant de la destination au moment du clone.
+- Si la destination a avance entre le clone et le push (course avec un autre processus), `git push` echoue normalement (pas de retry/rebase automatique) : relancer la commande.

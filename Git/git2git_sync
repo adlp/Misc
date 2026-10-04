@@ -1,0 +1,99 @@
+#!/bin/bash
+
+#/*
+#* git2git_sync synchronise un sous-repertoire (ou fichier) d'un depot git
+#* vers un sous-repertoire precis d'un autre depot, a la maniere d'un rsync
+#* (le reste du depot destination n'est pas touche). Les id de commit ne
+#* sont pas conserves : chaque appel clone l'etat courant des deux depots,
+#* remplace la cible dans le clone destination, commit et pousse. Rejouable
+#* sans etat : chaque run repart de HEAD des deux cotes, donc fonctionne que
+#* la source ait evolue, que la destination ait evolue ailleurs (en dehors
+#* de la cible), ou les deux.
+#* Copyright (C) 2026 Antoine DELAPORTE
+#*
+#* This program is free software: you can redistribute it and/or modify
+#* it under the terms of the GNU General Public License as published by
+#* the Free Software Foundation, either version 3 of the License, or
+#* (at your option) any later version.
+#*
+#* This program is distributed in the hope that it will be useful,
+#* but WITHOUT ANY WARRANTY; without even the implied warranty of
+#* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#* GNU General Public License for more details.
+#*
+#* You should have received a copy of the GNU General Public License
+#* along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#*/
+
+set -u
+set -o pipefail
+
+usage() {
+    cat <<EOF
+Usage : git2git_sync <repoSrc> <cheminSrc> <repoDst> <cheminDst> <message>
+
+Synchronise (comme rsync --delete) <cheminSrc> (fichier ou repertoire, HEAD)
+du depot <repoSrc> vers <cheminDst> dans le depot <repoDst>, commit avec
+<message> et pousse. Le reste de <repoDst> n'est pas touche.
+
+Rejouable sans etat : chaque appel repart de l'etat HEAD courant des deux
+depots. Fonctionne quelle que soit l'evolution de la source et/ou de la
+destination (hors cible) depuis le dernier appel. Rien n'est commite si le
+resultat est identique au commit precedent.
+EOF
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    usage
+    exit 0
+fi
+
+if [ $# -ne 5 ]; then
+    usage >&2
+    exit 1
+fi
+
+cd "${GIT_PREFIX:-.}" || exit 1
+
+repoSrc=$1
+cheminSrc=$2
+repoDst=$3
+cheminDst=$4
+msg=$5
+
+tmp=$(mktemp -d) || exit 1
+trap 'rm -rf "$tmp"' EXIT
+
+echo "Clonage de la source ${repoSrc}..."
+git clone --quiet --depth 1 "$repoSrc" "$tmp/src" || exit 1
+
+src_path="$tmp/src/$cheminSrc"
+if [ ! -e "$src_path" ]; then
+    echo "Source introuvable dans ${repoSrc} (HEAD) : $cheminSrc" >&2
+    exit 1
+fi
+
+echo "Clonage de la destination ${repoDst}..."
+git clone --quiet "$repoDst" "$tmp/dst" || exit 1
+
+dst_path="$tmp/dst/$cheminDst"
+
+if [ -d "$src_path" ]; then
+    rm -rf -- "$dst_path"
+    mkdir -p -- "$dst_path"
+    cp -a -- "$src_path"/. "$dst_path"/ || exit 1
+else
+    mkdir -p -- "$(dirname -- "$dst_path")"
+    cp -- "$src_path" "$dst_path" || exit 1
+fi
+
+cd "$tmp/dst" || exit 1
+git add -A -- "$cheminDst"
+if git diff --cached --quiet -- "$cheminDst"; then
+    echo "Rien a committer."
+    exit 0
+fi
+
+git commit -q -m "$msg" || exit 1
+echo "Synchronisation vers ${repoDst}..."
+git push origin HEAD
