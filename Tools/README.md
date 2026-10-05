@@ -4,7 +4,7 @@ Petits outils d'administration indépendants, sous licence GPL v3.
 
 | Outil | Langage | Version | Description |
 |---|---|---|---|
-| `checkssl` | bash | 1.4 | État d'un certificat TLS (serveur ou fichier) et jours restants avant expiration |
+| `checkssl` | bash | 1.5 | État d'un certificat TLS (serveur ou fichier) et jours restants avant expiration |
 | `cronMutt` | Python 3 | 0.24.2 | Lance une commande (ou lit un pipe) et envoie sa sortie par mail (mutt) et/ou sur Nextcloud, selon le résultat |
 | `sleepUntil` | bash | 1.1 | Comme `at`, mais bloquant : attend une heure donnée puis lance une commande |
 | `whosshkey` | bash | 1.4 | Comme `last`, avec en plus la clef SSH utilisée pour chaque connexion |
@@ -28,10 +28,13 @@ checkssl -u <url> [-i <ip>] [-t <jours>] [-d] [-V]
 Ports par défaut : https 443, imap 143, imaps 993, pop3 110, pop3s 995, smtp 25 (MX ; `smtp://hôte:587` pour la
 soumission), smtps 465.
 
+Toutes les adresses DNS de l'hôte sont essayées dans l'ordre du système jusqu'à obtenir un certificat (un échec est
+signalé sur stderr) ; `-i` n'en essaie qu'une.
+
 Les serveurs restés en TLS 1.0 / 1.1 sont lus aussi : checkssl lit le certificat, il ne juge pas la connexion.
 
 Affiche le CN, les SAN, la date de fin, les jours restants (négatifs si le certificat a expiré) et, pour un serveur,
-la version TLS négociée, avec une ligne `ATTENTION` si elle est inférieure à TLS 1.2 (sans effet sur le code retour). Code retour : `0`
+l'IP et le port interrogés (`Serveur interrogé : 172.66.147.243 port 443`) et la version TLS négociée, avec une ligne `ATTENTION` si elle est inférieure à TLS 1.2 (sans effet sur le code retour). Code retour : `0`
 OK, `2` expiration dans `-t` jours ou moins (certificat expiré compris), `1` erreur (message sur stderr : URL sans
 protocole, fichier absent ou sans certificat PEM, serveur injoignable ou muet plus de 30 s). Dépend de `openssl` et
 `timeout` (coreutils).

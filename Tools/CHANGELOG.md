@@ -1,5 +1,13 @@
 # Changelog — Tools
 
+## checkssl 1.5 — IP du serveur interrogé — 2026-10-05
+
+- Ligne `Serveur interrogé : <IP> port <N>` pour un serveur : l'adresse qui a réellement fourni le certificat.
+- Pour la connaître, checkssl résout lui-même l'hôte (`getent ahosts`, ordre du système comme openssl) et essaie les
+  adresses une à une jusqu'à recevoir un certificat ; chaque échec est signalé sur stderr. Avec `-i`, seule cette IP.
+- Messages d'erreur plus précis : « Résolution DNS impossible pour <hôte> », et la liste des adresses essayées quand
+  aucune ne répond.
+
 ## whosshkey 1.4 — comptes d'annuaire (LDAP, SSSD) — 2026-09-30
 
 - **Comptes d'annuaire** : la liste des comptes venait de `getent passwd` sans argument, qu'un annuaire (SSSD avec
