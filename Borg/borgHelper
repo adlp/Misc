@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.182"
+Version="1.0.183"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -3711,6 +3711,68 @@ class BorgHelperDB:
         finally: conn.close()
         return dict(zip(('run_id','started_at','finished_at','result'),r)) if r else None
 
+    def previous_bkp_status(self,nick,run_id,db_path=None):
+        """1.0.183 (story 50, décisions de l'utilisateur) : Bkp PRÉCÉDENT de celui de `run_id` = dernière ligne bkp_status du nick
+        démarrée avant lui (started_at, puis ordre d'écriture) — un Bkp lancé APRÈS lui (refusé sur le verrou du dépôt) n'en est
+        jamais un ; run_id None (Bkp en attente de l'Index, sans ligne encore) : dernière ligne du nick. {run_id, started_at,
+        finished_at, result, failed} ; failed = fini en 'error' OU jamais fini et son marqueur de Bkp n'est pas vivant (tué :
+        SIGKILL, redémarrage — comme le watcher, AD-7) ; jamais fini au marqueur vivant (Bkp concurrent encore en cours, revue 2) :
+        pas en échec. Un Bkp concurrent refusé (fini en 'error') compte (décision de l'utilisateur). None : aucun précédent.
+        Lecture impossible : [WARN] dit, None (Report reste best-effort, la règle « précédent en erreur » n'est alors pas appliquée)."""
+        conn=None
+        try:
+            db_path=self._hist(nick,db_path)
+            if db_path is None: return None
+            conn=_open_db(db_path,nick=None,role='read')
+            if run_id is None:
+                r=conn.execute("SELECT run_id,started_at,finished_at,result FROM bkp_status WHERE nick=? "
+                               "ORDER BY started_at DESC, rowid DESC LIMIT 1",(nick,)).fetchone()
+            else:
+                r=conn.execute("SELECT p.run_id,p.started_at,p.finished_at,p.result FROM bkp_status p, bkp_status c "
+                               "WHERE c.nick=? AND c.run_id=? AND p.nick=c.nick AND p.run_id<>c.run_id "
+                               "AND (p.started_at<c.started_at OR (p.started_at=c.started_at AND p.rowid<c.rowid)) "
+                               "ORDER BY p.started_at DESC, p.rowid DESC LIMIT 1",(nick,run_id)).fetchone()
+            if not r: return None
+            d=dict(zip(('run_id','started_at','finished_at','result'),r))
+            d['failed']=d['result']=='error' or (d['finished_at'] is None and d['run_id'] not in self.bkp_markers(nick))
+            return d
+        except Exception as e:
+            printer(f"[WARN] {nick}: Bkp précédent illisible ({type(e).__name__}: {e}) — règle « précédent en erreur » non appliquée")
+            return None
+        finally:
+            if conn is not None: conn.close()
+
+    # 1.0.183 (story 50, revue 2) : marqueur de Bkp, un fichier par exécution « <prefix>-<nick>-bkp.lock.<run_id> » (PID, écriture
+    # atomique _set_pid_lock), posé par backup() AVANT le verrou de priorité et retiré à sa toute fin (Index de fin compris). Lie la
+    # ligne bkp_status au processus du Bkp lui-même : un autre porteur des verrous du dépôt (Index extérieur repris après un Bkp
+    # tué, Restore, Prune, Bkp d'un autre nick) n'en est jamais un. Marqueur mort (Bkp tué, PID repris : _lock_holder) retiré.
+    def _bkp_marker_base(self,nick):
+        k=re.sub(r'[^a-zA-Z0-9_-]','_',nick)
+        if k!=nick: k+='-'+hashlib.sha1(nick.encode()).hexdigest()[:8]   # deux nicks ne partagent jamais un marqueur
+        return os.path.join(self.cache_dir,f"{self.db_prefix}-{k}-bkp.lock")
+    def set_bkp_marker(self,nick,run_id): self._set_pid_lock(f"{self._bkp_marker_base(nick)}.{run_id}")
+    def clear_bkp_marker(self,nick,run_id): self._clear_pid_lock(f"{self._bkp_marker_base(nick)}.{run_id}")
+    def any_bkp_marker(self):
+        """Un marqueur de Bkp (vivant ou non) existe-t-il dans CACHE_DIR ? Test rapide avant de chercher un nick voisin."""
+        return bool(glob.glob(os.path.join(glob.escape(self.cache_dir),f"{glob.escape(self.db_prefix)}-*-bkp.lock.*")))
+    def bkp_markers(self,nick):
+        """{run_id: date d'écriture (epoch)} des marqueurs VIVANTS du nick ; un marqueur mort est retiré au passage."""
+        base=self._bkp_marker_base(nick); out={}
+        for p in glob.glob(glob.escape(base)+'.*'):
+            rid=p[len(base)+1:]
+            if not re.fullmatch(r'[0-9a-f]{32}',rid): continue   # fichier .tmp d'écriture, autre
+            if self._check_pid_lock(p):
+                try: out[rid]=os.path.getmtime(p)
+                except OSError: pass
+        return out
+    def bkp_status_known(self,nick,run_id,db_path=None):
+        """La ligne bkp_status de run_id existe-t-elle ? Base absente : False. Lecture impossible : exception (l'appelant décide)."""
+        db_path=self._hist(nick,db_path)
+        if db_path is None: return False
+        conn=_open_db(db_path,nick=None,role='read')
+        try: return conn.execute("SELECT 1 FROM bkp_status WHERE nick=? AND run_id=?",(nick,run_id)).fetchone() is not None
+        finally: conn.close()
+
     def list_pending_bkp_status(self,nick,timeout_s,db_path=None):
         """Lignes bkp_status prêtes à être réclamées par le watcher (borgHelperWWW) : terminées
         (finished_at renseigné) ou bloquées depuis plus de timeout_s secondes sans fin (AD-7).
@@ -5947,6 +6009,8 @@ class BorgHelper:
         create.extend(cfg['EXCLUDE'].split(' '))
         if 'EXCLUDE_NEXT' in list(cfg.keys()):
             create.extend(cfg['EXCLUDE_NEXT'].split(' '))
+        run_id=uuid.uuid4().hex
+        self.db.set_bkp_marker(nick,run_id)   # 1.0.183 (story 50, revue 2) : Report voit ce Bkp dès ici (« en attente de l'Index »)
         self.db.set_priority_lock(nick)
         self.db.wait_index_idle(nick)
         # bkp_status (Story 1, spec-notifications-push) : signal dédié, exclusif à backup(), écrit
@@ -5954,7 +6018,6 @@ class BorgHelper:
         # Reste À L'INTÉRIEUR du try (ensure_diff_db peut sys.exit/lever sur DB corrompue) : le
         # `finally` ci-dessous doit couvrir cette fenêtre pour toujours libérer priority.lock.
         try:
-            run_id=uuid.uuid4().hex
             bkp_status_db=self.db.get_history_db(nick)            # bkp_status vit dans history.db (1.0.139, AD-7) ; défini
                                                                   # AVANT ce qui peut échouer : le finally (filet) s'en sert
             self.db.ensure_diff_db(self.db.get_diff_db(nick),nick=nick)   # migre les mesures d'une base antérieure
@@ -6083,7 +6146,8 @@ class BorgHelper:
             # a empêché store_bkp_status_finish ci-dessus, ferme la ligne en 'error' immédiatement —
             # sans attendre le timeout AD-7 du watcher. No-op (CAS sur finished_at IS NULL) si la fin
             # normale a déjà écrit le résultat.
-            self.db.store_bkp_status_safety_net(nick,run_id,bkp_status_db)
+            try: self.db.store_bkp_status_safety_net(nick,run_id,bkp_status_db)
+            finally: self.db.clear_bkp_marker(nick,run_id)   # 1.0.183 (story 50, revue 2) : en dernier, la ligne est close
 
     def prune(self,nick,dryrun=False,debug=0):
         cfg=self.borg.cfgreaded(nick,debug=debug)
@@ -8941,6 +9005,87 @@ class BorgHelper:
         if stats_err: tcmpl[nick]['_stats_error']=True   # 1.0.179 (A92) : retiré à l'affichage, code 1
         return tcmpl,tbkps
 
+    def _bkp_live(self,nick,quiet=False):
+        """1.0.183 (story 50, demande et décisions de l'utilisateur) : Bkp VIVANT du nick — marqueur de Bkp vivant (bkp_markers :
+        le processus du Bkp lui-même, Index de fin compris) ET, soit sa ligne bkp_status ouverte et non périmée (délai
+        bkp_status_timeout), soit pas encore de ligne (Bkp en attente de l'Index, décision revue 2 : 'en_attente', début = date du
+        marqueur). Bkp tué, périmé, autre opération : None, comportement inchangé. Rend la ligne augmentée de 'depuis'
+        (« HH:MM (XhYYmin) », format de Status), 'started_iso' (UTC) et 'en_attente', et le dit sur stderr (sauf quiet) ; Report
+        (en ligne comme -o) tire alors ce nick de la base, sans borg ni attente : avant, borg info échouait sur le verrou du dépôt
+        (« Failed to create/acquire the lock », ligne ERREUR, code 2, aucun historique). Toute erreur de lecture : None (revue 2 :
+        SchemaVersionError & co restent signalées par la suite du Report, dans le try du nick)."""
+        from datetime import datetime,timezone
+        try:
+            marks=self.db.bkp_markers(nick)
+            if not marks: return None   # aucun Bkp vivant : rc (BKP_STATUS_TIMEOUT) ni base lus
+            row=self.db.get_running_bkp_status(nick,timeout_s=self.bkp_status_timeout(nick))
+            if row and row['run_id'] in marks:
+                if row.get('stale'): return None
+                st=datetime.strptime(row['started_at'],"%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc); row['en_attente']=False
+            else:
+                wait=[r for r in marks if not self.db.bkp_status_known(nick,r)]
+                if not wait: return None
+                rid=max(wait,key=marks.get)
+                st=datetime.fromtimestamp(int(marks[rid]),timezone.utc)
+                row={'run_id':rid,'started_at':st.strftime("%Y-%m-%d %H:%M:%S"),'stale':False,'en_attente':True}
+        except Exception: return None
+        row['started_iso']=st.strftime('%Y-%m-%dT%H:%M:%SZ')
+        try: row['depuis']=_bkp_running_readable(row['started_at'])
+        except (ValueError,TypeError): row['depuis']=row['started_iso']
+        if not quiet:
+            what="Bkp en attente de l'Index" if row['en_attente'] else "Bkp en cours"
+            printer(f"  {nick} : {what} depuis {row['depuis']} — rapport tiré de la base, borg non interrogé")
+        return row
+
+    def _bkp_neighbor(self,nick):
+        """1.0.183 (story 50, revue 2, décision de l'utilisateur) : Bkp vivant d'un AUTRE nick du même dépôt borg (_repo_key) —
+        borg info de ce nick buterait sur le verrou du dépôt. Rend la ligne de _bkp_live de ce voisin, 'voisin' = son nick, et le
+        dit sur stderr ; None sinon (aucun marqueur dans CACHE_DIR : rien n'est lu)."""
+        try:
+            if not self.db.any_bkp_marker(): return None
+            key=self.db._repo_key(nick); others=[n for n in (self.borg.cfgreadnicks() or '').split(',') if n and n!=nick]   # chaîne « a,b »
+        except Exception: return None
+        for o in others:
+            try:
+                if self.db._repo_key(o)!=key: continue
+            except Exception: continue
+            lv=self._bkp_live(o,quiet=True)
+            if lv:
+                lv['voisin']=o
+                printer(f"  {nick} : Bkp de {o} en cours sur le même dépôt depuis {lv['depuis']} — rapport tiré de la base, borg non interrogé")
+                return lv
+        return None
+
+    def _bkp_live_mark(self,nick,row,live,errhost,htrep,as_json):
+        """1.0.183 (story 50, décisions de l'utilisateur) : ligne d'un nick dont le Bkp tourne — colonne « reste » gardée
+        (espace libre, « ⚠ dépôt absent ») et suffixée « ⏳ Bkp en cours depuis … » (« en attente de l'Index » avant sa ligne
+        bkp_status ; JSON : champ bkp_en_cours) ; alerte (nick ***, code 1) si le Bkp PRÉCÉDENT (previous_bkp_status) a échoué ou
+        n'a jamais fini. Voisin (live['voisin'], Bkp d'un autre nick du dépôt) : « ⏳ Bkp de <voisin> en cours sur le dépôt
+        depuis … », JSON bkp_voisin, jamais d'alerte. MAX_AGE_BKP et « aucune archive » restent la règle de l'appelant (code 1).
+        Rend 0 ou 1."""
+        cur=row.get('reste')
+        if live.get('voisin'):
+            mention=f"⏳ Bkp de {live['voisin']} en cours sur le dépôt depuis {live['depuis']}"
+            row['reste']=f"{cur} — {mention}" if cur not in (None,'') else mention
+            if as_json: row['bkp_voisin']={'nick':live['voisin'],'started_at':live['started_iso'],'depuis':live['depuis'],'en_attente':live['en_attente']}
+            return 0
+        prev=self.db.previous_bkp_status(nick,None if live['en_attente'] else live['run_id'])
+        failed=bool(prev and prev['failed'])
+        what="Bkp en attente de l'Index" if live['en_attente'] else "Bkp en cours"
+        mention=f"⏳ {what} depuis {live['depuis']}"+(" — Bkp précédent en erreur" if failed else '')
+        row['reste']=f"{cur} — {mention}" if cur not in (None,'') else mention
+        if as_json: row['bkp_en_cours']={'started_at':live['started_iso'],'depuis':live['depuis'],'precedent_en_erreur':failed,'en_attente':live['en_attente']}
+        if not failed: return 0
+        if htrep:
+            if nick not in errhost: errhost.append(nick)
+        elif not str(row.get('nom','')).startswith('*'): row['nom']=f"***{nick}"
+        return 1
+
+    def _report_msg_row(self,nick,tcmpl,htrep):
+        """Ligne d'un nick sans archive indexée (prep_report_from_db -> '_msg') : la même pour report_offline et report pendant
+        un Bkp vivant (revue story 50 : un seul exemplaire)."""
+        return tcmpl[nick] if htrep else {'nom':f"*** {nick}",'duree':tcmpl[nick]['_msg'],'depuis':'','derniere':'','taille':'','recuperable':'','reste':'','modifications':''}
+
     def report_offline(self,nicks,htrep=False,debug=0,maxp=None,as_json=False):
         reshos={}; resbck={}; reshosto={}; errcode=0; errhost=[]
         for i in ['duree','derniere','taille','recuperable']: reshosto[i]=0
@@ -8948,6 +9093,7 @@ class BorgHelper:
         for nick in nicks.split(','):
             if _orph: _orph=False; _release_orphan_connections()   # 1.0.182 (story 48) : nick précédent en erreur -> connexions orphelines libérées
             cfg=self.borg.cfgreaded(nick,debug=debug)
+            live=self._bkp_live(nick) or self._bkp_neighbor(nick)   # 1.0.183 (story 50) : jumelle de report()
             mk=_print_mark()
             try:
                 (tcmpl,tbkps)=self.prep_report_from_db(nick,maxp=maxp)
@@ -8962,11 +9108,13 @@ class BorgHelper:
                     reshos[nick]={'nom':nick,'duree':'—','depuis':'—','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {_html_esc(err_msg)}"}
                 else:
                     reshos[nick]={'nom':f"*** {nick}",'duree':'—','depuis':'—','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {err_msg}"}
+                if live: self._bkp_live_mark(nick,reshos[nick],live,errhost,htrep,as_json)   # 1.0.183 (revue) : base illisible pendant le Bkp, dit
                 resbck[nick]={}; continue
             if '_msg' in tcmpl.get(nick,{}):
                 errcode=max(errcode,1)   # 1.0.171 (revue story 34) : jamais un 2 d'un nick précédent écrasé
                 if htrep: errhost.append(nick)
-                reshos[nick]=tcmpl[nick] if htrep else {'nom':f"*** {nick}",'duree':tcmpl[nick]['_msg'],'depuis':'','derniere':'','taille':'','recuperable':'','reste':'','modifications':''}
+                reshos[nick]=self._report_msg_row(nick,tcmpl,htrep)
+                if live: self._bkp_live_mark(nick,reshos[nick],live,errhost,htrep,as_json)   # 1.0.183 : aucune archive = déjà alerte, code 1
                 resbck[nick]={}; continue
             maxage=25
             if "MAX_AGE_BKP" in cfg: maxage=float(cfg["MAX_AGE_BKP"])
@@ -8995,6 +9143,7 @@ class BorgHelper:
                     tbkps[i][j]=(None if as_json else '—') if tbkps[i][j] is None else convert_octets_readable(tbkps[i][j])   # A75 : inconnu
                 if 'duration' in tbkps[i].keys():
                     tbkps[i]['duration']=f"{tbkps[i]['duration']:.2f} min"
+            if live: errcode=max(errcode,self._bkp_live_mark(nick,tcmpl[nick],live,errhost,htrep,as_json))   # 1.0.183 (story 50)
             reshos[nick]=tcmpl[nick]; resbck[nick]=tbkps
         if _orph: _release_orphan_connections()
         for i in ['derniere','taille','recuperable']: reshosto[i]=convert_octets_readable(reshosto[i])
@@ -9034,16 +9183,18 @@ class BorgHelper:
         for nick in nicks.split(','):
             if _orph: _orph=False; _release_orphan_connections()   # 1.0.182 (story 48) : nick précédent en erreur -> connexions orphelines libérées
             cfg=self.borg.cfgreaded(nick,debug=debug)
-            if self.db.check_priority_lock(nick):
-                printer(f"  {nick}: Bkp/Restore en cours — borg info sera mis en attente du verrou")
-            self.db.set_report_running_lock(nick)
-            self.db.wait_index_idle(nick,timeout=30)
+            live=self._bkp_live(nick) or self._bkp_neighbor(nick)   # 1.0.183 (story 50) : Bkp vivant (ou du nick voisin) -> base seule, ni borg ni attente
+            if not live:
+                if self.db.check_priority_lock(nick):
+                    printer(f"  {nick}: Bkp/Restore en cours — borg info sera mis en attente du verrou")
+                self.db.set_report_running_lock(nick)
+                self.db.wait_index_idle(nick,timeout=30)
             mk=_print_mark()
             try:
-                (tcmpl,tbkps)=self.prep_report(nick,debug=debug,maxp=maxp)
+                (tcmpl,tbkps)=self.prep_report_from_db(nick,maxp=maxp) if live else self.prep_report(nick,debug=debug,maxp=maxp)
             except (Exception,SystemExit) as e:
                 _orph=True   # 1.0.182 (story 48) : libérées au nick suivant ou après la boucle, hors de l'except
-                self.db.clear_report_running_lock(nick)
+                if not live: self.db.clear_report_running_lock(nick)
                 if isinstance(e,SystemExit) and e.code==130: raise   # Ctrl-C pendant borg (boex -> sys.exit(130)) : arrêt
                 if isinstance(e,SystemExit):   # 1.0.166 (story 29) : jumelle de report_offline (bases, config)
                     errcode=2; err_msg=_stop_text(e,mk)   # 1.0.168 (A51) : message réel, déjà affiché (pas de doublon)
@@ -9055,8 +9206,15 @@ class BorgHelper:
                     reshos[nick]={'nom':nick,'duree':'—','depuis':'ERREUR','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {_html_esc(err_msg)}"}
                 else:
                     reshos[nick]={'nom':f"*** ERREUR {nick}",'duree':'—','depuis':'ERREUR','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {err_msg}"}
+                if live: self._bkp_live_mark(nick,reshos[nick],live,errhost,htrep,as_json)   # 1.0.183 (revue) : base illisible pendant le Bkp, dit
                 resbck[nick]={}; continue
-            self.db.clear_report_running_lock(nick)
+            if not live: self.db.clear_report_running_lock(nick)
+            if live and '_msg' in tcmpl.get(nick,{}):   # 1.0.183 : aucune archive indexée (base) -> alerte, code 1 (comme -o)
+                errcode=max(errcode,1)
+                if htrep: errhost.append(nick)
+                reshos[nick]=self._report_msg_row(nick,tcmpl,htrep)
+                self._bkp_live_mark(nick,reshos[nick],live,errhost,htrep,as_json)
+                resbck[nick]={}; continue
             if tcmpl[nick].get('duree')==-1:
                 # dépôt vide (c==0) : aucune archive borg → alerte systématique
                 errcode=max(errcode,1)
@@ -9095,6 +9253,7 @@ class BorgHelper:
                     tbkps[i][j]=(None if as_json else '—') if tbkps[i][j] is None else convert_octets_readable(tbkps[i][j])   # A75 : inconnu
                 if 'duration' in tbkps[i].keys():
                     tbkps[i]['duration']=f"{tbkps[i]['duration']:.2f} min"
+            if live: errcode=max(errcode,self._bkp_live_mark(nick,tcmpl[nick],live,errhost,htrep,as_json))   # 1.0.183 (story 50)
             reshos[nick]=tcmpl[nick]; resbck[nick]=tbkps
         if _orph: _release_orphan_connections()
         for i in ['derniere','taille','recuperable']: reshosto[i]=convert_octets_readable(reshosto[i])
@@ -14556,6 +14715,191 @@ fail()
             if bad: print(f"  {bad}")
             return not bad
         check("Index et Bkp multi-nicks : connexion orpheline du nick en erreur libérée au suivant, Sentry qui garde l'exception (comportement, 1.0.182)",_multi_orphans)
+        def _report_bkp_live():
+            """1.0.183 (story 50, demande et décisions de l'utilisateur, revues 1 et 2) — Report pendant un Bkp VIVANT : marqueur de Bkp
+            (« <prefix>-<nick>-bkp.lock.<run_id> ») au PID d'un enfant `sleep` vivant + ligne bkp_status ouverte non périmée, ou pas encore
+            de ligne (Bkp en attente de l'Index) ; borg piégé (boex lève « borg appelé »). rl1 précédent réussi (+ Bkp concurrent refusé
+            de même started_at, rowid supérieur ; + verrous de priorité et d'Index tenus : aucune attente) -> 0 ; rl2 précédent en erreur
+            (même started_at, rowid inférieur) -> 1 ; rl3 MAX_AGE_BKP -> 1 ; rl4 aucune archive -> 1 ; rl5 Bkp tué (marqueur et verrou
+            de priorité d'un PID mort) -> borg, marqueur retiré ; rl6 ligne périmée, marqueur vivant -> borg ; rl7 marqueur mort + verrou
+            de priorité d'un processus vivant démarré AVANT la ligne (Restore, Index repris) -> borg ; rl8 Index de fin (marqueur + verrou
+            d'Index seul) -> vu ; rl9 dépôt absent -> 2 + mention ; rl10 précédent tué -> 1 ; rl11 précédent jamais fini au marqueur
+            vivant -> 0 ; rl12/rl13 en attente de l'Index (dernière ligne réussie/en erreur) -> 0/1 ; rl14 verrou de priorité sans Bkp,
+            BKP_STATUS_TIMEOUT invalide -> borg, aucun [WARN] ; rl16 voisin de rl15 (même dépôt) -> base, « Bkp de rl15 », 0 ; rl17
+            diff.db corrompue pendant le Bkp -> 2, ⚠ + mention ; rl18 diff.db de schéma plus récent -> 2, les autres nicks rendus.
+            Matrice jouée sur report ET report_offline (jumelles) ; JSON exact (started_at, depuis) ; texte, HTML, multi-nicks ;
+            JSON de -o = JSON en ligne ; précédent illisible -> [WARN], None."""
+            from datetime import datetime,timedelta,timezone
+            d=os.path.join(tmp,'rbl50'); shutil.rmtree(d,ignore_errors=True); os.makedirs(d); rc=os.path.join(d,'rc')
+            nk=tuple(f'rl{i}' for i in range(1,19))
+            repo=lambda n: os.path.join(d,'r-'+('rl15' if n=='rl16' else n))
+            for n in nk+('rlb','rlx'):
+                if n not in ('rl9','rl16'): os.makedirs(repo(n))
+            extra={'rl3':"MAX_AGE_BKP=1\n",'rl6':"BKP_STATUS_TIMEOUT=60\n",'rl14':"BKP_STATUS_TIMEOUT=abc\n"}
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nBORG_PASSPHRASE=pw\nSER_NAME=h\nSER_LOGIN=x\nGLOB_ARCH=*\n"
+                        f"BORG_ARCHNAME=t\nEXCLUDE=--exclude-caches\nDB_ENCRYPT=false\nMAX_AGE_BKP=1000000\n\n"
+                        +''.join(f"[{n}]\nBORG_REPO={repo(n)}\n"+extra.get(n,'')+"\n" for n in nk+('rlb','rlx')))
+            os.chmod(rc,0o600)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            recent=(datetime.now()-timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%S.000000')
+            R={'prec':'1'.rjust(32,'0'),'cours':'2'.rjust(32,'0'),'conc':'3'.rjust(32,'0'),'attente':'4'.rjust(32,'0')}
+            child=_rb_popen(['sleep','120'])   # processus du « Bkp » : démarré AVANT les lignes et les marqueurs
+            dead=subprocess.Popen(['true']); dead.wait(); time.sleep(1.2)   # PID d'un Bkp tué
+            res={}; orig=b.borg.boex
+            def mark(n,rid,pid):
+                with open(f"{b.db._bkp_marker_base(n)}.{rid}",'w') as f: f.write(str(pid))
+            try:
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                    for n in nk:
+                        p=b.db.get_diff_db(n); b.db.ensure_diff_db(p)
+                        if n!='rl4':
+                            c=sqlite3.connect(p,isolation_level=None)
+                            c.execute("INSERT INTO archive_stats(nick,archive,archive_date,duration,original_size,compressed_size,"
+                                      "deduplicated_size,nfiles) VALUES(?,?,?,?,?,?,?,?)",
+                                      (n,f'{n}-a1','2026-01-01T10:00:00.000000' if n=='rl3' else recent,60,10,10,10,1))
+                            c.close()
+                        if n=='rl16': continue   # voisin : aucune ligne bkp_status
+                        h=b.db.get_history_db(n)
+                        b.db.store_bkp_status_start(n,R['prec'],db_path=h)
+                        if n not in ('rl10','rl11'): b.db.store_bkp_status_finish(n,R['prec'],'error' if n in ('rl2','rl13') else 'success',db_path=h)
+                        if n not in ('rl12','rl13'): b.db.store_bkp_status_start(n,R['cours'],db_path=h)
+                        if n=='rl14': b.db.store_bkp_status_finish(n,R['cours'],'success',db_path=h)
+                        if n=='rl1': b.db.store_bkp_status_start(n,R['conc'],db_path=h); b.db.store_bkp_status_finish(n,R['conc'],'error',db_path=h)
+                        c=sqlite3.connect(h,isolation_level=None)
+                        if n=='rl2': c.execute("UPDATE bkp_status SET started_at=(SELECT started_at FROM bkp_status WHERE nick=? AND run_id=?) "
+                                               "WHERE nick=? AND run_id=?",(n,R['cours'],n,R['prec']))
+                        else: c.execute("UPDATE bkp_status SET started_at=datetime('now','-1 hour') WHERE nick=? AND run_id=?",(n,R['prec']))
+                        if n=='rl1': c.execute("UPDATE bkp_status SET started_at=(SELECT started_at FROM bkp_status WHERE nick=? AND run_id=?) "
+                                               "WHERE nick=? AND run_id=?",(n,R['cours'],n,R['conc']))
+                        if n=='rl6': c.execute("UPDATE bkp_status SET started_at=datetime('now','-120 seconds') WHERE nick=? AND run_id=?",(n,R['cours']))
+                        c.close()
+                    cours1=sqlite3.connect(b.db.get_history_db('rl1')).execute("SELECT started_at FROM bkp_status WHERE nick='rl1' AND run_id=?",(R['cours'],)).fetchone()[0]
+                    p17=b.db.get_diff_db('rl17'); raw=open(p17,'rb').read()
+                    with open(p17,'wb') as f: f.write(raw[:100]+b'\x5a'*(len(raw)-100))   # pages illisibles
+                    c=sqlite3.connect(b.db.get_diff_db('rl18'),isolation_level=None)
+                    c.execute("UPDATE db_meta SET value=? WHERE key='schema_version'",(str(DIFF_DB_SCHEMA_VERSION+1),)); c.close()
+                for n in ('rl1','rl2','rl3','rl4','rl6','rl8','rl9','rl10','rl11','rl15','rl17','rl18'): mark(n,R['cours'],child.pid)
+                mark('rl11',R['prec'],child.pid)
+                for n in ('rl12','rl13'): mark(n,R['attente'],child.pid)
+                for n in ('rl5','rl7'): mark(n,R['cours'],dead.pid)
+                m12=time.time()-40; os.utime(f"{b.db._bkp_marker_base('rl12')}.{R['attente']}",(m12,m12))   # début = date du marqueur, pas l'heure du Report (< 60 s : PID repris sinon)
+                with open(f"{b.db._bkp_marker_base('rl14')}.{R['attente']}.{child.pid}.tmp",'w') as f: f.write(str(child.pid))   # écriture interrompue : jamais un marqueur
+                for n,pid in (('rl1',child.pid),('rl5',dead.pid),('rl7',child.pid),('rl14',child.pid)):
+                    with open(b.db._priority_holder_path(n,pid=pid),'w') as f: f.write(str(pid))
+                for n in ('rl1','rl8'):
+                    with open(b.db._index_running_lock_path(n),'w') as f: f.write(str(child.pid))
+                b.borg.boex=lambda *a,**k: (_ for _ in ()).throw(RuntimeError('borg appelé'))
+                def run(fn,*a,**k):
+                    o,e=io.StringIO(),io.StringIO(); t0=time.monotonic()
+                    with contextlib.redirect_stdout(o),contextlib.redirect_stderr(e):
+                        try: code=fn(*a,**k)
+                        except (Exception,SystemExit) as x: code=f"{type(x).__name__}: {x}"
+                    return code,o.getvalue(),e.getvalue(),time.monotonic()-t0
+                def js(o):
+                    try: return json.loads(o)
+                    except ValueError: return {}
+                def row(o,n): return (js(o).get('summary') or {}).get(n) or {}
+                iso=lambda t: t.replace(' ','T')+'Z'
+                for fn,F in ((b.report,'Report'),(b.report_offline,'Report -o')):
+                    on=fn==b.report
+                    dep=_bkp_running_readable(cours1); code,o,e,dt=run(fn,'rl1',as_json=True); r1=row(o,'rl1'); bk=r1.get('bkp_en_cours') or {}
+                    dep=(dep,_bkp_running_readable(cours1))   # minute qui change pendant l'appel : l'une ou l'autre
+                    res[f'{F} rl1 : 0, reste gardé + mention, JSON exact, historique, stderr, sans attente']=(code==0
+                        and ' — ⏳ Bkp en cours depuis' in r1.get('reste','') and not r1.get('reste','').startswith('⏳')
+                        and bk.get('precedent_en_erreur') is False and bk.get('en_attente') is False and bk.get('started_at')==iso(cours1)
+                        and bk.get('depuis') in dep and re.fullmatch(r'\d{2}:\d{2} \(\d+h\d{2}min\)',bk.get('depuis') or '')
+                        and 'rl1-a1' in json.dumps((js(o).get('backups') or {}).get('rl1')) and 'rl1 : Bkp en cours depuis' in e
+                        and 'rapport tiré de la base, borg non interrogé' in e and 'borg appelé' not in o+e and dt<10,code,r1,e[-200:],round(dt,1))
+                    code,o,e,dt=run(fn,'rl1')
+                    res[f'{F} rl1 texte : mention, ligne stderr']=(code==0 and '⏳ Bkp en cours depuis' in o and 'ERREUR' not in o and 'rl1 : Bkp en cours' in e,code,o[-300:])
+                    code,o,e,dt=run(fn,'rl2',as_json=True); r=row(o,'rl2')
+                    res[f'{F} rl2 précédent en erreur (même started_at) : 1, ***']=(code==1 and r.get('nom')=='***rl2' and r.get('reste','').endswith('— Bkp précédent en erreur')
+                        and (r.get('bkp_en_cours') or {}).get('precedent_en_erreur') is True,code,r)
+                    code,o,e,dt=run(fn,'rl3',as_json=True); r=row(o,'rl3')
+                    res[f'{F} rl3 MAX_AGE_BKP : 1']=(code==1 and str(r.get('nom','')).startswith('***') and '⏳ Bkp en cours' in r.get('reste','') and 'précédent' not in r.get('reste',''),code,r)
+                    code,o,e,dt=run(fn,'rl4',as_json=True); r=row(o,'rl4')
+                    res[f'{F} rl4 aucune archive : 1, mention']=(code==1 and r.get('nom')=='*** rl4' and r.get('reste','').startswith('⏳ Bkp en cours')
+                        and 'bkp_en_cours' in r,code,r)
+                    for n,why in (('rl5','Bkp tué'),('rl6','ligne périmée'),('rl7','verrou d\'un autre processus antérieur, marqueur mort')):
+                        code,o,e,dt=run(fn,n,as_json=True); r=row(o,n)
+                        ok=(code==2 and 'borg appelé' in r.get('reste','')) if on else (code==0 and r.get('nom')==n)
+                        res[f'{F} {n} {why} : comme avant']=(ok and '⏳' not in r.get('reste','') and 'Bkp en cours' not in e and 'bkp_en_cours' not in r,code,r,e[-200:])
+                    res[f'{F} rl5 : marqueur mort retiré']=(not glob.glob(glob.escape(b.db._bkp_marker_base('rl5'))+'.*'),)
+                    code,o,e,dt=run(fn,'rl8',as_json=True); r=row(o,'rl8')
+                    res[f'{F} rl8 Index de fin : vu, sans attente']=(code==0 and '⏳ Bkp en cours depuis' in r.get('reste','') and dt<10,code,r,round(dt,1))
+                    code,o,e,dt=run(fn,'rl9',as_json=True); r=row(o,'rl9')
+                    res[f'{F} rl9 dépôt absent : 2, ⚠ gardé + mention']=(code==2 and r.get('reste','').startswith('⚠ dépôt absent — ⏳ Bkp en cours'),code,r)
+                    code,o,e,dt=run(fn,'rl10',as_json=True); r=row(o,'rl10')
+                    res[f'{F} rl10 précédent tué : 1']=(code==1 and r.get('reste','').endswith('— Bkp précédent en erreur'),code,r)
+                    code,o,e,dt=run(fn,'rl11',as_json=True); r=row(o,'rl11')
+                    res[f'{F} rl11 précédent jamais fini, marqueur vivant : 0']=(code==0 and '⏳ Bkp en cours' in r.get('reste','') and 'précédent' not in r.get('reste','')
+                        and (r.get('bkp_en_cours') or {}).get('precedent_en_erreur') is False,code,r)
+                    code,o,e,dt=run(fn,'rl12',as_json=True); r=row(o,'rl12'); bk=r.get('bkp_en_cours') or {}
+                    st12=datetime.fromtimestamp(int(m12),timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                    res[f'{F} rl12 en attente de l\'Index : 0, mention, en_attente, début = marqueur']=(code==0
+                        and " — ⏳ Bkp en attente de l'Index depuis" in r.get('reste','') and bk.get('en_attente') is True and bk.get('started_at')==st12
+                        and bk.get('precedent_en_erreur') is False and "rl12 : Bkp en attente de l'Index depuis" in e and 'borg appelé' not in o+e,code,r,st12,e[-200:])
+                    code,o,e,dt=run(fn,'rl13',as_json=True); r=row(o,'rl13')
+                    res[f'{F} rl13 en attente, dernière ligne en erreur : 1']=(code==1 and r.get('nom')=='***rl13' and "en attente de l'Index" in r.get('reste','')
+                        and r.get('reste','').endswith('— Bkp précédent en erreur'),code,r)
+                    code,o,e,dt=run(fn,'rl14',as_json=True); r=row(o,'rl14')
+                    ok=(code==2 and 'borg appelé' in r.get('reste','') and 'Bkp/Restore en cours — borg info sera mis en attente du verrou' in e) if on else code==0
+                    res[f'{F} rl14 verrou sans Bkp, timeout invalide : comme avant, aucun [WARN] du délai']=(ok and '⏳' not in r.get('reste','') and 'BKP_STATUS_TIMEOUT' not in e,code,r,e[-300:])
+                    code,o,e,dt=run(fn,'rl16',as_json=True); r=row(o,'rl16'); bv=r.get('bkp_voisin') or {}
+                    res[f'{F} rl16 voisin de rl15 : base, mention, bkp_voisin, 0']=(code==0
+                        and r.get('reste','').endswith(' — ⏳ Bkp de rl15 en cours sur le dépôt depuis '+str(bv.get('depuis'))) and bv.get('nick')=='rl15'
+                        and bv.get('en_attente') is False and str(bv.get('started_at','')).endswith('Z') and 'bkp_en_cours' not in r
+                        and 'rl16 : Bkp de rl15 en cours sur le même dépôt depuis' in e and 'rl15 : Bkp en cours' not in e and 'borg appelé' not in o+e,code,r,e[-300:])
+                    code,o,e,dt=run(fn,'rl17',as_json=True); r=row(o,'rl17')
+                    res[f'{F} rl17 base illisible pendant le Bkp : 2, ⚠ + mention']=(code==2 and r.get('reste','').startswith('⚠') and '— ⏳ Bkp en cours' in r.get('reste',''),code,r)
+                    code,o,e,dt=run(fn,'rl18,rl1',as_json=True); r=row(o,'rl18')
+                    res[f'{F} rl18 schéma plus récent : 2, autres nicks rendus']=(code==2 and r.get('reste','').startswith('⚠') and '⏳ Bkp en cours' in row(o,'rl1').get('reste',''),code,r)
+                    code,o,e,dt=run(fn,'rl2',htrep=True)
+                    res[f'{F} HTML rl2 : mention, nick en rouge, 1']=(code==1 and '⏳ Bkp en cours depuis' in o and 'FF6161' in o,code,o[-200:])
+                    code,o,e,dt=run(fn,'rl1',htrep=True)
+                    res[f'{F} HTML rl1 : mention, 0']=(code==0 and '⏳ Bkp en cours depuis' in o and 'FF6161' not in o,code)
+                code,o,e,dt=run(b.report,'rl1,rl5',as_json=True)
+                res['multi-nicks rl1,rl5 : rl1 de la base, rl5 par borg']=(code==2 and '⏳' in row(o,'rl1').get('reste','') and 'borg appelé' in row(o,'rl5').get('reste',''),code)
+                _,o1,_,_=run(b.report,'rl1,rl2',as_json=True); _,o2,_,_=run(b.report_offline,'rl1,rl2',as_json=True)
+                def _sansheure(x):   # « depuis » (âge à 0,01 h = 36 s ; minute du Bkp) et chiffres de « reste » (espace libre, durée de la
+                    if isinstance(x,dict):   # mention) : peuvent changer entre deux appels (mesuré : 2.00 h -> 2.01 h) — vérifiés plus haut
+                        return {k:(re.sub(r'\d','#',v) if k=='reste' and isinstance(v,str) else _sansheure(v)) for k,v in x.items() if k!='depuis'}
+                    return x
+                j1,j2=_sansheure(js(o1)),_sansheure(js(o2)); dif={f'{k}.{n}':((j1.get(k) or {}).get(n),(j2.get(k) or {}).get(n)) for k in ('summary','backups')
+                                          for n in set(j1.get(k) or {})|set(j2.get(k) or {}) if (j1.get(k) or {}).get(n)!=(j2.get(k) or {}).get(n)}
+                res['JSON en ligne = JSON -o pendant le Bkp']=(j1!={} and not dif,str(dif)[:1500])
+                e=io.StringIO()
+                with mock.patch.object(b.db,'_hist',side_effect=sqlite3.OperationalError('illisible (contrôle)')),contextlib.redirect_stderr(e),contextlib.redirect_stdout(e):
+                    pv=b.db.previous_bkp_status('rl2',R['cours'])
+                res['précédent illisible : [WARN], None']=(pv is None and '[WARN] rl2: Bkp précédent illisible' in e.getvalue(),pv,e.getvalue()[-200:])
+                # backup() réel, borg simulé : marqueur au PID du Bkp posé AVANT l'attente d'Index (ligne pas encore écrite), toujours là
+                # pendant create (ligne écrite), retiré à la fin — create planté compris (rlx)
+                obs={}
+                def mk_state(nick): return [(open(x).read(),b.db.bkp_status_known(nick,x.rsplit('.',1)[1])) for x in glob.glob(glob.escape(b.db._bkp_marker_base(nick))+'.*')]
+                def fake_wait(nick,timeout=120): obs[(nick,'attente')]=mk_state(nick)
+                def fake_boex(nick,cmd,**kw):
+                    if cmd and cmd[0]=='create':
+                        obs[(nick,'create')]=mk_state(nick)
+                        if nick=='rlx': raise RuntimeError('create planté (contrôle)')
+                        return {'exitcode':0,'stdout':[{'archive':{'name':f'{nick}-a1','start':'2026-10-01T10:00:00.000000','duration':1,
+                                'stats':{'original_size':1,'compressed_size':1,'deduplicated_size':1,'nfiles':1}},'cache':{'stats':{}}}],'stderr':[]}
+                    return {'exitcode':0,'stdout':[{}],'stderr':[]}
+                for n in ('rlb','rlx'):
+                    o=io.StringIO()
+                    with mock.patch.object(b.borg,'boex',fake_boex),mock.patch.object(b.db,'wait_index_idle',fake_wait),\
+                            contextlib.redirect_stdout(o),contextlib.redirect_stderr(o):
+                        try: b.backup(n,no_index=True)
+                        except (Exception,SystemExit): pass
+                    me=str(os.getpid())
+                    res[f'backup() {n} : marqueur avant la ligne, pendant create, retiré']=(obs.get((n,'attente'))==[(me,False)]
+                        and obs.get((n,'create'))==[(me,True)] and mk_state(n)==[],obs.get((n,'attente')),obs.get((n,'create')),mk_state(n),o.getvalue()[-300:])
+            finally:
+                b.borg.boex=orig; _rb_killtree(child)
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("Report pendant un Bkp vivant : base seule, « Bkp en cours », code selon le Bkp précédent (1.0.183)",_report_bkp_live)
         def _sentry_absent():
             """1.0.182 (story 48, décision de l'utilisateur) : module sentry_sdk absent (interpréteur sans le paquet) -> jamais de
             plantage. En processus : _sentry_init rend False, [WARN] une seule fois. CLI réelle (sous-processus, sys.modules

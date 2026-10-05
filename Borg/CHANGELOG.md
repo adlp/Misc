@@ -1,5 +1,49 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.183 — Report pendant un Bkp : pas d'erreur, Bkp en cours dit, historique rendu — 2026-10-05
+
+Chantier « reconstruction progressive », story 50 (demande de l'utilisateur du 2026-10-04 ; décisions de l'utilisateur au
+checkpoint et après les deux revues). Mesuré avant sur un vrai Bkp de `demo.borghelperrc` (verrou du dépôt tenu 45 s) : Report
+en ligne (texte, `-j`, `-l`) -> `borg info` en échec sur `lock.exclusive (timeout)`, ligne `*** ERREUR demo-modules`, code 2
+(HTTP 400 par `/report` de borgHelperWWW), aucun historique ; `-o` -> code 0 mais rien sur le Bkp.
+
+- **Marqueur de Bkp** : `backup()` pose `<prefix>-<nick>-bkp.lock.<run_id>` (son PID, écriture atomique) dans `CACHE_DIR`
+  AVANT le verrou de priorité et le retire à sa toute fin (Index de fin compris, aussi après une exception). Bkp VIVANT =
+  marqueur vivant (PID vivant, non repris) ET sa ligne `bkp_status` ouverte, plus récente que `BKP_STATUS_TIMEOUT` — ou pas
+  encore de ligne : **Bkp en attente de l'Index** (le Bkp attend qu'un Index extérieur se mette en pause, jusqu'à 120 s).
+  Un marqueur mort (Bkp tué) est retiré par le Report suivant. Seul le processus du Bkp compte : un Index extérieur repris
+  après un Bkp tué, un Restore ou un Prune ne le fait jamais passer pour vivant.
+- **Report, en ligne comme `-o`** : un nick dont le Bkp est vivant est tiré de la base (`prep_report_from_db`), sans borg ni
+  attente du verrou d'Index ; colonne `reste` gardée (espace libre, `⚠ dépôt absent`) et suffixée `— ⏳ Bkp en cours depuis
+  HH:MM (XhYYmin)` (`— ⏳ Bkp en attente de l'Index depuis …` avant la ligne) ; JSON : champ `bkp_en_cours` (`started_at` en
+  UTC `…Z`, `depuis`, `precedent_en_erreur`, `en_attente`) ; stderr : `<nick> : Bkp en cours depuis … — rapport tiré de la
+  base, borg non interrogé`.
+- **Nick voisin** (même `BORG_REPO`) : pendant le Bkp vivant de A, le Report de B est aussi tiré de la base (borg info
+  buterait sur le verrou du dépôt) : `reste` suffixé `— ⏳ Bkp de A en cours sur le dépôt depuis …`, JSON `bkp_voisin`
+  (`nick`, `started_at`, `depuis`, `en_attente`), stderr `B : Bkp de A en cours sur le même dépôt depuis … — rapport tiré de
+  la base, borg non interrogé` ; code selon les règles habituelles de B.
+- **Erreur seulement si le Bkp précédent manque ou a échoué** : Bkp précédent (dernier démarré AVANT celui en cours ; en
+  attente : dernière ligne du nick) fini en `error` — un Bkp concurrent refusé sur le verrou du dépôt compris — ou jamais
+  fini et sans marqueur vivant (tué) -> `… — Bkp précédent en erreur`, nick `***`, code 1 ; un précédent jamais fini dont le
+  marqueur vit encore (Bkp concurrent en cours) n'est pas en erreur. Dernière archive au-delà de `MAX_AGE_BKP`, aucune
+  archive -> code 1 ; dépôt absent, base illisible -> code 2 (avec la mention) ; sinon code 0.
+- Inchangé : Bkp tué, ligne au-delà de `BKP_STATUS_TIMEOUT` (même processus vivant : un Bkp plus long que ce délai retombe
+  sur borg), Restore/Prune/DelBkp en cours ; sans marqueur, ni le rc (`BKP_STATUS_TIMEOUT`) ni `history.db` ne sont lus.
+- Limites : marqueur illisible (`/proc` monté `hidepid`, autre compte) : `_lock_holder` le tient pour vivant ; écriture de
+  la ligne `bkp_status` en échec : Bkp vu « en attente de l'Index » jusqu'à sa fin. borgHelperWWW (inchangé) garde
+  `/report?offline=true` 5 min : son empreinte couvre `history.db`, donc le début du Bkp (ligne écrite) renouvelle la réponse ;
+  après un Bkp tué, pendant l'attente de l'Index et pour un nick voisin, la mention peut apparaître ou rester jusqu'à 5 min
+  en retard.
+- Contrôle : « Report pendant un Bkp vivant » (18 nicks, marqueurs au PID d'un enfant `sleep` vivant ou d'un processus
+  fini, verrous d'autres processus, attente de l'Index, voisin, précédent vivant/tué/en erreur de même `started_at`, base
+  corrompue, schéma plus récent ; borg piégé ; matrice jouée sur `report` et `report_offline` ; texte, JSON exact, HTML,
+  multi-nicks ; `backup()` réel à borg simulé : marqueur posé avant l'attente, retiré après un create planté).
+- Mesuré après sur de vrais Bkp de `demo.borghelperrc` (copie du rc ; wrapper `BORG_EXE` qui tient le verrou du dépôt 20 s
+  pendant create et retarde le diff de l'Index de fin) : texte, `-j`, `-l`, `-o`, `-o -j` en code 0 avec la mention, 0,5 à
+  1 s, pendant l'attente de l'Index, `borg create` et l'Index de fin ; 100 Reports en boucle du début à la fin du Bkp (Index
+  de fin qui écrit compris) : aucun code non nul ; nick voisin : `Bkp de demo-modules en cours sur le dépôt`, son propre
+  code (1 : jamais indexé) ; aucun marqueur restant. 31 mutations détectées.
+
 ## borgHelper 1.0.182 — Python 3.10 à 3.14 sans plantage ni avertissement — 2026-10-04
 
 Chantier « reconstruction progressive », story 48 (demande de l'utilisateur : avertissement sqlite3 sur un hôte, puis exigence

@@ -2361,6 +2361,29 @@ bornes : réponse en général 10 s après le délai, 30 s au plus (tubes encore
 504 en 6,07 s, enfant vivant 12 s après (SIGKILL sauté) ; 1.31.2 : 504 en 16,1 s, groupe vide ; arrêt du serveur : enfant tué
 10,1 s après le 1er signal.
 
+**Report pendant un Bkp (1.0.183, story 50)** : marqueur de Bkp `<prefix>-<nick>-bkp.lock.<run_id>` dans `CACHE_DIR` (nick hors
+`[a-zA-Z0-9_-]` : remplacé par `_` et suffixé de 8 caractères de son SHA-1), contenu = PID, écrit par `_set_pid_lock` (`.tmp` +
+`os.replace`). `backup()` tire `run_id`, pose le marqueur (`set_bkp_marker`) AVANT `set_priority_lock`/`wait_index_idle` et le
+retire (`clear_bkp_marker`) en dernier dans son `finally`, après le filet `store_bkp_status_safety_net` : le marqueur couvre
+l'attente de l'Index, `borg create` et l'Index de fin. `BorgHelperDB.bkp_markers(nick)` : marqueurs VIVANTS (`_check_pid_lock` :
+PID vivant, non repris — `_lock_holder`, règle des 60 s ; `/proc` illisible : vivant), noms en `[0-9a-f]{32}` seulement ; un
+marqueur mort est supprimé au passage. `BorgHelper._bkp_live(nick)` : aucun marqueur -> None sans rien lire d'autre ; sinon
+`get_running_bkp_status` (délai `bkp_status_timeout`) : ligne ouverte dont le `run_id` a un marqueur vivant et non périmée ->
+Bkp en cours ; ligne périmée -> None ; marqueur vivant sans ligne (`bkp_status_known` faux) -> Bkp en attente de l'Index
+(`en_attente`, début = date du marqueur). Toute exception -> None (une base de schéma plus récent reste signalée par la suite
+du Report, dans le `try` du nick). `BorgHelper._bkp_neighbor(nick)` : si un marqueur existe dans `CACHE_DIR`
+(`any_bkp_marker`), cherche parmi les autres nicks du rc (`cfgreadnicks`) de même `_repo_key` un `_bkp_live` (sans ligne
+stderr propre) -> `voisin`. `report()` et sa jumelle `report_offline()` prennent `live = _bkp_live(nick) or
+_bkp_neighbor(nick)` ; `report()` saute alors `set_report_running_lock`/`wait_index_idle` et lit `prep_report_from_db` au lieu
+de `prep_report`. `_bkp_live_mark` (après le formatage de la ligne, dans la branche « aucune archive » — `_report_msg_row`, un
+seul exemplaire — et dans la branche d'erreur) suffixe `reste` (valeur gardée), écrit `bkp_en_cours` (ou `bkp_voisin`, jamais
+d'alerte) et met le nick en alerte (code 1) si `BorgHelperDB.previous_bkp_status(nick, run_id)` — dernière ligne démarrée
+avant celle du Bkp en cours (`started_at`, puis `rowid`), ou dernière ligne du nick si `run_id` est None (en attente) — a
+`failed` : fin en `error`, ou aucune fin et aucun marqueur vivant à son `run_id`. Lecture impossible : `[WARN]`, règle non
+appliquée. `MAX_AGE_BKP`, « aucune archive » et « dépôt absent » restent la règle de l'appelant. Ligne `bkp_status` non écrite
+(`[WARN] store_bkp_status_start a échoué`) : Bkp vu « en attente » jusqu'à sa fin. Le cache de `/report?offline=true` de
+borgHelperWWW (5 min, empreinte = mtimes de diff.db, cache.db, history.db et `-wal` du nick) n'inclut pas les marqueurs.
+
 **Compatibilité Python 3.10 à 3.14 (1.0.182, story 48)** : vérifiée par un CodecSelfTest complet sous chaque version (3.10.12
 système avec SQLite 3.37.2 et sentry-sdk 1.4.3 ; 3.11.15, 3.12.13, 3.13.13, 3.14.5 d'uv avec SQLite 3.50.4, prettytable 3.18.0 et
 sentry-sdk 2.71.0 en venv ; `tools/make_pyvenvs.sh`, venv-3.10 = système en `--system-site-packages`), par `cst.sh start ALL

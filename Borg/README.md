@@ -493,6 +493,29 @@ borgHelper -c Report -n ALL -o -N 10       # offline + 10 dernières archives
 Code retour 1 si un dépôt dépasse `MAX_AGE_BKP` heures depuis la dernière sauvegarde.  
 Code retour 2 si un dépôt est inaccessible.
 
+Report pendant un Bkp (1.0.183) : un nick dont le Bkp tourne — marqueur du Bkp vivant dans `CACHE_DIR`
+(`<prefix>-<nick>-bkp.lock.<run_id>`, posé par le Bkp dès son début, retiré à sa fin, Index de fin compris) et sa ligne
+`bkp_status` ouverte, plus récente que `BKP_STATUS_TIMEOUT` — est tiré de la base, sans borg ni attente, en ligne comme en
+`-o`. Sa colonne `reste` garde sa valeur (espace libre, `⚠ dépôt absent`) suivie de `— ⏳ Bkp en cours depuis HH:MM
+(XhYYmin)` (heure locale de début, durée écoulée) ; avant sa ligne `bkp_status`, quand le Bkp attend qu'un Index extérieur
+se mette en pause (jusqu'à 120 s) : `— ⏳ Bkp en attente de l'Index depuis …`. L'historique est rendu ; stderr dit `<nick> :
+Bkp en cours depuis … — rapport tiré de la base, borg non interrogé` ; en JSON, la ligne porte aussi `"bkp_en_cours":
+{"started_at": "2026-10-05T05:08:14Z", "depuis": "…", "precedent_en_erreur": false, "en_attente": false}` (début en UTC).
+Un autre nick du même dépôt (`BORG_REPO`) est aussi tiré de la base pendant ce Bkp : `— ⏳ Bkp de <nick> en cours sur le
+dépôt depuis …`, JSON `"bkp_voisin": {"nick", "started_at", "depuis", "en_attente"}`, sans alerte de ce fait.
+
+Codes pendant un Bkp : alerte (`***`, code 1) si le Bkp précédent a échoué — fini en erreur (un Bkp concurrent refusé sur
+le verrou du dépôt compte) ou jamais fini sans être encore vivant (tué) : `… — Bkp précédent en erreur` dans `reste` ;
+« précédent » = le dernier Bkp démarré AVANT celui en cours (en attente de l'Index : la dernière ligne du nick) ; aussi
+code 1 si la dernière archive dépasse `MAX_AGE_BKP` ou s'il n'y a aucune archive ; dépôt absent ou base illisible : code
+2, comme avant (avec la mention) ; sinon code 0. Avant : `borg info` échouait sur le verrou du dépôt (`*** ERREUR nick`,
+« Failed to create/acquire the lock », code 2, aucun historique). Inchangé : Bkp tué (marqueur mort, retiré au Report
+suivant), ligne au-delà de `BKP_STATUS_TIMEOUT` (un Bkp plus long que ce délai retombe sur borg), Restore/Prune/DelBkp en
+cours. Limites : borgHelperWWW garde `/report?offline=true` en cache 5 min ; le début du Bkp le renouvelle (`history.db`
+fait partie de son empreinte), mais après un Bkp tué, pendant l'attente de l'Index et pour un nick voisin, la mention peut
+apparaître ou rester jusqu'à 5 min en retard ; si le Bkp ne peut écrire sa ligne `bkp_status` (`[WARN]
+store_bkp_status_start a échoué`), il reste vu « en attente de l'Index » jusqu'à sa fin.
+
 Dépôt local introuvable (disque démonté, chemin faux ; 1.0.167) : colonne `reste` = `⚠ dépôt absent`, nick en
 alerte (`*** nick`, rouge en HTML), code 2 ; archives affichées en hors ligne (avant : aucune archive du nick dans
 `Report -o`). Un dépôt présent mais illisible (droits) n'est jamais dit absent.
