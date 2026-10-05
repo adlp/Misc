@@ -2402,6 +2402,27 @@ chargeur PyInstaller `borg.wrapped` -> enfant `borg.wrapped` qui tient le verrou
 borgHelper, parent 1, l'archive est écrite. Revues : versions par nom d'ancêtre et nom d'hôte, puis par absence de marqueur,
 abandonnées.
 
+**Bkp tué dont le borg a fini (1.0.185, story 54)** : `backup()` insère `--comment "borgHelper run <run_id>"` juste après
+`create` (le run_id est tiré avant le marqueur ; `shlex.quote` avec `SSH_REMFO` : ssh joint ses arguments, le shell distant
+redécoupe). `BorgHelper._reconcile_killed_bkp(nick)` est appelé par `_index_pass` après la garde `repoLocalAbsent`, sous
+`self.borg._stop` (arrêt prioritaire/échéance de l'Index) : rend `None` si ce borg a été tué -> la passe rend `_kill_outcome`
+(`interrupted` : pause puis passe refaite, rapprochement compris ; `deadline` : fin de tranche muette) ; sinon `plan['rk']` posé,
+plus de rapprochement dans cet Index. Aussi dans `backup()` entre `wait_index_idle` et `store_bkp_status_start` (dans le `try`
+dont le `finally` libère `priority.lock`, après `ensure_history_db`). Candidats = `open_bkp_runs` (`_BKP_OPEN_WHERE` : sans
+`finished_at` et aucun Bkp démarré après n'a réussi — borne le coût, décision de l'utilisateur ; une ligne écartée ou dont
+l'examen a échoué au début d'un Bkp qui réussit n'est plus jamais examinée) moins les marqueurs vivants (`bkp_markers(nick,
+include_me=True)` — le processus courant compte : sinon l'Index de fin d'un Bkp rapproche sa propre ligne, mesuré) moins le run
+d'un `borg create` orphelin vivant (`repo_orphan_create`, dépôt local seulement) ; sans candidat, ou dépôt local absent, rien
+d'autre. Sinon `boex(['list','--json','--format','{comment}{end}']+glob_args(cfg), forceEnv={'TZ':'UTC'})` (le JSON porte alors
+`comment` et `end` en plus des clés habituelles, `end` en heure locale de borg — d'où `TZ=UTC`, mesuré : borg suit `TZ` ; borg
+1.2.6) ; archives `.checkpoint` écartées (borg 1.1 les liste) ; pour chaque candidat dont une archive a le commentaire exact,
+`BorgHelperDB.close_bkp_status_reconciled(nick, run_id, fin)` : `UPDATE … SET finished_at=?, result='success' WHERE … AND
+finished_at IS NULL` (comparer-et-échanger, jamais d'écrasement ; `changed_during_backup`/`read_errors` restent NULL). Erreur de
+base : à la lecture, rien, muet ; à la fermeture, ce candidat sauté (message SQLite de `_with_lock_retry`, attente jusqu'à 300 s
+d'une base verrouillée) ; borg en échec : `[WARN]`, rien fermé ; Ctrl-C (130) propagé. Le watcher de borgHelperWWW réclame
+ensuite cette ligne finie et notifie la fin en succès (inchangé) — seulement si elle n'a pas déjà été réclamée comme périmée
+(`BKP_STATUS_TIMEOUT` : échec notifié, jamais re-notifié).
+
 **Compatibilité Python 3.10 à 3.14 (1.0.182, story 48)** : vérifiée par un CodecSelfTest complet sous chaque version (3.10.12
 système avec SQLite 3.37.2 et sentry-sdk 1.4.3 ; 3.11.15, 3.12.13, 3.13.13, 3.14.5 d'uv avec SQLite 3.50.4, prettytable 3.18.0 et
 sentry-sdk 2.71.0 en venv ; `tools/make_pyvenvs.sh`, venv-3.10 = système en `--system-site-packages`), par `cst.sh start ALL

@@ -435,6 +435,12 @@ prev = bh.db.previous_bkp_status('mon-serveur', row['run_id'])
 # 1.0.183 : marqueurs de Bkp (« <prefix>-<nick>-bkp.lock.<run_id> », PID du Bkp) — posés/retirés par backup() ;
 # {run_id: date d'écriture} des marqueurs VIVANTS (un marqueur mort est supprimé au passage).
 vivants = bh.db.bkp_markers('mon-serveur')
+# 1.0.185 (story 54) : include_me=True compte aussi les marqueurs du processus courant.
+# Lignes ouvertes (_BKP_OPEN_WHERE : sans fin, aucun Bkp réussi depuis) ; fermeture en succès d'une ligne sans fin (fin UTC) —
+# la méthode ne vérifie PAS l'archive (rôle de l'appelant, BorgHelper._reconcile_killed_bkp) ; base verrouillée : attente
+# jusqu'à 300 s, puis « SQLite error » et False :
+ouvertes = bh.db.open_bkp_runs('mon-serveur')
+ferme = bh.db.close_bkp_status_reconciled('mon-serveur', run_id, '2026-10-05 16:12:22')   # True si CETTE fermeture a eu lieu
 
 # 1.0.184 (story 52) : PID des détenteurs exclusifs du verrou du dépôt LOCAL (lock.roster) ; [] si distant, absent, illisible.
 pids = bh.db.repo_lock_holders('mon-serveur')

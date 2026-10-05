@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.184"
+Version="1.0.185"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -3796,13 +3796,18 @@ class BorgHelperDB:
     def any_bkp_marker(self):
         """Un marqueur de Bkp (vivant ou non) existe-t-il dans CACHE_DIR ? Test rapide avant de chercher un nick voisin."""
         return bool(glob.glob(os.path.join(glob.escape(self.cache_dir),f"{glob.escape(self.db_prefix)}-*-bkp.lock.*")))
-    def bkp_markers(self,nick):
-        """{run_id: date d'écriture (epoch)} des marqueurs VIVANTS du nick ; un marqueur mort est retiré au passage."""
+    def bkp_markers(self,nick,include_me=False):
+        """{run_id: date d'écriture (epoch)} des marqueurs VIVANTS du nick ; un marqueur mort est retiré au passage. include_me
+        (1.0.185, story 54) : compte aussi les marqueurs du processus courant (Index de fin d'un Bkp : son propre Bkp vit)."""
         base=self._bkp_marker_base(nick); out={}
         for p in glob.glob(glob.escape(base)+'.*'):
             rid=p[len(base)+1:]
             if not re.fullmatch(r'[0-9a-f]{32}',rid): continue   # fichier .tmp d'écriture, autre
-            if self._check_pid_lock(p):
+            h=self._lock_holder(p)
+            if h=='dead':
+                try: os.unlink(p)
+                except OSError: pass
+            elif h=='alive' or (include_me and h=='me'):
                 try: out[rid]=os.path.getmtime(p)
                 except OSError: pass
         return out
@@ -3813,6 +3818,33 @@ class BorgHelperDB:
         conn=_open_db(db_path,nick=None,role='read')
         try: return conn.execute("SELECT 1 FROM bkp_status WHERE nick=? AND run_id=?",(nick,run_id)).fetchone() is not None
         finally: conn.close()
+
+    def open_bkp_runs(self,nick,db_path=None):
+        """1.0.185 (story 54) : run_id des lignes bkp_status OUVERTES du nick (_BKP_OPEN_WHERE : sans fin, et aucun Bkp démarré
+        après elles n'a réussi — décision de l'utilisateur, revue : borne le coût du rapprochement ; une ligne dépassée par un
+        succès n'est plus examinée, le Bkp réussi l'a examinée à son début) ; history.db absente : []. Lecture impossible :
+        exception (l'appelant, _reconcile_killed_bkp, ne rapproche alors rien)."""
+        db_path=self._hist(nick,db_path)
+        if db_path is None: return []
+        conn=_open_db(db_path,nick=None,role='read')
+        try: return [r[0] for r in conn.execute("SELECT b.run_id FROM bkp_status b WHERE "+_BKP_OPEN_WHERE,(nick,))]
+        finally: conn.close()
+
+    def close_bkp_status_reconciled(self,nick,run_id,finished_utc,db_path=None):
+        """1.0.185 (story 54, décisions de l'utilisateur) : ferme en 'success' la ligne d'un Bkp tué dont l'archive (commentaire
+        « borgHelper run <run_id> ») est écrite — finished_at = fin de l'archive (UTC, « YYYY-MM-DD HH:MM:SS »). Comparer-et-échanger
+        (WHERE finished_at IS NULL) : jamais d'écrasement d'une fin déjà écrite. True si CETTE fermeture a eu lieu."""
+        db_path=self._hist(nick,db_path)
+        if db_path is None: return False
+        def _do():
+            conn=_open_db(db_path,nick=None,role='write')
+            try:
+                cur=conn.execute("UPDATE bkp_status SET finished_at=?,result='success' WHERE nick=? AND run_id=? AND finished_at IS NULL",
+                                 (finished_utc,nick,run_id))
+                conn.commit(); return cur.rowcount==1
+            finally: conn.close()
+        try: return self._with_lock_retry(_do)
+        except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
 
     def bkp_status_open(self,nick,run_id,timeout_s,db_path=None):
         """1.0.184 (story 52) : ligne bkp_status OUVERTE (finished_at nul) du run `run_id` du nick, {run_id, started_at, stale} ;
@@ -6075,6 +6107,8 @@ class BorgHelper:
         if 'EXCLUDE_NEXT' in list(cfg.keys()):
             create.extend(cfg['EXCLUDE_NEXT'].split(' '))
         run_id=uuid.uuid4().hex
+        cmt=f'borgHelper run {run_id}'   # 1.0.185 (story 54) : l'archive porte son run (rapprochement d'un Bkp tué) ; SSH_REMFO
+        create[1:1]=['--comment',cmt if preBorg is None else shlex.quote(cmt)]   # (revue) : ssh joint, le shell distant redécoupe
         self.db.set_bkp_marker(nick,run_id)   # 1.0.183 (story 50, revue 2) : Report voit ce Bkp dès ici (« en attente de l'Index »)
         self.db.set_priority_lock(nick)
         self.db.wait_index_idle(nick)
@@ -6087,6 +6121,8 @@ class BorgHelper:
                                                                   # AVANT ce qui peut échouer : le finally (filet) s'en sert
             self.db.ensure_diff_db(self.db.get_diff_db(nick),nick=nick)   # migre les mesures d'une base antérieure
             self.db.ensure_history_db(bkp_status_db)
+            self._reconcile_killed_bkp(nick,debug=debug)   # 1.0.185 (story 54) : AVANT sa ligne (sa règle « précédent » voit le Bkp tué
+            # rapproché), DANS le try : le finally libère priority.lock même sur Ctrl-C pendant le borg list
             if not self.db.store_bkp_status_start(nick,run_id,bkp_status_db):
                 printer(f"[WARN] store_bkp_status_start a échoué pour {nick} (run_id={run_id})")
             # 1.0.163 (story 26, choix de l'utilisateur) : borg local seulement (avec SSH_REMFO, borg tourne sur la machine
@@ -6814,6 +6850,12 @@ class BorgHelper:
         self.db.ensure_diff_db(db_path,nick=nick)
         cfg=self.borg.cfgreaded(nick,debug=debug)
         stop=lambda: self._index_stop_reason(nick,deadline) is not None
+        if not plan.get('rk'):   # 1.0.185 (story 54) : sous le tour d'Index, après la garde « dépôt absent », une fois par Index
+            prev_stop=self.borg._stop; self.borg._stop=stop   # (revue) : son borg list cède comme les autres
+            try: rk=self._reconcile_killed_bkp(nick,debug=debug)
+            finally: self.borg._stop=prev_stop
+            if rk is None: return self._kill_outcome(deadline)   # (revue 2) tué : reprise après la pause (refait), ou échéance
+            plan['rk']=True
         prev_stop=self.borg._stop; self.borg._stop=stop
         try:
             rb=self.borg.boex(nick,['list','--json']+glob_args(cfg),debug=debug)
@@ -9071,6 +9113,52 @@ class BorgHelper:
             tbkps[arch]['borg']=_borg_ver_text(_measure_of(measures,arch,starts.get(arch)))   # 1.0.165 (jumelle : prep_report_from_db)
         if stats_err: tcmpl[nick]['_stats_error']=True   # 1.0.179 (A92) : retiré à l'affichage, code 1
         return tcmpl,tbkps
+
+    def _reconcile_killed_bkp(self,nick,debug=0):
+        """1.0.185 (story 54, décisions de l'utilisateur) : rapprochement des Bkp TUÉS dont le borg create a quand même écrit
+        l'archive — sinon le Bkp suivant voit « Bkp précédent en erreur » et le watcher notifie un échec au bout de
+        BKP_STATUS_TIMEOUT. Candidat : ligne bkp_status OUVERTE du nick (open_bkp_runs : _BKP_OPEN_WHERE), sans marqueur de Bkp
+        vivant, sans borg create orphelin vivant de ce run (repo_orphan_create : dépôt local seulement). Aucun candidat, ou dépôt
+        local absent : rien d'autre (aucun borg). Sinon UN `borg list --json --format '{comment}{end}'` (GLOB_ARCH du nick ;
+        TZ=UTC passé à borg : `end` lu tel quel en UTC) : la ligne dont l'archive (hors .checkpoint) porte le commentaire
+        « borgHelper run <run_id> » (posé par backup() depuis 1.0.185) est fermée en succès, fin = fin de l'archive. Appelé par
+        _index_pass (une fois par Index, sous son arrêt prioritaire/échéance) et par backup() (avant sa ligne). borg en échec :
+        [WARN], rien fermé, réessayé au prochain Index (sauf si un Bkp réussit d'ici là : ligne dépassée) ; borg tué par l'arrêt :
+        None, muet ; erreur de base : rien fermé, pas d'exception (lecture : muet ; fermeture : message SQLite habituel). Rend le
+        nombre de lignes fermées."""
+        from datetime import datetime
+        try:
+            runs=self.db.open_bkp_runs(nick)
+            if not runs: return 0
+            alive=set(self.db.bkp_markers(nick,include_me=True)); orp=self.db.repo_orphan_create(nick)   # mesure : l'Index de fin d'un Bkp
+            # rapprochait sa PROPRE ligne (marqueur 'me', non « vivant » pour _check_pid_lock)
+            cand=[r for r in runs if r not in alive and not (orp and orp['run_id']==r)]
+            if not cand: return 0
+            if self.borg.repoLocalAbsent(nick): return 0   # (revue 2) comme _index_pass : jamais de borg sur un dépôt absent
+        except Exception: return 0   # base illisible : la suite de la commande le dira
+        try:
+            cfg=self.borg.cfgreaded(nick,debug=debug)
+            rb=self.borg.boex(nick,['list','--json','--format','{comment}{end}']+glob_args(cfg),debug=debug,
+                              forceEnv={'TZ':'UTC'})   # (revue 2) `end` en UTC (mesuré : borg suit TZ) : ni fuseau ni heure ambiguë
+            if rb.get('killed'): return None   # arrêt prioritaire/échéance de l'Index : réessayé, rien à dire
+            self.borg._boex_check_stdout(rb,nick,'borg list')
+            arch=rb['stdout'][0]['archives']
+        except (Exception,SystemExit) as e:
+            if isinstance(e,SystemExit) and e.code==130: raise
+            printer(f"[WARN] {nick} : rapprochement impossible (borg list : {str(e)[:120] or type(e).__name__}) — réessayé au prochain Index")
+            return 0
+        by={a.get('comment'):a for a in arch if isinstance(a,dict) and a.get('comment')
+            and not str(a.get('name','')).endswith('.checkpoint')}   # (revue 2) checkpoint (borg 1.1 le liste) : archive partielle
+        n=0
+        for r in cand:
+            a=by.get(f'borgHelper run {r}')
+            if not a: continue
+            try: fin=datetime.strptime(str(a.get('end',''))[:19],'%Y-%m-%dT%H:%M:%S').strftime('%Y-%m-%d %H:%M:%S')   # déjà UTC
+            except ValueError: continue   # fin illisible : jamais une date inventée
+            try: ok=self.db.close_bkp_status_reconciled(nick,r,fin)
+            except Exception: continue   # (revue) erreur de base : jamais le Bkp ni l'Index tués par le rapprochement
+            if ok: printer(f"  {nick} : Bkp interrompu {r[:8]} rapproché — archive {a.get('name')} écrite, ligne fermée en succès"); n+=1
+        return n
 
     def _bkp_live(self,nick,quiet=False):
         """1.0.183 (story 50, demande et décisions de l'utilisateur) : Bkp VIVANT du nick — marqueur de Bkp vivant (bkp_markers :
@@ -15148,6 +15236,193 @@ fail()
             if bad: print(f"  {bad}")
             return not bad
         check("Report pendant un borg orphelin : base, « Bkp interrompu, borg create encore actif », code 1 (1.0.184)",_report_borg_orphelin)
+        def _reconcile_bkp_tue():
+            """1.0.185 (story 54, décisions de l'utilisateur) — rapprochement d'un Bkp tué dont l'archive est écrite : lignes bkp_status
+            et marqueurs écrits à la main, borg list simulé (commentaire, fin). rk1 ligne ouverte, marqueur mort, archive « borgHelper
+            run R » -> fermée en succès, fin = `end` de l'archive lu en UTC (TZ=UTC passé à borg), ligne sur stderr (stdout vide),
+            précédent du Bkp suivant réussi ; négatifs (ligne intacte) : rk2 sans archive, rk3 marqueur vivant, rk4 marqueur du processus courant, rk5 orphelin
+            vivant de ce run (aucun borg pour ces trois), rk6 archives d'un autre run / sans commentaire, rk9 ligne déjà close ; rk7
+            aucune ligne ouverte -> aucun borg ; rk8 borg list en échec -> [WARN] sur stderr, rien fermé ; fermeture d'une ligne déjà
+            close refusée (comparer-et-échanger). Revue : rkd deux candidats -> deux fermetures, UN borg list, GLOB_ARCH du nick ; rke
+            ligne dépassée par un Bkp réussi (_BKP_OPEN_WHERE, décision de l'utilisateur) -> aucun borg ; rkg borg tué par l'arrêt ->
+            None, muet ; rkh erreur de base à la fermeture -> rien, pas d'exception ; rki Ctrl-C (130) propagé. Revue 2 : fins
+            distinctes par archive (appariement), archive d'un autre run AVANT les cibles (rkd) ; rkf fin illisible puis candidat
+            lisible fermé ; rkc .checkpoint écarté ; rkj dépôt local absent -> aucun borg ; rkk base illisible -> 0, aucun borg ;
+            _index_pass (comportement, faux boex qui obéit à self.borg._stop) : rkp arrêt prioritaire -> 'interrupted', muet, rien
+            fermé, refait à la reprise puis UNE fois par Index (une ligne sans archive reste candidate) ; rkq échéance -> 'deadline', muet. backup() : --comment « borgHelper
+            run <run_id> » juste après create (rkb), cité pour le shell distant avec SSH_REMFO (rkr), rapprochement AVANT sa propre
+            ligne (Bkp tué déjà fermé au create ; structure : avant store_bkp_status_start, dans le try) ; Ctrl-C pendant son borg
+            list (rki) : 130, aucun create, priority.lock et marqueur retirés, aucune ligne ; _index_pass : après la garde « dépôt
+            absent » (structure). Fuseau local fixé (TZ=Europe/Paris, restauré) : une conversion locale se verrait."""
+            from datetime import datetime,timezone
+            d=os.path.join(tmp,'rk54'); shutil.rmtree(d,ignore_errors=True); os.makedirs(d); rc=os.path.join(d,'rc')
+            nk=tuple(f'rk{i}' for i in range(1,10))+('rkb','rkc','rkd','rke','rkf','rkg','rkh','rki','rkj','rkk','rkp','rkq','rkr')
+            for n in nk:
+                if n!='rkj': os.makedirs(os.path.join(d,'r-'+n))   # rkj : dépôt local absent
+            extra={'rkd':"GLOB_ARCH=rkd-*\n",'rkr':"SSH_REMFO=2222:localhost:22\n"}
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nBORG_PASSPHRASE=pw\nSER_NAME=h\nSER_LOGIN=x\nGLOB_ARCH=*\n"
+                        f"BORG_ARCHNAME=t\nEXCLUDE=--exclude-caches\nDB_ENCRYPT=false\n\n"
+                        +''.join(f"[{n}]\nBORG_REPO={os.path.join(d,'r-'+n)}\n{extra.get(n,'')}\n" for n in nk))
+            os.chmod(rc,0o600)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            RUN=lambda n,k=2: f"{n}{k}".encode().hex().ljust(32,'0')[:32]
+            E=lambda k: f'2026-10-05T10:{k:02d}:05.000000'; F=lambda k: f'2026-10-05 10:{k:02d}:05'   # `end` (UTC, TZ=UTC) -> fin
+            END=E(0)
+            tz0=os.environ.get('TZ'); os.environ['TZ']='Europe/Paris'; time.tzset()
+            A=lambda n,k=2,end=None: {'name':f'{n}-{k}','comment':f'borgHelper run {RUN(n,k)}','end':E(k) if end is None else end}
+            arch={'rk1':[A('rk1')],'rk2':[{'name':'rk2-a','comment':'','end':END}],'rk3':[A('rk3')],'rk4':[A('rk4')],'rk5':[A('rk5')],
+                  'rk6':[A('rk6',9),{'name':'manuel','comment':'','end':END}],'rk9':[A('rk9')],'rkb':[A('rkb')],
+                  'rkc':[{'name':'rkc-2.checkpoint','comment':f'borgHelper run {RUN("rkc")}','end':E(2)}],
+                  'rkd':[A('rkd',7),A('rkd'),A('rkd',3)],'rke':[A('rke')],'rkf':[A('rkf',end=''),A('rkf',3)],'rkh':[A('rkh')],
+                  'rki':[A('rki')],'rkj':[A('rkj')],'rkk':[A('rkk')],'rkp':[A('rkp')],'rkq':[A('rkq')]}
+            calls=[]; seen={}
+            class Stop54(Exception): pass
+            def fake_boex(nick,cmd,**kw):
+                calls.append((nick,cmd[0] if cmd else '',list(cmd),kw))
+                if b.borg._stop is not None and b.borg._stop(): return {'exitcode':-15,'killed':True,'stdout':[],'stderr':[]}   # comme boex
+                if cmd and cmd[0]=='list' and '--format' not in cmd and nick in ('rkp','rkq'): raise Stop54()   # borg list initial de l'Index
+                if cmd and cmd[0]=='list':
+                    if nick=='rk8': return {'exitcode':2,'stdout':[],'stderr':['Failed to create/acquire the lock /r/lock.exclusive (timeout).']}
+                    if nick=='rkg': return {'exitcode':-15,'killed':True,'stdout':[],'stderr':[]}
+                    if nick=='rki': raise SystemExit(130)
+                    return {'exitcode':0,'stdout':[{'archives':arch.get(nick,[])}],'stderr':[]}
+                if cmd and cmd[0]=='create':
+                    h=b.db.get_history_db(nick)
+                    seen[nick]=(list(cmd),kw.get('preBorg'),sqlite3.connect(h).execute("SELECT result FROM bkp_status WHERE nick=? AND run_id=?",(nick,RUN(nick))).fetchone())
+                    return {'exitcode':0,'stdout':[{'archive':{'name':f'{nick}-n','start':'2026-10-01T10:00:00.000000','duration':1,
+                            'stats':{'original_size':1,'compressed_size':1,'deduplicated_size':1,'nfiles':1}},'cache':{'stats':{}}}],'stderr':[]}
+                return {'exitcode':0,'stdout':[{}],'stderr':[]}
+            child=_rb_popen(['sleep','3600']); time.sleep(0.3); res={}
+            res['fuseau local fixé (Paris, UTC+2 : une conversion locale se verrait)']=(datetime.strptime(E(2)[:19],'%Y-%m-%dT%H:%M:%S').astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')!=F(2),)
+            def row(n,k=2):
+                return sqlite3.connect(b.db.get_history_db(n)).execute("SELECT finished_at,result FROM bkp_status WHERE nick=? AND run_id=?",(n,RUN(n,k))).fetchone()
+            try:
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                    for n in nk:
+                        b.db.ensure_diff_db(b.db.get_diff_db(n)); h=b.db.get_history_db(n)
+                        b.db.store_bkp_status_start(n,RUN(n,1),db_path=h); b.db.store_bkp_status_finish(n,RUN(n,1),'success',db_path=h)
+                        if n!='rk7': b.db.store_bkp_status_start(n,RUN(n),db_path=h)
+                        if n=='rk9': b.db.store_bkp_status_finish(n,RUN(n),'error',db_path=h)
+                        if n in ('rkd','rkf','rkp'): b.db.store_bkp_status_start(n,RUN(n,3),db_path=h)   # rkp : RUN 3 sans archive, toujours candidate
+                        if n=='rke': b.db.store_bkp_status_start(n,RUN(n,3),db_path=h); b.db.store_bkp_status_finish(n,RUN(n,3),'success',db_path=h)
+                        c=sqlite3.connect(h,isolation_level=None)
+                        c.execute("UPDATE bkp_status SET started_at=datetime('now','-1 hour') WHERE nick=? AND run_id=?",(n,RUN(n,1))); c.close()
+                with open(f"{b.db._bkp_marker_base('rk3')}.{RUN('rk3')}",'w') as f: f.write(str(child.pid))
+                with open(f"{b.db._bkp_marker_base('rk4')}.{RUN('rk4')}",'w') as f: f.write(str(os.getpid()))
+                real_orp=b.db.repo_orphan_create
+                def run(n,close=None,opn=None):
+                    o,e=io.StringIO(),io.StringIO(); del calls[:]
+                    with mock.patch.object(b.borg,'boex',fake_boex),mock.patch.object(b.db,'repo_orphan_create',
+                            lambda nick: {'pid':1,'run_id':RUN('rk5')} if nick=='rk5' else real_orp(nick)),\
+                            mock.patch.object(b.db,'close_bkp_status_reconciled',close or b.db.close_bkp_status_reconciled),\
+                            mock.patch.object(b.db,'open_bkp_runs',opn or b.db.open_bkp_runs),\
+                            contextlib.redirect_stdout(o),contextlib.redirect_stderr(e):
+                        try: r=b._reconcile_killed_bkp(n)
+                        except (Exception,SystemExit) as x: r=f"{type(x).__name__}: {x}"
+                    return r,o.getvalue(),e.getvalue(),[c for c in calls if c[1]=='list']
+                r,o,e,l=run('rk1')
+                pv=b.db.previous_bkp_status('rk1',None)
+                res['rk1 tué, archive du run : fermé en succès, fin de l\'archive en UTC, TZ passé à borg, ligne stderr, précédent réussi']=(r==1
+                    and row('rk1')==(F(2),'success') and f"rk1 : Bkp interrompu {RUN('rk1')[:8]} rapproché — archive rk1-2 écrite, ligne fermée en succès" in e
+                    and not o.strip() and len(l)==1 and l[0][3].get('forceEnv')=={'TZ':'UTC'}
+                    and pv and pv['failed'] is False,r,row('rk1'),o[-200:],e[-200:],l,pv)
+                for n,why in (('rk2','sans archive'),('rk6','archive d\'un autre run ou sans commentaire'),('rkc','seule archive du run : .checkpoint')):
+                    r,o,e,l=run(n)
+                    res[f'{n} {why} : ligne intacte']=(r==0 and row(n)==(None,None) and 'rapproché' not in o+e and len(l)==1,r,row(n),o[-200:],e[-200:],l)
+                for n,why in (('rk3','marqueur vivant'),('rk4','marqueur du processus courant'),('rk5','orphelin vivant de ce run'),
+                              ('rke','ligne dépassée par un Bkp réussi'),('rkj','dépôt local absent')):
+                    r,o,e,l=run(n)
+                    res[f'{n} {why} : intacte, aucun borg']=(r==0 and row(n)==(None,None) and l==[] and 'rapproché' not in o+e,r,row(n),l)
+                r,o,e,l=run('rk7'); res['rk7 aucune ligne ouverte : aucun borg']=(r==0 and l==[],r,l)
+                r,o,e,l=run('rk9'); res['rk9 ligne déjà close (error) : intacte, aucun borg']=(r==0 and row('rk9')[1]=='error' and l==[],r,row('rk9'),l)
+                r,o,e,l=run('rk8')
+                res['rk8 borg list en échec : [WARN] sur stderr, rien fermé']=(r==0 and row('rk8')==(None,None)
+                    and '[WARN] rk8 : rapprochement impossible (borg list : ' in e and 'réessayé au prochain Index' in e,r,o[-300:],e[-300:])
+                r,o,e,l=run('rkd')
+                res['rkd deux candidats : chacun sa fin et son nom, UN borg list, GLOB_ARCH du nick']=(r==2 and row('rkd')==(F(2),'success')
+                    and row('rkd',3)==(F(3),'success') and len(l)==1 and l[0][2]==['list','--json','--format','{comment}{end}','--glob-archives','rkd-*']
+                    and f"Bkp interrompu {RUN('rkd')[:8]} rapproché — archive rkd-2 écrite" in e and f"Bkp interrompu {RUN('rkd',3)[:8]} rapproché — archive rkd-3 écrite" in e,
+                    r,row('rkd'),row('rkd',3),l,e[-400:])
+                r,o,e,l=run('rkf')
+                res['rkf fin illisible puis candidat lisible : le second fermé']=(r==1 and row('rkf')==(None,None) and row('rkf',3)==(F(3),'success'),r,row('rkf'),row('rkf',3))
+                def unreadable(*a,**k): raise sqlite3.DatabaseError('file is not a database (contrôle)')
+                r,o,e,l=run('rkk',opn=unreadable); res['rkk base illisible : 0, aucun borg, pas d\'exception']=(r==0 and l==[] and row('rkk')==(None,None),r,l)
+                r,o,e,l=run('rkg'); res['rkg borg tué par l\'arrêt : None, muet, intacte']=(r is None and row('rkg')==(None,None) and not (o+e).strip(),r,o,e)
+                def boom(*a,**k): raise OSError('base (contrôle)')
+                r,o,e,l=run('rkh',close=boom); res['rkh erreur de base à la fermeture : 0, intacte, pas d\'exception']=(r==0 and row('rkh')==(None,None),r,row('rkh'))
+                r,o,e,l=run('rki'); res['rki Ctrl-C (130) propagé, intacte']=(r=='SystemExit: 130' and row('rki')==(None,None),r)
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                    ok=b.db.close_bkp_status_reconciled('rk9',RUN('rk9'),'2000-01-01 00:00:00')
+                res['rk9 fermeture d\'une ligne déjà close : refusée, fin et résultat intacts']=(ok is False and row('rk9')[1]=='error'
+                    and row('rk9')[0]!='2000-01-01 00:00:00',ok,row('rk9'))
+                P=lambda dl=None: {'tranche':False,'deadline':dl,'natures':{'stats','snap','diff'},'period':None,'snap_only':False,
+                                   'done':set(),'shadow':None,'sdone':set(),'recheck':False}
+                mode={'stop':None}
+                def ip(n,plan):
+                    o,e=io.StringIO(),io.StringIO(); del calls[:]
+                    with mock.patch.object(b.borg,'boex',fake_boex),mock.patch.object(b,'_index_stop_reason',lambda *a: mode['stop']),\
+                            contextlib.redirect_stdout(o),contextlib.redirect_stderr(e):
+                        try: r=b._index_pass(n,0,b.db.get_diff_db(n),False,None,plan)
+                        except Stop54: r='borg list initial'
+                        except (Exception,SystemExit) as x: r=f"{type(x).__name__}: {x}"
+                    return r,o.getvalue()+e.getvalue(),len([c for c in calls if c[1]=='list' and '--format' in c[2]])
+                p1=P(); mode['stop']='priority'; r,o,fl=ip('rkp',p1)
+                res['_index_pass arrêt prioritaire : interrupted, muet, rien fermé']=(r=='interrupted' and not p1.get('rk') and fl==1
+                    and row('rkp')==(None,None) and '[WARN]' not in o,r,fl,row('rkp'),o[-300:])
+                mode['stop']=None; r,o,fl=ip('rkp',p1)
+                res['_index_pass reprise : rapprochement refait, fermé, puis borg list initial']=(r=='borg list initial' and p1.get('rk') and fl==1
+                    and row('rkp')==(F(2),'success') and row('rkp',3)==(None,None),r,fl,row('rkp'),o[-300:])
+                r,o,fl=ip('rkp',p1); res['_index_pass passe suivante du même Index, candidat restant : aucun borg list du rapprochement']=(r=='borg list initial' and fl==0
+                    and row('rkp',3)==(None,None),r,fl)
+                mode['stop']='deadline'; r,o,fl=ip('rkq',P(time.monotonic()-1)); mode['stop']=None
+                res['_index_pass échéance : deadline, muet, rien fermé']=(r=='deadline' and fl==1 and row('rkq')==(None,None) and '[WARN]' not in o,r,fl,o[-300:])
+                for n in ('rkb','rkr'):
+                    o=io.StringIO()
+                    with mock.patch.object(b.borg,'boex',fake_boex),mock.patch.object(b.db,'wait_index_idle',lambda *a,**k: None),\
+                            contextlib.redirect_stdout(o),contextlib.redirect_stderr(o):
+                        try: b.backup(n,no_index=True)
+                        except (Exception,SystemExit): pass
+                    seen.setdefault(n,(None,None,None)); seen[n]=seen[n]+(o.getvalue()[-300:],)
+                rid={n:(sqlite3.connect(b.db.get_history_db(n)).execute("SELECT run_id FROM bkp_status WHERE nick=? AND run_id NOT IN (?,?)",(n,RUN(n,1),RUN(n))).fetchone() or [None])[0]
+                     for n in ('rkb','rkr')}
+                cm,pb,tf,_o=seen['rkb']
+                res['backup() : --comment juste après create, Bkp tué rapproché avant le create']=(rid['rkb'] is not None and pb is None
+                    and (cm or [])[:3]==['create','--comment',f'borgHelper run {rid["rkb"]}'] and tf==('success',),(cm or [])[:3],rid,tf,_o)
+                cm,pb,tf,_o=seen['rkr']
+                sp=shlex.split(' '.join(cm or [])); i=sp.index('--comment') if '--comment' in sp else -1
+                res['backup() SSH_REMFO : commentaire intact après redécoupage par le shell distant']=(rid['rkr'] is not None and pb is not None
+                    and i==1 and sp[2]==f'borgHelper run {rid["rkr"]}',cm and cm[:3],pb,rid,_o)
+                o=io.StringIO(); del calls[:]
+                with mock.patch.object(b.borg,'boex',fake_boex),mock.patch.object(b.db,'wait_index_idle',lambda *a,**k: None),\
+                        contextlib.redirect_stdout(o),contextlib.redirect_stderr(o):
+                    try: b.backup('rki',no_index=True); x='rien'
+                    except SystemExit as y: x=y.code
+                    except Exception as y: x=f"{type(y).__name__}: {y}"
+                nr=sqlite3.connect(b.db.get_history_db('rki')).execute("SELECT count(*) FROM bkp_status WHERE nick='rki'").fetchone()[0]
+                res['backup() Ctrl-C pendant le borg list : 130, aucun create, priority.lock et marqueur retirés, aucune ligne']=(x==130
+                    and not [c for c in calls if c[1]=='create'] and not os.path.exists(b.db._priority_holder_path('rki'))
+                    and not glob.glob(glob.escape(b.db._bkp_marker_base('rki'))+'.*') and nr==2,x,nr,o.getvalue()[-300:])
+                import inspect,ast,textwrap
+                def body_src(f): return ast.parse(textwrap.dedent(inspect.getsource(f)))
+                trys=[t for t in ast.walk(body_src(BorgHelper.backup)) if isinstance(t,ast.Try)
+                      and any('store_bkp_status_start' in ast.unparse(s) for s in t.body)]
+                pos=lambda t,w: next((i for i,s in enumerate(t.body) if w in ast.unparse(s)),None)
+                ib,ist=(pos(trys[0],'_reconcile_killed_bkp'),pos(trys[0],'store_bkp_status_start')) if trys else (None,None)
+                res['backup() : rapprochement dans le try, avant store_bkp_status_start (structure)']=(ib is not None and ist is not None and ib<ist,ib,ist)
+                fn=body_src(BorgHelper._index_pass).body[0]
+                ia=pos(fn,'repoLocalAbsent'); ir=pos(fn,'_reconcile_killed_bkp')
+                res['_index_pass : rapprochement après la garde « dépôt absent » (structure)']=(ia is not None and ir is not None and ia<ir,ia,ir)
+                res['index() : plus d\'appel direct']=('_reconcile_killed_bkp' not in inspect.getsource(BorgHelper.index),)
+            finally:
+                _rb_killtree(child)
+                if tz0 is None: os.environ.pop('TZ',None)
+                else: os.environ['TZ']=tz0
+                time.tzset()
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("Bkp tué dont le borg a fini : ligne rapprochée en succès (commentaire du run), à l'Index et au début du Bkp (1.0.185)",_reconcile_bkp_tue)
         def _sentry_absent():
             """1.0.182 (story 48, décision de l'utilisateur) : module sentry_sdk absent (interpréteur sans le paquet) -> jamais de
             plantage. En processus : _sentry_init rend False, [WARN] une seule fois. CLI réelle (sous-processus, sys.modules

@@ -532,6 +532,17 @@ de `BKP_STATUS_TIMEOUT`. Après la fin de l'orphelin, l'archive existe mais le B
 suivant le compte comme précédent en erreur. Cache de 5 min de borgHelperWWW (`/report?offline=true`). Status dit encore
 « Bkp en cours ».
 
+Bkp tué dont le borg a fini (1.0.185) : chaque archive porte le commentaire `borgHelper run <run_id>` (visible dans `borg
+list`/`borg info`). À chaque Index et au début de chaque Bkp, la ligne `bkp_status` d'un Bkp tué (borgHelper arrêté, aucun borg
+de ce Bkp encore vivant sur un dépôt local) dont l'archive porte ce commentaire est fermée en succès, à l'heure de fin de
+l'archive : `<nick> : Bkp interrompu <8 premiers car. du run_id> rapproché — archive <nom> écrite, ligne fermée en succès`. Le Bkp
+suivant ne voit donc plus « Bkp précédent en erreur ». Si ce rapprochement passe avant `BKP_STATUS_TIMEOUT`, la notification de
+fin dit « succès » (sans compteurs d'avertissements) ; sinon l'échec (et l'alerte Sentry) déjà notifié reste, et l'historique dit
+succès. Seules les lignes encore ouvertes (aucun Bkp réussi depuis) sont examinées : un `borg list` en plus (qui lit chaque
+archive) tant qu'il y en a une — au début du Bkp suivant et dans son Index de fin au plus —, aucun sinon ; s'il échoue :
+`[WARN] … rapprochement impossible … — réessayé au prochain Index` (tant qu'aucun Bkp ne réussit d'ici là ; aussi tant que le
+borg d'un Bkp tué tient le dépôt). Archives d'avant 1.0.185 : pas de commentaire, pas de rapprochement.
+
 Dépôt local introuvable (disque démonté, chemin faux ; 1.0.167) : colonne `reste` = `⚠ dépôt absent`, nick en
 alerte (`*** nick`, rouge en HTML), code 2 ; archives affichées en hors ligne (avant : aucune archive du nick dans
 `Report -o`). Un dépôt présent mais illisible (droits) n'est jamais dit absent.

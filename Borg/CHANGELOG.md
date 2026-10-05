@@ -1,5 +1,53 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.185 — Bkp tué dont le borg a fini : ligne fermée et Index — 2026-10-05
+
+Chantier « reconstruction progressive », story 54 (rétrospective F299, A111 ; décisions de l'utilisateur). Observé avant
+(`work/m50/retro52.log`) : borgHelper tué pendant un Bkp, son `borg create` finit et écrit l'archive, mais la ligne `bkp_status`
+du Bkp reste ouverte — le Bkp suivant affiche « Bkp précédent en erreur » (`***`, code 1) et, au bout de `BKP_STATUS_TIMEOUT`,
+le watcher de borgHelperWWW notifie un échec et alerte Sentry alors que l'archive est complète.
+
+- **L'archive porte son run** : `backup()` passe `--comment "borgHelper run <run_id>"` à `borg create` (visible dans `borg
+  list`/`borg info` ; archives écrites à partir de 1.0.185 ; avec `SSH_REMFO`, cité pour le shell distant).
+- **Rapprochement** (`BorgHelper._reconcile_killed_bkp`) une fois par Index (après la garde « dépôt absent » ; son `borg list` cède
+  à une opération prioritaire ou à l'échéance comme les autres : reprise après la pause, ou fin de tranche muette) et au début de
+  chaque Bkp (après l'attente d'Index, avant sa propre ligne) : ligne OUVERTE du nick (sans fin, et aucun Bkp démarré après elle
+  n'a réussi — décision de l'utilisateur en revue, borne le coût), sans marqueur de Bkp vivant (celui du processus courant compté
+  vivant), sans `borg create` orphelin vivant de ce run (dépôt local) ; dépôt local présent ; s'il y en a, UN `borg list --json
+  --format '{comment}{end}'` (`TZ=UTC` passé à borg : `end` lu en UTC, sans conversion ni heure ambiguë) ; la ligne dont l'archive
+  (hors `.checkpoint`) porte « borgHelper run <run_id> » est fermée en succès (fin = fin de l'archive ; jamais d'écrasement).
+  Ligne : `<nick> : Bkp interrompu <run_id 8 car.> rapproché — archive <nom> écrite, ligne fermée en succès` ; échec de borg :
+  `[WARN] <nick> : rapprochement impossible (borg list : …) — réessayé au prochain Index`. Sans candidat : aucun borg. Erreur de
+  base : rien fermé, jamais le Bkp ni l'Index interrompus (à la lecture : muet ; à la fermeture : message SQLite habituel, après
+  l'attente d'une base verrouillée).
+- Effets : le Bkp suivant voit un précédent réussi ; si un Index ou un Bkp du nick passe avant `BKP_STATUS_TIMEOUT`, le watcher
+  notifie la fin en succès (plus d'échec ni d'alerte Sentry pour ce Bkp ; compteurs d'avertissements C/E inconnus, vides) — sinon
+  l'échec déjà notifié reste (le watcher ne re-notifie pas, décision de l'utilisateur) et l'historique dit succès.
+- Jamais rapprochés : Bkp vivant, orphelin qui tourne encore (dépôt local), archive sans ce commentaire (d'avant 1.0.185, `borg
+  create` manuel, autre run, autre nick), `.checkpoint`, ligne dépassée par un Bkp réussi — y compris celle dont l'examen a échoué
+  ou qui était écartée au début de ce Bkp (borg list en échec, orphelin alors vivant, Bkp `-I`) : le `[WARN]` « réessayé » ne vaut
+  que tant qu'aucun Bkp ne réussit. Un orphelin vivant (dépôt distant, ou local avec une autre ligne candidate) fait échouer le
+  `borg list` sur son verrou -> `[WARN]` à chaque Index jusqu'à sa fin.
+- Coût : un `borg list` qui lit chaque archive du motif (mesuré en local : 0,82 s contre 0,63 s, 34 archives ; distant non mesuré),
+  seulement tant qu'une ligne est candidate — au plus au début du Bkp suivant et dans son Index de fin, la ligne étant ensuite
+  dépassée par ce Bkp s'il réussit.
+- Mesuré après (vrai borg 1.2.6, `work/m50/mesure54c.log`, `BORG_EXE` qui journalise chaque appel) : borgHelper tué, orphelin
+  suspendu -> `Index` sans aucun `borg list` du rapprochement, ligne intacte ; orphelin fini -> `Index` ferme la ligne en succès,
+  fin = `end` UTC de borg ; idem sous un `TZ` étranger ; Bkp suivant : rapprochement à son début, Report pendant ce Bkp sans
+  « précédent en erreur » ; ensuite plus aucune ligne ouverte, aucun `borg list` du rapprochement. La première mesure
+  (`mesure54-1.log`) a montré l'Index de fin d'un Bkp rapprochant sa PROPRE ligne (marqueur du processus courant non compté
+  vivant) : corrigé.
+- Contrôle « Bkp tué dont le borg a fini : ligne rapprochée en succès … » (22 nicks, borg list simulé, marqueurs à la main ; fins
+  distinctes par archive ; `_index_pass` exécuté avec un faux borg qui obéit à son arrêt : interrompu, reprise, une fois par Index,
+  échéance ; `backup()` local, `SSH_REMFO`, Ctrl-C pendant son `borg list` : 130, aucun create, `priority.lock` et marqueur retirés).
+- Revue 1 (3 relecteurs, `work/rev54/`) : commentaire coupé en trois mots par le shell distant avec `SSH_REMFO` (tous ces Bkp
+  cassés) ; lignes jamais rapprochables relançant un `borg list` à chaque Index ; `borg list` du rapprochement sans arrêt
+  prioritaire et avant la garde « dépôt absent » ; fuseau de borg non transmis ; erreur de base à la fermeture qui pouvait tuer le
+  Bkp ; promesse du watcher sans condition — corrigés. Revue 2 (`work/rev54b/`) : `TZ` vide ou heure ambiguë (-> `TZ=UTC`) ;
+  tranche dont le rapprochement atteint l'échéance : faux `[WARN]` sur le `borg list` initial ; dépôt absent au début d'un Bkp ;
+  checkpoint de borg 1.1 ; une erreur sur un candidat abandonnait les suivants ; preuves par structure seule — corrigés.
+MUTATIONS54
+
 ## borgHelper 1.0.184 — Report pendant un borg orphelin : base et mention — 2026-10-05
 
 Chantier « reconstruction progressive », story 52 (rétrospective F291, A109 ; décisions de l'utilisateur au checkpoint).
