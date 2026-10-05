@@ -2384,6 +2384,24 @@ appliquée. `MAX_AGE_BKP`, « aucune archive » et « dépôt absent » restent 
 (`[WARN] store_bkp_status_start a échoué`) : Bkp vu « en attente » jusqu'à sa fin. Le cache de `/report?offline=true` de
 borgHelperWWW (5 min, empreinte = mtimes de diff.db, cache.db, history.db et `-wal` du nick) n'inclut pas les marqueurs.
 
+**Report pendant un borg orphelin (1.0.184, story 52)** : `backup()` appelle `boex(create, forceEnv=dict(forceEnv or {},
+BORGHELPER_BKP_RUN=run_id, BORGHELPER_BKP_PID="<pid>:<début>"))` (`_proc_start`, ticks de `/proc/<pid>/stat`) — boex recopie
+`forceEnv` dans l'environnement de borg (`env=varfut`), sur ce seul `borg create`. `BorgHelperDB.repo_lock_holders(nick)` : PID
+(> 1) des détenteurs exclusifs du verrou du dépôt LOCAL (`BORG_REPO` absolu sans `:` ni `{…}`, ni `SSH_REPO` ni `SSH_REMFO`) lus
+dans `<dépôt>/lock.roster` (`{"exclusive": [["<hôte>@<id>", pid, thread]]}` ; toute anomalie : `[]`, jamais d'exception) — la
+partie hôte n'est pas comparée (elle dépend de `BORG_HOST_ID`, de `getfqdn`, et la partie après `@` varie d'un processus à
+l'autre, mesuré). `repo_orphan_create(nick)` : un de ces PID dont la première sous-commande borg de l'argv (`_BORG_SUBCMDS`,
+`_proc_argv`) est `create`, dont `/proc/<pid>/environ` porte les deux variables, et dont le processus `BORGHELPER_BKP_PID` n'est
+plus vivant (`_proc_live`) -> `{'pid', 'run_id'}`. `BorgHelperDB.bkp_status_open(nick, run_id, timeout_s)` : ligne ouverte de CE
+run (`stale` comme `get_running_bkp_status`). `_bkp_live` : sans marqueur vivant, `repo_orphan_create` d'abord (aucun détenteur :
+ni délai rc ni base lus), puis `bkp_status_open(son run_id)` ouverte et non périmée -> live `orphelin` (« depuis » = début de la
+ligne) ; `_bkp_live_mark` : mention `⏳ Bkp interrompu, borg create encore actif depuis …`, JSON `orphelin` (false dans les autres
+cas), alerte (code 1) ; `_bkp_neighbor` entre si un marqueur existe ou si `repo_orphan_create(nick)` trouve un orphelin, et
+cherche chaque autre nick du dépôt par `_bkp_live` (sa ligne doit porter le run_id). Mesuré : borg 1.2.6 = script `nice` ->
+chargeur PyInstaller `borg.wrapped` -> enfant `borg.wrapped` qui tient le verrou (environnement hérité) ; après SIGKILL de
+borgHelper, parent 1, l'archive est écrite. Revues : versions par nom d'ancêtre et nom d'hôte, puis par absence de marqueur,
+abandonnées.
+
 **Compatibilité Python 3.10 à 3.14 (1.0.182, story 48)** : vérifiée par un CodecSelfTest complet sous chaque version (3.10.12
 système avec SQLite 3.37.2 et sentry-sdk 1.4.3 ; 3.11.15, 3.12.13, 3.13.13, 3.14.5 d'uv avec SQLite 3.50.4, prettytable 3.18.0 et
 sentry-sdk 2.71.0 en venv ; `tools/make_pyvenvs.sh`, venv-3.10 = système en `--system-site-packages`), par `cst.sh start ALL

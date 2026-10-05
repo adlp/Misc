@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.183"
+Version="1.0.184"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -3752,6 +3752,47 @@ class BorgHelperDB:
         return os.path.join(self.cache_dir,f"{self.db_prefix}-{k}-bkp.lock")
     def set_bkp_marker(self,nick,run_id): self._set_pid_lock(f"{self._bkp_marker_base(nick)}.{run_id}")
     def clear_bkp_marker(self,nick,run_id): self._clear_pid_lock(f"{self._bkp_marker_base(nick)}.{run_id}")
+    def repo_lock_holders(self,nick):
+        """1.0.184 (story 52) : PID des détenteurs exclusifs du verrou du dépôt LOCAL du nick (lock.roster de borg :
+        {"exclusive": [["<hôte>@<id>", pid, thread], …]}) ; dépôt distant (« : », {…}, SSH_REPO, SSH_REMFO), roster absent, illisible
+        ou de forme inattendue : [] — jamais une exception."""
+        try:
+            cfg=self._cfg_reader(nick) if self._cfg_reader else None
+            if cfg is None: return []
+            repo=(cfg.get('BORG_REPO') or '').strip()
+            if not repo or ':' in repo or '{' in repo or not os.path.isabs(repo): return []
+            if (cfg.get('SSH_REPO') or '').strip() or (cfg.get('SSH_REMFO') or '').strip(): return []
+            with open(os.path.join(repo,'lock.roster')) as f: ro=json.load(f)
+            hs=ro.get('exclusive') if isinstance(ro,dict) else None
+            if not isinstance(hs,list): return []
+            out=[]
+            for h in hs:
+                try: pid=int(h[1])
+                except (TypeError,ValueError,IndexError,KeyError): continue
+                if pid>1: out.append(pid)
+            return out
+        except Exception: return []   # roster pathologique (JSON très imbriqué…) compris : jamais une exception
+
+    def repo_orphan_create(self,nick):
+        """1.0.184 (story 52, revues : lien au Bkp exact, mort prouvée) : `borg create` ORPHELIN détenteur du verrou du dépôt local du
+        nick — backup() passe à son seul borg create BORGHELPER_BKP_RUN=<run_id de sa ligne bkp_status> et BORGHELPER_BKP_PID=<pid>:<début>
+        (son propre processus) ; ici : détenteur vivant dont la première sous-commande borg de l'argv est create et dont
+        /proc/<pid>/environ porte les deux, le processus BORGHELPER_BKP_PID n'étant plus vivant (_proc_live : borgHelper tué, SIGKILL,
+        OOM ; PID réattribué compris). Un borg lancé à la main, par cron, par borgmatic (sans ces variables), un borg d'Index, de Restore,
+        de Prune (autre sous-commande), un Bkp vivant (son borgHelper vit) n'en sont jamais. Environnement illisible (autre uid,
+        hidepid) : pas d'orphelin. {'pid', 'run_id'} — l'appelant rattache ce run_id à la ligne ouverte du nick — ou None."""
+        for pid in self.repo_lock_holders(nick):
+            a=_proc_argv(pid)
+            if not a or next((x for x in a[1:] if x in _BORG_SUBCMDS),None)!='create': continue
+            try:
+                with open(f'/proc/{pid}/environ','rb') as f: env=dict(x.split(b'=',1) for x in f.read().split(b'\0') if b'=' in x)
+                rid=env.get(b'BORGHELPER_BKP_RUN',b'').decode(); bp,bs=env.get(b'BORGHELPER_BKP_PID',b'').decode().split(':',1)
+                bp=int(bp)
+            except (OSError,ValueError,UnicodeDecodeError): continue
+            if not rid or _proc_live(bp,bs): continue   # son borgHelper vit : Bkp vivant (marqueur absent ou non), pas un orphelin
+            return {'pid':pid,'run_id':rid}
+        return None
+
     def any_bkp_marker(self):
         """Un marqueur de Bkp (vivant ou non) existe-t-il dans CACHE_DIR ? Test rapide avant de chercher un nick voisin."""
         return bool(glob.glob(os.path.join(glob.escape(self.cache_dir),f"{glob.escape(self.db_prefix)}-*-bkp.lock.*")))
@@ -3771,6 +3812,20 @@ class BorgHelperDB:
         if db_path is None: return False
         conn=_open_db(db_path,nick=None,role='read')
         try: return conn.execute("SELECT 1 FROM bkp_status WHERE nick=? AND run_id=?",(nick,run_id)).fetchone() is not None
+        finally: conn.close()
+
+    def bkp_status_open(self,nick,run_id,timeout_s,db_path=None):
+        """1.0.184 (story 52) : ligne bkp_status OUVERTE (finished_at nul) du run `run_id` du nick, {run_id, started_at, stale} ;
+        None si absente ou close. stale : même règle que get_running_bkp_status (délai validé comme la variable). Lecture impossible :
+        exception (l'appelant, _bkp_live, rend alors None)."""
+        db_path=self._hist(nick,db_path)
+        if db_path is None: return None
+        conn=_open_db(db_path,nick=None,role='read')
+        try:
+            t=_bkp_status_timeout(timeout_s)
+            r=conn.execute("SELECT run_id,started_at,COALESCE(started_at >= datetime('now',?),0) FROM bkp_status "
+                           "WHERE nick=? AND run_id=? AND finished_at IS NULL",(f"-{t} seconds",nick,run_id)).fetchone()
+            return {'run_id':r[0],'started_at':r[1],'stale':not r[2]} if r else None
         finally: conn.close()
 
     def list_pending_bkp_status(self,nick,timeout_s,db_path=None):
@@ -4294,6 +4349,16 @@ def _proc_live(pid,start):
         fl=st[st.rindex(')')+2:].split()
         return fl[19]==start and fl[0]!='Z'
     except (OSError,ValueError,IndexError): return False
+
+_BORG_SUBCMDS=frozenset(('benchmark','break-lock','check','compact','config','create','debug','delete','diff','export-tar','extract',
+    'help','import-tar','info','init','key','list','mount','prune','recreate','rename','serve','umount','upgrade','version','with-lock'))
+
+def _proc_argv(pid):
+    """1.0.184 (story 52) : argv d'un processus (/proc/<pid>/cmdline) ; None s'il est fini, illisible ou vide (noyau, zombie)."""
+    try:
+        with open(f'/proc/{pid}/cmdline','rb') as f: a=f.read()
+    except OSError: return None
+    return [x.decode(errors='replace') for x in a.split(b'\0')[:-1]] if a else None
 
 def _group_pids(pgid):
     """PID des processus VIVANTS du groupe `pgid` (champ pgrp de /proc/<pid>/stat, zombies exclus) ; /proc illisible : None.
@@ -6037,7 +6102,9 @@ class BorgHelper:
                     self.db.store_bkp_status_finish(nick,run_id,'error',bkp_status_db)
                     sentry_alert('bkp_error',nick,f"Sauvegarde en échec — {nick} ({msg})",cfg,extra={'exitcode':2})
                     sys.exit(2)
-            anaRet=self.borg.boex(nick,create,preBorg=preBorg,forceEnv=forceEnv,debug=debug)
+            # 1.0.184 (story 52) : le run_id dans l'environnement de borg create — Report reconnaît ce borg s'il survit à borgHelper
+            anaRet=self.borg.boex(nick,create,preBorg=preBorg,debug=debug,
+                                  forceEnv=dict(forceEnv or {},BORGHELPER_BKP_RUN=run_id,BORGHELPER_BKP_PID=f"{os.getpid()}:{_proc_start(os.getpid())}"))
             newretC=0
             if anaRet['exitcode']:
                 for i in anaRet['stderr']:
@@ -9009,7 +9076,10 @@ class BorgHelper:
         """1.0.183 (story 50, demande et décisions de l'utilisateur) : Bkp VIVANT du nick — marqueur de Bkp vivant (bkp_markers :
         le processus du Bkp lui-même, Index de fin compris) ET, soit sa ligne bkp_status ouverte et non périmée (délai
         bkp_status_timeout), soit pas encore de ligne (Bkp en attente de l'Index, décision revue 2 : 'en_attente', début = date du
-        marqueur). Bkp tué, périmé, autre opération : None, comportement inchangé. Rend la ligne augmentée de 'depuis'
+        marqueur). 1.0.184 (story 52) : sans marqueur vivant, Bkp TUÉ dont le borg create (BORGHELPER_BKP_RUN = run_id de la ligne
+        ouverte non périmée) tient encore le dépôt local (repo_orphan_create) -> 'orphelin' ; le roster du dépôt est alors lu (le rc
+        aussi, pour son chemin), le délai rc et la base seulement s'il a un détenteur. Bkp tué sans borg vivant, périmé, autre
+        opération : None, comportement inchangé. Rend la ligne augmentée de 'depuis'
         (« HH:MM (XhYYmin) », format de Status), 'started_iso' (UTC) et 'en_attente', et le dit sur stderr (sauf quiet) ; Report
         (en ligne comme -o) tire alors ce nick de la base, sans borg ni attente : avant, borg info échouait sur le verrou du dépôt
         (« Failed to create/acquire the lock », ligne ERREUR, code 2, aucun historique). Toute erreur de lecture : None (revue 2 :
@@ -9017,9 +9087,16 @@ class BorgHelper:
         from datetime import datetime,timezone
         try:
             marks=self.db.bkp_markers(nick)
-            if not marks: return None   # aucun Bkp vivant : rc (BKP_STATUS_TIMEOUT) ni base lus
-            row=self.db.get_running_bkp_status(nick,timeout_s=self.bkp_status_timeout(nick))
-            if row and row['run_id'] in marks:
+            if not marks:
+                # 1.0.184 (story 52) : borgHelper tué, le borg create de SON Bkp (ligne ouverte) tient encore le dépôt ; sans détenteur
+                # du verrou dans le roster du dépôt local, ni délai rc ni base lus
+                orp=self.db.repo_orphan_create(nick)   # revue 2 : run_id lu chez l'orphelin, sa ligne cherchée (pas la plus récente)
+                if not orp: return None
+                row=self.db.bkp_status_open(nick,orp['run_id'],timeout_s=self.bkp_status_timeout(nick))
+                if not row or row.get('stale'): return None
+                st=datetime.strptime(row['started_at'],"%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                row['en_attente']=False; row['orphelin']=True
+            elif (row:=self.db.get_running_bkp_status(nick,timeout_s=self.bkp_status_timeout(nick))) and row['run_id'] in marks:
                 if row.get('stale'): return None
                 st=datetime.strptime(row['started_at'],"%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc); row['en_attente']=False
             else:
@@ -9028,21 +9105,24 @@ class BorgHelper:
                 rid=max(wait,key=marks.get)
                 st=datetime.fromtimestamp(int(marks[rid]),timezone.utc)
                 row={'run_id':rid,'started_at':st.strftime("%Y-%m-%d %H:%M:%S"),'stale':False,'en_attente':True}
+            row.setdefault('orphelin',False)
         except Exception: return None
         row['started_iso']=st.strftime('%Y-%m-%dT%H:%M:%SZ')
         try: row['depuis']=_bkp_running_readable(row['started_at'])
         except (ValueError,TypeError): row['depuis']=row['started_iso']
         if not quiet:
-            what="Bkp en attente de l'Index" if row['en_attente'] else "Bkp en cours"
+            what=("Bkp interrompu (borgHelper arrêté), borg create encore actif" if row['orphelin'] else
+                  "Bkp en attente de l'Index" if row['en_attente'] else "Bkp en cours")
             printer(f"  {nick} : {what} depuis {row['depuis']} — rapport tiré de la base, borg non interrogé")
         return row
 
     def _bkp_neighbor(self,nick):
         """1.0.183 (story 50, revue 2, décision de l'utilisateur) : Bkp vivant d'un AUTRE nick du même dépôt borg (_repo_key) —
         borg info de ce nick buterait sur le verrou du dépôt. Rend la ligne de _bkp_live de ce voisin, 'voisin' = son nick, et le
-        dit sur stderr ; None sinon (aucun marqueur dans CACHE_DIR : rien n'est lu)."""
+        dit sur stderr ; None sinon (aucun marqueur dans CACHE_DIR et aucun détenteur du verrou du dépôt : rien d'autre n'est lu).
+        1.0.184 (story 52) : le voisin peut être un Bkp tué dont le borg create tient encore le dépôt ('orphelin')."""
         try:
-            if not self.db.any_bkp_marker(): return None
+            if not self.db.any_bkp_marker() and not self.db.repo_orphan_create(nick): return None   # 1.0.184 : orphelin prouvé seulement
             key=self.db._repo_key(nick); others=[n for n in (self.borg.cfgreadnicks() or '').split(',') if n and n!=nick]   # chaîne « a,b »
         except Exception: return None
         for o in others:
@@ -9052,7 +9132,8 @@ class BorgHelper:
             lv=self._bkp_live(o,quiet=True)
             if lv:
                 lv['voisin']=o
-                printer(f"  {nick} : Bkp de {o} en cours sur le même dépôt depuis {lv['depuis']} — rapport tiré de la base, borg non interrogé")
+                what=f"Bkp de {o} interrompu, borg create encore actif" if lv['orphelin'] else f"Bkp de {o} en cours"   # 1.0.184
+                printer(f"  {nick} : {what} sur le même dépôt depuis {lv['depuis']} — rapport tiré de la base, borg non interrogé")
                 return lv
         return None
 
@@ -9062,20 +9143,26 @@ class BorgHelper:
         bkp_status ; JSON : champ bkp_en_cours) ; alerte (nick ***, code 1) si le Bkp PRÉCÉDENT (previous_bkp_status) a échoué ou
         n'a jamais fini. Voisin (live['voisin'], Bkp d'un autre nick du dépôt) : « ⏳ Bkp de <voisin> en cours sur le dépôt
         depuis … », JSON bkp_voisin, jamais d'alerte. MAX_AGE_BKP et « aucune archive » restent la règle de l'appelant (code 1).
-        Rend 0 ou 1."""
+        1.0.184 (story 52, décisions de l'utilisateur) : live['orphelin'] (Bkp tué, borg create encore actif) -> « ⏳ Bkp interrompu,
+        borg create encore actif depuis … » (voisin : « ⏳ Bkp de A interrompu, borg create encore actif sur le dépôt … »), JSON
+        orphelin (false sinon), alerte code 1 quel que soit le précédent (voisin : jamais). Rend 0 ou 1."""
         cur=row.get('reste')
         if live.get('voisin'):
-            mention=f"⏳ Bkp de {live['voisin']} en cours sur le dépôt depuis {live['depuis']}"
+            what=f"Bkp de {live['voisin']} interrompu, borg create encore actif" if live.get('orphelin') else f"Bkp de {live['voisin']} en cours"
+            mention=f"⏳ {what} sur le dépôt depuis {live['depuis']}"
             row['reste']=f"{cur} — {mention}" if cur not in (None,'') else mention
-            if as_json: row['bkp_voisin']={'nick':live['voisin'],'started_at':live['started_iso'],'depuis':live['depuis'],'en_attente':live['en_attente']}
+            if as_json: row['bkp_voisin']={'nick':live['voisin'],'started_at':live['started_iso'],'depuis':live['depuis'],'en_attente':live['en_attente'],
+                                           'orphelin':bool(live.get('orphelin'))}
             return 0
         prev=self.db.previous_bkp_status(nick,None if live['en_attente'] else live['run_id'])
         failed=bool(prev and prev['failed'])
-        what="Bkp en attente de l'Index" if live['en_attente'] else "Bkp en cours"
+        orph=bool(live.get('orphelin'))   # 1.0.184 (story 52) : Bkp interrompu, borg encore actif -> alerte (décision de l'utilisateur)
+        what="Bkp interrompu, borg create encore actif" if orph else "Bkp en attente de l'Index" if live['en_attente'] else "Bkp en cours"
         mention=f"⏳ {what} depuis {live['depuis']}"+(" — Bkp précédent en erreur" if failed else '')
         row['reste']=f"{cur} — {mention}" if cur not in (None,'') else mention
-        if as_json: row['bkp_en_cours']={'started_at':live['started_iso'],'depuis':live['depuis'],'precedent_en_erreur':failed,'en_attente':live['en_attente']}
-        if not failed: return 0
+        if as_json: row['bkp_en_cours']={'started_at':live['started_iso'],'depuis':live['depuis'],'precedent_en_erreur':failed,'en_attente':live['en_attente'],
+                                         'orphelin':orph}
+        if not (failed or orph): return 0
         if htrep:
             if nick not in errhost: errhost.append(nick)
         elif not str(row.get('nom','')).startswith('*'): row['nom']=f"***{nick}"
@@ -14900,6 +14987,167 @@ fail()
             if bad: print(f"  {bad}")
             return not bad
         check("Report pendant un Bkp vivant : base seule, « Bkp en cours », code selon le Bkp précédent (1.0.183)",_report_bkp_live)
+        def _report_borg_orphelin():
+            """1.0.184 (story 52, décisions de l'utilisateur, revue : lien au Bkp exact) — borgHelper tué, le borg create de SON Bkp
+            tient encore le dépôt : faux borg `borg.wrapped` (script python) lancé par double fork avec BORGHELPER_BKP_RUN=<run_id>
+            dans son environnement (comme backup()), lock.roster écrit à la main ; borg piégé (boex lève « borg appelé »).
+            ro1 ligne ouverte (run 2) + create du run 2 -> base, « Bkp interrompu, borg create encore actif », orphelin: true, code 1 ;
+            ro2 voisin sans ligne et ro15 voisin à sa propre ligne ouverte (run 5) -> « Bkp de ro1 interrompu », bkp_voisin, code 0 ;
+            négatifs (comme avant : borg en ligne, rien en -o) : ro3 `list` du run 2 (Index), ro4 create sans run (main, cron,
+            borgmatic), ro5 create d'un autre run, ro6 lignes closes, ro7 ligne périmée, ro8 roster invalide, ro9 PID mort,
+            ro11 SSH_REPO, ro13 roster de forme inattendue, ro16 create du run 2 dont le borgHelper VIT (marqueur non écrit) ;
+            ro17 deux lignes ouvertes, l'orphelin est celui de la plus ancienne -> détecté, « depuis » = sa ligne ; ro10 marqueur vivant ->
+            story 50 (orphelin: false) ; ro12 sans roster, délai rc invalide -> rien lu ; SSH_REMFO, « : », « {…} » -> aucun détenteur
+            lu ; argv réel PyInstaller (borg.wrapped en argv[0]) ; backup() par le VRAI boex (BORG_EXE factice qui enregistre son
+            environnement) : BORGHELPER_BKP_RUN = run_id de sa ligne, BORGHELPER_BKP_PID = ce processus."""
+            from datetime import datetime,timedelta
+            d=os.path.join(tmp,'rbo52'); shutil.rmtree(d,ignore_errors=True); os.makedirs(d); rc=os.path.join(d,'rc')
+            fb=os.path.join(d,'fb'); os.makedirs(fb); fake=os.path.join(fb,'borg.wrapped')
+            with open(fake,'w') as f: f.write("#!/usr/bin/env python3\nimport sys,time\ntime.sleep(float(sys.argv[-1]))\n")
+            os.chmod(fake,0o700)
+            rec=os.path.join(fb,'borgrec')   # BORG_EXE factice de rob : enregistre son environnement, puis code 0
+            with open(rec,'w') as f:
+                f.write("#!/usr/bin/env python3\nimport os,sys\nsub=next((x for x in sys.argv[1:] if not x.startswith('-')),'x')\n"
+                        f"open(os.path.join({d!r},'rec-'+sub+'.txt'),'w').write(os.environ.get('BORGHELPER_BKP_RUN','-')+'|'+os.environ.get('BORGHELPER_BKP_PID','-'))\n")
+            os.chmod(rec,0o700)
+            nk=tuple(f'ro{i}' for i in range(1,18)); repo=lambda n: os.path.join(d,'r-'+('ro1' if n in ('ro2','ro15') else n))
+            for n in nk+('rob','ro18'):
+                if n not in ('ro2','ro15'): os.makedirs(repo(n))
+            os.makedirs(os.path.join(d,'r-{x}'))
+            extra={'ro7':"BKP_STATUS_TIMEOUT=60\n",'ro11':"SSH_REPO=u@h:/r\n",'ro12':"BKP_STATUS_TIMEOUT=abc\n",'ro18':"SSH_REMFO=2222:x:22\n",
+                   'rob':f"BORG_EXE={rec}\n"}
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nBORG_PASSPHRASE=pw\nSER_NAME=h\nSER_LOGIN=x\nGLOB_ARCH=*\n"
+                        f"BORG_ARCHNAME=t\nEXCLUDE=--exclude-caches\nDB_ENCRYPT=false\nMAX_AGE_BKP=1000000\n\n"
+                        +''.join(f"[{n}]\nBORG_REPO={repo(n)}\n"+extra.get(n,'')+"\n" for n in nk+('rob','ro18'))
+                        +f"[ro19]\nBORG_REPO=u@h:{repo('ro1')}\n\n[ro20]\nBORG_REPO={os.path.join(d,'r-{x}')}\n\n")
+            os.chmod(rc,0o600)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            recent=(datetime.now()-timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%S.000000')
+            RUN=lambda k: str(k).rjust(32,'0')
+            def orphan(sub,run,bkp):   # double fork : le faux borg survit à son sh (fini avant le retour de run), rattaché hors de ce selftest
+                en=dict(os.environ); en.pop('BORGHELPER_BKP_RUN',None); en.pop('BORGHELPER_BKP_PID',None)
+                if run: en['BORGHELPER_BKP_RUN']=run; en['BORGHELPER_BKP_PID']=bkp
+                r=subprocess.run(['sh','-c','"$@" >/dev/null 2>&1 </dev/null & echo $!','sh',fake,sub,'--log-json','::a','3600'],
+                                 capture_output=True,text=True,timeout=30,stdin=subprocess.DEVNULL,env=en)
+                pid=int(r.stdout.strip()); return pid,_proc_start(pid)
+            res={}; orig=b.borg.boex; orph=[]
+            try:
+                dead=subprocess.Popen(['sleep','0.3']); mort=f"{dead.pid}:{_proc_start(dead.pid)}"; dead.wait()   # borgHelper « tué »
+                vif=f"{os.getpid()}:{_proc_start(os.getpid())}"   # borgHelper vivant (ce selftest)
+                O1=orphan('create',RUN(2),mort); orph.append(O1)
+                O2=orphan('list',RUN(2),mort); orph.append(O2)
+                O3=orphan('create',None,None); orph.append(O3)
+                O4=orphan('create',RUN(9),mort); orph.append(O4)
+                O5=orphan('create',RUN(2),vif); orph.append(O5)
+                time.sleep(0.5)
+                roster={'ro1':O1[0],'ro3':O2[0],'ro4':O3[0],'ro5':O4[0],'ro6':O1[0],'ro7':O1[0],'ro9':dead.pid,'ro10':O1[0],'ro11':O1[0],
+                        'ro16':O5[0],'ro17':O1[0],'ro18':O1[0]}
+                with open(os.path.join(d,'r-{x}','lock.roster'),'w') as f: json.dump({'exclusive':[['h@1',O1[0],0]]},f)
+                for n,pid in roster.items():
+                    with open(os.path.join(repo(n),'lock.roster'),'w') as f: json.dump({'exclusive':[[f'{socket.gethostname()}@12345',pid,0]]},f)
+                with open(os.path.join(repo('ro8'),'lock.roster'),'w') as f: f.write('{"exclusive": [[')
+                with open(os.path.join(repo('ro13'),'lock.roster'),'w') as f: f.write('{"exclusive": 5}')
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                    for n in nk:
+                        p=b.db.get_diff_db(n); b.db.ensure_diff_db(p)
+                        c=sqlite3.connect(p,isolation_level=None)
+                        c.execute("INSERT INTO archive_stats(nick,archive,archive_date,duration,original_size,compressed_size,"
+                                  "deduplicated_size,nfiles) VALUES(?,?,?,?,?,?,?,?)",(n,f'{n}-a1',recent,60,10,10,10,1))
+                        c.close()
+                        if n in ('ro2','ro12'): continue
+                        h=b.db.get_history_db(n); cur=RUN(5 if n=='ro15' else 2)
+                        b.db.store_bkp_status_start(n,RUN(1),db_path=h); b.db.store_bkp_status_finish(n,RUN(1),'success',db_path=h)
+                        b.db.store_bkp_status_start(n,cur,db_path=h)
+                        if n=='ro6': b.db.store_bkp_status_finish(n,cur,'success',db_path=h)
+                        if n=='ro17': b.db.store_bkp_status_start(n,RUN(3),db_path=h)   # Bkp suivant, tué avant son borg create
+                        c=sqlite3.connect(h,isolation_level=None)
+                        c.execute("UPDATE bkp_status SET started_at=datetime('now','-1 hour') WHERE nick=? AND run_id=?",(n,RUN(1)))
+                        if n=='ro17': c.execute("UPDATE bkp_status SET started_at=datetime('now','-30 minutes') WHERE nick=? AND run_id=?",(n,RUN(2)))
+                        if n=='ro7': c.execute("UPDATE bkp_status SET started_at=datetime('now','-120 seconds') WHERE nick=? AND run_id=?",(n,cur))
+                        c.close()
+                mk10=f"{b.db._bkp_marker_base('ro10')}.{RUN(2)}"   # posé seulement pour ro10 : sinon any_bkp_marker() ouvre le voisin
+                b.borg.boex=lambda *a,**k: (_ for _ in ()).throw(RuntimeError('borg appelé'))
+                def run(fn,*a,**k):
+                    o,e=io.StringIO(),io.StringIO()
+                    with contextlib.redirect_stdout(o),contextlib.redirect_stderr(e):
+                        try: code=fn(*a,**k)
+                        except (Exception,SystemExit) as x: code=f"{type(x).__name__}: {x}"
+                    return code,o.getvalue(),e.getvalue()
+                def row(o,n):
+                    try: return (json.loads(o).get('summary') or {}).get(n) or {}
+                    except ValueError: return {}
+                def ppid(q):
+                    with open(f'/proc/{q}/stat') as f: return int(f.read().rsplit(')',1)[1].split()[1])
+                res['décor : faux borg vivants, rattachés hors de ce selftest']=(all(_proc_live(p,st) and ppid(p)!=os.getpid() for p,st in orph),
+                                                                               [ppid(p) for p,_ in orph])
+                ro=b.db.repo_orphan_create
+                v={n:ro(n) for n in ('ro1','ro3','ro4','ro5','ro8','ro9','ro11','ro12','ro13','ro16')}
+                lh={n:b.db.repo_lock_holders(n) for n in ('ro11','ro13','ro18','ro19','ro20')}
+                res['repo_orphan_create : ro1 et ro5 (run lu chez le borg) ; list, sans run, borgHelper vivant, roster invalide/inattendu, PID mort, distant -> None']=(
+                    v['ro1']=={'pid':O1[0],'run_id':RUN(2)} and v['ro5']=={'pid':O4[0],'run_id':RUN(9)}
+                    and all(v[n] is None for n in ('ro3','ro4','ro8','ro9','ro11','ro12','ro13','ro16')) and all(x==[] for x in lh.values()),v,lh)
+                real_argv=_proc_argv
+                with mock.patch(f"{__name__}._proc_argv",side_effect=lambda q: ['/usr/local/bin/borg.wrapped','create','--log-json','::a'] if q==O1[0] else real_argv(q)):
+                    a1=ro('ro1')
+                with mock.patch(f"{__name__}._proc_argv",side_effect=lambda q: ['/usr/local/bin/borg.wrapped','list','::a'] if q==O1[0] else real_argv(q)):
+                    a2=ro('ro1')
+                res['argv réel PyInstaller (borg.wrapped en argv[0]) : create détecté, list non']=((a1 or {}).get('pid')==O1[0] and a2 is None,a1,a2)
+                for fn,F in ((b.report,'Report'),(b.report_offline,'Report -o')):
+                    on=fn==b.report
+                    code,o,e=run(fn,'ro1',as_json=True); r=row(o,'ro1'); bk=r.get('bkp_en_cours') or {}
+                    res[f'{F} ro1 orphelin : base, mention, orphelin: true, ***, code 1, stderr']=(code==1 and r.get('nom')=='***ro1'
+                        and ' — ⏳ Bkp interrompu, borg create encore actif depuis ' in r.get('reste','') and bk.get('orphelin') is True
+                        and bk.get('en_attente') is False and 'ro1 : Bkp interrompu (borgHelper arrêté), borg create encore actif depuis' in e
+                        and 'rapport tiré de la base, borg non interrogé' in e and 'borg appelé' not in o+e and 'ro1-a1' in o,code,r,e[-300:])
+                    code,o,e=run(fn,'ro1',htrep=True)
+                    res[f'{F} ro1 HTML : mention, rouge, 1']=(code==1 and 'Bkp interrompu, borg create encore actif' in o and 'FF6161' in o,code,o[-200:])
+                    code,o,e=run(fn,'ro2',htrep=True)
+                    res[f'{F} ro2 HTML voisin : mention, pas rouge, 0']=(code==0 and 'Bkp de ro1 interrompu, borg create encore actif sur le dépôt' in o
+                        and 'FF6161' not in o,code,o[-200:])
+                    st17=sqlite3.connect(b.db.get_history_db('ro17')).execute("SELECT started_at FROM bkp_status WHERE nick='ro17' AND run_id=?",(RUN(2),)).fetchone()[0]
+                    code,o,e=run(fn,'ro17',as_json=True); r=row(o,'ro17'); bk=r.get('bkp_en_cours') or {}
+                    res[f'{F} ro17 orphelin de la ligne la plus ancienne : détecté, début de SA ligne']=(code==1 and bk.get('orphelin') is True
+                        and bk.get('started_at')==st17.replace(' ','T')+'Z',code,r,st17)
+                    for n in ('ro2','ro15'):
+                        code,o,e=run(fn,n,as_json=True); r=row(o,n); bv=r.get('bkp_voisin') or {}
+                        res[f'{F} {n} voisin : base, mention de ro1, bkp_voisin orphelin, 0']=(code==0
+                            and r.get('reste','').endswith(' — ⏳ Bkp de ro1 interrompu, borg create encore actif sur le dépôt depuis '+str(bv.get('depuis')))
+                            and bv.get('nick')=='ro1' and bv.get('orphelin') is True and 'bkp_en_cours' not in r
+                            and f'{n} : Bkp de ro1 interrompu, borg create encore actif sur le même dépôt depuis' in e and 'borg appelé' not in o+e,code,r,e[-300:])
+                    for n,why in (('ro3','list du run (Index)'),('ro4','create sans run (main, cron, borgmatic)'),('ro5','create d\'un autre run'),
+                                  ('ro6','lignes closes'),('ro7','ligne périmée'),('ro8','roster invalide'),('ro9','PID mort'),('ro11','SSH_REPO'),
+                                  ('ro13','roster de forme inattendue'),('ro16','borgHelper vivant (marqueur non écrit)')):
+                        code,o,e=run(fn,n,as_json=True); r=row(o,n)
+                        ok=(code==2 and 'borg appelé' in r.get('reste','')) if on else (code==0 and r.get('nom')==n)
+                        res[f'{F} {n} {why} : comme avant']=(ok and '⏳' not in r.get('reste','') and 'interrompu' not in e and 'bkp_en_cours' not in r,code,r,e[-200:])
+                    with open(mk10,'w') as f: f.write(str(O1[0]))
+                    code,o,e=run(fn,'ro10',as_json=True); r=row(o,'ro10'); bk=r.get('bkp_en_cours') or {}
+                    os.unlink(mk10)
+                    res[f'{F} ro10 marqueur vivant : story 50, orphelin: false']=(code==0 and '⏳ Bkp en cours depuis' in r.get('reste','')
+                        and bk.get('orphelin') is False and 'interrompu' not in o+e,code,r)
+                    code,o,e=run(fn,'ro12',as_json=True); r=row(o,'ro12')
+                    res[f'{F} ro12 sans roster, délai rc invalide : rien lu']=('BKP_STATUS_TIMEOUT' not in e and '⏳' not in r.get('reste',''),code,e[-200:])
+                # backup() par le VRAI boex (BORG_EXE factice qui enregistre son environnement) : run_id de sa ligne, PID de ce processus
+                b.borg.boex=orig; o=io.StringIO()
+                with mock.patch.object(b.db,'wait_index_idle',lambda *a,**k: None),contextlib.redirect_stdout(o),contextlib.redirect_stderr(o):
+                    try: b.backup('rob',no_index=True)
+                    except (Exception,SystemExit): pass
+                rid=sqlite3.connect(b.db.get_history_db('rob')).execute("SELECT run_id FROM bkp_status WHERE nick='rob'").fetchone()
+                try: got=open(os.path.join(d,'rec-create.txt')).read()
+                except OSError: got=None
+                res['backup() par le vrai boex : BORGHELPER_BKP_RUN et BORGHELPER_BKP_PID dans l\'environnement de borg create']=(rid is not None
+                    and got==f"{rid[0]}|{vif}",rid,got,o.getvalue()[-300:])
+            finally:
+                b.borg.boex=orig
+                for p,st in orph:
+                    if _proc_live(p,st):
+                        try: os.kill(p,signal.SIGKILL)
+                        except OSError: pass
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("Report pendant un borg orphelin : base, « Bkp interrompu, borg create encore actif », code 1 (1.0.184)",_report_borg_orphelin)
         def _sentry_absent():
             """1.0.182 (story 48, décision de l'utilisateur) : module sentry_sdk absent (interpréteur sans le paquet) -> jamais de
             plantage. En processus : _sentry_init rend False, [WARN] une seule fois. CLI réelle (sous-processus, sys.modules

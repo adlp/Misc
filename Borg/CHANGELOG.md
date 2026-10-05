@@ -1,5 +1,45 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.184 — Report pendant un borg orphelin : base et mention — 2026-10-05
+
+Chantier « reconstruction progressive », story 52 (rétrospective F291, A109 ; décisions de l'utilisateur au checkpoint).
+Mesuré avant sur un vrai Bkp de `demo.borghelperrc` (sans `BORG_EXE`) : borgHelper tué par SIGKILL pendant `borg create`,
+son borg survit (parent 1), garde le verrou du dépôt et va au bout (archive écrite après le kill) ; pendant ce temps `Report`
+en ligne -> `*** ERREUR … Failed to create/acquire the lock`, code 2 ; `-o` -> code 0, rien sur le Bkp.
+
+- **Lien au Bkp exact, mort prouvée** : `backup()` passe à son seul `borg create` `BORGHELPER_BKP_RUN=<run_id>` (sa ligne
+  `bkp_status`) et `BORGHELPER_BKP_PID=<pid>:<début>` (son propre processus). Détection (`BorgHelperDB.repo_lock_holders`,
+  `repo_orphan_create(nick)`, `bkp_status_open`) : détenteur exclusif du `lock.roster` du dépôt local, vivant, première
+  sous-commande borg de son argv = `create`, les deux variables dans `/proc/<pid>/environ`, le processus `BORGHELPER_BKP_PID` mort
+  (PID réattribué compris) ; puis la ligne de CE `run_id` du nick, ouverte et non périmée (pas la plus récente : un Bkp suivant
+  tué avant son create ne masque rien). Jamais : `borg create` lancé à la main, par cron ou par borgmatic (sans ces variables),
+  un Bkp vivant même sans marqueur (son borgHelper vit), un autre Bkp ou un autre nick (ligne absente), un borg d'Index, de
+  Restore, de Prune (autre sous-commande). Revues : la première version (« aucun ancêtre nommé borgHelper » + nom d'hôte)
+  prenait un `create` manuel pour l'orphelin et l'attribuait au premier nick du dépôt à ligne ouverte ; la deuxième déduisait
+  la mort de borgHelper de l'absence de marqueur (marqueur non écrit : faux « arrêté »).
+- **Report, en ligne comme `-o`** : nick tiré de la base, sans borg ; `reste` suffixé `— ⏳ Bkp interrompu, borg create encore
+  actif depuis HH:MM (XhYYmin)` ; stderr `<nick> : Bkp interrompu (borgHelper arrêté), borg create encore actif depuis … —
+  rapport tiré de la base, borg non interrogé` ; JSON `bkp_en_cours.orphelin: true` (`false` dans les autres cas, aussi dans
+  `bkp_voisin`) ; nick `***`, **code 1** (le Bkp est déjà en échec pour borgHelper).
+- **Nick voisin** (même `BORG_REPO`) : tiré de la base, `— ⏳ Bkp de A interrompu, borg create encore actif sur le dépôt depuis
+  …`, `bkp_voisin.orphelin: true`, sans alerte de ce fait.
+- Sans détenteur dans le roster du dépôt local, ni délai rc (`BKP_STATUS_TIMEOUT`) ni base ne sont lus (le rc l'est, pour le
+  chemin du dépôt) : Report inchangé hors Bkp.
+- Changement de code : `Report -o` pendant un tel orphelin passe de 0 (rien sur le Bkp) à 1 (décision de l'utilisateur).
+- Limites (comportement d'avant, sans détection) : Bkp lancé par borgHelper < 1.0.184 ; environnement du borg illisible (Report
+  sous un autre compte, `/proc` en `hidepid`) ou vidé par `BORG_EXE` (`sudo`, `env -i`) ; dépôt non local au sens de borgHelper
+  (`:`, `{…}`, chemin relatif, `~`, `file://`, `SSH_REPO`, `SSH_REMFO`) ; borg 2 (pas de `lock.roster`) ; ligne au-delà de
+  `BKP_STATUS_TIMEOUT`. Après la fin de l'orphelin, son archive existe mais la ligne `bkp_status` reste ouverte et l'Index n'est
+  pas fait : le Bkp suivant voit un « Bkp précédent en erreur » (règle de la story 50). Status dit encore « Bkp en cours ».
+  borgHelperWWW garde `/report?offline=true` 5 min (empreinte : bases seulement) — mention présente ou absente jusqu'à 5 min de
+  trop au début et à la fin de l'orphelin.
+- Mesuré après (vrai borg 1.2.6, borgHelper tué pendant `borg create`, borg gelé par SIGSTOP pour tenir le verrou) : texte,
+  `-j`, `-l`, `-o`, `-o -j` -> code 1 avec la mention, aucune erreur de verrou ; nick voisin -> mention et `bkp_voisin` ; une fois
+  l'orphelin fini (SIGCONT) -> code 0, comportement normal. Contrôle « Report pendant un borg orphelin » (20 nicks, faux
+  `borg.wrapped` lancés par double fork avec ou sans les variables, borgHelper mort ou vivant, roster écrit à la main, argv réel
+  PyInstaller simulé ; jumelles ; `backup()` par le vrai `boex` avec un `BORG_EXE` qui enregistre son environnement) ;
+  14 mutations détectées.
+
 ## borgHelper 1.0.183 — Report pendant un Bkp : pas d'erreur, Bkp en cours dit, historique rendu — 2026-10-05
 
 Chantier « reconstruction progressive », story 50 (demande de l'utilisateur du 2026-10-04 ; décisions de l'utilisateur au

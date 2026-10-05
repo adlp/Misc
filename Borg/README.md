@@ -500,9 +500,9 @@ Report pendant un Bkp (1.0.183) : un nick dont le Bkp tourne — marqueur du Bkp
 (XhYYmin)` (heure locale de début, durée écoulée) ; avant sa ligne `bkp_status`, quand le Bkp attend qu'un Index extérieur
 se mette en pause (jusqu'à 120 s) : `— ⏳ Bkp en attente de l'Index depuis …`. L'historique est rendu ; stderr dit `<nick> :
 Bkp en cours depuis … — rapport tiré de la base, borg non interrogé` ; en JSON, la ligne porte aussi `"bkp_en_cours":
-{"started_at": "2026-10-05T05:08:14Z", "depuis": "…", "precedent_en_erreur": false, "en_attente": false}` (début en UTC).
+{"started_at": "2026-10-05T05:08:14Z", "depuis": "…", "precedent_en_erreur": false, "en_attente": false, "orphelin": false}` (début en UTC ; `orphelin` : 1.0.184).
 Un autre nick du même dépôt (`BORG_REPO`) est aussi tiré de la base pendant ce Bkp : `— ⏳ Bkp de <nick> en cours sur le
-dépôt depuis …`, JSON `"bkp_voisin": {"nick", "started_at", "depuis", "en_attente"}`, sans alerte de ce fait.
+dépôt depuis …`, JSON `"bkp_voisin": {"nick", "started_at", "depuis", "en_attente", "orphelin"}`, sans alerte de ce fait.
 
 Codes pendant un Bkp : alerte (`***`, code 1) si le Bkp précédent a échoué — fini en erreur (un Bkp concurrent refusé sur
 le verrou du dépôt compte) ou jamais fini sans être encore vivant (tué) : `… — Bkp précédent en erreur` dans `reste` ;
@@ -511,10 +511,26 @@ code 1 si la dernière archive dépasse `MAX_AGE_BKP` ou s'il n'y a aucune archi
 2, comme avant (avec la mention) ; sinon code 0. Avant : `borg info` échouait sur le verrou du dépôt (`*** ERREUR nick`,
 « Failed to create/acquire the lock », code 2, aucun historique). Inchangé : Bkp tué (marqueur mort, retiré au Report
 suivant), ligne au-delà de `BKP_STATUS_TIMEOUT` (un Bkp plus long que ce délai retombe sur borg), Restore/Prune/DelBkp en
-cours. Limites : borgHelperWWW garde `/report?offline=true` en cache 5 min ; le début du Bkp le renouvelle (`history.db`
+cours ; Bkp tué dont le `borg create` tient encore le dépôt : voir 1.0.184 ci-dessous. Limites : borgHelperWWW garde `/report?offline=true` en cache 5 min ; le début du Bkp le renouvelle (`history.db`
 fait partie de son empreinte), mais après un Bkp tué, pendant l'attente de l'Index et pour un nick voisin, la mention peut
 apparaître ou rester jusqu'à 5 min en retard ; si le Bkp ne peut écrire sa ligne `bkp_status` (`[WARN]
 store_bkp_status_start a échoué`), il reste vu « en attente de l'Index » jusqu'à sa fin.
+
+Report pendant un borg orphelin (1.0.184) : si borgHelper a été tué (SIGKILL, OOM) pendant un Bkp, son `borg create` continue
+seul et garde le verrou du dépôt jusqu'à sa fin. Le Bkp passe à son `borg create` son identifiant et son PID
+(`BORGHELPER_BKP_RUN`, `BORGHELPER_BKP_PID`) ; Report reconnaît ce borg — détenteur du verrou (`lock.roster`) du dépôt local,
+en `create`, dont le borgHelper n'est plus vivant, rattaché par son identifiant à la ligne `bkp_status` ouverte du nick — et tire
+le nick de la base, en ligne comme en `-o` : `— ⏳ Bkp interrompu, borg create encore actif depuis HH:MM (XhYYmin)` (heure de
+début du Bkp) dans `reste`, nick en alerte (`***`, code 1), JSON `"bkp_en_cours": {…, "orphelin": true}` ; un autre nick du même
+dépôt : `— ⏳ Bkp de <nick> interrompu, borg create encore actif sur le dépôt depuis …`, `"bkp_voisin": {…, "orphelin": true}`,
+sans alerte de ce fait. Avant : en ligne `Failed to create/acquire the lock`, code 2 ; `-o` code 0, rien sur le Bkp (code 1
+désormais). Jamais pris pour cet orphelin : un `borg create` lancé à la main, par cron ou par borgmatic, celui d'un Bkp vivant
+ou d'un autre Bkp, un borg d'Index, de Restore ou de Prune. Limites (comportement d'avant) : Bkp lancé par une version
+< 1.0.184 ; Report sous un autre compte que le Bkp, ou `/proc` en `hidepid` (environnement illisible) ; `BORG_EXE` qui vide
+l'environnement ; dépôt non local (`hôte:chemin`, `{…}`, relatif, `~`, `file://`, `SSH_REPO`, `SSH_REMFO`) ; borg 2 ; ligne au-delà
+de `BKP_STATUS_TIMEOUT`. Après la fin de l'orphelin, l'archive existe mais le Bkp reste « jamais fini » (pas d'Index) : le Bkp
+suivant le compte comme précédent en erreur. Cache de 5 min de borgHelperWWW (`/report?offline=true`). Status dit encore
+« Bkp en cours ».
 
 Dépôt local introuvable (disque démonté, chemin faux ; 1.0.167) : colonne `reste` = `⚠ dépôt absent`, nick en
 alerte (`*** nick`, rouge en HTML), code 2 ; archives affichées en hors ligne (avant : aucune archive du nick dans
