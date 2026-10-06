@@ -1,5 +1,44 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.186 — Status aligné sur le marqueur et l'orphelin — 2026-10-05
+
+Chantier « reconstruction progressive », story 55 (rétrospective A112 ; décisions de l'utilisateur au checkpoint et en revue).
+Avant : `Status` disait « Bkp en cours depuis … » pour toute ligne `bkp_status` ouverte non périmée — pour un Bkp tué, Report
+disait « Bkp interrompu, borg create encore actif » ou rien, Status « en cours ».
+
+- `status()` lit l'état du Bkp par `_bkp_live(nick, quiet=True, strict=True)`, la source de Report (marqueur de Bkp, borg create
+  orphelin) : Bkp vivant « Bkp en cours depuis X » (inchangé) ; marqueur sans ligne « Bkp en attente de l'Index depuis X » ;
+  orphelin « Bkp interrompu (borgHelper arrêté), borg create encore actif depuis X » ; ligne ouverte non périmée sans rien de
+  vivant « Bkp interrompu depuis X — aucun processus ; fermé au prochain Index si son archive existe » — dépôt distant, où un
+  orphelin ne se voit pas : « — borgHelper arrêté, borg non vérifiable (dépôt distant) ; … » ; ligne périmée : inchangé
+  (`bkp_stale`, « probablement interrompu »). Ligne d'un autre run que le Bkp vivant ou en attente : dite aussi. Lecture
+  impossible : rien sur le Bkp. Comme Report, Status retire les marqueurs de processus morts.
+- JSON : `bkp_running` = `{started_at, en_attente, orphelin}` (avant `{started_at}`) ; nouvelle clé `bkp_interrupted`
+  `{started_at, verifie}` (`verifie` : `false` pour un dépôt distant ; `null` dans le résultat d'erreur d'un nick).
+- « Opération prioritaire en cours » : cachée sous un Bkp vivant ou en attente seulement (un orphelin ne tient plus
+  `priority.lock`) ; variante « Bkp peut-être toujours actif » aussi sous un Bkp interrompu non vérifiable.
+- `_status_one(nick)` par défaut (`bkp_live=False`) : base seule, comme avant — borgHelperWWW /access (qui n'en garde que
+  build/rebuild, sondé toutes les 30 s) ne lit ni marqueurs ni `lock.roster`. Nouveaux : `BorgHelperDB.repo_orphan_checkable`,
+  `_repo_local_path` (prédicat partagé avec `repo_lock_holders`).
+- Inchangés : Report, `bkp_running_state` (/access et ⏳ de l'UI, alerte de retard : base seule — hors story, décision de
+  l'utilisateur), borgHelperWWW.
+- Mesuré (vrai borg 1.2.6, `work/m55/mesure55b.log`) : Bkp vivant, tué avec borg suspendu — Status (texte et JSON) dit ce que dit
+  Report ; tué borg fini — Status « interrompu, aucun processus » (Report : rien) ; après le rapprochement de l'Index (1.0.185),
+  plus rien.
+- Contrôle « Status aligné sur Report : … (1.0.186) » (12 nicks, borg compté) ; contrôles Status existants revus : leurs
+  « Bkp en cours » n'avaient pas de marqueur (décor fictif) — marqueur vivant ajouté ; factice de `_status_one` à la nouvelle
+  signature.
+- Revue (3 relecteurs, `work/rev55/`) : /access payait marqueurs et `lock.roster` à chaque sondage ; « aucun processus » affirmé
+  pour un dépôt distant (décision : « non vérifiable ») ; ligne d'un autre run masquée (décision : les deux) ; lecture en
+  échec prise pour « interrompu » ; doc périmée (README, « lecture seule ») — corrigés.
+- Séries de mutations (pré-vérifiées, Python 3.14 strict) : avant revue 10/10, après revue 22/22 DÉTECTÉES — marqueur et orphelin
+  ignorés, lecture impossible prise pour « rien de vivant » (deux sites), ligne d'un autre run masquée, Bkp interrompu jamais
+  dit, `bkp_live` ignoré, /access payant `_bkp_live`, `status()` sans `bkp_live`, drapeaux faux, `verifie` toujours vrai,
+  `SSH_REPO`/`SSH_REMFO` comptés locaux, orphelin/attente dits « en cours », distant dit « aucun processus », interrompu muet,
+  opération prioritaire cachée sous un orphelin ou dite sous un Bkp vivant, variante « peut-être » absente sous un distant,
+  résultat d'erreur sans `bkp_interrupted`, ligne stderr de Report dans Status. (M13 « `:` retiré » a d'abord survécu :
+  `hôte:chemin` n'est pas absolu, la garde `isabs` suffit — remplacé par le décor `SSH_REPO`.)
+
 ## borgHelper 1.0.185 — Bkp tué dont le borg a fini : ligne fermée et Index — 2026-10-05
 
 Chantier « reconstruction progressive », story 54 (rétrospective F299, A111 ; décisions de l'utilisateur). Observé avant

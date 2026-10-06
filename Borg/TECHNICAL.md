@@ -3649,7 +3649,8 @@ uniquement par `bkp_status`.
 
 ## `Status` — état rapide par nick (`borgHelper` 1.0.111, `spec-status-cli-etat-rapide`)
 
-Commande CLI en lecture seule, **100% locale — jamais d'appel `boex`/`borg`** (contrairement à
+Commande CLI en lecture seule (1.0.186 : elle retire seulement, comme Report, les marqueurs de Bkp de processus morts),
+**100% locale — jamais d'appel `boex`/`borg`** (contrairement à
 `LstBkp`/`GetLastBkp`, qui interrogent le dépôt en direct). Trois sources, toutes déjà en base :
 
 1. **Dernier backup connu** : `SELECT archive,archive_date FROM archive_stats WHERE nick=? ORDER BY
@@ -3671,7 +3672,15 @@ Commande CLI en lecture seule, **100% locale — jamais d'appel `boex`/`borg`** 
    abaissement s'applique aussi aux Bkp en cours. Limites : horloge qui recule (une ligne datée dans le futur reste la
    plus récente) ; CLI et service ne lisent le même délai que s'ils lisent le même rc (`-C` et
    `BORGHELPERWWW_CFGFILE`). `Status`
-   range une ligne périmée dans `bkp_stale` (« probablement interrompu »), jamais dans `bkp_running`. Délai et non
+   range une ligne périmée dans `bkp_stale` (« probablement interrompu »), jamais dans `bkp_running`. 1.0.186 (story 55) :
+   `status()` appelle `_status_one(nick, bkp_live=True)` : `bkp_running` vient de `_bkp_live(nick, quiet=True, strict=True)`
+   (marqueur vivant + ligne, marqueur sans ligne -> `en_attente`, orphelin -> `orphelin` ; la source de Report ; `strict` :
+   une erreur de lecture lève au lieu de rendre None -> rien sur le Bkp, jamais un faux « interrompu ») ; la ligne la plus
+   récente, si elle n'est pas celle du Bkp vivant : périmée -> `bkp_stale`, sinon -> `bkp_interrupted` ({started_at,
+   verifie = `repo_orphan_checkable(nick)`, dépôt local au sens de `_repo_local_path`, le prédicat de `repo_lock_holders`}).
+   `_status_one(nick)` par défaut (`bkp_live=False`, borgHelperWWW /access qui n'en garde que build/rebuild) : base seule,
+   comme avant — jamais de marqueurs, de `lock.roster` ni de /proc à chaque sondage. `bkp_running_state` (/access, alerte de
+   retard) reste sur la base seule. Délai et non
    verrou : `backup()` relâche `priority.lock` avant son Index de fin, ligne encore ouverte, et un Index externe peut tenir
    `index-running.lock` — aucun verrou ne prouve qu'un Bkp vit.
 3. **Opération prioritaire en cours** : `check_priority_lock(nick)` (déjà existant, réutilisé tel
@@ -3689,10 +3698,11 @@ opération résoudrait l'ambiguïté mais est hors périmètre (chantier futur s
 ### Affichage texte vs JSON
 
 En texte, l'opération prioritaire n'est **jamais affichée si un Bkp en cours est aussi détecté** — redondant,
-puisque c'est le Bkp lui-même qui tient ce lock ; un Bkp interrompu (`bkp_stale`, 1.0.154) ne la masque pas. En JSON (`-j`), `priority_op_running` reste le
+puisque c'est le Bkp lui-même qui tient ce lock ; un Bkp interrompu (`bkp_stale`, 1.0.154 ; `bkp_interrupted` et orphelin,
+1.0.186 : son borgHelper mort ne tient plus le verrou) ne la masque pas. En JSON (`-j`), `priority_op_running` reste le
 booléen **brut** de `check_priority_lock(nick)`, indépendamment de `bkp_running` — c'est au
 consommateur machine de corréler les deux s'il le souhaite ; la sortie JSON est toujours une **liste**
-`[{nick,last_backup,bkp_running,bkp_stale,priority_op_running,build,rebuild}, ...]` (`bkp_stale` 1.0.154, `build` 1.0.141, `rebuild` 1.0.143 : état du
+`[{nick,last_backup,bkp_running,bkp_interrupted,bkp_stale,priority_op_running,build,rebuild}, ...]` (`bkp_interrupted` 1.0.186, `bkp_stale` 1.0.154, `build` 1.0.141, `rebuild` 1.0.143 : état du
 fantôme, `null` sans reconstruction), même à un seul nick, pour une forme
 homogène (contrairement à `RepoHistory`/`ArchiveHistory`, qui renvoient un objet unique et rejettent
 le multi-nick).

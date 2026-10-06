@@ -529,8 +529,8 @@ ou d'un autre Bkp, un borg d'Index, de Restore ou de Prune. Limites (comportemen
 < 1.0.184 ; Report sous un autre compte que le Bkp, ou `/proc` en `hidepid` (environnement illisible) ; `BORG_EXE` qui vide
 l'environnement ; dépôt non local (`hôte:chemin`, `{…}`, relatif, `~`, `file://`, `SSH_REPO`, `SSH_REMFO`) ; borg 2 ; ligne au-delà
 de `BKP_STATUS_TIMEOUT`. Après la fin de l'orphelin, l'archive existe mais le Bkp reste « jamais fini » (pas d'Index) : le Bkp
-suivant le compte comme précédent en erreur. Cache de 5 min de borgHelperWWW (`/report?offline=true`). Status dit encore
-« Bkp en cours ».
+suivant le compte comme précédent en erreur (1.0.185 : rapproché par l'Index s'il porte le commentaire de son run). Cache de
+5 min de borgHelperWWW (`/report?offline=true`). Status (1.0.186) dit la même chose (voir [`Status`](#status)).
 
 Bkp tué dont le borg a fini (1.0.185) : chaque archive porte le commentaire `borgHelper run <run_id>` (visible dans `borg
 list`/`borg info`). À chaque Index et au début de chaque Bkp, la ligne `bkp_status` d'un Bkp tué (borgHelper arrêté, aucun borg
@@ -1221,7 +1221,7 @@ borgHelper -c Status -n ALL -j               # tous les nicks configurés, JSON
 | Option | Description |
 |--------|-------------|
 | `-n <nick1,nick2>` / `-n ALL` | Un ou plusieurs nicks nativement (contrairement à `RepoHistory`/`ArchiveHistory` qui rejettent le multi-nick) — c'est le cas d'usage principal de `Status` |
-| `-j` | Sortie JSON — toujours une **liste**, même à un seul nick : `[{nick,last_backup,bkp_running,bkp_stale,priority_op_running,build,rebuild}, ...]` — `rebuild` (1.0.143) : état du fichier fantôme (`build_state`), `null` sans reconstruction |
+| `-j` | Sortie JSON — toujours une **liste**, même à un seul nick : `[{nick,last_backup,bkp_running,bkp_interrupted,bkp_stale,priority_op_running,build,rebuild}, ...]` — `rebuild` (1.0.143) : état du fichier fantôme (`build_state`), `null` sans reconstruction |
 
 En texte, en ligne de commande, une ligne finale signale les restes à nettoyer sur la machine, comme `Report`
 (1.0.160 ; JSON inchangé ; jamais via borgHelperWWW) — voir [`BorgCleanup`](#borgcleanup).
@@ -1231,8 +1231,15 @@ Par nick :
   lisible (« il y a 3h12 ») ; « aucune archive indexée » si le nick n'a jamais été indexé. Ligne suivante (1.0.165) :
   `borg : 1.2.6` (ou `1.2.6 / srv 1.2.4`, `—`), versions relevées au Bkp de cette archive ; JSON : `last_backup`
   porte `borg_version` et `borg_server_version`.
-- **Bkp en cours** : si une ligne `bkp_status` non terminée existe, « Bkp en cours depuis HH:MM
-  (XhYYmin) ». Démarrée depuis plus que le délai du nick (1.0.154) : « Bkp sans fin depuis HH:MM (XhYYmin) — probablement
+- **Bkp en cours** (1.0.186 : comme Report — marqueur de Bkp vivant, borg create orphelin) : Bkp vivant « Bkp en cours
+  depuis HH:MM (XhYYmin) » ; marqueur sans ligne encore « Bkp en attente de l'Index depuis … » ; borgHelper tué, son `borg
+  create` encore actif « Bkp interrompu (borgHelper arrêté), borg create encore actif depuis … » ; ligne `bkp_status` non
+  terminée sans rien de vivant « Bkp interrompu depuis … — aucun processus ; fermé au prochain Index si son archive existe »
+  (dépôt distant — `hôte:chemin`, `{…}`, `SSH_REPO`, `SSH_REMFO` —, où un borg orphelin ne se voit pas : « — borgHelper
+  arrêté, borg non vérifiable (dépôt distant) ; … ») — Report, lui, ne dit rien dans ce cas. Ligne d'un autre run que le Bkp
+  vivant ou en attente : dite aussi, sous la sienne. Lecture impossible (marqueurs, base) : rien sur le Bkp. Status retire
+  au passage les marqueurs de processus morts, comme Report (avant 1.0.186 : « Bkp en cours » pour toute ligne non
+  terminée). Démarrée depuis plus que le délai du nick (1.0.154) : « Bkp sans fin depuis HH:MM (XhYYmin) — probablement
   interrompu (délai 6 h dépassé) », jamais « en cours » (date affichée au-delà de 24 h). Seule la dernière ligne du nick
   compte : un Bkp tué suivi d'autres Bkp n'est plus affiché (1.0.155 : effacé seulement par un Bkp plus récent réussi ;
   un Bkp vivant suivi d'un Bkp arrêté en échec par le verrou du dépôt reste « en cours »). Délai (1.0.155) : clé rc
@@ -1240,12 +1247,14 @@ Par nick :
   `BORGHELPERWWW_BKP_STATUS_TIMEOUT`, sinon 6 h — le même que `/access` et le watcher à condition qu'ils lisent le même
   rc (`-C` et `BORGHELPERWWW_CFGFILE`), ou que les deux rc portent la même clé. La variable se lit dans l'environnement
   de chaque processus : préférer la clé rc.
-- **Opération prioritaire en cours** : si un autre processus tient le verrou prioritaire (`priority.lock.<pid>`) et qu'aucun Bkp en cours n'est détecté (un Bkp interrompu ne la masque pas),
-  « Opération prioritaire en cours (Restore, Prune ou DelBkp) » (« Bkp peut-être toujours actif, … » si un Bkp interrompu est affiché) — **ambiguïté assumée**, `priority.lock` ne
+- **Opération prioritaire en cours** : si un autre processus tient le verrou prioritaire (`priority.lock.<pid>`) et qu'aucun Bkp vivant ou en attente n'est détecté (un Bkp interrompu, orphelin compris, ne la masque pas),
+  « Opération prioritaire en cours (Restore, Prune ou DelBkp) » (« Bkp peut-être toujours actif, … » si un Bkp sans fin au-delà du délai, ou interrompu sur un dépôt distant, est affiché) — **ambiguïté assumée**, `priority.lock` ne
   distingue pas laquelle le tient. Si un Bkp est aussi détecté, pas de message redondant (le
   Bkp lui-même tient ce lock).
 
-En JSON : `last_backup` est `{archive,date}` ou `null` ; `bkp_running` est `{started_at}` ou `null` ; `bkp_stale`
+En JSON : `last_backup` est `{archive,date}` ou `null` ; `bkp_running` est `{started_at,en_attente,orphelin}` (1.0.186 :
+drapeaux de `bkp_en_cours` de Report ; avant : `{started_at}`) ou `null` ; `bkp_interrupted` (1.0.186) est `{started_at,verifie}` pour
+une ligne non terminée non périmée sans rien de vivant (`verifie` : `false` pour un dépôt distant), sinon `null` ; `bkp_stale`
 (1.0.154) est `{started_at,timeout_s}` (`timeout_s` 1.0.155 : délai du nick) pour un Bkp sans fin au-delà du délai (alors `bkp_running` vaut `null`), sinon `null` ;
 `priority_op_running` est un booléen brut (reflète `priority.lock`, indépendamment de `bkp_running` —
 c'est au consommateur de corréler les deux, comme pour l'affichage texte). `build` (1.0.141) : état de construction

@@ -412,6 +412,10 @@ for row in pending:
 # effacée que par un Bkp plus récent réussi (tué puis réussi -> False ; vivant puis échec -> True) ; timeout_s < 1 s ou
 # invalide : 21600, plafond 10 ans.
 state = bh.db.bkp_running_state('mon-serveur', timeout_s=bh.bkp_status_timeout('mon-serveur'))
+# 1.0.186 : base seule (une ligne d'un Bkp tué compte « en cours » jusqu'au délai). Comme la commande Status et Report
+# (marqueur de Bkp, borg create orphelin) : bh._status_one('mon-serveur', bkp_live=True) (méthode interne, forme du JSON de
+# Status) -> bkp_running {started_at, en_attente, orphelin}, bkp_interrupted {started_at, verifie}, bkp_stale ; sans
+# bkp_live : base seule. bh.db.repo_orphan_checkable('mon-serveur') : orphelin détectable ici (dépôt local) ?
 
 # Délai du nick (1.0.155) : clé rc BKP_STATUS_TIMEOUT (section ou [DEFAULT] ; secondes ou suffixe s/m/h), sinon
 # BORGHELPERWWW_BKP_STATUS_TIMEOUT, sinon 21600 ; valeur invalide : 21600 ; [WARN] si invalide ou < 300 s ; jamais
