@@ -1966,6 +1966,15 @@ un thread, attente 1 s, montage figé -> `ok`, une seule sonde en attente par ni
 mtimes stables, mesuré). Cache par périmètre : `_capture_fingerprints(nick, 'diffbkp')` (présence) et `written_at` comparé à
 `_CACHE_TTL` dans `_scope_cache_get`. `_never_cache(result)` = `_is_db_key_error`, `[ERREUR]` sur stderr ou « SQLite error »
 (stdout/stderr) — seul prédicat des trois écritures (`run_borghelper`, `_scoped_cached_mono`, `_scoped_cached_multi`) ;
+1.31.3 (story 56, A113) : pour `report`, `_external_fingerprint` ajoute `|bkp:` + `_bkp_markers_state()` (TOUS les marqueurs
+`<prefix>-*-bkp.lock.*` de `CACHE_DIR` triés, « nom:`_lock_holder` » — lecture seule, jamais retirés ici ; décision de
+l'utilisateur : un voisin du même dépôt compte ; run_id de 32 hex seulement, jamais les `.<pid>.tmp` de `_set_pid_lock` ; porteur
+vivant mais zombie -> `zombie`, `_pid_alive` lit `/proc/<pid>/stat` : un borgHelper lancé par POST /bkp puis tué reste zombie,
+enfant du worker, jusqu'au Popen suivant) et `|roster:<nick>:<pid>:<vivant>,…` (`_repo_roster_state` : `repo_lock_holders` de
+borgHelper, `_pid_alive`) ; sondes par `_bounded_probe(sorte, nick, fn, repli)` (revue : inscrite sous `_PROBE_LOCK` avant son
+départ, une seule en vol par (sorte, nick), une requête concurrente attend la même ; au-delà de 1 s marquée figée, les suivantes
+rendent le repli aussitôt) — repli de la présence `ok`, du roster le dernier état lu `_ROSTER_LAST` (empreinte stable : réponse
+en cache gardée ; un résultat tardif devient le dernier état) ;
 `[ERREUR]` = arrêt d'un nick (`_nick_stop_msg`, `_db_schema_fail`) : sur-approximation voulue, comme AD-13 ; « Index vide »
 (1.0.179) : `[WARN]`, réponse cacheable, renouvelée par l'empreinte quand un Index crée la base (mesuré : « absent » -> mtime ;
 1.31.1 : `-wal` compris dans l'empreinte, un Index écrit d'abord dans le journal). Reste muet (code 0, aucun marqueur) : les mesures de Report -o sur erreur SQLite (`get_cache_rows`/CacheInfo : marqué,
@@ -2382,7 +2391,8 @@ avant celle du Bkp en cours (`started_at`, puis `rowid`), ou dernière ligne du 
 `failed` : fin en `error`, ou aucune fin et aucun marqueur vivant à son `run_id`. Lecture impossible : `[WARN]`, règle non
 appliquée. `MAX_AGE_BKP`, « aucune archive » et « dépôt absent » restent la règle de l'appelant. Ligne `bkp_status` non écrite
 (`[WARN] store_bkp_status_start a échoué`) : Bkp vu « en attente » jusqu'à sa fin. Le cache de `/report?offline=true` de
-borgHelperWWW (5 min, empreinte = mtimes de diff.db, cache.db, history.db et `-wal` du nick) n'inclut pas les marqueurs.
+borgHelperWWW (5 min, empreinte = mtimes de diff.db, cache.db, history.db et `-wal` du nick) inclut depuis borgHelperWWW 1.31.3
+les marqueurs de Bkp et les détenteurs du `lock.roster` (voir « Cache des réponses »).
 
 **Report pendant un borg orphelin (1.0.184, story 52)** : `backup()` appelle `boex(create, forceEnv=dict(forceEnv or {},
 BORGHELPER_BKP_RUN=run_id, BORGHELPER_BKP_PID="<pid>:<début>"))` (`_proc_start`, ticks de `/proc/<pid>/stat`) — boex recopie

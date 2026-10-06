@@ -511,9 +511,9 @@ code 1 si la dernière archive dépasse `MAX_AGE_BKP` ou s'il n'y a aucune archi
 2, comme avant (avec la mention) ; sinon code 0. Avant : `borg info` échouait sur le verrou du dépôt (`*** ERREUR nick`,
 « Failed to create/acquire the lock », code 2, aucun historique). Inchangé : Bkp tué (marqueur mort, retiré au Report
 suivant), ligne au-delà de `BKP_STATUS_TIMEOUT` (un Bkp plus long que ce délai retombe sur borg), Restore/Prune/DelBkp en
-cours ; Bkp tué dont le `borg create` tient encore le dépôt : voir 1.0.184 ci-dessous. Limites : borgHelperWWW garde `/report?offline=true` en cache 5 min ; le début du Bkp le renouvelle (`history.db`
-fait partie de son empreinte), mais après un Bkp tué, pendant l'attente de l'Index et pour un nick voisin, la mention peut
-apparaître ou rester jusqu'à 5 min en retard ; si le Bkp ne peut écrire sa ligne `bkp_status` (`[WARN]
+cours ; Bkp tué dont le `borg create` tient encore le dépôt : voir 1.0.184 ci-dessous. Limites : borgHelperWWW garde `/report?offline=true` en cache 5 min ;
+depuis borgHelperWWW 1.31.3, un marqueur de Bkp qui apparaît (tout nick, voisin compris), un borgHelper tué ou un changement
+des détenteurs du verrou d'un dépôt local renouvellent la réponse au premier appel suivant (avant : jusqu'à 5 min de retard) ; si le Bkp ne peut écrire sa ligne `bkp_status` (`[WARN]
 store_bkp_status_start a échoué`), il reste vu « en attente de l'Index » jusqu'à sa fin.
 
 Report pendant un borg orphelin (1.0.184) : si borgHelper a été tué (SIGKILL, OOM) pendant un Bkp, son `borg create` continue
@@ -530,7 +530,8 @@ ou d'un autre Bkp, un borg d'Index, de Restore ou de Prune. Limites (comportemen
 l'environnement ; dépôt non local (`hôte:chemin`, `{…}`, relatif, `~`, `file://`, `SSH_REPO`, `SSH_REMFO`) ; borg 2 ; ligne au-delà
 de `BKP_STATUS_TIMEOUT`. Après la fin de l'orphelin, l'archive existe mais le Bkp reste « jamais fini » (pas d'Index) : le Bkp
 suivant le compte comme précédent en erreur (1.0.185 : rapproché par l'Index s'il porte le commentaire de son run). Cache de
-5 min de borgHelperWWW (`/report?offline=true`). Status (1.0.186) dit la même chose (voir [`Status`](#status)).
+5 min de borgHelperWWW (`/report?offline=true`), renouvelé au premier appel après la fin de l'orphelin (dépôt local) depuis
+borgHelperWWW 1.31.3. Status (1.0.186) dit la même chose (voir [`Status`](#status)).
 
 Bkp tué dont le borg a fini (1.0.185) : chaque archive porte le commentaire `borgHelper run <run_id>` (visible dans `borg
 list`/`borg info`). À chaque Index et au début de chaque Bkp, la ligne `bkp_status` d'un Bkp tué (borgHelper arrêté, aucun borg
@@ -2229,7 +2230,12 @@ dont le stderr porte `[ERREUR]` (arrêt d'un nick d'un lecteur multi-nicks — c
 illisible ; index vide en texte) ou qui porte « SQLite error » n'est jamais mise en cache, ni ici ni dans le cache par
 périmètre ; `GET /report?offline=true` et `GET /diffbkp` (qui lit le dépôt en direct) ajoutent à l'empreinte la présence
 de chaque dépôt local (disque démonté -> recalcul ; remonté -> la réponse d'avant resservie) et ne sont servis du cache
-que 5 min (« depuis », alerte de sauvegarde trop ancienne, place libre, nouvelle archive).
+que 5 min (« depuis », alerte de sauvegarde trop ancienne, place libre, nouvelle archive). borgHelperWWW 1.31.3 : celle de
+`/report?offline=true` porte aussi les marqueurs de Bkp de `CACHE_DIR` (porteur vivant ou mort) et les détenteurs du
+`lock.roster` de chaque dépôt local (vivants ou non ; un zombie compte mort) — « ⏳ Bkp en cours / en attente / interrompu » suit
+le Bkp au premier appel ; lecture du roster bornée à 1 s (montage figé : dernier état lu, réponse en cache gardée ; le premier
+appel sur un montage figé attend jusqu'à 1 s pour la présence et 1 s pour le roster, par nick). Limite : pour un nick voisin
+d'un dépôt distant (aucun `lock.roster` lisible), le passage « en attente » -> « en cours » du Bkp voisin peut retarder de 5 min.
 
 ⚠️ **Périmètre de chemin actif ⇒ jamais servi depuis `_RESPONSE_CACHE`** (Story 1.3, étendu Story
 1.4) : pour `/search`, `/filehist`, `/lstbkpfls`, `/diffbkp`, `/treehist`, `/treefind`, `/duidx`,

@@ -1,5 +1,40 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.31.3 — Cache /report?offline : empreinte avec roster et marqueurs — 2026-10-06
+
+Chantier « reconstruction progressive », story 56 (rétrospective A113 ; décision de l'utilisateur). Avant : `/report?offline=true`
+était resservi depuis `_RESPONSE_CACHE` jusqu'à 5 min tant que les bases ne changeaient pas ; « ⏳ Bkp en cours / en attente de
+l'Index / interrompu, borg create encore actif » vient des marqueurs de Bkp et du `lock.roster` du dépôt, hors empreinte — un Bkp
+qui démarre (marqueur avant sa ligne), un borgHelper tué, un borg orphelin qui finit restaient invisibles jusqu'à 5 min.
+
+- `_external_fingerprint('report', …)` ajoute `_bkp_markers_state()` (tous les marqueurs de Bkp de `CACHE_DIR`, voisin compris —
+  décision de l'utilisateur —, « nom:porteur » par `_lock_holder`, porteur zombie compté à part, `.tmp` d'écriture ignorés, lecture
+  seule) et `_repo_roster_state(nick)` (détenteurs exclusifs du `lock.roster` du dépôt local, « pid:vivant », zombie = mort ; sonde
+  bornée à 1 s ; montage figé : dernier état lu, réponse en cache gardée). Mêmes empreintes à la lecture et à l'écriture (une
+  réponse dont l'empreinte change pendant l'exécution n'est jamais rangée, comme avant).
+- Sondes de présence et du roster : `_bounded_probe` — une seule en vol par nick, inscrite sous verrou (avant : lue puis inscrite
+  sans verrou, des requêtes concurrentes en lançaient chacune une), une requête concurrente attend la même.
+- Inchangés : borgHelper, diffbkp et les autres routes, durée de vie de 5 min (« depuis … » peut retarder de 5 min, comme avant).
+- Contrôle du push selftest « cache Report -o : marqueurs de Bkp et lock.roster dans l'empreinte, … (story 56, A113) » (13 cas) :
+  marqueur posé, marqueur d'un voisin, porteur mort (marqueur gardé) ou zombie, détenteur du roster ajouté, mort ou zombie ->
+  exécuté ; sinon resservi ; `.tmp` ignoré ; roster figé : ~1 s, dernier état lu, réponse en cache gardée, une sonde ; résultat
+  tardif adopté ; requêtes concurrentes : une lecture, sa vraie valeur rendue à toutes ; diffbkp sans marqueurs ni roster. Push selftest 125/125.
+- Revue (3 relecteurs, `work/rev56/`) : montage figé qui invalidait le cache (`?`) au lieu de le garder ; zombie d'un Bkp lancé par
+  POST /bkp compté vivant ; sondes concurrentes sans verrou (aussi la présence, préexistant) ; `.tmp` dans l'empreinte ; `KeyError`
+  du contrôle qui masquait trois détections ; mesure sans appel servi par le cache — corrigés.
+- Mesuré (borg 1.2.6, trois serveurs de test sur le même rc de démo : 1.31.3, 1.31.2, et 1.31.3 sans roster ; appels répétés,
+  « servi par le cache » = ~5 ms ; `work/m56/mesure56b.log`) : Bkp en attente de l'Index (Index réel suspendu) -> 1.31.3 le dit
+  aussitôt, 1.31.2 resservait sa réponse sans mention ; borgHelper tué -> 1.31.3 « interrompu, borg create encore actif » au
+  premier appel (puis servi par le cache), 1.31.2 « en cours » ; orphelin fini -> seul 1.31.3 à jour, le témoin sans roster
+  resservait « interrompu » (la part roster est nécessaire). Première mesure (`mesure56.log`) : aucun appel servi par le cache,
+  non discriminante (revue) ; `mesure56b-1.log` : script qui attendait l'Index avant le create (états 1-3 manqués).
+- Séries de mutations (pré-vérifiées, push selftest complet sous le Python système — fastapi —, avertissements stricts) : avant
+  revue 8/8 (trois détectées par un `KeyError` du contrôle, pas par l'assertion visée — revue), après revue 16/16 DÉTECTÉES —
+  Report -o sans marqueurs ni roster, marqueurs retirés, porteur ignoré, roster retiré, vie des détenteurs ignorée, sonde sans
+  délai, sonde figée jamais marquée, diffbkp avec marqueurs et roster, WWW qui retire les marqueurs morts, porteur ou détenteur
+  zombie compté vivant, `.tmp` dans l'empreinte, roster figé rendu `?`, dernier état jamais gardé, sonde non inscrite, sonde en
+  vol rendue figée (a d'abord survécu : le contrôle concurrent ne vérifiait pas la valeur rendue — renforcé).
+
 ## borgHelper 1.0.186 — Status aligné sur le marqueur et l'orphelin — 2026-10-05
 
 Chantier « reconstruction progressive », story 55 (rétrospective A112 ; décisions de l'utilisateur au checkpoint et en revue).

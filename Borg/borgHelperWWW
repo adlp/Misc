@@ -67,7 +67,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.31.2"
+WWW_VERSION="1.31.3"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -1296,27 +1296,84 @@ def _cache_fingerprint(nick: Optional[str]) -> str:
 # (présence du dépôt, heure : « depuis », MAX_AGE_BKP, place libre) et DiffBkp (présence, `borg list` en direct : dernière paire
 # d'archives) ; empreinte + présence de chaque dépôt local, durée de vie 5 min (secondes ; commande absente = sans limite).
 _CACHE_TTL={'report':300,'diffbkp':300}
-_PRESENCE_PROBES={}   # nick -> sonde encore bloquée (montage figé) : jamais deux en attente pour un même nick
+# 1.31.3 (revue story 56) : sondes bornées partagées — une seule en vol par (sorte, nick), inscrite sous verrou AVANT son départ
+# (avant : lue puis inscrite sans verrou, des requêtes concurrentes lançaient chacune la leur) ; une requête concurrente attend la
+# même ; bloquée au-delà de 1 s : marquée « figée », les suivantes rendent aussitôt la valeur de repli.
+_PROBE_LOCK=threading.Lock()
+_PROBES={}   # (sorte, nick) -> {'t': thread, 'res': {'v': …}, 'stuck': bool}
+
+def _bounded_probe(kind: str, n: str, fn, frozen):
+    with _PROBE_LOCK:
+        e=_PROBES.get((kind,n))
+        if e is not None and e['t'].is_alive() and e['stuck']: return frozen()
+        if e is None or not e['t'].is_alive():
+            e={'res':{},'stuck':False}
+            def run(e=e):
+                try: e['res']['v']=fn()
+                except (Exception,SystemExit): e['res']['v']='?'
+            e['t']=threading.Thread(target=run,daemon=True,name=f"{kind}-{n}"); _PROBES[(kind,n)]=e; e['t'].start()
+    e['t'].join(1.0)
+    if e['t'].is_alive(): e['stuck']=True; return frozen()
+    return e['res'].get('v','?')
 
 def _repo_presence(n: str) -> str:
-    """'ok' | 'absent' | '?' (nick illisible) — repoLocalAbsent dans un thread, attente 1 s : un montage réseau figé
-    (os.open sans délai) ne bloque jamais un thread de requête ; sans réponse -> 'ok' (présent mais muet, comme
-    repoLocalAbsent pour un dépôt inaccessible), une seule sonde en attente par nick (revue story 37)."""
-    t=_PRESENCE_PROBES.get(n)
-    if t is not None and t.is_alive(): return 'ok'
-    res={}
-    def probe():
-        try: res['v']='absent' if _bh_paths.borg.repoLocalAbsent(n) else 'ok'
-        except (Exception,SystemExit): res['v']='?'
-    t=threading.Thread(target=probe,daemon=True,name=f"presence-{n}"); t.start(); t.join(1.0)
-    if t.is_alive(): _PRESENCE_PROBES[n]=t; return 'ok'
-    _PRESENCE_PROBES.pop(n,None)
-    return res.get('v','?')
+    """'ok' | 'absent' | '?' (nick illisible) — repoLocalAbsent dans une sonde bornée (_bounded_probe, 1 s) : un montage réseau
+    figé (os.open sans délai) ne bloque jamais un thread de requête ; sans réponse -> 'ok' (présent mais muet, comme
+    repoLocalAbsent pour un dépôt inaccessible), une seule sonde en attente par nick (revue story 37, verrou : revue story 56)."""
+    return _bounded_probe('presence',n,lambda: 'absent' if _bh_paths.borg.repoLocalAbsent(n) else 'ok',lambda: 'ok')
+
+def _pid_alive(pid) -> bool:
+    """1.31.3 (revue story 56) : processus vivant au sens de /proc/<pid>/stat — zombie (Z) ou mort (X), absent : non. Un
+    borgHelper lancé par POST /bkp puis tué reste zombie, enfant du worker, jusqu'au Popen suivant (os.kill(pid, 0) y réussit)."""
+    try:
+        with open(f'/proc/{int(pid)}/stat') as f: st=f.read()
+        return st[st.rindex(')')+2:][:1] not in ('Z','X','')
+    except (OSError,ValueError): return False
+
+_ROSTER_LAST={}   # nick -> dernier état lu du lock.roster (repli d'une sonde figée : empreinte stable, réponse en cache gardée)
+
+def _repo_roster_state(n: str) -> str:
+    """1.31.3 (story 56, A113) : détenteurs exclusifs du lock.roster du dépôt local du nick (repo_lock_holders de borgHelper :
+    dépôt distant, roster absent ou illisible -> rien), « pid:vivant » (_pid_alive : zombie = mort) triés, lus par une sonde
+    bornée (_bounded_probe, 1 s, une seule en vol par nick). Revue : sonde figée -> DERNIER état lu (ou '?' s'il n'y en a pas
+    encore) : l'empreinte ne change pas, la réponse en cache est gardée (comme la présence, 'ok') ; un résultat tardif devient
+    le dernier état lu."""
+    def read():
+        v=','.join(f"{p}:{int(_pid_alive(p))}" for p in sorted(_bh_paths.db.repo_lock_holders(n)))
+        _ROSTER_LAST[n]=v; return v
+    return _bounded_probe('roster',n,read,lambda: _ROSTER_LAST.get(n,'?'))
+
+_MARKER_RE=re.compile(r'-bkp\.lock\.[0-9a-f]{32}$')
+
+def _bkp_markers_state() -> str:
+    """1.31.3 (story 56, décision de l'utilisateur) : TOUS les marqueurs de Bkp de CACHE_DIR (un voisin du même dépôt compris :
+    Report dit « Bkp de X en cours »), « nom:porteur » (_lock_holder : alive/dead/gone/me ; revue : 'zombie' si son PID est un
+    zombie, _pid_alive) — lecture seule, jamais retirés ici (Report et Status s'en chargent) ; revue : run_id de 32 hex seulement
+    (jamais les « .<pid>.tmp » d'écriture de _set_pid_lock). Erreur : '?'."""
+    import glob
+    try:
+        db=_bh_paths.db; out=[]
+        for p in sorted(glob.glob(os.path.join(glob.escape(db.cache_dir),f"{glob.escape(db.db_prefix)}-*-bkp.lock.*"))):
+            if not _MARKER_RE.search(p): continue
+            h=db._lock_holder(p)
+            if h in ('alive','me'):
+                try:
+                    with open(p) as f: pid=int(f.read().strip())
+                except (OSError,ValueError): pid=None
+                if pid and not _pid_alive(pid): h='zombie'
+            out.append(f"{os.path.basename(p)}:{h}")
+        return ','.join(out)
+    except (Exception,SystemExit): return '?'
 
 def _external_fingerprint(cmd: str, nick: Optional[str]) -> str:
-    """Part « état extérieur » d'une empreinte (les deux caches) : présence de chaque dépôt local des commandes de _CACHE_TTL."""
+    """Part « état extérieur » d'une empreinte (les deux caches) : présence de chaque dépôt local des commandes de _CACHE_TTL.
+    1.31.3 (story 56, A113) : Report -o y ajoute les marqueurs de Bkp et le lock.roster de chaque dépôt local — un Bkp qui démarre,
+    un borgHelper tué, un borg orphelin qui finit renouvellent la réponse (avant : jusqu'à 5 min de « Bkp en cours » de trop)."""
     if cmd not in _CACHE_TTL: return ''
-    return '|repos:'+','.join(f"{n}:{_repo_presence(n)}" for n in _nick_list(nick))
+    fp='|repos:'+','.join(f"{n}:{_repo_presence(n)}" for n in _nick_list(nick))
+    if cmd=='report':
+        fp+='|bkp:'+_bkp_markers_state()+'|roster:'+','.join(f"{n}:{_repo_roster_state(n)}" for n in _nick_list(nick))
+    return fp
 
 def _response_fingerprint(cmd: str, nick: Optional[str]) -> str:
     """Empreinte d'une entrée de _RESPONSE_CACHE — MÊME fonction à la lecture et à l'écriture : mtimes des bases
@@ -4532,6 +4589,82 @@ def push_selftest():
                     return ok
                 check("cache des réponses : Report -o et DiffBkp recalculés si un dépôt local disparaît ou après 5 min, autres routes inchangées (A66)",
                       _cache_external_state)
+                def _cache_report_bkp_state():
+                    """1.31.3 (story 56, A113, décision de l'utilisateur) : Report -o en cache renouvelé quand un marqueur de Bkp apparaît
+                    (tout nick : voisin compris), que son porteur meurt ou devient zombie (Bkp lancé par POST /bkp puis tué : enfant du
+                    worker non récolté), ou que les détenteurs du lock.roster du dépôt changent, meurent ou sont zombies ; sinon
+                    resservi ; marqueurs jamais retirés par WWW ; « .<pid>.tmp » d'écriture ignorés. Revue : sonde du roster figée -> ~1 s
+                    puis DERNIER état lu (réponse en cache gardée), suivantes immédiates, une seule sonde ; résultat tardif adopté ;
+                    requêtes concurrentes : une seule lecture du roster ; diffbkp : ni marqueurs ni roster."""
+                    def clear():
+                        for k in [k for k in _RESPONSE_CACHE if k and k[0]=='report' and k[1]==_internal]: _RESPONSE_CACHE.pop(k,None)
+                    db=_bh_paths.db; ok_r=CommandResult(exitcode=0,stdout='tableau',stderr='')
+                    mk=f"{db._bkp_marker_base(_internal)}.{'5'*32}"; mv=f"{db._bkp_marker_base('selftest-voisin')}.{'6'*32}"
+                    mz=f"{db._bkp_marker_base(_internal)}.{'7'*32}"; mt=f"{mk}.4242.tmp"
+                    kids=[subprocess.Popen(['sleep','60']) for _ in range(5)]; holders=[[]]; after=[[]]; gate=threading.Event(); res={}; reads=[]
+                    def rh(n):
+                        reads.append(n)
+                        if holders[0]=='bloque': gate.wait(10); return list(after[0])
+                        if holders[0]=='lent': time.sleep(0.4); return [kids[1].pid]
+                        return list(holders[0])
+                    def zombie(k):
+                        k.kill()
+                        for _ in range(50):
+                            if not _pid_alive(k.pid): return True
+                            time.sleep(0.05)
+                        return False
+                    try:
+                        with mock.patch(f"{__name__}._exec_borghelper",return_value=ok_r) as ex, \
+                             mock.patch.object(db,'repo_lock_holders',side_effect=rh):
+                            call=lambda: run_borghelper('report',nick=_internal,extra_args=['-o'],cacheable=True)
+                            def runs(f): n0=ex.call_count; f(); return ex.call_count-n0
+                            clear(); _ROSTER_LAST.pop(_internal,None)
+                            res['1er appel exécuté, 2e resservi']=(runs(lambda:(call(),call()))==1,)
+                            with open(mk,'w') as f: f.write(str(kids[0].pid))
+                            res['marqueur posé -> exécuté, puis resservi']=(runs(call)==1 and runs(call)==0,)
+                            with open(mt,'w') as f: f.write(str(kids[0].pid))
+                            res['« .<pid>.tmp » d\'écriture ignoré']=(runs(call)==0,)
+                            with open(mv,'w') as f: f.write(str(kids[1].pid))
+                            res['marqueur d\'un autre nick (voisin) -> exécuté']=(runs(call)==1,)
+                            kids[0].kill(); kids[0].wait()
+                            res['porteur mort -> exécuté, marqueur gardé (lecture seule)']=(runs(call)==1 and os.path.exists(mk) and runs(call)==0,)
+                            with open(mz,'w') as f: f.write(str(kids[3].pid))
+                            runs(call); z=zombie(kids[3])
+                            res['porteur zombie -> exécuté']=(z and runs(call)==1 and runs(call)==0,z)
+                            holders[0]=[kids[2].pid]
+                            res['détenteur du roster -> exécuté, puis resservi']=(runs(call)==1 and runs(call)==0,)
+                            kids[2].kill(); kids[2].wait()
+                            res['détenteur mort -> exécuté']=(runs(call)==1,)
+                            holders[0]=[kids[4].pid]; runs(call); z=zombie(kids[4])
+                            res['détenteur zombie -> exécuté']=(z and runs(call)==1,z)
+                            holders[0]=[]; runs(call)
+                            last=_ROSTER_LAST.get(_internal)
+                            holders[0]='bloque'; after[0]=[kids[1].pid]; t0=time.time(); a=runs(call); t1=time.time(); b=runs(call); t2=time.time()
+                            nth=sum(1 for t in threading.enumerate() if t.name==f"roster-{_internal}" and t.is_alive())
+                            res['roster figé : ~1 s, dernier état lu, réponse en cache gardée ; suivant immédiat ; une sonde']=(a==0 and b==0
+                                and 0.9<=t1-t0<3 and t2-t1<0.9 and nth==1 and _ROSTER_LAST.get(_internal)==last,a,b,round(t1-t0,2),round(t2-t1,2),nth)
+                            gate.set(); e=_PROBES.get(('roster',_internal)); e and e['t'].join(5)
+                            res['résultat tardif adopté']=(_ROSTER_LAST.get(_internal)==f"{kids[1].pid}:1",_ROSTER_LAST.get(_internal))
+                            holders[0]='lent'; del reads[:]; _ROSTER_LAST[_internal]='avant'; got=[]
+                            th=[threading.Thread(target=lambda: got.append(_repo_roster_state(_internal))) for _ in range(3)]
+                            for t in th: t.start()
+                            for t in th: t.join(5)
+                            res['requêtes concurrentes : une seule lecture, toutes attendent sa vraie valeur']=(reads==[_internal]
+                                and got==[f"{kids[1].pid}:1"]*3,reads,got)
+                            holders[0]=[]
+                            res['diffbkp : ni marqueurs ni roster']=('|bkp:' not in _external_fingerprint('diffbkp',_internal)
+                                and '|roster:' not in _external_fingerprint('diffbkp',_internal) and '|bkp:' in _external_fingerprint('report',_internal),)
+                    finally:
+                        gate.set(); e=_PROBES.pop(('roster',_internal),None); e and e['t'].join(5); _ROSTER_LAST.pop(_internal,None); clear()
+                        for k in kids:
+                            with contextlib.suppress(Exception): k.kill(); k.wait()
+                        for p in (mk,mv,mz,mt):
+                            with contextlib.suppress(OSError): os.unlink(p)
+                    bad={k:v for k,v in res.items() if not v[0]}
+                    if bad: print(f"  {bad}")
+                    return not bad and len(res)==13
+                check("cache Report -o : marqueurs de Bkp et lock.roster dans l'empreinte, lecture seule, sonde bornée (story 56, A113)",
+                      _cache_report_bkp_state)
                 def _scope_cache_ttl():
                     """1.29.0 (story 37, A66) : cache par périmètre — DiffBkp : ligne de plus de 5 min ignorée, empreinte avec la présence
                     du dépôt (_capture_fingerprints(…,'diffbkp')) ; LstBkpFls : âge sans effet, empreinte sans présence."""
@@ -4559,8 +4692,8 @@ def push_selftest():
                     def hung(n,*a,**k): calls.append(n); gate.wait(10); return True
                     with mock.patch.object(_bh_paths.borg,'repoLocalAbsent',hung):
                         t0=time.time(); a=_repo_presence('selftest-pres'); t1=time.time(); b=_repo_presence('selftest-pres'); t2=time.time()
-                        gate.set(); _PRESENCE_PROBES['selftest-pres'].join(5); c=_repo_presence('selftest-pres')
-                    _PRESENCE_PROBES.pop('selftest-pres',None)
+                        gate.set(); _PROBES[('presence','selftest-pres')]['t'].join(5); c=_repo_presence('selftest-pres')
+                    _PROBES.pop(('presence','selftest-pres'),None)
                     got=(a,b,c,len(calls),0.8<t1-t0<3,t2-t1<0.5)
                     if got!=('ok','ok','absent',2,True,True): print(f"  {got}")
                     return got==('ok','ok','absent',2,True,True)
