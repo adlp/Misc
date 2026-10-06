@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.186"
+Version="1.0.187"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -413,8 +413,10 @@ def _version_from_output(text):
 
 def _borg_ver_text(m):
     """Colonne « borg » (Report, UI ; 1.0.165) depuis une mesure d'archive : « 1.2.6 », « 1.2.6 / srv 1.2.4 » (serveur connu
-    et différent), « — » (inconnue : archive créée hors borgHelper ou avant 1.0.165, version non lue)."""
+    et différent), « — » (inconnue : archive créée hors borgHelper ou avant 1.0.165, version non lue), « — (rapprochée) »
+    (1.0.187, story 58, décision de l'utilisateur : archive d'un Bkp tué fermée par le rapprochement, versions inconnues)."""
     bv=(m or {}).get('borg_version'); sv=(m or {}).get('borg_server_version')
+    if not bv and not sv and (m or {}).get('reconciled'): return '— (rapprochée)'
     return (bv or '—')+(f" / srv {sv}" if sv and sv!=bv else '')
 
 def _measure_of(measures,archive,archive_date):
@@ -1310,7 +1312,8 @@ _DEC_MEMO_MAX=262144  # entrées du mémo de décodage (DbCodec.decode_path)
 
 # Définition de référence de la vue archive_snapshot_v (1.0.131 : source unique, comparée aux bases existantes).
 # history.db (1.0.139, AD-7) : mesures NON régénérables — jamais un chemin, donc jamais chiffrée ; une base par nick,
-# à côté de diff.db. Écrivains : bkp_status et archive_measure = Bkp seul ; repo_stats = Bkp/Prune/refresh d'Index.
+# à côté de diff.db. Écrivains : bkp_status et archive_measure = Bkp (et le rapprochement d'un Bkp tué, 1.0.185/1.0.187 :
+# fermeture de sa ligne, marque de son archive) ; repo_stats = Bkp/Prune/refresh d'Index.
 _HISTORY_SCHEMA="""
     CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT);
     CREATE TABLE IF NOT EXISTS repo_stats (
@@ -1346,6 +1349,7 @@ _HISTORY_SCHEMA="""
         read_errors           INTEGER,
         borg_version          TEXT,
         borg_server_version   TEXT,
+        reconciled            INTEGER,
         PRIMARY KEY (nick, archive, archive_date)
     );
     CREATE TABLE IF NOT EXISTS archive_chart (
@@ -1373,10 +1377,12 @@ _RECONCILE_ERRORS=(sqlite3.Error,SystemExit,DbKeyError,DbModeError,DbTamperError
 # archive_chart (1.0.140, AD-7 amendé) : ligne de graphique figée d'une archive par le rapprochement avant sa purge
 # (gone=1), ou seuls les comptages de fichiers d'une archive restante dont la paire entrante est retirée (gone=0).
 # Gardée STATS_RETENTION_MONTHS, que l'archive existe encore ou non. Ajout pur : HISTORY_DB_SCHEMA_VERSION inchangé.
-# archive_measure.borg_version / borg_server_version (1.0.165, story 28, A44) : version du borg qui a créé l'archive (flux
-# --show-version du borg create) et de celui qui a reçu les données, relevées au Bkp — borg ne les enregistre nulle part
-# (mesuré, 1.2.6). Colonnes ajoutées par introspection (ensure_history_db) : ajout pur, version de schéma inchangée.
-_MEASURE_VERSION_COLS=('borg_version','borg_server_version')
+# Colonnes d'archive_measure ajoutées par introspection (ensure_history_db) : ajout pur, version de schéma inchangée.
+# borg_version / borg_server_version (1.0.165, story 28, A44) : version du borg qui a créé l'archive (flux --show-version du
+# borg create) et de celui qui a reçu les données, relevées au Bkp — borg ne les enregistre nulle part (mesuré, 1.2.6).
+# reconciled (1.0.187, story 58, décisions de l'utilisateur) : 1 = archive d'un Bkp tué rapprochée (_reconcile_killed_bkp) —
+# aucune mesure de Bkp (versions, C/E inconnues).
+_MEASURE_ADDED_COLS={'borg_version':'TEXT','borg_server_version':'TEXT','reconciled':'INTEGER'}
 _CHART_FIELDS=('duration','original_size','compressed_size','deduplicated_size','nfiles',
                'files_added','files_modified','files_removed','changed_during_backup','read_errors')
 
@@ -3291,15 +3297,15 @@ class BorgHelperDB:
                 conn.executescript(_HISTORY_SCHEMA)
                 # 1.0.165 : colonnes de versions, relues sous verrou (deux écrivains qui ouvrent ensemble une base d'avant :
                 # un seul les ajoute) ; base d'un schéma plus récent : jamais touchée (_check_set_meta la refuse ensuite)
-                if not {c for c in _MEASURE_VERSION_COLS}<={r[1] for r in conn.execute("PRAGMA table_info(archive_measure)")}:
+                if not set(_MEASURE_ADDED_COLS)<={r[1] for r in conn.execute("PRAGMA table_info(archive_measure)")}:
                     if conn.in_transaction: conn.commit()
                     conn.execute("BEGIN IMMEDIATE")
                     try:
                         row=conn.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()
                         if not (row and str(row[0]).isdigit() and int(row[0])>HISTORY_DB_SCHEMA_VERSION):
                             cols=[r[1] for r in conn.execute("PRAGMA table_info(archive_measure)").fetchall()]
-                            for col in _MEASURE_VERSION_COLS:
-                                if col not in cols: conn.execute(f"ALTER TABLE archive_measure ADD COLUMN {col} TEXT")
+                            for col,typ in _MEASURE_ADDED_COLS.items():   # 1.0.187 : reconciled aussi
+                                if col not in cols: conn.execute(f"ALTER TABLE archive_measure ADD COLUMN {col} {typ}")
                         conn.commit()
                     except BaseException:
                         if conn.in_transaction: conn.rollback()
@@ -3524,21 +3530,36 @@ class BorgHelperDB:
         try: return self._with_lock_retry(_do)
         except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
 
+    def mark_archive_reconciled(self,nick,archive,db_path=None):
+        """1.0.187 (story 58) : marque l'archive d'un Bkp tué fermée par le rapprochement — ligne archive_measure sans mesure
+        (archive_date '' : la date de borg list, en UTC, n'est pas celle d'archive_stats ; lue par nom, repli de
+        get_archive_measures), reconciled=1. Jamais sur une archive qui a déjà une mesure (aucune écrasée). True si écrite."""
+        db_path=self._hist(nick,db_path,create=True)
+        def _do():
+            conn=_open_db(db_path,nick=None,role='write')
+            try:
+                cur=conn.execute("INSERT INTO archive_measure (nick,archive,archive_date,reconciled) SELECT ?,?,'',1 "
+                                 "WHERE NOT EXISTS (SELECT 1 FROM archive_measure WHERE nick=? AND archive=?)",(nick,archive,nick,archive))
+                conn.commit(); return cur.rowcount==1
+            finally: conn.close()
+        try: return self._with_lock_retry(_do)
+        except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
+
     def get_archive_measures(self,nick,db_path=None):
         """{(archive, archive_date ou ''): {'deduplicated_size','changed_during_backup','read_errors','borg_version',
-        'borg_server_version'}} — {} si aucune."""
+        'borg_server_version','reconciled'}} — {} si aucune. reconciled (1.0.187) : archive fermée par le rapprochement."""
         db_path=self._hist(nick,db_path)
         if db_path is None: return {}
         try:
             conn=_open_db(db_path,nick=None,role='read')
             try:
                 cols=[r[1] for r in conn.execute("PRAGMA table_info(archive_measure)").fetchall()]
-                ver=','.join(c if c in cols else 'NULL' for c in _MEASURE_VERSION_COLS)   # base d'avant 1.0.165 non rouverte en écriture
+                ver=','.join(c if c in cols else 'NULL' for c in _MEASURE_ADDED_COLS)   # base d'avant 1.0.165/1.0.187 non rouverte en écriture
                 rows=conn.execute(f"SELECT archive,archive_date,deduplicated_size,changed_during_backup,read_errors,{ver} "
                                   "FROM archive_measure WHERE nick=?",(nick,)).fetchall()
             finally: conn.close()
             out={(r[0],r[1]):{'deduplicated_size':r[2],'changed_during_backup':r[3],'read_errors':r[4],
-                              'borg_version':r[5],'borg_server_version':r[6]} for r in rows}
+                              'borg_version':r[5],'borg_server_version':r[6],'reconciled':bool(r[7])} for r in rows}
             # Repli (revue story 2) : clé (archive, None) = mesure retrouvée par le seul nom quand il est unique — une
             # archive_stats reconstruite peut porter une archive_date formatée autrement (ou absente) que celle du Bkp.
             names={}
@@ -8250,6 +8271,7 @@ class BorgHelper:
             # 1.0.165 (A44) : versions de borg relevées au Bkp (null : inconnue)
             r['borg_version']=m.get('borg_version') if m else None
             r['borg_server_version']=m.get('borg_server_version') if m else None
+            r['reconciled']=bool(m.get('reconciled')) if m else False   # 1.0.187 (story 58)
         diff_stats=self.db._diff_stats_for_nick(nick)
         for r in rows:
             st=diff_stats.get(r['archive'])
@@ -8278,7 +8300,7 @@ class BorgHelper:
                              'deduplicated_size':f['deduplicated_size'],'nfiles':f['nfiles'],
                              'changed_during_backup':f['changed_during_backup'],'read_errors':f['read_errors'],
                              'files_added':f['files_added'],'files_modified':f['files_modified'],
-                             'files_removed':f['files_removed'],'borg_version':None,'borg_server_version':None,'pruned':True})
+                             'files_removed':f['files_removed'],'borg_version':None,'borg_server_version':None,'reconciled':False,'pruned':True})
         rows.sort(key=lambda r:(r['archive_date'] is not None,r['archive_date'] or '',r['archive']))
         print(json.dumps({'borghelper_version':Version,'nick':nick,'rows':rows},ensure_ascii=False,indent=2))
 
@@ -8323,6 +8345,7 @@ class BorgHelper:
             m=_measure_of(self.db.get_archive_measures(nick),last_backup['archive'],last_backup['date'])
             last_backup['borg_version']=m.get('borg_version') if m else None
             last_backup['borg_server_version']=m.get('borg_server_version') if m else None
+            last_backup['reconciled']=bool(m.get('reconciled')) if m else False   # 1.0.187 (story 58)
         # history.db (1.0.139). 1.0.154 (story 17) : au-delà du délai de /access, Bkp interrompu (bkp_stale), plus « en cours ».
         # 1.0.155 (story 18) : délai du nick (clé rc BKP_STATUS_TIMEOUT, puis variable, puis 6 h), le même que borgHelperWWW
         timeout_s=self.bkp_status_timeout(nick)
@@ -8379,7 +8402,8 @@ class BorgHelper:
             try: age=_age_readable(d2DateNSince(lb['date'])['since'])
             except (ValueError,TypeError): age=''
             printer(f"  Dernier backup : {lb['archive']} ({lb['date']}) {age}".rstrip())
-            printer(f"  borg : {_borg_ver_text(lb)}")   # 1.0.165 (A44)
+            vt=_borg_ver_text(lb)   # 1.0.165 (A44) ; 1.0.187 (story 58, décision de l'utilisateur) : même règle que Report
+            printer("  borg : inconnue (Bkp interrompu, archive rapprochée)" if vt=='— (rapprochée)' else f"  borg : {vt}")
         else:
             printer("  Dernier backup : aucune archive indexée")
         run=st['bkp_running']
@@ -9194,9 +9218,16 @@ class BorgHelper:
             if not a: continue
             try: fin=datetime.strptime(str(a.get('end',''))[:19],'%Y-%m-%dT%H:%M:%S').strftime('%Y-%m-%d %H:%M:%S')   # déjà UTC
             except ValueError: continue   # fin illisible : jamais une date inventée
+            # 1.0.187 (story 58) : archive dite rapprochée par Status, Report, ArchiveHistory — marquée AVANT la fermeture (revue :
+            # un arrêt entre les deux laissait une ligne fermée, plus jamais candidate, et son archive sans marque ; marque sans
+            # fermeture : ligne refermée au prochain passage, marque déjà là). Échec : archive non marquée, ligne fermée quand
+            # même (message SQLite habituel), jamais l'Index arrêté
+            try: self.db.mark_archive_reconciled(nick,str(a.get('name')))
+            except (Exception,SystemExit): pass   # base refusée (_db_schema_fail : sys.exit, son message) comprise
             try: ok=self.db.close_bkp_status_reconciled(nick,r,fin)
             except Exception: continue   # (revue) erreur de base : jamais le Bkp ni l'Index tués par le rapprochement
-            if ok: printer(f"  {nick} : Bkp interrompu {r[:8]} rapproché — archive {a.get('name')} écrite, ligne fermée en succès"); n+=1
+            if ok:
+                printer(f"  {nick} : Bkp interrompu {r[:8]} rapproché — archive {a.get('name')} écrite, ligne fermée en succès"); n+=1
         return n
 
     def _bkp_live(self,nick,quiet=False,strict=False):
@@ -11347,8 +11378,10 @@ def codec_selftest(pattern=None,list_only=False):
             return ok
         check("versions de borg : serveur selon le mode (tunnel inverse, ssh direct, commande forcée, échec, délai, local, _MEI mappé au délai)",_bver_server)
         def _bver_history():
-            """history.db d'avant 1.0.165 (archive_measure sans colonnes) : lue telle quelle par un lecteur (versions null),
-            colonnes ajoutées à l'ouverture par un écrivain, versions écrites puis relues ; mesure existante gardée."""
+            """history.db d'avant 1.0.165 (archive_measure sans colonnes) : lue telle quelle par un lecteur (versions null,
+            reconciled false), colonnes ajoutées à l'ouverture par un écrivain (reconciled aussi, 1.0.187), versions écrites puis
+            relues ; mesure existante gardée. 1.0.187 (story 58) : marque de rapprochement écrite sur une archive sans mesure, refusée
+            sur une archive qui en a une (versions intactes)."""
             dp=os.path.join(tmp,'bver-history.db')
             for suf in ('','-wal','-shm'):
                 if os.path.exists(dp+suf): os.unlink(dp+suf)
@@ -11364,14 +11397,48 @@ def codec_selftest(pattern=None,list_only=False):
             with contextlib.redirect_stdout(io.StringIO()):
                 w=bhq.db.store_archive_measure('hv','a2','d2',20,1,0,dp,borg_version='1.2.6',borg_server_version='1.2.4')
             cols=[r[1] for r in _q(dp,"PRAGMA table_info(archive_measure)")]
+            with contextlib.redirect_stdout(io.StringIO()):
+                mk=(bhq.db.mark_archive_reconciled('hv','a3',dp),bhq.db.mark_archive_reconciled('hv','a2',dp))
             after=bhq.db.get_archive_measures('hv',dp)
-            ok=(before.get(('a1','d1'),{}).get('borg_version','x') is None and 'borg_version' not in cols0 and w
-                and cols[-2:]==['borg_version','borg_server_version']
+            ok=(before.get(('a1','d1'),{}).get('borg_version','x') is None and before.get(('a1','d1'),{}).get('reconciled') is False
+                and 'borg_version' not in cols0 and w
+                and cols[-3:]==['borg_version','borg_server_version','reconciled']
                 and after[('a2','d2')]['borg_version']=='1.2.6' and after[('a2','d2')]['borg_server_version']=='1.2.4'
-                and after[('a1','d1')]['deduplicated_size']==10 and after[('a1','d1')]['borg_version'] is None)
-            if not ok: print(f"  avant {before} {cols0} ; écrit {w} ; colonnes {cols} ; après {after}")
+                and after[('a1','d1')]['deduplicated_size']==10 and after[('a1','d1')]['borg_version'] is None
+                and mk==(True,False) and after[('a3','')]['reconciled'] is True and after[('a3',None)]['reconciled'] is True
+                and after[('a3','')]['borg_version'] is None and after[('a3','')]['deduplicated_size'] is None
+                and after[('a2','d2')]['reconciled'] is False and after[('a1','d1')]['reconciled'] is False)
+            if not ok: print(f"  avant {before} {cols0} ; écrit {w} ; colonnes {cols} ; marques {mk} ; après {after}")
             return ok
         check("versions de borg : history.db d'avant lue sans colonnes, colonnes ajoutées par un écrivain",_bver_history)
+        def _reconciled_history_186():
+            """1.0.187 (story 58, revue) : history.db de 1.0.165 à 1.0.186 (colonnes de versions présentes, sans reconciled) — forme
+            de toute installation à jour : lue telle quelle (reconciled false), colonne ajoutée par un écrivain (la marque), marque
+            écrite et relue ; mesure existante intacte."""
+            dp=os.path.join(tmp,'brec-history-186.db')
+            for suf in ('','-wal','-shm'):
+                if os.path.exists(dp+suf): os.unlink(dp+suf)
+            c=sqlite3.connect(dp)
+            c.executescript("CREATE TABLE db_meta (key TEXT PRIMARY KEY, value TEXT); INSERT INTO db_meta VALUES('schema_version','1');"
+                "CREATE TABLE archive_measure (nick TEXT NOT NULL, archive TEXT NOT NULL, archive_date TEXT NOT NULL DEFAULT '',"
+                " deduplicated_size INTEGER, changed_during_backup INTEGER, read_errors INTEGER, borg_version TEXT, borg_server_version TEXT,"
+                " PRIMARY KEY (nick, archive, archive_date));"
+                "INSERT INTO archive_measure VALUES('h6','a1','d1',10,0,0,'1.2.6','1.2.4');")
+            c.close()
+            before=bhq.db.get_archive_measures('h6',dp)
+            cols0=[r[1] for r in _q(dp,"PRAGMA table_info(archive_measure)")]
+            bhq.db._hist_ready.discard(dp)
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                w=bhq.db.mark_archive_reconciled('h6','a2',dp)
+            cols=[r[1] for r in _q(dp,"PRAGMA table_info(archive_measure)")]
+            after=bhq.db.get_archive_measures('h6',dp)
+            ok=(before.get(('a1','d1'),{}).get('reconciled') is False and 'reconciled' not in cols0 and w is True
+                and cols[-3:]==['borg_version','borg_server_version','reconciled']
+                and after[('a2','')]['reconciled'] is True and after[('a1','d1')]['reconciled'] is False
+                and after[('a1','d1')]['borg_version']=='1.2.6' and after[('a1','d1')]['borg_server_version']=='1.2.4')
+            if not ok: print(f"  avant {before} {cols0} ; marque {w} ; colonnes {cols} ; après {after}")
+            return ok
+        check("archive rapprochée : history.db de 1.0.165 à 1.0.186 lue, colonne reconciled ajoutée par la marque (1.0.187)",_reconciled_history_186)
         def _bver_history_newer():
             """history.db d'un schéma plus récent que ce code, sans les colonnes : jamais modifiée (refusée)."""
             dp=os.path.join(tmp,'bver-history-new.db')
@@ -11409,7 +11476,7 @@ def codec_selftest(pattern=None,list_only=False):
             except (Exception,SystemExit) as e: w=False; err=e
             cols=[r[1] for r in _q(dp,"PRAGMA table_info(archive_measure)")]
             m=bhq.db.get_archive_measures('hh',dp).get(('a1','d1'),{}) if w else {}
-            ok=(w and cols[-2:]==['borg_version','borg_server_version'] and cols.count('borg_version')==1
+            ok=(w and cols[-3:]==['borg_version','borg_server_version','reconciled'] and cols.count('borg_version')==1
                 and m.get('borg_version')=='1.2.6' and m.get('borg_server_version')=='1.2.4')
             if not ok: print(f"  écrit {w} {err!r} ; colonnes {cols} ; mesure {m}")
             return ok
@@ -15417,10 +15484,12 @@ fail()
             run <run_id> » juste après create (rkb), cité pour le shell distant avec SSH_REMFO (rkr), rapprochement AVANT sa propre
             ligne (Bkp tué déjà fermé au create ; structure : avant store_bkp_status_start, dans le try) ; Ctrl-C pendant son borg
             list (rki) : 130, aucun create, priority.lock et marqueur retirés, aucune ligne ; _index_pass : après la garde « dépôt
-            absent » (structure). Fuseau local fixé (TZ=Europe/Paris, restauré) : une conversion locale se verrait."""
+            absent » (structure). Fuseau local fixé (TZ=Europe/Paris, restauré) : une conversion locale se verrait. 1.0.187 (story 58) :
+            archive du run marquée rapprochée, sans mesure inventée (rk1) ; marque impossible (sys.exit de la base) -> ligne fermée
+            quand même, pas d'exception (rkm)."""
             from datetime import datetime,timezone
             d=os.path.join(tmp,'rk54'); shutil.rmtree(d,ignore_errors=True); os.makedirs(d); rc=os.path.join(d,'rc')
-            nk=tuple(f'rk{i}' for i in range(1,10))+('rkb','rkc','rkd','rke','rkf','rkg','rkh','rki','rkj','rkk','rkp','rkq','rkr')
+            nk=tuple(f'rk{i}' for i in range(1,10))+('rkb','rkc','rkd','rke','rkf','rkg','rkh','rki','rkj','rkk','rkp','rkq','rkr','rkm')
             for n in nk:
                 if n!='rkj': os.makedirs(os.path.join(d,'r-'+n))   # rkj : dépôt local absent
             extra={'rkd':"GLOB_ARCH=rkd-*\n",'rkr':"SSH_REMFO=2222:localhost:22\n"}
@@ -15439,7 +15508,7 @@ fail()
                   'rk6':[A('rk6',9),{'name':'manuel','comment':'','end':END}],'rk9':[A('rk9')],'rkb':[A('rkb')],
                   'rkc':[{'name':'rkc-2.checkpoint','comment':f'borgHelper run {RUN("rkc")}','end':E(2)}],
                   'rkd':[A('rkd',7),A('rkd'),A('rkd',3)],'rke':[A('rke')],'rkf':[A('rkf',end=''),A('rkf',3)],'rkh':[A('rkh')],
-                  'rki':[A('rki')],'rkj':[A('rkj')],'rkk':[A('rkk')],'rkp':[A('rkp')],'rkq':[A('rkq')]}
+                  'rki':[A('rki')],'rkj':[A('rkj')],'rkk':[A('rkk')],'rkp':[A('rkp')],'rkq':[A('rkq')],'rkm':[A('rkm')]}
             calls=[]; seen={}
             class Stop54(Exception): pass
             def fake_boex(nick,cmd,**kw):
@@ -15491,6 +15560,13 @@ fail()
                     and row('rk1')==(F(2),'success') and f"rk1 : Bkp interrompu {RUN('rk1')[:8]} rapproché — archive rk1-2 écrite, ligne fermée en succès" in e
                     and not o.strip() and len(l)==1 and l[0][3].get('forceEnv')=={'TZ':'UTC'}
                     and pv and pv['failed'] is False,r,row('rk1'),o[-200:],e[-200:],l,pv)
+                ms1=b.db.get_archive_measures('rk1')
+                res['rk1 archive marquée rapprochée (1.0.187), sans mesure inventée']=(ms1.get(('rk1-2',''),{}).get('reconciled') is True
+                    and ms1[('rk1-2','')]['borg_version'] is None and ms1[('rk1-2','')]['changed_during_backup'] is None,ms1)
+                def exitmark(*a,**k): raise SystemExit(1)   # comme _db_schema_fail (base refusée)
+                with mock.patch.object(b.db,'mark_archive_reconciled',exitmark): r,o,e,l=run('rkm')
+                res['rkm marque impossible (sys.exit de la base) : ligne fermée quand même, pas d\'exception (1.0.187)']=(r==1
+                    and row('rkm')==(F(2),'success') and b.db.get_archive_measures('rkm')=={},r,row('rkm'))
                 for n,why in (('rk2','sans archive'),('rk6','archive d\'un autre run ou sans commentaire'),('rkc','seule archive du run : .checkpoint')):
                     r,o,e,l=run(n)
                     res[f'{n} {why} : ligne intacte']=(r==0 and row(n)==(None,None) and 'rapproché' not in o+e and len(l)==1,r,row(n),o[-200:],e[-200:],l)
@@ -15514,7 +15590,8 @@ fail()
                 r,o,e,l=run('rkk',opn=unreadable); res['rkk base illisible : 0, aucun borg, pas d\'exception']=(r==0 and l==[] and row('rkk')==(None,None),r,l)
                 r,o,e,l=run('rkg'); res['rkg borg tué par l\'arrêt : None, muet, intacte']=(r is None and row('rkg')==(None,None) and not (o+e).strip(),r,o,e)
                 def boom(*a,**k): raise OSError('base (contrôle)')
-                r,o,e,l=run('rkh',close=boom); res['rkh erreur de base à la fermeture : 0, intacte, pas d\'exception']=(r==0 and row('rkh')==(None,None),r,row('rkh'))
+                r,o,e,l=run('rkh',close=boom); res['rkh erreur de base à la fermeture : 0, intacte, pas d\'exception ; archive déjà marquée (marque avant la fermeture, 1.0.187)']=(r==0
+                    and row('rkh')==(None,None) and b.db.get_archive_measures('rkh').get(('rkh-2',''),{}).get('reconciled') is True,r,row('rkh'))
                 r,o,e,l=run('rki'); res['rki Ctrl-C (130) propagé, intacte']=(r=='SystemExit: 130' and row('rki')==(None,None),r)
                 with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
                     ok=b.db.close_bkp_status_reconciled('rk9',RUN('rk9'),'2000-01-01 00:00:00')
@@ -15551,8 +15628,10 @@ fail()
                 rid={n:(sqlite3.connect(b.db.get_history_db(n)).execute("SELECT run_id FROM bkp_status WHERE nick=? AND run_id NOT IN (?,?)",(n,RUN(n,1),RUN(n))).fetchone() or [None])[0]
                      for n in ('rkb','rkr')}
                 cm,pb,tf,_o=seen['rkb']
-                res['backup() : --comment juste après create, Bkp tué rapproché avant le create']=(rid['rkb'] is not None and pb is None
-                    and (cm or [])[:3]==['create','--comment',f'borgHelper run {rid["rkb"]}'] and tf==('success',),(cm or [])[:3],rid,tf,_o)
+                mb=b.db.get_archive_measures('rkb').get(('rkb-2',''),{})
+                res['backup() : --comment juste après create, Bkp tué rapproché avant le create, son archive marquée (1.0.187)']=(rid['rkb'] is not None
+                    and pb is None and (cm or [])[:3]==['create','--comment',f'borgHelper run {rid["rkb"]}'] and tf==('success',)
+                    and mb.get('reconciled') is True,(cm or [])[:3],rid,tf,mb,_o)
                 cm,pb,tf,_o=seen['rkr']
                 sp=shlex.split(' '.join(cm or [])); i=sp.index('--comment') if '--comment' in sp else -1
                 res['backup() SSH_REMFO : commentaire intact après redécoupage par le shell distant']=(rid['rkr'] is not None and pb is not None
@@ -19629,6 +19708,66 @@ fail()
                              f"ArchiveHistory {ah} ; Status {os_[-200:]!r} ; bw {gw} {ew[-200:]!r} ; Bkp {eb[-300:]!r}")
             return ok
         _rbc("versions de borg sur vrai borg : Bkp, Report (texte et JSON), ArchiveHistory, Status ; archive externe « — » ; sans --show-version",_bver_real_borg)
+        def _reconciled_real_borg():
+            """1.0.187 (story 58, décisions de l'utilisateur) : vrai borg, CLI. Nick br : archive hors borgHelper (ext), Bkp normal
+            (bkp), puis Bkp « tué » dont le borg a fini — ligne bkp_status ouverte (run R, aucun marqueur) et `borg create --comment
+            « borgHelper run R »` lancé à la main, comme le borg resté seul — puis Index : ligne rapprochée et archive marquée.
+            Attendu (en dur) : Status « borg : inconnue (Bkp interrompu, archive rapprochée) », Status -j reconciled true ; Report -o
+            -j et Report -j en direct (jumelle) : rec « — (rapprochée) », bkp <version>, ext « — » ; Report -o texte, Report texte
+            en direct et Report -o -l (HTML, cellule) citent « — (rapprochée) » ; ArchiveHistory -j : reconciled {bkp: false, ext: false, rec: true}, versions et C/E null pour rec."""
+            borg=shutil.which('borg'); me=os.path.realpath(__file__)
+            vr=subprocess.run([borg,'--version'],capture_output=True,text=True,stdin=subprocess.DEVNULL,timeout=60)
+            ver=vr.stdout.strip().split()[-1] if vr.returncode==0 and vr.stdout.strip() else None
+            d=os.path.join(tmp,'brec-real'); bb=os.path.join(d,'bb'); src=os.path.join(d,'src'); os.makedirs(src)
+            with open(os.path.join(src,'f'),'w') as f: f.write('x')
+            fq=socket.getfqdn(); rc=os.path.join(d,'rc'); cache=os.path.join(d,'cache'); w=os.path.join(d,'borgw'); repo=os.path.join(d,'repo-br')
+            _rb_wrapper(w,bb); env=_rb_env(bb,BORG_PASSPHRASE='pw-br')
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={cache}\n\n[br]\nBORG_REPO={repo}\nBORG_PASSPHRASE=pw-br\nSER_NAME=br\nSER_LOGIN=x\n"
+                        f"GLOB_ARCH={fq}-*\nBORG_ARCHNAME=br\nBORG_ROOTBKP={src}\nEXCLUDE=--exclude-caches\nDB_ENCRYPT=false\n"
+                        f"BORG_EXE={w}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\n")
+            os.chmod(rc,0o600); cenv=_rb_cli_env(bb)
+            def cli(*a):
+                p=_rb_run([me,'-C',rc,'-c',*a],300,env=cenv); return p.returncode,p.stdout,p.stderr
+            r=_rb_run([borg,'init','-e','repokey',repo],120,env=env)
+            if r.returncode!=0: print(f"  init : {r.stderr[-200:]}"); return False
+            r=_rb_run([borg,'create','--timestamp','2026-01-01T00:00:00',f"{repo}::{fq}-ext-1",src],120,env=env)
+            if r.returncode not in (0,1): print(f"  create ext : {r.stderr[-200:]}"); return False
+            cb,ob,eb=cli('Bkp','-n','br')
+            run_id='5a'*16
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                hb=BorgHelper(cfgfile=rc,cache_dir=cache); hb.db.store_bkp_status_start('br',run_id,db_path=hb.db.get_history_db('br'))
+            r=_rb_run([borg,'create','--comment',f'borgHelper run {run_id}',f"{repo}::{fq}-rec-1",src],120,env=env)
+            if r.returncode not in (0,1): print(f"  create rec : {r.stderr[-200:]}"); return False
+            ci,oi,ei=cli('Index','-n','br')
+            kind=lambda k: 'ext' if '-ext-' in k else 'rec' if '-rec-' in k else 'bkp'
+            def borgcol(o):
+                try: return {kind(k):v.get('borg') for k,v in json.loads(o)['backups']['br'].items() if k not in ('Prunable','Totaux')}
+                except (ValueError,KeyError): return {}
+            cr,orp,_e=cli('Report','-n','br','-o','-j'); got=borgcol(orp)
+            cl,ol,_e=cli('Report','-n','br','-j'); live=borgcol(ol)
+            ct,ot,_e=cli('Report','-n','br','-o')
+            ctl,otl,_e=cli('Report','-n','br')   # jumelle prep_report, texte
+            ch,oh,_e=cli('Report','-n','br','-o','-l')   # HTML
+            ca,oa,_e=cli('ArchiveHistory','-n','br','-j')
+            try: ah={kind(x['archive']):(x.get('reconciled'),x.get('borg_version'),x.get('changed_during_backup'),x.get('read_errors'))
+                     for x in json.loads(oa)['rows']}
+            except (ValueError,KeyError): ah={}
+            cs,os_,es=cli('Status','-n','br'); os_+=es
+            cj,oj,_e=cli('Status','-n','br','-j')
+            try: lb=json.loads(oj)[0]['last_backup']
+            except (ValueError,KeyError,IndexError): lb={}
+            ok=(ver is not None and (cb,ci,cr,cl,ct,ctl,ch,ca,cs,cj)==(0,)*10
+                and f"Bkp interrompu {run_id[:8]} rapproché — archive {fq}-rec-1 écrite" in oi+ei
+                and got=={'bkp':ver,'ext':'—','rec':'— (rapprochée)'} and live==got and '— (rapprochée)' in ot
+                and '— (rapprochée)' in otl and ("'>— (rapprochée)</td>" in oh or '<em>— (rapprochée)</em>' in oh)
+                and ah=={'bkp':(False,ver,0,0),'ext':(False,None,None,None),'rec':(True,None,None,None)}
+                and "borg : inconnue (Bkp interrompu, archive rapprochée)" in os_
+                and lb.get('archive')==f"{fq}-rec-1" and lb.get('reconciled') is True and lb.get('borg_version') is None)
+            if not ok: print(f"  version {ver!r} ; codes {(cb,ci,cr,cl,ct,ctl,ch,ca,cs,cj)} ; Index {(oi+ei)[-300:]!r} ; Report {got} / direct {live} ; "
+                             f"texte {'— (rapprochée)' in ot}/{'— (rapprochée)' in otl} ; HTML {'(rapprochée)' in oh} ; ArchiveHistory {ah} ; Status {os_[-250:]!r} ; -j {lb} ; Bkp {eb[-200:]!r}")
+            return ok
+        _rbc("archive rapprochée sur vrai borg : Status « inconnue (Bkp interrompu, archive rapprochée) », Report « — (rapprochée) », reconciled (1.0.187)",_reconciled_real_borg)
         def _bver_real_ssh():
             """1.0.165 (story 28) : vrais Bkp vers des dépôts ssh://, faux ssh (BORG_RSH : retire l'hôte, lance la commande en
             local). BORG_REMOTE_PATH = wrapper du vrai borg serve : bs répond à --version « borg 9.9.9 » ; bx = vraie commande

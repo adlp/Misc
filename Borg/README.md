@@ -542,7 +542,10 @@ fin dit « succès » (sans compteurs d'avertissements) ; sinon l'échec (et l'a
 succès. Seules les lignes encore ouvertes (aucun Bkp réussi depuis) sont examinées : un `borg list` en plus (qui lit chaque
 archive) tant qu'il y en a une — au début du Bkp suivant et dans son Index de fin au plus —, aucun sinon ; s'il échoue :
 `[WARN] … rapprochement impossible … — réessayé au prochain Index` (tant qu'aucun Bkp ne réussit d'ici là ; aussi tant que le
-borg d'un Bkp tué tient le dépôt). Archives d'avant 1.0.185 : pas de commentaire, pas de rapprochement.
+borg d'un Bkp tué tient le dépôt). Archives d'avant 1.0.185 : pas de commentaire, pas de rapprochement. 1.0.187 : l'archive
+rapprochée est dite comme telle — Status `borg : inconnue (Bkp interrompu, archive rapprochée)`, Report et UI colonne borg
+`— (rapprochée)`, JSON `reconciled` (Status `last_backup`, ArchiveHistory) ; ses versions de borg et compteurs
+d'avertissements restent inconnus (le Bkp tué n'a rien relevé).
 
 Dépôt local introuvable (disque démonté, chemin faux ; 1.0.167) : colonne `reste` = `⚠ dépôt absent`, nick en
 alerte (`*** nick`, rouge en HTML), code 2 ; archives affichées en hors ligne (avant : aucune archive du nick dans
@@ -596,7 +599,9 @@ Formule (identique résumé et détail) :
 et complet) : version du borg qui a **créé** l'archive, suivie de `/ srv X` quand le borg qui a **reçu** les données
 est connu et différent (`1.2.6`, `1.2.6 / srv 1.2.4`), `—` si inconnue. borg n'enregistre aucune version (ni dans
 l'archive, ni dans le dépôt, et `borg serve` ne transmet pas la sienne : mesuré, borg 1.2.6) : borgHelper la relève
-lui-même **au Bkp** — archives créées hors borgHelper (dépôts externes) ou avant 1.0.165 : `—`.
+lui-même **au Bkp** — archives créées hors borgHelper (dépôts externes) ou avant 1.0.165 : `—`. 1.0.187 : archive d'un
+Bkp tué rapprochée par l'Index ou au début du Bkp suivant (son borg create avait fini, voir Index) : `— (rapprochée)` — versions inconnues, le Bkp
+n'ayant rien relevé (archives rapprochées avant 1.0.187 : `—`).
 - Créateur : message `borgbackup version X` de `borg create --show-version` (Bkp local comme distant `SSH_REMFO`, où
   c'est le borg de la machine sauvegardée) — aucune connexion de plus.
 - Serveur, selon le mode :
@@ -1198,6 +1203,10 @@ rattrapées par Index).
 Depuis 1.0.165 : `borg_version` / `borg_server_version` — versions de borg relevées au Bkp (créateur de l'archive,
 borg qui a reçu les données ; voir `Report`, « Version de borg ») — `null` si inconnues (archive créée hors borgHelper
 ou avant 1.0.165, ligne figée).
+Depuis 1.0.187 : `reconciled` (booléen) — `true` = archive d'un Bkp tué rapprochée (Index, ou début du Bkp suivant ;
+versions et `changed_during_backup`/`read_errors` alors `null` : le Bkp n'a rien relevé) ; `false` = aucune marque : archive
+normale ou externe, mais aussi archive rapprochée avant 1.0.187 et ligne figée (`pruned`) — `false` ne prouve pas qu'elle
+ne l'a pas été.
 Depuis 1.0.140 : `pruned` (booléen) sur chaque ligne. `true` = archive disparue du dépôt, ligne figée dans
 `history.db` au moment de sa disparition et gardée `STATS_RETENTION_MONTHS` (graphiques sur 13 mois même avec une
 rétention d'archives courte) — jamais restaurable. Pour une archive présente dont la paire précédente a été retirée
@@ -1231,7 +1240,9 @@ Par nick :
 - **Dernier backup connu** : archive + date depuis `archive_stats` (déjà indexée localement) + âge
   lisible (« il y a 3h12 ») ; « aucune archive indexée » si le nick n'a jamais été indexé. Ligne suivante (1.0.165) :
   `borg : 1.2.6` (ou `1.2.6 / srv 1.2.4`, `—`), versions relevées au Bkp de cette archive ; JSON : `last_backup`
-  porte `borg_version` et `borg_server_version`.
+  porte `borg_version` et `borg_server_version`. 1.0.187 : archive d'un Bkp tué rapprochée par l'Index :
+  `borg : inconnue (Bkp interrompu, archive rapprochée)` ; JSON `last_backup.reconciled` (booléen ; absent, comme
+  `borg_version`, quand `last_backup` porte `error`).
 - **Bkp en cours** (1.0.186 : comme Report — marqueur de Bkp vivant, borg create orphelin) : Bkp vivant « Bkp en cours
   depuis HH:MM (XhYYmin) » ; marqueur sans ligne encore « Bkp en attente de l'Index depuis … » ; borgHelper tué, son `borg
   create` encore actif « Bkp interrompu (borgHelper arrêté), borg create encore actif depuis … » ; ligne `bkp_status` non

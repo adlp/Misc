@@ -444,6 +444,9 @@ vivants = bh.db.bkp_markers('mon-serveur')
 # la méthode ne vérifie PAS l'archive (rôle de l'appelant, BorgHelper._reconcile_killed_bkp) ; base verrouillée : attente
 # jusqu'à 300 s, puis « SQLite error » et False :
 ouvertes = bh.db.open_bkp_runs('mon-serveur')
+# 1.0.187 (story 58) : archive marquée rapprochée AVANT la fermeture (Status/Report/ArchiveHistory la disent) ; False si elle a
+# déjà une mesure :
+bh.db.mark_archive_reconciled('mon-serveur', 'mon-serveur-2026-10-05T161012')
 ferme = bh.db.close_bkp_status_reconciled('mon-serveur', run_id, '2026-10-05 16:12:22')   # True si CETTE fermeture a eu lieu
 
 # 1.0.184 (story 52) : PID des détenteurs exclusifs du verrou du dépôt LOCAL (lock.roster) ; [] si distant, absent, illisible.
@@ -792,7 +795,8 @@ sys.exit(0)
 | `history_path(nick)` | Idem, après migration éventuelle de la diff.db du nick (lecteurs) ; ne crée jamais le fichier |
 | `ensure_history_db(path, create=True)` | Schéma de history.db ; `create=False` : ne rien créer si absente |
 | `store_archive_measure(nick, archive, archive_date, deduplicated_size, changed_during_backup, read_errors, db_path=None, borg_version=None, borg_server_version=None)` | Mesures d'une archive prises au Bkp (history.db) ; versions de borg (1.0.165, mot-clé, `None` = inconnue) |
-| `get_archive_measures(nick)` | `{(archive, archive_date): {deduplicated_size, changed_during_backup, read_errors, borg_version, borg_server_version}}` (+ clé `(archive, None)` si le nom est unique) ; `{}` si aucune |
+| `mark_archive_reconciled(nick, archive, db_path=None)` | 1.0.187 : marque une archive d'un Bkp tué rapprochée (ligne sans mesure, `archive_date=''`, `reconciled`) ; `False` si l'archive a déjà une mesure ou sur erreur SQLite (message, attente jusqu'à 300 s d'une base verrouillée) ; crée history.db si absente ; `SystemExit` sur une base refusée ; ne vérifie ni l'existence de l'archive ni son run (rôle de l'appelant, comme `close_bkp_status_reconciled`, que `_reconcile_killed_bkp` appelle juste après) |
+| `get_archive_measures(nick)` | `{(archive, archive_date): {deduplicated_size, changed_during_backup, read_errors, borg_version, borg_server_version, reconciled}}` (+ clé `(archive, None)` si le nom est unique ; `reconciled` booléen, 1.0.187) ; `{}` si aucune |
 | `delete_archive_measures(nick, keep=None)` | Retire les mesures des archives absentes de `keep` (toutes si `keep` vide) |
 | `freeze_archive_chart(nick, rows, db_path=None)` | 1.0.140 — fige des lignes de graphique dans `history.db.archive_chart` (dicts `archive`, `archive_date`, `gone`, champs de graphique) ; jamais une valeur non nulle écrasée par `None` ; purge au-delà de `STATS_RETENTION_MONTHS` ; lève `sqlite3.Error` |
 | `get_archive_chart(nick, db_path=None)` | 1.0.140 — lignes figées dans la rétention : `[{archive, archive_date, duration, …, read_errors, gone}]` ; `[]` si aucune |

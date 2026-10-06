@@ -449,7 +449,7 @@ avertissement « base non chiffrée »). `DbStatus` l'affiche `plain (aucun chem
 |---|---|---|---|
 | `repo_stats` | historique des tailles du dépôt (`op` bkp/prune/index) | Bkp, Prune, refresh d'Index | `STATS_RETENTION_MONTHS` |
 | `bkp_status` | cycle de vie des Bkp (watcher push, `Status`) | Bkp seul ; réclamations CAS du watcher | `STATS_RETENTION_MONTHS` |
-| `archive_measure` | par `(nick, archive, archive_date)` : taille dédupliquée à la création, C/E ; `borg_version`, `borg_server_version` (1.0.165 : colonnes ajoutées par introspection dans `ensure_history_db`, ajout pur ; un lecteur d'une base pas encore rouverte en écriture lit `NULL`) | Bkp seul | tant que l'archive existe dans le dépôt (retirée par le rapprochement, après figeage ; jamais pour une archive seulement hors `GLOB_ARCH`, 1.0.146) |
+| `archive_measure` | par `(nick, archive, archive_date)` : taille dédupliquée à la création, C/E ; `borg_version`, `borg_server_version` (1.0.165 : colonnes ajoutées par introspection dans `ensure_history_db`, ajout pur ; un lecteur d'une base pas encore rouverte en écriture lit `NULL`) ; `reconciled` INTEGER (1.0.187, même ajout : 1 = archive d'un Bkp tué rapprochée, ligne SANS mesure — ni taille ni C/E —, `archive_date=''`) | Bkp ; `reconciled` : rapprochement d'un Bkp tué (`_reconcile_killed_bkp`, Index ou début du Bkp suivant) | tant que l'archive existe dans le dépôt (retirée par le rapprochement, après figeage ; jamais pour une archive seulement hors `GLOB_ARCH`, 1.0.146) |
 | `archive_chart` (1.0.140) | par `(nick, archive, archive_date)` : ligne de graphique figée (`_CHART_FIELDS` + `gone`) | rapprochement de la base servie, `DIFF_KEEP` | `STATS_RETENTION_MONTHS`, que l'archive existe ou non |
 
 - **Lecture** : `history_path(nick)` / `_hist(nick)` ouvrent d'abord `diff.db` (`ensure_diff_db`, sans la créer), ce
@@ -2427,7 +2427,16 @@ d'autre. Sinon `boex(['list','--json','--format','{comment}{end}']+glob_args(cfg
 `comment` et `end` en plus des clés habituelles, `end` en heure locale de borg — d'où `TZ=UTC`, mesuré : borg suit `TZ` ; borg
 1.2.6) ; archives `.checkpoint` écartées (borg 1.1 les liste) ; pour chaque candidat dont une archive a le commentaire exact,
 `BorgHelperDB.close_bkp_status_reconciled(nick, run_id, fin)` : `UPDATE … SET finished_at=?, result='success' WHERE … AND
-finished_at IS NULL` (comparer-et-échanger, jamais d'écrasement ; `changed_during_backup`/`read_errors` restent NULL). Erreur de
+finished_at IS NULL` (comparer-et-échanger, jamais d'écrasement ; `changed_during_backup`/`read_errors` restent NULL). 1.0.187
+(story 58) : juste AVANT la fermeture (revue : un arrêt entre les deux laissait une ligne fermée, plus jamais candidate, et son
+archive sans marque ; marque sans fermeture : ligne refermée au passage suivant), `BorgHelperDB.mark_archive_reconciled(nick,
+nom)` — ligne `archive_measure` sans mesure,
+`archive_date=''` (la date de `borg list`, en UTC, n'est pas celle d'`archive_stats` : lue par le repli par nom de
+`get_archive_measures`), `reconciled=1`, jamais si l'archive a déjà une mesure (`INSERT … WHERE NOT EXISTS`) ; échec (SQLite,
+`sys.exit` d'une base refusée, avec son message) : archive non marquée, ligne fermée quand même, Index ou Bkp continue. Lecteurs :
+`_borg_ver_text` (Report, jumelles `prep_report`/`prep_report_from_db` ; UI) « — (rapprochée) » si aucune version — seule source
+de la règle ; `_status_print_one` en tire « borg : inconnue (Bkp interrompu, archive rapprochée) » ; `last_backup.reconciled`, ArchiveHistory
+`reconciled` (ligne figée : false). Erreur de
 base : à la lecture, rien, muet ; à la fermeture, ce candidat sauté (message SQLite de `_with_lock_retry`, attente jusqu'à 300 s
 d'une base verrouillée) ; borg en échec : `[WARN]`, rien fermé ; Ctrl-C (130) propagé. Le watcher de borgHelperWWW réclame
 ensuite cette ligne finie et notifie la fin en succès (inchangé) — seulement si elle n'a pas déjà été réclamée comme périmée

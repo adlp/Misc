@@ -1,5 +1,29 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.187 — Archive rapprochée : dite, pas « borg : — » — 2026-10-06
+
+Chantier « reconstruction progressive », story 58 (rétrospective F313, A116 ; décisions de l'utilisateur). Avant : l'archive d'un
+Bkp tué que l'Index rapproche (1.0.185) n'avait aucune mesure de Bkp — Status `borg : —`, Report et UI colonne borg `—`,
+ArchiveHistory versions et C/E `null` : indiscernable d'une archive faite hors borgHelper (mesuré, `work/m58/mesure58b.log`).
+
+- Rapprochement (Index, ou début du Bkp suivant) : l'archive est marquée juste avant la fermeture de la ligne
+  (`archive_measure.reconciled`, colonne ajoutée par introspection comme 1.0.165 ; version de schéma inchangée ; jamais sur une
+  archive qui a une mesure ; échec : ligne fermée quand même, Index ou Bkp continue).
+- Status : `borg : inconnue (Bkp interrompu, archive rapprochée)` ; Report (texte, HTML, JSON) et UI : `— (rapprochée)` ;
+  JSON `reconciled` (Status `last_backup`, ArchiveHistory ; `false` = aucune marque, pas une preuve). Versions et compteurs
+  d'avertissements restent inconnus ; push de fin, borgHelperWWW et UI inchangés (valeurs relayées telles quelles, mesuré) ;
+  archives rapprochées avant 1.0.187 : `—`.
+- Contrôles : « archive rapprochée sur vrai borg » (Index réel ; Status texte et JSON, Report -o texte/JSON/HTML, Report en
+  direct texte et JSON, ArchiveHistory) ; rapprochement (archive marquée, à l'Index et par le Bkp suivant ; marque impossible) ;
+  history.db d'avant 1.0.165 et de 1.0.165 à 1.0.186 (colonne ajoutée, marque refusée sur une archive mesurée) ; listes de
+  colonnes figées revues.
+- Série de mutations (3.14 strict, lignes entières, code final après revue ; journaux vérifiés : échec sur l'assertion de sa
+  pièce) : 11/11 DÉTECTÉES — archive jamais marquée, marque écrite sur une archive mesurée, marque jamais lue, colonne non
+  ajoutée aux bases d'avant (boucle ALTER) puis garde de 1.0.186 (bases 1.0.165–1.0.186), Report/UI et Status muets,
+  `reconciled` toujours faux (Status -j, ArchiveHistory), `sys.exit` de la marque qui arrête le rapprochement, marque posée
+  après la fermeture. Deux mutants d'une première série mal construits (SQL aux marqueurs faux ; constante partagée qui cassait
+  la lecture : ils plantaient au lieu de viser leur pièce) refaits.
+
 ## borgHelperWWW 1.31.4 — Compatible fastapi 0.63 (Python 3.10) et 0.142 (Python 3.14) — 2026-10-06
 
 Chantier « reconstruction progressive », story 57 (rétrospective F311, A114 ; décision de l'utilisateur : « compatible des deux »).
