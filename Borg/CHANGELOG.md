@@ -1,5 +1,49 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.31.4 — Compatible fastapi 0.63 (Python 3.10) et 0.142 (Python 3.14) — 2026-10-06
+
+Chantier « reconstruction progressive », story 57 (rétrospective F311, A114 ; décision de l'utilisateur : « compatible des deux »).
+Avant : le push selftest ne tournait que sous le Python système (3.10, fastapi 0.63, pydantic 1.8) — `work/py/venv-3.14` n'avait pas
+fastapi. Installée, la pile courante sous 3.14 (fastapi 0.142, pydantic 2.13, starlette 1.7, uvicorn 0.54) donnait 122/125
+et, en avertissements stricts, une erreur au chargement (`@app.on_event` déprécié).
+
+- Démarrage/arrêt (watcher bkp_status, borg des téléchargements) par `app.router.lifespan_context` (existe dans les deux piles ;
+  `FastAPI(lifespan=)` n'existe pas en 0.63, `on_event` est déprécié en 0.142).
+- pydantic : `_mdump` (`model_dump` ou `dict`), `_mset` (`model_fields_set` ou `__fields_set__`).
+- fastapi 0.142 : télémétrie OpenTelemetry et `strict_content_type` coupés quand ces options existent (`_fastapi_compat_kw`) —
+  corps JSON sans `Content-Type` accepté comme en 0.63.
+- Arrêt en exécution directe (`_make_server`), écarts d'uvicorn 0.54 : force l'arrêt à tout second signal (0.54 : second SIGINT
+  seulement) ; ne relance plus les signaux reçus après `serve()` (mort par SIGTERM, atexit sauté) ; `_LIVE_BORG_LOCK` et
+  `_LIVE_GROUPS_LOCK` en `RLock` (`handle_exit` tourne dans le vrai gestionnaire de signal : un verrou déjà tenu s'interbloquait) ;
+  au second signal, connexions ouvertes coupées — sous Python >= 3.12, un client qui ne lisait plus gardait le serveur vivant
+  (borg déjà arrêté) jusqu'au SIGKILL (mesuré).
+- `_borg_stream` : tube stderr de borg fermé à la fin de sa lecture (avant : par le ramasse-miettes, ResourceWarning) ;
+  `_restore_where` : itérateur `os.scandir` fermé.
+- Selftest : `_flat_routes` récursif (fastapi 0.142 garde un `_IncludedRouter` paresseux dans `app.routes` : 11 routes vues au lieu
+  de 40+, deux contrôles faussement en échec) ; TestClient en `raise_server_exceptions=False` (une exception du serveur devient
+  l'échec du contrôle, jamais l'arrêt du selftest) ; nouveaux contrôles « lifespan : le watcher démarre au démarrage du serveur et
+  s'arrête à l'arrêt, sans on_event » (piloté par le protocole ASGI lifespan, TestClient en contexte ; garde de structure : ni `on_event`, ni `add_event_handler`, ni `on_startup`/`on_shutdown`)
+  et « FastAPI : corps JSON sans Content-Type accepté, télémétrie coupée » ; contrôle d'arrêt étendu (signal reçu verrous tenus,
+  signaux capturés vidés, connexions coupées au second signal seulement).
+- Push selftest 127/127 sous Python 3.10 (fastapi 0.63) et 3.14 en avertissements stricts (fastapi 0.142). Mesuré, serveurs réels
+  sous les deux piles (`work/m57/mesure57*.log`) : watcher démarré par le lifespan, `/healthz`, `/api/report?offline`, `/api/access`
+  à 200 ; SIGTERM ou SIGINT au repos : code 0 ; téléchargement en cours (client qui ne lit plus) : second SIGTERM -> sortie en
+  0,2 s, borg arrêté (3.14 avant ce correctif : aucune sortie en 30 s) ; `uvicorn borgHelperWWW:app --workers 2` : watcher par
+  worker, SIGTERM -> code 0. Sous uvicorn externe 0.54 (Python 3.14), un client qui ne lit plus garde le serveur et son borg
+  vivants malgré deux SIGTERM puis deux SIGINT ; au SIGKILL du serveur, borg meurt avec lui (tube fermé) — documenté (README).
+- Restent (bibliothèque ou selftest, non bloquant) : `StarletteDeprecationWarning` du TestClient avec httpx ; `ResourceWarning` de
+  fichiers ouverts par des contrôles du selftest (tous alloués dans `push_selftest`, tracemalloc) ; `CancelledError` au journal
+  d'uvicorn lors d'un arrêt forcé.
+- Outillage (hors git) : `tools/make_pyvenvs.sh` installe et vérifie la pile de borgHelperWWW dans `venv-3.14` (`PKGS_WWW`).
+- Séries de mutations (push selftest, source finale, lignes entières ; journaux vérifiés : chaque échec sur l'assertion de sa pièce) :
+  sous Python 3.14 strict (fastapi 0.142) 18/18 DÉTECTÉES — lifespan (non posé, sans démarrage, sans arrêt), second signal sans arrêt
+  forcé, pydantic 1 seul (`.dict`, `__fields_set__`), routes incluses ignorées, verrous non réentrants (2), signaux capturés gardés,
+  connexions jamais coupées / coupure jamais planifiée / coupées dès le 1er signal, boucle du serveur non retenue, options de
+  compatibilité non passées, télémétrie gardée, `strict_content_type` gardé, stderr de borg jamais fermé ; miroir sous Python 3.10
+  (fastapi 0.63) 14 DÉTECTÉES dont pydantic 2 seul (`model_dump`, `model_fields_set`), routes directes ignorées, `on_event` remis,
+  8 SURVIT — les pièces sans objet sous cette pile (arrêt forcé et signaux d'uvicorn 0.54, branches pydantic 1 et `_IncludedRouter`,
+  options de fastapi 0.142).
+
 ## borgHelperWWW 1.31.3 — Cache /report?offline : empreinte avec roster et marqueurs — 2026-10-06
 
 Chantier « reconstruction progressive », story 56 (rétrospective A113 ; décision de l'utilisateur). Avant : `/report?offline=true`

@@ -3574,23 +3574,41 @@ un échec après le délai.
 ### Watcher (`borgHelperWWW`, premier composant de fond du fichier)
 
 ```python
-@app.on_event("startup")
-async def _start_bkp_status_watcher():
-    global _bkp_watcher_task
-    _bkp_watcher_task = asyncio.create_task(_bkp_status_watcher())
+async def _start_bkp_status_watcher(): ...   # crée _bkp_watcher_task
+async def _stop_bkp_status_watcher(): ...    # _kill_live_borg(), annule la tâche
 
-@app.on_event("shutdown")
-async def _stop_bkp_status_watcher():
-    _bkp_watcher_task.cancel()
-    ...
+@contextlib.asynccontextmanager
+async def _lifespan(_app):
+    await _start_bkp_status_watcher()
+    try: yield
+    finally: await _stop_bkp_status_watcher()
+app.router.lifespan_context = _lifespan
 ```
 
-`@app.on_event(...)` plutôt que le paramètre `FastAPI(lifespan=...)` (plus récent) : l'environnement
-d'exécution observé embarque FastAPI 0.63 (paquet système `python3-fastapi`, aucune version épinglée
-dans ce projet — voir README « `pip install fastapi uvicorn pydantic` », sans contrainte de version),
-qui **ne supporte pas** `lifespan=` au constructeur (`TypeError` à l'import, vérifié directement).
-`on_event` reste supporté par toutes les versions de FastAPI couramment rencontrées, y compris les
-plus récentes (juste dépréciée en faveur de `lifespan`, pas retirée).
+1.31.4 (story 57) : ni `@app.on_event(...)` (déprécié : sous fastapi 0.142 l'avertissement est attribué à ce module, une
+erreur en avertissements stricts) ni `FastAPI(lifespan=...)` (absent de fastapi 0.63, paquet système `python3-fastapi` :
+`TypeError`) — `app.router.lifespan_context` existe dans les deux (starlette 0.18 et 1.7) ; garde de structure du selftest :
+ni `on_event`, ni `add_event_handler`, ni `on_startup`/`on_shutdown`. Avant 1.31.4 : `on_event`. Piles vérifiées (push
+selftest, serveurs réels) : Python 3.10 + fastapi 0.63 / pydantic 1.8 / starlette 0.18 / uvicorn 0.15 (système) et Python
+3.14 + fastapi 0.142 / pydantic 2.13 / starlette 1.7 / uvicorn 0.54 (`work/py/venv-3.14`). Autres écarts entre ces piles,
+traités en 1.31.4 :
+
+- pydantic 2 déprécie `.dict()` et `__fields_set__` (`_mdump`, `_mset`). Non traité, écart d'API : pydantic 2 refuse un
+  nombre JSON pour un champ `str` et un décimal non entier pour un champ `int` (422 ; pydantic 1 convertissait : `"123"`, 7) ;
+  une chaîne numérique pour un champ `int` reste acceptée (vérifié, pydantic 1.8 et 2.13).
+- fastapi 0.142 : télémétrie OpenTelemetry auto-configurée et `strict_content_type` (corps JSON sans `Content-Type:
+  application/json` -> 422) — `_fastapi_compat_kw` les coupe quand ces options existent (comportement de 0.63).
+- fastapi 0.142 garde un `_IncludedRouter` paresseux dans `app.routes` (`_flat_routes`, récursif, contrôles du selftest).
+- `_make_server._Server` (exécution directe) : uvicorn 0.54 ne force l'arrêt qu'au second SIGINT — `force_exit` posé à tout
+  second signal (comportement documenté) ; il relance après `serve()` les signaux reçus, gestionnaire par défaut rétabli
+  (mort par SIGTERM, atexit sauté) — liste `_captured_signals` vidée, sortie normale comme sous 0.15 ; il appelle `handle_exit`
+  dans le VRAI gestionnaire de signal (`signal.signal`, fil principal) — `_LIVE_BORG_LOCK`/`_LIVE_GROUPS_LOCK` sont des `RLock`
+  (un `Lock` déjà tenu par le fil principal s'interbloquait) ; au second signal, `_abort_connections` (par
+  `loop.call_soon_threadsafe`, jamais depuis le gestionnaire) coupe les connexions ouvertes : sous Python >= 3.12 uvicorn
+  attend leur fermeture même en arrêt forcé (un client qui ne lisait plus gardait le serveur vivant — mesuré). Sous uvicorn
+  externe, rien de cela ne s'applique (voir README, Arrêt du serveur).
+- TestClient : starlette 0.18 et 1.7 relancent toutes deux l'exception du serveur par défaut — le selftest crée le sien avec
+  `raise_server_exceptions=False` (exception = réponse 500 = échec du contrôle, jamais l'arrêt du selftest).
 
 Une tâche asyncio par processus **worker** uvicorn (`--workers 2` déjà documenté) — aucune
 coordination inter-process nécessaire : chaque worker interroge indépendamment, et la réclamation CAS

@@ -1584,7 +1584,9 @@ Toutes les commandes sont exposées **sauf `Mount`/`UMount`** (accès FUSE local
 ### Prérequis
 
 ```bash
-pip install fastapi uvicorn pydantic
+pip install fastapi uvicorn pydantic   # vérifié (1.31.4) : fastapi 0.63 + pydantic 1.8 + starlette 0.18 + uvicorn 0.15
+                                       # (paquets Ubuntu, Python 3.10) et fastapi 0.142.2 + pydantic 2.13.5 + starlette 1.7.0
+                                       # + uvicorn 0.54.0 (Python 3.14) ; + httpx (0.28.1) pour --selftest seulement (TestClient)
 apt install python3-aiohttp python3-requests python3-cryptography  # OPTIONNEL (notifications push,
     # spec-notifications-push) : dépendances de pywebpush, toutes dans les dépôts apt Ubuntu.
     # `cryptography` est en plus importée et utilisée directement par borgHelperWWW (sérialisation de
@@ -2675,7 +2677,12 @@ délai. borg est arrêté avec tout son groupe de processus (le borg PyInstaller
 `/tmp/_MEI*` sont retirés. **Arrêt du serveur** (exécution directe) : au premier SIGTERM/Ctrl-C, les borg sans octet lu depuis
 10 s sont arrêtés, puis tout borg qui le devient ; un téléchargement sain va jusqu'au bout pendant qu'uvicorn attend ses
 connexions ; au second signal (arrêt forcé), tous. Avant : uvicorn attendait sans limite et un SIGKILL laissait borg orphelin.
-Sous un uvicorn externe : le premier signal attend (délai d'inactivité seulement), l'arrêt forcé arrête borg (mesuré).
+1.31.4 : à l'arrêt forcé, les connexions encore ouvertes sont coupées — sous Python >= 3.12, un client qui ne lisait plus
+gardait sinon le serveur vivant (borg déjà arrêté) jusqu'au SIGKILL ; signaux d'arrêt : sortie normale (code 0) sous les deux
+piles vérifiées (mesuré). Sous un uvicorn externe : le premier signal attend (délai d'inactivité seulement). uvicorn 0.15
+(Python 3.10) : le second SIGTERM ou Ctrl-C force l'arrêt et arrête borg. uvicorn 0.54 (Python 3.14) : seul un second Ctrl-C
+(SIGINT) force l'arrêt, et un client qui ne lit plus garde quand même le serveur — et son borg — vivants jusqu'au SIGKILL ;
+borg meurt alors avec le serveur (tube fermé ; mesuré, 1.31.4). Exécution directe recommandée pour un arrêt borné.
 
 > **Reverse proxy : HTTP/1.1 obligatoire vers borgHelperWWW.** La coupure n'est visible qu'en HTTP/1.1 (transfert par
 > morceaux) ; en HTTP/1.0, une connexion fermée vaut fin normale et un fichier tronqué repasse pour complet. nginx parle

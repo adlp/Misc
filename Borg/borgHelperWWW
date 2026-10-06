@@ -16,6 +16,14 @@ from fastapi.routing import APIRoute
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse, Response
 from pydantic import BaseModel, Field
 
+def _mdump(m):
+    """1.31.4 (story 57) : dict d'un modèle — pydantic 2 (`model_dump`) et 1 (`dict`, déprécié en 2 : erreur en strict)."""
+    return m.model_dump() if hasattr(m,'model_dump') else m.dict()
+
+def _mset(m):
+    """1.31.4 (story 57) : champs fournis par le client — pydantic 2 (`model_fields_set`) et 1 (`__fields_set__`)."""
+    return m.model_fields_set if hasattr(m,'model_fields_set') else m.__fields_set__
+
 # vendor/ (spec-push-vendoring) : pywebpush/py_vapid/http_ece ne sont des paquets d'aucun dépôt apt
 # (PyPI-only, contrairement à leurs propres dépendances aiohttp/requests/cryptography, toutes dans
 # les dépôts apt) — copie figée des wheels dans le repo pour éviter tout pip/venv en production, voir
@@ -67,7 +75,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.31.3"
+WWW_VERSION="1.31.4"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -710,6 +718,17 @@ class _ExitGuardRoute(APIRoute):
                     "corrompue) — détails dans le journal de borgHelperWWW"})
         return guarded
 
+def _fastapi_compat_kw():
+    """1.31.4 (revue story 57) : options de FastAPI absentes de fastapi 0.63, passées seulement si présentes — comportement de 0.63
+    gardé : aucune télémétrie OpenTelemetry (0.142 s'auto-configure si le SDK est installé) ; corps JSON accepté sans en-tête
+    `Content-Type: application/json` (0.142 strict : 422)."""
+    import inspect
+    params=inspect.signature(FastAPI.__init__).parameters; kw={}
+    if 'telemetry' in params:
+        kw['telemetry']={'auto_configure':False,'tracing':False,'metrics':False,'logs':False,'operation_spans':False}
+    if 'strict_content_type' in params: kw['strict_content_type']=False
+    return kw
+
 app=FastAPI(
     title="borgHelperWWW",
     version=BORGHELPER_VERSION,
@@ -724,6 +743,7 @@ app=FastAPI(
         "sans objet pour un serveur HTTP). `Login` écrit en clair la passphrase fournie dans "
         f"{CFGFILE} — à réserver au provisioning, pas à un usage courant."
     ),
+    **_fastapi_compat_kw(),
 )
 app.router.route_class=_ExitGuardRoute  # avant toute déclaration @app.get (1.27.6)
 
@@ -777,7 +797,6 @@ async def _access_log_and_user_guard(request: Request, call_next):
 
 _bkp_watcher_task=None
 
-@app.on_event("startup")
 async def _start_bkp_status_watcher():
     global _bkp_watcher_task
     if not _PYWEBPUSH_AVAILABLE:
@@ -785,13 +804,22 @@ async def _start_bkp_status_watcher():
               f"envoi réel) : {_push_deps_hint(_PUSH_IMPORT_ERROR)}",file=sys.stderr,flush=True)
     _bkp_watcher_task=asyncio.create_task(_bkp_status_watcher())
 
-@app.on_event("shutdown")
 async def _stop_bkp_status_watcher():
     _kill_live_borg()   # 1.31.0 (A86) : connexions fermées : plus aucun borg de téléchargement après l'arrêt
     if _bkp_watcher_task is None: return
     _bkp_watcher_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await _bkp_watcher_task
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app):
+    """1.31.4 (story 57) : démarrage/arrêt par le lifespan du routeur — `@app.on_event` est déprécié (fastapi 0.142 : avertissement
+    attribué à ce module, erreur en strict) et `FastAPI(lifespan=…)` n'existe pas dans fastapi 0.63 ; `router.lifespan_context`
+    existe dans les deux (starlette 0.18 et 1.7)."""
+    await _start_bkp_status_watcher()
+    try: yield
+    finally: await _stop_bkp_status_watcher()
+app.router.lifespan_context=_lifespan
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 
@@ -822,7 +850,10 @@ def _restore_where(where: str) -> str:
         raise HTTPException(403,detail=f"Destination hors de la racine de restauration ({RESTORE_ROOT}) : {where}")
     # Revue story 37 (décision de l'utilisateur) : un lien laissé sous la destination (restauration précédente) ferait écrire
     # borg/copy2 hors de la racine — destination absente ou vide seulement, jamais d'arborescence préexistante dessous.
-    try: busy=os.path.isdir(p) and any(True for _ in os.scandir(p))
+    try:
+        busy=False
+        if os.path.isdir(p):
+            with os.scandir(p) as it: busy=any(True for _ in it)   # 1.31.4 (story 57) : itérateur fermé (ResourceWarning)
     except OSError as e: raise HTTPException(403,detail=f"Destination illisible : {where} ({e.strerror or e})")
     if busy:
         raise HTTPException(409,detail=f"Destination déjà remplie : {where} — restaurer dans un dossier absent ou vide")
@@ -2096,7 +2127,9 @@ def _argv_label(argv):
 # 1.31.1 (revue story 42) : groupes lancés par _run_group (borgHelper et son borg, en session propre) — un Ctrl-C au terminal ne
 # les atteint plus directement : _signal_groups relaie le signal d'arrêt du serveur (premier : le même, comme le terminal ou
 # systemd le faisaient avant ; second, atexit : SIGKILL).
-_LIVE_GROUPS=set(); _LIVE_GROUPS_LOCK=threading.Lock()
+# 1.31.4 (revue story 57) : RLock — uvicorn >= 0.54 appelle handle_exit (-> _signal_groups) dans le VRAI gestionnaire de signal
+# (signal.signal), donc sur le fil principal, éventuellement pendant qu'il tient déjà ce verrou : un Lock s'y interbloquerait.
+_LIVE_GROUPS=set(); _LIVE_GROUPS_LOCK=threading.RLock()
 
 def _signal_groups(sig):
     # Jamais conditionné à pr.poll() : le 1er signal tue la tête (borgHelper) et laisse un enfant qui l'ignore — le groupe
@@ -2157,8 +2190,8 @@ def run_borghelper(cmd: str, nick: Optional[str]=None, extra_args=(), passphrase
     if (key is not None and result.exitcode in (0,1) and not _never_cache(result)
             and _response_fingerprint(cmd,nick)==fp):
         if len(_RESPONSE_CACHE)>500: _RESPONSE_CACHE.clear()  # garde-fou anti-croissance illimitée
-        _RESPONSE_CACHE[key]=(fp,result.dict(),time.monotonic())
-    return JSONResponse(status_code=_http_status(result.exitcode),content=result.dict())
+        _RESPONSE_CACHE[key]=(fp,_mdump(result),time.monotonic())
+    return JSONResponse(status_code=_http_status(result.exitcode),content=_mdump(result))
 
 # ── Filtrage a posteriori par périmètre (Story 1.3) ─────────────────────────
 # _run_scoped() : variante non-cacheable de run_borghelper() pour les 6 routes Search/FileHist/
@@ -2188,7 +2221,7 @@ def _scoped_filter_result(result,filter_fn):
             if result.exitcode!=0: result.stdout=''   # erreur : jamais de sortie non filtrée (stderr gardé)
             else:
                 result.exitcode=1; result.stdout=''; result.stderr=(result.stderr or '')+"\n[borgHelperWWW] réponse non-JSON reçue pour un appelant à périmètre restreint — requête refusée."
-    return JSONResponse(status_code=_http_status(result.exitcode),content=result.dict())
+    return JSONResponse(status_code=_http_status(result.exitcode),content=_mdump(result))
 
 def _filter_per_nick_list(results,scopes,path_key='path'):
     """Search : `results` = {nick: [{...,path_key:...}, ...] | {'error':msg}}. Filtre chaque liste
@@ -2579,7 +2612,7 @@ def _safe_filename(name: str) -> str:
 
 # 1.31.0 (story 41, A86) : borg des téléchargements en cours {Popen: état} — état : 'last' (dernier octet lu, monotonic),
 # 'why' (None, 'idle' : chien de garde, 'stop' : arrêt du serveur), 'mei' (dossiers _MEI* présents avant son lancement).
-_LIVE_BORG={}; _LIVE_BORG_LOCK=threading.Lock()
+_LIVE_BORG={}; _LIVE_BORG_LOCK=threading.RLock()   # 1.31.4 (revue story 57) : RLock, cf. _LIVE_GROUPS_LOCK (_kill_live_borg au signal)
 _STOP_IDLE=10   # arrêt demandé : un borg sans octet lu depuis _STOP_IDLE s est tué (décision de l'utilisateur) — au signal, puis
 _STOPPING=[False]   # par le chien de garde dès qu'il le devient (un borg muet depuis 4 s au signal ne survit plus jusqu'au SIGKILL)
 
@@ -2623,11 +2656,31 @@ def _make_server(config):
     second (arrêt forcé) tous les borg de téléchargement."""
     import uvicorn
     class _Server(uvicorn.Server):
+        async def startup(self,*a,**k):
+            self._bh_loop=asyncio.get_running_loop()   # 1.31.4 : boucle du serveur, pour _abort_connections au 2e signal
+            await super().startup(*a,**k)
+        def _abort_connections(self):
+            # 1.31.4 (revue story 57, mesuré) : arrêt forcé — connexions encore ouvertes coupées (abort : tampon d'envoi jeté).
+            # Sous Python >= 3.12, uvicorn attend la fermeture de toutes les connexions (asyncio Server.wait_closed) même en arrêt
+            # forcé : un client qui ne lit plus gardait le serveur vivant (borg déjà tué) jusqu'au SIGKILL.
+            for c in list(getattr(getattr(self,'server_state',None),'connections',None) or ()):
+                t=getattr(c,'transport',None)
+                if t is not None: t.abort()
         def handle_exit(self,sig,frame):
             _kill_live_borg(idle_only=not self.should_exit)
             import signal as _sg
             _signal_groups(sig if not self.should_exit else _sg.SIGKILL)   # revue : commandes borgHelper en cours (session propre)
+            again=self.should_exit
             super().handle_exit(sig,frame)
+            if again: self.force_exit=True   # 1.31.4 (story 57) : uvicorn 0.54 ne force qu'au 2e SIGINT ; ici tout 2e signal
+            # 1.31.4 (revue story 57) : uvicorn 0.54 relance après serve() les signaux reçus (gestionnaire par défaut rétabli) — le
+            # processus mourait par SIGTERM sans atexit (_kill_live_borg) ; comme uvicorn 0.15 : sortie normale, atexit exécuté.
+            cap=getattr(self,'_captured_signals',None)
+            if isinstance(cap,list): cap.clear()
+            loop=getattr(self,'_bh_loop',None)
+            if again and loop is not None:
+                try: loop.call_soon_threadsafe(self._abort_connections)   # jamais directement : peut tourner dans le gestionnaire de signal
+                except RuntimeError: pass   # boucle déjà fermée
     return _Server(config)
 
 import atexit as _atexit, shutil
@@ -2694,6 +2747,9 @@ def _borg_stream(request,cmd,env,what,decoy=None,path=None,missing=None):
         try:
             for l in proc.stderr: errs.append(l.decode('utf-8','replace').rstrip('\n'))
         except (ValueError,OSError): pass
+        finally:   # 1.31.4 (story 57, mesuré sous -W default) : tube fermé à la fin de sa lecture, plus par le ramasse-miettes
+            try: proc.stderr.close()
+            except Exception: pass
     err_t=threading.Thread(target=_read_err,daemon=True); err_t.start()
     def lines():
         err_t.join(5)
@@ -3503,7 +3559,7 @@ def _push_row(endpoint):
 def push_subscribe(request: Request, body: PushSubscribeBody, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     scope_nicks=_current_scope_nicks(request)
-    if 'expires_in_days' not in body.__fields_set__:
+    if 'expires_in_days' not in _mset(body):
         days=PUSH_DEFAULT_EXPIRY_DAYS  # absent de la requête -> défaut serveur (BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS)
     else:
         days=_resolve_push_expiry_days(body.expires_in_days)
@@ -3517,12 +3573,12 @@ def push_subscribe(request: Request, body: PushSubscribeBody, x_api_key: Optiona
     finally:
         conn.close()
     if body.defaults is not None:
-        base=body.defaults.dict()
+        base=_mdump(body.defaults)
     else:
         base=dict(_PUSH_DEFAULT_HOST)
         if body.notify_start is not None: base['start']=body.notify_start
         if body.notify_end is not None: base['success']=base['error']=body.notify_end
-    hosts={n:(body.hosts[n].dict() if n in body.hosts else dict(base)) for n in scope_nicks}
+    hosts={n:(_mdump(body.hosts[n]) if n in body.hosts else dict(base)) for n in scope_nicks}
     prefs={'scope_nicks':scope_nicks,'hosts':hosts,
            'expires_at':_expires_at_value(days),'updated_at':_utc_now_str(),'user':_request_user(request)}
     def _set(subs):
@@ -3561,7 +3617,7 @@ def push_subscribe_patch(request: Request, body: PushPatchBody, x_api_key: Optio
     row=_push_row(body.endpoint)
     if row is None:
         raise HTTPException(404,detail="Aucun abonnement pour cet endpoint — pas de création silencieuse (PATCH != POST)")
-    fields_set=body.__fields_set__
+    fields_set=_mset(body)
     # notify_start/notify_end n'ont pas d'état « null » significatif (un type de notification est
     # actif ou non) — contrairement à expires_in_days, où null explicite a une sémantique claire
     # (« à vie ») : un null explicite ici est rejeté plutôt que traité comme absent.
@@ -3579,7 +3635,7 @@ def push_subscribe_patch(request: Request, body: PushPatchBody, x_api_key: Optio
             if outside:
                 raise HTTPException(422,detail=f"Host(s) hors du périmètre de cet abonnement : "
                     f"{', '.join(outside)} — périmètre figé à l'abonnement (se réabonner pour le rafraîchir)")
-            for n,h in body.hosts.items(): p['hosts'][n]=h.dict()
+            for n,h in body.hosts.items(): p['hosts'][n]=_mdump(h)
         for h in p['hosts'].values():
             if 'notify_start' in fields_set: h['start']=body.notify_start
             if 'notify_end' in fields_set: h['success']=h['error']=body.notify_end
@@ -3638,6 +3694,19 @@ def push_test(endpoint: str, x_api_key: Optional[str]=Header(default=None)):
 
 app.include_router(router,prefix=API_PREFIX)
 
+def _flat_routes():
+    """1.31.4 (story 57) : routes de l'application, celles des routeurs inclus comprises — fastapi 0.142 garde dans app.routes un
+    `_IncludedRouter` paresseux (`original_router`) au lieu d'y recopier les routes comme fastapi 0.63 ; récursif (routeur inclus
+    dans un routeur inclus)."""
+    out=[]
+    def walk(routes):
+        for r in routes:
+            sub=getattr(r,'original_router',None)
+            if sub is not None: walk(sub.routes)
+            else: out.append(r)
+    walk(app.routes)
+    return out
+
 def push_selftest():
     """Équivalent, pour la story push, de `CodecSelfTest` (borgHelper) — convention existante de ce
     projet pour toute vérification DB, adaptée ici car la logique testée (push.db, VAPID, py_vapid)
@@ -3695,7 +3764,7 @@ def push_selftest():
                            stderr='[ERREUR] DbKeyError : qe: passphrase incorrecte')
         clean=CommandResult(exitcode=0,stdout=json.dumps({'qe':['b'],'qp':['a']}),stderr='')
         puts=[]
-        def run(r): return lambda: JSONResponse(status_code=200,content=r.dict())
+        def run(r): return lambda: JSONResponse(status_code=200,content=_mdump(r))
         with mock.patch(f"{__name__}._scope_cache_get",return_value=None),\
              mock.patch(f"{__name__}._scope_cache_put",side_effect=lambda *a,**k: puts.append(a[0])):
             _scoped_cached_multi('search','qe,qp',['qe','qp'],{'qe':None,'qp':None},{},{},run(part)); n_part=len(puts)
@@ -4135,11 +4204,11 @@ def push_selftest():
             except Exception as e:
                 print(f"SKIP routes /push/* de bout en bout (TestClient indisponible : {e})")
             else:
-                client=TestClient(app); H={'X-API-Key':API_KEY}; P=API_PREFIX
+                client=TestClient(app,raise_server_exceptions=False); H={'X-API-Key':API_KEY}; P=API_PREFIX
                 def _routes_guarded():
                     """1.27.6 : toute route (app et router) convertit un SystemExit de borgHelper en 500 — sous
                     uvicorn, un sys.exit dans une route arrêtait sinon tout le serveur."""
-                    api_routes=[r for r in app.routes if isinstance(r,APIRoute)]
+                    api_routes=[r for r in _flat_routes() if isinstance(r,APIRoute)]
                     unguarded=[r.path for r in api_routes if not isinstance(r,_ExitGuardRoute)]
                     with mock.patch(f"{__name__}._nick_list",side_effect=SystemExit(1)), \
                          contextlib.redirect_stderr(io.StringIO()):
@@ -4148,6 +4217,39 @@ def push_selftest():
                     return (len(api_routes)>40 and unguarded==[] and bad.status_code==500 and 'borgHelper' in bad.json()['detail']
                             and after.status_code==200)
                 check("routes : sys.exit de borgHelper -> 500, serveur maintenu ; toutes les routes protégées",_routes_guarded)
+                def _lifespan_runs():
+                    """1.31.4 (story 57) : démarrage/arrêt par le lifespan du routeur (ni `on_event`, déprécié en fastapi 0.142, ni
+                    `FastAPI(lifespan=)`, absent de 0.63) — le lifespan RÉELLEMENT posé sur app.router démarre le watcher (tâche
+                    vivante) et l'arrête à la sortie (tâche annulée, borg des téléchargements tués une fois), piloté par le protocole
+                    ASGI lifespan (TestClient en contexte, revue) ; ancienne API absente (structure : on_event, add_event_handler,
+                    on_startup/on_shutdown — leurs gestionnaires ne tourneraient plus) ; watcher et _kill_live_borg simulés."""
+                    global _bkp_watcher_task
+                    seen={}
+                    async def fake_watcher():
+                        seen['start']=True
+                        try: await asyncio.sleep(3600)
+                        except asyncio.CancelledError: seen['cancel']=True; raise
+                    kills=[]   # le vrai _kill_live_borg poserait _STOPPING pour tout le processus (contrôles suivants faussés)
+                    with mock.patch(f"{__name__}._bkp_status_watcher",fake_watcher),mock.patch(f"{__name__}._kill_live_borg",lambda *a,**k: kills.append(a)),\
+                            contextlib.redirect_stderr(io.StringIO()):
+                        # revue : par le VRAI protocole ASGI lifespan (TestClient en contexte : lifespan.startup/shutdown envoyés à
+                        # l'application, Router.lifespan de starlette compris) — jamais l'appel direct de lifespan_context
+                        with TestClient(app,raise_server_exceptions=False):
+                            time.sleep(0.1); seen['alive']=_bkp_watcher_task is not None and not _bkp_watcher_task.done()
+                        seen['done']=_bkp_watcher_task is not None and _bkp_watcher_task.done()
+                    seen['kill']=len(kills)
+                    _bkp_watcher_task=None   # tâche finie du faux watcher : rien ne doit la retrouver après le contrôle
+                    import ast as _ast
+                    with open(os.path.realpath(__file__),encoding='utf-8') as f: tree=_ast.parse(f.read())
+                    # ancienne API de démarrage/arrêt (dépréciée en 0.142) : décorateur on_event, add_event_handler, on_startup/
+                    # on_shutdown (argument de FastAPI/APIRouter ou attribut)
+                    old=('on_event','add_event_handler','on_startup','on_shutdown')
+                    deco=sorted({_ast.unparse(n)[:80] for n in _ast.walk(tree)
+                                 if (isinstance(n,_ast.Attribute) and n.attr in old) or (isinstance(n,_ast.keyword) and n.arg in old)})
+                    ok=seen=={'start':True,'alive':True,'cancel':True,'done':True,'kill':1} and deco==[] and _STOPPING[0] is False
+                    if not ok: print(f"  {seen} ancienne API={deco}")
+                    return ok
+                check("lifespan : le watcher démarre au démarrage du serveur et s'arrête à l'arrêt, sans on_event (story 57)",_lifespan_runs)
                 ep='https://push.example.invalid/ep-route'
                 all_nicks=_nick_list('ALL'); h0=all_nicks[0]
                 r=client.post(f"{P}/push/subscribe",headers=H,json={'endpoint':ep,'keys':{'p256dh':'p','auth':'a'},
@@ -4174,6 +4276,19 @@ def push_selftest():
                 r=client.patch(f"{P}/push/subscribe",headers=H,json={'endpoint':ep,'hosts':{'nick-hors-perimetre':{'start':True}}})
                 check("route PATCH : host hors périmètre -> 422, rien écrit",
                       lambda: r.status_code==422 and open(PUSH_PREFS_FILE,encoding='utf-8').read()==before)
+                def _compat_kw():
+                    """1.31.4 (revue story 57) : comportement de fastapi 0.63 gardé sous 0.142 — corps JSON sans en-tête Content-Type
+                    accepté (0.142 strict : 422), télémétrie OpenTelemetry coupée (attribut absent en 0.63)."""
+                    import inspect
+                    raw=json.dumps({'endpoint':ep,'notify_end':True}).encode()
+                    kw={'content':raw} if 'content' in inspect.signature(client.patch).parameters else {'data':raw}   # httpx / requests
+                    rr=client.patch(f"{P}/push/subscribe",headers=H,**kw)
+                    tel=getattr(app,'_telemetry',None)
+                    ok=(rr.status_code==200 and 'content-type' not in {k.lower() for k in rr.request.headers}
+                        and (tel is None or not any(tel.get(k) for k in ('auto_configure','tracing','metrics','logs','operation_spans'))))
+                    if not ok: print(f"  HTTP {rr.status_code} {rr.text[:200]} ; télémétrie={tel}")
+                    return ok
+                check("FastAPI : corps JSON sans Content-Type accepté, télémétrie coupée (comme fastapi 0.63, story 57)",_compat_kw)
                 r=client.patch(f"{P}/push/subscribe",headers=H,json={'endpoint':ep,'notify_end':True})
                 check("route PATCH hérité (notify_end) : succès+échec activés sur tous les hosts",
                       lambda: r.status_code==200 and all(h['success'] and h['error'] for h in r.json()['hosts'].values()))
@@ -4333,7 +4448,7 @@ def push_selftest():
                     import ast,inspect,textwrap
                     exempt={'request','nick','x_api_key','x_borg_passphrase','json_output'}
                     bad=[]; seen=0
-                    for route in app.routes:
+                    for route in _flat_routes():
                         fn=getattr(route,'endpoint',None)
                         try: src=textwrap.dedent(inspect.getsource(fn))
                         except Exception: continue
@@ -4717,7 +4832,7 @@ def push_selftest():
                         for k in [k for k in _RESPONSE_CACHE if k and k[0]=='selftest-nickerr']: _RESPONSE_CACHE.pop(k,None)
                         return ex.call_count
                     puts=[]
-                    def run(r): return lambda: JSONResponse(status_code=200,content=r.dict())
+                    def run(r): return lambda: JSONResponse(status_code=200,content=_mdump(r))
                     with mock.patch(f"{__name__}._scope_cache_get",return_value=None),\
                          mock.patch(f"{__name__}._scope_cache_put",side_effect=lambda *a,**k: puts.append(a[0])):
                         _scoped_cached_mono('idxtop','qz',None,'',{},run(busy)); m_busy=len(puts)
@@ -5059,6 +5174,52 @@ def push_selftest():
                         res['arrêt : inactifs au 1er signal, puis dès 1 s sans octet, tous au 2e']=(first==(True,True,True,False) and later[0] and 0.5<=later[1]<=5 and second==(True,)
                             and getattr(r1.state,'stream_aborted',False) and getattr(r2.state,'stream_aborted',False)
                             and e.getvalue().count("en cours d'envoi : arrêt du serveur borgHelperWWW — borg arrêté")==2 and wait_empty(),first,later,second,e.getvalue()[-200:])
+                    # 1.31.4 (revue story 57) : handle_exit appelé PENDANT que le fil tient les deux verrous (cas du vrai gestionnaire
+                    # de signal d'uvicorn 0.54, exécuté sur le fil principal) — fini sans interblocage ; signaux capturés vidés (sinon
+                    # uvicorn 0.54 les relance après serve() : mort par SIGTERM, atexit sauté)
+                    srv3=_make_server(_uv.Config(app)); done3=[]
+                    def reentrant(lk):   # sonde bornée d'abord : un verrou non réentrant bloquerait sinon tout le reste du selftest
+                        with lk:
+                            ok=lk.acquire(timeout=1)
+                            if ok: lk.release()
+                        return ok
+                    def held():
+                        with _LIVE_BORG_LOCK, _LIVE_GROUPS_LOCK:
+                            srv3.handle_exit(_sig.SIGTERM,None); done3.append(list(getattr(srv3,'_captured_signals',[])))
+                    th=threading.Thread(target=held,daemon=True)
+                    if reentrant(_LIVE_BORG_LOCK) and reentrant(_LIVE_GROUPS_LOCK):
+                        try: th.start(); th.join(5)
+                        finally: _STOPPING[0]=False
+                    else: done3.append('verrou non réentrant')
+                    # 1.31.4 (story 57, -W default) : tube stderr de borg fermé par son fil de lecture une fois lu (avant : par le
+                    # ramasse-miettes, ResourceWarning)
+                    with _LIVE_BORG_LOCK: avant=set(_LIVE_BORG)
+                    b5=_borg_stream(req(),[P,'-c',"import sys; sys.stdout.write('x'*10); sys.stderr.write('e\\n')"],dict(os.environ),'borg extract')
+                    with _LIVE_BORG_LOCK: p5=[x for x in _LIVE_BORG if x not in avant]
+                    o5=asyncio.run(drain(b5)); t0=time.monotonic()
+                    while p5 and not p5[0].stderr.closed and time.monotonic()-t0<5: time.sleep(0.05)
+                    res['tube stderr de borg fermé une fois lu']=(len(p5)==1 and p5[0].stderr.closed and o5==b'x'*10 and wait_empty(),len(p5),o5[:20])
+                    class _Tr:
+                        def __init__(self): self.n=0
+                        def abort(self): self.n+=1
+                    class _Cn:
+                        def __init__(self): self.transport=_Tr()
+                    async def _forced():
+                        # vrai startup (comme Server._serve : config chargée, lifespan coupé, port libre) : il retient la boucle
+                        srv4=_make_server(_uv.Config(app,host='127.0.0.1',port=0,lifespan='off',log_level='warning'))
+                        srv4.config.load(); srv4.lifespan=srv4.config.lifespan_class(srv4.config); await srv4.startup()
+                        try:
+                            cs=[_Cn(),_Cn()]; srv4.server_state.connections.update(cs)
+                            srv4.handle_exit(_sig.SIGTERM,None); await asyncio.sleep(0.05); n1=[c.transport.n for c in cs]
+                            srv4.handle_exit(_sig.SIGTERM,None); await asyncio.sleep(0.05); n2=[c.transport.n for c in cs]
+                        finally:
+                            srv4.server_state.connections.difference_update(cs); await srv4.shutdown()
+                        return (n1,n2,srv4.force_exit)
+                    try: f4=asyncio.run(_forced())
+                    finally: _STOPPING[0]=False
+                    res['arrêt forcé : connexions ouvertes coupées au 2e signal seulement']=(f4==([0,0],[1,1],True),f4)
+                    res['signal reçu verrous tenus : sans interblocage, signaux capturés vidés']=(not th.is_alive() and done3==[[]] and srv3.should_exit,
+                                                                                                th.is_alive(),done3)
                     import inspect as _in, ast as _ast
                     # garde de STRUCTURE : instructions du niveau module (jamais le texte de ce contrôle, qui cite les mêmes appels)
                     tree=_ast.parse(open(os.path.realpath(__file__),encoding='utf-8').read())
