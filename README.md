@@ -82,7 +82,7 @@ Script Python 3 d'aide à la gestion des sauvegardes BorgBackup.
 
 ## Ssh
 ### sshvault
-CLI Python (sans root, `uv tool install ./Ssh`) : clés SSH dans Vaultwarden via le CLI `bw` ; pour l'instant `login`, `unlock`, `lock`, `status`, `sync`, `list` et `search` des éléments « SSH key » par hôte, nom ou empreinte. Détails : README.md dans le répertoire Ssh/
+CLI Python (sans root, `uv tool install ./Ssh`) : clés SSH dans Vaultwarden via le CLI `bw` ; `login`, `unlock`, `lock`, `status`, `sync`, `list` et `search` des éléments « SSH key » par hôte, nom ou empreinte ; `load` dans un `ssh-agent` dédié (durée de vie, `--confirm`, `--restrict`), `agent status|purge|lock|unlock|stop`, `config` (durée par défaut). Détails : README.md dans le répertoire Ssh/
 
 ## Docker
 ### Compose

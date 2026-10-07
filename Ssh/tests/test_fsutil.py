@@ -58,3 +58,15 @@ def test_write_private_0600(tmp_path):
     p = tmp_path / "d" / "f"
     fsutil.write_private(str(p), b"x")
     assert mode(p) == 0o600 and p.read_bytes() == b"x"
+
+
+def test_fs_type_point_de_montage_le_plus_long(tmp_path):
+    from sshvault.fsutil import fs_type
+    m = tmp_path / "mounts"
+    m.write_text("/dev/sda1 / ext4 rw 0 0\ntmpfs /run tmpfs rw 0 0\ntmpfs /run/user/1001 tmpfs rw 0 0\n"
+                 "/dev/sdb1 /run/user/1001/disque xfs rw 0 0\nx /mon\\040dossier ramfs rw 0 0\n")
+    assert fs_type("/run/user/1001/a", str(m)) == "tmpfs"
+    assert fs_type("/run/user/1001/disque/a", str(m)) == "xfs"
+    assert fs_type("/run/user/10011", str(m)) == "tmpfs"  # préfixe /run, pas /run/user/1001
+    assert fs_type("/mon dossier/x", str(m)) == "ramfs"
+    assert fs_type("/home", str(m)) == "ext4"

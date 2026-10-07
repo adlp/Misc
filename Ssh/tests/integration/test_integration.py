@@ -25,7 +25,7 @@ import uuid
 
 import pytest
 
-from bench import SRC, private_runtime_dir
+from bench import HAVE_OPENSSH, SRC, agent_list, check_witness, kill_agents_under, private_runtime_dir, wait_gone
 
 pytestmark = pytest.mark.integration
 
@@ -271,8 +271,9 @@ def vault(account, bw_exe, ssh_keys, report):
 
 
 @pytest.fixture
-def home(account, bw_exe, ring, report):
-    """HOME temporaire de sshvault, son bw dédié connecté puis verrouillé ; logout et suppression à la fin."""
+def home(account, bw_exe, ring, report, witness):
+    """HOME temporaire de sshvault, son bw dédié connecté puis verrouillé ; logout et suppression à la fin.
+    Agent de l'utilisateur remplacé par l'agent témoin ; agents dédiés du test arrêtés à la fin."""
     tmp = tempfile.mkdtemp(prefix="sshvault-it-home-")
     os.chmod(tmp, 0o700)
     h = os.path.join(tmp, "home")
@@ -285,6 +286,10 @@ def home(account, bw_exe, ring, report):
     env.update(account.extra_env)
     env.update(HOME=h, XDG_RUNTIME_DIR=rt, SSHVAULT_BW=bw_exe, PYTHONPATH=SRC,
                SSHVAULT_PROMPT_TIMEOUT="30", SSHVAULT_BW_TIMEOUT="180")
+    env.pop("SSH_AGENT_PID", None)
+    env.pop("SSH_AUTH_SOCK", None)
+    if witness:
+        env["SSH_AUTH_SOCK"] = witness["sock"]
     if ring:
         env["SSHVAULT_KEYRING"] = ring
     else:
@@ -297,9 +302,17 @@ def home(account, bw_exe, ring, report):
     try:
         yield {"env": env, "bw": own, "tmp": tmp, "askpass": askpass, "runtime": rt}
     finally:
-        own.run("logout")
-        shutil.rmtree(tmp, ignore_errors=True)
-        shutil.rmtree(rt, ignore_errors=True)
+        try:
+            own.run("logout")
+        finally:
+            try:
+                kill_agents_under(rt)
+            finally:
+                try:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    shutil.rmtree(rt, ignore_errors=True)
+                finally:
+                    check_witness(witness)
 
 
 def sv(home, *args, env=None):
@@ -465,6 +478,37 @@ def test_sshvault_sur_le_vrai_bw(account, vault, ssh_keys, home, report):
     check(account, r, 1, "search élément login")
     r = sv(home, "--nointeraction", "status")
     check(account, r, 0, "status déverrouillé")
+
+    # agent dédié (story 3) : load d'une clé de test, présence, agent status, purge, stop
+    if HAVE_OPENSSH:  # sinon ignoré (ssh-agent/ssh-add absents)
+        sock = os.path.join(home["runtime"], "sshvault", "agent.sock")
+        fp = ssh_keys["hotes"]["fingerprint"]
+        blob = ssh_keys["hotes"]["public"].split()[1]
+        r = sv(home, "--nointeraction", "load", "--id", vault["hotes"], "-t", "10m")
+        report.add("sshvault load", r)
+        check(account, r, 0, "load --id")
+        assert r.stdout == "chargée : sshvault-it %s prod %s (durée 10m)\n" % (TAG, fp)
+        rc, listing = agent_list(sock)
+        assert rc == 0 and [l.split()[1] for l in listing] == [blob], "clé dans l'agent dédié"
+        r = sv(home, "--nointeraction", "load", "--host", "prod-%s.it.example" % TAG)
+        check(account, r, 0, "load clé présente")
+        assert r.stdout.startswith("déjà chargée : ")
+        r = sv(home, "agent", "status")
+        check(account, r, 0, "agent status")
+        lines = r.stdout.splitlines()
+        pid = int(lines[2].split(" : ")[1])
+        assert lines[:2] == ["agent : actif", "socket : %s" % sock]
+        assert lines[3].split("\t")[:3] == ["sshvault-it %s prod" % TAG, fp, "prod-%s.it.example,*.Lab-%s.it" % (TAG, TAG)]
+        r = sv(home, "agent", "purge")
+        check(account, r, 0, "agent purge")
+        assert agent_list(sock) == (1, [])
+        with open(os.path.join(home["runtime"], "sshvault", "agent.json")) as f:
+            watcher = json.load(f)["agent"]["watcher"]
+        r = sv(home, "agent", "stop")
+        check(account, r, 0, "agent stop")
+        assert wait_gone([pid, watcher]) and not os.path.exists(sock), "agent et surveillant arrêtés"
+        r = sv(home, "agent", "status")
+        check(account, r, 3, "agent status arrêté")
 
     # session invalidée par un autre unlock : purge, puis « verrouillé »
     own.ok("unlock", "--passwordenv", PW_VAR, "--raw", env={PW_VAR: account.password})

@@ -780,7 +780,8 @@ def test_status_decrit_le_magasin(bench):
 
 def test_usage(bench):
     for args in (["search"], ["inconnue"], ["unlock", "--ttl", "0"], ["unlock", "--ttl", "x"],
-                 ["search", "a", "--host", "--name"], []):
+                 ["search", "a", "--host", "--name"], [], ["agent"], ["agent", "x"], ["config"],
+                 ["config", "set", "key-ttl"], ["config", "get", "a", "b"], ["load", "-t"]):
         r = bench.run(*args)
         assert r.returncode == 2, args
         one_line_error(r)
@@ -803,3 +804,79 @@ def test_jamais_bw_serve(bench, tmp_path):
         bench.run(*args, env=env)
     assert bench.calls()
     assert not any("serve" in c["argv"] for c in bench.calls())
+
+
+# --- config (story 3) ------------------------------------------------------------------
+
+def config_file(bench):
+    return bench.home / ".config" / "sshvault" / "config.json"
+
+
+def test_config_get_set_unset(bench):
+    r = bench.run("config", "get")
+    assert r.returncode == 0 and r.stdout == "key-ttl 1h (défaut)\n"
+    assert not config_file(bench).exists(), "get n'écrit rien"
+    for value, shown in (("90", "90s"), ("90s", "90s"), ("15m", "15m"), ("2h", "2h"), ("30d", "30d"),
+                         ("120", "2m"), ("0", "0 (illimitée)")):
+        r = bench.run("config", "set", "key-ttl", value)
+        assert r.returncode == 0 and r.stdout == "key-ttl %s\n" % shown, value
+        assert bench.run("config", "get", "key-ttl").stdout == "key-ttl %s\n" % shown
+    f = config_file(bench)
+    assert stat.S_IMODE(f.stat().st_mode) == 0o600
+    assert stat.S_IMODE(f.parent.stat().st_mode) == 0o700
+    assert json.loads(f.read_text()) == {"key-ttl": 0}
+    r = bench.run("config", "unset", "key-ttl")
+    assert r.returncode == 0 and r.stdout == "key-ttl 1h (défaut)\n"
+    assert json.loads(f.read_text()) == {}
+    assert not bench.calls(), "config n'appelle pas bw"
+
+
+def test_config_xdg_config_home(bench):
+    xdg = bench.tmp / "xdg-config"
+    assert bench.run("config", "set", "key-ttl", "5m", env={"XDG_CONFIG_HOME": str(xdg)}).returncode == 0
+    assert json.loads((xdg / "sshvault" / "config.json").read_text()) == {"key-ttl": 300}
+    assert not config_file(bench).exists()
+
+
+@pytest.mark.parametrize("value", ["abc", "-1", "1w", "31d", "2592001", "1.5h", "", "1H", "2 h"])
+def test_config_duree_invalide(bench, value):
+    assert bench.run("config", "set", "key-ttl", "2h").returncode == 0
+    before = config_file(bench).read_bytes()
+    r = bench.run("config", "set", "key-ttl", value)
+    assert r.returncode == 2
+    assert "durée invalide" in one_line_error(r)
+    assert config_file(bench).read_bytes() == before
+
+
+@pytest.mark.parametrize("args", [["get", "ttl"], ["set", "ttl", "1h"], ["unset", "ttl"]])
+def test_config_cle_inconnue(bench, args):
+    r = bench.run("config", *args)
+    assert r.returncode == 2 and "clé de configuration inconnue" in one_line_error(r)
+    assert not config_file(bench).exists()
+
+
+@pytest.mark.parametrize("content,mode,msg", [(b"{pas du json", 0o600, "JSON invalide"),
+                                              (b"[]", 0o600, "objet JSON attendu"),
+                                              (b'{"key-ttl": 99999999}', 0o600, "key-ttl invalide"),
+                                              (b'{"key-ttl": 60}', 0o644, "illisible")])
+def test_config_fichier_invalide(bench, content, mode, msg):
+    f = config_file(bench)
+    f.parent.mkdir(parents=True, mode=0o700)
+    f.write_bytes(content)
+    os.chmod(str(f), mode)
+    for args in (["get"], ["set", "key-ttl", "1h"]):
+        r = bench.run("config", *args)
+        assert r.returncode == 2, args
+        assert msg in one_line_error(r)
+    assert f.read_bytes() == content
+
+
+def test_config_ecriture_impossible(bench):
+    d = config_file(bench).parent.parent  # ~/.config sans droit d'écriture : sshvault/ impossible
+    d.mkdir(parents=True, mode=0o700)
+    os.chmod(str(d), 0o500)
+    try:
+        r = bench.run("config", "set", "key-ttl", "1h")
+        assert r.returncode == 4 and "écriture de" in one_line_error(r)
+    finally:
+        os.chmod(str(d), 0o700)

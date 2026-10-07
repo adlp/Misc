@@ -19,13 +19,12 @@ import subprocess
 import time
 from typing import Callable, Optional
 
-from .fsutil import ensure_dir, read_private, write_private
+from .fsutil import NotPrivateTmpfs, check_private_tmpfs, read_private, write_private
 
 KEY_DESC = "sshvault:session"
 DEFAULT_TTL = 900
 KEYCTL_TIMEOUT = 10
 _TOKEN_RE = re.compile(r"[A-Za-z0-9+/=_.:-]{8,4096}")
-_PRIVATE_FS = ("tmpfs", "ramfs")
 
 
 class SessionStoreError(Exception):
@@ -36,37 +35,15 @@ def valid_token(token: Optional[str]) -> bool:
     return bool(token) and bool(_TOKEN_RE.fullmatch(token))
 
 
-def _unescape_mount(path: str) -> str:
-    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), path)
-
-
-def fs_type(path: str, mounts: str = "/proc/self/mounts") -> Optional[str]:
-    """Type du système de fichiers qui porte `path` (point de montage le plus long)."""
-    path = os.path.realpath(path)
-    best, kind = "", None
-    try:
-        with open(mounts) as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) < 3:
-                    continue
-                mp = _unescape_mount(parts[1])
-                if (path == mp or path.startswith(mp.rstrip("/") + "/")) and len(mp) >= len(best):
-                    best, kind = mp, parts[2]
-    except OSError:
-        return None
-    return kind
-
-
 def check_private_runtime(rt: str, mounts: str = "/proc/self/mounts") -> None:
     """Le repli fichier exige un XDG_RUNTIME_DIR à l'utilisateur, sans droits groupe/autres,
     sur tmpfs ou ramfs (jamais un disque persistant)."""
     try:
-        st = os.stat(rt)
-    except OSError as e:
-        raise SessionStoreError("XDG_RUNTIME_DIR inutilisable : %s" % (e.strerror or e)) from None
-    if st.st_uid != os.getuid() or st.st_mode & 0o077 or fs_type(rt, mounts) not in _PRIVATE_FS:
-        raise SessionStoreError("XDG_RUNTIME_DIR n'est pas un tmpfs privé (%s) : session non rangée" % rt)
+        check_private_tmpfs(rt, mounts)
+    except NotPrivateTmpfs as e:
+        if e.reason is not None:
+            raise SessionStoreError("XDG_RUNTIME_DIR inutilisable : %s" % e.reason) from None
+        raise SessionStoreError("XDG_RUNTIME_DIR n'est pas un tmpfs privé (%s) : session non rangée" % rt) from None
 
 
 class SessionStore:

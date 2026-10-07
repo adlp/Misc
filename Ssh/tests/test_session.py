@@ -190,15 +190,3 @@ def test_runtime_droits_groupe_refuse(rt):
     s = SessionStore(keyctl="/nonexistent/keyctl", runtime_dir=str(sub))
     with pytest.raises(SessionStoreError, match="tmpfs privé"):
         s.put(TOK, 60)
-
-
-def test_fs_type_point_de_montage_le_plus_long(tmp_path):
-    from sshvault.session import fs_type
-    m = tmp_path / "mounts"
-    m.write_text("/dev/sda1 / ext4 rw 0 0\ntmpfs /run tmpfs rw 0 0\ntmpfs /run/user/1001 tmpfs rw 0 0\n"
-                 "/dev/sdb1 /run/user/1001/disque xfs rw 0 0\nx /mon\\040dossier ramfs rw 0 0\n")
-    assert fs_type("/run/user/1001/a", str(m)) == "tmpfs"
-    assert fs_type("/run/user/1001/disque/a", str(m)) == "xfs"
-    assert fs_type("/run/user/10011", str(m)) == "tmpfs"  # préfixe /run, pas /run/user/1001
-    assert fs_type("/mon dossier/x", str(m)) == "ramfs"
-    assert fs_type("/home", str(m)) == "ext4"
