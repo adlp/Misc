@@ -2692,14 +2692,20 @@ classique (404 nick inconnu, 502 `borg list` en échec ou archive `bid` inconnue
 `200` vide) ; borg en échec **pendant** l'envoi -> **flux coupé** : la connexion se ferme sans fin de transfert (curl :
 code 18 ; l'UI affiche « Téléchargement interrompu ») et `[ERREUR]` au journal du serveur — jamais un fichier tronqué
 servi comme complet (avant : `200`, fichier vide ou tronqué). Code 1 (avertissement) : réponse complète, `[WARN]` au journal.
-Client qui abandonne un téléchargement : borg arrêté aussitôt (avant : resté bloqué, verrou de dépôt gardé).
+Client qui abandonne un téléchargement : borg arrêté aussitôt (avant : resté bloqué, verrou de dépôt gardé). 1.31.6 : en moins
+d'une seconde (mesuré ; avant : 28 s à plus de 90 s, jusqu'à l'arrêt du serveur). borg est arrêté par SIGTERM — il rend lui-même
+son verrou de dépôt — puis SIGKILL 5 s après s'il vit encore (borg figé : son entrée de `lock.roster` reste, retirée par le
+prochain borg de la même machine). « Moins d'une seconde » vaut pour l'abandon par le client : arrêté par le chien de garde
+(client qui ne lit plus) ou au premier signal d'arrêt, un borg bloqué en écriture ne traite pas SIGTERM et finit au SIGKILL
+5 s après — son entrée de `lock.roster` reste alors, retirée de la même façon.
 
 **Inactivité bornée (1.31.0)** : aucun octet lu sur la sortie de borg pendant `BORGHELPERWWW_TIMEOUT` secondes (défaut 3600 ;
 0 = aucune limite) — borg muet, client parti avant le premier octet, client qui ne lit plus — -> borg arrêté, `[ERREUR]` au
 journal ; avant la réponse : `502` « … a échoué : aucune activité depuis N s — borg arrêté » ; après : flux coupé. Un borg
 lent qui produit encore n'est jamais arrêté. Limite : un `borg extract` qui parcourt longtemps l'archive sans rien écrire
 avant de trouver le fichier, ou un `export-tar` dont le préfixe ne correspond à rien de longtemps, est arrêté au-delà de ce
-délai. borg est arrêté avec tout son groupe de processus (le borg PyInstaller lance un second processus) ; ses dossiers
+délai. borg est arrêté avec tout son groupe de processus (le borg PyInstaller lance un second processus ; 1.31.6 : SIGTERM, SIGKILL
+5 s après ; arrêt forcé : SIGKILL) ; ses dossiers
 `/tmp/_MEI*` sont retirés. **Arrêt du serveur** (exécution directe) : au premier SIGTERM/Ctrl-C, les borg sans octet lu depuis
 10 s sont arrêtés, puis tout borg qui le devient ; un téléchargement sain va jusqu'au bout pendant qu'uvicorn attend ses
 connexions ; au second signal (arrêt forcé), tous. Avant : uvicorn attendait sans limite et un SIGKILL laissait borg orphelin.

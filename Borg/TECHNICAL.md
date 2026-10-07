@@ -2505,7 +2505,10 @@ collecteurs de DuIdx et `get_cache_rows` (`_reader_sqlite_line`), Search/FileHis
 + JSON ; texte : `_reader_sqlite_line` ; index illisible en `-j` : `[ERREUR]` aussi sur stderr), LstBkp/LstBkpFls (`_open_db`
 et requêtes : `_reader_sqlite_line`, `sys.exit(1)`, `-j` `{'error'}`), RepoHistory « no such column » (marquée), `cache_info`
 (boucle sous `_PerNick` ; « Cache vide. » seulement sans erreur). borgHelperWWW `_borg_stream` : borg en session propre
-(`start_new_session`) et arrêté par `_borg_killgrp` (`os.killpg`, SIGKILL) — le borg PyInstaller (`exec nice borg.wrapped`)
+(`start_new_session`) et arrêté par `_borg_killgrp` (`os.killpg` ; 1.31.6 : SIGTERM puis SIGKILL après `_KILL_GRACE`=5 s — échéance
+déposée dans `_KILL_PENDING` (deque, sans verrou : sûr dans le gestionnaire de signal), servie par un seul fil `borg-kill`
+démarré au chargement ; `_borg_killed(proc,st)` : code < 0, ou 143 (le vrai borg traite SIGTERM) avec `why` posé ; `force=True` — 2e signal, `atexit`, fin du lifespan, `_kill_live_borg(idle_only=False)` — : SIGKILL
+immédiat ; `st` passé : `_MEI*` relevés avant le signal) — le borg PyInstaller (`exec nice borg.wrapped`)
 a un enfant que tuer le PID de tête laissait vivre, tube ouvert (mesuré) ; `_borg_reap` (seulement si borghelperwww l'a tué :
 `st['why']`) retire les `_MEI*` apparus depuis son lancement et inutilisés (`_mei_dirs`/`_mei_in_use` de borgHelper). Registre
 `_LIVE_BORG` {Popen: état `last`/`why`/`mei`/`reading`}. Lectures par `read1` (`_rd`, chaque lecture — EOF compris — repousse
@@ -2513,7 +2516,10 @@ a un enfant que tuer le PID de tête laissait vivre, tube ouvert (mesuré) ; `_b
 un arrêt demandé, `_STOPPING` : `_STOP_IDLE`=10 s) -> groupe tué, `[ERREUR]` si vraiment tué par lui ; borg fini mais corps
 jamais lu -> au même délai (3600 s si TIMEOUT=0) tubes fermés et entrée retirée (`reading` : jamais pendant une lecture). Cause :
 code < 0 et `why` 'idle' -> « aucune activité depuis N s », 'stop' -> « arrêt du serveur » ; corps : pas de seconde ligne
-`[ERREUR]` après celle du chien de garde. `_kill_live_borg(idle_only)` : `_make_server(config)` (sous-classe d'`uvicorn.Server`,
+`[ERREUR]` après celle du chien de garde. 1.31.6 (story 60) : routes `/download/*` -> `_ClosingStreamingResponse` (`__call__` : `finally` -> `body_iterator.aclose()` sous `anyio.CancelScope(shield=True)`, défensif : la fermeture ne suspend
+pas aujourd'hui ; corps = `_Body`, enveloppe du générateur dont `aclose` d'un corps jamais commencé appelle `end(False)` — le
+`finally` d'un générateur jamais démarré ne s'exécute pas) — sous `BaseHTTPMiddleware`, le corps annulé pendant un `send` dans la tâche interne n'était jamais fermé (finalisé par le ramasse-miettes, 28-58 s ou jamais, mesuré) ; lectures du corps par `loop.run_in_executor(_borg_read_pool())` (40 fils `borg-read`, joints en fin d'interpréteur après
+`_kill_live_borg` : `concurrent.futures.thread` importé avant l'enregistrement ; annulables ; `anyio.to_thread.run_sync` attend la fin du fil) ; `stop()` : `_borg_killgrp(proc,st)`, puis dans un fil `borg-reap-<pid>` (sauf borg déjà fini) vidage borné de stdout (`select`, `_KILL_GRACE`+5 s — borg bloqué en écriture ne traite pas SIGTERM), `wait`, `_borg_reap`. Chien de garde et 1er signal : pas de vidage (le corps peut encore lire : une fin volée passerait pour complète) — borg bloqué en écriture y finit au SIGKILL du délai. `_kill_live_borg(idle_only)` : `_make_server(config)` (sous-classe d'`uvicorn.Server`,
 exécution directe) l'appelle à chaque signal — premier : `idle_only` (et `_STOPPING`), second (`should_exit` déjà vrai) : tous ;
 l'événement shutdown, `atexit` et `threading._register_atexit` (avant la jonction des fils non démons d'anyio bloqués dans
 `read1`) : tous. `_srv.started` faux -> code 3. TIMEOUT < 0 refusé au démarrage. `_note_http10(request)` dans le middleware :

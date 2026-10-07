@@ -1,5 +1,43 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.31.6 — Téléchargement abandonné : borg arrêté aussitôt — 2026-10-07
+
+Chantier « reconstruction progressive », story 60 (constat de la story 57 ; décision de l'utilisateur). Avant : un client qui
+abandonnait un `/download/*` ne voyait pas borg arrêté « aussitôt » (README 1.30.2) — mesuré sur vrai serveur : 28 s, 56 s, ou
+plus de 90 s (jusqu'à l'arrêt du serveur) ; borg et le verrou du dépôt restaient tenus, un Bkp suivant échouait sur le verrou.
+Cause mesurée (copie instrumentée) : la réponse externe du middleware finissait aussitôt, mais le corps de `_borg_stream`,
+annulé pendant un envoi dans la tâche interne de `BaseHTTPMiddleware`, n'était jamais fermé — son `finally` (qui arrête borg)
+attendait le ramasse-miettes.
+
+- Corps fermé à la fin de la réponse, même annulée (`_ClosingStreamingResponse` : `aclose()` protégé de l'annulation), sous les
+  deux piles (fastapi 0.63 / starlette 0.18, fastapi 0.142 / starlette 1.7).
+- Arrêt de borg (décision de l'utilisateur) : SIGTERM au groupe — borg rend lui-même son entrée de `lock.roster` —, SIGKILL
+  5 s après (`_KILL_GRACE`, fil d'arrière-plan) s'il vit encore ; client parti, chien de garde et premier signal d'arrêt du
+  serveur. Arrêt forcé (second signal), `atexit`, fin du lifespan : SIGKILL immédiat, comme avant. Avant : SIGKILL toujours —
+  entrée périmée laissée dans `lock.roster`.
+- Client parti : sortie de borg vidée pendant l'arrêt (mesuré : bloqué en écriture sur un tube plein, borg ne traitait pas
+  SIGTERM et finissait au SIGKILL du délai) ; attente et récolte dans un fil (la boucle d'événements n'attend plus borg).
+- Lectures du corps annulables (`run_in_executor`, exécuteur dédié de 40 fils comme le limiteur d'anyio ; `run_in_threadpool`
+  attendait la fin du fil même annulé) : un client parti pendant que borg se tait est traité aussitôt (mesuré : borg gelé, départ
+  jamais traité en 90 s sous 3.14).
+- Client parti avant le premier envoi du corps : borg arrêté aussi (avant : la fermeture d'un corps jamais commencé ne faisait
+  rien — borg et le verrou gardés jusqu'au chien de garde, 3.10 ; revue).
+- Causes et journal avec le vrai borg : il traite SIGTERM et sort en 143 (mesuré) — « aucune activité depuis N s », « arrêt du
+  serveur » et la ligne `[ERREUR]` du chien de garde reconnaissent cette sortie (sans quoi : « code 143 », ligne perdue ; revue).
+- SIGKILL différé armé sans démarrer de fil dans le gestionnaire de signal (un seul fil `borg-kill`, file sans verrou ; revue).
+- `_MEI*` d'un borg arrêté pour client parti relevés avant le signal et retirés — avant : jamais relevés sur ce chemin (témoin
+  de la baseline : un dossier `/tmp/_MEI*` de 57 Mo laissé par abandon tué par SIGKILL ; 27 retirés de /tmp après les mesures).
+- Mesuré (vrai serveur, rc de démo, vrai borg ; `work/m60/mesure60-f5.log`, `mesure60-fgel3.log`, témoin baseline
+  `mesure60-o.log`) : abandon après 512 Ko, 4 tours par pile -> borg arrêté par SIGTERM (sortie 143) en 0,06-0,07 s, aucune entrée dans `lock.roster`, aucun `_MEI*` laissé
+  (témoin : 28 s à plus de 90 s, entrée laissée par 3 tours sur 4 — le 4e, arrêté par le SIGTERM du dispositif après 90 s) ; borg gelé (sourd à SIGTERM), 2 tours par pile -> SIGKILL à
+  5,05-5,10 s, `_MEI*` retirés (entrée de `lock.roster` laissée par le SIGKILL, retirée par le borg suivant).
+- Contrôles : push selftest — bout en bout par la vraie application, corps retenu et ramasse-miettes coupé, envois après le
+  départ ignorés comme uvicorn (envoi bloqué puis déconnexion, aussi par `/download/file` ; envoi qui lève ; borg muet ; départ
+  avant le premier envoi), application finie et borg mort moins de 2 s après le départ ; borg factice qui traite SIGTERM comme
+  borg (143) ; borg sourd à SIGTERM -> SIGKILL au délai, fermeture du corps sans attente ; `_MEI*` du client parti retirés ;
+  chien de garde et arrêt du serveur avec un borg sorti en 143 ; premier signal = SIGTERM ; arrêt forcé et `atexit` : SIGKILL
+  aussitôt d'un borg sourd à SIGTERM.
+
 ## borgHelperWWW 1.31.5, UI 1.23.1, borgHelper 1.0.188 — /access et alerte de retard alignés sur le marqueur et l'orphelin — 2026-10-06
 
 Chantier « reconstruction progressive », story 59 (rétrospective F305, A115 ; décisions de l'utilisateur). Avant : `/access`

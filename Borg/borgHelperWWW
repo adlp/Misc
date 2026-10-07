@@ -9,7 +9,7 @@
 import os,re,sys,io,json,sqlite3,secrets,subprocess,configparser,tarfile,hmac,hashlib,asyncio,contextlib,datetime,urllib.parse,time,ipaddress,threading
 from pathlib import Path
 from typing import Optional, Dict
-from collections import defaultdict
+from collections import defaultdict, deque
 
 from fastapi import FastAPI, APIRouter, Header, HTTPException, Query, Request, Depends
 from fastapi.routing import APIRoute
@@ -75,7 +75,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.31.5"
+WWW_VERSION="1.31.6"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -2648,15 +2648,45 @@ _LIVE_BORG={}; _LIVE_BORG_LOCK=threading.RLock()   # 1.31.4 (revue story 57) : R
 _STOP_IDLE=10   # arrêt demandé : un borg sans octet lu depuis _STOP_IDLE s est tué (décision de l'utilisateur) — au signal, puis
 _STOPPING=[False]   # par le chien de garde dès qu'il le devient (un borg muet depuis 4 s au signal ne survit plus jusqu'au SIGKILL)
 
-def _borg_killgrp(proc,st=None,why=None):
+_KILL_GRACE=5.0   # 1.31.6 (story 60) : délai entre SIGTERM et SIGKILL du groupe de borg (s)
+# 1.31.6 (revue story 60) : SIGKILL différés — (Popen, PGID, échéance) ; deque.append sans verrou : sûr dans le gestionnaire de
+# signal (démarrer un fil y pouvait s'interbloquer sur le verrou interne de threading si le signal tombait dans un Thread.start
+# du fil principal). Un seul fil, démarré au chargement, les envoie à échéance.
+_KILL_PENDING=deque()
+def _kill_pending_loop():
+    while True:
+        time.sleep(0.05)
+        for _ in range(len(_KILL_PENDING)):
+            proc,pg,t=_KILL_PENDING.popleft()
+            if proc.returncode is not None: continue   # récolté : groupe fini (_borg_reap a tué un survivant)
+            if time.monotonic()<t: _KILL_PENDING.append((proc,pg,t)); continue
+            try: os.killpg(pg,9)
+            except OSError: pass
+threading.Thread(target=_kill_pending_loop,daemon=True,name='borg-kill').start()
+
+def _borg_killgrp(proc,st=None,why=None,force=False):
     """Tue le GROUPE de processus de borg (lancé en session propre) : le vrai borg est un exécutable PyInstaller (chargeur +
     enfant) derrière un script `exec nice …` — tuer le seul PID de tête laissait l'enfant vivant, tube de sortie ouvert (mesuré,
-    story 41). Ne fait rien pour un borg déjà récolté ; `why` noté dans l'état (cause du message)."""
+    story 41). Ne fait rien pour un borg déjà récolté ; `why` noté dans l'état (cause du message). 1.31.6 (story 60, décision de
+    l'utilisateur) : SIGTERM au groupe — borg retire lui-même son entrée de lock.roster (un SIGKILL la laissait, retirée par le borg
+    suivant seulement à identité d'hôte égale) — puis SIGKILL au délai _KILL_GRACE par le fil borg-kill (_KILL_PENDING ; jamais
+    une attente ni un fil démarré ici : appelé depuis la boucle d'événements et le gestionnaire de signal), si la tête n'est pas
+    encore récoltée (son PGID reste réservé jusque-là ; une récolte par un autre fil entre le test et le signal reste possible,
+    fenêtre de quelques microsecondes). force (arrêt forcé, atexit : le processus finit, aucun délai possible) : SIGKILL."""
     if proc.returncode is not None: return
     if st is not None and why and st.get('why') is None: st['why']=why
     if st is not None: st['meis'].update(_mei_mapped(_group_pids(proc.pid)))   # 1.31.1 (story 42) : avant le kill
-    try: os.killpg(proc.pid,9)
-    except OSError: pass
+    import signal as _sg
+    try: os.killpg(proc.pid,_sg.SIGKILL if force else _sg.SIGTERM)
+    except OSError: return
+    if force: return
+    _KILL_PENDING.append((proc,proc.pid,time.monotonic()+_KILL_GRACE))
+
+def _borg_killed(proc,st):
+    """1.31.6 (revue story 60, mesuré) : borg arrêté par borgHelperWWW — tué par un signal (code < 0) ou, au SIGTERM, sorti en 143 :
+    le vrai borg traite SIGTERM (128+15, lu ou bloqué en écriture puis vidé ; mesuré) ; `why` posé = arrêt demandé ici."""
+    rc=proc.returncode
+    return rc is not None and (rc<0 or (bool(st.get('why')) and rc==143))
 
 def _LIVE_BORG_pop(proc):
     with _LIVE_BORG_LOCK: _LIVE_BORG.pop(proc,None)
@@ -2679,8 +2709,8 @@ def _kill_live_borg(idle_only=False):
     _STOPPING[0]=True
     now=time.monotonic()
     with _LIVE_BORG_LOCK: items=list(_LIVE_BORG.items())
-    for pr,st in items:
-        if pr.poll() is None and (not idle_only or now-st['last']>=_STOP_IDLE): _borg_killgrp(pr,st,'stop')
+    for pr,st in items:   # 1.31.6 : premier signal SIGTERM puis SIGKILL au délai ; arrêt forcé, atexit, fin du lifespan : SIGKILL
+        if pr.poll() is None and (not idle_only or now-st['last']>=_STOP_IDLE): _borg_killgrp(pr,st,'stop',force=not idle_only)
 
 def _make_server(config):
     """1.31.0 (story 41, A86, décision de l'utilisateur) : uvicorn.Server dont le PREMIER signal d'arrêt tue les borg inactifs
@@ -2718,11 +2748,39 @@ def _make_server(config):
 import atexit as _atexit, shutil
 _atexit.register(_kill_live_borg)
 _atexit.register(lambda: _signal_groups(9))   # revue story 42 : jamais une commande borgHelper orpheline après le serveur
-# Revue (mesuré par un relecteur) : à la fin de l'interpréteur, les fils NON démons du pool d'anyio (bloqués dans read1 sur un
-# borg muet) sont attendus AVANT les fonctions atexit -> enregistré aussi là où il passe avant cette attente (arrêt forcé d'un
-# uvicorn externe).
+# Revue (mesuré par un relecteur) : à la fin de l'interpréteur, les fils NON démons (1.31.6 : lectures de téléchargement de
+# _borg_read_pool, joints par concurrent.futures ; avant : pool d'anyio) bloqués dans read1 sur un borg muet sont attendus AVANT
+# les fonctions atexit -> enregistré aussi là où il passe avant cette attente (arrêt forcé d'un uvicorn externe). Ordre :
+# threading._register_atexit appelle en ordre inverse ; concurrent.futures.thread (qui y enregistre sa jonction) importé AVANT,
+# explicitement (revue story 60 : n'en dépendait que par l'import de borgHelper) -> borg tués avant la jonction des lectures.
+import concurrent.futures.thread
 if hasattr(threading,'_register_atexit'):
     threading._register_atexit(_kill_live_borg); threading._register_atexit(lambda: _signal_groups(9))
+
+class _ClosingStreamingResponse(StreamingResponse):
+    """1.31.6 (story 60, mesuré) : réponse de téléchargement qui FERME son corps à la fin, même annulée. Sous le middleware
+    (BaseHTTPMiddleware), un client qui part fait annuler la tâche interne pendant un envoi : le générateur body() de _borg_stream
+    n'était jamais fermé, son finally (borg arrêté, verrou du dépôt rendu) n'arrivait qu'à sa finalisation par le ramasse-miettes
+    — 28 s, 58 s ou jamais avant l'arrêt du serveur (mesuré, deux piles). aclose protégé de l'annulation (CancelScope shield),
+    défensif : la fermeture actuelle (_Body.aclose, finally sans attente) ne suspend pas — une annulation en cours ne l'interrompt
+    pas aujourd'hui (revue : mutant sans protection équivalent) ; une attente ajoutée plus tard le serait sans elle."""
+    async def __call__(self,scope,receive,send):
+        try: await super().__call__(scope,receive,send)
+        finally:
+            ac=getattr(self.body_iterator,'aclose',None)
+            if ac is not None:
+                import anyio
+                with anyio.CancelScope(shield=True): await ac()
+
+_BORG_READ_POOL=[]
+def _borg_read_pool():
+    """1.31.6 (revue story 60) : exécuteur des lectures de téléchargement, 40 fils comme le limiteur d'anyio d'avant (créé dans la
+    boucle d'événements, un seul fil : pas de course). Fils joints en fin d'interpréteur par concurrent.futures APRÈS
+    _kill_live_borg (enregistré après lui : appelé avant, voir plus haut) — borg tués, lectures finies sur EOF."""
+    if not _BORG_READ_POOL:
+        import concurrent.futures
+        _BORG_READ_POOL.append(concurrent.futures.ThreadPoolExecutor(max_workers=40,thread_name_prefix='borg-read'))
+    return _BORG_READ_POOL[0]
 
 def _borg_stream(request,cmd,env,what,decoy=None,path=None,missing=None):
     """1.30.2 (story 40, A83, décisions de l'utilisateur) : lance borg (`what` : « borg extract »/« borg export-tar »), lit son
@@ -2736,9 +2794,10 @@ def _borg_stream(request,cmd,env,what,decoy=None,path=None,missing=None):
     bloqué sur son tube, zombie, verrou de dépôt gardé (revue, mesuré). Avant 1.30.2 : stderr vers DEVNULL, code jamais lu.
     1.31.0 (story 41, A86, décision de l'utilisateur) : aucun octet lu sur la sortie de borg pendant TIMEOUT s (borg muet, corps
     jamais lu — client parti avant le 1er octet —, client qui ne consomme plus) -> borg tué par un chien de garde, [ERREUR] au
-    journal ; avant la réponse : 502 « aucune activité depuis N s » ; après : flux coupé. TIMEOUT None (0) : aucune limite."""
+    journal ; avant la réponse : 502 « aucune activité depuis N s » ; après : flux coupé. TIMEOUT None (0) : aucune limite.
+    1.31.6 (story 60, mesuré) : corps fermé par la réponse (_ClosingStreamingResponse) — avant, attendait le ramasse-miettes ;
+    lectures annulables ; client parti : SIGTERM puis SIGKILL au délai, sortie vidée et borg récolté dans un fil, _MEI* relevés."""
     import collections
-    from starlette.concurrency import run_in_threadpool
     st={'last':time.monotonic(),'why':None,'meis':set()}
     proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,start_new_session=True)   # groupe propre (killpg)
     with _LIVE_BORG_LOCK: _LIVE_BORG[proc]=st
@@ -2755,7 +2814,7 @@ def _borg_stream(request,cmd,env,what,decoy=None,path=None,missing=None):
                 if lim and time.monotonic()-st['last']>=lim:
                     _borg_killgrp(proc,st,why)
                     proc.wait()   # corps jamais lu : personne d'autre ne l'attendra
-                    if proc.returncode<0 and st['why']=='idle':   # vraiment tué ici (pas sorti seul entre-temps)
+                    if _borg_killed(proc,st) and st['why']=='idle':   # vraiment tué ici (pas sorti seul entre-temps ; 143 : SIGTERM traité)
                         print(f"[ERREUR] {what} : aucune activité depuis {lim} s (borg muet ou téléchargement plus lu) — borg arrêté",
                               file=sys.stderr,flush=True)
                     if not st.get('reading'): _borg_reap(proc,st); _close_pipes(); return
@@ -2787,16 +2846,32 @@ def _borg_stream(request,cmd,env,what,decoy=None,path=None,missing=None):
         err_t.join(5)
         return [l.replace(decoy,path or '') for l in errs] if decoy else list(errs)
     def cause():
-        if proc.returncode is not None and proc.returncode<0:   # tué : par le chien de garde ou l'arrêt du serveur ?
+        if _borg_killed(proc,st):   # tué (signal, ou 143 : SIGTERM traité par borg) : par le chien de garde ou l'arrêt du serveur ?
             if st['why']=='idle': return f"aucune activité depuis {TIMEOUT} s — borg arrêté"
             if st['why']=='stop': return "arrêt du serveur borgHelperWWW — borg arrêté"
         return _rb_errmsg({'exitcode':proc.returncode,'stderr':lines()},what)
     def stop():
-        _borg_killgrp(proc)
-        proc.wait()
-        _borg_reap(proc,st)
-        try: proc.stdout.close()
-        except Exception: pass
+        # 1.31.6 (story 60) : SIGTERM puis SIGKILL au délai — attente et récolte d'un borg encore vivant dans un fil : stop() est
+        # appelé par la fermeture du corps, dans la boucle d'événements (jamais une requête bloquée pendant le délai). Sortie de
+        # borg vidée jusqu'à sa fin : bloqué en écriture sur un tube plein (client parti), borg ne traite pas SIGTERM (mesuré :
+        # arrêté par le SIGKILL du délai, 5 s) ; vidage borné (délai + 5 s : un descendant hors du groupe garderait le tube).
+        # État passé : _MEI* relevés avant le signal (sans lui, jamais relevés — mesuré, témoin de la baseline : un dossier
+        # _MEI* de 57 Mo laissé dans /tmp par abandon tué par SIGKILL)
+        _borg_killgrp(proc,st)
+        def finish():
+            import select
+            t0=time.monotonic()
+            try:
+                fd=proc.stdout.fileno()
+                while proc.poll() is None and time.monotonic()-t0<_KILL_GRACE+5:
+                    if select.select([fd],[],[],0.2)[0] and not proc.stdout.read1(65536): break
+            except (ValueError,OSError): pass   # tube fermé par le chien de garde
+            proc.wait()
+            _borg_reap(proc,st)
+            try: proc.stdout.close()
+            except Exception: pass
+        if proc.poll() is not None: finish()
+        else: threading.Thread(target=finish,daemon=True,name=f"borg-reap-{proc.pid}").start()
     first=b''
     while len(first)<65536:   # 1.31.0 : par morceaux (read1) — chaque octet lu repousse le chien de garde
         c=_rd(65536-len(first))
@@ -2810,26 +2885,44 @@ def _borg_stream(request,cmd,env,what,decoy=None,path=None,missing=None):
             if missing is not None and any('never matched' in l for l in lines()): stop(); raise HTTPException(404,detail=missing)
             if missing is None: stop(); raise HTTPException(502,detail=f"{what} a échoué : aucune sortie ({cause()})")
     async def body():
+        st['ended']=False   # démarré : sa fin (finally) appelle end()
+        # 1.31.6 (story 60, mesuré : borg muet — gelé —, départ du client jamais traité en 90 s sous 3.14) : lectures par
+        # run_in_executor, annulables ; run_in_threadpool (anyio.to_thread) attend la fin du fil même annulé — le départ du
+        # client n'était traité qu'à la prochaine sortie de borg. Fil abandonné : rend la main à la fin de borg (EOF). Exécuteur
+        # dédié (revue : celui d'asyncio, min(32, CPU+4) fils partagés, réduisait les lectures simultanées — avant : 40, anyio).
+        loop=asyncio.get_running_loop(); pool=_borg_read_pool()
         done=False
         try:
             if first: yield first
             while True:
-                chunk=await run_in_threadpool(_rd)
+                chunk=await loop.run_in_executor(pool,_rd)
                 if not chunk: break
                 yield chunk
-            await run_in_threadpool(proc.wait)
+            await loop.run_in_executor(pool,proc.wait)
             done=True
             if proc.returncode not in (0,1):
                 if st['why']!='idle':   # chien de garde : sa ligne [ERREUR] est déjà au journal
                     print(f"[ERREUR] {what} a échoué en cours d'envoi : {cause()} — téléchargement interrompu (flux coupé)",file=sys.stderr,flush=True)
                 request.state.stream_aborted=True
             elif proc.returncode==1: print(f"[WARN] {what} (téléchargement) : {cause()}",file=sys.stderr,flush=True)
-        finally:
-            if not done and proc.poll() is None:
-                print(f"[WARN] {what} : téléchargement abandonné par le client — borg arrêté",file=sys.stderr,flush=True)
-                st['why']=st['why'] or 'client'   # _MEI* du borg tué retirés (_borg_reap)
-            stop()
-    return body()
+        finally: end(done)
+    def end(done):
+        st['ended']=True
+        if not done and proc.poll() is None:
+            print(f"[WARN] {what} : téléchargement abandonné par le client — borg arrêté",file=sys.stderr,flush=True)
+            st['why']=st['why'] or 'client'   # _MEI* du borg tué retirés (_borg_reap)
+        stop()
+    gen=body()
+    class _Body:
+        # 1.31.6 (revue story 60, mesuré) : aclose() d'un générateur jamais démarré n'exécute pas son finally — client parti avant
+        # le premier envoi du corps (3.10) : borg et le verrou du dépôt gardés jusqu'au chien de garde. Fermeture d'un corps jamais
+        # itéré : même fin qu'un abandon.
+        def __aiter__(self): return self
+        async def __anext__(self): return await gen.__anext__()
+        async def aclose(self):
+            await gen.aclose()
+            if not st.get('ended'): end(False)
+    return _Body()
 
 # ── Story 2.1 : réponses synthétiques "introuvable" (hors périmètre) ───────────────────────────
 # Chacune des quatre fonctions ci-dessous imite, EXACTEMENT, la forme que sa route produit
@@ -2884,7 +2977,7 @@ def download_file(nick: str, path: str, request: Request, bid: Optional[str]=Non
     # 1.30.2 (A83) : code de borg lu — introuvable (ou hors périmètre, leurre) 404, échec 502, échec en cours : flux coupé
     body=_borg_stream(request,[borg_exe,'extract','--stdout',f"{cfg['BORG_REPO']}::{archive}",target],env,'borg extract',
                       decoy=None if target==path else target,path=path,missing=f"{path} introuvable dans l'archive {archive}")
-    return StreamingResponse(body,media_type='application/octet-stream',
+    return _ClosingStreamingResponse(body,media_type='application/octet-stream',
         headers={'Content-Disposition':f'attachment; filename="{_safe_filename(path)}"'})
 
 @router.get("/download/tar",tags=["téléchargement"],summary="Télécharge un .tar d'une arborescence depuis une archive (borg export-tar)")
@@ -2905,7 +2998,7 @@ def download_tar(nick: str, request: Request, prefix: Optional[str]=None, bid: O
     if target: cmd.append(target)
     # 1.30.2 (A83) : code de borg lu — échec avant le 1er octet 502, en cours : flux coupé ; préfixe absent : tar vide (inchangé)
     body=_borg_stream(request,cmd,env,'borg export-tar',decoy=None if target==prefix else target,path=prefix)
-    return StreamingResponse(body,media_type='application/x-tar',
+    return _ClosingStreamingResponse(body,media_type='application/x-tar',
         headers={'Content-Disposition':f'attachment; filename="{_download_tar_filename(nick,prefix)}"'})
 
 # ── Interface web ────────────────────────────────────────────────────────────
@@ -5084,7 +5177,12 @@ def push_selftest():
                     res['avertissement après sortie']=(o[0]==b'x'*200000 and o[3] is False and '[WARN] borg extract (téléchargement) : Warning: w' in o[4])
                     o=run(W+big+"time.sleep(60); sys.stdout.write('y')",stop_after=1)
                     pr=o[5][0] if o[5] else None
-                    res['client parti : borg tué']=(pr is not None and pr.returncode==-9 and 'abandonné par le client' in o[4],pr.returncode if pr else None)
+                    rc=pr.wait(10) if pr is not None else None   # 1.31.6 : récolte dans un fil (stop() ne bloque plus la boucle)
+                    res['client parti : borg arrêté par SIGTERM (1.31.6, décision de l\'utilisateur)']=(rc==-15 and 'abandonné par le client' in o[4],rc)
+                    with mock.patch(f"{__name__}._KILL_GRACE",1.0):
+                        t0=time.monotonic(); o=run(W+"signal.signal(signal.SIGTERM,signal.SIG_IGN); "+big+"time.sleep(60)",stop_after=1)
+                        pr=o[5][0] if o[5] else None; rc=pr.wait(10) if pr is not None else None; dt=time.monotonic()-t0
+                    res['client parti, borg sourd à SIGTERM : SIGKILL au délai (1 s)']=(rc==-9 and 0.8<dt<6 and 'abandonné par le client' in o[4],rc,round(dt,1))
                     bad={k:v for k,v in res.items() if not (v if isinstance(v,bool) else v[0])}
                     if bad: print(f"  {bad}")
                     return not bad
@@ -5142,6 +5240,93 @@ def push_selftest():
                     if not ok: print(f"  {out}")
                     return ok
                 check("/download/* : bout en bout par l'application — échec en cours d'envoi = pas de fin de transfert, succès = fin envoyée (A83)",_download_abort_e2e)
+                def _download_client_gone_e2e():
+                    """1.31.6 (story 60 ; mesuré sur serveur réel : borg arrêté 28 s, 58 s après l'abandon, ou jamais avant l'arrêt du
+                    serveur — le corps, annulé pendant un envoi dans la tâche interne du middleware, attendait le ramasse-miettes) : bout
+                    en bout par la VRAIE application (middleware, route, _borg_stream). Corps RETENU pendant le cas (revue : sinon libéré
+                    par comptage de références et fermé aussitôt — le contrôle passait sur le code d'avant ; sur le serveur, retenu
+                    28-58 s) et ramasse-miettes coupé : seule une fermeture explicite arrête borg. Borg factice qui écrit sans fin et,
+                    comme borg, traite SIGTERM en Python (sortie 143) — bloqué en écriture sur un tube plein, il ne le traite qu'une fois
+                    sa sortie vidée (mesuré : sinon SIGKILL au délai, mis ici à 10 s). Envois après le départ ignorés, comme uvicorn 0.15
+                    et 0.54 (revue : un envoi bloqué sans fin n'existe pas). (a) envoi bloqué (socket pleine) puis http.disconnect ; (f) comme (a) par /download/file ; (b) ASGI 2.4 : l'envoi lève OSError après le départ du client ;
+                    (c) borg qui se tait après 600 Ko (lecture en cours dans un fil ; mesuré : sous 3.14, départ jamais traité tant que
+                    borg n'écrivait pas) ; (p) client parti avant le premier envoi du corps. Chaque cas : application finie avant 10 s
+                    (revue : un dépassement avalé, puis borg sorti de lui-même, passait), borg mort moins de 2 s après le départ du
+                    client, DANS la boucle (sa fermeture ferme tous les générateurs), registre vidé."""
+                    import gc
+                    fb=os.path.join(tmpdir,'fb-dl60.py'); pidf=os.path.join(tmpdir,'fb-dl60.pid')
+                    with open(fb+'.tmp','w') as f:
+                        f.write(f"#!{sys.executable}\nimport os,sys\nopen({pidf!r},'w').write(str(os.getpid()))\n"
+                                "import signal\nsignal.signal(signal.SIGTERM,lambda *a: sys.exit(143))\n"
+                                "while True:\n    sys.stdout.buffer.write(b'x'*65536); sys.stdout.flush()\n")
+                    os.chmod(fb+'.tmp',0o700); os.replace(fb+'.tmp',fb)
+                    fbc=os.path.join(tmpdir,'fb-dl60c.py')
+                    with open(fbc+'.tmp','w') as f:
+                        f.write(f"#!{sys.executable}\nimport os,sys,signal,time\nopen({pidf!r},'w').write(str(os.getpid()))\n"
+                                "signal.signal(signal.SIGTERM,lambda *a: sys.exit(143))\n"
+                                "sys.stdout.buffer.write(b'x'*600000); sys.stdout.flush(); time.sleep(20)\n")
+                    os.chmod(fbc+'.tmp',0o700); os.replace(fbc+'.tmp',fbc)
+                    def alive(pid): return os.path.exists(f'/proc/{pid}') and open(f'/proc/{pid}/stat').read().split(')')[-1].split()[0]!='Z'
+                    held=[]; real_stream=_borg_stream
+                    def holding(*a,**k):
+                        b=real_stream(*a,**k); held.append(b); return b
+                    async def call(mode):
+                        sent=[0]; gone=asyncio.Event(); first=[True]; tg=[None]
+                        def leave():
+                            if not gone.is_set(): gone.set(); tg[0]=time.monotonic()
+                        if mode=='p': leave()
+                        async def receive():
+                            if first[0]:
+                                first[0]=False; return {'type':'http.request','body':b'','more_body':False}
+                            await gone.wait(); return {'type':'http.disconnect'}
+                        async def send(m):
+                            if m['type']!='http.response.body': return
+                            if gone.is_set():
+                                if mode=='b': raise OSError('client parti')
+                                return   # uvicorn 0.15 et 0.54 : envoi après la perte de connexion ignoré
+                            sent[0]+=len(m.get('body',b''))
+                            if mode=='c':   # tout envoyé, borg muet : départ quand la lecture suivante attend dans son fil (revue : M11)
+                                if sent[0]>=600000: asyncio.get_running_loop().call_later(0.1,leave)
+                                return
+                            if sent[0]>=512*1024:
+                                if mode in ('a','f'):   # socket pleine : le corps produit le bloc suivant puis attend l'envoi, suspendu au yield
+                                    await asyncio.sleep(0.1); leave(); await asyncio.sleep(0.1)   # puis perte de connexion (uvicorn : resume_writing)
+                                else: leave()
+                        asgi={'version':'3.0','spec_version':'2.4'} if mode=='b' else {'version':'3.0'}
+                        route,qs=('/download/file',b'nick=zz&bid=a1&path=x') if mode=='f' else ('/download/tar',b'nick=zz&bid=a1')
+                        scope={'type':'http','asgi':asgi,'http_version':'1.1','method':'GET','scheme':'http','path':f"{API_PREFIX}{route}",
+                               'raw_path':f"{API_PREFIX}{route}".encode(),'query_string':qs,'root_path':'',
+                               'headers':[(b'host',b'test'),(b'x-api-key',API_KEY.encode())],'client':('127.0.0.1',1),'server':('test',80)}
+                        timed_out=False
+                        try: await asyncio.wait_for(app(scope,receive,send),15)
+                        except asyncio.TimeoutError: timed_out=True
+                        except Exception: pass
+                        t_app=time.monotonic()-(tg[0] or time.monotonic())
+                        pid=int(open(pidf).read()); t0=time.monotonic()
+                        while alive(pid) and time.monotonic()-t0<5: await asyncio.sleep(0.05)
+                        dead=not alive(pid); t_dead=time.monotonic()-(tg[0] or t0)
+                        return (tg[0] is not None and (mode=='p' or sent[0]>=512*1024),not timed_out and t_app<10,dead,round(t_dead,1))
+                    out={}; gc_on=gc.isenabled(); gc.disable()
+                    try:
+                        for mode in ('a','f','b','c','p'):
+                            try: os.unlink(pidf)
+                            except FileNotFoundError: pass
+                            exe=fbc if mode=='c' else fb
+                            with mock.patch(f"{__name__}._borg_cfg",lambda n,p: {'BORG_REPO':'/r','BORG_EXE':exe}), \
+                                 mock.patch(f"{__name__}.require_path_in_scope",lambda *a: True), \
+                                 mock.patch(f"{__name__}.require_downloads_allowed",lambda: None), contextlib.redirect_stderr(io.StringIO()), \
+                                 mock.patch(f"{__name__}._KILL_GRACE",10.0), mock.patch(f"{__name__}._borg_stream",holding):
+                                r=asyncio.run(call(mode))
+                            held.clear()
+                            t0=time.monotonic()   # récolte et retrait du registre dans un fil (stop() ne bloque pas la boucle)
+                            while _LIVE_BORG and time.monotonic()-t0<5: time.sleep(0.05)
+                            out[mode]=r+(not _LIVE_BORG,)
+                    finally:
+                        if gc_on: gc.enable()
+                    ok=all(v[0] and v[1] and v[2] and v[3]<2 and v[4] for v in out.values())
+                    if not ok: print(f"  {out}")
+                    return ok
+                check("/download/* : client parti (envoi bloqué puis déconnexion ; envoi qui lève ; borg muet ; avant le 1er envoi) -> borg arrêté sans attendre le ramasse-miettes (1.31.6)",_download_client_gone_e2e)
                 def _download_idle_watchdog():
                     """1.31.0 (story 41, A86, décisions de l'utilisateur ; mesuré : borg muet bloquait un fil sans fin, corps jamais lu =
                     borg orphelin, arrêt du serveur sans effet ; revue : vrai borg = chargeur PyInstaller + enfant, tuer le seul PID de
@@ -5182,6 +5367,16 @@ def push_selftest():
                         res['muet, enfant tué']=(st==502 and det=='borg extract a échoué : aucune activité depuis 1 s — borg arrêté' and dt<10
                                                  and child is not None and not alive(child) and e.getvalue().count('[ERREUR] borg extract : aucune activité depuis 1 s')==1
                                                  and wait_empty(),st,det,round(dt,1),child)
+                        # 1.31.6 (revue story 60, mesuré) : le vrai borg traite SIGTERM et sort en 143 — cause et [ERREUR] gardées
+                        got2={}; e=io.StringIO()
+                        def _muet143():
+                            try: _borg_stream(req(),[P,'-c',"import signal,sys,time\nsignal.signal(signal.SIGTERM,lambda *a: sys.exit(143))\ntime.sleep(60)"],
+                                              dict(os.environ),'borg extract')
+                            except HTTPException as x: got2['st'],got2['det']=x.status_code,x.detail
+                        with contextlib.redirect_stderr(e):
+                            th=threading.Thread(target=_muet143,daemon=True); th.start(); th.join(15)
+                        res['muet, sorti en 143 au SIGTERM (vrai borg)']=(got2.get('st')==502 and got2.get('det')=='borg extract a échoué : aucune activité depuis 1 s — borg arrêté'
+                                                 and e.getvalue().count('[ERREUR] borg extract : aucune activité depuis 1 s')==1 and wait_empty(),got2,e.getvalue()[-200:])
                         procs=[]
                         def popen(*a,**k): p_=orig(*a,**k); procs.append(p_); return p_
                         e=io.StringIO()
@@ -5191,7 +5386,7 @@ def push_selftest():
                             t0=time.monotonic()
                             while procs[0].poll() is None and time.monotonic()-t0<15: time.sleep(0.1)
                             emp=wait_empty()
-                        res['corps jamais lu']=(procs[0].returncode==-9 and emp and '[ERREUR] borg extract : aucune activité' in e.getvalue(),procs[0].returncode)
+                        res['corps jamais lu']=(procs[0].returncode==-15 and emp and '[ERREUR] borg extract : aucune activité' in e.getvalue(),procs[0].returncode)
                         body=None; procs.clear()
                         with contextlib.redirect_stderr(io.StringIO()), mock.patch.object(subprocess,'Popen',popen):
                             body=_borg_stream(req(),[P,'-c',"import sys; sys.stdout.write('petit')"],dict(os.environ),'borg extract')
@@ -5215,8 +5410,14 @@ def push_selftest():
                         import uvicorn as _uv
                         srv=_make_server(_uv.Config(app))
                         e=io.StringIO(); r1,r2=req(),req()
+                        # 1.31.6 (revue story 60) : borg factice qui traite SIGTERM comme le vrai (sortie 143) ; 100 Ko : jamais bloqué
+                        # en écriture (64 Kio lus, le reste tient dans le tube)
+                        REAL="import signal,sys,time\nsignal.signal(signal.SIGTERM,lambda *a: sys.exit(143))\nsys.stdout.write('x'*100000); sys.stdout.flush(); time.sleep(60)"
+                        DEAF="import signal,sys,time\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nsys.stdout.write('x'*100000); sys.stdout.flush(); time.sleep(60)"
+                        def newp(before):
+                            with _LIVE_BORG_LOCK: return [(p_,s_) for p_,s_ in _LIVE_BORG.items() if p_ not in before][0]
                         with contextlib.redirect_stderr(e):
-                            mk=lambda r: _borg_stream(r,[P,'-c',"import sys,time; sys.stdout.write('x'*200000); sys.stdout.flush(); time.sleep(60)"],dict(os.environ),'borg extract')
+                            mk=lambda r,c=REAL: _borg_stream(r,[P,'-c',c],dict(os.environ),'borg extract')
                             b_idle=mk(r1); b_live=mk(r2)
                             with _LIVE_BORG_LOCK: items=list(_LIVE_BORG.items())
                             (pi,si),(pl,sl)=items
@@ -5231,9 +5432,25 @@ def push_selftest():
                                 second=(srv.force_exit,)
                             finally: _STOPPING[0]=False
                             o1=asyncio.run(drain(b_idle)); o2=asyncio.run(drain(b_live))
-                        res['arrêt : inactifs au 1er signal, puis dès 1 s sans octet, tous au 2e']=(first==(True,True,True,False) and later[0] and 0.5<=later[1]<=5 and second==(True,)
+                        # 1.31.6 (revue story 60) : arrêt forcé (2e signal) et _kill_live_borg() (atexit, fin du lifespan) -> SIGKILL
+                        # immédiat d'un borg sourd à SIGTERM, actif (jamais le délai : le processus finit)
+                        forced=[]
+                        with contextlib.redirect_stderr(io.StringIO()), mock.patch(f"{__name__}._KILL_GRACE",10.0):
+                            for how in ('2e signal','atexit/lifespan'):
+                                with _LIVE_BORG_LOCK: before=set(_LIVE_BORG)
+                                bd=mk(req(),DEAF); pd,sd=newp(before); sd['last']=time.monotonic()+5
+                                t0=time.monotonic()
+                                try:
+                                    if how=='2e signal': srv.handle_exit(_sig.SIGTERM,None)
+                                    else: _kill_live_borg()
+                                    while pd.poll() is None and time.monotonic()-t0<5: time.sleep(0.02)
+                                finally: _STOPPING[0]=False
+                                forced.append((how,pd.returncode,round(time.monotonic()-t0,1)))
+                                asyncio.run(drain(bd))
+                        res['arrêt forcé et atexit : borg sourd à SIGTERM tué par SIGKILL aussitôt']=(all(rc==-9 and dt<1 for _h,rc,dt in forced) and wait_empty(),forced)
+                        res['arrêt : inactifs au 1er signal, puis dès 1 s sans octet, tous au 2e']=(first==(True,True,True,False) and pi.returncode==143 and later[0] and 0.5<=later[1]<=5 and second==(True,)
                             and getattr(r1.state,'stream_aborted',False) and getattr(r2.state,'stream_aborted',False)
-                            and e.getvalue().count("en cours d'envoi : arrêt du serveur borgHelperWWW — borg arrêté")==2 and wait_empty(),first,later,second,e.getvalue()[-200:])
+                            and e.getvalue().count("en cours d'envoi : arrêt du serveur borgHelperWWW — borg arrêté")==2 and wait_empty(),first,pi.returncode,later,second,e.getvalue()[-200:])
                     # 1.31.4 (revue story 57) : handle_exit appelé PENDANT que le fil tient les deux verrous (cas du vrai gestionnaire
                     # de signal d'uvicorn 0.54, exécuté sur le fil principal) — fini sans interblocage ; signaux capturés vidés (sinon
                     # uvicorn 0.54 les relance après serve() : mort par SIGTERM, atexit sauté)
@@ -5438,6 +5655,36 @@ def push_selftest():
                     if not ok: print(f"  {got}")
                     return ok
                 check("/download/* : borg tué par le chien de garde -> ses _MEI* relevés avant le kill et retirés, voisin intact (A91)",_killgrp_mei)
+                def _client_gone_mei():
+                    """1.31.6 (story 60 ; mesuré : témoin de la baseline, un _MEI* laissé dans /tmp par abandon tué par SIGKILL — stop()
+                    appelait _borg_killgrp sans état, rien relevé) : client parti, borg sourd à SIGTERM -> SIGKILL au délai (1 s) ; ses
+                    _MEI* relevés avant le signal et retirés, voisin intact, registre vidé ; fermeture du corps immédiate (attente et
+                    récolte dans un fil : jamais la boucle d'événements bloquée pendant le délai)."""
+                    import tempfile, shutil as _sh, types as _t
+                    base=tempfile.mkdtemp(prefix='mei60-',dir=tmpdir); d=os.path.join(base,'_MEIc60ab'); other=os.path.join(base,'_MEIautre')
+                    os.makedirs(d); os.makedirs(other)
+                    with open(os.path.join(d,'lib.so'),'wb') as f: f.write(b'\0'*8192)
+                    code=("import mmap,signal,sys,time\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+                          "f=open(sys.argv[1],'rb'); m=mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ); f.close()\n"
+                          "sys.stdout.buffer.write(b'x'*200000); sys.stdout.flush(); time.sleep(60)")
+                    async def go():
+                        body=_borg_stream(_t.SimpleNamespace(state=_t.SimpleNamespace()),[sys.executable,'-c',code,os.path.join(d,'lib.so')],
+                                          dict(os.environ),'borg export-tar')
+                        async for c in body: break
+                        t0=time.monotonic(); await body.aclose(); return time.monotonic()-t0
+                    try:
+                        with mock.patch(f"{__name__}._KILL_GRACE",1.0), contextlib.redirect_stderr(io.StringIO()):
+                            t_close=asyncio.run(go())
+                            t0=time.monotonic()
+                            while _LIVE_BORG and time.monotonic()-t0<10: time.sleep(0.05)
+                            dt=round(time.monotonic()-t0,1)
+                        got=(not _LIVE_BORG,os.path.exists(d),os.path.isdir(other),0.5<dt<6,t_close<0.5)
+                    finally:
+                        _sh.rmtree(base,ignore_errors=True)
+                    ok=got==(True,False,True,True,True)
+                    if not ok: print(f"  {got} {dt} fermeture {t_close:.2f} s")
+                    return ok
+                check("/download/* : client parti, borg sourd à SIGTERM -> SIGKILL au délai hors de la boucle, ses _MEI* relevés avant le signal et retirés, voisin intact (1.31.6)",_client_gone_mei)
                 def _http10_detect():
                     """1.31.0 (story 41, A85, décision de l'utilisateur) : requête HTTP/1.0 (appel ASGI direct, vraie application) ->
                     /version http_version « 1.0 » et une seule ligne [WARN] (deux requêtes) ; HTTP/1.1 -> « 1.1 », aucune ligne."""
