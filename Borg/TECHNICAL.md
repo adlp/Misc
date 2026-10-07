@@ -2415,6 +2415,35 @@ chargeur PyInstaller `borg.wrapped` -> enfant `borg.wrapped` qui tient le verrou
 borgHelper, parent 1, l'archive est écrite. Revues : versions par nom d'ancêtre et nom d'hôte, puis par absence de marqueur,
 abandonnées.
 
+**Fin d'un Bkp tué par le watcher (borgHelper 1.0.189 / borgHelperWWW 1.31.8, story 63)** : `_reconcile_killed_bkp(nick,
+report=None)` remplit `report` — `verified` (état de chaque ligne ouverte établi : base lue, et `borg list` réussi s'il y avait
+un candidat ; faux : dépôt absent, `borg list` en échec ou tué, base illisible) et `runs` {run_id: `fermé` | `absent` (seulement
+si `repo_orphan_checkable` : dépôt local) | `non vérifiable` (dépôt distant, aucune archive) | `vivant` (marqueur, `include_me`) |
+`orphelin` (`repo_orphan_create`, ou `run_create_alive` : `borg create` de ce run dans /proc — BORGHELPER_BKP_RUN — même avant le
+verrou) | `fin illisible` | `erreur de base` (exception) | `non fermé` (fermeture refusée ou déjà faite) | `non vérifié` (candidat,
+`borg list` impossible)}, et `error` (« base illisible (…) ») si la lecture de la base lève ; libellés = constantes `RK_*` (les
+neuf importées par borgHelperWWW) ; valeur rendue inchangée (Index, `backup()`). `run_create_alive` (scan de /proc : argv `create`,
+environ `BORGHELPER_BKP_RUN` ; environ illisible — autre uid — ignoré) n'est appelé que s'il reste une ligne ouverte ni vivante ni
+orpheline du roster : coût d'un parcours de /proc pour l'Index et `backup()` qui ont une telle ligne, aucun sinon.
+Commande `BkpReconcile` (`bkp_reconcile`, optab `Ccdnj`, opération `read`) : `borg._stop` = `check_priority_lock(nick)` le temps
+du rapprochement (son `borg list` cède à Bkp/Restore/Prune) ; `-n` nettoyé (espaces, doublons) ; `error` dit en `[WARN]` ; code
+1 si un nick n'est pas vérifié, inconnu du rc, ou rc sans nick. Ligne `absent` laissée ouverte (décision de l'utilisateur, revue
+2) : une archive arrivée ensuite reste rapprochable.
+borgHelperWWW :
+`_reconcile_interrupted(nick)` appelé par `_bkp_status_watcher_pass` après le passage de fin — `_bkp_state` (gardé) dit
+`bkp_running` False et `bkp_interrupted.verifie` vrai -> run_id de `get_running_bkp_status`, rien si `bkp_status_notified`
+(notified_at posé : fin déjà notifiée, durable entre workers et redémarrages) ; `_RECONCILE` {(nick, run_id):
+{state, next}} sous `_RECONCILE_LOCK` (un fil `reconcile-<nick>` en vol par nick, une fois par run ; au-delà de 500 entrées,
+purge des `fait` et des échéances passées seulement) ; `_reconcile_run` :
+`_build_borghelper_argv_env('BkpReconcile', nick, ['-j'])` + `_run_group` (groupe tué au délai : TIMEOUT, 3600 s s'il est
+illimité) ; compte rendu vérifié : CHAQUE run `absent` -> `_reconcile_claim_error` (`claim_bkp_status` CAS puis
+`_send_bkp_push(nick,'end','error',{})` et `sentry_alert('bkp_error', …, « Sauvegarde interrompue — … »)` ; CAS rendu False :
+`bkp_status_notified` relu — vide = erreur SQLite avalée par `claim_bkp_status`, exception) ; réclamations isolées, celle du run
+de la décision en dernier et jamais après un échec (sa fin notifiée arrêterait la garde) ; `fermé` ou ligne plus ouverte : `fait`
+(la fin vient du passage suivant) ; `fin illisible`, `non vérifiable` : `fait`, dit au journal (fin au délai) ;
+`vivant`/`orphelin` : revu au passage suivant ; non vérifié, `erreur de base`, `non fermé`, réclamation en exception ou
+refusée, sortie non JSON : `_RECONCILE_RETRY` (600 s), journal avec le code et la dernière ligne `[WARN]`/`[ERREUR]`. État
+inconnu, Bkp vivant, distant (`verifie` faux) : rien (délai AD-7 inchangé).
 **Bkp tué dont le borg a fini (1.0.185, story 54)** : `backup()` insère `--comment "borgHelper run <run_id>"` juste après
 `create` (le run_id est tiré avant le marqueur ; `shlex.quote` avec `SSH_REMFO` : ssh joint ses arguments, le shell distant
 redécoupe). `BorgHelper._reconcile_killed_bkp(nick)` est appelé par `_index_pass` après la garde `repoLocalAbsent`, sous

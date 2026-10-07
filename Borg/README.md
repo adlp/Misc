@@ -539,7 +539,9 @@ de ce Bkp encore vivant sur un dépôt local) dont l'archive porte ce commentair
 l'archive : `<nick> : Bkp interrompu <8 premiers car. du run_id> rapproché — archive <nom> écrite, ligne fermée en succès`. Le Bkp
 suivant ne voit donc plus « Bkp précédent en erreur ». Si ce rapprochement passe avant `BKP_STATUS_TIMEOUT`, la notification de
 fin dit « succès » (sans compteurs d'avertissements) ; sinon l'échec (et l'alerte Sentry) déjà notifié reste, et l'historique dit
-succès. Seules les lignes encore ouvertes (aucun Bkp réussi depuis) sont examinées : un `borg list` en plus (qui lit chaque
+succès. Depuis borgHelperWWW 1.31.8, le watcher le lance lui-même dès qu'un Bkp tué est interrompu (voir
+[`BkpReconcile`](#bkpreconcile) et les notifications de fin) : il n'attend plus un Index. Seules les lignes encore ouvertes
+(aucun Bkp réussi depuis) sont examinées : un `borg list` en plus (qui lit chaque
 archive) tant qu'il y en a une — au début du Bkp suivant et dans son Index de fin au plus —, aucun sinon ; s'il échoue :
 `[WARN] … rapprochement impossible … — réessayé au prochain Index` (tant qu'aucun Bkp ne réussit d'ici là ; aussi tant que le
 borg d'un Bkp tué tient le dépôt). Archives d'avant 1.0.185 : pas de commentaire, pas de rapprochement. 1.0.187 : l'archive
@@ -1216,6 +1218,29 @@ rétention d'archives courte) — jamais restaurable. Pour une archive présente
 comportement que `IdxTop -j`).
 
 ---
+
+### `BkpReconcile`
+Rapproche les Bkp tués (1.0.189) : même règle que l'Index (ligne `bkp_status` ouverte, aucun Bkp vivant ni `borg create`
+orphelin de ce run, archive « `borgHelper run <run_id>` » -> ligne fermée en succès), sans lancer d'Index — un `borg list` par nick
+qui a un candidat, aucun sinon ; ce `borg list` cède à une opération prioritaire du nick qui démarre (Bkp, Restore, Prune — comme
+l'Index : nick alors non vérifié). Sans `-n` : nick = nom de la machine (comme les autres commandes) ; `-n a,b` (espaces et
+doublons ignorés). Lancée par le watcher de borgHelperWWW (fin d'un Bkp tué) ; utilisable à la main ; pas d'endpoint HTTP.
+
+```bash
+borgHelper -c BkpReconcile -n mon-serveur        # texte : une ligne par ligne ouverte (fermé, absent, vivant, orphelin…)
+borgHelper -c BkpReconcile -n ALL -j             # [{nick, verified, runs: {run_id: état}}]
+```
+
+États : `fermé` (archive du run écrite, ligne fermée en succès), `absent` (vérifié : aucune archive de ce run), `vivant` (Bkp
+vivant), `orphelin` (son `borg create` vit encore — dépôt local, ou lancé avant d'avoir pris le verrou), `fin illisible`, `erreur
+de base`, `non fermé` (fermeture refusée, ou déjà faite par un autre rapprochement), `non vérifié` (`borg list` en échec ou arrêté,
+dépôt local absent), `non vérifiable` (dépôt distant : un `borg create` encore vivant n'y est pas visible — jamais dit `absent`).
+Texte : une ligne « `<nick> : Bkp <8 premiers caractères du run> — <état>` » par ligne `bkp_status` ouverte (Bkp interrompu ou
+vivant ; « `aucun Bkp interrompu` » sinon), plus « `vérification impossible … — réessayer` » si le nick n'est pas vérifié. Code 0 :
+chaque nick vérifié ; 1 : vérification impossible (`borg list` en échec ou arrêté, dépôt local absent — `[WARN]` de borg dit ;
+base illisible — `[WARN] <nick> : base illisible (…)`), nick inconnu du rc, rc sans nick. Une ligne `absent` reste ouverte
+(décision de l'utilisateur) : seul le watcher notifie l'échec ; Status et `/access` la disent interrompue jusqu'au délai
+`BKP_STATUS_TIMEOUT`, et une archive de ce run arrivée ensuite (un `borg create` passé inaperçu) est encore rapprochée en succès.
 
 ### `Status`
 État rapide (dernier backup connu, Bkp en cours, opération prioritaire en cours) par nick — **100%
@@ -2186,7 +2211,8 @@ clair sur le réseau sinon.
 
 ### Endpoints
 
-Un endpoint par commande CLI, sauf `BorgCleanup` (suppression en ligne de commande seulement) (voir [Commandes](#commandes) ci-dessus pour le détail de chaque
+Un endpoint par commande CLI, sauf `BorgCleanup` (suppression en ligne de commande seulement) et `BkpReconcile` (lancée par le
+watcher lui-même, fin d'un Bkp tué) (voir [Commandes](#commandes) ci-dessus pour le détail de chaque
 comportement) — `GET` pour les commandes en lecture, `POST`/`DELETE` pour celles qui modifient un état.
 Toutes les routes du tableau ci-dessous sont montées sous `api_prefix` (`/api` par défaut — voir
 [Configuration](#configuration)) : `GET /lstbkp` du tableau signifie concrètement
@@ -2455,11 +2481,25 @@ groupes](#autorisation-par-groupes-reverse-proxy-oidcauth_request) ci-dessus).
 
 ### Notifications push
 
+**Bkp tué (borgHelperWWW 1.31.8, borgHelper 1.0.189)** : dès qu'un Bkp est interrompu (borgHelper arrêté, rien de vivant —
+`/access` `bkp_interrupted` ; dépôt local), le watcher lance `borgHelper -c BkpReconcile` (dans un fil, un seul
+par nick : jamais un passage bloqué par borg ; une fois par Bkp tué et par processus serveur — chaque worker uvicorn, chaque
+redémarrage refait son `borg list` —, jamais après la fin notifiée). Archive de ce run écrite : ligne fermée, fin **succès** au
+passage suivant ; aucune archive de ce run (vérifié) : fin **échec** aussitôt et alerte Sentry « Sauvegarde interrompue — <nick>
+(borgHelper arrêté, aucune archive de ce Bkp) » — pour chaque Bkp tué ainsi vérifié (plusieurs de suite : chacun) ; la ligne
+reste ouverte (`/access` : interrompu jusqu'au délai). Vérification impossible (borg list en échec, opération prioritaire, dépôt
+absent), fermeture ou réclamation refusée par la base : nouvel essai 10 min après ; Bkp redevenu vivant : revu au passage
+suivant ; fin d'archive illisible : dit au journal, fin au délai. Dépôt distant (un `borg create` encore vivant n'y est pas
+vérifiable), état illisible : comme avant, fin au délai `BKP_STATUS_TIMEOUT` (échec + « Sauvegarde bloquée ou interrompue »).
+Mesuré (délai ramené à 90 s, watcher toutes les 5 s) : borgHelper et borg tués -> échec en 2 à 5 s (avant : au délai) ;
+archive écrite -> succès à 10 s (avant : échec au délai, jamais corrigé).
+
 **Depuis l'UI (Story 2c, `spec-push-ui-prefs-json`)** : bouton **🔔 Notifications** dans l'en-tête
 (affiché une fois connecté, si `GET /version` indique `push_available: true` — `pywebpush`/`py_vapid`
 disponibles et Service Worker déployé). La vue permet de s'abonner (le navigateur demande la
 permission), de régler **host par host** trois types de notification — **début** de sauvegarde,
-**succès**, **échec** (Bkp en erreur, ou bloqué au-delà du délai du nick, `BKP_STATUS_TIMEOUT`) — avec
+**succès**, **échec** (Bkp en erreur, ou bloqué au-delà du délai du nick, `BKP_STATUS_TIMEOUT` ; 1.31.8 : Bkp tué — voir
+ci-dessous) — avec
 une ligne « Tous » pour cocher une colonne entière (défaut d'un nouvel abonnement : succès + échec),
 de choisir la durée (défaut serveur, 7/30/90/365 jours, ou « à vie »), d'**envoyer un test**, de
 modifier ses réglages et de se désabonner (borgHelperWWW ≥ 1.21.0 / UI ≥ 1.12.0). Réglages

@@ -422,6 +422,18 @@ state = bh.db.bkp_running_state('mon-serveur', timeout_s=bh.bkp_status_timeout('
 # bkp_unknown : marqueurs illisibles (rien dit du Bkp vivant ni interrompu). Un PID zombie compte mort.
 etat = bh.bkp_state('mon-serveur')   # {bkp_running, bkp_interrupted, bkp_stale, bkp_unknown}
 
+# 1.0.189 (story 63) : rapprochement des Bkp tués (commande BkpReconcile ; même règle que l'Index, un borg list par nick à
+# candidat). Rend 0 si chaque nick est vérifié, 1 sinon ; as_json=True : imprime [{nick, verified, runs: {run_id: état}}].
+# Compte rendu brut : rep={} ; bh._reconcile_killed_bkp('mon-serveur', report=rep) -> rep['verified'], rep['runs']
+# (états RK_CLOSED 'fermé' | RK_ABSENT 'absent' | RK_ALIVE 'vivant' | RK_ORPHAN 'orphelin' | RK_BADEND 'fin illisible' |
+# RK_DBERR 'erreur de base' | RK_NOTCLOSED 'non fermé' | RK_UNVERIFIED 'non vérifié' | RK_UNCHECKABLE 'non vérifiable' — constantes
+# du module), rep['error'] si la base est illisible (dit en [WARN] par bkp_reconcile). Nick inconnu du rc ou rc sans nick : 1 ;
+# nick None ou 'ALL' : tous les nicks du rc (en CLI sans -n : nom de la machine) ; 'a, b' : espaces et doublons ignorés. Le borg
+# list cède à une opération prioritaire du nick (non vérifié). Une ligne 'absent' reste ouverte (seul le watcher notifie l'échec).
+# Base : bh.db.run_create_alive({run_id, …}) -> run_id d'un borg create vivant lancé par backup() (/proc, même avant le verrou) ;
+# bh.db.bkp_status_notified(nick, run_id) -> fin déjà notifiée (notified_at posé ; base illisible : exception).
+code = bh.bkp_reconcile('mon-serveur', as_json=False)
+
 # Délai du nick (1.0.155) : clé rc BKP_STATUS_TIMEOUT (section ou [DEFAULT] ; secondes ou suffixe s/m/h), sinon
 # BORGHELPERWWW_BKP_STATUS_TIMEOUT, sinon 21600 ; valeur invalide : 21600 ; [WARN] si invalide ou < 300 s ; jamais
 # d'exception (nick absent, rc illisible).

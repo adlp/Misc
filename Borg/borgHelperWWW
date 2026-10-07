@@ -70,12 +70,14 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
                          _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES, _enc_header_read, sentry_alert, _bkp_status_timeout,
                          _sentry_alert_kinds, db_plain_anomalies, _cfg_bool, convert_octets_readable,
                          op_allowed, allowed_ops, is_external, _rb_errmsg, _valid_nick_name, _mei_mapped, _purge_mei_dirs,
-                         _group_pids, _group_alive, _group_wait)   # 1.31.2 : communs à borgHelper (zombies exclus, /proc illisible)
+                         _group_pids, _group_alive, _group_wait,   # 1.31.2 : communs à borgHelper (zombies exclus, /proc illisible)
+                         RK_CLOSED, RK_ABSENT, RK_ALIVE, RK_ORPHAN, RK_BADEND, RK_NOTCLOSED,   # 1.31.8 : états de BkpReconcile
+                         RK_DBERR, RK_UNVERIFIED, RK_UNCHECKABLE)
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.31.7"
+WWW_VERSION="1.31.8"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -478,6 +480,7 @@ def _bkp_status_watcher_pass():
                     sentry_alert('bkp_error',nick,f"Sauvegarde bloquée ou interrompue — {nick} "
                                  f"(sans fin après {timeout_s} s)",_bh_paths.borg.cfgread(nick),
                                  extra={'run_id':row['run_id'],'timeout_s':timeout_s},release=f"borgHelperWWW@{WWW_VERSION}")
+            _reconcile_interrupted(nick)   # 1.31.8 (story 63) : Bkp tué -> rapprochement en fil, fin notifiée aussitôt
             for row in _bh_paths.db.list_pending_bkp_status_start(nick,hist):
                 if not _bh_paths.db.claim_bkp_status_start(nick,row['run_id'],hist):
                     continue  # déjà réclamée par un autre worker (CAS perdu) — jamais de double traitement
@@ -493,6 +496,98 @@ def _bkp_status_watcher_pass():
             print(f"[watcher] nick={nick} erreur : {'sortie borgHelper (voir message ci-dessus)' if isinstance(e,SystemExit) else e}",
                   file=sys.stderr,flush=True)
             continue
+
+_RECONCILE={}   # (nick, run_id) -> {'state': 'en_cours' | 'fait' | 'à refaire', 'next': monotonic} — par processus
+_RECONCILE_LOCK=threading.Lock()
+_RECONCILE_RETRY=600   # s : nouvel essai après une vérification impossible (borg list en échec, dépôt absent)
+
+def _reconcile_interrupted(nick):
+    """1.31.8 (story 63, A118, décisions de l'utilisateur) : Bkp TUÉ (état de /access : interrompu, rien de vivant, orphelin
+    vérifiable — dépôt local) -> `borgHelper -c BkpReconcile -n <nick> -j` dans un fil (un seul en vol par nick, jamais le
+    passage bloqué par borg), une fois par Bkp tué (nouvel essai au plus tôt _RECONCILE_RETRY s après une vérification
+    impossible). Archive de ce run écrite : ligne fermée en succès, fin notifiée par le passage de FIN suivant. Rapprochement
+    vérifié sans archive de ce run : fin « échec » réclamée ici (CAS, une seule notification entre workers) + Sentry
+    « Sauvegarde interrompue ». État inconnu, dépôt distant (orphelin non vérifiable), Bkp vivant : rien — délai inchangé (AD-7).
+    Coût par passage : _bkp_state (gardé : base et marqueurs) ; un borg list par Bkp tué ET par processus serveur (revue : chaque
+    worker, chaque redémarrage refait le sien) — jamais après la fin notifiée de ce run (notified_at, durable)."""
+    st=_bkp_state(nick); bi=st.get('bkp_interrupted')
+    if st.get('bkp_running') is not False or not bi or not bi.get('verifie'): return
+    try:
+        row=_bh_paths.db.get_running_bkp_status(nick)
+        run_id=(row or {}).get('run_id')
+        if not run_id or _bh_paths.db.bkp_status_notified(nick,run_id): return   # revue : fin déjà notifiée (autre worker, avant redémarrage)
+    except (Exception,SystemExit): return
+    now=time.monotonic(); key=(nick,run_id)
+    with _RECONCILE_LOCK:
+        e=_RECONCILE.get(key)
+        if e and (e['state'] in ('en_cours','fait') or now<e['next']): return
+        if any(k[0]==nick and v['state']=='en_cours' for k,v in _RECONCILE.items()): return   # un seul fil par nick
+        if len(_RECONCILE)>500:   # revue 2 : jamais une échéance de nouvel essai perdue (borg list relancé aussitôt)
+            [_RECONCILE.pop(k) for k,v in list(_RECONCILE.items()) if v['state']=='fait' or (v['state']=='à refaire' and now>=v['next'])]
+        _RECONCILE[key]={'state':'en_cours','next':0.0}
+    try: threading.Thread(target=_reconcile_run,args=(nick,run_id),daemon=True,name=f"reconcile-{nick}").start()
+    except Exception:
+        with _RECONCILE_LOCK: _RECONCILE[key]={'state':'à refaire','next':now+_RECONCILE_RETRY}
+
+def _reconcile_claim_error(nick,run_id):
+    """Fin « échec » d'un run dont le rapprochement a VÉRIFIÉ l'absence d'archive : réclamation CAS (une seule notification entre
+    workers), push « échec », Sentry « Sauvegarde interrompue ». Exception : propagée (l'appelant réessaie). Revue 2 : claim_bkp_status
+    rend False aussi sur une erreur SQLite (avalée, dite) — notified_at relu : toujours vide = réclamation refusée par la base,
+    exception (nouvel essai), jamais confondue avec un CAS perdu (autre worker : notified_at posé)."""
+    hist=_bh_paths.db.get_history_db(nick)
+    if not _bh_paths.db.claim_bkp_status(nick,run_id,hist):
+        if not _bh_paths.db.bkp_status_notified(nick,run_id,hist):
+            raise RuntimeError(f"réclamation de la fin refusée par la base (run {run_id[:8]})")
+    else:
+        print(f"[watcher] bkp_status (fin) réclamé : nick={nick} run_id={run_id} result=error (Bkp interrompu, aucune archive de ce run)",
+              file=sys.stderr,flush=True)
+        _send_bkp_push(nick,'end','error',{})
+        sentry_alert('bkp_error',nick,f"Sauvegarde interrompue — {nick} (borgHelper arrêté, aucune archive de ce Bkp)",
+                     _bh_paths.borg.cfgread(nick),extra={'run_id':run_id},release=f"borgHelperWWW@{WWW_VERSION}")
+
+def _reconcile_run(nick,run_id):
+    """Fil de _reconcile_interrupted : BkpReconcile (délai TIMEOUT, 3600 s s'il est illimité : jamais un fil en vol à vie), puis
+    fin « échec » de CHAQUE run du compte rendu vérifié sans archive (revue : plusieurs Bkp tués de suite ; revue 2 : chacune isolée,
+    celle du run de la décision en dernier). États figés (fin illisible, non vérifiable — dépôt devenu distant) : fait, dit au
+    journal — la fin viendra du délai ; vivant/orphelin : revu au passage suivant ; non vérifié, erreur de base, non fermé (revue
+    2 : écriture refusée — une ligne fermée ailleurs n'est plus relancée, la garde ne la voit plus), réclamation impossible ou
+    refusée : nouvel essai après _RECONCILE_RETRY. Journal : code et dernière ligne [WARN]/[ERREUR] de borgHelper quand rien
+    n'est vérifié."""
+    state,nxt='à refaire',_RECONCILE_RETRY
+    try:
+        argv,env=_build_borghelper_argv_env('BkpReconcile',nick,['-j'])
+        proc=_run_group(argv,TIMEOUT or 3600,env)
+        try: data=json.loads(proc.stdout or '[]')
+        except ValueError: data=[]
+        o=next((x for x in data if isinstance(x,dict) and x.get('nick')==nick),None)
+        ok=bool(o and o.get('verified')); runs=(o or {}).get('runs') or {}
+        rs=runs.get(run_id) if ok else None
+        if ok:
+            # revue 2 : chaque réclamation isolée ; le run de la décision réclamé EN DERNIER, jamais après un échec — sa fin notifiée
+            # arrête la garde de _reconcile_interrupted, qui ne relancerait plus les autres runs restés sans fin
+            errs=[]
+            for r in sorted((r for r,v in runs.items() if v==RK_ABSENT),key=lambda r: r==run_id):
+                if errs and r==run_id: break
+                try: _reconcile_claim_error(nick,r)
+                except Exception as e: errs.append(f"{r[:8]} : {e}")
+            if errs: raise RuntimeError('; '.join(errs))
+            if rs in (RK_CLOSED,RK_ABSENT,None): state='fait'   # None : ligne plus ouverte (fermée ailleurs)
+            elif rs in (RK_BADEND,RK_UNCHECKABLE):   # figés : la fin viendra du délai (AD-7) — dit au journal
+                state='fait'
+                print(f"[watcher] nick={nick} Bkp interrompu {run_id[:8]} : {rs} — fin au délai BKP_STATUS_TIMEOUT",file=sys.stderr,flush=True)
+            elif rs in (RK_ALIVE,RK_ORPHAN): nxt=0   # état changé depuis la décision : revu au passage suivant
+        if state!='fait':
+            why=rs or 'vérification impossible'
+            if not ok:
+                tail=[l for l in (proc.stderr or '').splitlines() if '[WARN]' in l or '[ERREUR]' in l]
+                why+=f" (code {proc.returncode}"+(f" : {tail[-1][:160]}" if tail else '')+")"
+            print(f"[watcher] nick={nick} rapprochement du Bkp interrompu {run_id[:8]} : {why} — réessayé"
+                  +(f" dans {nxt} s" if nxt else ' au passage suivant'),file=sys.stderr,flush=True)
+    except (Exception,SystemExit) as e:
+        state,nxt='à refaire',_RECONCILE_RETRY
+        print(f"[watcher] nick={nick} rapprochement du Bkp interrompu {run_id[:8]} impossible : {e}",file=sys.stderr,flush=True)
+    finally:
+        with _RECONCILE_LOCK: _RECONCILE[(nick,run_id)]={'state':state,'next':time.monotonic()+nxt}
 
 def _max_age_bkp(cfg):
     """MAX_AGE_BKP du nick en heures (même clé et même défaut que Report : 25) — valeur illisible ou
@@ -4159,6 +4254,140 @@ def push_selftest():
                         and again==[] and len(reminder)==1 and reminder[0]['reminder'] is True
                         and fresh==[] and running==[] and len(after)==1)
             check("retard : alerte (type échec), pas de doublon, rappel, silence si nouvelle archive ou Bkp en cours",_overdue_flow)
+            def _reconcile_flow():
+                """1.31.8 (story 63, A118, décisions de l'utilisateur ; revue) : Bkp tué (interrompu, dépôt local) -> BkpReconcile dans
+                un fil, une fois par run et par processus, jamais après la fin notifiée ; chaque run vérifié sans archive -> fin
+                « échec » réclamée + Sentry « Sauvegarde interrompue » ; fermé, ligne fermée ailleurs -> rien ici (fait) ; fin
+                illisible, non vérifiable -> fait, dit au journal ; non vérifié, erreur de base, non fermé, réclamation impossible
+                (exception) ou refusée par la base (False, notified_at vide — le vrai claim_bkp_status avale l'erreur SQLite), sortie
+                non JSON -> nouvel essai après _RECONCILE_RETRY (journal : code et [WARN]) ; plusieurs runs, une réclamation en échec :
+                les autres réclamées, celui de la décision jamais (garde) ; vivant -> revu au passage suivant ; CAS perdu (notified_at
+                posé par l'autre) -> fait, rien envoyé ; état inconnu, Bkp vivant, distant non vérifiable, garde illisible : aucun
+                lancement ; un seul fil par nick (même run, autre run), passage jamais bloqué ; purge au-delà de 500 : échéances
+                gardées ; passage de fin du watcher : appelé. Comptes rendus construits avec les états de borgHelper (RK_*, les neuf) :
+                un libellé renommé y change aussi ce décor."""
+                import types as _t
+                R='ab'*16; R2='ef'*16; state={'running':False,'bi':{'started_at':'x','verifie':True}}; ex=[]; push=[]; sen=[]
+                claim={'ok':True,'n':0,'boom':False,'refuse':False,'fail':set(),'who':[]}; rid={'v':R}; notified=set()
+                gate=threading.Event(); gate.set(); reply={'out':'','err':'','code':0}
+                def fake_run(argv,timeout,env):
+                    ex.append((argv[argv.index('-c')+1],argv[argv.index('-n')+1],argv[argv.index('-n')+2:],timeout)); gate.wait(10)
+                    return _t.SimpleNamespace(stdout=reply['out'],stderr=reply['err'],returncode=reply['code'])
+                def fake_claim(n,r,h=None):
+                    claim['n']+=1; claim['who'].append(r)
+                    if claim['boom'] or r in claim['fail']: raise sqlite3.OperationalError('database is locked (contrôle)')
+                    if claim['refuse']: return False   # comme le vrai : erreur SQLite avalée, notified_at toujours vide
+                    if not claim['ok']: notified.add(r); return False   # CAS perdu : l'autre worker a posé notified_at
+                    notified.add(r); return True
+                def js(verified,runs): return json.dumps([{'nick':'nR','verified':verified,'runs':runs}])
+                def go(out,wait=True,err='',code=0):
+                    reply.update(out=out,err=err,code=code); t0=time.monotonic(); _reconcile_interrupted('nR'); dt=time.monotonic()-t0
+                    if wait:
+                        t1=time.monotonic()
+                        while any(v['state']=='en_cours' for k,v in _RECONCILE.items() if k[0]=='nR') and time.monotonic()-t1<10: time.sleep(0.02)
+                    return dt
+                def reset(): del ex[:],push[:],sen[:],claim['who'][:]; _RECONCILE.clear(); notified.clear(); claim.update(ok=True,boom=False,refuse=False,fail=set())
+                pats=[mock.patch(f"{__name__}._bkp_state",lambda n:{'bkp_running':state['running'],'bkp_detail':None,'bkp_interrupted':state['bi']}),
+                      mock.patch.object(_bh_paths.db,'get_running_bkp_status',lambda n,*a,**k:{'run_id':rid['v']}),
+                      mock.patch.object(_bh_paths.db,'bkp_status_notified',lambda n,r,*a,**k: r in notified),
+                      mock.patch.object(_bh_paths.db,'claim_bkp_status',fake_claim),
+                      mock.patch.object(_bh_paths.db,'get_history_db',lambda n:'/nonexistent'),
+                      mock.patch.object(_bh_paths.borg,'cfgread',lambda n:{}),
+                      mock.patch(f"{__name__}._run_group",fake_run),
+                      mock.patch(f"{__name__}._send_bkp_push",lambda *a,**k: push.append(a)),
+                      mock.patch(f"{__name__}.sentry_alert",lambda *a,**k: sen.append((a,k)))]
+                res={}
+                with contextlib.ExitStack() as es, contextlib.redirect_stderr(io.StringIO()) as err:
+                    for pt in pats: es.enter_context(pt)
+                    reset()
+                    go(js(True,{R:RK_ABSENT}))
+                    res['absent : fin échec + Sentry, une fois ; délai borné']=(len(ex)==1 and ex[0][:3]==('BkpReconcile','nR',['-j']) and ex[0][3]
+                        and push==[('nR','end','error',{})] and len(sen)==1
+                        and sen[0][0][:3]==('bkp_error','nR','Sauvegarde interrompue — nR (borgHelper arrêté, aucune archive de ce Bkp)'),ex,push,sen)
+                    notified.discard(R); go(js(True,{R:RK_ABSENT}))   # garde durable écartée : _RECONCILE seul
+                    res['même run : jamais relancé']=(len(ex)==1 and len(push)==1,ex,push)
+                    _RECONCILE[('nR',R)]['next']=0.0; go(js(True,{R:RK_ABSENT}))   # mutants (W17) : « fait » arrête seul, sans l'échéance
+                    res['même run fait : jamais relancé, échéance passée comprise']=(len(ex)==1 and len(push)==1,ex,push)
+                    reset(); go(js(True,{}))   # mutants (W14) : ligne fermée ailleurs entre la décision et borg list
+                    res['ligne plus ouverte (fermée ailleurs) : rien, fait']=(push==[] and _RECONCILE.get(('nR',R),{}).get('state')=='fait',dict(_RECONCILE))
+                    reset()
+                    with mock.patch(f"{__name__}.TIMEOUT",None): go(js(True,{R:RK_CLOSED}))
+                    res['TIMEOUT illimité : délai 3600 s (jamais un fil en vol à vie)']=(len(ex)==1 and ex[0][3]==3600,ex)
+                    reset(); notified.add(R); go(js(True,{R:RK_ABSENT})); notified.clear()
+                    res['fin déjà notifiée (autre worker, redémarrage) : aucun lancement']=(ex==[] and push==[],ex)
+                    reset()
+                    def nboom(*a,**k): raise sqlite3.OperationalError('disk I/O error (contrôle)')
+                    with mock.patch.object(_bh_paths.db,'bkp_status_notified',nboom): go(js(True,{R:RK_ABSENT}))
+                    res['garde illisible (base) : aucun lancement, rien envoyé']=(ex==[] and push==[],ex)
+                    reset(); go(js(True,{R:RK_ABSENT,R2:RK_ABSENT}))
+                    res['deux Bkp tués sans archive : chacun réclamé et notifié']=(sorted(p[0] for p in push)==['nR','nR'] and claim['n']>=2 and len(sen)==2,push,sen)
+                    reset(); claim['fail']={R2}; go(js(True,{R:RK_ABSENT,R2:RK_ABSENT,'cd'*16:RK_ABSENT})); st5=dict(_RECONCILE.get(('nR',R),{}))
+                    res['trois runs, une réclamation en échec : les autres réclamées, celui de la décision jamais, nouvel essai']=(
+                        R not in claim['who'] and 'cd'*16 in claim['who'] and R2 in claim['who'] and len(push)==1 and st5.get('state')=='à refaire'
+                        and st5.get('next',0)-time.monotonic()>_RECONCILE_RETRY-30,claim['who'],push,st5)
+                    reset(); claim['ok']=False; go(js(True,{R:RK_ABSENT})); st6=dict(_RECONCILE.get(('nR',R),{}))
+                    res['CAS perdu (autre worker) : rien envoyé, fait']=(len(ex)==1 and push==[] and sen==[] and st6.get('state')=='fait',push,sen,st6)
+                    reset(); claim['refuse']=True; go(js(True,{R:RK_ABSENT})); st7=dict(_RECONCILE.get(('nR',R),{}))
+                    res['réclamation refusée par la base (False, notified_at vide) : rien envoyé, nouvel essai']=(push==[] and sen==[]
+                        and st7.get('state')=='à refaire' and st7.get('next',0)-time.monotonic()>_RECONCILE_RETRY-30,st7)
+                    reset(); claim['boom']=True; go(js(True,{R:RK_ABSENT})); st0=dict(_RECONCILE.get(('nR',R),{}))
+                    res['réclamation impossible (base) : rien envoyé, nouvel essai plus tard']=(push==[] and st0.get('state')=='à refaire'
+                        and st0.get('next',0)-time.monotonic()>_RECONCILE_RETRY-30,st0)
+                    for lbl,v,said in (('fermé',RK_CLOSED,False),('fin illisible',RK_BADEND,True),('non vérifiable (dépôt devenu distant)',RK_UNCHECKABLE,True)):
+                        reset(); err.seek(0); err.truncate(); go(js(True,{R:v}))
+                        res[f'{lbl} : rien ici, fait (jamais relancé)'+(', dit au journal' if said else '')]=(push==[] and sen==[]
+                            and _RECONCILE[('nR',R)]['state']=='fait' and ((f'{v} — fin au délai' in err.getvalue())==said),push,dict(_RECONCILE),err.getvalue()[-200:])
+                    for lbl,v in (('erreur de base',RK_DBERR),('non fermé (écriture refusée)',RK_NOTCLOSED)):
+                        reset(); go(js(True,{R:v})); st3=dict(_RECONCILE.get(('nR',R),{}))
+                        res[f'{lbl} : rien, nouvel essai après _RECONCILE_RETRY']=(push==[] and st3.get('state')=='à refaire'
+                            and st3.get('next',0)-time.monotonic()>_RECONCILE_RETRY-30,st3)
+                    reset(); err.seek(0); err.truncate(); go('Traceback (most recent call last):',err='[ERREUR] plantage (contrôle)',code=2)
+                    st4=dict(_RECONCILE.get(('nR',R),{}))
+                    res['sortie non JSON (plantage) : rien, nouvel essai, code au journal']=(push==[] and st4.get('state')=='à refaire'
+                        and 'code 2 : [ERREUR] plantage (contrôle)' in err.getvalue(),st4,err.getvalue()[-200:])
+                    reset(); err.seek(0); err.truncate()
+                    go(json.dumps([{'nick':'nR','verified':False,'runs':{R:RK_UNVERIFIED}}]),err="[WARN] nR : rapprochement impossible (borg list : lock) — réessayé plus tard",code=1)
+                    st1=dict(_RECONCILE.get(('nR',R),{})); go(js(True,{R:RK_ABSENT}))
+                    res['non vérifié : rien, nouvel essai après _RECONCILE_RETRY, code et [WARN] au journal']=(push==[] and len(ex)==1
+                        and st1.get('state')=='à refaire' and st1.get('next',0)-time.monotonic()>_RECONCILE_RETRY-30
+                        and 'code 1 : [WARN] nR : rapprochement impossible' in err.getvalue(),st1,ex,err.getvalue()[-300:])
+                    reset(); go(js(True,{R:RK_ALIVE})); st2=dict(_RECONCILE.get(('nR',R),{}))
+                    res['vivant : revu au passage suivant']=(push==[] and st2.get('state')=='à refaire' and st2.get('next',0)-time.monotonic()<=1,st2)
+                    reset()
+                    for lbl,run,bi in (('état inconnu',None,{'started_at':'x','verifie':True}),('Bkp vivant',True,None),
+                                       ('dépôt distant (orphelin non vérifiable)',False,{'started_at':'x','verifie':False}),('rien d\'interrompu',False,None)):
+                        state['running']=run; state['bi']=bi; go(js(True,{R:RK_ABSENT}),wait=False)
+                        res[f'{lbl} : aucun lancement']=(ex==[],ex)
+                    state['running']=False; state['bi']={'started_at':'x','verifie':True}; _RECONCILE.clear(); gate.clear()
+                    dt=go(js(True,{R:RK_ABSENT}),wait=False)
+                    t0=time.monotonic()
+                    while not ex and time.monotonic()-t0<5: time.sleep(0.01)   # revue : le fil a bien commencé avant de compter
+                    dt2=go(js(True,{R:RK_ABSENT}),wait=False)
+                    rid['v']=R2; dt3=go(js(True,{R:RK_ABSENT}),wait=False); rid['v']=R   # autre run du même nick (revue des mutants : W5)
+                    n_en=len(ex); gate.set(); go('',wait=True)
+                    res['un seul fil par nick (même run, autre run), passage jamais bloqué par borg']=(n_en==1 and max(dt,dt2,dt3)<0.5,n_en,dt,dt2,dt3)
+                    reset(); fut=time.monotonic()+_RECONCILE_RETRY
+                    _RECONCILE.update({(f'z{i}','0'*32):{'state':'fait','next':0.0} for i in range(499)})
+                    _RECONCILE[('nZ',R)]={'state':'à refaire','next':fut}; _RECONCILE[('nY',R)]={'state':'à refaire','next':0.0}
+                    go(js(True,{R:RK_CLOSED}))
+                    res['purge au-delà de 500 : « fait » et échéances passées retirées, échéance à venir gardée']=(('nZ',R) in _RECONCILE
+                        and ('nY',R) not in _RECONCILE and not any(k[0].startswith('z') for k in _RECONCILE),len(_RECONCILE))
+                called=[]
+                with mock.patch(f"{__name__}._nick_list",lambda n:['nR']), \
+                     mock.patch.object(_bh_paths.db,'get_diff_db',lambda n:'/nonexistent'), \
+                     mock.patch.object(_bh_paths.db,'ensure_diff_db',lambda *a,**k: None), \
+                     mock.patch.object(_bh_paths.db,'get_history_db',lambda n:'/nonexistent'), \
+                     mock.patch.object(_bh_paths.db,'list_pending_bkp_status',lambda *a,**k: []), \
+                     mock.patch.object(_bh_paths.db,'list_pending_bkp_status_start',lambda *a,**k: []), \
+                     mock.patch(f"{__name__}._check_overdue",lambda *a,**k: None), \
+                     mock.patch(f"{__name__}._reconcile_interrupted",lambda n: called.append(n)), contextlib.redirect_stderr(io.StringIO()):
+                    _bkp_status_watcher_pass()
+                res['passage du watcher : rapprochement appelé pour chaque nick']=(called==['nR'],called)
+                _RECONCILE.clear()
+                bad={k:v for k,v in res.items() if not v[0]}
+                if bad: print(f"  {bad}")
+                return not bad
+            check("fin d'un Bkp tué : rapprochement par le watcher, échec vérifié notifié aussitôt + Sentry, une fois (1.31.8)",_reconcile_flow)
             def _overdue_no_subscriber():
                 with mock.patch.object(_bh_paths.db,'last_archive_stat',lambda n,p=None:('Z1',(_dt.datetime.now()-_dt.timedelta(hours=30)).isoformat())), \
                      mock.patch(f"{__name__}._bkp_state",lambda n:{'bkp_running':False,'bkp_detail':None,'bkp_interrupted':None}), \

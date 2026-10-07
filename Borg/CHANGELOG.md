@@ -1,5 +1,36 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.31.8, borgHelper 1.0.189 — Fin d'un Bkp tué notifiée aussitôt — 2026-10-07
+
+Chantier « reconstruction progressive », story 63 (rétrospective 57-60, A118 ; décisions de l'utilisateur). Avant : pour un Bkp
+tué, `/access` le disait interrompu tout de suite (1.31.5), mais la fin n'était notifiée qu'au rapprochement par un Index ou au
+délai `BKP_STATUS_TIMEOUT` (6 h) — mesuré (délai ramené à 90 s, `work/m63/mesure63-o.log`) : borgHelper et borg tués -> échec au
+délai ; borgHelper tué, archive écrite -> **échec au délai alors que l'archive existait** (l'Index suivant rapprochait en succès,
+jamais renotifié).
+
+- borgHelper 1.0.189 : commande `BkpReconcile [-n nick/ALL] [-j]` — rapprochement des Bkp tués sans Index (même règle, un `borg
+  list` par nick à candidat, qui cède à une opération prioritaire) ; compte rendu par run (`fermé`, `absent`, `vivant`,
+  `orphelin`, `fin illisible`, `erreur de base`, `non fermé`, `non vérifié`, `non vérifiable` — dépôt distant, jamais `absent`) ;
+  `borg create` d'un run vu dans /proc même avant son verrou (`orphelin`) ; base illisible dite en `[WARN]` ; code 1 si la
+  vérification est impossible, nick inconnu du rc, rc sans nick. Ligne `absent` laissée ouverte (décision de l'utilisateur) :
+  une archive arrivée ensuite reste rapprochable.
+- borgHelperWWW 1.31.8 : le watcher lance `BkpReconcile` dès qu'un Bkp tué est interrompu (dépôt local, état lisible ; une fois
+  par Bkp et par processus serveur, jamais après la fin notifiée ; dans un fil, un seul par nick) ; archive écrite : fin
+  « succès » au passage suivant ; aucune archive de ce run (vérifié) : fin « échec » aussitôt + Sentry « Sauvegarde interrompue —
+  <nick> (borgHelper arrêté, aucune archive de ce Bkp) », pour chaque Bkp tué ainsi vérifié. Dépôt distant, état illisible :
+  délai inchangé ; vérification impossible, fermeture ou réclamation refusée par la base : nouvel essai 10 min après ; fin
+  d'archive illisible : dit au journal, fin au délai.
+- Mesuré (`work/m63/mesure63-f3.log`, vrai serveur, vrai borg, watcher toutes les 5 s) : échec à 4,4 s (avant : 88 s), archive
+  écrite -> succès à 9,9 s (avant : échec à 86 s), Index aussitôt : inchangé (succès).
+- Contrôles : CodecSelfTest (compte rendu par run sur 19 cas dont `borg create` sans verrou, dépôt distant, base en erreur,
+  fermeture refusée ; leurres de `run_create_alive` ; vraie requête de la garde « fin déjà notifiée » ; commande : code 0 et
+  JSON, dépôt absent code 1, base illisible dite, arrêt prioritaire, nick inconnu, rc sans nick, `-n` nettoyé, sortie texte) ;
+  push selftest (échec vérifié notifié une fois + Sentry, fin déjà notifiée, garde illisible, plusieurs Bkp tués dont une
+  réclamation en échec, CAS perdu, réclamation impossible ou refusée par la base, fermé, fin illisible, non vérifiable, non
+  fermé, ligne fermée ailleurs, erreur de base, sortie non JSON, délai illimité borné à 3600 s, vérification impossible avec
+  code et [WARN] au journal, vivant, état inconnu, Bkp vivant, dépôt distant, un seul fil par nick, passage jamais bloqué,
+  purge au-delà de 500, appel par le passage du watcher).
+
 ## borgHelperWWW 1.31.7 — Borg bloqué en écriture : il rend son verrou au SIGTERM — 2026-10-07
 
 Chantier « reconstruction progressive », story 62 (rétrospective 57-60, A117 ; décision de l'utilisateur : documentation
