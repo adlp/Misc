@@ -814,7 +814,8 @@ def config_file(bench):
 
 def test_config_get_set_unset(bench):
     r = bench.run("config", "get")
-    assert r.returncode == 0 and r.stdout == "key-ttl 1h (défaut)\n"
+    assert r.returncode == 0 and r.stdout == ("key-ttl 1h (défaut)\nauto-load true (défaut)\n"
+                                              "auto-restrict false (défaut)\nauto-confirm false (défaut)\n")
     assert not config_file(bench).exists(), "get n'écrit rien"
     for value, shown in (("90", "90s"), ("90s", "90s"), ("15m", "15m"), ("2h", "2h"), ("30d", "30d"),
                          ("120", "2m"), ("0", "0 (illimitée)")):

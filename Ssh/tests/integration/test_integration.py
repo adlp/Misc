@@ -27,7 +27,8 @@ import uuid
 
 import pytest
 
-from bench import HAVE_OPENSSH, SRC, agent_list, check_witness, kill_agents_under, private_runtime_dir, wait_gone
+from bench import (HAVE_OPENSSH, SRC, agent_list, check_witness, kill_agents_under, private_runtime_dir, wait_gone,
+                   write_exe)
 
 pytestmark = pytest.mark.integration
 
@@ -287,8 +288,11 @@ def home(account, bw_exe, ring, report, witness):
            if not k.startswith(("BW_", "SSH_ASKPASS", "SSHVAULT_", "XDG_", "BITWARDENCLI_"))
            and k not in ("DISPLAY", "WAYLAND_DISPLAY")}
     env.update(account.extra_env)
+    # `sshvault` des lignes Match exec : l'enveloppe du banc (dépôt), jamais celle du poste
+    exe = write_exe(os.path.join(tmp, "exe"))
     env.update(HOME=h, SSHVAULT_SSH_HOME=h, XDG_RUNTIME_DIR=rt, SSHVAULT_BW=bw_exe, PYTHONPATH=SRC,
-               SSHVAULT_PROMPT_TIMEOUT="30", SSHVAULT_BW_TIMEOUT="180")
+               SSHVAULT_PROMPT_TIMEOUT="30", SSHVAULT_BW_TIMEOUT="180", SSHVAULT_TEST_BENCH="1",
+               PATH=str(exe.parent) + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"))
     env.pop("SSH_AGENT_PID", None)
     env.pop("SSH_AUTH_SOCK", None)
     if witness:
@@ -516,6 +520,9 @@ def test_sshvault_sur_le_vrai_bw(account, vault, ssh_keys, home, report):
     # hôtes (story 4) : écriture par sshvault, relecture par un autre client bw, ssh-config
     check_hosts_and_ssh_config(account, vault, ssh_keys, home, report)
 
+    # chargement à la demande (story 5) : ssh vers un sshd local, agent vide, vrai bw
+    check_ensure(account, vault, ssh_keys, home, report)
+
     # session invalidée par un autre unlock : purge, puis « verrouillé »
     own.ok("unlock", "--passwordenv", PW_VAR, "--raw", env={PW_VAR: account.password})
     r = sv(home, "--nointeraction", "list")
@@ -674,3 +681,96 @@ def check_hosts_and_ssh_config(account, vault, ssh_keys, home, report):
     r = sv(home, "--nointeraction", "ssh-config")
     check(account, r, 0, "ssh-config sans changement")
     assert "inchangé" in r.stdout
+
+
+SSHD = "/usr/sbin/sshd"
+
+
+def check_ensure(account, vault, ssh_keys, home, report):
+    """Story 5 : `ssh` vers un sshd local (127.0.0.1, utilisateur courant) qui n'accepte que la
+    clé de test ; agent dédié vide (arrêté), coffre déverrouillé (session rangée) : la connexion
+    réussit par la ligne `Match … exec` du ssh_config généré, `sshvault ensure` et le vrai bw."""
+    if not (HAVE_OPENSSH and shutil.which("ssh") and os.access(SSHD, os.X_OK)):
+        report.add("ensure", note="ignoré : ssh, sshd, ssh-agent ou ssh-add absent")
+        return
+    import getpass
+    import socket as _socket
+    iid = vault["hotes"]
+    host = "prod-%s.it.example" % TAG
+    rt_dir = os.path.join(home["runtime"], "sshvault")
+    sock = os.path.join(rt_dir, "agent.sock")
+    d = os.path.join(home["env"]["HOME"], ".ssh", "sshvault")
+    text = open(os.path.join(d, "config")).read()
+    exe = os.path.join(home["tmp"], "exe", "sshvault")
+    assert "Match originalhost prod-%s.it.example,*.lab-%s.it exec \"'%s' ensure --id %s\"\n" % (TAG, TAG, exe, iid) \
+        in text, text
+    r = sv(home, "agent", "stop")  # agent dédié vide avant la connexion
+    check(account, r, 0, "agent stop avant ensure")
+    assert not os.path.exists(sock)
+    lab = os.path.join(home["tmp"], "sshd")
+    os.mkdir(lab, 0o700)
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", os.path.join(lab, "hostkey")], check=True)
+    with open(os.path.join(lab, "authorized_keys"), "w") as f:
+        f.write(ssh_keys["hotes"]["public"] + "\n")
+    with _socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    with open(os.path.join(lab, "sshd_config"), "w") as f:
+        f.write("Port %d\nListenAddress 127.0.0.1\nHostKey %s/hostkey\nPidFile %s/sshd.pid\nAuthorizedKeysFile "
+                "%s/authorized_keys\nStrictModes no\nUsePAM no\nPasswordAuthentication no\n"
+                "KbdInteractiveAuthentication no\nPrintMotd no\nLogLevel VERBOSE\n" % (port, lab, lab, lab))
+    with open(os.path.join(lab, "sshd.log"), "wb") as log:
+        sshd = subprocess.Popen([SSHD, "-D", "-e", "-f", os.path.join(lab, "sshd_config")], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=log, start_new_session=True)
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            with _socket.socket() as s:
+                if s.connect_ex(("127.0.0.1", port)) == 0:
+                    break
+            assert time.monotonic() < deadline, "sshd de test muet"
+            time.sleep(0.1)
+        main = os.path.join(home["tmp"], "ssh_config_ensure")
+        with open(main, "w") as f:
+            f.write('Include "%s"\nHost %s\n    HostName 127.0.0.1\n    Port %d\nHost *\n    User %s\n'
+                    "    UserKnownHostsFile /dev/null\n    GlobalKnownHostsFile /dev/null\n"
+                    "    StrictHostKeyChecking no\n    BatchMode yes\n    LogLevel VERBOSE\n"
+                    % (os.path.join(d, "config"), host, port, getpass.getuser()))
+        os.chmod(main, 0o600)
+        env = dict(home["env"], SSHVAULT_TEST_TRACE="1")
+        t0 = time.monotonic()
+        r = subprocess.run(["ssh", "-F", main, "-v", host, "true"], env=env, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=600, start_new_session=True)
+        took = time.monotonic() - t0
+        report.add("ssh via ensure (agent vide, vrai bw)", note="rc=%d durée=%.2fs" % (r.returncode, took))
+        if r.returncode != 0:
+            raise AssertionError(account.scrub("ssh via ensure : code %d ; stderr : %s"
+                                               % (r.returncode, r.stderr.strip()[-3000:])))
+        assert re.findall(r"^sshvault-test: fin ensure --id (\S+) rc=(\d+)$", r.stderr, re.M) == [(iid, "0")]
+        assert not [l for l in r.stderr.splitlines() if l.startswith("sshvault:")], "ensure silencieux"
+        fp = ssh_keys["hotes"]["fingerprint"]
+        assert re.findall(r"Offering public key: \S+ \S+ (SHA256:\S+)", r.stderr) == [fp], "une seule clé offerte"
+        assert "Accepted publickey for %s" % getpass.getuser() in open(os.path.join(lab, "sshd.log")).read()
+        rc, listing = agent_list(sock)
+        assert rc == 0 and [l.split()[1] for l in listing] == [ssh_keys["hotes"]["public"].split()[1]]
+        # 2e connexion : clé présente, chemin rapide (ni bw ni invite)
+        t0 = time.monotonic()
+        r = subprocess.run(["ssh", "-F", main, host, "true"], env=env, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=120, start_new_session=True)
+        report.add("ssh via ensure (clé présente)", note="rc=%d durée=%.2fs" % (r.returncode, time.monotonic() - t0))
+        assert r.returncode == 0, account.scrub(r.stderr)
+        assert "PRIVATE KEY" not in r.stdout + r.stderr
+    finally:
+        try:
+            sshd.terminate()
+            try:
+                sshd.wait(10)
+            except subprocess.TimeoutExpired:
+                sshd.kill()
+                sshd.wait(10)
+        finally:
+            try:
+                assert wait_gone([sshd.pid]), "sshd de test encore vivant"
+            finally:
+                r = sv(home, "agent", "stop")
+                check(account, r, 0, "agent stop après ensure")

@@ -2,13 +2,15 @@
 
 Clés SSH dans un Vaultwarden auto-hébergé, utilisées de façon transparente par ssh.
 
-État (0.3.0) : **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
+État (0.4.0) : **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
 éléments « SSH key »), **agent dédié** (chargement d'une clé du coffre dans un
 `ssh-agent` d'OpenSSH propre à sshvault, sans écriture disque, avec durée de vie,
 confirmation et restriction aux hôtes en option ; état, purge, verrou et arrêt de l'agent),
-**hôtes d'une clé** modifiables depuis la CLI et **`ssh_config` généré** : chaque hôte
-associé reçoit l'agent dédié et sa seule clé. Le chargement à la demande (`Match exec`),
-l'import et la génération de clés viendront ensuite.
+**hôtes d'une clé** modifiables depuis la CLI, **`ssh_config` généré** (chaque hôte
+associé reçoit l'agent dédié et sa seule clé) et **chargement automatique** : `ssh <hôte>`
+charge seul la clé manquante, pour la cible comme pour chaque saut ProxyJump/ProxyCommand,
+avec au plus une invite de déverrouillage du coffre. L'import et la génération de clés
+viendront ensuite.
 
 ## Installation (sans root)
 
@@ -32,7 +34,10 @@ l'import et la génération de clés viendront ensuite.
    uv tool install ./Ssh        # depuis la racine de Misc ; --force pour réinstaller
    sshvault --help
    ```
-   La commande est installée dans `~/.local/bin/sshvault`.
+   La commande est installée dans `~/.local/bin/sshvault`. Le `ssh_config` généré appelle
+   ce chemin absolu (chargement automatique) : après une réinstallation ailleurs, relancer
+   `sshvault ssh-config`. Mise à jour depuis la 0.3.0 : `uv tool install --force ./Ssh`
+   (nouveau point d'entrée), puis `sshvault ssh-config`.
 
 ## Utilisation
 
@@ -47,12 +52,14 @@ sshvault lock
 
 sshvault load (MOTIF [--host | --name | --fingerprint | --id] | --all) [-t DURÉE] [--confirm] [--restrict] [--force]
 sshvault agent status | purge | lock | unlock | stop
-sshvault config get [key-ttl] | set key-ttl DURÉE | unset key-ttl
+sshvault config get [CLÉ] | set CLÉ VALEUR | unset CLÉ   # key-ttl, auto-load, auto-restrict, auto-confirm
 
 sshvault hosts add | remove | set  SÉLECTION [--host | --name | --fingerprint | --id] HÔTE…
 sshvault hosts list SÉLECTION [--host | --name | --fingerprint | --id]
 sshvault ssh-config [--print | --check]
 sshvault ssh-config install
+
+sshvault ensure --id ID          # appelé par ssh (ligne Match exec du ssh_config généré)
 ```
 
 - `list` affiche, pour chaque élément « SSH key » (type 5) : nom, empreinte, hôtes.
@@ -161,8 +168,11 @@ par sshvault sont ceux de cette version.
   autre processus : aucun signal, seul le socket est nettoyé.
 - **Config** : `${XDG_CONFIG_HOME:-~/.config}/sshvault/config.json` (0600, dossier 0700,
   aucun secret). `config set key-ttl 2h` fixe la durée par défaut, `config get` l'affiche,
-  `config unset key-ttl` revient à 1 h. Durée ou fichier invalide (JSON, valeur, droits
-  autres que 0600, propriétaire) : code 2 ; écriture impossible : code 4.
+  `config unset key-ttl` revient à 1 h. Clés du chargement automatique (voir plus bas) :
+  `auto-load` (défaut `true`), `auto-restrict` et `auto-confirm` (défaut `false`), valeurs
+  `true`/`false` (aussi `yes`/`no`, `on`/`off`, `1`/`0`). Durée, booléen ou fichier
+  invalide (JSON, valeur, droits autres que 0600, propriétaire) : code 2 ; écriture
+  impossible : code 4.
 
 ### Hôtes d'une clé
 
@@ -221,6 +231,7 @@ voir une modification faite ailleurs) et écrit `~/.ssh/sshvault/config` (0600, 
 
 ```
 # Serveur Prod 11111111-1111-4111-8111-111111111111
+Match originalhost prod.example.org,*.lab exec "'/home/alice/.local/bin/sshvault' ensure --id 11111111-1111-4111-8111-111111111111"
 Match originalhost prod.example.org,*.lab
     IdentityAgent "/run/user/1000/sshvault/agent.sock"
     IdentityFile "/home/alice/.ssh/sshvault/pub/SHA256:70bMgv5m…_OjUbIQdVk.pub"
@@ -236,8 +247,10 @@ Match originalhost prod.example.org,*.lab
   bloc `Host prod.example.org` + `HostName 10.0.0.5` de votre config reçoit bien la clé,
   `ssh 10.0.0.5` non. (Mesuré sur OpenSSH 8.9p1 : une ligne `Host foo` ne s'applique pas
   à `ssh FOO`, d'où cette forme.)
-- Jamais de `HostName`, `User`, `Port`, `ProxyJump`, `ProxyCommand` ni `Match exec` : la
-  topologie reste dans votre `~/.ssh/config`.
+- La ligne `Match … exec` (sans directive) charge la clé à la connexion : voir
+  « Chargement automatique ». `config set auto-load false` la retire (forme de la 0.3.0).
+- Jamais de `HostName`, `User`, `Port`, `ProxyJump` ni `ProxyCommand` : la topologie reste
+  dans votre `~/.ssh/config`.
 - Rien n'est réécrit si le contenu est identique (mtime inchangée) ; `pub/` ne garde que
   les clés des éléments associés (sshvault est le seul à y écrire). Aucune clé privée.
 - `~` désigne le répertoire de passwd (là où ssh lit `~/.ssh/config`), pas `$HOME` ;
@@ -269,10 +282,83 @@ s'en servir tant que la session est ouverte. Le transfert restreint par hôte vi
 la story 8 ; d'ici là, éviter `ForwardAgent yes` vers ces hôtes.
 
 **Clé absente de l'agent dédié.** Le bloc n'offre que la clé de l'agent dédié
-(`IdentitiesOnly yes`) : si elle n'y est pas chargée, ssh affiche
-`Load key "…/pub/SHA256:….pub": error in libcrypto` puis `Permission denied (publickey)`.
-Lancer d'abord `sshvault load <hôte>` (le chargement automatique à la connexion viendra
-avec la story 5).
+(`IdentitiesOnly yes`) : si elle n'y est pas (chargement automatique désactivé ou en
+échec), ssh affiche `Load key "…/pub/SHA256:….pub": error in libcrypto` puis
+`Permission denied (publickey)`. La ligne `sshvault: …` qui précède dit pourquoi ;
+`sshvault load <hôte>` la charge à la main.
+
+### Chargement automatique (`Match exec`)
+
+Avec la config générée incluse, `ssh <hôte>` charge seul la clé de l'hôte si elle manque
+dans l'agent dédié, pour la cible **et** pour chaque saut `ProxyJump`/`ProxyCommand ssh -W`
+(le ssh du saut relit la config). Aucune commande préalable ; au plus une invite de
+déverrouillage du coffre par connexion.
+
+- **Comment.** Avant chaque bloc, `Match originalhost <motifs> exec "'<sshvault>' ensure
+  --id <id>"` : ssh n'exécute la commande que si le nom tapé correspond, avant
+  l'authentification, puis applique le bloc. La ligne ne porte aucune directive : son code
+  de sortie ne change rien. Mesuré (OpenSSH 8.9p1) : un appel par saut, la cible d'abord
+  puis le saut, chacun fini avant l'authentification de son saut.
+- **Commande sûre.** La commande passe par le shell de l'utilisateur : elle ne contient
+  que le chemin absolu de sshvault entre apostrophes (refusé s'il contient `'`, `"`, `\`,
+  `${` ou un caractère de contrôle ; `%` doublé) et l'id de l'élément, un UUID vérifié.
+  Jamais `%h` ni `%n` : avec un motif `*.lab`, un nom tapé contenant des métacaractères du
+  shell y passerait. (Élément dont l'id n'est pas un UUID : pas de ligne, avertissement.)
+- **Clé déjà là** (enregistrée par sshvault pour cet élément, ou pour un autre élément de
+  même clé ; égale au `.pub` de l'élément dans la config générée ; restant plus de
+  min(60 s, durée/2)) : `ensure` répond sans `bw` ni réseau, sans rien afficher. Mesuré sur
+  trois séries de 20 appels : médiane 27 à 30 ms, max 31 à 43 ms, démarrage de Python compris
+  (`ssh -G`, `ssh -O` et ce cas ne chargent pas la CLI). Au-dessous du seuil, la clé est
+  rechargée ; clé changée dans le coffre (puis `ssh-config`) : la nouvelle est chargée.
+- **Clé absente** : sous un verrou par utilisateur (`$XDG_RUNTIME_DIR/sshvault/ensure.lock`),
+  état relu, agent vérifié **avant le coffre** (démarré s'il le faut, OpenSSH ≥ 8.9 ;
+  verrouillé → code 3, une ligne, ni invite ni `bw`), puis comme `load` : un `bw get item`
+  (cache local, ~1,4 s pour le vrai `bw`), `ssh-add -t <key-ttl> -` (clé par stdin), tout
+  ou rien (une clé privée qui ne correspond pas est retirée, même si une ancienne copie
+  est là), état enregistré. Mesuré avec un faux `bw` à 1,4 s par appel : `ssh B` derrière
+  le rebond A, agent vide, 3,3 s (deux `bw`). Deux ssh lancés ensemble : une invite, un
+  `ssh-add` par clé.
+- **Options** : durée `key-ttl`, sans `-c` ni `-h`. `config set auto-restrict true` ajoute
+  `ssh-add -h` (hôtes de l'élément, littéraux, dans `known_hosts` ; sinon une ligne
+  d'erreur, rien chargé) ; `config set auto-confirm true` ajoute `-c` (confirmation par
+  l'askpass de l'agent ; agent lancé sans askpass utilisable : une ligne d'erreur, rien
+  chargé). Une clé rechargée garde les `-c`/`-h` qu'elle avait.
+- **Coffre verrouillé** : invite sur le terminal si ssh est **au premier plan**
+  (`tcgetpgrp == getpgrp`), jamais sur stdin (`/dev/null` sous `Match exec`) ; sinon
+  (`ssh … &`, pas de terminal) l'askpass selon les règles de `man ssh` (`SSH_ASKPASS`
+  exécutable, `DISPLAY`, `SSH_ASKPASS_REQUIRE`) ; sinon échec immédiat, sans appel à
+  `bw`. Aucune invite sous `sshvault --nointeraction ensure` ni si un ssh de la chaîne a
+  `-o BatchMode=yes` en argument (pas dans un fichier de config). Jamais d'arrêt par
+  SIGTTIN. L'invite dit ce qui la déclenche (« clé pour <hôte> »). La session obtenue sert
+  aux sauts suivants ; **sans magasin de session utilisable** (ni keyring, ni
+  `XDG_RUNTIME_DIR` privé : avertissement « session non rangée »), chaque saut redemande.
+- **Mauvais mot de passe** (refusé par `bw`, ou invite annulée ou sans réponse) : une ligne,
+  et l'échec est mémorisé 30 s pour **cette connexion** (`$XDG_RUNTIME_DIR/sshvault/unlock-failed`
+  : horodatage, pid et date de démarrage du ssh tapé) : les sauts suivants échouent
+  aussitôt, sans invite ni `bw`, et ssh finit en `Permission denied`. Une autre connexion
+  redemande. Une invite impossible n'est pas mémorisée. `sshvault unlock` ou un
+  déverrouillage réussi efface la mémoire.
+- **`ssh -G`, `ssh -O`** : ssh exécute aussi les `Match exec` ; `ensure` reconnaît l'option
+  sur le ssh qui l'a lancé (premier `ssh` parmi ses ancêtres, lus dans `/proc`, à travers le
+  shell de `$SHELL -c`) et sort aussitôt, code 0, sans rien demander ni charger.
+- **Échec** : une seule ligne `sshvault: <hôte> : <cause>` sur stderr (hôte tapé, ou id de
+  l'élément si le ssh appelant n'est pas trouvé), puis ssh continue et échoue proprement.
+  Rien en cas de succès, sauf les avertissements du backend (une ligne chacun). Délais
+  bornés : invite `SSHVAULT_PROMPT_TIMEOUT` (réduite au temps restant), `bw`
+  `SSHVAULT_BW_TIMEOUT`, tout l'appel depuis son démarrage (chemin rapide et attente du
+  verrou compris) `SSHVAULT_ENSURE_TIMEOUT` (240 s ; 0 < v ≤ 86400, sinon code 2). Ctrl-C,
+  SIGTERM, SIGHUP : terminal rétabli, sous-processus tués, « interrompu » ; un délai ou un
+  signal arrivé une fois la clé chargée ne change plus rien.
+- **Chemin de sshvault** : celui de la commande qui génère la config si elle s'appelle
+  `sshvault`, sinon le premier `sshvault` du PATH (dossiers absolus) qui répond
+  `--version` ≥ 0.4.0. Avertissement s'il diffère de celui de la config existante, ou s'il
+  est dans un environnement de projet (`.venv`).
+- **Limites.** La commande suppose un shell à guillemets POSIX (apostrophes littérales) :
+  testé avec bash et dash (`/bin/sh`) ; zsh et fish le sont s'ils sont installés (absents du
+  poste de test). Une clé chiffrée par passphrase demande sa passphrase (terminal au
+  premier plan ou askpass), sinon une ligne d'erreur. Clé changée dans le coffre sans
+  `ssh-config` : l'ancienne reste offerte. Le chemin de sshvault est figé dans la config
+  générée.
 
 **Inclusion.** ssh ne lit le fichier que si `~/.ssh/config` l'inclut **en tête** (pour
 chaque paramètre, la première valeur rencontrée l'emporte). « En tête » : avant la
@@ -313,6 +399,10 @@ manque, est conditionnelle ou n'est pas en tête.
 | 4 | erreur du backend : `bw` introuvable, en erreur, réponse illisible, délai dépassé ; magasin de session inutilisable ; agent dédié : `XDG_RUNTIME_DIR` relatif, non privé ou hors tmpfs, chemin du socket trop long, agent tiers sur le socket, OpenSSH < 8.9, `--restrict` (élément sans hôte, hôte non littéral ou absent de `known_hosts`), clé publique illisible ou différente de la clé privée, `ssh-add`/`ssh-agent` en erreur ; écriture de `config.json` impossible ; écriture des hôtes dans le coffre non aboutie ou non vérifiée (y compris hôtes écrits mais `ssh_config` non régénéré) ; `ssh_config` généré impossible à écrire (chemin avec `"`, `\`, `${`, fichier non ordinaire, droits) ; répertoire personnel inconnu ; `ssh-config install` refusé (lien symbolique, fichier non ordinaire, `Include` conditionnel, chemin personnel avec `%`, `$` ou joker) ; erreur interne |
 | 130 | interrompu (Ctrl-C, SIGTERM, SIGHUP) |
 
+`ensure` : 0 si la clé est présente ou chargée, et pour `ssh -G` ; sinon le code de
+l'erreur (3 coffre verrouillé ou agent verrouillé, 4 backend, agent, délai global…), sans
+effet sur ssh.
+
 `status` : 0 si le coffre est déverrouillé, 3 s'il est verrouillé ou non connecté,
 4 si `bw` est en erreur. Un délai invalide dans l'environnement (voir Variables) donne
 le code 2. Toute erreur est une ligne sur stderr, sans traceback.
@@ -343,9 +433,10 @@ le code 2. Toute erreur est une ligne sur stderr, sans traceback.
   `XDG_RUNTIME_DIR` appartient à l'utilisateur, sans droits groupe/autres, sur tmpfs
   ou ramfs ; sinon la session n'est pas rangée (`unlock` : code 4 ; `list` marche
   avec un avertissement). `lock` vide les deux. Une session refusée par `bw` est purgée.
-- **Invite** : `/dev/tty` (pas stdin), ou le programme `SSH_ASKPASS`, selon les
-  règles de `man ssh` pour `SSH_ASKPASS_REQUIRE` (`never`, `prefer`, `force`) et
-  `DISPLAY`/`WAYLAND_DISPLAY`. Délai `SSHVAULT_PROMPT_TIMEOUT` (60 s par défaut).
+- **Invite** : `/dev/tty` (pas stdin) si le processus est au premier plan du terminal,
+  ou le programme `SSH_ASKPASS`, selon les règles de `man ssh` pour
+  `SSH_ASKPASS_REQUIRE` (`never`, `prefer`, `force`) et `DISPLAY`/`WAYLAND_DISPLAY`.
+  Délai `SSHVAULT_PROMPT_TIMEOUT` (60 s par défaut).
 - Fichiers créés en 0600, dossiers en 0700.
 
 ### Variables
@@ -355,6 +446,7 @@ le code 2. Toute erreur est une ligne sur stderr, sans traceback.
 | `SSHVAULT_BW` | exécutable `bw` (défaut : `bw` du PATH) |
 | `SSHVAULT_BW_TIMEOUT` | délai d'un appel `bw`, en secondes, 0 < v ≤ 86400 (défaut 60 ; `login` : 600) |
 | `SSHVAULT_PROMPT_TIMEOUT` | délai d'une invite, en secondes, 0 < v ≤ 86400 (défaut 60) |
+| `SSHVAULT_ENSURE_TIMEOUT` | délai global d'un `ensure` depuis son démarrage, attente du verrou comprise, en secondes, 0 < v ≤ 86400 (défaut 240) |
 | `SSHVAULT_KEYRING`, `SSHVAULT_KEYCTL` | anneau et exécutable `keyctl` (tests ; défaut `@u`, `keyctl`) |
 | `XDG_DATA_HOME` | base du dossier de données de `bw` (défaut `~/.local/share`) |
 | `XDG_RUNTIME_DIR` | repli fichier de la session ; socket et état de l'agent dédié (tmpfs privé exigé) |
@@ -388,6 +480,16 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   arrêté avant l'authentification (`ProxyCommand true`) pour voir le `.pub` réellement
   chargé. Le faux `bw` sait faire `edit` (élément lu sur stdin, argv journalisé) et
   simuler un `edit` en échec, bloqué, passé puis bloqué, ou en concurrence.
+- `tests/test_ensure.py` (chargement automatique) : vrais `ssh` contre deux sshd de test
+  (A, le rebond, et B, la cible, sur 127.0.0.1, chacun n'acceptant que sa clé), en
+  `ProxyJump` et en `ProxyCommand ssh -W`, vrais `ssh-agent`/`ssh-add`, faux `bw` (avec un
+  délai de 1,4 s par appel pour mesurer le chargement), vrai terminal par pty (premier
+  plan, arrière-plan, deux ssh simultanés, Ctrl-C). La commande `sshvault` des lignes
+  `Match exec` y est une enveloppe de `python -m sshvault` du dépôt, inerte hors du banc.
+  La latence du chemin rapide est mesurée (médiane et maximum de 20 appels).
+- En fin de session, les tests vérifient qu'aucun de leurs processus ne reste (agent,
+  surveillant, sshd, `bw`, askpass, `ensure`), que `~/.ssh` réel est inchangé et
+  qu'aucun dossier sshvault réel (socket, données, config) n'a été créé.
 - L'intégration (`-m integration`, `bw` par `SSHVAULT_BW` ou le PATH) a deux modes :
   - **compte de test** (défaut) : identifiants dans `~/.config/sshvault-test/account.env`
     (0600, hors git ; chemin remplaçable par `SSHVAULT_IT_ENV`) : `SSHVAULT_IT_SERVER`,
@@ -407,5 +509,7 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   de tous les processus relevées dans `/proc` pendant l'appel : ni JSON ni clé privée ;
   relecture par un autre client `bw` après `sync` : autres champs et clé privée
   identiques), `ssh-config` dans le HOME de test (validé par `ssh -G`), une session
-  invalidée et `lock`. `register.py` (mode
+  invalidée et `lock` ; enfin `ssh` vers un sshd local qui n'accepte que la clé de test,
+  agent dédié vide, coffre déverrouillé : la connexion passe par `ensure` et le vrai `bw`.
+  `register.py` (mode
   conteneur) se lance seul par `SSHVAULT_IT_PASSWORD=… python register.py <url> <e-mail>`.

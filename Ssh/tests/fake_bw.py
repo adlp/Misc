@@ -35,6 +35,8 @@ perd), errorafter (edit : écrit, puis code 1), errorsecond (premier appel norma
 suivants en erreur), silent (edit : code 0 sans rien écrire), erroronce (seul le premier appel en erreur).
 FAKE_BW_EDIT_RACE=<champ>=<valeur> : à l'edit, le « serveur » change d'abord ce champ de
 l'élément (autre client) puis traite la requête.
+FAKE_BW_DELAY=<secondes> : chaque appel attend d'abord ce délai (coût mesuré d'un vrai bw :
+environ 1,4 s, démarrage de Node compris).
 Journal : FAKE_BW_LOG (JSON par ligne : argv, BW_SESSION présent, appdata,
 variables de l'environnement qui contiennent le mot de passe).
 """
@@ -459,6 +461,9 @@ CMDS = {"edit": cmd_edit, "status": cmd_status, "config": cmd_config, "login": c
 def main():
     argv = sys.argv[1:]
     log(argv)
+    delay = os.environ.get("FAKE_BW_DELAY")
+    if delay:
+        time.sleep(float(delay))
     cmd, flags, opts, pos = parse(argv)
     if cmd is None:
         out("Usage: bw [options] [command]")

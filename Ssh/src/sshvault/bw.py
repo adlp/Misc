@@ -27,7 +27,7 @@ import termios
 from typing import Optional
 
 from .backend import (HOSTS_FIELD, BackendError, BackendNotFound, ItemNotFound, NotLoggedIn,
-                      Prompt, SshKeyItem, VaultBackend, VaultError, VaultLocked, VaultStatus, WriteFailed,
+                      PasswordRefused, Prompt, SshKeyItem, VaultBackend, VaultError, VaultLocked, VaultStatus, WriteFailed,
                       normalize_hosts, parse_hosts)
 from .fsutil import ensure_dir
 from .settings import seconds
@@ -282,7 +282,7 @@ class BwBackend(VaultBackend):
                 raise NotLoggedIn("non connecté au coffre : lancer « sshvault login »")
             # unlock est local : un refus est presque toujours le mot de passe (mesuré :
             # « Cryptography error, The decryption operation failed », code 1).
-            raise VaultLocked("mot de passe maître refusé par bw (%s)" % (last_line(r.err) or "code %d" % r.rc))
+            raise PasswordRefused("mot de passe maître refusé par bw (%s)" % (last_line(r.err) or "code %d" % r.rc))
         token = r.out.strip()
         if not valid_token(token):
             raise BackendError("erreur bw : « unlock » n'a pas renvoyé de session")
@@ -431,6 +431,20 @@ class BwBackend(VaultBackend):
         if not isinstance(d, dict):
             raise BackendError("erreur bw : « get item » n'a pas renvoyé d'objet")
         return d
+
+    def get_ssh_key(self, item_id: str, prompt: Optional[Prompt] = None):
+        """Un seul `bw get item` (cache local) : élément et clé privée (chargement automatique)."""
+        d = self.get_item(item_id, prompt)
+        try:
+            item = self._item(d)
+            if item is None:
+                raise ItemNotFound("élément %s : pas une clé SSH" % item_id)
+            key = d["sshKey"].get("privateKey") or ""
+            if not key:
+                raise BackendError("erreur bw : élément %s sans clé privée" % item_id)
+            return item, key.encode()
+        finally:
+            del d
 
     def get_private_key(self, item_id: str, prompt: Optional[Prompt] = None) -> bytes:
         d = self.get_item(item_id, prompt)

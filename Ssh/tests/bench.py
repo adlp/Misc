@@ -87,6 +87,82 @@ def keyring_session(rid):
     return subprocess.run(["keyctl", "pipe", r.stdout.strip()], capture_output=True, text=True).stdout
 
 
+# --- garde de session : rien laissé hors des bancs -------------------------------
+
+def _real_home():
+    import pwd
+    return pwd.getpwuid(os.getuid()).pw_dir
+
+
+def real_paths():
+    """Données réelles de l'utilisateur que les tests ne doivent pas toucher."""
+    home = _real_home()
+    rt = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    return {"ssh": os.path.join(home, ".ssh"),
+            "runtime": os.path.join(rt, "sshvault"),
+            "data": os.path.join(home, ".local", "share", "sshvault"),
+            "config": os.path.join(home, ".config", "sshvault")}
+
+
+def snapshot(path):
+    """{chemin relatif : (mode, taille, mtime_ns, inode)} de tout ce qui est sous `path`, ou None."""
+    if not os.path.lexists(path):
+        return None
+    out = {}
+    for root, dirs, files in os.walk(path):
+        for name in dirs + files:
+            full = os.path.join(root, name)
+            try:
+                st = os.lstat(full)
+            except OSError:
+                continue
+            out[os.path.relpath(full, path)] = (st.st_mode, st.st_size, st.st_mtime_ns, st.st_ino)
+    return out
+
+
+def processes_matching(markers):
+    """[(pid, ligne de commande)] des processus de l'utilisateur dont la ligne de commande
+    contient l'un des marqueurs (pytest et ses parents exclus)."""
+    me = {os.getpid(), os.getppid()}
+    out = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit() or int(d) in me:
+            continue
+        try:
+            if os.stat("/proc/" + d).st_uid != os.getuid():
+                continue
+            with open("/proc/%s/cmdline" % d, "rb") as f:
+                cmd = " " + f.read().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            continue
+        if proc_alive(int(d)) and any(m in cmd for m in markers):
+            out.append((int(d), cmd.strip()))
+    return out
+
+
+@pytest.fixture(scope="session", autouse=True)
+def session_guard(tmp_path_factory):
+    """Critère d'acceptation (stories 4 et 5), vérifié en fin de session : aucun processus de
+    test restant (agent, surveillant, sshd, bw, askpass, ensure), `~/.ssh` réel inchangé, et ni
+    socket, ni état, ni données sshvault réels créés par les tests."""
+    paths = real_paths()
+    before = {k: snapshot(p) for k, p in paths.items()}
+    yield
+    markers = ["/dev/shm/sshvault-test-", str(tmp_path_factory.getbasetemp()), FAKE_BW, "sshvault-it-",
+               " -m sshvault "]
+    deadline = time.monotonic() + 10
+    left = processes_matching(markers)
+    while left and time.monotonic() < deadline:
+        time.sleep(0.2)
+        left = processes_matching(markers)
+    assert not left, "processus de test restants : %s" % left
+    after = {k: snapshot(p) for k, p in paths.items()}
+    assert after["ssh"] == before["ssh"], "~/.ssh réel modifié par les tests"
+    for k in ("runtime", "data", "config"):
+        if before[k] is None:
+            assert after[k] is None, "%s réel créé par les tests" % paths[k]
+
+
 # --- clés de test et coffre factice ---------------------------------------------
 
 @pytest.fixture(scope="session")
@@ -280,6 +356,7 @@ class Bench:
         self.ssh_add.chmod(0o755)
         self.known_hosts = tmp_path / "known_hosts"
         self.known_hosts.write_text("")
+        self.exe = write_exe(tmp_path / "exe")
         self.env = self.base_env()
 
     def write_vault(self):
@@ -294,7 +371,8 @@ class Bench:
         env.update(HOME=str(self.home), SSHVAULT_SSH_HOME=str(self.home), XDG_RUNTIME_DIR=str(self.runtime),
                    SSHVAULT_BW=str(self.bw), FAKE_BW_VAULT=str(self.vault_file),
                    FAKE_BW_LOG=str(self.log), FAKE_BW_PIDS=str(self.pids),
-                   PYTHONPATH=SRC, SSHVAULT_PROMPT_TIMEOUT="10",
+                   PYTHONPATH=SRC, SSHVAULT_PROMPT_TIMEOUT="10", SSHVAULT_TEST_BENCH="1",
+                   PATH=str(self.exe.parent) + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"),
                    SSHVAULT_SSH_ADD=str(self.ssh_add), SSHVAULT_KNOWN_HOSTS=str(self.known_hosts))
         env.pop("SSH_AGENT_PID", None)
         if self.witness:
@@ -410,66 +488,157 @@ class Bench:
         chaque apparition de l'invite (`trigger`, expression régulière). `signal_at_prompt` :
         signal envoyé à sshvault à la première invite. Après la sortie, `self.tty_echo` dit si
         l'écho du terminal est actif."""
-        answers = [answer] if isinstance(answer, str) else list(answer or [])
         e = dict(self.env)
         e.update(env or {})
-        master, slave = pty.openpty()
-        slave_name = os.ttyname(slave)
+        r = pty_run([[sys.executable, "-m", "sshvault", *args]], e, answers=answer, timeout=timeout,
+                    trigger=trigger, signal_at_prompt=signal_at_prompt)
+        self.tty_echo = r.echo
+        return subprocess.CompletedProcess(r.args, r.returncode, r.stdout, r.stderr), r.screen
 
-        def ctty():
-            fd = os.open(slave_name, os.O_RDWR)  # après setsid : devient le terminal de contrôle
-            os.close(fd)
 
-        p = subprocess.Popen([sys.executable, "-m", "sshvault", *args], env=e, stdin=subprocess.DEVNULL,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
-                             preexec_fn=ctty)
-        # le parent garde le côté esclave ouvert : sinon le maître lit EIO tant que
-        # l'enfant n'a pas rouvert /dev/tty
-        seen = b""
-        sent = 0
-        deadline = time.monotonic() + timeout
+PTYLEAD = os.path.join(HERE, "ptylead.py")
+
+
+def session_members(sid):
+    """pids vivants de la session `sid` (champ « session » de /proc/<pid>/stat)."""
+    out = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
         try:
-            while p.poll() is None and time.monotonic() < deadline:
-                r, _, _ = select.select([master], [], [], 0.1)
-                if r:
-                    try:
-                        chunk = os.read(master, 4096)
-                    except OSError:
-                        break
-                    seen += chunk
-                if signal_at_prompt is not None and re.search(trigger, seen):
-                    time.sleep(0.2)
+            with open("/proc/%s/stat" % d) as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if fields[0] != "Z" and int(fields[3]) == sid:
+            out.append(int(d))
+    return out
+
+
+class PtyResult:
+    def __init__(self, args, returncode, stdout, stderr, screen, echo, prompts, duration, rcs):
+        self.args, self.returncode, self.stdout, self.stderr = args, returncode, stdout, stderr
+        self.screen, self.echo, self.prompts, self.duration, self.rcs = screen, echo, prompts, duration, rcs
+
+
+def pty_run(cmds, env, answers=None, trigger=rb"mot de passe", timeout=30, signal_at_prompt=None,
+            send_at_prompt=None, mode="direct"):
+    """Commande(s) `cmds` (liste d'argv) sur un pseudo-terminal neuf, terminal de contrôle de leur
+    session ; stdin /dev/null, stdout et stderr hors du terminal (comme ssh lancé avec < /dev/null).
+    mode « direct » : la commande unique est chef de session, donc au premier plan ;
+    « fg » : un chef (ptylead.py) lance toutes les commandes dans son groupe, au premier plan ;
+    « bg » : chaque commande dans son propre groupe, en arrière-plan (comme `cmd &` d'un shell
+    interactif : lire le terminal l'arrêterait par SIGTTIN).
+    `answers` (texte, ou liste : une réponse par invite) est tapé après chaque apparition de
+    l'invite (`trigger`) ; `send_at_prompt` (octets) est écrit dans le terminal à la première
+    invite (b"\\x03" : Ctrl-C) ; `signal_at_prompt` envoyé au processus lancé à la première invite.
+    Résultat : codes, sorties, texte affiché sur le terminal, écho actif après la sortie,
+    nombre d'invites vues, durée."""
+    answers = [answers] if isinstance(answers, str) else list(answers or [])
+    master, slave = pty.openpty()
+    slave_name = os.ttyname(slave)
+
+    def ctty():
+        os.close(os.open(slave_name, os.O_RDWR))  # après setsid : devient le terminal de contrôle
+
+    if mode == "direct":
+        assert len(cmds) == 1
+        argv = list(cmds[0])
+    else:
+        argv = [sys.executable, PTYLEAD, mode, slave_name, json.dumps([list(c) for c in cmds])]
+    t0 = time.monotonic()
+    p = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         start_new_session=True, preexec_fn=ctty if mode == "direct" else None)
+    # le parent garde le côté esclave ouvert : sinon le maître lit EIO tant que
+    # l'enfant n'a pas rouvert /dev/tty
+    seen = b""
+    sent = 0
+    deadline = time.monotonic() + timeout
+    out = err = b""
+    try:
+        while p.poll() is None and time.monotonic() < deadline:
+            r, _, _ = select.select([master], [], [], 0.1)
+            if r:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    break
+                seen += chunk
+            if (signal_at_prompt is not None or send_at_prompt is not None) and re.search(trigger, seen):
+                time.sleep(0.2)
+                if signal_at_prompt is not None:
                     p.send_signal(signal_at_prompt)
                     signal_at_prompt = None
-                if sent < len(answers) and len(re.findall(trigger, seen)) > sent:
-                    time.sleep(0.2)
-                    os.write(master, (answers[sent] + "\n").encode())
-                    sent += 1
-            out, err = p.communicate(timeout=max(1, deadline - time.monotonic()))
+                if send_at_prompt is not None:
+                    os.write(master, send_at_prompt)
+                    send_at_prompt = None
+            if sent < len(answers) and len(re.findall(trigger, seen)) > sent:
+                time.sleep(0.2)
+                os.write(master, (answers[sent] + "\n").encode())
+                sent += 1
+        out, err = p.communicate(timeout=max(1, deadline - time.monotonic()))
+        duration = time.monotonic() - t0
+        try:
+            while True:
+                r, _, _ = select.select([master], [], [], 0.1)
+                if not r:
+                    break
+                chunk = os.read(master, 4096)
+                if not chunk:
+                    break
+                seen += chunk
+        except OSError:
+            pass
+    finally:
+        # délai dépassé ou erreur : toute la session (chef, ssh lancés en arrière-plan dans
+        # leurs propres groupes, ensure, bw…), pas seulement le processus lancé
+        left = session_members(p.pid)
+        for pid in left:
             try:
-                while True:
-                    r, _, _ = select.select([master], [], [], 0.1)
-                    if not r:
-                        break
-                    chunk = os.read(master, 4096)
-                    if not chunk:
-                        break
-                    seen += chunk
-            except OSError:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
                 pass
-        finally:
-            if p.poll() is None:
-                p.kill()
-                p.wait()
-            try:
-                import termios
-                self.tty_echo = bool(termios.tcgetattr(slave)[3] & termios.ECHO)
-            except Exception:
-                self.tty_echo = None
-            os.close(master)
-            os.close(slave)
-        return subprocess.CompletedProcess(p.args, p.returncode, out.decode(), err.decode()), seen.decode(
-            errors="replace")
+        if p.poll() is None:
+            p.kill()
+        p.wait()
+        assert wait_gone(left), "processus de la session pty encore vivants : %s" % left
+        try:
+            import termios
+            echo = bool(termios.tcgetattr(slave)[3] & termios.ECHO)
+        except Exception:
+            echo = None
+        os.close(master)
+        os.close(slave)
+    out, err = out.decode(errors="replace"), err.decode(errors="replace")
+    stragglers = [x for x in left if x != p.pid]
+    rcs = [p.returncode]
+    if mode != "direct":
+        m = re.search(r"^ptylead-rc: (\[.*\])$", out, re.M)
+        rcs = json.loads(m.group(1)) if m else None
+        out = re.sub(r"^ptylead-rc: .*\n?", "", out, flags=re.M)
+    r = PtyResult(argv, p.returncode, out, err, seen.decode(errors="replace"), echo,
+                  len(re.findall(trigger, seen)), duration, rcs)
+    r.stragglers = stragglers  # processus de la session encore vivants à la fin (tués)
+    return r
+
+
+def write_exe(directory):
+    """`sshvault` du PATH des bancs (lignes Match exec du ssh_config généré) : enveloppe de
+    `python -m sshvault` du dépôt, jamais un sshvault installé sur le poste. Hors d'un banc
+    (SSHVAULT_TEST_BENCH absent : un `ssh` lancé avec l'environnement de pytest, qui a le vrai
+    XDG_RUNTIME_DIR et le vrai keyring), elle sort en code 1 sans rien lancer.
+    SSHVAULT_TEST_TRACE=1 : une ligne « sshvault-test: fin <args> rc=N » sur stderr après chaque
+    appel (ordre des appels dans la sortie de ssh -v)."""
+    directory = pathlib.Path(directory)
+    directory.mkdir(exist_ok=True)
+    exe = directory / "sshvault"
+    exe.write_text(
+        "#!/bin/sh\n[ -n \"$SSHVAULT_TEST_BENCH\" ] || exit 1\n"
+        "if [ -n \"$SSHVAULT_TEST_TRACE\" ]; then\n  '%s' -m sshvault \"$@\"\n  rc=$?\n"
+        "  printf 'sshvault-test: fin %%s rc=%%d\\n' \"$*\" \"$rc\" >&2\n  exit $rc\nfi\n"
+        "exec '%s' -m sshvault \"$@\"\n" % (sys.executable, sys.executable))
+    exe.chmod(0o755)
+    return exe
 
 
 def private_runtime_dir():

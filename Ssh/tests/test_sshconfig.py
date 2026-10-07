@@ -172,12 +172,16 @@ def test_ssh_config_genere(bench):
     assert r.returncode == 0, r.stderr
     d = sv_dir(bench)
     sock = bench.runtime / "sshvault" / "agent.sock"
+    exe = bench.exe
     assert (d / "config").read_text() == (
         sshconfig.HEADER
-        + "\n# Bastion RSA %s\nMatch originalhost bastion,jump\n    IdentityAgent \"%s\"\n    IdentityFile \"%s\"\n"
-          "    IdentitiesOnly yes\n" % (ID_BASTION, sock, d / "pub" / pub_name(bench, "bastion"))
-        + "\n# Serveur Prod %s\nMatch originalhost prod.example.com,*.lab.example\n    IdentityAgent \"%s\"\n"
-          "    IdentityFile \"%s\"\n    IdentitiesOnly yes\n" % (ID_PROD, sock, d / "pub" / pub_name(bench, "prod")))
+        + "\n# Bastion RSA %s\nMatch originalhost bastion,jump exec \"'%s' ensure --id %s\"\n"
+          "Match originalhost bastion,jump\n    IdentityAgent \"%s\"\n    IdentityFile \"%s\"\n"
+          "    IdentitiesOnly yes\n" % (ID_BASTION, exe, ID_BASTION, sock, d / "pub" / pub_name(bench, "bastion"))
+        + "\n# Serveur Prod %s\nMatch originalhost prod.example.com,*.lab.example exec \"'%s' ensure --id %s\"\n"
+          "Match originalhost prod.example.com,*.lab.example\n    IdentityAgent \"%s\"\n"
+          "    IdentityFile \"%s\"\n    IdentitiesOnly yes\n" % (ID_PROD, exe, ID_PROD, sock,
+                                                                d / "pub" / pub_name(bench, "prod")))
     assert sorted(os.listdir(d / "pub")) == sorted([pub_name(bench, "bastion"), pub_name(bench, "prod")])
     assert (d / "pub" / pub_name(bench, "prod")).read_text().split() == bench.keys["prod"]["public"].split()[:2]
     assert mode(bench.home / ".ssh") == 0o700 and mode(d) == 0o700 and mode(d / "pub") == 0o700
@@ -258,7 +262,8 @@ def test_ssh_config_hote_dans_deux_elements(bench, tmp_path):
     assert r.returncode == 0, r.stderr
     assert "hôte « prod.example.com » porté par 2 éléments" in r.stderr
     text = (sv_dir(bench) / "config").read_text()
-    assert text.count("prod.example.com") == 2
+    blocks = [l for l in text.splitlines() if l.startswith("Match ") and " exec " not in l]
+    assert sum(l.count("prod.example.com") for l in blocks) == 2
     pub = sv_dir(bench) / "pub"
     for host in ("prod.example.com", "Prod.Example.COM"):
         conf = ssh_G(tmp_path, host, sv_dir(bench) / "config")
@@ -548,7 +553,7 @@ def test_rien_ecrit_hors_du_home_de_test(bench):
     assert snap() == before
     written = {str(p.relative_to(bench.tmp)) for p in bench.tmp.rglob("*") if p.is_file()}
     assert {w for w in written if not w.startswith("home/")} <= {
-        "server/vault.json", "bw.log", "bin/bw", "bin/ssh-add", "known_hosts"}
+        "server/vault.json", "bw.log", "bin/bw", "bin/ssh-add", "known_hosts", "exe/sshvault"}
 
 
 # --- revue : fichiers non ordinaires, verrou, prérequis, Include, chemins, --check ----------

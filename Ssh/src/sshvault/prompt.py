@@ -6,8 +6,10 @@ Choix (lecture de `read_passphrase()`, readpass.c d'OpenSSH 8.9, et `man ssh`) :
       force  : askpass, même sans DISPLAY ;
       prefer : askpass plutôt que le terminal, si permis ;
       never  : jamais d'askpass ;
-  - sinon le terminal (`/dev/tty`, pas stdin : sous `Match exec`, stdin est /dev/null) ;
-    sans terminal, askpass si permis ;
+  - sinon le terminal (`/dev/tty`, pas stdin : sous `Match exec`, stdin est /dev/null),
+    seulement si le processus est au premier plan du terminal (`tcgetpgrp == getpgrp`) :
+    en arrière-plan (`ssh … &`), lire `/dev/tty` arrêterait le processus (SIGTTIN) ;
+    sans terminal au premier plan, askpass si permis ;
   - askpass suppose SSH_ASKPASS défini (`man ssh`) ; s'il manque, repli sur le terminal.
 
 Chaque invite a un délai borné. Le descripteur de `/dev/tty` est fermé et l'écho
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 import os
 import select
+import shutil
 import signal
 import subprocess
 import termios
@@ -69,6 +72,23 @@ def open_tty(path: str = TTY_PATH) -> Optional[int]:
         return os.open(path, os.O_RDWR | os.O_NOCTTY)
     except OSError:
         return None
+
+
+def is_foreground(fd: int) -> bool:
+    """Le processus est-il dans le groupe de premier plan du terminal `fd` ?"""
+    try:
+        return os.tcgetpgrp(fd) == os.getpgrp()
+    except OSError:
+        return False
+
+
+def open_foreground_tty(path: str = TTY_PATH) -> Optional[int]:
+    """Descripteur de `/dev/tty` si le processus y est au premier plan, sinon None."""
+    fd = open_tty(path)
+    if fd is not None and not is_foreground(fd):
+        os.close(fd)
+        return None
+    return fd
 
 
 def prompt_tty(fd: int, text: str, timeout: float) -> str:
@@ -129,16 +149,41 @@ def prompt_askpass(prog: str, text: str, timeout: float) -> str:
     return out.decode(errors="replace").rstrip("\r\n")
 
 
+UNAVAILABLE = "aucune invite possible (ni /dev/tty, ni SSH_ASKPASS utilisable)"
+
+
+def _usable_env(env: Mapping[str, str]) -> Mapping[str, str]:
+    """`env` sans SSH_ASKPASS si ce programme n'est pas un fichier exécutable (cherché dans le
+    PATH s'il n'a pas de `/`) : un askpass absent compte comme « pas d'askpass », pas comme une
+    invite annulée."""
+    prog = env.get("SSH_ASKPASS") or ""
+    if not prog:
+        return env
+    path = prog if "/" in prog else (shutil.which(prog, path=env.get("PATH")) or "")
+    if path and os.path.isfile(path) and os.access(path, os.X_OK):
+        return env
+    return {k: v for k, v in env.items() if k != "SSH_ASKPASS"}
+
+
+def available(env: Optional[Mapping[str, str]] = None, tty_path: str = TTY_PATH) -> bool:
+    """Une invite serait-elle possible (terminal au premier plan, ou askpass utilisable) ?"""
+    env = os.environ if env is None else env
+    fd = open_foreground_tty(tty_path)
+    if fd is not None:
+        os.close(fd)
+    return plan(_usable_env(env), fd is not None) is not None
+
+
 def ask_password(text: str, env: Optional[Mapping[str, str]] = None,
                  timeout: Optional[float] = None, tty_path: str = TTY_PATH) -> str:
     env = os.environ if env is None else env
     if timeout is None:
         timeout = prompt_timeout(env)
-    fd = open_tty(tty_path)
+    fd = open_foreground_tty(tty_path)
     try:
-        p = plan(env, fd is not None)
+        p = plan(_usable_env(env), fd is not None)
         if p is None:
-            raise PromptUnavailable("aucune invite possible (ni /dev/tty, ni SSH_ASKPASS utilisable)")
+            raise PromptUnavailable(UNAVAILABLE)
         if p.use_askpass:
             return prompt_askpass(p.askpass, text, timeout)
         return prompt_tty(fd, text, timeout)

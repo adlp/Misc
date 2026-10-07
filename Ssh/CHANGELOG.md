@@ -1,5 +1,54 @@
 # Changelog — sshvault
 
+## sshvault 0.4.0 — Chargement transparent à la demande — 2026-10-07
+
+- `ssh <hôte>` charge seul la clé manquante, pour la cible comme pour chaque saut
+  ProxyJump/ProxyCommand : le `ssh_config` généré reçoit, avant chaque bloc, une ligne
+  `Match originalhost <motifs> exec "'<sshvault>' ensure --id <id>"` sans directive. La
+  commande ne contient que le chemin absolu de sshvault (entre apostrophes, `%` doublé ;
+  `'`, `"`, `\`, `${` et caractères de contrôle refusés) et l'id (UUID vérifié) : jamais
+  `%h` ni `%n`. Chemin résolu : la commande lancée sous le nom `sshvault`, sinon le PATH
+  (dossiers absolus) ; introuvable : code 4.
+- `sshvault ensure --id ID` : chemin rapide sans `bw` ni réseau si la clé est dans
+  l'agent dédié avec plus de 60 s restantes (médiane mesurée 27 à 30 ms, max 31 à 43 ms ; point
+  d'entrée `sshvault.launch` qui ne charge pas la CLI dans ce cas) ; sinon, sous un verrou
+  `flock` par utilisateur et après relecture de l'état, chargement comme `load` (un seul
+  `bw get item`, agent démarré s'il le faut, `ssh-add -t key-ttl -` par stdin, tout ou
+  rien, état enregistré ; une clé presque expirée est rechargée, avec ses `-c`/`-h`).
+  `ssh -G` (parent lu dans `/proc`, à travers le shell de `$SHELL -c`) : rien demandé,
+  code 0. Invite du coffre sur `/dev/tty` seulement au premier plan du terminal, sinon
+  askpass, sinon échec immédiat sans `bw` ; jamais stdin, jamais SIGTTIN. Échec de
+  déverrouillage mémorisé 30 s pour la connexion (`unlock-failed`) : pas de nouvelle
+  invite. Silencieux en cas de succès, une ligne `sshvault: <hôte> : <cause>` sinon ;
+  délai global `SSHVAULT_ENSURE_TIMEOUT` (240 s) ; Ctrl-C, SIGTERM, SIGHUP rattrapés.
+- Revue : agent vérifié (démarré, OpenSSH ≥ 8.9, verrou) avant toute invite ou `bw` ;
+  mémoire d'échec liée à la connexion (ssh le plus haut : pid et date de démarrage),
+  écrite seulement pour un mot de passe refusé par `bw` ou une invite annulée ou sans
+  réponse, effacée par `sshvault unlock` ; askpass non exécutable = pas d'askpass ;
+  `--nointeraction` et `-o BatchMode=yes` du ssh : aucune invite ; `ssh -O` traité comme
+  `-G`, `-P` reconnu ; ssh appelant cherché sur tous les ancêtres ; seuil de fraîcheur
+  min(60 s, durée/2) ; clé changée dans le coffre détectée (`.pub` de la config) ; même
+  clé dans deux éléments : reconnue pour les deux ; `auto-confirm` refusé si l'agent n'a
+  pas d'askpass ; clé privée différente détectée même avec une ancienne copie, retrait
+  protégé des signaux, état non écrit → clé retirée ; délai global 240 s compté depuis le
+  démarrage (chemin rapide compris), invite bornée par le temps restant, résultat acquis
+  protégé d'un délai ou signal tardif ; avertissements du backend affichés ; invite
+  « clé pour <hôte> » ; chemin de sshvault vérifié (`--version` ≥ 0.4.0), avertissement
+  s'il change ou vient d'un `.venv`.
+- `config` : `auto-load` (défaut `true` ; `false` = config de la 0.3.0, sans lignes
+  `ensure`), `auto-restrict` et `auto-confirm` (défaut `false` : `ssh-add -h` / `-c` au
+  chargement automatique). Booléens `true`/`false`.
+- L'invite du coffre (toutes commandes) et l'écho coupé pendant `ssh-add` exigent
+  désormais d'être au premier plan du terminal ; en arrière-plan : askpass ou échec.
+- Message « absent de known_hosts » commun à `load --restrict` et `auto-restrict`
+  (« restriction -h »).
+- Tests : `tests/test_ensure.py`, une ligne par ligne de la matrice : vrais `ssh` contre
+  deux sshd de test (rebond A, cible B), ProxyJump et ProxyCommand, vrais
+  `ssh-agent`/`ssh-add`, faux `bw` (délai simulé de 1,4 s), pty au premier plan, en
+  arrière-plan, deux ssh simultanés, Ctrl-C ; latence du chemin rapide mesurée. Garde de
+  fin de session : aucun processus de test restant, `~/.ssh` réel inchangé, aucun dossier
+  sshvault réel créé. Intégration : `ssh` vers un sshd local via `ensure` et le vrai `bw`.
+
 ## sshvault 0.3.0 — Association clé-hôtes et ssh_config généré — 2026-10-07
 
 - `hosts add|remove|set SÉLECTION HÔTE…` et `hosts list SÉLECTION` : modifient le seul

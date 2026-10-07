@@ -27,7 +27,6 @@ import base64
 import contextlib
 import errno
 import fcntl
-import hashlib
 import os
 import re
 import shutil
@@ -42,12 +41,12 @@ from dataclasses import dataclass
 from typing import Callable, Mapping, Optional, Sequence
 
 from .agentstate import STATE_NAME, AgentState, empty
-from .fsutil import NotPrivateTmpfs, check_private_tmpfs, ensure_dir
+from .fsutil import ensure_dir
+from .prompt import open_foreground_tty
+# briques légères (aussi pour le chemin rapide d'ensure), réexportées ici
+from .runtime import (DIR_NAME, RUN_USER, SOCKET_NAME, SUN_PATH_MAX, AgentError, fingerprint,  # noqa: F401
+                      parse_listing, public_blob, resolve_dir)
 
-DIR_NAME = "sshvault"
-SOCKET_NAME = "agent.sock"
-RUN_USER = "/run/user"
-SUN_PATH_MAX = 107  # sun_path : 108 octets, NUL final compris
 CMD_TIMEOUT = 30.0
 STOP_WAIT = 5.0
 MIN_OPENSSH = (8, 9)
@@ -58,10 +57,6 @@ _PID_RE = re.compile(rb"SSH_AGENT_PID=(\d+);")
 _NO_HOSTKEY_RE = re.compile(r'No host keys found for destination "([^"]*)"')
 #: Hôte accepté par --restrict : nom ou IPv4 littéral (pas de motif, user@, >, :port, IPv6).
 LITERAL_HOST_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
-
-
-class AgentError(Exception):
-    """Erreur de l'agent dédié (code 4), message d'une ligne."""
 
 
 class AgentStopped(AgentError):
@@ -90,57 +85,6 @@ def _one_line(data, limit: int = 300) -> str:
     s = " ".join(l.strip() for l in (data or "").splitlines() if l.strip())
     s = re.sub(r"[\x00-\x1f\x7f-\x9f]", "?", s)
     return s if len(s) <= limit else s[: limit - 1] + "…"
-
-
-# --- socket -------------------------------------------------------------------------
-
-def resolve_dir(env: Optional[Mapping[str, str]] = None, uid: Optional[int] = None,
-                run_user: str = RUN_USER, mounts: str = "/proc/self/mounts") -> str:
-    """Dossier `<base>/sshvault` du socket et de l'état ; base : XDG_RUNTIME_DIR, ou
-    `/run/user/<uid>` si la variable est absente ; tmpfs privé exigé (sinon AgentError).
-    Chemin canonique (realpath) : une même base écrite autrement donne le même socket."""
-    env = os.environ if env is None else env
-    uid = os.getuid() if uid is None else uid
-    rt = env.get("XDG_RUNTIME_DIR") or ""
-    if rt:
-        if not os.path.isabs(rt):
-            raise AgentError("XDG_RUNTIME_DIR n'est pas un chemin absolu (%r) : agent dédié refusé" % rt)
-        try:
-            check_private_tmpfs(rt, mounts)
-        except NotPrivateTmpfs as e:
-            raise AgentError("XDG_RUNTIME_DIR refusé pour l'agent dédié : %s" % e) from None
-        base = rt
-    else:
-        base = os.path.join(run_user, str(uid))
-        try:
-            check_private_tmpfs(base, mounts)
-        except NotPrivateTmpfs as e:
-            raise AgentError("XDG_RUNTIME_DIR absent, repli refusé : %s ; agent dédié impossible" % e) from None
-    d = os.path.join(os.path.realpath(base), DIR_NAME)
-    if len(os.fsencode(os.path.join(d, SOCKET_NAME))) > SUN_PATH_MAX:
-        raise AgentError("chemin du socket trop long (%d octets au plus) : %s"
-                         % (SUN_PATH_MAX, os.path.join(d, SOCKET_NAME)))
-    return d
-
-
-# --- clés -------------------------------------------------------------------------------
-
-def fingerprint(blob_b64: str) -> str:
-    """Empreinte SHA256 au format d'OpenSSH (`SHA256:` + base64 sans `=`)."""
-    raw = base64.b64decode(blob_b64, validate=True)
-    return "SHA256:" + base64.b64encode(hashlib.sha256(raw).digest()).decode().rstrip("=")
-
-
-def public_blob(public_key: str) -> Optional[str]:
-    """`type base64 [commentaire]` → base64 de la clé, ou None si illisible."""
-    parts = (public_key or "").split()
-    if len(parts) < 2:
-        return None
-    try:
-        base64.b64decode(parts[1], validate=True)
-    except (ValueError, TypeError):
-        return None
-    return parts[1]
 
 
 @dataclass(frozen=True)
@@ -194,9 +138,11 @@ def askpass_rules(env: Mapping[str, str]):
 
 
 def tty_available() -> bool:
-    try:
-        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
-    except OSError:
+    """Terminal de contrôle utilisable : `/dev/tty` ouvrable **et** processus au premier plan
+    (en arrière-plan, ssh-add lisant `/dev/tty` serait arrêté par SIGTTIN, et couper l'écho
+    toucherait le terminal d'un autre travail)."""
+    fd = open_foreground_tty()
+    if fd is None:
         return False
     os.close(fd)
     return True
@@ -215,9 +161,8 @@ class NoEcho:
         self.fd, self.old, self.newline = None, None, newline
 
     def __enter__(self):
-        try:
-            self.fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
-        except OSError:
+        self.fd = open_foreground_tty()
+        if self.fd is None:
             return self
         try:
             self.old = termios.tcgetattr(self.fd)
@@ -683,19 +628,8 @@ class Agent:
     def keys(self) -> list:
         """Clés de l'agent (`ssh-add -L`). Un agent verrouillé n'en montre aucune."""
         r = self._ssh_add_simple(["-L"], "-L")
-        text = r.stdout.decode(errors="replace")
-        if r.returncode == 1 and "has no identities" in text + r.stderr.decode(errors="replace"):
-            return []
-        if r.returncode != 0:
-            raise AgentError("ssh-add -L (code %d) : %s" % (r.returncode, _one_line(r.stderr) or _one_line(text)))
-        out = []
-        for line in text.splitlines():
-            parts = line.split(None, 2)
-            blob = public_blob(line)
-            if blob is None:
-                continue
-            out.append(AgentKey(parts[0], blob, parts[2] if len(parts) > 2 else "", fingerprint(blob)))
-        return out
+        return [AgentKey(t, blob, comment, fingerprint(blob))
+                for t, blob, comment in parse_listing(r.returncode, r.stdout, r.stderr)]
 
     def remove(self, key: AgentKey) -> None:
         """`ssh-add -d -`, clé **publique** sur stdin (mesuré : accepté par la 8.9)."""
@@ -723,7 +657,7 @@ class Agent:
         err = r.stderr.decode(errors="replace")
         m = _NO_HOSTKEY_RE.search(err)
         if m:
-            raise HostKeyMissing("hôte %s absent de known_hosts (--restrict) : rien chargé" % _one_line(m.group(1)))
+            raise HostKeyMissing("hôte %s absent de known_hosts (restriction -h) : rien chargé" % _one_line(m.group(1)))
         if r.returncode != 1 or "Error loading key" not in err:
             raise AgentError("ssh-add -h (code %d) : %s" % (r.returncode, _one_line(err)))
 
@@ -747,7 +681,7 @@ class Agent:
         err = r.stderr.decode(errors="replace")
         m = _NO_HOSTKEY_RE.search(err)
         if m:
-            raise HostKeyMissing("hôte %s absent de known_hosts (--restrict) : clé non chargée" % _one_line(m.group(1)))
+            raise HostKeyMissing("hôte %s absent de known_hosts (restriction -h) : clé non chargée" % _one_line(m.group(1)))
         if "agent refused operation" in err and self.state.load().get("locked"):
             raise AgentLocked("agent verrouillé : lancer « sshvault agent unlock »")
         if encrypted and "Could not add identity" not in err and "Error connecting" not in err:

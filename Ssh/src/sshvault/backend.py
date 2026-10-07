@@ -38,6 +38,10 @@ class VaultLocked(VaultError):
     """Coffre verrouillé et pas de déverrouillage possible (pas d'invite, mot de passe refusé…)."""
 
 
+class PasswordRefused(VaultLocked):
+    """Mot de passe maître saisi puis refusé par le client du coffre."""
+
+
 class BackendError(VaultError):
     """Le client du coffre a échoué : absent, code d'erreur, sortie illisible, délai dépassé."""
 
@@ -181,6 +185,15 @@ class VaultBackend(abc.ABC):
     @abc.abstractmethod
     def get_private_key(self, item_id: str, prompt: Optional[Prompt] = None) -> bytes:
         """Clé privée, en mémoire seulement : l'appelant ne l'écrit ni ne l'affiche."""
+
+    def get_ssh_key(self, item_id: str, prompt: Optional[Prompt] = None):
+        """(élément, clé privée) d'un seul élément « SSH key » ; ItemNotFound s'il manque. La clé
+        reste en mémoire : l'appelant ne l'écrit ni ne l'affiche. Une implémentation peut le
+        faire en un seul appel au client du coffre."""
+        found = [i for i in self.list_ssh_keys(prompt) if i.id == item_id]
+        if not found:
+            raise ItemNotFound("élément %s absent du coffre (ou pas une clé SSH)" % item_id)
+        return found[0], self.get_private_key(item_id, prompt)
 
     @abc.abstractmethod
     def set_hosts(self, item_id: str, hosts: Sequence[str], prompt: Optional[Prompt] = None) -> SshKeyItem:

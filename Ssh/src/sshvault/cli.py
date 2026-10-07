@@ -21,6 +21,8 @@ Codes de sortie :
      ordinaire, Include de sshvault dans un bloc Host/Match, chemin personnel avec %, $ ou
      joker de glob), ou erreur interne
   130 interrompu (Ctrl-C, SIGTERM, SIGHUP)
+`ensure` (appelé par ssh, Match exec) : 0 si la clé est présente ou chargée, et pour `ssh -G` ;
+sinon le code de l'erreur, sans effet sur ssh (le Match ne porte aucune directive).
 `status` : 0 si le coffre est déverrouillé, 3 s'il est verrouillé ou non connecté, 4 en erreur.
 `agent status` : 0 si l'agent dédié tourne, 3 s'il est arrêté, 4 en erreur ou agent tiers.
 Toute erreur donne une seule ligne sur stderr, jamais de traceback.
@@ -45,6 +47,9 @@ from .backend import (BackendError, InvalidHost, NotLoggedIn, SshKeyItem, VaultB
                       normalize_hosts, valid_host)
 from .bw import BwBackend
 from .config import Config, ConfigError, ConfigWriteError, describe_duration, parse_duration
+from . import ensure as ensure_mod
+from . import fastpath
+from .ensure import Deadline
 from .prompt import DEFAULT_TIMEOUT as PROMPT_TIMEOUT, PromptError, ask_password, prompt_timeout
 from .bw import DEFAULT_TIMEOUT as BW_TIMEOUT
 from .session import DEFAULT_TTL, SessionStore, SessionStoreError
@@ -184,7 +189,12 @@ def build_parser() -> Parser:
     g.add_argument("--check", action="store_true",
                    help="code 0 si tout est à jour et la ligne Include en tête, 1 sinon ; n'écrit rien")
 
-    s = sub.add_parser("config", help="réglages (key-ttl : durée de vie par défaut des clés)")
+    s = sub.add_parser("ensure", help="charge à la demande la clé d'un élément (appelé par ssh : ligne "
+                                      "Match exec du ssh_config généré)")
+    s.add_argument("--id", required=True, metavar="ID", help="id (UUID) de l'élément")
+
+    s = sub.add_parser("config", help="réglages : key-ttl (durée de vie par défaut des clés), auto-load, "
+                                      "auto-restrict, auto-confirm (chargement automatique)")
     csub = s.add_subparsers(dest="config_cmd", metavar="ACTION", parser_class=Parser)
     csub.required = True
     c = csub.add_parser("get", help="affiche un réglage, ou tous")
@@ -258,6 +268,7 @@ def run(args, backend: VaultBackend) -> int:
         return RC_OK
     if args.cmd == "unlock":
         backend.unlock(prompt, ttl=args.ttl)
+        _clear_unlock_failure()
         where = backend.info()["session"]
         print("coffre déverrouillé (%s)" % ("session %ds, %s" % (args.ttl, where) if where
                                             else "session non rangée"))
@@ -291,6 +302,14 @@ def run(args, backend: VaultBackend) -> int:
     if args.cmd == "ssh-config":
         return run_ssh_config(args, backend, prompt)
     raise UsageError("commande inconnue : %s" % args.cmd)
+
+
+def _clear_unlock_failure() -> None:
+    """Coffre déverrouillé à la main : l'échec mémorisé par `ensure` ne bloque plus rien."""
+    try:
+        ensure_mod.clear_failure(resolve_dir())
+    except Exception:
+        pass
 
 
 # --- agent dédié ---------------------------------------------------------------------
@@ -549,10 +568,24 @@ def _split(values) -> list:
     return [h.strip() for v in values for h in v.split(",") if h.strip()]
 
 
-def regenerate(items: list, paths=None, socket: Optional[str] = None) -> None:
+def ensure_exe(paths) -> Optional[str]:
+    """Chemin de sshvault pour les lignes `Match exec` (avertissements sur stderr), ou None si
+    `auto-load` est faux."""
+    if not Config().get("auto-load"):
+        return None
+    exe = sshconfig.sshvault_exe()
+    for w in sshconfig.exe_warnings(exe, paths):
+        err("avertissement : %s" % w)
+    return exe
+
+
+_RESOLVE = object()  # regenerate : chemin de sshvault à résoudre (None : pas de Match exec)
+
+
+def regenerate(items: list, paths=None, socket: Optional[str] = None, exe=_RESOLVE) -> None:
     """Réécrit ce qui a changé dans ~/.ssh/sshvault/ ; avertissements sur stderr."""
     paths = paths or sshconfig.default_paths()
-    plan = sshconfig.build(items, paths, socket or make_agent().socket)
+    plan = sshconfig.build(items, paths, socket or make_agent().socket, ensure_exe(paths) if exe is _RESOLVE else exe)
     for w in plan.warnings:
         err("avertissement : %s" % w)
     res = sshconfig.apply(plan, paths)
@@ -612,7 +645,8 @@ def run_hosts(args, backend: VaultBackend, prompt) -> int:
     # dans le coffre : SshConfigError ou AgentError ici, rien n'est écrit.
     paths = sshconfig.default_paths()
     socket = make_agent().socket
-    sshconfig.build(items, paths, socket)
+    exe = ensure_exe(paths)
+    sshconfig.build(items, paths, socket, exe)
     if want == current:
         print("hôtes de « %s » inchangés : %s" % (clean(item.name), _hosts(item.hosts)))
         updated = item
@@ -625,7 +659,7 @@ def run_hosts(args, backend: VaultBackend, prompt) -> int:
         _warn_restricted(updated)
     items = [updated if i.id == updated.id else i for i in items]
     try:
-        regenerate(items, paths, socket)
+        regenerate(items, paths, socket, exe)
     except (sshconfig.SshConfigError, AgentError) as e:
         err("hôtes écrits dans le coffre, mais ssh_config non régénéré : %s" % e)
         return RC_BACKEND
@@ -656,7 +690,7 @@ def run_ssh_config(args, backend: VaultBackend, prompt) -> int:
     if not (args.print_only or args.check):
         regenerate(items)
         return RC_OK
-    plan = sshconfig.build(items, paths, make_agent().socket)
+    plan = sshconfig.build(items, paths, make_agent().socket, ensure_exe(paths))
     for w in plan.warnings:
         err("avertissement : %s" % w)
     if args.print_only:
@@ -682,12 +716,14 @@ def run_config(args) -> int:
     if args.config_cmd == "get":
         for line in cfg.lines(args.key):
             print(line)
-    elif args.config_cmd == "set":
-        cfg.set(args.key, args.value)
+    elif args.config_cmd in ("set", "unset"):
+        if args.config_cmd == "set":
+            cfg.set(args.key, args.value)
+        else:
+            cfg.unset(args.key)
         print(cfg.lines(args.key)[0])
-    elif args.config_cmd == "unset":
-        cfg.unset(args.key)
-        print(cfg.lines(args.key)[0])
+        if args.key == "auto-load":
+            print("pris en compte à la prochaine génération : lancer « sshvault ssh-config »")
     else:
         raise UsageError("action inconnue : config %s" % args.config_cmd)
     return RC_OK
@@ -695,6 +731,102 @@ def run_config(args) -> int:
 
 def _on_signal(signum, frame):
     raise Interrupted(signum)
+
+
+# --- chargement à la demande (Match exec) ----------------------------------------------------
+
+def _ensure_settings() -> dict:
+    cfg = Config()
+    return {k: cfg.get(k) for k in ("key-ttl", "auto-confirm", "auto-restrict")}
+
+
+def _quiet() -> None:
+    """Plus d'interruption ni de délai : le résultat est acquis, il ne reste qu'à le dire."""
+    signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGALRM))
+    signal.setitimer(signal.ITIMER_REAL, 0)
+
+
+def run_ensure(args) -> int:
+    """`ensure --id ID` : silencieux en cas de succès (sauf avertissements du backend, une
+    ligne chacun) ; sinon une ligne `sshvault: <hôte ou id> : <cause>`. Jamais de lecture de
+    stdin ni de traceback ; délai global borné (compté depuis le démarrage du processus) ;
+    terminal restauré et sous-processus tués sur tout chemin (finally des couches basses), y
+    compris Ctrl-C, SIGTERM, SIGHUP et le délai global."""
+    item_id = (args.id or "").strip().lower()
+    label = clean(item_id) or "?"
+    backend = None
+    try:
+        c = fastpath.caller()
+        if c.no_connect:
+            return RC_OK  # ssh -G, ssh -O : lecture de la config, aucune connexion
+        label = c.host or label
+        # Jamais arrêté par le terminal : en arrière-plan, une lecture ou un réglage de /dev/tty
+        # échoue (EIO) au lieu de stopper le processus (aucune n'est tentée : premier plan vérifié).
+        for sig in (signal.SIGTTIN, signal.SIGTTOU):
+            signal.signal(sig, signal.SIG_IGN)
+        if not fastpath.ITEM_ID_RE.fullmatch(item_id):
+            raise UsageError("--id : UUID attendu")
+        try:
+            for name, default in (("SSHVAULT_PROMPT_TIMEOUT", PROMPT_TIMEOUT), ("SSHVAULT_BW_TIMEOUT", BW_TIMEOUT)):
+                seconds(os.environ, name, default)
+            total = fastpath.ensure_timeout(os.environ)
+        except ValueError as e:
+            raise ConfigError(str(e)) from None
+
+        def on_alarm(signum, frame):
+            raise Deadline(total)
+        signal.signal(signal.SIGALRM, on_alarm)
+        left = fastpath.time_left(total)
+        if left <= 0:
+            raise Deadline(total)
+        signal.setitimer(signal.ITIMER_REAL, left)
+        why = "--nointeraction" if args.nointeraction else "BatchMode=yes" if c.batch else ""
+        ctx = ensure_mod.Context(conn=c.conn, host=c.host, interactive=not why, why_not=why,
+                                 deadline_at=time.monotonic() + left)
+        settings = _ensure_settings()
+        store = SessionStore()
+        backend = BwBackend(store=store)
+        ensure_mod.ensure(item_id, backend, store, settings, ctx=ctx)
+        _quiet()  # clé présente ou chargée : un délai ou un signal tardif n'y change plus rien
+        rc = RC_OK
+    except (Exception, KeyboardInterrupt, Interrupted, Deadline) as e:
+        _quiet()
+        rc, msg = classify(e)
+        try:
+            err("%s : %s" % (label, msg))
+        except (OSError, ValueError):
+            pass
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    for w in (backend.warnings if backend is not None else []):
+        try:
+            err("%s : %s" % (label, w))
+        except (OSError, ValueError):
+            pass
+    return rc
+
+
+def classify(e: BaseException):
+    """(code de sortie, message d'une ligne) d'une erreur."""
+    if isinstance(e, UsageError):
+        return RC_USAGE, "%s (voir sshvault --help)" % e
+    if isinstance(e, (NotLoggedIn, VaultLocked)):
+        return RC_LOCKED, str(e)
+    if isinstance(e, SessionStoreError):
+        return RC_BACKEND, "magasin de session : %s" % e
+    if isinstance(e, (BackendError, ConfigWriteError, sshconfig.SshConfigError)):
+        return RC_BACKEND, str(e)
+    if isinstance(e, (InvalidHost, ConfigError)):
+        return RC_USAGE, str(e)
+    if isinstance(e, (AgentStopped, AgentLocked, PassphraseRefused)):
+        return RC_LOCKED, str(e)
+    if isinstance(e, (AgentError, VaultError)):
+        return RC_BACKEND, str(e)
+    if isinstance(e, (KeyboardInterrupt, Interrupted)):
+        return RC_INTERRUPTED, "interrompu"
+    if isinstance(e, Deadline):
+        return RC_BACKEND, "délai de %gs dépassé (SSHVAULT_ENSURE_TIMEOUT) : clé non chargée" % e.args[0]
+    return RC_BACKEND, "erreur interne : %s: %s" % (type(e).__name__, e)
 
 
 def main(argv=None) -> int:
@@ -707,6 +839,8 @@ def main(argv=None) -> int:
         except UsageError as e:
             err("%s (voir sshvault --help)" % e)
             return RC_USAGE
+        if args.cmd == "ensure":
+            return run_ensure(args)
         for name, default in (("SSHVAULT_PROMPT_TIMEOUT", PROMPT_TIMEOUT), ("SSHVAULT_BW_TIMEOUT", BW_TIMEOUT)):
             try:
                 seconds(os.environ, name, default)
@@ -717,49 +851,13 @@ def main(argv=None) -> int:
         store = SessionStore()
         backend = BwBackend(store=store)
         rc = run(args, backend)
-    except UsageError as e:
-        err("%s (voir sshvault --help)" % e)
-        rc = RC_USAGE
-    except (NotLoggedIn, VaultLocked) as e:
-        err(e)
-        rc = RC_LOCKED
-    except BackendError as e:
-        err(e)
-        rc = RC_BACKEND
-    except SessionStoreError as e:
-        err("magasin de session : %s" % e)
-        rc = RC_BACKEND
-    except ConfigWriteError as e:
-        err(e)
-        rc = RC_BACKEND
-    except InvalidHost as e:
-        err(e)
-        rc = RC_USAGE
-    except sshconfig.SshConfigError as e:
-        err(e)
-        rc = RC_BACKEND
-    except ConfigError as e:
-        err(e)
-        rc = RC_USAGE
-    except (AgentStopped, AgentLocked, PassphraseRefused) as e:
-        err(e)
-        rc = RC_LOCKED
-    except AgentError as e:
-        err(e)
-        rc = RC_BACKEND
-    except VaultError as e:
-        err(e)
-        rc = RC_BACKEND
-    except (KeyboardInterrupt, Interrupted):
-        err("interrompu")
-        rc = RC_INTERRUPTED
     except BrokenPipeError:
         # sortie fermée (sshvault list | head) : rien à dire
         _stdout_to_devnull()
         rc = RC_OK
-    except Exception as e:  # filet : jamais de traceback
-        err("erreur interne : %s: %s" % (type(e).__name__, e))
-        rc = RC_BACKEND
+    except (Exception, KeyboardInterrupt, Interrupted, Deadline) as e:  # filet : jamais de traceback
+        rc, msg = classify(e)
+        err(msg)
     if backend is not None:
         for w in backend.warnings:
             err(w)

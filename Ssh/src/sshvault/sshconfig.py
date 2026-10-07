@@ -6,7 +6,14 @@ puis, sur demande seulement, la ligne `Include` en tête de `~/.ssh/config`.
   tenir compte de la casse (mesuré sur OpenSSH 8.9p1 : `Host foo` ne s'applique pas à
   `ssh FOO`). Directives : `IdentityAgent` (socket dédié résolu, sans `${XDG_RUNTIME_DIR}`),
   `IdentityFile` (clé publique), `IdentitiesOnly yes`. Jamais `HostName`, `User`, `Port`,
-  `ProxyJump`, `ProxyCommand` ni `Match exec`.
+  `ProxyJump` ni `ProxyCommand`.
+- Chargement automatique (réglage `auto-load`, défaut oui) : avant chaque bloc, une ligne
+  `Match originalhost <motifs> exec "'<sshvault>' ensure --id <id>"` sans directive (ssh
+  n'exécute la commande que si `originalhost` correspond). La commande, passée au shell de
+  l'utilisateur, ne contient que des éléments contrôlés : chemin absolu de sshvault entre
+  apostrophes (refusé s'il contient `'`, `"`, `\\`, `${` ou un caractère de contrôle ; `%`
+  doublé) et id de l'élément, un UUID validé (sinon pas de ligne, avertissement). Jamais
+  `%h` ni `%n` : un motif `*.lab` y ferait passer un nom tapé par l'utilisateur.
 - Chemins absolus, entre guillemets, `%` échappé en `%%` (IdentityAgent et IdentityFile
   développent les tokens `%x` et `${VAR}` : un chemin avec `"`, `\\`, `${` ou un caractère de
   contrôle est refusé).
@@ -29,11 +36,13 @@ import pwd
 import re
 import shlex
 import stat
+import sys
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
 from .agent import fingerprint, public_blob
 from .backend import SshKeyItem, valid_host
+from .fastpath import ITEM_ID_RE
 from .fsutil import ensure_dir, read_private, write_private
 
 HEADER = ("# Généré par sshvault, ne pas éditer : « sshvault ssh-config » le réécrit.\n"
@@ -47,6 +56,7 @@ _CATCH_ALL = re.compile(r"[*?.]+")
 CATCH_ALL_WARNING = "ce bloc prend toutes les connexions ssh et désactive ton agent habituel"
 #: Répertoire personnel imposé (tests seulement) ; sinon celui de passwd.
 HOME_ENV = "SSHVAULT_SSH_HOME"
+EXE_NAME = "sshvault"
 
 
 class SshConfigError(Exception):
@@ -126,6 +136,77 @@ def quote_path(path: str, what: str) -> str:
     return '"%s"' % path.replace("%", "%%")
 
 
+#: Version minimale d'une commande sshvault pour les lignes `Match exec` (`ensure`).
+ENSURE_MIN_VERSION = (0, 4, 0)
+_VERSION_RE = re.compile(r"sshvault (\d+)\.(\d+)\.(\d+)")
+_exe_checked: dict = {}
+
+
+def exe_version(exe: str):
+    """Version rendue par `<exe> --version` (tuple), ou None ; mise en cache pour le processus
+    (une génération)."""
+    if exe not in _exe_checked:
+        import subprocess
+        try:
+            r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=30,
+                               stdin=subprocess.DEVNULL)
+            m = _VERSION_RE.search(r.stdout) if r.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            m = None
+        _exe_checked[exe] = tuple(int(x) for x in m.groups()) if m else None
+    return _exe_checked[exe]
+
+
+def sshvault_exe(argv0: Optional[str] = None, env=None) -> str:
+    """Chemin absolu de la commande `sshvault` pour `Match exec` : celle qui tourne si elle a
+    été lancée sous ce nom (console script installé), sinon les `sshvault` exécutables des
+    dossiers **absolus** du PATH, dans l'ordre ; la première qui connaît `ensure`
+    (`--version` ≥ 0.4.0) est retenue. Aucune : SshConfigError."""
+    env = os.environ if env is None else env
+    argv0 = sys.argv[0] if argv0 is None else argv0
+    cands = []
+    if os.path.basename(argv0 or "") == EXE_NAME:
+        cands.append(os.path.abspath(argv0))
+    cands += [os.path.join(d, EXE_NAME) for d in (env.get("PATH") or "").split(os.pathsep) if os.path.isabs(d)]
+    old = []
+    for c in cands:
+        c = os.path.normpath(c)
+        if not (os.path.isfile(c) and os.access(c, os.X_OK)):
+            continue
+        v = exe_version(c)
+        if v is not None and v >= ENSURE_MIN_VERSION:
+            return c
+        old.append(c)
+    raise SshConfigError("commande sshvault %s pour le chargement automatique%s : l'installer (uv tool install "
+                         "--force), ou « sshvault config set auto-load false »"
+                         % ("0.4.0 ou plus introuvable (PATH)" if not old else "trop ancienne",
+                            " (%s)" % ", ".join(clean(o) for o in old) if old else ""))
+
+
+def exe_warnings(exe: str, paths: "Paths") -> list:
+    """Avertissements sur le chemin retenu : différent de celui de la config générée existante,
+    ou dans un environnement de projet (`.venv`), dont la config dépendrait."""
+    out = []
+    raw = read_private(paths.config)
+    m = re.search(r"exec \"'([^']*)' ensure --id ", raw.decode(errors="replace")) if raw else None
+    if m and m.group(1).replace("%%", "%") != exe:
+        out.append("chemin de sshvault des lignes Match exec changé : %s → %s"
+                   % (clean(m.group(1).replace("%%", "%")), clean(exe)))
+    if ".venv" in exe.split(os.sep):
+        out.append("sshvault pris dans un environnement de projet (%s) : la config générée en dépendra ; "
+                   "préférer la commande installée (uv tool install)" % clean(exe))
+    return out
+
+
+def ensure_command(exe: str, item_id: str) -> str:
+    """Commande de `Match exec` : `'<exe>' ensure --id <uuid>` (`%` doublé pour ssh). Rien
+    d'autre que le chemin vérifié et l'id validé : la commande passe par un shell."""
+    _check_path(exe, "chemin de sshvault", "'")
+    if not ITEM_ID_RE.fullmatch(item_id or ""):
+        raise SshConfigError("id d'élément inattendu (UUID attendu) : %s" % clean(item_id))
+    return "'%s' ensure --id %s" % (exe.replace("%", "%%"), item_id.lower())
+
+
 def include_line(paths: Paths) -> str:
     """`Include "<config>"`. Include ne développe pas `%` en 8.9 (mesuré) mais le fait dans
     les versions récentes (man) : un chemin avec `%`, `$` ou un joker de glob est refusé."""
@@ -147,11 +228,15 @@ def _label(it: SshKeyItem) -> str:
     return "« %s » (%s)" % (clean(it.name), clean(it.id))
 
 
-def build(items: Sequence[SshKeyItem], paths: Paths, socket: str) -> Plan:
+def build(items: Sequence[SshKeyItem], paths: Paths, socket: str, exe: Optional[str] = None) -> Plan:
     """Contenu du fichier généré et des `.pub`, sans rien écrire. Vérifie aussi les chemins
-    (SshConfigError) : sert de contrôle préalable avant une écriture dans le coffre."""
+    (SshConfigError) : sert de contrôle préalable avant une écriture dans le coffre.
+    `exe` : chemin de sshvault ; s'il est donné, chaque bloc est précédé de sa ligne
+    `Match … exec` (chargement automatique)."""
     agent = quote_path(socket, "socket de l'agent dédié")
     _check_path(paths.pub, "dossier des clés publiques")
+    if exe is not None:
+        _check_path(exe, "chemin de sshvault", "'")
     plan = Plan(config=b"")
     out = [HEADER]
     entries = []  # (motif, élément), dans l'ordre des blocs
@@ -178,10 +263,16 @@ def build(items: Sequence[SshKeyItem], paths: Paths, socket: str) -> Plan:
                 if is_catch_all(h):
                     plan.warnings.append("%s : motif « %s » : %s" % (_label(it), h, CATCH_ALL_WARNING))
         # hôtes validés (HOST_RE) : ni virgule ni espace, la liste à virgules est sûre
-        out.append("\n# %s %s\nMatch originalhost %s\n    IdentityAgent %s\n    IdentityFile %s\n"
+        out.append("\n# %s %s\n" % (clean(it.name), clean(it.id)))
+        if exe is not None:
+            if ITEM_ID_RE.fullmatch(it.id):
+                out.append('Match originalhost %s exec "%s"\n' % (",".join(hosts), ensure_command(exe, it.id)))
+            else:
+                plan.warnings.append("%s : id inattendu (UUID attendu) : pas de chargement automatique pour "
+                                     "cet élément" % _label(it))
+        out.append("Match originalhost %s\n    IdentityAgent %s\n    IdentityFile %s\n"
                    "    IdentitiesOnly yes\n"
-                   % (clean(it.name), clean(it.id), ",".join(hosts), agent,
-                      quote_path(os.path.join(paths.pub, name), "clé publique")))
+                   % (",".join(hosts), agent, quote_path(os.path.join(paths.pub, name), "clé publique")))
         plan.blocks += 1
     owners = {}
     for h, it in entries:
