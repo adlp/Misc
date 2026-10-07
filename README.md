@@ -80,6 +80,10 @@ Script Python 3 d'aide à la gestion des sauvegardes BorgBackup.
   * Indexation SQLite incrémentale des diffs inter-archives
   * Détails : README.md dans le répertoire Borg/
 
+## Ssh
+### sshvault
+CLI Python (sans root, `uv tool install ./Ssh`) : clés SSH dans Vaultwarden via le CLI `bw` ; pour l'instant `login`, `unlock`, `lock`, `status`, `sync`, `list` et `search` des éléments « SSH key » par hôte, nom ou empreinte. Détails : README.md dans le répertoire Ssh/
+
 ## Docker
 ### Compose
 Fichiers docker-compose pour services auto-hébergés :
