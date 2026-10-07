@@ -5,7 +5,8 @@
 # ferait partie de la valeur (un mot de passe peut en contenir).
 
 [ovpnMgmt]
-# Serveur utilisé sans -s
+# Serveur(s) traité(s) sans -s ; plusieurs : séparés par des virgules (default = paris, lyon),
+# la même commande est alors envoyée à chacun en parallèle
 default = paris
 
 # Côté OpenVPN, dans la configuration du serveur :

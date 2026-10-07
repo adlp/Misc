@@ -1,5 +1,19 @@
 # Changelog — Tools
 
+## ovpnMgmt 1.1 — plusieurs serveurs à la fois — 2026-10-07
+
+- **Plusieurs serveurs** : `-s a,b` ou `-s a -s b`, `-a` pour tous, ou `default = a, b` dans `[ovpnMgmt]`. Une
+  connexion par serveur, ouvertes et interrogées en parallèle : la même commande part sur chacun en même temps.
+- Réponses réunies : `list` en un tableau avec colonne `Serveur` (et champ `server` en `--json`, durée calculée sur
+  l'heure de chaque serveur), `--watch` sur tous avec le débit, `info` en colonnes, `log` fusionné par date et préfixé
+  `[serveur]` (`-f` suit tous les serveurs), `kill` cherché sur tous avec une seule confirmation, `verb` / `mute` /
+  `hold` / `signal` en lignes `[serveur] …`, `raw` en sections ; `shell` refusé au-delà d'un serveur.
+- Un serveur injoignable n'empêche pas les autres : erreur sur stderr, code retour `1`.
+- `log 0` : aucun historique (OpenVPN refuse `log 0`, il n'est pas envoyé), pour `log 0 -f`.
+- Un seul serveur : sortie inchangée. Testé sur deux serveurs OpenVPN 2.5.11 réels (TCP avec mot de passe et socket
+  unix via commande ssh) : un serveur muet parmi trois coûte son délai (2 s) et pas la somme, kill sur deux serveurs
+  en parallèle, `log 0 -f` reçoit les deux serveurs.
+
 ## ovpnMgmt 1.0 — pilotage d'OpenVPN par son management — 2026-10-07
 
 Nouvel outil, Python sans dépendance.

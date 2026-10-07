@@ -6,7 +6,7 @@ Petits outils d'administration indépendants, sous licence GPL v3.
 |---|---|---|---|
 | `checkssl` | bash | 1.5 | État d'un certificat TLS (serveur ou fichier) et jours restants avant expiration |
 | `cronMutt` | Python 3 | 0.24.2 | Lance une commande (ou lit un pipe) et envoie sa sortie par mail (mutt) et/ou sur Nextcloud, selon le résultat |
-| `ovpnMgmt` | Python 3 | 1.0 | Pilote un serveur OpenVPN par son management, en direct ou via ssh : connexions, coupure, log, signaux |
+| `ovpnMgmt` | Python 3 | 1.1 | Pilote un ou plusieurs serveurs OpenVPN par leur management, en direct ou via ssh : connexions, coupure, log, signaux |
 | `sleepUntil` | bash | 1.1 | Comme `at`, mais bloquant : attend une heure donnée puis lance une commande |
 | `whosshkey` | bash | 1.4 | Comme `last`, avec en plus la clef SSH utilisée pour chaque connexion |
 
@@ -122,7 +122,7 @@ Dépendances : Python ≥ 3.6, `requests`, `mutt` configuré pour envoyer.
 ## ovpnMgmt
 
 ```bash
-ovpnMgmt [-c conf] [-s serveur] [-D] [COMMANDE ...]     # sans commande : list
+ovpnMgmt [-c conf] [-s serveur[,serveur…]]… [-a] [-D] [COMMANDE ...]     # sans commande : list
 ```
 
 Pilote un serveur OpenVPN par son interface de management, en direct ou au travers de ssh. Python ≥ 3.8, sans
@@ -131,8 +131,25 @@ dépendance ; `ssh` pour les serveurs distants.
 ### Configuration
 
 Fichier INI, `~/.config/ovpnMgmt/ovpnMgmt.conf` par défaut (`$OVPNMGMT_CONF` ou `-c` pour un autre), `chmod 600`.
-Modèle commenté : `ovpnMgmt.conf.example`. La section `[ovpnMgmt]` donne le serveur par défaut (`default = nom`) ;
-chaque autre section est un serveur, choisi par `-s nom`.
+Modèle commenté : `ovpnMgmt.conf.example`. La section `[ovpnMgmt]` donne le ou les serveurs par défaut
+(`default = paris` ou `default = paris, lyon`) ; chaque autre section est un serveur.
+
+### Plusieurs serveurs
+
+`-s paris,lyon` (ou `-s paris -s lyon`), `-a` pour tous, ou plusieurs noms dans `default` : la même commande est
+envoyée à chaque serveur **en parallèle**, une connexion par serveur, et les réponses sont réunies :
+
+- `list` : un seul tableau, colonne `Serveur` en tête, tri sur l'ensemble ; `--json` porte le champ `server` ;
+  `--watch` rafraîchit tous les serveurs, débit compris ;
+- `info` : une colonne par serveur (`--json` : un objet par serveur) ;
+- `log` : lignes des serveurs fusionnées par date, préfixées `[serveur]`, `-f` suit tous les serveurs ;
+- `kill` : cible cherchée sur tous les serveurs, une seule confirmation pour l'ensemble, coupures en parallèle ;
+- `verb`, `mute`, `hold`, `signal` : une ligne `[serveur] réponse` par serveur (`signal` : une confirmation) ;
+- `raw` : une section `=== serveur ===` par serveur ; `shell` : un seul serveur.
+
+Un serveur injoignable est signalé sur stderr, les autres sont traités ; code retour `1` dans ce cas. Les délais
+courent en même temps : un serveur muet coûte son `timeout`, pas la somme. Via ssh, préférer clefs et agent : deux
+ssh qui demandent un mot de passe en même temps se partagent le terminal.
 
 | Clef | Rôle | Défaut |
 |---|---|---|
@@ -157,13 +174,13 @@ comptes est signalé.
 | `list [filtre]` | Connexions actives : nom, adresse réelle, IP VPN, connecté depuis, durée, reçu, envoyé, CID. `--sort cn\|real\|virtual\|since\|rx\|tx`, `-r`, `-l` (utilisateur, IPv6, chiffrement, peer ID), `--json`, `-w SEC` (rafraîchi, avec le débit) |
 | `kill CIBLE… [--cid N] [--halt] [-y]` | Coupe des connexions : nom, IP ou IP:port réelle, IP VPN, ou CID. `RESTART` par défaut (le client se reconnecte, comme `kill` d'OpenVPN), `--halt` lui demande de s'arrêter. Confirmation au-delà d'une connexion. « Coupée » n'est affiché qu'une fois la connexion sortie de la liste (OpenVPN la ferme quelques secondes après) |
 | `info [--json]` | Version, PID, verbosité, mute, hold, nombre de clients, octets cumulés, état |
-| `log [N\|all] [-f]` | Dernières lignes du log du serveur (20 par défaut), `-f` pour suivre |
+| `log [N\|all\|0] [-f]` | Dernières lignes du log du serveur (20 par défaut, `0` : aucune), `-f` pour suivre |
 | `verb [N]`, `mute [N]` | Affiche ou change la verbosité / la limite de répétition du log |
 | `signal SIGHUP\|SIGTERM\|SIGUSR1\|SIGUSR2 [-y]` | Signal au démon, effet rappelé et confirmation (sauf `SIGUSR2`) |
 | `hold [on\|off\|release]` | État d'attente au démarrage (`management-hold`) |
 | `raw COMMANDE…` | Commandes brutes du management (`raw "status 3" load-stats`) |
-| `shell` | Session interactive (`help` liste les commandes du serveur) |
-| `servers` | Serveurs de la configuration, `*` = défaut |
+| `shell` | Session interactive avec un seul serveur (`help` liste les commandes du serveur) |
+| `servers` | Serveurs de la configuration, `*` = par défaut |
 
 Reçu / envoyé sont vus du serveur : reçu du client, envoyé au client. OpenVPN ne sert **qu'une session de management à
 la fois** : pendant un `list -w`, `log -f` ou `shell` (ou un outil de supervision branché dessus), les autres appels
