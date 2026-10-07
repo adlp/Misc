@@ -2,11 +2,13 @@
 
 Clés SSH dans un Vaultwarden auto-hébergé, utilisées de façon transparente par ssh.
 
-État (0.2.0) : **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
-éléments « SSH key ») et **agent dédié** : chargement d'une clé du coffre dans un
+État (0.3.0) : **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
+éléments « SSH key »), **agent dédié** (chargement d'une clé du coffre dans un
 `ssh-agent` d'OpenSSH propre à sshvault, sans écriture disque, avec durée de vie,
-confirmation et restriction aux hôtes en option ; état, purge, verrou et arrêt de l'agent.
-`ssh_config` généré, chargement à la demande, import et génération de clés viendront ensuite.
+confirmation et restriction aux hôtes en option ; état, purge, verrou et arrêt de l'agent),
+**hôtes d'une clé** modifiables depuis la CLI et **`ssh_config` généré** : chaque hôte
+associé reçoit l'agent dédié et sa seule clé. Le chargement à la demande (`Match exec`),
+l'import et la génération de clés viendront ensuite.
 
 ## Installation (sans root)
 
@@ -46,6 +48,11 @@ sshvault lock
 sshvault load (MOTIF [--host | --name | --fingerprint | --id] | --all) [-t DURÉE] [--confirm] [--restrict] [--force]
 sshvault agent status | purge | lock | unlock | stop
 sshvault config get [key-ttl] | set key-ttl DURÉE | unset key-ttl
+
+sshvault hosts add | remove | set  SÉLECTION [--host | --name | --fingerprint | --id] HÔTE…
+sshvault hosts list SÉLECTION [--host | --name | --fingerprint | --id]
+sshvault ssh-config [--print | --check]
+sshvault ssh-config install
 ```
 
 - `list` affiche, pour chaque élément « SSH key » (type 5) : nom, empreinte, hôtes.
@@ -60,7 +67,8 @@ sshvault config get [key-ttl] | set key-ttl DURÉE | unset key-ttl
   garde tels quels.
 - Option globale `--nointeraction` (avant la commande) : jamais d'invite ; un
   coffre verrouillé donne le code 3.
-- Coffre verrouillé : `list`, `search`, `sync` et `load` demandent le mot de passe, puis
+- Coffre verrouillé : `list`, `search`, `sync`, `load`, `hosts` et `ssh-config` (sauf
+  `install`, qui ne lit pas le coffre) demandent le mot de passe, puis
   gardent la session (900 s).
 - Déconnexion : pas encore de commande `logout`. En attendant :
   `sshvault lock && BITWARDENCLI_APPDATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/sshvault/bw" bw logout`.
@@ -161,17 +169,148 @@ par sshvault sont ceux de cette version.
 Champ personnalisé `sshvault-hosts` de l'élément, texte ou masqué : liste
 d'hôtes séparés par des virgules (`prod.example.org, *.lab`). Les espaces autour
 sont ignorés et la comparaison est insensible à la casse. Le nom de l'élément
-reste libre.
+reste libre. Il se modifie dans l'interface web ou par `sshvault hosts` :
+
+```
+sshvault hosts add  --id 1111… prod.example.org '*.lab'    # crée ou complète le champ
+sshvault hosts remove 'Serveur Prod' prod.example.org      # champ retiré s'il devient vide
+sshvault hosts set  --id 1111… a.example,b.example         # remplace la liste ; "" la vide
+sshvault hosts list --id 1111…                             # un hôte par ligne
+```
+
+- La sélection désigne **un seul** élément, comme pour `load` (motif seul : nom, hôte
+  ou empreinte ; ou `--host`, `--name`, `--fingerprint`, `--id`). Plusieurs : code 2
+  (« préciser --id ») ; aucun : code 1.
+- Hôte accepté : motif de ligne `Host` d'OpenSSH fait de lettres, chiffres, `.`, `-`, `_`,
+  `*`, `?` ; écrit en minuscules, sans doublon. Tout autre caractère (espace, `!`, `%`,
+  `"`, `@`, `:`, `/`, accent, contrôle…) : code 2, rien écrit. Une liste du coffre qui
+  contient déjà un hôte invalide n'est réécrite qu'une fois cet hôte retiré (`remove`) ou
+  la liste remplacée (`set`). `remove` d'un hôte absent : code 1, rien écrit.
+- Écriture : `bw sync` d'abord (une modification faite dans l'interface web est vue),
+  puis `bw get item`, seul le champ `sshvault-hosts` changé (créé, complété ou
+  retiré ; autres champs, notes, clé et `revisionDate` gardés tels que `bw` les rend),
+  puis `bw edit item <id>` avec l'élément encodé **sur stdin**, jamais en argument (argv
+  est lisible par `ps`, l'élément contient la clé privée), puis relecture. `edit` passe
+  par le réseau : s'il échoue ou reste bloqué (`SSHVAULT_BW_TIMEOUT`), sshvault relit
+  l'état du serveur (`sync`, puis `get`) avant toute décision : écriture passée → succès ;
+  élément inchangé → rejouée **une** fois ; élément modifié entre-temps (par exemple par
+  l'interface web : « The client copy of this cipher is out of date ») → rien rejoué.
+  Échec final : code 4, avec les hôtes relus ou « état inconnu » si la relecture échoue.
+  Interrompue (Ctrl-C, SIGTERM) pendant l'écriture : code 130 et « écriture peut-être
+  passée : vérifier par sshvault sync puis sshvault hosts list --id … ».
+- Durée au pire d'une écriture (`SSHVAULT_BW_TIMEOUT`, 60 s par défaut, noté T) : cinq
+  appels réseau (sync initial, deux `edit`, deux relectures `sync`), soit 5 × T, plus les
+  lectures locales (`list`, jusqu'à trois `get`), un T chacune au plus ; s'y ajoute le
+  déverrouillage si le coffre est verrouillé.
+- Avant d'écrire, sshvault vérifie qu'il pourra régénérer le `ssh_config` (socket de
+  l'agent, chemins) : sinon code 4 et rien écrit. Si la régénération échoue malgré tout
+  après l'écriture : code 4, « hôtes écrits dans le coffre, mais ssh_config non régénéré ».
+- Après une modification, le `ssh_config` généré est mis à jour. Si la clé est chargée
+  dans l'agent avec `--restrict`, ses contraintes gardent les anciens hôtes : sshvault le
+  signale (relancer `sshvault load --force --restrict --id …`).
+- Motif sans partie littérale (`*`, `*.*`, `?*`) : accepté, avec l'avertissement « ce bloc
+  prend toutes les connexions ssh et désactive ton agent habituel » (à l'écriture et à
+  chaque génération).
+
+### `ssh_config` généré
+
+`sshvault ssh-config` lit le **cache local** de `bw` (lancer `sshvault sync` d'abord pour
+voir une modification faite ailleurs) et écrit `~/.ssh/sshvault/config` (0600, dossier
+0700, en-tête « ne pas éditer ») et `~/.ssh/sshvault/pub/<empreinte en base64url>.pub` (0600). Un bloc par
+élément qui a des hôtes, triés par nom puis par id :
+
+```
+# Serveur Prod 11111111-1111-4111-8111-111111111111
+Match originalhost prod.example.org,*.lab
+    IdentityAgent "/run/user/1000/sshvault/agent.sock"
+    IdentityFile "/home/alice/.ssh/sshvault/pub/SHA256:70bMgv5m…_OjUbIQdVk.pub"
+    IdentitiesOnly yes
+```
+
+- `IdentityAgent` est le chemin **résolu** du socket de l'agent dédié (sans
+  `${XDG_RUNTIME_DIR}` : la config reste valable si la variable manque, par exemple sous
+  `su` ou cron). Chemins absolus entre guillemets, `%` doublé en `%%` ; un chemin avec
+  `"`, `\`, `${` ou un caractère de contrôle est refusé (code 4).
+- `Match originalhost` compare le nom **tapé** (`ssh Prod.Example.ORG`, alias d'un
+  `ProxyJump`), sans tenir compte de la casse, motifs glob compris ; pas le `HostName` : un
+  bloc `Host prod.example.org` + `HostName 10.0.0.5` de votre config reçoit bien la clé,
+  `ssh 10.0.0.5` non. (Mesuré sur OpenSSH 8.9p1 : une ligne `Host foo` ne s'applique pas
+  à `ssh FOO`, d'où cette forme.)
+- Jamais de `HostName`, `User`, `Port`, `ProxyJump`, `ProxyCommand` ni `Match exec` : la
+  topologie reste dans votre `~/.ssh/config`.
+- Rien n'est réécrit si le contenu est identique (mtime inchangée) ; `pub/` ne garde que
+  les clés des éléments associés (sshvault est le seul à y écrire). Aucune clé privée.
+- `~` désigne le répertoire de passwd (là où ssh lit `~/.ssh/config`), pas `$HOME` ;
+  inconnu ou `/` : code 4.
+- Élément avec un hôte invalide (saisi dans l'interface web) ou une clé publique
+  illisible : sauté, avec un avertissement ; le reste est généré. Hôte porté par deux
+  éléments, ou motifs qui se recouvrent (`*.lab` et `x.lab`) : un bloc chacun, ssh offre
+  les deux clés dans l'ordre des blocs ; avertissement.
+- Verrou (`flock` sur `~/.ssh/sshvault/`) : deux régénérations simultanées ne se gênent
+  pas. Un fichier non ordinaire (FIFO, dossier) à la place d'un fichier généré : code 4.
+- `--print` affiche le fichier sans rien écrire ; `--check` n'écrit rien et sort en 0 si
+  tout est à jour et la ligne `Include` en tête, 1 sinon. Différences sur stdout : contenu,
+  fichier absent, en trop ou non ordinaire, droits autres que 0600 (fichiers) ou 0700
+  (dossiers), `pub/` qui n'est pas un dossier ou illisible. Un sous-dossier de `pub/` est
+  signalé (stderr) et laissé en place, comme par `ssh-config`.
+- Première valeur rencontrée : `IdentityAgent` et `IdentitiesOnly` de sshvault
+  l'emportent sur vos défauts (`Host *`) placés après la ligne `Include`. `IdentityFile`,
+  lui, se **cumule** : un `IdentityFile` de votre config qui vise aussi cet hôte s'ajoute
+  après la clé de sshvault (mesuré) ; pour n'offrir qu'une clé, ne pas en mettre pour les
+  hôtes gérés par sshvault.
+
+**ForwardAgent : attention.** Le bloc généré n'écrit pas `ForwardAgent` : votre
+config décide. Mais avec `ForwardAgent yes` sur un hôte géré par sshvault, c'est
+**l'agent dédié entier** (toutes les clés chargées par sshvault, pas seulement celle de
+cet hôte) qui est transféré, et non votre agent habituel : `IdentityAgent` remplace
+`SSH_AUTH_SOCK` pour la connexion (mesuré sur OpenSSH 8.9p1 avec un sshd de test :
+`ssh-add -L` sur l'hôte distant liste les clés de l'agent dédié). Un root distant peut
+s'en servir tant que la session est ouverte. Le transfert restreint par hôte viendra avec
+la story 8 ; d'ici là, éviter `ForwardAgent yes` vers ces hôtes.
+
+**Clé absente de l'agent dédié.** Le bloc n'offre que la clé de l'agent dédié
+(`IdentitiesOnly yes`) : si elle n'y est pas chargée, ssh affiche
+`Load key "…/pub/SHA256:….pub": error in libcrypto` puis `Permission denied (publickey)`.
+Lancer d'abord `sshvault load <hôte>` (le chargement automatique à la connexion viendra
+avec la story 5).
+
+**Inclusion.** ssh ne lit le fichier que si `~/.ssh/config` l'inclut **en tête** (pour
+chaque paramètre, la première valeur rencontrée l'emporte). « En tête » : avant la
+première ligne qui n'est ni vide ni un commentaire (lignes coupées sur le seul saut de
+ligne, comme ssh). `sshvault ssh-config install` insère
+`Include "<répertoire personnel>/.ssh/sshvault/config"` en première ligne (vos
+commentaires d'en-tête restent dessous, inchangés) :
+
+- idempotent (ligne déjà en tête, sous toute forme : chemin réel, `~`, `~user`, relatif à
+  `~/.ssh`, joker, parmi plusieurs fichiers : rien fait) ; une ligne `Include` de sshvault
+  placée plus bas est déplacée en tête (une ligne qui inclut aussi d'autres fichiers est
+  gardée telle quelle : ssh ignore le doublon) ;
+- une ligne `Include` de sshvault **dans** un bloc `Host`/`Match` (Include conditionnel)
+  n'est pas déplacée : code 4, rien modifié ; `ssh-config` et `--check` la signalent ;
+- sauvegarde avant toute écriture, jamais écrasée : `~/.ssh/config.sshvault.bak`, sinon
+  `.bak.1`, `.bak.2`… (0600) ; écriture atomique, mode et propriétaire conservés ; fichier
+  absent : créé en 0600 (et `~/.ssh` en 0700 s'il manque), sans écraser un fichier créé
+  entre-temps ;
+- `~/.ssh/config` lien symbolique ou non ordinaire (FIFO, dossier) : code 4, rien
+  modifié ; chemin personnel avec `%`, `$` ou un joker de glob : code 4 (`Include`
+  développe les tokens dans les versions récentes d'OpenSSH, pas en 8.9).
+
+Jamais automatique : `ssh-config` et `hosts` préviennent seulement (stderr) si la ligne
+manque, est conditionnelle ou n'est pas en tête.
+
+**Désinstaller.** Retirer la ligne `Include "…/.ssh/sshvault/config"` de `~/.ssh/config`
+(ou remettre une sauvegarde `~/.ssh/config.sshvault.bak*`), puis supprimer
+`~/.ssh/sshvault/` (`rm -r ~/.ssh/sshvault`) ; `sshvault agent stop` arrête l'agent dédié.
 
 ### Codes de sortie
 
 | Code | Sens |
 |---|---|
 | 0 | succès |
-| 1 | `search`, `load` : aucun résultat |
-| 2 | usage (option ou argument invalide ; `load` sans sélection ni `--all`) ; durée invalide ; `config.json` invalide, illisible ou aux droits inattendus |
+| 1 | `search`, `load`, `hosts` : aucun résultat ; `hosts remove` : hôte absent (rien écrit) ; `ssh-config --check` : pas à jour (contenu, droits, fichier en trop ou non ordinaire), ou ligne `Include` absente, conditionnelle ou pas en tête |
+| 2 | usage (option ou argument invalide ; `load` sans sélection ni `--all`) ; durée invalide ; `config.json` invalide, illisible ou aux droits inattendus ; hôte invalide ; sélection de `hosts` qui désigne plusieurs éléments |
 | 3 | non connecté (« lancer sshvault login »), ou coffre verrouillé : aucune invite possible, invite annulée ou sans réponse, mot de passe refusé ; agent dédié arrêté (`agent status`, `lock`, `unlock`) ou verrouillé ; passphrase d'une clé refusée ou impossible à saisir |
-| 4 | erreur du backend : `bw` introuvable, en erreur, réponse illisible, délai dépassé ; magasin de session inutilisable ; agent dédié : `XDG_RUNTIME_DIR` relatif, non privé ou hors tmpfs, chemin du socket trop long, agent tiers sur le socket, OpenSSH < 8.9, `--restrict` (élément sans hôte, hôte non littéral ou absent de `known_hosts`), clé publique illisible ou différente de la clé privée, `ssh-add`/`ssh-agent` en erreur ; écriture de `config.json` impossible ; erreur interne |
+| 4 | erreur du backend : `bw` introuvable, en erreur, réponse illisible, délai dépassé ; magasin de session inutilisable ; agent dédié : `XDG_RUNTIME_DIR` relatif, non privé ou hors tmpfs, chemin du socket trop long, agent tiers sur le socket, OpenSSH < 8.9, `--restrict` (élément sans hôte, hôte non littéral ou absent de `known_hosts`), clé publique illisible ou différente de la clé privée, `ssh-add`/`ssh-agent` en erreur ; écriture de `config.json` impossible ; écriture des hôtes dans le coffre non aboutie ou non vérifiée (y compris hôtes écrits mais `ssh_config` non régénéré) ; `ssh_config` généré impossible à écrire (chemin avec `"`, `\`, `${`, fichier non ordinaire, droits) ; répertoire personnel inconnu ; `ssh-config install` refusé (lien symbolique, fichier non ordinaire, `Include` conditionnel, chemin personnel avec `%`, `$` ou joker) ; erreur interne |
 | 130 | interrompu (Ctrl-C, SIGTERM, SIGHUP) |
 
 `status` : 0 si le coffre est déverrouillé, 3 s'il est verrouillé ou non connecté,
@@ -189,7 +328,8 @@ le code 2. Toute erreur est une ligne sur stderr, sans traceback.
   seul environnement. Le mot de passe maître passe par `--passwordenv`, dans
   l'environnement du seul sous-processus : jamais en argument ni dans un fichier.
 - Réseau : `list`, `search`, `unlock`, `lock` et `status` ne lisent que le cache local
-  de `bw` (aucune connexion) ; seuls `sync` et `login` passent par le réseau. Une
+  de `bw` (aucune connexion) ; seuls `sync`, `login` et l'écriture de `hosts`
+  (`bw edit`, jamais relancé à l'aveugle : voir Hôtes d'une clé) passent par le réseau. Une
   connexion neuve peut y rester bloquée sans fin (mesuré : ClientHello TLS jamais
   acquitté ; `bw` n'a pas de délai réseau propre). Un passage de `sync` fait donc
   deux essais de `SSHVAULT_BW_TIMEOUT`/2 chacun. S'il faut d'abord déverrouiller (pas
@@ -219,6 +359,7 @@ le code 2. Toute erreur est une ligne sur stderr, sans traceback.
 | `XDG_DATA_HOME` | base du dossier de données de `bw` (défaut `~/.local/share`) |
 | `XDG_RUNTIME_DIR` | repli fichier de la session ; socket et état de l'agent dédié (tmpfs privé exigé) |
 | `XDG_CONFIG_HOME` | base de `sshvault/config.json` (défaut `~/.config`) |
+| `SSHVAULT_SSH_HOME` | tests seulement : répertoire personnel de `~/.ssh` (défaut : celui de passwd) |
 | `SSHVAULT_SSH_AGENT`, `SSHVAULT_SSH_ADD` | exécutables `ssh-agent` et `ssh-add` (défaut : ceux du PATH) |
 | `SSHVAULT_KNOWN_HOSTS` | fichiers known_hosts passés à `ssh-add -H` pour `--restrict`, séparés par `:` (défaut : ceux d'`ssh-add`) |
 | `BW_CLIENTID`, `BW_CLIENTSECRET` | clé API pour `sshvault login --apikey` (lues par `bw`) |
@@ -241,6 +382,12 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   un agent témoin dont le contenu est revérifié inchangé après chaque test ; tout
   `ssh-agent` (et surveillant) lancé par un test est arrêté et sa disparition vérifiée. Un test passe
   `load` sous `strace -f` : seules écritures, le fichier d'état (et son temporaire).
+- `tests/test_sshconfig.py` valide le fichier généré avec l'OpenSSH du poste :
+  `ssh -G -F <config de test qui l'inclut>` (agent dédié, une seule `identityfile`,
+  `identitiesonly yes`, HOME et `XDG_RUNTIME_DIR` avec espace et `%`), puis `ssh -vvv`
+  arrêté avant l'authentification (`ProxyCommand true`) pour voir le `.pub` réellement
+  chargé. Le faux `bw` sait faire `edit` (élément lu sur stdin, argv journalisé) et
+  simuler un `edit` en échec, bloqué, passé puis bloqué, ou en concurrence.
 - L'intégration (`-m integration`, `bw` par `SSHVAULT_BW` ou le PATH) a deux modes :
   - **compte de test** (défaut) : identifiants dans `~/.config/sshvault-test/account.env`
     (0600, hors git ; chemin remplaçable par `SSHVAULT_IT_ENV`) : `SSHVAULT_IT_SERVER`,
@@ -256,5 +403,9 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   `SSHVAULT_IT_REPORT=<fichier>` y écrit les messages réels de `bw` mesurés, sans identifiants.
   Le test pilote `sshvault login` sous un pseudo-terminal, puis `unlock` (askpass),
   `list`, `search`, `sync`, `load` d'une clé de test dans l'agent dédié, `agent status`,
-  `purge` et `stop`, une session invalidée et `lock`. `register.py` (mode
+  `purge` et `stop`, `hosts add`/`remove` sur les deux éléments de test (lignes de commande
+  de tous les processus relevées dans `/proc` pendant l'appel : ni JSON ni clé privée ;
+  relecture par un autre client `bw` après `sync` : autres champs et clé privée
+  identiques), `ssh-config` dans le HOME de test (validé par `ssh -G`), une session
+  invalidée et `lock`. `register.py` (mode
   conteneur) se lance seul par `SSHVAULT_IT_PASSWORD=… python register.py <url> <e-mail>`.

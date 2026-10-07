@@ -9,12 +9,17 @@ from __future__ import annotations
 
 import abc
 import fnmatch
+import re
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional, Sequence
 
 #: Champ personnalisé qui porte les hôtes d'un élément : liste séparée par des virgules,
 #: espaces autour ignorés, comparaison insensible à la casse.
 HOSTS_FIELD = "sshvault-hosts"
+
+#: Hôte accepté : motif de ligne `Host` d'OpenSSH fait de lettres, chiffres, `.`, `-`, `_`, `*`, `?`
+#: (ASCII seulement, vérifié avant la mise en minuscules).
+HOST_RE = re.compile(r"[A-Za-z0-9._*?-]+", re.ASCII)
 
 #: Fonction d'invite : reçoit le texte de l'invite, renvoie le mot de passe.
 #: Elle lève `VaultLocked` si aucune invite n'est possible ou si l'utilisateur annule.
@@ -43,6 +48,14 @@ class BackendNotFound(BackendError):
 
 class ItemNotFound(BackendError):
     """Élément absent du coffre."""
+
+
+class WriteFailed(BackendError):
+    """Écriture dans le coffre non aboutie ou non vérifiée ; le message dit l'état relu (code 4)."""
+
+
+class InvalidHost(ValueError):
+    """Hôte refusé (caractère hors de lettres, chiffres, `.`, `-`, `_`, `*`, `?`) ; code 2."""
 
 
 @dataclass(frozen=True)
@@ -107,6 +120,28 @@ def parse_hosts(value: str) -> tuple:
     return tuple(out)
 
 
+def valid_host(host: str) -> bool:
+    """Motif de ligne `Host` accepté (voir HOST_RE), espaces autour ignorés."""
+    return bool(HOST_RE.fullmatch((host or "").strip()))
+
+
+def normalize_hosts(values: Iterable[str]) -> tuple:
+    """Hôtes donnés par l'utilisateur (chacun peut être une liste à virgules) → tuple en
+    minuscules, sans vide ni doublon, dans l'ordre. Un hôte invalide lève InvalidHost."""
+    out = []
+    for v in values:
+        for h in (v or "").split(","):
+            h = h.strip()
+            if not h:
+                continue
+            if not valid_host(h):
+                raise InvalidHost("hôte invalide : %r (lettres, chiffres, « . », « - », « _ », « * », « ? »)" % h)
+            h = h.lower()
+            if h not in out:
+                out.append(h)
+    return tuple(out)
+
+
 class VaultBackend(abc.ABC):
     """Accès au coffre. `prompt=None` veut dire : ne jamais demander de mot de passe.
 
@@ -146,3 +181,10 @@ class VaultBackend(abc.ABC):
     @abc.abstractmethod
     def get_private_key(self, item_id: str, prompt: Optional[Prompt] = None) -> bytes:
         """Clé privée, en mémoire seulement : l'appelant ne l'écrit ni ne l'affiche."""
+
+    @abc.abstractmethod
+    def set_hosts(self, item_id: str, hosts: Sequence[str], prompt: Optional[Prompt] = None) -> SshKeyItem:
+        """Remplace les hôtes de l'élément par `hosts` (validés, en minuscules ; vide = champ
+        retiré), sans toucher au reste de l'élément. Renvoie l'élément relu après écriture.
+        InvalidHost si un hôte est refusé (rien écrit) ; WriteFailed si l'écriture n'a pas
+        abouti ou ne se relit pas (message avec l'état relu)."""

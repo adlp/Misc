@@ -291,7 +291,7 @@ class Bench:
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("BW_", "SSH_ASKPASS", "SSHVAULT_", "FAKE_BW_", "XDG_"))
                and k not in ("DISPLAY", "WAYLAND_DISPLAY", "BITWARDENCLI_APPDATA_DIR", "PYTHONPATH")}
-        env.update(HOME=str(self.home), XDG_RUNTIME_DIR=str(self.runtime),
+        env.update(HOME=str(self.home), SSHVAULT_SSH_HOME=str(self.home), XDG_RUNTIME_DIR=str(self.runtime),
                    SSHVAULT_BW=str(self.bw), FAKE_BW_VAULT=str(self.vault_file),
                    FAKE_BW_LOG=str(self.log), FAKE_BW_PIDS=str(self.pids),
                    PYTHONPATH=SRC, SSHVAULT_PROMPT_TIMEOUT="10",
@@ -386,6 +386,10 @@ class Bench:
     def add_item(self, item):
         self.items.append(item)
         self.write_vault()
+
+    def vault_item(self, iid):
+        """Élément tel que le faux serveur le garde (après un éventuel `bw edit`)."""
+        return next(i for i in json.loads(self.vault_file.read_text())["items"] if i.get("id") == iid)
 
     def calls(self):
         if not self.log.exists():

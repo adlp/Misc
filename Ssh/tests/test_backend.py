@@ -138,3 +138,115 @@ def test_lock_garde_la_premiere_erreur(bench, backend, monkeypatch):
     monkeypatch.setattr(backend.store, "clear", clear)
     with pytest.raises(BwTimeout):
         backend.lock()
+
+
+# --- hôtes : validation, normalisation, champ réécrit (story 4) ----------------------------
+
+from sshvault.backend import InvalidHost, normalize_hosts, valid_host  # noqa: E402
+from sshvault.bw import hosts_of, with_hosts  # noqa: E402
+
+
+@pytest.mark.parametrize("host", ["a", "Prod.Example.COM", "*.lab", "h?st", "a_b-c.d", "*", "10.0.0.1"])
+def test_valid_host(host):
+    assert valid_host(host)
+
+
+@pytest.mark.parametrize("host", ["a b", "a,b", "!a", "a%h", 'a"', "u@h", "h:22", "a/b", "a\tb", "a\x00",
+                                  "é", "K", "[a]", "", " "])
+def test_invalid_host(host):
+    assert not valid_host(host)
+
+
+def test_normalize_hosts():
+    assert normalize_hosts(["B.example, a.example", "b.EXAMPLE", "", " c "]) == ("b.example", "a.example", "c")
+    assert normalize_hosts([""]) == ()
+    with pytest.raises(InvalidHost, match="'a b'"):
+        normalize_hosts(["ok", "a b"])
+
+
+def _item(fields):
+    return {"id": "x", "type": 5, "name": "n", "notes": None, "revisionDate": "2026-10-06T10:00:00.000Z",
+            "fields": fields, "sshKey": {"privateKey": "PRIV", "publicKey": "ssh-ed25519 AAAA", "keyFingerprint": "SHA256:x"}}
+
+
+def test_with_hosts_cree_le_champ():
+    it = _item(None)
+    new = with_hosts(it, ("a", "b"))
+    assert new["fields"] == [{"name": "sshvault-hosts", "value": "a,b", "type": 0, "linkedId": None}]
+    assert it["fields"] is None, "original non modifié"
+    assert {k: v for k, v in new.items() if k != "fields"} == {k: v for k, v in it.items() if k != "fields"}
+
+
+def test_with_hosts_vide_retire_le_champ_et_garde_une_liste():
+    it = _item([{"name": "sshvault-hosts", "value": "a", "type": 0, "linkedId": None}])
+    assert with_hosts(it, ())["fields"] == [], "null ferait garder les anciens champs à bw"
+    assert with_hosts(_item(None), ()) == _item(None)
+
+
+def test_with_hosts_fusionne_et_garde_le_reste():
+    other = {"name": "note", "value": "v", "type": 0, "linkedId": None}
+    boolean = {"name": "sshvault-hosts", "value": "true", "type": 2, "linkedId": None}
+    it = _item([{"name": "sshvault-hosts", "value": "A", "type": 1, "linkedId": None}, other,
+                {"name": "sshvault-hosts", "value": "b", "type": 0, "linkedId": None}, boolean])
+    assert hosts_of(it) == ("a", "b")
+    new = with_hosts(it, ("a", "c"))
+    assert new["fields"] == [{"name": "sshvault-hosts", "value": "a,c", "type": 1, "linkedId": None}, other, boolean]
+    assert hosts_of(new) == ("a", "c")
+
+
+def test_with_hosts_identique_rien_a_ecrire():
+    it = _item([{"name": "sshvault-hosts", "value": "a,b", "type": 0, "linkedId": None}])
+    assert with_hosts(it, ("a", "b")) == it
+
+
+def test_set_hosts_renvoie_l_element_relu(bench, backend):
+    from bench import ID_PROD
+    got = backend.set_hosts(ID_PROD, ["x.example", "Prod.Example.com"])
+    assert got.id == ID_PROD and got.hosts == ("x.example", "prod.example.com")
+    with pytest.raises(InvalidHost):
+        backend.set_hosts(ID_PROD, ["a b"])
+    assert not [c for c in bench.calls() if "edit" in c["argv"][1:2]][1:], "un seul edit"
+
+
+# --- set_hosts : interruption, relecture en échec après edit, null et "" ---------------------
+
+def test_set_hosts_interrompu_entre_edit_et_relecture(bench, backend, monkeypatch):
+    from bench import ID_PROD
+    real = backend.get_item
+    n = {"get": 0}
+
+    def get_item(iid, prompt=None):
+        n["get"] += 1
+        if n["get"] == 2:
+            raise KeyboardInterrupt
+        return real(iid, prompt)
+    monkeypatch.setattr(backend, "get_item", get_item)
+    with pytest.raises(KeyboardInterrupt):
+        backend.set_hosts(ID_PROD, ["x.example"])
+    assert backend.warnings == ["hôtes de « Serveur Prod » : écriture peut-être passée : vérifier par "
+                                "« sshvault sync » puis « sshvault hosts list --id %s »" % ID_PROD]
+    assert [c["argv"][1] for c in bench.calls()].count("edit") == 1
+
+
+def test_set_hosts_relecture_impossible_apres_edit(bench, backend, monkeypatch):
+    from bench import ID_PROD
+    from sshvault.backend import WriteFailed
+    real = backend.get_item
+    n = {"get": 0}
+
+    def get_item(iid, prompt=None):
+        n["get"] += 1
+        if n["get"] == 2:
+            raise BackendError("erreur bw (get item, code 1) : Unexpected error.")
+        return real(iid, prompt)
+    monkeypatch.setattr(backend, "get_item", get_item)
+    with pytest.raises(WriteFailed, match="bw edit a réussi, relecture impossible .* état inconnu, vérifier par"):
+        backend.set_hosts(ID_PROD, ["x.example"])
+
+
+def test_is_written_null_et_vide_confondus():
+    from sshvault.bw import _is_written
+    before = _item([{"name": "note", "value": None, "type": 0, "linkedId": None}])
+    after = with_hosts(_item([{"name": "note", "value": "", "type": 0, "linkedId": None}]), ("a",))
+    after["notes"] = ""
+    assert _is_written(after, before, ("a",))

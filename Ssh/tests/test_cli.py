@@ -880,3 +880,353 @@ def test_config_ecriture_impossible(bench):
         assert r.returncode == 4 and "écriture de" in one_line_error(r)
     finally:
         os.chmod(str(d), 0o700)
+
+
+# --- hosts (CAP-4) : une ligne de test par ligne de la matrice de la story 4 ----------------
+
+def _hosts_field(item):
+    return [f for f in (item.get("fields") or []) if f.get("name") == "sshvault-hosts"]
+
+
+def _edits(bench):
+    return [c for c in bench.calls() if "edit" in c["argv"]]
+
+
+def _assert_no_json_in_argv(bench):
+    """Journal argv du faux bw : ni JSON, ni base64 de l'élément, ni clé privée."""
+    for c in bench.calls():
+        for a in c["argv"]:
+            assert "{" not in a and "PRIVATE" not in a and len(a) < 80, c["argv"]
+            for k in bench.keys.values():
+                assert "".join(k["private"].splitlines()[1:2])[:20] not in a
+
+
+def _unlocked(bench):
+    bench.unlocked("keyring" if bench.ring else "file")
+
+
+def test_hosts_add_cree_le_champ(bench):
+    _unlocked(bench)
+    before = bench.vault_item(ID_PERSO)
+    r = bench.run("hosts", "add", "--id", ID_PERSO, "Perso.Example", "b.example,perso.example")
+    assert r.returncode == 0, r.stderr
+    assert "hôtes de « clé perso » : perso.example,b.example" in r.stdout
+    after = bench.vault_item(ID_PERSO)
+    assert _hosts_field(after) == [{"name": "sshvault-hosts", "value": "perso.example,b.example", "type": 0,
+                                    "linkedId": None}]
+    assert after["sshKey"] == before["sshKey"] and after["notes"] == before["notes"]
+    edits = _edits(bench)
+    assert len(edits) == 1 and edits[0]["argv"] == ["--nointeraction", "edit", "item", ID_PERSO]
+    _assert_no_json_in_argv(bench)
+    # relu après écriture, puis ssh-config régénéré
+    assert [c["argv"][1:] for c in bench.calls()][-1] == ["get", "item", ID_PERSO]
+    cfg = (bench.home / ".ssh" / "sshvault" / "config").read_text()
+    assert "Match originalhost perso.example,b.example\n" in cfg
+    assert "config : écrit" in r.stdout
+
+
+def test_hosts_add_complete_en_minuscules_sans_doublon(bench):
+    _unlocked(bench)
+    before = bench.vault_item(ID_BASTION)
+    r = bench.run("hosts", "add", "--name", "bastion", "JUMP", "Rebond.Example")
+    assert r.returncode == 0, r.stderr
+    after = bench.vault_item(ID_BASTION)
+    assert _hosts_field(after)[0]["value"] == "bastion,jump,rebond.example"
+    # autres champs, notes, clé conservés
+    assert [f for f in after["fields"] if f["name"] == "note"] == [f for f in before["fields"] if f["name"] == "note"]
+    assert after["sshKey"] == before["sshKey"]
+    assert after["revisionDate"] != before["revisionDate"]
+
+
+def test_hosts_add_rien_a_ajouter(bench):
+    _unlocked(bench)
+    r = bench.run("hosts", "add", "--id", ID_BASTION, "jump")
+    assert r.returncode == 0, r.stderr
+    assert "inchangés" in r.stdout
+    assert not _edits(bench)
+
+
+def test_hosts_selection_multiple(bench):
+    _unlocked(bench)
+    r = bench.run("hosts", "add", "--name", "e", "x.example")  # « Serveur Prod », « clé perso », …
+    assert r.returncode == 2
+    assert "préciser --id" in one_line_error(r)
+    assert not _edits(bench)
+
+
+def test_hosts_selection_aucune(bench):
+    _unlocked(bench)
+    r = bench.run("hosts", "add", "--name", "inconnu", "x.example")
+    assert r.returncode == 1
+    assert not _edits(bench)
+
+
+def test_hosts_remove(bench):
+    _unlocked(bench)
+    r = bench.run("hosts", "remove", "--id", ID_PROD, "PROD.example.com")
+    assert r.returncode == 0, r.stderr
+    assert _hosts_field(bench.vault_item(ID_PROD))[0]["value"] == "*.lab.example"
+
+
+def test_hosts_remove_dernier_hote_retire_le_champ(bench):
+    _unlocked(bench)
+    before = bench.vault_item(ID_BASTION)
+    r = bench.run("hosts", "remove", "--id", ID_BASTION, "bastion,jump")
+    assert r.returncode == 0, r.stderr
+    after = bench.vault_item(ID_BASTION)
+    assert not _hosts_field(after)
+    assert after["fields"] == [f for f in before["fields"] if f["name"] != "sshvault-hosts"]
+
+
+def test_hosts_remove_hote_absent(bench):
+    _unlocked(bench)
+    before = bench.vault_item(ID_BASTION)
+    r = bench.run("hosts", "remove", "--id", ID_BASTION, "jump", "absent.example")
+    assert r.returncode == 1
+    assert "absent.example" in one_line_error(r)
+    assert not _edits(bench) and bench.vault_item(ID_BASTION) == before
+
+
+def test_hosts_set_et_list(bench):
+    _unlocked(bench)
+    r = bench.run("hosts", "set", "--id", ID_PROD, "a.example,B.example")
+    assert r.returncode == 0, r.stderr
+    assert _hosts_field(bench.vault_item(ID_PROD))[0]["value"] == "a.example,b.example"
+    r = bench.run("hosts", "list", "--id", ID_PROD)
+    assert r.returncode == 0 and r.stdout == "a.example\nb.example\n"
+    r = bench.run("hosts", "set", "--id", ID_PROD, "")
+    assert r.returncode == 0, r.stderr
+    assert not _hosts_field(bench.vault_item(ID_PROD))
+    r = bench.run("hosts", "list", "--id", ID_PROD)
+    assert r.returncode == 0 and r.stdout == ""
+
+
+@pytest.mark.parametrize("host", ["a b", "!neg", "50%", '"q"', "user@h", "h:22", "a/b", "ctl\x01", "é.example",
+                                  "K.example"])
+@pytest.mark.parametrize("cmd", ["add", "set"])
+def test_hosts_invalide_rien_ecrit(bench, cmd, host):
+    _unlocked(bench)
+    before = bench.vault_item(ID_PROD)
+    r = bench.run("hosts", cmd, "--id", ID_PROD, "ok.example", host)
+    assert r.returncode == 2, r.stderr
+    assert "hôte invalide" in one_line_error(r)
+    assert not _edits(bench) and bench.vault_item(ID_PROD) == before
+
+
+def test_hosts_hote_invalide_deja_dans_le_coffre(bench):
+    """Saisi dans l'interface web : add refuse d'écrire la liste, remove permet de le retirer."""
+    bench.items[0]["fields"][0]["value"] = "prod.example.com, mauvais hote"
+    bench.write_vault()
+    _unlocked(bench)
+    r = bench.run("hosts", "add", "--id", ID_PROD, "x.example")
+    assert r.returncode == 2 and "déjà dans" in one_line_error(r)
+    assert not _edits(bench)
+    r = bench.run("hosts", "remove", "--id", ID_PROD, "mauvais hote")
+    assert r.returncode == 0, r.stderr
+    assert _hosts_field(bench.vault_item(ID_PROD))[0]["value"] == "prod.example.com"
+
+
+def test_hosts_champ_masque_garde_son_type(bench):
+    bench.items[0]["fields"][0]["type"] = 1
+    bench.write_vault()
+    _unlocked(bench)
+    r = bench.run("hosts", "add", "--id", ID_PROD, "x.example")
+    assert r.returncode == 0, r.stderr
+    assert _hosts_field(bench.vault_item(ID_PROD)) == [
+        {"name": "sshvault-hosts", "value": "prod.example.com,*.lab.example,x.example", "type": 1, "linkedId": None}]
+
+
+def test_hosts_edit_en_echec_rejoue_une_fois(bench):
+    _unlocked(bench)
+    before = bench.vault_item(ID_PROD)
+    r = bench.run("hosts", "add", "--id", ID_PROD, "x.example", env={"FAKE_BW_FAIL": "edit=error"})
+    assert r.returncode == 4
+    line = one_line_error(r)
+    assert "deux fois" in line and "état relu : élément inchangé (hôtes : prod.example.com,*.lab.example)" in line
+    argv = [c["argv"][1:] for c in bench.calls()]
+    assert argv.count(["edit", "item", ID_PROD]) == 2
+    # relecture de l'état réel (sync puis get) avant le rejeu
+    i = argv.index(["edit", "item", ID_PROD])
+    assert argv[i + 1:i + 3] == [["sync"], ["get", "item", ID_PROD]]
+    assert bench.vault_item(ID_PROD) == before
+
+
+def test_hosts_edit_en_echec_une_fois(bench):
+    _unlocked(bench)
+    r = bench.run("hosts", "add", "--id", ID_PROD, "x.example", env={"FAKE_BW_FAIL": "edit=erroronce"})
+    assert r.returncode == 0, r.stderr
+    assert len(_edits(bench)) == 2
+    assert _hosts_field(bench.vault_item(ID_PROD))[0]["value"].endswith(",x.example")
+
+
+def test_hosts_edit_bloque_sans_ecriture_rejoue(bench):
+    _unlocked(bench)
+    r = bench.run("hosts", "add", "--id", ID_PROD, "x.example",
+                  env={"FAKE_BW_FAIL": "edit=hangonce", "SSHVAULT_BW_TIMEOUT": "2"})
+    assert r.returncode == 0, r.stderr
+    assert len(_edits(bench)) == 2
+    assert _hosts_field(bench.vault_item(ID_PROD))[0]["value"].endswith(",x.example")
+    assert _gone([int(x) for x in bench.pids.read_text().split()]), "bw bloqué et son enfant tués"
+
+
+@pytest.mark.parametrize("mode", ["hangafter", "errorafter"])
+def test_hosts_edit_ecrit_puis_bloque_pas_de_rejeu(bench, mode):
+    """La réponse se perd mais l'écriture est passée : la relecture le voit, rien n'est rejoué."""
+    _unlocked(bench)
+    r = bench.run("hosts", "add", "--id", ID_PROD, "x.example",
+                  env={"FAKE_BW_FAIL": "edit=" + mode, "SSHVAULT_BW_TIMEOUT": "2"})
+    assert r.returncode == 0, r.stderr
+    assert len(_edits(bench)) == 1
+    assert _hosts_field(bench.vault_item(ID_PROD))[0]["value"].endswith(",x.example")
+
+
+def test_hosts_element_change_entre_temps_pas_de_rejeu(bench):
+    _unlocked(bench)
+    r = bench.run("hosts", "add", "--id", ID_PROD, "x.example", env={"FAKE_BW_EDIT_RACE": "notes=autre client"})
+    assert r.returncode == 4
+    line = one_line_error(r)
+    assert "out of date" in line and "a changé dans le coffre" in line and "rien rejoué" in line
+    assert len(_edits(bench)) == 1
+    item = bench.vault_item(ID_PROD)
+    assert item["notes"] == "autre client" and not item["fields"][0]["value"].endswith("x.example")
+
+
+def test_hosts_edit_reussi_mais_relu_different(bench):
+    _unlocked(bench)
+    r = bench.run("hosts", "add", "--id", ID_PROD, "x.example", env={"FAKE_BW_FAIL": "edit=silent"})
+    assert r.returncode == 4
+    assert "bw edit a réussi mais l'élément relu diffère (hôtes relus : prod.example.com,*.lab.example)" \
+        in one_line_error(r)
+    assert len(_edits(bench)) == 1, "pas de rejeu sur un succès annoncé"
+    assert not (bench.home / ".ssh").exists(), "ssh-config non régénéré"
+
+
+def test_hosts_relecture_impossible(bench):
+    _unlocked(bench)
+    r = bench.run("hosts", "add", "--id", ID_PROD, "x.example", env={"FAKE_BW_FAIL": "edit=error,sync=errorsecond"})
+    assert r.returncode == 4
+    assert "état inconnu" in one_line_error(r)
+    assert len(_edits(bench)) == 1
+
+
+@pytest.mark.parametrize("args", [["hosts", "add", "--id", ID_PROD, "x.example"], ["hosts", "list", "--id", ID_PROD],
+                                  ["ssh-config"], ["ssh-config", "--check"]])
+def test_hosts_et_ssh_config_verrouille(bench, args):
+    bench.set_state(logged_in=True)
+    r = bench.run("--nointeraction", *args)
+    assert r.returncode == 3
+    assert "verrouillé" in one_line_error(r)
+    assert not (bench.home / ".ssh").exists()
+
+
+def test_hosts_non_connecte(bench):
+    r = bench.run("hosts", "add", "--id", ID_PROD, "x.example")
+    assert r.returncode == 3 and "sshvault login" in one_line_error(r)
+
+
+def test_hosts_coffre_verrouille_invite(bench):
+    bench.set_state(logged_in=True)
+    r, tty = bench.run_tty("hosts", "add", "--id", ID_PERSO, "perso.example", answer=PASSWORD)
+    assert r.returncode == 0, (r.stderr, tty)
+    assert _hosts_field(bench.vault_item(ID_PERSO))[0]["value"] == "perso.example"
+
+
+# --- hosts : revue (sync, prérequis, succès partiel, interruption, --restrict, sélection) -----
+
+def test_hosts_sync_avant_lecture(bench):
+    _unlocked(bench)
+    r = bench.run("hosts", "add", "--id", ID_PROD, "x.example")
+    assert r.returncode == 0, r.stderr
+    argv = [c["argv"][1:] for c in bench.calls()]
+    assert argv[:2] == [["sync"], ["list", "items"]]
+    r = bench.run("hosts", "list", "--id", ID_PROD)
+    assert [c["argv"][1:] for c in bench.calls()][-1] == ["list", "items"], "list : cache local, sans sync"
+
+
+def test_hosts_prerequis_verifies_avant_ecriture(bench, tmp_path):
+    _unlocked(bench)
+    d = tmp_path / "pas-tmpfs"
+    d.mkdir(mode=0o700)
+    before = bench.vault_item(ID_PROD)
+    r = bench.run("hosts", "add", "--id", ID_PROD, "x.example", env={"XDG_RUNTIME_DIR": str(d)})
+    assert r.returncode == 4 and "XDG_RUNTIME_DIR" in one_line_error(r)
+    assert not _edits(bench) and bench.vault_item(ID_PROD) == before
+
+
+def test_hosts_chemin_inutilisable_verifie_avant_ecriture(bench, tmp_path):
+    _unlocked(bench)
+    home = tmp_path / 'gui"llemet'
+    home.mkdir()
+    before = bench.vault_item(ID_PROD)
+    r = bench.run("hosts", "add", "--id", ID_PROD, "x.example", env={"SSHVAULT_SSH_HOME": str(home)})
+    assert r.returncode == 4 and "inutilisable dans un ssh_config" in one_line_error(r)
+    assert not _edits(bench) and bench.vault_item(ID_PROD) == before
+    assert not (home / ".ssh").exists()
+
+
+def test_hosts_ecrits_mais_ssh_config_non_regenere(bench):
+    """Échec après l'écriture (~/.ssh/sshvault est un fichier) : code 4, message, élément écrit."""
+    _unlocked(bench)
+    ssh = bench.home / ".ssh"
+    ssh.mkdir(mode=0o700)
+    (ssh / "sshvault").write_text("pas un dossier")
+    r = bench.run("hosts", "add", "--id", ID_PROD, "x.example")
+    assert r.returncode == 4
+    assert "hôtes écrits dans le coffre, mais ssh_config non régénéré" in r.stderr
+    assert "hôtes de « Serveur Prod » : prod.example.com,*.lab.example,x.example" in r.stdout
+    assert _hosts_field(bench.vault_item(ID_PROD))[0]["value"].endswith(",x.example")
+    assert (ssh / "sshvault").read_text() == "pas un dossier"
+
+
+def test_hosts_sigterm_pendant_edit(bench):
+    import signal
+    import subprocess
+    import sys
+    _unlocked(bench)
+    e = dict(bench.env, FAKE_BW_FAIL="edit=hang", SSHVAULT_BW_TIMEOUT="60")
+    p = subprocess.Popen([sys.executable, "-m", "sshvault", "hosts", "add", "--id", ID_PROD, "x.example"], env=e,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         start_new_session=True)
+    deadline = time.monotonic() + 20
+    while not (bench.pids.exists() and len(bench.pids.read_text().split()) == 2) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    p.send_signal(signal.SIGTERM)
+    out, err = p.communicate(timeout=20)
+    assert p.returncode == 130
+    assert err.splitlines() == [
+        "sshvault: interrompu",
+        "sshvault: hôtes de « Serveur Prod » : écriture peut-être passée : vérifier par « sshvault sync » puis "
+        "« sshvault hosts list --id %s »" % ID_PROD]
+    assert _gone([int(x) for x in bench.pids.read_text().split()])
+
+
+def test_hosts_avertit_cle_chargee_avec_restrict(bench):
+    _unlocked(bench)
+    d = bench.runtime / "sshvault"
+    d.mkdir(mode=0o700, exist_ok=True)
+    state = {"version": 1, "agent": None, "locked": False, "keys": {bench.keys["prod"]["fingerprint"]: {
+        "id": ID_PROD, "name": "Serveur Prod", "hosts": ["prod.example.com"], "loaded": time.time(),
+        "lifetime": 0, "confirm": False, "restrict": True}}}
+    fd = os.open(str(d / "agent.json"), os.O_WRONLY | os.O_CREAT, 0o600)
+    os.write(fd, json.dumps(state).encode())
+    os.close(fd)
+    r = bench.run("hosts", "add", "--id", ID_PROD, "x.example")
+    assert r.returncode == 0, r.stderr
+    assert "chargée avec --restrict" in r.stderr and "sshvault load --force --restrict --id %s" % ID_PROD in r.stderr
+    r = bench.run("hosts", "add", "--id", ID_BASTION, "x.example")
+    assert "--restrict" not in r.stderr
+
+
+@pytest.mark.parametrize("args", [["--host", "JUMP"], ["--fingerprint", None]])
+def test_hosts_selection_host_et_empreinte(bench, args):
+    _unlocked(bench)
+    if args[1] is None:
+        args = ["--fingerprint", bench.keys["bastion"]["fingerprint"]]
+    r = bench.run("hosts", "list", args[0], args[1])
+    assert r.returncode == 0 and r.stdout == "Bastion\njump\n"
+
+
+def test_hosts_list_aucun_element(bench):
+    _unlocked(bench)
+    r = bench.run("hosts", "list", "--name", "inconnu")
+    assert r.returncode == 1 and "aucune clé ne correspond" in one_line_error(r)

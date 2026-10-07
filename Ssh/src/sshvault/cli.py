@@ -2,16 +2,24 @@
 
 Codes de sortie :
   0  succès
-  1  aucun résultat (search, load)
+  1  aucun résultat (search, load, hosts : sélection sans élément) ; hosts remove : hôte
+     absent de l'élément (rien écrit) ; ssh-config --check : pas à jour (contenu, droits,
+     fichier en trop ou non ordinaire) ou ligne Include absente, conditionnelle ou pas en tête
   2  usage (option ou argument invalide ; load sans sélection ni --all ; durée invalide ;
-     config.json invalide, illisible ou aux droits inattendus)
+     config.json invalide, illisible ou aux droits inattendus ; hôte invalide ; sélection
+     de hosts qui désigne plusieurs éléments)
   3  non connecté au coffre, ou coffre verrouillé (aucune invite possible, mot de passe refusé) ;
      agent dédié arrêté ou verrouillé ; passphrase d'une clé refusée ou impossible à saisir
   4  erreur du backend (bw absent, en erreur, réponse illisible, délai dépassé), de l'agent
      dédié (XDG_RUNTIME_DIR relatif, non privé ou hors tmpfs, chemin du socket trop long,
      agent tiers, OpenSSH < 8.9, --restrict : élément sans hôte, hôte non littéral ou absent
      de known_hosts ; clé publique illisible ou différente de la clé privée), écriture de
-     config.json impossible, ou erreur interne
+     config.json impossible, écriture des hôtes dans le coffre non aboutie ou non vérifiée
+     (y compris hôtes écrits mais ssh_config non régénéré), ssh_config généré impossible à
+     écrire (chemin avec « " », « \\ », « ${ », fichier non ordinaire, droits), répertoire
+     personnel inconnu, ssh-config install refusé (~/.ssh/config lien symbolique ou non
+     ordinaire, Include de sshvault dans un bloc Host/Match, chemin personnel avec %, $ ou
+     joker de glob), ou erreur interne
   130 interrompu (Ctrl-C, SIGTERM, SIGHUP)
 `status` : 0 si le coffre est déverrouillé, 3 s'il est verrouillé ou non connecté, 4 en erreur.
 `agent status` : 0 si l'agent dédié tourne, 3 s'il est arrêté, 4 en erreur ou agent tiers.
@@ -33,13 +41,15 @@ from .agent import (CMD_TIMEOUT as AGENT_TIMEOUT, Agent, AgentError, AgentLocked
                     PassphraseRefused, askpass_rules, fingerprint, is_encrypted, literal_host, public_blob,
                     resolve_dir, tty_available)
 from .agentstate import entry as state_entry, maybe_locked, reconcile, remaining
-from .backend import BackendError, NotLoggedIn, SshKeyItem, VaultBackend, VaultError, VaultLocked
+from .backend import (BackendError, InvalidHost, NotLoggedIn, SshKeyItem, VaultBackend, VaultError, VaultLocked,
+                      normalize_hosts, valid_host)
 from .bw import BwBackend
 from .config import Config, ConfigError, ConfigWriteError, describe_duration, parse_duration
 from .prompt import DEFAULT_TIMEOUT as PROMPT_TIMEOUT, PromptError, ask_password, prompt_timeout
 from .bw import DEFAULT_TIMEOUT as BW_TIMEOUT
 from .session import DEFAULT_TTL, SessionStore, SessionStoreError
 from .settings import seconds
+from . import sshconfig
 
 RC_OK, RC_NONE, RC_USAGE, RC_LOCKED, RC_BACKEND, RC_INTERRUPTED = 0, 1, 2, 3, 4, 130
 
@@ -92,9 +102,11 @@ def duration_arg(s: str) -> int:
 
 def build_parser() -> Parser:
     p = Parser(prog="sshvault", description="Clés SSH du coffre Vaultwarden (via bw).",
-               epilog="Codes de sortie : 0 ok, 1 aucun résultat, 2 usage, "
+               epilog="Codes de sortie : 0 ok, 1 aucun résultat (hosts remove : hôte absent ; "
+                      "ssh-config --check : pas à jour), 2 usage (hôte invalide, sélection ambiguë), "
                       "3 non connecté ou verrouillé (coffre ou agent, passphrase refusée), "
-                      "4 erreur backend ou agent, 130 interrompu. "
+                      "4 erreur backend ou agent, écriture ou ssh_config impossible, install refusé, "
+                      "130 interrompu. "
                       "status : 0 déverrouillé, 3 sinon ; agent status : 0 actif, 3 arrêté.")
     p.add_argument("--version", action="version", version="sshvault " + __version__)
     p.add_argument("--nointeraction", action="store_true",
@@ -146,6 +158,31 @@ def build_parser() -> Parser:
     asub.add_parser("lock", help="verrouille l'agent (ssh-add -x, mot de passe saisi par ssh-add)")
     asub.add_parser("unlock", help="déverrouille l'agent (ssh-add -X)")
     asub.add_parser("stop", help="arrête l'agent, supprime socket et état")
+
+    s = sub.add_parser("hosts", help="hôtes associés à une clé (champ sshvault-hosts de l'élément)")
+    hsub = s.add_subparsers(dest="hosts_cmd", metavar="ACTION", parser_class=Parser)
+    hsub.required = True
+    for name, what, nargs in (("add", "ajoute des hôtes", "+"), ("remove", "retire des hôtes", "+"),
+                              ("set", "remplace la liste (\"\" : la vide)", "+"), ("list", "affiche les hôtes", None)):
+        h = hsub.add_parser(name, help=what)
+        h.add_argument("pattern", metavar="SÉLECTION", help="un seul élément, choisi comme pour load")
+        g = h.add_mutually_exclusive_group()
+        for flag, sel in (("host", "motif glob d'hôte"), ("name", "sous-chaîne du nom"),
+                          ("fingerprint", "empreinte exacte"), ("id", "id exact de l'élément")):
+            g.add_argument("--" + flag, dest="by", action="store_const", const=flag, help=sel)
+        if nargs:
+            h.add_argument("hosts", metavar="HÔTE", nargs=nargs,
+                           help="motif de ligne Host (lettres, chiffres, . - _ * ?), ou liste à virgules")
+
+    s = sub.add_parser("ssh-config", help="génère ~/.ssh/sshvault/config et les clés publiques ; "
+                                          "install : ligne Include en tête de ~/.ssh/config")
+    s.add_argument("action", nargs="?", choices=["install"], metavar="install",
+                   help="insère la ligne Include en tête de ~/.ssh/config (sauvegarde faite)")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--print", dest="print_only", action="store_true",
+                   help="affiche la config générée sans rien écrire")
+    g.add_argument("--check", action="store_true",
+                   help="code 0 si tout est à jour et la ligne Include en tête, 1 sinon ; n'écrit rien")
 
     s = sub.add_parser("config", help="réglages (key-ttl : durée de vie par défaut des clés)")
     csub = s.add_subparsers(dest="config_cmd", metavar="ACTION", parser_class=Parser)
@@ -249,6 +286,10 @@ def run(args, backend: VaultBackend) -> int:
         return run_agent(args)
     if args.cmd == "config":
         return run_config(args)
+    if args.cmd == "hosts":
+        return run_hosts(args, backend, prompt)
+    if args.cmd == "ssh-config":
+        return run_ssh_config(args, backend, prompt)
     raise UsageError("commande inconnue : %s" % args.cmd)
 
 
@@ -488,6 +529,154 @@ def reap_orphans_quietly() -> None:
         pass
 
 
+# --- hôtes et ssh_config généré --------------------------------------------------------
+
+def _select_one(items: list, args) -> Optional[SshKeyItem]:
+    """L'élément désigné par la sélection ; None (message dit) si aucun ; UsageError si plusieurs."""
+    if not args.pattern.strip():
+        raise UsageError("sélection vide")
+    found = [i for i in items if match(i, args.pattern, args.by)]
+    if not found:
+        err("aucune clé ne correspond à « %s »" % args.pattern)
+        return None
+    if len(found) > 1:
+        raise UsageError("« %s » désigne %d éléments (%s) : préciser --id"
+                         % (args.pattern, len(found), ", ".join("%s %s" % (clean(i.name), i.id) for i in found)))
+    return found[0]
+
+
+def _split(values) -> list:
+    return [h.strip() for v in values for h in v.split(",") if h.strip()]
+
+
+def regenerate(items: list, paths=None, socket: Optional[str] = None) -> None:
+    """Réécrit ce qui a changé dans ~/.ssh/sshvault/ ; avertissements sur stderr."""
+    paths = paths or sshconfig.default_paths()
+    plan = sshconfig.build(items, paths, socket or make_agent().socket)
+    for w in plan.warnings:
+        err("avertissement : %s" % w)
+    res = sshconfig.apply(plan, paths)
+    for w in res.warnings:
+        err("avertissement : %s" % w)
+    print("%s : %s (%d bloc%s)" % (paths.config, "écrit" if res.config_written else "inchangé", plan.blocks,
+                                   "s" if plan.blocks > 1 else ""))
+    if res.pubs_written or res.pubs_removed:
+        print("clés publiques (%s) : %d écrite%s, %d supprimée%s"
+              % (paths.pub, len(res.pubs_written), "s" if len(res.pubs_written) > 1 else "",
+                 len(res.pubs_removed), "s" if len(res.pubs_removed) > 1 else ""))
+    w = sshconfig.include_warning(paths)
+    if w:
+        err("avertissement : %s" % w)
+
+
+def run_hosts(args, backend: VaultBackend, prompt) -> int:
+    cmd = args.hosts_cmd
+    if cmd != "list":
+        given = _split(args.hosts)
+        if cmd in ("add", "set"):
+            new = normalize_hosts(given)  # InvalidHost (code 2) avant tout accès au coffre
+            if cmd == "add" and not new:
+                raise UsageError("aucun hôte à ajouter")
+        elif not given:
+            raise UsageError("aucun hôte à retirer")
+        # écriture : partir de l'état du serveur, pas d'un cache local périmé (interface web)
+        backend.sync(prompt)
+    items = backend.list_ssh_keys(prompt)
+    item = _select_one(items, args)
+    if item is None:
+        return RC_NONE
+    if cmd == "list":
+        for h in item.hosts:
+            print(clean(h))
+        return RC_OK
+    current = []
+    for h in item.hosts:
+        if h.lower() not in current:
+            current.append(h.lower())
+    if cmd == "add":
+        want = current + [h for h in new if h not in current]
+    elif cmd == "set":
+        want = list(new)
+    else:
+        targets = [h.lower() for h in given]
+        missing = [h for h in targets if h not in current]
+        if missing:
+            err("« %s » n'a pas l'hôte « %s » : rien écrit" % (clean(item.name), clean(missing[0])))
+            return RC_NONE
+        want = [h for h in current if h not in targets]
+    bad = [h for h in want if not valid_host(h)]
+    if bad:
+        raise InvalidHost("hôte invalide « %s » déjà dans « %s » : le retirer (hosts remove) ou remplacer la liste "
+                          "(hosts set) ; rien écrit" % (clean(bad[0]), clean(item.name)))
+    # Prérequis de la régénération (chemins, socket de l'agent) vérifiés avant d'écrire
+    # dans le coffre : SshConfigError ou AgentError ici, rien n'est écrit.
+    paths = sshconfig.default_paths()
+    socket = make_agent().socket
+    sshconfig.build(items, paths, socket)
+    if want == current:
+        print("hôtes de « %s » inchangés : %s" % (clean(item.name), _hosts(item.hosts)))
+        updated = item
+    else:
+        for h in want:
+            if sshconfig.is_catch_all(h):
+                err("avertissement : motif « %s » : %s" % (h, sshconfig.CATCH_ALL_WARNING))
+        updated = backend.set_hosts(item.id, want, prompt)
+        print("hôtes de « %s » : %s" % (clean(updated.name), _hosts(updated.hosts)))
+        _warn_restricted(updated)
+    items = [updated if i.id == updated.id else i for i in items]
+    try:
+        regenerate(items, paths, socket)
+    except (sshconfig.SshConfigError, AgentError) as e:
+        err("hôtes écrits dans le coffre, mais ssh_config non régénéré : %s" % e)
+        return RC_BACKEND
+    return RC_OK
+
+
+def _warn_restricted(item: SshKeyItem) -> None:
+    """Clé de l'élément chargée avec --restrict : ses contraintes -h gardent les anciens hôtes."""
+    try:
+        keys = make_agent().state.load()["keys"]
+    except Exception:
+        return
+    if any(e.get("id") == item.id and e.get("restrict") for e in keys.values()):
+        err("avertissement : clé « %s » chargée avec --restrict : elle reste limitée aux anciens hôtes ; relancer "
+            "« sshvault load --force --restrict --id %s »" % (clean(item.name), item.id))
+
+
+def run_ssh_config(args, backend: VaultBackend, prompt) -> int:
+    paths = sshconfig.default_paths()
+    if args.action == "install":
+        if args.print_only or args.check:
+            raise UsageError("install exclut --print et --check")
+        print(sshconfig.install(paths))
+        if not os.path.exists(paths.config):
+            err("avertissement : %s n'existe pas encore : lancer « sshvault ssh-config »" % paths.config)
+        return RC_OK
+    items = backend.list_ssh_keys(prompt)
+    if not (args.print_only or args.check):
+        regenerate(items)
+        return RC_OK
+    plan = sshconfig.build(items, paths, make_agent().socket)
+    for w in plan.warnings:
+        err("avertissement : %s" % w)
+    if args.print_only:
+        sys.stdout.write(plan.config.decode())
+        return RC_OK
+    diffs, notes = sshconfig.check(plan, paths)
+    for w in notes:
+        err("avertissement : %s" % w)
+    w = sshconfig.include_warning(paths)
+    if w:
+        diffs.append(w)
+    for d in diffs:
+        print(d)
+    if diffs:
+        return RC_NONE
+    print("à jour : %s (%d bloc%s), ligne Include en tête de %s"
+          % (paths.config, plan.blocks, "s" if plan.blocks > 1 else "", paths.user_config))
+    return RC_OK
+
+
 def run_config(args) -> int:
     cfg = Config()
     if args.config_cmd == "get":
@@ -541,6 +730,12 @@ def main(argv=None) -> int:
         err("magasin de session : %s" % e)
         rc = RC_BACKEND
     except ConfigWriteError as e:
+        err(e)
+        rc = RC_BACKEND
+    except InvalidHost as e:
+        err(e)
+        rc = RC_USAGE
+    except sshconfig.SshConfigError as e:
         err(e)
         rc = RC_BACKEND
     except ConfigError as e:

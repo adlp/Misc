@@ -108,9 +108,10 @@ def write_private(path: str, data: bytes) -> None:
 
 
 def read_private(path: str):
-    """Contenu de `path` s'il est un fichier ordinaire à nous en 0600 (sans lien), sinon None."""
+    """Contenu de `path` s'il est un fichier ordinaire à nous en 0600 (sans lien), sinon None.
+    O_NONBLOCK : une FIFO à ce chemin ne bloque pas l'ouverture (rejetée par fstat)."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
     try:

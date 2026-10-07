@@ -1,5 +1,50 @@
 # Changelog — sshvault
 
+## sshvault 0.3.0 — Association clé-hôtes et ssh_config généré — 2026-10-07
+
+- `hosts add|remove|set SÉLECTION HÔTE…` et `hosts list SÉLECTION` : modifient le seul
+  champ `sshvault-hosts` de l'élément (créé s'il manque, retiré s'il devient vide ; type
+  texte ou masqué gardé ; autres champs, notes, clé et `revisionDate` tels que `bw` les
+  rend). Sélection d'un seul élément comme `load` (plusieurs : code 2 « préciser --id »).
+  Hôtes : lettres, chiffres, `.`, `-`, `_`, `*`, `?`, en minuscules, sans doublon ; autre
+  caractère → code 2, rien écrit ; `remove` d'un hôte absent → code 1.
+- Écriture par `bw edit item <id>` avec l'élément encodé sur **stdin** (jamais en
+  argument), puis relecture ; `edit` en échec ou bloqué : relecture de l'état du serveur
+  (`sync`, `get`), rejeu **une** fois seulement si l'élément n'a pas changé, succès si
+  l'écriture est passée malgré l'erreur ; sinon code 4 avec l'état relu.
+- `ssh-config [--print|--check]` : `~/.ssh/sshvault/config` (un bloc par élément
+  associé, trié par nom puis id, ouvert par `Match originalhost <motif>,<motif>` : nom
+  tapé, sans tenir compte de la casse, pas le `HostName` ; `IdentityAgent` = socket dédié résolu, `IdentityFile` =
+  `pub/<empreinte base64url>.pub`, `IdentitiesOnly yes`), chemins absolus entre
+  guillemets, `%` doublé ; écriture atomique 0600/0700, rien réécrit sans changement,
+  `pub/` purgé ; élément à hôte invalide ou clé publique illisible sauté avec avertissement ;
+  hôte porté par deux éléments : deux blocs et avertissement. `--check` : code 1 si pas à
+  jour ou `Include` absent ou pas en tête. `hosts` régénère après chaque modification.
+- `ssh-config install` : `Include "<HOME>/.ssh/sshvault/config"` en première ligne de
+  `~/.ssh/config` (déplacée si plus bas, idempotent), sauvegarde `config.sshvault.bak`,
+  mode et propriétaire conservés, lien symbolique refusé (code 4). Jamais automatique :
+  `ssh-config` et `hosts` préviennent seulement.
+- Mesuré (OpenSSH 8.9p1) : `Host foo` ne s'applique pas à `ssh FOO` (d'où `Match
+  originalhost`) ; `IdentityAgent` et `IdentitiesOnly` de sshvault l'emportent sur un
+  `Host *` placé après l'`Include`, mais un `IdentityFile` de l'utilisateur se cumule ;
+  `Include` n'y développe pas `%` (les versions récentes le font : chemin avec `%` refusé
+  à `install`).
+- Revue : `hosts` fait `sync` avant de lire l'élément, vérifie socket et chemins avant
+  d'écrire, signale une écriture peut-être passée si interrompu, et une clé chargée avec
+  `--restrict` ; `ssh-config` sous verrou `flock`, jamais bloqué par une FIFO (fichier
+  non ordinaire → code 4), `~` = répertoire de passwd ; `Include` « en tête » = avant la
+  première ligne utile, conditionnel (dans un bloc Host/Match) signalé et non déplacé,
+  reconnu sous toutes ses formes, lignes coupées sur `\n` seulement ; sauvegarde jamais
+  écrasée (`.bak.N`) ; création sans écraser un fichier apparu entre-temps ; `--check`
+  aligné sur l'écriture (droits des dossiers, `pub/` inutilisable) ; motifs attrape-tout
+  (`*`, `*.*`, `?*`) et motifs qui se recouvrent : avertissement. `ForwardAgent` non
+  écrit : mesuré qu'il transfère l'agent dédié entier (README).
+- Tests : faux `bw` avec `edit` (stdin, `revisionDate` vérifiée, pannes avant/après
+  écriture, concurrence) ; validation par `ssh -G -F` et `ssh -vvv` du poste (espace et
+  `%` dans les chemins) ; intégration : `hosts add`/`remove` sur le compte de test,
+  `/proc/<pid>/cmdline` surveillé pendant l'appel, relecture par un autre client `bw`,
+  `ssh-config` dans un HOME de test.
+
 ## sshvault 0.2.0 — Agent dédié, chargement, état et purge — 2026-10-07
 
 - `load (MOTIF [--host|--name|--fingerprint|--id] | --all) [-t DURÉE] [--confirm] [--restrict] [--force]` :

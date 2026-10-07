@@ -14,12 +14,14 @@ import base64
 import json
 import os
 import pty
+import re
 import select
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 
@@ -254,6 +256,7 @@ def vault(account, bw_exe, ssh_keys, report):
         report.add("échec de mise en place", note="%s: %s" % (type(e).__name__, e))
         raise
     else:
+        ids["_reader"] = (pop, session)  # autre client bw : relecture côté serveur (après sync)
         yield ids
     finally:
         try:
@@ -284,7 +287,7 @@ def home(account, bw_exe, ring, report, witness):
            if not k.startswith(("BW_", "SSH_ASKPASS", "SSHVAULT_", "XDG_", "BITWARDENCLI_"))
            and k not in ("DISPLAY", "WAYLAND_DISPLAY")}
     env.update(account.extra_env)
-    env.update(HOME=h, XDG_RUNTIME_DIR=rt, SSHVAULT_BW=bw_exe, PYTHONPATH=SRC,
+    env.update(HOME=h, SSHVAULT_SSH_HOME=h, XDG_RUNTIME_DIR=rt, SSHVAULT_BW=bw_exe, PYTHONPATH=SRC,
                SSHVAULT_PROMPT_TIMEOUT="30", SSHVAULT_BW_TIMEOUT="180")
     env.pop("SSH_AGENT_PID", None)
     env.pop("SSH_AUTH_SOCK", None)
@@ -510,6 +513,9 @@ def test_sshvault_sur_le_vrai_bw(account, vault, ssh_keys, home, report):
         r = sv(home, "agent", "status")
         check(account, r, 3, "agent status arrêté")
 
+    # hôtes (story 4) : écriture par sshvault, relecture par un autre client bw, ssh-config
+    check_hosts_and_ssh_config(account, vault, ssh_keys, home, report)
+
     # session invalidée par un autre unlock : purge, puis « verrouillé »
     own.ok("unlock", "--passwordenv", PW_VAR, "--raw", env={PW_VAR: account.password})
     r = sv(home, "--nointeraction", "list")
@@ -528,3 +534,143 @@ def test_sshvault_sur_le_vrai_bw(account, vault, ssh_keys, home, report):
     check(account, r, 3, "status après lock")
     with open(os.path.join(home["tmp"], "askpass.calls")) as f:
         report.add("askpass", note="appels=%d" % len(f.read().splitlines()))
+
+
+_B64ISH = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
+
+
+def b64_fragments(text):
+    """Fragments du base64 de `text` sous les trois alignements possibles dans un JSON encodé."""
+    out = []
+    for shift in range(3):
+        enc = base64.b64encode(("x" * shift + text).encode()).decode()
+        out.append(enc[8:48])
+    return out
+
+
+class ArgvWatch:
+    """Relève, pendant un appel, la ligne de commande (/proc/<pid>/cmdline) de chaque processus
+    de l'utilisateur ; garde celles qui contiennent `needle` et signale tout argument suspect :
+    clé privée ou son base64 (tout processus) ; pour bw et sshvault, tout argument (hors argv[0])
+    de plus de 80 caractères, d'allure base64, ou contenant « { »."""
+
+    def __init__(self, needle, secrets):
+        self.needle, self.secrets = needle, [s for s in secrets if s]
+        self.seen, self.suspect = set(), []
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        me = os.getuid()
+        while not self._stop.is_set():
+            for d in os.listdir("/proc"):
+                if not d.isdigit():
+                    continue
+                try:
+                    if os.stat("/proc/" + d).st_uid != me:
+                        continue
+                    with open("/proc/%s/cmdline" % d, "rb") as f:
+                        argv = f.read().decode(errors="replace").split("\0")
+                except OSError:
+                    continue
+                # bw, ou sshvault (exécutable ou `python -m sshvault…`) ; « un argument contient
+                # sshvault » attrapait aussi le shell qui lance pytest (faux positif mesuré)
+                related = (any(self.needle in a for a in argv)
+                           or os.path.basename(argv[0]) in ("bw", "sshvault")
+                           or any(argv[i] == "-m" and argv[i + 1].startswith("sshvault")
+                                  for i in range(len(argv) - 1)))
+                if any(self.needle in a for a in argv):
+                    self.seen.add(tuple(argv))
+                for n, a in enumerate(argv):
+                    if "PRIVATE KEY" in a or any(s in a for s in self.secrets) or (
+                            related and n > 0 and ("{" in a or len(a) > 80 or _B64ISH.search(a))):
+                        self.suspect.append([x[:60] for x in argv])
+            time.sleep(0.002)
+
+    def __enter__(self):
+        self._t.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._t.join(timeout=10)
+
+
+def _fields(item):
+    return [(f.get("name"), f.get("value"), f.get("type")) for f in (item.get("fields") or [])]
+
+
+def check_hosts_and_ssh_config(account, vault, ssh_keys, home, report):
+    pop, session = vault["_reader"]
+
+    def read(iid):
+        assert pop.sync(session).returncode == 0, "sync du lecteur"
+        return json.loads(pop.ok("get", "item", iid, session=session).stdout)
+
+    for key, iid, orig_hosts in (("hotes", vault["hotes"], "prod-%s.it.example,*.lab-%s.it" % (TAG, TAG)),
+                                 ("sans-hotes", vault["sans-hotes"], None)):
+        before = read(iid)
+        priv = ssh_keys[key]["private"]
+        body = "".join(priv.splitlines()[1:-1])
+        added = "ajout-%s.it.example" % TAG
+        with ArgvWatch(iid, [body[:40], body[-40:]] + b64_fragments(priv)) as w:
+            r = sv(home, "--nointeraction", "hosts", "add", "--id", iid, "Ajout-%s.IT.example" % TAG)
+        report.add("sshvault hosts add (%s)" % key, r)
+        check(account, r, 0, "hosts add %s" % key)
+        edits = [a for a in w.seen if "edit" in a]
+        assert edits, "bw edit observé dans /proc (surveillance effective) : %s" % sorted(w.seen)
+        assert all(list(a[-4:]) == ["edit", "item", iid, ""] or list(a[-3:]) == ["edit", "item", iid]
+                   for a in edits), edits
+        assert not w.suspect, "argument suspect dans /proc/<pid>/cmdline : %s" % w.suspect[:3]
+        after = read(iid)
+        want = (orig_hosts + "," if orig_hosts else "") + added
+        assert [v for n, v, t in _fields(after) if n == "sshvault-hosts"] == [want]
+        assert [f for f in _fields(after) if f[0] != "sshvault-hosts"] == \
+            [f for f in _fields(before) if f[0] != "sshvault-hosts"], "autres champs inchangés"
+        assert after["sshKey"] == before["sshKey"], "clé inchangée"
+        assert after["sshKey"]["privateKey"].strip() == priv.strip(), "clé privée identique"
+        assert [after.get(k) for k in ("name", "notes", "type")] == [before.get(k) for k in ("name", "notes", "type")]
+        r = sv(home, "--nointeraction", "hosts", "remove", "--id", iid, added)
+        check(account, r, 0, "hosts remove %s" % key)
+        final = read(iid)
+        hf = [v for n, v, t in _fields(final) if n == "sshvault-hosts"]
+        assert hf == ([orig_hosts] if orig_hosts else []), hf
+        assert [f for f in _fields(final) if f[0] != "sshvault-hosts"] == \
+            [f for f in _fields(before) if f[0] != "sshvault-hosts"]
+        assert final["sshKey"] == before["sshKey"]
+        r = sv(home, "--nointeraction", "hosts", "list", "--id", iid)
+        check(account, r, 0, "hosts list %s" % key)
+        assert r.stdout.split() == (orig_hosts.split(",") if orig_hosts else [])
+
+    # hôte absent : code 1, rien écrit ; hôte invalide : code 2
+    r = sv(home, "--nointeraction", "hosts", "remove", "--id", vault["hotes"], "absent-%s.example" % TAG)
+    check(account, r, 1, "hosts remove absent")
+    r = sv(home, "--nointeraction", "hosts", "add", "--id", vault["hotes"], "a b")
+    check(account, r, 2, "hosts add invalide")
+
+    # ssh-config dans le HOME de test, validé par l'OpenSSH du poste
+    r = sv(home, "--nointeraction", "ssh-config")
+    report.add("sshvault ssh-config", r)
+    check(account, r, 0, "ssh-config")
+    d = os.path.join(home["env"]["HOME"], ".ssh", "sshvault")
+    text = open(os.path.join(d, "config")).read()
+    assert "Match originalhost prod-%s.it.example,*.lab-%s.it\n" % (TAG, TAG) in text
+    from sshvault.sshconfig import fp_filename
+    pub = os.path.join(d, "pub", fp_filename(ssh_keys["hotes"]["fingerprint"]))
+    with open(pub) as f:
+        assert f.read().split() == ssh_keys["hotes"]["public"].split()[:2]
+    assert not os.path.exists(os.path.join(d, "pub", fp_filename(ssh_keys["sans-hotes"]["fingerprint"])))
+    if shutil.which("ssh"):
+        main = os.path.join(home["tmp"], "ssh_config_de_test")
+        with open(main, "w") as f:
+            f.write('Include "%s"\n' % os.path.join(d, "config"))
+        os.chmod(main, 0o600)
+        g = subprocess.run(["ssh", "-G", "-F", main, "x.lab-%s.it" % TAG], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=30)
+        conf = [l.split(" ", 1) for l in g.stdout.splitlines()]
+        assert [v for k, v in conf if k == "identityagent"] == [os.path.join(home["runtime"], "sshvault", "agent.sock")]
+        assert [v for k, v in conf if k == "identityfile"] == [pub]
+        assert [v for k, v in conf if k == "identitiesonly"] == ["yes"]
+    r = sv(home, "--nointeraction", "ssh-config")
+    check(account, r, 0, "ssh-config sans changement")
+    assert "inchangé" in r.stdout

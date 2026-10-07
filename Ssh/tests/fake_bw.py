@@ -13,7 +13,12 @@ Faits reproduits (vrai bw 2026.9.1, lus dans le source embarqué du binaire et m
   - `--nointeraction` : jamais d'invite (« Master password is required… ») ;
   - non connecté : « You are not logged in. » ; verrouillé : « Vault is locked. » ;
   - `get item` absent : « Not found. » ; `lock` : « Your vault is locked. » ;
-  - `sync` : « Syncing complete. » ; `config server` : « Saved setting `config`. ».
+  - `sync` : « Syncing complete. » ; `config server` : « Saved setting `config`. » ;
+  - `edit item <id> [encodedJson]` : JSON en base64 en argument ou sur stdin (aide de bw
+    2026.9.1) ; champs repris comme `CipherExport.toView` (name, notes, favorite, reprompt,
+    folderId ; `fields` et `passwordHistory` seulement s'ils ne sont pas null ; sshKey) ;
+    `revisionDate` de la requête différente de celle du serveur : « The client copy of this
+    cipher is out of date. Resync the client and try again. » ; l'élément modifié est rendu.
 Mesuré sur le vrai bw contre le compte de test (2026-10-07) : mauvais mot de passe à
 `unlock` (journaux « ERROR … » du SDK puis « Cryptography error, The decryption operation
 failed », code 1), « Vault is locked. » sans session et avec une session invalide,
@@ -25,7 +30,11 @@ Le « serveur » est un fichier JSON désigné par FAKE_BW_VAULT :
 Pannes simulées : FAKE_BW_FAIL="<commande>=<mode>[,…]" ; mode : badjson (JSON
 invalide, code 0), error (code 1, « Unexpected error. »), hang (bloqué, avec un
 enfant `sleep` ; pids écrits dans FAKE_BW_PIDS), hangonce (seul le premier appel bloque), hangnoecho
-(écho du terminal coupé, puis bloqué).
+(écho du terminal coupé, puis bloqué), hangafter (edit : écrit, puis bloqué : la réponse se
+perd), errorafter (edit : écrit, puis code 1), errorsecond (premier appel normal, les
+suivants en erreur), silent (edit : code 0 sans rien écrire), erroronce (seul le premier appel en erreur).
+FAKE_BW_EDIT_RACE=<champ>=<valeur> : à l'edit, le « serveur » change d'abord ce champ de
+l'élément (autre client) puis traite la requête.
 Journal : FAKE_BW_LOG (JSON par ligne : argv, BW_SESSION présent, appdata,
 variables de l'environnement qui contiennent le mot de passe).
 """
@@ -114,6 +123,20 @@ def simulate(mode):
         sys.exit(0)
     if mode == "error":
         fail("Unexpected error.")
+    if mode in ("hangafter", "errorafter", "silent"):
+        return  # traité par la commande
+    if mode == "errorsecond":  # premier appel normal, les suivants en erreur
+        flag = (os.environ.get("FAKE_BW_PIDS") or "/nonexistent") + ".errsecond." + (sys.argv[1:] or ["?"])[-1]
+        if not os.path.exists(flag):
+            open(flag, "w").close()
+            return
+        fail("Unexpected error.")
+    if mode == "erroronce":
+        flag = (os.environ.get("FAKE_BW_PIDS") or "/nonexistent") + ".erronce"
+        if os.path.exists(flag):
+            return
+        open(flag, "w").close()
+        fail("Unexpected error.")
     if mode == "hangonce":
         # premier appel bloqué, les suivants normaux (connexion neuve qui passe : mesuré)
         flag = (os.environ.get("FAKE_BW_PIDS") or "/nonexistent") + ".once"
@@ -156,6 +179,7 @@ CMD_FLAGS = {
     "config": (set(), {"--web-vault", "--api", "--identity", "--icons", "--notifications", "--events",
                        "--key-connector"}),
     "status": (set(), set()), "lock": (set(), set()), "logout": (set(), set()),
+    "edit": (set(), {"--organizationid"}),
 }
 
 
@@ -372,7 +396,63 @@ def cmd_get(ctx, pos):
     fail("Not found.")
 
 
-CMDS = {"status": cmd_status, "config": cmd_config, "login": cmd_login, "logout": cmd_logout,
+def save_vault(v):
+    path = os.environ["FAKE_BW_VAULT"]
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(v, f)
+    os.replace(tmp, path)
+
+
+_rev = [0]
+
+
+def now_iso():
+    _rev[0] += 1
+    t = time.time() + _rev[0] / 1000.0
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".%03dZ" % (int(t * 1000) % 1000)
+
+
+def cmd_edit(ctx, pos):
+    if len(pos) < 2 or pos[0] != "item":
+        fail("Unknown object.")
+    ctx.need_unlocked()
+    enc = pos[2] if len(pos) > 2 else sys.stdin.read()
+    try:
+        req = json.loads(base64.b64decode(enc.strip(), validate=True).decode())
+    except ValueError:
+        fail("Error parsing the encoded request data.")
+    v = vault()
+    item = next((i for i in v["items"] if i.get("id") == pos[1]), None)
+    if item is None:
+        fail("Not found.")
+    race = os.environ.get("FAKE_BW_EDIT_RACE")
+    if race:  # un autre client écrit d'abord
+        k, _, val = race.partition("=")
+        item[k] = val
+        item["revisionDate"] = now_iso()
+        save_vault(v)
+    if req.get("revisionDate") and req["revisionDate"] != item.get("revisionDate"):
+        fail("The client copy of this cipher is out of date. Resync the client and try again.")
+    if injected("edit") == "silent":
+        ctx.json(item)
+        return
+    for k in ("name", "notes", "favorite", "reprompt", "folderId"):
+        item[k] = req.get(k)
+    for k in ("fields", "passwordHistory"):
+        if req.get(k) is not None:
+            item[k] = req[k]
+    if item.get("type") == 5:
+        item["sshKey"] = req.get("sshKey")
+    item["revisionDate"] = now_iso()
+    save_vault(v)
+    mode = injected("edit")
+    if mode in ("hangafter", "errorafter"):
+        simulate("hang" if mode == "hangafter" else "error")
+    ctx.json(item)
+
+
+CMDS = {"edit": cmd_edit, "status": cmd_status, "config": cmd_config, "login": cmd_login, "logout": cmd_logout,
         "unlock": cmd_unlock, "lock": cmd_lock, "sync": cmd_sync, "list": cmd_list, "get": cmd_get}
 
 
