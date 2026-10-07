@@ -23,6 +23,11 @@ ssh_options = -p 2222
 management = 127.0.0.1:7505
 # Mot de passe du management (première ligne du fichier)
 password_file = ~/.config/ovpnMgmt/paris.pass
+# Configuration du serveur OpenVPN, lue sur la machine ssh (list --offline) : les utilisateurs connus en sont
+# déduits (index.txt de la PKI à côté de "ca", client-config-dir, ifconfig-pool-persist)
+openvpn_config = /etc/openvpn/server/server.conf
+# Ces fichiers sont souvent réservés à root : lecture par "sudo -n" (sudo sans mot de passe requis)
+sudo = yes
 
 [lyon]
 description = VPN Lyon, management en socket unix
@@ -35,6 +40,10 @@ description = VPN du labo, joint par un bastion
 ssh = vpn-labo
 ssh_options = -J bastion.example.com
 management = 127.0.0.1:7505
+# Copie locale de la configuration (préfixe local:) ; les chemins qu'elle donne sont lus ici aussi
+openvpn_config = local:~/vpn/labo/server.conf
+# index.txt ailleurs qu'à côté du "ca" (ca.crt copié hors de la PKI)
+pki_index = ~/vpn/labo/pki/index.txt
 # Réponses lentes (liaison satellite...) : délai en secondes, 15 par défaut
 timeout = 30
 

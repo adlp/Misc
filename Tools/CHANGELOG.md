@@ -1,5 +1,18 @@
 # Changelog — Tools
 
+## ovpnMgmt 1.2 — utilisateurs non connectés — 2026-10-07
+
+- **`list --offline` (`-o`)** : table « Non connectés » sous les connexions (nom, IP réservée, fin du certificat,
+  sources, état), `--json` en `{"connected", "offline"}`, aussi en `--watch`.
+- Source : clé `openvpn_config` (configuration du serveur OpenVPN, lue via ssh en un appel, ou `local:` pour une
+  copie locale) ; utilisateurs déduits de l'`index.txt` de la PKI à côté du `ca` (ou `pki_index`), du
+  `client-config-dir` (`disable`, `ifconfig-push`) et de l'`ifconfig-pool-persist`. Certificat du serveur retiré ;
+  révoqués et expirés comptés, pas listés. Clé `sudo = yes` : lecture par `sudo -n`.
+- Fichier non lu : note sur stderr ; configuration illisible ou `openvpn_config` absent : erreur pour ce serveur,
+  les autres sont traités.
+- Testé sur OpenVPN 2.5.11 réel (PKI avec valides, révoqué, expiré et certificat serveur ; ccd avec `disable`,
+  `ifconfig-push` et `DEFAULT` ; ipp.txt) : lecture locale, via ssh avec sudo, et `local:` pour un serveur ssh.
+
 ## ovpnMgmt 1.1 — plusieurs serveurs à la fois — 2026-10-07
 
 - **Plusieurs serveurs** : `-s a,b` ou `-s a -s b`, `-a` pour tous, ou `default = a, b` dans `[ovpnMgmt]`. Une

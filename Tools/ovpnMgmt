@@ -37,9 +37,11 @@ verb, mute, signal, hold, raw (commande brute) et shell (interactif).
 """
 
 import argparse
+import calendar
 import configparser
 import json
 import os
+import posixpath
 import re
 import select
 import shlex
@@ -51,7 +53,9 @@ import tempfile
 import threading
 import time
 
-Version="1.1"
+Version="1.2"
+# 1.2 list --offline : utilisateurs connus non connectes, d'apres la configuration OpenVPN (openvpn_config) :
+#     index.txt de la PKI, client-config-dir, ifconfig-pool-persist ; lue via ssh ou en local, sudo possible
 # 1.1 plusieurs serveurs a la fois (-s a,b / -s a -s b / -a, ou default = a, b) : connexions et commandes en
 #     parallele, list en un tableau avec colonne Serveur, info en colonnes, log fusionne par date, kill sur tous
 # 1.0 version initiale : list (--watch, --json, --long), kill (CN / adresse / IP VPN / CID, --halt), info, log
@@ -89,6 +93,11 @@ class Server:
       password_file : fichier contenant le mot de passe du management
       password      : mot de passe en clair (préférer password_file)
       timeout       : délai de réponse en secondes (défaut 15)
+      openvpn_config: configuration du serveur OpenVPN, lue sur la machine ssh
+                      (ou "local:/chemin" pour une copie sur cette machine) ;
+                      pour list --offline
+      pki_index     : index.txt de la PKI s'il n'est pas à côté du "ca"
+      sudo          : yes = fichiers OpenVPN lus par "sudo -n" (défaut no)
     """
 
     def __init__(self, name, section, configPath):
@@ -99,6 +108,12 @@ class Server:
         self.command=section.get('command','').strip() or None
         self.timeout=self._number(section.get('timeout',str(DEFAULT_TIMEOUT)),'timeout')
         self.password=self._readPassword(section,configPath)
+        self.openvpnConfig=section.get('openvpn_config','').strip() or None
+        self.pkiIndex=section.get('pki_index','').strip() or None
+        sudo=section.get('sudo','no').strip().lower()
+        if sudo not in ('yes','no','true','false','1','0','oui','non'):
+            raise ManagementError(f"[{name}] sudo invalide : « {sudo} » (yes ou no)")
+        self.sudo=sudo in ('yes','true','1','oui')
         management=section.get('management',DEFAULT_MANAGEMENT).strip()
         self.socketPath=None
         self.host=None
@@ -562,6 +577,264 @@ def realIp(real):
 
 
 ################################################################################
+# Utilisateurs connus : fichiers d'OpenVPN lus là où il tourne
+################################################################################
+
+def runFileScript(server, script, local):
+    """Lance un script sh là où tourne OpenVPN (machine ssh, ou cette machine si local) ; renvoie sa sortie.
+
+    Sert à lire la configuration d'OpenVPN et les fichiers qu'elle désigne.
+    Le script se charge de ses propres erreurs de lecture (marqueurs) ; seul
+    un échec de ssh lui-même (code 255) devient une ManagementError.
+    """
+    if server.ssh and not local:
+        argv=['ssh',*server.sshOptions,server.ssh,'sh -c '+shlex.quote(script)]
+    else:
+        argv=['/bin/sh','-c',script]
+    try:
+        done=subprocess.run(argv,stdin=subprocess.DEVNULL,capture_output=True,timeout=max(server.timeout,60))
+    except subprocess.TimeoutExpired:
+        raise ManagementError(f"[{server.name}] lecture des fichiers OpenVPN : pas de réponse en {max(server.timeout,60):g} s")
+    except OSError as err:
+        raise ManagementError(f"[{server.name}] lecture des fichiers OpenVPN impossible : {err}")
+    if server.ssh and not local and done.returncode == 255:
+        raise ManagementError(f"[{server.name}] ssh {server.ssh} : {done.stderr.decode('utf-8','replace').strip()}")
+    return(done.stdout.decode('utf-8','replace'))
+
+
+def readFiles(server, files, ccdDir, local):
+    """Lit des fichiers (et le répertoire ccd) en un seul appel ; renvoie ({libellé: (code, texte)}, {client: texte ccd}).
+
+    files : liste (libellé, chemin). Avec "sudo = yes", lecture par sudo -n
+    (sans mot de passe : un sudo qui en demande un échoue, avec son message).
+    Les sorties sont séparées par des marqueurs à jeton aléatoire, qu'aucun
+    fichier ne peut contenir par hasard.
+    """
+    token="ovpnMgmt-"+os.urandom(8).hex()
+    run='sudo -n ' if server.sudo else ''
+    lines=['set +e']
+    for label,path in files:
+        lines.append(f"printf '%s FILE %s\\n' {token} {label}")
+        lines.append(f"{run}cat -- {shlex.quote(path)} 2>&1; printf '\\n%s RC %s %s\\n' {token} {label} $?")
+    if ccdDir:
+        inner=('[ -d "$1" ] || { echo "répertoire absent : $1"; exit 3; }; '
+               'for f in "$1"/*; do [ -f "$f" ] || continue; printf "%s CCD %s\\n" "$2" "${f##*/}"; cat -- "$f"; echo; done')
+        lines.append(f"printf '%s FILE ccd\\n' {token}")
+        lines.append(f"{run}sh -c {shlex.quote(inner)} sh {shlex.quote(ccdDir)} {token} 2>&1; printf '\\n%s RC ccd %s\\n' {token} $?")
+    output=runFileScript(server,'\n'.join(lines),local)
+    results={}
+    ccd={}
+    label=None
+    client=None
+    buffer=[]
+    for line in output.split('\n'):
+        if line.startswith(token+" "):
+            fields=line.split(' ')
+            if fields[1] == 'FILE':
+                label,client,buffer=fields[2],None,[]
+            elif fields[1] == 'CCD':
+                client=' '.join(fields[2:])
+                ccd[client]=''
+            elif fields[1] == 'RC' and len(fields) > 3:
+                text='\n'.join(buffer).strip('\n')
+                results[fields[2]]=(toInt(fields[3]),text)
+                label=client=None
+            continue
+        if client is not None:
+            ccd[client]+=line+'\n'
+        elif label is not None:
+            buffer.append(line)
+    return(results,ccd)
+
+
+def parseOpenvpnConfig(text):
+    """Directives d'une configuration OpenVPN : ({directive: arguments de la dernière occurrence}, {bloc en ligne: texte}).
+
+    Commentaires '#' ou ';' en début de ligne, guillemets comme OpenVPN,
+    blocs en ligne <ca>...</ca>, <cert>...</cert>.
+    """
+    directives={}
+    inline={}
+    block=None
+    for raw in text.split('\n'):
+        line=raw.strip()
+        if block is not None:
+            if line == f"</{block}>":
+                block=None
+            else:
+                inline[block]+=raw+'\n'
+            continue
+        if not line or line[0] in '#;':
+            continue
+        match=re.fullmatch(r'<([\w-]+)>',line)
+        if match:
+            block=match.group(1)
+            inline[block]=''
+            continue
+        try:
+            words=shlex.split(line)
+        except ValueError:
+            words=line.split()
+        if words:
+            directives[words[0].lstrip('-')]=words[1:]
+    return(directives,inline)
+
+
+def certExpiry(text):
+    """Date d'expiration d'index.txt ("YYMMDDHHMMSSZ" ou "YYYYMMDDHHMMSSZ") en epoch UTC, None si illisible."""
+    match=re.fullmatch(r'(\d{2}|\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z',text.strip())
+    if not match:
+        return(None)
+    year=int(match.group(1))
+    if len(match.group(1)) == 2:
+        year+=2000 if year < 50 else 1900
+    try:
+        return(calendar.timegm((year,*(int(g) for g in match.groups()[1:]))))
+    except (ValueError,OverflowError):
+        return(None)
+
+
+def certCommonName(pem):
+    """CN d'un certificat PEM (openssl local), None si openssl manque ou si le texte n'en est pas un."""
+    try:
+        done=subprocess.run(['openssl','x509','-noout','-subject','-nameopt','RFC2253'],input=pem.encode(),
+                            capture_output=True,timeout=10)
+    except (OSError,subprocess.TimeoutExpired):
+        return(None)
+    match=re.search(r'(?:^subject=|,)CN=([^,\n]+)',done.stdout.decode('utf-8','replace'))
+    return(match.group(1) if match else None)
+
+
+def knownUsers(server):
+    """Utilisateurs connus d'un serveur, d'après la configuration OpenVPN (openvpn_config).
+
+    Sources, déduites des directives :
+      * index.txt de la PKI easy-rsa (à côté de "ca", ou pki_index) : certificats
+        valides ; révoqués (R) et expirés comptés à part, non listés ;
+      * client-config-dir : un fichier par client ("disable" = désactivé,
+        "ifconfig-push" = IP réservée) ; le fichier DEFAULT n'est pas un client ;
+      * ifconfig-pool-persist (ipp.txt) : clients déjà venus et leur IP.
+    Le CN du certificat du serveur ("cert") est retiré de la liste.
+    Renvoie {'users': {cn: infos}, 'ignored': nombre, 'notes': [textes]}.
+    """
+    if not server.openvpnConfig:
+        raise ManagementError(f"[{server.name}] --offline : ajouter openvpn_config (configuration du serveur OpenVPN)")
+    local=server.openvpnConfig.startswith('local:')
+    configPath=server.openvpnConfig[len('local:'):] if local else server.openvpnConfig
+    if local or not server.ssh:
+        configPath=os.path.expanduser(configPath)
+        local=True
+    where="cette machine" if local else server.ssh
+    files,_=readFiles(server,[('config',configPath)],None,local)
+    rc,text=files.get('config',(None,''))
+    if rc != 0:
+        raise ManagementError(f"[{server.name}] configuration OpenVPN illisible ({configPath} sur {where}) : {text or 'pas de réponse'}")
+    directives,inline=parseOpenvpnConfig(text)
+    # Chemins relatifs : par rapport à "cd", sinon au répertoire de la configuration (WorkingDirectory de systemd)
+    base=posixpath.dirname(configPath)
+    if directives.get('cd'):
+        base=posixpath.join(base,directives['cd'][0])
+    resolve=lambda path: posixpath.normpath(posixpath.join(base,path))
+    notes=[]
+    wanted=[]
+    index=server.pkiIndex
+    if not index:
+        if 'ca' in inline:
+            notes.append("ca en ligne dans la configuration : index.txt introuvable, préciser pki_index")
+        elif directives.get('ca'):
+            index=posixpath.join(posixpath.dirname(resolve(directives['ca'][0])),'index.txt')
+    if index:
+        wanted.append(('index',index if posixpath.isabs(index) else resolve(index)))
+    if directives.get('ifconfig-pool-persist'):
+        wanted.append(('ipp',resolve(directives['ifconfig-pool-persist'][0])))
+    if directives.get('cert') and 'cert' not in inline:
+        wanted.append(('cert',resolve(directives['cert'][0])))
+    ccdDir=resolve(directives['client-config-dir'][0]) if directives.get('client-config-dir') else None
+    files,ccd=readFiles(server,wanted,ccdDir,local)
+    for label,path in wanted+([('ccd',ccdDir)] if ccdDir else []):
+        rc,text=files.get(label,(None,'pas de réponse'))
+        if rc != 0:
+            notes.append(f"{label} non lu ({path}) : {text.strip() or 'erreur'}")
+
+    users={}
+    def user(cn):
+        return(users.setdefault(cn,{'cn':cn,'sources':[],'ip':'','cert_expires':None,'disabled':False}))
+    ignored=set()
+    now=time.time()
+    if files.get('index',(1,))[0] == 0:
+        valid={}
+        for line in files['index'][1].split('\n'):
+            fields=line.split('\t')
+            match=re.search(r'/CN=([^/]+)',fields[-1]) if len(fields) >= 6 else None
+            if not match:
+                continue
+            cn=match.group(1)
+            expires=certExpiry(fields[1])
+            if fields[0] == 'V' and (expires is None or expires > now):
+                # Plusieurs certificats pour un même nom (renouvellement) : le plus lointain compte
+                valid[cn]=max(valid.get(cn) or 0,expires or 0) or None
+            else:
+                ignored.add(cn)
+        for cn,expires in valid.items():
+            info=user(cn)
+            info['sources'].append('pki')
+            info['cert_expires']=expires
+        ignored-=set(valid)
+    if files.get('ipp',(1,))[0] == 0:
+        for line in files['ipp'][1].split('\n'):
+            fields=line.strip().split(',')
+            if len(fields) >= 2 and fields[0] and fields[0] not in ignored:
+                info=user(fields[0])
+                info['sources'].append('ipp')
+                info['ip']=info['ip'] or fields[1]
+    if files.get('ccd',(1,))[0] == 0:
+        for cn,content in ccd.items():
+            if cn == 'DEFAULT' or cn in ignored:
+                continue
+            info=user(cn)
+            info['sources'].append('ccd')
+            ccdDirectives,_=parseOpenvpnConfig(content)
+            info['disabled']='disable' in ccdDirectives
+            if ccdDirectives.get('ifconfig-push'):
+                info['ip']=ccdDirectives['ifconfig-push'][0]
+    # Le certificat du serveur figure dans la PKI : ce n'est pas un utilisateur
+    serverPem=inline.get('cert') or (files['cert'][1] if files.get('cert',(1,))[0] == 0 else '')
+    serverCn=certCommonName(serverPem) if serverPem else None
+    if serverCn:
+        users.pop(serverCn,None)
+    return({'users':users,'ignored':len(ignored),'notes':notes})
+
+
+def offlineUsers(known, connected, pattern):
+    """Utilisateurs connus non connectés : [infos + serveur], filtrés par pattern (nom ou IP), triés par nom.
+
+    known : {serveur: knownUsers()} ; connected : {serveur: CN connectés sur ce serveur}.
+    Un utilisateur connecté sur un autre serveur reste « non connecté » sur celui-ci.
+    """
+    offline=[]
+    for name,data in known.items():
+        for cn,info in data['users'].items():
+            if cn in connected.get(name,set()):
+                continue
+            if pattern and pattern.lower() not in cn.lower() and pattern not in info['ip']:
+                continue
+            offline.append({'server':name,**info})
+    return(sorted(offline,key=lambda u: (u['cn'].lower(),u['server'])))
+
+
+def offlineRows(offline, multi):
+    """Lignes du tableau des non connectés : nom, IP réservée, fin du certificat, sources, état."""
+    headers=(["Serveur"] if multi else [])+["Nom","IP réservée","Certificat jusqu'au","Sources","État"]
+    rows=[]
+    for u in offline:
+        rows.append(([u['server']] if multi else [])+[
+            u['cn'],u['ip'] or '-',
+            time.strftime("%Y-%m-%d",time.localtime(u['cert_expires'])) if u['cert_expires'] else '-',
+            ','.join(u['sources']),"désactivé (ccd)" if u['disabled'] else ""])
+    return(headers,rows)
+
+
+################################################################################
 # Affichage
 ################################################################################
 
@@ -776,7 +1049,10 @@ def actionServers(servers, defaults, args):
 
 
 def collectClients(mgmts, pattern, sort, reverse):
-    """Connexions de tous les serveurs, filtrées et triées ; renvoie (connexions, {serveur: heure}, échecs).
+    """Connexions de tous les serveurs, filtrées et triées ; renvoie (connexions, {serveur: heure}, {serveur: CN connectés}, échecs).
+
+    Les CN connectés sont relevés avant le filtre : un connecté écarté par le
+    filtre ne doit pas apparaître parmi les non connectés.
 
     Chaque connexion porte son serveur et sa durée, calculée sur l'heure
     donnée par ce serveur (pas d'écart d'horloge avec la machine locale).
@@ -784,41 +1060,84 @@ def collectClients(mgmts, pattern, sort, reverse):
     statuses,failed=gather(mgmts,lambda mgmt: mgmt.status())
     clients=[]
     times={}
+    connected={}
     for name,status in statuses.items():
         now=status['time'] or time.time()
         times[name]=now
+        connected[name]={c['cn'] for c in status['clients']}
         for c in status['clients']:
             c['server']=name
             c['duration']=now-c['since'] if c['since'] else None
             clients.append(c)
-    return(sortClients(filterClients(clients,pattern),sort,reverse),times,failed)
+    return(sortClients(filterClients(clients,pattern),sort,reverse),times,connected,failed)
+
+
+def gatherKnown(mgmts):
+    """knownUsers de chaque serveur en parallèle ; erreurs et notes (fichier non lu...) sur stderr.
+
+    Renvoie ({serveur: utilisateurs connus}, nombre d'échecs).
+    """
+    known,failed=gather(mgmts,lambda mgmt: knownUsers(mgmt.server))
+    for name,data in known.items():
+        for note in data['notes']:
+            say(f"ovpnMgmt: [{name}] note : {note}",file=sys.stderr)
+    return(known,failed)
+
+
+def printOffline(offline, known, multi):
+    """Section des non connectés, sous le tableau des connexions."""
+    ignored=sum(data['ignored'] for data in known.values())
+    print()
+    if offline:
+        print("Non connectés :")
+        headers,rows=offlineRows(offline,multi)
+        printTable(headers,rows)
+        print(f"\n{len(offline)} non connecté(s)"+(f" ; {ignored} révoqué(s) ou expiré(s) non affiché(s)" if ignored else ""))
+    else:
+        print("Aucun utilisateur connu non connecté."+(f" ({ignored} révoqué(s) ou expiré(s) non affiché(s))" if ignored else ""))
 
 
 def actionList(mgmts, args):
-    """Connexions actives de tous les serveurs : tableau, --json, ou rafraîchi toutes les --watch secondes avec le débit."""
+    """Connexions actives de tous les serveurs : tableau, --json, ou rafraîchi toutes les --watch secondes avec le débit.
+
+    --offline ajoute les utilisateurs connus non connectés (lus une fois, au
+    lancement, dans les fichiers d'OpenVPN).
+    """
     multi=len(mgmts) > 1
+    known,knownFailed={},0
+    if args.offline:
+        known,knownFailed=gatherKnown(mgmts)
     if args.watch is None:
-        clients,times,failed=collectClients(mgmts,args.filter,args.sort,args.reverse)
+        clients,times,connected,failed=collectClients(mgmts,args.filter,args.sort,args.reverse)
+        failed+=knownFailed
+        offline=offlineUsers(known,connected,args.filter)
         if args.json:
-            print(json.dumps([clientJson(c) for c in clients],indent=2,ensure_ascii=False))
+            data=[clientJson(c) for c in clients]
+            if args.offline:
+                for u in offline:
+                    u['cert_expires_iso']=time.strftime("%Y-%m-%dT%H:%M:%S%z",time.localtime(u['cert_expires'])) if u['cert_expires'] else None
+                data={'connected':data,'offline':offline}
+            print(json.dumps(data,indent=2,ensure_ascii=False))
             return(1 if failed else 0)
         if not clients:
             print("Aucune connexion active." if not args.filter else f"Aucune connexion ne correspond à « {args.filter} ».")
-            return(1 if failed else 0)
-        headers,rows=clientRows(clients,args.long,multi)
-        printTable(headers,rows)
-        if multi:
-            counts=', '.join(f"{name} {sum(1 for c in clients if c['server'] == name)}" for name in times)
-            print(f"\n{len(clients)} connexion(s) ({counts}) ; reçu / envoyé : vus de chaque serveur")
         else:
-            print(f"\n{len(clients)} connexion(s) ; reçu / envoyé : vus du serveur")
+            headers,rows=clientRows(clients,args.long,multi)
+            printTable(headers,rows)
+            if multi:
+                counts=', '.join(f"{name} {sum(1 for c in clients if c['server'] == name)}" for name in times)
+                print(f"\n{len(clients)} connexion(s) ({counts}) ; reçu / envoyé : vus de chaque serveur")
+            else:
+                print(f"\n{len(clients)} connexion(s) ; reçu / envoyé : vus du serveur")
+        if args.offline:
+            printOffline(offline,known,multi)
         return(1 if failed else 0)
 
     # Mode --watch : connexions gardées ouvertes, débit calculé entre deux status de chaque serveur
     previous={}
     previousTimes={}
     while True:
-        clients,times,failed=collectClients(mgmts,args.filter,args.sort,args.reverse)
+        clients,times,connected,failed=collectClients(mgmts,args.filter,args.sort,args.reverse)
         rates={}
         for c in clients:
             before=previous.get(serverClientKey(c))
@@ -834,6 +1153,8 @@ def actionList(mgmts, args):
                 printTable(headers,rows)
             else:
                 print("Aucune connexion active.")
+            if args.offline:
+                printOffline(offlineUsers(known,connected,args.filter),known,multi)
             sys.stdout.flush()
         previous={serverClientKey(c):(c['rx'],c['tx']) for c in clients}
         previousTimes=times
@@ -1161,6 +1482,8 @@ def buildParser():
     p.add_argument('-l','--long',action='store_true',help="colonnes en plus : utilisateur, IPv6, chiffrement, peer ID")
     p.add_argument('--json',action='store_true',help="sortie JSON")
     p.add_argument('-w','--watch',type=positiveFloat,metavar='SEC',help="rafraîchit toutes les SEC secondes, avec le débit")
+    p.add_argument('-o','--offline',action='store_true',
+                   help="ajoute les utilisateurs connus non connectés (PKI, ccd, ipp.txt ; openvpn_config requis)")
 
     sub.add_parser('servers',help="serveurs de la configuration (* = par défaut)")
 

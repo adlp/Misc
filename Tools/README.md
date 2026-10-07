@@ -6,7 +6,7 @@ Petits outils d'administration indépendants, sous licence GPL v3.
 |---|---|---|---|
 | `checkssl` | bash | 1.5 | État d'un certificat TLS (serveur ou fichier) et jours restants avant expiration |
 | `cronMutt` | Python 3 | 0.24.2 | Lance une commande (ou lit un pipe) et envoie sa sortie par mail (mutt) et/ou sur Nextcloud, selon le résultat |
-| `ovpnMgmt` | Python 3 | 1.1 | Pilote un ou plusieurs serveurs OpenVPN par leur management, en direct ou via ssh : connexions, coupure, log, signaux |
+| `ovpnMgmt` | Python 3 | 1.2 | Pilote un ou plusieurs serveurs OpenVPN par leur management, en direct ou via ssh : connexions, coupure, log, signaux |
 | `sleepUntil` | bash | 1.1 | Comme `at`, mais bloquant : attend une heure donnée puis lance une commande |
 | `whosshkey` | bash | 1.4 | Comme `last`, avec en plus la clef SSH utilisée pour chaque connexion |
 
@@ -161,6 +161,9 @@ ssh qui demandent un mot de passe en même temps se partagent le terminal.
 | `password_file` | Fichier dont la première ligne est le mot de passe du management | — |
 | `password` | Mot de passe en clair (préférer `password_file`) | — |
 | `timeout` | Délai de réponse, en secondes | 15 |
+| `openvpn_config` | Configuration du serveur OpenVPN, lue sur la machine ssh (`local:/chemin` : copie sur cette machine) ; sert à `list --offline` | — |
+| `pki_index` | `index.txt` de la PKI, s'il n'est pas à côté du `ca` | à côté du `ca` |
+| `sudo` | `yes` : fichiers OpenVPN lus par `sudo -n` (sudo sans mot de passe) | `no` |
 
 Via ssh avec `management = hôte:port`, ovpnMgmt lance `ssh -W hôte:port` : rien à installer sur le serveur, mais
 `AllowTcpForwarding` ne doit pas y être à `no`. Côté OpenVPN : `management 127.0.0.1 7505 /chemin/mot-de-passe`
@@ -171,7 +174,7 @@ comptes est signalé.
 
 | Commande | Rôle |
 |---|---|
-| `list [filtre]` | Connexions actives : nom, adresse réelle, IP VPN, connecté depuis, durée, reçu, envoyé, CID. `--sort cn\|real\|virtual\|since\|rx\|tx`, `-r`, `-l` (utilisateur, IPv6, chiffrement, peer ID), `--json`, `-w SEC` (rafraîchi, avec le débit) |
+| `list [filtre]` | Connexions actives : nom, adresse réelle, IP VPN, connecté depuis, durée, reçu, envoyé, CID. `--sort cn\|real\|virtual\|since\|rx\|tx`, `-r`, `-l` (utilisateur, IPv6, chiffrement, peer ID), `--json`, `-w SEC` (rafraîchi, avec le débit), `-o` (utilisateurs non connectés, voir plus bas) |
 | `kill CIBLE… [--cid N] [--halt] [-y]` | Coupe des connexions : nom, IP ou IP:port réelle, IP VPN, ou CID. `RESTART` par défaut (le client se reconnecte, comme `kill` d'OpenVPN), `--halt` lui demande de s'arrêter. Confirmation au-delà d'une connexion. « Coupée » n'est affiché qu'une fois la connexion sortie de la liste (OpenVPN la ferme quelques secondes après) |
 | `info [--json]` | Version, PID, verbosité, mute, hold, nombre de clients, octets cumulés, état |
 | `log [N\|all\|0] [-f]` | Dernières lignes du log du serveur (20 par défaut, `0` : aucune), `-f` pour suivre |
@@ -181,6 +184,23 @@ comptes est signalé.
 | `raw COMMANDE…` | Commandes brutes du management (`raw "status 3" load-stats`) |
 | `shell` | Session interactive avec un seul serveur (`help` liste les commandes du serveur) |
 | `servers` | Serveurs de la configuration, `*` = par défaut |
+
+### Utilisateurs non connectés (`list --offline`)
+
+Le management ne connaît que les connectés. Avec `-o`, ovpnMgmt lit `openvpn_config` là où tourne OpenVPN (via le
+ssh du serveur, en un appel) et en déduit les utilisateurs connus :
+
+- `index.txt` de la PKI easy-rsa (à côté du `ca`, ou `pki_index`) : certificats valides, avec leur date de fin ;
+  révoqués et expirés comptés à part, pas listés ;
+- `client-config-dir` : un fichier par client (`disable` → « désactivé », `ifconfig-push` → IP réservée ; le
+  fichier `DEFAULT` n'est pas un client) ;
+- `ifconfig-pool-persist` (`ipp.txt`) : clients déjà venus, avec leur IP.
+
+Le certificat du serveur (`cert`) est retiré de la liste, les chemins relatifs suivent `cd` ou le répertoire de la
+configuration. Une table « Non connectés » (nom, IP réservée, fin du certificat, sources, état) suit celle des
+connexions ; le filtre s'y applique ; `--json` donne `{"connected": […], "offline": […]}`. Un fichier non lu est
+signalé en note sur stderr (la liste peut alors être incomplète). Avec plusieurs serveurs, un utilisateur connecté
+ailleurs reste « non connecté » sur ce serveur. Les fichiers sont lus une fois au lancement, même avec `-w`.
 
 Reçu / envoyé sont vus du serveur : reçu du client, envoyé au client. OpenVPN ne sert **qu'une session de management à
 la fois** : pendant un `list -w`, `log -f` ou `shell` (ou un outil de supervision branché dessus), les autres appels
