@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.23.0 -->
+<!-- UI_VERSION: 1.23.1 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -399,7 +399,16 @@ function stateBadges(nick){
   if(!a) return '';
   let h='';
   if(a.external) h+=`<span class="badge" title="${escapeAttr('Dépôt externe : archives créées hors borgHelper. Opérations permises : '+(a.ops||[]).join(', '))}">🔗 externe</span> `;
-  if(a.bkp_running) h+='<span class="badge warn" title="Sauvegarde en cours">⏳ Bkp en cours</span> ';
+  // UI 1.23.1 (story 59, décisions de l'utilisateur) : état de Status (WWW 1.31.5 : bkp_detail, bkp_interrupted)
+  if(a.bkp_running){
+    if(a.bkp_detail==='orphelin') h+='<span class="badge warn" title="Bkp interrompu (borgHelper arrêté), borg create encore actif">⏳ Bkp interrompu, borg create encore actif</span> ';
+    else if(a.bkp_detail==='en_attente') h+=`<span class="badge warn" title="${escapeAttr("Bkp en attente de l'Index")}">⏳ Bkp en attente de l'Index</span> `;
+    else h+='<span class="badge warn" title="Sauvegarde en cours">⏳ Bkp en cours</span> ';
+  }
+  if(a.bkp_interrupted){
+    const why=a.bkp_interrupted.verifie===false?'borgHelper arrêté, borg non vérifiable (dépôt distant)':'borgHelper arrêté';
+    h+=`<span class="badge warn" title="${escapeAttr(why+' — fermé au prochain Index si son archive existe')}">⚠ Bkp interrompu</span> `;
+  }
   const b=a.build;
   if(b && b.state==='partial'){
     const st=(b.stats_done!=null)?`, statistiques ${b.stats_done}/${b.archives_total}`:'';
@@ -731,7 +740,9 @@ async function reloadMachineCard(nick){
 // Bkp DIFFÉRENT et fini, ou un Bkp différent vu « en cours » puis bkp_running false. Un Bkp déjà en cours au clic (cron)
 // qui finit : carte rechargée, suivi gardé. État illisible au clic : la première lecture lisible sert de référence, sans
 // recharge. Deux ▶ Backup avant la fin du premier : suivi prolongé d'un Bkp (left). Jamais de bkp_status : entrée inerte.
-// Avant (1.19.1-1.19.2) : 60 s sans le voir en cours -> recharge et abandon.
+// Avant (1.19.1-1.19.2) : 60 s sans le voir en cours -> recharge et abandon. UI 1.23.1 / WWW 1.31.5 (story 59) : bkp_running
+// suit l'état de Status — un Bkp tué n'est plus « en cours » jusqu'au délai (6 h) : fin dès la relecture suivante ; tué avant
+// toute relecture : fin sur bkp_interrupted.
 let pollBusy=false;
 const pendingBkp={};
 function bkpRef(nick){
@@ -772,6 +783,8 @@ async function pollAccess(){
         p.prevFin=true; reload=true;                      // Bkp déjà en cours au clic (cron) fini : carte à jour, suivi gardé
       }
       if(!end && p.seen && a.bkp_running===false) end=true;   // vu en cours puis fini
+      // UI 1.23.1 (revue story 59) : Bkp nouveau tué avant toute relecture (jamais vu en cours) — interrompu, plus rien de vivant
+      if(!end && bl && bl.run_id && bl.run_id!==p.prev && !bl.finished_at && a.bkp_running===false && a.bkp_interrupted) end=true;
       if(end){
         reload=true;
         if(--p.left>0){ p.prev=(bl && bl.run_id)||p.prev; p.prevFin=true; p.seen=false; }   // un autre ▶ Backup attendu

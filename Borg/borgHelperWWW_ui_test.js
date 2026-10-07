@@ -125,6 +125,22 @@ async ${grab('pollAccess')}
      ['🔗 externe','⏳ Bkp en cours','construction partielle 1/5','prête à basculer'].every(t=>be.includes(t)),true);
   eq('badge reconstruction démarrée (sans build_state)',ui.stateBadges('f').includes('reconstruction démarrée'),true);
   eq('base complète interne : aucun badge',ui.stateBadges('g'),'');
+  // UI 1.23.1 (story 59, décisions de l'utilisateur) : état de Status relayé par /access (WWW 1.31.5)
+  ui.set(acc({o:{bkp_running:true,bkp_detail:'orphelin'},w:{bkp_running:true,bkp_detail:'en_attente'},
+              i:{bkp_running:false,bkp_interrupted:{started_at:'2026-10-06 10:00:00',verifie:true}},
+              id:{bkp_running:false,bkp_interrupted:{started_at:'2026-10-06 10:00:00',verifie:false}},
+              v:{bkp_running:true,bkp_detail:'en_cours'},n:{bkp_running:null}}));
+  const bo=ui.stateBadges('o'), bw=ui.stateBadges('w'), bi=ui.stateBadges('i'), bd=ui.stateBadges('id');
+  eq('orphelin : « ⏳ Bkp interrompu, borg create encore actif », jamais « Bkp en cours »',
+     [bo.includes('⏳ Bkp interrompu, borg create encore actif'),bo.includes('Bkp en cours')],[true,false]);
+  eq("en attente : « ⏳ Bkp en attente de l'Index »",[bw.includes("⏳ Bkp en attente de l'Index"),bw.includes('Bkp en cours')],[true,false]);
+  eq('interrompu : « ⚠ Bkp interrompu », title borgHelper arrêté + Index, pas de ⏳',
+     [bi.includes('⚠ Bkp interrompu'),bi.includes('title="borgHelper arrêté — fermé au prochain Index si son archive existe"'),bi.includes('⏳')],[true,true,false]);
+  eq('interrompu non vérifiable : title du dépôt distant',bd.includes('borgHelper arrêté, borg non vérifiable (dépôt distant) — fermé au prochain Index'),true);
+  eq('vivant : « ⏳ Bkp en cours » ; inconnu (null) : aucun badge',[ui.stateBadges('v').includes('⏳ Bkp en cours'),ui.stateBadges('n')],[true,'']);
+  ui.set(acc({vi:{bkp_running:true,bkp_detail:'en_attente',bkp_interrupted:{started_at:'2026-10-06 09:00:00',verifie:true}}}));
+  const bvi=ui.stateBadges('vi');
+  eq('revue : en attente ET ligne interrompue d\'un autre run -> les deux badges',[bvi.includes("⏳ Bkp en attente de l'Index"),bvi.includes('⚠ Bkp interrompu')],[true,true]);
   // résultat du dernier Index (UI 1.19.2) : échec/refus toujours ; « déjà en cours » seulement via HTTP, moins d'1 h
   // Heures écrites par borgHelper ≥ 1.0.149 : ISO avec décalage ; « now » absolu (Date.UTC) : juste dans tout fuseau.
   const fin='2026-09-28T10:00:05+02:00', T0=globalThis.Date.UTC(2026,8,28,8,0,5); now=T0+60000;
@@ -181,6 +197,14 @@ async ${grab('pollAccess')}
   eq('nouveau Bkp fini : une recharge',calls.reload.slice(n0),['s']);
   await ui.pollAccess();
   eq('une seule recharge (suivi terminé)',[R()-n0,'s' in ui.pending],[1,false]);
+  // UI 1.23.1 (revue story 59) : Bkp nouveau tué avant toute relecture — jamais vu en cours, ligne ouverte, bkp_running false +
+  // bkp_interrupted -> fin du suivi (avant WWW 1.31.5 : vu « en cours » jusqu'au délai, puis fini)
+  n0=R(); ui.set(acc({k:B('k-old','x')}),'view-machines'); ui.notePendingBkp('k');
+  next=acc({k:{...B('k-new',null,false),bkp_interrupted:{started_at:'2026-10-06 10:00:00',verifie:true}}}); await ui.pollAccess();
+  eq('Bkp nouveau tué avant la 1re relecture : une recharge, suivi terminé',[calls.reload.slice(n0),'k' in ui.pending],[['k'],false]);
+  n0=R(); ui.set(acc({k:B('k-new','z')}),'view-machines'); ui.notePendingBkp('k');
+  next=acc({k:B('k-new2',null,false)}); await ui.pollAccess();
+  eq('Bkp nouveau pas encore vu en cours, ni interrompu : suivi gardé',[R()-n0,'k' in ui.pending],[0,true]);
   // critère d'acceptation : démarrage à 200 s, 10 s de Bkp entre deux relectures, jamais vu en cours
   n0=R(); ui.set(acc({q:B('old','x')})); ui.notePendingBkp('q');
   for(const s of [30,60,90,120,150,180,210]){ next=acc({q:B('old','x')}); now=T+s*1000; await ui.pollAccess(); }

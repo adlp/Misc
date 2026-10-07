@@ -1,5 +1,41 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.31.5, UI 1.23.1, borgHelper 1.0.188 — /access et alerte de retard alignés sur le marqueur et l'orphelin — 2026-10-06
+
+Chantier « reconstruction progressive », story 59 (rétrospective F305, A115 ; décisions de l'utilisateur). Avant : `/access`
+(`bkp_running`, ⏳ de l'UI, suivi d'un ▶ Backup) et l'alerte de retard lisaient la base seule — un Bkp tué restait « en cours »
+jusqu'à `BKP_STATUS_TIMEOUT` (6 h par défaut), alors que Status (1.0.186) le dit interrompu.
+
+- borgHelper 1.0.188 : `BorgHelper.bkp_state(nick)` — l'état du Bkp de Status extrait de `_status_one`, source unique de Status
+  et de borgHelperWWW. `_lock_holder` (tous les verrous à PID : priority, index-running, marqueurs…) : un PID zombie compte mort — un Bkp lancé par `POST /bkp` puis tué reste enfant non
+  récolté du worker (`os.kill(pid, 0)` y réussit) : Status et /access le disaient « en cours », et l'Index se mettait en pause
+  sans fin derrière son `priority.lock` (mesuré : témoin bloqué, `index-paused.lock` resté). `/proc` illisible (hidepid) : inchangé.
+- borgHelperWWW 1.31.5 : `/access` — `bkp_running` vrai seulement si un processus du Bkp vit (vivant, en attente de l'Index,
+  borg create orphelin), `bkp_detail` (`en_cours`, `en_attente`, `orphelin`), `bkp_interrupted` (`{started_at, verifie}` comme
+  Status) ; alerte de retard : suspendue par un Bkp vivant ou un état illisible (décision de l'utilisateur, revue), plus par un
+  Bkp tué — même si son borg a écrit une archive que seul le prochain Index fera connaître (décision de l'utilisateur). Coût par
+  relecture (30 s) : base et marqueurs ; `bkp_state` (lock.roster d'un dépôt local) seulement s'il y a une ligne ouverte ou un
+  marqueur, dans une sonde bornée (1 s ; figée : dernier état lu, sinon inconnu ; état oublié dès qu'il n'y a plus rien).
+- UI 1.23.1 : badges « ⏳ Bkp en cours », « ⏳ Bkp en attente de l'Index », « ⏳ Bkp interrompu, borg create encore actif »,
+  « ⚠ Bkp interrompu » (au survol : « borgHelper arrêté — fermé au prochain Index si son archive existe » ; dépôt distant :
+  « borgHelper arrêté, borg non vérifiable (dépôt distant) — … ») ; suivi d'un ▶ Backup : fin aussi pour un Bkp tué avant toute
+  relecture (`bkp_interrupted`). Effet de WWW 1.31.5 : un ▶ Backup suivi se termine dès que le Bkp n'est plus en cours (avant :
+  au délai).
+- Mesuré (serveur de test, rc de démo, vrai borg ; `work/m59/mesure59b.log`, témoin sur le code d'avant
+  `mesure59-temoin.log`) : vivant -> en cours ; borgHelper tué, borg suspendu -> orphelin (avant : en cours) ; borg fini ->
+  interrompu (avant : en cours) ; après Index -> rien ; même parcours par `POST /bkp` avec le borgHelper tué ZOMBIE dans le worker
+  -> orphelin puis interrompu (avant : en cours, et l'Index du témoin en pause sans fin).
+- Contrôles : push selftest — état relayé (orphelin, attente, interrompu, inconnu), coût (ni ligne ni marqueur : `bkp_state`
+  jamais appelé), sonde figée ; décors des contrôles /access et retard dotés d'un marqueur vivant (vrai processus) quand ils
+  simulent un Bkp vivant ; CodecSelfTest « porteur zombie -> mort » ; test UI (node) des badges.
+- Séries de mutations (code final après revue, lignes entières ; journaux vérifiés : échec sur l'assertion de sa pièce) :
+  borgHelperWWW et borgHelper sous Python 3.14 strict 17/17 DÉTECTÉES — /access et alerte sur la base seule, garde de coût
+  retirée, sonde non bornée, sans dernier état, impossible (500), marqueurs ou base illisibles pris pour « rien », erreur avalée
+  prise pour « rien », dernier état jamais oublié, alerte envoyée en état inconnu, détail toujours « en_cours », interrompu
+  jamais relayé ; zombie compté vivant, état de processus jamais lu, `bkp_unknown` toujours faux, Status hors de `bkp_state`
+  (W6 a d'abord survécu : cas « marqueur sans ligne » ajouté au contrôle, puis DÉTECTÉ) ; UI (test node) 5/5 — orphelin et
+  attente dits « en cours », interrompu sans badge, infobulle du dépôt distant, suivi d'un Bkp tué avant relecture jamais clos.
+
 ## borgHelper 1.0.187 — Archive rapprochée : dite, pas « borg : — » — 2026-10-06
 
 Chantier « reconstruction progressive », story 58 (rétrospective F313, A116 ; décisions de l'utilisateur). Avant : l'archive d'un

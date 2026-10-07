@@ -2403,10 +2403,22 @@ Depuis 1.28.0, chaque nick lisible par l'appelant porte aussi (lectures locales 
   "pairs_total","archives_total","stats_done","snapshot","updated_at"}` ;
 - `rebuild` : même forme pour le fichier fantôme (`{"state":"partial"}` avant sa première fin de tranche), `null` sans
   reconstruction ;
-- `bkp_running` : `true` si un Bkp du nick sans fin, non suivi d'un Bkp réussi, a démarré depuis moins que son délai (clé rc `BKP_STATUS_TIMEOUT`,
-  sinon `BORGHELPERWWW_BKP_STATUS_TIMEOUT`, sinon 6 h) sans finir, `false` sinon (un Bkp tué au-delà n'est plus « en
-  cours » : le watcher le traite en échec ; 1.28.4 : un Bkp tué suivi d'un Bkp réussi non plus), `null` si `history.db` est
-  illisible (1.28.1 ; jamais pris pour une fin de Bkp).
+- `bkp_running` (1.31.5, borgHelper ≥ 1.0.188 : état de `Status`) : `true` si un processus du Bkp du nick vit — marqueur de
+  Bkp vivant (avec sa ligne non périmée, délai : clé rc `BKP_STATUS_TIMEOUT`, sinon `BORGHELPERWWW_BKP_STATUS_TIMEOUT`, sinon
+  6 h), Bkp en attente de l'Index (marqueur sans ligne encore), borg create orphelin d'un borgHelper tué ; `false` sinon — Bkp
+  tué sans rien de vivant (alors `bkp_interrupted`), ligne au-delà du délai (le watcher la traite en échec), Bkp tué suivi
+  d'un Bkp réussi ; `null` si l'état est illisible (`history.db`, marqueurs, sonde du dépôt figée sans état déjà lu, erreur)
+  — jamais pris pour une fin de Bkp. Avant 1.31.5 : base seule, un Bkp tué restait `true` jusqu'au délai. Une relecture peut
+  retirer les marqueurs de Bkp morts de `CACHE_DIR` (comme Status et Report ; impossible sous un autre compte : sans effet).
+- `bkp_detail` (1.31.5) : `"en_cours"`, `"en_attente"` (Bkp en attente de l'Index, ligne pas encore écrite),
+  `"orphelin"` (borgHelper tué, son borg create écrit encore) quand `bkp_running` est `true`, sinon `null`.
+- `bkp_interrupted` (1.31.5) : `{"started_at","verifie"}` comme `Status -j` (ligne ouverte non périmée d'un Bkp dont rien ne
+  vit ; aussi à côté d'un `bkp_running` vrai d'un AUTRE run, par exemple un Bkp en attente de l'Index derrière une ligne
+  tuée : deux badges ; `verifie` `false` : dépôt distant, borg non vérifiable) ou `null`. UI 1.23.1 : badges « ⏳ Bkp en cours », « ⏳ Bkp en attente de l'Index »,
+  « ⏳ Bkp interrompu, borg create encore actif », « ⚠ Bkp interrompu » (au survol : « borgHelper arrêté — fermé au
+  prochain Index si son archive existe ») ; un ▶ Backup suivi se termine dès que le Bkp n'est plus en cours. Coût par
+  relecture (toutes les 30 s) : base et marqueurs (CACHE_DIR) ; le verrou du dépôt local (`lock.roster`, borg orphelin)
+  seulement s'il y a une ligne ouverte ou un marqueur, dans une sonde bornée (1 s ; figée : dernier état lu).
 - `index_last` (1.28.2, borgHelper ≥ 1.0.149) : résultat du dernier `Index` de ce nick, quel que soit son lanceur
   (CLI, cron, `POST /index`) — `{"nick","started_at","finished_at","outcome","code","via","message"}` avec `outcome`
   ∈ `ok`, `error`, `refused` (code 3), `busy` (« Index déjà en cours », rien fait), `deadline` (échéance atteinte
@@ -2636,7 +2648,10 @@ marque déjà le serveur en erreur dans `Report`). Au-delà, notification de typ
 (seuil : 25 h) », payload `{"event":"overdue","result":"error","age_hours","max_age_hours",
 "last_backup","reminder"}`. Une alerte au franchissement du seuil, puis un **rappel** à chaque période
 supplémentaire (2×, 3× le seuil… — « ⏰ Toujours aucune sauvegarde »), jusqu'à la prochaine archive.
-Rien pendant un Bkp en cours, ni pour un serveur sans aucune archive connue. Tant que personne n'est
+Rien pendant un Bkp en cours, ni pour un serveur sans aucune archive connue. 1.31.5 : « en cours » au sens de Status
+(processus du Bkp vivant, en attente de l'Index, borg create orphelin) ; un Bkp tué sans rien de vivant ne suspend plus
+l'alerte — même si son borg a fini et écrit une archive, que seul le prochain Index (cron, Bkp suivant) fait connaître
+(décision de l'utilisateur) ; état illisible (marqueurs, sonde du dépôt figée, base) : suspendue (décision de l'utilisateur). Tant que personne n'est
 abonné aux échecs de ce host, l'alerte n'est pas consommée : un abonnement pris pendant le retard la
 reçoit au passage suivant. Plusieurs workers uvicorn : un seul envoie (réservation atomique dans
 `push.db`, table `overdue_alerts`). « Dernière archive connue » = `archive_stats` (alimentée par chaque

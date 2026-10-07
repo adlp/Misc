@@ -416,6 +416,11 @@ state = bh.db.bkp_running_state('mon-serveur', timeout_s=bh.bkp_status_timeout('
 # (marqueur de Bkp, borg create orphelin) : bh._status_one('mon-serveur', bkp_live=True) (méthode interne, forme du JSON de
 # Status) -> bkp_running {started_at, en_attente, orphelin}, bkp_interrupted {started_at, verifie}, bkp_stale ; sans
 # bkp_live : base seule. bh.db.repo_orphan_checkable('mon-serveur') : orphelin détectable ici (dépôt local) ?
+# 1.0.188 (story 59) : l'état du Bkp seul, même calcul (source unique de Status et de borgHelperWWW /access) — sans lire
+# diff.db ; lock.roster du dépôt lu si aucun marqueur vivant (dépôt monté : borner l'appel). Erreur SQLite sur history.db :
+# avalée (aucune ligne, comme Status) — relire bh.db.bkp_running_state pour distinguer ; rc illisible : exception.
+# bkp_unknown : marqueurs illisibles (rien dit du Bkp vivant ni interrompu). Un PID zombie compte mort.
+etat = bh.bkp_state('mon-serveur')   # {bkp_running, bkp_interrupted, bkp_stale, bkp_unknown}
 
 # Délai du nick (1.0.155) : clé rc BKP_STATUS_TIMEOUT (section ou [DEFAULT] ; secondes ou suffixe s/m/h), sinon
 # BORGHELPERWWW_BKP_STATUS_TIMEOUT, sinon 21600 ; valeur invalide : 21600 ; [WARN] si invalide ou < 300 s ; jamais

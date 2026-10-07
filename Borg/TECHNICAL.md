@@ -939,7 +939,9 @@ mort : retiré à la lecture.
 
 **Verdict commun `_lock_holder`** (tous les verrous à PID : prioritaire, `index-running`, `index-paused`,
 `report-running`) : `gone` (absent) ; `alive` pour un fichier vide de moins de 2 s ou un PID vivant, **y compris d'un
-autre utilisateur** (`PermissionError`) ; `me` pour le PID courant ; `dead` pour un PID mort, ≤ 0 ou hors plage, et
+autre utilisateur** (`PermissionError`) ; `me` pour le PID courant ; `dead` pour un PID mort, ≤ 0 ou hors plage, zombie ou
+mort (`Z`/`X` de `/proc/<pid>/stat`, `_pid_state`, 1.0.188 : un Bkp de `POST /bkp` tué reste enfant non récolté du worker,
+`os.kill(pid, 0)` y réussit — `/proc` illisible, hidepid : verdict inchangé), et
 (1.0.148) pour un **PID repris** : processus démarré plus de 60 s après la dernière écriture du fichier (PID et date
 lus dans la même ouverture), même d'un autre utilisateur ou du processus courant. `_owns_lock` suit ce verdict (un
 ancien fichier à notre PID n'est pas à nous). La date de démarrage vient de `btime` + ticks (`_pid_start_time`) : elle
@@ -1970,7 +1972,8 @@ mtimes stables, mesuré). Cache par périmètre : `_capture_fingerprints(nick, '
 `<prefix>-*-bkp.lock.*` de `CACHE_DIR` triés, « nom:`_lock_holder` » — lecture seule, jamais retirés ici ; décision de
 l'utilisateur : un voisin du même dépôt compte ; run_id de 32 hex seulement, jamais les `.<pid>.tmp` de `_set_pid_lock` ; porteur
 vivant mais zombie -> `zombie`, `_pid_alive` lit `/proc/<pid>/stat` : un borgHelper lancé par POST /bkp puis tué reste zombie,
-enfant du worker, jusqu'au Popen suivant) et `|roster:<nick>:<pid>:<vivant>,…` (`_repo_roster_state` : `repo_lock_holders` de
+enfant du worker, jusqu'au Popen suivant ; 1.31.5 / borgHelper 1.0.188 : `_lock_holder` rend déjà `dead` pour un zombie, le
+libellé est donc `dead` — branche `zombie` gardée pour `/proc` lu entre-temps ; `_pid_alive` lit `_pid_state` de borgHelper) et `|roster:<nick>:<pid>:<vivant>,…` (`_repo_roster_state` : `repo_lock_holders` de
 borgHelper, `_pid_alive`) ; sondes par `_bounded_probe(sorte, nick, fn, repli)` (revue : inscrite sous `_PROBE_LOCK` avant son
 départ, une seule en vol par (sorte, nick), une requête concurrente attend la même ; au-delà de 1 s marquée figée, les suivantes
 rendent le repli aussitôt) — repli de la présence `ok`, du roster le dernier état lu `_ROSTER_LAST` (empreinte stable : réponse
@@ -3716,8 +3719,15 @@ Commande CLI en lecture seule (1.0.186 : elle retire seulement, comme Report, le
    récente, si elle n'est pas celle du Bkp vivant : périmée -> `bkp_stale`, sinon -> `bkp_interrupted` ({started_at,
    verifie = `repo_orphan_checkable(nick)`, dépôt local au sens de `_repo_local_path`, le prédicat de `repo_lock_holders`}).
    `_status_one(nick)` par défaut (`bkp_live=False`, borgHelperWWW /access qui n'en garde que build/rebuild) : base seule,
-   comme avant — jamais de marqueurs, de `lock.roster` ni de /proc à chaque sondage. `bkp_running_state` (/access, alerte de
-   retard) reste sur la base seule. Délai et non
+   comme avant — jamais de marqueurs, de `lock.roster` ni de /proc à chaque sondage. 1.0.188 (story 59) : ce calcul est
+   `BorgHelper.bkp_state(nick, bkp_live=True)` (+ `bkp_unknown` : `_bkp_live` illisible), source unique de `_status_one` et de
+   borgHelperWWW 1.31.5 (`_bkp_state` : /access `bkp_running`/`bkp_detail`/`bkp_interrupted`, alerte de retard — appel dans
+   `_bounded_probe('bkpstate', …)` et seulement si `bkp_running_state` est vrai ou qu'un marqueur existe ; sonde figée :
+   `_BKPSTATE_LAST`, sinon inconnu). `_lock_holder` : PID zombie (Z) ou mort (X), lu dans `/proc/<pid>/stat`
+   (`_pid_state`), -> `'dead'` — un Bkp lancé par `POST /bkp` puis tué reste enfant non récolté du worker et `os.kill(pid, 0)`
+   y réussit (mesuré : Status et /access le croyaient vivant ; l'Index se mettait en pause sans fin derrière son
+   `priority.lock`, `index-paused.lock` resté) ; `/proc` illisible
+   (hidepid) : inchangé. Délai et non
    verrou : `backup()` relâche `priority.lock` avant son Index de fin, ligne encore ouverte, et un Index externe peut tenir
    `index-running.lock` — aucun verrou ne prouve qu'un Bkp vit.
 3. **Opération prioritaire en cours** : `check_priority_lock(nick)` (déjà existant, réutilisé tel
@@ -4082,7 +4092,8 @@ Vérifié : `push_selftest` 54/54 ; essai réel (Bkp réussi sur un host « éch
 jamais de création de base), âge via `_archive_age_hours` (heure locale naïve, comme `d2DateNSince` de
 Report), seuil `_max_age_bkp(cfg)` (`MAX_AGE_BKP`, défaut 25, illisible/≤0 → 25). Silence si : envoi push
 indisponible, aucune archive, âge ≤ seuil, Bkp en cours (`bkp_running` : ligne `bkp_status` non finie de
-moins de `BKP_STATUS_TIMEOUT`), aucun abonné aux échecs de ce host (`_push_subscriptions_for(nick,'error')`)
+moins de `BKP_STATUS_TIMEOUT` ; 1.31.5 : `_bkp_state(nick)['bkp_running']`, état de Status — un Bkp tué sans rien de vivant
+ne suspend plus l'alerte), aucun abonné aux échecs de ce host (`_push_subscriptions_for(nick,'error')`)
 — l'alerte n'est alors pas consommée. Sinon `level = int(age // seuil)` et réservation
 `_overdue_claim` : `INSERT … ON CONFLICT(nick) DO UPDATE … WHERE last_archive != excluded OR level <
 excluded` — une seule instruction SQLite, `rowcount==1` = gagné (plusieurs workers : un seul envoi). Une
