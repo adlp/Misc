@@ -3,20 +3,26 @@
 Codes de sortie :
   0  succès
   1  aucun résultat (search, load, hosts : sélection sans élément) ; hosts remove : hôte
-     absent de l'élément (rien écrit) ; ssh-config --check : pas à jour (contenu, droits,
-     fichier en trop ou non ordinaire) ou ligne Include absente, conditionnelle ou pas en tête
+     absent de l'élément (rien écrit) ; import : clé déjà dans le coffre (rien créé) ;
+     ssh-config --check : pas à jour (contenu, droits, fichier en trop ou non ordinaire) ou
+     ligne Include absente, conditionnelle ou pas en tête
   2  usage (option ou argument invalide ; load sans sélection ni --all ; durée invalide ;
      config.json invalide, illisible ou aux droits inattendus ; hôte invalide ; sélection
-     de hosts qui désigne plusieurs éléments)
+     de hosts qui désigne plusieurs éléments ; import : fichier refusé — illisible, pas une
+     clé privée, type ou format non accepté — ou --name avec plusieurs fichiers)
   3  non connecté au coffre, ou coffre verrouillé (aucune invite possible, mot de passe refusé) ;
      agent dédié arrêté ou verrouillé ; passphrase d'une clé refusée ou impossible à saisir
+     (load, import)
   4  erreur du backend (bw absent, en erreur, réponse illisible, délai dépassé), de l'agent
      dédié (XDG_RUNTIME_DIR relatif, non privé ou hors tmpfs, chemin du socket trop long,
      agent tiers, OpenSSH < 8.9, --restrict : élément sans hôte, hôte non littéral ou absent
      de known_hosts ; clé publique illisible ou différente de la clé privée), écriture de
      config.json impossible, écriture des hôtes dans le coffre non aboutie ou non vérifiée
-     (y compris hôtes écrits mais ssh_config non régénéré), ssh_config généré impossible à
-     écrire (chemin avec « " », « \\ », « ${ », fichier non ordinaire, droits), répertoire
+     (y compris hôtes écrits mais ssh_config non régénéré), création d'un élément par import
+     non aboutie ou non vérifiée (y compris clé importée mais ssh_config non régénéré), copie
+     impossible dans un tmpfs privé (import --decrypt), ssh-keygen absent ou en erreur,
+     ssh_config généré impossible à écrire (chemin avec « " », « \\ », « ${ », fichier non
+     ordinaire, droits), répertoire
      personnel inconnu, ssh-config install refusé (~/.ssh/config lien symbolique ou non
      ordinaire, Include de sshvault dans un bloc Host/Match, chemin personnel avec %, $ ou
      joker de glob), ou erreur interne
@@ -24,6 +30,7 @@ Codes de sortie :
 `ensure` (appelé par ssh, Match exec) : 0 si la clé est présente ou chargée, et pour `ssh -G` ;
 sinon le code de l'erreur, sans effet sur ssh (le Match ne porte aucune directive).
 `status` : 0 si le coffre est déverrouillé, 3 s'il est verrouillé ou non connecté, 4 en erreur.
+`import` de plusieurs fichiers : le pire des codes rencontrés (0 < 1 < 2 < 3 < 4).
 `agent status` : 0 si l'agent dédié tourne, 3 s'il est arrêté, 4 en erreur ou agent tiers.
 Toute erreur donne une seule ligne sur stderr, jamais de traceback.
 """
@@ -43,12 +50,13 @@ from .agent import (CMD_TIMEOUT as AGENT_TIMEOUT, Agent, AgentError, AgentLocked
                     PassphraseRefused, askpass_rules, fingerprint, is_encrypted, literal_host, public_blob,
                     resolve_dir, tty_available)
 from .agentstate import entry as state_entry, maybe_locked, reconcile, remaining
-from .backend import (BackendError, InvalidHost, NotLoggedIn, SshKeyItem, VaultBackend, VaultError, VaultLocked,
-                      normalize_hosts, valid_host)
+from .backend import (HOSTS_FIELD, BackendError, InvalidHost, NotLoggedIn, SshKeyItem, VaultBackend, VaultError,
+                      VaultLocked, normalize_hosts, valid_host)
 from .bw import BwBackend
 from .config import Config, ConfigError, ConfigWriteError, describe_duration, parse_duration
 from . import ensure as ensure_mod
 from . import fastpath
+from . import keyfile
 from .ensure import Deadline
 from .prompt import DEFAULT_TIMEOUT as PROMPT_TIMEOUT, PromptError, ask_password, prompt_timeout
 from .bw import DEFAULT_TIMEOUT as BW_TIMEOUT
@@ -108,7 +116,8 @@ def duration_arg(s: str) -> int:
 def build_parser() -> Parser:
     p = Parser(prog="sshvault", description="Clés SSH du coffre Vaultwarden (via bw).",
                epilog="Codes de sortie : 0 ok, 1 aucun résultat (hosts remove : hôte absent ; "
-                      "ssh-config --check : pas à jour), 2 usage (hôte invalide, sélection ambiguë), "
+                      "ssh-config --check : pas à jour ; import : déjà dans le coffre), 2 usage (hôte "
+                      "invalide, sélection ambiguë, import : fichier refusé), "
                       "3 non connecté ou verrouillé (coffre ou agent, passphrase refusée), "
                       "4 erreur backend ou agent, écriture ou ssh_config impossible, install refusé, "
                       "130 interrompu. "
@@ -178,6 +187,22 @@ def build_parser() -> Parser:
         if nargs:
             h.add_argument("hosts", metavar="HÔTE", nargs=nargs,
                            help="motif de ligne Host (lettres, chiffres, . - _ * ?), ou liste à virgules")
+
+    s = sub.add_parser("import", help="importe des clés privées existantes dans le coffre (fichiers d'origine "
+                                      "jamais modifiés)")
+    s.add_argument("files", metavar="FICHIER", nargs="+",
+                   help="clé privée Ed25519 ou RSA (≥ 2048 bits), format OpenSSH, PKCS#8 (RSA seulement avec "
+                        "OpenSSH 8.9) ou RSA PEM PKCS#1 ; PEM en clair converti au format OpenSSH ; PKCS#1 "
+                        "chiffrée : avec --decrypt seulement")
+    s.add_argument("--name", metavar="NOM", help="nom de l'élément (un seul FICHIER ; défaut : commentaire de la "
+                                                  "clé, sinon nom du fichier)")
+    s.add_argument("--hosts", metavar="HÔTES", action="append", default=[],
+                   help="hôtes associés, liste à virgules (comme hosts add) ; ssh_config régénéré")
+    s.add_argument("--force", action="store_true",
+                   help="importe même si l'empreinte est déjà dans le coffre (second élément)")
+    s.add_argument("--decrypt", action="store_true",
+                   help="clé à passphrase : stockée déchiffrée (passphrase demandée une fois) ; défaut : "
+                        "stockée chiffrée, telle quelle")
 
     s = sub.add_parser("ssh-config", help="génère ~/.ssh/sshvault/config et les clés publiques ; "
                                           "install : ligne Include en tête de ~/.ssh/config")
@@ -301,6 +326,8 @@ def run(args, backend: VaultBackend) -> int:
         return run_hosts(args, backend, prompt)
     if args.cmd == "ssh-config":
         return run_ssh_config(args, backend, prompt)
+    if args.cmd == "import":
+        return run_import(args, backend, prompt)
     raise UsageError("commande inconnue : %s" % args.cmd)
 
 
@@ -711,6 +738,145 @@ def run_ssh_config(args, backend: VaultBackend, prompt) -> int:
     return RC_OK
 
 
+# --- import d'une clé existante ----------------------------------------------------------
+
+TEST_FIELD_ENV = "SSHVAULT_TEST_FIELD"
+
+
+def _test_fields() -> list:
+    """Tests seulement : `SSHVAULT_TEST_FIELD=NOM=VALEUR` ajoute un champ texte aux éléments
+    importés (marqueur que le nettoyage des tests d'intégration exige)."""
+    raw = os.environ.get(TEST_FIELD_ENV) or ""
+    if not raw:
+        return []
+    name, sep, value = raw.partition("=")
+    if not sep or not name or name == HOSTS_FIELD:
+        raise ConfigError("%s invalide : NOM=VALEUR attendu" % TEST_FIELD_ENV)
+    return [(name, value)]
+
+
+def _passphrase_mode(args) -> str:
+    """Invite de passphrase possible pour ssh-keygen ? Sinon PassphraseRefused (code 3)."""
+    if args.nointeraction:
+        raise PassphraseRefused("clé chiffrée par passphrase, saisie impossible (--nointeraction) : rien importé")
+    mode = keyfile.passphrase_mode(os.environ)
+    if mode is None:
+        raise PassphraseRefused("clé chiffrée par passphrase : aucune invite possible (ni terminal au premier plan, "
+                                "ni askpass utilisable) : rien importé")
+    return mode
+
+
+def _notice(label: str):
+    return lambda: err("%s : passphrase de la clé (demandée par ssh-keygen)" % label)
+
+
+def _needs_prompt(args, kf) -> bool:
+    """Passphrase indispensable : clé publique inconnue sans elle, ou déchiffrement demandé."""
+    return kf.blob is None or (args.decrypt and kf.encrypted)
+
+
+def _import_one(args, backend: VaultBackend, prompt, kf, hosts, items: list, extra) -> Optional[SshKeyItem]:
+    """Un fichier analysé : doublon (None, message dit), sinon élément créé et relu."""
+    label = clean(kf.path)
+    if kf.blob is None:  # PKCS#8 (ou PKCS#1) chiffré : la clé publique exige la passphrase
+        mode = _passphrase_mode(args)
+        kf = (keyfile.decrypt if args.decrypt else keyfile.public_from_encrypted)(kf, mode, notice=_notice(label))
+    for w in kf.warnings:
+        err("avertissement : %s" % w)
+    fp = kf.fingerprint
+    same = [i for i in items if i.match_fingerprint(fp)]
+    if same and not args.force:
+        hint = ("pour lui associer les hôtes : « sshvault hosts add --id %s %s » ; --force pour créer un second "
+                "élément" % (same[0].id, ",".join(hosts)) if hosts else "--force pour l'importer quand même")
+        err("%s : déjà dans le coffre (%s) : %s ; %s"
+            % (label, fp, ", ".join("« %s » %s" % (clean(i.name), i.id) for i in same), hint))
+        return None
+    if args.decrypt and kf.encrypted:
+        kf = keyfile.decrypt(kf, _passphrase_mode(args), notice=_notice(label))
+    name = args.name.strip() if args.name is not None else kf.default_name()
+    item = backend.create_ssh_key(name, kf.data.decode("ascii"), kf.public_key, fp, hosts, prompt,
+                                  existing=[i.id for i in same], extra_fields=extra)
+    print("importée : %s (%s)" % (clean(item.name), fp))
+    if kf.encrypted:
+        err("avertissement : « %s » stockée chiffrée par sa passphrase : demandée à chaque chargement, et "
+            "inutilisable par l'agent de Bitwarden Desktop, peut-être par d'autres clients Bitwarden "
+            "(--decrypt : stockée déchiffrée)" % clean(item.name))
+    return item
+
+
+def run_import(args, backend: VaultBackend, prompt) -> int:
+    """Chaque fichier traité à part (une ligne de résultat chacun) ; code : le pire rencontré."""
+    if args.name is not None:
+        if not args.name.strip():
+            raise UsageError("--name vide")
+        if len(args.files) > 1:
+            raise UsageError("--name ne vaut que pour un seul FICHIER")
+    hosts = normalize_hosts(_split(args.hosts))  # InvalidHost (code 2) avant tout accès
+    extra = _test_fields()
+    worst = RC_OK
+
+    def failed(path, e):
+        nonlocal worst
+        rc, msg = classify(e)
+        err("%s : %s" % (clean(path), msg) if path is not None else msg)
+        worst = max(worst, rc)
+
+    todo = []
+    for path in args.files:  # lecture, analyse et refus locaux, sans invite ni accès au coffre
+        try:
+            kf = keyfile.analyze(path, decrypt=args.decrypt)
+            if _needs_prompt(args, kf):
+                _passphrase_mode(args)  # --nointeraction, ou ni terminal ni askpass : refus ici
+            todo.append(kf)
+        except Exception as e:
+            failed(path, e)
+    if not todo:
+        return worst
+    try:
+        if hosts:
+            # Prérequis de la régénération vérifiés avant toute écriture (comme hosts).
+            paths = sshconfig.default_paths()
+            socket = make_agent().socket
+            exe = ensure_exe(paths)
+            for h in hosts:
+                if sshconfig.is_catch_all(h):
+                    err("avertissement : motif « %s » : %s" % (h, sshconfig.CATCH_ALL_WARNING))
+        # doublons : état du serveur, pas un cache local périmé
+        backend.sync(prompt)
+        items = backend.list_ssh_keys(prompt)
+        if hosts:
+            sshconfig.build(items, paths, socket, exe)
+    except Exception as e:  # le pire code reste, avec les refus déjà dits
+        failed(None, e)
+        return worst
+    created = []
+    try:
+        for kf in todo:
+            try:
+                item = _import_one(args, backend, prompt, kf, hosts, items, extra)
+            except Exception as e:
+                failed(kf.path, e)
+                continue
+            if item is None:
+                worst = max(worst, RC_NONE)
+                continue
+            items.append(item)
+            created.append(item)
+    except BaseException:
+        # Ctrl-C, SIGTERM… : les éléments déjà créés restent ; la config n'est pas régénérée
+        if hosts and created:
+            err("clés créées : %s ; ssh_config non régénéré : lancer « sshvault ssh-config »"
+                % ", ".join("« %s » %s" % (clean(i.name), i.id) for i in created))
+        raise
+    if hosts and created:
+        try:
+            regenerate(items, paths, socket, exe)
+        except (sshconfig.SshConfigError, AgentError) as e:
+            err("clé importée dans le coffre, mais ssh_config non régénéré : %s" % e)
+            worst = max(worst, RC_BACKEND)
+    return worst
+
+
 def run_config(args) -> int:
     cfg = Config()
     if args.config_cmd == "get":
@@ -816,7 +982,7 @@ def classify(e: BaseException):
         return RC_BACKEND, "magasin de session : %s" % e
     if isinstance(e, (BackendError, ConfigWriteError, sshconfig.SshConfigError)):
         return RC_BACKEND, str(e)
-    if isinstance(e, (InvalidHost, ConfigError)):
+    if isinstance(e, (InvalidHost, ConfigError, keyfile.KeyRefused)):
         return RC_USAGE, str(e)
     if isinstance(e, (AgentStopped, AgentLocked, PassphraseRefused)):
         return RC_LOCKED, str(e)

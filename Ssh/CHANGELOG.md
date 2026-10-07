@@ -1,5 +1,60 @@
 # Changelog — sshvault
 
+## sshvault 0.5.0 — Import d'une clé existante — 2026-10-07
+
+- `sshvault import FICHIER… [--name NOM] [--hosts HÔTE,…] [--force] [--decrypt]` : chaque
+  fichier devient un élément « SSH key » avec `privateKey` (le fichier tel quel),
+  `publicKey` et `keyFingerprint`, et ses hôtes dans `sshvault-hosts` (validés comme pour
+  `hosts add`) ; `ssh_config` régénéré si des hôtes sont donnés, prérequis vérifiés avant
+  d'écrire. Nom : commentaire de la clé (ou de la `.pub` voisine qui correspond), sinon nom
+  du fichier ; `--name` pour un seul fichier.
+- Acceptées : Ed25519 et RSA ≥ 2048 bits, formats OpenSSH, PKCS#8 (PEM ; RSA seulement avec
+  OpenSSH 8.9, qui ne lit pas une Ed25519 PKCS#8) et RSA PEM PKCS#1. Refusées, code 2,
+  message clair : ECDSA, DSA, `-sk`, PuTTY, SSH2, RSA trop courte, clé publique, fichier qui
+  n'est pas une clé (ou partie privée incohérente avec l'en-tête), illisible, non ordinaire
+  ou de plus de 64 Kio.
+- PEM en clair (RSA PKCS#1, PKCS#8) : converti au format OpenSSH par
+  `ssh-keygen -p -P "" -N ""` sur une copie dans le tmpfs privé (supprimée sur tous les
+  chemins), original intact. PKCS#1 chiffrée : seulement avec `--decrypt`, sinon code 2 avec
+  l'indication. PKCS#8 chiffrée sans `--decrypt` : gardée telle quelle (clients Bitwarden
+  peut-être incapables de l'utiliser, dit à l'import). Fins de ligne CRLF stockées en LF
+  (`ssh-add -` refuse le CRLF, mesuré).
+- Clé publique lue dans l'en-tête OpenSSH (sans passphrase ; pour un PEM, après
+  conversion), ou par `ssh-keygen -y` sur une copie pour une PKCS#8 chiffrée ; empreinte
+  comme `ssh-keygen -l`. `.pub` voisine différente ou illisible : avertissement, ignorée.
+- Clé à passphrase : importée **chiffrée** par défaut (avertissement : passphrase demandée
+  au chargement, inutilisable par l'agent de Bitwarden Desktop). `--decrypt` : passphrase
+  demandée une fois par `ssh-keygen -p -N "" -f <copie>` (terminal au premier plan ou
+  askpass, jamais `-P`), copie 0600 dans un sous-dossier 0700 du tmpfs privé, lue puis
+  supprimée sur tous les chemins (signaux masqués pendant la suppression ; un échec du
+  nettoyage n'efface jamais l'erreur en cours ; verrou `flock` tenu sur le sous-dossier,
+  orphelin d'un SIGKILL au verrou libre supprimé au suivant, même pid réutilisé). Invite :
+  règles de readpass.c (askpass d'abord avec `SSH_ASKPASS_REQUIRE=force|prefer`) ; invite
+  impossible décidée avant tout accès au coffre. PKCS#8 chiffrée sans `--decrypt` : une invite, pour la clé
+  publique seulement. Mesuré (OpenSSH 8.9p1) : `ssh-keygen -y` relit le fichier après la
+  saisie de la passphrase, un tube déjà lu est vide ; la clé publique d'une PKCS#8 chiffrée
+  passe donc aussi par la copie tmpfs.
+- Fichier d'origine et `.pub` jamais modifiés ni supprimés (pas d'option) ; le README
+  invite à supprimer soi-même l'original, avec la mise en garde SSD/journalisation.
+- Doublon (empreinte déjà dans le coffre, après `bw sync`) : code 1 avec le nom et l'id de
+  l'élément existant (avec `--hosts` : la commande `hosts add --id …` à lancer) ; `--force`
+  crée un second élément.
+- Création par `bw create item`, élément encodé sur stdin ; relecture et comparaison des
+  trois champs `sshKey` et des hôtes. Échec ou blocage : `sync`, recherche d'un nouvel
+  élément à cette empreinte (les éléments déjà présents exclus, pour `--force`), rejeu une
+  seule fois s'il est absent, code 4 s'il l'est toujours ; créé mais différent : code 4,
+  l'id à supprimer donné. Interruption : code 130 et « création peut-être passée » (avec
+  `--hosts`, clés créées nommées et `sshvault ssh-config` à lancer).
+- Plusieurs fichiers : une ligne par fichier, code de sortie = le pire rencontré.
+- Variables : `SSHVAULT_SSH_KEYGEN` ; `SSHVAULT_TEST_FIELD` (tests : champ ajouté aux
+  éléments importés, marqueur de nettoyage de l'intégration).
+- Tests : `tests/test_import.py` (vraies clés `ssh-keygen`, formats convertis, pty et
+  askpass, faux `bw` capable de `create` et de ses pannes, argv de `bw`/`ssh-keygen` et
+  `/proc/<pid>/cmdline` sans JSON, clé ni passphrase, aucun fichier de clé hors des
+  fixtures) ; intégration : import de trois clés de test (dont une PKCS#1 convertie),
+  relecture par un autre client `bw`, `load`, `ssh -G`. `ArgvWatch` déplacé dans
+  `tests/bench.py` (ancêtres de pytest exclus du relevé).
+
 ## sshvault 0.4.0 — Chargement transparent à la demande — 2026-10-07
 
 - `ssh <hôte>` charge seul la clé manquante, pour la cible comme pour chaque saut

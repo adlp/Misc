@@ -21,14 +21,13 @@ import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import uuid
 
 import pytest
 
-from bench import (HAVE_OPENSSH, SRC, agent_list, check_witness, kill_agents_under, private_runtime_dir, wait_gone,
-                   write_exe)
+from bench import (HAVE_OPENSSH, SRC, ArgvWatch, agent_list, b64_fragments, check_witness, kill_agents_under,
+                   private_runtime_dir, wait_gone, write_exe)
 
 pytestmark = pytest.mark.integration
 
@@ -523,6 +522,9 @@ def test_sshvault_sur_le_vrai_bw(account, vault, ssh_keys, home, report):
     # chargement à la demande (story 5) : ssh vers un sshd local, agent vide, vrai bw
     check_ensure(account, vault, ssh_keys, home, report)
 
+    # import d'une clé existante (story 6) : relecture par un autre client bw, load, ssh -G
+    check_import(account, vault, home, report)
+
     # session invalidée par un autre unlock : purge, puis « verrouillé »
     own.ok("unlock", "--passwordenv", PW_VAR, "--raw", env={PW_VAR: account.password})
     r = sv(home, "--nointeraction", "list")
@@ -541,66 +543,6 @@ def test_sshvault_sur_le_vrai_bw(account, vault, ssh_keys, home, report):
     check(account, r, 3, "status après lock")
     with open(os.path.join(home["tmp"], "askpass.calls")) as f:
         report.add("askpass", note="appels=%d" % len(f.read().splitlines()))
-
-
-_B64ISH = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
-
-
-def b64_fragments(text):
-    """Fragments du base64 de `text` sous les trois alignements possibles dans un JSON encodé."""
-    out = []
-    for shift in range(3):
-        enc = base64.b64encode(("x" * shift + text).encode()).decode()
-        out.append(enc[8:48])
-    return out
-
-
-class ArgvWatch:
-    """Relève, pendant un appel, la ligne de commande (/proc/<pid>/cmdline) de chaque processus
-    de l'utilisateur ; garde celles qui contiennent `needle` et signale tout argument suspect :
-    clé privée ou son base64 (tout processus) ; pour bw et sshvault, tout argument (hors argv[0])
-    de plus de 80 caractères, d'allure base64, ou contenant « { »."""
-
-    def __init__(self, needle, secrets):
-        self.needle, self.secrets = needle, [s for s in secrets if s]
-        self.seen, self.suspect = set(), []
-        self._stop = threading.Event()
-        self._t = threading.Thread(target=self._run, daemon=True)
-
-    def _run(self):
-        me = os.getuid()
-        while not self._stop.is_set():
-            for d in os.listdir("/proc"):
-                if not d.isdigit():
-                    continue
-                try:
-                    if os.stat("/proc/" + d).st_uid != me:
-                        continue
-                    with open("/proc/%s/cmdline" % d, "rb") as f:
-                        argv = f.read().decode(errors="replace").split("\0")
-                except OSError:
-                    continue
-                # bw, ou sshvault (exécutable ou `python -m sshvault…`) ; « un argument contient
-                # sshvault » attrapait aussi le shell qui lance pytest (faux positif mesuré)
-                related = (any(self.needle in a for a in argv)
-                           or os.path.basename(argv[0]) in ("bw", "sshvault")
-                           or any(argv[i] == "-m" and argv[i + 1].startswith("sshvault")
-                                  for i in range(len(argv) - 1)))
-                if any(self.needle in a for a in argv):
-                    self.seen.add(tuple(argv))
-                for n, a in enumerate(argv):
-                    if "PRIVATE KEY" in a or any(s in a for s in self.secrets) or (
-                            related and n > 0 and ("{" in a or len(a) > 80 or _B64ISH.search(a))):
-                        self.suspect.append([x[:60] for x in argv])
-            time.sleep(0.002)
-
-    def __enter__(self):
-        self._t.start()
-        return self
-
-    def __exit__(self, *exc):
-        self._stop.set()
-        self._t.join(timeout=10)
 
 
 def _fields(item):
@@ -774,3 +716,134 @@ def check_ensure(account, vault, ssh_keys, home, report):
             finally:
                 r = sv(home, "agent", "stop")
                 check(account, r, 0, "agent stop après ensure")
+
+
+IMPORT_PASSPHRASE = "passphrase d'import " + TAG
+
+
+def check_import(account, vault, home, report):
+    """Story 6 : `sshvault import` de trois clés de test (Ed25519 en clair, Ed25519 chiffrée avec
+    --decrypt par askpass, RSA PEM PKCS#1 convertie) avec un hôte, marquées pour le nettoyage (SSHVAULT_TEST_FIELD) ;
+    /proc/<pid>/cmdline relevé pendant l'import ; relecture par le client du peuplement après
+    sync (trois champs sshKey, hôtes, marqueur) ; doublon refusé ; load de la clé importée et
+    ssh -G sur la config régénérée."""
+    pop, session = vault["_reader"]
+    d = os.path.join(home["tmp"], "import")
+    os.mkdir(d, 0o700)
+    files = {}
+    for name, pp, typ in (("clair", "", ["-t", "ed25519"]), ("chiffree", IMPORT_PASSPHRASE, ["-t", "ed25519"]),
+                          ("pkcs1", "", ["-t", "rsa", "-b", "2048", "-m", "PEM"])):
+        p = os.path.join(d, name)
+        subprocess.run(["ssh-keygen", "-q", *typ, "-N", pp, "-C", "sshvault-it-import-%s-%s" % (name, TAG),
+                        "-f", p], check=True, stdin=subprocess.DEVNULL)
+        with open(p) as f:
+            private = f.read()
+        with open(p + ".pub") as f:
+            public = f.read().strip()
+        fp = subprocess.run(["ssh-keygen", "-l", "-E", "sha256", "-f", p + ".pub"], capture_output=True, text=True,
+                            check=True).stdout.split()[1]
+        st = os.stat(p)
+        files[name] = {"path": p, "private": private, "public": public, "fingerprint": fp,
+                       "stat": (st.st_mtime_ns, st.st_size, st.st_ino)}
+    host = "import-%s.it.example" % TAG
+    env = {"SSHVAULT_TEST_FIELD": "%s=%s" % (MARK, RUN), "SSH_ASKPASS": home["askpass"],
+           "SSH_ASKPASS_REQUIRE": "force", "SSHVAULT_IT_ASKPASS_REPLY": IMPORT_PASSPHRASE}
+    secrets = [IMPORT_PASSPHRASE]
+    for k in files.values():
+        body = "".join(k["private"].splitlines()[1:-1])
+        secrets += [body[:40], body[-40:]] + b64_fragments(k["private"])
+    calls_file = os.path.join(home["tmp"], "askpass.calls")
+
+    def askpass_calls():
+        try:
+            with open(calls_file) as f:
+                return len(f.read().splitlines())
+        except FileNotFoundError:
+            return 0
+    calls_before = askpass_calls()
+    with ArgvWatch(home["env"]["SSHVAULT_BW"], secrets) as w:
+        r = sv(home, "import", "--decrypt", "--hosts", host, files["clair"]["path"], files["chiffree"]["path"],
+               files["pkcs1"]["path"], env=env)
+    report.add("sshvault import", r)
+    check(account, r, 0, "import")
+    assert askpass_calls() - calls_before == 1, "une seule invite (passphrase de la clé chiffrée, --decrypt)"
+    for k in files.values():
+        assert "importée : %s (%s)" % (k["public"].split()[2], k["fingerprint"]) in r.stdout, r.stdout
+    creates = [a for a in w.seen if "create" in a]
+    assert creates, "bw create observé dans /proc (surveillance effective) : %s" % sorted(w.seen)
+    assert all(list(a[-3:]) == ["create", "item", ""] or list(a[-2:]) == ["create", "item"] for a in creates), creates
+    assert not w.suspect, "argument suspect dans /proc/<pid>/cmdline : %s" % w.suspect[:3]
+    for k in files.values():
+        st = os.stat(k["path"])
+        assert (st.st_mtime_ns, st.st_size, st.st_ino) == k["stat"], "fichier d'origine inchangé"
+        with open(k["path"]) as f:
+            assert f.read() == k["private"]
+    assert not [n for n in os.listdir(os.path.join(home["runtime"], "sshvault")) if n.startswith("import.")], \
+        "copie tmpfs supprimée"
+
+    # relecture par un second client bw, après sync
+    assert pop.sync(session).returncode == 0, "sync du lecteur"
+    found = {}
+    for it in json.loads(pop.ok("list", "items", session=session).stdout):
+        for name, k in files.items():
+            if (it.get("sshKey") or {}).get("keyFingerprint") == k["fingerprint"]:
+                found.setdefault(name, []).append(it)
+    assert sorted(found) == ["chiffree", "clair", "pkcs1"] and all(len(v) == 1 for v in found.values()), found.keys()
+    plain = found["clair"][0]
+    assert has_mark(plain) and has_mark(found["chiffree"][0]), "marqueur de nettoyage"
+    assert plain["type"] == 5 and plain["name"] == files["clair"]["public"].split()[2]
+    report.add("import : clé privée relue", note="identique=%s ; identique sans blancs de fin=%s"
+               % (plain["sshKey"]["privateKey"] == files["clair"]["private"],
+                  plain["sshKey"]["privateKey"].rstrip() == files["clair"]["private"].rstrip()))
+    assert plain["sshKey"] == {"privateKey": files["clair"]["private"], "publicKey": files["clair"]["public"],
+                               "keyFingerprint": files["clair"]["fingerprint"]}
+    dec = found["chiffree"][0]["sshKey"]
+    assert dec["publicKey"] == files["chiffree"]["public"]
+    assert dec["keyFingerprint"] == files["chiffree"]["fingerprint"]
+    from sshvault.agent import is_encrypted
+    assert dec["privateKey"].startswith("-----BEGIN OPENSSH PRIVATE KEY-----") and not is_encrypted(
+        dec["privateKey"].encode()), "stockée déchiffrée"
+    y = subprocess.run(["ssh-keygen", "-y", "-f", "/dev/stdin"], input=dec["privateKey"], capture_output=True,
+                       text=True)
+    assert y.returncode == 0 and y.stdout.split()[:2] == files["chiffree"]["public"].split()[:2]
+    assert has_mark(found["pkcs1"][0]), "marqueur de nettoyage"
+    conv = found["pkcs1"][0]["sshKey"]
+    assert files["pkcs1"]["private"].startswith("-----BEGIN RSA PRIVATE KEY-----")
+    assert conv["keyFingerprint"] == files["pkcs1"]["fingerprint"] and conv["publicKey"] == files["pkcs1"]["public"]
+    assert conv["privateKey"].startswith("-----BEGIN OPENSSH PRIVATE KEY-----") and not is_encrypted(
+        conv["privateKey"].encode()), "PKCS#1 convertie au format OpenSSH"
+    y = subprocess.run(["ssh-keygen", "-y", "-f", "/dev/stdin"], input=conv["privateKey"], capture_output=True,
+                       text=True)
+    assert y.returncode == 0 and y.stdout.split()[:2] == files["pkcs1"]["public"].split()[:2], "même clé"
+    for it in (plain, found["chiffree"][0], found["pkcs1"][0]):
+        assert [v for n, v, t in _fields(it) if n == "sshvault-hosts"] == [host]
+
+    # doublon : rien créé
+    r = sv(home, "--nointeraction", "import", files["clair"]["path"], env=env)
+    report.add("sshvault import doublon", r)
+    check(account, r, 1, "import doublon")
+    assert "déjà dans le coffre" in r.stderr and plain["id"] in r.stderr
+
+    # load de la clé importée, ssh -G sur la config régénérée
+    if HAVE_OPENSSH:
+        sock = os.path.join(home["runtime"], "sshvault", "agent.sock")
+        r = sv(home, "--nointeraction", "load", "--id", plain["id"], "-t", "5m")
+        check(account, r, 0, "load de la clé importée")
+        rc, listing = agent_list(sock)
+        assert rc == 0 and [l.split()[1] for l in listing] == [files["clair"]["public"].split()[1]]
+        r = sv(home, "agent", "stop")
+        check(account, r, 0, "agent stop après import")
+    if shutil.which("ssh"):
+        from sshvault.sshconfig import fp_filename
+        cfg = os.path.join(home["env"]["HOME"], ".ssh", "sshvault", "config")
+        main = os.path.join(home["tmp"], "ssh_config_import")
+        with open(main, "w") as f:
+            f.write('Include "%s"\n' % cfg)
+        os.chmod(main, 0o600)
+        g = subprocess.run(["ssh", "-G", "-F", main, host], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=30)
+        conf = [l.split(" ", 1) for l in g.stdout.splitlines()]
+        pubs = os.path.join(home["env"]["HOME"], ".ssh", "sshvault", "pub")
+        assert sorted(v for k, v in conf if k == "identityfile") == sorted(
+            os.path.join(pubs, fp_filename(k["fingerprint"])) for k in files.values())
+        assert [v for k, v in conf if k == "identitiesonly"] == ["yes"]

@@ -1,4 +1,4 @@
-"""Interface d'accès au coffre : la couche qui lit (et plus tard écrit) les éléments
+"""Interface d'accès au coffre : la couche qui lit et écrit les éléments
 « SSH key », derrière un adaptateur interchangeable (aujourd'hui le CLI `bw`).
 
 Rien de propre à un client particulier (bw, rbw…) ne doit sortir de ce module
@@ -201,3 +201,14 @@ class VaultBackend(abc.ABC):
         retiré), sans toucher au reste de l'élément. Renvoie l'élément relu après écriture.
         InvalidHost si un hôte est refusé (rien écrit) ; WriteFailed si l'écriture n'a pas
         abouti ou ne se relit pas (message avec l'état relu)."""
+
+    @abc.abstractmethod
+    def create_ssh_key(self, name: str, private_key: str, public_key: str, fingerprint: str, hosts: Sequence[str],
+                       prompt: Optional[Prompt] = None, existing: Optional[Iterable[str]] = None,
+                       extra_fields: Sequence[tuple] = ()) -> SshKeyItem:
+        """Crée un élément « SSH key » (les trois champs `privateKey`, `publicKey`,
+        `keyFingerprint` ; hôtes validés dans `sshvault-hosts` ; `extra_fields` : champs texte
+        (nom, valeur) en plus), le relit et le compare. Une création n'est pas idempotente :
+        après un échec, l'état du serveur est relu (recherche par empreinte d'un élément absent
+        de `existing`, les ids qui la portaient déjà) avant tout rejeu, sans doublon.
+        Renvoie l'élément relu ; WriteFailed si la création n'aboutit pas ou ne se relit pas."""

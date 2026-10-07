@@ -28,7 +28,7 @@ from typing import Optional
 
 from .backend import (HOSTS_FIELD, BackendError, BackendNotFound, ItemNotFound, NotLoggedIn,
                       PasswordRefused, Prompt, SshKeyItem, VaultBackend, VaultError, VaultLocked, VaultStatus, WriteFailed,
-                      normalize_hosts, parse_hosts)
+                      normalize_fingerprint, normalize_hosts, parse_hosts)
 from .fsutil import ensure_dir
 from .settings import seconds
 from .session import DEFAULT_TTL, SessionStore, SessionStoreError, valid_token
@@ -355,7 +355,7 @@ class BwBackend(VaultBackend):
             raise self._fail(r, "lock")
 
     def sync(self, prompt: Optional[Prompt] = None) -> None:
-        # commandes réseau de sshvault : sync, login et edit (mesuré : status, unlock, lock, list
+        # commandes réseau de sshvault : sync, login, edit et create (mesuré : status, unlock, lock, list
         # et get lisent le cache local, aucune connexion)
         self._with_session(["sync"], "sync", prompt, attempts=2)
 
@@ -487,6 +487,90 @@ class BwBackend(VaultBackend):
             self.warnings.append("hôtes de « %s » : écriture peut-être passée : %s" % (name, check))
             raise
 
+    def create_item(self, item: dict, prompt: Optional[Prompt] = None) -> dict:
+        """`bw create item` avec l'élément encodé (base64 du JSON) sur **stdin**, jamais en
+        argument ; renvoie l'élément créé tel que bw le rend. Appel réseau, sans nouvel essai
+        ici (une création n'est pas idempotente : voir create_ssh_key)."""
+        r = self._with_session(["create", "item"], "create item", prompt,
+                               input=base64.b64encode(json.dumps(item).encode()))
+        d = self._json(r, "create item")
+        if not isinstance(d, dict) or not isinstance(d.get("id"), str) or not d["id"]:
+            raise BackendError("erreur bw : « create item » n'a pas renvoyé d'élément avec un id")
+        return d
+
+    def _list_raw(self, prompt: Optional[Prompt]) -> list:
+        r = self._with_session(["list", "items"], "list items", prompt)
+        data = self._json(r, "list items")
+        del r
+        if not isinstance(data, list):
+            raise BackendError("erreur bw : « list items » n'a pas renvoyé de liste")
+        return data
+
+    def create_ssh_key(self, name: str, private_key: str, public_key: str, fingerprint: str, hosts,
+                       prompt: Optional[Prompt] = None, existing=None, extra_fields=()) -> SshKeyItem:
+        """Crée l'élément, le relit et le compare (trois champs `sshKey` et hôtes).
+
+        Échec ou blocage de `bw create` : `sync`, puis recherche par empreinte d'un élément
+        absent de `existing` (ids qui portaient déjà cette empreinte ; None : lus dans le cache
+        local avant la création). Trouvé : vérifié, succès. Absent : rejeu une seule fois."""
+        want = normalize_hosts(hosts)
+        item = new_ssh_item(name, private_key, public_key, fingerprint, want, extra_fields)
+        if existing is None:
+            existing = [i.id for i in self.list_ssh_keys(prompt) if i.match_fingerprint(fingerprint)]
+        known = set(existing)
+        label = _clean(name)
+        check = "vérifier par « sshvault sync » puis « sshvault search --fingerprint %s »" % fingerprint
+        try:
+            return self._create_checked(item, label, fingerprint, want, known, prompt, check)
+        except BaseException as e:
+            if not isinstance(e, Exception):
+                # interruption (KeyboardInterrupt, Interrupted de la CLI sur SIGTERM/SIGHUP) pendant
+                # bw create ou la relecture : la création a pu passer
+                self.warnings.append("« %s » : création peut-être passée : %s" % (label, check))
+            raise
+
+    def _create_checked(self, item, label, fp, want, known, prompt, check) -> SshKeyItem:
+        for attempt in (1, 2):
+            try:
+                created = self.create_item(item, prompt)
+                failure = None
+            except BackendError as e:  # code d'erreur, réponse illisible, délai dépassé
+                failure = e
+            if failure is None:
+                iid = created["id"]
+                del created
+                try:
+                    after = self.get_item(iid, prompt)
+                except VaultError as e:
+                    raise WriteFailed("« %s » : bw create a réussi (id %s), relecture impossible (%s) : état inconnu, "
+                                      "%s" % (label, iid, e, check)) from None
+                diff = _created_diff(after, item, want)
+                if diff:
+                    raise WriteFailed("« %s » : bw create a réussi (id %s) mais l'élément relu diffère (%s) : "
+                                      "%s" % (label, iid, diff, _delete_hint(iid)))
+                return self._item(after)
+            # Échec ou blocage : la création a pu passer côté serveur. État réel relu (sync,
+            # puis recherche par empreinte) avant tout rejeu, jamais de doublon.
+            what = "« %s » : création en échec (%s)" % (label, failure)
+            try:
+                self._with_session(["sync"], "sync", prompt, attempts=2)
+                found = [d for d in self._list_raw(prompt) if _fp_of(d) == normalize_fingerprint(fp)
+                         and str(d.get("id") or "") not in known]
+            except VaultError as e:
+                raise WriteFailed("%s ; relecture impossible (%s) : état inconnu, %s" % (what, e, check)) from None
+            if len(found) > 1:
+                raise WriteFailed("%s ; %d éléments nouveaux portent cette empreinte (%s) : rien rejoué, %s"
+                                  % (what, len(found), ", ".join(str(d.get("id")) for d in found), check))
+            if found:
+                diff = _created_diff(found[0], item, want)
+                if diff:
+                    raise WriteFailed("%s ; élément créé malgré l'erreur (id %s) mais différent (%s) : rien rejoué ; "
+                                      "%s" % (what, found[0].get("id"), diff, _delete_hint(found[0].get("id"))))
+                return self._item(found[0])  # créé malgré l'erreur : vérifié à la relecture
+            if attempt == 2:
+                raise WriteFailed("%s, deux fois ; état relu : élément absent du coffre" % what)
+        raise AssertionError("inaccessible")
+
     def _write_hosts(self, item_id, name, before, new, want, prompt, check) -> SshKeyItem:
         for attempt in (1, 2):
             try:
@@ -562,6 +646,45 @@ def _others(item: dict) -> tuple:
 
 def _is_written(after: dict, before: dict, want: tuple) -> bool:
     return hosts_of(after) == tuple(want) and _others(after) == _others(before)
+
+
+def new_ssh_item(name: str, private_key: str, public_key: str, fingerprint: str, hosts: tuple,
+                 extra_fields=()) -> dict:
+    """Élément « SSH key » à créer, sur le modèle de `bw get template item` (2026.9.1) :
+    les trois champs `sshKey` remplis ; `sshvault-hosts` s'il y a des hôtes ; champs texte en plus."""
+    fields = []
+    if hosts:
+        fields.append({"name": HOSTS_FIELD, "value": ",".join(hosts), "type": 0, "linkedId": None})
+    fields += [{"name": n, "value": v, "type": 0, "linkedId": None} for n, v in extra_fields]
+    return {"passwordHistory": [], "revisionDate": None, "creationDate": None, "deletedDate": None,
+            "organizationId": None, "collectionIds": None, "folderId": None, "type": SSH_KEY_TYPE,
+            "name": name, "notes": None, "favorite": False, "fields": fields, "login": None,
+            "secureNote": None, "card": None, "identity": None,
+            "sshKey": {"privateKey": private_key, "publicKey": public_key, "keyFingerprint": fingerprint},
+            "reprompt": 0}
+
+
+def _delete_hint(iid) -> str:
+    return ("supprimer l'élément %s (interface web) avant de relancer l'import, sinon il sera vu comme "
+            "doublon (ou relancer avec --force)" % iid)
+
+
+def _fp_of(item) -> Optional[str]:
+    if not isinstance(item, dict) or item.get("type") != SSH_KEY_TYPE or not isinstance(item.get("sshKey"), dict):
+        return None
+    return normalize_fingerprint(str(item["sshKey"].get("keyFingerprint") or ""))
+
+
+def _created_diff(after: dict, item: dict, want: tuple) -> str:
+    """Ce qui diffère entre l'élément relu et celui demandé (les trois champs `sshKey`, hôtes) ;
+    "" si rien. Jamais la valeur d'un champ de clé dans le message."""
+    if after.get("type") != SSH_KEY_TYPE or not isinstance(after.get("sshKey"), dict):
+        return "pas une clé SSH"
+    bad = [k for k in ("privateKey", "publicKey", "keyFingerprint")
+           if (after["sshKey"].get(k) or "") != item["sshKey"][k]]
+    if hosts_of(after) != tuple(want):
+        bad.append("hôtes relus : %s" % _fmt(hosts_of(after)))
+    return ", ".join(bad)
 
 
 def with_hosts(item: dict, hosts: tuple) -> dict:

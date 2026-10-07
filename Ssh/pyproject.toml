@@ -1,6 +1,6 @@
 [project]
 name = "sshvault"
-version = "0.4.0"
+version = "0.5.0"
 description = "Clés SSH dans Vaultwarden, utilisées de façon transparente par ssh"
 readme = "README.md"
 requires-python = ">=3.10"

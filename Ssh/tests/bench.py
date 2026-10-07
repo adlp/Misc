@@ -14,6 +14,7 @@ Le processus pytest rejoint une session keyring anonyme neuve (ce que fait
 sshvault par SSHVAULT_KEYRING. Le `@u` réel n'est jamais utilisé : sans anneau
 dédié, les tests passent SSHVAULT_KEYCTL=/nonexistent (repli fichier).
 """
+import base64
 import ctypes
 import json
 import os
@@ -26,6 +27,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 
@@ -120,10 +122,24 @@ def snapshot(path):
     return out
 
 
+def ancestors():
+    """pids (texte) de pytest et de tous ses ancêtres."""
+    out, pid = set(), os.getpid()
+    while pid > 1:
+        out.add(str(pid))
+        try:
+            with open("/proc/%d/stat" % pid) as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return out
+
+
 def processes_matching(markers):
     """[(pid, ligne de commande)] des processus de l'utilisateur dont la ligne de commande
-    contient l'un des marqueurs (pytest et ses parents exclus)."""
-    me = {os.getpid(), os.getppid()}
+    contient l'un des marqueurs (pytest et tous ses ancêtres exclus : le shell qui a lancé
+    pytest peut contenir un marqueur dans sa ligne de commande, faux positif mesuré)."""
+    me = {int(p) for p in ancestors()}
     out = []
     for d in os.listdir("/proc"):
         if not d.isdigit() or int(d) in me:
@@ -676,3 +692,69 @@ def make_askpass(tmp_path, reply=PASSWORD, rc=0, name="askpass"):
     script.write_text("#!/bin/sh\necho \"$1\" >> '%s'\nprintf '%%s\\n' '%s'\nexit %d\n" % (calls, reply, rc))
     script.chmod(0o755)
     return str(script), calls
+
+
+# --- surveillance de /proc/<pid>/cmdline -------------------------------------------------------
+
+_B64ISH = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
+
+
+def b64_fragments(text):
+    """Fragments du base64 de `text` sous les trois alignements possibles dans un JSON encodé."""
+    out = []
+    for shift in range(3):
+        enc = base64.b64encode(("x" * shift + text).encode()).decode()
+        out.append(enc[8:48])
+    return out
+
+
+class ArgvWatch:
+    """Relève, pendant un appel, la ligne de commande (/proc/<pid>/cmdline) de chaque processus
+    de l'utilisateur ; garde celles qui contiennent `needle` et signale tout argument suspect :
+    clé privée ou son base64 (tout processus) ; pour bw et sshvault, tout argument (hors argv[0])
+    de plus de 80 caractères, d'allure base64, ou contenant « { » (`heuristics` faux : seulement
+    la clé et les `secrets`, pour les bancs dont les chemins ressemblent à du base64)."""
+
+    def __init__(self, needle, secrets, heuristics=True):
+        self.needle, self.secrets, self.heuristics = needle, [s for s in secrets if s], heuristics
+        self.seen, self.suspect = set(), []
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+        # ancêtres de pytest (shell qui l'a lancé, dont la ligne de commande peut contenir
+        # n'importe quoi) : hors du relevé (faux positif mesuré)
+        self.ancestors = ancestors()
+
+    def _run(self):
+        me = os.getuid()
+        while not self._stop.is_set():
+            for d in os.listdir("/proc"):
+                if not d.isdigit() or d in self.ancestors:
+                    continue
+                try:
+                    if os.stat("/proc/" + d).st_uid != me:
+                        continue
+                    with open("/proc/%s/cmdline" % d, "rb") as f:
+                        argv = f.read().decode(errors="replace").split("\0")
+                except OSError:
+                    continue
+                # bw, ou sshvault (exécutable ou `python -m sshvault…`) ; « un argument contient
+                # sshvault » attrapait aussi le shell qui lance pytest (faux positif mesuré)
+                related = (any(self.needle in a for a in argv)
+                           or os.path.basename(argv[0]) in ("bw", "sshvault")
+                           or any(argv[i] == "-m" and argv[i + 1].startswith("sshvault")
+                                  for i in range(len(argv) - 1)))
+                if any(self.needle in a for a in argv):
+                    self.seen.add(tuple(argv))
+                for n, a in enumerate(argv):
+                    if "PRIVATE KEY" in a or any(s in a for s in self.secrets) or (
+                            self.heuristics and related and n > 0 and ("{" in a or len(a) > 80 or _B64ISH.search(a))):
+                        self.suspect.append([x[:60] for x in argv])
+            time.sleep(0.002)
+
+    def __enter__(self):
+        self._t.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._t.join(timeout=10)

@@ -18,7 +18,10 @@ Faits reproduits (vrai bw 2026.9.1, lus dans le source embarqué du binaire et m
     2026.9.1) ; champs repris comme `CipherExport.toView` (name, notes, favorite, reprompt,
     folderId ; `fields` et `passwordHistory` seulement s'ils ne sont pas null ; sshKey) ;
     `revisionDate` de la requête différente de celle du serveur : « The client copy of this
-    cipher is out of date. Resync the client and try again. » ; l'élément modifié est rendu.
+    cipher is out of date. Resync the client and try again. » ; l'élément modifié est rendu ;
+  - `create item [encodedJson]` : même encodage, argument ou stdin ; type 5 : les trois champs
+    `sshKey` exigés (SshKeyExport.toView : « SSH key private key is required. »…) ; nouvel id ;
+    l'élément créé est rendu.
 Mesuré sur le vrai bw contre le compte de test (2026-10-07) : mauvais mot de passe à
 `unlock` (journaux « ERROR … » du SDK puis « Cryptography error, The decryption operation
 failed », code 1), « Vault is locked. » sans session et avec une session invalide,
@@ -30,9 +33,13 @@ Le « serveur » est un fichier JSON désigné par FAKE_BW_VAULT :
 Pannes simulées : FAKE_BW_FAIL="<commande>=<mode>[,…]" ; mode : badjson (JSON
 invalide, code 0), error (code 1, « Unexpected error. »), hang (bloqué, avec un
 enfant `sleep` ; pids écrits dans FAKE_BW_PIDS), hangonce (seul le premier appel bloque), hangnoecho
-(écho du terminal coupé, puis bloqué), hangafter (edit : écrit, puis bloqué : la réponse se
-perd), errorafter (edit : écrit, puis code 1), errorsecond (premier appel normal, les
-suivants en erreur), silent (edit : code 0 sans rien écrire), erroronce (seul le premier appel en erreur).
+(écho du terminal coupé, puis bloqué), hangafter (edit, create : écrit, puis bloqué : la réponse
+se perd), errorafter (edit, create : écrit, puis code 1), errorsecond (premier appel normal, les
+suivants en erreur), silent (edit, create : code 0 sans rien écrire), erroronce (seul le premier
+appel en erreur), badjsonafter (create : créé, puis réponse illisible), corrupt (create :
+enregistré sans la fin de ligne finale de la clé privée), corruptafter (create : enregistré
+altéré, puis code 1), duperror (create : deux éléments enregistrés, puis code 1), hangsecond
+(premier appel normal, les suivants bloqués).
 FAKE_BW_EDIT_RACE=<champ>=<valeur> : à l'edit, le « serveur » change d'abord ce champ de
 l'élément (autre client) puis traite la requête.
 FAKE_BW_DELAY=<secondes> : chaque appel attend d'abord ce délai (coût mesuré d'un vrai bw :
@@ -47,6 +54,7 @@ import secrets
 import subprocess
 import sys
 import time
+import uuid
 
 USAGE_ERR = 1
 
@@ -125,7 +133,7 @@ def simulate(mode):
         sys.exit(0)
     if mode == "error":
         fail("Unexpected error.")
-    if mode in ("hangafter", "errorafter", "silent"):
+    if mode in ("hangafter", "errorafter", "silent", "badjsonafter", "corrupt", "corruptafter", "duperror"):
         return  # traité par la commande
     if mode == "errorsecond":  # premier appel normal, les suivants en erreur
         flag = (os.environ.get("FAKE_BW_PIDS") or "/nonexistent") + ".errsecond." + (sys.argv[1:] or ["?"])[-1]
@@ -133,6 +141,12 @@ def simulate(mode):
             open(flag, "w").close()
             return
         fail("Unexpected error.")
+    if mode == "hangsecond":  # premier appel normal, les suivants bloqués
+        flag = (os.environ.get("FAKE_BW_PIDS") or "/nonexistent") + ".hangsecond"
+        if not os.path.exists(flag):
+            open(flag, "w").close()
+            return
+        mode = "hang"
     if mode == "erroronce":
         flag = (os.environ.get("FAKE_BW_PIDS") or "/nonexistent") + ".erronce"
         if os.path.exists(flag):
@@ -182,6 +196,7 @@ CMD_FLAGS = {
                        "--key-connector"}),
     "status": (set(), set()), "lock": (set(), set()), "logout": (set(), set()),
     "edit": (set(), {"--organizationid"}),
+    "create": (set(), {"--file", "--itemid", "--organizationid"}),
 }
 
 
@@ -454,7 +469,54 @@ def cmd_edit(ctx, pos):
     ctx.json(item)
 
 
-CMDS = {"edit": cmd_edit, "status": cmd_status, "config": cmd_config, "login": cmd_login, "logout": cmd_logout,
+def cmd_create(ctx, pos):
+    if pos[:1] != ["item"]:
+        fail("Unknown object.")
+    ctx.need_unlocked()
+    enc = pos[1] if len(pos) > 1 else sys.stdin.read()
+    try:
+        req = json.loads(base64.b64decode(enc.strip(), validate=True).decode())
+    except ValueError:
+        fail("Error parsing the encoded request data.")
+    if req.get("type") == 5:
+        # SshKeyExport.toView (bw 2026.9.1)
+        key = req.get("sshKey") or {}
+        if not (key.get("privateKey") or "").strip():
+            fail("SSH key private key is required.")
+        if not (key.get("publicKey") or "").strip():
+            fail("SSH key public key is required.")
+        if not (key.get("keyFingerprint") or "").strip():
+            fail("SSH key fingerprint is required.")
+    now = now_iso()
+    item = {"passwordHistory": None, "revisionDate": now, "creationDate": now, "deletedDate": None,
+            "archivedDate": None, "object": "item", "id": str(uuid.uuid4()), "organizationId": None,
+            "folderId": req.get("folderId"), "type": req.get("type"), "reprompt": req.get("reprompt") or 0,
+            "name": req.get("name"), "notes": req.get("notes"), "favorite": bool(req.get("favorite")),
+            "fields": req.get("fields") if req.get("fields") else None, "collectionIds": []}
+    if req.get("type") == 5:
+        item["sshKey"] = dict(req["sshKey"])
+    mode = injected("create")
+    if mode == "silent":  # réponse de succès, rien enregistré
+        ctx.json(item)
+        return
+    if mode in ("corrupt", "corruptafter") and isinstance(item.get("sshKey"), dict):  # enregistré altéré
+        item["sshKey"]["privateKey"] = (item["sshKey"].get("privateKey") or "").rstrip("\n")
+    v = vault()
+    v["items"].append(item)
+    if mode == "duperror":  # deux éléments enregistrés (requête rejouée côté serveur ?), puis erreur
+        v["items"].append(dict(item, id=str(uuid.uuid4())))
+    save_vault(v)
+    if mode in ("corruptafter", "duperror"):
+        simulate("error")
+    if mode in ("hangafter", "errorafter"):
+        simulate("hang" if mode == "hangafter" else "error")
+    if mode == "badjsonafter":
+        out("<html>502 Bad Gateway</html>")
+        return
+    ctx.json(item)
+
+
+CMDS = {"create": cmd_create, "edit": cmd_edit, "status": cmd_status, "config": cmd_config, "login": cmd_login, "logout": cmd_logout,
         "unlock": cmd_unlock, "lock": cmd_lock, "sync": cmd_sync, "list": cmd_list, "get": cmd_get}
 
 
