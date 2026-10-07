@@ -2696,8 +2696,11 @@ Client qui abandonne un téléchargement : borg arrêté aussitôt (avant : rest
 d'une seconde (mesuré ; avant : 28 s à plus de 90 s, jusqu'à l'arrêt du serveur). borg est arrêté par SIGTERM — il rend lui-même
 son verrou de dépôt — puis SIGKILL 5 s après s'il vit encore (borg figé : son entrée de `lock.roster` reste, retirée par le
 prochain borg de la même machine). « Moins d'une seconde » vaut pour l'abandon par le client : arrêté par le chien de garde
-(client qui ne lit plus) ou au premier signal d'arrêt, un borg bloqué en écriture ne traite pas SIGTERM et finit au SIGKILL
-5 s après — son entrée de `lock.roster` reste alors, retirée de la même façon.
+(client qui ne lit plus) ou au premier signal d'arrêt, un borg bloqué en écriture rend son verrou dès le SIGTERM (entrée de
+`lock.roster` retirée dans les 0,1 s) mais reste bloqué en écriture jusqu'au SIGKILL 5 s après (1.31.7, mesuré sur dépôt local,
+`export-tar`, deux piles ; 1.31.6 disait à tort l'entrée laissée). Une entrée reste après un SIGKILL immédiat — arrêt forcé
+(second signal), `atexit`, fin du lifespan (uvicorn externe compris) — et pour un borg figé. Premier signal avec un client qui
+ne lit plus : borg arrêté au délai, mais le serveur attend la connexion jusqu'au second signal (mesuré).
 
 **Inactivité bornée (1.31.0)** : aucun octet lu sur la sortie de borg pendant `BORGHELPERWWW_TIMEOUT` secondes (défaut 3600 ;
 0 = aucune limite) — borg muet, client parti avant le premier octet, client qui ne lit plus — -> borg arrêté, `[ERREUR]` au

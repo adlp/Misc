@@ -75,7 +75,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.31.6"
+WWW_VERSION="1.31.7"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -2813,7 +2813,10 @@ def _borg_stream(request,cmd,env,what,decoy=None,path=None,missing=None):
             if proc.poll() is None:
                 if lim and time.monotonic()-st['last']>=lim:
                     _borg_killgrp(proc,st,why)
-                    proc.wait()   # corps jamais lu : personne d'autre ne l'attendra
+                    # corps jamais lu : personne d'autre ne l'attendra. Pas de vidage ici (le corps peut encore lire : une fin
+                    # volée passerait pour complète) — borg bloqué en écriture y rend son verrou au SIGTERM et attend le SIGKILL
+                    # du délai (story 62, mesuré ; décision de l'utilisateur : inchangé)
+                    proc.wait()
                     if _borg_killed(proc,st) and st['why']=='idle':   # vraiment tué ici (pas sorti seul entre-temps ; 143 : SIGTERM traité)
                         print(f"[ERREUR] {what} : aucune activité depuis {lim} s (borg muet ou téléchargement plus lu) — borg arrêté",
                               file=sys.stderr,flush=True)
@@ -2853,8 +2856,10 @@ def _borg_stream(request,cmd,env,what,decoy=None,path=None,missing=None):
     def stop():
         # 1.31.6 (story 60) : SIGTERM puis SIGKILL au délai — attente et récolte d'un borg encore vivant dans un fil : stop() est
         # appelé par la fermeture du corps, dans la boucle d'événements (jamais une requête bloquée pendant le délai). Sortie de
-        # borg vidée jusqu'à sa fin : bloqué en écriture sur un tube plein (client parti), borg ne traite pas SIGTERM (mesuré :
-        # arrêté par le SIGKILL du délai, 5 s) ; vidage borné (délai + 5 s : un descendant hors du groupe garderait le tube).
+        # borg vidée jusqu'à sa fin : bloqué en écriture sur un tube plein (client parti), borg rend son verrou au SIGTERM
+        # (entrée de lock.roster retirée) mais reste bloqué en écriture (pipe_write) jusqu'au SIGKILL du délai, 5 s (story 62,
+        # mesuré : « ne traite pas SIGTERM » était faux) ; vidé, il sort en 143 en 0,1 s (story 60, mesure60-f2/f5). Vidage
+        # borné (délai + 5 s : un descendant hors du groupe garderait le tube).
         # État passé : _MEI* relevés avant le signal (sans lui, jamais relevés — mesuré, témoin de la baseline : un dossier
         # _MEI* de 57 Mo laissé dans /tmp par abandon tué par SIGKILL)
         _borg_killgrp(proc,st)
@@ -5242,13 +5247,14 @@ def push_selftest():
                 check("/download/* : bout en bout par l'application — échec en cours d'envoi = pas de fin de transfert, succès = fin envoyée (A83)",_download_abort_e2e)
                 def _download_client_gone_e2e():
                     """1.31.6 (story 60 ; mesuré sur serveur réel : borg arrêté 28 s, 58 s après l'abandon, ou jamais avant l'arrêt du
-                    serveur — le corps, annulé pendant un envoi dans la tâche interne du middleware, attendait le ramasse-miettes) : bout
-                    en bout par la VRAIE application (middleware, route, _borg_stream). Corps RETENU pendant le cas (revue : sinon libéré
-                    par comptage de références et fermé aussitôt — le contrôle passait sur le code d'avant ; sur le serveur, retenu
-                    28-58 s) et ramasse-miettes coupé : seule une fermeture explicite arrête borg. Borg factice qui écrit sans fin et,
-                    comme borg, traite SIGTERM en Python (sortie 143) — bloqué en écriture sur un tube plein, il ne le traite qu'une fois
-                    sa sortie vidée (mesuré : sinon SIGKILL au délai, mis ici à 10 s). Envois après le départ ignorés, comme uvicorn 0.15
-                    et 0.54 (revue : un envoi bloqué sans fin n'existe pas). (a) envoi bloqué (socket pleine) puis http.disconnect ; (f) comme (a) par /download/file ; (b) ASGI 2.4 : l'envoi lève OSError après le départ du client ;
+                    serveur — le corps, annulé pendant un envoi dans la tâche interne du middleware, attendait le ramasse-miettes) :
+                    bout en bout par la VRAIE application (middleware, route, _borg_stream). Corps RETENU pendant le cas (revue : sinon
+                    libéré par comptage de références et fermé aussitôt — le contrôle passait sur le code d'avant ; sur le serveur,
+                    retenu 28-58 s) et ramasse-miettes coupé : seule une fermeture explicite arrête borg. Borg factice qui écrit sans
+                    fin et, comme borg, traite SIGTERM en Python (sortie 143) — bloqué en écriture sur un tube plein, il le reste tant
+                    que sa sortie n'est pas vidée (mesuré : sinon SIGKILL au délai, mis ici à 10 s). Envois après le départ ignorés,
+                    comme uvicorn 0.15 et 0.54 (revue : un envoi bloqué sans fin n'existe pas). (a) envoi bloqué (socket pleine) puis
+                    http.disconnect ; (f) comme (a) par /download/file ; (b) ASGI 2.4 : l'envoi lève OSError après le départ du client ;
                     (c) borg qui se tait après 600 Ko (lecture en cours dans un fil ; mesuré : sous 3.14, départ jamais traité tant que
                     borg n'écrivait pas) ; (p) client parti avant le premier envoi du corps. Chaque cas : application finie avant 10 s
                     (revue : un dépassement avalé, puis borg sorti de lui-même, passait), borg mort moins de 2 s après le départ du

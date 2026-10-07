@@ -1,5 +1,20 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.31.7 — Borg bloqué en écriture : il rend son verrou au SIGTERM — 2026-10-07
+
+Chantier « reconstruction progressive », story 62 (rétrospective 57-60, A117 ; décision de l'utilisateur : documentation
+seule). Le report A117 et la doc de 1.31.6 disaient qu'un borg bloqué en écriture (client qui ne lit plus), arrêté par le chien
+de garde ou le premier signal d'arrêt, « ne traite pas SIGTERM » et laisse son entrée de `lock.roster`. Mesuré faux
+(`work/m62/mesure62-o.log`, chronologies `roster62.out` et `roster62b.out` : chien de garde et premier signal, deux piles,
+`--timeout 4`, dépôt local, `export-tar`) : au SIGTERM, borg retire son entrée dans les 0,1 s (verrou rendu) puis reste bloqué
+en écriture (`pipe_write`) jusqu'au SIGKILL du délai (5 s ; `_MEI*` retirés, `[ERREUR]` du chien de garde au journal). La
+mesure de la story 60 le montrait déjà (`mesure60-f.log` : borg mort à 5,0 s, aucune entrée) — la conclusion avait été tirée du
+seul délai de mort. Une entrée reste après un SIGKILL immédiat (arrêt forcé, `atexit`, fin du lifespan : décision de la story
+60 maintenue) et pour un borg figé.
+
+- README, TECHNICAL, commentaire de `stop()` et docstring du contrôle bout en bout corrigés ; phrase de 1.31.6 marquée.
+- Aucun changement de comportement.
+
 ## borgHelperWWW 1.31.6 — Téléchargement abandonné : borg arrêté aussitôt — 2026-10-07
 
 Chantier « reconstruction progressive », story 60 (constat de la story 57 ; décision de l'utilisateur). Avant : un client qui
@@ -16,7 +31,8 @@ attendait le ramasse-miettes.
   serveur. Arrêt forcé (second signal), `atexit`, fin du lifespan : SIGKILL immédiat, comme avant. Avant : SIGKILL toujours —
   entrée périmée laissée dans `lock.roster`.
 - Client parti : sortie de borg vidée pendant l'arrêt (mesuré : bloqué en écriture sur un tube plein, borg ne traitait pas
-  SIGTERM et finissait au SIGKILL du délai) ; attente et récolte dans un fil (la boucle d'événements n'attend plus borg).
+  SIGTERM et finissait au SIGKILL du délai [corrigé en 1.31.7 : il traite SIGTERM et rend son verrou ; c'est sa sortie à la
+  fermeture qui reste bloquée jusqu'au SIGKILL]) ; attente et récolte dans un fil (la boucle d'événements n'attend plus borg).
 - Lectures du corps annulables (`run_in_executor`, exécuteur dédié de 40 fils comme le limiteur d'anyio ; `run_in_threadpool`
   attendait la fin du fil même annulé) : un client parti pendant que borg se tait est traité aussitôt (mesuré : borg gelé, départ
   jamais traité en 90 s sous 3.14).
