@@ -1,0 +1,43 @@
+# Configuration de ovpnMgmt : copier dans ~/.config/ovpnMgmt/ovpnMgmt.conf (chmod 600)
+# ou indiquer un autre fichier par -c / $OVPNMGMT_CONF.
+#
+# Commentaires sur leur propre ligne seulement : un ';' ou un '#' en fin de ligne
+# ferait partie de la valeur (un mot de passe peut en contenir).
+
+[ovpnMgmt]
+# Serveur utilisé sans -s
+default = paris
+
+# Côté OpenVPN, dans la configuration du serveur :
+#   management 127.0.0.1 7505 /etc/openvpn/server/management.pass
+# (fichier : le mot de passe sur la première ligne ; sans fichier, pas de mot de passe)
+
+[paris]
+description = VPN Paris (production)
+# Destination ssh : user@hote, ou un Host de ~/.ssh/config (ProxyJump, clef... y sont pris en compte)
+ssh = admin@vpn-paris.example.com
+# Options ssh en plus, au besoin
+ssh_options = -p 2222
+# Port de management, vu depuis la machine ssh (ssh -W, rien à installer sur le serveur)
+management = 127.0.0.1:7505
+# Mot de passe du management (première ligne du fichier)
+password_file = ~/.config/ovpnMgmt/paris.pass
+
+[lyon]
+description = VPN Lyon, management en socket unix
+ssh = root@vpn-lyon.example.com
+# ssh -W ne sait pas joindre un socket unix : une commande sur le serveur relie stdin/stdout au socket
+command = socat - UNIX-CONNECT:/run/openvpn-server/server.sock
+
+[labo]
+description = VPN du labo, joint par un bastion
+ssh = vpn-labo
+ssh_options = -J bastion.example.com
+management = 127.0.0.1:7505
+# Réponses lentes (liaison satellite...) : délai en secondes, 15 par défaut
+timeout = 30
+
+[local]
+description = Serveur OpenVPN de cette machine
+# Sans ssh : connexion directe, TCP (hote:port) ou socket unix (/chemin)
+management = /run/openvpn-server/server.sock

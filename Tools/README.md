@@ -6,6 +6,7 @@ Petits outils d'administration indépendants, sous licence GPL v3.
 |---|---|---|---|
 | `checkssl` | bash | 1.5 | État d'un certificat TLS (serveur ou fichier) et jours restants avant expiration |
 | `cronMutt` | Python 3 | 0.24.2 | Lance une commande (ou lit un pipe) et envoie sa sortie par mail (mutt) et/ou sur Nextcloud, selon le résultat |
+| `ovpnMgmt` | Python 3 | 1.0 | Pilote un serveur OpenVPN par son management, en direct ou via ssh : connexions, coupure, log, signaux |
 | `sleepUntil` | bash | 1.1 | Comme `at`, mais bloquant : attend une heure donnée puis lance une commande |
 | `whosshkey` | bash | 1.4 | Comme `last`, avec en plus la clef SSH utilisée pour chaque connexion |
 
@@ -117,6 +118,57 @@ df -h | cronMutt -s "disques" -d admin@example.com
 ```
 
 Dépendances : Python ≥ 3.6, `requests`, `mutt` configuré pour envoyer.
+
+## ovpnMgmt
+
+```bash
+ovpnMgmt [-c conf] [-s serveur] [-D] [COMMANDE ...]     # sans commande : list
+```
+
+Pilote un serveur OpenVPN par son interface de management, en direct ou au travers de ssh. Python ≥ 3.8, sans
+dépendance ; `ssh` pour les serveurs distants.
+
+### Configuration
+
+Fichier INI, `~/.config/ovpnMgmt/ovpnMgmt.conf` par défaut (`$OVPNMGMT_CONF` ou `-c` pour un autre), `chmod 600`.
+Modèle commenté : `ovpnMgmt.conf.example`. La section `[ovpnMgmt]` donne le serveur par défaut (`default = nom`) ;
+chaque autre section est un serveur, choisi par `-s nom`.
+
+| Clef | Rôle | Défaut |
+|---|---|---|
+| `description` | Texte affiché par `servers` | — |
+| `ssh` | Destination ssh (`user@hôte` ou `Host` de `~/.ssh/config`) ; absente = connexion directe | — |
+| `ssh_options` | Options ssh en plus (`-p 2222 -J bastion`) | — |
+| `management` | `hôte:port` ou `/chemin/socket` du management, vu depuis la machine ssh | `127.0.0.1:7505` |
+| `command` | Commande reliant stdin/stdout au management, lancée sur la machine ssh (ou en local) : pour un socket unix via ssh (`socat - UNIX-CONNECT:/run/…sock`) | — |
+| `password_file` | Fichier dont la première ligne est le mot de passe du management | — |
+| `password` | Mot de passe en clair (préférer `password_file`) | — |
+| `timeout` | Délai de réponse, en secondes | 15 |
+
+Via ssh avec `management = hôte:port`, ovpnMgmt lance `ssh -W hôte:port` : rien à installer sur le serveur, mais
+`AllowTcpForwarding` ne doit pas y être à `no`. Côté OpenVPN : `management 127.0.0.1 7505 /chemin/mot-de-passe`
+(jamais sur une adresse publique : le management donne la main sur le serveur). Un mot de passe lisible par d'autres
+comptes est signalé.
+
+### Commandes
+
+| Commande | Rôle |
+|---|---|
+| `list [filtre]` | Connexions actives : nom, adresse réelle, IP VPN, connecté depuis, durée, reçu, envoyé, CID. `--sort cn\|real\|virtual\|since\|rx\|tx`, `-r`, `-l` (utilisateur, IPv6, chiffrement, peer ID), `--json`, `-w SEC` (rafraîchi, avec le débit) |
+| `kill CIBLE… [--cid N] [--halt] [-y]` | Coupe des connexions : nom, IP ou IP:port réelle, IP VPN, ou CID. `RESTART` par défaut (le client se reconnecte, comme `kill` d'OpenVPN), `--halt` lui demande de s'arrêter. Confirmation au-delà d'une connexion. « Coupée » n'est affiché qu'une fois la connexion sortie de la liste (OpenVPN la ferme quelques secondes après) |
+| `info [--json]` | Version, PID, verbosité, mute, hold, nombre de clients, octets cumulés, état |
+| `log [N\|all] [-f]` | Dernières lignes du log du serveur (20 par défaut), `-f` pour suivre |
+| `verb [N]`, `mute [N]` | Affiche ou change la verbosité / la limite de répétition du log |
+| `signal SIGHUP\|SIGTERM\|SIGUSR1\|SIGUSR2 [-y]` | Signal au démon, effet rappelé et confirmation (sauf `SIGUSR2`) |
+| `hold [on\|off\|release]` | État d'attente au démarrage (`management-hold`) |
+| `raw COMMANDE…` | Commandes brutes du management (`raw "status 3" load-stats`) |
+| `shell` | Session interactive (`help` liste les commandes du serveur) |
+| `servers` | Serveurs de la configuration, `*` = défaut |
+
+Reçu / envoyé sont vus du serveur : reçu du client, envoyé au client. OpenVPN ne sert **qu'une session de management à
+la fois** : pendant un `list -w`, `log -f` ou `shell` (ou un outil de supervision branché dessus), les autres appels
+attendent ; ovpnMgmt le signale après le délai. Code retour : `0`, `1` en cas d'erreur (connexion, commande refusée,
+cible introuvable, abandon), `130` sur Ctrl-C.
 
 ## sleepUntil
 

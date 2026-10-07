@@ -111,6 +111,9 @@ Script bash pour vérifier l'état d'un certificat SSL.
 ### cronMutt
 Script Python pour gérer la sortie d'une commande cron — envoi conditionnel par mail (mutt), push Nextcloud, etc.
 
+### ovpnMgmt
+Script Python pour piloter un serveur OpenVPN par son interface de management (en direct ou via ssh) : connexions actives, coupure, log, signaux.
+
 ### sleepUntil
 Script bash similaire à `at` mais bloquant : suspend le processus jusqu'à une heure précise, utilisable dans un script.
 

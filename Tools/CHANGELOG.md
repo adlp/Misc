@@ -1,5 +1,23 @@
 # Changelog — Tools
 
+## ovpnMgmt 1.0 — pilotage d'OpenVPN par son management — 2026-10-07
+
+Nouvel outil, Python sans dépendance.
+
+- **Connexion** : directe (TCP, socket unix), par `ssh -W hôte:port` (rien à installer sur le serveur) ou par une
+  commande lancée via ssh (socket unix : `socat - UNIX-CONNECT:…`). Mot de passe du management (`password_file`),
+  y compris le cas « mot de passe faux » où OpenVPN repose la question sans `ERROR`. Erreurs de ssh citées.
+- **Configuration INI** : un serveur par section, serveur par défaut dans `[ovpnMgmt]`, `-s` pour un autre ;
+  modèle `ovpnMgmt.conf.example`.
+- **Commandes** : `list` (durée, octets, `--sort`, `--long`, `--json`, `--watch` avec débit), `kill` (nom, adresse,
+  IP VPN, CID ; RESTART ou `--halt` ; confirmation au-delà d'une connexion ; attend la fermeture effective), `info`,
+  `log` (`-f`), `verb`, `mute`, `signal` (confirmation), `hold`, `raw`, `shell`, `servers`.
+- Session de management déjà occupée (OpenVPN n'en sert qu'une) : message explicite au lieu d'un simple délai.
+- Testé contre OpenVPN 2.5.11 réel (deux serveurs, trois clients, dans un espace de noms réseau sans root) : en
+  direct TCP avec mot de passe, socket unix direct, `ssh -W` et commande via ssh (faux `ssh` reproduisant OpenSSH),
+  commande locale ; kill RESTART / HALT / par IP avec et sans confirmation ; erreurs (mot de passe absent ou faux,
+  port fermé, ssh injoignable, serveur muet, serveur inconnu).
+
 ## checkssl 1.5 — IP du serveur interrogé — 2026-10-05
 
 - Ligne `Serveur interrogé : <IP> port <N>` pour un serveur : l'adresse qui a réellement fourni le certificat.

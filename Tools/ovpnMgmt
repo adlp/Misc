@@ -1,0 +1,1033 @@
+#!/usr/bin/env python3
+
+#/*
+#* ovpnMgmt manage an OpenVPN server through its management interface, directly or over ssh
+#* Copyright (C) 2026 Antoine DELAPORTE
+#*
+#* This program is free software: you can redistribute it and/or modify
+#* it under the terms of the GNU General Public License as published by
+#* the Free Software Foundation, either version 3 of the License, or
+#* (at your option) any later version.
+#*
+#* This program is distributed in the hope that it will be useful,
+#* but WITHOUT ANY WARRANTY; without even the implied warranty of
+#* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#* GNU General Public License for more details.
+#*
+#* You should have received a copy of the GNU General Public License
+#* along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#*/
+
+"""ovpnMgmt : pilote un serveur OpenVPN par son interface de management.
+
+La connexion se fait en direct (TCP ou socket unix) ou au travers de ssh :
+  * "ssh -W hote:port" relie notre stdin/stdout au port de management vu
+    depuis la machine ssh (rien à installer sur le serveur) ;
+  * ou une commande lancée sur la machine ssh (ex. "sudo socat -
+    UNIX-CONNECT:/run/openvpn/server.sock") pour un socket unix.
+
+Les serveurs sont décrits dans un fichier INI (voir ovpnMgmt.conf.example),
+avec un serveur par défaut ; -s en choisit un autre.
+
+Actions : list (connexions, durée, octets, débit en --watch), kill (par
+nom, adresse, IP VPN ou CID, RESTART ou HALT), info, log (--follow),
+verb, mute, signal, hold, raw (commande brute) et shell (interactif).
+"""
+
+import argparse
+import configparser
+import json
+import os
+import re
+import select
+import shlex
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+Version="1.0"
+# 1.0 version initiale : list (--watch, --json, --long), kill (CN / adresse / IP VPN / CID, --halt), info, log
+#     (--follow), verb, mute, signal, hold, raw, shell ; connexion directe (TCP, unix), ssh -W ou commande via ssh
+
+DEFAULT_CONFIG="~/.config/ovpnMgmt/ovpnMgmt.conf"
+DEFAULT_MANAGEMENT="127.0.0.1:7505"
+DEFAULT_TIMEOUT=15
+
+
+class ManagementError(Exception):
+    """Erreur de connexion ou de dialogue avec l'interface de management."""
+
+
+class ManagementTimeout(ManagementError):
+    """Le management n'a rien envoyé dans le délai imparti."""
+
+
+################################################################################
+# Configuration
+################################################################################
+
+class Server:
+    """Un serveur OpenVPN décrit par une section du fichier de configuration.
+
+    Clefs reconnues :
+      description   : texte libre, affiché par "servers"
+      ssh           : destination ssh (user@hote, ou un Host de ~/.ssh/config) ;
+                      absente = connexion directe depuis cette machine
+      ssh_options   : options ssh supplémentaires (ex. "-p 2222 -J bastion")
+      management    : "hote:port" ou "/chemin/socket" du management, vu depuis
+                      la machine ssh (défaut 127.0.0.1:7505)
+      command       : commande reliant stdin/stdout au management, lancée sur
+                      la machine ssh (ou en local sans ssh) ; remplace management
+      password_file : fichier contenant le mot de passe du management
+      password      : mot de passe en clair (préférer password_file)
+      timeout       : délai de réponse en secondes (défaut 15)
+    """
+
+    def __init__(self, name, section, configPath):
+        self.name=name
+        self.description=section.get('description','')
+        self.ssh=section.get('ssh','').strip() or None
+        self.sshOptions=shlex.split(section.get('ssh_options',''))
+        self.command=section.get('command','').strip() or None
+        self.timeout=self._number(section.get('timeout',str(DEFAULT_TIMEOUT)),'timeout')
+        self.password=self._readPassword(section,configPath)
+        management=section.get('management',DEFAULT_MANAGEMENT).strip()
+        self.socketPath=None
+        self.host=None
+        self.port=None
+        if management.startswith('/'):
+            self.socketPath=management
+            if self.ssh and not self.command:
+                raise ManagementError(f"[{name}] management en socket unix via ssh : ssh -W ne sait pas l'atteindre, "
+                                      f"ajouter par exemple : command = sudo socat - UNIX-CONNECT:{management}")
+        else:
+            # "hote:port", IPv6 entre crochets : [::1]:7505
+            match=re.fullmatch(r'\[?([^\[\]]+?)\]?:(\d+)',management)
+            if not match:
+                raise ManagementError(f"[{name}] management invalide : « {management} » (attendu hote:port ou /chemin/socket)")
+            self.host,self.port=match.group(1),int(match.group(2))
+
+    def _number(self, value, key):
+        """Valeur numérique positive d'une clef, sinon erreur explicite."""
+        try:
+            number=float(value)
+        except ValueError:
+            number=-1
+        if number <= 0:
+            raise ManagementError(f"[{self.name}] {key} invalide : « {value} » (nombre de secondes attendu)")
+        return(number)
+
+    def _readPassword(self, section, configPath):
+        """Mot de passe du management : password_file d'abord, sinon password.
+
+        Un mot de passe en clair dans un fichier lisible par d'autres comptes
+        est signalé sur stderr (il donne la main sur le serveur VPN).
+        """
+        passwordFile=section.get('password_file','').strip()
+        if passwordFile:
+            passwordFile=os.path.expanduser(passwordFile)
+            try:
+                with open(passwordFile,encoding='utf-8') as handle:
+                    password=handle.readline().rstrip('\r\n')
+            except OSError as err:
+                raise ManagementError(f"[{self.name}] password_file illisible : {err}")
+            warnIfReadableByOthers(passwordFile)
+            return(password)
+        password=section.get('password')
+        if password is not None:
+            warnIfReadableByOthers(configPath)
+        return(password)
+
+    def transport(self):
+        """Description courte de la connexion, pour "servers" et les erreurs."""
+        target=self.socketPath or f"{self.host}:{self.port}"
+        if self.command:
+            target=f"commande « {self.command} »"
+        if self.ssh:
+            return(f"ssh {self.ssh} → {target}")
+        return(f"direct → {target}")
+
+
+def warnIfReadableByOthers(path):
+    """Avertit sur stderr si un fichier contenant un secret est lisible par le groupe ou les autres."""
+    try:
+        mode=os.stat(path).st_mode
+    except OSError:
+        return
+    if mode & (stat.S_IRGRP | stat.S_IROTH):
+        print(f"ovpnMgmt: attention, {path} contient un mot de passe et est lisible par d'autres comptes (chmod 600)",file=sys.stderr)
+
+
+def loadConfig(path):
+    """Lit le fichier de configuration et renvoie (serveurs, nom du serveur par défaut).
+
+    La section [ovpnMgmt] porte les réglages généraux (default = nom) ; chaque
+    autre section est un serveur. Sans "default", un serveur unique est pris
+    par défaut. Pas d'interpolation ni de commentaire en fin de ligne : un
+    mot de passe peut contenir '%', ';' ou '#'.
+    """
+    path=os.path.expanduser(path)
+    parser=configparser.ConfigParser(interpolation=None,inline_comment_prefixes=None)
+    try:
+        with open(path,encoding='utf-8') as handle:
+            parser.read_file(handle)
+    except FileNotFoundError:
+        raise ManagementError(f"fichier de configuration absent : {path} (voir ovpnMgmt.conf.example, ou -c)")
+    except (OSError,configparser.Error) as err:
+        raise ManagementError(f"fichier de configuration illisible : {path} : {err}")
+    servers={}
+    for name in parser.sections():
+        if name != 'ovpnMgmt':
+            servers[name]=Server(name,parser[name],path)
+    if not servers:
+        raise ManagementError(f"aucun serveur dans {path}")
+    default=parser.get('ovpnMgmt','default',fallback='').strip() or None
+    if default is None and len(servers) == 1:
+        default=next(iter(servers))
+    if default is not None and default not in servers:
+        raise ManagementError(f"serveur par défaut « {default} » absent de {path} (serveurs : {', '.join(servers)})")
+    return(servers,default)
+
+
+def pickServer(servers, default, name):
+    """Serveur demandé par -s, sinon le serveur par défaut."""
+    if name is None:
+        if default is None:
+            raise ManagementError(f"pas de serveur par défaut : choisir avec -s ({', '.join(servers)}) "
+                                  f"ou ajouter default = ... dans [ovpnMgmt]")
+        name=default
+    if name not in servers:
+        raise ManagementError(f"serveur inconnu : « {name} » (serveurs : {', '.join(servers)})")
+    return(servers[name])
+
+
+################################################################################
+# Connexion à l'interface de management
+################################################################################
+
+class Management:
+    """Dialogue avec l'interface de management d'un serveur OpenVPN.
+
+    Le protocole est textuel, ligne par ligne :
+      * une commande reçoit soit une ligne "SUCCESS: ..." ou "ERROR: ...",
+        soit plusieurs lignes terminées par "END" (status, log N, version...) ;
+      * les lignes commençant par '>' sont des notifications temps réel
+        (>INFO, >LOG, >HOLD...) qui peuvent s'intercaler à tout moment ; elles
+        sont mises de côté (self.notifications) ou passées à onNotification.
+    Lecture et écriture passent par des descripteurs bruts (socket ou tubes de
+    ssh), avec select pour borner chaque attente.
+    """
+
+    def __init__(self, server, debug=False):
+        self.server=server
+        self.debug=debug
+        self.sock=None
+        self.process=None
+        self.sshStderr=None
+        self.readFd=None
+        self.writeFd=None
+        self.buffer=b""
+        self.notifications=[]
+        self.onNotification=None
+
+    # -- ouverture / fermeture ------------------------------------------------
+
+    def open(self):
+        """Ouvre la connexion, répond au mot de passe si demandé."""
+        server=self.server
+        if server.ssh or server.command:
+            self._openProcess()
+        elif server.socketPath:
+            self._openSocket(socket.AF_UNIX,server.socketPath)
+        else:
+            self._openSocket(None,(server.host,server.port))
+        # Premier échange : ">INFO:..." directement, ou "ENTER PASSWORD:" (sans fin de ligne).
+        # Via ssh, délai large : ssh peut demander un mot de passe ou une passphrase sur le terminal.
+        wait=max(server.timeout,60) if server.ssh else server.timeout
+        deadline=time.monotonic()+wait
+        try:
+            while b"\n" not in self.buffer and b"ENTER PASSWORD:" not in self.buffer:
+                self._fill(deadline)
+        except ManagementTimeout:
+            # OpenVPN ne sert qu'une session de management à la fois : les suivantes attendent, muettes
+            raise ManagementTimeout(f"[{server.name}] le management n'a rien envoyé en {wait:g} s : une autre session "
+                                    f"l'occupe sans doute (ovpnMgmt list --watch, log -f, shell, supervision...), "
+                                    f"OpenVPN n'en sert qu'une à la fois")
+        if b"ENTER PASSWORD:" in self.buffer:
+            self.buffer=self.buffer.split(b"ENTER PASSWORD:",1)[1]
+            if server.password is None:
+                raise ManagementError(f"[{server.name}] le management demande un mot de passe : "
+                                      f"ajouter password_file dans la configuration")
+            self._send(server.password,secret=True)
+            # Mot de passe faux : pas de ERROR, OpenVPN repose la question "ENTER PASSWORD:"
+            deadline=time.monotonic()+server.timeout
+            while b"\n" not in self.buffer and b"ENTER PASSWORD:" not in self.buffer:
+                self._fill(deadline)
+            if b"ENTER PASSWORD:" in self.buffer.split(b"\n",1)[0]:
+                raise ManagementError(f"[{server.name}] mot de passe refusé par le management (password_file / password)")
+            answer=self._readLine(deadline)
+            if not answer.startswith("SUCCESS"):
+                raise ManagementError(f"[{server.name}] mot de passe refusé par le management ({answer})")
+
+    def _openSocket(self, family, address):
+        """Connexion directe : TCP (family None) ou socket unix."""
+        try:
+            if family == socket.AF_UNIX:
+                self.sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+                self.sock.settimeout(self.server.timeout)
+                self.sock.connect(address)
+            else:
+                self.sock=socket.create_connection(address,timeout=self.server.timeout)
+        except OSError as err:
+            raise ManagementError(f"[{self.server.name}] connexion impossible ({self.server.transport()}) : {err}")
+        # Bloquant : chaque attente est bornée par select, os.read/os.write ne doivent pas lever EAGAIN
+        self.sock.settimeout(None)
+        self.readFd=self.writeFd=self.sock.fileno()
+
+    def _openProcess(self):
+        """Connexion par un processus dont stdin/stdout sont reliés au management.
+
+        ssh -W hote:port (aucun outil requis sur le serveur), ou la commande
+        "command", lancée par ssh sur la machine distante ou en local. stderr
+        de ce processus est gardé dans un fichier temporaire et cité si la
+        connexion échoue (clef refusée, port fermé...).
+        """
+        server=self.server
+        if server.ssh:
+            argv=['ssh',*server.sshOptions]
+            if server.command:
+                argv+=['-T',server.ssh,server.command]
+            else:
+                argv+=['-W',f'{server.host}:{server.port}',server.ssh]
+        else:
+            argv=['/bin/sh','-c',server.command]
+        if self.debug:
+            print(f"[debug] lance : {shlex.join(argv)}",file=sys.stderr)
+        self.sshStderr=tempfile.TemporaryFile()
+        try:
+            self.process=subprocess.Popen(argv,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=self.sshStderr,bufsize=0)
+        except OSError as err:
+            raise ManagementError(f"[{server.name}] impossible de lancer {argv[0]} : {err}")
+        self.readFd=self.process.stdout.fileno()
+        self.writeFd=self.process.stdin.fileno()
+
+    def close(self):
+        """Ferme proprement : "quit", puis socket ou processus."""
+        try:
+            if self.writeFd is not None:
+                self._send("quit")
+        except ManagementError:
+            pass
+        if self.sock is not None:
+            self.sock.close()
+        if self.process is not None:
+            try:
+                self.process.stdin.close()
+            except OSError:
+                pass
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+        if self.sshStderr is not None:
+            self.sshStderr.close()
+        self.readFd=self.writeFd=None
+
+    def __enter__(self):
+        self.open()
+        return(self)
+
+    def __exit__(self, *exc):
+        self.close()
+
+    # -- lecture / écriture brutes ---------------------------------------------
+
+    def _processError(self):
+        """Fin de ligne explicative d'une coupure : stderr de ssh / de la commande."""
+        if self.sshStderr is None:
+            return("")
+        self.sshStderr.seek(0)
+        text=self.sshStderr.read().decode('utf-8','replace').strip()
+        return(f" : {text}" if text else "")
+
+    def _fill(self, deadline):
+        """Lit ce qui est disponible, en attendant au plus jusqu'à deadline."""
+        remaining=deadline-time.monotonic()
+        if remaining <= 0:
+            raise ManagementTimeout(f"[{self.server.name}] pas de réponse du management en {self.server.timeout:g} s")
+        ready,_,_=select.select([self.readFd],[],[],remaining)
+        if not ready:
+            raise ManagementTimeout(f"[{self.server.name}] pas de réponse du management en {self.server.timeout:g} s")
+        try:
+            data=os.read(self.readFd,65536)
+        except OSError as err:
+            raise ManagementError(f"[{self.server.name}] lecture impossible : {err}")
+        if not data:
+            if self.process is not None:
+                # Laisse le temps à ssh d'écrire sa raison avant de la citer
+                try:
+                    self.process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+            raise ManagementError(f"[{self.server.name}] connexion fermée ({self.server.transport()}){self._processError()}")
+        self.buffer+=data
+
+    def _readLine(self, deadline):
+        """Une ligne complète, sans \\r\\n."""
+        while b"\n" not in self.buffer:
+            self._fill(deadline)
+        line,self.buffer=self.buffer.split(b"\n",1)
+        line=line.rstrip(b"\r").decode('utf-8','replace')
+        if self.debug:
+            print(f"[debug] < {line}",file=sys.stderr)
+        return(line)
+
+    def _send(self, line, secret=False):
+        """Envoie une ligne (écriture complète, même par morceaux)."""
+        if self.debug:
+            print(f"[debug] > {'********' if secret else line}",file=sys.stderr)
+        data=(line+"\n").encode('utf-8')
+        try:
+            while data:
+                written=os.write(self.writeFd,data)
+                data=data[written:]
+        except OSError as err:
+            raise ManagementError(f"[{self.server.name}] envoi impossible : {err}{self._processError()}")
+
+    # -- protocole -------------------------------------------------------------
+
+    def _notify(self, line):
+        """Range ou transmet une notification temps réel (ligne '>...').
+
+        La bannière ">INFO:OpenVPN Management Interface..." de l'ouverture est écartée.
+        """
+        if line.startswith(">INFO:"):
+            return
+        if self.onNotification is not None:
+            self.onNotification(line)
+        else:
+            self.notifications.append(line)
+
+    def readNotification(self, timeout):
+        """Attend une ligne pendant timeout secondes ; None si rien n'est arrivé.
+
+        Sert aux modes suivis (log --follow, shell) : les notifications sont
+        renvoyées telles quelles, les autres lignes aussi.
+        """
+        deadline=time.monotonic()+timeout
+        try:
+            return(self._readLine(deadline))
+        except ManagementTimeout:
+            return(None)
+
+    def command(self, cmd):
+        """Envoie une commande et renvoie (succès, lignes de la réponse).
+
+        Réponse sur une ligne : SUCCESS/ERROR, texte après "SUCCESS: " ou
+        "ERROR: " ; réponse multiligne : lignes jusqu'à END (exclu), succès.
+        """
+        self._send(cmd)
+        deadline=time.monotonic()+self.server.timeout
+        lines=[]
+        while True:
+            line=self._readLine(deadline)
+            if line.startswith('>'):
+                self._notify(line)
+                continue
+            if not lines and line.startswith("SUCCESS:"):
+                return(True,[line[len("SUCCESS:"):].strip()])
+            if not lines and line.startswith("ERROR:"):
+                return(False,[line[len("ERROR:"):].strip()])
+            if line == "END":
+                return(True,lines)
+            lines.append(line)
+
+    def check(self, cmd):
+        """Comme command, mais une réponse ERROR devient une ManagementError."""
+        ok,lines=self.command(cmd)
+        if not ok:
+            raise ManagementError(f"[{self.server.name}] « {cmd} » refusé : {' '.join(lines)}")
+        return(lines)
+
+    def status(self):
+        """État du serveur (status 3, à tabulations ; status 2 pour les versions sans le 3)."""
+        ok,lines=self.command("status 3")
+        if not ok:
+            lines=self.check("status 2")
+        return(parseStatus(lines))
+
+
+################################################################################
+# Analyse des réponses
+################################################################################
+
+def parseDate(text):
+    """Date du status en epoch : "2026-10-07 22:58:16" (2.5+) ou "Wed Oct  7 22:58:16 2026" (anciennes)."""
+    for fmt in ("%Y-%m-%d %H:%M:%S","%a %b %d %H:%M:%S %Y"):
+        try:
+            return(int(time.mktime(time.strptime(text.strip(),fmt))))
+        except ValueError:
+            pass
+    return(None)
+
+
+def toInt(text):
+    """Entier, ou None pour une valeur vide ou illisible."""
+    try:
+        return(int(text))
+    except (TypeError,ValueError):
+        return(None)
+
+
+def parseStatus(lines):
+    """Découpe la réponse de "status 2|3" en {title, time, clients, routes, globals}.
+
+    Les colonnes sont lues dans les lignes HEADER : le même code suit les
+    versions d'OpenVPN qui ajoutent des colonnes (Peer ID, Data Channel
+    Cipher...). "Bytes Received" / "Bytes Sent" sont vus du serveur : reçu
+    du client / envoyé au client.
+    """
+    separator='\t' if any('\t' in line for line in lines) else ','
+    headers={}
+    result={'title':'','time':None,'clients':[],'routes':[],'globals':{}}
+    for line in lines:
+        fields=line.split(separator)
+        kind=fields[0]
+        if kind == 'HEADER' and len(fields) > 1:
+            headers[fields[1]]=fields[2:]
+        elif kind == 'TITLE':
+            result['title']=separator.join(fields[1:])
+        elif kind == 'TIME':
+            result['time']=toInt(fields[2]) if len(fields) > 2 else None
+            if result['time'] is None and len(fields) > 1:
+                result['time']=parseDate(fields[1])
+        elif kind == 'GLOBAL_STATS' and len(fields) > 2:
+            result['globals'][fields[1]]=fields[2]
+        elif kind in headers:
+            row=dict(zip(headers[kind],fields[1:]))
+            if kind == 'CLIENT_LIST':
+                result['clients'].append(clientFromRow(row))
+            elif kind == 'ROUTING_TABLE':
+                result['routes'].append({
+                    'virtual':row.get('Virtual Address',''),
+                    'cn':row.get('Common Name',''),
+                    'real':row.get('Real Address',''),
+                    'last_ref':toInt(row.get('Last Ref (time_t)')) or parseDate(row.get('Last Ref','')),
+                })
+    return(result)
+
+
+def clientFromRow(row):
+    """Une ligne CLIENT_LIST, avec des noms de clefs courts et des nombres."""
+    since=toInt(row.get('Connected Since (time_t)'))
+    if since is None:
+        since=parseDate(row.get('Connected Since',''))
+    username=row.get('Username','')
+    return({
+        'cn':row.get('Common Name',''),
+        'real':row.get('Real Address',''),
+        'virtual':row.get('Virtual Address',''),
+        'virtual6':row.get('Virtual IPv6 Address',''),
+        'rx':toInt(row.get('Bytes Received')) or 0,
+        'tx':toInt(row.get('Bytes Sent')) or 0,
+        'since':since,
+        'username':'' if username == 'UNDEF' else username,
+        'cid':toInt(row.get('Client ID')),
+        'peer_id':toInt(row.get('Peer ID')),
+        'cipher':row.get('Data Channel Cipher',''),
+    })
+
+
+def realIp(real):
+    """IP seule d'une adresse réelle : "udp4:1.2.3.4:5000" ou "[2001:db8::1]:5000" → IP."""
+    match=re.fullmatch(r'(?:(?:udp|tcp)[46]?(?:-server|-client)?:)?\[?(.+?)\]?:(\d+)',real)
+    return(match.group(1) if match else real)
+
+
+################################################################################
+# Affichage
+################################################################################
+
+def humanBytes(count):
+    """Octets lisibles : 1023 o, 1,5 Kio, 12,3 Mio..."""
+    value=float(count)
+    for unit in ("o","Kio","Mio","Gio","Tio"):
+        if value < 1024 or unit == "Tio":
+            if unit == "o":
+                return(f"{int(value)} o")
+            return(f"{value:.1f} {unit}".replace('.',','))
+        value/=1024
+
+
+def humanDuration(seconds):
+    """Durée lisible : "04:05:06", ou "3j 04:05:06" au-delà d'un jour."""
+    if seconds is None:
+        return("?")
+    seconds=max(0,int(seconds))
+    days,rest=divmod(seconds,86400)
+    hours,rest=divmod(rest,3600)
+    minutes,secs=divmod(rest,60)
+    clock=f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return(f"{days}j {clock}" if days else clock)
+
+
+def humanDate(epoch):
+    """Date locale d'un epoch, "?" s'il est inconnu."""
+    if epoch is None:
+        return("?")
+    return(time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(epoch)))
+
+
+def printTable(headers, rows):
+    """Tableau aligné ; les colonnes de nombres (titres finissant par ' ') sont alignées à droite."""
+    widths=[len(h.strip()) for h in headers]
+    for row in rows:
+        widths=[max(w,len(str(cell))) for w,cell in zip(widths,row)]
+    def fmt(cells):
+        out=[]
+        for header,width,cell in zip(headers,widths,cells):
+            out.append(str(cell).rjust(width) if header.endswith(' ') else str(cell).ljust(width))
+        return("  ".join(out).rstrip())
+    print(fmt([h.strip() for h in headers]))
+    for row in rows:
+        print(fmt(row))
+
+
+def sortClients(clients, key, reverse):
+    """Tri des connexions : cn, real, virtual, since (plus ancienne d'abord), rx, tx."""
+    keys={
+        'cn':lambda c: c['cn'].lower(),
+        'real':lambda c: c['real'],
+        'virtual':lambda c: tuple(int(p) for p in c['virtual'].split('.')) if re.fullmatch(r'[\d.]+',c['virtual']) else (999,c['virtual']),
+        'since':lambda c: c['since'] or 0,
+        'rx':lambda c: c['rx'],
+        'tx':lambda c: c['tx'],
+    }
+    return(sorted(clients,key=keys[key],reverse=reverse))
+
+
+def filterClients(clients, pattern):
+    """Connexions dont le nom, l'adresse réelle, l'IP VPN ou l'utilisateur contient pattern (sans casse)."""
+    if not pattern:
+        return(clients)
+    pattern=pattern.lower()
+    return([c for c in clients if any(pattern in c[k].lower() for k in ('cn','real','virtual','virtual6','username'))])
+
+
+def clientRows(clients, now, long, rates=None):
+    """Lignes du tableau des connexions (et en-têtes), selon --long et le débit du mode --watch."""
+    headers=["Nom","Adresse réelle","IP VPN","Connecté depuis","Durée ","Reçu ","Envoyé "]
+    if rates is not None:
+        headers+=["Reçu/s ","Envoyé/s "]
+    headers+=["CID "]
+    if long:
+        headers+=["Utilisateur","IPv6 VPN","Chiffrement","Peer ID "]
+    rows=[]
+    for c in clients:
+        row=[c['cn'],c['real'],c['virtual'],humanDate(c['since']),
+             humanDuration(now-c['since'] if c['since'] else None),humanBytes(c['rx']),humanBytes(c['tx'])]
+        if rates is not None:
+            rate=rates.get(clientKey(c))
+            row+=[humanBytes(rate[0]) if rate else "-",humanBytes(rate[1]) if rate else "-"]
+        row+=["" if c['cid'] is None else c['cid']]
+        if long:
+            row+=[c['username'],c['virtual6'],c['cipher'],"" if c['peer_id'] is None else c['peer_id']]
+        rows.append(row)
+    return(headers,rows)
+
+
+def clientKey(client):
+    """Identifiant stable d'une connexion entre deux status (CID, sinon nom + adresse)."""
+    return(client['cid'] if client['cid'] is not None else (client['cn'],client['real']))
+
+
+def clientJson(client):
+    """Connexion pour --json : champs bruts + dates ISO et durée en secondes."""
+    data=dict(client)
+    data['since_iso']=time.strftime("%Y-%m-%dT%H:%M:%S%z",time.localtime(client['since'])) if client['since'] else None
+    return(data)
+
+
+################################################################################
+# Actions
+################################################################################
+
+def actionServers(servers, default, args):
+    """Liste les serveurs de la configuration, le défaut marqué d'une '*'."""
+    rows=[["*" if name == default else "",name,server.transport(),server.description] for name,server in servers.items()]
+    printTable(["","Serveur","Connexion","Description"],rows)
+    return(0)
+
+
+def actionList(mgmt, args):
+    """Connexions actives : tableau, --json, ou rafraîchi toutes les --watch secondes avec le débit."""
+    if args.watch is None:
+        status=mgmt.status()
+        clients=sortClients(filterClients(status['clients'],args.filter),args.sort,args.reverse)
+        if args.json:
+            print(json.dumps([clientJson(c) for c in clients],indent=2,ensure_ascii=False))
+            return(0)
+        now=status['time'] or time.time()
+        if not clients:
+            print("Aucune connexion active." if not args.filter else f"Aucune connexion ne correspond à « {args.filter} ».")
+            return(0)
+        headers,rows=clientRows(clients,now,args.long)
+        printTable(headers,rows)
+        print(f"\n{len(clients)} connexion(s) ; reçu / envoyé : vus du serveur")
+        return(0)
+
+    # Mode --watch : une seule connexion au management, débit calculé entre deux status
+    previous={}
+    previousTime=None
+    while True:
+        status=mgmt.status()
+        now=status['time'] or time.time()
+        clients=sortClients(filterClients(status['clients'],args.filter),args.sort,args.reverse)
+        rates={}
+        if previousTime is not None and now > previousTime:
+            for c in clients:
+                before=previous.get(clientKey(c))
+                if before:
+                    rates[clientKey(c)]=(max(0,c['rx']-before[0])/(now-previousTime),max(0,c['tx']-before[1])/(now-previousTime))
+        sys.stdout.write("\033[H\033[2J")
+        print(f"{mgmt.server.name} — {humanDate(now)} — {len(clients)} connexion(s) — rafraîchi toutes les {args.watch:g} s (Ctrl-C pour quitter)\n")
+        if clients:
+            headers,rows=clientRows(clients,now,args.long,rates)
+            printTable(headers,rows)
+        else:
+            print("Aucune connexion active.")
+        sys.stdout.flush()
+        previous={clientKey(c):(c['rx'],c['tx']) for c in clients}
+        previousTime=now
+        time.sleep(args.watch)
+
+
+def actionInfo(mgmt, args):
+    """Version, PID, état, charge (clients et octets cumulés), verbosité, mute, hold."""
+    info={'serveur':mgmt.server.name}
+    version=mgmt.check("version")
+    info['version']=next((l.split(':',1)[1].strip() for l in version if l.startswith("OpenVPN Version")),' '.join(version))
+    info['management']=next((l.split(':',1)[1].strip() for l in version if l.startswith("Management Version")),'')
+    for cmd in ("pid","verb","mute","hold"):
+        ok,lines=mgmt.command(cmd)
+        info[cmd]=lines[0].split('=',1)[-1] if ok and lines else ''
+    ok,lines=mgmt.command("load-stats")
+    if ok and lines:
+        stats=dict(item.split('=',1) for item in lines[0].split(',') if '=' in item)
+        info['clients']=stats.get('nclients','')
+        info['octets reçus']=stats.get('bytesin','')
+        info['octets envoyés']=stats.get('bytesout','')
+    ok,lines=mgmt.command("state")
+    if ok and lines:
+        # "epoch,ETAT,detail,ip locale,ip distante,..." : dernier état connu
+        fields=lines[-1].split(',')
+        info['état']=f"{fields[1]} depuis {humanDate(toInt(fields[0]))}" if len(fields) > 1 else lines[-1]
+    if args.json:
+        print(json.dumps(info,indent=2,ensure_ascii=False))
+        return(0)
+    for key in ('octets reçus','octets envoyés'):
+        if toInt(info.get(key)) is not None:
+            info[key]=f"{humanBytes(int(info[key]))} ({info[key]})"
+    width=max(len(k) for k in info)
+    for key,value in info.items():
+        print(f"{key.ljust(width)} : {value}")
+    return(0)
+
+
+def actionKill(mgmt, args):
+    """Coupe des connexions désignées par nom, adresse réelle (IP ou IP:port), IP VPN ou --cid.
+
+    Chaque connexion trouvée reçoit "client-kill CID RESTART|HALT" :
+    RESTART (défaut, comme "kill" d'OpenVPN) laisse le client se reconnecter,
+    HALT (--halt) lui demande de s'arrêter. Plus d'une connexion visée :
+    confirmation, sauf --yes.
+    """
+    if not args.targets and not args.cid:
+        raise ManagementError("kill : indiquer un nom, une adresse, une IP VPN ou --cid")
+    clients=mgmt.status()['clients']
+    selected=[]
+    for target in args.targets:
+        found=[c for c in clients if target in (c['cn'],c['real'],realIp(c['real']),c['virtual'],c['virtual6'])]
+        if not found:
+            print(f"Aucune connexion ne correspond à « {target} ».",file=sys.stderr)
+        selected+=found
+    for cid in args.cid or []:
+        found=[c for c in clients if c['cid'] == cid]
+        if not found:
+            print(f"Aucune connexion de CID {cid}.",file=sys.stderr)
+        selected+=found
+    # Une connexion visée deux fois (nom et adresse) n'est coupée qu'une fois
+    unique={}
+    for c in selected:
+        unique.setdefault(clientKey(c),c)
+    selected=list(unique.values())
+    if not selected:
+        return(1)
+    message="HALT" if args.halt else "RESTART"
+    describe=lambda c: f"{c['cn']} ({c['real']}, IP VPN {c['virtual'] or '-'}, CID {c['cid']})"
+    if len(selected) > 1 and not args.yes:
+        print(f"{len(selected)} connexions vont être coupées ({message}) :")
+        for c in selected:
+            print(f"  {describe(c)}")
+        if not confirm("Confirmer ?"):
+            print("Abandon, rien n'a été coupé.")
+            return(1)
+    failed=0
+    pending=[]
+    for c in selected:
+        if c['cid'] is not None:
+            ok,lines=mgmt.command(f"client-kill {c['cid']} {message}")
+        else:
+            # OpenVPN trop ancien pour donner le CID : "kill IP:port" (toujours RESTART)
+            ok,lines=mgmt.command(f"kill {c['real']}")
+        if ok:
+            pending.append(c)
+        else:
+            failed+=1
+            print(f"Échec pour {describe(c)} : {' '.join(lines)}",file=sys.stderr)
+    # OpenVPN ferme l'instance quelques secondes après la commande (sortie différée) :
+    # "Coupée" n'est annoncé qu'une fois la connexion sortie de la liste
+    deadline=time.monotonic()+KILL_WAIT
+    closed=0
+    while pending:
+        present={clientKey(c) for c in mgmt.status()['clients']}
+        for c in [c for c in pending if clientKey(c) not in present]:
+            print(f"Coupée ({message}) : {describe(c)}")
+            pending.remove(c)
+            closed+=1
+        if not pending or time.monotonic() > deadline:
+            break
+        time.sleep(0.5)
+    for c in pending:
+        failed+=1
+        print(f"Commande acceptée, mais toujours listée après {KILL_WAIT} s : {describe(c)}",file=sys.stderr)
+    if message == "RESTART" and closed:
+        print("RESTART : le client va se reconnecter (sous un nouveau CID) ; --halt pour l'arrêter.")
+    return(1 if failed else 0)
+
+
+# Délai maximal d'attente de la fermeture effective d'une connexion coupée, en secondes
+KILL_WAIT=15
+
+LOG_FLAGS={'I':'info','F':'FATAL','N':'erreur','W':'avert.','D':'debug'}
+
+def formatLogLine(line):
+    """Ligne de log "epoch,drapeaux,message" → "date [niveau] message"."""
+    if line.startswith(">LOG:"):
+        line=line[len(">LOG:"):]
+    parts=line.split(',',2)
+    if len(parts) < 3 or toInt(parts[0]) is None:
+        return(line)
+    level=' '.join(LOG_FLAGS.get(flag,flag) for flag in parts[1]) or '-'
+    return(f"{humanDate(int(parts[0]))} [{level}] {parts[2]}")
+
+
+def actionLog(mgmt, args):
+    """Dernières lignes du log du serveur ; --follow les suit en temps réel (Ctrl-C pour quitter)."""
+    for line in mgmt.check(f"log {args.lines}"):
+        print(formatLogLine(line))
+    if not args.follow:
+        return(0)
+    sys.stdout.flush()
+    mgmt.check("log on")
+    try:
+        while True:
+            line=mgmt.readNotification(3600)
+            if line is not None and line.startswith(">LOG:"):
+                print(formatLogLine(line),flush=True)
+    finally:
+        try:
+            mgmt.command("log off")
+        except ManagementError:
+            pass
+
+
+def actionLevel(mgmt, args):
+    """verb ou mute : affiche le niveau, ou le change si un niveau est donné."""
+    cmd=args.action if args.level is None else f"{args.action} {args.level}"
+    lines=mgmt.check(cmd)
+    print(lines[0] if lines else "ok")
+    return(0)
+
+
+def actionSignal(mgmt, args):
+    """Envoie un signal au démon (SIGHUP recharge, SIGTERM arrête, SIGUSR1 redémarre, SIGUSR2 écrit son état dans le log).
+
+    Touche toutes les connexions : confirmation, sauf --yes.
+    """
+    effects={'SIGHUP':"redémarre le serveur et relit sa configuration : toutes les connexions sont coupées",
+             'SIGTERM':"ARRÊTE le serveur : toutes les connexions sont coupées et il ne redémarre pas seul",
+             'SIGUSR1':"redémarre le serveur sans relire sa configuration : les connexions se rétablissent",
+             'SIGUSR2':"écrit les statistiques dans le log du serveur, sans effet sur les connexions"}
+    print(f"{args.signal} sur {mgmt.server.name} : {effects[args.signal]}.")
+    if args.signal != 'SIGUSR2' and not args.yes and not confirm("Confirmer ?"):
+        print("Abandon, aucun signal envoyé.")
+        return(1)
+    print(mgmt.check(f"signal {args.signal}")[0])
+    return(0)
+
+
+def actionHold(mgmt, args):
+    """hold : affiche l'état ; hold on|off|release le change (release démarre un serveur en attente)."""
+    cmd="hold" if args.state is None else f"hold {args.state}"
+    lines=mgmt.check(cmd)
+    print(lines[0] if lines else "ok")
+    return(0)
+
+
+def actionRaw(mgmt, args):
+    """Envoie des commandes brutes et affiche leurs réponses (ERROR → code retour 1)."""
+    status=0
+    for cmd in args.commands:
+        ok,lines=mgmt.command(cmd)
+        for line in mgmt.notifications:
+            print(line)
+        mgmt.notifications.clear()
+        if len(args.commands) > 1:
+            print(f"== {cmd}")
+        print('\n'.join(lines) if ok else f"ERROR: {' '.join(lines)}")
+        status=status or (0 if ok else 1)
+    return(status)
+
+
+def actionShell(mgmt, args):
+    """Session interactive : chaque ligne tapée est envoyée telle quelle ("help" liste les commandes du serveur)."""
+    try:
+        import readline  # noqa: F401  (historique et édition de ligne)
+    except ImportError:
+        pass
+    print(f"Connecté à {mgmt.server.name} ({mgmt.server.transport()}). « help » : commandes du serveur ; « quit » ou Ctrl-D : sortie.")
+    mgmt.onNotification=lambda line: print(line)
+    while True:
+        try:
+            cmd=input(f"{mgmt.server.name}> ").strip()
+        except EOFError:
+            print()
+            return(0)
+        if not cmd:
+            # Ligne vide : affiche les notifications arrivées entre-temps
+            while (line := mgmt.readNotification(0.2)) is not None:
+                print(line)
+            continue
+        if cmd in ("quit","exit"):
+            return(0)
+        ok,lines=mgmt.command(cmd)
+        print('\n'.join(lines) if ok else f"ERROR: {' '.join(lines)}")
+
+
+def confirm(question):
+    """Question oui/non sur le terminal ; sans terminal, refus (utiliser --yes)."""
+    sys.stdout.flush()
+    if not sys.stdin.isatty():
+        print("Pas de terminal pour confirmer : relancer avec --yes.",file=sys.stderr)
+        return(False)
+    try:
+        answer=input(f"{question} [o/N] ").strip().lower()
+    except EOFError:
+        return(False)
+    return(answer in ("o","oui","y","yes"))
+
+
+################################################################################
+# Ligne de commande
+################################################################################
+
+def buildParser():
+    """Options générales et sous-commandes."""
+    parser=argparse.ArgumentParser(
+        prog='ovpnMgmt',
+        description="Pilote un serveur OpenVPN par son interface de management, en direct ou au travers de ssh.",
+        epilog=f"Configuration : {DEFAULT_CONFIG} (ou $OVPNMGMT_CONF, ou -c). Sans commande : list.")
+    parser.add_argument('-c','--config',default=os.environ.get('OVPNMGMT_CONF',DEFAULT_CONFIG),help="fichier de configuration")
+    parser.add_argument('-s','--server',help="serveur à utiliser (défaut : celui de la configuration)")
+    parser.add_argument('-D','--debug',action='store_true',help="affiche les échanges avec le management sur stderr")
+    parser.add_argument('-V','--version',action='version',version=f"%(prog)s {Version}")
+    sub=parser.add_subparsers(dest='action',metavar='COMMANDE')
+
+    p=sub.add_parser('list',aliases=['ls'],help="connexions actives (durée, octets reçus/envoyés)")
+    p.add_argument('filter',nargs='?',help="ne garder que les connexions dont le nom, l'adresse ou l'IP VPN contient ce texte")
+    p.add_argument('--sort',choices=['cn','real','virtual','since','rx','tx'],default='cn',help="tri (défaut : cn)")
+    p.add_argument('-r','--reverse',action='store_true',help="tri inversé")
+    p.add_argument('-l','--long',action='store_true',help="colonnes en plus : utilisateur, IPv6, chiffrement, peer ID")
+    p.add_argument('--json',action='store_true',help="sortie JSON")
+    p.add_argument('-w','--watch',type=positiveFloat,metavar='SEC',help="rafraîchit toutes les SEC secondes, avec le débit")
+
+    sub.add_parser('servers',help="serveurs de la configuration (* = défaut)")
+
+    p=sub.add_parser('info',help="version, PID, état, charge, verbosité")
+    p.add_argument('--json',action='store_true',help="sortie JSON")
+
+    p=sub.add_parser('kill',help="coupe des connexions (nom, IP[:port] réelle, IP VPN, ou --cid)")
+    p.add_argument('targets',nargs='*',metavar='CIBLE',help="nom (CN), adresse réelle IP ou IP:port, ou IP VPN")
+    p.add_argument('--cid',type=int,action='append',help="identifiant de connexion (colonne CID), répétable")
+    p.add_argument('--halt',action='store_true',help="demande au client de s'arrêter (défaut : RESTART, il se reconnecte)")
+    p.add_argument('-y','--yes',action='store_true',help="pas de confirmation quand plusieurs connexions sont visées")
+
+    p=sub.add_parser('log',help="dernières lignes du log du serveur")
+    p.add_argument('lines',nargs='?',default='20',help="nombre de lignes, ou all (défaut : 20)")
+    p.add_argument('-f','--follow',action='store_true',help="puis suit le log en temps réel")
+
+    for name,what in (('verb',"verbosité du log"),('mute',"limite de répétition des messages")):
+        p=sub.add_parser(name,help=f"affiche ou change la {what}")
+        p.add_argument('level',nargs='?',type=int,help="nouveau niveau")
+
+    p=sub.add_parser('signal',help="signal au démon (SIGHUP, SIGTERM, SIGUSR1, SIGUSR2)")
+    p.add_argument('signal',choices=['SIGHUP','SIGTERM','SIGUSR1','SIGUSR2'])
+    p.add_argument('-y','--yes',action='store_true',help="pas de confirmation")
+
+    p=sub.add_parser('hold',help="état d'attente au démarrage (management-hold)")
+    p.add_argument('state',nargs='?',choices=['on','off','release'])
+
+    p=sub.add_parser('raw',help="envoie des commandes brutes du management")
+    p.add_argument('commands',nargs='+',metavar='COMMANDE',help="ex. \"status 3\" \"load-stats\"")
+
+    sub.add_parser('shell',help="session interactive avec le management")
+    return(parser)
+
+
+def positiveFloat(value):
+    """Type argparse : nombre de secondes strictement positif."""
+    try:
+        number=float(value)
+    except ValueError:
+        number=0
+    if number <= 0:
+        raise argparse.ArgumentTypeError(f"nombre de secondes positif attendu, pas « {value} »")
+    return(number)
+
+
+def main():
+    """Lit la configuration, ouvre la connexion au serveur choisi et lance l'action."""
+    parser=buildParser()
+    args=parser.parse_args()
+    if args.action is None:
+        args=parser.parse_args(sys.argv[1:]+['list'])
+    if args.action == 'ls':
+        args.action='list'
+    actions={'list':actionList,'info':actionInfo,'kill':actionKill,'log':actionLog,'verb':actionLevel,
+             'mute':actionLevel,'signal':actionSignal,'hold':actionHold,'raw':actionRaw,'shell':actionShell}
+    try:
+        servers,default=loadConfig(args.config)
+        if args.action == 'servers':
+            return(actionServers(servers,default,args))
+        server=pickServer(servers,default,args.server)
+        with Management(server,debug=args.debug) as mgmt:
+            return(actions[args.action](mgmt,args))
+    except ManagementError as err:
+        print(f"ovpnMgmt: {err}",file=sys.stderr)
+        return(1)
+    except KeyboardInterrupt:
+        print()
+        return(130)
+    except BrokenPipeError:
+        # Sortie coupée (ovpnMgmt list | head) : pas de trace Python
+        sys.stderr.close()
+        return(0)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
