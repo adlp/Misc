@@ -1,5 +1,23 @@
 # Changelog — Tools
 
+## ovpnMgmt 1.4 — un seul tableau, certificats, clusters, --full — 2026-10-08
+
+- **`list -o`** : les non connectés entrent dans le même tableau que les connexions, avec `___` pour adresse,
+  connecté depuis, durée, reçu, envoyé et CID, l'IP réservée entre parenthèses, et une colonne `État` (connecté,
+  non connecté, banni le …, désactivé (ccd), partiel « … sur A »). Bilan unique : connexions, non connectés, masqués.
+- **Colonne `Certificat`** pour tous les clients, connectés compris, dès qu'un serveur a `openvpn_config` : fin de
+  validité et jours restants, « expiré le », « révoqué le », « hors PKI ». L'`index.txt` garde désormais l'état de
+  chaque certificat (le meilleur par nom en cas de renouvellement).
+- **`--full`** (implique `-o`) : seuls à montrer les non connectés au certificat révoqué ou expiré ; sans lui, ils
+  sont comptés « masqués ».
+- **Clusters** : clé `cluster = nom` ; ses serveurs traités ensemble ne montrent qu'une fois chaque nom (non connecté
+  au nom du cluster s'il n'est connecté sur aucun serveur ; plusieurs sessions d'un même nom sur une ligne,
+  « connecté (N sessions) »). `-s cluster` et `default = cluster` prennent tous ses serveurs ; `servers` les montre.
+- **JSON** de `list` : une seule liste (champ `connected`, `state`, certificat), à la place de l'objet
+  `{"connected", "offline"}` de la 1.2.
+- Testé sur deux serveurs OpenVPN 2.5.11 réels en cluster (PKI partagée, ccd et ipp.txt propres à chacun),
+  `--watch` compris.
+
 ## ovpnMgmt 1.3 — killban, unban, bans — 2026-10-08
 
 - **`killban CIBLE…`** : bannit des clients, connectés ou non, puis coupe leurs connexions en HALT. Le ban est un

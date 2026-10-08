@@ -54,7 +54,10 @@ import tempfile
 import threading
 import time
 
-Version="1.3"
+Version="1.4"
+# 1.4 list : non connectes dans le meme tableau ("___" pour la connexion), colonne Certificat (fin de validite) pour
+#     tous des qu'il y a openvpn_config, revoques / expires seulement avec --full, cluster (un nom affiche une fois
+#     par cluster, -s cluster), JSON en une seule liste avec "connected"
 # 1.3 killban / unban / bans : "disable" marque ovpnMgmt dans le fichier client-config-dir du client (connecte ou
 #     non), coupure HALT des connexions bannies ; list --offline montre "banni le ..."
 # 1.2 list --offline : utilisateurs connus non connectes, d'apres la configuration OpenVPN (openvpn_config) :
@@ -101,6 +104,8 @@ class Server:
                       pour list --offline
       pki_index     : index.txt de la PKI s'il n'est pas à côté du "ca"
       sudo          : yes = fichiers OpenVPN lus par "sudo -n" (défaut no)
+      cluster       : nom de cluster ; ses serveurs traités ensemble ne
+                      montrent qu'une fois chaque client ; -s cluster les prend tous
     """
 
     def __init__(self, name, section, configPath):
@@ -117,6 +122,7 @@ class Server:
         if sudo not in ('yes','no','true','false','1','0','oui','non'):
             raise ManagementError(f"[{name}] sudo invalide : « {sudo} » (yes ou no)")
         self.sudo=sudo in ('yes','true','1','oui')
+        self.cluster=section.get('cluster','').strip() or None
         management=section.get('management',DEFAULT_MANAGEMENT).strip()
         self.socketPath=None
         self.host=None
@@ -212,27 +218,41 @@ def loadConfig(path):
             servers[name]=Server(name,parser[name],path)
     if not servers:
         raise ManagementError(f"aucun serveur dans {path}")
+    clusters={server.cluster for server in servers.values() if server.cluster}
+    for cluster in clusters & set(servers):
+        raise ManagementError(f"« {cluster} » est à la fois un serveur et un cluster dans {path}")
     defaults=splitNames(parser.get('ovpnMgmt','default',fallback=''))
     if not defaults and len(servers) == 1:
         defaults=list(servers)
     for name in defaults:
-        if name not in servers:
+        if name not in servers and name not in clusters:
             raise ManagementError(f"serveur par défaut « {name} » absent de {path} (serveurs : {', '.join(servers)})")
     return(servers,defaults)
 
 
 def pickServers(servers, defaults, requested, everything):
-    """Serveurs à traiter : tous (-a), ceux de -s (répétable, ou séparés par des virgules), sinon ceux par défaut."""
+    """Serveurs à traiter : tous (-a), ceux de -s (répétable, ou séparés par des virgules), sinon ceux par défaut.
+
+    Un nom de cluster désigne tous ses serveurs, dans l'ordre de la configuration.
+    """
     if everything:
         return(list(servers.values()))
     names=splitNames(','.join(requested)) if requested else defaults
     if not names:
         raise ManagementError(f"pas de serveur par défaut : choisir avec -s ({', '.join(servers)}) ou -a, "
                               f"ou ajouter default = ... dans [ovpnMgmt]")
-    unknown=[name for name in names if name not in servers]
+    clusters={}
+    for server in servers.values():
+        if server.cluster:
+            clusters.setdefault(server.cluster,[]).append(server.name)
+    expanded=[]
+    for name in names:
+        expanded+=clusters.get(name,[name])
+    unknown=[name for name in expanded if name not in servers]
     if unknown:
-        raise ManagementError(f"serveur inconnu : « {', '.join(unknown)} » (serveurs : {', '.join(servers)})")
-    return([servers[name] for name in names])
+        known=', '.join(list(servers)+[f"{c} (cluster)" for c in clusters])
+        raise ManagementError(f"serveur inconnu : « {', '.join(unknown)} » (serveurs : {known})")
+    return([servers[name] for name in dict.fromkeys(expanded)])
 
 
 ################################################################################
@@ -740,13 +760,15 @@ def knownUsers(server):
     """Utilisateurs connus d'un serveur, d'après la configuration OpenVPN (openvpn_config).
 
     Sources, déduites des directives :
-      * index.txt de la PKI easy-rsa (à côté de "ca", ou pki_index) : certificats
-        valides ; révoqués (R) et expirés comptés à part, non listés ;
+      * index.txt de la PKI easy-rsa (à côté de "ca", ou pki_index) : état du
+        certificat (valid, revoked, expired), fin de validité, date de révocation ;
       * client-config-dir : un fichier par client ("disable" = désactivé,
         "ifconfig-push" = IP réservée) ; le fichier DEFAULT n'est pas un client ;
       * ifconfig-pool-persist (ipp.txt) : clients déjà venus et leur IP.
     Le CN du certificat du serveur ("cert") est retiré de la liste.
-    Renvoie {'users': {cn: infos}, 'ignored': nombre, 'notes': [textes]}.
+    Plusieurs certificats pour un même nom (renouvellement) : le meilleur compte
+    (valide, puis expiré, puis révoqué ; à état égal, la fin la plus lointaine).
+    Renvoie {'users': {cn: infos}, 'notes': [textes]}.
     """
     layout=openvpnLayout(server,"--offline")
     directives,inline,resolve,local=layout['directives'],layout['inline'],layout['resolve'],layout['local']
@@ -773,38 +795,39 @@ def knownUsers(server):
 
     users={}
     def user(cn):
-        return(users.setdefault(cn,{'cn':cn,'sources':[],'ip':'','cert_expires':None,'disabled':False,'banned':None}))
-    ignored=set()
+        return(users.setdefault(cn,{'cn':cn,'sources':[],'ip':'','cert_state':None,'cert_expires':None,
+                                    'revoked_at':None,'disabled':False,'banned':None}))
     now=time.time()
     if files.get('index',(1,))[0] == 0:
-        valid={}
         for line in files['index'][1].split('\n'):
+            # V|R|E <TAB> fin <TAB> révocation <TAB> numéro <TAB> fichier <TAB> /.../CN=nom
             fields=line.split('\t')
             match=re.search(r'/CN=([^/]+)',fields[-1]) if len(fields) >= 6 else None
             if not match:
                 continue
-            cn=match.group(1)
             expires=certExpiry(fields[1])
-            if fields[0] == 'V' and (expires is None or expires > now):
-                # Plusieurs certificats pour un même nom (renouvellement) : le plus lointain compte
-                valid[cn]=max(valid.get(cn) or 0,expires or 0) or None
+            if fields[0] == 'R':
+                state='revoked'
+            elif fields[0] == 'V' and (expires is None or expires > now):
+                state='valid'
             else:
-                ignored.add(cn)
-        for cn,expires in valid.items():
-            info=user(cn)
-            info['sources'].append('pki')
-            info['cert_expires']=expires
-        ignored-=set(valid)
+                state='expired'
+            info=user(match.group(1))
+            if 'pki' not in info['sources']:
+                info['sources'].append('pki')
+            if (CERT_RANK[state],expires or 0) > (CERT_RANK[info['cert_state']],info['cert_expires'] or 0):
+                info['cert_state'],info['cert_expires']=state,expires
+                info['revoked_at']=certExpiry(fields[2]) if state == 'revoked' else None
     if files.get('ipp',(1,))[0] == 0:
         for line in files['ipp'][1].split('\n'):
             fields=line.strip().split(',')
-            if len(fields) >= 2 and fields[0] and fields[0] not in ignored:
+            if len(fields) >= 2 and fields[0]:
                 info=user(fields[0])
                 info['sources'].append('ipp')
                 info['ip']=info['ip'] or fields[1]
     if files.get('ccd',(1,))[0] == 0:
         for cn,content in ccd.items():
-            if cn == 'DEFAULT' or cn in ignored:
+            if cn == 'DEFAULT':
                 continue
             info=user(cn)
             info['sources'].append('ccd')
@@ -819,36 +842,7 @@ def knownUsers(server):
     serverCn=certCommonName(serverPem) if serverPem else None
     if serverCn:
         users.pop(serverCn,None)
-    return({'users':users,'ignored':len(ignored),'notes':notes})
-
-
-def offlineUsers(known, connected, pattern):
-    """Utilisateurs connus non connectés : [infos + serveur], filtrés par pattern (nom ou IP), triés par nom.
-
-    known : {serveur: knownUsers()} ; connected : {serveur: CN connectés sur ce serveur}.
-    Un utilisateur connecté sur un autre serveur reste « non connecté » sur celui-ci.
-    """
-    offline=[]
-    for name,data in known.items():
-        for cn,info in data['users'].items():
-            if cn in connected.get(name,set()):
-                continue
-            if pattern and pattern.lower() not in cn.lower() and pattern not in info['ip']:
-                continue
-            offline.append({'server':name,**info})
-    return(sorted(offline,key=lambda u: (u['cn'].lower(),u['server'])))
-
-
-def offlineRows(offline, multi):
-    """Lignes du tableau des non connectés : nom, IP réservée, fin du certificat, sources, état."""
-    headers=(["Serveur"] if multi else [])+["Nom","IP réservée","Certificat jusqu'au","Sources","État"]
-    rows=[]
-    for u in offline:
-        rows.append(([u['server']] if multi else [])+[
-            u['cn'],u['ip'] or '-',
-            time.strftime("%Y-%m-%d",time.localtime(u['cert_expires'])) if u['cert_expires'] else '-',
-            ','.join(u['sources']),f"banni le {u['banned']}" if u['banned'] else "désactivé (ccd)" if u['disabled'] else ""])
-    return(headers,rows)
+    return({'users':users,'notes':notes})
 
 
 ################################################################################
@@ -900,60 +894,6 @@ def printTable(headers, rows):
         print(fmt(row))
 
 
-def sortClients(clients, key, reverse):
-    """Tri des connexions : cn, real, virtual, since (plus ancienne d'abord), rx, tx.
-
-    À clef égale, l'ordre des serveurs est gardé (tri stable sur une liste
-    déjà rangée par serveur).
-    """
-    keys={
-        'cn':lambda c: c['cn'].lower(),
-        'real':lambda c: c['real'],
-        'virtual':lambda c: tuple(int(p) for p in c['virtual'].split('.')) if re.fullmatch(r'[\d.]+',c['virtual']) else (999,c['virtual']),
-        'since':lambda c: c['since'] or 0,
-        'rx':lambda c: c['rx'],
-        'tx':lambda c: c['tx'],
-    }
-    return(sorted(clients,key=keys[key],reverse=reverse))
-
-
-def filterClients(clients, pattern):
-    """Connexions dont le nom, l'adresse réelle, l'IP VPN ou l'utilisateur contient pattern (sans casse)."""
-    if not pattern:
-        return(clients)
-    pattern=pattern.lower()
-    return([c for c in clients if any(pattern in c[k].lower() for k in ('cn','real','virtual','virtual6','username'))])
-
-
-def clientRows(clients, long, multi, rates=None):
-    """Lignes du tableau des connexions (et en-têtes).
-
-    multi : colonne Serveur en tête ; rates : colonnes de débit du mode --watch ;
-    long : colonnes en plus. La durée vient de c['duration'], calculée sur
-    l'heure du serveur concerné.
-    """
-    headers=["Serveur"] if multi else []
-    headers+=["Nom","Adresse réelle","IP VPN","Connecté depuis","Durée ","Reçu ","Envoyé "]
-    if rates is not None:
-        headers+=["Reçu/s ","Envoyé/s "]
-    headers+=["CID "]
-    if long:
-        headers+=["Utilisateur","IPv6 VPN","Chiffrement","Peer ID "]
-    rows=[]
-    for c in clients:
-        row=[c['server']] if multi else []
-        row+=[c['cn'],c['real'],c['virtual'] or c['virtual6'] or '-',humanDate(c['since']),humanDuration(c['duration']),
-              humanBytes(c['rx']),humanBytes(c['tx'])]
-        if rates is not None:
-            rate=rates.get(serverClientKey(c))
-            row+=[humanBytes(rate[0]) if rate else "-",humanBytes(rate[1]) if rate else "-"]
-        row+=["" if c['cid'] is None else c['cid']]
-        if long:
-            row+=[c['username'],c['virtual6'],c['cipher'],"" if c['peer_id'] is None else c['peer_id']]
-        rows.append(row)
-    return(headers,rows)
-
-
 def clientKey(client):
     """Identifiant stable d'une connexion entre deux status (CID, sinon nom + adresse)."""
     return(client['cid'] if client['cid'] is not None else (client['cn'],client['real']))
@@ -962,13 +902,6 @@ def clientKey(client):
 def serverClientKey(client):
     """clientKey précédé du serveur : deux serveurs peuvent avoir le même CID."""
     return((client['server'],clientKey(client)))
-
-
-def clientJson(client):
-    """Connexion pour --json : champs bruts, serveur, durée en secondes et date ISO."""
-    data=dict(client)
-    data['since_iso']=time.strftime("%Y-%m-%dT%H:%M:%S%z",time.localtime(client['since'])) if client['since'] else None
-    return(data)
 
 
 ################################################################################
@@ -1059,131 +992,344 @@ def prefixFor(name, multi):
 ################################################################################
 
 def actionServers(servers, defaults, args):
-    """Liste les serveurs de la configuration, ceux par défaut marqués d'une '*'."""
-    rows=[["*" if name in defaults else "",name,server.transport(),server.description] for name,server in servers.items()]
-    printTable(["","Serveur","Connexion","Description"],rows)
+    """Liste les serveurs de la configuration, ceux par défaut marqués d'une '*', avec leur cluster."""
+    rows=[["*" if name in defaults else "",name,server.cluster or "",server.transport(),server.description]
+          for name,server in servers.items()]
+    printTable(["","Serveur","Cluster","Connexion","Description"],rows)
     return(0)
 
 
-def collectClients(mgmts, pattern, sort, reverse):
-    """Connexions de tous les serveurs, filtrées et triées ; renvoie (connexions, {serveur: heure}, {serveur: CN connectés}, échecs).
+def gatherKnown(mgmts, required):
+    """knownUsers des serveurs qui ont openvpn_config, en parallèle ; erreurs et notes sur stderr.
 
-    Les CN connectés sont relevés avant le filtre : un connecté écarté par le
-    filtre ne doit pas apparaître parmi les non connectés.
-
-    Chaque connexion porte son serveur et sa durée, calculée sur l'heure
-    donnée par ce serveur (pas d'écart d'horloge avec la machine locale).
-    """
-    statuses,failed=gather(mgmts,lambda mgmt: mgmt.status())
-    clients=[]
-    times={}
-    connected={}
-    for name,status in statuses.items():
-        now=status['time'] or time.time()
-        times[name]=now
-        connected[name]={c['cn'] for c in status['clients']}
-        for c in status['clients']:
-            c['server']=name
-            c['duration']=now-c['since'] if c['since'] else None
-            clients.append(c)
-    return(sortClients(filterClients(clients,pattern),sort,reverse),times,connected,failed)
-
-
-def gatherKnown(mgmts):
-    """knownUsers de chaque serveur en parallèle ; erreurs et notes (fichier non lu...) sur stderr.
-
+    required (list -o / --full) : un serveur sans openvpn_config est une
+    erreur ; sinon il est simplement sans informations de certificat.
     Renvoie ({serveur: utilisateurs connus}, nombre d'échecs).
     """
-    known,failed=gather(mgmts,lambda mgmt: knownUsers(mgmt.server))
+    withConfig={name:mgmt for name,mgmt in mgmts.items() if mgmt.server.openvpnConfig}
+    failed=0
+    if required:
+        for name in mgmts:
+            if name not in withConfig:
+                say(f"ovpnMgmt: [{name}] --offline : ajouter openvpn_config (configuration du serveur OpenVPN)",file=sys.stderr)
+                failed+=1
+    known,readFailed=gather(withConfig,lambda mgmt: knownUsers(mgmt.server))
     for name,data in known.items():
         for note in data['notes']:
             say(f"ovpnMgmt: [{name}] note : {note}",file=sys.stderr)
-    return(known,failed)
+    return(known,failed+readFailed)
 
 
-def printPendingNote(clients):
+def groupsOf(mgmts):
+    """Groupe d'affichage de chaque serveur : {serveur: libellé}.
+
+    Les serveurs d'un même cluster traités ensemble forment un groupe (libellé
+    = nom du cluster) : un client n'y est compté qu'une fois. Un serveur seul
+    (sans cluster, ou seul de son cluster dans la sélection) est son propre groupe.
+    """
+    members={}
+    for name,mgmt in mgmts.items():
+        if mgmt.server.cluster:
+            members.setdefault(mgmt.server.cluster,[]).append(name)
+    groups={}
+    for name,mgmt in mgmts.items():
+        cluster=mgmt.server.cluster
+        groups[name]=cluster if cluster and len(members[cluster]) > 1 else name
+    return(groups)
+
+
+CERT_RANK={'valid':3,'expired':2,'revoked':1,None:0}
+
+def mergeKnown(known, groups):
+    """Utilisateurs connus réunis par groupe : {groupe: {cn: infos}}.
+
+    Dans un cluster : sources réunies, première IP réservée, certificat le
+    meilleur (valide > expiré > révoqué, puis la fin la plus lointaine), ban
+    et désactivation gardés par serveur.
+    """
+    merged={}
+    for server,data in known.items():
+        users=merged.setdefault(groups[server],{})
+        for cn,info in data['users'].items():
+            m=users.setdefault(cn,{'cn':cn,'sources':[],'ip':'','cert_state':None,'cert_expires':None,'revoked_at':None,
+                                   'banned':{},'disabled':{}})
+            m['sources']+=[s for s in info['sources'] if s not in m['sources']]
+            m['ip']=m['ip'] or info['ip']
+            if (CERT_RANK[info['cert_state']],info['cert_expires'] or 0) > (CERT_RANK[m['cert_state']],m['cert_expires'] or 0):
+                m['cert_state'],m['cert_expires'],m['revoked_at']=info['cert_state'],info['cert_expires'],info['revoked_at']
+            if info['banned']:
+                m['banned'][server]=info['banned']
+            if info['disabled']:
+                m['disabled'][server]=True
+    return(merged)
+
+
+def buildEntries(statuses, known, mgmts, offline):
+    """Lignes du tableau de list : connexions, puis (offline) utilisateurs connus non connectés.
+
+    Une connexion porte son serveur, sa durée (sur l'heure de ce serveur) et
+    les informations de certificat de son groupe. Un utilisateur est non
+    connecté dans un groupe s'il n'est connecté sur aucun de ses serveurs :
+    une seule ligne par groupe (libellé du cluster).
+    Renvoie (lignes, {serveur: heure du serveur}).
+    """
+    groups=groupsOf(mgmts)
+    merged=mergeKnown(known,groups)
+    groupServers={}
+    for server,group in groups.items():
+        groupServers.setdefault(group,[]).append(server)
+    entries=[]
+    times={}
+    connectedIn={}
+    for server,status in statuses.items():
+        now=status['time'] or time.time()
+        times[server]=now
+        for c in status['clients']:
+            info=merged.get(groups[server],{}).get(c['cn'],{})
+            entries.append({**c,'server':server,'group':groups[server],'connected':True,
+                            'duration':now-c['since'] if c['since'] else None,'ip':info.get('ip',''),
+                            'cert_state':info.get('cert_state'),'cert_expires':info.get('cert_expires'),
+                            'revoked_at':info.get('revoked_at'),'banned':info.get('banned',{}),
+                            'disabled':info.get('disabled',{}),'known':groups[server] in merged})
+            connectedIn.setdefault(groups[server],set()).add(c['cn'])
+    # Cluster : un nom connecté sur plusieurs de ses serveurs (même certificat sur deux appareils) n'occupe
+    # qu'une ligne, celle de la session la plus récente, avec la liste des serveurs
+    byName={}
+    for e in entries:
+        if e['group'] != e['server']:
+            byName.setdefault((e['group'],e['cn']),[]).append(e)
+    for sessions in byName.values():
+        if len(sessions) > 1:
+            kept=max(sessions,key=lambda e: e['since'] or 0)
+            kept['sessions']=[e['server'] for e in sessions]
+            kept['label']=', '.join(kept['sessions'])
+            entries=[e for e in entries if e is kept or e not in sessions]
+    if offline:
+        for group,users in merged.items():
+            for cn,info in users.items():
+                if cn in connectedIn.get(group,set()):
+                    continue
+                entries.append({'cn':cn,'server':group,'group':group,'connected':False,'real':'','virtual':'',
+                                'virtual6':'','since':None,'duration':None,'rx':None,'tx':None,'cid':None,
+                                'peer_id':None,'cipher':'','username':'','known':True,**info,
+                                'servers':groupServers[group]})
+    return(entries,times)
+
+
+def entryState(entry):
+    """État affiché : connecté, ou non connecté / banni / désactivé (sur tout le groupe ou une partie)."""
+    if entry['connected']:
+        sessions=entry.get('sessions')
+        return(f"connecté ({len(sessions)} sessions)" if sessions else "connecté")
+    servers=entry.get('servers',[entry['server']])
+    banned=entry['banned']
+    if banned:
+        if len(banned) == len(servers):
+            return(f"banni le {min(banned.values())}")
+        return(f"banni sur {', '.join(sorted(banned))}")
+    disabled=entry['disabled']
+    if disabled:
+        return("désactivé (ccd)" if len(disabled) == len(servers) else f"désactivé (ccd) sur {', '.join(sorted(disabled))}")
+    return("non connecté")
+
+
+def certText(entry, now):
+    """Fin de validité du certificat : "2027-03-01 (144 j)", "expiré le …", "révoqué le …", "hors PKI" (nom absent de
+    l'index.txt lu), "" si aucune PKI n'a été lue pour ce serveur."""
+    if not entry['known']:
+        return("")
+    state,expires=entry['cert_state'],entry['cert_expires']
+    if state == 'revoked':
+        return(f"révoqué le {humanDay(entry['revoked_at'])}" if entry['revoked_at'] else "révoqué")
+    if state == 'expired':
+        return(f"expiré le {humanDay(expires)}")
+    if state == 'valid':
+        return(f"{humanDay(expires)} ({int((expires-now)//86400)} j)" if expires else "valide")
+    return("hors PKI")
+
+
+def humanDay(epoch):
+    """Date seule d'un epoch, "?" s'il est inconnu."""
+    return(time.strftime("%Y-%m-%d",time.localtime(epoch)) if epoch else "?")
+
+
+def filterEntries(entries, pattern):
+    """Lignes dont le nom, l'adresse réelle, l'IP VPN, l'IP réservée ou l'utilisateur contient pattern (sans casse)."""
+    if not pattern:
+        return(entries)
+    pattern=pattern.lower()
+    return([e for e in entries if any(pattern in (e[k] or '').lower() for k in ('cn','real','virtual','virtual6','username','ip'))])
+
+
+def sortEntries(entries, key, reverse):
+    """Tri : cn mêle connectés et non connectés ; les autres clefs trient les connexions, puis les non connectés par nom.
+
+    À clef égale, l'ordre des serveurs est gardé (tri stable).
+    """
+    keys={
+        'cn':lambda e: e['cn'].lower(),
+        'real':lambda e: e['real'],
+        'virtual':lambda e: tuple(int(p) for p in e['virtual'].split('.')) if re.fullmatch(r'[\d.]+',e['virtual']) else (999,e['virtual']),
+        'since':lambda e: e['since'] or 0,
+        'rx':lambda e: e['rx'] or 0,
+        'tx':lambda e: e['tx'] or 0,
+    }
+    if key == 'cn':
+        return(sorted(entries,key=keys['cn'],reverse=reverse))
+    connected=sorted([e for e in entries if e['connected']],key=keys[key],reverse=reverse)
+    offline=sorted([e for e in entries if not e['connected']],key=keys['cn'],reverse=reverse)
+    return(connected+offline)
+
+
+NOT_CONNECTED="___"
+
+def entryRows(entries, long, multi, showCert, showState, rates=None):
+    """En-têtes et lignes du tableau de list ; "___" dans les colonnes de connexion d'un non connecté."""
+    headers=["Serveur"] if multi else []
+    headers+=["Nom","Adresse réelle","IP VPN","Connecté depuis","Durée ","Reçu ","Envoyé "]
+    if rates is not None:
+        headers+=["Reçu/s ","Envoyé/s "]
+    headers+=["CID "]
+    if showCert:
+        headers+=["Certificat"]
+    if showState:
+        headers+=["État"]
+    if long:
+        headers+=["Utilisateur","IPv6 VPN","Chiffrement","Peer ID "]
+    now=time.time()
+    rows=[]
+    for e in entries:
+        row=[e.get('label',e['server'])] if multi else []
+        if e['connected']:
+            row+=[e['cn'],e['real'],e['virtual'] or e['virtual6'] or '-',humanDate(e['since']),humanDuration(e['duration']),
+                  humanBytes(e['rx']),humanBytes(e['tx'])]
+            if rates is not None:
+                rate=rates.get(serverClientKey(e))
+                row+=[humanBytes(rate[0]) if rate else "-",humanBytes(rate[1]) if rate else "-"]
+            row+=["" if e['cid'] is None else e['cid']]
+        else:
+            # IP VPN : l'IP réservée (ipp.txt, ifconfig-push) entre parenthèses, s'il y en a une
+            row+=[e['cn'],NOT_CONNECTED,f"({e['ip']})" if e['ip'] else NOT_CONNECTED]+[NOT_CONNECTED]*4
+            if rates is not None:
+                row+=[NOT_CONNECTED]*2
+            row+=[NOT_CONNECTED]
+        if showCert:
+            row+=[certText(e,now)]
+        if showState:
+            row+=[entryState(e)]
+        if long:
+            row+=[e['username'],e['virtual6'],e['cipher'],"" if e['peer_id'] is None else e['peer_id']]
+        rows.append(row)
+    return(headers,rows)
+
+
+def entryJson(entry):
+    """Ligne pour --json : champs bruts, état, dates ISO."""
+    iso=lambda epoch: time.strftime("%Y-%m-%dT%H:%M:%S%z",time.localtime(epoch)) if epoch else None
+    data={k:v for k,v in entry.items() if k not in ('known',)}
+    data['state']=entryState(entry)
+    data['since_iso']=iso(entry['since'])
+    data['cert_expires_iso']=iso(entry['cert_expires'])
+    data['revoked_at_iso']=iso(entry['revoked_at'])
+    return(data)
+
+
+def printPendingNote(entries):
     """Note sous le tableau quand des connexions n'ont pas (encore) d'IP VPN."""
-    if any(not c['virtual'] and not c['virtual6'] for c in clients):
+    if any(e['connected'] and not e['virtual'] and not e['virtual6'] for e in entries):
         print("IP VPN « - » : connexion en cours d'établissement, ou refusée (ban, certificat...) ; "
               "OpenVPN la retire de la liste sous quelques secondes")
 
 
-def printOffline(offline, known, multi):
-    """Section des non connectés, sous le tableau des connexions."""
-    ignored=sum(data['ignored'] for data in known.values())
-    print()
+def listTable(mgmts, args, known, watch=None):
+    """Interroge les serveurs et prépare le tableau ; renvoie (lignes affichées, en-têtes, lignes du tableau, masqués, échecs).
+
+    Sans --full, les non connectés au certificat révoqué ou expiré sont
+    masqués (comptés) ; un connecté reste toujours affiché. watch (mode
+    --watch) : {'previous': octets du status précédent, 'times': ses heures},
+    mis à jour ici ; le débit vient de l'écart avec le status qui vient d'être lu.
+    """
+    statuses,failed=gather(mgmts,lambda mgmt: mgmt.status())
+    entries,times=buildEntries(statuses,known,mgmts,args.offline or args.full)
+    rates=None
+    if watch is not None:
+        rates={}
+        connected=[e for e in entries if e['connected']]
+        for e in connected:
+            before=watch['previous'].get(serverClientKey(e))
+            elapsed=times[e['server']]-watch['times'].get(e['server'],times[e['server']])
+            if before and elapsed > 0:
+                rates[serverClientKey(e)]=(max(0,e['rx']-before[0])/elapsed,max(0,e['tx']-before[1])/elapsed)
+        watch['previous']={serverClientKey(e):(e['rx'],e['tx']) for e in connected}
+        watch['times']=times
+    entries=filterEntries(entries,args.filter)
+    hidden=0
+    if not args.full:
+        kept=[e for e in entries if e['connected'] or e['cert_state'] not in ('revoked','expired')]
+        hidden=len(entries)-len(kept)
+        entries=kept
+    entries=sortEntries(entries,args.sort,args.reverse)
+    headers,rows=entryRows(entries,args.long,len(mgmts) > 1,bool(known),args.offline or args.full,rates)
+    return(entries,headers,rows,hidden,failed)
+
+
+def printSummary(entries, mgmts, hidden):
+    """Ligne de bilan : connexions (par serveur s'il y en a plusieurs), non connectés, masqués."""
+    # Sessions réelles : une ligne de cluster peut en regrouper plusieurs
+    sessions=[server for e in entries if e['connected'] for server in e.get('sessions',[e['server']])]
+    offline=sum(1 for e in entries if not e['connected'])
+    text=f"{len(sessions)} connexion(s)"
+    if len(mgmts) > 1:
+        text+=" ("+', '.join(f"{name} {sessions.count(name)}" for name in mgmts)+")"
     if offline:
-        print("Non connectés :")
-        headers,rows=offlineRows(offline,multi)
-        printTable(headers,rows)
-        print(f"\n{len(offline)} non connecté(s)"+(f" ; {ignored} révoqué(s) ou expiré(s) non affiché(s)" if ignored else ""))
-    else:
-        print("Aucun utilisateur connu non connecté."+(f" ({ignored} révoqué(s) ou expiré(s) non affiché(s))" if ignored else ""))
+        text+=f", {offline} non connecté(s)"
+    if hidden:
+        text+=f" ; {hidden} révoqué(s) ou expiré(s) masqué(s) (--full)"
+    text+=" ; reçu / envoyé : vus "+("de chaque serveur" if len(mgmts) > 1 else "du serveur")
+    print(text)
 
 
 def actionList(mgmts, args):
-    """Connexions actives de tous les serveurs : tableau, --json, ou rafraîchi toutes les --watch secondes avec le débit.
+    """Connexions de tous les serveurs, et avec -o les utilisateurs connus non connectés, dans un seul tableau.
 
-    --offline ajoute les utilisateurs connus non connectés (lus une fois, au
-    lancement, dans les fichiers d'OpenVPN).
+    Colonne Certificat (fin de validité) dès qu'un serveur a openvpn_config ;
+    --full ajoute les certificats révoqués ou expirés ; --json, ou rafraîchi
+    toutes les --watch secondes avec le débit. Les fichiers d'OpenVPN sont
+    lus une fois, au lancement.
     """
-    multi=len(mgmts) > 1
-    known,knownFailed={},0
-    if args.offline:
-        known,knownFailed=gatherKnown(mgmts)
+    known,knownFailed=gatherKnown(mgmts,args.offline or args.full)
     if args.watch is None:
-        clients,times,connected,failed=collectClients(mgmts,args.filter,args.sort,args.reverse)
+        entries,headers,rows,hidden,failed=listTable(mgmts,args,known)
         failed+=knownFailed
-        offline=offlineUsers(known,connected,args.filter)
         if args.json:
-            data=[clientJson(c) for c in clients]
-            if args.offline:
-                for u in offline:
-                    u['cert_expires_iso']=time.strftime("%Y-%m-%dT%H:%M:%S%z",time.localtime(u['cert_expires'])) if u['cert_expires'] else None
-                data={'connected':data,'offline':offline}
-            print(json.dumps(data,indent=2,ensure_ascii=False))
+            print(json.dumps([entryJson(e) for e in entries],indent=2,ensure_ascii=False))
             return(1 if failed else 0)
-        if not clients:
-            print("Aucune connexion active." if not args.filter else f"Aucune connexion ne correspond à « {args.filter} ».")
-        else:
-            headers,rows=clientRows(clients,args.long,multi)
-            printTable(headers,rows)
-            if multi:
-                counts=', '.join(f"{name} {sum(1 for c in clients if c['server'] == name)}" for name in times)
-                print(f"\n{len(clients)} connexion(s) ({counts}) ; reçu / envoyé : vus de chaque serveur")
-            else:
-                print(f"\n{len(clients)} connexion(s) ; reçu / envoyé : vus du serveur")
-            printPendingNote(clients)
-        if args.offline:
-            printOffline(offline,known,multi)
+        if not entries:
+            print("Aucune connexion active." if not args.filter else f"Aucune ligne ne correspond à « {args.filter} ».")
+            if hidden:
+                print(f"{hidden} révoqué(s) ou expiré(s) masqué(s) (--full)")
+            return(1 if failed else 0)
+        printTable(headers,rows)
+        print()
+        printSummary(entries,mgmts,hidden)
+        printPendingNote(entries)
         return(1 if failed else 0)
 
     # Mode --watch : connexions gardées ouvertes, débit calculé entre deux status de chaque serveur
-    previous={}
-    previousTimes={}
+    watch={'previous':{},'times':{}}
     while True:
-        clients,times,connected,failed=collectClients(mgmts,args.filter,args.sort,args.reverse)
-        rates={}
-        for c in clients:
-            before=previous.get(serverClientKey(c))
-            elapsed=times[c['server']]-previousTimes.get(c['server'],times[c['server']])
-            if before and elapsed > 0:
-                rates[serverClientKey(c)]=(max(0,c['rx']-before[0])/elapsed,max(0,c['tx']-before[1])/elapsed)
+        entries,headers,rows,hidden,failed=listTable(mgmts,args,known,watch)
         with printLock:
             sys.stdout.write("\033[H\033[2J")
-            print(f"{', '.join(mgmts)} — {humanDate(time.time())} — {len(clients)} connexion(s) — "
-                  f"rafraîchi toutes les {args.watch:g} s (Ctrl-C pour quitter)\n")
-            if clients:
-                headers,rows=clientRows(clients,args.long,multi,rates)
+            print(f"{', '.join(mgmts)} — {humanDate(time.time())} — rafraîchi toutes les {args.watch:g} s (Ctrl-C pour quitter)\n")
+            if entries:
                 printTable(headers,rows)
-                printPendingNote(clients)
+                print()
+                printSummary(entries,mgmts,hidden)
+                printPendingNote(entries)
             else:
                 print("Aucune connexion active.")
-            if args.offline:
-                printOffline(offlineUsers(known,connected,args.filter),known,multi)
             sys.stdout.flush()
-        previous={serverClientKey(c):(c['rx'],c['tx']) for c in clients}
-        previousTimes=times
         time.sleep(args.watch)
 
 
@@ -1737,7 +1883,7 @@ def buildParser():
         epilog=f"Configuration : {DEFAULT_CONFIG} (ou $OVPNMGMT_CONF, ou -c). Sans commande : list.")
     parser.add_argument('-c','--config',default=os.environ.get('OVPNMGMT_CONF',DEFAULT_CONFIG),help="fichier de configuration")
     parser.add_argument('-s','--server',action='append',metavar='SERVEUR',
-                        help="serveur(s) à traiter : -s a -s b ou -s a,b (défaut : ceux de la configuration)")
+                        help="serveur(s) ou cluster(s) à traiter : -s a -s b ou -s a,b (défaut : ceux de la configuration)")
     parser.add_argument('-a','--all',action='store_true',help="tous les serveurs de la configuration")
     parser.add_argument('-D','--debug',action='store_true',help="affiche les échanges avec le management sur stderr")
     parser.add_argument('-V','--version',action='version',version=f"%(prog)s {Version}")
@@ -1751,7 +1897,8 @@ def buildParser():
     p.add_argument('--json',action='store_true',help="sortie JSON")
     p.add_argument('-w','--watch',type=positiveFloat,metavar='SEC',help="rafraîchit toutes les SEC secondes, avec le débit")
     p.add_argument('-o','--offline',action='store_true',
-                   help="ajoute les utilisateurs connus non connectés (PKI, ccd, ipp.txt ; openvpn_config requis)")
+                   help="ajoute au tableau les utilisateurs connus non connectés (PKI, ccd, ipp.txt ; openvpn_config requis)")
+    p.add_argument('--full',action='store_true',help="comme -o, avec aussi les certificats révoqués ou expirés")
 
     sub.add_parser('servers',help="serveurs de la configuration (* = par défaut)")
 

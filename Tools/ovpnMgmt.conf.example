@@ -15,6 +15,7 @@ default = paris
 
 [paris]
 description = VPN Paris (production)
+cluster = paris-ha
 # Destination ssh : user@hote, ou un Host de ~/.ssh/config (ProxyJump, clef... y sont pris en compte)
 ssh = admin@vpn-paris.example.com
 # Options ssh en plus, au besoin
@@ -28,6 +29,17 @@ password_file = ~/.config/ovpnMgmt/paris.pass
 openvpn_config = /etc/openvpn/server/server.conf
 # Ces fichiers sont souvent réservés à root : lecture (et écriture pour killban / unban, dans le
 # client-config-dir) par "sudo -n" (sudo sans mot de passe requis)
+sudo = yes
+
+# Cluster : plusieurs serveurs d'un même service VPN ; traités ensemble (-s paris-ha, ou default = paris-ha),
+# chaque client n'apparaît qu'une fois dans list
+[paris2]
+description = VPN Paris, second nœud
+cluster = paris-ha
+ssh = admin@vpn-paris2.example.com
+management = 127.0.0.1:7505
+password_file = ~/.config/ovpnMgmt/paris.pass
+openvpn_config = /etc/openvpn/server/server.conf
 sudo = yes
 
 [lyon]
