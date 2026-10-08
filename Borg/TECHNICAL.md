@@ -2346,11 +2346,18 @@ morte aussitôt ne coupe plus le délai de l'enfant), SIGKILL à l'arbre relevé
 `_index_diffs` : moniteur (`trees` par paire) et borg lancé pendant l'arrêt (SIGTERM, 5 s pour la tête et l'arbre, SIGKILL) ; `_run_diff` ne lance
 plus borg si l'arrêt est déjà demandé. Vrai borg mesuré : `exec nice borg.wrapped` (chargeur PyInstaller + enfant) — SIGTERM relayé
 (1,1 s), SIGINT non (11 s), SIGKILL jamais (enfant survivant, `_MEI` laissé). `_mei_mapped(pids)` : dossiers `_MEI*` mappés par
-ces processus (`/proc/<pid>/maps`), relevés par `_kill_tree` AVANT le signal ; `_purge_mei_dirs(dirs)` les retire ensuite s'ils
+ces processus (`/proc/<pid>/maps`), relevés AVANT le signal ; `_purge_mei_dirs(dirs)` les retire ensuite s'ils
 sont à nous et plus utilisés (`_mei_in_use`), même tout juste extraits — jamais l'extraction d'un autre borg (avant/après par
-listing : écarté en revue). Utilisé par boex, `_index_diffs`, borgHelperWWW `_borg_killgrp`/`_borg_reap` (`_group_pids` du
-groupe) ; `_bkp_server_version` : voir story 43 ci-dessous. borgHelperWWW `_run_group` (`_exec_borghelper`, `_latest_archive`) : session propre,
-au délai `killpg` SIGTERM, 10 s, SIGKILL, puis `TimeoutExpired` (504) ; registre `_LIVE_GROUPS` : `_signal_groups(sig)` relaie
+listing : écarté en revue). Appelants : `_kill_tree` (boex, `_index_diffs`, `_stop_fresh_borg`), `_bkp_server_version` (voir story
+43 ci-dessous), borgHelperWWW `_borg_killgrp`/`_borg_reap`, `_run_group`/`_signal_groups` (WWW 1.31.9 ; `_group_pids` du groupe).
+1.0.191 (revue story 65) : un chemin n'est retenu que par un composant au nom PyInstaller (`_MEI_NAME` : `_MEI` + 6 caractères
+alphanumériques, gabarit `mkdtemp` du chargeur) dont le parent (realpath) est un dossier temporaire DE CE processus
+(`_proc_tmpdirs(pid)` : TMPDIR, TEMP, TMP de `/proc/<pid>/environ`, chemins absolus, puis `/tmp`, `/var/tmp`, `/usr/tmp` — l'ordre
+de recherche du chargeur ; environ illisible : ces trois seuls) — avant, tout chemin contenant « /_MEI » (maps, cwd, fd) : un `borg
+extract` (boex, `/restore` via `_run_group`) qui écrit dans `<dest>/…/_MEIxxx` ou y travaille voyait ce dossier de DONNÉES retiré.
+`_purge_mei_dirs` refuse aussi tout nom hors motif (défense), comme les purges par motif `<tmp>/_MEI*` : `_purge_mei_orphans` et
+`_mei_dirs` (donc `_purge_run_mei`) ne retiennent qu'un nom au motif — un `/tmp/_MEIdonnees` vieux et inutilisé n'est plus retiré. borgHelperWWW `_run_group` (`_exec_borghelper`, `_latest_archive`) : session propre,
+au délai `killpg` SIGTERM, 10 s, SIGKILL, puis `TimeoutExpired` (504) ; registre `_LIVE_GROUPS` (1.31.9 : `{Popen: _MEI* relevés}`) : `_signal_groups(sig)` relaie
 l'arrêt du serveur (`handle_exit` : 1er signal le même, 2e SIGKILL ; atexit et `threading._register_atexit` : SIGKILL) —
 sans condition sur `poll()` (la tête morte au SIGTERM, son enfant vit encore dans le groupe, mesuré). `_cache_fingerprint` :
 `-wal` (mtime_ns, taille) de chaque base en plus du fichier principal. `_path_present(p)` (ENOENT seul = absent) :
@@ -2372,6 +2379,31 @@ sans délai avec des restes : idem avant la réponse, une ligne `[WARN] … proc
 bornes : réponse en général 10 s après le délai, 30 s au plus (tubes encore tenus après le SIGKILL) ; registre `_LIVE_GROUPS` gardé jusqu'au groupe vide. Mesuré sur 1.31.1 :
 504 en 6,07 s, enfant vivant 12 s après (SIGKILL sauté) ; 1.31.2 : 504 en 16,1 s, groupe vide ; arrêt du serveur : enfant tué
 10,1 s après le 1er signal.
+**`_MEI*` des arrêts de `_run_group` (WWW 1.31.9, story 65, F334)** : le chargeur PyInstaller de borg ne retire son dossier
+`/tmp/_MEI*` (~57 Mo) que si son enfant sort de lui-même (SIGTERM traité, code 143) ; enfant tué par un signal non traité (SIGKILL,
+ou SIGTERM avant que borg installe son gestionnaire) -> chargeur mort (-15), dossier laissé (mesuré hors serveur,
+`work/m65/sigterm_borg*.log`). Mesure (`mesure65.py`, `GET /api/key`, `TIMEOUT=4`, deux piles 3.10 / 3.14) — G : enfant de borg
+figé (SIGKILL) ; D : chargeur figé dès son apparition (délai pendant le démarrage) ; T : enfant figé puis relâché 1 s après le délai.
+Avant (1.31.8, `work/m65/mesure65-o3.log`) : G 504 en 14,1 s / 14,1 s, D 5,0 s / 5,1 s, T 5,1 s / 5,1 s, un `_MEI*` laissé dans
+chaque cas. Après (1.31.9, `work/m65/mesure65-f.log`) : G 14,2 s / 14,1 s, D 5,1 s / 5,1 s, T 5,1 s / 5,1 s, aucun `_MEI*` laissé ;
+code final, relevé restreint aux dossiers temporaires (`mesure65-f2.log`) : G 14,1 s / 14,2 s, D 5,1 s / 5,1 s, T 5,0 s / 5,1 s, aucun.
+Mécanisme, comme les téléchargements (`_borg_killgrp`/`_borg_reap`) : `_run_group` tient un jeu `meis`, enrichi de
+`_mei_mapped(_group_pids(pgid))` juste AVANT chaque signal qu'il envoie (SIGTERM puis SIGKILL du délai, et des restes après une sortie
+sans délai) ; `_LIVE_GROUPS` devient `{Popen: meis}` et `_signal_groups` relève de même avant de relayer le 1er signal d'arrêt du
+serveur — jamais avant un SIGKILL relayé (2e signal, atexit : le serveur sort, personne ne purgerait ; parcours de /proc évité dans
+le gestionnaire de signal). Chaque relevé est dans un `try` : une erreur n'empêche jamais le signal. Le `finally` de `_run_group`
+retire le groupe du registre (sous `_LIVE_GROUPS_LOCK`) PUIS appelle `_purge_mei_dirs(meis)` ; `_signal_groups` relève sous ce même
+verrou et seulement si le groupe est encore au registre (son instantané peut dater d'avant le retrait) — jamais un ajout à un jeu
+déjà purgé ; dossiers à nous et plus utilisés (`_mei_in_use`) seulement, jamais par motif ni par âge
+(`_purge_mei_orphans`). Sortie normale sans signal : rien relevé, aucune purge, aucune attente. Signaux, délais et codes HTTP
+inchangés. Limites : arrêt forcé du serveur (2e signal, atexit) non couvert ; relevé ponctuel — un chargeur saisi entre deux
+fichiers de son extraction (ni fd ni mappage dans `_MEI*` à cet instant) échappe ; un membre qui survit au SIGKILL (état D) garde
+son dossier (`_mei_in_use`), jamais repris ensuite (le fil de `_run_group` est fini) ; serveur sous un uvicorn externe
+(`uvicorn borgHelperWWW:app`) : `_make_server` n'est pas utilisé, le 1er signal n'est pas relayé (seul `_signal_groups(9)` d'atexit)
+— non couvert ; extraction jamais relevée si le TMPDIR de borg est relatif (écarté par `_proc_tmpdirs`), si borg est construit avec
+un `runtime_tmpdir` PyInstaller (dossier hors des dossiers temporaires), ou si `/proc/<pid>/environ` est illisible alors que borg a
+son propre TMPDIR (repli : /tmp, /var/tmp, /usr/tmp seuls) ; une restauration dont un chemin devient enfant direct d'un dossier
+temporaire avec un nom au motif (`dest=/`, `tmp/_MEIxxxxxx` dans l'archive) reste relevée, et retirée si plus utilisée.
 
 **Report pendant un Bkp (1.0.183, story 50)** : marqueur de Bkp `<prefix>-<nick>-bkp.lock.<run_id>` dans `CACHE_DIR` (nick hors
 `[a-zA-Z0-9_-]` : remplacé par `_` et suffixé de 8 caractères de son SHA-1), contenu = PID, écrit par `_set_pid_lock` (`.tmp` +

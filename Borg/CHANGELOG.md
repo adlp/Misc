@@ -1,5 +1,45 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.31.9, borgHelper 1.0.191 — Commande arrêtée par borgHelperWWW : dossiers _MEI* de borg retirés à l'arrêt — 2026-10-08
+
+Chantier « reconstruction progressive », story 65 (F334, décision de l'utilisateur). Avant : une commande arrêtée par
+borgHelperWWW (délai `BORGHELPERWWW_TIMEOUT` -> 504, restes après la sortie de borgHelper, arrêt du serveur relayé) laissait le
+dossier d'extraction PyInstaller de son borg (`/tmp/_MEI*`, ~57 Mo) quand borg était tué au SIGKILL ou arrêté pendant son
+démarrage — le chargeur ne retire son dossier que si borg sort de lui-même. Les téléchargements les retiraient déjà (1.31.1).
+
+- borgHelperWWW 1.31.9 : `_run_group` relève les `_MEI*` de son groupe juste avant chaque signal (SIGTERM, SIGKILL ; 1er signal
+  d'arrêt du serveur relayé par `_signal_groups`) et les retire une fois le groupe vide, s'ils ne sont plus utilisés — seuls
+  ceux de ce borg, jamais l'extraction d'un autre ; jamais par motif ni par âge. Une erreur du relevé n'empêche jamais le
+  signal. Signaux, délais et codes HTTP inchangés ; sortie normale : rien relevé, aucune attente. Concerne toute commande passée
+  à borgHelper par l'API (`/restore` compris), le `BkpReconcile` du watcher et le `borg list` des téléchargements.
+- borgHelper 1.0.191 : `_mei_mapped` ne relève plus qu'un dossier au nom PyInstaller (`_MEI` + 6 caractères alphanumériques)
+  situé dans un dossier temporaire du processus relevé (TMPDIR, TEMP, TMP de son environnement, puis /tmp, /var/tmp, /usr/tmp) —
+  avant, tout chemin contenant « /_MEI » : un `borg extract` (boex, `/restore`) qui écrivait dans `<dest>/…/_MEIxxx` ou y
+  travaillait voyait ce dossier de données retiré à son arrêt. `_purge_mei_dirs`, `_purge_mei_orphans` et `_mei_dirs` (fin de
+  CodecSelfTest) refusent tout nom hors motif (un `/tmp/_MEIdonnees` vieux et inutilisé n'est plus retiré).
+- Limites : arrêt forcé du serveur (2e signal, atexit) non couvert (le serveur sort : rien relevé ni retiré) ; sous un uvicorn
+  externe (`uvicorn borgHelperWWW:app`), le 1er signal n'est pas relayé (seul le SIGKILL d'atexit) — non couvert ; relevé
+  ponctuel — un chargeur saisi entre deux fichiers de son extraction (ni fichier ouvert ni mappage à cet instant) échappe ; un
+  membre qui survit au SIGKILL (état D) garde son dossier, jamais repris ensuite ; extraction jamais relevée si le TMPDIR de borg
+  est relatif, si borg est construit avec un `runtime_tmpdir`, ou si son environnement est illisible alors qu'il a son propre
+  TMPDIR ; une restauration dont un chemin devient enfant direct d'un dossier temporaire avec un nom au motif (`dest=/`,
+  `tmp/_MEIxxxxxx` dans l'archive) reste relevée.
+- Mesuré (`mesure65.py`, deux piles 3.10 / 3.14, `TIMEOUT=4`) — G (borg figé, SIGKILL), D (délai pendant le démarrage de borg),
+  T (borg relâché 1 s après le délai). Avant (`work/m65/mesure65-o3.log`) : G 504 en 14,1 s / 14,1 s, D 5,0 s / 5,1 s, T 5,1 s /
+  5,1 s, un `_MEI*` laissé dans chaque cas. Après (`work/m65/mesure65-f.log`) : G 14,2 s / 14,1 s, D 5,1 s / 5,1 s, T 5,1 s /
+  5,1 s, aucun `_MEI*` laissé ; code final (`mesure65-f2.log`) : G 14,1 s / 14,2 s, D 5,1 s / 5,1 s, T 5,0 s / 5,1 s, aucun.
+- Contrôles : push selftest « délai et arrêts de borgHelperWWW (_run_group) : _MEI* du groupe… » — `os.killpg` espionné (le jeu du
+  groupe contient le dossier au moment du signal attendu) ; délai avec dossier tenu seulement au SIGTERM (vu au SIGKILL), membre
+  mort au SIGTERM qui tient le dossier par mmap, par un fd seul, par son cwd seul ; restes après sortie ; 1er signal relayé ;
+  2e signal (SIGKILL relayé) sans relevé ; dossier encore utilisé gardé ; relevé en erreur : signal envoyé (SIGTERM et SIGKILL du
+  délai, relais) ; membre de type `/restore` : dossier de données au motif hors de son TMPDIR, tenu par fd ou cwd, intact après
+  le 504 ; sortie normale sans relevé ni purge ; voisin au motif, vieilli, dans `tempfile.tempdir` du contrôle : intact. Factices
+  fidèles (TMPDIR = dossier du test, noms au motif) dans les contrôles `_MEI` de borgHelper et de borgHelperWWW. CodecSelfTest :
+  « _MEI* d'un borg tué » (données `_MEI…` hors dossier temporaire tenues par fd et cwd, nom long tenu dans TMPDIR : jamais
+  relevés ; TMPDIR par lien symbolique ; repli /tmp, /var/tmp, /usr/tmp sans TMPDIR ; TEMP seul) ; orphelins de boex et fin de
+  run : nom hors motif vieilli gardé ; nouveau contrôle sur vrai borg (`borg serve` figé, avec TMPDIR et sans) : un dossier au
+  motif dans son dossier temporaire, retiré après l'arrêt, rien laissé.
+
 ## borgHelper 1.0.190 — BkpReconcile : nick inconnu en une ligne — 2026-10-08
 
 Chantier « reconstruction progressive », story 64 (rétrospective 61-63, F336, A121 ; décision de l'utilisateur). Avant :

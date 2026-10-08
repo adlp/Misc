@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.190"
+Version="1.0.191"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -4547,17 +4547,54 @@ def _tree_wait(ps,tree,until,mei=None):
         if time.monotonic()>=until: return tree,False
         time.sleep(0.1)
 
+_MEI_NAME=re.compile(r'_MEI[A-Za-z0-9]{6}')   # 1.0.191 : nom d'une extraction PyInstaller (mkdtemp « _MEIXXXXXX »)
+_MEI_SYS_TMP=('/tmp','/var/tmp','/usr/tmp')   # repli du chargeur PyInstaller après TMPDIR, TEMP, TMP
+
+def _proc_tmpdirs(pid):
+    """1.0.191 (revue story 65) : dossiers où le chargeur PyInstaller du processus `pid` a pu extraire — TMPDIR, TEMP, TMP de son
+    environnement (/proc/<pid>/environ, chemins absolus), puis /tmp, /var/tmp, /usr/tmp ; environ illisible : ces trois seuls.
+    Realpath de chacun."""
+    cand=[]
+    try:
+        with open(f'/proc/{pid}/environ','rb') as f: raw=f.read()
+        env={}
+        for e in raw.split(b'\0'):
+            k,sep,v=e.partition(b'=')
+            if sep: env.setdefault(k,v)
+        for k in (b'TMPDIR',b'TEMP',b'TMP'):
+            v=os.fsdecode(env.get(k) or b'')
+            if v.startswith('/'): cand.append(v)
+    except (OSError,ValueError): pass
+    out=set()
+    for x in cand+list(_MEI_SYS_TMP):
+        try: out.add(os.path.realpath(x))
+        except (OSError,ValueError): pass
+    return out
+
 def _mei_mapped(pids):
     """1.0.179 (A91) : dossiers _MEI* (PyInstaller) mappés par ces processus (/proc/<pid>/maps) — relevés avant de les tuer :
     seuls ceux-là sont retirés ensuite (jamais l'extraction d'un autre borg). 1.0.180 (revue story 43) : aussi ceux qu'ils
     tiennent ouverts (/proc/<pid>/fd) ou où ils travaillent (cwd) — un chargeur tué PENDANT son extraction écrit ses fichiers
-    sans encore rien mapper (comme _mei_in_use)."""
+    sans encore rien mapper (comme _mei_in_use). 1.0.191 (revue story 65) : seul un dossier au nom de PyInstaller (`_MEI` + 6
+    caractères alphanumériques) dont le parent (realpath) est un dossier temporaire DE CE processus (_proc_tmpdirs) — avant, tout
+    chemin contenant « /_MEI » : un `borg extract` qui écrit dans `<dest>/…/_MEIxxx` (ou y travaille) voyait ce dossier de
+    données retiré. Appelants : _kill_tree (boex, _index_diffs, _stop_fresh_borg), _bkp_server_version ; borgHelperWWW :
+    _borg_killgrp, _borg_reap, _run_group, _signal_groups."""
     out=set()
-    def add(path):
-        j=path.find('/_MEI')
-        if j<0: return
-        k=path.find('/',j+1); out.add(path[:k] if k>0 else path)
     for p in pids or ():
+        tmps=None; seen={}
+        def add(path):
+            nonlocal tmps
+            if '/_MEI' not in path: return
+            parts=path.split('/')
+            for i in range(1,len(parts)):
+                if not _MEI_NAME.fullmatch(parts[i]): continue
+                parent='/'.join(parts[:i]) or '/'
+                if tmps is None: tmps=_proc_tmpdirs(p)
+                if parent not in seen:
+                    try: seen[parent]=os.path.realpath(parent) in tmps
+                    except (OSError,ValueError): seen[parent]=False
+                if seen[parent]: out.add('/'.join(parts[:i+1])); return
         try:
             with open(f'/proc/{p}/maps') as f:
                 for l in f:
@@ -4600,10 +4637,13 @@ def _kill_tree(ps,sig,known=None,mei=None):
     return known
 
 def _purge_mei_dirs(dirs):
-    """1.0.179 (A91) : retire les dossiers _MEI* donnés (relevés par _kill_tree sur les borg tués), s'ils sont à nous et plus
-    utilisés par aucun processus — même tout juste extraits (que _purge_mei_orphans, 120 s sans modification, garde)."""
+    """1.0.179 (A91) : retire les dossiers _MEI* donnés (relevés par _mei_mapped avant l'arrêt de borg : _kill_tree,
+    _bkp_server_version, borgHelperWWW), s'ils sont à nous et plus utilisés par aucun processus — même tout juste extraits (que
+    _purge_mei_orphans, 120 s sans modification, garde). 1.0.191 (revue story 65) : nom hors motif PyInstaller (`_MEI` + 6
+    caractères alphanumériques) refusé — défense : jamais un dossier de données qui ne fait que commencer par « _MEI »."""
     for d in list(dirs or ()):   # 1.0.181 (revue) : copie atomique — le jeu est partagé par les fils de l'Index (mei.update)
         try:
+            if not _MEI_NAME.fullmatch(os.path.basename(d)): continue
             st=os.lstat(d)
             if stat.S_ISDIR(st.st_mode) and st.st_uid==os.getuid() and not _mei_in_use(d): shutil.rmtree(d,ignore_errors=True)
         except Exception: pass
@@ -4612,19 +4652,23 @@ def _purge_mei_orphans(min_age=120):
     """Répertoires PyInstaller (<TMPDIR>/_MEI*, ~60 Mo chacun) laissés par un borg arrêté par SIGKILL, ou par SIGTERM
     pendant son démarrage : retirés s'ils sont à nous, plus modifiés depuis min_age s (jamais une extraction en cours)
     et utilisés par aucun processus (_mei_in_use). Appelé après tout arrêt de borg (1.0.145 : boex à l'échéance
-    compris — un selftest en laissait 2 Go dans /tmp)."""
+    compris — un selftest en laissait 2 Go dans /tmp). 1.0.191 (revue story 65) : nom au motif PyInstaller seulement
+    (_MEI_NAME) — jamais un dossier de données qui ne fait que commencer par « _MEI »."""
     import tempfile
     for d in glob.glob(os.path.join(tempfile.gettempdir(),'_MEI*')):
         try:
+            if not _MEI_NAME.fullmatch(os.path.basename(d)): continue
             st=os.lstat(d)
             if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or time.time()-st.st_mtime<min_age: continue
             if not _mei_in_use(d): shutil.rmtree(d,ignore_errors=True)
         except Exception: pass
 
 def _mei_dirs():
-    """_MEI* de tempfile.gettempdir() et de /tmp : boex reconstruit l'environnement de borg sans TMPDIR."""
+    """_MEI* de tempfile.gettempdir() et de /tmp : boex reconstruit l'environnement de borg sans TMPDIR. 1.0.191 (revue story
+    65) : nom au motif PyInstaller seulement (_MEI_NAME) — _purge_run_mei n'en retire jamais d'autre."""
     import tempfile
-    return set().union(*(glob.glob(os.path.join(x,'_MEI*')) for x in {tempfile.gettempdir(),'/tmp'}))
+    return {d for x in {tempfile.gettempdir(),'/tmp'} for d in glob.glob(os.path.join(x,'_MEI*'))
+            if _MEI_NAME.fullmatch(os.path.basename(d))}
 
 def _mei_newest(d):
     """mtime le plus récent de d et de son arborescence (lstat) : une extraction écrit dans les sous-répertoires."""
@@ -9828,7 +9872,8 @@ def codec_selftest(pattern=None,list_only=False):
             le bilan, code inchangé ; rien avec -l. codec_selftest imbriqué (^HMAC), _purge_run_mei espionné."""
             import inspect
             real=_purge_run_mei; sig=inspect.signature(real).parameters
-            x=os.path.join(tempfile.gettempdir(),f'_MEIs14h-{os.getpid()}-avant'); y=x[:-5]+'pendant'
+            # 1.0.191 : noms au motif PyInstaller (_mei_dirs ne relève que ceux-là)
+            x=os.path.join(tempfile.gettempdir(),f'_MEIa{os.getpid()%100000:05d}'); y=os.path.join(tempfile.gettempdir(),f'_MEIp{os.getpid()%100000:05d}')
             calls=[]; out={}
             def spy(before,*a,**k): calls.append((x in before,y in before,a,k)); return spy.ret
             mkd=tempfile.mkdtemp
@@ -11428,14 +11473,15 @@ def codec_selftest(pattern=None,list_only=False):
             # 1.0.180 (story 43, A94) : borg muet qui mappe un _MEI* (enfant sous un sh, comme le chargeur PyInstaller) -> seul CE
             # dossier retiré après le SIGKILL du groupe (avant : listing avant/après de /tmp) ; un voisin jamais relevé intact
             # revue : + un _MEI* tenu OUVERT sans mappage (chargeur tué pendant son extraction) ; mode tunnel (borg local, le cas réel)
-            md=os.path.join(d,'mei'); shutil.rmtree(md,ignore_errors=True); mei=os.path.join(md,'_MEIv43ab'); meix=os.path.join(md,'_MEIx43ab')
+            md=os.path.join(d,'mei'); shutil.rmtree(md,ignore_errors=True); mei=os.path.join(md,'_MEIv43abc'); meix=os.path.join(md,'_MEIx43abc')
             os.makedirs(mei); os.makedirs(meix)
             with open(os.path.join(mei,'lib.so'),'wb') as f: f.write(b'\0'*8192)
             mpy=("import mmap,sys,time\nf=open(sys.argv[1],'rb'); m=mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ); f.close()\n"
                  "w=open(sys.argv[3],'w'); w.write('x'); w.flush()\nopen(sys.argv[2],'w').write('ok'); time.sleep(30)")
             mok=os.path.join(d,'mei-ok'); scope=os.path.join(d,'meiscope'); shutil.rmtree(scope,ignore_errors=True); os.makedirs(scope)
-            voisin=os.path.join(scope,'_MEIneuf')   # extraction d'un autre borg née pendant l'appel, dans la portée de _mei_dirs
-            slowmei=sh('slowmei',f'{shlex.quote(sys.executable)} -c {shlex.quote(mpy)} {shlex.quote(os.path.join(mei,"lib.so"))} '
+            voisin=os.path.join(scope,'_MEIvoisin')   # extraction d'un autre borg née pendant l'appel, dans la portée de _mei_dirs
+            # 1.0.191 : TMPDIR du faux borg = dossier de ses _MEI (seul un _MEI de SON dossier temporaire est relevé), noms au motif
+            slowmei=sh('slowmei',f'TMPDIR={shlex.quote(md)} {shlex.quote(sys.executable)} -c {shlex.quote(mpy)} {shlex.quote(os.path.join(mei,"lib.so"))} '
                                  f'{shlex.quote(mok)} {shlex.quote(os.path.join(meix,"part"))} & wait')
             vr=subprocess.run([borg,'--version'],capture_output=True,text=True,stdin=subprocess.DEVNULL,timeout=60)
             ver=vr.stdout.strip().split()[-1] if vr.returncode==0 and vr.stdout.strip() else None
@@ -17966,8 +18012,8 @@ fail()
                   "    sys.stderr.write('Received SIGTERM\\n'); sys.stdout.write('{\"fin\":1}\\n'); sys.stdout.flush(); sys.exit(143)\n")
             deaf=("import signal,sys,time\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nsys.stderr.write('prêt\\n'); sys.stderr.flush()\n"
                   "sys.stdout.write('x'*200000); sys.stdout.flush()\ntime.sleep(60)\n")
-            def launch(c,*a):
-                p=subprocess.Popen([sys.executable,'-c',c,*a],encoding='utf-8',stdout=subprocess.PIPE,stderr=subprocess.PIPE,stdin=subprocess.DEVNULL)
+            def launch(c,*a,env=None):
+                p=subprocess.Popen([sys.executable,'-c',c,*a],encoding='utf-8',stdout=subprocess.PIPE,stderr=subprocess.PIPE,stdin=subprocess.DEVNULL,env=env)
                 ready=p.stderr.readline().strip()=='prêt'; full=False; end=time.monotonic()+20
                 cap=fcntl.fcntl(p.stdout.fileno(),1032)   # F_GETPIPE_SZ : capacité réelle du tube (revue : pas toujours 64 Kio)
                 while ready and time.monotonic()<end:
@@ -17982,8 +18028,9 @@ fail()
                 tree,done=_tree_wait(p,tree,time.monotonic()+2,set())
                 res['témoin sans vidage : bloqué']=(ok and not done,ok,done)
                 _kill_tree(p,signal.SIGKILL,tree,set()); p.wait(5)
-                md=tempfile.mkdtemp(prefix='mei44-',dir=tmp); mei=os.path.realpath(os.path.join(md,'_MEIf44ab')); os.makedirs(mei)
-                p,ok=launch(code,mei); procs.append(p); meis=set(); t0=time.monotonic(); done=_stop_fresh_borg(p,meis); dt=time.monotonic()-t0
+                # 1.0.191 : TMPDIR du factice = parent du _MEI (seul un _MEI de son dossier temporaire est relevé)
+                md=tempfile.mkdtemp(prefix='mei44-',dir=tmp); mei=os.path.realpath(os.path.join(md,'_MEIf44abc')); os.makedirs(mei)
+                p,ok=launch(code,mei,env=dict(os.environ,TMPDIR=md)); procs.append(p); meis=set(); t0=time.monotonic(); done=_stop_fresh_borg(p,meis); dt=time.monotonic()-t0
                 res['vidé : sorti seul, _MEI retiré']=(ok and done and p.returncode==143 and dt<3 and mei in meis and not os.path.exists(mei),
                                                      ok,done,p.returncode,round(dt,2),sorted(meis),os.path.exists(mei))
                 p,ok=launch(deaf); procs.append(p); t0=time.monotonic(); done=_stop_fresh_borg(p,set(),grace=2); dt=time.monotonic()-t0
@@ -18083,21 +18130,45 @@ fail()
         def _mei_purge_mapped():
             """1.0.179 (story 42, A91 ; revue) : _MEI* relevé par _mei_mapped sur le processus (fichier mappé, comme les bibliothèques
             du chargeur PyInstaller) ; _purge_mei_dirs le garde tant qu'un processus le mappe, le retire une fois ce processus tué —
-            même tout juste créé ; un _MEI* voisin jamais relevé (un autre borg) n'est jamais touché."""
-            base=tempfile.mkdtemp(prefix='mei42-',dir=tmp); d=os.path.join(base,'_MEIk42ab'); other=os.path.join(base,'_MEIautre'); res={}
-            os.makedirs(d); os.makedirs(other)
+            même tout juste créé ; un _MEI* voisin jamais relevé (un autre borg) n'est jamais touché. 1.0.191 (revue story 65) :
+            TMPDIR du factice = dossier de base (comme le chargeur, qui extrait dans SON dossier temporaire), noms au motif ; un
+            dossier de DONNÉES au nom de PyInstaller hors de ses dossiers temporaires (borg extract qui y écrit : fd, cwd) n'est
+            jamais relevé ni retiré ; nom hors motif dans le dossier temporaire : jamais relevé ; _purge_mei_dirs refuse un nom
+            hors motif."""
+            base=os.path.realpath(tempfile.mkdtemp(prefix='mei42-',dir=tmp)); d=os.path.join(base,'_MEIk42abc'); other=os.path.join(base,'_MEIautre1'); res={}
+            data=os.path.join(base,'dest','_MEIdata01'); short=os.path.join(base,'_MEIdat')   # données hors TMPDIR ; nom hors motif
+            badname=os.path.join(base,'_MEIdonnees')   # hors motif (7+ caractères) : tenu -> jamais relevé ; inutilisé -> refusé par _purge_mei_dirs
+            for x in (d,other,data,short,badname): os.makedirs(x)
             with open(os.path.join(d,'lib.so'),'wb') as f: f.write(b'\0'*8192)
-            code=("import mmap,sys,time\nf=open(sys.argv[1],'rb'); m=mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ); f.close()\n"
-                  "print('ok',flush=True); time.sleep(60)")
-            hp=_rb_popen([sys.executable,'-c',code,os.path.join(d,'lib.so')],stdout=subprocess.PIPE,stdin=subprocess.DEVNULL,text=True)
+            code=("import mmap,os,sys,time\nf=open(sys.argv[1],'rb'); m=mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ); f.close()\n"
+                  "g=open(os.path.join(sys.argv[2],'part'),'w'); h=open(os.path.join(sys.argv[3],'part'),'w'); os.chdir(sys.argv[2])\n"
+                  "k=open(os.path.join(sys.argv[4],'part'),'w')\nprint('ok',flush=True); time.sleep(60)")
+            link=os.path.join(tmp,f'mei42-lien-{os.getpid()}'); os.symlink(base,link)   # TMPDIR par lien symbolique : realpath
+            hp=_rb_popen([sys.executable,'-c',code,os.path.join(d,'lib.so'),data,short,badname],stdout=subprocess.PIPE,stdin=subprocess.DEVNULL,
+                         text=True,env=dict(os.environ,TMPDIR=link))
             try:
                 res['mappé']=(hp.stdout.readline().strip()=='ok',)
-                got=_mei_mapped([hp.pid]); res['relevé']=(got=={d},got)
+                got=_mei_mapped([hp.pid]); res['relevé : seul le _MEI de son dossier temporaire']=(got=={d},got)
                 _purge_mei_dirs(got); res['utilisé : gardé']=(os.path.isdir(d),)
             finally: _rb_killtree(hp)
             with contextlib.suppress(subprocess.TimeoutExpired): hp.wait(5)
             _purge_mei_dirs(got); res['tué : retiré']=(not os.path.exists(d),)
             res['voisin intact']=(os.path.isdir(other),)
+            res['données _MEI hors dossier temporaire (fd, cwd) : intactes']=(os.path.isfile(os.path.join(data,'part')),)
+            res['nom hors motif : intact']=(os.path.isdir(short),)
+            _purge_mei_dirs({badname}); res['purge : nom hors motif refusé']=(os.path.isdir(badname),)
+            # _proc_tmpdirs : sans TMPDIR/TEMP/TMP -> repli /tmp, /var/tmp, /usr/tmp (cas réel de boex) ; TEMP seul -> base
+            bare={k:v for k,v in os.environ.items() if k not in ('TMPDIR','TEMP','TMP')}
+            sysd={os.path.realpath(x) for x in ('/tmp','/var/tmp','/usr/tmp')}
+            for tag,env in (('aucun',bare),('TEMP',dict(bare,TEMP=link))):
+                qp=_rb_popen([sys.executable,'-c',"import time; print('ok',flush=True); time.sleep(60)"],stdout=subprocess.PIPE,
+                             stdin=subprocess.DEVNULL,text=True,env=env)
+                try:
+                    up=qp.stdout.readline().strip()=='ok'; got_t=_proc_tmpdirs(qp.pid)
+                finally: _rb_killtree(qp)
+                want=sysd|({base} if tag=='TEMP' else set())
+                res[f'dossiers temporaires ({tag})']=(up and got_t==want,got_t,want)
+            os.unlink(link)
             shutil.rmtree(base,ignore_errors=True)
             bad={k:v for k,v in res.items() if not v[0]}
             if bad: print(f"  {bad}")
@@ -18450,25 +18521,28 @@ fail()
             gardés : celui qu'un processus vivant mappe (comme un borg : bibliothèques mappées, répertoire courant ailleurs
             — fuser ne le voit pas) et celui d'une extraction récente."""
             ctx=_ix_ctx(); b=_ix_bh(ctx,'c-mei'); td=tempfile.gettempdir()
-            orphan,used,fresh=(tempfile.mkdtemp(prefix=f'_MEIs8{k}',dir=td) for k in 'oun')
+            # 1.0.191 : noms au motif PyInstaller (_MEI + 6) ; + un dossier de DONNÉES hors motif, vieux et inutilisé : gardé
+            orphan,used,fresh=(os.path.join(td,f'_MEI{k}{secrets.token_hex(3)[:5]}') for k in 'oun')
+            for d in (orphan,used,fresh): os.makedirs(d)
+            data=tempfile.mkdtemp(prefix='_MEIdonnees-',dir=td)
             lib=os.path.join(used,'lib.so')
             with open(lib,'wb') as f: f.write(b'\0'*4096)
             holder=subprocess.Popen([sys.executable,'-c',"import mmap,sys,time; f=open(sys.argv[1],'rb'); "
                                      "m=mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ); f.close(); print(1,flush=True); time.sleep(60)",lib],
                                     cwd=tmp,stdout=subprocess.PIPE)
             holder.stdout.readline()   # fichier mappé, descripteur fermé
-            for d in (orphan,used): os.utime(d,(time.time()-600,)*2)
+            for d in (orphan,used,data): os.utime(d,(time.time()-600,)*2)
             _ix_slow(ctx,'ALL',5)
             try:
                 b.borg._stop=lambda: True
                 rb=b.borg.boex('ix',['list','--json'])
             finally:
                 b.borg._stop=None; _ix_slow(ctx,None,0); holder.kill(); holder.wait()
-                kept=os.path.isdir(used) and os.path.isdir(fresh)
-                for d in (used,fresh): shutil.rmtree(d,ignore_errors=True)
+                kept=os.path.isdir(used) and os.path.isdir(fresh); kept_data=os.path.isdir(data)
+                for d in (used,fresh,data): shutil.rmtree(d,ignore_errors=True)
             gone=not os.path.exists(orphan); shutil.rmtree(orphan,ignore_errors=True)
-            ok=bool(rb.get('killed')) and gone and kept
-            if not ok: print(f"  _MEI : tué {rb.get('killed')}, orphelin retiré {gone}, mappé et récent gardés {kept}")
+            ok=bool(rb.get('killed')) and gone and kept and kept_data
+            if not ok: print(f"  _MEI : tué {rb.get('killed')}, orphelin retiré {gone}, mappé et récent gardés {kept}, données hors motif gardées {kept_data}")
             return ok
         def _sc_scope():
             """1.0.146 (story 9 R6), dépôt neuf partagé par deux machines (a-*, b-*) :
@@ -18860,21 +18934,26 @@ fail()
             vivant (cwd dedans), récent sans attente et sous-répertoire actif gardés ; récent modifié pendant
             l'attente gardé ; récent retiré après l'attente."""
             import tempfile
-            base=os.path.join(tempfile.gettempdir(),f'_MEIs14-{os.getpid()}-'); real=_mei_dirs
-            own=lambda: {d for d in real() if d.startswith(base)}
+            # 1.0.191 : noms au motif PyInstaller (_MEI + 2 chiffres du pid + 4) ; own() = dossiers créés ici SEULEMENT (jamais
+            # un vrai _MEI qui partagerait le préfixe) ; un dossier hors motif, vieux, du dossier temporaire n'est jamais relevé
+            base=os.path.join(tempfile.gettempdir(),f'_MEI{os.getpid()%100:02d}'); real=_mei_dirs; made=set()
+            own=lambda: {d for d in real() if d in made}
+            hors=tempfile.mkdtemp(prefix='_MEIdonnees-'); os.utime(hors,(time.time()-600,)*2)
             def mk(s,age,sub_age=None):
+                made.add(base+s)
                 os.makedirs(os.path.join(base+s,'sub'),exist_ok=True)
                 os.utime(os.path.join(base+s,'sub'),(time.time()-(age if sub_age is None else sub_age),)*2)
                 os.utime(base+s,(time.time()-age,)*2); return base+s
             p=None; r={}
             try:
                 with mock.patch.dict(globals(),{'_mei_dirs':own}):
-                    pre=mk('pre',60); before=own()
-                    orph=mk('orph',60); live=mk('live',60); fresh=mk('fresh',0); other=mk('other',60)
+                    pre=mk('pre0',60); before=own()
+                    orph=mk('orph',60); live=mk('live',60); fresh=mk('frsh',0); other=mk('othr',60)
                     deep=mk('deep',60,sub_age=0)
                     p=subprocess.Popen(['sleep','60'],cwd=live)
                     with mock.patch.object(os,'getuid',return_value=os.getuid()+1):
                         r['autre']=(_purge_run_mei(own()-{other},min_age=10,wait=0),os.path.exists(other))
+                    r['hors motif']=(hors in real(),)
                     r['n1']=_purge_run_mei(before|{other},min_age=10,wait=0)
                     r['st1']={k:os.path.exists(v) for k,v in (('pre',pre),('orph',orph),('live',live),('fresh',fresh),('deep',deep))}
                     def touch(): time.sleep(0.6); open(os.path.join(fresh,'sub','x'),'w').close()
@@ -18884,9 +18963,9 @@ fail()
                     r['attente']=(_purge_run_mei(own()-{fresh},min_age=4,wait=5),os.path.exists(fresh))   # attente réelle (~1,5 s)
             finally:
                 if p: p.kill(); p.wait()
-                for d in real():
-                    if d.startswith(base): shutil.rmtree(d,ignore_errors=True)
-            ok=(r.get('autre')==(0,True) and r.get('n1')==1
+                for d in made: shutil.rmtree(d,ignore_errors=True)
+                shutil.rmtree(hors,ignore_errors=True)
+            ok=(r.get('autre')==(0,True) and r.get('hors motif')==(False,) and r.get('n1')==1
                 and r.get('st1')=={'pre':True,'orph':False,'live':True,'fresh':True,'deep':True}
                 and r.get('modifié')==(0,True) and r.get('attente')==(1,False))
             if not ok: print(f"  _MEI fin de run : {r}")
@@ -20111,6 +20190,42 @@ fail()
             if not ok: print(f"  version {ver!r} ; {out} ; direct {live} ; HTML {(ch, want_bs in oh)} ; ArchiveHistory {ah} ; Status {st}")
             return ok
         _rbc("versions de borg sur vrai borg par ssh : serveur différent du créateur, commande forcée, échec du serveur",_bver_real_ssh)
+        def _mei_real_borg():
+            """1.0.191 (revue story 65) : garde du gabarit PyInstaller sur un VRAI borg (si le nom ou le dossier d'extraction
+            changeait, le nettoyage s'arrêterait sans bruit). `borg serve` (attend sur stdin) lancé par un wrapper isolé
+            (_rb_wrapper, BORG_BASE_DIR du test), son enfant figé (SIGSTOP) dès qu'il existe : _mei_mapped(_group_pids(...)) rend
+            UN dossier au motif `_MEI` + 6 dont le parent est un dossier temporaire du processus — TMPDIR du test, puis sans
+            TMPDIR/TEMP/TMP (cas de boex) : /tmp ; groupe tué (SIGKILL), dossier retiré par _purge_mei_dirs, rien laissé."""
+            d=os.path.join(tmp,'rb-mei'); bb=os.path.join(d,'bb'); mt=os.path.join(d,'mt'); w=os.path.join(d,'borgw.sh')
+            for x in (bb,mt): os.makedirs(x)
+            _rb_wrapper(w,bb); res={}
+            def kids(pid): return _proc_kids().get(pid,[])
+            for tag,env,parent in (('TMPDIR',_rb_env(bb,TMPDIR=mt),os.path.realpath(mt)),
+                                   ('sans TMPDIR',{k:v for k,v in _rb_env(bb).items() if k not in ('TMPDIR','TEMP','TMP')},os.path.realpath('/tmp'))):
+                mei_ls=lambda: {x for x in os.listdir(parent) if x.startswith('_MEI')}
+                before=mei_ls(); ps=_rb_popen([w,'serve'],stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,
+                                                             stderr=subprocess.DEVNULL,env=env)
+                meis=set(); child=None
+                try:
+                    t0=time.monotonic()
+                    while child is None and ps.poll() is None and time.monotonic()-t0<60:
+                        k=kids(ps.pid)
+                        if k: child=k[0]; os.kill(child,signal.SIGSTOP)
+                        else: time.sleep(0.02)
+                    if child is not None: meis=_mei_mapped(_group_pids(ps.pid))
+                    tmps=_proc_tmpdirs(child) if child is not None else set()
+                finally:
+                    _rb_killtree(ps,wait=10)
+                _purge_mei_dirs(meis)
+                left=sorted(mei_ls()-before)
+                one=next(iter(meis)) if len(meis)==1 else ''
+                res[tag]=(child is not None and len(meis)==1 and bool(_MEI_NAME.fullmatch(os.path.basename(one)))
+                          and os.path.dirname(one)==parent and parent in tmps and not os.path.exists(one) and left==[],
+                          child,sorted(meis),parent,left)
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        _rbc("_MEI* d'un vrai borg : relevé au motif PyInstaller dans son dossier temporaire (TMPDIR, /tmp sans TMPDIR), retiré après l'arrêt (1.0.191)",_mei_real_borg)
         # 1.0.167 (story 30) : Bkp -n ALL / liste avec plusieurs nicks internes — un nick après l'autre (vrai borg, CLI)
         def _mb_env(tag,m1_mid='',m1_roots=None):
             """Dépôts neufs m1, m2 (+ externe mx, écarté par -n ALL) ; wrapper BORG_EXE isolé ; m1 peut avoir son propre

@@ -77,7 +77,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.31.8"
+WWW_VERSION="1.31.9"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -2211,12 +2211,23 @@ def _run_group(argv,timeout,env):
     l'extérieur, OOM, 1er signal d'arrêt relayé) : SIGTERM, 10 s, SIGKILL, puis réponse (décision de l'utilisateur), une ligne
     [WARN] au journal. Le groupe reste au registre (`_signal_groups`) jusqu'à vide. Bornes : au délai, la réponse part en général
     10 s après (SIGKILL), 30 s au plus (tubes encore tenus après le SIGKILL : 10 s de plus pour les lire) ; restes après une
-    sortie sans délai : 10 s, 20 s au plus."""
+    sortie sans délai : 10 s, 20 s au plus.
+    1.31.9 (story 65, F334, décision de l'utilisateur ; mesuré : borg figé -> SIGKILL, ou délai pendant le démarrage de borg ->
+    un /tmp/_MEI* de ~57 Mo laissé par arrêt — le chargeur PyInstaller ne retire son dossier que si son enfant sort de lui-même) :
+    comme les téléchargements (_borg_killgrp/_borg_reap), _MEI* de CE groupe relevés avant chaque signal (`_mei_mapped`, avant
+    le SIGTERM et le SIGKILL du délai ou des restes après sortie ; `_signal_groups` pour le signal d'arrêt du serveur relayé),
+    retirés une fois le groupe vide s'ils ne sont plus utilisés (`_purge_mei_dirs`) — jamais l'extraction d'un autre borg ;
+    sortie normale sans signal : rien relevé, aucune attente."""
     import signal as _sg
     proc=subprocess.Popen(argv,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=env,start_new_session=True)
-    with _LIVE_GROUPS_LOCK: _LIVE_GROUPS.add(proc)   # revue : relais des signaux d'arrêt du serveur (session propre)
+    meis=set()   # 1.31.9 : _MEI* relevés avant chaque signal (ici et par _signal_groups), retirés dans le finally
+    with _LIVE_GROUPS_LOCK: _LIVE_GROUPS[proc]=meis   # revue : relais des signaux d'arrêt du serveur (session propre)
     timed=False; out=err=None
+    def mark():   # 1.31.9 : avant le signal (un mort ne mappe plus rien) ; une erreur du relevé n'empêche jamais le signal
+        try: meis.update(_mei_mapped(_group_pids(proc.pid)))
+        except Exception: pass
     def term():
+        mark()
         try: os.killpg(proc.pid,_sg.SIGTERM)
         except OSError: pass
         return time.monotonic()+10
@@ -2233,6 +2244,7 @@ def _run_group(argv,timeout,env):
                       f"(code {proc.returncode}, pids {_group_pids(proc.pid) or '?'}) — SIGTERM, SIGKILL après 10 s",file=sys.stderr)
                 until=term()
         if until is not None and not _group_wait(proc.pid,until):   # /proc illisible : sonde killpg(0), jamais « vide » par défaut
+            mark()
             try: os.killpg(proc.pid,_sg.SIGKILL)
             except OSError: pass
             _group_wait(proc.pid,time.monotonic()+10)
@@ -2240,7 +2252,10 @@ def _run_group(argv,timeout,env):
             try: out,err=proc.communicate(timeout=10)
             except subprocess.TimeoutExpired: out,err='',''   # tube tenu hors groupe (démon) : jamais une attente sans fin
     finally:
-        with _LIVE_GROUPS_LOCK: _LIVE_GROUPS.discard(proc)
+        # 1.31.9 : retiré du registre AVANT la purge (_signal_groups n'ajoute plus rien au jeu ensuite) ; groupe vide ici (ou
+        # membre que le SIGKILL n'atteint pas : ses dossiers, encore utilisés, sont gardés)
+        with _LIVE_GROUPS_LOCK: _LIVE_GROUPS.pop(proc,None)
+        if meis: _purge_mei_dirs(meis)
     if timed: raise subprocess.TimeoutExpired(argv,timeout)
     return subprocess.CompletedProcess(argv,proc.returncode,out,err)
 
@@ -2256,13 +2271,24 @@ def _argv_label(argv):
 # systemd le faisaient avant ; second, atexit : SIGKILL).
 # 1.31.4 (revue story 57) : RLock — uvicorn >= 0.54 appelle handle_exit (-> _signal_groups) dans le VRAI gestionnaire de signal
 # (signal.signal), donc sur le fil principal, éventuellement pendant qu'il tient déjà ce verrou : un Lock s'y interbloquerait.
-_LIVE_GROUPS=set(); _LIVE_GROUPS_LOCK=threading.RLock()
+# 1.31.9 (story 65) : {Popen: _MEI* relevés} — le jeu est celui de _run_group, qui le purge une fois le groupe vide.
+_LIVE_GROUPS={}; _LIVE_GROUPS_LOCK=threading.RLock()
 
 def _signal_groups(sig):
     # Jamais conditionné à pr.poll() : le 1er signal tue la tête (borgHelper) et laisse un enfant qui l'ignore — le groupe
     # reste au registre jusqu'à vide (1.31.2, _run_group) ; le 2e (SIGKILL) doit l'atteindre (mesuré).
-    with _LIVE_GROUPS_LOCK: procs=list(_LIVE_GROUPS)
-    for pr in procs:
+    with _LIVE_GROUPS_LOCK: items=list(_LIVE_GROUPS.items())
+    import signal as _sg
+    for pr,meis in items:
+        # 1.31.9 (story 65) : relevé avant le signal, purgé par le fil de _run_group une fois le groupe vide — jamais pour SIGKILL
+        # (2e signal, atexit : le serveur sort, personne ne purgerait ; parcours de /proc évité dans le gestionnaire de signal).
+        # Sous _LIVE_GROUPS_LOCK et seulement si le groupe est encore au registre : _run_group le retire (sous ce verrou) AVANT
+        # de purger — jamais un ajout à un jeu déjà purgé. Une erreur du relevé n'empêche jamais le signal.
+        if sig!=_sg.SIGKILL:
+            with _LIVE_GROUPS_LOCK:
+                if pr in _LIVE_GROUPS:
+                    try: meis.update(_mei_mapped(_group_pids(pr.pid)))
+                    except Exception: pass
         try: os.killpg(pr.pid,sig)
         except OSError: pass
 
@@ -5871,13 +5897,13 @@ def push_selftest():
                     """1.31.1 (story 42, A91 ; mutation W8) : borg de téléchargement tué (chien de garde) — ses _MEI* relevés par mappage
                     AVANT le kill (_borg_killgrp), retirés par _borg_reap ; un _MEI* voisin jamais relevé (un autre borg) intact."""
                     import tempfile, shutil as _sh
-                    base=tempfile.mkdtemp(prefix='mei42w-',dir=tmpdir); d=os.path.join(base,'_MEIw42ab'); other=os.path.join(base,'_MEIautre')
+                    base=tempfile.mkdtemp(prefix='mei42w-',dir=tmpdir); d=os.path.join(base,'_MEIw42abc'); other=os.path.join(base,'_MEIautre1')
                     os.makedirs(d); os.makedirs(other)
                     with open(os.path.join(d,'lib.so'),'wb') as f: f.write(b'\0'*8192)
                     code=("import mmap,sys,time\nf=open(sys.argv[1],'rb'); m=mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ); f.close()\n"
                           "print('ok',flush=True); time.sleep(60)")
                     proc=subprocess.Popen([sys.executable,'-c',code,os.path.join(d,'lib.so')],stdout=subprocess.PIPE,stdin=subprocess.DEVNULL,
-                                          text=True,start_new_session=True)
+                                          text=True,start_new_session=True,env=dict(os.environ,TMPDIR=base))   # 1.31.9 : TMPDIR du factice
                     try:
                         mapped=proc.stdout.readline().strip()=='ok'
                         st={'last':time.monotonic(),'why':None,'meis':set()}
@@ -5890,13 +5916,172 @@ def push_selftest():
                     if not ok: print(f"  {got}")
                     return ok
                 check("/download/* : borg tué par le chien de garde -> ses _MEI* relevés avant le kill et retirés, voisin intact (A91)",_killgrp_mei)
+                def _run_group_mei():
+                    """1.31.9 (story 65, F334 ; mesuré sur 1.31.8 : borg figé -> SIGKILL, ou délai pendant son démarrage -> un _MEI*
+                    laissé par arrêt) : _run_group relève les _MEI* de SON groupe avant chaque signal et les retire une fois le groupe
+                    vide. Factices sh -> python, membre du groupe autre que la tête, TMPDIR = dossier de base (le chargeur extrait dans
+                    SON dossier temporaire), noms au motif PyInstaller ; os.killpg espionné : le jeu du registre (_LIVE_GROUPS[proc])
+                    au moment de CHAQUE signal doit déjà contenir le dossier (ordre « relevé puis signal », jamais un hasard de timing).
+                    Cas : délai, dossier tenu seulement au SIGTERM (vu au SIGKILL) ; délai, membre mort au SIGTERM qui tient le dossier
+                    par mmap, par un fd ouvert seulement, par son cwd seulement (chargeur tué pendant son extraction) ; restes après
+                    la sortie de « borgHelper » ; signal d'arrêt relayé (_signal_groups SIGTERM) ; 2e signal (SIGKILL relayé) : aucun
+                    relevé (limite documentée : dossier laissé) ; dossier encore tenu hors du groupe : gardé ; relevé en erreur : le
+                    signal part quand même (délai, SIGKILL du délai, relais) ; sortie normale : rien relevé ni purgé, aucune attente ;
+                    voisin au motif dans le dossier temporaire, vieilli de 600 s, jamais relevé : intact — tempfile.tempdir = ce dossier
+                    pendant le contrôle (restauré), pour qu'une purge par motif ou par âge (_purge_mei_orphans) y soit vue ; membre de
+                    type /restore : dossier de DONNÉES au motif hors du TMPDIR du membre, tenu par fd ou cwd, après un 504 : intact."""
+                    import tempfile, shutil as _sh, signal as _sg, glob as _gl
+                    from borgHelper import _proc_live
+                    real_run_group=_run_group; real_purge=_purge_mei_dirs; real_mapped=_mei_mapped; real_killpg=os.killpg
+                    base=os.path.realpath(tempfile.mkdtemp(prefix='mei65-',dir=tmpdir)); env=dict(os.environ,TMPDIR=base)
+                    other=os.path.join(base,'_MEIvoisin'); os.makedirs(other); os.utime(other,(time.time()-600,)*2)
+                    res={}; purged=[]; nmapped=[0]; sigs=[]
+                    def spy_purge(dirs): purged.append(set(dirs)); return real_purge(dirs)
+                    def spy_mapped(p): nmapped[0]+=1; return real_mapped(p)
+                    def bad_mapped(p): raise RuntimeError('relevé en erreur (selftest)')
+                    nbad=[0]
+                    def bad_second(p):   # relevé du SIGTERM normal, celui du SIGKILL en erreur
+                        nbad[0]+=1
+                        if nbad[0]>1: raise RuntimeError('relevé en erreur (selftest)')
+                        return real_mapped(p)
+                    def spy_killpg(pg,sig):
+                        if sig in (_sg.SIGTERM,_sg.SIGKILL):
+                            with _LIVE_GROUPS_LOCK: m=[set(v) for k,v in _LIVE_GROUPS.items() if k.pid==pg]
+                            sigs.append((int(sig),m[0] if m else None))
+                        return real_killpg(pg,sig)
+                    def at(sig,d):   # premier signal `sig` envoyé : le jeu du groupe contenait-il déjà d ?
+                        x=[m for g,m in sigs if g==sig]
+                        return bool(x) and x[0] is not None and d in x[0]
+                    def mk(tag):   # tag : 6 caractères alphanumériques (motif PyInstaller)
+                        d=os.path.join(base,f'_MEI{tag}'); os.makedirs(d); del purged[:]; del sigs[:]
+                        with open(os.path.join(d,'lib.so'),'wb') as f: f.write(b'\0'*8192)
+                        return d,os.path.join(base,f'{tag}.ok')
+                    # membre : dossier, drapeau (écrit une fois le dossier tenu), quand ('start' ; 'term' : au SIGTERM, survit),
+                    # comment ('map' : mmap ; 'fd' : fichier ouvert seulement ; 'cwd' : répertoire courant seulement) ; <drapeau>.pid :
+                    # « pid heure-de-démarrage » (nettoyage : jamais un PID réattribué)
+                    MAP=("import mmap,os,signal,sys,time\nd,flag,when,how=sys.argv[1:5]\nkeep=[]\n"
+                         "st=open('/proc/self/stat').read().rsplit(')',1)[1].split()[19]\n"
+                         "open(flag+'.pid','w').write(f'{os.getpid()} {st}')\n"
+                         "def hold(*a):\n"
+                         " if how=='map': f=open(os.path.join(d,'lib.so'),'rb'); keep.append(mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ)); f.close()\n"
+                         " elif how=='fd': keep.append(open(os.path.join(d,'part'),'w'))\n"
+                         " else: os.chdir(d)\n"
+                         " open(flag+'.tmp','w').write('ok'); os.replace(flag+'.tmp',flag)\n"
+                         "if when=='term': signal.signal(signal.SIGTERM,hold)\nelse: hold()\ntime.sleep(60)\n")
+                    def grp(d,flag,when,how='map'): return ['sh','-c','"$1" -c "$0" "$2" "$3" "$4" "$5"; true',MAP,sys.executable,d,flag,when,how]
+                    def wait_flag(flag,secs=10):
+                        t0=time.monotonic()
+                        while not os.path.exists(flag) and time.monotonic()-t0<secs: time.sleep(0.05)
+                        return os.path.exists(flag)
+                    def timed_out(argv,tmo):
+                        t0=time.monotonic()
+                        try: real_run_group(argv,tmo,dict(env)); to=False
+                        except subprocess.TimeoutExpired: to=True
+                        except Exception as x: to=repr(x)   # relevé en erreur propagé : dit dans le résultat, jamais une panne du contrôle
+                        return to,round(time.monotonic()-t0,1)
+                    def relay(argv,sig,mapped=None):   # _run_group dans un fil, signal relayé une fois le dossier tenu
+                        out={}
+                        def bg():
+                            try: out['r']=real_run_group(argv,60,dict(env))
+                            except Exception as x: out['r']=x
+                        th=threading.Thread(target=bg,daemon=True); th.start(); ok0=wait_flag(argv[-3])
+                        try:
+                            if mapped is None: _signal_groups(sig)
+                            else:
+                                with mock.patch(f"{__name__}._mei_mapped",mapped): _signal_groups(sig)
+                        except Exception as x: out['relais']=repr(x)   # dit dans le résultat (signal jamais envoyé : membre vivant)
+                        if 'relais' in out:   # signal non relayé : le groupe de CE contrôle arrêté ici, jamais un fil laissé derrière
+                            with contextlib.suppress(OSError,StopIteration): real_killpg(next(k.pid for k in list(_LIVE_GROUPS) if k.args==argv),_sg.SIGKILL)
+                        th.join(15)
+                        return ok0,th.is_alive(),out.get('relais') or getattr(out.get('r'),'returncode',out.get('r'))
+                    def gone(flag):   # membre mort (pid + heure de démarrage)
+                        try: pid,st=open(flag+'.pid').read().split()
+                        except (OSError,ValueError): return False
+                        return not _proc_live(int(pid),st)
+                    holder=None; old_tempdir=tempfile.tempdir; tempfile.tempdir=base
+                    try:
+                        with mock.patch(f"{__name__}._purge_mei_dirs",spy_purge), mock.patch.object(os,'killpg',spy_killpg):
+                            # 1) délai, dossier tenu au SIGTERM seulement -> vu au SIGKILL
+                            d,flag=mk('kill65'); to,dt=timed_out(grp(d,flag,'term'),3)
+                            res['délai : relevé avant le SIGKILL']=(to is True and os.path.exists(flag) and at(9,d) and not os.path.exists(d) and purged==[{d}]
+                                                                   and 12<=dt<25,to,os.path.exists(flag),sigs,os.path.exists(d),purged,dt)
+                            # 2) délai, membre mort au SIGTERM (chargeur tué pendant son extraction) : mmap, fd seul, cwd seul
+                            for how,tag in (('map','term65'),('fd','fdonly'),('cwd','cwdonl')):
+                                d,flag=mk(tag); to,dt=timed_out(grp(d,flag,'start',how),3)
+                                res[f'délai : membre mort au SIGTERM ({how})']=(to is True and os.path.exists(flag) and at(15,d) and not os.path.exists(d)
+                                                                               and purged==[{d}] and dt<6,to,os.path.exists(flag),sigs,os.path.exists(d),purged,dt)
+                            # 3) restes après la sortie de « borgHelper » : son enfant tient le dossier, tubes ailleurs, mort au SIGTERM
+                            d,flag=mk('reste6')
+                            head=("import subprocess,sys,os,time\nexe,code,d,flag=sys.argv[1:5]\n"
+                                  "subprocess.Popen([exe,'-c',code,d,flag,'start','map'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+                                  "stderr=subprocess.DEVNULL)\nt0=time.monotonic()\n"
+                                  "while not os.path.exists(flag) and time.monotonic()-t0<20: time.sleep(0.05)\nprint('lancé',flush=True)\n")
+                            e0=io.StringIO(); t0=time.monotonic()
+                            with contextlib.redirect_stderr(e0): r=real_run_group([sys.executable,'-c',head,sys.executable,MAP,d,flag],60,dict(env))
+                            dt=round(time.monotonic()-t0,1)
+                            res['restes après sortie']=(r.returncode==0 and 'lancé' in r.stdout and at(15,d) and not os.path.exists(d) and purged==[{d}]
+                                                        and 'processus restés dans le groupe' in e0.getvalue() and dt<9,
+                                                        r.returncode,sigs,os.path.exists(d),purged,dt,e0.getvalue()[-120:])
+                            # 4) signal d'arrêt du serveur relayé : relevé par _signal_groups, purge par le fil de _run_group
+                            d,flag=mk('relais'); ok0,alive,rc=relay(grp(d,flag,'start'),_sg.SIGTERM)
+                            res['arrêt du serveur relayé']=(ok0 and not alive and rc==-15 and at(15,d) and not os.path.exists(d) and purged==[{d}]
+                                                           and not _LIVE_GROUPS,ok0,alive,rc,sigs,os.path.exists(d),purged)
+                            # 5) 2e signal (SIGKILL relayé) : groupe tué, aucun relevé (le serveur sort) — dossier laissé (limite dite)
+                            d,flag=mk('relak9'); nmapped[0]=0
+                            ok0,alive,rc=relay(grp(d,flag,'start'),_sg.SIGKILL,spy_mapped)
+                            res['2e signal : SIGKILL sans relevé']=(ok0 and not alive and rc==-9 and nmapped[0]==0 and purged==[] and gone(flag)
+                                                                  and not _LIVE_GROUPS,ok0,alive,rc,nmapped[0],purged)
+                            # 6) dossier encore tenu hors du groupe : relevé, gardé (jamais retiré sous un processus vivant)
+                            d,flag=mk('garde6')
+                            holder=subprocess.Popen([sys.executable,'-c',MAP,d,flag+'h','start','map'],stdin=subprocess.DEVNULL,
+                                                    stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,env=dict(env))
+                            okh=wait_flag(flag+'h'); to,dt=timed_out(grp(d,flag,'start'),3)
+                            res['dossier utilisé gardé']=(okh and to is True and os.path.exists(flag) and at(15,d) and os.path.isdir(d) and purged==[{d}]
+                                                         and dt<6,okh,to,sigs,os.path.exists(d),purged,dt)
+                            # 7) relevé en erreur : le signal part quand même (délai, relais)
+                            d,flag=mk('exc065')
+                            with mock.patch(f"{__name__}._mei_mapped",bad_mapped): to,dt=timed_out(grp(d,flag,'start'),3)
+                            res['délai : relevé en erreur, signal envoyé']=(to is True and dt<6 and [g for g,_ in sigs][:1]==[15] and gone(flag),to,dt,sigs)
+                            d,flag=mk('exc265'); nbad[0]=0
+                            with mock.patch(f"{__name__}._mei_mapped",bad_second): to,dt=timed_out(grp(d,flag,'term'),3)
+                            res['SIGKILL du délai : relevé en erreur, signal envoyé']=(to is True and 12<=dt<25 and [g for g,_ in sigs]==[15,9]
+                                                                                      and nbad[0]==2 and gone(flag),to,dt,sigs,nbad[0])
+                            d,flag=mk('exc165'); ok0,alive,rc=relay(grp(d,flag,'start'),_sg.SIGTERM,bad_mapped)
+                            res['relais : relevé en erreur, signal envoyé']=(ok0 and not alive and rc==-15 and gone(flag),ok0,alive,rc)
+                            # 8) membre de type /restore : dossier de DONNÉES au motif hors de son TMPDIR, tenu par fd ou cwd -> intact
+                            for how,tag in (('fd','restfd'),('cwd','restcw')):
+                                d=os.path.join(base,'dest',f'_MEI{tag}'); os.makedirs(d); flag=os.path.join(base,f'{tag}.ok'); del purged[:]; del sigs[:]
+                                to,dt=timed_out(grp(d,flag,'start',how),3)
+                                res[f'/restore : données _MEI hors TMPDIR intactes ({how})']=(to is True and os.path.exists(flag) and os.path.isdir(d)
+                                                                                            and not any(d in (m or ()) for _g,m in sigs) and purged==[],
+                                                                                            to,os.path.exists(flag),os.path.isdir(d),sigs,purged)
+                            # 9) sortie normale : aucun relevé, aucune purge, aucune attente
+                            del purged[:]; del sigs[:]; nmapped[0]=0; t0=time.monotonic()
+                            with mock.patch(f"{__name__}._mei_mapped",spy_mapped):
+                                r=real_run_group(['sh','-c','echo ok'],60,dict(env))
+                            dt=round(time.monotonic()-t0,1)
+                            res['sortie normale : rien relevé']=(r.returncode==0 and nmapped[0]==0 and purged==[] and sigs==[] and dt<2,nmapped[0],purged,sigs,dt)
+                        res['voisin au motif, vieilli, jamais relevé : intact']=(os.path.isdir(other),)
+                    finally:
+                        tempfile.tempdir=old_tempdir
+                        if holder is not None and holder.poll() is None: holder.kill(); holder.wait()
+                        for x in _gl.glob(os.path.join(base,'*.pid')):   # seulement un membre VIVANT dont l'heure de démarrage est celle relevée
+                            try:
+                                pid,st=open(x).read().split()
+                                if _proc_live(int(pid),st): os.kill(int(pid),9)
+                            except (OSError,ValueError): pass
+                        _sh.rmtree(base,ignore_errors=True)
+                    bad={k:v for k,v in res.items() if not v[0]}
+                    if bad: print(f"  {bad}")
+                    return not bad
+                check("délai et arrêts de borgHelperWWW (_run_group) : _MEI* du groupe relevés avant chaque signal, retirés groupe vide, voisin et dossier utilisé intacts, sortie normale sans relevé (F334)",_run_group_mei)
                 def _client_gone_mei():
                     """1.31.6 (story 60 ; mesuré : témoin de la baseline, un _MEI* laissé dans /tmp par abandon tué par SIGKILL — stop()
                     appelait _borg_killgrp sans état, rien relevé) : client parti, borg sourd à SIGTERM -> SIGKILL au délai (1 s) ; ses
                     _MEI* relevés avant le signal et retirés, voisin intact, registre vidé ; fermeture du corps immédiate (attente et
                     récolte dans un fil : jamais la boucle d'événements bloquée pendant le délai)."""
                     import tempfile, shutil as _sh, types as _t
-                    base=tempfile.mkdtemp(prefix='mei60-',dir=tmpdir); d=os.path.join(base,'_MEIc60ab'); other=os.path.join(base,'_MEIautre')
+                    base=tempfile.mkdtemp(prefix='mei60-',dir=tmpdir); d=os.path.join(base,'_MEIc60abc'); other=os.path.join(base,'_MEIautre1')
                     os.makedirs(d); os.makedirs(other)
                     with open(os.path.join(d,'lib.so'),'wb') as f: f.write(b'\0'*8192)
                     code=("import mmap,signal,sys,time\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
@@ -5904,7 +6089,7 @@ def push_selftest():
                           "sys.stdout.buffer.write(b'x'*200000); sys.stdout.flush(); time.sleep(60)")
                     async def go():
                         body=_borg_stream(_t.SimpleNamespace(state=_t.SimpleNamespace()),[sys.executable,'-c',code,os.path.join(d,'lib.so')],
-                                          dict(os.environ),'borg export-tar')
+                                          dict(os.environ,TMPDIR=base),'borg export-tar')   # 1.31.9 : TMPDIR du factice
                         async for c in body: break
                         t0=time.monotonic(); await body.aclose(); return time.monotonic()-t0
                     try:
