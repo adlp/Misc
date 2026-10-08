@@ -25,6 +25,18 @@ puis, sur demande seulement, la ligne `Include` en tête de `~/.ssh/config`.
   propriétaire gardés, lien symbolique ou fichier non ordinaire refusé) ; ailleurs, on ne fait
   que lire, sans jamais bloquer sur une FIFO.
 - `~` = répertoire de passwd (celui où ssh lit `~/.ssh/config`), pas `$HOME`.
+- Transfert d'agent restreint (CAP-8) : pour chaque motif de `sshvault-forward`, **avant** les
+  blocs d'identité (première valeur gagnante), une ligne `Match originalhost <motif> exec
+  "'<sshvault>' ensure --forward <fid> --id <uuid>…"` (sous-agent chargé à la demande) puis
+  `Match originalhost <motif>` + `ForwardAgent "<socket résolu du sous-agent>"`. Ordre : motifs
+  littéraux, puis motifs à joker du plus au moins précis (nombre de caractères littéraux),
+  attrape-tout en dernier, alphabétique à égalité. Pour un hôte couvert par deux motifs, le
+  premier bloc gagne (avertissement) ; la ligne `Match … exec` d'un bloc exclut les motifs des
+  blocs précédents (`<motif>,!<motif précédent>…`) : les clés d'un sous-agent jamais transféré
+  ne sont ni lues ni chargées. Aucun `ForwardAgent` pour un hôte
+  d'identité sans transfert déclaré : la config de l'utilisateur décide. Bloc sans ligne
+  `Match exec` (`auto-load false`, aucune clé utilisable) : `ForwardAgent no` (un socket jamais
+  créé arrêterait un saut `ssh -W` par cet hôte).
 """
 from __future__ import annotations
 
@@ -40,7 +52,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
-from .agent import fingerprint, public_blob
+from .agent import FID_RE, FWD_DIR, SUN_PATH_MAX, fingerprint, forward_id, public_blob
 from .backend import SshKeyItem, valid_host
 from .fastpath import ITEM_ID_RE
 from .fsutil import ensure_dir, read_private, write_private
@@ -54,6 +66,14 @@ _TMP = re.compile(r"\..+\.(\d+)\.tmp$")
 _CATCH_ALL = re.compile(r"[*?.]+")
 #: Avertissement des motifs sans partie littérale (décision de l'utilisateur, 2026-10-07).
 CATCH_ALL_WARNING = "ce bloc prend toutes les connexions ssh et désactive ton agent habituel"
+#: Avertissement d'un motif de transfert sans partie littérale.
+FORWARD_CATCH_ALL_WARNING = "ce sous-agent de transfert sera transféré à toutes les connexions ssh"
+#: Commentaire qui ouvre un bloc de transfert : `# transfert d'agent <motif> <fid>`.
+FORWARD_COMMENT = "# transfert d'agent "
+#: Délai d'un `ssh -G` de contrôle (s), et de l'ensemble des contrôles d'une commande.
+SSH_G_TIMEOUT = 15
+SSH_G_BUDGET = 30.0
+SSH_G_BUDGET_VAR = "SSHVAULT_SSH_G_BUDGET"
 #: Répertoire personnel imposé (tests seulement) ; sinon celui de passwd.
 HOME_ENV = "SSHVAULT_SSH_HOME"
 EXE_NAME = "sshvault"
@@ -188,7 +208,7 @@ def exe_warnings(exe: str, paths: "Paths") -> list:
     ou dans un environnement de projet (`.venv`), dont la config dépendrait."""
     out = []
     raw = read_private(paths.config)
-    m = re.search(r"exec \"'([^']*)' ensure --id ", raw.decode(errors="replace")) if raw else None
+    m = re.search(r"exec \"'([^']*)' ensure --(?:id|forward) ", raw.decode(errors="replace")) if raw else None
     if m and m.group(1).replace("%%", "%") != exe:
         out.append("chemin de sshvault des lignes Match exec changé : %s → %s"
                    % (clean(m.group(1).replace("%%", "%")), clean(exe)))
@@ -207,6 +227,34 @@ def ensure_command(exe: str, item_id: str) -> str:
     return "'%s' ensure --id %s" % (exe.replace("%", "%%"), item_id.lower())
 
 
+def forward_command(exe: str, fid: str, ids: Sequence[str]) -> str:
+    """Commande de `Match exec` d'un bloc de transfert : `'<exe>' ensure --forward <fid> --id
+    <uuid>…` (`%` doublé pour ssh). Seulement le chemin vérifié, le `fid` (16 hex) et des ids
+    validés (UUID) : la commande passe par un shell. Ni `%h` ni `%n`."""
+    _check_path(exe, "chemin de sshvault", "'")
+    if not FID_RE.fullmatch(fid or ""):
+        raise SshConfigError("identifiant de sous-agent inattendu : %s" % clean(fid or ""))
+    if not ids:
+        raise SshConfigError("bloc de transfert sans clé")
+    for i in ids:
+        if not ITEM_ID_RE.fullmatch(i or ""):
+            raise SshConfigError("id d'élément inattendu (UUID attendu) : %s" % clean(i or ""))
+    return "'%s' ensure --forward %s%s" % (exe.replace("%", "%%"), fid, "".join(" --id %s" % i.lower() for i in ids))
+
+
+def forward_socket(agent_socket: str, fid: str) -> str:
+    """Socket du sous-agent `fid` : `fwd/<fid>.sock` à côté du socket de l'agent dédié."""
+    return os.path.join(os.path.dirname(agent_socket), FWD_DIR, fid + ".sock")
+
+
+def _forward_order(pattern: str):
+    """Ordre des blocs de transfert (le premier gagne) : motifs littéraux, puis motifs à joker
+    du plus au moins précis (nombre de caractères littéraux), attrape-tout en dernier ;
+    alphabétique à égalité."""
+    wild = "*" in pattern or "?" in pattern
+    return (wild, is_catch_all(pattern), -len(pattern.replace("*", "").replace("?", "")) if wild else 0, pattern)
+
+
 def include_line(paths: Paths) -> str:
     """`Include "<config>"`. Include ne développe pas `%` en 8.9 (mesuré) mais le fait dans
     les versions récentes (man) : un chemin avec `%`, `$` ou un joker de glob est refusé."""
@@ -222,6 +270,8 @@ class Plan:
     pubs: dict = field(default_factory=dict)  # nom de fichier -> contenu
     blocks: int = 0
     warnings: list = field(default_factory=list)
+    #: sous-agents référencés : fid -> (motif, [ids des clés autorisées])
+    forward: dict = field(default_factory=dict)
 
 
 def _label(it: SshKeyItem) -> str:
@@ -239,6 +289,7 @@ def build(items: Sequence[SshKeyItem], paths: Paths, socket: str, exe: Optional[
         _check_path(exe, "chemin de sshvault", "'")
     plan = Plan(config=b"")
     out = [HEADER]
+    _forward_blocks(items, socket, exe, plan, out)
     entries = []  # (motif, élément), dans l'ordre des blocs
     for it in sorted(items, key=lambda i: (i.name.casefold(), i.id)):
         if not it.hosts:
@@ -290,6 +341,146 @@ def build(items: Sequence[SshKeyItem], paths: Paths, socket: str, exe: Optional[
                                      "ssh offrira les deux clés dans l'ordre des blocs" % (h1, _label(a), h2, _label(b)))
     plan.config = "".join(out).encode()
     return plan
+
+
+def _forward_blocks(items: Sequence[SshKeyItem], socket: str, exe: Optional[str], plan: Plan, out: list) -> None:
+    """Blocs de transfert (CAP-8), avant les blocs d'identité : un par motif de `sshvault-forward`."""
+    forwards = {}  # motif -> [éléments], dans l'ordre des éléments
+    for it in sorted(items, key=lambda i: (i.name.casefold(), i.id)):
+        for h in it.forward:
+            if not valid_host(h):
+                plan.warnings.append("%s : motif de transfert invalide « %s » : ignoré" % (_label(it), clean(h)))
+                continue
+            h = h.strip().lower()
+            its = forwards.setdefault(h, [])
+            if it not in its:
+                its.append(it)
+    if not forwards:
+        return
+    if exe is None:
+        plan.warnings.append("auto-load false : aucune ligne Match exec, aucun sous-agent de transfert : ForwardAgent no "
+                             "pour les motifs de transfert (l'hôte distant ne verra aucune clé)")
+    order = sorted(forwards, key=_forward_order)
+    for p in order:
+        fid = forward_id(p)
+        sock = forward_socket(socket, fid)
+        if len(os.fsencode(sock)) > SUN_PATH_MAX:
+            raise SshConfigError("chemin du socket de transfert trop long (%d octets au plus) : %s"
+                                 % (SUN_PATH_MAX, clean(sock)))
+        ids = []
+        for it in forwards[p]:
+            if not ITEM_ID_RE.fullmatch(it.id):
+                plan.warnings.append("%s : id inattendu (UUID attendu) : pas de transfert de cette clé vers « %s »"
+                                     % (_label(it), p))
+            elif public_blob(it.public_key) is None:
+                plan.warnings.append("%s : clé publique illisible : pas de transfert de cette clé vers « %s »"
+                                     % (_label(it), p))
+            elif it.id.lower() not in ids:
+                ids.append(it.id.lower())
+        if not ids:
+            plan.warnings.append("motif de transfert « %s » : aucune clé transférable : ForwardAgent no" % p)
+        if is_catch_all(p):
+            plan.warnings.append("motif de transfert « %s » : %s" % (p, FORWARD_CATCH_ALL_WARNING))
+        # motif validé (HOST_RE) : ni espace ni virgule, sûr sur la ligne Match
+        out.append("\n%s%s %s\n" % (FORWARD_COMMENT, p, fid))
+        if exe is not None and ids:
+            # motifs des blocs précédents exclus (« ! », hors de HOST_RE : sûr) : pour un hôte
+            # qu'ils couvrent, ce bloc ne s'applique pas, ses clés ne sont pas chargées
+            match = ",".join([p] + ["!" + q for q in order[:order.index(p)]])
+            out.append('Match originalhost %s exec "%s"\n' % (match, forward_command(exe, fid, ids)))
+            target = quote_path(sock, "socket du sous-agent de transfert")
+        else:
+            # sans Match exec, le socket n'existerait jamais : un saut `ssh -W` par cet hôte
+            # s'arrêterait (-W impose ExitOnForwardFailure, mesuré) ; rien n'est transféré
+            target = "no"
+        out.append("Match originalhost %s\n    ForwardAgent %s\n" % (p, target))
+        # sans Match exec, aucune clé autorisée : un sous-agent qui en garde est arrêté
+        plan.forward[fid] = (p, ids if target != "no" else [])
+        plan.blocks += 1
+    for n, p1 in enumerate(order):
+        for p2 in order[n + 1:]:
+            if is_catch_all(p1) or is_catch_all(p2):
+                continue
+            if fnmatch.fnmatchcase(p1, p2) or fnmatch.fnmatchcase(p2, p1):
+                plan.warnings.append("motifs de transfert « %s » et « %s » se recouvrent : pour les hôtes communs, seul "
+                                     "le premier bloc (« %s ») s'applique" % (p1, p2, p1))
+
+
+def forward_map(paths: Paths) -> dict:
+    """{fid : motif} des blocs de transfert du fichier généré (commentaires `# transfert
+    d'agent <motif> <fid>`, fid recalculé) ; {} si le fichier manque."""
+    raw = read_private(paths.config)
+    out = {}
+    for line in (raw.decode(errors="replace").splitlines() if raw else []):
+        if line.startswith(FORWARD_COMMENT):
+            parts = line[len(FORWARD_COMMENT):].split()
+            if len(parts) == 2 and forward_id(parts[0]) == parts[1]:
+                out[parts[1]] = parts[0]
+    return out
+
+
+def unforwarded_literal_hosts(items: Sequence[SshKeyItem], plan: Plan) -> list:
+    """Hôtes d'identité **littéraux** (sans `*` ni `?`) qu'aucun motif de transfert ne couvre,
+    dans l'ordre des blocs."""
+    patterns = [p for p, _ in plan.forward.values()]
+    out = []
+    for it in sorted(items, key=lambda i: (i.name.casefold(), i.id)):
+        if any(not valid_host(h) for h in it.hosts) or public_blob(it.public_key) is None:
+            continue  # élément sauté par build
+        for h in it.hosts:
+            h = h.strip().lower()
+            if "*" in h or "?" in h or h.startswith("-") or h in out:
+                continue
+            if not any(fnmatch.fnmatchcase(h, p) for p in patterns):
+                out.append(h)
+    return out
+
+
+def forwardagent_yes(hosts: Sequence[str], paths: Paths, env=None, budget: Optional[float] = None):
+    """(hôtes, interrompu) : hôtes pour lesquels `ssh -G <hôte>` (config réelle de l'utilisateur ;
+    `-F ~/.ssh/config` seulement si le répertoire personnel est imposé, tests) affiche
+    `forwardagent yes` : l'agent dédié entier y serait transféré. Un `ssh -G` en échec ou trop
+    long est ignoré ; l'ensemble est borné par `budget` s (SSH_G_BUDGET) : au-delà, interrompu.
+    `ssh -G` évalue les lignes `Match exec` de l'utilisateur ; celles de sshvault n'y chargent
+    rien (`ssh -G` reconnu)."""
+    import signal
+    import subprocess
+    import time
+    env = os.environ if env is None else env
+    deadline = time.monotonic() + (SSH_G_BUDGET if budget is None else budget)
+    argv = [env.get("SSHVAULT_SSH") or "ssh", "-G"]
+    if env.get(HOME_ENV):
+        argv += ["-F", paths.user_config if _kind(paths.user_config) == "file" else os.devnull]
+    out = []
+    for h in hosts:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return out, True
+        try:
+            # sa propre session : au délai, tout le groupe (lignes Match exec comprises) est tué
+            p = subprocess.Popen(argv + ["--", h], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                                 stdin=subprocess.DEVNULL, env=dict(env), start_new_session=True)
+        except OSError:
+            continue
+        try:
+            stdout, _ = p.communicate(timeout=min(SSH_G_TIMEOUT, left))
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            p.communicate()
+            if time.monotonic() >= deadline:
+                return out, True
+            continue
+        if p.returncode == 0 and "forwardagent yes" in stdout.splitlines():
+            out.append(h)
+    return out, False
+
+
+FORWARD_YES_WARNING = ("ForwardAgent yes dans ta config (ssh -G) : l'agent dédié entier (toutes les clés chargées "
+                       "par sshvault) y serait transféré ; déclarer un transfert restreint (« sshvault forward add "
+                       "… %s ») ou poser ForwardAgent no pour cet hôte")
 
 
 @dataclass

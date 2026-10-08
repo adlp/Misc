@@ -1,4 +1,4 @@
-"""Surveillant de l'agent dédié : `python -m sshvault.watch <pid> <socket> <st_dev> <st_ino>`.
+"""Surveillant de l'agent dédié (ou d'un sous-agent de transfert) : `python -m sshvault.watch <pid> <socket> <st_dev> <st_ino>`.
 
 Lancé détaché (sa propre session) par sshvault avec l'agent. Toutes les WATCH_INTERVAL
 secondes : si le socket n'est plus celui créé par l'agent (supprimé, remplacé) ou si
@@ -15,7 +15,7 @@ import stat
 import sys
 import time
 
-from .agent import Agent
+from .agent import FWD_DIR, Agent
 
 WATCH_INTERVAL = 2.0
 
@@ -35,8 +35,12 @@ def main(argv=None) -> int:
     except (IndexError, ValueError):
         return 2
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
-    agent = Agent(os.path.dirname(sock), env={})
-    runtime = os.path.dirname(os.path.dirname(sock))
+    agent = Agent(os.path.dirname(sock), env={}, socket=sock)
+    # XDG_RUNTIME_DIR : parent de `sshvault/` (agent dédié) ou de `sshvault/fwd/` (sous-agent)
+    sdir = os.path.dirname(sock)
+    if os.path.basename(sdir) == FWD_DIR:
+        sdir = os.path.dirname(sdir)
+    runtime = os.path.dirname(sdir)
     while agent.pid_is_agent(pid):
         if socket_gone(sock, dev, ino) or not os.path.isdir(runtime):
             try:

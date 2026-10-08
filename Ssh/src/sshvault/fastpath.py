@@ -16,6 +16,14 @@ refait ces contrôles.
   plus de min(FRESH_MIN, durée/2) s, listée par `ssh-add -L` sur le socket dédié, et égale à
   celle du `.pub` de l'élément dans le ssh_config généré (clé changée dans le coffre :
   rechargée). Ni bw, ni réseau, ni écriture.
+- `ensure --forward <fid> --id ID…` (sous-agent de transfert, CAP-8) : toutes les clés des
+  éléments fraîches dans le sous-agent `fwd/<fid>.sock`, et aucune autre clé ; agent dédié
+  non verrouillé (état lu seulement, jamais contacté). ssh appelant en `-W` (saut ProxyJump
+  ou ProxyCommand `ssh -W`) ou `-N` : aucun canal de session, rien n'est transféré, aucune clé
+  chargée ; mais `-W` impose `ExitOnForwardFailure` (mesuré, 8.9p1 : socket absent → le saut
+  s'arrête aussitôt, même avec `-a`) : le socket du sous-agent doit exister (sous-agent vide
+  lancé par la CLI s'il manque). ssh appelant avec `-a` ou `-o ForwardAgent=no` (sans -W/-N) :
+  rien n'est transféré, code 0 sans rien faire.
 """
 from __future__ import annotations
 
@@ -29,7 +37,8 @@ from typing import Mapping, Optional, Sequence
 
 from .agentstate import STATE_NAME, AgentState, remaining
 from .fsutil import read_private
-from .runtime import SOCKET_NAME, AgentError, fingerprint, parse_listing, public_blob, resolve_dir
+from .runtime import (FID_RE, SOCKET_NAME, AgentError, fingerprint, forward_paths, parse_listing, public_blob,
+                      resolve_dir)
 from .settings import seconds
 
 #: Début du processus (délai global d'ensure : le chemin rapide en fait partie).
@@ -48,6 +57,7 @@ SSH_ARG_OPTS = "bceilmopBDEFIJLOPQRSwW"
 ITEM_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.ASCII | re.IGNORECASE)
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _BATCH_RE = re.compile(r"\s*batchmode\s*(=\s*|\s+)\"?(yes|true)\"?\s*$", re.IGNORECASE)
+_FORWARD_RE = re.compile(r"\s*forwardagent\s*(?:=\s*|\s+)\"?([^\"]*?)\"?\s*$", re.IGNORECASE)
 
 
 def clean(text: str) -> str:
@@ -108,7 +118,7 @@ def parse_ssh_args(args: Sequence[str]) -> dict:
     collé ou suivant, options aussi après la destination (ssh relance getopt), `--` ; le 2e
     argument hors option commence la commande. {"G": -G, "O": -O (commande de contrôle),
     "batch": -o BatchMode=yes, "dest": destination}."""
-    r = {"G": False, "O": False, "batch": False, "dest": None}
+    r = {"G": False, "O": False, "W": False, "N": False, "batch": False, "dest": None, "agent": None}
     i, n = 0, len(args)
     while i < n:
         a = args[i]
@@ -121,6 +131,11 @@ def parse_ssh_args(args: Sequence[str]) -> dict:
                 c = a[j]
                 if c == "G":
                     r["G"] = True
+                elif c == "N":
+                    r["N"] = True
+                elif c in "aA":
+                    # -a / -A : affectation directe (getopt de ssh.c), la dernière gagne
+                    r["agent"] = c == "A"
                 if c in SSH_ARG_OPTS:
                     if j == len(a) - 1:
                         i += 1  # argument dans le mot suivant
@@ -129,8 +144,13 @@ def parse_ssh_args(args: Sequence[str]) -> dict:
                         val = a[j + 1:]
                     if c == "O":
                         r["O"] = True
+                    elif c == "W":
+                        r["W"] = True
                     elif c == "o" and _BATCH_RE.match(val):
                         r["batch"] = True
+                    elif c == "o" and _FORWARD_RE.match(val) and r["agent"] is None:
+                        # -o ForwardAgent : première valeur seulement (process_config_line)
+                        r["agent"] = _FORWARD_RE.match(val).group(1).lower() not in ("no", "false")
                     break
             i += 1
             continue
@@ -165,6 +185,10 @@ class Caller:
         first = parse_ssh_args(ancestors[0][1][1:]) if ancestors else parse_ssh_args([])
         #: ssh -G (lecture de config) ou -O (commande de contrôle) : aucune connexion
         self.no_connect = first["G"] or first["O"]
+        #: ssh -W (saut ProxyJump/ProxyCommand) ou -N : aucun canal de session, rien n'est transféré
+        self.no_session = first["W"] or first["N"]
+        #: ssh -a ou -o ForwardAgent=no : aucun agent transféré, quelle que soit la config
+        self.no_forward = first["agent"] is False
         self.host = dest_label(first["dest"])
         #: BatchMode=yes en argument d'un ssh de la chaîne : aucune invite
         self.batch = any(parse_ssh_args(argv[1:])["batch"] for _, argv in ancestors)
@@ -226,11 +250,12 @@ def pub_fingerprint(item_id: str, env: Mapping[str, str]) -> Optional[str]:
     return None
 
 
-def agent_fingerprints(directory: str, env: Mapping[str, str], timeout: float = LIST_TIMEOUT) -> Optional[set]:
-    """Empreintes des clés de l'agent dédié (`ssh-add -L`, même environnement qu'`Agent`), ou
-    None si l'agent ne répond pas."""
+def agent_fingerprints(directory: str, env: Mapping[str, str], timeout: float = LIST_TIMEOUT,
+                       socket: Optional[str] = None) -> Optional[set]:
+    """Empreintes des clés de l'agent dédié (ou du socket `socket`) par `ssh-add -L`, même
+    environnement qu'`Agent`, ou None si l'agent ne répond pas."""
     e = {k: v for k, v in env.items() if k not in ("SSH_AUTH_SOCK", "SSH_AGENT_PID")}
-    e["SSH_AUTH_SOCK"] = os.path.join(directory, SOCKET_NAME)
+    e["SSH_AUTH_SOCK"] = socket or os.path.join(directory, SOCKET_NAME)
     e["SSH_ASKPASS_REQUIRE"] = "never"
     try:
         r = subprocess.run([env.get("SSHVAULT_SSH_ADD") or "ssh-add", "-L"], env=e, stdin=subprocess.DEVNULL,
@@ -259,6 +284,54 @@ def present_fresh(directory: str, item_id: str, env: Mapping[str, str], timeout:
     return bool(got and want & got)
 
 
+def main_locked(directory: str) -> bool:
+    """L'état de l'agent dédié le dit verrouillé (`sshvault agent lock`) **et** le pid enregistré
+    est encore cet ssh-agent (`ssh-agent … -a <socket>` de l'utilisateur, lu dans /proc) : un
+    verrou laissé par un agent mort ne bloque rien. L'agent n'est jamais contacté."""
+    data = AgentState(os.path.join(directory, STATE_NAME)).load()
+    rec = data.get("agent")
+    if not data.get("locked") or not rec:
+        return False
+    sock = os.path.join(directory, SOCKET_NAME)
+    st = _stat(rec["pid"])
+    argv = _proc_argv(rec["pid"])
+    return bool(st and st[0] != "Z" and argv and os.path.basename(argv[0]) == "ssh-agent"
+                and any(a == "-a" and argv[i + 1:i + 2] == [sock] for i, a in enumerate(argv)))
+
+
+def forward_wanted(data: dict, ids: Sequence[str], env: Mapping[str, str], now: float):
+    """(empreintes autorisées, empreintes voulues ou None) d'un sous-agent d'après son état :
+    autorisées = enregistrées pour l'un des éléments (et égales au `.pub` de sa config générée
+    s'il en a un) ; voulues = les autorisées encore fraîches. None : un élément sans clé fraîche."""
+    allowed, want, missing = set(), set(), False
+    for i in ids:
+        mine = {fp for fp, e in data["keys"].items() if owns(e, i)}
+        pub = pub_fingerprint(i, env)
+        if pub is not None:
+            mine &= {pub}  # clé changée dans le coffre (config régénérée) : l'ancienne n'est plus autorisée
+        allowed |= mine
+        cand = {fp for fp in mine if fresh(data["keys"][fp], now)}
+        if not cand:
+            missing = True
+        want |= cand
+    return allowed, (None if missing else want)
+
+
+def forward_fresh(directory: str, fid: str, ids: Sequence[str], env: Mapping[str, str],
+                  timeout: float = LIST_TIMEOUT) -> bool:
+    """Sous-agent `fid` : toutes les clés des éléments `ids` fraîches et listées, aucune autre
+    clé ; agent dédié pas verrouillé. Ni bw, ni réseau, ni écriture."""
+    if main_locked(directory):
+        return False
+    _, sock, state = forward_paths(directory, fid)
+    data = AgentState(state).load()
+    allowed, want = forward_wanted(data, ids, env, time.time())
+    if not want:
+        return False
+    got = agent_fingerprints(directory, env, timeout, socket=sock)
+    return bool(got) and want <= got and got <= allowed
+
+
 def ensure_timeout(env: Mapping[str, str]) -> float:
     """SSHVAULT_ENSURE_TIMEOUT validé (ValueError sinon)."""
     return seconds(env, TIMEOUT_VAR, DEFAULT_TIMEOUT)
@@ -279,16 +352,32 @@ def _stop(signum, frame):
 
 
 def ensure_args(argv: Sequence[str]):
-    """(id, --nointeraction) si `argv` est exactement `[--nointeraction] ensure --id ID`, sinon None."""
+    """(ids, fid ou None, --nointeraction) si `argv` est `[--nointeraction] ensure` suivi de
+    `--id ID` (une fois), ou de `--forward FID` et d'au moins un `--id ID` (formes `--opt=v`
+    acceptées) ; sinon None (la CLI complète tranche)."""
     argv = list(argv)
     noint = bool(argv) and argv[0] == "--nointeraction"
     if noint:
         argv = argv[1:]
-    if len(argv) == 3 and argv[0] == "ensure" and argv[1] == "--id":
-        return argv[2], noint
-    if len(argv) == 2 and argv[0] == "ensure" and argv[1].startswith("--id="):
-        return argv[1][len("--id="):], noint
-    return None
+    if not argv or argv[0] != "ensure":
+        return None
+    ids, fids, i = [], [], 1
+    while i < len(argv):
+        a = argv[i]
+        for opt, dest in (("--id", ids), ("--forward", fids)):
+            if a == opt and i + 1 < len(argv):
+                dest.append(argv[i + 1])
+                i += 2
+                break
+            if a.startswith(opt + "="):
+                dest.append(a[len(opt) + 1:])
+                i += 1
+                break
+        else:
+            return None
+    if len(fids) > 1 or not ids or (not fids and len(ids) != 1):
+        return None
+    return ids, (fids[0] if fids else None), noint
 
 
 def try_fast(argv: Sequence[str]) -> Optional[int]:
@@ -298,9 +387,11 @@ def try_fast(argv: Sequence[str]) -> Optional[int]:
     parsed = ensure_args(argv)
     if parsed is None:
         return None
-    item_id = parsed[0].strip().lower()
-    if not ITEM_ID_RE.fullmatch(item_id):
+    ids = [i.strip().lower() for i in parsed[0]]
+    fid = parsed[1]
+    if not all(ITEM_ID_RE.fullmatch(i) for i in ids) or (fid is not None and not FID_RE.fullmatch(fid)):
         return None
+    item_id = ids[0]
     label = item_id
     rc = None
     try:
@@ -310,6 +401,11 @@ def try_fast(argv: Sequence[str]) -> Optional[int]:
         label = c.host or item_id
         if c.no_connect:
             rc = 0
+        elif fid is not None and c.no_session:
+            if os.path.exists(forward_paths(resolve_dir(os.environ), fid)[1]):
+                rc = 0  # saut -W, -N : socket présent, rien à transférer
+        elif fid is not None and c.no_forward:
+            rc = 0  # ssh -a, -o ForwardAgent=no : rien à transférer
         else:
             try:
                 total = ensure_timeout(os.environ)
@@ -320,7 +416,9 @@ def try_fast(argv: Sequence[str]) -> Optional[int]:
                     d = resolve_dir(os.environ)
                 except AgentError:
                     d = None
-                if d is not None and present_fresh(d, item_id, os.environ, min(LIST_TIMEOUT, time_left(total))):
+                left = min(LIST_TIMEOUT, time_left(total))
+                if d is not None and (forward_fresh(d, fid, ids, os.environ, left) if fid is not None
+                                      else present_fresh(d, item_id, os.environ, left)):
                     rc = 0
     except (KeyboardInterrupt, _Stop):
         try:

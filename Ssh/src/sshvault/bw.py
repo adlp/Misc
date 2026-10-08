@@ -26,7 +26,7 @@ import subprocess
 import termios
 from typing import Optional
 
-from .backend import (HOSTS_FIELD, BackendError, BackendNotFound, ItemNotFound, NotLoggedIn,
+from .backend import (FORWARD_FIELD, HOSTS_FIELD, BackendError, BackendNotFound, ItemNotFound, NotLoggedIn,
                       PasswordRefused, Prompt, SshKeyItem, VaultBackend, VaultError, VaultLocked, VaultStatus, WriteFailed,
                       normalize_fingerprint, normalize_hosts, parse_hosts)
 from .fsutil import ensure_dir
@@ -397,15 +397,17 @@ class BwBackend(VaultBackend):
         key = d.get("sshKey")
         if not isinstance(key, dict):
             return None
-        hosts = []
+        lists = {HOSTS_FIELD: [], FORWARD_FIELD: []}
         for f in d.get("fields") or []:
             # types 0 (texte) et 1 (masqué)
-            if isinstance(f, dict) and f.get("name") == HOSTS_FIELD and f.get("type", 0) in (0, 1):
-                hosts.extend(parse_hosts(f.get("value") or ""))
+            if (isinstance(f, dict) and isinstance(f.get("name"), str) and f["name"] in lists
+                    and f.get("type", 0) in (0, 1)):
+                lists[f["name"]].extend(parse_hosts(f.get("value") or ""))
         return SshKeyItem(id=str(d.get("id") or ""), name=str(d.get("name") or ""),
                           public_key=str(key.get("publicKey") or ""),
                           fingerprint=str(key.get("keyFingerprint") or ""),
-                          hosts=parse_hosts(",".join(hosts)))
+                          hosts=parse_hosts(",".join(lists[HOSTS_FIELD])),
+                          forward=parse_hosts(",".join(lists[FORWARD_FIELD])))
 
     def list_ssh_keys(self, prompt: Optional[Prompt] = None) -> list:
         r = self._with_session(["list", "items"], "list items", prompt)
@@ -469,22 +471,29 @@ class BwBackend(VaultBackend):
         del r  # bw rend l'élément modifié, clé privée comprise : non gardé
 
     def set_hosts(self, item_id: str, hosts, prompt: Optional[Prompt] = None) -> SshKeyItem:
+        return self._set_field(item_id, hosts, prompt, HOSTS_FIELD)
+
+    def set_forward(self, item_id: str, hosts, prompt: Optional[Prompt] = None) -> SshKeyItem:
+        return self._set_field(item_id, hosts, prompt, FORWARD_FIELD)
+
+    def _set_field(self, item_id: str, hosts, prompt: Optional[Prompt], field: str) -> SshKeyItem:
+        """`set_hosts` / `set_forward` : seul le champ `field` change (mêmes règles d'écriture)."""
         want = normalize_hosts(hosts)
         before = self.get_item(item_id, prompt)
         if before.get("type") != SSH_KEY_TYPE or not isinstance(before.get("sshKey"), dict):
             raise ItemNotFound("élément %s : pas une clé SSH" % item_id)
         name = _clean(str(before.get("name") or item_id))
-        new = with_hosts(before, want)
+        new = with_hosts(before, want, field)
         if new == before:
             return self._item(before)
-        check = "vérifier par « sshvault sync » puis « sshvault hosts list --id %s »" % item_id
+        check = "vérifier par « sshvault sync » puis « sshvault %s list --id %s »" % (_COMMAND[field], item_id)
         try:
-            return self._write_hosts(item_id, name, before, new, want, prompt, check)
+            return self._write_hosts(item_id, name, before, new, want, prompt, check, field)
         except Exception:
             raise
         except BaseException:
             # Ctrl-C, SIGTERM… pendant bw edit ou la relecture : l'écriture a pu passer.
-            self.warnings.append("hôtes de « %s » : écriture peut-être passée : %s" % (name, check))
+            self.warnings.append("%s de « %s » : écriture peut-être passée : %s" % (_WHAT[field], name, check))
             raise
 
     def create_item(self, item: dict, prompt: Optional[Prompt] = None) -> dict:
@@ -571,7 +580,8 @@ class BwBackend(VaultBackend):
                 raise WriteFailed("%s, deux fois ; état relu : élément absent du coffre" % what)
         raise AssertionError("inaccessible")
 
-    def _write_hosts(self, item_id, name, before, new, want, prompt, check) -> SshKeyItem:
+    def _write_hosts(self, item_id, name, before, new, want, prompt, check, field=HOSTS_FIELD) -> SshKeyItem:
+        what = _WHAT[field]
         for attempt in (1, 2):
             try:
                 self.edit_item(item_id, new, prompt)
@@ -582,32 +592,33 @@ class BwBackend(VaultBackend):
                 try:
                     after = self.get_item(item_id, prompt)
                 except VaultError as e:
-                    raise WriteFailed("hôtes de « %s » : bw edit a réussi, relecture impossible (%s) : état inconnu, "
-                                      "%s" % (name, e, check)) from None
-                if not _is_written(after, before, want):
-                    raise WriteFailed("hôtes de « %s » : bw edit a réussi mais l'élément relu diffère "
-                                      "(hôtes relus : %s)" % (name, _fmt(hosts_of(after))))
+                    raise WriteFailed("%s de « %s » : bw edit a réussi, relecture impossible (%s) : état inconnu, "
+                                      "%s" % (what, name, e, check)) from None
+                if not _is_written(after, before, want, field):
+                    raise WriteFailed("%s de « %s » : bw edit a réussi mais l'élément relu diffère "
+                                      "(%s relus : %s)" % (what, name, what, _fmt(hosts_of(after, field))))
                 return self._item(after)
             # Échec ou blocage : l'écriture a pu passer côté serveur. Relecture de l'état réel
             # (sync, puis get) avant de décider ; rejeu une seule fois, et seulement si
             # l'élément n'a pas changé.
-            what = "hôtes de « %s » : écriture en échec (%s)" % (name, failure)
+            failed = "%s de « %s » : écriture en échec (%s)" % (what, name, failure)
             try:
                 self._with_session(["sync"], "sync", prompt, attempts=2)
                 after = self.get_item(item_id, prompt)
             except VaultError as e:
-                raise WriteFailed("%s ; relecture impossible (%s) : état inconnu, %s" % (what, e, check)) from None
-            if _is_written(after, before, want):
+                raise WriteFailed("%s ; relecture impossible (%s) : état inconnu, %s" % (failed, e, check)) from None
+            if _is_written(after, before, want, field):
                 return self._item(after)  # écrit malgré l'erreur : vérifié à la relecture
             unchanged = (after.get("revisionDate") == before.get("revisionDate")
-                         and hosts_of(after) == hosts_of(before))
+                         and hosts_of(after, field) == hosts_of(before, field))
             if not unchanged:
-                raise WriteFailed("%s ; l'élément a changé dans le coffre (hôtes relus : %s) : rien rejoué ; "
-                                  "lancer « sshvault sync » puis relancer la commande" % (what, _fmt(hosts_of(after))))
+                raise WriteFailed("%s ; l'élément a changé dans le coffre (%s relus : %s) : rien rejoué ; "
+                                  "lancer « sshvault sync » puis relancer la commande"
+                                  % (failed, what, _fmt(hosts_of(after, field))))
             if attempt == 2:
-                raise WriteFailed("%s, deux fois ; état relu : élément inchangé (hôtes : %s)"
-                                  % (what, _fmt(hosts_of(after))))
-            before, new = after, with_hosts(after, want)
+                raise WriteFailed("%s, deux fois ; état relu : élément inchangé (%s : %s)"
+                                  % (failed, what, _fmt(hosts_of(after, field))))
+            before, new = after, with_hosts(after, want, field)
         raise AssertionError("inaccessible")
 
 
@@ -622,30 +633,37 @@ def _fmt(hosts) -> str:
     return ",".join(_clean(h) for h in hosts) or "aucun"
 
 
-def _hosts_fields(item: dict) -> list:
+#: Noms des listes d'hôtes dans les messages, et commande qui les relit.
+_WHAT = {HOSTS_FIELD: "hôtes", FORWARD_FIELD: "transferts"}
+_COMMAND = {HOSTS_FIELD: "hosts", FORWARD_FIELD: "forward"}
+
+
+def _hosts_fields(item: dict, field: str = HOSTS_FIELD) -> list:
     return [f for f in (item.get("fields") or [])
-            if isinstance(f, dict) and f.get("name") == HOSTS_FIELD and f.get("type", 0) in (0, 1)]
+            if isinstance(f, dict) and f.get("name") == field and f.get("type", 0) in (0, 1)]
 
 
-def hosts_of(item: dict) -> tuple:
-    """Hôtes de l'élément (tous les champs `sshvault-hosts` texte ou masqués), en minuscules."""
-    return tuple(h.lower() for h in parse_hosts(",".join(f.get("value") or "" for f in _hosts_fields(item))))
+def hosts_of(item: dict, field: str = HOSTS_FIELD) -> tuple:
+    """Hôtes de l'élément (tous les champs `field` texte ou masqués, `sshvault-hosts` par
+    défaut), en minuscules."""
+    return tuple(h.lower() for h in parse_hosts(",".join(f.get("value") or "" for f in _hosts_fields(item, field))))
 
 
-def _others(item: dict) -> tuple:
-    """Ce qu'une écriture des hôtes ne doit pas changer : nom, notes, clé, autres champs.
-    null et "" sont confondus (bw peut rendre l'un pour l'autre)."""
+def _others(item: dict, field: str = HOSTS_FIELD) -> tuple:
+    """Ce qu'une écriture du champ `field` ne doit pas changer : nom, notes, clé, autres champs
+    (l'autre liste d'hôtes comprise). null et "" sont confondus (bw peut rendre l'un pour l'autre)."""
     def v(x):
         return "" if x is None else x
+    mine = _hosts_fields(item, field)
     fields = [(v(f.get("name")), v(f.get("value")), f.get("type")) if isinstance(f, dict) else f
-              for f in (item.get("fields") or []) if not (isinstance(f, dict) and f in _hosts_fields(item))]
+              for f in (item.get("fields") or []) if not (isinstance(f, dict) and f in mine)]
     key = item.get("sshKey") or {}
     return (item.get("type"), v(item.get("name")), v(item.get("notes")), fields,
             v(key.get("privateKey")), v(key.get("publicKey")), v(key.get("keyFingerprint")))
 
 
-def _is_written(after: dict, before: dict, want: tuple) -> bool:
-    return hosts_of(after) == tuple(want) and _others(after) == _others(before)
+def _is_written(after: dict, before: dict, want: tuple, field: str = HOSTS_FIELD) -> bool:
+    return hosts_of(after, field) == tuple(want) and _others(after, field) == _others(before, field)
 
 
 def new_ssh_item(name: str, private_key: str, public_key: str, fingerprint: str, hosts: tuple,
@@ -687,17 +705,18 @@ def _created_diff(after: dict, item: dict, want: tuple) -> str:
     return ", ".join(bad)
 
 
-def with_hosts(item: dict, hosts: tuple) -> dict:
-    """Copie de l'élément où seul le champ `sshvault-hosts` change : valeur remplacée (premier
-    champ texte ou masqué de ce nom, type gardé ; les autres de ce nom fusionnés), créé s'il
-    manque, retiré si `hosts` est vide. Tout le reste tel que bw l'a rendu (revisionDate compris).
-    `fields` reste une liste, vide au besoin : bw garde les anciens champs si `fields` est null."""
+def with_hosts(item: dict, hosts: tuple, field: str = HOSTS_FIELD) -> dict:
+    """Copie de l'élément où seul le champ `field` (`sshvault-hosts` par défaut, ou
+    `sshvault-forward`) change : valeur remplacée (premier champ texte ou masqué de ce nom, type
+    gardé ; les autres de ce nom fusionnés), créé s'il manque, retiré si `hosts` est vide. Tout
+    le reste tel que bw l'a rendu (revisionDate compris). `fields` reste une liste, vide au
+    besoin : bw garde les anciens champs si `fields` est null."""
     value = ",".join(hosts)
     new = copy.deepcopy(item)
     old = item.get("fields") or []
     out, placed = [], False
     for f in old:
-        if isinstance(f, dict) and f.get("name") == HOSTS_FIELD and f.get("type", 0) in (0, 1):
+        if isinstance(f, dict) and f.get("name") == field and f.get("type", 0) in (0, 1):
             if placed or not hosts:
                 continue
             f = copy.deepcopy(f)
@@ -707,7 +726,7 @@ def with_hosts(item: dict, hosts: tuple) -> dict:
             f = copy.deepcopy(f)
         out.append(f)
     if hosts and not placed:
-        out.append({"name": HOSTS_FIELD, "value": value, "type": 0, "linkedId": None})
+        out.append({"name": field, "value": value, "type": 0, "linkedId": None})
     if out != old:
         new["fields"] = out
     return new

@@ -20,6 +20,9 @@
   (`SSH_AUTH_SOCK` hérité) n'est jamais lu ni modifié.
 - La clé privée ne passe que par le stdin de `ssh-add -` : jamais en argument, fichier,
   journal ou sortie.
+- Sous-agents de transfert (CAP-8, `forward_agent`) : même classe, mêmes règles, sur
+  `sshvault/fwd/<fid>.sock` (état `<fid>.json` à côté, verrou `flock` sur `fwd/`, jamais
+  celui de l'agent dédié).
 """
 from __future__ import annotations
 
@@ -44,8 +47,8 @@ from .agentstate import STATE_NAME, AgentState, empty
 from .fsutil import ensure_dir
 from .prompt import open_foreground_tty
 # briques légères (aussi pour le chemin rapide d'ensure), réexportées ici
-from .runtime import (DIR_NAME, RUN_USER, SOCKET_NAME, SUN_PATH_MAX, AgentError, fingerprint,  # noqa: F401
-                      parse_listing, public_blob, resolve_dir)
+from .runtime import (DIR_NAME, FID_RE, FWD_DIR, RUN_USER, SOCKET_NAME, SUN_PATH_MAX, AgentError,  # noqa: F401
+                      fingerprint, forward_id, forward_paths, parse_listing, public_blob, resolve_dir)
 
 CMD_TIMEOUT = 30.0
 STOP_WAIT = 5.0
@@ -241,11 +244,17 @@ def openssh_version(ssh_add: str) -> Optional[tuple]:
 class Agent:
     def __init__(self, directory: str, env: Optional[Mapping[str, str]] = None,
                  ssh_agent: Optional[str] = None, ssh_add: Optional[str] = None,
-                 known_hosts: Optional[str] = None, clock=time.time):
+                 known_hosts: Optional[str] = None, clock=time.time,
+                 socket: Optional[str] = None, state: Optional[str] = None):
+        """`directory` : dossier verrouillé (`flock`) et créé au besoin ; socket et état par
+        défaut `agent.sock` et `agent.json` dedans (agent dédié), sinon `socket`/`state`
+        (sous-agent de transfert : voir `forward_agent`)."""
         self.env = dict(os.environ if env is None else env)
         self.dir = directory
-        self.socket = os.path.join(directory, SOCKET_NAME)
-        self.state = AgentState(os.path.join(directory, STATE_NAME))
+        self.socket = socket or os.path.join(directory, SOCKET_NAME)
+        self.state = AgentState(state or os.path.join(directory, STATE_NAME))
+        #: identifiant du sous-agent de transfert (None : agent dédié)
+        self.fid: Optional[str] = None
         self.ssh_agent = ssh_agent or self.env.get("SSHVAULT_SSH_AGENT") or "ssh-agent"
         self.ssh_add = ssh_add or self.env.get("SSHVAULT_SSH_ADD") or "ssh-add"
         kh = known_hosts if known_hosts is not None else self.env.get("SSHVAULT_KNOWN_HOSTS", "")
@@ -711,3 +720,52 @@ class Agent:
             raise AgentLocked("ssh-add %s : aucune saisie en %gs" % (flag, timeout)) from None
         if r.returncode != 0:
             raise AgentLocked("ssh-add %s : %s" % (flag, _one_line(r.stderr) or "code %d" % r.returncode))
+
+
+# --- sous-agents de transfert (CAP-8) -------------------------------------------------------
+
+def forward_agent(directory: str, fid: str, env: Optional[Mapping[str, str]] = None, **kw) -> Agent:
+    """Sous-agent de transfert `fid` sous le dossier de l'agent dédié `directory` : un
+    `ssh-agent` d'OpenSSH sur `fwd/<fid>.sock`, état `fwd/<fid>.json`, verrou `flock` sur
+    `fwd/` ; mêmes garanties que l'agent dédié (pid vérifié avant tout signal, surveillant,
+    orphelins, `SSH_AUTH_SOCK` = son socket pour chaque `ssh-add`)."""
+    d, sock, state = forward_paths(directory, fid)
+    a = Agent(d, env=env, socket=sock, state=state, **kw)
+    a.fid = fid
+    return a
+
+
+_FWD_NAME = re.compile(r"([0-9a-f]{16})\.(?:sock|json)")
+
+
+def forward_fids(directory: str) -> list:
+    """`fid` des sous-agents connus : socket ou état dans `fwd/`, ou ssh-agent de
+    l'utilisateur lancé sur un socket `fwd/<fid>.sock` (orphelin dont le socket a disparu)."""
+    fdir = os.path.join(directory, FWD_DIR)
+    out = set()
+    try:
+        names = os.listdir(fdir)
+    except OSError:
+        names = []
+    for n in names:
+        m = _FWD_NAME.fullmatch(n)
+        if m:
+            out.add(m.group(1))
+    prefix = fdir + os.sep
+    for pid in _user_pids():
+        if pid == os.getpid():
+            continue
+        argv = _cmdline(pid)
+        if not argv or os.path.basename(argv[0]) != "ssh-agent" or not _alive(pid):
+            continue
+        for i, a in enumerate(argv[:-1]):
+            if a == "-a" and argv[i + 1].startswith(prefix):
+                m = re.fullmatch(r"([0-9a-f]{16})\.sock", argv[i + 1][len(prefix):])
+                if m:
+                    out.add(m.group(1))
+    return sorted(out)
+
+
+def forward_agents(directory: str, env: Optional[Mapping[str, str]] = None) -> list:
+    """Sous-agents connus (voir `forward_fids`), un `Agent` chacun."""
+    return [forward_agent(directory, fid, env) for fid in forward_fids(directory)]

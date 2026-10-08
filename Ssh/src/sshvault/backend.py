@@ -16,6 +16,9 @@ from typing import Callable, Iterable, Optional, Sequence
 #: Champ personnalisé qui porte les hôtes d'un élément : liste séparée par des virgules,
 #: espaces autour ignorés, comparaison insensible à la casse.
 HOSTS_FIELD = "sshvault-hosts"
+#: Champ personnalisé des hôtes vers lesquels la clé est transférée (sous-agent par motif,
+#: CAP-8) : mêmes règles que `sshvault-hosts`.
+FORWARD_FIELD = "sshvault-forward"
 
 #: Hôte accepté : motif de ligne `Host` d'OpenSSH fait de lettres, chiffres, `.`, `-`, `_`, `*`, `?`
 #: (ASCII seulement, vérifié avant la mise en minuscules).
@@ -77,10 +80,12 @@ class SshKeyItem:
     public_key: str
     fingerprint: str
     hosts: tuple = field(default_factory=tuple)
+    #: motifs d'hôtes vers lesquels la clé est transférée (champ `sshvault-forward`)
+    forward: tuple = field(default_factory=tuple)
 
     def to_dict(self) -> dict:
         return {"id": self.id, "name": self.name, "fingerprint": self.fingerprint,
-                "hosts": list(self.hosts), "publicKey": self.public_key}
+                "hosts": list(self.hosts), "forward": list(self.forward), "publicKey": self.public_key}
 
     # --- recherche par hôte, nom ou empreinte --------------------------------
 
@@ -88,12 +93,11 @@ class SshKeyItem:
         """Insensible à la casse, dans les deux sens : le motif glob (fnmatch) donné couvre
         un hôte associé (`*.example` → `prod.example`), ou un hôte associé écrit en glob
         couvre le nom donné (`x.lab` → `*.lab`, la clé qui sert à cet hôte)."""
-        p = pattern.strip().lower()
-        return any(fnmatch.fnmatchcase(h.lower(), p)
-                   # sens inverse seulement pour un hôte associé écrit en glob (* ou ?) :
-                   # un nom littéral avec « [ » n'est pas un motif
-                   or (("*" in h or "?" in h) and fnmatch.fnmatchcase(p, h.lower()))
-                   for h in self.hosts)
+        return _match_patterns(pattern, self.hosts)
+
+    def match_forward(self, pattern: str) -> bool:
+        """Comme `match_host`, sur les motifs de transfert (`sshvault-forward`)."""
+        return _match_patterns(pattern, self.forward)
 
     def match_name(self, text: str) -> bool:
         """Sous-chaîne du nom, insensible à la casse."""
@@ -103,6 +107,15 @@ class SshKeyItem:
         """Empreinte exacte, avec ou sans le préfixe `SHA256:`."""
         want = normalize_fingerprint(fp)
         return bool(want) and want == normalize_fingerprint(self.fingerprint)
+
+
+def _match_patterns(pattern: str, hosts) -> bool:
+    p = pattern.strip().lower()
+    return any(fnmatch.fnmatchcase(h.lower(), p)
+               # sens inverse seulement pour un hôte associé écrit en glob (* ou ?) :
+               # un nom littéral avec « [ » n'est pas un motif
+               or (("*" in h or "?" in h) and fnmatch.fnmatchcase(p, h.lower()))
+               for h in hosts)
 
 
 def normalize_fingerprint(fp: str) -> str:
@@ -201,6 +214,10 @@ class VaultBackend(abc.ABC):
         retiré), sans toucher au reste de l'élément. Renvoie l'élément relu après écriture.
         InvalidHost si un hôte est refusé (rien écrit) ; WriteFailed si l'écriture n'a pas
         abouti ou ne se relit pas (message avec l'état relu)."""
+
+    @abc.abstractmethod
+    def set_forward(self, item_id: str, hosts: Sequence[str], prompt: Optional[Prompt] = None) -> SshKeyItem:
+        """Comme `set_hosts`, pour le champ `sshvault-forward` (hôtes de transfert d'agent)."""
 
     @abc.abstractmethod
     def create_ssh_key(self, name: str, private_key: str, public_key: str, fingerprint: str, hosts: Sequence[str],

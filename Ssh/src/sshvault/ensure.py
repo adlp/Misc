@@ -26,6 +26,13 @@ un échec, ssh continue et l'authentification échoue proprement.
   et date de démarrage du ssh le plus haut) : pendant ce délai, les autres sauts de la même
   connexion échouent aussitôt, sans invite ni bw ; une autre connexion n'est pas gênée.
   Effacé par un déverrouillage réussi (ensure ou `sshvault unlock`).
+
+`sshvault ensure --forward FID --id ID…` (CAP-8, `ensure_forward`) : même chose pour le
+sous-agent de transfert `fwd/<fid>.sock`, jamais pour l'agent dédié (dont l'état est seulement
+lu : verrouillé par `agent lock` → refus). Clés `ssh-add [-t key-ttl] [-c] -` (`-c` selon
+`forward-confirm`, défaut oui : sans askpass utilisable pour le sous-agent, refus), jamais
+`-h` ; tout ou rien ; clés en trop (élément retiré, clé changée, chargée à la main) retirées.
+Même verrou `ensure.lock`, même invite unique et même mémoire d'échec que `--id`.
 """
 from __future__ import annotations
 
@@ -39,11 +46,11 @@ from typing import Mapping, Optional
 
 from . import fastpath
 from .agent import (CMD_TIMEOUT as AGENT_TIMEOUT, Agent, AgentError, AgentLocked, PassphraseRefused,
-                    askpass_rules, fingerprint, is_encrypted, literal_host, public_blob, resolve_dir,
-                    tty_available)
+                    askpass_rules, fingerprint, forward_agent, forward_id, is_encrypted, literal_host, public_blob,
+                    resolve_dir, tty_available)
 from .agentstate import entry as state_entry, reconcile
 from .backend import PasswordRefused, VaultBackend, VaultLocked
-from .fastpath import clean, fresh, owns
+from .fastpath import clean, forward_wanted, fresh, owns
 from .fsutil import ensure_dir, read_private, write_private
 from .prompt import UNAVAILABLE, PromptError, PromptUnavailable, ask_password, available, prompt_timeout
 from .session import SessionStore
@@ -93,9 +100,10 @@ def signals_blocked():
 # --- verrou et mémoire d'échec ---------------------------------------------------------------
 
 @contextlib.contextmanager
-def user_lock(directory: str):
+def user_lock(directory: str, on_wait=None):
     """`flock` exclusif sur `<dossier de l'agent>/ensure.lock` (fichier vide, 0600). L'attente
-    est bornée par le délai global (SIGALRM interrompt flock)."""
+    est bornée par le délai global (SIGALRM interrompt flock). `on_wait` : appelé une fois si le
+    verrou est déjà tenu, avant d'attendre."""
     try:
         ensure_dir(directory)
         fd = os.open(os.path.join(directory, LOCK_NAME),
@@ -106,7 +114,14 @@ def user_lock(directory: str):
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
             raise AgentError("verrou %s : pas un fichier ordinaire à l'utilisateur" % os.path.join(directory, LOCK_NAME))
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        if on_wait is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                on_wait()
+                fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
         os.close(fd)
@@ -194,6 +209,20 @@ def running_unlocked(agent: Agent) -> dict:
     return adata
 
 
+def _unlock_possible(directory: str, store: SessionStore, env: Mapping[str, str], ctx: Context) -> None:
+    """Sans session rangée, il faudrait une invite : échec immédiat, sans bw, si elle est
+    interdite, impossible, ou si cette connexion vient d'échouer à déverrouiller."""
+    if store.get():
+        return
+    age = recent_failure(directory, time.time(), ctx.conn)
+    if age is not None:
+        raise VaultLocked(failed_message(age))
+    if not ctx.interactive:
+        raise VaultLocked("coffre verrouillé : aucune invite (%s)" % ctx.why_not)
+    if not available(env):
+        raise VaultLocked("coffre verrouillé : %s" % UNAVAILABLE)
+
+
 def ensure(item_id: str, backend: VaultBackend, store: SessionStore, settings: dict,
            env: Optional[Mapping[str, str]] = None, agent: Optional[Agent] = None,
            ctx: Optional[Context] = None) -> str:
@@ -209,16 +238,7 @@ def ensure(item_id: str, backend: VaultBackend, store: SessionStore, settings: d
         if present_fresh(agent, item_id):  # chargée par un ensure parallèle pendant l'attente
             return "present"
         running_unlocked(agent)  # avant toute invite ou appel à bw
-        if not store.get():
-            # sans session rangée, il faudrait une invite : échec immédiat, sans bw, si elle est
-            # interdite, impossible, ou si cette connexion vient d'échouer à déverrouiller
-            age = recent_failure(agent.dir, time.time(), ctx.conn)
-            if age is not None:
-                raise VaultLocked(failed_message(age))
-            if not ctx.interactive:
-                raise VaultLocked("coffre verrouillé : aucune invite (%s)" % ctx.why_not)
-            if not available(env):
-                raise VaultLocked("coffre verrouillé : %s" % UNAVAILABLE)
+        _unlock_possible(agent.dir, store, env, ctx)
         prompt = UnlockPrompt(agent.dir, env, ctx) if ctx.interactive else None
         try:
             item, key = backend.get_ssh_key(item_id, prompt)
@@ -304,3 +324,168 @@ def load(agent: Agent, item, key: bytes, settings: dict, env: Mapping[str, str],
                     pass
         raise
     return "loaded"
+
+
+# --- transfert d'agent restreint (CAP-8) ------------------------------------------------------
+
+FORWARD_LOCKED = ("agent dédié verrouillé : transfert d'agent refusé (« sshvault agent unlock » ; « sshvault agent "
+                  "stop » s'il ne répond plus)")
+STALE_PUB = ("élément %s : clé du coffre différente de celle du ssh_config généré : rien transféré "
+             "(lancer « sshvault ssh-config »)")
+NO_ASKPASS = ("forward-confirm : aucun askpass utilisable pour le sous-agent de transfert (DISPLAY, SSH_ASKPASS) : "
+              "la confirmation serait toujours refusée ; rien chargé (se connecter depuis une session graphique, ou "
+              "« sshvault config set forward-confirm false »)")
+
+
+def forward_ready(sub: Agent, confirm: bool) -> dict:
+    """Sous-agent vivant (démarré s'il le faut). Avec `confirm` : il doit avoir été lancé avec
+    un askpass utilisable ; sinon relancé si cet environnement en a un (un sous-agent se
+    recharge à la demande), refusé s'il n'en a pas (AgentError, rien démarré)."""
+    if confirm:
+        usable = askpass_rules(sub._agent_env())[1]
+        with sub.locked():
+            kind, data = sub.probe()
+            # askpass inconnu (None : sous-agent repris, enregistrement reconstruit) compté comme absent
+            if kind == "ours" and (data.get("agent") or {}).get("askpass") is not True:
+                # refusé ou non, ce sous-agent (clés peut-être sans -c) ne doit plus servir
+                try:
+                    sub.purge()
+                except AgentError:
+                    pass
+                sub.stop()
+                if not usable:
+                    raise AgentError(NO_ASKPASS)
+            elif kind != "ours" and kind != "foreign" and not usable:
+                raise AgentError(NO_ASKPASS)
+    return running_unlocked(sub)
+
+
+def drop_extras(sub: Agent, ids, env: Mapping[str, str]) -> list:
+    """Retire du sous-agent toute clé qui n'est pas autorisée pour `ids` (clé d'un élément
+    retiré du transfert, clé changée dans le coffre, clé chargée à la main), et de son état
+    toute entrée absente de l'agent ou non autorisée. Renvoie les empreintes retirées."""
+    allowed, _ = forward_wanted(sub.state.load(), ids, env, time.time())
+    gone = [k for k in sub.keys() if k.fingerprint not in allowed]
+    for k in gone:
+        sub.remove(k)
+    present = {k.fingerprint for k in sub.keys()}
+
+    def prune(d):
+        d["keys"] = {fp: e for fp, e in d["keys"].items() if fp in present and fp in allowed}
+    sub.update(prune)
+    return [k.fingerprint for k in gone]
+
+
+def _rollback(sub: Agent, before: set) -> None:
+    """Retire les clés apparues depuis `before` (blobs) et leurs entrées d'état."""
+    try:
+        for k in sub.keys():
+            if k.blob not in before:
+                sub.remove(k)
+        present = {k.fingerprint for k in sub.keys()}
+        sub.update(lambda d: d.update(keys={fp: e for fp, e in d["keys"].items() if fp in present}))
+    except AgentError:
+        pass
+
+
+def ensure_forward(fid: str, ids, backend: VaultBackend, store: SessionStore, settings: dict,
+                   env: Optional[Mapping[str, str]] = None, ctx: Optional[Context] = None,
+                   directory: Optional[str] = None) -> str:
+    """Clés des éléments `ids` (UUID en minuscules), et elles seules, dans le sous-agent de
+    transfert `fid`, chargées s'il le faut. `settings` : key-ttl, forward-confirm. Renvoie
+    "present" ou "loaded" ; toute impossibilité lève l'erreur à afficher (une ligne).
+    L'agent dédié n'est jamais contacté."""
+    env = os.environ if env is None else env
+    ctx = ctx or Context()
+    base = directory or resolve_dir(env)
+    ids = [i.lower() for i in ids]
+    sub = forward_agent(base, fid, env)
+    if fastpath.forward_fresh(base, fid, ids, env):
+        return "present"
+    with user_lock(base):
+        if fastpath.forward_fresh(base, fid, ids, env):  # chargé par un ensure parallèle
+            return "present"
+        if fastpath.main_locked(base):
+            raise AgentLocked(FORWARD_LOCKED)
+        confirm = bool(settings["forward-confirm"])
+        forward_ready(sub, confirm)  # avant toute invite ou appel à bw
+        drop_extras(sub, ids, env)
+        todo = _missing(sub, ids, env, need_fresh=True)
+        if not todo:
+            return "present"
+        _unlock_possible(base, store, env, ctx)
+        prompt = UnlockPrompt(base, env, ctx) if ctx.interactive else None
+        got = []
+        try:
+            try:
+                for i in todo:
+                    got.append(backend.get_ssh_key(i, prompt))
+            except PasswordRefused:
+                record_failure(base, ctx.conn)
+                raise
+            if prompt is not None and prompt.answered:
+                clear_failure(base)
+            for item, _ in got:
+                # le coffre fait foi : une clé dont l'élément ne déclare plus ce transfert n'est
+                # pas chargée (config générée périmée)
+                if not any(forward_id(p) == fid for p in item.forward):
+                    raise AgentError("« %s » n'est plus déclarée pour ce transfert dans le coffre : rien chargé "
+                                     "(lancer « sshvault ssh-config »)" % clean(item.name))
+                # clé du coffre différente du `.pub` généré (clé changée, config non régénérée) :
+                # elle serait retirée aussitôt ; refus avant tout chargement
+                pub = fastpath.pub_fingerprint(item.id.lower(), env)
+                blob = public_blob(item.public_key)
+                if pub is not None and blob is not None and fingerprint(blob) != pub:
+                    raise AgentError(STALE_PUB % item.id.lower())
+            if fastpath.main_locked(base):
+                # `agent lock` posé pendant la lecture du coffre (il attend ensure.lock, mais un
+                # verrou posé autrement passerait) : rien chargé
+                raise AgentLocked(FORWARD_LOCKED)
+            fset = {"key-ttl": settings["key-ttl"], "auto-confirm": confirm, "auto-restrict": False}
+            before = {k.blob for k in sub.keys()}
+            try:
+                for item, key in got:
+                    load(sub, item, key, fset, env, ctx)
+                drop_extras(sub, ids, env)
+                missing = _missing(sub, ids, env, need_fresh=False)
+                if missing:
+                    # clé chargée puis retirée (filet : contrôle préalable ci-dessus)
+                    raise AgentError(STALE_PUB % missing[0])
+            except BaseException:
+                with signals_blocked():
+                    _rollback(sub, before)
+                raise
+        finally:
+            got.clear()
+    return "loaded"
+
+
+def _missing(sub: Agent, ids, env: Mapping[str, str], need_fresh: bool) -> list:
+    """Éléments de `ids` sans clé autorisée présente dans le sous-agent (fraîche si `need_fresh`,
+    égale au `.pub` de la config générée s'il y en a un)."""
+    have = {k.fingerprint for k in sub.keys()}
+    data = sub.state.load()
+    now = time.time()
+    out = []
+    for i in ids:
+        ok = {fp for fp, e in data["keys"].items()
+              if owns(e, i) and fp in have and (not need_fresh or fresh(e, now))}
+        pub = fastpath.pub_fingerprint(i, env)
+        if pub is not None:
+            ok &= {pub}
+        if not ok:
+            out.append(i)
+    return out
+
+
+def forward_socket_only(fid: str, env: Optional[Mapping[str, str]] = None, directory: Optional[str] = None) -> str:
+    """Saut `ssh -W` (ProxyJump, ProxyCommand `ssh -W`) : aucun canal de session, rien n'est
+    transféré, mais `-W` impose ExitOnForwardFailure (mesuré, 8.9p1) : un socket de
+    `ForwardAgent` absent arrête le saut. Le sous-agent est lancé (vide) s'il manque ; ni
+    coffre, ni clé, ni invite. Renvoie "present" ou "started"."""
+    env = os.environ if env is None else env
+    sub = forward_agent(directory or resolve_dir(env), fid, env)
+    if os.path.exists(sub.socket):
+        return "present"
+    _, started = sub.ensure_running()
+    return "started" if started else "present"

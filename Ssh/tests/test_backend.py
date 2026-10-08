@@ -58,7 +58,7 @@ def test_match_fingerprint():
 
 
 def test_to_dict_sans_cle_privee():
-    assert set(item().to_dict()) == {"id", "name", "fingerprint", "hosts", "publicKey"}
+    assert set(item().to_dict()) == {"id", "name", "fingerprint", "hosts", "forward", "publicKey"}
 
 
 def test_item_bw():

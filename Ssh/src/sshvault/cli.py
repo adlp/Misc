@@ -2,25 +2,26 @@
 
 Codes de sortie :
   0  succès
-  1  aucun résultat (search, load, hosts, pubkey, deploy : sélection sans élément) ; hosts
-     remove : hôte absent de l'élément (rien écrit) ; import : clé déjà dans le coffre (rien
+  1  aucun résultat (search, load, hosts, forward, pubkey, deploy : sélection sans élément) ;
+     hosts/forward remove : hôte absent de l'élément (rien écrit) ; import : clé déjà dans le coffre (rien
      créé) ; generate : nom déjà pris par une clé du coffre, sans --force (rien généré) ;
      ssh-config --check : pas à jour (contenu, droits, fichier en trop ou non ordinaire) ou
      ligne Include absente, conditionnelle ou pas en tête
   2  usage (option ou argument invalide ; load sans sélection ni --all ; durée invalide ;
      config.json invalide, illisible ou aux droits inattendus ; hôte invalide ; sélection
-     de hosts qui désigne plusieurs éléments ; import : fichier refusé — illisible, pas une
+     de hosts ou forward qui désigne plusieurs éléments ; import : fichier refusé — illisible, pas une
      clé privée, type ou format non accepté — ou --name avec plusieurs fichiers ; generate :
      type, bits, nom ou commentaire refusés ; deploy : cible, port ou options ssh invalides)
   3  non connecté au coffre, ou coffre verrouillé (aucune invite possible, mot de passe refusé) ;
-     agent dédié arrêté ou verrouillé ; passphrase d'une clé refusée ou impossible à saisir
-     (load, import)
+     agent dédié arrêté ou verrouillé (ensure --forward compris) ; passphrase d'une clé
+     refusée ou impossible à saisir (load, import)
   4  erreur du backend (bw absent, en erreur, réponse illisible, délai dépassé), de l'agent
      dédié (XDG_RUNTIME_DIR relatif, non privé ou hors tmpfs, chemin du socket trop long,
      agent tiers, OpenSSH < 8.9, --restrict : élément sans hôte, hôte non littéral ou absent
      de known_hosts ; clé publique illisible ou différente de la clé privée), écriture de
-     config.json impossible, écriture des hôtes dans le coffre non aboutie ou non vérifiée
-     (y compris hôtes écrits mais ssh_config non régénéré), création d'un élément par import
+     config.json impossible, écriture des hôtes ou des transferts dans le coffre non aboutie
+     ou non vérifiée (y compris écrits mais ssh_config non régénéré), sous-agent de transfert
+     en erreur (ensure --forward : forward-confirm sans askpass, agent tiers…), création d'un élément par import
      non aboutie ou non vérifiée (y compris clé importée mais ssh_config non régénéré), copie
      impossible dans un tmpfs privé (import --decrypt, generate), ssh-keygen absent ou en
      erreur, création d'un élément par generate non aboutie ou non vérifiée (y compris clé
@@ -36,7 +37,12 @@ Codes de sortie :
 sinon le code de l'erreur, sans effet sur ssh (le Match ne porte aucune directive).
 `status` : 0 si le coffre est déverrouillé, 3 s'il est verrouillé ou non connecté, 4 en erreur.
 `import` de plusieurs fichiers : le pire des codes rencontrés (0 < 1 < 2 < 3 < 4).
-`agent status` : 0 si l'agent dédié tourne, 3 s'il est arrêté, 4 en erreur ou agent tiers.
+`agent status` : 0 si l'agent dédié tourne, 3 s'il est arrêté, 4 en erreur ou agent tiers ;
+`agent status|stop|purge|lock` : 4 si un sous-agent de transfert est en erreur (agent tiers sur
+son socket…), sinon le code de l'agent dédié.
+`ensure --forward` : comme `ensure` (0 si les clés sont présentes ou chargées ; pour un saut
+`ssh -W`, 0 dès que le socket du sous-agent existe, lancé vide au besoin) ; un échec laisse la
+connexion se faire, sans clé transférée.
 Toute erreur donne une seule ligne sur stderr, jamais de traceback.
 """
 from __future__ import annotations
@@ -51,11 +57,11 @@ import time
 from typing import Optional
 
 from . import __version__
-from .agent import (CMD_TIMEOUT as AGENT_TIMEOUT, Agent, AgentError, AgentLocked, AgentStopped,
-                    PassphraseRefused, askpass_rules, fingerprint, is_encrypted, literal_host, public_blob,
-                    resolve_dir, tty_available)
+from .agent import (CMD_TIMEOUT as AGENT_TIMEOUT, FID_RE, Agent, AgentError, AgentLocked, AgentStopped,
+                    PassphraseRefused, askpass_rules, fingerprint, forward_agent, forward_agents, forward_fids,
+                    is_encrypted, literal_host, public_blob, resolve_dir, tty_available)
 from .agentstate import entry as state_entry, maybe_locked, reconcile, remaining
-from .backend import (HOSTS_FIELD, BackendError, InvalidHost, NotLoggedIn, SshKeyItem, VaultBackend, VaultError,
+from .backend import (FORWARD_FIELD, HOSTS_FIELD, BackendError, InvalidHost, NotLoggedIn, SshKeyItem, VaultBackend, VaultError,
                       VaultLocked, WriteFailed, normalize_hosts, valid_host)
 from .bw import BwBackend
 from .config import Config, ConfigError, ConfigWriteError, describe_duration, parse_duration
@@ -143,7 +149,8 @@ def build_parser() -> Parser:
                       "4 erreur backend ou agent, écriture ou ssh_config impossible, install refusé, "
                       "ssh-keygen ou ssh en échec, "
                       "130 interrompu. "
-                      "status : 0 déverrouillé, 3 sinon ; agent status : 0 actif, 3 arrêté.")
+                      "status : 0 déverrouillé, 3 sinon ; agent status : 0 actif, 3 arrêté, 4 sous-agent de "
+                      "transfert en erreur.")
     p.add_argument("--version", action="version", version="sshvault " + __version__)
     p.add_argument("--nointeraction", action="store_true",
                    help="ne jamais rien demander : mot de passe du coffre, passphrase d'une clé, "
@@ -186,29 +193,35 @@ def build_parser() -> Parser:
                    help="restreinte aux hôtes de l'élément (ssh-add -h, hôtes dans known_hosts)")
     s.add_argument("--force", action="store_true", help="recharge une clé déjà présente (nouvelles options)")
 
-    s = sub.add_parser("agent", help="agent dédié : état, purge, verrou, arrêt")
+    s = sub.add_parser("agent", help="agent dédié et sous-agents de transfert : état, purge, verrou, arrêt")
     asub = s.add_subparsers(dest="agent_cmd", metavar="ACTION", parser_class=Parser)
     asub.required = True
-    asub.add_parser("status", help="socket, pid et clés chargées (code 3 si arrêté)")
-    asub.add_parser("purge", help="retire toutes les clés (ssh-add -D)")
-    asub.add_parser("lock", help="verrouille l'agent (ssh-add -x, mot de passe saisi par ssh-add)")
+    asub.add_parser("status", help="socket, pid et clés chargées, sous-agents de transfert compris (code 3 si "
+                                   "l'agent dédié est arrêté)")
+    asub.add_parser("purge", help="retire toutes les clés (ssh-add -D), sous-agents de transfert compris")
+    asub.add_parser("lock", help="vide et arrête les sous-agents de transfert, puis verrouille l'agent dédié "
+                                 "(ssh-add -x, mot de passe saisi par ssh-add)")
     asub.add_parser("unlock", help="déverrouille l'agent (ssh-add -X)")
-    asub.add_parser("stop", help="arrête l'agent, supprime socket et état")
+    asub.add_parser("stop", help="arrête l'agent dédié et les sous-agents de transfert, supprime sockets et états")
 
-    s = sub.add_parser("hosts", help="hôtes associés à une clé (champ sshvault-hosts de l'élément)")
-    hsub = s.add_subparsers(dest="hosts_cmd", metavar="ACTION", parser_class=Parser)
-    hsub.required = True
-    for name, what, nargs in (("add", "ajoute des hôtes", "+"), ("remove", "retire des hôtes", "+"),
-                              ("set", "remplace la liste (\"\" : la vide)", "+"), ("list", "affiche les hôtes", None)):
-        h = hsub.add_parser(name, help=what)
-        h.add_argument("pattern", metavar="SÉLECTION", help="un seul élément, choisi comme pour load")
-        g = h.add_mutually_exclusive_group()
-        for flag, sel in (("host", "motif glob d'hôte"), ("name", "sous-chaîne du nom"),
-                          ("fingerprint", "empreinte exacte"), ("id", "id exact de l'élément")):
-            g.add_argument("--" + flag, dest="by", action="store_const", const=flag, help=sel)
-        if nargs:
-            h.add_argument("hosts", metavar="HÔTE", nargs=nargs,
-                           help="motif de ligne Host (lettres, chiffres, . - _ * ?), ou liste à virgules")
+    for cmd, what_cmd in (("hosts", "hôtes associés à une clé (champ sshvault-hosts de l'élément)"),
+                          ("forward", "hôtes vers lesquels la clé est transférée par un sous-agent restreint "
+                                      "(champ sshvault-forward de l'élément)")):
+        s = sub.add_parser(cmd, help=what_cmd)
+        hsub = s.add_subparsers(dest="hosts_cmd", metavar="ACTION", parser_class=Parser)
+        hsub.required = True
+        for name, what, nargs in (("add", "ajoute des hôtes", "+"), ("remove", "retire des hôtes", "+"),
+                                  ("set", "remplace la liste (\"\" : la vide)", "+"),
+                                  ("list", "affiche les hôtes", None)):
+            h = hsub.add_parser(name, help=what)
+            h.add_argument("pattern", metavar="SÉLECTION", help="un seul élément, choisi comme pour load")
+            g = h.add_mutually_exclusive_group()
+            for flag, sel in (("host", "motif glob d'hôte"), ("name", "sous-chaîne du nom"),
+                              ("fingerprint", "empreinte exacte"), ("id", "id exact de l'élément")):
+                g.add_argument("--" + flag, dest="by", action="store_const", const=flag, help=sel)
+            if nargs:
+                h.add_argument("hosts", metavar="HÔTE", nargs=nargs,
+                               help="motif de ligne Host (lettres, chiffres, . - _ * ?), ou liste à virgules")
 
     s = sub.add_parser("import", help="importe des clés privées existantes dans le coffre (fichiers d'origine "
                                       "jamais modifiés)")
@@ -264,10 +277,15 @@ def build_parser() -> Parser:
 
     s = sub.add_parser("ensure", help="charge à la demande la clé d'un élément (appelé par ssh : ligne "
                                       "Match exec du ssh_config généré)")
-    s.add_argument("--id", required=True, metavar="ID", help="id (UUID) de l'élément")
+    s.add_argument("--id", required=True, action="append", metavar="ID",
+                   help="id (UUID) de l'élément ; plusieurs avec --forward")
+    s.add_argument("--forward", metavar="FID", action="append",
+                   help="sous-agent de transfert (16 chiffres hexadécimaux) : y charge les clés des --id, et elles "
+                        "seules")
 
     s = sub.add_parser("config", help="réglages : key-ttl (durée de vie par défaut des clés), auto-load, "
-                                      "auto-restrict, auto-confirm (chargement automatique)")
+                                      "auto-restrict, auto-confirm (chargement automatique), forward-confirm "
+                                      "(sous-agents de transfert)")
     csub = s.add_subparsers(dest="config_cmd", metavar="ACTION", parser_class=Parser)
     csub.required = True
     c = csub.add_parser("get", help="affiche un réglage, ou tous")
@@ -370,7 +388,7 @@ def run(args, backend: VaultBackend) -> int:
         return run_agent(args)
     if args.cmd == "config":
         return run_config(args)
-    if args.cmd == "hosts":
+    if args.cmd in ("hosts", "forward"):
         return run_hosts(args, backend, prompt)
     if args.cmd == "ssh-config":
         return run_ssh_config(args, backend, prompt)
@@ -552,27 +570,131 @@ def _need_prompt(args, agent: Agent, what: str) -> None:
         raise AgentLocked("%s : aucune saisie possible (ni terminal, ni askpass utilisable)" % what)
 
 
+def _forward_label(fid: str, patterns: dict) -> str:
+    return "%s (%s)" % (clean(patterns.get(fid, "?")), fid)
+
+
+def _forward_patterns() -> dict:
+    """{fid : motif} lus dans le ssh_config généré ; {} s'il est illisible."""
+    try:
+        return sshconfig.forward_map(sshconfig.default_paths())
+    except Exception:
+        return {}
+
+
+def _each_forward(base: str, fn) -> int:
+    """`fn(sous-agent, étiquette)` pour chaque sous-agent de transfert connu ; une erreur est
+    dite (une ligne) sans arrêter les autres. Renvoie RC_BACKEND si l'un a échoué, sinon RC_OK."""
+    patterns = _forward_patterns()
+    rc = RC_OK
+    for sub in forward_agents(base):
+        label = _forward_label(sub.fid, patterns)
+        try:
+            fn(sub, label)
+        except AgentError as e:
+            err("transfert %s : %s" % (label, e))
+            rc = RC_BACKEND
+    return rc
+
+
+def _forward_status(sub: Agent, label: str) -> None:
+    now = time.time()
+    with sub.locked(create=False):
+        kind, data = sub.probe()
+        if kind == "foreign":
+            raise sub.foreign()
+        if kind != "ours":
+            print("transfert %s : arrêté%s" % (label, " (socket mort)" if kind == "dead" else ""))
+            return
+        keys = sub.keys()
+        if reconcile(data, {k.fingerprint for k in keys}, now):
+            sub.save(data)
+    print("transfert %s : actif, pid %d, socket %s" % (label, data["agent"]["pid"], sub.socket))
+    for k in keys:
+        e = data["keys"].get(k.fingerprint)
+        if e is None:  # chargée hors de sshvault
+            print("  ?\t%s\t?\t?" % k.fingerprint)
+            continue
+        left = remaining(e, now)
+        print("  %s\t%s\t%s\t%s" % (clean(e["name"]), k.fingerprint,
+                                   "illimitée" if left is None else fmt_remaining(left),
+                                   ",".join(_options(e["confirm"], e["restrict"])) or "-"))
+    if not keys:
+        print("  clés : aucune")
+
+
+def _forward_purge(sub: Agent, label: str) -> None:
+    with sub.locked(create=False):
+        try:
+            sub.running()
+        except AgentStopped:
+            return
+        sub.purge()
+        sub.update(lambda d: d.update(keys={}))
+    print("transfert %s : vidé" % label)
+
+
+def _forward_stop(sub: Agent, label: str, purge: bool = False) -> None:
+    if purge:
+        with sub.locked(create=False):
+            try:
+                sub.running()
+                sub.purge()
+            except AgentStopped:
+                pass
+            except AgentError as e:  # vidage refusé (verrouillé à la main…) : l'arrêt suit quand même
+                err("transfert %s : vidage impossible (%s) : arrêté quand même" % (label, e))
+    print("transfert %s : %s" % (label, sub.stop()))
+
+
+def _ensure_lock(base: str):
+    """`ensure.lock` (celui d'`ensure --id`/`--forward`) si le dossier existe : un `ensure
+    --forward` en cours finit avant l'arrêt des sous-agents, aucun ne les relance pendant. S'il
+    est tenu, une ligne le dit avant d'attendre."""
+    import contextlib
+    if not os.path.isdir(base):
+        return contextlib.nullcontext()
+    return ensure_mod.user_lock(base, on_wait=lambda: err("attente d'un chargement en cours (ensure)…"))
+
+
+def stop_all_forward(base: str) -> int:
+    """Arrête tous les sous-agents de transfert (sous ensure.lock) ; renvoie leur nombre."""
+    n = 0
+    with _ensure_lock(base):
+        for sub in forward_agents(base):
+            try:
+                sub.stop()
+                n += 1
+            except AgentError as e:
+                err("avertissement : sous-agent de transfert %s : %s" % (sub.fid, e))
+    return n
+
+
 def run_agent(args) -> int:
     agent = make_agent()
+    base = agent.dir
     cmd = args.agent_cmd
     if cmd == "stop":
-        print(agent.stop())
-        return RC_OK
+        with _ensure_lock(base):
+            rc = _each_forward(base, _forward_stop)
+            print(agent.stop())
+        return rc
     if cmd == "status":
         with agent.locked(create=False):
             kind, data = agent.probe()
             if kind == "foreign":
                 raise agent.foreign()
-            if kind != "ours":
-                print("agent : arrêté%s" % (" (socket mort)" if kind == "dead" else ""))
-                print("socket : %s" % agent.socket)
-                return RC_LOCKED
-            keys = agent.keys()
-            _sync_lock_flag(agent, data, keys)
-            now = time.time()
-            present = {k.fingerprint for k in keys}
-            if reconcile(data, present, now):
-                agent.save(data)
+            if kind == "ours":
+                keys = agent.keys()
+                _sync_lock_flag(agent, data, keys)
+                now = time.time()
+                present = {k.fingerprint for k in keys}
+                if reconcile(data, present, now):
+                    agent.save(data)
+        if kind != "ours":
+            print("agent : arrêté%s" % (" (socket mort)" if kind == "dead" else ""))
+            print("socket : %s" % agent.socket)
+            return max(RC_LOCKED, _each_forward(base, _forward_status))
         guess = maybe_locked(data, present)
         print("agent : actif%s" % (", verrouillé" if data["locked"] else ", verrouillé ?" if guess else ""))
         print("socket : %s" % agent.socket)
@@ -590,52 +712,109 @@ def run_agent(args) -> int:
                                           ",".join(_options(e["confirm"], e["restrict"])) or "-"))
         if not rows:
             print("clés : aucune")
-        return RC_OK
+        return _each_forward(base, _forward_status)
     if cmd == "purge":
+        rc = _each_forward(base, _forward_purge)
         with agent.locked(create=False):
             try:
                 data = agent.running()
             except AgentStopped:
                 print("agent arrêté : rien à purger")
-                return RC_OK
+                return rc
             _sync_lock_flag(agent, data, agent.keys())
             if data["locked"]:
                 raise AgentLocked("agent verrouillé : lancer « sshvault agent unlock »")
             agent.purge()
             agent.update(lambda d: d.update(keys={}))
         print("agent vidé")
-        return RC_OK
+        return rc
     if cmd in ("lock", "unlock"):
-        data = agent.running()
-        keys = agent.keys()
-        _sync_lock_flag(agent, data, keys)
-        if cmd == "unlock" and not data["locked"] and (keys or not data["keys"]):
-            print("agent déjà déverrouillé")
-            return RC_OK
-        _need_prompt(args, agent, "agent " + cmd)
-        timeout = 2 * prompt_timeout(os.environ) + AGENT_TIMEOUT
-        agent.set_locked(cmd == "lock", timeout)
-        agent.update(lambda d: d.update(locked=cmd == "lock"))
+        import contextlib
+        rc = RC_OK
+        # lock : ensure.lock tenu de l'arrêt des sous-agents jusqu'à l'état « verrouillé »
+        # enregistré : aucun `ensure --forward` ne les relance entre-temps
+        with _ensure_lock(base) if cmd == "lock" else contextlib.nullcontext():
+            if cmd == "lock":
+                # d'abord, quoi qu'il arrive ensuite : sous-agents vidés et arrêtés (rechargés par le
+                # premier ssh après « agent unlock »)
+                rc = _each_forward(base, lambda sub, label: _forward_stop(sub, label, purge=True))
+            data = agent.running()
+            keys = agent.keys()
+            _sync_lock_flag(agent, data, keys)
+            if cmd == "unlock" and not data["locked"] and (keys or not data["keys"]):
+                print("agent déjà déverrouillé")
+                return RC_OK
+            _need_prompt(args, agent, "agent " + cmd)
+            timeout = 2 * prompt_timeout(os.environ) + AGENT_TIMEOUT
+            agent.set_locked(cmd == "lock", timeout)
+            agent.update(lambda d: d.update(locked=cmd == "lock"))
         print("agent verrouillé" if cmd == "lock" else "agent déverrouillé")
-        return RC_OK
+        return rc
     raise UsageError("action inconnue : agent %s" % cmd)
 
 
 def reap_orphans_quietly() -> None:
-    """À chaque lancement : arrête les agents sshvault orphelins (socket disparu). Silencieux."""
+    """À chaque lancement : arrête les agents sshvault orphelins (socket disparu), agent dédié
+    et sous-agents de transfert. Silencieux."""
     try:
-        Agent(resolve_dir()).reap_orphans()
+        base = resolve_dir()
+        Agent(base).reap_orphans()
+        for sub in forward_agents(base):
+            sub.reap_orphans()
     except Exception:
         pass
 
 
+def forward_upkeep(plan, socket: str, out=None) -> None:
+    """Après une régénération : arrête chaque sous-agent de transfert que le ssh_config ne
+    référence plus, ou qui garde une clé dont l'élément n'est plus autorisé pour ce motif
+    (rechargé au prochain ssh). Une erreur est dite en avertissement."""
+    base = os.path.dirname(socket)
+    fids = forward_fids(base)
+    if not fids:
+        return
+    with _ensure_lock(base):  # un ensure --forward en cours finit d'abord
+        for fid in fids:
+            try:
+                sub = forward_agent(base, fid)
+                ref = plan.forward.get(fid)
+                if ref is None:
+                    why = "%s, plus référencé" % fid
+                else:
+                    ids = ref[1]
+                    if all(any(fastpath.owns(e, i) for i in ids) for e in sub.state.load()["keys"].values()):
+                        continue
+                    why = "%s (%s), clé retirée du transfert" % (clean(ref[0]), fid)
+                print("sous-agent de transfert %s : %s" % (why, sub.stop()), file=out or sys.stdout, flush=True)
+            except AgentError as e:
+                err("avertissement : sous-agent de transfert %s : %s" % (fid, e))
+
+
+def warn_forwardagent(items: list, plan, paths) -> None:
+    """`ssh-config` seulement : hôtes d'identité littéraux sans transfert déclaré pour lesquels
+    `ssh -G` montre `forwardagent yes` (l'agent dédié entier y serait transféré). Durée totale
+    bornée (SSH_G_BUDGET) ; au-delà, un avertissement dit que le contrôle est incomplet."""
+    try:
+        budget = seconds(os.environ, sshconfig.SSH_G_BUDGET_VAR, sshconfig.SSH_G_BUDGET)
+    except ValueError:
+        budget = sshconfig.SSH_G_BUDGET
+    found, cut = sshconfig.forwardagent_yes(sshconfig.unforwarded_literal_hosts(items, plan), paths, budget=budget)
+    for h in found:
+        err("avertissement : hôte « %s » : %s" % (h, sshconfig.FORWARD_YES_WARNING % h))
+    if cut:
+        err("avertissement : contrôle ForwardAgent (ssh -G) interrompu après %gs : hôtes restants non vérifiés"
+            % budget)
+
+
 # --- hôtes et ssh_config généré --------------------------------------------------------
 
-def _select_one(items: list, args) -> Optional[SshKeyItem]:
-    """L'élément désigné par la sélection ; None (message dit) si aucun ; UsageError si plusieurs."""
+def _select_one(items: list, args, forward: bool = False) -> Optional[SshKeyItem]:
+    """L'élément désigné par la sélection ; None (message dit) si aucun ; UsageError si plusieurs.
+    `forward` : `--host` et la sélection par défaut couvrent aussi les motifs de transfert."""
     if not args.pattern.strip():
         raise UsageError("sélection vide")
-    found = [i for i in items if match(i, args.pattern, args.by)]
+    found = [i for i in items if match(i, args.pattern, args.by)
+             or (forward and args.by in (None, "host") and i.match_forward(args.pattern))]
     if not found:
         err("aucune clé ne correspond à « %s »" % args.pattern)
         return None
@@ -668,9 +847,11 @@ def regenerate(items: list, paths=None, socket: Optional[str] = None, exe=_RESOL
     """Réécrit ce qui a changé dans ~/.ssh/sshvault/ ; avertissements sur stderr, compte rendu
     sur `out` (défaut stdout ; stderr pour generate, dont stdout ne porte que la clé publique)."""
     paths = paths or sshconfig.default_paths()
-    plan = sshconfig.build(items, paths, socket or make_agent().socket, ensure_exe(paths) if exe is _RESOLVE else exe)
+    socket = socket or make_agent().socket
+    plan = sshconfig.build(items, paths, socket, ensure_exe(paths) if exe is _RESOLVE else exe)
     for w in plan.warnings:
-        if not (skip_catch_all and sshconfig.CATCH_ALL_WARNING in w):  # déjà dit par l'appelant
+        if not (skip_catch_all and (sshconfig.CATCH_ALL_WARNING in w
+                                    or sshconfig.FORWARD_CATCH_ALL_WARNING in w)):  # déjà dit par l'appelant
             err("avertissement : %s" % w)
     res = sshconfig.apply(plan, paths)
     for w in res.warnings:
@@ -684,9 +865,15 @@ def regenerate(items: list, paths=None, socket: Optional[str] = None, exe=_RESOL
     w = sshconfig.include_warning(paths)
     if w:
         err("avertissement : %s" % w)
+    forward_upkeep(plan, socket, out)
+    return plan
 
 
 def run_hosts(args, backend: VaultBackend, prompt) -> int:
+    """`hosts` (champ sshvault-hosts) et `forward` (champ sshvault-forward) : mêmes règles."""
+    fwd = args.cmd == "forward"
+    of = (lambda i: i.forward) if fwd else (lambda i: i.hosts)
+    what, one = ("transferts", "le transfert vers") if fwd else ("hôtes", "l'hôte")
     cmd = args.hosts_cmd
     if cmd != "list":
         given = _split(args.hosts)
@@ -699,15 +886,15 @@ def run_hosts(args, backend: VaultBackend, prompt) -> int:
         # écriture : partir de l'état du serveur, pas d'un cache local périmé (interface web)
         backend.sync(prompt)
     items = backend.list_ssh_keys(prompt)
-    item = _select_one(items, args)
+    item = _select_one(items, args, forward=fwd)
     if item is None:
         return RC_NONE
     if cmd == "list":
-        for h in item.hosts:
+        for h in of(item):
             print(clean(h))
         return RC_OK
     current = []
-    for h in item.hosts:
+    for h in of(item):
         if h.lower() not in current:
             current.append(h.lower())
     if cmd == "add":
@@ -718,13 +905,13 @@ def run_hosts(args, backend: VaultBackend, prompt) -> int:
         targets = [h.lower() for h in given]
         missing = [h for h in targets if h not in current]
         if missing:
-            err("« %s » n'a pas l'hôte « %s » : rien écrit" % (clean(item.name), clean(missing[0])))
+            err("« %s » n'a pas %s « %s » : rien écrit" % (clean(item.name), one, clean(missing[0])))
             return RC_NONE
         want = [h for h in current if h not in targets]
     bad = [h for h in want if not valid_host(h)]
     if bad:
-        raise InvalidHost("hôte invalide « %s » déjà dans « %s » : le retirer (hosts remove) ou remplacer la liste "
-                          "(hosts set) ; rien écrit" % (clean(bad[0]), clean(item.name)))
+        raise InvalidHost("hôte invalide « %s » déjà dans « %s » : le retirer (%s remove) ou remplacer la liste "
+                          "(%s set) ; rien écrit" % (clean(bad[0]), clean(item.name), args.cmd, args.cmd))
     # Prérequis de la régénération (chemins, socket de l'agent) vérifiés avant d'écrire
     # dans le coffre : SshConfigError ou AgentError ici, rien n'est écrit.
     paths = sshconfig.default_paths()
@@ -732,20 +919,22 @@ def run_hosts(args, backend: VaultBackend, prompt) -> int:
     exe = ensure_exe(paths)
     sshconfig.build(items, paths, socket, exe)
     if want == current:
-        print("hôtes de « %s » inchangés : %s" % (clean(item.name), _hosts(item.hosts)))
+        print("%s de « %s » inchangés : %s" % (what, clean(item.name), _hosts(of(item))))
         updated = item
     else:
         for h in want:
             if sshconfig.is_catch_all(h):
-                err("avertissement : motif « %s » : %s" % (h, sshconfig.CATCH_ALL_WARNING))
-        updated = backend.set_hosts(item.id, want, prompt)
-        print("hôtes de « %s » : %s" % (clean(updated.name), _hosts(updated.hosts)))
-        _warn_restricted(updated)
+                err("avertissement : motif « %s » : %s"
+                    % (h, sshconfig.FORWARD_CATCH_ALL_WARNING if fwd else sshconfig.CATCH_ALL_WARNING))
+        updated = (backend.set_forward if fwd else backend.set_hosts)(item.id, want, prompt)
+        print("%s de « %s » : %s" % (what, clean(updated.name), _hosts(of(updated))))
+        if not fwd:
+            _warn_restricted(updated)
     items = [updated if i.id == updated.id else i for i in items]
     try:
-        regenerate(items, paths, socket, exe)
+        regenerate(items, paths, socket, exe, skip_catch_all=fwd)
     except (sshconfig.SshConfigError, AgentError) as e:
-        err("hôtes écrits dans le coffre, mais ssh_config non régénéré : %s" % e)
+        err("%s écrits dans le coffre, mais ssh_config non régénéré : %s" % (what, e))
         return RC_BACKEND
     return RC_OK
 
@@ -772,7 +961,7 @@ def run_ssh_config(args, backend: VaultBackend, prompt) -> int:
         return RC_OK
     items = backend.list_ssh_keys(prompt)
     if not (args.print_only or args.check):
-        regenerate(items)
+        warn_forwardagent(items, regenerate(items, paths), paths)
         return RC_OK
     plan = sshconfig.build(items, paths, make_agent().socket, ensure_exe(paths))
     for w in plan.warnings:
@@ -783,6 +972,7 @@ def run_ssh_config(args, backend: VaultBackend, prompt) -> int:
     diffs, notes = sshconfig.check(plan, paths)
     for w in notes:
         err("avertissement : %s" % w)
+    warn_forwardagent(items, plan, paths)
     w = sshconfig.include_warning(paths)
     if w:
         diffs.append(w)
@@ -807,7 +997,7 @@ def _test_fields() -> list:
     if not raw:
         return []
     name, sep, value = raw.partition("=")
-    if not sep or not name or name == HOSTS_FIELD:
+    if not sep or not name or name in (HOSTS_FIELD, FORWARD_FIELD):
         raise ConfigError("%s invalide : NOM=VALEUR attendu" % TEST_FIELD_ENV)
     return [(name, value)]
 
@@ -1155,6 +1345,7 @@ def run_config(args) -> int:
         for line in cfg.lines(args.key):
             print(line)
     elif args.config_cmd in ("set", "unset"):
+        before = cfg.get(args.key) if args.key == "forward-confirm" else None
         if args.config_cmd == "set":
             cfg.set(args.key, args.value)
         else:
@@ -1162,6 +1353,14 @@ def run_config(args) -> int:
         print(cfg.lines(args.key)[0])
         if args.key == "auto-load":
             print("pris en compte à la prochaine génération : lancer « sshvault ssh-config »")
+        elif args.key == "forward-confirm" and cfg.get(args.key) != before:
+            # les clés déjà chargées garderaient l'ancienne option (-c ou non) jusqu'à expiration
+            try:
+                base = resolve_dir()
+            except AgentError:
+                base = None
+            if base is not None and stop_all_forward(base):
+                print("sous-agents de transfert arrêtés : rechargés au prochain ssh")
     else:
         raise UsageError("action inconnue : config %s" % args.config_cmd)
     return RC_OK
@@ -1175,7 +1374,7 @@ def _on_signal(signum, frame):
 
 def _ensure_settings() -> dict:
     cfg = Config()
-    return {k: cfg.get(k) for k in ("key-ttl", "auto-confirm", "auto-restrict")}
+    return {k: cfg.get(k) for k in ("key-ttl", "auto-confirm", "auto-restrict", "forward-confirm")}
 
 
 def _quiet() -> None:
@@ -1190,8 +1389,12 @@ def run_ensure(args) -> int:
     stdin ni de traceback ; délai global borné (compté depuis le démarrage du processus) ;
     terminal restauré et sous-processus tués sur tout chemin (finally des couches basses), y
     compris Ctrl-C, SIGTERM, SIGHUP et le délai global."""
-    item_id = (args.id or "").strip().lower()
+    ids = [(i or "").strip().lower() for i in args.id]
+    item_id = ids[0]
+    fids = args.forward or []
+    fid = fids[0] if fids else None
     label = clean(item_id) or "?"
+    what = "transfert d'agent : " if fid is not None else ""
     backend = None
     try:
         c = fastpath.caller()
@@ -1202,8 +1405,22 @@ def run_ensure(args) -> int:
         # échoue (EIO) au lieu de stopper le processus (aucune n'est tentée : premier plan vérifié).
         for sig in (signal.SIGTTIN, signal.SIGTTOU):
             signal.signal(sig, signal.SIG_IGN)
-        if not fastpath.ITEM_ID_RE.fullmatch(item_id):
+        if not all(fastpath.ITEM_ID_RE.fullmatch(i) for i in ids):
             raise UsageError("--id : UUID attendu")
+        if fid is None and len(ids) != 1:
+            raise UsageError("une seule --id sans --forward")
+        if len(fids) > 1:
+            raise UsageError("--forward : une seule fois")
+        if fid is not None and not FID_RE.fullmatch(fid):
+            raise UsageError("--forward : 16 chiffres hexadécimaux attendus")
+        if fid is not None and c.no_session:
+            # ssh -W (ProxyJump, ProxyCommand) ou -N : aucun canal de session, rien à transférer ;
+            # le socket du sous-agent doit seulement exister (-W impose ExitOnForwardFailure, même
+            # avec -a). Avant réglages, délais et coffre : un échec là laisserait le saut sans socket.
+            ensure_mod.forward_socket_only(fid)
+            return RC_OK
+        if fid is not None and c.no_forward:
+            return RC_OK  # ssh -a, -o ForwardAgent=no : aucun agent transféré, rien à faire
         try:
             for name, default in (("SSHVAULT_PROMPT_TIMEOUT", PROMPT_TIMEOUT), ("SSHVAULT_BW_TIMEOUT", BW_TIMEOUT)):
                 seconds(os.environ, name, default)
@@ -1224,14 +1441,17 @@ def run_ensure(args) -> int:
         settings = _ensure_settings()
         store = SessionStore()
         backend = BwBackend(store=store)
-        ensure_mod.ensure(item_id, backend, store, settings, ctx=ctx)
+        if fid is not None:
+            ensure_mod.ensure_forward(fid, ids, backend, store, settings, ctx=ctx)
+        else:
+            ensure_mod.ensure(item_id, backend, store, settings, ctx=ctx)
         _quiet()  # clé présente ou chargée : un délai ou un signal tardif n'y change plus rien
         rc = RC_OK
     except (Exception, KeyboardInterrupt, Interrupted, Deadline) as e:
         _quiet()
         rc, msg = classify(e)
         try:
-            err("%s : %s" % (label, msg))
+            err("%s : %s%s" % (label, what, msg))
         except (OSError, ValueError):
             pass
     finally:

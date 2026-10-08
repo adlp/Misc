@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import re
 from typing import Mapping, Optional
 
 from .fsutil import NotPrivateTmpfs, check_private_tmpfs
@@ -14,6 +15,10 @@ DIR_NAME = "sshvault"
 SOCKET_NAME = "agent.sock"
 RUN_USER = "/run/user"
 SUN_PATH_MAX = 107  # sun_path : 108 octets, NUL final compris
+#: Sous-dossier des sous-agents de transfert (CAP-8) : `<fid>.sock` et `<fid>.json`.
+FWD_DIR = "fwd"
+#: Identifiant d'un sous-agent : 16 premiers chiffres hexadécimaux du SHA-256 du motif en minuscules.
+FID_RE = re.compile(r"[0-9a-f]{16}", re.ASCII)
 
 
 class AgentError(Exception):
@@ -49,6 +54,24 @@ def resolve_dir(env: Optional[Mapping[str, str]] = None, uid: Optional[int] = No
         raise AgentError("chemin du socket trop long (%d octets au plus) : %s"
                          % (SUN_PATH_MAX, os.path.join(d, SOCKET_NAME)))
     return d
+
+
+def forward_id(pattern: str) -> str:
+    """`<fid>` du sous-agent de transfert d'un motif d'hôte : 16 premiers hex du SHA-256 du
+    motif en minuscules (espaces autour ignorés)."""
+    return hashlib.sha256(pattern.strip().lower().encode()).hexdigest()[:16]
+
+
+def forward_paths(directory: str, fid: str):
+    """(dossier `fwd/`, socket, état) du sous-agent `fid` sous le dossier de l'agent dédié ;
+    AgentError si `fid` est invalide ou si le chemin du socket est trop long."""
+    if not FID_RE.fullmatch(fid or ""):
+        raise AgentError("identifiant de sous-agent inattendu (16 chiffres hexadécimaux attendus) : %r" % (fid,))
+    d = os.path.join(directory, FWD_DIR)
+    sock = os.path.join(d, fid + ".sock")
+    if len(os.fsencode(sock)) > SUN_PATH_MAX:
+        raise AgentError("chemin du socket de transfert trop long (%d octets au plus) : %s" % (SUN_PATH_MAX, sock))
+    return d, sock, os.path.join(d, fid + ".json")
 
 
 # --- clés -------------------------------------------------------------------------------

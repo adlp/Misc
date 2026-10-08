@@ -1,5 +1,66 @@
 # Changelog — sshvault
 
+## sshvault 0.7.0 — Transfert d'agent restreint par hôte — 2026-10-08
+
+- Champ d'élément `sshvault-forward` (motifs d'hôtes, mêmes règles que `sshvault-hosts`) et
+  commande `sshvault forward add|remove|set|list SÉLECTION HÔTE…`, calquée sur `hosts`
+  (écriture sur stdin, relecture, rejeu unique, autres champs inchangés ; `set_forward` du
+  backend) ; le `ssh_config` est régénéré ensuite.
+- `ssh_config` généré : pour chaque motif de transfert, **avant** les blocs d'identité,
+  `Match originalhost <motif> exec "'<sshvault>' ensure --forward <fid> --id <uuid>…"` puis
+  `Match originalhost <motif>` + `ForwardAgent "<socket résolu du sous-agent>"` (`<fid>` = 16
+  premiers hex du SHA-256 du motif en minuscules ; ni `%h` ni `%n` ; ids et motif validés).
+  Mesuré (8.9p1) : ce chemin gagne sur un `ForwardAgent yes` ultérieur, `ssh -A` et
+  `-o ForwardAgent=yes`. Motifs littéraux d'abord, puis à joker du plus précis au moins précis,
+  attrape-tout en dernier ; la ligne `Match … exec` d'un bloc exclut les motifs des blocs
+  précédents (`!motif`) ; avertissements : recouvrement (le premier bloc gagne), attrape-tout,
+  motif invalide, id non UUID, clé publique illisible ; sans ligne `Match exec` possible
+  (`auto-load false`, aucune clé utilisable) : `ForwardAgent no`. Aucun `ForwardAgent` pour un
+  hôte d'identité sans transfert.
+- Sous-agents : `ssh-agent` d'OpenSSH sur `$XDG_RUNTIME_DIR/sshvault/fwd/<fid>.sock`, état
+  `<fid>.json`, mêmes garanties que l'agent dédié (`Agent` paramétré par socket et état,
+  fabrique `forward_agent`) : pid vérifié, surveillant (aussi pour `fwd/`), orphelins arrêtés,
+  verrou `flock` sur `fwd/`, `SSH_AUTH_SOCK` = son socket.
+- `sshvault ensure --forward FID --id ID…` : clés des éléments, et elles seules, chargées à la
+  demande dans le sous-agent (`ssh-add -t <key-ttl> [-c] -`, clé sur stdin, jamais `-h`), tout
+  ou rien, clés en trop retirées, état enregistré ; chemin rapide (sans charger la CLI) si
+  toutes sont fraîches et seules ; même verrou, même invite unique et même mémoire d'échec
+  que `ensure --id` ; le coffre fait foi (élément qui ne déclare plus ce motif : rien chargé).
+  N'ouvre jamais l'agent dédié (état lu : verrouillé → code 3). Échec : une ligne
+  `… : transfert d'agent : …`, la connexion continue.
+- Saut `ssh -W` (ProxyJump, ProxyCommand) et `ssh -N` : rien n'est transféré ni chargé ;
+  mesuré : `-W` impose `ExitOnForwardFailure` (même avec `-a`), un socket absent arrêtait le
+  saut : un sous-agent vide est lancé au besoin (ni réglage, ni coffre, ni invite). `ssh -a`,
+  `-o ForwardAgent=no` : `ensure --forward` ne fait rien. Clé du coffre différente du `.pub`
+  généré : retirée, code 4, « lancer sshvault ssh-config ».
+- Réglage `forward-confirm` (défaut `true`) : clés transférées chargées avec `-c`. Sans askpass
+  utilisable pour le sous-agent : rien chargé (une ligne) ; sous-agent lancé sans askpass
+  relancé dès qu'un ssh en a un.
+- `agent status` liste les sous-agents (motif, clés, temps restant, options) ; `agent purge`
+  les vide ; `agent stop` les arrête (aucun ssh-agent de sshvault restant, `fwd/` vide) ;
+  `agent lock` les vide et les arrête d'abord (rechargés par le premier ssh après `unlock`) ;
+  `agent lock` et `agent stop` tiennent `ensure.lock` (aucun `ensure --forward` ne relance un
+  sous-agent pendant l'arrêt).
+- `ssh-config` (et toute régénération) arrête les sous-agents qu'il ne référence plus, ou qui
+  gardent la clé d'un élément retiré du motif. `sshvault ssh-config` seul (et `--check`)
+  avertit pour chaque hôte d'identité littéral sans transfert déclaré dont `ssh -G` montre
+  `forwardagent yes` (l'agent dédié entier y serait transféré) ; 30 s au total.
+- `config set|unset forward-confirm` qui change la valeur : sous-agents arrêtés (rechargés au
+  prochain ssh). `agent lock`/`stop`, les régénérations qui arrêtent un sous-agent et ce
+  réglage tiennent `ensure.lock` (« attente d'un chargement en cours (ensure)… » s'il est
+  pris). `agent status|stop|purge|lock` : code 4 si un sous-agent est en erreur. Un état
+  « verrouillé » laissé par un agent dédié mort ne bloque plus le transfert. Contrôle `ssh -G`
+  : chaque `ssh -G` dans sa session, groupe tué au délai ; budget `SSHVAULT_SSH_G_BUDGET`.
+- `list --json` : champ `forward` ; `forward … --host` (et la sélection par défaut) couvre
+  aussi les motifs de transfert.
+- README : section « Transfert d'agent restreint », risques résiduels (root distant pendant
+  la session, confirmation hameçonnable, pas de `-h src>dst`, `ExitOnForwardFailure`, `ssh -A`
+  et motifs non vérifiables sur les hôtes d'identité).
+- Tests : `tests/test_forward.py` (matrice et critères de la story ; deux sshd de test,
+  `ssh a 'ssh-add -L'` ne liste que la clé transférée, confirmation par askpass, saut
+  ProxyJump) ; intégration : `forward add` relu par un second client `bw`, transfert vérifié
+  sur sshd local avec le vrai `bw`, `forward remove`.
+
 ## sshvault 0.6.0 — Génération d'une clé dans le coffre — 2026-10-08
 
 - `sshvault generate --name NOM [--type ed25519|rsa] [--bits 3072|4096] [--comment TEXTE]

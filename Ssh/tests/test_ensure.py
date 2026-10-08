@@ -249,9 +249,16 @@ def test_fraicheur_seuil():
 
 
 def test_ensure_args():
-    assert E.ensure_args(["ensure", "--id", "x"]) == ("x", False)
-    assert E.ensure_args(["--nointeraction", "ensure", "--id=x"]) == ("x", True)
+    assert E.ensure_args(["ensure", "--id", "x"]) == (["x"], None, False)
+    assert E.ensure_args(["--nointeraction", "ensure", "--id=x"]) == (["x"], None, True)
     assert E.ensure_args(["ensure", "--id", "x", "y"]) is None and E.ensure_args(["list"]) is None
+    assert E.ensure_args(["ensure", "--id", "x", "--id", "y"]) is None, "plusieurs --id : seulement avec --forward"
+    # transfert d'agent (story 8)
+    assert E.ensure_args(["ensure", "--forward", "f", "--id", "x", "--id", "y"]) == (["x", "y"], "f", False)
+    assert E.ensure_args(["--nointeraction", "ensure", "--forward=f", "--id=x"]) == (["x"], "f", True)
+    for bad in (["ensure", "--forward", "f"], ["ensure", "--forward", "f", "--forward", "g", "--id", "x"],
+                ["ensure", "--forward", "f", "--id"], ["ensure", "--forward", "f", "--id", "x", "--autre"]):
+        assert E.ensure_args(bad) is None, bad
 
 
 @pytest.mark.parametrize("dest,label", [
@@ -320,6 +327,11 @@ def test_exe_warnings(tmp_path):
     pathlib_path.chmod(0o600)
     w = sshconfig.exe_warnings(str(venv), paths)
     assert len(w) == 2 and "/autre/sshvault → %s" % venv in w[0] and ".venv" in w[1]
+    # config qui n'a que des blocs de transfert (story 8) : changement de chemin dit aussi
+    pathlib_path.write_text("Match originalhost a exec \"'/autre/sshvault' ensure --forward 0123456789abcdef "
+                            "--id %s\"\n" % ID_A)
+    w = sshconfig.exe_warnings("/opt/sshvault", paths)
+    assert w == ["chemin de sshvault des lignes Match exec changé : /autre/sshvault → /opt/sshvault"]
 
 
 SHELLS = ["/bin/bash", "/bin/sh"] + [shutil.which(x) or "/absent/" + x for x in ("zsh", "fish")]

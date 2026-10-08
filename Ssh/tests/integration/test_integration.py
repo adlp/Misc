@@ -524,7 +524,7 @@ def test_sshvault_sur_le_vrai_bw(account, vault, ssh_keys, home, report):
     assert got[vault["hotes"]]["fingerprint"] == ssh_keys["hotes"]["fingerprint"]
     assert got[vault["hotes"]]["publicKey"] == ssh_keys["hotes"]["public"]
     assert got[vault["sans-hotes"]]["hosts"] == []
-    assert set(got[vault["hotes"]]) == {"id", "name", "fingerprint", "hosts", "publicKey"}
+    assert set(got[vault["hotes"]]) == {"id", "name", "fingerprint", "hosts", "forward", "publicKey"}
 
     # sync (réseau ; sshvault relance lui-même une connexion bloquée)
     r = sv(home, "--nointeraction", "sync")
@@ -590,6 +590,10 @@ def test_sshvault_sur_le_vrai_bw(account, vault, ssh_keys, home, report):
 
     # chargement à la demande (story 5) : ssh vers un sshd local, agent vide, vrai bw
     check_ensure(account, vault, ssh_keys, home, report)
+
+    # transfert d'agent restreint (story 8) : forward add relu par un autre client bw, puis ssh vers
+    # un sshd local : l'hôte distant ne voit que la clé transférée
+    check_forward(account, vault, ssh_keys, home, report)
 
     # import d'une clé existante (story 6) : relecture par un autre client bw, load, ssh -G
     check_import(account, vault, home, report)
@@ -788,6 +792,112 @@ def check_ensure(account, vault, ssh_keys, home, report):
             finally:
                 r = sv(home, "agent", "stop")
                 check(account, r, 0, "agent stop après ensure")
+
+
+def check_forward(account, vault, ssh_keys, home, report):
+    """Story 8 : `sshvault forward add` écrit `sshvault-forward` (relu par le client du
+    peuplement après sync, clé et hôtes inchangés) ; `ssh` vers un sshd local (127.0.0.1,
+    utilisateur courant, `PermitUserRC no`) qui n'accepte que la clé `hotes`, avec
+    `ForwardAgent yes` dans la config de test : sur l'hôte distant, `ssh-add -L` ne liste que la
+    clé transférée (`sans-hotes`), aussi avec `ssh -A`, chargée par `ensure --forward` et le
+    vrai bw ; puis `forward remove` : bloc retiré, sous-agent arrêté, champ retiré."""
+    if not (HAVE_OPENSSH and shutil.which("ssh") and os.access(SSHD, os.X_OK)):
+        report.add("forward", note="ignoré : ssh, sshd, ssh-agent ou ssh-add absent")
+        return
+    import getpass
+    import socket as _socket
+    from sshvault.agent import forward_id
+    pop, session = vault["_reader"]
+    host = "prod-%s.it.example" % TAG
+    fwd = vault["sans-hotes"]
+    r = sv(home, "--nointeraction", "forward", "add", "--id", fwd, host)
+    report.add("sshvault forward add", r)
+    check(account, r, 0, "forward add")
+    assert pop.sync(session).returncode == 0, "sync du lecteur"
+    it = json.loads(pop.ok("get", "item", fwd, session=session).stdout)
+    assert [v for n, v, t in _fields(it) if n == "sshvault-forward"] == [host]
+    assert [v for n, v, t in _fields(it) if n == "sshvault-hosts"] == [], "sshvault-hosts inchangé (absent)"
+    assert has_mark(it) and it["sshKey"]["publicKey"] == ssh_keys["sans-hotes"]["public"]
+    r = sv(home, "config", "set", "forward-confirm", "false")  # pas d'askpass de confirmation ici
+    check(account, r, 0, "config set forward-confirm")
+    r = sv(home, "--nointeraction", "ssh-config")
+    check(account, r, 0, "ssh-config avec transfert")
+    d = os.path.join(home["env"]["HOME"], ".ssh", "sshvault")
+    fsock = os.path.join(home["runtime"], "sshvault", "fwd", forward_id(host) + ".sock")
+    text = open(os.path.join(d, "config")).read()
+    assert 'Match originalhost %s\n    ForwardAgent "%s"\n' % (host, fsock) in text, text
+    assert text.index("ForwardAgent") < text.index("IdentityAgent"), "bloc de transfert avant les blocs d'identité"
+    r = sv(home, "agent", "stop")
+    check(account, r, 0, "agent stop avant forward")
+    lab = os.path.join(home["tmp"], "sshd-fwd")
+    os.mkdir(lab, 0o700)
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", os.path.join(lab, "hostkey")], check=True)
+    with open(os.path.join(lab, "authorized_keys"), "w") as f:
+        f.write(ssh_keys["hotes"]["public"] + "\n")
+    with _socket.socket() as s_:
+        s_.bind(("127.0.0.1", 0))
+        port = s_.getsockname()[1]
+    with open(os.path.join(lab, "sshd_config"), "w") as f:
+        f.write("Port %d\nListenAddress 127.0.0.1\nHostKey %s/hostkey\nPidFile %s/sshd.pid\nAuthorizedKeysFile "
+                "%s/authorized_keys\nStrictModes no\nUsePAM no\nPasswordAuthentication no\n"
+                "KbdInteractiveAuthentication no\nPrintMotd no\nAllowAgentForwarding yes\nPermitUserRC no\n"
+                "LogLevel VERBOSE\n" % (port, lab, lab, lab))
+    with open(os.path.join(lab, "sshd.log"), "wb") as log:
+        sshd = subprocess.Popen([SSHD, "-D", "-e", "-f", os.path.join(lab, "sshd_config")], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=log, start_new_session=True)
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            with _socket.socket() as s_:
+                if s_.connect_ex(("127.0.0.1", port)) == 0:
+                    break
+            assert time.monotonic() < deadline, "sshd de test muet"
+            time.sleep(0.1)
+        main = os.path.join(home["tmp"], "ssh_config_forward")
+        with open(main, "w") as f:
+            f.write('Include "%s"\nHost %s\n    HostName 127.0.0.1\n    Port %d\nHost *\n    User %s\n'
+                    "    UserKnownHostsFile /dev/null\n    GlobalKnownHostsFile /dev/null\n"
+                    "    StrictHostKeyChecking no\n    BatchMode yes\n    ForwardAgent yes\n"
+                    % (os.path.join(d, "config"), host, port, getpass.getuser()))
+        os.chmod(main, 0o600)
+        env = dict(home["env"], SSHVAULT_TEST_TRACE="1")
+        for opts in ((), ("-A",)):
+            t0 = time.monotonic()
+            r = subprocess.run(["ssh", "-F", main, *opts, host, "ssh-add -L"], env=env, capture_output=True,
+                               text=True, stdin=subprocess.DEVNULL, timeout=600, start_new_session=True)
+            report.add("ssh %s'ssh-add -L' (transfert restreint, vrai bw)" % ("-A " if opts else ""),
+                       note="rc=%d durée=%.2fs" % (r.returncode, time.monotonic() - t0))
+            if r.returncode != 0:
+                raise AssertionError(account.scrub("ssh (transfert) : code %d ; stderr : %s"
+                                                   % (r.returncode, r.stderr.strip()[-3000:])))
+            seen = [l.split()[1] for l in r.stdout.splitlines() if l.startswith("ssh-")]
+            assert seen == [ssh_keys["sans-hotes"]["public"].split()[1]], "seule la clé transférée : %s" % seen
+            assert not [l for l in r.stderr.splitlines() if l.startswith("sshvault:")], account.scrub(r.stderr)
+            assert "PRIVATE KEY" not in r.stdout + r.stderr
+        rc, listing = agent_list(fsock)
+        assert rc == 0 and [l.split()[1] for l in listing] == [ssh_keys["sans-hotes"]["public"].split()[1]]
+    finally:
+        try:
+            sshd.terminate()
+            try:
+                sshd.wait(10)
+            except subprocess.TimeoutExpired:
+                sshd.kill()
+                sshd.wait(10)
+        finally:
+            try:
+                assert wait_gone([sshd.pid]), "sshd de test encore vivant"
+            finally:
+                r = sv(home, "--nointeraction", "forward", "remove", "--id", fwd, host)
+                report.add("sshvault forward remove", r)
+                check(account, r, 0, "forward remove")
+    assert "plus référencé" in r.stdout and not os.path.exists(fsock), "sous-agent arrêté"
+    assert "transfert d'agent" not in open(os.path.join(d, "config")).read()
+    assert pop.sync(session).returncode == 0
+    it = json.loads(pop.ok("get", "item", fwd, session=session).stdout)
+    assert [v for n, v, t in _fields(it) if n == "sshvault-forward"] == [], "champ retiré"
+    r = sv(home, "agent", "stop")
+    check(account, r, 0, "agent stop après forward")
 
 
 IMPORT_PASSPHRASE = "passphrase d'import " + TAG

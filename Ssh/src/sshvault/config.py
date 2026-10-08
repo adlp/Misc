@@ -6,7 +6,9 @@ Fichier 0600 dans un dossier 0700, sans aucun secret. Clés :
   - `auto-load` : le `ssh_config` généré charge la clé à la connexion (`Match … exec
     "sshvault ensure"`) ; défaut `true` ; `false` = config de la 0.3.0 ;
   - `auto-restrict`, `auto-confirm` : le chargement automatique ajoute `ssh-add -h`
-    (hôtes de l'élément) ou `-c` ; défaut `false`.
+    (hôtes de l'élément) ou `-c` ; défaut `false` ;
+  - `forward-confirm` : les clés des sous-agents de transfert (CAP-8) sont chargées avec
+    `ssh-add -c` (confirmation à chaque usage, par l'askpass de l'agent) ; défaut `true`.
 
 Durées acceptées : `N`, `Ns`, `Nm`, `Nh`, `Nd` (N entier), entre 1 s et 30 j, ou `0`
 (illimitée). Booléens : `true`/`false` (aussi `yes`/`no`, `on`/`off`, `1`/`0`). Toute
@@ -23,9 +25,10 @@ from .fsutil import read_private, write_private
 
 DEFAULT_KEY_TTL = 3600
 MAX_DURATION = 30 * 86400
-DEFAULTS = {"key-ttl": DEFAULT_KEY_TTL, "auto-load": True, "auto-restrict": False, "auto-confirm": False}
+DEFAULTS = {"key-ttl": DEFAULT_KEY_TTL, "auto-load": True, "auto-restrict": False, "auto-confirm": False,
+            "forward-confirm": True}
 KEYS = tuple(DEFAULTS)
-BOOL_KEYS = ("auto-load", "auto-restrict", "auto-confirm")
+BOOL_KEYS = ("auto-load", "auto-restrict", "auto-confirm", "forward-confirm")
 _TRUE, _FALSE = ("true", "yes", "on", "1"), ("false", "no", "off", "0")
 _UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 _DURATION_RE = re.compile(r"(\d{1,12})([smhd]?)")

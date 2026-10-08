@@ -229,8 +229,8 @@ def test_list_json(bench):
     data = json.loads(r.stdout)
     assert [d["id"] for d in data] == [ID_BASTION, ID_PERSO, ID_PROD]
     prod = data[2]
-    assert set(prod) == {"id", "name", "fingerprint", "hosts", "publicKey"}
-    assert prod["hosts"] == ["prod.example.com", "*.Lab.example"]
+    assert set(prod) == {"id", "name", "fingerprint", "hosts", "forward", "publicKey"}
+    assert prod["hosts"] == ["prod.example.com", "*.Lab.example"] and prod["forward"] == []
     assert prod["publicKey"] == bench.keys["prod"]["public"]
     assert data[1]["hosts"] == []
 
@@ -815,7 +815,8 @@ def config_file(bench):
 def test_config_get_set_unset(bench):
     r = bench.run("config", "get")
     assert r.returncode == 0 and r.stdout == ("key-ttl 1h (défaut)\nauto-load true (défaut)\n"
-                                              "auto-restrict false (défaut)\nauto-confirm false (défaut)\n")
+                                              "auto-restrict false (défaut)\nauto-confirm false (défaut)\n"
+                                              "forward-confirm true (défaut)\n")
     assert not config_file(bench).exists(), "get n'écrit rien"
     for value, shown in (("90", "90s"), ("90s", "90s"), ("15m", "15m"), ("2h", "2h"), ("30d", "30d"),
                          ("120", "2m"), ("0", "0 (illimitée)")):
