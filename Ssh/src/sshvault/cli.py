@@ -8,19 +8,22 @@ Codes de sortie :
      ssh-config --check : pas à jour (contenu, droits, fichier en trop ou non ordinaire) ou
      ligne Include absente, conditionnelle ou pas en tête
   2  usage (option ou argument invalide ; load sans sélection ni --all ; durée invalide ;
-     config.json invalide, illisible ou aux droits inattendus ; hôte invalide ; sélection
-     de hosts ou forward qui désigne plusieurs éléments ; import : fichier refusé — illisible, pas une
-     clé privée, type ou format non accepté — ou --name avec plusieurs fichiers ; generate :
-     type, bits, nom ou commentaire refusés ; deploy : cible, port ou options ssh invalides)
+     config.json invalide, illisible ou aux droits inattendus ; config set bw-path : chemin
+     relatif, absent, avec un caractère de contrôle, ou pas un fichier ordinaire exécutable ;
+     hôte invalide ; sélection de hosts ou forward qui désigne plusieurs éléments ; import :
+     fichier refusé — illisible, pas une clé privée, type ou format non accepté — ou --name
+     avec plusieurs fichiers ; generate : type, bits, nom ou commentaire refusés ; deploy :
+     cible, port ou options ssh invalides)
   3  non connecté au coffre, ou coffre verrouillé (aucune invite possible, mot de passe refusé) ;
      agent dédié arrêté ou verrouillé (ensure --forward compris) ; passphrase d'une clé
      refusée ou impossible à saisir (load, import)
-  4  erreur du backend (bw absent, en erreur, réponse illisible, délai dépassé), de l'agent
-     dédié (XDG_RUNTIME_DIR relatif, non privé ou hors tmpfs, chemin du socket trop long,
-     agent tiers, OpenSSH < 8.9, --restrict : élément sans hôte, hôte non littéral ou absent
-     de known_hosts ; clé publique illisible ou différente de la clé privée), écriture de
-     config.json impossible, écriture des hôtes ou des transferts dans le coffre non aboutie
-     ou non vérifiée (y compris écrits mais ssh_config non régénéré), sous-agent de transfert
+  4  erreur du backend (bw absent, non exécutable ou impossible à lancer, au chemin du réglage
+     bw-path compris ; bw en erreur, réponse illisible, délai dépassé), de l'agent dédié
+     (XDG_RUNTIME_DIR relatif, non privé ou hors tmpfs, chemin du socket trop long, agent
+     tiers, OpenSSH < 8.9, --restrict : élément sans hôte, hôte non littéral ou absent de known_hosts ; clé publique
+     illisible ou différente de la clé privée), écriture de config.json impossible,
+     écriture des hôtes ou des transferts dans le coffre non aboutie ou non vérifiée
+     (y compris écrits mais ssh_config non régénéré), sous-agent de transfert
      en erreur (ensure --forward : forward-confirm sans askpass, agent tiers…), création d'un élément par import
      non aboutie ou non vérifiée (y compris clé importée mais ssh_config non régénéré), copie
      impossible dans un tmpfs privé (import --decrypt, generate), ssh-keygen absent ou en
@@ -63,17 +66,19 @@ from .agent import (CMD_TIMEOUT as AGENT_TIMEOUT, FID_RE, Agent, AgentError, Age
 from .agentstate import entry as state_entry, maybe_locked, reconcile, remaining
 from .backend import (FORWARD_FIELD, HOSTS_FIELD, BackendError, InvalidHost, NotLoggedIn, SshKeyItem, VaultBackend, VaultError,
                       VaultLocked, WriteFailed, normalize_hosts, valid_host)
-from .bw import BwBackend
-from .config import Config, ConfigError, ConfigWriteError, describe_duration, parse_duration
+from .bw import EXE_VAR as BW_EXE_VAR, BwBackend
+from .config import BW_PATH, Config, ConfigError, ConfigWriteError, describe_duration, parse_duration
 from . import deploy as deploy_mod
 from . import ensure as ensure_mod
 from . import fastpath
+from .fsutil import exposure_warning
 from . import keyfile
 from .ensure import Deadline
 from .prompt import DEFAULT_TIMEOUT as PROMPT_TIMEOUT, PromptError, ask_password, prompt_timeout
 from .bw import DEFAULT_TIMEOUT as BW_TIMEOUT
 from .session import DEFAULT_TTL, SessionStore, SessionStoreError
 from .settings import seconds
+from .text import clean  # texte venu du coffre, pour un terminal
 from . import sshconfig
 
 RC_OK, RC_NONE, RC_USAGE, RC_LOCKED, RC_BACKEND, RC_INTERRUPTED = 0, 1, 2, 3, 4, 130
@@ -144,7 +149,8 @@ def build_parser() -> Parser:
                epilog="Codes de sortie : 0 ok, 1 aucun résultat (hosts remove : hôte absent ; "
                       "ssh-config --check : pas à jour ; import : déjà dans le coffre ; generate : nom "
                       "déjà pris), 2 usage (hôte invalide, sélection ambiguë, import : fichier refusé, "
-                      "generate : type ou commentaire refusé, deploy : cible invalide), "
+                      "generate : type ou commentaire refusé, deploy : cible invalide, config set bw-path : "
+                      "chemin refusé), "
                       "3 non connecté ou verrouillé (coffre ou agent, passphrase refusée), "
                       "4 erreur backend ou agent, écriture ou ssh_config impossible, install refusé, "
                       "ssh-keygen ou ssh en échec, "
@@ -285,7 +291,7 @@ def build_parser() -> Parser:
 
     s = sub.add_parser("config", help="réglages : key-ttl (durée de vie par défaut des clés), auto-load, "
                                       "auto-restrict, auto-confirm (chargement automatique), forward-confirm "
-                                      "(sous-agents de transfert)")
+                                      "(sous-agents de transfert), bw-path (chemin absolu de bw ; défaut : PATH)")
     csub = s.add_subparsers(dest="config_cmd", metavar="ACTION", parser_class=Parser)
     csub.required = True
     c = csub.add_parser("get", help="affiche un réglage, ou tous")
@@ -296,15 +302,6 @@ def build_parser() -> Parser:
     c = csub.add_parser("unset", help="revient à la valeur par défaut")
     c.add_argument("key", metavar="CLÉ")
     return p
-
-
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-
-
-def clean(text: str) -> str:
-    """Texte venu du coffre, pour un terminal : caractères de contrôle (tabulation, fin de
-    ligne, séquences ANSI/OSC) remplacés par leur échappement \\xNN."""
-    return _CONTROL.sub(lambda m: "\\x%02x" % ord(m.group()), text)
 
 
 def print_items(items: list, as_json: bool) -> None:
@@ -333,6 +330,7 @@ def run(args, backend: VaultBackend) -> int:
     if args.cmd == "search" and not args.pattern.strip():
         raise UsageError("motif vide")
     if args.cmd == "status":
+        print("bw : %s" % backend.describe_exe(), flush=True)  # avant le lancement : dit même si bw manque
         st = backend.status()
         label = {"unauthenticated": "non connecté", "locked": "verrouillé",
                  "unlocked": "déverrouillé"}[st.state]
@@ -1339,6 +1337,12 @@ def _report_deployed(items, lines, answers, target) -> None:
               flush=True)
 
 
+def configured_bw_path():
+    """Réglage `bw-path` seul (None : non posé), lu par BwBackend au premier appel de bw
+    seulement ; les autres réglages, même invalides, n'y changent rien."""
+    return Config().bw_path()
+
+
 def run_config(args) -> int:
     cfg = Config()
     if args.config_cmd == "get":
@@ -1347,12 +1351,18 @@ def run_config(args) -> int:
     elif args.config_cmd in ("set", "unset"):
         before = cfg.get(args.key) if args.key == "forward-confirm" else None
         if args.config_cmd == "set":
-            cfg.set(args.key, args.value)
+            v = cfg.set(args.key, args.value)
+            warning = exposure_warning(v) if args.key == BW_PATH else None
+            if warning:
+                err(warning)  # accepté (choix de l'utilisateur), mais dit
         else:
             cfg.unset(args.key)
         print(cfg.lines(args.key)[0])
         if args.key == "auto-load":
             print("pris en compte à la prochaine génération : lancer « sshvault ssh-config »")
+        elif args.key == BW_PATH and os.environ.get(BW_EXE_VAR):
+            print("%s est posé : %s" % (BW_EXE_VAR, "il reste prioritaire sur " + BW_PATH
+                                         if args.config_cmd == "set" else "il reste utilisé"))
         elif args.key == "forward-confirm" and cfg.get(args.key) != before:
             # les clés déjà chargées garderaient l'ancienne option (-c ou non) jusqu'à expiration
             try:
@@ -1440,7 +1450,12 @@ def run_ensure(args) -> int:
                                  deadline_at=time.monotonic() + left)
         settings = _ensure_settings()
         store = SessionStore()
-        backend = BwBackend(store=store)
+        def warn(text, label=label):
+            try:
+                err("%s : %s" % (label, text))
+            except (OSError, ValueError):
+                pass
+        backend = BwBackend(store=store, bw_path=configured_bw_path, warn=warn)
         if fid is not None:
             ensure_mod.ensure_forward(fid, ids, backend, store, settings, ctx=ctx)
         else:
@@ -1513,7 +1528,7 @@ def main(argv=None) -> int:
                 return RC_USAGE
         reap_orphans_quietly()
         store = SessionStore()
-        backend = BwBackend(store=store)
+        backend = BwBackend(store=store, bw_path=configured_bw_path, warn=err)
         rc = run(args, backend)
     except BrokenPipeError:
         # sortie fermée (sshvault list | head) : rien à dire

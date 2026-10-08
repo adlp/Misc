@@ -1,6 +1,9 @@
 """`BwBackend` : le coffre via le CLI officiel `bw`, en sous-processus.
 
-- Exécutable : `SSHVAULT_BW` (défaut `bw`, cherché dans le PATH).
+- Exécutable : `SSHVAULT_BW` (tests), sinon le réglage `bw-path` de sshvault (chemin absolu),
+  sinon `bw` cherché dans le PATH. Un réglage posé n'est jamais doublé par le PATH : `bw`
+  absent à ce chemin = erreur (BackendNotFound) qui cite le chemin et le réglage. Le chemin
+  n'est jamais passé à un shell (argv de Popen).
 - Données propres à sshvault, login séparé de l'usage personnel de bw :
   `BITWARDENCLI_APPDATA_DIR=${XDG_DATA_HOME:-~/.local/share}/sshvault/bw`,
   donc un login séparé de l'usage personnel de `bw`.
@@ -18,27 +21,46 @@ from __future__ import annotations
 
 import base64
 import copy
+import errno
+import sys
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import termios
-from typing import Optional
+from typing import Callable, Optional
 
 from .backend import (FORWARD_FIELD, HOSTS_FIELD, BackendError, BackendNotFound, ItemNotFound, NotLoggedIn,
                       PasswordRefused, Prompt, SshKeyItem, VaultBackend, VaultError, VaultLocked, VaultStatus, WriteFailed,
                       normalize_fingerprint, normalize_hosts, parse_hosts)
-from .fsutil import ensure_dir
-from .settings import seconds
+from .fsutil import ensure_dir, exe_problem, exposure_warning
 from .session import DEFAULT_TTL, SessionStore, SessionStoreError, valid_token
+from .settings import seconds
+from .text import clean as _clean
 
 DEFAULT_TIMEOUT = 60.0
 LOGIN_TIMEOUT = 600.0  # login interactif (saisie, 2FA)
 SSH_KEY_TYPE = 5
 PASSWORD_VAR = "SSHVAULT_BW_MASTER_PASSWORD"
-INSTALL_HINT = ("installer le binaire natif dans ~/.local/bin "
-                "(https://bitwarden.com/download/?app=cli&platform=linux) ou définir SSHVAULT_BW")
+EXE_VAR = "SSHVAULT_BW"
+BW_PATH_KEY = "bw-path"
+INSTALL_HINT = ("installer le binaire natif (https://bitwarden.com/download/?app=cli&platform=linux), "
+                "par exemple dans ~/.local/bin, puis « sshvault config set bw-path <chemin absolu> » "
+                "si son dossier n'est pas dans le PATH de ssh")
+#: Source de l'exécutable → (ce qui a été essayé, comment corriger), pour les messages d'erreur.
+#: Le réglage `bw-path` est revérifié avant chaque lancement (`fsutil.exe_problem`) ; s'il est
+#: modifiable par d'autres, un avertissement (une fois par processus) : bw reçoit le mot de
+#: passe maître et BW_SESSION.
+_EXE_SOURCES = {
+    EXE_VAR: ("(%s, " + EXE_VAR + ")", "corriger ou retirer " + EXE_VAR),
+    BW_PATH_KEY: ("(%s, réglage " + BW_PATH_KEY + ")",
+                  "corriger par « sshvault config set " + BW_PATH_KEY + " <chemin absolu> » ou revenir au "
+                  "PATH par « sshvault config unset " + BW_PATH_KEY + " »"),
+    "PATH": ("(%s cherché dans le PATH, réglage " + BW_PATH_KEY + " non posé)", INSTALL_HINT),
+    "argument": ("(%s)", INSTALL_HINT),
+}
 # Variables de l'utilisateur qui changeraient le comportement ou la sortie de bw.
 _STRIP_ENV = ("BW_SESSION", "BW_NOINTERACTION", "BW_RAW", "BW_RESPONSE", "BW_QUIET",
               "BW_PRETTY", "BW_CLEANEXIT", "BITWARDENCLI_APPDATA_DIR", PASSWORD_VAR,
@@ -72,6 +94,28 @@ def default_appdata(env=None) -> str:
     if not os.path.isabs(base):
         base = os.path.join(os.path.expanduser("~"), ".local", "share")
     return os.path.join(base, "sshvault", "bw")
+
+
+def resolve_exe(env=None, configured: Optional[Callable[[], Optional[str]]] = None) -> tuple:
+    """(exécutable, source) de bw : `SSHVAULT_BW`, sinon le réglage `bw-path` (`configured()`,
+    lu seulement si `SSHVAULT_BW` est vide ; ConfigError s'il est invalide), sinon `bw` du PATH.
+    Source : "SSHVAULT_BW", "bw-path" ou "PATH"."""
+    env = os.environ if env is None else env
+    v = env.get(EXE_VAR)
+    if v:
+        return v, EXE_VAR
+    path = configured() if configured is not None else None
+    if path:
+        return path, BW_PATH_KEY
+    return "bw", "PATH"
+
+
+def _stderr_warning(text: str) -> None:
+    try:
+        sys.stderr.write("sshvault: %s\n" % text)
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
 
 
 def bw_timeout(env=None) -> float:
@@ -123,13 +167,74 @@ class Result:
 
 class BwBackend(VaultBackend):
     def __init__(self, store: Optional[SessionStore] = None, exe: Optional[str] = None,
-                 appdata: Optional[str] = None, timeout: Optional[float] = None):
+                 appdata: Optional[str] = None, timeout: Optional[float] = None,
+                 bw_path: Optional[Callable[[], Optional[str]]] = None,
+                 warn: Optional[Callable[[str], None]] = None):
+        """`exe` : exécutable imposé ; sinon résolu au premier appel de bw (`resolve_exe`) avec
+        `bw_path()`, le réglage `bw-path` (None : non posé) : une commande qui ne lance pas bw
+        ne lit pas la configuration. `warn` : affiche aussitôt un avertissement d'une ligne
+        (bw-path exposé à d'autres, avant le premier lancement de bw) ; défaut : stderr."""
         self.store = store or SessionStore()
-        self.exe = exe or os.environ.get("SSHVAULT_BW") or "bw"
+        self._exe = (exe, "argument") if exe else None
+        self._bw_path = bw_path
+        self._exposure_checked = False
+        self._warn = warn or _stderr_warning
         self.appdata = appdata or default_appdata()
         self.timeout = timeout if timeout is not None else bw_timeout()
         self.calls = 0  # nombre d'appels à bw (mesure du coût : ~1,4 s chacun)
         self.warnings: list = []  # avertissements d'une ligne pour l'utilisateur
+
+    @property
+    def exe(self) -> str:
+        return self._resolved()[0]
+
+    def _resolved(self) -> tuple:
+        if self._exe is None:
+            self._exe = resolve_exe(configured=self._bw_path)
+        return self._exe
+
+    def _not_found(self, what: str, why: Optional[str] = None) -> BackendNotFound:
+        """`<what> (<chemin>, <source>)[ : <why>] : <remède de la source>`, une ligne."""
+        exe, source = self._resolved()
+        tried, fix = _EXE_SOURCES[source]
+        return BackendNotFound("%s %s%s : %s" % (what, tried % _clean(exe), " : " + _clean(why) if why else "", fix))
+
+    def _target(self) -> Optional[str]:
+        """Fichier que lance Popen (PATH résolu comme lui), s'il existe."""
+        exe = self.exe
+        found = exe if os.sep in exe else shutil.which(exe, mode=os.F_OK)
+        return found if found and os.path.exists(found) else None
+
+    def _check_exe(self) -> None:
+        """Réglage `bw-path` : revérifié avant chaque lancement (le PATH n'est jamais essayé)."""
+        exe, source = self._resolved()
+        if source != BW_PATH_KEY:
+            return
+        try:
+            os.stat(exe)
+        except OSError as e:
+            if e.errno in (errno.ENOENT, errno.ENOTDIR):
+                raise self._not_found("bw introuvable") from None
+            raise self._not_found("bw refusé", str(e.strerror or e)) from None  # EACCES, ELOOP…
+        why = exe_problem(exe)
+        if why:
+            raise self._not_found("bw refusé", why)
+        if not self._exposure_checked:
+            # accepté, mais dit tout de suite (une fois par processus), avant que bw reçoive le
+            # mot de passe maître ou la session : choix de l'utilisateur
+            self._exposure_checked = True
+            warning = exposure_warning(exe, BW_PATH_KEY)
+            if warning:
+                self._warn(warning)
+
+    def describe_exe(self) -> str:
+        """`<chemin> (<source>)` du bw qui sera lancé, sans le lancer (ligne `bw :` de status)."""
+        exe, source = self._resolved()
+        if source == "PATH":
+            found = shutil.which(exe)
+            return "%s (PATH)" % _clean(found) if found else "bw (introuvable dans le PATH)"
+        label = {EXE_VAR: EXE_VAR, BW_PATH_KEY: "réglage " + BW_PATH_KEY}.get(source, source)
+        return "%s (%s)" % (_clean(exe), label)
 
     def info(self) -> dict:
         return {"session": self.store.last_backend, "store": self.store.describe(), "data": self.appdata}
@@ -153,7 +258,8 @@ class BwBackend(VaultBackend):
             ensure_dir(self.appdata)
         except OSError as e:
             raise BackendError("dossier de données de bw %s : %s" % (self.appdata, e.strerror or e)) from None
-        argv = [self.exe] + ([] if interactive else ["--nointeraction"]) + args
+        self._check_exe()
+        argv = [self.exe] + ([] if interactive else ["--nointeraction"]) + args  # jamais de shell
         timeout = timeout or self.timeout
         self.calls += 1
         tty = _save_tty() if interactive else None
@@ -172,11 +278,17 @@ class BwBackend(VaultBackend):
                 # hors interactif : groupe à part, tué en entier si le délai expire
                 start_new_session=not interactive)
         except FileNotFoundError:
-            raise BackendNotFound("bw introuvable (%s) : %s" % (self.exe, INSTALL_HINT)) from None
+            # fichier présent mais ENOENT : interpréteur du shebang ou chargeur ELF absent
+            raise self._not_found("interpréteur ou chargeur de bw introuvable" if self._target()
+                                  else "bw introuvable") from None
         except PermissionError:
-            raise BackendNotFound("bw non exécutable (%s) : %s" % (self.exe, INSTALL_HINT)) from None
+            raise self._not_found("bw non exécutable") from None
         except OSError as e:
-            raise BackendError("erreur bw : lancement de %s : %s" % (self.exe, e.strerror or e)) from None
+            if e.errno == errno.ENOEXEC:
+                raise self._not_found("bw : format non exécutable") from None
+            exe, source = self._resolved()
+            raise BackendError("erreur bw : lancement de bw %s : %s"
+                               % (_EXE_SOURCES[source][0] % _clean(exe), e.strerror or e)) from None
         done = False
         try:
             out, err = p.communicate(input=input, timeout=timeout)
@@ -620,13 +732,6 @@ class BwBackend(VaultBackend):
                                   % (failed, what, _fmt(hosts_of(after, field))))
             before, new = after, with_hosts(after, want, field)
         raise AssertionError("inaccessible")
-
-
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-
-
-def _clean(text: str) -> str:
-    return _CONTROL.sub(lambda m: "\\x%02x" % ord(m.group()), text)
 
 
 def _fmt(hosts) -> str:

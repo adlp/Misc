@@ -6,8 +6,11 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import stat
 from typing import Optional
+
+from .text import clean
 
 PRIVATE_FS = ("tmpfs", "ramfs")
 
@@ -127,3 +130,98 @@ def read_private(path: str):
         return b"".join(chunks)
     finally:
         os.close(fd)
+
+
+def exe_problem(path: str) -> Optional[str]:
+    """Raison (une ligne, sans le chemin) pour laquelle `path` ne peut pas servir d'exécutable,
+    ou None : lien symbolique suivi, la cible doit exister, être un fichier ordinaire et être
+    exécutable par l'utilisateur. Propriété et droits d'écriture : `exe_exposure`."""
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        return str(e.strerror or e)
+    if not stat.S_ISREG(st.st_mode):
+        return "pas un fichier ordinaire"
+    if not os.access(path, os.X_OK):
+        return "non exécutable par l'utilisateur"
+    return None
+
+
+def _ancestors(d: str) -> list:
+    """`d` puis chacun de ses parents jusqu'à `/` (chemin normalisé, liens non résolus)."""
+    out = []
+    d = os.path.normpath(d)
+    while True:
+        out.append(d)
+        up = os.path.dirname(d)
+        if up == d:
+            return out
+        d = up
+
+
+def _link_chain(path: str) -> tuple:
+    """(cible finale, dossiers à contrôler) : `path` puis chaque lien symbolique suivi (lstat,
+    lien relatif résolu depuis son propre dossier) ; dossiers = dossier de chaque maillon et
+    ses parents jusqu'à `/`, sous leur forme écrite et résolue (sans doublon, dans l'ordre)."""
+    dirs = []
+
+    def add(d):
+        for a in _ancestors(d) + _ancestors(os.path.realpath(d)):
+            if a not in dirs:
+                dirs.append(a)
+    p = os.path.abspath(path)
+    for _ in range(40):  # au-delà : boucle de liens, que exe_problem refuse
+        add(os.path.dirname(p))
+        try:
+            if not stat.S_ISLNK(os.lstat(p).st_mode):
+                break
+            p = os.path.normpath(os.path.join(os.path.dirname(p), os.readlink(p)))
+        except OSError:
+            break
+    return p, dirs
+
+
+def exe_exposure(path: str) -> Optional[tuple]:
+    """(raisons, à chmod, à déplacer) si d'autres que l'utilisateur et root peuvent remplacer
+    l'exécutable `path`, sinon None. Contrôlés, comme le StrictModes d'OpenSSH (safe_path) :
+    la cible finale, le dossier de chaque maillon de liens symboliques et tous leurs parents
+    jusqu'à `/`. Chacun doit être à l'utilisateur ou à root et non modifiable par le groupe ni
+    les autres (pas d'exception pour le sticky bit : n'importe qui peut y créer un fichier).
+    À chmod (`g-w,o-w`) : ce qui est à l'utilisateur, ouvert en écriture, sans sticky bit ;
+    sinon (sticky, autre propriétaire, dossier système) : déplacer bw."""
+    target, dirs = _link_chain(path)
+    uid = os.getuid()
+    reasons, to_chmod, move = [], [], False
+    for what, p in [("fichier", target)] + [("dossier", d) for d in dirs]:
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue  # disparu entre-temps : exe_problem le dira au lancement
+        if st.st_uid not in (uid, 0):
+            reasons.append("%s %s à un autre utilisateur (uid %d)" % (what, p, st.st_uid))
+            move = True
+        if st.st_mode & 0o022:
+            reasons.append("%s %s modifiable par le groupe ou les autres" % (what, p))
+            if st.st_uid == uid and not st.st_mode & stat.S_ISVTX:
+                to_chmod.append(p)
+            else:
+                move = True
+    return (reasons, to_chmod, move) if reasons else None
+
+
+def exposure_warning(path: str, key: str = "bw-path") -> Optional[str]:
+    """Avertissement d'une ligne si d'autres que l'utilisateur et root peuvent remplacer
+    l'exécutable `path` (`exe_exposure`), sinon None. N'empêche rien : choix de l'utilisateur
+    (dossier partagé avec son groupe). Jamais de chmod proposé sur ce qui n'est pas à lui ni
+    sur un dossier à sticky bit (/tmp)."""
+    found = exe_exposure(path)
+    if found is None:
+        return None
+    reasons, to_chmod, move = found
+    fixes = []
+    if to_chmod:
+        fixes.append("corriger par « chmod g-w,o-w %s »" % " ".join(shlex.quote(clean(p)) for p in to_chmod))
+    if move:
+        fixes.append("déplacer bw dans un dossier à vous non modifiable par d'autres")
+    return ("avertissement : %s « %s » exposé à d'autres (%s) : ils pourraient remplacer bw et recevoir le "
+            "mot de passe maître ; %s" % (key, clean(path), " ; ".join(clean(r) for r in reasons), " et ".join(fixes)))

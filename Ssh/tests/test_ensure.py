@@ -392,6 +392,54 @@ def test_proxyjump_un_ensure_par_saut(bench, lab, tmp_path):
     assert {e["id"] for e in st.values()} == {ID_A, ID_B} and all(e["lifetime"] == 3600 for e in st.values())
 
 
+def _bw_path_lab(bench, lab, tmp_path):
+    """Story 9 : SSHVAULT_BW absent, PATH sans autre bw qu'un piège en tête (jamais lancé),
+    réglage bw-path posé. Renvoie (config ssh, bw du réglage, son journal, témoin du piège)."""
+    main = setup(bench, lab, tmp_path)
+    trap = tmp_path / "piege.log"
+    bench.bw_wrapper(tmp_path / "piege" / "bw", trap)
+    bench.env = bench.env_without_bw()
+    assert not shutil.which("bw", path=bench.env["PATH"]), "PATH sans bw"
+    bench.env["PATH"] = str(tmp_path / "piege") + os.pathsep + bench.env["PATH"]
+    used = tmp_path / "bw-reglage.log"
+    bw = bench.bw_wrapper(bench.safe() / "local" / "bin" / "bw", used)
+    assert bench.run("config", "set", "bw-path", str(bw)).returncode == 0
+    assert bench.agent_keys() == []
+    return main, bw, used, trap
+
+
+def test_bw_path_reglage_sans_bw_dans_le_path(bench, lab, tmp_path):
+    """Agent vide : `ssh b` (via le rebond a) charge les deux clés par le bw du réglage ; le
+    bw du PATH n'est jamais lancé."""
+    main, bw, used, trap = _bw_path_lab(bench, lab, tmp_path)
+    r = ssh_run(bench, main, "b")
+    assert r.returncode == 0, r.stderr
+    assert fins(r.stderr) == [(ID_B, "0"), (ID_A, "0")] and sv_lines(r.stderr) == []
+    assert sorted(bench.agent_keys()) == sorted([bench.blob("prod"), bench.blob("bastion")])
+    assert bw_cmds(bench)[-2:] == [["get", "item"], ["get", "item"]]
+    assert len(used.read_text().splitlines()) == 2, "les deux chargements par le bw du réglage"
+    assert not trap.exists(), "bw du PATH jamais lancé"
+
+
+def test_bw_path_reglage_casse_sous_ssh(bench, lab, tmp_path):
+    """Réglage posé puis fichier supprimé : chaque ensure dit une ligne qui cite bw-path (code
+    4), le bw du PATH n'est jamais lancé, la connexion échoue proprement (clé absente)."""
+    main, bw, used, trap = _bw_path_lab(bench, lab, tmp_path)
+    bw.unlink()
+    calls = len(bench.calls())
+    r = ssh_run(bench, main, "b")
+    assert r.returncode == 255 and "Permission denied" in r.stderr
+    assert "Traceback" not in r.stderr
+    lines = sv_lines(r.stderr)
+    assert lines == ["sshvault: %s : bw introuvable (%s, réglage bw-path) : corriger par « sshvault config set "
+                     "bw-path <chemin absolu> » ou revenir au PATH par « sshvault config unset bw-path »" % (h, bw)
+                     for h in ("b", "a")], r.stderr
+    assert fins(r.stderr) == [(ID_B, "4"), (ID_A, "4")]
+    assert not trap.exists(), "bw du PATH jamais lancé"
+    assert len(bench.calls()) == calls and loads(bench) == []
+    assert no_leftovers(bench) == []
+
+
 def test_proxycommand_ssh_w(bench, lab, tmp_path):
     main = setup(bench, lab, tmp_path)
     r = ssh_run(bench, main, "bpc")

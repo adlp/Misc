@@ -361,6 +361,8 @@ class Bench:
         self.write_vault()
         self.bw = tmp_path / "bin" / "bw"
         self.bw.parent.mkdir()
+        self.bw.parent.chmod(0o755)  # umask 002 : pas de dossier ouvert au groupe sans raison
+        self._safe = None
         self.bw.write_text("#!/bin/sh\nexec '%s' '%s' \"$@\"\n" % (sys.executable, FAKE_BW))
         self.bw.chmod(0o755)
         self.appdata = self.home / ".local" / "share" / "sshvault" / "bw"
@@ -400,6 +402,54 @@ class Bench:
         else:
             env["SSHVAULT_KEYCTL"] = "/nonexistent/keyctl"
         return env
+
+    def env_without_bw(self, extra_path=()):
+        """Environnement du banc sans SSHVAULT_BW et PATH sans aucun `bw` (dossiers qui en ont
+        un exécutable retirés) ; `extra_path` en tête du PATH (piège `bw`, par exemple)."""
+        env = dict(self.env)
+        env.pop("SSHVAULT_BW", None)
+        dirs = [d for d in env.get("PATH", "").split(os.pathsep)
+                if d and not os.access(os.path.join(d, "bw"), os.X_OK)]
+        env["PATH"] = os.pathsep.join([str(d) for d in extra_path] + dirs)
+        return env
+
+    def bw_wrapper(self, path, marker):
+        """`bw` à `path` (fichier ordinaire exécutable, dossier 0755 : rien d'exposé de leur fait ;
+        sous `safe()`, bw-path n'avertit pas) : note chaque lancement dans `marker` (une ligne),
+        puis lance le faux bw du banc."""
+        path = pathlib.Path(path)
+        created, d = [], path.parent
+        while not d.exists():
+            created.append(d)
+            d = d.parent
+        for d in reversed(created):  # umask 002 : chaque dossier créé ramené à 0755
+            d.mkdir()
+            d.chmod(0o755)
+        path.parent.chmod(0o755)
+        path.write_text("#!/bin/sh\necho run >> '%s'\nexec '%s' \"$@\"\n" % (marker, self.bw))
+        path.chmod(0o755)
+        return path
+
+    def safe(self):
+        """Dossier temporaire dont ni lui ni aucun parent n'est ouvert à d'autres
+        (`safe_base`) : un bw-path y est accepté sans avertissement. Sous /tmp (sticky 1777),
+        tout bw-path est averti. Ignore le test si le poste n'en a pas."""
+        if self._safe is None:
+            base = safe_base()
+            if base is None:
+                pytest.skip("pas de dossier sûr pour bw-path (/run/user/<uid> 0700 attendu)")
+            self._safe = pathlib.Path(tempfile.mkdtemp(prefix="sshvault-test-bw-", dir=base))
+        return self._safe
+
+    def cleanup_safe(self):
+        if self._safe is not None:
+            for d, subdirs, _ in os.walk(str(self._safe)):
+                for sd in subdirs:
+                    try:
+                        os.chmod(os.path.join(d, sd), 0o700)
+                    except OSError:
+                        pass
+            shutil.rmtree(str(self._safe), ignore_errors=True)
 
     # --- état du faux bw ---
 
@@ -657,6 +707,26 @@ def write_exe(directory):
     return exe
 
 
+def safe_base():
+    """/run/user/<uid> s'il est à l'utilisateur en 0700 et qu'aucun parent n'est à un autre
+    utilisateur ni modifiable par le groupe ou les autres (sinon bw-path avertit) ; None sinon. Jamais son sous-dossier
+    sshvault/ : les tests y créent leur propre dossier temporaire."""
+    base = "/run/user/%d" % os.getuid()
+    d = base
+    while True:
+        try:
+            st = os.stat(d)
+        except OSError:
+            return None
+        if st.st_uid not in (os.getuid(), 0) or st.st_mode & 0o022:
+            return None
+        if d == base and (st.st_uid != os.getuid() or st.st_mode & 0o077):
+            return None
+        if d == "/":
+            return base
+        d = os.path.dirname(d)
+
+
 def private_runtime_dir():
     """Dossier 0700 sur tmpfs (/dev/shm), comme un vrai XDG_RUNTIME_DIR."""
     d = tempfile.mkdtemp(prefix="sshvault-test-run-", dir="/dev/shm")
@@ -677,6 +747,7 @@ def bench(tmp_path, keys, ring, witness):
     try:
         yield b
     finally:
+        b.cleanup_safe()
         try:
             kill_agents_under(b.runtime)
         finally:

@@ -3,7 +3,10 @@ connecté, verrouillé avec ou sans invite, session expirée, list, search, bw e
 bloqué, lock), plus les cas annexes."""
 import json
 import os
+import pathlib
 import stat
+import subprocess
+import sys
 import time
 
 import pytest
@@ -38,12 +41,14 @@ def test_bw_absent_du_path(bench, tmp_path):
     assert r.returncode == 4
     line = one_line_error(r)
     assert "bw introuvable" in line and "~/.local/bin" in line
+    assert "cherché dans le PATH" in line and "bw-path" in line, "message : chemin essayé et réglage"
 
 
 def test_bw_absent_sshvault_bw(bench):
     r = bench.run("status", env={"SSHVAULT_BW": "/nonexistent/bw"})
     assert r.returncode == 4
-    assert "bw introuvable" in one_line_error(r)
+    line = one_line_error(r)
+    assert "bw introuvable" in line and "/nonexistent/bw" in line and "SSHVAULT_BW" in line
 
 
 # --- non connecté -----------------------------------------------------------------
@@ -816,7 +821,7 @@ def test_config_get_set_unset(bench):
     r = bench.run("config", "get")
     assert r.returncode == 0 and r.stdout == ("key-ttl 1h (défaut)\nauto-load true (défaut)\n"
                                               "auto-restrict false (défaut)\nauto-confirm false (défaut)\n"
-                                              "forward-confirm true (défaut)\n")
+                                              "forward-confirm true (défaut)\nbw-path PATH (défaut)\n")
     assert not config_file(bench).exists(), "get n'écrit rien"
     for value, shown in (("90", "90s"), ("90s", "90s"), ("15m", "15m"), ("2h", "2h"), ("30d", "30d"),
                          ("120", "2m"), ("0", "0 (illimitée)")):
@@ -882,6 +887,519 @@ def test_config_ecriture_impossible(bench):
         assert r.returncode == 4 and "écriture de" in one_line_error(r)
     finally:
         os.chmod(str(d), 0o700)
+
+
+# --- bw-path (story 9) : une ligne de test par ligne de la matrice ------------------------
+
+def _trap(bench):
+    """`bw` piège dans un dossier mis en tête du PATH : (dossier, fichier témoin de lancement)."""
+    d = bench.tmp / "piege"
+    marker = bench.tmp / "piege.log"
+    bench.bw_wrapper(d / "bw", marker)
+    return d, marker
+
+
+def _unlock(bench):
+    bench.unlocked("keyring" if bench.ring else "file")
+
+
+def _write_config(bench, data):
+    f = config_file(bench)
+    f.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    content = (data if isinstance(data, bytes) else json.dumps(data).encode())
+    f.write_bytes(content)
+    os.chmod(str(f), 0o600)
+    return content
+
+
+def test_bw_path_set_get_unset(bench):
+    bench.env = bench.env_without_bw()
+    bw = str(bench.bw_wrapper(bench.safe() / "local" / "bin" / "bw", bench.tmp / "local.log"))
+    r = bench.run("config", "set", "bw-path", bw)
+    assert (r.returncode, r.stdout, r.stderr) == (0, "bw-path %s\n" % bw, "")
+    assert json.loads(config_file(bench).read_text()) == {"bw-path": bw}
+    assert bench.run("config", "get", "bw-path").stdout == "bw-path %s\n" % bw
+    assert bench.run("config", "get").stdout.endswith("forward-confirm true (défaut)\nbw-path %s\n" % bw)
+    r = bench.run("config", "unset", "bw-path")
+    assert (r.returncode, r.stdout, r.stderr) == (0, "bw-path PATH (défaut)\n", "")
+    assert json.loads(config_file(bench).read_text()) == {}
+    assert not bench.calls() and not (bench.tmp / "local.log").exists(), "config ne lance pas bw"
+
+
+def test_bw_path_avis_sshvault_bw(bench):
+    """SSHVAULT_BW posé : `set` le dit prioritaire, `unset` le dit toujours utilisé."""
+    bw = str(bench.bw_wrapper(bench.safe() / "local" / "bin" / "bw", bench.tmp / "local.log"))
+    r = bench.run("config", "set", "bw-path", bw)
+    assert r.returncode == 0
+    assert r.stdout == "bw-path %s\nSSHVAULT_BW est posé : il reste prioritaire sur bw-path\n" % bw
+    r = bench.run("config", "unset", "bw-path")
+    assert r.returncode == 0
+    assert r.stdout == "bw-path PATH (défaut)\nSSHVAULT_BW est posé : il reste utilisé\n"
+    r = bench.run("config", "unset", "bw-path", env={"SSHVAULT_BW": ""})
+    assert r.stdout == "bw-path PATH (défaut)\n"
+
+
+def test_bw_path_lien_symbolique_garde_tel_quel(bench):
+    """`~/.local/bin/bw` est souvent un lien vers une version installée à côté : accepté
+    (cible ordinaire exécutable), enregistré sans résolution."""
+    target = bench.bw_wrapper(bench.safe() / "opt" / "bw-2026.9.1", bench.tmp / "opt.log")
+    link = bench.safe() / "lien" / "bw"
+    link.parent.mkdir()
+    link.symlink_to(target)
+    r = bench.run("config", "set", "bw-path", str(link))
+    assert r.returncode == 0, r.stderr
+    assert json.loads(config_file(bench).read_text()) == {"bw-path": str(link)}
+
+
+def _refused_paths(bench):
+    d = bench.tmp / "refus"
+    d.mkdir(exist_ok=True)
+    d.chmod(0o755)
+    plain = d / "bw-0644"
+    plain.write_text("#!/bin/sh\nexit 0\n")
+    plain.chmod(0o644)
+    fifo = d / "fifo"
+    os.mkfifo(str(fifo))
+    os.chmod(str(fifo), 0o755)
+    good = str(bench.bw)
+    return {"relatif": ("bw", "« bw » (chemin absolu attendu)"),
+            "relatif-point": ("./bin/bw", "« ./bin/bw » (chemin absolu attendu)"),
+            "vide": ("", "« » (chemin absolu attendu)"),  # espaces regroupés par err()
+            "absent": (str(d / "absent"), "« %s » (No such file" % (d / "absent")),
+            "repertoire": (str(d), "« %s » (pas un fichier ordinaire)" % d),
+            "fifo": (str(fifo), "(pas un fichier ordinaire)"),
+            "non-executable": (str(plain), "(non exécutable par l'utilisateur)"),
+            "controle-nl": (good + "\n", "« %s\\x0a » (caractère de contrôle)" % good),
+            "controle-esc": ("/tmp/\x1b[31mbw", "« /tmp/\\x1b[31mbw » (caractère de contrôle)")}
+
+
+@pytest.mark.parametrize("case", ["relatif", "relatif-point", "vide", "absent", "repertoire", "fifo",
+                                  "non-executable", "controle-nl", "controle-esc"])
+def test_bw_path_refuse(bench, case):
+    value, msg = _refused_paths(bench)[case]
+    # sans fichier de config : rien créé
+    r = bench.run("config", "set", "bw-path", value)
+    assert r.returncode == 2, r.stderr
+    line = one_line_error(r)
+    assert line.startswith("sshvault: bw-path refusé : ") and msg in line, line
+    assert "\x1b" not in line
+    assert not config_file(bench).exists()
+    # réglage déjà posé : fichier inchangé
+    assert bench.run("config", "set", "bw-path", str(bench.bw)).returncode == 0
+    before = config_file(bench).read_bytes()
+    r = bench.run("config", "set", "bw-path", value)
+    assert r.returncode == 2 and msg in one_line_error(r)
+    assert config_file(bench).read_bytes() == before
+    assert not bench.calls()
+
+
+def test_bw_path_utilise_sans_sshvault_bw(bench):
+    """Réglage posé, PATH sans bw (piège en tête) : status, list et ensure lancent ce bw-là ;
+    status le dit."""
+    trap_dir, trap = _trap(bench)
+    bench.env = bench.env_without_bw([trap_dir])
+    used = bench.tmp / "local.log"
+    bw = bench.bw_wrapper(bench.safe() / "local" / "bin" / "bw", used)
+    assert bench.run("config", "set", "bw-path", str(bw)).returncode == 0
+    _unlock(bench)
+    r = bench.run("status")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.startswith("bw : %s (réglage bw-path)\n" % bw)
+    r = bench.run("list")
+    assert r.returncode == 0 and "Serveur Prod" in r.stdout, r.stderr
+    r = bench.run("ensure", "--id", ID_PROD)
+    assert (r.returncode, r.stderr) == (0, ""), r.stderr
+    assert bench.agent_keys() == [bench.blob("prod")]
+    assert len(used.read_text().splitlines()) == len(bench.calls()) >= 3
+    assert not trap.exists(), "bw du PATH jamais lancé"
+
+
+def test_bw_path_sans_reglage_bw_du_path(bench):
+    """Sans réglage : bw du PATH (comportement 0.7.0) ; status dit lequel."""
+    path_dir = bench.tmp / "pathbin"
+    marker = bench.tmp / "pathbin.log"
+    bench.bw_wrapper(path_dir / "bw", marker)
+    bench.env = bench.env_without_bw([path_dir])
+    _unlock(bench)
+    r = bench.run("status")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.startswith("bw : %s (PATH)\n" % (path_dir / "bw"))
+    assert marker.exists() and len(marker.read_text().splitlines()) == len(bench.calls())
+
+
+def test_bw_path_autres_reglages_invalides_sans_effet(bench):
+    """Un autre réglage invalide dans config.json ne touche pas les commandes qui lancent bw
+    (seul bw-path est lu) : status, load -t, lock comme en 0.7.0."""
+    path_dir = bench.tmp / "pathbin"
+    marker = bench.tmp / "pathbin.log"
+    bench.bw_wrapper(path_dir / "bw", marker)
+    bench.env = bench.env_without_bw([path_dir])
+    content = _write_config(bench, {"key-ttl": "2h"})
+    _unlock(bench)
+    r = bench.run("status")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.startswith("bw : %s (PATH)\n" % (path_dir / "bw"))
+    r = bench.run("load", "--id", ID_PROD, "-t", "5m")
+    assert r.returncode == 0, r.stderr
+    assert bench.agent_keys() == [bench.blob("prod")]
+    r = bench.run("lock")
+    assert r.returncode == 0, r.stderr
+    assert any(c["argv"][1:] == ["lock"] for c in bench.calls()), "bw lock lancé"
+    assert len(marker.read_text().splitlines()) == len(bench.calls())
+    assert config_file(bench).read_bytes() == content
+    # config, lui, valide tout le fichier
+    r = bench.run("config", "get")
+    assert r.returncode == 2 and "key-ttl invalide" in one_line_error(r)
+
+
+def test_bw_path_sshvault_bw_prioritaire(bench):
+    """SSHVAULT_BW et réglage posés : SSHVAULT_BW gagne, le bw du réglage n'est pas lancé."""
+    marker = bench.tmp / "reglage.log"
+    bw = bench.bw_wrapper(bench.tmp / "reglage" / "bw", marker)
+    assert bench.run("config", "set", "bw-path", str(bw)).returncode == 0
+    _unlock(bench)
+    r = bench.run("status")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.startswith("bw : %s (SSHVAULT_BW)\n" % bench.bw)
+    assert bench.calls() and not marker.exists()
+
+
+@pytest.mark.parametrize("how,msg", [
+    ("supprime", "bw introuvable ("),
+    ("non-executable", "bw refusé (%s, réglage bw-path) : non exécutable par l'utilisateur"),
+    ("repertoire", "bw refusé (%s, réglage bw-path) : pas un fichier ordinaire"),
+    ("sans-shebang", "bw : format non exécutable ("),
+    ("interpreteur-absent", "interpréteur ou chargeur de bw introuvable ("),
+])
+def test_bw_path_disparu(bench, how, msg):
+    """Réglage posé puis fichier supprimé ou rendu inutilisable : code 4, une ligne qui cite le
+    chemin et bw-path, avec le remède ; le bw du PATH n'est pas lancé."""
+    trap_dir, trap = _trap(bench)
+    bench.env = bench.env_without_bw([trap_dir])
+    bw = bench.bw_wrapper(bench.safe() / "local" / "bin" / "bw", bench.tmp / "local.log")
+    assert bench.run("config", "set", "bw-path", str(bw)).returncode == 0
+    _unlock(bench)
+    bw.unlink()
+    if how == "non-executable":
+        bw.write_text("#!/bin/sh\nexit 0\n")
+        bw.chmod(0o644)
+    elif how == "repertoire":
+        bw.mkdir()
+    elif how == "sans-shebang":
+        bw.write_text("echo bw sans shebang\n")
+        bw.chmod(0o755)
+    elif how == "interpreteur-absent":
+        bw.write_text("#!/nonexistent/interp\n")
+        bw.chmod(0o755)
+    want = msg % bw if "%s" in msg else msg
+    for args in (["status"], ["list"], ["ensure", "--id", ID_PROD]):
+        r = bench.run(*args)
+        assert r.returncode == 4, (args, r.stderr)
+        line = one_line_error(r)
+        assert str(bw) in line and "bw-path" in line and want in line, line
+        assert line.endswith("ou revenir au PATH par « sshvault config unset bw-path »"), line
+    assert not trap.exists(), "bw du PATH jamais lancé"
+    assert not bench.calls()
+
+
+@pytest.mark.parametrize("how,reason", [("dossier-non-traversable", "Permission denied"),
+                                        ("boucle-de-liens", "Too many levels of symbolic links")])
+def test_bw_path_inaccessible_pas_introuvable(bench, how, reason):
+    """EACCES ou ELOOP au lancement : « bw refusé » avec la cause, pas « introuvable » ; code
+    4 ; le PATH n'est pas essayé."""
+    trap_dir, trap = _trap(bench)
+    bench.env = bench.env_without_bw([trap_dir])
+    if how == "boucle-de-liens":
+        target = bench.bw_wrapper(bench.safe() / "opt" / "bw", bench.tmp / "opt.log")
+        bw = bench.safe() / "lien" / "bw"
+        bw.parent.mkdir()
+        bw.symlink_to(target)
+    else:
+        bw = bench.bw_wrapper(bench.safe() / "ferme" / "bin" / "bw", bench.tmp / "local.log")
+    assert bench.run("config", "set", "bw-path", str(bw)).returncode == 0
+    _unlock(bench)
+    if how == "boucle-de-liens":
+        bw.unlink()
+        other = bw.parent / "autre"
+        other.symlink_to(bw)
+        bw.symlink_to(other)
+    else:
+        bw.parent.parent.chmod(0o000)
+    try:
+        r = bench.run("status")
+    finally:
+        if how != "boucle-de-liens":
+            bw.parent.parent.chmod(0o755)
+    assert r.returncode == 4
+    line = one_line_error(r)
+    assert line.startswith("sshvault: bw refusé (%s, réglage bw-path) : %s : corriger par" % (bw, reason)), line
+    assert not trap.exists() and not bench.calls()
+
+
+def test_status_bw_absent_dit_le_bw(bench, tmp_path):
+    """status dit quel bw serait lancé avant de le lancer : visible même s'il manque."""
+    empty = tmp_path / "vide"
+    empty.mkdir()
+    bench.env = dict(bench.env_without_bw(), PATH=str(empty))
+    r = bench.run("status")
+    assert r.returncode == 4
+    assert r.stdout == "bw : bw (introuvable dans le PATH)\n"
+    assert "bw introuvable (bw cherché dans le PATH" in one_line_error(r)
+
+
+@pytest.mark.parametrize("content,mode,msg", [(b'{"key-ttl": "2h"}', 0o600, "key-ttl invalide"),
+                                              (b'{"bw-path": "relatif"}', 0o600, "bw-path invalide"),
+                                              (b"{pas du json", 0o600, "JSON invalide"),
+                                              (b'{"key-ttl": 60}', 0o644, "illisible")])
+def test_ensure_config_invalide(bench, content, mode, msg):
+    """ensure (lit tout config.json) : code 2, une ligne `sshvault: <hôte> : …`, sans
+    traceback ni bw lancé."""
+    trap_dir, trap = _trap(bench)
+    bench.env = bench.env_without_bw([trap_dir])
+    _write_config(bench, content)
+    os.chmod(str(config_file(bench)), mode)
+    r = bench.run("ensure", "--id", ID_PROD)
+    assert (r.returncode, r.stdout) == (2, "")
+    line = one_line_error(r)
+    assert line.startswith("sshvault: %s : " % ID_PROD) and msg in line, line
+    assert not trap.exists() and not bench.calls()
+
+
+_CHMOD = "corriger par « chmod g-w,o-w %s »"
+_MOVE = "déplacer bw dans un dossier à vous non modifiable par d'autres"
+_EXPOSED = {
+    # cas : (mode du fichier, mode du dossier, raisons, remède) ; {f} fichier, {d} dossier
+    "fichier-0775": (0o775, 0o755, "fichier {f} modifiable par le groupe ou les autres", _CHMOD % "{f}"),
+    "dossier-0775": (0o755, 0o775, "dossier {d} modifiable par le groupe ou les autres", _CHMOD % "{d}"),
+    "dossier-0777": (0o755, 0o777, "dossier {d} modifiable par le groupe ou les autres", _CHMOD % "{d}"),
+    # sticky (type /tmp) : jamais de chmod proposé dessus
+    "dossier-sticky": (0o755, 0o1777, "dossier {d} modifiable par le groupe ou les autres", _MOVE),
+    "les-deux": (0o775, 0o775, "fichier {f} modifiable par le groupe ou les autres ; dossier {d} "
+                              "modifiable par le groupe ou les autres", _CHMOD % "{f} {d}"),
+}
+
+
+def _exposed_line(bw, reasons, fix):
+    return ("sshvault: avertissement : bw-path « %s » exposé à d'autres (%s) : ils pourraient remplacer bw et "
+            "recevoir le mot de passe maître ; %s" % (bw, reasons, fix))
+
+
+@pytest.mark.parametrize("case", sorted(_EXPOSED))
+def test_bw_path_modifiable_par_d_autres_averti(bench, case):
+    """bw-path exposé (fichier ou dossier ouvert au groupe ou aux autres, sticky compris) :
+    accepté avec une ligne d'avertissement à `config set` et une seule par processus à
+    l'usage ; codes de sortie et stdout inchangés ; le PATH n'est pas essayé."""
+    fmode, dmode, reasons, fix = _EXPOSED[case]
+    trap_dir, trap = _trap(bench)
+    bench.env = bench.env_without_bw([trap_dir])
+    used = bench.tmp / "local.log"
+    bw = bench.bw_wrapper(bench.safe() / "partage" / "bw", used)
+    bw.chmod(fmode)
+    bw.parent.chmod(dmode)
+    want = _exposed_line(bw, reasons.format(f=bw, d=bw.parent), fix.format(f=bw, d=bw.parent))
+    r = bench.run("config", "set", "bw-path", str(bw))
+    assert (r.returncode, r.stdout, r.stderr) == (0, "bw-path %s\n" % bw, want + "\n")
+    assert json.loads(config_file(bench).read_text()) == {"bw-path": str(bw)}
+    _unlock(bench)
+    r = bench.run("status")
+    assert r.returncode == 0
+    assert r.stderr == want + "\n", "une seule ligne pour tous les appels de bw du processus"
+    assert r.stdout.startswith("bw : %s (réglage bw-path)\n" % bw)
+    r = bench.run("list")
+    assert r.returncode == 0 and "Serveur Prod" in r.stdout and r.stderr == want + "\n"
+    r = bench.run("list", env={"SSHVAULT_BW": str(bench.bw)})
+    assert (r.returncode, r.stderr) == (0, ""), "SSHVAULT_BW : bw-path ni lu ni averti"
+    assert r.stdout == bench.run("list").stdout, "stdout inchangé par l'avertissement"
+    r = bench.run("ensure", "--id", ID_PROD)
+    assert (r.returncode, r.stdout) == (0, "")
+    assert r.stderr == "sshvault: %s : %s\n" % (ID_PROD, want[len("sshvault: "):])
+    assert bench.agent_keys() == [bench.blob("prod")]
+    assert used.exists() and not trap.exists()
+
+
+def test_bw_path_lien_dans_un_dossier_ouvert(bench):
+    """Lien dans un dossier 0775 (le ~/.local/bin courant) vers un fichier d'un dossier 0755 :
+    le dossier du lien est nommé."""
+    target = bench.bw_wrapper(bench.safe() / "opt" / "bw-2026.9.1", bench.tmp / "opt.log")
+    link = bench.safe() / "bin" / "bw"
+    link.parent.mkdir()
+    link.symlink_to(os.path.relpath(str(target), str(link.parent)))  # lien relatif
+    link.parent.chmod(0o775)
+    r = bench.run("config", "set", "bw-path", str(link))
+    assert r.returncode == 0
+    assert r.stderr == _exposed_line(link, "dossier %s modifiable par le groupe ou les autres" % link.parent,
+                                     _CHMOD % link.parent) + "\n"
+
+
+def test_bw_path_parent_ouvert(bench):
+    """Un dossier parent ouvert au groupe (renommer `bin`, y planter un autre bw) : averti."""
+    bw = bench.bw_wrapper(bench.safe() / "haut" / "bin" / "bw", bench.tmp / "local.log")
+    top = bw.parent.parent
+    top.chmod(0o775)
+    r = bench.run("config", "set", "bw-path", str(bw))
+    assert r.returncode == 0
+    assert r.stderr == _exposed_line(bw, "dossier %s modifiable par le groupe ou les autres" % top,
+                                     _CHMOD % top) + "\n"
+
+
+def test_bw_path_avertit_avant_le_premier_lancement(bench, tmp_path):
+    """`unlock` avec un bw-path exposé : l'avertissement paraît avant le premier lancement de bw
+    et avant l'invite du mot de passe (bw recevra le mot de passe maître)."""
+    log = tmp_path / "ordre.log"
+    bw = bench.safe() / "partage" / "bw"
+    bw.parent.mkdir()
+    bw.write_text("#!/bin/sh\necho BW-LANCE >> '%s'\nexec '%s' \"$@\"\n" % (log, bench.bw))
+    bw.chmod(0o755)
+    bw.parent.chmod(0o775)
+    askpass = tmp_path / "askpass-ordre"
+    askpass.write_text("#!/bin/sh\necho INVITE >> '%s'\nprintf '%%s\\n' '%s'\n" % (log, PASSWORD))
+    askpass.chmod(0o755)
+    bench.env = bench.env_without_bw()
+    assert bench.run("config", "set", "bw-path", str(bw)).returncode == 0
+    bench.set_state(logged_in=True)
+    e = dict(bench.env, SSH_ASKPASS=str(askpass), SSH_ASKPASS_REQUIRE="force")
+    with open(str(log), "ab") as out:
+        r = subprocess.run([sys.executable, "-m", "sshvault", "unlock"], env=e, stdout=subprocess.PIPE,
+                           stderr=out, stdin=subprocess.DEVNULL, start_new_session=True, timeout=60)
+    assert r.returncode == 0
+    lines = log.read_text().splitlines()
+    assert "INVITE" in lines and "BW-LANCE" in lines, lines
+    warn = [i for i, l in enumerate(lines) if l.startswith("sshvault: avertissement : bw-path")]
+    assert len(warn) == 1 and warn[0] < lines.index("BW-LANCE") and warn[0] < lines.index("INVITE"), lines
+
+
+def test_bw_path_un_avertissement_par_processus(bench):
+    """Commande qui lance bw plusieurs fois (hosts add) : une seule ligne d'avertissement."""
+    bw = bench.bw_wrapper(bench.safe() / "partage" / "bw", bench.tmp / "local.log")
+    bw.parent.chmod(0o775)
+    bench.env = bench.env_without_bw()
+    assert bench.run("config", "set", "bw-path", str(bw)).returncode == 0
+    _unlock(bench)
+    n = len(bench.calls())
+    r = bench.run("hosts", "add", "--id", ID_PROD, "x.example")
+    assert r.returncode == 0, r.stderr
+    assert len(bench.calls()) - n >= 2
+    assert [l for l in r.stderr.splitlines() if "avertissement : bw-path" in l] == [
+        _exposed_line(bw, "dossier %s modifiable par le groupe ou les autres" % bw.parent, _CHMOD % bw.parent)]
+
+
+def test_bw_path_proprietaire_etranger(bench, monkeypatch):
+    """Fichier et dossiers à un autre utilisateur : « exposé », remède « déplacer », jamais de
+    chmod sur ce qui n'est pas à l'utilisateur."""
+    from sshvault import fsutil
+    bw = bench.bw_wrapper(bench.safe() / "local" / "bin" / "bw", bench.tmp / "local.log")
+    real = os.getuid()
+    monkeypatch.setattr(fsutil.os, "getuid", lambda: real + 4242)
+    line = fsutil.exposure_warning(str(bw))
+    assert line.startswith("avertissement : bw-path « %s » exposé à d'autres (fichier %s à un autre utilisateur "
+                           "(uid %d) ; dossier %s à un autre utilisateur (uid %d)" % (bw, bw, real, bw.parent, real))
+    assert line.endswith(" ; " + _MOVE) and "chmod" not in line
+
+
+def test_bw_path_systeme_root_sans_avertissement(bench):
+    """Exécutable à root dans des dossiers à root non ouverts en écriture : ni refus ni
+    avertissement."""
+    exe = "/usr/bin/true"
+    for p in (exe, "/usr/bin", "/usr", "/"):
+        st = os.stat(p)
+        if st.st_uid != 0 or st.st_mode & 0o022 or os.path.islink(p):
+            pytest.skip("%s pas à root ou ouvert en écriture sur ce poste" % p)
+    r = bench.run("config", "set", "bw-path", exe)
+    assert (r.returncode, r.stderr) == (0, "")
+
+
+@pytest.mark.parametrize("how,msg", [("sans-shebang", "bw : format non exécutable (bw cherché dans le PATH"),
+                                     ("interpreteur-absent", "interpréteur ou chargeur de bw introuvable (bw "
+                                                             "cherché dans le PATH")])
+def test_bw_du_path_inutilisable(bench, how, msg):
+    """Sans réglage : bw du PATH présent mais impossible à lancer, la cause dite."""
+    d = bench.tmp / "pathbin"
+    d.mkdir()
+    (d / "bw").write_text("echo x\n" if how == "sans-shebang" else "#!/nonexistent/interp\n")
+    (d / "bw").chmod(0o755)
+    bench.env = bench.env_without_bw([d])
+    r = bench.run("status")
+    assert r.returncode == 4
+    line = one_line_error(r)
+    assert msg in line and "bw-path" in line, line
+
+
+def test_bw_path_unset_retour_au_path(bench):
+    path_dir = bench.tmp / "pathbin"
+    in_path = bench.tmp / "pathbin.log"
+    bench.bw_wrapper(path_dir / "bw", in_path)
+    bench.env = bench.env_without_bw([path_dir])
+    configured = bench.tmp / "local.log"
+    bw = bench.bw_wrapper(bench.safe() / "local" / "bin" / "bw", configured)
+    assert bench.run("config", "set", "bw-path", str(bw)).returncode == 0
+    _unlock(bench)
+    assert bench.run("status").returncode == 0
+    assert configured.exists() and not in_path.exists()
+    assert bench.run("config", "unset", "bw-path").returncode == 0
+    n = len(configured.read_text().splitlines())
+    assert bench.run("status").returncode == 0
+    assert in_path.exists() and len(configured.read_text().splitlines()) == n
+
+
+@pytest.mark.parametrize("value,msg", [
+    ("bw", "bw-path invalide : « bw » (chemin absolu attendu)"),
+    ("", "bw-path invalide : « » (chemin absolu attendu)"),  # espaces regroupés par err()
+    (5, "bw-path invalide : 5 (chemin absolu attendu)"),
+    (None, "bw-path invalide : null (chemin absolu attendu)"),
+    (True, "bw-path invalide : true (chemin absolu attendu)"),
+    (["/usr/bin/bw"], 'bw-path invalide : ["/usr/bin/bw"] (chemin absolu attendu)'),
+    ("/tmp/b\nw", "bw-path invalide : « /tmp/b\\x0aw » (caractère de contrôle)")])
+def test_bw_path_fichier_invalide(bench, value, msg):
+    """config.json avec un bw-path qui n'est pas une chaîne absolue : code 2, à `config` comme
+    à l'usage (sans SSHVAULT_BW) ; rien lancé, fichier inchangé."""
+    trap_dir, trap = _trap(bench)
+    bench.env = bench.env_without_bw([trap_dir])
+    content = _write_config(bench, {"bw-path": value})
+    for args in (["config", "get"], ["config", "set", "key-ttl", "1h"], ["status"], ["lock"]):
+        r = bench.run(*args)
+        assert r.returncode == 2, (args, r.stderr)
+        assert msg in one_line_error(r)
+    assert config_file(bench).read_bytes() == content
+    assert not trap.exists() and not bench.calls()
+
+
+@pytest.mark.parametrize("content,mode,msg", [(b"{pas du json", 0o600, "JSON invalide"),
+                                              (b"[]", 0o600, "objet JSON attendu"),
+                                              (b'{"bw-path": "/usr/bin/bw"}', 0o644, "illisible")])
+def test_bw_path_illisible(bench, content, mode, msg):
+    """Valeur de bw-path impossible à établir (fichier illisible, droits, JSON) : code 2, rien
+    lancé."""
+    trap_dir, trap = _trap(bench)
+    bench.env = bench.env_without_bw([trap_dir])
+    _write_config(bench, content)
+    os.chmod(str(config_file(bench)), mode)
+    r = bench.run("status")
+    assert r.returncode == 2 and msg in one_line_error(r)
+    assert not trap.exists() and not bench.calls()
+
+
+def test_bw_path_lecture_paresseuse(bench):
+    """bw-path invalide, sans SSHVAULT_BW : une commande qui ne lance pas bw ne le lit pas."""
+    bench.env = bench.env_without_bw()
+    _write_config(bench, {"bw-path": "relatif"})
+    r = bench.run("agent", "status")
+    assert r.returncode == 3, r.stderr
+    assert "bw-path" not in r.stdout + r.stderr
+    assert not bench.calls()
+
+
+def test_bw_path_jamais_de_shell(bench):
+    """Chemin avec espace, apostrophe et `$` : lancé tel quel (argv), sans shell."""
+    d = bench.tmp / "un dossier$(touch PWNED) 'x'"
+    marker = bench.tmp / "shell.log"
+    bw = bench.bw_wrapper(d / "bw", marker)
+    bench.env = bench.env_without_bw()
+    assert bench.run("config", "set", "bw-path", str(bw)).returncode == 0
+    _unlock(bench)
+    r = bench.run("status")
+    assert r.returncode == 0, r.stderr
+    assert marker.exists()
+    assert not list(bench.tmp.rglob("PWNED")) and not (pathlib.Path.cwd() / "PWNED").exists()
 
 
 # --- hosts (CAP-4) : une ligne de test par ligne de la matrice de la story 4 ----------------

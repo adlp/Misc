@@ -1,5 +1,69 @@
 # Changelog — sshvault
 
+## sshvault 0.8.0 — bw par chemin configuré ou PATH — 2026-10-08
+
+- Réglage `bw-path` : `sshvault config set bw-path /chemin/absolu/bw`. Les lignes
+  `Match exec` héritent du PATH du ssh appelant (session graphique, cron), qui peut ne pas
+  contenir le dossier de `bw` : le chargement automatique trouve désormais `bw` par ce
+  réglage. Ordre : `SSHVAULT_BW` (tests), sinon `bw-path`, sinon `bw` du PATH ; aucune
+  recherche implicite ailleurs. Lu dans le `config.json` de l'environnement de ssh
+  (`XDG_CONFIG_HOME` compris), au premier appel de `bw` seulement (une commande qui ne lance
+  pas `bw` ne le lit pas) ; chemin passé tel quel à `Popen`, jamais à un shell ; arguments
+  et environnement de `bw` inchangés.
+- Lecture : `status`, `list`, `search`, `login`, `unlock`, `lock`, `sync`, `load -t`,
+  `pubkey`, `deploy`, `hosts list` et `forward list` ne lisent que `bw-path`
+  (`Config.bw_path`) : un autre réglage invalide ne les gêne pas (comme en 0.7.0). `config`,
+  `ensure`, `load` sans `-t`, `ssh-config`, `hosts`/`forward add|remove|set`, `import` et
+  `generate` avec hôtes valident toujours tout le fichier. Fichier illisible, droits, JSON
+  invalide ou `bw-path` qui n'est pas une chaîne absolue sans caractère de contrôle :
+  code 2.
+- `config set bw-path` refuse (code 2, `config.json` inchangé) un chemin relatif, absent,
+  avec un caractère de contrôle, ou dont la cible (lien suivi, gardé tel quel) n'est pas un
+  fichier ordinaire exécutable par l'utilisateur. Messages
+  `bw-path refusé : « <chemin> » (<raison>)`.
+- `config unset bw-path` revient au PATH ; `config get` affiche le chemin ou
+  `bw-path PATH (défaut)`. Avec `SSHVAULT_BW` posé, `set` le dit prioritaire, `unset` le
+  dit toujours utilisé.
+- Avertissement (pas un refus, choix de l'utilisateur : dossier partagé avec son groupe)
+  quand d'autres peuvent remplacer `bw` : cible finale, dossier de chaque lien de la chaîne
+  (lstat, liens relatifs résolus depuis leur dossier) et tous leurs parents jusqu'à `/`
+  doivent être à l'utilisateur ou à root et non modifiables par le groupe ni les autres
+  (sticky bit compris), comme le `StrictModes` d'OpenSSH. Une ligne sur stderr
+  `avertissement : bw-path « <chemin> » exposé à d'autres (<raisons>) : ils pourraient
+  remplacer bw et recevoir le mot de passe maître ; <remède>`, à `config set` puis une fois
+  par processus, aussitôt, avant le premier lancement de `bw` (avant l'invite du mot de
+  passe) ; sous `ensure`, préfixée de l'hôte. Remède : `« chmod g-w,o-w … »` pour ce qui est
+  à l'utilisateur sans sticky bit, sinon « déplacer bw dans un dossier à vous non
+  modifiable par d'autres ». Codes de sortie et stdout inchangés.
+- Refus revérifié avant chaque lancement de `bw` par le réglage : fichier supprimé
+  (ENOENT, ENOTDIR : « bw introuvable »), non exécutable, répertoire, inaccessible (EACCES,
+  ELOOP : « bw refusé » avec la cause) : code 4, une ligne `bw introuvable|refusé (<chemin>,
+  réglage bw-path)[ : <raison>] : corriger par « sshvault config set bw-path … » ou revenir
+  au PATH par « sshvault config unset bw-path »` ; le PATH n'est pas essayé.
+- Lancement de `bw` (toute source) : fichier présent mais interpréteur du shebang ou
+  chargeur absent → « interpréteur ou chargeur de bw introuvable » ; ENOEXEC → « bw : format
+  non exécutable » ; même remède que « bw introuvable » pour la source. Messages « bw
+  introuvable » : citent le chemin essayé et sa source (`SSHVAULT_BW`, `réglage bw-path`,
+  ou `bw cherché dans le PATH, réglage bw-path non posé`).
+- `sshvault status` : première ligne `bw : <chemin> (SSHVAULT_BW | réglage bw-path | PATH)`
+  (ou `bw : bw (introuvable dans le PATH)`), affichée avant tout lancement de `bw`, donc
+  même s'il manque.
+- Nettoyage des caractères de contrôle partagé (`sshvault.text.clean`) par la CLI, `bw` et
+  la configuration.
+- Tests : matrice de la story 9 (réglage utilisé par `status`, `list` et `ensure` avec un
+  PATH sans `bw` et un `bw` piège en tête du PATH jamais lancé ; sans réglage ;
+  `SSHVAULT_BW` prioritaire ; chemins refusés ; fichier, dossier, dossier d'un lien ou parent
+  ouvert au groupe ou aux autres (sticky compris) accepté avec avertissement à `set` et une
+  fois par processus, avant le premier lancement de `bw` et l'invite ; propriétaire
+  étranger ; exécutable système à root sans avertissement ; fichier disparu, non
+  exécutable, répertoire, inaccessible, boucle de liens, sans shebang ou à interpréteur
+  absent ; autre réglage invalide sans effet sur `status`, `load -t`, `lock` ; `ensure` avec
+  `config.json` invalide ; lecture paresseuse ; `unset` ; chemin avec espace, apostrophe et
+  `$(…)` sans shell) ; sous vrai `ssh b` via le rebond `a` (agent vide, PATH sans `bw`,
+  piège en tête) : clés chargées par le `bw` du réglage, et réglage cassé : une ligne par
+  `ensure` citant `bw-path`, connexion refusée proprement. Banc : `env_without_bw`,
+  `bw_wrapper`, `safe()` (dossier sous `/run/user/<uid>`, sans parent ouvert à d'autres).
+
 ## sshvault 0.7.0 — Transfert d'agent restreint par hôte — 2026-10-08
 
 - Champ d'élément `sshvault-forward` (motifs d'hôtes, mêmes règles que `sshvault-hosts`) et

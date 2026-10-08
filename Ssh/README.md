@@ -2,7 +2,7 @@
 
 Clés SSH dans un Vaultwarden auto-hébergé, utilisées de façon transparente par ssh.
 
-État (0.7.0) : **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
+État (0.8.0) : **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
 éléments « SSH key »), **agent dédié** (chargement d'une clé du coffre dans un
 `ssh-agent` d'OpenSSH propre à sshvault, sans écriture disque, avec durée de vie,
 confirmation et restriction aux hôtes en option ; état, purge, verrou et arrêt de l'agent),
@@ -15,7 +15,8 @@ le coffre (`sshvault import`) et **génération** d'une clé directement dans le
 (`sshvault pubkey`) et **déploiement** de la clé publique dans `authorized_keys` d'une
 cible (`sshvault deploy`), et **transfert d'agent restreint** : vers un hôte déclaré
 (`sshvault forward`), seul un sous-agent qui ne contient que les clés autorisées pour cet
-hôte est transféré, jamais l'agent dédié entier.
+hôte est transféré, jamais l'agent dédié entier. `bw` est pris au chemin absolu du réglage
+`bw-path` s'il est posé, sinon dans le PATH.
 
 ## Installation (sans root)
 
@@ -33,7 +34,6 @@ hôte est transféré, jamais l'agent dédié entier.
      && unzip -o -d ~/.local/bin "$D/bw.zip" bw && chmod 700 ~/.local/bin/bw
    rm -r "$D"
    ```
-   Un autre chemin se donne par `SSHVAULT_BW=/chemin/vers/bw`.
 2. sshvault (Python ≥ 3.10, bibliothèque standard seule) :
    ```
    uv tool install ./Ssh        # depuis la racine de Misc ; --force pour réinstaller
@@ -43,6 +43,21 @@ hôte est transféré, jamais l'agent dédié entier.
    ce chemin absolu (chargement automatique) : après une réinstallation ailleurs, relancer
    `sshvault ssh-config`. Mise à jour depuis la 0.3.0 : `uv tool install --force ./Ssh`
    (nouveau point d'entrée), puis `sshvault ssh-config`.
+3. Chemin de `bw`. sshvault prend `bw` dans le PATH. Les lignes `Match exec` du
+   `ssh_config` généré héritent du PATH du ssh appelant (session graphique, cron…), qui peut
+   ne pas contenir `~/.local/bin` : le chargement automatique échoue alors (« bw
+   introuvable »). Donner le chemin absolu une fois pour toutes :
+   ```
+   sshvault config set bw-path ~/.local/bin/bw
+   sshvault status          # ligne « bw : /home/alice/.local/bin/bw (réglage bw-path) »
+   ```
+   Le réglage est lu dans `${XDG_CONFIG_HOME:-~/.config}/sshvault/config.json` de
+   l'environnement où tourne ssh : si ssh (donc `Match exec`) voit un autre
+   `XDG_CONFIG_HOME` que votre terminal, il ne voit pas ce réglage. `sshvault config unset
+   bw-path` revient au PATH. `SSHVAULT_BW` (tests) reste prioritaire. Si le fichier, un
+   dossier de la chaîne de liens ou un de leurs parents est modifiable par d'autres
+   (`~/.local/bin` ouvert au groupe, par exemple), le réglage est accepté avec un
+   avertissement (voir « Config ») : `bw` reçoit le mot de passe maître et la session.
 
 ## Utilisation
 
@@ -57,7 +72,7 @@ sshvault lock
 
 sshvault load (MOTIF [--host | --name | --fingerprint | --id] | --all) [-t DURÉE] [--confirm] [--restrict] [--force]
 sshvault agent status | purge | lock | unlock | stop
-sshvault config get [CLÉ] | set CLÉ VALEUR | unset CLÉ   # key-ttl, auto-load, auto-restrict, auto-confirm, forward-confirm
+sshvault config get [CLÉ] | set CLÉ VALEUR | unset CLÉ   # key-ttl, auto-load, auto-restrict, auto-confirm, forward-confirm, bw-path
 
 sshvault hosts add | remove | set  SÉLECTION [--host | --name | --fingerprint | --id] HÔTE…
 sshvault hosts list SÉLECTION [--host | --name | --fingerprint | --id]
@@ -195,6 +210,46 @@ par sshvault sont ceux de cette version.
   `true`/`false` (aussi `yes`/`no`, `on`/`off`, `1`/`0`). Durée, booléen ou fichier
   invalide (JSON, valeur, droits autres que 0600, propriétaire) : code 2 ; écriture
   impossible : code 4.
+- **`bw-path`** : chemin absolu de `bw` (défaut : `bw` du PATH, affiché `bw-path PATH
+  (défaut)`). Ordre : `SSHVAULT_BW`, sinon `bw-path`, sinon le PATH ; aucune recherche
+  ailleurs (pas même `~/.local/bin`). `sshvault status` affiche d'abord celui qui sera lancé,
+  sans le lancer, donc même s'il manque : `bw : <chemin> (SSHVAULT_BW | réglage bw-path |
+  PATH)`, ou `bw : bw (introuvable dans le PATH)`.
+  - **Refus** : `config set bw-path` refuse (code 2, `config.json` inchangé) un chemin
+    relatif, absent, qui contient un caractère de contrôle, ou dont la cible (lien
+    symbolique suivi, gardé tel quel) n'est pas un fichier ordinaire exécutable par
+    l'utilisateur. Revérifié avant chaque lancement : fichier disparu (« bw introuvable »),
+    devenu non exécutable, inaccessible (dossier non traversable, boucle de liens : « bw
+    refusé » avec la cause) : code 4, une ligne qui cite le chemin et `bw-path` avec le
+    remède ; le PATH n'est **pas** essayé. Fichier présent mais impossible à lancer :
+    « interpréteur ou chargeur de bw introuvable » (shebang vers un interpréteur absent) ou
+    « format non exécutable » (ni ELF ni shebang), pour toute source.
+  - **Avertissement** (pas un refus) : comme le `StrictModes` d'OpenSSH, sont contrôlés la
+    cible finale, le dossier de chaque lien symbolique de la chaîne (liens relatifs résolus
+    depuis leur dossier) et tous leurs dossiers parents jusqu'à `/`. Chacun doit être à vous
+    ou à root et non modifiable par le groupe ni les autres (sticky bit compris : un dossier
+    type `/tmp` compte). Sinon le réglage est **accepté** avec une ligne sur stderr, à
+    `config set bw-path` puis dans chaque processus qui lance `bw` par ce réglage, une fois,
+    **avant** le premier lancement de `bw` (donc avant l'invite du mot de passe maître) ;
+    sous `ensure`, préfixée de l'hôte comme les autres messages, dans la sortie de ssh.
+    Codes de sortie et stdout inchangés. Exemple : `avertissement : bw-path
+    « /home/alice/.local/bin/bw » exposé à d'autres (dossier /home/alice/.local/bin
+    modifiable par le groupe ou les autres) : ils pourraient remplacer bw et recevoir le mot
+    de passe maître ; corriger par « chmod g-w,o-w /home/alice/.local/bin »`. Le `chmod`
+    n'est proposé que pour ce qui est à vous sans sticky bit ; sinon (sticky, autre
+    propriétaire, dossier système) : « déplacer bw dans un dossier à vous non modifiable
+    par d'autres ».
+  - **Lecture** : ne lisent que `bw-path` dans `config.json` (un autre réglage invalide ne
+    les gêne pas) : `status`, `list`, `search`, `login`, `unlock`, `lock`, `sync`, `load -t`,
+    `pubkey`, `deploy`, `hosts list`, `forward list`. Valident tout le fichier (code 2 sur
+    n'importe quel réglage invalide) : `config`, `ensure`, `load` sans `-t` (`key-ttl`),
+    `ssh-config`, `hosts`/`forward add|remove|set`, `import` et `generate` avec hôtes
+    (régénération du `ssh_config`). Partout, un `bw-path` qui n'est pas une chaîne absolue
+    sans caractère de contrôle, ou un fichier illisible (droits, JSON) : code 2. Une
+    commande qui ne lance pas `bw` (`agent status`…) ne lit pas ce réglage.
+  - Lu dans le `config.json` de l'environnement de ssh (`XDG_CONFIG_HOME` compris) ; le
+    chemin n'est jamais passé à un shell ; `bw` reçoit les mêmes arguments et le même
+    environnement qu'avant. Pris en compte au prochain appel, sans régénérer le `ssh_config`.
 
 ### Hôtes d'une clé
 
@@ -710,9 +765,9 @@ sshvault forward list --id 2222…                   # un motif par ligne
 |---|---|
 | 0 | succès |
 | 1 | `search`, `load`, `hosts`, `forward`, `pubkey`, `deploy` : aucun résultat ; `import` : clé déjà dans le coffre (rien créé) ; `generate` : nom déjà pris, sans `--force` (rien généré) ; `hosts remove`, `forward remove` : hôte absent (rien écrit) ; `ssh-config --check` : pas à jour (contenu, droits, fichier en trop ou non ordinaire), ou ligne `Include` absente, conditionnelle ou pas en tête |
-| 2 | usage (option ou argument invalide ; `load` sans sélection ni `--all`) ; durée invalide ; `config.json` invalide, illisible ou aux droits inattendus ; hôte invalide ; sélection de `hosts` ou `forward` qui désigne plusieurs éléments ; `import` : fichier refusé (illisible, pas une clé privée, type ou format non accepté), `--name` avec plusieurs fichiers ; `generate` : type, bits, nom ou commentaire refusés ; `deploy` : cible, port ou options ssh invalides ou refusées ; délai `SSHVAULT_DEPLOY_TIMEOUT` invalide |
+| 2 | usage (option ou argument invalide ; `load` sans sélection ni `--all`) ; durée invalide ; `config.json` invalide, illisible ou aux droits inattendus ; `config set bw-path` : chemin relatif, absent, avec un caractère de contrôle, ou pas un fichier ordinaire exécutable ; `bw-path` invalide dans `config.json` ; hôte invalide ; sélection de `hosts` ou `forward` qui désigne plusieurs éléments ; `import` : fichier refusé (illisible, pas une clé privée, type ou format non accepté), `--name` avec plusieurs fichiers ; `generate` : type, bits, nom ou commentaire refusés ; `deploy` : cible, port ou options ssh invalides ou refusées ; délai `SSHVAULT_DEPLOY_TIMEOUT` invalide |
 | 3 | non connecté (« lancer sshvault login »), ou coffre verrouillé : aucune invite possible, invite annulée ou sans réponse, mot de passe refusé ; agent dédié arrêté (`agent status`, `lock`, `unlock`) ou verrouillé (`ensure --forward` compris) ; passphrase d'une clé refusée ou impossible à saisir (`load`, `import`) |
-| 4 | erreur du backend : `bw` introuvable, en erreur, réponse illisible, délai dépassé ; magasin de session inutilisable ; agent dédié : `XDG_RUNTIME_DIR` relatif, non privé ou hors tmpfs, chemin du socket trop long, agent tiers sur le socket, OpenSSH < 8.9, `--restrict` (élément sans hôte, hôte non littéral ou absent de `known_hosts`), sous-agent de transfert en erreur (`agent status`, `stop`, `purge`, `lock`), clé publique illisible ou différente de la clé privée, `ssh-add`/`ssh-agent` en erreur ; écriture de `config.json` impossible ; écriture des hôtes ou des transferts dans le coffre non aboutie ou non vérifiée (y compris écrits mais `ssh_config` non régénéré) ; `ensure --forward` : `forward-confirm` sans askpass, élément qui ne déclare plus ce transfert, chemin du socket de transfert trop long ; `import` : création non aboutie ou non vérifiée (y compris clé importée mais `ssh_config` non régénéré), copie impossible dans un tmpfs privé (`--decrypt`), `ssh-keygen` absent ou en erreur ; `generate` : tmpfs privé inutilisable, `ssh-keygen` absent ou en erreur, création non aboutie ou non vérifiée (clé perdue, dit), clé créée mais `ssh_config` non régénéré ; `pubkey` : clé publique d'un élément illisible ; `deploy` : `ssh` absent, en échec ou sans réponse (`SSHVAULT_DEPLOY_TIMEOUT`), réponse inattendue de la cible, échec partiel (clés déjà ajoutées dites, puis code 4), clé publique illisible ; `ssh_config` généré impossible à écrire (chemin avec `"`, `\`, `${`, fichier non ordinaire, droits) ; répertoire personnel inconnu ; `ssh-config install` refusé (lien symbolique, fichier non ordinaire, `Include` conditionnel, chemin personnel avec `%`, `$` ou joker) ; erreur interne |
+| 4 | erreur du backend : `bw` introuvable, non exécutable, interpréteur ou chargeur absent, format non exécutable (au chemin du réglage `bw-path` compris, le PATH n'étant alors pas essayé), en erreur, réponse illisible, délai dépassé ; magasin de session inutilisable ; agent dédié : `XDG_RUNTIME_DIR` relatif, non privé ou hors tmpfs, chemin du socket trop long, agent tiers sur le socket, OpenSSH < 8.9, `--restrict` (élément sans hôte, hôte non littéral ou absent de `known_hosts`), sous-agent de transfert en erreur (`agent status`, `stop`, `purge`, `lock`), clé publique illisible ou différente de la clé privée, `ssh-add`/`ssh-agent` en erreur ; écriture de `config.json` impossible ; écriture des hôtes ou des transferts dans le coffre non aboutie ou non vérifiée (y compris écrits mais `ssh_config` non régénéré) ; `ensure --forward` : `forward-confirm` sans askpass, élément qui ne déclare plus ce transfert, chemin du socket de transfert trop long ; `import` : création non aboutie ou non vérifiée (y compris clé importée mais `ssh_config` non régénéré), copie impossible dans un tmpfs privé (`--decrypt`), `ssh-keygen` absent ou en erreur ; `generate` : tmpfs privé inutilisable, `ssh-keygen` absent ou en erreur, création non aboutie ou non vérifiée (clé perdue, dit), clé créée mais `ssh_config` non régénéré ; `pubkey` : clé publique d'un élément illisible ; `deploy` : `ssh` absent, en échec ou sans réponse (`SSHVAULT_DEPLOY_TIMEOUT`), réponse inattendue de la cible, échec partiel (clés déjà ajoutées dites, puis code 4), clé publique illisible ; `ssh_config` généré impossible à écrire (chemin avec `"`, `\`, `${`, fichier non ordinaire, droits) ; répertoire personnel inconnu ; `ssh-config install` refusé (lien symbolique, fichier non ordinaire, `Include` conditionnel, chemin personnel avec `%`, `$` ou joker) ; erreur interne |
 | 130 | interrompu (Ctrl-C, SIGTERM, SIGHUP) |
 
 `agent status`, `stop`, `purge`, `lock` : code de l'agent dédié (`status` : 0 actif, 3 arrêté),
@@ -766,7 +821,7 @@ le code 2. Toute erreur est une ligne sur stderr, sans traceback.
 
 | Variable | Rôle |
 |---|---|
-| `SSHVAULT_BW` | exécutable `bw` (défaut : `bw` du PATH) |
+| `SSHVAULT_BW` | exécutable `bw`, prioritaire sur le réglage `bw-path` (défaut : `bw-path`, sinon `bw` du PATH) |
 | `SSHVAULT_BW_TIMEOUT` | délai d'un appel `bw`, en secondes, 0 < v ≤ 86400 (défaut 60 ; `login` : 600) |
 | `SSHVAULT_PROMPT_TIMEOUT` | délai d'une invite, en secondes, 0 < v ≤ 86400 (défaut 60) |
 | `SSHVAULT_ENSURE_TIMEOUT` | délai global d'un `ensure` depuis son démarrage, attente du verrou comprise, en secondes, 0 < v ≤ 86400 (défaut 240) |
