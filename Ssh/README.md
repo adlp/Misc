@@ -2,15 +2,18 @@
 
 Clés SSH dans un Vaultwarden auto-hébergé, utilisées de façon transparente par ssh.
 
-État (0.5.0) : **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
+État (0.6.0) : **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
 éléments « SSH key »), **agent dédié** (chargement d'une clé du coffre dans un
 `ssh-agent` d'OpenSSH propre à sshvault, sans écriture disque, avec durée de vie,
 confirmation et restriction aux hôtes en option ; état, purge, verrou et arrêt de l'agent),
 **hôtes d'une clé** modifiables depuis la CLI, **`ssh_config` généré** (chaque hôte
 associé reçoit l'agent dédié et sa seule clé) et **chargement automatique** : `ssh <hôte>`
 charge seul la clé manquante, pour la cible comme pour chaque saut ProxyJump/ProxyCommand,
-avec au plus une invite de déverrouillage du coffre, et **import** d'une clé existante dans
-le coffre (`sshvault import`). La génération de clés viendra ensuite.
+avec au plus une invite de déverrouillage du coffre, **import** d'une clé existante dans
+le coffre (`sshvault import`) et **génération** d'une clé directement dans le coffre
+(`sshvault generate`, clé privée jamais écrite sur disque par sshvault, voir les limites), avec affichage
+(`sshvault pubkey`) et **déploiement** de la clé publique dans `authorized_keys` d'une
+cible (`sshvault deploy`).
 
 ## Installation (sans root)
 
@@ -60,6 +63,9 @@ sshvault ssh-config [--print | --check]
 sshvault ssh-config install
 
 sshvault import FICHIER… [--name NOM] [--hosts HÔTE,…] [--force] [--decrypt]
+sshvault generate --name NOM [--type ed25519 | --type rsa [--bits 3072|4096]] [--comment TEXTE] [--hosts HÔTE,…] [--force]
+sshvault pubkey (SÉLECTION [--host | --name | --fingerprint | --id] | --all)
+sshvault deploy SÉLECTION [--host | --name | --fingerprint | --id] [UTILISATEUR@]HÔTE [-p PORT] [-- OPTIONS_SSH…]
 
 sshvault ensure --id ID          # appelé par ssh (ligne Match exec du ssh_config généré)
 ```
@@ -76,7 +82,8 @@ sshvault ensure --id ID          # appelé par ssh (ligne Match exec du ssh_conf
   garde tels quels.
 - Option globale `--nointeraction` (avant la commande) : jamais d'invite ; un
   coffre verrouillé donne le code 3.
-- Coffre verrouillé : `list`, `search`, `sync`, `load`, `hosts`, `import` et `ssh-config` (sauf
+- Coffre verrouillé : `list`, `search`, `sync`, `load`, `hosts`, `import`, `generate`, `pubkey`,
+  `deploy` et `ssh-config` (sauf
   `install`, qui ne lit pas le coffre) demandent le mot de passe, puis
   gardent la session (900 s).
 - Déconnexion : pas encore de commande `logout`. En attendant :
@@ -305,6 +312,111 @@ quel s'il est au format OpenSSH, sinon converti, voir plus bas), `publicKey` et
   (`importée : nom (empreinte)` sur la sortie, ou l'erreur sur stderr) ; code de sortie : le
   pire des codes rencontrés (0 < 1 < 2 < 3 < 4), y compris si le coffre échoue ensuite.
 
+### Génération d'une clé dans le coffre
+
+```
+sshvault generate --name web --hosts web.example.org
+sshvault generate --name vieux-serveur --type rsa --bits 3072 > vieux-serveur.pub
+```
+
+- La clé est générée par `ssh-keygen -q -t <type> [-b <bits>] -N "" -C <commentaire> -f
+  <dossier>/key`, dans un sous-dossier 0700 neuf de `$XDG_RUNTIME_DIR/sshvault/` (tmpfs
+  privé vérifié, mêmes règles que la copie de `import --decrypt` : verrou `flock`,
+  suppression sur tous les chemins, Ctrl-C et SIGTERM compris, signaux masqués pendant la
+  suppression, dossier d'une génération tuée supprimé à la suivante). La clé privée est relue
+  en mémoire puis le dossier supprimé : sshvault ne l'écrit **jamais sur un stockage
+  persistant**, ne l'affiche pas et ne la passe pas en argument (le seul « secret » en argument
+  est la passphrase vide `-N ""`). Limites : un tmpfs peut être évincé vers le swap (en clair
+  si le swap n'est pas chiffré), et les copies Python de la clé restent dans la mémoire du
+  processus jusqu'à sa fin (Python ne garantit pas leur effacement).
+- **Types** : Ed25519 par défaut ; `--type rsa` avec `--bits 3072` ou `4096` (défaut 4096).
+  Toute autre valeur (`--bits 1024`, `--type ecdsa`, `dsa`, `-sk`, `--bits` avec Ed25519) :
+  code 2, avant toute génération. ECDSA, DSA et `-sk` ne sont pas pris en charge par les
+  clients Bitwarden.
+- **Sans passphrase** : le coffre chiffre déjà la clé (utilisable par l'agent de Bitwarden
+  Desktop).
+- **Nom** (`--name`, obligatoire) : un nom déjà porté par une clé SSH du coffre (casse et
+  blancs autour ignorés, après `bw sync`) donne le code 1, rien généré, avec le nom et l'id de
+  l'élément existant ; `--force` crée quand même un élément de ce nom.
+- **Commentaire** de la clé (`--comment`, défaut : le nom) : caractères imprimables
+  seulement (ni tabulation, ni fin de ligne, ni contrôle), 255 au plus ; sinon code 2.
+- **Sortie** : stdout ne contient **qu'une ligne**, la clé publique au format OpenSSH (à
+  rediriger vers un fichier ou à déployer) ; tout le reste (compte rendu, régénération du
+  `ssh_config`, avertissements) va sur stderr.
+- **Création** : comme `import` (élément sur stdin, trois champs `sshKey`, reprise sans
+  doublon après un échec ou un blocage de `bw create`, relecture comparée). Si la création
+  n'aboutit pas (code 4), le message le dit : la clé générée n'a jamais existé ailleurs qu'en
+  mémoire, elle est perdue ; relancer `generate`. Interrompu pendant la création : code 130 et
+  « création peut-être passée » (vérifier par `sshvault sync` puis
+  `sshvault search --fingerprint …`, clé publique par `sshvault pubkey`).
+- **Hôtes** (`--hosts`) : comme `import` (validés, prérequis de la régénération vérifiés
+  avant le coffre, `ssh_config` régénéré ensuite). Un motif attrape-tout (`*`) est signalé
+  une seule fois, après le contrôle du nom et avant la génération.
+- **Ordre** : refus d'usage (code 2) ; puis, avant tout accès au coffre, tmpfs privé et son
+  dossier `sshvault/` (code 4 : `XDG_RUNTIME_DIR` relatif, non privé ou hors tmpfs, repli
+  `/run/user/<uid>` inutilisable) et prérequis du `ssh_config` (chemins, socket, chemin de
+  sshvault ; code 4) ; puis le coffre (code 3 verrouillé sans invite possible), le nom déjà
+  pris (code 1) ; seulement ensuite la génération et la création.
+- **Après la création**, une interruption ou une sortie fermée (`generate … | head -0`) laisse
+  la clé dans le coffre : stderr le dit (« clé créée : « nom » id », et « ssh_config non
+  régénéré : lancer « sshvault ssh-config » » si la régénération n'a pas eu lieu). Session
+  refusée par `bw` pendant la création : même code que d'habitude (3), avec « clé perdue ».
+
+### Clés publiques : affichage et déploiement
+
+```
+sshvault pubkey --host web.example.org > web.pub
+sshvault deploy --id 0f2c… admin@web.example.org
+sshvault deploy web web.example.org -p 2222 -- -i ~/.ssh/cle_admin -o ConnectTimeout=10
+```
+
+- `pubkey` affiche la ou les clés publiques sélectionnées (sélection comme `load`, ou
+  `--all`), une ligne `type base64 [commentaire]` par clé, rien d'autre sur stdout. Elle lit
+  le cache local de `bw` : aucun appel réseau (lancer `sshvault sync` d'abord si besoin).
+  Deux éléments d'une même clé : une ligne. Commentaire avec caractère de contrôle : retiré
+  de la ligne. Clé publique d'un élément illisible : message, code 4, les autres affichées.
+- `deploy` ajoute les clés publiques sélectionnées à `~/.ssh/authorized_keys` de la cible
+  par **un seul `ssh`** :
+  - les clés passent sur **stdin** ; la commande distante est un script POSIX **fixe**,
+    lancé par `exec sh -c '…'`, qui ne contient aucune donnée de l'utilisateur ;
+  - sous `umask 077`, il crée `~/.ssh` (0700) s'il manque et `authorized_keys` (0600) ;
+  - il tient un verrou (`~/.ssh/.sshvault-deploy.lock`, un dossier, 10 essais d'une seconde,
+    supprimé à la sortie) autour de la vérification et de l'ajout : deux `deploy` simultanés
+    ne se doublent pas. Un verrou resté d'un `deploy` tué : erreur qui le nomme ;
+  - il n'ajoute une clé que si elle (type + base64) n'y est pas déjà ; les lignes commentées
+    `#` ne comptent pas, les fins de ligne CRLF sont reconnues ; un fichier sans fin de ligne
+    finale est complété ;
+  - il lance `restorecon -F` sur `~/.ssh` et `authorized_keys` si la commande existe (SELinux ;
+    échec ignoré) ;
+  - il répond, par clé : « ajoutée », « déjà présente », ou « déjà présente (avec options : la
+    connexion peut être restreinte) » si la clé n'y figure qu'avec des options (`command=`,
+    `from=`, `restrict`, `cert-authority`, `expiry-time`…) : une ligne par clé sur stdout.
+    Un second `deploy` n'ajoute rien et ne touche pas au fichier.
+- Shells de connexion distants éprouvés : `sh`, `dash`, `bash` (tests pour `zsh`, `fish`,
+  `tcsh`, ignorés quand ils manquent : non éprouvés sur le poste de développement). Le script
+  tient sur une ligne, sans apostrophe ni `!`.
+- Cible `[utilisateur@]hôte` : nom de lettres, chiffres, `.`, `-`, `_` (pas de `-` en tête),
+  ou adresse IPv6 valide (au moins deux `:`), nue ou entre crochets (`[::1]`) : les crochets
+  sont retirés avant `ssh` (OpenSSH 8.9 les garderait dans le nom à résoudre). Tout autre
+  caractère (`;`, `$`, espace, `%`…) ou `hôte:port` est refusé (code 2) : rien ne peut être
+  interprété par un shell local, ni par un `ProxyCommand` de la config ssh de l'utilisateur
+  (`%h`, `%r`). `-p PORT` : 1 à 65535.
+- `-- OPTIONS_SSH…` : options passées telles quelles à `ssh`, chacune en argument séparé,
+  jamais par un shell ; seules des options de `ssh` (et leurs arguments) y sont acceptées,
+  pas une cible ni une commande. Refusées aussi, car elles changent le mode de `ssh` : `-N`,
+  `-n`, `-f`, `-G`, `-V`, `-Q`, `-O`, `-W`, `-s`, `-M`, `-t`, et `-o` `RequestTTY`,
+  `StdinNull`, `SessionType`, `ForkAfterAuthentication`, `RemoteCommand`, `LocalCommand`,
+  `PermitLocalCommand`, `ProxyUseFdpass` (code 2).
+- `ssh` reçoit, dans l'ordre : `[-o BatchMode=yes]` (avec `--nointeraction`), les options,
+  `-o ConnectTimeout=30` (sauf si les options en donnent un), `-p PORT`, `--`, la cible, la
+  commande fixe. L'authentification est celle de `ssh` (agent, clés, mot de passe ou
+  confirmation de la clé d'hôte sur le terminal). `SSHVAULT_SSH` remplace l'exécutable.
+- Délai global `SSHVAULT_DEPLOY_TIMEOUT` (120 s par défaut, saisie comprise) : passé, `ssh`
+  est arrêté (SIGTERM, puis SIGKILL) : code 4.
+- `ssh` en échec (connexion, authentification, commande distante) : code 4, avec son
+  message. Échec en cours de route : les clés déjà ajoutées sont dites (une ligne chacune),
+  puis code 4. Le coffre n'est pas contacté par le réseau (cache local de `bw`).
+
 ### `ssh_config` généré
 
 `sshvault ssh-config` lit le **cache local** de `bw` (lancer `sshvault sync` d'abord pour
@@ -476,10 +588,10 @@ manque, est conditionnelle ou n'est pas en tête.
 | Code | Sens |
 |---|---|
 | 0 | succès |
-| 1 | `search`, `load`, `hosts` : aucun résultat ; `import` : clé déjà dans le coffre (rien créé) ; `hosts remove` : hôte absent (rien écrit) ; `ssh-config --check` : pas à jour (contenu, droits, fichier en trop ou non ordinaire), ou ligne `Include` absente, conditionnelle ou pas en tête |
-| 2 | usage (option ou argument invalide ; `load` sans sélection ni `--all`) ; durée invalide ; `config.json` invalide, illisible ou aux droits inattendus ; hôte invalide ; sélection de `hosts` qui désigne plusieurs éléments ; `import` : fichier refusé (illisible, pas une clé privée, type ou format non accepté), `--name` avec plusieurs fichiers |
+| 1 | `search`, `load`, `hosts`, `pubkey`, `deploy` : aucun résultat ; `import` : clé déjà dans le coffre (rien créé) ; `generate` : nom déjà pris, sans `--force` (rien généré) ; `hosts remove` : hôte absent (rien écrit) ; `ssh-config --check` : pas à jour (contenu, droits, fichier en trop ou non ordinaire), ou ligne `Include` absente, conditionnelle ou pas en tête |
+| 2 | usage (option ou argument invalide ; `load` sans sélection ni `--all`) ; durée invalide ; `config.json` invalide, illisible ou aux droits inattendus ; hôte invalide ; sélection de `hosts` qui désigne plusieurs éléments ; `import` : fichier refusé (illisible, pas une clé privée, type ou format non accepté), `--name` avec plusieurs fichiers ; `generate` : type, bits, nom ou commentaire refusés ; `deploy` : cible, port ou options ssh invalides ou refusées ; délai `SSHVAULT_DEPLOY_TIMEOUT` invalide |
 | 3 | non connecté (« lancer sshvault login »), ou coffre verrouillé : aucune invite possible, invite annulée ou sans réponse, mot de passe refusé ; agent dédié arrêté (`agent status`, `lock`, `unlock`) ou verrouillé ; passphrase d'une clé refusée ou impossible à saisir (`load`, `import`) |
-| 4 | erreur du backend : `bw` introuvable, en erreur, réponse illisible, délai dépassé ; magasin de session inutilisable ; agent dédié : `XDG_RUNTIME_DIR` relatif, non privé ou hors tmpfs, chemin du socket trop long, agent tiers sur le socket, OpenSSH < 8.9, `--restrict` (élément sans hôte, hôte non littéral ou absent de `known_hosts`), clé publique illisible ou différente de la clé privée, `ssh-add`/`ssh-agent` en erreur ; écriture de `config.json` impossible ; écriture des hôtes dans le coffre non aboutie ou non vérifiée (y compris hôtes écrits mais `ssh_config` non régénéré) ; `import` : création non aboutie ou non vérifiée (y compris clé importée mais `ssh_config` non régénéré), copie impossible dans un tmpfs privé (`--decrypt`), `ssh-keygen` absent ou en erreur ; `ssh_config` généré impossible à écrire (chemin avec `"`, `\`, `${`, fichier non ordinaire, droits) ; répertoire personnel inconnu ; `ssh-config install` refusé (lien symbolique, fichier non ordinaire, `Include` conditionnel, chemin personnel avec `%`, `$` ou joker) ; erreur interne |
+| 4 | erreur du backend : `bw` introuvable, en erreur, réponse illisible, délai dépassé ; magasin de session inutilisable ; agent dédié : `XDG_RUNTIME_DIR` relatif, non privé ou hors tmpfs, chemin du socket trop long, agent tiers sur le socket, OpenSSH < 8.9, `--restrict` (élément sans hôte, hôte non littéral ou absent de `known_hosts`), clé publique illisible ou différente de la clé privée, `ssh-add`/`ssh-agent` en erreur ; écriture de `config.json` impossible ; écriture des hôtes dans le coffre non aboutie ou non vérifiée (y compris hôtes écrits mais `ssh_config` non régénéré) ; `import` : création non aboutie ou non vérifiée (y compris clé importée mais `ssh_config` non régénéré), copie impossible dans un tmpfs privé (`--decrypt`), `ssh-keygen` absent ou en erreur ; `generate` : tmpfs privé inutilisable, `ssh-keygen` absent ou en erreur, création non aboutie ou non vérifiée (clé perdue, dit), clé créée mais `ssh_config` non régénéré ; `pubkey` : clé publique d'un élément illisible ; `deploy` : `ssh` absent, en échec ou sans réponse (`SSHVAULT_DEPLOY_TIMEOUT`), réponse inattendue de la cible, échec partiel (clés déjà ajoutées dites, puis code 4), clé publique illisible ; `ssh_config` généré impossible à écrire (chemin avec `"`, `\`, `${`, fichier non ordinaire, droits) ; répertoire personnel inconnu ; `ssh-config install` refusé (lien symbolique, fichier non ordinaire, `Include` conditionnel, chemin personnel avec `%`, `$` ou joker) ; erreur interne |
 | 130 | interrompu (Ctrl-C, SIGTERM, SIGHUP) |
 
 `ensure` : 0 si la clé est présente ou chargée, et pour `ssh -G` ; sinon le code de
@@ -502,8 +614,9 @@ le code 2. Toute erreur est une ligne sur stderr, sans traceback.
   l'environnement du seul sous-processus : jamais en argument ni dans un fichier.
 - Réseau : `list`, `search`, `unlock`, `lock` et `status` ne lisent que le cache local
   de `bw` (aucune connexion) ; seuls `sync`, `login`, l'écriture de `hosts`
-  (`bw edit`, jamais relancé à l'aveugle : voir Hôtes d'une clé) et `import` (`bw create`,
-  même règle : voir Import) passent par le réseau. Une
+  (`bw edit`, jamais relancé à l'aveugle : voir Hôtes d'une clé), `import` et `generate`
+  (`bw create`, même règle : voir Import) passent par le réseau. `pubkey` et `deploy` lisent
+  le cache local (`deploy` ne contacte que la cible, par `ssh`). Une
   connexion neuve peut y rester bloquée sans fin (mesuré : ClientHello TLS jamais
   acquitté ; `bw` n'a pas de délai réseau propre). Un passage de `sync` fait donc
   deux essais de `SSHVAULT_BW_TIMEOUT`/2 chacun. S'il faut d'abord déverrouiller (pas
@@ -537,8 +650,10 @@ le code 2. Toute erreur est une ligne sur stderr, sans traceback.
 | `XDG_CONFIG_HOME` | base de `sshvault/config.json` (défaut `~/.config`) |
 | `SSHVAULT_SSH_HOME` | tests seulement : répertoire personnel de `~/.ssh` (défaut : celui de passwd) |
 | `SSHVAULT_SSH_AGENT`, `SSHVAULT_SSH_ADD` | exécutables `ssh-agent` et `ssh-add` (défaut : ceux du PATH) |
-| `SSHVAULT_SSH_KEYGEN` | exécutable `ssh-keygen` (`import` ; défaut : celui du PATH) |
-| `SSHVAULT_TEST_FIELD` | tests seulement : `NOM=VALEUR`, champ texte ajouté aux éléments créés par `import` (marqueur de nettoyage de l'intégration) |
+| `SSHVAULT_SSH_KEYGEN` | exécutable `ssh-keygen` (`import`, `generate` ; défaut : celui du PATH) |
+| `SSHVAULT_SSH` | exécutable `ssh` (`deploy` ; défaut : celui du PATH) |
+| `SSHVAULT_DEPLOY_TIMEOUT` | délai global d'un `deploy`, en secondes, 0 < v ≤ 86400 (défaut 120) |
+| `SSHVAULT_TEST_FIELD` | tests seulement : `NOM=VALEUR`, champ texte ajouté aux éléments créés par `import` et `generate` (marqueur de nettoyage de l'intégration) |
 | `SSHVAULT_KNOWN_HOSTS` | fichiers known_hosts passés à `ssh-add -H` pour `--restrict`, séparés par `:` (défaut : ceux d'`ssh-add`) |
 | `BW_CLIENTID`, `BW_CLIENTSECRET` | clé API pour `sshvault login --apikey` (lues par `bw`) |
 | `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE`, `DISPLAY`, `WAYLAND_DISPLAY` | choix de l'invite (`man ssh`) |
@@ -580,6 +695,17 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   passée puis bloquée, illisible ou altérée ; argv de `bw` et de `ssh-keygen` journalisés et
   `/proc/<pid>/cmdline` relevé pendant l'appel (ni JSON, ni clé, ni passphrase) ; fichiers
   d'origine inchangés, copie tmpfs supprimée, aucun fichier de clé privée hors des fixtures.
+- `tests/test_generate.py` (`generate`, `pubkey`, `deploy`) : vrai `ssh-keygen` (enveloppé
+  pour journaliser ses arguments) ; empreinte de l'élément = `ssh-keygen -l` de la ligne
+  affichée, `ssh-keygen -y` de la clé privée stockée = cette ligne ; refus et ordre des
+  contrôles vérifiés par l'absence d'appel à `ssh-keygen` et à `bw` ; interruptions
+  (SIGINT, SIGTERM) pendant la génération et la création ; `/proc/<pid>/cmdline` relevé
+  pendant l'appel et contrôlé après coup contre la clé générée. `deploy` vers un sshd de test
+  sur 127.0.0.1 dont le HOME des sessions est un dossier de test (`SetEnv HOME=`), puis
+  connexion avec la clé déployée chargée dans l'agent dédié ; script distant aussi éprouvé
+  sous `sh`, `dash` et `bash` (`zsh`, `fish`, `tcsh` s'ils sont installés) : CRLF, clé avec
+  options, verrou ; cibles et options piégées (`;`, `$()`, espaces) ; faux `ssh` : échec
+  partiel, réponse incomplète, délai, SIGTERM.
 - En fin de session, les tests vérifient qu'aucun de leurs processus ne reste (agent,
   surveillant, sshd, `bw`, askpass, `ensure`), que `~/.ssh` réel est inchangé et
   qu'aucun dossier sshvault réel (socket, données, config) n'a été créé.
@@ -590,7 +716,10 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
     affichés ; mot de passe par `--passwordenv` ; données `bw` dans des dossiers
     temporaires supprimés à la fin. Le test crée 2 éléments SSH et 1 login marqués
     `sshvault-test-run=<uuid>`, pilote sshvault, puis supprime définitivement
-    (`--permanent`) les seuls éléments de son run, même en cas d'échec, et fait `bw logout` ;
+    (`--permanent`) les éléments de son run, même en cas d'échec, et fait `bw logout`. Au début
+    et à la fin, il purge aussi tout élément marqué `sshvault-test-run` (quelle que soit la
+    valeur : restes d'un run interrompu), marqueur relu avant chaque suppression ; `sync` et
+    `delete` sont retentés après une panne réseau passagère (DNS, connexion) ;
   - **conteneur** (`SSHVAULT_IT_MODE=container`) : Vaultwarden 1.37.4 sur un port libre de
     127.0.0.1, compte créé par l'API (crypto d'inscription Bitwarden, dépendance de test
     `cryptography`), conteneur supprimé à la fin.
@@ -607,6 +736,9 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   puis `import` de trois clés de test (en clair, chiffrée avec `--decrypt` par askpass, RSA
   PEM PKCS#1 convertie),
   marquées pour le nettoyage, `/proc` relevé pendant l'appel, relecture par l'autre client
-  `bw` (trois champs `sshKey`, hôtes), doublon refusé, `load` et `ssh -G`.
+  `bw` (trois champs `sshKey`, hôtes), doublon refusé, `load` et `ssh -G` ; enfin `generate`
+  avec un hôte (marquée), relue par l'autre client `bw` (`ssh-keygen -y` de la clé privée
+  = la ligne affichée, même empreinte), aucune ligne de commande relevée ne contenant la clé,
+  `pubkey`, `load` et `ssh -G`.
   `register.py` (mode
   conteneur) se lance seul par `SSHVAULT_IT_PASSWORD=… python register.py <url> <e-mail>`.

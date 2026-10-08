@@ -2,14 +2,16 @@
 
 Codes de sortie :
   0  succès
-  1  aucun résultat (search, load, hosts : sélection sans élément) ; hosts remove : hôte
-     absent de l'élément (rien écrit) ; import : clé déjà dans le coffre (rien créé) ;
+  1  aucun résultat (search, load, hosts, pubkey, deploy : sélection sans élément) ; hosts
+     remove : hôte absent de l'élément (rien écrit) ; import : clé déjà dans le coffre (rien
+     créé) ; generate : nom déjà pris par une clé du coffre, sans --force (rien généré) ;
      ssh-config --check : pas à jour (contenu, droits, fichier en trop ou non ordinaire) ou
      ligne Include absente, conditionnelle ou pas en tête
   2  usage (option ou argument invalide ; load sans sélection ni --all ; durée invalide ;
      config.json invalide, illisible ou aux droits inattendus ; hôte invalide ; sélection
      de hosts qui désigne plusieurs éléments ; import : fichier refusé — illisible, pas une
-     clé privée, type ou format non accepté — ou --name avec plusieurs fichiers)
+     clé privée, type ou format non accepté — ou --name avec plusieurs fichiers ; generate :
+     type, bits, nom ou commentaire refusés ; deploy : cible, port ou options ssh invalides)
   3  non connecté au coffre, ou coffre verrouillé (aucune invite possible, mot de passe refusé) ;
      agent dédié arrêté ou verrouillé ; passphrase d'une clé refusée ou impossible à saisir
      (load, import)
@@ -20,7 +22,10 @@ Codes de sortie :
      config.json impossible, écriture des hôtes dans le coffre non aboutie ou non vérifiée
      (y compris hôtes écrits mais ssh_config non régénéré), création d'un élément par import
      non aboutie ou non vérifiée (y compris clé importée mais ssh_config non régénéré), copie
-     impossible dans un tmpfs privé (import --decrypt), ssh-keygen absent ou en erreur,
+     impossible dans un tmpfs privé (import --decrypt, generate), ssh-keygen absent ou en
+     erreur, création d'un élément par generate non aboutie ou non vérifiée (y compris clé
+     créée mais ssh_config non régénéré), deploy : ssh absent, en échec ou sans réponse
+     (SSHVAULT_DEPLOY_TIMEOUT), réponse inattendue, échec partiel (clés déjà ajoutées dites),
      ssh_config généré impossible à écrire (chemin avec « " », « \\ », « ${ », fichier non
      ordinaire, droits), répertoire
      personnel inconnu, ssh-config install refusé (~/.ssh/config lien symbolique ou non
@@ -51,9 +56,10 @@ from .agent import (CMD_TIMEOUT as AGENT_TIMEOUT, Agent, AgentError, AgentLocked
                     resolve_dir, tty_available)
 from .agentstate import entry as state_entry, maybe_locked, reconcile, remaining
 from .backend import (HOSTS_FIELD, BackendError, InvalidHost, NotLoggedIn, SshKeyItem, VaultBackend, VaultError,
-                      VaultLocked, normalize_hosts, valid_host)
+                      VaultLocked, WriteFailed, normalize_hosts, valid_host)
 from .bw import BwBackend
 from .config import Config, ConfigError, ConfigWriteError, describe_duration, parse_duration
+from . import deploy as deploy_mod
 from . import ensure as ensure_mod
 from . import fastpath
 from . import keyfile
@@ -106,6 +112,20 @@ def ttl_arg(s: str) -> int:
     return v
 
 
+def bits_arg(s: str) -> int:
+    try:
+        return int(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError("--bits invalide : %r (3072 ou 4096)" % s) from None
+
+
+def _selection_flags(parser) -> None:
+    g = parser.add_mutually_exclusive_group()
+    for flag, what in (("host", "motif glob d'hôte"), ("name", "sous-chaîne du nom"),
+                       ("fingerprint", "empreinte exacte"), ("id", "id exact de l'élément")):
+        g.add_argument("--" + flag, dest="by", action="store_const", const=flag, help=what)
+
+
 def duration_arg(s: str) -> int:
     try:
         return parse_duration(s)
@@ -116,10 +136,12 @@ def duration_arg(s: str) -> int:
 def build_parser() -> Parser:
     p = Parser(prog="sshvault", description="Clés SSH du coffre Vaultwarden (via bw).",
                epilog="Codes de sortie : 0 ok, 1 aucun résultat (hosts remove : hôte absent ; "
-                      "ssh-config --check : pas à jour ; import : déjà dans le coffre), 2 usage (hôte "
-                      "invalide, sélection ambiguë, import : fichier refusé), "
+                      "ssh-config --check : pas à jour ; import : déjà dans le coffre ; generate : nom "
+                      "déjà pris), 2 usage (hôte invalide, sélection ambiguë, import : fichier refusé, "
+                      "generate : type ou commentaire refusé, deploy : cible invalide), "
                       "3 non connecté ou verrouillé (coffre ou agent, passphrase refusée), "
                       "4 erreur backend ou agent, écriture ou ssh_config impossible, install refusé, "
+                      "ssh-keygen ou ssh en échec, "
                       "130 interrompu. "
                       "status : 0 déverrouillé, 3 sinon ; agent status : 0 actif, 3 arrêté.")
     p.add_argument("--version", action="version", version="sshvault " + __version__)
@@ -203,6 +225,32 @@ def build_parser() -> Parser:
     s.add_argument("--decrypt", action="store_true",
                    help="clé à passphrase : stockée déchiffrée (passphrase demandée une fois) ; défaut : "
                         "stockée chiffrée, telle quelle")
+
+    s = sub.add_parser("generate", help="génère une nouvelle clé directement dans le coffre (clé publique "
+                                        "seule sur stdout ; clé privée jamais écrite sur disque)")
+    s.add_argument("--name", required=True, metavar="NOM", help="nom de l'élément (obligatoire)")
+    s.add_argument("--type", default="ed25519", metavar="TYPE", help="ed25519 (défaut) ou rsa")
+    s.add_argument("--bits", type=bits_arg, metavar="BITS", help="RSA seulement : 3072 ou 4096 (défaut 4096)")
+    s.add_argument("--comment", metavar="TEXTE",
+                   help="commentaire de la clé (imprimable, 255 caractères au plus ; défaut : le nom)")
+    s.add_argument("--hosts", metavar="HÔTES", action="append", default=[],
+                   help="hôtes associés, liste à virgules (comme hosts add) ; ssh_config régénéré")
+    s.add_argument("--force", action="store_true", help="crée l'élément même si une clé du coffre porte déjà ce nom")
+
+    s = sub.add_parser("pubkey", help="affiche les clés publiques sélectionnées, une ligne chacune (cache local "
+                                      "de bw, aucun appel réseau)")
+    s.add_argument("pattern", metavar="SÉLECTION", nargs="?", help="comme load (ou --all)")
+    s.add_argument("--all", action="store_true", help="toutes les clés SSH du coffre")
+    _selection_flags(s)
+
+    s = sub.add_parser("deploy", help="ajoute les clés publiques sélectionnées à ~/.ssh/authorized_keys d'une "
+                                      "cible, par un seul ssh (idempotent)",
+                       usage="sshvault deploy [-h] [--host | --name | --fingerprint | --id] [-p PORT] "
+                             "SÉLECTION [UTILISATEUR@]HÔTE [-- OPTIONS_SSH…]")
+    s.add_argument("pattern", metavar="SÉLECTION", help="comme load")
+    s.add_argument("target", metavar="[UTILISATEUR@]HÔTE", help="cible (lettres, chiffres, . - _ ; IPv6 entre crochets)")
+    s.add_argument("-p", dest="port", metavar="PORT", help="port de la cible")
+    _selection_flags(s)
 
     s = sub.add_parser("ssh-config", help="génère ~/.ssh/sshvault/config et les clés publiques ; "
                                           "install : ligne Include en tête de ~/.ssh/config")
@@ -328,6 +376,12 @@ def run(args, backend: VaultBackend) -> int:
         return run_ssh_config(args, backend, prompt)
     if args.cmd == "import":
         return run_import(args, backend, prompt)
+    if args.cmd == "generate":
+        return run_generate(args, backend, prompt)
+    if args.cmd == "pubkey":
+        return run_pubkey(args, backend, prompt)
+    if args.cmd == "deploy":
+        return run_deploy(args, backend, prompt)
     raise UsageError("commande inconnue : %s" % args.cmd)
 
 
@@ -609,21 +663,24 @@ def ensure_exe(paths) -> Optional[str]:
 _RESOLVE = object()  # regenerate : chemin de sshvault à résoudre (None : pas de Match exec)
 
 
-def regenerate(items: list, paths=None, socket: Optional[str] = None, exe=_RESOLVE) -> None:
-    """Réécrit ce qui a changé dans ~/.ssh/sshvault/ ; avertissements sur stderr."""
+def regenerate(items: list, paths=None, socket: Optional[str] = None, exe=_RESOLVE, out=None,
+               skip_catch_all: bool = False) -> None:
+    """Réécrit ce qui a changé dans ~/.ssh/sshvault/ ; avertissements sur stderr, compte rendu
+    sur `out` (défaut stdout ; stderr pour generate, dont stdout ne porte que la clé publique)."""
     paths = paths or sshconfig.default_paths()
     plan = sshconfig.build(items, paths, socket or make_agent().socket, ensure_exe(paths) if exe is _RESOLVE else exe)
     for w in plan.warnings:
-        err("avertissement : %s" % w)
+        if not (skip_catch_all and sshconfig.CATCH_ALL_WARNING in w):  # déjà dit par l'appelant
+            err("avertissement : %s" % w)
     res = sshconfig.apply(plan, paths)
     for w in res.warnings:
         err("avertissement : %s" % w)
     print("%s : %s (%d bloc%s)" % (paths.config, "écrit" if res.config_written else "inchangé", plan.blocks,
-                                   "s" if plan.blocks > 1 else ""))
+                                   "s" if plan.blocks > 1 else ""), file=out or sys.stdout, flush=True)
     if res.pubs_written or res.pubs_removed:
         print("clés publiques (%s) : %d écrite%s, %d supprimée%s"
               % (paths.pub, len(res.pubs_written), "s" if len(res.pubs_written) > 1 else "",
-                 len(res.pubs_removed), "s" if len(res.pubs_removed) > 1 else ""))
+                 len(res.pubs_removed), "s" if len(res.pubs_removed) > 1 else ""), file=out or sys.stdout, flush=True)
     w = sshconfig.include_warning(paths)
     if w:
         err("avertissement : %s" % w)
@@ -877,6 +934,221 @@ def run_import(args, backend: VaultBackend, prompt) -> int:
     return worst
 
 
+# --- génération d'une clé dans le coffre (story 7) -----------------------------------------------
+
+def run_generate(args, backend: VaultBackend, prompt) -> int:
+    """Clé générée par ssh-keygen dans le tmpfs privé, créée dans le coffre par le chemin
+    d'`import` (create_ssh_key : stdin, reprise sans doublon, relecture). stdout : la seule clé
+    publique (une ligne) ; tout le reste sur stderr. Ordre : refus d'usage (2), tmpfs privé (4),
+    prérequis de la régénération (4), coffre (3/4), nom déjà pris (1), puis seulement la
+    génération et la création."""
+    name = args.name.strip()
+    if not name:
+        raise UsageError("--name vide")
+    if not name.isprintable():
+        raise UsageError("--name : caractères imprimables seulement")
+    key_type, bits = keyfile.gen_spec(args.type, args.bits)  # KeyRefused (code 2)
+    if args.comment is not None:
+        comment = keyfile.check_comment(args.comment)
+    else:
+        try:
+            comment = keyfile.check_comment(name)
+        except keyfile.KeyRefused as e:
+            raise keyfile.KeyRefused("nom inutilisable comme commentaire de la clé (%s) : préciser --comment" % e) \
+                from None
+    hosts = normalize_hosts(_split(args.hosts))  # InvalidHost (code 2) avant tout accès
+    extra = _test_fields()
+    # Prérequis, avant tout accès au coffre : tmpfs privé et son dossier sshvault/ (code 4),
+    # puis chemins, socket et sshvault du ssh_config (contrôle sans éléments : build([])).
+    keyfile.check_workspace()
+    if hosts:
+        paths = sshconfig.default_paths()
+        socket = make_agent().socket
+        exe = ensure_exe(paths)
+        sshconfig.build([], paths, socket, exe)
+    backend.sync(prompt)  # nom déjà pris : état du serveur, pas un cache local périmé
+    items = backend.list_ssh_keys(prompt)
+    taken = [i for i in items if i.name.strip().casefold() == name.casefold()]
+    if taken and not args.force:
+        err("nom « %s » déjà pris par %s : rien généré ; --force pour créer quand même un élément de ce nom"
+            % (clean(name), ", ".join("« %s » %s" % (clean(i.name), clean(i.id)) for i in taken)))
+        return RC_NONE
+    if hosts:
+        sshconfig.build(items, paths, socket, exe)
+        for h in hosts:  # une seule fois (la régénération le tait), avant la génération et l'écriture
+            if sshconfig.is_catch_all(h):
+                err("avertissement : motif « %s » : %s" % (h, sshconfig.CATCH_ALL_WARNING))
+    gen = keyfile.generate(args.type, args.bits, comment)
+    try:
+        item = backend.create_ssh_key(name, gen.private_key, gen.public_key, gen.fingerprint, hosts, prompt,
+                                      existing=[], extra_fields=extra)
+    except VaultError as e:
+        # WriteFailed, mais aussi session refusée (VaultLocked, NotLoggedIn…) : même classe, code inchangé
+        raise e.__class__("%s ; la clé générée n'a jamais été écrite sur disque : sans élément valide dans le "
+                          "coffre, elle est perdue (relancer « sshvault generate »)" % e) from None
+    public, fp = gen.public_key, gen.fingerprint
+    del gen
+    regenerated = False
+    try:
+        print(public, flush=True)
+        err("clé %s générée dans le coffre : « %s » %s (id %s)"
+            % ("Ed25519" if key_type == "ssh-ed25519" else "RSA %d" % bits, clean(item.name), fp, clean(item.id)))
+        if hosts:
+            try:
+                regenerate(items + [item], paths, socket, exe, out=sys.stderr, skip_catch_all=True)
+            except (sshconfig.SshConfigError, AgentError) as e:
+                err("clé créée dans le coffre, mais ssh_config non régénéré : %s" % e)
+                return RC_BACKEND
+            regenerated = True
+    except BaseException:
+        # Ctrl-C, SIGTERM, sortie fermée… après la création : la clé existe, on le dit
+        note = "clé créée : « %s » %s" % (clean(item.name), clean(item.id))
+        if hosts and not regenerated:
+            note += " ; ssh_config non régénéré : lancer « sshvault ssh-config »"
+        try:
+            err(note)
+        except (OSError, ValueError):
+            pass
+        raise
+    return RC_OK
+
+
+# --- clés publiques : affichage et déploiement (story 7) --------------------------------------------
+
+def _public_lines(args, backend: VaultBackend, prompt, allow_all: bool):
+    """(éléments, lignes de clé publique, code) de la sélection, une ligne par clé (deux éléments
+    d'une même clé : une seule) ; (None, None, RC_NONE) si rien ne correspond (message dit). Clé
+    publique illisible : message, ignorée, code RC_BACKEND."""
+    if args.pattern is not None and not args.pattern.strip():
+        raise UsageError("sélection vide")
+    if allow_all:
+        if args.pattern is None and args.by:
+            raise UsageError("--%s demande une SÉLECTION" % args.by)
+        if args.pattern is None and not args.all:
+            raise UsageError("préciser une sélection ou --all")
+        if args.pattern is not None and args.all:
+            raise UsageError("--all exclut une SÉLECTION")
+    every = allow_all and args.all
+    found = [i for i in backend.list_ssh_keys(prompt) if every or match(i, args.pattern, args.by)]
+    if not found:
+        err("aucune clé ne correspond à « %s »" % clean(args.pattern) if args.pattern is not None
+            else "aucune clé SSH dans le coffre")
+        return None, None, RC_NONE
+    rc, out, seen = RC_OK, [], set()
+    for i in found:
+        line = deploy_mod.key_line(i.public_key)
+        if line is None:
+            err("« %s » (%s) : clé publique de l'élément illisible : ignorée" % (clean(i.name), clean(i.id)))
+            rc = RC_BACKEND
+            continue
+        blob = line.split()[1]
+        if blob in seen:
+            continue
+        seen.add(blob)
+        out.append((i, line))
+    return [i for i, _ in out], [l for _, l in out], rc
+
+
+def run_pubkey(args, backend: VaultBackend, prompt) -> int:
+    """Une ligne de clé publique par clé sélectionnée, rien d'autre sur stdout. Lecture du
+    cache local de bw (list items) : aucun appel réseau."""
+    items, lines, rc = _public_lines(args, backend, prompt, allow_all=True)
+    for line in lines or []:
+        print(line)
+    return rc
+
+
+# Options de `ssh` (OpenSSH 8.9, ssh.c) : sans argument, puis avec argument ; refusées : celles
+# qui changent le mode de ssh (pas de commande, stdin coupé, arrière-plan, terminal, sous-système,
+# contrôle de connexion, transfert -W, affichage seul) ; mots-clés -o de même effet.
+_SSH_FLAGS = set("1246afgknqstvxyACGKMNTVXY")
+_SSH_WITH_ARG = set("bceilmopBDEFIJLOPQRSWw")
+_SSH_REFUSED = set("NnfGVQOWsMt")
+_SSH_REFUSED_KEYWORDS = {"requesttty", "stdinnull", "sessiontype", "forkafterauthentication", "remotecommand",
+                         "localcommand", "permitlocalcommand", "proxyusefdpass"}
+
+
+def split_ssh_options(argv: list):
+    """`deploy … -- OPTIONS_SSH…` : les options de ssh, séparées avant argparse (dont la prise en
+    charge de « -- » dans une sous-commande varie selon la version de Python). Seulement pour
+    la commande deploy ; ailleurs, argv inchangé."""
+    cmd = next((n for n, a in enumerate(argv) if not a.startswith("-")), None)
+    if cmd is None or argv[cmd] != "deploy" or "--" not in argv[cmd:]:
+        return argv, []
+    cut = argv.index("--", cmd)
+    return argv[:cut], argv[cut + 1:]
+
+
+def check_ssh_options(options: list) -> None:
+    """Chaque élément doit être une option de ssh ou l'argument d'une option : ni cible ni
+    commande glissée par erreur (la cible et la commande distante sont fixées par deploy)."""
+    n = 0
+    while n < len(options):
+        a = options[n]
+        if a == "--" or not a.startswith("-") or len(a) < 2:
+            raise deploy_mod.BadTarget("option ssh inattendue %r : seulement des options après « -- » (la cible "
+                                       "se donne avant)" % a)
+        k = 1
+        while k < len(a):
+            c = a[k]
+            if c in _SSH_REFUSED:
+                raise deploy_mod.BadTarget("option ssh -%s refusée : elle change le mode de ssh (deploy envoie les "
+                                           "clés sur stdin et lance une commande fixe)" % c)
+            if c in _SSH_WITH_ARG:
+                if k == len(a) - 1:
+                    n += 1
+                    if n >= len(options):
+                        raise deploy_mod.BadTarget("option ssh -%s sans argument" % c)
+                    value = options[n]
+                else:
+                    value = a[k + 1:]
+                if c == "o":
+                    key = re.split(r"[\s=]", value.strip(), 1)[0].lower()
+                    if key in _SSH_REFUSED_KEYWORDS:
+                        raise deploy_mod.BadTarget("option ssh -o %s refusée : elle change le mode de ssh"
+                                                   % clean(key))
+                break
+            if c not in _SSH_FLAGS:
+                raise deploy_mod.BadTarget("option ssh inconnue -%s" % c)
+            k += 1
+        n += 1
+
+
+def run_deploy(args, backend: VaultBackend, prompt) -> int:
+    """Un seul `ssh` vers la cible pour toutes les clés sélectionnées (voir deploy.py) ; une
+    ligne par clé sur stdout : « ajoutée » ou « déjà présente »."""
+    deploy_mod.check_target(args.target)  # BadTarget (code 2) avant tout accès
+    port = deploy_mod.check_port(args.port) if args.port is not None else None
+    options = list(getattr(args, "ssh_options", []) or [])
+    check_ssh_options(options)
+    if args.nointeraction:
+        options = ["-o", "BatchMode=yes"] + options  # première valeur lue : elle l'emporte
+    items, lines, rc = _public_lines(args, backend, prompt, allow_all=False)
+    if not lines:
+        if items is not None and rc == RC_BACKEND:
+            raise deploy_mod.DeployError("aucune clé déployable (clé publique illisible)")
+        return rc
+    try:
+        answers, notes = deploy_mod.deploy(lines, args.target, port, options)
+    except deploy_mod.DeployError as e:
+        _report_deployed(items, lines, e.answers, args.target)  # clés traitées avant l'échec
+        raise
+    for note in notes:
+        err("ssh : %s" % note)
+    _report_deployed(items, lines, answers, args.target)
+    return rc
+
+
+_ANSWERS = {"added": "ajoutée", "present": "déjà présente",
+            "present-options": "déjà présente (avec options : la connexion peut être restreinte)"}
+
+
+def _report_deployed(items, lines, answers, target) -> None:
+    for i, line, ans in zip(items, lines, answers):
+        print("%s : « %s » %s → %s" % (_ANSWERS[ans], clean(i.name), fingerprint(line.split()[1]), target),
+              flush=True)
+
+
 def run_config(args) -> int:
     cfg = Config()
     if args.config_cmd == "get":
@@ -982,7 +1254,9 @@ def classify(e: BaseException):
         return RC_BACKEND, "magasin de session : %s" % e
     if isinstance(e, (BackendError, ConfigWriteError, sshconfig.SshConfigError)):
         return RC_BACKEND, str(e)
-    if isinstance(e, (InvalidHost, ConfigError, keyfile.KeyRefused)):
+    if isinstance(e, deploy_mod.DeployError):
+        return RC_BACKEND, str(e)
+    if isinstance(e, (InvalidHost, ConfigError, keyfile.KeyRefused, deploy_mod.BadTarget)):
         return RC_USAGE, str(e)
     if isinstance(e, (AgentStopped, AgentLocked, PassphraseRefused)):
         return RC_LOCKED, str(e)
@@ -1001,13 +1275,17 @@ def main(argv=None) -> int:
     backend = None
     try:
         try:
+            argv, ssh_options = split_ssh_options(sys.argv[1:] if argv is None else list(argv))
             args = build_parser().parse_args(argv)
+            if args.cmd == "deploy":
+                args.ssh_options = ssh_options
         except UsageError as e:
             err("%s (voir sshvault --help)" % e)
             return RC_USAGE
         if args.cmd == "ensure":
             return run_ensure(args)
-        for name, default in (("SSHVAULT_PROMPT_TIMEOUT", PROMPT_TIMEOUT), ("SSHVAULT_BW_TIMEOUT", BW_TIMEOUT)):
+        for name, default in (("SSHVAULT_PROMPT_TIMEOUT", PROMPT_TIMEOUT), ("SSHVAULT_BW_TIMEOUT", BW_TIMEOUT),
+                              (deploy_mod.TIMEOUT_VAR, deploy_mod.DEFAULT_TIMEOUT)):
             try:
                 seconds(os.environ, name, default)
             except ValueError as e:

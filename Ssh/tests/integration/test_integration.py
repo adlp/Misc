@@ -45,6 +45,15 @@ PW_VAR = "SSHVAULT_IT_PW"
 NET_TIMEOUT = 45
 NET_ATTEMPTS = 3
 TIMEOUT_RC = 124
+# Pannes réseau passagères (mesuré le 2026-10-08 : getaddrinfo ENOTFOUND pendant le nettoyage,
+# 4 éléments marqués restés sur le compte) : nouvel essai après une pause croissante.
+TRANSIENT = ("ENOTFOUND", "EAI_AGAIN", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH",
+             "socket hang up", "fetch failed", "getaddrinfo", "network error", "Network")
+BACKOFF = (2, 5, 10, 20)
+
+
+def transient(r) -> bool:
+    return r.returncode == TIMEOUT_RC or (r.returncode != 0 and any(t in (r.stderr or "") for t in TRANSIENT))
 
 
 class Bw:
@@ -81,10 +90,13 @@ class Bw:
         return r
 
     def sync(self, session):
-        for _ in range(NET_ATTEMPTS):
+        for n in range(NET_ATTEMPTS + 1):
             r = self.run("sync", session=session)
-            if r.returncode != TIMEOUT_RC:
+            if not transient(r):
                 return r
+            if self.report:
+                self.report.add("bw sync : panne passagère, nouvel essai", r)
+            time.sleep(BACKOFF[n])
         return r
 
     def login(self):
@@ -116,15 +128,19 @@ class Bw:
         raise self.fail(("create",), r)
 
     def delete(self, iid, session):
-        """Suppression définitive ; après un blocage, relit l'élément avant de réessayer."""
-        for _ in range(NET_ATTEMPTS):
+        """Suppression définitive ; après un blocage ou une panne réseau passagère, relit
+        l'élément (sync, get) avant de réessayer."""
+        for n in range(NET_ATTEMPTS + 1):
             r = self.run("delete", "item", iid, "--permanent", session=session)
-            if r.returncode != TIMEOUT_RC:
+            if not transient(r):
                 return r
+            if self.report:
+                self.report.add("bw delete : panne passagère, relecture puis nouvel essai", r)
+            time.sleep(BACKOFF[n])
             if self.sync(session).returncode == 0:
                 g = self.run("get", "item", iid, session=session)
                 if g.returncode != 0 and "Not found." in g.stderr:
-                    return subprocess.CompletedProcess(r.args, 0, "", "supprimé (vérifié après blocage)")
+                    return subprocess.CompletedProcess(r.args, 0, "", "supprimé (vérifié après panne)")
         return r
 
 
@@ -218,6 +234,52 @@ def cleanup(pop, session, created, report):
     return problems
 
 
+def purge_marked(pop, session, report, when):
+    """Supprime TOUS les éléments marqués `sshvault-test-run` (quelle que soit la valeur : restes
+    d'un run précédent interrompu), actifs ou à la corbeille ; sync d'abord, marqueur relu avant
+    chaque suppression, puis contrôle final après sync. Renvoie les problèmes (texte nettoyé)."""
+    problems = []
+    sy = pop.sync(session)
+    if sy.returncode != 0:
+        problems.append("sync avant purge : %s" % sy.stderr.strip())
+    ids = []
+    for listing in (["list", "items"], ["list", "items", "--trash"]):
+        r = pop.run(*listing, session=session)
+        if r.returncode != 0:
+            problems.append("%s : code %d" % (" ".join(listing), r.returncode))
+            continue
+        ids += [it["id"] for it in json.loads(r.stdout) if has_mark(it, None) and it.get("id") not in ids]
+    deleted = 0
+    for iid in ids:
+        g = pop.run("get", "item", iid, session=session)
+        if g.returncode != 0:
+            if "Not found." not in g.stderr:
+                problems.append("relecture de %s : %s" % (iid, g.stderr.strip()))
+            continue
+        if not has_mark(json.loads(g.stdout), None):
+            problems.append("%s sans marqueur à la relecture : non supprimé" % iid)
+            continue
+        d = pop.delete(iid, session)
+        if d.returncode != 0:
+            problems.append("suppression de %s : %s" % (iid, d.stderr.strip()))
+            continue
+        deleted += 1
+    left = 0
+    sy = pop.sync(session)
+    for listing in (["list", "items"], ["list", "items", "--trash"]):
+        r = pop.run(*listing, session=session)
+        if r.returncode == 0:
+            left += sum(1 for it in json.loads(r.stdout) if has_mark(it, None))
+        else:
+            problems.append("contrôle %s : code %d" % (" ".join(listing), r.returncode))
+    report.add("purge des éléments %s (%s)" % (MARK, when),
+               note="trouvés=%d supprimés=%d restants=%d ; %s" % (
+                   len(ids), deleted, left, "après sync" if sy.returncode == 0 else "cache local (sync en échec)"))
+    if left:
+        problems.append("%d élément(s) %s encore présents (%s)" % (left, MARK, when))
+    return [report.account.scrub(p) for p in problems]
+
+
 @pytest.fixture(scope="module")
 def vault(account, bw_exe, ssh_keys, report):
     appdata = tempfile.mkdtemp(prefix="sshvault-it-bw-")
@@ -228,6 +290,9 @@ def vault(account, bw_exe, ssh_keys, report):
     try:
         session = pop.login()
         assert session, "login sans session"
+        # restes d'un run précédent interrompu : purgés d'abord (un échec ici est retenté à la fin)
+        for p in purge_marked(pop, session, report, "début"):
+            report.add("purge (début) incomplète", note=p)
         tpl = json.loads(pop.ok("get", "template", "item", session=session).stdout)
 
         def create(**fields):
@@ -265,6 +330,10 @@ def vault(account, bw_exe, ssh_keys, report):
                     problems = cleanup(pop, session, created, report)
                 except Exception as e:  # le logout et la suppression du dossier ont lieu quand même
                     problems = ["nettoyage interrompu : %s: %s" % (type(e).__name__, e)]
+                try:
+                    problems += purge_marked(pop, session, report, "fin")
+                except Exception as e:
+                    problems.append("purge interrompue : %s: %s" % (type(e).__name__, e))
         finally:
             lo = pop.run("logout")
             report.add("logout (peuplement)", lo)
@@ -524,6 +593,9 @@ def test_sshvault_sur_le_vrai_bw(account, vault, ssh_keys, home, report):
 
     # import d'une clé existante (story 6) : relecture par un autre client bw, load, ssh -G
     check_import(account, vault, home, report)
+
+    # génération dans le coffre (story 7) : relecture par un autre client bw, pubkey, load, ssh -G
+    check_generate(account, vault, home, report)
 
     # session invalidée par un autre unlock : purge, puis « verrouillé »
     own.ok("unlock", "--passwordenv", PW_VAR, "--raw", env={PW_VAR: account.password})
@@ -846,4 +918,83 @@ def check_import(account, vault, home, report):
         pubs = os.path.join(home["env"]["HOME"], ".ssh", "sshvault", "pub")
         assert sorted(v for k, v in conf if k == "identityfile") == sorted(
             os.path.join(pubs, fp_filename(k["fingerprint"])) for k in files.values())
+        assert [v for k, v in conf if k == "identitiesonly"] == ["yes"]
+
+
+def check_generate(account, vault, home, report):
+    """Story 7 : `sshvault generate` sur le compte de test, avec un hôte, marquée pour le nettoyage
+    (SSHVAULT_TEST_FIELD) ; relecture par le client du peuplement après sync : `ssh-keygen -y`
+    de `privateKey` = la ligne affichée sur stdout (hors commentaire), empreinte = `ssh-keygen -l`
+    de cette ligne ; aucune ligne de commande relevée ne contient la clé privée ; aucun dossier
+    de génération restant ; pubkey, load et ssh -G."""
+    pop, session = vault["_reader"]
+    name = "sshvault-it %s générée" % TAG
+    host = "gen-%s.it.example" % TAG
+    env = {"SSHVAULT_TEST_FIELD": "%s=%s" % (MARK, RUN)}
+    with ArgvWatch(home["env"]["SSHVAULT_BW"], [], keep_all=True) as w:
+        r = sv(home, "--nointeraction", "generate", "--name", name, "--hosts", host, env=env)
+    report.add("sshvault generate", r)
+    check(account, r, 0, "generate")
+    lines = r.stdout.splitlines()
+    assert len(lines) == 1, "stdout = la seule clé publique : %r" % r.stdout
+    public = lines[0]
+    assert public.startswith("ssh-ed25519 ") and public.endswith(" " + name)
+    fp = subprocess.run(["ssh-keygen", "-l", "-E", "sha256", "-f", "/dev/stdin"], input=public + "\n",
+                        capture_output=True, text=True, check=True).stdout.split()[1]
+    assert not [n for n in os.listdir(os.path.join(home["runtime"], "sshvault")) if n.startswith("generate.")], \
+        "dossier de génération supprimé"
+
+    # relecture par un second client bw, après sync
+    assert pop.sync(session).returncode == 0, "sync du lecteur"
+    found = [it for it in json.loads(pop.ok("list", "items", session=session).stdout)
+             if (it.get("sshKey") or {}).get("keyFingerprint") == fp]
+    assert len(found) == 1, "un seul élément porte l'empreinte affichée"
+    it = found[0]
+    assert has_mark(it), "marqueur de nettoyage"
+    assert it["type"] == 5 and it["name"] == name
+    key = it["sshKey"]
+    assert key["publicKey"] == public and key["keyFingerprint"] == fp
+    from sshvault.agent import is_encrypted
+    assert key["privateKey"].startswith("-----BEGIN OPENSSH PRIVATE KEY-----") and not is_encrypted(
+        key["privateKey"].encode()), "sans passphrase"
+    y = subprocess.run(["ssh-keygen", "-y", "-f", "/dev/stdin"], input=key["privateKey"], capture_output=True,
+                       text=True)
+    assert y.returncode == 0 and y.stdout.split()[:2] == public.split()[:2], "privée relue → même clé publique"
+    assert [v for n, v, t in _fields(it) if n == "sshvault-hosts"] == [host]
+    report.add("generate : relecture", note="empreinte identique, ssh-keygen -y identique")
+
+    # aucune ligne de commande relevée pendant generate ne contient la clé privée générée
+    body = "".join(key["privateKey"].splitlines()[1:-1])
+    secrets = [body[:40], body[-40:], body[100:140]] + b64_fragments(key["privateKey"])
+    creates = [a for a in w.seen if "create" in a]
+    assert creates, "bw create observé dans /proc (surveillance effective) : %s" % sorted(w.seen)
+    assert all(list(a[-3:]) == ["create", "item", ""] or list(a[-2:]) == ["create", "item"] for a in creates), creates
+    assert not w.suspect, "argument suspect dans /proc/<pid>/cmdline : %s" % w.suspect[:3]
+    leaked = [a[:3] for a in w.all if any(s in x for x in a for s in secrets)]
+    assert not leaked, "clé privée en argument : %s" % leaked
+
+    # pubkey (cache local), load, ssh -G
+    r = sv(home, "--nointeraction", "pubkey", "--id", it["id"])
+    check(account, r, 0, "pubkey de la clé générée")
+    assert r.stdout == public + "\n"
+    if HAVE_OPENSSH:
+        sock = os.path.join(home["runtime"], "sshvault", "agent.sock")
+        r = sv(home, "--nointeraction", "load", "--id", it["id"], "-t", "5m")
+        check(account, r, 0, "load de la clé générée")
+        rc, listing = agent_list(sock)
+        assert rc == 0 and [l.split()[1] for l in listing] == [public.split()[1]]
+        r = sv(home, "agent", "stop")
+        check(account, r, 0, "agent stop après generate")
+    if shutil.which("ssh"):
+        from sshvault.sshconfig import fp_filename
+        cfg = os.path.join(home["env"]["HOME"], ".ssh", "sshvault", "config")
+        main = os.path.join(home["tmp"], "ssh_config_generate")
+        with open(main, "w") as f:
+            f.write('Include "%s"\n' % cfg)
+        os.chmod(main, 0o600)
+        g = subprocess.run(["ssh", "-G", "-F", main, host], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=30)
+        conf = [l.split(" ", 1) for l in g.stdout.splitlines()]
+        pubs = os.path.join(home["env"]["HOME"], ".ssh", "sshvault", "pub")
+        assert [v for k, v in conf if k == "identityfile"] == [os.path.join(pubs, fp_filename(fp))]
         assert [v for k, v in conf if k == "identitiesonly"] == ["yes"]

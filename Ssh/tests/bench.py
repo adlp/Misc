@@ -713,11 +713,14 @@ class ArgvWatch:
     de l'utilisateur ; garde celles qui contiennent `needle` et signale tout argument suspect :
     clé privée ou son base64 (tout processus) ; pour bw et sshvault, tout argument (hors argv[0])
     de plus de 80 caractères, d'allure base64, ou contenant « { » (`heuristics` faux : seulement
-    la clé et les `secrets`, pour les bancs dont les chemins ressemblent à du base64)."""
+    la clé et les `secrets`, pour les bancs dont les chemins ressemblent à du base64).
+    `keep_all` : garde aussi chaque ligne de commande relevée (`all`), pour un contrôle après
+    coup contre un secret inconnu avant l'appel (clé générée)."""
 
-    def __init__(self, needle, secrets, heuristics=True):
+    def __init__(self, needle, secrets, heuristics=True, keep_all=False):
         self.needle, self.secrets, self.heuristics = needle, [s for s in secrets if s], heuristics
         self.seen, self.suspect = set(), []
+        self.keep_all, self.all = keep_all, set()
         self._stop = threading.Event()
         self._t = threading.Thread(target=self._run, daemon=True)
         # ancêtres de pytest (shell qui l'a lancé, dont la ligne de commande peut contenir
@@ -745,6 +748,8 @@ class ArgvWatch:
                                   for i in range(len(argv) - 1)))
                 if any(self.needle in a for a in argv):
                     self.seen.add(tuple(argv))
+                if self.keep_all:
+                    self.all.add(tuple(argv))
                 for n, a in enumerate(argv):
                     if "PRIVATE KEY" in a or any(s in a for s in self.secrets) or (
                             self.heuristics and related and n > 0 and ("{" in a or len(a) > 80 or _B64ISH.search(a))):

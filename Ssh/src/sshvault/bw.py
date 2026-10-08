@@ -665,7 +665,7 @@ def new_ssh_item(name: str, private_key: str, public_key: str, fingerprint: str,
 
 
 def _delete_hint(iid) -> str:
-    return ("supprimer l'élément %s (interface web) avant de relancer l'import, sinon il sera vu comme "
+    return ("supprimer l'élément %s (interface web) avant de relancer la commande, sinon il sera vu comme "
             "doublon (ou relancer avec --force)" % iid)
 
 

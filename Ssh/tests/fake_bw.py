@@ -39,7 +39,8 @@ suivants en erreur), silent (edit, create : code 0 sans rien écrire), erroronce
 appel en erreur), badjsonafter (create : créé, puis réponse illisible), corrupt (create :
 enregistré sans la fin de ligne finale de la clé privée), corruptafter (create : enregistré
 altéré, puis code 1), duperror (create : deux éléments enregistrés, puis code 1), hangsecond
-(premier appel normal, les suivants bloqués).
+(premier appel normal, les suivants bloqués), locked (« Vault is locked. », code 1 : session
+refusée).
 FAKE_BW_EDIT_RACE=<champ>=<valeur> : à l'edit, le « serveur » change d'abord ce champ de
 l'élément (autre client) puis traite la requête.
 FAKE_BW_DELAY=<secondes> : chaque appel attend d'abord ce délai (coût mesuré d'un vrai bw :
@@ -133,6 +134,8 @@ def simulate(mode):
         sys.exit(0)
     if mode == "error":
         fail("Unexpected error.")
+    if mode == "locked":
+        fail("Vault is locked.")
     if mode in ("hangafter", "errorafter", "silent", "badjsonafter", "corrupt", "corruptafter", "duperror"):
         return  # traité par la commande
     if mode == "errorsecond":  # premier appel normal, les suivants en erreur

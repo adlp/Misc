@@ -24,6 +24,11 @@ empreinte, commentaire ; passphrase selon les décisions de la story 6.
   `.lock` dans le sous-dossier : un sous-dossier dont le verrou est libre (import tué par
   SIGKILL) est supprimé au prochain import, même si son pid a été réutilisé.
 - Le fichier d'origine et sa `.pub` ne sont jamais modifiés : lecture seule.
+
+Génération (`sshvault generate`, story 7) : `ssh-keygen -q -t <type> [-b <bits>] -N "" -C
+<commentaire> -f <dossier>/key` dans un sous-dossier `generate.<pid>.*` du même tmpfs privé
+(mêmes règles que la copie : 0700, verrou, suppression sur tous les chemins, orphelins
+récupérés) ; clé privée relue en mémoire, jamais copiée ailleurs.
 """
 from __future__ import annotations
 
@@ -51,6 +56,12 @@ MIN_RSA_BITS = 2048
 TYPES = ("ssh-ed25519", "ssh-rsa")
 CMD_TIMEOUT = 30.0
 WORK_PREFIX = "import."
+GEN_PREFIX = "generate."
+GEN_TYPES = {"ed25519": "ssh-ed25519", "rsa": "ssh-rsa"}
+RSA_BITS = (3072, 4096)
+DEFAULT_RSA_BITS = 4096
+GEN_TIMEOUT = 120.0
+MAX_COMMENT = 255
 LOCK_NAME = ".lock"
 _SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -464,60 +475,65 @@ def _stale(d: str, pid: int) -> bool:
         os.close(fd)
 
 
+_WORK_RE = re.compile("(?:%s|%s)" % (re.escape(WORK_PREFIX), re.escape(GEN_PREFIX)) + r"(\d+)\..+")
+
+
 def reap_stale(base: str) -> None:
-    """Sous-dossiers `import.<pid>.*` d'un import disparu (tué par SIGKILL) : supprimés."""
+    """Sous-dossiers `import.<pid>.*` ou `generate.<pid>.*` d'un import ou d'une génération
+    disparus (tués par SIGKILL) : supprimés."""
     try:
         names = os.listdir(base)
     except OSError:
         return
     for n in names:
-        m = re.fullmatch(re.escape(WORK_PREFIX) + r"(\d+)\..+", n)
+        m = _WORK_RE.fullmatch(n)
         d = os.path.join(base, n)
         if m and os.path.isdir(d) and not os.path.islink(d) and _stale(d, int(m.group(1))):
             shutil.rmtree(d, ignore_errors=True)
 
 
 @contextlib.contextmanager
-def private_copy(data: bytes, env=None):
+def private_copy(data: Optional[bytes], env=None, prefix: str = WORK_PREFIX, what: str = "copie de la clé",
+                 nothing: str = "rien importé"):
     """Chemin d'une copie 0600 de `data` dans un sous-dossier 0700 neuf de
     `$XDG_RUNTIME_DIR/sshvault/` (tmpfs privé vérifié, comme en 0.1.0) ; le sous-dossier est
     supprimé à la sortie, quelle qu'elle soit, signaux SIGINT/SIGTERM/SIGHUP masqués pendant
-    la création et la suppression (un signal arrivé entre-temps est traité après)."""
+    la création et la suppression (un signal arrivé entre-temps est traité après).
+    `data` None : chemin d'un fichier à créer (génération), rien n'y est écrit."""
     try:
         base = ensure_dir(resolve_dir(env))
     except AgentError as e:
-        raise AgentError("copie de la clé impossible dans un tmpfs privé : %s ; rien importé" % e) from None
+        raise AgentError("%s impossible dans un tmpfs privé : %s ; %s" % (what, e, nothing)) from None
     except OSError as e:
-        raise AgentError("copie de la clé impossible dans un tmpfs privé (%s) : rien importé"
-                         % (e.strerror or e)) from None
+        raise AgentError("%s impossible dans un tmpfs privé (%s) : %s" % (what, e.strerror or e, nothing)) from None
     reap_stale(base)
     work, lock = None, None
     try:
         try:
             with _blocked():
-                work = tempfile.mkdtemp(prefix="%s%d." % (WORK_PREFIX, os.getpid()), dir=base)
+                work = tempfile.mkdtemp(prefix="%s%d." % (prefix, os.getpid()), dir=base)
                 lock = os.open(os.path.join(work, LOCK_NAME), os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                                0o600)
                 fcntl.flock(lock, fcntl.LOCK_EX)
         except OSError as e:
-            raise AgentError("copie de la clé impossible dans un tmpfs privé (%s) : rien importé"
-                             % (e.strerror or e)) from None
+            raise AgentError("%s impossible dans un tmpfs privé (%s) : %s" % (what, e.strerror or e, nothing)) from None
         try:
             check_private_tmpfs(work)
         except NotPrivateTmpfs as e:
-            raise AgentError("copie refusée : %s" % e) from None
+            raise AgentError("%s refusée : %s ; %s" % (what, e, nothing)) from None
         path = os.path.join(work, "key")
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        if data is not None:
             try:
-                view = memoryview(data)
-                while view:
-                    view = view[os.write(fd, view):]
-            finally:
-                os.close(fd)
-        except OSError as e:  # ENOSPC, EDQUOT…
-            raise AgentError("copie de la clé impossible dans un tmpfs privé (%s) : rien importé"
-                             % (e.strerror or e)) from None
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                try:
+                    view = memoryview(data)
+                    while view:
+                        view = view[os.write(fd, view):]
+                finally:
+                    os.close(fd)
+            except OSError as e:  # ENOSPC, EDQUOT…
+                raise AgentError("%s impossible dans un tmpfs privé (%s) : %s"
+                                 % (what, e.strerror or e, nothing)) from None
         yield path
     except BaseException:
         # erreur en cours : un échec du nettoyage n'est qu'un avertissement, l'erreur d'origine reste
@@ -600,3 +616,102 @@ def _rewritten(kf: KeyFile, data: Optional[bytes]) -> KeyFile:
     out = replace(kf, data=data, fmt="openssh", encrypted=False, key_type=key_type, blob=blob, bits=bits,
                   comment=comment)
     return out if kf.blob is not None else with_neighbor(out)
+
+
+# --- génération (story 7) ----------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Generated:
+    private_key: str     # texte OpenSSH en clair : en mémoire seulement, jamais affiché ni écrit
+    public_key: str      # `type base64 [commentaire]`
+    fingerprint: str
+    key_type: str
+    bits: int
+
+    def __repr__(self) -> str:  # jamais la clé privée dans une trace
+        return "Generated(%s, %s)" % (self.key_type, self.fingerprint)
+
+
+def check_comment(comment: str) -> str:
+    """Commentaire de clé : imprimable (aucun caractère de contrôle), 255 caractères au plus ;
+    sinon KeyRefused (code 2)."""
+    if len(comment) > MAX_COMMENT:
+        raise KeyRefused("commentaire trop long (%d caractères, %d au plus)" % (len(comment), MAX_COMMENT))
+    if not comment.isprintable():
+        raise KeyRefused("commentaire refusé : caractères imprimables seulement (ni tabulation, ni fin de ligne, "
+                         "ni contrôle)")
+    return comment
+
+
+def gen_spec(kind: str, bits: Optional[int]):
+    """(type OpenSSH, bits) d'une demande `--type/--bits` ; KeyRefused (code 2) sinon :
+    Ed25519 (défaut) ou RSA 3072/4096 (défaut 4096) ; ECDSA, DSA, `-sk` refusés."""
+    kind = "ed25519" if kind is None else kind.strip().lower()  # "" : refusé, pas le défaut
+    if kind not in GEN_TYPES:
+        raise KeyRefused("type %s refusé : ed25519 (défaut) ou rsa ; ECDSA, DSA et -sk ne sont pas pris en charge "
+                         "par les clients Bitwarden" % _clean(kind))
+    if kind == "ed25519":
+        if bits is not None:
+            raise KeyRefused("--bits ne vaut que pour --type rsa (Ed25519 : 256 bits, fixe)")
+        return GEN_TYPES[kind], 256
+    if bits is None:
+        bits = DEFAULT_RSA_BITS
+    if bits not in RSA_BITS:
+        raise KeyRefused("RSA de %d bits refusée : %s" % (bits, " ou ".join(map(str, RSA_BITS))))
+    return GEN_TYPES[kind], bits
+
+
+def check_workspace(env=None) -> str:
+    """Tmpfs privé de la génération utilisable (règles de la 0.1.0), dossier `sshvault/` compris
+    (créé en 0700 au besoin, comme le ferait la génération) ? Vérifié avant tout accès au
+    coffre ; AgentError (code 4) sinon."""
+    try:
+        base = ensure_dir(resolve_dir(env))
+        check_private_tmpfs(base)
+        return base
+    except AgentError as e:
+        raise AgentError("génération impossible : %s ; rien généré" % e) from None
+    except NotPrivateTmpfs as e:
+        raise AgentError("génération impossible : %s ; rien généré" % e) from None
+    except OSError as e:
+        raise AgentError("génération impossible : dossier sshvault du tmpfs privé inutilisable (%s) ; rien généré"
+                         % (e.strerror or e)) from None
+
+
+def generate(kind: str, bits: Optional[int], comment: str, env=None) -> Generated:
+    """Nouvelle clé sans passphrase, générée par `ssh-keygen` dans un sous-dossier neuf du tmpfs
+    privé (`private_copy`), relue en mémoire puis supprimée sur tous les chemins. La clé
+    publique (`key.pub`) est vérifiée contre l'en-tête de la clé privée."""
+    key_type, bits = gen_spec(kind, bits)
+    comment = check_comment(comment).strip()
+    args = ["-t", key_type[len("ssh-"):]] + (["-b", str(bits)] if key_type == "ssh-rsa" else [])
+    with private_copy(None, env, prefix=GEN_PREFIX, what="génération de la clé", nothing="rien généré") as path:
+        keygen(args + ["-q", "-N", "", "-C", comment, "-f", path], env=env, timeout=GEN_TIMEOUT)
+        data = read_private(path)
+        try:
+            pub_text = read_file(path + ".pub").decode("utf-8")  # commentaire : UTF-8 possible
+        except (KeyRefused, UnicodeDecodeError) as e:
+            raise KeyToolError("ssh-keygen : clé publique générée illisible (%s)" % e) from None
+    if data is None:
+        raise KeyToolError("ssh-keygen : clé privée générée illisible (fichier absent ou droits inattendus)")
+    try:
+        fmt, _, raw = detect(data)
+        if fmt != "openssh":
+            raise KeyRefused("format %s" % fmt)
+        encrypted, pub, priv = parse_openssh(raw)
+        if encrypted:
+            raise KeyRefused("chiffrée")
+        got_type, got_bits, parts = describe_blob(pub)
+        got_comment = private_comment(got_type, parts, priv)
+    except (KeyRefused, ValueError, UnicodeDecodeError) as e:
+        raise KeyToolError("ssh-keygen : clé privée générée illisible (%s)" % e) from None
+    blob = base64.b64encode(pub).decode()
+    fields = pub_text.strip().split(None, 2)
+    if len(fields) < 2 or fields[0] != got_type or fields[1] != blob:
+        raise KeyToolError("ssh-keygen : la clé publique générée ne correspond pas à la clé privée")
+    if got_type != key_type or got_bits != bits:
+        raise KeyToolError("ssh-keygen : clé générée inattendue (%s, %s bits)" % (_clean(got_type), got_bits))
+    if got_comment != comment:
+        raise KeyToolError("ssh-keygen : commentaire de la clé générée inattendu")
+    public = "%s %s%s" % (got_type, blob, " " + comment if comment else "")
+    return Generated(data.decode("ascii"), public, fingerprint(blob), got_type, bits)

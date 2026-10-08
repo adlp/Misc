@@ -1,5 +1,63 @@
 # Changelog — sshvault
 
+## sshvault 0.6.0 — Génération d'une clé dans le coffre — 2026-10-08
+
+- `sshvault generate --name NOM [--type ed25519|rsa] [--bits 3072|4096] [--comment TEXTE]
+  [--hosts HÔTE,…] [--force]` : nouvelle clé générée par
+  `ssh-keygen -q -t <type> [-b <bits>] -N "" -C <commentaire> -f <dossier>/key` dans un
+  sous-dossier 0700 neuf du tmpfs privé (mêmes règles que la copie de l'import : tmpfs
+  vérifié, verrou `flock`, suppression sur tous les chemins, signaux masqués pendant la
+  suppression, orphelin `generate.<pid>.*` récupéré). La clé privée est relue en mémoire,
+  jamais écrite par sshvault sur disque persistant (limites : swap d'un tmpfs, copies en mémoire
+  du processus jusqu'à sa fin), affichée ni passée en argument ; l'élément est créé
+  par le chemin de l'import (stdin, reprise sans doublon, relecture, trois champs `sshKey`).
+- Ed25519 par défaut ; RSA 3072 ou 4096 (défaut 4096) ; toute autre valeur (ECDSA, DSA,
+  `-sk`, `--bits 1024`, `--bits` avec Ed25519) : code 2 avant toute génération. Sans
+  passphrase (le coffre chiffre déjà la clé).
+- stdout ne contient que la clé publique, une ligne au format OpenSSH ; tout le reste sur
+  stderr (la régénération du `ssh_config` y écrit aussi son compte rendu). Nom déjà porté par
+  une clé du coffre : code 1, rien généré, sauf `--force`. Commentaire (défaut : le nom) :
+  imprimable, 255 caractères au plus.
+- Ordre des contrôles : usage (2), tmpfs privé (4), prérequis du `ssh_config` (4), coffre
+  (3), nom (1), puis seulement la génération. Création non aboutie : code 4, le message dit
+  que la clé générée est perdue (jamais écrite sur disque). Interruption : code 130, dossier
+  supprimé ; pendant la création, « création peut-être passée ».
+- `sshvault pubkey (SÉLECTION | --all)` : une ligne de clé publique par clé sélectionnée,
+  rien d'autre sur stdout ; cache local de `bw`, aucun appel réseau ; commentaire avec
+  caractère de contrôle retiré ; clé publique illisible : message, code 4.
+- `sshvault deploy SÉLECTION [UTILISATEUR@]HÔTE [-p PORT] [-- OPTIONS_SSH…]` : ajoute les clés
+  publiques sélectionnées à `~/.ssh/authorized_keys` de la cible par un seul `ssh` (clés sur
+  stdin, commande distante fixe `exec sh -c '…'` sans donnée de l'utilisateur, `umask 077`,
+  `~/.ssh` 0700 et `authorized_keys` 0600 créés au besoin, ajout seulement si type + base64
+  absents, lignes commentées ignorées) ; « ajoutée » ou « déjà présente », une ligne par clé ;
+  idempotent. Cible validée (lettres, chiffres, `.`, `-`, `_`, IPv6 entre crochets ; code 2
+  sinon), options ssh passées en arguments séparés, sans shell local (seules des options de
+  `ssh` acceptées après `--`), `--nointeraction` → `-o BatchMode=yes`. `ssh` en échec :
+  code 4 avec son message. Variable `SSHVAULT_SSH`.
+- `deploy`, durcissements : options qui changent le mode de `ssh` refusées (`-N -n -f -G -V
+  -Q -O -W -s -M -t`, `-o RequestTTY/StdinNull/SessionType/ForkAfterAuthentication/
+  RemoteCommand/LocalCommand/PermitLocalCommand/ProxyUseFdpass`) ; `-o ConnectTimeout=30`
+  ajouté sauf s'il est donné ; délai global `SSHVAULT_DEPLOY_TIMEOUT` (120 s, ssh arrêté par
+  TERM puis KILL, code 4) ; échec partiel : clés déjà ajoutées dites, puis code 4 ; IPv6 entre
+  crochets passée sans crochets à ssh, IPv6 nue validée (`cafe:22` refusé) ; script distant :
+  CRLF reconnu, « déjà présente (avec options…) », verrou `~/.ssh/.sshvault-deploy.lock`,
+  `restorecon -F` si présent, aucun `!` ; type de clé hors `ssh-*`/`ecdsa-*`/`sk-*` refusé
+  localement (les autres clés déployées).
+- `generate` : prérequis (dossier `sshvault/` du tmpfs, chemins du `ssh_config`) vérifiés avant
+  le coffre ; avertissement attrape-tout une seule fois, après le contrôle du nom ; session
+  refusée à la création : « clé perdue » dit aussi ; interruption ou sortie fermée après la
+  création : « clé créée : « nom » id » (et « ssh_config non régénéré » au besoin) ; `--type ""`
+  refusé. Limites documentées (swap d'un tmpfs, copies en mémoire du processus).
+- Intégration : purge de tous les éléments `sshvault-test-run` au début et à la fin ; `sync` et
+  `delete` retentés après une panne réseau passagère.
+- `private_copy` : dossier sans données (génération), préfixe et messages paramétrés ;
+  `reap_stale` récupère aussi `generate.<pid>.*`. Message « élément relu différent » : « avant
+  de relancer la commande » (import et generate).
+- Tests : `tests/test_generate.py` (matrice de la story, sshd de test à HOME de test,
+  connexion avec la clé déployée, script distant sous sh/dash/bash, argv contrôlé après coup
+  contre la clé générée) ; `ArgvWatch(keep_all=True)` ; intégration : `generate` relue par
+  un second client `bw`, `pubkey`, `load`, `ssh -G`.
+
 ## sshvault 0.5.0 — Import d'une clé existante — 2026-10-07
 
 - `sshvault import FICHIER… [--name NOM] [--hosts HÔTE,…] [--force] [--decrypt]` : chaque
