@@ -32,7 +32,8 @@ prend tous. Avec plusieurs serveurs, la même commande est envoyée à chacun
 en parallèle (une connexion par serveur) et les réponses sont réunies.
 
 Actions : list (connexions, durée, octets, débit en --watch), kill (par
-nom, adresse, IP VPN ou CID, RESTART ou HALT), info, log (--follow),
+nom, adresse, IP VPN ou CID, RESTART ou HALT), killban / unban / bans
+(interdire un client jusqu'à nouvel ordre), info, log (--follow),
 verb, mute, signal, hold, raw (commande brute) et shell (interactif).
 """
 
@@ -53,7 +54,9 @@ import tempfile
 import threading
 import time
 
-Version="1.2"
+Version="1.3"
+# 1.3 killban / unban / bans : "disable" marque ovpnMgmt dans le fichier client-config-dir du client (connecte ou
+#     non), coupure HALT des connexions bannies ; list --offline montre "banni le ..."
 # 1.2 list --offline : utilisateurs connus non connectes, d'apres la configuration OpenVPN (openvpn_config) :
 #     index.txt de la PKI, client-config-dir, ifconfig-pool-persist ; lue via ssh ou en local, sudo possible
 # 1.1 plusieurs serveurs a la fois (-s a,b / -s a -s b / -a, ou default = a, b) : connexions et commandes en
@@ -705,6 +708,34 @@ def certCommonName(pem):
     return(match.group(1) if match else None)
 
 
+def openvpnLayout(server, purpose):
+    """Lit la configuration OpenVPN du serveur (openvpn_config) ; renvoie {local, configPath, directives, inline, resolve}.
+
+    local : fichiers lus sur cette machine ("local:/chemin", ou serveur sans
+    ssh), sinon sur la machine ssh. resolve(chemin) : chemin d'une directive,
+    les relatifs par rapport à "cd", sinon au répertoire de la configuration
+    (WorkingDirectory de systemd).
+    """
+    if not server.openvpnConfig:
+        raise ManagementError(f"[{server.name}] {purpose} : ajouter openvpn_config (configuration du serveur OpenVPN)")
+    local=server.openvpnConfig.startswith('local:')
+    configPath=server.openvpnConfig[len('local:'):] if local else server.openvpnConfig
+    if local or not server.ssh:
+        configPath=os.path.expanduser(configPath)
+        local=True
+    where="cette machine" if local else server.ssh
+    files,_=readFiles(server,[('config',configPath)],None,local)
+    rc,text=files.get('config',(None,''))
+    if rc != 0:
+        raise ManagementError(f"[{server.name}] configuration OpenVPN illisible ({configPath} sur {where}) : {text or 'pas de réponse'}")
+    directives,inline=parseOpenvpnConfig(text)
+    base=posixpath.dirname(configPath)
+    if directives.get('cd'):
+        base=posixpath.join(base,directives['cd'][0])
+    return({'local':local,'configPath':configPath,'directives':directives,'inline':inline,
+            'resolve':lambda path: posixpath.normpath(posixpath.join(base,path))})
+
+
 def knownUsers(server):
     """Utilisateurs connus d'un serveur, d'après la configuration OpenVPN (openvpn_config).
 
@@ -717,24 +748,8 @@ def knownUsers(server):
     Le CN du certificat du serveur ("cert") est retiré de la liste.
     Renvoie {'users': {cn: infos}, 'ignored': nombre, 'notes': [textes]}.
     """
-    if not server.openvpnConfig:
-        raise ManagementError(f"[{server.name}] --offline : ajouter openvpn_config (configuration du serveur OpenVPN)")
-    local=server.openvpnConfig.startswith('local:')
-    configPath=server.openvpnConfig[len('local:'):] if local else server.openvpnConfig
-    if local or not server.ssh:
-        configPath=os.path.expanduser(configPath)
-        local=True
-    where="cette machine" if local else server.ssh
-    files,_=readFiles(server,[('config',configPath)],None,local)
-    rc,text=files.get('config',(None,''))
-    if rc != 0:
-        raise ManagementError(f"[{server.name}] configuration OpenVPN illisible ({configPath} sur {where}) : {text or 'pas de réponse'}")
-    directives,inline=parseOpenvpnConfig(text)
-    # Chemins relatifs : par rapport à "cd", sinon au répertoire de la configuration (WorkingDirectory de systemd)
-    base=posixpath.dirname(configPath)
-    if directives.get('cd'):
-        base=posixpath.join(base,directives['cd'][0])
-    resolve=lambda path: posixpath.normpath(posixpath.join(base,path))
+    layout=openvpnLayout(server,"--offline")
+    directives,inline,resolve,local=layout['directives'],layout['inline'],layout['resolve'],layout['local']
     notes=[]
     wanted=[]
     index=server.pkiIndex
@@ -758,7 +773,7 @@ def knownUsers(server):
 
     users={}
     def user(cn):
-        return(users.setdefault(cn,{'cn':cn,'sources':[],'ip':'','cert_expires':None,'disabled':False}))
+        return(users.setdefault(cn,{'cn':cn,'sources':[],'ip':'','cert_expires':None,'disabled':False,'banned':None}))
     ignored=set()
     now=time.time()
     if files.get('index',(1,))[0] == 0:
@@ -795,6 +810,8 @@ def knownUsers(server):
             info['sources'].append('ccd')
             ccdDirectives,_=parseOpenvpnConfig(content)
             info['disabled']='disable' in ccdDirectives
+            mark=re.search(r'^# ovpnMgmt ban (\S+ \S+)',content,re.M)
+            info['banned']=mark.group(1) if mark and info['disabled'] else None
             if ccdDirectives.get('ifconfig-push'):
                 info['ip']=ccdDirectives['ifconfig-push'][0]
     # Le certificat du serveur figure dans la PKI : ce n'est pas un utilisateur
@@ -830,7 +847,7 @@ def offlineRows(offline, multi):
         rows.append(([u['server']] if multi else [])+[
             u['cn'],u['ip'] or '-',
             time.strftime("%Y-%m-%d",time.localtime(u['cert_expires'])) if u['cert_expires'] else '-',
-            ','.join(u['sources']),"désactivé (ccd)" if u['disabled'] else ""])
+            ','.join(u['sources']),f"banni le {u['banned']}" if u['banned'] else "désactivé (ccd)" if u['disabled'] else ""])
     return(headers,rows)
 
 
@@ -925,7 +942,7 @@ def clientRows(clients, long, multi, rates=None):
     rows=[]
     for c in clients:
         row=[c['server']] if multi else []
-        row+=[c['cn'],c['real'],c['virtual'],humanDate(c['since']),humanDuration(c['duration']),
+        row+=[c['cn'],c['real'],c['virtual'] or c['virtual6'] or '-',humanDate(c['since']),humanDuration(c['duration']),
               humanBytes(c['rx']),humanBytes(c['tx'])]
         if rates is not None:
             rate=rates.get(serverClientKey(c))
@@ -1084,6 +1101,13 @@ def gatherKnown(mgmts):
     return(known,failed)
 
 
+def printPendingNote(clients):
+    """Note sous le tableau quand des connexions n'ont pas (encore) d'IP VPN."""
+    if any(not c['virtual'] and not c['virtual6'] for c in clients):
+        print("IP VPN « - » : connexion en cours d'établissement, ou refusée (ban, certificat...) ; "
+              "OpenVPN la retire de la liste sous quelques secondes")
+
+
 def printOffline(offline, known, multi):
     """Section des non connectés, sous le tableau des connexions."""
     ignored=sum(data['ignored'] for data in known.values())
@@ -1129,6 +1153,7 @@ def actionList(mgmts, args):
                 print(f"\n{len(clients)} connexion(s) ({counts}) ; reçu / envoyé : vus de chaque serveur")
             else:
                 print(f"\n{len(clients)} connexion(s) ; reçu / envoyé : vus du serveur")
+            printPendingNote(clients)
         if args.offline:
             printOffline(offline,known,multi)
         return(1 if failed else 0)
@@ -1151,6 +1176,7 @@ def actionList(mgmts, args):
             if clients:
                 headers,rows=clientRows(clients,args.long,multi,rates)
                 printTable(headers,rows)
+                printPendingNote(clients)
             else:
                 print("Aucune connexion active.")
             if args.offline:
@@ -1210,52 +1236,54 @@ def actionInfo(mgmts, args):
     return(1 if failed else 0)
 
 
-# Délai maximal d'attente de la fermeture effective d'une connexion coupée, en secondes
-KILL_WAIT=15
-
-def actionKill(mgmts, args):
-    """Coupe des connexions désignées par nom, adresse réelle (IP ou IP:port), IP VPN ou --cid, sur tous les serveurs.
-
-    Chaque connexion trouvée reçoit "client-kill CID RESTART|HALT" :
-    RESTART (défaut, comme "kill" d'OpenVPN) laisse le client se reconnecter,
-    HALT (--halt) lui demande de s'arrêter. Plus d'une connexion visée :
-    confirmation, sauf --yes. Les serveurs sont traités en parallèle.
-    """
-    if not args.targets and not args.cid:
-        raise ManagementError("kill : indiquer un nom, une adresse, une IP VPN ou --cid")
-    multi=len(mgmts) > 1
+def connectedClients(mgmts):
+    """Connexions de tous les serveurs, chacune marquée de son serveur ; renvoie (connexions, échecs)."""
     statuses,failed=gather(mgmts,lambda mgmt: mgmt.status()['clients'])
     everyone=[]
     for name,clients in statuses.items():
         for c in clients:
             c['server']=name
             everyone.append(c)
+    return(everyone,failed)
+
+
+def selectConnections(everyone, targets, cids):
+    """Connexions désignées par nom, adresse réelle (IP ou IP:port), IP VPN ou CID ; renvoie (connexions, cibles sans connexion).
+
+    Avec plusieurs serveurs, un CID peut exister sur chacun : tous sont visés.
+    Une connexion visée deux fois (nom et adresse) ne compte qu'une fois.
+    """
     selected=[]
-    for target in args.targets:
+    missing=[]
+    for target in targets:
         found=[c for c in everyone if target in (c['cn'],c['real'],realIp(c['real']),c['virtual'],c['virtual6'])]
         if not found:
-            print(f"Aucune connexion ne correspond à « {target} ».",file=sys.stderr)
+            missing.append(target)
         selected+=found
-    for cid in args.cid or []:
-        # Avec plusieurs serveurs, un CID peut exister sur chacun : tous sont visés (et la confirmation les montre)
+    for cid in cids or []:
         found=[c for c in everyone if c['cid'] == cid]
         if not found:
-            print(f"Aucune connexion de CID {cid}.",file=sys.stderr)
+            missing.append(f"CID {cid}")
         selected+=found
-    # Une connexion visée deux fois (nom et adresse) n'est coupée qu'une fois
-    selected=list({serverClientKey(c):c for c in selected}.values())
-    if not selected:
-        return(1)
-    message="HALT" if args.halt else "RESTART"
-    describe=lambda c: (f"{c['server']} : " if multi else "")+f"{c['cn']} ({c['real']}, IP VPN {c['virtual'] or '-'}, CID {c['cid']})"
-    if len(selected) > 1 and not args.yes:
-        print(f"{len(selected)} connexions vont être coupées ({message}) :")
-        for c in selected:
-            print(f"  {describe(c)}")
-        if not confirm("Confirmer ?"):
-            print("Abandon, rien n'a été coupé.")
-            return(1)
+    return(list({serverClientKey(c):c for c in selected}.values()),missing)
 
+
+def describeClient(client, multi):
+    """Connexion en une ligne : [serveur : ]nom (adresse, IP VPN, CID)."""
+    return((f"{client['server']} : " if multi else "")+
+           f"{client['cn']} ({client['real']}, IP VPN {client['virtual'] or '-'}, CID {client['cid']})")
+
+
+# Délai maximal d'attente de la fermeture effective d'une connexion coupée, en secondes
+KILL_WAIT=15
+
+def killSelected(mgmts, selected, message, multi):
+    """Envoie "client-kill CID RESTART|HALT" aux connexions choisies, serveurs en parallèle ; renvoie (fermées, échecs).
+
+    OpenVPN ferme l'instance quelques secondes après la commande (sortie
+    différée) : "Coupée" n'est annoncé qu'une fois la connexion sortie de la
+    liste, au plus KILL_WAIT secondes après.
+    """
     def killOn(mgmt):
         """Coupe les connexions choisies sur un serveur ; renvoie (fermées, échecs)."""
         pending=[]
@@ -1270,15 +1298,13 @@ def actionKill(mgmts, args):
                 pending.append(c)
             else:
                 errors+=1
-                say(f"Échec pour {describe(c)} : {' '.join(lines)}",file=sys.stderr)
-        # OpenVPN ferme l'instance quelques secondes après la commande (sortie différée) :
-        # "Coupée" n'est annoncé qu'une fois la connexion sortie de la liste
+                say(f"Échec pour {describeClient(c,multi)} : {' '.join(lines)}",file=sys.stderr)
         deadline=time.monotonic()+KILL_WAIT
         closed=0
         while pending:
             present={clientKey(c) for c in mgmt.status()['clients']}
             for c in [c for c in pending if clientKey(c) not in present]:
-                say(f"Coupée ({message}) : {describe(c)}")
+                say(f"Coupée ({message}) : {describeClient(c,multi)}")
                 pending.remove(c)
                 closed+=1
             if not pending or time.monotonic() > deadline:
@@ -1286,16 +1312,258 @@ def actionKill(mgmts, args):
             time.sleep(0.5)
         for c in pending:
             errors+=1
-            say(f"Commande acceptée, mais toujours listée après {KILL_WAIT} s : {describe(c)}",file=sys.stderr)
+            say(f"Commande acceptée, mais toujours listée après {KILL_WAIT} s : {describeClient(c,multi)}",file=sys.stderr)
         return(closed,errors)
 
     targets={name:mgmt for name,mgmt in mgmts.items() if any(c['server'] == name for c in selected)}
     results,serverErrors=gather(targets,killOn)
-    closed=sum(r[0] for r in results.values())
-    errors=sum(r[1] for r in results.values())+serverErrors
+    return(sum(r[0] for r in results.values()),sum(r[1] for r in results.values())+serverErrors)
+
+
+def actionKill(mgmts, args):
+    """Coupe des connexions désignées par nom, adresse réelle (IP ou IP:port), IP VPN ou --cid, sur tous les serveurs.
+
+    Chaque connexion trouvée reçoit "client-kill CID RESTART|HALT" :
+    RESTART (défaut, comme "kill" d'OpenVPN) laisse le client se reconnecter,
+    HALT (--halt) lui demande de s'arrêter. Plus d'une connexion visée :
+    confirmation, sauf --yes. Les serveurs sont traités en parallèle.
+    """
+    if not args.targets and not args.cid:
+        raise ManagementError("kill : indiquer un nom, une adresse, une IP VPN ou --cid")
+    multi=len(mgmts) > 1
+    everyone,failed=connectedClients(mgmts)
+    selected,missing=selectConnections(everyone,args.targets,args.cid)
+    for target in missing:
+        print(f"Aucune connexion ne correspond à « {target} ».",file=sys.stderr)
+    if not selected:
+        return(1)
+    message="HALT" if args.halt else "RESTART"
+    if len(selected) > 1 and not args.yes:
+        print(f"{len(selected)} connexions vont être coupées ({message}) :")
+        for c in selected:
+            print(f"  {describeClient(c,multi)}")
+        if not confirm("Confirmer ?"):
+            print("Abandon, rien n'a été coupé.")
+            return(1)
+    closed,errors=killSelected(mgmts,selected,message,multi)
     if message == "RESTART" and closed:
         print("RESTART : le client va se reconnecter (sous un nouveau CID) ; --halt pour l'arrêter.")
-    return(1 if errors or failed else 0)
+    return(1 if errors or failed or missing else 0)
+
+
+################################################################################
+# Bannissement : "disable" dans le fichier client-config-dir du client
+################################################################################
+
+# Ligne posée au-dessus du "disable" : unban ne retire que ce qui porte cette marque
+BAN_MARK="# ovpnMgmt ban"
+BAN_CREATED="(fichier créé par ovpnMgmt)"
+
+def ccdFileName(cn):
+    """Nom du fichier ccd d'un client, comme OpenVPN le cherche : caractères hors [A-Za-z0-9_.@-] remplacés par '_'."""
+    name=re.sub(r'[^A-Za-z0-9_.@-]','_',cn)
+    if name in ('','.','..'):
+        raise ManagementError(f"nom de client inutilisable comme fichier ccd : « {cn} »")
+    return(name)
+
+
+def ccdDirectory(server, purpose):
+    """Répertoire client-config-dir du serveur et lieu de lecture : (chemin, local).
+
+    Sans client-config-dir dans la configuration OpenVPN, rien ne permet de
+    bannir sans modifier cette configuration et redémarrer le serveur : refus.
+    """
+    layout=openvpnLayout(server,purpose)
+    if not layout['directives'].get('client-config-dir'):
+        raise ManagementError(f"[{server.name}] {purpose} : la configuration OpenVPN ({layout['configPath']}) n'a pas de "
+                              f"client-config-dir ; l'ajouter (et redémarrer le serveur) pour pouvoir bannir")
+    return(layout['resolve'](layout['directives']['client-config-dir'][0]),layout['local'])
+
+
+# Script lancé là où tourne OpenVPN (sudo -n au besoin) : $1 répertoire ccd, $2 ban|unban|list, $3 marque, puis les fichiers.
+# Réponses : "fichier<TAB>ETAT<TAB>détail", ou "@ERR<TAB>message".
+BAN_SCRIPT=r'''
+d=$1; mode=$2; mark=$3; shift 3
+[ -d "$d" ] || { printf '@ERR\trépertoire client-config-dir absent : %s\n' "$d"; exit 0; }
+isdisabled() { grep -q '^[[:space:]]*disable[[:space:]]*$' "$1"; }
+ours() { grep -q '^# ovpnMgmt ban ' "$1"; }
+if [ "$mode" = list ]; then
+    for f in "$d"/*; do
+        [ -f "$f" ] && isdisabled "$f" || continue
+        printf '%s\tBANNED\t%s\n' "${f##*/}" "$(grep -m1 '^# ovpnMgmt ban ' "$f")"
+    done
+    exit 0
+fi
+for n in "$@"; do
+    f="$d/$n"
+    case $mode in
+    ban)
+        if [ -f "$f" ] && isdisabled "$f"; then
+            if ours "$f"; then printf '%s\tALREADY\tovpnMgmt\n' "$n"; else printf '%s\tALREADY\tmanual\n' "$n"; fi
+            continue
+        fi
+        created=""
+        [ -e "$f" ] || created=" (fichier créé par ovpnMgmt)"
+        # Dernière ligne sans fin de ligne : en ajouter une, sinon la marque s'y collerait
+        if [ -s "$f" ] && [ -n "$(tail -c1 "$f")" ]; then echo >> "$f"; fi
+        if { printf '%s%s\n' "$mark" "$created"; echo disable; } >> "$f" 2>/dev/null; then
+            [ -n "$created" ] && chmod 644 "$f"
+            printf '%s\tOK\t\n' "$n"
+        else
+            printf '%s\tERR\técriture impossible : %s\n' "$n" "$f"
+        fi
+        ;;
+    unban)
+        if [ ! -f "$f" ] || ! ours "$f"; then
+            if [ -f "$f" ] && isdisabled "$f"; then printf '%s\tMANUAL\t\n' "$n"; else printf '%s\tNOTBANNED\t\n' "$n"; fi
+            continue
+        fi
+        tmp=$(mktemp "$f.XXXXXX") || { printf '%s\tERR\tfichier temporaire impossible dans %s\n' "$n" "$d"; continue; }
+        # Retire chaque marque ovpnMgmt et le "disable" qui la suit, rien d'autre
+        awk '/^# ovpnMgmt ban / {m=1; next} m && /^[ \t]*disable[ \t]*$/ {m=0; next} {m=0; print}' "$f" > "$tmp"
+        if grep -q '^# ovpnMgmt ban .*(fichier créé par ovpnMgmt)' "$f" && ! grep -q '[^[:space:]]' "$tmp"; then
+            rm -f "$tmp" "$f"
+            printf '%s\tOK\tremoved\n' "$n"
+        elif cat "$tmp" > "$f"; then
+            rm -f "$tmp"
+            if isdisabled "$f"; then printf '%s\tMANUAL\t\n' "$n"; else printf '%s\tOK\t\n' "$n"; fi
+        else
+            rm -f "$tmp"
+            printf '%s\tERR\tréécriture impossible : %s\n' "$n" "$f"
+        fi
+        ;;
+    esac
+done
+'''
+
+def runBanScript(server, purpose, mode, files):
+    """Lance BAN_SCRIPT sur le serveur ; renvoie {fichier: (état, détail)}.
+
+    La marque porte la date et l'auteur (utilisateur@machine de ovpnMgmt).
+    """
+    ccdDir,local=ccdDirectory(server,purpose)
+    mark=f"{BAN_MARK} {time.strftime('%Y-%m-%d %H:%M:%S')} par {os.environ.get('USER','?')}@{socket.gethostname()}"
+    run='sudo -n ' if server.sudo else ''
+    script=f"{run}sh -c {shlex.quote(BAN_SCRIPT)} sh {shlex.quote(ccdDir)} {mode} {shlex.quote(mark)} "+' '.join(shlex.quote(f) for f in files)
+    output=runFileScript(server,script,local)
+    results={}
+    for line in output.split('\n'):
+        fields=line.split('\t')
+        if fields[0] == '@ERR':
+            raise ManagementError(f"[{server.name}] {fields[1] if len(fields) > 1 else 'erreur'}")
+        if len(fields) >= 2:
+            results[fields[0]]=(fields[1],fields[2] if len(fields) > 2 else '')
+    if mode != 'list':
+        for name in files:
+            if name not in results:
+                # sudo qui demande un mot de passe, droits... : la sortie brute dit pourquoi
+                raise ManagementError(f"[{server.name}] {purpose} sans réponse pour « {name} » dans {ccdDir} : "
+                                      f"{output.strip() or 'aucune sortie'}"+(" (sudo = yes ?)" if not server.sudo else ""))
+    return(results)
+
+
+def nameTargets(everyone, args):
+    """Noms (CN) à bannir : cibles qui désignent une connexion (nom, adresse, IP VPN, CID) → son nom ; sinon la cible est prise comme un nom.
+
+    Une adresse ou un CID sans connexion ne désigne aucun nom : erreur.
+    """
+    names=[]
+    for target in args.targets:
+        selected,missing=selectConnections(everyone,[target],None)
+        if selected:
+            names+=[c['cn'] for c in selected]
+        elif re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}(:\d+)?',target) or (':' in target and re.fullmatch(r'\[?[0-9a-fA-F:]+\]?(:\d+)?',target)):
+            raise ManagementError(f"« {target} » ressemble à une adresse sans connexion : pour un client absent, donner son nom")
+        else:
+            names.append(target)
+    for cid in args.cid or []:
+        selected,missing=selectConnections(everyone,[],[cid])
+        if missing:
+            raise ManagementError(f"aucune connexion de CID {cid}")
+        names+=[c['cn'] for c in selected]
+    return(list(dict.fromkeys(names)))
+
+
+def actionKillban(mgmts, args):
+    """Bannit des clients puis coupe leurs connexions (HALT) : ils ne peuvent plus se connecter jusqu'au unban.
+
+    Le bannissement est un "disable" (précédé d'une marque ovpnMgmt) dans le
+    fichier client-config-dir de chaque nom, sur chaque serveur traité,
+    connecté ou non : OpenVPN relit ce fichier à chaque connexion, rien à
+    redémarrer. Le ban est posé avant la coupure, pour que la reconnexion
+    soit refusée. Plus d'un nom : confirmation, sauf --yes.
+    """
+    if not args.targets and not args.cid:
+        raise ManagementError("killban : indiquer un nom, une adresse, une IP VPN ou --cid")
+    multi=len(mgmts) > 1
+    everyone,failed=connectedClients(mgmts)
+    names=nameTargets(everyone,args)
+    if len(names) > 1 and not args.yes:
+        print(f"{len(names)} clients vont être bannis sur {', '.join(mgmts)} et leurs connexions coupées : {', '.join(names)}")
+        if not confirm("Confirmer ?"):
+            print("Abandon, rien n'a été fait.")
+            return(1)
+    files={name:ccdFileName(name) for name in names}
+    results,banFailed=gather(mgmts,lambda mgmt: runBanScript(mgmt.server,"killban",'ban',list(files.values())))
+    errors=failed+banFailed
+    banned=set()
+    for server,result in results.items():
+        for name,fileName in files.items():
+            state,detail=result[fileName]
+            where=f"{server} : " if multi else ""
+            if state == 'OK':
+                print(f"Banni : {where}{name}")
+                banned.add((server,name))
+            elif state == 'ALREADY':
+                print(f"Déjà banni : {where}{name}"+(" (disable posé à la main, hors ovpnMgmt)" if detail == 'manual' else ""))
+                banned.add((server,name))
+            else:
+                errors+=1
+                print(f"Échec du ban : {where}{name} : {detail}",file=sys.stderr)
+    # Coupure (HALT) des connexions des noms bannis, seulement là où le ban est en place
+    selected=[c for c in everyone if (c['server'],c['cn']) in banned]
+    if selected:
+        _,killErrors=killSelected(mgmts,selected,"HALT",multi)
+        errors+=killErrors
+    return(1 if errors else 0)
+
+
+def actionUnban(mgmts, args):
+    """Lève les bans posés par ovpnMgmt (marque + disable) ; un "disable" posé à la main n'est pas touché."""
+    multi=len(mgmts) > 1
+    files={name:ccdFileName(name) for name in dict.fromkeys(args.names)}
+    results,errors=gather(mgmts,lambda mgmt: runBanScript(mgmt.server,"unban",'unban',list(files.values())))
+    for server,result in results.items():
+        for name,fileName in files.items():
+            state,detail=result[fileName]
+            where=f"{server} : " if multi else ""
+            if state == 'OK':
+                print(f"Débanni : {where}{name}"+(" (fichier ccd créé par le ban, supprimé)" if detail == 'removed' else ""))
+            elif state == 'NOTBANNED':
+                print(f"Pas banni : {where}{name}")
+            elif state == 'MANUAL':
+                errors+=1
+                print(f"Toujours désactivé : {where}{name} : « disable » posé hors ovpnMgmt dans son fichier ccd, non retiré",file=sys.stderr)
+            else:
+                errors+=1
+                print(f"Échec du unban : {where}{name} : {detail}",file=sys.stderr)
+    return(1 if errors else 0)
+
+
+def actionBans(mgmts, args):
+    """Clients désactivés ("disable" dans leur fichier ccd) sur chaque serveur : par ovpnMgmt (date, auteur) ou à la main."""
+    multi=len(mgmts) > 1
+    results,errors=gather(mgmts,lambda mgmt: runBanScript(mgmt.server,"bans",'list',[]))
+    rows=[]
+    for server,result in results.items():
+        for fileName,(_,mark) in sorted(result.items()):
+            origin=mark[len(BAN_MARK):].replace(BAN_CREATED,'').strip() if mark.startswith(BAN_MARK) else "à la main (hors ovpnMgmt)"
+            rows.append(([server] if multi else [])+[fileName,origin])
+    if rows:
+        printTable((["Serveur"] if multi else [])+["Client","Banni"],rows)
+    else:
+        print("Aucun client banni.")
+    return(1 if errors else 0)
 
 
 LOG_FLAGS={'I':'info','F':'FATAL','N':'erreur','W':'avert.','D':'debug'}
@@ -1496,6 +1764,16 @@ def buildParser():
     p.add_argument('--halt',action='store_true',help="demande au client de s'arrêter (défaut : RESTART, il se reconnecte)")
     p.add_argument('-y','--yes',action='store_true',help="pas de confirmation quand plusieurs connexions sont visées")
 
+    p=sub.add_parser('killban',help="bannit des clients, connectés ou non, et coupe leurs connexions (jusqu'au unban)")
+    p.add_argument('targets',nargs='*',metavar='CIBLE',help="nom (CN), ou adresse / IP VPN d'une connexion en cours")
+    p.add_argument('--cid',type=int,action='append',help="identifiant de connexion (colonne CID), répétable")
+    p.add_argument('-y','--yes',action='store_true',help="pas de confirmation quand plusieurs clients sont visés")
+
+    p=sub.add_parser('unban',help="lève un bannissement posé par killban")
+    p.add_argument('names',nargs='+',metavar='NOM',help="nom (CN) du client")
+
+    sub.add_parser('bans',help="clients bannis (killban) ou désactivés à la main")
+
     p=sub.add_parser('log',help="dernières lignes du log du serveur")
     p.add_argument('lines',nargs='?',default='20',help="nombre de lignes, all, ou 0 pour aucune (avec -f) ; défaut : 20")
     p.add_argument('-f','--follow',action='store_true',help="puis suit le log en temps réel")
@@ -1537,7 +1815,7 @@ def main():
         args=parser.parse_args(sys.argv[1:]+['list'])
     if args.action == 'ls':
         args.action='list'
-    actions={'list':actionList,'info':actionInfo,'kill':actionKill,'log':actionLog,'verb':actionLevel,
+    actions={'list':actionList,'info':actionInfo,'kill':actionKill,'killban':actionKillban,'unban':actionUnban,'bans':actionBans,'log':actionLog,'verb':actionLevel,
              'mute':actionLevel,'signal':actionSignal,'hold':actionHold,'raw':actionRaw,'shell':actionShell}
     mgmts={}
     try:
@@ -1547,7 +1825,11 @@ def main():
         chosen=pickServers(servers,defaults,args.server,args.all)
         if args.action == 'shell' and len(chosen) > 1:
             raise ManagementError(f"shell : un seul serveur à la fois (demandés : {', '.join(s.name for s in chosen)}), choisir avec -s")
-        mgmts,failed=openAll(chosen,args.debug)
+        if args.action in ('unban','bans'):
+            # Fichiers ccd seulement : le management n'est pas ouvert (il peut être occupé ou arrêté)
+            mgmts,failed={server.name:Management(server,debug=args.debug) for server in chosen},0
+        else:
+            mgmts,failed=openAll(chosen,args.debug)
         if not mgmts:
             return(1)
         status=actions[args.action](mgmts,args)

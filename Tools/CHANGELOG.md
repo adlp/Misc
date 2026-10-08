@@ -1,5 +1,22 @@
 # Changelog — Tools
 
+## ovpnMgmt 1.3 — killban, unban, bans — 2026-10-08
+
+- **`killban CIBLE…`** : bannit des clients, connectés ou non, puis coupe leurs connexions en HALT. Le ban est un
+  `disable` précédé d'une marque ovpnMgmt (date, auteur) dans le fichier `client-config-dir` du client, relu par
+  OpenVPN à chaque connexion : le client est refusé (`AUTH_FAILED`) jusqu'au `unban`, sans redémarrer le serveur. Cible
+  par nom, ou par adresse / IP VPN / `--cid` d'une connexion en cours ; ban posé avant la coupure, sur chaque serveur
+  traité ; confirmation au-delà d'un nom. Répertoire ccd déduit d'`openvpn_config` ; refus explicite sans
+  `client-config-dir`. Écriture par `sudo -n` avec `sudo = yes`.
+- **`unban NOM…`** : retire seulement les lignes marquées par ovpnMgmt ; fichier créé par le ban supprimé ; `disable`
+  posé à la main gardé et signalé.
+- **`bans`** : clients bannis (date, auteur) ou désactivés à la main. `unban` et `bans` n'ouvrent pas le management.
+- `list -o` : état « banni le … » ; `list` : IP VPN `-` et une note pour une connexion sans IP (en cours ou refusée,
+  qu'OpenVPN retire sous quelques secondes).
+- Testé sur OpenVPN 2.5.11 réel : client banni refusé à la reconnexion (« rejected due to 'disable' directive »,
+  client arrêté sur `AUTH_FAILED`), revenu après `unban` ; ban d'absents (fichier créé, fichier existant sans fin de
+  ligne), `disable` manuel respecté, ban et unban via ssh avec sudo, serveur sans `client-config-dir` refusé.
+
 ## ovpnMgmt 1.2 — utilisateurs non connectés — 2026-10-07
 
 - **`list --offline` (`-o`)** : table « Non connectés » sous les connexions (nom, IP réservée, fin du certificat,

@@ -26,7 +26,8 @@ password_file = ~/.config/ovpnMgmt/paris.pass
 # Configuration du serveur OpenVPN, lue sur la machine ssh (list --offline) : les utilisateurs connus en sont
 # déduits (index.txt de la PKI à côté de "ca", client-config-dir, ifconfig-pool-persist)
 openvpn_config = /etc/openvpn/server/server.conf
-# Ces fichiers sont souvent réservés à root : lecture par "sudo -n" (sudo sans mot de passe requis)
+# Ces fichiers sont souvent réservés à root : lecture (et écriture pour killban / unban, dans le
+# client-config-dir) par "sudo -n" (sudo sans mot de passe requis)
 sudo = yes
 
 [lyon]

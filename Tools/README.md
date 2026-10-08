@@ -6,7 +6,7 @@ Petits outils d'administration indépendants, sous licence GPL v3.
 |---|---|---|---|
 | `checkssl` | bash | 1.5 | État d'un certificat TLS (serveur ou fichier) et jours restants avant expiration |
 | `cronMutt` | Python 3 | 0.24.2 | Lance une commande (ou lit un pipe) et envoie sa sortie par mail (mutt) et/ou sur Nextcloud, selon le résultat |
-| `ovpnMgmt` | Python 3 | 1.2 | Pilote un ou plusieurs serveurs OpenVPN par leur management, en direct ou via ssh : connexions, coupure, log, signaux |
+| `ovpnMgmt` | Python 3 | 1.3 | Pilote un ou plusieurs serveurs OpenVPN par leur management, en direct ou via ssh : connexions, coupure, log, signaux |
 | `sleepUntil` | bash | 1.1 | Comme `at`, mais bloquant : attend une heure donnée puis lance une commande |
 | `whosshkey` | bash | 1.4 | Comme `last`, avec en plus la clef SSH utilisée pour chaque connexion |
 
@@ -161,7 +161,7 @@ ssh qui demandent un mot de passe en même temps se partagent le terminal.
 | `password_file` | Fichier dont la première ligne est le mot de passe du management | — |
 | `password` | Mot de passe en clair (préférer `password_file`) | — |
 | `timeout` | Délai de réponse, en secondes | 15 |
-| `openvpn_config` | Configuration du serveur OpenVPN, lue sur la machine ssh (`local:/chemin` : copie sur cette machine) ; sert à `list --offline` | — |
+| `openvpn_config` | Configuration du serveur OpenVPN, lue sur la machine ssh (`local:/chemin` : copie sur cette machine) ; sert à `list --offline`, `killban`, `unban`, `bans` | — |
 | `pki_index` | `index.txt` de la PKI, s'il n'est pas à côté du `ca` | à côté du `ca` |
 | `sudo` | `yes` : fichiers OpenVPN lus par `sudo -n` (sudo sans mot de passe) | `no` |
 
@@ -176,6 +176,9 @@ comptes est signalé.
 |---|---|
 | `list [filtre]` | Connexions actives : nom, adresse réelle, IP VPN, connecté depuis, durée, reçu, envoyé, CID. `--sort cn\|real\|virtual\|since\|rx\|tx`, `-r`, `-l` (utilisateur, IPv6, chiffrement, peer ID), `--json`, `-w SEC` (rafraîchi, avec le débit), `-o` (utilisateurs non connectés, voir plus bas) |
 | `kill CIBLE… [--cid N] [--halt] [-y]` | Coupe des connexions : nom, IP ou IP:port réelle, IP VPN, ou CID. `RESTART` par défaut (le client se reconnecte, comme `kill` d'OpenVPN), `--halt` lui demande de s'arrêter. Confirmation au-delà d'une connexion. « Coupée » n'est affiché qu'une fois la connexion sortie de la liste (OpenVPN la ferme quelques secondes après) |
+| `killban CIBLE… [--cid N] [-y]` | Bannit des clients, connectés ou non, puis coupe leurs connexions (HALT) : plus de connexion possible jusqu'au `unban` (voir plus bas) |
+| `unban NOM…` | Lève un ban posé par `killban` |
+| `bans` | Clients bannis (date, auteur) ou désactivés à la main |
 | `info [--json]` | Version, PID, verbosité, mute, hold, nombre de clients, octets cumulés, état |
 | `log [N\|all\|0] [-f]` | Dernières lignes du log du serveur (20 par défaut, `0` : aucune), `-f` pour suivre |
 | `verb [N]`, `mute [N]` | Affiche ou change la verbosité / la limite de répétition du log |
@@ -184,6 +187,24 @@ comptes est signalé.
 | `raw COMMANDE…` | Commandes brutes du management (`raw "status 3" load-stats`) |
 | `shell` | Session interactive avec un seul serveur (`help` liste les commandes du serveur) |
 | `servers` | Serveurs de la configuration, `*` = par défaut |
+
+### Bannir un client (`killban`, `unban`, `bans`)
+
+Le ban est un `disable` dans le fichier `client-config-dir` du client, précédé d'une ligne de marque
+(`# ovpnMgmt ban <date> par <utilisateur>@<machine>`) : OpenVPN relit ce fichier à chaque connexion et refuse le
+client (`AUTH_FAILED`, un client standard s'arrête alors), sans redémarrer le serveur. Il faut donc :
+
+- `openvpn_config` dans la section du serveur, et `client-config-dir` dans la configuration OpenVPN (sinon refus
+  avec un message : l'ajouter demande un redémarrage) ;
+- le droit d'écrire dans ce répertoire : `sudo = yes` pour passer par `sudo -n`.
+
+`killban` prend un nom (CN), connecté ou non, ou l'adresse / l'IP VPN / le `--cid` d'une connexion en cours (son nom
+est alors banni). Le ban est posé avant la coupure, sur chaque serveur traité ; un client déjà désactivé à la main est
+signalé. Nom → fichier comme OpenVPN : caractères hors `[A-Za-z0-9_.@-]` remplacés par `_` (avec
+`username-as-common-name`, c'est le nom d'utilisateur). `unban` ne retire que les lignes marquées par ovpnMgmt (un
+fichier créé par le ban est supprimé ; un `disable` posé à la main reste, et c'est signalé) ; si le fichier n'avait pas
+de fin de ligne finale, il en garde une. `list -o` montre « banni le … ». Un client refusé apparaît quelques secondes
+dans `list` avec l'IP VPN `-`, le temps qu'OpenVPN le retire.
 
 ### Utilisateurs non connectés (`list --offline`)
 
