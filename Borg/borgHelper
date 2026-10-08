@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.189"
+Version="1.0.190"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -1242,6 +1242,7 @@ def usage(doc=None,debug=0):
         printer("       Rapproche les Bkp tués (ligne bkp_status ouverte, rien de vivant) : archive « borgHelper run <id> »")
         printer("       écrite -> ligne fermée en succès ; même règle que l'Index, sans Index (un borg list par nick à")
         printer("       candidat)  |  -j : [{nick,verified,runs:{run_id:état}}]  |  code 1 : vérification impossible")
+        printer("       ou nick inconnu du rc, ou rc sans nick")
     elif doc=='status':
         printer("   -c Status [-n nick1,nick2/ALL] [-j]")
         printer("       État rapide (dernier backup connu + âge, Bkp en cours depuis quand, opération")
@@ -9323,7 +9324,10 @@ class BorgHelper:
         absent, base illisible, nick inconnu du rc, rc sans nick). Lancée par le watcher de borgHelperWWW dès qu'un Bkp tué est
         interrompu (fin notifiée aussitôt). Revue : son borg list cède à une opération prioritaire du nick (priority.lock : Bkp,
         Restore, Prune — comme l'Index) ; sans -n en CLI : nick = nom de la machine (comme les autres commandes) ; nick None ou
-        'ALL' : tous les nicks du rc. Revue 2 : liste « a, b » nettoyée (espaces, doublons) ; base illisible dite en [WARN]."""
+        'ALL' : tous les nicks du rc. Revue 2 : liste « a, b » nettoyée (espaces, doublons) ; base illisible dite en [WARN].
+        1.0.190 (story 64, F336, décision de l'utilisateur) : nick inconnu du rc dit en UNE ligne (« n : nick inconnu du rc », plus
+        de « vérification impossible » en plus), à sa place dans l'ordre de la demande (texte et -j, stderr) ; code 1 et JSON -j
+        inchangés."""
         known=[x for x in (self.borg.cfgreadnicks(debug) or '').split(',') if x]
         nicks=list(dict.fromkeys(x.strip() for x in (nick.split(',') if nick and nick!='ALL' else known) if x.strip()))   # revue 2 : « a, b », doublon
         out=[]
@@ -9331,7 +9335,7 @@ class BorgHelper:
         for n in nicks:
             rep={}
             if n not in known:   # (revue) faute de frappe : jamais « aucun Bkp interrompu, vérifié »
-                printer(f"{n} : nick inconnu du rc"); out.append({'nick':n,'verified':False,'runs':{}}); continue
+                out.append({'nick':n,'verified':False,'runs':{}}); continue   # 1.0.190 : dit dans la boucle de sortie, à sa place
             prev_stop=self.borg._stop
             self.borg._stop=lambda n=n: bool(self.db.check_priority_lock(n))   # (revue) son borg list cède à un Bkp/Restore/Prune qui démarre
             try: self._reconcile_killed_bkp(n,debug=debug,report=rep,retry='par le watcher de borgHelperWWW, ou en relançant BkpReconcile')
@@ -9341,12 +9345,13 @@ class BorgHelper:
             finally: self.borg._stop=prev_stop
             if rep.get('error'): printer(f"[WARN] {n} : {rep['error']}")   # revue 2 : jamais un « vérification impossible » muet
             out.append({'nick':n,'verified':bool(rep.get('verified')),'runs':dict(rep.get('runs') or {})})
+        for o in out:
+            if o['nick'] not in known: printer(f"{o['nick']} : nick inconnu du rc"); continue   # 1.0.190 (F336) : une seule ligne, texte et -j
+            if as_json: continue
+            if not o['runs']: printer(f"{o['nick']} : {'aucun Bkp interrompu' if o['verified'] else 'vérification impossible'}")
+            for r,st in o['runs'].items(): printer(f"{o['nick']} : Bkp {r[:8]} — {st}")
+            if o['runs'] and not o['verified']: printer(f"{o['nick']} : vérification impossible (borg list ou dépôt) — réessayer")
         if as_json: print(json.dumps(out,ensure_ascii=False,indent=2))
-        else:
-            for o in out:
-                if not o['runs']: printer(f"{o['nick']} : {'aucun Bkp interrompu' if o['verified'] else 'vérification impossible'}")
-                for r,st in o['runs'].items(): printer(f"{o['nick']} : Bkp {r[:8]} — {st}")
-                if o['runs'] and not o['verified']: printer(f"{o['nick']} : vérification impossible (borg list ou dépôt) — réessayer")
         return 0 if all(o['verified'] for o in out) else 1
 
     def _bkp_live(self,nick,quiet=False,strict=False):
@@ -15857,7 +15862,10 @@ fail()
                 # revue 2 : base illisible -> [WARN] dit, non vérifié ; « nick, nick » nettoyé (un seul passage)
                 def boom(*a,**k): raise sqlite3.OperationalError('disk I/O error (contrôle)')
                 with mock.patch.object(b.db,'open_bkp_runs',boom): br_b=runbr('rk7')
+                with mock.patch.object(b.db,'open_bkp_runs',boom): br_bt=runbr('rk7',as_json=False)   # 1.0.190 : nick connu non vérifié, texte inchangé
                 br_d=runbr(' rk7 , rk7')
+                br_ut=runbr('inconnu',as_json=False)   # 1.0.190 (story 64, F336) : nick inconnu, texte ; liste mixte dans les deux ordres
+                br_m=runbr('inconnu,rk2',as_json=False); br_mr=runbr('rk2,inconnu',as_json=False); br_mj=runbr('inconnu,rk2'); br_mrj=runbr('rk2,inconnu')
                 res['BkpReconcile (revue 2) : base illisible dite en [WARN], code 1 ; « nick, nick » : un seul nick']=(br_b[0]==1
                     and br_b[1]==[{'nick':'rk7','verified':False,'runs':{}}] and '[WARN] rk7 : base illisible (disk I/O error (contrôle))' in br_b[2]
                     and br_d[0]==0 and br_d[1]==[{'nick':'rk7','verified':True,'runs':{}}],br_b[:3],br_d[:3])
@@ -15881,8 +15889,15 @@ fail()
                 rc0=os.path.join(d,'rc0')
                 with open(rc0,'w') as f: f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache0')}\nBORG_PASSPHRASE=pw\n")
                 os.chmod(rc0,0o600)
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                    b0=BorgHelper(cfgfile=rc0,cache_dir=os.path.join(d,'cache0'))
                 with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()) as e0:
-                    c0=BorgHelper(cfgfile=rc0,cache_dir=os.path.join(d,'cache0')).bkp_reconcile('ALL',as_json=True)
+                    c0=b0.bkp_reconcile('ALL',as_json=True)
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()) as e0t:
+                    c0t=b0.bkp_reconcile('ALL',as_json=False)
+                res['BkpReconcile (1.0.190) : rc sans nick -> la ligne « aucun nick dans le rc », texte et -j, code 1']=(c0==1 and c0t==1
+                    and e0.getvalue().splitlines()==['BkpReconcile : aucun nick dans le rc']
+                    and e0t.getvalue().splitlines()==['BkpReconcile : aucun nick dans le rc'],c0,e0.getvalue()[-200:],c0t,e0t.getvalue()[-200:])
                 res['BkpReconcile (revue) : arrêt prioritaire du nick -> borg list arrêté, non vérifié, code 1 ; nick inconnu du rc -> non vérifié, code 1 ; rc sans nick -> code 1 ; texte : une ligne par run']=(
                     br_t[0]==1 and br_t[1]==[{'nick':'rkt','verified':False,'runs':{X('rkt'):'non vérifié'}}] and row('rkt')==(None,None)
                     and br_u[0]==1 and br_u[1]==[{'nick':'inconnu','verified':False,'runs':{}}] and 'inconnu : nick inconnu du rc' in br_u[2] and br_u[3]==[]
@@ -15900,8 +15915,25 @@ fail()
                 me=os.path.realpath(__file__)
                 c7=subprocess.run([sys.executable,me,'-C',rc,'-c','BkpReconcile','-n','rk7','-j'],capture_output=True,text=True,timeout=120,env=cenv,stdin=subprocess.DEVNULL)
                 cj=subprocess.run([sys.executable,me,'-C',rc,'-c','BkpReconcile','-n','rkj'],capture_output=True,text=True,timeout=120,env=cenv,stdin=subprocess.DEVNULL)
+                cn=subprocess.run([sys.executable,me,'-C',rc,'-c','BkpReconcile'],capture_output=True,text=True,timeout=120,env=cenv,stdin=subprocess.DEVNULL)   # 1.0.190 : sans -n
                 try: j7=json.loads(c7.stdout)
                 except ValueError: j7=None
+                U1='inconnu : nick inconnu du rc'; R2=f"rk2 : Bkp {X('rk2')[:8]} — absent"
+                JU={'nick':'inconnu','verified':False,'runs':{}}; J2={'nick':'rk2','verified':True,'runs':{X('rk2'):'absent'}}
+                res['BkpReconcile (1.0.190) : nick inconnu du rc, texte -> UNE ligne, code 1, aucun borg list']=(br_ut[0]==1
+                    and br_ut[2].splitlines()==[U1] and br_ut[3]==[],br_ut[:3],br_ut[3])
+                res['BkpReconcile (1.0.190) : nick inconnu du rc, -j -> JSON inchangé, UNE ligne sur stderr, code 1']=(br_u[0]==1
+                    and br_u[1]==[JU] and br_u[2].splitlines()==[U1] and br_u[3]==[],br_u[:3],br_u[3])
+                res['BkpReconcile (1.0.190) : liste mixte inconnu/connu, deux ordres -> lignes dans l\'ordre de la demande, seul borg list du connu, code 1']=(
+                    br_m[0]==1 and br_m[2].splitlines()==[U1,R2] and br_mr[0]==1 and br_mr[2].splitlines()==[R2,U1]
+                    and br_mj[0]==1 and br_mj[1]==[JU,J2] and br_mj[2].splitlines()==[U1] and br_mrj[0]==1 and br_mrj[1]==[J2,JU]
+                    and br_mrj[2].splitlines()==[U1] and all([c[0] for c in x[3]]==['rk2'] for x in (br_m,br_mr,br_mj,br_mrj)),
+                    br_m[:3],br_mr[:3],br_mj[:3],br_mrj[:3],[[c[0] for c in x[3]] for x in (br_m,br_mr,br_mj,br_mrj)])
+                res['BkpReconcile (1.0.190) : CLI sans -n, nom de la machine absent du rc -> UNE ligne, stdout vide, code 1']=(cn.returncode==1
+                    and cn.stdout=='' and cn.stderr.splitlines()==[f"{socket.gethostname()} : nick inconnu du rc"],cn.returncode,cn.stdout[-200:],cn.stderr[-300:])
+                res['BkpReconcile (1.0.190) : nick connu non vérifié sans run, texte -> « vérification impossible » inchangé, [WARN] dit, code 1']=(br_bt[0]==1
+                    and 'rk7 : vérification impossible' in br_bt[2].splitlines()
+                    and '[WARN] rk7 : base illisible (disk I/O error (contrôle))' in br_bt[2],br_bt[:3])
                 res['commande BkpReconcile (1.0.189) : -j vérifié code 0 (aucun Bkp interrompu) ; dépôt absent code 1, dit']=(c7.returncode==0
                     and j7==[{'nick':'rk7','verified':True,'runs':{}}] and cj.returncode==1 and f"rkj : Bkp {X('rkj')[:8]} — non vérifié" in cj.stderr
                     and 'vérification impossible' in cj.stderr,c7.returncode,c7.stdout[-200:],c7.stderr[-200:],cj.returncode,cj.stderr[-300:])

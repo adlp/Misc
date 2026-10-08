@@ -1236,7 +1236,10 @@ vivant), `orphelin` (son `borg create` vit encore — dépôt local, ou lancé a
 de base`, `non fermé` (fermeture refusée, ou déjà faite par un autre rapprochement), `non vérifié` (`borg list` en échec ou arrêté,
 dépôt local absent), `non vérifiable` (dépôt distant : un `borg create` encore vivant n'y est pas visible — jamais dit `absent`).
 Texte : une ligne « `<nick> : Bkp <8 premiers caractères du run> — <état>` » par ligne `bkp_status` ouverte (Bkp interrompu ou
-vivant ; « `aucun Bkp interrompu` » sinon), plus « `vérification impossible … — réessayer` » si le nick n'est pas vérifié. Code 0 :
+vivant ; « `aucun Bkp interrompu` » sinon). Nick non vérifié : avec des lignes ouvertes, « `vérification impossible (borg list
+ou dépôt) — réessayer` » en plus ; sans ligne ouverte, « `<nick> : vérification impossible` » seule. Nick inconnu du rc (faute
+de frappe, ou nom de la machine sans `-n`) : une seule ligne pour ce nick, « `<nick> : nick inconnu du rc` », à sa place dans
+l'ordre de la demande (aussi avec `-j`, sur stderr). Code 0 :
 chaque nick vérifié ; 1 : vérification impossible (`borg list` en échec ou arrêté, dépôt local absent — `[WARN]` de borg dit ;
 base illisible — `[WARN] <nick> : base illisible (…)`), nick inconnu du rc, rc sans nick. Une ligne `absent` reste ouverte
 (décision de l'utilisateur) : seul le watcher notifie l'échec ; Status et `/access` la disent interrompue jusqu'au délai

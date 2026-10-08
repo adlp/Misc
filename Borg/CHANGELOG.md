@@ -1,5 +1,20 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.190 — BkpReconcile : nick inconnu en une ligne — 2026-10-08
+
+Chantier « reconstruction progressive », story 64 (rétrospective 61-63, F336, A121 ; décision de l'utilisateur). Avant :
+`BkpReconcile -n <nick absent du rc>` (ou sans `-n`, nom de la machine absent du rc) écrivait deux lignes pour une seule cause,
+« `<nick> : nick inconnu du rc` » puis « `<nick> : vérification impossible` ».
+
+- borgHelper 1.0.190 : nick inconnu du rc dit en une seule ligne, « `<nick> : nick inconnu du rc` », à sa place dans l'ordre
+  de la demande (texte et `-j`). Inchangés : code 1, JSON `-j` (`{nick, verified: false, runs: {}}`, la ligne restant sur
+  stderr), lignes des autres nicks (« `aucun Bkp interrompu` », « `vérification impossible` » d'un nick connu non vérifié,
+  `[WARN] … base illisible`), « `aucun nick dans le rc` ». Aide `-h bkpreconcile` : « code 1 : vérification impossible ou nick
+  inconnu du rc, ou rc sans nick ». borgHelperWWW non touché (le watcher ne passe que des nicks du rc, en `-j`).
+- Contrôles : CodecSelfTest (nick inconnu : une ligne exacte en texte, JSON inchangé en `-j` ; liste mixte dans les deux ordres,
+  lignes dans l'ordre de la demande, seul le nick connu lance `borg list` ; CLI sans `-n` ; code 1 ; nick connu non vérifié :
+  « `vérification impossible` » toujours dit ; rc sans nick : « `aucun nick dans le rc` », texte et `-j`).
+
 ## borgHelperWWW 1.31.8, borgHelper 1.0.189 — Fin d'un Bkp tué notifiée aussitôt — 2026-10-07
 
 Chantier « reconstruction progressive », story 63 (rétrospective 57-60, A118 ; décisions de l'utilisateur). Avant : pour un Bkp
