@@ -208,8 +208,9 @@ def test_build_blocs_de_transfert(keys, tmp_path):
     # blocs d'identité ensuite, sans ForwardAgent
     ident = text[len(sshconfig.HEADER + fwd_text):]
     assert ident.startswith("\n# K1 %s\n" % ID_K1) and "ForwardAgent" not in ident
-    assert plan.forward == {fid("a"): ("a", [ID_K2, ID_K3]), fid("saut.dmz"): ("saut.dmz", [ID_K2]),
-                            fid("x.dmz.*"): ("x.dmz.*", [ID_K2]), fid("*.dmz"): ("*.dmz", [ID_K2])}
+    k2, k3 = (None, ID_K2), (None, ID_K3)  # éléments sans compte : ancienne forme
+    assert plan.forward == {fid("a"): ("a", [k2, k3]), fid("saut.dmz"): ("saut.dmz", [k2]),
+                            fid("x.dmz.*"): ("x.dmz.*", [k2]), fid("*.dmz"): ("*.dmz", [k2])}
     assert plan.blocks == 6
     assert any("« saut.dmz » et « *.dmz » se recouvrent" in w and "seul le premier bloc (« saut.dmz »)" in w
                for w in plan.warnings), plan.warnings
@@ -518,9 +519,9 @@ def test_agent_status_purge(bench):
     assert r.returncode == 0, r.stderr
     out = r.stdout
     assert "transfert a (%s) : actif, pid " % fid("a") in out and "transfert b (%s) : actif" % fid("b") in out
-    assert re.search(r"^  K2 transférée\t%s\t(59m\d\ds|1h00m00s)\t-$" % re.escape(bench.keys["bastion"]["fingerprint"]),
+    assert re.search(r"^  alice\tK2 transférée\t%s\t(59m\d\ds|1h00m00s)\t-$" % re.escape(bench.keys["bastion"]["fingerprint"]),
                      out, re.M), out
-    assert "  K3 transférée\t%s\t" % bench.keys["perso"]["fingerprint"] in out
+    assert "  alice\tK3 transférée\t%s\t" % bench.keys["perso"]["fingerprint"] in out
     assert out.index("K1 identité") < out.index("transfert a"), "agent dédié d'abord"
     r = bench.run("agent", "purge")
     assert r.returncode == 0, r.stderr
@@ -723,7 +724,7 @@ def test_bout_en_bout_seule_k2_transferee(bench, lab, tmp_path):
         assert not [l for l in r.stderr.splitlines() if l.startswith("sshvault:")], r.stderr
     assert bench.agent_keys() == [bench.blob("prod")], "K1 dans l'agent dédié (authentification)"
     calls = re.findall(r"^sshvault-test: fin (ensure --\S+ \S+)", r.stderr, re.M)
-    assert calls == ["ensure --forward %s" % fid("a"), "ensure --id %s" % ID_K1], "bloc de transfert d'abord"
+    assert calls == ["ensure --forward %s" % fid("a"), "ensure --account alice"], "bloc de transfert d'abord"
 
 
 def test_bout_en_bout_saut_proxyjump_sans_transfert(bench, lab, tmp_path):
@@ -740,7 +741,7 @@ def test_bout_en_bout_saut_proxyjump_sans_transfert(bench, lab, tmp_path):
     n_bw = len(bench.calls())
     r = ssh_remote(bench, main, "b", "true")
     assert r.returncode == 0, r.stderr
-    assert "fin ensure --forward %s --id %s rc=0" % (fid("a"), ID_K3) in r.stderr
+    assert "fin ensure --forward %s --id alice:%s rc=0" % (fid("a"), ID_K3) in r.stderr
     # -W impose ExitOnForwardFailure (mesuré) : le socket doit exister, sous-agent lancé vide
     assert "Cannot forward agent socket path" not in r.stderr
     assert fwd_keys(bench, "a") == [], "aucune clé chargée pour un saut"
@@ -946,7 +947,7 @@ def test_list_json_et_selection_par_motif_de_transfert(bench):
     forward_vault(bench, k2_forward="bastion.dmz")
     data = json.loads(bench.run("list", "--json").stdout)
     assert {d["id"]: d["forward"] for d in data} == {ID_K1: [], ID_K2: ["bastion.dmz"]}
-    assert bench.run("list").stdout.splitlines()[1].split("\t")[2] == "-", "colonnes texte inchangées"
+    assert bench.run("list").stdout.splitlines()[1].split("\t")[3] == "-", "colonnes texte inchangées"
     r = bench.run("forward", "list", "--host", "bastion.dmz")
     assert (r.returncode, r.stdout) == (0, "bastion.dmz\n"), r.stderr
     r = bench.run("forward", "list", "*.dmz")  # sélection par défaut, motif glob
@@ -1128,7 +1129,7 @@ def test_agent_status_agent_dedie_arrete(bench):
     r = bench.run("agent", "status")
     assert r.returncode == 3, r.stderr
     assert "agent : arrêté" in r.stdout and "transfert a (%s) : actif" % fid("a") in r.stdout
-    assert "  K2 transférée\t%s\t" % bench.keys["bastion"]["fingerprint"] in r.stdout
+    assert "  alice\tK2 transférée\t%s\t" % bench.keys["bastion"]["fingerprint"] in r.stdout
 
 
 @needs_openssh
@@ -1244,7 +1245,7 @@ def test_forward_confirm_refus_arrete_le_sous_agent(bench):
     cfg = bench.home / ".config" / "sshvault" / "config.json"
     cfg.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     for value in (False, True):
-        cfg.write_text(json.dumps({"forward-confirm": value}))
+        cfg.write_text(json.dumps(dict(bench.registry(), **{"forward-confirm": value})))
         cfg.chmod(0o600)
         if not value:
             assert ensure_fwd(bench, "a", ID_K2).returncode == 0

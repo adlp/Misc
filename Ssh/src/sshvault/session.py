@@ -1,12 +1,16 @@
 """Magasin de la session du coffre, gardée hors de tout disque persistant.
 
+Une session par compte (CAP-10, alias `<a>`) :
 1. Keyring noyau (`keyctl`, anneau `@u` par défaut) : clé `user` nommée
-   `sshvault:session`, jeton passé par stdin (jamais en argument), expiration
+   `sshvault:session:<a>`, jeton passé par stdin (jamais en argument), expiration
    posée par le noyau (`keyctl timeout`).
 2. Si `keyctl` échoue (absent, session keyring non liée à `@u` ou révoquée…) :
-   fichier 0600 `$XDG_RUNTIME_DIR/sshvault/session` (dossier 0700), qui porte sa
+   fichier 0600 `$XDG_RUNTIME_DIR/sshvault/sessions/<a>` (dossiers 0700), qui porte sa
    date d'expiration ; il est expiré à la lecture et purgé au `lock`. XDG_RUNTIME_DIR
    doit être à l'utilisateur, sans droits groupe/autres, sur tmpfs ou ramfs.
+
+Sans alias : magasin de la 0.8.0 (`sshvault:session`, `$XDG_RUNTIME_DIR/sshvault/session`),
+seulement vidé à l'adoption d'une installation existante.
 
 Rien n'est écrit sur un stockage persistant. Sans keyring utilisable ni
 `XDG_RUNTIME_DIR`, la session n'est pas rangée (`SessionStoreError`).
@@ -22,6 +26,7 @@ from typing import Callable, Optional
 from .fsutil import NotPrivateTmpfs, check_private_tmpfs, read_private, write_private
 
 KEY_DESC = "sshvault:session"
+SESSIONS_DIR = "sessions"
 DEFAULT_TTL = 900
 KEYCTL_TIMEOUT = 10
 _TOKEN_RE = re.compile(r"[A-Za-z0-9+/=_.:-]{8,4096}")
@@ -49,13 +54,22 @@ def check_private_runtime(rt: str, mounts: str = "/proc/self/mounts") -> None:
 class SessionStore:
     def __init__(self, keyring: Optional[str] = None, keyctl: Optional[str] = None,
                  runtime_dir: Optional[str] = None, clock: Callable[[], float] = time.time,
-                 mounts: str = "/proc/self/mounts"):
+                 mounts: str = "/proc/self/mounts", alias: Optional[str] = None):
+        """`alias` : compte du coffre (session propre) ; None : magasin de la 0.8.0."""
         env = os.environ
+        self.alias = alias
+        self.key_desc = KEY_DESC + ":" + alias if alias else KEY_DESC
         # Anneau et exécutable injectables (tests : anneau dédié, jamais le @u réel).
         self.keyring = keyring or env.get("SSHVAULT_KEYRING") or "@u"
         self.keyctl = keyctl or env.get("SSHVAULT_KEYCTL") or "keyctl"
         rt = runtime_dir if runtime_dir is not None else env.get("XDG_RUNTIME_DIR", "")
-        self.file = os.path.join(rt, "sshvault", "session") if rt and os.path.isabs(rt) else None
+        self.runtime = rt if rt and os.path.isabs(rt) else None
+        if self.runtime is None:
+            self.file = None
+        elif alias:
+            self.file = os.path.join(rt, "sshvault", SESSIONS_DIR, alias)
+        else:
+            self.file = os.path.join(rt, "sshvault", "session")
         self.clock = clock
         self.mounts = mounts
         self.last_backend: Optional[str] = None  # "keyring" | "file" : où get() a trouvé la session
@@ -73,12 +87,12 @@ class SessionStore:
         return r.stdout, None
 
     def _key_id(self) -> Optional[str]:
-        out, _ = self._keyctl("search", self.keyring, "user", KEY_DESC)
+        out, _ = self._keyctl("search", self.keyring, "user", self.key_desc)
         return out.strip() if out else None
 
     def _keyring_put(self, token: str, ttl: int) -> Optional[str]:
         """Renvoie None si la session est rangée avec son délai, sinon la raison de l'échec."""
-        out, err = self._keyctl("padd", "user", KEY_DESC, self.keyring, data=token)
+        out, err = self._keyctl("padd", "user", self.key_desc, self.keyring, data=token)
         if out is None:
             return "keyctl padd : " + err
         kid = out.strip()
@@ -130,7 +144,7 @@ class SessionStore:
     def _file_put(self, token: str, ttl: int) -> None:
         if not self.file:
             raise SessionStoreError("XDG_RUNTIME_DIR absent : impossible de ranger la session hors disque")
-        check_private_runtime(os.path.dirname(os.path.dirname(self.file)), self.mounts)
+        check_private_runtime(self.runtime, self.mounts)
         write_private(self.file, ("%s %d\n" % (token, int(self.clock()) + ttl)).encode())
 
     def _file_clear(self) -> None:
@@ -186,6 +200,49 @@ class SessionStore:
                 first = first or e
         if first is not None:
             raise first
+
+    def _keyring_ttl(self) -> Optional[int]:
+        """Secondes restantes de la clé de session dans l'anneau (colonne d'expiration de
+        /proc/keys, arrondie par le noyau vers le bas : `59m`, `40s`…), ou None."""
+        kid = self._key_id()
+        if not kid:
+            return None
+        try:
+            want = "%08x" % int(kid)
+            with open("/proc/keys") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) > 3 and parts[0] == want:
+                        m = re.fullmatch(r"(\d+)([smhdw])", parts[3])
+                        if not m:
+                            return None
+                        return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[m.group(2)]
+        except (OSError, ValueError):
+            return None
+        return None
+
+    def move_to(self, other: "SessionStore") -> Optional[str]:
+        """Session déplacée vers le magasin `other` (compte renommé), même jeton, durée restante
+        gardée ; renvoie "keyring", "file" ou None (aucune session). Échec : SessionStoreError
+        (l'appelant oublie alors la session)."""
+        token = self._keyring_get()
+        if token:
+            ttl = self._keyring_ttl()
+            if not ttl or ttl < 1:
+                raise SessionStoreError("durée restante de la session illisible (/proc/keys)")
+            why = other._keyring_put(token, ttl)
+            if why is not None:
+                raise SessionStoreError(why)
+            self._keyring_clear()
+            return "keyring"
+        if self.file and other.file and self._file_get():
+            try:
+                os.makedirs(os.path.dirname(other.file), mode=0o700, exist_ok=True)
+                os.rename(self.file, other.file)
+            except OSError as e:
+                raise SessionStoreError("déplacement de %s : %s" % (self.file, e.strerror or e)) from None
+            return "file"
+        return None
 
     def describe(self) -> str:
         return "keyring %s (repli : %s)" % (self.keyring, self.file or "aucun, XDG_RUNTIME_DIR absent")

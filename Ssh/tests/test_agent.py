@@ -88,7 +88,7 @@ def test_premier_load(bench):
     st = bench.agent_state()
     assert st["keys"] == {fp: {"id": ID_PROD, "name": "Serveur Prod", "hosts": ["prod.example.com", "*.Lab.example"],
                                "loaded": st["keys"][fp]["loaded"], "lifetime": 3600, "confirm": False,
-                               "restrict": False}}
+                               "restrict": False, "account": "alice"}}
     pid = st["agent"]["pid"]
     with open("/proc/%d/cmdline" % pid, "rb") as f:
         argv = f.read().split(b"\0")[:-1]
@@ -363,7 +363,8 @@ def test_status_agent_vivant(bench):
     lines = r.stdout.splitlines()
     pid = bench.agent_state()["agent"]["pid"]
     assert lines[:3] == ["agent : actif", "socket : %s" % bench.sock(), "pid : %d" % pid]
-    rows = {l.split("\t")[0]: l.split("\t") for l in lines[3:]}
+    rows = {l.split("\t")[1]: l.split("\t")[1:] for l in lines[3:]}
+    assert {l.split("\t")[0] for l in lines[3:]} == {"alice"}, "alias du compte en première colonne"
     prod = rows["Serveur Prod"]
     assert prod[1:3] == [bench.keys["prod"]["fingerprint"], "prod.example.com,*.Lab.example"]
     assert re.fullmatch(r"(1h00m00s|59m[0-5]\ds)", prod[3]) and prod[4] == "-"
@@ -384,7 +385,7 @@ def test_status_cle_chargee_hors_sshvault(bench):
     env = dict(os.environ, SSH_AUTH_SOCK=str(bench.sock()))
     subprocess.run(["ssh-add", "-q", "-"], input=bench.keys["bastion"]["private"], env=env, text=True, check=True)
     r = bench.run("agent", "status")
-    assert "?\t%s\t-\t?\t?" % bench.keys["bastion"]["fingerprint"] in r.stdout.splitlines()
+    assert "?\t?\t%s\t-\t?\t?" % bench.keys["bastion"]["fingerprint"] in r.stdout.splitlines()
 
 
 def test_cle_expiree_retiree_de_l_etat(bench):
@@ -501,9 +502,9 @@ def test_config_ttl_puis_load(bench):
 def test_config_invalide_load_refuse(bench):
     unlocked(bench)
     d = bench.home / ".config" / "sshvault"
-    d.mkdir(parents=True, mode=0o700)
-    fd = os.open(str(d / "config.json"), os.O_WRONLY | os.O_CREAT, 0o600)
-    os.write(fd, b'{"key-ttl": "2h"}')
+    d.mkdir(parents=True, mode=0o700, exist_ok=True)
+    fd = os.open(str(d / "config.json"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.write(fd, json.dumps(dict(bench.registry(), **{"key-ttl": "2h"})).encode())
     os.close(fd)
     r = bench.run("load", "--id", ID_PROD)
     assert r.returncode == 2 and "key-ttl invalide" in one_line_error(r)
@@ -772,6 +773,11 @@ def test_strace_load_n_ecrit_que_l_etat(bench):
             p.send_signal(signal.SIGTERM)
             p.wait(timeout=30)
         out.close()
+    if not done and trace.exists():
+        # strace terminé entre deux lectures (sous charge) : dernière lecture de la trace
+        text = trace.read_text(errors="replace")
+        main_pid = main_pid or (text.split(None, 1)[0] if text else None)
+        done = main_pid is not None and re.search(r"^%s \+\+\+ exited with 0 \+\+\+$" % main_pid, text, re.M)
     assert done, (bench.tmp / "strace.stdout").read_text()
     assert bench.agent_keys() == [bench.blob("prod")]
     state = str(bench.runtime / "sshvault" / "agent.json")

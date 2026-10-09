@@ -3,11 +3,14 @@
 Deux modes :
 - **compte de test** (défaut) : identifiants dans `~/.config/sshvault-test/account.env`
   (chemin remplaçable par SSHVAULT_IT_ENV) : SSHVAULT_IT_SERVER, SSHVAULT_IT_EMAIL,
-  SSHVAULT_IT_PASSWORD, NODE_EXTRA_CA_CERTS en option. Ces valeurs ne sont jamais
+  SSHVAULT_IT_PASSWORD, NODE_EXTRA_CA_CERTS en option ; second compte (volet deux comptes,
+  CAP-10, créé par l'utilisateur) : SSHVAULT_IT2_SERVER, SSHVAULT_IT2_EMAIL,
+  SSHVAULT_IT2_PASSWORD, sans eux ce volet est sauté (dit dans le rapport). Ces valeurs ne sont jamais
   affichées, journalisées ni comparées dans une assertion : `Account` masque son repr
   et `scrub()` les retire de tout message d'échec ;
 - **conteneur** (SSHVAULT_IT_MODE=container) : `vaultwarden/server:1.37.4` sous docker,
-  port libre de 127.0.0.1, données temporaires, compte créé par `register.py`,
+  port libre de 127.0.0.1, données temporaires, comptes créés par `register.py` (le second à
+  la demande),
   conteneur supprimé à la fin.
 Ignoré si `bw` manque, ou si ni le fichier ni (en mode conteneur) docker ne sont disponibles.
 """
@@ -26,6 +29,7 @@ IMAGE = "vaultwarden/server:1.37.4"
 NAME_PREFIX = "sshvault-it-"
 DEFAULT_ENV_FILE = os.path.join(os.path.expanduser("~"), ".config", "sshvault-test", "account.env")
 KEYS = ("SSHVAULT_IT_SERVER", "SSHVAULT_IT_EMAIL", "SSHVAULT_IT_PASSWORD", "NODE_EXTRA_CA_CERTS")
+KEYS2 = ("SSHVAULT_IT2_SERVER", "SSHVAULT_IT2_EMAIL", "SSHVAULT_IT2_PASSWORD")
 
 
 class Account:
@@ -69,7 +73,7 @@ def load_account_env(path):
             v = v.strip()
             if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
                 v = v[1:-1]
-            if k in KEYS:
+            if k in KEYS or k in KEYS2:
                 vals[k] = v
     return vals
 
@@ -130,7 +134,9 @@ def _container(tmp_path_factory):
         email = "it-%s@example.test" % uuid.uuid4().hex[:8]
         password = "integration pass phrase " + uuid.uuid4().hex[:8]
         register(url, email, password)
-        yield Account(url, email, password)
+        acct = Account(url, email, password)
+        acct.container_url = url  # second compte inscrit à la demande (fixture account2)
+        yield acct
     finally:
         subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True, timeout=120)
         left = subprocess.run(["docker", "ps", "-a", "-q", "--filter", "name=" + name],
@@ -157,3 +163,22 @@ def account(tmp_path_factory, bw_exe):
         pytest.skip("compte de test incomplet : %s manquant(s)" % ", ".join(missing))
     extra = {"NODE_EXTRA_CA_CERTS": vals["NODE_EXTRA_CA_CERTS"]} if vals.get("NODE_EXTRA_CA_CERTS") else {}
     yield Account(vals["SSHVAULT_IT_SERVER"], vals["SSHVAULT_IT_EMAIL"], vals["SSHVAULT_IT_PASSWORD"], extra)
+
+
+@pytest.fixture(scope="session")
+def account2(account):
+    """Second compte (CAP-10) : SSHVAULT_IT2_* du fichier du compte de test (créé par
+    l'utilisateur), ou inscrit dans le conteneur ; None s'il manque (volet deux comptes sauté)."""
+    url = getattr(account, "container_url", None)
+    if url:
+        from register import register
+        email = "it2-%s@example.test" % uuid.uuid4().hex[:8]
+        password = "integration pass phrase 2 " + uuid.uuid4().hex[:8]
+        register(url, email, password)
+        return Account(url, email, password)
+    path = os.environ.get("SSHVAULT_IT_ENV") or DEFAULT_ENV_FILE
+    vals = load_account_env(path) if os.path.isfile(path) else {}
+    if not all(vals.get(k) for k in KEYS2):
+        return None
+    return Account(vals["SSHVAULT_IT2_SERVER"], vals["SSHVAULT_IT2_EMAIL"], vals["SSHVAULT_IT2_PASSWORD"],
+                   account.extra_env)

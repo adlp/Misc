@@ -19,6 +19,8 @@ SUN_PATH_MAX = 107  # sun_path : 108 octets, NUL final compris
 FWD_DIR = "fwd"
 #: Identifiant d'un sous-agent : 16 premiers chiffres hexadécimaux du SHA-256 du motif en minuscules.
 FID_RE = re.compile(r"[0-9a-f]{16}", re.ASCII)
+#: Alias d'un compte du coffre (CAP-10), choisi par l'utilisateur.
+ALIAS_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}", re.ASCII)
 
 
 class AgentError(Exception):

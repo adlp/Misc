@@ -82,9 +82,11 @@ class SshKeyItem:
     hosts: tuple = field(default_factory=tuple)
     #: motifs d'hôtes vers lesquels la clé est transférée (champ `sshvault-forward`)
     forward: tuple = field(default_factory=tuple)
+    #: alias du compte du coffre (CAP-10), posé par la CLI ; None : inconnu
+    account: Optional[str] = None
 
     def to_dict(self) -> dict:
-        return {"id": self.id, "name": self.name, "fingerprint": self.fingerprint,
+        return {"account": self.account, "id": self.id, "name": self.name, "fingerprint": self.fingerprint,
                 "hosts": list(self.hosts), "forward": list(self.forward), "publicKey": self.public_key}
 
     # --- recherche par hôte, nom ou empreinte --------------------------------

@@ -27,6 +27,11 @@ un échec, ssh continue et l'authentification échoue proprement.
   connexion échouent aussitôt, sans invite ni bw ; une autre connexion n'est pas gênée.
   Effacé par un déverrouillage réussi (ensure ou `sshvault unlock`).
 
+Plusieurs comptes (CAP-10) : l'élément est désigné par (compte, id) ; session, invite (qui nomme
+l'alias) et mémoire d'échec (`unlock-failed.<alias>`) sont propres au compte : un échec sur un
+compte ne bloque pas les autres. Une connexion qui touche plusieurs comptes : au plus une invite
+par compte.
+
 `sshvault ensure --forward FID --id ID…` (CAP-8, `ensure_forward`) : même chose pour le
 sous-agent de transfert `fwd/<fid>.sock`, jamais pour l'agent dédié (dont l'état est seulement
 lu : verrouillé par `agent lock` → refus). Clés `ssh-add [-t key-ttl] [-c] -` (`-c` selon
@@ -127,12 +132,17 @@ def user_lock(directory: str, on_wait=None):
         os.close(fd)
 
 
-def recent_failure(directory: str, now: float, conn: Optional[str]) -> Optional[int]:
-    """Âge (s) du dernier échec de déverrouillage de **cette** connexion s'il date de moins de
-    FAIL_MEMORY s, sinon None (hors ssh, `conn` None : jamais)."""
+def fail_path(directory: str, account: Optional[str] = None) -> str:
+    """Mémoire d'échec du compte `account` (`unlock-failed.<alias>`), `unlock-failed` sans compte."""
+    return os.path.join(directory, FAIL_NAME + ("." + account if account else ""))
+
+
+def recent_failure(directory: str, now: float, conn: Optional[str], account: Optional[str] = None) -> Optional[int]:
+    """Âge (s) du dernier échec de déverrouillage du compte pour **cette** connexion s'il date de
+    moins de FAIL_MEMORY s, sinon None (hors ssh, `conn` None : jamais)."""
     if conn is None:
         return None
-    raw = read_private(os.path.join(directory, FAIL_NAME))
+    raw = read_private(fail_path(directory, account))
     if raw is None:
         return None
     try:
@@ -143,25 +153,27 @@ def recent_failure(directory: str, now: float, conn: Optional[str]) -> Optional[
     return int(age) if who == conn and 0 <= age < FAIL_MEMORY else None
 
 
-def record_failure(directory: str, conn: Optional[str]) -> None:
+def record_failure(directory: str, conn: Optional[str], account: Optional[str] = None) -> None:
     if conn is None:
         return
     try:
-        write_private(os.path.join(directory, FAIL_NAME), ("%d %s\n" % (int(time.time()), conn)).encode())
+        write_private(fail_path(directory, account), ("%d %s\n" % (int(time.time()), conn)).encode())
     except OSError:
         pass
 
 
-def clear_failure(directory: str) -> None:
+def clear_failure(directory: str, account: Optional[str] = None) -> None:
     try:
-        os.unlink(os.path.join(directory, FAIL_NAME))
+        os.unlink(fail_path(directory, account))
     except OSError:
         pass
 
 
-def failed_message(age: int) -> str:
-    return ("déverrouillage du coffre en échec il y a %ds pour cette connexion : pas de nouvelle invite avant %ds "
-            "(ou « sshvault unlock »)" % (age, FAIL_MEMORY - age))
+def failed_message(age: int, account: Optional[str] = None, hint: str = "") -> str:
+    """Compte nommé seulement s'il y en a plusieurs (`hint` : « --account <alias> »)."""
+    account = account if hint else None
+    return ("déverrouillage du coffre%s en échec il y a %ds pour cette connexion : pas de nouvelle invite avant %ds "
+            "(ou « sshvault unlock%s »)" % (" « %s »" % account if account else "", age, FAIL_MEMORY - age, hint))
 
 
 class UnlockPrompt:
@@ -169,22 +181,26 @@ class UnlockPrompt:
     échec de la même connexion ; une invite annulée ou sans réponse compte comme un échec, une
     invite impossible (ni terminal au premier plan, ni askpass exécutable) non."""
 
-    def __init__(self, directory: str, env: Mapping[str, str], ctx: Context):
+    def __init__(self, directory: str, env: Mapping[str, str], ctx: Context, account: Optional[str] = None,
+                 hint: str = ""):
         self.dir, self.env, self.ctx, self.answered = directory, env, ctx, False
+        self.account, self.hint = account, hint
 
     def __call__(self, text: str) -> str:
-        age = recent_failure(self.dir, time.time(), self.ctx.conn)
+        age = recent_failure(self.dir, time.time(), self.ctx.conn, self.account)
         if age is not None:
-            raise VaultLocked(failed_message(age))
+            raise VaultLocked(failed_message(age, self.account, self.hint))
         if self.ctx.host:
-            text = text.replace("mot de passe maître du coffre",
-                                "mot de passe maître du coffre (clé pour %s)" % self.ctx.host, 1)
+            if text.endswith(" : "):
+                text = text[:-3] + ", clé pour %s : " % self.ctx.host
+            else:
+                text += " (clé pour %s)" % self.ctx.host
         try:
             pw = ask_password(text, self.env, timeout=self.ctx.cap(prompt_timeout(self.env)))
         except PromptUnavailable as e:
             raise VaultLocked("coffre verrouillé : %s" % e) from None
         except PromptError as e:
-            record_failure(self.dir, self.ctx.conn)
+            record_failure(self.dir, self.ctx.conn, self.account)
             raise VaultLocked("coffre verrouillé : %s" % e) from None
         self.answered = True
         return pw
@@ -192,9 +208,9 @@ class UnlockPrompt:
 
 # --- chargement ----------------------------------------------------------------------------
 
-def present_fresh(agent: Agent, item_id: str) -> bool:
+def present_fresh(agent: Agent, item_id: str, account: Optional[str] = None) -> bool:
     """Chemin rapide (le même que celui du point d'entrée) : ni bw, ni réseau, ni écriture."""
-    return fastpath.present_fresh(agent.dir, item_id, agent.env)
+    return fastpath.present_fresh(agent.dir, item_id, agent.env, account=account)
 
 
 def running_unlocked(agent: Agent) -> dict:
@@ -209,52 +225,58 @@ def running_unlocked(agent: Agent) -> dict:
     return adata
 
 
-def _unlock_possible(directory: str, store: SessionStore, env: Mapping[str, str], ctx: Context) -> None:
+def _unlock_possible(directory: str, store: SessionStore, env: Mapping[str, str], ctx: Context,
+                     account: Optional[str] = None, hint: str = "") -> None:
     """Sans session rangée, il faudrait une invite : échec immédiat, sans bw, si elle est
-    interdite, impossible, ou si cette connexion vient d'échouer à déverrouiller."""
+    interdite, impossible, ou si cette connexion vient d'échouer à déverrouiller ce compte."""
     if store.get():
         return
-    age = recent_failure(directory, time.time(), ctx.conn)
+    age = recent_failure(directory, time.time(), ctx.conn, account)
     if age is not None:
-        raise VaultLocked(failed_message(age))
+        raise VaultLocked(failed_message(age, account, hint))
+    which = " « %s »" % account if account and hint else ""  # compte nommé s'il y en a plusieurs
     if not ctx.interactive:
-        raise VaultLocked("coffre verrouillé : aucune invite (%s)" % ctx.why_not)
+        raise VaultLocked("coffre%s verrouillé : aucune invite (%s)" % (which, ctx.why_not))
     if not available(env):
-        raise VaultLocked("coffre verrouillé : %s" % UNAVAILABLE)
+        raise VaultLocked("coffre%s verrouillé : %s" % (which, UNAVAILABLE))
+
+
+def _hint(backend) -> str:
+    return getattr(backend, "hint", "") or ""
 
 
 def ensure(item_id: str, backend: VaultBackend, store: SessionStore, settings: dict,
            env: Optional[Mapping[str, str]] = None, agent: Optional[Agent] = None,
-           ctx: Optional[Context] = None) -> str:
-    """Clé de l'élément `item_id` (UUID en minuscules) présente dans l'agent dédié, chargée s'il
-    le faut. `settings` : key-ttl, auto-confirm, auto-restrict. Renvoie "present" ou "loaded" ;
-    toute impossibilité lève l'erreur à afficher (une ligne)."""
+           ctx: Optional[Context] = None, account: Optional[str] = None) -> str:
+    """Clé de l'élément (`account`, `item_id` en minuscules) présente dans l'agent dédié, chargée
+    s'il le faut. `settings` : key-ttl, auto-confirm, auto-restrict. Renvoie "present" ou
+    "loaded" ; toute impossibilité lève l'erreur à afficher (une ligne)."""
     env = os.environ if env is None else env
     ctx = ctx or Context()
     agent = agent or Agent(resolve_dir(env), env=env)
-    if present_fresh(agent, item_id):
+    if present_fresh(agent, item_id, account):
         return "present"
     with user_lock(agent.dir):
-        if present_fresh(agent, item_id):  # chargée par un ensure parallèle pendant l'attente
+        if present_fresh(agent, item_id, account):  # chargée par un ensure parallèle pendant l'attente
             return "present"
         running_unlocked(agent)  # avant toute invite ou appel à bw
-        _unlock_possible(agent.dir, store, env, ctx)
-        prompt = UnlockPrompt(agent.dir, env, ctx) if ctx.interactive else None
+        _unlock_possible(agent.dir, store, env, ctx, account, _hint(backend))
+        prompt = UnlockPrompt(agent.dir, env, ctx, account, _hint(backend)) if ctx.interactive else None
         try:
             item, key = backend.get_ssh_key(item_id, prompt)
         except PasswordRefused:
-            record_failure(agent.dir, ctx.conn)
+            record_failure(agent.dir, ctx.conn, account)
             raise
         if prompt is not None and prompt.answered:
-            clear_failure(agent.dir)
+            clear_failure(agent.dir, account)
         try:
-            return load(agent, item, key, settings, env, ctx)
+            return load(agent, item, key, settings, env, ctx, account)
         finally:
             del key
 
 
 def load(agent: Agent, item, key: bytes, settings: dict, env: Mapping[str, str],
-         ctx: Optional[Context] = None) -> str:
+         ctx: Optional[Context] = None, account: Optional[str] = None) -> str:
     """Chargement d'une clé comme `load` : agent démarré s'il le faut, tout ou rien, état enregistré."""
     ctx = ctx or Context()
     blob = public_blob(item.public_key)
@@ -267,11 +289,12 @@ def load(agent: Agent, item, key: bytes, settings: dict, env: Mapping[str, str],
     e = adata["keys"].get(fp)
     if fp in {k.fingerprint for k in keys} and e is not None and fresh(e, time.time()):
         # même clé enregistrée pour un autre élément : celui-ci y est ajouté (chemin rapide)
-        if not owns(e, iid):
+        if not owns(e, iid, account):
             def also(d):
                 x = d["keys"].get(fp)
-                if x is not None and not owns(x, iid):
-                    x["also"] = [a for a in (x.get("also") or []) if isinstance(a, str)] + [item.id]
+                if x is not None and not owns(x, iid, account):
+                    x["also"] = [a for a in (x.get("also") or []) if isinstance(a, str)] + [
+                        "%s:%s" % (account, item.id) if account else item.id]
             agent.update(also)
         return "present"
     lifetime = settings["key-ttl"]
@@ -313,7 +336,7 @@ def load(agent: Agent, item, key: bytes, settings: dict, env: Mapping[str, str],
 
         def record(d):
             reconcile(d, {k.fingerprint for k in agent.keys()}, time.time())
-            d["keys"][fp] = state_entry(item.id, item.name, item.hosts, t, lifetime, confirm, restrict)
+            d["keys"][fp] = state_entry(item.id, item.name, item.hosts, t, lifetime, confirm, restrict, account)
         agent.update(record)  # en échec : clé retirée, jamais une clé chargée sans état
     except BaseException:
         with signals_blocked():
@@ -388,17 +411,23 @@ def _rollback(sub: Agent, before: set) -> None:
         pass
 
 
-def ensure_forward(fid: str, ids, backend: VaultBackend, store: SessionStore, settings: dict,
+def ensure_forward(fid: str, ids, backend: Optional[VaultBackend], store: Optional[SessionStore], settings: dict,
                    env: Optional[Mapping[str, str]] = None, ctx: Optional[Context] = None,
-                   directory: Optional[str] = None) -> str:
-    """Clés des éléments `ids` (UUID en minuscules), et elles seules, dans le sous-agent de
-    transfert `fid`, chargées s'il le faut. `settings` : key-ttl, forward-confirm. Renvoie
-    "present" ou "loaded" ; toute impossibilité lève l'erreur à afficher (une ligne).
-    L'agent dédié n'est jamais contacté."""
+                   directory: Optional[str] = None, accounts: Optional[Mapping] = None) -> str:
+    """Clés des éléments `ids` (UUID en minuscules, ou couples (compte, UUID)), et elles seules,
+    dans le sous-agent de transfert `fid`, chargées s'il le faut. `accounts` : {alias : (backend,
+    magasin de session)} des comptes de `ids` ; sans lui, `backend` et `store` pour tous. Au plus
+    une invite par compte ; un échec de déverrouillage est mémorisé pour son seul compte.
+    `settings` : key-ttl, forward-confirm. Renvoie "present" ou "loaded" ; toute impossibilité
+    lève l'erreur à afficher (une ligne), rien chargé (tout ou rien). L'agent dédié n'est
+    jamais contacté."""
     env = os.environ if env is None else env
     ctx = ctx or Context()
     base = directory or resolve_dir(env)
-    ids = [i.lower() for i in ids]
+    ids = [fastpath._pair(i) for i in ids]
+
+    def access(a):
+        return accounts[a] if accounts is not None else (backend, store)
     sub = forward_agent(base, fid, env)
     if fastpath.forward_fresh(base, fid, ids, env):
         return "present"
@@ -413,19 +442,25 @@ def ensure_forward(fid: str, ids, backend: VaultBackend, store: SessionStore, se
         todo = _missing(sub, ids, env, need_fresh=True)
         if not todo:
             return "present"
-        _unlock_possible(base, store, env, ctx)
-        prompt = UnlockPrompt(base, env, ctx) if ctx.interactive else None
+        groups = {}  # compte -> [ids], dans l'ordre
+        for a, i in todo:
+            groups.setdefault(a, []).append(i)
+        for a in groups:  # toute invite impossible dite avant la première invite
+            _unlock_possible(base, access(a)[1], env, ctx, a, _hint(access(a)[0]))
         got = []
         try:
-            try:
-                for i in todo:
-                    got.append(backend.get_ssh_key(i, prompt))
-            except PasswordRefused:
-                record_failure(base, ctx.conn)
-                raise
-            if prompt is not None and prompt.answered:
-                clear_failure(base)
-            for item, _ in got:
+            for a, iids in groups.items():
+                b = access(a)[0]
+                prompt = UnlockPrompt(base, env, ctx, a, _hint(b)) if ctx.interactive else None
+                try:
+                    for i in iids:
+                        got.append((a,) + tuple(b.get_ssh_key(i, prompt)))
+                except PasswordRefused:
+                    record_failure(base, ctx.conn, a)
+                    raise
+                if prompt is not None and prompt.answered:
+                    clear_failure(base, a)
+            for acct, item, _ in got:
                 # le coffre fait foi : une clé dont l'élément ne déclare plus ce transfert n'est
                 # pas chargée (config générée périmée)
                 if not any(forward_id(p) == fid for p in item.forward):
@@ -433,7 +468,7 @@ def ensure_forward(fid: str, ids, backend: VaultBackend, store: SessionStore, se
                                      "(lancer « sshvault ssh-config »)" % clean(item.name))
                 # clé du coffre différente du `.pub` généré (clé changée, config non régénérée) :
                 # elle serait retirée aussitôt ; refus avant tout chargement
-                pub = fastpath.pub_fingerprint(item.id.lower(), env)
+                pub = fastpath.pub_fingerprint(item.id.lower(), env, acct)
                 blob = public_blob(item.public_key)
                 if pub is not None and blob is not None and fingerprint(blob) != pub:
                     raise AgentError(STALE_PUB % item.id.lower())
@@ -444,13 +479,13 @@ def ensure_forward(fid: str, ids, backend: VaultBackend, store: SessionStore, se
             fset = {"key-ttl": settings["key-ttl"], "auto-confirm": confirm, "auto-restrict": False}
             before = {k.blob for k in sub.keys()}
             try:
-                for item, key in got:
-                    load(sub, item, key, fset, env, ctx)
+                for a, item, key in got:
+                    load(sub, item, key, fset, env, ctx, a)
                 drop_extras(sub, ids, env)
                 missing = _missing(sub, ids, env, need_fresh=False)
                 if missing:
                     # clé chargée puis retirée (filet : contrôle préalable ci-dessus)
-                    raise AgentError(STALE_PUB % missing[0])
+                    raise AgentError(STALE_PUB % missing[0][1])
             except BaseException:
                 with signals_blocked():
                     _rollback(sub, before)
@@ -467,14 +502,15 @@ def _missing(sub: Agent, ids, env: Mapping[str, str], need_fresh: bool) -> list:
     data = sub.state.load()
     now = time.time()
     out = []
-    for i in ids:
+    for x in ids:
+        a, i = fastpath._pair(x)
         ok = {fp for fp, e in data["keys"].items()
-              if owns(e, i) and fp in have and (not need_fresh or fresh(e, now))}
-        pub = fastpath.pub_fingerprint(i, env)
+              if owns(e, i, a) and fp in have and (not need_fresh or fresh(e, now))}
+        pub = fastpath.pub_fingerprint(i, env, a)
         if pub is not None:
             ok &= {pub}
         if not ok:
-            out.append(i)
+            out.append((a, i))
     return out
 
 

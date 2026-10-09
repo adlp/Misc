@@ -58,7 +58,7 @@ def test_match_fingerprint():
 
 
 def test_to_dict_sans_cle_privee():
-    assert set(item().to_dict()) == {"id", "name", "fingerprint", "hosts", "forward", "publicKey"}
+    assert set(item().to_dict()) == {"account", "id", "name", "fingerprint", "hosts", "forward", "publicKey"}
 
 
 def test_item_bw():
@@ -106,7 +106,8 @@ def backend(bench, monkeypatch):
         if k.startswith(("FAKE_BW_", "SSHVAULT_KEYCTL", "SSHVAULT_KEYRING")):
             monkeypatch.setenv(k, v)
     bench.unlocked("file")
-    store = SessionStore(keyctl="/nonexistent/keyctl", runtime_dir=str(bench.runtime))
+    from bench import ALIAS
+    store = SessionStore(keyctl="/nonexistent/keyctl", runtime_dir=str(bench.runtime), alias=ALIAS)
     return BwBackend(store=store, exe=str(bench.bw), appdata=str(bench.appdata), timeout=30)
 
 

@@ -56,7 +56,7 @@ def rehome(bench, name):
     h = bench.tmp / name
     h.mkdir()
     bench.home = h
-    bench.appdata = h / ".local" / "share" / "sshvault" / "bw"
+    bench.appdata = h / ".local" / "share" / "sshvault" / "accounts" / "alice" / "bw"
     bench.env["HOME"] = bench.env["SSHVAULT_SSH_HOME"] = str(h)
 
 
@@ -175,10 +175,10 @@ def test_ssh_config_genere(bench):
     exe = bench.exe
     assert (d / "config").read_text() == (
         sshconfig.HEADER
-        + "\n# Bastion RSA %s\nMatch originalhost bastion,jump exec \"'%s' ensure --id %s\"\n"
+        + "\n# Bastion RSA alice %s\nMatch originalhost bastion,jump exec \"'%s' ensure --account alice --id %s\"\n"
           "Match originalhost bastion,jump\n    IdentityAgent \"%s\"\n    IdentityFile \"%s\"\n"
           "    IdentitiesOnly yes\n" % (ID_BASTION, exe, ID_BASTION, sock, d / "pub" / pub_name(bench, "bastion"))
-        + "\n# Serveur Prod %s\nMatch originalhost prod.example.com,*.lab.example exec \"'%s' ensure --id %s\"\n"
+        + "\n# Serveur Prod alice %s\nMatch originalhost prod.example.com,*.lab.example exec \"'%s' ensure --account alice --id %s\"\n"
           "Match originalhost prod.example.com,*.lab.example\n    IdentityAgent \"%s\"\n"
           "    IdentityFile \"%s\"\n    IdentitiesOnly yes\n" % (ID_PROD, exe, ID_PROD, sock,
                                                                 d / "pub" / pub_name(bench, "prod")))
@@ -246,7 +246,7 @@ def test_ssh_config_hote_invalide_dans_le_coffre(bench):
     unlocked(bench)
     r = bench.run("ssh-config")
     assert r.returncode == 0, r.stderr
-    assert "« Bastion RSA » (%s) : hôte invalide « mauvais hote » : élément sauté" % ID_BASTION in r.stderr
+    assert "« Bastion RSA » (alice %s) : hôte invalide « mauvais hote » : élément sauté" % ID_BASTION in r.stderr
     text = (sv_dir(bench) / "config").read_text()
     assert "Match originalhost prod.example.com,*.lab.example\n" in text
     assert "bastion" not in text.lower()

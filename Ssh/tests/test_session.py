@@ -32,11 +32,11 @@ def test_keyring(ring, rt):
     s = SessionStore(keyring=ring, runtime_dir=str(rt))
     assert s.get() is None
     assert s.put(TOK, 60) == "keyring"
-    assert keyring_session(ring) == TOK
+    assert keyring_session(ring, None) == TOK
     assert s.get() == TOK and s.last_backend == "keyring"
     assert not (rt / "sshvault" / "session").exists(), "aucun fichier quand le keyring marche"
     s.clear()
-    assert keyring_session(ring) is None and s.get() is None
+    assert keyring_session(ring, None) is None and s.get() is None
 
 
 def test_keyring_expiration_noyau(ring, rt):
@@ -54,7 +54,7 @@ def test_keyring_timeout_refuse_repli_fichier(ring, rt, tmp_path):
         pytest.skip("pas de session keyring dédiée")
     s = SessionStore(keyring=ring, keyctl=keyctl_wrapper(tmp_path, "timeout"), runtime_dir=str(rt))
     assert s.put(TOK, 60) == "file"
-    assert keyring_session(ring) is None, "pas de clé sans délai laissée dans l'anneau"
+    assert keyring_session(ring, None) is None, "pas de clé sans délai laissée dans l'anneau"
     f = rt / "sshvault" / "session"
     assert stat.S_IMODE(f.stat().st_mode) == 0o600
     assert stat.S_IMODE(f.parent.stat().st_mode) == 0o700
@@ -128,7 +128,7 @@ def test_clear_vide_les_deux(ring, rt):
     s = SessionStore(keyring=ring, runtime_dir=str(rt))
     s._keyring_put(TOK, 60)
     s.clear()
-    assert keyring_session(ring) is None
+    assert keyring_session(ring, None) is None
     assert not (rt / "sshvault" / "session").exists()
 
 
@@ -190,3 +190,68 @@ def test_runtime_droits_groupe_refuse(rt):
     s = SessionStore(keyctl="/nonexistent/keyctl", runtime_dir=str(sub))
     with pytest.raises(SessionStoreError, match="tmpfs privé"):
         s.put(TOK, 60)
+
+
+def test_session_par_compte(ring, rt):
+    """CAP-10 : une session par alias (clé `sshvault:session:<alias>`, repli `sessions/<alias>`),
+    indépendantes entre elles et de celle de la 0.8.0."""
+    kw = {"keyring": ring} if ring else {"keyctl": "/nonexistent/keyctl"}
+    a = SessionStore(runtime_dir=str(rt), alias="perso", **kw)
+    b = SessionStore(runtime_dir=str(rt), alias="boulot", **kw)
+    legacy = SessionStore(runtime_dir=str(rt), **kw)
+    where = a.put(TOK, 60)
+    assert where == ("keyring" if ring else "file")
+    assert a.get() == TOK and b.get() is None and legacy.get() is None
+    if ring:
+        assert keyring_session(ring, "perso") == TOK and keyring_session(ring, None) is None
+    else:
+        f = rt / "sshvault" / "sessions" / "perso"
+        assert stat.S_IMODE(f.stat().st_mode) == 0o600 and stat.S_IMODE(f.parent.stat().st_mode) == 0o700
+        assert not (rt / "sshvault" / "session").exists()
+    b.put("autre-session-%s" % TOK, 60)
+    a.clear()
+    assert a.get() is None and b.get() == "autre-session-%s" % TOK
+    assert "sessions/perso" in a.describe() and "sessions/boulot" in b.describe()
+
+
+def test_move_to_keyring_garde_la_duree(ring, rt):
+    """Compte renommé : jeton déplacé sous la nouvelle clé avec sa durée restante (arrondie
+    vers le bas par /proc/keys), pas la durée par défaut ; ancienne clé retirée."""
+    if not ring:
+        pytest.skip("pas de session keyring dédiée")
+    old = SessionStore(keyring=ring, runtime_dir=str(rt), alias="boulot")
+    new = SessionStore(keyring=ring, runtime_dir=str(rt), alias="travail")
+    old.put(TOK, 3000)
+    assert old.move_to(new) == "keyring"
+    assert old.get() is None and keyring_session(ring, "boulot") is None
+    assert new.get() == TOK
+    ttl = new._keyring_ttl()
+    assert ttl is not None and 2800 <= ttl <= 3000, ttl
+
+
+def test_move_to_fichier_garde_l_expiration(rt):
+    old = SessionStore(keyctl="/nonexistent/keyctl", runtime_dir=str(rt), alias="boulot")
+    new = SessionStore(keyctl="/nonexistent/keyctl", runtime_dir=str(rt), alias="travail")
+    old.put(TOK, 500)
+    exp = (rt / "sshvault" / "sessions" / "boulot").read_text().split()[1]
+    assert old.move_to(new) == "file"
+    assert not (rt / "sshvault" / "sessions" / "boulot").exists()
+    assert (rt / "sshvault" / "sessions" / "travail").read_text().split() == [TOK, exp]
+    assert new.get() == TOK and old.get() is None
+
+
+def test_move_to_refuse_garde_l_ancienne(ring, rt, tmp_path):
+    """Nouvelle clé refusée (keyctl padd en échec) : SessionStoreError, ancienne session intacte."""
+    if not ring:
+        pytest.skip("pas de session keyring dédiée")
+    old = SessionStore(keyring=ring, runtime_dir=str(rt), alias="boulot")
+    new = SessionStore(keyring=ring, keyctl=keyctl_wrapper(tmp_path, "padd"), runtime_dir=str(rt), alias="travail")
+    old.put(TOK, 600)
+    with pytest.raises(SessionStoreError):
+        old.move_to(new)
+    assert old.get() == TOK and keyring_session(ring, "travail") is None
+
+
+def test_move_to_sans_session(rt):
+    old = SessionStore(keyctl="/nonexistent/keyctl", runtime_dir=str(rt), alias="boulot")
+    assert old.move_to(SessionStore(keyctl="/nonexistent/keyctl", runtime_dir=str(rt), alias="travail")) is None

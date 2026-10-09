@@ -13,8 +13,12 @@ Codes de sortie :
      hôte invalide ; sélection de hosts ou forward qui désigne plusieurs éléments ; import :
      fichier refusé — illisible, pas une clé privée, type ou format non accepté — ou --name
      avec plusieurs fichiers ; generate : type, bits, nom ou commentaire refusés ; deploy :
-     cible, port ou options ssh invalides)
-  3  non connecté au coffre, ou coffre verrouillé (aucune invite possible, mot de passe refusé) ;
+     cible, port ou options ssh invalides ; comptes : alias inconnu ou invalide, alias ou
+     couple serveur + e-mail déjà enregistré, serveur ou e-mail invalide, écriture ou login
+     sans --account alors que plusieurs comptes sont possibles, aucun compte par défaut,
+     account rename vers un alias déjà pris, account add : dossier accounts/<alias> existant)
+  3  non connecté au coffre, aucun compte enregistré, ou coffre verrouillé (aucune invite
+     possible, mot de passe refusé) ;
      agent dédié arrêté ou verrouillé (ensure --forward compris) ; passphrase d'une clé
      refusée ou impossible à saisir (load, import)
   4  erreur du backend (bw absent, non exécutable ou impossible à lancer, au chemin du réglage
@@ -34,11 +38,17 @@ Codes de sortie :
      ordinaire, droits), répertoire
      personnel inconnu, ssh-config install refusé (~/.ssh/config lien symbolique ou non
      ordinaire, Include de sshvault dans un bloc Host/Match, chemin personnel avec %, $ ou
-     joker de glob), ou erreur interne
+     joker de glob), adoption de l'installation 0.8.0 impossible (rien modifié ; account add
+     refusé tant qu'elle n'est pas faite), account rename : destination existante ou
+     déplacement impossible, account remove : données impossibles à supprimer, magasin de
+     session ou agent en erreur (clés laissées), ou erreur interne
   130 interrompu (Ctrl-C, SIGTERM, SIGHUP)
 `ensure` (appelé par ssh, Match exec) : 0 si la clé est présente ou chargée, et pour `ssh -G` ;
 sinon le code de l'erreur, sans effet sur ssh (le Match ne porte aucune directive).
-`status` : 0 si le coffre est déverrouillé, 3 s'il est verrouillé ou non connecté, 4 en erreur.
+`status` : 0 si le coffre de chaque compte affiché est déverrouillé, 3 si l'un est verrouillé ou
+non connecté (ou aucun compte), 4 en erreur.
+Plusieurs comptes (lecture, unlock, lock, sync) : l'erreur d'un compte est dite (`<alias> : …`),
+les autres sont traités ; code : le pire.
 `import` de plusieurs fichiers : le pire des codes rencontrés (0 < 1 < 2 < 3 < 4).
 `agent status` : 0 si l'agent dédié tourne, 3 s'il est arrêté, 4 en erreur ou agent tiers ;
 `agent status|stop|purge|lock` : 4 si un sous-agent de transfert est en erreur (agent tiers sur
@@ -64,10 +74,14 @@ from .agent import (CMD_TIMEOUT as AGENT_TIMEOUT, FID_RE, Agent, AgentError, Age
                     PassphraseRefused, askpass_rules, fingerprint, forward_agent, forward_agents, forward_fids,
                     is_encrypted, literal_host, public_blob, resolve_dir, tty_available)
 from .agentstate import entry as state_entry, maybe_locked, reconcile, remaining
-from .backend import (FORWARD_FIELD, HOSTS_FIELD, BackendError, InvalidHost, NotLoggedIn, SshKeyItem, VaultBackend, VaultError,
+from . import accounts as accounts_mod
+from .accounts import (AccountError, AccountIOError, Accounts, AdoptError, NoAccount, adopt_legacy,
+                       pending_message, tag)
+from .backend import (FORWARD_FIELD, HOSTS_FIELD, BackendError, InvalidHost, ItemNotFound, NotLoggedIn, SshKeyItem, VaultBackend, VaultError,
                       VaultLocked, WriteFailed, normalize_hosts, valid_host)
-from .bw import EXE_VAR as BW_EXE_VAR, BwBackend
-from .config import BW_PATH, Config, ConfigError, ConfigWriteError, describe_duration, parse_duration
+from .bw import EXE_VAR as BW_EXE_VAR, BwBackend, account_dir, reset_process_state
+from .config import (ACCOUNTS, BW_PATH, DEFAULT_ACCOUNTS, Config, ConfigError, ConfigWriteError, check_alias,
+                     describe_duration, normalize_email, normalize_server, parse_duration)
 from . import deploy as deploy_mod
 from . import ensure as ensure_mod
 from . import fastpath
@@ -130,6 +144,21 @@ def bits_arg(s: str) -> int:
         raise argparse.ArgumentTypeError("--bits invalide : %r (3072 ou 4096)" % s) from None
 
 
+def account_arg(s: str) -> str:
+    try:
+        return check_alias(s)
+    except ConfigError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
+def _account_flag(parser, what: str = "compte visé (plusieurs fois : plusieurs comptes) ; défaut : comptes par "
+                                      "défaut") -> None:
+    parser.add_argument("--account", metavar="ALIAS", action="append", type=account_arg, help=what)
+
+
+_ONE = "compte visé (un seul) ; défaut : le compte par défaut s'il est unique"
+
+
 def _selection_flags(parser) -> None:
     g = parser.add_mutually_exclusive_group()
     for flag, what in (("host", "motif glob d'hôte"), ("name", "sous-chaîne du nom"),
@@ -150,9 +179,10 @@ def build_parser() -> Parser:
                       "ssh-config --check : pas à jour ; import : déjà dans le coffre ; generate : nom "
                       "déjà pris), 2 usage (hôte invalide, sélection ambiguë, import : fichier refusé, "
                       "generate : type ou commentaire refusé, deploy : cible invalide, config set bw-path : "
-                      "chemin refusé), "
-                      "3 non connecté ou verrouillé (coffre ou agent, passphrase refusée), "
+                      "chemin refusé ; comptes : alias inconnu, invalide ou pris, --account requis), "
+                      "3 aucun compte, non connecté ou verrouillé (coffre ou agent, passphrase refusée), "
                       "4 erreur backend ou agent, écriture ou ssh_config impossible, install refusé, "
+                      "adoption 0.8.0 impossible, account rename/remove en échec, "
                       "ssh-keygen ou ssh en échec, "
                       "130 interrompu. "
                       "status : 0 déverrouillé, 3 sinon ; agent status : 0 actif, 3 arrêté, 4 sous-agent de "
@@ -163,18 +193,40 @@ def build_parser() -> Parser:
                         "mot de passe de verrouillage de l'agent (code 3)")
     sub = p.add_subparsers(dest="cmd", metavar="COMMANDE", parser_class=Parser)
     sub.required = True
-    sub.add_parser("status", help="état du coffre et de la session")
-    s = sub.add_parser("login", help="connexion au coffre (interactive, déléguée à bw)")
-    s.add_argument("--server", metavar="URL", help="URL du serveur Vaultwarden (bw config server)")
+    s = sub.add_parser("status", help="état du coffre et de la session de chaque compte")
+    _account_flag(s, "compte affiché (plusieurs fois possible) ; défaut : tous")
+    s = sub.add_parser("login", help="connexion d'un compte au coffre (interactive, déléguée à bw : bw login <e-mail>)")
+    _account_flag(s, "compte à connecter (obligatoire s'il y a plusieurs comptes)")
     s.add_argument("--apikey", action="store_true", help="connexion par clé API (BW_CLIENTID/BW_CLIENTSECRET)")
-    s = sub.add_parser("unlock", help="déverrouille le coffre et garde la session")
+    s = sub.add_parser("unlock", help="déverrouille le coffre et garde la session (une invite par compte)")
+    _account_flag(s)
     s.add_argument("--ttl", type=ttl_arg, default=DEFAULT_TTL, metavar="SECONDES",
                    help="durée de vie de la session (défaut %d)" % DEFAULT_TTL)
-    sub.add_parser("lock", help="verrouille le coffre et oublie la session")
-    sub.add_parser("sync", help="resynchronise le coffre depuis le serveur")
+    s = sub.add_parser("lock", help="verrouille le coffre et oublie la session")
+    _account_flag(s, "compte à verrouiller (plusieurs fois possible) ; défaut : tous")
+    s = sub.add_parser("sync", help="resynchronise le coffre depuis le serveur")
+    _account_flag(s)
     s = sub.add_parser("list", help="liste les clés SSH du coffre")
+    _account_flag(s)
     s.add_argument("--json", action="store_true", help="sortie JSON")
+    s = sub.add_parser("account", help="comptes du coffre : add, list, remove, default, rename")
+    asub = s.add_subparsers(dest="account_cmd", metavar="ACTION", parser_class=Parser)
+    asub.required = True
+    a = asub.add_parser("add", help="enregistre un compte (alias → serveur + e-mail) ; puis « sshvault login »")
+    a.add_argument("alias", metavar="ALIAS", type=account_arg)
+    a.add_argument("--server", metavar="URL", required=True, help="URL du serveur Vaultwarden")
+    a.add_argument("--email", metavar="E", required=True, help="e-mail du compte")
+    asub.add_parser("list", help="comptes enregistrés (alias, serveur, e-mail, défaut)")
+    a = asub.add_parser("remove", help="verrouille le compte, supprime ses données locales de bw, retire ses clés "
+                                       "des agents et régénère le ssh_config (rien n'est modifié dans le coffre)")
+    a.add_argument("alias", metavar="ALIAS", type=account_arg)
+    a = asub.add_parser("default", help="remplace la liste des comptes par défaut")
+    a.add_argument("aliases", metavar="ALIAS", nargs="+", type=account_arg)
+    a = asub.add_parser("rename", help="renomme un compte (données, état des agents, ssh_config)")
+    a.add_argument("old", metavar="ANCIEN", type=account_arg)
+    a.add_argument("new", metavar="NOUVEAU", type=account_arg)
     s = sub.add_parser("search", help="cherche des clés par hôte, nom ou empreinte")
+    _account_flag(s)
     s.add_argument("pattern", metavar="MOTIF")
     g = s.add_mutually_exclusive_group()
     g.add_argument("--host", dest="by", action="store_const", const="host",
@@ -188,6 +240,7 @@ def build_parser() -> Parser:
     s = sub.add_parser("load", help="charge des clés du coffre dans l'agent dédié")
     s.add_argument("pattern", metavar="MOTIF", nargs="?", help="comme search (ou --all)")
     s.add_argument("--all", action="store_true", help="toutes les clés SSH du coffre")
+    _account_flag(s)
     g = s.add_mutually_exclusive_group()
     for flag, what in (("host", "motif glob d'hôte"), ("name", "sous-chaîne du nom"),
                        ("fingerprint", "empreinte exacte"), ("id", "id exact de l'élément")):
@@ -221,6 +274,7 @@ def build_parser() -> Parser:
                                   ("list", "affiche les hôtes", None)):
             h = hsub.add_parser(name, help=what)
             h.add_argument("pattern", metavar="SÉLECTION", help="un seul élément, choisi comme pour load")
+            _account_flag(h, "comptes lus (list) ; compte écrit (add, remove, set : un seul)")
             g = h.add_mutually_exclusive_group()
             for flag, sel in (("host", "motif glob d'hôte"), ("name", "sous-chaîne du nom"),
                               ("fingerprint", "empreinte exacte"), ("id", "id exact de l'élément")):
@@ -237,6 +291,7 @@ def build_parser() -> Parser:
                         "chiffrée : avec --decrypt seulement")
     s.add_argument("--name", metavar="NOM", help="nom de l'élément (un seul FICHIER ; défaut : commentaire de la "
                                                   "clé, sinon nom du fichier)")
+    _account_flag(s, _ONE)
     s.add_argument("--hosts", metavar="HÔTES", action="append", default=[],
                    help="hôtes associés, liste à virgules (comme hosts add) ; ssh_config régénéré")
     s.add_argument("--force", action="store_true",
@@ -248,6 +303,7 @@ def build_parser() -> Parser:
     s = sub.add_parser("generate", help="génère une nouvelle clé directement dans le coffre (clé publique "
                                         "seule sur stdout ; clé privée jamais écrite sur disque)")
     s.add_argument("--name", required=True, metavar="NOM", help="nom de l'élément (obligatoire)")
+    _account_flag(s, _ONE)
     s.add_argument("--type", default="ed25519", metavar="TYPE", help="ed25519 (défaut) ou rsa")
     s.add_argument("--bits", type=bits_arg, metavar="BITS", help="RSA seulement : 3072 ou 4096 (défaut 4096)")
     s.add_argument("--comment", metavar="TEXTE",
@@ -260,15 +316,17 @@ def build_parser() -> Parser:
                                       "de bw, aucun appel réseau)")
     s.add_argument("pattern", metavar="SÉLECTION", nargs="?", help="comme load (ou --all)")
     s.add_argument("--all", action="store_true", help="toutes les clés SSH du coffre")
+    _account_flag(s)
     _selection_flags(s)
 
     s = sub.add_parser("deploy", help="ajoute les clés publiques sélectionnées à ~/.ssh/authorized_keys d'une "
                                       "cible, par un seul ssh (idempotent)",
-                       usage="sshvault deploy [-h] [--host | --name | --fingerprint | --id] [-p PORT] "
+                       usage="sshvault deploy [-h] [--host | --name | --fingerprint | --id] [-p PORT] [--account ALIAS] "
                              "SÉLECTION [UTILISATEUR@]HÔTE [-- OPTIONS_SSH…]")
     s.add_argument("pattern", metavar="SÉLECTION", help="comme load")
     s.add_argument("target", metavar="[UTILISATEUR@]HÔTE", help="cible (lettres, chiffres, . - _ ; IPv6 entre crochets)")
     s.add_argument("-p", dest="port", metavar="PORT", help="port de la cible")
+    _account_flag(s)
     _selection_flags(s)
 
     s = sub.add_parser("ssh-config", help="génère ~/.ssh/sshvault/config et les clés publiques ; "
@@ -283,8 +341,9 @@ def build_parser() -> Parser:
 
     s = sub.add_parser("ensure", help="charge à la demande la clé d'un élément (appelé par ssh : ligne "
                                       "Match exec du ssh_config généré)")
+    s.add_argument("--account", metavar="ALIAS", action="append", help="compte de l'élément")
     s.add_argument("--id", required=True, action="append", metavar="ID",
-                   help="id (UUID) de l'élément ; plusieurs avec --forward")
+                   help="id (UUID) de l'élément ; avec --forward : <alias>:<UUID>, plusieurs")
     s.add_argument("--forward", metavar="FID", action="append",
                    help="sous-agent de transfert (16 chiffres hexadécimaux) : y charge les clés des --id, et elles "
                         "seules")
@@ -305,12 +364,13 @@ def build_parser() -> Parser:
 
 
 def print_items(items: list, as_json: bool) -> None:
+    """Texte : `alias⇥nom⇥empreinte⇥hôtes` (alias toujours en première colonne) ; JSON : clé `account`."""
     if as_json:
         print(json.dumps([i.to_dict() for i in items], ensure_ascii=False, indent=1))
         return
     for i in items:
-        print("%s\t%s\t%s" % (clean(i.name), clean(i.fingerprint or "-"),
-                              ",".join(clean(h) for h in i.hosts) or "-"))
+        print("%s\t%s\t%s\t%s" % (clean(i.account or "-"), clean(i.name), clean(i.fingerprint or "-"),
+                                  ",".join(clean(h) for h in i.hosts) or "-"))
 
 
 def match(item: SshKeyItem, pattern: str, by: Optional[str]) -> bool:
@@ -325,88 +385,516 @@ def match(item: SshKeyItem, pattern: str, by: Optional[str]) -> bool:
     return item.match_name(pattern) or item.match_host(pattern) or item.match_fingerprint(pattern)
 
 
-def run(args, backend: VaultBackend) -> int:
+def collect(accts: Accounts, aliases: list, prompt) -> tuple:
+    """(éléments de ces comptes, alias en tête, code) : une invite au plus par compte. Un seul
+    compte : son erreur est levée telle quelle. Plusieurs : l'erreur d'un compte est dite (une
+    ligne, `<alias> : …`) et les autres sont lus, code le pire ; tous en échec : _Reported."""
+    if len(aliases) == 1:
+        a = aliases[0]
+        return tag(a, accts.backend(a).list_ssh_keys(prompt)), RC_OK
+    items, rc, failed = [], RC_OK, 0
+    for a in aliases:
+        try:
+            items += tag(a, accts.backend(a).list_ssh_keys(prompt))
+        except (VaultError, SessionStoreError) as e:
+            code, msg = classify(e)
+            err("%s : %s" % (a, msg))
+            rc, failed = max(rc, code), failed + 1
+    if failed == len(aliases):
+        raise _Reported(rc)  # aucun compte lu : erreurs déjà dites
+    return items, rc
+
+
+class _Reported(Exception):
+    """Erreur déjà dite (une ligne par compte) : seulement le code de sortie."""
+
+    def __init__(self, rc: int):
+        super().__init__("")
+        self.rc = rc
+
+
+def _per_account(accts: Accounts, aliases: list, fn) -> int:
+    """`fn(alias, backend)` pour chaque compte ; un seul compte : erreur levée telle quelle ;
+    plusieurs : erreur dite (`<alias> : …`), les autres traités, code le pire."""
+    if len(aliases) == 1:
+        fn(aliases[0], accts.backend(aliases[0]))
+        return RC_OK
+    rc = RC_OK
+    for a in aliases:
+        try:
+            fn(a, accts.backend(a))
+        except (VaultError, SessionStoreError, AgentError) as e:
+            code, msg = classify(e)
+            err("%s : %s" % (a, msg))
+            rc = max(rc, code)
+    return rc
+
+
+def run(args, accts: Accounts) -> int:
     prompt = make_prompt(args)
     if args.cmd == "search" and not args.pattern.strip():
         raise UsageError("motif vide")
+    if args.cmd == "account":
+        return run_account(args, accts, prompt)
     if args.cmd == "status":
-        print("bw : %s" % backend.describe_exe(), flush=True)  # avant le lancement : dit même si bw manque
-        st = backend.status()
-        label = {"unauthenticated": "non connecté", "locked": "verrouillé",
-                 "unlocked": "déverrouillé"}[st.state]
-        info = backend.info()
-        print("coffre : %s" % label)
-        print("serveur : %s" % clean(st.server or "-"))
-        print("compte : %s" % clean(st.user or "-"))
-        session = info["session"] if st.state == "unlocked" else None
-        print("session : %s" % (session or "aucune"))
-        print("magasin : %s" % info["store"])
-        print("données : %s" % info["data"])
-        return RC_OK if st.state == "unlocked" else RC_LOCKED
+        return run_status(args, accts)
     if args.cmd == "login":
+        if not args.account and len(accts.registry) > 1:
+            raise AccountError("login : préciser --account ALIAS (comptes : %s)" % ", ".join(accts.registry))
+        alias = accts.write_one(args.account, "login") if (args.account or not accts.registry) \
+            else next(iter(accts.registry))
+        b = accts.backend(alias)
         try:
-            state = backend.login(server=args.server, apikey=args.apikey)
+            state = b.login(apikey=args.apikey)
         except VaultError:
             # l'invite de bw reste sans fin de ligne si la saisie est interrompue
             sys.stderr.write("\n")
             raise
+        who = "compte %s : " % alias
         if state == "unlocked":
-            print("connecté, coffre déverrouillé")
+            print(who + "connecté, coffre déverrouillé")
         else:
-            print("connecté ; lancer « sshvault unlock » pour déverrouiller")
-        return RC_OK
+            print(who + "connecté ; lancer « %s » pour déverrouiller" % b.cmd("unlock"))
+        return _regen_after_login()
     if args.cmd == "unlock":
-        backend.unlock(prompt, ttl=args.ttl)
-        _clear_unlock_failure()
-        where = backend.info()["session"]
-        print("coffre déverrouillé (%s)" % ("session %ds, %s" % (args.ttl, where) if where
-                                            else "session non rangée"))
-        return RC_OK
+        def unlock(a, b):
+            b.unlock(prompt, ttl=args.ttl)
+            _clear_unlock_failure(a)
+            where = b.info()["session"]
+            print("coffre déverrouillé%s (%s)" % (" : " + a if accts.multi else "",
+                                                  "session %ds, %s" % (args.ttl, where) if where
+                                                  else "session non rangée"))
+        return _per_account(accts, accts.read_set(args.account), unlock)
     if args.cmd == "lock":
-        backend.lock()
-        print("coffre verrouillé, session oubliée")
-        return RC_OK
+        def lock(a, b):
+            b.lock()
+            print("coffre verrouillé, session oubliée%s" % (" : " + a if accts.multi else ""))
+        accts.need_some()  # aucun compte : NoAccount (code 3), comme unlock et sync
+        return _per_account(accts, accts.all(args.account), lock)
     if args.cmd == "sync":
-        backend.sync(prompt)
-        print("synchronisé")
-        return RC_OK
+        def sync(a, b):
+            b.sync(prompt)
+            print("synchronisé%s" % (" : " + a if accts.multi else ""))
+        return _per_account(accts, accts.read_set(args.account), sync)
     if args.cmd == "list":
-        print_items(backend.list_ssh_keys(prompt), args.json)
-        return RC_OK
+        items, rc = collect(accts, accts.read_set(args.account), prompt)
+        print_items(items, args.json)
+        return rc
     if args.cmd == "search":
-        found = [i for i in backend.list_ssh_keys(prompt) if match(i, args.pattern, args.by)]
+        items, rc = collect(accts, accts.read_set(args.account), prompt)
+        found = [i for i in items if match(i, args.pattern, args.by)]
         if not found:
             err("aucune clé ne correspond à « %s »" % args.pattern)
-            return RC_NONE
+            return max(rc, RC_NONE)
         print_items(found, args.json)
-        return RC_OK
+        return rc
     if args.cmd == "load":
-        return run_load(args, backend, prompt)
+        return run_load(args, accts, prompt)
     if args.cmd == "agent":
         return run_agent(args)
     if args.cmd == "config":
         return run_config(args)
     if args.cmd in ("hosts", "forward"):
-        return run_hosts(args, backend, prompt)
+        return run_hosts(args, accts, prompt)
     if args.cmd == "ssh-config":
-        return run_ssh_config(args, backend, prompt)
+        return run_ssh_config(args, accts, prompt)
     if args.cmd == "import":
-        return run_import(args, backend, prompt)
+        return run_import(args, accts, prompt)
     if args.cmd == "generate":
-        return run_generate(args, backend, prompt)
+        return run_generate(args, accts, prompt)
     if args.cmd == "pubkey":
-        return run_pubkey(args, backend, prompt)
+        return run_pubkey(args, accts, prompt)
     if args.cmd == "deploy":
-        return run_deploy(args, backend, prompt)
+        return run_deploy(args, accts, prompt)
     raise UsageError("commande inconnue : %s" % args.cmd)
 
 
-def _clear_unlock_failure() -> None:
+def run_status(args, accts: Accounts) -> int:
+    """Tous les comptes (ou ceux de --account) : 0 s'ils sont tous déverrouillés, 3 sinon, 4 en
+    erreur (le pire)."""
+    describe = BwBackend(bw_path=configured_bw_path, warn=err)
+    print("bw : %s" % describe.describe_exe(), flush=True)  # avant le lancement : dit même si bw manque
+    aliases = accts.all(args.account)
+    if not aliases:
+        pending = pending_message(accts.cfg, "aucun compte utilisable pour l'instant")
+        print("comptes : aucun (%s)" % (pending or "« sshvault account add ALIAS --server URL --email E »"))
+        return RC_LOCKED
+    rc = RC_OK
+    for n, a in enumerate(aliases):
+        b = accts.backend(a)
+        reg = accts.registry[a]
+        if n:
+            print()
+        print("alias : %s%s" % (a, " (défaut)" if a in accts.defaults else ""), flush=True)
+        try:
+            st = b.status()
+        except (VaultError, SessionStoreError) as e:
+            code, msg = classify(e)
+            if len(aliases) == 1:
+                raise
+            err("%s : %s" % (a, msg))
+            rc = max(rc, code)
+            continue
+        label = {"unauthenticated": "non connecté", "locked": "verrouillé",
+                 "unlocked": "déverrouillé"}[st.state]
+        info = b.info()
+        print("coffre : %s" % label)
+        print("serveur : %s" % clean(st.server or reg["server"]))
+        print("compte : %s" % clean(st.user or reg["email"]))
+        session = info["session"] if st.state == "unlocked" else None
+        print("session : %s" % (session or "aucune"))
+        print("magasin : %s" % info["store"])
+        print("données : %s" % info["data"])
+        if st.user and st.user.strip().lower() != reg["email"]:
+            err("avertissement : %sbw est connecté comme %s, le registre dit %s"
+                % (accts.prefix(a), clean(st.user), reg["email"]))
+        if st.state != "unauthenticated" and st.server:
+            try:
+                srv = normalize_server(st.server)
+            except ConfigError:
+                srv = st.server
+            if srv != reg["server"]:
+                err("avertissement : %sbw est connecté au serveur %s, le registre dit %s"
+                    % (accts.prefix(a), clean(st.server), reg["server"]))
+        if st.state != "unlocked":
+            rc = max(rc, RC_LOCKED)
+    return rc
+
+
+def _clear_unlock_failure(alias: Optional[str] = None) -> None:
     """Coffre déverrouillé à la main : l'échec mémorisé par `ensure` ne bloque plus rien."""
     try:
-        ensure_mod.clear_failure(resolve_dir())
+        ensure_mod.clear_failure(resolve_dir(), alias)
     except Exception:
         pass
+
+
+# --- comptes du coffre (CAP-10) ------------------------------------------------------------
+
+def run_account(args, accts: Accounts, prompt) -> int:
+    cfg = accts.cfg
+    cmd = args.account_cmd
+    if cmd == "list":
+        if not accts.registry:
+            print("aucun compte (« sshvault account add ALIAS --server URL --email E »)")
+            return RC_OK
+        for a, reg in accts.registry.items():
+            print("%s\t%s\t%s\t%s" % (a, reg["server"], reg["email"], "défaut" if a in accts.defaults else "-"))
+        return RC_OK
+    if cmd == "add":
+        server, email = normalize_server(args.server), normalize_email(args.email)
+        pending = pending_message(cfg, "rien ajouté (un compte ajouté maintenant empêcherait l'adoption)")
+        if pending:
+            # l'adoption a été tentée au lancement et remise (bw illisible)
+            raise AdoptError(pending)
+        d_acct = account_dir(args.alias)
+        if os.path.lexists(d_acct):
+            raise AccountError("%s existe déjà (données d'un ancien compte ?) : rien ajouté ; le déplacer ou le "
+                               "supprimer d'abord" % d_acct)
+
+        def add(d):
+            reg = d.setdefault(ACCOUNTS, {})
+            if args.alias in reg:
+                raise AccountError("compte « %s » déjà enregistré (%s, %s) : rien changé"
+                                   % (args.alias, reg[args.alias]["server"], reg[args.alias]["email"]))
+            same = [a for a, v in reg.items() if (v["server"], v["email"]) == (server, email)]
+            if same:
+                raise AccountError("%s sur %s déjà enregistré sous l'alias « %s » : rien changé" % (email, server, same[0]))
+            reg[args.alias] = {"server": server, "email": email}
+            if not d.get(DEFAULT_ACCOUNTS) and len(reg) == 1:
+                d[DEFAULT_ACCOUNTS] = [args.alias]  # premier compte : compte par défaut
+        data = cfg.update(add)
+        n = len(data[ACCOUNTS])
+        if server.startswith("http://"):
+            err("avertissement : %s en http : mot de passe maître et coffre passent en clair sur le réseau" % server)
+        print("compte %s ajouté : %s, %s%s" % (args.alias, server, email,
+                                              ", compte par défaut" if args.alias in data.get(DEFAULT_ACCOUNTS, []) else ""))
+        print("lancer « sshvault login%s »" % (" --account %s" % args.alias if n > 1 else ""))
+        return RC_OK
+    if cmd == "default":
+        want = []
+        for a in args.aliases:
+            accts.check(a)
+            if a not in want:
+                want.append(a)
+
+        def setdef(d):
+            for a in want:  # revérifié sous le verrou : un `account remove` concurrent
+                if a not in d.get(ACCOUNTS, {}):
+                    raise AccountError("compte « %s » inconnu : rien changé" % a)
+            d[DEFAULT_ACCOUNTS] = want
+        cfg.update(setdef)
+        print("comptes par défaut : %s" % ", ".join(want))
+        return RC_OK
+    if cmd == "rename":
+        return account_rename(args, accts)
+    if cmd == "remove":
+        return account_remove(args, accts)
+    raise UsageError("action inconnue : account %s" % cmd)
+
+
+def _agents_with_ensure_lock():
+    """(dossier de l'agent dédié, agent dédié, sous-agents) ; dossier None si XDG_RUNTIME_DIR refusé."""
+    try:
+        base = resolve_dir()
+    except AgentError:
+        return None, None, []
+    return base, Agent(base), forward_agents(base)
+
+
+def _states(base, main, subs):
+    """Agents dont l'état existe : agent dédié puis sous-agents de transfert."""
+    return [a for a in [main] + list(subs) if a is not None and os.path.exists(a.state.path)]
+
+
+def _locked_or_null(base):
+    import contextlib
+    return _ensure_lock(base) if base is not None else contextlib.nullcontext()
+
+
+def account_rename(args, accts: Accounts) -> int:
+    """Données de bw déplacées, registre, comptes par défaut, session (déplacée sous le nouvel
+    alias, durée restante gardée), état des agents et ssh_config ; sous ensure.lock. Rien dans le
+    coffre. Alias pris : code 2 ; destination existante ou déplacement impossible : code 4."""
+    old, new = args.old, args.new
+    accts.check(old)
+    if new in accts.registry:
+        raise AccountError("alias « %s » déjà pris : rien changé" % new)
+    src_dir, dst_dir = account_dir(old), account_dir(new)
+    if os.path.lexists(dst_dir):
+        raise AccountIOError("%s existe déjà : rien changé" % dst_dir)
+    base, main, subs = _agents_with_ensure_lock()
+    session_note = None
+    with _locked_or_null(base):
+        moved = False
+        if os.path.lexists(src_dir):
+            try:
+                os.rename(src_dir, dst_dir)
+                moved = True
+            except OSError as e:
+                raise AccountIOError("déplacement de %s vers %s impossible (%s) : rien changé"
+                                     % (src_dir, dst_dir, e.strerror or e)) from None
+
+        def ren(d):
+            reg = d.get(ACCOUNTS, {})
+            if old not in reg or new in reg:  # revérifié sous le verrou
+                raise AccountError("compte « %s » absent ou alias « %s » pris entre-temps : rien changé" % (old, new))
+            reg[new] = reg.pop(old)
+            d[DEFAULT_ACCOUNTS] = [new if a == old else a for a in d.get(DEFAULT_ACCOUNTS, [])]
+        try:
+            accts.cfg.update(ren)
+        except BaseException:
+            if moved:
+                try:
+                    os.rename(dst_dir, src_dir)
+                except OSError:
+                    pass
+            raise
+        try:
+            SessionStore(alias=old).move_to(SessionStore(alias=new))
+        except SessionStoreError as e:
+            session_note = str(e)
+            for a in (old, new):
+                try:
+                    SessionStore(alias=a).clear()
+                except SessionStoreError:
+                    pass
+        if base is not None:
+            _clear_unlock_failure(old)
+
+            def relabel(d):
+                for e in d["keys"].values():
+                    if e.get("account") == old:
+                        e["account"] = new
+                    if e.get("also"):
+                        e["also"] = ["%s:%s" % (new, x.split(":", 1)[1]) if isinstance(x, str) and x.startswith(old + ":")
+                                     else x for x in e["also"]]
+            for a in _states(base, main, subs):
+                try:
+                    a.update(relabel)
+                except AgentError as e:
+                    err("avertissement : état de l'agent %s : %s" % (a.state.path, e))
+    multi = len(accts.registry) > 1
+    print("compte %s renommé en %s" % (old, new))
+    if session_note is not None:
+        err("avertissement : session de %s non déplacée (%s) : oubliée, déverrouillage à refaire (« sshvault unlock%s »)"
+            % (old, session_note, " --account %s" % new if multi else ""))
+    return _regen_after_registry_change(renamed={old: new})
+
+
+def _owner_refs(e: dict, alias: str, ids: set):
+    """(entrée au compte `alias` ?, autres détenteurs de la clé : références `also` d'autres
+    comptes, dans l'ordre)."""
+    def is_mine(acct, iid):
+        return acct == alias or (acct is None and iid.lower() in ids)
+    mine = is_mine(e.get("account"), e["id"])
+    others = []
+    for x in e.get("also") or []:
+        if not isinstance(x, str):
+            continue
+        a, i = fastpath._pair(x)
+        if not is_mine(a, i):
+            others.append(x)
+    return mine, others
+
+
+def _drop_account(dd: dict, alias: str, ids: set, known: Optional[dict] = None) -> set:
+    """Entrées de l'état sans le compte `alias` : sa clé gardée et promue au détenteur suivant
+    si un autre compte la partage (`also` ; nom et hôtes du nouveau détenteur pris dans `known`
+    {(compte, id) : (nom, hôtes)}, sinon inconnus : « ? », aucun hôte), sinon entrée retirée.
+    Renvoie les empreintes à retirer de l'agent."""
+    unload = set()
+    for fp, e in list(dd["keys"].items()):
+        mine, others = _owner_refs(e, alias, ids)
+        if mine and not others:
+            del dd["keys"][fp]
+            unload.add(fp)
+            continue
+        if mine:
+            a, i = fastpath._pair(others[0])
+            e["id"] = i
+            if a:
+                e["account"] = a
+            else:
+                e.pop("account", None)
+            name, hosts = (known or {}).get((a, i), ("?", []))
+            e["name"], e["hosts"] = name, list(hosts)
+        if mine or e.get("also"):
+            rest = others[1:] if mine else others
+            if rest:
+                e["also"] = rest
+            else:
+                e.pop("also", None)
+    return unload
+
+
+def _known_items() -> dict:
+    """{(compte, id) : (nom, hôtes)} des blocs du ssh_config généré ({} sans fichier)."""
+    try:
+        paths = sshconfig.default_paths()
+        return {(i.account, i.id): (i.name, list(i.hosts)) for i in sshconfig.kept_items(paths, lambda a: True,
+                                                                                     known=Config().accounts())}
+    except Exception:
+        return {}
+
+
+def account_remove(args, accts: Accounts) -> int:
+    """Sous ensure.lock, dans cet ordre : clés du compte retirées des agents (dédié et
+    sous-agents ; une clé partagée avec un autre compte reste, promue), puis compte verrouillé
+    (session oubliée), données locales de bw supprimées, compte retiré du registre ; ensuite
+    ssh_config régénéré. Agents en erreur ou verrouillés : arrêt avant toute suppression, état
+    gardé, une ligne, code 4. Rien n'est modifié dans le coffre."""
+    import shutil
+    alias = accts.check(args.alias)
+    rc = RC_OK
+    b = accts.backend(alias)
+    ids, ids_known = set(), False
+    try:
+        if b.store.get():  # déverrouillé : ses ids, pour les entrées d'état sans compte (avant CAP-10)
+            ids = {i.id.lower() for i in b.list_ssh_keys(None)}
+            ids_known = True
+    except (VaultError, SessionStoreError, ConfigError):
+        pass
+    d = account_dir(alias)
+    removed, legacy_left = 0, set()
+    known = _known_items()
+    base, main, subs = _agents_with_ensure_lock()
+    with _locked_or_null(base):
+        if base is not None:
+            now = time.time()
+            for a in _states(base, main, subs):
+                try:
+                    data = a.state.load()
+                    if not ids_known:
+                        # entrées d'avant la 0.9.0 sans compte, que rien n'attribue à un autre compte
+                        legacy_left |= {fp for fp, e in data["keys"].items() if not e.get("account") and not any(
+                            fastpath._pair(x)[0] in accts.registry and fastpath._pair(x)[0] != alias
+                            for x in e.get("also") or [] if isinstance(x, str))}
+                    copy = dict(data, keys={k: dict(v) for k, v in data["keys"].items()})
+                    unload = _drop_account(copy, alias, ids, known)
+                    if copy == data:
+                        continue
+                    if unload and os.path.exists(a.socket):
+                        present = {k.fingerprint: k for k in a.keys()}
+                        live = [fp for fp in unload if remaining(data["keys"][fp], now) != 0]
+                        if live and (data.get("locked") or maybe_locked(data, set(present))):
+                            raise AgentLocked("agent verrouillé")
+                        for fp in unload:
+                            if fp in present:
+                                a.remove(present[fp])
+                                removed += 1
+                    a.update(lambda dd: _drop_account(dd, alias, ids, known))
+                except AgentError as e:
+                    err("clés de %s dans l'agent %s non retirées (%s) : compte gardé, rien supprimé ; « sshvault agent "
+                        "unlock » puis relancer « sshvault account remove %s »" % (alias, a.socket, e, alias))
+                    return RC_BACKEND
+            _clear_unlock_failure(alias)
+        try:
+            b.lock()
+        except (VaultError, SessionStoreError, ConfigError) as e:
+            err("avertissement : verrouillage de %s : %s" % (alias, classify(e)[1]))
+            try:
+                SessionStore(alias=alias).clear()
+            except SessionStoreError as e2:
+                err("magasin de session : %s" % e2)
+                rc = RC_BACKEND
+        try:
+            if os.path.lexists(d):
+                shutil.rmtree(d)
+        except OSError as e:
+            raise AccountIOError("suppression de %s impossible (%s) : compte gardé, relancer « sshvault account remove "
+                                 "%s »" % (d, e.strerror or e, alias)) from None
+
+        def drop(dd):
+            dd[ACCOUNTS].pop(alias, None)
+            dd[DEFAULT_ACCOUNTS] = [a for a in dd.get(DEFAULT_ACCOUNTS, []) if a != alias]
+        accts.cfg.update(drop)
+    if legacy_left:
+        n = len(legacy_left)
+        err("avertissement : %d clé%s chargée%s avant la 0.9.0 (compte inconnu, %s verrouillé) laissée%s dans les "
+            "agents (« sshvault agent purge » pour les retirer)"
+            % (n, "s" if n > 1 else "", "s" if n > 1 else "", alias, "s" if n > 1 else ""))
+    print("compte %s retiré : session oubliée, données locales supprimées, %d clé%s retirée%s des agents ; "
+          "rien n'est modifié dans le coffre" % (alias, removed, "s" if removed > 1 else "", "s" if removed > 1 else ""))
+    return max(rc, _regen_after_registry_change())
+
+
+def _regen_after_login() -> int:
+    """Après un login : ssh_config régénéré s'il existe (tous les comptes, comptes illisibles
+    gardés), sinon la commande à lancer est dite."""
+    try:
+        paths = sshconfig.default_paths()
+    except sshconfig.SshConfigError:
+        return RC_OK
+    if not os.path.exists(paths.config):
+        print("lancer « sshvault ssh-config » pour générer la config ssh")
+        return RC_OK
+    return _regen_after_registry_change()
+
+
+def _regen_after_registry_change(renamed: Optional[dict] = None) -> int:
+    """ssh_config régénéré après un changement du registre (comptes lus sans invite : blocs des
+    comptes verrouillés gardés). Pas de ssh_config généré : rien à faire."""
+    try:
+        paths = sshconfig.default_paths()
+    except sshconfig.SshConfigError:
+        return RC_OK
+    if not os.path.exists(paths.config):
+        return RC_OK
+    accts = Accounts(bw_path=configured_bw_path, warn=err)
+    try:
+        src = gather(accts, paths, {}, None, renamed)
+        regenerate(src.items, paths, kept=src.kept, notes=src.notes)
+    except (sshconfig.SshConfigError, AgentError, ConfigError) as e:
+        err("ssh_config non régénéré : %s (lancer « sshvault ssh-config »)" % e)
+        return RC_BACKEND
+    finally:
+        _ACCOUNTS_SEEN.append(accts)
+    return RC_OK
+
+
+#: Contextes de comptes créés pendant la commande (avertissements des backends en fin de commande).
+_ACCOUNTS_SEEN: list = []
 
 
 # --- agent dédié ---------------------------------------------------------------------
@@ -449,7 +937,7 @@ def _rollback(agent: Agent, added: dict) -> None:
             err("retrait de %s impossible : %s" % (k.fingerprint, e))
 
 
-def run_load(args, backend: VaultBackend, prompt) -> int:
+def run_load(args, accts: Accounts, prompt) -> int:
     if args.pattern is not None and not args.pattern.strip():
         raise UsageError("motif vide")
     if args.pattern is None and args.by:
@@ -471,11 +959,12 @@ def run_load(args, backend: VaultBackend, prompt) -> int:
             raise AgentLocked("agent verrouillé : lancer « sshvault agent unlock »")
         present = {k.blob for k in current}
 
-    found = [i for i in backend.list_ssh_keys(prompt) if args.all or match(i, args.pattern, args.by)]
+    items, rc_read = collect(accts, accts.read_set(args.account), prompt)
+    found = [i for i in items if args.all or match(i, args.pattern, args.by)]
     if not found:
         err("aucune clé ne correspond à « %s »" % args.pattern if args.pattern is not None
             else "aucune clé SSH dans le coffre")
-        return RC_NONE
+        return max(rc_read, RC_NONE)
     todo, seen, skipped, already = [], set(), 0, 0
     for i in found:
         blob = public_blob(i.public_key)
@@ -494,7 +983,7 @@ def run_load(args, backend: VaultBackend, prompt) -> int:
     if not todo:
         if skipped and not already:
             raise AgentError("aucune clé chargeable (clé publique illisible)")
-        return RC_OK
+        return rc_read
     if args.restrict:
         for i, _ in todo:
             if not i.hosts:
@@ -516,13 +1005,13 @@ def run_load(args, backend: VaultBackend, prompt) -> int:
     try:
         # Toutes les clés lues avant le premier chargement.
         for i, _ in todo:
-            keys[i.id] = backend.get_private_key(i.id, prompt)
-            if not interactive and is_encrypted(keys[i.id]):
+            keys[i.account, i.id] = accts.backend(i.account).get_private_key(i.id, prompt)
+            if not interactive and is_encrypted(keys[i.account, i.id]):
                 raise PassphraseRefused("« %s » : clé chiffrée par passphrase, saisie impossible "
                                         "(--nointeraction) : rien chargé" % clean(i.name))
         timeout = prompt_timeout(os.environ) + 10
         for i, blob in todo:
-            key = keys.pop(i.id)
+            key = keys.pop((i.account, i.id))
             enc = is_encrypted(key)
             before = {k.blob for k in agent.keys()}
             t = time.time()
@@ -547,13 +1036,13 @@ def run_load(args, backend: VaultBackend, prompt) -> int:
         reconcile(d, {k.fingerprint for k in agent.keys()}, now)
         for i, blob, t in done:
             d["keys"][fingerprint(blob)] = state_entry(i.id, i.name, i.hosts, t, lifetime, args.confirm,
-                                                       args.restrict)
+                                                       args.restrict, i.account)
     agent.update(record)
     for i, blob, _ in done:
         opts = ", ".join(["durée " + describe_duration(lifetime)] + _options(args.confirm, False)
                          + (["restreinte à " + _hosts(i.hosts)] if args.restrict else []))
-        print("chargée : %s %s (%s)" % (clean(i.name), fingerprint(blob), opts))
-    return RC_OK
+        print("chargée : %s%s %s (%s)" % (accts.prefix(i.account), clean(i.name), fingerprint(blob), opts))
+    return rc_read
 
 
 def _need_prompt(args, agent: Agent, what: str) -> None:
@@ -611,10 +1100,10 @@ def _forward_status(sub: Agent, label: str) -> None:
     for k in keys:
         e = data["keys"].get(k.fingerprint)
         if e is None:  # chargée hors de sshvault
-            print("  ?\t%s\t?\t?" % k.fingerprint)
+            print("  ?\t?\t%s\t?\t?" % k.fingerprint)
             continue
         left = remaining(e, now)
-        print("  %s\t%s\t%s\t%s" % (clean(e["name"]), k.fingerprint,
+        print("  %s\t%s\t%s\t%s\t%s" % (clean(e.get("account") or "?"), clean(e["name"]), k.fingerprint,
                                    "illimitée" if left is None else fmt_remaining(left),
                                    ",".join(_options(e["confirm"], e["restrict"])) or "-"))
     if not keys:
@@ -702,10 +1191,10 @@ def run_agent(args) -> int:
             rows = list(data["keys"].items())
         for fp, e in rows:
             if e is None:  # chargée hors de sshvault
-                print("?\t%s\t-\t?\t?" % fp)
+                print("?\t?\t%s\t-\t?\t?" % fp)
                 continue
             left = remaining(e, now)
-            print("%s\t%s\t%s\t%s\t%s" % (clean(e["name"]), fp, _hosts(e["hosts"]),
+            print("%s\t%s\t%s\t%s\t%s\t%s" % (clean(e.get("account") or "?"), clean(e["name"]), fp, _hosts(e["hosts"]),
                                           "illimitée" if left is None else fmt_remaining(left),
                                           ",".join(_options(e["confirm"], e["restrict"])) or "-"))
         if not rows:
@@ -780,7 +1269,7 @@ def forward_upkeep(plan, socket: str, out=None) -> None:
                     why = "%s, plus référencé" % fid
                 else:
                     ids = ref[1]
-                    if all(any(fastpath.owns(e, i) for i in ids) for e in sub.state.load()["keys"].values()):
+                    if all(any(fastpath.owns(e, i, a) for a, i in ids) for e in sub.state.load()["keys"].values()):
                         continue
                     why = "%s (%s), clé retirée du transfert" % (clean(ref[0]), fid)
                 print("sous-agent de transfert %s : %s" % (why, sub.stop()), file=out or sys.stdout, flush=True)
@@ -806,19 +1295,29 @@ def warn_forwardagent(items: list, plan, paths) -> None:
 
 # --- hôtes et ssh_config généré --------------------------------------------------------
 
-def _select_one(items: list, args, forward: bool = False) -> Optional[SshKeyItem]:
+def _select_one(items: list, args, forward: bool = False, multi: bool = False,
+                account: Optional[str] = None) -> Optional[SshKeyItem]:
     """L'élément désigné par la sélection ; None (message dit) si aucun ; UsageError si plusieurs.
-    `forward` : `--host` et la sélection par défaut couvrent aussi les motifs de transfert."""
+    `forward` : `--host` et la sélection par défaut couvrent aussi les motifs de transfert.
+    `multi` : plusieurs comptes (l'alias est dit, --account suggéré)."""
     if not args.pattern.strip():
         raise UsageError("sélection vide")
     found = [i for i in items if match(i, args.pattern, args.by)
              or (forward and args.by in (None, "host") and i.match_forward(args.pattern))]
     if not found:
-        err("aucune clé ne correspond à « %s »" % args.pattern)
+        if account:  # écriture, plusieurs comptes : dire où l'on a cherché
+            err("aucune clé ne correspond à « %s » dans le compte %s (autre compte : --account ALIAS)"
+                % (args.pattern, account))
+        else:
+            err("aucune clé ne correspond à « %s »" % args.pattern)
         return None
     if len(found) > 1:
-        raise UsageError("« %s » désigne %d éléments (%s) : préciser --id"
-                         % (args.pattern, len(found), ", ".join("%s %s" % (clean(i.name), i.id) for i in found)))
+        accounts = {i.account for i in found}
+        raise UsageError("« %s » désigne %d éléments (%s) : préciser --id%s"
+                         % (args.pattern, len(found),
+                            ", ".join("%s%s %s" % ("%s " % i.account if multi and i.account else "", clean(i.name), i.id)
+                                      for i in found),
+                            " et --account" if multi and len(accounts) > 1 else ""))
     return found[0]
 
 
@@ -840,13 +1339,56 @@ def ensure_exe(paths) -> Optional[str]:
 _RESOLVE = object()  # regenerate : chemin de sshvault à résoudre (None : pas de Match exec)
 
 
+class Sources:
+    """Éléments de tous les comptes pour une régénération : `items` (relus dans le coffre, ou
+    gardés tels quels du fichier actuel pour un compte illisible), `kept` ((compte, id) gardés),
+    `notes` (avertissements : comptes illisibles), `read` (comptes lus)."""
+
+    def __init__(self):
+        self.items, self.kept, self.notes, self.read, self.unreadable = [], frozenset(), [], [], []
+        self.rc = RC_OK  # pire code des comptes illisibles
+
+
+def gather(accts: Accounts, paths, fresh: dict, prompt, renamed: Optional[dict] = None) -> Sources:
+    """Sources d'une régénération (CAP-10 : toujours tous les comptes) : `fresh` {alias :
+    éléments déjà lus} ; les autres comptes lus avec `prompt` (None : sans invite). Un compte
+    illisible (verrouillé sans invite possible, non connecté, bw en erreur) garde ses blocs
+    actuels, relus dans le fichier généré, avec un avertissement ; un bloc d'ancienne forme (sans
+    compte) n'est gardé que si un compte est illisible et que son élément n'a pas été relu."""
+    src = Sources()
+    for a in accts.registry:
+        if a in fresh:
+            src.items += fresh[a]
+            src.read.append(a)
+            continue
+        try:
+            src.items += tag(a, accts.backend(a).list_ssh_keys(prompt))
+            src.read.append(a)
+        except (VaultError, SessionStoreError, ConfigError) as e:  # ConfigError : bw-path invalide
+            src.unreadable.append(a)
+            src.rc = max(src.rc, classify(e)[0])
+            src.notes.append("compte %s illisible (%s) : ses blocs du ssh_config sont gardés tels quels (« sshvault "
+                             "unlock%s » puis « sshvault ssh-config »)" % (a, e, accts.hint(a)))
+    if src.unreadable:
+        bad = set(src.unreadable)
+        have = {i.id.lower() for i in src.items}
+        known = set(accts.registry) | set(renamed or ())
+        kept = [i for i in sshconfig.kept_items(paths, lambda a: a in bad or a is None, renamed, known, src.notes)
+                if i.account is not None or i.id not in have]
+        src.items += kept
+        src.kept = frozenset((i.account, i.id) for i in kept)
+    return src
+
+
 def regenerate(items: list, paths=None, socket: Optional[str] = None, exe=_RESOLVE, out=None,
-               skip_catch_all: bool = False) -> None:
+               skip_catch_all: bool = False, kept: frozenset = frozenset(), notes=()) -> None:
     """Réécrit ce qui a changé dans ~/.ssh/sshvault/ ; avertissements sur stderr, compte rendu
     sur `out` (défaut stdout ; stderr pour generate, dont stdout ne porte que la clé publique)."""
     paths = paths or sshconfig.default_paths()
     socket = socket or make_agent().socket
-    plan = sshconfig.build(items, paths, socket, ensure_exe(paths) if exe is _RESOLVE else exe)
+    for w in notes:
+        err("avertissement : %s" % w)
+    plan = sshconfig.build(items, paths, socket, ensure_exe(paths) if exe is _RESOLVE else exe, kept)
     for w in plan.warnings:
         if not (skip_catch_all and (sshconfig.CATCH_ALL_WARNING in w
                                     or sshconfig.FORWARD_CATCH_ALL_WARNING in w)):  # déjà dit par l'appelant
@@ -867,30 +1409,40 @@ def regenerate(items: list, paths=None, socket: Optional[str] = None, exe=_RESOL
     return plan
 
 
-def run_hosts(args, backend: VaultBackend, prompt) -> int:
-    """`hosts` (champ sshvault-hosts) et `forward` (champ sshvault-forward) : mêmes règles."""
+def run_hosts(args, accts: Accounts, prompt) -> int:
+    """`hosts` (champ sshvault-hosts) et `forward` (champ sshvault-forward) : mêmes règles. `list`
+    lit les comptes par défaut (ou --account) ; une écriture vise un seul compte."""
     fwd = args.cmd == "forward"
     of = (lambda i: i.forward) if fwd else (lambda i: i.hosts)
     what, one = ("transferts", "le transfert vers") if fwd else ("hôtes", "l'hôte")
     cmd = args.hosts_cmd
-    if cmd != "list":
-        given = _split(args.hosts)
-        if cmd in ("add", "set"):
-            new = normalize_hosts(given)  # InvalidHost (code 2) avant tout accès au coffre
-            if cmd == "add" and not new:
-                raise UsageError("aucun hôte à ajouter")
-        elif not given:
-            raise UsageError("aucun hôte à retirer")
-        # écriture : partir de l'état du serveur, pas d'un cache local périmé (interface web)
-        backend.sync(prompt)
-    items = backend.list_ssh_keys(prompt)
-    item = _select_one(items, args, forward=fwd)
-    if item is None:
-        return RC_NONE
     if cmd == "list":
+        if not args.pattern.strip():
+            raise UsageError("sélection vide")
+        items, rc = collect(accts, accts.read_set(args.account), prompt)
+        item = _select_one(items, args, forward=fwd, multi=accts.multi)
+        if item is None:
+            return max(rc, RC_NONE)
         for h in of(item):
             print(clean(h))
-        return RC_OK
+        return rc
+    given = _split(args.hosts)
+    if cmd in ("add", "set"):
+        new = normalize_hosts(given)  # InvalidHost (code 2) avant tout accès au coffre
+        if cmd == "add" and not new:
+            raise UsageError("aucun hôte à ajouter")
+    elif not given:
+        raise UsageError("aucun hôte à retirer")
+    if not args.pattern.strip():
+        raise UsageError("sélection vide")
+    alias = accts.write_one(args.account, "%s %s" % (args.cmd, cmd))  # code 2 avant tout accès
+    backend = accts.backend(alias)
+    # écriture : partir de l'état du serveur, pas d'un cache local périmé (interface web)
+    backend.sync(prompt)
+    mine = tag(alias, backend.list_ssh_keys(prompt))
+    item = _select_one(mine, args, forward=fwd, account=alias if accts.multi else None)
+    if item is None:
+        return RC_NONE
     current = []
     for h in of(item):
         if h.lower() not in current:
@@ -908,14 +1460,17 @@ def run_hosts(args, backend: VaultBackend, prompt) -> int:
         want = [h for h in current if h not in targets]
     bad = [h for h in want if not valid_host(h)]
     if bad:
-        raise InvalidHost("hôte invalide « %s » déjà dans « %s » : le retirer (%s remove) ou remplacer la liste "
-                          "(%s set) ; rien écrit" % (clean(bad[0]), clean(item.name), args.cmd, args.cmd))
+        raise InvalidHost("hôte invalide « %s » déjà dans « %s » : le retirer (%s remove%s) ou remplacer la liste "
+                          "(%s set%s) ; rien écrit" % (clean(bad[0]), clean(item.name), args.cmd, accts.hint(alias),
+                                                       args.cmd, accts.hint(alias)))
     # Prérequis de la régénération (chemins, socket de l'agent) vérifiés avant d'écrire
-    # dans le coffre : SshConfigError ou AgentError ici, rien n'est écrit.
+    # dans le coffre : SshConfigError ou AgentError ici, rien n'est écrit. Les autres comptes
+    # sont lus sans invite (verrouillés : leurs blocs actuels gardés).
     paths = sshconfig.default_paths()
     socket = make_agent().socket
     exe = ensure_exe(paths)
-    sshconfig.build(items, paths, socket, exe)
+    src = gather(accts, paths, {alias: mine}, None)
+    sshconfig.build(src.items, paths, socket, exe, src.kept)
     if want == current:
         print("%s de « %s » inchangés : %s" % (what, clean(item.name), _hosts(of(item))))
         updated = item
@@ -925,30 +1480,35 @@ def run_hosts(args, backend: VaultBackend, prompt) -> int:
                 err("avertissement : motif « %s » : %s"
                     % (h, sshconfig.FORWARD_CATCH_ALL_WARNING if fwd else sshconfig.CATCH_ALL_WARNING))
         updated = (backend.set_forward if fwd else backend.set_hosts)(item.id, want, prompt)
+        updated = tag(alias, [updated])[0]
         print("%s de « %s » : %s" % (what, clean(updated.name), _hosts(of(updated))))
         if not fwd:
-            _warn_restricted(updated)
-    items = [updated if i.id == updated.id else i for i in items]
+            _warn_restricted(updated, accts)
+    items = [updated if (i.account, i.id) == (updated.account, updated.id) else i for i in src.items]
     try:
-        regenerate(items, paths, socket, exe, skip_catch_all=fwd)
+        regenerate(items, paths, socket, exe, skip_catch_all=fwd, kept=src.kept, notes=src.notes)
     except (sshconfig.SshConfigError, AgentError) as e:
         err("%s écrits dans le coffre, mais ssh_config non régénéré : %s" % (what, e))
         return RC_BACKEND
     return RC_OK
 
 
-def _warn_restricted(item: SshKeyItem) -> None:
+def _warn_restricted(item: SshKeyItem, accts: Accounts) -> None:
     """Clé de l'élément chargée avec --restrict : ses contraintes -h gardent les anciens hôtes."""
     try:
         keys = make_agent().state.load()["keys"]
     except Exception:
         return
-    if any(e.get("id") == item.id and e.get("restrict") for e in keys.values()):
+    if any(e.get("id") == item.id and e.get("account") in (None, item.account) and e.get("restrict")
+           for e in keys.values()):
         err("avertissement : clé « %s » chargée avec --restrict : elle reste limitée aux anciens hôtes ; relancer "
-            "« sshvault load --force --restrict --id %s »" % (clean(item.name), item.id))
+            "« sshvault load --force --restrict%s --id %s »" % (clean(item.name), accts.hint(item.account), item.id))
 
 
-def run_ssh_config(args, backend: VaultBackend, prompt) -> int:
+def run_ssh_config(args, accts: Accounts, prompt) -> int:
+    """Régénération à partir des éléments de **tous** les comptes (une invite au plus par compte
+    verrouillé) ; un compte illisible garde ses blocs actuels (avertissement). Tous illisibles :
+    erreur, rien écrit."""
     paths = sshconfig.default_paths()
     if args.action == "install":
         if args.print_only or args.check:
@@ -957,11 +1517,30 @@ def run_ssh_config(args, backend: VaultBackend, prompt) -> int:
         if not os.path.exists(paths.config):
             err("avertissement : %s n'existe pas encore : lancer « sshvault ssh-config »" % paths.config)
         return RC_OK
-    items = backend.list_ssh_keys(prompt)
+    if not accts.registry:
+        # jamais de config régénérée sans compte : elle perdrait tous les blocs (installation
+        # 0.8.0 pas encore adoptée, par exemple)
+        pending = pending_message(accts.cfg, "ssh_config non régénéré, rien écrit")
+        if pending:
+            raise NoAccount(pending)
+        raise NoAccount("aucun compte du coffre : ssh_config non régénéré, rien écrit (« sshvault account add ALIAS "
+                        "--server URL --email E »)")
+    if len(accts.registry) == 1:
+        a = next(iter(accts.registry))
+        src = gather(accts, paths, {a: tag(a, accts.backend(a).list_ssh_keys(prompt))}, prompt)
+    else:
+        src = gather(accts, paths, {}, prompt)
+        if accts.registry and not src.read:
+            for w in src.notes:
+                err(w)
+            raise _Reported(src.rc)
+    items = src.items
     if not (args.print_only or args.check):
-        warn_forwardagent(items, regenerate(items, paths), paths)
+        warn_forwardagent(items, regenerate(items, paths, kept=src.kept, notes=src.notes), paths)
         return RC_OK
-    plan = sshconfig.build(items, paths, make_agent().socket, ensure_exe(paths))
+    for w in src.notes:
+        err("avertissement : %s" % w)
+    plan = sshconfig.build(items, paths, make_agent().socket, ensure_exe(paths), src.kept)
     for w in plan.warnings:
         err("avertissement : %s" % w)
     if args.print_only:
@@ -1020,7 +1599,8 @@ def _needs_prompt(args, kf) -> bool:
     return kf.blob is None or (args.decrypt and kf.encrypted)
 
 
-def _import_one(args, backend: VaultBackend, prompt, kf, hosts, items: list, extra) -> Optional[SshKeyItem]:
+def _import_one(args, backend: VaultBackend, prompt, kf, hosts, items: list, extra, alias: str,
+                hint: str = "") -> Optional[SshKeyItem]:
     """Un fichier analysé : doublon (None, message dit), sinon élément créé et relu."""
     label = clean(kf.path)
     if kf.blob is None:  # PKCS#8 (ou PKCS#1) chiffré : la clé publique exige la passphrase
@@ -1031,8 +1611,8 @@ def _import_one(args, backend: VaultBackend, prompt, kf, hosts, items: list, ext
     fp = kf.fingerprint
     same = [i for i in items if i.match_fingerprint(fp)]
     if same and not args.force:
-        hint = ("pour lui associer les hôtes : « sshvault hosts add --id %s %s » ; --force pour créer un second "
-                "élément" % (same[0].id, ",".join(hosts)) if hosts else "--force pour l'importer quand même")
+        hint = ("pour lui associer les hôtes : « sshvault hosts add%s --id %s %s » ; --force pour créer un second "
+                "élément" % (hint, same[0].id, ",".join(hosts)) if hosts else "--force pour l'importer quand même")
         err("%s : déjà dans le coffre (%s) : %s ; %s"
             % (label, fp, ", ".join("« %s » %s" % (clean(i.name), i.id) for i in same), hint))
         return None
@@ -1041,7 +1621,8 @@ def _import_one(args, backend: VaultBackend, prompt, kf, hosts, items: list, ext
     name = args.name.strip() if args.name is not None else kf.default_name()
     item = backend.create_ssh_key(name, kf.data.decode("ascii"), kf.public_key, fp, hosts, prompt,
                                   existing=[i.id for i in same], extra_fields=extra)
-    print("importée : %s (%s)" % (clean(item.name), fp))
+    item = tag(alias, [item])[0]
+    print("importée : %s (%s)%s" % (clean(item.name), fp, " dans %s" % alias if hint else ""))
     if kf.encrypted:
         err("avertissement : « %s » stockée chiffrée par sa passphrase : demandée à chaque chargement, et "
             "inutilisable par l'agent de Bitwarden Desktop, peut-être par d'autres clients Bitwarden "
@@ -1049,8 +1630,9 @@ def _import_one(args, backend: VaultBackend, prompt, kf, hosts, items: list, ext
     return item
 
 
-def run_import(args, backend: VaultBackend, prompt) -> int:
-    """Chaque fichier traité à part (une ligne de résultat chacun) ; code : le pire rencontré."""
+def run_import(args, accts: Accounts, prompt) -> int:
+    """Chaque fichier traité à part (une ligne de résultat chacun) ; code : le pire rencontré.
+    Un seul compte écrit (--account, sinon le compte par défaut s'il est unique)."""
     if args.name is not None:
         if not args.name.strip():
             raise UsageError("--name vide")
@@ -1058,6 +1640,8 @@ def run_import(args, backend: VaultBackend, prompt) -> int:
             raise UsageError("--name ne vaut que pour un seul FICHIER")
     hosts = normalize_hosts(_split(args.hosts))  # InvalidHost (code 2) avant tout accès
     extra = _test_fields()
+    alias = accts.write_one(args.account, "import")  # code 2 avant tout accès
+    backend = accts.backend(alias)
     worst = RC_OK
 
     def failed(path, e):
@@ -1088,9 +1672,10 @@ def run_import(args, backend: VaultBackend, prompt) -> int:
                     err("avertissement : motif « %s » : %s" % (h, sshconfig.CATCH_ALL_WARNING))
         # doublons : état du serveur, pas un cache local périmé
         backend.sync(prompt)
-        items = backend.list_ssh_keys(prompt)
+        items = tag(alias, backend.list_ssh_keys(prompt))
         if hosts:
-            sshconfig.build(items, paths, socket, exe)
+            src = gather(accts, paths, {alias: items}, None)
+            sshconfig.build(src.items, paths, socket, exe, src.kept)
     except Exception as e:  # le pire code reste, avec les refus déjà dits
         failed(None, e)
         return worst
@@ -1098,7 +1683,7 @@ def run_import(args, backend: VaultBackend, prompt) -> int:
     try:
         for kf in todo:
             try:
-                item = _import_one(args, backend, prompt, kf, hosts, items, extra)
+                item = _import_one(args, backend, prompt, kf, hosts, items, extra, alias, accts.hint(alias))
             except Exception as e:
                 failed(kf.path, e)
                 continue
@@ -1107,6 +1692,8 @@ def run_import(args, backend: VaultBackend, prompt) -> int:
                 continue
             items.append(item)
             created.append(item)
+            if hosts:
+                src.items.append(item)
     except BaseException:
         # Ctrl-C, SIGTERM… : les éléments déjà créés restent ; la config n'est pas régénérée
         if hosts and created:
@@ -1115,7 +1702,7 @@ def run_import(args, backend: VaultBackend, prompt) -> int:
         raise
     if hosts and created:
         try:
-            regenerate(items, paths, socket, exe)
+            regenerate(src.items, paths, socket, exe, kept=src.kept, notes=src.notes)
         except (sshconfig.SshConfigError, AgentError) as e:
             err("clé importée dans le coffre, mais ssh_config non régénéré : %s" % e)
             worst = max(worst, RC_BACKEND)
@@ -1124,7 +1711,7 @@ def run_import(args, backend: VaultBackend, prompt) -> int:
 
 # --- génération d'une clé dans le coffre (story 7) -----------------------------------------------
 
-def run_generate(args, backend: VaultBackend, prompt) -> int:
+def run_generate(args, accts: Accounts, prompt) -> int:
     """Clé générée par ssh-keygen dans le tmpfs privé, créée dans le coffre par le chemin
     d'`import` (create_ssh_key : stdin, reprise sans doublon, relecture). stdout : la seule clé
     publique (une ligne) ; tout le reste sur stderr. Ordre : refus d'usage (2), tmpfs privé (4),
@@ -1146,6 +1733,8 @@ def run_generate(args, backend: VaultBackend, prompt) -> int:
                 from None
     hosts = normalize_hosts(_split(args.hosts))  # InvalidHost (code 2) avant tout accès
     extra = _test_fields()
+    alias = accts.write_one(args.account, "generate")  # code 2 avant tout accès
+    backend = accts.backend(alias)
     # Prérequis, avant tout accès au coffre : tmpfs privé et son dossier sshvault/ (code 4),
     # puis chemins, socket et sshvault du ssh_config (contrôle sans éléments : build([])).
     keyfile.check_workspace()
@@ -1155,14 +1744,15 @@ def run_generate(args, backend: VaultBackend, prompt) -> int:
         exe = ensure_exe(paths)
         sshconfig.build([], paths, socket, exe)
     backend.sync(prompt)  # nom déjà pris : état du serveur, pas un cache local périmé
-    items = backend.list_ssh_keys(prompt)
+    items = tag(alias, backend.list_ssh_keys(prompt))
     taken = [i for i in items if i.name.strip().casefold() == name.casefold()]
     if taken and not args.force:
         err("nom « %s » déjà pris par %s : rien généré ; --force pour créer quand même un élément de ce nom"
             % (clean(name), ", ".join("« %s » %s" % (clean(i.name), clean(i.id)) for i in taken)))
         return RC_NONE
     if hosts:
-        sshconfig.build(items, paths, socket, exe)
+        src = gather(accts, paths, {alias: items}, None)
+        sshconfig.build(src.items, paths, socket, exe, src.kept)
         for h in hosts:  # une seule fois (la régénération le tait), avant la génération et l'écriture
             if sshconfig.is_catch_all(h):
                 err("avertissement : motif « %s » : %s" % (h, sshconfig.CATCH_ALL_WARNING))
@@ -1173,17 +1763,20 @@ def run_generate(args, backend: VaultBackend, prompt) -> int:
     except VaultError as e:
         # WriteFailed, mais aussi session refusée (VaultLocked, NotLoggedIn…) : même classe, code inchangé
         raise e.__class__("%s ; la clé générée n'a jamais été écrite sur disque : sans élément valide dans le "
-                          "coffre, elle est perdue (relancer « sshvault generate »)" % e) from None
+                          "coffre, elle est perdue (relancer « sshvault generate%s »)" % (e, accts.hint(alias))) from None
     public, fp = gen.public_key, gen.fingerprint
     del gen
+    item = tag(alias, [item])[0]
     regenerated = False
     try:
         print(public, flush=True)
-        err("clé %s générée dans le coffre : « %s » %s (id %s)"
-            % ("Ed25519" if key_type == "ssh-ed25519" else "RSA %d" % bits, clean(item.name), fp, clean(item.id)))
+        err("clé %s générée dans le coffre%s : « %s » %s (id %s)"
+            % ("Ed25519" if key_type == "ssh-ed25519" else "RSA %d" % bits,
+               " %s" % alias if accts.multi else "", clean(item.name), fp, clean(item.id)))
         if hosts:
             try:
-                regenerate(items + [item], paths, socket, exe, out=sys.stderr, skip_catch_all=True)
+                regenerate(src.items + [item], paths, socket, exe, out=sys.stderr, skip_catch_all=True, kept=src.kept,
+                           notes=src.notes)
             except (sshconfig.SshConfigError, AgentError) as e:
                 err("clé créée dans le coffre, mais ssh_config non régénéré : %s" % e)
                 return RC_BACKEND
@@ -1203,7 +1796,7 @@ def run_generate(args, backend: VaultBackend, prompt) -> int:
 
 # --- clés publiques : affichage et déploiement (story 7) --------------------------------------------
 
-def _public_lines(args, backend: VaultBackend, prompt, allow_all: bool):
+def _public_lines(args, accts: Accounts, prompt, allow_all: bool):
     """(éléments, lignes de clé publique, code) de la sélection, une ligne par clé (deux éléments
     d'une même clé : une seule) ; (None, None, RC_NONE) si rien ne correspond (message dit). Clé
     publique illisible : message, ignorée, code RC_BACKEND."""
@@ -1217,12 +1810,13 @@ def _public_lines(args, backend: VaultBackend, prompt, allow_all: bool):
         if args.pattern is not None and args.all:
             raise UsageError("--all exclut une SÉLECTION")
     every = allow_all and args.all
-    found = [i for i in backend.list_ssh_keys(prompt) if every or match(i, args.pattern, args.by)]
+    items, rc = collect(accts, accts.read_set(args.account), prompt)
+    found = [i for i in items if every or match(i, args.pattern, args.by)]
     if not found:
         err("aucune clé ne correspond à « %s »" % clean(args.pattern) if args.pattern is not None
             else "aucune clé SSH dans le coffre")
-        return None, None, RC_NONE
-    rc, out, seen = RC_OK, [], set()
+        return None, None, max(rc, RC_NONE)
+    out, seen = [], set()
     for i in found:
         line = deploy_mod.key_line(i.public_key)
         if line is None:
@@ -1237,10 +1831,10 @@ def _public_lines(args, backend: VaultBackend, prompt, allow_all: bool):
     return [i for i, _ in out], [l for _, l in out], rc
 
 
-def run_pubkey(args, backend: VaultBackend, prompt) -> int:
+def run_pubkey(args, accts: Accounts, prompt) -> int:
     """Une ligne de clé publique par clé sélectionnée, rien d'autre sur stdout. Lecture du
     cache local de bw (list items) : aucun appel réseau."""
-    items, lines, rc = _public_lines(args, backend, prompt, allow_all=True)
+    items, lines, rc = _public_lines(args, accts, prompt, allow_all=True)
     for line in lines or []:
         print(line)
     return rc
@@ -1302,7 +1896,7 @@ def check_ssh_options(options: list) -> None:
         n += 1
 
 
-def run_deploy(args, backend: VaultBackend, prompt) -> int:
+def run_deploy(args, accts: Accounts, prompt) -> int:
     """Un seul `ssh` vers la cible pour toutes les clés sélectionnées (voir deploy.py) ; une
     ligne par clé sur stdout : « ajoutée » ou « déjà présente »."""
     deploy_mod.check_target(args.target)  # BadTarget (code 2) avant tout accès
@@ -1311,7 +1905,7 @@ def run_deploy(args, backend: VaultBackend, prompt) -> int:
     check_ssh_options(options)
     if args.nointeraction:
         options = ["-o", "BatchMode=yes"] + options  # première valeur lue : elle l'emporte
-    items, lines, rc = _public_lines(args, backend, prompt, allow_all=False)
+    items, lines, rc = _public_lines(args, accts, prompt, allow_all=False)
     if not lines:
         if items is not None and rc == RC_BACKEND:
             raise deploy_mod.DeployError("aucune clé déployable (clé publique illisible)")
@@ -1393,19 +1987,86 @@ def _quiet() -> None:
     signal.setitimer(signal.ITIMER_REAL, 0)
 
 
+#: Lectures de l'ancienne forme d'`ensure` dans ce processus : ("status" | "ids", alias) -> résultat.
+_LEGACY_CACHE: dict = {}
+
+
+def _legacy_account(item_id: str, accts: Accounts) -> str:
+    """Compte d'un élément désigné par son seul id (ligne `Match exec` d'une config générée par la
+    0.8.0, avant régénération) : le seul compte ; sinon l'état de l'agent (entrée ou référence
+    `also` qui porte ce compte) ; sinon les comptes déverrouillés, lus sans invite (une fois par
+    compte et par processus) ; sinon le seul compte connecté verrouillé. Introuvable : une ligne."""
+    names = list(accts.registry)
+    if not names:
+        raise NoAccount("aucun compte du coffre : %s" % "« sshvault account add ALIAS --server URL --email E »")
+    if len(names) == 1:
+        return names[0]
+    try:
+        for e in make_agent().state.load()["keys"].values():
+            if e["id"].lower() == item_id and e.get("account") in accts.registry:
+                return e["account"]
+            for x in e.get("also") or []:
+                if isinstance(x, str):
+                    a, i = fastpath._pair(x)
+                    if i == item_id and a in accts.registry:
+                        return a
+    except Exception:
+        pass
+    locked = []
+    for a in names:
+        b = accts.backend(a)
+        try:
+            has = b.store.get()
+        except SessionStoreError:
+            has = None
+        if not has:
+            if ("status", a) not in _LEGACY_CACHE:
+                try:
+                    _LEGACY_CACHE["status", a] = b.status().state
+                except (VaultError, SessionStoreError, ConfigError):
+                    _LEGACY_CACHE["status", a] = "error"
+            st = _LEGACY_CACHE["status", a]
+            if st in ("unauthenticated", "error"):
+                continue  # non connecté ou bw en erreur : ni lu, ni candidat « seul verrouillé »
+            if st != "unlocked":
+                locked.append(a)
+                continue
+        if ("ids", a) not in _LEGACY_CACHE:
+            try:
+                _LEGACY_CACHE["ids", a] = {i.id.lower() for i in b.list_ssh_keys(None)}
+            except (VaultError, SessionStoreError, ConfigError):
+                _LEGACY_CACHE["ids", a] = None
+        ids = _LEGACY_CACHE["ids", a]
+        if ids is None:
+            continue  # lecture en erreur : pas candidat
+        if item_id in ids:
+            return a
+    if len(locked) == 1:
+        return locked[0]
+    raise ItemNotFound("élément %s introuvable dans les comptes déverrouillés%s : lancer « sshvault "
+                       "ssh-config » (config générée par une version précédente)"
+                       % (item_id, " (verrouillés : %s)" % ", ".join(locked) if locked else ""))
+
+
 def run_ensure(args) -> int:
-    """`ensure --id ID` : silencieux en cas de succès (sauf avertissements du backend, une
-    ligne chacun) ; sinon une ligne `sshvault: <hôte ou id> : <cause>`. Jamais de lecture de
-    stdin ni de traceback ; délai global borné (compté depuis le démarrage du processus) ;
-    terminal restauré et sous-processus tués sur tout chemin (finally des couches basses), y
-    compris Ctrl-C, SIGTERM, SIGHUP et le délai global."""
-    ids = [(i or "").strip().lower() for i in args.id]
-    item_id = ids[0]
+    """`ensure --account ALIAS --id ID` (ou `--forward FID --id ALIAS:ID…`) : silencieux en cas de
+    succès (sauf avertissements du backend, une ligne chacun) ; sinon une ligne `sshvault: <hôte
+    ou id> : <cause>`. Ancienne forme sans compte (`--id ID`) : compte cherché par l'id. Jamais
+    de lecture de stdin ni de traceback ; délai global borné (compté depuis le démarrage du
+    processus) ; terminal restauré et sous-processus tués sur tout chemin (finally des couches
+    basses), y compris Ctrl-C, SIGTERM, SIGHUP et le délai global."""
+    reset_process_state()
+    _ACCOUNTS_SEEN.clear()
+    _LEGACY_CACHE.clear()
+    accounts_mod.DEFERRED.clear()
+    refs = [fastpath.parse_ref(i) for i in args.id]
+    raw0 = (args.id[0] or "").strip().lower()
+    item_id = refs[0][1] if refs[0] else raw0
     fids = args.forward or []
     fid = fids[0] if fids else None
     label = clean(item_id) or "?"
     what = "transfert d'agent : " if fid is not None else ""
-    backend = None
+    accts = None
     try:
         c = fastpath.caller()
         if c.no_connect:
@@ -1415,14 +2076,20 @@ def run_ensure(args) -> int:
         # échoue (EIO) au lieu de stopper le processus (aucune n'est tentée : premier plan vérifié).
         for sig in (signal.SIGTTIN, signal.SIGTTOU):
             signal.signal(sig, signal.SIG_IGN)
-        if not all(fastpath.ITEM_ID_RE.fullmatch(i) for i in ids):
-            raise UsageError("--id : UUID attendu")
-        if fid is None and len(ids) != 1:
+        if any(r is None for r in refs):
+            raise UsageError("--id : UUID attendu (ou <alias>:<UUID> avec --forward)")
+        if fid is None and len(refs) != 1:
             raise UsageError("une seule --id sans --forward")
         if len(fids) > 1:
             raise UsageError("--forward : une seule fois")
         if fid is not None and not FID_RE.fullmatch(fid):
             raise UsageError("--forward : 16 chiffres hexadécimaux attendus")
+        accounts_arg = args.account or []
+        if len(accounts_arg) > 1 or (accounts_arg and (fid is not None or refs[0][0] is not None)):
+            raise UsageError("--account : une fois, avec une seule --id <UUID>, sans --forward")
+        if accounts_arg:
+            check_alias(accounts_arg[0])
+            refs = [(accounts_arg[0], refs[0][1])]
         if fid is not None and c.no_session:
             # ssh -W (ProxyJump, ProxyCommand) ou -N : aucun canal de session, rien à transférer ;
             # le socket du sous-agent doit seulement exister (-W impose ExitOnForwardFailure, même
@@ -1449,17 +2116,25 @@ def run_ensure(args) -> int:
         ctx = ensure_mod.Context(conn=c.conn, host=c.host, interactive=not why, why_not=why,
                                  deadline_at=time.monotonic() + left)
         settings = _ensure_settings()
-        store = SessionStore()
+
         def warn(text, label=label):
             try:
                 err("%s : %s" % (label, text))
             except (OSError, ValueError):
                 pass
-        backend = BwBackend(store=store, bw_path=configured_bw_path, warn=warn)
+        cfg = Config()
+        adopt_legacy(cfg, warn, configured_bw_path, warn)
+        accts = Accounts(cfg, configured_bw_path, warn)
+        refs = [(a if a is not None else _legacy_account(i, accts), i) for a, i in refs]
+        for a, _ in refs:
+            accts.check(a)
         if fid is not None:
-            ensure_mod.ensure_forward(fid, ids, backend, store, settings, ctx=ctx)
+            accounts = {a: (accts.backend(a), accts.backend(a).store) for a, _ in refs}
+            ensure_mod.ensure_forward(fid, refs, None, None, settings, ctx=ctx, accounts=accounts)
         else:
-            ensure_mod.ensure(item_id, backend, store, settings, ctx=ctx)
+            a, i = refs[0]
+            b = accts.backend(a)
+            ensure_mod.ensure(i, b, b.store, settings, ctx=ctx, account=a)
         _quiet()  # clé présente ou chargée : un délai ou un signal tardif n'y change plus rien
         rc = RC_OK
     except (Exception, KeyboardInterrupt, Interrupted, Deadline) as e:
@@ -1471,16 +2146,19 @@ def run_ensure(args) -> int:
             pass
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
-    for w in (backend.warnings if backend is not None else []):
-        try:
-            err("%s : %s" % (label, w))
-        except (OSError, ValueError):
-            pass
+    for a, b in (accts.backends() if accts is not None else []):
+        for w in b.warnings:
+            try:
+                err("%s : %s%s" % (label, accts.prefix(a), w))
+            except (OSError, ValueError):
+                pass
     return rc
 
 
 def classify(e: BaseException):
     """(code de sortie, message d'une ligne) d'une erreur."""
+    if isinstance(e, _Reported):
+        return e.rc, ""
     if isinstance(e, UsageError):
         return RC_USAGE, "%s (voir sshvault --help)" % e
     if isinstance(e, (NotLoggedIn, VaultLocked)):
@@ -1491,7 +2169,11 @@ def classify(e: BaseException):
         return RC_BACKEND, str(e)
     if isinstance(e, deploy_mod.DeployError):
         return RC_BACKEND, str(e)
-    if isinstance(e, (InvalidHost, ConfigError, keyfile.KeyRefused, deploy_mod.BadTarget)):
+    if isinstance(e, NoAccount):
+        return RC_LOCKED, str(e)
+    if isinstance(e, (AdoptError, AccountIOError)):
+        return RC_BACKEND, str(e)
+    if isinstance(e, (InvalidHost, ConfigError, keyfile.KeyRefused, deploy_mod.BadTarget, AccountError)):
         return RC_USAGE, str(e)
     if isinstance(e, (AgentStopped, AgentLocked, PassphraseRefused)):
         return RC_LOCKED, str(e)
@@ -1504,10 +2186,21 @@ def classify(e: BaseException):
     return RC_BACKEND, "erreur interne : %s: %s" % (type(e).__name__, e)
 
 
+def _without_vault(args) -> bool:
+    """Commandes qui ne lisent ni n'écrivent aucun compte : une adoption 0.8.0 impossible ne les
+    bloque pas (avertissement)."""
+    return (args.cmd in ("config", "agent") or (args.cmd == "account" and args.account_cmd == "list")
+            or (args.cmd == "ssh-config" and args.action == "install"))
+
+
 def main(argv=None) -> int:
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, _on_signal)
-    backend = None
+    reset_process_state()
+    _ACCOUNTS_SEEN.clear()
+    _LEGACY_CACHE.clear()
+    accounts_mod.DEFERRED.clear()
+    accts = None
     try:
         try:
             argv, ssh_options = split_ssh_options(sys.argv[1:] if argv is None else list(argv))
@@ -1527,19 +2220,27 @@ def main(argv=None) -> int:
                 err(e)
                 return RC_USAGE
         reap_orphans_quietly()
-        store = SessionStore()
-        backend = BwBackend(store=store, bw_path=configured_bw_path, warn=err)
-        rc = run(args, backend)
+        cfg = Config()
+        try:
+            adopt_legacy(cfg, err, configured_bw_path, err)
+        except AdoptError as e:
+            if not _without_vault(args):
+                raise
+            err("avertissement : %s" % e)  # commande qui ne touche pas au coffre : elle se fait
+        accts = Accounts(cfg, configured_bw_path, err)
+        rc = run(args, accts)
     except BrokenPipeError:
         # sortie fermée (sshvault list | head) : rien à dire
         _stdout_to_devnull()
         rc = RC_OK
     except (Exception, KeyboardInterrupt, Interrupted, Deadline) as e:  # filet : jamais de traceback
         rc, msg = classify(e)
-        err(msg)
-    if backend is not None:
-        for w in backend.warnings:
-            err(w)
+        if msg:
+            err(msg)
+    for ac in ([accts] if accts is not None else []) + _ACCOUNTS_SEEN:
+        for a, b in ac.backends():
+            for w in b.warnings:
+                err("%s%s" % (ac.prefix(a), w))
     try:
         sys.stdout.flush()
     except (BrokenPipeError, OSError):

@@ -1,5 +1,83 @@
 # Changelog — sshvault
 
+## sshvault 0.9.0 — Plusieurs comptes Vaultwarden simultanés — 2026-10-09
+
+- Comptes du coffre (CAP-10) : registre alias → serveur + e-mail dans `config.json` (clés
+  `accounts`, `default-accounts`), géré par `sshvault account add ALIAS --server URL
+  --email E`, `account list`, `account remove ALIAS`, `account default ALIAS…` (remplace la
+  liste des comptes par défaut) et `account rename ANCIEN NOUVEAU`. Alias
+  `[a-z0-9][a-z0-9_-]{0,31}`, unique ; couple (serveur normalisé, e-mail en minuscules)
+  unique ; refus en code 2, registre inchangé. Le premier compte ajouté est compte par défaut.
+- Par compte : données de `bw` propres (`…/sshvault/accounts/<alias>/bw`), session propre
+  (clé keyring `sshvault:session:<alias>`, repli `$XDG_RUNTIME_DIR/sshvault/sessions/<alias>`),
+  mémoire d'échec de déverrouillage propre (`unlock-failed.<alias>`). `bw-path`, l'agent dédié,
+  les sous-agents et leurs sockets restent communs.
+- `--account ALIAS` sur `status`, `login`, `unlock`, `lock`, `sync`, `list`, `search`, `load`,
+  `hosts`, `forward`, `import`, `generate`, `pubkey` et `deploy` ; alias inconnu : code 2.
+  Lecture : comptes par défaut (une invite au plus par compte, qui nomme l'alias ; un compte
+  en erreur est dit en une ligne `<alias> : …`, les autres traités, code le pire). Écriture :
+  un seul compte, le défaut s'il est unique, sinon `--account` obligatoire (code 2, une ligne,
+  rien écrit). Sans `--account` : `status` montre tous les comptes, `lock` les verrouille tous,
+  `login` exige `--account` dès qu'il y a plusieurs comptes.
+- `login` : `bw login <e-mail du registre>` (bw ne demande plus que le mot de passe, et la
+  2FA), serveur du registre posé par `bw config server` ; l'option `--server` est retirée
+  (le serveur vient du compte) ; `--account` obligatoire dès qu'il y a plusieurs comptes.
+  `--apikey` : compte connecté vérifié (clé API d'un autre compte : `bw logout`, code 4).
+- `account add` : port par défaut retiré de l'URL, `http://` accepté avec un avertissement,
+  refus si `accounts/<alias>/` existe (code 2) ou si une installation 0.8.0 attend son
+  adoption (code 4). `status` avertit d'un e-mail ou d'un serveur différent du registre.
+  `lock` sans compte : code 3.
+- `list`/`search` texte : alias en première colonne, toujours (`alias⇥nom⇥empreinte⇥hôtes`) ;
+  `--json` : clé `account`.
+- Élément désigné par (compte, id) partout : état des agents (champ `account` ; `also` en
+  `<alias>:<id>` ; entrées d'avant 0.9.0 comparées par id seul), blocs générés
+  (`# <nom> <alias> <id>`), lignes `Match exec` `ensure --account <alias> --id <uuid>` et
+  `ensure --forward <fid> --id <alias>:<uuid>…` (alias et UUID validés). Le chemin rapide
+  d'`ensure` reconnaît la nouvelle forme sans charger la CLI ; l'ancienne (`ensure --id`,
+  `--forward … --id <uuid>`) reste acceptée jusqu'à la régénération : compte trouvé par l'id
+  (seul compte, sinon état de l'agent, comptes déverrouillés, puis seul compte verrouillé ;
+  introuvable : une ligne).
+- Toute régénération du `ssh_config` (`ssh-config`, `hosts`, `forward`, `import`,
+  `generate`) part des éléments de tous les comptes. Un compte illisible (verrouillé sans
+  invite possible, non connecté, bw en erreur) garde ses blocs actuels, relus dans le fichier
+  généré, avec un avertissement : jamais retirés. `ssh-config` demande le mot de passe de
+  chaque compte verrouillé ; les écritures lisent les autres comptes sans invite. Tous les
+  comptes illisibles : rien écrit.
+- `ensure --forward` peut mêler plusieurs comptes : au plus une invite par compte, échec
+  mémorisé pour son seul compte, tout ou rien.
+- `account remove` : verrouille le compte (session oubliée), supprime ses données locales de
+  `bw`, retire ses clés de l'agent dédié et des sous-agents, le retire du registre, régénère
+  le `ssh_config`, sous `ensure.lock`. Une clé partagée avec un autre compte reste (promue) ;
+  agent verrouillé ou en erreur : état gardé, une ligne, code 4 ; clés d'avant 0.9.0 d'un
+  compte verrouillé : laissées, une ligne. Rien n'est modifié dans le coffre. `account
+  rename` : données, registre, défauts, session (durée restante gardée, arrondie vers le bas à
+  l'unité de `/proc/keys`), état des agents et
+  `ssh_config` suivent ; alias pris : code 2, destination existante : code 4.
+- Installation 0.8.0 adoptée au premier lancement : le compte connecté devient un alias
+  déduit de l'e-mail, ses données passent dans `accounts/<alias>/`, compte par défaut, une
+  ligne le dit ; l'ancienne session est oubliée (déverrouillage à refaire). Déplacement
+  impossible : rien modifié, code 4 (sauf `config`, `agent`, `account list`, `ssh-config
+  install` : avertissement). `bw` illisible : avertissement, retenté plus tard ; entre-temps
+  `ssh-config` n'écrit rien (code 3) et `account add` est refusé.
+- Messages qui suggèrent une commande : `--account <alias>` dès qu'il y a plusieurs comptes.
+- `login` réussi : `ssh_config` régénéré s'il existe (tous les comptes), sinon « lancer
+  sshvault ssh-config ». `agent status` : alias du compte en première colonne (`?` inconnu).
+  Écriture sans élément trouvé, plusieurs comptes : le compte cherché est nommé. `config
+  set/unset` sous le verrou du registre. E-mail commençant par `-` refusé ; `bw login -- <e-mail>`.
+  Adoption remise : `status`, `list`, `lock` disent la cause au lieu de suggérer `account add`.
+- Changements incompatibles : `login --server` retiré (`account add` puis `login`) ;
+  `list`/`search` et `agent status` texte : colonne alias en tête, `--json` : clé `account` ; `status` : un
+  groupe de lignes par compte (`alias : …`), `comptes : aucun` et code 3 sans compte ; données,
+  session et mémoire d'échec par compte (nouveaux chemins) ; `ssh_config` généré : commentaire
+  et lignes `ensure` avec l'alias ; état des agents : champ `account`, `also` en
+  `<alias>:<id>` ; texte de l'invite du coffre.
+- Invite du coffre : `sshvault : mot de passe maître du coffre « <alias> » (<e-mail>) : `
+  (`(<e-mail>)` absent quand bw l'a déjà dit connecté, session refusée) ; sous `ssh`, la fin
+  devient `…, clé pour <hôte> : ` (sans e-mail : `… « <alias> », clé pour <hôte> : `).
+- Tests : faux `bw` multi-serveurs (`FAKE_BW_VAULTS`), `tests/test_accounts.py` (matrice de
+  la story, trois sshd de test, rebond sur deux comptes) ; intégration à deux comptes
+  (`SSHVAULT_IT2_*`, volet sauté sans eux).
+
 ## sshvault 0.8.0 — bw par chemin configuré ou PATH — 2026-10-08
 
 - Réglage `bw-path` : `sshvault config set bw-path /chemin/absolu/bw`. Les lignes

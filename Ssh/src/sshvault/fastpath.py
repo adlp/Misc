@@ -16,6 +16,10 @@ refait ces contrôles.
   plus de min(FRESH_MIN, durée/2) s, listée par `ssh-add -L` sur le socket dédié, et égale à
   celle du `.pub` de l'élément dans le ssh_config généré (clé changée dans le coffre :
   rechargée). Ni bw, ni réseau, ni écriture.
+- Élément désigné par (compte, id) (CAP-10) : `ensure --account <alias> --id <uuid>`, et
+  `ensure --forward <fid> --id <alias>:<uuid>…`. Ancienne forme (`ensure --id <uuid>`,
+  `--forward <fid> --id <uuid>…`, config générée par la 0.8.0) acceptée : clé reconnue par son
+  id seul, compte cherché par la CLI complète.
 - `ensure --forward <fid> --id ID…` (sous-agent de transfert, CAP-8) : toutes les clés des
   éléments fraîches dans le sous-agent `fwd/<fid>.sock`, et aucune autre clé ; agent dédié
   non verrouillé (état lu seulement, jamais contacté). ssh appelant en `-W` (saut ProxyJump
@@ -37,7 +41,7 @@ from typing import Mapping, Optional, Sequence
 
 from .agentstate import STATE_NAME, AgentState, remaining
 from .fsutil import read_private
-from .runtime import (FID_RE, SOCKET_NAME, AgentError, fingerprint, forward_paths, parse_listing, public_blob,
+from .runtime import (ALIAS_RE, FID_RE, SOCKET_NAME, AgentError, fingerprint, forward_paths, parse_listing, public_blob,
                       resolve_dir)
 from .settings import seconds
 
@@ -213,9 +217,42 @@ def fresh(e: dict, now: float) -> bool:
     return left is None or left > min(FRESH_MIN, e["lifetime"] / 2)
 
 
-def owns(e: dict, item_id: str) -> bool:
-    """Entrée de l'état enregistrée pour cet élément (ou pour un autre élément de même clé)."""
-    return e["id"].lower() == item_id or item_id in [x.lower() for x in e.get("also") or [] if isinstance(x, str)]
+def parse_ref(ref: str):
+    """`<alias>:<uuid>` → (alias, uuid en minuscules) ; `<uuid>` (ancienne forme) → (None, uuid) ;
+    sinon None."""
+    ref = (ref or "").strip()
+    alias, sep, iid = ref.rpartition(":")
+    if sep and not ALIAS_RE.fullmatch(alias):
+        return None
+    if not ITEM_ID_RE.fullmatch(iid):
+        return None
+    return (alias or None), iid.lower()
+
+
+def _pair(x):
+    """(compte ou None, id) d'un id donné seul, en couple, ou `<alias>:<id>`."""
+    if isinstance(x, tuple):
+        return x[0], x[1].lower()
+    a, _, i = x.rpartition(":")
+    return (a or None), i.lower()
+
+
+def owns(e: dict, item_id: str, account: Optional[str] = None) -> bool:
+    """Entrée de l'état enregistrée pour cet élément (ou pour un autre élément de même clé).
+    Compte comparé seulement s'il est connu des deux côtés (entrées d'avant CAP-10, ancienne
+    forme d'`ensure` : par id)."""
+    item_id = item_id.lower()
+
+    def same(acc, iid):
+        return iid.lower() == item_id and (account is None or not acc or acc == account)
+    if same(e.get("account"), e["id"]):
+        return True
+    for x in e.get("also") or []:
+        if isinstance(x, str):
+            a, i = _pair(x)
+            if same(a, i):
+                return True
+    return False
 
 
 def ssh_home(env: Mapping[str, str]) -> Optional[str]:
@@ -229,20 +266,41 @@ def ssh_home(env: Mapping[str, str]) -> Optional[str]:
     return home if os.path.isabs(home) else None
 
 
-def pub_fingerprint(item_id: str, env: Mapping[str, str]) -> Optional[str]:
-    """Empreinte du `.pub` de l'élément dans le ssh_config généré (bloc `# <nom> <id>`), ou
-    None si la config, le bloc ou le fichier manque."""
+_EXEC_ACCOUNT_RE = re.compile(r" ensure --account (\S+) --id ")
+
+
+def pub_fingerprint(item_id: str, env: Mapping[str, str], account: Optional[str] = None) -> Optional[str]:
+    """Empreinte du `.pub` de l'élément (compte, id) dans le ssh_config généré, ou None si la
+    config, le bloc ou le fichier manque. Bloc : commentaire `# <nom> <alias> <id>` (l'id en fin
+    de ligne) ; le compte est celui de la ligne `ensure --account <alias>` du bloc, sinon le
+    dernier mot du commentaire ; un bloc d'ancienne forme (`# <nom> <id>`, `ensure --id`, sans
+    compte) vaut pour tout compte. `account` None : par id seul."""
     home = ssh_home(env)
     if not home:
         return None
     raw = read_private(os.path.join(home, ".ssh", "sshvault", "config"))
     if raw is None:
         return None
-    inside = False
+    inside, word, exec_seen = False, None, False
     for line in raw.decode(errors="replace").splitlines():
         if line.startswith("# "):
-            inside = line.rstrip().lower().endswith(" " + item_id)
+            body = line.rstrip()
+            inside = body.lower().endswith(" " + item_id)
+            parts = body.split(" ")
+            word = parts[-2] if len(parts) >= 4 else None
+            exec_seen = False
+        elif inside and line.startswith("Match ") and ' exec "' in line:
+            exec_seen = True
+            m = _EXEC_ACCOUNT_RE.search(line)
+            # ligne exec d'ancienne forme (sans --account) : bloc sans compte, vaut pour tout compte
+            if account is not None and m is not None and m.group(1) != account:
+                inside = False
         elif inside and line.strip().startswith("IdentityFile "):
+            if account is not None and not exec_seen and word is not None and ALIAS_RE.fullmatch(word) \
+                    and word != account:
+                # sans ligne exec (auto-load false) : le commentaire nomme un autre compte
+                inside = False
+                continue
             path = line.strip()[len("IdentityFile "):].strip().strip('"').replace("%%", "%")
             pub = read_private(path)
             blob = public_blob(pub.decode(errors="replace")) if pub else None
@@ -265,17 +323,18 @@ def agent_fingerprints(directory: str, env: Mapping[str, str], timeout: float = 
         return None
 
 
-def present_fresh(directory: str, item_id: str, env: Mapping[str, str], timeout: float = LIST_TIMEOUT) -> bool:
+def present_fresh(directory: str, item_id: str, env: Mapping[str, str], timeout: float = LIST_TIMEOUT,
+                  account: Optional[str] = None) -> bool:
     """Une clé enregistrée pour cet élément, encore valable, est listée par l'agent dédié et
     correspond au `.pub` de l'élément dans la config générée (verrouillé : non)."""
     data = AgentState(os.path.join(directory, STATE_NAME)).load()
     if data.get("locked"):
         return False
     now = time.time()
-    want = {fp for fp, e in data["keys"].items() if owns(e, item_id) and fresh(e, now)}
+    want = {fp for fp, e in data["keys"].items() if owns(e, item_id, account) and fresh(e, now)}
     if not want:
         return False
-    pub = pub_fingerprint(item_id, env)
+    pub = pub_fingerprint(item_id, env, account)
     if pub is not None:
         want &= {pub}  # clé changée dans le coffre (et config régénérée) : l'ancienne ne compte plus
         if not want:
@@ -304,9 +363,10 @@ def forward_wanted(data: dict, ids: Sequence[str], env: Mapping[str, str], now: 
     autorisées = enregistrées pour l'un des éléments (et égales au `.pub` de sa config générée
     s'il en a un) ; voulues = les autorisées encore fraîches. None : un élément sans clé fraîche."""
     allowed, want, missing = set(), set(), False
-    for i in ids:
-        mine = {fp for fp, e in data["keys"].items() if owns(e, i)}
-        pub = pub_fingerprint(i, env)
+    for x in ids:
+        a, i = _pair(x)
+        mine = {fp for fp, e in data["keys"].items() if owns(e, i, a)}
+        pub = pub_fingerprint(i, env, a)
         if pub is not None:
             mine &= {pub}  # clé changée dans le coffre (config régénérée) : l'ancienne n'est plus autorisée
         allowed |= mine
@@ -352,19 +412,19 @@ def _stop(signum, frame):
 
 
 def ensure_args(argv: Sequence[str]):
-    """(ids, fid ou None, --nointeraction) si `argv` est `[--nointeraction] ensure` suivi de
-    `--id ID` (une fois), ou de `--forward FID` et d'au moins un `--id ID` (formes `--opt=v`
-    acceptées) ; sinon None (la CLI complète tranche)."""
+    """(ids, fid ou None, --nointeraction, compte ou None) si `argv` est `[--nointeraction] ensure`
+    suivi de `[--account ALIAS] --id ID` (une fois chacun), ou de `--forward FID` et d'au moins un
+    `--id ID` (formes `--opt=v` acceptées) ; sinon None (la CLI complète tranche)."""
     argv = list(argv)
     noint = bool(argv) and argv[0] == "--nointeraction"
     if noint:
         argv = argv[1:]
     if not argv or argv[0] != "ensure":
         return None
-    ids, fids, i = [], [], 1
+    ids, fids, accts, i = [], [], [], 1
     while i < len(argv):
         a = argv[i]
-        for opt, dest in (("--id", ids), ("--forward", fids)):
+        for opt, dest in (("--id", ids), ("--forward", fids), ("--account", accts)):
             if a == opt and i + 1 < len(argv):
                 dest.append(argv[i + 1])
                 i += 2
@@ -375,9 +435,9 @@ def ensure_args(argv: Sequence[str]):
                 break
         else:
             return None
-    if len(fids) > 1 or not ids or (not fids and len(ids) != 1):
+    if len(fids) > 1 or len(accts) > 1 or not ids or (not fids and len(ids) != 1) or (fids and accts):
         return None
-    return ids, (fids[0] if fids else None), noint
+    return ids, (fids[0] if fids else None), noint, (accts[0] if accts else None)
 
 
 def try_fast(argv: Sequence[str]) -> Optional[int]:
@@ -387,11 +447,16 @@ def try_fast(argv: Sequence[str]) -> Optional[int]:
     parsed = ensure_args(argv)
     if parsed is None:
         return None
-    ids = [i.strip().lower() for i in parsed[0]]
-    fid = parsed[1]
-    if not all(ITEM_ID_RE.fullmatch(i) for i in ids) or (fid is not None and not FID_RE.fullmatch(fid)):
+    fid, account = parsed[1], parsed[3]
+    refs = [parse_ref(i) for i in parsed[0]]
+    if any(r is None for r in refs) or (fid is not None and not FID_RE.fullmatch(fid)):
         return None
-    item_id = ids[0]
+    if account is not None and (not ALIAS_RE.fullmatch(account) or refs[0][0] is not None):
+        return None
+    ids = [(a, i) for a, i in refs]
+    item_id = ids[0][1]
+    if fid is None and account is None:
+        account = refs[0][0]  # `ensure --id <alias>:<uuid>` : le compte de la référence
     label = item_id
     rc = None
     try:
@@ -418,7 +483,7 @@ def try_fast(argv: Sequence[str]) -> Optional[int]:
                     d = None
                 left = min(LIST_TIMEOUT, time_left(total))
                 if d is not None and (forward_fresh(d, fid, ids, os.environ, left) if fid is not None
-                                      else present_fresh(d, item_id, os.environ, left)):
+                                      else present_fresh(d, item_id, os.environ, left, account)):
                     rc = 0
     except (KeyboardInterrupt, _Stop):
         try:

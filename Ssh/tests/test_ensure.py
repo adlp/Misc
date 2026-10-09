@@ -175,7 +175,7 @@ def sv_lines(stderr):
 
 
 def fins(stderr):
-    return re.findall(r"^sshvault-test: fin ensure --id (\S+) rc=(\d+)$", stderr, re.M)
+    return re.findall(r"^sshvault-test: fin ensure (?:--account \S+ )?--id (\S+) rc=(\d+)$", stderr, re.M)
 
 
 def loads(bench):
@@ -249,16 +249,34 @@ def test_fraicheur_seuil():
 
 
 def test_ensure_args():
-    assert E.ensure_args(["ensure", "--id", "x"]) == (["x"], None, False)
-    assert E.ensure_args(["--nointeraction", "ensure", "--id=x"]) == (["x"], None, True)
+    assert E.ensure_args(["ensure", "--id", "x"]) == (["x"], None, False, None)
+    assert E.ensure_args(["--nointeraction", "ensure", "--id=x"]) == (["x"], None, True, None)
     assert E.ensure_args(["ensure", "--id", "x", "y"]) is None and E.ensure_args(["list"]) is None
     assert E.ensure_args(["ensure", "--id", "x", "--id", "y"]) is None, "plusieurs --id : seulement avec --forward"
     # transfert d'agent (story 8)
-    assert E.ensure_args(["ensure", "--forward", "f", "--id", "x", "--id", "y"]) == (["x", "y"], "f", False)
-    assert E.ensure_args(["--nointeraction", "ensure", "--forward=f", "--id=x"]) == (["x"], "f", True)
+    assert E.ensure_args(["ensure", "--forward", "f", "--id", "x", "--id", "y"]) == (["x", "y"], "f", False, None)
+    assert E.ensure_args(["--nointeraction", "ensure", "--forward=f", "--id=x"]) == (["x"], "f", True, None)
     for bad in (["ensure", "--forward", "f"], ["ensure", "--forward", "f", "--forward", "g", "--id", "x"],
                 ["ensure", "--forward", "f", "--id"], ["ensure", "--forward", "f", "--id", "x", "--autre"]):
         assert E.ensure_args(bad) is None, bad
+    # compte (story 10) : `--account A --id X`, une fois chacun ; jamais avec --forward
+    assert E.ensure_args(["ensure", "--account", "a", "--id", "x"]) == (["x"], None, False, "a")
+    assert E.ensure_args(["ensure", "--account=a", "--id=x"]) == (["x"], None, False, "a")
+    for bad in (["ensure", "--account", "a", "--account", "b", "--id", "x"],
+                ["ensure", "--forward", "f", "--account", "a", "--id", "x"], ["ensure", "--account", "a"]):
+        assert E.ensure_args(bad) is None, bad
+
+
+def test_parse_ref_et_owns():
+    assert E.parse_ref("perso:%s" % ID_A.upper()) == ("perso", ID_A)
+    assert E.parse_ref(ID_A) == (None, ID_A)
+    for bad in ("Perso:%s" % ID_A, ":%s" % ID_A, "a:b:%s" % ID_A, "perso:x", "", "x"):
+        assert E.parse_ref(bad) is None, bad
+    new = {"id": ID_A, "account": "perso", "also": ["boulot:%s" % ID_B]}
+    old = {"id": ID_A}
+    assert E.owns(new, ID_A, "perso") and not E.owns(new, ID_A, "boulot") and E.owns(new, ID_A)
+    assert E.owns(new, ID_B, "boulot") and not E.owns(new, ID_B, "perso")
+    assert E.owns(old, ID_A, "perso") and E.owns(old, ID_A.upper()), "entrée d'avant CAP-10 : par id seul"
 
 
 @pytest.mark.parametrize("dest,label", [
@@ -374,9 +392,9 @@ def test_proxyjump_un_ensure_par_saut(bench, lab, tmp_path):
     assert r.returncode == 0, r.stderr
     err = r.stderr
     assert fins(err) == [(ID_B, "0"), (ID_A, "0")], "la cible d'abord, puis le saut, un appel chacun"
-    i_b = err.index("sshvault-test: fin ensure --id %s" % ID_B)
+    i_b = err.index("sshvault-test: fin ensure --account alice --id %s" % ID_B)
     i_proxy = err.index("Executing proxy command")
-    i_a = err.index("sshvault-test: fin ensure --id %s" % ID_A)
+    i_a = err.index("sshvault-test: fin ensure --account alice --id %s" % ID_A)
     i_conn_a = err.index("Connecting to 127.0.0.1 [127.0.0.1] port %d" % lab.ports["a"])
     i_auth_a = err.index("Authenticated to 127.0.0.1 ([127.0.0.1]:%d)" % lab.ports["a"])
     i_auth_b = err.index("Authenticated to 127.0.0.1 (via proxy)")
@@ -446,8 +464,8 @@ def test_proxycommand_ssh_w(bench, lab, tmp_path):
     assert r.returncode == 0, r.stderr
     err = r.stderr
     assert fins(err) == [(ID_B, "0"), (ID_A, "0")]
-    assert err.index("fin ensure --id %s" % ID_B) < err.index("Executing proxy command: exec ssh -v")
-    assert err.index("fin ensure --id %s" % ID_A) < err.index("Connecting to 127.0.0.1 [127.0.0.1] port %d"
+    assert err.index("fin ensure --account alice --id %s" % ID_B) < err.index("Executing proxy command: exec ssh -v")
+    assert err.index("fin ensure --account alice --id %s" % ID_A) < err.index("Connecting to 127.0.0.1 [127.0.0.1] port %d"
                                                               % lab.ports["a"])
     assert offers(err) == [fp(bench, "prod"), fp(bench, "bastion")]
     assert len(loads(bench)) == 2 and sv_lines(err) == []
@@ -525,7 +543,8 @@ def test_mauvais_mot_de_passe_memorise(bench, lab, tmp_path):
     r = pty_run([ssh_argv(main, "b")], env_of(bench), answers=["mauvais"], timeout=60)
     assert r.returncode == 255
     assert r.prompts == 1, r.screen
-    assert "mot de passe maître du coffre (clé pour b)" in r.screen, "l'invite dit ce qui la déclenche"
+    assert "mot de passe maître du coffre « alice » (alice@example.test), clé pour b :" in r.screen, \
+        "l'invite nomme le compte et dit ce qui la déclenche"
     lines = sv_lines(r.stderr)
     assert len(lines) == 2 and lines[0] == "sshvault: b : %s" % REFUSED, r.stderr
     m = re.fullmatch(r"sshvault: a : déverrouillage du coffre en échec il y a (\d+)s pour cette connexion : pas de "
@@ -535,7 +554,7 @@ def test_mauvais_mot_de_passe_memorise(bench, lab, tmp_path):
     assert [c for c in bw_cmds(bench)[calls:]] == [["status"], ["unlock", "--passwordenv"]], \
         "le saut suivant n'appelle pas bw"
     assert bench.agent_keys() == [] and loads(bench) == []
-    fail = bench.runtime / "sshvault" / "unlock-failed"
+    fail = bench.runtime / "sshvault" / "unlock-failed.alice"
     assert oct(fail.stat().st_mode & 0o777) == "0o600" and re.fullmatch(r"\d+ \d+:\d+\n", fail.read_text())
     # autre connexion dans les 30 s : pas gênée (nouvelle invite), succès, mémoire effacée
     r = pty_run([ssh_argv(main, "b")], env_of(bench), answers=[PASSWORD], timeout=60)
@@ -574,7 +593,7 @@ def test_askpass_non_executable_compte_comme_absent(bench, lab, tmp_path):
     assert r.returncode == 255
     assert all("aucune invite possible" in l for l in sv_lines(r.stderr)) and len(sv_lines(r.stderr)) == 2
     assert len(bench.calls()) == calls
-    assert not (bench.runtime / "sshvault" / "unlock-failed").exists()
+    assert not (bench.runtime / "sshvault" / "unlock-failed.alice").exists()
 
 
 @pytest.mark.parametrize("askpass", [False, True])
@@ -612,7 +631,7 @@ def test_sans_tty_ni_askpass(bench, lab, tmp_path):
                                   "SSH_ASKPASS utilisable)" % h for h in ("b", "a")], r.stderr
     assert len(bench.calls()) == calls, "échec rapide : aucun bw"
     assert r.duration < 5 and "Permission denied" in r.stderr
-    assert not (bench.runtime / "sshvault" / "unlock-failed").exists(), "invite impossible : pas un échec mémorisé"
+    assert not (bench.runtime / "sshvault" / "unlock-failed.alice").exists(), "invite impossible : pas un échec mémorisé"
 
 
 @pytest.mark.parametrize("shell", SHELLS)
@@ -738,7 +757,7 @@ def test_ctrl_c_pendant_l_invite(bench, lab, tmp_path):
     assert "Traceback" not in r.stderr
     assert loads(bench) == [] and bench.agent_keys() == []
     assert no_leftovers(bench) == []
-    assert not (bench.runtime / "sshvault" / "unlock-failed").exists(), "interruption : pas un échec mémorisé"
+    assert not (bench.runtime / "sshvault" / "unlock-failed.alice").exists(), "interruption : pas un échec mémorisé"
 
 
 # --- chargement : coût mesuré, erreurs, robustesse ---------------------------------------------
@@ -882,7 +901,7 @@ def test_meme_cle_deux_elements(bench, lab, tmp_path):
     assert bench.run("ensure", "--id", id_c).returncode == 0
     assert len(loads(bench)) == n and len(bench.calls()) == calls + 1, "reconnue (un bw), pas rechargée"
     e = bench.agent_state()["keys"][fp(bench, "prod")]
-    assert e["id"] == ID_A and e["also"] == [id_c]
+    assert e["id"] == ID_A and e["also"] == ["alice:%s" % id_c]
     assert bench.run("ensure", "--id", id_c).returncode == 0 and len(bench.calls()) == calls + 1, "chemin rapide"
 
 
@@ -1006,9 +1025,9 @@ def test_exec_apres_hosts_add_et_print(bench):
     r = bench.run("hosts", "add", "--id", ID_PERSO, "perso.example")
     assert r.returncode == 0, r.stderr
     text = (bench.home / ".ssh" / "sshvault" / "config").read_text()
-    assert "Match originalhost perso.example exec \"'%s' ensure --id %s\"\n" % (bench.exe, ID_PERSO) in text
+    assert "Match originalhost perso.example exec \"'%s' ensure --account alice --id %s\"\n" % (bench.exe, ID_PERSO) in text
     r = bench.run("ssh-config", "--print")
-    assert r.returncode == 0 and ("exec \"'%s' ensure --id %s\"" % (bench.exe, ID_PERSO)) in r.stdout
+    assert r.returncode == 0 and ("exec \"'%s' ensure --account alice --id %s\"" % (bench.exe, ID_PERSO)) in r.stdout
 
 
 def test_config_booleens(bench, lab, tmp_path):

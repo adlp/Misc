@@ -4,9 +4,9 @@
   sinon `bw` cherché dans le PATH. Un réglage posé n'est jamais doublé par le PATH : `bw`
   absent à ce chemin = erreur (BackendNotFound) qui cite le chemin et le réglage. Le chemin
   n'est jamais passé à un shell (argv de Popen).
-- Données propres à sshvault, login séparé de l'usage personnel de bw :
-  `BITWARDENCLI_APPDATA_DIR=${XDG_DATA_HOME:-~/.local/share}/sshvault/bw`,
-  donc un login séparé de l'usage personnel de `bw`.
+- Données propres à sshvault, une par compte (CAP-10 : une instance = un compte) :
+  `BITWARDENCLI_APPDATA_DIR=${XDG_DATA_HOME:-~/.local/share}/sshvault/accounts/<alias>/bw`,
+  donc un login séparé de l'usage personnel de `bw` (0.8.0 : `sshvault/bw`, un seul compte).
 - `--nointeraction` partout sauf `login` ; délai borné (`SSHVAULT_BW_TIMEOUT`,
   défaut 60 s) ; la session passe par `BW_SESSION` dans l'environnement du
   sous-processus, le mot de passe maître par `--passwordenv` sur un environnement
@@ -88,12 +88,28 @@ def last_line(text: str) -> str:
     return one_line((useful or lines or [""])[-1])
 
 
-def default_appdata(env=None) -> str:
+def data_root(env=None) -> str:
+    """`${XDG_DATA_HOME:-~/.local/share}/sshvault`."""
     env = os.environ if env is None else env
     base = env.get("XDG_DATA_HOME") or ""
     if not os.path.isabs(base):
         base = os.path.join(os.path.expanduser("~"), ".local", "share")
-    return os.path.join(base, "sshvault", "bw")
+    return os.path.join(base, "sshvault")
+
+
+def default_appdata(env=None) -> str:
+    """Dossier de données de bw de la 0.8.0 (un seul compte), repris à l'adoption."""
+    return os.path.join(data_root(env), "bw")
+
+
+def account_dir(alias: str, env=None) -> str:
+    """Données locales d'un compte : `<data_root>/accounts/<alias>`."""
+    return os.path.join(data_root(env), "accounts", alias)
+
+
+def account_appdata(alias: str, env=None) -> str:
+    """Dossier de données de bw d'un compte : `<data_root>/accounts/<alias>/bw`."""
+    return os.path.join(account_dir(alias, env), "bw")
 
 
 def resolve_exe(env=None, configured: Optional[Callable[[], Optional[str]]] = None) -> tuple:
@@ -151,6 +167,17 @@ def _restore_tty(saved) -> None:
         os.close(fd)
 
 
+#: bw-path déjà vérifiés (avertissement d'exposition) dans ce processus ; vidé au début de
+#: chaque commande (`reset_process_state`).
+_EXPOSURE_CHECKED: set = set()
+
+
+def reset_process_state() -> None:
+    """Début d'une commande (`main` appelé plusieurs fois dans un même processus) : chaque
+    commande redit l'avertissement d'exposition de bw-path une fois."""
+    _EXPOSURE_CHECKED.clear()
+
+
 class BwTimeout(BackendError):
     """bw n'a pas fini dans le délai (mesuré : connexion TLS bloquée, bw ne l'abandonne jamais)."""
 
@@ -169,15 +196,18 @@ class BwBackend(VaultBackend):
     def __init__(self, store: Optional[SessionStore] = None, exe: Optional[str] = None,
                  appdata: Optional[str] = None, timeout: Optional[float] = None,
                  bw_path: Optional[Callable[[], Optional[str]]] = None,
-                 warn: Optional[Callable[[str], None]] = None):
-        """`exe` : exécutable imposé ; sinon résolu au premier appel de bw (`resolve_exe`) avec
+                 warn: Optional[Callable[[str], None]] = None, label: Optional[str] = None,
+                 email: Optional[str] = None, server: Optional[str] = None, hint: str = ""):
+        """`label` : alias du compte (invite) ; `email`, `server` : ceux du registre (login) ;
+        `hint` : suffixe des commandes suggérées (« --account <alias> » s'il y a plusieurs
+        comptes). `exe` : exécutable imposé ; sinon résolu au premier appel de bw (`resolve_exe`) avec
         `bw_path()`, le réglage `bw-path` (None : non posé) : une commande qui ne lance pas bw
         ne lit pas la configuration. `warn` : affiche aussitôt un avertissement d'une ligne
         (bw-path exposé à d'autres, avant le premier lancement de bw) ; défaut : stderr."""
         self.store = store or SessionStore()
         self._exe = (exe, "argument") if exe else None
         self._bw_path = bw_path
-        self._exposure_checked = False
+        self.label, self.email, self.server, self.hint = label, email, server, hint
         self._warn = warn or _stderr_warning
         self.appdata = appdata or default_appdata()
         self.timeout = timeout if timeout is not None else bw_timeout()
@@ -219,10 +249,10 @@ class BwBackend(VaultBackend):
         why = exe_problem(exe)
         if why:
             raise self._not_found("bw refusé", why)
-        if not self._exposure_checked:
-            # accepté, mais dit tout de suite (une fois par processus), avant que bw reçoive le
-            # mot de passe maître ou la session : choix de l'utilisateur
-            self._exposure_checked = True
+        if exe not in _EXPOSURE_CHECKED:
+            # accepté, mais dit tout de suite (une fois par processus, quel que soit le nombre de
+            # comptes), avant que bw reçoive le mot de passe maître ou la session : choix de l'utilisateur
+            _EXPOSURE_CHECKED.add(exe)
             warning = exposure_warning(exe, BW_PATH_KEY)
             if warning:
                 self._warn(warning)
@@ -235,6 +265,13 @@ class BwBackend(VaultBackend):
             return "%s (PATH)" % _clean(found) if found else "bw (introuvable dans le PATH)"
         label = {EXE_VAR: EXE_VAR, BW_PATH_KEY: "réglage " + BW_PATH_KEY}.get(source, source)
         return "%s (%s)" % (_clean(exe), label)
+
+    def cmd(self, name: str) -> str:
+        """`sshvault <name>[ --account <alias>]` pour un message."""
+        return "sshvault %s%s" % (name, self.hint)
+
+    def _not_logged_in(self, what: str = "non connecté au coffre") -> NotLoggedIn:
+        return NotLoggedIn("%s : lancer « %s »" % (what, self.cmd("login")))
 
     def info(self) -> dict:
         return {"session": self.store.last_backend, "store": self.store.describe(), "data": self.appdata}
@@ -375,15 +412,16 @@ class BwBackend(VaultBackend):
         if not known_logged_in:
             st = self._bw_status(None)
             if st.state == "unauthenticated":
-                raise NotLoggedIn("non connecté au coffre : lancer « sshvault login »")
+                raise self._not_logged_in()
             if st.state == "unlocked":
                 return ""  # déverrouillé sans session (bw configuré sans verrouillage)
             who = st.user or "?"
         else:
             who = None
         if prompt is None:
-            raise VaultLocked("coffre verrouillé : lancer « sshvault unlock » (invite désactivée)")
-        password = prompt("sshvault : mot de passe maître du coffre%s : " % (" (%s)" % who if who else ""))
+            raise VaultLocked("coffre verrouillé : lancer « %s » (invite désactivée)" % self.cmd("unlock"))
+        password = prompt("sshvault : mot de passe maître du coffre%s%s : "
+                          % (" « %s »" % self.label if self.label else "", " (%s)" % _clean(who) if who else ""))
         try:
             r = self._run(["unlock", "--passwordenv", PASSWORD_VAR, "--raw"],
                           extra_env={PASSWORD_VAR: password})
@@ -391,7 +429,7 @@ class BwBackend(VaultBackend):
             del password
         if r.rc != 0:
             if r.has(MSG_NOT_LOGGED_IN):
-                raise NotLoggedIn("non connecté au coffre : lancer « sshvault login »")
+                raise self._not_logged_in()
             # unlock est local : un refus est presque toujours le mot de passe (mesuré :
             # « Cryptography error, The decryption operation failed », code 1).
             raise PasswordRefused("mot de passe maître refusé par bw (%s)" % (last_line(r.err) or "code %d" % r.rc))
@@ -416,7 +454,7 @@ class BwBackend(VaultBackend):
                 return
             self._forget()
             if st.state == "unauthenticated":
-                raise NotLoggedIn("non connecté au coffre : lancer « sshvault login »")
+                raise self._not_logged_in()
             self._unlock_with(prompt, ttl, known_logged_in=True, must_store=True)
             return
         self._unlock_with(prompt, ttl, known_logged_in=False, must_store=True)
@@ -434,7 +472,7 @@ class BwBackend(VaultBackend):
                 return r
             if r.has(MSG_NOT_LOGGED_IN):
                 self._forget()
-                raise NotLoggedIn("non connecté au coffre : lancer « sshvault login »")
+                raise self._not_logged_in()
             if not r.has(MSG_LOCKED):
                 raise self._fail(r, what)
             self._forget()
@@ -444,7 +482,7 @@ class BwBackend(VaultBackend):
         if r.rc == 0:
             return r
         if r.has(MSG_NOT_LOGGED_IN):
-            raise NotLoggedIn("non connecté au coffre : lancer « sshvault login »")
+            raise self._not_logged_in()
         if r.has(MSG_LOCKED):
             self._forget()
             raise VaultLocked("coffre verrouillé : session refusée par bw juste après le déverrouillage")
@@ -471,23 +509,31 @@ class BwBackend(VaultBackend):
         # et get lisent le cache local, aucune connexion)
         self._with_session(["sync"], "sync", prompt, attempts=2)
 
-    def login(self, server: Optional[str] = None, apikey: bool = False, ttl: int = DEFAULT_TTL) -> str:
-        """Login délégué à bw en interactif. Renvoie "unlocked" si bw a donné une session
-        (rangée), sinon "locked" (clé API : il reste à faire `unlock`)."""
+    def login(self, server: Optional[str] = None, apikey: bool = False, ttl: int = DEFAULT_TTL,
+               email: Optional[str] = None) -> str:
+        """Login délégué à bw en interactif (`bw login <e-mail>` : bw demande le mot de passe, et la
+        2FA s'il y a lieu) ; serveur et e-mail du registre par défaut. Renvoie "unlocked" si bw a
+        donné une session (rangée), sinon "locked" (clé API : il reste à faire `unlock`)."""
+        server = server or self.server
+        email = email or self.email
         if server:
-            r = self._run(["config", "server", server])
-            if r.rc != 0:
-                raise self._fail(r, "config server")
-        args = ["login", "--raw"] + (["--apikey"] if apikey else [])
+            st = self._bw_status(None)
+            # bw refuse de changer de serveur une fois connecté : le login dira « déjà connecté »
+            if st.state == "unauthenticated" and (st.server or "").rstrip("/").lower() != server.rstrip("/").lower():
+                r = self._run(["config", "server", server])
+                if r.rc != 0:
+                    raise self._fail(r, "config server")
+        # « -- » : un e-mail n'est jamais lu comme une option de bw
+        args = ["login", "--raw"] + (["--apikey"] if apikey else []) + (["--", email] if email and not apikey else [])
         r = self._run(args, interactive=True, timeout=LOGIN_TIMEOUT)
         if r.rc != 0:
             st = self._bw_status(None)
             if st.state == "unauthenticated":
                 raise NotLoggedIn("login refusé par bw (code %d, message ci-dessus)" % r.rc)
             raise BackendError("erreur bw : login refusé (code %d) ; déjà connecté comme %s"
-                               % (r.rc, st.user or "?"))
+                               % (r.rc, _clean(st.user or "?")))
         token = r.out.strip()
-        if valid_token(token):
+        if valid_token(token) and not apikey:
             try:
                 self.store.put(token, ttl)
             except SessionStoreError as e:
@@ -498,6 +544,24 @@ class BwBackend(VaultBackend):
         st = self._bw_status(None)
         if st.state == "unauthenticated":
             raise NotLoggedIn("login non abouti : toujours non connecté au coffre")
+        if email and (st.user or "").strip().lower() != email.strip().lower():
+            # clé API d'un autre compte : ses données ne restent pas sous cet alias
+            try:
+                out = self._run(["logout"])
+                logged_out = out.rc == 0
+            except BackendError:
+                logged_out = False
+            raise BackendError("erreur bw : la clé API est celle de %s, pas de %s (compte %s) : %s"
+                               % (_clean(st.user or "?"), _clean(email), _clean(self.label or "?"),
+                                  "déconnecté" if logged_out else
+                                  "bw logout en échec : les données de %s restent sous cet alias (%s)"
+                                  % (_clean(st.user or "?"), self.appdata)))
+        if valid_token(token):
+            try:
+                self.store.put(token, ttl)
+            except SessionStoreError as e:
+                self.warnings.append("session non rangée : %s" % e)
+            return "unlocked"
         return st.state
 
     # --- lecture ---------------------------------------------------------------
@@ -598,7 +662,8 @@ class BwBackend(VaultBackend):
         new = with_hosts(before, want, field)
         if new == before:
             return self._item(before)
-        check = "vérifier par « sshvault sync » puis « sshvault %s list --id %s »" % (_COMMAND[field], item_id)
+        check = "vérifier par « %s » puis « sshvault %s list%s --id %s »" % (self.cmd("sync"), _COMMAND[field], self.hint,
+                                                                       item_id)
         try:
             return self._write_hosts(item_id, name, before, new, want, prompt, check, field)
         except Exception:
@@ -640,7 +705,8 @@ class BwBackend(VaultBackend):
             existing = [i.id for i in self.list_ssh_keys(prompt) if i.match_fingerprint(fingerprint)]
         known = set(existing)
         label = _clean(name)
-        check = "vérifier par « sshvault sync » puis « sshvault search --fingerprint %s »" % fingerprint
+        check = "vérifier par « %s » puis « sshvault search%s --fingerprint %s »" % (self.cmd("sync"), self.hint,
+                                                                                fingerprint)
         try:
             return self._create_checked(item, label, fingerprint, want, known, prompt, check)
         except BaseException as e:
@@ -725,8 +791,8 @@ class BwBackend(VaultBackend):
                          and hosts_of(after, field) == hosts_of(before, field))
             if not unchanged:
                 raise WriteFailed("%s ; l'élément a changé dans le coffre (%s relus : %s) : rien rejoué ; "
-                                  "lancer « sshvault sync » puis relancer la commande"
-                                  % (failed, what, _fmt(hosts_of(after, field))))
+                                  "lancer « %s » puis relancer la commande"
+                                  % (failed, what, _fmt(hosts_of(after, field)), self.cmd("sync")))
             if attempt == 2:
                 raise WriteFailed("%s, deux fois ; état relu : élément inchangé (%s : %s)"
                                   % (failed, what, _fmt(hosts_of(after, field))))

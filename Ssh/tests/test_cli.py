@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from bench import (EMAIL, ID_BASTION, ID_PERSO, ID_PROD, PASSWORD, make_askpass)
+from bench import (ALIAS, EMAIL, ID_BASTION, ID_PERSO, ID_PROD, PASSWORD, make_askpass)
 
 
 def one_line_error(r):
@@ -37,6 +37,7 @@ def test_bw_absent_du_path(bench, tmp_path):
     del env["SSHVAULT_BW"]
     env["PATH"] = str(empty)
     bench.env = env
+    bench.write_registry()
     r = bench.run("list")
     assert r.returncode == 4
     line = one_line_error(r)
@@ -45,6 +46,7 @@ def test_bw_absent_du_path(bench, tmp_path):
 
 
 def test_bw_absent_sshvault_bw(bench):
+    bench.write_registry()
     r = bench.run("status", env={"SSHVAULT_BW": "/nonexistent/bw"})
     assert r.returncode == 4
     line = one_line_error(r)
@@ -220,9 +222,9 @@ def test_list(bench):
     assert r.returncode == 0, r.stderr
     lines = r.stdout.splitlines()
     assert lines == [
-        "Bastion RSA\t%s\tBastion,jump" % bench.keys["bastion"]["fingerprint"],
-        "clé perso\t%s\t-" % bench.keys["perso"]["fingerprint"],
-        "Serveur Prod\t%s\tprod.example.com,*.Lab.example" % bench.keys["prod"]["fingerprint"],
+        "alice\tBastion RSA\t%s\tBastion,jump" % bench.keys["bastion"]["fingerprint"],
+        "alice\tclé perso\t%s\t-" % bench.keys["perso"]["fingerprint"],
+        "alice\tServeur Prod\t%s\tprod.example.com,*.Lab.example" % bench.keys["prod"]["fingerprint"],
     ]
     assert len(bench.calls()) == 1, "un seul appel bw par opération courante"
 
@@ -234,7 +236,8 @@ def test_list_json(bench):
     data = json.loads(r.stdout)
     assert [d["id"] for d in data] == [ID_BASTION, ID_PERSO, ID_PROD]
     prod = data[2]
-    assert set(prod) == {"id", "name", "fingerprint", "hosts", "forward", "publicKey"}
+    assert set(prod) == {"account", "id", "name", "fingerprint", "hosts", "forward", "publicKey"}
+    assert prod["account"] == ALIAS
     assert prod["hosts"] == ["prod.example.com", "*.Lab.example"] and prod["forward"] == []
     assert prod["publicKey"] == bench.keys["prod"]["public"]
     assert data[1]["hosts"] == []
@@ -254,12 +257,14 @@ def test_list_aucune_cle_privee(bench):
 
 def test_fichiers_et_dossiers_crees(bench):
     assert not (bench.home / ".local").exists()
+    bench.write_registry()
     assert bench.run("status").returncode == 3  # crée le dossier de données de bw
     bench.set_state(logged_in=True)
     r, _ = bench.run_tty("unlock", answer=PASSWORD, env={"SSHVAULT_KEYCTL": "/nonexistent/keyctl"})
     assert r.returncode == 0, r.stderr
     for d in (bench.home / ".local", bench.home / ".local" / "share", bench.home / ".local" / "share" / "sshvault",
-              bench.appdata, bench.runtime / "sshvault"):
+              bench.appdata.parent.parent, bench.appdata.parent, bench.appdata, bench.runtime / "sshvault",
+              bench.session_file().parent):
         assert stat.S_IMODE(d.stat().st_mode) == 0o700, d
     assert stat.S_IMODE(bench.session_file().stat().st_mode) == 0o600
 
@@ -277,7 +282,7 @@ def test_donnees_bw_dediees(bench):
     assert c["appdata"] == str(bench.appdata)
     xdg = bench.tmp / "xdg"
     bench.run("status", env={"XDG_DATA_HOME": str(xdg)})
-    assert bench.calls()[-1]["appdata"] == str(xdg / "sshvault" / "bw")
+    assert bench.calls()[-1]["appdata"] == str(xdg / "sshvault" / "accounts" / ALIAS / "bw")
 
 
 # --- search -----------------------------------------------------------------------
@@ -299,7 +304,7 @@ def test_search(bench, args, expected):
     bench.unlocked("keyring" if bench.ring else "file")
     r = bench.run("search", args[1], args[0])
     assert r.returncode == 0, r.stderr
-    assert [l.split("\t")[0] for l in r.stdout.splitlines()] == expected
+    assert [l.split("\t")[1] for l in r.stdout.splitlines()] == expected
 
 
 @pytest.mark.parametrize("prefix", ["SHA256:", "", "sha256:"])
@@ -323,7 +328,7 @@ def test_search_fingerprint_exacte(bench):
 def test_search_sans_mode(bench):
     bench.unlocked("keyring" if bench.ring else "file")
     r = bench.run("search", "jump")
-    assert [l.split("\t")[0] for l in r.stdout.splitlines()] == ["Bastion RSA"]
+    assert [l.split("\t")[1] for l in r.stdout.splitlines()] == ["Bastion RSA"]
 
 
 @pytest.mark.parametrize("args", [["--host", "inconnu.example"], ["--name", "zzz"],
@@ -483,6 +488,9 @@ def test_lock_purge_meme_si_bw_echoue(bench):
 
 def test_lock_non_connecte(bench):
     r = bench.run("lock")
+    assert r.returncode == 3 and "aucun compte" in one_line_error(r), "aucun compte : comme unlock et sync"
+    bench.write_registry()
+    r = bench.run("lock")
     assert r.returncode == 0
 
 
@@ -490,6 +498,10 @@ def test_lock_non_connecte(bench):
 
 def test_status(bench):
     r = bench.run("status")
+    assert r.returncode == 3 and "comptes : aucun" in r.stdout and "account add" in r.stdout
+    bench.write_registry()
+    r = bench.run("status")
+    assert "alias : alice (défaut)" in r.stdout
     assert r.returncode == 3 and "non connecté" in r.stdout
     bench.set_state(logged_in=True)
     r = bench.run("status")
@@ -559,16 +571,21 @@ def test_sync(bench):
 
 
 def test_login_interactif(bench):
-    """login délégué à bw : saisie interactive (pas de --nointeraction), session rangée."""
+    """login délégué à bw : `bw login <e-mail du registre>` (bw ne demande que le mot de passe),
+    saisie interactive (pas de --nointeraction), serveur du registre, session rangée."""
     import subprocess
     import sys
+    bench.accounts["alice"] = ("https://vw.example.test", EMAIL)
+    bench.write_registry()
     e = dict(bench.env)
-    p = subprocess.run([sys.executable, "-m", "sshvault", "login", "--server", "https://vw.example.test"],
-                       env=e, input="%s\n%s\n" % (EMAIL, PASSWORD), capture_output=True, text=True, timeout=60)
+    p = subprocess.run([sys.executable, "-m", "sshvault", "login"],
+                       env=e, input="%s\n" % PASSWORD, capture_output=True, text=True, timeout=60)
     assert p.returncode == 0, p.stderr
+    assert "compte alice : connecté, coffre déverrouillé" in p.stdout
     assert bench.state()["serverUrl"] == "https://vw.example.test"
     login = [c for c in bench.calls() if c["argv"][:1] == ["login"]]
-    assert login and not login[0]["nointeraction"]
+    assert login and not login[0]["nointeraction"] and login[0]["argv"][-2:] == ["--", EMAIL], "« -- » avant l'e-mail"
+    assert PASSWORD not in json.dumps(login)
     assert bench.bw_session() in bench.stored_session()
     assert bench.bw_session() not in p.stdout + p.stderr
 
@@ -576,6 +593,7 @@ def test_login_interactif(bench):
 def test_login_apikey(bench):
     import subprocess
     import sys
+    bench.write_registry()
     e = dict(bench.env, BW_CLIENTID="user.aaaa", BW_CLIENTSECRET="apisecret")
     p = subprocess.run([sys.executable, "-m", "sshvault", "login", "--apikey"], env=e, stdin=subprocess.DEVNULL,
                        capture_output=True, text=True, timeout=60)
@@ -586,6 +604,7 @@ def test_login_apikey(bench):
 
 def test_login_non_abouti(bench):
     """bw login peut finir en code 0 sans connexion (stdin fermé) : mesuré sur le vrai bw 2026.9.1."""
+    bench.write_registry()
     r = bench.run("login", "--apikey")  # stdin /dev/null, ni BW_CLIENTID ni BW_CLIENTSECRET
     assert r.returncode == 3
     # stderr de bw transmis tel quel (login interactif) ; l'erreur de sshvault est la dernière ligne
@@ -596,8 +615,9 @@ def test_login_non_abouti(bench):
 def test_login_refuse(bench):
     import subprocess
     import sys
+    bench.write_registry()
     p = subprocess.run([sys.executable, "-m", "sshvault", "login"], env=bench.env,
-                       input="%s\nmauvais\n" % EMAIL, capture_output=True, text=True, timeout=60)
+                       input="mauvais\n", capture_output=True, text=True, timeout=60)
     assert p.returncode == 3
     assert p.stderr.splitlines()[-1].startswith("sshvault: login refusé")
     bench.set_state(logged_in=True)
@@ -617,7 +637,7 @@ def test_search_motif_vide(bench):
 def test_search_sans_mode_nom_seul_et_empreinte_seule(bench):
     bench.unlocked("keyring" if bench.ring else "file")
     r = bench.run("search", "PERSO")  # nom seul (aucun hôte ni empreinte ne contient « perso »)
-    assert [l.split("\t")[0] for l in r.stdout.splitlines()] == ["clé perso"]
+    assert [l.split("\t")[1] for l in r.stdout.splitlines()] == ["clé perso"]
     fp = bench.keys["perso"]["fingerprint"]
     r = bench.run("search", fp, "--json")  # empreinte seule
     assert [d["id"] for d in json.loads(r.stdout)] == [ID_PERSO]
@@ -631,8 +651,8 @@ def test_texte_du_coffre_nettoye(bench):
     bench.unlocked("keyring" if bench.ring else "file")
     r = bench.run("search", "--name", "mal")
     assert r.returncode == 0
-    assert "\x1b" not in r.stdout and r.stdout.count("\n") == 1 and r.stdout.count("\t") == 2
-    assert r.stdout.startswith("mal\\x09venu\\x0a\\x1b]0;titre\\x07\t")
+    assert "\x1b" not in r.stdout and r.stdout.count("\n") == 1 and r.stdout.count("\t") == 3
+    assert r.stdout.startswith("alice\tmal\\x09venu\\x0a\\x1b]0;titre\\x07\t")
     assert "a\\x1b[31m,b\\x09c" in r.stdout
     r = bench.run("search", "--name", "mal", "--json")
     assert json.loads(r.stdout)[0]["name"] == "mal\tvenu\n\x1b]0;titre\x07", "JSON inchangé"
@@ -728,8 +748,9 @@ def test_login_session_non_rangee(bench):
     import sys
     env = dict(bench.env, SSHVAULT_KEYCTL="/nonexistent/keyctl")
     env.pop("XDG_RUNTIME_DIR")
+    bench.write_registry()
     p = subprocess.run([sys.executable, "-m", "sshvault", "login"], env=env,
-                       input="%s\n%s\n" % (EMAIL, PASSWORD), capture_output=True, text=True, timeout=60)
+                       input="%s\n" % PASSWORD, capture_output=True, text=True, timeout=60)
     assert p.returncode == 0, p.stderr
     assert "connecté, coffre déverrouillé" in p.stdout
     # les invites de bw (sans fin de ligne) précèdent l'avertissement sur la même ligne
@@ -749,6 +770,7 @@ def test_login_tue_retablit_l_echo(bench):
     def ctty():
         os.close(os.open(name, os.O_RDWR))
 
+    bench.write_registry()
     e = dict(bench.env, FAKE_BW_FAIL="login=hangnoecho")
     p = subprocess.Popen([sys.executable, "-m", "sshvault", "login"], env=e, stdin=slave,
                          stdout=subprocess.PIPE, stderr=slave, start_new_session=True, preexec_fn=ctty)
@@ -779,8 +801,9 @@ def test_login_tue_retablit_l_echo(bench):
 
 
 def test_status_decrit_le_magasin(bench):
+    bench.write_registry()
     r = bench.run("status")
-    assert "magasin : keyring" in r.stdout and str(bench.runtime) in r.stdout
+    assert "magasin : keyring" in r.stdout and str(bench.session_file()) in r.stdout
 
 
 def test_usage(bench):
@@ -906,6 +929,8 @@ def _unlock(bench):
 def _write_config(bench, data):
     f = config_file(bench)
     f.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if isinstance(data, dict):
+        data = dict(bench.registry(), **data)  # registre des comptes du banc (CAP-10) en plus
     content = (data if isinstance(data, bytes) else json.dumps(data).encode())
     f.write_bytes(content)
     os.chmod(str(f), 0o600)
@@ -1141,9 +1166,10 @@ def test_status_bw_absent_dit_le_bw(bench, tmp_path):
     empty = tmp_path / "vide"
     empty.mkdir()
     bench.env = dict(bench.env_without_bw(), PATH=str(empty))
+    bench.write_registry()
     r = bench.run("status")
     assert r.returncode == 4
-    assert r.stdout == "bw : bw (introuvable dans le PATH)\n"
+    assert r.stdout == "bw : bw (introuvable dans le PATH)\nalias : alice (défaut)\n"
     assert "bw introuvable (bw cherché dans le PATH" in one_line_error(r)
 
 
@@ -1318,6 +1344,7 @@ def test_bw_du_path_inutilisable(bench, how, msg):
     (d / "bw").write_text("echo x\n" if how == "sans-shebang" else "#!/nonexistent/interp\n")
     (d / "bw").chmod(0o755)
     bench.env = bench.env_without_bw([d])
+    bench.write_registry()
     r = bench.run("status")
     assert r.returncode == 4
     line = one_line_error(r)

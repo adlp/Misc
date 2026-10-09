@@ -38,6 +38,9 @@ SRC = os.path.join(os.path.dirname(HERE), "src")
 FAKE_BW = os.path.join(HERE, "fake_bw.py")
 PASSWORD = "correct horse battery staple"
 EMAIL = "alice@example.test"
+#: Compte du banc (CAP-10) : alias déduit de EMAIL, comme à l'adoption d'une installation 0.8.0.
+ALIAS = "alice"
+SERVER = "https://vault.example.test"
 PASSPHRASE = "passphrase de la cle chiffree"
 SSH_ADD = shutil.which("ssh-add") or "/usr/bin/ssh-add"
 SSH_AGENT = shutil.which("ssh-agent") or "/usr/bin/ssh-agent"
@@ -82,8 +85,9 @@ def ring(keyring_ok):
     subprocess.run(["keyctl", "unlink", rid, "@s"], capture_output=True)
 
 
-def keyring_session(rid):
-    r = subprocess.run(["keyctl", "search", rid, "user", "sshvault:session"], capture_output=True, text=True)
+def keyring_session(rid, alias=ALIAS):
+    desc = "sshvault:session:%s" % alias if alias else "sshvault:session"
+    r = subprocess.run(["keyctl", "search", rid, "user", desc], capture_output=True, text=True)
     if r.returncode != 0:
         return None
     return subprocess.run(["keyctl", "pipe", r.stdout.strip()], capture_output=True, text=True).stdout
@@ -365,7 +369,7 @@ class Bench:
         self._safe = None
         self.bw.write_text("#!/bin/sh\nexec '%s' '%s' \"$@\"\n" % (sys.executable, FAKE_BW))
         self.bw.chmod(0o755)
-        self.appdata = self.home / ".local" / "share" / "sshvault" / "bw"
+        self.appdata = self.home / ".local" / "share" / "sshvault" / "accounts" / ALIAS / "bw"
         self.witness = witness
         self.ssh_add_log = tmp_path / "ssh-add.log"
         self.ssh_add = tmp_path / "bin" / "ssh-add"
@@ -376,11 +380,84 @@ class Bench:
         self.known_hosts.write_text("")
         self.exe = write_exe(tmp_path / "exe")
         self.env = self.base_env()
+        #: comptes du registre : alias -> (serveur, e-mail)
+        # écrit par set_state()/unlocked()/write_registry() : un banc neuf n'a pas de config.json
+        self.accounts = {ALIAS: (SERVER, EMAIL)}
+        self.defaults = [ALIAS]
+
+    # --- registre des comptes (config.json) ---
+
+    def config_file(self):
+        base = self.env.get("XDG_CONFIG_HOME") or str(self.home / ".config")
+        return pathlib.Path(base) / "sshvault" / "config.json"
+
+    def registry(self):
+        """Clés du registre des comptes dans config.json."""
+        return {"accounts": {a: {"server": srv, "email": e} for a, (srv, e) in self.accounts.items()},
+                "default-accounts": list(self.defaults)}
+
+    def write_registry(self):
+        """Registre des comptes du banc dans config.json (autres réglages gardés)."""
+        f = self.config_file()
+        try:
+            data = json.loads(f.read_text())
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        reg = self.registry()
+        if all(data.get(k) == v for k, v in reg.items()):
+            return  # déjà là : fichier inchangé (octets comparés par certains tests)
+        data.update(reg)
+        f.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(str(f.parent), 0o700)
+        fd = os.open(str(f), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.write(fd, (json.dumps(data) + "\n").encode())
+        os.close(fd)
+
+    def appdata_of(self, alias):
+        return self.home / ".local" / "share" / "sshvault" / "accounts" / alias / "bw"
+
+    def add_account(self, alias, email, server=SERVER, items=(), password=PASSWORD, logged_in=True,
+                    unlocked=False, where="keyring", default=False):
+        """Second compte (même serveur ou autre) : coffre du faux serveur, registre, données de bw
+        (connecté, déverrouillé et session rangée par sshvault au besoin). Renvoie le fichier du coffre."""
+        vf = self.tmp / "server" / ("vault-%s.json" % alias)
+        n = len(self.accounts) + 1
+        vf.write_text(json.dumps({"server": server, "email": email, "password": password,
+                                  "userId": "aaaaaaaa-0000-4000-8000-%012d" % n, "clientId": "user.%s" % alias,
+                                  "clientSecret": "apisecret-%s" % alias, "items": list(items)}))
+        if not getattr(self, "vault_server", None):
+            self.vault_server = self.accounts[ALIAS][0]
+            self.write_vault()
+        self.env["FAKE_BW_VAULTS"] = ":".join([p for p in self.env.get("FAKE_BW_VAULTS", "").split(":") if p]
+                                              + [str(vf)])
+        self.accounts[alias] = (server, email)
+        if default:
+            self.defaults.append(alias)
+        self.write_registry()
+        if logged_in:
+            tok = ("c2Vzc2lvbi0%s-MTIzNDU2Nzg5MA==" % alias) if unlocked else None
+            d = self.appdata_of(alias)
+            d.mkdir(parents=True, exist_ok=True, mode=0o700)
+            (d / "data.json").write_text(json.dumps({
+                "stateVersion": 85, "serverUrl": server, "userId": "aaaaaaaa-0000-4000-8000-%012d" % n,
+                "userEmail": email, "lastSync": "2026-10-06T00:00:00.000Z", "session": tok, "vault": str(vf)}))
+            if unlocked:
+                self.store_session(tok, where, alias=alias)
+        return vf
+
+    def account_vault(self, alias):
+        if alias == ALIAS:
+            return self.vault_file
+        return self.tmp / "server" / ("vault-%s.json" % alias)
 
     def write_vault(self):
-        self.vault_file.write_text(json.dumps({
-            "email": EMAIL, "password": PASSWORD, "userId": "aaaaaaaa-0000-4000-8000-000000000001",
-            "clientId": "user.aaaa", "clientSecret": "apisecret", "items": self.items}))
+        v = {"email": EMAIL, "password": PASSWORD, "userId": "aaaaaaaa-0000-4000-8000-000000000001",
+             "clientId": "user.aaaa", "clientSecret": "apisecret", "items": self.items}
+        if getattr(self, "vault_server", None):
+            v["server"] = self.vault_server  # plusieurs serveurs (FAKE_BW_VAULTS) : le coffre d'alice a le sien
+        self.vault_file.write_text(json.dumps(v))
 
     def base_env(self):
         env = {k: v for k, v in os.environ.items()
@@ -463,8 +540,9 @@ class Bench:
             return {}
 
     def set_state(self, logged_in=True, session=None):
+        self.write_registry()
         self.appdata.mkdir(parents=True, exist_ok=True, mode=0o700)
-        st = {"stateVersion": 85, "serverUrl": "https://vault.example.test"}
+        st = {"stateVersion": 85, "serverUrl": SERVER}
         if logged_in:
             st.update(userId="aaaaaaaa-0000-4000-8000-000000000001", userEmail=EMAIL,
                       lastSync="2026-10-06T00:00:00.000Z", session=session)
@@ -475,25 +553,29 @@ class Bench:
 
     # --- magasin de session de sshvault ---
 
-    def session_file(self):
-        return self.runtime / "sshvault" / "session"
+    def session_file(self, alias=ALIAS):
+        if alias is None:
+            return self.runtime / "sshvault" / "session"
+        return self.runtime / "sshvault" / "sessions" / alias
 
-    def stored_session(self):
+    def stored_session(self, alias=ALIAS):
         """Session rangée par sshvault : (keyring, fichier)."""
-        k = keyring_session(self.ring) if self.ring else None
-        f = self.session_file().read_text().split()[0] if self.session_file().exists() else None
+        k = keyring_session(self.ring, alias) if self.ring else None
+        f = self.session_file(alias).read_text().split()[0] if self.session_file(alias).exists() else None
         return k, f
 
-    def store_session(self, token, where="keyring", ttl=900):
+    def store_session(self, token, where="keyring", ttl=900, alias=ALIAS):
         if where == "keyring":
             assert self.ring, "anneau dédié requis"
-            r = subprocess.run(["keyctl", "padd", "user", "sshvault:session", self.ring],
+            desc = "sshvault:session:%s" % alias if alias else "sshvault:session"
+            r = subprocess.run(["keyctl", "padd", "user", desc, self.ring],
                                input=token, capture_output=True, text=True, check=True)
             subprocess.run(["keyctl", "timeout", r.stdout.strip(), str(ttl)], check=True)
         else:
-            d = self.runtime / "sshvault"
-            d.mkdir(mode=0o700, exist_ok=True)
-            fd = os.open(str(d / "session"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            f = self.session_file(alias)
+            f.parent.parent.mkdir(mode=0o700, exist_ok=True)
+            f.parent.mkdir(mode=0o700, exist_ok=True)
+            fd = os.open(str(f), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             os.write(fd, ("%s %d\n" % (token, int(time.time()) + ttl)).encode())
             os.close(fd)
 

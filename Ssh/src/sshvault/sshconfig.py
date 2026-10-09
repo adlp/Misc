@@ -1,14 +1,18 @@
 """`ssh_config` inclus (CAP-5) : `~/.ssh/sshvault/config` et `~/.ssh/sshvault/pub/*.pub`,
 puis, sur demande seulement, la ligne `Include` en tête de `~/.ssh/config`.
 
-- Un bloc par élément associé, triés par nom d'élément puis par id, ouvert par
+- Plusieurs comptes (CAP-10) : un élément est désigné par (compte, id) ; le fichier couvre les
+  éléments de tous les comptes. Commentaire d'un bloc d'identité : `# <nom> <alias> <id>` (l'id
+  en fin de ligne). Un compte illisible à la régénération (verrouillé sans invite possible) garde
+  ses blocs actuels, relus dans le fichier (`kept_items`), jamais retirés.
+- Un bloc par élément associé, triés par nom d'élément, alias puis id, ouvert par
   `Match originalhost <motif>,<motif>` : comparé au nom **tapé** (pas au HostName), sans
   tenir compte de la casse (mesuré sur OpenSSH 8.9p1 : `Host foo` ne s'applique pas à
   `ssh FOO`). Directives : `IdentityAgent` (socket dédié résolu, sans `${XDG_RUNTIME_DIR}`),
   `IdentityFile` (clé publique), `IdentitiesOnly yes`. Jamais `HostName`, `User`, `Port`,
   `ProxyJump` ni `ProxyCommand`.
 - Chargement automatique (réglage `auto-load`, défaut oui) : avant chaque bloc, une ligne
-  `Match originalhost <motifs> exec "'<sshvault>' ensure --id <id>"` sans directive (ssh
+  `Match originalhost <motifs> exec "'<sshvault>' ensure --account <alias> --id <id>"` sans directive (ssh
   n'exécute la commande que si `originalhost` correspond). La commande, passée au shell de
   l'utilisateur, ne contient que des éléments contrôlés : chemin absolu de sshvault entre
   apostrophes (refusé s'il contient `'`, `"`, `\\`, `${` ou un caractère de contrôle ; `%`
@@ -54,7 +58,8 @@ from typing import Optional, Sequence
 
 from .agent import FID_RE, FWD_DIR, SUN_PATH_MAX, fingerprint, forward_id, public_blob
 from .backend import SshKeyItem, valid_host
-from .fastpath import ITEM_ID_RE
+from .fastpath import ITEM_ID_RE, parse_ref
+from .runtime import ALIAS_RE
 from .fsutil import ensure_dir, read_private, write_private
 
 HEADER = ("# Généré par sshvault, ne pas éditer : « sshvault ssh-config » le réécrit.\n"
@@ -208,7 +213,7 @@ def exe_warnings(exe: str, paths: "Paths") -> list:
     ou dans un environnement de projet (`.venv`), dont la config dépendrait."""
     out = []
     raw = read_private(paths.config)
-    m = re.search(r"exec \"'([^']*)' ensure --(?:id|forward) ", raw.decode(errors="replace")) if raw else None
+    m = re.search(r"exec \"'([^']*)' ensure --(?:id|forward|account) ", raw.decode(errors="replace")) if raw else None
     if m and m.group(1).replace("%%", "%") != exe:
         out.append("chemin de sshvault des lignes Match exec changé : %s → %s"
                    % (clean(m.group(1).replace("%%", "%")), clean(exe)))
@@ -218,28 +223,43 @@ def exe_warnings(exe: str, paths: "Paths") -> list:
     return out
 
 
-def ensure_command(exe: str, item_id: str) -> str:
-    """Commande de `Match exec` : `'<exe>' ensure --id <uuid>` (`%` doublé pour ssh). Rien
-    d'autre que le chemin vérifié et l'id validé : la commande passe par un shell."""
+def _check_alias(alias) -> None:
+    if not ALIAS_RE.fullmatch(alias or ""):
+        raise SshConfigError("alias de compte inattendu : %s" % clean(alias or ""))
+
+
+def ensure_command(exe: str, item_id: str, account: Optional[str] = None) -> str:
+    """Commande de `Match exec` : `'<exe>' ensure --account <alias> --id <uuid>` (`%` doublé pour
+    ssh ; sans compte : ancienne forme `ensure --id <uuid>`). Rien d'autre que le chemin vérifié,
+    l'alias et l'id validés : la commande passe par un shell."""
     _check_path(exe, "chemin de sshvault", "'")
     if not ITEM_ID_RE.fullmatch(item_id or ""):
         raise SshConfigError("id d'élément inattendu (UUID attendu) : %s" % clean(item_id))
-    return "'%s' ensure --id %s" % (exe.replace("%", "%%"), item_id.lower())
+    if account is not None:
+        _check_alias(account)
+    return "'%s' ensure %s--id %s" % (exe.replace("%", "%%"), "--account %s " % account if account else "",
+                                      item_id.lower())
 
 
-def forward_command(exe: str, fid: str, ids: Sequence[str]) -> str:
+def forward_command(exe: str, fid: str, ids: Sequence) -> str:
     """Commande de `Match exec` d'un bloc de transfert : `'<exe>' ensure --forward <fid> --id
-    <uuid>…` (`%` doublé pour ssh). Seulement le chemin vérifié, le `fid` (16 hex) et des ids
-    validés (UUID) : la commande passe par un shell. Ni `%h` ni `%n`."""
+    <alias>:<uuid>…` (`%` doublé pour ssh ; id sans compte : `--id <uuid>`). Seulement le chemin
+    vérifié, le `fid` (16 hex), des alias et des ids validés (UUID) : la commande passe par un
+    shell. Ni `%h` ni `%n`."""
     _check_path(exe, "chemin de sshvault", "'")
     if not FID_RE.fullmatch(fid or ""):
         raise SshConfigError("identifiant de sous-agent inattendu : %s" % clean(fid or ""))
     if not ids:
         raise SshConfigError("bloc de transfert sans clé")
-    for i in ids:
+    refs = []
+    for x in ids:
+        a, i = x if isinstance(x, tuple) else (None, x)
         if not ITEM_ID_RE.fullmatch(i or ""):
             raise SshConfigError("id d'élément inattendu (UUID attendu) : %s" % clean(i or ""))
-    return "'%s' ensure --forward %s%s" % (exe.replace("%", "%%"), fid, "".join(" --id %s" % i.lower() for i in ids))
+        if a is not None:
+            _check_alias(a)
+        refs.append("%s:%s" % (a, i.lower()) if a else i.lower())
+    return "'%s' ensure --forward %s%s" % (exe.replace("%", "%%"), fid, "".join(" --id %s" % r for r in refs))
 
 
 def forward_socket(agent_socket: str, fid: str) -> str:
@@ -270,28 +290,35 @@ class Plan:
     pubs: dict = field(default_factory=dict)  # nom de fichier -> contenu
     blocks: int = 0
     warnings: list = field(default_factory=list)
-    #: sous-agents référencés : fid -> (motif, [ids des clés autorisées])
+    #: sous-agents référencés : fid -> (motif, [(compte, id) des clés autorisées])
     forward: dict = field(default_factory=dict)
 
 
 def _label(it: SshKeyItem) -> str:
-    return "« %s » (%s)" % (clean(it.name), clean(it.id))
+    return "« %s » (%s%s)" % (clean(it.name), clean(it.account) + " " if it.account else "", clean(it.id))
 
 
-def build(items: Sequence[SshKeyItem], paths: Paths, socket: str, exe: Optional[str] = None) -> Plan:
+def _order(i: SshKeyItem):
+    return (i.name.casefold(), i.account or "", i.id)
+
+
+def build(items: Sequence[SshKeyItem], paths: Paths, socket: str, exe: Optional[str] = None,
+          kept: frozenset = frozenset()) -> Plan:
     """Contenu du fichier généré et des `.pub`, sans rien écrire. Vérifie aussi les chemins
     (SshConfigError) : sert de contrôle préalable avant une écriture dans le coffre.
     `exe` : chemin de sshvault ; s'il est donné, chaque bloc est précédé de sa ligne
-    `Match … exec` (chargement automatique)."""
+    `Match … exec` (chargement automatique). `kept` : (compte, id) des éléments relus dans le
+    fichier actuel (compte illisible, `kept_items`) : clé publique d'un élément de transfert sans
+    bloc d'identité inconnue, mais déjà vérifiée à la génération précédente."""
     agent = quote_path(socket, "socket de l'agent dédié")
     _check_path(paths.pub, "dossier des clés publiques")
     if exe is not None:
         _check_path(exe, "chemin de sshvault", "'")
     plan = Plan(config=b"")
     out = [HEADER]
-    _forward_blocks(items, socket, exe, plan, out)
+    _forward_blocks(items, socket, exe, plan, out, kept)
     entries = []  # (motif, élément), dans l'ordre des blocs
-    for it in sorted(items, key=lambda i: (i.name.casefold(), i.id)):
+    for it in sorted(items, key=_order):
         if not it.hosts:
             continue
         bad = [h for h in it.hosts if not valid_host(h)]
@@ -314,10 +341,10 @@ def build(items: Sequence[SshKeyItem], paths: Paths, socket: str, exe: Optional[
                 if is_catch_all(h):
                     plan.warnings.append("%s : motif « %s » : %s" % (_label(it), h, CATCH_ALL_WARNING))
         # hôtes validés (HOST_RE) : ni virgule ni espace, la liste à virgules est sûre
-        out.append("\n# %s %s\n" % (clean(it.name), clean(it.id)))
+        out.append("\n# %s %s%s\n" % (clean(it.name), clean(it.account) + " " if it.account else "", clean(it.id)))
         if exe is not None:
-            if ITEM_ID_RE.fullmatch(it.id):
-                out.append('Match originalhost %s exec "%s"\n' % (",".join(hosts), ensure_command(exe, it.id)))
+            if ITEM_ID_RE.fullmatch(it.id) and (it.account is None or ALIAS_RE.fullmatch(it.account)):
+                out.append('Match originalhost %s exec "%s"\n' % (",".join(hosts), ensure_command(exe, it.id, it.account)))
             else:
                 plan.warnings.append("%s : id inattendu (UUID attendu) : pas de chargement automatique pour "
                                      "cet élément" % _label(it))
@@ -343,10 +370,11 @@ def build(items: Sequence[SshKeyItem], paths: Paths, socket: str, exe: Optional[
     return plan
 
 
-def _forward_blocks(items: Sequence[SshKeyItem], socket: str, exe: Optional[str], plan: Plan, out: list) -> None:
+def _forward_blocks(items: Sequence[SshKeyItem], socket: str, exe: Optional[str], plan: Plan, out: list,
+                    kept: frozenset = frozenset()) -> None:
     """Blocs de transfert (CAP-8), avant les blocs d'identité : un par motif de `sshvault-forward`."""
     forwards = {}  # motif -> [éléments], dans l'ordre des éléments
-    for it in sorted(items, key=lambda i: (i.name.casefold(), i.id)):
+    for it in sorted(items, key=_order):
         for h in it.forward:
             if not valid_host(h):
                 plan.warnings.append("%s : motif de transfert invalide « %s » : ignoré" % (_label(it), clean(h)))
@@ -369,14 +397,15 @@ def _forward_blocks(items: Sequence[SshKeyItem], socket: str, exe: Optional[str]
                                  % (SUN_PATH_MAX, clean(sock)))
         ids = []
         for it in forwards[p]:
-            if not ITEM_ID_RE.fullmatch(it.id):
+            ref = (it.account, it.id.lower())
+            if not ITEM_ID_RE.fullmatch(it.id) or (it.account is not None and not ALIAS_RE.fullmatch(it.account)):
                 plan.warnings.append("%s : id inattendu (UUID attendu) : pas de transfert de cette clé vers « %s »"
                                      % (_label(it), p))
-            elif public_blob(it.public_key) is None:
+            elif public_blob(it.public_key) is None and (it.account, it.id) not in kept:
                 plan.warnings.append("%s : clé publique illisible : pas de transfert de cette clé vers « %s »"
                                      % (_label(it), p))
-            elif it.id.lower() not in ids:
-                ids.append(it.id.lower())
+            elif ref not in ids:
+                ids.append(ref)
         if not ids:
             plan.warnings.append("motif de transfert « %s » : aucune clé transférable : ForwardAgent no" % p)
         if is_catch_all(p):
@@ -419,12 +448,102 @@ def forward_map(paths: Paths) -> dict:
     return out
 
 
+def kept_items(paths: Paths, keep, renamed: Optional[dict] = None, known=None, notes: Optional[list] = None):
+    """Éléments relus dans le fichier généré actuel, pour garder tels quels les blocs d'un compte
+    illisible (verrouillé sans invite possible) : [SshKeyItem] dont `keep(alias)` est vrai (alias
+    None : bloc d'ancienne forme, sans compte). Nom, hôtes (ligne `Match originalhost`), clé
+    publique (`.pub` du bloc) et motifs de transfert (lignes `ensure --forward … --id
+    <alias>:<id>`). Compte d'un bloc d'identité : celui de sa ligne `ensure --account` ; sans
+    ligne exec (`auto-load false`), le dernier mot du commentaire seulement s'il est dans `known`
+    (alias du registre) ; sinon bloc d'ancienne forme (le mot reste dans le nom). `renamed` :
+    {ancien alias : nouveau} (`account rename`). `.pub` absent : bloc impossible à refaire,
+    un avertissement dans `notes`. Fichier absent : []."""
+    renamed = renamed or {}
+    known = set(known or ())
+    raw = read_private(paths.config)
+    if raw is None:
+        return []
+    blocks = []  # blocs d'identité : dict
+    forwards = {}  # (compte, id) -> [motifs]
+    order = []  # références de transfert, dans l'ordre
+    cur = None
+    fwd = None
+    for line in raw.decode(errors="replace").splitlines():
+        if line.startswith(FORWARD_COMMENT):
+            parts = line[len(FORWARD_COMMENT):].split()
+            fwd = parts[0] if len(parts) == 2 and forward_id(parts[0]) == parts[1] else None
+            cur = None
+            continue
+        if line.startswith("# "):
+            fwd, cur = None, None
+            name, _, iid = line[2:].rpartition(" ")
+            if not ITEM_ID_RE.fullmatch(iid):
+                continue
+            head, _, word = name.rpartition(" ")
+            cur = {"id": iid.lower(), "full": name, "head": head, "word": word if head and ALIAS_RE.fullmatch(word)
+                   else None, "exec": None, "hosts": (), "pub": None}
+            blocks.append(cur)
+            continue
+        m = re.match(r'Match originalhost (\S+) exec "(.*)"$', line)
+        if m and fwd is not None:
+            for ref in re.findall(r" --id (\S+)", m.group(2)):
+                r = parse_ref(ref)
+                if r is None:
+                    continue
+                if r not in forwards:
+                    forwards[r] = []
+                    order.append(r)
+                if fwd not in forwards[r]:
+                    forwards[r].append(fwd)
+            continue
+        if m and cur is not None:
+            m2 = re.search(r" ensure --account (\S+) --id ", m.group(2))
+            cur["exec"] = m2.group(1) if m2 else ""  # "" : ancienne forme, sans compte
+            continue
+        m = re.match(r"Match originalhost (\S+)$", line)
+        if m and cur is not None:
+            cur["hosts"] = tuple(h for h in m.group(1).split(",") if h)
+            continue
+        s_ = line.strip()
+        if s_.startswith("IdentityFile ") and cur is not None:
+            path = s_[len("IdentityFile "):].strip().strip('"').replace("%%", "%")
+            pub = read_private(path) if os.path.dirname(path) == paths.pub else None
+            cur["pub"] = pub.decode(errors="replace").strip() if pub else None
+    found = {}  # (compte, id) -> (nom, hôtes, clé publique)
+    for b in blocks:
+        if b["exec"]:
+            account = b["exec"]
+        elif b["exec"] is None and b["word"] and b["word"] in known:
+            account = b["word"]
+        else:
+            account = None
+        name = b["head"] if account is not None and b["word"] == account else b["full"]
+        if not b["pub"]:
+            # clé publique perdue : bloc impossible à refaire à l'identique ; dit s'il devait être gardé
+            if notes is not None and keep(renamed.get(account, account)):
+                notes.append("bloc « %s » (%s%s) non gardé : sa clé publique a disparu de %s (« sshvault unlock » puis "
+                             "« sshvault ssh-config » le refont)" % (clean(name), account + " " if account else "",
+                                                                   b["id"], paths.pub))
+            continue
+        found.setdefault((account, b["id"]), (name, b["hosts"], b["pub"]))
+    out = []
+    for key in list(found) + [r for r in order if r not in found]:
+        account, iid = key
+        name, hosts, pub = found.get(key, (iid, (), ""))
+        account = renamed.get(account, account)
+        if not keep(account):
+            continue
+        out.append(SshKeyItem(id=iid, name=name, public_key=pub, fingerprint="", hosts=hosts,
+                              forward=tuple(forwards.get(key, ())), account=account))
+    return out
+
+
 def unforwarded_literal_hosts(items: Sequence[SshKeyItem], plan: Plan) -> list:
     """Hôtes d'identité **littéraux** (sans `*` ni `?`) qu'aucun motif de transfert ne couvre,
     dans l'ordre des blocs."""
     patterns = [p for p, _ in plan.forward.values()]
     out = []
-    for it in sorted(items, key=lambda i: (i.name.casefold(), i.id)):
+    for it in sorted(items, key=_order):
         if any(not valid_host(h) for h in it.hosts) or public_blob(it.public_key) is None:
             continue  # élément sauté par build
         for h in it.hosts:

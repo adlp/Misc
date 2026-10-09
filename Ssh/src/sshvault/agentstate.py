@@ -1,7 +1,9 @@
 """État de l'agent dédié : ce que `ssh-agent` ne dit pas.
 
 Fichier JSON 0600 `agent.json`, à côté du socket (tmpfs privé, dossier 0700). Aucune clé
-privée : par empreinte SHA256, l'élément d'origine (id, nom, hôtes), l'heure de
+privée : par empreinte SHA256, l'élément d'origine (compte, id, nom, hôtes ; `account` absent
+des entrées d'avant CAP-10 : compte inconnu, comparées par id seulement ; `also` : autres
+éléments de même clé, `<alias>:<id>` ou `<id>`), l'heure de
 chargement, la durée de vie et les options ; plus le pid de l'agent lancé par sshvault,
 l'identité de son socket (st_dev, st_ino) et le verrou posé par `sshvault agent lock`.
 
@@ -34,7 +36,8 @@ def _valid_entry(e) -> bool:
     return (isinstance(e, dict) and isinstance(e.get("id"), str) and isinstance(e.get("name"), str)
             and isinstance(e.get("hosts"), list) and all(isinstance(h, str) for h in e["hosts"])
             and isinstance(e.get("loaded"), (int, float)) and isinstance(e.get("lifetime"), int)
-            and isinstance(e.get("confirm"), bool) and isinstance(e.get("restrict"), bool))
+            and isinstance(e.get("confirm"), bool) and isinstance(e.get("restrict"), bool)
+            and (e.get("account") is None or isinstance(e.get("account"), str)))
 
 
 class AgentState:
@@ -78,9 +81,13 @@ class AgentState:
             pass
 
 
-def entry(item_id: str, name: str, hosts, loaded: float, lifetime: int, confirm: bool, restrict: bool) -> dict:
-    return {"id": item_id, "name": name, "hosts": list(hosts), "loaded": loaded, "lifetime": lifetime,
-            "confirm": confirm, "restrict": restrict}
+def entry(item_id: str, name: str, hosts, loaded: float, lifetime: int, confirm: bool, restrict: bool,
+          account: Optional[str] = None) -> dict:
+    e = {"id": item_id, "name": name, "hosts": list(hosts), "loaded": loaded, "lifetime": lifetime,
+         "confirm": confirm, "restrict": restrict}
+    if account:
+        e["account"] = account
+    return e
 
 
 def remaining(e: dict, now: float) -> Optional[int]:

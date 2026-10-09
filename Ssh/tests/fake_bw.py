@@ -29,6 +29,10 @@ failed », code 1), « Vault is locked. » sans session et avec une session inva
 
 Le « serveur » est un fichier JSON désigné par FAKE_BW_VAULT :
   {"email", "password", "userId", "clientId", "clientSecret", "items": [...]}.
+Plusieurs comptes (CAP-10) : FAKE_BW_VAULTS, liste de fichiers (séparés par « : ») de même
+forme avec en plus "server" (URL) : `login` choisit le coffre dont l'e-mail (et le serveur, s'il
+est donné, celui de `config server`) correspond, et le note dans les données de bw ("vault") ;
+les commandes suivantes lisent ce coffre-là (sinon FAKE_BW_VAULT).
 
 Pannes simulées : FAKE_BW_FAIL="<commande>=<mode>[,…]" ; mode : badjson (JSON
 invalide, code 0), error (code 1, « Unexpected error. »), hang (bloqué, avec un
@@ -97,22 +101,57 @@ def save_state(path, st):
     os.replace(tmp, path)
 
 
+_STATE_VAULT = [None]  # coffre noté dans les données de bw (login multi-comptes)
+
+
+def vault_path():
+    return _STATE_VAULT[0] or os.environ["FAKE_BW_VAULT"]
+
+
 def vault():
-    with open(os.environ["FAKE_BW_VAULT"]) as f:
+    with open(vault_path()) as f:
         return json.load(f)
+
+
+def candidates():
+    """Coffres connus : FAKE_BW_VAULT puis FAKE_BW_VAULTS."""
+    out = [os.environ["FAKE_BW_VAULT"]] if os.environ.get("FAKE_BW_VAULT") else []
+    out += [p for p in (os.environ.get("FAKE_BW_VAULTS") or "").split(":") if p]
+    return out
+
+
+def find_vault(email=None, server=None, client_id=None):
+    multi = bool(os.environ.get("FAKE_BW_VAULTS"))
+    for p in candidates():
+        try:
+            with open(p) as f:
+                v = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if server and (v.get("server") or "").rstrip("/") != server.rstrip("/") and (v.get("server") or multi):
+            continue  # plusieurs serveurs : un coffre sans serveur ne répond à aucun
+        if email is not None and v.get("email", "").lower() == email.lower():
+            return p, v
+        if client_id is not None and v.get("clientId") == client_id:
+            return p, v
+    return None, None
 
 
 def log(argv):
     path = os.environ.get("FAKE_BW_LOG")
     if not path:
         return
-    try:
-        pw = vault().get("password")
-    except (KeyError, OSError, ValueError):
-        pw = None
+    pws = set()
+    for p in candidates():
+        try:
+            with open(p) as f:
+                pws.add(json.load(f).get("password"))
+        except (OSError, ValueError):
+            pass
+    pws.discard(None)
     rec = {"argv": argv, "session_env": bool(os.environ.get("BW_SESSION")),
            "appdata": os.environ.get("BITWARDENCLI_APPDATA_DIR"),
-           "password_in_env": sorted(k for k, v in os.environ.items() if pw and v == pw),
+           "password_in_env": sorted(k for k, v in os.environ.items() if v in pws),
            "nointeraction": "--nointeraction" in argv,
            "bw_env": sorted(k for k in os.environ if k.startswith(("BW_", "BITWARDENCLI_")))}
     with open(path, "a") as f:
@@ -207,9 +246,12 @@ def parse(argv):
     flags, opts, pos = set(), {}, []
     cmd = None
     i = 0
+    rest = False  # après « -- » : arguments seulement (commander)
     while i < len(argv):
         a = argv[i]
-        if a.startswith("-") and a != "-":
+        if a == "--" and not rest:
+            rest = True
+        elif a.startswith("-") and a != "-" and not rest:
             name, eq, val = a.partition("=")
             local = CMD_FLAGS.get(cmd, (set(), set())) if cmd else (set(), set())
             if name in GLOBAL_FLAGS or name in local[0]:
@@ -238,6 +280,7 @@ class Ctx:
         self.flags, self.opts = flags, opts
         self.data = appdata()
         self.st = load_state(self.data)
+        _STATE_VAULT[0] = self.st.get("vault")
         self.session = opts.get("--session") or os.environ.get("BW_SESSION")
         self.noint = "--nointeraction" in flags or os.environ.get("BW_NOINTERACTION") == "true"
 
@@ -326,15 +369,15 @@ def cmd_config(ctx, pos):
 def cmd_login(ctx, pos):
     if ctx.authed():
         fail("You are already logged in as %s." % ctx.st.get("userEmail"))
-    v = vault()
     if "--apikey" in ctx.flags:
         cid = os.environ.get("BW_CLIENTID") or (None if ctx.noint else read_line("? client_id: "))
         sec = os.environ.get("BW_CLIENTSECRET") or (None if ctx.noint else read_line("? client_secret: "))
         if not cid or not sec:
             fail("client_id and client_secret are required.")
-        if cid != v.get("clientId") or sec != v.get("clientSecret"):
+        path, v = find_vault(client_id=cid, server=ctx.st.get("serverUrl"))
+        if v is None or sec != v.get("clientSecret"):
             fail("client_id or client_secret is incorrect. Try again.")
-        ctx.st.update(userId=v["userId"], userEmail=v["email"], session=None,
+        ctx.st.update(userId=v["userId"], userEmail=v["email"], session=None, vault=path,
                       lastSync="2026-10-06T00:00:00.000Z")
         ctx.save()
         ctx.message("You are logged in!\n\nTo unlock your vault, use the `unlock` command. ex:\n$ bw unlock")
@@ -343,9 +386,10 @@ def cmd_login(ctx, pos):
     if not email:
         fail("Email address is required.")
     password = get_password(ctx, pos[1] if len(pos) > 1 else None)
-    if email.lower() != v["email"].lower() or password != v["password"]:
+    path, v = find_vault(email=email, server=ctx.st.get("serverUrl"))
+    if v is None or password != v["password"]:
         fail("Username or password is incorrect. Try again.")
-    ctx.st.update(userId=v["userId"], userEmail=v["email"], lastSync="2026-10-06T00:00:00.000Z")
+    ctx.st.update(userId=v["userId"], userEmail=v["email"], vault=path, lastSync="2026-10-06T00:00:00.000Z")
     tok = new_session(ctx)
     ctx.message("You are logged in!\n\nTo unlock your vault, set your session key to the `BW_SESSION` "
                 "environment variable. ex:\n$ export BW_SESSION=\"%s\"" % tok, raw=tok)
@@ -355,6 +399,7 @@ def cmd_logout(ctx, pos):
     if not ctx.authed():
         fail("You are not logged in.")
     ctx.st = {"stateVersion": 85, "serverUrl": ctx.st.get("serverUrl")}
+    _STATE_VAULT[0] = None
     ctx.save()
     ctx.message("You have logged out.")  # mesuré
 
@@ -417,7 +462,7 @@ def cmd_get(ctx, pos):
 
 
 def save_vault(v):
-    path = os.environ["FAKE_BW_VAULT"]
+    path = vault_path()
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(v, f)
