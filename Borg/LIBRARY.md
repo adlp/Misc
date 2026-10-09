@@ -341,7 +341,9 @@ for a in archives:
 lm = bh.borg._boex_last_modified('mon-serveur')
 print('Dernière modification :', lm)
 
-# Dernières N archives (moins de N dans le dépôt : message + SystemExit(3) ; strict=False rend [] à la place)
+# Dernières N archives (moins de N dans le dépôt : message sur stderr + SystemExit(3) ; strict=False rend [] à la place ;
+# 1.0.193 : as_json=True -> {"error": "<nick>: <n> archive(s) dans le dépôt, <N> nécessaire(s)"} sur stdout seul, puis
+# SystemExit(3) — défaut False, comportement d'avant)
 last2 = bh.borg.getlastbkp('mon-serveur', nbl=2)
 print('Avant-dernière :', last2[0])
 print('Dernière :', last2[1])
@@ -412,6 +414,10 @@ for row in pending:
 # effacée que par un Bkp plus récent réussi (tué puis réussi -> False ; vivant puis échec -> True) ; timeout_s < 1 s ou
 # invalide : 21600, plafond 10 ans.
 state = bh.db.bkp_running_state('mon-serveur', timeout_s=bh.bkp_status_timeout('mon-serveur'))
+# Commande Status entière : imprime l'état de chaque nick (texte sur stderr, as_json=True : liste JSON sur stdout). 1.0.193 :
+# rend 1 si un nick finit en erreur (champ `error`, ou `last_backup.error`) ou si un lecteur a dit une erreur SQLite réelle
+# (`[ERREUR]`) pendant l'appel, sinon 0 (avant : None) — la CLI en fait son code de sortie.
+code = bh.status('mon-serveur,autre', as_json=True)
 # 1.0.186 : base seule (une ligne d'un Bkp tué compte « en cours » jusqu'au délai). Comme la commande Status et Report
 # (marqueur de Bkp, borg create orphelin) : bh._status_one('mon-serveur', bkp_live=True) (méthode interne, forme du JSON de
 # Status) -> bkp_running {started_at, en_attente, orphelin}, bkp_interrupted {started_at, verifie}, bkp_stale ; sans

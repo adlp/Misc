@@ -677,6 +677,10 @@ mon-serveur-root-2026-06-04T020001 → mon-serveur-root-2026-06-05T020001
 
 Source : index SQLite si la paire est indexée, sinon `borg diff` + stockage automatique.
 
+Moins de deux archives dans le dépôt : `<nick>: <n> archive(s) dans le dépôt, 2 nécessaire(s)` sur stderr, code 3 ; avec `-j`
+(1.0.193) : `{"error": "<nick>: <n> archive(s) dans le dépôt, 2 nécessaire(s)"}` seul sur stdout, rien sur stderr, code 3
+(avant : stdout vide), comme les autres erreurs de `DiffBkp -j`.
+
 ---
 
 ### `Restore`
@@ -767,7 +771,8 @@ sortent en **1** quand ils ont rencontré une erreur SQLite réelle, un nick arr
 absente…) ou un chemin illisible — données des autres nicks et lignes partielles toujours affichées (en-tête de base altéré :
 `DbTamperError`, code 2 ; LstBkpFls sur un chemin illisible : 3) ; `-j` : l'erreur est dans
 le JSON **et** sur stderr (avant : code 0, JSON seul) ; LstBkp/LstBkpFls : message `[ERREUR]` au lieu d'une trace Python.
-Status, Bkp, Index, Prune, Restore, DiffBkp : codes inchangés. **1.0.179** : « Index vide pour X — lancez Index »
+Status, Bkp, Index, Prune, Restore, DiffBkp : codes inchangés (Status : code 1 d'un nick en erreur depuis 1.0.193, voir
+[`Status`](#status)). **1.0.179** : « Index vide pour X — lancez Index »
 (nick jamais indexé) est un `[WARN]` (code 0 ; avant : marqué `[ERREUR]` en code 0) ; quand une lecture a échoué, Search,
 FileHist et DuIdx disent « Aucun résultat dans les bases lisibles (erreurs ci-dessus). » (et équivalents) au lieu de
 « Aucun résultat. » (DuIdx `-j` : `{}`, inchangé) ; RepoHistory/ArchiveHistory sur un dossier de cache non traversable :
@@ -1227,7 +1232,9 @@ rétention d'archives courte) — jamais restaurable. Pour une archive présente
 (archive précédente disparue, `DIFF_KEEP`), `files_*` reprend les comptages figés au lieu de `null`.
 
 `diff.db` jamais indexé : `{'error':'diff.db absent pour <nick>'}`, jamais une exception (même
-comportement que `IdxTop -j`).
+comportement que `IdxTop -j`). `diff.db` sans table `archive_stats` (1.0.193) : `rows` sans archive vivante — les lignes figées
+(`pruned`) de `history.db` restent —, code 0, aucune ligne `[ERREUR]`, comme `RepoHistory` sans `repo_stats` (avant :
+`{"error": "… no such table: archive_stats"}`). Colonne absente (schéma abîmé) : `{"error": "… no such column: …"}`, inchangé.
 
 ---
 
@@ -1275,6 +1282,13 @@ borgHelper -c Status -n ALL -j               # tous les nicks configurés, JSON
 
 En texte, en ligne de commande, une ligne finale signale les restes à nettoyer sur la machine, comme `Report`
 (1.0.160 ; JSON inchangé ; jamais via borgHelperWWW) — voir [`BorgCleanup`](#borgcleanup).
+
+Code de sortie (1.0.193) : **1** dès qu'un nick demandé finit en erreur — `last_backup` porte `error` (base illisible,
+corrompue ou verrouillée au-delà du délai de 2 s des lecteurs, passphrase absente, base en migration) ou le nick a levé une exception (champ `error`) —, ou quand une lecture a dit une
+erreur SQLite réelle pendant l'appel (`[ERREUR] SQLite error …` sur stderr : `history.db` corrompue ou verrouillée, par exemple —
+le dernier backup reste affiché), texte comme `-j` ; la notice de nettoyage reste écrite ; l'état
+de tous les nicks est toujours écrit (sorties inchangées). Sinon 0 (nick jamais indexé compris). Avant : 0 toujours — un cron
+ne voyait pas une base corrompue.
 
 Par nick :
 - **Dernier backup connu** : archive + date depuis `archive_stats` (déjà indexée localement) + âge

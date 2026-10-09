@@ -2328,7 +2328,9 @@ DiffBkp s'arrête (code 2, aucun borg), `_index_select_pairs` saute la paire ; p
 `list_pending_bkp_status(_start)` (watcher) : `_reader_sqlite_err(e, base, clé)` + `_reader_sqlite_ok(clé)`, clé = (base, lecteur)
 (marque levée après une lecture réussie DU MÊME lecteur : une ligne par épisode dans un worker long) ; `_find_last_archive_with_file`, IdxTop/DiffTop (`_reader_sqlite_line` en texte : ligne
 `[ERREUR]` pour une vraie erreur pas encore dite, sinon la ligne d'avant — jamais vide ; `-j` : JSON + `_reader_sqlite_err`),
-RepoHistory (`no such table` seulement -> `rows: []`) et ArchiveHistory `-j` marqués. Dispatch Index : plusieurs nicks -> exception,
+RepoHistory (`no such table` seulement -> `rows: []`) et ArchiveHistory `-j` marqués (1.0.193, story 68, D138 : ArchiveHistory
+`no such table` sur `archive_stats` -> `rows` sans archive vivante, la suite — mesures, comptes, lignes figées d'`archive_chart`
+— inchangée, code 0 ; `no such column` : `{'error'}` comme avant). Dispatch Index : plusieurs nicks -> exception,
 `SystemExit` (sauf 130) ou erreur de base d'un nick enregistrée (`_record_index_last`), message par `_nick_stop_msg` (texte d'un
 `sys.exit(str)` affiché), code = le pire (`_exit_code`), nick suivant ; un seul nick : relancée (inchangé). Exception imprévue
 (ni base ni schéma) d'un nick, Index et Bkp multi-nicks : `_sentry_capture(e, nick)` (`capture_exception`, étiquette nick, si
@@ -2571,7 +2573,11 @@ avant le SIGTERM. `_record_index_last` (issue deadline/busy) écarte ces lignes 
 erreur, marque dite ou non), `_is_index_empty` (vraie erreur), `_codec_fail` et `_PerNick.__exit__` (nick isolé) ; fin du
 dispatch : commande de `_READER_CODE_CMDS` (liste explicite : search, filehist, treehist, treefind, duidx, idxtop, difftop,
 archivehistory, repohistory, cacheinfo, lstbkp, lstbkpfls — jamais `_CMD_OPS`, qui range tout le reste en « read ») et drapeau
-posé -> `sys.exit(1)` ; une sortie antérieure (`sys.exit`, `usage`) garde son code. Sites passés à l'enregistreur : les trois
+posé -> `sys.exit(1)` ; une sortie antérieure (`sys.exit`, `usage`) garde son code. Status (1.0.193, story 68, D148) : hors de
+cette liste — `status()` rend 1 si un nick finit en erreur (clé `error` de l'exception isolée, ou `last_backup.error` de
+`_status_one` : présence de la clé, jamais sa valeur — une exception au message vide rend `''`) ou si `_READER_FAILED` a
+augmenté pendant l'appel (valeur lue avant la boucle : `[ERREUR]` d'une lecture annexe, history.db, fantôme, marqueurs), 0
+sinon ; le dispatch en fait le code de sortie après la notice de nettoyage. Sites passés à l'enregistreur : les trois
 collecteurs de DuIdx et `get_cache_rows` (`_reader_sqlite_line`), Search/FileHist/TreeHist/TreeFind (`-j` : `_reader_sqlite_err`
 + JSON ; texte : `_reader_sqlite_line` ; index illisible en `-j` : `[ERREUR]` aussi sur stderr), LstBkp/LstBkpFls (`_open_db`
 et requêtes : `_reader_sqlite_line`, `sys.exit(1)`, `-j` `{'error'}`), RepoHistory « no such column » (marquée), `cache_info`
@@ -2616,6 +2622,9 @@ message sinon), `_exit_code` (borg tué : 256+code, jamais 0 dans le pire code).
 échoué (>= 2 ou tué), sinon celui de compact (avant : toujours compact). `repoLocalAbsent` (revue) : `BORG_REPO` avec
 marqueur `{…}` (remplacé par borg) -> jamais absent ; `os.open` au lieu de `stat` (un montage autofs se déclenche,
 lu : `stat` suit `AT_NO_AUTOMOUNT`). `_lastbkp_or_stop` : sortie de `borg list` illisible -> message, jamais de trace.
+1.0.193 (story 68, D114) : moins de `nbl` archives -> `getlastbkp(…, as_json=True)` (passé par `_lastbkp_or_stop`, donc DiffBkp
+`-j` seul) imprime `{'error': '<nick>: <n> archive(s) dans le dépôt, <nbl> nécessaire(s)'}` sur stdout, rien sur stderr, code 3 ;
+sans `as_json` (DiffBkp texte, Restore, Mount) : la ligne sur stderr, code 3, inchangé.
 `ensure_history_db(create=False)` : base illisible -> erreur réelle comme avant (seul « absent » rend False).
 **Base recréée tenue ailleurs (1.0.169, A52)** — mesuré (SQLite 3.37.2) : un `-wal`/`-shm` orphelin (processus tué) n'est
 jamais rejoué quand la base est recréée, fichier principal absent ou vide (l'ancien WAL est jeté au passage en WAL) ;

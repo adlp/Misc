@@ -1,5 +1,36 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.193 — CLI : DiffBkp -j en JSON, ArchiveHistory sans archive_stats en rows, Status en code 1 quand un nick est en erreur — 2026-10-09
+
+Chantier « reconstruction progressive », story 68 (reports D114, D138, D148 ; décisions de l'utilisateur Q1-Q3). Avant, trois
+sorties trompaient un consommateur machine : `DiffBkp -j` sur un dépôt de moins de deux archives n'écrivait rien sur stdout
+(la ligne sur stderr, code 3) ; `ArchiveHistory -j` sur une `diff.db` sans table `archive_stats` rendait
+`{"error": "… no such table: archive_stats"}` quand `RepoHistory` rend `rows: []` dans le même cas ; `Status` sortait en code 0
+avec une base illisible ou corrompue (texte et `-j`) — un cron ne voyait pas l'erreur.
+
+- `DiffBkp -j`, moins de deux archives (une ou aucune) : `{"error": "<nick>: <n> archive(s) dans le dépôt, 2 nécessaire(s)"}`
+  seul sur stdout, rien sur stderr, code 3 — comme les autres erreurs de `DiffBkp -j`. Texte : inchangé (ligne sur stderr,
+  code 3) ; Restore et Mount (autres appelants) inchangés.
+- `ArchiveHistory -j`, `diff.db` sans `archive_stats` : `rows` sans archive vivante, lignes figées de `history.db` (`pruned`)
+  gardées, code 0, aucune ligne `[ERREUR]`. Colonne absente (« no such column », schéma abîmé) et vraie erreur SQLite :
+  inchangées.
+- `Status` : code **1** dès qu'un nick demandé finit en erreur — `last_backup.error` (base illisible, corrompue, passphrase
+  absente, base en migration) ou exception isolée du nick (champ `error`, même au message vide) — ou qu'une erreur SQLite réelle
+  d'une lecture est dite pendant l'appel (`[ERREUR] SQLite error …` : `history.db` corrompue ou verrouillée, fantôme, marqueurs),
+  texte comme `-j` ; état de tous les nicks toujours écrit, sorties inchangées, notice de nettoyage gardée ; sinon 0.
+  `BorgHelper.status()` rend ce code (avant : `None`). Aide `-H Status` : ligne du code 1. LIBRARY.md : `status()` et
+  `getlastbkp(…, as_json=False)`.
+- borgHelperWWW et UI inchangés : `/diffbkp` sans périmètre lance `DiffBkp` en texte (inchangé) ; avec périmètre (`-j` forcé),
+  l'erreur arrive dans `stdout` (`{"error"}`, relayée telle quelle par le filtre, HTTP 400, jamais en cache) au lieu de `stderr` ;
+  `/archivehistory` rend `rows` (graphiques : les lignes figées, ou « Aucune statistique d'archive enregistrée — lancer un Index… »)
+  au lieu de `{"error"}` en rouge ;
+  Status n'est pas relayé (`/access` appelle `_status_one`).
+- Tests : CodecSelfTest, un contrôle par ligne de la matrice (D114 : `DiffBkp -j` une archive et dépôt vide, texte une archive
+  + Mount `-b last` et Restore `-L` ; D138 : table absente avec et sans ligne figée, colonne absente ; D148 : base corrompue,
+  exception isolée — message vide compris —, aucun nick en erreur ; history.db corrompue, passphrase absente réelle, notice de
+  nettoyage en code 1) ; borg factice : mode `archn` (nombre d'archives exact). Contrôle A87 (« lecteurs :
+  erreur SQLite réelle ou nick arrêté… ») : Status sur une base verrouillée au-delà du délai attendu en code 1 (avant : 0).
+
 ## borgHelper 1.0.192, UI 1.24.0 — Graphiques : axe temporel réel, gain du premier Prune — 2026-10-09
 
 Chantier « reconstruction progressive », story 67 (reports D034, D035, D040, D050, D192, D197 ; décisions de

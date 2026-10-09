@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.192"
+Version="1.0.193"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -1258,6 +1258,7 @@ def usage(doc=None,debug=0):
         printer("       sinon variable BORGHELPERWWW_BKP_STATUS_TIMEOUT, sinon 6 h — le même que borgHelperWWW")
         printer("       build/rebuild : état de construction de la base servie / du fantôme (Index par tranches)")
         printer("       Restore, Prune et DelBkp ne sont pas distingués (priority.lock ne porte pas cette info)")
+        printer("       code 1 : nick en erreur (base illisible, verrou, passphrase absente, migration, exception) ou [ERREUR] SQLite")
     elif doc=='idxpurge':
         printer("   -c IdxPurge [-x <pattern>] [-n nick/servername/ALL] [-D]")
         printer("       Purge rétroactive des entrées diff_index + anciens snapshots + VACUUM")
@@ -4786,14 +4787,19 @@ class BorgRunner:
         _borg_warn(nick,'borg info',rb)   # 1.0.176 (A77)
         return rb['stdout'][0]['repository']['last_modified']
 
-    def getlastbkp(self,nick,nbl=1,debug=0,strict=True):
+    def getlastbkp(self,nick,nbl=1,debug=0,strict=True,as_json=False):
         cfg=self.cfgreaded(nick,debug=debug)
         rb=self.boex(nick,['list','--json']+glob_args(cfg),debug=debug)
         self._boex_check_stdout(rb,nick,'borg list')
         lines=rb['stdout'][0]['archives']
         if len(lines)<nbl:
             if not strict: return []   # appelant qui tolère un dépôt encore vide (1er Bkp)
-            printer(f"{nick}: {len(lines)} archive(s) dans le dépôt, {nbl} nécessaire(s)"); sys.exit(3)
+            msg=f"{nick}: {len(lines)} archive(s) dans le dépôt, {nbl} nécessaire(s)"
+            # 1.0.193 (story 68, D114, décision de l'utilisateur) : -j (DiffBkp) -> {"error": …} sur stdout seul, code 3 ; avant :
+            # stdout vide, la ligne sur stderr. Texte (DiffBkp, Restore, Mount) : inchangé
+            if as_json: print(json.dumps({'error':msg},ensure_ascii=False))
+            else: printer(msg)
+            sys.exit(3)
         return [lines[i]['name'] for i in range(nbl*-1,0)]
 
     def dfRepo(self,nick,debug=0):
@@ -5715,7 +5721,7 @@ class BorgHelper:
     def _lastbkp_or_stop(self,nick,nbl=1,debug=0,as_json=False):
         """getlastbkp des appelants STRICTS (DiffBkp, Restore, Mount) : échec de borg list -> _borg_stop. getlastbkp garde son
         exception : Bkp l'appelle sous `except Exception` (strict=False), un sys.exit l'arrêterait."""
-        try: return self.borg.getlastbkp(nick,nbl,debug=debug)
+        try: return self.borg.getlastbkp(nick,nbl,debug=debug,as_json=as_json)   # 1.0.193 (D114) : moins de nbl archives en JSON
         except RuntimeError as e: self._borg_stop(nick,'borg list',e,as_json=as_json)
         except (KeyError,IndexError,TypeError,ValueError) as e:   # sortie code 0 qui n'est pas la liste attendue (wrapper BORG_EXE)
             self._borg_stop(nick,'borg list',f"réponse illisible ({type(e).__name__})",as_json=as_json)
@@ -8349,6 +8355,7 @@ class BorgHelper:
         if not as_json:
             printer(f"  {nick}: historique archive_stats disponible via -j (JSON) — destiné à l'API")
             return
+        conn=None
         try:
             conn=_open_db(db_path,nick=nick,role='read',empty_ok=True)
             rows=[{'archive':r[0],'archive_date':r[1],'duration':r[2],'original_size':r[3],
@@ -8367,8 +8374,14 @@ class BorgHelper:
         except DbCodecError as e:
             print(json.dumps({'error':_codec_fail(nick,e,conn)},ensure_ascii=False,indent=2)); return
         except sqlite3.Error as e:
-            _reader_sqlite_err(e,db_path)   # 1.0.176 (A78) : vraie erreur dite sur stderr (table absente : JSON seul, inchangé)
-            print(json.dumps({'error':f"SQLite error ({db_path}): {e}"},ensure_ascii=False,indent=2)); return
+            # 1.0.193 (story 68, D138, décision de l'utilisateur) : diff.db sans archive_stats -> aucune archive vivante, rows
+            # sans elles (lignes figées de history.db gardées), code 0 — comme RepoHistory (1.0.176) ; avant : {"error": … no
+            # such table}, code 0. Colonne absente (schéma abîmé) et vraie erreur : inchangées
+            if not str(e).startswith('no such table'):
+                _reader_sqlite_err(e,db_path)   # 1.0.176 (A78) : vraie erreur dite sur stderr
+                print(json.dumps({'error':f"SQLite error ({db_path}): {e}"},ensure_ascii=False,indent=2)); return
+            if conn is not None: conn.close()
+            rows=[]
         # Mesures du Bkp (history.db, 1.0.139) : C/E (null si inconnues) et taille dédupliquée à la création, préférée
         # à celle d'archive_stats (borg info) quand elle existe — décision utilisateur, sorties identiques à avant.
         measures=self.db.get_archive_measures(nick)
@@ -8572,10 +8585,16 @@ class BorgHelper:
         """Commande CLI Status (spec-status-cli-etat-rapide) : état rapide (dernier backup connu, Bkp
         en cours, opération prioritaire Restore/Prune ambiguë) par nick, 100% local — jamais d'appel
         boex()/borg (contrairement à getlastbkp/list_backups). Supporte -n nick1,nick2 et ALL nativement
-        (contrairement à RepoHistory/ArchiveHistory qui rejettent le multi-nick)."""
+        (contrairement à RepoHistory/ArchiveHistory qui rejettent le multi-nick).
+
+        1.0.193 (story 68, D148, décision de l'utilisateur) : rend 1 dès qu'un nick demandé finit en erreur — clé `error`
+        (exception isolée ci-dessous) ou `last_backup.error` (base illisible, échec de déchiffrement : erreurs réelles de
+        _status_one) — ou qu'une erreur SQLite réelle d'un lecteur a été dite ([ERREUR], _READER_FAILED a augmenté pendant
+        l'appel : history.db, fantôme, marqueurs), sinon 0 ; la CLI en fait son code de sortie (avant : 0 toujours). Sorties
+        inchangées."""
         nicks=nick.split(',') if nick and nick!='ALL' else self.borg.cfgreadnicks(debug).split(',')
         nicks=[n for n in nicks if n]
-        results=[]
+        results=[]; _n0=_READER_FAILED[0]   # 1.0.193 (story 68, revue) : [ERREUR] d'un lecteur pendant CET appel -> code 1
         for n in nicks:
             try:
                 results.append(self._status_one(n,debug=debug,bkp_live=True))
@@ -8590,8 +8609,10 @@ class BorgHelper:
             # forme homogène pour les consommateurs machine (contrairement à RepoHistory/ArchiveHistory
             # qui rejettent le multi-nick et renvoient donc un objet unique).
             print(json.dumps(results,ensure_ascii=False,indent=2))
-            return
-        for st in results: self._status_print_one(st)
+        else:
+            for st in results: self._status_print_one(st)
+        # présence des clés, jamais leur valeur : une exception au message vide rend 'error': '' (revue)
+        return 1 if (_READER_FAILED[0]!=_n0 or any('error' in st or 'error' in (st.get('last_backup') or {}) for st in results)) else 0
 
     # ── Nettoyage des restes de dépôts disparus et de nicks retirés (1.0.160, story 23, A30) ──
     def cleanup_scan(self,home=None):
@@ -14729,6 +14750,10 @@ if mode=='diffcrash' and sub=='diff': crash()
 if mode=='initexists' and sub=='init': sys.stderr.write('A repository already exists at ssh://h.invalid/./r.'+chr(10)); sys.exit(2)
 if mode=='initok' and sub=='init':
     sys.stderr.write('IMPORTANT: you will need both KEY AND PASSPHRASE to access this repo!'+chr(10)+'    borg key export repo'+chr(10)); sys.exit(0)
+# 1.0.193 (story 68, D114) : archn — `list --json` rend les archives du fichier `archives` (noms ; vide ou absent : aucune), code 0
+if mode=='archn' and sub=='list' and '--json' in a:
+    names=open(d+'/archives').read().split() if os.path.exists(d+'/archives') else []
+    print(json.dumps(dict(archives=[dict(name=x,start='2026-01-%02dT00:00:00'%(i+1)) for i,x in enumerate(names)]))); sys.exit(0)
 fail()
 ''')
             os.chmod(fb+'.tmp',0o700); os.replace(fb+'.tmp',fb)
@@ -15096,6 +15121,222 @@ fail()
             if bad_: print(f"  {bad_}")
             return not bad_
         check("lecteurs annexes : vraie erreur SQLite dite, paire jamais recalculée en double, RepoHistory sans repo_stats -> rows [] (A78)",_sqlite_annex)
+        # ── 1.0.193 (story 68, D114, D138, D148, décisions de l'utilisateur) : un contrôle par ligne de la matrice ──
+        def _s68_diffbkp(names,j):
+            """DiffBkp sur un dépôt de len(names) archives (borg factice archn, CLI réelle) -> (code, stdout, stderr)."""
+            d,rc,calls,cli=_bf_env(f"s68diff{len(names)}{'j' if j else 't'}")
+            open(os.path.join(d,'mode'),'w').write('archn'); open(os.path.join(d,'archives'),'w').write(' '.join(names))
+            return cli('-c','DiffBkp','-n','zr',*(['-j'] if j else []))
+        def _s68_diffbkp_j1():
+            """D114 : DiffBkp -j sur un dépôt d'une archive -> {"error": "zr: 1 archive(s) dans le dépôt, 2 nécessaire(s)"} seul sur
+            stdout, stderr vide, code 3 (avant : stdout vide, la ligne sur stderr)."""
+            code,out,err=_s68_diffbkp(['a'],True)
+            try: ok=json.loads(out)=={'error':'zr: 1 archive(s) dans le dépôt, 2 nécessaire(s)'}
+            except ValueError: ok=False
+            ok=ok and code==3 and err==''
+            if not ok: print(f"  code {code} stdout {out[-200:]!r} stderr {err[-200:]!r}")
+            return ok
+        check("D114 DiffBkp -j, dépôt d'une archive : {error} seul sur stdout, stderr vide, code 3",_s68_diffbkp_j1)
+        def _s68_diffbkp_text1():
+            """D114 : DiffBkp texte sur un dépôt d'une archive -> inchangé : la ligne sur stderr, stdout vide, code 3. Autres appelants
+            de _lastbkp_or_stop (Mount -b last, Restore -L sans -b) sur un dépôt vide : ligne sur stderr, code 3, jamais de JSON."""
+            res={}
+            code,out,err=_s68_diffbkp(['a'],False)
+            res['DiffBkp']=(code==3 and out=='' and err.strip()=='zr: 1 archive(s) dans le dépôt, 2 nécessaire(s)',code,out[-150:],err[-150:])
+            d,rc,calls,cli=_bf_env('s68others'); open(os.path.join(d,'mode'),'w').write('archn')
+            for lbl,a in (('Mount -b last',['-c','Mount','-b','last']),('Restore -L',['-c','Restore','-f','/etc','-L'])):
+                code,out,err=cli(*a,'-n','zr')
+                res[lbl]=(code==3 and '{' not in out and 'zr: 0 archive(s) dans le dépôt, 1 nécessaire(s)' in err,code,out[-150:],err[-150:])
+            bad_=[(k,v) for k,v in res.items() if not v[0]]
+            if bad_: print(f"  {bad_}")
+            return not bad_
+        check("D114 DiffBkp texte, dépôt d'une archive : inchangé (ligne sur stderr, code 3) ; Mount, Restore inchangés",_s68_diffbkp_text1)
+        def _s68_diffbkp_j0():
+            """D114 : DiffBkp -j sur un dépôt vide -> comme une archive : {"error": "zr: 0 archive(s) …"} seul, stderr vide, code 3."""
+            code,out,err=_s68_diffbkp([],True)
+            try: ok=json.loads(out)=={'error':'zr: 0 archive(s) dans le dépôt, 2 nécessaire(s)'}
+            except ValueError: ok=False
+            ok=ok and code==3 and err==''
+            if not ok: print(f"  code {code} stdout {out[-200:]!r} stderr {err[-200:]!r}")
+            return ok
+        check("D114 DiffBkp -j, dépôt vide : {error} seul sur stdout, stderr vide, code 3",_s68_diffbkp_j0)
+        def _s68_env(sub,nicks,enc=()):
+            """Nicks en clair (DB_ENCRYPT=false ; `enc` : chiffrés, passphrase pw), dépôts locaux jamais lus (Status, ArchiveHistory :
+            aucun borg) ; base de chaque nick de `nicks` avec une archive a1 dans archive_stats. Passphrase dans la section de chaque
+            nick (ligne `BORG_PASSPHRASE=pw` à retirer pour « passphrase absente »). Rend (d, b, cli) — cli(*args, **env) : CLI
+            réelle, Sentry neutralisé, variables d'environnement en plus."""
+            d=os.path.join(tmp,sub); os.makedirs(d); rc=os.path.join(d,'rc')
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nDB_KDF=light\nSER_NAME=h\nSER_LOGIN=x\n"
+                        f"GLOB_ARCH=*\nBORG_EXE={os.path.join(d,'pas-de-borg')}\n\n"
+                        +''.join(f"[{n}]\nBORG_REPO={d}/r-{n}\nBORG_PASSPHRASE=pw\n{'' if n in enc else 'DB_ENCRYPT=false'}\n\n" for n in ('sa','sb','sc')))
+            os.chmod(rc,0o600)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                for n in nicks:
+                    p=b.db.get_diff_db(n); b.db.ensure_diff_db(p,nick=n)
+                    b.db.store_archive_stats(n,'a1','2026-01-01T00:00:00',1.0,10,10,10,1,p)
+            nodsn=os.path.join(d,'sentry-vide'); open(nodsn,'w').close()
+            env=dict(os.environ,BORGHELPERC_SENTRY_FILE=nodsn); env.pop('BORGHELPERC_SENTRY_DSN',None)
+            def cli(*a,**more):
+                r=subprocess.run([sys.executable,os.path.realpath(__file__),'-C',rc]+list(a),capture_output=True,text=True,env=dict(env,**more),
+                                 timeout=120,stdin=subprocess.DEVNULL,cwd=d)
+                return r.returncode,r.stdout,r.stderr
+            return d,b,cli
+        def _s68_corrupt(p):
+            """Pages 2 et suivantes écrasées (après checkpoint, -wal/-shm retirés) : en-tête lisible, tables illisibles."""
+            _s68_sql(p,"SELECT 1")
+            for x in (p+'-wal',p+'-shm'):
+                if os.path.exists(x): os.unlink(x)
+            raw=bytearray(open(p,'rb').read()); ps=int.from_bytes(raw[16:18],'big') or 65536
+            for i in range(ps,len(raw)): raw[i]=0xff
+            with open(p,'wb') as f: f.write(raw)
+        def _s68_sql(p,*stmts):
+            c=sqlite3.connect(p)
+            try:
+                for x in stmts: c.execute(x)
+                c.commit(); c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally: c.close()
+        def _s68_ah_notable():
+            """D138 : ArchiveHistory -j sur une diff.db sans archive_stats -> rows sans archive vivante, lignes figées de history.db
+            gardées (pruned), code 0, stderr vide (aucune ligne [ERREUR]) ; sans ligne figée : rows []. Témoin : avant la suppression
+            de la table, a1 (vivante) et la ligne figée."""
+            d,b,cli=_s68_env('s68ahtab',('sa','sb')); res={}
+            from datetime import datetime,timedelta
+            dt=(datetime.now()-timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%S')
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                b.db.freeze_archive_chart('sa',[{'archive':'old','archive_date':dt,'gone':True,'nfiles':5}])
+            code,out,err=cli('-c','ArchiveHistory','-n','sa','-j')
+            try: res['témoin']=(code==0 and [(r['archive'],r['pruned']) for r in json.loads(out)['rows']]==[('a1',False),('old',True)],code,out[-200:],err)
+            except (ValueError,KeyError,TypeError): res['témoin']=(False,code,out[-200:],err)
+            for n,want in (('sa',[('old',True,5)]),('sb',[])):
+                _s68_sql(b.db.get_diff_db(n),"DROP TABLE archive_stats")
+                code,out,err=cli('-c','ArchiveHistory','-n',n,'-j')
+                try:
+                    o=json.loads(out); rows=[(r['archive'],r['pruned'],r['nfiles']) for r in o['rows']]
+                    res[n]=(code==0 and err=='' and 'error' not in o and o['nick']==n and rows==want,code,out[-200:],err)
+                except (ValueError,KeyError,TypeError): res[n]=(False,code,out[-200:],err)
+            bad_=[(k,v) for k,v in res.items() if not v[0]]
+            if bad_: print(f"  {bad_}")
+            return not bad_
+        check("D138 ArchiveHistory -j, table archive_stats absente : rows sans archive vivante, lignes figées gardées, code 0, aucune [ERREUR]",_s68_ah_notable)
+        def _s68_ah_nocol():
+            """D138 : ArchiveHistory -j, colonne absente (schéma abîmé : « no such column ») -> inchangé : {"error": "SQLite error (…):
+            no such column: nfiles"}, jamais rows ; code et stderr d'avant 1.0.193 (code 0, aucune ligne [ERREUR] : _reader_sqlite_err
+            tait « table/colonne absente »)."""
+            d,b,cli=_s68_env('s68ahcol',('sa',)); p=b.db.get_diff_db('sa')
+            _s68_sql(p,"ALTER TABLE archive_stats RENAME COLUMN nfiles TO nfiles_x")
+            code,out,err=cli('-c','ArchiveHistory','-n','sa','-j')
+            try: o=json.loads(out); ok=set(o)=={'error'} and o['error']==f"SQLite error ({p}): no such column: nfiles"
+            except (ValueError,TypeError): ok=False
+            ok=ok and code==0 and '[ERREUR]' not in err
+            if not ok: print(f"  code {code} stdout {out[-200:]!r} stderr {err[-200:]!r}")
+            return ok
+        check("D138 ArchiveHistory -j, colonne absente (schéma abîmé) : {error} inchangé",_s68_ah_nocol)
+        _S68_KEYS={'nick','last_backup','bkp_running','bkp_interrupted','bkp_stale','priority_op_running','build','rebuild'}
+        def _s68_status_corrupt():
+            """D148 : Status -n sa,sb, diff.db de sa corrompue -> code 1 en texte et en -j (avant : 0) ; sorties inchangées : les deux
+            nicks, sa « base illisible » (texte : « Dernier backup : base illisible (…) », JSON : last_backup.error, mêmes clés), sb
+            sa dernière archive ; [ERREUR] SQLite error sur stderr ; texte : notice de nettoyage toujours écrite (dossier personnel
+            de bac à sable, une entrée borg d'un dépôt disparu). Revue : history.db d'un nick corrompue, diff.db saine -> [ERREUR] du
+            lecteur, code 1, sorties identiques à celles d'avant la corruption (texte hors ligne [ERREUR], JSON) ; nick chiffré sans
+            passphrase (DbKeyError réel) -> code 1, « base illisible (DbKeyError: … »."""
+            d,b,cli=_s68_env('s68stcor',('sa','sb')); p=b.db.get_diff_db('sa'); res={}
+            H=os.path.join(d,'home'); bid='a'*64
+            os.makedirs(os.path.join(H,'.config','borg','security',bid)); os.makedirs(os.path.join(H,'.cache','borg',bid))
+            with open(os.path.join(H,'.config','borg','security',bid,'location'),'w') as f: f.write(os.path.join(d,'depot-disparu'))
+            open(os.path.join(H,'.cache','borg',bid,'chunks'),'w').write('x'*100)
+            _s68_corrupt(p)
+            code,out,err=cli('-c','Status','-n','sa,sb',BORGHELPERC_CLEANUP_HOME=H)
+            res['texte']=(code==1 and 'sa:\n  Dernier backup : base illisible (' in out+err and 'sb:\n  Dernier backup : a1 (' in out+err
+                          and f'[ERREUR] SQLite error ({p}): ' in err and 'Traceback' not in out+err
+                          and 'Nettoyage possible : 1 entrée(s) borg de dépôts disparus' in out+err,code,(out+err)[-300:])
+            code,out,err=cli('-c','Status','-n','sa,sb','-j')
+            try:
+                o=json.loads(out)
+                res['-j']=(code==1 and [x['nick'] for x in o]==['sa','sb'] and all(set(x)==_S68_KEYS for x in o)
+                           and o[0]['last_backup']['error'].startswith('base illisible (') and o[1]['last_backup']['archive']=='a1'
+                           and f'[ERREUR] SQLite error ({p}): ' in err,code,out[-300:],err[-200:])
+            except (ValueError,KeyError,TypeError,IndexError): res['-j']=(False,code,out[-300:],err[-200:])
+            # history.db corrompue, diff.db saine : seule la ligne [ERREUR] du lecteur dit l'erreur
+            d2,b2,cli2=_s68_env('s68sthist',('sa','sb'))
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                for n in ('sa','sb'): b2.db.ensure_history_db(b2.db.get_history_db(n))
+            ref={j:cli2('-c','Status','-n','sa,sb',*j) for j in ((),('-j',))}
+            h=b2.db.get_history_db('sb'); _s68_corrupt(h)
+            for j in ((),('-j',)):
+                code,out,err=cli2('-c','Status','-n','sa,sb',*j)
+                kept=[l for l in err.splitlines(True) if not l.startswith('[ERREUR] ')]
+                res[f'history.db{j}']=(ref[j][0]==0 and code==1 and f'[ERREUR] SQLite error ({h}): ' in err and out==ref[j][1]
+                                       and ''.join(kept)==ref[j][2],code,out[-200:],err[-300:],ref[j][2][-200:])
+            # passphrase absente : base chiffrée (sc), rc sans sa passphrase -> DbKeyError réel
+            d3,b3,cli3=_s68_env('s68stkey',('sb','sc'),enc=('sc',)); rc3=os.path.join(d3,'rc')
+            txt=open(rc3).read(); i=txt.index('[sc]'); txt=txt[:i]+txt[i:].replace('BORG_PASSPHRASE=pw\n','',1)
+            with open(rc3+'.tmp','w') as f: f.write(txt)
+            os.chmod(rc3+'.tmp',0o600); os.replace(rc3+'.tmp',rc3)
+            code,out,err=cli3('-c','Status','-n','sb,sc')
+            res['passphrase absente']=(code==1 and 'sc:\n  Dernier backup : base illisible (DbKeyError: ' in out+err
+                                       and 'sb:\n  Dernier backup : a1 (' in out+err,code,(out+err)[-300:])
+            code,out,err=cli3('-c','Status','-n','sb,sc','-j')
+            try: res['passphrase absente -j']=(code==1 and json.loads(out)[1]['last_backup']['error'].startswith('base illisible (DbKeyError: '),code,out[-300:])
+            except (ValueError,KeyError,TypeError,IndexError): res['passphrase absente -j']=(False,code,out[-300:],err[-200:])
+            bad_=[(k,v) for k,v in res.items() if not v[0]]
+            if bad_: print(f"  {bad_}")
+            return not bad_
+        check("D148 Status, une base corrompue sur deux : code 1 (texte et -j), sorties des deux nicks inchangées ; history.db corrompue, passphrase absente, notice de nettoyage",_s68_status_corrupt)
+        def _s68_status_exc():
+            """D148 : Status, exception isolée d'un nick (CLI : archive_stats sans archive_date -> OperationalError relancée par
+            _status_one ; bibliothèque : _status_one qui lève) -> code 1 (texte et -j), entrée `error` inchangée (clés, null), autre
+            nick intact ; status() rend 1."""
+            d,b,cli=_s68_env('s68stexc',('sa','sb')); res={}
+            _s68_sql(b.db.get_diff_db('sa'),"ALTER TABLE archive_stats RENAME COLUMN archive_date TO archive_date_x")
+            code,out,err=cli('-c','Status','-n','sa,sb')
+            res['texte']=(code==1 and 'sa:' in out+err and '  Erreur : no such column: archive_date' in out+err and 'sb:\n  Dernier backup : a1 (' in out+err,
+                          code,(out+err)[-300:])
+            code,out,err=cli('-c','Status','-n','sa,sb','-j')
+            try:
+                o=json.loads(out)
+                res['-j']=(code==1 and o[0]=={'nick':'sa','last_backup':None,'bkp_running':None,'bkp_interrupted':None,'bkp_stale':None,
+                                               'priority_op_running':False,'build':None,'rebuild':None,'error':'no such column: archive_date'}
+                           and o[1]['last_backup']['archive']=='a1',code,out[-300:],err[-200:])
+            except (ValueError,KeyError,TypeError,IndexError): res['-j']=(False,code,out[-300:],err[-200:])
+            real=b._status_one
+            def boom(n,**k):
+                if n=='sb': raise RuntimeError('simulée')
+                return real(n,**k)
+            for j in (False,True):
+                o=io.StringIO()
+                with mock.patch.object(b,'_status_one',boom), contextlib.redirect_stdout(o),contextlib.redirect_stderr(o):
+                    r=b.status('sc,sb',as_json=j)
+                res[f'bibliothèque{" -j" if j else ""}']=(r==1 and 'simulée' in o.getvalue(),r,o.getvalue()[-200:])
+            # revue : exception au message vide -> 'error': '' — présence de la clé, jamais sa valeur
+            def boom0(n,**k):
+                if n=='sb': raise RuntimeError()
+                return real(n,**k)
+            o=io.StringIO()
+            with mock.patch.object(b,'_status_one',boom0), contextlib.redirect_stdout(o),contextlib.redirect_stderr(o):
+                r=b.status('sc,sb',as_json=True)
+            try: res['message vide']=(r==1 and json.loads(o.getvalue())[1]['error']=='',r,o.getvalue()[-200:])
+            except (ValueError,KeyError,IndexError,TypeError): res['message vide']=(False,r,o.getvalue()[-200:])
+            bad_=[(k,v) for k,v in res.items() if not v[0]]
+            if bad_: print(f"  {bad_}")
+            return not bad_
+        check("D148 Status, exception isolée d'un nick : code 1 (texte et -j), entrée error inchangée",_s68_status_exc)
+        def _s68_status_ok():
+            """D148 : Status sans nick en erreur (deux bases saines, un nick jamais indexé : « aucune archive indexée », pas une
+            erreur) -> code 0, texte et -j ; status() rend 0."""
+            d,b,cli=_s68_env('s68stok',('sa','sb')); res={}
+            for j in ([],['-j']):
+                code,out,err=cli('-c','Status','-n','sa,sb,sc',*j)
+                res[f'cli{j}']=(code==0 and '[ERREUR]' not in err and 'Traceback' not in out+err,code,(out+err)[-300:])
+            o=io.StringIO()
+            with contextlib.redirect_stdout(o),contextlib.redirect_stderr(o): r=b.status('sa,sb,sc',as_json=True)
+            try: res['bibliothèque']=(r==0 and [x['last_backup'] is None for x in json.loads(o.getvalue())]==[False,False,True],r)
+            except ValueError: res['bibliothèque']=(False,r,o.getvalue()[-200:])
+            bad_=[(k,v) for k,v in res.items() if not v[0]]
+            if bad_: print(f"  {bad_}")
+            return not bad_
+        check("D148 Status, aucun nick en erreur : code 0",_s68_status_ok)
         def _bf_multi():
             """Plusieurs nicks : Key -n zr,za et za,zr -> code 2 (le pire), message de chacun ; Prune -n zk,za -> code 3 (le pire :
             avant, le dernier non nul), zk « aucune clé KEEP_* », za « ⚠ dépôt absent » ; aucun dict brut."""
@@ -16372,7 +16613,7 @@ fail()
             """1.0.178 (story 41, A87, décisions de l'utilisateur ; mesuré : code 0 avant) : lecteur qui rencontre une erreur SQLite
             réelle (verrou exclusif réel tenu par un autre processus) -> code 1 et `[ERREUR]` sur stderr, texte comme -j ; multi-nicks :
             données du nick sain gardées ; nick arrêté parmi plusieurs (_PerNick) -> 1 ; LstBkp/LstBkpFls : message, jamais de trace ;
-            Status : code inchangé (0) ; sans verrou : 0 (contrôle positif) ; dispatch en processus : jamais l'erreur d'un appel précédent."""
+            Status : code 1 depuis 1.0.193 (story 68 ; avant : 0) ; sans verrou : 0 (contrôle positif) ; dispatch en processus : jamais l'erreur d'un appel précédent."""
             d,b=_nb_env('readcode'); rc=os.path.join(d,'rc'); res={}
             with open(rc,'a') as f: f.write("[zs]\nDB_ENCRYPT=false\n\n")
             b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
@@ -16455,7 +16696,8 @@ fail()
                     r,o,e=run(*argv)
                     res[f'{nm} en erreur : message']=(r==1 and o==msg and mark(e,p),r,o[-90:],e[-120:])
                 r,o,e=run('-c','Status','-n','zr')
-                res['Status inchangé (0)']=(r==0,r,e[-150:])
+                # 1.0.193 (story 68, D148, décision Q1 de l'utilisateur) : base illisible (verrou au-delà du délai) -> code 1 (avant : 0)
+                res['Status code 1 (1.0.193)']=(r==1 and 'Dernier backup : base illisible (database is locked)' in o+e,r,e[-150:])
             finally: _rb_killtree(hp)
             r,o,e=run('-c','Search','-n','zs','-f','etc','-j')
             res['appel suivant 0']=(r==0,r,e[-150:])
@@ -21159,10 +21401,11 @@ def _cli_main():
         _rc=bh.bkp_reconcile(nick,debug=debug,as_json=('-j' in options))
         if _rc: sys.exit(_rc)
     elif cmd=='status':
-        bh.status(nick,debug=debug,as_json=('-j' in options))
+        _rc=bh.status(nick,debug=debug,as_json=('-j' in options))   # 1.0.193 (D148) : 1 si un nick est en erreur
         if '-j' not in options:   # 1.0.160 : notice de nettoyage, texte et CLI seulement
             _note=bh.cleanup_notice()
             if _note: printer(_note)
+        if _rc: sys.exit(_rc)
     elif cmd=='difftop':
         _depth=int(options.get('-p','3'))
         _topn=int(options.get('-N','10'))
