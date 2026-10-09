@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.191"
+Version="1.0.192"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -1066,6 +1066,7 @@ def usage(doc=None,debug=0):
         printer("       -N n : top N (défaut 20)  |  -p d : profondeur répertoire (défaut 3)  |  -j : brut par-chemin (ignore -N/-p)")
         printer("   -c RepoHistory -n nick -j")
         printer("       Historique brut repo_stats (id/op/unique_csize/total_size/total_csize/updated_at), ordre chronologique")
+        printer("       + baseline : dernière mesure d'avant STATS_RETENTION_MONTHS (null si aucune), hors rows")
         printer("       Un seul nick à la fois  |  destiné à l'API (borgHelperWWW /repohistory)")
         printer("   -c ArchiveHistory -n nick -j")
         printer("       Historique brut archive_stats (archive/archive_date/duration/tailles/nfiles), ordre chronologique")
@@ -1232,6 +1233,7 @@ def usage(doc=None,debug=0):
     elif doc=='repohistory':
         printer("   -c RepoHistory -n nick -j")
         printer("       Historique brut repo_stats (colonnes brutes, ordre chronologique par id) — un seul nick")
+        printer("       baseline : dernière mesure d'avant STATS_RETENTION_MONTHS (gardée par la purge), null si aucune")
         printer("       Sans -j : message court, pas de crash (commande destinée à l'API)")
     elif doc=='archivehistory':
         printer("   -c ArchiveHistory -n nick -j")
@@ -4041,6 +4043,9 @@ class BorgHelperDB:
         except (TypeError,ValueError): return 13
 
     def store_repo_stats(self,nick,op,unique_csize,total_size,total_csize,db_path=None):
+        """Ajoute une mesure repo_stats (Bkp/Prune/Index) puis purge les mesures d'avant STATS_RETENTION_MONTHS.
+        1.0.192 (story 67, D034) : la purge épargne la plus récente d'avant la fenêtre (plus grand id) — mesure de base
+        que RepoHistory -j rend à part (`baseline`) pour chiffrer le gain d'un premier Prune ; jamais plus d'une par nick."""
         db_path=self._hist(nick,db_path,create=True)
         months=self._stats_retention_months(nick)
         def _do():
@@ -4048,7 +4053,10 @@ class BorgHelperDB:
             try:
                 conn.execute("INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize,updated_at) VALUES (?,?,?,?,?,datetime('now'))",
                              (nick,op,unique_csize,total_size,total_csize))
-                conn.execute(f"DELETE FROM repo_stats WHERE nick=? AND updated_at < datetime('now','-{int(months)} months')",(nick,))
+                # un seul 'now' pour la purge et la base épargnée (même instruction) ; cette base est celle que lit repo_history
+                old=f"nick=? AND updated_at < datetime('now','-{int(months)} months')"
+                conn.execute(f"DELETE FROM repo_stats WHERE {old} AND id <> (SELECT id FROM repo_stats WHERE {old} ORDER BY id DESC LIMIT 1)",
+                             (nick,nick))
                 conn.commit(); return True
             finally: conn.close()
         try: return self._with_lock_retry(_do)
@@ -8253,7 +8261,11 @@ class BorgHelper:
     def repo_history(self,nick,debug=0,as_json=False):
         """Story 2 (spec-charts-evolution-sauvegardes) : historique brut repo_stats (colonnes brutes,
         ordre chronologique), gabarit exact de idxtop() -j (borgHelper:3819-3844) — jamais de valeur
-        dérivée calculée ici (Boundaries)."""
+        dérivée calculée ici (Boundaries).
+
+        1.0.192 (story 67, D034) : + `baseline` = dernière mesure d'avant la fenêtre STATS_RETENTION_MONTHS (plus
+        grand id, même forme qu'une ligne de `rows`, `null` s'il n'y en a pas), hors `rows` — l'UI en tire le gain
+        d'un premier Prune et ne la dessine jamais ; la purge à l'écriture (store_repo_stats) la garde."""
         db_path=self.db.get_diff_db(nick)
         # history.db présente : les mesures se lisent même si diff.db (jetable, 1.0.139) a été supprimée
         # 1.0.179 (story 42, A92) : _path_present — dossier de cache non traversable = présent mais illisible (la sonde dit
@@ -8281,7 +8293,7 @@ class BorgHelper:
         # repo_stats vit dans history.db (1.0.139, AD-7) ; _hist migre d'abord une diff.db antérieure, et rend None
         # (aucune ligne, rien de créé) si ce nick n'a encore aucune mesure.
         hist=self.db._hist(nick,strict=True)   # 1.0.179 (A92) : non traversable -> erreur réelle, jamais rows []
-        rows=[]
+        rows=[]; baseline=None
         if hist is not None:
             try:
                 conn=_open_db(hist,nick=None,role='read')
@@ -8289,11 +8301,13 @@ class BorgHelper:
                 # l'écriture (fin de Bkp/Prune) : une valeur abaissée s'applique ainsi dès le prochain affichage.
                 months=self.db._stats_retention_months(nick)
                 try:
-                    rows=[{'id':r[0],'op':r[1],'unique_csize':r[2],'total_size':r[3],'total_csize':r[4],'updated_at':r[5]}
-                          for r in conn.execute(
-                              "SELECT id,op,unique_csize,total_size,total_csize,updated_at FROM repo_stats WHERE nick=? "
-                              f"AND updated_at >= datetime('now','-{int(months)} months') ORDER BY id",
-                              (nick,)).fetchall()]
+                    # 1.0.192 (story 67) : borne calculée une fois — rows (>=) et baseline (<) jamais d'accord sur une même ligne
+                    cut=conn.execute(f"SELECT datetime('now','-{int(months)} months')").fetchone()[0]
+                    sel="SELECT id,op,unique_csize,total_size,total_csize,updated_at FROM repo_stats WHERE nick=? "
+                    row=lambda r: {'id':r[0],'op':r[1],'unique_csize':r[2],'total_size':r[3],'total_csize':r[4],'updated_at':r[5]}
+                    rows=[row(r) for r in conn.execute(sel+"AND updated_at >= ? ORDER BY id",(nick,cut)).fetchall()]
+                    b=conn.execute(sel+"AND updated_at < ? ORDER BY id DESC LIMIT 1",(nick,cut)).fetchone()
+                    baseline=row(b) if b else None
                 finally: conn.close()
             except sqlite3.Error as e:
                 # 1.0.176 (story 39, A78, décision de l'utilisateur) : history.db sans repo_stats (vide, en-tête seul, vue seule, -wal
@@ -8303,7 +8317,7 @@ class BorgHelper:
                     if _sqlite_missing(e): _READER_FAILED[0]+=1; printer(f"[ERREUR] SQLite error ({hist}): {e}")   # 1.0.178 : marquée, code 1
                     else: _reader_sqlite_err(e,hist)
                     print(json.dumps({'error':f"SQLite error ({hist}): {e}"},ensure_ascii=False,indent=2)); return
-        print(json.dumps({'borghelper_version':Version,'nick':nick,'rows':rows},ensure_ascii=False,indent=2))
+        print(json.dumps({'borghelper_version':Version,'nick':nick,'rows':rows,'baseline':baseline},ensure_ascii=False,indent=2))
 
     def archive_history(self,nick,debug=0,as_json=False):
         """Story 2 (spec-charts-evolution-sauvegardes) : historique brut archive_stats (colonnes
@@ -10104,6 +10118,7 @@ def codec_selftest(pattern=None,list_only=False):
         def _rs_purge_default_check():
             p=_rs_path('purge'); bhrs.ensure_history_db(p)
             c=_open_db(p,nick='p1',role='write')
+            c.execute("INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize,updated_at) VALUES ('p1','bkp',11,11,11,datetime('now','-16 months'))")
             c.execute("INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize,updated_at) VALUES ('p1','bkp',9,9,9,datetime('now','-14 months'))")
             c.execute("INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize,updated_at) VALUES ('p1','bkp',8,8,8,datetime('now','-1 months'))")
             c.commit(); c.close()
@@ -10111,18 +10126,24 @@ def codec_selftest(pattern=None,list_only=False):
             c=_open_db(p,nick='p1',role='read')
             vals=[r[0] for r in c.execute("SELECT unique_csize FROM repo_stats WHERE nick='p1' ORDER BY id").fetchall()]
             c.close()
-            return 9 not in vals and vals==[8,7]
-        check("repo_stats : purge par ancienneté (13 mois défaut) — ligne expirée absente, récentes conservées",_rs_purge_default_check)
+            # 1.0.192 (story 67, D034) : la plus récente des expirées (9) reste, mesure de base du premier Prune
+            return 11 not in vals and vals==[9,8,7]
+        check("repo_stats : purge par ancienneté (13 mois défaut) — expirées retirées sauf la plus récente (base), récentes conservées",_rs_purge_default_check)
         def _rs_purge_override_check():
             p=_rs_path('purge_over'); bhrs.ensure_history_db(p)
             c=_open_db(p,nick='over',role='write')
-            c.execute("INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize,updated_at) VALUES ('over','bkp',5,5,5,datetime('now','-2 months'))")
+            for m,v in ((4,3),(3,4),(2,5)):   # 3 mesures hors fenêtre (1 mois), insérées dans l'ordre chronologique
+                c.execute("INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize,updated_at) VALUES ('over','bkp',?,?,?,datetime('now',?))",(v,v,v,f'-{m} months'))
+            c.execute("INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize,updated_at) VALUES ('autre','bkp',1,1,1,datetime('now','-4 months'))")
             c.commit(); c.close()
             bhrs.store_repo_stats('over','bkp',6,6,6,db_path=p)  # STATS_RETENTION_MONTHS=1 pour 'over' -> purge >1 mois
             c=_open_db(p,nick='over',role='read')
             vals=[r[0] for r in c.execute("SELECT unique_csize FROM repo_stats WHERE nick='over' ORDER BY id").fetchall()]
+            other=c.execute("SELECT COUNT(*) FROM repo_stats WHERE nick='autre'").fetchone()[0]
             c.close()
-            return vals==[6]
+            # 1.0.192 (story 67) : 3 hors fenêtre + 1 dans -> les 2 plus anciennes retirées, la plus récente hors fenêtre gardée ;
+            # purge par nick (la ligne d'un autre nick jamais touchée)
+            return vals==[5,6] and other==1
         check("repo_stats : STATS_RETENTION_MONTHS surchargé par nick appliqué (pas le défaut 13 mois)",_rs_purge_override_check)
         check("STATS_RETENTION_MONTHS non numérique -> fallback 13 mois (except TypeError/ValueError)",lambda: bhrs._stats_retention_months('badval')==13)
         # ── RepoHistory / ArchiveHistory (Story 2, spec-charts-evolution-sauvegardes) ──
@@ -10132,14 +10153,14 @@ def codec_selftest(pattern=None,list_only=False):
             # 1.0.161 (story 24) : CACHE_DIR explicite — _cli_rh_multi_rejected lance _cli_main dans ce processus ; sans lui,
             # BorgHelper() créait ~/.cache/borghelper (vu par strace et par le crochet d'audit)
             f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(rh_dir,'cache')}\n\n")
-            for nk in ('rhA','rhB','rhEmpty','rhOld'):
+            for nk in ('rhA','rhB','rhEmpty','rhOld','rhBase','rhBase2'):
                 # dates fixes des fixtures rhA/rhB (2026) : rétention très longue, sinon le bornage des
-                # séries (1.0.127, 13 mois par défaut) les ferait disparaître avec le temps. rhOld : défaut.
-                ret="" if nk=='rhOld' else "STATS_RETENTION_MONTHS=1200\n"
+                # séries (1.0.127, 13 mois par défaut) les ferait disparaître avec le temps. rhOld : défaut. rhBase/rhBase2 : 1 mois.
+                ret="" if nk=='rhOld' else ("STATS_RETENTION_MONTHS=1\n" if nk in ('rhBase','rhBase2') else "STATS_RETENTION_MONTHS=1200\n")
                 f.write(f"[{nk}]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw-{nk}\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n{ret}\n")
         os.chmod(rh_rc,0o600)
         bh_rh=BorgHelper(cfgfile=rh_rc,cache_dir=os.path.join(rh_dir,'cache'))
-        for nk in ('rhA','rhB','rhEmpty','rhOld'):
+        for nk in ('rhA','rhB','rhEmpty','rhOld','rhBase','rhBase2'):
             bh_rh.db.ensure_diff_db(bh_rh.db.get_diff_db(nk))
         bh_rh.db.store_repo_stats('rhA','bkp',100,200,300)
         bh_rh.db.store_repo_stats('rhA','prune',90,190,290)
@@ -10166,6 +10187,40 @@ def codec_selftest(pattern=None,list_only=False):
             b=_rh_run(bh_rh.repo_history,'rhB',as_json=True)['rows']
             return len(a)==2 and len(b)==1 and b[0]['unique_csize']==1
         check("RepoHistory -j : plusieurs nicks isolés correctement (rhA/rhB)",_rh_repo_isolation)
+        def _rh_baseline():
+            """1.0.192 (story 67, D034) : STATS_RETENTION_MONTHS=1, 3 mesures hors fenêtre puis une écrite -> la purge garde
+            la plus récente hors fenêtre, RepoHistory -j la rend en `baseline` (même forme qu'une ligne), jamais dans rows ;
+            rien hors fenêtre (rhA) ou aucune mesure (rhEmpty) -> baseline null, rows inchangé."""
+            h=bh_rh.db.get_history_db('rhBase'); bh_rh.db.ensure_history_db(h); c=sqlite3.connect(h)
+            for m,v in ((4,41),(3,31),(2,21)):
+                c.execute("INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize,updated_at) "
+                          "VALUES ('rhBase','prune',?,?,?,datetime('now',?))",(v,v+1,v+2,f'-{m} months'))
+            c.commit(); c.close()
+            bh_rh.db.store_repo_stats('rhBase','bkp',7,8,9)
+            c=sqlite3.connect(h); left=[r[0] for r in c.execute("SELECT unique_csize FROM repo_stats WHERE nick='rhBase' ORDER BY id")]; c.close()
+            v=_rh_run(bh_rh.repo_history,'rhBase',as_json=True); b=v['baseline']; rows=v['rows']
+            a=_rh_run(bh_rh.repo_history,'rhA',as_json=True); e=_rh_run(bh_rh.repo_history,'rhEmpty',as_json=True)
+            res={'base':left==[21,7],'rows':[r['unique_csize'] for r in rows]==[7],
+                 'baseline':isinstance(b,dict) and (b['op'],b['unique_csize'],b['total_size'],b['total_csize'])==('prune',21,22,23),
+                 'forme':isinstance(b,dict) and len(rows)==1 and list(b)==list(rows[0]) and b['id']!=rows[0]['id'],
+                 'null':'baseline' in a and a['baseline'] is None and len(a['rows'])==2 and 'baseline' in e and e['baseline'] is None and e['rows']==[]}
+            if not all(res.values()): print(f"    {res} left={left} v={v}")
+            return all(res.values())
+        check("RepoHistory -j : baseline = dernière mesure d'avant STATS_RETENTION_MONTHS (gardée par la purge), hors rows ; null sinon",_rh_baseline)
+        def _rh_baseline_unpurged():
+            """1.0.192 (story 67, revue) : plusieurs mesures d'avant la fenêtre pas encore purgées (rétention abaissée, aucune écriture
+            depuis) -> baseline = la plus grande id avant la borne (-2 mois), jamais la plus ancienne ; la ligne de la fenêtre dans rows.
+            Insertion directe dans history.db : ni store_repo_stats, ni purge."""
+            h=bh_rh.db.get_history_db('rhBase2'); bh_rh.db.ensure_history_db(h); c=sqlite3.connect(h)
+            for m,v in (('-3 months',301),('-2 months',201),('-1 days',11)):
+                c.execute("INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize,updated_at) "
+                          "VALUES ('rhBase2','bkp',?,?,?,datetime('now',?))",(v,v,v,m))
+            c.commit(); n=c.execute("SELECT COUNT(*) FROM repo_stats WHERE nick='rhBase2'").fetchone()[0]; c.close()
+            v=_rh_run(bh_rh.repo_history,'rhBase2',as_json=True); b=v['baseline']
+            res={'base':n==3,'baseline':isinstance(b,dict) and b['unique_csize']==201,'rows':[r['unique_csize'] for r in v['rows']]==[11]}
+            if not all(res.values()): print(f"    {res} v={v}")
+            return all(res.values())
+        check("RepoHistory -j : baseline = plus grande id avant la borne quand plusieurs mesures anciennes restent (rétention abaissée)",_rh_baseline_unpurged)
         def _rh_arch_populated():
             v=_rh_run(bh_rh.archive_history,'rhA',as_json=True); rows=v['rows']
             return (len(rows)==2 and rows[0]['archive']=='A1' and rows[1]['archive']=='A2'

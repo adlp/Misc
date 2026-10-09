@@ -4,7 +4,8 @@
 // matrice d'adresses (analyse, adresses invalides, aller-retour d'encodage état -> adresse -> état) et
 // le titre de l'onglet de chaque page (UI >= 1.15.0). Puis, DOM et API simulés : badges, fin de Bkp, actions, carte,
 // et graphiques de la page Historique (tous construits, séries, archives supprimées, sans lignes, blocs HTML ;
-// chargements croisés, rechargement, réponses en erreur, échec partiel, bibliothèque absente) ; bandeau de nettoyage.
+// chargements croisés, rechargement, réponses en erreur, échec partiel, bibliothèque absente ; UI >= 1.24.0 : axe temporel,
+// premier Prune, avec la vraie Chart.js de vendor/chartjs sur un canvas simulé) ; bandeau de nettoyage.
 //
 //   node borgHelperWWW_ui_test.js [chemin/vers/borgHelperWWW_ui.html]
 //
@@ -371,12 +372,13 @@ async ${grab('reloadMachineCard')}
   }};
   // Faux Chart (story 22) : refuse un canvas encore utilisé, comme Chart.js (« Canvas is already in use ») ; compte les destroy().
   // hooks.noChart : page sans bibliothèque (typeof Chart === 'undefined').
-  const built=[], apiCalls=[], live=new Set(), destroyed=[]; let resp={};
+  const built=[], apiCalls=[], live=new Set(), destroyed=[], adapters=[]; let resp={};
   const mkCharts=noChart=>new Function('cdom','hooks',`
     const document={getElementById:id=>cdom.byId(id)};
     class FakeChart{ constructor(canvas,cfg){ if(hooks.live.has(canvas.id)) throw new Error('Canvas is already in use');
       hooks.live.add(canvas.id); this.id=canvas.id; hooks.built.push({id:canvas.id,cfg}); }
       destroy(){ hooks.live.delete(this.id); hooks.destroyed.push(this.id); } }
+    FakeChart._adapters={_date:{override(m){ hooks.adapter.push(m); }}};   // UI 1.24.0 : adaptateur de dates posé par la page
     const Chart=hooks.noChart?undefined:FakeChart;
     const apiCall=async(m,p,q)=>{ hooks.calls.push([m,p,q&&q.nick]); const r=hooks.resp(); return (r[q&&q.nick]||r)[p]; };
     ${grabLine('SPINNER')}
@@ -384,6 +386,14 @@ async ${grab('reloadMachineCard')}
     ${grabConst('ARCHIVE_EXTRA_CHARTS')}
     ${grabLine('chartExtraInstances')}
     ${grabLine('chartsLoadSeq')}
+    ${grabLine('dateAdapterReady')}
+${grab('_parseTs')}
+${grab('_fmtTs')}
+${grab('_dateAdapter')}
+${grab('_installDateAdapter')}
+${grab('_timeAxis')}
+${grab('_tsTitle')}
+${grab('_datedRows')}
 ${grab('_fmtBytes')}
 ${grab('_fmtDuration')}
 ${grab('_showChartMsg')}
@@ -394,10 +404,9 @@ ${grab('_errLine')}
 ${grab('_parseHistoryResponse')}
 ${grab('_renderRepoSizeAndPruneGainCharts')}
 ${grab('_fadeFor')}
-${grab('_prunedTitle')}
 ${grab('_renderArchiveSizeChart')}
 ${grab('_renderArchiveExtraChart')}
-    return {loadCharts,_safeRender,extra:ARCHIVE_EXTRA_CHARTS,SPINNER};`)(cdom,{built,live,destroyed,noChart,calls:apiCalls,resp:()=>resp});
+    return {loadCharts,_safeRender,extra:ARCHIVE_EXTRA_CHARTS,SPINNER};`)(cdom,{built,live,destroyed,noChart,calls:apiCalls,resp:()=>resp,adapter:adapters});
   const charts=mkCharts(false);
   const ok=rows=>({exitcode:0,httpStatus:200,stdout:JSON.stringify({rows}),stderr:''});
   const allIds=['chartRepoSize','chartPruneGain','chartArchiveSize',...charts.extra];
@@ -405,11 +414,12 @@ ${grab('_renderArchiveExtraChart')}
      allIds.filter(id=>!new RegExp('<canvas id="'+id+'"').test(markup)||!htmlIds.has(id+'Msg')),[]);
   const spinners=()=>allIds.filter(id=>{ const m=cdom.byId(id+'Msg'); return !m||(!m.hidden&&m.querySelector('.spinner')); });
   const tryLoad=async()=>{ try{ await charts.loadCharts('n'); return null; } catch(e){ return String(e); } };
-  const repoRows=[{updated_at:'t1',op:'bkp',unique_csize:100,total_size:300,total_csize:200},
-                   {updated_at:'t2',op:'prune',unique_csize:60,total_size:250,total_csize:150}];
-  const archRows=k=>[{archive_date:'d1',original_size:1000*k,compressed_size:600,deduplicated_size:50,files_added:1,
+  // UI 1.24.0 : dates au format réel (updated_at : datetime('now') de SQLite, UTC ; archive_date : borg, heure locale)
+  const repoRows=[{updated_at:'2026-09-01 08:00:05',op:'bkp',unique_csize:100,total_size:300,total_csize:200},
+                   {updated_at:'2026-09-03 08:30:00',op:'prune',unique_csize:60,total_size:250,total_csize:150}];
+  const archRows=k=>[{archive_date:'2026-09-01T10:00:00.000000',original_size:1000*k,compressed_size:600,deduplicated_size:50,files_added:1,
                       files_modified:2,files_removed:0,changed_during_backup:0,read_errors:0,duration:12,pruned:true},
-                     {archive_date:'d2',original_size:1100*k,compressed_size:650,deduplicated_size:40,files_added:0,
+                     {archive_date:'2026-09-03T10:30:00.000000',original_size:1100*k,compressed_size:650,deduplicated_size:40,files_added:0,
                       files_modified:3,files_removed:1,changed_during_backup:0,read_errors:0,duration:15,pruned:false}];
   resp={'/repohistory':ok(repoRows),'/archivehistory':ok(archRows(1))};
   const err1=await tryLoad();
@@ -420,12 +430,13 @@ ${grab('_renderArchiveExtraChart')}
   const cfgOf=id=>(built.find(b=>b.id===id)||{cfg:{data:{datasets:[]},options:{plugins:{tooltip:{callbacks:{}}}}}}).cfg;
   const as=cfgOf('chartArchiveSize');
   eq('courbe des tailles : original_size, compressed_size, deduplicated_size, chacune avec sa donnée',
-     as.data.datasets.map(d=>[d.label,d.data]),
+     as.data.datasets.map(d=>[d.label,d.data.map(p=>p.y)]),
      [['original_size',[1000,1100]],['compressed_size',[600,650]],['deduplicated_size',[50,40]]]);
   const faded=cfg=>cfg.data.datasets.length>0 && cfg.data.datasets.every(d=>{ const c=d.pointBackgroundColor||d.backgroundColor;
     return Array.isArray(c) && c[0].endsWith('4D') && !c[1].endsWith('4D'); });
+  // UI 1.24.0 : titre = date du point en heure locale ISO (plus le libellé de catégorie)
   const titled=cfg=>{ const t=cfg.options.plugins.tooltip.callbacks.title;
-    return !!t && t([{label:'d1',dataIndex:0}])==='d1 (supprimée)' && t([{label:'d2',dataIndex:1}])==='d2'; };
+    return !!t && t([{label:'x',dataIndex:0}])==='2026-09-01 10:00 (supprimée)' && t([{label:'x',dataIndex:1}])==='2026-09-03 10:30'; };
   eq('archive supprimée (pruned) : atténuée (…4D) et « (supprimée) » dans l\'infobulle, graphiques par archive',
      ['chartArchiveSize',...charts.extra].map(id=>[id,faded(cfgOf(id)),titled(cfgOf(id))]),
      ['chartArchiveSize',...charts.extra].map(id=>[id,true,true]));
@@ -456,7 +467,7 @@ ${grab('_renderArchiveExtraChart')}
   built.length=0; apiCalls.length=0; let e5=null;
   try{ const first=charts.loadCharts('a'); await charts.loadCharts('b'); release(); await first; } catch(e){ e5=String(e); }
   eq('chargements croisés : seul le dernier dessine, avec ses données, page finale propre',
-     [e5,built.length,cfgOf('chartArchiveSize').data.datasets[0].data,spinners(),
+     [e5,built.length,cfgOf('chartArchiveSize').data.datasets[0].data.map(p=>p.y),spinners(),
       allIds.map(id=>!cdom.byId(id).hidden && cdom.byId(id+'Msg').hidden),apiCalls.filter(c=>c[2]==='b').length],
      [null,5,[3000,3300],[],allIds.map(()=>true),2]);
   // Erreurs de /repohistory et /archivehistory : un message d'erreur par graphique, rien construit, aucune exception.
@@ -508,6 +519,204 @@ ${grab('_renderArchiveExtraChart')}
   eq('bibliothèque de graphiques absente : message sur les cinq, rien construit, sans exception',
      [e4,built.length,allIds.map(id=>{ const m=cdom.byId(id+'Msg'); return !m.hidden && m.className==='error' && cdom.byId(id).hidden
        && m.textContent.startsWith('Bibliothèque de graphiques indisponible'); }),spinners()],[null,0,allIds.map(()=>true),[]]);
+  // ── UI 1.24.0 (story 67) : axe temporel réel, premier Prune (D034, D035, D040, D050, D197, D192) ──
+  // Faux Chart : échelle `time` sur les cinq graphiques, points {x: horodatage, y}, adaptateur de dates posé une fois.
+  resp={'/repohistory':ok(repoRows),'/archivehistory':ok(archRows(1))}; built.length=0;
+  await tryLoad();
+  const ad=adapters[0]||{};
+  eq('axe temporel : adaptateur de dates posé (une fois), complet',
+     [adapters.length,['formats','parse','format','add','diff','startOf','endOf'].filter(k=>typeof ad[k]!=='function')],[1,[]]);
+  eq('axe temporel : échelle time sur les cinq graphiques, x = horodatages numériques, sans labels de catégorie',
+     chartIds.map(id=>{ const c=cfgOf(id); return [id,c.options.scales.x.type,!c.data.labels,
+       c.data.datasets.every(d=>d.data.every(p=>typeof p.x==='number'&&isFinite(p.x)))]; }),chartIds.map(id=>[id,'time',true,true]));
+  const TU0=globalThis.Date.UTC(2026,8,1,8,0,5);
+  const fmtLocal=t=>{ const d=new globalThis.Date(t), p=n=>String(n).padStart(2,'0');   // heure locale ISO, écrite indépendamment de la page
+    return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes()); };
+  eq('axe temporel : updated_at lu en UTC, archive_date en heure locale',
+     [cfgOf('chartRepoSize').data.datasets[0].data[0].x,cfgOf('chartArchiveSize').data.datasets[0].data[0].x],
+     [TU0,new globalThis.Date(2026,8,1,10,0,0).getTime()]);
+  // Adaptateur : interface de Chart.js en heure locale (graduations ISO selon l'unité).
+  {
+    const L=(...a)=>new globalThis.Date(...a).getTime(), t=L(2026,9,4,10,46,17);
+    eq('adaptateur : formats ISO par unité (jour, mois, année, heure, minute, seconde)',
+       ['day','month','year','hour','minute','second','week','quarter','datetime'].map(u=>ad.format(t,ad.formats()[u])),
+       ['2026-10-04','2026-10','2026','2026-10-04 10:46','2026-10-04 10:46','2026-10-04 10:46:17','2026-10-04','2026-10','2026-10-04 10:46']);
+    eq('adaptateur : startOf / endOf / add / diff',
+       [ad.startOf(t,'hour')===L(2026,9,4,10),ad.startOf(t,'day')===L(2026,9,4),ad.startOf(t,'month')===L(2026,9,1),
+        ad.startOf(t,'quarter')===L(2026,9,1),ad.startOf(t,'year')===L(2026,0,1),ad.startOf(t,'isoWeek',1)===L(2026,8,28),
+        ad.startOf(t,'week')===L(2026,9,4),ad.endOf(t,'day')===L(2026,9,5)-1,ad.add(t,1,'month')===L(2026,10,4,10,46,17),
+        ad.add(t,2,'day')===L(2026,9,6,10,46,17),ad.diff(L(2026,9,14),L(2026,9,4),'day'),ad.diff(L(2027,0,1),L(2026,9,1),'month'),
+        ad.parse(t),ad.parse(null),ad.parse('n\'importe quoi')],
+       [true,true,true,true,true,true,true,true,true,true,10,3,t,null,null]);
+  }
+  // Premier Prune : mesure précédente = baseline (borgHelper ≥ 1.0.192) ; sans elle : marqué sans barre, note.
+  const firstPrune=[{id:9,op:'prune',unique_csize:60,total_size:1,total_csize:1,updated_at:'2026-09-03 08:30:00'},
+                    {id:10,op:'bkp',unique_csize:70,total_size:1,total_csize:1,updated_at:'2026-09-04 08:30:00'}];
+  const okB=(rows,extra)=>({exitcode:0,httpStatus:200,stderr:'',stdout:JSON.stringify(Object.assign({rows},extra))});
+  const pgNote=()=>{ const n=cdom.byId('chartPruneGainNote'); return n.hidden?null:n.textContent; };
+  resp={'/repohistory':okB(firstPrune,{baseline:{id:8,op:'bkp',unique_csize:100,total_size:1,total_csize:1,updated_at:'2026-07-01 00:00:00'}}),
+        '/archivehistory':ok(archRows(1))}; built.length=0;
+  const eB=await tryLoad(); const gB=cfgOf('chartPruneGain');
+  eq('premier Prune, base gardée : barre = baseline.unique_csize - prune.unique_csize, base jamais dessinée, aucune note',
+     [eB,gB.data.datasets.map(d=>d.data.map(p=>p.y)),cfgOf('chartRepoSize').data.datasets[0].data.map(p=>p.y),pgNote()],
+     [null,[[40]],[60,70],null]);
+  for(const [nm,extra] of [['baseline null',{baseline:null}],['champ baseline absent (borgHelper < 1.0.192)',{}]]){
+    resp={'/repohistory':okB(firstPrune,extra),'/archivehistory':ok(archRows(1))}; built.length=0;
+    const e=await tryLoad(); const g=cfgOf('chartPruneGain'), cb=g.options.plugins.tooltip.callbacks;
+    eq('premier Prune sans base ('+nm+') : marqué sans barre (croix à 0), infobulle et ligne sous le graphique',
+       [e,g.data.datasets.map(d=>[d.type||'bar',d.data.map(p=>[p.x,p.y])]),cb.label({datasetIndex:1,parsed:{y:0}}),
+        cb.title([{datasetIndex:1,dataIndex:0}]),pgNote(),!cdom.byId('chartPruneGain').hidden,cdom.byId('chartPruneGainMsg').hidden],
+       [null,[['bar',[]],['line',[[globalThis.Date.UTC(2026,8,3,8,30),0]]]],'Prune : gain inconnu : aucune mesure précédente',
+        fmtLocal(globalThis.Date.UTC(2026,8,3,8,30)),'Prune du '+fmtLocal(globalThis.Date.UTC(2026,8,3,8,30))+' : gain inconnu : aucune mesure précédente.',
+        true,true]);
+  }
+  resp={'/repohistory':ok(repoRows),'/archivehistory':ok(archRows(1))}; built.length=0; await tryLoad();
+  eq('note « gain inconnu » retirée au rechargement suivant (Prune précédé d\'une mesure)',[pgNote(),cfgOf('chartPruneGain').data.datasets.length],[null,1]);
+  // Date illisible : ligne hors de l'axe, graphique dessiné, jamais d'exception ; même updated_at : deux points.
+  const badRepo=[{op:'bkp',unique_csize:1,updated_at:''},{op:'bkp',unique_csize:2,updated_at:'2026-09-01 08:00:00'},
+                 {op:'index',unique_csize:3,updated_at:'2026-09-01 08:00:00'},{op:'bkp',unique_csize:4,updated_at:'pas une date'},
+                 {op:'bkp',unique_csize:5,updated_at:'2026-02-30 08:00:00'},{op:'prune',unique_csize:6,updated_at:null},
+                 {op:'prune',unique_csize:1,updated_at:'2026-09-02 08:00:00'}];
+  const badArch=archRows(1).concat([{archive_date:'2026-13-01T00:00:00',original_size:9,duration:9,files_added:9},{archive_date:'',duration:9}]);
+  resp={'/repohistory':ok(badRepo),'/archivehistory':ok(badArch)}; built.length=0;
+  const eBad=await tryLoad();
+  eq('date illisible : lignes hors de l\'axe, cinq graphiques dessinés, sans exception ; même updated_at : deux points distincts',
+     [eBad,built.length,cfgOf('chartRepoSize').data.datasets[0].data.map(p=>p.y),
+      cfgOf('chartPruneGain').data.datasets.map(d=>d.data.map(p=>p.y)),['chartArchiveSize',...charts.extra].map(id=>cfgOf(id).data.datasets[0].data.length)],
+     [null,5,[2,3,1],[[5]],[2,2,2]]);
+  // Valeurs portées seulement par une ligne à date illisible : graphique par archive vide -> son message (jamais un canvas vide).
+  resp={'/repohistory':ok(repoRows),'/archivehistory':ok([{archive_date:'2026-09-01T10:00:00',original_size:1,compressed_size:1,deduplicated_size:1,
+    duration:null,files_added:null,files_modified:null,files_removed:null,changed_during_backup:null,read_errors:null},
+    {archive_date:'',original_size:2,duration:7,files_added:3,files_modified:1,files_removed:1,changed_during_backup:1,read_errors:1}])};
+  built.length=0;
+  const eUnd=await tryLoad();
+  eq('valeurs seulement sur une ligne non datée : Durée et Fichiers modifiés -> leur message « Aucun… », rien construit pour eux',
+     [eUnd,built.map(b=>b.id).sort(),charts.extra.map(id=>[cdom.byId(id).hidden,cdom.byId(id+'Msg').hidden,cdom.byId(id+'Msg').textContent.startsWith('Aucun')])],
+     [null,['chartArchiveSize','chartPruneGain','chartRepoSize'],charts.extra.map(()=>[true,false,true])]);
+  // Une seule ligne : un point, axe d'un jour centré sur lui, une graduation à sa date.
+  resp={'/repohistory':ok([repoRows[0]]),'/archivehistory':ok([archRows(1)[1]])}; built.length=0;
+  const e1=await tryLoad(); const x1=cfgOf('chartRepoSize').options.scales.x;
+  eq('une seule ligne : graphiques dessinés, axe d\'un jour centré sur le point, graduation à sa date',
+     [e1,built.map(b=>b.id).sort(),x1.max-TU0,TU0-x1.min,x1.ticks.source,x1.time.unit],
+     [null,['chartArchiveSize','chartDuration','chartFileChanges','chartRepoSize'],432e5,432e5,'data','minute']);
+
+  // Vraie Chart.js (vendor/chartjs, servie par borgHelperWWW) sur un canvas simulé, avec l'adaptateur de la page : graduations,
+  // position des points. TZ Europe/Paris : updated_at (UTC) et archive_date (local) diffèrent de 2 h dans le texte.
+  const tzPrev=process.env.TZ; process.env.TZ='Europe/Paris';
+  try{
+    const cjs=fs.readFileSync(path.join(__dirname,'vendor','chartjs','chart.umd.min.js'),'utf8');
+    const mod={exports:{}}; new Function('module','exports',cjs)(mod,mod.exports); const RealChart=mod.exports;
+    const rdom={els:{},byId(id){
+      if(!htmlIds.has(id)) return null;
+      if(this.els[id]) return this.els[id];
+      const el={id,hidden:false,className:'',textContent:'',innerHTML:'',width:800,height:300,style:{},querySelector:()=>null};
+      const ctx=new Proxy({canvas:el},{get(t,k){ if(k==='measureText') return x=>({width:String(x).length*6}); return k in t?t[k]:()=>{}; },
+                                       set(t,k,v){ t[k]=v; return true; }});
+      el.getContext=()=>ctx; return this.els[id]=el; }};
+    const real=new Function('rdom','Chart',`
+      const document={getElementById:id=>rdom.byId(id)};
+      ${grabLine('chartRepoSizeInstance')}
+      ${grabLine('chartExtraInstances')}
+      ${grabLine('dateAdapterReady')}
+${grab('_parseTs')}
+${grab('_fmtTs')}
+${grab('_dateAdapter')}
+${grab('_installDateAdapter')}
+${grab('_timeAxis')}
+${grab('_tsTitle')}
+${grab('_datedRows')}
+${grab('_fmtBytes')}
+${grab('_fmtDuration')}
+${grab('_showChartMsg')}
+${grab('_hideChartMsg')}
+${grab('_errLine')}
+${grab('_parseHistoryResponse')}
+${grab('_renderRepoSizeAndPruneGainCharts')}
+${grab('_fadeFor')}
+${grab('_renderArchiveSizeChart')}
+${grab('_renderArchiveExtraChart')}
+      _installDateAdapter();
+      return {repo:r=>_renderRepoSizeAndPruneGainCharts(r),arch:r=>_renderArchiveSizeChart(r),extra:(id,r)=>_renderArchiveExtraChart(id,r),
+              get:id=>({chartRepoSize:chartRepoSizeInstance,chartPruneGain:chartPruneGainInstance,chartArchiveSize:chartArchiveSizeInstance})[id]||chartExtraInstances[id]};`)(rdom,RealChart);
+    const tryR=f=>{ try{ f(); return null; } catch(e){ return String(e); } };
+    const px=(c,ds=0)=>c.getDatasetMeta(ds).data.map(e=>e.x);
+    const ticks=c=>c.scales.x.ticks.map(t=>t.label);
+    const titleOf=(c,i,ds=0)=>c.options.plugins.tooltip.callbacks.title([{dataIndex:i,datasetIndex:ds}]);
+    // Espacement proportionnel au temps : (x_i - x_0) / (t_i - t_0) constant.
+    const proportional=(xs,ts)=>{ const k=(xs[xs.length-1]-xs[0])/(ts[ts.length-1]-ts[0]);
+      return k>0 && xs.every((x,i)=>Math.abs((x-xs[0])-k*(ts[i]-ts[0]))<1e-6*Math.abs(xs[xs.length-1]-xs[0])+1e-9); };
+    // Réponses réelles capturées (story 67, 2026-10-09) : borgHelper 1.0.192 servi par borgHelperWWW (tools/www_server.py), bac à
+    // sable à dépôts neufs — sa : Bkp à J, J+5 s, J+35 s puis Prune (KEEP_DAILY=1) ; sb (STATS_RETENTION_MONTHS=1) : mesures
+    // reculées hors fenêtre, Bkp puis Prune réels -> rows = [prune], baseline = mesure du Bkp.
+    const CAP={
+    'sa/repohistory':{exitcode:0,httpStatus:200,stderr:"",stdout:JSON.stringify({"borghelper_version":"1.0.192","nick":"sa","rows":[{"id":1,"op":"bkp","unique_csize":21085,"total_size":20000,"total_csize":20043,"updated_at":"2026-10-09 13:50:16"},{"id":2,"op":"bkp","unique_csize":52246,"total_size":70000,"total_csize":70129,"updated_at":"2026-10-09 13:50:21"},{"id":3,"op":"bkp","unique_csize":93478,"total_size":160000,"total_csize":160258,"updated_at":"2026-10-09 13:50:51"},{"id":4,"op":"prune","unique_csize":91318,"total_size":90000,"total_csize":90129,"updated_at":"2026-10-09 13:51:17"}],"baseline":null})},
+    'sa/archivehistory':{exitcode:0,httpStatus:200,stderr:"",stdout:JSON.stringify({"borghelper_version":"1.0.192","nick":"sa","rows":[{"archive":"p-sxb-35-a-2026-10-09T155015","archive_date":"2026-10-09T15:50:15.000000","duration":0.025564,"original_size":20808,"compressed_size":20803,"deduplicated_size":20803,"nfiles":1,"changed_during_backup":0,"read_errors":0,"files_added":null,"files_modified":null,"files_removed":null,"borg_version":null,"borg_server_version":null,"reconciled":false,"pruned":true},{"archive":"p-sxb-35-a-2026-10-09T155021","archive_date":"2026-10-09T15:50:21.000000","duration":0.026639,"original_size":50808,"compressed_size":50843,"deduplicated_size":30800,"nfiles":2,"changed_during_backup":0,"read_errors":0,"files_added":1,"files_modified":0,"files_removed":0,"borg_version":null,"borg_server_version":null,"reconciled":false,"pruned":true},{"archive":"p-sxb-35-a-2026-10-09T155050","archive_date":"2026-10-09T15:50:50.000000","duration":0.026962,"original_size":90812,"compressed_size":90889,"deduplicated_size":40803,"nfiles":3,"changed_during_backup":0,"read_errors":0,"borg_version":"1.2.6","borg_server_version":"1.2.6","reconciled":false,"files_added":1,"files_modified":0,"files_removed":0,"pruned":false}]})},
+    'sb/repohistory':{exitcode:0,httpStatus:200,stderr:"",stdout:JSON.stringify({"borghelper_version":"1.0.192","nick":"sb","rows":[{"id":9,"op":"prune","unique_csize":76324,"total_size":75000,"total_csize":75129,"updated_at":"2026-10-09 13:51:55"}],"baseline":{"id":8,"op":"bkp","unique_csize":77444,"total_size":125000,"total_csize":125215,"updated_at":"2026-09-08 13:51:49"}})},
+    'sb/archivehistory':{exitcode:0,httpStatus:200,stderr:"",stdout:JSON.stringify({"borghelper_version":"1.0.192","nick":"sb","rows":[{"archive":"p-sxb-35-b-2026-10-09T155057","archive_date":"2026-10-09T15:50:57.000000","duration":0.024958,"original_size":20808,"compressed_size":20800,"deduplicated_size":20800,"nfiles":1,"changed_during_backup":0,"read_errors":0,"files_added":null,"files_modified":null,"files_removed":null,"borg_version":null,"borg_server_version":null,"reconciled":false,"pruned":true},{"archive":"p-sxb-35-b-2026-10-09T155102","archive_date":"2026-10-09T15:51:02.000000","duration":0.026051,"original_size":50808,"compressed_size":50843,"deduplicated_size":30800,"nfiles":2,"changed_during_backup":0,"read_errors":0,"files_added":1,"files_modified":0,"files_removed":0,"borg_version":null,"borg_server_version":null,"reconciled":false,"pruned":true},{"archive":"p-sxb-35-b-2026-10-09T155149","archive_date":"2026-10-09T15:51:49.000000","duration":0.032272,"original_size":75812,"compressed_size":75889,"deduplicated_size":25803,"nfiles":3,"changed_during_backup":0,"read_errors":0,"borg_version":"1.2.6","borg_server_version":"1.2.6","reconciled":false,"files_added":1,"files_modified":0,"files_removed":0,"pruned":false}]})}
+    };
+    const capRows=k=>JSON.parse(CAP[k].stdout).rows;
+    const eR=[tryR(()=>real.repo(CAP['sa/repohistory'])),tryR(()=>real.arch(CAP['sa/archivehistory'])),
+              ...charts.extra.map(id=>tryR(()=>real.extra(id,CAP['sa/archivehistory'])))];
+    const rc=real.get('chartRepoSize'), ac=real.get('chartArchiveSize'), du=real.get('chartDuration');
+    const rT=capRows('sa/repohistory').map(r=>globalThis.Date.parse(r.updated_at.replace(' ','T')+'Z'));
+    const aT=capRows('sa/archivehistory').map(r=>new globalThis.Date(r.archive_date).getTime());
+    eq('vraie Chart.js, réponses capturées (sa) : cinq graphiques sans exception, intervalles inégaux -> espacement proportionnel au temps',
+       [eR,proportional(px(rc),rT),proportional(px(ac),aT),proportional(px(du),aT),
+        (px(rc)[1]-px(rc)[0])<(px(rc)[2]-px(rc)[1])/3],[[null,null,null,null],true,true,true,true]);
+    // Concordance des deux familles : un même Bkp a la même heure locale dans l'infobulle (updated_at 13:50 UTC = archive 15:50)
+    eq('vraie Chart.js : heures des deux familles concordantes (Bkp n -> même minute locale), graduations ISO',
+       [[0,1,2].map(i=>titleOf(rc,i)),[0,1,2].map(i=>titleOf(ac,i).replace(' (supprimée)','')),
+        ticks(rc).every(l=>/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$/.test(l)),ticks(rc).length>1],
+       [['2026-10-09 15:50','2026-10-09 15:50','2026-10-09 15:50'],['2026-10-09 15:50','2026-10-09 15:50','2026-10-09 15:50'],true,true]);
+    const g=real.get('chartPruneGain'), rowsSa=capRows('sa/repohistory');
+    eq('vraie Chart.js : gain Prune à la date du Prune (unique_csize précédent - celui du Prune)',
+       [g.data.datasets[0].data.map(p=>p.y),titleOf(g,0)],[[rowsSa[2].unique_csize-rowsSa[3].unique_csize],'2026-10-09 15:51']);
+    // sb : premier Prune de la fenêtre, gain tiré de baseline (réponse réelle)
+    const sb=JSON.parse(CAP['sb/repohistory'].stdout);
+    const eS=tryR(()=>real.repo(CAP['sb/repohistory'])); const gs=real.get('chartPruneGain'), rs=real.get('chartRepoSize');
+    eq('vraie Chart.js, réponse capturée (sb) : premier Prune chiffré par baseline, baseline jamais dessinée, une graduation lisible',
+       [eS,gs.data.datasets.map(d=>d.data.map(p=>p.y)),rs.data.datasets[0].data.map(p=>p.y),ticks(rs),
+        px(rs)[0]>rs.chartArea.left && px(rs)[0]<rs.chartArea.right,rdom.byId('chartPruneGainNote').hidden],
+       [null,[[sb.baseline.unique_csize-sb.rows[0].unique_csize]],[sb.rows[0].unique_csize],['2026-10-09 15:51'],true,true]);
+    // Matrice : J, J+1, J+10 (barres) ; même minute ; une ligne ; graduations par unité (heures, mois)
+    const arch=dates=>({exitcode:0,httpStatus:200,stderr:'',stdout:JSON.stringify({rows:dates.map((d,i)=>({archive_date:d,duration:10+i,original_size:1,compressed_size:1,deduplicated_size:1,
+      files_added:1,files_modified:2,files_removed:1}))})});
+    tryR(()=>real.extra('chartDuration',arch(['2026-09-01T10:00:00','2026-09-02T10:00:00','2026-09-11T10:00:00'])));
+    const dj=real.get('chartDuration'), J=new globalThis.Date(2026,8,1,10).getTime(), D=864e5;
+    eq('matrice : barres à J, J+1, J+10 -> espacement proportionnel, graduations « AAAA-MM-JJ »',
+       [proportional(px(dj),[J,J+D,J+10*D]),ticks(dj).every(l=>/^\d{4}-\d{2}-\d{2}$/.test(l))],[true,true]);
+    const same={exitcode:0,httpStatus:200,stderr:'',stdout:JSON.stringify({rows:[{op:'bkp',unique_csize:5,updated_at:'2026-10-04 08:46:17'},
+      {op:'index',unique_csize:7,updated_at:'2026-10-04 08:46:17'}],baseline:null})};
+    const eSame=tryR(()=>real.repo(same)); const sm=real.get('chartRepoSize');
+    eq('matrice : même minute -> deux points distincts (même x, deux valeurs), aucun perdu ; graduation « 2026-10-04 10:46 »',
+       [eSame,px(sm).length,px(sm)[0]===px(sm)[1],sm.getDatasetMeta(0).data.map(e=>Math.round(e.y)).filter((y,i,a)=>a.indexOf(y)===i).length,ticks(sm)],
+       [null,2,true,2,['2026-10-04 10:46']]);
+    tryR(()=>real.extra('chartDuration',arch(['2026-10-04T10:00:00','2026-10-04T15:00:00','2026-10-04T19:00:00'])));
+    const hh=ticks(real.get('chartDuration'));
+    tryR(()=>real.extra('chartDuration',arch(['2026-01-15T10:00:00','2026-04-15T10:00:00','2026-09-15T10:00:00'])));
+    const mm=ticks(real.get('chartDuration'));
+    eq('graduations selon l\'unité : heures « AAAA-MM-JJ HH:00 », mois « AAAA-MM »',
+       [hh.length>1&&hh.every(l=>/^\d{4}-\d{2}-\d{2} \d{2}:00$/.test(l)),mm.length>1&&mm.every(l=>/^\d{4}-\d{2}$/.test(l))],[true,true]);
+    // Barres à largeur fixe (barThickness 8) : J, J+5 s, J+30 j (plus petit écart 5 s sur un axe d'un mois : 0 px sans elle),
+    // et une seule barre (toute la largeur sans elle) — Durée, Fichiers modifiés (3 séries empilées), Gain Prune.
+    const widths=()=>{ const w=[];
+      for(const id of ['chartDuration','chartFileChanges']){ const c=real.get(id);
+        (id==='chartDuration'?[0]:[0,1,2]).forEach(ds=>c.getDatasetMeta(ds).data.forEach(e=>w.push(Math.round(e.width*100)/100))); }
+      real.get('chartPruneGain').getDatasetMeta(0).data.forEach(e=>w.push(Math.round(e.width*100)/100)); return w; };
+    const pr=dates=>({exitcode:0,httpStatus:200,stderr:'',stdout:JSON.stringify({rows:[{op:'bkp',unique_csize:100,updated_at:'2026-08-01 00:00:00'}]
+      .concat(dates.map((d,i)=>({op:'prune',unique_csize:90-i,updated_at:d}))),baseline:null})});
+    const wErr=[];
+    const spread=['2026-09-01T10:00:00','2026-09-01T10:00:05','2026-10-01T10:00:00'];
+    wErr.push(...['chartDuration','chartFileChanges'].map(id=>tryR(()=>real.extra(id,arch(spread)))),tryR(()=>real.repo(pr(['2026-09-01 08:00:00','2026-09-01 08:00:05','2026-10-01 08:00:00']))));
+    const w3=widths();
+    wErr.push(...['chartDuration','chartFileChanges'].map(id=>tryR(()=>real.extra(id,arch(['2026-09-01T10:00:00'])))),tryR(()=>real.repo(pr(['2026-09-01 08:00:00']))));
+    const w1=widths();
+    eq('barres de largeur fixe 8 px : J, J+5 s, J+30 j et barre seule (Durée, Fichiers modifiés empilés, Gain Prune)',
+       [wErr.every(e=>e===null),w3,w1],[true,Array(15).fill(8),Array(5).fill(8)]);
+    const eBadR=[tryR(()=>real.repo(ok(badRepo))),tryR(()=>real.extra('chartFileChanges',ok(badArch)))];
+    eq('vraie Chart.js : dates illisibles ignorées, sans exception',[eBadR,real.get('chartRepoSize').getDatasetMeta(0).data.length],[[null,null],3]);
+  } finally { if(tzPrev===undefined) delete process.env.TZ; else process.env.TZ=tzPrev; }
+
   // UI 1.23.0 (A87) : explorateur (/treehist, /treefind) — code 1 avec JSON lu (erreur du nick), code 1 sans sortie ou >= 2 : stderr
   {
     const rj=new Function(grab('_readerJson')+'\nreturn _readerJson;')();

@@ -840,3 +840,5 @@ sys.exit(0)
 | `check_index_pending_lock(nick)` | `True` si un `Index` interrompu attend d'être repris |
 
 > ⚠️ **Changement cassant (1.0.139)** : `store_archive_stats(...)` n'accepte plus `changed_during_backup=` / `read_errors=` (`TypeError`) — ces mesures passent par `store_archive_measure(...)` dans `history.db`. Les fonctions `bkp_status`/`repo_stats` (`store_bkp_status_*`, `list_pending_bkp_status*`, `claim_bkp_status*`, `bkp_running`, `bkp_running_state` (1.0.145), `get_running_bkp_status`, `store_repo_stats`, `get_repo_stats`) visent désormais la `history.db` du nick par défaut ; un `db_path` explicite doit être un chemin de `history.db`.
+
+> 1.0.192 : `store_repo_stats(...)` purge toujours les mesures d'avant `STATS_RETENTION_MONTHS`, sauf la plus récente d'entre elles (une par nick) — `repo_history(nick, as_json=True)` l'imprime à part sur stdout (JSON, clé `baseline`, `null` si aucune ; jamais dans `rows`) et rend `None` (rien de retourné).

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.23.1 -->
+<!-- UI_VERSION: 1.24.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -246,6 +246,7 @@
         <h3 style="margin:0 0 8px">Gain Prune</h3>
         <div id="chartPruneGainMsg" class="hint" hidden></div>
         <canvas id="chartPruneGain" height="90"></canvas>
+        <div id="chartPruneGainNote" class="hint" hidden></div>
       </div>
       <div style="margin-bottom:24px">
         <h3 style="margin:0 0 8px">Métriques par archive</h3>
@@ -903,6 +904,107 @@ function _fmtBytes(n){
   return (n<0?'-':'')+v.toFixed(2)+' '+suffixes[i];
 }
 
+// ── Axe temporel réel (UI 1.24.0, story 67 — D035, D040, D050, D197) ──────────
+// Échelle `time` de Chart.js sur les cinq graphiques, avec un adaptateur de dates écrit ici (Date native, aucune
+// dépendance). updated_at (repo_stats, datetime('now') de SQLite) est en UTC, archive_date (borg) en heure locale :
+// chacun lu explicitement, tous affichés en heure locale du navigateur, en ISO (« 2026-10-04 10:46 »).
+// Date illisible -> null : ligne hors de l'axe, jamais d'exception.
+function _parseTs(s,utc){
+  if(typeof s!=='string') return null;
+  const m=s.trim().match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?(Z|[+-]\d{2}:?\d{2})?$/);
+  if(!m) return null;
+  const [y,mo,d,h,mi,se]=m.slice(1,7).map(x=>x===undefined?0:Number(x));
+  const ms=m[7]?Math.floor(Number('0.'+m[7])*1000):0;
+  if(mo<1||mo>12||d<1||d>31||h>23||mi>59||se>59) return null;
+  let t, back;
+  if(utc||m[8]){   // UTC (updated_at), ou décalage écrit dans la date (archive_date d'un borg qui le donne)
+    t=Date.UTC(y,mo-1,d,h,mi,se,ms); back=new Date(t).getUTCDate();
+    if(m[8] && m[8]!=='Z'){ const z=m[8].replace(':',''), off=(Number(z.slice(1,3))*60+Number(z.slice(3,5)))*(z[0]==='-'?-1:1); t-=off*60000; }
+  } else { t=new Date(y,mo-1,d,h,mi,se,ms).getTime(); back=new Date(t).getDate(); }
+  return (isFinite(t) && back===d) ? t : null;   // 31 février : refusé, jamais reporté au mois suivant
+}
+function _fmtTs(t,fmt){
+  const d=new Date(t), p=n=>String(n).padStart(2,'0');
+  const day=d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate()), hm=p(d.getHours())+':'+p(d.getMinutes());
+  switch(fmt){
+    case 'year': return String(d.getFullYear());
+    case 'month': return d.getFullYear()+'-'+p(d.getMonth()+1);
+    case 'day': return day;
+    case 'second': return day+' '+hm+':'+p(d.getSeconds());
+    default: return day+' '+hm;   // minute, heure (graduation sur l'heure pile : « 10:00 »), infobulle
+  }
+}
+// Adaptateur de dates de Chart.js (interface de chartjs-adapter-date-fns), en heure locale du navigateur.
+function _dateAdapter(){
+  const FIXED={millisecond:1,second:1e3,minute:6e4,hour:36e5,day:864e5,week:6048e5};
+  const add=(t,n,unit)=>{
+    const d=new Date(t);
+    switch(unit){
+      case 'millisecond': case 'second': case 'minute': case 'hour': return t+n*FIXED[unit];
+      case 'day': d.setDate(d.getDate()+n); break;
+      case 'week': d.setDate(d.getDate()+7*n); break;
+      case 'month': d.setMonth(d.getMonth()+n); break;
+      case 'quarter': d.setMonth(d.getMonth()+3*n); break;
+      case 'year': d.setFullYear(d.getFullYear()+n); break;
+      default: return t;
+    }
+    return d.getTime();
+  };
+  const startOf=(t,unit,weekday)=>{
+    const d=new Date(t);
+    switch(unit){
+      case 'second': d.setMilliseconds(0); break;
+      case 'minute': d.setSeconds(0,0); break;
+      case 'hour': d.setMinutes(0,0,0); break;
+      case 'day': d.setHours(0,0,0,0); break;
+      case 'week': case 'isoWeek': {   // isoWeek : weekday 1 = lundi … 7 = dimanche (true = lundi) ; week : dimanche
+        const wd=unit==='isoWeek'?(weekday===true?1:Number(weekday)||1)%7:0;
+        d.setHours(0,0,0,0); d.setDate(d.getDate()-((d.getDay()-wd+7)%7)); break;
+      }
+      case 'month': d.setHours(0,0,0,0); d.setDate(1); break;
+      case 'quarter': d.setHours(0,0,0,0); d.setMonth(d.getMonth()-d.getMonth()%3,1); break;
+      case 'year': d.setHours(0,0,0,0); d.setMonth(0,1); break;
+      default: return t;
+    }
+    return d.getTime();
+  };
+  return {
+    formats:()=>({datetime:'minute',millisecond:'second',second:'second',minute:'minute',hour:'minute',
+                  day:'day',week:'day',month:'month',quarter:'month',year:'year'}),
+    parse:v=>v instanceof Date?v.getTime():((typeof v==='number'&&isFinite(v))?v:(typeof v==='string'?_parseTs(v,false):null)),
+    format:(t,fmt)=>_fmtTs(t,fmt),
+    add, startOf,
+    diff:(max,min,unit)=>{
+      if(FIXED[unit]) return (max-min)/FIXED[unit];
+      const a=new Date(max), b=new Date(min), mo=(a.getFullYear()-b.getFullYear())*12+a.getMonth()-b.getMonth();
+      return unit==='quarter'?mo/3:(unit==='year'?mo/12:mo);
+    },
+    endOf:(t,unit)=>add(startOf(t,unit),1,unit)-1
+  };
+}
+let dateAdapterReady=false;
+function _installDateAdapter(){   // Chart peut arriver du CDN de repli après ce script : posé au premier dessin
+  if(dateAdapterReady) return;
+  Chart._adapters._date.override(_dateAdapter());
+  dateAdapterReady=true;
+}
+// Axe X temporel borné aux dates des données ; une seule date : fenêtre d'un jour centrée, une graduation à cette date.
+function _timeAxis(ts,extra){
+  const ax=Object.assign({type:'time',bounds:'data',time:{minUnit:'second'},ticks:{maxRotation:0,autoSkipPadding:12}},extra||{});
+  const u=[...new Set(ts)];
+  if(u.length===1){ ax.min=u[0]-432e5; ax.max=u[0]+432e5; ax.time={unit:'minute'}; ax.ticks={...ax.ticks,source:'data'}; }
+  return ax;
+}
+// Titre d'infobulle : date du point (heure locale ISO), « (supprimée) » pour une archive retirée (pruned).
+function _tsTitle(pts){
+  return items=>{ const p=items.length?pts[items[0].dataIndex]:null;
+    return p ? _fmtTs(p.t)+(p.row.pruned?' (supprimée)':'') : ''; };
+}
+// Lignes datées : {row,t} dans l'ordre des lignes, date illisible écartée.
+function _datedRows(rows,key,utc){
+  return rows.map(row=>({row,t:_parseTs(row[key],utc)})).filter(p=>p.t!==null);
+}
+
 let chartRepoSizeInstance=null, chartPruneGainInstance=null, chartArchiveSizeInstance=null;
 // Graphiques par archive supplémentaires (UI 1.13.0), tous alimentés par les mêmes lignes /archivehistory.
 // UI 1.19.4 : « Taille dédupliquée par archive » retiré — doublon de la série deduplicated_size de chartArchiveSize
@@ -941,6 +1043,7 @@ async function loadCharts(nick){
     document.getElementById(id+'Msg').hidden=false;
     document.getElementById(id).hidden=true;
   });
+  document.getElementById('chartPruneGainNote').hidden=true;
 
   const [repoR,archR]=await Promise.all([
     apiCall('GET','/repohistory',{nick},false),
@@ -953,6 +1056,8 @@ async function loadCharts(nick){
     ['chartRepoSize','chartPruneGain','chartArchiveSize',...ARCHIVE_EXTRA_CHARTS].forEach(id=>_showChartMsg(id+'Msg',id,msg,true));
     return;
   }
+  // UI 1.24.0 : adaptateur de dates de l'axe temporel ; s'il ne peut être posé, chaque graphique le dit (_safeRender)
+  try{ _installDateAdapter(); }catch(e){}
 
   // Chaque graphique finit TOUJOURS dessiné ou remplacé par un message — jamais un indicateur de
   // chargement laissé en place (exception de Chart.js, réponse inattendue...).
@@ -1005,18 +1110,21 @@ function _parseHistoryResponse(r){
   catch(e){ return {error:(r.exitcode!==0&&r.stderr)||('Réponse illisible : '+r.stdout.slice(0,200))}; }
   if(parsed.error) return {error:parsed.error};
   if(!Array.isArray(parsed.rows)) return {error:'Réponse inattendue (pas de champ rows).'};
+  // UI 1.24.0 (borgHelper ≥ 1.0.192) : `baseline` de /repohistory — dernière mesure d'avant la fenêtre, à part (jamais dans rows)
+  const baseline=(parsed.baseline && typeof parsed.baseline==='object' && !Array.isArray(parsed.baseline))?parsed.baseline:null;
   if(r.exitcode===1){   // aucune ligne : l'erreur seule (jamais « aucune statistique ») ; sinon lignes + erreur dite dessous
     const m=_errLine(r.stderr)||r.stderr||'erreur de lecture';
-    return parsed.rows.length?{rows:parsed.rows,partial:m}:{error:m};
+    return parsed.rows.length?{rows:parsed.rows,baseline,partial:m}:{error:m};
   }
-  return {rows:parsed.rows};
+  return {rows:parsed.rows,baseline};
 }
 
 function _renderRepoSizeAndPruneGainCharts(r){
   if(chartRepoSizeInstance){ chartRepoSizeInstance.destroy(); chartRepoSizeInstance=null; }
   if(chartPruneGainInstance){ chartPruneGainInstance.destroy(); chartPruneGainInstance=null; }
+  const note=document.getElementById('chartPruneGainNote'); note.hidden=true; note.textContent='';
 
-  const {rows,error}=_parseHistoryResponse(r);
+  const {rows,baseline,error}=_parseHistoryResponse(r);
   if(error!==undefined){
     const msg=error===null?'Session expirée — reconnectez-vous.':error;
     _showChartMsg('chartRepoSizeMsg','chartRepoSize',msg,true);
@@ -1029,27 +1137,28 @@ function _renderRepoSizeAndPruneGainCharts(r){
     return;
   }
 
-  // Graphique 1 : taille du dépôt dans le temps, un point par événement (bkp/prune)
-  const labels=rows.map(row=>row.updated_at);
+  // Graphique 1 : taille du dépôt dans le temps, un point par événement (bkp/prune/index), placé à sa date
+  // (updated_at en UTC) ; deux lignes à la même date : deux points, aucun perdu.
+  const pts=_datedRows(rows,'updated_at',true);
   // bkp : rond ; prune : triangle rouge ; index (relevé lors d'un Index, borgHelper ≥ 1.0.114) : carré gris
-  const pointColors=rows.map(row=>row.op==='prune'?'#c0392b':(row.op==='index'?'#718096':'#2b6cb0'));
-  const pointStyles=rows.map(row=>row.op==='prune'?'triangle':(row.op==='index'?'rect':'circle'));
+  const pointColors=pts.map(p=>p.row.op==='prune'?'#c0392b':(p.row.op==='index'?'#718096':'#2b6cb0'));
+  const pointStyles=pts.map(p=>p.row.op==='prune'?'triangle':(p.row.op==='index'?'rect':'circle'));
+  const serie=key=>pts.map(p=>({x:p.t,y:p.row[key]}));
   _hideChartMsg('chartRepoSizeMsg','chartRepoSize');
   chartRepoSizeInstance=new Chart(document.getElementById('chartRepoSize'), {
     type:'line',
     data:{
-      labels,
       datasets:[
-        {label:'unique_csize',data:rows.map(row=>row.unique_csize),borderColor:'#2b6cb0',backgroundColor:'#2b6cb0',pointBackgroundColor:pointColors,pointStyle:pointStyles,pointRadius:5,tension:0.1},
-        {label:'total_size',data:rows.map(row=>row.total_size),borderColor:'#1e7d3a',backgroundColor:'#1e7d3a',pointBackgroundColor:pointColors,pointStyle:pointStyles,pointRadius:5,tension:0.1},
-        {label:'total_csize',data:rows.map(row=>row.total_csize),borderColor:'#b8860b',backgroundColor:'#b8860b',pointBackgroundColor:pointColors,pointStyle:pointStyles,pointRadius:5,tension:0.1}
+        {label:'unique_csize',data:serie('unique_csize'),borderColor:'#2b6cb0',backgroundColor:'#2b6cb0',pointBackgroundColor:pointColors,pointStyle:pointStyles,pointRadius:5,tension:0.1},
+        {label:'total_size',data:serie('total_size'),borderColor:'#1e7d3a',backgroundColor:'#1e7d3a',pointBackgroundColor:pointColors,pointStyle:pointStyles,pointRadius:5,tension:0.1},
+        {label:'total_csize',data:serie('total_csize'),borderColor:'#b8860b',backgroundColor:'#b8860b',pointBackgroundColor:pointColors,pointStyle:pointStyles,pointRadius:5,tension:0.1}
       ]
     },
     options:{
       responsive:true,
-      scales:{y:{ticks:{callback:v=>_fmtBytes(v)}}},
-      plugins:{tooltip:{callbacks:{label:ctx=>{
-        const row=rows[ctx.dataIndex];
+      scales:{x:_timeAxis(pts.map(p=>p.t)),y:{ticks:{callback:v=>_fmtBytes(v)}}},
+      plugins:{tooltip:{callbacks:{title:_tsTitle(pts),label:ctx=>{
+        const row=pts[ctx.dataIndex].row;
         return ctx.dataset.label+': '+_fmtBytes(ctx.parsed.y)+' ('+row.op+')';
       }}}}
     }
@@ -1057,40 +1166,54 @@ function _renderRepoSizeAndPruneGainCharts(r){
 
   // Graphique 2 : gain Prune, calculé côté client uniquement à partir des mêmes lignes repohistory
   // (pas de second appel) — pour chaque ligne op='prune', delta = unique_csize de la ligne précédente
-  // moins unique_csize de cette ligne, valeur brute non tronquée.
+  // moins unique_csize de cette ligne, valeur brute non tronquée. Ligne précédente d'une date illisible : sa mesure
+  // compte (seule la ligne est hors de l'axe).
   // Suppose rows déjà trié par ordre croissant de temps (garanti aujourd'hui par ORDER BY id côté
   // serveur, Story 1/2) — sinon rows[i-1] n'est pas le point précédent et le delta est faux.
-  const pruneDeltas=[];
-  for(let i=0;i<rows.length;i++){
-    if(rows[i].op==='prune' && i>0){
-      pruneDeltas.push({label:rows[i].updated_at, delta:rows[i-1].unique_csize-rows[i].unique_csize});
-    }
-  }
-  if(pruneDeltas.length===0){
+  // UI 1.24.0 (story 67, D034, D192) : premier Prune de la fenêtre -> mesure précédente = `baseline` (dernière mesure
+  // d'avant la fenêtre, gardée par borgHelper ≥ 1.0.192) ; sans elle : Prune marqué sans barre, « gain inconnu ».
+  const gains=[], unknown=[];
+  let anyPrune=false;
+  rows.forEach((row,i)=>{
+    if(row.op!=='prune') return;
+    anyPrune=true;
+    const t=_parseTs(row.updated_at,true);
+    if(t===null) return;   // date illisible : hors de l'axe
+    const prev=i>0?rows[i-1]:baseline;
+    if(prev) gains.push({t,row,delta:prev.unique_csize-row.unique_csize});
+    else unknown.push({t,row});
+  });
+  if(!anyPrune){
     _showChartMsg('chartPruneGainMsg','chartPruneGain','Aucun Prune enregistré.',false);
   } else {
+    const UNKNOWN='gain inconnu : aucune mesure précédente';
+    const datasets=[{label:'Gain Prune (unique_csize libéré)',data:gains.map(g=>({x:g.t,y:g.delta})),backgroundColor:'#c0392b',barThickness:8}];
+    // Prune sans mesure antérieure (ni dans rows, ni baseline) : marqué sur l'axe (croix à 0), sans barre chiffrée
+    if(unknown.length) datasets.push({type:'line',label:'Prune ('+UNKNOWN+')',data:unknown.map(u=>({x:u.t,y:0})),
+      borderColor:'#c0392b',backgroundColor:'#c0392b',showLine:false,pointStyle:'crossRot',pointRadius:8,pointBorderWidth:2});
+    const byDs=[gains,unknown];
     _hideChartMsg('chartPruneGainMsg','chartPruneGain');
     chartPruneGainInstance=new Chart(document.getElementById('chartPruneGain'), {
       type:'bar',
-      data:{
-        labels:pruneDeltas.map(d=>d.label),
-        datasets:[{label:'Gain Prune (unique_csize libéré)',data:pruneDeltas.map(d=>d.delta),backgroundColor:'#c0392b'}]
-      },
+      data:{datasets},
       options:{
         responsive:true,
-        scales:{y:{ticks:{callback:v=>_fmtBytes(v)}}},
-        plugins:{tooltip:{callbacks:{label:ctx=>'Gain : '+_fmtBytes(ctx.parsed.y)}}}
+        scales:{x:_timeAxis([...gains,...unknown].map(g=>g.t)),y:{ticks:{callback:v=>_fmtBytes(v)}}},
+        plugins:{tooltip:{callbacks:{
+          title:items=>{ const g=items.length?byDs[items[0].datasetIndex][items[0].dataIndex]:null; return g?_fmtTs(g.t):''; },
+          label:ctx=>ctx.datasetIndex===1?'Prune : '+UNKNOWN:'Gain : '+_fmtBytes(ctx.parsed.y)}}}
       }
     });
+    if(unknown.length){
+      note.textContent=unknown.map(u=>'Prune du '+_fmtTs(u.t)+' : '+UNKNOWN+'.').join(' ');
+      note.hidden=false;
+    }
   }
 }
 
 // Archives supprimées (pruned, borgHelper ≥ 1.0.140) : ligne de graphique figée, gardée STATS_RETENTION_MONTHS
 // après la disparition de l'archive — dessinée atténuée, infobulle suffixée « (supprimée) ».
 function _fadeFor(rows,color){ return rows.map(row=>row.pruned?color+'4D':color); }
-function _prunedTitle(rows){
-  return items=>items.length ? items[0].label+(rows[items[0].dataIndex]&&rows[items[0].dataIndex].pruned?' (supprimée)':'') : '';
-}
 
 function _renderArchiveSizeChart(r){
   if(chartArchiveSizeInstance){ chartArchiveSizeInstance.destroy(); chartArchiveSizeInstance=null; }
@@ -1105,21 +1228,23 @@ function _renderArchiveSizeChart(r){
     return;
   }
 
+  // UI 1.24.0 : chaque archive à sa date (archive_date de borg, heure locale) ; date illisible : hors de l'axe
+  const pts=_datedRows(rows,'archive_date',false), prs=pts.map(p=>p.row);
+  const serie=key=>pts.map(p=>({x:p.t,y:p.row[key]}));
   _hideChartMsg('chartArchiveSizeMsg','chartArchiveSize');
   chartArchiveSizeInstance=new Chart(document.getElementById('chartArchiveSize'), {
     type:'line',
     data:{
-      labels:rows.map(row=>row.archive_date),
       datasets:[
-        {label:'original_size',data:rows.map(row=>row.original_size),borderColor:'#2b6cb0',backgroundColor:'#2b6cb0',pointBackgroundColor:_fadeFor(rows,'#2b6cb0'),pointBorderColor:_fadeFor(rows,'#2b6cb0'),tension:0.1},
-        {label:'compressed_size',data:rows.map(row=>row.compressed_size),borderColor:'#1e7d3a',backgroundColor:'#1e7d3a',pointBackgroundColor:_fadeFor(rows,'#1e7d3a'),pointBorderColor:_fadeFor(rows,'#1e7d3a'),tension:0.1},
-        {label:'deduplicated_size',data:rows.map(row=>row.deduplicated_size),borderColor:'#b8860b',backgroundColor:'#b8860b',pointBackgroundColor:_fadeFor(rows,'#b8860b'),pointBorderColor:_fadeFor(rows,'#b8860b'),tension:0.1}
+        {label:'original_size',data:serie('original_size'),borderColor:'#2b6cb0',backgroundColor:'#2b6cb0',pointBackgroundColor:_fadeFor(prs,'#2b6cb0'),pointBorderColor:_fadeFor(prs,'#2b6cb0'),tension:0.1},
+        {label:'compressed_size',data:serie('compressed_size'),borderColor:'#1e7d3a',backgroundColor:'#1e7d3a',pointBackgroundColor:_fadeFor(prs,'#1e7d3a'),pointBorderColor:_fadeFor(prs,'#1e7d3a'),tension:0.1},
+        {label:'deduplicated_size',data:serie('deduplicated_size'),borderColor:'#b8860b',backgroundColor:'#b8860b',pointBackgroundColor:_fadeFor(prs,'#b8860b'),pointBorderColor:_fadeFor(prs,'#b8860b'),tension:0.1}
       ]
     },
     options:{
       responsive:true,
-      scales:{y:{ticks:{callback:v=>_fmtBytes(v)}}},
-      plugins:{tooltip:{callbacks:{title:_prunedTitle(rows),label:ctx=>ctx.dataset.label+': '+_fmtBytes(ctx.parsed.y)}}}
+      scales:{x:_timeAxis(pts.map(p=>p.t)),y:{ticks:{callback:v=>_fmtBytes(v)}}},
+      plugins:{tooltip:{callbacks:{title:_tsTitle(pts),label:ctx=>ctx.dataset.label+': '+_fmtBytes(ctx.parsed.y)}}}
     }
   });
 }
@@ -1133,30 +1258,35 @@ function _renderArchiveExtraChart(id,r){
     _showChartMsg(id+'Msg',id,error===null?'Session expirée — reconnectez-vous.':error,true);
     return;
   }
-  const labels=rows.map(row=>row.archive_date);
+  // UI 1.24.0 : barres placées à la date de leur archive (heure locale) ; date illisible : hors de l'axe. Barres de largeur
+  // fixe (barThickness 8) : sur un axe temporel, Chart.js les dimensionne sur le plus petit écart (0 px pour deux archives à
+  // 5 s sur un axe d'un mois, toute la largeur pour une seule).
+  const pts=_datedRows(rows,'archive_date',false), prs=pts.map(p=>p.row);
   const num=v=>(v===null||v===undefined)?null:v;
+  const serie=f=>pts.map(p=>({x:p.t,y:num(f(p.row))}));
+  const xAxis=_timeAxis(pts.map(p=>p.t));
   let cfg, empty;
   if(id==='chartFileChanges'){
-    empty=!rows.some(row=>row.files_added!=null||row.files_modified!=null||row.files_removed!=null
+    empty=!prs.some(row=>row.files_added!=null||row.files_modified!=null||row.files_removed!=null
                           ||row.changed_during_backup!=null||row.read_errors!=null);
     cfg={type:'bar',
-      data:{labels,datasets:[
-        {label:'Ajoutés',data:rows.map(row=>num(row.files_added)),backgroundColor:_fadeFor(rows,'#1e7d3a'),stack:'f'},
-        {label:'Modifiés',data:rows.map(row=>num(row.files_modified)),backgroundColor:_fadeFor(rows,'#b8860b'),stack:'f'},
-        {label:'Supprimés',data:rows.map(row=>num(row.files_removed)),backgroundColor:_fadeFor(rows,'#c0392b'),stack:'f'},
+      data:{datasets:[
+        {label:'Ajoutés',data:serie(row=>row.files_added),backgroundColor:_fadeFor(prs,'#1e7d3a'),stack:'f',barThickness:8},
+        {label:'Modifiés',data:serie(row=>row.files_modified),backgroundColor:_fadeFor(prs,'#b8860b'),stack:'f',barThickness:8},
+        {label:'Supprimés',data:serie(row=>row.files_removed),backgroundColor:_fadeFor(prs,'#c0392b'),stack:'f',barThickness:8},
         // Signal de qualité de borg create (borgHelper ≥ 1.0.117), pas un diff : points hors barres.
-        {type:'line',label:'⚠ Modifiés pendant la sauvegarde',data:rows.map(row=>num(row.changed_during_backup)),
-         borderColor:'#6b46c1',backgroundColor:'#6b46c1',pointBackgroundColor:_fadeFor(rows,'#6b46c1'),pointBorderColor:_fadeFor(rows,'#6b46c1'),showLine:false,pointRadius:5,pointStyle:'rectRot',stack:'w1'},
-        {type:'line',label:'⚠ Erreurs de lecture',data:rows.map(row=>num(row.read_errors)),
-         borderColor:'#1a202c',backgroundColor:'#1a202c',pointBackgroundColor:_fadeFor(rows,'#1a202c'),pointBorderColor:_fadeFor(rows,'#1a202c'),showLine:false,pointRadius:6,pointStyle:'crossRot',stack:'w2'}]},
-      options:{responsive:true,scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,ticks:{precision:0}}},
-        plugins:{tooltip:{callbacks:{title:_prunedTitle(rows),label:ctx=>ctx.dataset.label+' : '+(ctx.parsed.y??'—').toLocaleString()+' fichier(s)'}}}}};
+        {type:'line',label:'⚠ Modifiés pendant la sauvegarde',data:serie(row=>row.changed_during_backup),
+         borderColor:'#6b46c1',backgroundColor:'#6b46c1',pointBackgroundColor:_fadeFor(prs,'#6b46c1'),pointBorderColor:_fadeFor(prs,'#6b46c1'),showLine:false,pointRadius:5,pointStyle:'rectRot',stack:'w1'},
+        {type:'line',label:'⚠ Erreurs de lecture',data:serie(row=>row.read_errors),
+         borderColor:'#1a202c',backgroundColor:'#1a202c',pointBackgroundColor:_fadeFor(prs,'#1a202c'),pointBorderColor:_fadeFor(prs,'#1a202c'),showLine:false,pointRadius:6,pointStyle:'crossRot',stack:'w2'}]},
+      options:{responsive:true,scales:{x:{...xAxis,stacked:true},y:{stacked:true,beginAtZero:true,ticks:{precision:0}}},
+        plugins:{tooltip:{callbacks:{title:_tsTitle(pts),label:ctx=>ctx.dataset.label+' : '+(ctx.parsed.y??'—').toLocaleString()+' fichier(s)'}}}}};
   } else if(id==='chartDuration'){
-    empty=!rows.some(row=>row.duration!=null);
+    empty=!prs.some(row=>row.duration!=null);   // lignes datées seules : une valeur hors de l'axe ne se dessine pas
     cfg={type:'bar',
-      data:{labels,datasets:[{label:'Durée',data:rows.map(row=>num(row.duration)),backgroundColor:_fadeFor(rows,'#2b6cb0')}]},
-      options:{responsive:true,scales:{y:{beginAtZero:true,ticks:{callback:v=>_fmtDuration(v)}}},
-        plugins:{tooltip:{callbacks:{title:_prunedTitle(rows),label:ctx=>'Durée : '+_fmtDuration(ctx.parsed.y)}}}}};
+      data:{datasets:[{label:'Durée',data:serie(row=>row.duration),backgroundColor:_fadeFor(prs,'#2b6cb0'),barThickness:8}]},
+      options:{responsive:true,scales:{x:xAxis,y:{beginAtZero:true,ticks:{callback:v=>_fmtDuration(v)}}},
+        plugins:{tooltip:{callbacks:{title:_tsTitle(pts),label:ctx=>'Durée : '+_fmtDuration(ctx.parsed.y)}}}}};
   } else throw new Error('graphique par archive inconnu : '+id);   // jamais dessiné en « Durée » par défaut
   if(empty){
     const what={chartFileChanges:'Aucun comptage de fichiers modifiés enregistré — lancer un Index.',

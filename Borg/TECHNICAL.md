@@ -266,7 +266,12 @@ code 0, pas de `index_pending` ; verrou prioritaire posé pendant les diffs → 
 `get_repo_stats()` lit la dernière ligne par nick (`ORDER BY id DESC LIMIT 1`, jamais un `SELECT` nu sans
 ordre — `updated_at` est à résolution seconde et peut collisionner entre deux événements rapprochés).  
 Purge par ancienneté à chaque écriture (même transaction que l'`INSERT`) : lignes plus vieilles que
-`STATS_RETENTION_MONTHS` (`.borghelperrc`, 13 mois par défaut, surchargeable par nick).  
+`STATS_RETENTION_MONTHS` (`.borghelperrc`, 13 mois par défaut, surchargeable par nick) — **sauf la plus récente d'entre
+elles** (plus grand `id`, 1.0.192, story 67) : `DELETE … WHERE nick=? AND updated_at < borne AND id <> (SELECT id … même
+condition ORDER BY id DESC LIMIT 1)`, une seule instruction (un seul `'now'`). Juste après une écriture, au plus une
+mesure hors fenêtre par nick ; une rétention abaissée (ou le temps qui passe) peut en laisser plusieurs jusqu'à l'écriture
+suivante — `RepoHistory -j` rend alors la plus grande `id` avant la borne. C'est la mesure de base (`baseline`) qui chiffre
+le gain d'un Prune ouvrant la fenêtre.  
 Utilisée par `Report -o` pour alimenter la colonne `taille` sans appel borg (dernière ligne, tout `op`
 confondu).  
 Seules des valeurs brutes renvoyées par borg sont persistées — aucune métrique dérivée (dédup, gain
@@ -276,9 +281,14 @@ Prune) : ces calculs se font à la lecture (graphiques `borgHelperWWW`, hors pé
 `GET /repohistory?nick=<nick>` (route `borgHelperWWW`, RBAC niveau lecture) exposent l'historique
 complet, colonnes brutes, ordonné par `id` croissant : `{'borghelper_version','nick','rows':[{'id',
 'op','unique_csize','total_size','total_csize','updated_at'},...]}`. Gabarit exact de `IdxTop -j` :
-requête directe `SELECT ... FROM repo_stats WHERE nick=? ORDER BY id`, un seul nick à la fois (`nick=a,b`
+lecture bornée à `STATS_RETENTION_MONTHS` (1.0.127) : borne `SELECT datetime('now','-N months')` calculée une fois
+(1.0.192), puis deux requêtes — `rows` : `SELECT id,op,… FROM repo_stats WHERE nick=? AND updated_at >= ? ORDER BY id` ;
+`baseline` : `… AND updated_at < ? ORDER BY id DESC LIMIT 1` —, un seul nick à la fois (`nick=a,b`
 ou `ALL` sur plusieurs nicks rejeté par `usage(cmd)`), `{'error':...}` (jamais une exception) si
-`diff.db` n'existe pas encore. `archive_stats` a son pendant symétrique : `ArchiveHistory -j` /
+`diff.db` n'existe pas encore. Depuis 1.0.192 (story 67) : clé `baseline` en plus, hors `rows` — ligne de plus grande
+`id` avant la borne (même forme qu'une ligne, `null` sinon) ; `rows` (`>=`) et `baseline` (`<`) comparent la même borne :
+jamais une même ligne dans les deux. `updated_at` est en UTC (`datetime('now')`), `archive_date` en heure locale (borg) : l'UI
+(1.24.0) lit chacun explicitement. `archive_stats` a son pendant symétrique : `ArchiveHistory -j` /
 `GET /archivehistory?nick=<nick>`, même `SELECT` que `prep_report_from_db()` (`archive,archive_date,
 duration,original_size,compressed_size,deduplicated_size,nfiles FROM archive_stats WHERE nick=? ORDER BY
 archive_date`). Aucune métrique dérivée dans ces deux commandes/routes — colonnes brutes uniquement, le
@@ -1690,7 +1700,7 @@ clé fait échouer le contrôle. Complété par un contrôle comportemental de `
 ### Rétention et bornage des historiques (1.0.127 / borgHelperWWW 1.26.3)
 
 `STATS_RETENTION_MONTHS` (13 par défaut, par nick) gouverne désormais trois choses : purge de `repo_stats` à
-l'écriture (inchangé) ; **bornage à la lecture** de `RepoHistory` (même borne, pour qu'une valeur abaissée s'applique
+l'écriture (1.0.192 : la plus récente des mesures expirées est gardée, `baseline` de `RepoHistory`) ; **bornage à la lecture** de `RepoHistory` (même borne, pour qu'une valeur abaissée s'applique
 dès l'affichage suivant) et d'`ArchiveHistory` (`archive_date >= strftime('%Y-%m-%dT%H:%M:%S','now','-N months')`,
 format ISO `T` des dates d'archive ; `archive_date` NULL conservé ; départage `ORDER BY archive_date,archive`) ; purge
 de `bkp_status` au démarrage d'un Bkp (`started_at` plus vieux que N mois). **`archive_stats` n'est jamais purgée par

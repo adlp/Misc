@@ -132,7 +132,8 @@ DIFF_KEEP        = 30
 
 # Rétention des historiques, en mois (défaut 13 : une vue annuelle complète pour repérer les motifs
 # saisonniers). Défaut 13 si absent, non numérique ou < 1. S'applique à :
-#  - repo_stats (taille du dépôt dans le temps) : purgé à chaque écriture (fin de Bkp/Prune réel) ;
+#  - repo_stats (taille du dépôt dans le temps) : purgé à chaque écriture (fin de Bkp/Prune réel, relevé d'Index),
+#    sauf la plus récente des mesures expirées (1.0.192) : mesure de base du gain d'un premier Prune ;
 #  - séries des graphiques (RepoHistory/ArchiveHistory, depuis 1.0.127) : bornées à cette durée à
 #    l'affichage — les statistiques par archive restent en base tant que l'archive existe (Report,
 #    Historique complet) ; quand elle disparaît, sa ligne de graphique est figée dans history.db et
@@ -1185,11 +1186,22 @@ borgHelper -c ArchiveHistory -n mon-serveur -j    # historique archive_stats (pa
 | Option | Description |
 |--------|-------------|
 | `-n <nick>` | Un seul nick — jamais `nick=a,b` ni `ALL` sur plusieurs nicks configurés (rejeté, code de sortie non nul) |
-| `-j` | Sortie JSON `{borghelper_version,nick,rows:[...]}` — sans `-j` : message court, pas de crash (mode texte non destiné à un usage interactif élaboré) |
+| `-j` | Sortie JSON `{borghelper_version,nick,rows:[...]}` (`RepoHistory` : `+ baseline`, 1.0.192) — sans `-j` : message court, pas de crash (mode texte non destiné à un usage interactif élaboré) |
 
 `RepoHistory -j` : une ligne par événement `repo_stats` (`id`,`op` (`'bkp'|'prune'|'index'`),`unique_csize`,
-`total_size`,`total_csize`,`updated_at`), ordonnées par `id` croissant. `history.db` sans table `repo_stats` (fichier vide,
+`total_size`,`total_csize`,`updated_at`), ordonnées par `id` croissant. `updated_at` est en **UTC** (`datetime('now')` de
+SQLite), contrairement à `archive_date` d'`ArchiveHistory` (heure locale de borg). `history.db` sans table `repo_stats` (fichier vide,
 en-tête seul, vue seule) : `rows: []` (1.0.176 ; avant : `{"error": … no such table}`).
+Depuis 1.0.192 : `baseline` — dernière mesure d'avant la fenêtre `STATS_RETENTION_MONTHS` (plus grand `id`), même forme
+qu'une ligne de `rows`, **hors** `rows` ; `null` s'il n'y en a pas (aucune mesure, ou toutes dans la fenêtre). La purge à
+l'écriture la garde (une seule par nick). Elle sert à chiffrer le gain d'un Prune qui ouvre la fenêtre (l'UI ne la dessine
+jamais) ; rien n'est calculé côté serveur.
+
+```json
+{"borghelper_version": "1.0.192", "nick": "srv", "rows": [{"id": 9, "op": "prune", "unique_csize": 76324, "total_size": 75000,
+ "total_csize": 75129, "updated_at": "2026-10-09 13:51:55"}],
+ "baseline": {"id": 8, "op": "bkp", "unique_csize": 77444, "total_size": 125000, "total_csize": 125215, "updated_at": "2026-09-08 13:51:49"}}
+```
 
 `ArchiveHistory -j` : une ligne par archive de `archive_stats` (`archive`,`archive_date`,`duration`,
 `original_size`,`compressed_size`,`deduplicated_size`,`nfiles`), ordonnées par `archive_date`.
@@ -2153,6 +2165,16 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
      elle est absente du déploiement (`[WARN]` au démarrage), l'UI se replie sur le CDN
      (`cdn.jsdelivr.net`) ; ni l'une ni l'autre : message à la place des graphiques, le reste de la
      page reste fonctionnel. Même empreinte d'intégrité (SRI) vérifiée dans les deux cas.
+     **Axe temporel réel** (UI ≥ 1.24.0) : sur les cinq graphiques, chaque point ou barre est placé à sa date — l'espacement
+     suit le temps (Bkp à J, J+1, J+10 : écarts de 1 et 9 jours), plus des intervalles égaux par catégorie. Dates en heure
+     locale du navigateur, en ISO : infobulle « 2026-10-04 10:46 », graduations selon l'échelle (« 2026-10-04 »,
+     « 2026-10 », « 2026-10-04 10:00 »). `updated_at` est en UTC, `archive_date` en heure locale de l'hôte de borgHelper,
+     lue dans le fuseau du navigateur : les heures des deux familles de graphiques concordent quand navigateur et hôte
+     partagent le même fuseau (sinon, les dates par archive sont décalées de l'écart entre les deux). Axe borné aux dates des données ; une seule date : un jour centré sur elle. Ligne à date illisible : hors de
+     l'axe, le graphique reste dessiné. Barres de largeur fixe (8 px). Adaptateur de dates écrit dans l'UI : aucune dépendance ni ressource externe en plus.
+     **Premier Prune** (UI ≥ 1.24.0, borgHelper ≥ 1.0.192) : un Prune sans mesure précédente dans la fenêtre a désormais son
+     gain, tiré de `baseline` de `RepoHistory` ; sans aucune mesure antérieure (`baseline` nulle, ou borgHelper plus ancien),
+     il est marqué d'une croix sans barre, infobulle et ligne sous le graphique « gain inconnu : aucune mesure précédente ».
 
 **Icône du site** (borgHelperWWW ≥ 1.22.0) : un fichier `favicon.ico` posé à côté de
 `borgHelperWWW_ui.html` (sinon à côté de `borgHelperWWW`) est servi sur `/favicon.ico`, sans clé API —

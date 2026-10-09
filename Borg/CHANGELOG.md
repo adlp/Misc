@@ -1,5 +1,44 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.192, UI 1.24.0 — Graphiques : axe temporel réel, gain du premier Prune — 2026-10-09
+
+Chantier « reconstruction progressive », story 67 (reports D034, D035, D040, D050, D192, D197 ; décisions de
+l'utilisateur Q1-Q5). Avant : les graphiques de la page Historique avaient un axe X en catégories (intervalles inégaux
+dessinés égaux), des étiquettes brutes décalées de 2 h d'une famille à l'autre (`updated_at` en UTC, `archive_date` en heure
+locale), et le gain d'un Prune dont la mesure précédente était sortie de la fenêtre `STATS_RETENTION_MONTHS` n'était jamais
+dessiné (`pruneDeltas` exigeait une ligne précédente).
+
+- borgHelper 1.0.192 : la purge de `repo_stats` à l'écriture (fin de Bkp/Prune/Index) garde la plus récente des mesures
+  d'avant `STATS_RETENTION_MONTHS` (une seule par nick) ; `RepoHistory -j` la rend à part, clé `baseline` (même forme qu'une
+  ligne, `null` s'il n'y en a pas ; plusieurs mesures anciennes encore là après une rétention abaissée : la plus grande
+  `id` avant la borne), jamais dans `rows` — `rows` inchangé. Borne de la fenêtre calculée une fois par lecture
+  (`rows` et `baseline` jamais d'accord sur une même ligne). Aide de `RepoHistory` complétée. Aucun gain calculé ni stocké
+  côté serveur ; `ArchiveHistory` et borgHelperWWW (relais tel quel) inchangés.
+- UI 1.24.0 : échelle `time` de Chart.js sur les cinq graphiques (taille du dépôt, gain Prune, métriques par archive, fichiers
+  modifiés, durée), points et barres à leur date ; adaptateur de dates écrit dans l'UI (Date native, posé au premier
+  dessin — Chart.js local ou CDN de repli), aucune dépendance ni ressource externe nouvelle. `updated_at` lu en UTC,
+  `archive_date` en heure locale (celle de l'hôte de borgHelper, lue dans le fuseau du navigateur : les heures des deux
+  familles concordent quand navigateur et hôte partagent le même fuseau), tout affiché en heure locale du navigateur, en
+  ISO : infobulle « 2026-10-04 10:46 »
+  (« (supprimée) » gardé), graduations selon l'unité (« 2026-10-04 », « 2026-10 », « 2026-10-04 10:00 »). Axe borné aux
+  dates des données ; une seule date : un jour centré, une graduation à cette date. Barres (durée, fichiers modifiés, gain
+  Prune) de largeur fixe 8 px — sinon dimensionnées sur le plus petit écart (0 px pour deux archives à 5 s sur un axe d'un
+  mois, toute la largeur pour une seule). Graphique par archive vide si seules des lignes à date illisible portent ses
+  valeurs : son message habituel. Date illisible (vide, malformée,
+  31 février) : ligne hors de l'axe, graphique dessiné, jamais d'exception (sa mesure compte encore pour le gain du Prune
+  suivant). Premier Prune de la fenêtre : gain = `baseline.unique_csize - unique_csize du Prune` ; sans aucune mesure
+  antérieure (`baseline` nulle, ou borgHelper < 1.0.192) : Prune marqué d'une croix sans barre, infobulle et ligne sous le
+  graphique « gain inconnu : aucune mesure précédente ». Messages existants (aucune donnée, erreur, données partielles,
+  bibliothèque absente) inchangés.
+- Tests : CodecSelfTest — purge (défaut 13 mois, surcharge par nick : 3 mesures hors fenêtre + 1 écrite -> la plus récente
+  hors fenêtre gardée, autre nick intact), `RepoHistory -j` `baseline` (forme, hors `rows`, `null` sans mesure ancienne ou
+  sans mesure). `borgHelperWWW_ui_test.js` : échelle `time` et adaptateur (formats, startOf/endOf/add/diff), premier Prune
+  (avec base, sans base, ancien serveur), dates illisibles, même `updated_at`, une seule ligne ; vraie Chart.js
+  (`vendor/chartjs`) sur un canvas simulé, fuseau Europe/Paris : réponses réelles capturées (borgHelperWWW, Bkp à J, J+5 s,
+  J+35 s puis Prune ; premier Prune chiffré par `baseline`) -> espacement proportionnel au temps, heures des deux familles
+  concordantes (navigateur et hôte au même fuseau), graduations ISO par unité, barres de 8 px (J, J+5 s, J+30 j ; barre
+  seule). CodecSelfTest : `baseline` = plus grande id avant la borne quand plusieurs mesures anciennes restent.
+
 ## borgHelperWWW 1.31.9, borgHelper 1.0.191 — Commande arrêtée par borgHelperWWW : dossiers _MEI* de borg retirés à l'arrêt — 2026-10-08
 
 Chantier « reconstruction progressive », story 65 (F334, décision de l'utilisateur). Avant : une commande arrêtée par
