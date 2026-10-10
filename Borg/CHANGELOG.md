@@ -1,5 +1,52 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.31.10 — Journal des téléchargements : une ligne à la fin réelle, issue dite — 2026-10-10
+
+Chantier « reconstruction progressive », story 71 (reports D143, D146 ; décisions de l'utilisateur Q1 = A, Q2 = A). Avant : la
+ligne `[req]` était écrite au retour de `call_next`, avant l'envoi du corps — mesuré sur serveur réel (bac à sable `s71`, fichier
+de 60 Mo) : téléchargement complet, abandonné par le client ou coupé par borg tué, toujours `[req] … 200 ~1000ms` (durée de
+l'en-tête, jamais celle du transfert) ; client parti avant la réponse : `[req] … 500` et une trace complète
+`RuntimeError: No response returned.` (BaseHTTPMiddleware, Starlette 0.18).
+
+- `/download/*` : la ligne `[req]` est écrite UNE fois, à la fin réelle du transfert, durée totale ; issue en fin de ligne
+  quand le flux n'est pas complet : ` (flux coupé)` (borg en échec en cours d'envoi, chien de garde d'inactivité — borg
+  arrêté, ou données restées non lues —, arrêt du serveur pendant l'envoi, erreur inattendue pendant l'envoi) ou
+  ` (client parti)` (abandon, et issue par défaut d'un transfert non fini qu'aucune autre règle ne classe). Complet : forme
+  inchangée. Lignes `[ERREUR]` / `[WARN]` du téléchargement inchangées, sauf l'erreur inattendue du corps et les données non
+  lues (voir Revue) ; quand le corps constate l'échec, son `[ERREUR]` vient avant la ligne `[req]` (chien de garde
+  d'inactivité, `[WARN]` d'abandon : ordre non garanti) ; elle arrive tard pour un client qui cesse de lire et manque si le
+  processus est tué avant, ou si la requête est annulée entre la route et la réponse. Derrière nginx en HTTP/1.0 (A85), le
+  client peut toujours voir un flux coupé comme complet.
+- Revue : erreur inattendue du corps après l'en-tête (lecture) -> flux coupé, fin de transfert retenue, `[ERREUR] <borg> :
+  erreur pendant l'envoi (<exception>) — téléchargement interrompu (flux coupé)` à la place du `[WARN]` d'abandon (avant :
+  fin envoyée, fichier tronqué tenu pour complet, « (client parti) », cause jamais dite sous Starlette 0.18) ; tube fermé par
+  le chien de garde avec des octets non lus (borg fini, client arrêté `TIMEOUT` s) -> flux coupé, fin retenue, `[ERREUR]
+  <borg> : téléchargement plus lu depuis <n> s — flux coupé` (avant : tronqué, fin envoyée, journalisé complet) — EOF seul restant : complet, le tube n'est plus relu après l'EOF ; tâche annulée
+  pendant un arrêt du serveur -> « (flux coupé) » (arrêt demandé sans annulation : complet ou client parti, selon le cas) ;
+  erreur de la sonde de l'en-tête, ou de celle du chemin 499 de Starlette 0.18, = client présent (jamais un téléchargement
+  cassé pour le journal ; `RuntimeError` d'origine relancée).
+- Client parti avant la réponse : `[req] … 499 <durée>ms (client parti avant la réponse)`, aucune trace, sur les deux piles —
+  Starlette 0.18 : `RuntimeError` de Starlette lui-même ET client parti ; Starlette 1.7 (pas d'erreur : l'en-tête est produit
+  puis ignoré par uvicorn, mesuré `200 … (client parti)` sans cette sonde) : client déjà parti au relais de l'en-tête. Une
+  exception de l'application (même au texte « No response returned. ») ou une application sans réponse, client présent :
+  500 et trace, comme avant.
+- Inchangés : routes non diffusées (ligne écrite à la réponse, même forme), 403 de `require_user`, chemins masqués, codes
+  HTTP envoyés, fin de transfert retenue d'un flux coupé (`_AbortableResponse`).
+- Push selftest : contrôle bout en bout par la vraie application, une ligne de la matrice par cas (complet, client parti
+  — deux variantes —, borg tué, client parti avant la réponse, route JSON, exception de l'application, RuntimeError de
+  l'application au même texte, application sans réponse), plus les cas des revues (refus 502/404 avant le corps, erreur du
+  corps, arrêt demandé avec ou sans annulation, tube fermé avec ou sans octets non lus, petit fichier, complet en code 1,
+  sonde en erreur ou vraie, priorités de l'issue, exception hors envoi).
+- Mesuré (serveur réel, bac à sable `s71`, `mesure.py`, 60 Mo, deux piles 3.10 / Starlette 0.18 et 3.14 / Starlette 1.7) :
+  complet `200 1469ms` / `200 1445ms` ; client parti après 3 s `200 3009ms (client parti)` / `200 3006ms (client parti)` ;
+  borg tué `200 50818ms (flux coupé)` / `200 52616ms (flux coupé)` (`[ERREUR]` inchangé) ; client parti avant la réponse
+  `499 1043ms (client parti avant la réponse)` / `499 1021ms (…)`, aucune trace (mesure faite avant les corrections de revue ;
+  remesuré après les trois revues, 3.10 : `200 1377ms`, `200 3008ms (client parti)`, `200 51915ms (flux coupé)`,
+  `499 1062ms (client parti avant la réponse)`, aucune trace).
+  Avant (3.10) : `200 990ms`, `200 1046ms`,
+  `200 1036ms`, `500 1038ms` + trace ; 3.14 sans la sonde de l'en-tête : `200 1037ms (client parti)` pour le dernier cas.
+  Push selftest 133/133 (3.10 et 3.14).
+
 ## UI 1.24.1 — Explorateur : refus 403 et JSON illisible dits clairement — 2026-10-10
 
 Chantier « reconstruction progressive », story 70 (report D154 ; décision de l'utilisateur Q1 = B). Avant : un refus de

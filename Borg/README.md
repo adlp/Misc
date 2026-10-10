@@ -2002,11 +2002,37 @@ borgHelperWWW lui-même (plus le journal d'accès d'uvicorn, désactivé en exé
 
 ```
 [req] 203.0.113.9 alice@example.org "POST /api/login?servername=x&repo=u@h:r&repo_passphrase=***" 200 213ms
-       │           │                  │                                                         │   └ durée
+       │           │                  │                                                         │   └ durée (suivie d'une issue pour un téléchargement, voir plus bas)
+       │           │                  │                                                         └ statut (499 : client parti avant la réponse)
        │           │                  └ requête — paramètres sensibles masqués (passphrase, clé, secret, token)
        │           └ utilisateur (header BORGHELPERWWW_USER_HEADER), « - » si absent/non configuré
        └ IP du navigateur
 ```
+
+**Téléchargements** (`/download/*`, borgHelperWWW ≥ 1.31.10) : la ligne est écrite à la **fin réelle du transfert** — durée
+totale, pas celle de l'en-tête — et dit l'issue quand le flux n'est pas complet. Autres routes : ligne écrite à la réponse,
+comme avant.
+
+```
+[req] 127.0.0.1 - "GET /api/download/file?nick=dl&path=d/gros.bin" 200 61234ms
+[req] 127.0.0.1 - "GET /api/download/file?nick=dl&path=d/gros.bin" 200 3021ms (client parti)
+[req] 127.0.0.1 - "GET /api/download/file?nick=dl&path=d/gros.bin" 200 3044ms (flux coupé)
+[req] 127.0.0.1 - "GET /api/download/file?nick=dl&path=d/gros.bin" 499 1012ms (client parti avant la réponse)
+```
+
+| Fin de ligne | Signification |
+|---|---|
+| (rien) | téléchargement complet |
+| ` (client parti)` | le client a fermé la connexion en cours de transfert ; c'est aussi l'issue par défaut d'un transfert non fini qu'aucune autre règle ne classe |
+| ` (flux coupé)` | borg en échec en cours d'envoi, chien de garde d'inactivité (borg arrêté, ou données restées non lues), arrêt du serveur pendant l'envoi, erreur inattendue pendant l'envoi — fin de transfert jamais envoyée |
+| ` (client parti avant la réponse)`, statut 499 | client parti avant l'en-tête : rien envoyé, aucune trace (avant 1.31.10 : sous Starlette 0.18 `500` et une trace `RuntimeError: No response returned.` ; sous 1.7 `200 …`). Le départ est sondé au relais de l'en-tête : la sonde peut consommer un `http.disconnect`, qu'uvicorn (seul serveur pris en charge) redonne à chaque lecture |
+
+Ordre et moment : quand le corps du téléchargement constate l'échec de borg (ou une erreur pendant l'envoi), son `[ERREUR]`
+vient AVANT la ligne `[req]` ; pour les autres lignes du même téléchargement (`[ERREUR]` du chien de garde d'inactivité,
+`[WARN]` d'abandon), l'ordre n'est pas garanti. La ligne arrive tard pour un client qui cesse de lire (jusqu'au chien de
+garde) ; elle manque si le processus est tué avant la fin du transfert, ou si la requête est annulée entre la fin de la route
+et le début de la réponse. Derrière nginx en HTTP/1.0 (sans
+`proxy_http_version 1.1`), le client peut toujours voir un flux coupé comme complet, même si la ligne dit ` (flux coupé)`.
 
 **IP du navigateur** : si la connexion vient d'un reverse proxy listé dans
 `BORGHELPERWWW_TRUSTED_PROXIES` / `--trusted-proxies` / `trusted_proxies` (IP ou CIDR séparés par des

@@ -4199,8 +4199,10 @@ aucune sauvegarde » (rappel). `push_selftest` 63/63 ; essai réel (démo, `MAX_
 notification reçue et déchiffrée sur ~5 passages du watcher, aucun doublon.
 
 **Journal des requêtes, identité, IP du navigateur (1.25.0)** : middleware HTTP
-`_access_log_and_user_guard`, une ligne `[req] <ip> <user|-> "<méthode> <chemin>" <statut> <ms>ms` par
-requête (dans un `finally` : statut 500 journalisé si une exception remonte). IP : `_client_ip(peer,
+`_access_log_and_user_guard`, une ligne `[req] <ip> <user|-> "<méthode> <chemin>" <statut> <ms>ms[ (<issue>)]` par
+requête (dans un `finally` : statut 500 journalisé si une exception remonte ; WWW 1.31.10 : issue ` (flux coupé)` / ` (client
+parti)` des seuls téléchargements, écrite à la fin du transfert, et statut 499 ` (client parti avant la réponse)` — voir
+plus bas). IP : `_client_ip(peer,
 xff, nets)` — `X-Forwarded-For` n'est lu que si l'IP de connexion est dans `_TRUSTED_PROXY_NETS`
 (`_parse_trusted_proxies`, IP/CIDR via `ipaddress`, `*` = toutes, entrée invalide → refus de démarrer),
 parcouru de droite à gauche en sautant les proxies de confiance. Lu par borgHelperWWW lui-même :
@@ -4214,6 +4216,36 @@ sauf `/healthz` ; `REQUIRE_USER` sans `USER_HEADER` → refus de démarrer. Pré
 (`_prefs_entry`), écrit par `POST` (conservé si absent au réabonnement) et `PATCH`, exposé dans les
 réponses `/push/*`. `push_selftest` 69/69 ; essai réel dans les deux modes de lancement (403 sans
 identité, `/healthz` 200, IP `X-Forwarded-For` et utilisateur journalisés, passphrase masquée).
+
+**Ligne `[req]` des téléchargements (WWW 1.31.10, story 71, D143/D146)** : `_borg_stream` pose `request.state.stream_log` quand il
+rend un corps (un refus avant le corps, 404/502, garde la ligne ordinaire). La ligne n'est alors pas écrite dans le `finally`
+du middleware mais par `_AbortableResponse(resp, log=…, gone=request.is_disconnected)`, une seule fois, à la fin de son envoi,
+avec la durée totale. Issue, dans cet ordre de priorité :
+1. avant la réponse — client déjà parti au relais de `http.response.start` (sonde `gone`) : statut 499,
+   ` (client parti avant la réponse)` ;
+2. flux coupé — `stream_aborted` posé par le corps : borg en échec (code ≥ 2 ou signal), chien de garde (borg arrêté, ou tube
+   fermé avec des octets non lus : `st['cut']`, mesuré par FIONREAD à la fermeture, avec `[ERREUR] <what> : téléchargement plus
+   lu depuis <n> s — flux coupé` si borg était sorti seul), erreur inattendue du corps (posé avant de relancer, avec un
+   `[ERREUR]` qui en dit la cause) : ` (flux coupé)` ;
+3. tâche annulée (`CancelledError`) pendant un arrêt du serveur (`_STOPPING`), transfert non fini : ` (flux coupé)` — un arrêt
+   demandé sans annulation suit les règles ordinaires ;
+4. envoi qui lève : ` (client parti)` ;
+5. autre exception : ` (flux coupé)` ;
+6. fin non atteinte — fin de transfert non envoyée, ou corps sans `stream_done` (posé quand borg est lu jusqu'à l'EOF ; sous
+   Starlette 1.7 le middleware envoie la fin de transfert même après le départ du client, uvicorn l'ignore) : ` (client parti)` ;
+7. complet : rien.
+
+Le corps ne relit jamais le tube après l'EOF (`st['eof']`). La sonde `gone` est un receive annulé aussitôt : sans perte pour un
+GET sans corps ; un `http.disconnect` consommé est redonné par uvicorn à chaque receive ; toute erreur de la sonde vaut « client
+présent » (au chemin 499 de 0.18 : `RuntimeError` d'origine relancée). Ordre : un `[ERREUR]` écrit par le corps (borg en
+échec, erreur d'envoi, données non lues) précède la ligne `[req]` ; celui du chien de garde d'inactivité (autre fil) et le
+`[WARN]` d'abandon, non garanti. Ligne absente si le processus est tué avant la fin, ou si la tâche est annulée entre
+`call_next` et la réponse. Client parti avant la réponse sous Starlette 0.18 : la `StreamingResponse` interne est annulée avant son en-tête et
+`call_next` lève `RuntimeError("No response returned.")` lui-même (`_no_response_raised` : texte exact et dernier cadre
+`call_next` de `starlette/middleware/base.py`) ; si en plus `request.is_disconnected()`, le middleware rend `_NoResponse`
+(statut 499, n'envoie rien) et la même ligne ; sinon l'exception est relancée (500 et trace, inchangé), de même qu'une
+exception de l'application au même texte. Sous 1.7 il n'y a pas d'erreur : l'en-tête est produit puis relayé à un uvicorn qui
+a perdu la connexion, d'où la sonde (mesuré sur serveur réel, les deux piles).
 
 **Fichiers statiques (1.22.0)** : `/static/chart.umd.min.js` — `vendor/chartjs/chart.umd.min.js` lu
 une fois au démarrage (`_CHARTJS`, `[WARN]` si absent → 404), `Cache-Control: public, max-age=86400` ;

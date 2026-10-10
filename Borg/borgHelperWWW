@@ -77,7 +77,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.31.9"
+WWW_VERSION="1.31.10"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -851,14 +851,62 @@ app.router.route_class=_ExitGuardRoute  # avant toute déclaration @app.get (1.2
 class _AbortableResponse:
     """1.30.2 (story 40, A83) : réponse relayée par le middleware ; si le corps a posé `request.state.stream_aborted` (borg en
     échec pendant un téléchargement), le dernier message de corps (fin de transfert) n'est jamais envoyé — uvicorn ferme la
-    connexion sur une réponse incomplète et le client voit une erreur."""
-    def __init__(self,resp): self.resp=resp; self.status_code=resp.status_code
+    connexion sur une réponse incomplète et le client voit une erreur.
+    1.31.10 (story 71, D143, décision de l'utilisateur) : `log` (réponse en flux, `request.state.stream_log` posé par
+    _borg_stream) -> appelé UNE fois à la fin réelle de l'envoi avec l'issue : « (flux coupé) » (stream_aborted, ou exception
+    hors envoi), « (client parti) » (envoi qui lève, fin de transfert non envoyée, ou corps jamais arrivé à sa fin —
+    `stream_done` absent : sous starlette 1.7 le middleware envoie la fin de transfert même après le départ du client, à
+    uvicorn qui l'ignore), « » (complet) ; tâche annulée pendant un arrêt du serveur (_STOPPING) avant la fin : « (flux coupé) »
+    (arrêt demandé sans annulation : règles ordinaires). Ordre : avant la réponse, flux coupé, annulée à l'arrêt, envoi qui
+    lève, autre exception, fin non atteinte, complet. `gone` (Request.is_disconnected du middleware) : client déjà parti quand l'en-tête est
+    relayé (starlette 1.7 : l'en-tête est produit, uvicorn l'ignore — mesuré, s71) -> statut 499, « (client parti avant la
+    réponse) », comme le chemin RuntimeError de starlette 0.18 ; en-tête relayé tel quel. Sonde par un receive annulé aussitôt :
+    une requête GET sans corps (/download/*) n'y perd rien."""
+    def __init__(self,resp,log=None,gone=None): self.resp=resp; self.status_code=resp.status_code; self.log=log; self.gone=gone
     async def __call__(self,scope,receive,send):
+        fin=[False]; send_err=[False]; before=[False]
         async def send_w(msg):
-            if (msg.get('type')=='http.response.body' and not msg.get('more_body',False)
-                    and (scope.get('state') or {}).get('stream_aborted')): return
-            await send(msg)
-        await self.resp(scope,receive,send_w)
+            if msg.get('type')=='http.response.start' and self.gone is not None:
+                # sonde (revue story 71) : toute erreur = « pas parti » — jamais un téléchargement sain cassé pour une ligne de
+                # journal. Elle peut consommer un http.disconnect : sans perte, uvicorn le redonne à chaque receive suivant
+                try: before[0]=bool(await self.gone())
+                except Exception: before[0]=False
+            last=msg.get('type')=='http.response.body' and not msg.get('more_body',False)
+            if last and (scope.get('state') or {}).get('stream_aborted'): return
+            try: await send(msg)
+            except BaseException: send_err[0]=True; raise
+            if last: fin[0]=True
+        if self.log is None: return await self.resp(scope,receive,send_w)
+        failed=False; cancelled=False
+        try: await self.resp(scope,receive,send_w)
+        except asyncio.CancelledError: cancelled=True; raise   # revue story 71 : seule une annulation réelle vaut arrêt
+        except Exception: failed=True; raise
+        finally:
+            stt=scope.get('state') or {}; status=self.status_code
+            if before[0]: status=499; issue=' (client parti avant la réponse)'
+            elif stt.get('stream_aborted'): issue=' (flux coupé)'
+            elif cancelled and _STOPPING[0] and not (fin[0] and stt.get('stream_done')): issue=' (flux coupé)'   # arrêt : tâche annulée
+            elif send_err[0]: issue=' (client parti)'
+            elif failed: issue=' (flux coupé)'
+            elif not (fin[0] and stt.get('stream_done')): issue=' (client parti)'
+            else: issue=''
+            self.log(status,issue)
+
+class _NoResponse:
+    """1.31.10 (story 71, D146) : client parti avant la réponse — rien à envoyer (uvicorn ignore tout envoi après la perte de
+    connexion) ; statut journalisé 499."""
+    status_code=499
+    async def __call__(self,scope,receive,send): return
+
+def _no_response_raised(x):
+    """1.31.10 (story 71, D146) : RuntimeError « No response returned. » levée par call_next de BaseHTTPMiddleware LUI-MÊME
+    (application finie sans réponse) — jamais une exception de l'application au même texte (relancée telle quelle par call_next,
+    sa trace descend dans l'application)."""
+    if type(x) is not RuntimeError or str(x)!='No response returned.': return False
+    tb=x.__traceback__
+    while tb is not None and tb.tb_next is not None: tb=tb.tb_next
+    return (tb is not None and tb.tb_frame.f_code.co_name=='call_next'
+            and tb.tb_frame.f_code.co_filename.replace(os.sep,'/').endswith('starlette/middleware/base.py'))
 
 # 1.31.0 (story 41, A85, décision de l'utilisateur) : requête reçue en HTTP/1.0 (nginx sans `proxy_http_version 1.1`) -> une
 # ligne [WARN] par processus : un /download/* coupé (borg en échec en cours d'envoi) y passe pour complet. /version renvoie aussi
@@ -879,18 +927,35 @@ async def _access_log_and_user_guard(request: Request, call_next):
     user=_request_user(request)
     ip=_client_ip(request.client.host if request.client else None,
                   request.headers.get('x-forwarded-for'),_TRUSTED_PROXY_NETS)
-    status=500
+    status=500; issue=''; deferred=False
+    def line(status,issue=''):
+        print(f"[req] {ip} {user or '-'} \"{request.method} {_loggable_path(request.url.path,request.url.query)}\" "
+              f"{status} {int((time.monotonic()-t0)*1000)}ms{issue}",file=sys.stderr,flush=True)
     try:
         if REQUIRE_USER and user is None and request.url.path!='/healthz':
             response=JSONResponse(status_code=403,content={'detail':
                 f"Identité utilisateur absente (header {USER_HEADER}) — accès refusé (require_user)"})
         else:
-            response=_AbortableResponse(await call_next(request))   # 1.30.2 (A83) : flux coupé possible
+            try: inner=await call_next(request)
+            except RuntimeError as x:
+                # 1.31.10 (story 71, D146, décision de l'utilisateur) : client parti avant la réponse (StreamingResponse annulée
+                # avant son en-tête) -> 499, aucune trace ; application sans réponse, client présent : 500 et trace (inchangé)
+                if not _no_response_raised(x): raise
+                try: gone=await request.is_disconnected()
+                except Exception: gone=False   # revue story 71 : sonde en erreur = client présent, RuntimeError d'origine relancée
+                if not gone: raise
+                status=499; issue=' (client parti avant la réponse)'
+                return _NoResponse()
+            if (request.scope.get('state') or {}).get('stream_log'):
+                # 1.31.10 (story 71, D143, décision de l'utilisateur) : flux (/download/*) -> ligne écrite à la fin réelle du
+                # transfert (durée totale, issue), par _AbortableResponse
+                deferred=True
+                response=_AbortableResponse(inner,log=line,gone=request.is_disconnected)
+            else: response=_AbortableResponse(inner)   # 1.30.2 (A83) : flux coupé possible
         status=response.status_code
         return response
     finally:
-        print(f"[req] {ip} {user or '-'} \"{request.method} {_loggable_path(request.url.path,request.url.query)}\" "
-              f"{status} {int((time.monotonic()-t0)*1000)}ms",file=sys.stderr,flush=True)
+        if not deferred: line(status,issue)
 
 _bkp_watcher_task=None
 
@@ -2943,17 +3008,28 @@ def _borg_stream(request,cmd,env,what,decoy=None,path=None,missing=None):
                               file=sys.stderr,flush=True)
                     if not st.get('reading'): _borg_reap(proc,st); _close_pipes(); return
             elif time.monotonic()-st['last']>=(lim or 3600) and not st.get('reading'):
+                st['cut_after']=lim or 3600   # délai dit par le corps si des octets restaient non lus (st['cut'])
                 _borg_reap(proc,st); _close_pipes(); return
             time.sleep(min(5.0,max(0.1,(lim or 50)/20)))
     def _close_pipes():
+        # 1.31.10 (revue story 71) : octets encore non lus dans le tube à sa fermeture -> flux tronqué (« cut ») ; rien (EOF seul
+        # restant) -> intact. FIONREAD suffit : read1 du BufferedReader lit sans tampon intermédiaire. Mesure impossible -> coupé
+        # (jamais un fichier tronqué tenu pour complet).
+        try:
+            import fcntl,termios,array
+            n=array.array('i',[0]); fcntl.ioctl(proc.stdout.fileno(),termios.FIONREAD,n,True); st['cut']=n[0]>0
+        except Exception: st['cut']=True
         for f in (proc.stdout,proc.stderr):
             try: f.close()
             except Exception: pass
     threading.Thread(target=_watchdog,daemon=True).start()
     def _rd(n=65536):
+        if st.get('eof'): return b''   # 1.31.10 (revue story 71) : jamais relu après l'EOF (tube peut-être fermé depuis)
         st['reading']=True   # lecture en cours : le chien de garde ne ferme jamais un tube qu'un fil lit
-        try: c=proc.stdout.read1(n)
-        except ValueError: c=b''   # tube fermé par le chien de garde (corps lu trop tard)
+        try:
+            c=proc.stdout.read1(n)
+            if not c: st['eof']=True
+        except ValueError: c=b''   # tube fermé par le chien de garde (corps lu trop tard) ; tronqué ou non : st['cut']
         finally: st['reading']=False
         st['last']=time.monotonic()   # octet lu, ou fin de sortie : le délai repart (borg qui tarde à sortir après l'EOF)
         return c
@@ -3016,9 +3092,9 @@ def _borg_stream(request,cmd,env,what,decoy=None,path=None,missing=None):
         # run_in_executor, annulables ; run_in_threadpool (anyio.to_thread) attend la fin du fil même annulé — le départ du
         # client n'était traité qu'à la prochaine sortie de borg. Fil abandonné : rend la main à la fin de borg (EOF). Exécuteur
         # dédié (revue : celui d'asyncio, min(32, CPU+4) fils partagés, réduisait les lectures simultanées — avant : 40, anyio).
-        loop=asyncio.get_running_loop(); pool=_borg_read_pool()
-        done=False
+        done=False; failed=False
         try:
+            loop=asyncio.get_running_loop(); pool=_borg_read_pool()
             if first: yield first
             while True:
                 chunk=await loop.run_in_executor(pool,_rd)
@@ -3026,16 +3102,29 @@ def _borg_stream(request,cmd,env,what,decoy=None,path=None,missing=None):
                 yield chunk
             await loop.run_in_executor(pool,proc.wait)
             done=True
+            # 1.31.10 (story 71) : corps lu jusqu'au bout (issue de la ligne [req]) ; tube fermé par le chien de garde avec des
+            # octets non lus (borg fini, client arrêté TIMEOUT s) : tronqué -> flux coupé (revue : passait pour complet, fin envoyée)
+            if st.get('cut'):
+                request.state.stream_aborted=True
+                if proc.returncode in (0,1):   # borg fini seul (tué : la ligne [ERREUR] du chien de garde ou ci-dessous suffit)
+                    print(f"[ERREUR] {what} : téléchargement plus lu depuis {st.get('cut_after',TIMEOUT)} s — flux coupé",file=sys.stderr,flush=True)
+            else: request.state.stream_done=True
             if proc.returncode not in (0,1):
                 if st['why']!='idle':   # chien de garde : sa ligne [ERREUR] est déjà au journal
                     print(f"[ERREUR] {what} a échoué en cours d'envoi : {cause()} — téléchargement interrompu (flux coupé)",file=sys.stderr,flush=True)
                 request.state.stream_aborted=True
             elif proc.returncode==1: print(f"[WARN] {what} (téléchargement) : {cause()}",file=sys.stderr,flush=True)
-        finally: end(done)
-    def end(done):
+        except Exception as x:
+            # 1.31.10 (revue story 71) : erreur inattendue (lecture) -> fin retenue, flux coupé, cause au journal (jamais le
+            # [WARN] d'abandon : sous starlette 0.18 l'exception n'est dite nulle part ailleurs)
+            request.state.stream_aborted=True; failed=True
+            print(f"[ERREUR] {what} : erreur pendant l'envoi ({x!r}) — téléchargement interrompu (flux coupé)",file=sys.stderr,flush=True)
+            raise
+        finally: end(done,failed)
+    def end(done,failed=False):
         st['ended']=True
         if not done and proc.poll() is None:
-            print(f"[WARN] {what} : téléchargement abandonné par le client — borg arrêté",file=sys.stderr,flush=True)
+            if not failed: print(f"[WARN] {what} : téléchargement abandonné par le client — borg arrêté",file=sys.stderr,flush=True)
             st['why']=st['why'] or 'client'   # _MEI* du borg tué retirés (_borg_reap)
         stop()
     gen=body()
@@ -3048,6 +3137,7 @@ def _borg_stream(request,cmd,env,what,decoy=None,path=None,missing=None):
         async def aclose(self):
             await gen.aclose()
             if not st.get('ended'): end(False)
+    request.state.stream_log=True   # 1.31.10 (story 71, D143) : réponse en flux — ligne [req] à la fin réelle (_AbortableResponse)
     return _Body()
 
 # ── Story 2.1 : réponses synthétiques "introuvable" (hors périmètre) ───────────────────────────
@@ -5588,6 +5678,234 @@ def push_selftest():
                     if not ok: print(f"  {out}")
                     return ok
                 check("/download/* : client parti (envoi bloqué puis déconnexion ; envoi qui lève ; borg muet ; avant le 1er envoi) -> borg arrêté sans attendre le ramasse-miettes (1.31.6)",_download_client_gone_e2e)
+                def _req_line_e2e():
+                    """1.31.10 (story 71, D143/D146, décisions de l'utilisateur ; mesuré sur serveur réel, bac à sable s71 : ligne [req]
+                    écrite au retour de call_next — « 200 ~1000ms », durée de l'en-tête — pour un téléchargement complet, abandonné ou
+                    coupé ; client parti avant la réponse : « 500 » et trace « RuntimeError: No response returned. ») : bout en bout par
+                    la VRAIE application (middleware, route, _borg_stream), stderr capturé, borg factice. UNE ligne [req] par cas :
+                    complet (borg muet 1 s au milieu) -> « 200 Nms », N >= 900, écrite APRÈS le premier envoi, fin de transfert
+                    envoyée ; client parti en cours (socket pleine puis déconnexion ; ASGI 2.4 : envoi qui lève) -> « 200 Nms (client
+                    parti) », [WARN] d'abandon inchangé ; borg tué en cours -> « 200 Nms (flux coupé) », [ERREUR] inchangée, fin de
+                    transfert retenue ; client parti avant la réponse -> « 499 Nms (client parti avant la réponse) », rien envoyé,
+                    aucune exception ni trace (starlette 0.18 : RuntimeError de call_next ; 1.7 : en-tête produit, client déjà
+                    parti à son relais — mesuré sur serveur réel, les deux piles) ; route JSON (/version) -> « 200 Nms », écrite AVANT le premier envoi (moment inchangé) ;
+                    exception de l'application -> « 500 », 500 envoyé, exception relancée (trace) — aussi une RuntimeError de
+                    l'application au texte « No response returned. », client parti (jamais un 499) ; application sans réponse,
+                    client présent -> « 500 », RuntimeError relancée (inchangé). Revue story 71 : refus avant le corps (502 code 2,
+                    404 « never matched ») -> une ligne sans issue ; erreur inattendue du corps après l'en-tête, arrêt du serveur
+                    (tâche annulée) et tube fermé par le chien de garde (données non lues) -> « (flux coupé) », jamais complet ; 499
+                    par le mécanisme de la pile (0.18 : _NoResponse ; autre : l'un ou l'autre). 2e revue : tube fermé avec l'EOF seul
+                    restant (gros fichier lu, petit fichier) -> complet ; arrêt demandé sans annulation -> règles ordinaires (complet,
+                    client parti) ; erreur du corps -> [ERREUR] avec sa cause, jamais le [WARN] d'abandon ; [ERREUR] d'un borg tué AVANT
+                    [req] ; _AbortableResponse seul : sonde en erreur = client présent, exception hors envoi = flux coupé. 3e revue :
+                    complet en code 1 (avertissement) -> sans issue, [WARN] ; tube fermé avec octets non lus -> une ligne [ERREUR]
+                    « plus lu depuis » ; priorités (sonde vraie -> 499 en-tête relayé, avant la réponse > flux coupé, envoi qui
+                    lève > exception hors envoi). Registre de borg vide après chaque cas."""
+                    fbs={}
+                    def mkfb(name,code):
+                        f=os.path.join(tmpdir,f'fb71-{name}.py')
+                        with open(f+'.tmp','w') as fh:
+                            fh.write(f"#!{sys.executable}\nimport os,sys,signal,time\nsignal.signal(signal.SIGTERM,lambda *a: sys.exit(143))\n{code}\n")
+                        os.chmod(f+'.tmp',0o700); os.replace(f+'.tmp',f); fbs[name]=f
+                    mkfb('ok',"sys.stdout.buffer.write(b'x'*200000); sys.stdout.flush(); time.sleep(1.0); sys.stdout.buffer.write(b'y'*100000); sys.stdout.flush()")
+                    mkfb('inf',"while True:\n    sys.stdout.buffer.write(b'x'*65536); sys.stdout.flush()")
+                    mkfb('kill',"sys.stdout.buffer.write(b'x'*200000); sys.stdout.flush(); time.sleep(0.3); os.kill(os.getpid(),signal.SIGKILL)")
+                    mkfb('e2',"sys.stdout.write('abc'); sys.stdout.flush(); sys.stderr.write('Connection closed by remote host\\n'); sys.exit(2)")
+                    mkfb('w1',"sys.stdout.buffer.write(b'x'*200000); sys.stdout.flush(); sys.stderr.write('Warning: w71\\n'); sys.exit(1)")
+                    mkfb('nm',"sys.stderr.write(\"Include pattern 'x' never matched.\\n\"); sys.exit(1)")
+                    class _Silent(Response):
+                        async def __call__(self,scope,receive,send): return
+                    async def call(mode,path,qs,e):
+                        msgs=[]; gone=asyncio.Event(); first=[True]; at_first=[None]; sent=[0]; task=[None]; stopped=[False]; tried=[]
+                        if mode=='p': gone.set()
+                        async def receive():
+                            if first[0]:
+                                first[0]=False; return {'type':'http.request','body':b'','more_body':False}
+                            await gone.wait(); return {'type':'http.disconnect'}
+                        async def send(m):
+                            if at_first[0] is None: at_first[0]=e.getvalue()
+                            if m['type']=='http.response.start': tried.append(m['status'])   # tenté, même après le départ
+                            if gone.is_set():
+                                if mode=='b': raise OSError('client parti')
+                                return   # uvicorn : envoi après la perte de connexion ignoré
+                            msgs.append(m); sent[0]+=len(m.get('body',b''))
+                            if mode in ('a','b') and sent[0]>=512*1024:
+                                if mode=='a': await asyncio.sleep(0.1); gone.set(); await asyncio.sleep(0.1)
+                                else: gone.set()
+                            if mode=='x' and sent[0]>=512*1024 and not stopped[0]:   # arrêt du serveur : tâche de la requête annulée
+                                stopped[0]=True; _STOPPING[0]=True; task[0].cancel()
+                        asgi={'version':'3.0','spec_version':'2.4'} if mode=='b' else {'version':'3.0'}
+                        scope={'type':'http','asgi':asgi,'http_version':'1.1','method':'GET','scheme':'http','path':path,
+                               'raw_path':path.encode(),'query_string':qs.encode(),'root_path':'',
+                               'headers':[(b'host',b'test'),(b'x-api-key',API_KEY.encode())],'client':('127.0.0.1',1),'server':('test',80)}
+                        exc=None
+                        task[0]=asyncio.ensure_future(app(scope,receive,send))
+                        try: await asyncio.wait_for(task[0],20)
+                        except asyncio.CancelledError: exc='annulée'
+                        except Exception as x: exc=x
+                        return msgs,exc,at_first[0],tried
+                    def run(mode,route,qs,exe='inf',patches=(),stopping=False):
+                        e=io.StringIO(); path=route if route=='/version' else f"{API_PREFIX}{route}"
+                        with mock.patch(f"{__name__}._borg_cfg",lambda n,p: {'BORG_REPO':'/r','BORG_EXE':fbs[exe]}), \
+                             mock.patch(f"{__name__}.require_path_in_scope",lambda *a: True), \
+                             mock.patch(f"{__name__}.require_downloads_allowed",lambda: None), \
+                             mock.patch(f"{__name__}._KILL_GRACE",5.0), contextlib.ExitStack() as es:
+                            for tgt,val in patches: es.enter_context(mock.patch(f"{__name__}.{tgt}",val))
+                            es.enter_context(contextlib.redirect_stderr(e))
+                            prev=_STOPPING[0]   # revue story 71 : valeur d'avant rendue, jamais forcée
+                            if stopping: _STOPPING[0]=True
+                            try: msgs,exc,at_first,tried=asyncio.run(call(mode,path,qs,e))
+                            finally: _STOPPING[0]=prev
+                            t0=time.monotonic()
+                            while _LIVE_BORG and time.monotonic()-t0<10: time.sleep(0.05)
+                        err=e.getvalue()
+                        rx=re.compile(r'^\[req\] 127\.0\.0\.1 - "GET '+re.escape(path+'?'+qs if qs else path)+r'" (\d+) (\d+)ms(.*)$')
+                        reqs=[l for l in err.splitlines() if l.startswith('[req]')]
+                        m=rx.match(reqs[0]) if len(reqs)==1 else None
+                        st=[x['status'] for x in msgs if x['type']=='http.response.start']
+                        fin=any(x['type']=='http.response.body' and not x.get('more_body',False) for x in msgs)
+                        return {'line':(int(m.group(1)),int(m.group(2)),m.group(3)) if m else (None,-1,reqs),'err':err,'exc':exc,'st':st,'fin':fin,
+                                'avant':'[req]' in (at_first or ''),'msgs':len(msgs),'vide':not _LIVE_BORG,'tried':tried}
+                    T,F='/download/tar','/download/file'; QT='nick=zz&bid=a1'; QF='nick=zz&bid=a1&path=x'
+                    res={}
+                    o=run('n',T,QT,'ok')
+                    res['complet']=(o['line'][0]==200 and o['line'][1]>=900 and o['line'][2]=='' and not o['avant'] and o['fin'] and o['st']==[200] and o['exc'] is None and o['vide'],o['line'],o['avant'],o['fin'],o['st'])
+                    o=run('n',T,QT,'w1')
+                    res['complet, borg en code 1 (avertissement) : sans issue, [WARN]']=(o['line'][0]==200 and o['line'][2]=='' and o['fin'] and o['exc'] is None and o['vide']
+                        and '[WARN] borg export-tar (téléchargement) : Warning: w71' in o['err'],o['line'],o['fin'],o['err'][-300:])
+                    o=run('n',T,QT,'ok',stopping=True)
+                    res['arrêt demandé, téléchargement mené à son terme : sans issue']=(o['line'][0]==200 and o['line'][2]=='' and o['fin'] and o['exc'] is None and o['vide'],o['line'],o['fin'])
+                    o=run('a',T,QT,stopping=True)
+                    res['arrêt demandé, client parti : (client parti)']=(o['line'][0]==200 and o['line'][2]==' (client parti)' and o['exc'] is None and o['vide'],o['line'],o['exc'])
+                    o=run('a',T,QT)
+                    res['client parti en cours']=(o['line'][0]==200 and o['line'][2]==' (client parti)' and 'téléchargement abandonné par le client' in o['err']
+                        and o['exc'] is None and 'Traceback' not in o['err'] and o['vide'],o['line'],o['exc'])
+                    import starlette as _stl
+                    st018=tuple(_stl.__version__.split('.')[:2])==('0','18')   # revue : 0.18 exactement
+                    o=run('b',T,QT)
+                    # starlette 1.7 : l'OSError de l'envoi remonte de l'application (antérieur : _AbortableResponse relaie l'envoi
+                    # sans l'attraper depuis 1.30.2 ; contrôle 1.31.6 du même mode : `except Exception: pass`) ; 0.18 : absorbée
+                    res['client parti en cours (ASGI 2.4, envoi qui lève)']=(o['line'][0]==200 and o['line'][2]==' (client parti)' and 'téléchargement abandonné par le client' in o['err']
+                        and (o['exc'] is None if st018 else (o['exc'] is None or isinstance(o['exc'],OSError))) and 'Traceback' not in o['err'] and o['vide'],o['line'],o['exc'])
+                    o=run('n',F,QF,'kill')
+                    ln=o['err'].splitlines(); er="[ERREUR] borg extract a échoué en cours d'envoi : borg extract failed (code -9) — téléchargement interrompu (flux coupé)"
+                    order=er in ln and any(l.startswith('[req]') for l in ln) and ln.index(er)<min(i for i,l in enumerate(ln) if l.startswith('[req]'))
+                    res['borg tué en cours ([ERREUR] avant [req])']=(o['line'][0]==200 and o['line'][2]==' (flux coupé)' and not o['fin'] and o['exc'] is None and o['vide']
+                        and order,o['line'],o['exc'],o['err'][-300:])
+                    # revue story 71 : 499 par le mécanisme attendu de chaque pile — 0.18 : RuntimeError de call_next -> _NoResponse ;
+                    # 1.7 : en-tête produit, sonde au relais (msgs==0 ne les distingue pas : envois après le départ ignorés)
+                    made=[]
+                    class _NoResp(_NoResponse):
+                        def __init__(self): made.append(1)
+                    o=run('p',T,QT,patches=(('_NoResponse',_NoResp),))
+                    mech='RuntimeError' if made else 'sonde'; want='RuntimeError' if st018 else 'au choix'   # autre pile : l'un ou l'autre
+                    res['client parti avant la réponse']=(o['line'][0]==499 and o['line'][2]==' (client parti avant la réponse)' and o['exc'] is None and o['msgs']==0
+                        and (mech==want or not st018) and 'Traceback' not in o['err'] and 'No response returned' not in o['err'] and o['vide'],o['line'],o['exc'],mech,want,o['err'][-300:])
+                    o=run('n',T,QT,'e2')
+                    res['refus avant le corps : 502, une ligne sans issue']=(o['line'][0]==502 and o['line'][2]=='' and o['st']==[502] and o['vide'],o['line'],o['st'])
+                    o=run('n',F,QF,'nm')
+                    res['introuvable : 404, une ligne sans issue']=(o['line'][0]==404 and o['line'][2]=='' and o['st']==[404] and o['vide'],o['line'],o['st'])
+                    import concurrent.futures as _cf
+                    class _BadPool(_cf.ThreadPoolExecutor):
+                        def submit(self,*a,**k): raise RuntimeError('lecture71')
+                    bad_pool=_BadPool(max_workers=1)
+                    o=run('n',T,QT,'ok',patches=(('_borg_read_pool',lambda: bad_pool),))
+                    res['erreur inattendue du corps après l\'en-tête : flux coupé, fin retenue, cause au journal']=(o['line'][0]==200 and o['line'][2]==' (flux coupé)' and not o['fin'] and o['vide']
+                        and "[ERREUR] borg export-tar : erreur pendant l'envoi (RuntimeError('lecture71')) — téléchargement interrompu (flux coupé)" in o['err']
+                        and 'abandonné par le client' not in o['err'],o['line'],o['fin'],o['err'][-300:])
+                    o=run('x',T,QT)
+                    res['arrêt du serveur (tâche annulée) : flux coupé']=(o['line'][0]==200 and o['line'][2]==' (flux coupé)' and o['exc']=='annulée' and o['vide'],o['line'],o['exc'])
+                    # tube fermé par le chien de garde (borg fini, corps plus lu TIMEOUT s) : drapeaux qui font la ligne — corps tiré
+                    # directement (le middleware lit un bloc d'avance : cas non déterministe). Attente bornée de la vraie condition
+                    # (tube fermé), jamais un délai fixe. Coupé seulement si des octets restaient non lus (revue story 71)
+                    import types as _t
+                    def wd(code,pause):
+                        r=_t.SimpleNamespace(state=_t.SimpleNamespace()); shut=[False]
+                        async def drain(body,pr):
+                            out=b''; k=0
+                            async for c in body:
+                                out+=c; k+=1
+                                if pause(k,out) and not shut[0]:
+                                    t0=time.monotonic()
+                                    while not pr.stdout.closed and time.monotonic()-t0<10: await asyncio.sleep(0.05)
+                                    shut[0]=pr.stdout.closed
+                            return out
+                        e=io.StringIO()
+                        with mock.patch(f"{__name__}.TIMEOUT",1), contextlib.redirect_stderr(e):
+                            body=_borg_stream(r,[sys.executable,'-c',code],dict(os.environ),'borg extract')
+                            with _LIVE_BORG_LOCK: pr=list(_LIVE_BORG)[-1]
+                            out=asyncio.run(drain(body,pr))
+                            t0=time.monotonic()
+                            while _LIVE_BORG and time.monotonic()-t0<10: time.sleep(0.05)
+                        return (out,shut[0],getattr(r.state,'stream_aborted',False),getattr(r.state,'stream_done',False),not _LIVE_BORG,
+                                e.getvalue().count('[ERREUR] borg extract : téléchargement plus lu depuis 1 s — flux coupé'))
+                    BIG="import sys; sys.stdout.write('x'*100000); sys.stdout.flush()"
+                    o=wd(BIG,lambda k,out: k==1)
+                    res['tube fermé, octets non lus : flux coupé, jamais complet']=(len(o[0])<100000 and o[1] and o[2] and not o[3] and o[4] and o[5]==1,len(o[0]),o[1:])
+                    o=wd(BIG,lambda k,out: len(out)>=100000)
+                    res['tube fermé après le dernier bloc (EOF seul restant) : complet']=(len(o[0])==100000 and o[1] and not o[2] and o[3] and o[4] and o[5]==0,len(o[0]),o[1:])
+                    o=wd("import sys; sys.stdout.write('petit')",lambda k,out: k==1)
+                    res['petit fichier (EOF lu avant la réponse), tube fermé : complet']=(o[0]==b'petit' and o[1] and not o[2] and o[3] and o[4] and o[5]==0,o)
+                    # _AbortableResponse seul : sonde en erreur = client présent ; exception hors envoi = flux coupé (revue story 71)
+                    async def ar(inner,gone=None,bad_send=False):
+                        sent=[]; col=[]
+                        class R:
+                            status_code=200
+                            async def __call__(self,sc,rc,sd): await inner(sc,sd)
+                        resp=_AbortableResponse(R(),log=lambda st_,iss: col.append((st_,iss)),gone=gone)
+                        async def send(m):
+                            if bad_send and m['type']=='http.response.body': raise OSError('client parti')
+                            sent.append((m['type'],m.get('more_body')))
+                        exc=None
+                        try: await resp({'type':'http','state':{}},None,send)
+                        except Exception as x: exc=x
+                        return sent,col,exc
+                    async def whole(sc,sd):
+                        await sd({'type':'http.response.start','status':200,'headers':[]})
+                        await sd({'type':'http.response.body','body':b'ab','more_body':True})
+                        sc['state']['stream_done']=True
+                        await sd({'type':'http.response.body','body':b'','more_body':False})
+                    async def raising(): raise RuntimeError('sonde71')
+                    o=asyncio.run(ar(whole,raising))
+                    res['sonde en erreur : client présent, tout relayé, sans issue']=(o[0]==[('http.response.start',None),('http.response.body',True),('http.response.body',False)]
+                        and o[1]==[(200,'')] and o[2] is None,o)
+                    async def start_then_raise(sc,sd):
+                        await sd({'type':'http.response.start','status':200,'headers':[]}); raise ValueError('corps71')
+                    o=asyncio.run(ar(start_then_raise))
+                    res['exception hors envoi (stream_aborted absent) : flux coupé, relancée']=(o[1]==[(200,' (flux coupé)')] and isinstance(o[2],ValueError),o)
+                    async def yes(): return True
+                    o=asyncio.run(ar(whole,yes))
+                    res['sonde : client parti à l\'en-tête -> 499, en-tête relayé']=(o[0]==[('http.response.start',None),('http.response.body',True),('http.response.body',False)]
+                        and o[1]==[(499,' (client parti avant la réponse)')] and o[2] is None,o)
+                    async def aborted(sc,sd):
+                        await sd({'type':'http.response.start','status':200,'headers':[]})
+                        await sd({'type':'http.response.body','body':b'ab','more_body':True})
+                        sc['state']['stream_aborted']=True
+                        await sd({'type':'http.response.body','body':b'','more_body':False})
+                    o=asyncio.run(ar(aborted,yes))
+                    res['avant la réponse prime sur flux coupé']=(o[1]==[(499,' (client parti avant la réponse)')] and o[2] is None,o)
+                    async def swallow_then_raise(sc,sd):
+                        await sd({'type':'http.response.start','status':200,'headers':[]})
+                        try: await sd({'type':'http.response.body','body':b'ab','more_body':True})
+                        except OSError: pass
+                        raise ValueError('hors envoi')
+                    o=asyncio.run(ar(swallow_then_raise,bad_send=True))
+                    res['envoi qui lève prime sur une exception hors envoi']=(o[1]==[(200,' (client parti)')] and isinstance(o[2],ValueError),o)
+                    o=run('n','/version','')
+                    res['route JSON inchangée']=(o['line'][0]==200 and o['line'][2]=='' and o['avant'] and o['st']==[200] and o['exc'] is None,o['line'],o['avant'])
+                    def boom(*a): raise ValueError('boom71')
+                    o=run('n',T,QT,patches=(('_borg_cfg',boom),))
+                    res['exception de l\'application']=(o['line'][0]==500 and o['line'][2]=='' and isinstance(o['exc'],ValueError) and o['st']==[500],o['line'],o['exc'],o['st'])
+                    def nrr(*a): raise RuntimeError('No response returned.')
+                    o=run('p',T,QT,patches=(('_borg_cfg',nrr),))
+                    res['RuntimeError de l\'application, client parti : jamais 499']=(o['line'][0]==500 and o['line'][2]=='' and o['tried']==[500] and type(o['exc']) is RuntimeError,o['line'],o['exc'],o['tried'])
+                    o=run('n',T,QT,patches=(('_borg_stream',lambda *a,**k: iter([b''])),('_ClosingStreamingResponse',lambda *a,**k: _Silent())))
+                    res['sans réponse, client présent : 500 et RuntimeError']=(o['line'][0]==500 and o['line'][2]=='' and type(o['exc']) is RuntimeError
+                                                                             and str(o['exc'])=='No response returned.',o['line'],o['exc'])
+                    bad={k:v for k,v in res.items() if not v[0]}
+                    if bad: print(f"  {bad}")
+                    return not bad
+                check("Journal [req] des flux /download/* : une ligne à la fin réelle (durée totale, « (client parti) » / « (flux coupé) ») ; client parti avant la réponse : 499 sans trace ; JSON et exceptions inchangées (story 71)",_req_line_e2e)
                 def _download_idle_watchdog():
                     """1.31.0 (story 41, A86, décisions de l'utilisateur ; mesuré : borg muet bloquait un fil sans fin, corps jamais lu =
                     borg orphelin, arrêt du serveur sans effet ; revue : vrai borg = chargeur PyInstaller + enfant, tuer le seul PID de
