@@ -2605,6 +2605,14 @@ premier `scope['http_version']=='1.0'` hors `/healthz` -> `[WARN]` avec chemin e
 `_parseHistoryResponse` accepte le code 1 avec JSON (`error`, ou `rows` + `partial` = `_errLine(stderr)` ; aucune ligne ->
 erreur), `loadCharts` écrit « Données partielles : … » sous un graphique dessiné ; `http10` depuis `/access` (`loadMyAccess`),
 sinon `/version`.
+UI 1.24.1 (story 70, D154) : `respError(r, fallback)` = message d'erreur d'une réponse d'`apiCall` — `stderr`, sinon `detail`
+du serveur (refus FastAPI : `{detail}` seul, sans `exitcode` ni `stderr`, ex. 403 `require_user` ; non textuel : « HTTP <code>
+— <JSON> » ; chaîne vide = absent), sinon `fallback`, sinon « HTTP <code> ». Utilisée par les affichages qui montraient
+`r.stderr||('HTTP '+…)` (`loadMyAccess` en 5xx, `loadMachines`, `loadHistoryInline`, `loadHistoryFull`, `_parseHistoryResponse`)
+et par l'explorateur (`loadBrowse`, `runBrowseSearch`, repli « exitcode <n> »). Hors de son périmètre, avec leur propre
+message : les alertes des actions (`r.detail||r.stderr||r.stdout`), le panneau de résultat d'une action (`resultStderr`) et
+`apiErr` (page Notifications). `loadBrowse` : toute branche d'erreur passe par `browseFail` (message, `browseBody` vidé,
+`browseEntriesByPath={}`) ; une réponse arrivée après une navigation plus récente reste ignorée (`browseLoadSeq`).
 CodecSelfTest : `-f '=<nom>'` -> `re.compile('^'+re.escape(nom)+'$')`, sans `IGNORECASE`.
 **Ensure sans création (1.0.172, story 35, A61)** : `_open_db(…, create_file=None)` — `None` : le rôle décide (`read` jamais,
 `write`/`admin` `O_CREAT` 0600) ; `False` : `write`/`admin` en `mode=rw`, fichier absent -> `sqlite3.OperationalError`.

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.24.0 -->
+<!-- UI_VERSION: 1.24.1 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -478,7 +478,7 @@ async function loadMyAccess(){
     // Cas volontaire (Story 1.1) : GROUPS_PATHS rendu ambigu dans .borghelperrc pendant que le
     // process tourne fait échouer /access en 500 non catché — jamais silencieux ici non plus.
     document.getElementById('machinesError').textContent=
-      'Erreur : '+(r.stderr||('HTTP '+r.httpStatus))+' — droits/périmètre indisponibles (configuration serveur invalide ?).';
+      'Erreur : '+respError(r)+' — droits/périmètre indisponibles (configuration serveur invalide ?).';
     return null;
   }
   if(r.exitcode!==undefined || !r.nicks) return null; // forme inattendue : ne pas casser l'affichage
@@ -582,6 +582,16 @@ async function apiCall(method, path, params, needsPass, nickForPass){
   return {httpStatus:res.status, ...body};
 }
 
+// Message d'erreur d'une réponse d'apiCall (UI 1.24.1, D154) : stderr de borgHelper, sinon `detail` du serveur (refus
+// FastAPI — 403 require_user, groupes… : {detail} seul, sans exitcode ni stderr), sinon `fallback`, sinon « HTTP <code> ».
+// Jamais « undefined ».
+function respError(r,fallback){
+  if(r.stderr) return r.stderr;
+  if(typeof r.detail==='string' && r.detail) return r.detail;
+  if(r.detail!==undefined && r.detail!==null && r.detail!=='') return 'HTTP '+r.httpStatus+' — '+JSON.stringify(r.detail);
+  return fallback||('HTTP '+r.httpStatus);
+}
+
 // ── Login ─────────────────────────────────────────────────────────────────
 
 async function doLogin(){
@@ -652,7 +662,7 @@ async function loadMachines(){
   if(seq!==machinesLoadSeq) return; // un rafraîchissement plus récent a eu lieu entre-temps
   if(r.httpStatus===401) return;
   if(r.exitcode===undefined || r.httpStatus>=500 || (!r.stdout && r.stderr)){
-    errEl.textContent='Erreur : '+(r.stderr||('HTTP '+r.httpStatus));
+    errEl.textContent='Erreur : '+respError(r);
     listEl.textContent='';
     return;
   }
@@ -846,7 +856,7 @@ async function loadHistoryInline(nick,panel){
   const r=await apiCall('GET','/report',{nick,n:'10',json:'true',offline:'true'},false);
   if(r.httpStatus===401) return;
   if(r.exitcode===undefined || r.httpStatus>=500 || (!r.stdout && r.stderr)){
-    panel.innerHTML='<p class="error">Erreur : '+escapeHtml(r.stderr||('HTTP '+r.httpStatus))+'</p>';
+    panel.innerHTML='<p class="error">Erreur : '+escapeHtml(respError(r))+'</p>';
     return;
   }
   let parsed;
@@ -881,7 +891,7 @@ async function loadHistoryFull(nick){
   if(seq!==historyLoadSeq) return; // une navigation plus récente a eu lieu entre-temps
   if(r.httpStatus===401) return;
   if(r.exitcode===undefined || r.httpStatus>=500 || (!r.stdout && r.stderr)){
-    err.textContent='Erreur : '+(r.stderr||('HTTP '+r.httpStatus)); body.innerHTML=''; return;
+    err.textContent='Erreur : '+respError(r); body.innerHTML=''; return;
   }
   let parsed;
   try{ parsed=JSON.parse(r.stdout); }
@@ -1103,7 +1113,7 @@ function _parseHistoryResponse(r){
   if(r.httpStatus===401) return {error:null}; // apiCall a déjà géré logout(), rien de plus à afficher ici
   // UI 1.23.0 (A87) : code 1 = erreur rencontrée (base illisible) avec une réponse JSON : son `error`, ou ses lignes + `partial`
   if(r.exitcode===undefined || (r.exitcode!==0 && r.exitcode!==1) || r.httpStatus>=500 || (!r.stdout && r.stderr)){
-    return {error:r.stderr||('HTTP '+r.httpStatus)};
+    return {error:respError(r)};
   }
   let parsed;
   try{ parsed=JSON.parse(r.stdout); }
@@ -1679,18 +1689,18 @@ async function loadBrowse(){
   const r=await apiCall('GET','/treehist',params,false);
   if(seq!==browseLoadSeq) return; // une navigation plus récente a eu lieu entre-temps : on ignore
   if(r.httpStatus===401) return;
-  if(!_readerJson(r)){
-    document.getElementById('browseError').textContent=r.stderr||('exitcode '+r.exitcode);
-    document.getElementById('browseBody').innerHTML=''; return;
-  }
+  // UI 1.24.1 (D154) : toute erreur -> message (stderr, detail du serveur, sinon code), tableau vidé (plus de spinner) et
+  // entrées vidées (la boîte de téléchargement ne lit jamais celles d'un autre répertoire)
+  const browseFail=msg=>{
+    document.getElementById('browseError').textContent=msg;
+    document.getElementById('browseBody').innerHTML=''; browseEntriesByPath={};
+  };
+  if(!_readerJson(r)){ browseFail(respError(r,r.exitcode!==undefined?'exitcode '+r.exitcode:'')); return; }
   let parsed;
   try{ parsed=JSON.parse(r.stdout); }
-  catch(e){ document.getElementById('browseError').textContent=(r.exitcode!==0&&r.stderr)||('Réponse illisible : '+r.stdout.slice(0,200)); return; }
-  const data=parsed[reqNick];
-  if(!data || data.error){
-    document.getElementById('browseError').textContent=(data&&data.error)||'Aucune donnée';
-    document.getElementById('browseBody').innerHTML=''; return;
-  }
+  catch(e){ browseFail((r.exitcode!==0&&r.stderr)||('Réponse illisible : '+(r.stdout||'').slice(0,200))); return; }
+  const data=parsed&&parsed[reqNick];
+  if(!data || data.error){ browseFail((data&&data.error)||'Aucune donnée'); return; }
   const entries=(data.entries||[]).filter(e=>e.name!=='.');
   browseEntriesByPath={};
   entries.forEach(e=>{ browseEntriesByPath[e.full_path]=e; });
@@ -1745,11 +1755,11 @@ async function runBrowseSearch(){
   results.hidden=false; results.innerHTML=SPINNER;
   const r=await apiCall('GET','/treefind',{nick:browseNick,prefix:browsePath,pattern,json:'true'},false);
   if(r.httpStatus===401) return;
-  if(!_readerJson(r)){ err.textContent=r.stderr||('exitcode '+r.exitcode); results.innerHTML=''; return; }
+  if(!_readerJson(r)){ err.textContent=respError(r,r.exitcode!==undefined?'exitcode '+r.exitcode:''); results.innerHTML=''; return; }
   let parsed;
   try{ parsed=JSON.parse(r.stdout); }
-  catch(e){ err.textContent=(r.exitcode!==0&&r.stderr)||('Réponse illisible : '+r.stdout.slice(0,200)); results.innerHTML=''; return; }
-  const data=parsed[browseNick];
+  catch(e){ err.textContent=(r.exitcode!==0&&r.stderr)||('Réponse illisible : '+(r.stdout||'').slice(0,200)); results.innerHTML=''; return; }
+  const data=parsed&&parsed[browseNick];
   if(!data || data.error){ err.textContent=(data&&data.error)||'Aucune donnée'; results.innerHTML=''; return; }
   const matches=data.matches||[];
   // Publiés dans la même map que loadBrowse : openDownloadDialog() lit browseEntriesByPath pour

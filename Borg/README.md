@@ -2152,6 +2152,12 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
      bouton **⬇ Télécharger** (même fenêtre de téléchargement que ci-dessus). Bouton **✕ Revenir à
      l'explorateur** pour effacer la recherche ; toute navigation normale (dossier, fil d'Ariane)
      l'efface aussi automatiquement.
+   - **Erreurs** (UI ≥ 1.24.1) : la raison donnée par borgHelper (stderr) ou par le serveur (refus `403` : son message),
+     sinon « exitcode <n> » (explorateur et recherche, erreur de borgHelper sans stderr), sinon « HTTP <code> » ; le
+     tableau et les entrées du répertoire précédent sont effacés. Même message (« Erreur : … ») sur la liste des
+     serveurs, l'erreur de droits/périmètre (`/access` en 5xx), la carte, l'Historique complet et ses graphiques.
+     Le refus `require_user` (« Identité utilisateur absente … ») survient quand l'en-tête utilisateur manque aux appels
+     d'API : proxy d'authentification qui l'injecte sur la page mais pas sur `/api/…`, ou session du proxy expirée.
 5. **Historique complet** (bouton **📜 Historique complet** sur la page Serveurs) : toutes les archives
    indexées en base pour ce serveur (`Report -o -j`, sans limite `-N`), mêmes colonnes que le tableau
    des 10 dernières, plus une colonne **Actions** par archive :
@@ -2229,7 +2235,8 @@ montrer exactement ce dont on parle.
 - Test de l'UI (Node, sans dépendance) : `node borgHelperWWW_ui_test.js` — routeur, badges, fin de Bkp, actions et
   graphiques de la page Historique (tous construits, séries de la courbe des tailles, archives supprimées atténuées,
   message sans données, bloc HTML de chaque graphique, chargements qui se croisent, rechargement, réponses en erreur,
-  bibliothèque absente). À lancer après toute modification de ces parties de
+  bibliothèque absente), messages d'erreur de l'explorateur et des autres pages (refus 403 du serveur, JSON illisible).
+  À lancer après toute modification de ces parties de
   `borgHelperWWW_ui.html`. Inutile au déploiement.
 
 Cette page HTML elle-même n'est pas protégée par `X-API-Key` (elle ne contient aucun secret — la clé et

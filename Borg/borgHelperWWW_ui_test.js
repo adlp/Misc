@@ -5,7 +5,8 @@
 // le titre de l'onglet de chaque page (UI >= 1.15.0). Puis, DOM et API simulés : badges, fin de Bkp, actions, carte,
 // et graphiques de la page Historique (tous construits, séries, archives supprimées, sans lignes, blocs HTML ;
 // chargements croisés, rechargement, réponses en erreur, échec partiel, bibliothèque absente ; UI >= 1.24.0 : axe temporel,
-// premier Prune, avec la vraie Chart.js de vendor/chartjs sur un canvas simulé) ; bandeau de nettoyage.
+// premier Prune, avec la vraie Chart.js de vendor/chartjs sur un canvas simulé) ; bandeau de nettoyage ; UI >= 1.24.1 :
+// messages d'erreur (respError) de l'explorateur, de sa recherche et des autres pages (403 capturé, JSON illisible).
 //
 //   node borgHelperWWW_ui_test.js [chemin/vers/borgHelperWWW_ui.html]
 //
@@ -401,6 +402,7 @@ ${grab('_hideChartMsg')}
 async ${grab('loadCharts')}
 ${grab('_safeRender')}
 ${grab('_errLine')}
+${grab('respError')}
 ${grab('_parseHistoryResponse')}
 ${grab('_renderRepoSizeAndPruneGainCharts')}
 ${grab('_fadeFor')}
@@ -470,8 +472,13 @@ ${grab('_renderArchiveExtraChart')}
      [e5,built.length,cfgOf('chartArchiveSize').data.datasets[0].data.map(p=>p.y),spinners(),
       allIds.map(id=>!cdom.byId(id).hidden && cdom.byId(id+'Msg').hidden),apiCalls.filter(c=>c[2]==='b').length],
      [null,5,[3000,3300],[],allIds.map(()=>true),2]);
+  // UI 1.24.1 (story 70, D154) : réponse réelle capturée (2026-10-10) — borgHelperWWW (tools/www_server.py, bac à sable lk)
+  // lancé avec BORGHELPERWWW_REQUIRE_USER=1 ; GET /api/treehist sans l'en-tête X-User -> HTTP 403, corps {"detail": DETAIL403}
+  // (ni exitcode ni stderr ; témoin avec l'en-tête : 200). Même middleware pour toute route sauf /healthz.
+  const DETAIL403='Identité utilisateur absente (header X-User) — accès refusé (require_user)';
   // Erreurs de /repohistory et /archivehistory : un message d'erreur par graphique, rien construit, aucune exception.
-  for(const [name,r,want] of [['HTTP 500',{httpStatus:500,stdout:'',stderr:''},'HTTP 500'],
+  for(const [name,r,want] of [['403 capturé (require_user) : le detail du serveur',{httpStatus:403,detail:DETAIL403},DETAIL403],
+      ['403 sans detail',{httpStatus:403},'HTTP 403'],['HTTP 500',{httpStatus:500,stdout:'',stderr:''},'HTTP 500'],
       ['HTTP 502 avec code 0',{exitcode:0,httpStatus:502,stdout:'',stderr:''},'HTTP 502'],
       ['code 0, stderr seul',{exitcode:0,httpStatus:200,stdout:'',stderr:'dépôt verrouillé'},'dépôt verrouillé'],
       ['champ error',{exitcode:0,httpStatus:200,stdout:'{"error":"nick inconnu"}',stderr:''},'nick inconnu'],
@@ -630,6 +637,7 @@ ${grab('_fmtDuration')}
 ${grab('_showChartMsg')}
 ${grab('_hideChartMsg')}
 ${grab('_errLine')}
+${grab('respError')}
 ${grab('_parseHistoryResponse')}
 ${grab('_renderRepoSizeAndPruneGainCharts')}
 ${grab('_fadeFor')}
@@ -725,6 +733,164 @@ ${grab('_renderArchiveExtraChart')}
        [true,true,false,false,false]);
     eq('explorateur : les deux appels passent par _readerJson',(src.match(/if\(!_readerJson\(r\)\)/g)||[]).length,2);
   }
+  // UI 1.24.1 (story 70, D154) : message d'erreur commun (respError : stderr, sinon detail du serveur, sinon « HTTP <code> ») ;
+  // explorateur et recherche : tableau / résultats et entrées vidés sur toute erreur, jamais « undefined » ni spinner.
+  {
+    // DETAIL403 : réponse réelle capturée (voir sa définition, avant les graphiques).
+    const ah={};
+    const api=new Function('hooks',`
+      const API_PREFIX='/api'; const location={origin:'http://x'};
+      const getApiKey=()=>'k', getPassphrase=()=>null, logout=()=>{ hooks.loggedOut=true; };
+      const document={getElementById:()=>({textContent:''})};
+      const fetch=async()=>({status:hooks.status,json:async()=>hooks.body});
+async ${grab('apiCall')}
+      return apiCall;`)(ah);
+    // Passée par le vrai apiCall (forme {httpStatus, ...corps}) avant d'être rendue.
+    const capture=async(path,status,body)=>{ ah.status=status; ah.body=body; return api('GET',path,{nick:'n'},false); };
+    const r403=await capture('/treehist',403,{detail:DETAIL403}), f403=await capture('/treefind',403,{detail:DETAIL403});
+    const r403e=await capture('/treehist',403,{});
+    eq('403 capturé : apiCall rend {httpStatus:403, detail} sans exitcode ni stderr, pas de déconnexion',
+       [r403,ah.loggedOut===true],[{httpStatus:403,detail:DETAIL403},false]);
+    const re=new Function(grab('respError')+'\nreturn respError;')();
+    eq('respError : stderr, sinon detail, sinon repli, sinon « HTTP <code> » ; detail non textuel sérialisé',
+       [re({httpStatus:400,exitcode:1,stderr:'e',detail:'d'}),re(r403),re(r403e),re({httpStatus:403},'exitcode 2'),
+        re({httpStatus:422,detail:[{msg:'x'}]}),re({httpStatus:200,exitcode:2,stdout:'',stderr:''},'exitcode 2'),
+        re({httpStatus:403,detail:''}),re({httpStatus:403,detail:''},'exitcode 3')],
+       ['e',DETAIL403,'HTTP 403','exitcode 2','HTTP 422 — [{"msg":"x"}]','exitcode 2','HTTP 403','exitcode 3']);
+    const usersOf=['loadMyAccess','loadMachines','loadHistoryInline','loadHistoryFull','_parseHistoryResponse','loadBrowse','runBrowseSearch'];
+    eq('respError appelée par les sept affichages (droits/périmètre, machines, carte, historique, graphiques, explorateur, recherche)',
+       usersOf.filter(f=>!grab(f).includes('respError(')),[]);
+    // DETAIL403 = texte du middleware require_user de borgHelperWWW, en-tête X-User (celui de la mesure).
+    const wwwSrc=fs.readFileSync(path.join(__dirname,'borgHelperWWW'),'utf8');
+    const TPL403='Identité utilisateur absente (header {USER_HEADER}) — accès refusé (require_user)';
+    eq('403 capturé : texte du middleware require_user de borgHelperWWW (en-tête X-User)',
+       [wwwSrc.includes('f"'+TPL403+'"'),TPL403.replace('{USER_HEADER}','X-User')],[true,DETAIL403]);
+
+    // Explorateur et recherche : vraies fonctions de la page, DOM simulé.
+    const bdom={els:{},byId(id){ return this.els[id]||(this.els[id]={id,hidden:false,value:'',textContent:'',innerHTML:''}); }};
+    const bh={resp:null,calls:[]};
+    const br=new Function('bdom','hooks',`
+      const document={getElementById:id=>bdom.byId(id)};
+      ${grabLine('SPINNER')}
+      const syncUrl=()=>{}, syncBrowseModeControls=()=>{}, renderBreadcrumb=()=>{};
+      const opAllowed=()=>true, downloadInScope=()=>true; let allowDownloads=true;
+      let browseNick='n', browsePath='', browseArchive=null, browseChanges=null, browseEntriesByPath={}, browseLoadSeq=0;
+      const apiCall=async(m,p,q)=>{ hooks.calls.push([p,q.prefix]); const d=hooks.defer; return d?await d:hooks.resp; };
+${grab('escapeHtml')}
+${grab('escapeAttr')}
+${grab('respError')}
+${grab('_readerJson')}
+${grab('clearBrowseSearch')}
+async ${grab('loadBrowse')}
+async ${grab('runBrowseSearch')}
+      return {loadBrowse,runBrowseSearch,entries:()=>Object.keys(browseEntriesByPath).sort(),go:p=>{ browsePath=p; }};`)(bdom,bh);
+    const ent=(p,x)=>Object.assign({name:p.split('/').pop(),full_path:p,parent:p.split('/').slice(0,-1).join('/'),is_dir:false,
+      genre:'f',mode:'-rw-r--r--',owner:'u',events:[{type:'added',archive:'a1'}]},x||{});
+    const okTree=(...ps)=>({httpStatus:200,exitcode:0,stderr:'',stdout:JSON.stringify({n:{entries:ps.map(p=>ent(p))}})});
+    const errEl=bdom.byId('browseError'), body=bdom.byId('browseBody'), res=bdom.byId('browseSearchResults');
+    const view=()=>({err:errEl.textContent,body:body.innerHTML,entries:br.entries()});
+    const SP='<span class="spinner">';
+    // Chaque erreur suit un affichage réussi du répertoire « a » (entrées présentes) : leur effacement est donc mesuré.
+    const afterA=async(resp,path)=>{
+      br.go('a'); bh.resp=okTree('a/f','a/g'); await br.loadBrowse();
+      const before=br.entries();
+      br.go(path||'b'); bh.resp=resp;
+      try{ await br.loadBrowse(); }catch(e){ return {before,...view(),err:'EXCEPTION '+e}; }
+      return {before,...view()};
+    };
+    const vA={before:['a/f','a/g'],body:''};
+    const v1=await afterA(r403);
+    eq('explorateur, 403 capturé : le detail du serveur, tableau vide, entrées vidées, jamais « undefined »',
+       [v1.before,v1.err,v1.body,v1.entries,/undefined/.test(v1.err)],[vA.before,DETAIL403,'',[],false]);
+    const v2=await afterA(r403e);
+    eq('explorateur, 403 sans detail : « HTTP 403 », tableau vide, entrées vidées',[v2.err,v2.body,v2.entries],['HTTP 403','',[]]);
+    const v3=await afterA({httpStatus:200,exitcode:0,stdout:'<html>pas du json',stderr:''});
+    eq('explorateur, JSON illisible : « Réponse illisible : … », tableau vide (plus de spinner), entrées vidées',
+       [v3.err,v3.body,v3.body.includes(SP),v3.entries],['Réponse illisible : <html>pas du json','',false,[]]);
+    const v4=await afterA({httpStatus:400,exitcode:1,stdout:'',stderr:'[ERREUR] base illisible'});
+    eq('explorateur, erreur borgHelper (code 1, stderr) : stderr inchangé, tableau vide, entrées vidées',
+       [v4.err,v4.body,v4.entries],['[ERREUR] base illisible','',[]]);
+    const v5=await afterA({httpStatus:400,exitcode:2,stdout:'',stderr:''});
+    eq('explorateur, code 2 sans stderr : « exitcode 2 » inchangé, entrées vidées',[v5.err,v5.entries],['exitcode 2',[]]);
+    const v6=await afterA({httpStatus:200,exitcode:1,stdout:'{"n":{"error":"SQLite error"}}',stderr:'x'});
+    const v7=await afterA({httpStatus:200,exitcode:0,stdout:'{}',stderr:''});
+    const v7b=await afterA({httpStatus:200,exitcode:0,stdout:'null',stderr:''});
+    eq('explorateur, erreur du nick / « Aucune donnée » (messages inchangés) / JSON null : tableau et entrées vidés',
+       [[v6.err,v6.body,v6.entries],[v7.err,v7.body,v7.entries],[v7b.err,v7b.body,v7b.entries]],
+       [['SQLite error','',[]],['Aucune donnée','',[]],['Aucune donnée','',[]]]);
+    // Réussite après erreur : entrées et tableau du nouveau répertoire, message vidé.
+    br.go('b'); bh.resp=r403; await br.loadBrowse();
+    br.go('c'); bh.resp=okTree('c/x','c/y','c/z'); await br.loadBrowse();
+    eq('explorateur, réussite après erreur : tableau et entrées du nouveau répertoire, message vidé',
+       [errEl.textContent,br.entries(),(body.innerHTML.match(/class="browse-row"/g)||[]).length],['',['c/x','c/y','c/z'],3]);
+    // Réponse en erreur arrivée après une navigation plus récente réussie : ignorée (tableau, entrées, message intacts).
+    for(const late of [r403,{httpStatus:200,exitcode:0,stdout:'pas du json',stderr:''}]){
+      let release; bh.defer=new Promise(ok=>{ release=ok; });
+      br.go('old'); const pOld=br.loadBrowse(); bh.defer=null;
+      br.go('c'); bh.resp=okTree('c/x','c/y','c/z'); await br.loadBrowse();
+      const bodyBefore=body.innerHTML;
+      release(late); await pOld;
+      eq('explorateur, erreur ('+(late.detail?'403':'JSON illisible')+') arrivée après une navigation plus récente : ignorée',
+         [errEl.textContent,br.entries(),body.innerHTML===bodyBefore],['',['c/x','c/y','c/z'],true]);
+    }
+    br.go('d'); bh.resp={httpStatus:200,exitcode:0,stderr:'',stdout:JSON.stringify({n:{entries:[]}})}; await br.loadBrowse();
+    eq('explorateur, répertoire vide : « Répertoire vide » inchangé, aucune entrée',[errEl.textContent,body.innerHTML.includes('Répertoire vide'),br.entries()],
+       ['',true,[]]);
+    // Recherche (/treefind) : depuis un répertoire affiché.
+    const search=async resp=>{
+      br.go('a'); bh.resp=okTree('a/f','a/g'); await br.loadBrowse();
+      bdom.byId('browseSearchInput').value='f'; bh.resp=resp;
+      try{ await br.runBrowseSearch(); }catch(e){ return {err:'EXCEPTION '+e,res:res.innerHTML}; }   // exception = FAIL, jamais un plantage du test
+      return {err:errEl.textContent,res:res.innerHTML,hidden:res.hidden};
+    };
+    const s1=await search(f403);
+    eq('recherche, 403 capturé : le detail du serveur, résultats vides, jamais « undefined »',[s1.err,s1.res,/undefined/.test(s1.err)],[DETAIL403,'',false]);
+    const s2=await search(r403e);
+    eq('recherche, 403 sans detail : « HTTP 403 », résultats vides',[s2.err,s2.res],['HTTP 403','']);
+    const s3=await search({httpStatus:200,exitcode:0,stdout:'pas du json',stderr:''});
+    eq('recherche, JSON illisible : « Réponse illisible : … », résultats vides',[s3.err,s3.res],['Réponse illisible : pas du json','']);
+    const s5=await search({httpStatus:200,exitcode:0,stdout:'null',stderr:''});
+    eq('recherche, JSON null : « Aucune donnée », résultats vides',[s5.err,s5.res],['Aucune donnée','']);
+    const s6=await search({httpStatus:400,exitcode:2,stdout:'',stderr:''});
+    eq('recherche, code 2 sans stderr : « exitcode 2 », résultats vides',[s6.err,s6.res],['exitcode 2','']);
+    const s4=await search({httpStatus:200,exitcode:0,stderr:'',stdout:JSON.stringify({n:{matches:[ent('a/f')]}})});
+    eq('recherche réussie : message vidé, un résultat',[s4.err,(s4.res.match(/sr-goto-btn/g)||[]).length],['',1]);
+
+    // Cinq autres affichages, 403 capturé : le detail (préfixes « Erreur : » gardés).
+    const odom={els:{},byId(id){ return this.els[id]||(this.els[id]={id,hidden:false,textContent:'',innerHTML:''}); }};
+    const oh={resp:null};
+    const other=new Function('odom','hooks',`
+      const document={getElementById:id=>odom.byId(id)};
+      ${grabLine('SPINNER')}
+      let myAccess=null, http10=false, machinesLoadSeq=0, historyLoadSeq=0;
+      const applyBadges=()=>{}, renderCleanupNotice=()=>{};
+      const apiCall=async()=>hooks.resp;
+${grab('escapeHtml')}
+${grab('respError')}
+async ${grab('loadMyAccess')}
+async ${grab('loadMachines')}
+async ${grab('loadHistoryInline')}
+async ${grab('loadHistoryFull')}
+      return {loadMyAccess,loadMachines,loadHistoryInline,loadHistoryFull};`)(odom,oh);
+    oh.resp=r403; await other.loadMachines();
+    const mach=[odom.byId('machinesError').textContent,odom.byId('machinesList').textContent];
+    const panel={innerHTML:''}; await other.loadHistoryInline('n',panel);
+    await other.loadHistoryFull('n');
+    const hist=[odom.byId('historyError').textContent,odom.byId('historyBody').innerHTML];
+    odom.byId('machinesError').textContent='';
+    oh.resp={httpStatus:500,detail:'GROUPS_PATHS ambigu'}; const acc500=await other.loadMyAccess();
+    const acc=odom.byId('machinesError').textContent;
+    oh.resp={httpStatus:500,stdout:'',stderr:''}; await other.loadMyAccess();
+    const acc500e=odom.byId('machinesError').textContent;
+    eq('autres affichages, 403 capturé : machines, carte, historique -> « Erreur : <detail> » ; droits/périmètre (500) : detail',
+       [mach,panel.innerHTML,hist,[acc500,acc],acc500e],
+       [['Erreur : '+DETAIL403,''],'<p class="error">Erreur : '+DETAIL403+'</p>',['Erreur : '+DETAIL403,''],
+        [null,'Erreur : GROUPS_PATHS ambigu — droits/périmètre indisponibles (configuration serveur invalide ?).'],
+        'Erreur : HTTP 500 — droits/périmètre indisponibles (configuration serveur invalide ?).']);
+    oh.resp={httpStatus:403}; await other.loadHistoryFull('n');
+    eq('autres affichages, 403 sans detail : « Erreur : HTTP 403 » (inchangé)',odom.byId('historyError').textContent,'Erreur : HTTP 403');
+    // Graphiques (_parseHistoryResponse) : couverts par la boucle « graphiques, réponse en erreur » (403 capturé ajouté).
+  }
   // UI 1.23.0 (A85) : /version http_version « 1.0 » (proxy en HTTP/1.0) -> badge, seulement si les téléchargements sont permis.
   {
     const bd={els:{},byId(id){ return this.els[id]||(this.els[id]={hidden:false,textContent:''}); }};
@@ -774,6 +940,7 @@ ${grab('renderCleanupNotice')}
 ${grab('_fmtBytes')}
 ${grab('cleanupNoticeText')}
 ${grab('renderCleanupNotice')}
+${grab('respError')}
 async ${grab('loadMyAccess')}
     return {loadMyAccess,set:r=>{ hooks.resp=r; },http10:()=>http10};`)(cdom,{resp:{nicks:{},borg_cleanup:{borg_entries:3,borg_size:1000,keys:0,bh_files:0,history:0},httpStatus:200}});
   nel.hidden=true; nel.textContent='';

@@ -1,5 +1,29 @@
 # Changelog — borgHelper
 
+## UI 1.24.1 — Explorateur : refus 403 et JSON illisible dits clairement — 2026-10-10
+
+Chantier « reconstruction progressive », story 70 (report D154 ; décision de l'utilisateur Q1 = B). Avant : un refus de
+borgHelperWWW sans `exitcode` ni `stderr` — mesuré : `BORGHELPERWWW_REQUIRE_USER=1` et requête sans l'en-tête utilisateur ->
+HTTP 403, corps `{"detail": "Identité utilisateur absente (header X-User) — accès refusé (require_user)"}` — s'affichait
+« exitcode undefined » dans l'explorateur et sa recherche, et « HTTP 403 » (sans la raison) sur la liste des serveurs, la carte
+d'un serveur, l'Historique complet et ses graphiques. Une réponse JSON illisible de `/treehist` laissait le spinner dans le
+tableau, et toute erreur de l'explorateur gardait les entrées du répertoire précédent (lues par la boîte de téléchargement).
+
+- Message d'erreur commun (`respError`) : `stderr` de borgHelper, sinon le `detail` du serveur (non textuel : « HTTP <code> —
+  <JSON> » ; vide : ignoré), sinon « HTTP <code> » (« exitcode <n> » gardé dans l'explorateur pour une erreur de borgHelper sans stderr). Utilisé
+  par l'explorateur, sa recherche et les cinq affichages qui montraient `stderr` ou « HTTP <code> » (droits/périmètre en
+  erreur 5xx, liste des serveurs, carte, Historique complet, graphiques) ; préfixes « Erreur : » gardés.
+- Explorateur : sur toute erreur (refus, erreur de borgHelper, JSON illisible ou `null`, erreur du nick, « Aucune donnée »),
+  message affiché, tableau vidé et entrées oubliées ; la navigation réussie suivante affiche le nouveau répertoire et efface
+  le message. Recherche : résultats vidés sur toute erreur (déjà le cas), message tiré de `respError`.
+- Inchangés : 401 (déconnexion), réponses réussies, « Aucune donnée », « Répertoire vide », messages de stderr ;
+  borgHelperWWW et borgHelper inchangés. Un 403 sur `/access` reste silencieux (forme inattendue), la liste des serveurs
+  disant le refus par `/report`.
+- Test de l'UI (`node borgHelperWWW_ui_test.js`) : réponse 403 capturée passée par le vrai `apiCall`, puis rendue par
+  l'explorateur, la recherche, la liste des serveurs, la carte, l'Historique complet et les graphiques (le `detail`, jamais
+  « undefined ») ; 403 sans `detail` (« HTTP 403 ») ; JSON illisible (message, tableau sans spinner, entrées vidées) ; erreur de
+  borgHelper (stderr inchangé) ; réussite après erreur ; aucun ancien affichage `r.stderr||('HTTP '+…)` restant.
+
 ## borgHelper 1.0.194 — Passphrase avec « % » passée par -P ou BORGHELPERC_RUNTIME_PASSPHRASE — 2026-10-10
 
 Chantier « reconstruction progressive », story 69 (report D190). Avant : la passphrase de `-P` ou de
