@@ -110,6 +110,7 @@ bh = BorgHelper(cfgfile=None, cache_dir=None, passphrase=None)
 # cache_dir : répertoire des DB SQLite (défaut : valeur CACHE_DIR du borghelperrc ou ~/.cache/borghelper)
 # passphrase: complète/supplante BORG_PASSPHRASE du borghelperrc pour toute la durée de vie de bh
 #             (utile pour ne pas persister de passphrase en clair dans un borghelperrc partagé)
+#             passée telle quelle, « % » compris (1.0.194) ; str attendu (sinon TypeError)
 ```
 
 Attributs :

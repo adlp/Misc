@@ -2299,7 +2299,7 @@ en échec -> `[ERREUR] <_borg_fail_msg>`, `return 2` ; `_run_diff` lit le stderr
 non tué -> `[WARN] … paire … non indexée`. `cache_prune_dryrun` : code de borg ≠ 0/1 -> `[WARN] … récupérable inconnu`, `[]`
 rendu, rien écrit ; revue : rend `None` (inconnu) -> `prep_report` : récupérable `None` + marqueur `_prune_unknown` retiré au
 rendu (« — », JSON `null`), ligne Prunable idem (jumelles report/report_offline). Login : `_valid_nick_name` (liste blanche, CLI
-et borgHelperWWW, importée) ; `cfgwrite` échappe `%` en `%%` (rc relu avec interpolation). borgHelperWWW `_repo_is_remote` :
+et borgHelperWWW, importée) ; `cfgwrite` échappe `%` en `%%` (rc relu avec interpolation) ; `cfgread` fait de même pour la passphrase injectée (`passphrase=` : `-P`, `BORGHELPERC_RUNTIME_PASSPHRASE`, `X-Borg-Passphrase` du téléchargement), relue à l'identique (1.0.194). borgHelperWWW `_repo_is_remote` :
 `_REPO_SSH_RE`/`_REPO_SCP_RE` calquées sur `borg/helpers/parseformat.py` (ssh_re, scp_re avec hôte), `::`/`%`/contrôles refusés.
 **Erreurs SQLite des lecteurs (1.0.175, A72)** : `_reader_sqlite_err(e, db_path)` — `no such table`/`no such column`
 silencieux ; autre `sqlite3.Error` -> `[ERREUR] SQLite error (<base>): <e>`, une fois par base et par processus

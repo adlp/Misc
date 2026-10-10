@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.193"
+Version="1.0.194"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -4735,7 +4735,10 @@ class BorgRunner:
             config.read(self.cfgfile)
             if nick not in config.keys(): return None
             cfg=config[nick]
-            if self.passphrase is not None: cfg['BORG_PASSPHRASE']=self.passphrase
+            # 1.0.194 (story 69, D190) : section à interpolation — « % » de la passphrase injectée (-P, BORGHELPERC_RUNTIME_PASSPHRASE)
+            # échappé en « %% » (comme cfgwrite, 1.0.175) : relue à l'identique. Avant : « a%b » -> ValueError (trace, Status
+            # « Erreur », BKP_STATUS_TIMEOUT du nick ignoré en silence), « a%%b » relue « a%b » (passphrase fausse)
+            if self.passphrase is not None: cfg['BORG_PASSPHRASE']=self.passphrase.replace('%','%%')   # non-str : TypeError, comme avant (revue)
             return cfg
         return None
 
@@ -10931,6 +10934,39 @@ def codec_selftest(pattern=None,list_only=False):
             c=_open_db(os.path.join(cdir,'new.db'),nick=None,role='write'); c.close()   # 1.0.171 : un lecteur ne crée plus
             return (_mode(rc),_mode(cdir),_mode(os.path.join(cdir,'new.db')))==(0o600,0o700,0o600)
         check("permissions : rc 0600, cache 0700, .db 0600 à la création",_perm_new)
+        def _pp_percent():
+            """1.0.194 (story 69, D190) : passphrase injectée (BorgRunner/BorgHelper passphrase=, que -P, BORGHELPERC_RUNTIME_PASSPHRASE
+            et l'en-tête X-Borg-Passphrase de borgHelperWWW alimentent) relue à l'identique quel que soit son contenu (« % » isolé,
+            « %% », « %(x)s », « %(BORG_REPO)s ») par cfg[...] (environnement de borg : boex, téléchargement), cfg.get et dict(cfg) ;
+            aucune exception ; BKP_STATUS_TIMEOUT du nick lu (avant : avalé -> défaut) ; autres valeurs du rc inchangées ; passphrase
+            non-str : TypeError (comme avant). CLI réelle : -P et variable avec « a%b » -> Status code 0. Témoin sans passphrase."""
+            r=os.path.join(tmp,'pprc')
+            with open(r,'w') as f: f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(tmp,'ppcache')}\nBKP_STATUS_TIMEOUT=600\n\n[n]\nBORG_REPO=/r%%x\nBORG_PASSPHRASE=rc%%pw\nDB_ENCRYPT=false\n\n")
+            os.chmod(r,0o600); res={}
+            t=BorgRunner(r).cfgread('n')
+            res['témoin']=(t['BORG_PASSPHRASE']=='rc%pw' and t['BORG_REPO']=='/r%x'
+                          and BorgHelper(cfgfile=r,cache_dir=os.path.join(tmp,'ppcache')).bkp_status_timeout('n')==600,dict(t))
+            try: BorgRunner(r,passphrase=b'pw').cfgread('n'); res['bytes']=(False,'aucune exception')
+            except TypeError: res['bytes']=(True,)
+            nodsn=os.path.join(tmp,'pp-sentry'); open(nodsn,'w').close()
+            for lbl,args,extra in (('-P',['-P','a%b'],{}),('variable',[],{'BORGHELPERC_RUNTIME_PASSPHRASE':'a%b'})):
+                env=dict(os.environ,BORGHELPERC_SENTRY_FILE=nodsn,**extra); env.pop('BORGHELPERC_SENTRY_DSN',None)
+                if not extra: env.pop('BORGHELPERC_RUNTIME_PASSPHRASE',None)
+                pr=subprocess.run([sys.executable,os.path.realpath(__file__),'-C',r,*args,'-c','Status','-n','n'],capture_output=True,
+                                  text=True,env=env,timeout=120,stdin=subprocess.DEVNULL,cwd=tmp)
+                res[f'CLI {lbl}']=(pr.returncode==0 and 'Dernier backup : aucune archive indexée' in pr.stdout+pr.stderr
+                                   and 'interpolation' not in pr.stdout+pr.stderr and 'Traceback' not in pr.stderr,pr.returncode,(pr.stdout+pr.stderr)[-300:])
+            for pp in ('a%b','a%%b','a%(x)s','a%(BORG_REPO)s','%','100%','plain',''):
+                try:
+                    c=BorgRunner(r,passphrase=pp).cfgread('n')
+                    bh_=BorgHelper(cfgfile=r,cache_dir=os.path.join(tmp,'ppcache'),passphrase=pp)
+                    res[pp]=(c['BORG_PASSPHRASE']==pp and c.get('BORG_PASSPHRASE')==pp and dict(c)['BORG_PASSPHRASE']==pp
+                             and c['BORG_REPO']=='/r%x' and bh_.bkp_status_timeout('n')==600,c.get('BORG_PASSPHRASE'))
+                except Exception as e: res[pp]=(False,f"{type(e).__name__}: {e}")
+            bad_=[(k,v) for k,v in res.items() if not v[0]]
+            if bad_: print(f"    {bad_}")
+            return not bad_
+        check("passphrase injectée avec « % » (-P, variable) : relue à l'identique, BKP_STATUS_TIMEOUT lu, aucune exception (1.0.194)",_pp_percent)
         def _perm_existing():
             p=os.path.join(tmp,'old.db'); open(p,'w').close(); os.chmod(p,0o644)
             d=os.path.join(tmp,'olddir'); os.mkdir(d); os.chmod(d,0o755)

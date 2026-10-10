@@ -1,5 +1,26 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.194 — Passphrase avec « % » passée par -P ou BORGHELPERC_RUNTIME_PASSPHRASE — 2026-10-10
+
+Chantier « reconstruction progressive », story 69 (report D190). Avant : la passphrase de `-P` ou de
+`BORGHELPERC_RUNTIME_PASSPHRASE` était posée telle quelle dans la section du rc, lue avec interpolation (`%(…)s`) : `a%b`
+faisait planter la commande (`ValueError`, trace — LstBkp, Bkp… — ou « Erreur : invalid interpolation syntax » dans Status ;
+`BKP_STATUS_TIMEOUT` du nick ignoré en silence par un Status lancé avec cette passphrase), `a%(x)s` donnait « Bad value
+substitution », et `a%%b` était relue `a%b` (passphrase fausse). Même défaut pour le téléchargement de borgHelperWWW
+(`/download`, en-tête `X-Borg-Passphrase` contenant `%` : erreur 500 ou passphrase fausse), qui lit le rc par la même fonction.
+
+- La passphrase injectée est échappée (`%` -> `%%`) comme `cfgwrite` le fait depuis 1.0.175 : relue à l'identique quel que
+  soit son contenu. Valeurs du rc et passphrase lue dans le rc : inchangées. Passphrase non textuelle (bibliothèque) :
+  `TypeError`, comme avant.
+- **Compatibilité :** qui doublait les `%` de sa passphrase dans `-P`, `BORGHELPERC_RUNTIME_PASSPHRASE` ou `X-Borg-Passphrase`
+  pour contourner le défaut doit cesser : la valeur passe désormais telle quelle (`a%%b` = deux `%`).
+- Mesuré de bout en bout (dépôt borg neuf, passphrase `p%q%%r%(x)s`, Sentry neutralisé) : Init, Bkp, LstBkp, Status en code 0,
+  par la variable comme par `-P` ; une passphrase voisine refusée par borg.
+- CodecSelfTest : « passphrase injectée avec « % » (-P, variable) : relue à l'identique, BKP_STATUS_TIMEOUT lu, aucune
+  exception (1.0.194) » — `a%b`, `a%%b`, `a%(x)s`, `a%(BORG_REPO)s`, `%`, `100%`, `plain`, chaîne vide (`cfg[…]`, `cfg.get`,
+  `dict(cfg)`, `BKP_STATUS_TIMEOUT`) ; passphrase `bytes` -> `TypeError` ; CLI réelle `-P 'a%b'` et variable -> Status code 0 ;
+  témoin sans passphrase (rc relu, délai lu).
+
 ## borgHelper 1.0.193 — CLI : DiffBkp -j en JSON, ArchiveHistory sans archive_stats en rows, Status en code 1 quand un nick est en erreur — 2026-10-09
 
 Chantier « reconstruction progressive », story 68 (reports D114, D138, D148 ; décisions de l'utilisateur Q1-Q3). Avant, trois

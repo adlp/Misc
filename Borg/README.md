@@ -362,6 +362,7 @@ Options communes :
 | `-P <passphrase>` | Complète/supplante `BORG_PASSPHRASE` du fichier de conf pour cet appel |
 
 Variable d'environnement `BORGHELPERC_RUNTIME_PASSPHRASE` : valeur par défaut de `-P` — préférable sur une machine partagée car invisible dans `ps aux` (contrairement à `-P`, qui apparaît en clair dans la liste des processus).
+La passphrase de `-P` ou de la variable est passée à borg telle quelle, `%` compris (1.0.194 ; avant, un `%` faisait planter la commande ou changeait la passphrase — ne plus doubler les `%`).
 
 ---
 
@@ -2242,7 +2243,8 @@ clair sur le réseau sinon.
 - **`X-API-Key`** (header, requis sur tous les endpoints) — protège l'accès à l'API elle-même. Sans
   cette clé, n'importe qui pourrait déclencher `Prune`/`DelBkp`/`Restore` sur les dépôts configurés.
 - **`X-Borg-Passphrase`** (header, optionnel) — complète ou supplante `BORG_PASSPHRASE` du
-  `.borghelperrc` pour cet appel uniquement (équivalent HTTP de `-P` / `BORGHELPERC_RUNTIME_PASSPHRASE`).
+  `.borghelperrc` pour cet appel uniquement (équivalent HTTP de `-P` / `BORGHELPERC_RUNTIME_PASSPHRASE`) ; passée telle quelle,
+  `%` compris (borgHelper ≥ 1.0.194).
   Permet de garder le `.borghelperrc` de l'API **sans passphrase en clair** : chaque appelant fournit
   la sienne à la demande.
 - **`Login`** est un cas à part : il **écrit** la passphrase fournie (`repo_passphrase`) en clair dans
