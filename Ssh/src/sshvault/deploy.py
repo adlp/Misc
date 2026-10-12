@@ -178,7 +178,7 @@ def _has_option(options, name: str) -> bool:
             value = a[2:]
         else:
             continue
-        if re.split(r"[\s=]", value.strip(), 1)[0].lower() == name:
+        if re.split(r"[\s=]", value.strip(), maxsplit=1)[0].lower() == name:
             return True
     return False
 

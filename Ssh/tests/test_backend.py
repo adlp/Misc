@@ -251,3 +251,131 @@ def test_is_written_null_et_vide_confondus():
     after = with_hosts(_item([{"name": "note", "value": "", "type": 0, "linkedId": None}]), ("a",))
     after["notes"] = ""
     assert _is_written(after, before, ("a",))
+
+
+# --- logout (story 11) -------------------------------------------------------------------
+
+def _store_has(backend):
+    return backend.store.get() is not None
+
+
+def test_logout_deconnecte_et_oublie_la_session(bench, backend):
+    assert _store_has(backend)
+    assert backend.logout() is True
+    assert not bench.state().get("userId") and not _store_has(backend) and backend.warnings == []
+
+
+def test_logout_dossier_absent_bw_non_lance(bench, backend, monkeypatch, tmp_path):
+    backend.appdata = str(tmp_path / "absent" / "bw")
+    monkeypatch.setattr(backend, "_run", lambda *a, **k: pytest.fail("bw lancé"))
+    assert backend.logout() is False
+    assert not (tmp_path / "absent").exists() and not _store_has(backend)
+
+
+def test_logout_non_connecte(bench, backend):
+    bench.set_state(logged_in=False)
+    assert backend.logout() is False
+    assert not _store_has(backend)
+
+
+def test_logout_bw_en_erreur(bench, backend, monkeypatch):
+    monkeypatch.setenv("FAKE_BW_FAIL", "logout=error")
+    with pytest.raises(BackendError, match="logout"):
+        backend.logout()
+    assert bench.state().get("userId") and not _store_has(backend)
+    assert backend.warnings == []
+
+
+def test_logout_exception_de_run_session_oubliee(bench, backend, monkeypatch):
+    def run(*a, **k):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(backend, "_run", run)
+    with pytest.raises(KeyboardInterrupt):
+        backend.logout()
+    assert not _store_has(backend)
+
+
+def test_logout_magasin_en_panne_avertissement(bench, backend, monkeypatch):
+    from sshvault.session import SessionStoreError
+
+    def clear():
+        raise SessionStoreError("magasin en panne")
+    monkeypatch.setattr(backend.store, "clear", clear)
+    assert backend.logout() is True
+    assert backend.warnings == ["session non oubliée : magasin en panne"]
+
+
+def test_logout_magasin_en_panne_et_bw_en_erreur_sans_avertissement(bench, backend, monkeypatch):
+    from sshvault.session import SessionStoreError
+
+    def clear():
+        raise SessionStoreError("magasin en panne")
+    monkeypatch.setattr(backend.store, "clear", clear)
+    monkeypatch.setenv("FAKE_BW_FAIL", "logout=error")
+    with pytest.raises(BackendError):
+        backend.logout()
+    assert backend.warnings == [], "une seule ligne : l'appelant dit l'état de la session"
+
+
+@pytest.mark.parametrize("after,expect", [("unauthenticated", True), ("locked", "timeout"), ("error", "unknown")])
+def test_logout_delai_etat_relu(bench, backend, monkeypatch, after, expect):
+    """bw tué sur délai : l'état relu tranche (déconnecté quand même, toujours connecté, inconnu)."""
+    from sshvault.backend import VaultStatus
+    from sshvault.bw import BwTimeout, LogoutUnknown
+
+    def run(*a, **k):
+        raise BwTimeout("erreur bw : « bw logout » sans réponse en 1s")
+
+    def status(session, timeout=None):
+        assert timeout is not None and timeout <= 10, "relecture à délai court"
+        if after == "error":
+            raise BackendError("erreur bw (status, code 1) : Unexpected error.")
+        return VaultStatus(after, None, None, None)
+    monkeypatch.setattr(backend, "_run", run)
+    monkeypatch.setattr(backend, "_bw_status", status)
+    if expect is True:
+        assert backend.logout() is True
+    elif expect == "timeout":
+        with pytest.raises(BwTimeout) as e:
+            backend.logout()
+        assert not isinstance(e.value, LogoutUnknown)
+    else:
+        with pytest.raises(LogoutUnknown, match="état relu impossible"):
+            backend.logout()
+    assert not _store_has(backend)
+
+
+def test_login_apikey_autre_compte_oublie_la_session(bench, monkeypatch):
+    """`login --apikey` avec la clé API d'un autre compte : déconnecté, session existante oubliée."""
+    from bench import ALIAS
+    from sshvault.session import SessionStore
+    for k, v in bench.env.items():
+        if k.startswith(("FAKE_BW_", "SSHVAULT_KEYCTL", "SSHVAULT_KEYRING")):
+            monkeypatch.setenv(k, v)
+    monkeypatch.setenv("BW_CLIENTID", "user.aaaa")
+    monkeypatch.setenv("BW_CLIENTSECRET", "apisecret")
+    bench.set_state(logged_in=False)
+    store = SessionStore(keyctl="/nonexistent/keyctl", runtime_dir=str(bench.runtime), alias=ALIAS)
+    store.put("c2Vzc2lvbi1hbmNpZW5uZS0xMjM0NTY3ODkw", 900)
+    assert store.get()
+    b = BwBackend(store=store, exe=str(bench.bw), appdata=str(bench.appdata), timeout=30,
+                  email="bob@example.test", label="boulot")
+    with pytest.raises(BackendError, match="pas de bob@example.test.*déconnecté"):
+        b.login(apikey=True)
+    assert not bench.state().get("userId") and store.get() is None
+
+
+def test_logout_interrompu_pendant_la_relecture(bench, backend, monkeypatch):
+    """Interruption pendant la relecture d'état après un délai : session oubliée quand même."""
+    from sshvault.bw import BwTimeout
+
+    def run(*a, **k):
+        raise BwTimeout("erreur bw : « bw logout » sans réponse en 1s")
+
+    def status(session, timeout=None):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(backend, "_run", run)
+    monkeypatch.setattr(backend, "_bw_status", status)
+    with pytest.raises(KeyboardInterrupt):
+        backend.logout()
+    assert not _store_has(backend)

@@ -437,6 +437,10 @@ def sv_login(home, account, report, alias=None, own=None):
                         os.write(master, value.encode() + b"\r")
                         sent.add(what)
             out = p.stdout.read().decode(errors="replace")
+            # échec : fin de ce que bw a écrit après l'invite du mot de passe (sans écho), masquée
+            i = seen.rfind(b"Master password")
+            tail = account.scrub(seen[i + len(b"Master password"):].decode(errors="replace").strip()[-300:]) \
+                if i >= 0 and p.returncode else ""
         finally:
             if p.poll() is None:
                 p.kill()
@@ -447,7 +451,8 @@ def sv_login(home, account, report, alias=None, own=None):
         if not blocked:
             report.add("sshvault login", note="rc=%d sortie=%r invites=%s" % (p.returncode, out.strip(), sorted(sent)))
             if p.returncode != 0:
-                raise AssertionError("sshvault login : code %d (invites vues : %s)" % (p.returncode, sorted(sent)))
+                raise AssertionError("sshvault login : code %d (invites vues : %s) ; terminal après l'invite : %r"
+                                     % (p.returncode, sorted(sent), tail))
             return out
         report.add("sshvault login bloqué (%ds), interrompu" % (NET_TIMEOUT + 30))
         (own or home["bw"]).run("logout")
@@ -1126,7 +1131,8 @@ def test_deux_comptes_sur_le_vrai_bw(account, account2, bw_exe, vault, ssh_keys,
     `sshvault login --account` dans ses propres données ; une clé générée dans `it2` (marquée) ;
     `list --account` sur les deux comptes, alias de chaque élément ; `account default` change la
     liste suivante ; `ssh-config` couvre les deux ; `ensure --account` charge la clé de chacun ;
-    `lock` les verrouille tous. Éléments de ce run supprimés des deux comptes à la fin."""
+    `logout --account it2` puis login ; `account set` aller-retour puis login ; `lock` les
+    verrouille tous. Éléments de ce run supprimés des deux comptes à la fin."""
     if account2 is None:
         report.add("deux comptes", note="sauté : SSHVAULT_IT2_SERVER, SSHVAULT_IT2_EMAIL ou SSHVAULT_IT2_PASSWORD "
                                         "absent du fichier du compte de test")
@@ -1216,6 +1222,79 @@ def test_deux_comptes_sur_le_vrai_bw(account, account2, bw_exe, vault, ssh_keys,
                 [ssh_keys["hotes"]["public"].split()[1], public2.split()[1]]), "clés des deux comptes chargées"
             r = sv(home, "agent", "stop")
             ok(r, 0, "agent stop, deux comptes")
+
+        # logout du second compte (story 11) : bw déconnecté, sa clé retirée de l'agent, blocs
+        # gardés ; déjà déconnecté : rien à faire ; puis login
+        cfg = os.path.join(home["env"]["HOME"], ".ssh", "sshvault", "config")
+        sock = os.path.join(home["runtime"], "sshvault", "agent.sock")
+        r = sv(home, "logout")
+        ok(r, 2, "logout sans --account, deux comptes")
+        if HAVE_OPENSSH:
+            for alias, iid in ((ALIAS, vault["hotes"]), (ALIAS2, id2)):
+                r = sv(home, "--nointeraction", "ensure", "--account", alias, "--id", iid)
+                ok(r, 0, "ensure --account %s avant logout" % alias)
+        # config à jour avant le logout (les étapes précédentes ont changé le coffre), ligne
+        # Include posée dans le ~/.ssh/config du HOME de test (sinon --check rend toujours 1)
+        r = sv(home, "--nointeraction", "ssh-config", "install")
+        ok(r, 0, "ssh-config install")
+        r = sv(home, "--nointeraction", "ssh-config")
+        ok(r, 0, "ssh-config avant logout")
+        r = sv(home, "--nointeraction", "ssh-config", "--check")
+        assert r.returncode == 0, "ssh-config --check avant logout : code %d ; stdout : %s" % (
+            r.returncode, scrub(r.stdout.strip()))
+        before = open(cfg).read()
+        r = sv(home, "logout", "--account", ALIAS2)
+        ok(r, 0, "logout --account it2")
+        assert "compte %s déconnecté" % ALIAS2 in r.stdout
+        assert json.loads(own2.ok("status").stdout)["status"] == "unauthenticated", "bw déconnecté"
+        # session relue par le magasin de sshvault lui-même (keyring ou repli fichier)
+        r = subprocess.run([sys.executable, "-c", "from sshvault.session import SessionStore; "
+                            "print(SessionStore(alias=%r).get() is None)" % ALIAS2],
+                           env=home["env"], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        assert r.returncode == 0 and r.stdout.strip() == "True", "logout : session de it2 oubliée"
+        assert open(cfg).read() == before, "logout : blocs gardés"
+        if HAVE_OPENSSH:
+            rc, listing = agent_list(sock)
+            assert rc == 0 and [l.split()[1] for l in listing] == [ssh_keys["hotes"]["public"].split()[1]], \
+                "logout : seule la clé de it2 retirée"
+            # marqueur `logged-out` : ensure sans invite propose login (vrai `bw status`)
+            r = sv(home, "--nointeraction", "ensure", "--account", ALIAS2, "--id", id2)
+            ok(r, 3, "ensure après logout")
+            assert "sshvault login --account %s" % ALIAS2 in r.stderr, "ensure après logout : login proposé"
+        r = sv(home, "--nointeraction", "ssh-config", "--check")
+        assert r.returncode == 0, "ssh-config --check après logout : code %d ; stdout : %s" % (
+            r.returncode, scrub(r.stdout.strip()))
+        assert open(cfg).read() == before, "ssh-config --check après logout : blocs gardés"
+        r = sv(home, "logout", "--account", ALIAS2)
+        ok(r, 0, "logout d'un compte déjà déconnecté")
+        assert "rien à faire" in r.stdout
+        out = sv_login(home, account2, report, alias=ALIAS2, own=own2)
+        assert "compte %s : connecté, coffre déverrouillé" % ALIAS2 in out
+        if HAVE_OPENSSH:
+            r = sv(home, "--nointeraction", "ensure", "--account", ALIAS2, "--id", id2)
+            ok(r, 0, "ensure après logout puis login (marqueur retiré)")
+        report.add("logout puis login (second compte)", note="ok")
+
+        # account set aller-retour : e-mail factice (logout, blocs retirés), puis le vrai, login
+        fake = "sshvault-it-%s@example.invalid" % TAG
+        r = sv(home, "account", "set", ALIAS2, "--email", fake)
+        ok(r, 0, "account set (aller)")
+        assert "déconnecté de l'ancien compte" in r.stdout and "sshvault login --account %s" % ALIAS2 in r.stdout
+        assert json.loads(own2.ok("status").stdout)["status"] == "unauthenticated", "set : bw déconnecté"
+        text = open(cfg).read()
+        assert "--account %s --id" % ALIAS2 not in text and "--account %s --id" % ALIAS in text, "set : blocs retirés"
+        r = sv(home, "account", "set", ALIAS2, "--email", fake.upper())
+        ok(r, 0, "account set sans changement")
+        assert "rien fait" in r.stdout
+        r = sv(home, "account", "set", ALIAS2, "--email", account2.email)
+        ok(r, 0, "account set (retour)")
+        out = sv_login(home, account2, report, alias=ALIAS2, own=own2)
+        assert "compte %s : connecté, coffre déverrouillé" % ALIAS2 in out
+        r = sv(home, "--nointeraction", "status", "--account", ALIAS2)
+        ok(r, 0, "status après account set et login")
+        assert "avertissement" not in r.stderr
+        assert "ensure --account %s --id %s\"" % (ALIAS2, id2) in open(cfg).read(), "login : blocs régénérés"
+        report.add("account set aller-retour (second compte)", note="ok")
         r = sv(home, "lock")
         ok(r, 0, "lock des deux comptes")
         for alias in (ALIAS, ALIAS2):

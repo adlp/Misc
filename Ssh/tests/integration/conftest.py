@@ -32,6 +32,13 @@ KEYS = ("SSHVAULT_IT_SERVER", "SSHVAULT_IT_EMAIL", "SSHVAULT_IT_PASSWORD", "NODE
 KEYS2 = ("SSHVAULT_IT2_SERVER", "SSHVAULT_IT2_EMAIL", "SSHVAULT_IT2_PASSWORD")
 
 
+def pytest_configure(config):
+    # traceback court : le format long affiche la valeur des fixtures (sessions bw, clés de
+    # test, environnement) dans la sortie d'un échec
+    if config.option.tbstyle in ("auto", "long"):
+        config.option.tbstyle = "short"
+
+
 class Account:
     """Identifiants du compte de test ; jamais affichés."""
 

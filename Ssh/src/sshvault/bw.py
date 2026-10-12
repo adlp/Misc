@@ -32,16 +32,19 @@ import subprocess
 import termios
 from typing import Callable, Optional
 
-from .backend import (FORWARD_FIELD, HOSTS_FIELD, BackendError, BackendNotFound, ItemNotFound, NotLoggedIn,
+from .backend import (FORWARD_FIELD, HOSTS_FIELD, BackendError, BackendNotFound, ItemNotFound, LogoutUnknown,
+                      NotLoggedIn,
                       PasswordRefused, Prompt, SshKeyItem, VaultBackend, VaultError, VaultLocked, VaultStatus, WriteFailed,
                       normalize_fingerprint, normalize_hosts, parse_hosts)
 from .fsutil import ensure_dir, exe_problem, exposure_warning
 from .session import DEFAULT_TTL, SessionStore, SessionStoreError, valid_token
-from .settings import seconds
+from .settings import account_dir, clear_logged_out, data_root, is_logged_out, seconds  # noqa: F401 (réexportés)
+from .settings import logged_out_path, set_logged_out
 from .text import clean as _clean
 
 DEFAULT_TIMEOUT = 60.0
 LOGIN_TIMEOUT = 600.0  # login interactif (saisie, 2FA)
+REREAD_TIMEOUT = 10.0  # relecture de `bw status` après un `bw logout` sans réponse (local, rapide)
 SSH_KEY_TYPE = 5
 PASSWORD_VAR = "SSHVAULT_BW_MASTER_PASSWORD"
 EXE_VAR = "SSHVAULT_BW"
@@ -88,23 +91,9 @@ def last_line(text: str) -> str:
     return one_line((useful or lines or [""])[-1])
 
 
-def data_root(env=None) -> str:
-    """`${XDG_DATA_HOME:-~/.local/share}/sshvault`."""
-    env = os.environ if env is None else env
-    base = env.get("XDG_DATA_HOME") or ""
-    if not os.path.isabs(base):
-        base = os.path.join(os.path.expanduser("~"), ".local", "share")
-    return os.path.join(base, "sshvault")
-
-
 def default_appdata(env=None) -> str:
     """Dossier de données de bw de la 0.8.0 (un seul compte), repris à l'adoption."""
     return os.path.join(data_root(env), "bw")
-
-
-def account_dir(alias: str, env=None) -> str:
-    """Données locales d'un compte : `<data_root>/accounts/<alias>`."""
-    return os.path.join(data_root(env), "accounts", alias)
 
 
 def account_appdata(alias: str, env=None) -> str:
@@ -212,6 +201,8 @@ class BwBackend(VaultBackend):
         self.appdata = appdata or default_appdata()
         self.timeout = timeout if timeout is not None else bw_timeout()
         self.calls = 0  # nombre d'appels à bw (mesure du coût : ~1,4 s chacun)
+        self.marker_cleared = False  # marqueur `logged-out` retiré par cette commande (bw vu connecté)
+        self.marker_warning: Optional[str] = None  # avertissement « non retiré », dit une fois
         self.warnings: list = []  # avertissements d'une ligne pour l'utilisateur
 
     @property
@@ -390,17 +381,51 @@ class BwBackend(VaultBackend):
         except SessionStoreError:
             pass
 
-    def _bw_status(self, session: Optional[str]) -> VaultStatus:
-        r = self._run(["status"], session=session)
+    def _seen_connected(self) -> None:
+        """bw vu connecté (état lu, déverrouillage ou login réussi) : le marqueur `logged-out` du
+        compte (posé par `sshvault logout`) est retiré. Point commun à tous les chemins ; échec :
+        avertissement de fin de commande."""
+        if not self.label:
+            return
+        try:
+            if is_logged_out(self.label):
+                clear_logged_out(self.label)
+                self.marker_cleared = True
+        except OSError as e:
+            if self.marker_warning is None:  # une fois par backend
+                self.marker_warning = ("marqueur %s non retiré (%s) : « sshvault ensure » continuera de proposer "
+                                       "« sshvault login »" % (logged_out_path(self.label), e.strerror or e))
+                self.warnings.append(self.marker_warning)
+
+    def restore_marker(self) -> None:
+        """bw finalement non connecté alors que cette commande avait retiré le marqueur : reposé
+        (échec : avertissement)."""
+        if not (self.label and self.marker_cleared):
+            return
+        try:
+            set_logged_out(self.label)
+            self.marker_cleared = False
+        except OSError as e:
+            self.warnings.append("marqueur %s non reposé (%s) : « sshvault ensure » ne proposera pas de relancer "
+                                 "« sshvault login »" % (logged_out_path(self.label), e.strerror or e))
+
+    def _bw_status(self, session: Optional[str], timeout: Optional[float] = None) -> VaultStatus:
+        r = self._run(["status"], session=session, timeout=timeout)
         if r.rc != 0:
             raise self._fail(r, "status")
         d = self._json(r, "status")
         state = d.get("status") if isinstance(d, dict) else None
         if state not in ("unauthenticated", "locked", "unlocked"):
             raise BackendError("erreur bw : état inconnu dans « status » : %r" % (state,))
+        if state != "unauthenticated":
+            self._seen_connected()
         return VaultStatus(state, d.get("serverUrl"), d.get("userEmail"), d.get("lastSync"))
 
-    def status(self) -> VaultStatus:
+    def status(self, forget: bool = True) -> VaultStatus:
+        """État du compte dans bw. `forget=False` : sonde sans effet, sans lire ni toucher la
+        session rangée (« unlocked » n'est alors jamais rendu : « locked » pour un compte connecté)."""
+        if not forget:
+            return self._bw_status(None)
         session = self.store.get()
         st = self._bw_status(session)
         if session and st.state != "unlocked":
@@ -436,6 +461,7 @@ class BwBackend(VaultBackend):
         token = r.out.strip()
         if not valid_token(token):
             raise BackendError("erreur bw : « unlock » n'a pas renvoyé de session")
+        self._seen_connected()  # tout déverrouillage réussi (unlock, invite de load, list, ensure…)
         try:
             self.store.put(token, ttl)
         except SessionStoreError as e:
@@ -504,6 +530,53 @@ class BwBackend(VaultBackend):
         if r.rc != 0 and not r.has(MSG_NOT_LOGGED_IN):
             raise self._fail(r, "lock")
 
+    def logout(self) -> bool:
+        """`bw logout` dans les données de ce compte, puis session oubliée (même si bw échoue ou
+        si l'appel est interrompu). True : déconnecté ; False : rien à faire (bw non connecté, ou
+        dossier de données absent : jamais créé ici). BackendError (bw en erreur…) : toujours
+        connecté, sauf LogoutUnknown : bw sans réponse et état relu impossible. Après un délai
+        dépassé, l'état est relu (délai court) : déconnecté quand même → True. Session
+        impossible à oublier : avertissement si bw a répondu (bw déconnecté, elle ne sert plus) ;
+        sinon l'appelant le dit."""
+        r, first = None, None
+        if os.path.isdir(self.appdata):
+            try:
+                r = self._run(["logout"])
+            except (SystemExit, GeneratorExit):
+                raise
+            except BwTimeout as e:
+                # bw tué : il a pu se déconnecter avant ; l'état relu (délai court) tranche
+                try:
+                    gone = self._bw_status(None, timeout=min(self.timeout, REREAD_TIMEOUT)).state == "unauthenticated"
+                except (SystemExit, GeneratorExit):
+                    raise
+                except BackendError as e2:
+                    first = LogoutUnknown("%s ; état relu impossible (%s)" % (e, e2))
+                except BaseException as e2:  # interrompu pendant la relecture : session oubliée quand même
+                    first = e2
+                else:
+                    if gone:
+                        r = Result(0, "", "")
+                    else:
+                        e.reread_connected = True  # relu : toujours connecté (état connu)
+                        first = e
+            except BaseException as e:  # session oubliée quand même ; l'erreur de bw est gardée
+                first = e
+        not_logged_in = r is not None and r.rc != 0 and r.has(MSG_NOT_LOGGED_IN)
+        failed = first is not None or (r is not None and r.rc != 0 and not not_logged_in)
+        try:
+            self.store.clear()
+        except SessionStoreError as e:
+            if not failed:
+                self.warnings.append("session non oubliée : %s" % e)
+        if first is not None:
+            raise first
+        if r is None or not_logged_in:
+            return False
+        if r.rc != 0:
+            raise self._fail(r, "logout")
+        return True
+
     def sync(self, prompt: Optional[Prompt] = None) -> None:
         # commandes réseau de sshvault : sync, login, edit et create (mesuré : status, unlock, lock, list
         # et get lisent le cache local, aucune connexion)
@@ -534,6 +607,7 @@ class BwBackend(VaultBackend):
                                % (r.rc, _clean(st.user or "?")))
         token = r.out.strip()
         if valid_token(token) and not apikey:
+            self._seen_connected()
             try:
                 self.store.put(token, ttl)
             except SessionStoreError as e:
@@ -547,15 +621,17 @@ class BwBackend(VaultBackend):
         if email and (st.user or "").strip().lower() != email.strip().lower():
             # clé API d'un autre compte : ses données ne restent pas sous cet alias
             try:
-                out = self._run(["logout"])
-                logged_out = out.rc == 0
+                outcome = "déconnecté" if self.logout() else "déjà déconnecté"
+                self.restore_marker()  # retiré quand bw a été vu connecté (à l'autre compte)
+            except LogoutUnknown as e:
+                self.restore_marker()
+                outcome = ("bw logout sans réponse (%s) : état de connexion inconnu, données sous cet alias (%s)"
+                           % (e, self.appdata))
             except BackendError:
-                logged_out = False
+                outcome = ("bw logout en échec : les données de %s restent sous cet alias (%s)"
+                           % (_clean(st.user or "?"), self.appdata))
             raise BackendError("erreur bw : la clé API est celle de %s, pas de %s (compte %s) : %s"
-                               % (_clean(st.user or "?"), _clean(email), _clean(self.label or "?"),
-                                  "déconnecté" if logged_out else
-                                  "bw logout en échec : les données de %s restent sous cet alias (%s)"
-                                  % (_clean(st.user or "?"), self.appdata)))
+                               % (_clean(st.user or "?"), _clean(email), _clean(self.label or "?"), outcome))
         if valid_token(token):
             try:
                 self.store.put(token, ttl)

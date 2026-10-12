@@ -14,9 +14,12 @@ Codes de sortie :
      fichier refusé — illisible, pas une clé privée, type ou format non accepté — ou --name
      avec plusieurs fichiers ; generate : type, bits, nom ou commentaire refusés ; deploy :
      cible, port ou options ssh invalides ; comptes : alias inconnu ou invalide, alias ou
-     couple serveur + e-mail déjà enregistré, serveur ou e-mail invalide, écriture ou login
-     sans --account alors que plusieurs comptes sont possibles, aucun compte par défaut,
-     account rename vers un alias déjà pris, account add : dossier accounts/<alias> existant)
+     couple serveur + e-mail déjà enregistré, serveur ou e-mail invalide, écriture, login ou
+     logout sans --account alors que plusieurs comptes sont possibles, logout ou account set
+     avec un bw-path invalide (rien fait), aucun compte par défaut,
+     account rename vers un alias déjà pris, account add : dossier accounts/<alias> existant,
+     account set sans --server ni --email, ou registre refusé après la déconnexion : ce qui
+     est déjà fait est dit)
   3  non connecté au coffre, aucun compte enregistré, ou coffre verrouillé (aucune invite
      possible, mot de passe refusé) ;
      agent dédié arrêté ou verrouillé (ensure --forward compris) ; passphrase d'une clé
@@ -41,7 +44,10 @@ Codes de sortie :
      joker de glob), adoption de l'installation 0.8.0 impossible (rien modifié ; account add
      refusé tant qu'elle n'est pas faite), account rename : destination existante ou
      déplacement impossible, account remove : données impossibles à supprimer, magasin de
-     session ou agent en erreur (clés laissées), ou erreur interne
+     session ou agent en erreur (clés laissées), logout et account set : agent verrouillé ou
+     en erreur (rien modifié, ou état partiel dit) ou bw logout en échec ou sans réponse (compte
+     toujours connecté, ou état inconnu ; set : registre inchangé), account set : registre
+     non écrit après la déconnexion, ou erreur interne
   130 interrompu (Ctrl-C, SIGTERM, SIGHUP)
 `ensure` (appelé par ssh, Match exec) : 0 si la clé est présente ou chargée, et pour `ssh -G` ;
 sinon le code de l'erreur, sans effet sur ssh (le Match ne porte aucune directive).
@@ -64,6 +70,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import signal
 import sys
 import time
@@ -77,10 +84,10 @@ from .agentstate import entry as state_entry, maybe_locked, reconcile, remaining
 from . import accounts as accounts_mod
 from .accounts import (AccountError, AccountIOError, Accounts, AdoptError, NoAccount, adopt_legacy,
                        pending_message, tag)
-from .backend import (FORWARD_FIELD, HOSTS_FIELD, BackendError, InvalidHost, ItemNotFound, NotLoggedIn, SshKeyItem, VaultBackend, VaultError,
+from .backend import (FORWARD_FIELD, HOSTS_FIELD, BackendError, InvalidHost, ItemNotFound, LogoutUnknown, NotLoggedIn, SshKeyItem, VaultBackend, VaultError,
                       VaultLocked, WriteFailed, normalize_hosts, valid_host)
 from .bw import EXE_VAR as BW_EXE_VAR, BwBackend, account_dir, reset_process_state
-from .config import (ACCOUNTS, BW_PATH, DEFAULT_ACCOUNTS, Config, ConfigError, ConfigWriteError, check_alias,
+from .config import (ACCOUNTS, BW_PATH, DEFAULT_ACCOUNTS, DEFAULT_SERVER, Config, ConfigError, ConfigWriteError, check_alias,
                      describe_duration, normalize_email, normalize_server, parse_duration)
 from . import deploy as deploy_mod
 from . import ensure as ensure_mod
@@ -91,7 +98,7 @@ from .ensure import Deadline
 from .prompt import DEFAULT_TIMEOUT as PROMPT_TIMEOUT, PromptError, ask_password, prompt_timeout
 from .bw import DEFAULT_TIMEOUT as BW_TIMEOUT
 from .session import DEFAULT_TTL, SessionStore, SessionStoreError
-from .settings import seconds
+from .settings import logged_out_path, seconds, set_logged_out
 from .text import clean  # texte venu du coffre, pour un terminal
 from . import sshconfig
 
@@ -179,10 +186,12 @@ def build_parser() -> Parser:
                       "ssh-config --check : pas à jour ; import : déjà dans le coffre ; generate : nom "
                       "déjà pris), 2 usage (hôte invalide, sélection ambiguë, import : fichier refusé, "
                       "generate : type ou commentaire refusé, deploy : cible invalide, config set bw-path : "
-                      "chemin refusé ; comptes : alias inconnu, invalide ou pris, --account requis), "
+                      "chemin refusé ; comptes : alias inconnu, invalide ou pris, --account requis, "
+                      "account set sans option ou registre refusé après la déconnexion, logout/set : "
+                      "bw-path invalide), "
                       "3 aucun compte, non connecté ou verrouillé (coffre ou agent, passphrase refusée), "
                       "4 erreur backend ou agent, écriture ou ssh_config impossible, install refusé, "
-                      "adoption 0.8.0 impossible, account rename/remove en échec, "
+                      "adoption 0.8.0 impossible, account rename/remove/set ou logout en échec, "
                       "ssh-keygen ou ssh en échec, "
                       "130 interrompu. "
                       "status : 0 déverrouillé, 3 sinon ; agent status : 0 actif, 3 arrêté, 4 sous-agent de "
@@ -198,6 +207,9 @@ def build_parser() -> Parser:
     s = sub.add_parser("login", help="connexion d'un compte au coffre (interactive, déléguée à bw : bw login <e-mail>)")
     _account_flag(s, "compte à connecter (obligatoire s'il y a plusieurs comptes)")
     s.add_argument("--apikey", action="store_true", help="connexion par clé API (BW_CLIENTID/BW_CLIENTSECRET)")
+    s = sub.add_parser("logout", help="déconnecte un compte (bw logout), oublie sa session et retire ses clés des "
+                                      "agents ; compte et ssh_config gardés")
+    _account_flag(s, "compte à déconnecter (obligatoire s'il y a plusieurs comptes)")
     s = sub.add_parser("unlock", help="déverrouille le coffre et garde la session (une invite par compte)")
     _account_flag(s)
     s.add_argument("--ttl", type=ttl_arg, default=DEFAULT_TTL, metavar="SECONDES",
@@ -209,7 +221,7 @@ def build_parser() -> Parser:
     s = sub.add_parser("list", help="liste les clés SSH du coffre")
     _account_flag(s)
     s.add_argument("--json", action="store_true", help="sortie JSON")
-    s = sub.add_parser("account", help="comptes du coffre : add, list, remove, default, rename")
+    s = sub.add_parser("account", help="comptes du coffre : add, list, remove, default, rename, set")
     asub = s.add_subparsers(dest="account_cmd", metavar="ACTION", parser_class=Parser)
     asub.required = True
     a = asub.add_parser("add", help="enregistre un compte (alias → serveur + e-mail) ; puis « sshvault login »")
@@ -222,6 +234,12 @@ def build_parser() -> Parser:
     a.add_argument("alias", metavar="ALIAS", type=account_arg)
     a = asub.add_parser("default", help="remplace la liste des comptes par défaut")
     a.add_argument("aliases", metavar="ALIAS", nargs="+", type=account_arg)
+    a = asub.add_parser("set", help="change le serveur ou l'e-mail d'un compte : déconnecté s'il l'était, ses clés "
+                                    "retirées des agents et ses blocs du ssh_config, puis « sshvault login » ; sauf si "
+                                    "bw y est déjà connecté (registre seul corrigé)")
+    a.add_argument("alias", metavar="ALIAS", type=account_arg)
+    a.add_argument("--server", metavar="URL", help="nouvelle URL du serveur Vaultwarden")
+    a.add_argument("--email", metavar="E", help="nouvel e-mail du compte")
     a = asub.add_parser("rename", help="renomme un compte (données, état des agents, ssh_config)")
     a.add_argument("old", metavar="ANCIEN", type=account_arg)
     a.add_argument("new", metavar="NOUVEAU", type=account_arg)
@@ -456,6 +474,8 @@ def run(args, accts: Accounts) -> int:
         else:
             print(who + "connecté ; lancer « %s » pour déverrouiller" % b.cmd("unlock"))
         return _regen_after_login()
+    if args.cmd == "logout":
+        return run_logout(args, accts)
     if args.cmd == "unlock":
         def unlock(a, b):
             b.unlock(prompt, ttl=args.ttl)
@@ -539,26 +559,50 @@ def run_status(args, accts: Accounts) -> int:
                  "unlocked": "déverrouillé"}[st.state]
         info = b.info()
         print("coffre : %s" % label)
-        print("serveur : %s" % clean(st.server or reg["server"]))
+        # connecté : serveur de bw (`serverUrl` nul = serveur par défaut, comme l'avertissement)
+        print("serveur : %s" % clean(_bw_server(st)[0] if st.state != "unauthenticated" else st.server or reg["server"]))
         print("compte : %s" % clean(st.user or reg["email"]))
         session = info["session"] if st.state == "unlocked" else None
         print("session : %s" % (session or "aucune"))
         print("magasin : %s" % info["store"])
         print("données : %s" % info["data"])
+        diffs, want = [], {}
+        if st.state != "unauthenticated":
+            raw, srv = _bw_server(st)  # `serverUrl` nul : serveur par défaut, comme `account set`
+            if (srv or raw) != reg["server"]:
+                diffs.append("au serveur %s, le registre dit %s" % (clean(raw), reg["server"]))
+                want["--server"] = srv
         if st.user and st.user.strip().lower() != reg["email"]:
-            err("avertissement : %sbw est connecté comme %s, le registre dit %s"
-                % (accts.prefix(a), clean(st.user), reg["email"]))
-        if st.state != "unauthenticated" and st.server:
+            diffs.append("comme %s, le registre dit %s" % (clean(st.user), reg["email"]))
             try:
-                srv = normalize_server(st.server)
+                want["--email"] = normalize_email(st.user)
             except ConfigError:
-                srv = st.server
-            if srv != reg["server"]:
-                err("avertissement : %sbw est connecté au serveur %s, le registre dit %s"
-                    % (accts.prefix(a), clean(st.server), reg["server"]))
+                want["--email"] = None
+        if diffs:
+            err("avertissement : %sbw est connecté %s : %s"
+                % (accts.prefix(a), " et ".join(diffs), _status_remedy(a, want, reg, accts.registry)))
         if st.state != "unlocked":
             rc = max(rc, RC_LOCKED)
     return rc
+
+
+def _status_remedy(alias: str, want: dict, reg: dict, registry: dict) -> str:
+    """Remède d'un écart entre bw et le registre (`want` : {option : valeur de bw normalisée, ou
+    None si invalide}) : corriger le registre par un seul `account set` (valeurs de bw, citées
+    pour le shell ; invalide : à saisir), sinon reconnecter (`logout`, `login`). Couple de bw
+    déjà enregistré sous un autre alias : reconnecter seulement."""
+    again = "« sshvault logout --account %s » puis « sshvault login --account %s »" % (alias, alias)
+    pair = (want.get("--server", reg["server"]), want.get("--email", reg["email"]))
+    if None not in pair:
+        other = [x for x, v in registry.items() if x != alias and (v["server"], v["email"]) == pair]
+        if other:
+            return "ce compte est celui de l'alias « %s » : reconnecter : %s" % (other[0], again)
+    opts = " ".join("%s %s" % (f, clean(shlex.quote(v)) if v is not None else {"--email": "E", "--server": "URL"}[f])
+                    for f, v in want.items())
+    fix = "« sshvault account set %s %s »" % (alias, opts)
+    if None in want.values():
+        fix += " puis « sshvault login --account %s »" % alias
+    return "registre à corriger : %s, sinon reconnecter : %s" % (fix, again)
 
 
 def _clear_unlock_failure(alias: Optional[str] = None) -> None:
@@ -630,6 +674,8 @@ def run_account(args, accts: Accounts, prompt) -> int:
         return account_rename(args, accts)
     if cmd == "remove":
         return account_remove(args, accts)
+    if cmd == "set":
+        return account_set(args, accts)
     raise UsageError("action inconnue : account %s" % cmd)
 
 
@@ -778,6 +824,180 @@ def _known_items() -> dict:
         return {}
 
 
+def _account_ids(b) -> tuple:
+    """(ids des éléments du compte, connus ?) : lus sans invite si le compte est déverrouillé,
+    pour les entrées d'état sans compte (chargées avant la 0.9.0)."""
+    try:
+        if b.store.get():
+            return {i.id.lower() for i in b.list_ssh_keys(None)}, True
+    except (VaultError, SessionStoreError, ConfigError):
+        pass
+    return set(), False
+
+
+def _mine_candidate(e: dict, alias: str) -> bool:
+    """Entrée d'état qui peut être au compte `alias` (à lui, sans compte, ou référence `also` à
+    lui ou sans compte), avant toute lecture du coffre."""
+    if e.get("account") in (None, "", alias):
+        return True
+    return any(isinstance(x, str) and fastpath._pair(x)[0] in (None, alias) for x in e.get("also") or [])
+
+
+def _check_agents(alias: str, agents, kept: str, retry: str):
+    """Avant tout appel à bw et tout effet : état de chaque agent (dédié, sous-agents) lu, et
+    ceux qui portent une clé possible du compte listés et contrôlés non verrouillés. Renvoie
+    [(agent, état, clés listées)] ; None si un agent est verrouillé ou en erreur (une ligne :
+    `kept`, ce qui reste ; `retry`, commande à relancer)."""
+    base, main, subs = agents
+    if base is None:
+        return []
+    out, now = [], time.time()
+    for a in _states(base, main, subs):
+        try:
+            data = a.state.load()
+            present = {}
+            cand = [fp for fp, e in data["keys"].items() if _mine_candidate(e, alias)]
+            if cand and os.path.exists(a.socket):
+                present = {k.fingerprint: k for k in a.keys()}
+                live = [fp for fp in cand if remaining(data["keys"][fp], now) != 0]
+                if live and (data.get("locked") or maybe_locked(data, set(present))):
+                    raise AgentLocked("agent verrouillé")
+            out.append((a, data, present))
+        except AgentError as e:
+            _agents_failed(alias, a, e, kept, retry)
+            return None
+    return out
+
+
+def _agents_failed(alias: str, a, e, what: str, retry: str) -> None:
+    err("clés de %s dans l'agent %s non retirées (%s) : %s ; « sshvault agent unlock » puis relancer « %s »"
+        % (alias, a.socket, e, what, retry))
+
+
+def _unload_account(alias: str, accts: Accounts, b, checked: list, kept: str, retry: str):
+    """Clés du compte `alias` retirées des agents vérifiés par `_check_agents` ; une clé partagée
+    avec un autre compte reste, promue à l'autre détenteur. À appeler sous ensure.lock. `bw
+    list` seulement pour des entrées sans compte (chargées avant la 0.9.0). Renvoie (clés
+    retirées, empreintes chargées avant la 0.9.0 laissées, état d'un agent modifié ?) ; None si
+    un retrait échoue : une ligne (`kept` si rien n'a encore été modifié, sinon l'état partiel,
+    agent en cours nommé ; `retry` : commande à relancer)."""
+    removed, legacy_left, changed = 0, set(), []
+    legacy = any(not e.get("account") or any(isinstance(x, str) and fastpath._pair(x)[0] is None
+                                             for x in e.get("also") or [])
+                 for _, data, _ in checked for e in data["keys"].values())
+    ids, ids_known = _account_ids(b) if legacy else (set(), True)
+    known = _known_items()
+    now = time.time()
+    plans = []
+    for a, data, present in checked:  # 1) plan, rien retiré
+        if not ids_known:
+            # entrées d'avant la 0.9.0 sans compte, que rien n'attribue à un autre compte
+            legacy_left |= {fp for fp, e in data["keys"].items() if not e.get("account") and not any(
+                fastpath._pair(x)[0] in accts.registry and fastpath._pair(x)[0] != alias
+                for x in e.get("also") or [] if isinstance(x, str))}
+        copy = dict(data, keys={k: dict(v) for k, v in data["keys"].items()})
+        unload = _drop_account(copy, alias, ids, known)
+        if copy != data:
+            plans.append((a, data, unload, present))
+    for a, data, unload, present in plans:  # 2) retrait
+        here = 0
+        try:
+            for fp in unload:
+                if fp not in present:
+                    continue
+                try:
+                    a.remove(present[fp])
+                    here += 1  # vrais retraits seulement
+                except AgentError:
+                    # clé partie entre les deux passes (durée de vie écoulée, ssh-add -d) : retirée ;
+                    # mais un agent qui ne liste plus rien alors que la clé vit encore est sans doute
+                    # verrouillé : aucune info sûre = tout garder (entrée gardée, code 4)
+                    listed = {k.fingerprint for k in a.keys()}
+                    if fp in listed:
+                        raise
+                    if data.get("locked") or (not listed and remaining(data["keys"][fp], now) != 0):
+                        raise AgentLocked("agent verrouillé") from None
+                removed += 1
+            late = set()
+
+            def drop_planned(dd):
+                # état frais : une clé du compte arrivée pendant la commande (load hors verrou)
+                # n'était pas au plan ; elle reste chargée : son entrée est gardée
+                before = {k: dict(v) for k, v in dd["keys"].items()}
+                for fp in _drop_account(dd, alias, ids, known) - set(unload):
+                    dd["keys"][fp] = before[fp]
+                    late.add(fp)
+            a.update(drop_planned)
+            changed.append(a)
+            if late:
+                err("avertissement : %d clé%s de %s chargée%s pendant la commande laissée%s dans l'agent %s "
+                    "(« sshvault agent purge » ou relancer « %s »)"
+                    % (len(late), "s" if len(late) > 1 else "", alias, "s" if len(late) > 1 else "",
+                       "s" if len(late) > 1 else "", a.socket, retry))
+        except AgentError as e:
+            if removed or changed:
+                parts = [_keys_removed(removed)]
+                if changed:
+                    parts.append("agent%s %s déjà mis à jour" % ("s" if len(changed) > 1 else "",
+                                                                 ", ".join(x.socket for x in changed)))
+                if here:
+                    parts.append("agent %s partiellement modifié" % a.socket)
+                what = "état partiel : " + ", ".join(parts)
+            else:
+                what = kept
+            _agents_failed(alias, a, e, what, retry)
+            return None
+    return removed, legacy_left, bool(changed)
+
+
+def _session_state(b) -> Optional[bool]:
+    """Session rangée du compte ? None : magasin de session en erreur."""
+    try:
+        return b.store.get() is not None
+    except SessionStoreError:
+        return None
+
+
+def _forget_session(b) -> None:
+    """Session oubliée sans bw (compte non connecté) ; échec : avertissement de fin de commande."""
+    try:
+        b.store.clear()
+    except SessionStoreError as e:
+        b.warnings.append("session non oubliée : %s" % e)
+
+
+def _forgot(b, had: Optional[bool]) -> bool:
+    return had is True and _session_state(b) is False
+
+
+def _set_logged_out_marker(alias: str, b=None) -> None:
+    """Pose le marqueur `logged-out` du compte (dans son dossier persistant, lu par ensure),
+    seulement si ce dossier existe ; il est retiré par le backend dès que bw est vu connecté.
+    Un avertissement « non retiré » du backend `b` dans la même commande est retiré (la
+    commande pose le marqueur). Échec (chemin occupé, droits…) : avertissement."""
+    if b is not None:
+        b.marker_cleared = False
+        if b.marker_warning in b.warnings:
+            b.warnings.remove(b.marker_warning)
+    try:
+        set_logged_out(alias)
+    except OSError as e:
+        err("avertissement : marqueur %s non posé (%s) : « sshvault ensure » ne proposera pas de relancer "
+            "« sshvault login »" % (logged_out_path(alias), e.strerror or e))
+
+
+def _legacy_left_warning(alias: str, legacy_left: set) -> None:
+    if legacy_left:
+        n = len(legacy_left)
+        err("avertissement : %d clé%s chargée%s avant la 0.9.0 (compte inconnu, %s verrouillé) laissée%s dans les "
+            "agents (« sshvault agent purge » pour les retirer)"
+            % (n, "s" if n > 1 else "", "s" if n > 1 else "", alias, "s" if n > 1 else ""))
+
+
+def _keys_removed(n: int) -> str:
+    return "%d clé%s retirée%s des agents" % (n, "s" if n > 1 else "", "s" if n > 1 else "")
+
+
 def account_remove(args, accts: Accounts) -> int:
     """Sous ensure.lock, dans cet ordre : clés du compte retirées des agents (dédié et
     sous-agents ; une clé partagée avec un autre compte reste, promue), puis compte verrouillé
@@ -788,47 +1008,16 @@ def account_remove(args, accts: Accounts) -> int:
     alias = accts.check(args.alias)
     rc = RC_OK
     b = accts.backend(alias)
-    ids, ids_known = set(), False
-    try:
-        if b.store.get():  # déverrouillé : ses ids, pour les entrées d'état sans compte (avant CAP-10)
-            ids = {i.id.lower() for i in b.list_ssh_keys(None)}
-            ids_known = True
-    except (VaultError, SessionStoreError, ConfigError):
-        pass
     d = account_dir(alias)
-    removed, legacy_left = 0, set()
-    known = _known_items()
-    base, main, subs = _agents_with_ensure_lock()
-    with _locked_or_null(base):
-        if base is not None:
-            now = time.time()
-            for a in _states(base, main, subs):
-                try:
-                    data = a.state.load()
-                    if not ids_known:
-                        # entrées d'avant la 0.9.0 sans compte, que rien n'attribue à un autre compte
-                        legacy_left |= {fp for fp, e in data["keys"].items() if not e.get("account") and not any(
-                            fastpath._pair(x)[0] in accts.registry and fastpath._pair(x)[0] != alias
-                            for x in e.get("also") or [] if isinstance(x, str))}
-                    copy = dict(data, keys={k: dict(v) for k, v in data["keys"].items()})
-                    unload = _drop_account(copy, alias, ids, known)
-                    if copy == data:
-                        continue
-                    if unload and os.path.exists(a.socket):
-                        present = {k.fingerprint: k for k in a.keys()}
-                        live = [fp for fp in unload if remaining(data["keys"][fp], now) != 0]
-                        if live and (data.get("locked") or maybe_locked(data, set(present))):
-                            raise AgentLocked("agent verrouillé")
-                        for fp in unload:
-                            if fp in present:
-                                a.remove(present[fp])
-                                removed += 1
-                    a.update(lambda dd: _drop_account(dd, alias, ids, known))
-                except AgentError as e:
-                    err("clés de %s dans l'agent %s non retirées (%s) : compte gardé, rien supprimé ; « sshvault agent "
-                        "unlock » puis relancer « sshvault account remove %s »" % (alias, a.socket, e, alias))
-                    return RC_BACKEND
-            _clear_unlock_failure(alias)
+    agents = _agents_with_ensure_lock()
+    kept, again = "compte gardé, rien supprimé", "sshvault account remove %s" % alias
+    with _locked_or_null(agents[0]):
+        checked = _check_agents(alias, agents, kept, again)
+        done = None if checked is None else _unload_account(alias, accts, b, checked, kept, again)
+        if done is None:
+            return RC_BACKEND
+        removed, legacy_left, _ = done
+        _clear_unlock_failure(alias)
         try:
             b.lock()
         except (VaultError, SessionStoreError, ConfigError) as e:
@@ -849,14 +1038,209 @@ def account_remove(args, accts: Accounts) -> int:
             dd[ACCOUNTS].pop(alias, None)
             dd[DEFAULT_ACCOUNTS] = [a for a in dd.get(DEFAULT_ACCOUNTS, []) if a != alias]
         accts.cfg.update(drop)
-    if legacy_left:
-        n = len(legacy_left)
-        err("avertissement : %d clé%s chargée%s avant la 0.9.0 (compte inconnu, %s verrouillé) laissée%s dans les "
-            "agents (« sshvault agent purge » pour les retirer)"
-            % (n, "s" if n > 1 else "", "s" if n > 1 else "", alias, "s" if n > 1 else ""))
-    print("compte %s retiré : session oubliée, données locales supprimées, %d clé%s retirée%s des agents ; "
-          "rien n'est modifié dans le coffre" % (alias, removed, "s" if removed > 1 else "", "s" if removed > 1 else ""))
+    _legacy_left_warning(alias, legacy_left)
+    print("compte %s retiré : session oubliée, données locales supprimées, %s ; rien n'est modifié dans le coffre"
+          % (alias, _keys_removed(removed)))
     return max(rc, _regen_after_registry_change())
+
+
+def _logout_failed(alias: str, b, e: BaseException, removed: int, had: Optional[bool], again: str,
+                   extra: str = "") -> int:
+    """`bw logout` en échec : une ligne qui dit ce qui reste et ce qui est fait, code 4. État
+    inconnu (LogoutUnknown) : marqueur posé (retiré dès que bw sera vu connecté)."""
+    if isinstance(e, LogoutUnknown):
+        _set_logged_out_marker(alias, b)
+    after = _session_state(b)
+    done = [_keys_removed(removed)]
+    if had:
+        done.append("session oubliée" if after is False else "session non oubliée (magasin de session en erreur)")
+    state = ("état de connexion inconnu, données de bw sous l'alias %s (%s)" if isinstance(e, LogoutUnknown)
+             else "données de bw toujours connectées sous l'alias %s (%s)") % (alias, b.appdata)
+    err("bw logout en échec (%s) : %s ; %s%s ; relancer « %s »" % (classify(e)[1], state, ", ".join(done), extra, again))
+    return RC_BACKEND
+
+
+def _probe(b):
+    """État du compte dans bw, sans effet sur la session rangée ; None si ses données sont
+    absentes (bw jamais lancé : il les créerait)."""
+    return b.status(forget=False) if os.path.isdir(b.appdata) else None
+
+
+def run_logout(args, accts: Accounts) -> int:
+    """`logout [--account ALIAS]` : `bw-path` vérifié d'abord (code 2, rien fait). Sous
+    ensure.lock : état lu dans bw (sans effet sur la session), puis chaque agent vérifié
+    (lisible, non verrouillé) avant toute liste du coffre, clés du compte retirées (clé
+    partagée avec un autre compte gardée, promue), `bw logout` s'il est connecté ou si son état est illisible,
+    session oubliée, marqueur `logged-out` posé dans le dossier du compte (ensure propose
+    `login`). Compte gardé au registre, blocs du ssh_config gardés. Plusieurs comptes :
+    --account obligatoire (code 2). Rien du tout à faire (non connecté, ni clé, ni état
+    d'agent, absence de session sûre) : une ligne, code 0, rien touché. Agent verrouillé ou en
+    erreur, `bw logout` en échec ou état inconnu : une ligne, code 4."""
+    if not args.account and len(accts.registry) > 1:
+        raise AccountError("logout : préciser --account ALIAS (comptes : %s)" % ", ".join(accts.registry))
+    alias = accts.write_one(args.account, "logout") if (args.account or not accts.registry) \
+        else next(iter(accts.registry))
+    b = accts.backend(alias)
+    b.exe  # bw-path invalide : ConfigError (code 2) avant tout changement, même sans données de bw
+    again = "sshvault logout --account %s" % alias
+    agents = _agents_with_ensure_lock()
+    with _locked_or_null(agents[0]):
+        had = _session_state(b)
+        # sonde d'abord : `bw status` sans effet sur la session (seul appel à bw avant le contrôle
+        # des agents ; aucun `bw list` avant lui)
+        try:
+            st = _probe(b)
+        except VaultError as e:  # état illisible : bw logout tenté quand même
+            st, unknown = None, e
+        else:
+            unknown = None
+        checked = _check_agents(alias, agents, "rien modifié", again)
+        done = None if checked is None else _unload_account(alias, accts, b, checked, "rien modifié", again)
+        if done is None:
+            return RC_BACKEND
+        removed, legacy_left, changed = done
+        connected = unknown is not None or (st is not None and st.state != "unauthenticated")
+        if connected:
+            try:
+                connected = b.logout()  # False : bw n'était pas (plus) connecté
+            except VaultError as e:
+                if unknown is not None and not getattr(e, "reread_connected", False):
+                    a1, a2 = classify(unknown)[1], classify(e)[1]
+                    e = LogoutUnknown("bw status et bw logout : %s" % a1 if a1 == a2
+                                      else "bw status : %s ; bw logout : %s" % (a1, a2))
+                _clear_unlock_failure(alias)
+                return _logout_failed(alias, b, e, removed, had, again)
+        elif had is not False:
+            _forget_session(b)
+        forgot = _forgot(b, had)
+        nothing = not connected and not changed and had is False
+        if not nothing:  # « rien à faire » : rien touché, mémoire d'échec de déverrouillage comprise
+            _clear_unlock_failure(alias)
+            _set_logged_out_marker(alias, b)
+        elif b.marker_cleared:
+            # la sonde a vu bw connecté (marqueur retiré), puis bw s'est dit non connecté : reposé
+            _set_logged_out_marker(alias, b)
+    _legacy_left_warning(alias, legacy_left)
+    if nothing:
+        print("compte %s non connecté : rien à faire" % alias)
+        return RC_OK
+    print("compte %s %s : %s ; compte et blocs du ssh_config gardés ; reconnecter : « sshvault login --account %s »"
+          % (alias, "déconnecté" if connected else "non connecté",
+             ", ".join((["session oubliée"] if forgot else []) + [_keys_removed(removed)]), alias))
+    return RC_OK
+
+
+def _bw_server(st) -> tuple:
+    """(serveur de bw tel qu'affiché, normalisé ou None si invalide) ; `serverUrl` nul = serveur
+    par défaut de bw. Même règle pour `status` et `account set`."""
+    raw = st.server or DEFAULT_SERVER
+    try:
+        return raw, normalize_server(raw)
+    except ConfigError:
+        return raw, None
+
+
+def _bw_pair(st) -> Optional[tuple]:
+    """(serveur, e-mail) normalisés du compte connecté dans bw, ou None."""
+    try:
+        return _bw_server(st)[1], normalize_email(st.user or "")
+    except ConfigError:
+        return None
+
+
+def account_set(args, accts: Accounts) -> int:
+    """`account set ALIAS [--server URL] [--email E]` : validé comme `account add` (au moins une
+    option ; couple unique, code 2 ; valeurs identiques : rien fait, code 0 ; `bw-path` vérifié
+    avant tout changement, code 2). bw déjà connecté avec exactement ces serveur et e-mail
+    (seul le registre se trompait) : registre corrigé, rien d'autre. Sinon, sous ensure.lock :
+    clés du compte retirées des agents, `bw logout` (compte connecté), session oubliée,
+    registre mis à jour ; ensuite ssh_config régénéré sans les blocs du compte (ils visaient
+    l'ancien). Alias et comptes par défaut gardés. Agent verrouillé ou en erreur, `bw logout`
+    en échec : une ligne, registre inchangé, code 4 ; registre refusé après la déconnexion :
+    une ligne qui dit ce qui est fait (code 2, 4 si l'écriture échoue)."""
+    alias = accts.check(args.alias)
+    if args.server is None and args.email is None:
+        raise UsageError("account set : préciser --server URL et/ou --email E")
+    old = accts.registry[alias]
+    server = normalize_server(args.server) if args.server is not None else old["server"]
+    email = normalize_email(args.email) if args.email is not None else old["email"]
+    if (server, email) == (old["server"], old["email"]):
+        print("compte %s inchangé (%s, %s) : rien fait" % (alias, server, email))
+        return RC_OK
+
+    def same_pair(reg):
+        return [a for a, v in reg.items() if a != alias and (v["server"], v["email"]) == (server, email)]
+    dup = same_pair(accts.registry)
+    if dup:
+        raise AccountError("%s sur %s déjà enregistré sous l'alias « %s » : rien changé" % (email, server, dup[0]))
+    b = accts.backend(alias)
+    b.exe  # bw-path invalide : ConfigError (code 2) avant tout changement, même sans données de bw
+    if server != old["server"] and server.startswith("http://"):
+        err("avertissement : %s en http : mot de passe maître et coffre passent en clair sur le réseau" % server)
+
+    def setreg(d):
+        reg = d.get(ACCOUNTS, {})
+        if alias not in reg:  # revérifié sous le verrou : un `account remove` concurrent
+            raise AccountError("compte « %s » retiré entre-temps" % alias)
+        dup = same_pair(reg)
+        if dup:
+            raise AccountError("%s sur %s déjà enregistré sous l'alias « %s »" % (email, server, dup[0]))
+        reg[alias] = {"server": server, "email": email}
+    again = "sshvault account set %s%s%s" % (alias, " --server %s" % shlex.quote(server) if args.server is not None else "",
+                                              " --email %s" % shlex.quote(email) if args.email is not None else "")
+    changed = "%s, %s (avant : %s, %s)" % (server, email, old["server"], old["email"])
+    agents = _agents_with_ensure_lock()
+    with _locked_or_null(agents[0]):
+        had = _session_state(b)
+        try:  # sonde d'abord (sans effet sur la session) : le registre seul ne dépend pas des agents
+            st = _probe(b)
+        except VaultError as e:  # état inconnu : ni registre corrigé à l'aveugle, ni déconnexion
+            code, msg = classify(e)
+            err("%s : état de connexion de bw inconnu : rien fait ; relancer « %s »" % (msg, again))
+            return code
+        connected = st is not None and st.state != "unauthenticated"
+        if connected and _bw_pair(st) == (server, email):
+            # seul le registre se trompait : bw est déjà connecté à ce compte
+            try:
+                accts.cfg.update(setreg)
+            except AccountError as e:
+                raise AccountError("%s : rien changé" % e) from None
+            print("compte %s : registre corrigé : %s ; bw y est déjà connecté : ni déconnexion, ni clé ni bloc retiré"
+                  % (alias, changed))
+            return RC_OK
+        checked = _check_agents(alias, agents, "registre inchangé", again)  # avant tout `bw list`
+        if checked is None:
+            return RC_BACKEND
+        done = _unload_account(alias, accts, b, checked, "registre inchangé", again)
+        if done is None:
+            return RC_BACKEND
+        removed, legacy_left, _ = done
+        _clear_unlock_failure(alias)
+        if connected:
+            try:
+                connected = b.logout()  # False : déconnecté entre-temps
+            except VaultError as e:
+                return _logout_failed(alias, b, e, removed, had, again, ", registre inchangé")
+            if connected or b.marker_cleared:  # déconnecté, ou vu connecté puis plus : marqueur (re)posé
+                _set_logged_out_marker(alias, b)
+        else:
+            _forget_session(b)
+        what = ", ".join((["déconnecté de l'ancien compte"] if connected else [])
+                         + (["session oubliée"] if _forgot(b, had) else []) + [_keys_removed(removed)])
+        try:
+            accts.cfg.update(setreg)
+        except ConfigError as e:  # ConfigWriteError comprise
+            err("registre non mis à jour (%s) : déjà fait : %s ; registre inchangé ; relancer « %s »"
+                % (e, what, again))
+            return classify(e)[0]
+        except AccountError as e:
+            err("registre non mis à jour (%s) : déjà fait : %s ; registre inchangé" % (e, what))
+            return RC_USAGE
+    _legacy_left_warning(alias, legacy_left)
+    print("compte %s modifié : %s ; %s" % (alias, changed, what))
+    rc = _regen_after_registry_change(fresh={alias: []})
+    print("lancer « sshvault login --account %s »" % alias)
+    return rc
 
 
 def _regen_after_login() -> int:
@@ -872,9 +1256,10 @@ def _regen_after_login() -> int:
     return _regen_after_registry_change()
 
 
-def _regen_after_registry_change(renamed: Optional[dict] = None) -> int:
+def _regen_after_registry_change(renamed: Optional[dict] = None, fresh: Optional[dict] = None) -> int:
     """ssh_config régénéré après un changement du registre (comptes lus sans invite : blocs des
-    comptes verrouillés gardés). Pas de ssh_config généré : rien à faire."""
+    comptes verrouillés gardés ; `fresh` {alias : éléments} : comptes pris tels quels, sans
+    lecture — `account set` : [], blocs retirés). Pas de ssh_config généré : rien à faire."""
     try:
         paths = sshconfig.default_paths()
     except sshconfig.SshConfigError:
@@ -883,7 +1268,7 @@ def _regen_after_registry_change(renamed: Optional[dict] = None) -> int:
         return RC_OK
     accts = Accounts(bw_path=configured_bw_path, warn=err)
     try:
-        src = gather(accts, paths, {}, None, renamed)
+        src = gather(accts, paths, fresh or {}, None, renamed)
         regenerate(src.items, paths, kept=src.kept, notes=src.notes)
     except (sshconfig.SshConfigError, AgentError, ConfigError) as e:
         err("ssh_config non régénéré : %s (lancer « sshvault ssh-config »)" % e)
@@ -1346,6 +1731,7 @@ class Sources:
 
     def __init__(self):
         self.items, self.kept, self.notes, self.read, self.unreadable = [], frozenset(), [], [], []
+        self.errors: dict = {}  # alias illisible -> erreur
         self.rc = RC_OK  # pire code des comptes illisibles
 
 
@@ -1366,9 +1752,14 @@ def gather(accts: Accounts, paths, fresh: dict, prompt, renamed: Optional[dict] 
             src.read.append(a)
         except (VaultError, SessionStoreError, ConfigError) as e:  # ConfigError : bw-path invalide
             src.unreadable.append(a)
+            src.errors[a] = e
             src.rc = max(src.rc, classify(e)[0])
-            src.notes.append("compte %s illisible (%s) : ses blocs du ssh_config sont gardés tels quels (« sshvault "
-                             "unlock%s » puis « sshvault ssh-config »)" % (a, e, accts.hint(a)))
+            if isinstance(e, NotLoggedIn):  # une seule forme de login dans la ligne
+                src.notes.append("compte %s non connecté : ses blocs du ssh_config sont gardés tels quels (« sshvault "
+                                 "login --account %s » puis « sshvault ssh-config »)" % (a, a))
+            else:
+                src.notes.append("compte %s illisible (%s) : ses blocs du ssh_config sont gardés tels quels (« sshvault "
+                                 "unlock%s » puis « sshvault ssh-config »)" % (a, e, accts.hint(a)))
     if src.unreadable:
         bad = set(src.unreadable)
         have = {i.id.lower() for i in src.items}
@@ -1525,12 +1916,20 @@ def run_ssh_config(args, accts: Accounts, prompt) -> int:
             raise NoAccount(pending)
         raise NoAccount("aucun compte du coffre : ssh_config non régénéré, rien écrit (« sshvault account add ALIAS "
                         "--server URL --email E »)")
-    if len(accts.registry) == 1:
+    # --check d'une config générée : un compte **déconnecté** (bw non connecté, après `logout`)
+    # garde ses blocs tels quels, même s'il est seul : « à jour » si le fichier correspond. Un
+    # compte verrouillé ou un bw en erreur garde la règle d'avant (seul : son code ; tous
+    # illisibles : le pire code)
+    keep_out = args.check and os.path.exists(paths.config)
+    if len(accts.registry) == 1 and not keep_out:
         a = next(iter(accts.registry))
         src = gather(accts, paths, {a: tag(a, accts.backend(a).list_ssh_keys(prompt))}, prompt)
     else:
         src = gather(accts, paths, {}, prompt)
-        if accts.registry and not src.read:
+        others = [a for a in src.unreadable if not (keep_out and isinstance(src.errors[a], NotLoggedIn))]
+        if len(accts.registry) == 1 and others:
+            raise src.errors[others[0]]  # seul compte, pas déconnecté : son erreur, comme avant
+        if accts.registry and not src.read and others:
             for w in src.notes:
                 err(w)
             raise _Reported(src.rc)

@@ -54,7 +54,7 @@ from .agent import (CMD_TIMEOUT as AGENT_TIMEOUT, Agent, AgentError, AgentLocked
                     askpass_rules, fingerprint, forward_agent, forward_id, is_encrypted, literal_host, public_blob,
                     resolve_dir, tty_available)
 from .agentstate import entry as state_entry, reconcile
-from .backend import PasswordRefused, VaultBackend, VaultLocked
+from .backend import NotLoggedIn, PasswordRefused, VaultBackend, VaultLocked
 from .fastpath import clean, forward_wanted, fresh, owns
 from .fsutil import ensure_dir, read_private, write_private
 from .prompt import UNAVAILABLE, PromptError, PromptUnavailable, ask_password, available, prompt_timeout
@@ -231,6 +231,8 @@ def _unlock_possible(directory: str, store: SessionStore, env: Mapping[str, str]
     interdite, impossible, ou si cette connexion vient d'échouer à déverrouiller ce compte."""
     if store.get():
         return
+    if fastpath.logged_out(account, env):
+        raise NotLoggedIn(fastpath.logged_out_message(account))
     age = recent_failure(directory, time.time(), ctx.conn, account)
     if age is not None:
         raise VaultLocked(failed_message(age, account, hint))

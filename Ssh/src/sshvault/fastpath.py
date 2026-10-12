@@ -43,7 +43,7 @@ from .agentstate import STATE_NAME, AgentState, remaining
 from .fsutil import read_private
 from .runtime import (ALIAS_RE, FID_RE, SOCKET_NAME, AgentError, fingerprint, forward_paths, parse_listing, public_blob,
                       resolve_dir)
-from .settings import seconds
+from .settings import is_logged_out, seconds
 
 #: Début du processus (délai global d'ensure : le chemin rapide en fait partie).
 STARTED = time.monotonic()
@@ -397,6 +397,24 @@ def ensure_timeout(env: Mapping[str, str]) -> float:
     return seconds(env, TIMEOUT_VAR, DEFAULT_TIMEOUT)
 
 
+def logged_out(account: Optional[str], env: Optional[Mapping[str, str]] = None) -> bool:
+    """Compte déconnecté par `sshvault logout` (marqueur, fichier ordinaire seulement)."""
+    return is_logged_out(account, env)
+
+
+def _agent_maybe_locked(directory: str, env: Mapping[str, str], timeout: float) -> bool:
+    """Agent dédié verrouillé, ou peut-être (état qui garde des clés, agent qui n'en montre
+    aucune) : la CLI tranche."""
+    data = AgentState(os.path.join(directory, STATE_NAME)).load()
+    if data.get("locked"):
+        return True
+    return bool(data["keys"]) and not agent_fingerprints(directory, env, timeout)
+
+
+def logged_out_message(account: str) -> str:
+    return "compte « %s » déconnecté (sshvault logout) : lancer « sshvault login --account %s »" % (account, account)
+
+
 def time_left(total: float) -> float:
     return total - (time.monotonic() - STARTED)
 
@@ -485,6 +503,13 @@ def try_fast(argv: Sequence[str]) -> Optional[int]:
                 if d is not None and (forward_fresh(d, fid, ids, os.environ, left) if fid is not None
                                       else present_fresh(d, item_id, os.environ, left, account)):
                     rc = 0
+                elif (fid is None and d is not None and logged_out(account)
+                      and not _agent_maybe_locked(d, os.environ, left)):
+                    # clé absente, compte déconnecté par `sshvault logout`, agent dédié connu et non
+                    # verrouillé : la ligne qui propose `login`, sans charger la CLI (même texte que
+                    # `ensure._unlock_possible`) ; sinon la CLI tranche
+                    sys.stderr.write("sshvault: %s : %s\n" % (clean(label), logged_out_message(account)))
+                    rc = 3
     except (KeyboardInterrupt, _Stop):
         try:
             sys.stderr.write("sshvault: %s : interrompu\n" % label)

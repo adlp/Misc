@@ -53,6 +53,11 @@ class BackendNotFound(BackendError):
     """Exécutable du client introuvable."""
 
 
+class LogoutUnknown(BackendError):
+    """Déconnexion sans réponse du client, et état de connexion impossible à relire : ni
+    « déconnecté » ni « toujours connecté »."""
+
+
 class ItemNotFound(BackendError):
     """Élément absent du coffre."""
 
@@ -182,8 +187,8 @@ class VaultBackend(abc.ABC):
         """Resynchronise le cache local depuis le serveur."""
 
     @abc.abstractmethod
-    def status(self) -> VaultStatus:
-        ...
+    def status(self, forget: bool = True) -> VaultStatus:
+        """État du compte ; `forget=False` : sonde sans effet sur la session rangée."""
 
     @abc.abstractmethod
     def unlock(self, prompt: Optional[Prompt], ttl: int) -> None:
@@ -192,6 +197,13 @@ class VaultBackend(abc.ABC):
     @abc.abstractmethod
     def lock(self) -> None:
         """Verrouille le coffre et vide le magasin de session."""
+
+    @abc.abstractmethod
+    def logout(self) -> bool:
+        """Déconnecte le compte (données locales du client) et oublie la session. True :
+        déconnecté ; False : il n'était pas connecté. LogoutUnknown : état de connexion inconnu
+        (client sans réponse, état impossible à relire) ; toute autre BackendError : toujours
+        connecté."""
 
     @abc.abstractmethod
     def list_ssh_keys(self, prompt: Optional[Prompt] = None) -> list:

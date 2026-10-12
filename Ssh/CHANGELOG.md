@@ -1,5 +1,86 @@
 # Changelog — sshvault
 
+## sshvault 0.10.0 — Déconnexion et modification d'un compte — 2026-10-12
+
+- `sshvault logout [--account ALIAS]` : `--account` obligatoire dès qu'il y a plusieurs
+  comptes (code 2, une ligne qui liste les alias) ; un seul compte : visé ; `bw-path`
+  invalide : code 2, rien fait (même sans données de `bw`). Sous `ensure.lock` : état lu
+  d'abord dans bw (`bw status` sans session, sans effet sur la session rangée), puis chaque
+  agent (dédié, sous-agents) vérifié lisible et non verrouillé avant tout `bw list` ; clés du
+  compte retirées (une clé partie entre-temps compte comme retirée si l'agent liste encore
+  d'autres clés ou si sa durée de vie est écoulée ; un agent qui ne liste plus rien alors que
+  la clé vit encore est tenu pour verrouillé : code 4, entrée gardée ; une clé du compte
+  chargée pendant la commande est laissée, entrée gardée, une ligne d'avertissement ; une clé
+  partagée avec un autre compte reste chargée, attribuée à l'autre compte) ; `bw logout` si le compte est
+  connecté ou si son état est illisible ; session oubliée (aussi quand bw a été déconnecté
+  hors de sshvault). `bw list` seulement pour des clés chargées avant la 0.9.0. Compte gardé
+  au registre, blocs du `ssh_config` gardés. Rien du tout à faire (non connecté, ni clé, ni
+  état d'agent, aucune session à coup sûr) : code 0, une ligne, rien touché (mémoire d'échec
+  de déverrouillage comprise ; bw jamais lancé sans données). Agent verrouillé ou en erreur :
+  rien modifié, ou état partiel dit (clés retirées, agents mis à jour, agent en cours),
+  code 4. `bw logout` en échec : code 4, une ligne qui dit que les données restent connectées
+  sous l'alias (après un délai dépassé, état relu en 10 s au plus ; `bw status` et `bw
+  logout` en échec : état inconnu, cause dite une fois si c'est la même ; relecture qui voit
+  bw toujours connecté : « toujours connectées ») et ce qui est fait ; « session oubliée »
+  seulement si c'est vrai.
+- Changement : `logout`, `account set` et `account remove` refusent maintenant (code 4, rien
+  modifié) dès qu'un agent qui porte une clé possible du compte (entrée du compte, entrée
+  sans compte d'avant la 0.9.0, ou référence `also` à ce compte) est verrouillé, même si
+  aucune clé du compte n'est à retirer (simple promotion d'une clé partagée, par exemple) :
+  le contrôle se fait avant tout `bw list`. Avant, `account remove` ne regardait que les clés
+  à retirer.
+- Marqueur persistant `${XDG_DATA_HOME:-~/.local/share}/sshvault/accounts/<alias>/logged-out`
+  (fichier ordinaire à côté des données de `bw`, survit au redémarrage ; un autre objet à sa
+  place ne compte pas) posé par `logout` (et `account set` qui déconnecte, et sur un état
+  inconnu), sauf « rien à faire » ou dossier du compte absent (jamais créé ; échec
+  d'écriture : avertissement) ; retiré par le backend dès que bw est vu connecté (tout `bw
+  status` qui le voit connecté, `login` compris même en échec « déjà connecté », et tout
+  déverrouillage réussi : `unlock`, invite de `load`, `list`, `ensure`), puis reposé si bw
+  finit déconnecté dans la même commande (`login --apikey` avec la clé d'un autre compte,
+  `logout`/`account set` qui voient bw connecté puis non connecté) ; avertissement « non
+  retiré » une seule fois, et jamais dans une commande qui pose le marqueur ; suit `account
+  rename`, part avec `account remove`. `ensure` sur ce compte, clé absente, échoue en une
+  ligne qui propose `sshvault login --account ALIAS`, même sans invite possible ; le chemin
+  rapide la donne sans charger la CLI si l'agent dédié est connu et non verrouillé.
+- `sshvault account set ALIAS [--server URL] [--email E]` : validé comme `account add`
+  (serveur normalisé, e-mail validé, `-` initial refusé, avertissement `http://`, couple
+  unique ; au moins une option ; code 2). Valeurs identiques aux actuelles : rien fait, code
+  0. bw déjà connecté avec exactement ces valeurs : registre corrigé seul, même avec un agent
+  verrouillé (aucun contrôle d'agent sur ce chemin ; ni déconnexion, ni
+  clé ni bloc retiré ; `serverUrl` nul = serveur par défaut de bw, même règle que `status`). Sinon, sous `ensure.lock` : clés du compte retirées des agents, `bw
+  logout` (compte connecté), session oubliée, registre mis à jour ; puis `ssh_config`
+  régénéré sans les blocs de ce compte. Alias et comptes par défaut gardés ; une ligne dit de
+  lancer `sshvault login --account ALIAS`. Agent verrouillé ou en erreur, `bw logout` en
+  échec : registre inchangé, code 4. Registre refusé après la déconnexion : une ligne qui dit
+  ce qui est déjà fait (code 2 ; 4 si l'écriture échoue). `bw status` illisible : rien fait,
+  code de l'erreur (pas de registre corrigé à l'aveugle). `bw-path` invalide : code 2, rien
+  fait, même sans données de `bw`.
+- `status` : l'écart d'e-mail ou de serveur avec le registre tient en une ligne, avec un seul
+  remède `sshvault account set ALIAS [--server …] [--email …]` (valeurs de bw citées pour le
+  shell ; invalides : `URL`/`E` à saisir) ou `sshvault logout --account ALIAS` puis `login` ;
+  couple de bw déjà enregistré sous un autre alias : reconnexion seulement.
+- `ssh-config --check` d'une config générée : un compte **déconnecté** (bw non connecté)
+  garde ses blocs tels quels, même seul : « à jour » si le fichier correspond (avant : code 3
+  avec un seul compte). Compte seulement verrouillé, `bw` en erreur : comme avant (seul ou
+  tous illisibles : leur code ; jamais « à jour »). L'avertissement d'un compte déconnecté
+  propose `sshvault login --account ALIAS` (plus `unlock`), une seule fois dans la ligne.
+- `status` : ligne `serveur :` d'un compte connecté lue comme l'avertissement (`serverUrl`
+  nul = serveur par défaut de bw).
+- Adaptateur : `VaultBackend.logout()`, `LogoutUnknown` (état inconnu) et `status(forget=False)`
+  (sonde sans effet sur la session) ; `BwBackend.logout()` (session oubliée même si bw échoue
+  ou si l'appel est interrompu ; « You are not logged in. » : rien à faire ; délai dépassé :
+  état relu à délai court), repris par `login --apikey` (clé API d'un autre compte : déconnecté,
+  déjà déconnecté, échec ou état inconnu dits). `data_root`/`account_dir` déplacés dans
+  `settings` (module léger, lu par le chemin rapide).
+- Tests : matrice de la story dans `tests/test_accounts.py`, `logout()` dans
+  `tests/test_backend.py` ; intégration à deux comptes : `logout` puis `login` du second
+  compte (`ensure` sans invite propose `login`, `ssh-config --check` à jour avant et après,
+  marqueur retiré au `login`), `account set` aller-retour puis `login`. Intégration :
+  traceback court (les valeurs des fixtures — sessions bw, clés de test — ne sont plus
+  affichées) ; `sshvault login` en échec : fin masquée du terminal gardée dans le message.
+- `deploy` : `re.split(…, maxsplit=1)` (argument nommé) : plus d'avertissement
+  `DeprecationWarning` sous Python 3.13 et suivants (antérieur à la story).
+
 ## sshvault 0.9.0 — Plusieurs comptes Vaultwarden simultanés — 2026-10-09
 
 - Comptes du coffre (CAP-10) : registre alias → serveur + e-mail dans `config.json` (clés
