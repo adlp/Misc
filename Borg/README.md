@@ -11,7 +11,13 @@ Utilisable comme CLI ou comme **librairie Python** — voir [LIBRARY.md](LIBRARY
 ## Prérequis
 
 - Python 3 — vérifié de **3.10 à 3.14** (1.0.182 : CodecSelfTest complet sous chaque version) ; versions antérieures non vérifiées
-- `borg` 1.2 ou plus dans le PATH (`borg compact`, `extract --numeric-ids`)
+- `borg` 1.2 ou plus dans le PATH (`borg compact`, `extract --numeric-ids`). borg 1.4 : codes de sortie hérités demandés à
+  chaque lancement (`BORG_EXIT_CODES=legacy`, 1.0.195 / borgHelperWWW 1.31.11) — un `BORG_EXIT_CODES=modern` de
+  l'environnement est sans effet. Seul borgHelperWWW était exposé avant (il copie son environnement vers le borg des
+  téléchargements) ; la CLI ne l'était que par un wrapper `BORG_EXE` ou l'environnement distant d'un Bkp `SSH_REMFO` (part
+  défensive). Bkp distant (`SSH_REMFO`) : le borg distant ne reçoit la variable que par `ssh -o SendEnv BORG_*`, si son sshd
+  l'accepte (`AcceptEnv`). Hors couverture : un wrapper `BORG_EXE` qui force lui-même `modern`, un environnement distant qui
+  force `modern` ou un sshd qui refuse `BORG_*`
 - `prettytable` (`pip install prettytable`) — requis pour `Report` et les commandes d'index
 - `sentry-sdk` — facultatif : seulement si un DSN Sentry est configuré (voir « Sentry ») ; vérifié avec 2.71 (Python 3.11 à 3.14)
   et 1.4.3 (Python 3.10)
@@ -788,7 +794,11 @@ Report en ligne : `borg prune --dry-run` en échec -> récupérable « — » (J
 `[WARN] <nick>: borg <commande> : <ligne>` (stderr, 5 lignes au plus puis leur nombre), code de la commande inchangé ; DelBkp
 en code 1 : archive supprimée, compact et rapprochement faits, code 0 (avant : « a échoué ») ; Prune : `borg prune`/`borg compact`
 en code 1 -> avertissements, code 0 (avant : compact « a échoué », code 1). Code ≥ 2, borg tué, ou code 1 sans sortie là où une
-sortie est attendue (`borg diff` de DiffBkp, snapshot) : échec. Restore, ListPerms, Mount, Key, Init, Umount, Login : code de borg. **Bkp** : `borg create` tué (OOM, `kill`)
+sortie est attendue (`borg diff` de DiffBkp, snapshot) : échec. Restore, ListPerms, Mount, Key, Init, Umount, Login : code de borg.
+Codes **hérités** de borg (0, 1, 2 et plus) : depuis 1.0.195, demandés à chaque borg lancé (`BORG_EXIT_CODES=legacy` ; borg
+distant d'un Bkp `SSH_REMFO` : par `SendEnv BORG_*`, seulement si son sshd l'accepte) — défensif côté CLI (la variable
+n'y arrivait que par un wrapper `BORG_EXE` ou l'environnement distant) : borg 1.4 en codes modernes (avertissements 100-127,
+erreurs 3-99) donne les mêmes résultats et codes que borg 1.2. **Bkp** : `borg create` tué (OOM, `kill`)
 ou en code 2 sans ligne ERROR -> `[ERREUR] <nick>: borg create a échoué : …`, code 2, `bkp_status` « error » (avant : succès).
 Lecteurs annexes (1.0.176) : notifications du watcher, alerte « en retard », Restore/ListPerms sans `-b`, IdxTop/DiffTop,
 RepoHistory/ArchiveHistory `-j` — même `[ERREUR] SQLite error` ; DiffBkp sur une base illisible : `[ERREUR] … non vérifiable`,
@@ -1591,7 +1601,8 @@ sur un dépôt borg jetable. Sans borg, chaque contrôle sur un vrai borg est sa
 bilan ; `-f` le montre, `-l` le liste).
 Contrôles sur un vrai borg isolés (1.0.158) : ni le cache, ni la sécurité, ni les clés, ni la configuration borg de
 l'utilisateur ne sont touchés, même avec `BORG_CACHE_DIR`, `BORG_SECURITY_DIR`, `BORG_CONFIG_DIR`, `BORG_KEYS_DIR` ou
-`BORG_BASE_DIR` exportés (variables `BORG_*` retirées, dossier borg propre à chaque famille de contrôles) ; chaque
+`BORG_BASE_DIR` exportés (variables `BORG_*` retirées, dossier borg propre à chaque famille de contrôles ; 1.0.195 :
+`BORG_EXIT_CODES=legacy` forcé, comme pour tout borg lancé par borgHelper) ; chaque
 contrôle échoue s'il laisse une entrée dans le dossier borg de l'utilisateur. Les runs d'avant 1.0.158 ont pu laisser
 des entrées dans `~/.config/borg/security` et `~/.cache/borg` (fichier `location` sous `/tmp/borghelper-selftest-*`) :
 sans valeur, supprimables.
@@ -2806,6 +2817,8 @@ classique (404 nick inconnu, 502 `borg list` en échec ou archive `bid` inconnue
 `200` vide) ; borg en échec **pendant** l'envoi -> **flux coupé** : la connexion se ferme sans fin de transfert (curl :
 code 18 ; l'UI affiche « Téléchargement interrompu ») et `[ERREUR]` au journal du serveur — jamais un fichier tronqué
 servi comme complet (avant : `200`, fichier vide ou tronqué). Code 1 (avertissement) : réponse complète, `[WARN]` au journal.
+1.31.11 : borg lancé avec `BORG_EXIT_CODES=legacy` — un serveur démarré avec `BORG_EXIT_CODES=modern` (borg 1.4) répond
+comme avec borg 1.2 (avant : chemin introuvable `502` au lieu de `404`, avertissement `502`).
 Client qui abandonne un téléchargement : borg arrêté aussitôt (avant : resté bloqué, verrou de dépôt gardé). 1.31.6 : en moins
 d'une seconde (mesuré ; avant : 28 s à plus de 90 s, jusqu'à l'arrêt du serveur). borg est arrêté par SIGTERM — il rend lui-même
 son verrou de dépôt — puis SIGKILL 5 s après s'il vit encore (borg figé : son entrée de `lock.roster` reste, retirée par le

@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.194"
+Version="1.0.195"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -705,6 +705,24 @@ def _print_boex_stdout(rb):
         if isinstance(i,str):
             if i.strip(): print(i)
         else: print(json.dumps(i,ensure_ascii=False))
+
+# 1.0.195 (story 72, D134, décision de l'utilisateur) : codes de sortie HÉRITÉS demandés à chaque borg lancé (boex, borg diff de
+# l'Index, sonde de version) — borg 1.4 avec BORG_EXIT_CODES=modern rend ses avertissements en 100-127 et ses erreurs en 3-99
+# (mesuré sur 1.4.5 : « never matched » 101, archive absente 31) : un avertissement y serait un échec pour _borg_ok ; borg 1.2
+# ignore la variable. Un wrapper BORG_EXE qui force `modern` après coup reste hors couverture (README).
+_BORG_EXIT_CODES_ENV={'BORG_EXIT_CODES':'legacy'}
+_BORG_RC_ENV_KEYS=('BORG_REPO','BORG_PASSPHRASE','BORG_REMOTE_PATH','BORG_RSH','BORG_SHOW_SYSINFO','BORG_RELOCATED_REPO_ACCESS_IS_OK',
+                   'BORG_KEY_FILE')
+
+def _borg_child_env(cfg,force=None):
+    """1.0.195 (story 72, revue) : environnement d'un borg lancé par borgHelper — SEULE construction (boex, borg diff de l'Index,
+    sonde de version) : clés borg du rc (_BORG_RC_ENV_KEYS), puis `force` (forceEnv de boex), puis PATH, LC_ALL et
+    BORG_EXIT_CODES=legacy. Ni HOME ni BORG_BASE_DIR (voir le harnais « vrai borg »). PATH absent ou vide : os.defpath (jamais
+    le dossier courant)."""
+    env={k:cfg[k] for k in cfg.keys() if k in _BORG_RC_ENV_KEYS}
+    if force is not None: env.update(force)
+    env['PATH']=os.environ.get('PATH') or os.defpath; env['LC_ALL']='fr_FR.UTF-8'; env.update(_BORG_EXIT_CODES_ENV)
+    return env
 
 def _borg_ok(rb):
     """1.0.176 (story 39, A77, décision de l'utilisateur) : résultat boex utilisable — code 0, ou 1 (avertissement de borg, sortie
@@ -4834,24 +4852,19 @@ class BorgRunner:
 
     def boex(self,nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True):
         cfg=self.cfgreaded(nick,debug=debug)
-        varcur=os.environ.copy()
-        varfut={}
         if debug!=0: printer('Boex the first')
-        for k in list(cfg.keys()):
-            if k in ['BORG_REPO','BORG_PASSPHRASE','BORG_REMOTE_PATH','BORG_RSH','BORG_SHOW_SYSINFO','BORG_RELOCATED_REPO_ACCESS_IS_OK','BORG_KEY_FILE']:
-                varfut[k]=cfg[k]
-        if forceEnv is not None:
-            for k in list(forceEnv.keys()): varfut[k]=forceEnv[k]
+        varfut=_borg_child_env(cfg,forceEnv)   # 1.0.195 (story 72, D134) : codes hérités, même avec borg 1.4 (après forceEnv)
         if debug!=0: printer(varfut)
         borg_exe=cfg.get('BORG_EXE','borg')
         if preBorg is not None:
-            commande=preBorg; commande.append(borg_exe)
+            # 1.0.195 (revue story 72) : copie — la liste de l'appelant n'est plus modifiée. Borg DISTANT : BORG_EXIT_CODES=legacy
+            # ne lui parvient que par `SendEnv BORG_*`, si le sshd distant l'accepte (AcceptEnv) — jamais de préfixe sur la commande
+            # distante (décision de l'utilisateur : clé à commande forcée « borg … », sudo env_reset)
+            commande=list(preBorg); commande.append(borg_exe)
         else:
             commande=[borg_exe]
         if rep is None: rep=os.getcwd()
         commande.extend(arg)
-        varfut['PATH']=varcur['PATH']
-        varfut["LC_ALL"]="fr_FR.UTF-8"
         if debug:
             for k in varfut: printer(f' {k}={varfut[k]}')
             printer(f"+{rep}"); printer(commande)
@@ -6160,7 +6173,8 @@ class BorgHelper:
         - Dépôt ssh direct : `<BORG_RSH|ssh> [options] [-p port] hôte <BORG_REMOTE_PATH|borg> --version` ; une clé à commande
           forcée lance borg serve, qui répond `Borg X.Y: Got connection close…` (mesuré) : version lue quand même.
         - Dépôt local (`/…`, `file://`) : le même borg que le créateur.
-        Environnement du borg du Bkp (boex : clés borg du rc, PATH, LC_ALL — sans agent ssh), entrée fermée, session à part
+        Environnement du borg du Bkp (_borg_child_env, comme boex : clés borg du rc, PATH, LC_ALL, BORG_EXIT_CODES=legacy — sans agent ssh ;
+        ssh direct : variable reçue par le client ssh local, jamais par le `borg --version` distant, en code 0 dans les deux modes), entrée fermée, session à part
         (sans terminal : jamais d'invite de mot de passe), groupe tué au délai et ses _MEI retirés, sortie décodée en
         tolérant. Réponse sans numéro (code 0) : None sans raison — « — » en silence (décision de l'utilisateur)."""
         try:
@@ -6179,9 +6193,7 @@ class BorgHelper:
                 opts=(['-o','BatchMode=yes','-o','ControlMaster=no','-o','ControlPath=none']
                       if os.path.basename(rsh[0])=='ssh' else [])
                 cmd=rsh+opts+(['-p',hp[1]] if hp[1] else [])+[hp[0]]+rp+['--version']
-            env={k:v for k,v in cfg.items() if k in ('BORG_REPO','BORG_PASSPHRASE','BORG_REMOTE_PATH','BORG_RSH',
-                                                      'BORG_SHOW_SYSINFO','BORG_RELOCATED_REPO_ACCESS_IS_OK','BORG_KEY_FILE')}
-            env.update(PATH=os.environ.get('PATH',''),LC_ALL='fr_FR.UTF-8')
+            env=_borg_child_env(cfg)   # 1.0.195 : comme boex (ssh direct : la variable atteint le client ssh local, pas le borg distant)
             try:
                 p=subprocess.Popen(cmd,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,
                                    start_new_session=True)
@@ -7109,9 +7121,7 @@ class BorgHelper:
         Retour : None (terminé), 'interrupted' (prioritaire), 'deadline' (échéance de tranche)."""
         workers=max(1,int(cfg.get('IDX_WORKERS','4')))
         borg_exe=cfg.get('BORG_EXE','borg')
-        varcur=os.environ.copy()
-        diff_env={k:cfg[k] for k in cfg.keys() if k in ('BORG_REPO','BORG_PASSPHRASE','BORG_REMOTE_PATH','BORG_RSH','BORG_SHOW_SYSINFO','BORG_RELOCATED_REPO_ACCESS_IS_OK','BORG_KEY_FILE')}
-        diff_env['PATH']=varcur['PATH']; diff_env['LC_ALL']='fr_FR.UTF-8'
+        diff_env=_borg_child_env(cfg)   # 1.0.195 : comme boex
         running_procs={}; running_procs_lock=threading.Lock()
         # 1.0.153 (story 16) : paires dont le borg a reçu un signal du moniteur. borg diff tué par SIGTERM peut sortir en
         # code 1 SANS sortie (mesuré, borg 1.2.6) : sans ce relevé, la paire était gardée vide pour toujours.
@@ -14718,6 +14728,15 @@ open({calls!r},'a').write(' '.join(a)+chr(10))
 mode=open(d+'/mode').read().strip() if os.path.exists(d+'/mode') else 'fail'
 rc=int(open(d+'/rcode').read()) if os.path.exists(d+'/rcode') else 2
 sub=a[0] if a else ''
+# 1.0.195 (story 72, D134) : valeur de BORG_EXIT_CODES reçue, notée à chaque appel (fichier `exitcodes`) ; fichier `b14` : SENTINELLE
+# de « legacy reçu », pas un modèle de borg 1.4 — codes MODERNES (avertissement 1 -> 101, erreur 2 -> 31 : valeurs mesurées sur borg
+# 1.4.5) seulement si BORG_EXIT_CODES vaut exactement `modern` ou est ABSENTE (elle vaut alors le contenu du fichier, `modern`) ;
+# toute autre valeur (`legacy`, `Legacy`, vide) : codes hérités ; le vrai borg 1.4.5 lit une variable absente comme legacy (mesuré) ;
+# sans `b14` : borg 1.2 (variable ignorée)
+open(d+'/exitcodes','a').write(sub+' '+os.environ.get('BORG_EXIT_CODES','-')+chr(10))
+if os.path.exists(d+'/b14') and os.environ.get('BORG_EXIT_CODES',open(d+'/b14').read().strip())=='modern':
+    _exit=sys.exit
+    sys.exit=lambda c=0: _exit({{1:101,2:31}}.get(c,c))
 def fail(code=None):
     sys.stderr.write('Connection closed by remote host'+chr(10)); sys.exit(rc if code is None else code)
 if mode=='json':
@@ -15526,6 +15545,88 @@ fail()
             if bad: print(f"  {bad}")
             return not bad
         check("borg en code 1 (avertissement) : sortie gardée, [WARN] par ligne, DiffBkp/DelBkp/Index en code 0 ; 2, tué, sans sortie : échec (A77)",_bf_warn1)
+        def _bf_codes14():
+            """1.0.195 (story 72, D134, décision de l'utilisateur) : BORG_EXIT_CODES=legacy à CHAQUE lancement de borg. Borg factice
+            « 1.4 » (fichier b14 = modern : codes modernes 101/31 seulement si la variable vaut `modern` ou est absente — toute autre
+            valeur : hérités ; sentinelle de « legacy reçu », pas un modèle du vrai borg 1.4, qui lit une variable absente comme
+            legacy) contre « 1.2 » (variable
+            ignorée), mêmes décors. Avertissement (warn1) -> DiffBkp -b a,b et Index -F en code 0, sortie gardée, [WARN] de borg list et borg
+            diff (boex) et de borg diff a → b (Index, _index_diffs) ; erreur (fail, code 2) -> DiffBkp et Index en échec, code 2,
+            « a échoué : Connection closed by remote host » ; mêmes codes et lignes [WARN]/[ERREUR]/« a échoué » sous 1.2 et 1.4 ;
+            chaque appel de borg a reçu BORG_EXIT_CODES=legacy (fichier exitcodes, list ET diff) ; sondes de version
+            (_bkp_server_version : ssh direct par BORG_RSH, tunnel inverse local) : legacy reçu, version lue. Revue : borg DISTANT
+            (boex avec preBorg, relais à la place de ssh qui transmet l'environnement, comme SendEnv accepté par AcceptEnv) ->
+            commande distante `<borg> …` sans préfixe, legacy reçu, avertissement en code 1, liste preBorg de l'appelant intacte.
+            Attentes en dur."""
+            res={}; lines={}
+            keep=lambda t: sorted(l for l in t.splitlines() if '[WARN]' in l or '[ERREUR]' in l or 'a échoué' in l)
+            for ver in ('12','14'):
+                d,rc,calls,cli=_bf_env(f'borgcodes{ver}')
+                if ver=='14': open(os.path.join(d,'b14'),'w').write('modern')
+                o={}
+                open(os.path.join(d,'mode'),'w').write('warn1')
+                o['DiffBkp avert.']=cli('-c','DiffBkp','-n','zr','-b','a,b')
+                o['Index avert.']=cli('-c','Index','-n','zr','-F')
+                open(os.path.join(d,'mode'),'w').write('fail')
+                o['DiffBkp erreur']=cli('-c','DiffBkp','-n','zr','-b','a,b')
+                o['Index erreur']=cli('-c','Index','-n','zr','-F')
+                c,so,se=o['DiffBkp avert.']
+                res[f'DiffBkp avert. {ver}']=(c==0 and 'etc/x' in so and '[WARN] zr: borg list : Warning: avertissement simulé list' in se
+                                             and '[WARN] zr: borg diff : Warning: avertissement simulé diff' in se and 'a échoué' not in so+se,c,so[-200:],se[-300:])
+                c,so,se=o['Index avert.']
+                res[f'Index avert. {ver}']=(c==0 and '[WARN] zr: borg list : Warning: avertissement simulé list' in se
+                                           and '[WARN] zr: borg diff a → b : Warning: avertissement simulé diff' in se and 'a échoué' not in so+se,c,so[-200:],se[-300:])
+                for k in ('DiffBkp erreur','Index erreur'):
+                    c,so,se=o[k]
+                    res[f'{k} {ver}']=(c==2 and 'zr: borg list a échoué : Connection closed by remote host' in so+se and 'Traceback' not in so+se,c,(so+se)[-300:])
+                lines[ver]={k:(v[0],keep(v[1]+v[2])) for k,v in o.items()}
+                p=os.path.join(d,'exitcodes'); seen=open(p).read().split('\n')[:-1] if os.path.exists(p) else []
+                res[f'legacy reçu {ver}']=(bool(seen) and all(l.endswith(' legacy') for l in seen)
+                                          and {'list','diff'}<=set(l.split(' ')[0] for l in seen),seen[:6])
+                if ver=='14':   # sondes de version : ssh direct (BORG_RSH) et tunnel inverse local (BORG_REMOTE_PATH lancé ici)
+                    log=os.path.join(d,'sonde.log'); pf=os.path.join(d,'sonde')
+                    with open(pf,'w') as f: f.write(f'#!/bin/bash\nprintf "%s\\n" "${{BORG_EXIT_CODES:--}}" >> {shlex.quote(log)}\necho "borg 1.4.5"\n')
+                    os.chmod(pf,0o700)
+                    b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+                    v1=b._bkp_server_version('zr',{'BORG_RSH':pf},None,'u@h:/r','1.2.6')
+                    v2=b._bkp_server_version('zr',{'BORG_REMOTE_PATH':pf,'SSH_REMFO':'2222:localhost:22'},['ssh','x'],'ssh://localhost:9/r','1.2.6')
+                    got=open(log).read().split('\n')[:-1] if os.path.exists(log) else []
+                    res['sondes de version']=(v1==v2==('1.4.5',None) and got==['legacy','legacy'],v1,v2,got)
+                    # borg distant (Bkp SSH_REMFO : preBorg) : relais à la place de ssh, qui transmet l'environnement (SendEnv BORG_*
+                    # accepté par AcceptEnv) puis lance la commande distante telle quelle
+                    relay=os.path.join(d,'relais'); alog=os.path.join(d,'relais.argv')
+                    with open(relay,'w') as f: f.write(f'#!/bin/bash\nprintf "%s\\n" "$@" > {shlex.quote(alog)}\nexec "$@"\n')
+                    os.chmod(relay,0o700); open(os.path.join(d,'mode'),'w').write('warn1')
+                    pb=[relay]; xc=os.path.join(d,'exitcodes'); n0=len(open(xc).read().split('\n')[:-1]) if os.path.exists(xc) else 0
+                    with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                        rb=b.borg.boex('zr',['list','--json','ssh://h.invalid/./r'],preBorg=pb)
+                    av=open(alog).read().split('\n')[:-1] if os.path.exists(alog) else []
+                    rx=open(xc).read().split('\n')[:-1][n0:] if os.path.exists(xc) else []
+                    res['borg distant (preBorg) : commande sans préfixe, legacy par l\'environnement, liste de l\'appelant intacte']=(
+                        av==[os.path.join(d,'borg'),'list','--json','ssh://h.invalid/./r'] and rx==['list legacy'] and rb.get('exitcode')==1
+                        and pb==[relay],av,rx,rb.get('exitcode'),pb)
+            res['1.2 = 1.4']=(lines.get('12')==lines.get('14'),lines)
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("codes de sortie hérités demandés à borg (BORG_EXIT_CODES=legacy) : borg 1.4 « moderne » = borg 1.2 — avertissement gardé, erreur en échec, sondes de version (D134)",_bf_codes14)
+        def _borg_env_path():
+            """1.0.195 (story 72, revue 2 ; mutation E2 survivante) : PATH absent ou vide dans l'environnement de borgHelper -> borg
+            reçoit os.defpath, jamais une chaîne vide (Popen chercherait borg/ssh dans le dossier courant) ; PATH présent : gardé ;
+            BORG_EXIT_CODES=legacy et LC_ALL toujours posés, clés borg du rc seules."""
+            res={}
+            for lbl,val in (('absent',None),('vide',''),('présent','/opt/x:/usr/bin')):
+                env=dict(os.environ); env.pop('PATH',None)
+                if val is not None: env['PATH']=val
+                with mock.patch.dict(os.environ,env,clear=True):
+                    e=_borg_child_env({'BORG_REPO':'/r','SER_NAME':'s','BORG_PASSPHRASE':'p'})
+                want=os.defpath if not val else val
+                res[lbl]=(e.get('PATH')==want and e.get('BORG_EXIT_CODES')=='legacy' and e.get('LC_ALL')=='fr_FR.UTF-8'
+                          and set(e)=={'PATH','LC_ALL','BORG_EXIT_CODES','BORG_REPO','BORG_PASSPHRASE'},e)
+            bad_=[(k,v) for k,v in res.items() if not v[0]]
+            if bad_: print(f"    {bad_}")
+            return not bad_
+        check("environnement de borg : PATH absent ou vide -> os.defpath (jamais le dossier courant), legacy et LC_ALL posés (1.0.195)",_borg_env_path)
         def _bf_create_fail():
             """1.0.176 (story 39, décision de l'utilisateur ; mesuré : « success », code 0) : borg create tué (SIGKILL) ou en code 2 sans
             enregistrement ERROR -> Bkp code 2, « [ERREUR] zw: borg create a échoué : … », bkp_status « error » ; aucune trace."""
@@ -17443,7 +17544,7 @@ fail()
         check("tranche : priorité basse -> nice 10 et ionice idle (processus à part)",_ix_lower_priority)
         # ── Harnais « vrai borg » (1.0.158, story 21, A27) : un borg lancé par le selftest n'écrit jamais hors du dossier de
         # son test. Deux fuites mesurées (borg 1.2.6) : BORG_CACHE_DIR / BORG_SECURITY_DIR… de l'utilisateur priment sur
-        # BORG_BASE_DIR ; et boex ne passe à borg que les clés du rc, PATH et LC_ALL (ni HOME ni BORG_BASE_DIR) — un borg
+        # BORG_BASE_DIR ; et boex ne passe à borg que les clés du rc, PATH, LC_ALL et BORG_EXIT_CODES (ni HOME ni BORG_BASE_DIR) — un borg
         # lancé par boex sans BORG_EXE écrit dans le dossier personnel (~/.cache/borg, ~/.config/borg/security).
         # D'où : sous-processus -> _rb_env ; tout BorgHelper du selftest -> BORG_EXE=_rb_wrapper ; _rbc scrute ensuite
         # les dossiers de sécurité borg de l'utilisateur.
@@ -17451,9 +17552,10 @@ fail()
         # selftest (NameError dans les contrôles définis plus haut) ; le module l'importe déjà
         def _rb_env(bb,**kw):
             """Environnement d'un sous-processus borg ou borgHelper : os.environ sans aucune clé BORG_*, BORG_BASE_DIR du test,
-            TMPDIR du selftest, BORG_RELOCATED_REPO_ACCESS_IS_OK, puis les clés propres au test."""
+            TMPDIR du selftest, BORG_RELOCATED_REPO_ACCESS_IS_OK, BORG_EXIT_CODES=legacy (1.0.195, comme boex : lectures du
+            selftest en (0,1) même avec borg 1.4), puis les clés propres au test."""
             e={k:v for k,v in os.environ.items() if not k.startswith('BORG_')}
-            e.update(BORG_BASE_DIR=bb,TMPDIR=tmp,BORG_RELOCATED_REPO_ACCESS_IS_OK='yes'); e.update(kw)
+            e.update(BORG_BASE_DIR=bb,TMPDIR=tmp,BORG_RELOCATED_REPO_ACCESS_IS_OK='yes',BORG_EXIT_CODES='legacy'); e.update(kw)
             return e
         def _rb_cli_env(bb=None,**kw):
             """Environnement d'un borgHelper enfant : _rb_env (si bb) ou os.environ, sans DSN Sentry ni passphrase
@@ -17547,7 +17649,7 @@ fail()
             try:
                 for way in ('sous-processus','wrapper','wrapper-mid','boex','cli'):
                     bb=os.path.join(d,way,'bb'); repo=os.path.join(d,way,'repo'); w=os.path.join(d,way+'.sh'); os.makedirs(bb)
-                    uenv=dict(os.environ,BORG_PASSPHRASE='pw-iso',BORG_RELOCATED_REPO_ACCESS_IS_OK='yes')   # tel quel : seul le wrapper isole
+                    uenv=dict(os.environ,BORG_PASSPHRASE='pw-iso',BORG_RELOCATED_REPO_ACCESS_IS_OK='yes',BORG_EXIT_CODES='legacy')   # tel quel : seul le wrapper isole (codes hérités : 1.0.195)
                     _rb_wrapper(w,bb,mid=(f"if [ \"$1\" = create ]; then {shlex.quote(borg)} \"$@\"; exit $?; fi\n" if way=='wrapper-mid' else ''))
                     if way=='sous-processus':
                         for cmd in (('init','-e','repokey',repo),('create',f'{repo}::a',src)): run(way,[borg,*cmd],_rb_env(bb,BORG_PASSPHRASE='pw-iso'))
@@ -17590,7 +17692,7 @@ fail()
                 sl=f": >{shlex.quote(mk)}; sleep 2 #"; sl=(sl+'x'*(tail-len(sl.encode())-1)+"\n") if tail>len(sl.encode())+1 else None
                 if sl is None: return (False,f"ligne de ralentissement trop longue pour {tail} octets",None,None,None)
                 _rb_wrapper(w,bb,pre=sl)
-                env={'PATH':os.environ.get('PATH',''),'HOME':home,'BORG_PASSPHRASE':'pw-rw','BORG_RELOCATED_REPO_ACCESS_IS_OK':'yes'}
+                env={'PATH':os.environ.get('PATH',''),'HOME':home,'BORG_PASSPHRASE':'pw-rw','BORG_RELOCATED_REPO_ACCESS_IS_OK':'yes','BORG_EXIT_CODES':'legacy'}
                 ps=_rb_popen([w,'init','-e','repokey',repo],env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
                 try:
                     t0=time.monotonic()

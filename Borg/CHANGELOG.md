@@ -1,5 +1,52 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.195, borgHelperWWW 1.31.11 — Codes de sortie hérités demandés à borg 1.4 — 2026-10-10
+
+Chantier « reconstruction progressive », story 72 (reports D134, D142 ; décisions de l'utilisateur Q1 = A, Q2 = A). borgHelper et
+borgHelperWWW lisent les codes de borg selon la convention 1.2 (0 et 1 = utilisable, 2 et plus = échec ; `/download/file` :
+« never matched » en code 1 -> 404). borg 1.4 avec `BORG_EXIT_CODES=modern` rend ses avertissements en 100-127 et ses erreurs
+en 3-99 — mesuré sur borg 1.4.5 (binaire officiel, signature vérifiée, bac à sable) : « never matched » 101 au lieu de 1,
+archive absente 31 au lieu de 2 ; variable absente = codes hérités. **Seul borgHelperWWW était exposé** : `_borg_env` copie
+son environnement vers le borg des téléchargements — lancé avec `BORG_EXIT_CODES=modern`, `/download/file` d'un chemin absent
+répondait **502** au lieu de 404, `/download/tar` d'un préfixe absent 502 au lieu d'un tar vide et d'un `[WARN]` (mesuré).
+La CLI construit l'environnement de borg de zéro (clés borg du rc, PATH, LC_ALL) : avant 1.0.195, la variable n'y arrivait
+que par un wrapper `BORG_EXE` ou l'environnement de la machine distante d'un Bkp `SSH_REMFO` — sa part est défensive.
+
+- borgHelperWWW : `_borg_env` (dernière archive et téléchargements) force `BORG_EXIT_CODES=legacy`.
+- borgHelper : environnement de borg construit par une seule fonction, `_borg_child_env` (boex — toutes les commandes —,
+  `borg diff` de l'Index, sonde de version du Bkp), qui ajoute `BORG_EXIT_CODES=legacy` (PATH absent ou vide : `os.defpath`).
+  Bkp distant (`SSH_REMFO`) : commande distante inchangée (`<borg> …`, jamais de préfixe — décision de l'utilisateur : clé à
+  commande forcée « borg … », `sudo` qui remet l'environnement à zéro) ; le borg distant ne reçoit la variable que par
+  `SendEnv BORG_*`, si son sshd l'accepte (`AcceptEnv`). `boex` copie la liste `preBorg` (celle de l'appelant n'est plus
+  modifiée). Sonde de version en ssh direct : la variable atteint le client ssh local, pas le `borg --version` distant
+  (code 0 dans les deux modes, sans effet).
+- Codes hérités garantis avec borg 1.4, variable ignorée par borg 1.2 ; lectures des codes, codes de sortie de borgHelper et
+  statuts HTTP inchangés pour une même situation. Hors couverture (documenté) : un wrapper `BORG_EXE` qui force lui-même
+  `BORG_EXIT_CODES=modern` (jamais touché par borgHelper) ; l'environnement distant d'un Bkp `SSH_REMFO` qui force `modern`
+  ou dont le sshd refuse `BORG_*`.
+- Mesuré de bout en bout (borg 1.4.5, bac à sable `s72`, serveur lancé avec `BORG_EXIT_CODES=modern`, Sentry neutralisé) :
+  `/download/file` d'un chemin absent -> 404 (avec ou sans `bid`), fichier présent -> 200, `/download/tar` d'un préfixe
+  absent -> 200 (tar vide) et `[WARN] borg export-tar (téléchargement) : Include pattern … never matched.`, archive inconnue
+  -> 502 ; témoin 1.31.10, même serveur : 502, 200, 502, 502. Dossiers borg de l'utilisateur et `/tmp/_MEI*` inchangés.
+- CodecSelfTest : « environnement de borg : PATH absent ou vide -> os.defpath » (absent, vide, présent ; `legacy` et `LC_ALL`
+  posés, clés borg du rc seules).
+- CodecSelfTest : « codes de sortie hérités demandés à borg (BORG_EXIT_CODES=legacy) : borg 1.4 « moderne » = borg 1.2 —
+  avertissement gardé, erreur en échec, sondes de version (D134) » — borg factice « 1.4 » contre « 1.2 » : DiffBkp et Index en
+  avertissement (code 0, sortie et `[WARN]` de borg list, borg diff, borg diff de l'Index) et en erreur (code 2, « a échoué »),
+  mêmes codes et lignes sous 1.2 et 1.4, `legacy` reçu à chaque appel ; sondes de version (ssh direct, tunnel inverse local) :
+  `legacy` reçu ; borg distant (boex avec `preBorg`, relais qui transmet l'environnement comme un sshd qui accepte `BORG_*`) :
+  commande distante `<borg> …` sans préfixe, `legacy` reçu, avertissement en code 1, liste `preBorg` de l'appelant intacte. Le
+  borg factice partagé (`_bf_env`) note la variable reçue (`exitcodes`) ; son fichier `b14` est une SENTINELLE de « legacy
+  reçu » (codes modernes 101/31 seulement si la variable vaut `modern` ou est absente ; toute autre valeur — `legacy`, `Legacy`,
+  vide — : codes hérités), pas un modèle de borg 1.4 (qui lit une variable absente comme `legacy`). Harnais « vrai borg »
+  (`_rb_env`, environnements de `_rb_isolation` et `_rb_wrapper_rewrite`) : `BORG_EXIT_CODES=legacy`, comme boex.
+- push selftest : « /download/* : codes de sortie hérités demandés à borg (BORG_EXIT_CODES=legacy) — serveur en codes
+  modernes, borg 1.4 = borg 1.2 : 404 introuvable, 502 erreur, avertissement gardé (D142) » — bout en bout par l'application,
+  borg factice 1.4/1.2 (variable absente = legacy, comme le vrai), serveur avec et sans `BORG_EXIT_CODES=modern` : chemin
+  absent sans `bid` -> `[WARN]` de borg list puis 404 ; avec `bid` -> 404 ; `/download/tar` d'un préfixe absent -> 200, tar
+  vide, `[WARN] … never matched` ; erreur -> 502 ; fichier et tar avec avertissement -> 200 et `[WARN]` ; `legacy` reçu par
+  chaque borg.
+
 ## borgHelperWWW 1.31.10 — Journal des téléchargements : une ligne à la fin réelle, issue dite — 2026-10-10
 
 Chantier « reconstruction progressive », story 71 (reports D143, D146 ; décisions de l'utilisateur Q1 = A, Q2 = A). Avant : la

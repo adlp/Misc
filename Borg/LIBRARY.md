@@ -332,6 +332,9 @@ for nick in nicks.split(','):
 
 ```python
 # Appel borg brut (retourne dict {stdout, stderr, exitcode})
+# 1.0.195 : borg lancé avec BORG_EXIT_CODES=legacy (posé après forceEnv ; preBorg : borg distant,
+# variable reçue seulement par SendEnv BORG_* si le sshd distant l'accepte)
+# — exitcode en codes hérités (0, 1, 2…) même avec borg 1.4 ; un wrapper BORG_EXE qui force `modern` n'est pas couvert
 rb = bh.borg.boex('mon-serveur', ['list', '--json'])
 archives = rb['stdout'][0]['archives']
 for a in archives:

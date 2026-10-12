@@ -573,7 +573,8 @@ _bkp_server_version() → borg qui a reçu les données (ne lève jamais : appel
     tunnel inverse (preBorg) vers cette machine (_remfo_target_local) = `<BORG_REMOTE_PATH|borg> --version` local, vers
     une autre : None ; dépôt ssh direct = `<BORG_RSH|ssh> [-o BatchMode=yes -o ControlMaster=no -o ControlPath=none]
     [-p port] hôte <BORG_REMOTE_PATH|borg> --version` ; dépôt local (chemin, file://) = créateur. Environnement de boex
-    (clés borg du rc, PATH, LC_ALL), stdin fermé, start_new_session (sans terminal), _BORG_VERSION_TIMEOUT 15 s puis
+    (_borg_child_env : clés borg du rc, PATH, LC_ALL, BORG_EXIT_CODES=legacy — en ssh direct, reçu par le client ssh local,
+    pas par le `borg --version` distant, en code 0 dans les deux modes), stdin fermé, start_new_session (sans terminal), _BORG_VERSION_TIMEOUT 15 s puis
     killpg + _MEI de son groupe retirés (1.0.180 : relevés par processus, plus par listing), décodage tolérant. _version_from_output : « borg… X.Y » ou réponse de borg serve
     lancé par une clé à commande forcée (« Borg X.Y: Got connection close… », mesuré). Sans numéro, code 0 : None en
     silence ; échec : [WARN], jamais d'échec ; JSON stdout borgHelper_borg_versions {archive, server}
@@ -2335,6 +2336,24 @@ RepoHistory (`no such table` seulement -> `rows: []`) et ArchiveHistory `-j` mar
 `sys.exit(str)` affiché), code = le pire (`_exit_code`), nick suivant ; un seul nick : relancée (inchangé). Exception imprévue
 (ni base ni schéma) d'un nick, Index et Bkp multi-nicks : `_sentry_capture(e, nick)` (`capture_exception`, étiquette nick, si
 Sentry est initialisé). `_borg_extract_args` : `--numeric-ids`.
+**Codes de sortie hérités (1.0.195 / WWW 1.31.11, story 72, D134/D142)** : environnement de borg construit par UNE fonction,
+`_borg_child_env(cfg, force=None)` — clés borg du rc (`_BORG_RC_ENV_KEYS`), puis `force` (forceEnv de boex), puis PATH (`os.defpath`
+si absent ou vide, jamais le dossier courant), LC_ALL et `_BORG_EXIT_CODES_ENV` (`BORG_EXIT_CODES=legacy`) — pour `boex`, `_index_diffs` et `_bkp_server_version`.
+`boex` avec `preBorg` (Bkp `SSH_REMFO`, borg distant) : commande `list(preBorg) + [BORG_EXE] + arg` (copie : la liste de
+l'appelant n'est plus modifiée), sans préfixe (décision de l'utilisateur : une clé à commande forcée « borg … » la refuserait,
+`sudo` env_reset la retirerait) — le borg distant ne reçoit la variable que par `SendEnv BORG_*`, si son sshd l'accepte
+(`AcceptEnv`) ; un environnement distant qui force `modern` reste hors couverture. Sonde de version en ssh direct : la
+variable atteint le client ssh local, jamais le `borg --version` distant (code 0 dans les deux modes). borgHelperWWW `_borg_env`
+(copie de `os.environ` + clés borg du rc, utilisé par `_latest_archive` et les deux routes `/download/*`) la force aussi. Les
+lectures (`_borg_ok`, `_borg_warn`, `create_mute_fail`, `_borg_stream`, `_latest_archive`) restent en convention 1.2 : borg 1.4
+avec `BORG_EXIT_CODES=modern` (avertissements 100-127, erreurs 3-99 ; mesuré sur 1.4.5 : « never matched » 101, archive absente
+31 ; variable absente = hérités) y donne un échec pour un avertissement et un 502 pour un chemin introuvable ; borg 1.2 ignore la
+variable. Exposition réelle avant 1.0.195 : borgHelperWWW seul (`_borg_env` copiait un `modern` posé sur le service, mesuré) ;
+la CLI construit l'environnement de zéro — sa part est défensive (wrapper `BORG_EXE`, environnement distant). Non couvert :
+wrapper `BORG_EXE` qui force `modern` après coup. Harnais : le borg factice de `_bf_env` note la variable reçue (`exitcodes`) ;
+son fichier `b14` est une SENTINELLE de « legacy reçu » (codes modernes seulement si la variable vaut `modern` ou est
+absente ; toute autre valeur — `legacy`, `Legacy`, vide — : hérités), pas un modèle de borg 1.4 ; le borg factice du push selftest suit le vrai (absente = legacy) ; `_rb_env` pose
+`legacy` (borg réel des contrôles).
 **Téléchargements, index_last, sondes lecteur (1.0.177 / WWW 1.30.2 / UI 1.22.1, story 40)** : borgHelperWWW `_borg_stream(request,
 cmd, env, what, decoy, path, missing)` remplace `_stream_proc` — stderr de borg lu dans un thread, premier bloc lu AVANT la
 réponse : rien et code 1 + `missing` -> 404, rien et code ≥ 2/signal -> 502 (`_rb_errmsg`, leurre remplacé par le chemin

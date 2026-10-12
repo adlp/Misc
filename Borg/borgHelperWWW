@@ -77,7 +77,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.31.10"
+WWW_VERSION="1.31.11"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -2801,9 +2801,14 @@ def _borg_cfg(nick: str, passphrase: Optional[str]):
     return cfg
 
 def _borg_env(cfg):
+    """Environnement d'un borg lancé ici (téléchargements, dernière archive) : celui du serveur, clés borg du rc.
+    1.31.11 (story 72, D142, décision de l'utilisateur) : BORG_EXIT_CODES=legacy forcé — borg 1.4 avec BORG_EXIT_CODES=modern
+    (posé sur le service, copié d'ici) rend « never matched » en 101 et ses erreurs en 3-99 (mesuré sur 1.4.5 : /download/file
+    d'un chemin absent en 502 au lieu de 404) ; lectures des codes (0/1/>= 2) inchangées ; borg 1.2 ignore la variable."""
     env=os.environ.copy()
     for k in _BORG_ENV_KEYS:
         if k in cfg.keys(): env[k]=cfg[k]
+    env['BORG_EXIT_CODES']='legacy'
     return env
 
 def _latest_archive(cfg,env):
@@ -5590,6 +5595,82 @@ def push_selftest():
                     if not ok: print(f"  {out}")
                     return ok
                 check("/download/* : bout en bout par l'application — échec en cours d'envoi = pas de fin de transfert, succès = fin envoyée (A83)",_download_abort_e2e)
+                def _download_codes14_e2e():
+                    """1.31.11 (story 72, D142, décision de l'utilisateur ; mesuré sur borg 1.4.5 avec BORG_EXIT_CODES=modern dans
+                    l'environnement du serveur : « never matched » 101 -> /download/file 502 au lieu de 404) : bout en bout par la VRAIE
+                    application (middleware, route, _borg_env, _latest_archive, _borg_stream), borg factice « 1.4 » (codes modernes
+                    101/31 si BORG_EXIT_CODES=modern lui parvient) et « 1.2 » (variable ignorée), serveur avec BORG_EXIT_CODES=modern
+                    puis sans. Chaque fois : /download/file d'un chemin absent sans bid -> borg list en avertissement (dernière
+                    archive gardée, [WARN] au journal) puis 404 « absent introuvable dans l'archive a1 » ; avec bid -> 404 ;
+                    /download/tar d'un préfixe absent (borg : tar vide, « never matched ») -> 200, tar vide, [WARN] ; erreur de borg extract ->
+                    502 « borg extract a échoué : Archive a1 does not exist » ; fichier présent avec avertissement -> 200, contenu
+                    entier, [WARN] ; /download/tar avec avertissement -> 200, contenu entier. Chaque borg lancé a reçu
+                    BORG_EXIT_CODES=legacy. Attentes en dur."""
+                    log=os.path.join(tmpdir,'fb72.log')
+                    def mk(b14):
+                        fb=os.path.join(tmpdir,f'fb72-{b14}.py')
+                        with open(fb+'.tmp','w') as f:
+                            f.write(f"#!{sys.executable}\nimport os,sys\nsub=sys.argv[1]; p=sys.argv[-1]\n"
+                                    f"open({log!r},'a').write(sub+' '+os.environ.get('BORG_EXIT_CODES','-')+chr(10))\n"
+                                    f"modern={(b14=='14')!r} and os.environ.get('BORG_EXIT_CODES')=='modern'\n"
+                                    "W,E=(101,31) if modern else (1,2)\n"
+                                    "if sub=='list': sys.stdout.write('a0\\na1\\n'); sys.stderr.write('Warning: w72 list\\n'); sys.exit(W)\n"
+                                    "if p=='absent' and sub=='export-tar': sys.stdout.buffer.write(bytes(10240)); sys.stdout.flush()\n"   # comme borg : tar vide
+                                    "if p=='absent': sys.stderr.write(\"Include pattern 'absent' never matched.\\n\"); sys.exit(W)\n"
+                                    "if p=='erreur': sys.stderr.write('Archive a1 does not exist\\n'); sys.exit(E)\n"
+                                    "sys.stdout.write('contenu72'); sys.stdout.flush(); sys.stderr.write('Warning: w72 '+sub+'\\n'); sys.exit(W)\n")
+                        os.chmod(fb+'.tmp',0o700); os.replace(fb+'.tmp',fb); return fb
+                    async def call(route,qs):
+                        msgs=[]; got=[False]
+                        async def receive():
+                            if got[0]: await asyncio.sleep(3600)
+                            got[0]=True; return {'type':'http.request','body':b'','more_body':False}
+                        async def send(m): msgs.append(m)
+                        scope={'type':'http','asgi':{'version':'3.0'},'http_version':'1.1','method':'GET','scheme':'http','path':f"{API_PREFIX}{route}",
+                               'raw_path':f"{API_PREFIX}{route}".encode(),'query_string':qs.encode(),'root_path':'',
+                               'headers':[(b'host',b'test'),(b'x-api-key',API_KEY.encode())],'client':('127.0.0.1',1),'server':('test',80)}
+                        await asyncio.wait_for(app(scope,receive,send),60)
+                        st=[x['status'] for x in msgs if x['type']=='http.response.start']
+                        return (st[0] if len(st)==1 else st),b''.join(x.get('body',b'') for x in msgs if x['type']=='http.response.body')
+                    res={}
+                    for b14 in ('12','14'):
+                        fb=mk(b14)
+                        for srv in ('modern',None):
+                            if os.path.exists(log): os.unlink(log)
+                            env_srv={k:v for k,v in os.environ.items() if k!='BORG_EXIT_CODES'}
+                            if srv: env_srv['BORG_EXIT_CODES']=srv
+                            o={}
+                            for lbl,route,qs in (('absent','/download/file','nick=zz&path=absent'),('absent bid','/download/file','nick=zz&bid=a1&path=absent'),
+                                                 ('tar absent','/download/tar','nick=zz&bid=a1&prefix=absent'),('erreur','/download/file','nick=zz&bid=a1&path=erreur'),
+                                                 ('présent','/download/file','nick=zz&bid=a1&path=x'),('tar','/download/tar','nick=zz&bid=a1&prefix=x')):
+                                e=io.StringIO()
+                                with mock.patch.dict(os.environ,env_srv,clear=True), \
+                                     mock.patch(f"{__name__}._borg_cfg",lambda n,p: {'BORG_REPO':'/r','BORG_EXE':fb}), \
+                                     mock.patch(f"{__name__}.require_path_in_scope",lambda *a: True), \
+                                     mock.patch(f"{__name__}.require_downloads_allowed",lambda: None), contextlib.redirect_stderr(e):
+                                    st,body=asyncio.run(call(route,qs))
+                                o[lbl]=(st,body,e.getvalue())
+                            k=f"borg {b14[0]}.{b14[1]}, serveur {'BORG_EXIT_CODES=modern' if srv else 'sans la variable'}"
+                            st,body,err=o['absent']
+                            res[k+' : absent']=(st==404 and json.loads(body or b'{}').get('detail')=="absent introuvable dans l'archive a1"
+                                                and '[WARN] borg list (téléchargement, /r) : Warning: w72 list' in err,st,body[:200],err[-300:])
+                            st,body,err=o['absent bid']
+                            res[k+' : absent avec bid']=(st==404 and json.loads(body or b'{}').get('detail')=="absent introuvable dans l'archive a1",st,body[:200])
+                            st,body,err=o['tar absent']
+                            res[k+' : tar absent']=(st==200 and body==bytes(10240)
+                                                    and "[WARN] borg export-tar (téléchargement) : Include pattern 'absent' never matched." in err,st,len(body),err[-300:])
+                            st,body,err=o['erreur']
+                            res[k+' : erreur']=(st==502 and json.loads(body or b'{}').get('detail')=='borg extract a échoué : Archive a1 does not exist',st,body[:200])
+                            st,body,err=o['présent']
+                            res[k+' : présent']=(st==200 and body==b'contenu72' and '[WARN] borg extract (téléchargement) : Warning: w72 extract' in err,st,body[:200],err[-300:])
+                            st,body,err=o['tar']
+                            res[k+' : tar']=(st==200 and body==b'contenu72' and '[WARN] borg export-tar (téléchargement) : Warning: w72 export-tar' in err,st,body[:200],err[-300:])
+                            seen=open(log).read().split('\n')[:-1] if os.path.exists(log) else []
+                            res[k+' : legacy reçu']=(len(seen)==7 and all(l.endswith(' legacy') for l in seen),seen)
+                    bad={k:v for k,v in res.items() if not v[0]}
+                    if bad: print(f"  {bad}")
+                    return not bad
+                check("/download/* : codes de sortie hérités demandés à borg (BORG_EXIT_CODES=legacy) — serveur en codes modernes, borg 1.4 = borg 1.2 : 404 introuvable, 502 erreur, avertissement gardé (D142)",_download_codes14_e2e)
                 def _download_client_gone_e2e():
                     """1.31.6 (story 60 ; mesuré sur serveur réel : borg arrêté 28 s, 58 s après l'abandon, ou jamais avant l'arrêt du
                     serveur — le corps, annulé pendant un envoi dans la tâche interne du middleware, attendait le ramasse-miettes) :
