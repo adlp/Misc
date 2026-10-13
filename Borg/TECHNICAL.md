@@ -2829,6 +2829,11 @@ préfixe `BORGHELPERWWW_*` des autres réglages (`BORGHELPERWWW_HOST`, `BORGHELP
 
 ### Lancement externe (`uvicorn borgHelperWWW:app ...`)
 
+Arrêt : `_make_server` n'est pas utilisé — un téléchargement dont le client ne lit plus retient uvicorn 0.54 malgré deux SIGTERM
+et deux SIGINT (mesuré, story 73). `--timeout-graceful-shutdown N` (absente d'uvicorn 0.15) annule les requêtes encore en cours
+après N s : borg arrêté par la fin du lifespan / `atexit`, entrée `lock.roster` possible, `[req]` « (client parti) », `_MEI*`
+possibles ; toute requête longue (`/restore`, Prune, DelBkp) est coupée de même. Voir README (installation, « Arrêt »).
+
 Ici, uvicorn possède seul `sys.argv` et son propre cycle de vie — le code Python de `borgHelperWWW`
 n'a plus la main sur la construction du serveur, donc `BORGHELPERWWW_TRUSTED_PROXIES` est **sans
 effet**. C'est le mécanisme natif d'uvicorn qui s'applique directement :

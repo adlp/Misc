@@ -1,5 +1,17 @@
 # Changelog — borgHelper
 
+## Documentation (borgHelperWWW) — uvicorn externe : arrêt et --timeout-graceful-shutdown — 2026-10-13
+
+Chantier « reconstruction progressive », story 73 (report D176 ; décision de l'utilisateur : documentation seule). Remesuré sous
+uvicorn 0.54 (Python 3.14, `python -m uvicorn borgHelperWWW:app`, bac à sable isolé, fichier de 60 Mo) : un téléchargement dont le
+client ne lit plus garde le serveur et son borg vivants malgré deux SIGTERM puis deux SIGINT ; avec `--timeout-graceful-shutdown 5`,
+sortie 5,2 s après le premier SIGTERM, borg arrêté.
+
+- README (installation, « Arrêt ») et TECHNICAL (« Lancement externe ») : limite remesurée ; `--timeout-graceful-shutdown N` décrite
+  comme variante (absente d'uvicorn 0.15 : exemples laissés sans elle), avec ses effets — toute requête encore en cours coupée après
+  N s (téléchargement tronqué, `/restore`, Prune, DelBkp), entrée `lock.roster` du borg arrêté (mesuré), `_MEI*` possibles, `[req]`
+  « (client parti) » ; `TimeoutStopSec=` de systemd au-delà de N. Mesure : un seul worker. Aucun code changé.
+
 ## borgHelper 1.0.195, borgHelperWWW 1.31.11 — Codes de sortie hérités demandés à borg 1.4 — 2026-10-10
 
 Chantier « reconstruction progressive », story 72 (reports D134, D142 ; décisions de l'utilisateur Q1 = A, Q2 = A). borgHelper et

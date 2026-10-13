@@ -1756,6 +1756,14 @@ export BORGHELPERWWW_CONF=/etc/borghelperwww.conf
 uvicorn borgHelperWWW:app --host 0.0.0.0 --port 8000 --workers 2
 ```
 
+Arrêt sous uvicorn externe : sans option, un téléchargement dont le client ne lit plus garde le serveur et son borg vivants
+jusqu'au SIGKILL ou à la fermeture du client (voir « Arrêt » plus bas). Variante, si la version d'uvicorn la connaît (absente
+d'uvicorn 0.15, la pile Python 3.10 vérifiée — le serveur refuserait de démarrer ; mesurée sous uvicorn 0.54, un seul worker) :
+`--timeout-graceful-shutdown N` borne l'arrêt à N secondes, mais coupe alors **toute** requête encore en cours : téléchargement
+sain tronqué, `/restore`, Prune, DelBkp… arrêtés par le SIGKILL de fin (résultat partiel, `/tmp/_MEI*` et entrée de verrou
+`lock.roster` du dépôt possibles — l'entrée d'un borg mort est retirée par le borg suivant, mesuré sous borg 1.2.6). Choisir N au-delà de la plus longue
+opération attendue ; sous systemd, `TimeoutStopSec=` doit dépasser N (sinon le SIGKILL de systemd arrive avant).
+
 #### Préfixe des routes API
 
 Toutes les routes API métier (voir [Endpoints](#endpoints) ci-dessous) sont montées sous un préfixe
@@ -2843,8 +2851,14 @@ connexions ; au second signal (arrêt forcé), tous. Avant : uvicorn attendait s
 gardait sinon le serveur vivant (borg déjà arrêté) jusqu'au SIGKILL ; signaux d'arrêt : sortie normale (code 0) sous les deux
 piles vérifiées (mesuré). Sous un uvicorn externe : le premier signal attend (délai d'inactivité seulement). uvicorn 0.15
 (Python 3.10) : le second SIGTERM ou Ctrl-C force l'arrêt et arrête borg. uvicorn 0.54 (Python 3.14) : seul un second Ctrl-C
-(SIGINT) force l'arrêt, et un client qui ne lit plus garde quand même le serveur — et son borg — vivants jusqu'au SIGKILL ;
-borg meurt alors avec le serveur (tube fermé ; mesuré, 1.31.4). Exécution directe recommandée pour un arrêt borné.
+(SIGINT) force l'arrêt, et un client qui ne lit plus garde quand même le serveur — et son borg — vivants jusqu'au SIGKILL ou à la fermeture du client ;
+borg meurt alors avec le serveur (tube fermé ; mesuré, 1.31.4 ; remesuré le 2026-10-13 : deux SIGTERM puis deux SIGINT sans
+effet, sortie à la fermeture du client). Variante sous uvicorn externe : `--timeout-graceful-shutdown N` (absente d'uvicorn
+0.15 ; mesuré sous uvicorn 0.54, un worker, N=5 : sortie 5,2 s après le premier SIGTERM, borg arrêté, une entrée de son borg
+laissée dans `lock.roster` du dépôt) — elle coupe toute requête encore en cours après N s (voir l'installation) ; la ligne
+`[req]` d'un téléchargement coupé dit alors « (client parti) » (l'arrêt n'est pas vu par borgHelperWWW sous uvicorn externe :
+une telle ligne à l'heure d'un arrêt vient de l'arrêt) et des `/tmp/_MEI*` de borg peuvent rester. Exécution directe
+recommandée pour un arrêt borné sans ces effets.
 Commandes en cours (borgHelper et son borg, délai `BORGHELPERWWW_TIMEOUT`) : en exécution directe, le premier signal leur est
 relayé, le second leur envoie SIGKILL ; 1.31.9 : les `/tmp/_MEI*` de leur borg sont retirés après le premier signal relayé
 (relevés juste avant), jamais après l'arrêt forcé (second signal, atexit : le serveur sort). Sous un uvicorn externe, le premier
