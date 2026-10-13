@@ -1288,16 +1288,29 @@ vivant), `orphelin` (son `borg create` vit encore, qu'il ait pris le verrou ou n
 `BORGHELPER_BKP_RUN` ; 1.0.198, environnement illisible : argv `--comment "borgHelper run <run_id>"`, create de root ou du
 propriétaire du dossier du dépôt local seulement), `fin illisible`, `erreur de base`, `non fermé` (fermeture refusée, ou déjà
 faite par un autre rapprochement), `non vérifié` (`borg list` en échec ou arrêté, dépôt local absent), `non vérifiable` (dépôt
-distant, aucune archive de ce run et aucun `borg create` de ce run vu sur cette machine — jamais dit `absent`). Dépôt distant :
+distant, aucune archive de ce run et aucun `borg create` de ce run vu sur cette machine — jamais dit `absent`), `passphrase
+absente` (1.0.199 : `borg list` refusé faute de passphrase — rc sans `BORG_PASSPHRASE`, passphrase donnée seulement à la requête
+par `-P` ou `X-Borg-Passphrase` ; reconnu au message propre de borg, mesuré sur borg 1.2.6 (« can not acquire a passphrase »)
+et 1.4.5 (« Cannot acquire a passphrase ») — un autre message retombe sur `non vérifié`, réessayé comme avant ; dépôt non
+chiffré ou clé sans passphrase : jamais, le `borg list` réussit). Dépôt distant :
 un `borg create` du run qui tourne ICI avec un environnement lisible (`SSH_REPO`, `ssh://…`) est dit `orphelin` ; celui qui
 tourne sur une autre machine (`SSH_REMFO`) ou sous un autre compte n'est pas vu (pas de voie argv sans dépôt local).
 Texte : une ligne « `<nick> : Bkp <8 premiers caractères du run> — <état>` » par ligne `bkp_status` ouverte (Bkp interrompu ou
 vivant ; « `aucun Bkp interrompu` » sinon). Nick non vérifié : avec des lignes ouvertes, « `vérification impossible (borg list
-ou dépôt) — réessayer` » en plus ; sans ligne ouverte, « `<nick> : vérification impossible` » seule. Nick inconnu du rc (faute
+ou dépôt) — réessayer` » en plus (1.0.199, passphrase absente : « `vérification impossible (passphrase borg absente)` », les
+sources d'une passphrase étant dites par le `[WARN]`) ; sans ligne ouverte, « `<nick> : vérification impossible` » seule.
+Nick inconnu du rc (faute
 de frappe, ou nom de la machine sans `-n`) : une seule ligne pour ce nick, « `<nick> : nick inconnu du rc` », à sa place dans
 l'ordre de la demande (aussi avec `-j`, sur stderr). Code 0 :
 chaque nick vérifié ; 1 : vérification impossible (`borg list` en échec ou arrêté, dépôt local absent — `[WARN]` de borg dit ;
-base illisible — `[WARN] <nick> : base illisible (…)`), nick inconnu du rc, rc sans nick. Une ligne `absent` reste ouverte
+base illisible — `[WARN] <nick> : base illisible (…)` ; passphrase absente — `[WARN] <nick> : rapprochement impossible —
+passphrase borg absente : la donner par …` qui cite `BORG_PASSPHRASE` dans le rc (ou `POST /login` de borgHelperWWW),
+`BORGHELPERC_RUNTIME_PASSPHRASE` dans l'environnement du serveur, `-P` en CLI, `X-Borg-Passphrase` en HTTP, sans « réessayé » ;
+à l'Index et au début d'un Bkp, même
+`[WARN]` suivi de « réessayé au prochain Index » : l'Index réessaie), nick inconnu du rc, rc sans nick. Passphrase fausse
+(`-P` erroné) : `non vérifié`, comme avant. `BkpReconcile -P` à la main n'avance la fin que si l'archive du run existe (ligne
+fermée en succès, notifiée au passage suivant) ; s'il conclut `absent`, l'avis d'échec n'arrive qu'au délai
+`BKP_STATUS_TIMEOUT` : le watcher a gardé ce run comme traité. Une ligne `absent` reste ouverte
 (décision de l'utilisateur) : seul le watcher notifie l'échec ; Status et `/access` la disent interrompue jusqu'au délai
 `BKP_STATUS_TIMEOUT`, et une archive de ce run arrivée ensuite (un `borg create` passé inaperçu) est encore rapprochée en succès.
 
@@ -2627,7 +2640,17 @@ passage suivant ; aucune archive de ce run (vérifié) : fin **échec** aussitô
 (borgHelper arrêté, aucune archive de ce Bkp) » — pour chaque Bkp tué ainsi vérifié (plusieurs de suite : chacun) ; la ligne
 reste ouverte (`/access` : interrompu jusqu'au délai). Vérification impossible (borg list en échec, opération prioritaire, dépôt
 absent), fermeture ou réclamation refusée par la base : nouvel essai 10 min après ; Bkp redevenu vivant : revu au passage
-suivant ; fin d'archive illisible : dit au journal, fin au délai. Dépôt distant (Status : « borg non vérifiable » — le watcher
+suivant ; fin d'archive illisible : dit au journal, fin au délai. Passphrase absente côté serveur (borgHelper 1.0.199,
+borgHelperWWW 1.31.15 — nick dont la passphrase n'est donnée qu'à la requête, `-P`/`X-Borg-Passphrase`, jamais gardée par le
+serveur) : une ligne de journal par processus serveur (chaque worker, chaque redémarrage refait son `borg list` : « `[watcher]
+nick=<nick> Bkp interrompu <run> : passphrase absente côté serveur — fin au délai BKP_STATUS_TIMEOUT, sans avis d'échec
+immédiat (pour le retrouver : passphrase côté serveur — …)` »), ni nouvel essai par ce processus, ni notification d'échec, ni
+Sentry ; la fin vient du délai, comme un Bkp non vérifiable — avant : `borg list` refait toutes les 10 min, par worker, une
+ligne de journal à chaque essai. Avis d'échec immédiat retrouvé avec une passphrase côté serveur (`BORG_PASSPHRASE` dans le rc,
+`POST /login`, ou `BORGHELPERC_RUNTIME_PASSPHRASE` dans l'environnement du serveur, hérité par BkpReconcile). `BkpReconcile
+-P` à la main : utile seulement si l'archive du run existe (fermée en succès) ; `absent` : échec notifié au délai seulement.
+Détection mesurée sur borg 1.2.6 et 1.4.5 ; un autre message de borg retombe sur « nouvel essai 10 min après ». Passphrase
+fausse : nouvel essai 10 min après, inchangé. Dépôt distant (Status : « borg non vérifiable » — le watcher
 ne lance pas BkpReconcile), état illisible : comme avant, fin au délai `BKP_STATUS_TIMEOUT` (échec + « Sauvegarde bloquée ou
 interrompue »). borgHelper 1.0.198 : un Bkp dont le `borg create` vit encore sans tenir le verrou (démarrage, attente du
 verrou) est orphelin pour `/access` — le watcher ne lance plus BkpReconcile pendant cette fenêtre ; un `borg create` de root

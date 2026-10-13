@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.198"
+Version="1.0.199"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -1265,7 +1265,8 @@ def usage(doc=None,debug=0):
         printer("       Rapproche les Bkp tués (ligne bkp_status ouverte, rien de vivant) : archive « borgHelper run <id> »")
         printer("       écrite -> ligne fermée en succès ; même règle que l'Index, sans Index (un borg list par nick à")
         printer("       candidat)  |  -j : [{nick,verified,runs:{run_id:état}}]  |  code 1 : vérification impossible")
-        printer("       ou nick inconnu du rc, ou rc sans nick")
+        printer("       ou nick inconnu du rc, ou rc sans nick  |  passphrase borg ni dans le rc ni donnée : état")
+        printer("       « passphrase absente », code 1 — passphrase par le rc, BORGHELPERC_RUNTIME_PASSPHRASE ou -P")
     elif doc=='status':
         printer("   -c Status [-n nick1,nick2/ALL] [-j]")
         printer("       État rapide (dernier backup connu + âge, Bkp en cours depuis quand, opération")
@@ -4575,6 +4576,29 @@ _BORG_SUBCMDS=frozenset(('benchmark','break-lock','check','compact','config','cr
 # qui importe ces noms : un libellé renommé ici ne peut pas diverger de son lecteur (revue)
 RK_CLOSED='fermé'; RK_ABSENT='absent'; RK_ALIVE='vivant'; RK_ORPHAN='orphelin'; RK_BADEND='fin illisible'
 RK_DBERR='erreur de base'; RK_NOTCLOSED='non fermé'; RK_UNVERIFIED='non vérifié'; RK_UNCHECKABLE='non vérifiable'
+RK_NOPASS='passphrase absente'   # 1.0.199 (story 77, D182) : borg list refusé faute de passphrase (_borg_no_passphrase)
+
+# 1.0.199 (story 77, revue) : sources d'une passphrase, citées par le [WARN] « passphrase borg absente »
+_NOPASS_HOW=("la donner par BORG_PASSPHRASE dans le rc (ou POST /login de borgHelperWWW), BORGHELPERC_RUNTIME_PASSPHRASE dans "
+             "l'environnement du serveur, -P en CLI ou X-Borg-Passphrase en HTTP")
+
+# 1.0.199 (story 77, D182, décision Q1 de l'utilisateur) : échec de borg FAUTE de passphrase (NoPassphraseFailure de borg) —
+# reconnu par le message propre de borg, mesuré : 1.2.6 « can not acquire a passphrase: BORG_PASSPHRASE is not set. … »,
+# 1.4.5 « Cannot acquire a passphrase: … » (texte, sur la ligne de l'invite « Enter passphrase for key … : ») ; --log-json :
+# msgid NoPassphraseFailure. Passphrase fausse (« … is incorrect. »), dépôt verrouillé, réseau, borg tué : jamais. Mesuré sur
+# 1.2.6 et 1.4.5 seulement : un autre message (autre version de borg) retombe sur 'non vérifié' (réessayé, comme avant)
+_NOPASS_RE=re.compile(r'\bcan ?not acquire a passphrase\b',re.IGNORECASE)
+
+def _borg_no_passphrase(rb):
+    """Vrai si le résultat boex `rb` est un échec de borg faute de passphrase (BORG_PASSPHRASE absente de l'environnement de
+    borg, aucune saisie possible — boex ne passe jamais BORG_PASSCOMMAND, hors _BORG_RC_ENV_KEYS) ; faux pour un succès (code
+    0/1), un borg tué ou tout autre échec."""
+    if _borg_ok(rb) or rb.get('killed'): return False
+    for i in rb.get('stderr') or []:
+        if isinstance(i,dict):
+            if i.get('msgid')=='NoPassphraseFailure' or _NOPASS_RE.search(str(i.get('message',''))): return True
+        elif isinstance(i,str) and _NOPASS_RE.search(i): return True
+    return False
 
 def _proc_argv(pid):
     """1.0.184 (story 52) : argv d'un processus (/proc/<pid>/cmdline) ; None s'il est fini, illisible ou vide (noyau, zombie)."""
@@ -9487,7 +9511,7 @@ class BorgHelper:
         if stats_err: tcmpl[nick]['_stats_error']=True   # 1.0.179 (A92) : retiré à l'affichage, code 1
         return tcmpl,tbkps
 
-    def _reconcile_killed_bkp(self,nick,debug=0,report=None,retry='au prochain Index'):
+    def _reconcile_killed_bkp(self,nick,debug=0,report=None,retry='au prochain Index',nopass_retry=True):
         """1.0.185 (story 54, décisions de l'utilisateur) : rapprochement des Bkp TUÉS dont le borg create a quand même écrit
         l'archive — sinon le Bkp suivant voit « Bkp précédent en erreur » et le watcher notifie un échec au bout de
         BKP_STATUS_TIMEOUT. Candidat : ligne bkp_status OUVERTE du nick (open_bkp_runs : _BKP_OPEN_WHERE), sans marqueur de Bkp
@@ -9506,7 +9530,13 @@ class BorgHelper:
         vérifiable : dépôt distant)} — constantes RK_*, lu par la commande BkpReconcile (watcher de borgHelperWWW : fin d'un Bkp
         tué). Revue : un borg create vivant de ce run qui ne tient pas encore le verrou (démarrage) compte orphelin
         (run_create_alive) ; retry : texte du [WARN] d'échec (« au prochain Index », ou celui de BkpReconcile). Revue 2 : base illisible
-        -> 'error' (texte) dans report, dit en [WARN] par BkpReconcile (l'Index et backup() restent muets ici, comme avant)."""
+        -> 'error' (texte) dans report, dit en [WARN] par BkpReconcile (l'Index et backup() restent muets ici, comme avant).
+        1.0.199 (story 77, D182, décision Q1 de l'utilisateur) : borg list refusé FAUTE de passphrase (_borg_no_passphrase : message
+        propre de borg — rc sans BORG_PASSPHRASE, nick dont la passphrase n'est donnée qu'à la requête) -> candidats 'passphrase
+        absente' (RK_NOPASS ; figé pour le watcher seulement, qui ne réessaie plus ce run — l'Index réessaie), 'verified' faux,
+        [WARN] qui cite les sources d'une passphrase (_NOPASS_HOW) puis « réessayé `retry` » — sauf nopass_retry=False
+        (BkpReconcile : le watcher ne réessaie pas) ; rien fermé, comme tout échec. Passphrase fausse, autre échec : inchangés
+        ('non vérifié', [WARN] `retry`)."""
         from datetime import datetime
         rep=report if report is not None else {}
         rep['verified']=False; rep['runs']={}
@@ -9533,6 +9563,11 @@ class BorgHelper:
             if rb.get('killed'):   # arrêt prioritaire/échéance de l'Index : réessayé, rien à dire
                 for r in cand: rep['runs'][r]=RK_UNVERIFIED
                 return None
+            if _borg_no_passphrase(rb):   # 1.0.199 (story 77, D182, Q1) : état figé — le watcher ne réessaie plus ce run
+                printer(f"[WARN] {nick} : rapprochement impossible — passphrase borg absente : {_NOPASS_HOW}"
+                        +(f" — réessayé {retry}" if nopass_retry else ''))
+                for r in cand: rep['runs'][r]=RK_NOPASS
+                return 0
             self.borg._boex_check_stdout(rb,nick,'borg list')
             arch=rb['stdout'][0]['archives']
         except (Exception,SystemExit) as e:
@@ -9573,7 +9608,9 @@ class BorgHelper:
         'ALL' : tous les nicks du rc. Revue 2 : liste « a, b » nettoyée (espaces, doublons) ; base illisible dite en [WARN].
         1.0.190 (story 64, F336, décision de l'utilisateur) : nick inconnu du rc dit en UNE ligne (« n : nick inconnu du rc », plus
         de « vérification impossible » en plus), à sa place dans l'ordre de la demande (texte et -j, stderr) ; code 1 et JSON -j
-        inchangés."""
+        inchangés. 1.0.199 (story 77, D182, Q1) : borg list refusé faute de passphrase -> runs 'passphrase absente', [WARN] qui
+        cite les sources d'une passphrase (sans « réessayé »), texte « vérification impossible (passphrase borg absente) », code 1
+        (rien vérifié)."""
         known=[x for x in (self.borg.cfgreadnicks(debug) or '').split(',') if x]
         nicks=list(dict.fromkeys(x.strip() for x in (nick.split(',') if nick and nick!='ALL' else known) if x.strip()))   # revue 2 : « a, b », doublon
         out=[]
@@ -9584,7 +9621,8 @@ class BorgHelper:
                 out.append({'nick':n,'verified':False,'runs':{}}); continue   # 1.0.190 : dit dans la boucle de sortie, à sa place
             prev_stop=self.borg._stop
             self.borg._stop=lambda n=n: bool(self.db.check_priority_lock(n))   # (revue) son borg list cède à un Bkp/Restore/Prune qui démarre
-            try: self._reconcile_killed_bkp(n,debug=debug,report=rep,retry='par le watcher de borgHelperWWW, ou en relançant BkpReconcile')
+            try: self._reconcile_killed_bkp(n,debug=debug,report=rep,retry='par le watcher de borgHelperWWW, ou en relançant BkpReconcile',
+                                            nopass_retry=False)   # 1.0.199 (revue story 77) : le watcher ne réessaie pas sans passphrase
             except (Exception,SystemExit) as e:
                 if isinstance(e,SystemExit) and e.code==130: raise
                 rep={'verified':False,'runs':{}}
@@ -9596,7 +9634,10 @@ class BorgHelper:
             if as_json: continue
             if not o['runs']: printer(f"{o['nick']} : {'aucun Bkp interrompu' if o['verified'] else 'vérification impossible'}")
             for r,st in o['runs'].items(): printer(f"{o['nick']} : Bkp {r[:8]} — {st}")
-            if o['runs'] and not o['verified']: printer(f"{o['nick']} : vérification impossible (borg list ou dépôt) — réessayer")
+            if o['runs'] and not o['verified']:
+                if RK_NOPASS in o['runs'].values():   # 1.0.199 (story 77, D182) : jamais « réessayer » ; sources dites par le [WARN]
+                    printer(f"{o['nick']} : vérification impossible (passphrase borg absente)")
+                else: printer(f"{o['nick']} : vérification impossible (borg list ou dépôt) — réessayer")
         if as_json: print(json.dumps(out,ensure_ascii=False,indent=2))
         return 0 if all(o['verified'] for o in out) else 1
 
@@ -17184,6 +17225,96 @@ fail()
             if bad: print(f"  {bad}")
             return not bad
         check("Bkp tué dont le borg a fini : ligne rapprochée en succès (commentaire du run), à l'Index et au début du Bkp (1.0.185)",_reconcile_bkp_tue)
+        def _reconcile_nopass():
+            """1.0.199 (story 77, D182, décision Q1 de l'utilisateur) — borg list du rapprochement refusé FAUTE de passphrase (rc sans
+            BORG_PASSPHRASE : passphrase donnée à la requête seulement). Sorties de borg recopiées des mesures (1.2.6 et 1.4.5, texte ;
+            1.2.6 et 1.4.5 --log-json : msgid NoPassphraseFailure). Ligne ouverte, marqueur mort, borg list simulé. Attendu : np12,
+            np14, npj (appel de l'Index) -> 'passphrase absente' (RK_NOPASS), non vérifié, rien fermé, [WARN] qui cite les sources
+            d'une passphrase PUIS « réessayé au prochain Index » (revue : l'Index réessaie) ; BkpReconcile -j : JSON, code 1, [WARN]
+            sans « réessayé » ; texte : « … — passphrase absente » et « vérification impossible (passphrase borg absente) », sources
+            dites une seule fois (revue). Négatifs (inchangés) : passphrase fausse (1.2.6, 1.4.5), dépôt verrouillé -> 'non vérifié',
+            [WARN] « réessayé », texte « (borg list ou dépôt) — réessayer » ; borg tué portant le message -> None, muet, non vérifié ;
+            _borg_no_passphrase : code 0/1 (sortie valide) jamais, autre message jamais."""
+            d=os.path.join(tmp,'rk77'); shutil.rmtree(d,ignore_errors=True); os.makedirs(d); rc=os.path.join(d,'rc')
+            nk=('np12','np14','npj','npw2','npw4','npl','npk')
+            for n in nk: os.makedirs(os.path.join(d,'r-'+n))
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nSER_NAME=h\nSER_LOGIN=x\nGLOB_ARCH=*\nBORG_ARCHNAME=t\n"
+                        f"EXCLUDE=--exclude-caches\nDB_ENCRYPT=false\n\n"+''.join(f"[{n}]\nBORG_REPO={os.path.join(d,'r-'+n)}\n\n" for n in nk))
+            os.chmod(rc,0o600)
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            RUN=lambda n: f"{n}7".encode().hex().ljust(32,'0')[:32]
+            K='/r/repo: '; ENV=' BORG_PASSPHRASE is not set. BORG_PASSCOMMAND is not set. Interactive password query failed.'
+            GP=['getpass.py:91: GetPassWarning: Can not control echo on the terminal.','Warning: Password input may be echoed.']
+            LJ=lambda m: {'type':'log_message','time':1.0,'message':m,'levelname':'ERROR','name':'borg.archiver','msgid':'NoPassphraseFailure'}
+            err={'np12':GP+[f'Enter passphrase for key{K}can not acquire a passphrase:{ENV}'],
+                 'np14':GP+[f'Enter passphrase for key{K}Cannot acquire a passphrase:{ENV}'],
+                 'npj':[{'type':'log_message','time':1.0,'message':GP[0],'levelname':'WARNING','name':'borg.logger'},GP[1],
+                        f'Enter passphrase for key{K}'.rstrip(),LJ('Cannot acquire a passphrase:'+ENV)],
+                 'npw2':['passphrase supplied in BORG_PASSPHRASE, by BORG_PASSCOMMAND or via BORG_PASSPHRASE_FD is incorrect.'],
+                 'npw4':['Passphrase supplied in BORG_PASSPHRASE, by BORG_PASSCOMMAND, or via BORG_PASSPHRASE_FD is incorrect.'],
+                 'npl':['Failed to create/acquire the lock /r/lock.exclusive (timeout).'],
+                 'npk':GP+[f'Enter passphrase for key{K}can not acquire a passphrase:{ENV}']}
+            calls=[]
+            def fake_boex(nick,cmd,**kw):
+                calls.append((nick,list(cmd)))
+                if nick=='npk': return {'exitcode':-15,'killed':True,'stdout':[],'stderr':list(err[nick])}
+                return {'exitcode':2,'stdout':['',''] if nick in ('np12','np14') else [],'stderr':list(err[nick])}
+            res={}
+            def row(n): return _q(b.db.get_history_db(n),f"SELECT finished_at,result FROM bkp_status WHERE nick='{n}' AND run_id='{RUN(n)}'",one=True)
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                for n in nk:
+                    b.db.ensure_diff_db(b.db.get_diff_db(n)); b.db.store_bkp_status_start(n,RUN(n),db_path=b.db.get_history_db(n))
+                    with open(f"{b.db._bkp_marker_base(n)}.{RUN(n)}",'w') as f: f.write('99999999')   # marqueur mort
+            def rk(n):
+                o,e=io.StringIO(),io.StringIO(); rp={}; del calls[:]
+                with mock.patch.object(b.borg,'boex',fake_boex),contextlib.redirect_stdout(o),contextlib.redirect_stderr(e):
+                    try: r=b._reconcile_killed_bkp(n,report=rp)
+                    except (Exception,SystemExit) as x: r=f"{type(x).__name__}: {x}"
+                return r,rp.get('verified'),dict(rp.get('runs') or {}),o.getvalue(),e.getvalue(),len(calls)
+            def br(n,as_json):
+                o,e=io.StringIO(),io.StringIO()
+                with mock.patch.object(b.borg,'boex',fake_boex),contextlib.redirect_stdout(o),contextlib.redirect_stderr(e):
+                    c=b.bkp_reconcile(n,as_json=as_json)
+                try: j=json.loads(o.getvalue()) if as_json else o.getvalue()
+                except ValueError: j='?'
+                return c,j,e.getvalue()
+            W=("rapprochement impossible — passphrase borg absente : la donner par BORG_PASSPHRASE dans le rc (ou POST /login de "
+               "borgHelperWWW), BORGHELPERC_RUNTIME_PASSPHRASE dans l'environnement du serveur, -P en CLI ou X-Borg-Passphrase en HTTP")
+            for n,lbl in (('np12','borg 1.2.6 texte'),('np14','borg 1.4.5 texte'),('npj','--log-json, msgid NoPassphraseFailure')):
+                r,v,runs,o,e,nc=rk(n)
+                res[f'{n} {lbl} (Index) : passphrase absente, non vérifié, rien fermé, [WARN] -P sans « réessayé »']=(r==0 and v is False
+                    and runs=={RUN(n):RK_NOPASS} and row(n)==(None,None) and f"[WARN] {n} : {W} — réessayé au prochain Index" in e
+                    and not o.strip() and nc==1,r,v,runs,row(n),o[-200:],e[-300:])
+            c,j,e=br('np12',True)
+            res['BkpReconcile -j : runs « passphrase absente », verified false, [WARN] -P, code 1']=(c==1
+                and j==[{'nick':'np12','verified':False,'runs':{RUN('np12'):'passphrase absente'}}]
+                and f"[WARN] np12 : {W}  [borgHelper v{Version}]" in e.splitlines() and 'réessay' not in e,c,j,e[-300:])
+            c,j,e=br('np14',False)
+            res['BkpReconcile texte : ligne du run « passphrase absente », « relancer avec -P », code 1']=(c==1 and j==''
+                and f"np14 : Bkp {RUN('np14')[:8]} — passphrase absente" in e.splitlines()
+                and 'np14 : vérification impossible (passphrase borg absente)' in e.splitlines()
+                and 'réessay' not in e and e.count('X-Borg-Passphrase')==1,c,e[-400:])
+            for n,lbl in (('npw2','passphrase fausse 1.2.6'),('npw4','passphrase fausse 1.4.5'),('npl','dépôt verrouillé')):
+                r,v,runs,o,e,nc=rk(n); c,j,et=br(n,False)
+                res[f'{n} {lbl} : inchangé — non vérifié, [WARN] « réessayé », texte « réessayer », code 1']=(r==0 and v is False
+                    and runs=={RUN(n):RK_UNVERIFIED} and row(n)==(None,None) and f'[WARN] {n} : rapprochement impossible (borg list : ' in e
+                    and 'réessayé au prochain Index' in e and 'passphrase borg absente' not in e+et and c==1
+                    and f'{n} : vérification impossible (borg list ou dépôt) — réessayer' in et.splitlines(),r,v,runs,e[-300:],c,et[-300:])
+            r,v,runs,o,e,nc=rk('npk')
+            res['npk borg tué (message de passphrase présent) : None, muet, non vérifié']=(r is None and v is False
+                and runs=={RUN('npk'):RK_UNVERIFIED} and not (o+e).strip(),r,v,runs,o,e)
+            ok12={'exitcode':1,'stdout':[{'archives':[]}],'stderr':list(err['np12'])}
+            res['_borg_no_passphrase : code 0/1 jamais, autre échec jamais, NoPassphraseFailure seul (JSON) reconnu']=(
+                not _borg_no_passphrase(ok12) and not _borg_no_passphrase(dict(ok12,exitcode=0))
+                and not _borg_no_passphrase({'exitcode':2,'stderr':err['npw2']}) and not _borg_no_passphrase({'exitcode':2,'stderr':[]})
+                and _borg_no_passphrase({'exitcode':2,'stderr':[{'levelname':'ERROR','msgid':'NoPassphraseFailure','message':''}]})
+                and not _borg_no_passphrase({'exitcode':2,'stderr':[{'levelname':'ERROR','msgid':'PasswordRetriesExceeded','message':'x'}]}),)
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("Bkp tué, passphrase absente (rc sans passphrase) : BkpReconcile « passphrase absente », [WARN] -P, code 1 ; passphrase fausse, autre échec inchangés (1.0.199)",_reconcile_nopass)
         def _sentry_absent():
             """1.0.182 (story 48, décision de l'utilisateur) : module sentry_sdk absent (interpréteur sans le paquet) -> jamais de
             plantage. En processus : _sentry_init rend False, [WARN] une seule fois. CLI réelle (sous-processus, sys.modules
@@ -21321,6 +21452,58 @@ fail()
                              f"texte {'— (rapprochée)' in ot}/{'— (rapprochée)' in otl} ; HTML {'(rapprochée)' in oh} ; ArchiveHistory {ah} ; Status {os_[-250:]!r} ; -j {lb} ; Bkp {eb[-200:]!r}")
             return ok
         _rbc("archive rapprochée sur vrai borg : Status « inconnue (Bkp interrompu, archive rapprochée) », Report « — (rapprochée) », reconciled (1.0.187)",_reconciled_real_borg)
+        def _nopass_real_borg():
+            """1.0.199 (story 77, D182, décision Q1 de l'utilisateur) : vrai borg, CLI (mesure77.sh). Nick pc : dépôt repokey, rc SANS
+            passphrase (donnée à la requête), Bkp -P puis Bkp « tué » (ligne bkp_status ouverte, marqueur mort) ; nick pn : dépôt
+            non chiffré (-e none), rc sans passphrase, même Bkp tué. Attendu (en dur) : BkpReconcile -j sans -P -> code 1,
+            [{pc, verified false, runs {R: « passphrase absente »}}], [WARN] qui cite les sources d'une passphrase ; texte sans -P
+            (revue) -> code 1, ligne du run, « vérification impossible (passphrase borg absente) », sources dites une fois, jamais
+            « réessay… » ; -P fausse -> code 1, « non vérifié » (inchangé) ; -P (témoin) -> code 0, « absent » ; pn sans passphrase
+            -> code 0, « absent » (inchangé) ; lignes bkp_status de pc et pn toujours ouvertes (finished_at NULL) à la fin."""
+            borg=shutil.which('borg'); me=os.path.realpath(__file__)
+            d=os.path.join(tmp,'nopass-real'); bb=os.path.join(d,'bb'); src=os.path.join(d,'src'); os.makedirs(src)
+            with open(os.path.join(src,'f'),'w') as f: f.write('x')
+            rc=os.path.join(d,'rc'); cache=os.path.join(d,'cache'); w=os.path.join(d,'borgw')
+            _rb_wrapper(w,bb)
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={cache}\nSER_NAME=h\nSER_LOGIN=x\nGLOB_ARCH=*\nBORG_ROOTBKP={src}\nEXCLUDE=--exclude-caches\n"
+                        f"DB_ENCRYPT=false\nBORG_EXE={w}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\n\n"
+                        f"[pc]\nBORG_REPO={os.path.join(d,'repo-pc')}\nBORG_ARCHNAME=pc\n\n[pn]\nBORG_REPO={os.path.join(d,'repo-pn')}\nBORG_ARCHNAME=pn\n")
+            os.chmod(rc,0o600); cenv=_rb_cli_env(bb)
+            def cli(*a):
+                p=_rb_run([me,'-C',rc,*a],300,env=cenv); return p.returncode,p.stdout,p.stderr
+            for n,e in (('pc','repokey'),('pn','none')):
+                r=_rb_run([borg,'init','-e',e,os.path.join(d,'repo-'+n)],120,env=_rb_env(bb,BORG_PASSPHRASE='pw-np'))
+                if r.returncode!=0: print(f"  init {n} : {r.stderr[-200:]}"); return False
+            cb=[cli('-P','pw-np','-n',n,'-c','Bkp','-I')[0] for n in ('pc','pn')]
+            R='7e'*16
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                hb=BorgHelper(cfgfile=rc,cache_dir=cache)
+                for n in ('pc','pn'):
+                    hb.db.store_bkp_status_start(n,R,db_path=hb.db.get_history_db(n))
+                    with open(f"{hb.db._bkp_marker_base(n)}.{R}",'w') as f: f.write('99999999')   # marqueur mort : Bkp tué
+            def js(o):
+                try: return json.loads(o)
+                except ValueError: return None
+            c0,o0,e0=cli('-n','pc','-c','BkpReconcile','-j')
+            ct,ot,et=cli('-n','pc','-c','BkpReconcile')
+            cf,of,ef=cli('-P','faux','-n','pc','-c','BkpReconcile','-j')
+            cp,op,ep=cli('-P','pw-np','-n','pc','-c','BkpReconcile','-j')
+            cn,on,en=cli('-n','pn','-c','BkpReconcile','-j')
+            W=("[WARN] pc : rapprochement impossible — passphrase borg absente : la donner par BORG_PASSPHRASE dans le rc (ou POST /login "
+               "de borgHelperWWW), BORGHELPERC_RUNTIME_PASSPHRASE dans l'environnement du serveur, -P en CLI ou X-Borg-Passphrase en HTTP")
+            fin=[_q(hb.db.get_history_db(n),f"SELECT finished_at FROM bkp_status WHERE nick='{n}' AND run_id='{R}'",one=True) for n in ('pc','pn')]
+            ok=(cb==[0,0] and c0==1 and js(o0)==[{'nick':'pc','verified':False,'runs':{R:'passphrase absente'}}] and W in e0
+                and ct==1 and ot=='' and f"pc : Bkp {R[:8]} — passphrase absente" in et.splitlines()
+                and 'pc : vérification impossible (passphrase borg absente)' in et.splitlines() and W in et
+                and 'réessay' not in e0+et and et.count('X-Borg-Passphrase')==1 and fin==[(None,),(None,)]
+                and cf==1 and js(of)==[{'nick':'pc','verified':False,'runs':{R:'non vérifié'}}] and 'passphrase borg absente' not in ef
+                and cp==0 and js(op)==[{'nick':'pc','verified':True,'runs':{R:'absent'}}]
+                and cn==0 and js(on)==[{'nick':'pn','verified':True,'runs':{R:'absent'}}])
+            if not ok: print(f"  Bkp {cb} ; sans -P {c0} {o0[-200:]!r} {e0[-300:]!r} ; texte {ct} {ot[-100:]!r} {et[-400:]!r} ; fin {fin} ; -P faux {cf} {of[-200:]!r} {ef[-200:]!r} ; "
+                             f"-P {cp} {op[-200:]!r} {ep[-200:]!r} ; non chiffré {cn} {on[-200:]!r} {en[-200:]!r}")
+            return ok
+        _rbc("Bkp tué, passphrase absente sur vrai borg : BkpReconcile sans -P « passphrase absente » code 1 ; -P fausse non vérifié ; -P et dépôt non chiffré absent (1.0.199)",_nopass_real_borg)
         def _untracked_real_borg():
             """1.0.196 (story 74, D172 L2, décision Q1 de l'utilisateur) : vrai borg, CLI. Nick bu : un Bkp normal (archive indexée),
             puis un déclencheur SQLite qui refuse tout INSERT dans bkp_status (IntegrityError, attrapée par store_bkp_status_start

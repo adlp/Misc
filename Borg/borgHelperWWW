@@ -72,13 +72,13 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
                          op_allowed, allowed_ops, is_external, _rb_errmsg, _valid_nick_name, _mei_mapped, _purge_mei_dirs,
                          _group_pids, _group_alive, _group_wait,   # 1.31.2 : communs à borgHelper (zombies exclus, /proc illisible)
                          RK_CLOSED, RK_ABSENT, RK_ALIVE, RK_ORPHAN, RK_BADEND, RK_NOTCLOSED,   # 1.31.8 : états de BkpReconcile
-                         RK_DBERR, RK_UNVERIFIED, RK_UNCHECKABLE,
+                         RK_DBERR, RK_UNVERIFIED, RK_UNCHECKABLE, RK_NOPASS,   # 1.31.15 : passphrase absente (story 77)
                          _ORPHAN_TXT)   # 1.31.14 : mention d'un borg create orphelin (_never_cache), source unique dans borgHelper
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.31.14"
+WWW_VERSION="1.31.15"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -500,14 +500,15 @@ def _bkp_status_watcher_pass():
 
 _RECONCILE={}   # (nick, run_id) -> {'state': 'en_cours' | 'fait' | 'à refaire', 'next': monotonic} — par processus
 _RECONCILE_LOCK=threading.Lock()
-_RECONCILE_RETRY=600   # s : nouvel essai après une vérification impossible (borg list en échec, dépôt absent)
+_RECONCILE_RETRY=600   # s : nouvel essai après une vérification impossible (borg list en échec, dépôt absent) — jamais pour
+# « passphrase absente » (RK_NOPASS, 1.31.15 : figé, fait — une ligne de journal par processus serveur)
 
 def _reconcile_interrupted(nick):
     """1.31.8 (story 63, A118, décisions de l'utilisateur) : Bkp TUÉ (état de /access : interrompu, rien de vivant, orphelin
     vérifiable — dépôt local) -> `borgHelper -c BkpReconcile -n <nick> -j` dans un fil (un seul en vol par nick, jamais le
     passage bloqué par borg), une fois par Bkp tué (nouvel essai au plus tôt _RECONCILE_RETRY s après une vérification
-    impossible). Archive de ce run écrite : ligne fermée en succès, fin notifiée par le passage de FIN suivant. Rapprochement
-    vérifié sans archive de ce run : fin « échec » réclamée ici (CAS, une seule notification entre workers) + Sentry
+    impossible — sauf « passphrase absente », RK_NOPASS, 1.31.15 : jamais réessayé par ce processus). Archive de ce run
+    écrite : ligne fermée en succès, fin notifiée par le passage de FIN suivant. Rapprochement vérifié sans archive de ce run : fin « échec » réclamée ici (CAS, une seule notification entre workers) + Sentry
     « Sauvegarde interrompue ». État inconnu, dépôt distant (orphelin non vérifiable), Bkp vivant : rien — délai inchangé (AD-7).
     Coût par passage : _bkp_state (gardé : base et marqueurs) ; un borg list par Bkp tué ET par processus serveur (revue : chaque
     worker, chaque redémarrage refait le sien) — jamais après la fin notifiée de ce run (notified_at, durable)."""
@@ -553,7 +554,12 @@ def _reconcile_run(nick,run_id):
     journal — la fin viendra du délai ; vivant/orphelin : revu au passage suivant ; non vérifié, erreur de base, non fermé (revue
     2 : écriture refusée — une ligne fermée ailleurs n'est plus relancée, la garde ne la voit plus), réclamation impossible ou
     refusée : nouvel essai après _RECONCILE_RETRY. Journal : code et dernière ligne [WARN]/[ERREUR] de borgHelper quand rien
-    n'est vérifié."""
+    n'est vérifié. 1.31.15 (story 77, D182, décision Q1 de l'utilisateur) : run du compte rendu « passphrase absente »
+    (RK_NOPASS — borg list refusé faute de passphrase : nick dont la passphrase n'est donnée qu'à la requête, jamais gardée côté
+    serveur ; BkpReconcile hérite de l'environnement du serveur, BORGHELPERC_RUNTIME_PASSPHRASE compris) -> fait, une ligne de
+    journal par processus serveur (_RECONCILE : par worker, perdu au redémarrage ou à la purge au-delà de 500), ni nouvel essai
+    par ce processus, ni notification d'échec, ni Sentry : la fin vient du délai BKP_STATUS_TIMEOUT, comme un Bkp non vérifiable.
+    Avant : borg list refait toutes les 10 min jusqu'au délai."""
     state,nxt='à refaire',_RECONCILE_RETRY
     try:
         argv,env=_build_borghelper_argv_env('BkpReconcile',nick,['-j'])
@@ -577,6 +583,11 @@ def _reconcile_run(nick,run_id):
                 state='fait'
                 print(f"[watcher] nick={nick} Bkp interrompu {run_id[:8]} : {rs} — fin au délai BKP_STATUS_TIMEOUT",file=sys.stderr,flush=True)
             elif rs in (RK_ALIVE,RK_ORPHAN): nxt=0   # état changé depuis la décision : revu au passage suivant
+        elif runs.get(run_id)==RK_NOPASS:   # 1.31.15 (story 77, D182, Q1) : figé — rien vérifié, jamais réessayé, rien notifié
+            state='fait'
+            print(f"[watcher] nick={nick} Bkp interrompu {run_id[:8]} : passphrase absente côté serveur — fin au délai BKP_STATUS_TIMEOUT, "
+                  f"sans avis d'échec immédiat (pour le retrouver : passphrase côté serveur — BORG_PASSPHRASE dans le rc, ou POST /login, "
+                  f"ou BORGHELPERC_RUNTIME_PASSPHRASE dans l'environnement du serveur)",file=sys.stderr,flush=True)
         if state!='fait':
             why=rs or 'vérification impossible'
             if not ok:
@@ -4410,8 +4421,9 @@ def push_selftest():
                 les autres réclamées, celui de la décision jamais (garde) ; vivant -> revu au passage suivant ; CAS perdu (notified_at
                 posé par l'autre) -> fait, rien envoyé ; état inconnu, Bkp vivant, distant non vérifiable, garde illisible : aucun
                 lancement ; un seul fil par nick (même run, autre run), passage jamais bloqué ; purge au-delà de 500 : échéances
-                gardées ; passage de fin du watcher : appelé. Comptes rendus construits avec les états de borgHelper (RK_*, les neuf) :
-                un libellé renommé y change aussi ce décor."""
+                gardées ; passage de fin du watcher : appelé. Comptes rendus construits avec les états de borgHelper (RK_*, les neuf ;
+                1.31.15 : dix, RK_NOPASS) : un libellé renommé y change aussi ce décor. 1.31.15 (story 77) : passphrase absente (non
+                vérifié) -> fait, une ligne de journal, rien notifié, jamais relancé par ce processus ; passphrase fausse -> nouvel essai, inchangé."""
                 import types as _t
                 R='ab'*16; R2='ef'*16; state={'running':False,'bi':{'started_at':'x','verifie':True}}; ex=[]; push=[]; sen=[]
                 claim={'ok':True,'n':0,'boom':False,'refuse':False,'fail':set(),'who':[]}; rid={'v':R}; notified=set()
@@ -4497,6 +4509,27 @@ def push_selftest():
                     res['non vérifié : rien, nouvel essai après _RECONCILE_RETRY, code et [WARN] au journal']=(push==[] and len(ex)==1
                         and st1.get('state')=='à refaire' and st1.get('next',0)-time.monotonic()>_RECONCILE_RETRY-30
                         and 'code 1 : [WARN] nR : rapprochement impossible' in err.getvalue(),st1,ex,err.getvalue()[-300:])
+                    # 1.31.15 (story 77, D182, Q1) : passphrase absente (rc sans passphrase) -> fait, UNE ligne de journal, rien notifié,
+                    # jamais relancé par ce processus ; témoin : passphrase fausse (non vérifié) -> nouvel essai inchangé
+                    WP="[WARN] nR : rapprochement impossible — passphrase borg absente : la donner par BORG_PASSPHRASE dans le rc (…)"
+                    reset(); err.seek(0); err.truncate(); n8=claim['n']   # claim['n'] : cumulé, jamais remis à zéro par reset()
+                    go(json.dumps([{'nick':'nR','verified':False,'runs':{R:RK_NOPASS}}]),err=WP,code=1); st8=dict(_RECONCILE.get(('nR',R),{}))
+                    j8=[l for l in err.getvalue().splitlines() if l.strip()]
+                    go(json.dumps([{'nick':'nR','verified':False,'runs':{R:RK_NOPASS}}]),err=WP,code=1)
+                    _RECONCILE[('nR',R)]['next']=0.0; go(json.dumps([{'nick':'nR','verified':False,'runs':{R:RK_NOPASS}}]),err=WP,code=1)
+                    res['passphrase absente : fait, une ligne de journal, ni push ni Sentry, jamais relancé par ce processus (1.31.15)']=(len(ex)==1
+                        and push==[] and sen==[] and claim['n']==n8 and st8.get('state')=='fait'
+                        and j8==[f"[watcher] nick=nR Bkp interrompu {R[:8]} : passphrase absente côté serveur — fin au délai BKP_STATUS_TIMEOUT, "
+                                 "sans avis d'échec immédiat (pour le retrouver : passphrase côté serveur — BORG_PASSPHRASE dans le rc, ou "
+                                 "POST /login, ou BORGHELPERC_RUNTIME_PASSPHRASE dans l'environnement du serveur)"]
+                        and len([l for l in err.getvalue().splitlines() if l.strip()])==1,ex,push,sen,st8,err.getvalue()[-400:])
+                    reset(); err.seek(0); err.truncate()
+                    go(json.dumps([{'nick':'nR','verified':False,'runs':{R:RK_UNVERIFIED}}]),
+                       err="[WARN] nR : rapprochement impossible (borg list : passphrase supplied in BORG_PASSPHRASE … is incorrect.) — réessayé plus tard",code=1)
+                    st9=dict(_RECONCILE.get(('nR',R),{}))
+                    res['passphrase fausse (non vérifié) : inchangé — nouvel essai après _RECONCILE_RETRY, rien notifié (1.31.15)']=(push==[]
+                        and sen==[] and st9.get('state')=='à refaire' and st9.get('next',0)-time.monotonic()>_RECONCILE_RETRY-30
+                        and 'passphrase absente' not in err.getvalue(),st9,err.getvalue()[-300:])
                     reset(); go(js(True,{R:RK_ALIVE})); st2=dict(_RECONCILE.get(('nR',R),{}))
                     res['vivant : revu au passage suivant']=(push==[] and st2.get('state')=='à refaire' and st2.get('next',0)-time.monotonic()<=1,st2)
                     reset()

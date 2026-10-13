@@ -436,8 +436,11 @@ etat = bh.bkp_state('mon-serveur')   # {bkp_running, bkp_interrupted, bkp_stale,
 # candidat). Rend 0 si chaque nick est vérifié, 1 sinon ; as_json=True : imprime [{nick, verified, runs: {run_id: état}}].
 # Compte rendu brut : rep={} ; bh._reconcile_killed_bkp('mon-serveur', report=rep) -> rep['verified'], rep['runs']
 # (états RK_CLOSED 'fermé' | RK_ABSENT 'absent' | RK_ALIVE 'vivant' | RK_ORPHAN 'orphelin' | RK_BADEND 'fin illisible' |
-# RK_DBERR 'erreur de base' | RK_NOTCLOSED 'non fermé' | RK_UNVERIFIED 'non vérifié' | RK_UNCHECKABLE 'non vérifiable' — constantes
-# du module), rep['error'] si la base est illisible (dit en [WARN] par bkp_reconcile). Nick inconnu du rc ou rc sans nick : 1 ;
+# RK_DBERR 'erreur de base' | RK_NOTCLOSED 'non fermé' | RK_UNVERIFIED 'non vérifié' | RK_UNCHECKABLE 'non vérifiable' |
+# RK_NOPASS 'passphrase absente' (1.0.199 : borg list refusé faute de passphrase — BorgHelper(passphrase=…) ou BORG_PASSPHRASE
+# du rc pour l'éviter ; rep['verified'] faux ; détection mesurée sur borg 1.2.6 et 1.4.5, sinon 'non vérifié') —
+# constantes du module ; _borg_no_passphrase(rb) : résultat boex en échec faute de passphrase), rep['error'] si la base est
+# illisible (dit en [WARN] par bkp_reconcile). Nick inconnu du rc ou rc sans nick : 1 ;
 # nick None ou 'ALL' : tous les nicks du rc (en CLI sans -n : nom de la machine) ; 'a, b' : espaces et doublons ignorés. Le borg
 # list cède à une opération prioritaire du nick (non vérifié). Une ligne 'absent' reste ouverte (seul le watcher notifie l'échec).
 # Base : bh.db.run_create_alive({run_id, …}) -> run_id d'un borg create vivant lancé par backup() (/proc, même avant le verrou ;

@@ -1,5 +1,37 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.199, borgHelperWWW 1.31.15 — Passphrase du watcher (BkpReconcile) — 2026-10-13
+
+Chantier « reconstruction progressive », story 77 (report D182 de la revue 2 de la story 63 ; décision de l'utilisateur
+Q1 = A). Nick dont la passphrase borg n'est donnée qu'à la requête (`-P`, `X-Borg-Passphrase`, rc sans `BORG_PASSPHRASE`) :
+pour un Bkp tué, le watcher de borgHelperWWW lançait `BkpReconcile -j` sans passphrase, son `borg list` échouait, et il
+réessayait toutes les 10 min, par worker, jusqu'au délai `BKP_STATUS_TIMEOUT` — une ligne de journal à chaque essai.
+
+- borgHelper : l'échec de `borg list` FAUTE de passphrase est reconnu au message propre de borg (`NoPassphraseFailure` :
+  « can not acquire a passphrase » en 1.2.6, « Cannot acquire a passphrase » en 1.4.5, mesurés ; `msgid` sous `--log-json`) et
+  devient un état du rapprochement, figé pour le watcher seulement : runs candidats `passphrase absente` (constante
+  `RK_NOPASS`, importée par borgHelperWWW), `[WARN] <nick> : rapprochement impossible — passphrase borg absente : la donner
+  par …` qui cite les sources d'une passphrase (`BORG_PASSPHRASE` dans le rc ou `POST /login`, `BORGHELPERC_RUNTIME_PASSPHRASE`
+  dans l'environnement du serveur, `-P` en CLI, `X-Borg-Passphrase` en HTTP), rien vérifié (code 1 de BkpReconcile ; texte :
+  « vérification impossible (passphrase borg absente) »). À l'Index et au début du Bkp, même `[WARN]` suivi de « réessayé au
+  prochain Index » (l'Index réessaie). Détection mesurée sur borg 1.2.6 et 1.4.5 : un autre message retombe sur `non vérifié`
+  (réessayé, comme avant). Passphrase fausse, dépôt verrouillé, réseau : `non vérifié`, inchangés ; dépôt non chiffré ou
+  passphrase dans le rc : comportement actuel.
+- borgHelperWWW : run `passphrase absente` -> état `fait`, une ligne de journal par processus serveur (chaque worker, chaque
+  redémarrage refait son `borg list`) — « passphrase absente côté serveur — fin au délai BKP_STATUS_TIMEOUT, sans avis d'échec
+  immédiat (pour le retrouver : passphrase côté serveur — …) » —, ni nouvel essai par ce processus, ni notification d'échec,
+  ni Sentry ; la fin vient du délai, comme un Bkp non vérifiable. Aucune passphrase de requête gardée côté serveur
+  (BkpReconcile hérite de l'environnement du serveur : `BORGHELPERC_RUNTIME_PASSPHRASE`, s'il y est, lui en donne une).
+  `BkpReconcile -P` à la main n'avance la fin que si l'archive du run existe (fermée en succès) ; `absent` : l'avis d'échec
+  arrive au délai `BKP_STATUS_TIMEOUT`, le watcher ayant gardé ce run comme traité.
+- Mesuré (`work/s77/mesure77.sh`, CLI réelle, borg 1.2.6 et 1.4.5) : avant, `BkpReconcile -j` sans `-P` -> `non vérifié`, code 1,
+  `[WARN] … Enter passphrase for key …` ; après -> `passphrase absente`, `[WARN]` des sources, code 1 ; témoin `-P` : `absent`,
+  code 0 (inchangé).
+- Contrôles : CodecSelfTest « Bkp tué, passphrase absente (rc sans passphrase) … (1.0.199) » (sorties de borg 1.2.6/1.4.5,
+  texte et `--log-json` ; passphrase fausse, dépôt verrouillé, borg tué inchangés) et « Bkp tué, passphrase absente sur vrai
+  borg … (1.0.199) » (repokey sans -P en -j et en texte, ligne restée ouverte, -P fausse, -P, dépôt non chiffré) ; push selftest : sous-contrôles « passphrase
+  absente » et « passphrase fausse » du rapprochement par le watcher.
+
 ## borgHelper 1.0.198, borgHelperWWW 1.31.14 — Orphelin avant le verrou, borg create d'un autre uid — 2026-10-13
 
 Chantier « reconstruction progressive », story 76 (reports D183 et D181 de la revue 2 de la story 63 ; décisions de

@@ -2555,12 +2555,25 @@ un candidat ; faux : dépôt absent, `borg list` en échec ou tué, base illisib
 si `repo_orphan_checkable` : dépôt local) | `non vérifiable` (dépôt distant, aucune archive) | `vivant` (marqueur, `include_me`) |
 `orphelin` (`repo_orphan_create`, ou `run_create_alive` : `borg create` de ce run dans /proc — BORGHELPER_BKP_RUN — même avant le
 verrou) | `fin illisible` | `erreur de base` (exception) | `non fermé` (fermeture refusée ou déjà faite) | `non vérifié` (candidat,
-`borg list` impossible)}, et `error` (« base illisible (…) ») si la lecture de la base lève ; libellés = constantes `RK_*` (les
-neuf importées par borgHelperWWW) ; valeur rendue inchangée (Index, `backup()`). `run_create_alive` (scan de /proc : argv `create`,
+`borg list` impossible) | `passphrase absente` (1.0.199, candidat : `borg list` refusé faute de passphrase)}, et `error` (« base
+illisible (…) ») si la lecture de la base lève ; libellés = constantes `RK_*` (les dix importées par borgHelperWWW) ; valeur
+rendue inchangée (Index, `backup()`). `run_create_alive` (scan de /proc : argv `create`,
 environ `BORGHELPER_BKP_RUN` ; 1.0.198 : environ illisible — autre uid — run lu dans l'argv d'un create de root ou du
 propriétaire du dépôt du nick, `_proc_argv_bkp_run` ; avant : ignoré, d'où `absent` et une fin « échec » notifiée à tort ;
 borgHelper du Bkp non vérifié ici, comme avant) n'est appelé que s'il reste une ligne ouverte ni vivante ni orpheline du
 roster : coût d'un parcours de /proc pour l'Index et `backup()` qui ont une telle ligne, aucun sinon.
+Passphrase absente (1.0.199, story 77, D182, décision Q1 de l'utilisateur) : `_borg_no_passphrase(rb)` — résultat boex en échec
+(ni code 0/1, ni tué) dont le stderr porte le message propre de borg `NoPassphraseFailure` (`_NOPASS_RE`, sans casse :
+« can not acquire a passphrase » en 1.2.6, « Cannot acquire a passphrase » en 1.4.5, mesurés, sur la ligne de l'invite « Enter
+passphrase for key … : » ; enregistrement `--log-json` : `msgid` `NoPassphraseFailure`) -> candidats `passphrase absente`
+(`RK_NOPASS`), `verified` faux, `[WARN] <nick> : rapprochement impossible — passphrase borg absente : <_NOPASS_HOW>` (sources :
+BORG_PASSPHRASE du rc ou `POST /login`, BORGHELPERC_RUNTIME_PASSPHRASE du serveur, `-P`, `X-Borg-Passphrase`) puis « — réessayé
+<retry> » (Index, `backup()` : l'Index réessaie) — sans ce suffixe pour BkpReconcile (`nopass_retry=False`), rien fermé. État
+figé pour le watcher seulement. Détection mesurée sur borg 1.2.6 et 1.4.5 ; un autre message (autre version) retombe sur
+`non vérifié` (réessayé). Passphrase fausse (« … is incorrect. »), dépôt verrouillé, réseau : `non vérifié` et `[WARN]` `retry`,
+inchangés. `boex` ne passe jamais BORG_PASSCOMMAND (hors `_BORG_RC_ENV_KEYS`). Une passphrase donnée à une requête n'est jamais
+gardée côté serveur ; le watcher lance BkpReconcile avec l'environnement du serveur (`_build_borghelper_argv_env` copie
+`os.environ`) : BORGHELPERC_RUNTIME_PASSPHRASE, s'il y est, lui donne une passphrase.
 Commande `BkpReconcile` (`bkp_reconcile`, optab `Ccdnj`, opération `read`) : `borg._stop` = `check_priority_lock(nick)` le temps
 du rapprochement (son `borg list` cède à Bkp/Restore/Prune) ; `-n` nettoyé (espaces, doublons) ; `error` dit en `[WARN]` ; code
 1 si un nick n'est pas vérifié, inconnu du rc, ou rc sans nick. Ligne `absent` laissée ouverte (décision de l'utilisateur, revue
@@ -2576,7 +2589,12 @@ illimité) ; compte rendu vérifié : CHAQUE run `absent` -> `_reconcile_claim_e
 `_send_bkp_push(nick,'end','error',{})` et `sentry_alert('bkp_error', …, « Sauvegarde interrompue — … »)` ; CAS rendu False :
 `bkp_status_notified` relu — vide = erreur SQLite avalée par `claim_bkp_status`, exception) ; réclamations isolées, celle du run
 de la décision en dernier et jamais après un échec (sa fin notifiée arrêterait la garde) ; `fermé` ou ligne plus ouverte : `fait`
-(la fin vient du passage suivant) ; `fin illisible`, `non vérifiable` : `fait`, dit au journal (fin au délai) ;
+(la fin vient du passage suivant) ; `fin illisible`, `non vérifiable` : `fait`, dit au journal (fin au délai) ; 1.31.15 (story
+77) : compte rendu NON vérifié dont le run de la décision est `passphrase absente` (`RK_NOPASS`) : `fait`, une ligne de journal
+par processus serveur (`_RECONCILE` est par worker, perdu au redémarrage et à la purge au-delà de 500) « passphrase absente
+côté serveur — fin au délai BKP_STATUS_TIMEOUT, sans avis d'échec immédiat (pour le retrouver : passphrase côté serveur …) »,
+aucune réclamation, ni push ni Sentry (avant : `_RECONCILE_RETRY`, un `borg list` toutes les 10 min par worker jusqu'au délai) ;
+un `BkpReconcile -P` manuel qui conclut `absent` ne notifie rien (run `fait` : échec au délai) ;
 `vivant`/`orphelin` : revu au passage suivant ; non vérifié, `erreur de base`, `non fermé`, réclamation en exception ou
 refusée, sortie non JSON : `_RECONCILE_RETRY` (600 s), journal avec le code et la dernière ligne `[WARN]`/`[ERREUR]`. État
 inconnu, Bkp vivant, distant (`verifie` faux) : rien (délai AD-7 inchangé).
