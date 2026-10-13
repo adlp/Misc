@@ -65,7 +65,7 @@ def _push_deps_hint(err):
             f"python3-requests python3-cryptography' ; vendor/ attendu dans {_VENDOR_DIR}")
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
-from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail, glob_args, _pid_state,
+from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail, glob_args, _pid_stat,
                          DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec,
                          _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES, _enc_header_read, sentry_alert, _bkp_status_timeout,
                          _sentry_alert_kinds, db_plain_anomalies, _cfg_bool, convert_octets_readable,
@@ -77,7 +77,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.31.12"
+WWW_VERSION="1.31.13"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -1520,8 +1520,15 @@ def _repo_presence(n: str) -> str:
 def _pid_alive(pid) -> bool:
     """1.31.3 (revue story 56) : processus vivant au sens de /proc/<pid>/stat — zombie (Z) ou mort (X), absent : non. Un
     borgHelper lancé par POST /bkp puis tué reste zombie, enfant du worker, jusqu'au Popen suivant (os.kill(pid, 0) y réussit)."""
-    try: return _pid_state(int(pid)) not in ('Z','X',None)   # 1.31.5 (revue story 59) : lecteur de borgHelper, un seul
-    except ValueError: return False
+    return _pid_alive_start(pid)[0]   # 1.31.5 (revue story 59) : lecteur de borgHelper, un seul ; 1.31.13 : règle commune au roster
+
+def _pid_alive_start(pid) -> tuple:
+    """1.31.13 (story 75, D173) : (vivant, heure de démarrage) d'un processus en UNE lecture de /proc/<pid>/stat (_pid_stat de
+    borgHelper, seul parseur de _pid_state, _proc_start et _proc_live) — vivant : règle de _pid_alive ; début : champ 22 tel que
+    lu (None si illisible ou PID invalide)."""
+    try: st,start=_pid_stat(int(pid))
+    except ValueError: return False,None
+    return st not in ('Z','X',None),start   # 1.31.5 (revue story 59) : zombie et mort (X) comptent morts, illisible aussi
 
 _BKPSTATE_LAST={}   # nick -> dernier état du Bkp lu par _bkp_state (repli d'une sonde figée)
 
@@ -1557,12 +1564,18 @@ _ROSTER_LAST={}   # nick -> dernier état lu du lock.roster (repli d'une sonde f
 
 def _repo_roster_state(n: str) -> str:
     """1.31.3 (story 56, A113) : détenteurs exclusifs du lock.roster du dépôt local du nick (repo_lock_holders de borgHelper :
-    dépôt distant, roster absent ou illisible -> rien), « pid:vivant » (_pid_alive : zombie = mort) triés, lus par une sonde
-    bornée (_bounded_probe, 1 s, une seule en vol par nick). Revue : sonde figée -> DERNIER état lu (ou '?' s'il n'y en a pas
-    encore) : l'empreinte ne change pas, la réponse en cache est gardée (comme la présence, 'ok') ; un résultat tardif devient
-    le dernier état lu."""
+    dépôt distant, roster absent ou illisible -> rien), triés, « pid:1:<début> » pour un vivant, « pid:0 » pour un mort, un
+    zombie ou /proc illisible (_pid_alive_start : zombie = mort ; début = champ 22 de /proc/<pid>/stat, lu avec l'état), lus
+    par une sonde bornée (_bounded_probe, 1 s, une seule en vol par nick). Revue : sonde figée -> DERNIER état lu (ou '?' s'il
+    n'y en a pas encore) : l'empreinte ne change pas, la réponse en cache est gardée (comme la présence, 'ok') ; un résultat
+    tardif devient le dernier état lu. 1.31.13 (story 75, D173) : le début d'un vivant (avant : « pid:1 » seul) — un détenteur
+    tué dont le PID est réattribué entre deux appels change l'empreinte (avant : réponse « borg create encore actif » resservie
+    jusqu'à 5 min) ; « pid:0 » inchangé."""
+    def holder(p):
+        alive,start=_pid_alive_start(p)
+        return f"{p}:1:{start}" if alive else f"{p}:0"
     def read():
-        v=','.join(f"{p}:{int(_pid_alive(p))}" for p in sorted(_bh_paths.db.repo_lock_holders(n)))
+        v=','.join(holder(p) for p in sorted(_bh_paths.db.repo_lock_holders(n)))
         _ROSTER_LAST[n]=v; return v
     return _bounded_probe('roster',n,read,lambda: _ROSTER_LAST.get(n,'?'))
 
@@ -5221,7 +5234,9 @@ def push_selftest():
                     resservi ; marqueurs jamais retirés par WWW ; « .<pid>.tmp » d'écriture ignorés ; 1.31.12 (story 74) : trace
                     « <marqueur>.sans-suivi » qui apparaît -> recalculé. Revue : sonde du roster figée -> ~1 s
                     puis DERNIER état lu (réponse en cache gardée), suivantes immédiates, une seule sonde ; résultat tardif adopté ;
-                    requêtes concurrentes : une seule lecture du roster ; diffbkp : ni marqueurs ni roster."""
+                    requêtes concurrentes : une seule lecture du roster ; diffbkp : ni marqueurs ni roster. 1.31.13 (story 75, D173) :
+                    PID d'un détenteur repris (même PID vivant, début changé : simulé par _pid_stat) -> recalculé ; mort et /proc
+                    illisible : « pid:0 » comme avant."""
                     def clear():
                         for k in [k for k in _RESPONSE_CACHE if k and k[0]=='report' and k[1]==_internal]: _RESPONSE_CACHE.pop(k,None)
                     db=_bh_paths.db; ok_r=CommandResult(exitcode=0,stdout='tableau',stderr='')
@@ -5261,8 +5276,19 @@ def push_selftest():
                             res['porteur zombie -> exécuté']=(z and runs(call)==1 and runs(call)==0,z)
                             holders[0]=[kids[2].pid]
                             res['détenteur du roster -> exécuté, puis resservi']=(runs(call)==1 and runs(call)==0,)
+                            def f22(pid):   # 1.31.13 (story 75) : champ 22 lu ici, jamais par _pid_stat (la pièce contrôlée)
+                                with open(f'/proc/{pid}/stat') as f: return f.read().rsplit(')',1)[1].split()[19]
+                            real=_pid_stat; p2=kids[2].pid   # même PID vivant, début d'un autre processus
+                            with mock.patch(f"{__name__}._pid_stat",lambda p: (real(p)[0],'repris') if int(p)==p2 else real(p)):
+                                res['PID d\'un détenteur repris (début changé) -> exécuté, puis resservi']=(runs(call)==1 and runs(call)==0
+                                    and _ROSTER_LAST.get(_internal)==f"{p2}:1:repris",_ROSTER_LAST.get(_internal))
+                            with mock.patch(f"{__name__}._pid_stat",lambda p: (None,None) if int(p)==p2 else real(p)):
+                                res['/proc illisible -> « pid:0 » (comme un mort)']=(runs(call)==1 and _ROSTER_LAST.get(_internal)==f"{p2}:0",
+                                    _ROSTER_LAST.get(_internal))
+                            res['/proc lisible de nouveau -> exécuté, « pid:1:<début> » réel']=(runs(call)==1
+                                and _ROSTER_LAST.get(_internal)==f"{p2}:1:{f22(p2)}",_ROSTER_LAST.get(_internal))
                             kids[2].kill(); kids[2].wait()
-                            res['détenteur mort -> exécuté']=(runs(call)==1,)
+                            res['détenteur mort -> exécuté']=(runs(call)==1 and _ROSTER_LAST.get(_internal)==f"{p2}:0",_ROSTER_LAST.get(_internal))
                             holders[0]=[kids[4].pid]; runs(call); z=zombie(kids[4])
                             res['détenteur zombie -> exécuté']=(z and runs(call)==1,z)
                             holders[0]=[]; runs(call)
@@ -5272,13 +5298,14 @@ def push_selftest():
                             res['roster figé : ~1 s, dernier état lu, réponse en cache gardée ; suivant immédiat ; une sonde']=(a==0 and b==0
                                 and 0.9<=t1-t0<3 and t2-t1<0.9 and nth==1 and _ROSTER_LAST.get(_internal)==last,a,b,round(t1-t0,2),round(t2-t1,2),nth)
                             gate.set(); e=_PROBES.get(('roster',_internal)); e and e['t'].join(5)
-                            res['résultat tardif adopté']=(_ROSTER_LAST.get(_internal)==f"{kids[1].pid}:1",_ROSTER_LAST.get(_internal))
+                            k1=f"{kids[1].pid}:1:{f22(kids[1].pid)}"   # 1.31.13 (story 75) : début du détenteur vivant, lu par le contrôle
+                            res['résultat tardif adopté']=(_ROSTER_LAST.get(_internal)==k1,_ROSTER_LAST.get(_internal))
                             holders[0]='lent'; del reads[:]; _ROSTER_LAST[_internal]='avant'; got=[]
                             th=[threading.Thread(target=lambda: got.append(_repo_roster_state(_internal))) for _ in range(3)]
                             for t in th: t.start()
                             for t in th: t.join(5)
                             res['requêtes concurrentes : une seule lecture, toutes attendent sa vraie valeur']=(reads==[_internal]
-                                and got==[f"{kids[1].pid}:1"]*3,reads,got)
+                                and got==[k1]*3,reads,got)
                             holders[0]=[]
                             res['diffbkp : ni marqueurs ni roster']=('|bkp:' not in _external_fingerprint('diffbkp',_internal)
                                 and '|roster:' not in _external_fingerprint('diffbkp',_internal) and '|bkp:' in _external_fingerprint('report',_internal),)
@@ -5290,7 +5317,7 @@ def push_selftest():
                             with contextlib.suppress(OSError): os.unlink(p)
                     bad={k:v for k,v in res.items() if not v[0]}
                     if bad: print(f"  {bad}")
-                    return not bad and len(res)==14
+                    return not bad and len(res)==17
                 check("cache Report -o : marqueurs de Bkp et lock.roster dans l'empreinte, lecture seule, sonde bornée (story 56, A113)",
                       _cache_report_bkp_state)
                 def _scope_cache_ttl():

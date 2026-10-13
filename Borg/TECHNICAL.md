@@ -1984,15 +1984,23 @@ mtimes stables, mesuré). Cache par périmètre : `_capture_fingerprints(nick, '
 1.31.3 (story 56, A113) : pour `report`, `_external_fingerprint` ajoute `|bkp:` + `_bkp_markers_state()` (TOUS les marqueurs
 `<prefix>-*-bkp.lock.*` de `CACHE_DIR` triés — 1.31.12 (story 74) : traces `<marqueur>.sans-suivi` comprises (`_MARKER_RE`),
 sinon « en attente de l'Index » restait en cache jusqu'à 5 min après leur apparition —, « nom:`_lock_holder` » — lecture
-seule, jamais retirés ici ; décision de
-l'utilisateur : un voisin du même dépôt compte ; run_id de 32 hex seulement, jamais les `.<pid>.tmp` de `_set_pid_lock` ; porteur
-vivant mais zombie -> `zombie`, `_pid_alive` lit `/proc/<pid>/stat` : un borgHelper lancé par POST /bkp puis tué reste zombie,
-enfant du worker, jusqu'au Popen suivant ; 1.31.5 / borgHelper 1.0.188 : `_lock_holder` rend déjà `dead` pour un zombie, le
-libellé est donc `dead` — branche `zombie` gardée pour `/proc` lu entre-temps ; `_pid_alive` lit `_pid_state` de borgHelper) et `|roster:<nick>:<pid>:<vivant>,…` (`_repo_roster_state` : `repo_lock_holders` de
-borgHelper, `_pid_alive`) ; sondes par `_bounded_probe(sorte, nick, fn, repli)` (revue : inscrite sous `_PROBE_LOCK` avant son
-départ, une seule en vol par (sorte, nick), une requête concurrente attend la même ; au-delà de 1 s marquée figée, les suivantes
-rendent le repli aussitôt) — repli de la présence `ok`, du roster le dernier état lu `_ROSTER_LAST` (empreinte stable : réponse
-en cache gardée ; un résultat tardif devient le dernier état) ;
+seule, jamais retirés ici ; décision de l'utilisateur : un voisin du même dépôt compte ; run_id de 32 hex seulement, jamais
+les `.<pid>.tmp` de `_set_pid_lock` ; porteur vivant mais zombie -> `zombie`, `_pid_alive` lit `/proc/<pid>/stat` : un
+borgHelper lancé par POST /bkp puis tué reste zombie, enfant du worker, jusqu'au Popen suivant ; 1.31.5 / borgHelper
+1.0.188 : `_lock_holder` rend déjà `dead` pour un zombie, le libellé est donc `dead` — branche `zombie` gardée pour `/proc` lu
+entre-temps ; `_pid_alive` lit l'état par le lecteur de borgHelper — `_pid_state`, depuis 1.31.13 `_pid_alive_start` ->
+`_pid_stat` ; PID d'un porteur repris (part « porteur » de D173, story 75) : déjà réglé, `_lock_holder` applique la règle du
+PID repris — processus démarré plus de 60 s après la dernière écriture du marqueur -> `dead` (1.0.148) —, la même que Report
+(`bkp_markers`) : cache et CLI disent la même chose ; reste vu vivant par les deux un PID repris dans les 60 s qui suivent la
+dernière écriture du marqueur) et `|roster:<nick>:<détenteur>,…`, détenteur = `<pid>:1:<début>` (vivant ; début = champ 22 de
+`/proc/<pid>/stat`, 1.31.13) ou `<pid>:0` (mort, zombie ou `/proc` illisible) (`_repo_roster_state` : `repo_lock_holders` de
+borgHelper ; `_pid_alive_start` lit état et début dans UNE lecture de `/proc/<pid>/stat`, `_pid_stat` de borgHelper 1.0.197,
+seul parseur de `_pid_state`, `_proc_start` et `_proc_live` ; 1.31.13, story 75, D173 : un détenteur tué dont le PID est
+réattribué entre deux appels change l'empreinte — avant, `<pid>:1` seul, la réponse « borg create encore actif » était
+resservie jusqu'à 5 min) ; sondes par `_bounded_probe(sorte, nick, fn, repli)` (revue : inscrite sous `_PROBE_LOCK` avant son
+départ, une seule en vol par (sorte, nick), une requête concurrente attend la même ; au-delà de 1 s marquée figée, les
+suivantes rendent le repli aussitôt) — repli de la présence `ok`, du roster le dernier état lu `_ROSTER_LAST` (empreinte
+stable : réponse en cache gardée ; un résultat tardif devient le dernier état) ;
 `[ERREUR]` = arrêt d'un nick (`_nick_stop_msg`, `_db_schema_fail`) : sur-approximation voulue, comme AD-13 ; « Index vide »
 (1.0.179) : `[WARN]`, réponse cacheable, renouvelée par l'empreinte quand un Index crée la base (mesuré : « absent » -> mtime ;
 1.31.1 : `-wal` compris dans l'empreinte, un Index écrit d'abord dans le journal). Reste muet (code 0, aucun marqueur) : les mesures de Report -o sur erreur SQLite (`get_cache_rows`/CacheInfo : marqué,
@@ -2486,7 +2494,8 @@ appliquée. `MAX_AGE_BKP`, « aucune archive » et « dépôt absent » restent 
 (`[WARN] store_bkp_status_start a échoué`) : Bkp vu « en attente » jusqu'à sa fin avant 1.0.196, « en cours (suivi
 bkp_status indisponible) » depuis (trace « sans suivi », ci-dessus). Le cache de `/report?offline=true` de
 borgHelperWWW (5 min, empreinte = mtimes de diff.db, cache.db, history.db et `-wal` du nick) inclut depuis borgHelperWWW 1.31.3
-les marqueurs de Bkp et les détenteurs du `lock.roster` (voir « Cache des réponses »).
+les marqueurs de Bkp et les détenteurs du `lock.roster` (PID et, depuis 1.31.13, heure de démarrage de chaque détenteur
+vivant : PID repris compris ; voir « Cache des réponses »).
 
 **Report pendant un borg orphelin (1.0.184, story 52)** : `backup()` appelle `boex(create, forceEnv=dict(forceEnv or {},
 BORGHELPER_BKP_RUN=run_id, BORGHELPER_BKP_PID="<pid>:<début>"))` (`_proc_start`, ticks de `/proc/<pid>/stat`) — boex recopie

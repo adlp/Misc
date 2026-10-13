@@ -523,7 +523,9 @@ code 1 si la dernière archive dépasse `MAX_AGE_BKP` ou s'il n'y a aucune archi
 suivant), ligne au-delà de `BKP_STATUS_TIMEOUT` (un Bkp plus long que ce délai retombe sur borg), Restore/Prune/DelBkp en
 cours ; Bkp tué dont le `borg create` tient encore le dépôt : voir 1.0.184 ci-dessous. Limites : borgHelperWWW garde `/report?offline=true` en cache 5 min ;
 depuis borgHelperWWW 1.31.3, un marqueur de Bkp qui apparaît (tout nick, voisin compris), un borgHelper tué ou un changement
-des détenteurs du verrou d'un dépôt local renouvellent la réponse au premier appel suivant (avant : jusqu'à 5 min de retard).
+des détenteurs du verrou d'un dépôt local renouvellent la réponse au premier appel suivant (avant : jusqu'à 5 min de retard) ;
+depuis borgHelperWWW 1.31.13, un détenteur tué dont le PID est repris par un autre processus aussi (avant : « borg create
+encore actif » resservi jusqu'à 5 min).
 1.0.196 : si le Bkp ne peut écrire sa ligne `bkp_status` (`[WARN] store_bkp_status_start a échoué`), il le signale à côté de
 son marqueur (`<marqueur>.sans-suivi`) et reste vu en cours : `— ⏳ Bkp en cours depuis HH:MM (XhYYmin) (suivi bkp_status
 indisponible)` (début = date du marqueur ; JSON `"sans_suivi": true` dans `bkp_en_cours` — `false` sinon — et `bkp_voisin`) ;
@@ -550,7 +552,8 @@ l'environnement ; dépôt non local (`hôte:chemin`, `{…}`, relatif, `~`, `fil
 de `BKP_STATUS_TIMEOUT`. Après la fin de l'orphelin, l'archive existe mais le Bkp reste « jamais fini » (pas d'Index) : le Bkp
 suivant le compte comme précédent en erreur (1.0.185 : rapproché par l'Index s'il porte le commentaire de son run). Cache de
 5 min de borgHelperWWW (`/report?offline=true`), renouvelé au premier appel après la fin de l'orphelin (dépôt local) depuis
-borgHelperWWW 1.31.3. Status (1.0.186) dit la même chose (voir [`Status`](#status)).
+borgHelperWWW 1.31.3, et depuis 1.31.13 même si son PID a été repris entre-temps par un autre processus. Status (1.0.186) dit
+la même chose (voir [`Status`](#status)).
 
 Bkp tué dont le borg a fini (1.0.185) : chaque archive porte le commentaire `borgHelper run <run_id>` (visible dans `borg
 list`/`borg info`). À chaque Index et au début de chaque Bkp, la ligne `bkp_status` d'un Bkp tué (borgHelper arrêté, aucun borg
@@ -2383,11 +2386,12 @@ périmètre ; `GET /report?offline=true` et `GET /diffbkp` (qui lit le dépôt e
 de chaque dépôt local (disque démonté -> recalcul ; remonté -> la réponse d'avant resservie) et ne sont servis du cache
 que 5 min (« depuis », alerte de sauvegarde trop ancienne, place libre, nouvelle archive). borgHelperWWW 1.31.3 : celle de
 `/report?offline=true` porte aussi les marqueurs de Bkp de `CACHE_DIR` (porteur vivant ou mort ; 1.31.12 : et leurs traces
-`.sans-suivi`, Bkp en cours sans ligne `bkp_status`) et les détenteurs du `lock.roster` de chaque dépôt local (vivants ou non
-; un zombie compte mort) — « ⏳ Bkp en cours / en attente / interrompu » suit
-le Bkp au premier appel ; lecture du roster bornée à 1 s (montage figé : dernier état lu, réponse en cache gardée ; le premier
-appel sur un montage figé attend jusqu'à 1 s pour la présence et 1 s pour le roster, par nick). Limite : pour un nick voisin
-d'un dépôt distant (aucun `lock.roster` lisible), le passage « en attente » -> « en cours » du Bkp voisin peut retarder de 5 min.
+`.sans-suivi`, Bkp en cours sans ligne `bkp_status`) et les détenteurs du `lock.roster` de chaque dépôt local (vivants ou
+non ; un zombie compte mort ; 1.31.13 : avec l'heure de démarrage de chaque vivant — un détenteur tué dont le PID est repris par
+un autre processus change l'empreinte, la réponse est recalculée) — « ⏳ Bkp en cours / en attente / interrompu » suit le Bkp
+au premier appel ; lecture du roster bornée à 1 s (montage figé : dernier état lu, réponse en cache gardée ; le premier appel
+sur un montage figé attend jusqu'à 1 s pour la présence et 1 s pour le roster, par nick). Limite : pour un nick voisin d'un
+dépôt distant (aucun `lock.roster` lisible), le passage « en attente » -> « en cours » du Bkp voisin peut retarder de 5 min.
 
 ⚠️ **Périmètre de chemin actif ⇒ jamais servi depuis `_RESPONSE_CACHE`** (Story 1.3, étendu Story
 1.4) : pour `/search`, `/filehist`, `/lstbkpfls`, `/diffbkp`, `/treehist`, `/treefind`, `/duidx`,

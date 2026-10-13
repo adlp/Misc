@@ -1,5 +1,30 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.197, borgHelperWWW 1.31.13 — PID repris dans l'empreinte du roster — 2026-10-13
+
+Chantier « reconstruction progressive », story 75 (report D173, reste du tri A122 : le zombie était réglé par
+borgHelperWWW 1.31.3 / borgHelper 1.0.188).
+
+- borgHelperWWW : l'empreinte du cache de `/api/report?offline=true` notait chaque détenteur du `lock.roster` du dépôt local
+  en « pid:vivant » seulement. Un détenteur tué dont le PID était réattribué à un autre processus entre deux appels laissait
+  l'empreinte identique : la réponse en cache (« Bkp interrompu (borgHelper arrêté), borg create encore actif », code 1)
+  était resservie jusqu'à 5 min alors que Report -o ne la disait plus. Un détenteur vivant y porte désormais aussi son heure
+  de démarrage (champ 22 de `/proc/<pid>/stat`, lue dans la même lecture que son état : aucun coût de plus par appel) — un
+  PID repris change l'empreinte, la réponse est recalculée. Mort, zombie ou `/proc` illisible : « pid:0 », comme avant ;
+  sonde bornée, repli « dernier état lu » et partie « marqueurs de Bkp » inchangés, TTL inchangé.
+- Part « porteur » de D173 (marqueurs de Bkp dans l'empreinte) : déjà réglée, inchangée. `_lock_holder` applique la règle
+  du PID repris (processus démarré plus de 60 s après la dernière écriture du marqueur -> mort, 1.0.148), la même que Report
+  (`bkp_markers`) : le cache et la CLI disent la même chose. Reste : un PID repris dans les 60 s qui suivent la dernière
+  écriture du marqueur est encore vu vivant par les deux.
+- borgHelper : `_pid_stat(pid)` -> (état, début) en une lecture de `/proc/<pid>/stat`, seul parseur de `_pid_state`,
+  `_proc_start` et `_proc_live` (comportement inchangé), lu par borgHelperWWW (`_pid_alive_start`, aussi derrière
+  `_pid_alive`) — jamais un second parseur de `/proc` dans borgHelperWWW.
+- Mesuré (`work/s75/mesure75.sh`, espace de noms PID `unshare -Urpf`, PID réattribué par `ns_last_pid`) : faux `borg create`
+  orphelin détenteur, tué, son PID repris par `sleep` -> avant, l'API resservait « borg create encore actif » depuis le cache
+  quand la CLI ne le disait plus ; après, l'API recalcule et dit comme la CLI. Push selftest : contrôle du cache Report -o
+  étendu (PID repris -> recalculé, `/proc` illisible et mort -> « pid:0 », retour à « pid:1:<début> » réel ;
+  début attendu lu par le contrôle lui-même).
+
 ## borgHelper 1.0.196, borgHelperWWW 1.31.12 — Bkp vivant rapproché de sa ligne, Bkp sans ligne bkp_status dit en cours — 2026-10-13
 
 Chantier « reconstruction progressive », story 74 (report D172 ; décision de l'utilisateur Q1 = A). Deux limites de `_bkp_live`,

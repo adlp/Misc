@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.196"
+Version="1.0.197"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -4434,12 +4434,20 @@ class BorgHelperDB:
 
 # ── BorgRunner — borg subprocess + borghelperrc config ────────────────────────
 
-def _pid_state(pid):
-    """1.0.188 (story 59) : état d'un processus d'après /proc/<pid>/stat (« R », « S », « Z », « X »…) ; None si illisible."""
+def _pid_stat(pid):
+    """1.0.197 (story 75, D173) : (état, heure de démarrage) d'un processus lus dans UNE lecture de /proc/<pid>/stat — état
+    (« R », « S », « Z », « X »… ; None si illisible) et champ 22 (None si illisible ou absent). Seul parseur de _pid_state,
+    _proc_start et _proc_live (borgHelperWWW : état et début d'un détenteur du lock.roster sans seconde lecture)."""
     try:
         with open(f'/proc/{pid}/stat') as f: st=f.read()
-        return st[st.rindex(')')+2:][:1] or None
-    except (OSError,ValueError): return None
+        fl=st[st.rindex(')')+2:]
+    except (OSError,ValueError): return None,None
+    sp=fl.split()
+    return fl[:1] or None,(sp[19] if len(sp)>19 else None)
+
+def _pid_state(pid):
+    """1.0.188 (story 59) : état d'un processus d'après /proc/<pid>/stat (« R », « S », « Z », « X »…) ; None si illisible."""
+    return _pid_stat(pid)[0]
 
 def _pid_start_time(pid):
     """Heure de démarrage (epoch) d'un processus, d'après /proc (champ 22 de stat + btime) ; None si inconnue."""
@@ -4495,18 +4503,12 @@ def _proc_descendants(pid,kids=None):
 def _proc_start(pid):
     """Heure de démarrage d'un processus (champ 22 de /proc/<pid>/stat), None s'il n'existe plus : (pid, heure) désigne un
     processus sans ambiguïté — jamais un PID réattribué entre deux signaux."""
-    try:
-        with open(f'/proc/{pid}/stat') as f: st=f.read()
-        return st[st.rindex(')')+2:].split()[19]
-    except (OSError,ValueError,IndexError): return None
+    return _pid_stat(pid)[1]   # 1.0.197 (story 75) : parseur commun
 
 def _proc_live(pid,start):
     """1.0.180 (story 43) : vrai si (pid, heure de démarrage) désigne encore un processus VIVANT — un zombie est déjà mort."""
-    try:
-        with open(f'/proc/{pid}/stat') as f: st=f.read()
-        fl=st[st.rindex(')')+2:].split()
-        return fl[19]==start and fl[0] not in ('Z','X')   # 1.0.188 (revue story 59) : mort (X) aussi, comme _pid_state
-    except (OSError,ValueError,IndexError): return False
+    st,s0=_pid_stat(pid)   # 1.0.197 (story 75) : état et début d'une seule lecture, parseur commun
+    return s0 is not None and s0==start and st not in ('Z','X',None)   # 1.0.188 (revue story 59) : mort (X) aussi, comme _pid_state
 
 _BORG_SUBCMDS=frozenset(('benchmark','break-lock','check','compact','config','create','debug','delete','diff','export-tar','extract',
     'help','import-tar','info','init','key','list','mount','prune','recreate','rename','serve','umount','upgrade','version','with-lock'))
