@@ -38,7 +38,7 @@ Pannes simulées : FAKE_BW_FAIL="<commande>=<mode>[,…]" ; mode : badjson (JSON
 invalide, code 0), error (code 1, « Unexpected error. »), hang (bloqué, avec un
 enfant `sleep` ; pids écrits dans FAKE_BW_PIDS), hangonce (seul le premier appel bloque), hangnoecho
 (écho du terminal coupé, puis bloqué), hangafter (edit, create : écrit, puis bloqué : la réponse
-se perd), errorafter (edit, create : écrit, puis code 1), errorsecond (premier appel normal, les
+se perd ; logout : déconnecté, puis bloqué), errorafter (edit, create : écrit, puis code 1), errorsecond (premier appel normal, les
 suivants en erreur), silent (edit, create : code 0 sans rien écrire), erroronce (seul le premier
 appel en erreur), badjsonafter (create : créé, puis réponse illisible), corrupt (create :
 enregistré sans la fin de ligne finale de la clé privée), corruptafter (create : enregistré
@@ -401,6 +401,8 @@ def cmd_logout(ctx, pos):
     ctx.st = {"stateVersion": 85, "serverUrl": ctx.st.get("serverUrl")}
     _STATE_VAULT[0] = None
     ctx.save()
+    if injected("logout") == "hangafter":  # déconnecté, puis bloqué : la réponse se perd
+        simulate("hang")
     ctx.message("You have logged out.")  # mesuré
 
 

@@ -41,10 +41,13 @@ Codes de sortie :
      ordinaire, droits), répertoire
      personnel inconnu, ssh-config install refusé (~/.ssh/config lien symbolique ou non
      ordinaire, Include de sshvault dans un bloc Host/Match, chemin personnel avec %, $ ou
-     joker de glob), adoption de l'installation 0.8.0 impossible (rien modifié ; account add
+     joker de glob), ssh-config uninstall refusé (~/.ssh/config lien symbolique ou non
+     ordinaire, ~/.ssh/sshvault, sa config ou pub/ d'un type inattendu : rien modifié),
+     adoption de l'installation 0.8.0 impossible (rien modifié ; account add
      refusé tant qu'elle n'est pas faite), account rename : destination existante ou
      déplacement impossible, account remove : données impossibles à supprimer, magasin de
-     session ou agent en erreur (clés laissées), logout et account set : agent verrouillé ou
+     session ou agent en erreur (clés laissées), lock --unload : agent verrouillé ou en erreur
+     (coffre verrouillé quand même, clés laissées), logout et account set : agent verrouillé ou
      en erreur (rien modifié, ou état partiel dit) ou bw logout en échec ou sans réponse (compte
      toujours connecté, ou état inconnu ; set : registre inchangé), account set : registre
      non écrit après la déconnexion, ou erreur interne
@@ -190,7 +193,8 @@ def build_parser() -> Parser:
                       "account set sans option ou registre refusé après la déconnexion, logout/set : "
                       "bw-path invalide), "
                       "3 aucun compte, non connecté ou verrouillé (coffre ou agent, passphrase refusée), "
-                      "4 erreur backend ou agent, écriture ou ssh_config impossible, install refusé, "
+                      "4 erreur backend ou agent (lock --unload : clés non retirées), écriture ou ssh_config "
+                      "impossible, install ou uninstall refusé, "
                       "adoption 0.8.0 impossible, account rename/remove/set ou logout en échec, "
                       "ssh-keygen ou ssh en échec, "
                       "130 interrompu. "
@@ -214,8 +218,12 @@ def build_parser() -> Parser:
     _account_flag(s)
     s.add_argument("--ttl", type=ttl_arg, default=DEFAULT_TTL, metavar="SECONDES",
                    help="durée de vie de la session (défaut %d)" % DEFAULT_TTL)
-    s = sub.add_parser("lock", help="verrouille le coffre et oublie la session")
+    s = sub.add_parser("lock", help="verrouille le coffre et oublie la session (--unload : retire aussi les clés "
+                                    "des agents)")
     _account_flag(s, "compte à verrouiller (plusieurs fois possible) ; défaut : tous")
+    s.add_argument("--unload", action="store_true",
+                   help="retire aussi des agents (dédié et sous-agents de transfert) les clés des comptes "
+                        "verrouillés ; une clé partagée avec un compte non verrouillé reste, attribuée à lui")
     s = sub.add_parser("sync", help="resynchronise le coffre depuis le serveur")
     _account_flag(s)
     s = sub.add_parser("list", help="liste les clés SSH du coffre")
@@ -348,9 +356,12 @@ def build_parser() -> Parser:
     _selection_flags(s)
 
     s = sub.add_parser("ssh-config", help="génère ~/.ssh/sshvault/config et les clés publiques ; "
-                                          "install : ligne Include en tête de ~/.ssh/config")
-    s.add_argument("action", nargs="?", choices=["install"], metavar="install",
-                   help="insère la ligne Include en tête de ~/.ssh/config (sauvegarde faite)")
+                                          "install : ligne Include en tête de ~/.ssh/config ; uninstall : retire "
+                                          "la ligne Include, la config générée et les clés publiques")
+    s.add_argument("action", nargs="?", choices=["install", "uninstall"], metavar="install|uninstall",
+                   help="install : insère la ligne Include en tête de ~/.ssh/config (sauvegarde faite) ; "
+                        "uninstall : retire la ligne Include (sauvegarde faite), ~/.ssh/sshvault/config et "
+                        "~/.ssh/sshvault/pub/ (agents, comptes, sessions et données de bw gardés)")
     g = s.add_mutually_exclusive_group()
     g.add_argument("--print", dest="print_only", action="store_true",
                    help="affiche la config générée sans rien écrire")
@@ -490,6 +501,8 @@ def run(args, accts: Accounts) -> int:
             b.lock()
             print("coffre verrouillé, session oubliée%s" % (" : " + a if accts.multi else ""))
         accts.need_some()  # aucun compte : NoAccount (code 3), comme unlock et sync
+        if args.unload:
+            return run_lock_unload(accts, accts.all(args.account))
         return _per_account(accts, accts.all(args.account), lock)
     if args.cmd == "sync":
         def sync(a, b):
@@ -843,11 +856,13 @@ def _mine_candidate(e: dict, alias: str) -> bool:
     return any(isinstance(x, str) and fastpath._pair(x)[0] in (None, alias) for x in e.get("also") or [])
 
 
-def _check_agents(alias: str, agents, kept: str, retry: str):
+def _check_agents(alias: str, agents, kept: str, retry: str, fail=None):
     """Avant tout appel à bw et tout effet : état de chaque agent (dédié, sous-agents) lu, et
-    ceux qui portent une clé possible du compte listés et contrôlés non verrouillés. Renvoie
-    [(agent, état, clés listées)] ; None si un agent est verrouillé ou en erreur (une ligne :
-    `kept`, ce qui reste ; `retry`, commande à relancer)."""
+    ceux qui portent une clé possible du compte listés et contrôlés non verrouillés (agent qui
+    ne liste rien alors qu'une clé possible du compte n'est pas échue : verdict de la sonde
+    `ssh-add -D`). Renvoie [(agent, état, clés listées)] ; None si un agent est verrouillé ou
+    en erreur (une ligne : `kept`, ce qui reste ; `retry`, commande à relancer ; `fail` :
+    remplace `_agents_failed`)."""
     base, main, subs = agents
     if base is None:
         return []
@@ -860,11 +875,11 @@ def _check_agents(alias: str, agents, kept: str, retry: str):
             if cand and os.path.exists(a.socket):
                 present = {k.fingerprint: k for k in a.keys()}
                 live = [fp for fp in cand if remaining(data["keys"][fp], now) != 0]
-                if live and (data.get("locked") or maybe_locked(data, set(present))):
+                if live and (data.get("locked") or (maybe_locked(data, set(present)) and a.probe_locked())):
                     raise AgentLocked("agent verrouillé")
             out.append((a, data, present))
         except AgentError as e:
-            _agents_failed(alias, a, e, kept, retry)
+            (fail or _agents_failed)(alias, a, e, kept, retry)
             return None
     return out
 
@@ -874,13 +889,13 @@ def _agents_failed(alias: str, a, e, what: str, retry: str) -> None:
         % (alias, a.socket, e, what, retry))
 
 
-def _unload_account(alias: str, accts: Accounts, b, checked: list, kept: str, retry: str):
+def _unload_account(alias: str, accts: Accounts, b, checked: list, kept: str, retry: str, fail=None):
     """Clés du compte `alias` retirées des agents vérifiés par `_check_agents` ; une clé partagée
     avec un autre compte reste, promue à l'autre détenteur. À appeler sous ensure.lock. `bw
     list` seulement pour des entrées sans compte (chargées avant la 0.9.0). Renvoie (clés
     retirées, empreintes chargées avant la 0.9.0 laissées, état d'un agent modifié ?) ; None si
     un retrait échoue : une ligne (`kept` si rien n'a encore été modifié, sinon l'état partiel,
-    agent en cours nommé ; `retry` : commande à relancer)."""
+    agent en cours nommé ; `retry` : commande à relancer ; `fail` : remplace `_agents_failed`)."""
     removed, legacy_left, changed = 0, set(), []
     legacy = any(not e.get("account") or any(isinstance(x, str) and fastpath._pair(x)[0] is None
                                              for x in e.get("also") or [])
@@ -910,12 +925,14 @@ def _unload_account(alias: str, accts: Accounts, b, checked: list, kept: str, re
                     here += 1  # vrais retraits seulement
                 except AgentError:
                     # clé partie entre les deux passes (durée de vie écoulée, ssh-add -d) : retirée ;
-                    # mais un agent qui ne liste plus rien alors que la clé vit encore est sans doute
-                    # verrouillé : aucune info sûre = tout garder (entrée gardée, code 4)
+                    # mais un agent qui ne liste plus rien alors que la clé vit encore est peut-être
+                    # verrouillé : la sonde `ssh-add -D` tranche (vide et déverrouillé : partie ;
+                    # verrouillé : entrée gardée, code 4)
                     listed = {k.fingerprint for k in a.keys()}
                     if fp in listed:
                         raise
-                    if data.get("locked") or (not listed and remaining(data["keys"][fp], now) != 0):
+                    if data.get("locked") or (not listed and remaining(data["keys"][fp], now) != 0
+                                              and a.probe_locked()):
                         raise AgentLocked("agent verrouillé") from None
                 removed += 1
             late = set()
@@ -945,7 +962,7 @@ def _unload_account(alias: str, accts: Accounts, b, checked: list, kept: str, re
                 what = "état partiel : " + ", ".join(parts)
             else:
                 what = kept
-            _agents_failed(alias, a, e, what, retry)
+            (fail or _agents_failed)(alias, a, e, what, retry)
             return None
     return removed, legacy_left, bool(changed)
 
@@ -1060,6 +1077,18 @@ def _logout_failed(alias: str, b, e: BaseException, removed: int, had: Optional[
     return RC_BACKEND
 
 
+def _on_logout_interrupted(alias: str, b):
+    """`bw logout` interrompu (`logout`, `account set`) : appelé signaux retenus, état relu ;
+    marqueur `logged-out` posé si bw est déconnecté ou si son état est inconnu (retiré dès que
+    bw sera vu connecté), mémoire d'échec de déverrouillage effacée. L'interruption suit
+    (« interrompu », code 130)."""
+    def done(gone: Optional[bool]) -> None:
+        _clear_unlock_failure(alias)
+        if gone is not False:
+            _set_logged_out_marker(alias, b)
+    return done
+
+
 def _probe(b):
     """État du compte dans bw, sans effet sur la session rangée ; None si ses données sont
     absentes (bw jamais lancé : il les créerait)."""
@@ -1102,7 +1131,7 @@ def run_logout(args, accts: Accounts) -> int:
         connected = unknown is not None or (st is not None and st.state != "unauthenticated")
         if connected:
             try:
-                connected = b.logout()  # False : bw n'était pas (plus) connecté
+                connected = b.logout(_on_logout_interrupted(alias, b))  # False : bw n'était pas (plus) connecté
             except VaultError as e:
                 if unknown is not None and not getattr(e, "reread_connected", False):
                     a1, a2 = classify(unknown)[1], classify(e)[1]
@@ -1128,6 +1157,56 @@ def run_logout(args, accts: Accounts) -> int:
           % (alias, "déconnecté" if connected else "non connecté",
              ", ".join((["session oubliée"] if forgot else []) + [_keys_removed(removed)]), alias))
     return RC_OK
+
+
+def run_lock_unload(accts: Accounts, aliases: list) -> int:
+    """`lock --unload` : sous ensure.lock, compte après compte (une clé partagée par deux comptes
+    verrouillés part avec le second) : agents vérifiés, clés du compte retirées des agents (clé
+    partagée avec un autre compte gardée, promue), puis coffre verrouillé (`b.lock()` après le
+    retrait : la session sert aux entrées d'avant la 0.9.0). Agent verrouillé ou en erreur : le
+    coffre est verrouillé quand même (un `lock` n'est jamais empêché), une ligne dit les clés non
+    retirées, code 4. Erreur de verrouillage : une ligne (plusieurs comptes : `<alias> : …`), les
+    clés retirées sont dites quand même, les autres comptes traités ; code : le pire (agent et
+    verrouillage compris)."""
+    agents = _agents_with_ensure_lock()
+    rc = RC_OK
+    with _locked_or_null(agents[0]):
+        for a in aliases:
+            b = accts.backend(a)
+            retry = "sshvault lock --unload%s" % (" --account %s" % a if accts.multi else "")
+            fails = []
+
+            def note(*failure):
+                fails.append(failure)
+            done = None
+            checked = _check_agents(a, agents, "clés gardées", retry, fail=note)
+            if checked is not None:
+                done = _unload_account(a, accts, b, checked, "clés gardées", retry, fail=note)
+            lock_error = None
+            try:
+                b.lock()
+            except (VaultError, SessionStoreError, ConfigError) as e:
+                lock_error = e
+            # `b.lock()` oublie la session même si bw échoue ; SessionStoreError : bw a verrouillé,
+            # session non oubliée. État de la session : relu dans le magasin
+            vault_locked = lock_error is None or isinstance(lock_error, SessionStoreError)
+            for alias, ag, e, what, again in fails:
+                _agents_failed(alias, ag, e, "%s, %s" % (what, "coffre verrouillé quand même" if vault_locked
+                                                         else "coffre non verrouillé (ci-dessous)"), again)
+            if fails:
+                rc = max(rc, RC_BACKEND)
+            if lock_error is not None:
+                code, msg = classify(lock_error)
+                err("%s%s" % (accts.prefix(a), msg))
+                rc = max(rc, code)
+            if done is not None:
+                _legacy_left_warning(a, done[1])
+            print("%s, %s%s%s" % ("coffre verrouillé" if vault_locked else "coffre non verrouillé (erreur ci-dessus)",
+                                  "session oubliée" if _session_state(b) is False else "session non oubliée",
+                                  " : " + a if accts.multi else "",
+                                  ", " + _keys_removed(done[0]) if done is not None
+                                  else ", clés non retirées des agents"))
+    return rc
 
 
 def _bw_server(st) -> tuple:
@@ -1218,7 +1297,7 @@ def account_set(args, accts: Accounts) -> int:
         _clear_unlock_failure(alias)
         if connected:
             try:
-                connected = b.logout()  # False : déconnecté entre-temps
+                connected = b.logout(_on_logout_interrupted(alias, b))  # False : déconnecté entre-temps
             except VaultError as e:
                 return _logout_failed(alias, b, e, removed, had, again, ", registre inchangé")
             if connected or b.marker_cleared:  # déconnecté, ou vu connecté puis plus : marqueur (re)posé
@@ -1601,11 +1680,12 @@ def run_agent(args) -> int:
         print("agent vidé")
         return rc
     if cmd in ("lock", "unlock"):
-        import contextlib
         rc = RC_OK
         # lock : ensure.lock tenu de l'arrêt des sous-agents jusqu'à l'état « verrouillé »
-        # enregistré : aucun `ensure --forward` ne les relance entre-temps
-        with _ensure_lock(base) if cmd == "lock" else contextlib.nullcontext():
+        # enregistré : aucun `ensure --forward` ne les relance entre-temps ; unlock : liste, sonde
+        # `ssh-add -D` et déverrouillage sous ensure.lock (la sonde ne vide jamais une clé qu'un
+        # `ensure` parallèle viendrait de charger)
+        with _ensure_lock(base):
             if cmd == "lock":
                 # d'abord, quoi qu'il arrive ensuite : sous-agents vidés et arrêtés (rechargés par le
                 # premier ssh après « agent unlock »)
@@ -1613,7 +1693,12 @@ def run_agent(args) -> int:
             data = agent.running()
             keys = agent.keys()
             _sync_lock_flag(agent, data, keys)
-            if cmd == "unlock" and not data["locked"] and (keys or not data["keys"]):
+            # aucune clé listée, état non marqué verrouillé : vide, ou verrouillé hors de sshvault
+            # (`ssh-add -x`) ; la sonde `ssh-add -D` tranche
+            if cmd == "unlock" and not data["locked"] and (keys or not agent.probe_locked()):
+                if not keys and data["keys"]:
+                    # agent prouvé vide (vidé à la main) : entrées d'état périmées retirées
+                    agent.update(lambda d: d.update(keys={}))
                 print("agent déjà déverrouillé")
                 return RC_OK
             _need_prompt(args, agent, "agent " + cmd)
@@ -1900,13 +1985,33 @@ def run_ssh_config(args, accts: Accounts, prompt) -> int:
     """Régénération à partir des éléments de **tous** les comptes (une invite au plus par compte
     verrouillé) ; un compte illisible garde ses blocs actuels (avertissement). Tous illisibles :
     erreur, rien écrit."""
+    if args.action in ("install", "uninstall") and (args.print_only or args.check):
+        raise UsageError("%s exclut --print et --check" % args.action)
     paths = sshconfig.default_paths()
     if args.action == "install":
-        if args.print_only or args.check:
-            raise UsageError("install exclut --print et --check")
         print(sshconfig.install(paths))
         if not os.path.exists(paths.config):
             err("avertissement : %s n'existe pas encore : lancer « sshvault ssh-config »" % paths.config)
+        return RC_OK
+    if args.action == "uninstall":
+        # ni coffre ni agent : seuls ~/.ssh/config et ce qu'écrit la régénération
+        res = sshconfig.uninstall(paths)
+        for w in res.warnings:
+            err("avertissement : %s" % w)
+        for line in res.done:
+            print(line)
+        if not res.done:
+            print("rien d'autre à faire" if res.kept or res.warnings
+                  else "rien à faire : sshvault n'est pas installé dans %s" % paths.ssh_dir)
+            return RC_OK
+        if res.kept:
+            print("ligne%s Include gardée%s : %s inclu%s toujours %s ; la prochaine régénération (hosts, forward, "
+                  "import, generate, ssh-config) rendra sshvault de nouveau actif"
+                  % ("s" if len(res.kept) > 1 else "", "s" if len(res.kept) > 1 else "",
+                     "elles" if len(res.kept) > 1 else "elle", "ent" if len(res.kept) > 1 else "t", paths.config))
+        else:
+            print("ssh n'utilise plus sshvault ; agents, comptes, sessions et données de bw gardés ; réinstaller : "
+                  "« sshvault ssh-config » puis « sshvault ssh-config install »")
         return RC_OK
     if not accts.registry:
         # jamais de config régénérée sans compte : elle perdrait tous les blocs (installation
@@ -2589,7 +2694,7 @@ def _without_vault(args) -> bool:
     """Commandes qui ne lisent ni n'écrivent aucun compte : une adoption 0.8.0 impossible ne les
     bloque pas (avertissement)."""
     return (args.cmd in ("config", "agent") or (args.cmd == "account" and args.account_cmd == "list")
-            or (args.cmd == "ssh-config" and args.action == "install"))
+            or (args.cmd == "ssh-config" and args.action in ("install", "uninstall")))
 
 
 def main(argv=None) -> int:

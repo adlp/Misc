@@ -705,6 +705,20 @@ class Agent:
                 raise AgentLocked("agent verrouillé : lancer « sshvault agent unlock » (%s)" % err)
             raise AgentError("ssh-add -D (code %d) : %s" % (r.returncode, err))
 
+    def probe_locked(self) -> bool:
+        """Agent qui vient de ne lister aucune clé : verrouillé, ou vide ? Un agent verrouillé
+        ne liste rien et refuse toute requête sauf le déverrouillage ; `ssh-add -D` tranche
+        (mesuré, 8.9p1 : code 0 « All identities removed. » sur un agent vide et déverrouillé,
+        qui ne perd rien ; code 1 « Failed to remove all identities. » s'il est verrouillé).
+        Jamais `-x`/`-X`. Autre échec (agent absent…) : AgentError."""
+        r = self._ssh_add_simple(["-D"], "-D")
+        if r.returncode == 0:
+            return False
+        text = (r.stderr + r.stdout).decode(errors="replace")
+        if r.returncode == 1 and "Failed to remove all identities" in text:
+            return True
+        raise AgentError("ssh-add -D (code %d) : %s" % (r.returncode, _one_line(r.stderr) or _one_line(r.stdout)))
+
     def set_locked(self, lock: bool, timeout: float) -> None:
         """`ssh-add -x` / `-X` : saisie du mot de passe par ssh-add (tty ou askpass). Ici
         ssh-add coupe l'écho lui-même, stdin terminal ou non (mesuré, 8.9p1)."""

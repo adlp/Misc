@@ -403,12 +403,17 @@ def logged_out(account: Optional[str], env: Optional[Mapping[str, str]] = None) 
 
 
 def _agent_maybe_locked(directory: str, env: Mapping[str, str], timeout: float) -> bool:
-    """Agent dédié verrouillé, ou peut-être (état qui garde des clés, agent qui n'en montre
-    aucune) : la CLI tranche."""
+    """Compte déconnecté seulement : agent dédié verrouillé, ou peut-être (il ne liste aucune
+    clé, quel que soit son état ; un `ssh-add -L`) : la CLI tranche, par la sonde `ssh-add -D`
+    sous `ensure.lock` (jamais ici, hors verrou : elle pourrait vider une clé qu'un `ensure`
+    parallèle vient de charger). Agent jamais lancé (pas de socket) : il ne peut être
+    verrouillé, False."""
     data = AgentState(os.path.join(directory, STATE_NAME)).load()
     if data.get("locked"):
         return True
-    return bool(data["keys"]) and not agent_fingerprints(directory, env, timeout)
+    if not os.path.exists(os.path.join(directory, SOCKET_NAME)):
+        return False
+    return not agent_fingerprints(directory, env, timeout)
 
 
 def logged_out_message(account: str) -> str:
@@ -506,8 +511,9 @@ def try_fast(argv: Sequence[str]) -> Optional[int]:
                 elif (fid is None and d is not None and logged_out(account)
                       and not _agent_maybe_locked(d, os.environ, left)):
                     # clé absente, compte déconnecté par `sshvault logout`, agent dédié connu et non
-                    # verrouillé : la ligne qui propose `login`, sans charger la CLI (même texte que
-                    # `ensure._unlock_possible`) ; sinon la CLI tranche
+                    # verrouillé (il liste une clé, ou n'a pas de socket) : la ligne qui propose
+                    # `login`, sans charger la CLI (même texte que `ensure._unlock_possible`) ;
+                    # sinon la CLI tranche (sonde « agent verrouillé » avant « déconnecté »)
                     sys.stderr.write("sshvault: %s : %s\n" % (clean(label), logged_out_message(account)))
                     rc = 3
     except (KeyboardInterrupt, _Stop):

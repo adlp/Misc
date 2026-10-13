@@ -30,6 +30,7 @@ import tempfile
 import threading
 import time
 import uuid
+import warnings
 
 import pytest
 
@@ -160,11 +161,58 @@ def processes_matching(markers):
     return out
 
 
+#: Garde de session : « warn » ramène les changements dans les dossiers sshvault réels
+#: existants à un avertissement (usage réel de sshvault pendant les tests) ; défaut : échec.
+GUARD_VAR = "SSHVAULT_TEST_GUARD"
+
+
+def changed_paths(before, after):
+    """Chemins relatifs ajoutés, retirés ou modifiés (mode, taille, mtime, inode) entre deux
+    instantanés (`snapshot`), triés ; dossier disparu ou apparu : « . »."""
+    if before is None or after is None:
+        return [] if before is after else ["."]
+    return sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+
+
+def guard_report(paths, before, after):
+    """(échecs, changements tolérables) de la garde de session : `~/.ssh` réel modifié ou
+    dossier sshvault réel créé ou disparu (toujours des échecs) ; chemins changés dans un dossier
+    sshvault réel déjà existant (runtime, data, config : échec, ou avertissement sous
+    SSHVAULT_TEST_GUARD=warn, voir `guard_verdict`)."""
+    fails, changes = [], []
+    if after["ssh"] != before["ssh"]:
+        fails.append("~/.ssh réel modifié par les tests (%s) : %s"
+                     % (paths["ssh"], ", ".join(changed_paths(before["ssh"], after["ssh"]))))
+    for k in ("runtime", "data", "config"):
+        if before[k] is None:
+            if after[k] is not None:
+                fails.append("%s réel créé par les tests" % paths[k])
+            continue
+        if after[k] is None:
+            fails.append("%s réel disparu pendant les tests" % paths[k])
+            continue
+        diff = changed_paths(before[k], after[k])
+        if diff:
+            changes.append("%s réel changé pendant les tests : %s" % (paths[k], ", ".join(diff)))
+    return fails, changes
+
+
+def guard_verdict(fails, changes, env=None):
+    """(message d'échec ou None, avertissements) : les changements dans les dossiers réels
+    existants sont des échecs, sauf SSHVAULT_TEST_GUARD=warn (usage réel concurrent)."""
+    env = os.environ if env is None else env
+    tolerate = (env.get(GUARD_VAR) or "").strip().lower() == "warn"
+    problems = fails + ([] if tolerate else changes)
+    return ("; ".join(problems) if problems else None), (changes if tolerate else [])
+
+
 @pytest.fixture(scope="session", autouse=True)
 def session_guard(tmp_path_factory):
-    """Critère d'acceptation (stories 4 et 5), vérifié en fin de session : aucun processus de
-    test restant (agent, surveillant, sshd, bw, askpass, ensure), `~/.ssh` réel inchangé, et ni
-    socket, ni état, ni données sshvault réels créés par les tests."""
+    """Critère d'acceptation (stories 4, 5 et 12), vérifié en fin de session : aucun processus
+    de test restant (agent, surveillant, sshd, bw, askpass, ensure), `~/.ssh` réel inchangé, ni
+    socket, ni état, ni données sshvault réels créés par les tests, et rien de changé dans les
+    dossiers sshvault réels déjà existants (instantané récursif : chemins changés listés ;
+    SSHVAULT_TEST_GUARD=warn : avertissement seulement, pour un usage réel concurrent)."""
     paths = real_paths()
     before = {k: snapshot(p) for k, p in paths.items()}
     yield
@@ -177,10 +225,10 @@ def session_guard(tmp_path_factory):
         left = processes_matching(markers)
     assert not left, "processus de test restants : %s" % left
     after = {k: snapshot(p) for k, p in paths.items()}
-    assert after["ssh"] == before["ssh"], "~/.ssh réel modifié par les tests"
-    for k in ("runtime", "data", "config"):
-        if before[k] is None:
-            assert after[k] is None, "%s réel créé par les tests" % paths[k]
+    failure, warned = guard_verdict(*guard_report(paths, before, after))
+    for w in warned:
+        warnings.warn("garde de session (%s=warn) : %s" % (GUARD_VAR, w))
+    assert failure is None, failure
 
 
 # --- clés de test et coffre factice ---------------------------------------------

@@ -616,6 +616,9 @@ def test_sshvault_sur_le_vrai_bw(account, vault, ssh_keys, home, report):
     # génération dans le coffre (story 7) : relecture par un autre client bw, pubkey, load, ssh -G
     check_generate(account, vault, home, report)
 
+    # désinstallation du ssh_config (story 12) : install puis uninstall dans le HOME de test
+    check_uninstall(account, home, report)
+
     # session invalidée par un autre unlock : purge, puis « verrouillé »
     own.ok("unlock", "--passwordenv", PW_VAR, "--raw", env={PW_VAR: account.password})
     r = sv(home, "--nointeraction", "list")
@@ -632,6 +635,31 @@ def test_sshvault_sur_le_vrai_bw(account, vault, ssh_keys, home, report):
     assert json.loads(own.ok("status").stdout)["status"] == "locked"
     r = sv(home, "--nointeraction", "status")
     check(account, r, 3, "status après lock")
+
+    # lock --unload (story 12) : coffre déverrouillé à nouveau par l'invite (askpass), clé chargée,
+    # puis révocation : clé retirée de l'agent dédié, coffre verrouillé
+    if HAVE_OPENSSH:
+        sock = os.path.join(home["runtime"], "sshvault", "agent.sock")
+        blob = ssh_keys["hotes"]["public"].split()[1]
+        r = sv(home, "list", env=good)
+        check(account, r, 0, "list avant lock --unload")
+        r = sv(home, "--nointeraction", "load", "--id", vault["hotes"], "-t", "10m")
+        check(account, r, 0, "load avant lock --unload")
+        rc, listing = agent_list(sock)
+        assert rc == 0 and blob in [l.split()[1] for l in listing], "clé chargée avant lock --unload"
+        r = sv(home, "lock", "--unload")
+        report.add("sshvault lock --unload", r)
+        check(account, r, 0, "lock --unload")
+        assert r.stdout.startswith("coffre verrouillé, session oubliée, ") and "retirée" in r.stdout, \
+            account.scrub(r.stdout)
+        assert agent_list(sock) == (1, []), "lock --unload : clés retirées de l'agent dédié"
+        assert not os.path.exists(session_file)
+        assert json.loads(own.ok("status").stdout)["status"] == "locked"
+        r = sv(home, "--nointeraction", "status")
+        check(account, r, 3, "status après lock --unload")
+        assert "coffre : verrouillé" in r.stdout
+        r = sv(home, "agent", "stop")
+        check(account, r, 0, "agent stop après lock --unload")
     with open(os.path.join(home["tmp"], "askpass.calls")) as f:
         report.add("askpass", note="appels=%d" % len(f.read().splitlines()))
 
@@ -714,6 +742,50 @@ def check_hosts_and_ssh_config(account, vault, ssh_keys, home, report):
     r = sv(home, "--nointeraction", "ssh-config")
     check(account, r, 0, "ssh-config sans changement")
     assert "inchangé" in r.stdout
+
+
+def check_uninstall(account, home, report):
+    """Story 12 : `ssh-config install` puis `uninstall` dans le HOME de test : ~/.ssh/config
+    revenu à ses octets d'avant, config générée et pub/ retirées, `ssh -G -F <~/.ssh/config du
+    HOME de test>` sans l'agent dédié ; puis `ssh-config` (régénéré, inerte sans Include)."""
+    h = home["env"]["HOME"]
+    user_cfg = os.path.join(h, ".ssh", "config")
+    d = os.path.join(h, ".ssh", "sshvault")
+    sock = os.path.join(home["runtime"], "sshvault", "agent.sock")
+    if not os.path.exists(user_cfg):
+        with open(user_cfg, "w") as f:  # HOME de test seulement
+            f.write("# config de test\nHost autre-%s.it\n    Port 2222\n" % TAG)
+        os.chmod(user_cfg, 0o600)
+    with open(user_cfg, "rb") as f:
+        before = f.read()
+    r = sv(home, "--nointeraction", "ssh-config")
+    check(account, r, 0, "ssh-config avant install")
+    r = sv(home, "ssh-config", "install")
+    check(account, r, 0, "ssh-config install")
+
+    def agents_for(host):
+        g = subprocess.run(["ssh", "-G", "-F", user_cfg, host], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=30, env=home["env"])
+        assert g.returncode == 0, account.scrub(g.stderr)
+        return [l.split(" ", 1)[1] for l in g.stdout.splitlines() if l.startswith("identityagent ")]
+    host = "x.lab-%s.it" % TAG
+    if shutil.which("ssh"):
+        assert agents_for(host) == [sock], "install : agent dédié pour l'hôte géré"
+    r = sv(home, "ssh-config", "uninstall")
+    report.add("sshvault ssh-config uninstall", r)
+    check(account, r, 0, "ssh-config uninstall")
+    assert "ssh n'utilise plus sshvault" in r.stdout and r.stderr == "", account.scrub(r.stderr)
+    with open(user_cfg, "rb") as f:
+        assert f.read() == before, "uninstall : ~/.ssh/config revenu à ses octets d'avant install"
+    assert not os.path.exists(os.path.join(d, "config")) and not os.path.exists(os.path.join(d, "pub"))
+    if shutil.which("ssh"):
+        assert sock not in agents_for(host), "uninstall : plus d'IdentityAgent sshvault"
+    r = sv(home, "ssh-config", "uninstall")
+    check(account, r, 0, "ssh-config uninstall, rien à faire")
+    assert r.stdout.startswith("rien à faire")
+    r = sv(home, "--nointeraction", "ssh-config")
+    check(account, r, 0, "ssh-config après uninstall")
+    assert "n'inclut pas" in r.stderr, "régénéré, inerte sans Include : avertissement"
 
 
 SSHD = "/usr/sbin/sshd"

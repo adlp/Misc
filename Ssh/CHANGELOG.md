@@ -1,5 +1,71 @@
 # Changelog — sshvault
 
+## sshvault 0.11.0 — Révocation au verrouillage, désinstallation du ssh_config, robustesse de logout — 2026-10-13
+
+- `sshvault lock --unload` : révoque aussitôt les clés chargées. Sous `ensure.lock`, compte
+  après compte : agents (dédié et sous-agents) vérifiés comme pour `logout`, clés du compte
+  retirées (une clé partagée avec un compte non verrouillé reste chargée, attribuée à lui ;
+  une clé partagée par deux comptes verrouillés part avec le second), puis coffre verrouillé
+  (après le retrait : la session sert aux entrées chargées avant la 0.9.0). Agent verrouillé
+  ou en erreur : le coffre est verrouillé quand même, une ligne dit les clés non retirées et
+  la commande à relancer, code 4. `bw lock` en échec : une ligne (plusieurs comptes :
+  `<alias> : …`), clés retirées dites quand même, autres comptes traités, code le pire ; la
+  ligne de compte rendu dit l'état réel du coffre (« coffre non verrouillé » si bw a échoué,
+  « coffre verrouillé » si seule la session n'a pas pu être oubliée) et de la session
+  (« session oubliée » ou « session non oubliée », relu dans le magasin).
+  `lock` sans `--unload` : inchangé (aucun agent touché).
+- `sshvault ssh-config uninstall` : retire de `~/.ssh/config` les lignes `Include` qui ne
+  désignent que le fichier généré (en tête, plus bas ou dans un bloc ; sauvegarde
+  `config.sshvault.bak*` d'abord, mode et propriétaire gardés : après `install` puis
+  `uninstall`, le fichier est identique, sauf un `~/.ssh/config` créé par `install` (gardé,
+  vide) et une ligne `Include` qu'`install` a déplacée ou une ligne à joker qu'il a retirée
+  (pas remises en place ; dans sa sauvegarde)), supprime `~/.ssh/sshvault/config` et les `*.pub` de
+  `pub/` (dossier supprimé s'il est vide). Une ligne qui inclut aussi d'autres fichiers ou un
+  joker : gardée, avertissement. Mêmes refus qu'`install` (lien symbolique, non ordinaire ;
+  aussi `~/.ssh/sshvault`, sa config ou `pub/` d'un type inattendu) : code 4, rien modifié.
+  Rien d'installé : « rien à faire », code 0. Ligne `Include` gardée : la sortie dit qu'elle
+  inclut toujours le fichier généré (la prochaine régénération réactive sshvault), pas « ssh
+  n'utilise plus sshvault ». `--print`/`--check` exclus (code 2). Ni coffre,
+  ni agent, ni compte, ni session touchés ; se fait même si l'adoption 0.8.0 est en attente
+  (comme `install`). Remplace la désinstallation à la main du README.
+- Sonde de verrou d'agent : un agent qui ne liste aucune clé est départagé par `ssh-add -D`
+  (réussi : vide et déverrouillé, rien à retirer ; « Failed to remove all identities. » :
+  verrouillé ; mesuré sur OpenSSH 8.9p1), jamais par `-x`/`-X`.
+  - Contrôles de retrait (`logout`, `account set`, `account remove`, `lock --unload`) :
+    sonde seulement si l'état attend une clé non échue. Un agent vidé à la main n'est plus
+    pris pour verrouillé (avant : code 4) ; clé partie entre les deux passes, agent devenu
+    vide (durée de vie écoulée, retrait à la main) : comptée retirée, plus « agent
+    verrouillé » à tort.
+  - `ensure` d'un compte déconnecté (marqueur) : dès que l'agent dédié ne liste aucune clé,
+    quel que soit son état (état vide compris), la CLI sonde sous `ensure.lock` ; agent
+    verrouillé hors de sshvault (`ssh-add -x`) : « agent verrouillé : lancer « sshvault agent
+    unlock » » (code 3) au lieu de « déconnecté ». Le chemin rapide ne sonde jamais : il lit
+    l'agent (un `ssh-add -L`, sur ce chemin seulement) et ne dit « déconnecté » que si
+    l'agent liste une clé ou n'a pas de socket (sinon la CLI tranche). Coût : compte
+    déconnecté dont l'agent dédié tourne mais est vide, chaque `ssh` vers ses hôtes charge
+    la CLI et sonde.
+  - `agent unlock`, quel que soit l'état : agent qui ne liste aucune clé, état non marqué
+    verrouillé : verrouillé hors de sshvault → `ssh-add -X` (avant : « déjà déverrouillé ») ;
+    vide → « déjà déverrouillé », entrées d'état périmées retirées. Liste, sonde et
+    déverrouillage sous `ensure.lock` : un `ensure` en cours finit d'abord, et un `ssh` lancé
+    pendant la saisie du mot de passe attend (borné par son délai), comme pour `agent lock`.
+  - La sonde n'est pas sans perte dans tous les cas : une clé ajoutée à cet instant par
+    `sshvault load` (hors `ensure.lock`) ou à la main serait retirée (`ensure` recharge une
+    clé du coffre à son prochain usage).
+- Interruption (Ctrl-C, SIGTERM, SIGHUP) pendant `bw logout` (`logout`, `account set`) : bw
+  tué, état relu (10 s au plus), session oubliée, marqueur `logged-out` posé si bw est
+  déconnecté ou si son état est inconnu ; Ctrl-C, SIGTERM et SIGHUP retenus le temps de la
+  relecture et de la pose du marqueur (un second signal est servi après) ; session impossible
+  à oublier : « session non oubliée : … » dit après la ligne ; « interrompu », code 130
+  (`account set` : registre inchangé). Avant : marqueur jamais posé, `ensure`
+  pouvait dire « verrouillé » au lieu de proposer `login`. Adaptateur : `BwBackend.logout(on_interrupt)`.
+- Tests : garde de fin de session stricte sur les dossiers sshvault réels déjà existants
+  (runtime, données, config) : instantané récursif comparé, échec qui liste les chemins
+  changés ; `SSHVAULT_TEST_GUARD=warn` le ramène à un avertissement (usage réel concurrent ;
+  `~/.ssh` modifié, dossier réel créé ou disparu restent des échecs) ; garde éprouvée par une écriture
+  simulée. Matrice de la story dans `tests/test_accounts.py`, `tests/test_sshconfig.py`,
+  `tests/test_cli.py` ; faux `bw` : `logout=hangafter` (déconnecté puis bloqué).
+
 ## sshvault 0.10.0 — Déconnexion et modification d'un compte — 2026-10-12
 
 - `sshvault logout [--account ALIAS]` : `--account` obligatoire dès qu'il y a plusieurs

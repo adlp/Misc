@@ -805,7 +805,7 @@ def test_replace_garde_expect(tmp_path):
     p.write_text("avant")
     st = os.stat(p)
     p.write_text("modifié ailleurs")
-    with pytest.raises(sshconfig.SshConfigError, match="modifié pendant l'installation"):
+    with pytest.raises(sshconfig.SshConfigError, match="modifié pendant l'écriture"):
         sshconfig._replace(str(p), b"nouveau", 0o600, os.getuid(), os.getgid(),
                            expect=(st.st_ino, st.st_size - 1, st.st_mtime_ns))
     assert p.read_text() == "modifié ailleurs" and os.listdir(tmp_path) == ["f"]
@@ -971,3 +971,209 @@ def test_forwardagent_transfere_l_agent_dedie(bench, tmp_path):
         sshd.terminate()
         sshd.wait(10)
         assert wait_gone([sshd.pid])
+
+
+# --- désinstallation (ssh-config uninstall, story 12) ------------------------------------------
+
+def installed(bench, orig=None):
+    """Config générée, clés publiques et ligne Include en tête ; `orig` : ~/.ssh/config d'avant
+    (None : absent). Renvoie le chemin de ~/.ssh/config."""
+    ssh = bench.home / ".ssh"
+    cfg = ssh / "config"
+    if orig is not None:
+        ssh.mkdir(mode=0o700, exist_ok=True)
+        cfg.write_text(orig)
+        cfg.chmod(0o640)
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    assert bench.run("ssh-config", "install").returncode == 0
+    assert sorted(os.listdir(sv_dir(bench) / "pub")) == sorted([pub_name(bench, "prod"), pub_name(bench, "bastion")])
+    return cfg
+
+
+def identity_agent(bench, cfg, host="prod.example.com"):
+    """`identityagent` que `ssh -G -F ~/.ssh/config` montre pour l'hôte (Match exec : bench)."""
+    r = subprocess.run([SSH, "-G", "-F", str(cfg), host], capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL, timeout=30, env=bench.env)
+    assert r.returncode == 0, r.stderr
+    return [l.split(" ", 1)[1] for l in r.stdout.splitlines() if l.startswith("identityagent ")]
+
+
+@needs_ssh
+def test_uninstall_defait_install(bench):
+    """Matrice : Include en tête, config, pub/ : trois retirés, sauvegarde ; ~/.ssh/config
+    identique à l'original (mode compris) ; `ssh -G` ne montre plus l'agent dédié."""
+    orig = "Host *\n    ServerAliveInterval 30\n# fin sans retour à la ligne"
+    cfg = installed(bench, orig)
+    assert identity_agent(bench, cfg) == [str(bench.sock())]
+    calls = len(bench.calls())
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 0 and r.stderr == "", r.stderr
+    assert cfg.read_text() == orig and mode(cfg) == 0o640
+    ssh = bench.home / ".ssh"
+    bak = sorted(n for n in os.listdir(ssh) if n.startswith("config.sshvault.bak"))
+    assert bak == ["config.sshvault.bak", "config.sshvault.bak.1"], "sauvegardes d'install et d'uninstall"
+    assert (ssh / "config.sshvault.bak.1").read_text().startswith(include(bench) + "\n")
+    assert not (sv_dir(bench) / "config").exists() and not (sv_dir(bench) / "pub").exists()
+    assert os.listdir(sv_dir(bench)) == []
+    out = r.stdout.splitlines()
+    assert out[0] == "%s : ligne Include de sshvault retirée (sauvegarde : %s)" % (cfg, ssh / "config.sshvault.bak.1")
+    assert out[1] == "%s supprimé" % (sv_dir(bench) / "config")
+    assert out[2] == "%s : 2 clés publiques supprimées, dossier supprimé" % (sv_dir(bench) / "pub")
+    assert "agents, comptes, sessions et données de bw gardés" in out[3]
+    assert len(bench.calls()) == calls, "aucun accès au coffre"
+    assert identity_agent(bench, cfg) == [], "plus d'IdentityAgent sshvault"
+    assert bench.stored_session() != (None, None), "session gardée"
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 0 and r.stdout.startswith("rien à faire"), r.stdout
+
+
+def test_uninstall_config_creee_par_install(bench):
+    cfg = installed(bench)
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 0, r.stderr
+    assert cfg.read_text() == "", "fichier gardé, vidé de la seule ligne posée par install"
+
+
+def test_uninstall_rien(bench):
+    """Matrice : ni Include ni dossier : rien, code 0 ; ~/.ssh jamais créé."""
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 0 and r.stderr == ""
+    assert r.stdout == "rien à faire : sshvault n'est pas installé dans %s\n" % (bench.home / ".ssh")
+    assert not (bench.home / ".ssh").exists() and not bench.calls()
+    ssh = bench.home / ".ssh"
+    ssh.mkdir(mode=0o700)
+    (ssh / "config").write_text("Host a\n")
+    st = os.stat(ssh / "config")
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 0 and r.stdout.startswith("rien à faire")
+    assert os.stat(ssh / "config").st_mtime_ns == st.st_mtime_ns and os.listdir(ssh) == ["config"]
+
+
+@pytest.mark.parametrize("orig,n", [('ServerAliveInterval 30\nInclude a "{cfg}"\nHost b\n', 2),
+                                    ("Include ~/.ssh/*/config\nHost b\n", 1)])
+def test_uninstall_include_mixte_gardee(bench, orig, n):
+    """Matrice : Include qui désigne aussi d'autres fichiers (ou un joker) : ligne gardée,
+    avertissement (numéro de ligne du fichier réécrit), reste retiré, code 0."""
+    orig = orig.format(cfg=sv_dir(bench) / "config")
+    cfg = installed(bench, orig)
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 0, r.stderr
+    line = one_line_error(r)
+    assert "ligne %d :" % n in line and "d'autres fichiers" in line and "gardée" in line, line
+    assert cfg.read_text() == orig
+    assert not (sv_dir(bench) / "config").exists() and not (sv_dir(bench) / "pub").exists()
+
+
+def test_uninstall_include_plus_bas_et_dans_un_bloc(bench):
+    """Lignes Include qui ne désignent que le fichier généré, plus bas et dans un bloc : retirées."""
+    ssh = bench.home / ".ssh"
+    ssh.mkdir(mode=0o700)
+    cfg = ssh / "config"
+    cfg.write_text("ServerAliveInterval 30\ninclude ~/.ssh/sshvault/config\nHost b\n    Include sshvault/config\n"
+                   "    Port 2222\n")
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 0, r.stderr
+    assert "lignes Include de sshvault retirées" in r.stdout
+    assert cfg.read_text() == "ServerAliveInterval 30\nHost b\n    Port 2222\n"
+    assert (ssh / "config.sshvault.bak").exists()
+
+
+def test_uninstall_lien_refuse_rien_modifie(bench, tmp_path):
+    """Matrice : ~/.ssh/config lien symbolique : code 4, rien modifié (ni config générée ni pub/)."""
+    installed(bench)
+    ssh = bench.home / ".ssh"
+    target = tmp_path / "dotfiles-config"
+    target.write_text((ssh / "config").read_text())
+    (ssh / "config").unlink()
+    (ssh / "config").symlink_to(target)
+    before = sorted(os.listdir(sv_dir(bench) / "pub"))
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 4 and "lien symbolique" in one_line_error(r) and "rien modifié" in r.stderr
+    assert target.read_text().startswith(include(bench)) and os.path.islink(ssh / "config")
+    assert (sv_dir(bench) / "config").exists() and sorted(os.listdir(sv_dir(bench) / "pub")) == before
+
+
+def test_uninstall_non_ordinaire_refuse(bench):
+    ssh = bench.home / ".ssh"
+    ssh.mkdir(mode=0o700)
+    os.mkfifo(ssh / "config")
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 4 and "pas un fichier ordinaire" in one_line_error(r)
+
+
+def test_uninstall_config_generee_non_ordinaire_refuse(bench):
+    """Un chemin généré d'un type inattendu (lien) : refus, Include compris gardé."""
+    cfg = installed(bench)
+    gen = sv_dir(bench) / "config"
+    gen.unlink()
+    gen.symlink_to(bench.tmp / "ailleurs")
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 4 and "rien modifié" in one_line_error(r)
+    assert cfg.read_text().startswith(include(bench)) and os.path.islink(gen)
+
+
+def test_uninstall_pub_garde_ce_qui_n_est_pas_une_cle(bench):
+    """Dans pub/, seuls les *.pub retirés ; dossier gardé s'il reste autre chose (avertissement)."""
+    installed(bench)
+    pub = sv_dir(bench) / "pub"
+    (pub / "notes.txt").write_text("à moi\n")
+    (pub / "sous-dossier.pub").mkdir()
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 0, r.stderr
+    assert "2 entrées autres que des clés publiques" in one_line_error(r)
+    assert sorted(os.listdir(pub)) == ["notes.txt", "sous-dossier.pub"]
+    assert "2 clés publiques supprimées" in r.stdout and "dossier supprimé" not in r.stdout
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 0 and r.stdout == "rien d'autre à faire\n", r.stdout
+    assert "n'est pas installé" not in r.stdout and "autres que des clés publiques" in r.stderr
+
+
+@pytest.mark.parametrize("opt", ["--print", "--check"])
+def test_uninstall_exclut_print_check(bench, opt):
+    r = bench.run("ssh-config", "uninstall", opt)
+    assert r.returncode == 2 and "uninstall exclut --print et --check" in one_line_error(r)
+
+
+def test_apres_uninstall_regeneration_inerte(bench):
+    """Après `uninstall`, `ssh-config` recrée ~/.ssh/sshvault/, inerte sans Include : avertissement
+    existant ; `install` remet la ligne."""
+    installed(bench, "Host a\n")
+    assert bench.run("ssh-config", "uninstall").returncode == 0
+    r = bench.run("ssh-config")
+    assert r.returncode == 0 and (sv_dir(bench) / "config").exists()
+    assert "n'inclut pas" in r.stderr and "ssh-config install" in r.stderr
+    assert bench.run("ssh-config", "install").returncode == 0
+    assert (bench.home / ".ssh" / "config").read_text() == include(bench) + "\nHost a\n"
+
+
+@pytest.mark.parametrize("which", ["sshvault", "pub"])
+def test_uninstall_dossier_lien_refuse(bench, which):
+    """`~/.ssh/sshvault` ou `pub/` lien symbolique : code 4, rien modifié (Include, cible du lien)."""
+    cfg = installed(bench)
+    before = cfg.read_text()
+    src = sv_dir(bench) if which == "sshvault" else sv_dir(bench) / "pub"
+    target = bench.tmp / ("vrai-" + which)
+    src.rename(target)
+    src.symlink_to(target)
+    listing = sorted(os.listdir(target))
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 4
+    line = one_line_error(r)
+    assert "n'est pas un dossier" in line and "rien modifié" in line, line
+    assert cfg.read_text() == before and os.path.islink(src) and sorted(os.listdir(target)) == listing
+    assert not (bench.home / ".ssh" / "config.sshvault.bak").exists()
+
+
+@needs_ssh
+def test_uninstall_include_garde_dit_que_sshvault_reste_actif(bench):
+    """Ligne Include gardée (mixte) : pas « ssh n'utilise plus sshvault » ; la ligne dit qu'elle
+    inclut toujours le fichier généré, que la prochaine régénération réactive."""
+    installed(bench, 'Include a "%s"\nHost b\n' % (sv_dir(bench) / "config"))
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 0, r.stderr
+    assert "ssh n'utilise plus sshvault" not in r.stdout
+    assert "ligne Include gardée : elle inclut toujours %s" % (sv_dir(bench) / "config") in r.stdout
+    assert "prochaine régénération" in r.stdout
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 0 and r.stdout == "rien d'autre à faire\n"

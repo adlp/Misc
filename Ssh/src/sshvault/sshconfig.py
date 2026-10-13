@@ -25,9 +25,10 @@ puis, sur demande seulement, la ligne `Include` en tête de `~/.ssh/config`.
   identique (mtime inchangée) ; `pub/` ne garde que les clés des éléments associés.
 - Verrou `flock` sur `~/.ssh/sshvault/` autour de l'écriture et de la purge : deux
   régénérations simultanées ne se gênent pas.
-- `Include` : seul `install` écrit `~/.ssh/config` (sauvegarde jamais écrasée, mode et
-  propriétaire gardés, lien symbolique ou fichier non ordinaire refusé) ; ailleurs, on ne fait
-  que lire, sans jamais bloquer sur une FIFO.
+- `Include` : seuls `install` et `uninstall` écrivent `~/.ssh/config` (sauvegarde jamais
+  écrasée, mode et propriétaire gardés, lien symbolique ou fichier non ordinaire refusé) ;
+  ailleurs, on ne fait que lire, sans jamais bloquer sur une FIFO. `uninstall` retire aussi
+  `~/.ssh/sshvault/config` et les `*.pub` de `pub/`, rien d'autre.
 - `~` = répertoire de passwd (celui où ssh lit `~/.ssh/config`), pas `$HOME`.
 - Transfert d'agent restreint (CAP-8) : pour chaque motif de `sshvault-forward`, **avant** les
   blocs d'identité (première valeur gagnante), une ligne `Match originalhost <motif> exec
@@ -738,9 +739,10 @@ def _keyword(line: str):
     return (m.group(1).lower(), m.group(2)) if m else ("", s)
 
 
-def _refs(args_text: str, paths: Paths) -> list:
-    """Pour chaque argument d'`Include` : désigne-t-il le fichier généré ? (`~`, `~user`,
-    relatif à ~/.ssh, chemin réel, joker de glob)."""
+def _ref_kinds(args_text: str, paths: Paths) -> list:
+    """Pour chaque argument d'`Include` : « exact » s'il désigne le fichier généré lui-même (`~`,
+    `~user`, relatif à ~/.ssh, chemin réel), « glob » si c'est un joker de glob qui le couvre
+    (il peut couvrir d'autres fichiers), None sinon."""
     try:
         args = shlex.split(args_text, comments=True)
     except ValueError:
@@ -755,9 +757,16 @@ def _refs(args_text: str, paths: Paths) -> list:
         if not os.path.isabs(a):
             a = os.path.join(paths.ssh_dir, a)
         a = os.path.normpath(a)
-        out.append(a == target or os.path.realpath(a) == real
-                   or (any(c in a for c in "*?[") and fnmatch.fnmatchcase(target, a)))
+        glob = any(c in a for c in "*?[")
+        out.append("exact" if not glob and (a == target or os.path.realpath(a) == real)
+                   else "glob" if glob and fnmatch.fnmatchcase(target, a) else None)
     return out
+
+
+def _refs(args_text: str, paths: Paths) -> list:
+    """Pour chaque argument d'`Include` : désigne-t-il le fichier généré ? (`~`, `~user`,
+    relatif à ~/.ssh, chemin réel, joker de glob)."""
+    return [k is not None for k in _ref_kinds(args_text, paths)]
 
 
 @dataclass
@@ -886,7 +895,7 @@ def _replace(path: str, data: bytes, mode: int, uid: int, gid: int, expect=None)
         if expect is not None:
             st = os.lstat(path)
             if (st.st_ino, st.st_size, st.st_mtime_ns) != expect:
-                raise SshConfigError("%s modifié pendant l'installation : rien changé, relancer" % path)
+                raise SshConfigError("%s modifié pendant l'écriture : rien changé, relancer" % path)
         os.replace(tmp, path)
     except BaseException:
         _unlink_quiet(tmp)
@@ -953,3 +962,114 @@ def install(paths: Paths) -> str:
     except OSError as e:
         raise SshConfigError("%s : %s" % (p, e.strerror or e)) from None
     raise SshConfigError("%s : créé ou supprimé pendant l'installation : rien changé, relancer" % p)
+
+
+# --- désinstallation -----------------------------------------------------------------------
+
+@dataclass
+class Uninstalled:
+    done: list = field(default_factory=list)  # ce qui a été retiré, une ligne chacun
+    warnings: list = field(default_factory=list)
+    kept: list = field(default_factory=list)  # numéros des lignes Include gardées (fichier réécrit)
+
+
+def _own_includes(lines: list, paths: Paths):
+    """(index des lignes `Include` qui ne désignent que le fichier généré, où qu'elles soient :
+    en tête, plus bas ou dans un bloc Host/Match ; index des lignes qui le désignent avec
+    d'autres fichiers ou par un joker de glob)."""
+    sole, mixed = [], []
+    for i, line in enumerate(lines):
+        kw, rest = _keyword(line)
+        if kw != "include":
+            continue
+        kinds = _ref_kinds(rest, paths)
+        if kinds and all(k == "exact" for k in kinds):
+            sole.append(i)
+        elif any(kinds):
+            mixed.append(i)
+    return sole, mixed
+
+
+def uninstall(paths: Paths) -> Uninstalled:
+    """Défait `install` et ce qu'écrit `apply`, rien d'autre : lignes `Include` qui ne désignent
+    que le fichier généré retirées de ~/.ssh/config (sauvegarde `config.sshvault.bak*` d'abord ;
+    mode et propriétaire gardés) ; une ligne qui inclut aussi d'autres fichiers (ou un joker qui
+    le couvre) est gardée, avec un avertissement ; `~/.ssh/sshvault/config` supprimé ; dans
+    `pub/`, seuls les `*.pub` (fichiers ordinaires) supprimés, le dossier s'il est vide.
+    `~/.ssh/sshvault/` lui-même est gardé. Refus, rien modifié (SshConfigError, code 4) :
+    ~/.ssh/config lien symbolique ou non ordinaire, `~/.ssh/sshvault`, sa config ou `pub/` d'un
+    type inattendu. Sous le verrou du dossier (une régénération concurrente attend). Rien
+    d'installé : `done` vide."""
+    res = Uninstalled()
+    p = paths.user_config
+
+    def refuse(path, what):
+        raise SshConfigError("%s %s : refusé, rien modifié" % (clean(path), what))
+    try:
+        k = _kind(p)
+        if k == "link":
+            refuse(p, "est un lien symbolique")
+        if k not in ("absent", "file"):
+            refuse(p, "n'est pas un fichier ordinaire")
+        dk = _kind(paths.dir)
+        if dk not in ("absent", "dir"):
+            refuse(paths.dir, "n'est pas un dossier")
+        with _locked(paths.dir) if dk == "dir" else contextlib.nullcontext():
+            ck, pk = _kind(paths.config), _kind(paths.pub)
+            if ck not in ("absent", "file"):
+                refuse(paths.config, "n'est pas un fichier ordinaire")
+            if pk not in ("absent", "dir"):
+                refuse(paths.pub, "n'est pas un dossier")
+            data = st = None
+            sole, mixed, lines = [], [], []
+            if k == "file":
+                try:
+                    data, st = _read_regular(p, follow=False)
+                except FileNotFoundError:
+                    data = None
+                if data is not None:
+                    lines = data.decode(errors="surrogateescape").split("\n")
+                    sole, mixed = _own_includes(lines, paths)
+            pubs = []
+            if pk == "dir":
+                pubs = [n for n in sorted(os.listdir(paths.pub))
+                        if n.endswith(".pub") and _kind(os.path.join(paths.pub, n)) == "file"]
+            # 1) ligne Include : ssh cesse d'abord de lire les fichiers générés
+            for i in mixed:  # numéro de ligne du fichier réécrit
+                n = i + 1 - len([j for j in sole if j < i])
+                res.kept.append(n)
+                res.warnings.append("%s ligne %d : Include de sshvault avec d'autres fichiers : ligne gardée ; y retirer "
+                                    "« %s » à la main" % (p, n, paths.config))
+            if sole:
+                new = "\n".join(l for i, l in enumerate(lines) if i not in set(sole))
+                bak = _backup(paths, data)
+                _replace(p, new.encode(errors="surrogateescape"), stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid,
+                         expect=(st.st_ino, st.st_size, st.st_mtime_ns))
+                res.done.append("%s : ligne%s Include de sshvault retirée%s (sauvegarde : %s)"
+                                % (p, "s" if len(sole) > 1 else "", "s" if len(sole) > 1 else "", bak))
+            # 2) fichiers générés
+            try:
+                if ck == "file":
+                    os.unlink(paths.config)
+                    res.done.append("%s supprimé" % paths.config)
+                for n in pubs:
+                    os.unlink(os.path.join(paths.pub, n))
+                if pk == "dir":
+                    left = os.listdir(paths.pub)
+                    if not left:
+                        os.rmdir(paths.pub)
+                    else:
+                        res.warnings.append("%s gardé : %d entrée%s autre%s que des clés publiques"
+                                            % (paths.pub, len(left), "s" if len(left) > 1 else "",
+                                               "s" if len(left) > 1 else ""))
+                    if pubs or not left:
+                        res.done.append("%s : %d clé%s publique%s supprimée%s%s"
+                                        % (paths.pub, len(pubs), "s" if len(pubs) > 1 else "", "s" if len(pubs) > 1 else "",
+                                           "s" if len(pubs) > 1 else "", ", dossier supprimé" if not left else ""))
+            except OSError as e:
+                where = " (%s)" % clean(str(e.filename)) if e.filename else ""
+                raise SshConfigError("désinstallation : %s%s ; déjà fait : %s ; relancer « sshvault ssh-config uninstall »"
+                                     % (clean(str(e.strerror or e)), where, " ; ".join(res.done) or "rien")) from None
+    except OSError as e:
+        raise SshConfigError("%s : %s" % (clean(str(e.filename or p)), e.strerror or e)) from None
+    return res

@@ -199,11 +199,12 @@ class VaultBackend(abc.ABC):
         """Verrouille le coffre et vide le magasin de session."""
 
     @abc.abstractmethod
-    def logout(self) -> bool:
+    def logout(self, on_interrupt=None) -> bool:
         """Déconnecte le compte (données locales du client) et oublie la session. True :
         déconnecté ; False : il n'était pas connecté. LogoutUnknown : état de connexion inconnu
         (client sans réponse, état impossible à relire) ; toute autre BackendError : toujours
-        connecté."""
+        connecté. Interrompu : client tué, état relu, `on_interrupt(déconnecté ? ou None)`
+        appelé signaux retenus, puis l'interruption est relevée."""
 
     @abc.abstractmethod
     def list_ssh_keys(self, prompt: Optional[Prompt] = None) -> list:

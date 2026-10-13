@@ -379,3 +379,39 @@ def test_logout_interrompu_pendant_la_relecture(bench, backend, monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         backend.logout()
     assert not _store_has(backend)
+
+
+def test_logout_interrompu_pendant_la_relecture_rappel(bench, backend, monkeypatch):
+    """Délai dépassé puis interruption pendant la relecture : `on_interrupt` appelé une fois,
+    avec None (état inconnu), session oubliée."""
+    from sshvault.bw import BwTimeout
+
+    def run(*a, **k):
+        raise BwTimeout("erreur bw : « bw logout » sans réponse en 1s")
+
+    def status(session, timeout=None):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(backend, "_run", run)
+    monkeypatch.setattr(backend, "_bw_status", status)
+    seen = []
+    with pytest.raises(KeyboardInterrupt):
+        backend.logout(seen.append)
+    assert seen == [None] and not _store_has(backend)
+
+
+def test_logout_interrompu_magasin_en_panne_avertissement(bench, backend, monkeypatch):
+    """Interrompu, session impossible à oublier : avertissement « session non oubliée », rappel
+    fait quand même."""
+    from sshvault.session import SessionStoreError
+
+    def run(*a, **k):
+        raise KeyboardInterrupt
+
+    def clear():
+        raise SessionStoreError("magasin en panne")
+    monkeypatch.setattr(backend, "_run", run)
+    monkeypatch.setattr(backend.store, "clear", clear)
+    seen = []
+    with pytest.raises(KeyboardInterrupt):
+        backend.logout(seen.append)
+    assert seen == [None] and backend.warnings == ["session non oubliée : magasin en panne"]

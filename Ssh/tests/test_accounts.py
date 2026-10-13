@@ -761,6 +761,7 @@ def test_adoption_remise_ssh_config_et_account_add(bench):
 
 @pytest.mark.parametrize("cmd,rc", [(["config", "get", "key-ttl"], 0), (["agent", "status"], 3),
                                     (["account", "list"], 0), (["ssh-config", "install"], 0),
+                                    (["ssh-config", "uninstall"], 0),
                                     (["list"], 4), (["status"], 4)])
 def test_adoption_impossible_commandes_sans_coffre(bench, cmd, rc):
     """Adoption impossible (code 4) : seules les commandes qui touchent au coffre échouent ; les
@@ -2564,3 +2565,451 @@ def test_chemin_rapide_agent_verrouille_hors_sshvault(bench):
     r = bench.run("--nointeraction", "ensure", "--account", "boulot", "--id", ID_B,
                   env={"SSHVAULT_PROMPT_TIMEOUT": "invalide"})
     assert r.returncode == 2 and "SSHVAULT_PROMPT_TIMEOUT" in one_line_error(r), r.stderr
+
+
+# --- story 12 : lock --unload, sonde de verrou d'agent, interruption de bw logout ------------------
+
+def hand_lock(bench):
+    """Agent dédié verrouillé par `ssh-add -x` hors de sshvault (l'état ne le dit pas)."""
+    from bench import SSH_ADD
+    prog, _ = make_askpass(bench.tmp, name="askpass-main-x")
+    r = subprocess.run([SSH_ADD, "-x"], env=dict(bench.env, SSH_AUTH_SOCK=str(bench.sock()), SSH_ASKPASS=prog,
+                                                SSH_ASKPASS_REQUIRE="force"),
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert not bench.agent_state().get("locked")
+
+
+def hand_purge(bench):
+    """Clés retirées à la main (`ssh-add -D` hors de sshvault) : agent vide et déverrouillé."""
+    from bench import SSH_ADD
+    r = subprocess.run([SSH_ADD, "-D"], env=dict(bench.env, SSH_AUTH_SOCK=str(bench.sock())),
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert bench.agent_keys() == []
+
+
+def test_lock_unload_deux_comptes(bench):
+    """Matrice : deux comptes, une clé chacun : coffres verrouillés, clés retirées."""
+    two_accounts(bench)
+    assert bench.run("load", "--id", ID_PROD).returncode == 0
+    assert bench.run("load", "--account", "boulot", "--id", ID_B).returncode == 0
+    r = bench.run("lock", "--unload")
+    assert r.returncode == 0 and r.stderr == "", r.stderr
+    assert r.stdout.splitlines() == ["coffre verrouillé, session oubliée : alice, 1 clé retirée des agents",
+                                     "coffre verrouillé, session oubliée : boulot, 1 clé retirée des agents"]
+    assert bench.agent_keys() == [] and bench.agent_state()["keys"] == {}
+    assert bench.stored_session() == (None, None) and bench.stored_session("boulot") == (None, None)
+    r = bench.run("status")
+    assert r.returncode == 3 and r.stdout.count("coffre : verrouillé") == 2, r.stdout
+
+
+def test_lock_sans_unload_inchange(bench):
+    two_accounts(bench)
+    assert bench.run("load", "--id", ID_PROD).returncode == 0
+    n = len(bench.ssh_add_calls())
+    r = bench.run("lock")
+    assert r.returncode == 0, r.stderr
+    assert "clé" not in r.stdout and bench.agent_keys() == [bench.blob("prod")]
+    assert bench.ssh_add_calls()[n:] == [], "aucun agent touché"
+
+
+def test_lock_unload_cle_partagee_gardee(bench):
+    """Matrice : `--account alice`, clé aussi dans boulot (non verrouillé) : gardée, attribuée à boulot."""
+    two_accounts(bench, boulot_items=[ssh_item(ID_B, "Copie", bench.keys["prod"], hosts="b")])
+    assert bench.run("ssh-config").returncode == 0
+    assert bench.run("ensure", "--account", "alice", "--id", ID_PROD).returncode == 0
+    assert bench.run("ensure", "--account", "boulot", "--id", ID_B).returncode == 0
+    r = bench.run("lock", "--unload", "--account", "alice")
+    assert r.returncode == 0, r.stderr
+    assert "0 clé retirée des agents" in r.stdout and bench.agent_keys() == [bench.blob("prod")]
+    e = bench.agent_state()["keys"][bench.keys["prod"]["fingerprint"]]
+    assert (e["account"], e["id"], e.get("also"), e["name"], e["hosts"]) == ("boulot", ID_B, None, "Copie", ["b"])
+    assert bench.stored_session() == (None, None) and bench.stored_session("boulot") != (None, None)
+
+
+def test_lock_unload_cle_partagee_par_deux_comptes_verrouilles(bench):
+    """Deux comptes verrouillés l'un après l'autre : la clé qu'ils partagent part."""
+    two_accounts(bench, boulot_items=[ssh_item(ID_B, "Copie", bench.keys["prod"], hosts="b")])
+    assert bench.run("ssh-config").returncode == 0
+    assert bench.run("ensure", "--account", "alice", "--id", ID_PROD).returncode == 0
+    assert bench.run("ensure", "--account", "boulot", "--id", ID_B).returncode == 0
+    r = bench.run("lock", "--unload")
+    assert r.returncode == 0, r.stderr
+    assert bench.agent_keys() == [] and bench.agent_state()["keys"] == {}
+    assert "boulot, 1 clé retirée des agents" in r.stdout
+
+
+def test_lock_unload_agent_verrouille(bench):
+    """Matrice : agent verrouillé (`ssh-add -x`) : coffre verrouillé quand même, clés gardées,
+    une ligne, code 4."""
+    two_accounts(bench)
+    assert bench.run("load", "--account", "boulot", "--id", ID_B).returncode == 0
+    hand_lock(bench)
+    r = bench.run("lock", "--unload", "--account", "boulot")
+    assert r.returncode == 4
+    line = one_line_error(r)
+    assert "non retirées (agent verrouillé)" in line and "coffre verrouillé quand même" in line, line
+    assert "relancer « sshvault lock --unload --account boulot »" in line, line
+    assert "clés non retirées des agents" in r.stdout
+    assert bench.stored_session("boulot") == (None, None) and bench.stored_session() != (None, None)
+    assert bench.keys["bastion"]["fingerprint"] in bench.agent_state()["keys"], "entrée gardée"
+    assert bench.run("agent", "unlock", env=askpass_env(bench)[0]).returncode == 0
+    assert bench.agent_keys() == [bench.blob("bastion")], "clé gardée"
+
+
+def test_lock_unload_bw_en_echec_cles_retirees(bench):
+    """`bw lock` en échec, un compte : clés retirées quand même (avant) et dites, erreur de
+    verrouillage en une ligne, session oubliée, code de l'erreur."""
+    two_accounts(bench)
+    assert bench.run("load", "--account", "boulot", "--id", ID_B).returncode == 0
+    r = bench.run("lock", "--unload", "--account", "boulot", env={"FAKE_BW_FAIL": "lock=error"})
+    assert r.returncode == 4
+    line = one_line_error(r)
+    assert line.startswith("sshvault: boulot : erreur bw (lock, code 1)"), line
+    assert r.stdout == ("coffre non verrouillé (erreur ci-dessus), session oubliée : boulot, 1 clé retirée des "
+                        "agents\n"), r.stdout
+    assert bench.agent_keys() == [] and bench.stored_session("boulot") == (None, None)
+
+
+def test_lock_unload_bw_en_echec_pour_un_seul_compte(bench):
+    """Deux comptes, `bw lock` en échec pour boulot seul : ligne `boulot : …`, alice verrouillée,
+    clés des deux retirées et dites, code le pire."""
+    two_accounts(bench)
+    assert bench.run("load", "--id", ID_PROD).returncode == 0
+    assert bench.run("load", "--account", "boulot", "--id", ID_B).returncode == 0
+    w = bench.tmp / "bw-lock-boulot"
+    w.write_text("#!/bin/sh\ncase \"$*\" in *\" lock\") case \"$BITWARDENCLI_APPDATA_DIR\" in */boulot/*) "
+                 "echo 'Unexpected error.' >&2; exit 1;; esac;; esac\nexec '%s' \"$@\"\n" % bench.bw)
+    w.chmod(0o755)
+    r = bench.run("lock", "--unload", env={"SSHVAULT_BW": str(w)})
+    assert r.returncode == 4
+    line = one_line_error(r)
+    assert line.startswith("sshvault: boulot : erreur bw (lock, code 1)"), line
+    assert r.stdout.splitlines() == ["coffre verrouillé, session oubliée : alice, 1 clé retirée des agents",
+                                     "coffre non verrouillé (erreur ci-dessus), session oubliée : boulot, 1 clé "
+                                     "retirée des agents"]
+    assert bench.agent_keys() == [] and bench.state().get("session") is None
+
+
+@pytest.mark.parametrize("cmd", [["logout", "--account", "boulot"], ["lock", "--unload", "--account", "boulot"]])
+def test_retrait_agent_vide_pendant_le_retrait_pas_verrouille(bench, cmd):
+    """Matrice : clé partie entre les deux passes (durée de vie écoulée), agent vide, entrée encore
+    valable : la sonde `ssh-add -D` dit l'agent déverrouillé ; retrait réussi, pas « verrouillé »."""
+    from bench import SSH_ADD
+    two_accounts(bench)
+    assert bench.run("load", "--account", "boulot", "--id", ID_B).returncode == 0
+    env = _ssh_add_script(bench, "ssh-add-vide", "if [ \"$1\" = -d ]; then '%s' \"$@\" >/dev/null 2>&1; "
+                                                "echo 'agent refused operation' >&2; exit 1; fi\nexec '%s' \"$@\""
+                          % (SSH_ADD, SSH_ADD))
+    r = bench.run(*cmd, env=env)
+    assert r.returncode == 0 and "verrouillé" not in r.stderr, r.stderr
+    assert "1 clé retirée des agents" in r.stdout and bench.agent_state()["keys"] == {}
+
+
+def test_logout_agent_vide_a_la_main_pas_verrouille(bench):
+    """Clés retirées à la main, agent vide et déverrouillé, état qui attend une clé non échue :
+    la sonde tranche (déverrouillé), `logout` se fait (avant : « agent verrouillé », code 4)."""
+    two_accounts(bench)
+    assert bench.run("load", "--account", "boulot", "--id", ID_B).returncode == 0
+    hand_purge(bench)
+    n = len(bench.ssh_add_calls())
+    r = bench.run("logout", "--account", "boulot")
+    assert r.returncode == 0, r.stderr
+    assert "compte boulot déconnecté" in r.stdout and bench.agent_state()["keys"] == {}
+    assert [c for _, c in bench.ssh_add_calls()[n:] if c == "-D"], "sonde ssh-add -D"
+    assert not [c for _, c in bench.ssh_add_calls() if c in ("-x", "-X")], "jamais -x/-X comme sonde"
+
+
+def test_ensure_marqueur_agent_verrouille_hors_sshvault(bench):
+    """Matrice : `logout`, puis agent verrouillé par `ssh-add -x` : ensure dit « agent
+    verrouillé » (code 3), pas « déconnecté » ; le verrou tient."""
+    two_accounts(bench)
+    assert bench.run("ssh-config").returncode == 0
+    assert bench.run("load", "--id", ID_PROD).returncode == 0
+    assert bench.run("logout", "--account", "boulot").returncode == 0
+    hand_lock(bench)
+    r = bench.run("--nointeraction", "ensure", "--account", "boulot", "--id", ID_B)
+    assert r.returncode == 3
+    line = one_line_error(r)
+    assert "agent verrouillé" in line and "déconnecté" not in line and "agent unlock" in line, line
+    assert bench.run("agent", "unlock", env=askpass_env(bench)[0]).returncode == 0
+    assert bench.agent_keys() == [bench.blob("prod")], "rien retiré par la sonde"
+
+
+def test_ensure_marqueur_agent_vide_dit_deconnecte(bench):
+    """Marqueur, agent vidé à la main (déverrouillé) alors que l'état attend une clé : la sonde
+    dit l'agent déverrouillé, la ligne propose `login`."""
+    two_accounts(bench)
+    assert bench.run("ssh-config").returncode == 0
+    assert bench.run("load", "--id", ID_PROD).returncode == 0
+    assert bench.run("logout", "--account", "boulot").returncode == 0
+    hand_purge(bench)
+    n = len(bench.ssh_add_calls())
+    r = bench.run("--nointeraction", "ensure", "--account", "boulot", "--id", ID_B)
+    assert r.returncode == 3
+    line = one_line_error(r)
+    assert "déconnecté" in line and "sshvault login --account boulot" in line, line
+    assert [c for _, c in bench.ssh_add_calls()[n:] if c == "-D"], "verdict de la sonde (CLI)"
+
+
+def _interrupt_bw_logout(bench, cmd, env, second=None):
+    """sshvault `cmd` interrompu (SIGTERM) pendant `bw logout` bloqué ; `second` : fichier dont
+    l'apparition déclenche un second SIGTERM. Renvoie (code, stderr)."""
+    import signal
+    p = subprocess.Popen([sys.executable, "-m", "sshvault", *cmd], env=dict(bench.env, **env),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         start_new_session=True)
+    deadline = time.monotonic() + 30
+    while not (bench.pids.exists() and len(bench.pids.read_text().split()) == 2) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert bench.pids.exists() and len(bench.pids.read_text().split()) == 2, \
+        "bw logout jamais bloqué (pids de bw et de son enfant absents de %s)" % bench.pids
+    p.send_signal(signal.SIGTERM)
+    if second is not None:
+        while not second.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert second.exists(), "relecture jamais lancée"
+        p.send_signal(signal.SIGTERM)
+    _, err = p.communicate(timeout=60)
+    from bench import wait_gone
+    assert wait_gone([int(x) for x in bench.pids.read_text().split()]), "bw bloqué et son enfant tués"
+    return p.returncode, err
+
+
+@pytest.mark.parametrize("cmd", [["logout", "--account", "boulot"],
+                                 ["account", "set", "boulot", "--email", "dan@example.test"]])
+def test_bw_logout_interrompu_deconnecte_marqueur_pose(bench, cmd):
+    """Interrompu pendant `bw logout` qui s'est déconnecté : bw tué, état relu (déconnecté),
+    marqueur posé, « interrompu », code 130 ; `account set` : registre inchangé."""
+    two_accounts(bench)
+    assert bench.run("load", "--account", "boulot", "--id", ID_B).returncode == 0
+    reg = bench.config_file().read_bytes()
+    rc, err = _interrupt_bw_logout(bench, cmd, {"FAKE_BW_FAIL": "logout=hangafter", "SSHVAULT_BW_TIMEOUT": "60"})
+    assert rc == 130 and err.strip() == "sshvault: interrompu", err
+    assert marker(bench, "boulot").exists() and not bw_state(bench, "boulot").get("userId")
+    assert bench.stored_session("boulot") == (None, None) and bench.agent_keys() == []
+    assert bench.config_file().read_bytes() == reg
+
+
+def test_bw_logout_interrompu_toujours_connecte_pas_de_marqueur(bench):
+    two_accounts(bench)
+    rc, err = _interrupt_bw_logout(bench, ["logout", "--account", "boulot"],
+                                   {"FAKE_BW_FAIL": "logout=hang", "SSHVAULT_BW_TIMEOUT": "60"})
+    assert rc == 130 and err.strip() == "sshvault: interrompu", err
+    assert bw_state(bench, "boulot").get("userId") and not marker(bench, "boulot").exists()
+    statuses = [c for c in bench.calls() if c["argv"][-1:] == ["status"]]
+    assert len(statuses) == 2, "sonde, puis relecture après l'interruption"
+
+
+def test_bw_logout_interrompu_etat_inconnu_marqueur_pose(bench):
+    two_accounts(bench)
+    rc, err = _interrupt_bw_logout(bench, ["logout", "--account", "boulot"],
+                                   {"FAKE_BW_FAIL": "logout=hang,status=errorsecond", "SSHVAULT_BW_TIMEOUT": "60"})
+    assert rc == 130 and err.strip() == "sshvault: interrompu", err
+    assert bw_state(bench, "boulot").get("userId") and marker(bench, "boulot").exists(), "état inconnu : marqueur"
+
+
+def test_bw_logout_interrompu_deux_fois_relecture_menee(bench):
+    """Second SIGTERM pendant la relecture : signaux retenus, relecture et marqueur menés à bien,
+    puis « interrompu », code 130."""
+    two_accounts(bench)
+    flag = bench.tmp / "logout-lance"
+    go = bench.tmp / "relecture-lancee"
+    w = bench.tmp / "bw-relecture-lente"
+    w.write_text("#!/bin/sh\ncase \"$*\" in *logout*) touch '%s';; *status*) if [ -e '%s' ]; then touch '%s'; "
+                 "sleep 2; fi;; esac\nexec '%s' \"$@\"\n" % (flag, flag, go, bench.bw))
+    w.chmod(0o755)
+    rc, err = _interrupt_bw_logout(bench, ["logout", "--account", "boulot"],
+                                   {"SSHVAULT_BW": str(w), "FAKE_BW_FAIL": "logout=hangafter",
+                                    "SSHVAULT_BW_TIMEOUT": "60"}, second=go)
+    assert rc == 130 and err.strip() == "sshvault: interrompu", err
+    assert marker(bench, "boulot").exists(), "relecture (déconnecté) et marqueur malgré le second signal"
+
+
+# --- story 12, revue 1 -----------------------------------------------------------------------
+
+def test_ensure_seul_compte_deconnecte_agent_verrouille_etat_vide(bench):
+    """Décision du 2026-10-13 : un seul compte, clé chargée, `logout` (état vide), clé ajoutée à
+    la main puis `ssh-add -x` : `ensure` dit « agent verrouillé » (code 3) quel que soit l'état ;
+    le chemin rapide passe la main à la CLI ; rien retiré par la sonde (vu après déverrouillage)."""
+    from bench import SSH_ADD
+    bench.unlocked(where(bench))
+    assert bench.run("ssh-config").returncode == 0
+    assert bench.run("load", "--id", ID_PROD).returncode == 0
+    assert bench.run("logout").returncode == 0
+    assert bench.agent_state()["keys"] == {} and marker(bench, ALIAS).exists()
+    env = dict(bench.env, SSH_AUTH_SOCK=str(bench.sock()))
+    r = subprocess.run([SSH_ADD, "-q", "-"], input=bench.keys["perso"]["private"], env=env, text=True,
+                       capture_output=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    hand_lock(bench)
+    # chemin rapide : il ne répond pas (délai d'invite invalide : seule la CLI le refuse, code 2)
+    r = bench.run("--nointeraction", "ensure", "--account", ALIAS, "--id", ID_PROD,
+                  env={"SSHVAULT_PROMPT_TIMEOUT": "invalide"})
+    assert r.returncode == 2 and "SSHVAULT_PROMPT_TIMEOUT" in one_line_error(r), r.stderr
+    r = bench.run("--nointeraction", "ensure", "--account", ALIAS, "--id", ID_PROD)
+    assert r.returncode == 3
+    line = one_line_error(r)
+    assert "agent verrouillé" in line and "déconnecté" not in line, line
+    # `agent unlock` (état vide, non marqué verrouillé) : la sonde voit le verrou, `ssh-add -X`
+    r = bench.run("agent", "unlock", env=askpass_env(bench)[0])
+    assert r.returncode == 0 and r.stdout == "agent déverrouillé\n", (r.stdout, r.stderr)
+    assert bench.agent_keys() == [bench.blob("perso")], "rien retiré par la sonde"
+
+
+def test_agent_unlock_agent_vide_deja_deverrouille(bench):
+    """Agent vide et déverrouillé (clés retirées à la main, état qui en attend encore) : « déjà
+    déverrouillé » après la sonde, aucun `ssh-add -X`."""
+    bench.unlocked(where(bench))
+    assert bench.run("load", "--id", ID_PROD).returncode == 0
+    hand_purge(bench)
+    n = len(bench.ssh_add_calls())
+    r = bench.run("agent", "unlock", env=askpass_env(bench)[0])
+    assert r.returncode == 0 and r.stdout == "agent déjà déverrouillé\n", (r.stdout, r.stderr)
+    calls = [c for _, c in bench.ssh_add_calls()[n:]]
+    assert "-D" in calls and "-X" not in calls, calls
+    assert bench.agent_state()["keys"] == {}, "entrées périmées retirées (agent prouvé vide)"
+    r = bench.run("agent", "status")
+    assert r.returncode == 0 and "verrouillé" not in r.stdout, r.stdout
+
+
+def test_lock_unload_magasin_en_panne_coffre_verrouille_session_gardee(bench, monkeypatch, capsys):
+    """`bw lock` réussi mais session impossible à oublier : « coffre verrouillé, session non
+    oubliée », clés retirées, ligne du magasin, code 4."""
+    from sshvault import cli
+    from sshvault.session import SessionStore, SessionStoreError
+    bench.unlocked(where(bench))
+    assert bench.run("load", "--id", ID_PROD).returncode == 0
+    for k in list(os.environ):
+        if k.startswith(("SSHVAULT_", "FAKE_BW_", "XDG_")):
+            monkeypatch.delenv(k, raising=False)
+    for k, v in bench.env.items():
+        monkeypatch.setenv(k, v)
+
+    def broken(self):
+        raise SessionStoreError("magasin en panne")
+    monkeypatch.setattr(SessionStore, "clear", broken)
+    rc = cli.main(["lock", "--unload"])
+    out, errs = capsys.readouterr()
+    assert rc == 4 and out == "coffre verrouillé, session non oubliée, 1 clé retirée des agents\n", (out, errs)
+    assert errs.strip() == "sshvault: magasin de session : magasin en panne", errs
+    assert bench.agent_keys() == [] and bench.bw_session() is None, "bw lock fait"
+
+
+def test_chemin_rapide_marqueur_agent_qui_liste_une_cle_repond(bench):
+    """Marqueur, agent qui liste une clé : le chemin rapide dit « déconnecté » sans la CLI."""
+    two_accounts(bench)
+    assert bench.run("load", "--id", ID_PROD).returncode == 0
+    assert bench.run("logout", "--account", "boulot").returncode == 0
+    r = bench.run("--nointeraction", "ensure", "--account", "boulot", "--id", ID_B,
+                  env={"SSHVAULT_PROMPT_TIMEOUT": "invalide"})
+    assert r.returncode == 3 and "sshvault login --account boulot" in one_line_error(r), r.stderr
+
+
+@pytest.mark.parametrize("cmd", [["logout", "--account", "boulot"], ["lock", "--unload", "--account", "boulot"]])
+def test_retrait_agent_verrouille_entre_les_passes_sonde(bench, cmd):
+    """Agent verrouillé entre les deux passes du retrait (`probe_locked()` vrai) : code 4, entrée
+    gardée ; la sonde `ssh-add -D` a bien tranché."""
+    from bench import SSH_ADD
+    two_accounts(bench)
+    assert bench.run("load", "--account", "boulot", "--id", ID_B).returncode == 0
+    prog, _ = make_askpass(bench.tmp, name="askpass-verrou-sonde")
+    log = bench.tmp / "sonde.log"
+    env = _ssh_add_script(bench, "ssh-add-verrou-sonde",
+                          "echo \"$*\" >> '%s'\nif [ \"$1\" = -d ]; then SSH_ASKPASS='%s' SSH_ASKPASS_REQUIRE=force "
+                          "'%s' -x </dev/null >/dev/null 2>&1; echo 'agent refused operation' >&2; exit 1; fi\n"
+                          "exec '%s' \"$@\"" % (log, prog, SSH_ADD, SSH_ADD))
+    r = bench.run(*cmd, env=env)
+    assert r.returncode == 4 and "agent verrouillé" in one_line_error(r), r.stderr
+    assert bench.keys["bastion"]["fingerprint"] in bench.agent_state()["keys"], "entrée gardée"
+    assert "-D" in log.read_text().split("\n"), "verdict de la sonde"
+
+
+def test_sonde_en_erreur_rien_modifie(bench):
+    """`ssh-add -D` en échec d'un autre genre (code 2) : une ligne qui le dit, rien modifié."""
+    from bench import SSH_ADD
+    two_accounts(bench)
+    assert bench.run("load", "--account", "boulot", "--id", ID_B).returncode == 0
+    hand_purge(bench)
+    env = _ssh_add_script(bench, "ssh-add-sonde-ko", "if [ \"$1\" = -D ]; then echo 'Error connecting to agent: "
+                                                     "Connection refused' >&2; exit 2; fi\nexec '%s' \"$@\"" % SSH_ADD)
+    state = bench.agent_state()
+    r = bench.run("logout", "--account", "boulot", env=env)
+    assert r.returncode == 4
+    line = one_line_error(r)
+    assert "ssh-add -D (code 2)" in line and "rien modifié" in line, line
+    assert bench.agent_state() == state and bw_state(bench, "boulot").get("userId")
+    assert not marker(bench, "boulot").exists()
+
+
+def test_lock_unload_sous_agent_de_transfert(bench):
+    """`lock --unload` : la clé du compte est retirée aussi du sous-agent de transfert ; celle de
+    l'autre compte y reste."""
+    from bench import agent_list
+    f, sock = _forward_setup(bench)
+    rc, before = agent_list(sock)
+    assert rc == 0 and sorted(l.split()[1] for l in before) == sorted([bench.blob("prod"), bench.blob("bastion")])
+    r = bench.run("lock", "--unload", "--account", "boulot")
+    assert r.returncode == 0, r.stderr
+    rc, after = agent_list(sock)
+    assert [l.split()[1] for l in after] == [bench.blob("prod")]
+    assert "1 clé retirée des agents" in r.stdout
+
+
+def test_bw_logout_interrompu_magasin_en_panne_dit(bench, monkeypatch, capsys):
+    """Interrompu pendant `bw logout`, session impossible à oublier : la ligne « session non
+    oubliée » est dite après « interrompu », code 130."""
+    from sshvault import cli
+    from sshvault.bw import BwBackend
+    from sshvault.session import SessionStore, SessionStoreError
+    two_accounts(bench)
+    for k in list(os.environ):
+        if k.startswith(("SSHVAULT_", "FAKE_BW_", "XDG_")):
+            monkeypatch.delenv(k, raising=False)
+    for k, v in bench.env.items():
+        monkeypatch.setenv(k, v)
+
+    def broken(self):
+        raise SessionStoreError("magasin en panne")
+    monkeypatch.setattr(SessionStore, "clear", broken)
+    real_run = BwBackend._run
+
+    def run(self, args, *a, **k):
+        if args[:1] == ["logout"]:
+            raise KeyboardInterrupt
+        return real_run(self, args, *a, **k)
+    monkeypatch.setattr(BwBackend, "_run", run)
+    rc = cli.main(["logout", "--account", "boulot"])
+    _, errs = capsys.readouterr()
+    lines = [l for l in errs.splitlines() if l.strip()]
+    assert rc == 130 and lines[0] == "sshvault: interrompu", errs
+    assert any("session non oubliée : magasin en panne" in l for l in lines[1:]), errs
+    assert not marker(bench, "boulot").exists(), "relu : toujours connecté"
+
+
+def test_agent_unlock_attend_ensure_lock(bench):
+    """`agent unlock` prend ensure.lock : liste, sonde `ssh-add -D` et déverrouillage attendent un
+    `ensure` en cours (simulé : verrou tenu), puis se font."""
+    import fcntl
+    from test_forward import wait_stderr
+    bench.unlocked(where(bench))
+    assert bench.run("load", "--id", ID_PROD).returncode == 0
+    hand_lock(bench)
+    n = len(bench.ssh_add_calls())
+    fd = os.open(str(bench.runtime / "sshvault" / "ensure.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        p = subprocess.Popen([sys.executable, "-m", "sshvault", "agent", "unlock"],
+                             env=dict(bench.env, **askpass_env(bench)[0]), stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        seen = wait_stderr(p, "attente d'un chargement en cours (ensure)")
+        assert "attente d'un chargement en cours (ensure)…" in seen, seen
+        time.sleep(0.3)
+        calls = [c for _, c in bench.ssh_add_calls()[n:]]
+        assert p.poll() is None and "-D" not in calls and "-X" not in calls, calls
+    finally:
+        os.close(fd)
+    out, err = p.communicate(timeout=30)
+    assert p.returncode == 0 and out == b"agent d\xc3\xa9verrouill\xc3\xa9\n", err
+    assert bench.agent_keys() == [bench.blob("prod")]

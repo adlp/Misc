@@ -530,14 +530,17 @@ class BwBackend(VaultBackend):
         if r.rc != 0 and not r.has(MSG_NOT_LOGGED_IN):
             raise self._fail(r, "lock")
 
-    def logout(self) -> bool:
+    def logout(self, on_interrupt: Optional[Callable[[Optional[bool]], None]] = None) -> bool:
         """`bw logout` dans les données de ce compte, puis session oubliée (même si bw échoue ou
         si l'appel est interrompu). True : déconnecté ; False : rien à faire (bw non connecté, ou
         dossier de données absent : jamais créé ici). BackendError (bw en erreur…) : toujours
         connecté, sauf LogoutUnknown : bw sans réponse et état relu impossible. Après un délai
         dépassé, l'état est relu (délai court) : déconnecté quand même → True. Session
         impossible à oublier : avertissement si bw a répondu (bw déconnecté, elle ne sert plus) ;
-        sinon l'appelant le dit."""
+        interrompu : avertissement aussi (`_interrupted_logout`) ; autre échec : l'appelant le dit.
+        Interrompu (Ctrl-C, SIGTERM, SIGHUP) : bw tué, puis, signaux retenus, état relu (délai
+        court), session oubliée et `on_interrupt(déconnecté ?)` appelé (True : bw déconnecté ;
+        False : toujours connecté ; None : état inconnu) ; l'interruption est ensuite relevée."""
         r, first = None, None
         if os.path.isdir(self.appdata):
             try:
@@ -552,16 +555,20 @@ class BwBackend(VaultBackend):
                     raise
                 except BackendError as e2:
                     first = LogoutUnknown("%s ; état relu impossible (%s)" % (e, e2))
-                except BaseException as e2:  # interrompu pendant la relecture : session oubliée quand même
-                    first = e2
+                except BaseException as e2:  # interrompu pendant la relecture : état inconnu
+                    self._interrupted_logout(on_interrupt, reread=False)
+                    raise e2
                 else:
                     if gone:
                         r = Result(0, "", "")
                     else:
                         e.reread_connected = True  # relu : toujours connecté (état connu)
                         first = e
-            except BaseException as e:  # session oubliée quand même ; l'erreur de bw est gardée
+            except Exception as e:  # session oubliée quand même ; l'erreur de bw est gardée
                 first = e
+            except BaseException:  # interrompu : bw tué (_spawn), état relu sous signaux retenus
+                self._interrupted_logout(on_interrupt)
+                raise
         not_logged_in = r is not None and r.rc != 0 and r.has(MSG_NOT_LOGGED_IN)
         failed = first is not None or (r is not None and r.rc != 0 and not not_logged_in)
         try:
@@ -576,6 +583,27 @@ class BwBackend(VaultBackend):
         if r.rc != 0:
             raise self._fail(r, "logout")
         return True
+
+    def _interrupted_logout(self, on_interrupt, reread: bool = True) -> None:
+        """`bw logout` interrompu (bw déjà tué) : Ctrl-C, SIGTERM, SIGHUP retenus le temps de
+        relire l'état (`REREAD_TIMEOUT`), d'oublier la session et d'appeler `on_interrupt`
+        (déconnecté ? None : inconnu). Un nouveau signal arrivé entre-temps est servi après."""
+        from .ensure import signals_blocked
+        with signals_blocked():
+            gone = None
+            try:
+                if reread:
+                    try:
+                        gone = self._bw_status(None, timeout=min(self.timeout, REREAD_TIMEOUT)).state == "unauthenticated"
+                    except Exception:
+                        gone = None
+            finally:  # session oubliée et marqueur, quoi qu'il arrive à la relecture
+                try:
+                    self.store.clear()
+                except SessionStoreError as e:  # dit en fin de commande, après « interrompu »
+                    self.warnings.append("session non oubliée : %s" % e)
+                if on_interrupt is not None:
+                    on_interrupt(gone)
 
     def sync(self, prompt: Optional[Prompt] = None) -> None:
         # commandes réseau de sshvault : sync, login, edit et create (mesuré : status, unlock, lock, list

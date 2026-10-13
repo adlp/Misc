@@ -486,6 +486,28 @@ def test_lock_purge_meme_si_bw_echoue(bench):
     assert bench.stored_session() == (None, None)
 
 
+def test_lock_unload_un_compte(bench):
+    """Critère d'acceptation (story 12) : clé chargée, `lock --unload` : `ssh-add -L` sur l'agent
+    dédié ne la liste plus, `status` dit le coffre verrouillé."""
+    bench.unlocked("keyring" if bench.ring else "file")
+    assert bench.run("load", "--id", ID_PROD).returncode == 0
+    assert bench.agent_keys() == [bench.blob("prod")]
+    r = bench.run("lock", "--unload")
+    assert r.returncode == 0 and r.stderr == "", r.stderr
+    assert r.stdout == "coffre verrouillé, session oubliée, 1 clé retirée des agents\n"
+    assert bench.agent_keys() == [] and bench.agent_state()["keys"] == {}
+    r = bench.run("status")
+    assert r.returncode == 3 and "coffre : verrouillé" in r.stdout, r.stdout
+
+
+def test_lock_unload_sans_agent(bench):
+    """Aucun agent lancé : coffre verrouillé, 0 clé retirée, aucun agent démarré."""
+    bench.unlocked("keyring" if bench.ring else "file")
+    r = bench.run("lock", "--unload")
+    assert r.returncode == 0, r.stderr
+    assert "0 clé retirée" in r.stdout and not bench.sock().exists()
+
+
 def test_lock_non_connecte(bench):
     r = bench.run("lock")
     assert r.returncode == 3 and "aucun compte" in one_line_error(r), "aucun compte : comme unlock et sync"
@@ -1777,3 +1799,57 @@ def test_hosts_list_aucun_element(bench):
     _unlocked(bench)
     r = bench.run("hosts", "list", "--name", "inconnu")
     assert r.returncode == 1 and "aucune clé ne correspond" in one_line_error(r)
+
+
+# --- garde de session des tests (story 12) ---------------------------------------------------
+
+def test_garde_de_session_signale_une_ecriture(tmp_path):
+    """Critère d'acceptation : un test qui écrit dans un dossier sshvault réel déjà existant est
+    signalé (chemins listés), même pour un fichier changé sans changer de taille ;
+    SSHVAULT_TEST_GUARD=warn ramène ce cas à un avertissement ; `~/.ssh` modifié ou dossier
+    réel créé restent des échecs."""
+    from bench import GUARD_VAR, guard_report, guard_verdict, snapshot
+    paths = {k: str(tmp_path / k) for k in ("ssh", "runtime", "data", "config")}
+    for k in ("ssh", "runtime", "data"):
+        os.makedirs(os.path.join(paths[k], "sous"))
+    (tmp_path / "runtime" / "agent.json").write_text("{}")
+    (tmp_path / "data" / "sous" / "data.json").write_text("abc")
+    before = {k: snapshot(p) for k, p in paths.items()}
+    assert before["config"] is None
+    assert guard_verdict(*guard_report(paths, before, before)) == (None, [])
+    (tmp_path / "runtime" / "ensure.lock").write_text("")  # écriture simulée d'un test
+    f = tmp_path / "data" / "sous" / "data.json"
+    st = f.stat()
+    f.write_text("xyz")  # même taille
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+    after = {k: snapshot(p) for k, p in paths.items()}
+    fails, changes = guard_report(paths, before, after)
+    assert fails == []
+    assert changes == ["%s réel changé pendant les tests : ensure.lock" % paths["runtime"],
+                       "%s réel changé pendant les tests : sous/data.json" % paths["data"]]
+    failure, warned = guard_verdict(fails, changes, env={})
+    assert failure and "ensure.lock" in failure and "sous/data.json" in failure and warned == []
+    failure, warned = guard_verdict(fails, changes, env={GUARD_VAR: "warn"})
+    assert failure is None and warned == changes
+    os.makedirs(paths["config"])
+    (tmp_path / "ssh" / "known_hosts").write_text("")
+    after = {k: snapshot(p) for k, p in paths.items()}
+    failure, _ = guard_verdict(*guard_report(paths, before, after), env={GUARD_VAR: "warn"})
+    assert "~/.ssh réel modifié" in failure and "known_hosts" in failure
+    assert "%s réel créé par les tests" % paths["config"] in failure
+
+
+def test_garde_de_session_dossier_reel_disparu(tmp_path):
+    """Dossier sshvault réel existant au début et disparu à la fin : échec, même sous
+    SSHVAULT_TEST_GUARD=warn."""
+    import shutil
+    from bench import GUARD_VAR, guard_report, guard_verdict, snapshot
+    paths = {k: str(tmp_path / k) for k in ("ssh", "runtime", "data", "config")}
+    for k in paths:
+        os.makedirs(paths[k])
+    (tmp_path / "data" / "x").write_text("x")
+    before = {k: snapshot(p) for k, p in paths.items()}
+    shutil.rmtree(paths["data"])
+    after = {k: snapshot(p) for k, p in paths.items()}
+    failure, warned = guard_verdict(*guard_report(paths, before, after), env={GUARD_VAR: "warn"})
+    assert failure == "%s réel disparu pendant les tests" % paths["data"] and warned == []

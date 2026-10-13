@@ -225,13 +225,31 @@ def running_unlocked(agent: Agent) -> dict:
     return adata
 
 
+AGENT_LOCKED = "agent verrouillé : lancer « sshvault agent unlock »"
+
+
+def probed_locked(agent: Agent) -> bool:
+    """Agent verrouillé, par sshvault ou hors de sshvault (`ssh-add -x`) ? Agent qui ne liste
+    aucune clé, quel que soit son état (état vide compris : seul compte déconnecté, puis
+    `ssh-add -x`) : verdict de `ssh-add -D` (`Agent.probe_locked`). À appeler sous
+    `ensure.lock`, compte déconnecté seulement. Agent qui liste une clé : False."""
+    if agent.state.load().get("locked"):
+        return True
+    if agent.keys():
+        return False
+    return agent.probe_locked()
+
+
 def _unlock_possible(directory: str, store: SessionStore, env: Mapping[str, str], ctx: Context,
-                     account: Optional[str] = None, hint: str = "") -> None:
+                     account: Optional[str] = None, hint: str = "", agent: Optional[Agent] = None) -> None:
     """Sans session rangée, il faudrait une invite : échec immédiat, sans bw, si elle est
-    interdite, impossible, ou si cette connexion vient d'échouer à déverrouiller ce compte."""
+    interdite, impossible, ou si cette connexion vient d'échouer à déverrouiller ce compte.
+    Compte déconnecté (marqueur) : « agent verrouillé » d'abord si la sonde de `agent` le dit."""
     if store.get():
         return
     if fastpath.logged_out(account, env):
+        if agent is not None and probed_locked(agent):
+            raise AgentLocked(AGENT_LOCKED)
         raise NotLoggedIn(fastpath.logged_out_message(account))
     age = recent_failure(directory, time.time(), ctx.conn, account)
     if age is not None:
@@ -262,7 +280,7 @@ def ensure(item_id: str, backend: VaultBackend, store: SessionStore, settings: d
         if present_fresh(agent, item_id, account):  # chargée par un ensure parallèle pendant l'attente
             return "present"
         running_unlocked(agent)  # avant toute invite ou appel à bw
-        _unlock_possible(agent.dir, store, env, ctx, account, _hint(backend))
+        _unlock_possible(agent.dir, store, env, ctx, account, _hint(backend), agent)
         prompt = UnlockPrompt(agent.dir, env, ctx, account, _hint(backend)) if ctx.interactive else None
         try:
             item, key = backend.get_ssh_key(item_id, prompt)
