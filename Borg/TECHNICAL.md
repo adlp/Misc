@@ -31,6 +31,8 @@ borgHelper est structuré en trois couches :
 | `~/.cache/borghelper/<conf>-<repo_sanitisé>-index-paused.lock` | Marqueur exclusif (1.0.141) : un seul `Index` en attente par dépôt |
 | `~/.cache/borghelper/<conf>-<repo_sanitisé>-report-running.lock` | Lock PID posé par `Report` — met aussi un `Index` en pause |
 | `~/.cache/borghelper/<conf>-<repo_sanitisé>-index-running.lock` | Lock PID exclusif tenu par `Index` pendant toutes ses phases (1.0.141) — `Bkp`/`Restore`/`Prune`/`DelBkp` attendent qu'il se mette en pause avant d'appeler borg |
+| `~/.cache/borghelper/<conf>-<nick>-bkp.lock.<run_id>` | Marqueur de Bkp (1.0.183) : PID du Bkp, écrit par `backup()` (`set_bkp_marker`) avant le verrou prioritaire, retiré à sa toute fin (`clear_bkp_marker`, Index de fin compris) ; mort (Bkp tué) : retiré par le lecteur suivant (`bkp_markers` : Report, Status, `/access`). Report/Status y lisent le Bkp vivant (`_bkp_live`) ; empreinte du cache `/report?offline=true` de borgHelperWWW (1.31.3, `_bkp_markers_state` : nom et porteur) |
+| `~/.cache/borghelper/<conf>-<nick>-bkp.lock.<run_id>.sans-suivi` | Trace « suivi bkp_status indisponible » (1.0.196) : écrite par `backup()` (`set_bkp_untracked`) quand `store_bkp_status_start` échoue ; retirée par `clear_bkp_marker` (avant le marqueur) et par `bkp_markers` si son marqueur est mort ou absent. Report/Status : Bkp en cours `sans_suivi` ; empreinte du cache `/report?offline=true` (borgHelperWWW 1.31.12 : son apparition recalcule la réponse) |
 | `~/.cache/borghelper/<conf>-<nick>-index-pending.lock` | Flag (vide) posé par l'Index de fin de Bkp quand il est interrompu (`pause=False`), ou par un Index annulé — `Bkp` le détecte en fin d'exécution et relance `Index` complet ; depuis 1.0.141, un Index externe interrompu se met en pause et reprend seul |
 
 - `<conf>` = basename sanitisé du fichier de configuration (ex : `borghelperrc` pour `~/.borghelperrc`)
@@ -1980,7 +1982,9 @@ mtimes stables, mesuré). Cache par périmètre : `_capture_fingerprints(nick, '
 `_CACHE_TTL` dans `_scope_cache_get`. `_never_cache(result)` = `_is_db_key_error`, `[ERREUR]` sur stderr ou « SQLite error »
 (stdout/stderr) — seul prédicat des trois écritures (`run_borghelper`, `_scoped_cached_mono`, `_scoped_cached_multi`) ;
 1.31.3 (story 56, A113) : pour `report`, `_external_fingerprint` ajoute `|bkp:` + `_bkp_markers_state()` (TOUS les marqueurs
-`<prefix>-*-bkp.lock.*` de `CACHE_DIR` triés, « nom:`_lock_holder` » — lecture seule, jamais retirés ici ; décision de
+`<prefix>-*-bkp.lock.*` de `CACHE_DIR` triés — 1.31.12 (story 74) : traces `<marqueur>.sans-suivi` comprises (`_MARKER_RE`),
+sinon « en attente de l'Index » restait en cache jusqu'à 5 min après leur apparition —, « nom:`_lock_holder` » — lecture
+seule, jamais retirés ici ; décision de
 l'utilisateur : un voisin du même dépôt compte ; run_id de 32 hex seulement, jamais les `.<pid>.tmp` de `_set_pid_lock` ; porteur
 vivant mais zombie -> `zombie`, `_pid_alive` lit `/proc/<pid>/stat` : un borgHelper lancé par POST /bkp puis tué reste zombie,
 enfant du worker, jusqu'au Popen suivant ; 1.31.5 / borgHelper 1.0.188 : `_lock_holder` rend déjà `dead` pour un zombie, le
@@ -2443,10 +2447,33 @@ retire (`clear_bkp_marker`) en dernier dans son `finally`, après le filet `stor
 l'attente de l'Index, `borg create` et l'Index de fin. `BorgHelperDB.bkp_markers(nick)` : marqueurs VIVANTS (`_check_pid_lock` :
 PID vivant, non repris — `_lock_holder`, règle des 60 s ; `/proc` illisible : vivant), noms en `[0-9a-f]{32}` seulement ; un
 marqueur mort est supprimé au passage. `BorgHelper._bkp_live(nick)` : aucun marqueur -> None sans rien lire d'autre ; sinon
-`get_running_bkp_status` (délai `bkp_status_timeout`) : ligne ouverte dont le `run_id` a un marqueur vivant et non périmée ->
-Bkp en cours ; ligne périmée -> None ; marqueur vivant sans ligne (`bkp_status_known` faux) -> Bkp en attente de l'Index
-(`en_attente`, début = date du marqueur). Toute exception -> None (une base de schéma plus récent reste signalée par la suite
-du Report, dans le `try` du nick). `BorgHelper._bkp_neighbor(nick)` : si un marqueur existe dans `CACHE_DIR`
+(1.0.196, story 74) chaque marqueur vivant est rapproché de SA ligne (délai `bkp_status_timeout` lu une fois) : trace « sans
+suivi » (voir plus bas) -> Bkp en cours `sans_suivi`, début = date du marqueur, base non lue pour ce run, jamais soumis au
+délai (sans ligne, aucun `bkp_stale` possible : le Bkp disparaîtrait de Status — qui nommerait alors « Restore, Prune ou
+DelBkp » le verrou prioritaire qu'il tient — et `/access` le dirait fini pendant que borg tourne ; son marqueur vivant prouve
+le processus) ; sinon `bkp_status_open(nick, run_id, délai)` : ligne ouverte non
+périmée -> Bkp en cours ; périmée -> ce run ne compte pas ; aucune ligne ouverte et `bkp_status_known` faux -> en attente de
+l'Index (`en_attente`, début = date du marqueur) ; ligne close (fin du Bkp, avant retrait du marqueur) -> ne compte pas.
+Rendu : le plus récent de TOUS ces candidats (début, puis date du marqueur) — un Bkp en attente plus récent l'emporte sur un
+Bkp en cours plus ancien —, sinon None. Avant 1.0.196 : seule la ligne ouverte la plus récente du nick
+(`get_running_bkp_status`) était comparée
+aux marqueurs — un Bkp A vivant derrière la ligne restée ouverte d'un Bkp B tué plus récent (B lancé pendant l'Index de fin de
+A, verrou prioritaire libéré) n'était plus vu : Report interrogeait borg (verrou du dépôt), Status disait seulement B
+interrompu. Toute exception -> None (une base de schéma plus récent reste signalée par la suite du Report, dans le `try` du
+nick). Trace « sans suivi » (1.0.196, D172 L2) : `backup()` dont `store_bkp_status_start` échoue écrit, outre le `[WARN]`,
+`<marqueur>.sans-suivi` (`set_bkp_untracked`, `.tmp` + `os.replace` ; jamais dans le fichier PID : `_lock_holder` tient un
+contenu non entier pour mort après 2 s) ; `clear_bkp_marker` la retire AVANT le marqueur ; `bkp_markers` ne la rend jamais
+(nom hors `[0-9a-f]{32}`) et la retire si son marqueur est mort ou absent. `_bkp_live` rend alors `sans_suivi` True (False
+dans tous les autres cas, orphelin compris) ; Report : `⏳ Bkp en cours depuis … (suivi bkp_status indisponible)`, JSON
+`bkp_en_cours.sans_suivi` / `bkp_voisin.sans_suivi`, Bkp « précédent » = dernière ligne du nick (comme en attente) ; Status :
+même suffixe, `bkp_running.sans_suivi`. `/access` (borgHelperWWW, code inchangé pour cet état) : `bkp_running` vrai,
+`bkp_detail` `"en_cours"` — si `history.db` est lisible : sinon sa garde `bkp_running_state` rend None et `_bkp_state` dit
+l'état inconnu (`bkp_running` null), comme pour tout Bkp. `backup()` relit la trace après l'avoir écrite : absente
+(`_set_pid_lock` avale `OSError`) -> `[WARN] <nick>: trace sans-suivi non écrite` (le Bkp sera vu « en attente de l'Index »).
+`bkp_state` (1.0.196, revue) : la ligne ouverte la plus récente d'un run dont le marqueur VIT n'est jamais `bkp_interrupted`
+(Bkp vivant moins récent que celui rendu par `_bkp_live`) ; lecture des marqueurs impossible : rien d'interrompu,
+`bkp_unknown`. Le cache de `/report?offline=true` (borgHelperWWW 1.31.12) compte aussi la trace dans son empreinte.
+`BorgHelper._bkp_neighbor(nick)` : si un marqueur existe dans `CACHE_DIR`
 (`any_bkp_marker`), cherche parmi les autres nicks du rc (`cfgreadnicks`) de même `_repo_key` un `_bkp_live` (sans ligne
 stderr propre) -> `voisin`. `report()` et sa jumelle `report_offline()` prennent `live = _bkp_live(nick) or
 _bkp_neighbor(nick)` ; `report()` saute alors `set_report_running_lock`/`wait_index_idle` et lit `prep_report_from_db` au lieu
@@ -2456,7 +2483,8 @@ d'alerte) et met le nick en alerte (code 1) si `BorgHelperDB.previous_bkp_status
 avant celle du Bkp en cours (`started_at`, puis `rowid`), ou dernière ligne du nick si `run_id` est None (en attente) — a
 `failed` : fin en `error`, ou aucune fin et aucun marqueur vivant à son `run_id`. Lecture impossible : `[WARN]`, règle non
 appliquée. `MAX_AGE_BKP`, « aucune archive » et « dépôt absent » restent la règle de l'appelant. Ligne `bkp_status` non écrite
-(`[WARN] store_bkp_status_start a échoué`) : Bkp vu « en attente » jusqu'à sa fin. Le cache de `/report?offline=true` de
+(`[WARN] store_bkp_status_start a échoué`) : Bkp vu « en attente » jusqu'à sa fin avant 1.0.196, « en cours (suivi
+bkp_status indisponible) » depuis (trace « sans suivi », ci-dessus). Le cache de `/report?offline=true` de
 borgHelperWWW (5 min, empreinte = mtimes de diff.db, cache.db, history.db et `-wal` du nick) inclut depuis borgHelperWWW 1.31.3
 les marqueurs de Bkp et les détenteurs du `lock.roster` (voir « Cache des réponses »).
 
@@ -3832,7 +3860,8 @@ Commande CLI en lecture seule (1.0.186 : elle retire seulement, comme Report, le
    `BORGHELPERWWW_CFGFILE`). `Status`
    range une ligne périmée dans `bkp_stale` (« probablement interrompu »), jamais dans `bkp_running`. 1.0.186 (story 55) :
    `status()` appelle `_status_one(nick, bkp_live=True)` : `bkp_running` vient de `_bkp_live(nick, quiet=True, strict=True)`
-   (marqueur vivant + ligne, marqueur sans ligne -> `en_attente`, orphelin -> `orphelin` ; la source de Report ; `strict` :
+   (marqueur vivant + SA ligne — 1.0.196 : rapprochement par run_id —, marqueur sans ligne -> `en_attente`, orphelin ->
+   `orphelin`, trace « sans suivi » -> `sans_suivi` (1.0.196) ; la source de Report ; `strict` :
    une erreur de lecture lève au lieu de rendre None -> rien sur le Bkp, jamais un faux « interrompu ») ; la ligne la plus
    récente, si elle n'est pas celle du Bkp vivant : périmée -> `bkp_stale`, sinon -> `bkp_interrupted` ({started_at,
    verifie = `repo_orphan_checkable(nick)`, dépôt local au sens de `_repo_local_path`, le prédicat de `repo_lock_holders`}).

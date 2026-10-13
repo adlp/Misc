@@ -77,7 +77,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.31.11"
+WWW_VERSION="1.31.12"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -1566,13 +1566,15 @@ def _repo_roster_state(n: str) -> str:
         _ROSTER_LAST[n]=v; return v
     return _bounded_probe('roster',n,read,lambda: _ROSTER_LAST.get(n,'?'))
 
-_MARKER_RE=re.compile(r'-bkp\.lock\.[0-9a-f]{32}$')
+_MARKER_RE=re.compile(r'-bkp\.lock\.[0-9a-f]{32}(?:\.sans-suivi)?$')   # 1.31.12 (story 74) : trace « sans suivi » de borgHelper 1.0.196 comprise
 
 def _bkp_markers_state() -> str:
     """1.31.3 (story 56, décision de l'utilisateur) : TOUS les marqueurs de Bkp de CACHE_DIR (un voisin du même dépôt compris :
     Report dit « Bkp de X en cours »), « nom:porteur » (_lock_holder : alive/dead/gone/me ; revue : 'zombie' si son PID est un
     zombie, _pid_alive) — lecture seule, jamais retirés ici (Report et Status s'en chargent) ; revue : run_id de 32 hex seulement
-    (jamais les « .<pid>.tmp » d'écriture de _set_pid_lock). Erreur : '?'."""
+    (jamais les « .<pid>.tmp » d'écriture de _set_pid_lock). 1.31.12 (story 74) : aussi la trace « <marqueur>.sans-suivi »
+    (borgHelper 1.0.196 : Bkp en cours sans ligne bkp_status) — sinon « en attente de l'Index » restait en cache jusqu'à 5 min
+    après son apparition. Erreur : '?'."""
     import glob
     try:
         db=_bh_paths.db; out=[]
@@ -5216,14 +5218,15 @@ def push_selftest():
                     """1.31.3 (story 56, A113, décision de l'utilisateur) : Report -o en cache renouvelé quand un marqueur de Bkp apparaît
                     (tout nick : voisin compris), que son porteur meurt ou devient zombie (Bkp lancé par POST /bkp puis tué : enfant du
                     worker non récolté), ou que les détenteurs du lock.roster du dépôt changent, meurent ou sont zombies ; sinon
-                    resservi ; marqueurs jamais retirés par WWW ; « .<pid>.tmp » d'écriture ignorés. Revue : sonde du roster figée -> ~1 s
+                    resservi ; marqueurs jamais retirés par WWW ; « .<pid>.tmp » d'écriture ignorés ; 1.31.12 (story 74) : trace
+                    « <marqueur>.sans-suivi » qui apparaît -> recalculé. Revue : sonde du roster figée -> ~1 s
                     puis DERNIER état lu (réponse en cache gardée), suivantes immédiates, une seule sonde ; résultat tardif adopté ;
                     requêtes concurrentes : une seule lecture du roster ; diffbkp : ni marqueurs ni roster."""
                     def clear():
                         for k in [k for k in _RESPONSE_CACHE if k and k[0]=='report' and k[1]==_internal]: _RESPONSE_CACHE.pop(k,None)
                     db=_bh_paths.db; ok_r=CommandResult(exitcode=0,stdout='tableau',stderr='')
                     mk=f"{db._bkp_marker_base(_internal)}.{'5'*32}"; mv=f"{db._bkp_marker_base('selftest-voisin')}.{'6'*32}"
-                    mz=f"{db._bkp_marker_base(_internal)}.{'7'*32}"; mt=f"{mk}.4242.tmp"
+                    mz=f"{db._bkp_marker_base(_internal)}.{'7'*32}"; mt=f"{mk}.4242.tmp"; ms=f"{mk}.sans-suivi"
                     kids=[subprocess.Popen(['sleep','60']) for _ in range(5)]; holders=[[]]; after=[[]]; gate=threading.Event(); res={}; reads=[]
                     def rh(n):
                         reads.append(n)
@@ -5245,6 +5248,8 @@ def push_selftest():
                             res['1er appel exécuté, 2e resservi']=(runs(lambda:(call(),call()))==1,)
                             with open(mk,'w') as f: f.write(str(kids[0].pid))
                             res['marqueur posé -> exécuté, puis resservi']=(runs(call)==1 and runs(call)==0,)
+                            with open(ms,'w') as f: f.write(str(kids[0].pid))   # 1.31.12 (story 74) : trace « sans suivi »
+                            res['trace « sans suivi » posée -> exécuté, puis resservi']=(runs(call)==1 and runs(call)==0,)
                             with open(mt,'w') as f: f.write(str(kids[0].pid))
                             res['« .<pid>.tmp » d\'écriture ignoré']=(runs(call)==0,)
                             with open(mv,'w') as f: f.write(str(kids[1].pid))
@@ -5281,11 +5286,11 @@ def push_selftest():
                         gate.set(); e=_PROBES.pop(('roster',_internal),None); e and e['t'].join(5); _ROSTER_LAST.pop(_internal,None); clear()
                         for k in kids:
                             with contextlib.suppress(Exception): k.kill(); k.wait()
-                        for p in (mk,mv,mz,mt):
+                        for p in (mk,mv,mz,mt,ms):
                             with contextlib.suppress(OSError): os.unlink(p)
                     bad={k:v for k,v in res.items() if not v[0]}
                     if bad: print(f"  {bad}")
-                    return not bad and len(res)==13
+                    return not bad and len(res)==14
                 check("cache Report -o : marqueurs de Bkp et lock.roster dans l'empreinte, lecture seule, sonde bornée (story 56, A113)",
                       _cache_report_bkp_state)
                 def _scope_cache_ttl():

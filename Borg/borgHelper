@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.195"
+Version="1.0.196"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -775,6 +775,7 @@ def _bkp_running_readable(started_at):
     return f"{started_local.strftime(fmt)} ({h}h{m:02d}min)"
 
 _BKP_STATUS_TIMEOUT_MAX=10*365*86400   # au-delà, datetime('now','-N seconds') rend NULL (ligne tenue pour interrompue)
+_BKP_UNTRACKED_TXT=" (suivi bkp_status indisponible)"   # 1.0.196 (story 74, décision Q1) : Bkp en cours sans sa ligne bkp_status
 
 # 1.0.155 (story 18) : ligne bkp_status « ouverte » du nick — sans fin, et aucun Bkp démarré après elle (ordre started_at
 # puis rowid, celui de last_bkp_status) n'a fini en succès. Un Bkp tué suivi d'un Bkp réussi n'est plus « en cours » ; un
@@ -3804,7 +3805,19 @@ class BorgHelperDB:
         if k!=nick: k+='-'+hashlib.sha1(nick.encode()).hexdigest()[:8]   # deux nicks ne partagent jamais un marqueur
         return os.path.join(self.cache_dir,f"{self.db_prefix}-{k}-bkp.lock")
     def set_bkp_marker(self,nick,run_id): self._set_pid_lock(f"{self._bkp_marker_base(nick)}.{run_id}")
-    def clear_bkp_marker(self,nick,run_id): self._clear_pid_lock(f"{self._bkp_marker_base(nick)}.{run_id}")
+    def clear_bkp_marker(self,nick,run_id):
+        # 1.0.196 (story 74) : trace « sans suivi » d'abord — tué entre les deux, le marqueur restant mourra (bkp_markers), jamais l'inverse
+        self._clear_pid_lock(self._bkp_untracked_path(nick,run_id))
+        self._clear_pid_lock(f"{self._bkp_marker_base(nick)}.{run_id}")
+    # 1.0.196 (story 74, D172 L2) : trace « suivi bkp_status indisponible » — fichier VOISIN du marqueur « <marqueur>.sans-suivi »
+    # (jamais dans le fichier PID : _lock_holder tient un contenu non entier pour mort après 2 s), posée par backup() quand
+    # store_bkp_status_start échoue : _bkp_live rend alors ce Bkp en cours (sans_suivi), sans lire la base pour ce run — un
+    # marqueur sans ligne vaudrait sinon « en attente de l'Index » toute la durée du Bkp. Retirée par clear_bkp_marker et, avec un
+    # marqueur mort (ou absent), par bkp_markers. Écriture atomique (.tmp + os.replace), comme le marqueur.
+    _BKP_UNTRACKED='.sans-suivi'
+    def _bkp_untracked_path(self,nick,run_id): return f"{self._bkp_marker_base(nick)}.{run_id}{self._BKP_UNTRACKED}"
+    def set_bkp_untracked(self,nick,run_id): self._set_pid_lock(self._bkp_untracked_path(nick,run_id))
+    def bkp_untracked(self,nick,run_id): return os.path.exists(self._bkp_untracked_path(nick,run_id))
     @staticmethod
     def _repo_local_path(cfg):
         """Chemin du dépôt LOCAL (absolu, ni « : », ni {…}, ni SSH_REPO/SSH_REMFO) ; sinon None (rc absent compris). Seul prédicat
@@ -3892,10 +3905,12 @@ class BorgHelperDB:
         return bool(glob.glob(os.path.join(glob.escape(self.cache_dir),f"{glob.escape(self.db_prefix)}-*-bkp.lock.*")))
     def bkp_markers(self,nick,include_me=False):
         """{run_id: date d'écriture (epoch)} des marqueurs VIVANTS du nick ; un marqueur mort est retiré au passage. include_me
-        (1.0.185, story 54) : compte aussi les marqueurs du processus courant (Index de fin d'un Bkp : son propre Bkp vit)."""
-        base=self._bkp_marker_base(nick); out={}
+        (1.0.185, story 54) : compte aussi les marqueurs du processus courant (Index de fin d'un Bkp : son propre Bkp vit).
+        1.0.196 (story 74) : la trace « sans suivi » d'un marqueur mort ou absent est retirée aussi (jamais rendue comme marqueur)."""
+        base=self._bkp_marker_base(nick); out={}; traces=[]
         for p in glob.glob(glob.escape(base)+'.*'):
             rid=p[len(base)+1:]
+            if re.fullmatch(r'[0-9a-f]{32}'+re.escape(self._BKP_UNTRACKED),rid): traces.append(p); continue   # 1.0.196 (story 74)
             if not re.fullmatch(r'[0-9a-f]{32}',rid): continue   # fichier .tmp d'écriture, autre
             h=self._lock_holder(p)
             if h=='dead':
@@ -3903,6 +3918,10 @@ class BorgHelperDB:
                 except OSError: pass
             elif h=='alive' or (include_me and h=='me'):
                 try: out[rid]=os.path.getmtime(p)
+                except OSError: pass
+        for t in traces:   # 1.0.196 (story 74) : trace d'un marqueur mort (retiré ci-dessus) ou absent -> retirée aussi
+            if not os.path.exists(t[:-len(self._BKP_UNTRACKED)]):
+                try: os.unlink(t)
                 except OSError: pass
         return out
     def bkp_status_known(self,nick,run_id,db_path=None):
@@ -6283,6 +6302,11 @@ class BorgHelper:
             # rapproché), DANS le try : le finally libère priority.lock même sur Ctrl-C pendant le borg list
             if not self.db.store_bkp_status_start(nick,run_id,bkp_status_db):
                 printer(f"[WARN] store_bkp_status_start a échoué pour {nick} (run_id={run_id})")
+                # 1.0.196 (story 74, D172 L2) : trace voisine du marqueur — Report et Status disent ce Bkp en cours « (suivi
+                # bkp_status indisponible) », pas « en attente de l'Index » toute sa durée ; retirée avec le marqueur (finally)
+                self.db.set_bkp_untracked(nick,run_id)
+                if not self.db.bkp_untracked(nick,run_id):   # revue : _set_pid_lock avale OSError -> dit, jamais muet
+                    printer(f"[WARN] {nick}: trace sans-suivi non écrite (run_id={run_id}) — ce Bkp sera vu « en attente de l'Index »")
             # 1.0.163 (story 26, choix de l'utilisateur) : borg local seulement (avec SSH_REMFO, borg tourne sur la machine
             # distante, ses chemins ne se vérifient pas ici). Chemin absent : [WARN], les autres sont sauvegardés (borg
             # ferait de même, code 1) ; tous absents : aucune archive vide, Bkp en échec (code 2, Status, notifications).
@@ -8500,7 +8524,7 @@ class BorgHelper:
         }
 
     def bkp_state(self,nick,bkp_live=True):
-        """État du Bkp du nick, forme JSON de Status : {'bkp_running': {started_at, en_attente, orphelin} | None,
+        """État du Bkp du nick, forme JSON de Status : {'bkp_running': {started_at, en_attente, orphelin, sans_suivi} | None,
         'bkp_interrupted': {started_at, verifie} | None, 'bkp_stale': {started_at, timeout_s} | None, 'bkp_unknown': bool}
         (bkp_unknown : _bkp_live illisible — Status ne l'expose pas). 1.0.188 (story 59) : extrait
         de _status_one — source unique de Status et de borgHelperWWW (/access, alerte de retard), qui l'appelle dans une sonde
@@ -8511,7 +8535,12 @@ class BorgHelper:
         ni marqueurs ni lock.roster du dépôt. _bkp_live illisible : rien sur le Bkp vivant ni interrompu. Ligne d'un AUTRE run
         que le Bkp vivant : dite aussi (décision de l'utilisateur, revue). Lecture de history.db impossible : erreur SQLite de
         get_running_bkp_status avalée (aucune ligne rendue, comme Status depuis toujours) — l'appelant qui sait qu'une ligne
-        existe (borgHelperWWW : garde bkp_running_state) relit ; autres erreurs (rc, timeout) : exception."""
+        existe (borgHelperWWW : garde bkp_running_state) relit ; autres erreurs (rc, timeout) : exception. 1.0.196 (story 74) :
+        Bkp vivant = le plus récent des marqueurs vivants rapprochés chacun de SA ligne (un Bkp vivant plus ancien qu'une ligne
+        ouverte tuée est en cours, la ligne tuée interrompue) ; sans_suivi : Bkp vivant dont la ligne n'a pu être écrite (trace
+        « sans suivi » de backup(), début = date du marqueur) — Status : « Bkp en cours depuis … (suivi bkp_status indisponible) ».
+        Revue : la ligne la plus récente d'un run dont le marqueur VIT n'est jamais bkp_interrupted (Bkp vivant moins récent que
+        celui rendu) ; marqueurs illisibles à ce moment : rien d'interrompu, bkp_unknown."""
         timeout_s=self.bkp_status_timeout(nick)
         bkp_row=self.db.get_running_bkp_status(nick,timeout_s=timeout_s)
         if bkp_live:
@@ -8520,11 +8549,16 @@ class BorgHelper:
             other=bkp_row if bkp_row and not (live and live.get('run_id')==bkp_row['run_id']) else None
             bkp_stale=other if other and other['stale'] else None
             bkp_interrupted=other if other and not other['stale'] and not unknown else None
+            if bkp_interrupted:   # 1.0.196 (revue story 74) : un run dont le marqueur vit n'est jamais « interrompu » (Bkp vivant
+                try:              # moins récent que celui rendu par _bkp_live, ex. un Bkp sans_suivi plus récent)
+                    if bkp_interrupted['run_id'] in self.db.bkp_markers(nick): bkp_interrupted=None
+                except Exception: bkp_interrupted=None; unknown=True
         else:
-            live={**bkp_row,'en_attente':False,'orphelin':False} if bkp_row and not bkp_row['stale'] else None
+            live={**bkp_row,'en_attente':False,'orphelin':False,'sans_suivi':False} if bkp_row and not bkp_row['stale'] else None
             bkp_stale=bkp_row if bkp_row and bkp_row['stale'] else None; bkp_interrupted=None
         return {
-            'bkp_running':{'started_at':live['started_at'],'en_attente':bool(live['en_attente']),'orphelin':bool(live['orphelin'])} if live else None,
+            'bkp_running':{'started_at':live['started_at'],'en_attente':bool(live['en_attente']),'orphelin':bool(live['orphelin']),
+                           'sans_suivi':bool(live.get('sans_suivi'))} if live else None,
             'bkp_interrupted':{'started_at':bkp_interrupted['started_at'],'verifie':self.db.repo_orphan_checkable(nick)} if bkp_interrupted else None,
             'bkp_stale':{'started_at':bkp_stale['started_at'],'timeout_s':timeout_s} if bkp_stale else None,
             'bkp_unknown':bool(bkp_live and unknown),   # _bkp_live illisible (Status n'en dit rien ; /access : inconnu, jamais une fin)
@@ -8560,7 +8594,7 @@ class BorgHelper:
             except (ValueError,TypeError): readable=run['started_at']
             what=("Bkp interrompu (borgHelper arrêté), borg create encore actif" if run.get('orphelin') else   # 1.0.186 (story 55)
                   "Bkp en attente de l'Index" if run.get('en_attente') else "Bkp en cours")
-            printer(f"  {what} depuis {readable}")
+            printer(f"  {what} depuis {readable}{_BKP_UNTRACKED_TXT if run.get('sans_suivi') else ''}")   # 1.0.196 (story 74, Q1)
         bi=st.get('bkp_interrupted')
         if bi:   # 1.0.186 : aussi sous un Bkp vivant d'un autre run (décision de l'utilisateur, revue)
             try: readable=_bkp_running_readable(bi['started_at'])
@@ -9457,7 +9491,16 @@ class BorgHelper:
         (« HH:MM (XhYYmin) », format de Status), 'started_iso' (UTC) et 'en_attente', et le dit sur stderr (sauf quiet) ; Report
         (en ligne comme -o) tire alors ce nick de la base, sans borg ni attente : avant, borg info échouait sur le verrou du dépôt
         (« Failed to create/acquire the lock », ligne ERREUR, code 2, aucun historique). Toute erreur de lecture : None (revue 2 :
-        SchemaVersionError & co restent signalées par la suite du Report, dans le try du nick)."""
+        SchemaVersionError & co restent signalées par la suite du Report, dans le try du nick).
+        1.0.196 (story 74, D172) : L1 — chaque marqueur vivant est rapproché de SA ligne (bkp_status_open de son run_id, délai lu une
+        fois) : le plus récent (début, puis date du marqueur) des Bkp vivants — en cours, sans suivi ou en attente de l'Index
+        (marqueur sans ligne, début = date du marqueur) — est rendu, quelle que soit la ligne ouverte la plus récente du nick
+        (avant : seule celle-ci était comparée aux marqueurs — un Bkp vivant derrière la ligne restée ouverte d'un Bkp tué plus
+        récent n'était plus vu, Report interrogeait borg) ; ligne périmée ou close : ce run ne compte pas. L2 — trace « sans
+        suivi » du run (backup() : store_bkp_status_start en échec) : Bkp en cours, 'sans_suivi' True, début = date du marqueur,
+        base non lue pour ce run (« Bkp en cours depuis … (suivi bkp_status indisponible) ») ; jamais soumis au délai
+        bkp_status_timeout (sans ligne, aucun bkp_stale possible : son marqueur vivant prouve le processus) ; 'sans_suivi' False
+        sinon. Sans marqueur vivant : aucune lecture de plus."""
         from datetime import datetime,timezone
         try:
             marks=self.db.bkp_markers(nick)
@@ -9470,16 +9513,28 @@ class BorgHelper:
                 if not row or row.get('stale'): return None
                 st=datetime.strptime(row['started_at'],"%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
                 row['en_attente']=False; row['orphelin']=True
-            elif (row:=self.db.get_running_bkp_status(nick,timeout_s=self.bkp_status_timeout(nick))) and row['run_id'] in marks:
-                if row.get('stale'): return None
-                st=datetime.strptime(row['started_at'],"%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc); row['en_attente']=False
             else:
-                wait=[r for r in marks if not self.db.bkp_status_known(nick,r)]
-                if not wait: return None
-                rid=max(wait,key=marks.get)
-                st=datetime.fromtimestamp(int(marks[rid]),timezone.utc)
-                row={'run_id':rid,'started_at':st.strftime("%Y-%m-%d %H:%M:%S"),'stale':False,'en_attente':True}
-            row.setdefault('orphelin',False)
+                # 1.0.196 (story 74, D172 L1) : chaque marqueur vivant rapproché de SA ligne (bkp_status_open) — avant, seule la ligne
+                # ouverte la plus récente du nick était comparée aux marqueurs : un Bkp vivant plus ancien que la ligne restée ouverte
+                # d'un Bkp tué n'était plus vu. Candidats : Bkp en cours (ligne ouverte non périmée), sans suivi (L2 : trace, début =
+                # date du marqueur, base non lue ; jamais soumis au délai — revue 2 : sans ligne, pas de bkp_stale, le Bkp disparaîtrait
+                # de Status et de /access alors que son marqueur vivant prouve le processus), en attente de l'Index (marqueur sans
+                # ligne) ; ligne périmée ou close : ce run ne compte pas. Rendu : le plus récent des candidats (début,
+                # puis date du marqueur) — revue : un Bkp en attente plus récent l'emporte sur un Bkp en cours plus ancien.
+                def at_mark(rid): return datetime.fromtimestamp(int(marks[rid]),timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                timeout_s=self.bkp_status_timeout(nick); cands=[]
+                for rid in marks:
+                    if self.db.bkp_untracked(nick,rid):
+                        cands.append({'run_id':rid,'started_at':at_mark(rid),'stale':False,'en_attente':False,'sans_suivi':True}); continue
+                    r=self.db.bkp_status_open(nick,rid,timeout_s=timeout_s)
+                    if r:
+                        if not r['stale']: r['en_attente']=False; cands.append(r)
+                    elif not self.db.bkp_status_known(nick,rid):
+                        cands.append({'run_id':rid,'started_at':at_mark(rid),'stale':False,'en_attente':True})
+                if not cands: return None
+                row=max(cands,key=lambda r:(r['started_at'],marks[r['run_id']]))
+                st=datetime.strptime(row['started_at'],"%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            row.setdefault('orphelin',False); row.setdefault('sans_suivi',False)
         except Exception:
             if strict: raise   # 1.0.186 (story 55) : Status distingue « lecture impossible » de « rien de vivant »
             return None
@@ -9489,7 +9544,7 @@ class BorgHelper:
         if not quiet:
             what=("Bkp interrompu (borgHelper arrêté), borg create encore actif" if row['orphelin'] else
                   "Bkp en attente de l'Index" if row['en_attente'] else "Bkp en cours")
-            printer(f"  {nick} : {what} depuis {row['depuis']} — rapport tiré de la base, borg non interrogé")
+            printer(f"  {nick} : {what} depuis {row['depuis']}{_BKP_UNTRACKED_TXT if row['sans_suivi'] else ''} — rapport tiré de la base, borg non interrogé")
         return row
 
     def _bkp_neighbor(self,nick):
@@ -9509,7 +9564,7 @@ class BorgHelper:
             if lv:
                 lv['voisin']=o
                 what=f"Bkp de {o} interrompu, borg create encore actif" if lv['orphelin'] else f"Bkp de {o} en cours"   # 1.0.184
-                printer(f"  {nick} : {what} sur le même dépôt depuis {lv['depuis']} — rapport tiré de la base, borg non interrogé")
+                printer(f"  {nick} : {what} sur le même dépôt depuis {lv['depuis']}{_BKP_UNTRACKED_TXT if lv['sans_suivi'] else ''} — rapport tiré de la base, borg non interrogé")
                 return lv
         return None
 
@@ -9525,19 +9580,21 @@ class BorgHelper:
         cur=row.get('reste')
         if live.get('voisin'):
             what=f"Bkp de {live['voisin']} interrompu, borg create encore actif" if live.get('orphelin') else f"Bkp de {live['voisin']} en cours"
-            mention=f"⏳ {what} sur le dépôt depuis {live['depuis']}"
+            ss=bool(live.get('sans_suivi'))   # 1.0.196 (story 74, Q1)
+            mention=f"⏳ {what} sur le dépôt depuis {live['depuis']}"+(_BKP_UNTRACKED_TXT if ss else '')
             row['reste']=f"{cur} — {mention}" if cur not in (None,'') else mention
             if as_json: row['bkp_voisin']={'nick':live['voisin'],'started_at':live['started_iso'],'depuis':live['depuis'],'en_attente':live['en_attente'],
-                                           'orphelin':bool(live.get('orphelin'))}
+                                           'orphelin':bool(live.get('orphelin')),'sans_suivi':ss}
             return 0
-        prev=self.db.previous_bkp_status(nick,None if live['en_attente'] else live['run_id'])
+        ss=bool(live.get('sans_suivi'))   # 1.0.196 (story 74, Q1) : pas de ligne pour ce run -> précédent = dernière ligne du nick
+        prev=self.db.previous_bkp_status(nick,None if live['en_attente'] or ss else live['run_id'])
         failed=bool(prev and prev['failed'])
         orph=bool(live.get('orphelin'))   # 1.0.184 (story 52) : Bkp interrompu, borg encore actif -> alerte (décision de l'utilisateur)
         what="Bkp interrompu, borg create encore actif" if orph else "Bkp en attente de l'Index" if live['en_attente'] else "Bkp en cours"
-        mention=f"⏳ {what} depuis {live['depuis']}"+(" — Bkp précédent en erreur" if failed else '')
+        mention=f"⏳ {what} depuis {live['depuis']}"+(_BKP_UNTRACKED_TXT if ss else '')+(" — Bkp précédent en erreur" if failed else '')
         row['reste']=f"{cur} — {mention}" if cur not in (None,'') else mention
         if as_json: row['bkp_en_cours']={'started_at':live['started_iso'],'depuis':live['depuis'],'precedent_en_erreur':failed,'en_attente':live['en_attente'],
-                                         'orphelin':orph}
+                                         'orphelin':orph,'sans_suivi':ss}
         if not (failed or orph): return 0
         if htrep:
             if nick not in errhost: errhost.append(nick)
@@ -12865,7 +12922,7 @@ def codec_selftest(pattern=None,list_only=False):
                 _fake_external_lock('qstbkp')  # cohérent : le Bkp lui-même tient ce lock
                 with open(f"{bhq.db._bkp_marker_base('qstbkp')}.{RS}",'w') as f: f.write(str(os.getppid()))   # 1.0.186 : Bkp vivant = marqueur vivant
                 st_bkp=bhq._status_one('qstbkp',bkp_live=True)
-                bkp_ok=(st_bkp['bkp_running']=={'started_at':st_bkp['bkp_running']['started_at'],'en_attente':False,'orphelin':False}
+                bkp_ok=(st_bkp['bkp_running']=={'started_at':st_bkp['bkp_running']['started_at'],'en_attente':False,'orphelin':False,'sans_suivi':False}
                         and st_bkp['bkp_running']['started_at'] is not None and st_bkp['priority_op_running'] is True
                         and st_bkp['bkp_interrupted'] is None)
                 os.unlink(bhq.db._priority_lock_path('qstbkp'))   # faux verrou externe : jamais retiré par clear (1.0.145)
@@ -13094,15 +13151,15 @@ def codec_selftest(pattern=None,list_only=False):
                     return st,o.getvalue()
                 INT=r"Bkp interrompu depuis \d\d:\d\d \(\dh\d\dmin\) — aucun processus ; fermé au prochain Index si son archive existe"
                 st,t=one('st1')
-                res['st1 vivant : en cours, drapeaux faux, opération prioritaire cachée']=(st['bkp_running']=={'started_at':sql_start('st1'),'en_attente':False,'orphelin':False}
+                res['st1 vivant : en cours, drapeaux faux, opération prioritaire cachée']=(st['bkp_running']=={'started_at':sql_start('st1'),'en_attente':False,'orphelin':False,'sans_suivi':False}
                     and st['bkp_interrupted'] is None and 'Bkp en cours depuis ' in t and 'Opération prioritaire' not in t,st,t)
                 st,t=one('st2')
                 mt=datetime.fromtimestamp(int(os.path.getmtime(f"{b.db._bkp_marker_base('st2')}.{RUN('st2')}")),timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 res['st2 marqueur sans ligne : en attente de l\'Index, date du marqueur, opération prioritaire cachée']=(
-                    st['bkp_running']=={'started_at':mt,'en_attente':True,'orphelin':False} and "Bkp en attente de l'Index depuis " in t
+                    st['bkp_running']=={'started_at':mt,'en_attente':True,'orphelin':False,'sans_suivi':False} and "Bkp en attente de l'Index depuis " in t
                     and 'Bkp en cours' not in t and 'Opération prioritaire' not in t,st,t,mt)
                 st,t=one('st3')
-                res['st3 orphelin : interrompu, borg create encore actif ; opération prioritaire dite']=(st['bkp_running']=={'started_at':sql_start('st3'),'en_attente':False,'orphelin':True}
+                res['st3 orphelin : interrompu, borg create encore actif ; opération prioritaire dite']=(st['bkp_running']=={'started_at':sql_start('st3'),'en_attente':False,'orphelin':True,'sans_suivi':False}
                     and st['bkp_interrupted'] is None and 'Bkp interrompu (borgHelper arrêté), borg create encore actif depuis ' in t
                     and 'Bkp en cours' not in t and 'Opération prioritaire en cours (Restore, Prune ou DelBkp)' in t,st,t)
                 for n,why in (('st4','ni marqueur ni orphelin'),('st5','marqueur mort')):
@@ -13157,6 +13214,228 @@ def codec_selftest(pattern=None,list_only=False):
             if bad: print(f"  {bad}")
             return not bad
         check("Status aligné sur Report : en cours, en attente de l'Index, orphelin, interrompu sans processus, périmé (1.0.186)",_status_aligne_report)
+        def _bkp_live_l1_l2():
+            """1.0.196 (story 74, D172, décision Q1 de l'utilisateur) — matrice de _bkp_live, jouée sur report, report_offline (jumelles)
+            et Status (_status_one + _status_print_one) ; borg piégé (boex lève « borg appelé »). Marqueurs vivants au PID du parent
+            (vivant, autre processus), mort au-delà de pid_max. ma L1 : A vivant (ligne ouverte, -1 h) + B tué plus récent (ligne
+            ouverte, sans marqueur) -> Report : en cours depuis A, base ; Status : en cours depuis A ET B interrompu. mt témoin : A
+            seul -> en cours depuis A. m2 deux marqueurs vivants (A -1 h, B maintenant, lignes ouvertes) -> B. ml L2 : marqueur vivant
+            + trace « sans suivi », aucune ligne -> « Bkp en cours depuis … (suivi bkp_status indisponible) », sans_suivi true, début
+            = date du marqueur (40 s avant) ; mx idem, history.db illisible -> idem (base non lue pour ce run) ; mxt témoin : history.db
+            illisible SANS trace -> Status : rien, bkp_unknown ; Report : borg. md marqueur mort + trace -> borg, marqueur et trace
+            retirés ; mo trace sans marqueur -> retirée ; mc marqueur vivant, ligne close -> rien (borg). mw marqueur sans ligne -> en
+            attente de l'Index (inchangé). Sans marqueur vivant : ni bkp_untracked, ni bkp_status_open/known, ni get_running lus par
+            _bkp_live. backup() (borg simulé, store_bkp_status_start en échec) : trace posée pendant create, retirée avec le marqueur."""
+            from datetime import datetime,timezone
+            d=os.path.join(tmp,'s74'); shutil.rmtree(d,ignore_errors=True); os.makedirs(d); rc=os.path.join(d,'rc')
+            nk=('ma','mt','m2','ml','mx','mxt','md','mo','mc','mw','mb','mb2','mi','mss','mwn','mva','mvb','mvc','mvd','mpe','mst','mst2')
+            same={'mvb':'mva','mvd':'mvc'}   # revue : voisins du même dépôt
+            for n in nk:
+                if n not in same: os.makedirs(os.path.join(d,'r-'+n))
+            extra={'mss':"BKP_STATUS_TIMEOUT=30\n"}   # délai court : marqueur plus vieux que le délai, PID jamais « repris » (< 60 s)
+            mss_lock=None
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nBORG_PASSPHRASE=pw\nSER_NAME=h\nSER_LOGIN=x\nGLOB_ARCH=*\n"
+                        f"BORG_ARCHNAME=t\nEXCLUDE=--exclude-caches\nDB_ENCRYPT=false\nMAX_AGE_BKP=1000000\n\n"
+                        +''.join(f"[{n}]\nBORG_REPO={os.path.join(d,'r-'+same.get(n,n))}\n"+extra.get(n,'')+"\n" for n in nk))
+            os.chmod(rc,0o600)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            RUN=lambda n,k: f"{n}{k}".encode().hex().ljust(32,'0')[:32]
+            LIVE=os.getppid(); DEAD=4194305   # au-delà de pid_max (2**22) : jamais un processus vivant
+            recent=(datetime.now()).strftime('%Y-%m-%dT%H:%M:%S.000000')
+            res={}; orig=b.borg.boex
+            def mpath(n,k): return f"{b.db._bkp_marker_base(n)}.{RUN(n,k)}"
+            def mark(n,k,pid):
+                with open(mpath(n,k),'w') as f: f.write(str(pid))
+            def sql_start(n,k):
+                return sqlite3.connect(b.db.get_history_db(n)).execute("SELECT started_at FROM bkp_status WHERE nick=? AND run_id=?",(n,RUN(n,k))).fetchone()[0]
+            try:
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                    for n in nk:
+                        p=b.db.get_diff_db(n); b.db.ensure_diff_db(p)
+                        c=sqlite3.connect(p,isolation_level=None)
+                        c.execute("INSERT INTO archive_stats(nick,archive,archive_date,duration,original_size,compressed_size,"
+                                  "deduplicated_size,nfiles) VALUES(?,?,?,?,?,?,?,?)",(n,f'{n}-a1',recent,60,10,10,10,1)); c.close()
+                        h=b.db.get_history_db(n); b.db.ensure_history_db(h)
+                        if n in ('ma','mt','m2','mc','mi','mwn','mvc','mpe','mst','mst2'): b.db.store_bkp_status_start(n,RUN(n,1),db_path=h)
+                        if n in ('ma','m2','mst2'): b.db.store_bkp_status_start(n,RUN(n,2),db_path=h)
+                        if n in ('mc','mpe'): b.db.store_bkp_status_finish(n,RUN(n,1),'success' if n=='mc' else 'error',db_path=h)
+                        c=sqlite3.connect(h,isolation_level=None)
+                        c.execute("UPDATE bkp_status SET started_at=datetime('now',?) WHERE nick=? AND run_id=?",
+                                  ('-7 hours' if n in ('mst','mst2') else '-1 hour',n,RUN(n,1))); c.close()
+                    for n in ('mx','mxt'):
+                        h=b.db.get_history_db(n); raw=open(h,'rb').read()
+                        with open(h,'wb') as f: f.write(raw[:100]+b'\x5a'*max(len(raw)-100,4096))   # pages illisibles
+                for n in ('ma','mt','m2','ml','mx','mxt','mc','mw','mi','mss','mwn','mva','mvc','mst','mst2'): mark(n,1,LIVE)
+                for n in ('m2','mi','mwn','mst','mst2','mpe'): mark(n,2,LIVE)
+                mark('md',1,DEAD)
+                for n in ('ml','mx','md','mo','mss','mva'): b.db.set_bkp_untracked(n,RUN(n,1))
+                for n in ('mi','mpe'): b.db.set_bkp_untracked(n,RUN(n,2))
+                m40=time.time()-40; m45=time.time()-45
+                for n,k in (('ml',1),('mx',1),('mva',1),('mpe',2)): os.utime(mpath(n,k),(m40,m40))   # début = date du marqueur (< 60 s : PID repris sinon)
+                os.utime(mpath('mss',1),(m45,m45))   # plus vieux que BKP_STATUS_TIMEOUT=30
+                mss_lock=b.db._priority_holder_path('mss',LIVE)   # verrou prioritaire tenu (le Bkp lui-même) : jamais « Restore, Prune ou DelBkp »
+                with open(mss_lock,'w') as f: f.write(str(LIVE))
+                mdate=datetime.fromtimestamp(int(m40),timezone.utc)
+                b.borg.boex=lambda *a,**k: (_ for _ in ()).throw(RuntimeError('borg appelé'))
+                def run(fn,*a,**k):
+                    o,e=io.StringIO(),io.StringIO()
+                    with contextlib.redirect_stdout(o),contextlib.redirect_stderr(e):
+                        try: code=fn(*a,**k)
+                        except (Exception,SystemExit) as x: code=f"{type(x).__name__}: {x}"
+                    return code,o.getvalue(),e.getvalue()
+                def row(o,n):
+                    try: return (json.loads(o).get('summary') or {}).get(n) or {}
+                    except ValueError: return {}
+                def one(n):
+                    o=io.StringIO()
+                    with contextlib.redirect_stdout(o),contextlib.redirect_stderr(o):
+                        st=b._status_one(n,bkp_live=True); b._status_print_one(st)
+                    return st,o.getvalue()
+                iso=lambda t: t.replace(' ','T')+'Z'
+                SS=" (suivi bkp_status indisponible)"
+                INT=r"Bkp interrompu depuis \d\d:\d\d \(\dh\d\dmin\) — aucun processus ; fermé au prochain Index si son archive existe"
+                for fn,F in ((b.report,'Report'),(b.report_offline,'Report -o')):
+                    for n,k in (('ma',1),('mt',1),('m2',2)):
+                        code,o,e=run(fn,n,as_json=True); r=row(o,n); bk=r.get('bkp_en_cours') or {}
+                        res[f'{F} {n} : en cours depuis le run {k}, base, 0']=(code==0 and '⏳ Bkp en cours depuis' in r.get('reste','') and SS not in r.get('reste','')
+                            and bk.get('started_at')==iso(sql_start(n,k)) and bk.get('en_attente') is False and bk.get('sans_suivi') is False
+                            and f'{n} : Bkp en cours depuis' in e and 'borg appelé' not in o+e,code,r,e[-300:])
+                    for n in ('ml','mx'):
+                        code,o,e=run(fn,n,as_json=True); r=row(o,n); bk=r.get('bkp_en_cours') or {}
+                        res[f'{F} {n} L2 : en cours (suivi bkp_status indisponible), sans_suivi, date du marqueur']=(
+                            f"⏳ Bkp en cours depuis {bk.get('depuis')}{SS}" in r.get('reste','') and bk.get('sans_suivi') is True
+                            and bk.get('en_attente') is False and bk.get('started_at')==mdate.strftime('%Y-%m-%dT%H:%M:%SZ')
+                            and f"{n} : Bkp en cours depuis {bk.get('depuis')}{SS} — rapport tiré de la base" in e and 'borg appelé' not in o+e
+                            and "en attente de l'Index" not in r.get('reste',''),code,r,e[-300:])
+                    for n,why in (('mxt','base illisible sans trace'),('md','marqueur mort + trace'),('mc','marqueur vivant, ligne close')):
+                        code,o,e=run(fn,n,as_json=True); r=row(o,n)
+                        ok=(code==2 and 'borg appelé' in r.get('reste','')) if fn==b.report else r.get('nom') in (n,f'***{n}',f'*** {n}')
+                        res[f'{F} {n} {why} : comme avant (aucun Bkp vivant)']=(ok and '⏳' not in r.get('reste','') and 'bkp_en_cours' not in r
+                            and 'Bkp en cours' not in e,code,r,e[-300:])
+                    code,o,e=run(fn,'mw',as_json=True); r=row(o,'mw'); bk=r.get('bkp_en_cours') or {}
+                    res[f'{F} mw en attente de l\'Index : inchangé']=(code==0 and "⏳ Bkp en attente de l'Index depuis" in r.get('reste','') and SS not in r.get('reste','')
+                        and bk.get('en_attente') is True and bk.get('sans_suivi') is False,code,r)
+                    code,o,e=run(fn,'ml')
+                    res[f'{F} ml texte : mention (suivi bkp_status indisponible)']=(code==0 and re.search(r"⏳ Bkp en cours depuis \d\d:\d\d \(\dh\d\dmin\) \(suivi bkp_status indisponible\)",o),code,o[-300:])
+                    # revue story 74 : voisins (a), précédent en erreur (b), lignes périmées (c), plus récent des candidats, délai du sans suivi
+                    code,o,e=run(fn,'mvb',as_json=True); r=row(o,'mvb'); bv=r.get('bkp_voisin') or {}
+                    res[f'{F} mvb voisin d\'un Bkp sans suivi : sans_suivi, mention, stderr']=(code==0 and bv.get('nick')=='mva' and bv.get('sans_suivi') is True
+                        and r.get('reste','').endswith(f" — ⏳ Bkp de mva en cours sur le dépôt depuis {bv.get('depuis')}{SS}")
+                        and f"mvb : Bkp de mva en cours sur le même dépôt depuis {bv.get('depuis')}{SS} — rapport tiré de la base" in e
+                        and 'borg appelé' not in o+e,code,r,e[-300:])
+                    code,o,e=run(fn,'mvd',as_json=True); r=row(o,'mvd'); bv=r.get('bkp_voisin') or {}
+                    res[f'{F} mvd voisin d\'un Bkp suivi : sans_suivi false']=(code==0 and bv.get('nick')=='mvc' and bv.get('sans_suivi') is False
+                        and SS not in r.get('reste','') and SS not in e,code,r,e[-300:])
+                    code,o,e=run(fn,'mpe',as_json=True); r=row(o,'mpe'); bk=r.get('bkp_en_cours') or {}
+                    res[f'{F} mpe sans suivi, précédent en erreur : 1, ***, mention']=(code==1 and r.get('nom')=='***mpe'
+                        and r.get('reste','').endswith(f"{SS} — Bkp précédent en erreur") and bk.get('precedent_en_erreur') is True
+                        and bk.get('sans_suivi') is True,code,r)
+                    for n,k,att in (('mst',2,True),('mst2',2,False),('mwn',2,True),('mi',2,False)):
+                        code,o,e=run(fn,n,as_json=True); r=row(o,n); bk=r.get('bkp_en_cours') or {}
+                        st_k=sql_start(n,k) if not att and n!='mi' else datetime.fromtimestamp(int(os.path.getmtime(mpath(n,k))),timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                        res[f'{F} {n} : le run {k} rendu (en attente {att})']=(code==0 and bk.get('en_attente') is att and bk.get('started_at')==iso(st_k)
+                            and 'borg appelé' not in o+e,code,r,st_k)
+                    code,o,e=run(fn,'mss',as_json=True); r=row(o,'mss'); bk=r.get('bkp_en_cours') or {}
+                    res[f'{F} mss sans suivi plus vieux que BKP_STATUS_TIMEOUT : toujours en cours (jamais soumis au délai)']=(code==0
+                        and f"⏳ Bkp en cours depuis {bk.get('depuis')}{SS}" in r.get('reste','') and bk.get('sans_suivi') is True
+                        and 'borg appelé' not in o+e,code,r,e[-300:])
+                res['md : marqueur mort et trace retirés']=(not os.path.exists(mpath('md',1)) and not os.path.exists(b.db._bkp_untracked_path('md',RUN('md',1))),)
+                b.db.bkp_markers('mo')
+                res['mo : trace sans marqueur retirée']=(not os.path.exists(b.db._bkp_untracked_path('mo',RUN('mo',1))),)
+                res['ml : trace et marqueur vivant gardés']=(os.path.exists(mpath('ml',1)) and b.db.bkp_untracked('ml',RUN('ml',1)),)
+                RS=lambda n,k,att=False,ss=False: {'started_at':sql_start(n,k) if k else mdate.strftime("%Y-%m-%d %H:%M:%S"),'en_attente':att,'orphelin':False,'sans_suivi':ss}
+                st,t=one('ma')
+                res['Status ma L1 : A en cours, B interrompu']=(st['bkp_running']==RS('ma',1) and st['bkp_interrupted']=={'started_at':sql_start('ma',2),'verifie':True}
+                    and 'Bkp en cours depuis ' in t and re.search(INT,t) and SS not in t,st,t)
+                st,t=one('mt')
+                res['Status mt témoin : A en cours, rien d\'interrompu']=(st['bkp_running']==RS('mt',1) and st['bkp_interrupted'] is None and 'Bkp en cours depuis ' in t,st,t)
+                st,t=one('m2')
+                res['Status m2 deux marqueurs vivants : B']=(st['bkp_running']==RS('m2',2) and st['bkp_interrupted'] is None,st,t)
+                for n in ('ml','mx'):
+                    st,t=one(n)
+                    res[f'Status {n} L2 : en cours (suivi bkp_status indisponible), sans_suivi']=(st['bkp_running']==RS(n,None,ss=True)
+                        and st['bkp_interrupted'] is None and re.search(r"  Bkp en cours depuis \d\d:\d\d \(\dh\d\dmin\) \(suivi bkp_status indisponible\)\n",t)
+                        and "en attente" not in t,st,t)
+                st,t=one('mi')
+                res['Status mi : Bkp sans suivi rendu, ligne d\'un run au marqueur vivant jamais « interrompu »']=((st['bkp_running'] or {}).get('sans_suivi') is True
+                    and st['bkp_interrupted'] is None and st['bkp_stale'] is None and 'interrompu' not in t,st,t)
+                st,t=one('mwn')
+                res['Status mwn : en attente plus récent l\'emporte, en cours plus ancien ni dit ni interrompu']=((st['bkp_running'] or {}).get('en_attente') is True
+                    and st['bkp_interrupted'] is None and "Bkp en attente de l'Index depuis " in t,st,t)
+                for n,att in (('mst',True),('mst2',False)):
+                    st,t=one(n)
+                    res[f'Status {n} : ligne périmée d\'un marqueur vivant, l\'autre Bkp rendu']=((st['bkp_running'] or {}).get('en_attente') is att
+                        and st['bkp_interrupted'] is None,st,t)
+                st,t=one('mss')
+                res['Status mss sans suivi au-delà du délai, verrou prioritaire tenu : en cours, aucune « opération prioritaire »']=(
+                    (st['bkp_running'] or {}).get('sans_suivi') is True and st['priority_op_running'] is True and st['bkp_stale'] is None
+                    and re.search(r"  Bkp en cours depuis \d\d:\d\d \(\dh\d\dmin\) \(suivi bkp_status indisponible\)\n",t)
+                    and 'Opération prioritaire' not in t,st,t)
+                st,t=one('mxt'); bs=b.bkp_state('mxt')
+                res['Status mxt témoin illisible sans trace : rien, bkp_unknown']=(st['bkp_running'] is None and st['bkp_interrupted'] is None
+                    and bs['bkp_unknown'] is True and 'Bkp en cours' not in t,st,t,bs)
+                for n in ('md','mc'):
+                    st,t=one(n)
+                    res[f'Status {n} : rien']=(st['bkp_running'] is None and st['bkp_interrupted'] is None and 'Bkp' not in t,st,t)
+                st,t=one('mw')
+                res['Status mw en attente : inchangé']=(st['bkp_running']=={'started_at':st['bkp_running']['started_at'],'en_attente':True,'orphelin':False,'sans_suivi':False}
+                    and "Bkp en attente de l'Index depuis " in t and SS not in t,st,t) if st['bkp_running'] else (False,st,t)
+                calls=[]
+                spy=lambda name: (lambda *a,**k: calls.append(name))
+                mark('md',1,DEAD); b.db.set_bkp_untracked('md',RUN('md',1)); b.db.set_bkp_untracked('mo',RUN('mo',1))   # revue 2 : recréés
+                spied=(mpath('md',1),b.db._bkp_untracked_path('md',RUN('md',1)),b.db._bkp_untracked_path('mo',RUN('mo',1)))
+                before=[os.path.exists(x) for x in spied]
+                with mock.patch.object(b.db,'bkp_untracked',spy('untracked')),mock.patch.object(b.db,'bkp_status_open',spy('open')),\
+                        mock.patch.object(b.db,'bkp_status_known',spy('known')),mock.patch.object(b.db,'get_running_bkp_status',spy('running')):
+                    lv=[b._bkp_live(n,quiet=True) for n in ('md','mo')]
+                    with mock.patch.object(b.db,'bkp_markers',lambda nick: {}): lv.append(b._bkp_live('ma',quiet=True))
+                after=[os.path.exists(x) for x in spied]
+                res['sans marqueur vivant : aucune lecture de plus (md marqueur mort + trace, mo trace seule : présents avant, retirés après)']=(
+                    lv==[None,None,None] and calls==[] and before==[True]*3 and after==[False]*3,lv,calls,before,after)
+                # backup() réel, borg simulé : store_bkp_status_start en échec -> trace posée avant create, retirée avec le marqueur
+                obs={}
+                def fake_boex(nick,cmd,**kw):
+                    if cmd and cmd[0]=='create':
+                        rid=next((x.rsplit('.',1)[1] for x in glob.glob(glob.escape(b.db._bkp_marker_base(nick))+'.*') if re.search(r'\.[0-9a-f]{32}$',x)),None)
+                        obs['create']=(rid is not None and b.db.bkp_untracked(nick,rid),b.db.bkp_status_known(nick,rid) if rid else None)
+                        return {'exitcode':0,'stdout':[{'archive':{'name':f'{nick}-a2','start':'2026-10-01T10:00:00.000000','duration':1,
+                                'stats':{'original_size':1,'compressed_size':1,'deduplicated_size':1,'nfiles':1}},'cache':{'stats':{}}}],'stderr':[]}
+                    return {'exitcode':0,'stdout':[{}],'stderr':[]}
+                o=io.StringIO()
+                with mock.patch.object(b.borg,'boex',fake_boex),mock.patch.object(b.db,'wait_index_idle',lambda *a,**k: None),\
+                        mock.patch.object(b.db,'store_bkp_status_start',lambda *a,**k: False),contextlib.redirect_stdout(o),contextlib.redirect_stderr(o):
+                    try: b.backup('mb',no_index=True)
+                    except (Exception,SystemExit): pass
+                left=glob.glob(glob.escape(b.db._bkp_marker_base('mb'))+'.*')
+                res['backup() store_bkp_status_start en échec : trace pendant create, [WARN], tout retiré à la fin']=(obs.get('create')==(True,False)
+                    and '[WARN] store_bkp_status_start a échoué pour mb' in o.getvalue() and left==[],obs,left,o.getvalue()[-300:])
+                obs.clear(); o=io.StringIO()   # revue : trace non écrite (_set_pid_lock avale OSError) -> [WARN], jamais muet
+                with mock.patch.object(b.borg,'boex',fake_boex),mock.patch.object(b.db,'wait_index_idle',lambda *a,**k: None),\
+                        mock.patch.object(b.db,'store_bkp_status_start',lambda *a,**k: False),mock.patch.object(b.db,'set_bkp_untracked',lambda *a,**k: None),\
+                        contextlib.redirect_stdout(o),contextlib.redirect_stderr(o):
+                    try: b.backup('mb2',no_index=True)
+                    except (Exception,SystemExit): pass
+                res['backup() trace non écrite : [WARN] « trace sans-suivi non écrite »']=(obs.get('create')==(False,False)
+                    and '[WARN] mb2: trace sans-suivi non écrite' in o.getvalue(),obs,o.getvalue()[-300:])
+                o=io.StringIO()
+                with mock.patch.object(b.borg,'boex',fake_boex),mock.patch.object(b.db,'wait_index_idle',lambda *a,**k: None),\
+                        contextlib.redirect_stdout(o),contextlib.redirect_stderr(o):
+                    try: b.backup('mb2',no_index=True)
+                    except (Exception,SystemExit): pass
+                res['backup() témoin, ligne écrite : ni trace ni [WARN]']=(obs.get('create')==(False,True) and 'trace sans-suivi' not in o.getvalue()
+                    and 'store_bkp_status_start a échoué' not in o.getvalue(),obs,o.getvalue()[-300:])
+            finally:
+                b.borg.boex=orig
+                if mss_lock:
+                    with contextlib.suppress(OSError): os.unlink(mss_lock)
+                for n in nk:
+                    for p in glob.glob(glob.escape(b.db._bkp_marker_base(n))+'.*'):
+                        with contextlib.suppress(OSError): os.unlink(p)
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("Bkp vivant : chaque marqueur rapproché de sa ligne (L1), suivi bkp_status indisponible (L2) — Report, Report -o, Status (1.0.196)",_bkp_live_l1_l2)
         # ── Sentry before_send/_sentry_scrub (AD-15) — sans ce contrôle, une régression ici fuiterait
         # des passphrases/DEK/chemins vers Sentry avec l'ensemble des autres contrôles toujours au vert.
         def _sentry_scrub_ok():
@@ -20562,6 +20841,91 @@ fail()
                              f"texte {'— (rapprochée)' in ot}/{'— (rapprochée)' in otl} ; HTML {'(rapprochée)' in oh} ; ArchiveHistory {ah} ; Status {os_[-250:]!r} ; -j {lb} ; Bkp {eb[-200:]!r}")
             return ok
         _rbc("archive rapprochée sur vrai borg : Status « inconnue (Bkp interrompu, archive rapprochée) », Report « — (rapprochée) », reconciled (1.0.187)",_reconciled_real_borg)
+        def _untracked_real_borg():
+            """1.0.196 (story 74, D172 L2, décision Q1 de l'utilisateur) : vrai borg, CLI. Nick bu : un Bkp normal (archive indexée),
+            puis un déclencheur SQLite qui refuse tout INSERT dans bkp_status (IntegrityError, attrapée par store_bkp_status_start
+            comme toute erreur SQLite -> False) et un Bkp -I dont le borg create est retenu par le wrapper (porte : fichier, 120 s au
+            plus). Pendant ce Bkp : trace « sans suivi » à côté du marqueur ; Status « Bkp en cours depuis … (suivi bkp_status
+            indisponible) », jamais « en attente » ; Status -j bkp_running {started_at = date du marqueur, en_attente false, orphelin
+            false, sans_suivi true} ; Report -o -j et Report -j (jumelle en ligne) : mention, bkp_en_cours.sans_suivi true, code 0,
+            borg non interrogé (stderr). Porte ouverte : Bkp fini (code 0, [WARN] store_bkp_status_start a échoué), marqueur et trace
+            retirés -> Status et Report -o : plus rien sur le Bkp."""
+            from datetime import datetime,timezone
+            borg=shutil.which('borg'); me=os.path.realpath(__file__)
+            d=os.path.join(tmp,'s74-real'); bb=os.path.join(d,'bb'); src=os.path.join(d,'src'); os.makedirs(src)
+            with open(os.path.join(src,'f'),'w') as f: f.write('x')
+            fq=socket.getfqdn(); rc=os.path.join(d,'rc'); cache=os.path.join(d,'cache'); w=os.path.join(d,'borgw'); repo=os.path.join(d,'repo-bu')
+            gate=os.path.join(d,'porte'); inside=os.path.join(d,'dans-create'); bout=os.path.join(d,'bkp.out')
+            _rb_wrapper(w,bb,mid=f'for x in "$@"; do if [ "$x" = create ]; then : >{shlex.quote(inside)}; n=0; '
+                                 f'while [ -e {shlex.quote(gate)} ] && [ $n -lt 1200 ]; do sleep 0.1; n=$((n+1)); done; break; fi; done\n')
+            env=_rb_env(bb,BORG_PASSPHRASE='pw-bu')
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={cache}\n\n[bu]\nBORG_REPO={repo}\nBORG_PASSPHRASE=pw-bu\nSER_NAME=bu\nSER_LOGIN=x\n"
+                        f"GLOB_ARCH={fq}-*\nBORG_ARCHNAME=bu\nBORG_ROOTBKP={src}\nEXCLUDE=--exclude-caches\nDB_ENCRYPT=false\n"
+                        f"BORG_EXE={w}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\nMAX_AGE_BKP=1000000\n")
+            os.chmod(rc,0o600); cenv=_rb_cli_env(bb)
+            def cli(*a):
+                p=_rb_run([me,'-C',rc,'-c',*a],300,env=cenv); return p.returncode,p.stdout,p.stderr
+            def js(o):
+                try: return json.loads(o)
+                except ValueError: return None
+            def rrow(o):
+                try: return js(o)['summary']['bu'] or {}
+                except (TypeError,KeyError): return {}
+            r=_rb_run([borg,'init','-e','repokey',repo],120,env=env)
+            if r.returncode!=0: print(f"  init : {r.stderr[-200:]}"); return False
+            c0,o0,e0=cli('Bkp','-n','bu')
+            if c0!=0: print(f"  Bkp initial : code {c0} {(o0+e0)[-300:]!r}"); return False
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                hb=BorgHelper(cfgfile=rc,cache_dir=cache); hist=hb.db.get_history_db('bu'); base=hb.db._bkp_marker_base('bu')
+            c=sqlite3.connect(hist,isolation_level=None)
+            c.execute("CREATE TRIGGER s74_refus BEFORE INSERT ON bkp_status BEGIN SELECT RAISE(ABORT,'refus (contrôle story 74)'); END"); c.close()
+            SS=" (suivi bkp_status indisponible)"; res={}; ps=None
+            with contextlib.suppress(OSError): os.unlink(inside)   # posé par le create du Bkp initial (porte absente : non retenu)
+            open(gate,'w').close()
+            try:
+                with open(bout,'w') as fo:
+                    ps=_rb_popen([me,'-C',rc,'-c','Bkp','-n','bu','-I'],stdout=fo,stderr=subprocess.STDOUT,stdin=subprocess.DEVNULL,env=cenv)
+                t0=time.monotonic()
+                while not os.path.exists(inside) and ps.poll() is None and time.monotonic()-t0<120: time.sleep(0.05)
+                if not os.path.exists(inside):
+                    print(f"  borg create jamais atteint : code {ps.poll()} {open(bout).read()[-400:]!r}"); return False
+                marks=[p for p in glob.glob(glob.escape(base)+'.*') if re.fullmatch(r'[0-9a-f]{32}',p[len(base)+1:])]
+                rid=marks[0][len(base)+1:] if len(marks)==1 else None
+                mdate=datetime.fromtimestamp(int(os.path.getmtime(marks[0])),timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if rid else None
+                res['pendant : un marqueur, sa trace, aucune ligne']=(rid is not None and os.path.exists(f"{base}.{rid}.sans-suivi")
+                    and sqlite3.connect(hist).execute("SELECT COUNT(*) FROM bkp_status WHERE run_id=?",(rid,)).fetchone()[0]==0,marks,sorted(os.listdir(cache)))
+                cs,os_,es=cli('Status','-n','bu'); ts=os_+es
+                res['pendant : Status texte']=(cs==0 and re.search(r"  Bkp en cours depuis \d\d:\d\d \(\dh\d\dmin\) \(suivi bkp_status indisponible\)\n",ts)
+                    and 'en attente' not in ts and 'interrompu' not in ts,cs,ts[-400:])
+                cj,oj,ej=cli('Status','-n','bu','-j'); sj=(js(oj) or [{}])[0]
+                res['pendant : Status -j sans_suivi']=(cj==0 and sj.get('bkp_running')=={'started_at':mdate,'en_attente':False,'orphelin':False,'sans_suivi':True}
+                    and sj.get('bkp_interrupted') is None,cj,sj,mdate)
+                for args,F in ((('-o','-j'),'Report -o -j'),(('-j',),'Report -j')):
+                    cr,orr,er=cli('Report','-n','bu',*args); rw=rrow(orr); bk=rw.get('bkp_en_cours') or {}
+                    res[f'pendant : {F}']=(cr==0 and f"⏳ Bkp en cours depuis {bk.get('depuis')}{SS}" in rw.get('reste','') and bk.get('sans_suivi') is True
+                        and bk.get('en_attente') is False and bk.get('started_at')==(mdate or '').replace(' ','T')+'Z'
+                        and 'rapport tiré de la base, borg non interrogé' in er,cr,rw,er[-300:])
+            finally:
+                with contextlib.suppress(OSError): os.unlink(gate)
+                if ps is not None:
+                    try: ps.wait(300)
+                    except subprocess.TimeoutExpired: pass
+                    _rb_killtree(ps)
+            bo=open(bout).read()
+            res['Bkp fini : code 0, [WARN]']=(ps.returncode==0 and '[WARN] store_bkp_status_start a échoué pour bu' in bo,ps.returncode,bo[-400:])
+            res['après : marqueur et trace retirés']=(glob.glob(glob.escape(base)+'.*')==[],glob.glob(glob.escape(base)+'.*'))
+            cs,os_,es=cli('Status','-n','bu'); ts=os_+es
+            cj,oj,ej=cli('Status','-n','bu','-j'); sj=(js(oj) or [{}])[0]
+            res['après : Status, plus rien']=(cs==0 and cj==0 and 'Bkp en cours' not in ts and 'Bkp interrompu' not in ts and 'attente' not in ts
+                and sj.get('bkp_running') is None and sj.get('bkp_interrupted') is None and sj.get('bkp_stale') is None,cs,cj,ts[-300:],sj)
+            cr,orr,er=cli('Report','-n','bu','-o','-j'); rw=rrow(orr)
+            res['après : Report -o, plus rien']=(cr==0 and rw!={} and 'bkp_en_cours' not in rw and '⏳' not in rw.get('reste','')
+                and 'Bkp en cours' not in er,cr,rw,er[-300:])
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        _rbc("Bkp réel sans ligne bkp_status (store_bkp_status_start en échec) : Status et Report « (suivi bkp_status indisponible) », sans_suivi ; fini : plus rien (1.0.196)",_untracked_real_borg)
         def _bver_real_ssh():
             """1.0.165 (story 28) : vrais Bkp vers des dépôts ssh://, faux ssh (BORG_RSH : retire l'hôte, lance la commande en
             local). BORG_REMOTE_PATH = wrapper du vrai borg serve : bs répond à --version « borg 9.9.9 » ; bx = vraie commande

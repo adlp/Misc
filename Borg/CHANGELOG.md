@@ -1,5 +1,47 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.196, borgHelperWWW 1.31.12 — Bkp vivant rapproché de sa ligne, Bkp sans ligne bkp_status dit en cours — 2026-10-13
+
+Chantier « reconstruction progressive », story 74 (report D172 ; décision de l'utilisateur Q1 = A). Deux limites de `_bkp_live`,
+la source de Report (en ligne et `-o`) et de Status (et, par `bkp_state`, de `/access` de borgHelperWWW).
+
+- L1 — Bkp vivant plus ancien masqué : seule la ligne `bkp_status` ouverte la plus récente du nick était comparée aux
+  marqueurs de Bkp. Un Bkp A vivant derrière la ligne restée ouverte d'un Bkp B tué plus récent (B lancé pendant l'Index de
+  fin de A, puis tué) n'était plus vu : Report et Report -o ne disaient aucun Bkp en cours (Report interrogeait borg, qui butait
+  sur le verrou du dépôt), Status disait seulement « Bkp interrompu ». Chaque marqueur vivant est désormais rapproché de SA
+  ligne (`bkp_status_open` de son run) ; le plus récent des Bkp vivants (en cours, sans suivi ou en attente de l'Index, par
+  date de début) est rendu ; ligne périmée ou close : ce run ne compte pas. Status : A « en cours », B « interrompu » (règle
+  existante : ligne d'un autre run) ; la ligne d'un run dont le marqueur vit n'est jamais « Bkp interrompu … — aucun
+  processus » (`bkp_interrupted` ; Bkp vivant moins récent que celui affiché ; avant : fausse alerte dans Status et
+  `/access`) — périmée, elle reste « Bkp sans fin … » (`bkp_stale`). Mesuré (CLI réelle, `work/s74/mesure74.sh`, bacs `base3`
+  avant / `apres1` après) : A vivant + B ouvert ->
+  avant, Status « Bkp interrompu … — aucun processus » seul et Report -o sans ligne de Bkp ; après, « Bkp en cours depuis » de A
+  dans les deux (et B interrompu dans Status) ; témoin A seul inchangé.
+- L2 — marqueur sans ligne : quand `store_bkp_status_start` échoue (`[WARN]`), `backup()` pose à côté de son marqueur une trace
+  `<marqueur>.sans-suivi` (le fichier PID reste intact) ; le Bkp est dit « ⏳ Bkp en cours depuis … (suivi bkp_status
+  indisponible) » (Report, stderr de Report, Status ; début = date du marqueur ; base non lue pour ce run, même illisible)
+  au lieu de « en attente de l'Index » pendant toute sa durée ; jamais soumis à `BKP_STATUS_TIMEOUT` (sans ligne, aucun
+  « Bkp sans fin » possible : passé le délai, Status nommerait « Restore, Prune ou DelBkp » le verrou prioritaire du Bkp et
+  `/access` le dirait fini pendant que borg tourne ; son marqueur vivant prouve le processus). JSON : `sans_suivi` (booléen) dans Status `bkp_running`, Report `bkp_en_cours` et
+  `bkp_voisin`. Trace retirée avec le marqueur (`clear_bkp_marker`, avant lui) et, marqueur mort ou absent, par `bkp_markers`.
+  Trace non écrite (`_set_pid_lock` avale l'erreur) : `[WARN] <nick>: trace sans-suivi non écrite`.
+- borgHelperWWW 1.31.12 : l'empreinte du cache de `/report?offline=true` compte aussi les traces `.sans-suivi`
+  (`_MARKER_RE`) — sinon « en attente de l'Index » restait en cache jusqu'à 5 min après leur apparition.
+- Inchangé : un seul Bkp (en cours, en attente de l'Index, orphelin, périmé, voisin), marqueur vivant à ligne close, lecture
+  impossible (règle actuelle, `strict` pour Status), aucune lecture de plus sans marqueur vivant, rapprochement des Bkp tués.
+  `/access` (code inchangé pour cet état) dit le Bkp `sans_suivi` « en cours » (`bkp_detail` `"en_cours"`) et le Bkp A de L1
+  en cours — si `history.db` est lisible ; sinon état inconnu (`bkp_running` null, garde `bkp_running_state`), comme avant.
+- CodecSelfTest : « Bkp vivant : chaque marqueur rapproché de sa ligne (L1), suivi bkp_status indisponible (L2) … » (matrice :
+  L1, témoin, deux marqueurs vivants, L2 et base illisible, témoin illisible sans trace, marqueur mort avec trace, trace sans
+  marqueur, marqueur vivant à ligne close, en attente ; Report, Report -o, Status ; aucune lecture sans marqueur ; `backup()`
+  borg simulé, trace non écrite ; revue : voisin d'un Bkp sans suivi, sans suivi derrière un précédent en erreur, lignes
+  périmées de marqueurs vivants, en attente plus récent qu'un en cours, sans suivi au-delà du délai toujours en cours (verrou
+  prioritaire tenu : aucune « opération prioritaire »), run au marqueur vivant jamais interrompu, lecture sans marqueur vivant
+  sur fichiers recréés) ; borgHelperWWW : « cache Report -o … » (trace posée -> recalculé) ; « Bkp réel sans ligne bkp_status … »
+  (vrai borg, CLI : déclencheur SQLite qui refuse l'INSERT, `borg create`
+  retenu — Status, Status -j, Report -o -j, Report -j pendant le Bkp, puis plus rien) ; contrôles Status existants : clé
+  `sans_suivi` dans les `bkp_running` attendus.
+
 ## Documentation (borgHelperWWW) — uvicorn externe : arrêt et --timeout-graceful-shutdown — 2026-10-13
 
 Chantier « reconstruction progressive », story 73 (report D176 ; décision de l'utilisateur : documentation seule). Remesuré sous

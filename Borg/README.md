@@ -508,9 +508,11 @@ Report pendant un Bkp (1.0.183) : un nick dont le Bkp tourne — marqueur du Bkp
 (XhYYmin)` (heure locale de début, durée écoulée) ; avant sa ligne `bkp_status`, quand le Bkp attend qu'un Index extérieur
 se mette en pause (jusqu'à 120 s) : `— ⏳ Bkp en attente de l'Index depuis …`. L'historique est rendu ; stderr dit `<nick> :
 Bkp en cours depuis … — rapport tiré de la base, borg non interrogé` ; en JSON, la ligne porte aussi `"bkp_en_cours":
-{"started_at": "2026-10-05T05:08:14Z", "depuis": "…", "precedent_en_erreur": false, "en_attente": false, "orphelin": false}` (début en UTC ; `orphelin` : 1.0.184).
+{"started_at": "2026-10-05T05:08:14Z", "depuis": "…", "precedent_en_erreur": false, "en_attente": false, "orphelin": false,
+"sans_suivi": false}` (début en UTC ; `orphelin` : 1.0.184 ; `sans_suivi` : 1.0.196).
 Un autre nick du même dépôt (`BORG_REPO`) est aussi tiré de la base pendant ce Bkp : `— ⏳ Bkp de <nick> en cours sur le
-dépôt depuis …`, JSON `"bkp_voisin": {"nick", "started_at", "depuis", "en_attente", "orphelin"}`, sans alerte de ce fait.
+dépôt depuis …`, JSON `"bkp_voisin": {"nick", "started_at", "depuis", "en_attente", "orphelin", "sans_suivi"}`, sans alerte de
+ce fait.
 
 Codes pendant un Bkp : alerte (`***`, code 1) si le Bkp précédent a échoué — fini en erreur (un Bkp concurrent refusé sur
 le verrou du dépôt compte) ou jamais fini sans être encore vivant (tué) : `… — Bkp précédent en erreur` dans `reste` ;
@@ -521,8 +523,17 @@ code 1 si la dernière archive dépasse `MAX_AGE_BKP` ou s'il n'y a aucune archi
 suivant), ligne au-delà de `BKP_STATUS_TIMEOUT` (un Bkp plus long que ce délai retombe sur borg), Restore/Prune/DelBkp en
 cours ; Bkp tué dont le `borg create` tient encore le dépôt : voir 1.0.184 ci-dessous. Limites : borgHelperWWW garde `/report?offline=true` en cache 5 min ;
 depuis borgHelperWWW 1.31.3, un marqueur de Bkp qui apparaît (tout nick, voisin compris), un borgHelper tué ou un changement
-des détenteurs du verrou d'un dépôt local renouvellent la réponse au premier appel suivant (avant : jusqu'à 5 min de retard) ; si le Bkp ne peut écrire sa ligne `bkp_status` (`[WARN]
-store_bkp_status_start a échoué`), il reste vu « en attente de l'Index » jusqu'à sa fin.
+des détenteurs du verrou d'un dépôt local renouvellent la réponse au premier appel suivant (avant : jusqu'à 5 min de retard).
+1.0.196 : si le Bkp ne peut écrire sa ligne `bkp_status` (`[WARN] store_bkp_status_start a échoué`), il le signale à côté de
+son marqueur (`<marqueur>.sans-suivi`) et reste vu en cours : `— ⏳ Bkp en cours depuis HH:MM (XhYYmin) (suivi bkp_status
+indisponible)` (début = date du marqueur ; JSON `"sans_suivi": true` dans `bkp_en_cours` — `false` sinon — et `bkp_voisin`) ;
+avant : « en attente de l'Index » jusqu'à sa fin. Sans ligne, ce Bkp n'est jamais soumis à `BKP_STATUS_TIMEOUT` : son
+marqueur vivant prouve le processus, et aucune ligne périmée ne pourrait dire « Bkp sans fin … » à sa place (Status nommerait
+une autre opération prioritaire, `/access` le dirait fini pendant que borg tourne). Trace impossible à écrire : `[WARN]
+<nick>: trace sans-suivi non écrite`, Bkp vu « en attente de l'Index ». Chaque marqueur vivant est rapproché de SA ligne
+`bkp_status` : un Bkp vivant reste vu même si la ligne restée ouverte d'un Bkp tué plus récent existe (avant 1.0.196 : rien,
+et Report interrogeait borg, qui butait sur le verrou du dépôt) ; deux Bkp vivants (en cours, sans suivi ou en attente de
+l'Index) : le plus récent par sa date de début.
 
 Report pendant un borg orphelin (1.0.184) : si borgHelper a été tué (SIGKILL, OOM) pendant un Bkp, son `borg create` continue
 seul et garde le verrou du dépôt jusqu'à sa fin. Le Bkp passe à son `borg create` son identifiant et son PID
@@ -1314,7 +1325,13 @@ Par nick :
   terminée sans rien de vivant « Bkp interrompu depuis … — aucun processus ; fermé au prochain Index si son archive existe »
   (dépôt distant — `hôte:chemin`, `{…}`, `SSH_REPO`, `SSH_REMFO` —, où un borg orphelin ne se voit pas : « — borgHelper
   arrêté, borg non vérifiable (dépôt distant) ; … ») — Report, lui, ne dit rien dans ce cas. Ligne d'un autre run que le Bkp
-  vivant ou en attente : dite aussi, sous la sienne. Lecture impossible (marqueurs, base) : rien sur le Bkp. Status retire
+  vivant ou en attente : dite aussi, sous la sienne (1.0.196 : un Bkp vivant derrière la ligne restée ouverte d'un Bkp tué
+  plus récent est « en cours », la ligne tuée « interrompu » — avant : seulement « interrompu »). Ligne `bkp_status` que le Bkp
+  n'a pu écrire (1.0.196) : « Bkp en cours depuis … (suivi bkp_status indisponible) », début = date du marqueur, jamais soumis
+  au délai (marqueur vivant), JSON `bkp_running.sans_suivi` `true` (`false` sinon). La ligne d'un run dont le marqueur vit
+  n'est jamais « Bkp interrompu … — aucun processus » (`bkp_interrupted`, 1.0.196), même quand un autre Bkp vivant, plus
+  récent, est celui affiché ; périmée, elle reste « Bkp sans fin … probablement interrompu » (`bkp_stale`). Lecture
+  impossible (marqueurs, base) : rien sur le Bkp. Status retire
   au passage les marqueurs de processus morts, comme Report (avant 1.0.186 : « Bkp en cours » pour toute ligne non
   terminée). Démarrée depuis plus que le délai du nick (1.0.154) : « Bkp sans fin depuis HH:MM (XhYYmin) — probablement
   interrompu (délai 6 h dépassé) », jamais « en cours » (date affichée au-delà de 24 h). Seule la dernière ligne du nick
@@ -1329,8 +1346,10 @@ Par nick :
   distingue pas laquelle le tient. Si un Bkp est aussi détecté, pas de message redondant (le
   Bkp lui-même tient ce lock).
 
-En JSON : `last_backup` est `{archive,date}` ou `null` ; `bkp_running` est `{started_at,en_attente,orphelin}` (1.0.186 :
-drapeaux de `bkp_en_cours` de Report ; avant : `{started_at}`) ou `null` ; `bkp_interrupted` (1.0.186) est `{started_at,verifie}` pour
+En JSON : `last_backup` est `{archive,date}` ou `null` ; `bkp_running` est `{started_at,en_attente,orphelin,sans_suivi}`
+(1.0.186 :
+drapeaux de `bkp_en_cours` de Report ; `sans_suivi` : 1.0.196 ; avant : `{started_at}`) ou `null` ; `bkp_interrupted`
+(1.0.186) est `{started_at,verifie}` pour
 une ligne non terminée non périmée sans rien de vivant (`verifie` : `false` pour un dépôt distant), sinon `null` ; `bkp_stale`
 (1.0.154) est `{started_at,timeout_s}` (`timeout_s` 1.0.155 : délai du nick) pour un Bkp sans fin au-delà du délai (alors `bkp_running` vaut `null`), sinon `null` ;
 `priority_op_running` est un booléen brut (reflète `priority.lock`, indépendamment de `bkp_running` —
@@ -2363,8 +2382,9 @@ illisible ; index vide en texte) ou qui porte « SQLite error » n'est jamais mi
 périmètre ; `GET /report?offline=true` et `GET /diffbkp` (qui lit le dépôt en direct) ajoutent à l'empreinte la présence
 de chaque dépôt local (disque démonté -> recalcul ; remonté -> la réponse d'avant resservie) et ne sont servis du cache
 que 5 min (« depuis », alerte de sauvegarde trop ancienne, place libre, nouvelle archive). borgHelperWWW 1.31.3 : celle de
-`/report?offline=true` porte aussi les marqueurs de Bkp de `CACHE_DIR` (porteur vivant ou mort) et les détenteurs du
-`lock.roster` de chaque dépôt local (vivants ou non ; un zombie compte mort) — « ⏳ Bkp en cours / en attente / interrompu » suit
+`/report?offline=true` porte aussi les marqueurs de Bkp de `CACHE_DIR` (porteur vivant ou mort ; 1.31.12 : et leurs traces
+`.sans-suivi`, Bkp en cours sans ligne `bkp_status`) et les détenteurs du `lock.roster` de chaque dépôt local (vivants ou non
+; un zombie compte mort) — « ⏳ Bkp en cours / en attente / interrompu » suit
 le Bkp au premier appel ; lecture du roster bornée à 1 s (montage figé : dernier état lu, réponse en cache gardée ; le premier
 appel sur un montage figé attend jusqu'à 1 s pour la présence et 1 s pour le roster, par nick). Limite : pour un nick voisin
 d'un dépôt distant (aucun `lock.roster` lisible), le passage « en attente » -> « en cours » du Bkp voisin peut retarder de 5 min.
@@ -2530,7 +2550,10 @@ Depuis 1.28.0, chaque nick lisible par l'appelant porte aussi (lectures locales 
   — jamais pris pour une fin de Bkp. Avant 1.31.5 : base seule, un Bkp tué restait `true` jusqu'au délai. Une relecture peut
   retirer les marqueurs de Bkp morts de `CACHE_DIR` (comme Status et Report ; impossible sous un autre compte : sans effet).
 - `bkp_detail` (1.31.5) : `"en_cours"`, `"en_attente"` (Bkp en attente de l'Index, ligne pas encore écrite),
-  `"orphelin"` (borgHelper tué, son borg create écrit encore) quand `bkp_running` est `true`, sinon `null`.
+  `"orphelin"` (borgHelper tué, son borg create écrit encore) quand `bkp_running` est `true`, sinon `null`. borgHelper
+  ≥ 1.0.196 : un Bkp qui n'a pu écrire sa ligne `bkp_status` (trace `.sans-suivi`) est `"en_cours"` (avant : `"en_attente"`
+  toute sa durée) ; `sans_suivi` n'est pas exposé par `/access` ; `history.db` illisible : état inconnu (`bkp_running`
+  `null`), comme pour tout Bkp.
 - `bkp_interrupted` (1.31.5) : `{"started_at","verifie"}` comme `Status -j` (ligne ouverte non périmée d'un Bkp dont rien ne
   vit ; aussi à côté d'un `bkp_running` vrai d'un AUTRE run, par exemple un Bkp en attente de l'Index derrière une ligne
   tuée : deux badges ; `verifie` `false` : dépôt distant, borg non vérifiable) ou `null`. UI 1.23.1 : badges « ⏳ Bkp en cours », « ⏳ Bkp en attente de l'Index »,
