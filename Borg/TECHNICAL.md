@@ -1980,7 +1980,11 @@ un thread, attente 1 s, montage figé -> `ok`, une seule sonde en attente par ni
 `(empreinte, réponse, time.monotonic())`, rangée seulement si l'empreinte est la même avant et après l'exécution (lecteurs :
 mtimes stables, mesuré). Cache par périmètre : `_capture_fingerprints(nick, 'diffbkp')` (présence) et `written_at` comparé à
 `_CACHE_TTL` dans `_scope_cache_get`. `_never_cache(result)` = `_is_db_key_error`, `[ERREUR]` sur stderr ou « SQLite error »
-(stdout/stderr) — seul prédicat des trois écritures (`run_borghelper`, `_scoped_cached_mono`, `_scoped_cached_multi`) ;
+(stdout/stderr), et (1.31.14, revue story 76) `_ORPHAN_TXT` « borg create encore actif » importé de borgHelper (toute
+réponse qui le contient, Status compris : un create orphelin avant le verrou n'est pas dans le `lock.roster`, sa mort sans
+verrou ne change pas l'empreinte ; effet réel dans `run_borghelper`, codes 0/1 — les caches par périmètre ne gardent que le
+code 0 de commandes qui ne l'impriment pas) — seul prédicat des trois écritures (`run_borghelper`, `_scoped_cached_mono`,
+`_scoped_cached_multi`) ;
 1.31.3 (story 56, A113) : pour `report`, `_external_fingerprint` ajoute `|bkp:` + `_bkp_markers_state()` (TOUS les marqueurs
 `<prefix>-*-bkp.lock.*` de `CACHE_DIR` triés — 1.31.12 (story 74) : traces `<marqueur>.sans-suivi` comprises (`_MARKER_RE`),
 sinon « en attente de l'Index » restait en cache jusqu'à 5 min après leur apparition —, « nom:`_lock_holder` » — lecture
@@ -2515,6 +2519,36 @@ chargeur PyInstaller `borg.wrapped` -> enfant `borg.wrapped` qui tient le verrou
 borgHelper, parent 1, l'archive est écrite. Revues : versions par nom d'ancêtre et nom d'hôte, puis par absence de marqueur,
 abandonnées.
 
+**Orphelin avant le verrou, borg create d'un autre uid (1.0.198, story 76)** : règle par processus extraite dans
+`_orphan_create_run(nick, pid, run_ids=None, owner=…)` (partagée par `repo_orphan_create` et `orphan_create_runs`) ; environ
+illisible (`PermissionError` de `_proc_environ` : autre uid, processus non dumpable) -> run lu dans l'argv (`_argv_bkp_run` :
+élément `borgHelper run <run_id>` qui suit le premier `--comment`, run_id `[0-9a-f]{32}` ; `--comment=…`, commentaire cité
+pour SSH_REMFO, autre texte : None) et borgHelper mort prouvé par l'absence de marqueur vivant de ce run du nick
+(`bkp_markers`, `include_me`) ; processus fini entre deux lectures : ignoré. Voie argv (`_proc_argv_bkp_run(pid, a, owner)`,
+décision de l'utilisateur « Q2 précisé ») réservée à un processus d'uid réel (`_proc_uid` : « Uid: » de
+`/proc/<pid>/status`) 0 ou `owner` = propriétaire du dossier du dépôt local (`_repo_owner_uid` : `os.stat` de `BORG_REPO`,
+lu une fois par parcours ; dépôt distant ou illisible : None, pas de voie argv) — tout utilisateur local peut lancer `x
+create --comment "borgHelper run <run_id>"` (run_id visible par `ps` pendant le Bkp) : faux orphelin, aucune fin « échec »
+avant le délai ; le falsifier exige d'être root ou ce propriétaire. Les processus du même uid que le lecteur passent
+normalement par la voie environ ; le propriétaire du dépôt est accepté par décision de l'utilisateur. Forme exacte de
+`backup()` : `create` (première sous-commande borg de l'argv), puis `--comment`, puis le commentaire. Lecture
+argv/environ/uid commune : `_proc_create_run(pid, owner)` -> (run_id, environ lisible, environ) ; chaque appelant garde sa
+règle de vie (`BORGHELPER_BKP_PID` ou marqueurs pour `_orphan_create_run`, aucune pour `run_create_alive`). Limite : Bkp sous
+un troisième compte (ni root ni propriétaire ; dépôt d'un groupe partagé : tout compte autre que le propriétaire) jamais
+reconnu par l'argv.
+`run_create_alive(run_ids, nick)` applique la même voie (propriétaire du dépôt du nick ; `_reconcile_killed_bkp` le passe).
+Orphelin AVANT le verrou : sans marqueur vivant et sans orphelin du roster rattaché à une ligne ouverte non périmée du nick,
+`_bkp_live` appelle `_bkp_prelock_orphan` — dépôt local (`repo_orphan_checkable`), `open_bkp_runs`, délai rc et
+`bkp_status_open` de chacune (délai rc lu sans `[WARN]` : `bkp_status_timeout(nick, quiet=True)`), puis `orphan_create_runs(nick, runs non périmés)` (parcours de
+`/proc`, même règle, ~10 ms pour 666 processus) ; ligne la plus récente dont le create est orphelin -> `orphelin`. Erreurs de
+LECTURE seules absorbées (`_READ_ERRORS` : OSError, `sqlite3.Error`, `Db*Error`, `SchemaVersionError`, `SystemExit` hors
+130 ; dites par Report et Report -o avec `-d`, jamais par Status — `bkp_state` n'a pas de `debug`) : aucun orphelin, la
+règle d'avant ; une erreur de programmation se propage (même liste pour `_repo_owner_uid` et la lecture des marqueurs). Coût sans marqueur vivant : une lecture de
+history.db (lignes ouvertes) ; `/proc` seulement avec une ligne ouverte non périmée. Le chemin du voisin (`_bkp_neighbor`
+-> `_bkp_live(o, prelock=False)`) ne cherche jamais l'orphelin avant le verrou : un create sans le verrou ne bloque pas le
+borg de ce nick, et la porte (`any_bkp_marker`) dépend des marqueurs morts encore sur disque. Texte « borg create encore
+actif » : `_ORPHAN_TXT`, aux 5 sites qui l'impriment, importé par borgHelperWWW (`_never_cache`).
+
 **Fin d'un Bkp tué par le watcher (borgHelper 1.0.189 / borgHelperWWW 1.31.8, story 63)** : `_reconcile_killed_bkp(nick,
 report=None)` remplit `report` — `verified` (état de chaque ligne ouverte établi : base lue, et `borg list` réussi s'il y avait
 un candidat ; faux : dépôt absent, `borg list` en échec ou tué, base illisible) et `runs` {run_id: `fermé` | `absent` (seulement
@@ -2523,8 +2557,10 @@ si `repo_orphan_checkable` : dépôt local) | `non vérifiable` (dépôt distant
 verrou) | `fin illisible` | `erreur de base` (exception) | `non fermé` (fermeture refusée ou déjà faite) | `non vérifié` (candidat,
 `borg list` impossible)}, et `error` (« base illisible (…) ») si la lecture de la base lève ; libellés = constantes `RK_*` (les
 neuf importées par borgHelperWWW) ; valeur rendue inchangée (Index, `backup()`). `run_create_alive` (scan de /proc : argv `create`,
-environ `BORGHELPER_BKP_RUN` ; environ illisible — autre uid — ignoré) n'est appelé que s'il reste une ligne ouverte ni vivante ni
-orpheline du roster : coût d'un parcours de /proc pour l'Index et `backup()` qui ont une telle ligne, aucun sinon.
+environ `BORGHELPER_BKP_RUN` ; 1.0.198 : environ illisible — autre uid — run lu dans l'argv d'un create de root ou du
+propriétaire du dépôt du nick, `_proc_argv_bkp_run` ; avant : ignoré, d'où `absent` et une fin « échec » notifiée à tort ;
+borgHelper du Bkp non vérifié ici, comme avant) n'est appelé que s'il reste une ligne ouverte ni vivante ni orpheline du
+roster : coût d'un parcours de /proc pour l'Index et `backup()` qui ont une telle ligne, aucun sinon.
 Commande `BkpReconcile` (`bkp_reconcile`, optab `Ccdnj`, opération `read`) : `borg._stop` = `check_priority_lock(nick)` le temps
 du rapprochement (son `borg list` cède à Bkp/Restore/Prune) ; `-n` nettoyé (espaces, doublons) ; `error` dit en `[WARN]` ; code
 1 si un nick n'est pas vérifié, inconnu du rc, ou rc sans nick. Ligne `absent` laissée ouverte (décision de l'utilisateur, revue
@@ -3875,7 +3911,11 @@ Commande CLI en lecture seule (1.0.186 : elle retire seulement, comme Report, le
    récente, si elle n'est pas celle du Bkp vivant : périmée -> `bkp_stale`, sinon -> `bkp_interrupted` ({started_at,
    verifie = `repo_orphan_checkable(nick)`, dépôt local au sens de `_repo_local_path`, le prédicat de `repo_lock_holders`}).
    `_status_one(nick)` par défaut (`bkp_live=False`, borgHelperWWW /access qui n'en garde que build/rebuild) : base seule,
-   comme avant — jamais de marqueurs, de `lock.roster` ni de /proc à chaque sondage. 1.0.188 (story 59) : ce calcul est
+   comme avant — jamais de marqueurs, de `lock.roster` ni de /proc à chaque sondage. 1.0.198 (story 76) : avec `bkp_live`,
+   sans marqueur vivant ni orphelin du roster rattaché à ses lignes, `_bkp_live` relit les lignes ouvertes du nick et, s'il y en
+   a une non périmée sur un dépôt local, parcourt `/proc` (`_bkp_prelock_orphan` -> `orphan_create_runs` : borg create orphelin
+   AVANT le verrou -> `orphelin`) — ~10 ms pour 666 processus (mesuré), dans la sonde bornée de 1 s de borgHelperWWW ; erreur de
+   lecture dans cette recherche : aucun orphelin (jamais `bkp_unknown` pour elle). 1.0.188 (story 59) : ce calcul est
    `BorgHelper.bkp_state(nick, bkp_live=True)` (+ `bkp_unknown` : `_bkp_live` illisible), source unique de `_status_one` et de
    borgHelperWWW 1.31.5 (`_bkp_state` : /access `bkp_running`/`bkp_detail`/`bkp_interrupted`, alerte de retard — appel dans
    `_bounded_probe('bkpstate', …)` et seulement si `bkp_running_state` est vrai ou qu'un marqueur existe ; sonde figée :

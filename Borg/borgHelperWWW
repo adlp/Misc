@@ -72,12 +72,13 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
                          op_allowed, allowed_ops, is_external, _rb_errmsg, _valid_nick_name, _mei_mapped, _purge_mei_dirs,
                          _group_pids, _group_alive, _group_wait,   # 1.31.2 : communs à borgHelper (zombies exclus, /proc illisible)
                          RK_CLOSED, RK_ABSENT, RK_ALIVE, RK_ORPHAN, RK_BADEND, RK_NOTCLOSED,   # 1.31.8 : états de BkpReconcile
-                         RK_DBERR, RK_UNVERIFIED, RK_UNCHECKABLE)
+                         RK_DBERR, RK_UNVERIFIED, RK_UNCHECKABLE,
+                         _ORPHAN_TXT)   # 1.31.14 : mention d'un borg create orphelin (_never_cache), source unique dans borgHelper
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.31.13"
+WWW_VERSION="1.31.14"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -1459,9 +1460,16 @@ def _never_cache(result: CommandResult) -> bool:
     illisible, schéma, index vide — inventaire mesuré) ; un lecteur multi-nicks sortait en 0 quand un seul nick s'arrête (en 1
     depuis borgHelper 1.0.178) : une erreur passagère (« DB occupée ») restait servie. « Index vide » : [WARN] depuis borgHelper
     1.0.179, mis en cache, renouvelé par l'empreinte (mtime et -wal des bases). Revue : « SQLite error » (stdout `-j` ou stderr) exclu aussi — avant borgHelper 1.0.178 les lecteurs
-    l'avalaient en code 0 sans [ERREUR] ; le cache ne retient que les codes 0/1, la règle reste utile pour le code 1."""
+    l'avalaient en code 0 sans [ERREUR] ; le cache ne retient que les codes 0/1, la règle reste utile pour le code 1.
+    1.31.14 (revue story 76, borgHelper 1.0.198) : toute réponse qui contient le texte d'un borg create orphelin (« borg create
+    encore actif », stdout ou stderr — Report, Report -o, voisin, Status compris) jamais en cache : un create orphelin AVANT le
+    verrou du dépôt n'est pas dans le lock.roster, l'empreinte ne change pas s'il meurt sans avoir pris le verrou
+    (BORG_LOCK_WAIT dépassé) — « encore actif », code 1, était resservi jusqu'à 5 min. Effet réel dans run_borghelper
+    (_RESPONSE_CACHE, codes 0 et 1) ; les caches par périmètre ne gardent que le code 0 de commandes qui n'impriment jamais ce
+    texte. Texte = _ORPHAN_TXT, importé de borgHelper (aux 5 sites qui l'impriment)."""
     text=f"{result.stdout or ''}\n{result.stderr or ''}"
-    return _is_db_key_error(result) or '[ERREUR]' in (result.stderr or '') or 'SQLite error' in text
+    return (_is_db_key_error(result) or '[ERREUR]' in (result.stderr or '') or 'SQLite error' in text
+            or _ORPHAN_TXT in text)
 
 def _cache_db_paths(nick: Optional[str]):
     nicks=[n.strip() for n in nick.split(',')] if (nick and nick!='ALL') else \
@@ -1538,8 +1546,10 @@ def _bkp_state(n: str) -> dict:
     compte mort, borgHelper 1.0.188). {'bkp_running': True (vivant, en attente, orphelin) | False | None (inconnu, jamais une fin),
     'bkp_detail': 'en_cours'|'en_attente'|'orphelin'|None, 'bkp_interrupted': {started_at, verifie}|None}. Coût par sondage (/access
     toutes les 30 s, watcher) : base (bkp_running_state) et marqueurs (glob de CACHE_DIR) ; bkp_state (lock.roster du dépôt local
-    pour un orphelin) seulement s'il existe une ligne ouverte non périmée ou un marqueur, dans une sonde bornée (_bounded_probe,
-    1 s, une seule en vol par nick ; figée : dernier état lu, sinon inconnu)."""
+    pour un orphelin ; borgHelper 1.0.198 : sans marqueur vivant ni orphelin du roster, lignes ouvertes relues et, s'il y en a une
+    non périmée, un parcours de /proc pour un borg create orphelin AVANT le verrou — ~10 ms pour 666 processus, mesuré) seulement
+    s'il existe une ligne ouverte non périmée ou un marqueur, dans une sonde bornée (_bounded_probe, 1 s, une seule en vol par
+    nick ; figée : dernier état lu, sinon inconnu)."""
     unknown={'bkp_running':None,'bkp_detail':None,'bkp_interrupted':None}
     try:
         base=_bh_paths.db.bkp_running_state(n,_bkp_timeout(n))
@@ -5356,7 +5366,9 @@ def push_selftest():
                 def _cache_nick_error():
                     """1.29.0 (story 37, A67) : réponse code 0 qui porte l'arrêt d'un nick (`[ERREUR]` sur stderr, forme réelle de
                     _nick_stop_msg) ou une erreur SQLite avalée (« SQLite error », stdout -j) jamais mise en cache — _RESPONSE_CACHE
-                    (deux appels, deux exécutions) et cache par périmètre (mono et multi : aucune ligne écrite) ; sans marqueur : en cache."""
+                    (deux appels, deux exécutions) et cache par périmètre (mono et multi : aucune ligne écrite) ; sans marqueur : en cache.
+                    1.31.14 (revue story 76) : texte d'un borg create orphelin (_ORPHAN_TXT importé) — _RESPONSE_CACHE jamais (code 1 du
+                    nick, code 0 du voisin, stderr seul) ; caches par périmètre : prédicat partagé vérifié sur la forme code 0."""
                     # 1.31.0 (revue story 41) : formes réelles de borgHelper 1.0.178 — code 1, [ERREUR] sur stderr (-j compris) ;
                     # sqle0 : forme d'avant 1.0.178 (code 0, erreur dans le JSON seul), gardée pour un borgHelper plus ancien
                     busy=CommandResult(exitcode=1,stdout=json.dumps({'qa':['a'],'qz':{'error':'DB occupée'}}),
@@ -5365,6 +5377,13 @@ def push_selftest():
                                        stderr='[ERREUR] SQLite error (/c/rc-qz-diff.db): database is locked  [borgHelper v1.0.178]')
                     sqle0=CommandResult(exitcode=0,stdout=json.dumps({'qa':['a'],'qz':{'error':'SQLite error (/c/rc-qz-diff.db): database is locked'}}),stderr='')
                     clean=CommandResult(exitcode=0,stdout=json.dumps({'qa':['a'],'qz':['b']}),stderr='')
+                    # 1.31.14 (revue story 76) : formes réelles de borgHelper 1.0.198 — Report -o d'un orphelin (code 1, mention dans
+                    # reste, ligne sur stderr) ; voisin (code 0, mention seule dans stdout) ; stderr seul
+                    # fixtures construites sur la constante importée de borgHelper (revue 2 : jamais un texte tapé à la main)
+                    orph=CommandResult(exitcode=1,stdout=f'| ***qz | … | 3.47 GB — ⏳ Bkp interrompu, {_ORPHAN_TXT} depuis 16:27 (0h00min) |',
+                                       stderr=f'  qz : Bkp interrompu (borgHelper arrêté), {_ORPHAN_TXT} depuis 16:27 (0h00min) — rapport tiré de la base, borg non interrogé')
+                    orphv=CommandResult(exitcode=0,stdout=f'| qa | … | — ⏳ Bkp de qz interrompu, {_ORPHAN_TXT} sur le dépôt depuis 16:27 (0h00min) |',stderr='')
+                    orphe=CommandResult(exitcode=0,stdout='| qz | … |',stderr=f'  qz : Bkp interrompu (borgHelper arrêté), {_ORPHAN_TXT} depuis 16:27 (0h00min)')
                     def twice(r):
                         for k in [k for k in _RESPONSE_CACHE if k and k[0]=='selftest-nickerr']: _RESPONSE_CACHE.pop(k,None)
                         with mock.patch(f"{__name__}._exec_borghelper",return_value=r) as ex:
@@ -5379,10 +5398,15 @@ def push_selftest():
                         _scoped_cached_multi('search','qa,qz',['qa','qz'],{'qa':None,'qz':None},{},{},run(busy)); x_busy=len(puts)-m_busy
                         _scoped_cached_multi('search','qa,qz',['qa','qz'],{'qa':None,'qz':None},{},{},run(sqle)); x_sql=len(puts)-m_busy-x_busy
                         _scoped_cached_mono('idxtop','qz',None,'',{},run(clean)); m_clean=len(puts)-m_busy-x_busy-x_sql
-                    got=(twice(busy),twice(sqle),twice(clean),m_busy,x_busy,x_sql,m_clean,twice(sqle0))
-                    if got!=(2,2,1,0,0,0,1,2): print(f"  {got}")
-                    return got==(2,2,1,0,0,0,1,2)
-                check("cache des réponses : arrêt d'un nick ([ERREUR]) ou erreur SQLite en code 0 jamais en cache, trois sites (A67)",_cache_nick_error)
+                        # prédicat partagé : aussi refusé par les caches par périmètre (code 0 seul : forme du voisin), bien
+                        # qu'aucune de leurs commandes n'imprime ce texte — l'effet réel est dans run_borghelper (codes 0/1)
+                        n0=len(puts); _scoped_cached_mono('idxtop','qz',None,'',{},run(orphv))
+                        _scoped_cached_multi('search','qa,qz',['qa','qz'],{'qa':None,'qz':None},{},{},run(orphv)); m_orph=len(puts)-n0
+                    got=(twice(busy),twice(sqle),twice(clean),m_busy,x_busy,x_sql,m_clean,twice(sqle0),
+                         twice(orph),twice(orphv),twice(orphe),m_orph)   # 1.31.14 : orphelin jamais en cache, trois sites
+                    if got!=(2,2,1,0,0,0,1,2,2,2,2,0): print(f"  {got}")
+                    return got==(2,2,1,0,0,0,1,2,2,2,2,0)
+                check("cache des réponses : arrêt d'un nick ([ERREUR]) ou erreur SQLite en code 0 jamais en cache, trois sites (A67) ; borg create orphelin (1.31.14) jamais dans _RESPONSE_CACHE",_cache_nick_error)
                 def _cache_index_empty_wal():
                     """1.31.1 (story 42, A89 + revue) : « Index vide » ([WARN], code 0 depuis borgHelper 1.0.179) est mis en cache comme
                     toute réponse saine ; l'empreinte des bases suit aussi leur journal -wal (apparu, grossi, disparu) — un Index écrit

@@ -440,7 +440,9 @@ etat = bh.bkp_state('mon-serveur')   # {bkp_running, bkp_interrupted, bkp_stale,
 # du module), rep['error'] si la base est illisible (dit en [WARN] par bkp_reconcile). Nick inconnu du rc ou rc sans nick : 1 ;
 # nick None ou 'ALL' : tous les nicks du rc (en CLI sans -n : nom de la machine) ; 'a, b' : espaces et doublons ignorés. Le borg
 # list cède à une opération prioritaire du nick (non vérifié). Une ligne 'absent' reste ouverte (seul le watcher notifie l'échec).
-# Base : bh.db.run_create_alive({run_id, …}) -> run_id d'un borg create vivant lancé par backup() (/proc, même avant le verrou) ;
+# Base : bh.db.run_create_alive({run_id, …}) -> run_id d'un borg create vivant lancé par backup() (/proc, même avant le verrou ;
+# 1.0.198 : environnement illisible — autre uid — run lu dans l'argv, --comment "borgHelper run <32 hex>", processus de root
+# ou du propriétaire du dossier du dépôt local du nick seulement : bh.db.run_create_alive({run_id, …}, 'mon-serveur')) ;
 # bh.db.bkp_status_notified(nick, run_id) -> fin déjà notifiée (notified_at posé ; base illisible : exception).
 code = bh.bkp_reconcile('mon-serveur', as_json=False)
 
@@ -491,8 +493,17 @@ ferme = bh.db.close_bkp_status_reconciled('mon-serveur', run_id, '2026-10-05 16:
 pids = bh.db.repo_lock_holders('mon-serveur')
 # borg create ORPHELIN détenteur du verrou (BORGHELPER_BKP_RUN et BORGHELPER_BKP_PID dans son environnement, posés par backup(),
 # ce PID mort) : {'pid','run_id'} ou None ; puis la ligne ouverte de ce run : {'run_id','started_at','stale'} ou None.
+# 1.0.198 : environnement illisible (autre uid) -> run lu dans l'argv (processus de root ou du propriétaire du dossier du
+# dépôt local seulement ; troisième compte, dépôt distant : non), borgHelper mort = aucun marqueur de Bkp vivant de ce run.
 orphelin = bh.db.repo_orphan_create('mon-serveur')
 ligne = bh.db.bkp_status_open('mon-serveur', orphelin['run_id'], timeout_s=21600) if orphelin else None
+# 1.0.198 : même règle hors du roster (borg create avant le verrou), parmi des run_id donnés (parcours de /proc) -> set ;
+# /proc illisible : exception. Comme l'appelant réel (_bkp_prelock_orphan) : dépôt local seulement, lignes ouvertes NON PÉRIMÉES.
+if bh.db.repo_orphan_checkable('mon-serveur'):
+    t = bh.bkp_status_timeout('mon-serveur')
+    ouvertes = [r for r in (bh.db.bkp_status_open('mon-serveur', x, timeout_s=t) for x in bh.db.open_bkp_runs('mon-serveur'))
+                if r and not r['stale']]
+    avant_verrou = bh.db.orphan_create_runs('mon-serveur', {r['run_id'] for r in ouvertes}) if ouvertes else set()
 ```
 
 ### Résultat du dernier Index (1.0.149)

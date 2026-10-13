@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.197"
+Version="1.0.198"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -56,6 +56,7 @@ CACHE_DB_BASE_SCHEMA_VERSION = 1
 # Ne concerne QUE diff.db, appelé par ensure_diff_db() — désormais garanti avant tout accès
 # depuis Bkp, Index, Prune (voir prune()) et tous les autres consommateurs de diff.db/cache.db.
 
+_UNSET=object()   # 1.0.198 : paramètre non fourni (propriétaire du dépôt lu au premier besoin)
 class SchemaVersionError(Exception): pass
 # Erreurs du chiffrement de base : n'héritent PAS de sqlite3.Error (jamais avalées par un `except sqlite3.Error`).
 class DbKeyError(Exception): pass      # passphrase absente/fausse, enveloppe indéchiffrable
@@ -796,12 +797,13 @@ def _bkp_timeout_parse(v):
         n=int(m.group(1))*{'':1,'s':1,'m':60,'h':3600}[m.group(2).lower()]
     return min(n,_BKP_STATUS_TIMEOUT_MAX) if n>=1 else None
 
-def _bkp_status_timeout(value=None,cfg=None,nick=None):
+def _bkp_status_timeout(value=None,cfg=None,nick=None,quiet=False):
     """Délai (s) au-delà duquel un Bkp sans fin est tenu pour interrompu (1.0.154, story 17), plafonné à 10 ans.
     1.0.155 (story 18) : cfg (section rc du nick) — clé BKP_STATUS_TIMEOUT (section ou [DEFAULT]) si présente et non
     vide, sinon la variable BORGHELPERWWW_BKP_STATUS_TIMEOUT (environnement de chaque processus), sinon 21600. Valeur :
     secondes, ou suffixe s/m/h ; invalide -> 21600. [WARN] une fois par nick et par valeur si elle est invalide ou sous
-    300 s (un Bkp plus long serait notifié en échec). value : valeur à valider telle quelle (ni clé ni variable)."""
+    300 s (un Bkp plus long serait notifié en échec). value : valeur à valider telle quelle (ni clé ni variable). 1.0.198
+    (story 76) : quiet -> aucun [WARN], et la valeur n'est pas notée comme dite (un lecteur suivant la dira)."""
     if value is not None:
         t=_bkp_timeout_parse(value); return t if t is not None else 21600
     src=v=None
@@ -815,7 +817,7 @@ def _bkp_status_timeout(value=None,cfg=None,nick=None):
         if not v: return 21600
         src='BORGHELPERWWW_BKP_STATUS_TIMEOUT'
     t=_bkp_timeout_parse(v)
-    if (t is None or t<300) and (nick,src,v) not in _BKP_TIMEOUT_WARNED:
+    if not quiet and (t is None or t<300) and (nick,src,v) not in _BKP_TIMEOUT_WARNED:
         _BKP_TIMEOUT_WARNED.add((nick,src,v))
         who=f"{nick}: " if nick else ''
         printer(f"[WARN] {who}{src}={v!r} invalide — 6 h appliquées (secondes, ou suffixe s/m/h : 90s, 5m, 12h)" if t is None else
@@ -3858,36 +3860,88 @@ class BorgHelperDB:
         (son propre processus) ; ici : détenteur vivant dont la première sous-commande borg de l'argv est create et dont
         /proc/<pid>/environ porte les deux, le processus BORGHELPER_BKP_PID n'étant plus vivant (_proc_live : borgHelper tué, SIGKILL,
         OOM ; PID réattribué compris). Un borg lancé à la main, par cron, par borgmatic (sans ces variables), un borg d'Index, de Restore,
-        de Prune (autre sous-commande), un Bkp vivant (son borgHelper vit) n'en sont jamais. Environnement illisible (autre uid,
-        hidepid) : pas d'orphelin. {'pid', 'run_id'} — l'appelant rattache ce run_id à la ligne ouverte du nick — ou None."""
+        de Prune (autre sous-commande), un Bkp vivant (son borgHelper vit) n'en sont jamais. {'pid', 'run_id'} — l'appelant
+        rattache ce run_id à la ligne ouverte du nick — ou None. 1.0.198 (story 76, D181, décision de l'utilisateur Q2 précisé) :
+        environ illisible (autre uid : Bkp par root/cron, Bkp sous le compte propriétaire du dépôt) -> run lu dans l'argv
+        (_proc_argv_bkp_run : « borgHelper run <32 hex> » qui suit --comment, lisible d'un uid à l'autre), seulement pour un
+        processus d'uid réel 0 ou du propriétaire du dossier du dépôt local (_repo_owner_uid) — tout utilisateur peut écrire cet
+        argv ; Bkp sous un troisième compte : jamais reconnu (limite). borgHelper du Bkp mort prouvé alors par l'absence de
+        marqueur vivant de ce run DU NICK (bkp_markers, include_me ; faute de BORGHELPER_BKP_PID lisible) — le run_id (uuid)
+        d'un voisin du même dépôt ne correspond jamais à une ligne du nick. argv illisible aussi (hidepid) : pas d'orphelin
+        (limite). Règle par processus : _orphan_create_run (partagée avec orphan_create_runs, create avant le verrou)."""
         for pid in self.repo_lock_holders(nick):
-            a=_proc_argv(pid)
-            if not a or next((x for x in a[1:] if x in _BORG_SUBCMDS),None)!='create': continue
-            try:
-                with open(f'/proc/{pid}/environ','rb') as f: env=dict(x.split(b'=',1) for x in f.read().split(b'\0') if b'=' in x)
-                rid=env.get(b'BORGHELPER_BKP_RUN',b'').decode(); bp,bs=env.get(b'BORGHELPER_BKP_PID',b'').decode().split(':',1)
-                bp=int(bp)
-            except (OSError,ValueError,UnicodeDecodeError): continue
-            if not rid or _proc_live(bp,bs): continue   # son borgHelper vit : Bkp vivant (marqueur absent ou non), pas un orphelin
-            return {'pid':pid,'run_id':rid}
+            rid=self._orphan_create_run(nick,pid)
+            if rid: return {'pid':pid,'run_id':rid}
         return None
 
-    def run_create_alive(self,run_ids):
-        """1.0.189 (revue story 63) : run_id (parmi run_ids) d'un `borg create` VIVANT lancé par backup() — argv : sous-commande
-        create ; environ : BORGHELPER_BKP_RUN — qu'il tienne le verrou du dépôt ou non (chargeur PyInstaller qui démarre, attente du
-        verrou : repo_orphan_create ne voit que les détenteurs du lock.roster). Processus de l'utilisateur seulement (environnement
-        d'un autre uid illisible : ignoré)."""
+    def _repo_owner_uid(self,nick):
+        """1.0.198 (story 76, Q2 précisé) : uid du propriétaire du dossier du dépôt LOCAL du nick (os.stat de BORG_REPO,
+        _repo_local_path) ; dépôt distant, rc ou dossier illisible : None (pas de voie argv)."""
+        try:
+            repo=self._repo_local_path(self._cfg_reader(nick) if self._cfg_reader else None)
+            return os.stat(repo).st_uid if repo is not None else None
+        except _READ_ERRORS as e:   # (revue 3) erreurs de lecture seules ; Ctrl-C propagé
+            if isinstance(e,SystemExit) and e.code==130: raise
+            return None
+
+    def _orphan_create_run(self,nick,pid,run_ids=None,owner=_UNSET):
+        """1.0.198 (story 76, extrait de repo_orphan_create) : run_id du `borg create` ORPHELIN `pid` d'un Bkp tué, ou None.
+        argv : sous-commande create. environ lisible : BORGHELPER_BKP_RUN, et BORGHELPER_BKP_PID plus vivant (règle de
+        1.0.184, inchangée). environ illisible (autre uid, Q2 précisé) : « borgHelper run <32 hex> » qui suit --comment, pour
+        un processus d'uid réel 0 ou du propriétaire du dépôt local (_proc_argv_bkp_run, owner : _repo_owner_uid, lu ici au
+        premier besoin si non fourni), sans marqueur vivant de ce run du nick (bkp_markers, include_me ; illisibles : None).
+        run_ids (optionnel) : run hors de cet ensemble -> None, avant toute lecture des marqueurs. Processus fini entre deux
+        lectures : None."""
+        r=_proc_create_run(pid,(lambda: self._repo_owner_uid(nick)) if owner is _UNSET else owner)
+        if not r: return None
+        rid,readable,env=r
+        if not rid or (run_ids is not None and rid not in run_ids): return None
+        if not readable:   # voie argv : borgHelper mort = aucun marqueur vivant de ce run
+            try: live=rid in self.bkp_markers(nick,include_me=True)
+            except _READ_ERRORS as e:   # (revue 3) marqueurs illisibles : jamais un orphelin supposé ; Ctrl-C propagé
+                if isinstance(e,SystemExit) and e.code==130: raise
+                return None
+            return None if live else rid    # marqueur vivant de ce run : son Bkp vit, pas un orphelin
+        try: bp,bs=env.get(b'BORGHELPER_BKP_PID',b'').decode().split(':',1); bp=int(bp)
+        except (ValueError,UnicodeDecodeError): return None
+        if _proc_live(bp,bs): return None   # son borgHelper vit : Bkp vivant (marqueur absent ou non), pas un orphelin
+        return rid
+
+    def orphan_create_runs(self,nick,run_ids):
+        """1.0.198 (story 76, D183, décision de l'utilisateur Q1) : run_id (parmi run_ids) d'un `borg create` ORPHELIN vivant —
+        même règle qu'un détenteur du lock.roster (_orphan_create_run) — qu'il tienne le verrou du dépôt ou non : parcourt
+        /proc (create avant le verrou : chargeur PyInstaller, attente du verrou). run_ids vide : /proc non lu. /proc illisible :
+        exception (l'appelant, _bkp_live, rend None ou lève si strict)."""
         out=set()
         if not run_ids: return out
+        memo=[]
+        def owner():   # propriétaire du dépôt : lu une fois par parcours, au premier create de la voie argv
+            if not memo: memo.append(self._repo_owner_uid(nick))
+            return memo[0]
         for d in os.listdir('/proc'):
             if not d.isdigit(): continue
-            a=_proc_argv(int(d))
-            if not a or next((x for x in a[1:] if x in _BORG_SUBCMDS),None)!='create': continue
-            try:
-                with open(f'/proc/{d}/environ','rb') as f: env=dict(x.split(b'=',1) for x in f.read().split(b'\0') if b'=' in x)
-                rid=env.get(b'BORGHELPER_BKP_RUN',b'').decode()
-            except (OSError,ValueError,UnicodeDecodeError): continue
-            if rid in run_ids: out.add(rid)
+            rid=self._orphan_create_run(nick,int(d),run_ids,owner)
+            if rid: out.add(rid)
+        return out
+
+    def run_create_alive(self,run_ids,nick=None):
+        """1.0.189 (revue story 63) : run_id (parmi run_ids) d'un `borg create` VIVANT lancé par backup() — argv : sous-commande
+        create ; environ : BORGHELPER_BKP_RUN — qu'il tienne le verrou du dépôt ou non (chargeur PyInstaller qui démarre, attente du
+        verrou : repo_orphan_create ne voit que les détenteurs du lock.roster). 1.0.198 (story 76, D181, décision de l'utilisateur
+        Q2 précisé) : environ illisible (autre uid) -> run lu dans l'argv (_proc_argv_bkp_run : « borgHelper run <32 hex> » qui
+        suit --comment), pour un processus d'uid réel 0 ou du propriétaire du dossier du dépôt local du nick (_repo_owner_uid) ;
+        troisième compte, nick absent, dépôt distant : ignoré, comme avant. environ lisible : sa règle seule (inchangée). argv
+        illisible (hidepid) : ignoré (limite documentée)."""
+        out=set()
+        if not run_ids: return out
+        memo=[]
+        def owner():   # propriétaire du dépôt du nick : lu une fois, au premier create de la voie argv ; sans nick : aucun
+            if not memo: memo.append(self._repo_owner_uid(nick) if nick else None)
+            return memo[0]
+        for d in os.listdir('/proc'):
+            if not d.isdigit(): continue
+            r=_proc_create_run(int(d),owner)   # (revue 3) lecture commune ; aucune règle de vie ici (comme 1.0.189)
+            if r and r[0] and r[0] in run_ids: out.add(r[0])
         return out
 
     def bkp_status_notified(self,nick,run_id,db_path=None):
@@ -4510,6 +4564,10 @@ def _proc_live(pid,start):
     st,s0=_pid_stat(pid)   # 1.0.197 (story 75) : état et début d'une seule lecture, parseur commun
     return s0 is not None and s0==start and st not in ('Z','X',None)   # 1.0.188 (revue story 59) : mort (X) aussi, comme _pid_state
 
+# 1.0.198 (revue story 76) : mention d'un borg create orphelin (Status, Report, Report -o, voisin) — UNE source, importée par
+# borgHelperWWW (_never_cache : jamais en cache) : une reformulation ici ne peut pas désarmer son lecteur
+_ORPHAN_TXT='borg create encore actif'
+
 _BORG_SUBCMDS=frozenset(('benchmark','break-lock','check','compact','config','create','debug','delete','diff','export-tar','extract',
     'help','import-tar','info','init','key','list','mount','prune','recreate','rename','serve','umount','upgrade','version','with-lock'))
 
@@ -4524,6 +4582,64 @@ def _proc_argv(pid):
         with open(f'/proc/{pid}/cmdline','rb') as f: a=f.read()
     except OSError: return None
     return [x.decode(errors='replace') for x in a.split(b'\0')[:-1]] if a else None
+
+def _proc_environ(pid):
+    """1.0.198 (story 76) : environnement d'un processus (/proc/<pid>/environ), {bytes: bytes}. Illisible (autre uid, processus
+    non dumpable) : PermissionError ; fini : autre OSError — l'appelant distingue les deux."""
+    with open(f'/proc/{pid}/environ','rb') as f: return dict(x.split(b'=',1) for x in f.read().split(b'\0') if b'=' in x)
+
+# 1.0.198 (revue story 76) : erreurs de LECTURE absorbées par la recherche d'un orphelin (base occupée, illisible, refusée par
+# sys.exit, /proc ou dossier illisible) — SystemExit 130 (Ctrl-C) toujours relancé par l'appelant ; tout le reste se propage
+_READ_ERRORS=(OSError,sqlite3.Error,DbKeyError,DbModeError,DbCodecError,DbTamperError,SchemaVersionError,SystemExit)
+
+def _argv_bkp_run(a):
+    """1.0.198 (story 76, D181, décision de l'utilisateur Q2) : run_id d'un borg create lancé par backup(), lu dans son argv —
+    exactement comme backup() l'écrit : sous-commande create (première sous-commande borg de l'argv), puis --comment, puis
+    « borgHelper run <run_id> » (lisible d'un uid à l'autre, contrairement à environ) ; run_id = 32 caractères hexadécimaux
+    (uuid4().hex de backup()). --comment ailleurs (revue 3), sans --comment, autre commentaire, forme --comment=…,
+    commentaire cité pour le shell distant (SSH_REMFO : dépôt distant, inchangé), run d'une autre forme : None."""
+    j=next((i for i,x in enumerate(a) if i>0 and x in _BORG_SUBCMDS),None)
+    if j is None or a[j]!='create' or a[j+1:j+2]!=['--comment'] or len(a)<j+3: return None
+    c=a[j+2]
+    rid=c[len('borgHelper run '):] if c.startswith('borgHelper run ') else ''
+    return rid if re.fullmatch(r'[0-9a-f]{32}',rid) else None
+
+def _proc_uid(pid):
+    """1.0.198 (revue story 76) : uid RÉEL d'un processus (ligne « Uid: » de /proc/<pid>/status, premier champ) ; illisible ou
+    fini : None."""
+    try:
+        with open(f'/proc/{pid}/status') as f:
+            for l in f:
+                if l.startswith('Uid:'): return int(l.split()[1])
+    except (OSError,ValueError,IndexError): pass
+    return None
+
+def _proc_argv_bkp_run(pid,a,owner):
+    """1.0.198 (revue story 76, Q2 précisé — « un commentaire reste un commentaire ») : _argv_bkp_run, seulement pour un
+    processus d'uid réel 0 (Bkp par root/cron) ou `owner` (propriétaire du dossier du dépôt local, _repo_owner_uid) — tout
+    utilisateur local peut lancer `x create --comment "borgHelper run <run_id>"` (run_id visible par ps pendant le Bkp) ;
+    falsifier exige d'être root ou ce propriétaire. owner None (dépôt distant, propriétaire illisible) : pas de voie argv.
+    Troisième compte (ni root ni propriétaire, dépôt d'un groupe partagé compris) : ignoré (limite). Les processus du même
+    uid que le lecteur passent normalement par la voie environ ; le propriétaire du dépôt est accepté par décision de
+    l'utilisateur."""
+    if owner is None: return None
+    return _argv_bkp_run(a) if _proc_uid(pid) in (0,owner) else None
+
+def _proc_create_run(pid,owner):
+    """1.0.198 (revue 3 story 76) : lecture commune d'un `borg create` lancé par backup() — (run_id, environ lisible, environ)
+    ou None (pas un create, processus fini). environ lisible : run_id = BORGHELPER_BKP_RUN ('' si absente). Illisible
+    (PermissionError) : run_id de l'argv (_proc_argv_bkp_run, uid réel 0 ou `owner`), environ None. owner : uid, None, ou
+    fonction sans argument appelée seulement sur la voie argv (propriétaire du dépôt lu au premier besoin). Chaque appelant
+    garde sa règle de vie (BORGHELPER_BKP_PID, marqueurs, ou aucune)."""
+    a=_proc_argv(pid)
+    if not a or next((x for x in a[1:] if x in _BORG_SUBCMDS),None)!='create': return None
+    try: env=_proc_environ(pid)
+    except PermissionError: env=None   # autre uid, processus non dumpable -> argv
+    except OSError: return None        # fini entre-temps
+    if env is None:
+        return _proc_argv_bkp_run(pid,a,owner() if callable(owner) else owner),False,None
+    try: return env.get(b'BORGHELPER_BKP_RUN',b'').decode(),True,env
+    except UnicodeDecodeError: return None
 
 def _group_pids(pgid):
     """PID des processus VIVANTS du groupe `pgid` (champ pgrp de /proc/<pid>/stat, zombies exclus) ; /proc illisible : None.
@@ -8530,7 +8646,9 @@ class BorgHelper:
         'bkp_interrupted': {started_at, verifie} | None, 'bkp_stale': {started_at, timeout_s} | None, 'bkp_unknown': bool}
         (bkp_unknown : _bkp_live illisible — Status ne l'expose pas). 1.0.188 (story 59) : extrait
         de _status_one — source unique de Status et de borgHelperWWW (/access, alerte de retard), qui l'appelle dans une sonde
-        bornée et seulement s'il existe une ligne ouverte ou un marqueur (lock.roster d'un dépôt monté : jamais à chaque sondage).
+        bornée et seulement s'il existe une ligne ouverte ou un marqueur (lock.roster d'un dépôt monté : jamais à chaque sondage ;
+        1.0.198 : sans marqueur vivant ni orphelin du roster, lignes ouvertes relues et, s'il y en a une non périmée sur un dépôt
+        local, un parcours de /proc — ~10 ms pour 666 processus, mesuré, dans la sonde de 1 s).
         1.0.186 (story 55, décisions de l'utilisateur) : Bkp vivant, en attente de l'Index ou orphelin = _bkp_live, la source de
         Report (marqueur de Bkp, borg create orphelin) ; ligne ouverte non périmée sans rien de vivant = Bkp interrompu (avant :
         « Bkp en cours » pour toute ligne ouverte non périmée) ; périmée : inchangé. bkp_live=False : base seule, comme avant —
@@ -8566,13 +8684,13 @@ class BorgHelper:
             'bkp_unknown':bool(bkp_live and unknown),   # _bkp_live illisible (Status n'en dit rien ; /access : inconnu, jamais une fin)
         }
 
-    def bkp_status_timeout(self,nick):
+    def bkp_status_timeout(self,nick,quiet=False):
         """Délai (s) au-delà duquel un Bkp sans fin de ce nick est tenu pour interrompu (1.0.155, story 18) : clé rc
         BKP_STATUS_TIMEOUT du nick (section ou [DEFAULT]), sinon BORGHELPERWWW_BKP_STATUS_TIMEOUT, sinon 21600. Lu par Status
         et par borgHelperWWW (/access, watcher, alerte de retard). Nick absent ou rc illisible : variable, sinon 21600."""
         try: cfg=self.borg.cfgread(nick)
         except Exception: cfg=None   # rc illisible : jamais d'exception (watcher, /access)
-        return _bkp_status_timeout(cfg=cfg,nick=nick)
+        return _bkp_status_timeout(cfg=cfg,nick=nick,quiet=quiet)   # 1.0.198 : quiet -> aucun [WARN] (orphelin avant le verrou)
 
     def _status_print_one(self,st):
         printer(f"{st['nick']}:")
@@ -8594,7 +8712,7 @@ class BorgHelper:
         if run:
             try: readable=_bkp_running_readable(run['started_at'])
             except (ValueError,TypeError): readable=run['started_at']
-            what=("Bkp interrompu (borgHelper arrêté), borg create encore actif" if run.get('orphelin') else   # 1.0.186 (story 55)
+            what=(f"Bkp interrompu (borgHelper arrêté), {_ORPHAN_TXT}" if run.get('orphelin') else   # 1.0.186 (story 55)
                   "Bkp en attente de l'Index" if run.get('en_attente') else "Bkp en cours")
             printer(f"  {what} depuis {readable}{_BKP_UNTRACKED_TXT if run.get('sans_suivi') else ''}")   # 1.0.196 (story 74, Q1)
         bi=st.get('bkp_interrupted')
@@ -9400,7 +9518,7 @@ class BorgHelper:
             for r in runs:
                 if r in alive: rep['runs'][r]=RK_ALIVE
                 elif orp and orp['run_id']==r: rep['runs'][r]=RK_ORPHAN
-            for r in self.db.run_create_alive(set(runs)-set(rep['runs'])): rep['runs'][r]=RK_ORPHAN   # (revue story 63) avant le verrou
+            for r in self.db.run_create_alive(set(runs)-set(rep['runs']),nick): rep['runs'][r]=RK_ORPHAN   # (revue story 63) avant le verrou
             cand=[r for r in runs if r not in rep['runs']]
             if not cand: rep['verified']=True; return 0
             if self.borg.repoLocalAbsent(nick):   # (revue 2) comme _index_pass : jamais de borg sur un dépôt absent
@@ -9482,18 +9600,22 @@ class BorgHelper:
         if as_json: print(json.dumps(out,ensure_ascii=False,indent=2))
         return 0 if all(o['verified'] for o in out) else 1
 
-    def _bkp_live(self,nick,quiet=False,strict=False):
+    def _bkp_live(self,nick,quiet=False,strict=False,prelock=True,debug=0):
         """1.0.183 (story 50, demande et décisions de l'utilisateur) : Bkp VIVANT du nick — marqueur de Bkp vivant (bkp_markers :
         le processus du Bkp lui-même, Index de fin compris) ET, soit sa ligne bkp_status ouverte et non périmée (délai
         bkp_status_timeout), soit pas encore de ligne (Bkp en attente de l'Index, décision revue 2 : 'en_attente', début = date du
         marqueur). 1.0.184 (story 52) : sans marqueur vivant, Bkp TUÉ dont le borg create (BORGHELPER_BKP_RUN = run_id de la ligne
         ouverte non périmée) tient encore le dépôt local (repo_orphan_create) -> 'orphelin' ; le roster du dépôt est alors lu (le rc
-        aussi, pour son chemin), le délai rc et la base seulement s'il a un détenteur. Bkp tué sans borg vivant, périmé, autre
-        opération : None, comportement inchangé. Rend la ligne augmentée de 'depuis'
+        aussi, pour son chemin), le délai rc et la base seulement s'il a un détenteur — 1.0.198 (story 76) : sinon, sur un dépôt
+        local, les lignes ouvertes du nick sont lues et, s'il y en a une non périmée, /proc est parcouru pour un borg create
+        orphelin qui ne tient PAS encore le verrou (_bkp_prelock_orphan, ~10 ms pour 666 processus, mesuré ; prelock=False : jamais,
+        chemin du voisin). Bkp tué sans borg vivant, périmé, autre opération : None, comportement inchangé. Rend la ligne
+        augmentée de 'depuis'
         (« HH:MM (XhYYmin) », format de Status), 'started_iso' (UTC) et 'en_attente', et le dit sur stderr (sauf quiet) ; Report
         (en ligne comme -o) tire alors ce nick de la base, sans borg ni attente : avant, borg info échouait sur le verrou du dépôt
         (« Failed to create/acquire the lock », ligne ERREUR, code 2, aucun historique). Toute erreur de lecture : None (revue 2 :
-        SchemaVersionError & co restent signalées par la suite du Report, dans le try du nick).
+        SchemaVersionError & co restent signalées par la suite du Report, dans le try du nick) ; strict : exception (Status), sauf
+        dans la recherche d'un orphelin avant le verrou (1.0.198 : erreur = aucun orphelin, la règle d'avant).
         1.0.196 (story 74, D172) : L1 — chaque marqueur vivant est rapproché de SA ligne (bkp_status_open de son run_id, délai lu une
         fois) : le plus récent (début, puis date du marqueur) des Bkp vivants — en cours, sans suivi ou en attente de l'Index
         (marqueur sans ligne, début = date du marqueur) — est rendu, quelle que soit la ligne ouverte la plus récente du nick
@@ -9502,17 +9624,23 @@ class BorgHelper:
         suivi » du run (backup() : store_bkp_status_start en échec) : Bkp en cours, 'sans_suivi' True, début = date du marqueur,
         base non lue pour ce run (« Bkp en cours depuis … (suivi bkp_status indisponible) ») ; jamais soumis au délai
         bkp_status_timeout (sans ligne, aucun bkp_stale possible : son marqueur vivant prouve le processus) ; 'sans_suivi' False
-        sinon. Sans marqueur vivant : aucune lecture de plus."""
+        sinon. Sans marqueur vivant : aucune lecture de plus (1.0.198 : sauf les lignes ouvertes, ci-dessous).
+        1.0.198 (story 76, D183, décision de l'utilisateur Q1) : sans marqueur vivant ni orphelin de ses lignes dans le roster, un
+        borg create orphelin du run d'une ligne ouverte non périmée qui ne tient PAS encore le verrou (démarrage, attente du
+        verrou) est orphelin aussi (_bkp_prelock_orphan : dépôt local, base lue, /proc parcouru seulement s'il y a une telle
+        ligne) — avant : « Bkp interrompu … aucun processus » le temps de la fenêtre, et le watcher relançait BkpReconcile."""
         from datetime import datetime,timezone
         try:
             marks=self.db.bkp_markers(nick)
             if not marks:
-                # 1.0.184 (story 52) : borgHelper tué, le borg create de SON Bkp (ligne ouverte) tient encore le dépôt ; sans détenteur
-                # du verrou dans le roster du dépôt local, ni délai rc ni base lus
+                # 1.0.184 (story 52) : borgHelper tué, le borg create de SON Bkp (ligne ouverte) tient encore le dépôt
                 orp=self.db.repo_orphan_create(nick)   # revue 2 : run_id lu chez l'orphelin, sa ligne cherchée (pas la plus récente)
-                if not orp: return None
-                row=self.db.bkp_status_open(nick,orp['run_id'],timeout_s=self.bkp_status_timeout(nick))
-                if not row or row.get('stale'): return None
+                row=None
+                if orp:
+                    row=self.db.bkp_status_open(nick,orp['run_id'],timeout_s=self.bkp_status_timeout(nick))
+                    if row and row.get('stale'): row=None
+                if row is None and prelock: row=self._bkp_prelock_orphan(nick,debug=debug)   # 1.0.198 (D183, Q1) : avant le verrou
+                if row is None: return None
                 st=datetime.strptime(row['started_at'],"%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
                 row['en_attente']=False; row['orphelin']=True
             else:
@@ -9544,10 +9672,39 @@ class BorgHelper:
         try: row['depuis']=_bkp_running_readable(row['started_at'])
         except (ValueError,TypeError): row['depuis']=row['started_iso']
         if not quiet:
-            what=("Bkp interrompu (borgHelper arrêté), borg create encore actif" if row['orphelin'] else
+            what=(f"Bkp interrompu (borgHelper arrêté), {_ORPHAN_TXT}" if row['orphelin'] else
                   "Bkp en attente de l'Index" if row['en_attente'] else "Bkp en cours")
             printer(f"  {nick} : {what} depuis {row['depuis']}{_BKP_UNTRACKED_TXT if row['sans_suivi'] else ''} — rapport tiré de la base, borg non interrogé")
         return row
+
+    def _bkp_prelock_orphan(self,nick,debug=0):
+        """1.0.198 (story 76, D183, décision de l'utilisateur Q1) : Bkp TUÉ dont le borg create vit mais ne tient pas encore le
+        verrou du dépôt (chargeur PyInstaller qui démarre, attente du verrou : 1 s par défaut, plus avec BORG_LOCK_WAIT) — absent du
+        lock.roster, il est orphelin comme un détenteur (même état partout : Report, Report -o, Status, /access ; BkpReconcile le
+        dit déjà orphelin par run_create_alive). Appelé par _bkp_live seulement sans marqueur vivant du nick et sans orphelin de
+        ses lignes dans le roster. Dépôt local seulement (repo_orphan_checkable ; distant : inchangé, « non vérifiable »). /proc
+        parcouru (orphan_create_runs : règle d'un détenteur du roster — environ : borgHelper du Bkp mort ; illisible : argv et
+        aucun marqueur vivant du run) seulement s'il existe une ligne ouverte (open_bkp_runs) non périmée
+        (bkp_status_open, délai rc) ; le délai rc n'est lu que s'il y a une ligne ouverte. Rend la ligne (bkp_status_open) la plus
+        récente dont le create vit, ou None. Revue : toute erreur de lecture (history.db occupée ou illisible, /proc illisible) =
+        « pas d'orphelin avant le verrou » (la règle d'avant), jamais une exception — sous strict, Status perdait sinon « Bkp
+        interrompu » (bkp_unknown). Jamais appelé par le chemin du voisin (_bkp_neighbor : prelock=False)."""
+        try:
+            if not self.db.repo_orphan_checkable(nick): return None
+            runs=self.db.open_bkp_runs(nick)
+            if not runs: return None
+            t=self.bkp_status_timeout(nick,quiet=True)   # (revue 3) muet : sans détenteur, rien n'est dit (story 52)
+            fresh=[r for r in (self.db.bkp_status_open(nick,x,timeout_s=t) for x in runs) if r and not r.get('stale')]
+            if not fresh: return None
+            alive=self.db.orphan_create_runs(nick,{r['run_id'] for r in fresh})
+        except _READ_ERRORS as e:
+            # (revue 2) erreurs de LECTURE seules (base refusée par sys.exit de _open_db comprise ; Ctrl-C, 130, propagé) —
+            # une erreur de programmation se propage ; dite en debug (Report, Report -o : leur -d ; Status : jamais)
+            if isinstance(e,SystemExit) and e.code==130: raise
+            if debug: printer(f"[debug] {nick} : orphelin avant le verrou non cherché ({type(e).__name__}: {e})")
+            return None
+        rows=[r for r in fresh if r['run_id'] in alive]
+        return max(rows,key=lambda r:r['started_at']) if rows else None
 
     def _bkp_neighbor(self,nick):
         """1.0.183 (story 50, revue 2, décision de l'utilisateur) : Bkp vivant d'un AUTRE nick du même dépôt borg (_repo_key) —
@@ -9562,10 +9719,10 @@ class BorgHelper:
             try:
                 if self.db._repo_key(o)!=key: continue
             except Exception: continue
-            lv=self._bkp_live(o,quiet=True)
+            lv=self._bkp_live(o,quiet=True,prelock=False)   # 1.0.198 (revue) : create sans le verrou : ne bloque pas ce nick
             if lv:
                 lv['voisin']=o
-                what=f"Bkp de {o} interrompu, borg create encore actif" if lv['orphelin'] else f"Bkp de {o} en cours"   # 1.0.184
+                what=f"Bkp de {o} interrompu, {_ORPHAN_TXT}" if lv['orphelin'] else f"Bkp de {o} en cours"   # 1.0.184
                 printer(f"  {nick} : {what} sur le même dépôt depuis {lv['depuis']}{_BKP_UNTRACKED_TXT if lv['sans_suivi'] else ''} — rapport tiré de la base, borg non interrogé")
                 return lv
         return None
@@ -9581,7 +9738,7 @@ class BorgHelper:
         orphelin (false sinon), alerte code 1 quel que soit le précédent (voisin : jamais). Rend 0 ou 1."""
         cur=row.get('reste')
         if live.get('voisin'):
-            what=f"Bkp de {live['voisin']} interrompu, borg create encore actif" if live.get('orphelin') else f"Bkp de {live['voisin']} en cours"
+            what=f"Bkp de {live['voisin']} interrompu, {_ORPHAN_TXT}" if live.get('orphelin') else f"Bkp de {live['voisin']} en cours"
             ss=bool(live.get('sans_suivi'))   # 1.0.196 (story 74, Q1)
             mention=f"⏳ {what} sur le dépôt depuis {live['depuis']}"+(_BKP_UNTRACKED_TXT if ss else '')
             row['reste']=f"{cur} — {mention}" if cur not in (None,'') else mention
@@ -9592,7 +9749,7 @@ class BorgHelper:
         prev=self.db.previous_bkp_status(nick,None if live['en_attente'] or ss else live['run_id'])
         failed=bool(prev and prev['failed'])
         orph=bool(live.get('orphelin'))   # 1.0.184 (story 52) : Bkp interrompu, borg encore actif -> alerte (décision de l'utilisateur)
-        what="Bkp interrompu, borg create encore actif" if orph else "Bkp en attente de l'Index" if live['en_attente'] else "Bkp en cours"
+        what=f"Bkp interrompu, {_ORPHAN_TXT}" if orph else "Bkp en attente de l'Index" if live['en_attente'] else "Bkp en cours"
         mention=f"⏳ {what} depuis {live['depuis']}"+(_BKP_UNTRACKED_TXT if ss else '')+(" — Bkp précédent en erreur" if failed else '')
         row['reste']=f"{cur} — {mention}" if cur not in (None,'') else mention
         if as_json: row['bkp_en_cours']={'started_at':live['started_iso'],'depuis':live['depuis'],'precedent_en_erreur':failed,'en_attente':live['en_attente'],
@@ -9615,7 +9772,7 @@ class BorgHelper:
         for nick in nicks.split(','):
             if _orph: _orph=False; _release_orphan_connections()   # 1.0.182 (story 48) : nick précédent en erreur -> connexions orphelines libérées
             cfg=self.borg.cfgreaded(nick,debug=debug)
-            live=self._bkp_live(nick) or self._bkp_neighbor(nick)   # 1.0.183 (story 50) : jumelle de report()
+            live=self._bkp_live(nick,debug=debug) or self._bkp_neighbor(nick)   # 1.0.183 (story 50) : jumelle de report()
             mk=_print_mark()
             try:
                 (tcmpl,tbkps)=self.prep_report_from_db(nick,maxp=maxp)
@@ -9705,7 +9862,7 @@ class BorgHelper:
         for nick in nicks.split(','):
             if _orph: _orph=False; _release_orphan_connections()   # 1.0.182 (story 48) : nick précédent en erreur -> connexions orphelines libérées
             cfg=self.borg.cfgreaded(nick,debug=debug)
-            live=self._bkp_live(nick) or self._bkp_neighbor(nick)   # 1.0.183 (story 50) : Bkp vivant (ou du nick voisin) -> base seule, ni borg ni attente
+            live=self._bkp_live(nick,debug=debug) or self._bkp_neighbor(nick)   # 1.0.183 (story 50) : Bkp vivant (ou du nick voisin) -> base seule, ni borg ni attente
             if not live:
                 if self.db.check_priority_lock(nick):
                     printer(f"  {nick}: Bkp/Restore en cours — borg info sera mis en attente du verrou")
@@ -13226,8 +13383,9 @@ def codec_selftest(pattern=None,list_only=False):
             = date du marqueur (40 s avant) ; mx idem, history.db illisible -> idem (base non lue pour ce run) ; mxt témoin : history.db
             illisible SANS trace -> Status : rien, bkp_unknown ; Report : borg. md marqueur mort + trace -> borg, marqueur et trace
             retirés ; mo trace sans marqueur -> retirée ; mc marqueur vivant, ligne close -> rien (borg). mw marqueur sans ligne -> en
-            attente de l'Index (inchangé). Sans marqueur vivant : ni bkp_untracked, ni bkp_status_open/known, ni get_running lus par
-            _bkp_live. backup() (borg simulé, store_bkp_status_start en échec) : trace posée pendant create, retirée avec le marqueur."""
+            attente de l'Index (inchangé). Sans marqueur vivant : ni bkp_untracked, ni bkp_status_known, ni get_running lus par
+            _bkp_live ; bkp_status_open une fois par ligne ouverte (1.0.198, story 76 : orphelin avant le verrou). backup()
+            (borg simulé, store_bkp_status_start en échec) : trace posée pendant create, retirée avec le marqueur."""
             from datetime import datetime,timezone
             d=os.path.join(tmp,'s74'); shutil.rmtree(d,ignore_errors=True); os.makedirs(d); rc=os.path.join(d,'rc')
             nk=('ma','mt','m2','ml','mx','mxt','md','mo','mc','mw','mb','mb2','mi','mss','mwn','mva','mvb','mvc','mvd','mpe','mst','mst2')
@@ -13393,8 +13551,11 @@ def codec_selftest(pattern=None,list_only=False):
                     lv=[b._bkp_live(n,quiet=True) for n in ('md','mo')]
                     with mock.patch.object(b.db,'bkp_markers',lambda nick: {}): lv.append(b._bkp_live('ma',quiet=True))
                 after=[os.path.exists(x) for x in spied]
-                res['sans marqueur vivant : aucune lecture de plus (md marqueur mort + trace, mo trace seule : présents avant, retirés après)']=(
-                    lv==[None,None,None] and calls==[] and before==[True]*3 and after==[False]*3,lv,calls,before,after)
+                # 1.0.198 (story 76, Q1) : sans marqueur vivant, les lignes ouvertes de md et mo sont lues (bkp_status_open :
+                # un create orphelin avant le verrou n'est cherché que pour une ligne non périmée) — ni trace, ni
+                # bkp_status_known, ni ligne la plus récente
+                res['sans marqueur vivant : seules les lignes ouvertes lues (1.0.198) (md marqueur mort + trace, mo trace seule : présents avant, retirés après)']=(
+                    lv==[None,None,None] and calls==['open','open'] and before==[True]*3 and after==[False]*3,lv,calls,before,after)
                 # backup() réel, borg simulé : store_bkp_status_start en échec -> trace posée avant create, retirée avec le marqueur
                 obs={}
                 def fake_boex(nick,cmd,**kw):
@@ -16250,13 +16411,15 @@ fail()
             dans son environnement (comme backup()), lock.roster écrit à la main ; borg piégé (boex lève « borg appelé »).
             ro1 ligne ouverte (run 2) + create du run 2 -> base, « Bkp interrompu, borg create encore actif », orphelin: true, code 1 ;
             ro2 voisin sans ligne et ro15 voisin à sa propre ligne ouverte (run 5) -> « Bkp de ro1 interrompu », bkp_voisin, code 0 ;
-            négatifs (comme avant : borg en ligne, rien en -o) : ro3 `list` du run 2 (Index), ro4 create sans run (main, cron,
+            négatifs (comme avant : borg en ligne, rien en -o) : ro3 `list` du run de sa ligne (Index), ro4 create sans run (main, cron,
             borgmatic), ro5 create d'un autre run, ro6 lignes closes, ro7 ligne périmée, ro8 roster invalide, ro9 PID mort,
-            ro11 SSH_REPO, ro13 roster de forme inattendue, ro16 create du run 2 dont le borgHelper VIT (marqueur non écrit) ;
+            ro11 SSH_REPO, ro13 roster de forme inattendue, ro16 create du run de sa ligne dont le borgHelper VIT (marqueur non écrit) ;
             ro17 deux lignes ouvertes, l'orphelin est celui de la plus ancienne -> détecté, « depuis » = sa ligne ; ro10 marqueur vivant ->
             story 50 (orphelin: false) ; ro12 sans roster, délai rc invalide -> rien lu ; SSH_REMFO, « : », « {…} » -> aucun détenteur
             lu ; argv réel PyInstaller (borg.wrapped en argv[0]) ; backup() par le VRAI boex (BORG_EXE factice qui enregistre son
-            environnement) : BORGHELPER_BKP_RUN = run_id de sa ligne, BORGHELPER_BKP_PID = ce processus."""
+            environnement) : BORGHELPER_BKP_RUN = run_id de sa ligne, BORGHELPER_BKP_PID = ce processus. 1.0.198 (story 76) : les
+            négatifs ro3, ro4, ro5, ro8, ro9, ro13, ro16 ont leur ligne ouverte au run 4 (list et create « borgHelper vivant » au
+            run 4) — au run 2, le create orphelin vivant de ro1 (O1) serait LEUR orphelin avant le verrou (_bkp_prelock_orphan)."""
             from datetime import datetime,timedelta
             d=os.path.join(tmp,'rbo52'); shutil.rmtree(d,ignore_errors=True); os.makedirs(d); rc=os.path.join(d,'rc')
             fb=os.path.join(d,'fb'); os.makedirs(fb); fake=os.path.join(fb,'borg.wrapped')
@@ -16293,10 +16456,10 @@ fail()
                 dead=subprocess.Popen(['sleep','0.3']); mort=f"{dead.pid}:{_proc_start(dead.pid)}"; dead.wait()   # borgHelper « tué »
                 vif=f"{os.getpid()}:{_proc_start(os.getpid())}"   # borgHelper vivant (ce selftest)
                 O1=orphan('create',RUN(2),mort); orph.append(O1)
-                O2=orphan('list',RUN(2),mort); orph.append(O2)
+                O2=orphan('list',RUN(4),mort); orph.append(O2)   # 1.0.198 (story 76) : run 4, celui de la ligne de ro3
                 O3=orphan('create',None,None); orph.append(O3)
                 O4=orphan('create',RUN(9),mort); orph.append(O4)
-                O5=orphan('create',RUN(2),vif); orph.append(O5)
+                O5=orphan('create',RUN(4),vif); orph.append(O5)   # 1.0.198 : run 4, celui de la ligne de ro16
                 time.sleep(0.5)
                 roster={'ro1':O1[0],'ro3':O2[0],'ro4':O3[0],'ro5':O4[0],'ro6':O1[0],'ro7':O1[0],'ro9':dead.pid,'ro10':O1[0],'ro11':O1[0],
                         'ro16':O5[0],'ro17':O1[0],'ro18':O1[0]}
@@ -16313,7 +16476,7 @@ fail()
                                   "deduplicated_size,nfiles) VALUES(?,?,?,?,?,?,?,?)",(n,f'{n}-a1',recent,60,10,10,10,1))
                         c.close()
                         if n in ('ro2','ro12'): continue
-                        h=b.db.get_history_db(n); cur=RUN(5 if n=='ro15' else 2)
+                        h=b.db.get_history_db(n); cur=RUN(5 if n=='ro15' else 4 if n in ('ro3','ro4','ro5','ro8','ro9','ro13','ro16') else 2)
                         b.db.store_bkp_status_start(n,RUN(1),db_path=h); b.db.store_bkp_status_finish(n,RUN(1),'success',db_path=h)
                         b.db.store_bkp_status_start(n,cur,db_path=h)
                         if n=='ro6': b.db.store_bkp_status_finish(n,cur,'success',db_path=h)
@@ -16405,6 +16568,321 @@ fail()
             if bad: print(f"  {bad}")
             return not bad
         check("Report pendant un borg orphelin : base, « Bkp interrompu, borg create encore actif », code 1 (1.0.184)",_report_borg_orphelin)
+        def _orphelin_avant_verrou(part):
+            """1.0.198 (story 76, D183 Q1, D181 Q2, décisions de l'utilisateur ; revue) — Bkp tué (ligne ouverte non périmée, marqueur
+            mort), son `borg create` VIVANT sans le verrou du dépôt (aucun lock.roster) : faux create `python -c … create --comment
+            "borgHelper run <run>" ::a`, environ BORGHELPER_BKP_RUN=<run>, BORGHELPER_BKP_PID=<processus mort> ; borg piégé (boex
+            lève « borg appelé ») sauf borg list de BkpReconcile (aucune archive).
+            part 'lisible' (environ lisible) : va avant le verrou -> Status, Report, Report -o, bkp_state (/access : orphelin, aucun
+            interrompu ; watcher : bkp_running vrai), BkpReconcile 'orphelin' ; vc témoin sans create -> interrompu, 'absent' ; vd
+            create d'un AUTRE run -> comme vc ; ve argv illisible (hidepid, _proc_argv simulé None) -> comme vc ; vh dépôt distant
+            (SSH_REPO) -> Status inchangé « non vérifiable », BkpReconcile 'orphelin' (run_create_alive, comme depuis 1.0.189) ;
+            vk borgHelper vivant -> jamais orphelin. /proc non lu (os.listdir espionné) sans ligne ouverte (vf), ligne périmée (vg),
+            dépôt distant (vh) ; lu pour va. Erreur de lecture (history.db occupée, /proc illisible) -> pas d'orphelin avant le
+            verrou, jamais bkp_unknown : « Bkp interrompu » gardé. Dépôt partagé (second rc) : wb voisin de wa, create avant le
+            verrou, marqueur mort présent puis absent -> même réponse pour wa (aucun bkp_voisin, borg en ligne) ; wc create avant
+            le verrou en file derrière l'orphelin du roster d'un AUTRE nick (wd) -> orphelin (Status, Report -o, bkp_state).
+            _argv_bkp_run : formes refusées (cité SSH_REMFO, --comment=, autre texte, absent, dernier, vide, run non hexadécimal ou
+            de mauvaise longueur) ; _proc_argv_bkp_run (Q2 précisé) : uid réel 0 ou du propriétaire du dépôt seulement (uid lu
+            simulé : root et propriétaire acceptés ; lecteur non propriétaire, troisième compte, dépôt distant refusés) ;
+            _repo_owner_uid réel (dépôt local : ce compte ; distant : None). vm deux lignes ouvertes non périmées : la plus
+            ancienne a un create vivant avant le verrou, la plus récente vient d'un Bkp tué avant son create -> « encore actif
+            depuis » la plus ancienne (Status, Report -o), bkp_interrupted = la plus récente. Revue 2 : run_id uuid4 par run, faux
+            create dans leur propre groupe de processus, groupe tué en finally (un run relancé ne voit aucun reste). Revue 3 :
+            vx détenteur du roster mort, vy roster invalide, create du run vivant hors roster -> orphelin ; erreurs : TypeError
+            propagé (bkp_unknown), SystemExit 130 propagé, SystemExit 2 et DbKeyError absorbés, Report -o -d dit « [debug] …
+            non cherché » ; vt délai rc invalide -> aucun [WARN] sur ce chemin ; --comment ailleurs qu'après create refusé.
+            part 'illisible' (processus non dumpable : environ illisible, argv lisible — jamais sous euid 0, SKIP) : vb (create du
+            propriétaire du dépôt) -> orphelin partout ; vz create de root (uid simulé 0, propriétaire simulé autre) -> orphelin ;
+            vd create d'un autre run -> interrompu, 'absent' ; vu troisième compte (uid simulé) et vn lecteur non propriétaire
+            (propriétaire simulé autre) -> ignorés, 'absent' ; vr dans le roster -> orphelin par l'argv sans marqueur vivant de son
+            run, jamais avec ce marqueur, sans commentaire, ni d'un troisième compte."""
+            from datetime import datetime,timedelta
+            d=os.path.join(tmp,'s76'+part); shutil.rmtree(d,ignore_errors=True); os.makedirs(d)
+            RUNS={}; R=lambda n,k=2: RUNS.setdefault((n,k),uuid.uuid4().hex)   # revue 2 : run_id neufs à chaque run
+            recent=(datetime.now()-timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%S.000000')
+            res={}; procs=[]; insts=[]
+            def mkb(tag,nicks,repo_of,extra):
+                rc=os.path.join(d,'rc'+tag)
+                for r in set(repo_of.values()): os.makedirs(r,exist_ok=True)
+                with open(rc,'w') as f:
+                    f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache'+tag)}\nBORG_PASSPHRASE=pw\nSER_NAME=h\nSER_LOGIN=x\nGLOB_ARCH=*\n"
+                            f"BORG_ARCHNAME=t\nEXCLUDE=--exclude-caches\nDB_ENCRYPT=false\nMAX_AGE_BKP=1000000\n\n"
+                            +''.join(f"[{n}]\nBORG_REPO={repo_of[n]}\n"+extra.get(n,'')+"\n" for n in nicks))
+                os.chmod(rc,0o600)
+                bb=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'+tag)); insts.append((bb,bb.borg.boex)); return bb
+            def seed(bb,n,row=True,stale=False,marker=True):
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                    pdb=bb.db.get_diff_db(n); bb.db.ensure_diff_db(pdb)
+                    c=sqlite3.connect(pdb,isolation_level=None)
+                    c.execute("INSERT INTO archive_stats(nick,archive,archive_date,duration,original_size,compressed_size,"
+                              "deduplicated_size,nfiles) VALUES(?,?,?,?,?,?,?,?)",(n,f'{n}-a1',recent,60,10,10,10,1))
+                    c.close()
+                    if not row: return
+                    h=bb.db.get_history_db(n); bb.db.store_bkp_status_start(n,R(n),db_path=h)
+                    if stale:
+                        c=sqlite3.connect(h,isolation_level=None)
+                        c.execute("UPDATE bkp_status SET started_at=datetime('now','-120 seconds') WHERE nick=? AND run_id=?",(n,R(n))); c.close()
+                    if marker:
+                        with open(f"{bb.db._bkp_marker_base(n)}.{R(n)}",'w') as f: f.write(str(dead.pid))   # marqueur mort (Bkp tué)
+            def fake(run,bkp,dump=True,comment=True):   # faux borg create ; dump=False : non dumpable (environ illisible, argv lisible)
+                code='import ctypes,time\n'+('' if dump else 'ctypes.CDLL(None).prctl(4,0,0,0,0)\n')+'time.sleep(120)\n'
+                en=dict(os.environ); en.pop('BORGHELPER_BKP_RUN',None); en.pop('BORGHELPER_BKP_PID',None)
+                if run: en['BORGHELPER_BKP_RUN']=run; en['BORGHELPER_BKP_PID']=bkp
+                q=subprocess.Popen([sys.executable,'-c',code,'create']+(['--comment',f'borgHelper run {run}'] if comment else [])+['::a'],
+                                   env=en,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                                   start_new_session=True)   # revue 2 : son propre groupe, tué entier en finally
+                procs.append(q); t0=time.monotonic(); ok=False
+                while time.monotonic()-t0<10:
+                    try: open(f'/proc/{q.pid}/environ','rb').read(); rd=True
+                    except PermissionError: rd=False
+                    if rd==dump and (_proc_argv(q.pid) or [None])[-1]=='::a': ok=True; break
+                    time.sleep(0.05)
+                return q,ok
+            def run(fn,*a,**k):
+                o,e=io.StringIO(),io.StringIO()
+                with contextlib.redirect_stdout(o),contextlib.redirect_stderr(e):
+                    try: code=fn(*a,**k)
+                    except (Exception,SystemExit) as x: code=f"{type(x).__name__}: {x}"
+                return code,o.getvalue(),e.getvalue()
+            def row(o,n):
+                try: return (json.loads(o).get('summary') or {}).get(n) or {}
+                except ValueError: return {}
+            def fake_boex(nick,cmd,**kw):
+                if cmd and cmd[0]=='list' and '--format' in cmd: return {'exitcode':0,'stdout':[{'archives':[]}],'stderr':[]}
+                raise RuntimeError('borg appelé')
+            def recon(bb,n):
+                code,o,e=run(bb.bkp_reconcile,n,as_json=True)
+                try: return code,(json.loads(o)[0].get('runs') or {}).get(R(n))
+                except (ValueError,IndexError,AttributeError): return code,o[-200:]+e[-200:]
+            def orphan_everywhere(bb,n,label,rexp='orphelin'):
+                code,o,e=run(bb.status,n); st=bb.bkp_state(n); rs=recon(bb,n) if rexp else None
+                res[f'{n} {label} : Status, bkp_state (/access), BkpReconcile orphelin']=(
+                    'Bkp interrompu (borgHelper arrêté), borg create encore actif depuis' in e and 'aucun processus' not in e
+                    and (st['bkp_running'] or {}).get('orphelin') is True and st['bkp_interrupted'] is None and st['bkp_unknown'] is False
+                    and (rexp is None or rs==(0,rexp)),e[-300:],st,rs)
+                for fn,FN in ((bb.report,'Report'),(bb.report_offline,'Report -o')):
+                    c2,o2,e2=run(fn,n,as_json=True); r2=row(o2,n); bk=r2.get('bkp_en_cours') or {}
+                    res[f'{FN} {n} {label} : orphelin, ***, code 1, borg non appelé']=(c2==1 and r2.get('nom')==f'***{n}'
+                        and ' — ⏳ Bkp interrompu, borg create encore actif depuis ' in r2.get('reste','') and bk.get('orphelin') is True
+                        and 'bkp_voisin' not in r2 and 'borg appelé' not in o2+e2
+                        and f'{n} : Bkp interrompu (borgHelper arrêté), borg create encore actif depuis' in e2,c2,r2,e2[-300:])
+            def interrupted(bb,n,label,remote=False,rexp='absent'):
+                code,o,e=run(bb.status,n); st=bb.bkp_state(n); rs=recon(bb,n)
+                why='borg non vérifiable (dépôt distant)' if remote else 'aucun processus'
+                c2,o2,e2=run(bb.report_offline,n,as_json=True); r2=row(o2,n)
+                res[f'{n} {label} : inchangé — Status interrompu, bkp_state, BkpReconcile {rexp}, Report -o sans mention']=(
+                    'Bkp interrompu depuis' in e and why in e and 'encore actif' not in e and st['bkp_running'] is None
+                    and (st['bkp_interrupted'] or {}).get('verifie') is (not remote) and st['bkp_unknown'] is False and rs==(0,rexp)
+                    and c2==0 and '⏳' not in r2.get('reste','') and 'bkp_en_cours' not in r2,e[-300:],st,rs,c2,r2)
+            try:
+                dead=subprocess.Popen(['sleep','0.3']); mort=f"{dead.pid}:{_proc_start(dead.pid)}"; dead.wait()   # borgHelper « tué »
+                vif=f"{os.getpid()}:{_proc_start(os.getpid())}"
+                if part=='lisible':
+                    nk=('va','vc','vd','ve','vf','vg','vh','vk','vm','vx','vy','vt')
+                    b=mkb('',nk,{n:os.path.join(d,'r-'+n) for n in nk},{'vh':"SSH_REPO=u@h:/r\n",'vg':"BKP_STATUS_TIMEOUT=60\n",
+                                                                         'vt':"BKP_STATUS_TIMEOUT=abc\n"})
+                    for n in nk: seed(b,n,row=n not in ('vf','vm'),stale=n=='vg')
+                    # vm : ligne ancienne (run 1, -30 min, create vivant avant le verrou), ligne récente (run 2, tué avant son create)
+                    hm=b.db.get_history_db('vm')
+                    with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                        b.db.store_bkp_status_start('vm',R('vm',1),db_path=hm); b.db.store_bkp_status_start('vm',R('vm',2),db_path=hm)
+                    c=sqlite3.connect(hm,isolation_level=None)
+                    c.execute("UPDATE bkp_status SET started_at=datetime('now','-30 minutes') WHERE nick='vm' AND run_id=?",(R('vm',1),))
+                    vm_st={r:c.execute("SELECT started_at FROM bkp_status WHERE run_id=?",(R('vm',r),)).fetchone()[0] for r in (1,2)}; c.close()
+                    W=os.path.join(d,'r-w1'); W2=os.path.join(d,'r-w2')
+                    b2=mkb('2',('wa','wb','wc','wd'),{'wa':W,'wb':W,'wc':W2,'wd':W2},{})
+                    seed(b2,'wa',row=False); seed(b2,'wb'); seed(b2,'wc',marker=False); seed(b2,'wd',marker=False)
+                    F={n:fake(R(n),vif if n=='vk' else mort) for n in ('va','ve','vf','vg','vh','vk','wb','wc','wd','vx','vy','vt')}
+                    F['vd']=fake(R('zz'),mort); F['vm']=fake(R('vm',1),mort)
+                    res['décor : faux create vivants, environ lisible, argv lisible']=(all(ok for _,ok in F.values()),{k:ok for k,(_,ok) in F.items()})
+                    with open(os.path.join(W2,'lock.roster'),'w') as f: json.dump({'exclusive':[[f'{socket.gethostname()}@1',F['wd'][0].pid,0]]},f)
+                    # revue 3 : roster dont le détenteur est mort (vx) ou invalide (vy), create vivant du même run ailleurs dans /proc
+                    with open(os.path.join(d,'r-vx','lock.roster'),'w') as f: json.dump({'exclusive':[[f'{socket.gethostname()}@1',dead.pid,0]]},f)
+                    with open(os.path.join(d,'r-vy','lock.roster'),'w') as f: f.write('{"exclusive": [[')
+                    b.borg.boex=fake_boex; b2.borg.boex=fake_boex
+                    real_argv=_proc_argv; hide=F['ve'][0].pid
+                    with mock.patch(f"{__name__}._proc_argv",side_effect=lambda q: None if q==hide else real_argv(q)):
+                        orphan_everywhere(b,'va','avant le verrou')
+                        interrupted(b,'vc','témoin sans create'); interrupted(b,'vd','create d\'un autre run')
+                        interrupted(b,'ve','argv illisible (hidepid)'); interrupted(b,'vh','dépôt distant',remote=True,rexp='orphelin')
+                        orphan_everywhere(b,'vx','détenteur du roster mort, create du run vivant hors roster')
+                        orphan_everywhere(b,'vy','roster invalide, create du run vivant hors roster')
+                    hn=b.db.get_history_db('va')
+                    res['jamais d\'écriture : ligne de va toujours ouverte, non notifiée']=(sqlite3.connect(hn).execute(
+                        "SELECT finished_at,notified_at FROM bkp_status WHERE run_id=?",(R('va'),)).fetchone()==(None,None),)
+                    # revue : erreur de lecture -> pas d'orphelin avant le verrou, jamais une exception (Status garde « Bkp interrompu »)
+                    def boom(*a,**k): raise sqlite3.OperationalError('database is locked (contrôle)')
+                    def pboom(*a,**k): raise PermissionError('/proc illisible (contrôle)')
+                    with mock.patch.object(b.db,'open_bkp_runs',boom): s1=b.bkp_state('vc'); c1,_,e1=run(b.status,'vc')
+                    with mock.patch.object(b.db,'orphan_create_runs',pboom): s2=b.bkp_state('va'); c2,_,e2=run(b.status,'va'); l2=b._bkp_live('va',quiet=True,strict=True)
+                    res['erreur de lecture (history.db occupée, /proc illisible) : pas d\'orphelin avant le verrou, « Bkp interrompu » gardé, jamais bkp_unknown']=(
+                        s1['bkp_unknown'] is False and (s1['bkp_interrupted'] or {}).get('verifie') is True and 'Bkp interrompu depuis' in e1
+                        and s2['bkp_unknown'] is False and s2['bkp_running'] is None and (s2['bkp_interrupted'] or {}).get('verifie') is True
+                        and 'Bkp interrompu depuis' in e2 and l2 is None,s1,e1[-200:],s2,e2[-200:],l2)
+                    # revue 3 : erreurs de LECTURE seules absorbées — (a) erreur de programmation propagée, (b) Ctrl-C propagé,
+                    # (c) base refusée (SystemExit 2) et (d) DbKeyError absorbées, (e) dites par Report -o -d
+                    def raiser(x):
+                        def f(*a,**k): raise x
+                        return f
+                    with mock.patch.object(b.db,'orphan_create_runs',raiser(TypeError('erreur de programmation (contrôle)'))):
+                        sa=b.bkp_state('va'); la=raises(TypeError,lambda: b._bkp_live('va',quiet=True,strict=True))
+                    def exit_code(x):
+                        with mock.patch.object(b.db,'open_bkp_runs',raiser(x)):
+                            try: return ('rendu',b._bkp_prelock_orphan('vc'))
+                            except SystemExit as e: return ('SystemExit',e.code)
+                            except Exception as e: return (type(e).__name__,str(e))
+                    eb,ec,ed=exit_code(SystemExit(130)),exit_code(SystemExit(2)),exit_code(DbKeyError('clé (contrôle)'))
+                    with mock.patch.object(b.db,'open_bkp_runs',boom): ce,oe,ee=run(b.report_offline,'vc',debug=1,as_json=True)
+                    res['revue 3 : TypeError propagé (bkp_unknown, _bkp_live strict lève) ; SystemExit 130 propagé ; SystemExit 2 et DbKeyError absorbés ; Report -o -d dit l\'erreur']=(
+                        sa['bkp_unknown'] is True and la and eb==('SystemExit',130) and ec==('rendu',None) and ed==('rendu',None)
+                        and '[debug] vc : orphelin avant le verrou non cherché (OperationalError: database is locked (contrôle))' in oe+ee,
+                        sa,la,eb,ec,ed,ce,(oe+ee)[-300:])
+                    # revue 3 : délai rc invalide lu en silence sur le chemin avant le verrou (story 52 : rien dit sans détenteur)
+                    ct,ot,et=run(b.report_offline,'vt',as_json=True); rt=row(ot,'vt')
+                    res['vt délai rc invalide, ligne ouverte, create avant le verrou : Report -o orphelin, aucun [WARN] BKP_STATUS_TIMEOUT']=(
+                        ct==1 and (rt.get('bkp_en_cours') or {}).get('orphelin') is True and 'BKP_STATUS_TIMEOUT' not in ot+et,ct,rt,et[-300:])
+                    # aucune lecture de /proc sans ligne ouverte non périmée (vf, vg) ni sur un dépôt distant (vh) ; va : lue
+                    real_ls=os.listdir; seen=[]
+                    def spy(x='.'):
+                        if str(x).rstrip('/')=='/proc': seen.append(1)
+                        return real_ls(x)
+                    cnt={}
+                    with mock.patch(f"{__name__}.os.listdir",side_effect=spy):
+                        for n in ('vf','vg','vh','va'):
+                            del seen[:]; lv=b._bkp_live(n,quiet=True); cnt[n]=(len(seen),bool(lv and lv.get('orphelin')))
+                    res['/proc lu seulement avec une ligne ouverte non périmée, dépôt local (vf, vg, vh : 0 ; va : lu, orphelin)']=(
+                        cnt['vf']==(0,False) and cnt['vg']==(0,False) and cnt['vh']==(0,False) and cnt['va'][0]>0 and cnt['va'][1],cnt)
+                    res['vk borgHelper vivant (environ lisible) : pas orphelin avant le verrou']=(b._bkp_live('vk',quiet=True) is None,)
+                    # revue 2 : vm deux lignes ouvertes non périmées — « encore actif depuis » la plus ancienne, la récente interrompue
+                    code,o,e=run(b.status,'vm'); st=b.bkp_state('vm'); c2,o2,e2=run(b.report_offline,'vm',as_json=True); r2=row(o2,'vm')
+                    rd=_bkp_running_readable(vm_st[1])[:5]+' ('; ri=_bkp_running_readable(vm_st[2])[:5]+' ('   # HH:MM : la durée peut changer d'une minute
+                    res['vm deux lignes ouvertes : encore actif depuis la plus ancienne (Status, Report -o), bkp_interrupted = la plus récente']=(
+                        f'Bkp interrompu (borgHelper arrêté), {_ORPHAN_TXT} depuis {rd}' in e and f'Bkp interrompu depuis {ri}' in e and 'aucun processus' in e
+                        and (st['bkp_running'] or {}).get('orphelin') is True and st['bkp_running']['started_at']==vm_st[1]
+                        and (st['bkp_interrupted'] or {}).get('started_at')==vm_st[2] and c2==1
+                        and (r2.get('bkp_en_cours') or {}).get('started_at')==vm_st[1].replace(' ','T')+'Z'
+                        and f'{_ORPHAN_TXT} depuis {rd}' in r2.get('reste',''),e[-400:],st,vm_st,c2,r2)
+                    res['_repo_owner_uid réel : dépôt local -> ce compte, dépôt distant -> None']=(
+                        b.db._repo_owner_uid('va')==os.getuid() and b.db._repo_owner_uid('vh') is None,b.db._repo_owner_uid('va'),b.db._repo_owner_uid('vh'))
+                    # revue : voisin (wb) avec un create avant le verrou, marqueur mort présent puis absent -> même réponse pour wa
+                    mkw=f"{b2.db._bkp_marker_base('wb')}.{R('wb')}"; ans=[]
+                    for present in (True,False):
+                        for fn in (b2.report_offline,b2.report):
+                            if present:
+                                with open(mkw,'w') as f: f.write(str(dead.pid))
+                            elif os.path.exists(mkw): os.unlink(mkw)
+                            pres=(os.path.exists(mkw),b2.db.any_bkp_marker())   # absent : porte de _bkp_neighbor fermée aussi
+                            c,o,e=run(fn,'wa',as_json=True); r=row(o,'wa')
+                            ans.append((pres,(c,'bkp_voisin' in r,'⏳' in r.get('reste',''),'borg appelé' in r.get('reste',''))))
+                    lw=b2._bkp_live('wb',quiet=True)   # témoin : le create de wb EST un orphelin avant le verrou (chemin du nick)
+                    res['dépôt partagé : voisin wb orphelin avant le verrou, marqueur mort présent puis absent -> même réponse pour wa (aucun bkp_voisin, borg)']=(
+                        [p for p,_ in ans]==[(True,True),(True,True),(False,False),(False,False)] and ans[0][1]==ans[2][1]==(0,False,False,False)
+                        and ans[1][1]==ans[3][1]==(2,False,False,True) and bool(lw and lw.get('orphelin')),ans,lw)
+                    # revue : wc avant le verrou, en file derrière l'orphelin du roster d'un AUTRE nick (wd) du même dépôt
+                    ro=b2.db.repo_orphan_create('wc')
+                    res['décor : le roster du dépôt de wc tient l\'orphelin de wd']=(ro=={'pid':F['wd'][0].pid,'run_id':R('wd')},ro)
+                    code,o,e=run(b2.status,'wc'); st=b2.bkp_state('wc'); c2,o2,e2=run(b2.report_offline,'wc',as_json=True); r2=row(o2,'wc')
+                    res['wc avant le verrou derrière l\'orphelin de wd : Status, Report -o, bkp_state orphelin']=(
+                        'Bkp interrompu (borgHelper arrêté), borg create encore actif depuis' in e and 'aucun processus' not in e
+                        and (st['bkp_running'] or {}).get('orphelin') is True and st['bkp_interrupted'] is None
+                        and c2==1 and (r2.get('bkp_en_cours') or {}).get('orphelin') is True and 'bkp_voisin' not in r2,e[-300:],st,c2,r2)
+                    A=_argv_bkp_run; X=R('x')
+                    av=[A(['borg','create','--comment',f'borgHelper run {X}','r::a']),A(['ssh','h','borg','create','--comment',shlex.quote(f'borgHelper run {X}')]),
+                        A(['borg','create',f'--comment=borgHelper run {X}']),A(['borg','create','--comment','autre','r::a']),A(['borg','create','r::a']),
+                        A(['borg','create','--comment']),A(['borg','create','--comment','borgHelper run ']),A(['borg','create','--comment',f'borgHelper run {X} y']),
+                        A(['borg','create','--comment','borgHelper run '+'Z'*32]),A(['borg','create','--comment',f'borgHelper run {X[:31]}']),
+                        A(['borg','create','--comment','borgHelper run AB'+X[2:]]),A(['borg','create','r::a','--comment',f'borgHelper run {X}']),
+                        A([sys.executable,'-c','x','create','--comment',f'borgHelper run {X}','::a'])]
+                    res['_argv_bkp_run : create puis --comment puis run de 32 hex (cité SSH_REMFO, --comment=, autre, absent, dernier, vide, espace, non hex, 31 car., majuscules, --comment ailleurs -> None)']=(
+                        av==[X]+[None]*11+[X],av)
+                    argv=['borg','create','--comment',f'borgHelper run {X}','r::a']
+                    me,own,third=os.geteuid(),os.geteuid()+11111,os.geteuid()+22222; uu={}
+                    for lbl,u,ow in (('root',0,own),('propriétaire',own,own),('lecteur non propriétaire',me,own),('troisième compte',third,own),
+                                     ('uid illisible',None,own),('root, dépôt distant',0,None),('propriétaire, dépôt distant',own,None)):
+                        with mock.patch(f"{__name__}._proc_uid",return_value=u): uu[lbl]=_proc_argv_bkp_run(os.getpid(),argv,ow)
+                    res['_proc_argv_bkp_run (Q2 précisé) : root et propriétaire du dépôt acceptés ; lecteur non propriétaire, troisième compte, uid illisible, dépôt distant -> None']=(
+                        uu=={'root':X,'propriétaire':X,'lecteur non propriétaire':None,'troisième compte':None,'uid illisible':None,
+                             'root, dépôt distant':None,'propriétaire, dépôt distant':None} and _proc_uid(os.getpid())==os.getuid(),uu)
+                else:
+                    nk=('vb','vd','vu','vr','vn','vz')
+                    b=mkb('',nk,{n:os.path.join(d,'r-'+n) for n in nk},{})
+                    for n in nk: seed(b,n)
+                    F={'vb':fake(R('vb'),mort,dump=False),'vd':fake(R('zy'),mort,dump=False),'vu':fake(R('vu'),mort,dump=False),
+                       'vn':fake(R('vn'),mort,dump=False),'vz':fake(R('vz'),mort,dump=False),
+                       'vr':fake(R('vr'),mort,dump=False),'vr2':fake(R('vr',3),mort,dump=False,comment=False)}
+                    res['décor : faux create vivants, environ illisible, argv lisible']=(all(ok for _,ok in F.values()),{k:ok for k,(_,ok) in F.items()})
+                    b.borg.boex=fake_boex
+                    real_uid=_proc_uid; real_own=b.db._repo_owner_uid
+                    fu={F['vu'][0].pid:os.geteuid()+12345,F['vz'][0].pid:0}   # vu troisième compte ; vz root
+                    fo={'vn':os.geteuid()+54321,'vz':os.geteuid()+54321}       # vn, vz : dépôt d'un autre propriétaire (lecteur non propriétaire)
+                    with mock.patch(f"{__name__}._proc_uid",side_effect=lambda q: fu.get(q,real_uid(q))),\
+                         mock.patch.object(b.db,'_repo_owner_uid',side_effect=lambda n: fo.get(n,real_own(n))):
+                        orphan_everywhere(b,'vb','propriétaire du dépôt (environ illisible)')
+                        orphan_everywhere(b,'vz','root, dépôt d\'un autre propriétaire (uid simulé)')
+                        interrupted(b,'vd','create d\'un autre run (environ illisible)')
+                        interrupted(b,'vu','troisième compte (uid simulé) : ignoré')
+                        interrupted(b,'vn','lecteur non propriétaire du dépôt (propriétaire simulé) : ignoré')
+                    qr=F['vr'][0].pid; qr2=F['vr2'][0].pid; rost=os.path.join(d,'r-vr','lock.roster')
+                    def hold(q):
+                        with open(rost,'w') as f: json.dump({'exclusive':[[f'{socket.gethostname()}@1',q,0]]},f)
+                    hold(qr); g1=b.db.repo_orphan_create('vr')
+                    mk=f"{b.db._bkp_marker_base('vr')}.{R('vr')}"
+                    with open(mk,'w') as f: f.write(str(os.getpid()))   # marqueur vivant de ce run (ce processus)
+                    g2=b.db.repo_orphan_create('vr')
+                    with open(mk,'w') as f: f.write(str(dead.pid))
+                    with mock.patch(f"{__name__}._proc_uid",side_effect=lambda q: os.geteuid()+12345 if q==qr else real_uid(q)): g4=b.db.repo_orphan_create('vr')
+                    hold(qr2); g3=b.db.repo_orphan_create('vr'); hold(qr)
+                    c4,o4,e4=run(b.report_offline,'vr',as_json=True); r4=row(o4,'vr')
+                    res['vr roster, environ illisible : orphelin par l\'argv sans marqueur vivant ; marqueur vivant, sans commentaire, troisième compte -> non']=(
+                        g1=={'pid':qr,'run_id':R('vr')} and g2 is None and g3 is None and g4 is None and c4==1
+                        and ' — ⏳ Bkp interrompu, borg create encore actif depuis ' in r4.get('reste',''),g1,g2,g3,g4,c4,r4)
+            finally:
+                for bb,ob in insts: bb.borg.boex=ob
+                for q in procs:
+                    try: os.killpg(q.pid,signal.SIGKILL)
+                    except OSError: pass
+                    try: q.wait(10)
+                    except (OSError,subprocess.TimeoutExpired): pass
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("Orphelin avant le verrou : Status, Report, /access, BkpReconcile, voisin, erreurs de lecture (1.0.198)",
+              lambda: _orphelin_avant_verrou('lisible'))
+        # revue 3 : _proc_uid réel — ce processus (indépendant de l'hôte), puis PID 1 seulement s'il appartient à root
+        check("_proc_uid : uid réel de ce processus = os.getuid() (1.0.198)",lambda: _proc_uid(os.getpid())==os.getuid())
+        N76P="_proc_uid : PID 1 de root lu 0 (1.0.198)"
+        try:
+            p1why=None if os.stat('/proc/1').st_uid==0 else "PID 1 n'appartient pas à root (conteneur, espace de noms)"
+            if p1why is None:
+                with open('/proc/1/status') as f: f.read()
+        except OSError as e: p1why=f"/proc/1 illisible ({type(e).__name__} : hidepid, conteneur)"
+        if p1why and not list_only: skip(N76P,p1why)
+        else: check(N76P,lambda: _proc_uid(1)==0)
+        N76="Orphelin avant le verrou, environ illisible (borg create d'un autre uid) : argv, roster, uid non root ignoré (1.0.198)"
+        def _nondumpable_probe():
+            """Revue 3 : un processus non dumpable a-t-il ici un environ illisible ? None si oui (cas simulables), sinon la raison
+            (root, CAP_SYS_PTRACE, prctl refusé, sonde impossible) — jamais un faux FAIL ni un succès muet."""
+            code=("import ctypes,time\nr=ctypes.CDLL(None).prctl(4,0,0,0,0)\nprint('ok',r,flush=True)\ntime.sleep(30)\n")
+            try: q=subprocess.Popen([sys.executable,'-c',code],stdout=subprocess.PIPE,stdin=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,text=True,start_new_session=True)
+            except OSError as e: return f"sonde impossible ({e})"
+            try:
+                if not select.select([q.stdout],[],[],10)[0]: return "sonde muette (10 s)"
+                l=q.stdout.readline().split()
+                if l!=['ok','0']: return f"prctl(PR_SET_DUMPABLE, 0) refusé ({' '.join(l) or 'aucune réponse'})"
+                try: open(f'/proc/{q.pid}/environ','rb').read()
+                except PermissionError: return None
+                except OSError as e: return f"sonde impossible ({e})"
+                return f"environ d'un processus non dumpable lisible ici (euid {os.geteuid()} : root, CAP_SYS_PTRACE…)"
+            finally:
+                try: os.killpg(q.pid,signal.SIGKILL)
+                except OSError: pass
+                q.wait()
+                q.stdout.close()
+        why76=_nondumpable_probe() if (not list_only and _selected(N76)) else None
+        if why76: skip(N76,why76+" — cas « environ illisible » non simulables")
+        else: check(N76,lambda: _orphelin_avant_verrou('illisible'))
         def _reconcile_bkp_tue():
             """1.0.185 (story 54, décisions de l'utilisateur) — rapprochement d'un Bkp tué dont l'archive est écrite : lignes bkp_status
             et marqueurs écrits à la main, borg list simulé (commentaire, fin). rk1 ligne ouverte, marqueur mort, archive « borgHelper

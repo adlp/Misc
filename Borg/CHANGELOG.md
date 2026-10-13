@@ -1,5 +1,76 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.198, borgHelperWWW 1.31.14 — Orphelin avant le verrou, borg create d'un autre uid — 2026-10-13
+
+Chantier « reconstruction progressive », story 76 (reports D183 et D181 de la revue 2 de la story 63 ; décisions de
+l'utilisateur Q1 = A, Q2 = A). Un `borg create` du run d'un Bkp tué, vivant, est un orphelin qu'il tienne le verrou du dépôt
+ou non, et qu'on lise son environnement ou seulement son argv.
+
+- D183 — orphelin avant le verrou : un Bkp tué dont le `borg create` vit encore mais ne tient pas encore le verrou du dépôt
+  (démarrage du chargeur PyInstaller, attente du verrou : 1 s par défaut, plus avec `BORG_LOCK_WAIT`) n'était cherché que dans
+  le `lock.roster` : Report, Report -o, Status et `/access` le disaient « Bkp interrompu … — aucun processus » le temps de la
+  fenêtre, pendant que BkpReconcile le voyait orphelin — le watcher de borgHelperWWW relançait BkpReconcile à chaque passage.
+  Désormais même état qu'un orphelin détenteur du verrou partout : Report/Report -o « ⏳ Bkp interrompu, borg create encore
+  actif » (alerte, code 1), Status « Bkp interrompu (borgHelper arrêté), borg create encore actif », `/access` `orphelin` (le
+  watcher ne relance plus BkpReconcile pendant la fenêtre). `/proc` n'est parcouru que sans marqueur de Bkp vivant du nick,
+  sans orphelin de ses lignes dans le roster, et s'il existe une ligne `bkp_status` ouverte non périmée (dépôt local) : un nick
+  sans telle ligne ne lit pas `/proc` (Report de tous les nicks). Sans marqueur vivant, les lignes ouvertes du nick sont lues
+  dans la base (avant : rien). Règle d'un processus = celle d'un détenteur du roster (borgHelper du Bkp mort ; un `borg create`
+  dont le borgHelper vit n'est jamais orphelin). Dépôt distant : inchangé (« borg non vérifiable (dépôt distant) »).
+- D181 — `borg create` d'un autre uid (Bkp par root/cron, borgHelperWWW sous un compte de service) : `/proc/<pid>/environ`
+  illisible, BkpReconcile concluait « absent » et le watcher notifiait un échec (push, Sentry) alors que l'archive pouvait
+  arriver ensuite. Le create est reconnu aussi par son argv : élément `borgHelper run <run_id>` qui suit `--comment` (posé par
+  `backup()` depuis 1.0.185, lisible d'un uid à l'autre) — dans `run_create_alive` (BkpReconcile) et pour un détenteur du
+  roster (`repo_orphan_create` : borgHelper du Bkp mort prouvé alors par l'absence de marqueur vivant de ce run, faute de
+  `BORGHELPER_BKP_PID` lisible). Environnement lisible : sa règle seule, inchangée. Chemin argv réservé (revue, décision de
+  l'utilisateur « Q2 précisé » : « un commentaire reste un commentaire ») à un processus d'uid réel 0 (Bkp par root/cron)
+  ou du propriétaire du dossier du dépôt local (`os.stat` de `BORG_REPO`) : tout utilisateur local peut lancer `x create
+  --comment "borgHelper run <run_id>"` (run_id visible par `ps` pendant le Bkp) — faux orphelin, aucune fin « échec » avant le
+  délai ; le falsifier exige d'être root ou ce propriétaire. Forme exacte de `backup()` exigée : `create`, puis `--comment`,
+  puis `borgHelper run <run_id>` en 32 caractères hexadécimaux. Dépôt distant ou propriétaire illisible : pas de voie argv.
+  Lecture argv/environ/uid commune (`_proc_create_run`) ; chaque appelant garde sa règle de vie. Limites : Bkp sous un
+  troisième compte, ni root ni propriétaire du dépôt — dépôt d'un groupe partagé (dossier setgid écrit par plusieurs
+  comptes) compris : tout compte autre que le propriétaire en est un — (jamais reconnu par l'argv) ; `/proc` en `hidepid` (argv illisible) — comme avant ; commentaire cité pour le shell distant
+  (`SSH_REMFO`) jamais lu.
+- Un `borg create` d'un AUTRE run, ou sans le commentaire du run (environnement illisible), n'en est jamais un ; aucune
+  écriture dans la base depuis ces lecteurs.
+- Revue : le chemin du voisin (Report d'un autre nick du même dépôt) ne cherche jamais l'orphelin avant le verrou — un create
+  qui ne tient pas le verrou ne bloque pas le borg de ce nick, et la réponse aurait dépendu du marqueur mort du voisin encore
+  sur disque. Une erreur de lecture dans cette recherche (history.db occupée ou illisible, `/proc` illisible) vaut « aucun
+  orphelin avant le verrou » (règle d'avant), jamais une exception : Status garde « Bkp interrompu » (pas d'état inconnu) ;
+  erreurs de lecture seules (OSError, SQLite, base refusée), dites par Report et Report -o avec `-d` (Status : jamais) ; une
+  erreur de programmation se propage. Le délai rc (`BKP_STATUS_TIMEOUT`) est lu sans `[WARN]` sur ce chemin (story 52 : rien
+  dit sans détenteur). Un détenteur du roster mort ou un roster invalide n'empêchent pas de voir le create du run vivant
+  ailleurs dans `/proc`. Coût mesuré du parcours de `/proc` : ~10 ms pour 666 processus, dans la sonde bornée de 1 s de
+  `/access`.
+- Texte « borg create encore actif » défini une fois (`_ORPHAN_TXT`), aux 5 sites qui l'impriment (Status, Report, voisin),
+  importé par borgHelperWWW comme les états `RK_*`.
+- borgHelperWWW 1.31.14 : toute réponse qui contient le texte d'un borg create orphelin (« borg create encore actif », stdout
+  ou stderr — Report, Report -o, voisin, Status compris) n'est jamais mise en cache (`_never_cache`, prédicat partagé) : un
+  create orphelin avant le verrou n'est pas dans le `lock.roster`, et s'il meurt sans avoir pris le verrou
+  (`BORG_LOCK_WAIT` dépassé) l'empreinte ne change pas — `/report?offline=true` resservait « encore actif » (code 1)
+  jusqu'à 5 min. Effet réel dans `run_borghelper` (`_RESPONSE_CACHE`, codes 0 et 1) ; les caches par périmètre ne gardent
+  que le code 0 de commandes qui n'impriment jamais ce texte. Push selftest : contrôle du cache des réponses étendu (formes
+  réelles construites sur `_ORPHAN_TXT` importé : orphelin du nick, voisin, stderr seul ; prédicat vérifié aussi aux
+  caches par périmètre sur la forme code 0).
+- Mesuré (CLI réelle, `work/s76/mesure76.sh`, bacs `avant1` sur 1.0.197 / `apres1`) : Bkp tué (ligne ouverte, marqueur
+  mort), faux `borg create` vivant sans `lock.roster` — environnement lisible : avant, Status « … — aucun processus », Report -o
+  rien, BkpReconcile `orphelin` ; après, Status et Report -o « borg create encore actif », BkpReconcile `orphelin` ;
+  environnement illisible (processus non dumpable, argv lisible) : avant, BkpReconcile `absent` ; après, `orphelin` et les
+  mêmes Status/Report -o ; témoin sans create inchangé (interrompu, `absent`).
+- CodecSelfTest : deux contrôles « Orphelin avant le verrou » — environnement lisible (avant le verrou, témoin, autre run,
+  argv illisible, dépôt distant, `/proc` non lu sans ligne ouverte non périmée, erreurs de lecture, voisin avec marqueur mort
+  présent puis absent, create en file derrière l'orphelin du roster d'un autre nick, deux lignes ouvertes dont la plus
+  ancienne a son create vivant, formes refusées de l'argv, règle d'uid : root et propriétaire du dépôt acceptés, lecteur
+  non propriétaire et troisième compte refusés) et environnement illisible (propriétaire du dépôt, root, autre run,
+  troisième compte et lecteur non propriétaire ignorés, roster) — ce dernier sauté (SKIP dit) quand une sonde montre
+  qu'un processus non dumpable garde ici un environnement lisible (root, CAP_SYS_PTRACE…) ; run_id neufs (uuid4) à chaque
+  run, faux create dans leur propre groupe de processus, tué en fin de contrôle ; erreurs : programmation propagée,
+  Ctrl-C propagé, base refusée et clé absorbées, `[debug]` de Report -o ; délai rc invalide muet ; détenteur du roster
+  mort ou roster invalide. Contrôles réels `_proc_uid` : ce processus = `os.getuid()` ; PID 1 lu 0 s'il appartient à root
+  (sinon SKIP dit). Décors des contrôles 1.0.184 et 1.0.196 ajustés (run propre aux négatifs ; lignes ouvertes lues sans
+  marqueur vivant).
+
 ## borgHelper 1.0.197, borgHelperWWW 1.31.13 — PID repris dans l'empreinte du roster — 2026-10-13
 
 Chantier « reconstruction progressive », story 75 (report D173, reste du tri A122 : le zombie était réglé par

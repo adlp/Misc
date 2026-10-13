@@ -546,10 +546,18 @@ début du Bkp) dans `reste`, nick en alerte (`***`, code 1), JSON `"bkp_en_cours
 dépôt : `— ⏳ Bkp de <nick> interrompu, borg create encore actif sur le dépôt depuis …`, `"bkp_voisin": {…, "orphelin": true}`,
 sans alerte de ce fait. Avant : en ligne `Failed to create/acquire the lock`, code 2 ; `-o` code 0, rien sur le Bkp (code 1
 désormais). Jamais pris pour cet orphelin : un `borg create` lancé à la main, par cron ou par borgmatic, celui d'un Bkp vivant
-ou d'un autre Bkp, un borg d'Index, de Restore ou de Prune. Limites (comportement d'avant) : Bkp lancé par une version
-< 1.0.184 ; Report sous un autre compte que le Bkp, ou `/proc` en `hidepid` (environnement illisible) ; `BORG_EXE` qui vide
-l'environnement ; dépôt non local (`hôte:chemin`, `{…}`, relatif, `~`, `file://`, `SSH_REPO`, `SSH_REMFO`) ; borg 2 ; ligne au-delà
-de `BKP_STATUS_TIMEOUT`. Après la fin de l'orphelin, l'archive existe mais le Bkp reste « jamais fini » (pas d'Index) : le Bkp
+ou d'un autre Bkp, un borg d'Index, de Restore ou de Prune. 1.0.198 : le `borg create` qui ne tient pas encore le verrou
+(démarrage du chargeur, attente du verrou) est cet orphelin aussi (cherché dans `/proc` seulement s'il existe une ligne
+`bkp_status` ouverte non périmée, sans marqueur de Bkp vivant). Environnement illisible (Report sous un autre compte que le
+Bkp) : le create est reconnu par son argv — `--comment "borgHelper run <run_id>"`, run de 32 caractères hexadécimaux —
+seulement s'il tourne sous root (Bkp par root/cron) ou sous le compte propriétaire du dossier du dépôt local (tout
+utilisateur peut écrire cet argv ; le falsifier exige d'être root ou ce propriétaire), son borgHelper étant tenu pour mort
+faute de marqueur de Bkp vivant de ce run. Limites (comportement d'avant) : Bkp lancé par une version < 1.0.184 (< 1.0.185
+pour un autre compte : pas de commentaire) ; Bkp sous un troisième compte, ni root ni propriétaire du dépôt (environnement
+illisible, argv ignoré) — dépôt d'un groupe partagé (dossier setgid écrit par plusieurs comptes) compris : tout compte autre
+que le propriétaire du dossier en est un ; `/proc` en `hidepid` (argv illisible) ; `BORG_EXE` qui vide l'environnement ; dépôt non local
+(`hôte:chemin`, `{…}`, relatif, `~`, `file://`, `SSH_REPO`, `SSH_REMFO`) ; borg 2 ; ligne au-delà de
+`BKP_STATUS_TIMEOUT`. Après la fin de l'orphelin, l'archive existe mais le Bkp reste « jamais fini » (pas d'Index) : le Bkp
 suivant le compte comme précédent en erreur (1.0.185 : rapproché par l'Index s'il porte le commentaire de son run). Cache de
 5 min de borgHelperWWW (`/report?offline=true`), renouvelé au premier appel après la fin de l'orphelin (dépôt local) depuis
 borgHelperWWW 1.31.3, et depuis 1.31.13 même si son PID a été repris entre-temps par un autre processus. Status (1.0.186) dit
@@ -1276,9 +1284,13 @@ borgHelper -c BkpReconcile -n ALL -j             # [{nick, verified, runs: {run_
 ```
 
 États : `fermé` (archive du run écrite, ligne fermée en succès), `absent` (vérifié : aucune archive de ce run), `vivant` (Bkp
-vivant), `orphelin` (son `borg create` vit encore — dépôt local, ou lancé avant d'avoir pris le verrou), `fin illisible`, `erreur
-de base`, `non fermé` (fermeture refusée, ou déjà faite par un autre rapprochement), `non vérifié` (`borg list` en échec ou arrêté,
-dépôt local absent), `non vérifiable` (dépôt distant : un `borg create` encore vivant n'y est pas visible — jamais dit `absent`).
+vivant), `orphelin` (son `borg create` vit encore, qu'il ait pris le verrou ou non ; environnement lisible : variable
+`BORGHELPER_BKP_RUN` ; 1.0.198, environnement illisible : argv `--comment "borgHelper run <run_id>"`, create de root ou du
+propriétaire du dossier du dépôt local seulement), `fin illisible`, `erreur de base`, `non fermé` (fermeture refusée, ou déjà
+faite par un autre rapprochement), `non vérifié` (`borg list` en échec ou arrêté, dépôt local absent), `non vérifiable` (dépôt
+distant, aucune archive de ce run et aucun `borg create` de ce run vu sur cette machine — jamais dit `absent`). Dépôt distant :
+un `borg create` du run qui tourne ICI avec un environnement lisible (`SSH_REPO`, `ssh://…`) est dit `orphelin` ; celui qui
+tourne sur une autre machine (`SSH_REMFO`) ou sous un autre compte n'est pas vu (pas de voie argv sans dépôt local).
 Texte : une ligne « `<nick> : Bkp <8 premiers caractères du run> — <état>` » par ligne `bkp_status` ouverte (Bkp interrompu ou
 vivant ; « `aucun Bkp interrompu` » sinon). Nick non vérifié : avec des lignes ouvertes, « `vérification impossible (borg list
 ou dépôt) — réessayer` » en plus ; sans ligne ouverte, « `<nick> : vérification impossible` » seule. Nick inconnu du rc (faute
@@ -1324,7 +1336,9 @@ Par nick :
   `borg_version`, quand `last_backup` porte `error`).
 - **Bkp en cours** (1.0.186 : comme Report — marqueur de Bkp vivant, borg create orphelin) : Bkp vivant « Bkp en cours
   depuis HH:MM (XhYYmin) » ; marqueur sans ligne encore « Bkp en attente de l'Index depuis … » ; borgHelper tué, son `borg
-  create` encore actif « Bkp interrompu (borgHelper arrêté), borg create encore actif depuis … » ; ligne `bkp_status` non
+  create` encore actif « Bkp interrompu (borgHelper arrêté), borg create encore actif depuis … » (1.0.198 : aussi avant qu'il
+  ne tienne le verrou du dépôt ; environnement illisible : seulement un create de root ou du propriétaire du dépôt, reconnu
+  par son argv — comme Report) ; ligne `bkp_status` non
   terminée sans rien de vivant « Bkp interrompu depuis … — aucun processus ; fermé au prochain Index si son archive existe »
   (dépôt distant — `hôte:chemin`, `{…}`, `SSH_REPO`, `SSH_REMFO` —, où un borg orphelin ne se voit pas : « — borgHelper
   arrêté, borg non vérifiable (dépôt distant) ; … ») — Report, lui, ne dit rien dans ce cas. Ligne d'un autre run que le Bkp
@@ -2437,7 +2451,9 @@ en cache miss silencieux, jamais une erreur visible). `_RESPONSE_CACHE` inclut d
 salé de la passphrase de la requête dans sa clé quand une passphrase est fournie (deux passphrases
 différentes pour le même appel ne partagent jamais une entrée) ; sans passphrase, comportement inchangé.
 Un résultat d'erreur de clé/mode de base n'est jamais mis en cache : rejoué à chaque appel plutôt que
-servi comme une réponse obsolète.
+servi comme une réponse obsolète. 1.31.14 : toute réponse qui contient « borg create encore actif » (Report, Report -o,
+voisin, Status) non plus — un create orphelin qui meurt avant d'avoir pris le verrou du dépôt ne change pas l'empreinte
+(`lock.roster` inchangé) : « encore actif », code 1, était resservi jusqu'à 5 min.
 
 | Méthode | Route | Commande CLI | Cache |
 |---------|-------|--------------|:---:|
@@ -2564,7 +2580,9 @@ Depuis 1.28.0, chaque nick lisible par l'appelant porte aussi (lectures locales 
   « ⏳ Bkp interrompu, borg create encore actif », « ⚠ Bkp interrompu » (au survol : « borgHelper arrêté — fermé au
   prochain Index si son archive existe ») ; un ▶ Backup suivi se termine dès que le Bkp n'est plus en cours. Coût par
   relecture (toutes les 30 s) : base et marqueurs (CACHE_DIR) ; le verrou du dépôt local (`lock.roster`, borg orphelin)
-  seulement s'il y a une ligne ouverte ou un marqueur, dans une sonde bornée (1 s ; figée : dernier état lu).
+  seulement s'il y a une ligne ouverte ou un marqueur, dans une sonde bornée (1 s ; figée : dernier état lu). borgHelper
+  ≥ 1.0.198 : sans marqueur vivant ni orphelin dans le roster, une ligne ouverte non périmée (dépôt local) ajoute un parcours
+  de `/proc` (borg create orphelin qui ne tient pas encore le verrou : `orphelin` aussi) — ~10 ms pour 666 processus, mesuré.
 - `index_last` (1.28.2, borgHelper ≥ 1.0.149) : résultat du dernier `Index` de ce nick, quel que soit son lanceur
   (CLI, cron, `POST /index`) — `{"nick","started_at","finished_at","outcome","code","via","message"}` avec `outcome`
   ∈ `ok`, `error`, `refused` (code 3), `busy` (« Index déjà en cours », rien fait), `deadline` (échéance atteinte
@@ -2609,8 +2627,14 @@ passage suivant ; aucune archive de ce run (vérifié) : fin **échec** aussitô
 (borgHelper arrêté, aucune archive de ce Bkp) » — pour chaque Bkp tué ainsi vérifié (plusieurs de suite : chacun) ; la ligne
 reste ouverte (`/access` : interrompu jusqu'au délai). Vérification impossible (borg list en échec, opération prioritaire, dépôt
 absent), fermeture ou réclamation refusée par la base : nouvel essai 10 min après ; Bkp redevenu vivant : revu au passage
-suivant ; fin d'archive illisible : dit au journal, fin au délai. Dépôt distant (un `borg create` encore vivant n'y est pas
-vérifiable), état illisible : comme avant, fin au délai `BKP_STATUS_TIMEOUT` (échec + « Sauvegarde bloquée ou interrompue »).
+suivant ; fin d'archive illisible : dit au journal, fin au délai. Dépôt distant (Status : « borg non vérifiable » — le watcher
+ne lance pas BkpReconcile), état illisible : comme avant, fin au délai `BKP_STATUS_TIMEOUT` (échec + « Sauvegarde bloquée ou
+interrompue »). borgHelper 1.0.198 : un Bkp dont le `borg create` vit encore sans tenir le verrou (démarrage, attente du
+verrou) est orphelin pour `/access` — le watcher ne lance plus BkpReconcile pendant cette fenêtre ; un `borg create` de root
+ou du propriétaire du dépôt dont l'environnement est illisible (Bkp par root/cron, borgHelperWWW sous un compte de service)
+est reconnu par son argv : BkpReconcile ne le dit plus `absent` — avant, fin **échec** et alerte Sentry « Sauvegarde
+interrompue » à tort, alors que l'archive arrivait ensuite (réglé). Troisième compte (ni root ni propriétaire) : non reconnu,
+comme avant.
 Mesuré (délai ramené à 90 s, watcher toutes les 5 s) : borgHelper et borg tués -> échec en 2 à 5 s (avant : au délai) ;
 archive écrite -> succès à 10 s (avant : échec au délai, jamais corrigé).
 
