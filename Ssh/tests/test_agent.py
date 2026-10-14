@@ -145,19 +145,21 @@ def hold_ensure_lock(bench):
     return fd
 
 
-def load_waiting(bench, *args, env=None):
+def load_waiting(bench, *args, env=None, keys=(), pre=()):
     """`sshvault load …` lancé ensure.lock tenu : il lit le coffre, puis attend le verrou (ligne
-    d'attente sur stderr) sans rien ajouter à l'agent."""
+    d'attente sur stderr) sans rien ajouter à l'agent (`keys` : clés déjà présentes ; `pre` :
+    options globales, avant « load »)."""
     from test_forward import wait_stderr
-    n_bw = len(bench.calls())
-    p = subprocess.Popen([sys.executable, "-m", "sshvault", "load", *args], env=dict(bench.env, **(env or {})),
+    n_bw, n_add = len(bench.calls()), len(adds(bench))
+    p = subprocess.Popen([sys.executable, "-m", "sshvault", *pre, "load", *args], env=dict(bench.env, **(env or {})),
                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          start_new_session=True)
     seen = wait_stderr(p, "attente d'un chargement en cours (ensure)")
     assert "attente d'un chargement en cours (ensure)…" in seen, seen
     time.sleep(0.3)
     assert p.poll() is None, "load attend le verrou"
-    assert adds(bench) == [] and bench.agent_keys() == [], "rien ajouté pendant l'attente"
+    loads = [a for a in adds(bench)[n_add:] if not a.startswith("-H ")]  # « -H » seul : contrôle de --restrict
+    assert loads == [] and bench.agent_keys() == list(keys), "rien ajouté pendant l'attente"
     assert any(c["argv"][1:3] == ["get", "item"] for c in bench.calls()[n_bw:]), "coffre lu avant le verrou"
     return p, seen
 
@@ -206,6 +208,315 @@ def test_load_cle_chargee_pendant_l_attente(bench, force):
         assert adds(bench) == [], "rien rechargé"
         assert fp not in bench.agent_state()["keys"], "état non écrit"
     assert bench.agent_keys() == [bench.blob("prod")]
+
+
+ID_B = "99999999-9999-4999-8999-999999999999"
+
+
+def remove_key(bench, name):
+    """Retire la clé `name` de l'agent dédié (vrai ssh-add -d, sans l'enveloppeur du banc)."""
+    from bench import SSH_ADD
+    pub = bench.tmp / ("%s.pub" % name)
+    pub.write_text(bench.keys[name]["public"] + "\n")
+    r = subprocess.run([SSH_ADD, "-d", str(pub)], env=dict(bench.env, SSH_AUTH_SOCK=str(bench.sock())),
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+
+
+def test_load_cle_retiree_pendant_l_attente(bench):
+    """Matrice : A présente au départ (« déjà chargée »), B à charger ; A retirée de l'agent
+    pendant que load attend ensure.lock : B chargée, A rechargée avec la durée et les options de
+    la commande (relue sans invite), état écrit pour les deux, code 0 ; `agent status` les montre."""
+    unlocked(bench)
+    bench.add_item(ssh_item(ID_B, "Prod B", bench.keys["perso"], hosts="b.example"))
+    assert bench.run("load", "--id", ID_PROD).returncode == 0
+    n = len(adds(bench))
+    fd = hold_ensure_lock(bench)
+    try:
+        p, _ = load_waiting(bench, "--name", "prod", "-t", "10m", "--confirm", keys=[bench.blob("prod")])
+        remove_key(bench, "prod")
+        assert bench.agent_keys() == []
+    finally:
+        os.close(fd)
+    out, err = p.communicate(timeout=60)
+    assert p.returncode == 0, err
+    assert b"Traceback" not in err and b"non recharg" not in err, err
+    fa, fb = bench.keys["prod"]["fingerprint"], bench.keys["perso"]["fingerprint"]
+    assert out.decode().splitlines() == [
+        "déjà chargée : Serveur Prod %s (--force pour recharger)" % fa,
+        "chargée : Prod B %s (durée 10m, confirmation)" % fb,
+        "rechargée (retirée pendant l'attente) : Serveur Prod %s (durée 10m, confirmation)" % fa]
+    assert adds(bench)[n:] == ["-t 600 -c -", "-t 600 -c -"]
+    assert sorted(bench.agent_keys()) == sorted([bench.blob("prod"), bench.blob("perso")])
+    keys = bench.agent_state()["keys"]
+    for f, iid in ((fa, ID_PROD), (fb, ID_B)):
+        assert (keys[f]["id"], keys[f]["lifetime"], keys[f]["confirm"], keys[f]["restrict"]) == (iid, 600, True, False)
+    gets = [c for c in bench.calls() if c["argv"][1:3] == ["get", "item"]]
+    assert [c["argv"][3] for c in gets][-2:] == [ID_B, ID_PROD], "B lue avant le verrou, A relue sous le verrou"
+    r = bench.run("agent", "status")
+    rows = {l.split("\t")[1]: l.split("\t")[1:] for l in r.stdout.splitlines()[3:]}
+    for name in ("Serveur Prod", "Prod B"):
+        assert re.fullmatch(r"(10m00s|9m[0-5]\ds)", rows[name][3]) and rows[name][4] == "confirmation", rows
+
+
+@pytest.mark.parametrize("change,why", [("lock", "verrouillé"), ("logout", "déconnecté")])
+def test_load_cle_retiree_compte_ferme_pendant_l_attente(bench, change, why):
+    """Matrice : A (compte alice) présente au départ puis retirée, compte alice verrouillé ou
+    déconnecté pendant l'attente ; B (compte boulot) : B chargée, « A non rechargée », code 0."""
+    unlocked(bench)
+    bench.add_account("boulot", "bob@example.test", items=[ssh_item(ID_B, "Prod B", bench.keys["perso"],
+                                                                     hosts="b.example")],
+                      unlocked=True, where="keyring" if bench.ring else "file", default=True)
+    assert bench.run("load", "--account", "alice", "--id", ID_PROD).returncode == 0
+    fd = hold_ensure_lock(bench)
+    try:
+        p, _ = load_waiting(bench, "--name", "prod", keys=[bench.blob("prod")])
+        remove_key(bench, "prod")
+        bench.set_state(logged_in=change != "logout", session=None)
+    finally:
+        os.close(fd)
+    out, err = p.communicate(timeout=60)
+    assert p.returncode == 0, err
+    fa, fb = bench.keys["prod"]["fingerprint"], bench.keys["perso"]["fingerprint"]
+    lines = [l for l in err.decode().splitlines() if l.strip()]
+    assert lines == ["sshvault: alice : Serveur Prod %s non rechargée : compte « alice » %s pendant l'attente du "
+                     "verrou d'ensure" % (fa, why)], lines
+    assert out.decode().splitlines() == ["déjà chargée : Serveur Prod %s (--force pour recharger)" % fa,
+                                         "chargée : boulot : Prod B %s (durée 1h)" % fb]
+    assert bench.agent_keys() == [bench.blob("perso")]
+    assert list(bench.agent_state()["keys"]) == [fb]
+
+
+def test_load_restrict_cle_retiree_sans_hote(bench):
+    """A présente au départ, sans hôte, retirée pendant l'attente de `load --restrict` : comme
+    toute clé sans hôte, rien chargé, code 4 (contrôle sous le verrou)."""
+    bench.items = [ssh_item(ID_PERSO, "clé perso", bench.keys["perso"]),
+                   ssh_item(ID_BASTION, "Bastion RSA", bench.keys["bastion"], hosts="Bastion,jump")]
+    bench.write_vault()
+    unlocked(bench)
+    bench.known_hosts.write_text(hostkey_line(bench, "bastion", "jump"))
+    assert bench.run("load", "--id", ID_PERSO).returncode == 0
+    fd = hold_ensure_lock(bench)
+    try:
+        p, _ = load_waiting(bench, "--all", "--restrict", keys=[bench.blob("perso")])
+        remove_key(bench, "perso")
+    finally:
+        os.close(fd)
+    out, err = p.communicate(timeout=60)
+    lines = [l for l in err.decode().splitlines() if l.strip()]
+    assert p.returncode == 4, err
+    assert lines == ["sshvault: --restrict : « clé perso » n'a aucun hôte associé : rien chargé"], lines
+    assert out.decode() == "déjà chargée : clé perso %s (--force pour recharger)\n" % bench.keys["perso"]["fingerprint"]
+    assert bench.agent_keys() == [] and bench.keys["bastion"]["fingerprint"] not in bench.agent_state()["keys"]
+
+
+def reload_bench(bench, items):
+    """Coffre réduit à `items`, déverrouillé, known_hosts pour bastion, jump et b.example."""
+    bench.items = items
+    bench.write_vault()
+    unlocked(bench)
+    bench.known_hosts.write_text(hostkey_line(bench, "bastion", "jump", "b.example"))
+
+
+def finish(p):
+    out, err = p.communicate(timeout=60)
+    assert b"Traceback" not in err, err
+    return p.returncode, out.decode(), [l for l in err.decode().splitlines() if l.strip()]
+
+
+def test_load_restrict_recharge_cle_retiree(bench):
+    """--restrict : A (bastion) rechargée sous le verrou avec ses hôtes (-h), « restreinte à »,
+    état restrict ; B chargée de même."""
+    reload_bench(bench, [ssh_item(ID_BASTION, "Bastion RSA", bench.keys["bastion"], hosts="Bastion,jump"),
+                         ssh_item(ID_B, "Prod B", bench.keys["perso"], hosts="b.example")])
+    assert bench.run("load", "--id", ID_BASTION).returncode == 0
+    n = len(adds(bench))
+    fd = hold_ensure_lock(bench)
+    try:
+        p, _ = load_waiting(bench, "--all", "--restrict", keys=[bench.blob("bastion")])
+        remove_key(bench, "bastion")
+    finally:
+        os.close(fd)
+    rc, out, err = finish(p)
+    assert rc == 0 and err == [], err
+    fa = bench.keys["bastion"]["fingerprint"]
+    assert out.splitlines()[-1] == ("rechargée (retirée pendant l'attente) : Bastion RSA %s (durée 1h, restreinte à "
+                                    "Bastion,jump)" % fa), out
+    kh = str(bench.known_hosts)
+    loads = [a for a in adds(bench)[n:] if a.startswith("-t")]
+    assert loads == ["-t 3600 -H %s -h b.example -" % kh, "-t 3600 -H %s -h bastion -h jump -" % kh], loads
+    assert bench.agent_state()["keys"][fa]["restrict"] is True
+    assert sorted(bench.agent_keys()) == sorted([bench.blob("bastion"), bench.blob("perso")])
+
+
+def test_load_restrict_cle_retiree_hote_absent(bench):
+    """--restrict : hôte de A absent de known_hosts, vu sous le verrou : rien chargé (B non
+    plus), code 4 ; aucune clé ajoutée à aucun moment."""
+    reload_bench(bench, [ssh_item(ID_BASTION, "Bastion RSA", bench.keys["bastion"], hosts="Bastion,absent.example"),
+                         ssh_item(ID_B, "Prod B", bench.keys["perso"], hosts="b.example")])
+    assert bench.run("load", "--id", ID_BASTION).returncode == 0
+    n = len(adds(bench))
+    fd = hold_ensure_lock(bench)
+    try:
+        p, _ = load_waiting(bench, "--all", "--restrict", keys=[bench.blob("bastion")])
+        remove_key(bench, "bastion")
+    finally:
+        os.close(fd)
+    rc, out, err = finish(p)
+    assert rc == 4 and "hôte absent.example absent de known_hosts" in err[-1], err
+    assert [a for a in adds(bench)[n:] if not a.startswith("-H ")] == [], "aucun chargement"
+    assert bench.agent_keys() == []
+
+
+def test_load_cle_retiree_chiffree_nointeraction(bench):
+    """Matrice : A chiffrée, partie pendant l'attente, --nointeraction : A sautée (une ligne),
+    B chargée, code 0."""
+    from bench import SSH_ADD
+    reload_bench(bench, [ssh_item(ID_CHIFFREE, "Prod chiffrée", bench.keys["chiffree"], hosts="s.example"),
+                         ssh_item(ID_B, "Prod B", bench.keys["perso"], hosts="b.example")])
+    prog, _ = make_askpass(bench.tmp, reply=PASSPHRASE, name="askpass-a")
+    assert bench.run("load", "--id", ID_B).returncode == 0  # agent lancé
+    assert bench.run("agent", "purge").returncode == 0
+    r = subprocess.run([SSH_ADD, "-"], input=bench.keys["chiffree"]["private"], text=True, capture_output=True,
+                       env=dict(bench.env, SSH_AUTH_SOCK=str(bench.sock()), SSH_ASKPASS=prog,
+                                SSH_ASKPASS_REQUIRE="force"), timeout=30)
+    assert r.returncode == 0, r.stderr
+    fd = hold_ensure_lock(bench)
+    try:
+        p, _ = load_waiting(bench, "--name", "prod", keys=[bench.blob("chiffree")], pre=["--nointeraction"])
+        remove_key(bench, "chiffree")
+    finally:
+        os.close(fd)
+    rc, out, err = finish(p)
+    fa = bench.keys["chiffree"]["fingerprint"]
+    assert rc == 0, err
+    assert err == ["sshvault: Prod chiffrée %s non rechargée : clé chiffrée par passphrase, saisie impossible "
+                   "(--nointeraction)" % fa], err
+    assert out.splitlines()[-1].startswith("chargée : Prod B ") and "rechargée (" not in out, out
+    assert bench.agent_keys() == [bench.blob("perso")]
+
+
+@pytest.mark.parametrize("failure,why", [("absent", "élément %s absent du coffre" % ID_PROD),
+                                         ("bw", "Unexpected error.")])
+def test_load_cle_retiree_relecture_en_echec(bench, failure, why):
+    """Relecture de A en échec sous le verrou (élément supprimé, ou `bw get` en erreur alors que
+    le compte est déverrouillé) : A sautée, B chargée, code 0."""
+    unlocked(bench)
+    bench.add_item(ssh_item(ID_B, "Prod B", bench.keys["perso"], hosts="b.example"))
+    env = {"FAKE_BW_FAIL": "get=errorsecond"} if failure == "bw" else {}
+    assert bench.run("load", "--id", ID_PROD, env=env).returncode == 0  # 1er « get » de A : normal
+    fd = hold_ensure_lock(bench)
+    try:
+        p, _ = load_waiting(bench, "--name", "prod", env=env, keys=[bench.blob("prod")])
+        remove_key(bench, "prod")
+        if failure == "absent":
+            bench.items = [i for i in bench.items if i.get("id") != ID_PROD]
+            bench.write_vault()
+    finally:
+        os.close(fd)
+    rc, out, err = finish(p)
+    assert rc == 0, err
+    assert len(err) == 1 and err[0].startswith("sshvault: Serveur Prod %s non rechargée : relecture du coffre : "
+                                               % bench.keys["prod"]["fingerprint"]) and why in err[0], err
+    assert bench.agent_keys() == [bench.blob("perso")]
+
+
+def test_load_cle_retiree_compte_en_erreur(bench):
+    """`bw status` en erreur pour le compte de A seul (B dans un autre compte, revu d'abord) :
+    A sautée, B chargée, code 0."""
+    unlocked(bench)
+    bench.add_account("boulot", "bob@example.test", items=[ssh_item(ID_B, "Prod B", bench.keys["perso"],
+                                                                     hosts="b.example")],
+                      unlocked=True, where="keyring" if bench.ring else "file", default=True)
+    assert bench.run("load", "--account", "alice", "--id", ID_PROD).returncode == 0
+    fd = hold_ensure_lock(bench)
+    try:
+        p, _ = load_waiting(bench, "--name", "prod", env={"FAKE_BW_FAIL": "status=errorsecond"},
+                            keys=[bench.blob("prod")])
+        remove_key(bench, "prod")
+    finally:
+        os.close(fd)
+    rc, out, err = finish(p)
+    assert rc == 0, err
+    st = [c["appdata"] for c in bench.calls() if c["argv"][1:2] == ["status"]]
+    assert st[-2:] == [str(bench.appdata_of("boulot")), str(bench.appdata)], "boulot (revu d'abord, normal), puis alice"
+    assert len(err) == 1 and "Serveur Prod" in err[0] and "non rechargée : compte « alice » : état relu" in err[0], err
+    assert "Unexpected error." in err[0], err
+    assert bench.agent_keys() == [bench.blob("perso")]
+
+
+def boulot(bench, item):
+    bench.add_account("boulot", "bob@example.test", items=[item], unlocked=True,
+                      where="keyring" if bench.ring else "file", default=True)
+
+
+def test_load_restrict_cle_retiree_compte_ferme_d_abord(bench):
+    """Ordre : compte de A revu avant --restrict. A sans hôte (alice), compte verrouillé pendant
+    l'attente : A sautée (une ligne), pas de code 4 ; B (boulot) chargée, code 0."""
+    bench.items = [ssh_item(ID_PERSO, "clé perso", bench.keys["perso"])]
+    bench.write_vault()
+    unlocked(bench)
+    bench.known_hosts.write_text(hostkey_line(bench, "bastion"))
+    boulot(bench, ssh_item(ID_B, "Cible B", bench.keys["bastion"], hosts="bastion"))
+    assert bench.run("load", "--account", "alice", "--id", ID_PERSO).returncode == 0
+    fd = hold_ensure_lock(bench)
+    try:
+        p, _ = load_waiting(bench, "--all", "--restrict", keys=[bench.blob("perso")])
+        remove_key(bench, "perso")
+        bench.set_state(logged_in=True, session=None)
+    finally:
+        os.close(fd)
+    rc, out, err = finish(p)
+    assert rc == 0, err
+    assert err == ["sshvault: alice : clé perso %s non rechargée : compte « alice » verrouillé pendant l'attente du "
+                   "verrou d'ensure" % bench.keys["perso"]["fingerprint"]], err
+    assert bench.agent_keys() == [bench.blob("bastion")]
+
+
+def test_load_cles_retirees_meme_compte_un_seul_status(bench):
+    """Deux clés retirées du même compte (alice, sans autre clé à charger) : un seul `bw status`
+    d'alice sous le verrou, même verdict pour les deux (rechargées) ; B (boulot) chargée."""
+    unlocked(bench)
+    boulot(bench, ssh_item(ID_B, "Cible B", bench.keys["perso"], hosts="b.example"))
+    for iid in (ID_PROD, ID_BASTION):
+        assert bench.run("load", "--account", "alice", "--id", iid).returncode == 0
+    fd = hold_ensure_lock(bench)
+    try:
+        p, _ = load_waiting(bench, "--host", "*", keys=sorted([bench.blob("prod"), bench.blob("bastion")],
+                                                                key=bench.agent_keys().index))
+        n = len(bench.calls())
+        remove_key(bench, "prod")
+        remove_key(bench, "bastion")
+    finally:
+        os.close(fd)
+    rc, out, err = finish(p)
+    assert rc == 0 and err == [], err
+    st = [c["appdata"] for c in bench.calls()[n:] if c["argv"][1:2] == ["status"]]
+    assert st == [str(bench.appdata_of("boulot")), str(bench.appdata)], st
+    assert sum(l.startswith("rechargée (retirée pendant l'attente) : alice : ") for l in out.splitlines()) == 2, out
+    assert sorted(bench.agent_keys()) == sorted(bench.blob(k) for k in ("prod", "bastion", "perso"))
+
+
+def test_load_cle_retiree_echec_en_cours_retour_arriere(bench):
+    """Recharge de A en échec après le chargement de B (clé privée de A changée dans le coffre
+    pendant l'attente) : B retirée (retour arrière), rien chargé, état non écrit, code 4."""
+    unlocked(bench)
+    bench.add_item(ssh_item(ID_B, "Prod B", bench.keys["perso"], hosts="b.example"))
+    assert bench.run("load", "--id", ID_PROD).returncode == 0
+    fd = hold_ensure_lock(bench)
+    try:
+        p, _ = load_waiting(bench, "--name", "prod", keys=[bench.blob("prod")])
+        remove_key(bench, "prod")
+        item = next(i for i in bench.items if i.get("id") == ID_PROD)
+        item["sshKey"]["privateKey"] = bench.keys["bastion"]["private"]
+        bench.write_vault()
+    finally:
+        os.close(fd)
+    rc, out, err = finish(p)
+    assert rc == 4 and "clé privée différente" in err[-1], err
+    assert [l for l in adds(bench) if l.startswith("-t")][-2:] == ["-t 3600 -", "-t 3600 -"], "B puis A tentées"
+    assert bench.agent_keys() == []
+    assert bench.keys["perso"]["fingerprint"] not in bench.agent_state()["keys"]
 
 
 def test_load_agent_verrouille_pendant_l_attente(bench):

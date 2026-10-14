@@ -1,5 +1,50 @@
 # Changelog — sshvault
 
+## sshvault 0.13.0 — Include lu comme ssh, joker voisin nommé, load qui recharge une clé partie — 2026-10-14
+
+- Ligne `Include` lue comme OpenSSH 8.9 : arguments découpés comme `argv_split` (guillemets,
+  `\` retiré devant `\`, un guillemet ou un espace, gardé ailleurs ; `#` en début de mot),
+  puis glob propre à sshvault : `\x` littéral (`con\*fig` n'est plus pris pour un joker),
+  `\` final littéral, `?` = un octet, classes POSIX (`[[:alpha:]]` prise ; classe inconnue
+  ou nom avec `\` : rien inclus), `^` littéral, `]` et `-` littéraux en tête, `]` cherché
+  dans tout le reste du motif (`[` sans `]` littéral, `[…]` qui enjambe `/` ne prend rien),
+  `\.` vaut un point écrit ; `~` et chemin absolu décidés sur l'argument brut (`\/…` relatif
+  à `~/.ssh`). « Couvre » est décidé en parcourant le disque comme le glob d'ssh, en octets
+  (dossiers listés avec `.` et `..`, `lstat`, liens suivis, `/` final, `..` jamais replié à
+  l'écrit) ; noms d'entrées et `lstat`/`stat` seulement ; fichier généré et dossiers parents
+  tenus pour existants ; borné à 5000 entrées (au-delà : réponse textuelle). Les « écarts
+  connus » de la 0.12.1 (classes POSIX, `\*` échappé) disparaissent, comme ceux trouvés en
+  revue (`.*` via `.`, `config/`, `absent/..`, `*/..`, lien atteint par un joker, octets).
+- `~user` avec un octet nul : utilisateur inconnu (avant : plantage de la lecture de
+  `~/.ssh/config`).
+- Joker voisin nommé : un joker qui n'inclut pas le fichier généré mais le couvrirait si
+  `*`, `?` et `[…]` traversaient `/` (`Include ~/.ssh/*`) et/ou sans la règle du point
+  initial (`Include ~/*/sshvault/config`, `Include ~/*`) a sa ligne, avec la ou les raisons,
+  dès que l'`Include` de sshvault n'est pas en tête : régénération (login, hosts, forward,
+  import, generate, comptes, `ssh-config`), `--check` (ligne de diff, code 1) et `install`
+  quand il réécrit le fichier (numéro du fichier réécrit). Jamais sur une ligne dont un autre
+  argument couvre déjà le fichier ; motif nettoyé. Sans voisin, l'avertissement est inchangé.
+- `load` : une clé « déjà chargée » au départ mais retirée de l'agent pendant l'attente
+  d'`ensure.lock` (avant : dite « déjà chargée », restée absente) est relue sous le verrou,
+  sans invite du coffre, et rechargée avec les options de la commande (durée, `--confirm`,
+  `--restrict` et ses contrôles) : ligne « rechargée (retirée pendant l'attente) : … ».
+  Ordre : compte revu (une fois par compte), `--restrict` (échec : rien chargé, code 4),
+  relecture. Compte déconnecté, verrouillé, changé ou en erreur, relecture en échec (invite,
+  élément absent, erreur de bw), clé chiffrée avec `--nointeraction` : « … non rechargée :
+  … », les autres clés chargées, code inchangé (une clé chiffrée à charger, lue avant le
+  verrou, fait toujours tout refuser avec `--nointeraction` ; la clé retirée était déjà
+  chargée au départ). Clé retirée qui partage son compte avec une clé à charger : compte
+  fermé pendant l'attente → rien chargé, code 3 (règle de la 0.12.0).
+- Revue : un lien physique vers le fichier généré n'est pas « le sien » (il garderait
+  l'ancien contenu après une régénération) ; pas de joker voisin quand le motif couvre à
+  l'écrit mais pas sur le disque ; budget du parcours (5000 entrées, comptées au fil de la
+  lecture) partagé par une lecture de `~/.ssh/config`, réponse gardée par argument ; au-delà
+  de 64 composants : réponse textuelle ; ligne voisin entièrement nettoyée.
+- Tests : chaque forme mesurée (échappements, guillemets, classes, `[…]`, `\/`, `\` final)
+  confrontée à `ssh -G` du poste ; découpage `argv_split` ; jokers voisins dans `ssh-config`,
+  `--check` et `install` ; `load` avec une clé retirée pendant l'attente (un ou deux
+  comptes, `--restrict` sans hôte).
+
 ## sshvault 0.12.1 — Jokers d'Include comparés comme le glob d'ssh — 2026-10-14
 
 - Un joker d'`Include` est comparé au fichier généré comme le glob d'ssh (`glob(3)`) :

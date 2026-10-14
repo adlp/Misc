@@ -2,7 +2,7 @@
 
 Clés SSH dans un Vaultwarden auto-hébergé, utilisées de façon transparente par ssh.
 
-État (0.12.1) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
+État (0.13.0) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
 + e-mail, sur un même serveur ou sur des serveurs différents ; déconnexion par `sshvault
 logout`, serveur ou e-mail corrigé par `sshvault account set` ; voir « Comptes du coffre »),
 **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
@@ -343,7 +343,20 @@ par sshvault sont ceux de cette version.
     avec `--nointeraction`, elle est bornée par `SSHVAULT_ENSURE_TIMEOUT` (240 s par défaut) :
     au-delà, « verrou d'ensure tenu : rien chargé », code 4. Sous le verrou, l'agent est relu :
     verrouillé entre-temps (`agent lock`) → rien chargé, code 3 ; clé chargée entre-temps (par
-    `ensure`) → « déjà chargée », rien rechargé (sauf `--force`). Chaque compte des clés à
+    `ensure`) → « déjà chargée », rien rechargé (sauf `--force`) ; clé « déjà chargée » au
+    départ mais retirée de l'agent pendant l'attente → rechargée avec les options de la
+    commande (durée, `--confirm`, `--restrict` et ses contrôles, passphrase sous le verrou),
+    ligne « rechargée (retirée pendant l'attente) : … ». Pour chacune, sous le verrou : son
+    compte revu (une fois par compte), puis `--restrict` (hôte non littéral ou absent de
+    `known_hosts` : rien chargé, code 4), puis sa clé privée relue sans invite du coffre ;
+    compte déconnecté, verrouillé, changé ou `bw` en erreur, relecture en échec (invite
+    nécessaire, élément absent, erreur de bw), ou clé chiffrée avec `--nointeraction` →
+    « … non rechargée : … » sur stderr, les autres clés chargées, code inchangé. (Une clé
+    chiffrée à charger, lue avant le verrou, fait tout refuser avec `--nointeraction` ; une
+    clé à recharger était déjà chargée au départ : la sauter rend l'état d'avant l'attente,
+    sans priver les autres clés.) Si la clé retirée partage son compte avec une clé à
+    charger, ce compte est revu comme celui des clés à charger : fermé pendant l'attente →
+    rien chargé, code 3 (règle de la 0.12.0). Chaque compte des clés à
     charger est aussi revu, comme `status` et sans invite (toujours enregistré avec le même
     serveur et le même e-mail, `bw` connecté, coffre déverrouillé) : un `logout`, `lock`,
     `account remove`, `account rename` ou `account set` passé pendant l'attente → rien
@@ -905,8 +918,38 @@ commentaires d'en-tête restent dessous, inchangés) :
   `[…]` ne traversent pas `/`), un nom à point initial (`.ssh`) pris seulement par un motif
   à point initial, liens symboliques suivis ; `Include ~/.ssh/*` ou `Include
   ~/*/sshvault/config` ne l'incluent pas (mesuré, OpenSSH 8.9p1) : ce sont des lignes
-  ordinaires, jamais touchées. Écarts connus, rares : classes POSIX (`[[:alpha:]]`, prises
-  par ssh, pas par sshvault) et `\*` échappé (littéral pour ssh) ;
+  ordinaires, jamais touchées. La ligne est lue comme ssh 8.9 : arguments découpés comme
+  `argv_split` (guillemets `'`/`"` retirés, `\` retiré devant `\`, un guillemet ou un espace,
+  gardé ailleurs ; `#` en début de mot : commentaire ; guillemet non fermé : rien), `~` et
+  chemin absolu décidés sur l'argument brut (`\/…` est relatif à `~/.ssh`), puis glob :
+  `\x` = `x` littéral (`con\*fig` n'est pas un joker), `?` = un octet, `[…]` avec `!` (pas
+  `^`), plages et classes POSIX (`[[:alpha:]]` ; classe inconnue, ou nom de classe avec un
+  `\` : l'argument n'inclut rien), `]` cherché dans tout le reste du motif (`[` sans `]` :
+  littéral ; un `[…]` qui enjambe un `/` ne prend rien), `\.` vaut un point écrit
+  (`~/\.ss*/…` couvre). « Couvre » est décidé en parcourant le disque comme le glob d'ssh,
+  en octets : dossiers listés (`.` et `..` compris : `~/.ssh/.*/sshvault/config` couvre),
+  segments sans joker vérifiés par `lstat`, liens suivis (`~/*/sshvault/config` couvre si
+  `~/lien → .ssh`), `/` final exige un dossier, `..` jamais replié à l'écrit
+  (`~/.ssh/absent/../sshvault/config` ne couvre pas, `~/.ssh/*/../sshvault/config` est un
+  joker qui couvre). Seuls les noms d'entrées et `lstat`/`stat` sont lus, jamais le contenu
+  d'un fichier ; le fichier généré et ses dossiers parents sont tenus pour existants (install
+  avant le premier `ssh-config`) ; couvre = un chemin trouvé dont le chemin réel est celui du
+  fichier généré (un lien symbolique oui, un lien physique non : il garderait l'ancien
+  contenu après une régénération) ; au-delà de 5000 entrées de dossier examinées (comptées au
+  fil de la lecture, pour toute une lecture de `~/.ssh/config`) ou de 64 composants, réponse
+  textuelle (motif comparé au chemin normal et réel) ;
+- un joker **voisin**, qui n'inclut pas le fichier généré mais le couvrirait si `*`, `?` et
+  `[…]` traversaient `/` (`Include ~/.ssh/*`) ou si un nom à point initial pouvait être pris
+  sans son point (`Include ~/*/sshvault/config`), ou les deux (`Include ~/*`), est nommé
+  dès que l'`Include` de sshvault n'est pas en tête (absent, plus bas ou conditionnel) : une
+  ligne par argument voisin, motif tel qu'écrit, avec la ou les raisons (« *, ? et […] ne
+  traversent pas / », « un nom à point initial (.ssh) doit être écrit avec son point »),
+  dans un bloc compris, ligne nettoyée (caractères de contrôle et octets non UTF-8 échappés),
+  jamais sur une ligne dont un autre argument couvre déjà le fichier généré, ni quand le motif
+  couvre à l'écrit mais pas sur le disque (`/` final, `absent/..`) ; sur stderr pour
+  `ssh-config` et chaque régénération, ligne de diff pour `--check` (code 1), avertissement
+  d'`install` quand il réécrit le fichier (pas quand il refuse), numéroté dans le fichier
+  réécrit ;
 - une ligne `Include` de sshvault exacte **dans** un bloc `Host`/`Match` (Include
   conditionnel) n'est pas déplacée : code 4, rien modifié ; `ssh-config` et `--check` la
   signalent (« le sortir du bloc ») ; pour une ligne à joker ou mixte dans un bloc,
@@ -920,7 +963,7 @@ commentaires d'en-tête restent dessous, inchangés) :
   développe les tokens dans les versions récentes d'OpenSSH, pas en 8.9).
 
 Jamais automatique : `ssh-config` et `hosts` préviennent seulement (stderr) si la ligne
-manque, est conditionnelle ou n'est pas en tête.
+manque, est conditionnelle ou n'est pas en tête (avec les jokers voisins).
 
 **Désinstaller.** `sshvault ssh-config uninstall` défait `install` et ce qu'écrit la
 régénération, rien d'autre, sans accès au coffre :
@@ -1163,7 +1206,12 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   `load` sous `strace -f` : seules écritures, le fichier d'état (et son temporaire) et le
   verrou `ensure.lock` (vide). `load` lancé pendant que `ensure.lock` est tenu : coffre lu,
   attente, rien ajouté avant la libération ; clé chargée ou agent verrouillé pendant
-  l'attente.
+  l'attente ; clé « déjà chargée » retirée pendant l'attente : rechargée avec les options de
+  la commande (état et `agent status`), sautée si son compte est verrouillé ou déconnecté
+  (deux comptes) ou `bw status` en erreur, relecture en échec (élément supprimé, `bw get` en
+  erreur), clé chiffrée avec `--nointeraction` ; `--restrict` : rechargée avec ses hôtes, clé
+  sans hôte ou hôte absent de `known_hosts` (rien chargé, code 4) ; échec en cours de
+  rechargement : retour arrière.
 - `tests/test_sshconfig.py` valide le fichier généré avec l'OpenSSH du poste :
   `ssh -G -F <config de test qui l'inclut>` (agent dédié, une seule `identityfile`,
   `identitiesonly yes`, HOME et `XDG_RUNTIME_DIR` avec espace et `%`), puis `ssh -vvv`
@@ -1178,7 +1226,15 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   `~/.*/sshvault/config`, `?`, `[s]`, `[!x]`, `[.]`…) comparée à la réponse d'`ssh -G` du
   poste ; formes relatives à `~/.ssh`, jokers sous un lien symbolique ; `install`,
   `ssh-config`, `--check` et `uninstall` avec des jokers qui ne couvrent pas le fichier généré
-  (plus bas, en tête, dans un bloc, parmi d'autres fichiers).
+  (plus bas, en tête, dans un bloc, parmi d'autres fichiers). Échappements, guillemets,
+  classes POSIX, `[…]` (`^`, `]` et `-` littéraux, plages, `[` sans `]`, `/`),
+  `\` final, guillemets au milieu d'un mot, `#`, guillemet non fermé, parcours du disque (`.*`,
+  `/` final, `absent/..`, `*/..`, lien atteint par un joker, octets d'un HOME `josé`, `[…]`
+  qui enjambe `/`) : chaque forme mesurée confrontée à `ssh -G` du poste ; config pas encore
+  écrite, parcours borné, `~user` avec octet nul, `\/…` relatif à `~/.ssh` (test unitaire :
+  un témoin `ssh -G` lirait sous le vrai `~/.ssh`) ; découpage `argv_split` ;
+  jokers voisins (une raison, deux raisons, aucune ligne quand l'`Include` est en tête,
+  avertissement d'avant inchangé sans voisin) dans `ssh-config`, `--check` et `install`.
 - `tests/test_it_accounts.py` : lecteur du fichier des comptes de test d'intégration
   (`tests/integration/accounts.py`), sans réseau ni vrai fichier : comptes valides et alias,
   doublon, champ manquant, vide ou de type faux, clé inconnue, TOML illisible, fichier absent

@@ -51,8 +51,8 @@ import fnmatch
 import os
 import pwd
 import re
-import shlex
 import stat
+import string
 import sys
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
@@ -739,59 +739,508 @@ def _keyword(line: str):
     return (m.group(1).lower(), m.group(2)) if m else ("", s)
 
 
-def _glob_covers(pattern: str, path: str) -> bool:
-    """`pattern` (joker, chemin absolu normalisé) couvre-t-il `path` comme le glob(3) d'ssh ?
-    Composant par composant (`*`, `?`, `[…]` ne traversent jamais `/`) ; un nom à point initial
-    n'est pris que par un motif de composant à point initial (mesuré, OpenSSH 8.9p1 :
-    `~/.ssh/*` et `~/*/sshvault/config` n'incluent pas `~/.ssh/sshvault/config`). Écarts connus,
-    rares : classes POSIX `[[:alpha:]]` (ignorées par fnmatch) et `\\*` échappé (lu comme
-    joker après shlex)."""
-    pp, tp = pattern.split("/"), path.split("/")
-    if len(pp) != len(tp):
-        return False
-    return all((not t.startswith(".") or p.startswith(".")) and fnmatch.fnmatchcase(t, p)
-               for p, t in zip(pp, tp))
+#: Classes POSIX du glob d'ssh (ASCII, comme isalpha() & co dans la locale C), en octets.
+_CLASSES = {name: frozenset(chars.encode("latin-1")) for name, chars in {
+    "alnum": string.ascii_letters + string.digits, "alpha": string.ascii_letters, "blank": " \t",
+    "cntrl": "".join(chr(c) for c in range(32)) + "\x7f", "digit": string.digits,
+    "graph": "".join(chr(c) for c in range(33, 127)), "lower": string.ascii_lowercase,
+    "print": "".join(chr(c) for c in range(32, 127)), "punct": string.punctuation, "space": " \t\n\v\f\r",
+    "upper": string.ascii_uppercase, "xdigit": string.hexdigits}.items()}
+_SLASH, _DOT, _BACKSLASH, _STAR, _QMARK = 0x2f, 0x2e, 0x5c, 0x2a, 0x3f
+_LBRACKET, _RBRACKET, _BANG, _COLON, _DASH = 0x5b, 0x5d, 0x21, 0x3a, 0x2d
+#: Parcours du disque borné, pour une lecture de ~/.ssh/config (tous ses arguments) : au-delà de
+#: ce nombre d'entrées de dossier examinées, réponse textuelle ; de même au-delà de WALK_DEPTH
+#: composants dans un argument.
+WALK_LIMIT = 5000
+WALK_DEPTH = 64
 
 
-def _glob_real(pattern: str) -> str:
-    """`pattern` dont le préfixe sans joker est résolu (liens symboliques, comme le parcours du
-    glob d'ssh) : comparé au chemin réel du fichier généré."""
-    parts = pattern.split("/")
-    n = next((i for i, c in enumerate(parts) if any(x in c for x in "*?[")), len(parts))
-    return "/".join([os.path.realpath("/".join(parts[:n]) or "/").rstrip("/")] + parts[n:])
+class _BadClass(Exception):
+    """Classe POSIX inconnue dans un `[…]` : pour ssh, l'argument n'inclut rien (GLOB_NOMATCH)."""
 
 
-def _ref_kinds(args_text: str, paths: Paths) -> list:
-    """Pour chaque argument d'`Include` : « exact » s'il désigne le fichier généré lui-même (`~`,
-    `~user`, relatif à ~/.ssh, chemin réel), « glob » si c'est un joker de glob qui le couvre
-    comme le glob d'ssh (`_glob_covers` ; il peut couvrir d'autres fichiers), None sinon."""
-    try:
-        args = shlex.split(args_text, comments=True)
-    except ValueError:
-        return []
-    target, real = os.path.normpath(paths.config), os.path.realpath(paths.config)
-    out = []
-    for a in args:
-        if a == "~" or a.startswith("~/"):
-            a = paths.home + a[1:]
-        elif a.startswith("~"):
-            a = os.path.expanduser(a)  # ~user : passwd
-        if not os.path.isabs(a):
-            a = os.path.join(paths.ssh_dir, a)
-        a = os.path.normpath(a)
-        if a.startswith("//"):  # normpath garde « // » initial (POSIX) ; noyau et ssh : « / »
-            a = "/" + a.lstrip("/")
-        glob = any(c in a for c in "*?[")
-        out.append("exact" if not glob and (a == target or os.path.realpath(a) == real)
-                   else "glob" if glob and (_glob_covers(a, target) or _glob_covers(_glob_real(a), real))
-                   else None)
+class _WalkLimit(Exception):
+    """Parcours du disque au-delà de WALK_LIMIT entrées."""
+
+
+def _include_args(text: str) -> list:
+    """Arguments d'une ligne `Include`, découpés comme `argv_split` d'OpenSSH 8.9 (fin de ligne
+    « \\t\\r\\n\\f » d'abord retirée, comme ssh) : [(argument, tel qu'écrit)]. Blancs = espace et
+    tabulation hors guillemets ; `'` ou `"` ouvre, seul le même ferme (l'autre est littéral),
+    guillemets retirés ; `\\` suivi de `'`, `"`, `\\` (ou d'un espace hors guillemets) : `\\`
+    retiré ; tout autre `\\x` gardé tel quel ; `#` en début de mot : fin ; guillemet non fermé :
+    aucun argument (ssh refuse la ligne)."""
+    s = text.rstrip(" \t\r\n\f")
+    out, i, n = [], 0, len(s)
+    while i < n:
+        if s[i] in " \t":
+            i += 1
+            continue
+        if s[i] == "#":
+            break
+        start, quote, arg = i, None, []
+        while i < n:
+            c = s[i]
+            if c == "\\" and i + 1 < n and (s[i + 1] in "'\"\\" or (quote is None and s[i + 1] == " ")):
+                arg.append(s[i + 1])
+                i += 2
+                continue
+            if quote is None and c in " \t":
+                break
+            if quote is None and c in "'\"":
+                quote = c
+            elif quote is not None and c == quote:
+                quote = None
+            else:
+                arg.append(c)
+            i += 1
+        if quote is not None:
+            return []
+        out.append(("".join(arg), s[start:i]))
     return out
 
 
-def _refs(args_text: str, paths: Paths) -> list:
+def _glob_tokens(s: bytes) -> list:
+    """[(octet, échappé)] comme le glob d'ssh : `\\x` → x littéral ; `\\` final : littéral."""
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == _BACKSLASH:
+            out.append((s[i + 1], True) if i + 1 < len(s) else (_BACKSLASH, True))
+            i += 2
+        else:
+            out.append((s[i], False))
+            i += 1
+    return out
+
+
+def _bracket(toks: list, k: int):
+    """`[` non échappé en toks[k] : (atome, index qui suit le `]`), ou None si le `[` est
+    littéral (pas de `]` dans tout le reste du motif). Comme le glob d'ssh : `!` en tête =
+    négation (`^` littéral), premier caractère toujours membre (`]` compris), `-` en tête ou en
+    fin littéral, plages, classes POSIX ; nom de classe inconnu (ou avec un `\\`) : _BadClass ;
+    un `[…]` qui enjambe un `/` ne prend rien (atome « x »)."""
+    n, p = len(toks), k + 1
+    neg = p < n and toks[p] == (_BANG, False)
+    if neg:
+        p += 1
+    if p >= n or (_RBRACKET, False) not in toks[p + 1:]:
+        return None
+    chars, ranges, classes, start = set(), [], [], p
+    c = toks[p]
+    p += 1
+    while True:
+        if c == (_LBRACKET, False) and p < n and toks[p] == (_COLON, False):
+            while c == (_LBRACKET, False) and p < n and toks[p] == (_COLON, False):
+                q = next((j for j in range(p + 1, n) if toks[j] == (_COLON, False)), None)
+                if q is None or q + 1 >= n or toks[q + 1] != (_RBRACKET, False):
+                    break  # pas une classe : `[` membre
+                name = toks[p + 1:q]
+                if any(e for _, e in name) or bytes(b for b, _ in name).decode("latin-1") not in _CLASSES:
+                    raise _BadClass()
+                classes.append(bytes(b for b, _ in name).decode("latin-1"))
+                p = q + 2
+                if p >= n:
+                    return None
+                c = toks[p]
+                p += 1
+            if c == (_RBRACKET, False):
+                break
+        if p + 1 < n and toks[p] == (_DASH, False) and toks[p + 1] != (_RBRACKET, False):
+            ranges.append((c[0], toks[p + 1][0]))  # plage seule : [z-a] ne prend rien
+            p += 2
+        else:
+            chars.add(c[0])
+        if p >= n:
+            return None
+        c = toks[p]
+        p += 1
+        if c == (_RBRACKET, False):
+            break
+    if any(b == _SLASH for b, _ in toks[start:p]):
+        return ("x",), p
+    return ("[", neg, frozenset(chars), tuple(ranges), tuple(classes)), p
+
+
+def _compile(toks: list) -> list:
+    """Atomes du motif entier : « / » (séparateur, même échappé), « c » (octet littéral), « * »,
+    « ? », « [ » (ensemble), « x » (ensemble qui ne prend rien)."""
+    items, i = [], 0
+    while i < len(toks):
+        b, esc = toks[i]
+        if b == _SLASH:
+            items.append(("/",))
+            i += 1
+            continue
+        if not esc and b in (_STAR, _QMARK):
+            items.append((chr(b),))
+            i += 1
+            continue
+        if not esc and b == _LBRACKET:
+            r = _bracket(toks, i)
+            if r is not None:
+                items.append(r[0])
+                i = r[1]
+                continue
+        items.append(("c", b))
+        i += 1
+    return items
+
+
+def _parse(arg: str, paths: Paths) -> Optional[list]:
+    """Atomes d'un argument d'`Include`, en octets (ssh : `~`, `~/`, `~user` et chemin absolu
+    décidés sur l'argument brut, sinon relatif à ~/.ssh). None : `~user` inconnu (rien inclus).
+    _BadClass : classe POSIX inconnue."""
+    if arg == "~" or arg.startswith("~/"):
+        prefix, rest = paths.home, arg[1:]
+    elif arg.startswith("~"):
+        user, sep, tail = arg[1:].partition("/")
+        try:
+            prefix = os.path.expanduser("~" + user)  # ~user : passwd
+        except ValueError:  # octet nul : utilisateur inconnu
+            return None
+        if prefix.startswith("~"):
+            return None
+        rest = sep + tail
+    elif arg.startswith("/"):
+        prefix, rest = "", arg
+    else:
+        prefix, rest = paths.ssh_dir, "/" + arg
+    # mêmes octets que ceux du fichier (lu en UTF-8, surrogateescape)
+    return _compile([(b, True) for b in os.fsencode(prefix)] + _glob_tokens(rest.encode("utf-8", "surrogateescape")))
+
+
+def _magic(items: list) -> bool:
+    return any(a[0] in "*?[x" for a in items)
+
+
+def _components(items: list) -> list:
+    """Composants (atomes, joker ?, octets) pour la réponse textuelle : `//`, `.` et `..`
+    repliés comme normpath."""
+    comps, cur = [], []
+    for a in items + [("/",)]:
+        if a[0] != "/":
+            cur.append(a)
+            continue
+        if cur:
+            magic = _magic(cur)
+            text = bytes(x[1] for x in cur) if not magic else b""
+            if not magic and text == b"..":
+                del comps[-1:]
+            elif magic or text != b".":
+                comps.append((cur, magic, text))
+        cur = []
+    return comps
+
+
+def _literal(path: bytes) -> list:
+    """Composants d'un chemin absolu sans joker."""
+    return [([("c", b) for b in part], False, part) for part in path.split(b"/") if part]
+
+
+def _fits(seq: list, path: bytes, cross: bool, dot: bool) -> bool:
+    """`seq` ([(atome, en tête de composant ?)]) prend-il tout `path` ? `cross` : `*`, `?`,
+    `[…]` prennent aussi `/` ; `dot` : un nom à point initial n'est pris que par un `.` écrit en
+    tête du composant du motif."""
+    m = len(path)
+
+    def ok(atom, start, j):
+        c = path[j]
+        if atom[0] == "/":
+            return c == _SLASH
+        lead = dot and c == _DOT and (j == 0 or path[j - 1] == _SLASH)
+        if atom[0] == "c":
+            return c == atom[1] and not (lead and not start)
+        if lead or (c == _SLASH and not cross) or atom[0] == "x":
+            return False
+        if atom[0] == "[":
+            _, neg, chars, ranges, classes = atom
+            hit = c in chars or any(a <= c <= b for a, b in ranges) or any(c in _CLASSES[k] for k in classes)
+            return hit != neg
+        return True
+
+    pos = {0}
+    for atom, start in seq:
+        if atom[0] == "*":
+            new = set()
+            for j in sorted(pos):
+                while j not in new:
+                    new.add(j)
+                    if j >= m or not ok(atom, start, j):
+                        break
+                    j += 1
+            pos = new
+        else:
+            pos = {j + 1 for j in pos if j < m and ok(atom, start, j)}
+        if not pos:
+            return False
+    return m in pos
+
+
+def _match(comps: list, path: bytes, cross: bool = False, dot: bool = True) -> bool:
+    """Réponse textuelle : le motif `comps` prend-il le chemin absolu `path` ? Par défaut comme
+    le glob d'ssh (`*`, `?`, `[…]` ne prennent jamais `/` ; règle du point initial)."""
+    seq = []
+    for atoms, _, _ in comps:
+        seq.append((("/",), True))
+        seq += [(a, k == 0) for k, a in enumerate(atoms)]
+    return _fits(seq, path, cross, dot)
+
+
+def _real(path: bytes) -> bytes:
+    """realpath, `//` initial lu `/` (noyau et ssh)."""
+    r = os.path.realpath(path)
+    return b"/" + r.lstrip(b"/") if r.startswith(b"//") else r
+
+
+def _glob_real(comps: list) -> list:
+    """`comps` dont le préfixe sans joker est résolu (liens symboliques) : comparé au chemin
+    réel du fichier généré."""
+    n = next((i for i, c in enumerate(comps) if c[1]), len(comps))
+    try:
+        head = _real(b"/" + b"/".join(c[2] for c in comps[:n]))
+    except ValueError:  # octet nul
+        return comps
+    return _literal(head) + comps[n:]
+
+
+class _Disk:
+    """Le disque vu par le glob d'ssh : noms d'entrées de dossier et lstat/stat seulement, jamais
+    le contenu d'un fichier. Le fichier généré et ses dossiers parents sont tenus pour existants
+    (config pas encore écrite) ; au-delà de WALK_LIMIT entrées examinées, comptées au fil de la
+    lecture et partagées par tous les parcours d'une lecture de la config : _WalkLimit."""
+
+    def __init__(self, config: str):
+        self.g = _real(os.fsencode(config))
+        self.seen = 0
+
+    def _chain(self, p: bytes) -> bool:
+        return p == self.g or self.g.startswith(p.rstrip(b"/") + b"/")
+
+    def resolve(self, p: bytes):
+        """(chemin réel, dossier ?) si `p` existe, sur le disque ou tenu pour existant ; None sinon."""
+        try:
+            os.lstat(p)
+            try:
+                isdir = stat.S_ISDIR(os.stat(p).st_mode)
+            except OSError:
+                isdir = False
+            return _real(p), isdir
+        except (OSError, ValueError):
+            pass
+        comps = [c for c in p.split(b"/") if c]
+        k = 0
+        while k < len(comps):
+            try:
+                os.lstat(b"/" + b"/".join(comps[:k + 1]))
+            except (OSError, ValueError):
+                break
+            k += 1
+        if k == len(comps):
+            return None  # tout existe, mais pas sous cette forme (`/` final sur un fichier…)
+        cur = _real(b"/" + b"/".join(comps[:k]))
+        for c in comps[k:]:  # au-delà du disque : seulement la chaîne du fichier généré
+            if not self._chain(cur) or cur == self.g:
+                return None
+            if c == b"..":
+                cur = os.path.dirname(cur)
+            elif c != b".":
+                cur = cur.rstrip(b"/") + b"/" + c
+            if not self._chain(cur):
+                return None
+        isdir = cur != self.g
+        if p.endswith(b"/") and not isdir:
+            return None
+        return cur, isdir
+
+    def listdir(self, d: bytes) -> Optional[list]:
+        r = self.resolve(d)
+        if r is None or not r[1]:
+            return None
+        names = [b".", b".."]
+        self.count(2)
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    self.count(1)
+                    names.append(e.name)
+        except FileNotFoundError:
+            pass  # dossier tenu pour existant
+        except (OSError, ValueError):
+            return None
+        if self._chain(r[0]) and r[0] != self.g:
+            child = self.g[len(r[0].rstrip(b"/")) + 1:].split(b"/")[0]
+            if child not in names:
+                names.append(child)
+        return names
+
+    def count(self, n: int) -> None:
+        self.seen += n
+        if self.seen > WALK_LIMIT:
+            raise _WalkLimit()
+
+    def is_target(self, p: bytes) -> bool:
+        """`p` est-il le fichier généré : même chemin réel (un lien physique n'en est pas : il
+        garde l'ancien contenu après une régénération), ou le chemin tenu pour existant."""
+        return self.resolve(p) == (self.g, False)
+
+
+def _walk(items: list, disk: _Disk) -> bool:
+    """Le glob d'OpenSSH 8.9 (glob2/glob3) trouve-t-il le fichier généré ? Segments sans joker
+    ajoutés tels quels (vérifiés par le lstat final, `..` et liens résolus par le noyau),
+    segments à joker comparés aux entrées du dossier (`.` et `..` comprises)."""
+    n = len(items)
+
+    def glob2(path: bytes, i: int) -> bool:
+        while True:
+            if i == n:
+                return disk.is_target(path)
+            j = i
+            while j < n and items[j][0] != "/":
+                j += 1
+            if _magic(items[i:j]):
+                return glob3(path, items[i:j], j)
+            path += bytes(a[1] for a in items[i:j])
+            i = j
+            while i < n and items[i][0] == "/":
+                path += b"/"
+                i += 1
+
+    def glob3(path: bytes, seg: list, rest: int) -> bool:
+        names = disk.listdir(path)
+        if names is None:
+            return False
+        seq = [(a, k == 0) for k, a in enumerate(seg)]
+        for name in names:
+            if name[:1] == b"." and seg[0] != ("c", _DOT):
+                continue
+            if _fits(seq, name, False, False) and glob2(path + name, rest):
+                return True
+        return False
+    return glob2(b"", 0)
+
+
+class _Read:
+    """Une lecture de ~/.ssh/config : un budget de parcours (`_Disk`) pour tous ses arguments et
+    la réponse de chaque argument gardée."""
+
+    def __init__(self, paths: Paths):
+        self.disk = _Disk(paths.config)
+        self.kinds = {}
+
+
+def _textual(comps: list, paths: Paths) -> bool:
+    """Réponse textuelle : le motif prend le chemin normal ou réel du fichier généré."""
+    return (_match(comps, os.fsencode(os.path.normpath(paths.config)))
+            or _match(_glob_real(comps), _real(os.fsencode(paths.config))))
+
+
+def _arg_kind(arg: str, paths: Paths, rd: Optional[_Read] = None):
+    """(sorte, composants, joker ?) d'un argument d'`Include` : « exact » ou « glob » si le glob
+    d'ssh, parcouru sur le disque (`_walk`), trouve le fichier généré, sans ou avec joker ; None
+    sinon ; « bad » : classe POSIX inconnue (n'inclut rien). Budget épuisé (WALK_LIMIT, partagé
+    par la lecture `rd`), plus de WALK_DEPTH composants ou récursion trop profonde : réponse
+    textuelle (`_textual`). Réponse gardée par argument dans `rd`."""
+    rd = rd or _Read(paths)
+    if arg in rd.kinds:
+        return rd.kinds[arg]
+    try:
+        items = _parse(arg, paths)
+    except _BadClass:
+        items = "bad"
+    if items == "bad":
+        out = "bad", None, False
+    elif items is None:
+        out = None, None, False
+    else:
+        comps, magic = _components(items), _magic(items)
+        depth = sum(1 for k, a in enumerate(items) if a[0] != "/" and (k == 0 or items[k - 1][0] == "/"))
+        try:
+            if depth > WALK_DEPTH:
+                raise _WalkLimit()
+            hit = _walk(items, rd.disk)
+        except (_WalkLimit, RecursionError):
+            hit = _textual(comps, paths)
+        out = ("glob" if magic else "exact") if hit else None, comps, magic
+    rd.kinds[arg] = out
+    return out
+
+
+def _ref_kinds(args_text: str, paths: Paths, rd: Optional[_Read] = None) -> list:
+    """Pour chaque argument d'`Include` (découpé comme ssh, `_include_args`) : « exact » s'il
+    désigne le fichier généré sans joker, « glob » si c'est un joker qui le couvre (il peut
+    couvrir d'autres fichiers), None sinon ; décidé comme le glob d'ssh sur le disque (`_arg_kind`)."""
+    rd = rd or _Read(paths)
+    out = []
+    for a, _ in _include_args(args_text):
+        k = _arg_kind(a, paths, rd)[0]
+        out.append(None if k == "bad" else k)
+    return out
+
+
+def _refs(args_text: str, paths: Paths, rd: Optional[_Read] = None) -> list:
     """Pour chaque argument d'`Include` : désigne-t-il le fichier généré ? (`~`, `~user`,
     relatif à ~/.ssh, chemin réel, joker de glob)."""
-    return [k is not None for k in _ref_kinds(args_text, paths)]
+    return [k is not None for k in _ref_kinds(args_text, paths, rd)]
+
+
+NEIGHBOUR_SLASH = "*, ? et […] ne traversent pas /"
+NEIGHBOUR_DOT = "un nom à point initial (%s) doit être écrit avec son point"
+
+
+def _neighbour(arg: str, paths: Paths, rd: Optional[_Read] = None) -> list:
+    """Raisons pour lesquelles un joker « presque bon » n'inclut pas le fichier généré : il le
+    couvrirait si `*`, `?` et `[…]` pouvaient prendre `/` (chemin entier) et/ou si la règle du
+    point initial était levée (réponse textuelle, mêmes échappements et classes ; chemin normal
+    ou réel). Les deux raisons seulement si chacune seule ne suffit pas. [] : pas un voisin
+    (exact, couvrant, sans joker, classe inconnue, couvrant pour le texte mais pas sur le
+    disque : `/` final, `absent/..`, dossier illisible, ou trop loin). Jamais une réponse de
+    `_ref_kinds`."""
+    kind, comps, magic = _arg_kind(arg, paths, rd)
+    if kind is not None or not magic or _textual(comps, paths):
+        return []
+    pairs = [(comps, os.fsencode(os.path.normpath(paths.config))),
+             (_glob_real(comps), _real(os.fsencode(paths.config)))]
+
+    def hits(cross, dot):
+        return next(((c, p) for c, p in pairs if _match(c, p, cross, dot)), None)
+
+    def dotted(hit):
+        c, p = hit
+        first = next((i for i, x in enumerate(c) if x[1]), 0)
+        name = next((x for x in p.split(b"/")[1:][first:] if x.startswith(b".")), b".ssh")
+        return NEIGHBOUR_DOT % name.decode("utf-8", "surrogateescape")
+    if hits(True, True):
+        return [NEIGHBOUR_SLASH]
+    hit = hits(False, False)
+    if hit:
+        return [dotted(hit)]
+    hit = hits(True, False)
+    return [NEIGHBOUR_SLASH, dotted(hit)] if hit else []
+
+
+def neighbours(lines: list, paths: Paths, rd: Optional[_Read] = None) -> list:
+    """[(index de ligne, argument tel qu'écrit, raisons)] des jokers voisins des lignes
+    `Include`, où qu'elles soient (en tête, plus bas, dans un bloc Host/Match) ; jamais sur une
+    ligne dont un argument couvre déjà le fichier généré."""
+    rd, out = rd or _Read(paths), []
+    for i, line in enumerate(lines):
+        kw, rest = _keyword(line)
+        if kw != "include" or any(_ref_kinds(rest, paths, rd)):
+            continue
+        for a, raw in _include_args(rest):
+            why = _neighbour(a, paths, rd)
+            if why:
+                out.append((i, raw, why))
+    return out
+
+
+def neighbour_line(paths: Paths, n: int, raw: str, why: list) -> str:
+    """Ligne d'avertissement d'un joker voisin : ligne `n` de ~/.ssh/config, argument tel
+    qu'écrit (`raw`), raisons ; toute la ligne nettoyée pour le terminal (contrôles et octets
+    non UTF-8 échappés)."""
+    line = "%s ligne %d : le joker « %s » n'inclut pas %s : %s" % (paths.user_config, n, raw, paths.config,
+                                                                    " ; ".join(why))
+    return clean(line.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace"))
 
 
 @dataclass
@@ -799,6 +1248,7 @@ class Scan:
     lines: list
     head: bool = False
     ours: list = field(default_factory=list)  # (index, dans un bloc Host/Match, seul argument : le nôtre)
+    read: Optional[_Read] = None  # lecture de la config : budget de parcours et réponses gardées
 
     @property
     def conditional(self) -> list:
@@ -815,7 +1265,7 @@ class Scan:
 def scan(text: str, paths: Paths) -> Scan:
     """Lignes coupées sur « \n » seulement (comme ssh). En tête = l'`Include` est la première
     ligne qui n'est ni vide ni un commentaire ; après une ligne Host/Match, il est conditionnel."""
-    sc = Scan(text.split("\n"))
+    sc = Scan(text.split("\n"), read=_Read(paths))
     first, in_block = None, False
     for i, line in enumerate(sc.lines):
         kw, rest = _keyword(line)
@@ -826,7 +1276,7 @@ def scan(text: str, paths: Paths) -> Scan:
         if kw in ("host", "match"):
             in_block = True
         elif kw == "include":
-            refs = _refs(rest, paths)
+            refs = _refs(rest, paths, sc.read)
             if any(refs):
                 sc.ours.append((i, in_block, all(refs)))
                 if i == first:
@@ -867,8 +1317,7 @@ def include_state(paths: Paths):
     return sc.state(), sc
 
 
-def include_warning(paths: Paths) -> Optional[str]:
-    st, sc = include_state(paths)
+def _include_warning(st: str, sc: Optional[Scan], paths: Paths) -> Optional[str]:
     p = paths.user_config
     if st == "head":
         return None
@@ -876,7 +1325,7 @@ def include_warning(paths: Paths) -> Optional[str]:
         return ("la ligne Include de sshvault n'est pas en tête de %s : les lignes qui la précèdent l'emportent ; "
                 "lancer « sshvault ssh-config install »" % p)
     if st == "conditional":
-        exact = set(_own_includes(sc.lines, paths)[0])
+        exact = set(_own_includes(sc.lines, paths, sc.read)[0])
         blocked = [i for i in sc.conditional if i in exact]
         if not blocked:  # joker ou ligne mixte : install ajoute l'Include exact en tête sans la toucher
             return ("%s ligne %d : Include conditionnel (dans un bloc Host/Match) : sshvault ne s'applique que dans ce "
@@ -888,6 +1337,20 @@ def include_warning(paths: Paths) -> Optional[str]:
     if st == "notregular":
         return "%s n'est pas un fichier ordinaire : ligne Include de sshvault non vérifiée" % p
     return "%s n'inclut pas %s : ssh ne s'en sert pas ; lancer « sshvault ssh-config install »" % (p, paths.config)
+
+
+def include_warnings(paths: Paths) -> list:
+    """Avertissements sur la ligne `Include` de ~/.ssh/config (une ligne chacun ; [] : en tête) :
+    l'état, puis, dès que l'Include de sshvault n'est pas en tête (absent, plus bas,
+    conditionnel), une ligne par joker voisin (`neighbours`, dans un bloc compris)."""
+    st, sc = include_state(paths)
+    w = _include_warning(st, sc, paths)
+    if w is None:
+        return []
+    out = [w]
+    if sc is not None:
+        out += [neighbour_line(paths, i + 1, raw, why) for i, raw, why in neighbours(sc.lines, paths, sc.read)]
+    return out
 
 
 def _tmp_write(path: str, data: bytes, mode: int, uid: int, gid: int) -> str:
@@ -968,8 +1431,9 @@ def install(paths: Paths) -> Installed:
     est ajouté en tête et elle reste, avec un avertissement (fichier généré inclus deux fois,
     sans effet néfaste : la première valeur rencontrée gagne ; ses `Match exec` sont évalués deux
     fois à chaque lecture de la config : `ensure` lancé deux fois, le second trouve la clé déjà
-    chargée quand le premier l'a chargée). Ligne de sshvault déjà en tête
-    (même à joker) : rien changé."""
+    chargée quand le premier l'a chargée). Joker voisin (`neighbours`) : un avertissement
+    chacun, numéroté dans le fichier réécrit. Ligne de sshvault déjà en tête (même à joker) :
+    rien changé."""
     p = paths.user_config
     line = include_line(paths)
     try:
@@ -994,7 +1458,7 @@ def install(paths: Paths) -> Installed:
             sc = scan(data.decode(errors="surrogateescape"), paths)
             if sc.head:
                 return Installed("%s : ligne Include déjà en tête, rien changé" % p)
-            exact, kept = _own_includes(sc.lines, paths)
+            exact, kept = _own_includes(sc.lines, paths, sc.read)
             blocked = [i for i in exact if i in set(sc.conditional)]
             if blocked:
                 raise SshConfigError("%s ligne %d : la ligne Include de sshvault est dans un bloc Host/Match (Include "
@@ -1010,6 +1474,9 @@ def install(paths: Paths) -> Installed:
                                 "première valeur rencontrée gagne ; ses lignes Match exec sont évaluées deux fois "
                                 "à chaque lecture de la config (« sshvault ensure » lancé deux fois : le second "
                                 "trouve la clé déjà chargée quand le premier l'a chargée)" % (p, n, paths.config))
+            # jamais dans `drop` : une ligne exacte n'a pas de joker
+            for i, raw, why in neighbours(sc.lines, paths, sc.read):
+                warnings.append(neighbour_line(paths, i + 2 - len([j for j in drop if j < i]), raw, why))
             bak = _backup(paths, data)
             _replace(p, new.encode(errors="surrogateescape"), stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid,
                      expect=(st.st_ino, st.st_size, st.st_mtime_ns))
@@ -1029,16 +1496,16 @@ class Uninstalled:
     kept: list = field(default_factory=list)  # numéros des lignes Include gardées (fichier réécrit)
 
 
-def _own_includes(lines: list, paths: Paths):
+def _own_includes(lines: list, paths: Paths, rd: Optional[_Read] = None):
     """(index des lignes `Include` qui ne désignent que le fichier généré, où qu'elles soient :
     en tête, plus bas ou dans un bloc Host/Match ; index des lignes qui le désignent avec
     d'autres fichiers ou par un joker de glob)."""
-    sole, mixed = [], []
+    rd, sole, mixed = rd or _Read(paths), [], []
     for i, line in enumerate(lines):
         kw, rest = _keyword(line)
         if kw != "include":
             continue
-        kinds = _ref_kinds(rest, paths)
+        kinds = _ref_kinds(rest, paths, rd)
         if kinds and all(k == "exact" for k in kinds):
             sole.append(i)
         elif any(kinds):

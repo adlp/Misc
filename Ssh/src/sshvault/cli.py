@@ -1435,7 +1435,7 @@ def run_load(args, accts: Accounts, prompt) -> int:
         err("aucune clé ne correspond à « %s »" % args.pattern if args.pattern is not None
             else "aucune clé SSH dans le coffre")
         return max(rc_read, RC_NONE)
-    todo, seen, skipped, already = [], set(), 0, 0
+    todo, seen, skipped, already = [], set(), 0, []
     for i in found:
         blob = public_blob(i.public_key)
         if blob is None:
@@ -1447,7 +1447,7 @@ def run_load(args, accts: Accounts, prompt) -> int:
         seen.add(blob)
         if blob in present and not args.force:
             print("déjà chargée : %s %s (--force pour recharger)" % (clean(i.name), fingerprint(blob)))
-            already += 1
+            already.append((i, blob))
         else:
             todo.append((i, blob))
     if not todo:
@@ -1456,18 +1456,13 @@ def run_load(args, accts: Accounts, prompt) -> int:
         return rc_read
     if args.restrict:
         for i, _ in todo:
-            if not i.hosts:
-                raise AgentError("--restrict : « %s » n'a aucun hôte associé : rien chargé" % clean(i.name))
-            bad = [h for h in i.hosts if not literal_host(h)]
-            if bad:
-                raise AgentError("--restrict : hôte « %s » de « %s » non littéral (motif, user@, >, :port) : "
-                                 "rien chargé" % (clean(bad[0]), clean(i.name)))
+            _restrict_hosts(i)
 
     agent.ensure_running()  # dossier de l'agent (et d'ensure.lock) créé ; relu sous le verrou
     if args.restrict:
         agent.check_hosts(sorted({h.lower() for i, _ in todo for h in i.hosts}))
     interactive = not args.nointeraction
-    keys, added, done = {}, {}, []
+    keys, added, done, back = {}, {}, [], set()
     try:
         # Toutes les clés lues avant le premier chargement, hors du verrou (invites du coffre).
         for i, _ in todo:
@@ -1498,7 +1493,33 @@ def run_load(args, accts: Accounts, prompt) -> int:
                     keys.pop((i.account, i.id), None)
                 todo = [t for t in todo if t[1] not in present]
             # comptes revus : logout, lock, account remove, rename ou set pendant l'attente : rien chargé
-            _accounts_still_open(accts, sorted({i.account for i, _ in todo}))
+            opened = sorted({i.account for i, _ in todo})
+            _accounts_still_open(accts, opened)
+            # « déjà chargée » au départ mais retirée de l'agent pendant l'attente : rechargée avec
+            # les options de cette commande. Pour chacune : compte revu (une fois par compte),
+            # --restrict (échec : rien chargé, code 4), relecture sans invite du coffre ; compte
+            # fermé, relecture en échec ou clé chiffrée sans saisie possible : sautée (une ligne)
+            verdict = {a: None for a in opened}
+            for i, blob in [t for t in already if t[1] not in present]:
+                if i.account not in verdict:
+                    verdict[i.account] = _account_gone(accts, i.account)
+                why = verdict[i.account]
+                if why is None and args.restrict:
+                    _restrict_hosts(i)
+                    agent.check_hosts(sorted({h.lower() for h in i.hosts}))
+                if why is None:
+                    try:
+                        keys[i.account, i.id] = accts.backend(i.account).get_private_key(i.id, None)
+                    except (VaultError, SessionStoreError) as e:
+                        why = "relecture du coffre : %s" % classify(e)[1]
+                if why is None and not interactive and is_encrypted(keys[i.account, i.id]):
+                    why = "clé chiffrée par passphrase, saisie impossible (--nointeraction)"
+                if why:
+                    keys.pop((i.account, i.id), None)
+                    err("%s%s %s non rechargée : %s" % (accts.prefix(i.account), clean(i.name), fingerprint(blob), why))
+                    continue
+                todo.append((i, blob))
+                back.add(blob)
             timeout = prompt_timeout(os.environ) + 10
             try:
                 for i, blob in todo:
@@ -1538,8 +1559,19 @@ def run_load(args, accts: Accounts, prompt) -> int:
     for i, blob, _ in done:
         opts = ", ".join(["durée " + describe_duration(lifetime)] + _options(args.confirm, False)
                          + (["restreinte à " + _hosts(i.hosts)] if args.restrict else []))
-        print("chargée : %s%s %s (%s)" % (accts.prefix(i.account), clean(i.name), fingerprint(blob), opts))
+        print("%s : %s%s %s (%s)" % ("rechargée (retirée pendant l'attente)" if blob in back else "chargée",
+                                     accts.prefix(i.account), clean(i.name), fingerprint(blob), opts))
     return rc_read
+
+
+def _restrict_hosts(i: SshKeyItem) -> None:
+    """--restrict : la clé a des hôtes, tous littéraux ; sinon AgentError (code 4, rien chargé)."""
+    if not i.hosts:
+        raise AgentError("--restrict : « %s » n'a aucun hôte associé : rien chargé" % clean(i.name))
+    bad = [h for h in i.hosts if not literal_host(h)]
+    if bad:
+        raise AgentError("--restrict : hôte « %s » de « %s » non littéral (motif, user@, >, :port) : "
+                         "rien chargé" % (clean(bad[0]), clean(i.name)))
 
 
 def _accounts_still_open(accts: Accounts, aliases: list) -> None:
@@ -1549,24 +1581,39 @@ def _accounts_still_open(accts: Accounts, aliases: list) -> None:
     (code 3), une ligne qui nomme le compte ; bw en erreur : son code."""
     now = accts.cfg.accounts()
     for a in aliases:
-        why = None
-        if a not in now:
-            why = "retiré ou renommé (account remove ou rename)"
-        elif now[a] != accts.registry.get(a):
-            why = "modifié (account set)"
-        else:
-            try:
-                st = accts.backend(a).status()
-            except (VaultError, SessionStoreError) as e:
-                code, msg = classify(e)
-                raise (BackendError if code == RC_BACKEND else VaultLocked)(
-                    "compte « %s » : état relu sous le verrou d'ensure : %s : rien chargé" % (a, msg)) from None
-            if st.state == "unauthenticated":
-                why = "déconnecté"
-            elif st.state != "unlocked":
-                why = "verrouillé"
+        try:
+            why = _account_change(accts, a, now)
+        except (VaultError, SessionStoreError) as e:
+            code, msg = classify(e)
+            raise (BackendError if code == RC_BACKEND else VaultLocked)(
+                "compte « %s » : état relu sous le verrou d'ensure : %s : rien chargé" % (a, msg)) from None
         if why:
             raise VaultLocked("compte « %s » %s pendant l'attente du verrou d'ensure : rien chargé" % (a, why))
+
+
+def _account_change(accts: Accounts, a: str, now: dict) -> Optional[str]:
+    """Pourquoi le compte `a` n'est plus lisible sous ensure.lock (None : toujours enregistré à
+    l'identique, bw connecté, coffre déverrouillé, lu comme `status`) ; bw en erreur : levée."""
+    if a not in now:
+        return "retiré ou renommé (account remove ou rename)"
+    if now[a] != accts.registry.get(a):
+        return "modifié (account set)"
+    st = accts.backend(a).status()
+    if st.state == "unauthenticated":
+        return "déconnecté"
+    if st.state != "unlocked":
+        return "verrouillé"
+    return None
+
+
+def _account_gone(accts: Accounts, a: str) -> Optional[str]:
+    """Comme `_accounts_still_open` pour une clé à recharger (`load`) : la raison de la sauter
+    (compte changé pendant l'attente, ou bw en erreur), sans rien lever."""
+    try:
+        why = _account_change(accts, a, accts.cfg.accounts())
+    except (VaultError, SessionStoreError) as e:
+        return "compte « %s » : état relu sous le verrou d'ensure : %s" % (a, classify(e)[1])
+    return "compte « %s » %s pendant l'attente du verrou d'ensure" % (a, why) if why else None
 
 
 def _need_prompt(args, agent: Agent, what: str) -> None:
@@ -1939,8 +1986,7 @@ def regenerate(items: list, paths=None, socket: Optional[str] = None, exe=_RESOL
         print("clés publiques (%s) : %d écrite%s, %d supprimée%s"
               % (paths.pub, len(res.pubs_written), "s" if len(res.pubs_written) > 1 else "",
                  len(res.pubs_removed), "s" if len(res.pubs_removed) > 1 else ""), file=out or sys.stdout, flush=True)
-    w = sshconfig.include_warning(paths)
-    if w:
+    for w in sshconfig.include_warnings(paths):
         err("avertissement : %s" % w)
     forward_upkeep(plan, socket, out)
     return plan
@@ -2118,9 +2164,7 @@ def run_ssh_config(args, accts: Accounts, prompt) -> int:
     for w in notes:
         err("avertissement : %s" % w)
     warn_forwardagent(items, plan, paths)
-    w = sshconfig.include_warning(paths)
-    if w:
-        diffs.append(w)
+    diffs += sshconfig.include_warnings(paths)
     for d in diffs:
         print(d)
     if diffs:
