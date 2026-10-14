@@ -26,6 +26,7 @@ import uuid
 
 import pytest
 
+from accounts import Scrub, alias as alias_of
 from bench import (HAVE_OPENSSH, SRC, ArgvWatch, agent_list, b64_fragments, check_witness, kill_agents_under,
                    private_runtime_dir, wait_gone, write_exe)
 
@@ -35,9 +36,11 @@ MARK = "sshvault-test-run"
 RUN = uuid.uuid4().hex
 TAG = RUN[:8]
 PW_VAR = "SSHVAULT_IT_PW"
-#: alias du compte de test dans sshvault (CAP-10), et du second compte (volet deux comptes)
-ALIAS = "it"
-ALIAS2 = "it2"
+#: alias du 1er compte de test dans sshvault (CAP-10) ; les suivants : it2, it3… (`alias_of`)
+ALIAS = alias_of(0)
+#: mesure du code de `sshvault login` (test opt-in) : nombre d'essais, écart minimal entre deux
+LOGIN_REPEAT = "SSHVAULT_IT_LOGIN_REPEAT"
+LOGIN_GAP = 7
 
 
 # Mesuré (diagnostic du 2026-10-07) : une petite part des connexions TCP neuves vers le serveur
@@ -53,6 +56,12 @@ TIMEOUT_RC = 124
 TRANSIENT = ("ENOTFOUND", "EAI_AGAIN", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH",
              "socket hang up", "fetch failed", "getaddrinfo", "network error", "Network")
 BACKOFF = (2, 5, 10, 20)
+# Limite de débit des connexions de Vaultwarden (mesuré le 2026-10-14 : 6 `login` sur 8 refusés
+# après 12 réussis, « Rate limit exceeded. Try again later. ») : attente puis nouvel essai.
+RATE_LIMIT = "Rate limit exceeded"
+RATE_LIMIT_WAIT = 60
+RATE_LIMIT_RETRIES = 3
+RATE_LIMIT_NOTE = "limite de débit du serveur : nouvel essai dans %d s" % RATE_LIMIT_WAIT
 
 
 def transient(r) -> bool:
@@ -105,13 +114,21 @@ class Bw:
     def login(self):
         self.ok("config", "server", self.account.server)
         args = ("login", self.account.email, "--passwordenv", PW_VAR, "--raw")
-        for _ in range(NET_ATTEMPTS):
+        attempt, limited = 0, 0
+        while attempt < NET_ATTEMPTS:
             r = self.run(*args, env={PW_VAR: self.account.password})
             if r.returncode == 0:
                 return r.stdout.strip()
+            if RATE_LIMIT in (r.stderr or "") and limited < RATE_LIMIT_RETRIES:
+                limited += 1
+                if self.report:
+                    self.report.add("bw login (peuplement)", note=RATE_LIMIT_NOTE)
+                time.sleep(RATE_LIMIT_WAIT)
+                continue
             if r.returncode != TIMEOUT_RC:
                 raise self.fail(args, r)
             self.run("logout")  # état partiel éventuel du login tué
+            attempt += 1
         raise self.fail(args, r)
 
     def create(self, enc, name, session):
@@ -169,8 +186,10 @@ class Report:
 
 
 @pytest.fixture(scope="module")
-def report(account):
-    rep = Report(account)
+def report(accounts):
+    rep = Report(Scrub(accounts))  # valeurs de tous les comptes masquées
+    for w in getattr(accounts, "warnings", ()):
+        rep.add("fichier des comptes", note="avertissement : " + w)
     yield rep
     rep.flush()
 
@@ -400,60 +419,95 @@ def sv(home, *args, env=None):
                           timeout=600, stdin=subprocess.DEVNULL, start_new_session=True)
 
 
-def sv_login(home, account, report, alias=None, own=None):
-    """`sshvault login [--account ALIAS]` sous un pty : sshvault passe l'e-mail du registre à
+def pty_login(home, account, alias=None):
+    """Un `sshvault login [--account ALIAS]` sous un pty : sshvault passe l'e-mail du registre à
     `bw login`, bw demande le mot de passe sur le terminal (saisie interactive réelle ; l'e-mail
-    aussi s'il le demandait). Rien de ce qui passe sur le terminal n'est gardé ni affiché.
-    Connexion bloquée (réseau) : sshvault interrompu, `bw logout`, nouvel essai."""
-    for attempt in range(NET_ATTEMPTS):
-        master, slave = pty.openpty()
-        name = os.ttyname(slave)
+    aussi s'il le demandait). Rien de ce qui passe sur le terminal n'est gardé ni affiché, sauf
+    en échec : la fin (300 caractères) de ce que le terminal a reçu après l'invite du mot de
+    passe (sans écho), ou de tout le terminal si l'invite n'est pas venue, masquée par
+    `account.scrub`. Renvoie {rc, out, invites, tail, blocked, duration} ; bloqué (réseau) :
+    sshvault interrompu (SIGTERM), `blocked` vrai."""
+    master, slave = pty.openpty()
+    name = os.ttyname(slave)
 
-        def ctty():
-            os.close(os.open(name, os.O_RDWR))
+    def ctty():
+        os.close(os.open(name, os.O_RDWR))
 
-        p = subprocess.Popen([sys.executable, "-m", "sshvault", "login"] + (["--account", alias] if alias else []),
-                             env=home["env"], stdin=slave, stdout=subprocess.PIPE, stderr=slave,
-                             start_new_session=True, preexec_fn=ctty)
-        seen, sent, blocked = b"", set(), False
-        deadline = time.monotonic() + NET_TIMEOUT + 30
-        try:
-            while p.poll() is None:
-                if time.monotonic() > deadline:
-                    blocked = True
-                    p.send_signal(signal.SIGTERM)
-                    p.wait(timeout=30)
-                    break
-                r, _, _ = select.select([master], [], [], 0.2)
-                if r:
-                    try:
-                        seen += os.read(master, 4096)
-                    except OSError:
-                        pass
-                for marker, what, value in ((b"Email address", "email", account.email),
-                                            (b"Master password", "password", account.password)):
-                    if marker in seen and what not in sent:
-                        time.sleep(0.3)
-                        os.write(master, value.encode() + b"\r")
-                        sent.add(what)
-            out = p.stdout.read().decode(errors="replace")
-            # échec : fin de ce que bw a écrit après l'invite du mot de passe (sans écho), masquée
+    t0 = time.monotonic()
+    p = subprocess.Popen([sys.executable, "-m", "sshvault", "login"] + (["--account", alias] if alias else []),
+                         env=home["env"], stdin=slave, stdout=subprocess.PIPE, stderr=slave,
+                         start_new_session=True, preexec_fn=ctty)
+    seen, sent, blocked = b"", set(), False
+    deadline = time.monotonic() + NET_TIMEOUT + 30
+    try:
+        while p.poll() is None:
+            if time.monotonic() > deadline:
+                blocked = True
+                p.send_signal(signal.SIGTERM)
+                p.wait(timeout=30)
+                break
+            r, _, _ = select.select([master], [], [], 0.2)
+            if r:
+                try:
+                    seen += os.read(master, 4096)
+                except OSError:
+                    pass
+            for marker, what, value in ((b"Email address", "email", account.email),
+                                        (b"Master password", "password", account.password)):
+                if marker in seen and what not in sent:
+                    time.sleep(0.3)
+                    os.write(master, value.encode() + b"\r")
+                    sent.add(what)
+        # reste du terminal après la sortie (message d'erreur écrit juste avant)
+        while True:
+            r, _, _ = select.select([master], [], [], 0.2)
+            if not r:
+                break
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            seen += chunk
+        out = p.stdout.read().decode(errors="replace")
+        tail = ""
+        if p.returncode:
             i = seen.rfind(b"Master password")
-            tail = account.scrub(seen[i + len(b"Master password"):].decode(errors="replace").strip()[-300:]) \
-                if i >= 0 and p.returncode else ""
-        finally:
-            if p.poll() is None:
-                p.kill()
-                p.wait()
-            os.close(master)
-            os.close(slave)
-            del seen  # e-mail tapé, écho du terminal : jamais conservé
-        if not blocked:
-            report.add("sshvault login", note="rc=%d sortie=%r invites=%s" % (p.returncode, out.strip(), sorted(sent)))
-            if p.returncode != 0:
+            rest = seen[i + len(b"Master password"):] if i >= 0 else seen
+            tail = account.scrub(rest.decode(errors="replace").strip()[-300:])
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait()
+        os.close(master)
+        os.close(slave)
+        del seen  # e-mail tapé, écho du terminal : jamais conservé
+    return {"rc": p.returncode, "out": out, "invites": sorted(sent), "tail": tail, "blocked": blocked,
+            "duration": time.monotonic() - t0}
+
+
+def sv_login(home, account, report, alias=None, own=None):
+    """`sshvault login [--account ALIAS]` sous un pty (`pty_login`), code 0 exigé. Connexion
+    bloquée (réseau) : `bw logout`, nouvel essai. Refus par la limite de débit du serveur
+    (« Rate limit exceeded » dans la fin masquée du terminal) : attente de 60 s, nouvel essai,
+    3 fois au plus (chaque attente dans le rapport)."""
+    attempt, limited = 0, 0
+    while attempt < NET_ATTEMPTS:
+        res = pty_login(home, account, alias)
+        if not res["blocked"] and res["rc"] != 0 and RATE_LIMIT in res["tail"] and limited < RATE_LIMIT_RETRIES:
+            limited += 1
+            report.add("sshvault login", note="rc=%d ; %s" % (res["rc"], RATE_LIMIT_NOTE))
+            time.sleep(RATE_LIMIT_WAIT)
+            continue
+        attempt += 1
+        if not res["blocked"]:
+            report.add("sshvault login", note="rc=%d sortie=%r invites=%s" % (res["rc"], res["out"].strip(),
+                                                                             res["invites"]))
+            if res["rc"] != 0:
                 raise AssertionError("sshvault login : code %d (invites vues : %s) ; terminal après l'invite : %r"
-                                     % (p.returncode, sorted(sent), tail))
-            return out
+                                     % (res["rc"], res["invites"], res["tail"]))
+            return res["out"]
         report.add("sshvault login bloqué (%ds), interrompu" % (NET_TIMEOUT + 30))
         (own or home["bw"]).run("logout")
     raise AssertionError("sshvault login : bloqué %d fois" % NET_ATTEMPTS)
@@ -1198,196 +1252,225 @@ def check_generate(account, vault, home, report):
         assert [v for k, v in conf if k == "identitiesonly"] == ["yes"]
 
 
-def test_deux_comptes_sur_le_vrai_bw(account, account2, bw_exe, vault, ssh_keys, home, report):
-    """CAP-10 sur le vrai bw : deux comptes enregistrés (`it`, `it2`), chacun connecté par
-    `sshvault login --account` dans ses propres données ; une clé générée dans `it2` (marquée) ;
-    `list --account` sur les deux comptes, alias de chaque élément ; `account default` change la
-    liste suivante ; `ssh-config` couvre les deux ; `ensure --account` charge la clé de chacun ;
-    `logout --account it2` puis login ; `account set` aller-retour puis login ; `lock` les
-    verrouille tous. Éléments de ce run supprimés des deux comptes à la fin."""
-    if account2 is None:
-        report.add("deux comptes", note="sauté : SSHVAULT_IT2_SERVER, SSHVAULT_IT2_EMAIL ou SSHVAULT_IT2_PASSWORD "
-                                        "absent du fichier du compte de test")
-        pytest.skip("second compte de test absent (SSHVAULT_IT2_*) : volet deux comptes sauté")
+def test_plusieurs_comptes_sur_le_vrai_bw(accounts, bw_exe, vault, ssh_keys, home, report):
+    """CAP-10 sur le vrai bw, tous les comptes du fichier (au moins 2) : `it` (1er, coffre peuplé),
+    puis `it2`, `it3`… dans l'ordre du fichier, chacun connecté par `sshvault login --account`
+    dans ses propres données ; une clé générée et marquée dans chaque compte au-delà du premier
+    (éléments marqués purgés au début et à la fin) ; `list` des comptes par défaut, alias de
+    chaque élément ; `account default` change la liste suivante ; `ssh-config` couvre tous les
+    comptes ; `ensure --account` charge la clé de chacun ; sur **chaque** compte, `it` compris :
+    `logout --account` puis login, et `account set` aller-retour puis login ; `lock` les
+    verrouille tous. Aucune valeur du fichier des comptes dans une assertion, un message ou le
+    rapport (`scrub` de tous les comptes)."""
+    if len(accounts) < 2:
+        report.add("plusieurs comptes", note="sauté : un seul compte dans le fichier des comptes de test")
+        pytest.skip("un seul compte de test : volet plusieurs comptes sauté")
+    scrub = Scrub(accounts).scrub
+    aliases = [alias_of(n) for n in range(len(accounts))]
+    others = list(zip(aliases[1:], accounts[1:]))
 
-    def scrub(text):
-        return account2.scrub(account.scrub(text))
+    def need(cond, what):
+        if not cond:
+            raise AssertionError(scrub(what))
 
     def ok(r, rc, what):
-        if r.returncode != rc:
-            raise AssertionError(scrub("%s : code %d attendu, %d obtenu ; stderr : %s"
-                                       % (what, rc, r.returncode, r.stderr.strip())))
-        assert "Traceback" not in r.stderr and "PRIVATE KEY" not in r.stdout + r.stderr
+        need(r.returncode == rc, "%s : code %d attendu, %d obtenu ; stderr : %s"
+             % (what, rc, r.returncode, r.stderr.strip()))
+        need("Traceback" not in r.stderr and "PRIVATE KEY" not in r.stdout + r.stderr, "%s : sortie inattendue" % what)
 
-    appdata2 = tempfile.mkdtemp(prefix="sshvault-it-bw2-")
-    os.chmod(appdata2, 0o700)
-    pop2 = Bw(bw_exe, appdata2, account2, report)
-    own2 = Bw(bw_exe, os.path.join(home["env"]["HOME"], ".local", "share", "sshvault", "accounts", ALIAS2, "bw"),
-              account2, report)
-    session2, problems = None, []
+    def bw_status(alias):
+        r = own[alias].ok("status")
+        return json.loads(r.stdout)["status"]
+
+    data_dir = os.path.join(home["env"]["HOME"], ".local", "share", "sshvault", "accounts")
+    own = {ALIAS: home["bw"]}
+    own.update({a: Bw(bw_exe, os.path.join(data_dir, a, "bw"), acct, report) for a, acct in others})
+    pops = {}  # alias -> (Bw du peuplement, dossier, session) des comptes au-delà du premier
+    cfg = os.path.join(home["env"]["HOME"], ".ssh", "sshvault", "config")
+    sock = os.path.join(home["runtime"], "sshvault", "agent.sock")
+    problems = []
     try:
-        session2 = pop2.login()
-        for p in purge_marked(pop2, session2, report, "début, second compte"):
-            report.add("purge (début, second compte) incomplète", note=scrub(p))
-        for alias, acct in ((ALIAS, account), (ALIAS2, account2)):
-            r = sv(home, "account", "add", alias, "--server", acct.server, "--email", acct.email)
-            ok(r, 0, "account add %s" % alias)
+        for a, acct in others:
+            appdata = tempfile.mkdtemp(prefix="sshvault-it-bw-%s-" % a)
+            os.chmod(appdata, 0o700)
+            pop = Bw(bw_exe, appdata, acct, report)
+            pops[a] = (pop, appdata, None)
+            pops[a] = (pop, appdata, pop.login())
+            for p in purge_marked(pop, pops[a][2], report, "début, compte %s" % a):
+                report.add("purge (début, compte %s) incomplète" % a, note=p)
+        for a, acct in zip(aliases, accounts):
+            r = sv(home, "account", "add", a, "--server", acct.server, "--email", acct.email)
+            ok(r, 0, "account add %s" % a)
         r = sv(home, "account", "list")
         ok(r, 0, "account list")
-        assert [l.split("\t")[0] for l in r.stdout.splitlines()] == [ALIAS, ALIAS2]
+        listed = [l.split("\t")[0] for l in r.stdout.splitlines()]
+        need(listed == aliases, "account list : alias %s" % listed)
         r = sv(home, "login")
-        ok(r, 2, "login sans --account, deux comptes")
-        assert "--account" in r.stderr
-        out = sv_login(home, account, report, alias=ALIAS)
-        assert "compte %s : connecté, coffre déverrouillé" % ALIAS in out
-        out = sv_login(home, account2, report, alias=ALIAS2, own=own2)
-        assert "compte %s : connecté, coffre déverrouillé" % ALIAS2 in out
+        ok(r, 2, "login sans --account, plusieurs comptes")
+        need("--account" in r.stderr, "login sans --account : --account non demandé")
+        for a, acct in zip(aliases, accounts):
+            out = sv_login(home, acct, report, alias=a, own=own[a])
+            need("compte %s : connecté, coffre déverrouillé" % a in out, "login %s : sortie inattendue" % a)
         r = sv(home, "--nointeraction", "status")
-        ok(r, 0, "status des deux comptes")
-        assert r.stdout.count("coffre : déverrouillé") == 2
+        ok(r, 0, "status de tous les comptes")
+        need(r.stdout.count("coffre : déverrouillé") == len(aliases), "status : comptes non tous déverrouillés")
 
-        # écriture : un seul compte
-        name2 = "sshvault-it %s second compte" % TAG
-        host2 = "deux-%s.it.example" % TAG
-        r = sv(home, "--nointeraction", "account", "default", ALIAS, ALIAS2)
-        ok(r, 0, "account default (deux)")
-        r = sv(home, "--nointeraction", "generate", "--name", name2, "--hosts", host2)
-        ok(r, 2, "generate sans --account, deux comptes par défaut")
-        r = sv(home, "--nointeraction", "generate", "--account", ALIAS2, "--name", name2, "--hosts", host2,
-               env={"SSHVAULT_TEST_FIELD": "%s=%s" % (MARK, RUN)})
-        report.add("generate --account it2", r)
-        ok(r, 0, "generate --account it2")
-        public2 = r.stdout.strip()
+        # écriture : un seul compte ; une clé générée (marquée) dans chaque compte au-delà du premier
+        r = sv(home, "--nointeraction", "account", "default", *aliases)
+        ok(r, 0, "account default (tous)")
+        r = sv(home, "--nointeraction", "generate", "--name", "sshvault-it %s sans compte" % TAG, "--hosts",
+               "aucun-%s.it.example" % TAG)
+        ok(r, 2, "generate sans --account, plusieurs comptes par défaut")
+        public = {ALIAS: ssh_keys["hotes"]["public"]}
+        for a, _ in others:
+            r = sv(home, "--nointeraction", "generate", "--account", a, "--name", "sshvault-it %s compte %s" % (TAG, a),
+                   "--hosts", "%s-%s.it.example" % (a, TAG), env={"SSHVAULT_TEST_FIELD": "%s=%s" % (MARK, RUN)})
+            report.add("generate --account %s" % a, r)
+            ok(r, 0, "generate --account %s" % a)
+            public[a] = r.stdout.strip()
+        blob = {a: k.split()[1] for a, k in public.items()}
 
-        # lecture : deux comptes, alias de chaque élément
+        # lecture : tous les comptes, alias de chaque élément
         r = sv(home, "--nointeraction", "list", "--json")
-        ok(r, 0, "list des deux comptes par défaut")
+        ok(r, 0, "list des comptes par défaut")
         data = json.loads(r.stdout)
         mine = {(d["account"], d["id"]) for d in data}
-        assert (ALIAS, vault["hotes"]) in mine and (ALIAS, vault["sans-hotes"]) in mine
-        id2 = [d["id"] for d in data if d["account"] == ALIAS2 and d["publicKey"] == public2]
-        assert len(id2) == 1, "clé générée relue dans le second compte"
-        id2 = id2[0]
+        need((ALIAS, vault["hotes"]) in mine and (ALIAS, vault["sans-hotes"]) in mine, "list : éléments de it absents")
+        ids = {ALIAS: vault["hotes"]}
+        for a, _ in others:
+            found = [d["id"] for d in data if d["account"] == a and d["publicKey"] == public[a]]
+            need(len(found) == 1, "clé générée relue dans le compte %s : %d trouvée(s)" % (a, len(found)))
+            ids[a] = found[0]
         r = sv(home, "--nointeraction", "list")
-        assert all(l.split("\t")[0] in (ALIAS, ALIAS2) for l in r.stdout.splitlines()), "alias en 1re colonne"
-        r = sv(home, "--nointeraction", "account", "default", ALIAS2)
-        ok(r, 0, "account default it2")
+        ok(r, 0, "list texte")
+        need(all(l.split("\t")[0] in aliases for l in r.stdout.splitlines()), "list : alias en 1re colonne")
+        last = aliases[-1]
+        r = sv(home, "--nointeraction", "account", "default", last)
+        ok(r, 0, "account default %s" % last)
         r = sv(home, "--nointeraction", "list", "--json")
         ok(r, 0, "list après account default")
-        assert {d["account"] for d in json.loads(r.stdout)} == {ALIAS2}
+        need({d["account"] for d in json.loads(r.stdout)} == {last}, "list après account default : autres comptes")
         r = sv(home, "--nointeraction", "list", "--json", "--account", ALIAS)
-        assert {d["account"] for d in json.loads(r.stdout)} == {ALIAS}
+        ok(r, 0, "list --account it")
+        need({d["account"] for d in json.loads(r.stdout)} == {ALIAS}, "list --account it : autres comptes")
 
-        # ssh_config sur les deux comptes, clés des deux chargées
+        # ssh_config sur tous les comptes, clés de tous chargées
         r = sv(home, "--nointeraction", "ssh-config")
-        ok(r, 0, "ssh-config, deux comptes")
-        text = open(os.path.join(home["env"]["HOME"], ".ssh", "sshvault", "config")).read()
-        assert "ensure --account %s --id %s\"" % (ALIAS, vault["hotes"]) in text
-        assert "ensure --account %s --id %s\"" % (ALIAS2, id2) in text
-        if HAVE_OPENSSH:
-            sock = os.path.join(home["runtime"], "sshvault", "agent.sock")
-            for alias, iid in ((ALIAS, vault["hotes"]), (ALIAS2, id2)):
-                r = sv(home, "--nointeraction", "ensure", "--account", alias, "--id", iid)
-                ok(r, 0, "ensure --account %s" % alias)
-            rc, listing = agent_list(sock)
-            assert rc == 0 and sorted(l.split()[1] for l in listing) == sorted(
-                [ssh_keys["hotes"]["public"].split()[1], public2.split()[1]]), "clés des deux comptes chargées"
-            r = sv(home, "agent", "stop")
-            ok(r, 0, "agent stop, deux comptes")
+        ok(r, 0, "ssh-config, tous les comptes")
+        text = open(cfg).read()
+        for a in aliases:
+            need("ensure --account %s --id %s\"" % (a, ids[a]) in text, "ssh-config : bloc du compte %s absent" % a)
 
-        # logout du second compte (story 11) : bw déconnecté, sa clé retirée de l'agent, blocs
-        # gardés ; déjà déconnecté : rien à faire ; puis login
-        cfg = os.path.join(home["env"]["HOME"], ".ssh", "sshvault", "config")
-        sock = os.path.join(home["runtime"], "sshvault", "agent.sock")
-        r = sv(home, "logout")
-        ok(r, 2, "logout sans --account, deux comptes")
+        def ensure_all():
+            for a in aliases:
+                r = sv(home, "--nointeraction", "ensure", "--account", a, "--id", ids[a])
+                ok(r, 0, "ensure --account %s" % a)
+
+        def loaded():
+            rc, listing = agent_list(sock)
+            return sorted(l.split()[1] for l in listing) if rc == 0 else []
+
         if HAVE_OPENSSH:
-            for alias, iid in ((ALIAS, vault["hotes"]), (ALIAS2, id2)):
-                r = sv(home, "--nointeraction", "ensure", "--account", alias, "--id", iid)
-                ok(r, 0, "ensure --account %s avant logout" % alias)
-        # config à jour avant le logout (les étapes précédentes ont changé le coffre), ligne
-        # Include posée dans le ~/.ssh/config du HOME de test (sinon --check rend toujours 1)
+            ensure_all()
+            need(loaded() == sorted(blob.values()), "ensure : clés de tous les comptes non chargées")
+            r = sv(home, "agent", "stop")
+            ok(r, 0, "agent stop, tous les comptes")
+
+        # logout puis login sur chaque compte (story 11) : bw déconnecté, sa clé retirée de
+        # l'agent, blocs gardés ; déjà déconnecté : rien à faire ; puis login. Ligne Include
+        # posée dans le ~/.ssh/config du HOME de test (sinon --check rend toujours 1)
+        r = sv(home, "logout")
+        ok(r, 2, "logout sans --account, plusieurs comptes")
         r = sv(home, "--nointeraction", "ssh-config", "install")
         ok(r, 0, "ssh-config install")
-        r = sv(home, "--nointeraction", "ssh-config")
-        ok(r, 0, "ssh-config avant logout")
-        r = sv(home, "--nointeraction", "ssh-config", "--check")
-        assert r.returncode == 0, "ssh-config --check avant logout : code %d ; stdout : %s" % (
-            r.returncode, scrub(r.stdout.strip()))
-        before = open(cfg).read()
-        r = sv(home, "logout", "--account", ALIAS2)
-        ok(r, 0, "logout --account it2")
-        assert "compte %s déconnecté" % ALIAS2 in r.stdout
-        assert json.loads(own2.ok("status").stdout)["status"] == "unauthenticated", "bw déconnecté"
-        # session relue par le magasin de sshvault lui-même (keyring ou repli fichier)
-        r = subprocess.run([sys.executable, "-c", "from sshvault.session import SessionStore; "
-                            "print(SessionStore(alias=%r).get() is None)" % ALIAS2],
-                           env=home["env"], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
-        assert r.returncode == 0 and r.stdout.strip() == "True", "logout : session de it2 oubliée"
-        assert open(cfg).read() == before, "logout : blocs gardés"
-        if HAVE_OPENSSH:
-            rc, listing = agent_list(sock)
-            assert rc == 0 and [l.split()[1] for l in listing] == [ssh_keys["hotes"]["public"].split()[1]], \
-                "logout : seule la clé de it2 retirée"
-            # marqueur `logged-out` : ensure sans invite propose login (vrai `bw status`)
-            r = sv(home, "--nointeraction", "ensure", "--account", ALIAS2, "--id", id2)
-            ok(r, 3, "ensure après logout")
-            assert "sshvault login --account %s" % ALIAS2 in r.stderr, "ensure après logout : login proposé"
-        r = sv(home, "--nointeraction", "ssh-config", "--check")
-        assert r.returncode == 0, "ssh-config --check après logout : code %d ; stdout : %s" % (
-            r.returncode, scrub(r.stdout.strip()))
-        assert open(cfg).read() == before, "ssh-config --check après logout : blocs gardés"
-        r = sv(home, "logout", "--account", ALIAS2)
-        ok(r, 0, "logout d'un compte déjà déconnecté")
-        assert "rien à faire" in r.stdout
-        out = sv_login(home, account2, report, alias=ALIAS2, own=own2)
-        assert "compte %s : connecté, coffre déverrouillé" % ALIAS2 in out
-        if HAVE_OPENSSH:
-            r = sv(home, "--nointeraction", "ensure", "--account", ALIAS2, "--id", id2)
-            ok(r, 0, "ensure après logout puis login (marqueur retiré)")
-        report.add("logout puis login (second compte)", note="ok")
+        for a, acct in zip(aliases, accounts):
+            if HAVE_OPENSSH:
+                ensure_all()
+            r = sv(home, "--nointeraction", "ssh-config")
+            ok(r, 0, "ssh-config avant logout %s" % a)
+            r = sv(home, "--nointeraction", "ssh-config", "--check")
+            ok(r, 0, "ssh-config --check avant logout %s" % a)
+            before = open(cfg).read()
+            r = sv(home, "logout", "--account", a)
+            ok(r, 0, "logout --account %s" % a)
+            need("compte %s déconnecté" % a in r.stdout, "logout %s : sortie inattendue" % a)
+            need(bw_status(a) == "unauthenticated", "logout %s : bw non déconnecté" % a)
+            # session relue par le magasin de sshvault lui-même (keyring ou repli fichier)
+            r = subprocess.run([sys.executable, "-c", "from sshvault.session import SessionStore; "
+                                "print(SessionStore(alias=%r).get() is None)" % a],
+                               env=home["env"], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+            need(r.returncode == 0 and r.stdout.strip() == "True", "logout : session de %s non oubliée" % a)
+            need(open(cfg).read() == before, "logout %s : blocs non gardés" % a)
+            if HAVE_OPENSSH:
+                need(loaded() == sorted(b for x, b in blob.items() if x != a),
+                     "logout %s : autre chose que sa seule clé retirée" % a)
+                # marqueur `logged-out` : ensure sans invite propose login (vrai `bw status`)
+                r = sv(home, "--nointeraction", "ensure", "--account", a, "--id", ids[a])
+                ok(r, 3, "ensure après logout %s" % a)
+                need("sshvault login --account %s" % a in r.stderr, "ensure après logout %s : login non proposé" % a)
+            r = sv(home, "--nointeraction", "ssh-config", "--check")
+            ok(r, 0, "ssh-config --check après logout %s" % a)
+            need(open(cfg).read() == before, "ssh-config --check après logout %s : blocs non gardés" % a)
+            r = sv(home, "logout", "--account", a)
+            ok(r, 0, "logout de %s déjà déconnecté" % a)
+            need("rien à faire" in r.stdout, "logout de %s déjà déconnecté : sortie inattendue" % a)
+            out = sv_login(home, acct, report, alias=a, own=own[a])
+            need("compte %s : connecté, coffre déverrouillé" % a in out, "login %s après logout" % a)
+            if HAVE_OPENSSH:
+                r = sv(home, "--nointeraction", "ensure", "--account", a, "--id", ids[a])
+                ok(r, 0, "ensure %s après logout puis login (marqueur retiré)" % a)
+            report.add("logout puis login (compte %s)" % a, note="ok")
 
-        # account set aller-retour : e-mail factice (logout, blocs retirés), puis le vrai, login
-        fake = "sshvault-it-%s@example.invalid" % TAG
-        r = sv(home, "account", "set", ALIAS2, "--email", fake)
-        ok(r, 0, "account set (aller)")
-        assert "déconnecté de l'ancien compte" in r.stdout and "sshvault login --account %s" % ALIAS2 in r.stdout
-        assert json.loads(own2.ok("status").stdout)["status"] == "unauthenticated", "set : bw déconnecté"
-        text = open(cfg).read()
-        assert "--account %s --id" % ALIAS2 not in text and "--account %s --id" % ALIAS in text, "set : blocs retirés"
-        r = sv(home, "account", "set", ALIAS2, "--email", fake.upper())
-        ok(r, 0, "account set sans changement")
-        assert "rien fait" in r.stdout
-        r = sv(home, "account", "set", ALIAS2, "--email", account2.email)
-        ok(r, 0, "account set (retour)")
-        out = sv_login(home, account2, report, alias=ALIAS2, own=own2)
-        assert "compte %s : connecté, coffre déverrouillé" % ALIAS2 in out
-        r = sv(home, "--nointeraction", "status", "--account", ALIAS2)
-        ok(r, 0, "status après account set et login")
-        assert "avertissement" not in r.stderr
-        assert "ensure --account %s --id %s\"" % (ALIAS2, id2) in open(cfg).read(), "login : blocs régénérés"
-        report.add("account set aller-retour (second compte)", note="ok")
+        # account set aller-retour sur chaque compte : e-mail factice (logout, blocs retirés),
+        # puis le vrai, login
+        for a, acct in zip(aliases, accounts):
+            fake = "sshvault-it-%s-%s@example.invalid" % (TAG, a)
+            r = sv(home, "account", "set", a, "--email", fake)
+            ok(r, 0, "account set %s (aller)" % a)
+            need("déconnecté de l'ancien compte" in r.stdout and "sshvault login --account %s" % a in r.stdout,
+                 "account set %s (aller) : sortie inattendue" % a)
+            need(bw_status(a) == "unauthenticated", "account set %s : bw non déconnecté" % a)
+            text = open(cfg).read()
+            need("--account %s --id" % a not in text, "account set %s : blocs non retirés" % a)
+            need(all("--account %s --id" % x in text for x in aliases if x != a),
+                 "account set %s : blocs des autres comptes retirés" % a)
+            r = sv(home, "account", "set", a, "--email", fake.upper())
+            ok(r, 0, "account set %s sans changement" % a)
+            need("rien fait" in r.stdout, "account set %s sans changement : sortie inattendue" % a)
+            r = sv(home, "account", "set", a, "--email", acct.email)
+            ok(r, 0, "account set %s (retour)" % a)
+            out = sv_login(home, acct, report, alias=a, own=own[a])
+            need("compte %s : connecté, coffre déverrouillé" % a in out, "login %s après account set" % a)
+            r = sv(home, "--nointeraction", "status", "--account", a)
+            ok(r, 0, "status %s après account set et login" % a)
+            need("avertissement" not in r.stderr, "status %s après account set : avertissement" % a)
+            need("ensure --account %s --id %s\"" % (a, ids[a]) in open(cfg).read(), "login %s : blocs non régénérés" % a)
+            report.add("account set aller-retour (compte %s)" % a, note="ok")
         r = sv(home, "lock")
-        ok(r, 0, "lock des deux comptes")
-        for alias in (ALIAS, ALIAS2):
-            assert not os.path.exists(os.path.join(home["runtime"], "sshvault", "sessions", alias))
-        assert json.loads(own2.ok("status").stdout)["status"] == "locked"
-        report.add("deux comptes", note="list, account default, ssh-config et ensure sur les deux comptes : ok")
+        ok(r, 0, "lock de tous les comptes")
+        for a in aliases:
+            need(not os.path.exists(os.path.join(home["runtime"], "sshvault", "sessions", a)),
+                 "lock : session de %s gardée" % a)
+            need(bw_status(a) == "locked", "lock : bw de %s non verrouillé" % a)
+        report.add("plusieurs comptes", note="%d comptes (%s) : list, account default, ssh-config, ensure, logout puis "
+                                            "login, account set aller-retour : ok" % (len(aliases), ", ".join(aliases)))
     finally:
         try:
-            if session2:
-                try:
-                    problems = purge_marked(pop2, session2, report, "fin, second compte")
-                except Exception as e:
-                    problems = ["purge interrompue (second compte) : %s: %s" % (type(e).__name__, e)]
+            for a, (pop, appdata, session) in pops.items():
+                if session:
+                    try:
+                        problems += purge_marked(pop, session, report, "fin, compte %s" % a)
+                    except Exception as e:
+                        problems.append("purge interrompue (compte %s) : %s: %s" % (a, type(e).__name__, e))
         finally:
-            try:
-                report.add("logout (second compte, peuplement)", pop2.run("logout"))
-                report.add("logout (second compte, sshvault)", own2.run("logout"))
-            finally:
-                shutil.rmtree(appdata2, ignore_errors=True)
+            for a, (pop, appdata, _) in pops.items():
+                try:
+                    report.add("logout (compte %s, peuplement)" % a, pop.run("logout"))
+                    report.add("logout (compte %s, sshvault)" % a, own[a].run("logout"))
+                finally:
+                    shutil.rmtree(appdata, ignore_errors=True)
     if problems:
-        pytest.fail(scrub("nettoyage incomplet (second compte) : " + " ; ".join(problems)))
+        pytest.fail(scrub("nettoyage incomplet (comptes au-delà du premier) : " + " ; ".join(problems)))
 
 
 def test_adoption_rename_remove_sur_le_vrai_bw(account, bw_exe, home, report):
@@ -1448,3 +1531,63 @@ def test_adoption_rename_remove_sur_le_vrai_bw(account, bw_exe, home, report):
             if os.path.isdir(d):
                 report.add("logout (adoption, %s)" % os.path.basename(os.path.dirname(d)),
                            Bw(bw_exe, d, account, report).run("logout"))
+
+
+@pytest.mark.skipif(not os.environ.get(LOGIN_REPEAT),
+                    reason="mesure du code de `sshvault login` : opt-in, SSHVAULT_IT_LOGIN_REPEAT=N")
+def test_login_repete_sur_le_vrai_bw(account, home, report):
+    """Mesure (pas un correctif) : un `sshvault login` sous pty a rendu 3 une fois sur 4
+    (2026-10-13). N essais (`SSHVAULT_IT_LOGIN_REPEAT=N`) de `sshvault login` puis `sshvault
+    logout`, HOME temporaire, 1er compte du fichier ; au moins 7 s entre la fin d'un essai et le
+    début du suivant. Rapport : rc de chaque essai (durée, invites vues, rc du logout), sortie
+    et fin du terminal de chaque échec (masquées), décompte par code. Échec si un essai rend
+    autre chose que 0 (connexion bloquée comprise). `logout` en échec entre deux essais :
+    anomalie (comptée dans les échecs), `bw logout` à la main (rc dans le rapport) ; s'il
+    échoue aussi, la série s'arrête (l'essai suivant commencerait déjà connecté)."""
+    import collections
+    scrub = report.account.scrub
+    raw = os.environ[LOGIN_REPEAT].strip()
+    n = int(raw) if raw.isdigit() else 0
+    if n < 1:
+        pytest.fail("%s : entier ≥ 1 attendu" % LOGIN_REPEAT, pytrace=False)
+    r = sv(home, "account", "add", ALIAS, "--server", account.server, "--email", account.email)
+    check(account, r, 0, "account add")
+    rcs, fails, last_end, stopped = [], [], None, False
+    for k in range(1, n + 1):
+        if last_end is not None:
+            time.sleep(max(0.0, LOGIN_GAP - (time.monotonic() - last_end)))
+        res = pty_login(home, account)
+        rc = "bloqué" if res["blocked"] else res["rc"]
+        lo = sv(home, "logout")
+        manual = None
+        if res["blocked"] or lo.returncode != 0:
+            # login interrompu, ou logout en échec : bw déconnecté à la main, sinon l'essai
+            # suivant commencerait déjà connecté
+            manual = home["bw"].run("logout")
+        last_end = time.monotonic()
+        rcs.append(rc)
+        note = "essai %d/%d : rc=%s durée=%.1fs invites=%s ; logout rc=%d" % (
+            k, n, rc, res["duration"], res["invites"], lo.returncode)
+        if rc != 0:
+            note += " ; sortie : %r ; terminal après l'invite (masqué) : %r" % (
+                scrub(res["out"].strip()[-300:]), res["tail"])
+        if lo.returncode != 0:
+            note += " ; anomalie : logout en échec (stderr : %r)" % scrub(lo.stderr.strip()[-300:])
+        if manual is not None:
+            note += " ; bw logout à la main rc=%d" % manual.returncode
+            if manual.returncode != 0 and "You are not logged in." not in (manual.stderr or ""):
+                note += " ; anomalie : bw logout à la main en échec (stderr : %r) : série arrêtée" % scrub(
+                    (manual.stderr or "").strip()[-300:])
+                stopped = True
+        if rc != 0 or lo.returncode != 0 or stopped:
+            fails.append(note)
+        report.add("login répété", note=note)
+        if stopped:
+            break
+    counts = collections.Counter(str(rc) for rc in rcs)
+    summary = ", ".join("rc=%s : %d" % (c, counts[c]) for c in sorted(counts))
+    report.add("login répété : décompte", note="%d essais sur %d%s ; %s" % (
+        len(rcs), n, " (série arrêtée)" if stopped else "", summary))
+    if fails:
+        raise AssertionError(scrub("sshvault login répété : %d échec(s) ou anomalie(s) sur %d essais (%s) ; %s"
+                                   % (len(fails), len(rcs), summary, " | ".join(fails))))

@@ -104,11 +104,15 @@ def signals_blocked():
 
 # --- verrou et mémoire d'échec ---------------------------------------------------------------
 
+class LockBusy(AgentError):
+    """`ensure.lock` toujours tenu au bout de l'attente bornée (`user_lock(timeout=…)`)."""
+
+
 @contextlib.contextmanager
-def user_lock(directory: str, on_wait=None):
+def user_lock(directory: str, on_wait=None, timeout: Optional[float] = None):
     """`flock` exclusif sur `<dossier de l'agent>/ensure.lock` (fichier vide, 0600). L'attente
     est bornée par le délai global (SIGALRM interrompt flock). `on_wait` : appelé une fois si le
-    verrou est déjà tenu, avant d'attendre."""
+    verrou est déjà tenu, avant d'attendre. `timeout` (s) : attente bornée, LockBusy au-delà."""
     try:
         ensure_dir(directory)
         fd = os.open(os.path.join(directory, LOCK_NAME),
@@ -119,12 +123,25 @@ def user_lock(directory: str, on_wait=None):
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
             raise AgentError("verrou %s : pas un fichier ordinaire à l'utilisateur" % os.path.join(directory, LOCK_NAME))
-        if on_wait is not None:
+        if on_wait is not None or timeout is not None:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                on_wait()
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                if on_wait is not None:
+                    on_wait()
+                if timeout is None:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                else:
+                    end = time.monotonic() + timeout
+                    while True:
+                        time.sleep(0.05)
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if time.monotonic() >= end:
+                                raise LockBusy("verrou %s tenu après %gs" % (os.path.join(directory, LOCK_NAME),
+                                                                            timeout)) from None
         else:
             fcntl.flock(fd, fcntl.LOCK_EX)
         yield

@@ -268,13 +268,14 @@ wheels = [
 
 [[package]]
 name = "sshvault"
-version = "0.11.0"
+version = "0.12.0"
 source = { editable = "." }
 
 [package.dev-dependencies]
 dev = [
     { name = "cryptography" },
     { name = "pytest" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
 
 [package.metadata]
@@ -283,6 +284,7 @@ dev = [
 dev = [
     { name = "cryptography", specifier = ">=42" },
     { name = "pytest", specifier = ">=8" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2" },
 ]
 
 [[package]]

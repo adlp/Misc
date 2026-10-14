@@ -194,6 +194,9 @@ class BwBackend(VaultBackend):
         ne lit pas la configuration. `warn` : affiche aussitôt un avertissement d'une ligne
         (bw-path exposé à d'autres, avant le premier lancement de bw) ; défaut : stderr."""
         self.store = store or SessionStore()
+        # session que le magasin a refusée (« session non rangée ») : gardée en mémoire pour la
+        # suite de cette commande seulement, jamais écrite
+        self._mem_session: Optional[str] = None
         self._exe = (exe, "argument") if exe else None
         self._bw_path = bw_path
         self.label, self.email, self.server, self.hint = label, email, server, hint
@@ -374,8 +377,27 @@ class BwBackend(VaultBackend):
 
     # --- session ---------------------------------------------------------------
 
+    def _stored_session(self) -> Optional[str]:
+        """Session rangée, sinon celle gardée en mémoire par cette commande (magasin en panne)."""
+        try:
+            session = self.store.get()
+        except SessionStoreError:
+            if self._mem_session:
+                return self._mem_session
+            raise
+        return session or self._mem_session
+
+    def _put_session(self, token: str, ttl: int) -> None:
+        """Range la session ; magasin en panne : gardée en mémoire (cette commande), puis l'erreur."""
+        try:
+            self.store.put(token, ttl)
+        except SessionStoreError:
+            self._mem_session = token
+            raise
+
     def _forget(self) -> None:
         """La session rangée a été refusée par bw (expirée, invalidée) : on la purge."""
+        self._mem_session = None
         try:
             self.store.clear()
         except SessionStoreError:
@@ -426,7 +448,7 @@ class BwBackend(VaultBackend):
         session rangée (« unlocked » n'est alors jamais rendu : « locked » pour un compte connecté)."""
         if not forget:
             return self._bw_status(None)
-        session = self.store.get()
+        session = self._stored_session()
         st = self._bw_status(session)
         if session and st.state != "unlocked":
             self._forget()
@@ -463,11 +485,11 @@ class BwBackend(VaultBackend):
             raise BackendError("erreur bw : « unlock » n'a pas renvoyé de session")
         self._seen_connected()  # tout déverrouillage réussi (unlock, invite de load, list, ensure…)
         try:
-            self.store.put(token, ttl)
+            self._put_session(token, ttl)
         except SessionStoreError as e:
             if must_store:
                 raise
-            # La session sert à l'opération en cours, sans être gardée pour la suivante.
+            # La session sert à la suite de cette commande (en mémoire), jamais à la suivante.
             self.warnings.append("session non rangée : %s" % e)
         return token
 
@@ -490,7 +512,7 @@ class BwBackend(VaultBackend):
         """Lance `bw args` avec la session rangée ; un seul appel si elle est valide.
         Session refusée : purge, puis traité comme verrouillé (invite, unlock, nouvel essai :
         « Vault is locked. » dit que bw n'a rien fait)."""
-        session = self.store.get()
+        session = self._stored_session()
         known_logged_in = False
         if session:
             r = self._run_retry(args, attempts, session=session, input=input)
@@ -515,6 +537,7 @@ class BwBackend(VaultBackend):
         raise self._fail(r, what)
 
     def lock(self) -> None:
+        self._mem_session = None
         first, r = None, None
         try:
             r = self._run(["lock"])
@@ -630,14 +653,17 @@ class BwBackend(VaultBackend):
         if r.rc != 0:
             st = self._bw_status(None)
             if st.state == "unauthenticated":
-                raise NotLoggedIn("login refusé par bw (code %d, message ci-dessus)" % r.rc)
+                # causes mesurées : mot de passe, limite de débit des connexions de Vaultwarden
+                # (« Rate limit exceeded. Try again later. », 2026-10-14), réseau
+                raise NotLoggedIn("login refusé par bw (code %d, message ci-dessus : mot de passe refusé, limite de "
+                                  "débit du serveur — réessayer dans une minute — ou réseau)" % r.rc)
             raise BackendError("erreur bw : login refusé (code %d) ; déjà connecté comme %s"
                                % (r.rc, _clean(st.user or "?")))
         token = r.out.strip()
         if valid_token(token) and not apikey:
             self._seen_connected()
             try:
-                self.store.put(token, ttl)
+                self._put_session(token, ttl)
             except SessionStoreError as e:
                 # bw est connecté : on le dit, sans échouer (même règle que le déverrouillage)
                 self.warnings.append("session non rangée : %s" % e)
@@ -662,7 +688,7 @@ class BwBackend(VaultBackend):
                                % (_clean(st.user or "?"), _clean(email), _clean(self.label or "?"), outcome))
         if valid_token(token):
             try:
-                self.store.put(token, ttl)
+                self._put_session(token, ttl)
             except SessionStoreError as e:
                 self.warnings.append("session non rangée : %s" % e)
             return "unlocked"

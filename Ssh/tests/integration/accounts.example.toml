@@ -1,0 +1,38 @@
+# Comptes de test d'intégration de sshvault (valeurs factices : à remplacer).
+#
+# Copier vers ~/.config/sshvault-test/accounts.toml (ou le chemin de SSHVAULT_IT_ACCOUNTS),
+# puis : chmod 600 ~/.config/sshvault-test/accounts.toml. Jamais dans git.
+#
+# - Un bloc [[account]] par compte Vaultwarden **dédié aux tests** (les tests y créent et
+#   suppriment des éléments marqués « sshvault-test-run ») : server, email, password,
+#   tous obligatoires, non vides.
+# - Le 1er compte devient l'alias « it » (coffre peuplé par les tests), les suivants « it2 »,
+#   « it3 »… dans l'ordre du fichier. Volet plusieurs comptes : au moins 2 comptes (un seul :
+#   volet sauté). Plusieurs comptes peuvent partager un serveur (e-mails différents).
+# - La session d'intégration échoue (message sans aucune valeur du fichier) sur : clé
+#   inconnue ; champ manquant, vide ou d'un autre type ; serveur ou e-mail que sshvault
+#   refuserait (« account add ») ; doublon, serveur et e-mail comparés comme le registre de
+#   sshvault (casse, « / » final, port par défaut 443/80 ignorés).
+# - node_extra_ca_certs (optionnel, commun à tous les comptes) : certificat d'une autorité
+#   auto-signée, passé à bw par NODE_EXTRA_CA_CERTS ; « ~ » développé, chemin rendu absolu ;
+#   doit être un fichier ordinaire lisible, sinon échec.
+# - Fichier ouvert au groupe ou aux autres, ou d'un autre propriétaire : avertissement seul.
+#
+# L'ancien fichier account.env (SSHVAULT_IT_*, SSHVAULT_IT2_*) n'est plus lu.
+
+# node_extra_ca_certs = "/home/alice/.config/sshvault-test/ca.pem"
+
+[[account]]
+server = "https://vault.example.invalid"
+email = "sshvault-test-1@example.invalid"
+password = "mot de passe maître du compte 1"
+
+[[account]]
+server = "https://vault.example.invalid"
+email = "sshvault-test-2@example.invalid"
+password = "mot de passe maître du compte 2"
+
+[[account]]
+server = "https://autre-vault.example.invalid"
+email = "sshvault-test-3@example.invalid"
+password = "mot de passe maître du compte 3"

@@ -1,16 +1,18 @@
-"""Cible des tests d'intégration : compte de test dédié (défaut) ou conteneur local.
+"""Cible des tests d'intégration : comptes de test dédiés (défaut) ou conteneur local.
 
 Deux modes :
-- **compte de test** (défaut) : identifiants dans `~/.config/sshvault-test/account.env`
-  (chemin remplaçable par SSHVAULT_IT_ENV) : SSHVAULT_IT_SERVER, SSHVAULT_IT_EMAIL,
-  SSHVAULT_IT_PASSWORD, NODE_EXTRA_CA_CERTS en option ; second compte (volet deux comptes,
-  CAP-10, créé par l'utilisateur) : SSHVAULT_IT2_SERVER, SSHVAULT_IT2_EMAIL,
-  SSHVAULT_IT2_PASSWORD, sans eux ce volet est sauté (dit dans le rapport). Ces valeurs ne sont jamais
-  affichées, journalisées ni comparées dans une assertion : `Account` masque son repr
-  et `scrub()` les retire de tout message d'échec ;
+- **comptes de test** (défaut) : fichier TOML `~/.config/sshvault-test/accounts.toml` (0600 ;
+  chemin remplaçable par SSHVAULT_IT_ACCOUNTS ; format et contrôles : `accounts.py`, exemple :
+  `accounts.example.toml`) : un `[[account]]` par compte (`server`, `email`, `password`),
+  `node_extra_ca_certs` commun en option. Le 1er compte est `it` (coffre peuplé), les suivants
+  `it2`, `it3`… (volet plusieurs comptes, CAP-10 ; un seul compte : volet sauté, dit dans le
+  rapport). Fichier absent : intégration sautée ; fichier invalide (clé inconnue, champ
+  manquant ou vide, type faux, doublon, TOML illisible) ou SSHVAULT_IT_ENV défini (ancien
+  format `account.env`, jamais lu) : échec. Ces valeurs ne sont jamais affichées,
+  journalisées ni comparées dans une assertion : `Account` masque son repr et `scrub()` les
+  retire de tout message d'échec ;
 - **conteneur** (SSHVAULT_IT_MODE=container) : `vaultwarden/server:1.37.4` sous docker,
-  port libre de 127.0.0.1, données temporaires, comptes créés par `register.py` (le second à
-  la demande),
+  port libre de 127.0.0.1, données temporaires, 3 comptes inscrits par `register.py`,
   conteneur supprimé à la fin.
 Ignoré si `bw` manque, ou si ni le fichier ni (en mode conteneur) docker ne sont disponibles.
 """
@@ -21,15 +23,17 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+import sys
 import uuid
 
 import pytest
 
+from accounts import Account, AccountsError, alias, load as load_accounts, locate
+
 IMAGE = "vaultwarden/server:1.37.4"
 NAME_PREFIX = "sshvault-it-"
-DEFAULT_ENV_FILE = os.path.join(os.path.expanduser("~"), ".config", "sshvault-test", "account.env")
-KEYS = ("SSHVAULT_IT_SERVER", "SSHVAULT_IT_EMAIL", "SSHVAULT_IT_PASSWORD", "NODE_EXTRA_CA_CERTS")
-KEYS2 = ("SSHVAULT_IT2_SERVER", "SSHVAULT_IT2_EMAIL", "SSHVAULT_IT2_PASSWORD")
+#: comptes inscrits dans le conteneur (volet plusieurs comptes : it, it2, it3)
+CONTAINER_ACCOUNTS = 3
 
 
 def pytest_configure(config):
@@ -39,50 +43,10 @@ def pytest_configure(config):
         config.option.tbstyle = "short"
 
 
-class Account:
-    """Identifiants du compte de test ; jamais affichés."""
-
-    def __init__(self, server, email, password, extra_env=None):
-        self._v = {"server": server, "email": email, "password": password}
-        self.extra_env = dict(extra_env or {})
-
-    server = property(lambda self: self._v["server"])
-    email = property(lambda self: self._v["email"])
-    password = property(lambda self: self._v["password"])
-
-    def __repr__(self):
-        return "<Account masqué>"
-
-    __str__ = __repr__
-
-    def scrub(self, text):
-        text = str(text)
-        for k, v in self._v.items():
-            if v:
-                text = text.replace(v, "<%s>" % k)
-                if k == "email":
-                    text = text.replace(v.lower(), "<%s>" % k)
-        return text
-
-
-def load_account_env(path):
-    """KEY=VALUE par ligne, commentaires (#) et lignes vides ignorés, guillemets retirés."""
-    vals = {}
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            k = k.strip()
-            if k.startswith("export "):
-                k = k[len("export "):].strip()
-            v = v.strip()
-            if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
-                v = v[1:-1]
-            if k in KEYS or k in KEYS2:
-                vals[k] = v
-    return vals
+class AccountList(list):
+    """Comptes de test, dans l'ordre du fichier ; `warnings` : avertissements sur le fichier
+    (droits, propriétaire), repris dans le rapport."""
+    warnings = ()
 
 
 def bw_path():
@@ -138,12 +102,13 @@ def _container(tmp_path_factory):
                 pytest.fail("Vaultwarden ne répond pas sur %s : %s" % (url, logs.stderr[-2000:]))
             time.sleep(0.5)
         from register import register  # dépendance de test `cryptography`
-        email = "it-%s@example.test" % uuid.uuid4().hex[:8]
-        password = "integration pass phrase " + uuid.uuid4().hex[:8]
-        register(url, email, password)
-        acct = Account(url, email, password)
-        acct.container_url = url  # second compte inscrit à la demande (fixture account2)
-        yield acct
+        accts = []
+        for n in range(CONTAINER_ACCOUNTS):
+            email = "%s-%s@example.test" % (alias(n), uuid.uuid4().hex[:8])
+            password = "integration pass phrase %d %s" % (n + 1, uuid.uuid4().hex[:8])
+            register(url, email, password)
+            accts.append(Account(url, email, password))
+        yield AccountList(accts)
     finally:
         subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True, timeout=120)
         left = subprocess.run(["docker", "ps", "-a", "-q", "--filter", "name=" + name],
@@ -152,40 +117,36 @@ def _container(tmp_path_factory):
 
 
 @pytest.fixture(scope="session")
-def account(tmp_path_factory, bw_exe):
-    """Compte cible : fichier du compte de test (défaut) ou conteneur (SSHVAULT_IT_MODE=container)."""
+def accounts(tmp_path_factory, bw_exe, pytestconfig):
+    """Comptes cibles, dans l'ordre du fichier (le 1er est `it`) : fichier des comptes de test
+    (défaut) ou conteneur (SSHVAULT_IT_MODE=container, 3 comptes)."""
     mode = os.environ.get("SSHVAULT_IT_MODE", "account")
     if mode == "container":
         yield from _container(tmp_path_factory)
         return
     if mode != "account":
         pytest.fail("SSHVAULT_IT_MODE inconnu (account ou container)")
-    path = os.environ.get("SSHVAULT_IT_ENV") or DEFAULT_ENV_FILE
-    if not os.path.isfile(path):
-        pytest.skip("compte de test absent (SSHVAULT_IT_ENV ou ~/.config/sshvault-test/account.env) ; "
-                    "mode conteneur : SSHVAULT_IT_MODE=container")
-    vals = load_account_env(path)
-    missing = [k for k in KEYS[:3] if not vals.get(k)]
-    if missing:
-        pytest.skip("compte de test incomplet : %s manquant(s)" % ", ".join(missing))
-    extra = {"NODE_EXTRA_CA_CERTS": vals["NODE_EXTRA_CA_CERTS"]} if vals.get("NODE_EXTRA_CA_CERTS") else {}
-    yield Account(vals["SSHVAULT_IT_SERVER"], vals["SSHVAULT_IT_EMAIL"], vals["SSHVAULT_IT_PASSWORD"], extra)
+    try:
+        path, why = locate()
+        if path is None:
+            pytest.skip(why + " ; mode conteneur : SSHVAULT_IT_MODE=container")
+        found, extra, notes = load_accounts(path)
+    except AccountsError as e:
+        pytest.fail(str(e), pytrace=False)
+    # droits ou propriétaire : avertissement seul, écrit dans la sortie de pytest (jamais par
+    # `warnings` : `-W error` en ferait une erreur) et dans le rapport
+    tr = pytestconfig.pluginmanager.get_plugin("terminalreporter")
+    for w in notes:
+        if tr is not None:
+            tr.write_line("avertissement : " + w, yellow=True)
+        else:
+            print("avertissement : " + w, file=sys.__stderr__, flush=True)
+    out = AccountList(Account(a["server"], a["email"], a["password"], extra) for a in found)
+    out.warnings = list(notes)
+    yield out
 
 
 @pytest.fixture(scope="session")
-def account2(account):
-    """Second compte (CAP-10) : SSHVAULT_IT2_* du fichier du compte de test (créé par
-    l'utilisateur), ou inscrit dans le conteneur ; None s'il manque (volet deux comptes sauté)."""
-    url = getattr(account, "container_url", None)
-    if url:
-        from register import register
-        email = "it2-%s@example.test" % uuid.uuid4().hex[:8]
-        password = "integration pass phrase 2 " + uuid.uuid4().hex[:8]
-        register(url, email, password)
-        return Account(url, email, password)
-    path = os.environ.get("SSHVAULT_IT_ENV") or DEFAULT_ENV_FILE
-    vals = load_account_env(path) if os.path.isfile(path) else {}
-    if not all(vals.get(k) for k in KEYS2):
-        return None
-    return Account(vals["SSHVAULT_IT2_SERVER"], vals["SSHVAULT_IT2_EMAIL"], vals["SSHVAULT_IT2_PASSWORD"],
-                   account.extra_env)
+def account(accounts):
+    """1er compte du fichier (`it`) : celui du coffre peuplé."""
+    return accounts[0]

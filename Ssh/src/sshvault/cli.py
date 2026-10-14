@@ -1420,8 +1420,14 @@ def run_load(args, accts: Accounts, prompt) -> int:
         current = agent.keys()
         _sync_lock_flag(agent, data, current)
         if data["locked"]:
-            raise AgentLocked("agent verrouillé : lancer « sshvault agent unlock »")
+            raise AgentLocked(ensure_mod.AGENT_LOCKED)
         present = {k.blob for k in current}
+    lock_wait = None
+    if args.nointeraction:  # attente d'ensure.lock bornée (interactif : sans limite, Ctrl-C)
+        try:
+            lock_wait = fastpath.ensure_timeout(os.environ)
+        except ValueError as e:
+            raise ConfigError(str(e)) from None
 
     items, rc_read = collect(accts, accts.read_set(args.account), prompt)
     found = [i for i in items if args.all or match(i, args.pattern, args.by)]
@@ -1457,56 +1463,110 @@ def run_load(args, accts: Accounts, prompt) -> int:
                 raise AgentError("--restrict : hôte « %s » de « %s » non littéral (motif, user@, >, :port) : "
                                  "rien chargé" % (clean(bad[0]), clean(i.name)))
 
-    adata, _ = agent.ensure_running()
-    if args.confirm and (adata.get("agent") or {}).get("askpass") is False:
-        err("avertissement : l'agent a été lancé sans askpass utilisable (DISPLAY, SSH_ASKPASS) : "
-            "chaque usage d'une clé --confirm sera refusé ; « sshvault agent stop » puis load depuis "
-            "une session graphique")
+    agent.ensure_running()  # dossier de l'agent (et d'ensure.lock) créé ; relu sous le verrou
     if args.restrict:
         agent.check_hosts(sorted({h.lower() for i, _ in todo for h in i.hosts}))
     interactive = not args.nointeraction
     keys, added, done = {}, {}, []
     try:
-        # Toutes les clés lues avant le premier chargement.
+        # Toutes les clés lues avant le premier chargement, hors du verrou (invites du coffre).
         for i, _ in todo:
             keys[i.account, i.id] = accts.backend(i.account).get_private_key(i.id, prompt)
             if not interactive and is_encrypted(keys[i.account, i.id]):
                 raise PassphraseRefused("« %s » : clé chiffrée par passphrase, saisie impossible "
                                         "(--nointeraction) : rien chargé" % clean(i.name))
-        timeout = prompt_timeout(os.environ) + 10
-        for i, blob in todo:
-            key = keys.pop((i.account, i.id))
-            enc = is_encrypted(key)
-            before = {k.blob for k in agent.keys()}
-            t = time.time()
+        # Ajouts, retour arrière et état sous ensure.lock (puis le verrou d'état de l'agent, pris
+        # par chaque lecture-écriture, comme ensure et logout) : une sonde `ssh-add -D` (logout,
+        # lock --unload, ensure, agent unlock) ne retire jamais une clé en cours de chargement.
+        # La passphrase d'une clé chiffrée se tape sous ce verrou, comme pour ensure.
+        with _ensure_lock(agent.dir, lock_wait):
+            # relu sous le verrou : agent verrouillé (agent lock), arrêté puis relancé, ou clé
+            # chargée (ensure) pendant l'attente
+            adata, _ = agent.ensure_running()
+            current = agent.keys()
+            _sync_lock_flag(agent, adata, current)
+            if adata["locked"]:
+                raise AgentLocked(ensure_mod.AGENT_LOCKED)
+            if args.confirm and (adata.get("agent") or {}).get("askpass") is False:
+                err("avertissement : l'agent a été lancé sans askpass utilisable (DISPLAY, SSH_ASKPASS) : "
+                    "chaque usage d'une clé --confirm sera refusé ; « sshvault agent stop » puis load depuis "
+                    "une session graphique")
+            present = {k.blob for k in current}
+            if not args.force:
+                for i, blob in [t for t in todo if t[1] in present]:
+                    print("déjà chargée : %s %s (--force pour recharger)" % (clean(i.name), fingerprint(blob)))
+                    keys.pop((i.account, i.id), None)
+                todo = [t for t in todo if t[1] not in present]
+            # comptes revus : logout, lock, account remove, rename ou set pendant l'attente : rien chargé
+            _accounts_still_open(accts, sorted({i.account for i, _ in todo}))
+            timeout = prompt_timeout(os.environ) + 10
             try:
-                agent.add(key, lifetime, args.confirm, i.hosts if args.restrict else (), interactive, enc,
-                          timeout if enc else AGENT_TIMEOUT)
-            finally:
-                del key
-                after = {k.blob: k for k in agent.keys()}
-                added.update({b: k for b, k in after.items() if b not in before})
-            if blob not in after and not (lifetime and time.time() - t >= lifetime):
-                raise AgentError("« %s » : clé privée différente de la clé publique de l'élément : "
-                                 "rien chargé" % clean(i.name))
-            done.append((i, blob, t))
-    except BaseException:
-        keys.clear()
-        _rollback(agent, added)
-        raise
-    now = time.time()
+                for i, blob in todo:
+                    key = keys.pop((i.account, i.id))
+                    enc = is_encrypted(key)
+                    before = {k.blob for k in agent.keys()}
+                    t = time.time()
+                    try:
+                        agent.add(key, lifetime, args.confirm, i.hosts if args.restrict else (), interactive, enc,
+                                  timeout if enc else AGENT_TIMEOUT)
+                    finally:
+                        del key
+                        after = {k.blob: k for k in agent.keys()}
+                        added.update({b: k for b, k in after.items() if b not in before})
+                    if blob not in after and not (lifetime and time.time() - t >= lifetime):
+                        raise AgentError("« %s » : clé privée différente de la clé publique de l'élément : "
+                                         "rien chargé" % clean(i.name))
+                    done.append((i, blob, t))
+            except BaseException:
+                keys.clear()
+                _rollback(agent, added)
+                raise
+            if done:
+                now = time.time()
 
-    def record(d):
-        reconcile(d, {k.fingerprint for k in agent.keys()}, now)
-        for i, blob, t in done:
-            d["keys"][fingerprint(blob)] = state_entry(i.id, i.name, i.hosts, t, lifetime, args.confirm,
-                                                       args.restrict, i.account)
-    agent.update(record)
+                def record(d):
+                    reconcile(d, {k.fingerprint for k in agent.keys()}, now)
+                    for i, blob, t in done:
+                        d["keys"][fingerprint(blob)] = state_entry(i.id, i.name, i.hosts, t, lifetime, args.confirm,
+                                                                   args.restrict, i.account)
+                agent.update(record)
+    except ensure_mod.LockBusy:
+        raise AgentError("verrou d'ensure tenu : rien chargé (attente bornée par SSHVAULT_ENSURE_TIMEOUT, "
+                         "--nointeraction)") from None
+    finally:
+        keys.clear()
     for i, blob, _ in done:
         opts = ", ".join(["durée " + describe_duration(lifetime)] + _options(args.confirm, False)
                          + (["restreinte à " + _hosts(i.hosts)] if args.restrict else []))
         print("chargée : %s%s %s (%s)" % (accts.prefix(i.account), clean(i.name), fingerprint(blob), opts))
     return rc_read
+
+
+def _accounts_still_open(accts: Accounts, aliases: list) -> None:
+    """Sous ensure.lock, avant tout ajout de `load` : chaque compte toujours enregistré (même
+    serveur, même e-mail), bw connecté et coffre déverrouillé, lu comme `status` (session rangée,
+    sans invite). Sinon (logout, lock, account remove, rename ou set pendant l'attente) : VaultLocked
+    (code 3), une ligne qui nomme le compte ; bw en erreur : son code."""
+    now = accts.cfg.accounts()
+    for a in aliases:
+        why = None
+        if a not in now:
+            why = "retiré ou renommé (account remove ou rename)"
+        elif now[a] != accts.registry.get(a):
+            why = "modifié (account set)"
+        else:
+            try:
+                st = accts.backend(a).status()
+            except (VaultError, SessionStoreError) as e:
+                code, msg = classify(e)
+                raise (BackendError if code == RC_BACKEND else VaultLocked)(
+                    "compte « %s » : état relu sous le verrou d'ensure : %s : rien chargé" % (a, msg)) from None
+            if st.state == "unauthenticated":
+                why = "déconnecté"
+            elif st.state != "unlocked":
+                why = "verrouillé"
+        if why:
+            raise VaultLocked("compte « %s » %s pendant l'attente du verrou d'ensure : rien chargé" % (a, why))
 
 
 def _need_prompt(args, agent: Agent, what: str) -> None:
@@ -1598,14 +1658,15 @@ def _forward_stop(sub: Agent, label: str, purge: bool = False) -> None:
     print("transfert %s : %s" % (label, sub.stop()))
 
 
-def _ensure_lock(base: str):
+def _ensure_lock(base: str, timeout: Optional[float] = None):
     """`ensure.lock` (celui d'`ensure --id`/`--forward`) si le dossier existe : un `ensure
     --forward` en cours finit avant l'arrêt des sous-agents, aucun ne les relance pendant. S'il
-    est tenu, une ligne le dit avant d'attendre."""
+    est tenu, une ligne le dit avant d'attendre. `timeout` : attente bornée (LockBusy)."""
     import contextlib
     if not os.path.isdir(base):
         return contextlib.nullcontext()
-    return ensure_mod.user_lock(base, on_wait=lambda: err("attente d'un chargement en cours (ensure)…"))
+    return ensure_mod.user_lock(base, on_wait=lambda: err("attente d'un chargement en cours (ensure)…"),
+                                timeout=timeout)
 
 
 def stop_all_forward(base: str) -> int:
@@ -1989,7 +2050,10 @@ def run_ssh_config(args, accts: Accounts, prompt) -> int:
         raise UsageError("%s exclut --print et --check" % args.action)
     paths = sshconfig.default_paths()
     if args.action == "install":
-        print(sshconfig.install(paths))
+        res = sshconfig.install(paths)
+        print(res.message)
+        for w in res.warnings:
+            err("avertissement : %s" % w)
         if not os.path.exists(paths.config):
             err("avertissement : %s n'existe pas encore : lancer « sshvault ssh-config »" % paths.config)
         return RC_OK

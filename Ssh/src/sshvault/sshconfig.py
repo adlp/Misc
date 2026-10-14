@@ -851,8 +851,13 @@ def include_warning(paths: Paths) -> Optional[str]:
         return ("la ligne Include de sshvault n'est pas en tête de %s : les lignes qui la précèdent l'emportent ; "
                 "lancer « sshvault ssh-config install »" % p)
     if st == "conditional":
+        exact = set(_own_includes(sc.lines, paths)[0])
+        blocked = [i for i in sc.conditional if i in exact]
+        if not blocked:  # joker ou ligne mixte : install ajoute l'Include exact en tête sans la toucher
+            return ("%s ligne %d : Include conditionnel (dans un bloc Host/Match) : sshvault ne s'applique que dans ce "
+                    "bloc ; lancer « sshvault ssh-config install »" % (p, sc.conditional[0] + 1))
         return ("%s ligne %d : Include conditionnel (dans un bloc Host/Match) : sshvault ne s'applique que dans ce "
-                "bloc ; le sortir du bloc, puis « sshvault ssh-config install »" % (p, sc.conditional[0] + 1))
+                "bloc ; le sortir du bloc, puis « sshvault ssh-config install »" % (p, blocked[0] + 1))
     if st == "unreadable":
         return "%s illisible : ligne Include de sshvault non vérifiée" % p
     if st == "notregular":
@@ -923,8 +928,23 @@ def _backup(paths: Paths, data: bytes) -> str:
     raise SshConfigError("trop de sauvegardes %s.N : en supprimer avant de relancer" % paths.backup)
 
 
-def install(paths: Paths) -> str:
-    """Met `Include "<config>"` en première ligne de ~/.ssh/config ; renvoie un message."""
+@dataclass
+class Installed:
+    message: str
+    warnings: list = field(default_factory=list)  # une ligne chacun (stderr, code 0)
+
+
+def install(paths: Paths) -> Installed:
+    """Met `Include "<config>"` en première ligne de ~/.ssh/config ; renvoie le message et les
+    avertissements. Seules les lignes `Include` dont tous les arguments désignent exactement le
+    fichier généré (« exact ») sont les siennes : déplacées en tête, ou refus (code 4, rien
+    modifié) si l'une est dans un bloc Host/Match. Une ligne à joker ou mixte (qui couvre aussi
+    d'autres fichiers) n'est jamais supprimée ni déplacée, même dans un bloc : l'`Include` exact
+    est ajouté en tête et elle reste, avec un avertissement (fichier généré inclus deux fois,
+    sans effet néfaste : la première valeur rencontrée gagne ; ses `Match exec` sont évalués deux
+    fois à chaque lecture de la config : `ensure` lancé deux fois, le second trouve la clé déjà
+    chargée quand le premier l'a chargée). Ligne de sshvault déjà en tête
+    (même à joker) : rien changé."""
     p = paths.user_config
     line = include_line(paths)
     try:
@@ -939,7 +959,7 @@ def install(paths: Paths) -> str:
                     _create(p, (line + "\n").encode(), 0o600)
                 except FileExistsError:
                     continue  # créé entre-temps par un autre : chemin normal
-                return "%s créé : %s" % (p, line)
+                return Installed("%s créé : %s" % (p, line))
             if k != "file":
                 raise SshConfigError("%s n'est pas un fichier ordinaire : refusé, rien modifié" % p)
             try:
@@ -948,17 +968,28 @@ def install(paths: Paths) -> str:
                 continue
             sc = scan(data.decode(errors="surrogateescape"), paths)
             if sc.head:
-                return "%s : ligne Include déjà en tête, rien changé" % p
-            if sc.conditional:
+                return Installed("%s : ligne Include déjà en tête, rien changé" % p)
+            exact, kept = _own_includes(sc.lines, paths)
+            blocked = [i for i in exact if i in set(sc.conditional)]
+            if blocked:
                 raise SshConfigError("%s ligne %d : la ligne Include de sshvault est dans un bloc Host/Match (Include "
                                      "conditionnel) : non déplacée, rien modifié ; la sortir de ce bloc ou la "
-                                     "supprimer, puis relancer" % (p, sc.conditional[0] + 1))
-            drop = {i for i, _, sole in sc.ours if sole}
+                                     "supprimer, puis relancer" % (p, blocked[0] + 1))
+            drop = set(exact)
             new = "\n".join([line] + [l for i, l in enumerate(sc.lines) if i not in drop])
+            warnings = []
+            for i in kept:  # numéro de ligne du fichier réécrit (Include ajouté en tête)
+                n = i + 2 - len([j for j in drop if j < i])
+                warnings.append("%s ligne %d : Include de sshvault avec d'autres fichiers (ou joker) : ligne gardée ; "
+                                "« %s » désormais inclus deux fois (en tête et ici), sans effet néfaste : la "
+                                "première valeur rencontrée gagne ; ses lignes Match exec sont évaluées deux fois "
+                                "à chaque lecture de la config (« sshvault ensure » lancé deux fois : le second "
+                                "trouve la clé déjà chargée quand le premier l'a chargée)" % (p, n, paths.config))
             bak = _backup(paths, data)
             _replace(p, new.encode(errors="surrogateescape"), stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid,
                      expect=(st.st_ino, st.st_size, st.st_mtime_ns))
-            return "%s : ligne Include %s en tête (sauvegarde : %s)" % (p, "déplacée" if drop else "ajoutée", bak)
+            return Installed("%s : ligne Include %s en tête (sauvegarde : %s)"
+                             % (p, "déplacée" if drop else "ajoutée", bak), warnings)
     except OSError as e:
         raise SshConfigError("%s : %s" % (p, e.strerror or e)) from None
     raise SshConfigError("%s : créé ou supprimé pendant l'installation : rien changé, relancer" % p)

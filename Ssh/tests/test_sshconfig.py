@@ -728,11 +728,36 @@ def test_include_conditionnel_non_deplace(bench, block):
     cfg.write_text(orig)
     r = bench.run("ssh-config")
     assert r.returncode == 0 and "ligne 3 : Include conditionnel" in r.stderr
+    assert "le sortir du bloc" in r.stderr, r.stderr
     r = bench.run("ssh-config", "install")
     assert r.returncode == 4 and "Include conditionnel" in one_line_error(r) and "non déplacée" in r.stderr
     assert cfg.read_text() == orig and not (cfg.parent / "config.sshvault.bak").exists()
     r = bench.run("ssh-config", "--check")
-    assert r.returncode == 1 and "conditionnel" in r.stdout
+    assert r.returncode == 1 and "conditionnel" in r.stdout and "le sortir du bloc" in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize("orig,n,remedy", [
+    # joker dans un bloc, puis ligne exacte dans un autre : numéro et remède de la ligne exacte
+    ("Host a\n    Include ~/.ssh/*/config\nHost b\n    Include ~/.ssh/sshvault/config\n", 4, "le sortir du bloc"),
+    # joker seul dans un bloc : install le garde, il suffit de le lancer
+    ("User x\nHost a\n    Include ~/.ssh/*/config\n", 3, "lancer « sshvault ssh-config install »"),
+])
+def test_include_conditionnel_ssh_config_et_check(bench, orig, n, remedy):
+    """`ssh-config` (stderr) et `--check` (stdout, code 1) : ligne exacte dans un bloc →
+    « le sortir du bloc » avec son numéro ; joker seul dans un bloc → « lancer install »."""
+    unlocked(bench)
+    cfg = _ssh_dir(bench) / "config"
+    cfg.write_text(orig)
+    r = bench.run("ssh-config")
+    assert r.returncode == 0, r.stderr
+    line = one_line_error(r)
+    assert "ligne %d : Include conditionnel" % n in line and remedy in line, line
+    assert ("le sortir" in line) == (remedy == "le sortir du bloc"), line
+    r = bench.run("ssh-config", "--check")
+    assert r.returncode == 1, r.stdout
+    assert "ligne %d : Include conditionnel" % n in r.stdout and remedy in r.stdout, r.stdout
+    assert ("le sortir" in r.stdout) == (remedy == "le sortir du bloc"), r.stdout
+    assert cfg.read_text() == orig
 
 
 def test_include_parmi_plusieurs_fichiers(bench):
@@ -747,6 +772,100 @@ def test_include_parmi_plusieurs_fichiers(bench):
     r = bench.run("ssh-config", "install")
     assert r.returncode == 0 and "ajoutée" in r.stdout
     assert cfg.read_text() == include(bench) + "\nUser x\nInclude a.conf ~/.ssh/sshvault/config\n"
+    assert kept_warnings(r) == [3], r.stderr
+
+
+def kept_warnings(r):
+    """Numéros de ligne des avertissements « ligne gardée » d'install (stderr)."""
+    out = []
+    for l in r.stderr.splitlines():
+        if "Include de sshvault avec d'autres fichiers" in l:
+            assert l.startswith("sshvault: avertissement : ") and "ligne gardée" in l and "deux fois" in l, l
+            out.append(int(l.split(" ligne ", 1)[1].split(" ", 1)[0]))
+    return out
+
+
+@pytest.mark.parametrize("orig,want,n", [
+    # matrice : joker plus bas
+    ("# en-tête\nServerAliveInterval 30\nInclude ~/.ssh/*/config\nHost b\n", None, 4),
+    # joker dans un bloc Host
+    ("User x\nHost b\n    Include ~/.ssh/*/config\n    Port 2222\n", None, 4),
+    # joker dans un bloc Match, forme relative à ~/.ssh
+    ("Match user alice\n    Include */config\n", None, 3),
+    # ligne mixte (sans joker) plus bas
+    ('ServerAliveInterval 30\nUser y\nInclude a "{cfg}"\n', None, 4),
+    # ligne mixte dans un bloc
+    ('Host b\n    Include a.conf ~/.ssh/sshvault/config\n', None, 3),
+    # exact plus bas et joker : l'exact est déplacé, le joker gardé (numéro du fichier réécrit)
+    ("User x\ninclude ~/.ssh/sshvault/config\nInclude ~/.ssh/*/config\n",
+     "User x\nInclude ~/.ssh/*/config\n", 3),
+    # joker avant l'exact
+    ("User x\nInclude ~/.ssh/*/config\nUser z\nInclude sshvault/config\nHost a\n",
+     "User x\nInclude ~/.ssh/*/config\nUser z\nHost a\n", 3),
+])
+def test_install_joker_ou_mixte_garde(bench, orig, want, n):
+    """Matrice : une ligne Include à joker ou mixte qui couvre la config générée n'est jamais
+    supprimée ni déplacée (plus bas ou dans un bloc) : Include exact ajouté en tête,
+    avertissement (numéro de ligne du fichier réécrit), code 0, sauvegarde ; les lignes exactes
+    sont déplacées."""
+    cfg = _ssh_dir(bench) / "config"
+    orig = orig.format(cfg=sv_dir(bench) / "config")
+    cfg.write_text(orig)
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0, r.stderr
+    assert ("déplacée" if want else "ajoutée") in r.stdout
+    assert cfg.read_text() == include(bench) + "\n" + (want or orig)
+    assert kept_warnings(r) == [n], r.stderr
+    assert cfg.read_text().split("\n")[n - 1] == (want or orig).split("\n")[n - 2], "numéro de ligne exact"
+    assert (cfg.parent / "config.sshvault.bak").read_text() == orig
+    assert "Traceback" not in r.stderr
+    # relancé : déjà en tête, rien changé, plus d'avertissement
+    st = os.stat(cfg)
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0 and "déjà en tête" in r.stdout and kept_warnings(r) == []
+    assert os.stat(cfg).st_mtime_ns == st.st_mtime_ns
+
+
+def test_install_joker_en_tete_rien_change(bench):
+    """Matrice : joker en 1re ligne : « déjà en tête », fichier intact, aucun avertissement."""
+    cfg = _ssh_dir(bench) / "config"
+    orig = "# commentaire\nInclude ~/.ssh/*/config\nHost a\n    Include ~/.ssh/sshvault/config\n"
+    cfg.write_text(orig)
+    st = os.stat(cfg)
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0 and "déjà en tête" in r.stdout and kept_warnings(r) == []
+    assert cfg.read_text() == orig and os.stat(cfg).st_mtime_ns == st.st_mtime_ns
+    assert not (cfg.parent / "config.sshvault.bak").exists()
+
+
+def test_install_exact_dans_un_bloc_avec_joker_refuse(bench):
+    """Matrice : une ligne exacte dans un bloc refuse (code 4, rien modifié), même avec un joker
+    dans un bloc plus haut ; le numéro est celui de la ligne exacte."""
+    cfg = _ssh_dir(bench) / "config"
+    orig = "User x\nHost a\n    Include ~/.ssh/*/config\nHost b\n    Include ~/.ssh/sshvault/config\n"
+    cfg.write_text(orig)
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 4, r.stderr
+    line = one_line_error(r)
+    assert "ligne 5 :" in line and "Include conditionnel" in line and "non déplacée" in line, line
+    assert cfg.read_text() == orig and not (cfg.parent / "config.sshvault.bak").exists()
+
+
+def test_include_conditionnel_joker_propose_install(bench):
+    """Joker dans un bloc avant install : ssh-config prévient et propose install (qui ne le
+    déplace pas), sans demander de le sortir du bloc."""
+    unlocked(bench)
+    cfg = _ssh_dir(bench) / "config"
+    cfg.write_text("User x\nHost b\n    Include ~/.ssh/*/config\n")
+    r = bench.run("ssh-config")
+    assert r.returncode == 0, r.stderr
+    line = one_line_error(r)
+    assert "ligne 3 : Include conditionnel" in line and "lancer « sshvault ssh-config install »" in line, line
+    assert "le sortir" not in line
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0 and kept_warnings(r) == [4], r.stderr
+    r = bench.run("ssh-config")
+    assert r.returncode == 0 and r.stderr == "", r.stderr
 
 
 def test_include_formes_reconnues(bench, tmp_path):
@@ -784,7 +903,7 @@ def test_install_course_a_la_creation(bench, monkeypatch, tmp_path):
                 f.write("Host z\n    User y\n")
         return real(path, data, mode)
     monkeypatch.setattr(sshconfig, "_create", racing)
-    msg = sshconfig.install(paths)
+    msg = sshconfig.install(paths).message
     assert "ajoutée" in msg
     assert open(paths.user_config).read() == 'Include "%s"\nHost z\n    User y\n' % paths.config
 
@@ -1063,6 +1182,27 @@ def test_uninstall_include_mixte_gardee(bench, orig, n):
     assert "ligne %d :" % n in line and "d'autres fichiers" in line and "gardée" in line, line
     assert cfg.read_text() == orig
     assert not (sv_dir(bench) / "config").exists() and not (sv_dir(bench) / "pub").exists()
+
+
+@pytest.mark.parametrize("orig,n", [("User x\nInclude ~/.ssh/*/config\nHost b\n", 2),
+                                    ("User x\nHost b\n    Include ~/.ssh/*/config\n", 3)])
+def test_uninstall_apres_install_joker_garde(bench, orig, n):
+    """Critère : install avec un joker gardé (plus bas ou dans un bloc), puis uninstall : la
+    ligne exacte part, le joker reste, avec l'avertissement d'uninstall ; fichier = l'original."""
+    cfg = _ssh_dir(bench) / "config"
+    cfg.write_text(orig)
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0 and kept_warnings(r) == [n + 1], r.stderr
+    assert cfg.read_text() == include(bench) + "\n" + orig
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 0, r.stderr
+    line = one_line_error(r)
+    assert "ligne %d :" % n in line and "d'autres fichiers" in line and "gardée" in line, line
+    assert "ligne Include de sshvault retirée" in r.stdout
+    assert cfg.read_text() == orig
+    assert not (sv_dir(bench) / "config").exists()
 
 
 def test_uninstall_include_plus_bas_et_dans_un_bloc(bench):

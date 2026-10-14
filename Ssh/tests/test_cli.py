@@ -641,7 +641,9 @@ def test_login_refuse(bench):
     p = subprocess.run([sys.executable, "-m", "sshvault", "login"], env=bench.env,
                        input="mauvais\n", capture_output=True, text=True, timeout=60)
     assert p.returncode == 3
-    assert p.stderr.splitlines()[-1].startswith("sshvault: login refusé")
+    assert p.stderr.splitlines()[-1] == (
+        "sshvault: login refusé par bw (code 1, message ci-dessus : mot de passe refusé, limite de débit du "
+        "serveur — réessayer dans une minute — ou réseau)"), p.stderr
     bench.set_state(logged_in=True)
     p = subprocess.run([sys.executable, "-m", "sshvault", "login"], env=bench.env, stdin=subprocess.DEVNULL,
                        capture_output=True, text=True, timeout=60)

@@ -2,7 +2,7 @@
 
 Clés SSH dans un Vaultwarden auto-hébergé, utilisées de façon transparente par ssh.
 
-État (0.11.0) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
+État (0.12.0) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
 + e-mail, sur un même serveur ou sur des serveurs différents ; déconnexion par `sshvault
 logout`, serveur ou e-mail corrigé par `sshvault account set` ; voir « Comptes du coffre »),
 **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
@@ -335,6 +335,23 @@ par sshvault sont ceux de cette version.
   - Une clé déjà présente dans l'agent n'est pas rechargée (« déjà chargée ») : un
     rechargement écraserait sa durée et ses contraintes. `--force` la recharge avec les
     nouvelles options.
+  - Verrou : après la lecture du coffre (invites du coffre hors verrou), `load` prend le
+    verrou d'`ensure` (`ensure.lock`) pour les ajouts à l'agent, le retour arrière et
+    l'écriture de l'état ; tenu par un `ensure` en cours : « attente d'un chargement en cours
+    (ensure)… » sur stderr, puis `load` continue ; les clés privées déjà lues restent en
+    mémoire pendant l'attente. En interactif, l'attente est sans limite (Ctrl-C l'arrête) ;
+    avec `--nointeraction`, elle est bornée par `SSHVAULT_ENSURE_TIMEOUT` (240 s par défaut) :
+    au-delà, « verrou d'ensure tenu : rien chargé », code 4. Sous le verrou, l'agent est relu :
+    verrouillé entre-temps (`agent lock`) → rien chargé, code 3 ; clé chargée entre-temps (par
+    `ensure`) → « déjà chargée », rien rechargé (sauf `--force`). Chaque compte des clés à
+    charger est aussi revu, comme `status` et sans invite (toujours enregistré avec le même
+    serveur et le même e-mail, `bw` connecté, coffre déverrouillé) : un `logout`, `lock`,
+    `account remove`, `account rename` ou `account set` passé pendant l'attente → rien
+    chargé, une ligne qui nomme le compte, code 3 ; `bw status` en erreur : code 4. Coût : un
+    `bw status` par compte à chaque `load`, sous le verrou (un `ensure` concurrent attend
+    pendant ce temps). Valeur invalide de `SSHVAULT_ENSURE_TIMEOUT` avec `--nointeraction` :
+    code 2, avant toute lecture du coffre. La passphrase d'une clé chiffrée se tape sous ce
+    verrou (les `ssh` qui doivent charger une clé attendent, dans leur délai).
   - Clé du coffre chiffrée par passphrase : `ssh-add` la demande (askpass s'il est
     permis et installé, sinon le terminal). sshvault coupe l'écho du terminal pendant
     tout `ssh-add` interactif (OpenSSH 8.9 lit la passphrase d'une clé passée sur stdin
@@ -388,10 +405,10 @@ par sshvault sont ceux de cette version.
     `agent lock`, `agent unlock` tient le verrou d'`ensure` pendant la saisie du mot de
     passe : un `ssh` lancé entre-temps attend, borné par son délai
     (`SSHVAULT_ENSURE_TIMEOUT`).
-  - La sonde n'est pas sans perte dans tous les cas : une clé ajoutée à l'agent à l'instant
-    même entre la liste vide et `ssh-add -D` — par `sshvault load` (qui ne prend pas le
-    verrou d'`ensure`) ou à la main — serait retirée ; une clé du coffre est rechargée par
-    `ensure` à son prochain usage.
+  - La sonde n'est pas sans perte dans tous les cas : une clé ajoutée à l'agent à la main
+    (`ssh-add`, hors du verrou d'`ensure`) à l'instant même entre la liste vide et `ssh-add
+    -D` serait retirée ; une clé du coffre est rechargée par `ensure` à son prochain usage.
+    `sshvault load` (0.12.0) ajoute ses clés sous ce verrou : jamais retirées ainsi.
 - L'agent de l'utilisateur (`SSH_AUTH_SOCK` hérité) n'est jamais lu ni modifié : chaque
   `ssh-add` reçoit `SSH_AUTH_SOCK` = socket dédié.
 - **Identité de l'agent** : avant tout signal, sshvault vérifie que le pid est un
@@ -833,6 +850,9 @@ déverrouillage par compte concerné et par connexion (l'invite nomme l'alias).
   SIGTTIN. L'invite dit ce qui la déclenche (« clé pour <hôte> »). La session obtenue sert
   aux sauts suivants ; **sans magasin de session utilisable** (ni keyring, ni
   `XDG_RUNTIME_DIR` privé : avertissement « session non rangée »), chaque saut redemande.
+  Dans une même commande (`load`, `list`…), la session obtenue à l'invite sert jusqu'à sa
+  fin, gardée en mémoire seulement (jamais écrite) : `load` relit ainsi le compte sous le
+  verrou d'`ensure` sans le dire verrouillé.
 - **Mauvais mot de passe** (refusé par `bw`, ou invite annulée ou sans réponse) : une ligne,
   et l'échec est mémorisé 30 s pour **cette connexion** (`$XDG_RUNTIME_DIR/sshvault/unlock-failed`
   : horodatage, pid et date de démarrage du ssh tapé) : les sauts suivants échouent
@@ -870,10 +890,20 @@ commentaires d'en-tête restent dessous, inchangés) :
 
 - idempotent (ligne déjà en tête, sous toute forme : chemin réel, `~`, `~user`, relatif à
   `~/.ssh`, joker, parmi plusieurs fichiers : rien fait) ; une ligne `Include` de sshvault
-  placée plus bas est déplacée en tête (une ligne qui inclut aussi d'autres fichiers est
-  gardée telle quelle : ssh ignore le doublon) ;
-- une ligne `Include` de sshvault **dans** un bloc `Host`/`Match` (Include conditionnel)
-  n'est pas déplacée : code 4, rien modifié ; `ssh-config` et `--check` la signalent ;
+  (dont tous les arguments désignent exactement le fichier généré) placée plus bas est
+  déplacée en tête ;
+- une ligne à **joker** qui couvre le fichier généré (`Include ~/.ssh/*/config`) ou **mixte**
+  (`Include a.conf ~/.ssh/sshvault/config`) n'est jamais supprimée ni déplacée, qu'elle soit
+  plus bas ou dans un bloc `Host`/`Match` (elle peut inclure d'autres fichiers) :
+  l'`Include` exact est ajouté en tête, elle reste, et un avertissement le dit sur stderr
+  (numéro de ligne du fichier réécrit), code 0 : le fichier généré est alors inclus deux
+  fois, sans effet néfaste (la première valeur rencontrée gagne) ; ses lignes `Match … exec`
+  sont évaluées deux fois à chaque lecture de la config : `sshvault ensure` est lancé deux
+  fois, et le second trouve la clé déjà chargée quand le premier l'a chargée ;
+- une ligne `Include` de sshvault exacte **dans** un bloc `Host`/`Match` (Include
+  conditionnel) n'est pas déplacée : code 4, rien modifié ; `ssh-config` et `--check` la
+  signalent (« le sortir du bloc ») ; pour une ligne à joker ou mixte dans un bloc,
+  `ssh-config` et `--check` proposent `install` ;
 - sauvegarde avant toute écriture, jamais écrasée : `~/.ssh/config.sshvault.bak`, sinon
   `.bak.1`, `.bak.2`… (0600) ; écriture atomique, mode et propriétaire conservés ; fichier
   absent : créé en 0600 (et `~/.ssh` en 0700 s'il manque), sans écraser un fichier créé
@@ -894,9 +924,9 @@ régénération, rien d'autre, sans accès au coffre :
   d'abord, jamais écrasée ; écriture atomique, mode et propriétaire conservés) : après
   `install` puis `uninstall`, le fichier est identique à l'original, sauf dans deux cas : un
   `~/.ssh/config` créé par `install` reste là, vide ; une ligne `Include` de sshvault
-  qu'`install` a déplacée de plus bas, ou une ligne `Include` à joker qu'il a prise pour la
-  sienne et retirée, n'est pas remise à sa place (elle est dans la sauvegarde
-  `config.sshvault.bak*` d'`install`). Une ligne qui inclut
+  qu'`install` a déplacée de plus bas, ou une ligne `Include` à joker qu'un `install`
+  antérieur à la 0.12.0 a prise pour la sienne et retirée, n'est pas remise à sa place (elle
+  est dans la sauvegarde `config.sshvault.bak*` d'`install`). Une ligne qui inclut
   aussi d'autres fichiers, ou un joker qui couvre le fichier généré, est gardée, avec un
   avertissement (son numéro de ligne) ;
 - `~/.ssh/sshvault/config` est supprimé ; dans `~/.ssh/sshvault/pub/`, seuls les `*.pub`
@@ -1028,9 +1058,9 @@ sshvault forward list --id 2222…                   # un motif par ligne
 |---|---|
 | 0 | succès |
 | 1 | `search`, `load`, `hosts`, `forward`, `pubkey`, `deploy` : aucun résultat ; `import` : clé déjà dans le coffre (rien créé) ; `generate` : nom déjà pris, sans `--force` (rien généré) ; `hosts remove`, `forward remove` : hôte absent (rien écrit) ; `ssh-config --check` : pas à jour (contenu, droits, fichier en trop ou non ordinaire), ou ligne `Include` absente, conditionnelle ou pas en tête |
-| 2 | usage (option ou argument invalide ; `load` sans sélection ni `--all`) ; comptes : alias invalide ou inconnu, alias ou couple serveur + e-mail déjà enregistré, serveur ou e-mail invalide, écriture sans `--account` quand plusieurs comptes sont possibles, `login` ou `logout` sans `--account` avec plusieurs comptes, aucun compte par défaut, `account rename` vers un alias pris, `account add` : dossier `accounts/<alias>` existant, `account set` sans `--server` ni `--email`, `account set` : registre refusé après la déconnexion (couple pris entre-temps ; ce qui est déjà fait est dit) ; `logout`, `account set` : `bw-path` invalide (rien fait) ; durée invalide ; `config.json` invalide, illisible ou aux droits inattendus ; `config set bw-path` : chemin relatif, absent, avec un caractère de contrôle, ou pas un fichier ordinaire exécutable ; `bw-path` invalide dans `config.json` ; hôte invalide ; sélection de `hosts` ou `forward` qui désigne plusieurs éléments ; `import` : fichier refusé (illisible, pas une clé privée, type ou format non accepté), `--name` avec plusieurs fichiers ; `generate` : type, bits, nom ou commentaire refusés ; `deploy` : cible, port ou options ssh invalides ou refusées ; délai `SSHVAULT_DEPLOY_TIMEOUT` invalide |
-| 3 | aucun compte enregistré (`ssh-config` n'écrit alors rien, `lock` compris), non connecté (« lancer sshvault login » ; `ensure` d'un compte déconnecté par `logout` : « lancer sshvault login --account ALIAS »), ou coffre verrouillé : aucune invite possible, invite annulée ou sans réponse, mot de passe refusé ; agent dédié arrêté (`agent status`, `lock`, `unlock`) ou verrouillé (`ensure --forward` compris) ; passphrase d'une clé refusée ou impossible à saisir (`load`, `import`) |
-| 4 | erreur du backend : `bw` introuvable, non exécutable, interpréteur ou chargeur absent, format non exécutable (au chemin du réglage `bw-path` compris, le PATH n'étant alors pas essayé), en erreur, réponse illisible, délai dépassé ; magasin de session inutilisable ; agent dédié : `XDG_RUNTIME_DIR` relatif, non privé ou hors tmpfs, chemin du socket trop long, agent tiers sur le socket, OpenSSH < 8.9, `--restrict` (élément sans hôte, hôte non littéral ou absent de `known_hosts`), sous-agent de transfert en erreur (`agent status`, `stop`, `purge`, `lock`), clé publique illisible ou différente de la clé privée, `ssh-add`/`ssh-agent` en erreur ; écriture de `config.json` impossible ; écriture des hôtes ou des transferts dans le coffre non aboutie ou non vérifiée (y compris écrits mais `ssh_config` non régénéré) ; `ensure --forward` : `forward-confirm` sans askpass, élément qui ne déclare plus ce transfert, chemin du socket de transfert trop long ; `import` : création non aboutie ou non vérifiée (y compris clé importée mais `ssh_config` non régénéré), copie impossible dans un tmpfs privé (`--decrypt`), `ssh-keygen` absent ou en erreur ; `generate` : tmpfs privé inutilisable, `ssh-keygen` absent ou en erreur, création non aboutie ou non vérifiée (clé perdue, dit), clé créée mais `ssh_config` non régénéré ; `pubkey` : clé publique d'un élément illisible ; `deploy` : `ssh` absent, en échec ou sans réponse (`SSHVAULT_DEPLOY_TIMEOUT`), réponse inattendue de la cible, échec partiel (clés déjà ajoutées dites, puis code 4), clé publique illisible ; `ssh_config` généré impossible à écrire (chemin avec `"`, `\`, `${`, fichier non ordinaire, droits) ; répertoire personnel inconnu ; `ssh-config install` refusé (lien symbolique, fichier non ordinaire, `Include` conditionnel, chemin personnel avec `%`, `$` ou joker) ; `ssh-config uninstall` refusé (`~/.ssh/config` lien symbolique ou non ordinaire, `~/.ssh/sshvault`, sa config ou `pub/` d'un type inattendu : rien modifié) ; `lock --unload` : agent verrouillé ou en erreur (coffre verrouillé quand même, clés laissées) ; adoption de l'installation 0.8.0 impossible (rien modifié ; `account add` refusé tant qu'elle n'est pas faite) ; `account rename` : destination existante ou déplacement impossible (rien changé) ; `account remove` : données locales impossibles à supprimer (compte gardé), magasin de session ou agent en erreur ou verrouillé (clés laissées, état gardé) ; `logout`, `account set` : agent en erreur ou verrouillé (rien modifié, ou état partiel dit), `bw logout` en échec ou sans réponse (compte toujours connecté, ou état inconnu ; `account set` : registre inchangé), `account set` : écriture du registre impossible après la déconnexion (ce qui est déjà fait est dit) ; `ssh-config --check` : `bw` en erreur, même pour un compte déconnecté ; erreur interne |
+| 2 | usage (option ou argument invalide ; `load` sans sélection ni `--all`) ; comptes : alias invalide ou inconnu, alias ou couple serveur + e-mail déjà enregistré, serveur ou e-mail invalide, écriture sans `--account` quand plusieurs comptes sont possibles, `login` ou `logout` sans `--account` avec plusieurs comptes, aucun compte par défaut, `account rename` vers un alias pris, `account add` : dossier `accounts/<alias>` existant, `account set` sans `--server` ni `--email`, `account set` : registre refusé après la déconnexion (couple pris entre-temps ; ce qui est déjà fait est dit) ; `logout`, `account set` : `bw-path` invalide (rien fait) ; durée invalide ; `config.json` invalide, illisible ou aux droits inattendus ; `config set bw-path` : chemin relatif, absent, avec un caractère de contrôle, ou pas un fichier ordinaire exécutable ; `bw-path` invalide dans `config.json` ; hôte invalide ; sélection de `hosts` ou `forward` qui désigne plusieurs éléments ; `import` : fichier refusé (illisible, pas une clé privée, type ou format non accepté), `--name` avec plusieurs fichiers ; `generate` : type, bits, nom ou commentaire refusés ; `deploy` : cible, port ou options ssh invalides ou refusées ; délai `SSHVAULT_DEPLOY_TIMEOUT` invalide ; `load --nointeraction` : `SSHVAULT_ENSURE_TIMEOUT` invalide (rien lu, rien chargé) |
+| 3 | aucun compte enregistré (`ssh-config` n'écrit alors rien, `lock` compris), non connecté (« lancer sshvault login » ; `ensure` d'un compte déconnecté par `logout` : « lancer sshvault login --account ALIAS »), ou coffre verrouillé : aucune invite possible, invite annulée ou sans réponse, mot de passe refusé ; agent dédié arrêté (`agent status`, `lock`, `unlock`) ou verrouillé (`ensure --forward` compris) ; passphrase d'une clé refusée ou impossible à saisir (`load`, `import`) ; `load` : compte déconnecté, verrouillé, retiré, renommé ou modifié pendant l'attente du verrou d'`ensure` (rien chargé) ; `login` refusé par bw (mot de passe, limite de débit des connexions du serveur — réessayer dans une minute —, réseau) |
+| 4 | erreur du backend : `bw` introuvable, non exécutable, interpréteur ou chargeur absent, format non exécutable (au chemin du réglage `bw-path` compris, le PATH n'étant alors pas essayé), en erreur, réponse illisible, délai dépassé ; magasin de session inutilisable ; agent dédié : `XDG_RUNTIME_DIR` relatif, non privé ou hors tmpfs, chemin du socket trop long, agent tiers sur le socket, OpenSSH < 8.9, `--restrict` (élément sans hôte, hôte non littéral ou absent de `known_hosts`), sous-agent de transfert en erreur (`agent status`, `stop`, `purge`, `lock`), clé publique illisible ou différente de la clé privée, `ssh-add`/`ssh-agent` en erreur ; écriture de `config.json` impossible ; écriture des hôtes ou des transferts dans le coffre non aboutie ou non vérifiée (y compris écrits mais `ssh_config` non régénéré) ; `ensure --forward` : `forward-confirm` sans askpass, élément qui ne déclare plus ce transfert, chemin du socket de transfert trop long ; `import` : création non aboutie ou non vérifiée (y compris clé importée mais `ssh_config` non régénéré), copie impossible dans un tmpfs privé (`--decrypt`), `ssh-keygen` absent ou en erreur ; `generate` : tmpfs privé inutilisable, `ssh-keygen` absent ou en erreur, création non aboutie ou non vérifiée (clé perdue, dit), clé créée mais `ssh_config` non régénéré ; `pubkey` : clé publique d'un élément illisible ; `deploy` : `ssh` absent, en échec ou sans réponse (`SSHVAULT_DEPLOY_TIMEOUT`), réponse inattendue de la cible, échec partiel (clés déjà ajoutées dites, puis code 4), clé publique illisible ; `ssh_config` généré impossible à écrire (chemin avec `"`, `\`, `${`, fichier non ordinaire, droits) ; répertoire personnel inconnu ; `ssh-config install` refusé (lien symbolique, fichier non ordinaire, `Include` exact conditionnel, chemin personnel avec `%`, `$` ou joker) ; `ssh-config uninstall` refusé (`~/.ssh/config` lien symbolique ou non ordinaire, `~/.ssh/sshvault`, sa config ou `pub/` d'un type inattendu : rien modifié) ; `lock --unload` : agent verrouillé ou en erreur (coffre verrouillé quand même, clés laissées) ; adoption de l'installation 0.8.0 impossible (rien modifié ; `account add` refusé tant qu'elle n'est pas faite) ; `account rename` : destination existante ou déplacement impossible (rien changé) ; `account remove` : données locales impossibles à supprimer (compte gardé), magasin de session ou agent en erreur ou verrouillé (clés laissées, état gardé) ; `logout`, `account set` : agent en erreur ou verrouillé (rien modifié, ou état partiel dit), `bw logout` en échec ou sans réponse (compte toujours connecté, ou état inconnu ; `account set` : registre inchangé), `account set` : écriture du registre impossible après la déconnexion (ce qui est déjà fait est dit) ; `ssh-config --check` : `bw` en erreur, même pour un compte déconnecté ; erreur interne ; `load` : « verrou d'ensure tenu : rien chargé » (`--nointeraction`, attente au-delà de `SSHVAULT_ENSURE_TIMEOUT`), `bw status` en erreur à la relecture d'un compte sous le verrou |
 | 130 | interrompu (Ctrl-C, SIGTERM, SIGHUP) ; pendant `bw logout` (`logout`, `account set`) : état relu, marqueur `logged-out` posé si bw est déconnecté ou si son état est inconnu |
 
 `agent status`, `stop`, `purge`, `lock` : code de l'agent dédié (`status` : 0 actif, 3 arrêté),
@@ -1090,7 +1120,7 @@ le code 2. Toute erreur est une ligne sur stderr, sans traceback.
 | `SSHVAULT_BW` | exécutable `bw`, prioritaire sur le réglage `bw-path` (défaut : `bw-path`, sinon `bw` du PATH) |
 | `SSHVAULT_BW_TIMEOUT` | délai d'un appel `bw`, en secondes, 0 < v ≤ 86400 (défaut 60 ; `login` : 600) |
 | `SSHVAULT_PROMPT_TIMEOUT` | délai d'une invite, en secondes, 0 < v ≤ 86400 (défaut 60) |
-| `SSHVAULT_ENSURE_TIMEOUT` | délai global d'un `ensure` depuis son démarrage, attente du verrou comprise, en secondes, 0 < v ≤ 86400 (défaut 240) |
+| `SSHVAULT_ENSURE_TIMEOUT` | délai global d'un `ensure` depuis son démarrage, attente du verrou comprise, en secondes, 0 < v ≤ 86400 (défaut 240) ; borne aussi l'attente d'`ensure.lock` par `load --nointeraction` (interactif : sans limite) |
 | `SSHVAULT_KEYRING`, `SSHVAULT_KEYCTL` | anneau et exécutable `keyctl` (tests ; défaut `@u`, `keyctl`) |
 | `XDG_DATA_HOME` | base des dossiers de données de `bw`, un par compte (défaut `~/.local/share`) |
 | `XDG_RUNTIME_DIR` | repli fichier de la session ; socket et état de l'agent dédié (tmpfs privé exigé) |
@@ -1123,7 +1153,10 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   `ssh-add` du poste (ignorés s'ils manquent), sur des sockets de test en `/dev/shm`. `SSH_AUTH_SOCK` y pointe sur
   un agent témoin dont le contenu est revérifié inchangé après chaque test ; tout
   `ssh-agent` (et surveillant) lancé par un test est arrêté et sa disparition vérifiée. Un test passe
-  `load` sous `strace -f` : seules écritures, le fichier d'état (et son temporaire).
+  `load` sous `strace -f` : seules écritures, le fichier d'état (et son temporaire) et le
+  verrou `ensure.lock` (vide). `load` lancé pendant que `ensure.lock` est tenu : coffre lu,
+  attente, rien ajouté avant la libération ; clé chargée ou agent verrouillé pendant
+  l'attente.
 - `tests/test_sshconfig.py` valide le fichier généré avec l'OpenSSH du poste :
   `ssh -G -F <config de test qui l'inclut>` (agent dédié, une seule `identityfile`,
   `identitiesonly yes`, HOME et `XDG_RUNTIME_DIR` avec espace et `%`), puis `ssh -vvv`
@@ -1132,7 +1165,12 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   simuler un `edit` en échec, bloqué, passé puis bloqué, ou en concurrence. `ssh-config
   uninstall` : `install` puis `uninstall` rendent `~/.ssh/config` identique (mode compris)
   et `ssh -G` ne montre plus l'agent dédié ; Include mixte, joker, plus bas, dans un bloc,
-  lien, FIFO, `pub/` avec d'autres fichiers.
+  lien, FIFO, `pub/` avec d'autres fichiers. `install` : joker ou ligne mixte plus bas, dans
+  un bloc ou en tête (gardé, avertissement), exact dans un bloc (refus), puis `uninstall`.
+- `tests/test_it_accounts.py` : lecteur du fichier des comptes de test d'intégration
+  (`tests/integration/accounts.py`), sans réseau ni vrai fichier : comptes valides et alias,
+  doublon, champ manquant, vide ou de type faux, clé inconnue, TOML illisible, fichier absent
+  (avec ou sans `account.env`), `SSHVAULT_IT_ENV` ; aucune valeur dans les messages.
 - `tests/test_ensure.py` (chargement automatique) : vrais `ssh` contre deux sshd de test
   (A, le rebond, et B, la cible, sur 127.0.0.1, chacun n'acceptant que sa clé), en
   `ProxyJump` et en `ProxyCommand ssh -W`, vrais `ssh-agent`/`ssh-add`, faux `bw` (avec un
@@ -1183,11 +1221,25 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   signal pendant la relecture) ; trois sshd de test :
   `ssh` vers un hôte de chacun de trois comptes (deux serveurs), rebond qui touche deux
   comptes (une invite par compte, refus sur l'un sans blocage de l'autre).
-- Intégration à deux comptes : second compte de test, créé par l'utilisateur
-  (`SSHVAULT_IT2_SERVER`, `SSHVAULT_IT2_EMAIL`, `SSHVAULT_IT2_PASSWORD` dans le fichier du
-  compte de test ; en mode conteneur, inscrit par le test) ; sans eux, ce volet est sauté et
-  le rapport le dit. Il couvre aussi `logout --account` du second compte puis `login`, et
-  `account set` aller-retour (e-mail factice puis le vrai) suivi de `login`.
+- Intégration à plusieurs comptes : tous les comptes du fichier des comptes de test (au
+  moins 2, créés par l'utilisateur ; en mode conteneur, 3 inscrits par le test), alias `it`
+  (1er, coffre peuplé), `it2`, `it3`… dans l'ordre du fichier ; un seul compte : ce volet est
+  sauté et le rapport le dit. Login de chacun, `list`, `account default`, une clé générée et
+  marquée dans chaque compte au-delà du premier (éléments marqués purgés au début et à la
+  fin), `ssh-config`, `ensure` ; puis sur **chaque** compte, `it` compris, `logout --account`
+  suivi de `login`, et `account set` aller-retour (e-mail factice puis le vrai) suivi de
+  `login` ; enfin `lock`. Rapport et messages d'échec masqués pour tous les comptes.
+- Mesure du code de `sshvault login` (opt-in) : `SSHVAULT_IT_LOGIN_REPEAT=N` lance N
+  `sshvault login` (pty) suivis de `sshvault logout`, au moins 7 s entre deux essais, HOME
+  temporaire, 1er compte ; le rapport donne le rc, la durée et les invites de chaque essai,
+  la sortie et la fin masquée du terminal de chaque échec, et le décompte par code ; le test
+  échoue si un essai rend autre chose que 0, ou si un `logout` entre deux essais échoue
+  (anomalie dite ; `bw logout` à la main avant l'essai suivant, son échec arrête la série).
+  Sans la variable : sauté. Mesuré le 2026-10-14 (N = 20) : 12 essais à 0, puis 6 sur 8 à
+  3, refusés par la limite de débit des connexions de Vaultwarden (« Rate limit exceeded.
+  Try again later. »). Les autres tests d'intégration attendent alors 60 s et réessaient
+  (3 fois au plus, chaque attente dans le rapport), pour `sshvault login` comme pour le
+  `bw login` du peuplement.
 - En fin de session, les tests vérifient qu'aucun de leurs processus ne reste (agent,
   surveillant, sshd, `bw`, askpass, `ensure`), que `~/.ssh` réel est inchangé,
   qu'aucun dossier sshvault réel (socket, données, config) n'a été créé, et que rien n'a
@@ -1197,18 +1249,31 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   alors ce seul contrôle à un avertissement (`~/.ssh` modifié et dossier créé restent des
   échecs).
 - L'intégration (`-m integration`, `bw` par `SSHVAULT_BW` ou le PATH) a deux modes :
-  - **compte de test** (défaut) : identifiants dans `~/.config/sshvault-test/account.env`
-    (0600, hors git ; chemin remplaçable par `SSHVAULT_IT_ENV`) : `SSHVAULT_IT_SERVER`,
-    `SSHVAULT_IT_EMAIL`, `SSHVAULT_IT_PASSWORD`, `NODE_EXTRA_CA_CERTS` en option. Jamais
-    affichés ; mot de passe par `--passwordenv` ; données `bw` dans des dossiers
-    temporaires supprimés à la fin. Le test crée 2 éléments SSH et 1 login marqués
+  - **comptes de test** (défaut) : fichier TOML `~/.config/sshvault-test/accounts.toml`
+    (0600, hors git ; chemin remplaçable par `SSHVAULT_IT_ACCOUNTS`), à écrire d'après
+    `tests/integration/accounts.example.toml` : un bloc `[[account]]` par compte (`server`,
+    `email`, `password`), `node_extra_ca_certs` commun en option (passé à `bw` par
+    `NODE_EXTRA_CA_CERTS`). Lu par `tomllib` (Python 3.11+) ou `tomli` (Python 3.10,
+    dépendance de test seule). Clé inconnue, champ manquant ou vide, type faux, serveur ou
+    e-mail invalide pour sshvault, doublon (serveur et e-mail normalisés comme le registre de
+    sshvault : casse, `/` final, port par défaut), certificat `node_extra_ca_certs` qui n'est
+    pas un fichier ordinaire lisible (`~` développé, chemin rendu absolu) ou TOML illisible
+    (ligne et colonne seulement) : la session échoue, avec le numéro du compte et le nom de la
+    clé, jamais une valeur. Fichier ouvert au groupe ou aux autres, ou d'un autre
+    propriétaire : avertissement seul (sortie de pytest et rapport). Les messages masquent les
+    valeurs de tous les comptes à la fois (la plus longue d'abord), et aussi le serveur tel
+    que sshvault l'affiche (normalisé), son nom d'hôte seul et le chemin du certificat.
+    Fichier absent : intégration sautée (l'ancien `account.env`, s'il existe encore, est
+    signalé : il n'est plus lu ; `SSHVAULT_IT_ENV` défini : échec qui nomme
+    `SSHVAULT_IT_ACCOUNTS`). Valeurs jamais affichées ; mot de passe par `--passwordenv` ;
+    données `bw` dans des dossiers temporaires supprimés à la fin. Le test crée 2 éléments SSH et 1 login marqués
     `sshvault-test-run=<uuid>`, pilote sshvault, puis supprime définitivement
     (`--permanent`) les éléments de son run, même en cas d'échec, et fait `bw logout`. Au début
     et à la fin, il purge aussi tout élément marqué `sshvault-test-run` (quelle que soit la
     valeur : restes d'un run interrompu), marqueur relu avant chaque suppression ; `sync` et
     `delete` sont retentés après une panne réseau passagère (DNS, connexion) ;
   - **conteneur** (`SSHVAULT_IT_MODE=container`) : Vaultwarden 1.37.4 sur un port libre de
-    127.0.0.1, compte créé par l'API (crypto d'inscription Bitwarden, dépendance de test
+    127.0.0.1, 3 comptes créés par l'API (crypto d'inscription Bitwarden, dépendance de test
     `cryptography`), conteneur supprimé à la fin.
   Ignorée si ni le fichier ni (en mode conteneur) docker ne sont disponibles.
   `SSHVAULT_IT_REPORT=<fichier>` y écrit les messages réels de `bw` mesurés, sans identifiants.

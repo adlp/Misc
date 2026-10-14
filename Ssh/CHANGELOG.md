@@ -1,5 +1,89 @@
 # Changelog — sshvault
 
+## sshvault 0.12.0 — Jokers d'install, load sous verrou, comptes de test en TOML — 2026-10-13
+
+- `sshvault ssh-config install` : seules les lignes `Include` dont tous les arguments
+  désignent exactement le fichier généré sont les siennes (déplacées en tête ; dans un bloc
+  `Host`/`Match` : refus, code 4, rien modifié, comme avant). Une ligne à joker
+  (`Include ~/.ssh/*/config`) ou mixte (`Include a.conf ~/.ssh/sshvault/config`) qui couvre le
+  fichier généré n'est plus jamais supprimée ni déplacée, et ne bloque plus quand elle est dans
+  un bloc : l'`Include` exact est ajouté en tête, la ligne reste, avec un avertissement sur
+  stderr (numéro de ligne du fichier réécrit), code 0. Le fichier généré est alors inclus deux
+  fois, sans effet néfaste (la première valeur gagne) ; ses lignes `Match … exec` sont évaluées
+  deux fois à chaque lecture de la config : `ensure` est lancé deux fois, et le second trouve
+  la clé déjà chargée quand le premier l'a chargée. Joker déjà en tête : « déjà en tête », rien
+  changé (inchangé). Avant : une ligne à joker plus bas était retirée (alors qu'elle pouvait
+  inclure d'autres fichiers), et une ligne à joker dans un bloc faisait refuser `install` avec
+  un message faux. `ssh-config` et `--check` (« Include conditionnel ») proposent alors
+  `install` sans demander de sortir la ligne du bloc (ligne exacte dans un bloc : « le sortir
+  du bloc », numéro de cette ligne). `ssh-config uninstall` après une telle installation : la
+  ligne exacte part, le joker reste (avertissement existant).
+- `sshvault load` prend le verrou `ensure.lock` après la lecture du coffre (invites du coffre
+  hors verrou), autour des ajouts à l'agent, du retour arrière et de l'écriture de l'état
+  (ordre des verrous : `ensure.lock` puis état de l'agent, comme `ensure` et `logout`) ; verrou
+  tenu : « attente d'un chargement en cours (ensure)… » sur stderr. Une sonde `ssh-add -D`
+  (`logout`, `lock --unload`, `ensure`, `agent unlock`) ne peut plus retirer une clé en cours
+  de chargement.
+  - Sous le verrou, l'agent est relu : verrouillé pendant l'attente (`agent lock`) → rien
+    chargé, code 3 (même texte qu'avant la lecture du coffre) ; clé chargée entre-temps (par
+    `ensure`) → « déjà chargée », ni durée ni contraintes écrasées (sauf `--force`) ;
+    avertissement `--confirm` sans askpass dit d'après l'agent relu.
+  - Chaque compte des clés à charger est aussi revu sous le verrou, comme `status` et sans
+    invite (un `bw status` par compte, à chaque `load` : un `ensure` concurrent attend
+    pendant ce temps) : `logout`, `lock`, `account remove`, `rename` ou `set` passé pendant
+    l'attente → rien chargé, une ligne qui nomme le compte, code 3 ; `bw status` en erreur :
+    rien chargé, code 4.
+  - Les clés privées déjà lues restent en mémoire pendant l'attente : sans limite en
+    interactif (Ctrl-C) ; bornée par `SSHVAULT_ENSURE_TIMEOUT` avec `--nointeraction`
+    (au-delà : « verrou d'ensure tenu : rien chargé », code 4 ; valeur invalide : code 2, avant
+    toute lecture du coffre). La passphrase d'une clé chiffrée se tape sous le verrou, comme
+    pour `ensure`.
+- Magasin de session en panne (« session non rangée ») : la session obtenue à l'invite sert
+  désormais à toute la suite de la commande (gardée en mémoire seulement, jamais écrite), pas
+  seulement à l'opération en cours ; `load` relit ainsi le compte sous le verrou sans le dire
+  verrouillé.
+- Tests d'intégration : comptes de test dans un fichier TOML à N comptes,
+  `~/.config/sshvault-test/accounts.toml` (0600 ; chemin par `SSHVAULT_IT_ACCOUNTS` ; exemple
+  `tests/integration/accounts.example.toml`) : `[[account]]` avec `server`, `email`,
+  `password`, `node_extra_ca_certs` commun en option ; lu par `tomllib` (3.11+) ou `tomli`
+  (dépendance de test seule, Python 3.10, groupe `dev` ; jamais de sshvault).
+  - Échec de la session, sans aucune valeur du fichier : clé inconnue, champ manquant ou vide,
+    type faux, serveur ou e-mail invalide pour sshvault, doublon (serveur et e-mail
+    normalisés comme le registre de sshvault : casse, `/` final, port par défaut), certificat
+    qui n'est pas un fichier ordinaire lisible (`~` développé, chemin rendu absolu), TOML
+    illisible (ligne et colonne seulement).
+  - Fichier ouvert au groupe ou aux autres, ou d'un autre propriétaire : avertissement seul
+    (sortie de pytest et rapport). Fichier absent : intégration sautée (avec mention
+    d'`account.env` s'il existe encore). `account.env` (`SSHVAULT_IT_*`, `SSHVAULT_IT2_*`)
+    n'est plus lu ; `SSHVAULT_IT_ENV` défini : échec qui nomme `SSHVAULT_IT_ACCOUNTS`.
+  - Masquage : valeurs brutes, serveur normalisé, nom d'hôte seul et chemin du certificat, de
+    tous les comptes à la fois (la valeur la plus longue d'abord).
+  - Comptes `it` (1er, coffre peuplé), `it2`, `it3`… dans l'ordre du fichier ; mode
+    conteneur : 3 comptes inscrits. Le volet deux comptes devient le volet plusieurs comptes
+    (tous les comptes du fichier, au moins 2 ; un seul : sauté, dit dans le rapport) : login,
+    `ssh-config`, `ensure`, puis sur chaque compte, `it` compris, `logout` puis login et
+    `account set` aller-retour puis login ; une clé générée et marquée dans chaque compte
+    au-delà du premier, purgée au début et à la fin.
+- Mesure du code 3 de `sshvault login` sous pty (1 essai sur 4, 2026-10-13) : test
+  d'intégration opt-in `SSHVAULT_IT_LOGIN_REPEAT=N` (N `login` puis `logout`, au moins 7 s
+  entre deux essais, HOME temporaire, 1er compte ; rapport : rc, durée et invites de chaque
+  essai, sortie et fin du terminal de chaque échec, masquées, décompte par code ; échec si un
+  essai rend autre chose que 0 ; `logout` en échec entre deux essais : anomalie comptée, `bw
+  logout` à la main, dont l'échec arrête la série). Aucun correctif avant la mesure.
+  Mesuré (2026-10-14, N = 20 : 12 à 0, puis 6 sur 8 à 3) : limite de débit des connexions de
+  Vaultwarden (« Rate limit exceeded. Try again later. »). Les logins de l'intégration
+  (`sshvault login` sous pty, `bw login` du peuplement) attendent 60 s et réessaient, 3 fois
+  au plus (dit dans le rapport) ; le test de répétition reste une mesure brute.
+- `sshvault login` refusé par bw (toujours non connecté, code 3) : le message nomme les causes
+  possibles (« mot de passe refusé, limite de débit du serveur — réessayer dans une minute —
+  ou réseau »).
+- Tests : matrice de la story dans `tests/test_sshconfig.py` (jokers et lignes mixtes plus
+  bas, dans un bloc, en tête ; exact dans un bloc ; `ssh-config` et `--check` ; `uninstall`
+  après `install`), `tests/test_agent.py` (`load` qui attend `ensure.lock` ; clé chargée,
+  agent verrouillé, compte changé ou `bw status` en erreur pendant l'attente ; attente bornée
+  ou non ; magasin de session en panne ; `strace` : `ensure.lock` seule écriture ajoutée) et
+  `tests/test_it_accounts.py` (fichier des comptes, sans réseau ni vrai fichier).
+
 ## sshvault 0.11.0 — Révocation au verrouillage, désinstallation du ssh_config, robustesse de logout — 2026-10-13
 
 - `sshvault lock --unload` : révoque aussitôt les clés chargées. Sous `ensure.lock`, compte
