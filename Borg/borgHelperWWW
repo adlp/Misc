@@ -73,12 +73,13 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
                          _group_pids, _group_alive, _group_wait,   # 1.31.2 : communs à borgHelper (zombies exclus, /proc illisible)
                          RK_CLOSED, RK_ABSENT, RK_ALIVE, RK_ORPHAN, RK_BADEND, RK_NOTCLOSED,   # 1.31.8 : états de BkpReconcile
                          RK_DBERR, RK_UNVERIFIED, RK_UNCHECKABLE, RK_NOPASS,   # 1.31.15 : passphrase absente (story 77)
-                         _ORPHAN_TXT)   # 1.31.14 : mention d'un borg create orphelin (_never_cache), source unique dans borgHelper
+                         _ORPHAN_TXT,   # 1.31.14 : mention d'un borg create orphelin (_never_cache), source unique dans borgHelper
+                         _MIGR_PENDING_TXT)   # 1.31.16 : mesures d'avant 1.0.139 pas encore migrées (_never_cache), borgHelper 1.0.201
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.31.15"
+WWW_VERSION="1.31.16"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -1477,10 +1478,14 @@ def _never_cache(result: CommandResult) -> bool:
     verrou du dépôt n'est pas dans le lock.roster, l'empreinte ne change pas s'il meurt sans avoir pris le verrou
     (BORG_LOCK_WAIT dépassé) — « encore actif », code 1, était resservi jusqu'à 5 min. Effet réel dans run_borghelper
     (_RESPONSE_CACHE, codes 0 et 1) ; les caches par périmètre ne gardent que le code 0 de commandes qui n'impriment jamais ce
-    texte. Texte = _ORPHAN_TXT, importé de borgHelper (aux 5 sites qui l'impriment)."""
+    texte. Texte = _ORPHAN_TXT, importé de borgHelper (aux 5 sites qui l'impriment).
+    1.31.16 (story 79, borgHelper 1.0.201) : « [WARN] <base>: mesures d'avant 1.0.139 pas encore migrées (<base> occupée) — … »
+    (stderr) : réponse d'un lecteur rendue SANS les mesures d'une diff.db d'avant 1.0.139 qu'il n'a pas pu migrer (base occupée) ;
+    en cache, elle serait resservie sans nouvel essai de migration (l'empreinte ne bouge pas tant que rien n'est écrit). Texte =
+    _MIGR_PENDING_TXT, importé de borgHelper."""
     text=f"{result.stdout or ''}\n{result.stderr or ''}"
     return (_is_db_key_error(result) or '[ERREUR]' in (result.stderr or '') or 'SQLite error' in text
-            or _ORPHAN_TXT in text)
+            or _ORPHAN_TXT in text or _MIGR_PENDING_TXT in text)
 
 def _cache_db_paths(nick: Optional[str]):
     nicks=[n.strip() for n in nick.split(',')] if (nick and nick!='ALL') else \
@@ -5401,7 +5406,9 @@ def push_selftest():
                     _nick_stop_msg) ou une erreur SQLite avalée (« SQLite error », stdout -j) jamais mise en cache — _RESPONSE_CACHE
                     (deux appels, deux exécutions) et cache par périmètre (mono et multi : aucune ligne écrite) ; sans marqueur : en cache.
                     1.31.14 (revue story 76) : texte d'un borg create orphelin (_ORPHAN_TXT importé) — _RESPONSE_CACHE jamais (code 1 du
-                    nick, code 0 du voisin, stderr seul) ; caches par périmètre : prédicat partagé vérifié sur la forme code 0."""
+                    nick, code 0 du voisin, stderr seul) ; caches par périmètre : prédicat partagé vérifié sur la forme code 0.
+                    1.31.16 (story 79) : [WARN] « mesures d'avant 1.0.139 pas encore migrées » (_MIGR_PENDING_TXT importé, code 0,
+                    stderr) — _RESPONSE_CACHE jamais (deux appels, deux exécutions), caches par périmètre : aucune ligne écrite."""
                     # 1.31.0 (revue story 41) : formes réelles de borgHelper 1.0.178 — code 1, [ERREUR] sur stderr (-j compris) ;
                     # sqle0 : forme d'avant 1.0.178 (code 0, erreur dans le JSON seul), gardée pour un borgHelper plus ancien
                     busy=CommandResult(exitcode=1,stdout=json.dumps({'qa':['a'],'qz':{'error':'DB occupée'}}),
@@ -5417,6 +5424,10 @@ def push_selftest():
                                        stderr=f'  qz : Bkp interrompu (borgHelper arrêté), {_ORPHAN_TXT} depuis 16:27 (0h00min) — rapport tiré de la base, borg non interrogé')
                     orphv=CommandResult(exitcode=0,stdout=f'| qa | … | — ⏳ Bkp de qz interrompu, {_ORPHAN_TXT} sur le dépôt depuis 16:27 (0h00min) |',stderr='')
                     orphe=CommandResult(exitcode=0,stdout='| qz | … |',stderr=f'  qz : Bkp interrompu (borgHelper arrêté), {_ORPHAN_TXT} depuis 16:27 (0h00min)')
+                    # 1.31.16 (story 79) : lecteur sans les mesures d'avant 1.0.139 (migration sautée, base occupée) — forme réelle de
+                    # borgHelper 1.0.201, construite sur la constante importée
+                    migr=CommandResult(exitcode=0,stdout='| qz | … |',
+                                       stderr=f"[WARN] qz: {_MIGR_PENDING_TXT} (history.db occupée) — réponse sans elles, migration à la prochaine ouverture  [borgHelper v1.0.201]")
                     def twice(r):
                         for k in [k for k in _RESPONSE_CACHE if k and k[0]=='selftest-nickerr']: _RESPONSE_CACHE.pop(k,None)
                         with mock.patch(f"{__name__}._exec_borghelper",return_value=r) as ex:
@@ -5435,11 +5446,14 @@ def push_selftest():
                         # qu'aucune de leurs commandes n'imprime ce texte — l'effet réel est dans run_borghelper (codes 0/1)
                         n0=len(puts); _scoped_cached_mono('idxtop','qz',None,'',{},run(orphv))
                         _scoped_cached_multi('search','qa,qz',['qa','qz'],{'qa':None,'qz':None},{},{},run(orphv)); m_orph=len(puts)-n0
+                        n1=len(puts); _scoped_cached_mono('idxtop','qz',None,'',{},run(migr))
+                        _scoped_cached_multi('search','qa,qz',['qa','qz'],{'qa':None,'qz':None},{},{},run(migr)); m_migr=len(puts)-n1
                     got=(twice(busy),twice(sqle),twice(clean),m_busy,x_busy,x_sql,m_clean,twice(sqle0),
-                         twice(orph),twice(orphv),twice(orphe),m_orph)   # 1.31.14 : orphelin jamais en cache, trois sites
-                    if got!=(2,2,1,0,0,0,1,2,2,2,2,0): print(f"  {got}")
-                    return got==(2,2,1,0,0,0,1,2,2,2,2,0)
-                check("cache des réponses : arrêt d'un nick ([ERREUR]) ou erreur SQLite en code 0 jamais en cache, trois sites (A67) ; borg create orphelin (1.31.14) jamais dans _RESPONSE_CACHE",_cache_nick_error)
+                         twice(orph),twice(orphv),twice(orphe),m_orph,   # 1.31.14 : orphelin jamais en cache, trois sites
+                         twice(migr),m_migr)   # 1.31.16 : mesures d'avant 1.0.139 non migrées jamais en cache, trois sites
+                    if got!=(2,2,1,0,0,0,1,2,2,2,2,0,2,0): print(f"  {got}")
+                    return got==(2,2,1,0,0,0,1,2,2,2,2,0,2,0)
+                check("cache des réponses : arrêt d'un nick ([ERREUR]) ou erreur SQLite en code 0 jamais en cache, trois sites (A67) ; borg create orphelin (1.31.14) jamais dans _RESPONSE_CACHE ; mesures d'avant 1.0.139 non migrées (1.31.16) jamais en cache",_cache_nick_error)
                 def _cache_index_empty_wal():
                     """1.31.1 (story 42, A89 + revue) : « Index vide » ([WARN], code 0 depuis borgHelper 1.0.179) est mis en cache comme
                     toute réponse saine ; l'empreinte des bases suit aussi leur journal -wal (apparu, grossi, disparu) — un Index écrit
@@ -5787,7 +5801,10 @@ def push_selftest():
                                 "signal.signal(signal.SIGTERM,lambda *a: sys.exit(143))\n"
                                 "sys.stdout.buffer.write(b'x'*600000); sys.stdout.flush(); time.sleep(20)\n")
                     os.chmod(fbc+'.tmp',0o700); os.replace(fbc+'.tmp',fbc)
-                    def alive(pid): return os.path.exists(f'/proc/{pid}') and open(f'/proc/{pid}/stat').read().split(')')[-1].split()[0]!='Z'
+                    def alive(pid):   # 1.31.16 (story 79) : récolté entre open et read -> ESRCH (ProcessLookupError, mesuré) = mort
+                        try:
+                            with open(f'/proc/{pid}/stat') as f: return f.read().split(')')[-1].split()[0]!='Z'
+                        except OSError: return False
                     held=[]; real_stream=_borg_stream
                     def holding(*a,**k):
                         b=real_stream(*a,**k); held.append(b); return b
@@ -6093,7 +6110,10 @@ def push_selftest():
                             out+=c; k+=1
                             if n and k==n and pause: await asyncio.sleep(pause)
                         return out
-                    def alive(pid): return os.path.exists(f'/proc/{pid}') and open(f'/proc/{pid}/stat').read().split(')')[-1].split()[0]!='Z'
+                    def alive(pid):   # 1.31.16 (story 79) : récolté entre open et read -> ESRCH (ProcessLookupError, mesuré) = mort
+                        try:
+                            with open(f'/proc/{pid}/stat') as f: return f.read().split(')')[-1].split()[0]!='Z'
+                        except OSError: return False
                     def wait_empty(t=15):
                         t0=time.monotonic()
                         while _LIVE_BORG and time.monotonic()-t0<t: time.sleep(0.1)

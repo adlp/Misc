@@ -228,7 +228,20 @@ Utilisée par `Report -o` pour produire un rapport complet sans aucun appel borg
 Agrégat des fichiers filtrés par `IDX_INCLUDE`/`IDX_EXCLUDE` lors de l'indexation des diffs, et des entrées retirées par `IdxPurge` (1.0.154, ajoutées aux lignes existantes).  
 Une ligne par (nick, archive_old, archive_new, change_type) : `file_count` + `total_size`.  
 Peuplée par `Index` et `Bkp` (taille non disponible pour `Bkp` car `--list` ne retourne pas les tailles).  
-Permet de savoir combien de fichiers ont été intentionnellement exclus de l'index et quelle taille ils représentent.
+Permet de savoir combien de fichiers ont été intentionnellement exclus de l'index et quelle taille ils représentent.  
+Écrits dans la transaction de leur paire et seulement si cette écriture a créé la paire (`INSERT OR IGNORE`, `rowcount==1`) :
+Index (`_index_diffs` ; 1.0.201 : avant, réécrits même pour une paire déjà là) et DiffBkp (1.0.201 : `store_diff_entries(…,
+exclu=…)` ; avant, `store_excluded_diff_stats` à part, même après un échec de la paire), et retirés avec elle
+(purges forcées, `DIFF_KEEP`, rapprochement). Exclus
+**orphelins** (1.0.201, story 79, D199) : la purge `DIFF_KEEP` d'avant 1.0.140 oubliait les exclus de la paire retirée ; les
+lecteurs (Report, ArchiveHistory, `_diff_stats_for_nick`, IdxTop — total « Exclus » et « Inchangés par archive ») les
+agrègent sans jointure sur `diff_indexed_pairs` -> comptage partiel au lieu de `null` ; DiffTop lit les exclus de la paire
+demandée (`-b <paire purgée>` : ses exclus orphelins affichés). Corrigés au prochain Index. `_drop_orphan_exclusions(nick, db_path)`, appelée par `_index_pass` juste après
+`_reconcile_archives` (toutes les natures, NOIDX compris ; base servie) : `SELECT 1 … NOT EXISTS (paire) LIMIT 1` (lecture
+bornée par cette petite table, aucune écriture s'il n'y a rien), sinon `BEGIN IMMEDIATE`, `DELETE` de ces lignes (relues sous
+verrou) ; connexion ouverte avec `timeout=_READER_WRITE_WAIT` (2 s au plus, ouverture comprise) et `create_file=False` (base
+disparue entre-temps : 0, muet, jamais recréée — règle de la story 78). Erreur (`_RECONCILE_ERRORS`) : `[WARN]`, nouvel essai au prochain Index, jamais l'échec de l'Index.
+Lecteurs inchangés : jamais de retrait hors Index.
 
 #### `snap_excluded_stats`
 Agrégat des fichiers filtrés lors de l'indexation du snapshot de la dernière archive.  
@@ -482,6 +495,47 @@ avertissement « base non chiffrée »). `DbStatus` l'affiche `plain (aucun chem
   refuser la version, et Bkp avale ce refus) : lignes recopiées (`repo_stats` sans imposer d'id), puis retirées. Base
   `migrating` (DbEncrypt/DbDecrypt en cours) : rien. Mesures par archive reprises seulement pour les lignes dont C/E
   n'est pas `NULL` (seule preuve d'un Bkp, ≥ 1.0.117) ; `archive_stats.deduplicated_size` reste dans `diff.db`.
+  `bkp_status` (1.0.201, story 79, D207, revues 2 et 4), à **chaque** copie (première migration, recopie après `done` ou
+  trace du retrait) : `start_notified_at` NULL copié = `started_at` pour les lignes **finies** (`finished_at` non NULL) — un
+  Bkp fini ne donne jamais de « début » ; ligne non finie : NULL gardé (Bkp peut-être encore en cours sous un binaire
+  d'avant, début à notifier). Sans cela, une base touchée par l'ancien palier 7 (colonne ajoutée, lignes NULL) donnait au
+  watcher une rafale de « débuts » pour d'anciens Bkp. Valeur déjà posée : copiée telle quelle. Couvert : une `diff.db`
+  touchée pas encore migrée ; non couvert : une base déjà migrée (les NULL sont déjà dans `history.db`, jamais réécrits).
+  Divergence connue (reportée) : le remplissage du palier 7 (colonne ajoutée) marque TOUTES les lignes déjà notifiées, Bkp encore en cours compris, alors que la copie vers `history.db` garde NULL pour une ligne non finie.
+  Migration lancée par un **lecteur** (1.0.201, story 79, D206 ; `ensure_diff_db(create=False)` avec la sonde des
+  lecteurs, `_migrate_to_history(…, reader=True)`) : `history.db` attendue `_READER_WRITE_WAIT` (2 s) au plus à chaque
+  ouverture — schéma (`ensure_history_db(…, reader=True)` : occupée -> `OperationalError` levée, jamais `_db_schema_fail`),
+  copie (`BEGIN IMMEDIATE`) et étape `done` ; occupée : `ROLLBACK` des deux bases, l'erreur remonte à `ensure_diff_db` ->
+  `_reader_busy_skip` (`diff.db` lue telle quelle, `_reader_skipped` : pas de nouvel essai ni de nouvel avertissement pendant
+  60 s dans ce processus), migration à une ouverture suivante. Avant : 60 s puis « DB occupée » (`sys.exit`, Report en code
+  2). « Migration des mesures vers … » n'est affiché qu'après le `COMMIT` de la copie. Écrivains (`create=True` ;
+  `history_path(writer=True)` : `create=False` mais sonde 60 s) : inchangés (60 s).
+  Avertissement (décision A de l'utilisateur ; `_reader_migration_warn`, revue) : un lecteur qui abandonne sur une base
+  occupée — `history.db` (schéma, copie) ou `diff.db` (palier d'ajout de colonnes, `BEGIN IMMEDIATE` de la migration) —
+  alors que des mesures attendent leur migration (`_hist_pending`, base d'un schéma pas plus récent) écrit sur stderr
+  « `[WARN] <base>: mesures d'avant 1.0.139 pas encore migrées (<history.db|diff.db> occupée) — réponse sans elles, migration à
+  la prochaine ouverture` » (texte `_MIGR_PENDING_TXT`, importé par borgHelperWWW : `_never_cache`). `<base>` : nom tiré du
+  fichier `<conf>-<base>-diff.db` — le nick, ou `DB_NAME` pour une base partagée. Rien en attente (base récente, réparation
+  du marqueur) ou schéma plus récent que le code : muet. Code de sortie inchangé. Lecteur seulement (même prédicat que
+  `reader=`) : `history_path(writer=True)` (Bkp, Prune), qui ouvre aussi `diff.db` en `create=False` (2 s, inchangé), reste
+  muet comme avant.
+  Marqueur resté à `copied` (étape `done` en échec, ou processus tué après le retrait) : `diff.db` n'a plus rien à migrer
+  mais n'a jamais été tamponnée (version < 10) -> `copied` passé à `done` (1.0.201, revue story 79), par la même fonction que
+  l'étape `done` (`_mark_done`) : `history.db` ouverte sans création (disparue : rien) ; lecteur et base occupée : rien,
+  erreur levée (`diff.db` non tamponnée : nouvel essai à l'ouverture suivante, muet) ; autre erreur : `_db_schema_fail` sur
+  `history.db` (« DB corrompue », données NON régénérables), comme la copie — sauf réparation par un lecteur (revue 4) :
+  sautée en silence, trace gardée (réparation cosmétique ; l'accès réel du lecteur à `history.db` dira le problème). Gardes
+  d'abord (revue 4) : `diff.db` d'un schéma plus récent que le code (lu sans coût) ou `migrating` (en-tête lu seulement s'il y
+  a quelque chose à réparer ou à migrer) : jamais touchée, réparation comprise. Seul ce cas lit `history.db` quand rien n'est à
+  migrer : base récente (version >= 10) ou neuve (sans version) : aucune ouverture. `history.db` sans `db_meta` (fichier de 0
+  octet) : rien à réparer, muet.
+  Trace du retrait (revue 3 story 79) : clé `hist_tables_dropped` (`_HIST_DROPPED_KEY`) écrite dans `db_meta` de `diff.db`
+  dans la transaction même du `DROP`, effacée (validée aussitôt) une fois `done` posé — elle ne vit qu'entre le retrait et
+  `done`. Marqueur `copied` + trace : retrait fait, `done` jamais posé ; des tables présentes ont été recréées depuis par un
+  binaire d'avant -> recopiées comme après `done` (`repo_stats` sans id imposé, le reste en `INSERT OR IGNORE`). Avant :
+  copie sautée (« déjà copiée ») puis `DROP` — lignes de l'ancien binaire perdues. `copied` sans trace (tué avant le
+  retrait) : rien recopié, aucun doublon. Sans rien à migrer, la trace déclenche aussi la réparation de `copied` (comme une
+  version < 10), puis est effacée.
 - **Version** : `DIFF_DB_SCHEMA_VERSION` et `DIFF_DB_BASE_SCHEMA_VERSION` passent à 10 (aussi pour les bases en
   clair) : un binaire d'avant refuse une `diff.db` migrée dès qu'il passe par `ensure_diff_db` (Bkp, Index, Report…) ;
   ses lectures directes (`RepoHistory`) répondent « no such table » sans rien écrire. Retour arrière : restaurer une
@@ -1881,7 +1935,8 @@ silence : mesuré au palier 10 (un palier de retard), lue sans erreur ; une base
 requêtes de ce nick (ligne en erreur du Report). Seul contrôle gardé : schéma plus récent que
 le code -> `SchemaVersionError`. La base est notée dans `_reader_skipped` pour `_READER_SKIP_TTL` (60 s) : pas de
 nouvelle attente à chaque ouverture du même processus (borgHelperWWW, qui vit longtemps, réessaie ensuite). Base libre :
-le lecteur migre et tamponne comme avant ; écrivains (`create=True`) inchangés (60 s). `report_offline`/`report`
+le lecteur migre et tamponne comme avant ; écrivains (`create=True`) inchangés (60 s). 1.0.201 (story 79, D206) : même
+règle pour `history.db` pendant la migration d'une base d'avant 1.0.139 (voir « Migration automatique »). `report_offline`/`report`
 isolent en plus tout `SystemExit` d'un nick (base illisible : ligne `*** nick ⚠ <message réel>`, code 2 — 1.0.168 :
 `_stop_text`, dernière ligne `[ERREUR]` affichée depuis l'appel et son détail indenté, comme les lecteurs ;
 Report direct : verrou `report-running` du nick retiré aussitôt), sauf Ctrl-C (`boex` -> `sys.exit(130)`) qui arrête
@@ -1985,8 +2040,10 @@ mtimes stables, mesuré). Cache par périmètre : `_capture_fingerprints(nick, '
 (stdout/stderr), et (1.31.14, revue story 76) `_ORPHAN_TXT` « borg create encore actif » importé de borgHelper (toute
 réponse qui le contient, Status compris : un create orphelin avant le verrou n'est pas dans le `lock.roster`, sa mort sans
 verrou ne change pas l'empreinte ; effet réel dans `run_borghelper`, codes 0/1 — les caches par périmètre ne gardent que le
-code 0 de commandes qui ne l'impriment pas) — seul prédicat des trois écritures (`run_borghelper`, `_scoped_cached_mono`,
-`_scoped_cached_multi`) ;
+code 0 de commandes qui ne l'impriment pas), et (1.31.16, story 79) `_MIGR_PENDING_TXT` « mesures d'avant 1.0.139 pas
+encore migrées » importé de borgHelper 1.0.201 (réponse d'un lecteur rendue sans les mesures d'une `diff.db` d'avant
+1.0.139 qu'il n'a pas pu migrer, base occupée : rien écrit, l'empreinte ne bouge pas — en cache, resservie sans nouvel essai)
+— seul prédicat des trois écritures (`run_borghelper`, `_scoped_cached_mono`, `_scoped_cached_multi`) ;
 1.31.3 (story 56, A113) : pour `report`, `_external_fingerprint` ajoute `|bkp:` + `_bkp_markers_state()` (TOUS les marqueurs
 `<prefix>-*-bkp.lock.*` de `CACHE_DIR` triés — 1.31.12 (story 74) : traces `<marqueur>.sans-suivi` comprises (`_MARKER_RE`),
 sinon « en attente de l'Index » restait en cache jusqu'à 5 min après leur apparition —, « nom:`_lock_holder` » — lecture
@@ -2861,11 +2918,19 @@ sans risque même après une migration partielle ou un `schema_version` désynch
 | 3 | `snapshot_file.mode` | colonne `mode` absente sur `snapshot_file` | `ALTER TABLE snapshot_file ADD COLUMN mode TEXT` — droits unix ls-style (`{mode}` de `borg list`), colonne « droits » de `TreeHist` |
 | 4 | `snapshot_file.owner` | colonne `owner` absente sur `snapshot_file` | `ALTER TABLE snapshot_file ADD COLUMN owner TEXT` — `{user}:{group} ({uid}:{gid})` de `borg list`, colonne « propriétaire » de `TreeHist` |
 | 6 | `repo_stats` historique | colonne `op` absente sur `repo_stats` | `_migrate_repo_stats()` : ligne unique par nick (`INSERT OR REPLACE`) → historique append-only (`id` AUTOINCREMENT, `op`) — la ligne existante devient la première ligne `op='bkp'`, aucune valeur perdue |
-| 7 | `bkp_status.start_notified_at` | colonne absente | `ALTER TABLE ADD COLUMN` + backfill (lignes existantes marquées déjà notifiées) |
+| 7 | `bkp_status.start_notified_at` | colonne absente | `ALTER TABLE ADD COLUMN` + backfill (lignes existantes marquées déjà notifiées) ; 1.0.201 (story 79, D207) : les deux dans UNE transaction (`_add_columns_locked`, voir sous le tableau ; avant : ALTER en autocommit, verrou perdu avant le backfill -> lignes NULL). Le backfill marque toutes les lignes, Bkp en cours compris — divergence avec la copie vers `history.db` (non finie : NULL gardée), reportée |
 | 9 | `bkp_status.changed_during_backup` / `read_errors` (1.0.118) | colonnes absentes | `ALTER TABLE ADD COLUMN` — écrites par `store_bkp_status_finish`, relues par `list_pending_bkp_status` : le watcher de borgHelperWWW les joint au payload de la notification de fin (`_send_bkp_push(..., warnings)`) ; NULL (Bkp antérieur) = omis du payload |
 | 8 | `archive_stats.changed_during_backup` / `read_errors` (1.0.117) | colonnes absentes | `ALTER TABLE ADD COLUMN` — NULL = inconnu (archives antérieures, ou rattrapées par Index : ces statuts ne sont connus qu'au Bkp). *Depuis 1.0.139 : colonnes retirées (palier 10), mesures dans `history.db` `archive_measure` ; `store_archive_stats` ne porte plus C/E* |
 | 10 | mesures → `history.db` (1.0.139) | tables `repo_stats`/`bkp_status` ou C/E non NULL présentes dans `diff.db` | `_migrate_to_history` (voir « Base de données `history.db` ») ; version de schéma **et** version de base à 10 |
 | 11 | `snapshot_file` par version (1.0.164, story 27) | index unique sur `snapshot_file` (`PRAGMA index_list`) | `_migrate_snapshot_versions()` : reconstruction sans `UNIQUE(nick, path)` en une transaction, SQL seul (base chiffrée : chemins copiés tels quels, sans passphrase) ; ids, liens `archive_snapshot` et compteur `AUTOINCREMENT` gardés ; vue `archive_snapshot_v` retirée puis recréée (`ALTER TABLE … RENAME` refuse une vue qui cite la table supprimée, mesuré sur SQLite 3.37.2). Les lignes existantes restent partagées : le passé n'est pas reconstitué, seuls les snapshots suivants ont leurs versions. Version de schéma et de base à 11 : un binaire plus ancien refuse la base (`SchemaVersionError`), régénérable. Palier 2 adapté : une version par (chemin, taille, mtime) de l'ancienne table |
+
+Paliers d'ajout de colonnes (2-4 `snapshot_file`, 7 et 9 `bkp_status`) — 1.0.201 (story 79, revue) : une seule étape,
+`_add_columns_locked(conn, table, cols, fill=None)`, appelée seulement si la lecture sans verrou voit une colonne manquante :
+`BEGIN IMMEDIATE`, table et colonnes relues sous verrou ; table présente et colonne absente -> `ALTER TABLE … ADD COLUMN`
+puis son remplissage `fill[col]` dans la même transaction ; sinon rien. Avant : `ALTER` en autocommit sur l'état lu sans
+verrou — un second ouvreur recevait « duplicate column name » (colonne ajoutée entre-temps) ou « no such table »
+(`bkp_status` retirée par une migration vers `history.db` finie entre-temps), présentés comme « DB corrompue … Supprimez »
+(code 1). Verrou non obtenu : transaction annulée, erreur levée (lecteur : `_reader_busy_skip` ; écrivain : « DB occupée »).
 
 `ensure_diff_db()` est désormais garanti appelé (donc les migrations garanties appliquées) avant tout
 accès à `diff.db`/`cache.db` depuis **Bkp**, **Index**, **Prune** et tous les autres consommateurs —

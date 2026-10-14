@@ -599,7 +599,13 @@ sans message, après 2 s d'attente au plus par base (Report direct : `diff.db` e
 une base illisible ne donne qu'une ligne `*** nick ⚠ <message réel>` (`*** ERREUR nick` en direct ; code 2 ; 1.0.168 : par exemple
 `⚠ DB corrompue : …/rc-nick-diff.db -> database disk image is malformed …`, avant `⚠ base illisible (voir message)`),
 en direct comme hors ligne — les autres dépôts s'affichent toujours (liste des machines de borgHelperWWW comprise). Même attente bornée pour
-`Status`.
+`Status`. 1.0.201 : même attente pour `history.db` quand un lecteur migre une `diff.db` d'avant 1.0.139 — `history.db`
+(ou `diff.db`) tenue par un autre processus : 2 s au plus, base lue telle quelle (sans les mesures d'avant 1.0.139), une
+ligne sur stderr « `[WARN] <base>: mesures d'avant 1.0.139 pas encore migrées (history.db occupée) — réponse sans elles,
+migration à la prochaine ouverture` » (`diff.db occupée` selon la base ; `<base>` = nom de la base : le nick, ou `DB_NAME` pour
+une base partagée), code de sortie inchangé ; migration à un appel suivant (avant : 60 s puis « [ERREUR] DB occupée :
+…-history.db », code 2). Index, Bkp et Prune : inchangés (60 s ; muets). borgHelperWWW 1.31.16 relaie cette ligne (stderr) et ne met jamais
+une telle réponse en cache.
 
 En texte seulement (ni `-j` ni `-l`), en ligne de commande, une ligne finale signale les restes à nettoyer sur la
 machine (1.0.160) : « Nettoyage possible : N entrée(s) borg de dépôts disparus (taille), … — aperçu : borgHelper -c
@@ -928,6 +934,13 @@ borgHelper -c Status -n mon-serveur                   # « Reconstruction (fant�
 
 **`DIFF_KEEP`** (corrigé en 1.0.141, pour tout Index) : seules les N paires les plus récentes sont calculées et gardées.
 Avant, chaque Index recalculait les paires purgées au précédent, et la paire gardée changeait d'un Index à l'autre.
+Avant 1.0.140, cette purge laissait les exclus (`diff_excluded_stats`) de la paire retirée : Report, ArchiveHistory et IdxTop
+(qui somment les exclus du nick sans regarder les paires) en tiraient des comptages partiels (`files_added: 7` au lieu de
+`null`, « Exclus » d'IdxTop gonflés, archive listée dans « Inchangés par archive »), et `DiffTop -b <paire purgée>` affichait ses
+exclus. Depuis 1.0.201, l'Index retire ces exclus orphelins : les comptages sont corrigés au prochain Index (les commandes de
+lecture, elles, ne retirent rien). Lecture seule s'il n'y en a pas ; base occupée, illisible ou chiffrée sans clé :
+`[WARN] <nick>: exclus orphelins (paires purgées avant 1.0.140) non retirés (…) — nouvel essai au prochain Index`, l'Index
+continue.
 
 Types d'événements : `added`, `removed`, `modified`, `C` (permissions), `B` (lien cassé), `T` (type changé).
 
@@ -2483,7 +2496,9 @@ différentes pour le même appel ne partagent jamais une entrée) ; sans passphr
 Un résultat d'erreur de clé/mode de base n'est jamais mis en cache : rejoué à chaque appel plutôt que
 servi comme une réponse obsolète. 1.31.14 : toute réponse qui contient « borg create encore actif » (Report, Report -o,
 voisin, Status) non plus — un create orphelin qui meurt avant d'avoir pris le verrou du dépôt ne change pas l'empreinte
-(`lock.roster` inchangé) : « encore actif », code 1, était resservi jusqu'à 5 min.
+(`lock.roster` inchangé) : « encore actif », code 1, était resservi jusqu'à 5 min. 1.31.16 (borgHelper 1.0.201) : réponse
+d'un lecteur qui porte « mesures d'avant 1.0.139 pas encore migrées » (base occupée, rendue sans ces mesures) non plus —
+elle serait resservie sans nouvel essai de migration.
 
 | Méthode | Route | Commande CLI | Cache |
 |---------|-------|--------------|:---:|

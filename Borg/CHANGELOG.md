@@ -1,5 +1,77 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.201, borgHelperWWW 1.31.16 — Anciennes bases : migration vers history.db d'un lecteur, paliers de colonnes, exclus orphelins — 2026-10-14
+
+Chantier « reconstruction progressive », story 79 (reports D206, D207, D199 de la puce « Robustesse, cas rares » du tri A46 ;
+décision A de l'utilisateur : avertissement du lecteur qui n'a pas migré). Ne concerne que des bases d'avant 1.0.139 (D206,
+D207) ou d'avant 1.0.140 (D199) ; bases récentes : comportement inchangé.
+
+- Migration vers `history.db` lancée par un LECTEUR (D206) : `ensure_diff_db(create=False)` avec la sonde des lecteurs (Report,
+  ArchiveHistory, Status, borgHelperWWW…) ouvre `history.db` avec l'attente des lecteurs (`_READER_WRITE_WAIT`, 2 s) à chaque
+  ouverture — schéma (`ensure_history_db(…, reader=True)`), copie (`BEGIN IMMEDIATE`) et étape finale `done`. Occupée :
+  migration abandonnée (rien écrit, transactions annulées), `diff.db` lue telle quelle (`_reader_busy_skip`), migration à une
+  ouverture suivante. Avant : 60 s d'attente puis « [ERREUR] DB occupée : …-history.db », sortie en code 2 (mesuré : `Report
+  -o`, 60,6 s ; après : 2,5 s, aucune `[ERREUR]` de base, migration faite à l'appel suivant). « Migration des mesures vers … »
+  n'est plus affiché qu'après la copie validée. Écrivains (Index, Bkp ; `history_path` d'un écrivain, sonde 60 s) : inchangés
+  (60 s, puis « DB occupée »).
+- Avertissement (décision A) : un lecteur qui abandonne sur une base occupée — `history.db` (schéma, copie) ou `diff.db`
+  (paliers, migration) — alors que des mesures d'avant 1.0.139 attendent leur migration écrit sur stderr « [WARN] <base>:
+  mesures d'avant 1.0.139 pas encore migrées (<history.db|diff.db> occupée) — réponse sans elles, migration à la prochaine
+  ouverture » (`<base>` : nom de la base, le nick ou `DB_NAME` pour une base partagée ; code de sortie inchangé). Rien en
+  attente, ou schéma plus récent que le code : muet comme avant. Lecteur seulement : `history_path` d'un écrivain (Bkp, Prune,
+  qui ouvre aussi `diff.db` sans la créer) reste muet comme avant.
+- Marqueur `migrated_from_diff` resté à `copied` (étape `done` en échec ou processus tué après le retrait des tables) : passé
+  à `done` à l'ouverture suivante — reconnu à une `diff.db` sans plus rien à migrer mais jamais tamponnée (version < 10) ;
+  aucune lecture de `history.db` pour une base récente. `history.db` jamais créée par cette réparation ; lecteur et
+  `history.db` occupée : rien (nouvel essai, muet) ; autre erreur : « DB corrompue » qui nomme `history.db` (données NON
+  régénérables), comme la copie — sauf pour un lecteur : réparation sautée en silence (son accès réel à `history.db` dira
+  le problème), trace gardée ; `history.db` sans `db_meta` (0 octet) : rien à réparer, muet. Base d'un schéma plus récent ou
+  `migrating` (DbEncrypt/DbDecrypt en cours) : jamais touchée, réparation comprise. Avant : `copied` pour
+  toujours, et une table recréée plus tard par un binaire d'avant aurait été retirée sans recopie.
+- Trace du retrait dans `diff.db` (`db_meta`, clé `hist_tables_dropped`, même transaction que le `DROP`, effacée une fois
+  `done` posé) : `copied` + trace = retrait déjà fait — des tables présentes ont été recréées par un binaire d'avant, leurs
+  lignes sont recopiées comme après `done`. Avant : copie sautée, lignes perdues au `DROP`. `copied` sans trace (processus
+  tué avant le retrait) : rien recopié, aucun doublon.
+- Paliers d'ajout de colonnes de `diff.db` (D207) : une seule étape, `_add_columns_locked` — transaction `BEGIN IMMEDIATE`,
+  table et colonnes RELUES sous verrou (table présente et colonne absente -> `ALTER TABLE … ADD COLUMN` et son remplissage
+  dans la même transaction ; sinon rien) — pour `bkp_status` (C/E, `start_notified_at`) et `snapshot_file`
+  (`type`/`mode`/`owner`). Avant : `ALTER` en autocommit sur un état lu sans verrou — `start_notified_at` ajoutée puis
+  remplie dans une autre transaction (verrou perdu avant le remplissage -> lignes NULL, copiées dans `history.db` : le
+  watcher de borgHelperWWW les prenait pour des « débuts » à notifier, rafale de notifications pour d'anciens Bkp) ; second
+  ouvreur : « duplicate column name » ou « no such table » (`bkp_status` retirée entre-temps par une migration finie)
+  présentés comme « DB corrompue … Supprimez », code 1.
+- Copie de `bkp_status` vers `history.db`, à CHAQUE copie (première migration, recopie après `done` ou trace du retrait) :
+  ligne FINIE (`finished_at` non NULL) dont `start_notified_at` est NULL copiée avec `started_at` — un Bkp fini ne donne
+  jamais de « début » à notifier ; ligne non finie : NULL gardé (Bkp peut-être encore en cours sous un binaire d'avant, début
+  à notifier). Valeur déjà posée : copiée telle quelle. Couvre une `diff.db` touchée par l'ancien palier et pas encore
+  migrée ; ne répare PAS une base déjà migrée (les NULL sont déjà dans `history.db`). Divergence connue (reportée) : le remplissage du palier 7 (colonne ajoutée) marque TOUTES les lignes déjà notifiées, Bkp encore en cours compris, alors que la copie vers `history.db` garde NULL pour une ligne non finie.
+- Exclus orphelins (D199) : la purge `DIFF_KEEP` d'avant 1.0.140 retirait `diff_index` et la paire (`diff_indexed_pairs`) mais
+  pas ses `diff_excluded_stats` ; Report et ArchiveHistory les agrègent sans jointure et donnaient un comptage partiel (mesuré :
+  `files_added: 7` au lieu de `null` pour l'archive) ; IdxTop les somme de même (« Exclus » gonflés, archive dans « Inchangés
+  par archive ») et `DiffTop -b <paire purgée>` affichait ses exclus. L'Index les retire désormais (`_drop_orphan_exclusions`, même passe que le
+  rapprochement des archives) : une lecture bornée par la petite table des exclus, écriture seulement s'il y en a ; base
+  occupée (2 s au plus, ouverture comprise), illisible ou chiffrée sans clé (disparue : rien, jamais recréée) : `[WARN] <nick>: exclus orphelins (paires
+  purgées avant 1.0.140) non retirés (…) — nouvel essai au prochain Index`, jamais l'échec de l'Index. Exclus d'une paire
+  indexée : jamais touchés ; lecteurs inchangés (aucun retrait hors Index).
+- Exclus écrits avec leur paire seulement si cette écriture a créé la paire : DiffBkp (`store_diff_entries(…, exclu=…)`, même
+  transaction ; avant : à part, même quand l'écriture de la paire avait échoué — exclus orphelins possibles) et Index (avant :
+  réécrits pour une paire déjà là, écrite par un DiffBkp concurrent).
+- borgHelperWWW 1.31.16 : `_never_cache` refuse aussi toute réponse qui contient « mesures d'avant 1.0.139 pas encore
+  migrées » (`_MIGR_PENDING_TXT`, importé de borgHelper) — rendue sans ces mesures, elle aurait été resservie sans nouvel essai
+  de migration (rien écrit : empreinte inchangée). La ligne est relayée telle quelle (stderr des réponses `CommandResult` :
+  `/report`, `/archivehistory`, `/repohistory`, `/search`, `/idxtop`… et l'UI qui l'affiche). Push selftest : cas ajouté au
+  contrôle du cache des réponses (134/134, Python 3.10 et 3.14). Push selftest : `alive()` des deux contrôles
+  « /download/* client parti » et « chien de garde » lisait `/proc/<pid>/stat` sans garde — processus récolté entre
+  l'ouverture et la lecture -> `ProcessLookupError` (ESRCH, mesuré sous 3.10 et 3.14), FAIL intermittent (1 run sur 3) ;
+  lecture en échec = processus mort.
+- CodecSelfTest : 18 contrôles « story 79 » (matrice de la story sur bases construites par `_hm_legacy`, puis revues :
+  `diff.db` tenue pendant le palier, second ouvreur, marqueur `copied` — tenu, corrompu, disparu, `history.db` de 0 octet —,
+  trace du retrait — tables, colonnes C/E seules —, réparation gardée — schéma plus récent, lecteur sur `history.db`
+  illisible —, règles de l'avertissement — stderr, base partagée, schéma plus récent, écrivain muet —, exclus de DiffBkp
+  et de l'Index, exclus orphelins — IdxTop et DiffTop corrigés, base illisible, chiffrée avec et sans clé, disparue, base
+  partagée `DB_NAME`) ; « tables recréées par un binaire d'avant » étendu : après `done`, ligne non finie recopiée avec
+  `start_notified_at` NULL (à notifier), ligne finie avec `started_at` (jamais un « début »).
+
 ## borgHelper 1.0.200 — Lecteurs et Prune : base supprimée, bases créées trop tôt, erreurs SQLite muettes — 2026-10-14
 
 Chantier « reconstruction progressive », story 78 (reports D116, D115, D137 ; décision de l'utilisateur Q1 = A pour D137,

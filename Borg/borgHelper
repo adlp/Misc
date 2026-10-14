@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.200"
+Version="1.0.201"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -1879,6 +1879,12 @@ def _db_open_fail(db_path,e):
 # nick (migration, réparation de vue, tampon de version) ; au-delà : base lue telle quelle, sans rien écrire. Les lectures
 # WAL n'attendent jamais : seul ce chemin d'écriture d'un lecteur bloquait (60 s puis sys.exit, Report -n ALL vide).
 _READER_WRITE_WAIT=2
+# 1.0.201 (story 79, décision A de l'utilisateur) : texte de l'avertissement d'un lecteur qui n'a pas pu migrer les mesures d'une
+# diff.db d'avant 1.0.139 (base occupée) — importé par borgHelperWWW (_never_cache : réponse sans ces mesures, jamais en cache)
+_MIGR_PENDING_TXT="mesures d'avant 1.0.139 pas encore migrées"
+# 1.0.201 (revue 3 story 79) : clé db_meta de diff.db — trace du retrait des tables mesurées (même transaction que le DROP),
+# effacée une fois history.db marquée 'done' : 'copied' + trace = retrait fait, tables présentes recréées depuis -> recopie
+_HIST_DROPPED_KEY='hist_tables_dropped'
 _READER_SKIP_TTL=60   # s : base trouvée occupée par un lecteur, lue telle quelle sans réessayer d'écrire pendant ce délai
 
 def _db_busy(e):
@@ -3097,7 +3103,7 @@ class BorgHelperDB:
         refuse une vue qui cite la table supprimée (mesuré, SQLite 3.37.2) — et recréée ensuite par la réparation de la vue
         d'ensure_diff_db (jamais ici : archive_snapshot peut être encore à l'ancien format, palier 2). Les lignes existantes
         restent partagées : le passé n'est pas reconstitué."""
-        if conn.in_transaction: conn.commit()   # ALTER … ADD COLUMN (paliers 2-4) juste avant
+        if conn.in_transaction: conn.commit()   # par prudence : les paliers 2-4 (_add_columns_locked, 1.0.201) valident déjà les leurs
         conn.execute("BEGIN IMMEDIATE")
         try:
             row=conn.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()
@@ -3168,6 +3174,30 @@ class BorgHelperDB:
             ALTER TABLE repo_stats_new RENAME TO repo_stats;
             CREATE INDEX IF NOT EXISTS idx_rstats_nick ON repo_stats(nick, id);
         """)
+
+    @staticmethod
+    def _add_columns_locked(conn,table,cols,fill=None):
+        """1.0.201 (story 79) : paliers d'ajout de colonnes (diff.db : snapshot_file type/mode/owner, bkp_status C/E et
+        start_notified_at). Une transaction BEGIN IMMEDIATE ; table et colonnes RELUES sous verrou : table présente et colonne
+        absente -> ALTER TABLE … ADD COLUMN, suivi de son remplissage `fill[col]` dans la même transaction ; sinon rien. Avant :
+        ALTER en autocommit sur un état lu sans verrou — un second ouvreur recevait « duplicate column name » (colonne ajoutée
+        entre-temps) ou « no such table » (bkp_status retirée par une migration vers history.db finie entre-temps), pris pour
+        une corruption (« DB corrompue … Supprimez », code 1). Erreur (verrou non obtenu) : transaction annulée, levée."""
+        if conn.in_transaction: conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            have={r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if have:
+                for col,typ in cols:
+                    if col in have: continue
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+                    if fill and col in fill: conn.execute(fill[col])
+            conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                try: conn.rollback()
+                except sqlite3.Error: pass
+            raise
 
     def ensure_diff_db(self,db_path,create=True,nick=None,probe_wait=_READER_WRITE_WAIT):
         """create=False (AD-12) : voir ensure_cache_db — même contrat, réservé aux lecteurs. Lecteur (1.0.166, story 29) :
@@ -3264,29 +3294,24 @@ class BorgHelperDB:
                 );
             """,new)
             sf_cols=[r[1] for r in conn.execute("PRAGMA table_info(snapshot_file)").fetchall()]
-            if 'type' not in sf_cols:
-                conn.execute("ALTER TABLE snapshot_file ADD COLUMN type TEXT")
-            if 'mode' not in sf_cols:
-                conn.execute("ALTER TABLE snapshot_file ADD COLUMN mode TEXT")
-            if 'owner' not in sf_cols:
-                conn.execute("ALTER TABLE snapshot_file ADD COLUMN owner TEXT")
+            if not {'type','mode','owner'}<=set(sf_cols):   # paliers 2-4 ; 1.0.201 (story 79) : relus sous verrou
+                self._add_columns_locked(conn,'snapshot_file',(('type','TEXT'),('mode','TEXT'),('owner','TEXT')))
             if any(r[2] for r in conn.execute("PRAGMA index_list(snapshot_file)").fetchall()):
                 self._migrate_snapshot_versions(conn)   # palier 11 (1.0.164) : UNIQUE(nick,path) encore là (relu sous verrou)
             # Paliers 7/9 (bkp_status) et 6 (repo_stats) : ne s'appliquent plus qu'à une base d'avant 1.0.139, pour
             # normaliser ses tables avant de les copier dans history.db (_migrate_to_history) — ces tables ne sont
             # plus créées dans diff.db.
             bkps_cols=[r[1] for r in conn.execute("PRAGMA table_info(bkp_status)").fetchall()]
-            for col in ('changed_during_backup','read_errors'):
-                if bkps_cols and col not in bkps_cols: conn.execute(f"ALTER TABLE bkp_status ADD COLUMN {col} INTEGER")
-            if bkps_cols and 'start_notified_at' not in bkps_cols:
-                conn.execute("ALTER TABLE bkp_status ADD COLUMN start_notified_at TEXT")
-                # Backfill obligatoire (revue de code) : sans lui, chaque ligne bkp_status déjà
-                # existante (créée par Story 1, avant cette colonne) se retrouve start_notified_at
-                # NULL -> le prochain passage watcher les traiterait TOUTES comme un "début" en
-                # attente et enverrait un push pour chaque sauvegarde historique jamais enregistrée.
-                # On les marque déjà notifiées (started_at comme sentinelle) : seules les lignes
-                # créées après cette migration (donc réellement nouvelles) restent éligibles.
-                conn.execute("UPDATE bkp_status SET start_notified_at=started_at WHERE start_notified_at IS NULL")
+            if bkps_cols and not {'changed_during_backup','read_errors','start_notified_at'}<=set(bkps_cols):
+                # Paliers 9 puis 7. 1.0.201 (story 79, D207) : start_notified_at ajoutée ET remplie dans la même transaction
+                # (avant : ALTER en autocommit, verrou perdu avant l'UPDATE -> lignes NULL, copiées telles quelles dans
+                # history.db : rafale de « débuts »). Backfill obligatoire (revue de code) : sans lui, chaque ligne bkp_status
+                # déjà existante (créée par Story 1, avant cette colonne) se retrouve start_notified_at NULL -> le prochain
+                # passage watcher les traiterait TOUTES comme un "début" en attente et enverrait un push pour chaque
+                # sauvegarde historique jamais enregistrée. On les marque déjà notifiées (started_at comme sentinelle) :
+                # seules les lignes créées après cette migration (donc réellement nouvelles) restent éligibles.
+                self._add_columns_locked(conn,'bkp_status',(('changed_during_backup','INTEGER'),('read_errors','INTEGER'),('start_notified_at','TEXT')),
+                    fill={'start_notified_at':"UPDATE bkp_status SET start_notified_at=started_at WHERE start_notified_at IS NULL"})
             cols=[r[1] for r in conn.execute("PRAGMA table_info(archive_snapshot)").fetchall()]
             if 'path' in cols:
                 self._migrate_archive_snapshot(conn)
@@ -3314,28 +3339,36 @@ class BorgHelperDB:
                 self._repair_archive_view(conn)
             conn.commit()
             if create and nick is not None and new is None: self._heal_empty_header(conn,db_path,nick,_MIGRATE_TABLES)
-            self._migrate_to_history(conn,db_path)   # 1.0.139 (AD-8) : AVANT _check_set_meta (version 10 = migrée)
+            # 1.0.201 (story 79, D206) : lecteur = create=False avec la sonde des lecteurs ; history_path(writer=True) (Bkp, Prune)
+            # passe probe_wait=60 : écrivain, migration inchangée
+            self._migrate_to_history(conn,db_path,reader=not create and probe_wait<=_READER_WRITE_WAIT)   # 1.0.139 (AD-8) : AVANT _check_set_meta (version 10 = migrée)
             self._check_set_meta(conn,DIFF_DB_SCHEMA_VERSION,db_path,DIFF_DB_BASE_SCHEMA_VERSION)
             conn.commit(); conn.close()
         except sqlite3.DatabaseError as e:
             if not create and _file_gone(db_path): _close_quiet(conn); return   # 1.0.200 (story 78, D116) : supprimée APRÈS l'ouverture -> absente, rien recréé ni dit
             if not create and conn is not None and _db_busy(e):
+                # 1.0.201 (story 79, décision A) : migration des mesures sautée -> dite, LECTEUR seulement (même prédicat que reader=
+                # de _migrate_to_history) ; history_path(writer=True) (Bkp, Prune : create=False, sonde 60 s) : muet comme avant
+                if probe_wait<=_READER_WRITE_WAIT: self._reader_migration_warn(conn,db_path,e)
                 self._reader_busy_skip(conn,db_path,DIFF_DB_SCHEMA_VERSION); self._reader_skipped[db_path]=time.monotonic(); return
             _close_quiet(conn)   # 1.0.182 (story 48) : sous 3.11+, une connexion non fermée reste ouverte (verrous, -shm)
             _db_schema_fail(db_path,e,"l'index",held=held)
         except BaseException:   # revue story 48 : SchemaVersionError, Db*Error, SystemExit, Ctrl-C — jamais la connexion laissée ouverte
             _close_quiet(conn); raise
 
-    def ensure_history_db(self,path,create=True):
+    def ensure_history_db(self,path,create=True,reader=False):
         """Schéma de history.db (1.0.139, AD-7). create=False : ne rien créer si le fichier est absent (lecteurs,
         AD-12). Mémorisé par processus. Ouverte sans nick (nick=None) : jamais de codec ni d'avertissement « base
-        non chiffrée » — history.db ne porte aucun chemin et n'est jamais chiffrée."""
+        non chiffrée » — history.db ne porte aucun chemin et n'est jamais chiffrée. reader (1.0.201, story 79, D206) :
+        migration lancée par un LECTEUR (_migrate_to_history) — attente _READER_WRITE_WAIT au lieu de 60 s, et base
+        occupée levée telle quelle (sqlite3.OperationalError) pour que l'appelant abandonne, jamais « DB occupée » + exit."""
         if path in self._hist_ready and os.path.exists(path): return True
         if not create and _db_probe(path,_READER_WRITE_WAIT)[0]=='absent': return False   # 1.0.172 : mêmes états que les deux autres bases ; illisible : erreur réelle ; 1.0.177 : 2 s
         try:
-            try: conn=_open_db(path,nick=None,role='admin',create_file=bool(create),timeout=60)
+            try: conn=_open_db(path,nick=None,role='admin',create_file=bool(create),timeout=_READER_WRITE_WAIT if reader else 60)
             except sqlite3.OperationalError as e:
                 if not create and _file_gone(path): return False   # 1.0.172 (A61) : supprimée depuis la sonde
+                if reader and _db_busy(e): raise
                 _db_open_fail(path,e)
             try:
                 _ensure_wal(conn)
@@ -3360,11 +3393,44 @@ class BorgHelperDB:
             finally: conn.close()
         except sqlite3.DatabaseError as e:
             if not create and _file_gone(path): return False   # 1.0.200 (story 78, D116) : supprimée APRÈS l'ouverture (connexion fermée par le finally)
+            if reader and _db_busy(e): raise   # 1.0.201 (story 79, D206) : l'appelant (lecteur) abandonne la migration
             _db_schema_fail(path,e,"historique des mesures",regenerable=False)
         self._hist_ready.add(path)
         return True
 
-    def _migrate_to_history(self,conn,diff_path):
+    @staticmethod
+    def _hist_migration_state(conn):
+        """(tables, colonnes C/E présentes, C/E encore remplies) d'une diff.db — état lu par _migrate_to_history."""
+        tables={r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        acols=[r[1] for r in conn.execute("PRAGMA table_info(archive_stats)")]
+        ce=[c for c in ('changed_during_backup','read_errors') if c in acols]
+        # C/E laissées en place par SQLite < 3.35 (pas de DROP COLUMN) : vidées à la migration, donc plus rien à migrer
+        ce_live=bool(ce) and conn.execute("SELECT 1 FROM archive_stats WHERE "+' OR '.join(f"{c} IS NOT NULL" for c in ce)+" LIMIT 1").fetchone() is not None
+        return tables,ce,ce_live
+
+    @staticmethod
+    def _hist_pending(tables,ce_live): return 'repo_stats' in tables or 'bkp_status' in tables or ce_live
+
+    def _reader_migration_warn(self,conn,db_path,e):
+        """1.0.201 (story 79, décision A de l'utilisateur ; revue) : un LECTEUR qui abandonne sur une base occupée (diff.db :
+        palier, BEGIN IMMEDIATE de la migration ; history.db : schéma, copie) alors que des mesures d'avant 1.0.139 attendent
+        leur migration (_hist_pending, base d'un schéma pas plus récent que ce code) : « [WARN] <base>: mesures d'avant 1.0.139
+        pas encore migrées (<diff.db|history.db> occupée) — réponse sans elles, migration à la prochaine ouverture ». <base> :
+        nom de la base tiré du fichier <conf>-<base>-diff.db (le nick, ou DB_NAME pour une base partagée). Rien à migrer
+        (base récente, marqueur 'copied' à réparer) : muet, comme avant. Transaction en cours annulée d'abord (état d'avant).
+        Appelée pour un LECTEUR seulement (revue 3) : history_path(writer=True) (create=False, sonde 60 s) reste muet."""
+        try:
+            if conn.in_transaction: conn.rollback()
+            tables,_,ce_live=self._hist_migration_state(conn)
+            row=conn.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone() if 'db_meta' in tables else None
+            if not self._hist_pending(tables,ce_live) or (row and str(row[0]).isdigit() and int(row[0])>DIFF_DB_SCHEMA_VERSION): return
+        except sqlite3.Error: return
+        who=os.path.basename(db_path)
+        if who.startswith(f"{self.db_prefix}-") and who.endswith('-diff.db'): who=who[len(self.db_prefix)+1:-len('-diff.db')]
+        base=getattr(e,'_bh_busy_base','diff.db')
+        printer(f"[WARN] {who}: {_MIGR_PENDING_TXT} ({base} occupée) — réponse sans elles, migration à la prochaine ouverture")
+
+    def _migrate_to_history(self,conn,diff_path,reader=False):
         """Migration automatique des mesures de diff.db vers history.db (1.0.139, AD-8), appelée par ensure_diff_db
         à chaque ouverture ; ne fait rien si diff.db n'a plus de mesure. Deux étapes idempotentes :
           1. copie + marqueur 'migrated_from_diff' dans UNE transaction BEGIN IMMEDIATE de history.db, qui relit le
@@ -3376,23 +3442,79 @@ class BorgHelperDB:
         après la migration, sont recopiées (repo_stats sans imposer d'id, le reste sans doublon), puis retirées.
         Base 'migrating' (DbEncrypt/DbDecrypt en cours) : rien, reprise à une ouverture suivante. Mesures par archive :
         seules les lignes dont C/E n'est pas NULL (seule preuve d'un Bkp, >= 1.0.117) ; archive_stats.deduplicated_size
-        reste dans diff.db."""
-        def _state():
-            tables={r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            acols=[r[1] for r in conn.execute("PRAGMA table_info(archive_stats)")]
-            ce=[c for c in ('changed_during_backup','read_errors') if c in acols]
-            # C/E laissées en place par SQLite < 3.35 (pas de DROP COLUMN) : vidées à la migration, donc plus rien à migrer
-            ce_live=bool(ce) and conn.execute("SELECT 1 FROM archive_stats WHERE "+' OR '.join(f"{c} IS NOT NULL" for c in ce)+" LIMIT 1").fetchone() is not None
-            return tables,ce,ce_live
-        def _pending(tables,ce_live): return 'repo_stats' in tables or 'bkp_status' in tables or ce_live
-        tables,ce_cols,ce_live=_state()
-        if not _pending(tables,ce_live): return
-        row=conn.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()
-        if row and str(row[0]).isdigit() and int(row[0])>DIFF_DB_SCHEMA_VERSION: return   # base plus récente : jamais touchée (_check_set_meta refuse)
-        raw=_enc_header_read(conn)
-        if raw is not None and _enc_header_parse(raw).get('path_enc')=='migrating': return
+        reste dans diff.db. bkp_status, à CHAQUE copie (première migration, recopie après 'done' ou trace) : ligne FINIE
+        (finished_at non NULL) dont start_notified_at est NULL copiée avec started_at (1.0.201, story 79, D207, revues 2 et 4)
+        — un Bkp fini ne donne jamais de « début » à notifier (base touchée par l'ancien palier 7, dont l'ALTER partait seul et
+        le remplissage dans une autre transaction ; lignes écrites après la migration par un binaire d'avant) ; ligne non
+        finie : NULL gardé (Bkp peut-être encore en cours, début à notifier).
+        reader (1.0.201, story 79, D206) : appel d'un LECTEUR (ensure_diff_db create=False, sonde des lecteurs) — history.db
+        attendue _READER_WRITE_WAIT au plus (avant : 60 s puis « DB occupée », code 2) ; occupée : migration abandonnée (rien
+        écrit, transactions annulées), [WARN] « mesures d'avant 1.0.139 pas encore migrées », OperationalError levée ->
+        _reader_busy_skip (diff.db lue telle quelle ; l'avertissement est dit par _reader_migration_warn), nouvel essai à une
+        ouverture suivante. Étape « done » aussi à l'attente des lecteurs : en échec, réparée à l'ouverture suivante (ci-dessous).
+        Écrivains (reader=False) : inchangés (60 s).
+        Marqueur resté à 'copied' alors que diff.db n'a plus rien à migrer (étape « done » en échec ou processus tué après le
+        retrait : diff.db encore à une version < 10, jamais tamponnée) : passé à 'done' (1.0.201, revue story 79) — sinon une
+        table recréée plus tard par un binaire d'avant serait retirée sans recopie. history.db ouverte sans création ; lecteur
+        et base occupée : rien, erreur levée (diff.db non tamponnée -> nouvel essai) ; autre erreur : _db_schema_fail sur
+        history.db, comme la copie — sauf pour un lecteur (revue 4) : réparation sautée en silence, trace gardée. Base d'un
+        schéma plus récent ou 'migrating' : jamais touchée, réparation comprise (revue 4).
+        Trace du retrait (revue 3) : clé _HIST_DROPPED_KEY écrite dans db_meta de diff.db dans la transaction du DROP, effacée
+        une fois 'done' posé ; 'copied' + trace = retrait fait, tables présentes recréées depuis par un binaire d'avant ->
+        recopiées comme après 'done' (avant : copie sautée, lignes perdues au DROP) ; 'copied' sans trace (tué avant le retrait)
+        : rien recopié. Sans rien à migrer, la trace déclenche aussi la réparation de 'copied'. history.db sans db_meta (0
+        octet) : rien à réparer, muet."""
+        _state=lambda: self._hist_migration_state(conn); _pending=self._hist_pending
+        hwait=_READER_WRITE_WAIT if reader else 60
         hist=_history_path_for(diff_path)
-        self.ensure_history_db(hist,create=True)
+        def _busy_hist(e):
+            """Lecteur et history.db occupée : vrai, erreur marquée (avertissement de _reader_migration_warn : « history.db »)."""
+            if reader and _db_busy(e):
+                try: e._bh_busy_base='history.db'
+                except AttributeError: pass
+                return True
+            return False
+        def _mark_done(repair=False):
+            """'copied' -> 'done' (étape 2 faite). history.db jamais créée ici (disparue : rien) ; lecteur et base occupée :
+            erreur levée (diff.db non tamponnée : réparée à une ouverture suivante) ; autre erreur : _db_schema_fail(history.db),
+            sauf réparation (repair, rien à migrer) par un LECTEUR (revue 4) : sautée en silence — réparation cosmétique, l'accès
+            réel du lecteur à history.db dira le problème. Rend False si sautée ainsi (trace gardée), True sinon."""
+            try:
+                h=_open_db(hist,nick=None,role='admin',create_file=False,timeout=hwait)
+                try:
+                    if not h.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='db_meta'").fetchone(): return True   # revue 3 : pas de schéma, rien à réparer
+                    if h.execute("SELECT 1 FROM db_meta WHERE key='migrated_from_diff' AND value='copied'").fetchone():
+                        h.execute("UPDATE db_meta SET value='done' WHERE key='migrated_from_diff' AND value='copied'"); h.commit()
+                finally: h.close()
+            except sqlite3.DatabaseError as e:
+                if _file_gone(hist): return True
+                if _busy_hist(e): raise
+                if repair and reader: return False
+                _db_schema_fail(hist,e,"historique des mesures",regenerable=False)
+            return True
+        def _clear_trace():
+            """Trace du retrait effacée une fois 'done' posé (validée aussitôt) : elle ne vit qu'entre le retrait et 'done'."""
+            conn.execute(f"DELETE FROM db_meta WHERE key='{_HIST_DROPPED_KEY}'"); conn.commit()
+        def _migrating():
+            raw=_enc_header_read(conn)
+            return raw is not None and _enc_header_parse(raw).get('path_enc')=='migrating'
+        tables,ce_cols,ce_live=_state()
+        row=conn.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()
+        if row and str(row[0]).isdigit() and int(row[0])>DIFF_DB_SCHEMA_VERSION: return   # base plus récente : jamais touchée (_check_set_meta refuse) — revue 4 : avant toute réparation
+        if not _pending(tables,ce_live):
+            # 1.0.201 (revue story 79) : 'copied' orphelin — trace du retrait dans diff.db (revue 3), ou base jamais tamponnée
+            # après un retrait fait par 1.0.139-1.0.200 (version < 10, celle de la migration) ; base récente sans trace ou
+            # neuve (sans version) : aucune lecture de history.db. Base 'migrating' (DbEncrypt/DbDecrypt) : jamais touchée
+            # (revue 4 ; en-tête lu seulement s'il y a quelque chose à réparer — jamais pour une base récente).
+            trace=conn.execute(f"SELECT 1 FROM db_meta WHERE key='{_HIST_DROPPED_KEY}'").fetchone() is not None
+            if not (trace or (row and str(row[0]).isdigit() and int(row[0])<10)) or _migrating(): return
+            if os.path.exists(hist) and not _mark_done(repair=True): return
+            if trace: _clear_trace()
+            return
+        if _migrating(): return
+        try: self.ensure_history_db(hist,create=True,reader=reader)
+        except sqlite3.OperationalError as e:
+            _busy_hist(e); raise
         # Verrou d'écriture de diff.db tenu de bout en bout (revue story 2) : aucun écrivain — pas même un binaire antérieur —
         # ne peut écrire entre la copie et le retrait, et deux processus sont sérialisés ici. L'état est relu SOUS verrou :
         # un processus arrivé en second voit la migration faite, jamais des tables disparues entre-temps. Ordre des verrous
@@ -3404,13 +3526,16 @@ class BorgHelperDB:
                 conn.rollback(); return
             h=None
             try:
-                h=_open_db(hist,nick=None,role='admin',timeout=60,isolation_level=None)
+                h=_open_db(hist,nick=None,role='admin',timeout=hwait,isolation_level=None)
                 h.execute("BEGIN IMMEDIATE")
                 try:
                     row=h.execute("SELECT value FROM db_meta WHERE key='migrated_from_diff'").fetchone()
                     state=None if row is None else (row[0] if row[0] in ('copied','done') else 'done')
+                    # 1.0.201 (revue 3 story 79) : 'copied' + trace du retrait dans diff.db (relue sous son verrou) = retrait déjà
+                    # fait, 'done' jamais posé ; les tables présentes ont été RECRÉÉES depuis (binaire d'avant) -> recopie comme
+                    # après 'done'. Sans trace (tué avant le retrait) : copie déjà faite, rien recopié (aucun doublon).
+                    if state=='copied' and conn.execute(f"SELECT 1 FROM db_meta WHERE key='{_HIST_DROPPED_KEY}'").fetchone(): state='done'
                     if state!='copied':
-                        printer(f"  Migration des mesures vers {os.path.basename(hist)}"+(" (lignes écrites par une version antérieure)" if state=='done' else "")+"...")
                         if 'repo_stats' in tables:
                             rs=conn.execute("SELECT id,nick,op,unique_csize,total_size,total_csize,updated_at FROM repo_stats ORDER BY id").fetchall()
                             if state is None and h.execute("SELECT count(*) FROM repo_stats").fetchone()[0]==0:
@@ -3419,8 +3544,13 @@ class BorgHelperDB:
                                 h.executemany("INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize,updated_at) VALUES (?,?,?,?,?,?)",[r[1:] for r in rs])
                         if 'bkp_status' in tables:
                             cols='nick,run_id,started_at,finished_at,result,notified_at,changed_during_backup,read_errors,start_notified_at'
+                            # 1.0.201 (D207 ; revues 2 et 4) : à CHAQUE copie (première migration, recopie après 'done' ou trace),
+                            # ligne FINIE sans début notifié -> started_at (jamais un « début » pour un Bkp fini) ; ligne non finie :
+                            # NULL gardé (Bkp peut-être encore en cours sous un binaire d'avant, début à notifier)
+                            sel=cols.replace(',start_notified_at',',CASE WHEN start_notified_at IS NULL AND finished_at IS NOT NULL '
+                                             'THEN started_at ELSE start_notified_at END')
                             h.executemany(f"INSERT OR IGNORE INTO bkp_status ({cols}) VALUES (?,?,?,?,?,?,?,?,?)",
-                                          conn.execute(f"SELECT {cols} FROM bkp_status").fetchall())
+                                          conn.execute(f"SELECT {sel} FROM bkp_status").fetchall())
                         if ce_live:
                             sel=','.join(c if c in ce_cols else 'NULL' for c in ('changed_during_backup','read_errors'))
                             where=' OR '.join(f"{c} IS NOT NULL" for c in ce_cols)
@@ -3430,13 +3560,17 @@ class BorgHelperDB:
                     h.execute("COMMIT")
                 except BaseException:
                     h.execute("ROLLBACK"); raise
+                if state!='copied':   # 1.0.201 (revue story 79) : dit après la copie validée, jamais pour une migration abandonnée
+                    printer(f"  Migration des mesures vers {os.path.basename(hist)}"+(" (lignes écrites par une version antérieure)" if state=='done' else "")+"...")
             except sqlite3.DatabaseError as e:
+                if _busy_hist(e): raise   # 1.0.201 (D206) : lecteur -> abandon (rollback de diff.db ci-dessous), _reader_busy_skip
                 # erreur de history.db : jamais le conseil de supprimer diff.db (qui porte encore les seules copies des mesures)
                 _db_schema_fail(hist,e,"historique des mesures",regenerable=False)
             finally:
                 if h is not None: h.close()
             if 'repo_stats' in tables: conn.execute("DROP TABLE repo_stats")
             if 'bkp_status' in tables: conn.execute("DROP TABLE bkp_status")
+            conn.execute(f"INSERT OR REPLACE INTO db_meta VALUES('{_HIST_DROPPED_KEY}','1')")   # revue 3 : trace, même transaction que le retrait
             if sqlite3.sqlite_version_info>=(3,35,0):
                 for c in ce_cols: conn.execute(f"ALTER TABLE archive_stats DROP COLUMN {c}")
             elif ce_cols:   # pas de DROP COLUMN : colonnes vidées, plus jamais lues ni écrites
@@ -3444,9 +3578,8 @@ class BorgHelperDB:
             conn.commit()
         except BaseException:
             conn.rollback(); raise
-        h=_open_db(hist,nick=None,role='admin',timeout=60)
-        try: h.execute("UPDATE db_meta SET value='done' WHERE key='migrated_from_diff'"); h.commit()
-        finally: h.close()
+        _mark_done()   # 1.0.201 (revue story 79) : attente des lecteurs ; en échec, réparée à l'ouverture suivante (trace gardée)
+        _clear_trace()
 
     def purge_stale_cache(self,nick,current_lm,db_path=None):
         if db_path is None: db_path=self.get_cache_db(nick)
@@ -3511,7 +3644,10 @@ class BorgHelperDB:
                     warned=True
                 time.sleep(2)
 
-    def store_diff_entries(self,nick,archive_old,archive_new,archive_new_date,entries,db_path=None):
+    def store_diff_entries(self,nick,archive_old,archive_new,archive_new_date,entries,db_path=None,exclu=None):
+        """exclu (1.0.201, revue story 79) : {change_type: {'count': N, 'size': M}} écrits dans la MÊME transaction que la paire,
+        et seulement si cet appel l'a écrite (comme ses lignes) — jamais d'exclu sans paire (DiffBkp écrivait les exclus à part,
+        même après un échec de la paire)."""
         if db_path is None: db_path=self.get_diff_db(nick)
         def _do():
             conn=_open_db(db_path,nick=nick,role='write')
@@ -3524,6 +3660,9 @@ class BorgHelperDB:
                     conn.executemany(
                         "INSERT INTO diff_index (nick,archive_old,archive_new,archive_new_date,change_type,path,size_before,size_after) VALUES (?,?,?,?,?,?,?,?)",
                         [(nick,archive_old,archive_new,archive_new_date,e['change_type'],_path_stored(conn,e['path']),e.get('size_before'),e.get('size_after')) for e in entries])
+                if exclu and cur.rowcount==1:
+                    conn.executemany("INSERT OR REPLACE INTO diff_excluded_stats (nick,archive_old,archive_new,change_type,file_count,total_size) VALUES (?,?,?,?,?,?)",
+                                     [(nick,archive_old,archive_new,ct,x['count'],x['size']) for ct,x in exclu.items()])
                 conn.commit(); return True
             finally: conn.close()
         try: return self._with_lock_retry(_do)
@@ -4241,7 +4380,9 @@ class BorgHelperDB:
         except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}")
 
     def store_excluded_diff_stats(self,nick,archive_old,archive_new,exclu,db_path=None):
-        """exclu : {change_type: {'count': N, 'size': M}}"""
+        """exclu : {change_type: {'count': N, 'size': M}}. Transaction à part, sans vérifier la paire — plus appelée en production
+        depuis 1.0.201 (DiffBkp : store_diff_entries(…, exclu=…), même transaction que la paire) ; des exclus écrits sans leur paire
+        sont retirés par l'Index suivant (_drop_orphan_exclusions). Préférer store_diff_entries(exclu=)."""
         if not exclu: return
         if db_path is None: db_path=self.get_diff_db(nick)
         def _do():
@@ -6116,8 +6257,7 @@ class BorgHelper:
                     if ct not in exclu: exclu[ct]={'count':0,'size':0}
                     exclu[ct]['count']+=1; exclu[ct]['size']+=sz
             self.db.ensure_diff_db(db_path,nick=nick)  # paire non indexée : on écrit -> création légitime (AD-12 ne visait que le lookup ci-dessus)
-            self.db.store_diff_entries(nick,bidun,bideux,date_new,entries_ok,db_path)
-            if exclu: self.db.store_excluded_diff_stats(nick,bidun,bideux,exclu,db_path)
+            self.db.store_diff_entries(nick,bidun,bideux,date_new,entries_ok,db_path,exclu=exclu)   # 1.0.201 : exclus avec la paire
             display_entries=all_entries
         else:
             try:
@@ -7190,6 +7330,32 @@ class BorgHelper:
         if n: printer(f"{nick}: {n} paire(s) de diff vide(s) à refaire (1.0.153)")
         return n
 
+    def _drop_orphan_exclusions(self,nick,db_path):
+        """1.0.201 (story 79, D199) : exclus de diff (diff_excluded_stats) dont la paire n'est plus dans diff_indexed_pairs,
+        retirés par l'Index. Seules d'anciennes bases en portent : la purge DIFF_KEEP d'avant 1.0.140 retirait diff_index et
+        la paire mais oubliait ses exclus — les lecteurs (Report, ArchiveHistory, IdxTop ; DiffTop -b de la paire) les agrègent sans jointure et donnaient des
+        comptages partiels non nuls (« files_added: 7 » au lieu de « — »). Le code actuel écrit les exclus dans la transaction
+        de leur paire (Index, DiffBkp depuis 1.0.201) et les retire ensemble : jamais d'exclu légitime sans paire. Une lecture bornée par la petite table des exclus ;
+        écriture seulement s'il y a des orphelins (BEGIN IMMEDIATE, relus sous verrou, attente 2 s : jamais sous le budget
+        d'une tranche ni devant un Bkp). Base occupée, illisible ou chiffrée sans clé : [WARN], nouvel essai au prochain Index,
+        jamais l'échec de l'Index ; base disparue : 0, muet, jamais recréée (create_file=False, revue 4). Lignes d'une paire
+        indexée : jamais touchées. Rend le nombre de lignes retirées."""
+        w=("FROM diff_excluded_stats WHERE nick=? AND NOT EXISTS (SELECT 1 FROM diff_indexed_pairs p WHERE "
+           "p.nick=diff_excluded_stats.nick AND p.archive_old=diff_excluded_stats.archive_old AND "
+           "p.archive_new=diff_excluded_stats.archive_new)")
+        try:
+            conn=_open_db(db_path,nick=nick,role='write',create_file=False,timeout=_READER_WRITE_WAIT)   # revue : avant, 5 s (défaut SQLite) + 2 s ; revue 4 : jamais recréée
+            try:
+                if not conn.execute("SELECT 1 "+w+" LIMIT 1",(nick,)).fetchall(): return 0
+                conn.execute("BEGIN IMMEDIATE")
+                n=conn.execute("DELETE "+w,(nick,)).rowcount
+                conn.commit(); return n
+            finally: conn.close()
+        except _RECONCILE_ERRORS as e:
+            if _file_gone(db_path): return 0   # revue 4 : base disparue entre-temps — rien à retirer, jamais recréée, muet
+            printer(f"[WARN] {nick}: exclus orphelins (paires purgées avant 1.0.140) non retirés ({e}) — nouvel essai au prochain Index")
+            return 0
+
     def _index_pass(self,nick,debug,db_path,force,target_archive,plan):
         """Une passe du moteur. Retour : 0/1 (fin, comme l'ancien index()), 'interrupted' (demande d'arrêt prioritaire :
         index() met en pause puis relance une passe complète — les sentinelles évitent de refaire le travail)."""
@@ -7227,6 +7393,7 @@ class BorgHelper:
         prev_stop=self.borg._stop; self.borg._stop=stop   # borg list du dépôt entier (R6) : cède comme les autres borg
         try: self._reconcile_archives(nick,db_path,names,repo=self._repo_archive_names(nick,cfg,debug))
         finally: self.borg._stop=prev_stop
+        self._drop_orphan_exclusions(nick,db_path)   # 1.0.201 (story 79, D199) : même passe, SQL seul
         keep=cfg.get('DIFF_KEEP','').strip()
         keep=int(keep) if keep.isdigit() else None
         cp=self._index_checkpoint(nick,deadline)   # demande d'arrêt pendant le rapprochement (SQL seul)
@@ -7454,7 +7621,7 @@ class BorgHelper:
                                         if entries and cur.rowcount==1:
                                             db_conn.executemany("INSERT INTO diff_index (nick,archive_old,archive_new,archive_new_date,change_type,path,size_before,size_after) VALUES (?,?,?,?,?,?,?,?)",
                                                 [(nick,a_old,a_new,date_new,e['change_type'],_path_stored(db_conn,e['path']),e.get('size_before'),e.get('size_after')) for e in entries])
-                                        if exclu:
+                                        if exclu and cur.rowcount==1:   # 1.0.201 (revue story 79) : jumeau de store_diff_entries
                                             db_conn.executemany(
                                                 "INSERT OR REPLACE INTO diff_excluded_stats "
                                                 "(nick,archive_old,archive_new,change_type,file_count,total_size) VALUES (?,?,?,?,?,?)",
@@ -11107,13 +11274,704 @@ def codec_selftest(pattern=None,list_only=False):
                     start_notified_at TEXT, PRIMARY KEY (nick, run_id));
                 INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize) VALUES ('hm','bkp',7,7,7);
                 INSERT INTO bkp_status (nick,run_id,result) VALUES ('hm','r-old','success');
+                INSERT INTO bkp_status (nick,run_id,started_at,finished_at,result) VALUES ('hm','r-fin','2026-03-01 00:00:00','2026-03-01 01:00:00','success');
             """); c.commit(); c.close()
             with contextlib.redirect_stderr(io.StringIO()): bh.ensure_diff_db(dp,create=False)
             rs,bs,am=_hm_snapshot(dp)
-            h=sqlite3.connect(_history_path_for(dp)); mark=h.execute("SELECT value FROM db_meta WHERE key='migrated_from_diff'").fetchone()[0]; h.close()
+            h=sqlite3.connect(_history_path_for(dp)); mark=h.execute("SELECT value FROM db_meta WHERE key='migrated_from_diff'").fetchone()[0]
+            sn={r[0]:r[1] for r in h.execute("SELECT run_id,start_notified_at FROM bkp_status WHERE run_id IN ('r-old','r-fin')")}; h.close()
+            pend={r.get('run_id') for r in bh.list_pending_bkp_status_start('hm',db_path=_history_path_for(dp))}
+            # 1.0.201 (revue 4 story 79) : lignes écrites APRÈS la migration (chemin 'done') — finie (r-fin) : start_notified_at =
+            # started_at, jamais un « début » ; non finie (r-old, Bkp peut-être en cours) : NULL gardé, début à notifier
             return (rs[:3]==_HM_EXPECT[0] and len(rs)==4 and rs[3][1:]==('hm','bkp',7,7,7) and rs[3][0]>5
-                    and {b[1] for b in bs}=={'r1','r2','r-old'} and am==_HM_EXPECT[2] and _hm_diff_clean(dp) and mark=='done')
+                    and {b[1] for b in bs}=={'r1','r2','r-old','r-fin'} and am==_HM_EXPECT[2] and _hm_diff_clean(dp) and mark=='done'
+                    and sn=={'r-old':None,'r-fin':'2026-03-01 00:00:00'} and 'r-old' in pend and 'r-fin' not in pend)
         check("history.db : tables recréées par un binaire d'avant après migration -> lignes recopiées puis retirées, aucun doublon",_hm_old_binary_rewrites)
+        # ── 1.0.201 (story 79) : anciennes bases — D206 (migration d'un lecteur, history.db tenue), D207 (palier
+        # start_notified_at), D199 (exclus orphelins d'une paire purgée avant 1.0.140) ──
+        def _hm79_out(fn):
+            """(sortie stdout+stderr, exception rendue ou None, durée en s) d'un appel."""
+            out=io.StringIO(); exc=None; t0=time.monotonic()
+            with contextlib.redirect_stdout(out),contextlib.redirect_stderr(out):
+                try: fn()
+                except (Exception,SystemExit) as e: exc=e
+            return out.getvalue(),exc,time.monotonic()-t0
+        def _hm79_hold(hp):
+            """Verrou d'écriture de history.db tenu par une autre connexion (BEGIN IMMEDIATE, comme un Index ou un Bkp qui écrit)."""
+            c=sqlite3.connect(hp,isolation_level=None); c.execute("BEGIN IMMEDIATE"); return c
+        def _hm79_untouched(dp):
+            """diff.db telle que _hm_legacy l'a construite (version 4, tables mesurées en place) et history.db sans copie."""
+            c=sqlite3.connect(dp)
+            try:
+                tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                ver=c.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()[0]
+            finally: c.close()
+            h=sqlite3.connect(_history_path_for(dp))
+            try:
+                mark=h.execute("SELECT value FROM db_meta WHERE key='migrated_from_diff'").fetchone()
+                n=sum(h.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in ('repo_stats','bkp_status','archive_measure'))
+            finally: h.close()
+            return {'repo_stats','bkp_status'}<=tables and ver=='4' and mark is None and n==0
+        def _hm79_open_rec():
+            """Enregistreur des délais d'ouverture de history.db (_open_db) : [(timeout demandé)]."""
+            seen=[]; real=_open_db
+            def rec(path,*a,**kw):
+                if os.path.basename(os.fsdecode(path)).endswith('-history.db'): seen.append(kw.get('timeout'))
+                return real(path,*a,**kw)
+            return seen,rec
+        def _hm79_reader_busy():
+            """D206 : LECTEUR (ensure_diff_db create=False) d'une diff.db d'avant 1.0.139, history.db tenue par une autre connexion
+            -> réponse en quelques secondes (avant : 60 s puis « [ERREUR] DB occupée », code 2), aucune sortie, aucune exception,
+            rien écrit (diff.db version 4 avec ses tables, history.db sans marqueur ni ligne) ; deux points d'attente : la copie
+            (BEGIN IMMEDIATE de history.db) et le schéma de history.db (tampon de version à réécrire) ; délais demandés pour
+            history.db : _READER_WRITE_WAIT seulement. Seule sortie (décision A de l'utilisateur, revue) : « [WARN] <nick>: mesures
+            d'avant 1.0.139 pas encore migrées (history.db occupée) — … », jamais « Migration des mesures » (rien migré). Verrou
+            relâché, ouverture suivante : migration faite, plus d'avertissement."""
+            res={}
+            for case in ('copie','schéma'):
+                nm=f'm12{case[0]}'; dp=_hm_legacy(nm); hp=_history_path_for(dp)
+                W=f"[WARN] {nm}: mesures d'avant 1.0.139 pas encore migrées (history.db occupée) — réponse sans elles, migration à la prochaine ouverture"
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): BorgHelperDB(hm_dir,'rc').ensure_history_db(hp)
+                if case=='schéma':
+                    c=sqlite3.connect(hp); c.execute("UPDATE db_meta SET value='1.0.0' WHERE key='borghelper_version'"); c.commit(); c.close()
+                db=BorgHelperDB(hm_dir,'rc'); hold=_hm79_hold(hp); seen,rec=_hm79_open_rec()
+                try:
+                    with mock.patch(f"{__name__}._open_db",rec): out,exc,dt=_hm79_out(lambda: db.ensure_diff_db(dp,create=False))
+                finally: hold.rollback(); hold.close()
+                res[f'{case} : rapide, [WARN] seul, rien écrit']=(dt<6 and exc is None and len(out.strip().splitlines())==1 and out.strip().startswith(W) and _hm79_untouched(dp)
+                    and seen and all(t==_READER_WRITE_WAIT for t in seen),round(dt,1),exc,seen,out[-300:])
+                db._reader_skipped.clear()
+                out2,exc2,_=_hm79_out(lambda: db.ensure_diff_db(dp,create=False))
+                res[f'{case} : verrou relâché -> migrée, sans avertissement']=(exc2 is None and 'Migration des mesures' in out2 and 'pas encore migrées' not in out2
+                    and _hm_snapshot(dp)==_HM_EXPECT and _hm_diff_clean(dp),exc2,out2[-200:])
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("history.db : lecteur, diff.db d'avant 1.0.139, history.db tenue -> quelques secondes, [WARN] seul, rien écrit, migrée plus tard (story 79, D206)",_hm79_reader_busy)
+        def _hm79_reader_free():
+            """D206 témoin : lecteur, history.db existante et libre -> migration faite comme avant ; délais demandés : attente des
+            lecteurs pour le schéma, la copie et l'étape « done » (revue 2 : plus d'exception à 60 s, « done » réparée ensuite)."""
+            dp=_hm_legacy('m13'); hp=_history_path_for(dp)
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): BorgHelperDB(hm_dir,'rc').ensure_history_db(hp)
+            seen,rec=_hm79_open_rec()
+            with mock.patch(f"{__name__}._open_db",rec): out,exc,_=_hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,create=False))
+            ok=(exc is None and 'Migration des mesures' in out and _hm_snapshot(dp)==_HM_EXPECT and _hm_diff_clean(dp)
+                and seen==[_READER_WRITE_WAIT]*3)
+            if not ok: print(f"  {exc} {seen} {out[-200:]}")
+            return ok
+        check("history.db : lecteur, history.db libre -> migration faite, attente des lecteurs à chaque ouverture de history.db (story 79, D206 témoin)",_hm79_reader_free)
+        def _hm79_writer_busy():
+            """D206 écrivain : Index/Bkp (ensure_diff_db create=True) et history_path d'un écrivain (create=False, sonde 60 s :
+            Bkp, Prune), history.db tenue -> inchangés : history.db demandée à 60 s, puis « [ERREUR] DB occupée » sur history.db,
+            sys.exit(1), rien copié. Délai réel raccourci à 0,3 s par l'enregistreur (le délai DEMANDÉ est contrôlé)."""
+            res={}
+            for lbl,kw in (('Index/Bkp (create=True)',{}),('history_path écrivain (create=False, sonde 60 s)',{'create':False,'probe_wait':60})):
+                dp=_hm_legacy('m14'); hp=_history_path_for(dp)
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): BorgHelperDB(hm_dir,'rc').ensure_history_db(hp)
+                seen=[]; real=_open_db
+                def rec(path,*a,**k):
+                    if os.path.basename(os.fsdecode(path)).endswith('-history.db'):
+                        seen.append(k.get('timeout'))
+                        if k.get('timeout')==60: k=dict(k,timeout=0.3)
+                    return real(path,*a,**k)
+                hold=_hm79_hold(hp)
+                try:
+                    with mock.patch(f"{__name__}._open_db",rec): out,exc,_=_hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,**kw))
+                finally: hold.rollback(); hold.close()
+                h=sqlite3.connect(hp); mark=h.execute("SELECT value FROM db_meta WHERE key='migrated_from_diff'").fetchone(); h.close()
+                res[lbl]=(isinstance(exc,SystemExit) and exc.code==1 and f"[ERREUR] DB occupée : {hp}" in out and seen and all(t==60 for t in seen)
+                          and mark is None and 'pas encore migrées' not in out and 'Migration des mesures' not in out,exc,seen,out[-200:])
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("history.db : écrivain, history.db tenue -> inchangé (60 s demandées, puis « DB occupée », sys.exit) (story 79, D206 écrivain)",_hm79_writer_busy)
+        def _hm79_legacy_nostart(name,touched=False):
+            """diff.db d'avant 1.0.139 dont bkp_status n'a pas encore start_notified_at (base d'avant la Story 2b) ; touched :
+            colonne déjà ajoutée par l'ancien palier, lignes laissées NULL (verrou perdu entre l'ALTER et le remplissage)."""
+            dp=_hm_legacy(name); c=sqlite3.connect(dp)
+            c.executescript("""DROP TABLE bkp_status;
+                CREATE TABLE bkp_status (nick TEXT NOT NULL, run_id TEXT NOT NULL, started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    finished_at TEXT, result TEXT, notified_at TEXT, changed_during_backup INTEGER, read_errors INTEGER, PRIMARY KEY (nick, run_id));
+                INSERT INTO bkp_status VALUES ('hm','r1','2026-01-01 00:00:00','2026-01-01 01:00:00','success','2026-01-01 01:00:05',2,0);
+                INSERT INTO bkp_status VALUES ('hm','r2','2026-01-02 00:00:00','2026-01-02 01:00:00','error','2026-01-02 01:00:05',NULL,NULL);""")
+            if touched: c.execute("ALTER TABLE bkp_status ADD COLUMN start_notified_at TEXT")
+            c.commit(); c.close(); return dp
+        def _hm79_hist_starts(dp):
+            h=sqlite3.connect(_history_path_for(dp))
+            try: return h.execute("SELECT run_id,started_at,start_notified_at FROM bkp_status WHERE nick='hm' ORDER BY run_id").fetchall()
+            finally: h.close()
+        def _hm79_start_lost():
+            """D207 : verrou perdu avant le remplissage de start_notified_at (« database is locked » injecté sur l'UPDATE) -> palier
+            annulé en entier (ALTER compris : une seule transaction ; avant, colonne ajoutée et lignes NULL) — lecteur : [WARN]
+            « mesures d'avant 1.0.139 pas encore migrées (diff.db occupée) » seul (décision A, revue 2) ;
+            écrivain : « DB occupée », sys.exit(1) ; aucune ligne NULL dans diff.db ; ouverture suivante : history.db sans aucun
+            « début » éligible au watcher. Base déjà touchée par l'ancien palier (colonne là, lignes NULL) : copiées avec
+            start_notified_at = started_at, aucun « début » éligible."""
+            res={}
+            real=sqlite3.Connection.execute
+            def _ex(self_,sql,*a):
+                if isinstance(sql,str) and sql.startswith("UPDATE bkp_status SET start_notified_at=started_at"): raise sqlite3.OperationalError("database is locked")
+                return real(self_,sql,*a)
+            for lbl,kw in (('lecteur',{'create':False}),('écrivain',{})):
+                dp=_hm79_legacy_nostart(f'm15{lbl[0]}'); db=BorgHelperDB(hm_dir,'rc')
+                with mock.patch.object(BhConnection,'execute',_ex): out,exc,_=_hm79_out(lambda: db.ensure_diff_db(dp,**kw))
+                c=sqlite3.connect(dp); cols=[r[1] for r in c.execute("PRAGMA table_info(bkp_status)")]
+                nulls=c.execute("SELECT count(*) FROM bkp_status WHERE start_notified_at IS NULL").fetchone()[0] if 'start_notified_at' in cols else 0
+                c.close()
+                first=((exc is None and len(out.strip().splitlines())==1 and f"[WARN] m15l: {_MIGR_PENDING_TXT} (diff.db occupée) — " in out)
+                       if lbl=='lecteur' else (isinstance(exc,SystemExit) and exc.code==1 and 'DB occupée' in out and _MIGR_PENDING_TXT not in out))
+                db=BorgHelperDB(hm_dir,'rc'); out2,exc2,_=_hm79_out(lambda: db.ensure_diff_db(dp,create=False))
+                st=_hm79_hist_starts(dp); pend=db.list_pending_bkp_status_start('hm',db_path=_history_path_for(dp))
+                res[lbl]=(first and 'start_notified_at' not in cols and nulls==0 and exc2 is None and len(st)==2 and all(r[2]==r[1] for r in st)
+                          and pend==[],exc,cols,nulls,exc2,st,pend,out[-150:])
+            dp=_hm79_legacy_nostart('m15t',touched=True); db=BorgHelperDB(hm_dir,'rc')
+            out,exc,_=_hm79_out(lambda: db.ensure_diff_db(dp,create=False))
+            st=_hm79_hist_starts(dp); pend=db.list_pending_bkp_status_start('hm',db_path=_history_path_for(dp))
+            res['base déjà touchée']=(exc is None and len(st)==2 and all(r[2]==r[1] for r in st) and pend==[],exc,st,pend)
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("history.db : palier start_notified_at, verrou perdu avant le remplissage -> aucun « début » historique éligible (story 79, D207)",_hm79_start_lost)
+        def _hm79_start_normal():
+            """D207 témoin : palier normal -> start_notified_at = started_at pour chaque ligne copiée, aucun « début » éligible ;
+            valeur déjà posée (non NULL) copiée telle quelle, jamais remplacée par started_at ; ligne d'un Bkp encore en cours
+            (finished_at NULL) : NULL gardé, son début reste à notifier (revue 2)."""
+            dp=_hm79_legacy_nostart('m16'); db=BorgHelperDB(hm_dir,'rc')
+            out,exc,_=_hm79_out(lambda: db.ensure_diff_db(dp,create=False))
+            st=_hm79_hist_starts(dp); pend=db.list_pending_bkp_status_start('hm',db_path=_history_path_for(dp))
+            dp2=_hm79_legacy_nostart('m16v',touched=True)
+            c=sqlite3.connect(dp2); c.execute("UPDATE bkp_status SET start_notified_at='2026-05-05 05:05:05' WHERE run_id='r1'")
+            c.execute("UPDATE bkp_status SET start_notified_at=started_at WHERE run_id='r2'")
+            # revue 2 : Bkp encore en cours sous un binaire d'avant (finished_at NULL, début pas encore notifié) : NULL gardé
+            c.execute("INSERT INTO bkp_status (nick,run_id,started_at) VALUES ('hm','r3','2026-01-03 00:00:00')"); c.commit(); c.close()
+            db2=BorgHelperDB(hm_dir,'rc'); out2,exc2,_=_hm79_out(lambda: db2.ensure_diff_db(dp2,create=False))
+            st2=_hm79_hist_starts(dp2); pend2=[r.get('run_id') for r in db2.list_pending_bkp_status_start('hm',db_path=_history_path_for(dp2))]
+            ok=(exc is None and exc2 is None and len(st)==2 and all(r[2]==r[1] for r in st) and pend==[]
+                and st2==[('r1','2026-01-01 00:00:00','2026-05-05 05:05:05'),('r2','2026-01-02 00:00:00','2026-01-02 00:00:00'),
+                          ('r3','2026-01-03 00:00:00',None)] and pend2==['r3'])
+            if not ok: print(f"  {exc} {exc2} {st} {pend} {st2} {pend2}")
+            return ok
+        check("history.db : palier start_notified_at normal -> start_notified_at = started_at, valeur posée gardée, Bkp en cours à notifier (story 79, D207 témoin)",_hm79_start_normal)
+        def _hm79_on_first_begin(fn):
+            """Remplacement de BhConnection.execute : au PREMIER « BEGIN IMMEDIATE » d'une connexion du code (le premier palier
+            d'ajout de colonnes), fn() s'exécute juste avant (autre ouvreur, verrou tenu…). Rend (execute, état)."""
+            real=sqlite3.Connection.execute; st={'fired':False}
+            def _ex(self_,sql,*a):
+                if not st['fired'] and isinstance(sql,str) and sql.strip()=="BEGIN IMMEDIATE":
+                    st['fired']=True; fn()
+                return real(self_,sql,*a)
+            return _ex,st
+        def _hm79_palier_locked():
+            """Revue story 79 : verrou d'écriture RÉEL de diff.db pris par une autre connexion au moment du palier
+            start_notified_at (premier BEGIN IMMEDIATE) — lecteur : saut en ~2 s, délai demandé pour diff.db
+            _READER_WRITE_WAIT, seule sortie « [WARN] m17l: mesures d'avant 1.0.139 pas encore migrées (diff.db occupée) — … »
+            (migration en attente : décision A, revue 2), colonne absente, rien migré ; écrivain : délai demandé 60 s (raccourci à 0,3 s), « DB occupée »
+            sur diff.db, sys.exit(1), colonne absente ; verrou relâché : ouverture normale, aucun « début » éligible."""
+            res={}
+            for lbl,kw in (('lecteur',{'create':False}),('écrivain',{})):
+                dp=_hm79_legacy_nostart(f'm17{lbl[0]}'); seen=[]; real=_open_db; hold={}
+                def rec(path,*a,**k):
+                    if os.fsdecode(path)==dp:
+                        seen.append(k.get('timeout'))
+                        if k.get('timeout')==60: k=dict(k,timeout=0.3)
+                    return real(path,*a,**k)
+                def take():
+                    hold['c']=sqlite3.connect(dp,isolation_level=None); hold['c'].execute("BEGIN IMMEDIATE")
+                _ex,st=_hm79_on_first_begin(take)
+                try:
+                    with mock.patch(f"{__name__}._open_db",rec),mock.patch.object(BhConnection,'execute',_ex):
+                        out,exc,dt=_hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,**kw))
+                finally:
+                    if 'c' in hold: hold['c'].rollback(); hold['c'].close()
+                c=sqlite3.connect(dp); cols=[r[1] for r in c.execute("PRAGMA table_info(bkp_status)")]; c.close()
+                if lbl=='lecteur': first=(exc is None and len(out.strip().splitlines())==1 and out.strip().startswith(
+                    f"[WARN] m17l: {_MIGR_PENDING_TXT} (diff.db occupée) — réponse sans elles, migration à la prochaine ouverture") and dt<6 and seen==[_READER_WRITE_WAIT])
+                else: first=isinstance(exc,SystemExit) and exc.code==1 and f"[ERREUR] DB occupée : {dp}" in out and seen==[60]
+                db=BorgHelperDB(hm_dir,'rc'); out2,exc2,_=_hm79_out(lambda: db.ensure_diff_db(dp,create=False))
+                sts=_hm79_hist_starts(dp); pend=db.list_pending_bkp_status_start('hm',db_path=_history_path_for(dp))
+                res[lbl]=(st['fired'] and first and 'start_notified_at' not in cols and exc2 is None and len(sts)==2
+                          and all(r[2]==r[1] for r in sts) and pend==[],st['fired'],exc,round(dt,1),seen,cols,exc2,sts,pend,out[-150:])
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("history.db : palier start_notified_at, diff.db tenue par une autre connexion -> lecteur [WARN] en ~2 s, écrivain « DB occupée », rien ajouté (story 79, revue)",_hm79_palier_locked)
+        def _hm79_second_opener():
+            """Revue story 79 : second ouvreur d'une base d'avant 1.0.139 — état changé par un autre entre la lecture sans verrou et
+            le palier (premier BEGIN IMMEDIATE) : (a) colonnes C/E et start_notified_at ajoutées et remplies par une autre
+            connexion ; (b) migration vers history.db finie par un autre ouvreur (bkp_status retirée) ; (c) snapshot_file :
+            mode/owner ajoutées par une autre connexion. Attendu : aucune erreur, jamais « DB corrompue » (avant : « duplicate
+            column name » / « no such table » pris pour une corruption, code 1), migration complète, aucun start_notified_at
+            NULL dans history.db."""
+            res={}
+            def nulls(dp):
+                h=sqlite3.connect(_history_path_for(dp))
+                try: return h.execute("SELECT count(*) FROM bkp_status WHERE start_notified_at IS NULL").fetchone()[0]
+                finally: h.close()
+            dp=_hm79_legacy_nostart('m18a'); c=sqlite3.connect(dp)
+            c.executescript("""CREATE TABLE b2 (nick TEXT NOT NULL, run_id TEXT NOT NULL, started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                finished_at TEXT, result TEXT, notified_at TEXT, PRIMARY KEY (nick, run_id));
+                INSERT INTO b2 SELECT nick,run_id,started_at,finished_at,result,notified_at FROM bkp_status; DROP TABLE bkp_status;
+                ALTER TABLE b2 RENAME TO bkp_status;"""); c.commit(); c.close()
+            def other_adds():
+                o=sqlite3.connect(dp)
+                for col,typ in (('changed_during_backup','INTEGER'),('read_errors','INTEGER'),('start_notified_at','TEXT')): o.execute(f"ALTER TABLE bkp_status ADD COLUMN {col} {typ}")
+                o.execute("UPDATE bkp_status SET start_notified_at=started_at"); o.commit(); o.close()
+            _ex,st=_hm79_on_first_begin(other_adds)
+            with mock.patch.object(BhConnection,'execute',_ex): out,exc,_=_hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,create=False))
+            sts=_hm79_hist_starts(dp)
+            res['(a) colonnes ajoutées par un autre']=(st['fired'] and exc is None and 'corrompue' not in out and len(sts)==2 and nulls(dp)==0
+                                                      and all(r[2]==r[1] for r in sts),st['fired'],exc,sts,out[-200:])
+            dp=_hm79_legacy_nostart('m18b')
+            def other_migrates():
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,create=False)
+            _ex,st=_hm79_on_first_begin(other_migrates)
+            with mock.patch.object(BhConnection,'execute',_ex): out,exc,_=_hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,create=False))
+            c=sqlite3.connect(dp); left={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}; c.close()
+            sts=_hm79_hist_starts(dp)
+            res['(b) bkp_status retirée par un autre']=(st['fired'] and exc is None and 'corrompue' not in out and 'bkp_status' not in left
+                                                       and len(sts)==2 and nulls(dp)==0,st['fired'],exc,left,sts,out[-200:])
+            dp=_hm_legacy('m18c'); c=sqlite3.connect(dp)
+            c.execute("CREATE TABLE snapshot_file (id INTEGER PRIMARY KEY AUTOINCREMENT, nick TEXT NOT NULL, path TEXT NOT NULL, size INTEGER, mtime TEXT, type TEXT)")
+            c.commit(); c.close()
+            def other_sf():
+                o=sqlite3.connect(dp); o.execute("ALTER TABLE snapshot_file ADD COLUMN mode TEXT"); o.execute("ALTER TABLE snapshot_file ADD COLUMN owner TEXT"); o.commit(); o.close()
+            _ex,st=_hm79_on_first_begin(other_sf)
+            with mock.patch.object(BhConnection,'execute',_ex): out,exc,_=_hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,create=False))
+            c=sqlite3.connect(dp); sf=[r[1] for r in c.execute("PRAGMA table_info(snapshot_file)")]; c.close()
+            res['(c) snapshot_file : colonnes ajoutées par un autre']=(st['fired'] and exc is None and 'corrompue' not in out and sf.count('mode')==1
+                and sf.count('owner')==1 and _hm_snapshot(dp)==_HM_EXPECT and _hm_diff_clean(dp),st['fired'],exc,sf,out[-200:])
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("history.db : second ouvreur (colonnes ajoutées, bkp_status retirée par un autre) -> aucune erreur, aucun « DB corrompue » (story 79, revue)",_hm79_second_opener)
+        def _hm79_done_failed(name,prep=None):
+            """Base d'avant 1.0.139 migrée par un écrivain dont l'étape « done » échoue (verrou injecté) : tables retirées,
+            trace du retrait dans diff.db, marqueur 'copied', diff.db à la version 4."""
+            dp=_hm_legacy(name); real=sqlite3.Connection.execute
+            if prep: prep(dp)
+            def _ex(self_,sql,*a):
+                if isinstance(sql,str) and sql.startswith("UPDATE db_meta SET value='done'"): raise sqlite3.OperationalError("database is locked")
+                return real(self_,sql,*a)
+            with mock.patch.object(BhConnection,'execute',_ex): _hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp))
+            return dp,_history_path_for(dp)
+        def _hm79_trace(dp): return _q(dp,f"SELECT value FROM db_meta WHERE key='{_HIST_DROPPED_KEY}'",one=True)
+        def _hm79_mark(hp): return _q(hp,"SELECT value FROM db_meta WHERE key='migrated_from_diff'",one=True)
+        def _hm79_copied_repair():
+            """Revue story 79 : étape « done » en échec (verrou de history.db, injecté ; écrivain : « DB occupée » sur history.db,
+            jamais sur diff.db) — marqueur resté 'copied', diff.db déjà vidée de ses mesures mais encore à la version 4 (jamais
+            tamponnée) ; ouverture suivante (lecteur) : marqueur passé à 'done', diff.db tamponnée, aucune recopie ni message ;
+            ouverture d'après : history.db plus jamais ouverte. Revue 2 : réparation d'un lecteur avec history.db tenue -> rien
+            (≤ ~2 s, délai demandé 2, muet : aucune mesure ne manque), marqueur toujours 'copied', diff.db non tamponnée,
+            réparée une fois relâchée ; history.db corrompue -> « DB corrompue » qui nomme history.db, jamais « Supprimez » ni
+            diff.db ; history.db disparue -> jamais recréée."""
+            res={}
+            def _ex_done(real):
+                def _ex(self_,sql,*a):
+                    if isinstance(sql,str) and sql.startswith("UPDATE db_meta SET value='done'"): raise sqlite3.OperationalError("database is locked")
+                    return real(self_,sql,*a)
+                return _ex
+            def copied(name):
+                dp=_hm_legacy(name)
+                with mock.patch.object(BhConnection,'execute',_ex_done(sqlite3.Connection.execute)):
+                    out,exc,_=_hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp))
+                return dp,_history_path_for(dp),out,exc
+            def state(dp,hp):
+                c=sqlite3.connect(dp); ver=c.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()[0]
+                t={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}; c.close()
+                h=sqlite3.connect(hp); m=h.execute("SELECT value FROM db_meta WHERE key='migrated_from_diff'").fetchone()[0]; h.close()
+                return ver,'repo_stats' in t or 'bkp_status' in t,m
+            dp,hp,out,exc=copied('m19'); s1=state(dp,hp)
+            out2,exc2,_=_hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,create=False))
+            s2=state(dp,hp)
+            seen,rec=_hm79_open_rec()
+            with mock.patch(f"{__name__}._open_db",rec): out3,exc3,_=_hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,create=False))
+            res['réparé à l\'ouverture suivante']=(isinstance(exc,SystemExit) and f"DB occupée : {hp}" in out and f"DB occupée : {dp}" not in out
+                and s1==('4',False,'copied') and exc2 is None and not out2.strip() and s2==(str(DIFF_DB_SCHEMA_VERSION),False,'done')
+                and _hm_snapshot(dp)==_HM_EXPECT and exc3 is None and seen==[],exc,s1,exc2,out2,s2,exc3,seen,out[-200:])
+            dp,hp,_,_=copied('m19h'); db=BorgHelperDB(hm_dir,'rc'); hold=_hm79_hold(hp); seen,rec=_hm79_open_rec()
+            try:
+                with mock.patch(f"{__name__}._open_db",rec): o,e,dt=_hm79_out(lambda: db.ensure_diff_db(dp,create=False))
+            finally: hold.rollback(); hold.close()
+            sh=state(dp,hp); db._reader_skipped.clear()
+            o2,e2,_=_hm79_out(lambda: db.ensure_diff_db(dp,create=False))
+            res['lecteur, history.db tenue : rien, puis réparé']=(e is None and not o.strip() and dt<6 and seen==[_READER_WRITE_WAIT]
+                and sh==('4',False,'copied') and e2 is None and not o2.strip() and state(dp,hp)==(str(DIFF_DB_SCHEMA_VERSION),False,'done'),
+                e,o,round(dt,1),seen,sh,e2,o2,state(dp,hp))
+            dp,hp,_,_=copied('m19c')
+            for f in (hp+'-wal',hp+'-shm'):
+                if os.path.exists(f): os.unlink(f)
+            with open(hp,'wb') as f: f.write(b'pas une base SQLite '*400)
+            o0,e0,_=_hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,create=False))   # revue 4 : lecteur, réparation sautée
+            o,e,_=_hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp))
+            res['history.db corrompue : lecteur muet ; écrivain : nommée, jamais « Supprimez … diff.db »']=(e0 is None and not o0.strip()
+                and _hm79_trace(dp)==('1',) and isinstance(e,SystemExit) and e.code==1 and f"[ERREUR] DB corrompue : {hp}" in o
+                and 'Supprimez' not in o and dp not in o,e0,o0[-200:],e,o[-300:])
+            dp,hp,_,_=copied('m19g')
+            for f in (hp,hp+'-wal',hp+'-shm'):
+                if os.path.exists(f): os.unlink(f)
+            real_exists=os.path.exists
+            def exists(x): return True if x==hp else real_exists(x)   # disparue entre le test d'existence et l'ouverture
+            with mock.patch.object(os.path,'exists',exists): o,e,_=_hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,create=False))
+            res['history.db disparue : jamais recréée']=(e is None and not real_exists(hp),e,o[-200:])
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("history.db : marqueur resté 'copied' (étape « done » en échec) -> passé à 'done' à l'ouverture suivante (story 79, revue)",_hm79_copied_repair)
+        def _hm79_dropped_trace():
+            """Revue 3 story 79 : trace du retrait (diff.db db_meta, même transaction que le DROP). (a) 'done' jamais posé après le
+            retrait, puis un binaire d'avant recrée repo_stats/bkp_status et y écrit : ouverture suivante -> ses lignes recopiées
+            (repo_stats sans id imposé, bkp_status sans doublon), marqueur 'done', trace effacée, tables retirées (avant : 'copied'
+            -> copie sautée, lignes perdues au DROP). (b) tué AVANT le retrait (pas de trace) : relance = retrait seul, aucun
+            doublon dans repo_stats, trace effacée à la fin."""
+            res={}
+            dp,hp=_hm79_done_failed('m20a'); t0,m0=_hm79_trace(dp),_hm79_mark(hp)
+            c=sqlite3.connect(dp)
+            c.executescript("""
+                CREATE TABLE repo_stats (id INTEGER PRIMARY KEY AUTOINCREMENT, nick TEXT, op TEXT, unique_csize INTEGER,
+                    total_size INTEGER, total_csize INTEGER, updated_at TEXT DEFAULT (datetime('now')));
+                CREATE TABLE bkp_status (nick TEXT NOT NULL, run_id TEXT NOT NULL, started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    finished_at TEXT, result TEXT, notified_at TEXT, changed_during_backup INTEGER, read_errors INTEGER,
+                    start_notified_at TEXT, PRIMARY KEY (nick, run_id));
+                INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize) VALUES ('hm','bkp',7,7,7);
+                INSERT INTO bkp_status (nick,run_id,result) VALUES ('hm','r-old','success');
+            """); c.commit(); c.close()
+            out,exc,_=_hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,create=False))
+            rs,bs,am=_hm_snapshot(dp)
+            res['(a) copied + trace : lignes recopiées']=(t0==('1',) and m0==('copied',) and exc is None and rs[:3]==_HM_EXPECT[0] and len(rs)==4
+                and rs[3][1:]==('hm','bkp',7,7,7) and {b[1] for b in bs}=={'r1','r2','r-old'} and _hm79_mark(hp)==('done',)
+                and _hm79_trace(dp) is None and _hm_diff_clean(dp),t0,m0,exc,rs,bs,_hm79_mark(hp),_hm79_trace(dp),out[-200:])
+            dp=_hm_legacy('m20b'); real=sqlite3.Connection.execute
+            class _Kill(BaseException): pass
+            def _ex(self_,sql,*a):
+                if isinstance(sql,str) and sql.startswith("DROP TABLE"): raise _Kill()
+                return real(self_,sql,*a)
+            with mock.patch.object(BhConnection,'execute',_ex):
+                try: _hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,create=False)); killed=False
+                except _Kill: killed=True
+            t1,m1=_hm79_trace(dp),_hm79_mark(_history_path_for(dp))
+            out,exc,_=_hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,create=False))
+            res['(b) tué avant le retrait : aucun doublon']=(killed and t1 is None and m1==('copied',) and exc is None and _hm_snapshot(dp)==_HM_EXPECT
+                and _hm79_trace(dp) is None and _hm_diff_clean(dp),killed,t1,m1,exc,_hm_snapshot(dp)[0])
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("history.db : trace du retrait dans diff.db — 'copied' après retrait puis tables recréées -> recopiées ; tué avant -> aucun doublon (story 79, revue 3)",_hm79_dropped_trace)
+        def _hm79_copied_nometa():
+            """Revue 3 story 79 : réparation de 'copied' sur une history.db de 0 octet (sans db_meta), lecteur, diff.db à une
+            version < 10 sans rien à migrer — avec et sans trace du retrait : aucun message, aucune exception (avant : « no such
+            table » -> « DB corrompue », exit), diff.db tamponnée, trace effacée."""
+            res={}
+            for lbl in ('trace','sans trace'):
+                dp,hp=_hm79_done_failed('m21'+('t' if lbl=='trace' else 's'))
+                if lbl=='sans trace':
+                    c=sqlite3.connect(dp); c.execute(f"DELETE FROM db_meta WHERE key='{_HIST_DROPPED_KEY}'"); c.commit(); c.close()
+                for f in (hp+'-wal',hp+'-shm'):
+                    if os.path.exists(f): os.unlink(f)
+                open(hp,'wb').close()
+                out,exc,_=_hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,create=False))
+                ver=_q(dp,"SELECT value FROM db_meta WHERE key='schema_version'",one=True)
+                res[lbl]=(exc is None and not out.strip() and ver==(str(DIFF_DB_SCHEMA_VERSION),) and _hm79_trace(dp) is None,exc,out[-200:],ver)
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("history.db : marqueur 'copied' à réparer, history.db de 0 octet (sans db_meta) -> muet, rien levé (story 79, revue 3)",_hm79_copied_nometa)
+        def _hm79_repair_guards():
+            """Revue 4 story 79 : réparation de 'copied' (rien à migrer) — (a) diff.db d'un schéma plus récent que ce code, avec
+            trace et history.db à 'copied' : rien touché (marqueur 'copied', trace gardée), SchemaVersionError comme avant ;
+            (b) lecteur, history.db illisible (version < 10 sans trace, et avec trace) : réparation sautée en silence, rien levé
+            par ensure_diff_db, trace gardée (l'accès réel du lecteur à history.db dira le problème)."""
+            res={}
+            dp,hp=_hm79_done_failed('m23a')
+            c=sqlite3.connect(dp); c.execute("UPDATE db_meta SET value=? WHERE key='schema_version'",(str(DIFF_DB_SCHEMA_VERSION+1),)); c.commit(); c.close()
+            m0=os.stat(hp).st_mtime_ns; time.sleep(0.05)
+            out,exc,_=_hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,create=False))
+            res['(a) schéma plus récent : rien touché']=(isinstance(exc,SchemaVersionError) and _hm79_mark(hp)==('copied',) and _hm79_trace(dp)==('1',)
+                                                         and os.stat(hp).st_mtime_ns==m0,exc,_hm79_mark(hp),_hm79_trace(dp))
+            for lbl in ('trace','version < 10'):
+                dp,hp=_hm79_done_failed('m23'+('t' if lbl=='trace' else 'v'))
+                if lbl!='trace':
+                    c=sqlite3.connect(dp); c.execute(f"DELETE FROM db_meta WHERE key='{_HIST_DROPPED_KEY}'"); c.commit(); c.close()
+                for f in (hp+'-wal',hp+'-shm'):
+                    if os.path.exists(f): os.unlink(f)
+                with open(hp,'wb') as f: f.write(b'pas une base SQLite '*400)
+                out,exc,_=_hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,create=False))
+                res[f'(b) lecteur, history.db illisible, {lbl}']=(exc is None and not out.strip() and _hm79_trace(dp)==(('1',) if lbl=='trace' else None),
+                                                                 exc,out[-200:],_hm79_trace(dp))
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("history.db : réparation de 'copied' — schéma plus récent jamais touché, lecteur sur history.db illisible muet (story 79, revue 4)",_hm79_repair_guards)
+        def _hm79_trace_ce():
+            """Revue 4 story 79 : trace du retrait sur une base d'avant 1.0.139 dont les seules mesures sont les colonnes C/E
+            d'archive_stats (ni repo_stats ni bkp_status) : 'done' jamais posé après le retrait, puis un binaire d'avant remet
+            C/E et les remplit (A2 déjà migrée, A4 nouvelle) — ouverture suivante : mesures recopiées sans doublon (A4 ajoutée),
+            marqueur 'done', trace effacée."""
+            def prep(dp):
+                c=sqlite3.connect(dp); c.executescript("DROP TABLE repo_stats; DROP TABLE bkp_status;"); c.commit(); c.close()
+            dp,hp=_hm79_done_failed('m24',prep)
+            t0,m0=_hm79_trace(dp),_hm79_mark(hp)
+            c=sqlite3.connect(dp)
+            cols=[r[1] for r in c.execute("PRAGMA table_info(archive_stats)")]
+            for col in ('changed_during_backup','read_errors'):
+                if col not in cols: c.execute(f"ALTER TABLE archive_stats ADD COLUMN {col} INTEGER")
+            c.execute("UPDATE archive_stats SET changed_during_backup=3,read_errors=1 WHERE archive='A2'")
+            c.execute("INSERT INTO archive_stats (nick,archive,archive_date,duration,original_size,compressed_size,deduplicated_size,nfiles,changed_during_backup,read_errors) "
+                      "VALUES ('hm','A4','2026-04-01T00:00:00',4,40,32,24,130,5,2)"); c.commit(); c.close()
+            out,exc,_=_hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,create=False))
+            am=_hm_snapshot(dp)[2]
+            ok=(t0==('1',) and m0==('copied',) and exc is None and am==_HM_EXPECT[2]+[('hm','A4','2026-04-01T00:00:00',24,5,2)]
+                and _hm79_mark(hp)==('done',) and _hm79_trace(dp) is None)
+            if not ok: print(f"  {t0} {m0} {exc} {am} {_hm79_mark(hp)} {_hm79_trace(dp)} {out[-200:]}")
+            return ok
+        check("history.db : trace du retrait, base à colonnes C/E seules -> mesures recopiées sans doublon (story 79, revue 4)",_hm79_trace_ce)
+        def _hm79_warn_rules():
+            """Revue 3 story 79 : avertissement d'un lecteur qui n'a pas migré — (a) canal : stderr seul (stdout vide) ; (b) base
+            partagée (DB_NAME) : nommée par sa base (« [WARN] partagee: … ») ; (c) diff.db d'un schéma plus récent que ce code,
+            tenue : aucun avertissement (SchemaVersionError comme avant) ; (d) history_path d'un écrivain (Bkp, Prune :
+            create=False, sonde 60 s), base d'avant 1.0.139, diff.db tenue : muet, comme avant."""
+            res={}
+            dp=_hm_legacy('m22a'); hp=_history_path_for(dp)
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): BorgHelperDB(hm_dir,'rc').ensure_history_db(hp)
+            hold=_hm79_hold(hp); so,se=io.StringIO(),io.StringIO()
+            try:
+                with contextlib.redirect_stdout(so),contextlib.redirect_stderr(se): BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,create=False)
+            finally: hold.rollback(); hold.close()
+            res['(a) stderr']=(not so.getvalue().strip() and f"[WARN] m22a: {_MIGR_PENDING_TXT} (history.db occupée)" in se.getvalue(),so.getvalue(),se.getvalue())
+            d=os.path.join(tmp,'warn79'); os.makedirs(d); rc=os.path.join(d,'rc')
+            with open(rc,'w') as f: f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nSER_NAME=h\nSER_LOGIN=x\nGLOB_ARCH=*\nDB_ENCRYPT=false\n\n"
+                                           f"[w1]\nBORG_REPO={d}/r1\nDB_NAME=partagee\n\n[w2]\nBORG_REPO={d}/r2\n\n")
+            os.chmod(rc,0o600)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); p1=b.db.get_diff_db('w1'); os.makedirs(os.path.dirname(p1),exist_ok=True)
+            shutil.copy(_hm_legacy('m22b'),p1); h1=_history_path_for(p1)
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db.ensure_history_db(h1)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); hold=_hm79_hold(h1)
+            try: out,exc,_=_hm79_out(lambda: b.db.ensure_diff_db(p1,create=False))
+            finally: hold.rollback(); hold.close()
+            res['(b) DB_NAME']=(exc is None and os.path.basename(p1).endswith('-partagee-diff.db') and f"[WARN] partagee: {_MIGR_PENDING_TXT}" in out,p1,exc,out[-200:])
+            dp=_hm_legacy('m22c')
+            c=sqlite3.connect(dp); c.execute("UPDATE db_meta SET value=? WHERE key='schema_version'",(str(DIFF_DB_SCHEMA_VERSION+1),)); c.commit(); c.close()
+            hold=sqlite3.connect(dp,isolation_level=None); hold.execute("BEGIN IMMEDIATE")
+            try: out,exc,_=_hm79_out(lambda: BorgHelperDB(hm_dir,'rc').ensure_diff_db(dp,create=False))
+            finally: hold.rollback(); hold.close()
+            res['(c) schéma plus récent']=(isinstance(exc,SchemaVersionError) and _MIGR_PENDING_TXT not in out,exc,out[-200:])
+            p2=b.db.get_diff_db('w2'); shutil.copy(_hm_legacy('m22d'),p2)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            hold=sqlite3.connect(p2,isolation_level=None); hold.execute("BEGIN IMMEDIATE")
+            try: out,exc,dt=_hm79_out(lambda: b.db.history_path('w2',writer=True))
+            finally: hold.rollback(); hold.close()
+            res['(d) history_path écrivain : muet']=(exc is None and not out.strip() and dt<15,exc,round(dt,1),out[-200:])
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("history.db : avertissement du lecteur — stderr, base partagée nommée, schéma plus récent muet, history_path écrivain muet (story 79, revue 3)",_hm79_warn_rules)
+        def _hm79_xs_env(sub,orphan,extra='',borg_exe='/bin/false',enc=False):
+            """Nick xs (DIFF_KEEP=1, en clair) : archives A1-A3, paire (A2,A3) indexée (2 ajouts) avec ses exclus (3 ajouts) ;
+            orphan : exclus (7 ajouts) d'une paire (A1,A2) purgée par un DIFF_KEEP d'avant 1.0.140 (paire et diff_index retirés)."""
+            d=os.path.join(tmp,sub); os.makedirs(os.path.join(d,'repo')); rc=os.path.join(d,'rc')
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nSER_NAME=h\nSER_LOGIN=x\nGLOB_ARCH=*\nDB_ENCRYPT=false\n\n"
+                        f"[xs]\nBORG_REPO={d}/repo\nBORG_EXE={borg_exe}\nDIFF_KEEP=1\nSTATS_RETENTION_MONTHS=1200\n{extra}"
+                        +("BORG_PASSPHRASE=pw\nDB_KDF=light\nDB_ENCRYPT=true\n" if enc else "")+"\n")
+            os.chmod(rc,0o600)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); p=b.db.get_diff_db('xs')
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db.ensure_diff_db(p,nick='xs')
+            c=_open_db(p,nick='xs',role='write')
+            try:
+                for a,dt in (('A1','2026-01-01T00:00:00'),('A2','2026-02-01T00:00:00'),('A3','2026-03-01T00:00:00')):
+                    c.execute("INSERT INTO archive_stats (nick,archive,archive_date,nfiles) VALUES ('xs',?,?,10)",(a,dt))
+                c.execute("INSERT INTO diff_indexed_pairs (nick,archive_old,archive_new,entry_count) VALUES ('xs','A2','A3',2)")
+                for f_ in ('f1','f2'):
+                    c.execute("INSERT INTO diff_index (nick,archive_old,archive_new,archive_new_date,change_type,path,size_before,size_after) "
+                              "VALUES ('xs','A2','A3','2026-03-01T00:00:00','added',?,NULL,100)",(_path_stored(c,f_),))
+                c.execute("INSERT INTO diff_excluded_stats (nick,archive_old,archive_new,change_type,file_count,total_size) VALUES ('xs','A2','A3','added',3,300)")
+                if orphan: c.execute("INSERT INTO diff_excluded_stats (nick,archive_old,archive_new,change_type,file_count,total_size) VALUES ('xs','A1','A2','added',7,700)")
+                c.commit()
+            finally: c.close()
+            return b,p
+        def _hm79_index(b,p,nick='xs'):
+            """Une passe d'Index (_index_pass) : borg list simulé (A1-A3), tout autre borg en échec ; sortie rendue."""
+            arch=[{'name':n,'start':s} for n,s in (('A1','2026-01-01T00:00:00.000000'),('A2','2026-02-01T00:00:00.000000'),('A3','2026-03-01T00:00:00.000000'))]
+            def boex(nick,cmd,*a,**k):
+                if cmd and cmd[0]=='list' and '--format' not in cmd: return {'exitcode':0,'stdout':[{'archives':arch}],'stderr':[]}
+                return {'exitcode':2,'stdout':[],'stderr':['borg simulé (contrôle story 79)']}
+            plan={'tranche':False,'deadline':None,'natures':{'stats','snap','diff'},'period':None,'snap_only':False,'done':set(),
+                  'shadow':None,'sdone':set(),'recheck':False,'rk':True}
+            with mock.patch.object(b.borg,'boex',boex),mock.patch.object(b,'_index_stop_reason',lambda *a: None):
+                out,exc,_=_hm79_out(lambda: b._index_pass(nick,0,p,False,None,plan))
+            return out,exc
+        def _hm79_added(b):
+            out=io.StringIO()
+            with contextlib.redirect_stdout(out),contextlib.redirect_stderr(io.StringIO()): b.archive_history('xs',as_json=True)
+            j=json.loads(out.getvalue()); rows=j.get('rows',j) if isinstance(j,dict) else j
+            return {r.get('archive'):r.get('files_added') for r in rows if isinstance(r,dict)}
+        def _hm79_excl(p): return _q(p,"SELECT archive_old,archive_new,change_type,file_count,total_size FROM diff_excluded_stats ORDER BY archive_old")
+        def _hm79_orphans():
+            """D199 : exclus orphelins d'une paire purgée avant 1.0.140 -> retirés par l'Index (passe _index_pass, même passe que
+            le rapprochement) ; ArchiveHistory : « — » (None) pour A2 (avant : « files_added: 7 ») ; exclus de la paire indexée
+            (A2,A3) et comptage de A3 inchangés. Lecteurs : ArchiveHistory avant l'Index lit encore 7 (jamais de retrait par un lecteur).
+            Revue 4 : IdxTop (exclus du nick sommés sans jointure : « Exclus : 10 entrées », A2 dans « Inchangés par archive ») et
+            DiffTop -b A1,A2 (exclus de la paire purgée : « Exclus : 7 entrées ») corrigés aussi par l'Index."""
+            b,p=_hm79_xs_env('xs79o',True)
+            def txt(fn):
+                o=io.StringIO()
+                with contextlib.redirect_stdout(o),contextlib.redirect_stderr(o): fn()
+                return o.getvalue()
+            before=_hm79_added(b); ex0=_hm79_excl(p); it0=txt(lambda: b.idxtop('xs')); dt0=txt(lambda: b.difftop('xs',bkp='A1,A2'))
+            out,exc=_hm79_index(b,p)
+            after=_hm79_added(b); ex1=_hm79_excl(p); it1=txt(lambda: b.idxtop('xs')); dt1=txt(lambda: b.difftop('xs',bkp='A1,A2'))
+            ok=(before.get('A2')==7 and len(ex0)==2 and ex1==[('A2','A3','added',3,300)] and after.get('A2') is None
+                and after.get('A3')==before.get('A3') and after.get('A3') is not None and '[WARN] xs: exclus orphelins' not in out
+                and 'Exclus  : 10 entrées' in it0 and '  A2 :' in it0 and 'Exclus  : 3 entrées' in it1 and '  A2 :' not in it1
+                and 'Exclus  : 7 entrées' in dt0 and 'Exclus' not in dt1 and 'aucune entrée pour cette paire (A1 → A2)' in dt1)
+            if not ok: print(f"  {before} {after} {ex0} {ex1} {exc} {out[-300:]} {it0[-300:]!r} {it1[-300:]!r} {dt0[-200:]!r} {dt1[-200:]!r}")
+            return ok
+        check("Index : exclus orphelins d'une paire purgée avant 1.0.140 retirés ; ArchiveHistory « — » (story 79, D199)",_hm79_orphans)
+        def _hm79_orphans_none():
+            """D199 témoin : exclus d'une paire indexée seulement -> l'Index n'y touche pas (lignes et ArchiveHistory identiques) ;
+            sans orphelin, aucune écriture (diff.db et son -wal inchangés : taille et mtime) ; base occupée : [WARN], rien retiré,
+            jamais d'exception."""
+            b,p=_hm79_xs_env('xs79t',False)
+            before=_hm79_added(b); ex0=_hm79_excl(p)
+            out,exc=_hm79_index(b,p)
+            after=_hm79_added(b); ex1=_hm79_excl(p)
+            def sig(): return [(os.path.getsize(f),os.stat(f).st_mtime_ns) if os.path.exists(f) else None for f in (p,p+'-wal')]
+            seen=[]; real=_open_db
+            def rec(path,*a,**k):
+                if os.fsdecode(path)==p: seen.append(k.get('timeout'))
+                return real(path,*a,**k)
+            s0=sig(); time.sleep(0.05)
+            o2,e2,_=_hm79_out(lambda: b._drop_orphan_exclusions('xs',p))
+            s1=sig()
+            c=sqlite3.connect(p); c.execute("INSERT INTO diff_excluded_stats VALUES ('xs','A1','A2','added',7,700)"); c.commit(); c.close()
+            hold=sqlite3.connect(p,isolation_level=None); hold.execute("BEGIN IMMEDIATE")
+            try:
+                with mock.patch(f"{__name__}._open_db",rec): o3,e3,dt=_hm79_out(lambda: b._drop_orphan_exclusions('xs',p))
+            finally: hold.rollback(); hold.close()
+            ok=(ex0==ex1==[('A2','A3','added',3,300)] and before==after and before.get('A3') is not None and e2 is None and not o2.strip()
+                and s0==s1 and e3 is None and dt<6 and '[WARN] xs: exclus orphelins' in o3 and len(_hm79_excl(p))==2 and seen==[_READER_WRITE_WAIT])
+            if not ok: print(f"  {before} {after} {ex0} {ex1} {s0} {s1} {e2} {o2!r} {e3} {o3!r} {round(dt,1)} {seen}")
+            return ok
+        check("Index : exclus d'une paire indexée inchangés, aucune écriture sans orphelin, base occupée -> [WARN] (story 79, D199 témoin)",_hm79_orphans_none)
+        def _hm79_diffbkp_exclu():
+            """Revue story 79 : exclus d'une paire écrits dans la transaction de la paire (store_diff_entries exclu=…) — écrits
+            avec elle ; paire déjà présente -> exclus non réécrits ; échec pendant l'écriture des exclus -> rien écrit, ni paire
+            ni exclu ; DiffBkp : exclus passés par cet argument, rien écrit si l'écriture de la paire échoue (avant : exclus
+            écrits à part, orphelins)."""
+            res={}
+            b,p=_hm79_xs_env('xs79d',False,extra='IDX_EXCLUDE=tmp/\n')
+            q=lambda o,n: [r for r in _hm79_excl(p) if r[:2]==(o,n)]
+            pair=lambda o,n: _q(p,f"SELECT count(*) FROM diff_indexed_pairs WHERE archive_old='{o}' AND archive_new='{n}'",one=True)[0]
+            E=[{'path':'g1','change_type':'added','size_after':1}]
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                ok1=b.db.store_diff_entries('xs','B1','B2','2026-02-01T00:00:00',E,p,exclu={'added':{'count':4,'size':40}})
+                ok2=b.db.store_diff_entries('xs','B1','B2','2026-02-01T00:00:00',E,p,exclu={'added':{'count':9,'size':90}})
+            res['paire et exclus ensemble ; paire déjà là : exclus intacts']=(ok1 is True and ok2 is True and pair('B1','B2')==1
+                                                                           and q('B1','B2')==[('B1','B2','added',4,40)],ok1,ok2,q('B1','B2'))
+            realm=sqlite3.Connection.executemany
+            def _em(self_,sql,*a):
+                if isinstance(sql,str) and 'diff_excluded_stats' in sql: raise sqlite3.OperationalError("disk I/O error (contrôle)")
+                return realm(self_,sql,*a)
+            with mock.patch.object(BhConnection,'executemany',_em),contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                ok3=b.db.store_diff_entries('xs','C1','C2','2026-02-01T00:00:00',E,p,exclu={'added':{'count':4,'size':40}})
+            res['échec : ni paire ni exclu']=(ok3 is False and pair('C1','C2')==0 and q('C1','C2')==[],ok3,pair('C1','C2'),q('C1','C2'))
+            arch=[{'name':'A1','start':'2026-01-01T00:00:00.000000','archive':'A1','time':'2026-01-01T00:00:00.000000','id':'1'},
+                  {'name':'A2','start':'2026-02-01T00:00:00.000000','archive':'A2','time':'2026-02-01T00:00:00.000000','id':'2'}]
+            lines=[json.dumps({'path':'tmp/x','changes':[{'type':'added','size':5}]}),json.dumps({'path':'etc/y','changes':[{'type':'added','size':6}]})]
+            def boex(nick,cmd,*a,**k):
+                if cmd and cmd[0]=='list': return {'exitcode':0,'stdout':[{'archives':arch}],'stderr':[]}
+                if cmd and cmd[0]=='diff': return {'exitcode':0,'stdout':list(lines),'stderr':[]}
+                return {'exitcode':2,'stdout':[],'stderr':['borg simulé']}
+            seen=[]; ok0=lambda e: e is None or (isinstance(e,SystemExit) and e.code in (0,None))   # DiffBkp finit par sys.exit(0)
+            def failing(*a,**k): seen.append(k.get('exclu')); return False
+            with mock.patch.object(b.borg,'boex',boex),mock.patch.object(b.db,'store_diff_entries',failing):
+                o,e,_=_hm79_out(lambda: b.diffbkp('xs','A1','A2'))
+            res['DiffBkp, paire en échec : aucun exclu']=(ok0(e) and seen==[{'added':{'count':1,'size':5}}] and q('A1','A2')==[] and pair('A1','A2')==0,e,seen,q('A1','A2'),o[-200:])
+            with mock.patch.object(b.borg,'boex',boex): o,e,_=_hm79_out(lambda: b.diffbkp('xs','A1','A2'))
+            res['DiffBkp : paire et exclus']=(ok0(e) and pair('A1','A2')==1 and q('A1','A2')==[('A1','A2','added',1,5)],e,q('A1','A2'),o[-200:])
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("DiffBkp : exclus écrits dans la transaction de leur paire, jamais sans elle (story 79, revue)",_hm79_diffbkp_exclu)
+        def _hm79_index_exclu_pair():
+            """Revue 2 story 79 : écriture des paires de l'Index (_index_diffs), jumelle de store_diff_entries — paire déjà écrite
+            (DiffBkp en même temps : is_diff_pair_indexed lu False, INSERT OR IGNORE sans effet) -> exclus non réécrits ni
+            lignes réinsérées ; paire neuve -> exclus écrits avec elle. Vrai borg diff remplacé par un exécutable factice
+            (BORG_EXE : `diff` rend un ajout exclu par IDX_EXCLUDE et un ajout indexé ; tout le reste en échec)."""
+            fb=os.path.join(tmp,'fakeborg79i.py')
+            with open(fb+'.tmp','w') as f:
+                f.write(f"#!{sys.executable}\nimport sys,json\nif len(sys.argv)>1 and sys.argv[1]=='diff':\n"
+                        "    print(json.dumps({'path':'tmp/z','changes':[{'type':'added','size':9}]}))\n"
+                        "    print(json.dumps({'path':'etc/k','changes':[{'type':'added','size':8}]}))\n    sys.exit(0)\nsys.exit(2)\n")
+            os.chmod(fb+'.tmp',0o755); os.replace(fb+'.tmp',fb)
+            b,p=_hm79_xs_env('xs79i',False,extra='IDX_EXCLUDE=tmp/\n',borg_exe=fb)
+            nrows=lambda: _q(p,"SELECT count(*) FROM diff_index WHERE archive_old='A2' AND archive_new='A3'",one=True)[0]
+            with mock.patch.object(b.db,'is_diff_pair_indexed',lambda *a,**k: False): o1,e1=_hm79_index(b,p)
+            x1=_hm79_excl(p); n1=nrows()
+            c=sqlite3.connect(p)
+            for t in ('diff_index','diff_indexed_pairs','diff_excluded_stats'): c.execute(f"DELETE FROM {t} WHERE archive_old='A2' AND archive_new='A3'")
+            c.commit(); c.close()
+            o2,e2=_hm79_index(b,p); x2=_hm79_excl(p); n2=nrows()
+            ok=(x1==[('A2','A3','added',3,300)] and n1==2 and x2==[('A2','A3','added',1,9)] and n2==1)
+            if not ok: print(f"  {x1} {n1} {x2} {n2} {e1} {e2} {o1[-300:]} {o2[-300:]}")
+            return ok
+        check("Index : exclus écrits avec leur paire seulement si cette passe l'a écrite (story 79, revue 2)",_hm79_index_exclu_pair)
+        def _hm79_orphans_bases():
+            """Revue 2 story 79 : _drop_orphan_exclusions — base illisible : [WARN], rien levé ; base chiffrée (siv1) sans clé :
+            [WARN] dans la passe d'Index, rien levé par cette étape, exclus gardés ; base chiffrée avec clé : orphelins retirés par
+            la passe d'Index, exclus de la paire indexée intacts."""
+            res={}; W='[WARN] xs: exclus orphelins (paires purgées avant 1.0.140) non retirés'
+            b,p=_hm79_xs_env('xs79u',True)
+            for f in (p+'-wal',p+'-shm'):
+                if os.path.exists(f): os.unlink(f)
+            with open(p,'wb') as f: f.write(b'pas une base SQLite '*400)
+            o,e,_=_hm79_out(lambda: b._drop_orphan_exclusions('xs',p))
+            res['illisible']=(e is None and W in o and '[ERREUR]' not in o,e,o[-200:])
+            b,p=_hm79_xs_env('xs79k',True,enc=True)
+            c=sqlite3.connect(p); hdr=_enc_header_read(c); c.close()
+            o,e=_hm79_index(b,p)
+            res['chiffrée avec clé : retirés']=(hdr is not None and _hm79_excl(p)==[('A2','A3','added',3,300)] and W not in o,hdr is not None,_hm79_excl(p),e,o[-300:])
+            b,p=_hm79_xs_env('xs79n',True,enc=True)
+            rc=os.path.join(tmp,'xs79n','rc'); rc2=rc+'-sansclé'
+            with open(rc2,'w') as f: f.write(''.join(l for l in open(rc) if not l.startswith('BORG_PASSPHRASE')))
+            os.chmod(rc2,0o600)
+            b2=BorgHelper(cfgfile=rc2,cache_dir=os.path.join(tmp,'xs79n','cache'))
+            o,e,_=_hm79_out(lambda: b2._drop_orphan_exclusions('xs',p))
+            o2,e2=_hm79_index(b2,p)
+            # passe d'Index : l'étape dit [WARN] et laisse la passe continuer ; une DbKeyError levée PLUS LOIN (autre étape, base
+            # chiffrée sans passphrase) est hors de cette étape — jamais levée par _drop_orphan_exclusions
+            import traceback as _tb
+            mine=e2 is not None and any(f.name=='_drop_orphan_exclusions' for f in _tb.extract_tb(e2.__traceback__))
+            res['chiffrée sans clé : [WARN], rien levé, gardés']=(e is None and W in o and W in o2 and '[ERREUR]' not in o and len(_hm79_excl(p))==2
+                                                                  and not mine and (e2 is None or isinstance(e2,DbKeyError)),e,e2,mine,o[-200:],o2[-300:])
+            # revue 4 : base disparue avant l'appel -> 0, jamais recréée, muet
+            b,p=_hm79_xs_env('xs79g',True)
+            for f in (p,p+'-wal',p+'-shm'):
+                if os.path.exists(f): os.unlink(f)
+            r=[None]; o,e,_=_hm79_out(lambda: r.__setitem__(0,b._drop_orphan_exclusions('xs',p)))
+            res['disparue : rien recréé, muet']=(e is None and r[0]==0 and not os.path.exists(p) and not o.strip(),e,r[0],os.path.exists(p),o[-200:])
+            # revue 4 : base partagée (DB_NAME) — orphelins de deux nicks : seuls ceux du nick indexé retirés
+            d=os.path.join(tmp,'xs79s'); os.makedirs(os.path.join(d,'r1')); os.makedirs(os.path.join(d,'r2')); rc=os.path.join(d,'rc')
+            with open(rc,'w') as f: f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nSER_NAME=h\nSER_LOGIN=x\nGLOB_ARCH=*\nDB_ENCRYPT=false\n\n"
+                                           f"[s1]\nBORG_REPO={d}/r1\nBORG_EXE=/bin/false\nDIFF_KEEP=1\nDB_NAME=sh\n\n[s2]\nBORG_REPO={d}/r2\nBORG_EXE=/bin/false\nDB_NAME=sh\n\n")
+            os.chmod(rc,0o600)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); p=b.db.get_diff_db('s1')
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db.ensure_diff_db(p,nick='s1')
+            c=_open_db(p,nick='s1',role='write')
+            try:
+                for a,dt in (('A1','2026-01-01T00:00:00'),('A2','2026-02-01T00:00:00'),('A3','2026-03-01T00:00:00')):
+                    c.execute("INSERT INTO archive_stats (nick,archive,archive_date,nfiles) VALUES ('s1',?,?,10)",(a,dt))
+                c.execute("INSERT INTO diff_indexed_pairs (nick,archive_old,archive_new,entry_count) VALUES ('s1','A2','A3',0)")
+                c.executemany("INSERT INTO diff_excluded_stats VALUES (?,?,?,'added',?,?)",
+                              [('s1','A2','A3',3,300),('s1','A1','A2',7,700),('s2','B1','B2',5,500)])
+                c.commit()
+            finally: c.close()
+            o,e=_hm79_index(b,p,'s1')
+            left=_q(p,"SELECT nick,archive_old,archive_new FROM diff_excluded_stats ORDER BY nick,archive_old")
+            res['DB_NAME partagée : seul le nick indexé']=(left==[('s1','A2','A3'),('s2','B1','B2')] and b.db.get_diff_db('s2')==p,left,e,o[-300:])
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("Index : exclus orphelins — base illisible, chiffrée sans clé ([WARN], rien levé), chiffrée avec clé (retirés) (story 79, revue 2)",_hm79_orphans_bases)
         def _hm_diff_discarded():
             """diff.db supprimée puis reconstruite (rattrapage borg info, autres tailles dédupliquées) : ArchiveHistory
             et RepoHistory rendent les mêmes mesures (C/E, taille dédupliquée mesurée) qu'avant."""

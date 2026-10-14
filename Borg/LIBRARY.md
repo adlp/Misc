@@ -55,6 +55,12 @@ du schéma (`_db_has_schema`) attend elle aussi 2 s au plus avec `create=False` 
 SQLite au premier accès, fichier disparu) rend la main sans message ni création (None ; `ensure_history_db` : False) — avant :
 « DB corrompue », `SystemExit(1)` ; base présente : inchangé. `prune()` ne crée plus `diff.db` ni `cache.db` absentes (base
 existante : inchangé) et n'enregistre le gain qu'après un `borg prune` et un `borg compact` réussis.
+1.0.201 : avec `create=False`, la migration d'une `diff.db` d'avant 1.0.139 vers `history.db` attend elle aussi 2 s au plus le
+verrou de `history.db` ; tenu (ou `diff.db` tenue pendant ses paliers ou sa migration) : même retour sans erreur, rien
+migré, `[WARN] <base>: mesures d'avant 1.0.139 pas encore migrées (<history.db|diff.db> occupée) — …` sur stderr (`<base>` :
+nom de la base, le nick ou `DB_NAME` ; texte `_MIGR_PENDING_TXT`) — avant : 60 s puis « DB occupée », `SystemExit(1)`.
+`ensure_history_db(path, create=True, reader=False)` : `reader=True` (usage interne de cette migration) attend 2 s et lève
+`sqlite3.OperationalError` sur une base occupée au lieu de `SystemExit(1)`.
 
 ### Exceptions du chiffrement de base
 
@@ -849,7 +855,7 @@ sys.exit(0)
 | `get_cache_db(nick)` | Chemin du cache.db d'un nick |
 | `get_history_db(nick)` | Chemin de la history.db d'un nick (1.0.139 : mesures non régénérables, en clair, sans chemin) |
 | `history_path(nick)` | Idem, après migration éventuelle de la diff.db du nick (lecteurs) ; ne crée jamais le fichier |
-| `ensure_history_db(path, create=True)` | Schéma de history.db ; `create=False` : ne rien créer si absente |
+| `ensure_history_db(path, create=True, reader=False)` | Schéma de history.db ; `create=False` : ne rien créer si absente ; `reader=True` (1.0.201) : attente 2 s, base occupée levée (`sqlite3.OperationalError`) |
 | `store_archive_measure(nick, archive, archive_date, deduplicated_size, changed_during_backup, read_errors, db_path=None, borg_version=None, borg_server_version=None)` | Mesures d'une archive prises au Bkp (history.db) ; versions de borg (1.0.165, mot-clé, `None` = inconnue) |
 | `mark_archive_reconciled(nick, archive, db_path=None)` | 1.0.187 : marque une archive d'un Bkp tué rapprochée (ligne sans mesure, `archive_date=''`, `reconciled`) ; `False` si l'archive a déjà une mesure ou sur erreur SQLite (message, attente jusqu'à 300 s d'une base verrouillée) ; crée history.db si absente ; `SystemExit` sur une base refusée ; ne vérifie ni l'existence de l'archive ni son run (rôle de l'appelant, comme `close_bkp_status_reconciled`, que `_reconcile_killed_bkp` appelle juste après) |
 | `get_archive_measures(nick)` | `{(archive, archive_date): {deduplicated_size, changed_during_backup, read_errors, borg_version, borg_server_version, reconciled}}` (+ clé `(archive, None)` si le nom est unique ; `reconciled` booléen, 1.0.187) ; `{}` si aucune |
@@ -859,7 +865,8 @@ sys.exit(0)
 | `is_diff_pair_indexed(nick, a_old, a_new)` | Vérifie si une paire est indexée ; 1.0.176 : `None` sur une vraie erreur SQLite (marquée `[ERREUR]`, jamais `False` : la paire serait recalculée en double), `False` si la table est absente |
 | `is_archive_snapshot_indexed(nick, archive)` | Vérifie si le snapshot est indexé. 1.0.200 : False si la base est absente, sans la table ou supprimée après l'ouverture (muet) ; **None** sur une vraie erreur SQLite (inconnu, avant : False) avec `[ERREUR] SQLite error (<base>): …` sur stderr (une fois par base et par processus) — `indexsnap` saute alors le snapshot (code 1, rien supprimé) |
 | `_diff_stats_for_nick(nick, archives=None, conn=None)` | Stats de mouvement par archive (Report, ArchiveHistory, figeage) — comptes en fichiers ordinaires depuis 1.0.162, tailles par familles ; `archives` (1.0.140) restreint aux archives nouvelles données, `conn` : erreurs SQLite remontées ; 1.0.179 : DbModeError/DbKeyError/DbTamperError (et tout défaut) remontent aussi sans `conn` (avant : `{}` en silence) |
-| `store_excluded_diff_stats(nick, a_old, a_new, exclu, db_path)` | Stocke stats fichiers exclus d'une paire |
+| `store_excluded_diff_stats(nick, a_old, a_new, exclu, db_path)` | Stocke stats fichiers exclus d'une paire, dans une transaction à part — sans vérifier la paire : des exclus écrits sans leur paire sont retirés par l'Index suivant (`_drop_orphan_exclusions`, 1.0.201) ; préférer `store_diff_entries(…, exclu=…)` |
+| `store_diff_entries(nick, a_old, a_new, a_new_date, entries, db_path=None, exclu=None)` | Écrit une paire et ses lignes (`INSERT OR IGNORE` de la paire d'abord : déjà présente -> rien réinséré) ; `exclu` (1.0.201) : exclus écrits dans la même transaction, seulement si la paire l'a été — préférer cet argument à `store_excluded_diff_stats` (transaction à part : exclu sans paire possible) ; `False` sur erreur SQLite |
 | `store_excluded_snap_stats(nick, archive, count, size, db_path)` | Stocke stats fichiers exclus d'un snapshot |
 | `_with_lock_retry(fn, max_wait=300)` | Exécute `fn()`, retente toutes les 2 s si `OperationalError: database is locked`, jusqu'à `max_wait` secondes |
 | `set_priority_lock(nick)` | Pose le lock prioritaire de CE processus (`<…>-priority.lock.<pid>`, 1.0.145) — appelé par `backup`/`restore`/`prune`/`delbkp` |
