@@ -1,5 +1,50 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.200 — Lecteurs et Prune : base supprimée, bases créées trop tôt, erreurs SQLite muettes — 2026-10-14
+
+Chantier « reconstruction progressive », story 78 (reports D116, D115, D137 ; décision de l'utilisateur Q1 = A pour D137,
+puis A pour le code 1 de Status). borgHelperWWW inchangé.
+
+- Base supprimée APRÈS son ouverture par un lecteur (D116) : `ensure_cache_db` et `ensure_diff_db` en `create=False` (lecteurs)
+  testent `_file_gone` dans leur `except sqlite3.DatabaseError` — base disparue : lue comme absente, rien recréé, aucun message
+  (comme la fenêtre sonde/ouverture fermée en 1.0.172). Avant : « [ERREUR] DB corrompue … -> disk I/O error … Supprimez le
+  fichier et relancez », code 1, pour un simple lecteur. `ensure_history_db(create=False)` reçoit la même garde (jumelle ; aucun
+  appelant en production, pas de changement visible). Base présente et corrompue : message et code 1 inchangés ; écrivains
+  (`create=True`) inchangés.
+- Prune ne crée plus `diff.db` ni `cache.db` d'un nick qui n'en a pas (D115) : sonde courte (`_db_probe`, 2 s) ; base non absente
+  (illisible ou occupée comprise) -> `ensure_cache_db`/`ensure_diff_db` en écrivain comme avant (migrations, réparation
+  d'en-tête, attente de 60 s, arrêt AVANT borg sur une base illisible) ; absente -> rien appelé, laissée absente. Limites : une
+  base supprimée entre la sonde et l'écrivain est recréée (fenêtre de l'écrivain, comme `_cleanup_index_after_prune`) ; la
+  migration d'une ancienne `diff.db` existante peut créer `history.db` avant borg (base existante traitée comme avant).
+- Gain de Prune (`history.db`, `op=prune`) seulement si `borg prune` ET `borg compact` ont réussi (code 0 ou 1) ; sinon `borg
+  info` n'est pas lancé : un Prune en échec ne crée aucune base. Avant : un gain « prune » (et `history.db`) enregistré après un
+  échec de prune ou de compact si `borg info` répondait.
+- Lecteurs « coût seulement » (D137) — `is_archive_snapshot_indexed`, `_refresh_chart_stats`, `_index_tranche`, `_build_state`,
+  `_db_meta_value` : une vraie erreur SQLite est dite par `_reader_sqlite_err` (« [ERREUR] SQLite error (<base>): … ») ; une fois
+  par base et par processus, sauf `_db_meta_value` (lu en boucle par borgHelperWWW, `/access`) : marque propre (base, lecteur),
+  levée par toute lecture réussie, base ou table absente, base disparue — une ligne par épisode d'erreur. Même valeur de repli,
+  travail refait (borg info) ; table absente : muet ; base supprimée après l'ouverture (fantôme jeté par une bascule) : lue
+  comme absente, muette et non comptée (règle D116, helper unique `_cost_reader_err`, ces cinq lecteurs seulement — les autres
+  lecteurs : report différé) ; codes d'Index et de Bkp inchangés ; Status : code 1 quand
+  la ligne est dite (sa règle depuis 1.0.193 — `db_meta` du fantôme illisible ; avant : code 0 sans message).
+- `is_archive_snapshot_indexed` rend None (inconnu) sur une vraie erreur, comme `is_diff_pair_indexed` (1.0.176) ; False pour
+  une base absente, une table absente ou une base disparue. `indexsnap` saute alors le snapshot (refait à un Index suivant) :
+  rien supprimé, pas de borg, code 1 (avant : False -> lignes `archive_snapshot` valides supprimées puis snapshot refait, sur
+  un simple délai de verrou).
+- Mesuré : `work/s78/race78.py` (+ `probe78.py` pour history.db et les écrivains) — avant : diff.db, cache.db -> « DB corrompue
+  … disk I/O error », `SystemExit(1)` ; après : retour normal, aucun message, rien recréé ; écrivains : inchangés. Prune d'un
+  dépôt `ssh://…nohost.invalid` sans base (`work/s78/prune2`) — avant : `rc-pd-cache.db`, `rc-pd-diff.db` créées ; après :
+  « borg prune a échoué : Connection closed by remote host », code 2, CACHE_DIR vide. `work/s78/d137.py` (pages de la table lue
+  et de ses index écrasées) — avant : muet ; après : une ligne `[ERREUR] SQLite error` par base, valeurs inchangées ;
+  `d137gone.py` : base supprimée après l'ouverture, muet ; `status78.py` : Status code 1.
+- Contrôles CodecSelfTest : « base supprimée après l'ouverture : lecteur (diff, cache, history) … », « base présente et
+  corrompue : lecteur … ; écrivain … », « Prune sans base, dépôt injoignable … » (prune ou compact en échec : ni borg info ni
+  gain), « Prune réussi sur bases existantes (ancien schéma compris) … » (bases partielles, base illisible : arrêt avant borg),
+  « Prune réussi sur un nick jamais indexé … » (quatre Prune, avertissement de prune ou de compact compris ; `--dry-run`), «
+  lecteurs « coût seulement » : vraie erreur SQLite … », « … : table absente … », « … : base supprimée après l'ouverture … », «
+  _db_meta_value : une ligne [ERREUR] par épisode d'erreur … », « indexsnap : snapshot indexé inconnu … », « Status, fantôme à
+  db_meta illisible … » (texte et `-j`, nick sain inchangé).
+
 ## borgHelper 1.0.199, borgHelperWWW 1.31.15 — Passphrase du watcher (BkpReconcile) — 2026-10-13
 
 Chantier « reconstruction progressive », story 77 (report D182 de la revue 2 de la story 63 ; décision de l'utilisateur

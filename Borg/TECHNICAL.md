@@ -1840,7 +1840,9 @@ l'utilisateur sur ce chemin CLI.
 fichier n'a pas de schéma (`_db_has_schema`, ci-dessous), la fonction retourne sans rien créer — ni fichier, ni table,
 ni `enc_header` — et l'appelant répond « non indexé »/« index vide » comme aujourd'hui pour une base absente. Si le
 fichier a déjà un schéma, comportement inchangé (`_check_set_meta`, migrations legacy). Seuls `Index`, `Bkp` et
-`indexsnap` (créateurs légitimes) gardent le défaut `create=True` ; **tous** les autres appelants identifiés (lecture,
+`indexsnap` (créateurs légitimes) gardent le défaut `create=True` — plus `Prune` et `_cleanup_index_after_prune`, en
+`create=True` mais seulement sur une base existante (sonde `_db_probe` d'abord ; 1.0.200, story 78 : Prune ne crée plus de
+base absente) ; **tous** les autres appelants identifiés (lecture,
 l'ensemble complet — pas un sous-ensemble) passent `create=False` : `_duidx_collect`/`_global`/`_raw`,
 `_find_last_archive_with_file`, `list_backups`, `list_files`, `cache_clean`, `diffbkp`, `search`, `treehist`,
 `treefind`, `filehist`, `prep_report_from_db`, `cache_prune_dryrun`, `cacheJsonBoexWithLM`,
@@ -2322,7 +2324,20 @@ et borgHelperWWW, importée) ; `cfgwrite` échappe `%` en `%%` (rc relu avec int
 silencieux ; autre `sqlite3.Error` -> `[ERREUR] SQLite error (<base>): <e>`, une fois par base et par processus
 (`_SQLITE_ERR_SEEN`). Appelée par `get_archive_measures`, `get_archive_chart`, `get_repo_stats`, `_diff_stats_for_nick`,
 `_is_index_empty` (vraie erreur -> son message « SQLite error … », affiché par les 7 appelants à la place d'« Index vide » ; texte
-`[ERREUR]`, `-j` `{'error'}`), IdxTop/DiffTop (exclus), lecture du cache de `cacheJsonBoexWithLM` (table absente silencieuse) ; RepoHistory,
+`[ERREUR]`, `-j` `{'error'}`), IdxTop/DiffTop (exclus), lecture du cache de `cacheJsonBoexWithLM` (table absente silencieuse),
+et depuis 1.0.200 (story 78, D137, décision de l'utilisateur), par `_cost_reader_err(e, db_path, key)` — base disparue au
+moment de l'erreur (`_file_gone` : supprimée après l'ouverture, fantôme jeté par une bascule) -> muet et non compté (règle
+D116), sinon `_reader_sqlite_err` ; seuls ces cinq lecteurs et les trois `ensure_*_db` suivent cette règle, les autres lecteurs
+disent encore « disk I/O error » (report différé) — les lecteurs « coût seulement » : `is_archive_snapshot_indexed` (None =
+inconnu sur une vraie erreur, comme `is_diff_pair_indexed` 1.0.176 ; False : base absente, table absente, base disparue ;
+`indexsnap` saute alors le snapshot, refait à un Index suivant, code 1, sans rien supprimer ni lancer borg — avant : False,
+lignes `archive_snapshot` valides supprimées sur un délai de verrou), `_refresh_chart_stats` et
+`_index_tranche` (`existing`/`have` vides : `borg info` refaits), `_build_state` (None), `_db_meta_value` (None) : connexion
+fermée ; `_READER_FAILED` compté : sans effet sur Index/Bkp (hors `_READER_CODE_CMDS`), Status rend 1 (`_n0`, règle
+1.0.193 : `db_meta` du fantôme illisible) ; `_db_meta_value` (lu en boucle par borgHelperWWW, `_status_one` en processus
+pour `/access`) a sa propre marque `(base, '_db_meta_value')`, levée par `_reader_sqlite_ok` à toute fin d'épisode — lecture
+réussie, base absente (`_path_present` : EACCES n'est pas absent), table absente, base disparue : une ligne au journal du
+serveur par épisode d'erreur ; RepoHistory,
 ArchiveHistory et Status passent par `_db_probe` (illisible ≠ absent). CodecSelfTest : `_pre(fn)` exécute un décor dont dépendent
 les contrôles suivants même quand `-f` écarte son contrôle (A74).
 **Code 1 de borg, lecteurs annexes, Index multi-nicks (1.0.176, story 39)** : `_borg_ok(rb)` — code 0 ou 1 et non `killed` —
@@ -2729,6 +2744,17 @@ CodecSelfTest : `-f '=<nom>'` -> `re.compile('^'+re.escape(nom)+'$')`, sans `IGN
 `ensure_*_db(create=False)` l'utilise après sa sonde : supprimée entre les deux -> `_file_gone` -> retour (base absente) ;
 autre échec -> `_db_open_fail` comme avant. WAL, paliers, tampons, vue : inchangés (fichier existant). `ensure_history_db
 (create=False)` (aucun appelant aujourd'hui) : `_db_probe` comme les deux autres (absent -> False ; illisible -> erreur réelle).
+1.0.200 (story 78, D116) : base supprimée APRÈS l'ouverture (SQLite : « disk I/O error » au premier accès) — l'`except
+sqlite3.DatabaseError` des trois jumelles teste `_file_gone` avant tout : lecteur -> connexion fermée, retour comme absente
+(None ; history : False — jumelle sans appelant en production), aucun message ; base présente : `_db_schema_fail` inchangé
+(« DB corrompue », code 1) ; écrivain (`create=True`) : inchangé. Prune (D115) : sonde courte `_db_probe(p, _READER_WRITE_WAIT)`
+puis, base non absente (illisible ou occupée comprise), `ensure_cache_db`/`ensure_diff_db(p, nick=nick)` en écrivain comme
+avant (60 s, migrations, `_heal_empty_header`, arrêt `_db_schema_fail` AVANT `borg prune` sur une base illisible) ; absente :
+rien appelé, laissée absente — `clear_cache_nick` (`_db_absent`) et `_cleanup_index_after_prune` (`_db_probe`) n'en créent
+pas. Limites : base supprimée entre la sonde et l'écrivain -> recréée (même fenêtre que `_cleanup_index_after_prune`) ;
+migrer une ancienne `diff.db` existante peut créer `history.db` avant borg (`_migrate_to_history`). Gain
+(`store_repo_stats`, crée `history.db`) seulement si `_borg_ok(rp)` et `_borg_ok(rb)` (prune et compact) — sinon `borg info`
+n'est pas lancé (avant : gain enregistré après un échec si `borg info` répondait).
 **Dépôt absent / borg en échec (1.0.172, A60)** : `BorgHelper._borg_fail_msg` (dépôt local introuvable `repoLocalAbsent` ->
 « ⚠ dépôt absent (BORG_REPO) », sinon « borg <cmd> a échoué : … »), `_borg_stop` (message ou `{'error'}` en `-j`, code 2),
 `_lastbkp_or_stop` (appelants stricts de `getlastbkp` : DiffBkp, Restore/`listperms`, Mount) ; `getlastbkp` garde son
@@ -2759,8 +2785,8 @@ couverte (« restaurer depuis une sauvegarde » inchangé).
 
 - **`DbDecrypt` et `cache.db` absent au moment de l'appel.** `_db_migrate_cache` ne fait rien si `cache.db` n'existe
   pas encore pour ce nick (rien à purger/recréer). Si `DB_ENCRYPT` reste `true` pour ce nick, le PROCHAIN processus
-  qui crée `cache.db` (AD-12 : cache de `borg` — Report, Prune — et `Prune` ; 1.0.168 : comme toute base neuve) le crée
-`siv1` d'emblée (comportement de création normal,
+  qui crée `cache.db` (AD-12 : cache de `borg` de Report ; 1.0.168 : comme toute base neuve ; `Prune` ne la crée plus
+  depuis 1.0.200 si elle est absente) le crée `siv1` d'emblée (comportement de création normal,
   indépendant de `DbDecrypt`) — alors que `diff.db` vient d'être repassé `plain`. Incohérence transitoire
   `diff.db=plain` / `cache.db=siv1` jusqu'à ce que l'opérateur mette `DB_ENCRYPT=false` pour ce nick ou relance
   `DbEncrypt`. Sans conséquence fonctionnelle (chaque base a sa propre DEK et son propre mode, lu indépendamment par

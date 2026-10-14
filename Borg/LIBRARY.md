@@ -51,6 +51,10 @@ plus 2 s le verrou d'écriture ; s'il est tenu par un autre processus, la foncti
 tamponner (base lue telle quelle par l'appelant) et ne réessaie pas pendant 60 s pour ce `BorgHelperDB` ; seule une base
 d'un schéma plus récent lève encore `SchemaVersionError`. `create=True` : inchangé (60 s). 1.0.177 : la sonde d'existence
 du schéma (`_db_has_schema`) attend elle aussi 2 s au plus avec `create=False` (avant : 60 s sous un verrou exclusif).
+1.0.200 : avec `create=False` (et `ensure_history_db(path, create=False)`), une base supprimée **après** son ouverture (erreur
+SQLite au premier accès, fichier disparu) rend la main sans message ni création (None ; `ensure_history_db` : False) — avant :
+« DB corrompue », `SystemExit(1)` ; base présente : inchangé. `prune()` ne crée plus `diff.db` ni `cache.db` absentes (base
+existante : inchangé) et n'enregistre le gain qu'après un `borg prune` et un `borg compact` réussis.
 
 ### Exceptions du chiffrement de base
 
@@ -853,7 +857,7 @@ sys.exit(0)
 | `freeze_archive_chart(nick, rows, db_path=None)` | 1.0.140 — fige des lignes de graphique dans `history.db.archive_chart` (dicts `archive`, `archive_date`, `gone`, champs de graphique) ; jamais une valeur non nulle écrasée par `None` ; purge au-delà de `STATS_RETENTION_MONTHS` ; lève `sqlite3.Error` |
 | `get_archive_chart(nick, db_path=None)` | 1.0.140 — lignes figées dans la rétention : `[{archive, archive_date, duration, …, read_errors, gone}]` ; `[]` si aucune |
 | `is_diff_pair_indexed(nick, a_old, a_new)` | Vérifie si une paire est indexée ; 1.0.176 : `None` sur une vraie erreur SQLite (marquée `[ERREUR]`, jamais `False` : la paire serait recalculée en double), `False` si la table est absente |
-| `is_archive_snapshot_indexed(nick, archive)` | Vérifie si le snapshot est indexé |
+| `is_archive_snapshot_indexed(nick, archive)` | Vérifie si le snapshot est indexé. 1.0.200 : False si la base est absente, sans la table ou supprimée après l'ouverture (muet) ; **None** sur une vraie erreur SQLite (inconnu, avant : False) avec `[ERREUR] SQLite error (<base>): …` sur stderr (une fois par base et par processus) — `indexsnap` saute alors le snapshot (code 1, rien supprimé) |
 | `_diff_stats_for_nick(nick, archives=None, conn=None)` | Stats de mouvement par archive (Report, ArchiveHistory, figeage) — comptes en fichiers ordinaires depuis 1.0.162, tailles par familles ; `archives` (1.0.140) restreint aux archives nouvelles données, `conn` : erreurs SQLite remontées ; 1.0.179 : DbModeError/DbKeyError/DbTamperError (et tout défaut) remontent aussi sans `conn` (avant : `{}` en silence) |
 | `store_excluded_diff_stats(nick, a_old, a_new, exclu, db_path)` | Stocke stats fichiers exclus d'une paire |
 | `store_excluded_snap_stats(nick, archive, count, size, db_path)` | Stocke stats fichiers exclus d'un snapshot |

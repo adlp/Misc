@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.199"
+Version="1.0.200"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -2558,6 +2558,13 @@ def _reader_sqlite_err(e,db_path,key=None):
     if k in _SQLITE_ERR_SEEN: return
     _SQLITE_ERR_SEEN.add(k); printer(f"[ERREUR] SQLite error ({db_path}): {e}")
 
+def _cost_reader_err(e,db_path,key=None):
+    """1.0.200 (story 78, D137) : erreur SQLite d'un lecteur « coût seulement » (is_archive_snapshot_indexed, _refresh_chart_stats,
+    _index_tranche, _build_state, _db_meta_value) — base supprimée APRÈS l'ouverture (fantôme jeté par une bascule : « disk I/O
+    error ») -> lue comme absente : muet, non comptée (règle D116) ; sinon _reader_sqlite_err. Rend True si la base a disparu."""
+    if _file_gone(db_path): return True
+    _reader_sqlite_err(e,db_path,key); return False
+
 def _db_has_schema(db_path,timeout=60):
     """True si db_path est une base (au moins une table, _db_probe). Un fichier existant mais vide ou sans table n'est pas une
     base créée — ensure_*_db(create=False) doit s'y fier plutôt qu'à os.path.exists (AD-12). 1.0.171 : tables seulement
@@ -3061,6 +3068,7 @@ class BorgHelperDB:
             self._check_set_meta(conn,CACHE_DB_SCHEMA_VERSION,db_path,CACHE_DB_BASE_SCHEMA_VERSION)
             conn.commit(); conn.close()
         except sqlite3.DatabaseError as e:
+            if not create and _file_gone(db_path): _close_quiet(conn); return   # 1.0.200 (story 78, D116) : supprimée APRÈS l'ouverture -> absente, rien recréé ni dit
             if not create and conn is not None and _db_busy(e):
                 self._reader_busy_skip(conn,db_path,CACHE_DB_SCHEMA_VERSION); self._reader_skipped[db_path]=time.monotonic(); return
             _close_quiet(conn)   # 1.0.182 (story 48) : sous 3.11+, une connexion non fermée reste ouverte (verrous, -shm)
@@ -3310,6 +3318,7 @@ class BorgHelperDB:
             self._check_set_meta(conn,DIFF_DB_SCHEMA_VERSION,db_path,DIFF_DB_BASE_SCHEMA_VERSION)
             conn.commit(); conn.close()
         except sqlite3.DatabaseError as e:
+            if not create and _file_gone(db_path): _close_quiet(conn); return   # 1.0.200 (story 78, D116) : supprimée APRÈS l'ouverture -> absente, rien recréé ni dit
             if not create and conn is not None and _db_busy(e):
                 self._reader_busy_skip(conn,db_path,DIFF_DB_SCHEMA_VERSION); self._reader_skipped[db_path]=time.monotonic(); return
             _close_quiet(conn)   # 1.0.182 (story 48) : sous 3.11+, une connexion non fermée reste ouverte (verrous, -shm)
@@ -3350,6 +3359,7 @@ class BorgHelperDB:
                 conn.commit()
             finally: conn.close()
         except sqlite3.DatabaseError as e:
+            if not create and _file_gone(path): return False   # 1.0.200 (story 78, D116) : supprimée APRÈS l'ouverture (connexion fermée par le finally)
             _db_schema_fail(path,e,"historique des mesures",regenerable=False)
         self._hist_ready.add(path)
         return True
@@ -4167,12 +4177,18 @@ class BorgHelperDB:
 
     def is_archive_snapshot_indexed(self,nick,archive,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
+        conn=None
         try:
             conn=_open_db(db_path,nick=nick,role='read')
             cur=conn.cursor()
             cur.execute("SELECT 1 FROM archive_snapshot_indexed WHERE nick=? AND archive=? LIMIT 1",(nick,archive))
             result=cur.fetchone(); conn.close(); return result is not None
-        except sqlite3.Error: return False
+        except sqlite3.Error as e:   # 1.0.200 (story 78, D137) : vraie erreur dite (table absente, base disparue : muettes)
+            _close_quiet(conn)
+            # 1.0.200 (revue story 78) : table absente ou base disparue après l'ouverture -> absente (False, muet) ; vraie erreur dite
+            # -> None (inconnu, comme is_diff_pair_indexed 1.0.176) : indexsnap saute le snapshot, sans rien supprimer
+            if _sqlite_missing(e) or _cost_reader_err(e,db_path): return False
+            return None
 
     def store_archive_snapshot(self,nick,archive,archive_date,files,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
@@ -6590,8 +6606,11 @@ class BorgHelper:
             printer(self._borg_fail_msg(nick,'borg prune')); return {'exitcode':2,'stdout':[],'stderr':[],'annonce':True}
         # Garantit que cache.db/diff.db sont à jour (migrations auto) avant que Prune n'y touche —
         # Prune ne passait jusqu'ici par aucun ensure_*_db(), contrairement à Bkp/Index/Report.
-        self.db.ensure_cache_db(self.db.get_cache_db(nick),nick=nick)
-        self.db.ensure_diff_db(self.db.get_diff_db(nick),nick=nick)
+        # 1.0.200 (story 78, D115) : base existante (sonde 2 s, _READER_WRITE_WAIT ; illisible ou occupée comprise) -> ensure écrivain comme avant (migrations,
+        # en-tête réparé, arrêt AVANT borg sur une base illisible) ; absente -> rien appelé, laissée absente (avant : diff.db et
+        # cache.db vides créées avant le premier borg, même en échec). Les purges qui suivent ne créent rien (sondes).
+        for _p,_ens in ((self.db.get_cache_db(nick),self.db.ensure_cache_db),(self.db.get_diff_db(nick),self.db.ensure_diff_db)):
+            if _db_probe(_p,_READER_WRITE_WAIT)[0]!='absent': _ens(_p,nick=nick)   # illisible/occupée : l'écrivain attend 60 s et décide, comme avant
         # priority.lock (spec-status-cli-etat-rapide) : posé avant tout appel boex(), relâché dans un
         # finally couvrant tout le corps — même patron que backup()/restore() — pour que Status()
         # puisse détecter un Prune en cours (ambiguïté assumée avec Restore, priority.lock ne
@@ -6619,13 +6638,16 @@ class BorgHelper:
                     # Gain Prune (spine AD-3) : borg info --json APRÈS compact --cleanup-commits — c'est
                     # compact, pas prune --stats, qui libère réellement l'espace disque (sinon delta faux/
                     # quasi nul). Appel léger (métadonnées seulement), jamais en --dry-run.
-                    try:
-                        rbi=self.borg.boex(nick,['info','--json'],debug=debug)
-                        self.borg._boex_check_stdout(rbi,nick,'borg info')
-                        cst=rbi['stdout'][0].get('cache',{}).get('stats',{})
-                        if cst.get('unique_csize') is not None:
-                            self.db.store_repo_stats(nick,'prune',cst['unique_csize'],cst.get('total_size'),cst.get('total_csize'))
-                    except (RuntimeError,KeyError,TypeError,IndexError,AttributeError,ValueError): pass
+                    # 1.0.200 (story 78) : gain seulement si borg prune ET compact ont réussi (code 0/1) — sinon ni borg info, ni
+                    # history.db créée, ni point « prune »
+                    if _borg_ok(rp) and _borg_ok(rb):
+                        try:
+                            rbi=self.borg.boex(nick,['info','--json'],debug=debug)
+                            self.borg._boex_check_stdout(rbi,nick,'borg info')
+                            cst=rbi['stdout'][0].get('cache',{}).get('stats',{})
+                            if cst.get('unique_csize') is not None:
+                                self.db.store_repo_stats(nick,'prune',cst['unique_csize'],cst.get('total_size'),cst.get('total_csize'))
+                        except (RuntimeError,KeyError,TypeError,IndexError,AttributeError,ValueError): pass
                     # 1.0.172 (revue story 35) : borg prune en échec (>= 2, ou tué : < 0) -> SON résultat (avant : celui de compact,
                     # code 0 si compact réussissait) ; « cmd » : commande citée par le message de main
                     if not _borg_ok(rp): return dict(rp,cmd='borg prune')
@@ -6769,7 +6791,9 @@ class BorgHelper:
             printer(f"{nick}: aucune archive"); return 0
         latest=archives[-1]
         archive_name=latest['name']; archive_date=latest['start']
-        if self.db.is_archive_snapshot_indexed(nick,archive_name,db_path):
+        ix=self.db.is_archive_snapshot_indexed(nick,archive_name,db_path)
+        if ix is None: return 1   # 1.0.200 (revue story 78) : base illisible ([ERREUR] dit) -> snapshot sauté, rien supprimé ; refait à un Index suivant
+        if ix:
             if not force:
                 print(f"{nick}: snapshot {archive_name} déjà indexé"); return 0
             try:
@@ -6889,11 +6913,13 @@ class BorgHelper:
           Index) ; donne un historique de taille du dépôt même sans Bkp/Prune faits par borgHelper.
         Erreurs signalées (printer), jamais fatales pour Index."""
         archive_names=set(a['name'] for a in archives)
+        conn=None
         try:
             conn=_open_db(db_path,nick=nick,role='read')
             existing=set(r[0] for r in conn.execute("SELECT archive FROM archive_stats WHERE nick=?",(nick,)).fetchall())
             conn.close()
-        except sqlite3.Error: existing=set()
+        except sqlite3.Error as e:   # 1.0.200 (story 78, D137) : vraie erreur dite (table absente : muette) ; borg info refait comme avant
+            _close_quiet(conn); _cost_reader_err(e,db_path); existing=set()
         missing=archive_names-existing
         if missing or (force and archive_names):
             rbi=self.borg.boex(nick,['info','--json']+glob_args(cfg,archives=True),debug=debug)
@@ -7505,7 +7531,7 @@ class BorgHelper:
                 conn=_open_db(db_path,nick=nick,role='read')
                 try: have={r[0] for r in conn.execute("SELECT archive FROM archive_stats WHERE nick=?",(nick,))}
                 finally: conn.close()
-            except sqlite3.Error: have=set()
+            except sqlite3.Error as e: _cost_reader_err(e,db_path); have=set()   # 1.0.200 (story 78, D137) : dite, borg info refaits comme avant
             todo=[a for a in reversed(archives) if a['name'] not in have and self._in_period(a.get('start'),lo,hi)]
             n=0; prev=self.borg._stop; self.borg._stop=stop
             try:
@@ -7551,7 +7577,7 @@ class BorgHelper:
                 pairs={(o,n) for o,n in conn.execute("SELECT archive_old,archive_new FROM diff_indexed_pairs WHERE nick=?",(nick,))}
                 snaps={r[0] for r in conn.execute("SELECT archive FROM archive_snapshot_indexed WHERE nick=?",(nick,))}
             finally: conn.close()
-        except sqlite3.Error: return None
+        except sqlite3.Error as e: _cost_reader_err(e,db_path); return None   # 1.0.200 (story 78, D137) : vraie erreur dite (table absente, base disparue : muettes)
         target=[] if noidx else self._diff_keep_pairs(archives,keep)
         done=sum(1 for o,n,_ in target if (o,n) in pairs)
         names=[a['name'] for a in archives]
@@ -7607,14 +7633,20 @@ class BorgHelper:
     @staticmethod
     def _db_meta_value(db_path,key):
         """Valeur db_meta d'une base existante (sans codec : db_meta n'est jamais chiffrée), None si absente/illisible."""
-        if not os.path.exists(db_path): return None
+        # 1.0.200 (story 78, D137) : marque (base, lecteur), levée par toute fin d'épisode (A78 : lu en boucle par borgHelperWWW,
+        # /access -> _status_one) — lecture réussie, base absente, table absente, base disparue après l'ouverture
+        mk=(db_path,'_db_meta_value')
+        if not _path_present(db_path): _reader_sqlite_ok(mk); return None   # 1.0.179 : EACCES n'est pas « absent »
         try:
             c=_open_db(db_path,nick=None,role='read')
             try:
                 row=c.execute("SELECT value FROM db_meta WHERE key=?",(key,)).fetchone()
-                return row[0] if row else None
             finally: c.close()
-        except sqlite3.Error: return None
+        except sqlite3.Error as e:   # vraie erreur dite ; table absente, base disparue : muettes, fin d'épisode
+            if _sqlite_missing(e) or _cost_reader_err(e,db_path,mk): _reader_sqlite_ok(mk)
+            return None
+        _reader_sqlite_ok(mk)
+        return row[0] if row else None
 
     def _live_header(self,live):
         """En-tête brut de la base servie (None : en clair). sqlite3.Error si illisible."""
@@ -18193,6 +18225,359 @@ fail()
             if not ok: print(f"  états {states} ; via ensure {via} ; {a[-150:]!r} / {b2[-150:]!r} / {c3[-150:]!r}")
             return ok
         check("base supprimée tenue : message dédié seulement pour l'état d'avant création et « disk I/O error » (direct et par ensure_*), lien résolu",_held_limits)
+        # 1.0.200 (story 78) : D116 (base supprimée APRÈS l'ouverture d'un lecteur), D115 (Prune ne crée aucune base), D137 (lecteurs
+        # « coût seulement » : vraie erreur SQLite dite)
+        def _s78_gone_env(sub):
+            """Bases réelles de zr (en clair) créées par l'écrivain ; (dossier, BorgHelper, [(nature, chemin, ensure)])."""
+            d,b=_nb_env(sub); os.makedirs(os.path.join(d,'cache'),exist_ok=True)
+            return d,b,[('diff',b.db.get_diff_db('zr'),b.db.ensure_diff_db),('cache',b.db.get_cache_db('zr'),b.db.ensure_cache_db),
+                        ('history',b.db.get_history_db('zr'),b.db.ensure_history_db)]
+        def _s78_make(b,path,ens):
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): ens(path)
+            b.db._hist_ready.discard(path); b.db._reader_skipped.clear()
+        def _s78_gone_after_open(path):
+            """_open_db réel, puis base, -wal et -shm supprimés (mesure race78.py)."""
+            real=_open_db
+            def gone(*a,**k):
+                c=real(*a,**k)
+                for s in ('','-wal','-shm'):
+                    if os.path.exists(path+s): os.unlink(path+s)
+                return c
+            return gone
+        def _s78_reader_gone():
+            """D116 : lecteur (create=False) de diff.db, cache.db, history.db dont la base est supprimée juste APRÈS l'ouverture (SQLite
+            réel : « disk I/O error ») -> retour normal (None ; history : False), aucun message, rien recréé (avant : « DB corrompue …
+            Supprimez le fichier », code 1)."""
+            d,b,kinds=_s78_gone_env('s78gone'); res={}
+            for kind,path,ens in kinds:
+                _s78_make(b,path,ens)
+                with mock.patch.dict(globals(),{'_open_db':_s78_gone_after_open(path)}): o=_wk_run(lambda: ens(path,create=False))
+                res[kind]=(o==('',None,False if kind=='history' else None) and not any(os.path.exists(path+s) for s in ('','-wal','-shm')),o)
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("base supprimée après l'ouverture : lecteur (diff, cache, history) -> absente, retour normal, aucun message, rien recréé",_s78_reader_gone)
+        def _s78_present_unchanged():
+            """D116 témoin : même erreur (« disk I/O error », levée après l'ouverture) sur une base PRÉSENTE -> lecteur : « DB corrompue »,
+            code 1, base gardée (diff, cache, history) ; vraie corruption présente (« database disk image is malformed ») : idem ;
+            écrivain (create=True) dont la base est supprimée après l'ouverture : inchangé (« DB corrompue », code 1, rien recréé)."""
+            d,b,kinds=_s78_gone_env('s78present'); res={}
+            for kind,path,ens in kinds:
+                for err in ('disk I/O error','database disk image is malformed'):
+                    _s78_make(b,path,ens)
+                    def boom(*a,_e=err,**k): raise sqlite3.DatabaseError(_e)
+                    with mock.patch.dict(globals(),{'_ensure_wal':boom}): o=_wk_run(lambda: ens(path,create=False))
+                    res[(kind,'lecteur',err)]=(o[1]==1 and 'DB corrompue' in o[0] and err in o[0] and os.path.exists(path),o[:2])
+                _s78_make(b,path,ens)
+                with mock.patch.dict(globals(),{'_open_db':_s78_gone_after_open(path)}): o=_wk_run(lambda: ens(path,create=True))
+                res[(kind,'écrivain')]=(o[1]==1 and 'DB corrompue' in o[0] and not os.path.exists(path),o[:2])
+                for s in ('','-wal','-shm'):
+                    if os.path.exists(path+s): os.unlink(path+s)
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("base présente et corrompue : lecteur -> « DB corrompue », code 1 (inchangé) ; écrivain, base supprimée après l'ouverture : inchangé",_s78_present_unchanged)
+        def _s78_prune_env(sub):
+            """Prune en processus, borg simulé (prune : code de `prune_rc[0]`, défaut 0 ; compact OK ; list -> archive b seule ; info ->
+            tailles) ; nick pe (bases existantes), pn (aucune base), pk (base existante illisible) ; dépôt local présent."""
+            d=os.path.join(tmp,sub); os.makedirs(os.path.join(d,'repo')); os.makedirs(os.path.join(d,'cache')); rc=os.path.join(d,'rc')
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nBORG_PASSPHRASE=pw\nDB_KDF=light\nDB_ENCRYPT=false\nSER_NAME=h\n"
+                        f"SER_LOGIN=x\nGLOB_ARCH=*\nBORG_REPO={d}/repo\nKEEP_DAILY=3\n\n[pe]\n\n[pn]\n\n[pk]\n\n[pd]\n\n[pc]\n")
+            os.chmod(rc,0o600); b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); seen=[]; prune_rc=[0]; compact_rc=[0]
+            def fake(nick,args,debug=0,**k):
+                seen.append(args[0])
+                if args[0]=='prune': return {'exitcode':prune_rc[0],'stdout':[],'stderr':['Connection closed by remote host'] if prune_rc[0]>1 else
+                                             ['Warning: avertissement simulé'] if prune_rc[0] else []}
+                if args[0]=='compact': return {'exitcode':compact_rc[0],'stdout':[],'stderr':['compact en échec'] if compact_rc[0] else []}
+                if args[0]=='list': return {'exitcode':0,'stdout':[{'archives':[{'name':'b','start':'2026-01-02T00:00:00'}]}],'stderr':[]}
+                if args[0]=='info': return {'exitcode':0,'stdout':[{'cache':{'stats':{'unique_csize':111,'total_size':222,'total_csize':333}}}],'stderr':[]}
+                return {'exitcode':0,'stdout':[],'stderr':[]}
+            fake.prune_rc=prune_rc; fake.compact_rc=compact_rc
+            return d,b,fake,seen
+        def _s78_prune_unreachable():
+            """D115 : Prune (processus réel, borg factice « Connection closed by remote host ») d'un dépôt distant injoignable, nick sans
+            base -> échec de borg dit, code 2, aucune base créée dans CACHE_DIR, history.db comprise (avant : rc-zr-cache.db et
+            rc-zr-diff.db vides) ; en processus, borg prune en échec -> borg info jamais lancé, ni history.db ni point « prune » (avant :
+            gain enregistré après l'échec), résultat de borg prune rendu ; borg prune réussi mais compact en échec -> idem, résultat
+            de compact."""
+            d,rc,calls,cli=_bf_env('s78prunefail')
+            code,out,err=cli('-c','Prune','-n','zr'); o=out+err
+            cache=os.path.join(d,'cache'); made=sorted(f for f in (os.listdir(cache) if os.path.isdir(cache) else ()) if '-zr-' in f and '.db' in f)
+            res={'cli':(code==2 and 'zr: borg prune a échoué : Connection closed by remote host' in o and 'Traceback' not in o and made==[]
+                        and os.path.exists(calls) and any(x.startswith('prune ') for x in open(calls).read().splitlines()),code,made,o[-200:])}
+            d2,b,fake,seen=_s78_prune_env('s78prunefail2')
+            for lbl,prc,crc,cmd in (('prune en échec',2,0,'borg prune'),('compact en échec',0,2,'borg compact')):
+                fake.prune_rc[0]=prc; fake.compact_rc[0]=crc; seen.clear()
+                with mock.patch.object(b.borg,'boex',fake): r=_wk_run(lambda: b.prune('pn'))
+                ret=r[2] if isinstance(r[2],dict) else {}
+                left=sorted(os.listdir(os.path.join(d2,'cache')))
+                res[lbl]=(ret.get('exitcode')==2 and ret.get('cmd')==cmd and 'compact' in seen and 'info' not in seen and left==[],ret.get('exitcode'),seen,left)
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("Prune sans base, dépôt injoignable : échec de borg dit, code 2, aucune base créée",_s78_prune_unreachable)
+        def _s78_prune_existing():
+            """D115 base existante : Prune réussi, diff.db au palier 10 (ancien schéma) et cache.db présentes -> diff.db migrée (version
+            courante), archive disparue purgée (a), gardée (b) ; cache du nick vidé (pe, pe:prune), cache.db mise à jour (version de
+            borgHelper) ; gain dans history.db (repo_stats op=prune) ; code 0. Base existante illisible (cache.db ou diff.db de pk) :
+            arrêt AVANT borg comme avant (« DB corrompue », code 1, aucun appel borg, fichier intact)."""
+            d,b,fake,seen=_s78_prune_env('s78pruneok'); p=b.db.get_diff_db('pe'); cp=b.db.get_cache_db('pe')
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                b.db.ensure_diff_db(p,nick='pe'); b.db.ensure_cache_db(cp,nick='pe')
+                for a,dt in (('a','2026-01-01T00:00:00'),('b','2026-01-02T00:00:00')): b.db.store_archive_stats('pe',a,dt,1,1,1,1,1,p)
+            _v10(p)
+            c=sqlite3.connect(cp)
+            try:
+                c.executemany("INSERT INTO cachejsonboexlm(nom,lastmodified,details) VALUES(?,?,?)",[('pe','t','{}'),('pe:prune','t','{}')])
+                c.execute("UPDATE db_meta SET value='0.0.0' WHERE key='borghelper_version'"); c.commit()
+            finally: c.close()
+            b.db._reader_skipped.clear()
+            with mock.patch.object(b.borg,'boex',fake): o=_wk_run(lambda: b.prune('pe'))
+            ret=o[2] if isinstance(o[2],dict) else {}
+            res={'code':(o[1],ret.get('exitcode')),'version':_q(p,"SELECT value FROM db_meta WHERE key='schema_version'",one=True),
+                 'stats':sorted(r[0] for r in _q(p,"SELECT archive FROM archive_stats WHERE nick='pe'")),
+                 'cache':_q(cp,"SELECT count(*) FROM cachejsonboexlm",one=True),
+                 'cache_ver':_q(cp,"SELECT value FROM db_meta WHERE key='borghelper_version'",one=True),
+                 'gain':_q(b.db.get_history_db('pe'),"SELECT op,unique_csize FROM repo_stats WHERE nick='pe'"),'borg':seen}
+            want={'code':(None,0),'version':(str(DIFF_DB_SCHEMA_VERSION),),'stats':['b'],'cache':(0,),'cache_ver':(Version,),
+                  'gain':[('prune',111)]}
+            ok=all(res[k]==v for k,v in want.items()) and seen[:2]==['prune','compact'] and 'info' in seen
+            bad={}
+            absent=lambda x: not any(os.path.exists(x+sfx) for sfx in ('','-wal','-shm'))
+            for kind,path,sib in (('cache',b.db.get_cache_db('pk'),b.db.get_diff_db('pk')),('diff',b.db.get_diff_db('pk'),b.db.get_cache_db('pk'))):
+                with open(path,'wb') as f: f.write(b'garbage'*600)
+                h=hashlib.sha256(open(path,'rb').read()).hexdigest(); seen.clear()
+                with mock.patch.object(b.borg,'boex',fake): k=_wk_run(lambda: b.prune('pk'))
+                if not (k[1]==1 and 'DB corrompue' in k[0] and seen==[] and hashlib.sha256(open(path,'rb').read()).hexdigest()==h and absent(sib)):
+                    bad[kind]=(k[1],list(seen),absent(sib),k[0][-200:])
+                os.unlink(path)
+            # base partielle : diff.db seule (palier 10) pour pd, cache.db seule (version de borgHelper ancienne) pour pc
+            dp=b.db.get_diff_db('pd'); cc=b.db.get_cache_db('pc')
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                b.db.ensure_diff_db(dp,nick='pd'); b.db.ensure_cache_db(cc,nick='pc')
+            _v10(dp)
+            c=sqlite3.connect(cc)
+            try: c.execute("UPDATE db_meta SET value='0.0.0' WHERE key='borghelper_version'"); c.commit()
+            finally: c.close()
+            for nk,present,q,want,other in (('pd',dp,"SELECT value FROM db_meta WHERE key='schema_version'",str(DIFF_DB_SCHEMA_VERSION),b.db.get_cache_db('pd')),
+                                            ('pc',cc,"SELECT value FROM db_meta WHERE key='borghelper_version'",Version,b.db.get_diff_db('pc'))):
+                seen.clear()
+                with mock.patch.object(b.borg,'boex',fake): k=_wk_run(lambda: b.prune(nk))
+                kr=k[2] if isinstance(k[2],dict) else {}
+                got=_q(present,q,one=True)
+                if not (k[1] is None and kr.get('exitcode')==0 and got==(want,) and absent(other)): bad[f'partielle {nk}']=(k[1],kr.get('exitcode'),got,absent(other),k[0][-200:])
+            ok=ok and not bad
+            if not ok: print(f"  {res} ; illisible {bad} ; {o[0][-250:]!r}")
+            return ok
+        check("Prune réussi sur bases existantes (ancien schéma compris) : migrations, purges, gain inchangés",_s78_prune_existing)
+        def _s78_prune_never_indexed():
+            """D115 jamais indexé : Prune réussi d'un nick sans aucune base, trois fois -> ni diff.db ni cache.db (ni -wal/-shm) créées ;
+            gain enregistré comme avant (history.db, repo_stats op=prune) ; 2e Prune : history.db présente, le nettoyage après Prune
+            va au bout (borg list) sans rien créer ; code 0. 3e Prune, borg prune en code 1 (avertissement), 4e, borg compact en code 1 :
+            code 0, borg info lancé, gain enregistré. Prune --dry-run (avant les autres) : aucune base créée."""
+            d,b,fake,seen=_s78_prune_env('s78prunenone'); p=b.db.get_diff_db('pn'); cp=b.db.get_cache_db('pn'); h=b.db.get_history_db('pn')
+            with mock.patch.object(b.borg,'boex',fake): dr=_wk_run(lambda: b.prune('pn',dryrun=True))
+            dry=([x+s for x in (p,cp) for s in ('','-wal','-shm') if os.path.exists(x+s)],dr[1],list(seen))
+            runs=[]
+            for i in range(4):
+                had_hist=os.path.exists(h); seen.clear(); fake.prune_rc[0]=1 if i==2 else 0; fake.compact_rc[0]=1 if i==3 else 0
+                with mock.patch.object(b.borg,'boex',fake): o=_wk_run(lambda: b.prune('pn'))
+                ret=o[2] if isinstance(o[2],dict) else {}
+                made=[x+s for x in (p,cp) for s in ('','-wal','-shm') if os.path.exists(x+s)]
+                runs.append((o[1],ret.get('exitcode'),made,had_hist,list(seen),o[0][-200:]))
+            gain=_q(h,"SELECT op,unique_csize FROM repo_stats WHERE nick='pn'") if os.path.exists(h) else None
+            ok=(all(r[0] is None and r[1]==0 and r[2]==[] and r[4][:2]==['prune','compact'] and 'info' in r[4] for r in runs)
+                and runs[0][3] is False and runs[1][3] is True and 'list' in runs[1][4] and gain==[('prune',111)]*4
+                and dry==([],None,['prune']))
+            if not ok: print(f"  {runs} ; gain {gain} ; dry-run {dry}")
+            return ok
+        check("Prune réussi sur un nick jamais indexé : aucune diff.db ni cache.db créée, gain enregistré",_s78_prune_never_indexed)
+        def _s78_cost_readers(sub):
+            """(nom, table lue, appel, repli sur erreur, borg relancé) des 5 lecteurs « coût seulement » (D137) sur le nick zr, borg
+            simulé arrêté (killed) et noté. is_archive_snapshot_indexed : None (inconnu) sur erreur depuis la revue, False table absente
+            ou base disparue."""
+            d,b=_nb_env(sub); cfg=b.borg.cfgreaded('zr'); arch=[{'name':'a','start':'2026-01-01T00:00:00'}]; seen=[]
+            def fake(nick,args,debug=0,**k): seen.append(args[0]); return {'killed':True}
+            rd=(('is_archive_snapshot_indexed','archive_snapshot_indexed',lambda p: b.db.is_archive_snapshot_indexed('zr','a',p),None,[]),
+                ('_refresh_chart_stats','archive_stats',lambda p: b._refresh_chart_stats('zr',cfg,p,arch),None,['info']),
+                ('_index_tranche','archive_stats',lambda p: b._index_tranche('zr',0,p,cfg,arch,None,None,None,{'stats'},None,False),'interrupted',['info']),
+                ('_build_state','archive_stats',lambda p: b._build_state('zr',p,arch,None,False),None,[]),
+                ('_db_meta_value','db_meta',lambda p: b._db_meta_value(p,'k'),None,[]))
+            return d,b,fake,seen,rd
+        def _s78_run_twice(b,fake,seen,fn,p):
+            out=[]
+            for _ in range(2):
+                seen.clear()
+                with mock.patch.object(b.borg,'boex',fake): o=_wk_run(lambda: fn(p))
+                out.append((o[0],o[1],o[2],list(seen)))
+            return out
+        def _s78_cost_error():
+            """D137 : vraie erreur SQLite (pages de la table lue et de ses index écrasées : « database disk image is malformed ») dans
+            is_archive_snapshot_indexed, _refresh_chart_stats, _index_tranche, _build_state, _db_meta_value -> « [ERREUR] SQLite error
+            (<base>): … » une seule fois pour deux appels, même valeur de repli qu'avant, travail refait (borg info relancé) ; Index et
+            Bkp hors des commandes dont un lecteur en erreur change le code."""
+            d,b,fake,seen,rd=_s78_cost_readers('s78costerr'); res={}
+            for name,table,fn,fallback,borg in rd:
+                p=os.path.join(d,f's78-{name}.db')
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db.ensure_diff_db(p)
+                c=sqlite3.connect(p)
+                try:
+                    roots=[r[0] for r in c.execute("SELECT rootpage FROM sqlite_master WHERE tbl_name=? AND rootpage>0",(table,))]
+                    ps=c.execute("PRAGMA page_size").fetchone()[0]; c.execute("PRAGMA journal_mode=DELETE")
+                finally: c.close()
+                with open(p,'r+b') as f:   # table ET ses index : une requête couverte par l'index de clé primaire ne lit pas la table
+                    for r in roots: f.seek((r-1)*ps); f.write(b'\xee'*ps)
+                n0=_READER_FAILED[0]; runs=_s78_run_twice(b,fake,seen,fn,p); line=f"[ERREUR] SQLite error ({p}): database disk image is malformed"
+                txt=''.join(r[0] for r in runs); n=_READER_FAILED[0]-n0   # compteur : +1 par appel en erreur (marque dite ou non)
+                res[name]=(txt.count('[ERREUR] SQLite error')==1 and line in runs[0][0] and all(r[1:]==(None,fallback,borg) for r in runs) and n==2,n,runs)
+            res['codes']=({'index','bkp'}.isdisjoint(_READER_CODE_CMDS),)
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("lecteurs « coût seulement » : vraie erreur SQLite -> « [ERREUR] SQLite error (<base>) » une fois par base, travail refait",_s78_cost_error)
+        def _s78_cost_missing():
+            """D137 table absente : base sans la table lue (une autre table seulement) -> muet, même valeur de repli, aucun compte
+            d'erreur de lecteur."""
+            d,b,fake,seen,rd=_s78_cost_readers('s78costmiss'); res={}
+            for name,table,fn,fallback,borg in rd:
+                p=os.path.join(d,f's78-{name}-sans-table.db'); c=sqlite3.connect(p)
+                try: c.execute("CREATE TABLE autre(x)"); c.commit()
+                finally: c.close()
+                n0=_READER_FAILED[0]; runs=_s78_run_twice(b,fake,seen,fn,p); fb=False if name=='is_archive_snapshot_indexed' else fallback
+                res[name]=(all(r==('',None,fb,borg) for r in runs) and _READER_FAILED[0]==n0,runs)
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("lecteurs « coût seulement » : table absente -> muet (inchangé), même valeur de repli",_s78_cost_missing)
+        def _s78_cost_gone():
+            """D137 revue : base supprimée juste APRÈS son ouverture par l'un des 5 lecteurs (fantôme jeté par une bascule…) -> muet
+            (_cost_reader_err), même valeur de repli (is_archive_snapshot_indexed : False, absente), compteur d'erreurs de lecteur
+            inchangé (comme D116) ; témoin, même course avec _file_gone forcé à faux : l'erreur réelle (« disk I/O error ») est bien
+            levée et dite une fois, compteur +1, repli d'erreur (None)."""
+            d,b,fake,seen,rd=_s78_cost_readers('s78costgone'); res={}
+            for name,table,fn,fallback,borg in rd:
+                fb_gone=False if name=='is_archive_snapshot_indexed' else fallback
+                for temoin in (False,True):
+                    p=os.path.join(d,f's78-{name}-{int(temoin)}.db')
+                    with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db.ensure_diff_db(p)
+                    real_hdr=_enc_header_read
+                    def unlink():
+                        for s in ('','-wal','-shm'):
+                            if os.path.exists(p+s): os.unlink(p+s)
+                    def hdr(conn): unlink(); return real_hdr(conn)   # lecteurs avec nick : 1re requête dans _open_db
+                    def opn(*a,_o=_s78_gone_after_open(p),**k): return _o(*a,**k)   # nick=None (_db_meta_value) : après l'ouverture
+                    pat={'_enc_header_read':hdr,'_open_db':opn}
+                    if temoin: pat['_file_gone']=lambda x: False
+                    n0=_READER_FAILED[0]; seen.clear()
+                    with mock.patch.dict(globals(),pat), mock.patch.object(b.borg,'boex',fake): o=_wk_run(lambda: fn(p))
+                    got=(o[0],o[1],o[2],list(seen),_READER_FAILED[0]-n0)
+                    if temoin: res[(name,'témoin')]=(o[0].count(f"[ERREUR] SQLite error ({p}): disk I/O error")==1 and got[1:]==(None,fallback,borg,1),got)
+                    else: res[name]=(got==('',None,fb_gone,borg,0) and not os.path.exists(p),got)
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("lecteurs « coût seulement » : base supprimée après l'ouverture -> muet, même valeur de repli, aucune erreur comptée",_s78_cost_gone)
+        def _s78_meta_episode():
+            """_db_meta_value, lu en boucle par borgHelperWWW (A78) : erreur, erreur, lecture réussie (db_meta saine remise), erreur ->
+            2 lignes [ERREUR] ; fin d'épisode aussi par base absente (erreur, absente, erreur -> 2), table absente (idem -> 2) et base
+            disparue après l'ouverture (erreur, disparue, erreur -> 2)."""
+            d,b=_nb_env('s78meta'); p=os.path.join(d,'meta.db'); res={}
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db.ensure_diff_db(p)
+            c=sqlite3.connect(p)
+            try:
+                roots=[r[0] for r in c.execute("SELECT rootpage FROM sqlite_master WHERE tbl_name='db_meta' AND rootpage>0")]
+                ps=c.execute("PRAGMA page_size").fetchone()[0]; c.execute("PRAGMA journal_mode=DELETE")
+            finally: c.close()
+            good=open(p,'rb').read(); bad=bytearray(good)
+            for r in roots: bad[(r-1)*ps:r*ps]=b'\xee'*ps
+            bad=bytes(bad)
+            def put(x):
+                for sfx in ('-wal','-shm'):
+                    if os.path.exists(p+sfx): os.unlink(p+sfx)
+                if x is None:
+                    if os.path.exists(p): os.unlink(p)
+                    return
+                with open(p+'.tmp','wb') as f: f.write(x)
+                os.replace(p+'.tmp',p)
+            notable=sqlite3.connect(p+'.nt')
+            try: notable.execute("CREATE TABLE autre(x)"); notable.commit()
+            finally: notable.close()
+            nt=open(p+'.nt','rb').read()
+            for lbl,mid in (('lecture réussie',good),('absente',None),('table absente',nt),('disparue',bad)):
+                _SQLITE_ERR_SEEN.discard((p,'_db_meta_value')); e=io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(e):
+                    for i,x in enumerate((bad,bad,mid,bad) if lbl=='lecture réussie' else (bad,mid,bad)):
+                        put(x)
+                        if lbl=='disparue' and i==1:   # base supprimée juste après l'ouverture (« disk I/O error »)
+                            with mock.patch.dict(globals(),{'_open_db':_s78_gone_after_open(p)}): b._db_meta_value(p,'k')
+                        else: b._db_meta_value(p,'k')
+                res[lbl]=(e.getvalue().count('[ERREUR] SQLite error')==2,e.getvalue()[-300:])
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("_db_meta_value : une ligne [ERREUR] par épisode d'erreur (lecture réussie, base ou table absente : fin d'épisode)",_s78_meta_episode)
+        def _s78_snap_unknown():
+            """is_archive_snapshot_indexed inconnu (None, base illisible) -> indexsnap ne supprime rien, ne lance pas borg, rend 1 (comme
+            les paires, is_diff_pair_indexed 1.0.176) ; témoin False : lignes archive_snapshot de l'archive supprimées (cas d'avant)."""
+            d,b=_nb_env('s78snap'); os.makedirs(os.path.join(d,'cache'),exist_ok=True); p=b.db.get_diff_db('zr'); res={}
+            arch=[{'name':'b','start':'2026-01-02T00:00:00'}]
+            for lbl,val in (('inconnu',None),('témoin',False)):
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db.ensure_diff_db(p,nick='zr')
+                c=sqlite3.connect(p)
+                try:
+                    c.execute("DELETE FROM archive_snapshot"); c.execute("INSERT INTO archive_snapshot(nick,archive,archive_date,file_id) VALUES('zr','b','2026-01-02',1)")
+                    c.commit()
+                finally: c.close()
+                calls=[]
+                def boex(*a,**k): calls.append(a); raise AssertionError('borg lancé')
+                o=None
+                with mock.patch.object(b.db,'is_archive_snapshot_indexed',lambda *a,**k: val), mock.patch.object(b.borg,'boex',boex):
+                    try: o=_wk_run(lambda: b.indexsnap('zr',db_path=p,archives=arch))
+                    except AssertionError: pass
+                rows=_q(p,"SELECT count(*) FROM archive_snapshot WHERE nick='zr' AND archive='b'",one=True)[0]
+                res[lbl]=((o is not None and o[2]==1 and rows==1 and calls==[]) if val is None else rows==0,o[:3] if o else None,rows,len(calls))
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("indexsnap : snapshot indexé inconnu (base illisible) -> rien supprimé ni refait, code 1",_s78_snap_unknown)
+        def _s78_status_shadow():
+            """D137 / Status (décision A) : CLI réelle, Status texte et -j sur zr (fantôme <diff.db>.rebuild dont les pages de db_meta
+            sont écrasées) avec zb sain dans le même appel (-n zr,zb) -> code 1, une seule ligne « [ERREUR] SQLite error (<fantôme>):
+            … », rebuild {'state': 'partial'} ; sortie de zb identique à Status -n zb seul."""
+            d,b=_nb_env('s78status'); os.makedirs(os.path.join(d,'cache'),exist_ok=True)
+            p=b.db.get_diff_db('zr'); sp=p+_SHADOW_SUFFIX
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                b.db.ensure_diff_db(p); b.db.ensure_diff_db(sp); b.db.ensure_diff_db(b.db.get_diff_db('zb'),nick='zb')
+            c=sqlite3.connect(sp)
+            try:
+                roots=[r[0] for r in c.execute("SELECT rootpage FROM sqlite_master WHERE tbl_name='db_meta' AND rootpage>0")]
+                ps=c.execute("PRAGMA page_size").fetchone()[0]; c.execute("PRAGMA journal_mode=DELETE")
+            finally: c.close()
+            with open(sp,'r+b') as f:
+                for r in roots: f.seek((r-1)*ps); f.write(b'\xee'*ps)
+            nodsn=os.path.join(tmp,'sentry-vide'); open(nodsn,'a').close()
+            env=dict(os.environ,BORGHELPERC_SENTRY_FILE=nodsn); env.pop('BORGHELPERC_SENTRY_DSN',None)
+            def cli(*a):
+                r=subprocess.run([sys.executable,os.path.realpath(__file__),'-C',os.path.join(d,'rc'),'-c','Status']+list(a),capture_output=True,
+                                 text=True,env=env,timeout=120,stdin=subprocess.DEVNULL,cwd=d)
+                return r.returncode,r.stdout,r.stderr
+            line=f"[ERREUR] SQLite error ({sp}): database disk image is malformed"; res={}
+            for j in (False,True):
+                x=['-j'] if j else []
+                code,out,err=cli('-n','zr,zb',*x); c1,o1,e1=cli('-n','zb',*x)
+                if j:
+                    try: lst=json.loads(out); one=json.loads(o1)
+                    except ValueError: lst=one=None
+                    zr=[s for s in lst or [] if s.get('nick')=='zr']; zb=[s for s in lst or [] if s.get('nick')=='zb']
+                    rest=(len(zr)==1 and zr[0].get('rebuild')=={'state':'partial'} and one is not None and zb==one and c1==0)
+                else:
+                    rest=(c1==0 and (o1+e1).strip()!='' and o1 in out and e1 in err and 'zr:' in out+err)   # texte : sur stderr (printer)
+                res['-j' if j else 'texte']=(code==1 and (out+err).count('[ERREUR] SQLite error')==1 and line in err and rest,code,c1,err[-200:],out[-300:],o1[-200:])
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("Status, fantôme à db_meta illisible : code 1, une ligne [ERREUR] SQLite error, rebuild partiel ; nick sain inchangé (texte et -j)",_s78_status_shadow)
         # ── Rapprochement de la liste des archives + lignes de graphique figées (1.0.140, story 3, AD-9/AD-7) ──
         rz_dir=os.path.join(tmp,'reconcile'); os.makedirs(rz_dir)
         def _rz_date(days):

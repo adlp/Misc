@@ -216,10 +216,11 @@ DB_ENCRYPT = true
 DB_KDF     = standard
 ```
 
-`DB_ENCRYPT=true` (défaut) : depuis 1.0.168, une base **neuve** (`diff.db`, `cache.db`) créée par `Bkp`/`Index`/`Prune`/
-`Diff`/`Report` (cache de `borg info`) est chiffrée dès sa création quand la passphrase est disponible — sauf pour une base
-partagée (`DB_NAME` sur ce nick, ou autre nick dont le `DB_NAME` désigne ce nick : en clair, comme avant). Base née d'une
-passphrase fausse et encore sans aucun chemin : le créateur suivant, avec la bonne passphrase, lui pose une nouvelle clé ;
+`DB_ENCRYPT=true` (défaut) : depuis 1.0.168, une base **neuve** (`diff.db`, `cache.db`) créée par `Bkp`/`Index`/
+`Diff`/`Report` (cache de `borg info`) — `Prune` ne crée plus une base absente depuis 1.0.200 — est chiffrée dès sa création
+quand la passphrase est disponible — sauf pour une base partagée (`DB_NAME` sur ce nick, ou autre nick dont le `DB_NAME`
+désigne ce nick : en clair, comme avant). Base née d'une passphrase fausse et encore sans aucun chemin : le créateur
+suivant, avec la bonne passphrase, lui pose une nouvelle clé ;
 d'ici là (1.0.169), les lectures la voient vide (« Index vide — lancez Index »), sans `DbKeyError`.
 `DbEncrypt -y`/`DbDecrypt -y` mettent aussi `cache.db` dans le mode voulu quand `diff.db` y est déjà. Une base **existante** en clair reste `plain` tant qu'on n'a pas lancé `DbEncrypt`
 dessus (elle ne le devient pas toute seule — pas de migration implicite). Si une base reste `plain` alors que `DB_ENCRYPT` est actif et qu'une passphrase est disponible,
@@ -480,7 +481,13 @@ Requiert au moins une clef `KEEP_*` dans la conf.
 Attend qu'un `Index` en cours se mette en pause (1.0.141), enchaîne automatiquement `borg compact`, invalide le cache SQLite, et retire des bases les archives disparues
 (rapprochement, voir `Index`) — leurs lignes de graphique restent affichées pendant `STATS_RETENTION_MONTHS`.
 Met aussi à jour le schéma de `cache.db`/`diff.db` si nécessaire avant toute opération (comme `Bkp`/`Index`)
-— voir [Schéma de base de données](TECHNICAL.md#migrations-diffdb--table-de-correspondance-version--action).
+— voir [Schéma de base de données](TECHNICAL.md#migrations-diffdb--table-de-correspondance-version--action) ; base existante
+illisible : arrêt avant tout appel borg, comme avant. Depuis 1.0.200, un nick sans `diff.db` ni `cache.db` les garde absentes
+(avant : créées vides avant le premier appel borg, même en échec) ; une base existante est traitée comme avant (sa
+migration peut créer `history.db`) ; une base supprimée pendant le court instant entre le test et la mise à jour peut être
+recréée. Le gain n'est enregistré dans `history.db` qu'après un `borg prune` et un `borg compact` réussis (code 0 ou 1) :
+borg en échec -> ni `borg info`, ni base créée (avant : gain « prune » enregistré, et `history.db` créée, si `borg info`
+répondait encore).
 
 ---
 
@@ -801,7 +808,17 @@ absente…) ou un chemin illisible — données des autres nicks et lignes parti
 `DbTamperError`, code 2 ; LstBkpFls sur un chemin illisible : 3) ; `-j` : l'erreur est dans
 le JSON **et** sur stderr (avant : code 0, JSON seul) ; LstBkp/LstBkpFls : message `[ERREUR]` au lieu d'une trace Python.
 Status, Bkp, Index, Prune, Restore, DiffBkp : codes inchangés (Status : code 1 d'un nick en erreur depuis 1.0.193, voir
-[`Status`](#status)). **1.0.179** : « Index vide pour X — lancez Index »
+[`Status`](#status)). **1.0.200** : même ligne `[ERREUR] SQLite error (<base>): …` pour les lectures dont l'échec fait
+seulement refaire du travail — archive déjà dans le snapshot, statistiques d'archive connues (Index, Bkp), état de
+construction, marqueurs de `db_meta` (Index, Status) — une fois par base et par processus ; les marqueurs de `db_meta`, relus
+en boucle par borgHelperWWW, ont leur propre marque : une ligne par épisode d'erreur (une lecture réussie, une base ou une
+table absente le terminent). Travail refait comme avant, codes d'Index et de Bkp inchangés (Status : code 1, sa règle
+depuis 1.0.193 pour toute `[ERREUR]` d'un lecteur — fantôme dont `db_meta` est illisible) ; avant : muet ; table absente :
+toujours silencieux. Snapshot dont l'état est illisible : Index le saute sans rien supprimer, il est refait à un Index
+suivant (avant : snapshot valide supprimé puis refait). Base supprimée pendant une de ces lectures ou pendant la mise à jour
+de schéma d'un lecteur (après son ouverture) : lue comme absente, sans message ni code 1 (avant : « [ERREUR] SQLite error …
+disk I/O error » ; « DB corrompue … Supprimez le fichier », code 1, pour la mise à jour de schéma).
+**1.0.179** : « Index vide pour X — lancez Index »
 (nick jamais indexé) est un `[WARN]` (code 0 ; avant : marqué `[ERREUR]` en code 0) ; quand une lecture a échoué, Search,
 FileHist et DuIdx disent « Aucun résultat dans les bases lisibles (erreurs ci-dessus). » (et équivalents) au lieu de
 « Aucun résultat. » (DuIdx `-j` : `{}`, inchangé) ; RepoHistory/ArchiveHistory sur un dossier de cache non traversable :
