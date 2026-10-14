@@ -2,7 +2,7 @@
 
 Clés SSH dans un Vaultwarden auto-hébergé, utilisées de façon transparente par ssh.
 
-État (0.12.0) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
+État (0.12.1) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
 + e-mail, sur un même serveur ou sur des serveurs différents ; déconnexion par `sshvault
 logout`, serveur ou e-mail corrigé par `sshvault account set` ; voir « Comptes du coffre »),
 **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
@@ -889,7 +889,8 @@ ligne, comme ssh). `sshvault ssh-config install` insère
 commentaires d'en-tête restent dessous, inchangés) :
 
 - idempotent (ligne déjà en tête, sous toute forme : chemin réel, `~`, `~user`, relatif à
-  `~/.ssh`, joker, parmi plusieurs fichiers : rien fait) ; une ligne `Include` de sshvault
+  `~/.ssh`, joker qui couvre le fichier généré pour ssh (voir plus bas), parmi plusieurs
+  fichiers : rien fait) ; une ligne `Include` de sshvault
   (dont tous les arguments désignent exactement le fichier généré) placée plus bas est
   déplacée en tête ;
 - une ligne à **joker** qui couvre le fichier généré (`Include ~/.ssh/*/config`) ou **mixte**
@@ -899,7 +900,13 @@ commentaires d'en-tête restent dessous, inchangés) :
   (numéro de ligne du fichier réécrit), code 0 : le fichier généré est alors inclus deux
   fois, sans effet néfaste (la première valeur rencontrée gagne) ; ses lignes `Match … exec`
   sont évaluées deux fois à chaque lecture de la config : `sshvault ensure` est lancé deux
-  fois, et le second trouve la clé déjà chargée quand le premier l'a chargée ;
+  fois, et le second trouve la clé déjà chargée quand le premier l'a chargée. Un joker
+  « couvre » le fichier généré comme le glob d'ssh : composant par composant (`*`, `?`,
+  `[…]` ne traversent pas `/`), un nom à point initial (`.ssh`) pris seulement par un motif
+  à point initial, liens symboliques suivis ; `Include ~/.ssh/*` ou `Include
+  ~/*/sshvault/config` ne l'incluent pas (mesuré, OpenSSH 8.9p1) : ce sont des lignes
+  ordinaires, jamais touchées. Écarts connus, rares : classes POSIX (`[[:alpha:]]`, prises
+  par ssh, pas par sshvault) et `\*` échappé (littéral pour ssh) ;
 - une ligne `Include` de sshvault exacte **dans** un bloc `Host`/`Match` (Include
   conditionnel) n'est pas déplacée : code 4, rien modifié ; `ssh-config` et `--check` la
   signalent (« le sortir du bloc ») ; pour une ligne à joker ou mixte dans un bloc,
@@ -1167,6 +1174,11 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   et `ssh -G` ne montre plus l'agent dédié ; Include mixte, joker, plus bas, dans un bloc,
   lien, FIFO, `pub/` avec d'autres fichiers. `install` : joker ou ligne mixte plus bas, dans
   un bloc ou en tête (gardé, avertissement), exact dans un bloc (refus), puis `uninstall`.
+  Jokers : chaque forme mesurée (`~/.ssh/*`, `~/*/sshvault/config`, `~/.ssh/*/config`,
+  `~/.*/sshvault/config`, `?`, `[s]`, `[!x]`, `[.]`…) comparée à la réponse d'`ssh -G` du
+  poste ; formes relatives à `~/.ssh`, jokers sous un lien symbolique ; `install`,
+  `ssh-config`, `--check` et `uninstall` avec des jokers qui ne couvrent pas le fichier généré
+  (plus bas, en tête, dans un bloc, parmi d'autres fichiers).
 - `tests/test_it_accounts.py` : lecteur du fichier des comptes de test d'intégration
   (`tests/integration/accounts.py`), sans réseau ni vrai fichier : comptes valides et alias,
   doublon, champ manquant, vide ou de type faux, clé inconnue, TOML illisible, fichier absent

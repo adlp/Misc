@@ -739,10 +739,32 @@ def _keyword(line: str):
     return (m.group(1).lower(), m.group(2)) if m else ("", s)
 
 
+def _glob_covers(pattern: str, path: str) -> bool:
+    """`pattern` (joker, chemin absolu normalisé) couvre-t-il `path` comme le glob(3) d'ssh ?
+    Composant par composant (`*`, `?`, `[…]` ne traversent jamais `/`) ; un nom à point initial
+    n'est pris que par un motif de composant à point initial (mesuré, OpenSSH 8.9p1 :
+    `~/.ssh/*` et `~/*/sshvault/config` n'incluent pas `~/.ssh/sshvault/config`). Écarts connus,
+    rares : classes POSIX `[[:alpha:]]` (ignorées par fnmatch) et `\\*` échappé (lu comme
+    joker après shlex)."""
+    pp, tp = pattern.split("/"), path.split("/")
+    if len(pp) != len(tp):
+        return False
+    return all((not t.startswith(".") or p.startswith(".")) and fnmatch.fnmatchcase(t, p)
+               for p, t in zip(pp, tp))
+
+
+def _glob_real(pattern: str) -> str:
+    """`pattern` dont le préfixe sans joker est résolu (liens symboliques, comme le parcours du
+    glob d'ssh) : comparé au chemin réel du fichier généré."""
+    parts = pattern.split("/")
+    n = next((i for i, c in enumerate(parts) if any(x in c for x in "*?[")), len(parts))
+    return "/".join([os.path.realpath("/".join(parts[:n]) or "/").rstrip("/")] + parts[n:])
+
+
 def _ref_kinds(args_text: str, paths: Paths) -> list:
     """Pour chaque argument d'`Include` : « exact » s'il désigne le fichier généré lui-même (`~`,
     `~user`, relatif à ~/.ssh, chemin réel), « glob » si c'est un joker de glob qui le couvre
-    (il peut couvrir d'autres fichiers), None sinon."""
+    comme le glob d'ssh (`_glob_covers` ; il peut couvrir d'autres fichiers), None sinon."""
     try:
         args = shlex.split(args_text, comments=True)
     except ValueError:
@@ -757,9 +779,12 @@ def _ref_kinds(args_text: str, paths: Paths) -> list:
         if not os.path.isabs(a):
             a = os.path.join(paths.ssh_dir, a)
         a = os.path.normpath(a)
+        if a.startswith("//"):  # normpath garde « // » initial (POSIX) ; noyau et ssh : « / »
+            a = "/" + a.lstrip("/")
         glob = any(c in a for c in "*?[")
         out.append("exact" if not glob and (a == target or os.path.realpath(a) == real)
-                   else "glob" if glob and fnmatch.fnmatchcase(target, a) else None)
+                   else "glob" if glob and (_glob_covers(a, target) or _glob_covers(_glob_real(a), real))
+                   else None)
     return out
 
 

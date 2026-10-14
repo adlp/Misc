@@ -880,6 +880,97 @@ def test_include_formes_reconnues(bench, tmp_path):
         assert "déjà en tête" in r.stdout, spelling
 
 
+#: (joker relatif au HOME, couvre ~/.ssh/sshvault/config pour ssh ?) — mesuré, OpenSSH 8.9p1
+GLOB_FORMS = [(".ssh/*", False), ("*/sshvault/config", False), (".ssh/*/*/*", False), (".ssh/*/config", True),
+              (".ssh/*/*", True), (".*/sshvault/config", True), (".ssh/sshvaul?/config", True),
+              (".ssh/[s]shvault/config", True), (".ssh/sshvault/*", True), ("*", False),
+              # point initial : ni `?` ni `[.]` ne le prennent ; négation `[!x]` oui, `[^x]` non
+              ("?ssh/sshvault/config", False), ("[.]ssh/sshvault/config", False),
+              (".ssh/[!x]shvault/config", True), (".ssh/[^x]shvault/config", False)]
+#: Écarts connus et acceptés (rares) : `[[:alpha:]]` (inclus par ssh, ignoré par fnmatch) et
+#: `con\*fig` (littéral pour ssh, joker après shlex) — dits dans la docstring de _glob_covers.
+
+#: formes relatives à ~/.ssh (comme ssh), sans témoin possible (ssh développe par passwd)
+REL_FORMS = [("*", False), ("*/config", True), ("sshvault/*", True), (".*/config", False), ("*/*", True)]
+
+
+@pytest.mark.parametrize("rel,covers", GLOB_FORMS)
+def test_ref_kinds_joker_comme_le_glob_d_ssh(tmp_path, rel, covers):
+    """Joker comparé composant par composant, nom à point initial pris seulement par un motif à
+    point initial (glob(3)) : `~/.ssh/*` et `~/*/sshvault/config` ne couvrent pas la config
+    générée (avant : fnmatch, où `*` traverse `/` et prend le point)."""
+    paths = sshconfig.Paths(str(tmp_path))
+    for arg in ("~/" + rel, "%s/%s" % (tmp_path, rel), "/%s/%s" % (tmp_path, rel)):
+        assert sshconfig._ref_kinds(arg, paths) == ["glob" if covers else None], arg
+
+
+@pytest.mark.parametrize("rel,covers", REL_FORMS)
+def test_ref_kinds_joker_relatif_a_ssh(tmp_path, rel, covers):
+    paths = sshconfig.Paths(str(tmp_path))
+    assert sshconfig._ref_kinds(rel, paths) == ["glob" if covers else None]
+
+
+def test_ref_kinds_joker_par_un_lien(tmp_path):
+    """Joker sous un lien symbolique vers ~/.ssh ou vers le HOME : couvert (le glob d'ssh suit
+    les liens) ; lien vers un autre dossier : non."""
+    home = tmp_path / "h"
+    (home / ".ssh" / "sshvault").mkdir(parents=True)
+    (tmp_path / "lien-ssh").symlink_to(home / ".ssh")
+    (tmp_path / "lien-h").symlink_to(home)
+    (tmp_path / "ailleurs" / "sshvault").mkdir(parents=True)
+    (tmp_path / "lien-ailleurs").symlink_to(tmp_path / "ailleurs")
+    paths = sshconfig.Paths(str(home))
+    for arg, want in (("%s/lien-ssh/*/config" % tmp_path, "glob"), ("%s/lien-h/.ssh/*/config" % tmp_path, "glob"),
+                      ("%s/lien-ailleurs/*/config" % tmp_path, None), ("%s/lien-ssh/*" % tmp_path, None)):
+        assert sshconfig._ref_kinds(arg, paths) == [want], arg
+
+
+@needs_ssh
+@pytest.mark.parametrize("rel,covers", GLOB_FORMS)
+def test_joker_temoin_ssh_g(tmp_path, rel, covers):
+    """Témoin : la réponse de `_ref_kinds` est celle d'`ssh -G` (chemins absolus : ssh développe
+    `~` par passwd, pas par HOME ; la config du test hors du HOME : `*` ne l'inclut pas)."""
+    home = tmp_path / "h"
+    sv = home / ".ssh" / "sshvault"
+    sv.mkdir(parents=True, mode=0o700)
+    for d in (home, home / ".ssh"):
+        d.chmod(0o700)
+    (sv / "config").write_text("Host probe\n    Port 2201\n")
+    (sv / "config").chmod(0o600)
+    cfg = tmp_path / "cfg"
+    cfg.write_text("Include %s/%s\n" % (home, rel))
+    cfg.chmod(0o600)
+    r = subprocess.run([SSH, "-G", "-F", str(cfg), "probe"], capture_output=True, text=True, timeout=30,
+                       stdin=subprocess.DEVNULL)
+    ports = [l.split()[1] for l in r.stdout.splitlines() if l.startswith("port ")]
+    assert ports == (["2201"] if covers else ["22"]), (_ssh_version(), r.stdout[-200:], r.stderr)
+    paths = sshconfig.Paths(str(home))
+    assert sshconfig._ref_kinds("%s/%s" % (home, rel), paths) == ["glob" if covers else None]
+
+
+@pytest.mark.parametrize("line", ["Include ~/.ssh/*", "Include *", "Include ~/*/sshvault/config",
+                                  "Include a.conf ~/.ssh/*", "Host a\n    Include ~/.ssh/*"])
+def test_install_joker_qui_ne_couvre_pas(bench, line):
+    """Un joker qui n'inclut pas la config générée pour ssh n'est pas « le nôtre » : install
+    ajoute l'Include en tête (avant : « déjà en tête », sshvault inactif), ligne gardée sans
+    avertissement ; uninstall retire l'Include et laisse la ligne, sans avertissement."""
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    cfg = _ssh_dir(bench) / "config"
+    orig = "%s\nHost b\n" % line
+    cfg.write_text(orig)
+    r = bench.run("ssh-config")
+    assert "n'inclut pas" in r.stderr and "conditionnel" not in r.stderr, r.stderr
+    r = bench.run("ssh-config", "--check")
+    assert r.returncode == 1 and "n'inclut pas" in r.stdout, r.stdout
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0 and "ajoutée" in r.stdout and kept_warnings(r) == [], r.stdout + r.stderr
+    assert cfg.read_text() == include(bench) + "\n" + orig
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 0 and "avertissement" not in r.stderr, r.stderr
+    assert cfg.read_text() == orig
+
+
 def test_lignes_coupees_sur_lf_seulement(bench):
     """\\x0c, \\x85, U+2028 ne coupent pas une ligne pour ssh : « Host a<FF>Include … » n'est pas
     un Include."""

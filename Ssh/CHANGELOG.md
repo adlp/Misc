@@ -1,5 +1,20 @@
 # Changelog — sshvault
 
+## sshvault 0.12.1 — Jokers d'Include comparés comme le glob d'ssh — 2026-10-14
+
+- Un joker d'`Include` est comparé au fichier généré comme le glob d'ssh (`glob(3)`) :
+  composant par composant (`*`, `?`, `[…]` ne traversent pas `/`), un nom à point initial
+  pris seulement par un motif à point initial, liens symboliques suivis, `//` initial lu `/`
+  (écarts connus, rares : classes POSIX `[[:alpha:]]`, `\*` échappé). Avant (`fnmatch`),
+  `Include ~/.ssh/*` et `Include ~/*/sshvault/config` passaient pour des lignes qui
+  l'incluent, alors qu'ssh ne l'inclut pas (mesuré, OpenSSH 8.9p1) : `install` disait « déjà
+  en tête » avec sshvault inactif, `ssh-config`/`--check` ne signalaient rien, `uninstall`
+  gardait la ligne avec un avertissement. Ce sont désormais des lignes ordinaires : `install`
+  ajoute l'`Include` en tête sans les toucher.
+- Tests : chaque forme mesurée confrontée à `ssh -G` du poste (version dans le message
+  d'échec) ; formes relatives à `~/.ssh`, liens ; `install`, `ssh-config`, `--check` et
+  `uninstall` avec des jokers qui ne couvrent pas le fichier généré.
+
 ## sshvault 0.12.0 — Jokers d'install, load sous verrou, comptes de test en TOML — 2026-10-13
 
 - `sshvault ssh-config install` : seules les lignes `Include` dont tous les arguments
