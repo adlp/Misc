@@ -2,7 +2,7 @@
 
 Clés SSH dans un Vaultwarden auto-hébergé, utilisées de façon transparente par ssh.
 
-État (0.13.0) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
+État (0.13.1) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
 + e-mail, sur un même serveur ou sur des serveurs différents ; déconnexion par `sshvault
 logout`, serveur ou e-mail corrigé par `sshvault account set` ; voir « Comptes du coffre »),
 **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
@@ -943,8 +943,10 @@ commentaires d'en-tête restent dessous, inchangés) :
   sans son point (`Include ~/*/sshvault/config`), ou les deux (`Include ~/*`), est nommé
   dès que l'`Include` de sshvault n'est pas en tête (absent, plus bas ou conditionnel) : une
   ligne par argument voisin, motif tel qu'écrit, avec la ou les raisons (« *, ? et […] ne
-  traversent pas / », « un nom à point initial (.ssh) doit être écrit avec son point »),
-  dans un bloc compris, ligne nettoyée (caractères de contrôle et octets non UTF-8 échappés),
+  traversent pas / », « un nom à point initial (.ssh) doit être écrit avec son point », qui
+  nomme chaque composant à point initial que le joker prend réellement : « (.x, .ssh) »), dans
+  un bloc compris,
+  ligne nettoyée (caractères de contrôle et octets non UTF-8 échappés),
   jamais sur une ligne dont un autre argument couvre déjà le fichier généré, ni quand le motif
   couvre à l'écrit mais pas sur le disque (`/` final, `absent/..`) ; sur stderr pour
   `ssh-config` et chaque régénération, ligne de diff pour `--check` (code 1), avertissement
@@ -953,7 +955,10 @@ commentaires d'en-tête restent dessous, inchangés) :
 - une ligne `Include` de sshvault exacte **dans** un bloc `Host`/`Match` (Include
   conditionnel) n'est pas déplacée : code 4, rien modifié ; `ssh-config` et `--check` la
   signalent (« le sortir du bloc ») ; pour une ligne à joker ou mixte dans un bloc,
-  `ssh-config` et `--check` proposent `install` ;
+  `ssh-config` et `--check` proposent `install` (« ne s'applique que dans ce bloc »), sauf si
+  une ligne hors bloc, au-dessus du bloc (toute ligne après une ligne `Host`/`Match` est dans
+  un bloc) mais pas en tête, désigne aussi le fichier généré : sshvault
+  s'applique alors partout, l'avertissement est celui d'un `Include` qui n'est pas en tête ;
 - sauvegarde avant toute écriture, jamais écrasée : `~/.ssh/config.sshvault.bak`, sinon
   `.bak.1`, `.bak.2`… (0600) ; écriture atomique, mode et propriétaire conservés ; fichier
   absent : créé en 0600 (et `~/.ssh` en 0700 s'il manque), sans écraser un fichier créé
@@ -1211,7 +1216,11 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   (deux comptes) ou `bw status` en erreur, relecture en échec (élément supprimé, `bw get` en
   erreur), clé chiffrée avec `--nointeraction` ; `--restrict` : rechargée avec ses hôtes, clé
   sans hôte ou hôte absent de `known_hosts` (rien chargé, code 4) ; échec en cours de
-  rechargement : retour arrière.
+  rechargement : retour arrière. Concurrence réelle : `load` qui attend derrière un vrai
+  `sshvault logout --account` (bloqué dans `bw logout` par une enveloppe de `bw`) : rien
+  chargé, code 3 ; derrière un vrai `sshvault ensure` (bloqué dans `bw get`) : la clé chargée
+  par `ensure` est « déjà chargée », rien rechargé. Agent arrêté pendant l'attente de `load
+  --confirm`, relancé sous le verrou sans askpass utilisable : avertissement affiché.
 - `tests/test_sshconfig.py` valide le fichier généré avec l'OpenSSH du poste :
   `ssh -G -F <config de test qui l'inclut>` (agent dédié, une seule `identityfile`,
   `identitiesonly yes`, HOME et `XDG_RUNTIME_DIR` avec espace et `%`), puis `ssh -vvv`
@@ -1232,13 +1241,26 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   `/` final, `absent/..`, `*/..`, lien atteint par un joker, octets d'un HOME `josé`, `[…]`
   qui enjambe `/`) : chaque forme mesurée confrontée à `ssh -G` du poste ; config pas encore
   écrite, parcours borné, `~user` avec octet nul, `\/…` relatif à `~/.ssh` (test unitaire :
-  un témoin `ssh -G` lirait sous le vrai `~/.ssh`) ; découpage `argv_split` ;
-  jokers voisins (une raison, deux raisons, aucune ligne quand l'`Include` est en tête,
-  avertissement d'avant inchangé sans voisin) dans `ssh-config`, `--check` et `install`.
+  un témoin `ssh -G` lirait sous le vrai `~/.ssh`) ; `~user/…` (exact, joker couvrant,
+  voisin, autre utilisateur, inconnu) avec `pwd.getpwnam` remplacé dans le processus de test
+  par un HOME temporaire, jamais le vrai passwd ni le vrai HOME ; découpage `argv_split` ;
+  jokers voisins (une raison, deux raisons, noms des composants à point initial réellement
+  pris, aucune ligne quand l'`Include` est en tête, avertissement d'avant inchangé sans voisin)
+  dans `ssh-config`, `--check` et `install` ; `_dot_taken` confronté à `_match` sur toutes ces
+  formes (chemin normal et réel, `/` traversé ou non), longue suite de `*` (coût compté) ;
+  joker ou ligne mixte dans un bloc avec une ligne hors bloc au-dessus du bloc : « pas en
+  tête » (`ssh-config`, `--check`), puis `install` (Include exact en tête, ligne du bloc
+  gardée, « inclus deux fois ») et plus aucun avertissement.
 - `tests/test_it_accounts.py` : lecteur du fichier des comptes de test d'intégration
   (`tests/integration/accounts.py`), sans réseau ni vrai fichier : comptes valides et alias,
   doublon, champ manquant, vide ou de type faux, clé inconnue, TOML illisible, fichier absent
-  (avec ou sans `account.env`), `SSHVAULT_IT_ENV` ; aucune valeur dans les messages.
+  (avec ou sans `account.env`), `SSHVAULT_IT_ENV`, `SSHVAULT_IT_ACCOUNTS` (`~` développé) vers
+  un chemin absent, un dossier, une FIFO, un lien cassé ou un chemin illisible, fichier par
+  défaut présent mais inutilisable (échec, raison nommée) ; aucune valeur dans les messages.
+- `tests/test_it_pty.py` : `pty_login` de l'intégration, sans réseau ni vrai sshvault (faux
+  paquet `sshvault` par PYTHONPATH, qui laisse un petit-enfant écrire sans fin sur le terminal
+  et garder la sortie standard ouverte) : reste du terminal et sortie standard lus 5 s au
+  plus chacun.
 - `tests/test_ensure.py` (chargement automatique) : vrais `ssh` contre deux sshd de test
   (A, le rebond, et B, la cible, sur 127.0.0.1, chacun n'acceptant que sa clé), en
   `ProxyJump` et en `ProxyCommand ssh -W`, vrais `ssh-agent`/`ssh-add`, faux `bw` (avec un
@@ -1318,7 +1340,9 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   échecs).
 - L'intégration (`-m integration`, `bw` par `SSHVAULT_BW` ou le PATH) a deux modes :
   - **comptes de test** (défaut) : fichier TOML `~/.config/sshvault-test/accounts.toml`
-    (0600, hors git ; chemin remplaçable par `SSHVAULT_IT_ACCOUNTS`), à écrire d'après
+    (0600, hors git ; chemin remplaçable par `SSHVAULT_IT_ACCOUNTS`, `~` développé : un chemin
+    absent, un lien cassé, autre chose qu'un fichier ordinaire ou un chemin illisible fait
+    échouer la session, chemin et raison nommés), à écrire d'après
     `tests/integration/accounts.example.toml` : un bloc `[[account]]` par compte (`server`,
     `email`, `password`), `node_extra_ca_certs` commun en option (passé à `bw` par
     `NODE_EXTRA_CA_CERTS`). Lu par `tomllib` (Python 3.11+) ou `tomli` (Python 3.10,
@@ -1331,9 +1355,10 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
     propriétaire : avertissement seul (sortie de pytest et rapport). Les messages masquent les
     valeurs de tous les comptes à la fois (la plus longue d'abord), et aussi le serveur tel
     que sshvault l'affiche (normalisé), son nom d'hôte seul et le chemin du certificat.
-    Fichier absent : intégration sautée (l'ancien `account.env`, s'il existe encore, est
-    signalé : il n'est plus lu ; `SSHVAULT_IT_ENV` défini : échec qui nomme
-    `SSHVAULT_IT_ACCOUNTS`). Valeurs jamais affichées ; mot de passe par `--passwordenv` ;
+    Fichier par défaut absent (sans `SSHVAULT_IT_ACCOUNTS`) : intégration sautée (l'ancien
+    `account.env`, s'il existe encore, est signalé : il n'est plus lu ; `SSHVAULT_IT_ENV`
+    défini : échec qui nomme `SSHVAULT_IT_ACCOUNTS`) ; présent sans être un fichier ordinaire
+    utilisable : échec. Valeurs jamais affichées ; mot de passe par `--passwordenv` ;
     données `bw` dans des dossiers temporaires supprimés à la fin. Le test crée 2 éléments SSH et 1 login marqués
     `sshvault-test-run=<uuid>`, pilote sshvault, puis supprime définitivement
     (`--permanent`) les éléments de son run, même en cas d'échec, et fait `bw logout`. Au début

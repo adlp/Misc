@@ -419,6 +419,53 @@ def sv(home, *args, env=None):
                           timeout=600, stdin=subprocess.DEVNULL, start_new_session=True)
 
 
+#: secondes au plus pour lire le reste du terminal, puis la sortie standard, après la sortie de
+#: sshvault (un processus resté attaché au terminal qui écrirait sans fin, ou qui garderait le
+#: tube de sortie ouvert, ne bloque pas le test)
+PTY_DRAIN_LIMIT = 5.0
+
+
+def drain_pty(master, limit=None):
+    """Reste du terminal `master` après la sortie du processus : lu jusqu'à 0,2 s sans donnée,
+    la fin du flux ou une erreur, et `limit` secondes au plus (PTY_DRAIN_LIMIT par défaut)."""
+    end = time.monotonic() + (PTY_DRAIN_LIMIT if limit is None else limit)
+    got = b""
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            break
+        r, _, _ = select.select([master], [], [], min(0.2, left))
+        if not r:
+            break
+        try:
+            chunk = os.read(master, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        got += chunk
+    return got
+
+
+def read_pipe(f, limit=None):
+    """Tube `f` lu jusqu'à sa fin, `limit` secondes au plus (PTY_DRAIN_LIMIT par défaut) : un
+    processus qui garde le tube ouvert ne bloque pas ; au-delà, ce qui a été lu."""
+    end = time.monotonic() + (PTY_DRAIN_LIMIT if limit is None else limit)
+    fd, got = f.fileno(), b""
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            break
+        r, _, _ = select.select([fd], [], [], left)
+        if not r:
+            break
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        got += chunk
+    return got
+
+
 def pty_login(home, account, alias=None):
     """Un `sshvault login [--account ALIAS]` sous un pty : sshvault passe l'e-mail du registre à
     `bw login`, bw demande le mot de passe sur le terminal (saisie interactive réelle ; l'e-mail
@@ -458,19 +505,9 @@ def pty_login(home, account, alias=None):
                     time.sleep(0.3)
                     os.write(master, value.encode() + b"\r")
                     sent.add(what)
-        # reste du terminal après la sortie (message d'erreur écrit juste avant)
-        while True:
-            r, _, _ = select.select([master], [], [], 0.2)
-            if not r:
-                break
-            try:
-                chunk = os.read(master, 4096)
-            except OSError:
-                break
-            if not chunk:
-                break
-            seen += chunk
-        out = p.stdout.read().decode(errors="replace")
+        # reste du terminal après la sortie (message d'erreur écrit juste avant), borné
+        seen += drain_pty(master)
+        out = read_pipe(p.stdout).decode(errors="replace")
         tail = ""
         if p.returncode:
             i = seen.rfind(b"Master password")
@@ -480,6 +517,7 @@ def pty_login(home, account, alias=None):
         if p.poll() is None:
             p.kill()
             p.wait()
+        p.stdout.close()
         os.close(master)
         os.close(slave)
         del seen  # e-mail tapé, écho du terminal : jamais conservé
@@ -577,8 +615,10 @@ def test_sshvault_sur_le_vrai_bw(account, vault, ssh_keys, home, report):
     r = sv(home, "list", env=bad)
     report.add("sshvault list mauvais mot de passe", r)
     check(account, r, 3, "list mauvais mot de passe")
-    assert r.stderr.strip() == ("sshvault: mot de passe maître refusé par bw "
-                                "(Cryptography error, The decryption operation failed)")
+    # message de bw selon sa version (mesuré : 2026.9.1, puis 2025.12.0)
+    assert r.stderr.strip() in ("sshvault: mot de passe maître refusé par bw "
+                                "(%s)" % m for m in ("Cryptography error, The decryption operation failed",
+                                                     "Invalid master password.")), r.stderr
     assert not os.path.exists(session_file)
     assert sv(home, "--nointeraction", "list").returncode == 3
 

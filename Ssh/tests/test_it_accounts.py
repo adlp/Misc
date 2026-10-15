@@ -1,6 +1,7 @@
 """Fichier des comptes de test d'intégration (`tests/integration/accounts.py`) : lecture et
 contrôles, sans réseau ni vrai fichier (HOME et chemins temporaires). Aucune valeur du fichier
 (serveur, e-mail, mot de passe) ne doit apparaître dans un message d'erreur."""
+import errno
 import os
 import re
 import sys
@@ -178,6 +179,82 @@ def test_chemin_par_variable(tmp_path):
     os.chmod(str(d / "accounts.toml"), 0o600)
     found, extra, notes = it.load(str(d / "accounts.toml"))
     assert len(found) == 3 and notes == []
+
+
+KINDS = {"absent": "absent", "dossier": "pas un fichier ordinaire", "fifo": "pas un fichier ordinaire",
+         "lien-casse": "lien cassé", "interdit": os.strerror(errno.EACCES)}
+
+
+def _make(target, kind):
+    """Chemin `target` de la sorte `kind` ; « interdit » : fichier dans un dossier 0000."""
+    if kind == "dossier":
+        target.mkdir()
+    elif kind == "fifo":
+        os.mkfifo(str(target))
+    elif kind == "lien-casse":
+        target.symlink_to(target.parent / "nulle-part.toml")
+    elif kind == "interdit":
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(VALID)
+        target.parent.chmod(0)
+
+
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_chemin_par_variable_invalide_echoue(tmp_path, kind):
+    """SSHVAULT_IT_ACCOUNTS vers un chemin absent, un lien cassé, autre chose qu'un fichier
+    ordinaire ou un chemin illisible : échec de la session (AccountsError : chemin et vraie
+    raison nommés, aucune valeur), jamais un saut, même si le fichier par défaut existe ;
+    variable absente (ou vide) et fichier par défaut absent : saut."""
+    d = tmp_path / ".config" / "sshvault-test"
+    d.mkdir(parents=True)
+    (d / "accounts.toml").write_text(VALID)
+    target = tmp_path / "sous" / "cible.toml" if kind == "interdit" else tmp_path / "cible.toml"
+    _make(target, kind)
+    try:
+        if kind == "interdit" and os.access(str(target), os.R_OK):
+            pytest.skip("lisible malgré 0000 (root)")
+        with pytest.raises(it.AccountsError) as e:
+            it.locate({"SSHVAULT_IT_ACCOUNTS": str(target)}, str(tmp_path))
+    finally:
+        if kind == "interdit":
+            target.parent.chmod(0o700)
+    msg = str(e.value)
+    assert str(target) in msg and "SSHVAULT_IT_ACCOUNTS" in msg and KINDS[kind] in msg, msg
+    assert sum(r in msg for r in set(KINDS.values())) == 1, msg
+    assert not any(v.lower() in msg.lower() for v in SECRETS), msg
+    os.unlink(str(d / "accounts.toml"))
+    for env in ({}, {"SSHVAULT_IT_ACCOUNTS": ""}):
+        path, why = it.locate(env, str(tmp_path))
+        assert path is None and str(d / "accounts.toml") in why
+
+
+def test_chemin_par_variable_tilde(tmp_path):
+    """`~` de SSHVAULT_IT_ACCOUNTS développé (HOME de test) ; absent : le chemin développé est nommé."""
+    f = tmp_path / "comptes.toml"
+    f.write_text(VALID)
+    assert it.locate({"SSHVAULT_IT_ACCOUNTS": "~/comptes.toml"}, str(tmp_path)) == (str(f), None)
+    with pytest.raises(it.AccountsError) as e:
+        it.locate({"SSHVAULT_IT_ACCOUNTS": "~/autre.toml"}, str(tmp_path))
+    assert str(tmp_path / "autre.toml") in str(e.value) and "absent" in str(e.value)
+
+
+@pytest.mark.parametrize("kind", ["dossier", "fifo", "lien-casse", "interdit"])
+def test_fichier_par_defaut_inutilisable_echoue(tmp_path, kind):
+    """Fichier par défaut présent sans être un fichier ordinaire utilisable : échec (chemin et
+    raison nommés), jamais un saut « absent »."""
+    target = tmp_path / ".config" / "sshvault-test" / "accounts.toml"
+    target.parent.mkdir(parents=True)
+    _make(target, kind)
+    try:
+        if kind == "interdit" and os.access(str(target), os.R_OK):
+            pytest.skip("lisible malgré 0000 (root)")
+        with pytest.raises(it.AccountsError) as e:
+            it.locate({}, str(tmp_path))
+    finally:
+        if kind == "interdit":
+            target.parent.chmod(0o700)
+    msg = str(e.value)
+    assert str(target) in msg and KINDS[kind] in msg and "absent" not in msg, msg
 
 
 def test_sshvault_it_env_echoue(tmp_path):

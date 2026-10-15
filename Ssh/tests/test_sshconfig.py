@@ -761,6 +761,62 @@ def test_include_conditionnel_ssh_config_et_check(bench, orig, n, remedy):
     assert cfg.read_text() == orig
 
 
+BELOW = "la ligne Include de sshvault n'est pas en tête de %s : les lignes qui la précèdent l'emportent ; " \
+    "lancer « sshvault ssh-config install »"
+
+
+@pytest.mark.parametrize("orig,verb,rest,kept", [
+    # matrice : joker dans un bloc, Include exact hors bloc (au-dessus du bloc), pas en tête
+    ("User x\nInclude ~/.ssh/sshvault/config\nHost a\n    Include ~/.ssh/*/config\n", "déplacée",
+     "User x\nHost a\n    Include ~/.ssh/*/config\n", [4]),
+    # ligne mixte dans un bloc, joker hors bloc (au-dessus du bloc)
+    ("User x\nInclude ~/.ssh/*/config\nMatch user alice\n    Include a.conf ~/.ssh/sshvault/config\n", "ajoutée",
+     None, [3, 5]),
+])
+def test_include_joker_en_bloc_et_ligne_hors_bloc(bench, orig, verb, rest, kept):
+    """Aucune ligne exacte dans un bloc, mais une ligne hors bloc (au-dessus du bloc) désigne
+    aussi la config générée : elle s'applique partout, seulement pas en tête : message « pas en
+    tête » (`ssh-config` et `--check`), jamais « ne s'applique que dans ce bloc ». `install` :
+    l'Include exact en tête, la ligne du bloc (et le joker hors bloc) gardées avec
+    l'avertissement « inclus deux fois » (numéros du fichier réécrit) ; puis plus aucun
+    avertissement."""
+    unlocked(bench)
+    cfg = _ssh_dir(bench) / "config"
+    cfg.write_text(orig)
+    want = BELOW % cfg
+    r = bench.run("ssh-config")
+    assert r.returncode == 0, r.stderr
+    assert one_line_error(r) == "sshvault: avertissement : " + want, r.stderr
+    r = bench.run("ssh-config", "--check")
+    assert r.returncode == 1 and want in r.stdout, r.stdout
+    assert "conditionnel" not in r.stdout and "ne s'applique que" not in r.stdout, r.stdout
+    assert cfg.read_text() == orig
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0 and verb in r.stdout, r.stdout + r.stderr
+    assert cfg.read_text() == include(bench) + "\n" + (rest or orig)
+    assert kept_warnings(r) == kept, r.stderr
+    assert all("inclus deux fois" in l for l in r.stderr.splitlines() if "ligne gardée" in l), r.stderr
+    r = bench.run("ssh-config")
+    assert r.returncode == 0 and r.stderr == "", r.stderr
+
+
+def test_include_exact_en_bloc_et_exact_hors_bloc(bench):
+    """Matrice : une ligne exacte dans un bloc garde « le sortir du bloc » (install la refuse),
+    même avec un Include exact hors bloc plus haut."""
+    unlocked(bench)
+    cfg = _ssh_dir(bench) / "config"
+    orig = "User x\nInclude ~/.ssh/sshvault/config\nHost a\n    Include ~/.ssh/sshvault/config\n"
+    cfg.write_text(orig)
+    r = bench.run("ssh-config")
+    line = one_line_error(r)
+    assert r.returncode == 0 and "ligne 4 : Include conditionnel" in line and "le sortir du bloc" in line, line
+    r = bench.run("ssh-config", "--check")
+    assert r.returncode == 1 and "ligne 4 : Include conditionnel" in r.stdout and "le sortir du bloc" in r.stdout
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 4 and "non déplacée" in r.stderr, r.stderr
+    assert cfg.read_text() == orig
+
+
 def test_include_parmi_plusieurs_fichiers(bench):
     """`Include a.conf <le nôtre>` en tête : reconnu ; plus bas : ligne gardée (ssh ignore le
     doublon d'IdentityFile, mesuré), la nôtre ajoutée en tête."""
@@ -1302,6 +1358,155 @@ def test_joker_voisin_par_le_chemin_reel(tmp_path):
     assert sshconfig._neighbour("%s/.ssh/*" % real, paths) == [SLASH]
     assert sshconfig._neighbour("%s/*/sshvault/config" % real, paths) == [DOT]
     assert sshconfig._ref_kinds("%s/.ssh/*/config" % real, paths) == ["glob"]
+
+
+def test_joker_voisin_nomme_le_composant_pris(tmp_path):
+    """Raison « point initial » : noms des composants à point initial que le joker prend
+    réellement, pas un composant à point écrit tel quel avant lui (HOME `…/w/.x`) ; tous s'il
+    en prend plusieurs."""
+    home = tmp_path / "w" / ".x"
+    home.mkdir(parents=True)
+    paths = sshconfig.Paths(str(home))
+    dot = sshconfig.NEIGHBOUR_DOT
+    # `.x` écrit, `*` prend `.ssh`
+    assert sshconfig._neighbour("%s/*/.x/*/sshvault/config" % tmp_path, paths) == [dot % ".ssh"]
+    assert sshconfig._neighbour("%s/*/.x/*" % tmp_path, paths) == [SLASH, dot % ".ssh"]
+    # `*` prend `.x`, `.ssh` écrit
+    assert sshconfig._neighbour("%s/w/*/.ssh/sshvault/config" % tmp_path, paths) == [dot % ".x"]
+    assert sshconfig._neighbour("%s/w/*/.ssh/*" % tmp_path, paths) == [SLASH, dot % ".x"]
+    # deux jokers, deux noms à point initial pris
+    assert sshconfig._neighbour("%s/w/*/*/sshvault/config" % tmp_path, paths) == [dot % ".x, .ssh"]
+    assert sshconfig._neighbour("%s/w/*" % tmp_path, paths) == [SLASH, dot % ".x, .ssh"]
+
+
+def _invariant_forms(home):
+    """Motifs déjà mesurés ou testés (jokers, échappements, relatifs, voisins), `{h}` = HOME."""
+    out = ["~/" + r for r, _ in GLOB_FORMS] + ["%s/%s" % (home, r) for r, _ in GLOB_FORMS]
+    out += [t.replace("{h}", str(home)) for t, _ in ESCAPE_FORMS]
+    out += [r for r, _ in REL_FORMS]
+    out += ["~/.ssh/*", "*", "~/*/sshvault/config", "~/*", "~/[.]ssh/sshvault/config", "~/.ssh/s*", "~/*/*/config",
+            "~/.ssh/sshvault/con\\*fig", "~/.ssh/*/config", "~/.ssh/sshvault/config", "~/.ssh/*/*/*", "/etc/*",
+            "~/?ssh/sshvault/config", "%s/*.ssh/sshvault/config" % home]
+    out += [p.replace("{t}", str(home.parent.parent)) for p in ("{t}/*/.x/*/sshvault/config", "{t}/*/.x/*",
+                                                                 "{t}/w/*/.ssh/sshvault/config", "{t}/w/*/*/sshvault/config",
+                                                                 "{t}/w/*", "{t}/w/*/.ssh/*")]
+    return out
+
+
+@pytest.mark.parametrize("linked", [False, True])
+def test_dot_taken_accorde_a_match(tmp_path, linked):
+    """Invariant, sur les formes de motifs des tests (chemin normal et réel, `/` traversé ou
+    non) : `_dot_taken` est None ssi `_match(…, dot=False)` ne prend pas le chemin, et [] ssi
+    `_match(…, dot=True)` le prend."""
+    real = tmp_path / "w" / ".x"
+    real.mkdir(parents=True)
+    home = real
+    if linked:
+        home = tmp_path / "lien"
+        home.symlink_to(real)
+    paths = sshconfig.Paths(str(home))
+    n = 0
+    for arg in _invariant_forms(home):
+        try:
+            items = sshconfig._parse(arg, paths)
+        except sshconfig._BadClass:
+            continue
+        if items is None:
+            continue
+        comps = sshconfig._components(items)
+        pairs = [(comps, os.fsencode(os.path.normpath(paths.config))),
+                 (sshconfig._glob_real(comps), sshconfig._real(os.fsencode(paths.config)))]
+        for c, p in pairs:
+            for cross in (False, True):
+                got = sshconfig._dot_taken(c, p, cross)
+                assert (got is None) == (not sshconfig._match(c, p, cross, False)), (arg, cross, got)
+                assert (got == []) == sshconfig._match(c, p, cross, True), (arg, cross, got)
+                n += 1
+    assert n > 200
+
+
+def test_dot_taken_longue_suite_de_jokers(tmp_path, monkeypatch):
+    """Longues suites de `*` sur un long chemin : chaque position parcourue au plus une fois
+    par atome et par nombre de noms (compté : appels de `_ok`, linéaire et non quadratique),
+    réponse égale à celle de `_match`."""
+    a, stars = "a" * 200, "*" * 400
+    home = tmp_path / a / ".x"
+    home.mkdir(parents=True)
+    paths = sshconfig.Paths(str(home))
+    p = os.fsencode(paths.config)
+    calls, real_ok = [0], sshconfig._ok
+
+    def ok(*args):
+        calls[0] += 1
+        return real_ok(*args)
+    for arg, cross, want in (("%s/%s/.x/%s/sshvault/config" % (tmp_path, stars, stars), False, [b".ssh"]),
+                             ("%s/%s/%s/%s/sshvault/config" % (tmp_path, a, stars, stars), False, [b".x", b".ssh"]),
+                             ("%s/%s/%s/config" % (tmp_path, a, stars), True, [b".x", b".ssh"]),
+                             ("%s/%s/%s/nope" % (tmp_path, a, stars), True, None)):
+        comps = sshconfig._components(sshconfig._parse(arg, paths))
+        calls[0] = 0
+        with monkeypatch.context() as m:
+            m.setattr(sshconfig, "_ok", ok)
+            assert sshconfig._dot_taken(comps, p, cross) == want, arg[-40:]
+        bound = len(sshconfig._sequence(comps)) * (len(p) + 1) * 2 * 3  # 2 appels par pas, ≤ 3 améliorations
+        assert calls[0] <= bound, (calls[0], bound)
+        assert sshconfig._match(comps, p, cross, False) == (want is not None)
+    long_arg = "%s/%s/.x/%s/sshvault/config" % (tmp_path, stars, stars)
+    assert sshconfig._neighbour(long_arg, paths) == [sshconfig.NEIGHBOUR_DOT % ".ssh"]
+
+
+USER = "sshvault-essai"
+
+
+@pytest.fixture
+def fake_user(tmp_path, monkeypatch):
+    """`~sshvault-essai` développé (pwd, comme ssh) vers un HOME temporaire, `~autre` vers un
+    autre dossier, tout autre nom inconnu : jamais le vrai passwd ni le vrai HOME."""
+    import pwd
+    home, other = tmp_path / "h", tmp_path / "autre"
+    for d in (home, other):
+        d.mkdir()
+    asked = []
+
+    def getpwnam(name):
+        asked.append(name)
+        if name in (USER, "autre"):
+            return type("P", (), {"pw_dir": str(home if name == USER else other), "pw_name": name})()
+        raise KeyError(name)
+    monkeypatch.setattr(pwd, "getpwnam", getpwnam)
+    monkeypatch.setenv("HOME", str(other))  # `~user` ne lit jamais HOME
+    return sshconfig.Paths(str(home)), asked
+
+
+@pytest.mark.parametrize("arg,kind,why", [
+    ("~%s/.ssh/sshvault/config" % USER, "exact", []),
+    ("~%s/.ssh/*/config" % USER, "glob", []), ("~%s/.ssh/sshvault/*" % USER, "glob", []),
+    ("~%s/.*/sshvault/config" % USER, "glob", []),
+    ("~%s/*/sshvault/config" % USER, None, [DOT]), ("~%s/.ssh/*" % USER, None, [SLASH]),
+    ("~%s/*" % USER, None, [SLASH, DOT]),
+    ("~autre/.ssh/sshvault/config", None, []), ("~autre/.ssh/*/config", None, []),
+    ("~inconnu-essai/.ssh/sshvault/config", None, []), ("~inconnu-essai/*", None, []),
+])
+def test_tilde_user(fake_user, arg, kind, why):
+    """`~user/…` développé par passwd (comme ssh) : exact, joker couvrant, voisin ; un autre
+    utilisateur ou un inconnu : rien."""
+    paths, asked = fake_user
+    assert sshconfig._ref_kinds(arg, paths) == [kind]
+    assert sshconfig._neighbour(arg, paths) == why
+    assert asked and asked[0] == arg[1:].split("/")[0], "développé par pwd"
+
+
+def test_tilde_user_en_tete(fake_user):
+    """`Include ~user/…` en tête : reconnu par scan (état « head »), sans avertissement."""
+    paths, _ = fake_user
+    os.mkdir(paths.ssh_dir, 0o700)
+    with open(paths.user_config, "w") as f:
+        f.write("Include ~%s/.ssh/*/config\nHost a\n" % USER)
+    assert sshconfig.include_warnings(paths) == []
+    with open(paths.user_config, "w") as f:
+        f.write("User x\nInclude ~%s/*/sshvault/config\n" % USER)
+    w = sshconfig.include_warnings(paths)
+    assert len(w) == 2 and "n'inclut pas" in w[0] and w[1].endswith(DOT), w
 
 
 def test_joker_voisin_numero_apres_ligne_retiree(bench):

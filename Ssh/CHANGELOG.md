@@ -1,5 +1,31 @@
 # Changelog — sshvault
 
+## sshvault 0.13.1 — Include hors bloc dit « pas en tête », noms à point initial du joker voisin, comptes de test stricts — 2026-10-15
+
+- `ssh-config` et `--check` : un `Include` à joker ou mixte dans un bloc `Host`/`Match`,
+  sans ligne exacte dans un bloc, alors qu'une ligne hors bloc (au-dessus du bloc, pas en
+  tête) désigne aussi le fichier généré, n'est plus dit « ne s'applique que dans ce bloc » :
+  l'avertissement est celui d'un `Include` qui n'est pas en tête. Une ligne exacte dans un
+  bloc garde « le sortir du bloc » ; `install` inchangé.
+- Joker voisin, raison « point initial » : elle nomme chaque composant à point initial que le
+  joker prend réellement, « (.x, .ssh) » s'il en prend plusieurs (avant : un seul nom, le
+  premier composant à point à partir du premier joker, parfois un composant écrit tel quel,
+  comme `.x` dans `…/*/.x/*/…`).
+- Tests d'intégration : `SSHVAULT_IT_ACCOUNTS` (`~` développé) vers un chemin absent, un lien
+  cassé, autre chose qu'un fichier ordinaire ou un chemin illisible fait échouer la session
+  (chemin et raison nommés, aucune valeur) au lieu de la sauter ; sans la variable, fichier par
+  défaut absent : saut, comme avant ; présent mais inutilisable : échec. `pty_login` : reste du
+  terminal et sortie standard lus 5 s au plus chacun après la sortie de `sshvault login`.
+- Tests : `load` derrière un vrai `sshvault logout --account` (rien chargé, code 3) et
+  derrière un vrai `sshvault ensure` (« déjà chargée », rien rechargé) ; avertissement
+  `--confirm` quand l'agent est relancé sous le verrou sans askpass utilisable ; `~user/…`
+  (exact, joker couvrant, voisin) avec `pwd.getpwnam` remplacé dans le processus de test par un
+  HOME temporaire ; `install` sur un joker ou une ligne mixte dans un bloc avec une ligne hors
+  bloc ; `_dot_taken` confronté à `_match`.
+- Intégration avec le `bw` installé dans `/usr/local/bin` (2025.12.0) : le refus d'un mauvais mot
+  de passe y est « Invalid master password. » (bw 2026.9.1 : « Cryptography error, The
+  decryption operation failed ») ; le test accepte les deux messages mesurés.
+
 ## sshvault 0.13.0 — Include lu comme ssh, joker voisin nommé, load qui recharge une clé partie — 2026-10-14
 
 - Ligne `Include` lue comme OpenSSH 8.9 : arguments découpés comme `argv_split` (guillemets,

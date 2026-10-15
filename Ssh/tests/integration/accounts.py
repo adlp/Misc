@@ -12,8 +12,10 @@ Format (exemple : `tests/integration/accounts.example.toml`) :
     [[account]]                               # 2e : `it2`, puis `it3`…
     …
 
-Chemin : `SSHVAULT_IT_ACCOUNTS`, sinon `~/.config/sshvault-test/accounts.toml` (0600, hors
-git). Aucune valeur du fichier (serveur, e-mail, mot de passe, chemin du certificat) n'apparaît
+Chemin : `SSHVAULT_IT_ACCOUNTS` (`~` développé ; chemin absent, lien cassé, autre chose qu'un
+fichier ordinaire ou illisible : échec de la session), sinon
+`~/.config/sshvault-test/accounts.toml` (0600, hors git ; absent : intégration sautée ; présent
+sans être un fichier ordinaire utilisable : échec). Aucune valeur du fichier (serveur, e-mail, mot de passe, chemin du certificat) n'apparaît
 dans un message : les erreurs nomment le numéro du compte (à partir de 1) et la clé ; une erreur
 de syntaxe TOML ne donne que la ligne et la colonne. `account.env` et `SSHVAULT_IT_ENV`
 (format précédent) ne sont plus lus.
@@ -54,17 +56,40 @@ def legacy_path(home=None):
     return os.path.join(config_dir(home), "account.env")
 
 
+def _unusable(path):
+    """Pourquoi `path` n'est pas un fichier ordinaire utilisable (None : il l'est) : « absent »,
+    « lien cassé », « pas un fichier ordinaire » ou le texte de l'erreur du système."""
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return "lien cassé" if os.path.islink(path) else "absent"
+    except OSError as e:
+        return e.strerror or str(e)
+    return None if stat.S_ISREG(st.st_mode) else "pas un fichier ordinaire"
+
+
 def locate(env=None, home=None):
-    """(chemin du fichier, None) ou (None, raison du saut) ; AccountsError si SSHVAULT_IT_ENV
-    est défini (ancien format, jamais lu)."""
+    """(chemin du fichier, None) ou (None, raison du saut : fichier par défaut absent) ;
+    AccountsError, chemin et raison nommés (jamais une valeur du fichier), si SSHVAULT_IT_ENV est
+    défini (ancien format, jamais lu), si SSHVAULT_IT_ACCOUNTS (`~` développé) désigne un chemin
+    absent, un lien cassé, autre chose qu'un fichier ordinaire ou un chemin illisible, ou si le
+    fichier par défaut existe sans être un fichier ordinaire utilisable."""
     env = os.environ if env is None else env
     if env.get(LEGACY_ENV):
         raise AccountsError("%s n'est plus lu (comptes de test en TOML) : désigner le fichier des comptes par %s "
                             "(défaut : %s ; exemple : %s), puis retirer %s"
                             % (LEGACY_ENV, ENV_PATH, default_path(home), EXAMPLE, LEGACY_ENV))
-    path = env.get(ENV_PATH) or default_path(home)
-    if os.path.isfile(path):
+    chosen = os.path.expanduser(env.get(ENV_PATH) or "")
+    path = chosen or default_path(home)
+    bad = _unusable(path)
+    if bad is None:
         return path, None
+    if chosen:
+        raise AccountsError("%s désigne %s : %s : corriger le chemin, ou retirer %s (défaut : %s)"
+                            % (ENV_PATH, path, bad, ENV_PATH, default_path(home)))
+    if bad != "absent":
+        raise AccountsError("fichier des comptes de test %s : %s : y mettre un fichier ordinaire (0600), ou désigner "
+                            "le fichier par %s" % (path, bad, ENV_PATH))
     why = "fichier des comptes de test absent (%s ; chemin par %s)" % (path, ENV_PATH)
     if os.path.exists(legacy_path(home)):
         why += " ; %s (ancien format) n'est plus lu : écrire accounts.toml d'après %s" % (legacy_path(home), EXAMPLE)

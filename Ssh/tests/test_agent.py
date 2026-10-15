@@ -154,14 +154,26 @@ def load_waiting(bench, *args, env=None, keys=(), pre=()):
     p = subprocess.Popen([sys.executable, "-m", "sshvault", *pre, "load", *args], env=dict(bench.env, **(env or {})),
                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          start_new_session=True)
-    seen = wait_stderr(p, "attente d'un chargement en cours (ensure)")
-    assert "attente d'un chargement en cours (ensure)…" in seen, seen
-    time.sleep(0.3)
-    assert p.poll() is None, "load attend le verrou"
-    loads = [a for a in adds(bench)[n_add:] if not a.startswith("-H ")]  # « -H » seul : contrôle de --restrict
-    assert loads == [] and bench.agent_keys() == list(keys), "rien ajouté pendant l'attente"
-    assert any(c["argv"][1:3] == ["get", "item"] for c in bench.calls()[n_bw:]), "coffre lu avant le verrou"
+    try:
+        seen = wait_stderr(p, "attente d'un chargement en cours (ensure)")
+        assert "attente d'un chargement en cours (ensure)…" in seen, seen
+        time.sleep(0.3)
+        assert p.poll() is None, "load attend le verrou"
+        loads = [a for a in adds(bench)[n_add:] if not a.startswith("-H ")]  # « -H » seul : contrôle de --restrict
+        assert loads == [] and bench.agent_keys() == list(keys), "rien ajouté pendant l'attente"
+        assert any(c["argv"][1:3] == ["get", "item"] for c in bench.calls()[n_bw:]), "coffre lu avant le verrou"
+    except BaseException:
+        reap([p])
+        raise
     return p, seen
+
+
+def reap(procs):
+    """Tue et attend chaque processus encore vivant (échec en cours de test)."""
+    for p in procs:
+        if p is not None and p.poll() is None:
+            p.kill()
+            p.communicate(timeout=30)
 
 
 def test_load_attend_ensure_lock(bench):
@@ -583,6 +595,132 @@ def test_load_compte_change_pendant_l_attente(bench, change, why):
         lines
     assert out == b"" and adds(bench) == [] and bench.agent_keys() == []
     assert bench.agent_state()["keys"] == {}
+
+
+# --- concurrence réelle : load derrière un vrai logout, un vrai ensure ----------------------------
+
+def gated_bw(bench, word, name):
+    """Enveloppe de bw (`SSHVAULT_BW`) : un appel dont un argument est `word` crée le fichier
+    « arrivé », puis attend le fichier « ouvert » (60 s au plus) avant de lancer le faux bw ;
+    les autres appels passent. Renvoie (enveloppe, arrivé, ouvert)."""
+    arrived, gate = bench.tmp / (name + ".arrive"), bench.tmp / (name + ".ouvert")
+    w = bench.tmp / ("bw-" + name)
+    w.write_text("#!/bin/sh\ncase \" $* \" in *\" %s \"*) touch '%s'; n=0; while [ ! -e '%s' ] && [ $n -lt 1200 ]; "
+                 "do sleep 0.05; n=$((n+1)); done;; esac\nexec '%s' \"$@\"\n" % (word, arrived, gate, bench.bw))
+    w.chmod(0o755)
+    return w, arrived, gate
+
+
+def start_gated(bench, wrapper, arrived, *args):
+    """`sshvault <args>` lancé avec l'enveloppe ; attend qu'il soit bloqué dans l'appel de bw
+    visé (il tient alors ensure.lock)."""
+    p = subprocess.Popen([sys.executable, "-m", "sshvault", *args], env=dict(bench.env, SSHVAULT_BW=str(wrapper)),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         start_new_session=True)
+    deadline = time.monotonic() + 30
+    while not arrived.exists() and p.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if not (arrived.exists() and p.poll() is None):
+        p.kill()
+        _, err = p.communicate(timeout=30)
+        raise AssertionError("sshvault %s jamais bloqué dans bw : %r" % (" ".join(args), err))
+    return p
+
+
+def test_load_derriere_un_vrai_logout(bench):
+    """Matrice : `load` attend ensure.lock derrière un vrai `sshvault logout --account alice`
+    (bloqué dans `bw logout`, avant la déconnexion) ; coffre lu avant le verrou. Logout fini :
+    load relit le compte sous le verrou : rien chargé, code 3, une ligne qui nomme le compte.
+    Agent lancé avant (dossier d'ensure.lock présent) ; sa clé retirée par logout avant `bw logout`."""
+    from bench import ALIAS
+    unlocked(bench)
+    assert bench.run("load", "--id", ID_PERSO).returncode == 0
+    n = len(adds(bench))
+    w, arrived, gate = gated_bw(bench, "logout", "logout")
+    procs = []
+    try:
+        procs.append(start_gated(bench, w, arrived, "logout", "--account", ALIAS))
+        procs.append(load_waiting(bench, "--id", ID_PROD)[0])
+        gate.touch()
+        lo, p = procs
+        lout, lerr = lo.communicate(timeout=60)
+        assert lo.returncode == 0, lerr
+        assert lout.decode().startswith("compte %s déconnecté" % ALIAS), lout
+        out, err = p.communicate(timeout=60)
+    finally:
+        gate.touch()  # logout repart, quoi qu'il arrive
+        reap(procs)
+    lines = [l for l in err.decode().splitlines() if l.strip()]
+    assert p.returncode == 3, err
+    assert lines == ["sshvault: compte « %s » déconnecté pendant l'attente du verrou d'ensure : rien chargé" % ALIAS], \
+        lines
+    assert adds(bench)[n:] == ["-d -"], "clé de alice retirée par logout ; rien chargé par load"
+    assert out == b"" and bench.agent_keys() == []
+    assert bench.agent_state()["keys"] == {}
+
+
+def test_load_derriere_un_vrai_ensure(bench):
+    """Matrice : `load` attend ensure.lock derrière un vrai `sshvault ensure` (bloqué dans la
+    lecture de la clé par bw) ; ensure charge la clé : « déjà chargée » pour load, rien
+    rechargé, code 0."""
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    w, arrived, gate = gated_bw(bench, "get", "ensure")
+    procs = []
+    try:
+        procs.append(start_gated(bench, w, arrived, "ensure", "--id", ID_PROD))
+        procs.append(load_waiting(bench, "--id", ID_PROD)[0])
+        gate.touch()
+        en, p = procs
+        eout, eerr = en.communicate(timeout=60)
+        assert (en.returncode, eout, eerr) == (0, b"", b""), eerr
+        out, err = p.communicate(timeout=60)
+    finally:
+        gate.touch()  # ensure repart, quoi qu'il arrive
+        reap(procs)
+    assert p.returncode == 0, err
+    assert err.strip() == b"", err
+    fp = bench.keys["prod"]["fingerprint"]
+    assert out.decode() == "déjà chargée : Serveur Prod %s (--force pour recharger)\n" % fp
+    assert adds(bench) == ["-t 3600 -"], "chargée une fois, par ensure"
+    assert bench.agent_keys() == [bench.blob("prod")]
+    assert bench.agent_state()["keys"][fp]["id"] == ID_PROD
+
+
+def test_load_confirm_agent_relance_sans_askpass(bench, tmp_path):
+    """Agent lancé avec un askpass utilisable, arrêté pendant que `load --confirm` attend
+    ensure.lock, relancé sous le verrou par load sans askpass utilisable (ni DISPLAY ni
+    SSH_ASKPASS) : l'avertissement « lancé sans askpass utilisable » s'affiche (calculé sur
+    l'agent relancé, pas sur l'ancien) ; clé chargée avec confirmation, code 0."""
+    from bench import wait_gone
+    unlocked(bench)
+    prog, _ = make_askpass(tmp_path)
+    assert bench.run("load", "--id", ID_PERSO, env={"SSH_ASKPASS": prog, "DISPLAY": ":99"}).returncode == 0
+    old = bench.agent_state()["agent"]
+    assert old["askpass"] is True
+    fd, p = hold_ensure_lock(bench), None
+    try:
+        try:
+            p, seen = load_waiting(bench, "--id", ID_PROD, "--confirm", keys=[bench.blob("perso")])
+            assert "askpass" not in seen, seen
+            os.kill(old["pid"], signal.SIGTERM)
+            assert wait_gone([old["pid"]]), "agent arrêté pendant l'attente"
+        finally:
+            os.close(fd)
+        out, err = p.communicate(timeout=60)
+    finally:
+        reap([p])
+    assert p.returncode == 0, err
+    lines = [l for l in err.decode().splitlines() if l.strip()]
+    assert lines == ["sshvault: avertissement : l'agent a été lancé sans askpass utilisable (DISPLAY, SSH_ASKPASS) : "
+                     "chaque usage d'une clé --confirm sera refusé ; « sshvault agent stop » puis load depuis une "
+                     "session graphique"], lines
+    st = bench.agent_state()
+    assert st["agent"]["pid"] != old["pid"] and st["agent"]["askpass"] is False, "agent relancé sous le verrou"
+    fp = bench.keys["prod"]["fingerprint"]
+    assert out.decode() == "chargée : Serveur Prod %s (durée 1h, confirmation)\n" % fp
+    assert bench.agent_keys() == [bench.blob("prod")]
+    assert adds(bench)[-1] == "-t 3600 -c -"
 
 
 def test_load_nointeraction_attente_bornee(bench):

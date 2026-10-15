@@ -477,8 +477,9 @@ class BwBackend(VaultBackend):
         if r.rc != 0:
             if r.has(MSG_NOT_LOGGED_IN):
                 raise self._not_logged_in()
-            # unlock est local : un refus est presque toujours le mot de passe (mesuré :
-            # « Cryptography error, The decryption operation failed », code 1).
+            # unlock est local : un refus est presque toujours le mot de passe (mesuré, code 1 :
+            # « Cryptography error, The decryption operation failed » avec bw 2026.9.1,
+            # « Invalid master password. » avec bw 2025.12.0).
             raise PasswordRefused("mot de passe maître refusé par bw (%s)" % (last_line(r.err) or "code %d" % r.rc))
         token = r.out.strip()
         if not valid_token(token):

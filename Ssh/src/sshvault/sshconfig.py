@@ -937,6 +937,24 @@ def _literal(path: bytes) -> list:
     return [([("c", b) for b in part], False, part) for part in path.split(b"/") if part]
 
 
+def _ok(atom, start: bool, path: bytes, j: int, cross: bool, dot: bool) -> bool:
+    """L'atome `atom` (en tête de composant du motif : `start`) prend-il l'octet `path[j]` ?
+    (règles de `_fits`)"""
+    c = path[j]
+    if atom[0] == "/":
+        return c == _SLASH
+    lead = dot and c == _DOT and (j == 0 or path[j - 1] == _SLASH)
+    if atom[0] == "c":
+        return c == atom[1] and not (lead and not start)
+    if lead or (c == _SLASH and not cross) or atom[0] == "x":
+        return False
+    if atom[0] == "[":
+        _, neg, chars, ranges, classes = atom
+        hit = c in chars or any(a <= c <= b for a, b in ranges) or any(c in _CLASSES[k] for k in classes)
+        return hit != neg
+    return True
+
+
 def _fits(seq: list, path: bytes, cross: bool, dot: bool) -> bool:
     """`seq` ([(atome, en tête de composant ?)]) prend-il tout `path` ? `cross` : `*`, `?`,
     `[…]` prennent aussi `/` ; `dot` : un nom à point initial n'est pris que par un `.` écrit en
@@ -944,19 +962,7 @@ def _fits(seq: list, path: bytes, cross: bool, dot: bool) -> bool:
     m = len(path)
 
     def ok(atom, start, j):
-        c = path[j]
-        if atom[0] == "/":
-            return c == _SLASH
-        lead = dot and c == _DOT and (j == 0 or path[j - 1] == _SLASH)
-        if atom[0] == "c":
-            return c == atom[1] and not (lead and not start)
-        if lead or (c == _SLASH and not cross) or atom[0] == "x":
-            return False
-        if atom[0] == "[":
-            _, neg, chars, ranges, classes = atom
-            hit = c in chars or any(a <= c <= b for a, b in ranges) or any(c in _CLASSES[k] for k in classes)
-            return hit != neg
-        return True
+        return _ok(atom, start, path, j, cross, dot)
 
     pos = {0}
     for atom, start in seq:
@@ -976,14 +982,59 @@ def _fits(seq: list, path: bytes, cross: bool, dot: bool) -> bool:
     return m in pos
 
 
-def _match(comps: list, path: bytes, cross: bool = False, dot: bool = True) -> bool:
-    """Réponse textuelle : le motif `comps` prend-il le chemin absolu `path` ? Par défaut comme
-    le glob d'ssh (`*`, `?`, `[…]` ne prennent jamais `/` ; règle du point initial)."""
+def _sequence(comps: list) -> list:
+    """Atomes du motif `comps`, chacun avec « en tête de composant ? », `/` compris."""
     seq = []
     for atoms, _, _ in comps:
         seq.append((("/",), True))
         seq += [(a, k == 0) for k, a in enumerate(atoms)]
-    return _fits(seq, path, cross, dot)
+    return seq
+
+
+def _match(comps: list, path: bytes, cross: bool = False, dot: bool = True) -> bool:
+    """Réponse textuelle : le motif `comps` prend-il le chemin absolu `path` ? Par défaut comme
+    le glob d'ssh (`*`, `?`, `[…]` ne prennent jamais `/` ; règle du point initial)."""
+    return _fits(_sequence(comps), path, cross, dot)
+
+
+def _dot_taken(comps: list, path: bytes, cross: bool) -> Optional[list]:
+    """Le motif `comps` prend `path` sans la règle du point initial (`_match(…, dot=False)`) :
+    noms à point initial qu'il prend contre cette règle (un joker, ou un `.` écrit hors tête de
+    composant du motif), pour la première correspondance trouvée qui en prend le moins ; None
+    s'il ne prend pas `path`. Réponse vide : `_match(…, dot=True)` le prend aussi."""
+    seq, m = _sequence(comps), len(path)
+    best = {0: ()}  # position dans `path` → positions de point initial prises contre la règle
+
+    def step(atom, start, j, taken):
+        if not _ok(atom, start, path, j, cross, False):
+            return None
+        return taken if _ok(atom, start, path, j, cross, True) else taken + (j,)
+
+    for atom, start in seq:
+        new = {}
+        for j0 in sorted(best):
+            j, taken = j0, best[j0]
+            if atom[0] == "*":
+                # la suite ne dépend que de la position : arrêt dès qu'elle est déjà atteinte avec
+                # au plus autant de noms (un parcours par position, comme `_fits`)
+                while j not in new or len(taken) < len(new[j]):
+                    new[j] = taken
+                    if j >= m:
+                        break
+                    taken = step(atom, start, j, taken)
+                    if taken is None:
+                        break
+                    j += 1
+            elif j < m:
+                t = step(atom, start, j, taken)
+                if t is not None and (j + 1 not in new or len(t) < len(new[j + 1])):
+                    new[j + 1] = t
+        best = new
+        if not best:
+            return None
+    if m not in best:
+        return None
+    return [path[j:].split(b"/", 1)[0] for j in best[m]]
 
 
 def _real(path: bytes) -> bytes:
@@ -1191,7 +1242,9 @@ def _neighbour(arg: str, paths: Paths, rd: Optional[_Read] = None) -> list:
     """Raisons pour lesquelles un joker « presque bon » n'inclut pas le fichier généré : il le
     couvrirait si `*`, `?` et `[…]` pouvaient prendre `/` (chemin entier) et/ou si la règle du
     point initial était levée (réponse textuelle, mêmes échappements et classes ; chemin normal
-    ou réel). Les deux raisons seulement si chacune seule ne suffit pas. [] : pas un voisin
+    ou réel). Les deux raisons seulement si chacune seule ne suffit pas ; la raison du point
+    nomme chaque composant à point initial que le motif prend contre la règle (`_dot_taken`,
+    jamais vide ici : sinon la règle tenue suffirait déjà). [] : pas un voisin
     (exact, couvrant, sans joker, classe inconnue, couvrant pour le texte mais pas sur le
     disque : `/` final, `absent/..`, dossier illisible, ou trop loin). Jamais une réponse de
     `_ref_kinds`."""
@@ -1204,18 +1257,18 @@ def _neighbour(arg: str, paths: Paths, rd: Optional[_Read] = None) -> list:
     def hits(cross, dot):
         return next(((c, p) for c, p in pairs if _match(c, p, cross, dot)), None)
 
-    def dotted(hit):
-        c, p = hit
-        first = next((i for i, x in enumerate(c) if x[1]), 0)
-        name = next((x for x in p.split(b"/")[1:][first:] if x.startswith(b".")), b".ssh")
-        return NEIGHBOUR_DOT % name.decode("utf-8", "surrogateescape")
+    def dotted(hit, cross):
+        """Raison « point initial » : noms des composants à point initial que le motif prend
+        réellement contre la règle (« .x, .ssh »)."""
+        names = _dot_taken(hit[0], hit[1], cross)
+        return NEIGHBOUR_DOT % ", ".join(n.decode("utf-8", "surrogateescape") for n in names)
     if hits(True, True):
         return [NEIGHBOUR_SLASH]
     hit = hits(False, False)
     if hit:
-        return [dotted(hit)]
+        return [dotted(hit, False)]
     hit = hits(True, False)
-    return [NEIGHBOUR_SLASH, dotted(hit)] if hit else []
+    return [NEIGHBOUR_SLASH, dotted(hit, True)] if hit else []
 
 
 def neighbours(lines: list, paths: Paths, rd: Optional[_Read] = None) -> list:
@@ -1319,14 +1372,19 @@ def include_state(paths: Paths):
 
 def _include_warning(st: str, sc: Optional[Scan], paths: Paths) -> Optional[str]:
     p = paths.user_config
+    below = ("la ligne Include de sshvault n'est pas en tête de %s : les lignes qui la précèdent l'emportent ; "
+             "lancer « sshvault ssh-config install »" % p)
     if st == "head":
         return None
     if st == "below":
-        return ("la ligne Include de sshvault n'est pas en tête de %s : les lignes qui la précèdent l'emportent ; "
-                "lancer « sshvault ssh-config install »" % p)
+        return below
     if st == "conditional":
         exact = set(_own_includes(sc.lines, paths, sc.read)[0])
         blocked = [i for i in sc.conditional if i in exact]
+        if not blocked and any(not cond for _, cond, _ in sc.ours):
+            # joker ou ligne mixte dans un bloc, mais une ligne hors bloc le désigne aussi : il
+            # s'applique partout, seulement pas en tête
+            return below
         if not blocked:  # joker ou ligne mixte : install ajoute l'Include exact en tête sans la toucher
             return ("%s ligne %d : Include conditionnel (dans un bloc Host/Match) : sshvault ne s'applique que dans ce "
                     "bloc ; lancer « sshvault ssh-config install »" % (p, sc.conditional[0] + 1))
