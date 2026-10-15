@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.201"
+Version="1.0.202"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -5801,7 +5801,7 @@ class BorgHelper:
         known.discard(None)
         return known
 
-    def _reconcile_archives(self,nick,db_path,current,repo=None):
+    def _reconcile_archives(self,nick,db_path,current,repo=None,deferred=None):
         """Rapprochement de la base avec la liste courante des archives (CAP-5, AD-9, 1.0.140) — Index (liste déjà
         obtenue ; borg list du dépôt entier seulement si une archive manque, voir Périmètre) et nettoyage après Prune et
         DelBkp. Tous les nicks, NOIDX compris.
@@ -5821,13 +5821,24 @@ class BorgHelper:
           mesure). Absente du dépôt = disparue (ci-dessus). Liste complète indisponible : reporté, rien retiré.
           repo None : `current` est le dépôt entier (nick sans filtre).
         Jamais de compactage ici (Prune/IdxPurge s'en chargent). Base illisible, occupée ou chiffrée sans clé : message,
-        rien retiré, Index continue. Retourne le nombre de lignes retirées de diff.db (décision de compactage)."""
+        rien retiré, Index continue. Retourne le nombre de lignes retirées de diff.db (décision de compactage).
+        deferred (1.0.202, story 80, D200) : liste facultative qui reçoit la raison d'un rapprochement REPORTÉ, rien retiré
+        faute d'information : base servie occupée (verrou, _db_busy — même sans disparue : état inconnu), opération
+        prioritaire, borg list du dépôt entier en échec ou interrompu, figeage en échec (écriture de history.db, illisible
+        comprise : décision A, pas de bascule tant qu'elle n'est pas réparée). Jamais pour « rien à retirer », une liste
+        vide, une base servie illisible, corrompue ou chiffrée sans clé, à toute lecture (la reconstruction est là pour la
+        remplacer : un nouvel essai n'y retrouverait rien) ni une purge interrompue (lignes de graphique déjà figées). Lue par la passe en tranches : pas de bascule
+        du fantôme (_shadow_swap) après un rapprochement reporté de la base servie dans la même passe."""
+        def _defer(why):
+            if deferred is not None: deferred.append(why)
+            return 0
         current=set(current)
         hist=_history_path_for(db_path)
         shadow=_is_shadow(db_path)   # fantôme (1.0.143) : purge de ses tables seulement — ni figeage, ni mesures (AD-7)
         dst,derr=_db_probe(db_path,_READER_WRITE_WAIT)
         if dst=='illisible':   # 1.0.171 (revue story 34) : jamais lue comme absente — sinon mesures de history.db retirées
-            printer(f"{nick}: rapprochement impossible ({db_path}) : {derr}"); return 0
+            printer(f"{nick}: rapprochement impossible ({db_path}) : {derr}")
+            return _defer('occupée') if _db_busy(derr) else 0
         diff_ok=dst=='base'
         measures=self.db.get_archive_measures(nick,hist) if not shadow and os.path.exists(hist) else {}
         known={k[0] for k in measures}; known_diff=set(); sweep=False; flag=f'reconcile_sweep:{nick}'
@@ -5839,7 +5850,8 @@ class BorgHelper:
                     sweep=not conn.execute("SELECT 1 FROM db_meta WHERE key=?",(flag,)).fetchone()
                 finally: conn.close()
         except _RECONCILE_ERRORS as e:
-            printer(f"{nick}: rapprochement impossible ({db_path}) : {e}"); return 0
+            printer(f"{nick}: rapprochement impossible ({db_path}) : {e}")
+            return _defer('occupée') if _db_busy(e) else 0
         if not current:
             if known: printer(f"{nick}: borg list ne rend aucune archive alors que la base en connaît {len(known)} — rien retiré (GLOB_ARCH ?)")
             return 0
@@ -5848,14 +5860,14 @@ class BorgHelper:
         # Bkp démarré entre borg list et ici : ses nouvelles archives passeraient pour disparues. Jamais vrai pour
         # Prune (verrou tenu par ce processus, ignoré par check_priority_lock) ni pour l'Index lancé par Bkp (relâché).
         if gone and self.db.check_priority_lock(nick):
-            printer(f"{nick}: opération prioritaire en cours — rapprochement reporté"); return 0
+            printer(f"{nick}: opération prioritaire en cours — rapprochement reporté"); return _defer('priorité')
         foreign=set()
         if gone and repo is not None and not shadow:
             whole=repo()
             if whole is None or whole is False:
                 printer(f"{nick}: liste complète du dépôt "+("interrompue (échéance ou opération prioritaire)" if whole is False
                         else "indisponible")+" — rapprochement reporté (archives hors GLOB_ARCH et disparues non distinguées)")
-                return 0
+                return _defer('dépôt')
             foreign=gone&set(whole)
         vanished=gone-foreign   # figeage, héritières et mesures : disparues seulement
         frozen=[]; orphans=set()
@@ -5891,9 +5903,15 @@ class BorgHelper:
                     frozen+=self.db._chart_counts(nick,conn,heirs)
             finally:
                 if conn is not None: conn.close()
+        except _RECONCILE_ERRORS as e:   # lecture de la base servie : reporté si occupée seulement (corrompue : la reconstruction la remplace)
+            printer(f"{nick}: lignes de graphique non figées ({e}) — rien retiré, nouvel essai au prochain Index")
+            return _defer('occupée') if _db_busy(e) else 0
+        try:
             if not shadow: self.db.freeze_archive_chart(nick,frozen,hist)
         except _RECONCILE_ERRORS as e:   # SystemExit : history.db illisible (_db_schema_fail) — Index continue
-            printer(f"{nick}: lignes de graphique non figées ({e}) — rien retiré, nouvel essai au prochain Index"); return 0
+            # 1.0.202 (décision A de l'utilisateur) : toute erreur de history.db, illisible comprise, reporte — pas de bascule tant
+            # qu'elle n'est pas réparée (les valeurs des disparues restent dans la base servie)
+            printer(f"{nick}: lignes de graphique non figées ({e}) — rien retiré, nouvel essai au prochain Index"); return _defer('figeage')
         r=[0]*6
         if diff_ok and (gone or sweep):
             def _do():
@@ -7391,8 +7409,12 @@ class BorgHelper:
         # Rapprochement (1.0.140, AD-9) : archives supprimées hors borgHelper retirées, sur la liste déjà obtenue.
         names=[a['name'] for a in archives]
         prev_stop=self.borg._stop; self.borg._stop=stop   # borg list du dépôt entier (R6) : cède comme les autres borg
-        try: self._reconcile_archives(nick,db_path,names,repo=self._repo_archive_names(nick,cfg,debug))
+        deferred=[]
+        try: self._reconcile_archives(nick,db_path,names,repo=self._repo_archive_names(nick,cfg,debug),deferred=deferred)
         finally: self.borg._stop=prev_stop
+        # 1.0.202 (story 80, D200) : rapprochement de la base servie reporté dans CETTE passe -> pas de bascule du fantôme
+        # (il a purgé les disparues sans figeage, AD-7 : basculer perdrait leurs lignes de graphique). Remis à chaque passe.
+        plan['reconcile_deferred']=bool(deferred)
         self._drop_orphan_exclusions(nick,db_path)   # 1.0.201 (story 79, D199) : même passe, SQL seul
         keep=cfg.get('DIFF_KEEP','').strip()
         keep=int(keep) if keep.isdigit() else None
@@ -7911,13 +7933,17 @@ class BorgHelper:
         return self._shadow_swap(nick,debug,cfg,sp,archives,plan)
 
     def _shadow_swap(self,nick,debug,cfg,sp,archives,plan):
-        """Bascule du fantôme complet (AD-2, AD-6), sous index-running.lock (tenu par index()). Purge IDX_* du fantôme,
+        """Bascule du fantôme complet (AD-2, AD-6), sous index-running.lock (tenu par index()). Rapprochement de la base
+        servie reporté dans la même passe (plan['reconcile_deferred'], 1.0.202) : reportée, sans borg. Purge IDX_* du fantôme,
         borg list frais identique à celui de la passe (archive d'un outil externe arrivée entre-temps : reportée),
         empreinte d'en-tête, espace pour le WAL, puis _swap_db(keep_new=True) : annulée, le fantôme reste pour la tranche
         suivante. Retour : 0, ou 'interrupted' (opération prioritaire : pause puis nouvelle passe)."""
         deadline=plan['deadline']; live=sp[:-len(_SHADOW_SUFFIX)]
         def _later(why):
             printer(f"{nick}: bascule reportée ({why}) — fantôme gardé, nouvel essai à la prochaine tranche"); return 0
+        # 1.0.202 (story 80, D200) : jamais après un rapprochement reporté de la base servie dans la même passe — la tranche
+        # suivante (rapprochement abouti : disparues figées avec leurs valeurs) bascule.
+        if plan.get('reconcile_deferred'): return _later("rapprochement de la base servie reporté")
         stop=lambda: self._index_stop_reason(nick,deadline) is not None
         prev=self.borg._stop; self.borg._stop=stop
         try: rb=self.borg.boex(nick,['list','--json']+glob_args(cfg),debug=debug)
@@ -19659,6 +19685,139 @@ fail()
             finally: os.unlink(lp)
             return _rz_cites(dp,'rzp','A1')==s0 and 'reporté' in out
         check("rapprochement : opération prioritaire d'un autre processus -> reporté, rien retiré",_rz_priority)
+        def _rz_deferred():
+            """1.0.202 (story 80, D200) : `deferred` reçoit EXACTEMENT une raison par rapprochement reporté, rien retiré faute
+            d'information — base servie occupée (verrou exclusif d'un autre ouvreur > 2 s ; `_known_archives` « database is
+            locked », même sans disparue ; lecture du figeage « locked »), opération prioritaire, dépôt entier en échec (None) ou
+            interrompu (False), figeage en échec, history.db illisible (décision A). Rien pour : base corrompue (fichier, table
+            abîmée, lecture du figeage « malformed »), chiffrée sans clé, purge interrompue (lignes déjà figées), rien à retirer,
+            liste vide, rapprochement abouti, disparues toutes hors GLOB_ARCH (purgées), fantôme (purge seule)."""
+            res={}; i=[0]
+            def run(key,drop='A1',prep=None,patch=None,repo=None,empty=False,twice=False,shadow=False):
+                i[0]+=1; nk=f'rzd{i[0]}'; b,dp,lst=_rz_mk(nk)
+                if drop: lst.remove(drop)
+                if twice: _q_run(b._reconcile_archives,nk,dp,lst)   # 1er passage : balayage unique
+                p=dp
+                if shadow:   # copie SQLite de la base (API backup), au nom d'un fantôme
+                    p=dp+_SHADOW_SUFFIX; src=sqlite3.connect(dp); dst=sqlite3.connect(p)
+                    try: src.backup(dst)
+                    finally: dst.close(); src.close()
+                d=[]; n=[None]; undo=prep(b,p,nk) if prep else None
+                def call(): n[0]=b._reconcile_archives(nk,p,[] if empty else lst,repo=repo,deferred=d)
+                try:
+                    if patch:
+                        with mock.patch.object(*patch(b)): out=_q_run(call)
+                    else: out=_q_run(call)
+                finally:
+                    if undo: undo()
+                fz=None
+                if os.path.exists(_history_path_for(dp)):
+                    c=sqlite3.connect(_history_path_for(dp))
+                    try: fz=[r[0] for r in c.execute("SELECT gone FROM archive_chart WHERE nick=? AND archive='A1'",(nk,))]
+                    except sqlite3.Error: fz=None   # history.db illisible (cas « history illisible »)
+                    finally: c.close()
+                res[key]=(n[0],d,_rz_cites(p,nk,'A1') if drop=='A1' and not key.startswith('corrompue') else None,out[-200:],fz)
+            def garbage(b,dp,nk):
+                for x in (dp+'-wal',dp+'-shm'):
+                    if os.path.exists(x): os.unlink(x)
+                with open(dp,'wb') as f: f.write(b'pas une base SQLite '*400)
+            def hold(b,dp,nk):   # verrou exclusif d'un autre ouvreur : _db_probe « database is locked » après 2 s
+                h=sqlite3.connect(dp,isolation_level=None); h.execute("PRAGMA locking_mode=EXCLUSIVE"); h.execute("BEGIN EXCLUSIVE")
+                h.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES('rzd_hold','1')")
+                def undo():
+                    h.execute("ROLLBACK"); h.close()
+                return undo
+            def hist_garbage(b,dp,nk):   # history.db illisible (décision A : reporté, pas de bascule tant qu'elle n'est pas réparée)
+                h=_history_path_for(dp)
+                for x in (h+'-wal',h+'-shm'):
+                    if os.path.exists(x): os.unlink(x)
+                with open(h,'wb') as f: f.write(b'pas une base SQLite '*400)
+            def prio(b,dp,nk):
+                lp=b.db._priority_lock_path(nk)
+                with open(lp,'w') as f: f.write(str(os.getppid()))
+                return lambda: os.unlink(lp)
+            def _raise(e):
+                def f(*a,**k): raise e
+                return f
+            def purge_fail(b):   # seulement la purge de diff.db (_do) : le figeage passe par le même _with_lock_retry
+                orig=b.db._with_lock_retry
+                def w(fn,*a,**k):
+                    if fn.__qualname__.endswith('_reconcile_archives.<locals>._do'): raise sqlite3.OperationalError('database is locked')
+                    return orig(fn,*a,**k)
+                return (b.db,'_with_lock_retry',w)
+            run('occupée',prep=hold)
+            run('occupée lecture',patch=lambda b: (b,'_known_archives',_raise(sqlite3.OperationalError('database is locked'))))
+            run('priorité',prep=prio)
+            run('dépôt None',repo=lambda: None)
+            run('dépôt False',repo=lambda: False)
+            run('figeage',patch=lambda b: (b.db,'freeze_archive_chart',_raise(sqlite3.OperationalError('disk I/O error'))))
+            run('history illisible',prep=hist_garbage)
+            run('occupée sans disparue',drop=None,prep=hold)
+            run('occupée lecture figeage',patch=lambda b: (b.db,'_diff_stats_for_nick',_raise(sqlite3.OperationalError('database is locked'))))
+            run('corrompue lecture figeage',patch=lambda b: (b.db,'_diff_stats_for_nick',_raise(sqlite3.DatabaseError('database disk image is malformed'))))
+            run('corrompue fichier',prep=garbage)
+            run('corrompue table',patch=lambda b: (b,'_known_archives',_raise(sqlite3.DatabaseError('database disk image is malformed'))))
+            run('sans clé',patch=lambda b: (b,'_known_archives',_raise(DbKeyError('passphrase absente'))))
+            run('purge',patch=purge_fail)
+            run('rien',drop=None,twice=True)
+            run('vide',empty=True)
+            run('fait',repo=lambda: {'A2','A3','A4'})
+            run('hors GLOB_ARCH',repo=lambda: {'A1','A2','A3','A4'})
+            run('fantôme',repo=lambda: None,shadow=True)
+            exp={'occupée':['occupée'],'occupée lecture':['occupée'],'priorité':['priorité'],'dépôt None':['dépôt'],
+                 'dépôt False':['dépôt'],'figeage':['figeage'],'history illisible':['figeage'],'occupée sans disparue':['occupée'],
+                 'occupée lecture figeage':['occupée']}
+            msg={'occupée':'rapprochement impossible','occupée lecture':'rapprochement impossible','priorité':'opération prioritaire',
+                 'dépôt None':'indisponible','dépôt False':'interrompue','figeage':'non figées','corrompue fichier':'rapprochement impossible',
+                 'corrompue table':'rapprochement impossible','sans clé':'rapprochement impossible','purge':'rapprochement interrompu',
+                 'history illisible':'non figées','occupée sans disparue':'rapprochement impossible','occupée lecture figeage':'non figées',
+                 'corrompue lecture figeage':'non figées'}
+            ok=all(res[k][1]==exp.get(k,[]) for k in res) and all(m in res[k][3] for k,m in msg.items())
+            ok=ok and all(res[k][0]==0 and (res[k][2] is None or res[k][2]>0) for k in exp)   # reporté : rien retiré
+            ok=ok and all(res[k][0]>0 and res[k][2]==0 for k in ('fait','hors GLOB_ARCH','fantôme'))   # abouti : purgée
+            ok=ok and res['rien'][0]==0 and res['vide'][0]==0 and res['purge'][0]==0 and res['corrompue lecture figeage'][0]==0
+            # purge interrompue : ligne de graphique de A1 déjà figée (rien de perdu à la bascule) ; reporté : rien figé
+            ok=ok and res['purge'][4]==[1] and res['purge'][2]>0 and all(not res[k][4] for k in exp) and res['history illisible'][2]>0
+            if not ok: print(f"  deferred : {res}")
+            return ok
+        check("rapprochement : deferred = raison exacte des seuls reports (base occupée même sans disparue, prioritaire, dépôt entier None/False, figeage, history.db illisible) ; corrompue à toute lecture, sans clé, purge interrompue, rien à retirer, liste vide, abouti, hors GLOB_ARCH, fantôme -> rien",_rz_deferred)
+        def _rz_plan_reset():
+            """1.0.202 (story 80, D200) : plan['reconcile_deferred'] remis à chaque passe d'un même index() — _index_pass
+            (arrêtée juste après le rapprochement par _index_checkpoint) : drapeau True + rapprochement abouti -> False ;
+            archive disparue sous opération prioritaire -> True ; même plan, verrou retiré -> False."""
+            b,dp,lst=_rz_mk('rzpl')
+            plan={'tranche':True,'deadline':None,'natures':{'stats','snap','diff'},'period':None,'snap_only':False,'done':set(),
+                  'shadow':None,'sdone':set(),'recheck':False,'rk':True,'reconcile_deferred':True}
+            seen=[]; rr=[]
+            def ip(): rr.append(b._index_pass('rzpl',0,dp,False,None,plan))
+            with mock.patch.object(b,'_index_checkpoint',lambda *a,**k: 'interrupted'):
+                _q_run(ip); seen.append(plan['reconcile_deferred'])
+                lst.remove('A1'); lp=b.db._priority_lock_path('rzpl')
+                with open(lp,'w') as f: f.write(str(os.getppid()))
+                try: o=_q_run(ip); seen.append(plan['reconcile_deferred'])
+                finally: os.unlink(lp)
+                _q_run(ip); seen.append(plan['reconcile_deferred'])
+            ok=seen==[False,True,False] and rr==['interrupted']*3 and 'rapprochement reporté' in o and _rz_cites(dp,'rzpl','A1')==0
+            if not ok: print(f"  remise à zéro : {seen}, {rr}, {o[-200:]!r}")
+            return ok
+        check("tranche : plan['reconcile_deferred'] remis à chaque passe (abouti -> False, reporté -> True, puis False)",_rz_plan_reset)
+        def _rz_swap_deferred():
+            """1.0.202 (story 80, D200) : _shadow_swap avec plan['reconcile_deferred'] -> message Q1 exact, retour 0, AUCUN borg
+            lancé (boex factice qui note ses appels), fantôme intact ; témoin (drapeau absent) : borg list lancé."""
+            b,dp,lst=_rz_mk('rzsw'); cfg=b.borg.cfgreaded('rzsw'); sp=dp+_SHADOW_SUFFIX
+            open(sp,'wb').close(); calls=[]
+            def stub(nick,args,*a,**k):
+                calls.append(list(args)); return {'exitcode':2,'stdout':[],'stderr':[{'message':'factice'}]}
+            b.borg.boex=stub; rr=[]
+            archives=[{'name':x} for x in lst]
+            o1=_q_run(lambda: rr.append(b._shadow_swap('rzsw',0,cfg,sp,archives,{'deadline':None,'reconcile_deferred':True})))
+            c1=list(calls)
+            o2=_q_run(lambda: rr.append(b._shadow_swap('rzsw',0,cfg,sp,archives,{'deadline':None})))
+            W='rzsw: bascule reportée (rapprochement de la base servie reporté) — fantôme gardé, nouvel essai à la prochaine tranche'
+            ok=(rr==[0,0] and c1==[] and W in o1 and os.path.exists(sp) and calls and calls[0][0]=='list' and W not in o2)
+            if not ok: print(f"  bascule reportée : {rr}, appels {c1}/{calls}, {o1[-200:]!r} / {o2[-200:]!r}")
+            return ok
+        check("fantôme : _shadow_swap après un rapprochement reporté -> message Q1, aucun borg lancé ; sans drapeau -> borg list",_rz_swap_deferred)
         # ── Index par tranches + surveillance croisée (1.0.141, story 4, AD-1/AD-3/AD-4/AD-10) ──
         check("_parse_duration : 90 / 90s / 5m / 1h ; invalide ou nul -> None",
               lambda: [_parse_duration(v) for v in ('90','90s','5m','1h','0','x','1d','','9'*30)]==[90,90,300,3600,None,None,None,None,None])
@@ -22000,6 +22159,213 @@ fail()
             if not ok: print(f"  suppression pendant : paires avant {len(prev)}, appels history {calls}, restes {left}, "
                              f"paires {npairs}, nouvelle {hasnew}, {out[-400:]!r}")
             return ok
+        def _rb_deferred_swap():
+            """1.0.202 (story 80, D200) : fantôme complété par la tranche, archive du milieu supprimée (borg delete), puis
+            tranche dont le rapprochement de la base servie est reporté — borg list du dépôt entier en échec (panne injectée par
+            le script BORG_EXE, comme la mesure) ou base servie tenue (verrou exclusif d'un autre ouvreur > 2 s) -> « bascule
+            reportée (rapprochement de la base servie reporté) », fantôme gardé, archive encore dans la base servie, rien figé ;
+            tranche suivante sans panne : archive figée avec ses valeurs (nfiles, original_size), héritière présente, bascule.
+            Témoin (sans panne) : figée puis basculée à la première tranche. Base servie corrompue (table abîmée :
+            _known_archives « malformed » pour elle seule) : « rapprochement impossible », jamais reporté — bascule dans la
+            même tranche (la reconstruction la remplace). history.db illisible (décision A) : « lignes de graphique non figées »,
+            reporté, pas de bascule ; réparée : figée puis bascule. Dépôt partagé : l'archive supprimée est extraite avant, puis
+            recréée depuis ce contenu d'origine (même nom, même date) ; noms des archives et liste de ses fichiers comparés."""
+            ctx=_rb_ctx(); _ix_slow(ctx,None,0); borg=shutil.which('borg')
+            fail=os.path.join(ctx['dir'],'s80-fail-list')
+            bs={k:_rb_bh(f'rb-s80{k}') for k in ('t','p','o','c','h')}
+            for b in bs.values(): _q_run(b.index,'rb'); _q_run(b.index,'rb',rebuild=True,natures=['stats'])
+            arch=json.loads(subprocess.run([borg,'list','--json',ctx['repo']],env=ctx['env'],
+                            capture_output=True,text=True,timeout=60).stdout)['archives']
+            names=[a['name'] for a in arch]
+            if len(names)<3: print(f"  rapprochement reporté : {len(names)} archive(s), 3 requises"); return False
+            gone,heir=names[1],names[2]
+            shadows={k:os.path.exists(_rb_sp(b,'rb')) for k,b in bs.items()}
+            # dépôt partagé : contenu d'origine de l'archive extrait AVANT sa suppression (dossier du contrôle), pour la recréer à
+            # l'identique (mêmes chemins stockés, même nom, même date) ; liste de ses fichiers comparée ensuite
+            fmt=['--format','{type} {mode} {size} {mtime} {path}{NL}']
+            def content(): return subprocess.run([borg,'list',*fmt,f"{ctx['repo']}::{gone}"],env=ctx['env'],capture_output=True,text=True,timeout=120)
+            c0=content(); xd=os.path.join(ctx['dir'],'s80-orig'); os.makedirs(xd)
+            rx=subprocess.run([borg,'extract',f"{ctx['repo']}::{gone}"],cwd=xd,env=ctx['env'],capture_output=True,text=True,timeout=120)
+            if c0.returncode!=0 or rx.returncode!=0 or not c0.stdout.strip():
+                print(f"  archive {gone} non extraite : list {c0.returncode}, extract {rx.returncode} {rx.stderr[-200:]!r}"); return False
+            rd=subprocess.run([borg,'delete',f"{ctx['repo']}::{gone}"],env=ctx['env'],capture_output=True,text=True,timeout=120)
+            if rd.returncode!=0:   # rien supprimé : rien à recréer
+                print(f"  borg delete {gone} : code {rd.returncode} {rd.stderr[-200:]!r}"); return False
+            ok=False
+            try: ok=_rb_deferred_swap_body(ctx,borg,fail,bs,gone,heir,shadows)
+            finally:
+                rc=subprocess.run([borg,'create','--timestamp',arch[1]['start'][:19],f"{ctx['repo']}::{gone}",ctx['src'].lstrip('/')],
+                                  cwd=xd,env=ctx['env'],capture_output=True,text=True,timeout=120)
+            after=[a['name'] for a in json.loads(subprocess.run([borg,'list','--json',ctx['repo']],env=ctx['env'],
+                                                               capture_output=True,text=True,timeout=60).stdout)['archives']]
+            c1=content(); same=c1.returncode==0 and c1.stdout==c0.stdout
+            if rc.returncode!=0 or after!=names or not same:
+                print(f"  archive non recréée à l'identique : code {rc.returncode} {rc.stderr[-200:]!r}, noms {after==names}, contenu {same}")
+            return ok and rc.returncode==0 and after==names and same
+        def _rb_deferred_swap_body(ctx,borg,fail,bs,gone,heir,shadows):
+            def chart(b):
+                c=sqlite3.connect(_history_path_for(b.db.get_diff_db('rb')))
+                try: return {a:(g,nf,osz) for a,g,nf,osz in c.execute("SELECT archive,gone,nfiles,original_size FROM archive_chart WHERE nick='rb'")}
+                except sqlite3.Error: return {}   # history.db illisible (scénario h)
+                finally: c.close()
+            def served_has(b):
+                c=sqlite3.connect(b.db.get_diff_db('rb'))
+                try: return c.execute("SELECT count(*) FROM archive_stats WHERE archive=?",(gone,)).fetchone()[0]
+                finally: c.close()
+            def frozen(ch): g=ch.get(gone); return bool(g and g[0]==1 and g[1] is not None and g[2] is not None and heir in ch and ch[heir][0]==0)
+            def swapped(o,b): return 'nouvelle base en service' in o and not os.path.exists(_rb_sp(b,'rb'))
+            W='bascule reportée (rapprochement de la base servie reporté) — fantôme gardé, nouvel essai à la prochaine tranche'
+            def held_back(o,b,why): return (why in o and W in o and 'nouvelle base en service' not in o and os.path.exists(_rb_sp(b,'rb'))
+                                            and served_has(b)==1 and gone not in chart(b))
+            r={}
+            # témoin : rapprochement fait -> figée, bascule à la première tranche
+            bt=bs['t']; ot=_q_run(bt.index,'rb',budget=120); r['témoin']=(swapped(ot,bt) and frozen(chart(bt)) and W not in ot)
+            # panne : borg list du dépôt entier (list --json, sans --glob-archives) en échec
+            bp=bs['p']
+            try:
+                _rb_wrapper(ctx['w'],ctx['bb'],pre=f'if [ -e {shlex.quote(fail)} ] && [ "$#" = 2 ] && [ "$1" = list ] && [ "$2" = --json ]; '
+                                                   'then echo "panne injectée : borg list" >&2; exit 2; fi\n')
+                open(fail,'w').close()
+                try: o1=_q_run(bp.index,'rb',budget=120)
+                finally: os.unlink(fail)
+                r['panne']=held_back(o1,bp,'liste complète du dépôt indisponible')
+                o2=_q_run(bp.index,'rb',budget=120); r['panne suivante']=swapped(o2,bp) and frozen(chart(bp)) and W not in o2
+            finally: _ix_slow(ctx,None,0)
+            # base servie tenue : verrou exclusif (locking_mode=EXCLUSIVE) pendant le seul rapprochement de la base servie
+            bo=bs['o']; orig=bo._reconcile_archives; held=[]
+            def hold(nick,db_path,*a,**k):
+                if held or _is_shadow(db_path): return orig(nick,db_path,*a,**k)
+                h=sqlite3.connect(db_path,isolation_level=None)
+                try:
+                    try:
+                        h.execute("PRAGMA locking_mode=EXCLUSIVE"); h.execute("BEGIN EXCLUSIVE")
+                        h.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES('s80_hold','1')"); held.append(True)
+                    except sqlite3.Error as e: held.append(f"verrou non pris : {e}")
+                    return orig(nick,db_path,*a,**k)
+                finally:
+                    try: h.execute("ROLLBACK")
+                    except sqlite3.Error: pass
+                    h.close()
+            bo._reconcile_archives=hold
+            try: o3=_q_run(bo.index,'rb',budget=120)
+            finally: del bo._reconcile_archives
+            r['occupée']=held==[True] and held_back(o3,bo,'rapprochement impossible')
+            o4=_q_run(bo.index,'rb',budget=120); r['occupée suivante']=swapped(o4,bo) and frozen(chart(bo)) and W not in o4
+            # base servie corrompue : _known_archives en échec « malformed » sur la seule base servie -> pas de report, bascule
+            bc=bs['c']; origc=bc._reconcile_archives; bad=[]
+            def corrupt(nick,db_path,*a,**k):
+                if _is_shadow(db_path): return origc(nick,db_path,*a,**k)
+                bad.append(db_path)
+                with mock.patch.object(bc,'_known_archives',lambda *x,**y: (_ for _ in ()).throw(sqlite3.DatabaseError('database disk image is malformed'))):
+                    return origc(nick,db_path,*a,**k)
+            bc._reconcile_archives=corrupt
+            try: o5=_q_run(bc.index,'rb',budget=120)
+            finally: del bc._reconcile_archives
+            r['corrompue']=len(bad)==1 and 'rapprochement impossible' in o5 and 'malformed' in o5 and W not in o5 and swapped(o5,bc)
+            # history.db illisible (décision A) : figeage impossible -> reporté, pas de bascule ; réparée (copie remise) -> figée, bascule
+            bh_=bs['h']; hp=_history_path_for(bh_.db.get_diff_db('rb')); bak=hp+'.s80'
+            src=sqlite3.connect(hp); dst=sqlite3.connect(bak)
+            try: src.backup(dst)
+            finally: dst.close(); src.close()
+            for x in (hp+'-wal',hp+'-shm'):
+                if os.path.exists(x): os.unlink(x)
+            with open(hp,'wb') as f: f.write(b'pas une base SQLite '*400)
+            o6=_q_run(bh_.index,'rb',budget=120)
+            r['history illisible']=('non figées' in o6 and W in o6 and 'nouvelle base en service' not in o6
+                                    and os.path.exists(_rb_sp(bh_,'rb')) and served_has(bh_)==1)
+            for x in (hp+'-wal',hp+'-shm'):
+                if os.path.exists(x): os.unlink(x)
+            os.replace(bak,hp)
+            o7=_q_run(bh_.index,'rb',budget=120); r['history réparée']=swapped(o7,bh_) and frozen(chart(bh_)) and W not in o7
+            ok=all(shadows.values()) and all(r.values()) and len(r)==8
+            if not ok: print(f"  rapprochement reporté : fantômes {shadows}, {r}, verrou {held} | {ot[-300:]!r} | {o1[-500:]!r} | "
+                             f"{o2[-300:]!r} | {o3[-500:]!r} | {o4[-300:]!r} | {o5[-500:]!r} | {o6[-700:]!r} | {o7[-300:]!r}")
+            return ok
+        def _rb_ext_kill_diff():
+            """1.0.202 (story 80, D202) : borg diff tué par un SIGTERM EXTÉRIEUR pendant un Index — trois variantes mesurées :
+            chargeur PyInstaller seul, enfant seul, arbre (chargeur + enfant, comme pkill ; jamais pkill ici). borg ralenti
+            (_ix_slow : le wrapper dort avant son exec) : le wrapper est trouvé pendant son sommeil, puis son PID suivi jusqu'à
+            l'exec de borg ; (PID, heure de démarrage) et argv revérifiés juste avant chaque signal. Attendu : « [WARN] …
+            (code -15) — paire a → b non indexée », paire absente de la base ; l'Index suivant la refait (entrées). _MEI* :
+            relevés (_mei_mapped) sur le chargeur tué et ses descendants avant chaque signal puis jusqu'à sa fin — seuls ceux-là
+            sont retirés sans attente, et il n'en reste aucun ; un autre nouveau dossier suit _purge_run_mei (âge minimal,
+            inchangé). Arbre : chargeur signalé d'abord ; un enfant déjà parti (SIGTERM relayé) compte comme atteint."""
+            ctx=_rb_ctx(); w=ctx['w'].encode(); res={}; mei_before=_mei_dirs(); ours=set()   # _MEI* relevés sur les PID tués
+            def argv(pid):
+                with open(f'/proc/{pid}/cmdline','rb') as f: return f.read().split(b'\0')
+            def wrapper_pid():   # bash <wrapper> diff --json-lines … (pendant le sommeil d'_ix_slow)
+                for x in os.listdir('/proc'):
+                    if not x.isdigit(): continue
+                    try: a=argv(int(x))
+                    except OSError: continue
+                    if len(a)>3 and a[1]==w and a[2:4]==[b'diff',b'--json-lines']: return int(x)
+                return None
+            def is_borg(a): return a[1:3]==[b'diff',b'--json-lines'] and len(a)>4 and b'::' in a[3]   # argv[0] libre (exec nice … borg.wrapped)
+            def child_of(pid,a):   # enfant PyInstaller : mêmes arguments (argv[0] peut différer)
+                for c in _proc_kids().get(pid,[]):
+                    with contextlib.suppress(OSError):
+                        ca=argv(c)
+                        if ca[1:]==a[1:]: return c,ca
+                return None
+            def killer(mode,got,done):
+                t0=time.monotonic(); pid=None
+                while pid is None and not done.is_set() and time.monotonic()-t0<120: pid=wrapper_pid() or time.sleep(0.01)
+                if pid is None: return
+                st=_proc_start(pid)
+                while not done.is_set() and _proc_live(pid,st) and time.monotonic()-t0<120:
+                    try: a=argv(pid)
+                    except OSError: return
+                    if is_borg(a): break
+                    time.sleep(0.002)
+                else: return
+                targets=[(pid,st,a)]
+                if mode!='chargeur':
+                    c=None
+                    while c is None and _proc_live(pid,st) and time.monotonic()-t0<120: c=child_of(pid,a) or time.sleep(0.002)
+                    if c is None: return
+                    ct=(c[0],_proc_start(c[0]),c[1])
+                    targets=[ct] if mode=='enfant' else [(pid,st,a),ct]
+                def relevé():   # _MEI* mappés, ouverts ou cwd du chargeur et de ses descendants (comme _borg_killgrp)
+                    with contextlib.suppress(OSError): ours.update(_mei_mapped([pid]+_proc_descendants(pid)))
+                for i,(p_,s_,a_) in enumerate(targets):   # (PID, heure de démarrage) et argv revérifiés juste avant le signal
+                    relevé()
+                    try:
+                        if argv(p_)==a_ and _proc_live(p_,s_): os.kill(p_,signal.SIGTERM); got.setdefault('pids',[]).append(p_)
+                        elif i>0: got.setdefault('relayé',[]).append(p_)   # arbre : enfant déjà parti, SIGTERM relayé par le chargeur
+                    except OSError:
+                        if i>0: got.setdefault('relayé',[]).append(p_)
+                got['argv']=[x.decode() for x in a]
+                while _proc_live(pid,st) and time.monotonic()-t0<120: relevé(); time.sleep(0.02)   # jusqu'à la fin du chargeur
+            def has(b,pr):
+                c=sqlite3.connect(b.db.get_diff_db('rb'))
+                try: return c.execute("SELECT entry_count FROM diff_indexed_pairs WHERE archive_old=? AND archive_new=?",pr).fetchone()
+                finally: c.close()
+            try:
+                for mode in ('chargeur','enfant','arbre'):
+                    b=_rb_bh(f'rb-s80k{mode}'); got={}; done=threading.Event()
+                    _ix_slow(ctx,'diff',0.5)
+                    th=threading.Thread(target=killer,args=(mode,got,done),daemon=True); th.start()
+                    try: o1=_q_run(b.index,'rb')
+                    finally: done.set(); th.join(130)
+                    _ix_slow(ctx,None,0)
+                    a=got.get('argv') or []; pair=(a[3].rsplit('::',1)[-1],a[4]) if len(a)>4 else None
+                    warn=bool(pair) and f"— paire {pair[0]} → {pair[1]} non indexée" in o1 and '[WARN]' in o1 and '(code -15)' in o1
+                    kept=has(b,pair) if pair else 'aucune'
+                    o2=_q_run(b.index,'rb'); redone=has(b,pair) if pair else None
+                    want=1 if mode!='arbre' else 2   # arbre : enfant signalé ou déjà parti (relayé par le chargeur)
+                    reached=len(got.get('pids',[]))+len(got.get('relayé',[]))
+                    res[mode]=(reached==want and got.get('pids',[])[:1]!=[] and warn and kept is None and bool(redone and redone[0]>0),
+                               got.get('pids'),got.get('relayé'),pair,warn,kept,redone,o1[-400:])
+            finally: _ix_slow(ctx,None,0)
+            # _MEI* : retirés sans attente seulement ceux relevés sur les PID tués ; tout autre nouveau dossier suit la règle de fin de
+            # run (_purge_run_mei : âge minimal, inchangé entre deux regards) — jamais l'extraction en cours d'un autre programme
+            mine=sorted(d for d in ours if os.path.exists(d))
+            _purge_mei_dirs(mine); left=[d for d in mine if os.path.exists(d)]
+            other=_purge_run_mei(mei_before|ours)
+            if mine or other: print(f"  _MEI* des borg tués : {len(mine)} retiré(s) ; autres nouveaux retirés par la règle de fin de run : {other}")
+            ok=all(v[0] for v in res.values()) and len(res)==3 and not left
+            if not ok: print(f"  diff tué de l'extérieur : {res}, _MEI à nous restants {left}")
+            return ok
         _rbc("fantôme : --rebuild refait une base abîmée ; sorties == Index complet ; history.db intacte ; fichier disparu",_rb_full)
         _rbc("fantôme : par tranches, base servie inchangée et lue, Status rebuild, paires jamais refaites, bascule",_rb_tranches)
         _rbc("fantôme : Bkp pendant la reconstruction -> pause, nouvelle archive dans la base basculée",_rb_bkp_during)
@@ -22016,6 +22382,8 @@ fail()
         _rbc("fantôme : _swap_db(keep_new=True) garde la nouvelle base sur changed/busy, la retire sur invalid",_rb_swap_keep_new)
         _rbc("fantôme : CLI --rebuild refusé -> code 3 ; --rebuild -F jette le fantôme ; -F -t et --rebuild hors Index refusés",_rb_cli)
         _rbc("fantôme : archive supprimée + nouvelle pendant la reconstruction (DIFF_KEEP) -> purgées, history.db jamais écrite par le fantôme",_rb_prune_during)
+        _rbc("fantôme : rapprochement de la base servie reporté (dépôt entier en échec, base tenue, history.db illisible) -> pas de bascule ; tranche suivante : figée avec ses valeurs, bascule ; témoin inchangé ; base corrompue -> bascule",_rb_deferred_swap)
+        _rbc("Index : borg diff tué par un SIGTERM extérieur (chargeur, enfant, arbre) -> paire non indexée ([WARN], code -15), refaite par l'Index suivant ; _MEI* retirés",_rb_ext_kill_diff)
         _rbc("fantôme : tranche limitée par -T, -b ou -B seul -> avertissement (et bascule quand le reste est couvert) ; -b ALL -> aucun",_rb_restricted_warn)
         # ── Dépôts borg externes (1.0.142, story 5, AD-11/AD-12) ──
         check("glob_args : motif -> ['--glob-archives', m] / ['--glob-archives=m'] ; absent ou vide -> aucun argument",

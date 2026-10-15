@@ -573,9 +573,9 @@ nom unique) + lignes `gone` absentes d'`archive_stats`, triées par date, champ 
 
 ### Rapprochement de la liste des archives (1.0.140, story 3, AD-9)
 
-`_reconcile_archives(nick, db_path, current, repo=None)` — appelé par `index()` juste après `borg list` (avant les
-branches `NOIDX` et « moins de 2 archives » ; un `borg list` du dépôt entier en plus seulement si une archive manque à
-la liste filtrée, étape 4) et par `_cleanup_index_after_prune` (Prune et DelBkp : `borg list` + rapprochement +
+`_reconcile_archives(nick, db_path, current, repo=None, deferred=None)` — appelé par `index()` juste après `borg list`
+(avant les branches `NOIDX` et « moins de 2 archives » ; un `borg list` du dépôt entier en plus seulement si une archive
+manque à la liste filtrée, étape 4) et par `_cleanup_index_after_prune` (Prune et DelBkp : `borg list` + rapprochement +
 `_vacuum_db` seulement si des lignes sont parties). Jamais de compactage depuis Index.
 
 1. Archives connues (`_known_archives`) : petites tables lues entières (`archive_stats`, `archive_snapshot_indexed`,
@@ -604,6 +604,20 @@ la liste filtrée, étape 4) et par `_cleanup_index_after_prune` (Prune et DelBk
    pour l'archive restante avant retrait. Seul balayage complet de `diff_index`, une fois ; une `diff.db` reconstruite
    le refait (rapide, base neuve). Drapeau par nick (`reconcile_sweep:<nick>`) : plusieurs nicks peuvent partager une
    `diff.db` (`DB_NAME`).
+
+Paramètre `deferred=` (1.0.202, story 80, D200) : liste facultative qui reçoit une raison par rapprochement **reporté**,
+rien retiré faute d'information — base servie occupée par un autre processus, opération prioritaire en cours, `borg list`
+du dépôt entier en échec ou interrompu, figeage des lignes de graphique en échec. Raisons : `occupée` (`_db_busy` à la
+sonde, à la lecture des archives connues ou aux lectures du figeage ; même sans disparue : état inconnu), `priorité`,
+`dépôt`, `figeage`.
+- `history.db` illisible ou corrompue (décision A de l'utilisateur) : `freeze_archive_chart` en échec (`SystemExit` de
+  `_db_schema_fail` compris) -> `figeage`, pas de bascule tant qu'elle n'est pas réparée ; les valeurs des disparues
+  restent dans la base servie. Toute erreur de l'écriture de `history.db` reporte, occupée ou non.
+- Base servie illisible, corrompue ou chiffrée sans clé, à n'importe quelle lecture (sonde, archives connues, lectures
+  du figeage) : jamais reporté, bascule permise — la reconstruction la remplace, un nouvel essai n'y retrouverait rien.
+- Jamais non plus : purge interrompue (lignes de graphique déjà figées), « rien à retirer », liste vide, fantôme.
+
+Seule `_index_pass` la passe (`plan['reconcile_deferred']`, remis à chaque passe) ; Prune et DelBkp : inchangés.
 
 Changement de `GLOB_ARCH` : les archives hors du nouveau motif sont traitées comme disparues (figées puis retirées).
 Erreurs (`_RECONCILE_ERRORS` : SQLite, codec — base chiffrée sans clé, mode changé par `DbEncrypt` —, `SystemExit` de
@@ -816,11 +830,12 @@ Bkp ne le touchent jamais.
 ```
 index() : tour exclusif (index-running.lock)
     → _shadow_prepare(create=rebuild, force=-F)      une fois par appel, sous le verrou
-    → passe : borg list → rapprochement + tranche de la base servie (plan['done'])
+    → passe : borg list → rapprochement (reporté → plan['reconcile_deferred']) + tranche de la base servie (plan['done'])
             → s'il reste du budget : _index_shadow
                   rapprochement du fantôme (purge seule) → tranche sur le fantôme (plan['sdone'], ensembles distincts)
                   → build_state du fantôme 'complete' → _shadow_swap
-_shadow_swap : purge IDX_* (idxpurge(db_path=fantôme) — Index filtre déjà à l'écriture ; rattrape un motif changé) → borg list frais == liste de la passe
+_shadow_swap : plan['reconcile_deferred'] → bascule reportée (1.0.202), sans borg
+             → purge IDX_* (idxpurge(db_path=fantôme) — Index filtre déjà à l'écriture ; rattrape un motif changé) → borg list frais == liste de la passe
              → empreinte d'en-tête inchangée → libre ≥ 1,1 × fantôme → data_version relevé sur la base servie
              → _swap_db(live, fantôme, keep_new=True, abort=opération prioritaire, changed=data_version changé)
 ```
@@ -835,7 +850,12 @@ _shadow_swap : purge IDX_* (idxpurge(db_path=fantôme) — Index filtre déjà �
 - **Un seul écrivain par fichier** : Bkp, Prune, DelBkp, IdxPurge et les lecteurs ne voient que la base servie. Le
   fantôme n'écrit jamais `history.db` (`_is_shadow` : `_reconcile_archives` ne fige rien et ne retire aucune mesure,
   `_diff_keep_purge` ne fige rien, `_refresh_repo_point` ne relève rien). `_history_path_for` d'un fantôme rend la
-  `history.db` de sa base.
+  `history.db` de sa base. Le figeage des archives disparues revient donc au rapprochement de la base servie. Reporté
+  dans la passe (`deferred`, 1.0.202, D200 — base servie occupée par un autre processus, opération prioritaire en
+  cours, `borg list` du dépôt entier en échec ou interrompu, figeage des lignes de graphique en échec) : pas de bascule,
+  « bascule reportée (rapprochement de la base servie reporté) », fantôme gardé et avancé ; la tranche suivante fige
+  (valeurs de `archive_stats`, ligne héritière) puis bascule. Avant 1.0.202 : bascule après un rapprochement reporté, l'Index suivant figeait l'archive SANS valeurs
+  (`nfiles`/`original_size` None, base servie remplacée) et sans ligne héritière (mesuré, borg 1.2.6).
 - **Rattrapage** : une opération prioritaire met la tranche en pause (story 4) ; la passe suivante repart d'un `borg
   list` frais, donc l'archive d'un Bkp entre dans le fantôme avant toute bascule. Les archives d'un outil externe
   arrivent sans verrou : le `borg list` final les voit (bascule reportée).
@@ -1042,8 +1062,11 @@ passe (_index_pass) : borg list → rapprochement → diffs / stats / snapshot (
     borg list / info / list du snapshot ; thread _priority_monitor pour les diffs (futures annulées, SIGTERM puis
     SIGKILL après 5 s, jamais de break-lock — 1.0.145) ; unité en cours jetée, unités finies gardées (sentinelles) ;
     1.0.153 : une paire dont le borg a reçu un signal du moniteur est TOUJOURS jetée — borg diff 1.2.6 tué par SIGTERM
-    peut sortir en code 1 sans sortie, que le code 0/1 faisait garder vide pour toujours ; une fois par nick et par base
-    (db_meta zero_pairs_rechecked:<nick>), la première passe qui refait des paires (après borg list et rapprochement ;
+    peut sortir en code 1 sans sortie, que le code 0/1 faisait garder vide pour toujours ; tué HORS du moniteur
+    (SIGTERM extérieur au chargeur PyInstaller, à l'enfant ou aux deux, 0 à 0,4 s après le lancement) : code -15,
+    paire rejetée (« borg diff failed (code -15) — paire … non indexée ») et refaite par l'Index suivant — mesuré
+    borg 1.2.6 en 1.0.202 (story 80, D202 clos) ; code 1 après une sortie partielle : jamais observé ; une fois par
+    nick et par base (db_meta zero_pairs_rechecked:<nick>), la première passe qui refait des paires (après borg list et rapprochement ;
     ni -S, ni NOIDX, ni période -b/-B, ni Index lancé par un Bkp — plan['recheck'], _recheck_wanted) retire la
     sentinelle des paires à 0 entrée sans ligne ni exclu, qui sont refaites ; base occupée : une tentative de 2 s ;
     après tout arrêt de borg (boex compris), _purge_mei_orphans retire les <TMPDIR>/_MEI* à nous, inchangés depuis
@@ -1277,7 +1300,7 @@ IDX_INCLUDE seul  → DELETE WHERE nick=? AND NOT (p1 OR p2 OR ...)
 Les deux          → DELETE WHERE nick=? AND (NOT (includes) OR (excludes))
 ```
 
-**Exclus (1.0.154) :** `BEGIN IMMEDIATE`, puis agrégat (clair : SQL ; chiffré : lignes réellement supprimées par id, même paire, type et chemin stocké qu'à la sélection) et `DELETE`, puis l'agrégat est ajouté à `diff_excluded_stats` par upsert qui additionne (`ON CONFLICT … DO UPDATE SET file_count=file_count+excluded.file_count, …`). Les stats (`_diff_stats_for_nick`, IdxTop) ne bougent donc pas (sauf `modified` à taille après nulle : taille avant comptée), DiffTop affiche les exclus d'une paire vidée, et une paire vidée garde des exclus : la révision des paires vides de 1.0.153 (`_recheck_zero_pairs`, paires à 0 entrée **sans exclu**) ne la reprend pas. 1.0.162 : un `removed` sans taille (répertoire ancien ou synthétique) est rangé sous `removed directory` (`_XCT`), pour que les comptes de Report (fichiers ordinaires) restent inchangés par la purge ; les exclus écrits avant 1.0.162 gardent leur `removed`.
+**Exclus (1.0.154) :** `BEGIN IMMEDIATE`, puis agrégat (clair : SQL ; chiffré : lignes réellement supprimées par id, même paire, type et chemin stocké qu'à la sélection) et `DELETE`, puis l'agrégat est ajouté à `diff_excluded_stats` par upsert qui additionne (`ON CONFLICT … DO UPDATE SET file_count=file_count+excluded.file_count, …`). Les stats (`_diff_stats_for_nick`, IdxTop) ne bougent donc pas (sauf `modified` à taille après nulle : taille avant comptée), DiffTop affiche les exclus d'une paire vidée, et une paire vidée garde des exclus : la révision des paires vides de 1.0.153 (`_recheck_zero_pairs`, paires à 0 entrée **sans exclu**) ne la reprend pas. Limite (bases d'avant 1.0.116, story 80 D203, mesurée en 1.0.202) : une paire écrite sans tailles par un Bkp d'avant 1.0.116 (lignes de `borg create --list`) puis vidée par `IdxPurge -x` a des exclus de `total_size` 0 — lus par `_diff_stats_for_nick` (moitié « taille » des `modifications` de Report et ArchiveHistory), IdxTop et DiffTop ; jamais refaite par `_recheck_zero_pairs` (exclus présents), et la refaire ferait revenir les entrées purgées par `-x`. 1.0.162 : un `removed` sans taille (répertoire ancien ou synthétique) est rangé sous `removed directory` (`_XCT`), pour que les comptes de Report (fichiers ordinaires) restent inchangés par la purge ; les exclus écrits avant 1.0.162 gardent leur `removed`.
 
 **Purge snapshots intégrée :** en fin d'opération (même s'il n'y avait rien à purger dans `diff_index`), `IdxPurge` appelle `_snapurge_check`/`_snapurge_exec` et supprime les snapshots (`archive_snapshot` + `archive_snapshot_indexed` + `snap_excluded_stats`) dont l'archive dépasse `IDX_SNAP_KEEP`. Un seul commit SQLite et un seul VACUUM pour les deux opérations.
 

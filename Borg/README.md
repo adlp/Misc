@@ -919,6 +919,16 @@ borgHelper -c Status -n mon-serveur                   # « Reconstruction (fant�
   de `DbEncrypt`/`DbDecrypt`, base servie ou son en-tête illisible. Pendant une tranche ordinaire, le même refus laisse
   la base servie avancer et affiche « reconstruction suspendue ».
 - `borg list` vide (`GLOB_ARCH` erroné, dépôt vidé) : le fantôme n'est ni avancé ni basculé.
+- Rapprochement de la base servie reporté pendant la tranche : le fantôme avance mais ne bascule pas — « `<nick>: bascule
+  reportée (rapprochement de la base servie reporté) — fantôme gardé, nouvel essai à la prochaine tranche` » (1.0.202).
+  Cas reportés : base servie occupée par un autre processus, opération prioritaire en cours, `borg list` du dépôt entier
+  en échec ou interrompu, figeage des lignes de graphique en échec. Une base servie occupée reporte même sans archive
+  disparue, son état étant inconnu ; les autres cas ne se présentent que lorsqu'il y a quelque chose à retirer, une
+  archive supprimée hors borgHelper par exemple. Une `history.db` illisible ou corrompue fait échouer le figeage : pas de
+  bascule tant qu'elle n'est pas réparée, les valeurs des archives disparues restant dans la base servie. À l'inverse, une
+  base servie illisible, corrompue ou chiffrée sans clé ne reporte jamais : la reconstruction est là pour la remplacer.
+  La tranche suivante fige d'abord les archives disparues, avec leurs valeurs, puis bascule. Avant 1.0.202, la bascule
+  perdait ces lignes.
 - Tranche limitée par `-T` ou `-b/-B` (une borne autre que `ALL`) : le fantôme n'avance que dans ces limites ; il ne
   devient complet et ne bascule que lorsque le reste a été couvert (par d'autres tranches, limitées ou non). Un
   avertissement le signale (1.0.148). La ligne cron conseillée n'a pas de limite.
@@ -1446,6 +1456,11 @@ Sans `-x`, lit `IDX_EXCLUDE`/`IDX_INCLUDE` depuis la configuration du nick et pu
 **Purge automatique des snapshots :** en fin d'opération, `IdxPurge` purge aussi les snapshots (`archive_snapshot`) au-delà du seuil `IDX_SNAP_KEEP`. Si `IDX_SNAP_KEEP` n'est pas défini, le seuil est calculé comme `sum(KEEP_DAILY + KEEP_WEEKLY + KEEP_MONTHLY + KEEP_YEARLY + KEEP_HOURLY)`, ou 10 si aucune règle KEEP_* n'est configurée. Le dry-run `-D` affiche également les snapshots qui seraient purgés.
 
 Les entrées supprimées rejoignent les exclus de leur paire (`diff_excluded_stats`, nombre et taille par type de changement, 1.0.154) : `modifications` de Report, ArchiveHistory et IdxTop sont inchangés par la purge (les fichiers purgés y comptent comme exclus — seule exception, un fichier `modified` dont la taille après vaut 0 compte alors sa taille avant, comme un exclu de l'Index), une paire entièrement vidée n'est pas prise pour une paire vide à tort, et DiffTop comme IdxTop affichent encore ses exclus (« IDX_* / IdxPurge », 1.0.155 pour IdxTop : plus de « diff_index vide » s'il reste des exclus). Détail des exclus par familles, comme Report (1.0.155) : `+` tous les ajouts (fichiers, répertoires, liens…), `-` toutes les suppressions, `=` tout le reste (`modified`, `changed link`, `mode`…) — la somme vaut le total.
+
+Limite (bases d'avant 1.0.116 seulement, mesurée en 1.0.202) : une paire écrite sans tailles par un Bkp d'avant 1.0.116
+puis entièrement vidée par `IdxPurge -x` garde ses exclus avec une taille 0 — lue par IdxTop, DiffTop et la moitié
+« taille » des `modifications` de Report et ArchiveHistory ; elle n'est jamais refaite — la refaire ferait revenir les
+entrées que `-x` a purgées.
 
 Après suppression, `IdxPurge` recalcule `diff_indexed_pairs.entry_count` et compacte le fichier via `VACUUM INTO` (dans le même répertoire, évite les problèmes de `/tmp` plein). Si le compactage échoue ou est reporté, les entrées sont quand même supprimées (message `[WARN] compactage impossible` ou `[WARN] compactage reporté : <raison>`) ; relancer `IdxPurge` plus tard, ou la procédure manuelle de LIBRARY.md.
 

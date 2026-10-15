@@ -1,5 +1,56 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.202 — Bascule du fantôme après un rapprochement reporté ; paires tronquées et vidées par IdxPurge closes — 2026-10-15
+
+Chantier « reconstruction progressive », story 80 (reports D200, D202, D203 de la puce « Robustesse, cas rares » du tri
+A46 ; décisions de l'utilisateur : Q1 = A, Q2 = A, Q3 = A). Mesuré sur borg 1.2.6 (PyInstaller), CLI réelle, bacs neufs.
+
+- **Bascule du fantôme après un rapprochement reporté** (D200) : quand le rapprochement de la base servie était reporté
+  pendant une tranche, le fantôme — qui purge les archives disparues sans rien figer (AD-7) — basculait quand même :
+  l'Index suivant figeait l'archive disparue SANS valeurs (`nfiles`/`original_size` None) et sans la ligne héritière de
+  l'archive suivante (statistiques du graphique perdues). Désormais `_reconcile_archives(…, deferred=)` signale un
+  rapprochement reporté, rien retiré faute d'information : base servie occupée par un autre processus, opération
+  prioritaire en cours, `borg list` du dépôt entier en échec ou interrompu, figeage des lignes de graphique en échec.
+  Base servie occupée : reporté même sans archive disparue, son état étant inconnu. `history.db` illisible ou corrompue
+  (décision A de l'utilisateur) : figeage en échec, donc pas de bascule tant qu'elle n'est pas réparée — les valeurs des
+  archives disparues restent dans la base servie. Jamais reporté : base servie illisible, corrompue ou chiffrée sans clé,
+  à n'importe quelle lecture — la reconstruction la remplace, bascule permise comme avant ; purge interrompue — lignes de
+  graphique déjà figées ; « rien à retirer » ; liste vide. La passe en tranches le note et `_shadow_swap` ne bascule
+  pas dans cette passe : « `<nick>: bascule reportée (rapprochement de la base servie reporté) — fantôme gardé, nouvel
+  essai à la prochaine tranche` » (décision Q1 = A, format des autres reports de bascule). Le fantôme avance
+  normalement ; la tranche suivante fige l'archive disparue avec ses valeurs puis bascule. Mesuré (CLI réelle, dépôt neuf
+  de 3 archives de 200 fichiers ; `Index`, puis `Index --rebuild -T snap` ; archive du milieu supprimée par `borg
+  delete` ; `borg list` du dépôt entier mis en échec par un script `BORG_EXE` ; tranche `Index -t 5m`, puis tranche sans
+  panne) : avant, « nouvelle base en service » dans la tranche en panne, puis archive figée sans valeurs ; après, pas de
+  bascule à la tranche en panne, puis « 1 archive(s) disparue(s) retirée(s) … 1 ligne(s) de graphique figée(s) » et
+  bascule à la tranche suivante, archive figée avec ses valeurs (200 fichiers, 5944 o) ; témoin sans panne inchangé
+  (figée puis basculée à la première tranche). Prune, DelBkp, rapprochement du fantôme : inchangés.
+- **Paire de diff tuée hors du moniteur — limite 1.0.153 réécrite** (D202, clos, Q2 = A) : non reproduit. `borg diff`
+  tué par un SIGTERM extérieur (chargeur PyInstaller seul, enfant seul, ou les deux comme `pkill` ; 0 s, 0,05 s et 0,4 s
+  après le lancement ; 30 000 fichiers modifiés, `Index -F`) sort toujours en code -15 : « [WARN] … borg diff failed (code
+  -15) — paire … non indexée », paire refaite par l'Index suivant. Le code 1 sans sortie de la story 16 venait du moniteur
+  (corrigé en 1.0.153) ; code 1 après une sortie partielle : jamais observé. La limite de 1.0.153 (« tuée hors du moniteur
+  (kill externe) n'est pas détectée ») ne tient plus : rejetée, mesuré borg 1.2.6.
+- **Paire vidée par `IdxPurge` jamais refaite** (D203, clos, Q3 = A) : confirmé, bases d'avant 1.0.116 seulement (le Bkp
+  y écrivait des paires sans tailles depuis `borg create --list` ; aucun code actuel n'en écrit). Seul effet : les exclus
+  de la paire vidée par `IdxPurge -x` ont une taille 0, lue par IdxTop, DiffTop et la moitié « taille » des
+  `modifications` de Report et ArchiveHistory (`_diff_stats_for_nick`). Pas de correctif : refaire la paire ferait revenir
+  les entrées purgées par `-x` (documenté dans README, `IdxPurge`).
+- Tests : `deferred` reçoit la raison exacte de chaque report — base occupée : verrou exclusif d'un autre ouvreur, même
+  sans disparue, lecture des archives connues ou du figeage « database is locked » ; opération prioritaire ; dépôt entier
+  None/False ; figeage ; `history.db` illisible — et rien pour une base corrompue à toute lecture (fichier, table abîmée,
+  lecture du figeage « malformed »), chiffrée sans clé, une purge interrompue (ligne déjà figée), « rien à retirer », une
+  liste vide, un rapprochement abouti, des disparues toutes hors `GLOB_ARCH`, le fantôme ; `plan['reconcile_deferred']`
+  remis à chaque passe d'un même `index()` ; `_shadow_swap` avec le drapeau : message, aucun borg lancé. Vrai borg :
+  fantôme complété par la tranche, archive du milieu supprimée, rapprochement de la base servie reporté — dépôt entier en
+  échec injecté par le script `BORG_EXE`, base servie tenue plus de 2 s par un verrou exclusif, `history.db` illisible —
+  -> pas de bascule, fantôme gardé, rien figé ; tranche suivante, ou `history.db` remise : figée avec ses valeurs,
+  héritière présente, bascule ; témoin basculé à la première tranche ; base servie corrompue -> pas de report, bascule ;
+  archive recréée ensuite depuis son contenu d'origine, dépôt partagé. `borg diff` tué par un SIGTERM extérieur pendant
+  un Index — chargeur PyInstaller seul, enfant seul, ou les deux comme `pkill` ; cible trouvée par son argv, revérifiée
+  avant le signal ->
+  « [WARN] … (code -15) — paire … non indexée », refaite par l'Index suivant ; `_MEI*` relevés sur les borg tués retirés.
+
 ## borgHelper 1.0.201, borgHelperWWW 1.31.16 — Anciennes bases : migration vers history.db d'un lecteur, paliers de colonnes, exclus orphelins — 2026-10-14
 
 Chantier « reconstruction progressive », story 79 (reports D206, D207, D199 de la puce « Robustesse, cas rares » du tri A46 ;
