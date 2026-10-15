@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.202"
+Version="1.0.203"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -1935,7 +1935,8 @@ def _clear_exc_frames(e):
 def _release_orphan_connections():
     """1.0.182 (story 48, décision de l'utilisateur) : filet de sécurité des commandes multi-nicks — un nick en erreur rattrapé peut
     laisser des connexions sqlite3 orphelines (Python 3.11+ : fermées seulement par le ramasse-miettes) ; gc.collect() avant le
-    nick suivant. Audit des ouvertures sans fermeture garantie : reporté (deferred-work, story 48)."""
+    nick suivant. 1.0.203 (story 81, D161) : toute ouverture de production a désormais une fermeture garantie (try/finally) ;
+    ce filet reste pour les connexions tenues par un cycle d'objets."""
     import gc
     gc.collect()
 
@@ -2038,16 +2039,24 @@ def _swap_db(live,new,nick=None,abort=None,changed=None,pages=4096,busy_limit=12
         except _SwapAbort as e:
             res=str(e); return res
     finally:
-        if dst is not None:
-            # Récupère le WAL (copie validée, annulée ou en erreur) sans attendre : busy_timeout=0, sinon un lecteur
-            # en cours ferait patienter TRUNCATE — qui bloque les nouveaux écrivains pendant l'attente — jusqu'à 60 s.
-            try: dst.execute("PRAGMA busy_timeout=0"); dst.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except sqlite3.Error: pass
-        for c in (src,dst):
-            if c is not None:
-                try: c.close()
+        try:
+            if dst is not None:
+                # Récupère le WAL (copie validée, annulée ou en erreur) sans attendre : busy_timeout=0, sinon un lecteur
+                # en cours ferait patienter TRUNCATE — qui bloque les nouveaux écrivains pendant l'attente — jusqu'à 60 s.
+                try: dst.execute("PRAGMA busy_timeout=0"); dst.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 except sqlite3.Error: pass
-        if not keep_new or res in ('ok','invalid'): _unlink_db(new)
+        finally:   # 1.0.203 (story 81) : chacune fermée dans son finally, puis `new` retirée selon la même règle — même si le
+            try:     # checkpoint ou une fermeture est interrompu (Ctrl-C, SystemExit)
+                if src is not None:
+                    try: src.close()
+                    except sqlite3.Error: pass
+            finally:
+                try:
+                    if dst is not None:
+                        try: dst.close()
+                        except sqlite3.Error: pass
+                finally:
+                    if not keep_new or res in ('ok','invalid'): _unlink_db(new)
 
 _PATH_TABLES=('snapshot_file','diff_index','cachejsonboexlm')   # tables qui portent des chemins/blobs chiffrés (diff.db, cache.db)
 
@@ -2411,7 +2420,9 @@ class _PerNick:
         iso.done()
     Un arrêt _NICK_STOP d'un nick parmi plusieurs est signalé (_nick_stop_msg), passé à on_stop(n,msg) (JSON par nick),
     la connexion rendue par le lambda (lu à la sortie : celle du nick en cours, une déjà fermée ou inexistante) est
-    fermée, et les nicks suivants continuent. Nick seul, Ctrl-C (130), sys.exit(0) : relancé tel quel. done() : tous en
+    fermée — depuis 1.0.203 (story 81), chaque site la ferme déjà dans son `finally` : fermeture de secours, sans effet —, et
+    les nicks suivants continuent. Le gc.collect de _release_orphan_connections ne vise plus que les connexions tenues par un
+    cycle d'objets. Nick seul, Ctrl-C (130), sys.exit(0) : relancé tel quel. done() : tous en
     échec -> la PREMIÈRE erreur relancée, comme un nick seul."""
     def __init__(self,nick,on_stop=None):
         self.nicks=nick.split(','); self.multi=len(self.nicks)>1; self.on_stop=on_stop
@@ -3583,6 +3594,7 @@ class BorgHelperDB:
 
     def purge_stale_cache(self,nick,current_lm,db_path=None):
         if db_path is None: db_path=self.get_cache_db(nick)
+        conn=None
         try:
             conn=_open_db(db_path,nick=nick.split(':',1)[0],role='write')
             cur=conn.execute("DELETE FROM cachejsonboexlm WHERE nom=? AND lastmodified!=?",(nick,current_lm))
@@ -3592,18 +3604,22 @@ class BorgHelperDB:
             if not getattr(e,'wrong_key',False): raise
             return 0                   # 1.0.169 : cache.db née d'une autre passphrase — rien de lisible à purger ; le cache
                                            # manqué qui suit la répare (ensure_cache_db créateur) ou lève comme avant
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
 
     def clear_cache_nick(self,nick,db_path=None):
         if db_path is None: db_path=self.get_cache_db(nick)
         if _db_absent(db_path): return 0   # 1.0.171 : pas de cache, rien à vider — jamais un cache.db créé (Prune, DelBkp)
+        conn=None
         try:
             conn=_open_db(db_path,nick=nick,role='write')
             cur=conn.execute("DELETE FROM cachejsonboexlm WHERE nom=? OR nom=?",(nick,f"{nick}:prune"))
             count=cur.rowcount; conn.commit(); conn.close(); return count
         except sqlite3.Error: return 0
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
 
     def is_diff_pair_indexed(self,nick,archive_old,archive_new,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
+        conn=None
         try:
             conn=_open_db(db_path,nick=nick,role='read')
             cur=conn.cursor()
@@ -3614,10 +3630,12 @@ class BorgHelperDB:
             # et Index recalculaient puis réinséraient la paire (diff_index sans UNIQUE : lignes en double, mesuré). Table absente : False.
             if _sqlite_missing(e): return False
             _reader_sqlite_err(e,db_path); return None
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
 
     def diff_pair_has_sizes(self,nick,archive_old,archive_new,db_path=None):
         """True si la paire indexée contient des tailles (borg diff), False si stockée sans tailles (backup list)."""
         if db_path is None: db_path=self.get_diff_db(nick)
+        conn=None
         try:
             conn=_open_db(db_path,nick=nick,role='read')
             row=conn.execute("SELECT entry_count FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=? LIMIT 1",(nick,archive_old,archive_new)).fetchone()
@@ -3631,6 +3649,7 @@ class BorgHelperDB:
         except sqlite3.Error as e:   # 1.0.176 (A78) : vraie erreur -> None (l'appelant laisse la paire), comme is_diff_pair_indexed
             if _sqlite_missing(e): return False
             _reader_sqlite_err(e,db_path); return None
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
 
     def _with_lock_retry(self,fn,max_wait=300):
         t0=time.time(); warned=False
@@ -4183,6 +4202,7 @@ class BorgHelperDB:
         Jamais de réclamation ici (lecture seule) — voir claim_bkp_status."""
         db_path=self._hist(nick,db_path)
         if db_path is None: return []
+        conn=None
         try:
             conn=_open_db(db_path,nick=None,role='read')
             rows=conn.execute(
@@ -4194,6 +4214,7 @@ class BorgHelperDB:
             return [{'run_id':r[0],'started_at':r[1],'finished_at':r[2],'result':r[3],
                      'changed_during_backup':r[4],'read_errors':r[5]} for r in rows]
         except sqlite3.Error as e: _reader_sqlite_err(e,db_path,(db_path,'pending_end')); return []   # 1.0.176 (A78) : notifications sautées, dit (journal WWW)
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
 
     def claim_bkp_status(self,nick,run_id,db_path=None):
         """Réclamation par comparer-et-échanger (AD-3) : UPDATE ... WHERE notified_at IS NULL, jamais
@@ -4251,6 +4272,7 @@ class BorgHelperDB:
         Lecture seule — voir claim_bkp_status_start."""
         db_path=self._hist(nick,db_path)
         if db_path is None: return []
+        conn=None
         try:
             conn=_open_db(db_path,nick=None,role='read')
             rows=conn.execute(
@@ -4260,6 +4282,7 @@ class BorgHelperDB:
             _reader_sqlite_ok((db_path,'pending_start'))
             return [{'run_id':r[0],'started_at':r[1]} for r in rows]
         except sqlite3.Error as e: _reader_sqlite_err(e,db_path,(db_path,'pending_start')); return []   # 1.0.176 (A78)
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
 
     def claim_bkp_status_start(self,nick,run_id,db_path=None):
         """Réclamation par comparer-et-échanger de l'événement de DÉBUT — même patron exact que
@@ -4307,12 +4330,14 @@ class BorgHelperDB:
     def get_repo_stats(self,nick,db_path=None):
         db_path=self._hist(nick,db_path)
         if db_path is None: return {}
+        conn=None
         try:
             conn=_open_db(db_path,nick=None,role='read')
             row=conn.execute("SELECT unique_csize,total_size,total_csize FROM repo_stats WHERE nick=? ORDER BY id DESC LIMIT 1",(nick,)).fetchone()
             conn.close()
             return {'unique_csize':row[0],'total_size':row[1],'total_csize':row[2]} if row else {}
         except sqlite3.Error as e: _reader_sqlite_err(e,db_path); return {}   # 1.0.175 (A72)
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
 
     def is_archive_snapshot_indexed(self,nick,archive,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
@@ -4328,6 +4353,7 @@ class BorgHelperDB:
             # -> None (inconnu, comme is_diff_pair_indexed 1.0.176) : indexsnap saute le snapshot, sans rien supprimer
             if _sqlite_missing(e) or _cost_reader_err(e,db_path): return False
             return None
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
 
     def store_archive_snapshot(self,nick,archive,archive_date,files,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
@@ -4481,6 +4507,7 @@ class BorgHelperDB:
         return out
 
     def _is_index_empty(self,nick,db_path):
+        conn=None
         try:
             conn=_open_db(db_path,nick=nick,role='read',empty_ok=True)
             n_diff=conn.execute("SELECT COUNT(*) FROM diff_index WHERE nick=?",(nick,)).fetchone()[0]
@@ -4494,6 +4521,7 @@ class BorgHelperDB:
             _SQLITE_ERR_SEEN.add(db_path)   # une seule ligne : celle de l'appelant
             _READER_FAILED[0]+=1   # 1.0.178 (A87) : code 1
             return f"SQLite error ({db_path}): {e}"
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
 
     def _diff_archive_filter(self,nick,archive_from,conn,archive_to=None):
         def _date_of(archive):
@@ -4545,6 +4573,7 @@ class BorgHelperDB:
                 except sqlite3.Error as e:
                     _close_quiet(conn)
                     printer(_reader_sqlite_line(e,db_path))   # 1.0.178 (A87) : marquée, code 1
+                finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         _iso.done()
         return totals
 
@@ -4585,6 +4614,7 @@ class BorgHelperDB:
                 except sqlite3.Error as e:
                     _close_quiet(conn)
                     printer(_reader_sqlite_line(e,db_path))   # 1.0.178 (A87) : marquée, code 1
+                finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         _iso.done()
         return totals
 
@@ -4627,12 +4657,14 @@ class BorgHelperDB:
                 except sqlite3.Error as e:
                     _close_quiet(conn)
                     printer(_reader_sqlite_line(e,db_path))   # 1.0.178 (A87) : marquée, code 1
+                finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         _iso.done()
         return rows
 
     def get_cache_rows(self,nick):
         db_path=self.get_cache_db(nick)
         self.ensure_cache_db(db_path,create=False)
+        conn=None
         try:
             conn=_open_db(db_path,nick=nick,role='read',empty_ok=True)
             cur=conn.execute("SELECT nom,lastmodified,length(details) FROM cachejsonboexlm WHERE nom=? ORDER BY lastmodified DESC",(nick,))
@@ -4642,6 +4674,7 @@ class BorgHelperDB:
             printer(_reader_sqlite_line(e,db_path)); return []   # 1.0.178 (A87) : marquée, code 1 (CacheInfo)
         except sqlite3.Error as e:
             printer(_reader_sqlite_line(e,db_path)); return []
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
 
 
 # ── BorgRunner — borg subprocess + borghelperrc config ────────────────────────
@@ -5296,6 +5329,7 @@ class BorgHelper:
         self.db.ensure_cache_db(db_path,create=False)
         nom=f"{nick}:prune"
         if _db_has_schema(db_path,_READER_WRITE_WAIT): self.db.purge_stale_cache(nom,last_modified,db_path)  # jamais mis en cache -> rien à purger (AD-12 : ne pas toucher le fichier)
+        conn=None
         try:
             conn=_open_db(db_path,nick=nick,role='read',empty_ok=True)
             row=conn.execute("SELECT details FROM cachejsonboexlm WHERE nom=? AND lastmodified=? LIMIT 1",(nom,last_modified)).fetchone()
@@ -5304,6 +5338,7 @@ class BorgHelper:
                 except DbCodecError: row=None  # ligne illisible = cache miss (AD-9), jamais une erreur
             conn.close()
         except sqlite3.Error: row=None
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         if row is not None:
             if debug: print(f'Cache hit (prune {nick})')
             return json.loads(row[0])
@@ -5328,6 +5363,7 @@ class BorgHelper:
             line=i if isinstance(i,str) else i.get('message','')
             if 'Would prune:' in line:
                 pruneme.append((re.sub(r'( )*',r'\1',line)).split(' ')[2])
+        conn=None
         try:
             self.db.ensure_cache_db(db_path,nick=nick)  # cache miss confirmé : on écrit -> création légitime (AD-12 ne visait que le lookup)
             conn=_open_db(db_path,nick=nick,role='write')
@@ -5337,6 +5373,7 @@ class BorgHelper:
             conn.commit(); conn.close()
         except sqlite3.Error as e:
             printer(f"Cache write error ({db_path}): {e}")
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         return pruneme
 
     def cacheJsonBoexWithLM(self,nick,boexarg,output="stdout",debug=0,db_path=None,last_modified=None):
@@ -5344,6 +5381,7 @@ class BorgHelper:
         self.db.ensure_cache_db(db_path,create=False)
         if last_modified is None: last_modified=self.borg._boex_last_modified(nick,debug=debug)
         if _db_has_schema(db_path,_READER_WRITE_WAIT): self.db.purge_stale_cache(nick,last_modified,db_path)  # jamais mis en cache -> rien à purger (AD-12 : ne pas toucher le fichier)
+        conn=None
         try:
             conn=_open_db(db_path,nick=nick,role='read',empty_ok=True)
             row=conn.execute("SELECT details FROM cachejsonboexlm WHERE nom=? AND lastmodified=? LIMIT 1",(nick,last_modified)).fetchone()
@@ -5354,6 +5392,7 @@ class BorgHelper:
         except sqlite3.Error as e:   # 1.0.175 (A72) : table absente (cache jamais écrit) silencieuse, vraie erreur dite
             if not str(e).startswith('no such table'): printer(f"Cache SQLite error ({db_path}): {e}")
             row=None
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         if row is None:
             if debug: print('Cache miss — appel borg')
             rbc=self.borg.boex(nick,boexarg,debug=debug)
@@ -5361,6 +5400,7 @@ class BorgHelper:
                 raise RuntimeError(_rb_errmsg(rbc,'borg '+' '.join(boexarg[:1])))
             _borg_warn(nick,'borg '+' '.join(boexarg[:1]),rbc)   # 1.0.176 (revue story 39) : code 1 -> avertissement dit (avant : muet)
             details=rbc[output][0]
+            conn=None
             try:
                 self.db.ensure_cache_db(db_path,nick=nick)  # cache miss confirmé : on écrit -> création légitime (AD-12 ne visait que le lookup)
                 conn=_open_db(db_path,nick=nick,role='write')
@@ -5370,6 +5410,7 @@ class BorgHelper:
                 conn.commit(); conn.close()
             except sqlite3.Error as e:
                 printer(f"Cache write error ({db_path}): {e}")
+            finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         else:
             if debug: print('Cache hit')
             details=json.loads(row[0])
@@ -5657,30 +5698,32 @@ class BorgHelper:
         if not passphrase:
             printer(f"  [ERREUR] {nick}: passphrase absente — {verb} impossible"); return 2
         conn=_open_db(db_path,nick=None,role='admin')
-        raw=_enc_header_read(conn)
-        cur_mode='plain' if raw is None else _enc_header_parse(raw)['path_enc']
-        if (direction=='encrypt' and cur_mode=='siv1') or (direction=='decrypt' and cur_mode=='plain'):
-            printer(f"  {nick}: "+("déjà chiffrée (siv1)" if direction=='encrypt' else "déjà en clair")); conn.close()
-            # 1.0.168 (revue story 31, décision de l'utilisateur) : diff.db née chiffrée (A48) à côté d'une cache.db en clair
-            # (ou l'inverse) — la cache.db est quand même mise dans le mode cible (-y seulement : purge du cache)
-            if confirm and not dryrun:
-                try: self._db_migrate_cache(nick,direction,passphrase,cfg,debug=debug)
-                except (DbKeyError,DbModeError,DbTamperError,DbCodecError) as e:
-                    printer(f"  [ERREUR] {nick}: {type(e).__name__}: {e}"); return 2
-            return 0
-        if cur_mode=='migrating':
-            migrating_dir=_enc_header_parse(raw).get('migrating_dir')
-            if migrating_dir not in (None,direction):
-                other='DbDecrypt' if direction=='encrypt' else 'DbEncrypt'
-                printer(f"  [ERREUR] {nick}: migration en cours dans l'autre sens — relancer {other} pour la terminer"); conn.close(); return 2
-        if not _check_disk_space(db_path):
-            printer(f"  [ERREUR] {nick}: espace disque insuffisant pour {verb} (marge {_DB_SPACE_MARGIN:.0%} de {os.path.getsize(db_path):,} octets)"); conn.close(); return 2
-        def _count(t):   # 1.0.171 : base non migrée en -D — une table d'un schéma plus récent peut manquer (« ? »)
-            try: return f"{conn.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]:,}"
-            except sqlite3.OperationalError: return '?'
-        counts={t:_count(t) for t in ('snapshot_file','diff_index')}
-        size=os.path.getsize(db_path)
-        conn.close()
+        try:
+            raw=_enc_header_read(conn)
+            cur_mode='plain' if raw is None else _enc_header_parse(raw)['path_enc']
+            if (direction=='encrypt' and cur_mode=='siv1') or (direction=='decrypt' and cur_mode=='plain'):
+                printer(f"  {nick}: "+("déjà chiffrée (siv1)" if direction=='encrypt' else "déjà en clair")); conn.close()
+                # 1.0.168 (revue story 31, décision de l'utilisateur) : diff.db née chiffrée (A48) à côté d'une cache.db en clair
+                # (ou l'inverse) — la cache.db est quand même mise dans le mode cible (-y seulement : purge du cache)
+                if confirm and not dryrun:
+                    try: self._db_migrate_cache(nick,direction,passphrase,cfg,debug=debug)
+                    except (DbKeyError,DbModeError,DbTamperError,DbCodecError) as e:
+                        printer(f"  [ERREUR] {nick}: {type(e).__name__}: {e}"); return 2
+                return 0
+            if cur_mode=='migrating':
+                migrating_dir=_enc_header_parse(raw).get('migrating_dir')
+                if migrating_dir not in (None,direction):
+                    other='DbDecrypt' if direction=='encrypt' else 'DbEncrypt'
+                    printer(f"  [ERREUR] {nick}: migration en cours dans l'autre sens — relancer {other} pour la terminer"); conn.close(); return 2
+            if not _check_disk_space(db_path):
+                printer(f"  [ERREUR] {nick}: espace disque insuffisant pour {verb} (marge {_DB_SPACE_MARGIN:.0%} de {os.path.getsize(db_path):,} octets)"); conn.close(); return 2
+            def _count(t):   # 1.0.171 : base non migrée en -D — une table d'un schéma plus récent peut manquer (« ? »)
+                try: return f"{conn.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]:,}"
+                except sqlite3.OperationalError: return '?'
+            counts={t:_count(t) for t in ('snapshot_file','diff_index')}
+            size=os.path.getsize(db_path)
+            conn.close()
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises (sorties anticipées, erreurs)
         if dryrun and confirm:
             printer(f"  {nick}: -D et -y sont exclusifs"); return 2
         if dryrun:
@@ -5764,9 +5807,9 @@ class BorgHelper:
             if st=='absent':   # 1.0.168 : fichier sans table (lookup d'un lecteur, O_CREAT) = pas une base
                 printer(f"  {nick}: {label}: absent"); continue
             import pathlib
-            peek=sqlite3.connect(pathlib.Path(path).absolute().as_uri()+'?mode=rw',uri=True)   # 1.0.171 : jamais créée (supprimée entre-temps)
             try:
-                try: raw=_enc_header_read(peek)
+                peek=sqlite3.connect(pathlib.Path(path).absolute().as_uri()+'?mode=rw',uri=True)   # 1.0.171 : jamais créée (supprimée entre-temps)
+                try: raw=_enc_header_read(peek)   # 1.0.203 (story 81) : ouverture suivie aussitôt du try/finally qui ferme
                 finally: peek.close()
                 mode='plain' if raw is None else _enc_header_parse(raw)['path_enc']
             except DbTamperError as e:
@@ -6000,6 +6043,7 @@ class BorgHelper:
         db_path=self.db.get_diff_db(nick)
         has_glob='*' in path or '?' in path
         sql_pat=path.replace('*','%').replace('?','_') if has_glob else None
+        conn=None
         try:
             self.db.ensure_diff_db(db_path,create=False)
             conn=_open_db(db_path,nick=nick,role='read')
@@ -6015,6 +6059,7 @@ class BorgHelper:
             conn.close(); return found
         except DbCodecError as e: _codec_fail(nick,e,conn); return None
         except sqlite3.Error as e: _reader_sqlite_err(e,db_path); return None   # 1.0.176 (A78) : repli sur la dernière archive, cause dite
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
 
     # ── Commands ───────────────────────────────────────────────────────────────
 
@@ -6137,29 +6182,31 @@ class BorgHelper:
             _close_quiet(conn); line=_reader_sqlite_line(e,db_path)
             if as_json: print(json.dumps({'error':f"SQLite error ({db_path}): {e}"},ensure_ascii=False))
             printer(line); sys.exit(1)
-        try: conn=_open_db(db_path,nick=nick,role='read',empty_ok=True)
-        except sqlite3.Error as e: _sql_fail(e)
-        if bid is None:
-            try: row=conn.execute("SELECT archive FROM archive_stats WHERE nick=? ORDER BY archive_date DESC LIMIT 1",(nick,)).fetchone()
+        try:
+            try: conn=_open_db(db_path,nick=nick,role='read',empty_ok=True)
+            except sqlite3.Error as e: _sql_fail(e)
+            if bid is None:
+                try: row=conn.execute("SELECT archive FROM archive_stats WHERE nick=? ORDER BY archive_date DESC LIMIT 1",(nick,)).fetchone()
+                except sqlite3.Error as e:
+                    if not _sqlite_missing(e): _sql_fail(e)
+                    row=None  # base absente/jamais indexée (create=False, AD-12)
+                if row is None:
+                    conn.close()
+                    msg="Aucune archive indexée en base — lancer 'index' ou 'bkp'."
+                    if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(1)
+                    printer(msg); sys.exit(1)
+                bid=row[0]
+            try: rows=[(_path_decode(conn,p),) for (p,) in conn.execute("SELECT path FROM archive_snapshot_v WHERE nick=? AND archive=?",(nick,bid))]
+            except DbCodecError as e:
+                msg=_codec_fail(nick,e,conn)
+                if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(3)
+                sys.exit(3)
             except sqlite3.Error as e:
                 if not _sqlite_missing(e): _sql_fail(e)
-                row=None  # base absente/jamais indexée (create=False, AD-12)
-            if row is None:
-                conn.close()
-                msg="Aucune archive indexée en base — lancer 'index' ou 'bkp'."
-                if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(1)
-                printer(msg); sys.exit(1)
-            bid=row[0]
-        try: rows=[(_path_decode(conn,p),) for (p,) in conn.execute("SELECT path FROM archive_snapshot_v WHERE nick=? AND archive=?",(nick,bid))]
-        except DbCodecError as e:
-            msg=_codec_fail(nick,e,conn)
-            if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(3)
-            sys.exit(3)
-        except sqlite3.Error as e:
-            if not _sqlite_missing(e): _sql_fail(e)
-            rows=[]  # base absente/jamais indexée (create=False, AD-12)
-        rows.sort(key=lambda r:_path_sort_key(r[0]))  # tri Python (ordre octet UTF-8) : identique en plain et chiffré
-        conn.close()
+                rows=[]  # base absente/jamais indexée (create=False, AD-12)
+            rows.sort(key=lambda r:_path_sort_key(r[0]))  # tri Python (ordre octet UTF-8) : identique en plain et chiffré
+            conn.close()
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises (sys.exit, erreurs)
         if not rows:
             msg=f"Aucun fichier indexé pour {bid} — lancer 'indexsnap'."
             if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(1)
@@ -6278,6 +6325,7 @@ class BorgHelper:
             self.db.store_diff_entries(nick,bidun,bideux,date_new,entries_ok,db_path,exclu=exclu)   # 1.0.201 : exclus avec la paire
             display_entries=all_entries
         else:
+            conn=None
             try:
                 conn=_open_db(db_path,nick=nick,role='read',empty_ok=True)
                 rows=[(ct,_path_decode(conn,p),sb,sa) for ct,p,sb,sa in conn.execute("SELECT change_type,path,size_before,size_after FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",(nick,bidun,bideux))]
@@ -6291,6 +6339,7 @@ class BorgHelper:
                 msg=f"SQLite error ({db_path}): {e}"
                 if as_json: print(json.dumps({'error':msg},ensure_ascii=False)); sys.exit(3)
                 printer(msg); sys.exit(3)
+            finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
             display_entries=[{'change_type':ct,'path':path,'size_before':sb,'size_after':sa} for ct,path,sb,sa in rows]
         n_add=sum(1 for p in display_entries if p['change_type'] in _DIFF_ADDED_TYPES)
         n_rem=sum(1 for p in display_entries if p['change_type'] in _DIFF_REMOVED_TYPES)
@@ -6824,6 +6873,7 @@ class BorgHelper:
     def _indexsnap_incremental(self,nick,archive_name,archive_date,cfg,db_path,debug=0):
         """Mise à jour incrémentale du snapshot via diff_index.
         Retourne (nfiles, exclu_count, exclu_size, n_added, n_removed, n_modified) ou None (fallback borg list)."""
+        conn=None
         try:
             conn=_open_db(db_path,nick=nick,role='write',timeout=60)
             _write_mode_check(conn)
@@ -6928,6 +6978,7 @@ class BorgHelper:
             try: conn.close()
             except: pass
             raise
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
 
     def indexsnap(self,nick,debug=0,db_path=None,force=False,archives=None):
         """Snapshot de la dernière archive. archives (1.0.141) : liste borg list déjà obtenue (moteur d'Index). Retourne
@@ -6954,6 +7005,7 @@ class BorgHelper:
         if ix:
             if not force:
                 print(f"{nick}: snapshot {archive_name} déjà indexé"); return 0
+            conn=None
             try:
                 conn=_open_db(db_path,nick=nick,role='write')
                 conn.execute("DELETE FROM archive_snapshot WHERE nick=? AND archive=?",(nick,archive_name))
@@ -6962,9 +7014,11 @@ class BorgHelper:
                 conn.commit(); conn.close()
             except sqlite3.Error as e:
                 printer(f"SQLite error ({db_path}): {e}")
+            finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         else:
             # Lignes sans sentinelle laissées par un arrêt brutal (kill -9, versions < 1.0.141 qui écrivaient le clone
             # incrémental avant leur borg list) : retirées avant de refaire l'unité (AD-1 : unité = sentinelle).
+            conn=None
             try:
                 conn=_open_db(db_path,nick=nick,role='write')
                 if conn.execute("DELETE FROM archive_snapshot WHERE nick=? AND archive=?",(nick,archive_name)).rowcount:
@@ -6973,6 +7027,7 @@ class BorgHelper:
                 conn.close()
             except sqlite3.Error as e:
                 printer(f"SQLite error ({db_path}): {e}")
+            finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         print(f"  {nick}: snapshot {archive_name}...",flush=True)
         # Auto-réparation : le clonage incrémental réutilise le file_id (donc type/mode/owner) des
         # fichiers inchangés — une colonne manquante (migration snapshot_file.type/.mode/.owner, ou
@@ -6981,6 +7036,7 @@ class BorgHelper:
         # suivants repassent en incrémental normal.
         auto_repair=False
         if not force:
+            rconn=None
             try:
                 rconn=_open_db(db_path,nick=nick,role='read')
                 # 1.0.164 : versions de l'archive que l'incrémental clonerait seulement — des versions NULL restent liées aux
@@ -6994,6 +7050,7 @@ class BorgHelper:
                     auto_repair=True
                     print(f"  {nick}: type/mode/propriétaire manquant pour certaines entrées — resnapshot complet (auto-réparation)")
             except sqlite3.Error: pass
+            finally: _close_quiet(rconn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         # Tentative incrémentale (pas en mode force, pas en auto-réparation)
         try:
             inc=None
@@ -7046,6 +7103,7 @@ class BorgHelper:
         keep_snap=int(cfg.get('IDX_SNAP_KEEP',
             sum(int(cfg.get(k,0)) for k in ['KEEP_DAILY','KEEP_WEEKLY','KEEP_MONTHLY','KEEP_YEARLY','KEEP_HOURLY'])
             or 10))
+        conn=None
         try:
             conn=_open_db(db_path,nick=nick,role='write',timeout=60)
             snap_del,snap_count=self._snapurge_check(nick,conn,keep_snap)
@@ -7056,6 +7114,7 @@ class BorgHelper:
             conn.close()
         except sqlite3.Error as e:
             printer(f"  [WARN] purge snapshot échouée ({e})")
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         return 0
 
     def _refresh_chart_stats(self,nick,cfg,db_path,archives,force=False,debug=0):
@@ -7078,6 +7137,7 @@ class BorgHelper:
             conn.close()
         except sqlite3.Error as e:   # 1.0.200 (story 78, D137) : vraie erreur dite (table absente : muette) ; borg info refait comme avant
             _close_quiet(conn); _cost_reader_err(e,db_path); existing=set()
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         missing=archive_names-existing
         if missing or (force and archive_names):
             rbi=self.borg.boex(nick,['info','--json']+glob_args(cfg,archives=True),debug=debug)
@@ -7482,6 +7542,7 @@ class BorgHelper:
             elif already and force: pairs_to_purge.append((a_old,a_new))
             pairs_todo.append((a_old,a_new,date_new))
         if pairs_to_purge:
+            conn=None
             try:
                 conn=_open_db(db_path,nick=nick,role='write')
                 for a_old,a_new in pairs_to_purge:
@@ -7494,6 +7555,7 @@ class BorgHelper:
                 # 1.0.176 (A78) : purge en échec -> ces paires (encore indexées) ne sont pas recalculées : réinsérées, elles
                 # doubleraient leurs lignes (diff_index sans UNIQUE)
                 purge=set(pairs_to_purge); pairs_todo=[p for p in pairs_todo if (p[0],p[1]) not in purge]
+            finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         return pairs_todo,skipped
 
     def _index_diffs(self,nick,cfg,db_path,pairs_todo,skipped,deadline,done=None):
@@ -8018,6 +8080,7 @@ class BorgHelper:
                         if isinstance(ie,str): printer(f"[ERREUR] {msg}")   # 1.0.178 (A87) : erreur aussi sur stderr en -j
                     else: printer(f"[ERREUR] {msg}" if isinstance(ie,str) else f"[WARN] {msg}")   # 1.0.179 (A89) : index vide = [WARN], code 0
                     continue
+                conn=None
                 try:
                     conn=_open_db(db_path,nick=n,role='read',empty_ok=True)
                     af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
@@ -8044,6 +8107,7 @@ class BorgHelper:
                     if as_json: _reader_sqlite_err(e,db_path); results[n]={'error':f"SQLite error ({db_path}): {e}"}   # 1.0.178 (A87)
                     else: printer(_reader_sqlite_line(e,db_path))
                     continue
+                finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
                 rows.extend(n_rows)
                 if as_json:
                     results[n]=[{'date':(d or '')[:19],'archive':a,'type':t,'path':p,'size_before':sb,'size_after':sa}
@@ -8080,6 +8144,7 @@ class BorgHelper:
                         if isinstance(ie,str): printer(f"[ERREUR] {msg}")   # 1.0.178 (A87) : erreur aussi sur stderr en -j
                     else: printer(f"[ERREUR] {msg}" if isinstance(ie,str) else f"[WARN] {msg}")   # 1.0.179 (A89) : index vide = [WARN], code 0
                     continue
+                conn=None
                 try:
                     conn=_open_db(db_path,nick=n,role='read',empty_ok=True)
                     af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
@@ -8094,6 +8159,7 @@ class BorgHelper:
                     if as_json: _reader_sqlite_err(e,db_path); results[n]={'error':f"SQLite error ({db_path}): {e}"}   # 1.0.178 (A87)
                     else: printer(_reader_sqlite_line(e,db_path))
                     continue
+                finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
                 n_rows.sort(key=lambda r:(r[1] or ''))
                 rows.extend(n_rows)
                 if as_json:
@@ -8401,6 +8467,7 @@ class BorgHelper:
                         if isinstance(ie,str): printer(f"[ERREUR] {msg}")   # 1.0.178 (A87) : erreur aussi sur stderr en -j
                     else: printer(f"[ERREUR] {msg}" if isinstance(ie,str) else f"[WARN] {msg}")   # 1.0.179 (A89) : index vide = [WARN], code 0
                     continue
+                conn=None
                 try:
                     conn=_open_db(db_path,nick=n,role='read',empty_ok=True)
                     if changes:  # -X (1.0.133) : seulement ce qui a changé entre -b (exclue) et -B (incluse)
@@ -8415,6 +8482,7 @@ class BorgHelper:
                 except sqlite3.Error as e:
                     if as_json: _reader_sqlite_err(e,db_path); results[n]={'error':f"SQLite error ({db_path}): {e}"}   # 1.0.178 (A87)
                     else: printer(_reader_sqlite_line(e,db_path))
+                finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         _iso.done()
         if as_json:
             print(json.dumps(results,ensure_ascii=False,indent=2))
@@ -8511,6 +8579,7 @@ class BorgHelper:
                         if isinstance(ie,str): printer(f"[ERREUR] {msg}")   # 1.0.178 (A87) : erreur aussi sur stderr en -j
                     else: printer(f"[ERREUR] {msg}" if isinstance(ie,str) else f"[WARN] {msg}")   # 1.0.179 (A89) : index vide = [WARN], code 0
                     continue
+                conn=None
                 try:
                     conn=_open_db(db_path,nick=n,role='read',empty_ok=True)
                     result=self._treefind_listing(n,prefix,pattern,conn,debug=debug,as_json=as_json)
@@ -8522,6 +8591,7 @@ class BorgHelper:
                 except sqlite3.Error as e:
                     if as_json: _reader_sqlite_err(e,db_path); results[n]={'error':f"SQLite error ({db_path}): {e}"}   # 1.0.178 (A87)
                     else: printer(_reader_sqlite_line(e,db_path))
+                finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         _iso.done()
         if as_json:
             print(json.dumps(results,ensure_ascii=False,indent=2))
@@ -8587,6 +8657,7 @@ class BorgHelper:
             except sqlite3.Error as e:
                 _close_quiet(conn); _reader_sqlite_err(e,db_path)   # 1.0.176 (A78) : vraie erreur dite sur stderr aussi
                 print(json.dumps({'error':f"SQLite error ({db_path}): {e}"},ensure_ascii=False,indent=2)); return
+            finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
             print(json.dumps({'borghelper_version':Version,'nick':nick,'rows':rows},ensure_ascii=False,indent=2))
             return
         def get_prefix(path,d):
@@ -8614,6 +8685,7 @@ class BorgHelper:
         except sqlite3.Error as e:
             _close_quiet(conn)
             printer(_reader_sqlite_line(e,db_path)); return   # 1.0.176 (A78) : [ERREUR] pour une vraie erreur
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         conn2=None
         try:
             conn2=_open_db(db_path,nick=nick,role='read',empty_ok=True)
@@ -8641,6 +8713,7 @@ class BorgHelper:
         except sqlite3.Error as e:
             _reader_sqlite_err(e,db_path)   # 1.0.175 (A72) : lignes Exclus/Inchangés perdues -> dit
             _close_quiet(conn2); exclu_by_ct={}; exclu_n=0; exclu_sz=0; idx_am_d={}; exclu_am_d={}; nfiles_d={}
+        finally: _close_quiet(conn2)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         if not total_count and not exclu_n:   # 1.0.155 : diff_index vidé par IdxPurge -> ses exclus restent affichés
             printer(f"  {nick}: diff_index vide"); return
         top=sorted(stats.items(),key=lambda x:x[1]['count'],reverse=True)[:topn]
@@ -8705,6 +8778,7 @@ class BorgHelper:
         hist=self.db._hist(nick,strict=True)   # 1.0.179 (A92) : non traversable -> erreur réelle, jamais rows []
         rows=[]; baseline=None
         if hist is not None:
+            conn=None
             try:
                 conn=_open_db(hist,nick=None,role='read')
                 # Bornage (1.0.127) : STATS_RETENTION_MONTHS aussi à la LECTURE — la purge n'a lieu qu'à
@@ -8727,6 +8801,7 @@ class BorgHelper:
                     if _sqlite_missing(e): _READER_FAILED[0]+=1; printer(f"[ERREUR] SQLite error ({hist}): {e}")   # 1.0.178 : marquée, code 1
                     else: _reader_sqlite_err(e,hist)
                     print(json.dumps({'error':f"SQLite error ({hist}): {e}"},ensure_ascii=False,indent=2)); return
+            finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         print(json.dumps({'borghelper_version':Version,'nick':nick,'rows':rows,'baseline':baseline},ensure_ascii=False,indent=2))
 
     def archive_history(self,nick,debug=0,as_json=False):
@@ -8786,6 +8861,7 @@ class BorgHelper:
                 print(json.dumps({'error':f"SQLite error ({db_path}): {e}"},ensure_ascii=False,indent=2)); return
             if conn is not None: conn.close()
             rows=[]
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         # Mesures du Bkp (history.db, 1.0.139) : C/E (null si inconnues) et taille dédupliquée à la création, préférée
         # à celle d'archive_stats (borg info) quand elle existe — décision utilisateur, sorties identiques à avant.
         measures=self.db.get_archive_measures(nick)
@@ -9244,6 +9320,7 @@ class BorgHelper:
                 _close_quiet(conn)
                 if as_json: _reader_sqlite_err(e,db_path); print(json.dumps({'error':f"SQLite error ({db_path}): {e}"},ensure_ascii=False,indent=2)); return
                 printer(_reader_sqlite_line(e,db_path)); return   # 1.0.176 (A78) : [ERREUR] pour une vraie erreur
+            finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
             if not row:
                 if as_json: print(json.dumps({'error':f"aucune paire indexée pour {nick}"},ensure_ascii=False,indent=2)); return
                 printer(f"  {nick}: aucune paire indexée — lancez borgHelper -c Index -n {nick}"); return
@@ -9269,6 +9346,7 @@ class BorgHelper:
             except sqlite3.Error as e:
                 _close_quiet(conn); _reader_sqlite_err(e,db_path)   # 1.0.176 (A78) : vraie erreur dite sur stderr aussi
                 print(json.dumps({'error':f"SQLite error ({db_path}): {e}"},ensure_ascii=False,indent=2)); return
+            finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
             print(json.dumps({'borghelper_version':Version,'nick':nick,'archive_old':arch_old,'archive_new':arch_new,
                                'rows':rows},ensure_ascii=False,indent=2))
             return
@@ -9310,6 +9388,7 @@ class BorgHelper:
         except sqlite3.Error as e:
             _close_quiet(conn)
             printer(_reader_sqlite_line(e,db_path)); return   # 1.0.176 (A78) : [ERREUR] pour une vraie erreur
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         conn3=None
         try:
             conn3=_open_db(db_path,nick=nick,role='read',empty_ok=True)
@@ -9322,6 +9401,7 @@ class BorgHelper:
         except sqlite3.Error as e:
             _reader_sqlite_err(e,db_path)   # 1.0.175 (A72)
             _close_quiet(conn3); exclu_by_ct3={}; exclu_n=0; exclu_sz=0; nfiles_new=None
+        finally: _close_quiet(conn3)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         if not total_count and not exclu_n:   # 1.0.154 : paire vidée par IdxPurge -> ses exclus restent affichés
             printer(f"  {nick}: aucune entrée pour cette paire ({arch_old} → {arch_new})"); return
         top=sorted(stats.items(),key=lambda x:x[1]['total'],reverse=True)[:topn]
@@ -9428,6 +9508,7 @@ class BorgHelper:
                     u,ua,_=_psel_under(conn,b,self_too=True)
                 parts.append(u); args.extend(ua)
             return (' OR '.join(parts),args) if parts else ('0',[])
+        conn=None
         try:
             conn=_open_db(db_path,nick=nick,role='write',timeout=60)
             count=0; size=0
@@ -9534,6 +9615,7 @@ class BorgHelper:
             printer(f"  SQLite error ({db_path}): {e}")
             try: conn.close()
             except: pass
+        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
 
     def prep_report_from_db(self,nick,maxp=None):
         """Comme prep_report() mais lit uniquement l'index SQLite — utilisé quand le dépôt est occupé."""
@@ -18507,6 +18589,478 @@ fail()
             if bad: print(f"  {bad[:10]}")
             return not bad
         check("compatibilité Python 3.10-3.14 : SQL en ? seulement, aucun utcnow(), ensure_* qui ferment avant de sortir (garde AST, 1.0.182)",_py_compat_guard)
+        def _sqlite_close_scan(src,extra=(),tests=('codec_selftest','perf_bench','push_selftest')):
+            """1.0.203 (story 81, D161) : ouvertures SQLite de PRODUCTION dont la fermeture n'est pas prouvée sous une des formes usuelles ci-dessous ->
+            ([(fonction, ligne, motif)], nombre d'ouvertures analysées). Ouvreurs : _open_db (nom ou attribut),
+            sqlite3.connect, sqlite3.dbapi2.connect, sqlite3.Connection(…), BhConnection(…), et `extra` (fonctions qui rendent une
+            connexion, ex. _push_conn de borgHelperWWW). Hors contrôles : fonctions `tests` et _pb_* (PerfBench). Refusés (une
+            ouverture que la garde ne verrait plus) : toute référence à un ouvreur-fonction hors d'un appel (alias,
+            functools.partial), `from sqlite3 import connect/Connection/*`, import renommé d'un ouvreur, `import sqlite3 as X`,
+            getattr(sqlite3, …).
+            Fermeture prouvée pour `v=<ouverture>` (ou `v=<ouverture> if c else None`) :
+            (a) try englobant T — ouverture dans son corps, ses except ou son else (jamais son finally), aucune boucle entre
+                l'ouverture et T, `v=None` avant T dans son bloc (sinon le finally lèverait UnboundLocalError et masquerait
+                l'erreur réelle) ; la fermeture tolère v None : `_close_quiet(v)`, ou `v.close()` sous `if v is not None:`/`if v:` ;
+            (b) ou try T qui suit aussitôt l'ouverture (`if x: v=…`, dernière instruction d'un if sans else : le try qui suit le
+                if) ; ouverture conditionnelle (`if x:` ou `… if c else None`) : fermeture sous ce même test ou sous
+                `v is not None`/`if v:`, ou `_close_quiet(v)` si v vaut toujours None sans ouverture (expression conditionnelle,
+                ou `v=None` avant le if) ;
+            dans les deux cas, une seule écriture de v dans T (affectation, tuple, with … as, for, :=, +=,
+            except … as, import) hors `v=None` juste après sa fermeture, et la fermeture est la PREMIÈRE instruction du finally
+            de T (ou d'un finally imbriqué en tête), jamais dans une fonction imbriquée, jamais après une instruction qui peut
+            lever ; `for c in (…, v, …):` suivi de la fermeture de c (même règle de None). `with contextlib.closing(<ouverture>)` :
+            prouvé ; `with <ouverture>` seul NE ferme PAS (gestionnaire de transaction de sqlite3) : refusé, comme une connexion
+            rendue (return) ou passée telle quelle.
+            Limites connues (formes absentes du code de production, relevé AST de la story 81) : variable d'ancrage réaffectée entre l'ouverture et la fermeture ; `del`/`nonlocal`/`global`/`match` sur la variable ; écriture de la variable dans le finally avant sa fermeture ; `break` dans la boucle de fermeture ; alias de module (`S=sqlite3`) ; sous-classe de `sqlite3.Connection` autre que `BhConnection` appelée directement ; fonction imbriquée nommée `_pb_*` (exclue comme PerfBench) ; `yield` dans le try ; liste blanche comptée par NOM de fonction (une homonyme partagerait le compte)."""
+            import ast
+            t=ast.parse(src); par={}
+            for p in ast.walk(t):
+                for ch in ast.iter_child_nodes(p): par[ch]=p
+            def anc(n):
+                while n in par:
+                    n=par[n]; yield n
+            FN=('_open_db',)+tuple(extra)
+            def is_name(n,v): return isinstance(n,ast.Name) and n.id==v
+            def sq(n): return is_name(n,'sqlite3') or (isinstance(n,ast.Attribute) and n.attr=='dbapi2' and is_name(n.value,'sqlite3'))
+            def fn_ref(f):   # ouvreur-fonction (référence hors appel refusée)
+                if isinstance(f,ast.Name): return f.id in FN
+                return isinstance(f,ast.Attribute) and (f.attr in FN or (f.attr=='connect' and sq(f.value)))
+            def is_open(c):
+                if not isinstance(c,ast.Call): return False
+                f=c.func
+                return fn_ref(f) or is_name(f,'BhConnection') or (isinstance(f,ast.Attribute) and f.attr in ('Connection','BhConnection') and sq(f.value) or
+                                                                 (isinstance(f,ast.Attribute) and f.attr=='BhConnection'))
+            def none_test(tst,v):
+                return is_name(tst,v) or (isinstance(tst,ast.Compare) and is_name(tst.left,v) and len(tst.ops)==1 and isinstance(tst.ops[0],ast.IsNot)
+                        and isinstance(tst.comparators[0],ast.Constant) and tst.comparators[0].value is None)
+            def ctx(req=(),bare=False,quiet=False,none_ok=False,anchors=()):
+                """req : tests d'ancrage TOUS exigés sur la chaîne de if qui ferme (ouverture `if a: [if b:] v=…` sans v=None : v non
+                liée hors de ces tests) ; anchors : tests d'ancrage (tous présents = fermeture acceptée) ; bare : `v.close()` nu
+                accepté (v toujours une connexion) ; quiet : `_close_quiet(v)` nu accepté (v toujours liée, None possible) ;
+                none_ok : fermeture sous `v is not None`/`if v:` acceptée (v toujours liée)."""
+                return {'req':frozenset(req),'bare':bare,'quiet':quiet,'none_ok':none_ok,'anchors':frozenset(anchors)}
+            def closer(s,v,c,have=frozenset(),nn=False):
+                if isinstance(s,ast.Expr) and isinstance(s.value,ast.Call):
+                    f=s.value.func
+                    anch=bool(c['anchors']) and have>=c['anchors']
+                    if isinstance(f,ast.Attribute) and f.attr=='close' and is_name(f.value,v) and not s.value.args:
+                        return anch or (not c['req'] and (c['bare'] or nn))
+                    if isinstance(f,ast.Name) and f.id=='_close_quiet' and len(s.value.args)==1 and is_name(s.value.args[0],v):
+                        return anch or (not c['req'] and (c['quiet'] or c['bare'] or nn))
+                    return False
+                if isinstance(s,ast.If) and not s.orelse and s.body:
+                    d=ast.dump(s.test)
+                    if d in c['anchors']: return closer(s.body[0],v,c,have|{d},nn)
+                    if none_test(s.test,v) and c['none_ok']: return closer(s.body[0],v,c,have,True)
+                    return False
+                if isinstance(s,ast.Try) and s.body: return closer(s.body[0],v,c,have,nn)   # try: <fermeture> … (exécutée d'abord)
+                if (isinstance(s,ast.For) and isinstance(s.target,ast.Name) and isinstance(s.iter,(ast.Tuple,ast.List)) and s.body
+                        and any(is_name(e,v) for e in s.iter.elts)):
+                    if c['req'] and not have>=c['req']: return False   # v peut être non liée : le tuple lèverait NameError
+                    return closer(s.body[0],s.target.id,ctx(bare=c['bare'] or nn,quiet=True,none_ok=True))
+                return False
+            def fin_closes(fb,v,c):
+                if not fb: return False
+                if closer(fb[0],v,c): return True
+                return isinstance(fb[0],ast.Try) and fin_closes(fb[0].finalbody,v,c)
+            def block_of(st):
+                b=par.get(st)
+                for f in ('body','orelse','finalbody','handlers'):
+                    l=getattr(b,f,None)
+                    if isinstance(l,list) and any(x is st for x in l): return l
+                return None
+            def is_closer_stmt(s,v): return closer(s,v,ctx(bare=True,quiet=True,none_ok=True))
+            def stores(T,v):
+                """Écritures de v dans T hors finally (portées imbriquées exclues) ; `v=None` juste après sa fermeture : non comptée."""
+                n=0
+                def visit(ch):
+                    nonlocal n
+                    if isinstance(ch,(ast.FunctionDef,ast.AsyncFunctionDef,ast.Lambda,ast.ClassDef)): return
+                    if isinstance(ch,ast.Name) and ch.id==v and isinstance(ch.ctx,ast.Store):
+                        a=par.get(ch)
+                        if isinstance(a,ast.Assign) and isinstance(a.value,ast.Constant) and a.value.value is None:
+                            blk=block_of(a); i=next((k for k,s in enumerate(blk or []) if s is a),0)
+                            if blk and i>0 and is_closer_stmt(blk[i-1],v): return
+                        n+=1
+                    if isinstance(ch,ast.ExceptHandler) and ch.name==v: n+=1
+                    if isinstance(ch,ast.alias) and (ch.asname or ch.name)==v: n+=1
+                    for c in ast.iter_child_nodes(ch): visit(c)
+                for part in (T.body,T.handlers,T.orelse):
+                    for st in part: visit(st)
+                return n
+            def init_before(st,v):
+                blk=block_of(st)
+                if blk is None: return False
+                j=next((k for k,s in enumerate(blk) if s is st),0)
+                return any(isinstance(s,ast.Assign) and isinstance(s.value,ast.Constant) and s.value.value is None
+                           and any(is_name(g,v) for g in s.targets) for s in blk[:j])
+            def skipped(n):
+                return any(isinstance(a,(ast.FunctionDef,ast.AsyncFunctionDef)) and (a.name in tests or a.name.startswith('_pb_')) for a in anc(n))
+            def fname(n):
+                return next((a.name for a in anc(n) if isinstance(a,(ast.FunctionDef,ast.AsyncFunctionDef))),'<module>')
+            out=[]; seen=0
+            for n in ast.walk(t):
+                if skipped(n) and not isinstance(n,ast.Module): continue
+                if isinstance(n,ast.ImportFrom):
+                    for a in n.names:
+                        if (n.module in ('sqlite3','sqlite3.dbapi2') and a.name in ('connect','Connection','dbapi2','*')) or (a.name in FN+('BhConnection',) and a.asname and a.asname!=a.name):
+                            out.append((fname(n),n.lineno,f"ouvreur importé sous un autre nom ou hors de sqlite3. ({a.name})"))
+                if isinstance(n,ast.Import):
+                    for a in n.names:
+                        if a.name.split('.')[0]=='sqlite3' and a.asname: out.append((fname(n),n.lineno,f"import {a.name} as {a.asname} (ouvreur caché)"))
+                if isinstance(n,ast.Call) and is_name(n.func,'getattr') and n.args and sq(n.args[0]):
+                    out.append((fname(n),n.lineno,"getattr(sqlite3, …) (ouvreur caché)"))
+                if isinstance(n,(ast.Name,ast.Attribute)) and fn_ref(n):
+                    p=par.get(n)
+                    if not (isinstance(p,ast.Call) and p.func is n):
+                        out.append((fname(n),n.lineno,"référence à un ouvreur hors d'un appel (alias)"))
+                if not is_open(n): continue
+                seen+=1; p=par[n]; why=None; v=None; cond=None
+                if isinstance(p,ast.withitem): why="with <ouverture> sans contextlib.closing (ne ferme pas)"
+                elif isinstance(p,ast.Call) and isinstance(par.get(p),ast.withitem):
+                    f=p.func
+                    if not (isinstance(f,ast.Attribute) and f.attr=='closing' and is_name(f.value,'contextlib')): why="with <appel> autre que contextlib.closing"
+                else:
+                    if isinstance(p,ast.IfExp) and p.body is n and isinstance(par.get(p),ast.Assign): p=par[p]; cond='ifexp'
+                    if isinstance(p,ast.Assign) and len(p.targets)==1 and isinstance(p.targets[0],ast.Name): v=p.targets[0].id
+                    else: why="ouverture hors d'une affectation simple (rendue, passée, jetée)"
+                if v is not None:
+                    st=p; guards=set()
+                    while isinstance(par.get(st),ast.If) and par[st].body[-1] is st and not par[st].orelse:
+                        st=par[st]; guards.add(ast.dump(st.test)); cond='if'
+                    blk=block_of(st)
+                    i=next((k for k,s in enumerate(blk) if s is st),None) if blk is not None else None
+                    T=blk[i+1] if i is not None and i+1<len(blk) and isinstance(blk[i+1],ast.Try) else None
+                    always=cond in (None,'ifexp') or init_before(st,v)   # v liée quel que soit le chemin jusqu'au try
+                    cb=ctx(req=() if always else guards,bare=cond is None,quiet=always,none_ok=always,anchors=guards)
+                    if T is not None and fin_closes(T.finalbody,v,cb):   # (b)
+                        k=stores(T,v)
+                        if k: why=f"{k} écriture(s) de {v} dans le try qui la ferme (écrasée sans fermeture)"
+                    else:
+                        why="aucun try/finally qui la ferme en premier"; child=p; loop=False
+                        for a in anc(p):
+                            if isinstance(a,(ast.FunctionDef,ast.AsyncFunctionDef,ast.Lambda)): break
+                            if isinstance(a,(ast.For,ast.While,ast.AsyncFor)): loop=True
+                            if isinstance(a,ast.Try) and fin_closes(a.finalbody,v,ctx(quiet=True,none_ok=True,anchors=guards)):
+                                if any(x is child for x in a.finalbody): why="ouverture dans le finally qui la ferme"; break
+                                k=stores(a,v)
+                                if loop: why="ouverture dans une boucle à l'intérieur du try qui la ferme"
+                                elif k!=1: why=f"{k} écritures de {v} dans le try qui la ferme (écrasée sans fermeture)"
+                                elif not init_before(a,v): why=f"pas de {v}=None avant le try (le finally lèverait UnboundLocalError)"
+                                else: why=None
+                                break
+                            if isinstance(a,ast.Try) and fin_closes(a.finalbody,v,ctx(bare=True,quiet=True,none_ok=True)):
+                                why=f"v.close() nu dans le finally d'un try englobant : lève si l'ouverture a échoué (_close_quiet({v}) ou sous `if {v} is not None:`)"; break
+                            child=a
+                if why: out.append((fname(n),n.lineno,why))
+            return out,seen
+        _SCG_WL={'borgHelper':{'_open_db':5,'ensure_cache_db':1,'ensure_diff_db':1,'ensure_history_db':1,'_audit_witness':1},
+                 'borgHelperWWW':{'_push_conn':1}}
+        _SCG_SEEN={'borgHelper':113,'borgHelperWWW':18}   # nombre EXACT d'ouvertures analysées (1.0.203 / 1.31.17)
+        def _sqlite_close_file(nm,f,extra):
+            """Partie fichier de la garde : sites non prouvés hors liste blanche, liste blanche au nombre exact par fonction,
+            nombre exact d'ouvertures analysées (ouverture ajoutée ou retirée, ouvreur devenu invisible : liste à revoir)."""
+            got,seen=_sqlite_close_scan(open(f).read(),extra); cnt={}; bad=[]
+            for fn,l,why in got: cnt[fn]=cnt.get(fn,0)+1
+            for fn,l,why in got:
+                if fn not in _SCG_WL[nm]: bad.append(f"{nm}:{l} ({fn}) {why}")
+            for fn,k in _SCG_WL[nm].items():
+                if cnt.get(fn,0)!=k: bad.append(f"{nm} liste blanche {fn} : {cnt.get(fn,0)} ouverture(s) non prouvée(s), {k} attendue(s) — à revoir")
+            if seen!=_SCG_SEEN[nm]: bad.append(f"{nm} : {seen} ouvertures analysées, {_SCG_SEEN[nm]} attendues — compte à revoir (ouverture ajoutée/retirée, ouvreur invisible)")
+            return bad
+        def _sqlite_close_guard():
+            """1.0.203 (story 81, D161) — garde AST (_sqlite_close_scan) sur la production de borgHelper. Liste blanche NOMMÉE,
+            nombre exact d'ouvertures non prouvées par fonction : _open_db (4 sqlite3.connect + la reprise rendue : connexion
+            rendue à l'appelant, refermée par son `except BaseException`), ensure_cache_db / ensure_diff_db (`except
+            BaseException` + _close_quiet(conn) puis relance, sorties d'erreur gardées par _py_compat_guard (3)),
+            ensure_history_db (ouverture dernière instruction de son try, suivie du try/finally qui ferme ; ses except sortent),
+            _audit_witness (ouverture vouée à l'échec : parent inexistant). Témoins : une source par règle, signalée avec
+            fonction et ligne ; formes garanties non signalées."""
+            bad=_sqlite_close_file('borgHelper',os.path.abspath(__file__),())
+            neg={"linéaire":("def a(p):\n    c=_open_db(p)\n    c.execute('x')\n    c.close()\n",[('a',2)]),
+                 "with sans closing":("def b(p):\n    with sqlite3.connect(p) as c: c.execute('x')\n",[('b',2)]),
+                 "with _push_conn (extra)":("def b3():\n    with _push_conn('read') as c: c.execute('x')\n",[('b3',2)]),
+                 "closing non contextlib":("from foo import closing\ndef b2(p):\n    with closing(_open_db(p)) as c: c.execute('x')\n",[('b2',3)]),
+                 "finally tardif":("def c(p):\n    k=_open_db(p)\n    x=k.execute('x')\n    try: pass\n    finally: k.close()\n",[('c',2)]),
+                 "conditionnelle sans finally":("def d(p,o):\n    k=_open_db(p) if o else None\n    k.close()\n",[('d',2)]),
+                 "rendue":("def e(p):\n    return _open_db(p)\n",[('e',2)]),
+                 "sans v=None":("def g(p):\n    try:\n        k=_open_db(p)\n    finally: _close_quiet(k)\n",[('g',3)]),
+                 "v.close() nu après v=None":("def g2(p):\n    k=None\n    try:\n        k=_open_db(p)\n    finally: k.close()\n",[('g2',4)]),
+                 "fermeture pas en tête":("def h(p):\n    k=None\n    try:\n        k=_open_db(p)\n    finally:\n        k.execute('x')\n        _close_quiet(k)\n",[('h',4)]),
+                 "fermeture dans une lambda":("def i(p):\n    k=None\n    try:\n        k=_open_db(p)\n    finally: (lambda: _close_quiet(k))()\n",[('i',4)]),
+                 "fermeture sous un autre test":("def i2(p,f):\n    k=None\n    try:\n        k=_open_db(p)\n    finally:\n        if f: k.close()\n",[('i2',4)]),
+                 "ouverture dans le finally":("def j(p):\n    k=None\n    try: pass\n    finally:\n        _close_quiet(k)\n        k=_open_db(p)\n",[('j',6)]),
+                 "boucle dans le try":("def l(ps):\n    k=None\n    try:\n        for p in ps:\n            k=_open_db(p)\n    finally: _close_quiet(k)\n",[('l',5)]),
+                 "deux affectations":("def m(p):\n    k=None\n    try:\n        k=_open_db(p)\n        k=_open_db(p)\n    finally: _close_quiet(k)\n",[('m',4),('m',5)]),
+                 "écritures : tuple, with as, for, :=, +=, except as":(
+                     "def w1(p):\n    k=None\n    try:\n        k=_open_db(p)\n        k,y=1,2\n    finally: _close_quiet(k)\n"
+                     "def w2(p):\n    k=None\n    try:\n        k=_open_db(p)\n        with open(p) as k: pass\n    finally: _close_quiet(k)\n"
+                     "def w3(p):\n    k=None\n    try:\n        k=_open_db(p)\n        for k in (): pass\n    finally: _close_quiet(k)\n"
+                     "def w4(p):\n    k=None\n    try:\n        k=_open_db(p)\n        (k:=1)\n    finally: _close_quiet(k)\n"
+                     "def w5(p):\n    k=None\n    try:\n        k=_open_db(p)\n        k+=1\n    finally: _close_quiet(k)\n"
+                     "def w6(p):\n    k=None\n    try:\n        k=_open_db(p)\n    except OSError as k: pass\n    finally: _close_quiet(k)\n"
+                     "def w7(p):\n    m=sqlite3.connect(p)\n    try: m=1\n    finally: m.close()\n",
+                     [('w1',4),('w2',10),('w3',16),('w4',22),('w5',28),('w6',34),('w7',38)]),
+                 "(b) ouverture conditionnelle, fermeture nue":(
+                     "def x1(p,own):\n    if own: r=_open_db(p)\n    try: pass\n    finally: r.close()\n"
+                     "def x2(p,own):\n    s=_open_db(p) if own else None\n    try: pass\n    finally: s.close()\n"
+                     "def x3(p,own):\n    if own: r=_open_db(p)\n    try: pass\n    finally: _close_quiet(r)\n",[('x1',2),('x2',6),('x3',10)]),
+                 "(b) ancrage sans v=None, fermeture sous is not None / if v":(
+                     "def y1(p,own):\n    if own: r=_open_db(p)\n    try: pass\n    finally:\n        if r is not None: r.close()\n"
+                     "def y2(p,own):\n    if own: r=_open_db(p)\n    try: pass\n    finally:\n        if r: _close_quiet(r)\n",[('y1',2),('y2',7)]),
+                 "(b) conditions imbriquées, une seule reprise":(
+                     "def z1(p,a,b):\n    if a:\n        if b: r=_open_db(p)\n    try: pass\n    finally:\n        if a: r.close()\n"
+                     "def z2(p,a,b):\n    if a:\n        if b: r=_open_db(p)\n    try: pass\n    finally:\n        if b: r.close()\n",[('z1',3),('z2',9)]),
+                 "autres ouvreurs":("def o1(p):\n    c=sqlite3.Connection(p)\n    c.close()\n"
+                                    "def o2(p):\n    c=sqlite3.dbapi2.connect(p)\n    c.close()\n"
+                                    "def o3(p):\n    c=BhConnection(p)\n    c.close()\n",[('o1',2),('o2',5),('o3',8)]),
+                 "alias":("import functools\nfrom sqlite3 import connect\nfrom borgHelper import _open_db as op\nx=_open_db\n"
+                          "def q(): return functools.partial(sqlite3.connect,'p')\nimport sqlite3 as S\nf=getattr(sqlite3,'connect')\n"
+                          "from sqlite3 import Connection\n",
+                          [('<module>',2),('<module>',3),('<module>',4),('q',5),('<module>',6),('<module>',7),('<module>',8)]),
+                 "ouvreur ajouté (extra)":("def r():\n    c=_push_conn('read')\n    c.close()\n",[('r',2)]),
+                 "garanties":("import contextlib\ndef f(p,own):\n    k=None\n    try:\n        k=_open_db(p)\n    finally: _close_quiet(k)\n"
+                              "    m=sqlite3.connect(p)\n    try: m.execute('x')\n    finally: m.close()\n"
+                              "    with contextlib.closing(sqlite3.connect(p)) as q: q.execute('x')\n"
+                              "    if own: r=_open_db(p)\n    try: pass\n    finally:\n        if own: r.close()\n"
+                              "    s=_open_db(p) if own else None\n    try: pass\n    finally:\n        if s is not None: s.close()\n"
+                              "    s2=_open_db(p) if own else None\n    try: pass\n    finally: _close_quiet(s2)\n"
+                              "    r2=None\n    if own: r2=_open_db(p)\n    try: pass\n    finally: _close_quiet(r2)\n"
+                              "    a=b=None\n    try:\n        a=_open_db(p)\n        b=_open_db(p)\n    finally:\n"
+                              "        try: a.execute('PRAGMA x')\n        finally:\n            for c in (a,b):\n"
+                              "                if c is not None:\n                    try: c.close()\n                    except sqlite3.Error: pass\n"
+                              "def p1(p):\n    k=None\n    try: pass\n    except OSError:\n        k=_open_db(p)\n    finally: _close_quiet(k)\n"
+                              "def p2(p):\n    k=None\n    try: pass\n    except OSError: pass\n    else:\n        k=_open_db(p)\n    finally:\n        if k: k.close()\n"
+                              "def p3(p,f):\n    k=None\n    try:\n        k=_open_db(p)\n        if f:\n            k.close(); k=None\n    finally: _close_quiet(k)\n"
+                              "def z3(p,a,b):\n    if a:\n        if b: r=_open_db(p)\n    try: pass\n    finally:\n        if b:\n            if a: r.close()\n"
+                              "def codec_selftest():\n    c=_open_db('x')\ndef push_selftest():\n    c=_open_db('x')\ndef _pb_x():\n    c=_open_db('x')\n",[])}
+            for k,(src,want) in neg.items():
+                g=sorted((fn,l) for fn,l,_ in _sqlite_close_scan(src,('_push_conn',) if 'extra' in k else ())[0])
+                if g!=sorted(want): bad.append(f"témoin {k} : {g} (attendu {sorted(want)})")
+            if bad: print(f"  {bad[:12]}")
+            return not bad
+        check("connexions SQLite de production de borgHelper : fermeture prouvée sous les formes usuelles, liste blanche nommée, témoins (garde AST, 1.0.203)",_sqlite_close_guard)
+        _www_src=os.path.join(os.path.dirname(os.path.abspath(__file__)),'borgHelperWWW')
+        def _sqlite_close_guard_www():
+            """1.0.203 / WWW 1.31.17 (story 81) — même garde sur la production de borgHelperWWW (push_selftest exclu, _push_conn
+            compté comme ouvreur ; liste blanche : _push_conn, connexion rendue)."""
+            bad=_sqlite_close_file('borgHelperWWW',_www_src,('_push_conn',))
+            if bad: print(f"  {bad[:12]}")
+            return not bad
+        _SCG_WWW="connexions SQLite de production de borgHelperWWW : fermeture prouvée sous les formes usuelles, liste blanche nommée (garde AST, 1.0.203)"
+        if os.path.isfile(_www_src): check(_SCG_WWW,_sqlite_close_guard_www)
+        else: skip(_SCG_WWW,"borgHelperWWW absent à côté de borgHelper")
+        def _fds81(p):
+            """Descripteurs du processus ouverts sur la base p (base, -wal, -shm) — /proc/self/fd."""
+            n=0; p=os.path.realpath(p)
+            for f in os.listdir('/proc/self/fd'):
+                try:
+                    if os.path.realpath(f'/proc/self/fd/{f}') in (p,p+'-wal',p+'-shm'): n+=1
+                except OSError: pass
+            return n
+        def _abandoned_conn_closed():
+            """1.0.203 (story 81, D161) — par comportement, une famille à la fois, sur des sites RÉELS : exception injectée entre
+            l'ouverture et la fermeture — BaseException privée (jamais avalée par les `except sqlite3.Error`), KeyboardInterrupt,
+            SystemExit(code propre au contrôle) — sur la connexion ouverte par la fonction visée (cadre appelant : jamais celles
+            des ensure_* ni des sondes) ; la connexion porte un cycle (c._cyc=c) : non fermée, elle ne serait libérée qu'au
+            ramasse-miettes, sous toute version de Python (comme une BhConnection abandonnée sous 3.11+, mesure 81b) ;
+            ramasse-miettes automatique coupé. Chaque cas exige UNE injection et l'exception injectée (type, code de SystemExit)
+            au retour, puis aucun descripteur de la base ouvert (base, -wal, -shm). Écrivains (clear_cache_nick sous
+            BaseException et SystemExit, purge_stale_cache) : le DELETE est EXÉCUTÉ puis l'exception levée (transaction ouverte)
+            -> autre écrivain (BEGIN IMMEDIATE, délai 0) libre et rien validé (2 lignes), lus AVANT le ramasse-miettes par une
+            connexion à part. Familles : écrivains ; lecteurs (get_repo_stats, _is_index_empty, get_cache_rows,
+            diff_pair_has_sizes) ; lecture multi-nicks par _PerNick (Search zr,zb, Ctrl-C) ; site qui finit en sys.exit
+            (ListFiles, SystemExit) ; sortie anticipée de _db_migrate (DbDecrypt -D d'une base en clair : Ctrl-C au message « déjà
+            en clair », entre la lecture d'en-tête et la fermeture de ce chemin) ; sqlite3.connect nu (sonde de DbStatus,
+            SystemExit) ; la connexion de _db_migrate porte aussi le cycle. Plus : arrêt d'un nick APRÈS l'ouverture du site
+            (Search zb,zr : DbKeyError, arrêt de nick pour _PerNick, au premier execute de la connexion de Search pour zb) — fermée
+            par le site avant _PerNick.__exit__ (sa fermeture de secours), zb arrêté, zr servi dans le même processus, aucune
+            connexion de zb ouverte quand zr ouvre la sienne."""
+            import gc
+            class _Boom(BaseException): pass
+            d,b=_nb_env('s81close'); cp=b.db.get_cache_db('zr'); dp=b.db.get_diff_db('zr'); hp=b.db.get_history_db('zr'); res={}
+            zbp=b.db.get_diff_db('zb')
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                b.db.ensure_cache_db(cp,nick='zr'); b.db.ensure_diff_db(dp,nick='zr'); b.db.ensure_history_db(hp)
+                b.db.ensure_diff_db(zbp,nick='zb')   # chiffrée (DB_ENCRYPT par défaut, passphrase pw)
+            c=sqlite3.connect(dp)
+            try:
+                c.execute("INSERT INTO diff_index (nick,archive_old,archive_new,archive_new_date,change_type,path,size_after) "
+                          "VALUES ('zr','a1','a2','2026-01-01T00:00:00','added','/x',1)"); c.commit()
+            finally: c.close()
+            c=_open_db(zbp,nick='zb',role='write')
+            try:
+                c.execute("INSERT INTO diff_index (nick,archive_old,archive_new,archive_new_date,change_type,path,size_after) "
+                          "VALUES (?,?,?,?,?,?,?)",('zb','a1','a2','2026-01-01T00:00:00','added',_path_stored(c,'/x'),1)); c.commit()
+            finally: c.close()
+            def seed():
+                c=sqlite3.connect(cp)
+                try:
+                    c.execute("DELETE FROM cachejsonboexlm")
+                    c.executemany("INSERT INTO cachejsonboexlm (nom,lastmodified,details) VALUES (?,?,?)",[('zr','lm1','[]'),('zr:prune','lm1','[]')])
+                    c.commit()
+                finally: c.close()
+            def free(p):
+                w=sqlite3.connect(p,timeout=0,isolation_level=None)
+                try: w.execute("BEGIN IMMEDIATE"); w.execute("ROLLBACK"); return True
+                except sqlite3.OperationalError: return False
+                finally: w.close()
+            class _Cy(sqlite3.Connection): pass   # sqlite3.connect nu : attributs posables (cycle, execute piégé)
+            g=globals(); real=g['_open_db']; real_connect=sqlite3.connect; real_printer=g['printer']; hits=[0]
+            def arm(c,how,exc):
+                c._cyc=c; ex=type(c).execute
+                def boom(*x,**y):
+                    if how=='after': ex(c,*x,**y)   # instruction appliquée dans la transaction ouverte, PUIS l'exception
+                    hits[0]+=1; raise exc()
+                c.execute=boom
+                return c
+            def armed(target,how,exc,raw=False):
+                def w(*a,**k):
+                    caller=sys._getframe(1).f_code.co_name
+                    if raw:
+                        if caller!=target: return real_connect(*a,**k)
+                        return arm(real_connect(*a,factory=_Cy,**k),how,exc)
+                    c=real(*a,**k)
+                    return arm(c,how,exc) if caller==target else c
+                return w
+            def printer_armed(target,needle,exc):
+                def w(*a,**k):
+                    if sys._getframe(1).f_code.co_name==target and needle in ' '.join(map(str,a)):
+                        hits[0]+=1; raise exc()
+                    return real_printer(*a,**k)
+                return w
+            def cyc_only(target):   # connexion de la cible dans un cycle, sans piège (l'exception vient d'ailleurs)
+                def w(*a,**k):
+                    c=real(*a,**k)
+                    if sys._getframe(1).f_code.co_name==target: c._cyc=c
+                    return c
+                return w
+            def install(kind,target,how,exc):
+                if kind=='raw': sqlite3.connect=armed(target,how,exc,raw=True)
+                elif kind=='printer': g['printer']=printer_armed(target,how,exc); g['_open_db']=cyc_only(target)
+                else: g['_open_db']=armed(target,how,exc)
+            def restore(): g['_open_db']=real; sqlite3.connect=real_connect; g['printer']=real_printer
+            def sig(e): return (type(e).__name__,e.code if isinstance(e,SystemExit) else None)
+            Q="SELECT COUNT(*) FROM cachejsonboexlm"
+            cases=(('écrivain clear_cache_nick',cp,'db','clear_cache_nick','after',_Boom,lambda: b.db.clear_cache_nick('zr',db_path=cp),True),
+                   ('écrivain clear_cache_nick (SystemExit)',cp,'db','clear_cache_nick','after',lambda: SystemExit(41),lambda: b.db.clear_cache_nick('zr',db_path=cp),True),
+                   ('écrivain purge_stale_cache',cp,'db','purge_stale_cache','after',_Boom,lambda: b.db.purge_stale_cache('zr','lm2',db_path=cp),True),
+                   ('lecteur get_repo_stats',hp,'db','get_repo_stats','before',_Boom,lambda: b.db.get_repo_stats('zr',db_path=hp),False),
+                   ('lecteur _is_index_empty',dp,'db','_is_index_empty','before',_Boom,lambda: b.db._is_index_empty('zr',dp),False),
+                   ('lecteur get_cache_rows',cp,'db','get_cache_rows','before',_Boom,lambda: b.db.get_cache_rows('zr'),False),
+                   ('lecteur diff_pair_has_sizes',dp,'db','diff_pair_has_sizes','before',_Boom,lambda: b.db.diff_pair_has_sizes('zr','a1','a2',db_path=dp),False),
+                   ('multi-nicks Search zr,zb (Ctrl-C)',dp,'db','search','before',KeyboardInterrupt,lambda: b.search('zr,zb','x'),False),
+                   ('sys.exit : ListFiles (SystemExit)',dp,'db','list_files','before',lambda: SystemExit(42),lambda: b.list_files('zr',None),False),
+                   ('sortie anticipée « déjà en clair » de _db_migrate (Ctrl-C)',dp,'printer','_db_migrate','déjà en clair',KeyboardInterrupt,lambda: b.db_decrypt('zr',dryrun=True),False),
+                   ('sqlite3.connect nu : DbStatus (SystemExit)',cp,'raw','db_status','before',lambda: SystemExit(43),lambda: b.db_status('zr'),False))
+            was=gc.isenabled(); rf=_READER_FAILED[0]; gc.collect(); gc.disable()
+            try:
+                for nm,p,kind,target,how,exc,fn,writer in cases:
+                    try:
+                        seed(); got=None; hits[0]=0
+                        install(kind,target,how,exc)
+                        try:
+                            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): fn()
+                        except (_Boom,KeyboardInterrupt,SystemExit) as e: got=sig(e)
+                        finally: restore()
+                        r={'injections':hits[0],'levée':got,'fds':_fds81(p)}
+                        if writer: r['autre écrivain libre']=free(p); r['lignes (avant gc)']=_q(cp,Q,one=True)[0]
+                        gc.collect()   # cas indépendants : une connexion laissée par ce cas libérée avant le suivant
+                        want={'injections':1,'levée':sig(exc()),'fds':0}
+                        if writer: want.update({'autre écrivain libre':True,'lignes (avant gc)':2})
+                        res[nm]=(r==want,r)
+                    except Exception as e: res[nm]=(False,f"{type(e).__name__}: {e}"); restore(); gc.collect()
+                # arrêt d'un nick APRÈS l'ouverture de Search : DbKeyError (classe réelle, arrêt de nick pour _PerNick) levée au premier
+                # execute de la connexion de Search pour zb -> seule la fermeture du site (finally) la ferme avant _PerNick.__exit__
+                # (dont la fermeture de secours viendrait sinon) ; zr servi ensuite, dans le même processus
+                PN=g['_PerNick']; real_exit=PN.__exit__; at_exit=[]; at_zr=[]; hits[0]=0
+                def ex_spy(self,et,e,tb):
+                    if self.n=='zb' and not at_exit: at_exit.append(_fds81(zbp))
+                    return real_exit(self,et,e,tb)
+                def w(*a,**k):
+                    c=real(*a,**k)
+                    if sys._getframe(1).f_code.co_name=='search':
+                        if k.get('nick')=='zr' and not at_zr: at_zr.append(_fds81(zbp))
+                        if k.get('nick')=='zb':
+                            c._cyc=c
+                            def boom(*x,**y): hits[0]+=1; raise DbKeyError('zb: arrêt injecté (contrôle)')
+                            c.execute=boom
+                    return c
+                g['_open_db']=w; PN.__exit__=ex_spy; out=io.StringIO()
+                try:
+                    with contextlib.redirect_stdout(out),contextlib.redirect_stderr(out): b.search('zb,zr','x',as_json=True)
+                finally: restore(); PN.__exit__=real_exit
+                o=out.getvalue()
+                r={'injections':hits[0],'zb arrêté':'arrêt injecté' in o,'zr servi':'"/x"' in o,'fds de zb à l\'entrée de _PerNick.__exit__':at_exit,
+                   'fds de zb quand zr ouvre':at_zr,'fds de zb au retour':_fds81(zbp)}
+                res['arrêt de zb après ouverture (DbKeyError), zr ensuite']=(r=={'injections':1,'zb arrêté':True,'zr servi':True,
+                    'fds de zb à l\'entrée de _PerNick.__exit__':[0],'fds de zb quand zr ouvre':[0],'fds de zb au retour':0},r)
+            finally:
+                restore(); _READER_FAILED[0]=rf; gc.collect()
+                if was: gc.enable()
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        _ABN="connexion abandonnée sur une exception (BaseException, Ctrl-C, SystemExit ; écrivains, lecteurs, multi-nicks, sys.exit, sortie anticipée, sqlite3.connect nu ; arrêt d'un nick après ouverture) : verrou relâché, rien validé, descripteurs fermés au retour (comportement, 1.0.203)"
+        if os.path.isdir('/proc/self/fd'): check(_ABN,_abandoned_conn_closed)
+        else: skip(_ABN,"/proc/self/fd absent : descripteurs non mesurables")
+        def _swap_interrupted():
+            """1.0.203 (story 81, revue) — _swap_db interrompu (KeyboardInterrupt) PENDANT le checkpoint WAL de fin de copie :
+            les deux connexions (src, dst : cycle forcé, ramasse-miettes coupé) sont fermées et `new` est retirée selon la même
+            règle qu'au retour normal — keep_new=False copie validée : retirée ; keep_new=True copie validée : retirée (sinon un
+            fantôme déjà basculé serait rebasculé) ; keep_new=True copie annulée (abort) : gardée pour une nouvelle tentative.
+            Et Ctrl-C à la fin de src.close() : dst fermée quand même et `new` retirée (chaque fermeture dans son finally).
+            Une injection exactement par cas."""
+            import gc
+            base=os.path.join(tmp,'swap81'); os.makedirs(base)
+            g=globals(); real=g['_open_db']; hits=[0]; res={}
+            where=['checkpoint']
+            def w(*a,**k):
+                c=real(*a,**k)
+                if sys._getframe(1).f_code.co_name!='_swap_db': return c
+                c._cyc=c
+                if k.get('timeout')==1 and where[0]=='checkpoint':   # dst : le checkpoint (PRAGMA wal_checkpoint) est interrompu
+                    ex=type(c).execute
+                    def ex2(sql,*x,**y):
+                        if 'wal_checkpoint' in sql: hits[0]+=1; raise KeyboardInterrupt()
+                        return ex(c,sql,*x,**y)
+                    c.execute=ex2
+                if k.get('timeout') is None and where[0]=='src.close':   # src : Ctrl-C à la fin de sa fermeture (src fermée)
+                    cl=type(c).close
+                    def cl2():
+                        cl(c); hits[0]+=1; raise KeyboardInterrupt()
+                    c.close=cl2
+                return c
+            was=gc.isenabled(); gc.collect(); gc.disable()
+            try:
+                for nm,keep,abort,want_res,gone in (('keep_new=False, copie validée',False,None,'ok',True),
+                                                    ('keep_new=True, copie validée',True,None,'ok',True),
+                                                    ('keep_new=True, copie annulée (abort)',True,(lambda: True),'abort',False),
+                                                    ('Ctrl-C pendant src.close(), keep_new=True, copie validée',True,None,'ok',True)):
+                    where[0]='src.close' if 'src.close' in nm else 'checkpoint'
+                    live=os.path.join(base,re.sub(r'[^\w=-]','_',nm)+'-live.db'); new=live[:-8]+'-new.db'
+                    for pth,n in ((live,1),(new,300)):
+                        c=sqlite3.connect(pth)
+                        try:
+                            c.execute("PRAGMA journal_mode=WAL"); c.execute("CREATE TABLE t(x)")
+                            c.executemany("INSERT INTO t VALUES (?)",[('x'*200,)]*n); c.commit()
+                        finally: c.close()
+                    hits[0]=0; got=None; g['_open_db']=w
+                    try: _swap_db(live,new,abort=abort,keep_new=keep,pages=1)
+                    except KeyboardInterrupt: got='KeyboardInterrupt'
+                    finally: g['_open_db']=real
+                    r={'injections':hits[0],'levée':got,'fds live':_fds81(live),'fds new':_fds81(new),'new retirée':not os.path.exists(new)}
+                    gc.collect()
+                    res[nm]=(r=={'injections':1,'levée':'KeyboardInterrupt','fds live':0,'fds new':0,'new retirée':gone},r)
+            finally:
+                g['_open_db']=real; gc.collect()
+                if was: gc.enable()
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        _SWI="_swap_db interrompu pendant le checkpoint WAL ou la fermeture de src : connexions fermées, new retirée selon keep_new/résultat (comportement, 1.0.203)"
+        if os.path.isdir('/proc/self/fd'): check(_SWI,_swap_interrupted)
+        else: skip(_SWI,"/proc/self/fd absent : descripteurs non mesurables")
         def _index_last_exit_code():
             """1.0.177 (story 40, A84) : index_last.code = code de sortie du processus — DbKeyError 2 (gestionnaire global),
             sys.exit(-9) 247 (_exit_code), sys.exit(None) 0, sys.exit(texte) 1, exception imprévue 1, code rendu tel quel."""

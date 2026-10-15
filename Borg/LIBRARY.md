@@ -87,6 +87,10 @@ borg diff échoué ») ; ailleurs elle se propage à l'appelant.
 ```python
 from borgHelper import _open_db, DbKeyError
 conn = _open_db(db_path, nick='mon-serveur', role='read')   # BhConnection ; .codec est None si la base est plain (ou mode 'empty', voir plus bas)
+try:
+    ...   # requêtes
+finally:
+    conn.close()   # la connexion appartient à l'appelant (voir « Fermeture des connexions »)
 ```
 
 `_open_db(db_path, nick=None, role='read', passphrase=None, empty_ok=False, create_file=None, **kw)` est le seul point d'ouverture SQLite
@@ -383,17 +387,27 @@ for archive, s in sorted(stats.items()):
 indexed = bh.db.is_diff_pair_indexed('mon-serveur', 'archive-old', 'archive-new')
 print('Indexé :', indexed)
 
-# Requête SQL directe
-conn = sqlite3.connect(db_path)
-rows = conn.execute(
-    "SELECT path, COUNT(*) as nb FROM diff_index WHERE nick=? AND change_type='added' "
-    "GROUP BY path ORDER BY nb DESC LIMIT 10",
-    ('mon-serveur',)
-).fetchall()
+# Requête SQL directe — connexion fermée aussi en cas d'erreur (voir ci-dessous)
+import contextlib
+with contextlib.closing(sqlite3.connect(db_path)) as conn:
+    rows = conn.execute(
+        "SELECT path, COUNT(*) as nb FROM diff_index WHERE nick=? AND change_type='added' "
+        "GROUP BY path ORDER BY nb DESC LIMIT 10",
+        ('mon-serveur',)
+    ).fetchall()
 for path, nb in rows:
     print(nb, path)
-conn.close()
 ```
+
+**Fermeture des connexions (1.0.203)** : toute connexion obtenue par `_open_db()` (ou `sqlite3.connect`) appartient à
+l'appelant, qui doit la fermer sur TOUT chemin — `try: … finally: conn.close()` ou `with contextlib.closing(…)`. Jamais
+`with conn:` seul : le gestionnaire de `sqlite3.Connection` valide ou annule la transaction mais ne ferme pas la connexion.
+Sous Python 3.11+, une connexion abandonnée sur une exception n'est fermée qu'au passage du ramasse-miettes : une
+connexion d'écriture garde son verrou (« database is locked » pour tout autre écrivain, borgHelper compris) et ses
+descripteurs (`-wal`, `-shm`) jusque-là — critique dans un processus long (serveur, watcher). Les méthodes de
+`BorgHelper`/`BorgHelperDB` ferment leurs propres connexions sur leurs chemins d'erreur depuis 1.0.203 (Ctrl-C et `SystemExit`
+compris, hors deux fenêtres inhérentes à Python : entre le retour de `sqlite3.connect` dans `_open_db` et l'entrée dans son `try` (`conn.role=…`), et entre le retour de l'ouvreur et l'affectation à la variable du site — un Ctrl-C (ou un signal) qui tombe exactement là laisse la connexion au ramasse-miettes) ; une transaction en cours au moment de l'erreur est annulée. Les mêmes fenêtres existent dans le code
+appelant : `conn = _open_db(…)` puis `try:` aussitôt.
 
 ### Consulter le statut des sauvegardes (`bkp_status`, Story 1 spec-notifications-push)
 
@@ -549,36 +563,34 @@ bh = BorgHelper()
 
 # Stats exclus du diff (par paire d'archives)
 db_path = bh.db.get_diff_db('mon-serveur')
-conn = sqlite3.connect(db_path)
+import contextlib
+with contextlib.closing(sqlite3.connect(db_path)) as conn:   # fermée aussi en cas d'erreur
+    # Vue d'ensemble : total exclus par change_type sur toutes les paires
+    rows = conn.execute(
+        "SELECT change_type, SUM(file_count) as nb, SUM(total_size) as sz "
+        "FROM diff_excluded_stats WHERE nick=? GROUP BY change_type",
+        ('mon-serveur',)
+    ).fetchall()
+    for ct, nb, sz in rows:
+        from borgHelper import convert_octets_readable
+        print(f"  exclus {ct}: {nb} fichiers, {convert_octets_readable(sz or 0)}")
 
-# Vue d'ensemble : total exclus par change_type sur toutes les paires
-rows = conn.execute(
-    "SELECT change_type, SUM(file_count) as nb, SUM(total_size) as sz "
-    "FROM diff_excluded_stats WHERE nick=? GROUP BY change_type",
-    ('mon-serveur',)
-).fetchall()
-for ct, nb, sz in rows:
-    from borgHelper import convert_octets_readable
-    print(f"  exclus {ct}: {nb} fichiers, {convert_octets_readable(sz or 0)}")
+    # Détail par archive
+    rows = conn.execute(
+        "SELECT archive_new, change_type, file_count, total_size "
+        "FROM diff_excluded_stats WHERE nick=? ORDER BY archive_new, change_type",
+        ('mon-serveur',)
+    ).fetchall()
 
-# Détail par archive
-rows = conn.execute(
-    "SELECT archive_new, change_type, file_count, total_size "
-    "FROM diff_excluded_stats WHERE nick=? ORDER BY archive_new, change_type",
-    ('mon-serveur',)
-).fetchall()
-
-# Stats exclus du snapshot (dernière archive)
-row = conn.execute(
-    "SELECT archive, file_count, total_size FROM snap_excluded_stats WHERE nick=? "
-    "ORDER BY archive DESC LIMIT 1",
-    ('mon-serveur',)
-).fetchone()
-if row:
-    arch, cnt, sz = row
-    print(f"Snapshot {arch}: {cnt} fichiers exclus ({convert_octets_readable(sz or 0)})")
-
-conn.close()
+    # Stats exclus du snapshot (dernière archive)
+    row = conn.execute(
+        "SELECT archive, file_count, total_size FROM snap_excluded_stats WHERE nick=? "
+        "ORDER BY archive DESC LIMIT 1",
+        ('mon-serveur',)
+    ).fetchone()
+    if row:
+        arch, cnt, sz = row
+        print(f"Snapshot {arch}: {cnt} fichiers exclus ({convert_octets_readable(sz or 0)})")
 ```
 
 ### Stocker des stats depuis borg info

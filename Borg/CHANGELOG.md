@@ -1,5 +1,51 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.203, borgHelperWWW 1.31.17 — Connexions SQLite fermées sur les chemins d'erreur — 2026-10-15
+
+Chantier « reconstruction progressive », story 81 (report D161 de la story 48 ; décision de l'utilisateur : Q1 = A, tous les
+sites de production + garde AST contre les nouveaux, selftests hors périmètre).
+
+- **Fermeture garantie de toute connexion de production** (D161) : 42 ouvertures (`_open_db`, `sqlite3.connect`) n'étaient
+  fermées que sur le chemin normal (`conn=…` … `conn.close()` sans `finally`) — lecteurs (IdxTop, DiffTop, Search, FileHist,
+  TreeHist, TreeFind, DuIdx, ArchiveHistory, RepoHistory, ListFiles, DiffBkp, CacheInfo, sondes d'index, notifications du
+  watcher, statistiques), écrivains (purge et vidage du cache, mise en cache de `borg list`/`prune --dry-run`, IndexSnap complet
+  et incrémental, purge des paires à réindexer, IdxPurge) et DbEncrypt/DbDecrypt. Une exception entre l'ouverture et la
+  fermeture (erreur imprévue, `DbKeyError`, `SystemExit`, Ctrl-C) abandonnait la connexion : sous Python 3.11+, elle n'est
+  fermée qu'au ramasse-miettes. Mesuré avant le correctif (Python 3.14, `clear_cache_nick` réel, exception après son
+  DELETE) : un autre écrivain reçoit « database is locked » jusqu'au `gc.collect()`, 4 descripteurs de la base gardés ;
+  dans un même processus (Index multi-nicks, watcher de borgHelperWWW qui appelle borgHelper en processus), un écrivain
+  suivant attendait son délai (60 s) puis échouait. Désormais chaque site est fermé par un `finally` (transaction en cours
+  annulée par la fermeture, comportement SQLite) : autre écrivain libre et descripteurs fermés dès le retour, sous toute
+  version — hors deux fenêtres inhérentes à Python : entre le retour de `sqlite3.connect` dans `_open_db` et l'entrée dans
+  son `try`, et entre le retour de l'ouvreur et l'affectation à la variable du site (un Ctrl-C qui tombe exactement là laisse
+  la connexion au ramasse-miettes). Chemin normal inchangé : mêmes requêtes, sorties et codes de sortie (Python 3.10 : déjà libre au retour, mesuré).
+  Écartés avec leur raison (fermeture déjà assurée autrement) : `_open_db` (connexion rendue), `ensure_*`,
+  `_diff_stats_for_nick`, `_reconcile_archives`, sonde du témoin d'isolation ; sonde de DbStatus (déjà sûre) réécrite pour la
+  garde, sans effet. PerfBench (outil de mesure) inchangé.
+- **Bascule par copie (`_swap_db`)** : ses deux connexions étaient fermées dans le `finally`, mais APRÈS le checkpoint WAL
+  de fin de copie, qui n'attrape que `sqlite3.Error` — un Ctrl-C ou un `SystemExit` pendant ce checkpoint sautait leur
+  fermeture ET la suppression de la copie `new` (copie temporaire laissée ; avec `keep_new` et une copie validée, fantôme
+  déjà basculé gardé, donc rebasculé plus tard). Désormais `src` puis `dst` sont fermées chacune dans son propre `finally`
+  (un Ctrl-C pendant la fermeture de `src` ne saute plus celle de `dst`, qui tient le verrou d'écriture de la base servie),
+  puis la suppression (même règle keep_new/résultat) dans un dernier `finally`.
+- **borgHelperWWW 1.31.17** : `ensure_scope_cache_db` et `ensure_push_db` (démarrage du serveur) ne fermaient leur connexion
+  que sur le chemin normal — base corrompue (« DB corrompue » + sortie 1) ou schéma plus récent : connexion laissée ouverte.
+  Fermée par un `finally`, messages et codes inchangés ; contrôle du push selftest (base corrompue -> sortie 1, connexion
+  fermée).
+- **Gardes CodecSelfTest** : garde AST sur borgHelper et sur borgHelperWWW (deux contrôles ; WWW absent : SKIP) — toute
+  ouverture de production dont la fermeture n'est pas prouvée sous une des formes usuelles = FAIL nommant fonction et ligne : `v=None` avant le try qui
+  ferme (fermeture alors `_close_quiet(v)` ou sous `v is not None`), ouverture conditionnelle fermée sous le même test,
+  fermeture en tête de son `finally`, pas d'ouverture dans une boucle ni d'autre écriture de la variable dans ce try (affectation,
+  tuple, with, for, :=, +=, except as), seul `contextlib.closing` compte, `with sqlite3.connect(…)` seul refusé car il ne ferme pas, autres ouvreurs
+  (`sqlite3.Connection(…)`, `sqlite3.dbapi2.connect`, `BhConnection(…)`) comptés, alias d'ouvreur refusés (`import sqlite3
+  as …`, `getattr`, `functools.partial`…) ; liste blanche nommée et nombre d'ouvertures EXACTS ; témoins par règle. Limites connues, absentes du code de production
+  (relevé AST) : variable d'ancrage réaffectée entre l'ouverture et la fermeture ; `del`/`nonlocal`/`global`/`match` sur la variable ; écriture de la variable dans le finally avant sa fermeture ; `break` dans la boucle de fermeture ; alias de module (`S=sqlite3`) ; sous-classe de `sqlite3.Connection` autre que `BhConnection` appelée directement ; fonction imbriquée nommée `_pb_*` (exclue comme PerfBench) ; `yield` dans le try ; liste blanche comptée par NOM de fonction (une homonyme partagerait le compte).
+  Contrôles de comportement : par famille (écrivains, lecteurs, multi-nicks, sys.exit, sortie anticipée, `sqlite3.connect`
+  nu ; exception privée, Ctrl-C et `SystemExit` injectés une fois, code vérifié : verrou relâché, rien validé après un DELETE
+  appliqué, aucun descripteur ouvert au retour), arrêt réel d'un nick (DbKeyError, nick suivant servi, connexion fermée
+  avant lui), `_swap_db` interrompu pendant son checkpoint ; SKIP sans `/proc/self/fd`.
+- **Bibliothèque** (LIBRARY.md) : une connexion obtenue par `_open_db` appartient à l'appelant, qui la ferme aussi sur ses chemins d'erreur (`try/finally` ou `contextlib.closing`).
+
 ## borgHelper 1.0.202 — Bascule du fantôme après un rapprochement reporté ; paires tronquées et vidées par IdxPurge closes — 2026-10-15
 
 Chantier « reconstruction progressive », story 80 (reports D200, D202, D203 de la puce « Robustesse, cas rares » du tri

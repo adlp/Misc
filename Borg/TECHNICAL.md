@@ -1361,8 +1361,9 @@ Règle : le code métier ne manipule que des chemins logiques, seul le chemin st
 `DB_ENCRYPT` (défaut activé) n'a aucun effet à l'exécution tant que `DbEncrypt` n'existe pas. La KEK sera dérivée de
 `BORG_PASSPHRASE` : une fois le chiffrement en place, changer la passphrase borg exigera un `DbRekey`.
 
-- **`_open_db(db_path, nick=None, role='read', passphrase=None, **kw)`** : seul point d'ouverture SQLite
-  (`grep -c 'sqlite3.connect(' borgHelper` = 1). Crée le fichier en `0600` (`os.open`, pas d'`umask`) s'il n'existe
+- **`_open_db(db_path, nick=None, role='read', passphrase=None, **kw)`** : point d'ouverture des bases (AD-1) ; seuls autres
+  `sqlite3.connect` de production : sondes sans codec (`_db_probe`, DbStatus, témoin d'isolation `_audit_witness`) — chaque
+  ouverture est inventoriée, avec sa fermeture, par la garde AST `_sqlite_close_guard` (nombre exact, 1.0.203). Crée le fichier en `0600` (`os.open`, pas d'`umask`) s'il n'existe
   pas, renvoie une `BhConnection` (`.codec`, `.mode`, `.role`, `.nick`). Si `nick` est fourni et la base non vide, lit
   `db_meta.enc_header` : absent → `plain` ; présent → `path_enc` doit être `siv1`/`migrating` (sinon `DbTamperError`),
   passphrase (argument, sinon config du nick via le lecteur enregistré par `BorgHelperDB` pour son répertoire de cache) → DEK (`DbKeyError` si absente
@@ -2735,18 +2736,46 @@ enfant. Règles qui en découlent :
 SQL en marqueurs `?` anonymes seulement — `?NNN` avertit sous des 3.12 (DeprecationWarning, cas de `_known_archives`), et
 `:nom`/`@nom`/`$nom` passés avec une séquence lèvent `ProgrammingError` en 3.14 ; jamais `datetime.utcnow()` (avertit depuis 3.12 :
 `_utcnow_naive()`), ni `utcfromtimestamp()`, ni `PurePath.as_uri()` (3.14) ; **toute connexion sqlite3 est fermée explicitement** — depuis 3.11, une
-connexion que plus rien ne référence n'est fermée qu'au passage du ramasse-miettes (mesuré : `-wal`/`-shm` et verrous gardés),
-d'où `_close_quiet(conn)` avant chaque sortie `_db_schema_fail` des `ensure_*` et dans un `except BaseException` qui relance (sinon
-la relance dans le même processus échouait en « disk I/O error ») et `_release_orphan_connections()` (`gc.collect()`) quand un nick
-en erreur est rattrapé (Bkp, Index, Report, Report hors ligne — seulement après une erreur, et en fin de boucle —, lecteurs
-multi-nicks par `_PerNick`). `_clear_exc_frames(e)` efface les variables des cadres terminés de l'exception et de sa chaîne
+connexion que plus rien ne référence n'est fermée qu'au passage du ramasse-miettes (mesuré : `-wal`/`-shm` et verrous gardés).
+**Fermeture garantie de toute ouverture de production** (1.0.203, story 81, D161 ; borgHelperWWW 1.31.17) : chaque
+`_open_db`/`sqlite3.connect` de borgHelper (hors CodecSelfTest et PerfBench) et de borgHelperWWW (hors push_selftest, `_push_conn`
+compris) est fermé aussi sur les chemins d'erreur, `BaseException` comprise (Ctrl-C, `SystemExit` ; hors deux fenêtres inhérentes à Python : entre le retour de `sqlite3.connect` dans `_open_db` et l'entrée dans son `try` (`conn.role=…`), et entre le retour de l'ouvreur et l'affectation à la variable du site — un Ctrl-C (ou un signal) qui tombe exactement là laisse la connexion au ramasse-miettes) — `v=None` puis `try: v=_open_db(…) …
+finally: _close_quiet(v)` (les `conn.close()` du chemin normal restent, la seconde fermeture est sans effet ; sans `v=None`, le
+`finally` lèverait UnboundLocalError et masquerait l'erreur réelle), ou ouverture suivie aussitôt d'un `try/finally` qui ferme, ou
+`with contextlib.closing(…)` ; la fermeture est la PREMIÈRE instruction du `finally` (ou dans un `finally` imbriqué en tête :
+`_swap_db` ferme `src` dans le `finally` du checkpoint WAL, qu'un Ctrl-C peut interrompre, `dst` dans le `finally` de cette
+fermeture, puis retire `new` dans un dernier `finally`, selon la règle keep_new/résultat inchangée). Jamais `with sqlite3.connect(…)`
+seul : le gestionnaire de sqlite3 valide/annule la transaction mais NE ferme PAS. Fermeture d'une connexion d'écriture en cours de
+transaction = annulation (comportement SQLite). Mesuré avant le correctif (Python 3.14) : écrivain réel (`clear_cache_nick`)
+abandonné sur une exception après son DELETE -> un autre écrivain reçoit « database is locked » jusqu'au `gc.collect()`, 4
+descripteurs gardés ; après : libre au retour (3.10 : libre dans les deux cas). Exceptions prouvées autrement (liste blanche
+nommée) : `_open_db` et `_push_conn` (connexion rendue : l'appelant la ferme ; `_open_db` la referme sur toute erreur par son
+`except BaseException`), `ensure_cache_db`/`ensure_diff_db` (`_close_quiet(conn)` avant chaque sortie `_db_schema_fail` et dans un
+`except BaseException` qui relance — sinon la relance dans le même processus échouait en « disk I/O error »), `ensure_history_db`
+(try/finally qui suit le try de l'ouverture), `_audit_witness` (ouverture vouée à l'échec). Filet restant, pour les seules
+connexions tenues par un CYCLE d'objets (une connexion locale est désormais fermée par son site) : `_release_orphan_connections()`
+(`gc.collect()`) quand un nick en erreur est rattrapé (Bkp, Index, Report, Report hors ligne — seulement après une erreur, et en
+fin de boucle —, lecteurs multi-nicks par `_PerNick`, qui ferme aussi la connexion du nick arrêté rendue par son lambda, sans effet
+si son site l'a déjà fermée). `_clear_exc_frames(e)` efface les variables des cadres terminés de l'exception et de sa chaîne
 `__cause__`/`__context__` : appelée par `_PerNick.__exit__`, par l'`except` de l'Index et par `_sentry_capture` après l'envoi —
 la DedupeIntegration de Sentry garde la dernière exception (référence forte en 1.x, et en 2.x pour les types natifs), qui
-retiendrait sinon ses connexions. Placement mesuré : un
-`gc.collect()` DANS le bloc `except` ne libère pas une connexion tenue par un cadre de la trace — la libération se fait au nick
-suivant (ou à `_PerNick.done()`, ou après la boucle de l'Index) ; `_PerNick.__exit__` efface les cadres (`traceback.clear_frames`)
-car la première exception, gardée dans `self.stop`, les retiendrait jusqu'à `done()`. Audit des 55 ouvertures sans fermeture
-garantie reporté (deferred-work). Sentry facultatif, jamais de plantage : DSN vide -> aucun import ; module absent ou `init` refusé
+retiendrait sinon les objets de ses cadres. Placement mesuré : un `gc.collect()` DANS le bloc `except` ne libère pas un objet tenu
+par un cadre de la trace — la libération se fait au nick suivant (ou à `_PerNick.done()`, ou après la boucle de l'Index) ;
+`_PerNick.__exit__` efface les cadres (`traceback.clear_frames`) car la première exception, gardée dans `self.stop`, les
+retiendrait jusqu'à `done()`. Gardes : `_sqlite_close_guard` et `_sqlite_close_guard_www` (AST, `_sqlite_close_scan` ; WWW absent : SKIP) — fermeture
+prouvée sous les formes usuelles : try englobant avec `v=None` avant lui (fermeture alors `_close_quiet(v)` ou sous `v is not None`/`if v:`),
+ouverture dans son corps/ses except/son else, jamais son finally ni dans une boucle, aucune autre écriture de v dans ce try
+(affectation, tuple, `with … as`, `for`, `:=`, `+=`, `except … as`, import) ; ou try qui suit l'ouverture (ouverture
+conditionnelle : fermeture sous le même test ou `is not None`) ; fermeture en tête du finally (ou d'un finally imbriqué en tête),
+jamais dans une fonction imbriquée ; seul `contextlib.closing` compte ; ouvreurs : `_open_db`, `sqlite3.connect`,
+`sqlite3.dbapi2.connect`, `sqlite3.Connection(…)`, `BhConnection(…)`, `_push_conn` (WWW) ; alias refusés (`import sqlite3 as …`,
+`from sqlite3 import connect`, `getattr(sqlite3, …)`, référence hors appel) ; liste blanche et nombre d'ouvertures EXACTS ;
+témoins par règle ; limites connues, absentes du code de production (relevé AST de la story 81) : variable d'ancrage réaffectée entre l'ouverture et la fermeture ; `del`/`nonlocal`/`global`/`match` sur la variable ; écriture de la variable dans le finally avant sa fermeture ; `break` dans la boucle de fermeture ; alias de module (`S=sqlite3`) ; sous-classe de `sqlite3.Connection` autre que `BhConnection` appelée directement ; fonction imbriquée nommée `_pb_*` (exclue comme PerfBench) ; `yield` dans le try ; liste blanche comptée par NOM de fonction (une homonyme partagerait le compte). `_abandoned_conn_closed` (comportement : écrivains — DELETE appliqué puis exception, rien validé lu avant le
+ramasse-miettes —, lecteurs, multi-nicks, sys.exit, sortie anticipée de `_db_migrate`, `sqlite3.connect` nu ; BaseException
+privée, Ctrl-C, SystemExit injectés une fois, type et code vérifiés ; arrêt réel d'un nick par DbKeyError, nick suivant servi
+après fermeture ; cycle forcé pour un résultat indépendant de la version de Python), `_swap_interrupted` (Ctrl-C pendant le
+checkpoint de `_swap_db` ou à la fin de `src.close()` : connexions fermées, `new` retirée selon keep_new/résultat) ; SKIP sans `/proc/self/fd` ;
+borgHelperWWW : `_ensure_close_on_corrupt` (push selftest). Et `_pernick_orphans`, `_multi_orphans`. Sentry facultatif, jamais de plantage : DSN vide -> aucun import ; module absent ou `init` refusé
 (BadDsn), import qui lève autre chose (installation cassée), dépendance absente (`ImportError.name` ≠ `sentry_sdk` : nommée) ou
 fichier DSN illisible (`_sentry_dsn` : `OSError`/`ValueError`) -> `_sentry_warn_once` : `[WARN]` une fois par processus
 (`_SENTRY_MISSING_WARNED`), muet quand `_via_www()` — `BORGHELPERC_NO_CLEANUP_NOTICE=1`, posé par borgHelperWWW sur TOUT enfant
