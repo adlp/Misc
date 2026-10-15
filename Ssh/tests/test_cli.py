@@ -868,7 +868,9 @@ def test_config_get_set_unset(bench):
     r = bench.run("config", "get")
     assert r.returncode == 0 and r.stdout == ("key-ttl 1h (défaut)\nauto-load true (défaut)\n"
                                               "auto-restrict false (défaut)\nauto-confirm false (défaut)\n"
-                                              "forward-confirm true (défaut)\nbw-path PATH (défaut)\n")
+                                              "forward-confirm true (défaut)\nbw-path PATH (défaut)\n"
+                                              "askpass-fallback /usr/bin/ssh-askpass si exécutable et DISPLAY défini, "
+                                              "sinon aucun (défaut)\n")
     assert not config_file(bench).exists(), "get n'écrit rien"
     for value, shown in (("90", "90s"), ("90s", "90s"), ("15m", "15m"), ("2h", "2h"), ("30d", "30d"),
                          ("120", "2m"), ("0", "0 (illimitée)")):
@@ -968,7 +970,9 @@ def test_bw_path_set_get_unset(bench):
     assert (r.returncode, r.stdout, r.stderr) == (0, "bw-path %s\n" % bw, "")
     assert json.loads(config_file(bench).read_text()) == {"bw-path": bw}
     assert bench.run("config", "get", "bw-path").stdout == "bw-path %s\n" % bw
-    assert bench.run("config", "get").stdout.endswith("forward-confirm true (défaut)\nbw-path %s\n" % bw)
+    assert bench.run("config", "get").stdout.endswith("forward-confirm true (défaut)\nbw-path %s\naskpass-fallback "
+                                                       "/usr/bin/ssh-askpass si exécutable et DISPLAY défini, sinon "
+                                                       "aucun (défaut)\n" % bw)
     r = bench.run("config", "unset", "bw-path")
     assert (r.returncode, r.stdout, r.stderr) == (0, "bw-path PATH (défaut)\n", "")
     assert json.loads(config_file(bench).read_text()) == {}

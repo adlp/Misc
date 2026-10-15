@@ -1,6 +1,6 @@
 [project]
 name = "sshvault"
-version = "0.13.1"
+version = "0.14.0"
 description = "Clés SSH dans Vaultwarden, utilisées de façon transparente par ssh"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -8,12 +8,14 @@ dependencies = []
 
 [project.scripts]
 sshvault = "sshvault.launch:main"
+sshvault-askpass = "sshvault.askpass:main"
 
 [dependency-groups]
 # cryptography ne sert qu'au test d'intégration (inscription Bitwarden) : absent de sshvault.
 # tomli : lecture du fichier des comptes de test (accounts.toml) sous Python 3.10 seulement
 # (tomllib à partir de 3.11) ; jamais dépendance de sshvault.
-dev = ["pytest>=8", "cryptography>=42", "tomli>=2 ; python_version < '3.11'"]
+# paramiko : serveurs SSH de test des mots de passe d'hôte (tests/pwserver.py) ; jamais dépendance de sshvault.
+dev = ["pytest>=8", "cryptography>=42", "tomli>=2 ; python_version < '3.11'", "paramiko>=3.4"]
 
 [build-system]
 requires = ["uv_build>=0.8,<0.12"]

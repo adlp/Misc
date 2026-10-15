@@ -14,7 +14,11 @@ Fichier 0600 dans un dossier 0700, sans aucun secret. Clés :
     fichier ordinaire exécutable par l'utilisateur (`fsutil.exe_problem`) ; fichier ou dossier
     (lien suivi) à un autre utilisateur que lui ou root, ou modifiable par le groupe ou les
     autres (dossiers parents et liens compris) : accepté avec un avertissement
-    (`fsutil.exposure_warning`) ; à la lecture : chaîne absolue sans caractère de contrôle.
+    (`fsutil.exposure_warning`) ; à la lecture : chaîne absolue sans caractère de contrôle ;
+  - `askpass-fallback` : askpass graphique vers lequel `sshvault-askpass` relaie une invite quand
+    aucun terminal n'est ouvrable (CAP-11), et que sshvault donne à ses propres invites et à ses
+    enfants à la place de son askpass ; mêmes contrôles que `bw-path`, jamais l'askpass de
+    sshvault ; défaut : `/usr/bin/ssh-askpass` s'il est exécutable et que DISPLAY est défini.
 
 Registre des comptes du coffre (CAP-10), hors de `config get/set` : changé par `sshvault
 account …` seulement :
@@ -45,11 +49,14 @@ from .text import CONTROL_RE, clean
 DEFAULT_KEY_TTL = 3600
 MAX_DURATION = 30 * 86400
 BW_PATH = "bw-path"
+ASKPASS_FALLBACK = "askpass-fallback"
+#: Défaut d'askpass-fallback (si exécutable et DISPLAY défini) : askpass graphique d'OpenSSH.
+DEFAULT_ASKPASS = "/usr/bin/ssh-askpass"
 DEFAULTS = {"key-ttl": DEFAULT_KEY_TTL, "auto-load": True, "auto-restrict": False, "auto-confirm": False,
-            "forward-confirm": True, BW_PATH: None}
+            "forward-confirm": True, BW_PATH: None, ASKPASS_FALLBACK: None}
 KEYS = tuple(DEFAULTS)
 BOOL_KEYS = ("auto-load", "auto-restrict", "auto-confirm", "forward-confirm")
-PATH_KEYS = (BW_PATH,)
+PATH_KEYS = (BW_PATH, ASKPASS_FALLBACK)
 _TRUE, _FALSE = ("true", "yes", "on", "1"), ("false", "no", "off", "0")
 _UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 _DURATION_RE = re.compile(r"(\d{1,12})([smhd]?)")
@@ -167,6 +174,8 @@ def parse_exe_path(text: str, key: str = BW_PATH) -> str:
 
 
 def format_value(key: str, v) -> str:
+    if key == ASKPASS_FALLBACK and v is None:
+        return "%s si exécutable et DISPLAY défini, sinon aucun" % DEFAULT_ASKPASS
     if key in PATH_KEYS:
         return "PATH" if v is None else clean(v)
     if key in BOOL_KEYS:
@@ -316,6 +325,12 @@ class Config:
         self._check_path(data, BW_PATH)
         return data.get(BW_PATH)
 
+    def askpass_fallback(self) -> Optional[str]:
+        """Réglage `askpass-fallback` seul (None : non posé), même règle que `bw_path`."""
+        data = self._read()
+        self._check_path(data, ASKPASS_FALLBACK)
+        return data.get(ASKPASS_FALLBACK)
+
     def save(self, data: dict) -> None:
         try:
             write_private(self.path, (json.dumps(data, indent=1, sort_keys=True) + "\n").encode())
@@ -341,6 +356,11 @@ class Config:
         # avant toute lecture ou écriture : config inchangée si invalide
         if key in PATH_KEYS:
             v = parse_exe_path(value, key)
+            if key == ASKPASS_FALLBACK:
+                from .prompt import own_askpass
+                if own_askpass(v):
+                    raise ConfigError("%s refusé : %s est l'askpass de sshvault (il relaierait vers lui-même) : "
+                                      "un askpass graphique attendu (%s)" % (key, show_value(v), DEFAULT_ASKPASS))
         elif key in BOOL_KEYS:
             v = parse_bool(value)
         else:

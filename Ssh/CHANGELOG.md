@@ -1,5 +1,52 @@
 # Changelog — sshvault
 
+## sshvault 0.14.0 — Mots de passe d'hôte fournis par l'askpass de sshvault — 2026-10-15
+
+- Mots de passe d'hôte (CAP-11) : un élément « identifiant » du coffre relié à ses hôtes par
+  URI `ssh://[user@]hôte[:port]` (hôte = nom tapé, sans motif, insensible à la casse ;
+  utilisateur de l'URI prioritaire sur celui de l'élément ; port ignoré ; autre URI ignorée
+  avec un avertissement) fournit son mot de passe à `ssh <hôte>`, cible ou saut ProxyJump.
+  Élément identifiant sans URI `ssh://` : ignoré (absent de `list`, `search`, `password
+  list`).
+- `sshvault password list [--account ALIAS] [--json]` : alias, nom, hôtes
+  (`[user@]hôte`), jamais le mot de passe ; URI ignorées dites sur stderr.
+- `ssh-config` : après les blocs d'identité, un bloc par élément identifiant
+  (`# <nom> <alias> <id> mot de passe`) et une ligne `Match originalhost <hôte> exec "…
+  ensure --password --account A --id UUID --host H"` par hôte, sans directive, gardée avec
+  `auto-load false` ; même hôte et même utilisateur dans deux éléments : avertissement, le
+  premier gagne. `kept_items`, `pub_fingerprint`, `exe_warnings` et `--check` les
+  reconnaissent ; un compte illisible garde ses blocs à mot de passe. Version minimale de la
+  commande des lignes `Match exec` : 0.14.0.
+- `sshvault ensure --password` : enregistre le ssh appelant (`$XDG_RUNTIME_DIR/sshvault/pw/<pid>.json`,
+  pid et date de début, compte, élément, hôte, aucun secret, 0600 dans 0700 ; enregistrements
+  morts retirés) et déverrouille le compte si besoin (une invite au plus, aucune sous
+  BatchMode/`--nointeraction`) ; rien sous `ssh -G`/`-O` (chemin rapide) ; code 0 sauf usage.
+- Nouvelle commande `sshvault-askpass` (à poser dans `SSH_ASKPASS`, avec
+  `SSH_ASKPASS_REQUIRE=force`) : donne le mot de passe du coffre (lu par `bw get item` au moment
+  de l'invite, en mémoire, écrit seulement sur sa sortie) une fois par ssh et par élément,
+  seulement au ssh enregistré, seulement à une invite `<u>@<h>'s password: ` ou `(<u>@<h>)
+  Password: ` dont l'utilisateur est l'attendu ; mot de passe refusé : une ligne, puis relais.
+  Toute autre invite est relayée : terminal (écho coupé sauf question de clé d'hôte), sinon
+  `askpass-fallback`, sinon code 1 ; `SSH_ASKPASS_PROMPT=confirm` : relais seul ; coffre
+  verrouillé : une ligne, relais, jamais d'invite du mot de passe maître. Module léger : `bw`
+  importé seulement quand l'enregistrement et l'invite correspondent.
+- Réglage `askpass-fallback` (chemin absolu d'un exécutable, jamais l'askpass de sshvault ;
+  défaut `/usr/bin/ssh-askpass` s'il est exécutable et que DISPLAY est défini).
+  L'avertissement d'exposition d'un chemin (`bw-path`, `askpass-fallback`) nomme ce qu'un
+  remplaçant recevrait.
+- Invites de sshvault et de ses enfants (`ssh-add`, `ssh-keygen`, `ssh-agent`) : jamais par
+  l'askpass de sshvault ; `SSH_ASKPASS` y devient `askpass-fallback` (absent : retiré) et
+  `SSH_ASKPASS_REQUIRE=force` est retiré, comme s'il n'était pas posé (déverrouillage et
+  passphrases au terminal d'abord, même avec `DISPLAY` : `prefer` les aurait envoyés à l'askpass
+  graphique).
+- Backend : `list_logins`, `get_login`/`get_password` ; une seule lecture `bw list items` sert
+  aux clés et aux éléments identifiant d'une commande. Faux `bw` : `create item` garde
+  `login` (type 1).
+- Tests : `tests/test_passwords.py` (matrice de la story, bout en bout avec deux serveurs SSH
+  paramiko locaux, `tests/pwserver.py`, et un vrai `ssh`) ; paramiko ajouté aux dépendances de
+  test seulement. Intégration : élément identifiant à URI `ssh://` créé par `bw create`, lu par
+  `password list` et `ssh-config`.
+
 ## sshvault 0.13.1 — Include hors bloc dit « pas en tête », noms à point initial du joker voisin, comptes de test stricts — 2026-10-15
 
 - `ssh-config` et `--check` : un `Include` à joker ou mixte dans un bloc `Host`/`Match`,

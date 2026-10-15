@@ -47,6 +47,7 @@ from dataclasses import dataclass, field, replace
 from typing import Optional
 
 from .agent import NoEcho, PassphraseRefused, askpass_rules, tty_available
+from .prompt import internal_env
 from .fsutil import NotPrivateTmpfs, check_private_tmpfs, ensure_dir, read_private
 from .prompt import prompt_timeout
 from .runtime import AgentError, fingerprint, resolve_dir
@@ -361,7 +362,9 @@ def keygen_exe(env=None) -> str:
 def passphrase_mode(env) -> Optional[str]:
     """Comment `ssh-keygen` demandera la passphrase (readpass.c 8.9, RP_ALLOW_STDIN) :
     « stdin » (stdin terminal hérité), « askpass », « tty » (/dev/tty, stdin /dev/null), ou None
-    si aucune invite n'est possible. Terminal : seulement au premier plan (sinon SIGTTIN)."""
+    si aucune invite n'est possible. Terminal : seulement au premier plan (sinon SIGTTIN).
+    Environnement interne : jamais l'askpass de sshvault (`internal_env`)."""
+    env = internal_env(env)
     allow, usable = askpass_rules(env)
     fg = tty_available()
     try:
@@ -387,7 +390,7 @@ def keygen(args, input: Optional[bytes] = None, env=None, mode: Optional[str] = 
     askpass interdit). Sinon (voir passphrase_mode) : invite par ssh-keygen ; au terminal, même
     session et écho coupé (état d'origine rétabli sur tous les chemins). Délai : seul
     ssh-keygen est tué (terminal) ou tout son groupe (askpass compris)."""
-    base = dict(os.environ if env is None else env)
+    base = dict(internal_env(dict(os.environ if env is None else env)))
     exe = keygen_exe(base)
     allow, usable = askpass_rules(base)
     if mode is None or (allow and not usable):

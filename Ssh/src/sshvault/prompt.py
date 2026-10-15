@@ -12,6 +12,14 @@ Choix (lecture de `read_passphrase()`, readpass.c d'OpenSSH 8.9, et `man ssh`) :
     sans terminal au premier plan, askpass si permis ;
   - askpass suppose SSH_ASKPASS défini (`man ssh`) ; s'il manque, repli sur le terminal.
 
+L'askpass de sshvault (`sshvault-askpass`, CAP-11), posé dans le shell avec
+`SSH_ASKPASS_REQUIRE=force`, ne sert jamais aux invites de sshvault ni à ses enfants (ssh-add,
+ssh-keygen, ssh-agent) : `internal_env` remplace SSH_ASKPASS par le réglage `askpass-fallback`
+(absent : retiré) et retire `SSH_ASKPASS_REQUIRE=force` (comme si l'utilisateur ne l'avait pas
+posé : `prefer` enverrait les invites à l'askpass graphique dès que DISPLAY est défini) ; les
+règles ci-dessus jugent sur cet environnement (le terminal d'abord, sinon l'askpass graphique
+s'il est permis).
+
 Chaque invite a un délai borné. Le descripteur de `/dev/tty` est fermé et l'écho
 restauré sur tous les chemins ; un askpass est tué avec tout son groupe.
 """
@@ -30,6 +38,8 @@ from .settings import seconds
 
 DEFAULT_TIMEOUT = 60.0
 TTY_PATH = "/dev/tty"
+#: Nom de l'askpass de sshvault (commande installée, [project.scripts]).
+ASKPASS_NAME = "sshvault-askpass"
 
 
 class PromptError(Exception):
@@ -149,6 +159,52 @@ def prompt_askpass(prog: str, text: str, timeout: float) -> str:
     return out.decode(errors="replace").rstrip("\r\n")
 
 
+def own_askpass(prog: Optional[str], env: Optional[Mapping[str, str]] = None) -> bool:
+    """`prog` (valeur de SSH_ASKPASS) est-il l'askpass de sshvault ? Nom `sshvault-askpass`,
+    écrit ou au bout des liens symboliques (cherché dans le PATH s'il n'a pas de `/`)."""
+    if not prog:
+        return False
+    env = os.environ if env is None else env
+    if os.path.basename(prog) == ASKPASS_NAME:
+        return True
+    path = prog if "/" in prog else (shutil.which(prog, path=env.get("PATH")) or "")
+    return bool(path) and os.path.basename(os.path.realpath(path)) == ASKPASS_NAME
+
+
+def askpass_fallback(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """Askpass de relais : le réglage `askpass-fallback` (config.json de `env`), sinon
+    /usr/bin/ssh-askpass s'il est exécutable et que DISPLAY est défini ; jamais l'askpass de
+    sshvault ; None : aucun. Réglage illisible : le défaut."""
+    env = os.environ if env is None else env
+    from .config import DEFAULT_ASKPASS, Config, ConfigError, default_path
+    try:
+        v = Config(default_path(env)).askpass_fallback()
+    except ConfigError:
+        v = None
+    if v is None and env.get("DISPLAY") and os.path.isfile(DEFAULT_ASKPASS) and os.access(DEFAULT_ASKPASS, os.X_OK):
+        v = DEFAULT_ASKPASS
+    if v and own_askpass(v, env):
+        return None
+    return v or None
+
+
+def internal_env(env: Mapping[str, str]) -> Mapping[str, str]:
+    """Environnement des invites de sshvault et de ses enfants : si SSH_ASKPASS est l'askpass de
+    sshvault, il devient `askpass-fallback` (absent : retiré) et SSH_ASKPASS_REQUIRE=force est
+    retiré (terminal d'abord, comme sans le réglage). Sinon `env` tel quel. Idempotent."""
+    if not own_askpass(env.get("SSH_ASKPASS") or "", env):
+        return env
+    out = dict(env)
+    fb = askpass_fallback(env)
+    if fb:
+        out["SSH_ASKPASS"] = fb
+    else:
+        out.pop("SSH_ASKPASS", None)
+    if (out.get("SSH_ASKPASS_REQUIRE") or "").lower() == "force":
+        del out["SSH_ASKPASS_REQUIRE"]
+    return out
+
+
 UNAVAILABLE = "aucune invite possible (ni /dev/tty, ni SSH_ASKPASS utilisable)"
 
 
@@ -167,7 +223,7 @@ def _usable_env(env: Mapping[str, str]) -> Mapping[str, str]:
 
 def available(env: Optional[Mapping[str, str]] = None, tty_path: str = TTY_PATH) -> bool:
     """Une invite serait-elle possible (terminal au premier plan, ou askpass utilisable) ?"""
-    env = os.environ if env is None else env
+    env = internal_env(os.environ if env is None else env)
     fd = open_foreground_tty(tty_path)
     if fd is not None:
         os.close(fd)
@@ -176,7 +232,7 @@ def available(env: Optional[Mapping[str, str]] = None, tty_path: str = TTY_PATH)
 
 def ask_password(text: str, env: Optional[Mapping[str, str]] = None,
                  timeout: Optional[float] = None, tty_path: str = TTY_PATH) -> str:
-    env = os.environ if env is None else env
+    env = internal_env(os.environ if env is None else env)
     if timeout is None:
         timeout = prompt_timeout(env)
     fd = open_foreground_tty(tty_path)

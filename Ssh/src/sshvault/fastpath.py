@@ -196,6 +196,12 @@ class Caller:
         self.host = dest_label(first["dest"])
         #: BatchMode=yes en argument d'un ssh de la chaîne : aucune invite
         self.batch = any(parse_ssh_args(argv[1:])["batch"] for _, argv in ancestors)
+        #: ssh le plus proche (celui qui appellera l'askpass, CAP-11) : (pid, date de début) ou None
+        self.nearest = None
+        if ancestors:
+            st = _stat(ancestors[0][0])
+            if st and len(st) > 19:
+                self.nearest = (ancestors[0][0], st[19])
         #: connexion : pid et date de démarrage du ssh le plus haut (None hors ssh)
         self.conn = None
         if ancestors:
@@ -463,10 +469,23 @@ def ensure_args(argv: Sequence[str]):
     return ids, (fids[0] if fids else None), noint, (accts[0] if accts else None)
 
 
+def password_args(argv: Sequence[str]) -> bool:
+    """`argv` est `[--nointeraction] ensure … --password …` (mot de passe d'hôte, CAP-11)."""
+    argv = list(argv)
+    if argv[:1] == ["--nointeraction"]:
+        argv = argv[1:]
+    return argv[:1] == ["ensure"] and "--password" in argv[1:]
+
+
 def try_fast(argv: Sequence[str]) -> Optional[int]:
     """Code de sortie si `ensure` n'a rien à faire (`ssh -G`, `ssh -O`, clé présente), sinon
     None : la CLI complète prend la suite (elle refait ces contrôles et rend toute erreur, délai
-    invalide compris, en une ligne)."""
+    invalide compris, en une ligne). `ensure --password` : seulement `ssh -G`/`-O` ici."""
+    if password_args(argv):
+        try:
+            return 0 if caller().no_connect else None
+        except Exception:
+            return None
     parsed = ensure_args(argv)
     if parsed is None:
         return None

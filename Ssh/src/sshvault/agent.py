@@ -45,7 +45,7 @@ from typing import Callable, Mapping, Optional, Sequence
 
 from .agentstate import STATE_NAME, AgentState, empty
 from .fsutil import ensure_dir
-from .prompt import open_foreground_tty
+from .prompt import internal_env, open_foreground_tty
 # briques légères (aussi pour le chemin rapide d'ensure), réexportées ici
 from .runtime import (DIR_NAME, FID_RE, FWD_DIR, RUN_USER, SOCKET_NAME, SUN_PATH_MAX, AgentError,  # noqa: F401
                       fingerprint, forward_id, forward_paths, parse_listing, public_blob, resolve_dir)
@@ -127,7 +127,9 @@ def askpass_rules(env: Mapping[str, str]):
     """(permis, utilisable) pour un `read_passphrase()` d'OpenSSH 8.9 : askpass permis si
     DISPLAY est non vide ou SSH_ASKPASS_REQUIRE=force, jamais si =never (WAYLAND_DISPLAY
     n'est pas lu par la 8.9) ; utilisable si le programme (SSH_ASKPASS, sinon
-    /usr/bin/ssh-askpass) est exécutable."""
+    /usr/bin/ssh-askpass) est exécutable. Jugé sur l'environnement interne (`internal_env`) :
+    l'askpass de sshvault n'est utilisable que si son relais (askpass-fallback) l'est."""
+    env = internal_env(env)
     allow = bool(env.get("DISPLAY"))
     req = (env.get("SSH_ASKPASS_REQUIRE") or "").lower()
     if req == "force":
@@ -249,7 +251,8 @@ class Agent:
         """`directory` : dossier verrouillé (`flock`) et créé au besoin ; socket et état par
         défaut `agent.sock` et `agent.json` dedans (agent dédié), sinon `socket`/`state`
         (sous-agent de transfert : voir `forward_agent`)."""
-        self.env = dict(os.environ if env is None else env)
+        # askpass de sshvault jamais donné à ssh-agent ni à ssh-add (CAP-11)
+        self.env = dict(internal_env(dict(os.environ if env is None else env)))
         self.dir = directory
         self.socket = socket or os.path.join(directory, SOCKET_NAME)
         self.state = AgentState(state or os.path.join(directory, STATE_NAME))

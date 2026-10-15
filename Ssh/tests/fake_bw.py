@@ -20,8 +20,9 @@ Faits reproduits (vrai bw 2026.9.1, lus dans le source embarqué du binaire et m
     `revisionDate` de la requête différente de celle du serveur : « The client copy of this
     cipher is out of date. Resync the client and try again. » ; l'élément modifié est rendu ;
   - `create item [encodedJson]` : même encodage, argument ou stdin ; type 5 : les trois champs
-    `sshKey` exigés (SshKeyExport.toView : « SSH key private key is required. »…) ; nouvel id ;
-    l'élément créé est rendu.
+    `sshKey` exigés (SshKeyExport.toView : « SSH key private key is required. »…) ; type 1
+    (identifiant) : `login` gardé (username, password, totp, uris) ; nouvel id ; l'élément créé
+    est rendu.
 Mesuré sur le vrai bw contre le compte de test (2026-10-07) : mauvais mot de passe à
 `unlock` (journaux « ERROR … » du SDK puis « Cryptography error, The decryption operation
 failed », code 1), « Vault is locked. » sans session et avec une session invalide,
@@ -545,6 +546,12 @@ def cmd_create(ctx, pos):
             "fields": req.get("fields") if req.get("fields") else None, "collectionIds": []}
     if req.get("type") == 5:
         item["sshKey"] = dict(req["sshKey"])
+    if req.get("type") == 1 and isinstance(req.get("login"), dict):  # LoginExport.toView : identifiant
+        login = req["login"]
+        item["login"] = {"username": login.get("username"), "password": login.get("password"),
+                         "totp": login.get("totp"), "passwordRevisionDate": None,
+                         "uris": [{"match": u.get("match"), "uri": u.get("uri")} for u in (login.get("uris") or [])
+                                  if isinstance(u, dict)]}
     mode = injected("create")
     if mode == "silent":  # réponse de succès, rien enregistré
         ctx.json(item)

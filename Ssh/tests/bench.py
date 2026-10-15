@@ -37,6 +37,8 @@ import pytest
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(os.path.dirname(HERE), "src")
 FAKE_BW = os.path.join(HERE, "fake_bw.py")
+#: serveur SSH de test (paramiko) des mots de passe d'hôte (CAP-11)
+PWSERVER = os.path.join(HERE, "pwserver.py")
 PASSWORD = "correct horse battery staple"
 EMAIL = "alice@example.test"
 #: Compte du banc (CAP-10) : alias déduit de EMAIL, comme à l'adoption d'une installation 0.8.0.
@@ -217,7 +219,7 @@ def session_guard(tmp_path_factory):
     before = {k: snapshot(p) for k, p in paths.items()}
     yield
     markers = ["/dev/shm/sshvault-test-", str(tmp_path_factory.getbasetemp()), FAKE_BW, "sshvault-it-",
-               " -m sshvault "]
+               " -m sshvault ", " -m sshvault.askpass", PWSERVER]
     deadline = time.monotonic() + 10
     left = processes_matching(markers)
     while left and time.monotonic() < deadline:
@@ -263,6 +265,17 @@ def ssh_item(iid, name, key, hosts=None, extra_fields=()):
             "fields": fields or None,
             "sshKey": {"privateKey": key["private"], "publicKey": key["public"],
                        "keyFingerprint": key["fingerprint"]},
+            "collectionIds": []}
+
+
+def login_item(iid, name, username=None, password=None, uris=(), fields=None):
+    """Élément « identifiant » (type 1) du faux coffre : `uris` = liste d'URI (texte)."""
+    return {"passwordHistory": None, "revisionDate": "2026-10-06T10:00:00.000Z",
+            "creationDate": "2026-10-06T10:00:00.000Z", "deletedDate": None, "archivedDate": None,
+            "object": "item", "id": iid, "organizationId": None, "folderId": None, "type": 1, "reprompt": 0,
+            "name": name, "notes": None, "favorite": False, "fields": fields,
+            "login": {"username": username, "password": password, "totp": None, "passwordRevisionDate": None,
+                      "uris": [{"match": None, "uri": u} for u in uris]},
             "collectionIds": []}
 
 
@@ -427,6 +440,8 @@ class Bench:
         self.known_hosts = tmp_path / "known_hosts"
         self.known_hosts.write_text("")
         self.exe = write_exe(tmp_path / "exe")
+        #: `sshvault-askpass` du banc (enveloppe de `python -m sshvault.askpass` du dépôt)
+        self.askpass = write_askpass(tmp_path / "exe")
         self.env = self.base_env()
         #: comptes du registre : alias -> (serveur, e-mail)
         # écrit par set_state()/unlocked()/write_registry() : un banc neuf n'a pas de config.json
@@ -833,6 +848,24 @@ def write_exe(directory):
         "if [ -n \"$SSHVAULT_TEST_TRACE\" ]; then\n  '%s' -m sshvault \"$@\"\n  rc=$?\n"
         "  printf 'sshvault-test: fin %%s rc=%%d\\n' \"$*\" \"$rc\" >&2\n  exit $rc\nfi\n"
         "exec '%s' -m sshvault \"$@\"\n" % (sys.executable, sys.executable))
+    exe.chmod(0o755)
+    return exe
+
+
+def write_askpass(directory):
+    """`sshvault-askpass` des bancs (programme SSH_ASKPASS, CAP-11) : enveloppe de `python -m
+    sshvault.askpass` du dépôt (même pid : `exec`), nommée comme la commande installée (sshvault
+    reconnaît son askpass à ce nom). Hors d'un banc (SSHVAULT_TEST_BENCH absent) : code 1 sans
+    rien lancer. SSHVAULT_TEST_ASKPASS_LOG : chaque appel y ajoute une ligne (texte de l'invite,
+    jamais une réponse)."""
+    directory = pathlib.Path(directory)
+    directory.mkdir(exist_ok=True)
+    exe = directory / "sshvault-askpass"
+    exe.write_text(
+        "#!/bin/sh\n[ -n \"$SSHVAULT_TEST_BENCH\" ] || exit 1\n"
+        "if [ -n \"$SSHVAULT_TEST_ASKPASS_LOG\" ]; then printf '%%s' \"$1\" | tr '\\n' ' ' >> \"$SSHVAULT_TEST_ASKPASS_LOG\"; "
+        "echo >> \"$SSHVAULT_TEST_ASKPASS_LOG\"; fi\n"
+        "exec '%s' -m sshvault.askpass \"$@\"\n" % sys.executable)
     exe.chmod(0o755)
     return exe
 

@@ -2,7 +2,7 @@
 
 Clés SSH dans un Vaultwarden auto-hébergé, utilisées de façon transparente par ssh.
 
-État (0.13.1) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
+État (0.14.0) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
 + e-mail, sur un même serveur ou sur des serveurs différents ; déconnexion par `sshvault
 logout`, serveur ou e-mail corrigé par `sshvault account set` ; voir « Comptes du coffre »),
 **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
@@ -20,8 +20,10 @@ cible (`sshvault deploy`), et **transfert d'agent restreint** : vers un hôte d�
 (`sshvault forward`), seul un sous-agent qui ne contient que les clés autorisées pour cet
 hôte est transféré, jamais l'agent dédié entier. `sshvault lock --unload` révoque aussitôt
 les clés chargées des comptes verrouillés ; `sshvault ssh-config uninstall` retire sshvault du
-`ssh_config`. `bw` est pris au chemin absolu du réglage `bw-path` s'il est posé, sinon dans le
-PATH.
+`ssh_config`. **Mots de passe d'hôte** : pour une machine qui n'accepte qu'un mot de passe,
+`ssh <hôte>` (cible ou saut) reçoit le mot de passe rangé dans un élément « identifiant » du
+coffre, par l'askpass de sshvault (`sshvault-askpass`, voir « Mots de passe d'hôte »). `bw` est
+pris au chemin absolu du réglage `bw-path` s'il est posé, sinon dans le PATH.
 
 ## Installation (sans root)
 
@@ -66,6 +68,18 @@ PATH.
    Le réglage est commun à tous les comptes.
 4. Comptes du coffre : `sshvault account add perso --server https://vault.example.org
    --email alice@example.org`, puis `sshvault login` (voir « Comptes du coffre »).
+5. Mots de passe d'hôte (facultatif, voir « Mots de passe d'hôte ») : dans le shell
+   (`~/.bashrc`, `~/.profile`…) :
+   ```
+   export SSH_ASKPASS="$HOME/.local/bin/sshvault-askpass"
+   export SSH_ASKPASS_REQUIRE=force
+   ```
+   **Attention** : avec `force`, ssh, `ssh-add` et `ssh-keygen` envoient **toutes** leurs
+   invites à cet askpass (mot de passe, passphrase, question de clé d'hôte, code à usage
+   unique…). Il ne répond lui-même qu'aux invites de mot de passe des hôtes du coffre et relaie
+   toutes les autres au terminal (sinon à `askpass-fallback`, sinon refus) ; un programme qui
+   lit son propre terminal sans terminal (cron, session graphique sans `askpass-fallback`) voit
+   donc ses invites refusées.
    Mise à jour depuis la 0.8.0 : l'installation est adoptée au premier lancement ; un
    déverrouillage est à refaire, puis `sshvault ssh-config`. Voir « Changements
    incompatibles (0.9.0) » ci-dessous pour les scripts.
@@ -110,7 +124,8 @@ sshvault lock [--account ALIAS]… [--unload]          # défaut : tous les comp
 
 sshvault load (MOTIF [--host | --name | --fingerprint | --id] | --all) [-t DURÉE] [--confirm] [--restrict] [--force]
 sshvault agent status | purge | lock | unlock | stop
-sshvault config get [CLÉ] | set CLÉ VALEUR | unset CLÉ   # key-ttl, auto-load, auto-restrict, auto-confirm, forward-confirm, bw-path
+sshvault config get [CLÉ] | set CLÉ VALEUR | unset CLÉ   # key-ttl, auto-load, auto-restrict, auto-confirm, forward-confirm, bw-path, askpass-fallback
+sshvault password list [--account ALIAS]… [--json]       # éléments identifiant à URI ssh:// (jamais le mot de passe)
 
 sshvault hosts add | remove | set  SÉLECTION [--host | --name | --fingerprint | --id] HÔTE…
 sshvault hosts list SÉLECTION [--host | --name | --fingerprint | --id]
@@ -462,7 +477,8 @@ par sshvault sont ceux de cette version.
   aucun secret). `config set key-ttl 2h` fixe la durée par défaut, `config get` l'affiche,
   `config unset key-ttl` revient à 1 h. Clés du chargement automatique (voir plus bas) :
   `auto-load` (défaut `true`), `auto-restrict` et `auto-confirm` (défaut `false`) ;
-  `forward-confirm` (défaut `true`, voir « Transfert d'agent restreint ») ; valeurs
+  `forward-confirm` (défaut `true`, voir « Transfert d'agent restreint ») ; `askpass-fallback`
+  (askpass graphique de relais, voir « Mots de passe d'hôte ») ; valeurs
   `true`/`false` (aussi `yes`/`no`, `on`/`off`, `1`/`0`). Durée, booléen ou fichier
   invalide (JSON, valeur, droits autres que 0600, propriétaire) : code 2 ; écriture
   impossible : code 4.
@@ -1001,6 +1017,11 @@ le dossier `$XDG_RUNTIME_DIR/sshvault/` (sockets, états, verrou ; vidé aussi �
 session), les données (`${XDG_DATA_HOME:-~/.local/share}/sshvault/`, dont les données de `bw`
 de chaque compte sous `accounts/<alias>/bw`) et la configuration
 (`${XDG_CONFIG_HOME:-~/.config}/sshvault/`), et enfin la commande `sshvault` elle-même.
+Mots de passe d'hôte : **d'abord** retirer `SSH_ASKPASS` (s'il désigne `sshvault-askpass`) et
+`SSH_ASKPASS_REQUIRE=force` des fichiers de démarrage du shell (`~/.bashrc`, `~/.profile`…), et
+ouvrir un nouveau shell, avant de désinstaller sshvault : sinon chaque invite de ssh, `ssh-add`
+et `ssh-keygen` échoue (askpass introuvable). Les enregistrements des connexions
+(`$XDG_RUNTIME_DIR/sshvault/pw/`, sans secret) partent avec le dossier runtime.
 Après `uninstall`, `hosts`, `forward`, `import`, `generate` et `ssh-config` recréent
 `~/.ssh/sshvault/`, inerte sans la ligne `Include` (avertissement habituel) ; `sshvault
 ssh-config` puis `sshvault ssh-config install` remettent tout.
@@ -1107,6 +1128,69 @@ sshvault forward list --id 2222…                   # un motif par ligne
   transfert déclaré reste exposé à `ForwardAgent yes`/`ssh -A` (voir « ForwardAgent :
   attention »).
 
+### Mots de passe d'hôte (`sshvault password`, `sshvault-askpass`)
+
+Pour les rares machines qui n'acceptent qu'un mot de passe (CAP-11). Le mot de passe vit dans
+un élément **identifiant** du coffre (créé dans le web vault ; `password add` viendra), relié à
+ses hôtes par ses URI :
+
+- `ssh://hôte`, `ssh://utilisateur@hôte`, `ssh://utilisateur@hôte:port` : `hôte` est le nom
+  **tapé** (`ssh hôte`, ou le nom d'un saut ProxyJump), lettres, chiffres, `.`, `-`, `_`, sans
+  motif, comparé sans tenir compte de la casse ; l'utilisateur de l'URI remplace le nom
+  d'utilisateur de l'élément pour cet hôte ; le port est ignoré (la topologie reste dans
+  `~/.ssh/config`). Toute autre URI de l'élément (web, autre forme) est ignorée, avec un
+  avertissement (`password list`, `ssh-config`). Un élément identifiant sans URI `ssh://`
+  n'est pas à sshvault (ni dans `password list`, ni dans le `ssh_config`) ; `list` et `search`
+  ne montrent que les clés.
+- `sshvault password list [--json]` : alias, nom, hôtes (`[utilisateur@]hôte`), jamais le mot
+  de passe.
+- `sshvault ssh-config` ajoute, après les blocs d'identité, un bloc par élément, sans
+  directive, gardé même avec `auto-load false` :
+  ```
+  # Routeur perso 22222222-2222-4222-8222-222222222222 mot de passe
+  Match originalhost routeur exec "'/home/alice/.local/bin/sshvault' ensure --password --account perso --id 22222222-2222-4222-8222-222222222222 --host routeur"
+  ```
+  Même hôte et même utilisateur dans deux éléments : avertissement, le premier (nom, compte,
+  id) gagne. Même hôte avec une clé et un mot de passe : les deux blocs, le serveur choisit.
+  Un compte illisible à la régénération garde ses blocs tels quels.
+- À la connexion, `ensure --password` (ligne `Match exec`) enregistre le ssh appelant dans
+  `$XDG_RUNTIME_DIR/sshvault/pw/<pid du ssh>.json` (pid et date de début du ssh, compte,
+  élément, hôte ; aucun secret ; 0600 dans un dossier 0700 ; enregistrements des ssh finis
+  retirés) et déverrouille le compte s'il le faut (mêmes règles d'invite que le chargement
+  automatique : une invite au plus par compte et par connexion, aucune sous `BatchMode=yes`
+  ou `--nointeraction`). Rien sous `ssh -G`/`-O`. Code 0 (sauf usage, 2) : un échec est dit
+  en une ligne, la connexion continue.
+- ssh appelle alors `sshvault-askpass` (avec `SSH_ASKPASS_REQUIRE=force`). Il donne le mot de
+  passe du coffre **seulement** si : son parent est le ssh enregistré (même pid **et** même
+  date de début) ; l'invite est exactement `<utilisateur>@<h>'s password: ` (méthode
+  password) ou `(<utilisateur>@<h>) Password: ` (keyboard-interactive) ; l'utilisateur est
+  celui attendu pour un hôte enregistré (`ssh root@routeur` avec un élément `admin` : relais) ;
+  ce mot de passe n'a pas encore été donné à ce ssh. Il est lu par `bw get item` à ce
+  moment-là (session rangée ; jamais d'invite du mot de passe maître dans l'askpass : coffre
+  verrouillé, une ligne, puis relais), gardé en mémoire et écrit seulement sur la sortie de
+  l'askpass : jamais en argument, dans un fichier, un état ou un journal.
+- Une fois par connexion **et par saut** : `ssh B` via le rebond A (ProxyJump), A et B à
+  mot de passe, aboutit sans saisie ; chaque ssh (le saut `-W` est un ssh à part) a son
+  enregistrement. Mot de passe refusé par le serveur : la nouvelle invite affiche « mot de
+  passe du coffre refusé pour <u>@<hôte> (<nom>) » et va au terminal.
+- **Relais** de toute autre invite (question de clé d'hôte, passphrase, code à usage unique,
+  confirmation `-c` d'un agent avec `SSH_ASKPASS_PROMPT=confirm`) : `/dev/tty` ouvrable →
+  invite au terminal (écho coupé, sauf la question de clé d'hôte) ; sinon le réglage
+  `askpass-fallback` (mêmes arguments et environnement) ; sinon code 1 (ssh : mot de passe
+  vide, « Host key verification failed. »).
+- `askpass-fallback` : `sshvault config set askpass-fallback /usr/bin/ssh-askpass` (chemin
+  absolu d'un fichier exécutable ; l'askpass de sshvault refusé ; même avertissement que
+  `bw-path` s'il est modifiable par d'autres). Défaut : `/usr/bin/ssh-askpass` s'il est
+  exécutable et que `DISPLAY` est défini.
+- Les invites de sshvault (déverrouillage, passphrase d'une clé à `load`, `import`, mot de
+  passe de verrou de l'agent) et ses enfants (`ssh-add`, `ssh-keygen`, `ssh-agent`) ne
+  passent jamais par son askpass : `SSH_ASKPASS` y devient `askpass-fallback` (absent :
+  retiré) et `SSH_ASKPASS_REQUIRE=force` est retiré, comme si vous ne l'aviez pas posé : le
+  terminal d'abord, l'askpass graphique seulement sans terminal (`prefer` l'aurait préféré au
+  terminal dès que `DISPLAY` est défini).
+- Hors champ : codes à usage unique, changement d'un mot de passe expiré, enveloppe `sshpass`
+  (ces invites sont relayées telles quelles).
+
 ### Codes de sortie
 
 | Code | Sens |
@@ -1126,7 +1210,12 @@ en une ligne ; les autres sous-agents sont traités quand même.
 l'erreur (3 coffre verrouillé, compte déconnecté ou agent verrouillé — même hors de
 sshvault —, 4 backend, agent, délai global…), sans
 effet sur ssh. `ensure --forward` : de même (0 aussi pour un saut `ssh -W` dont le socket
-existe) ; la connexion se fait sans clé transférée.
+existe) ; la connexion se fait sans clé transférée. `ensure --password` : 0 (y compris coffre
+verrouillé sans invite possible, dit en une ligne), sauf usage (2).
+
+`sshvault-askpass` : 0 et la réponse sur stdout (mot de passe du coffre, ou saisie relayée au
+terminal) ; code de `askpass-fallback` s'il a été lancé ; 1 sans terminal ni fallback, ou
+saisie annulée.
 
 `status` : 0 si le coffre de chaque compte affiché est déverrouillé, 3 si l'un est
 verrouillé ou non connecté (ou s'il n'y a aucun compte), 4 si `bw` est en erreur.
@@ -1190,7 +1279,8 @@ le code 2. Toute erreur est une ligne sur stderr, sans traceback.
 | `SSHVAULT_TEST_GUARD` | tests seulement : `warn` ramène à un avertissement la garde de fin de session sur les dossiers sshvault réels existants (défaut : échec) |
 | `SSHVAULT_KNOWN_HOSTS` | fichiers known_hosts passés à `ssh-add -H` pour `--restrict`, séparés par `:` (défaut : ceux d'`ssh-add`) |
 | `BW_CLIENTID`, `BW_CLIENTSECRET` | clé API pour `sshvault login --apikey` (lues par `bw`) |
-| `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE`, `DISPLAY`, `WAYLAND_DISPLAY` | choix de l'invite (`man ssh`) |
+| `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE`, `DISPLAY`, `WAYLAND_DISPLAY` | choix de l'invite (`man ssh`) ; `SSH_ASKPASS` = `sshvault-askpass` : remplacé par `askpass-fallback` (ou retiré) et `SSH_ASKPASS_REQUIRE=force` retiré pour les invites de sshvault et ses enfants (terminal d'abord) |
+| `SSH_ASKPASS_PROMPT` | lu par `sshvault-askpass` : `confirm` (confirmation d'un agent) ou `none` : relais seul |
 | `NODE_EXTRA_CA_CERTS` | transmise à `bw` (certificat auto-signé du serveur) |
 
 ## Tests
@@ -1251,6 +1341,22 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   joker ou ligne mixte dans un bloc avec une ligne hors bloc au-dessus du bloc : « pas en
   tête » (`ssh-config`, `--check`), puis `install` (Include exact en tête, ligne du bloc
   gardée, « inclus deux fois ») et plus aucun avertissement.
+- `tests/test_passwords.py` (mots de passe d'hôte) : URI `ssh://` acceptées et refusées,
+  éléments identifiant du faux `bw`, `password list`, blocs à mot de passe (après les blocs
+  d'identité, `auto-load false`, compte illisible gardé, `--check`, régénération par `hosts
+  add` sans appel `bw` de plus), `ensure --password` sous un faux parent `ssh` (enregistrement
+  0600/0700 sous son pid, aucun mot de passe lu, enregistrements morts retirés, `ssh -G` par le
+  chemin rapide, usage, une seule invite pour deux hôtes, `BatchMode`), `sshvault-askpass`
+  (donné une fois puis « refusé » et relais au terminal, keyboard-interactive, utilisateur
+  différent, parent inconnu, question de clé d'hôte avec écho, sans terminal ni fallback,
+  `askpass-fallback` avec mêmes arguments et environnement, `confirm`, coffre verrouillé,
+  module léger sans `bw`), invites internes au terminal sous `SSH_ASKPASS_REQUIRE=force`
+  (déverrouillage, passphrase). Bout en bout : deux serveurs SSH paramiko locaux
+  (`tests/pwserver.py`, dépendance de test seulement : A par mot de passe, B par
+  keyboard-interactive derrière A par ProxyJump), un vrai `ssh` et l'askpass du banc :
+  `ssh B` aboutit sans saisie, argv de tous les processus relevés pendant la connexion et
+  fichiers du HOME et du runtime relus (aucun mot de passe) ; mot de passe refusé puis saisi
+  au terminal ; question de clé d'hôte relayée.
 - `tests/test_it_accounts.py` : lecteur du fichier des comptes de test d'intégration
   (`tests/integration/accounts.py`), sans réseau ni vrai fichier : comptes valides et alias,
   doublon, champ manquant, vide ou de type faux, clé inconnue, TOML illisible, fichier absent

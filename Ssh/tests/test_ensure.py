@@ -323,8 +323,8 @@ def test_sshvault_exe(tmp_path):
     d1, d2, d3 = tmp_path / "d1", tmp_path / "d2", tmp_path / "d3"
     d1.mkdir()
     (d1 / "sshvault").write_text("pas exécutable")
-    old = _fake_exe(d2, "0.3.0")  # sans `ensure` : écarté
-    exe3 = _fake_exe(d3, "0.4.0")
+    old = _fake_exe(d2, "0.13.1")  # sans `ensure --password` (0.14.0) : écarté
+    exe3 = _fake_exe(d3, "0.14.0")
     env = {"PATH": "relatif:%s:%s:%s" % (d1, d2, d3)}
     assert sshconfig.sshvault_exe("/x/__main__.py", env) == str(exe3)
     assert sshconfig.sshvault_exe(str(exe3), {"PATH": ""}) == str(exe3)
@@ -332,12 +332,13 @@ def test_sshvault_exe(tmp_path):
         sshconfig.sshvault_exe("/x/__main__.py", {"PATH": "%s:%s" % (d1, d2)})
     with pytest.raises(sshconfig.SshConfigError, match="introuvable"):
         sshconfig.sshvault_exe("/x/__main__.py", {"PATH": str(d1)})
-    assert str(old) in sshconfig._exe_checked and sshconfig._exe_checked[str(old)] == (0, 3, 0), "version en cache"
+    assert str(old) in sshconfig._exe_checked and sshconfig._exe_checked[str(old)] == (0, 13, 1), "version en cache"
+    assert sshconfig.ENSURE_MIN_VERSION == (0, 14, 0)
 
 
 def test_exe_warnings(tmp_path):
     paths = sshconfig.Paths(str(tmp_path))
-    venv = _fake_exe(tmp_path / "proj" / ".venv" / "bin", "0.4.0")
+    venv = _fake_exe(tmp_path / "proj" / ".venv" / "bin", "0.14.0")
     assert sshconfig.exe_warnings("/opt/sshvault", paths) == []
     os.makedirs(paths.dir)
     (pathlib_path := tmp_path / ".ssh" / "sshvault" / "config").write_text(

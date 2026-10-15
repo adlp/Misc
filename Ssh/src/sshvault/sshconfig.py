@@ -42,6 +42,12 @@ puis, sur demande seulement, la ligne `Include` en tête de `~/.ssh/config`.
   d'identité sans transfert déclaré : la config de l'utilisateur décide. Bloc sans ligne
   `Match exec` (`auto-load false`, aucune clé utilisable) : `ForwardAgent no` (un socket jamais
   créé arrêterait un saut `ssh -W` par cet hôte).
+- Mots de passe d'hôte (CAP-11) : après les blocs d'identité, un bloc par élément identifiant
+  (`# <nom> <alias> <id> mot de passe`, jamais un UUID nu en fin de commentaire), une ligne
+  `Match originalhost <hôte> exec "'<sshvault>' ensure --password --account <alias> --id <uuid>
+  --host <hôte>"` par hôte, sans directive (elle enregistre le ssh appelant pour
+  `sshvault-askpass`), gardée même avec `auto-load false`. L'hôte écrit est un littéral validé
+  (lettres, chiffres, `.`, `-`, `_`), jamais `%h`/`%n`.
 """
 from __future__ import annotations
 
@@ -58,7 +64,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
 from .agent import FID_RE, FWD_DIR, SUN_PATH_MAX, fingerprint, forward_id, public_blob
-from .backend import SshKeyItem, valid_host
+from .backend import LOGIN_HOST_RE, SshKeyItem, valid_host
 from .fastpath import ITEM_ID_RE, parse_ref
 from .runtime import ALIAS_RE
 from .fsutil import ensure_dir, read_private, write_private
@@ -76,6 +82,8 @@ CATCH_ALL_WARNING = "ce bloc prend toutes les connexions ssh et désactive ton a
 FORWARD_CATCH_ALL_WARNING = "ce sous-agent de transfert sera transféré à toutes les connexions ssh"
 #: Commentaire qui ouvre un bloc de transfert : `# transfert d'agent <motif> <fid>`.
 FORWARD_COMMENT = "# transfert d'agent "
+#: Fin du commentaire d'un bloc à mot de passe : `# <nom> <alias> <id> mot de passe`.
+PASSWORD_SUFFIX = " mot de passe"
 #: Délai d'un `ssh -G` de contrôle (s), et de l'ensemble des contrôles d'une commande.
 SSH_G_TIMEOUT = 15
 SSH_G_BUDGET = 30.0
@@ -163,7 +171,7 @@ def quote_path(path: str, what: str) -> str:
 
 
 #: Version minimale d'une commande sshvault pour les lignes `Match exec` (`ensure`).
-ENSURE_MIN_VERSION = (0, 4, 0)
+ENSURE_MIN_VERSION = (0, 14, 0)
 _VERSION_RE = re.compile(r"sshvault (\d+)\.(\d+)\.(\d+)")
 _exe_checked: dict = {}
 
@@ -187,7 +195,7 @@ def sshvault_exe(argv0: Optional[str] = None, env=None) -> str:
     """Chemin absolu de la commande `sshvault` pour `Match exec` : celle qui tourne si elle a
     été lancée sous ce nom (console script installé), sinon les `sshvault` exécutables des
     dossiers **absolus** du PATH, dans l'ordre ; la première qui connaît `ensure`
-    (`--version` ≥ 0.4.0) est retenue. Aucune : SshConfigError."""
+    (`--version` ≥ ENSURE_MIN_VERSION : `ensure --password`) est retenue. Aucune : SshConfigError."""
     env = os.environ if env is None else env
     argv0 = sys.argv[0] if argv0 is None else argv0
     cands = []
@@ -205,7 +213,8 @@ def sshvault_exe(argv0: Optional[str] = None, env=None) -> str:
         old.append(c)
     raise SshConfigError("commande sshvault %s pour le chargement automatique%s : l'installer (uv tool install "
                          "--force), ou « sshvault config set auto-load false »"
-                         % ("0.4.0 ou plus introuvable (PATH)" if not old else "trop ancienne",
+                         % ("%s ou plus introuvable (PATH)" % ".".join(map(str, ENSURE_MIN_VERSION)) if not old
+                            else "trop ancienne",
                             " (%s)" % ", ".join(clean(o) for o in old) if old else ""))
 
 
@@ -214,7 +223,8 @@ def exe_warnings(exe: str, paths: "Paths") -> list:
     ou dans un environnement de projet (`.venv`), dont la config dépendrait."""
     out = []
     raw = read_private(paths.config)
-    m = re.search(r"exec \"'([^']*)' ensure --(?:id|forward|account) ", raw.decode(errors="replace")) if raw else None
+    m = re.search(r"exec \"'([^']*)' ensure --(?:id|forward|account|password) ", raw.decode(errors="replace")) \
+        if raw else None
     if m and m.group(1).replace("%%", "%") != exe:
         out.append("chemin de sshvault des lignes Match exec changé : %s → %s"
                    % (clean(m.group(1).replace("%%", "%")), clean(exe)))
@@ -263,6 +273,21 @@ def forward_command(exe: str, fid: str, ids: Sequence) -> str:
     return "'%s' ensure --forward %s%s" % (exe.replace("%", "%%"), fid, "".join(" --id %s" % r for r in refs))
 
 
+def password_command(exe: str, item_id: str, account: str, host: str) -> str:
+    """Commande de `Match exec` d'un bloc à mot de passe : `'<exe>' ensure --password --account
+    <alias> --id <uuid> --host <hôte>` (`%` doublé pour ssh). Seulement le chemin vérifié, l'alias,
+    l'id (UUID) et l'hôte (littéral : lettres, chiffres, `.`, `-`, `_`) validés : la commande passe
+    par un shell."""
+    _check_path(exe, "chemin de sshvault", "'")
+    if not ITEM_ID_RE.fullmatch(item_id or ""):
+        raise SshConfigError("id d'élément inattendu (UUID attendu) : %s" % clean(item_id or ""))
+    _check_alias(account)
+    if not LOGIN_HOST_RE.fullmatch(host or ""):
+        raise SshConfigError("hôte de mot de passe inattendu : %s" % clean(host or ""))
+    return "'%s' ensure --password --account %s --id %s --host %s" % (exe.replace("%", "%%"), account,
+                                                                      item_id.lower(), host.lower())
+
+
 def forward_socket(agent_socket: str, fid: str) -> str:
     """Socket du sous-agent `fid` : `fwd/<fid>.sock` à côté du socket de l'agent dédié."""
     return os.path.join(os.path.dirname(agent_socket), FWD_DIR, fid + ".sock")
@@ -304,13 +329,16 @@ def _order(i: SshKeyItem):
 
 
 def build(items: Sequence[SshKeyItem], paths: Paths, socket: str, exe: Optional[str] = None,
-          kept: frozenset = frozenset()) -> Plan:
+          kept: frozenset = frozenset(), logins: Sequence = (), pw_exe: Optional[str] = None) -> Plan:
     """Contenu du fichier généré et des `.pub`, sans rien écrire. Vérifie aussi les chemins
     (SshConfigError) : sert de contrôle préalable avant une écriture dans le coffre.
     `exe` : chemin de sshvault ; s'il est donné, chaque bloc est précédé de sa ligne
     `Match … exec` (chargement automatique). `kept` : (compte, id) des éléments relus dans le
     fichier actuel (compte illisible, `kept_items`) : clé publique d'un élément de transfert sans
-    bloc d'identité inconnue, mais déjà vérifiée à la génération précédente."""
+    bloc d'identité inconnue, mais déjà vérifiée à la génération précédente.
+    `logins` : éléments identifiant (CAP-11), un bloc à mot de passe chacun, après les blocs
+    d'identité ; lignes `Match exec` avec `pw_exe` (sinon `exe`) : elles ne dépendent pas
+    d'`auto-load`. Éléments identifiant de `kept` : relus dans le fichier (utilisateurs inconnus)."""
     agent = quote_path(socket, "socket de l'agent dédié")
     _check_path(paths.pub, "dossier des clés publiques")
     if exe is not None:
@@ -367,8 +395,55 @@ def build(items: Sequence[SshKeyItem], paths: Paths, socket: str, exe: Optional[
             if fnmatch.fnmatchcase(h1, h2) or fnmatch.fnmatchcase(h2, h1):
                 plan.warnings.append("motifs « %s » de %s et « %s » de %s se recouvrent : pour les hôtes communs, "
                                      "ssh offrira les deux clés dans l'ordre des blocs" % (h1, _label(a), h2, _label(b)))
+    _password_blocks(logins, pw_exe or exe, plan, out, kept)
     plan.config = "".join(out).encode()
     return plan
+
+
+def _password_blocks(logins: Sequence, exe: Optional[str], plan: Plan, out: list, kept: frozenset = frozenset()) -> None:
+    """Blocs à mot de passe (CAP-11) : un par élément identifiant à hôte, triés comme les blocs
+    d'identité ; une ligne `Match originalhost <hôte> exec "… ensure --password …"` par hôte."""
+    owners = {}  # (hôte, utilisateur) -> premier élément
+    for it in sorted(logins, key=_order):
+        hosts = []
+        for h in it.host_names():
+            if LOGIN_HOST_RE.fullmatch(h) and h.lower() not in hosts:
+                hosts.append(h.lower())
+        if not hosts:
+            continue
+        if not ITEM_ID_RE.fullmatch(it.id or "") or not ALIAS_RE.fullmatch(it.account or ""):
+            plan.warnings.append("%s : id ou compte inattendu : pas de mot de passe d'hôte pour cet élément" % _label(it))
+            continue
+        if exe is None:
+            plan.warnings.append("%s : chemin de sshvault inconnu : pas de ligne Match exec, mot de passe jamais "
+                                 "donné" % _label(it))
+            continue
+        out.append("\n# %s %s %s%s\n" % (clean(it.name), it.account, it.id.lower(), PASSWORD_SUFFIX))
+        for h in hosts:
+            out.append('Match originalhost %s exec "%s"\n' % (h, password_command(exe, it.id, it.account, h)))
+            if (it.account, it.id) in kept:
+                continue  # relu dans le fichier : utilisateurs inconnus
+            users = it.users(h)
+            if not users:
+                plan.warnings.append("%s : hôte « %s » sans utilisateur (ni nom d'utilisateur de l'élément, ni "
+                                     "ssh://utilisateur@%s) : mot de passe jamais donné" % (_label(it), h, h))
+            for u in users:
+                first = owners.setdefault((h, u), it)
+                if first is not it:
+                    plan.warnings.append("%s@%s porté par %s et %s : le premier (nom, compte, id) gagne, %s"
+                                         % (clean(u), h, _label(first), _label(it), _label(first)))
+        plan.blocks += 1
+
+
+def login_warnings(logins: Sequence) -> list:
+    """URI ignorées des éléments identifiant (autre forme, autre schéma), une ligne chacune."""
+    from .backend import redact_uri
+    out = []
+    for it in sorted(logins, key=_order):
+        for u in it.ignored:
+            out.append("%s : URI ignorée « %s » (forme attendue : ssh://[user@]hôte[:port])"
+                       % (_label(it), clean(redact_uri(u))))
+    return out
 
 
 def _forward_blocks(items: Sequence[SshKeyItem], socket: str, exe: Optional[str], plan: Plan, out: list,
@@ -536,6 +611,47 @@ def kept_items(paths: Paths, keep, renamed: Optional[dict] = None, known=None, n
             continue
         out.append(SshKeyItem(id=iid, name=name, public_key=pub, fingerprint="", hosts=hosts,
                               forward=tuple(forwards.get(key, ())), account=account))
+    return out
+
+
+def kept_logins(paths: Paths, keep, renamed: Optional[dict] = None, known=None) -> list:
+    """Éléments identifiant relus dans les blocs à mot de passe du fichier généré actuel, pour
+    garder tels quels ceux d'un compte illisible : [LoginItem] dont `keep(alias)` est vrai ; hôtes
+    des lignes `ensure --password`, utilisateurs inconnus (None). `renamed` : {ancien alias :
+    nouveau}. Fichier absent : []."""
+    from .backend import LoginItem
+    renamed = renamed or {}
+    raw = read_private(paths.config)
+    if raw is None:
+        return []
+    blocks, cur = [], None
+    for line in raw.decode(errors="replace").splitlines():
+        if line.startswith("# "):
+            cur = None
+            body = line[2:]
+            if body.endswith(PASSWORD_SUFFIX):
+                rest, sep, iid = body[:-len(PASSWORD_SUFFIX)].rpartition(" ")
+                name, sep2, alias = rest.rpartition(" ")
+                if sep and sep2 and ITEM_ID_RE.fullmatch(iid) and ALIAS_RE.fullmatch(alias):
+                    cur = {"name": name, "account": alias, "id": iid.lower(), "hosts": []}
+                    blocks.append(cur)
+            continue
+        if cur is None:
+            continue
+        m = re.match(r'Match originalhost (\S+) exec "\'[^\']*\' ensure --password --account (\S+) --id (\S+) '
+                     r'--host (\S+)"$', line)
+        if m and m.group(2) == cur["account"] and m.group(3) == cur["id"] and m.group(4) == m.group(1) \
+                and LOGIN_HOST_RE.fullmatch(m.group(1)) and m.group(1) not in cur["hosts"]:
+            cur["hosts"].append(m.group(1))
+        elif line.strip():
+            cur = None
+    out, seen = [], set()
+    for b in blocks:
+        account = renamed.get(b["account"], b["account"])
+        if not b["hosts"] or not keep(account) or (account, b["id"]) in seen:
+            continue
+        seen.add((account, b["id"]))
+        out.append(LoginItem(id=b["id"], name=b["name"], hosts=tuple((h, None) for h in b["hosts"]), account=account))
     return out
 
 

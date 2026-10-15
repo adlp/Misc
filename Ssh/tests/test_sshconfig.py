@@ -554,7 +554,8 @@ def test_rien_ecrit_hors_du_home_de_test(bench):
     assert snap() == before
     written = {str(p.relative_to(bench.tmp)) for p in bench.tmp.rglob("*") if p.is_file()}
     assert {w for w in written if not w.startswith("home/")} <= {
-        "server/vault.json", "bw.log", "bin/bw", "bin/ssh-add", "known_hosts", "exe/sshvault"}
+        "server/vault.json", "bw.log", "bin/bw", "bin/ssh-add", "known_hosts", "exe/sshvault",
+        "exe/sshvault-askpass"}
 
 
 # --- revue : fichiers non ordinaires, verrou, prérequis, Include, chemins, --check ----------

@@ -32,8 +32,8 @@ import subprocess
 import termios
 from typing import Callable, Optional
 
-from .backend import (FORWARD_FIELD, HOSTS_FIELD, BackendError, BackendNotFound, ItemNotFound, LogoutUnknown,
-                      NotLoggedIn,
+from .backend import (FORWARD_FIELD, HOSTS_FIELD, BackendError, BackendNotFound, ItemNotFound, LoginItem, LogoutUnknown,
+                      NotLoggedIn, login_hosts, ssh_scheme,
                       PasswordRefused, Prompt, SshKeyItem, VaultBackend, VaultError, VaultLocked, VaultStatus, WriteFailed,
                       normalize_fingerprint, normalize_hosts, parse_hosts)
 from .fsutil import ensure_dir, exe_problem, exposure_warning
@@ -46,6 +46,7 @@ DEFAULT_TIMEOUT = 60.0
 LOGIN_TIMEOUT = 600.0  # login interactif (saisie, 2FA)
 REREAD_TIMEOUT = 10.0  # relecture de `bw status` après un `bw logout` sans réponse (local, rapide)
 SSH_KEY_TYPE = 5
+LOGIN_TYPE = 1
 PASSWORD_VAR = "SSHVAULT_BW_MASTER_PASSWORD"
 EXE_VAR = "SSHVAULT_BW"
 BW_PATH_KEY = "bw-path"
@@ -207,6 +208,9 @@ class BwBackend(VaultBackend):
         self.marker_cleared = False  # marqueur `logged-out` retiré par cette commande (bw vu connecté)
         self.marker_warning: Optional[str] = None  # avertissement « non retiré », dit une fois
         self.warnings: list = []  # avertissements d'une ligne pour l'utilisateur
+        #: éléments identifiant de la dernière lecture du coffre (sans mot de passe) : une
+        #: régénération après `list_ssh_keys` n'appelle pas bw une seconde fois
+        self._logins: Optional[list] = None
 
     @property
     def exe(self) -> str:
@@ -716,15 +720,60 @@ class BwBackend(VaultBackend):
                           hosts=parse_hosts(",".join(lists[HOSTS_FIELD])),
                           forward=parse_hosts(",".join(lists[FORWARD_FIELD])))
 
-    def list_ssh_keys(self, prompt: Optional[Prompt] = None) -> list:
+    @staticmethod
+    def _login(d) -> Optional[LoginItem]:
+        """Élément identifiant (type 1) relié à des hôtes par URI `ssh://`, sans son mot de passe ;
+        None s'il n'a aucune URI `ssh:` (élément web ordinaire). URI `ssh:` toutes invalides :
+        élément sans hôte, seules ces URI dans `ignored`."""
+        if not isinstance(d, dict) or d.get("type") != LOGIN_TYPE:
+            return None
+        login = d.get("login")
+        if not isinstance(login, dict) or not isinstance(login.get("uris") or [], list):
+            return None
+        uris = [u.get("uri") for u in login.get("uris") or [] if isinstance(u, dict) and isinstance(u.get("uri"), str)]
+        hosts, ignored = login_hosts(login.get("username"), uris)
+        if not hosts:
+            ignored = tuple(u for u in ignored if ssh_scheme(u))
+            if not ignored:
+                return None
+        return LoginItem(id=str(d.get("id") or ""), name=str(d.get("name") or ""), hosts=hosts, ignored=ignored)
+
+    def list_vault(self, prompt: Optional[Prompt] = None) -> tuple:
+        """(clés SSH, éléments identifiant) en un seul `bw list items`, triés par nom puis id."""
         r = self._with_session(["list", "items"], "list items", prompt)
         data = self._json(r, "list items")
-        del r  # la sortie brute contient les clés privées : pas plus loin que nécessaire
+        del r  # la sortie brute contient les clés privées et les mots de passe : pas plus loin que nécessaire
         if not isinstance(data, list):
             raise BackendError("erreur bw : « list items » n'a pas renvoyé de liste")
         items = [it for it in (self._item(d) for d in data) if it is not None]
+        logins = [it for it in (self._login(d) for d in data) if it is not None]
         del data
-        return sorted(items, key=lambda i: (i.name.casefold(), i.id))
+        logins.sort(key=lambda i: (i.name.casefold(), i.id))
+        self._logins = logins
+        return sorted(items, key=lambda i: (i.name.casefold(), i.id)), list(logins)
+
+    def list_ssh_keys(self, prompt: Optional[Prompt] = None) -> list:
+        return self.list_vault(prompt)[0]
+
+    def list_logins(self, prompt: Optional[Prompt] = None) -> list:
+        """Éléments identifiant ; ceux de la dernière lecture du coffre par ce backend s'il y en a eu
+        une (même commande), sinon un `bw list items`."""
+        if self._logins is not None:
+            return list(self._logins)
+        return self.list_vault(prompt)[1]
+
+    def get_login(self, item_id: str, prompt: Optional[Prompt] = None):
+        """Un seul `bw get item` (cache local) : (élément identifiant, mot de passe en octets)."""
+        d = self.get_item(item_id, prompt)
+        try:
+            item = self._login(d)
+            if item is None or not item.hosts:
+                raise ItemNotFound("élément %s : pas un identifiant à URI ssh://" % item_id)
+            login = d.get("login") or {}
+            pw = login.get("password") if isinstance(login.get("password"), str) else ""
+            return item, pw.encode()
+        finally:
+            del d
 
     def get_item(self, item_id: str, prompt: Optional[Prompt] = None) -> dict:
         """Élément complet tel que `bw get item` le rend (cache local), clé privée comprise :

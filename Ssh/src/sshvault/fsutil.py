@@ -218,10 +218,16 @@ def exposure_warning(path: str, key: str = "bw-path") -> Optional[str]:
     if found is None:
         return None
     reasons, to_chmod, move = found
+    what, gain = _EXPOSED.get(key, _EXPOSED["bw-path"])
     fixes = []
     if to_chmod:
         fixes.append("corriger par « chmod g-w,o-w %s »" % " ".join(shlex.quote(clean(p)) for p in to_chmod))
     if move:
-        fixes.append("déplacer bw dans un dossier à vous non modifiable par d'autres")
-    return ("avertissement : %s « %s » exposé à d'autres (%s) : ils pourraient remplacer bw et recevoir le "
-            "mot de passe maître ; %s" % (key, clean(path), " ; ".join(clean(r) for r in reasons), " et ".join(fixes)))
+        fixes.append("déplacer %s dans un dossier à vous non modifiable par d'autres" % what)
+    return ("avertissement : %s « %s » exposé à d'autres (%s) : ils pourraient remplacer %s et recevoir %s ; %s"
+            % (key, clean(path), " ; ".join(clean(r) for r in reasons), what, gain, " et ".join(fixes)))
+
+
+#: Réglage → (ce que l'exécutable est, ce qu'un remplaçant recevrait), pour `exposure_warning`.
+_EXPOSED = {"bw-path": ("bw", "le mot de passe maître"),
+            "askpass-fallback": ("l'askpass", "les mots de passe et passphrases saisis")}

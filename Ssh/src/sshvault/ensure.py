@@ -58,7 +58,7 @@ from .backend import NotLoggedIn, PasswordRefused, VaultBackend, VaultLocked
 from .fastpath import clean, forward_wanted, fresh, owns
 from .fsutil import ensure_dir, read_private, write_private
 from .prompt import UNAVAILABLE, PromptError, PromptUnavailable, ask_password, available, prompt_timeout
-from .session import SessionStore
+from .session import DEFAULT_TTL as DEFAULT_SESSION_TTL, SessionStore
 
 #: Durée (s) pendant laquelle un échec de déverrouillage empêche toute nouvelle invite.
 FAIL_MEMORY = 30
@@ -199,9 +199,9 @@ class UnlockPrompt:
     invite impossible (ni terminal au premier plan, ni askpass exécutable) non."""
 
     def __init__(self, directory: str, env: Mapping[str, str], ctx: Context, account: Optional[str] = None,
-                 hint: str = ""):
+                 hint: str = "", purpose: str = "clé pour %s"):
         self.dir, self.env, self.ctx, self.answered = directory, env, ctx, False
-        self.account, self.hint = account, hint
+        self.account, self.hint, self.purpose = account, hint, purpose
 
     def __call__(self, text: str) -> str:
         age = recent_failure(self.dir, time.time(), self.ctx.conn, self.account)
@@ -209,9 +209,9 @@ class UnlockPrompt:
             raise VaultLocked(failed_message(age, self.account, self.hint))
         if self.ctx.host:
             if text.endswith(" : "):
-                text = text[:-3] + ", clé pour %s : " % self.ctx.host
+                text = text[:-3] + ", %s : " % (self.purpose % self.ctx.host)
             else:
-                text += " (clé pour %s)" % self.ctx.host
+                text += " (%s)" % (self.purpose % self.ctx.host)
         try:
             pw = ask_password(text, self.env, timeout=self.ctx.cap(prompt_timeout(self.env)))
         except PromptUnavailable as e:
@@ -384,6 +384,45 @@ def load(agent: Agent, item, key: bytes, settings: dict, env: Mapping[str, str],
                     pass
         raise
     return "loaded"
+
+
+# --- mot de passe d'hôte (CAP-11) -------------------------------------------------------------
+
+def ensure_password(account: str, item_id: str, host: str, backend: VaultBackend, store: SessionStore,
+                    env: Optional[Mapping[str, str]] = None, ctx: Optional[Context] = None,
+                    nearest: Optional[tuple] = None, directory: Optional[str] = None) -> str:
+    """`ensure --password` : (compte, élément, hôte) enregistrés pour le ssh `nearest` (pid, date de
+    début ; celui qui appellera `sshvault-askpass`) dans `pw/<pid>.json` (aucun secret ;
+    enregistrements morts retirés), puis compte déverrouillé s'il le faut (mêmes règles
+    d'invite qu'`ensure` : une au plus par compte et par connexion, aucune sous BatchMode ou
+    --nointeraction). Le mot de passe n'est pas lu ici. Renvoie "registered" (ou "unlocked")
+    ; toute impossibilité lève l'erreur à afficher (une ligne)."""
+    from .askpass import register
+    env = os.environ if env is None else env
+    ctx = ctx or Context()
+    base = directory or resolve_dir(env)
+    if nearest is not None:
+        try:
+            register(base, nearest[0], nearest[1], account, item_id, host)
+        except OSError as e:
+            raise AgentError("enregistrement pour sshvault-askpass impossible (%s) : %s"
+                             % (os.path.join(base, "pw"), e.strerror or e)) from None
+    with user_lock(base):
+        # session rangée vérifiée (un `bw status`, durée de vie inchangée) : l'askpass la lira
+        # sans invite ; refusée, elle est oubliée et l'invite suit
+        if store.get() and backend.status().state == "unlocked":
+            return "registered"
+        _unlock_possible(base, store, env, ctx, account, _hint(backend))
+        prompt = (UnlockPrompt(base, env, ctx, account, _hint(backend), purpose="pour le mot de passe d'hôte de %s")
+                  if ctx.interactive else None)
+        try:
+            backend.unlock(prompt, DEFAULT_SESSION_TTL)
+        except PasswordRefused:
+            record_failure(base, ctx.conn, account)
+            raise
+        if prompt is not None and prompt.answered:
+            clear_failure(base, account)
+    return "unlocked"
 
 
 # --- transfert d'agent restreint (CAP-8) ------------------------------------------------------

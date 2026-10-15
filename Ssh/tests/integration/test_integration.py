@@ -1,8 +1,9 @@
 """Vrai bw contre le compte de test (ou le conteneur) : peuplement, puis lecture par sshvault.
 
 - Peuplement par le vrai `bw` dans un dossier de données temporaire : 2 éléments SSH
-  (clés ed25519 jetables, avec et sans `sshvault-hosts`) et 1 élément login, chacun
-  avec le champ `sshvault-test-run=<uuid du run>`.
+  (clés ed25519 jetables, avec et sans `sshvault-hosts`), 1 élément login sans URI et 1 élément
+  login à URI `ssh://` (mot de passe d'hôte, CAP-11, créé par `bw create`, hors sshvault),
+  chacun avec le champ `sshvault-test-run=<uuid du run>`.
 - Nettoyage dans un finaliseur, même en cas d'échec : chaque élément est relu et n'est
   supprimé (`bw delete item <id> --permanent`) que s'il porte le marqueur de ce run ;
   puis `bw logout` et suppression des dossiers de données temporaires.
@@ -338,6 +339,13 @@ def vault(account, bw_exe, ssh_keys, report):
             "sans-hotes": ssh("sshvault-it %s perso" % TAG, ssh_keys["sans-hotes"]),
             "login": create(type=1, name="sshvault-it %s web" % TAG, notes=None,
                             login={"username": "it", "password": "jetable-" + TAG, "uris": [], "totp": None}),
+            # mot de passe d'hôte (CAP-11) : utilisateur de l'élément, puis celui de l'URI (port ignoré),
+            # et une URI web ignorée
+            "pw": create(type=1, name="sshvault-it %s ssh" % TAG, notes=None,
+                         login={"username": "it-user", "password": "jetable-ssh-" + TAG, "totp": None,
+                                "uris": [{"match": None, "uri": "ssh://pw-%s.it.example" % TAG},
+                                         {"match": None, "uri": "ssh://root@Pw2-%s.it.example:2222" % TAG},
+                                         {"match": None, "uri": "https://pw-%s.it.example/" % TAG}]}),
         }
     except BaseException as e:
         report.add("échec de mise en place", note="%s: %s" % (type(e).__name__, e))
@@ -697,6 +705,9 @@ def test_sshvault_sur_le_vrai_bw(account, vault, ssh_keys, home, report):
     # hôtes (story 4) : écriture par sshvault, relecture par un autre client bw, ssh-config
     check_hosts_and_ssh_config(account, vault, ssh_keys, home, report)
 
+    # mots de passe d'hôte (story 17) : élément identifiant créé par bw, lu par password list et ssh-config
+    check_passwords(account, vault, home, report)
+
     # chargement à la demande (story 5) : ssh vers un sshd local, agent vide, vrai bw
     check_ensure(account, vault, ssh_keys, home, report)
 
@@ -836,6 +847,44 @@ def check_hosts_and_ssh_config(account, vault, ssh_keys, home, report):
     r = sv(home, "--nointeraction", "ssh-config")
     check(account, r, 0, "ssh-config sans changement")
     assert "inchangé" in r.stdout
+
+
+def check_passwords(account, vault, home, report):
+    """Story 17 (CAP-11) : l'élément identifiant à URI ssh:// créé par `bw create` (hors sshvault) est
+    lu par `password list` (hôtes `[user@]hôte`, URI web signalée, jamais le mot de passe) et
+    donne son bloc à mot de passe dans le ssh_config ; l'élément identifiant sans URI ssh:// n'y
+    est pas."""
+    secret = "jetable-ssh-" + TAG
+    r = sv(home, "--nointeraction", "password", "list", "--json")
+    report.add("sshvault password list", r)
+    check(account, r, 0, "password list")
+    got = {d["id"]: d for d in json.loads(r.stdout)}
+    assert got[vault["pw"]]["hosts"] == ["it-user@pw-%s.it.example" % TAG, "root@pw2-%s.it.example" % TAG]
+    assert got[vault["pw"]]["account"] == ALIAS and vault["login"] not in got
+    assert "URI ignorée « https://pw-%s.it.example/ »" % TAG in r.stderr
+    assert secret not in r.stdout + r.stderr
+    r = sv(home, "--nointeraction", "password", "list")
+    check(account, r, 0, "password list (texte)")
+    assert "%s\tsshvault-it %s ssh\tit-user@pw-%s.it.example,root@pw2-%s.it.example\n" % (ALIAS, TAG, TAG, TAG) in r.stdout
+    assert vault["login"] not in sv(home, "--nointeraction", "list", "--json").stdout
+    r = sv(home, "--nointeraction", "ssh-config")
+    report.add("sshvault ssh-config (mots de passe)", r)
+    check(account, r, 0, "ssh-config avec un élément identifiant")
+    text = open(os.path.join(home["env"]["HOME"], ".ssh", "sshvault", "config")).read()
+    exe = os.path.join(home["tmp"], "exe", "sshvault")
+    assert "\n# sshvault-it %s ssh %s %s mot de passe\n" % (TAG, ALIAS, vault["pw"]) in text
+    for h in ("pw-%s.it.example" % TAG, "pw2-%s.it.example" % TAG):
+        assert ('Match originalhost %s exec "\'%s\' ensure --password --account %s --id %s --host %s"\n'
+                % (h, exe, ALIAS, vault["pw"], h)) in text
+    assert vault["login"] not in text and secret not in text
+    if shutil.which("ssh"):
+        # ssh -G évalue la ligne Match exec : ensure --password n'enregistre rien
+        g = subprocess.run(["ssh", "-G", "-F", os.path.join(home["env"]["HOME"], ".ssh", "sshvault", "config"),
+                            "pw-%s.it.example" % TAG], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                           timeout=60, env=home["env"])
+        assert g.returncode == 0, account.scrub(g.stderr)
+        assert not os.path.exists(os.path.join(home["runtime"], "sshvault", "pw")) or \
+            not os.listdir(os.path.join(home["runtime"], "sshvault", "pw"))
 
 
 def check_uninstall(account, home, report):
