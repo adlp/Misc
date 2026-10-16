@@ -2,7 +2,7 @@
 
 Clés SSH dans un Vaultwarden auto-hébergé, utilisées de façon transparente par ssh.
 
-État (0.15.0) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
+État (0.16.0) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
 + e-mail, sur un même serveur ou sur des serveurs différents ; déconnexion par `sshvault
 logout`, serveur ou e-mail corrigé par `sshvault account set` ; voir « Comptes du coffre »),
 **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
@@ -920,8 +920,16 @@ déverrouillage par compte concerné et par connexion (l'invite nomme l'alias).
 chaque paramètre, la première valeur rencontrée l'emporte). « En tête » : avant la
 première ligne qui n'est ni vide ni un commentaire (lignes coupées sur le seul saut de
 ligne, comme ssh). `sshvault ssh-config install` insère
-`Include "<répertoire personnel>/.ssh/sshvault/config"` en première ligne (vos
-commentaires d'en-tête restent dessous, inchangés) :
+`Include "~/.ssh/sshvault/config"` en première ligne (vos commentaires d'en-tête restent
+dessous, inchangés). ssh développe ce `~` avec `$HOME`, entre guillemets aussi (mesuré,
+OpenSSH 8.9p1) : la forme `~` est écrite quand `$HOME` (normalisé) est le répertoire
+personnel où sshvault écrit (celui de passwd), et sert alors telle quelle sur une autre
+machine au répertoire personnel différent qui partage le fichier (config versionnée par
+git) ; sinon la forme absolue `Include "<répertoire personnel>/.ssh/sshvault/config"`. Le
+`~` est développé à chaque lancement d'ssh avec **son** `$HOME` : un ssh lancé avec un autre
+`$HOME` (`sudo` ou `su` qui garde `HOME`, script qui le change) ne trouve pas la config
+générée. Les deux formes sont reconnues partout (install, uninstall, `--check`,
+avertissements) ; une ligne absolue déjà en tête n'est pas réécrite :
 
 - idempotent (ligne déjà en tête, sous toute forme : chemin réel, `~`, `~user`, relatif à
   `~/.ssh`, joker qui couvre le fichier généré pour ssh (voir plus bas), parmi plusieurs
@@ -985,9 +993,35 @@ commentaires d'en-tête restent dessous, inchangés) :
   `.bak.1`, `.bak.2`… (0600) ; écriture atomique, mode et propriétaire conservés ; fichier
   absent : créé en 0600 (et `~/.ssh` en 0700 s'il manque), sans écraser un fichier créé
   entre-temps ;
-- `~/.ssh/config` lien symbolique ou non ordinaire (FIFO, dossier) : code 4, rien
-  modifié ; chemin personnel avec `%`, `$` ou un joker de glob : code 4 (`Include`
-  développe les tokens dans les versions récentes d'OpenSSH, pas en 8.9).
+- `~/.ssh/config` **lien symbolique** (config versionnée par git, `~/.ssh/config →
+  ~/dotfiles/ssh/config`) : le lien est suivi maillon par maillon (liens relatifs résolus
+  depuis le chemin réel de leur dossier, comme le noyau) et la ligne est écrite dans sa
+  **cible finale**, si elle passe les contrôles qu'ssh applique au fichier qu'il lit (un
+  fichier à un autre que vous ou root, ou modifiable par le groupe ou les autres, fait
+  échouer ssh : « Bad owner or permissions », lien suivi ; mesuré 8.9p1), plus ceux de
+  `bw-path` pour les dossiers : cible = fichier ordinaire **à vous**, non modifiable par le
+  groupe ni les autres ; dossier de chaque maillon et tous ses parents jusqu'à `/` à vous ou
+  à root, non modifiables par le groupe ni les autres (sticky bit compris : un maillon sous
+  `/tmp` est refusé) ; pour écrire, dossier de la cible modifiable par vous (vérifié avant
+  toute sauvegarde, et seulement s'il faut écrire). Écriture atomique dans le dossier de la
+  cible, mode et propriétaire conservés ; sauvegarde du contenu de la cible dans
+  `~/.ssh/config.sshvault.bak*` comme d'habitude ; le lien et ses maillons ne sont jamais
+  modifiés ni remplacés par un fichier ; message « lien suivi : écrit dans <cible> ».
+  Contrôle échoué (lien cassé, boucle, cible non ordinaire, à un autre, droits ou dossier
+  ouverts, dossier de la cible non modifiable) : code 4, rien modifié, une ligne qui nomme
+  le lien, la cible (boucle : la valeur du lien), la raison et l'action à faire à la main :
+  « ajouter en première ligne de <cible> : Include "~/.ssh/sshvault/config" » (boucle : «
+  réparer le lien <lien> puis relancer » ; cible non ordinaire : « remplacer <cible> par un
+  fichier ordinaire (ou réparer le lien) puis relancer »), suivie de « ou corriger par «
+  chmod g-w,o-w <chemins> » puis relancer « sshvault ssh-config install » » quand ce chmod
+  lève à lui seul toutes les raisons (ssh refuse de toute façon une cible ouverte). Contrôle
+  échoué mais `Include` de sshvault déjà en tête de la cible : rien à écrire, code 0, « déjà
+  en tête, rien changé » et un avertissement qui nomme le lien, la cible et la raison (aucun
+  pour un dossier de la cible seulement non modifiable). Aucune option pour passer outre ;
+- `~/.ssh/config` non ordinaire (FIFO, dossier) : code 4, rien modifié ; chemin personnel
+  avec `%`, `$` ou un joker de glob : code 4, quelle que soit la forme écrite (`Include`
+  développe les tokens dans les versions récentes d'OpenSSH, pas en 8.9 ; le glob lit
+  `$HOME` comme un motif).
 
 Jamais automatique : `ssh-config` et `hosts` préviennent seulement (stderr) si la ligne
 manque, est conditionnelle ou n'est pas en tête (avec les jokers voisins).
@@ -1009,9 +1043,20 @@ régénération, rien d'autre, sans accès au coffre :
 - `~/.ssh/sshvault/config` est supprimé ; dans `~/.ssh/sshvault/pub/`, seuls les `*.pub`
   (fichiers ordinaires) le sont, puis le dossier s'il est vide (sinon gardé, avertissement) ;
   `~/.ssh/sshvault/` lui-même reste ;
-- mêmes refus qu'`install` : `~/.ssh/config` lien symbolique ou non ordinaire, ou
-  `~/.ssh/sshvault`, sa config ou `pub/` d'un type inattendu (lien…) : code 4, rien
-  modifié ; rien d'installé : « rien à faire », code 0 ; `--print`/`--check` exclus (code 2).
+- `~/.ssh/config` lien symbolique : même règle qu'`install`, lignes retirées de la cible
+  finale (lien intact, « lien suivi : écrit dans <cible> ») ; contrôle échoué avec des lignes
+  de sshvault à retirer de la cible : code 4, rien modifié (ni cible, ni config générée, ni
+  `pub/`), une ligne qui nomme le lien, la cible, la raison et, pour chaque ligne
+  qu'`uninstall` aurait retirée, « retirer de <cible> la ligne N : <ligne> » (et le `chmod`
+  comme pour `install`, puis relancer « sshvault ssh-config uninstall » ; cible illisible :
+  « retirer à la main » ; non ordinaire : « remplacer <cible> par un fichier ordinaire ») ;
+  dossier de la cible non modifiable : même refus s'il y a des lignes à retirer ; contrôle
+  échoué sans rien à retirer de la cible (aucune ligne de sshvault, cible absente, boucle) :
+  code 0, un avertissement (lien, cible, raison), cible non touchée, et le reste est
+  désinstallé (config générée, `pub/`) ;
+- mêmes refus qu'`install` : `~/.ssh/config` non ordinaire, ou `~/.ssh/sshvault`, sa config
+  ou `pub/` d'un type inattendu (lien…) : code 4, rien modifié ; rien d'installé : « rien à
+  faire », code 0 ; `--print`/`--check` exclus (code 2).
 
 Agents, comptes, sessions et données de `bw` sont gardés (`sshvault agent stop` arrête
 l'agent dédié, `sshvault account remove` oublie un compte). Pour tout retirer : `sshvault
@@ -1258,7 +1303,7 @@ relié à ses hôtes par ses URI :
 | 1 | `search`, `load`, `hosts`, `forward`, `pubkey`, `deploy`, `password hosts` : aucun résultat ; `password hosts remove` : paire absente, `password hosts remove`/`set` : URI à retirer non confirmées — autre réponse que `o`/`oui`/`y`/`yes`, délai ou fin de saisie — (rien écrit) ; `import` : clé déjà dans le coffre (rien créé) ; `generate` : nom déjà pris, sans `--force` (rien généré) ; `hosts remove`, `forward remove` : hôte absent (rien écrit) ; `ssh-config --check` : pas à jour (contenu, droits, fichier en trop ou non ordinaire), ou ligne `Include` absente, conditionnelle ou pas en tête |
 | 2 | usage (option ou argument invalide ; `load` sans sélection ni `--all`) ; comptes : alias invalide ou inconnu, alias ou couple serveur + e-mail déjà enregistré, serveur ou e-mail invalide, écriture sans `--account` quand plusieurs comptes sont possibles, `login` ou `logout` sans `--account` avec plusieurs comptes, aucun compte par défaut, `account rename` vers un alias pris, `account add` : dossier `accounts/<alias>` existant, `account set` sans `--server` ni `--email`, `account set` : registre refusé après la déconnexion (couple pris entre-temps ; ce qui est déjà fait est dit) ; `logout`, `account set` : `bw-path` invalide (rien fait) ; durée invalide ; `config.json` invalide, illisible ou aux droits inattendus ; `config set bw-path` : chemin relatif, absent, avec un caractère de contrôle, ou pas un fichier ordinaire exécutable ; `bw-path` invalide dans `config.json` ; hôte invalide ; sélection de `hosts` ou `forward` qui désigne plusieurs éléments ; `import` : fichier refusé (illisible, pas une clé privée, type ou format non accepté), `--name` avec plusieurs fichiers ; `generate` : type, bits, nom ou commentaire refusés ; `deploy` : cible, port ou options ssh invalides ou refusées ; délai `SSHVAULT_DEPLOY_TIMEOUT` invalide ; `load --nointeraction` : `SSHVAULT_ENSURE_TIMEOUT` invalide (rien lu, rien chargé) ; `password add` : nom, hôte ou utilisateur refusé, mot de passe vide, saisies différentes ou vides trois fois, stdin de plus d'une ligne, pas de l'UTF-8, de plus de 4096 octets ou sans rien en `SSHVAULT_PROMPT_TIMEOUT`, terminal pas au premier plan, saisie au terminal avec `--nointeraction` (rien créé) ; `password add`, `password hosts add`/`set` : hôte et utilisateur déjà portés par un autre élément identifiant, sans `--force` (rien écrit) ; `password hosts remove`/`set` : URI à retirer sans terminal ou avec `--nointeraction`, sans `--yes` (rien écrit) |
 | 3 | aucun compte enregistré (`ssh-config` n'écrit alors rien, `lock` compris), non connecté (« lancer sshvault login » ; `ensure` d'un compte déconnecté par `logout` : « lancer sshvault login --account ALIAS »), ou coffre verrouillé : aucune invite possible, invite annulée ou sans réponse, mot de passe refusé ; agent dédié arrêté (`agent status`, `lock`, `unlock`) ou verrouillé (`ensure --forward` compris) ; passphrase d'une clé refusée ou impossible à saisir (`load`, `import`) ; `load` : compte déconnecté, verrouillé, retiré, renommé ou modifié pendant l'attente du verrou d'`ensure` (rien chargé) ; `login` refusé par bw (mot de passe, limite de débit des connexions du serveur — réessayer dans une minute —, réseau) |
-| 4 | erreur du backend : `bw` introuvable, non exécutable, interpréteur ou chargeur absent, format non exécutable (au chemin du réglage `bw-path` compris, le PATH n'étant alors pas essayé), en erreur, réponse illisible, délai dépassé ; magasin de session inutilisable ; agent dédié : `XDG_RUNTIME_DIR` relatif, non privé ou hors tmpfs, chemin du socket trop long, agent tiers sur le socket, OpenSSH < 8.9, `--restrict` (élément sans hôte, hôte non littéral ou absent de `known_hosts`), sous-agent de transfert en erreur (`agent status`, `stop`, `purge`, `lock`), clé publique illisible ou différente de la clé privée, `ssh-add`/`ssh-agent` en erreur ; écriture de `config.json` impossible ; écriture des hôtes ou des transferts dans le coffre non aboutie ou non vérifiée (y compris écrits mais `ssh_config` non régénéré) ; `password add`, `password hosts` : création ou écriture de l'élément identifiant non aboutie ou non vérifiée (y compris écrite mais `ssh_config` non régénéré) ; `ensure --forward` : `forward-confirm` sans askpass, élément qui ne déclare plus ce transfert, chemin du socket de transfert trop long ; `import` : création non aboutie ou non vérifiée (y compris clé importée mais `ssh_config` non régénéré), copie impossible dans un tmpfs privé (`--decrypt`), `ssh-keygen` absent ou en erreur ; `generate` : tmpfs privé inutilisable, `ssh-keygen` absent ou en erreur, création non aboutie ou non vérifiée (clé perdue, dit), clé créée mais `ssh_config` non régénéré ; `pubkey` : clé publique d'un élément illisible ; `deploy` : `ssh` absent, en échec ou sans réponse (`SSHVAULT_DEPLOY_TIMEOUT`), réponse inattendue de la cible, échec partiel (clés déjà ajoutées dites, puis code 4), clé publique illisible ; `ssh_config` généré impossible à écrire (chemin avec `"`, `\`, `${`, fichier non ordinaire, droits) ; répertoire personnel inconnu ; `ssh-config install` refusé (lien symbolique, fichier non ordinaire, `Include` exact conditionnel, chemin personnel avec `%`, `$` ou joker) ; `ssh-config uninstall` refusé (`~/.ssh/config` lien symbolique ou non ordinaire, `~/.ssh/sshvault`, sa config ou `pub/` d'un type inattendu : rien modifié) ; `lock --unload` : agent verrouillé ou en erreur (coffre verrouillé quand même, clés laissées) ; adoption de l'installation 0.8.0 impossible (rien modifié ; `account add` refusé tant qu'elle n'est pas faite) ; `account rename` : destination existante ou déplacement impossible (rien changé) ; `account remove` : données locales impossibles à supprimer (compte gardé), magasin de session ou agent en erreur ou verrouillé (clés laissées, état gardé) ; `logout`, `account set` : agent en erreur ou verrouillé (rien modifié, ou état partiel dit), `bw logout` en échec ou sans réponse (compte toujours connecté, ou état inconnu ; `account set` : registre inchangé), `account set` : écriture du registre impossible après la déconnexion (ce qui est déjà fait est dit) ; `ssh-config --check` : `bw` en erreur, même pour un compte déconnecté ; erreur interne ; `load` : « verrou d'ensure tenu : rien chargé » (`--nointeraction`, attente au-delà de `SSHVAULT_ENSURE_TIMEOUT`), `bw status` en erreur à la relecture d'un compte sous le verrou |
+| 4 | erreur du backend : `bw` introuvable, non exécutable, interpréteur ou chargeur absent, format non exécutable (au chemin du réglage `bw-path` compris, le PATH n'étant alors pas essayé), en erreur, réponse illisible, délai dépassé ; magasin de session inutilisable ; agent dédié : `XDG_RUNTIME_DIR` relatif, non privé ou hors tmpfs, chemin du socket trop long, agent tiers sur le socket, OpenSSH < 8.9, `--restrict` (élément sans hôte, hôte non littéral ou absent de `known_hosts`), sous-agent de transfert en erreur (`agent status`, `stop`, `purge`, `lock`), clé publique illisible ou différente de la clé privée, `ssh-add`/`ssh-agent` en erreur ; écriture de `config.json` impossible ; écriture des hôtes ou des transferts dans le coffre non aboutie ou non vérifiée (y compris écrits mais `ssh_config` non régénéré) ; `password add`, `password hosts` : création ou écriture de l'élément identifiant non aboutie ou non vérifiée (y compris écrite mais `ssh_config` non régénéré) ; `ensure --forward` : `forward-confirm` sans askpass, élément qui ne déclare plus ce transfert, chemin du socket de transfert trop long ; `import` : création non aboutie ou non vérifiée (y compris clé importée mais `ssh_config` non régénéré), copie impossible dans un tmpfs privé (`--decrypt`), `ssh-keygen` absent ou en erreur ; `generate` : tmpfs privé inutilisable, `ssh-keygen` absent ou en erreur, création non aboutie ou non vérifiée (clé perdue, dit), clé créée mais `ssh_config` non régénéré ; `pubkey` : clé publique d'un élément illisible ; `deploy` : `ssh` absent, en échec ou sans réponse (`SSHVAULT_DEPLOY_TIMEOUT`), réponse inattendue de la cible, échec partiel (clés déjà ajoutées dites, puis code 4), clé publique illisible ; `ssh_config` généré impossible à écrire (chemin avec `"`, `\`, `${`, fichier non ordinaire, droits) ; répertoire personnel inconnu ; `ssh-config install` refusé (fichier non ordinaire, lien symbolique dont la cible échoue aux contrôles alors qu'il faudrait y écrire — lien cassé, boucle, cible non ordinaire, à un autre, droits ou dossier ouverts, dossier de la cible non modifiable —, `Include` exact conditionnel, chemin personnel avec `%`, `$` ou joker) ; `ssh-config uninstall` refusé (`~/.ssh/config` non ordinaire, ou lien symbolique dont il faudrait modifier la cible refusée — lignes de sshvault à retirer — ou dont la cible est illisible ou non ordinaire, `~/.ssh/sshvault`, sa config ou `pub/` d'un type inattendu : rien modifié) ; `lock --unload` : agent verrouillé ou en erreur (coffre verrouillé quand même, clés laissées) ; adoption de l'installation 0.8.0 impossible (rien modifié ; `account add` refusé tant qu'elle n'est pas faite) ; `account rename` : destination existante ou déplacement impossible (rien changé) ; `account remove` : données locales impossibles à supprimer (compte gardé), magasin de session ou agent en erreur ou verrouillé (clés laissées, état gardé) ; `logout`, `account set` : agent en erreur ou verrouillé (rien modifié, ou état partiel dit), `bw logout` en échec ou sans réponse (compte toujours connecté, ou état inconnu ; `account set` : registre inchangé), `account set` : écriture du registre impossible après la déconnexion (ce qui est déjà fait est dit) ; `ssh-config --check` : `bw` en erreur, même pour un compte déconnecté ; erreur interne ; `load` : « verrou d'ensure tenu : rien chargé » (`--nointeraction`, attente au-delà de `SSHVAULT_ENSURE_TIMEOUT`), `bw status` en erreur à la relecture d'un compte sous le verrou |
 | 130 | interrompu (Ctrl-C, SIGTERM, SIGHUP) ; pendant `bw logout` (`logout`, `account set`) : état relu, marqueur `logged-out` posé si bw est déconnecté ou si son état est inconnu |
 
 `agent status`, `stop`, `purge`, `lock` : code de l'agent dédié (`status` : 0 actif, 3 arrêté),
@@ -1378,8 +1423,19 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   simuler un `edit` en échec, bloqué, passé puis bloqué, ou en concurrence. `ssh-config
   uninstall` : `install` puis `uninstall` rendent `~/.ssh/config` identique (mode compris)
   et `ssh -G` ne montre plus l'agent dédié ; Include mixte, joker, plus bas, dans un bloc,
-  lien, FIFO, `pub/` avec d'autres fichiers. `install` : joker ou ligne mixte plus bas, dans
-  un bloc ou en tête (gardé, avertissement), exact dans un bloc (refus), puis `uninstall`.
+  lien, FIFO, `pub/` avec d'autres fichiers. `~/.ssh/config` lien symbolique (HOME de test
+  sous `/run/user/<uid>`, seul dossier du poste sans parent ouvert à d'autres) : lien vers
+  une config git, chaîne de liens relatifs, `..` sous un `~/.ssh` lien, déjà en tête (forme
+  `~` ou absolue), install puis uninstall (cible rendue identique, lien intact à chaque
+  étape) ; refus sans rien modifier (arborescence comparée) : lien cassé, boucle, FIFO, cible
+  0664/0606, dossier g+w (chmod proposé), maillon sous un dossier à sticky bit, `/tmp`,
+  dossier de la cible non modifiable, cible à un autre ou à root, chaîne qui ne mène pas à la
+  cible, cible remplacée ou disparue entre le contrôle et l'écriture ; rien à écrire malgré un
+  contrôle échoué (déjà en tête ; uninstall sans ligne, lien cassé, boucle, ligne mixte) :
+  code 0 et avertissement ; `ssh -G -F` réel qui lit `Include "~/…"` avec le HOME du banc (et
+  rien avec un autre HOME) ; HOME différent : forme absolue. `install` : joker ou ligne mixte
+  plus bas, dans un bloc ou en tête (gardé, avertissement), exact dans un bloc (refus), puis
+  `uninstall`.
   Jokers : chaque forme mesurée (`~/.ssh/*`, `~/*/sshvault/config`, `~/.ssh/*/config`,
   `~/.*/sshvault/config`, `?`, `[s]`, `[!x]`, `[.]`…) comparée à la réponse d'`ssh -G` du
   poste ; formes relatives à `~/.ssh`, jokers sous un lien symbolique ; `install`,

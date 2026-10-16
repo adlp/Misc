@@ -433,6 +433,12 @@ def test_ssh_config_sans_xdg_runtime_prive(bench, tmp_path):
 # --- ligne Include (ssh-config install) ---------------------------------------------------
 
 def include(bench):
+    """Ligne écrite par install : forme `~` (le banc pose HOME = SSHVAULT_SSH_HOME)."""
+    return 'Include "~/.ssh/sshvault/config"'
+
+
+def include_abs(bench):
+    """Forme absolue (HOME différent du répertoire personnel de sshvault, ou écrite à la main)."""
     return 'Include "%s"' % (sv_dir(bench) / "config")
 
 
@@ -501,19 +507,6 @@ def test_install_include_en_tete_sous_une_autre_forme(bench):
     (ssh / "config").write_text("Include ~/.ssh/sshvault/config\nHost a\n")
     r = bench.run("ssh-config", "install")
     assert r.returncode == 0 and "déjà en tête" in r.stdout
-
-
-def test_install_lien_symbolique_refuse(bench, tmp_path):
-    ssh = bench.home / ".ssh"
-    ssh.mkdir(mode=0o700)
-    target = tmp_path / "dotfiles-config"
-    target.write_text("Host a\n")
-    (ssh / "config").symlink_to(target)
-    r = bench.run("ssh-config", "install")
-    assert r.returncode == 4
-    assert "lien symbolique" in one_line_error(r)
-    assert target.read_text() == "Host a\n" and os.path.islink(ssh / "config")
-    assert sorted(os.listdir(ssh)) == ["config"]
 
 
 def test_install_chemin_avec_pourcent_refuse(bench):
@@ -1898,21 +1891,6 @@ def test_uninstall_include_plus_bas_et_dans_un_bloc(bench):
     assert (ssh / "config.sshvault.bak").exists()
 
 
-def test_uninstall_lien_refuse_rien_modifie(bench, tmp_path):
-    """Matrice : ~/.ssh/config lien symbolique : code 4, rien modifié (ni config générée ni pub/)."""
-    installed(bench)
-    ssh = bench.home / ".ssh"
-    target = tmp_path / "dotfiles-config"
-    target.write_text((ssh / "config").read_text())
-    (ssh / "config").unlink()
-    (ssh / "config").symlink_to(target)
-    before = sorted(os.listdir(sv_dir(bench) / "pub"))
-    r = bench.run("ssh-config", "uninstall")
-    assert r.returncode == 4 and "lien symbolique" in one_line_error(r) and "rien modifié" in r.stderr
-    assert target.read_text().startswith(include(bench)) and os.path.islink(ssh / "config")
-    assert (sv_dir(bench) / "config").exists() and sorted(os.listdir(sv_dir(bench) / "pub")) == before
-
-
 def test_uninstall_non_ordinaire_refuse(bench):
     ssh = bench.home / ".ssh"
     ssh.mkdir(mode=0o700)
@@ -1996,3 +1974,559 @@ def test_uninstall_include_garde_dit_que_sshvault_reste_actif(bench):
     assert "prochaine régénération" in r.stdout
     r = bench.run("ssh-config", "uninstall")
     assert r.returncode == 0 and r.stdout == "rien d'autre à faire\n"
+
+
+# --- ~/.ssh/config lien symbolique (story 19) ------------------------------------------------
+
+def safe_home(bench):
+    """HOME de test sous `bench.safe()` (/run/user/<uid>) : ni lui ni aucun parent ouvert à
+    d'autres, comme l'exige le suivi d'un ~/.ssh/config lien symbolique (sous /tmp, sticky 1777 :
+    toujours refusé). Ignore le test si le poste n'en a pas."""
+    h = bench.safe() / "home"
+    h.mkdir(mode=0o700)
+    h.chmod(0o700)
+    bench.home = h
+    bench.appdata = h / ".local" / "share" / "sshvault" / "accounts" / "alice" / "bw"
+    bench.env["HOME"] = bench.env["SSHVAULT_SSH_HOME"] = str(h)
+    return h
+
+
+def dotfiles(bench, text="Host a\n    User x\n", mode=0o600):
+    """~/.ssh/config lien relatif vers ~/dotfiles/ssh/config (config versionnée par git) :
+    (lien, cible). Dossiers ramenés à 0700 (umask 002 du poste)."""
+    d = bench.home / "dotfiles" / "ssh"
+    d.mkdir(parents=True)
+    for x in (d.parent, d):
+        x.chmod(0o700)
+    target = d / "config"
+    target.write_text(text)
+    target.chmod(mode)
+    link = _ssh_dir(bench) / "config"
+    link.symlink_to("../dotfiles/ssh/config")
+    return link, target
+
+
+def tree(root):
+    """Tout ce qui est sous `root` : {chemin: (type, mode, inode, mtime, contenu ou cible du lien)}."""
+    out = {}
+    for d, subdirs, files in os.walk(str(root)):
+        for name in subdirs + files:
+            p = os.path.join(d, name)
+            st = os.lstat(p)
+            if stat.S_ISLNK(st.st_mode):
+                body = os.readlink(p)
+            elif stat.S_ISREG(st.st_mode):
+                try:
+                    body = pathlib.Path(p).read_bytes()
+                except PermissionError:
+                    body = "illisible"
+            else:
+                body = None
+            out[p] = (stat.S_IFMT(st.st_mode), stat.S_IMODE(st.st_mode), st.st_ino, st.st_mtime_ns, body)
+    return out
+
+
+def test_include_line_forme_tilde_si_home_egal(tmp_path):
+    paths = sshconfig.Paths(str(tmp_path))
+    absolute = 'Include "%s/.ssh/sshvault/config"' % tmp_path
+    for home in (str(tmp_path), str(tmp_path) + "/", str(tmp_path) + "/./x/.."):
+        assert sshconfig.include_line(paths, {"HOME": home}) == 'Include "~/.ssh/sshvault/config"', home
+    for env in ({"HOME": str(tmp_path / "autre")}, {}, {"HOME": ""}, {"HOME": "relatif"}):
+        assert sshconfig.include_line(paths, env) == absolute, env
+
+
+def test_install_home_different_include_absolu(bench, tmp_path):
+    """Matrice : $HOME ≠ répertoire personnel de sshvault : Include absolu."""
+    other = tmp_path / "autre-home"
+    other.mkdir()
+    r = bench.run("ssh-config", "install", env={"HOME": str(other)})
+    assert r.returncode == 0, r.stderr
+    assert (bench.home / ".ssh" / "config").read_text() == include_abs(bench) + "\n"
+    assert not (other / ".ssh").exists()
+
+
+def test_install_lien_vers_config_git(bench):
+    """Matrice : lien vers une config git sûre : Include en tête de la cible, lien intact,
+    sauvegarde du contenu de la cible, « lien suivi »."""
+    safe_home(bench)
+    link, target = dotfiles(bench)
+    orig = target.read_text()
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0, r.stderr
+    assert "ajoutée en tête" in r.stdout and "lien suivi : écrit dans %s" % target in r.stdout, r.stdout
+    assert os.path.islink(link) and os.readlink(link) == "../dotfiles/ssh/config"
+    assert target.read_text() == include(bench) + "\n" + orig and mode(target) == 0o600
+    ssh = bench.home / ".ssh"
+    assert (ssh / "config.sshvault.bak").read_text() == orig and mode(ssh / "config.sshvault.bak") == 0o600
+    assert sorted(os.listdir(ssh)) == ["config", "config.sshvault.bak"]
+    assert sorted(os.listdir(target.parent)) == ["config"], "aucun temporaire laissé"
+
+
+def test_install_chaine_de_liens(bench):
+    """Matrice : lien → lien relatif → cible : écrit dans la cible finale, maillons intacts."""
+    safe_home(bench)
+    link, target = dotfiles(bench, mode=0o640)
+    mid = bench.home / "dotfiles" / "actuel"
+    mid.symlink_to("ssh/config")
+    link.unlink()
+    link.symlink_to("../dotfiles/actuel")
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0, r.stderr
+    assert "lien suivi : écrit dans %s" % target in r.stdout
+    assert os.readlink(link) == "../dotfiles/actuel" and os.readlink(mid) == "ssh/config"
+    assert target.read_text() == include(bench) + "\nHost a\n    User x\n" and mode(target) == 0o640
+
+
+@pytest.mark.parametrize("form", ["absolue", "tilde"])
+def test_install_lien_deja_en_tete(bench, form):
+    """Matrice : cible avec Include absolu ou `~` en tête : rien changé (ni réécrit ni sauvegardé)."""
+    safe_home(bench)
+    first = include_abs(bench) if form == "absolue" else include(bench)
+    link, target = dotfiles(bench, first + "\nHost a\n")
+    st = os.stat(target)
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0 and "non conforme" not in r.stderr, r.stdout + r.stderr
+    assert r.stdout == "%s : ligne Include déjà en tête, rien changé (lien suivi : %s)\n" % (link, target)
+    st2 = os.stat(target)
+    assert (st2.st_ino, st2.st_mtime_ns) == (st.st_ino, st.st_mtime_ns)
+    assert target.read_text() == first + "\nHost a\n" and os.path.islink(link)
+    assert sorted(os.listdir(bench.home / ".ssh")) == ["config"]
+
+
+@pytest.mark.parametrize("case,why,chmod", [
+    ("casse", "lien cassé : cible absente", None),
+    ("fifo", "cible pas un fichier ordinaire", None),
+    ("cible-0664", "fichier {target} modifiable par le groupe ou les autres", "{target}"),
+    ("cible-0606", "fichier {target} modifiable par le groupe ou les autres", "{target}"),
+    ("dossier-g+w", "dossier {dir} modifiable par le groupe ou les autres", "{dir}"),
+    ("dossier-du-maillon-sticky", "dossier {mid} modifiable par le groupe ou les autres", None),
+    ("dossier-cible-0500", "dossier de la cible non modifiable : {dir}", None),
+    # chmod proposé seulement s'il lève toutes les raisons
+    ("cible-0664-et-maillon-sticky", "fichier {target} modifiable par le groupe ou les autres", None),
+    ("cible-0664-et-dossier-0500", "fichier {target} modifiable par le groupe ou les autres ; dossier de la cible "
+                                   "non modifiable : {dir}", None),
+])
+def test_install_lien_refuse_rien_modifie(bench, case, why, chmod):
+    """Matrice : lien cassé, cible non ordinaire ou ouverte, dossier de la chaîne ouvert (sticky
+    compris), dossier de la cible non modifiable : code 4, une ligne (lien, cible, raison, ligne
+    à ajouter, chmod s'il suffit), rien créé ni modifié (aucune sauvegarde)."""
+    safe_home(bench)
+    link, target = dotfiles(bench)
+    mid = bench.home / "partage"
+    if case == "casse":
+        target.unlink()
+    elif case == "fifo":
+        target.unlink()
+        os.mkfifo(target)
+    elif case.startswith("cible-0664-et-"):
+        target.chmod(0o664)
+        if case.endswith("0500"):
+            target.parent.chmod(0o500)
+    elif case.startswith("cible-"):
+        target.chmod(int(case[-4:], 8))
+    elif case == "dossier-g+w":
+        target.parent.chmod(0o770)
+    elif case == "dossier-cible-0500":
+        target.parent.chmod(0o500)
+    if case.endswith("sticky"):  # maillon intermédiaire dans un dossier à sticky bit : jamais exempté
+        mid.mkdir()
+        mid.chmod(0o1777)
+        (mid / "lien").symlink_to(target)
+        link.unlink()
+        link.symlink_to(mid / "lien")
+    before = tree(bench.home)
+    r = bench.run("ssh-config", "install", timeout=20)
+    assert r.returncode == 4, r.stdout + r.stderr
+    line = one_line_error(r)
+    assert line.startswith("sshvault: %s : lien symbolique vers %s refusé (" % (link, target)), line
+    fmt = dict(target=target, dir=target.parent, mid=mid)
+    assert why.format(**fmt) in line, line
+    action = "rien modifié ; ajouter en première ligne de %s : %s" % (target, include(bench))
+    if case == "fifo":
+        action = "rien modifié ; remplacer %s par un fichier ordinaire (ou réparer le lien) puis relancer" % target
+    if chmod is None:
+        assert line.endswith(action) and "chmod" not in line, line
+    else:
+        assert line.endswith("%s ; ou corriger par « chmod g-w,o-w %s » puis relancer « sshvault ssh-config install »"
+                             % (action, chmod.format(**fmt))), line
+    assert tree(bench.home) == before
+
+
+def test_install_lien_boucle_refuse(bench):
+    safe_home(bench)
+    ssh = _ssh_dir(bench)
+    (ssh / "config").symlink_to("boucle")
+    (ssh / "boucle").symlink_to("config")
+    before = tree(bench.home)
+    r = bench.run("ssh-config", "install", timeout=20)
+    assert r.returncode == 4
+    line = one_line_error(r)
+    assert line == ("sshvault: %s : lien symbolique vers boucle refusé (boucle de liens symboliques) : rien modifié ; "
+                    "réparer le lien %s puis relancer" % (ssh / "config", ssh / "config")), line
+    assert tree(bench.home) == before
+
+
+def test_install_lien_sous_tmp_refuse(bench, tmp_path):
+    """HOME du banc sous /tmp (sticky 1777, à root) : jamais exempté, refus qui donne la ligne."""
+    if not str(tmp_path).startswith("/tmp/") or not os.stat("/tmp").st_mode & stat.S_ISVTX:
+        pytest.skip("dossier de test hors d'un /tmp à sticky bit")
+    ssh = _ssh_dir(bench)
+    target = tmp_path / "dotfiles-config"
+    target.write_text("Host a\n")
+    target.chmod(0o600)
+    (ssh / "config").symlink_to(target)
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 4
+    line = one_line_error(r)
+    assert "dossier /tmp modifiable par le groupe ou les autres" in line, line
+    assert "ajouter en première ligne de %s : %s" % (target, include(bench)) in line
+    assert target.read_text() == "Host a\n" and os.path.islink(ssh / "config")
+    assert sorted(os.listdir(ssh)) == ["config"]
+
+
+@pytest.mark.parametrize("owner", ["autre", "root"])
+def test_install_lien_cible_a_un_autre_refuse(bench, monkeypatch, owner):
+    """Cible à un autre utilisateur, ou à root (ssh l'accepterait, sshvault ne l'écrit pas) :
+    refus, rien modifié ; les dossiers à root restent acceptés."""
+    safe_home(bench)
+    link, target = dotfiles(bench)
+    before = tree(bench.home)
+    real_uid, real_stat = os.getuid(), os.stat
+    if owner == "autre":
+        monkeypatch.setattr(os, "getuid", lambda: real_uid + 4242)
+    else:
+        def fake_stat(p, *a, **k):
+            st = real_stat(p, *a, **k)
+            if os.fspath(p) == str(target):
+                st = os.stat_result(st[:4] + (0,) + st[5:])
+            return st
+        monkeypatch.setattr(os, "stat", fake_stat)
+    with pytest.raises(sshconfig.SshConfigError) as e:
+        sshconfig.install(sshconfig.Paths(str(bench.home)))
+    monkeypatch.undo()
+    msg = str(e.value)
+    assert "fichier %s à un autre utilisateur (uid %d)" % (target, real_uid if owner == "autre" else 0) in msg, msg
+    if owner == "root":
+        assert "dossier" not in msg, "dossiers à root ou à l'utilisateur acceptés"
+    assert "ajouter en première ligne de %s : Include " % target in msg
+    assert tree(bench.home) == before
+
+
+def test_install_puis_uninstall_par_lien(bench):
+    """Critère : lien vers une cible sûre, install puis uninstall : la cible revient à son
+    contenu d'origine, le lien reste un lien à chaque étape."""
+    safe_home(bench)
+    link, target = dotfiles(bench)
+    orig = target.read_text()
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    assert os.path.islink(link)
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0, r.stderr
+    assert os.path.islink(link) and target.read_text() == include(bench) + "\n" + orig
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 0, r.stderr
+    assert "ligne Include de sshvault retirée" in r.stdout and "lien suivi : écrit dans %s" % target in r.stdout
+    assert os.path.islink(link) and os.readlink(link) == "../dotfiles/ssh/config"
+    assert target.read_text() == orig and mode(target) == 0o600
+    assert not (sv_dir(bench) / "config").exists() and not (sv_dir(bench) / "pub").exists()
+    ssh = bench.home / ".ssh"
+    assert (ssh / "config.sshvault.bak.1").read_text() == include(bench) + "\n" + orig
+
+
+def test_uninstall_lien_refuse_rien_modifie(bench):
+    """Matrice : uninstall suit la règle d'install ; refus (lignes à retirer d'une cible
+    refusée) : code 4, chaque ligne qu'uninstall aurait retirée (numéro, texte) dite, chmod
+    proposé, rien modifié (cible, lien, config générée, pub/, sauvegardes)."""
+    safe_home(bench)
+    link, target = dotfiles(bench, "Host a\n")
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    assert bench.run("ssh-config", "install").returncode == 0
+    target.write_text(target.read_text() + "Host b\n    " + include_abs(bench) + "\n")
+    target.chmod(0o664)
+    before = tree(bench.home)
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 4
+    line = one_line_error(r)
+    assert line.startswith("sshvault: %s : lien symbolique vers %s refusé (" % (link, target)), line
+    assert line.endswith("rien modifié ; retirer de %s la ligne 1 : %s ; retirer de %s la ligne 4 : %s ; ou corriger "
+                         "par « chmod g-w,o-w %s » puis relancer « sshvault ssh-config uninstall »"
+                         % (target, include(bench), target, include_abs(bench), target)), line
+    assert tree(bench.home) == before
+
+
+def test_avertissements_et_check_sur_cible_liee(bench, tmp_path):
+    """status (--check) et avertissements des régénérations lisent la cible du lien (lecture
+    seule : même sous /tmp), formes `~` et absolue reconnues."""
+    unlocked(bench)
+    ssh = _ssh_dir(bench)
+    target = tmp_path / "dotfiles-config"
+    target.write_text("Host a\n")
+    (ssh / "config").symlink_to(target)
+    r = bench.run("ssh-config")
+    assert r.returncode == 0 and "n'inclut pas" in r.stderr, r.stderr
+    target.write_text("User x\n" + include(bench) + "\n")
+    r = bench.run("ssh-config")
+    assert r.returncode == 0 and "pas en tête" in r.stderr, r.stderr
+    for first in (include(bench), include_abs(bench)):
+        target.write_text(first + "\nHost a\n")
+        r = bench.run("ssh-config")
+        assert r.returncode == 0 and r.stderr == "", r.stderr
+        r = bench.run("ssh-config", "--check")
+        assert r.returncode == 0 and "à jour" in r.stdout, r.stdout + r.stderr
+    assert os.path.islink(ssh / "config")
+
+
+@needs_ssh
+def test_ssh_reel_lit_include_tilde_avec_home(bench, tmp_path):
+    """OpenSSH du poste : `Include "~/.ssh/sshvault/config"` (forme écrite par install) est lu
+    avec le HOME du banc ; avec un autre HOME, il ne mène à rien."""
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    main = tmp_path / "ssh_config_de_test"
+    main.write_text(include(bench) + "\n")
+    main.chmod(0o600)
+    other = tmp_path / "autre-home"
+    other.mkdir()
+
+    def G(home):
+        env = dict(bench.env, HOME=home)
+        r = subprocess.run([SSH, "-G", "-F", str(main), "prod.example.com"], capture_output=True, text=True,
+                           env=env, stdin=subprocess.DEVNULL, timeout=30)
+        assert r.returncode == 0, r.stderr
+        return [tuple(l.split(" ", 1)) for l in r.stdout.splitlines()]
+    conf = G(str(bench.home))
+    assert values(conf, "identitiesonly") == ["yes"]
+    assert str(sv_dir(bench) / "pub" / pub_name(bench, "prod")) in values(conf, "identityfile")
+    conf = G(str(other))
+    assert values(conf, "identitiesonly") == ["no"]
+    assert not any("sshvault" in v for v in values(conf, "identityfile"))
+
+
+@needs_ssh
+def test_forwardagent_yes_lu_a_travers_un_lien(bench, tmp_path):
+    """`ssh -G -F` du banc : ~/.ssh/config lien vers un fichier ordinaire lu (pas /dev/null)."""
+    unlocked(bench)
+    ssh = _ssh_dir(bench)
+    target = tmp_path / "dotfiles-config"
+    target.write_text(include(bench) + "\nHost *\n    ForwardAgent yes\n")
+    target.chmod(0o600)
+    (ssh / "config").symlink_to(target)
+    r = bench.run("ssh-config")
+    assert r.returncode == 0, r.stderr
+    assert re.findall(r"hôte « ([^»]+) » : ForwardAgent yes", r.stderr) == ["bastion", "jump", "prod.example.com"], \
+        r.stderr
+
+
+@pytest.mark.parametrize("new_mode", [0o664, 0o600])
+@pytest.mark.parametrize("action", ["install", "uninstall"])
+def test_lien_cible_remplacee_apres_controle(bench, monkeypatch, action, new_mode):
+    """Cible remplacée (autre inode ; 0664, ou 0600 à l'utilisateur : seul l'inode diffère) entre
+    le contrôle et la lecture : refus, rien modifié, aucune sauvegarde."""
+    safe_home(bench)
+    link, target = dotfiles(bench, include_abs(bench) + "\nHost a\n" if action == "uninstall" else "Host a\n")
+    real = sshconfig._follow
+
+    def swap(p):
+        lk = real(p)
+        new = target.parent / "neuf"
+        new.write_text("Host z\n")
+        new.chmod(new_mode)
+        os.replace(new, target)
+        return lk
+    monkeypatch.setattr(sshconfig, "_follow", swap)
+    with pytest.raises(sshconfig.SshConfigError) as e:
+        getattr(sshconfig, action)(sshconfig.Paths(str(bench.home)))
+    assert "cible du lien (%s) changée pendant l'opération : rien modifié" % target in str(e.value)
+    assert target.read_text() == "Host z\n" and os.path.islink(link)
+    assert sorted(os.listdir(bench.home / ".ssh")) == ["config"]
+
+
+@pytest.mark.parametrize("dir_mode", [0o700, 0o500])
+def test_install_lien_refuse_mais_deja_en_tete_avertit(bench, dir_mode):
+    """Décision (revue 1) : contrôle échoué mais Include déjà en tête de la cible : rien à
+    écrire, code 0, un avertissement (lien, cible, raison, chmod), rien modifié ; un dossier de
+    la cible non modifiable n'y est pas dit (rien à écrire)."""
+    safe_home(bench)
+    link, target = dotfiles(bench, include(bench) + "\nHost a\n", mode=0o664)
+    target.parent.chmod(dir_mode)
+    before = tree(bench.home)
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "%s : ligne Include déjà en tête, rien changé (lien suivi : %s)\n" % (link, target)
+    assert [l for l in r.stderr.splitlines() if "n'existe pas encore" not in l] == [
+        "sshvault: avertissement : %s : lien symbolique vers %s non conforme (fichier %s modifiable par le groupe ou "
+        "les autres) : rien à y écrire, cible non modifiée ; corriger par « chmod g-w,o-w %s »"
+        % (link, target, target, target)]
+    assert tree(bench.home) == before
+
+
+@pytest.mark.parametrize("case,why", [("casse", "lien cassé : cible absente"),
+                                      ("boucle", "boucle de liens symboliques"),
+                                      ("cible-0664-sans-ligne", "modifiable par le groupe ou les autres")])
+def test_uninstall_lien_rien_a_ecrire(bench, case, why):
+    """Décision (revue 1) : contrôle échoué mais aucune ligne de sshvault dans la cible (ou
+    cible absente, boucle) : code 0, un avertissement, cible et lien non touchés, aucune
+    sauvegarde ; config générée et pub/ retirés quand même."""
+    safe_home(bench)
+    link, target = dotfiles(bench, "Host a\n")
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    assert (sv_dir(bench) / "config").exists() and os.listdir(sv_dir(bench) / "pub")
+    if case == "casse":
+        target.unlink()
+    elif case == "boucle":
+        link.unlink()
+        link.symlink_to("boucle")
+        (link.parent / "boucle").symlink_to("config")
+    else:
+        target.chmod(0o664)
+    keep = {p: v for p, v in tree(bench.home).items() if not p.startswith(str(sv_dir(bench)))}
+    r = bench.run("ssh-config", "uninstall", timeout=20)
+    assert r.returncode == 0, r.stderr
+    line = one_line_error(r)
+    assert line.startswith("sshvault: avertissement : %s : lien symbolique vers " % link), line
+    assert why in line and "rien à y écrire, cible non modifiée" in line, line
+    assert ("chmod g-w,o-w %s" % target in line) == (case == "cible-0664-sans-ligne"), line
+    assert "%s supprimé" % (sv_dir(bench) / "config") in r.stdout, r.stdout
+    assert not (sv_dir(bench) / "config").exists() and not (sv_dir(bench) / "pub").exists()
+    assert {p: v for p, v in tree(bench.home).items() if not p.startswith(str(sv_dir(bench)))} == keep
+
+
+def test_uninstall_lien_cible_disparue_apres_controle(bench, monkeypatch):
+    """Cible supprimée entre le contrôle et la lecture : code 4 (SshConfigError), config générée
+    et pub/ gardés, aucune sauvegarde."""
+    safe_home(bench)
+    link, target = dotfiles(bench, include(bench) + "\nHost a\n")
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    pubs = sorted(os.listdir(sv_dir(bench) / "pub"))
+    real = sshconfig._follow
+
+    def vanish(p):
+        lk = real(p)
+        target.unlink()
+        return lk
+    monkeypatch.setattr(sshconfig, "_follow", vanish)
+    with pytest.raises(sshconfig.SshConfigError) as e:
+        sshconfig.uninstall(sshconfig.Paths(str(bench.home)))
+    assert "cible du lien (%s) changée pendant l'opération : rien modifié" % target in str(e.value)
+    assert (sv_dir(bench) / "config").exists() and sorted(os.listdir(sv_dir(bench) / "pub")) == pubs
+    assert os.path.islink(link) and sorted(os.listdir(bench.home / ".ssh")) == ["config", "sshvault"]
+
+
+def test_install_lien_relatif_sous_un_dossier_lien(bench):
+    """~/.ssh est un lien vers dotfiles/dotssh et config → ../ssh/config : le `..` remonte depuis
+    le dossier réel, comme le noyau (dotfiles/ssh/config), pas depuis ~ (écrit)."""
+    safe_home(bench)
+    d = bench.home / "dotfiles"
+    for sub in ("ssh", "dotssh"):
+        (d / sub).mkdir(parents=True)
+    for x in (d, d / "ssh", d / "dotssh"):
+        x.chmod(0o700)
+    target = d / "ssh" / "config"
+    target.write_text("Host a\n")
+    target.chmod(0o600)
+    (bench.home / ".ssh").symlink_to("dotfiles/dotssh")
+    (d / "dotssh" / "config").symlink_to("../ssh/config")
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0, r.stderr
+    assert "lien suivi : écrit dans %s" % target in r.stdout, r.stdout
+    assert target.read_text() == include(bench) + "\nHost a\n"
+    assert os.readlink(bench.home / ".ssh") == "dotfiles/dotssh"
+    assert os.readlink(d / "dotssh" / "config") == "../ssh/config"
+
+
+def test_install_lien_chaine_qui_ne_mene_pas_a_la_cible(bench, monkeypatch):
+    """Fin de chaîne différente du fichier que le noyau ouvre (forcée) : refus, rien modifié."""
+    safe_home(bench)
+    link, target = dotfiles(bench)
+    other = bench.home / "dotfiles" / "autre"
+    other.write_text("x\n")
+    other.chmod(0o600)
+    real = sshconfig.chain_exposure
+    monkeypatch.setattr(sshconfig, "chain_exposure",
+                        lambda p, root_file=True: (str(other),) + real(p, root_file)[1:])
+    before = tree(bench.home)
+    with pytest.raises(sshconfig.SshConfigError) as e:
+        sshconfig.install(sshconfig.Paths(str(bench.home)))
+    assert "refusé (chaîne de liens qui ne mène pas à %s)" % target in str(e.value)
+    assert tree(bench.home) == before
+
+
+def test_uninstall_lien_refuse_ligne_mixte_dite(bench):
+    """Cible refusée sans ligne de sshvault seule, mais une ligne mixte : rien à y écrire (code 0) ;
+    la ligne mixte, qui inclut toujours le fichier généré, est dite comme d'habitude."""
+    safe_home(bench)
+    mixed = 'Include a "%s"' % (sv_dir(bench) / "config")
+    link, target = dotfiles(bench, "Host a\n" + mixed + "\n", mode=0o664)
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 0, r.stderr
+    lines = r.stderr.splitlines()
+    assert len(lines) == 2 and "non conforme" in lines[0], r.stderr
+    assert "%s ligne 2 : Include de sshvault avec d'autres fichiers : ligne gardée" % link in lines[1], r.stderr
+    assert "ligne Include gardée : elle inclut toujours" in r.stdout, r.stdout
+    assert target.read_text() == "Host a\n" + mixed + "\n"
+
+
+@pytest.mark.parametrize("case", ["fifo", "cible-0020"])
+def test_uninstall_lien_cible_illisible_refuse(bench, case):
+    """Cible refusée qu'uninstall ne peut pas lire (non ordinaire, ou illisible) : on ne sait pas
+    s'il y a des lignes à retirer : code 4, action exacte, rien modifié."""
+    safe_home(bench)
+    link, target = dotfiles(bench, include(bench) + "\n")
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    if case == "fifo":
+        target.unlink()
+        os.mkfifo(target)
+        expected = ("cible pas un fichier ordinaire) : rien modifié ; remplacer %s par un fichier ordinaire (ou "
+                    "réparer le lien) puis relancer" % target)
+    else:
+        target.chmod(0o020)
+        expected = ("fichier %s modifiable par le groupe ou les autres) : rien modifié ; retirer à la main de %s les "
+                    "lignes Include de sshvault ; ou corriger par « chmod g-w,o-w %s » puis relancer « sshvault "
+                    "ssh-config uninstall »" % (target, target, target))
+    before = tree(bench.home)
+    r = bench.run("ssh-config", "uninstall", timeout=20)
+    assert r.returncode == 4
+    assert one_line_error(r) == "sshvault: %s : lien symbolique vers %s refusé (%s" % (link, target, expected)
+    assert tree(bench.home) == before
+
+
+def test_uninstall_lien_dossier_cible_non_modifiable_refuse(bench):
+    """Dossier de la cible non modifiable (0500), lignes de sshvault à retirer : code 4, action
+    exacte, aucune sauvegarde, rien retiré."""
+    safe_home(bench)
+    link, target = dotfiles(bench, "Host a\n")
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    assert bench.run("ssh-config", "install").returncode == 0
+    for b in (bench.home / ".ssh").glob("config.sshvault.bak*"):
+        b.unlink()
+    target.parent.chmod(0o500)
+    before = tree(bench.home)
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 4
+    assert one_line_error(r) == (
+        "sshvault: %s : lien symbolique vers %s refusé (dossier de la cible non modifiable : %s) : rien modifié ; "
+        "retirer de %s la ligne 1 : %s" % (link, target, target.parent, target, include(bench)))
+    assert tree(bench.home) == before
+    assert not list((bench.home / ".ssh").glob("config.sshvault.bak*"))
+
+
+def test_install_lien_deja_en_tete_dossier_cible_non_modifiable_sans_avertissement(bench):
+    """Seule raison : dossier de la cible non modifiable, et rien à écrire : code 0, aucun
+    avertissement (condition de l'écriture de sshvault, pas un contrôle d'ssh)."""
+    safe_home(bench)
+    link, target = dotfiles(bench, include(bench) + "\nHost a\n")
+    target.parent.chmod(0o500)
+    before = tree(bench.home)
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "%s : ligne Include déjà en tête, rien changé (lien suivi : %s)\n" % (link, target)
+    assert "lien symbolique" not in r.stderr and "non modifiable" not in r.stderr, r.stderr
+    assert tree(bench.home) == before

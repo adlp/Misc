@@ -48,10 +48,14 @@ Codes de sortie :
      (SSHVAULT_DEPLOY_TIMEOUT), réponse inattendue, échec partiel (clés déjà ajoutées dites),
      ssh_config généré impossible à écrire (chemin avec « " », « \\ », « ${ », fichier non
      ordinaire, droits), répertoire
-     personnel inconnu, ssh-config install refusé (~/.ssh/config lien symbolique ou non
-     ordinaire, Include de sshvault dans un bloc Host/Match, chemin personnel avec %, $ ou
-     joker de glob), ssh-config uninstall refusé (~/.ssh/config lien symbolique ou non
-     ordinaire, ~/.ssh/sshvault, sa config ou pub/ d'un type inattendu : rien modifié),
+     personnel inconnu, ssh-config install refusé (~/.ssh/config non ordinaire, ou lien
+     symbolique dont la cible échoue aux contrôles alors qu'il faudrait y écrire : lien cassé,
+     boucle, cible non ordinaire, à un autre, droits ou dossier ouverts, dossier de la cible
+     non modifiable ; Include de sshvault dans un bloc Host/Match, chemin
+     personnel avec %, $ ou joker de glob), ssh-config uninstall refusé (~/.ssh/config non
+     ordinaire, ou lien symbolique seulement s'il faudrait écrire dans une cible refusée, lignes
+     de sshvault à retirer, ou si sa cible est illisible ou non ordinaire ; ~/.ssh/sshvault, sa
+     config ou pub/ d'un type inattendu : rien modifié),
      adoption de l'installation 0.8.0 impossible (rien modifié ; account add
      refusé tant qu'elle n'est pas faite), account rename : destination existante ou
      déplacement impossible, account remove : données impossibles à supprimer, magasin de

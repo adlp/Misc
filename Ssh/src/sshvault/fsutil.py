@@ -161,8 +161,10 @@ def _ancestors(d: str) -> list:
 
 def _link_chain(path: str) -> tuple:
     """(cible finale, dossiers à contrôler) : `path` puis chaque lien symbolique suivi (lstat,
-    lien relatif résolu depuis son propre dossier) ; dossiers = dossier de chaque maillon et
-    ses parents jusqu'à `/`, sous leur forme écrite et résolue (sans doublon, dans l'ordre)."""
+    valeur du lien jointe au chemin réel de son dossier, puis sa partie dossier résolue par
+    realpath sans repli textuel de `..`, comme le noyau : un `..` après un dossier lien, dans le
+    chemin ou dans la valeur du lien, remonte depuis sa cible) ; dossiers = dossier de chaque maillon et ses parents
+    jusqu'à `/`, sous leur forme écrite et résolue (sans doublon, dans l'ordre)."""
     dirs = []
 
     def add(d):
@@ -175,29 +177,38 @@ def _link_chain(path: str) -> tuple:
         try:
             if not stat.S_ISLNK(os.lstat(p).st_mode):
                 break
-            p = os.path.normpath(os.path.join(os.path.dirname(p), os.readlink(p)))
+            j = os.path.join(os.path.realpath(os.path.dirname(p)), os.readlink(p))
+            p = os.path.join(os.path.realpath(os.path.dirname(j)), os.path.basename(j))
         except OSError:
             break
+    add(os.path.dirname(p))  # 40 maillons suivis : dossier du dernier atteint (sans doublon)
     return p, dirs
 
 
-def exe_exposure(path: str) -> Optional[tuple]:
-    """(raisons, à chmod, à déplacer) si d'autres que l'utilisateur et root peuvent remplacer
-    l'exécutable `path`, sinon None. Contrôlés, comme le StrictModes d'OpenSSH (safe_path) :
+def chain_exposure(path: str, root_file: bool = True) -> tuple:
+    """(cible finale, raisons, à chmod, à déplacer) de la chaîne de liens qui part de `path`
+    (`_link_chain`) : la règle unique d'`exe_exposure` et de `ssh-config install`/`uninstall`
+    (`~/.ssh/config` lien symbolique). Contrôlés, comme le StrictModes d'OpenSSH (safe_path) :
     la cible finale, le dossier de chaque maillon de liens symboliques et tous leurs parents
-    jusqu'à `/`. Chacun doit être à l'utilisateur ou à root et non modifiable par le groupe ni
-    les autres (pas d'exception pour le sticky bit : n'importe qui peut y créer un fichier).
-    À chmod (`g-w,o-w`) : ce qui est à l'utilisateur, ouvert en écriture, sans sticky bit ;
-    sinon (sticky, autre propriétaire, dossier système) : déplacer bw."""
+    jusqu'à `/`. Chacun doit être à l'utilisateur ou à root (`root_file` faux : la cible à
+    l'utilisateur seul) et non modifiable par le groupe ni les autres (pas d'exception pour le
+    sticky bit : n'importe qui peut y créer un fichier). Chaque fichier ou dossier (st_dev,
+    st_ino) n'est dit qu'une fois, sous son premier chemin. Un chemin disparu entre-temps n'est pas
+    compté (à l'appelant de vérifier la cible). À chmod (`g-w,o-w`) : ce qui est à
+    l'utilisateur, ouvert en écriture, sans sticky bit ; sinon (sticky, autre propriétaire,
+    dossier système) : à déplacer. Raisons vides : rien d'exposé."""
     target, dirs = _link_chain(path)
     uid = os.getuid()
-    reasons, to_chmod, move = [], [], False
+    reasons, to_chmod, move, seen = [], [], False, set()
     for what, p in [("fichier", target)] + [("dossier", d) for d in dirs]:
         try:
             st = os.stat(p)
         except OSError:
-            continue  # disparu entre-temps : exe_problem le dira au lancement
-        if st.st_uid not in (uid, 0):
+            continue  # disparu entre-temps : à l'appelant de le dire (exe_problem, au lancement)
+        if (st.st_dev, st.st_ino) in seen:
+            continue  # même dossier atteint par son chemin écrit et réel : dit une fois
+        seen.add((st.st_dev, st.st_ino))
+        if st.st_uid not in ((uid, 0) if root_file or what == "dossier" else (uid,)):
             reasons.append("%s %s à un autre utilisateur (uid %d)" % (what, p, st.st_uid))
             move = True
         if st.st_mode & 0o022:
@@ -206,6 +217,13 @@ def exe_exposure(path: str) -> Optional[tuple]:
                 to_chmod.append(p)
             else:
                 move = True
+    return target, reasons, to_chmod, move
+
+
+def exe_exposure(path: str) -> Optional[tuple]:
+    """(raisons, à chmod, à déplacer) si d'autres que l'utilisateur et root peuvent remplacer
+    l'exécutable `path`, sinon None (règle : `chain_exposure`). À déplacer : bw."""
+    _, reasons, to_chmod, move = chain_exposure(path)
     return (reasons, to_chmod, move) if reasons else None
 
 

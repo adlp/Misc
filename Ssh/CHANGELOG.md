@@ -1,5 +1,44 @@
 # Changelog — sshvault
 
+## sshvault 0.16.0 — ssh-config install et uninstall à travers un lien symbolique — 2026-10-16
+
+- `ssh-config install` et `uninstall` suivent un `~/.ssh/config` **lien symbolique** (config
+  versionnée par git) au lieu de le refuser : chaîne suivie maillon par maillon, écriture
+  atomique dans la **cible finale** (mode et propriétaire gardés, contrôle de la cible juste
+  avant le remplacement), sauvegarde `~/.ssh/config.sshvault.bak*` du contenu de la cible,
+  lien et maillons jamais modifiés ; message « lien suivi : écrit dans <cible> ». Chaque
+  maillon joint au chemin réel de son dossier, puis sa partie dossier résolue par `realpath`
+  (un `..` après un dossier lien remonte depuis sa cible, comme le noyau ; aussi pour
+  l'avertissement de `bw-path`), dossier du dernier maillon contrôlé même après 40 liens, et
+  un dossier atteint par deux chemins (écrit et réel) dit une seule fois.
+- Contrôles (ceux qu'ssh applique au fichier lu, plus la règle de `bw-path` pour les
+  dossiers, une seule fonction `fsutil.chain_exposure`) : cible = fichier ordinaire à
+  l'utilisateur, non modifiable par le groupe ni les autres ; dossier de chaque maillon et
+  ses parents jusqu'à `/` à l'utilisateur ou à root, non modifiables par le groupe ni les
+  autres (sticky bit non exempté) ; pour écrire seulement, dossier de la cible modifiable
+  par l'utilisateur (vérifié avant toute sauvegarde). Échec quand il faudrait écrire dans la
+  cible (lien cassé, boucle, cible non ordinaire, à un autre, droits ou dossier ouverts,
+  dossier de la cible non modifiable, cible remplacée entre le contrôle et la lecture) :
+  code 4, rien modifié, une ligne qui nomme le lien, la cible (boucle : valeur du lien), la
+  raison et l'action à faire à la main (install : « ajouter en première ligne de <cible> :
+  <ligne> » ; uninstall : « retirer de <cible> la ligne N : <ligne> » pour chaque ligne
+  qu'il aurait retirée ; boucle : « réparer le lien <lien> puis relancer » ; cible non
+  ordinaire : « remplacer <cible> par un fichier ordinaire (ou réparer le lien) puis
+  relancer »), plus « ou corriger par « chmod g-w,o-w <chemins> » puis relancer « sshvault
+  ssh-config install|uninstall » » quand ce chmod lève à lui seul toutes les raisons. Échec
+  sans rien à écrire (dossier de la cible non modifiable seul : aucun avertissement ;
+  install : Include déjà en tête ; uninstall : aucune ligne de sshvault, cible absente ou
+  boucle) : code 0, un avertissement, cible non touchée ; uninstall retire quand même la
+  config générée et `pub/`. Aucune option pour passer outre.
+- Ligne écrite : `Include "~/.ssh/sshvault/config"` quand `$HOME` (normalisé) est le
+  répertoire personnel de sshvault (ssh développe ce `~` avec `$HOME`, mesuré 8.9p1) : le
+  fichier partagé sert sur une machine au répertoire personnel différent ; sinon la forme
+  absolue d'avant. Ce `~` suit le `$HOME` de chaque ssh lancé ensuite : un ssh lancé avec un
+  autre `$HOME` (`sudo`/`su` qui garde `HOME`) ne trouve pas la config générée. Les deux
+  formes restent reconnues ; une ligne absolue déjà en tête n'est pas réécrite.
+- Avertissement `ForwardAgent yes` (banc de test, répertoire personnel imposé) : un
+  `~/.ssh/config` lien vers un fichier ordinaire est lu (`ssh -G -F`), plus `/dev/null`.
+
 ## sshvault 0.15.0 — Écriture des éléments identifiant (password add, password hosts) — 2026-10-16
 
 - `sshvault password add NOM --host [USER@]HÔTE… [--user U] [--account ALIAS] [--force]` :
