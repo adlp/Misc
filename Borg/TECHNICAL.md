@@ -2420,7 +2420,11 @@ pour `/access`) a sa propre marque `(base, '_db_meta_value')`, levée par `_read
 réussie, base absente (`_path_present` : EACCES n'est pas absent), table absente, base disparue : une ligne au journal du
 serveur par épisode d'erreur ; RepoHistory,
 ArchiveHistory et Status passent par `_db_probe` (illisible ≠ absent). CodecSelfTest : `_pre(fn)` exécute un décor dont dépendent
-les contrôles suivants même quand `-f` écarte son contrôle (A74).
+les contrôles suivants même quand `-f` écarte son contrôle (A74) ; décor en échec (exception ou résultat faux) avec son
+contrôle écarté : ligne « DÉCOR EN ÉCHEC <nom> (décor _pre exécuté hors sélection : …) » HORS des totaux (ni OK/FAIL/SKIP, ni
+sélection de `-l`), code de sortie 1, même sur une sélection vide (1.0.204, story 83 ; cst la lit comme un échec nommé) ; sous
+`-l` (liste seule), aucun décor `_pre` : seul le code commun hors contrôles tourne (bases temporaires listées au README, dans le
+dossier du run, retiré à la fin ; `[WARN] … base non chiffrée` possibles).
 **Code 1 de borg, lecteurs annexes, Index multi-nicks (1.0.176, story 39)** : `_borg_ok(rb)` — code 0 ou 1 et non `killed` —
 seule règle des lectures : `_boex_check_stdout` et `_boex_last_modified` (donc getlastbkp, `_lastbkp_or_stop`, Index, Report,
 CacheClean, `_repo_archive_names`, `_cleanup_index_after_prune`, stats d'archive, `_refresh_repo_point`, `_shadow_swap`), indexsnap
@@ -2752,7 +2756,18 @@ descripteurs gardés ; après : libre au retour (3.10 : libre dans les deux cas)
 nommée) : `_open_db` et `_push_conn` (connexion rendue : l'appelant la ferme ; `_open_db` la referme sur toute erreur par son
 `except BaseException`), `ensure_cache_db`/`ensure_diff_db` (`_close_quiet(conn)` avant chaque sortie `_db_schema_fail` et dans un
 `except BaseException` qui relance — sinon la relance dans le même processus échouait en « disk I/O error »), `ensure_history_db`
-(try/finally qui suit le try de l'ouverture), `_audit_witness` (ouverture vouée à l'échec). Filet restant, pour les seules
+(try/finally qui suit le try de l'ouverture), `_audit_witness` (ouverture vouée à l'échec).
+Gardes de source au niveau du module depuis 1.0.204 (story 83, D162a) : `_sqlite_close_scan`/`_sqlite_close_file` (fermeture ;
+liste blanche et compte exact de borgHelper : `_SCG_WL`/`_SCG_SEEN`, ceux de borgHelperWWW : SES constantes
+`_SCG_WL_WWW`/`_SCG_SEEN_WWW`, lues par la garde de borgHelper dans sa source par `_src_literal`), `_sql_marker_scan` et
+`_py_calls_scan` (marqueurs SQL et appels dépréciés, parties (1) et (2) de la garde « compatibilité Python », fichier ENTIER de
+borgHelperWWW des deux côtés) — le push selftest de borgHelperWWW les applique à sa propre production par le module importé
+(mutrun ne juge un mutant de borgHelperWWW que par ce push selftest).
+Fermeture des `ensure_*` prouvée par comportement (1.0.204, story 83, D162b : contrôle « ensure_cache_db / ensure_diff_db /
+ensure_history_db interrompus après l'ouverture ») : création, commit, lecteur, migration, création chiffrée. Asymétrie connue,
+reportée : un LECTEUR (`create=False`) sur une base occupée (« database is locked ») — `ensure_cache_db`/`ensure_diff_db`
+l'abandonnent sans erreur (`_reader_busy_skip`, base lue telle quelle), `ensure_history_db` (sans `reader=True`) sort en 1
+(`_db_schema_fail`) ; le contrôle fige ce comportement tel quel. Filet restant, pour les seules
 connexions tenues par un CYCLE d'objets (une connexion locale est désormais fermée par son site) : `_release_orphan_connections()`
 (`gc.collect()`) quand un nick en erreur est rattrapé (Bkp, Index, Report, Report hors ligne — seulement après une erreur, et en
 fin de boucle —, lecteurs multi-nicks par `_PerNick`, qui ferme aussi la connexion du nick arrêté rendue par son lambda, sans effet

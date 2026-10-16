@@ -409,6 +409,14 @@ descripteurs (`-wal`, `-shm`) jusque-là — critique dans un processus long (se
 compris, hors deux fenêtres inhérentes à Python : entre le retour de `sqlite3.connect` dans `_open_db` et l'entrée dans son `try` (`conn.role=…`), et entre le retour de l'ouvreur et l'affectation à la variable du site — un Ctrl-C (ou un signal) qui tombe exactement là laisse la connexion au ramasse-miettes) ; une transaction en cours au moment de l'erreur est annulée. Les mêmes fenêtres existent dans le code
 appelant : `conn = _open_db(…)` puis `try:` aussitôt.
 
+**Gardes de source au niveau du module (1.0.204)** : le push selftest de borgHelperWWW importe et appelle ces fonctions de
+borgHelper — leur nom et leur signature font partie de l'interface utilisée par borgHelperWWW :
+`_sql_marker_scan(src, label, skip=())` et `_py_calls_scan(src, label, skip=())` (listes de lignes « label:ligne … » :
+marqueurs SQL autres que `?`, appels dépréciés), `_sqlite_close_scan(src, extra=(), tests=…)` (sites non prouvés, nombre
+d'ouvertures) et `_sqlite_close_file(nm, src, extra, wl, seen_want)` (liste blanche `{fonction: nombre}` et compte exact
+passés par l'appelant ; borgHelperWWW passe ses constantes `_SCG_WL_WWW`/`_SCG_SEEN_WWW`). `_src_literal(src, name)` lit une
+constante littérale du module d'une source sans l'importer.
+
 ### Consulter le statut des sauvegardes (`bkp_status`, Story 1 spec-notifications-push)
 
 ```python

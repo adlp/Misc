@@ -1651,7 +1651,13 @@ borgHelper -c CodecSelfTest -f '=HMAC-SHA256 (RFC 4231 cas 1)'   # ce contrôle 
 **Par groupe** (1.0.147) : `-f <motif>` n'exécute que les contrôles dont le nom correspond (expression régulière, sans
 casse). Le bilan l'annonce : « run PARTIEL (filtre …, N contrôle(s) écarté(s)) : le run complet reste exigé avant
 commit ». Code de sortie 2 si le motif est invalide, vide ou ne sélectionne rien, 1 si un contrôle échoue. `-l` affiche
-les noms sans exécuter les contrôles (seule la préparation des bases temporaires tourne, ~2 s) — pour choisir un motif.
+les noms sans exécuter les contrôles — pour choisir un motif : seul le code commun hors contrôles tourne (~2 s, dans un
+dossier `borghelper-selftest-*` retiré à la fin : base d'en-tête `t.db`, bases `tamper.db`, `hugekdf.db`, `garbage.db`, `q0.db`,
+`bkpstatus-history.db`, bases des contrôles de requêtes `qcache/` et d'historique `rhist/`, d'où des `[WARN] … base non
+chiffrée` possibles) ; ni contrôle, ni décor d'un contrôle (`_pre`, 1.0.204). Sous `-f`, les décors `_pre` dont dépendent les
+contrôles suivants tournent même si leur contrôle est écarté ; un décor en échec y donne une ligne « DÉCOR EN ÉCHEC <nom>
+(décor _pre exécuté hors sélection : …) », hors des totaux, et le code de sortie 1 — aussi quand `-f` ne sélectionne rien
+(« aucun contrôle ne correspond » ET la ligne, code 1 au lieu de 2) (1.0.204).
 Les contrôles d'un même groupe partagent un dépôt de test que les précédents modifient (archives ajoutées, bases déjà
 construites) : viser un groupe entier plutôt qu'un contrôle isolé, et relancer le run complet en cas d'échec — le bilan
 le rappelle. Ne jamais lancer deux `CodecSelfTest` en même temps : les contrôles de minutage échouent sous charge.

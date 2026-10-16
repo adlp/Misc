@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.203"
+Version="1.0.204"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -1078,7 +1078,7 @@ def usage(doc=None,debug=0):
         printer("       Supprime les entrées périmées du cache")
         printer("   -c CodecSelfTest [-f <motif>] [-l]")
         printer("       Auto-test du codec de chiffrement (bases temporaires, aucune vraie base touchée) ; code de sortie non nul si un contrôle échoue")
-        printer("       -f : groupe de contrôles (run PARTIEL) ; -l : liste des noms sans exécuter")
+        printer("       -f : groupe de contrôles (run PARTIEL) ; -l : liste des noms sans exécuter (préparation commune seule)")
         printer("   -c PerfBench [-n <taille>] [-K]")
         printer("       Mesure les temps des commandes de lecture sur un jeu synthétique (bases temporaires, plain et chiffré)")
         printer("       -n <taille> : nb de lignes diff_index visé par mode (défaut 250000)  |  -K : + coût KDF/DbEncrypt/DbDecrypt")
@@ -1233,8 +1233,10 @@ def usage(doc=None,debug=0):
         printer("       et permissions, sur des bases temporaires. OK/FAIL par contrôle ; code de sortie non nul au moindre échec.")
         printer("       -f : seulement les contrôles dont le nom correspond (expression régulière, sans casse) — run PARTIEL,")
         printer("            viser un groupe ('tranche|surveillance'), le run complet reste exigé avant commit ; code 2 si")
-        printer("            le motif est invalide ou ne sélectionne rien")
-        printer("       -l : liste les noms des contrôles (sélectionnés par -f) sans les exécuter")
+        printer("            le motif est invalide ou ne sélectionne rien ; un décor dont dépendent les contrôles suivants tourne même")
+        printer("            si -f écarte son contrôle : en échec, ligne « DÉCOR EN ÉCHEC <nom> (…) » hors des totaux, code 1")
+        printer("       -l : liste les noms des contrôles (sélectionnés par -f) sans les exécuter — ni contrôle ni décor ; seule la")
+        printer("            préparation commune tourne (bases temporaires, retirées à la fin)")
     elif doc=='perfbench':
         printer("   -c PerfBench [-n <taille>] [-K]")
         printer("       Génère un jeu de données synthétique (SQL direct, PAS de vrai borg) sur des bases temporaires")
@@ -10314,23 +10316,272 @@ class BorgHelper:
         return errcode
 
 
+# Gardes de source (story 81 et 48) au niveau du module depuis 1.0.204 (story 83, D162a) : le push selftest de borgHelperWWW
+# les applique à sa propre source par le module importé — un mutant de borgHelperWWW y échoue (mutrun ne lance que lui).
+def _sqlite_close_scan(src,extra=(),tests=('codec_selftest','perf_bench','push_selftest')):
+    """1.0.203 (story 81, D161) : ouvertures SQLite de PRODUCTION dont la fermeture n'est pas prouvée sous une des formes usuelles ci-dessous ->
+    ([(fonction, ligne, motif)], nombre d'ouvertures analysées). Ouvreurs : _open_db (nom ou attribut),
+    sqlite3.connect, sqlite3.dbapi2.connect, sqlite3.Connection(…), BhConnection(…), et `extra` (fonctions qui rendent une
+    connexion, ex. _push_conn de borgHelperWWW). Hors contrôles : fonctions `tests` et _pb_* (PerfBench). Refusés (une
+    ouverture que la garde ne verrait plus) : toute référence à un ouvreur-fonction hors d'un appel (alias,
+    functools.partial), `from sqlite3 import connect/Connection/*`, import renommé d'un ouvreur, `import sqlite3 as X`,
+    getattr(sqlite3, …).
+    Fermeture prouvée pour `v=<ouverture>` (ou `v=<ouverture> if c else None`) :
+    (a) try englobant T — ouverture dans son corps, ses except ou son else (jamais son finally), aucune boucle entre
+        l'ouverture et T, `v=None` avant T dans son bloc (sinon le finally lèverait UnboundLocalError et masquerait
+        l'erreur réelle) ; la fermeture tolère v None : `_close_quiet(v)`, ou `v.close()` sous `if v is not None:`/`if v:` ;
+    (b) ou try T qui suit aussitôt l'ouverture (`if x: v=…`, dernière instruction d'un if sans else : le try qui suit le
+        if) ; ouverture conditionnelle (`if x:` ou `… if c else None`) : fermeture sous ce même test ou sous
+        `v is not None`/`if v:`, ou `_close_quiet(v)` si v vaut toujours None sans ouverture (expression conditionnelle,
+        ou `v=None` avant le if) ;
+    dans les deux cas, une seule écriture de v dans T (affectation, tuple, with … as, for, :=, +=,
+    except … as, import) hors `v=None` juste après sa fermeture, et la fermeture est la PREMIÈRE instruction du finally
+    de T (ou d'un finally imbriqué en tête), jamais dans une fonction imbriquée, jamais après une instruction qui peut
+    lever ; `for c in (…, v, …):` suivi de la fermeture de c (même règle de None). `with contextlib.closing(<ouverture>)` :
+    prouvé ; `with <ouverture>` seul NE ferme PAS (gestionnaire de transaction de sqlite3) : refusé, comme une connexion
+    rendue (return) ou passée telle quelle.
+    Limites connues (formes absentes du code de production, relevé AST de la story 81) : variable d'ancrage réaffectée entre l'ouverture et la fermeture ; `del`/`nonlocal`/`global`/`match` sur la variable ; écriture de la variable dans le finally avant sa fermeture ; `break` dans la boucle de fermeture ; alias de module (`S=sqlite3`) ; sous-classe de `sqlite3.Connection` autre que `BhConnection` appelée directement ; fonction imbriquée nommée `_pb_*` (exclue comme PerfBench) ; `yield` dans le try ; liste blanche comptée par NOM de fonction (une homonyme partagerait le compte)."""
+    import ast
+    t=ast.parse(src); par={}
+    for p in ast.walk(t):
+        for ch in ast.iter_child_nodes(p): par[ch]=p
+    def anc(n):
+        while n in par:
+            n=par[n]; yield n
+    FN=('_open_db',)+tuple(extra)
+    def is_name(n,v): return isinstance(n,ast.Name) and n.id==v
+    def sq(n): return is_name(n,'sqlite3') or (isinstance(n,ast.Attribute) and n.attr=='dbapi2' and is_name(n.value,'sqlite3'))
+    def fn_ref(f):   # ouvreur-fonction (référence hors appel refusée)
+        if isinstance(f,ast.Name): return f.id in FN
+        return isinstance(f,ast.Attribute) and (f.attr in FN or (f.attr=='connect' and sq(f.value)))
+    def is_open(c):
+        if not isinstance(c,ast.Call): return False
+        f=c.func
+        return fn_ref(f) or is_name(f,'BhConnection') or (isinstance(f,ast.Attribute) and f.attr in ('Connection','BhConnection') and sq(f.value) or
+                                                         (isinstance(f,ast.Attribute) and f.attr=='BhConnection'))
+    def none_test(tst,v):
+        return is_name(tst,v) or (isinstance(tst,ast.Compare) and is_name(tst.left,v) and len(tst.ops)==1 and isinstance(tst.ops[0],ast.IsNot)
+                and isinstance(tst.comparators[0],ast.Constant) and tst.comparators[0].value is None)
+    def ctx(req=(),bare=False,quiet=False,none_ok=False,anchors=()):
+        """req : tests d'ancrage TOUS exigés sur la chaîne de if qui ferme (ouverture `if a: [if b:] v=…` sans v=None : v non
+        liée hors de ces tests) ; anchors : tests d'ancrage (tous présents = fermeture acceptée) ; bare : `v.close()` nu
+        accepté (v toujours une connexion) ; quiet : `_close_quiet(v)` nu accepté (v toujours liée, None possible) ;
+        none_ok : fermeture sous `v is not None`/`if v:` acceptée (v toujours liée)."""
+        return {'req':frozenset(req),'bare':bare,'quiet':quiet,'none_ok':none_ok,'anchors':frozenset(anchors)}
+    def closer(s,v,c,have=frozenset(),nn=False):
+        if isinstance(s,ast.Expr) and isinstance(s.value,ast.Call):
+            f=s.value.func
+            anch=bool(c['anchors']) and have>=c['anchors']
+            if isinstance(f,ast.Attribute) and f.attr=='close' and is_name(f.value,v) and not s.value.args:
+                return anch or (not c['req'] and (c['bare'] or nn))
+            if isinstance(f,ast.Name) and f.id=='_close_quiet' and len(s.value.args)==1 and is_name(s.value.args[0],v):
+                return anch or (not c['req'] and (c['quiet'] or c['bare'] or nn))
+            return False
+        if isinstance(s,ast.If) and not s.orelse and s.body:
+            d=ast.dump(s.test)
+            if d in c['anchors']: return closer(s.body[0],v,c,have|{d},nn)
+            if none_test(s.test,v) and c['none_ok']: return closer(s.body[0],v,c,have,True)
+            return False
+        if isinstance(s,ast.Try) and s.body: return closer(s.body[0],v,c,have,nn)   # try: <fermeture> … (exécutée d'abord)
+        if (isinstance(s,ast.For) and isinstance(s.target,ast.Name) and isinstance(s.iter,(ast.Tuple,ast.List)) and s.body
+                and any(is_name(e,v) for e in s.iter.elts)):
+            if c['req'] and not have>=c['req']: return False   # v peut être non liée : le tuple lèverait NameError
+            return closer(s.body[0],s.target.id,ctx(bare=c['bare'] or nn,quiet=True,none_ok=True))
+        return False
+    def fin_closes(fb,v,c):
+        if not fb: return False
+        if closer(fb[0],v,c): return True
+        return isinstance(fb[0],ast.Try) and fin_closes(fb[0].finalbody,v,c)
+    def block_of(st):
+        b=par.get(st)
+        for f in ('body','orelse','finalbody','handlers'):
+            l=getattr(b,f,None)
+            if isinstance(l,list) and any(x is st for x in l): return l
+        return None
+    def is_closer_stmt(s,v): return closer(s,v,ctx(bare=True,quiet=True,none_ok=True))
+    def stores(T,v):
+        """Écritures de v dans T hors finally (portées imbriquées exclues) ; `v=None` juste après sa fermeture : non comptée."""
+        n=0
+        def visit(ch):
+            nonlocal n
+            if isinstance(ch,(ast.FunctionDef,ast.AsyncFunctionDef,ast.Lambda,ast.ClassDef)): return
+            if isinstance(ch,ast.Name) and ch.id==v and isinstance(ch.ctx,ast.Store):
+                a=par.get(ch)
+                if isinstance(a,ast.Assign) and isinstance(a.value,ast.Constant) and a.value.value is None:
+                    blk=block_of(a); i=next((k for k,s in enumerate(blk or []) if s is a),0)
+                    if blk and i>0 and is_closer_stmt(blk[i-1],v): return
+                n+=1
+            if isinstance(ch,ast.ExceptHandler) and ch.name==v: n+=1
+            if isinstance(ch,ast.alias) and (ch.asname or ch.name)==v: n+=1
+            for c in ast.iter_child_nodes(ch): visit(c)
+        for part in (T.body,T.handlers,T.orelse):
+            for st in part: visit(st)
+        return n
+    def init_before(st,v):
+        blk=block_of(st)
+        if blk is None: return False
+        j=next((k for k,s in enumerate(blk) if s is st),0)
+        return any(isinstance(s,ast.Assign) and isinstance(s.value,ast.Constant) and s.value.value is None
+                   and any(is_name(g,v) for g in s.targets) for s in blk[:j])
+    def skipped(n):
+        return any(isinstance(a,(ast.FunctionDef,ast.AsyncFunctionDef)) and (a.name in tests or a.name.startswith('_pb_')) for a in anc(n))
+    def fname(n):
+        return next((a.name for a in anc(n) if isinstance(a,(ast.FunctionDef,ast.AsyncFunctionDef))),'<module>')
+    out=[]; seen=0
+    for n in ast.walk(t):
+        if skipped(n) and not isinstance(n,ast.Module): continue
+        if isinstance(n,ast.ImportFrom):
+            for a in n.names:
+                if (n.module in ('sqlite3','sqlite3.dbapi2') and a.name in ('connect','Connection','dbapi2','*')) or (a.name in FN+('BhConnection',) and a.asname and a.asname!=a.name):
+                    out.append((fname(n),n.lineno,f"ouvreur importé sous un autre nom ou hors de sqlite3. ({a.name})"))
+        if isinstance(n,ast.Import):
+            for a in n.names:
+                if a.name.split('.')[0]=='sqlite3' and a.asname: out.append((fname(n),n.lineno,f"import {a.name} as {a.asname} (ouvreur caché)"))
+        if isinstance(n,ast.Call) and is_name(n.func,'getattr') and n.args and sq(n.args[0]):
+            out.append((fname(n),n.lineno,"getattr(sqlite3, …) (ouvreur caché)"))
+        if isinstance(n,(ast.Name,ast.Attribute)) and fn_ref(n):
+            p=par.get(n)
+            if not (isinstance(p,ast.Call) and p.func is n):
+                out.append((fname(n),n.lineno,"référence à un ouvreur hors d'un appel (alias)"))
+        if not is_open(n): continue
+        seen+=1; p=par[n]; why=None; v=None; cond=None
+        if isinstance(p,ast.withitem): why="with <ouverture> sans contextlib.closing (ne ferme pas)"
+        elif isinstance(p,ast.Call) and isinstance(par.get(p),ast.withitem):
+            f=p.func
+            if not (isinstance(f,ast.Attribute) and f.attr=='closing' and is_name(f.value,'contextlib')): why="with <appel> autre que contextlib.closing"
+        else:
+            if isinstance(p,ast.IfExp) and p.body is n and isinstance(par.get(p),ast.Assign): p=par[p]; cond='ifexp'
+            if isinstance(p,ast.Assign) and len(p.targets)==1 and isinstance(p.targets[0],ast.Name): v=p.targets[0].id
+            else: why="ouverture hors d'une affectation simple (rendue, passée, jetée)"
+        if v is not None:
+            st=p; guards=set()
+            while isinstance(par.get(st),ast.If) and par[st].body[-1] is st and not par[st].orelse:
+                st=par[st]; guards.add(ast.dump(st.test)); cond='if'
+            blk=block_of(st)
+            i=next((k for k,s in enumerate(blk) if s is st),None) if blk is not None else None
+            T=blk[i+1] if i is not None and i+1<len(blk) and isinstance(blk[i+1],ast.Try) else None
+            always=cond in (None,'ifexp') or init_before(st,v)   # v liée quel que soit le chemin jusqu'au try
+            cb=ctx(req=() if always else guards,bare=cond is None,quiet=always,none_ok=always,anchors=guards)
+            if T is not None and fin_closes(T.finalbody,v,cb):   # (b)
+                k=stores(T,v)
+                if k: why=f"{k} écriture(s) de {v} dans le try qui la ferme (écrasée sans fermeture)"
+            else:
+                why="aucun try/finally qui la ferme en premier"; child=p; loop=False
+                for a in anc(p):
+                    if isinstance(a,(ast.FunctionDef,ast.AsyncFunctionDef,ast.Lambda)): break
+                    if isinstance(a,(ast.For,ast.While,ast.AsyncFor)): loop=True
+                    if isinstance(a,ast.Try) and fin_closes(a.finalbody,v,ctx(quiet=True,none_ok=True,anchors=guards)):
+                        if any(x is child for x in a.finalbody): why="ouverture dans le finally qui la ferme"; break
+                        k=stores(a,v)
+                        if loop: why="ouverture dans une boucle à l'intérieur du try qui la ferme"
+                        elif k!=1: why=f"{k} écritures de {v} dans le try qui la ferme (écrasée sans fermeture)"
+                        elif not init_before(a,v): why=f"pas de {v}=None avant le try (le finally lèverait UnboundLocalError)"
+                        else: why=None
+                        break
+                    if isinstance(a,ast.Try) and fin_closes(a.finalbody,v,ctx(bare=True,quiet=True,none_ok=True)):
+                        why=f"v.close() nu dans le finally d'un try englobant : lève si l'ouverture a échoué (_close_quiet({v}) ou sous `if {v} is not None:`)"; break
+                    child=a
+        if why: out.append((fname(n),n.lineno,why))
+    return out,seen
+# Liste blanche et compte exact de borgHelper ; ceux de borgHelperWWW sont SES constantes (_SCG_WL_WWW, _SCG_SEEN_WWW, 1.0.204 :
+# un changement de WWW seul ne touche plus borgHelper), lues par la garde de borgHelper dans sa source (_src_literal).
+_SCG_WL={'borgHelper':{'_open_db':5,'ensure_cache_db':1,'ensure_diff_db':1,'ensure_history_db':1,'_audit_witness':1}}
+_SCG_SEEN={'borgHelper':113}   # nombre EXACT d'ouvertures analysées (1.0.203)
+def _sqlite_close_file(nm,src,extra,wl,seen_want):
+    """Partie fichier de la garde : sites non prouvés hors liste blanche `wl` ({fonction: nombre}), liste blanche au nombre exact
+    par fonction, nombre exact d'ouvertures analysées `seen_want` (ouverture ajoutée ou retirée, ouvreur devenu invisible : liste à
+    revoir). src : texte de la source (1.0.204 : lu par l'appelant, UTF-8)."""
+    got,seen=_sqlite_close_scan(src,extra); cnt={}; bad=[]
+    for fn,l,why in got: cnt[fn]=cnt.get(fn,0)+1
+    for fn,l,why in got:
+        if fn not in wl: bad.append(f"{nm}:{l} ({fn}) {why}")
+    for fn,k in wl.items():
+        if cnt.get(fn,0)!=k: bad.append(f"{nm} liste blanche {fn} : {cnt.get(fn,0)} ouverture(s) non prouvée(s), {k} attendue(s) — à revoir")
+    if seen!=seen_want: bad.append(f"{nm} : {seen} ouvertures analysées, {seen_want} attendues — compte à revoir (ouverture ajoutée/retirée, ouvreur invisible)")
+    return bad
+
+def _src_literal(src,name):
+    """Valeur littérale (ast.literal_eval) de l'affectation `name=…` au niveau du module de la source `src` ; None (la garde
+    échoue) si absente, non littérale ou écrite plus d'une fois au niveau du module (1.0.204 : constantes de borgHelperWWW lues
+    par la garde de borgHelper sans l'importer)."""
+    import ast
+    hits=[]
+    for n in ast.parse(src).body:   # toute écriture du nom au niveau du module (=, :=, +=, annotée, cible multiple ou tuple)
+        targets=n.targets if isinstance(n,ast.Assign) else [n.target] if isinstance(n,(ast.AugAssign,ast.AnnAssign)) else []
+        if any(isinstance(x,ast.Name) and x.id==name for t in targets for x in ast.walk(t)): hits.append(n)
+    if len(hits)!=1 or not isinstance(hits[0],ast.Assign) or len(hits[0].targets)!=1 or not isinstance(hits[0].targets[0],ast.Name):
+        return None   # absente, affectée plusieurs fois (revue : la dernière gagnerait à l'exécution), ou forme non simple : refus
+    try: return ast.literal_eval(hits[0].value)
+    except ValueError: return None
+
+def _py_calls_scan(src,label,skip=()):
+    """1.0.182 (story 48, partie (2) de _py_compat_guard) ; au niveau du module depuis 1.0.204 (story 83) : aucun .utcnow() /
+    .utcfromtimestamp() (DeprecationWarning affiché depuis 3.12), aucun PurePath(…).as_uri() (3.14). skip : fonctions dont le
+    corps est ignoré (ce scanner l'est toujours). -> ["<label>:<ligne> …"]."""
+    import ast
+    PURE=('PurePath','PurePosixPath','PureWindowsPath')
+    t=ast.parse(src); skip=tuple(skip)+('_py_calls_scan',)
+    rng=[(n.lineno,n.end_lineno) for n in ast.walk(t) if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name in skip]
+    out=[]
+    for n in ast.walk(t):
+        if not isinstance(n,ast.Attribute) or any(a<=n.lineno<=b for a,b in rng): continue
+        if n.attr in ('utcnow','utcfromtimestamp'): out.append(f"{label}:{n.lineno} .{n.attr}()")
+        if (n.attr=='as_uri' and isinstance(n.value,ast.Call)
+                and ((isinstance(n.value.func,ast.Name) and n.value.func.id in PURE) or
+                     (isinstance(n.value.func,ast.Attribute) and n.value.func.attr in PURE))):
+            out.append(f"{label}:{n.lineno} PurePath(…).as_uri()")
+    return out
+
+def _sql_marker_scan(src,label,skip=()):
+    """1.0.182 (story 48, partie (1) de _py_compat_guard) ; au niveau du module depuis 1.0.204 (story 83, D162a). Marqueurs SQL
+    autres que `?` anonyme dans la source `src` : numérotés (avertissement sous des 3.12) ou nommés (ProgrammingError en 3.14
+    avec une séquence) — chaînes SQL (constantes, f-strings) et fragments SQL (mot-clé en capitales + marqueur après
+    = ( , < > IN LIKE AND OR), littéraux '…' retirés ; numéroté signalé dans toute chaîne après = ( , < > ou une espace.
+    skip : fonctions dont le corps est ignoré (ce scanner l'est toujours : ses motifs). -> ["<label>:<ligne> marqueur SQL '…'"]."""
+    import ast,re
+    PH=re.compile(r"\?\d+|(?<![\w:])[:@$][A-Za-z_]\w*")
+    SQLK=re.compile(r"^\s*(SELECT|INSERT|UPDATE|DELETE|WITH|REPLACE|CREATE|PRAGMA)\b",re.I)
+    KW=re.compile(r"\b(SELECT|WHERE|AND|OR|FROM|VALUES|SET|IN|LIKE|JOIN|ON)\b")
+    FRAG=re.compile(r"\?\d+|(?:[=(,<>]|\bIN|\bLIKE|\bAND|\bOR)\s*[:@$][A-Za-z_]\w*")
+    QN=re.compile(r"[=(,<>\s]\?\d+")
+    t=ast.parse(src); skip=tuple(skip)+('_sql_marker_scan',)
+    rng=[(n.lineno,n.end_lineno) for n in ast.walk(t) if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name in skip]
+    out=[]
+    for n in ast.walk(t):
+        txt=None
+        if isinstance(n,ast.JoinedStr): txt=''.join(v.value if isinstance(v,ast.Constant) and isinstance(v.value,str) else ' X ' for v in n.values)
+        elif isinstance(n,ast.Constant) and isinstance(n.value,str): txt=n.value
+        if txt is None or any(a<=n.lineno<=b for a,b in rng): continue
+        body=re.sub(r"'(?:[^']|'')*'","''",txt)
+        m=(PH.search(body) if SQLK.match(txt) else None) or (FRAG.search(body) if KW.search(body) else None) or QN.search(body)
+        if m: out.append(f"{label}:{n.lineno} marqueur SQL {m.group(0)!r}")
+    return out
+
 # ── CodecSelfTest — vérifie codec/en-tête/permissions sur des bases TEMPORAIRES ─
 # (aucune vraie base ni vrai rc n'est touché) ; vecteurs à réponse connue fixés ci-dessous.
 
 _ST_PATH_VECTOR='Bzlli9DHwb7cerehZg/QIH8kVKtaTDqGJoDFQ/HBn.TTx6SCURAOpcPg'  # k_path=0x01*32, k_enc=0x02*32, 'a/b/c' (recalculé indépendamment)
 
 def codec_selftest(pattern=None,list_only=False):
-    """Retourne le nombre de contrôles en échec (0 = tout OK), ou None si un filtre ne sélectionne aucun contrôle.
+    """Retourne le nombre de contrôles en échec plus celui des décors _pre en échec hors sélection (lignes DÉCOR EN ÉCHEC, 1.0.204)
+    — 0 = tout OK ; None seulement si un filtre ne sélectionne aucun contrôle ET qu'aucun décor n'a échoué (sinon ce nombre).
     Affiche OK/FAIL par contrôle. 1.0.147 (story 10, A5) : pattern = re.Pattern compilé -> seuls les contrôles dont le
     nom correspond s'exécutent (run PARTIEL, jamais suffisant avant commit) ; list_only -> noms affichés, rien exécuté.
     Le code hors contrôles (bases temporaires) tourne toujours ; un groupe peut dépendre d'un contrôle précédent."""
     import tempfile,shutil,contextlib,io,signal
     from unittest import mock
     if isinstance(pattern,str): pattern=re.compile(pattern,re.IGNORECASE)
-    results=[]; left_out=[0]; skipped=[0]
+    results=[]; left_out=[0]; skipped=[0]; pre_failed=[0]   # pre_failed : lignes DÉCOR EN ÉCHEC (1.0.204)
     def _selected(name): return pattern is None or bool(pattern.search(name))
     def check(name,fn):
-        if not _selected(name): left_out[0]+=1; return
+        if not _selected(name):
+            pe=getattr(fn,'_pre_failed',None)
+            if pe is not None and not list_only:
+                # 1.0.204 (story 83, D132) : décor _pre en échec (exception ou résultat faux) alors que son contrôle est écarté par -f —
+                # avant : diagnostic éventuel sans ligne, run vert. Ligne distincte HORS des totals (ni OK/FAIL/SKIP, ni sélection de -l),
+                # code de sortie 1 (cst la lit comme un échec nommé)
+                print(f"DÉCOR EN ÉCHEC {name} (décor _pre exécuté hors sélection : {pe})"); pre_failed[0]+=1
+            left_out[0]+=1; return
         if list_only: print(f"LIST {name}"); results.append(True); return
         try: ok=bool(fn()); err=''
         except (Exception,SystemExit) as e: ok=False; err=f" ({type(e).__name__}: {e})"   # 1.0.166 : un sys.exit = FAIL, jamais la fin du run
@@ -10348,11 +10599,19 @@ def codec_selftest(pattern=None,list_only=False):
     def _pre(fn):
         """1.0.175 (story 38, A74) : décor dont dépendent les contrôles SUIVANTS — fn exécutée tout de suite, même si son
         contrôle est écarté par -f (avant : `-f Key` laissait la base en clair, 2 FAIL) ; rend la fonction du contrôle (résultat,
-        ou l'exception relevée)."""
-        try: r=fn(); return lambda: r
+        ou l'exception relevée). 1.0.204 (story 83, D132) : sous -l (liste seule), rien exécuté — aucun contrôle ne tourne, le
+        décor ne servirait à personne (avant : `-f plans -l` créait la base de décor snapv-qp.db, 2,7 s) ; décor en échec
+        (exception ou résultat faux) : marqué ; si -f écarte son contrôle, check() imprime « DÉCOR EN ÉCHEC <nom> (…) », ligne hors
+        des totals, et le run sort en 1 (avant : rien, ou le seul diagnostic du décor, run vert) ; sélectionné : FAIL comme avant."""
+        if list_only: return lambda: None
+        try: r=fn()
         except (Exception,SystemExit) as e:
             def _raise(): raise e
+            _raise._pre_failed=f"{type(e).__name__}: {e}"   # check() le dit même écarté par -f (1.0.204)
             return _raise
+        ok=lambda: r
+        if not r: ok._pre_failed=f"résultat {r!r}"
+        return ok
     def raises(exc,fn):
         try: fn()
         except exc: return True
@@ -12350,7 +12609,23 @@ def codec_selftest(pattern=None,list_only=False):
                 if key and isinstance(v,dict) and nk in v: v=v[nk]
                 res.append(norm(v) if norm else v)
             return res
-        def _same(*args,**k): p,e=_q_pair(*args,**k); return p==e and p not in ('',None)
+        def _plan_bad(v):   # 1.0.204 (story 83) : résultat vide ou en erreur — « non vide » regardé DANS le résultat (entries, matches, rows, files)
+            if not v or isinstance(v,str) or (isinstance(v,dict) and 'error' in v): return True
+            if isinstance(v,dict):
+                ls=[v[k] for k in ('entries','matches','rows','files') if k in v]
+                return not ls or not all(isinstance(x,list) and x for x in ls)
+            return isinstance(v,list) and not all(x is not None for x in v)
+        # parités qui couvrent l'échantillon du contrôle des plans (_plans_ok) : en plus de clair == chiffré, résultat non vide et sans
+        # erreur — un run complet voit ce que voit -f plans (revue story 83)
+        _PLAN_COVER={f"parité TreeHist {'etc'!r} -b {None}",f"parité TreeFind {'etc'!r} {'*'!r} (dont supprimés)",
+                     f"parité TreeFind {None!r} {'*.LOG'!r} (dont supprimés)",f"parité Search {'log'!r} -b {None}",
+                     f"parité Search {'*.LOG'!r} -b ALL",f"parité Search {'x?y'!r} -b ALL",f"parité FileHist {'/etc/passwd'!r} -b {None}",
+                     f"parité DuIdx -j {'etc/*'!r} -b {None}",f"parité DuIdx -j {'*.log'!r} -b ALL",f"parité DuIdx -R {'etc/*'!r} -b ALL",
+                     "parité IdxTop -j","parité DiffTop -j","parité ListBkpFiles -j (ordre octet UTF-8)",
+                     "TreeHist -X : changements entre deux archives (bornes, supprimés, répertoires, erreurs), identique clair/chiffré",
+                     "parité _find_last_archive_with_file (égalité et glob)"}
+        def _cov(name,p,e): return p==e and (name not in _PLAN_COVER or not _plan_bad(p))
+        def _same(*args,cover=None,**k): p,e=_q_pair(*args,**k); return p==e and p not in ('',None) and (cover not in _PLAN_COVER or not _plan_bad(p))
         # journal SQL des connexions chiffrées : aucun LIKE/GLOB ni ORDER BY sur un chemin ne doit y
         # passer — porte sur TOUT le reste du self-test (y compris IdxPurge et _find_last_archive_with_file).
         traced=[]; _orig_open=_open_db
@@ -12363,9 +12638,11 @@ def codec_selftest(pattern=None,list_only=False):
             tp=[None,'etc','Etc','ETC','a%b','a%b/x','aXYZb','home/u','éa','bin','x','x/z','nope','a_b','/etc','etc/','a%b//x','//etc//']
             for pre in tp:
                 for arch in (None,'ALL'):
-                    check(f"parité TreeHist {pre!r} -b {arch}",lambda pre=pre,arch=arch: _same(bhq.treehist,pre,archive_from=arch,as_json=True,key=True))
+                    nm=f"parité TreeHist {pre!r} -b {arch}"
+                    check(nm,lambda pre=pre,arch=arch,nm=nm: _same(bhq.treehist,pre,archive_from=arch,as_json=True,key=True,cover=nm))
             for pre,pat in (('/etc','*'),('etc/','*'),('a%b//x','*.log'),(None,'log'),(None,'*.LOG'),(None,None),('etc','*'),('a%b','*'),('home','*.tmp'),(None,'*.log'),('a_b','*'),('éa','日*'),('x','z'),('Etc','*')):
-                check(f"parité TreeFind {pre!r} {pat!r} (dont supprimés)",lambda pre=pre,pat=pat: _same(bhq.treefind,pre,pat,as_json=True,key=True))
+                nm=f"parité TreeFind {pre!r} {pat!r} (dont supprimés)"
+                check(nm,lambda pre=pre,pat=pat,nm=nm: _same(bhq.treefind,pre,pat,as_json=True,key=True,cover=nm))
             def _treefind_names(nk,pre,pat):
                 v=json.loads(_q_run(bhq.treefind,nk,pre,pat,as_json=True))[nk]
                 return {} if isinstance(v,dict) and 'error' in v else {m['name'] for m in v['matches']}
@@ -12382,21 +12659,26 @@ def codec_selftest(pattern=None,list_only=False):
             check("TreeFind : recherche par nom insensible à la casse (casefold, plain et chiffré)",_treefind_ci_ok)
             for pat in ('log','*.LOG','a_b','a%b','ETC/%','éa','日本','_tc','*.tmp','x?y','zzz','[a]'):
                 for arch in (None,'ALL'):
-                    check(f"parité Search {pat!r} -b {arch}",lambda pat=pat,arch=arch: (lambda p,e:p==e)(*_q_pair(bhq.search,pat,archive_from=arch,as_json=True,key=True)))
+                    nm=f"parité Search {pat!r} -b {arch}"
+                    check(nm,lambda pat=pat,arch=arch,nm=nm: _cov(nm,*_q_pair(bhq.search,pat,archive_from=arch,as_json=True,key=True)))
             for fp in ('/etc/passwd','etc//passwd','etc/passwd/','etc/passwd','etc/gone.conf','home/u/old.tmp','bin/b.log','éa/日本.log','a_b/h.tmp','Etc/upper.txt','etc'):
                 for arch in (None,'ALL'):
-                    check(f"parité FileHist {fp!r} -b {arch}",lambda fp=fp,arch=arch: (lambda p,e:p==e)(*_q_pair(bhq.filehist,fp,archive_from=arch,as_json=True,key=True)))
+                    nm=f"parité FileHist {fp!r} -b {arch}"
+                    check(nm,lambda fp=fp,arch=arch,nm=nm: _cov(nm,*_q_pair(bhq.filehist,fp,archive_from=arch,as_json=True,key=True)))
             _srt=lambda v: sorted(json.dumps(x,sort_keys=True,ensure_ascii=False) for x in v['rows']) if isinstance(v,dict) and 'rows' in v else v
             for pat in (None,'/etc/*','etc//*','etc/*','a%b/*','*','*.log','log','_tc','home/u/*','Etc/*','x/*','a_b/*'):
                 for arch in (None,'ALL'):
-                    check(f"parité DuIdx -R {pat!r} -b {arch}",lambda pat=pat,arch=arch: (lambda p,e:p==e)(*_q_pair(bhq.duidx,pat,archive_from=arch,raw=True,norm=_srt)))
-                    check(f"parité DuIdx -j {pat!r} -b {arch}",lambda pat=pat,arch=arch: _same(bhq.duidx,pat,archive_from=arch,as_json=True))
-            check("parité IdxTop -j",lambda: (lambda p,e:p==e and p)(*_q_pair(bhq.idxtop,3,20,as_json=True,norm=_srt)))
-            check("parité DiffTop -j",lambda: (lambda p,e:p==e and p)(*_q_pair(bhq.difftop,f"{A1},{A2}",3,10,as_json=True,norm=_srt)))
-            check("parité ListBkpFiles -j (ordre octet UTF-8)",lambda: (lambda p,e:p==e and p and p==dict(p,files=sorted(p['files'],key=_path_sort_key)))(
+                    nm=f"parité DuIdx -R {pat!r} -b {arch}"
+                    check(nm,lambda pat=pat,arch=arch,nm=nm: _cov(nm,*_q_pair(bhq.duidx,pat,archive_from=arch,raw=True,norm=_srt)))
+                    nm=f"parité DuIdx -j {pat!r} -b {arch}"
+                    check(nm,lambda pat=pat,arch=arch,nm=nm: _same(bhq.duidx,pat,archive_from=arch,as_json=True,cover=nm))
+            check("parité IdxTop -j",lambda: (lambda p,e:p==e and p and not _plan_bad(p))(*_q_pair(bhq.idxtop,3,20,as_json=True,norm=_srt)))
+            check("parité DiffTop -j",lambda: (lambda p,e:p==e and p and not _plan_bad(p))(*_q_pair(bhq.difftop,f"{A1},{A2}",3,10,as_json=True,norm=_srt)))
+            check("parité ListBkpFiles -j (ordre octet UTF-8)",lambda: (lambda p,e:p==e and p and not _plan_bad(p) and p==dict(p,files=sorted(p['files'],key=_path_sort_key)))(
                   *_q_pair(bhq.list_files,A3,as_json=True,norm=lambda v: {k:x for k,x in v.items() if k!='nick'})))
             check("parité _find_last_archive_with_file (égalité et glob)",lambda: all(
-                  bhq._find_last_archive_with_file('qp',p)==bhq._find_last_archive_with_file('qe',p) for p in ('etc/passwd','*.tmp','home/u/*.tmp','nope')))
+                  bhq._find_last_archive_with_file('qp',p)==bhq._find_last_archive_with_file('qe',p) for p in ('etc/passwd','*.tmp','home/u/*.tmp','nope'))
+                  and None not in [bhq._find_last_archive_with_file('qp',p) for p in ('etc/passwd','home/u/*.tmp')])   # 1.0.204 : archive trouvée
             # DuIdx global (sans motif) : assertion ABSOLUE contre un calcul indépendant depuis _diff
             # (pas via duidx()/_duidx_collect_global — reproduirait le bug testé) : counts/sizes added/removed/
             # modified pour la DERNIÈRE paire d'archives seulement (A1→A2 exclue) en défaut, les DEUX paires
@@ -12522,18 +12804,43 @@ def codec_selftest(pattern=None,list_only=False):
                         and [v['type'] for v in e12['passwd']['events']]==['modified'] and not e12['new.LOG'].get('deleted')
                         and set(e23)=={'passwd'} and 'a%b' not in root and root['etc']['is_dir']
                         and root['a_b'].get('deleted') and root['a_b']['is_dir']
-                        and 'error' in get('qp','etc',A3,A1) and 'error' in get('qp','etc','inconnue',A3))
+                        and 'error' in get('qp','etc',A3,A1) and 'error' in get('qp','etc','inconnue',A3)
+                        and not _plan_bad(get('qp','etc',A1,A3)))   # 1.0.204 : l'appel de l'échantillon de _plans_ok, non vide
             check("TreeHist -X : changements entre deux archives (bornes, supprimés, répertoires, erreurs), identique clair/chiffré",_treehist_changes_ok)
             def _plans_ok():
-                if not traced:   # 1.0.175 (A74) : contrôles de parité écartés par -f -> échantillon des mêmes appels (revue : un
-                    # ÉCHANTILLON — ListBkpFiles, _find_last_archive_with_file, TreeHist -X, jokers non couverts : un mutant de ces chemins
-                    # se juge au run complet, jamais sous -f plans)
-                    for call in (lambda: _q_pair(bhq.treehist,'etc',as_json=True,key=True),lambda: _q_pair(bhq.treefind,'etc','*',as_json=True,key=True),
-                                 lambda: _q_pair(bhq.search,'log',as_json=True,key=True),lambda: _q_pair(bhq.filehist,'/etc/passwd',as_json=True,key=True),
-                                 lambda: _q_pair(bhq.duidx,'etc',as_json=True),lambda: _q_pair(bhq.idxtop,3,20,as_json=True),
-                                 lambda: _q_pair(bhq.difftop,f"{A1},{A2}",3,10,as_json=True)):
-                        call()
-                return traced and not [q for q in traced if re.search(r'\bLIKE\b|\bGLOB\b|ORDER BY[^\n]*\bpath\b',q)]
+                """Aucun LIKE/GLOB ni ORDER BY sur un chemin dans le journal SQL des connexions chiffrées. 1.0.175 (A74) : contrôles de
+                parité écartés par -f -> échantillon des mêmes appels. 1.0.204 (story 83, D132) : chaque appel de l'échantillon tourne
+                SAUF si le contrôle qui le couvre (nommé ici) est lui-même sélectionné — avant : tout l'échantillon sauté dès qu'un autre
+                contrôle tracé avait tourné ; + ListBkpFiles, _find_last_archive_with_file (égalité et joker), TreeHist -X, jokers de
+                Search, TreeFind et DuIdx (avant : 7 appels). Chaque appel lancé : résultat non vide, sans erreur, clair == chiffré
+                (_q_pair, mêmes normalisations que sa parité), et au moins une requête tracée sur la connexion chiffrée."""
+                fl=lambda: [bhq._find_last_archive_with_file(nk,p) for nk in ('qp','qe') for p in ('etc/passwd','home/u/*.tmp')]
+                S=[(f"parité TreeHist {'etc'!r} -b {None}",lambda: _q_pair(bhq.treehist,'etc',as_json=True,key=True)),
+                   (f"parité TreeFind {'etc'!r} {'*'!r} (dont supprimés)",lambda: _q_pair(bhq.treefind,'etc','*',as_json=True,key=True)),
+                   (f"parité TreeFind {None!r} {'*.LOG'!r} (dont supprimés)",lambda: _q_pair(bhq.treefind,None,'*.LOG',as_json=True,key=True)),
+                   (f"parité Search {'log'!r} -b {None}",lambda: _q_pair(bhq.search,'log',as_json=True,key=True)),
+                   (f"parité Search {'*.LOG'!r} -b ALL",lambda: _q_pair(bhq.search,'*.LOG',archive_from='ALL',as_json=True,key=True)),
+                   (f"parité Search {'x?y'!r} -b ALL",lambda: _q_pair(bhq.search,'x?y',archive_from='ALL',as_json=True,key=True)),
+                   (f"parité FileHist {'/etc/passwd'!r} -b {None}",lambda: _q_pair(bhq.filehist,'/etc/passwd',as_json=True,key=True)),
+                   (f"parité DuIdx -j {'etc/*'!r} -b {None}",lambda: _q_pair(bhq.duidx,'etc/*',as_json=True)),
+                   (f"parité DuIdx -j {'*.log'!r} -b ALL",lambda: _q_pair(bhq.duidx,'*.log',archive_from='ALL',as_json=True)),
+                   (f"parité DuIdx -R {'etc/*'!r} -b ALL",lambda: _q_pair(bhq.duidx,'etc/*',archive_from='ALL',raw=True,norm=_srt)),
+                   ("parité IdxTop -j",lambda: _q_pair(bhq.idxtop,3,20,as_json=True,norm=_srt)),
+                   ("parité DiffTop -j",lambda: _q_pair(bhq.difftop,f"{A1},{A2}",3,10,as_json=True,norm=_srt)),
+                   ("parité ListBkpFiles -j (ordre octet UTF-8)",lambda: _q_pair(bhq.list_files,A3,as_json=True,
+                                                                                 norm=lambda v: {k:x for k,x in v.items() if k!='nick'} if isinstance(v,dict) else v)),
+                   ("TreeHist -X : changements entre deux archives (bornes, supprimés, répertoires, erreurs), identique clair/chiffré",
+                    lambda: _q_pair(bhq.treehist,'etc',archive_from=A1,archive_to=A3,as_json=True,changes=True,key=True)),
+                   ("parité _find_last_archive_with_file (égalité et glob)",lambda: (lambda r: (r[:2] if None not in r else None,r[2:]))(fl()))]   # archive trouvée pour chacun
+                bad=_plan_bad
+                if {c for c,_x in S}!=_PLAN_COVER: print(f"  échantillon et _PLAN_COVER divergent : {sorted({c for c,_x in S}^_PLAN_COVER)}"); return False
+                ko={}; ran=0
+                for cover,call in S:
+                    if _selected(cover): continue   # le contrôle qui le couvre tourne (tracé lui aussi)
+                    ran+=1; n0=len(traced); p,e=call()
+                    if len(traced)==n0 or p!=e or bad(p): ko[cover]={'tracé':len(traced)>n0,'clair == chiffré':p==e,'clair':repr(p)[:120]}
+                if ko: print(f"  échantillon ({ran} appel(s) lancé(s)) : {ko}")
+                return bool(traced) and not ko and not [q for q in traced if re.search(r'\bLIKE\b|\bGLOB\b|ORDER BY[^\n]*\bpath\b',q)]
             check("plans (etc) sur connexion chiffrée : aucun LIKE/GLOB, aucun ORDER BY portant sur un chemin",_plans_ok)
         finally:
             globals()['_open_db']=_orig_open
@@ -12674,6 +12981,121 @@ def codec_selftest(pattern=None,list_only=False):
             if (n,got,shared)!=(4,want,1): print(f"  {n} versions, {got}, p partagé {shared}")
             return (n,got,shared)==(4,want,1)
         check("snapshot par version : base d'avant le palier 2 — une version par taille et date, chaque archive la sienne",_snapv_legacy)
+        def _snapv_readers():
+            """1.0.204 (story 83, D215) — lecteurs par archive sur des chemins à PLUSIEURS versions (snapshot_file : une ligne par
+            version depuis 1.0.164), en clair (mvp) et chiffré (mve, passphrase pw). Base d'un scénario réel, écrite par l'écrivain
+            réel (_snap_link_versions) : DIFF_KEEP=2, quatre archives aux snapshots gardés (mv-1..4, sentinelles), paire mv-1 -> mv-2
+            purgée (ni ligne de paire ni entrée), paires mv-2 -> mv-3 et mv-3 -> mv-4 indexées avec LEURS entrées réelles. Versions :
+            v/f 10/20/30/40 (modified dans les deux paires indexées) ; v/k 7 (-rw-r--r--) / 8 (-rwx------) / 7 / 7 (retour à la 1re
+            version, ligne partagée ; modified 8 -> 7 en mv-3) ; v/h 3 (-rw-------) / 4 / 4 / 4 (changé dans la paire purgée : aucune
+            entrée) ; v/g 5 partout ; v/r en mv-1..3 (removed en mv-4) ; répertoire v 2 versions ; w et w/x en mv-4 (added).
+            Attendu en dur, identique dans les deux bases, archive INTERMÉDIAIRE comprise : Search, FileHist (-b ALL, défaut, -b mv-4 :
+            v/k « présent » 7/8/7/7, son entrée étant hors plage), DuIdx (-R et -j, mêmes plages : v/k 7 -> 8 -> 7 compris) ;
+            « présent » = taille de la version de CETTE archive ; ListBkpFiles par archive (et défaut = la plus récente) ;
+            _find_last_archive_with_file (égalité, joker, absent : v/r -> mv-3) ; TreeHist (droits de la version de la dernière
+            archive, r vu pour la dernière fois en mv-3) et TreeHist -X depuis mv-2 et de mv-1 à mv-3 (archive intermédiaire)."""
+            d=os.path.join(tmp,'snapv-readers'); cache=os.path.join(d,'cache'); rc=os.path.join(d,'rc'); os.makedirs(cache)
+            with open(rc,'w') as f:
+                f.write("[mvp]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw\nSER_NAME=s\nGLOB_ARCH=mv-*\nDB_ENCRYPT=false\nDIFF_KEEP=2\n\n"
+                        "[mve]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw\nSER_NAME=s\nGLOB_ARCH=mv-*\nDIFF_KEEP=2\n\n")
+            os.chmod(rc,0o600)
+            bh=BorgHelper(cfgfile=rc,cache_dir=cache); _DB_CFG_READERS[os.path.realpath(cache)]=bh.borg.cfgread
+            D={f'mv-{i}':f'2026-02-0{i}T10:00:00' for i in (1,2,3,4)}; A=list(D)
+            F='-rw-r--r--'; DM='drwxr-xr-x'
+            V={'v':{'mv-1':(0,'d1','d',DM),'mv-2':(0,'d1','d',DM),'mv-3':(0,'d1','d',DM),'mv-4':(0,'d2','d',DM)},'w':{'mv-4':(0,'w1','d',DM)},
+               'v/f':{f'mv-{i}':(10*i,f'f{i}','-',F) for i in (1,2,3,4)},
+               'v/k':{'mv-1':(7,'k1','-',F),'mv-2':(8,'k2','-','-rwx------'),'mv-3':(7,'k1','-',F),'mv-4':(7,'k1','-',F)},
+               'v/g':{a:(5,'g','-',F) for a in A},'v/h':{'mv-1':(3,'h1','-','-rw-------'),**{a:(4,'h2','-',F) for a in A[1:]}},
+               'v/r':{a:(6,'r','-',F) for a in A[:3]},'w/x':{'mv-4':(9,'x','-',F)}}
+            DIFF=[('mv-2','mv-3','modified','v/f',20,30),('mv-2','mv-3','modified','v/k',8,7),('mv-3','mv-4','modified','v/f',30,40),
+                  ('mv-3','mv-4','removed','v/r',6,None),('mv-3','mv-4','added directory','w',None,None),('mv-3','mv-4','added','w/x',None,9)]
+            for nk,enc in (('mvp',False),('mve',True)):
+                p=bh.db.get_diff_db(nk)
+                with contextlib.redirect_stderr(io.StringIO()): bh.db.ensure_diff_db(p)
+                if enc:
+                    c=_open_db(p,nick=None,role='admin'); _enc_header_write(c,cq_hdr); c.close()
+                c=_open_db(p,nick=nk,role='write')
+                try:
+                    if (c.codec is not None)!=enc: print(f"  {nk} : chiffrement {c.codec is not None}, attendu {enc}"); return False
+                    E=(lambda q: c.codec.path.encode(q)) if c.codec else (lambda q: q)
+                    for a,dt in D.items():
+                        _snap_link_versions(c,a,dt,[(nk,E(q),v[a][0],v[a][1],v[a][2],v[a][3],'o:g') for q,v in V.items() if a in v])
+                        c.execute("INSERT INTO archive_snapshot_indexed(nick,archive,entry_count) VALUES(?,?,?)",(nk,a,sum(a in v for v in V.values())))
+                    for ao,an,ct,q,sb,sa in DIFF:
+                        c.execute("INSERT INTO diff_index(nick,archive_old,archive_new,archive_new_date,change_type,path,size_before,size_after) "
+                                  "VALUES(?,?,?,?,?,?,?,?)",(nk,ao,an,D[an],ct,E(q),sb,sa))
+                    for ao,an in (('mv-2','mv-3'),('mv-3','mv-4')):
+                        c.execute("INSERT INTO diff_indexed_pairs(nick,archive_old,archive_new,entry_count) VALUES(?,?,?,?)",
+                                  (nk,ao,an,sum(x[1]==an for x in DIFF)))
+                    for a,dt in D.items():
+                        c.execute("INSERT INTO archive_stats(nick,archive,archive_date,nfiles) VALUES(?,?,?,?)",(nk,a,dt,sum(a in v and v[a][2]=='-' for v in V.values())))
+                    c.commit()
+                    nver=c.execute("SELECT count(*) FROM snapshot_file WHERE nick=?",(nk,)).fetchone()[0]
+                finally: c.close()
+                if nver!=14: print(f"  {nk} : {nver} versions dans snapshot_file (attendu 14 : v 2, w 1, v/f 4, v/k 2, v/g 1, v/h 2, v/r 1, w/x 1)"); return False
+            def j(fn,*a,**k):
+                out=io.StringIO()
+                with contextlib.redirect_stdout(out),contextlib.redirect_stderr(io.StringIO()):
+                    try: fn(*a,**k)
+                    except SystemExit: pass
+                try: return json.loads(out.getvalue())
+                except ValueError: return f"non JSON : {out.getvalue()[-200:]!r}"
+            dd=lambda a: D[a][:19]
+            pr=lambda q,a: {'date':dd(a),'archive':a,'type':'présent','path':q,'size_before':None,'size_after':V[q][a][0]}
+            fh=lambda q,a: {'date':dd(a),'archive_before':'','archive_after':a,'type':'présent','size_before':None,'size_after':V[q][a][0]}
+            sr=lambda ao,an,ct,q,sb,sa: {'date':dd(an),'archive':an,'type':ct,'path':q,'size_before':sb,'size_after':sa}
+            fd=lambda ao,an,ct,q,sb,sa: {'date':dd(an),'archive_before':ao,'archive_after':an,'type':ct,'size_before':sb,'size_after':sa}
+            dif=lambda q,new=None: [x for x in DIFF if x[3]==q and (new is None or x[1]==new)]
+            want={}
+            for b_ in ('ALL',None,'mv-4'):   # défaut : dernière paire (mv-4) ; -b mv-4 : entrées datées >= mv-4
+                last=None if b_=='ALL' else 'mv-4'
+                for q in ('v/h','v/g'):   # aucune entrée : « présent », version de chaque archive (mv-2 comprise)
+                    want[('Search',q,b_)]=[pr(q,a) for a in A]; want[('FileHist',q,b_)]=[fh(q,a) for a in A]
+                for q in ('v/f','v/r','w/x'):   # entrées : seules les entrées de la plage
+                    want[('Search',q,b_)]=[sr(*x) for x in dif(q,last)]; want[('FileHist',q,b_)]=[fd(*x) for x in dif(q,last)]
+            want[('Search','v/k','ALL')]=[sr(*x) for x in dif('v/k')]; want[('FileHist','v/k','ALL')]=[fd(*x) for x in dif('v/k')]
+            want[('Search','v/k','mv-4')]=[pr('v/k',a) for a in A]; want[('FileHist','v/k','mv-4')]=[fh('v/k',a) for a in A]   # 7/8/7/7
+            pres=lambda qs: [(q,'présent',V[q][a][0]) for q in qs for a in A]
+            want[('DuIdx -R','v/*','ALL')]=sorted([('v/f','modified',30),('v/f','modified',40),('v/k','modified',7),('v/r','removed',6)]+pres(('v/h','v/g')))
+            want[('DuIdx -R','v/*',None)]=sorted([('v/f','modified',40),('v/r','removed',6)]+pres(('v/h','v/g')))
+            want[('DuIdx -R','v/*','mv-4')]=sorted([('v/f','modified',40),('v/r','removed',6)]+pres(('v/h','v/g','v/k')))
+            want[('DuIdx -R','w/*',None)]=[('w/x','added',9)]
+            for q,b_,t in (('v/k','mv-4',{'présent':[4,29]}),('v/h','ALL',{'présent':[4,15]}),('v/h',None,{'présent':[4,15]}),
+                           ('v/f','ALL',{'modified':[2,70]}),('v/f',None,{'modified':[1,40]}),('w/x',None,{'added':[1,9]})):
+                want[('DuIdx -j',q,b_)]=t
+            lf=['v','v/f','v/g','v/h','v/k','v/r']
+            for a in A[:3]: want[('ListBkpFiles',a,None)]=lf
+            want[('ListBkpFiles','mv-4',None)]=want[('ListBkpFiles',None,None)]=['v','v/f','v/g','v/h','v/k','w','w/x']
+            for q,a in (('v/h','mv-4'),('v/r','mv-3'),('w/x','mv-4'),('v/*','mv-4'),('v/r*','mv-3'),('nope',None)): want[('_find_last',q,None)]=a
+            th=[('.',DM,None,None),('f',F,None,None),('g',F,None,None),('h',F,None,None),('k',F,None,None),('r',None,True,'mv-3')]
+            for b_ in ('ALL',None): want[('TreeHist','v',b_)]=th
+            want[('TreeHist -X','v',('mv-2',None))]=[('f',F,None,None),('k',F,None,None),('r',None,True,'mv-3')]
+            want[('TreeHist -X','v',('mv-1','mv-3'))]=[('f',F,None,None),('k',F,None,None)]
+            ent=lambda v: [(e['name'],e.get('mode'),e.get('deleted'),e.get('last_seen_archive')) for e in v['entries']] if isinstance(v,dict) and 'entries' in v else v
+            res={}
+            for nk in ('mvp','mve'):
+                got={}
+                for (cmd,q,b_) in want:
+                    if cmd in ('Search','FileHist'):
+                        v=j(bh.search if cmd=='Search' else bh.filehist,nk,q,archive_from=b_,as_json=True); v=v.get(nk) if isinstance(v,dict) else v
+                    elif cmd=='DuIdx -R':
+                        v=j(bh.duidx,nk,q,archive_from=b_,raw=True)
+                        v=sorted((r['chemin'],r['type'],r['taille']) for r in v['rows']) if isinstance(v,dict) and 'rows' in v else v
+                    elif cmd=='DuIdx -j':
+                        v=j(bh.duidx,nk,q,archive_from=b_,as_json=True)
+                        v={r['type']:[r['nb'],r['taille']] for r in v['rows']} if isinstance(v,dict) and 'rows' in v else v
+                    elif cmd=='ListBkpFiles':
+                        v=j(bh.list_files,nk,q,as_json=True); v=v.get('files') if isinstance(v,dict) and v.get('archive')==(q or 'mv-4') else v
+                    elif cmd=='_find_last': v=bh._find_last_archive_with_file(nk,q)
+                    elif cmd=='TreeHist': v=j(bh.treehist,nk,q,archive_from=b_,as_json=True); v=ent(v.get(nk) if isinstance(v,dict) else v)
+                    else: v=j(bh.treehist,nk,q,archive_from=b_[0],archive_to=b_[1],as_json=True,changes=True); v=ent(v.get(nk) if isinstance(v,dict) else v)
+                    got[(cmd,q,b_)]=v
+                bad=[(k,got[k],want[k]) for k in want if got[k]!=want[k]]
+                res[nk]=(not bad,bad[:4])
+            ko={k:v for k,v in res.items() if not v[0]}
+            if ko: print(f"  {ko}")
+            return not ko and len(res)==2 and len(want)==59
+        check("snapshot par version : Search, FileHist, DuIdx, ListBkpFiles, _find_last_archive_with_file, TreeHist rendent pour chaque archive la version de CETTE archive (chemins à plusieurs versions, scénario réel, clair et chiffré)",_snapv_readers)
         def _snapv_incr_db(name,rows,diffs):
             """Base simulée : snapshot de a1 (rows : (chemin, taille)), paire a1->a2 indexée avec diffs (type, chemin)."""
             dp=os.path.join(tmp,name)
@@ -18506,36 +18928,21 @@ fail()
                 done libèrent ; _sentry_capture efface les cadres (Dedupe garde l'exception) ; _cli_main l'appelle au moins trois fois
                 (Index : tour suivant + fin ; Bkp), avec la marque posée dans l'except de l'Index et le test `if _c:` du Bkp ; report
                 et report_offline : marque dans l'except, libération au nick suivant et après la boucle."""
-            import ast,re
-            PH=re.compile(r"\?\d+|(?<![\w:])[:@$][A-Za-z_]\w*")
-            SQLK=re.compile(r"^\s*(SELECT|INSERT|UPDATE|DELETE|WITH|REPLACE|CREATE|PRAGMA)\b",re.I)
-            KW=re.compile(r"\b(SELECT|WHERE|AND|OR|FROM|VALUES|SET|IN|LIKE|JOIN|ON)\b")
-            FRAG=re.compile(r"\?\d+|(?:[=(,<>]|\bIN|\bLIKE|\bAND|\bOR)\s*[:@$][A-Za-z_]\w*")
-            QN=re.compile(r"[=(,<>\s]\?\d+")
-            PURE=('PurePath','PurePosixPath','PureWindowsPath')
+            import ast
             me=_py_compat_guard.__code__.co_firstlineno
             here=os.path.dirname(os.path.abspath(__file__)); files=[os.path.abspath(__file__)]; bad=[]
             www=os.path.join(here,'borgHelperWWW')
             if os.path.isfile(www): files.append(www)
             else: print("  borgHelperWWW absent à côté de borgHelper : sa partie de la garde est sautée")
             for f in files:
-                t=ast.parse(open(f).read()); mine=f==files[0]
+                with open(f,encoding='utf-8') as fh: src=fh.read()
+                t=ast.parse(src); mine=f==files[0]
                 own=next((n for n in ast.walk(t) if isinstance(n,ast.FunctionDef) and n.name=='_py_compat_guard'),None) if mine else None
                 skip=lambda l: own is not None and own.lineno<=l<=own.end_lineno
-                for n in ast.walk(t):
-                    txt=None
-                    if isinstance(n,ast.JoinedStr): txt=''.join(v.value if isinstance(v,ast.Constant) and isinstance(v.value,str) else ' X ' for v in n.values)
-                    elif isinstance(n,ast.Constant) and isinstance(n.value,str): txt=n.value
-                    if txt is not None and not skip(n.lineno):
-                        body=re.sub(r"'(?:[^']|'')*'","''",txt)
-                        m=(PH.search(body) if SQLK.match(txt) else None) or (FRAG.search(body) if KW.search(body) else None) or QN.search(body)
-                        if m: bad.append(f"{os.path.basename(f)}:{n.lineno} marqueur SQL {m.group(0)!r}")
-                    if isinstance(n,ast.Attribute) and n.attr in ('utcnow','utcfromtimestamp') and not skip(n.lineno):
-                        bad.append(f"{os.path.basename(f)}:{n.lineno} .{n.attr}()")
-                    if (isinstance(n,ast.Attribute) and n.attr=='as_uri' and isinstance(n.value,ast.Call) and not skip(n.lineno)
-                            and ((isinstance(n.value.func,ast.Name) and n.value.func.id in PURE) or
-                                 (isinstance(n.value.func,ast.Attribute) and n.value.func.attr in PURE))):
-                        bad.append(f"{os.path.basename(f)}:{n.lineno} PurePath(…).as_uri()")
+                # (1) et (2) — 1.0.204 : au niveau du module ; borgHelperWWW : fichier ENTIER (push_selftest compris), même portée que
+                # son push selftest (_own_source_guards)
+                bad+=_sql_marker_scan(src,os.path.basename(f),('_py_compat_guard',) if mine else ())
+                bad+=_py_calls_scan(src,os.path.basename(f),('_py_compat_guard',) if mine else ())
                 if not mine: continue
                 closes_conn=lambda c: (isinstance(c,ast.Call) and isinstance(c.func,ast.Name) and c.func.id=='_close_quiet' and
                                        len(c.args)==1 and isinstance(c.args[0],ast.Name) and c.args[0].id=='conn')
@@ -18589,185 +18996,6 @@ fail()
             if bad: print(f"  {bad[:10]}")
             return not bad
         check("compatibilité Python 3.10-3.14 : SQL en ? seulement, aucun utcnow(), ensure_* qui ferment avant de sortir (garde AST, 1.0.182)",_py_compat_guard)
-        def _sqlite_close_scan(src,extra=(),tests=('codec_selftest','perf_bench','push_selftest')):
-            """1.0.203 (story 81, D161) : ouvertures SQLite de PRODUCTION dont la fermeture n'est pas prouvée sous une des formes usuelles ci-dessous ->
-            ([(fonction, ligne, motif)], nombre d'ouvertures analysées). Ouvreurs : _open_db (nom ou attribut),
-            sqlite3.connect, sqlite3.dbapi2.connect, sqlite3.Connection(…), BhConnection(…), et `extra` (fonctions qui rendent une
-            connexion, ex. _push_conn de borgHelperWWW). Hors contrôles : fonctions `tests` et _pb_* (PerfBench). Refusés (une
-            ouverture que la garde ne verrait plus) : toute référence à un ouvreur-fonction hors d'un appel (alias,
-            functools.partial), `from sqlite3 import connect/Connection/*`, import renommé d'un ouvreur, `import sqlite3 as X`,
-            getattr(sqlite3, …).
-            Fermeture prouvée pour `v=<ouverture>` (ou `v=<ouverture> if c else None`) :
-            (a) try englobant T — ouverture dans son corps, ses except ou son else (jamais son finally), aucune boucle entre
-                l'ouverture et T, `v=None` avant T dans son bloc (sinon le finally lèverait UnboundLocalError et masquerait
-                l'erreur réelle) ; la fermeture tolère v None : `_close_quiet(v)`, ou `v.close()` sous `if v is not None:`/`if v:` ;
-            (b) ou try T qui suit aussitôt l'ouverture (`if x: v=…`, dernière instruction d'un if sans else : le try qui suit le
-                if) ; ouverture conditionnelle (`if x:` ou `… if c else None`) : fermeture sous ce même test ou sous
-                `v is not None`/`if v:`, ou `_close_quiet(v)` si v vaut toujours None sans ouverture (expression conditionnelle,
-                ou `v=None` avant le if) ;
-            dans les deux cas, une seule écriture de v dans T (affectation, tuple, with … as, for, :=, +=,
-            except … as, import) hors `v=None` juste après sa fermeture, et la fermeture est la PREMIÈRE instruction du finally
-            de T (ou d'un finally imbriqué en tête), jamais dans une fonction imbriquée, jamais après une instruction qui peut
-            lever ; `for c in (…, v, …):` suivi de la fermeture de c (même règle de None). `with contextlib.closing(<ouverture>)` :
-            prouvé ; `with <ouverture>` seul NE ferme PAS (gestionnaire de transaction de sqlite3) : refusé, comme une connexion
-            rendue (return) ou passée telle quelle.
-            Limites connues (formes absentes du code de production, relevé AST de la story 81) : variable d'ancrage réaffectée entre l'ouverture et la fermeture ; `del`/`nonlocal`/`global`/`match` sur la variable ; écriture de la variable dans le finally avant sa fermeture ; `break` dans la boucle de fermeture ; alias de module (`S=sqlite3`) ; sous-classe de `sqlite3.Connection` autre que `BhConnection` appelée directement ; fonction imbriquée nommée `_pb_*` (exclue comme PerfBench) ; `yield` dans le try ; liste blanche comptée par NOM de fonction (une homonyme partagerait le compte)."""
-            import ast
-            t=ast.parse(src); par={}
-            for p in ast.walk(t):
-                for ch in ast.iter_child_nodes(p): par[ch]=p
-            def anc(n):
-                while n in par:
-                    n=par[n]; yield n
-            FN=('_open_db',)+tuple(extra)
-            def is_name(n,v): return isinstance(n,ast.Name) and n.id==v
-            def sq(n): return is_name(n,'sqlite3') or (isinstance(n,ast.Attribute) and n.attr=='dbapi2' and is_name(n.value,'sqlite3'))
-            def fn_ref(f):   # ouvreur-fonction (référence hors appel refusée)
-                if isinstance(f,ast.Name): return f.id in FN
-                return isinstance(f,ast.Attribute) and (f.attr in FN or (f.attr=='connect' and sq(f.value)))
-            def is_open(c):
-                if not isinstance(c,ast.Call): return False
-                f=c.func
-                return fn_ref(f) or is_name(f,'BhConnection') or (isinstance(f,ast.Attribute) and f.attr in ('Connection','BhConnection') and sq(f.value) or
-                                                                 (isinstance(f,ast.Attribute) and f.attr=='BhConnection'))
-            def none_test(tst,v):
-                return is_name(tst,v) or (isinstance(tst,ast.Compare) and is_name(tst.left,v) and len(tst.ops)==1 and isinstance(tst.ops[0],ast.IsNot)
-                        and isinstance(tst.comparators[0],ast.Constant) and tst.comparators[0].value is None)
-            def ctx(req=(),bare=False,quiet=False,none_ok=False,anchors=()):
-                """req : tests d'ancrage TOUS exigés sur la chaîne de if qui ferme (ouverture `if a: [if b:] v=…` sans v=None : v non
-                liée hors de ces tests) ; anchors : tests d'ancrage (tous présents = fermeture acceptée) ; bare : `v.close()` nu
-                accepté (v toujours une connexion) ; quiet : `_close_quiet(v)` nu accepté (v toujours liée, None possible) ;
-                none_ok : fermeture sous `v is not None`/`if v:` acceptée (v toujours liée)."""
-                return {'req':frozenset(req),'bare':bare,'quiet':quiet,'none_ok':none_ok,'anchors':frozenset(anchors)}
-            def closer(s,v,c,have=frozenset(),nn=False):
-                if isinstance(s,ast.Expr) and isinstance(s.value,ast.Call):
-                    f=s.value.func
-                    anch=bool(c['anchors']) and have>=c['anchors']
-                    if isinstance(f,ast.Attribute) and f.attr=='close' and is_name(f.value,v) and not s.value.args:
-                        return anch or (not c['req'] and (c['bare'] or nn))
-                    if isinstance(f,ast.Name) and f.id=='_close_quiet' and len(s.value.args)==1 and is_name(s.value.args[0],v):
-                        return anch or (not c['req'] and (c['quiet'] or c['bare'] or nn))
-                    return False
-                if isinstance(s,ast.If) and not s.orelse and s.body:
-                    d=ast.dump(s.test)
-                    if d in c['anchors']: return closer(s.body[0],v,c,have|{d},nn)
-                    if none_test(s.test,v) and c['none_ok']: return closer(s.body[0],v,c,have,True)
-                    return False
-                if isinstance(s,ast.Try) and s.body: return closer(s.body[0],v,c,have,nn)   # try: <fermeture> … (exécutée d'abord)
-                if (isinstance(s,ast.For) and isinstance(s.target,ast.Name) and isinstance(s.iter,(ast.Tuple,ast.List)) and s.body
-                        and any(is_name(e,v) for e in s.iter.elts)):
-                    if c['req'] and not have>=c['req']: return False   # v peut être non liée : le tuple lèverait NameError
-                    return closer(s.body[0],s.target.id,ctx(bare=c['bare'] or nn,quiet=True,none_ok=True))
-                return False
-            def fin_closes(fb,v,c):
-                if not fb: return False
-                if closer(fb[0],v,c): return True
-                return isinstance(fb[0],ast.Try) and fin_closes(fb[0].finalbody,v,c)
-            def block_of(st):
-                b=par.get(st)
-                for f in ('body','orelse','finalbody','handlers'):
-                    l=getattr(b,f,None)
-                    if isinstance(l,list) and any(x is st for x in l): return l
-                return None
-            def is_closer_stmt(s,v): return closer(s,v,ctx(bare=True,quiet=True,none_ok=True))
-            def stores(T,v):
-                """Écritures de v dans T hors finally (portées imbriquées exclues) ; `v=None` juste après sa fermeture : non comptée."""
-                n=0
-                def visit(ch):
-                    nonlocal n
-                    if isinstance(ch,(ast.FunctionDef,ast.AsyncFunctionDef,ast.Lambda,ast.ClassDef)): return
-                    if isinstance(ch,ast.Name) and ch.id==v and isinstance(ch.ctx,ast.Store):
-                        a=par.get(ch)
-                        if isinstance(a,ast.Assign) and isinstance(a.value,ast.Constant) and a.value.value is None:
-                            blk=block_of(a); i=next((k for k,s in enumerate(blk or []) if s is a),0)
-                            if blk and i>0 and is_closer_stmt(blk[i-1],v): return
-                        n+=1
-                    if isinstance(ch,ast.ExceptHandler) and ch.name==v: n+=1
-                    if isinstance(ch,ast.alias) and (ch.asname or ch.name)==v: n+=1
-                    for c in ast.iter_child_nodes(ch): visit(c)
-                for part in (T.body,T.handlers,T.orelse):
-                    for st in part: visit(st)
-                return n
-            def init_before(st,v):
-                blk=block_of(st)
-                if blk is None: return False
-                j=next((k for k,s in enumerate(blk) if s is st),0)
-                return any(isinstance(s,ast.Assign) and isinstance(s.value,ast.Constant) and s.value.value is None
-                           and any(is_name(g,v) for g in s.targets) for s in blk[:j])
-            def skipped(n):
-                return any(isinstance(a,(ast.FunctionDef,ast.AsyncFunctionDef)) and (a.name in tests or a.name.startswith('_pb_')) for a in anc(n))
-            def fname(n):
-                return next((a.name for a in anc(n) if isinstance(a,(ast.FunctionDef,ast.AsyncFunctionDef))),'<module>')
-            out=[]; seen=0
-            for n in ast.walk(t):
-                if skipped(n) and not isinstance(n,ast.Module): continue
-                if isinstance(n,ast.ImportFrom):
-                    for a in n.names:
-                        if (n.module in ('sqlite3','sqlite3.dbapi2') and a.name in ('connect','Connection','dbapi2','*')) or (a.name in FN+('BhConnection',) and a.asname and a.asname!=a.name):
-                            out.append((fname(n),n.lineno,f"ouvreur importé sous un autre nom ou hors de sqlite3. ({a.name})"))
-                if isinstance(n,ast.Import):
-                    for a in n.names:
-                        if a.name.split('.')[0]=='sqlite3' and a.asname: out.append((fname(n),n.lineno,f"import {a.name} as {a.asname} (ouvreur caché)"))
-                if isinstance(n,ast.Call) and is_name(n.func,'getattr') and n.args and sq(n.args[0]):
-                    out.append((fname(n),n.lineno,"getattr(sqlite3, …) (ouvreur caché)"))
-                if isinstance(n,(ast.Name,ast.Attribute)) and fn_ref(n):
-                    p=par.get(n)
-                    if not (isinstance(p,ast.Call) and p.func is n):
-                        out.append((fname(n),n.lineno,"référence à un ouvreur hors d'un appel (alias)"))
-                if not is_open(n): continue
-                seen+=1; p=par[n]; why=None; v=None; cond=None
-                if isinstance(p,ast.withitem): why="with <ouverture> sans contextlib.closing (ne ferme pas)"
-                elif isinstance(p,ast.Call) and isinstance(par.get(p),ast.withitem):
-                    f=p.func
-                    if not (isinstance(f,ast.Attribute) and f.attr=='closing' and is_name(f.value,'contextlib')): why="with <appel> autre que contextlib.closing"
-                else:
-                    if isinstance(p,ast.IfExp) and p.body is n and isinstance(par.get(p),ast.Assign): p=par[p]; cond='ifexp'
-                    if isinstance(p,ast.Assign) and len(p.targets)==1 and isinstance(p.targets[0],ast.Name): v=p.targets[0].id
-                    else: why="ouverture hors d'une affectation simple (rendue, passée, jetée)"
-                if v is not None:
-                    st=p; guards=set()
-                    while isinstance(par.get(st),ast.If) and par[st].body[-1] is st and not par[st].orelse:
-                        st=par[st]; guards.add(ast.dump(st.test)); cond='if'
-                    blk=block_of(st)
-                    i=next((k for k,s in enumerate(blk) if s is st),None) if blk is not None else None
-                    T=blk[i+1] if i is not None and i+1<len(blk) and isinstance(blk[i+1],ast.Try) else None
-                    always=cond in (None,'ifexp') or init_before(st,v)   # v liée quel que soit le chemin jusqu'au try
-                    cb=ctx(req=() if always else guards,bare=cond is None,quiet=always,none_ok=always,anchors=guards)
-                    if T is not None and fin_closes(T.finalbody,v,cb):   # (b)
-                        k=stores(T,v)
-                        if k: why=f"{k} écriture(s) de {v} dans le try qui la ferme (écrasée sans fermeture)"
-                    else:
-                        why="aucun try/finally qui la ferme en premier"; child=p; loop=False
-                        for a in anc(p):
-                            if isinstance(a,(ast.FunctionDef,ast.AsyncFunctionDef,ast.Lambda)): break
-                            if isinstance(a,(ast.For,ast.While,ast.AsyncFor)): loop=True
-                            if isinstance(a,ast.Try) and fin_closes(a.finalbody,v,ctx(quiet=True,none_ok=True,anchors=guards)):
-                                if any(x is child for x in a.finalbody): why="ouverture dans le finally qui la ferme"; break
-                                k=stores(a,v)
-                                if loop: why="ouverture dans une boucle à l'intérieur du try qui la ferme"
-                                elif k!=1: why=f"{k} écritures de {v} dans le try qui la ferme (écrasée sans fermeture)"
-                                elif not init_before(a,v): why=f"pas de {v}=None avant le try (le finally lèverait UnboundLocalError)"
-                                else: why=None
-                                break
-                            if isinstance(a,ast.Try) and fin_closes(a.finalbody,v,ctx(bare=True,quiet=True,none_ok=True)):
-                                why=f"v.close() nu dans le finally d'un try englobant : lève si l'ouverture a échoué (_close_quiet({v}) ou sous `if {v} is not None:`)"; break
-                            child=a
-                if why: out.append((fname(n),n.lineno,why))
-            return out,seen
-        _SCG_WL={'borgHelper':{'_open_db':5,'ensure_cache_db':1,'ensure_diff_db':1,'ensure_history_db':1,'_audit_witness':1},
-                 'borgHelperWWW':{'_push_conn':1}}
-        _SCG_SEEN={'borgHelper':113,'borgHelperWWW':18}   # nombre EXACT d'ouvertures analysées (1.0.203 / 1.31.17)
-        def _sqlite_close_file(nm,f,extra):
-            """Partie fichier de la garde : sites non prouvés hors liste blanche, liste blanche au nombre exact par fonction,
-            nombre exact d'ouvertures analysées (ouverture ajoutée ou retirée, ouvreur devenu invisible : liste à revoir)."""
-            got,seen=_sqlite_close_scan(open(f).read(),extra); cnt={}; bad=[]
-            for fn,l,why in got: cnt[fn]=cnt.get(fn,0)+1
-            for fn,l,why in got:
-                if fn not in _SCG_WL[nm]: bad.append(f"{nm}:{l} ({fn}) {why}")
-            for fn,k in _SCG_WL[nm].items():
-                if cnt.get(fn,0)!=k: bad.append(f"{nm} liste blanche {fn} : {cnt.get(fn,0)} ouverture(s) non prouvée(s), {k} attendue(s) — à revoir")
-            if seen!=_SCG_SEEN[nm]: bad.append(f"{nm} : {seen} ouvertures analysées, {_SCG_SEEN[nm]} attendues — compte à revoir (ouverture ajoutée/retirée, ouvreur invisible)")
-            return bad
         def _sqlite_close_guard():
             """1.0.203 (story 81, D161) — garde AST (_sqlite_close_scan) sur la production de borgHelper. Liste blanche NOMMÉE,
             nombre exact d'ouvertures non prouvées par fonction : _open_db (4 sqlite3.connect + la reprise rendue : connexion
@@ -18776,7 +19004,8 @@ fail()
             ensure_history_db (ouverture dernière instruction de son try, suivie du try/finally qui ferme ; ses except sortent),
             _audit_witness (ouverture vouée à l'échec : parent inexistant). Témoins : une source par règle, signalée avec
             fonction et ligne ; formes garanties non signalées."""
-            bad=_sqlite_close_file('borgHelper',os.path.abspath(__file__),())
+            with open(os.path.abspath(__file__),encoding='utf-8') as fh: src=fh.read()
+            bad=_sqlite_close_file('borgHelper',src,(),_SCG_WL['borgHelper'],_SCG_SEEN['borgHelper'])
             neg={"linéaire":("def a(p):\n    c=_open_db(p)\n    c.execute('x')\n    c.close()\n",[('a',2)]),
                  "with sans closing":("def b(p):\n    with sqlite3.connect(p) as c: c.execute('x')\n",[('b',2)]),
                  "with _push_conn (extra)":("def b3():\n    with _push_conn('read') as c: c.execute('x')\n",[('b3',2)]),
@@ -18843,8 +19072,15 @@ fail()
         _www_src=os.path.join(os.path.dirname(os.path.abspath(__file__)),'borgHelperWWW')
         def _sqlite_close_guard_www():
             """1.0.203 / WWW 1.31.17 (story 81) — même garde sur la production de borgHelperWWW (push_selftest exclu, _push_conn
-            compté comme ouvreur ; liste blanche : _push_conn, connexion rendue)."""
-            bad=_sqlite_close_file('borgHelperWWW',_www_src,('_push_conn',))
+            compté comme ouvreur ; liste blanche : _push_conn, connexion rendue). 1.0.204 : liste blanche et compte exact lus dans la
+            source de WWW (_SCG_WL_WWW, _SCG_SEEN_WWW, littéraux), les mêmes que son push selftest."""
+            with open(_www_src,encoding='utf-8') as fh: src=fh.read()
+            wl,sn=_src_literal(src,'_SCG_WL_WWW'),_src_literal(src,'_SCG_SEEN_WWW')
+            if not isinstance(wl,dict) or not isinstance(sn,int):
+                print(f"  _SCG_WL_WWW / _SCG_SEEN_WWW absentes, non littérales ou affectées plusieurs fois dans borgHelperWWW : {wl!r} {sn!r}"); return False
+            if (_src_literal("a=1\n",'a'),_src_literal("a=1\na=2\n",'a'),_src_literal("a=1\na+=1\n",'a'),_src_literal("a=f()\n",'a'))!=(1,None,None,None):
+                print("  témoin _src_literal : écriture multiple ou valeur non littérale acceptée"); return False
+            bad=_sqlite_close_file('borgHelperWWW',src,('_push_conn',),wl,sn)
             if bad: print(f"  {bad[:12]}")
             return not bad
         _SCG_WWW="connexions SQLite de production de borgHelperWWW : fermeture prouvée sous les formes usuelles, liste blanche nommée (garde AST, 1.0.203)"
@@ -19004,6 +19240,120 @@ fail()
         _ABN="connexion abandonnée sur une exception (BaseException, Ctrl-C, SystemExit ; écrivains, lecteurs, multi-nicks, sys.exit, sortie anticipée, sqlite3.connect nu ; arrêt d'un nick après ouverture) : verrou relâché, rien validé, descripteurs fermés au retour (comportement, 1.0.203)"
         if os.path.isdir('/proc/self/fd'): check(_ABN,_abandoned_conn_closed)
         else: skip(_ABN,"/proc/self/fd absent : descripteurs non mesurables")
+        def _ensure_closed_on_raise():
+            """1.0.204 (story 83, D162b) — par comportement (avant : forme seulement, garde « compatibilité Python »). Chaque ensure_*
+            (cache, diff, history), base neuve par cas, interrompu APRÈS l'ouverture de sa connexion, transaction d'écriture ouverte
+            (témoin écrit juste avant l'injection), en cinq points :
+            - meta : à _check_set_meta (création) — Ctrl-C privé, DbKeyError, SchemaVersionError RÉELLE (version 999 écrite puis le
+              vrai _check_set_meta lève), sqlite3.OperationalError (branche DatabaseError : _db_schema_fail, sortie 1) ;
+            - commit : au premier commit qui valide des écritures (transaction ouverte) — Ctrl-C privé, OperationalError ;
+            - reader : lecteur (create=False) sur une base existante, à _check_set_meta — Ctrl-C privé, DbKeyError, OperationalError
+              (sortie 1), « database is locked » (cache, diff : _reader_busy_skip, aucune exception ; history : sortie 1) ;
+            - migrate (diff) : dans _migrate_to_history (_hist_migration_state) — Ctrl-C privé, DbKeyError, OperationalError ;
+            - enc (cache, diff) : création CHIFFRÉE avec un nick (zb : DB_ENCRYPT, passphrase pw) — DbKeyError réelle
+              (_enc_header_unlock sans passphrase) levée dans la transaction BEGIN IMMEDIATE de _create_schema (_conn_has_table).
+            Attendu : l'exception attendue remonte (ou aucune), une injection exactement, connexion fermée — aucun descripteur sur la
+            base (base, -wal, -shm), autre écrivain libre (BEGIN IMMEDIATE, délai 0), rien validé (témoin, version 999, en-tête).
+            Connexion de l'ensure_* dans un cycle (c._cyc=c), ramasse-miettes automatique coupé, comme la story 81. Le Ctrl-C injecté
+            est une sous-classe privée de KeyboardInterrupt : un vrai Ctrl-C ou SIGTERM n'est jamais avalé, il arrête le run."""
+            import gc
+            class _S83Int(KeyboardInterrupt): pass
+            d,b=_nb_env('s83ensure'); res={}
+            g=globals(); real=g['_open_db']; real_cht=g['_conn_has_table']; real_csm=b.db._check_set_meta; real_hms=b.db._hist_migration_state
+            st={'target':'','mode':None,'exc':None,'hits':0,'conns':[]}
+            WIT="INSERT OR REPLACE INTO db_meta VALUES('s83','1')"
+            def mkexc():
+                return {'KI':_S83Int,'DbKeyError':lambda: DbKeyError('s83 : clé refusée (contrôle)'),
+                        'io':lambda: sqlite3.OperationalError('disk I/O error'),'busy':lambda: sqlite3.OperationalError('database is locked')}[st['exc']]()
+            def mine(conn): return st['hits']==0 and any(c is conn for c in st['conns'])
+            def fire(conn):
+                st['hits']+=1; conn.execute(WIT)
+                if st['exc']=='SchemaVersionError': conn.execute("INSERT OR REPLACE INTO db_meta VALUES('schema_version','999')"); return
+                raise mkexc()
+            def w(*a,**k):
+                c=real(*a,**k)
+                if a and os.path.realpath(a[0])==os.path.realpath(st['target']):
+                    c._cyc=c; st['conns'].append(c)
+                    if st['mode']=='commit':
+                        cm=type(c).commit
+                        def commit():
+                            if c.in_transaction and mine(c): fire(c)   # premier commit qui valide des écritures (pas celui de _ensure_wal)
+                            return cm(c)
+                        c.commit=commit
+                return c
+            def csm(conn,*a,**k):
+                if st['mode'] in ('meta','reader') and mine(conn): fire(conn)
+                return real_csm(conn,*a,**k)
+            def hms(conn):
+                if st['mode']=='migrate' and mine(conn): fire(conn)
+                return real_hms(conn)
+            def cht(conn):
+                if st['mode']=='enc' and mine(conn):
+                    st['hits']+=1; conn.execute("CREATE TABLE s83_temoin(x)")
+                    _enc_header_unlock({},'')   # DbKeyError réelle (« passphrase absente »)
+                return real_cht(conn)
+            def free(p):
+                c=sqlite3.connect(p,timeout=0,isolation_level=None)
+                try: c.execute("BEGIN IMMEDIATE"); c.execute("ROLLBACK"); return True
+                except sqlite3.OperationalError: return False
+                finally: c.close()
+            def committed(p):
+                c=sqlite3.connect(p)
+                try:
+                    tabs={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    out=['table témoin'] if 's83_temoin' in tabs else []
+                    if 'db_meta' in tabs:
+                        out+=[r[0] for r in c.execute("SELECT key FROM db_meta WHERE key IN ('s83','enc_header') OR (key='schema_version' AND value='999')")]
+                    return out
+                finally: c.close()
+            def unlink(p):
+                for x in (p,p+'-wal',p+'-shm'):
+                    with contextlib.suppress(FileNotFoundError): os.unlink(x)
+            fns={'cache':b.db.ensure_cache_db,'diff':b.db.ensure_diff_db,'history':b.db.ensure_history_db}
+            cases=[(base,m,e) for base in fns for m,es in (('meta',('KI','DbKeyError','SchemaVersionError','io')),('commit',('KI','io')),
+                                                           ('reader',('KI','DbKeyError','io','busy'))) for e in es]
+            cases+=[('diff','migrate',e) for e in ('KI','DbKeyError','io')]+[(base,'enc','DbKeyError') for base in ('cache','diff')]
+            def want_exc(base,m,e):
+                if e=='KI': return '_S83Int'
+                if e in ('DbKeyError','SchemaVersionError'): return e
+                if e=='busy' and base!='history': return None   # lecteur : _reader_busy_skip ferme et rend la main
+                return 'SystemExit(1)'                          # _db_schema_fail
+            was=gc.isenabled(); gc.collect(); gc.disable()
+            try:
+                for base,m,e in cases:
+                    nm=f"{base} {m} {e}"
+                    if m=='enc': p=b.db.get_cache_db('zb') if base=='cache' else b.db.get_diff_db('zb'); kw={'nick':'zb'}; unlink(p)
+                    else: p=os.path.join(d,f's83-{base}-{m}-{e}.db'); kw={'create':False} if m=='reader' else {}
+                    try:
+                        if m=='reader':   # base existante d'abord (sans injection), puis le lecteur
+                            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): fns[base](p)
+                            b.db._hist_ready.discard(p); b.db._reader_skipped.pop(p,None)
+                        st.update(target=p,mode=m,exc=e,hits=0,conns=[]); got=None
+                        g['_open_db']=w; g['_conn_has_table']=cht
+                        try:
+                            with mock.patch.object(b.db,'_check_set_meta',csm),mock.patch.object(b.db,'_hist_migration_state',hms),\
+                                 contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): fns[base](p,**kw)
+                        except (_S83Int,DbKeyError,SchemaVersionError) as x: got=type(x).__name__
+                        except SystemExit as x: got=f"SystemExit({x.code})"
+                        finally: g['_open_db']=real; g['_conn_has_table']=real_cht
+                        r={'injections':st['hits'],'levée':got,'fds':_fds81(p),'autre écrivain libre':free(p),'validé':committed(p)}
+                        res[nm]=(r=={'injections':1,'levée':want_exc(base,m,e),'fds':0,'autre écrivain libre':True,'validé':[]},r)
+                    except Exception as x: res[nm]=(False,f"{type(x).__name__}: {x}")
+                    finally:
+                        g['_open_db']=real; g['_conn_has_table']=real_cht
+                        for c in st['conns']:   # cas indépendants : connexion laissée par un défaut fermée avant le suivant
+                            with contextlib.suppress(Exception): c.close()
+                        st['conns']=[]; gc.collect()
+                        if m=='enc': unlink(p)
+            finally:
+                g['_open_db']=real; g['_conn_has_table']=real_cht; gc.collect()
+                if was: gc.enable()
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad and len(res)==35
+        _ECR="ensure_cache_db / ensure_diff_db / ensure_history_db interrompus après l'ouverture (SchemaVersionError, DbKeyError, Ctrl-C, OperationalError ; création, commit, lecteur, migration, création chiffrée) : connexion fermée, autre écrivain libre, rien validé (comportement, 1.0.204)"
+        if os.path.isdir('/proc/self/fd'): check(_ECR,_ensure_closed_on_raise)
+        else: skip(_ECR,"/proc/self/fd absent : descripteurs non mesurables")
         def _swap_interrupted():
             """1.0.203 (story 81, revue) — _swap_db interrompu (KeyboardInterrupt) PENDANT le checkpoint WAL de fin de copie :
             les deux connexions (src, dst : cycle forcé, ramasse-miettes coupé) sont fermées et `new` est retirée selon la même
@@ -20520,6 +20870,72 @@ fail()
                              f"BORG_BASE_DIR du chemin {placed}")
             return ok
         _rbc("harnais vrai borg : BORG_* factices de l'utilisateur jamais écrits (sous-processus, wrapper, boex, CLI), dossier borg de l'utilisateur intact",_rb_isolation)
+        # 1.0.204 (story 83, D132) : CLI enfant de CodecSelfTest chargé depuis CE fichier (SourceFileLoader), qui dit les fichiers du
+        # dossier du run (S83FICHIERS, relevés juste avant son retrait) ; mode decor : le décor _pre « enc_header : première écriture »
+        # rend False (base écrite quand même : aucun effet sur la suite)
+        _CHILD83=("import sys,os,json,shutil,importlib.machinery,importlib.util\n"
+                  "p,mode=sys.argv[1],sys.argv[2]; args=sys.argv[3:]\n"
+                  "ld=importlib.machinery.SourceFileLoader('bh83enfant',p); sp=importlib.util.spec_from_loader('bh83enfant',ld)\n"
+                  "B=importlib.util.module_from_spec(sp); ld.exec_module(B)\n"
+                  "real=shutil.rmtree\n"
+                  "def rm(path,*a,**k):\n"
+                  "    if os.path.basename(str(path)).startswith('borghelper-selftest-'):\n"
+                  "        fs=sorted(os.path.relpath(os.path.join(r,f),path) for r,ds,fl in os.walk(path) for f in fl)\n"
+                  "        print('S83FICHIERS '+json.dumps(fs),flush=True)\n"
+                  "    return real(path,*a,**k)\n"
+                  "shutil.rmtree=rm\n"
+                  "if mode=='decor':\n"
+                  "    rw=B._enc_header_write\n"
+                  "    def w(c,h):\n"
+                  "        r=rw(c,h)\n"
+                  "        return False if sys._getframe(1).f_code.co_name=='<lambda>' else r\n"
+                  "    B._enc_header_write=w\n"
+                  "sys.argv=[p]+args; B._cli_main()\n")
+        def _child83(mode,*args):
+            # TMPDIR du run (revue) : un enfant tué au délai ne laisse jamais de borghelper-selftest-* hors du dossier du run
+            r=_rb_run([sys.executable,'-c',_CHILD83,os.path.realpath(__file__),mode,'-c','CodecSelfTest',*args],300,env=_rb_cli_env(TMPDIR=tmp))
+            o=r.stdout+r.stderr; fs=None
+            for l in o.splitlines():
+                if l.startswith('S83FICHIERS '): fs=json.loads(l[12:])
+            return r.returncode,o,fs
+        # fichiers communs créés par le code hors contrôles (README « -l ») : 1er composant de leur chemin dans le dossier du run
+        _COMMON83={'t.db','tamper.db','hugekdf.db','garbage.db','bkpstatus-history.db','q0.db','qrc','qcache','rhist','rb-nodsn'}
+        def _list_only_no_decor():
+            """1.0.204 (story 83, D132) : CodecSelfTest -l (liste seule, sans filtre) n'exécute aucun décor _pre — CLI enfant : code 0,
+            autant de lignes LIST que le compte « N contrôle(s) » (N > 0), et, relevés dans le dossier du run juste avant son retrait,
+            AUCUN fichier hors des bases communes documentées (_COMMON83, README) — un décor qui tournerait sous -l en ajouterait (la
+            migration par version : snapv-qp.db, snapv-qe.db). Témoin : la base d'en-tête commune t.db est bien relevée (relevé lu)."""
+            rc,o,fs=_child83('liste','-l')
+            n=re.findall(r'^(\d+) contrôle\(s\)$',o,re.M); lst=sum(l.startswith('LIST ') for l in o.splitlines())
+            extra=sorted(f for f in (fs or []) if f.split('/')[0] not in _COMMON83)
+            ok=rc==0 and len(n)==1 and int(n[0])==lst>0 and fs is not None and 't.db' in fs and not extra
+            if not ok: print(f"  -l : code {rc}, compte {n}, LIST {lst}, relevé {fs is not None}, hors bases communes {extra[:8]} ; {o[-300:]!r}")
+            return ok
+        check("CodecSelfTest -l (liste seule) : aucun décor _pre exécuté (CLI enfant, aucun fichier hors des bases communes)",_list_only_no_decor)
+        def _decor_fail_line():
+            """1.0.204 (story 83, D132) : décor _pre en échec (résultat False forcé dans un CLI enfant) dont le contrôle est écarté par -f
+            -> ligne « DÉCOR EN ÉCHEC <nom> (décor _pre exécuté hors sélection : résultat False) » hors des totals, code 1 : avec un
+            contrôle sélectionné (son OK, bilan « 1/1 OK » + mention du décor) et avec une sélection vide (« aucun contrôle ne
+            correspond » ET la ligne, code 1). Témoin : même run sans décor cassé -> aucune ligne DÉCOR, code 0 et 2."""
+            D83="DÉCOR EN ÉCHEC enc_header : première écriture -> True (décor _pre exécuté hors sélection : résultat False)"
+            H="HMAC-SHA256 (RFC 4231 cas 1)"; res={}
+            for mode in ('decor','témoin'):
+                for k,flt in (('un contrôle','='+H),('sélection vide','=s83 aucun contrôle de ce nom')):
+                    rc,o,_fs=_child83(mode,'-f',flt); ls=o.splitlines()
+                    dl=[l for l in ls if l.startswith('DÉCOR EN ÉCHEC')]; ck=[l for l in ls if l.startswith(('OK  ','FAIL','SKIP'))]
+                    bil=[l for l in ls if l.startswith('CodecSelfTest : ')]
+                    if k=='un contrôle':
+                        want=(1 if mode=='decor' else 0,[D83] if mode=='decor' else [],[f"OK   {H}"])
+                        got=(rc,dl,ck); good=got==want and len(bil)==1 and bil[0].startswith('CodecSelfTest : 1/1 OK') and (
+                            ('1 décor(s) _pre en échec' in bil[0])==(mode=='decor'))
+                    else:
+                        want=(1 if mode=='decor' else 2,[D83] if mode=='decor' else [],[])
+                        got=(rc,dl,ck); good=got==want and any('aucun contrôle ne correspond' in l for l in bil)
+                    res[f"{mode} {k}"]=(good,got,bil[-1:] if bil else o[-200:])
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad and len(res)==4
+        check("CodecSelfTest -f : décor _pre en échec, son contrôle écarté -> ligne DÉCOR EN ÉCHEC hors des totals, code 1 (CLI enfant)",_decor_fail_line)
         def _rb_wrapper_rewrite():
             """1.0.159 (story 22, A29) : un wrapper réécrit par _rb_wrapper pendant qu'une copie tourne (sleep) ne lui fait
             jamais sauter son export. bash lit un script par position : la ligne de ralentissement a la longueur exacte, en
@@ -22208,6 +22624,157 @@ fail()
         _rbc("Restore fini pendant un Bkp -> Index toujours en pause ; diffs arrêtés sans break-lock, borg suivant passe ; reprise",_ix_restore_during_bkp)
         _rbc("DelBkp -> archive retirée des bases et du rapport sans nouvel Index",_ix_delbkp_reconcile)
         _rbc("périmètre GLOB_ARCH : hors motif retirée sans toucher history.db ; disparue figée ; liste complète en échec -> reporté ; sans filtre -> un seul borg list",_sc_scope)
+        def _sc_scope_killed():
+            """1.0.204 (story 83, D214) : borg list du dépôt ENTIER (_repo_archive_names : GLOB_ARCH a-*, archives b-* de la base
+            hors de la liste filtrée) lent — wrapper : sleep 25 s sur `list --json` sans --glob-archives, sous un drapeau —, tué
+            pendant le rapprochement de l'Index :
+            (1) échéance d'une tranche (budget 6 s) : Index rendu dans le budget (< 6 + 3 s), « liste complète du dépôt
+                interrompue (échéance ou opération prioritaire) … rapprochement reporté », rien retiré (archives, paires et
+                snapshots de diff.db, history.db), report noté (deferred ['dépôt'], plan['reconcile_deferred'] True, D200) ;
+            (2) opération prioritaire (priority.lock d'un autre PID posé dès que le journal montre ce borg list, Index sans
+                budget) : tour relâché en moins de 4 s, Index en pause, même message, rien retiré pendant la pause, report noté ;
+                drapeau retiré puis verrou retiré : reprise (« reprise de l'Index »), rapprochement abouti (b-* hors motif retirées,
+                history.db identique), report remis à False à la passe suivante, code 0.
+            history.db porte mesures ET lignes de graphique des b-* (revue) : les prendre pour disparues la changerait. Sortie du fil
+            de l'Index capturée pour ses seuls fils (nés pendant l'Index) ; fil encore vivant après son attente : groupes des borg lents
+            tués, sortie toujours capturée, échec et arrêt du contrôle. Le borg list lent écrit son PID et celui de son attente :
+            après l'échéance comme après la pause, les deux disparus (arbre tué, pas seulement abandonné)."""
+            d=os.path.join(tmp,'scopek'); src=os.path.join(d,'src'); os.makedirs(src)
+            repo=os.path.join(d,'repo'); bb=os.path.join(d,'bb'); log=os.path.join(d,'borg.log'); slow=os.path.join(d,'slow')
+            w=os.path.join(d,'borgw'); rc=os.path.join(d,'rc'); borg=shutil.which('borg'); nk='sk'
+            env=_rb_env(bb,BORG_PASSPHRASE='pw-sk')
+            r=subprocess.run([borg,'init','-e','repokey',repo],env=env,capture_output=True,text=True,timeout=120)
+            if r.returncode!=0: print(f"  borg init : {r.stderr[-200:]}"); return False
+            for i,m in enumerate(('a','b','a','b'),1):
+                with open(os.path.join(src,'f.txt'),'a') as f: f.write(f'{m}{i}\n')
+                subprocess.run([borg,'create','--timestamp',f'2026-09-0{i}T10:00:00',f'{repo}::{m}-2026-09-0{i}',src],
+                               env=env,capture_output=True,timeout=120,check=True)
+            pidf=os.path.join(d,'lent.pid')   # revue : le borg list lent dit son PID et celui de son attente (preuve qu'ils ont été tués)
+            _rb_wrapper(w,bb,f"echo \"$*\" >> {shlex.quote(log)}\n"
+                        f"if [ -f {shlex.quote(slow)} ] && [ \"$*\" = 'list --json' ]; then sleep 25 </dev/null >/dev/null 2>&1 & s=$!; "
+                        f"echo \"$$ $s\" >> {shlex.quote(pidf)}; wait $s; fi\n")
+            def slowpids():
+                try:
+                    with open(pidf) as f: return [tuple(int(x) for x in l.split()) for l in f if len(l.split())==2]
+                except OSError: return []
+            def alive(pid):
+                try:
+                    with open(f'/proc/{pid}/stat') as f: st=f.read()
+                    return st[st.rindex(')')+2]!='Z'
+                except (OSError,ValueError,IndexError): return False
+            def killed(pp,wait=3):
+                """Chaque borg list lent relevé : le script et son attente (sleep, son enfant) disparus — l'arbre tué par boex, pas
+                seulement abandonné (attente bornée : le signal est déjà parti ; jamais le groupe : celui du selftest)."""
+                t0=time.monotonic()
+                while any(alive(x) for p in pp for x in p) and time.monotonic()-t0<wait: time.sleep(0.05)
+                return bool(pp) and not any(alive(x) for p in pp for x in p)
+            def cfg(glob_):
+                with open(rc,'w') as f:
+                    f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\n\n[{nk}]\nBORG_REPO={repo}\nBORG_PASSPHRASE=pw-sk\nSER_NAME=sk\n"
+                            f"SER_LOGIN=x\n{'GLOB_ARCH='+glob_+chr(10) if glob_ else ''}BORG_ARCHNAME=a\nBORG_ROOTBKP={src}\n"
+                            f"DB_ENCRYPT=false\nIDX_WORKERS=1\nBORG_EXE={w}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\n")
+                os.chmod(rc,0o600)
+                b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+                spy={'deferred':[],'flags':[]}
+                rec=b._reconcile_archives; ip=b._index_pass
+                def _rec(*a,**k):
+                    v=rec(*a,**k)
+                    if 'deferred' in k: spy['deferred'].append(list(k['deferred']))
+                    return v
+                def _ip(n,dbg,dbp,force,ta,plan):
+                    v=ip(n,dbg,dbp,force,ta,plan); spy['flags'].append(plan.get('reconcile_deferred')); return v
+                b._reconcile_archives=_rec; b._index_pass=_ip
+                return b,spy
+            def logs(clear=True):
+                try:
+                    with open(log) as f: lines=f.read().splitlines()
+                except OSError: lines=[]
+                if clear and os.path.exists(log): os.unlink(log)
+                return lines
+            def state(b):
+                c=sqlite3.connect(b.db.get_diff_db(nk))
+                try: return (sorted(r[0] for r in c.execute("SELECT archive FROM archive_stats")),
+                             sorted(c.execute("SELECT archive_old,archive_new FROM diff_indexed_pairs").fetchall()),
+                             sorted(r[0] for r in c.execute("SELECT DISTINCT archive FROM archive_snapshot")))
+                finally: c.close()
+            def hist(b):
+                c=sqlite3.connect(b.db.get_history_db(nk))
+                try: return (sorted(c.execute("SELECT * FROM archive_chart").fetchall(),key=repr),
+                             sorted(c.execute("SELECT * FROM archive_measure").fetchall(),key=repr))
+                finally: c.close()
+            MSG='liste complète du dépôt interrompue (échéance ou opération prioritaire) — rapprochement reporté'
+            res={}; th=None; lp=None; streams=None; keep=False
+            try:
+                b,_s=cfg(None); _q_run(b.index,nk)
+                # mesures ET lignes de graphique pour TOUTES les archives, b-* comprises (revue) : un rapprochement qui prendrait les
+                # b-* (hors motif, encore dans le dépôt) pour disparues figerait leur ligne (gone) et retirerait leur mesure -> hist change
+                for n in ('a-2026-09-01','b-2026-09-02','a-2026-09-03','b-2026-09-04'):
+                    b.db.store_archive_measure(nk,n,f'{n[2:]}T10:00:00',1000,1,0)
+                b.db.freeze_archive_chart(nk,[{'archive':n,'archive_date':f'{n[2:]}T10:00:00','gone':False,'nfiles':1}
+                                              for n in ('b-2026-09-02','b-2026-09-04')])
+                s0=state(b); hb=hist(b)
+                b_in=(any(a.startswith('b-') for a in s0[0]) and sum(r[1].startswith('b-') for r in hb[0])==2
+                      and sum(r[1].startswith('b-') for r in hb[1])==2 and not any(r[1].startswith('b-') and r[13] for r in hb[0]))
+                # (1) échéance de tranche pendant le borg list du dépôt entier
+                b,spy=cfg('a-*'); h0=hist(b); open(slow,'w').close(); logs()
+                t0=time.monotonic(); out=_q_run(b.index,nk,budget=6); dt=time.monotonic()-t0; lg=logs(); pp=slowpids(); k1=killed(pp)
+                res['échéance']=(dt<6+3 and MSG in out and state(b)==s0 and hist(b)==h0 and 'list --json' in lg and len(pp)==1 and k1
+                                 and spy['deferred']==[['dépôt']] and spy['flags']==[True],
+                                 f"durée {dt:.1f}s, borg list lent {pp} tué {k1}, état {state(b)==s0}, history {hist(b)==h0}, deferred {spy['deferred']}, "
+                                 f"drapeaux {spy['flags']}, borg {lg[-4:]}, {out[-300:]!r}")
+                # (2) opération prioritaire pendant le borg list du dépôt entier, Index sans budget
+                b,spy=cfg('a-*'); out=io.StringIO(); rr={}; before=set(threading.enumerate()); frozen=[None]
+                with contextlib.suppress(FileNotFoundError): os.unlink(pidf)
+                class _TOut:
+                    """Revue : à la capture, SEULS les fils démarrés depuis le départ du fil de l'Index (différence d'enumerate, par objet
+                    Thread — jamais un ident réutilisable) ; capture gardée après le contrôle (fil survivant) : ensemble figé à ce
+                    moment, tout autre fil (le principal, ceux des contrôles suivants) écrit dans le flux réel."""
+                    def __init__(self,base): self.base=base
+                    def _t(self):
+                        t=threading.current_thread()
+                        return out if (t in frozen[0] if frozen[0] is not None else t not in before) else self.base
+                    def write(self,x): return self._t().write(x)
+                    def flush(self): return self._t().flush()
+                    def __getattr__(self,a): return getattr(self.base,a)
+                def run(): rr['r']=b.index(nk)
+                so,se=sys.stdout,sys.stderr; sys.stdout,sys.stderr=_TOut(so),_TOut(se); streams=(so,se)
+                th=threading.Thread(target=run,daemon=True); th.start(); t0=time.monotonic()
+                while time.monotonic()-t0<60 and 'list --json' not in logs(clear=False): time.sleep(0.05)
+                seen=time.monotonic()-t0<60
+                lp=b.db._priority_lock_path(nk); _ix_fake_lock(lp); t1=time.monotonic()
+                while time.monotonic()-t1<15 and os.path.exists(b.db._index_running_lock_path(nk)): time.sleep(0.05)
+                rel=time.monotonic()-t1; paused=b.db._owns_lock(b.db._index_paused_lock_path(nk)); pp=slowpids(); k2=killed(pp)
+                mid=(state(b),hist(b),out.getvalue(),list(spy['deferred']),list(spy['flags']))
+                os.unlink(slow); time.sleep(0.5); os.unlink(lp); lp=None; th.join(120)
+                if th.is_alive():   # revue : borg lents (script, attente) tués, capture gardée tant que le fil vit ; échec, arrêt du contrôle
+                    for x in {x for p in slowpids() for x in p}:
+                        if alive(x):
+                            with contextlib.suppress(ProcessLookupError,PermissionError): os.kill(x,signal.SIGKILL)
+                    th.join(60); keep=th.is_alive()
+                    if keep: frozen[0]={t for t in threading.enumerate() if t not in before}   # fils de l'Index seulement
+                    print(f"  Index (opération prioritaire) toujours vivant après 120 s : borg lents tués, "
+                          f"{'toujours vivant : sa sortie reste capturée' if keep else 'fini ensuite'} ; arrêt du contrôle")
+                    return False
+                sys.stdout,sys.stderr=streams; streams=None
+                end=out.getvalue(); s1=state(b)
+                res['prioritaire']=(seen and rel<4 and paused and len(pp)==1 and k2 and MSG in mid[2] and mid[0]==s0 and mid[1]==h0
+                                    and mid[3]==[['dépôt']] and mid[4]==[True] and rr.get('r')==0 and f"{nk}: reprise de l'Index" in end
+                                    and not any(a.startswith('b-') for a in s1[0]) and hist(b)==h0
+                                    and spy['deferred'][-1]==[] and spy['flags'][-1] is False,
+                                    f"vu {seen}, relâché {rel:.1f}s, pause {paused}, borg list lent {pp} tué {k2}, pendant : état {mid[0]==s0} history {mid[1]==h0} "
+                                    f"deferred {mid[3]} drapeaux {mid[4]} ; fin : code {rr.get('r')} archives {s1[0]} "
+                                    f"history {hist(b)==h0} deferred {spy['deferred']} drapeaux {spy['flags']} ; {end[-400:]!r}")
+                res['décor']=(b_in,(s0,hb))
+            finally:
+                if os.path.exists(slow): os.unlink(slow)
+                if lp and os.path.exists(lp): os.unlink(lp)
+                if th is not None and not keep: th.join(60)
+                # flux rendus, sauf fil de l'Index encore vivant : la capture (qui ne prend que ses fils) reste en place
+                if streams and not (th is not None and th.is_alive()): sys.stdout,sys.stderr=streams
+            bad={k:v[1] for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad and len(res)==3
+        _rbc("périmètre GLOB_ARCH : borg list du dépôt entier tué par l'échéance de tranche ou une opération prioritaire -> interrompu dans le budget, rapprochement reporté, rien retiré, report noté",_sc_scope_killed)
         _rbc("borg arrêté à l'échéance -> _MEI* orphelin retiré ; celui d'un processus vivant (mappé) ou récent gardé",_ix_mei_purge)
         def _mei_run_purge():
             """1.0.151 (story 14 A15) : fin de run, sur de faux répertoires seulement (_mei_dirs limité au préfixe du
@@ -24009,15 +24576,17 @@ fail()
             if n_mei: print(f"  /tmp/_MEI* : {n_mei} orphelin(s) du run retiré(s)")
     fails=results.count(False)
     if pattern is not None and not results and not skipped[0]:
-        print(f"CodecSelfTest : aucun contrôle ne correspond au filtre « {pattern.pattern} »"); return None
+        print(f"CodecSelfTest : aucun contrôle ne correspond au filtre « {pattern.pattern} »")
+        return pre_failed[0] or None   # 1.0.204 : décor en échec (ligne déjà dite) -> code 1, sinon 2
     if list_only:
         print(f"{len(results)} contrôle(s)"); return 0
     print(f"CodecSelfTest : {len(results)-fails}/{len(results)} OK"+(f", {fails} FAIL" if fails else "")+(f", {skipped[0]} SKIP" if skipped[0] else "")
+          +(f" — {pre_failed[0]} décor(s) _pre en échec hors sélection (lignes DÉCOR EN ÉCHEC) : code 1" if pre_failed[0] else "")
           +(f" — run PARTIEL (filtre « {pattern.pattern} », {left_out[0]} contrôle(s) écarté(s)) : le run complet reste "
             "exigé avant commit" if pattern is not None else "")
           +(" — un échec peut venir d'un contrôle écarté dont celui-ci dépend : relancer le run complet"
             if pattern is not None and fails else ""))
-    return fails
+    return fails+pre_failed[0]
 
 # ── PerfBench — mesures de performance sur jeu de données synthétique (story 6) ─
 # Générateur SQL direct (INSERT/executemany par gros lots), jamais de vrai `borg backup` (bien trop

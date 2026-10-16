@@ -1,5 +1,48 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.204, borgHelperWWW 1.31.18 — Contrôles manquants — 2026-10-16
+
+Chantier « reconstruction progressive », story 83 (reports D214, D162, D132, D215). Code de production inchangé : contrôles
+et outillage de CodecSelfTest seulement (aucun défaut trouvé par le contrôle D215).
+
+- **borg list du dépôt entier tué pendant le rapprochement** (D214) : nouveau contrôle vrai borg — GLOB_ARCH posé, archives de la
+  base hors de la liste filtrée, `borg list` du dépôt entier (`_repo_archive_names`) ralenti ; tué par l'échéance d'une tranche
+  (Index rendu dans le budget) puis par une opération prioritaire (tour relâché en moins de 4 s, pause) : « liste complète du
+  dépôt interrompue … rapprochement reporté », rien retiré de diff.db ni de history.db (mesures et lignes de graphique des
+  archives hors motif comprises), report noté (`deferred`, `plan['reconcile_deferred']`) ; reprise (« reprise de l'Index ») :
+  rapprochement abouti ; le `borg list` lent écrit son PID et celui de son attente (`sleep`) : les deux disparus après l'échéance comme
+  après la pause (arbre tué, pas abandonné). Avant : retirer l'arrêt autour de ce borg list survivait aux 51 contrôles du rapprochement, du
+  périmètre et des tranches.
+- **borgHelperWWW vérifié par son push selftest** (D162a) — mutrun ne juge un mutant de WWW que par lui : (a) `_exec_borghelper`,
+  `_launch_bkp_detached` (Bkp, POST /index ; enfants attendus, groupe tué au délai) et `_reconcile_run` (BkpReconcile) lancent un
+  vrai sous-processus qui reçoit `BORGHELPERC_NO_CLEANUP_NOTICE=1` (avant : ligne retirée = 135/135 OK) ; (b) gardes de source de
+  borgHelper appliquées à WWW par le module importé, même portée que la garde « compatibilité Python » de borgHelper : marqueurs
+  SQL anonymes seulement et aucun appel déprécié (fichier entier), fermeture SQLite prouvée (`_sql_marker_scan`,
+  `_py_calls_scan`, `_sqlite_close_scan`/`_sqlite_close_file`, désormais au niveau du module de borgHelper, voir LIBRARY) ; liste
+  blanche et compte exact de WWW déplacés dans WWW (`_SCG_WL_WWW`, `_SCG_SEEN_WWW`), lus par la garde de borgHelper dans sa
+  source (un changement de WWW seul ne touche plus borgHelper).
+- **ensure_cache_db / ensure_diff_db / ensure_history_db** (D162b) : contrôle de comportement, 35 cas — interrompus après
+  l'ouverture, transaction d'écriture ouverte, à la création, au commit, en lecteur (`create=False`), dans `_migrate_to_history`
+  et pendant une création chiffrée (DbKeyError réelle) : Ctrl-C (sous-classe privée : un vrai Ctrl-C arrête le run),
+  `DbKeyError`, `SchemaVersionError` réelle, `sqlite3.OperationalError` (sortie 1, ou lecteur sur base occupée) — exception
+  attendue, connexion fermée (aucun descripteur, autre écrivain libre, rien validé). Avant : seule la garde de forme le voyait.
+- **CodecSelfTest `-f`, `-l`** (D132) : (a) l'échantillon du contrôle des plans couvre aussi ListBkpFiles,
+  `_find_last_archive_with_file` (égalité et joker), TreeHist -X et les jokers de Search, TreeFind et DuIdx ; chaque appel tourne
+  sauf si le contrôle de parité qui le couvre est lui-même sélectionné (avant : tout l'échantillon sauté dès qu'un contrôle tracé
+  avait tourné), résultat non vide (listes entries/matches/rows/files comprises), sans erreur, clair == chiffré, et tracé sur la
+  connexion chiffrée — les contrôles de parité qui couvrent ces appels exigent aussi un résultat non vide et sans erreur ; (b) un décor `_pre` en
+  échec (exception ou résultat faux) dont le contrôle est écarté par `-f` donne une ligne « DÉCOR EN ÉCHEC <nom> (décor _pre exécuté
+  hors sélection : …) », HORS des totaux, et le code de sortie 1, même sur une sélection vide (avant : rien, run vert) — cst
+  (`_verdict`) et mutrun la lisent comme un échec nommé (mutrun : FILTRE VIDE si la sélection est vide) ; (c) `-l` n'exécute plus aucun décor `_pre` (avant, `-f plans -l`
+  créait la base de décor `snapv-qp.db`) — contrôle par un CLI enfant : aucun fichier hors des bases communes ; aide, README et
+  TECHNICAL disent ce que `-l` exécute encore (code commun hors contrôles : `t.db` et les bases temporaires des contrôles).
+- **Lecteurs sur des chemins à plusieurs versions** (D215) : base d'un scénario réel (paire ancienne purgée, paires
+  récentes avec leurs entrées réelles, DIFF_KEEP=2, quatre archives) écrite par `_snap_link_versions`, en clair et chiffrée —
+  Search, FileHist et DuIdx (-R, -j ; -b ALL, défaut, -b de la dernière archive), ListBkpFiles par archive,
+  `_find_last_archive_with_file`, TreeHist et TreeHist -X (depuis et jusqu'à une archive intermédiaire) rendent pour chaque
+  archive, l'intermédiaire comprise, la version de cette archive (version partagée, retour à une version antérieure 7 -> 8 -> 7,
+  chemin changé dans une paire purgée, supprimé, ajouté). Avant : décor de parité à une version par chemin.
+
 ## borgHelper 1.0.203, borgHelperWWW 1.31.17 — Connexions SQLite fermées sur les chemins d'erreur — 2026-10-15
 
 Chantier « reconstruction progressive », story 81 (report D161 de la story 48 ; décision de l'utilisateur : Q1 = A, tous les

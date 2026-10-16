@@ -80,7 +80,12 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.31.17"
+WWW_VERSION="1.31.18"
+# Garde de fermeture SQLite (story 81) appliquée à CE fichier : liste blanche nommée ({fonction: ouvertures non prouvées}) et
+# nombre EXACT d'ouvertures de production analysées (push_selftest exclu). Constantes de WWW (1.31.18, story 83) : lues par son push
+# selftest et, par littéral dans la source, par la garde de borgHelper — un changement de WWW seul ne touche plus borgHelper.
+_SCG_WL_WWW={'_push_conn':1}
+_SCG_SEEN_WWW=18
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -4175,6 +4180,99 @@ def push_selftest():
     _ECC="ensure_scope_cache_db / ensure_push_db : base corrompue -> DB corrompue + sortie 1, connexion fermée (comportement, 1.31.17)"
     if os.path.isdir('/proc/self/fd'): check(_ECC,_ensure_close_on_corrupt)
     else: print(f"SKIP {_ECC} (/proc/self/fd absent : descripteurs non mesurables)")
+    def _child_no_cleanup_notice():
+        """1.31.18 (story 83, D162a) : tout borgHelper lancé par WWW reçoit BORGHELPERC_NO_CLEANUP_NOTICE=1 — par les vraies
+        fonctions de lancement et un vrai sous-processus : _exec_borghelper (commandes HTTP synchrones, run_borghelper,
+        _run_scoped), _launch_bkp_detached (Bkp, POST /index), _reconcile_run (BkpReconcile du watcher). BORGHELPER_BIN remplacé le
+        temps du contrôle par un script qui écrit la valeur reçue (absente : null) dans un fichier par commande (-c). Marqueur
+        retiré de l'environnement du serveur pendant le contrôle (sinon hérité par os.environ.copy() : jamais un OK dû à
+        l'environnement du selftest). Avant : seule la forme était vérifiée (garde AST côté borgHelper)."""
+        import contextlib
+        d=tempfile.mkdtemp(prefix='bh83-'); res={}; rid='8'*32
+        fake=os.path.join(d,'faux-borghelper')
+        with open(fake,'w') as f:
+            f.write("import os,sys,json\n"
+                    f"out={d!r}\n"
+                    "cmd=sys.argv[sys.argv.index('-c')+1]\n"
+                    "tmp=os.path.join(out,cmd+'.tmp')\n"
+                    "with open(tmp,'w') as f: json.dump(os.environ.get('BORGHELPERC_NO_CLEANUP_NOTICE'),f)\n"
+                    "os.replace(tmp,os.path.join(out,cmd+'.json'))\n"
+                    "print('[]')\n")
+        def got(cmd,wait=0.0):
+            p=os.path.join(d,cmd+'.json'); t0=time.monotonic()
+            while not os.path.exists(p) and time.monotonic()-t0<wait: time.sleep(0.05)
+            try:
+                with open(p) as f: return json.load(f)
+            except (OSError,ValueError): return 'aucun lancement'
+        saved=os.environ.pop('BORGHELPERC_NO_CLEANUP_NOTICE',None); kids=[]; reaped=set()
+        def reap(pid,wait):
+            """Enfant détaché (session propre : groupe = pid) attendu `wait` s, puis son groupe tué (SIGKILL) et récolté. Un PID déjà
+            récolté n'est plus jamais signalé (revue : PID réattribuable)."""
+            import signal as _sg
+            if pid in reaped: return True
+            t0=time.monotonic()
+            while True:
+                try:
+                    if os.waitpid(pid,os.WNOHANG)[0]==pid: reaped.add(pid); return True
+                except ChildProcessError: reaped.add(pid); return True   # déjà récolté (subprocess._cleanup)
+                if time.monotonic()-t0>=wait: break
+                time.sleep(0.05)
+            with contextlib.suppress(OSError): os.killpg(pid,_sg.SIGKILL)
+            with contextlib.suppress(ChildProcessError): os.waitpid(pid,0)
+            reaped.add(pid); return False
+        try:
+            with mock.patch(f"{__name__}.BORGHELPER_BIN",Path(fake)),contextlib.redirect_stderr(io.StringIO()):
+                r=_exec_borghelper('s83-exec',None,[])
+                res['_exec_borghelper']=(got('s83-exec')=='1' and r.exitcode==0,got('s83-exec'),r.exitcode)
+                for cmd in ('s83-bkp','index'):
+                    pid=_launch_bkp_detached('s83-nick',[],cmd=cmd); kids.append(pid)
+                    v=got(cmd,20); ended=reap(pid,20)
+                    res[f'_launch_bkp_detached {cmd}']=(v=='1' and ended,v,'fini seul' if ended else 'tué au délai')
+                _reconcile_run('s83-nick',rid)
+                res['_reconcile_run (BkpReconcile)']=(got('BkpReconcile')=='1',got('BkpReconcile'))
+        finally:
+            if saved is not None: os.environ['BORGHELPERC_NO_CLEANUP_NOTICE']=saved
+            with _RECONCILE_LOCK: _RECONCILE.pop(('s83-nick',rid),None)
+            for pid in kids:   # interrompu avant l'attente : groupe tué, enfant récolté avant de retirer son dossier
+                if pid not in reaped: reap(pid,0)
+            shutil.rmtree(d,ignore_errors=True)
+        bad={k:v for k,v in res.items() if not v[0]}
+        if bad: print(f"  {bad}")
+        return not bad and len(res)==4
+    check("borgHelper lancé par WWW (_exec_borghelper, _launch_bkp_detached Bkp et index, _reconcile_run) : BORGHELPERC_NO_CLEANUP_NOTICE=1 dans son environnement (vrai sous-processus, 1.31.18)",_child_no_cleanup_notice)
+    def _own_source_guards():
+        """1.31.18 (story 83, D162a) : gardes de source de borgHelper appliquées à CE fichier par le module borgHelper importé —
+        mutrun ne juge un mutant de borgHelperWWW que par ce push selftest. Même portée que la garde « compatibilité Python » de
+        borgHelper : (1) marqueurs SQL (_sql_marker_scan : rien d'autre que le marqueur anonyme) et (2) appels dépréciés
+        (_py_calls_scan : utcnow, utcfromtimestamp, PurePath(…).as_uri()) sur le fichier ENTIER, push_selftest compris ; (3) fermeture
+        prouvée de chaque ouverture SQLite de production (_sqlite_close_file, push_selftest exclu) avec SES constantes
+        _SCG_WL_WWW / _SCG_SEEN_WWW. Témoins, sur des sources construites ici (aucun marqueur littéral dans ce fichier) : un marqueur
+        et un appel déprécié dans push_selftest ET dans une fonction de production -> exactement 2 chacun (portée : fichier entier) ;
+        liste blanche et compte exact : source juste -> rien, compte faux -> une ligne, site non prouvé hors liste -> une ligne."""
+        bh=sys.modules.get('borgHelper')
+        need=('_sql_marker_scan','_py_calls_scan','_sqlite_close_file','_sqlite_close_scan')
+        if bh is None or not all(hasattr(bh,n) for n in need):
+            print(f"  module borgHelper sans {[n for n in need if not hasattr(bh,n)]}"); return False
+        me=os.path.abspath(__file__)
+        with open(me,encoding='utf-8') as f: src=f.read()
+        res={'marqueurs SQL':bh._sql_marker_scan(src,'borgHelperWWW'),'appels dépréciés':bh._py_calls_scan(src,'borgHelperWWW'),
+             'fermeture':bh._sqlite_close_file('borgHelperWWW',src,('_push_conn',),_SCG_WL_WWW,_SCG_SEEN_WWW)}
+        q='?'; c=':'; u='utc'+'now'
+        two=(f'def push_selftest():\n    x="SELECT a FROM t WHERE n={q}1"\n    d=datetime.datetime.{u}()\n'
+             f'def prod():\n    y="SELECT a FROM t WHERE n={c}nm"\n    e=datetime.datetime.{u}()\n')
+        wit={'marqueurs (push_selftest + production)':(len(bh._sql_marker_scan(two,'t')),2),
+             'appels (push_selftest + production)':(len(bh._py_calls_scan(two,'t')),2)}
+        base=("def _push_conn(r):\n    return sqlite3.connect(r)\n"
+              "def ok(p):\n    k=_push_conn('w')\n    try: k.execute('x')\n    finally: k.close()\n")
+        badsite="def mal(p):\n    k=_push_conn('w')\n    k.close()\n"
+        sc=lambda s_,n_: bh._sqlite_close_file('t',s_,('_push_conn',),{'_push_conn':1},n_)
+        wit['liste blanche : source juste']=(len(sc(base,2)),0)
+        wit['liste blanche : compte faux']=(len(sc(base,3)),1)
+        wit['liste blanche : site non prouvé']=(len(sc(base+badsite,3)),1)
+        ok=not any(res.values()) and all(g==w for g,w in wit.values())
+        if not ok: print(f"  {res} ; témoins (obtenu, attendu) : {wit}")
+        return ok
+    check("gardes de source de borgHelper sur borgHelperWWW : marqueurs SQL anonymes, aucun appel déprécié, fermeture SQLite prouvée (liste blanche de WWW) (1.31.18)",_own_source_guards)
     def _scoped_any_code():
         """1.28.6 (story 30) : sortie d'un appelant restreint filtrée quel que soit le code — code 2 + JSON -> filtré, code
         gardé ; code 2 + texte -> stdout vidé ; code 0 + texte -> refusé (code 1) ; filtre qui ne connaît pas la forme
