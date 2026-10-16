@@ -2,7 +2,7 @@
 
 Clés SSH dans un Vaultwarden auto-hébergé, utilisées de façon transparente par ssh.
 
-État (0.14.0) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
+État (0.15.0) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
 + e-mail, sur un même serveur ou sur des serveurs différents ; déconnexion par `sshvault
 logout`, serveur ou e-mail corrigé par `sshvault account set` ; voir « Comptes du coffre »),
 **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
@@ -22,7 +22,9 @@ hôte est transféré, jamais l'agent dédié entier. `sshvault lock --unload` r
 les clés chargées des comptes verrouillés ; `sshvault ssh-config uninstall` retire sshvault du
 `ssh_config`. **Mots de passe d'hôte** : pour une machine qui n'accepte qu'un mot de passe,
 `ssh <hôte>` (cible ou saut) reçoit le mot de passe rangé dans un élément « identifiant » du
-coffre, par l'askpass de sshvault (`sshvault-askpass`, voir « Mots de passe d'hôte »). `bw` est
+coffre, par l'askpass de sshvault (`sshvault-askpass`, voir « Mots de passe d'hôte ») ; cet
+élément se crée (`sshvault password add`) et se relie à ses hôtes (`sshvault password hosts`)
+depuis la CLI, mot de passe jamais en argument. `bw` est
 pris au chemin absolu du réglage `bw-path` s'il est posé, sinon dans le PATH.
 
 ## Installation (sans root)
@@ -126,6 +128,10 @@ sshvault load (MOTIF [--host | --name | --fingerprint | --id] | --all) [-t DURÉ
 sshvault agent status | purge | lock | unlock | stop
 sshvault config get [CLÉ] | set CLÉ VALEUR | unset CLÉ   # key-ttl, auto-load, auto-restrict, auto-confirm, forward-confirm, bw-path, askpass-fallback
 sshvault password list [--account ALIAS]… [--json]       # éléments identifiant à URI ssh:// (jamais le mot de passe)
+sshvault password add NOM --host [USER@]HÔTE… [--user U] [--account ALIAS] [--force]   # mot de passe : terminal ou stdin
+sshvault password hosts add | set  SÉLECTION [--host | --name | --id] [USER@]HÔTE… [--account ALIAS] [--force]   # set : aussi --yes
+sshvault password hosts remove SÉLECTION [--host | --name | --id] [USER@]HÔTE… [--account ALIAS] [--yes]
+sshvault password hosts list SÉLECTION [--host | --name | --id] [--account ALIAS]…
 
 sshvault hosts add | remove | set  SÉLECTION [--host | --name | --fingerprint | --id] HÔTE…
 sshvault hosts list SÉLECTION [--host | --name | --fingerprint | --id]
@@ -1131,8 +1137,8 @@ sshvault forward list --id 2222…                   # un motif par ligne
 ### Mots de passe d'hôte (`sshvault password`, `sshvault-askpass`)
 
 Pour les rares machines qui n'acceptent qu'un mot de passe (CAP-11). Le mot de passe vit dans
-un élément **identifiant** du coffre (créé dans le web vault ; `password add` viendra), relié à
-ses hôtes par ses URI :
+un élément **identifiant** du coffre (créé par `sshvault password add`, ou dans le web vault),
+relié à ses hôtes par ses URI :
 
 - `ssh://hôte`, `ssh://utilisateur@hôte`, `ssh://utilisateur@hôte:port` : `hôte` est le nom
   **tapé** (`ssh hôte`, ou le nom d'un saut ProxyJump), lettres, chiffres, `.`, `-`, `_`, sans
@@ -1144,6 +1150,59 @@ ses hôtes par ses URI :
   ne montrent que les clés.
 - `sshvault password list [--json]` : alias, nom, hôtes (`[utilisateur@]hôte`), jamais le mot
   de passe.
+- `sshvault password add NOM --host [USER@]HÔTE… [--user U] [--account ALIAS] [--force]` crée
+  l'élément : `--user` = son nom d'utilisateur (utilisateur attendu des hôtes écrits sans
+  `USER@`) ; chaque `--host` (plusieurs fois, ou liste à virgules ; au moins un) donne l'URI
+  `ssh://hôte` ou `ssh://USER@hôte` (utilisateur encodé), jamais de port. Hôte (lettres,
+  chiffres, `.`, `-`, `_`, sans motif ni `-` en tête) et utilisateur (sans blanc, caractère de
+  contrôle ni `:`) vérifiés avant tout accès au coffre (code 2). Le mot de passe n'est jamais
+  un argument : stdin est un terminal → saisi deux fois, masqué (vide ou différent : message
+  et nouvelle saisie, trois essais, puis code 2, rien créé ; `--nointeraction` : code 2) ;
+  sinon une ligne lue sur stdin (`printf '%s\n' "$MDP" | sshvault password add …` ; fin de
+  ligne finale retirée ; vide, `\r` ou `\n` à l'intérieur, pas de l'UTF-8, plus de 4096
+  octets ou rien lu en `SSHVAULT_PROMPT_TIMEOUT` : code 2). Stdin terminal mais sshvault pas
+  au premier plan : code 2. Deux `--host` de même paire attendue (`db` et `admin@db` avec
+  `--user admin`) : une seule URI, la première. Élément écrit sur stdin de `bw create`, relu et comparé (nom, utilisateur,
+  mot de passe, URI) ; `bw create` en échec ou bloqué : `sync`, puis recherche d'un nouvel
+  élément identifiant de même nom et mêmes URI, rejeu une seule fois, jamais de doublon.
+  Compte rendu sur stdout (`élément « NOM » créé (id …)`), jamais le mot de passe ;
+  `ssh_config` régénéré. Un seul compte écrit (`--account`, sinon le compte par défaut
+  unique).
+- **Doublon** : un hôte et son utilisateur attendu (celui de l'URI, sinon le nom
+  d'utilisateur de l'élément) déjà portés par un autre élément identifiant (de tout compte
+  lisible sans invite) : code 2, l'autre élément nommé, rien écrit ; `--force` écrit quand même
+  (avertissement après l'écriture relue — rien n'est annoncé si elle échoue — : le premier
+  élément, par nom, compte, id, gagne). Création relue différente : le message donne la
+  commande exacte de suppression (`BITWARDENCLI_APPDATA_DIR=… <bw> delete item <id>`). Un hôte sans utilisateur (ni `USER@`, ni `--user`) n'est jamais un doublon.
+- `sshvault password hosts add|remove|set|list SÉLECTION [USER@]HÔTE…` : URI `ssh://` d'un
+  seul élément identifiant à URI `ssh://`, choisi comme pour `hosts` (`--name`, `--id`,
+  `--host` : motif glob d'hôte ; défaut : nom ou hôte ; `--id` choisit aussi un élément
+  identifiant sans URI `ssh:`, par exemple après `set ""`). `list` : `[user@]hôte` attendus,
+  comme `password list` (`list --id` d'un élément sans hôte : code 0, rien affiché).
+  **Paire attendue** : (hôte sans tenir compte de la casse, utilisateur de l'URI, sinon nom
+  d'utilisateur de l'élément), port ignoré. `add` : URI ajoutées après les URI `ssh://`
+  actuelles ; paire attendue déjà présente : « déjà présent » avec l'URI qui la porte, rien
+  écrit ; une paire répétée dans la commande (`add X db admin@db`, utilisateur `admin`) n'est
+  écrite qu'une fois. `remove` : retire les URI de ces paires **exactes** (`remove X root@db`
+  retire `ssh://root@db:22`, pas `ssh://db`) ; paire absente : code 1, rien écrit, chaque paire
+  absente dite sur sa ligne ; une paire qui ne correspond que par l'utilisateur attendu nomme
+  l'URI réelle et la forme à retirer (`ssh://db` porte `admin@db` par l'utilisateur de
+  l'élément : retirer « db » ; `ssh://admin@db` porte `admin@db` par son utilisateur : retirer
+  « admin@db »). `set` : les URI `ssh://` valides deviennent cette liste, dans l'ordre donné
+  (une URI déjà là pour une paire de la liste — exacte, sinon attendue — est gardée telle
+  quelle, port compris : `set X admin@db` garde `ssh://db` d'un élément d'utilisateur `admin`,
+  sans perte ni question) ; `set X ""` les retire toutes. Restent tels quels : nom, notes,
+  champs, dossier, favori, nouvelle demande du mot de passe maître (`reprompt`), organisation,
+  collections, historique des mots de passe, nom d'utilisateur, mot de passe, TOTP, passkeys,
+  autres URI (web, `ssh:` invalides) et le `match` de chaque URI gardée ; écriture relue et
+  comparée sur tout cela, rejouée une fois au plus et seulement si l'élément relu n'a pas
+  changé ; `ssh_config` régénéré. Avec `--force`, l'avertissement de doublon n'est dit
+  qu'une fois l'écriture relue.
+- `remove` et `set` qui retirent des URI : l'élément et chaque URI perdue (complète, port
+  compris) sur stderr, puis « confirmer ? [o/N] » au terminal (`o`, `oui`, `y` ou `yes`, sans
+  tenir compte de la casse : écrit ; toute autre réponse, délai `SSHVAULT_PROMPT_TIMEOUT` ou
+  fin de saisie : code 1, rien écrit). Sans terminal ou avec `--nointeraction` : la liste, code 2, rien écrit, sauf
+  `--yes`. Rien de perdu : pas de question.
 - `sshvault ssh-config` ajoute, après les blocs d'identité, un bloc par élément, sans
   directive, gardé même avec `auto-load false` :
   ```
@@ -1196,10 +1255,10 @@ ses hôtes par ses URI :
 | Code | Sens |
 |---|---|
 | 0 | succès |
-| 1 | `search`, `load`, `hosts`, `forward`, `pubkey`, `deploy` : aucun résultat ; `import` : clé déjà dans le coffre (rien créé) ; `generate` : nom déjà pris, sans `--force` (rien généré) ; `hosts remove`, `forward remove` : hôte absent (rien écrit) ; `ssh-config --check` : pas à jour (contenu, droits, fichier en trop ou non ordinaire), ou ligne `Include` absente, conditionnelle ou pas en tête |
-| 2 | usage (option ou argument invalide ; `load` sans sélection ni `--all`) ; comptes : alias invalide ou inconnu, alias ou couple serveur + e-mail déjà enregistré, serveur ou e-mail invalide, écriture sans `--account` quand plusieurs comptes sont possibles, `login` ou `logout` sans `--account` avec plusieurs comptes, aucun compte par défaut, `account rename` vers un alias pris, `account add` : dossier `accounts/<alias>` existant, `account set` sans `--server` ni `--email`, `account set` : registre refusé après la déconnexion (couple pris entre-temps ; ce qui est déjà fait est dit) ; `logout`, `account set` : `bw-path` invalide (rien fait) ; durée invalide ; `config.json` invalide, illisible ou aux droits inattendus ; `config set bw-path` : chemin relatif, absent, avec un caractère de contrôle, ou pas un fichier ordinaire exécutable ; `bw-path` invalide dans `config.json` ; hôte invalide ; sélection de `hosts` ou `forward` qui désigne plusieurs éléments ; `import` : fichier refusé (illisible, pas une clé privée, type ou format non accepté), `--name` avec plusieurs fichiers ; `generate` : type, bits, nom ou commentaire refusés ; `deploy` : cible, port ou options ssh invalides ou refusées ; délai `SSHVAULT_DEPLOY_TIMEOUT` invalide ; `load --nointeraction` : `SSHVAULT_ENSURE_TIMEOUT` invalide (rien lu, rien chargé) |
+| 1 | `search`, `load`, `hosts`, `forward`, `pubkey`, `deploy`, `password hosts` : aucun résultat ; `password hosts remove` : paire absente, `password hosts remove`/`set` : URI à retirer non confirmées — autre réponse que `o`/`oui`/`y`/`yes`, délai ou fin de saisie — (rien écrit) ; `import` : clé déjà dans le coffre (rien créé) ; `generate` : nom déjà pris, sans `--force` (rien généré) ; `hosts remove`, `forward remove` : hôte absent (rien écrit) ; `ssh-config --check` : pas à jour (contenu, droits, fichier en trop ou non ordinaire), ou ligne `Include` absente, conditionnelle ou pas en tête |
+| 2 | usage (option ou argument invalide ; `load` sans sélection ni `--all`) ; comptes : alias invalide ou inconnu, alias ou couple serveur + e-mail déjà enregistré, serveur ou e-mail invalide, écriture sans `--account` quand plusieurs comptes sont possibles, `login` ou `logout` sans `--account` avec plusieurs comptes, aucun compte par défaut, `account rename` vers un alias pris, `account add` : dossier `accounts/<alias>` existant, `account set` sans `--server` ni `--email`, `account set` : registre refusé après la déconnexion (couple pris entre-temps ; ce qui est déjà fait est dit) ; `logout`, `account set` : `bw-path` invalide (rien fait) ; durée invalide ; `config.json` invalide, illisible ou aux droits inattendus ; `config set bw-path` : chemin relatif, absent, avec un caractère de contrôle, ou pas un fichier ordinaire exécutable ; `bw-path` invalide dans `config.json` ; hôte invalide ; sélection de `hosts` ou `forward` qui désigne plusieurs éléments ; `import` : fichier refusé (illisible, pas une clé privée, type ou format non accepté), `--name` avec plusieurs fichiers ; `generate` : type, bits, nom ou commentaire refusés ; `deploy` : cible, port ou options ssh invalides ou refusées ; délai `SSHVAULT_DEPLOY_TIMEOUT` invalide ; `load --nointeraction` : `SSHVAULT_ENSURE_TIMEOUT` invalide (rien lu, rien chargé) ; `password add` : nom, hôte ou utilisateur refusé, mot de passe vide, saisies différentes ou vides trois fois, stdin de plus d'une ligne, pas de l'UTF-8, de plus de 4096 octets ou sans rien en `SSHVAULT_PROMPT_TIMEOUT`, terminal pas au premier plan, saisie au terminal avec `--nointeraction` (rien créé) ; `password add`, `password hosts add`/`set` : hôte et utilisateur déjà portés par un autre élément identifiant, sans `--force` (rien écrit) ; `password hosts remove`/`set` : URI à retirer sans terminal ou avec `--nointeraction`, sans `--yes` (rien écrit) |
 | 3 | aucun compte enregistré (`ssh-config` n'écrit alors rien, `lock` compris), non connecté (« lancer sshvault login » ; `ensure` d'un compte déconnecté par `logout` : « lancer sshvault login --account ALIAS »), ou coffre verrouillé : aucune invite possible, invite annulée ou sans réponse, mot de passe refusé ; agent dédié arrêté (`agent status`, `lock`, `unlock`) ou verrouillé (`ensure --forward` compris) ; passphrase d'une clé refusée ou impossible à saisir (`load`, `import`) ; `load` : compte déconnecté, verrouillé, retiré, renommé ou modifié pendant l'attente du verrou d'`ensure` (rien chargé) ; `login` refusé par bw (mot de passe, limite de débit des connexions du serveur — réessayer dans une minute —, réseau) |
-| 4 | erreur du backend : `bw` introuvable, non exécutable, interpréteur ou chargeur absent, format non exécutable (au chemin du réglage `bw-path` compris, le PATH n'étant alors pas essayé), en erreur, réponse illisible, délai dépassé ; magasin de session inutilisable ; agent dédié : `XDG_RUNTIME_DIR` relatif, non privé ou hors tmpfs, chemin du socket trop long, agent tiers sur le socket, OpenSSH < 8.9, `--restrict` (élément sans hôte, hôte non littéral ou absent de `known_hosts`), sous-agent de transfert en erreur (`agent status`, `stop`, `purge`, `lock`), clé publique illisible ou différente de la clé privée, `ssh-add`/`ssh-agent` en erreur ; écriture de `config.json` impossible ; écriture des hôtes ou des transferts dans le coffre non aboutie ou non vérifiée (y compris écrits mais `ssh_config` non régénéré) ; `ensure --forward` : `forward-confirm` sans askpass, élément qui ne déclare plus ce transfert, chemin du socket de transfert trop long ; `import` : création non aboutie ou non vérifiée (y compris clé importée mais `ssh_config` non régénéré), copie impossible dans un tmpfs privé (`--decrypt`), `ssh-keygen` absent ou en erreur ; `generate` : tmpfs privé inutilisable, `ssh-keygen` absent ou en erreur, création non aboutie ou non vérifiée (clé perdue, dit), clé créée mais `ssh_config` non régénéré ; `pubkey` : clé publique d'un élément illisible ; `deploy` : `ssh` absent, en échec ou sans réponse (`SSHVAULT_DEPLOY_TIMEOUT`), réponse inattendue de la cible, échec partiel (clés déjà ajoutées dites, puis code 4), clé publique illisible ; `ssh_config` généré impossible à écrire (chemin avec `"`, `\`, `${`, fichier non ordinaire, droits) ; répertoire personnel inconnu ; `ssh-config install` refusé (lien symbolique, fichier non ordinaire, `Include` exact conditionnel, chemin personnel avec `%`, `$` ou joker) ; `ssh-config uninstall` refusé (`~/.ssh/config` lien symbolique ou non ordinaire, `~/.ssh/sshvault`, sa config ou `pub/` d'un type inattendu : rien modifié) ; `lock --unload` : agent verrouillé ou en erreur (coffre verrouillé quand même, clés laissées) ; adoption de l'installation 0.8.0 impossible (rien modifié ; `account add` refusé tant qu'elle n'est pas faite) ; `account rename` : destination existante ou déplacement impossible (rien changé) ; `account remove` : données locales impossibles à supprimer (compte gardé), magasin de session ou agent en erreur ou verrouillé (clés laissées, état gardé) ; `logout`, `account set` : agent en erreur ou verrouillé (rien modifié, ou état partiel dit), `bw logout` en échec ou sans réponse (compte toujours connecté, ou état inconnu ; `account set` : registre inchangé), `account set` : écriture du registre impossible après la déconnexion (ce qui est déjà fait est dit) ; `ssh-config --check` : `bw` en erreur, même pour un compte déconnecté ; erreur interne ; `load` : « verrou d'ensure tenu : rien chargé » (`--nointeraction`, attente au-delà de `SSHVAULT_ENSURE_TIMEOUT`), `bw status` en erreur à la relecture d'un compte sous le verrou |
+| 4 | erreur du backend : `bw` introuvable, non exécutable, interpréteur ou chargeur absent, format non exécutable (au chemin du réglage `bw-path` compris, le PATH n'étant alors pas essayé), en erreur, réponse illisible, délai dépassé ; magasin de session inutilisable ; agent dédié : `XDG_RUNTIME_DIR` relatif, non privé ou hors tmpfs, chemin du socket trop long, agent tiers sur le socket, OpenSSH < 8.9, `--restrict` (élément sans hôte, hôte non littéral ou absent de `known_hosts`), sous-agent de transfert en erreur (`agent status`, `stop`, `purge`, `lock`), clé publique illisible ou différente de la clé privée, `ssh-add`/`ssh-agent` en erreur ; écriture de `config.json` impossible ; écriture des hôtes ou des transferts dans le coffre non aboutie ou non vérifiée (y compris écrits mais `ssh_config` non régénéré) ; `password add`, `password hosts` : création ou écriture de l'élément identifiant non aboutie ou non vérifiée (y compris écrite mais `ssh_config` non régénéré) ; `ensure --forward` : `forward-confirm` sans askpass, élément qui ne déclare plus ce transfert, chemin du socket de transfert trop long ; `import` : création non aboutie ou non vérifiée (y compris clé importée mais `ssh_config` non régénéré), copie impossible dans un tmpfs privé (`--decrypt`), `ssh-keygen` absent ou en erreur ; `generate` : tmpfs privé inutilisable, `ssh-keygen` absent ou en erreur, création non aboutie ou non vérifiée (clé perdue, dit), clé créée mais `ssh_config` non régénéré ; `pubkey` : clé publique d'un élément illisible ; `deploy` : `ssh` absent, en échec ou sans réponse (`SSHVAULT_DEPLOY_TIMEOUT`), réponse inattendue de la cible, échec partiel (clés déjà ajoutées dites, puis code 4), clé publique illisible ; `ssh_config` généré impossible à écrire (chemin avec `"`, `\`, `${`, fichier non ordinaire, droits) ; répertoire personnel inconnu ; `ssh-config install` refusé (lien symbolique, fichier non ordinaire, `Include` exact conditionnel, chemin personnel avec `%`, `$` ou joker) ; `ssh-config uninstall` refusé (`~/.ssh/config` lien symbolique ou non ordinaire, `~/.ssh/sshvault`, sa config ou `pub/` d'un type inattendu : rien modifié) ; `lock --unload` : agent verrouillé ou en erreur (coffre verrouillé quand même, clés laissées) ; adoption de l'installation 0.8.0 impossible (rien modifié ; `account add` refusé tant qu'elle n'est pas faite) ; `account rename` : destination existante ou déplacement impossible (rien changé) ; `account remove` : données locales impossibles à supprimer (compte gardé), magasin de session ou agent en erreur ou verrouillé (clés laissées, état gardé) ; `logout`, `account set` : agent en erreur ou verrouillé (rien modifié, ou état partiel dit), `bw logout` en échec ou sans réponse (compte toujours connecté, ou état inconnu ; `account set` : registre inchangé), `account set` : écriture du registre impossible après la déconnexion (ce qui est déjà fait est dit) ; `ssh-config --check` : `bw` en erreur, même pour un compte déconnecté ; erreur interne ; `load` : « verrou d'ensure tenu : rien chargé » (`--nointeraction`, attente au-delà de `SSHVAULT_ENSURE_TIMEOUT`), `bw status` en erreur à la relecture d'un compte sous le verrou |
 | 130 | interrompu (Ctrl-C, SIGTERM, SIGHUP) ; pendant `bw logout` (`logout`, `account set`) : état relu, marqueur `logged-out` posé si bw est déconnecté ou si son état est inconnu |
 
 `agent status`, `stop`, `purge`, `lock` : code de l'agent dédié (`status` : 0 actif, 3 arrêté),
@@ -1356,7 +1415,23 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   keyboard-interactive derrière A par ProxyJump), un vrai `ssh` et l'askpass du banc :
   `ssh B` aboutit sans saisie, argv de tous les processus relevés pendant la connexion et
   fichiers du HOME et du runtime relus (aucun mot de passe) ; mot de passe refusé puis saisi
-  au terminal ; question de clé d'hôte relayée.
+  au terminal ; question de clé d'hôte relayée ; éléments créés par `password add` (stdin)
+  puis `ssh B` via A sans saisie.
+- `tests/test_password_write.py` (écriture des éléments identifiant) : `[user@]hôte` acceptés
+  et refusés (jamais de port), URI gardées à leur place ou réordonnées ; `password add` par
+  stdin (une ligne, refus avant tout appel `bw`) et au terminal (stdin sur le pty : deux
+  saisies masquées, vide, trois paires différentes, `--nointeraction`), doublon hôte +
+  utilisateur (même compte, autre compte, `--force`), échecs de `bw create` (passé puis erreur,
+  bloqué, réponse illisible : rien rejoué ; erreur ou blocage une fois : rejeu unique ; erreur
+  deux fois, mot de passe relu différent, rien enregistré), SIGTERM pendant `bw create` ;
+  `password hosts` (list, add, « déjà présent », remove exact confirmé ou refusé au terminal,
+  set sans terminal : code 2 puis `--yes`, `set ""`, doublon, sélection ambiguë) ; échecs de
+  `bw edit` (passé puis erreur ou bloqué, une fois, deux fois, élément changé par un autre
+  client, relu différent) ; nom, notes, champs, utilisateur, mot de passe, TOTP et autres URI
+  inchangés ; aucun mot de passe en argument (`FAKE_BW_LOG`, `/proc`) ni sur une sortie.
+  Intégration : `password add` (stdin), `password hosts add`, `remove` (sans puis avec
+  `--yes`), `set --yes` sur le vrai Vaultwarden, élément relu par `bw get item` d'un autre
+  client, supprimé en fin de run (marqueur).
 - `tests/test_it_accounts.py` : lecteur du fichier des comptes de test d'intégration
   (`tests/integration/accounts.py`), sans réseau ni vrai fichier : comptes valides et alias,
   doublon, champ manquant, vide ou de type faux, clé inconnue, TOML illisible, fichier absent

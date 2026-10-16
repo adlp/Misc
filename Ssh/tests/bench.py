@@ -687,22 +687,25 @@ class Bench:
 
     # --- exécution de sshvault ---
 
-    def run(self, *args, env=None, timeout=60):
+    def run(self, *args, env=None, timeout=60, input=None):
+        """sshvault sans terminal ; stdin /dev/null, ou `input` (texte) sur un tube."""
         e = dict(self.env)
         e.update(env or {})
+        io = {"stdin": subprocess.DEVNULL} if input is None else {"input": input}
         return subprocess.run([sys.executable, "-m", "sshvault", *args], env=e, capture_output=True,
-                              text=True, timeout=timeout, start_new_session=True, stdin=subprocess.DEVNULL)
+                              text=True, timeout=timeout, start_new_session=True, **io)
 
-    def run_tty(self, *args, answer=None, env=None, timeout=30, trigger=rb"mot de passe", signal_at_prompt=None):
+    def run_tty(self, *args, answer=None, env=None, timeout=30, trigger=rb"mot de passe", signal_at_prompt=None,
+                stdin_tty=False):
         """sshvault avec un terminal de contrôle (pty), stdin et stdout hors terminal comme
-        sous `Match exec`. `answer` (texte, ou liste : une réponse par invite) est tapé après
+        sous `Match exec` (`stdin_tty` : stdin est le terminal). `answer` (texte, ou liste : une réponse par invite) est tapé après
         chaque apparition de l'invite (`trigger`, expression régulière). `signal_at_prompt` :
         signal envoyé à sshvault à la première invite. Après la sortie, `self.tty_echo` dit si
         l'écho du terminal est actif."""
         e = dict(self.env)
         e.update(env or {})
         r = pty_run([[sys.executable, "-m", "sshvault", *args]], e, answers=answer, timeout=timeout,
-                    trigger=trigger, signal_at_prompt=signal_at_prompt)
+                    trigger=trigger, signal_at_prompt=signal_at_prompt, stdin_tty=stdin_tty)
         self.tty_echo = r.echo
         return subprocess.CompletedProcess(r.args, r.returncode, r.stdout, r.stderr), r.screen
 
@@ -733,7 +736,7 @@ class PtyResult:
 
 
 def pty_run(cmds, env, answers=None, trigger=rb"mot de passe", timeout=30, signal_at_prompt=None,
-            send_at_prompt=None, mode="direct"):
+            send_at_prompt=None, mode="direct", stdin_tty=False):
     """Commande(s) `cmds` (liste d'argv) sur un pseudo-terminal neuf, terminal de contrôle de leur
     session ; stdin /dev/null, stdout et stderr hors du terminal (comme ssh lancé avec < /dev/null).
     mode « direct » : la commande unique est chef de session, donc au premier plan ;
@@ -744,7 +747,7 @@ def pty_run(cmds, env, answers=None, trigger=rb"mot de passe", timeout=30, signa
     l'invite (`trigger`) ; `send_at_prompt` (octets) est écrit dans le terminal à la première
     invite (b"\\x03" : Ctrl-C) ; `signal_at_prompt` envoyé au processus lancé à la première invite.
     Résultat : codes, sorties, texte affiché sur le terminal, écho actif après la sortie,
-    nombre d'invites vues, durée."""
+    nombre d'invites vues, durée. `stdin_tty` (mode « direct ») : stdin est le terminal."""
     answers = [answers] if isinstance(answers, str) else list(answers or [])
     master, slave = pty.openpty()
     slave_name = os.ttyname(slave)
@@ -758,7 +761,8 @@ def pty_run(cmds, env, answers=None, trigger=rb"mot de passe", timeout=30, signa
     else:
         argv = [sys.executable, PTYLEAD, mode, slave_name, json.dumps([list(c) for c in cmds])]
     t0 = time.monotonic()
-    p = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    p = subprocess.Popen(argv, env=env, stdin=slave if stdin_tty and mode == "direct" else subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          start_new_session=True, preexec_fn=ctty if mode == "direct" else None)
     # le parent garde le côté esclave ouvert : sinon le maître lit EIO tant que
     # l'enfant n'a pas rouvert /dev/tty

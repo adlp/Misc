@@ -934,3 +934,27 @@ def test_bout_en_bout_cle_d_hote_relayee(bench, pwlab, tmp_path):
     assert r.returncode == 0, (r.stdout, r.stderr, r.screen)
     assert "yes" in r.screen.split("(yes/no")[-1], "réponse visible au terminal"
     assert "ok=True" in pwlab.log("a")
+
+
+def test_bout_en_bout_elements_crees_par_password_add(bench, pwlab, tmp_path):
+    """Story 18 : éléments créés par `password add` (mot de passe sur stdin), puis `ssh B` via A :
+    l'askpass donne ces mots de passe, sans saisie ; aucun argv ni fichier ne les porte."""
+    setup_pw(bench, items=[], generate=False)
+    with ArgvWatch("password", [PW_A, PW_B], heuristics=False) as w:
+        r = bench.run("password", "add", "Saut A", "--host", "pa", "--user", "juser", input=PW_A + "\n")
+        assert r.returncode == 0, r.stderr
+        r = bench.run("password", "add", "Cible B", "--host", "tuser@pb", input=PW_B + "\n")
+        assert r.returncode == 0, r.stderr
+    assert any("add" in a for a in w.seen) and not w.suspect, w.suspect
+    cfg = e2e_config(bench, pwlab, tmp_path)
+    with ArgvWatch("--password", [PW_A, PW_B], heuristics=False) as w:
+        r = pty_run([[SSH, "-F", cfg, "pb", "echo", "bonjour"]], e2e_env(bench, tmp_path), trigger=rb"assword",
+                    timeout=90)
+    assert r.returncode == 0, (r.stdout, r.stderr, r.screen)
+    assert r.stdout.strip() == "OK port=%d cmd=echo bonjour" % pwlab.ports["b"]
+    assert "assword" not in r.screen, "aucune invite au terminal"
+    assert "port=%d password user=juser ok=True" % pwlab.ports["a"] in pwlab.log("a")
+    assert "port=%d keyboard-interactive user=tuser ok=True" % pwlab.ports["b"] in pwlab.log("b")
+    assert w.seen and not w.suspect, w.suspect
+    roots = [bench.home, bench.runtime] + [p for p in tmp_path.iterdir() if p.name != "server"]
+    assert files_with(roots, [PW_A, PW_B]) == []

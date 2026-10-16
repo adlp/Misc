@@ -1,5 +1,46 @@
 # Changelog — sshvault
 
+## sshvault 0.15.0 — Écriture des éléments identifiant (password add, password hosts) — 2026-10-16
+
+- `sshvault password add NOM --host [USER@]HÔTE… [--user U] [--account ALIAS] [--force]` :
+  crée l'élément identifiant d'un mot de passe d'hôte (CAP-11) sans passer par le web vault.
+  URI `ssh://hôte` ou `ssh://USER@hôte` (utilisateur encodé), jamais de port ; `--user` =
+  nom d'utilisateur de l'élément ; `--host` répétable ou liste à virgules ; deux `--host` de
+  même paire attendue (`db` et `admin@db` avec `--user admin`) : une seule URI, la première.
+  Hôtes et utilisateurs vérifiés avant tout accès au coffre.
+- Mot de passe jamais en argument : stdin terminal → saisi deux fois, masqué (vide ou
+  différent : nouvelle saisie, trois essais, puis code 2 ; terminal pas au premier plan ou
+  `--nointeraction` : code 2) ; sinon une ligne lue sur stdin (fin de ligne finale retirée ;
+  vide, `\r`/`\n` à l'intérieur, pas de l'UTF-8, plus de 4096 octets ou rien lu en
+  `SSHVAULT_PROMPT_TIMEOUT` : code 2). Élément écrit sur stdin de `bw create`, relu et comparé
+  (nom, utilisateur, mot de passe, URI) ; échec ou blocage : `sync`, recherche d'un nouvel
+  élément de même nom et mêmes URI, rejeu une seule fois ; relu différent : commande exacte de
+  suppression donnée. `ssh_config` régénéré ; compte rendu `élément « NOM » créé (id …)`,
+  jamais le secret.
+- `sshvault password hosts add|remove|set|list SÉLECTION [USER@]HÔTE…` : URI `ssh://` d'un
+  élément identifiant (sélection `--name`, `--id`, `--host`, comme `hosts` ; `--id` choisit
+  aussi un élément sans URI `ssh:`, par exemple après `set ""` ; `list --id` d'un élément sans
+  hôte : code 0, rien affiché). Paire attendue = hôte sans casse + utilisateur de l'URI, sinon
+  de l'élément ; port ignoré. `add` : paire attendue déjà présente dite avec son URI, rien
+  écrit ; répétition dans la commande écrite une fois. `remove` : paire exacte de l'URI ;
+  chaque paire absente dite (code 1), avec l'URI réelle quand elle ne correspond que par
+  l'utilisateur attendu. `set` : liste dans l'ordre donné, URI d'une paire déjà là (exacte,
+  sinon attendue) gardée telle quelle ; `set ""` retire tout. Nom, notes, champs, dossier,
+  favori, `reprompt`, organisation, collections, historique des mots de passe, utilisateur,
+  mot de passe, TOTP, passkeys, autres URI (web, `ssh:` invalides) et `match` des URI gardées :
+  inchangés, relus et comparés ; rejeu unique si l'élément n'a pas changé ; `ssh_config`
+  régénéré.
+- `remove`/`set` qui retirent des URI : l'élément et chaque URI perdue (complète, port
+  compris) sur stderr, puis « confirmer ? [o/N] » au terminal (`o`, `oui`, `y`, `yes` : écrit ;
+  autre réponse, délai ou fin de saisie : code 1, rien écrit) ; sans terminal ou
+  `--nointeraction` : code 2, rien écrit, sauf `--yes`.
+- Doublon : hôte et utilisateur attendu déjà portés par un autre élément identifiant (tout
+  compte lisible) : code 2, l'autre élément nommé, rien écrit ; `--force` écrit quand même,
+  avertissement dit seulement une fois l'écriture relue.
+- Invite de confirmation sans réponse (délai, fin de saisie, Ctrl-C) : fin de ligne écrite.
+- Faux `bw` des tests : `edit` d'un identifiant reprend `login` (passkeys comprises) ;
+  `create=corrupt` tronque son mot de passe. Banc : `run(input=…)`, `run_tty(stdin_tty=True)`.
+
 ## sshvault 0.14.0 — Mots de passe d'hôte fournis par l'askpass de sshvault — 2026-10-15
 
 - Mots de passe d'hôte (CAP-11) : un élément « identifiant » du coffre relié à ses hôtes par

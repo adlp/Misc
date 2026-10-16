@@ -1,2 +1,2 @@
 """sshvault : clés SSH dans Vaultwarden, utilisées de façon transparente par ssh."""
-__version__ = "0.14.0"
+__version__ = "0.15.0"

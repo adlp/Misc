@@ -101,14 +101,20 @@ def open_foreground_tty(path: str = TTY_PATH) -> Optional[int]:
     return fd
 
 
-def prompt_tty(fd: int, text: str, timeout: float) -> str:
+def prompt_tty(fd: int, text: str, timeout: float, echo: bool = False) -> str:
+    """Une ligne lue sur le terminal `fd` après `text` ; écho coupé (sauf `echo` : réponse
+    visible, pour une confirmation)."""
     try:
         old = termios.tcgetattr(fd)
     except (OSError, termios.error) as e:
         raise PromptUnavailable("terminal inutilisable : %s" % e) from None
     new = list(old)
     # Écho coupé, mode canonique imposé (un tty laissé en raw rendrait une lecture partielle).
-    new[3] = (new[3] & ~(termios.ECHO | termios.ECHONL)) | termios.ICANON
+    if echo:
+        new[3] = new[3] | termios.ICANON | termios.ECHO
+    else:
+        new[3] = (new[3] & ~(termios.ECHO | termios.ECHONL)) | termios.ICANON
+    line = False  # ligne entière lue (avec l'écho, sa fin de ligne est déjà affichée)
     try:
         os.write(fd, b"\r")
         # TCSAFLUSH comme readpassphrase : une saisie tapée avant l'invite est jetée.
@@ -118,12 +124,14 @@ def prompt_tty(fd: int, text: str, timeout: float) -> str:
         if not ready:
             raise PromptError("aucune saisie sur le terminal en %gs" % timeout)
         data = os.read(fd, 4096)
+        line = data.endswith(b"\n")
     except (OSError, termios.error) as e:  # termios.error n'est pas un OSError
         raise PromptError("terminal inutilisable : %s" % e) from None
     finally:
         try:
             termios.tcsetattr(fd, termios.TCSANOW, old)
-            os.write(fd, b"\n")
+            if not (echo and line):  # délai, fin de fichier, Ctrl-C : fin de ligne quand même
+                os.write(fd, b"\n")
         except (OSError, termios.error):
             pass
     if not data:

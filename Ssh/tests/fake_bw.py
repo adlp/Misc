@@ -17,6 +17,7 @@ Faits reproduits (vrai bw 2026.9.1, lus dans le source embarqué du binaire et m
   - `edit item <id> [encodedJson]` : JSON en base64 en argument ou sur stdin (aide de bw
     2026.9.1) ; champs repris comme `CipherExport.toView` (name, notes, favorite, reprompt,
     folderId ; `fields` et `passwordHistory` seulement s'ils ne sont pas null ; sshKey) ;
+    type 1 : `login` repris de la requête (username, password, totp, uris) ;
     `revisionDate` de la requête différente de celle du serveur : « The client copy of this
     cipher is out of date. Resync the client and try again. » ; l'élément modifié est rendu ;
   - `create item [encodedJson]` : même encodage, argument ou stdin ; type 5 : les trois champs
@@ -42,7 +43,7 @@ enfant `sleep` ; pids écrits dans FAKE_BW_PIDS), hangonce (seul le premier appe
 se perd ; logout : déconnecté, puis bloqué), errorafter (edit, create : écrit, puis code 1), errorsecond (premier appel normal, les
 suivants en erreur), silent (edit, create : code 0 sans rien écrire), erroronce (seul le premier
 appel en erreur), badjsonafter (create : créé, puis réponse illisible), corrupt (create :
-enregistré sans la fin de ligne finale de la clé privée), corruptafter (create : enregistré
+enregistré sans la fin de ligne finale de la clé privée ; identifiant : sans le dernier caractère du mot de passe), corruptafter (create : enregistré
 altéré, puis code 1), duperror (create : deux éléments enregistrés, puis code 1), hangsecond
 (premier appel normal, les suivants bloqués), locked (« Vault is locked. », code 1 : session
 refusée).
@@ -481,6 +482,20 @@ def now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".%03dZ" % (int(t * 1000) % 1000)
 
 
+def login_view(login, old=None):
+    """`login` d'un élément identifiant tel que le serveur le garde (LoginExport.toView) :
+    passkeys (`fido2Credentials`), utilisateur, mot de passe, TOTP, URI (uri, match) ; date de changement du mot de passe gardée
+    s'il ne change pas."""
+    login = login if isinstance(login, dict) else {}
+    old = old if isinstance(old, dict) else {}
+    same = old and old.get("password") == login.get("password")
+    return {"fido2Credentials": login.get("fido2Credentials") or [],
+            "username": login.get("username"), "password": login.get("password"), "totp": login.get("totp"),
+            "passwordRevisionDate": old.get("passwordRevisionDate") if same else (now_iso() if old else None),
+            "uris": [{"match": u.get("match"), "uri": u.get("uri")} for u in (login.get("uris") or [])
+                     if isinstance(u, dict)]}
+
+
 def cmd_edit(ctx, pos):
     if len(pos) < 2 or pos[0] != "item":
         fail("Unknown object.")
@@ -512,6 +527,8 @@ def cmd_edit(ctx, pos):
             item[k] = req[k]
     if item.get("type") == 5:
         item["sshKey"] = req.get("sshKey")
+    if item.get("type") == 1:  # LoginExport.toView : identifiant repris de la requête
+        item["login"] = login_view(req.get("login"), item.get("login"))
     item["revisionDate"] = now_iso()
     save_vault(v)
     mode = injected("edit")
@@ -547,17 +564,15 @@ def cmd_create(ctx, pos):
     if req.get("type") == 5:
         item["sshKey"] = dict(req["sshKey"])
     if req.get("type") == 1 and isinstance(req.get("login"), dict):  # LoginExport.toView : identifiant
-        login = req["login"]
-        item["login"] = {"username": login.get("username"), "password": login.get("password"),
-                         "totp": login.get("totp"), "passwordRevisionDate": None,
-                         "uris": [{"match": u.get("match"), "uri": u.get("uri")} for u in (login.get("uris") or [])
-                                  if isinstance(u, dict)]}
+        item["login"] = login_view(req["login"])
     mode = injected("create")
     if mode == "silent":  # réponse de succès, rien enregistré
         ctx.json(item)
         return
     if mode in ("corrupt", "corruptafter") and isinstance(item.get("sshKey"), dict):  # enregistré altéré
         item["sshKey"]["privateKey"] = (item["sshKey"].get("privateKey") or "").rstrip("\n")
+    if mode in ("corrupt", "corruptafter") and isinstance(item.get("login"), dict):  # identifiant : mot de passe tronqué
+        item["login"]["password"] = (item["login"].get("password") or "")[:-1]
     v = vault()
     v["items"].append(item)
     if mode == "duperror":  # deux éléments enregistrés (requête rejouée côté serveur ?), puis erreur

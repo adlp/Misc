@@ -6,7 +6,9 @@ Codes de sortie :
      hosts/forward remove : hôte absent de l'élément (rien écrit) ; import : clé déjà dans le coffre (rien
      créé) ; generate : nom déjà pris par une clé du coffre, sans --force (rien généré) ;
      ssh-config --check : pas à jour (contenu, droits, fichier en trop ou non ordinaire) ou
-     ligne Include absente, conditionnelle ou pas en tête
+     ligne Include absente, conditionnelle ou pas en tête ; password hosts : sélection sans
+     élément identifiant, remove d'une paire absente, ou perte d'URI non confirmée (autre
+     réponse que o/oui/y/yes, délai ou fin de saisie ; rien écrit)
   2  usage (option ou argument invalide ; load sans sélection ni --all ; durée invalide ;
      config.json invalide, illisible ou aux droits inattendus ; config set bw-path : chemin
      relatif, absent, avec un caractère de contrôle, ou pas un fichier ordinaire exécutable ;
@@ -19,7 +21,12 @@ Codes de sortie :
      avec un bw-path invalide (rien fait), aucun compte par défaut,
      account rename vers un alias déjà pris, account add : dossier accounts/<alias> existant,
      account set sans --server ni --email, ou registre refusé après la déconnexion : ce qui
-     est déjà fait est dit)
+     est déjà fait est dit ; password add : nom, hôte ou utilisateur refusé, mot de passe vide,
+     saisies différentes ou vides trois fois, stdin de plus d'une ligne, pas de l'UTF-8, de plus
+     de 4096 octets ou sans rien en SSHVAULT_PROMPT_TIMEOUT, terminal pas au premier plan,
+     saisie au terminal avec --nointeraction ; password add et password hosts
+     add/set : hôte et utilisateur déjà portés par un autre élément identifiant, sans --force ;
+     password hosts remove/set : URI à retirer sans terminal ni --yes ; rien écrit)
   3  non connecté au coffre, aucun compte enregistré, ou coffre verrouillé (aucune invite
      possible, mot de passe refusé) ;
      agent dédié arrêté ou verrouillé (ensure --forward compris) ; passphrase d'une clé
@@ -35,7 +42,9 @@ Codes de sortie :
      non aboutie ou non vérifiée (y compris clé importée mais ssh_config non régénéré), copie
      impossible dans un tmpfs privé (import --decrypt, generate), ssh-keygen absent ou en
      erreur, création d'un élément par generate non aboutie ou non vérifiée (y compris clé
-     créée mais ssh_config non régénéré), deploy : ssh absent, en échec ou sans réponse
+     créée mais ssh_config non régénéré), création ou écriture d'un élément identifiant non
+     aboutie ou non vérifiée (password add, password hosts ; y compris écrite mais ssh_config non
+     régénéré), deploy : ssh absent, en échec ou sans réponse
      (SSHVAULT_DEPLOY_TIMEOUT), réponse inattendue, échec partiel (clés déjà ajoutées dites),
      ssh_config généré impossible à écrire (chemin avec « " », « \\ », « ${ », fichier non
      ordinaire, droits), répertoire
@@ -87,8 +96,9 @@ from .agentstate import entry as state_entry, maybe_locked, reconcile, remaining
 from . import accounts as accounts_mod
 from .accounts import (AccountError, AccountIOError, Accounts, AdoptError, NoAccount, adopt_legacy,
                        pending_message, tag)
-from .backend import (FORWARD_FIELD, HOSTS_FIELD, BackendError, InvalidHost, ItemNotFound, LogoutUnknown, NotLoggedIn, SshKeyItem, VaultBackend, VaultError,
-                      VaultLocked, WriteFailed, normalize_hosts, valid_host)
+from .backend import (FORWARD_FIELD, HOSTS_FIELD, BackendError, InvalidHost, ItemNotFound, LoginItem, LogoutUnknown, NotLoggedIn, SshKeyItem, VaultBackend, VaultError,
+                      VaultLocked, WriteFailed, check_login_user, login_uri, normalize_hosts, parse_login_host, parse_ssh_uri,
+                      valid_host)
 from .bw import EXE_VAR as BW_EXE_VAR, BwBackend, account_dir, reset_process_state
 from .config import (ACCOUNTS, BW_PATH, DEFAULT_ACCOUNTS, PATH_KEYS, DEFAULT_SERVER, Config, ConfigError, ConfigWriteError, check_alias,
                      describe_duration, normalize_email, normalize_server, parse_duration)
@@ -187,7 +197,10 @@ def build_parser() -> Parser:
     p = Parser(prog="sshvault", description="Clés SSH du coffre Vaultwarden (via bw).",
                epilog="Codes de sortie : 0 ok, 1 aucun résultat (hosts remove : hôte absent ; "
                       "ssh-config --check : pas à jour ; import : déjà dans le coffre ; generate : nom "
-                      "déjà pris), 2 usage (hôte invalide, sélection ambiguë, import : fichier refusé, "
+                      "déjà pris ; password hosts : sélection sans élément, remove d'une paire absente, perte "
+                      "d'URI non confirmée), 2 usage (hôte invalide, "
+                      "sélection ambiguë, password : saisie refusée, doublon sans --force, perte d'URI sans "
+                      "terminal ni --yes, import : fichier refusé, "
                       "generate : type ou commentaire refusé, deploy : cible invalide, config set bw-path : "
                       "chemin refusé ; comptes : alias inconnu, invalide ou pris, --account requis, "
                       "account set sans option ou registre refusé après la déconnexion, logout/set : "
@@ -230,13 +243,54 @@ def build_parser() -> Parser:
     _account_flag(s)
     s.add_argument("--json", action="store_true", help="sortie JSON")
     s = sub.add_parser("password", help="mots de passe d'hôte : éléments identifiant reliés à leurs hôtes par URI "
-                                        "ssh://[user@]hôte[:port] (list)")
+                                        "ssh://[user@]hôte[:port] (add, list, hosts)")
     psub = s.add_subparsers(dest="password_cmd", metavar="ACTION", parser_class=Parser)
     psub.required = True
+    a = psub.add_parser("add", help="crée un élément identifiant relié à ses hôtes ; mot de passe saisi deux fois "
+                                    "au terminal (masqué), ou une ligne sur stdin s'il n'est pas un terminal ; "
+                                    "jamais en argument ; ssh_config régénéré")
+    a.add_argument("name", metavar="NOM", help="nom de l'élément")
+    a.add_argument("--host", dest="hosts", metavar="[USER@]HÔTE", action="append", default=[],
+                   help="hôte tapé (lettres, chiffres, . - _ ; jamais de port), plusieurs fois ou liste à virgules ; "
+                        "au moins un")
+    a.add_argument("--user", metavar="U", help="nom d'utilisateur de l'élément : utilisateur attendu des hôtes "
+                                               "écrits sans USER@")
+    _account_flag(a, _ONE)
+    a.add_argument("--force", action="store_true",
+                   help="crée l'élément même si un hôte et son utilisateur sont déjà portés par un autre élément "
+                        "identifiant")
     a = psub.add_parser("list", help="éléments identifiant à URI ssh:// : alias, nom, hôtes ([user@]hôte), jamais le "
                                      "mot de passe")
     _account_flag(a)
     a.add_argument("--json", action="store_true", help="sortie JSON")
+    a = psub.add_parser("hosts", help="hôtes d'un élément identifiant (ses URI ssh://) : add, remove, set, list")
+    hsub = a.add_subparsers(dest="hosts_cmd", metavar="ACTION", parser_class=Parser)
+    hsub.required = True
+    for name, what in (("add", "ajoute des hôtes (URI ssh://[user@]hôte)"),
+                       ("remove", "retire les URI ssh:// de ces paires hôte + utilisateur exactes (port ignoré)"),
+                       ("set", "remplace les URI ssh:// valides par cette liste (\"\" : les retire toutes)"),
+                       ("list", "affiche les hôtes ([user@]hôte attendus)")):
+        h = hsub.add_parser(name, help=what)
+        h.add_argument("pattern", metavar="SÉLECTION",
+                       help="un seul élément identifiant à URI ssh:// (avec --id : tout élément identifiant, même "
+                            "sans URI ssh:)")
+        _account_flag(h, "comptes lus (list) ; compte écrit (add, remove, set : un seul)")
+        g = h.add_mutually_exclusive_group()
+        for flag, sel in (("host", "motif glob d'hôte"), ("name", "sous-chaîne du nom"),
+                          ("id", "id exact de l'élément (aussi un élément identifiant sans URI ssh:)")):
+            g.add_argument("--" + flag, dest="by", action="store_const", const=flag, help=sel)
+        if name != "list":
+            h.add_argument("hosts", metavar="[USER@]HÔTE", nargs="+",
+                           help="hôte tapé (lettres, chiffres, . - _ ; jamais de port), ou liste à virgules")
+        if name in ("add", "set"):
+            h.add_argument("--force", action="store_true",
+                           help="écrit même si un hôte et son utilisateur sont déjà portés par un autre élément "
+                                "identifiant")
+        if name in ("remove", "set"):
+            h.add_argument("--yes", action="store_true",
+                           help="retire les URI ssh:// perdues sans confirmation (obligatoire sans terminal) ; "
+                                "sinon « confirmer ? [o/N] » au terminal : o, oui, y ou yes écrit, toute autre "
+                                "réponse, le délai ou la fin de saisie n'écrit rien (code 1)")
     s = sub.add_parser("account", help="comptes du coffre : add, list, remove, default, rename, set")
     asub = s.add_subparsers(dest="account_cmd", metavar="ACTION", parser_class=Parser)
     asub.required = True
@@ -414,14 +468,13 @@ def print_items(items: list, as_json: bool) -> None:
                                   ",".join(clean(h) for h in i.hosts) or "-"))
 
 
-def run_password(args, accts: Accounts, prompt) -> int:
-    """`password list` : éléments identifiant à URI ssh:// des comptes lus (une invite au plus par
-    compte) ; texte `alias⇥nom⇥hôtes` ou JSON (comme `list`) ; URI ignorées dites sur stderr."""
-    aliases = accts.read_set(args.account)
+def read_logins(accts: Accounts, aliases: list, prompt, every: bool = False) -> tuple:
+    """(éléments identifiant de ces comptes, code) : une invite au plus par compte ; comme `collect`.
+    `every` : tous les éléments identifiant, même sans URI ssh:."""
     logins, rc, failed = [], RC_OK, 0
     for a in aliases:
         try:
-            logins += tag(a, accts.backend(a).list_logins(prompt))
+            logins += tag(a, accts.backend(a).list_logins(prompt, every=every))
         except (VaultError, SessionStoreError) as e:
             if len(aliases) == 1:
                 raise
@@ -430,6 +483,13 @@ def run_password(args, accts: Accounts, prompt) -> int:
             rc, failed = max(rc, code), failed + 1
     if aliases and failed == len(aliases):
         raise _Reported(rc)
+    return logins, rc
+
+
+def run_password(args, accts: Accounts, prompt) -> int:
+    """`password list` : éléments identifiant à URI ssh:// des comptes lus (une invite au plus par
+    compte) ; texte `alias⇥nom⇥hôtes` ou JSON (comme `list`) ; URI ignorées dites sur stderr."""
+    logins, rc = read_logins(accts, accts.read_set(args.account), prompt)
     for w in sshconfig.login_warnings(logins):
         err("avertissement : %s" % w)
     shown = [i for i in logins if i.hosts]
@@ -553,6 +613,10 @@ def run(args, accts: Accounts) -> int:
         print_items(items, args.json)
         return rc
     if args.cmd == "password":
+        if args.password_cmd == "add":
+            return run_password_add(args, accts, prompt)
+        if args.password_cmd == "hosts":
+            return run_password_hosts(args, accts, prompt)
         return run_password(args, accts, prompt)
     if args.cmd == "search":
         items, rc = collect(accts, accts.read_set(args.account), prompt)
@@ -2259,6 +2323,426 @@ def run_ssh_config(args, accts: Accounts, prompt) -> int:
         return RC_NONE
     print("à jour : %s (%d bloc%s), ligne Include en tête de %s"
           % (paths.config, plan.blocks, "s" if plan.blocks > 1 else "", paths.user_config))
+    return RC_OK
+
+
+# --- écriture des éléments identifiant (story 18, CAP-11) ----------------------------------------
+
+#: Taille au plus d'un mot de passe lu sur stdin (octets).
+STDIN_PASSWORD_MAX = 4096
+PASSWORD_TRIES = 3
+
+
+def _login_pairs(values) -> list:
+    """`[user@]hôte` donnés (chacun peut être une liste à virgules) → [(hôte, utilisateur ou None)],
+    sans doublon, dans l'ordre ; InvalidHost (code 2) avant tout accès au coffre."""
+    out = []
+    for spec in _split(values):
+        pair = parse_login_host(spec)
+        if pair not in out:
+            out.append(pair)
+    return out
+
+
+def _pair_label(pair) -> str:
+    h, u = pair
+    return "%s@%s" % (clean(u), h) if u else h
+
+
+def _stdin_is_tty() -> bool:
+    try:
+        return os.isatty(0)
+    except (OSError, ValueError):
+        return False
+
+
+def _password_from_stdin() -> str:
+    """Une ligne sur stdin (pas un terminal) : fin de ligne finale (`\\n`) retirée ; vide, `\\r` ou
+    `\\n` à l'intérieur, pas de l'UTF-8, trop long ou rien en `SSHVAULT_PROMPT_TIMEOUT` : UsageError
+    (code 2). Le mot de passe n'apparaît dans aucun message."""
+    import select
+    timeout = prompt_timeout(os.environ)
+    deadline = time.monotonic() + timeout
+    data = b""
+    try:
+        while len(data) <= STDIN_PASSWORD_MAX + 1:
+            left = deadline - time.monotonic()
+            ready = select.select([0], [], [], max(0.0, left))[0] if left > 0 else []
+            if not ready:
+                raise UsageError("mot de passe : rien lu sur stdin en %gs : rien créé" % timeout)
+            chunk = os.read(0, STDIN_PASSWORD_MAX + 2 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    except OSError as e:
+        raise UsageError("mot de passe : stdin illisible (%s) : rien créé" % (e.strerror or e)) from None
+    try:
+        if data.endswith(b"\n"):
+            data = data[:-1]
+        if not data:
+            raise UsageError("mot de passe vide sur stdin : rien créé")
+        if b"\r" in data or b"\n" in data:
+            raise UsageError("mot de passe sur stdin : une seule ligne attendue (retour chariot ou fin de ligne à "
+                             "l'intérieur) : rien créé")
+        if len(data) > STDIN_PASSWORD_MAX:
+            raise UsageError("mot de passe sur stdin : plus de %d octets : rien créé" % STDIN_PASSWORD_MAX)
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise UsageError("mot de passe sur stdin : pas de l'UTF-8 : rien créé") from None
+    finally:
+        del data
+
+
+def _password_from_tty(name: str) -> str:
+    """Saisie masquée au terminal, deux fois ; vide ou différentes : message, nouvelle saisie,
+    `PASSWORD_TRIES` essais, puis UsageError (code 2)."""
+    from .prompt import open_foreground_tty, prompt_tty
+    fd = open_foreground_tty()
+    if fd is None:
+        raise UsageError("mot de passe : stdin est un terminal mais sshvault n'y est pas au premier plan : rien créé")
+    try:
+        timeout = prompt_timeout(os.environ)
+        for _ in range(PASSWORD_TRIES):
+            first = prompt_tty(fd, "mot de passe de « %s » : " % clean(name), timeout)
+            if not first:
+                err("mot de passe vide")
+                continue
+            second = prompt_tty(fd, "mot de passe de « %s », encore une fois : " % clean(name), timeout)
+            if first != second:
+                del first, second
+                err("les deux saisies diffèrent")
+                continue
+            del second
+            return first
+        raise UsageError("mot de passe : %d essais sans deux saisies identiques non vides : rien créé" % PASSWORD_TRIES)
+    except PromptError as e:
+        raise UsageError("mot de passe : %s : rien créé" % e) from None
+    finally:
+        os.close(fd)
+
+
+def _expected(pair, username) -> tuple:
+    """Paire attendue : (hôte, utilisateur de l'URI, sinon nom d'utilisateur de l'élément)."""
+    h, u = pair
+    return h, (u if u is not None else (username or None))
+
+
+def _pair_conflicts(pairs, logins, skip=None) -> list:
+    """[(paire, élément)] : paire attendue (hôte, utilisateur) déjà portée par un autre élément
+    identifiant lu (même règle que l'avertissement de `ssh-config`) ; paire sans utilisateur :
+    jamais en conflit. `skip` : (compte, id) de l'élément écrit."""
+    out = []
+    for h, user in pairs:
+        if not user:
+            continue
+        for it in sorted(logins, key=lambda i: (i.name.casefold(), i.account or "", i.id)):
+            if skip is not None and (it.account, it.id) == skip:
+                continue
+            if (h, user) in it.hosts:
+                out.append(((h, user), it))
+                break
+    return out
+
+
+def _where(it: LoginItem, accts: Accounts) -> str:
+    return "%s(id %s)" % (("compte %s, " % it.account) if accts.multi and it.account else "", it.id)
+
+
+def _refuse_conflicts(conflicts, accts: Accounts, force: bool) -> bool:
+    """Sans `force` : doublons dits (une ligne chacun), True (rien écrire, code 2). Avec `force` :
+    rien dit ici (`_warn_forced`, une fois l'écriture décidée)."""
+    if force:
+        return False
+    for (h, u), it in conflicts:
+        err("%s@%s déjà porté par l'élément identifiant « %s » %s : rien écrit ; --force pour écrire quand même"
+            % (clean(u), h, clean(it.name), _where(it, accts)))
+    return bool(conflicts)
+
+
+def _warn_forced(conflicts, accts: Accounts) -> None:
+    """Doublons écrits avec `--force` : un avertissement chacun, juste avant l'écriture."""
+    for (h, u), it in conflicts:
+        err("avertissement : %s@%s déjà porté par « %s » %s : écrit quand même (--force) ; le premier (nom, compte, "
+            "id) gagne" % (clean(u), h, clean(it.name), _where(it, accts)))
+
+
+def _login_matches(it: LoginItem, pattern: str, by: Optional[str]) -> bool:
+    import fnmatch
+    p = pattern.strip()
+
+    def host():
+        return any(fnmatch.fnmatchcase(h.lower(), p.lower()) for h in it.host_names())
+
+    def name():
+        return p.casefold() in it.name.casefold()
+    if by == "host":
+        return host()
+    if by == "name":
+        return name()
+    if by == "id":
+        return it.id == p
+    return name() or host()
+
+
+def _select_login(logins: list, args, multi: bool = False, account: Optional[str] = None) -> Optional[LoginItem]:
+    """L'élément identifiant désigné par la sélection (comme `_select_one`) ; None (message dit)
+    si aucun ; UsageError si plusieurs."""
+    if not args.pattern.strip():
+        raise UsageError("sélection vide")
+    found = [i for i in logins if _login_matches(i, args.pattern, args.by)]
+    if not found:
+        if account:
+            err("aucun élément identifiant ne correspond à « %s » dans le compte %s (autre compte : --account ALIAS)"
+                % (clean(args.pattern), account))
+        else:
+            err("aucun élément identifiant ne correspond à « %s »" % clean(args.pattern))
+        return None
+    if len(found) > 1:
+        accounts = {i.account for i in found}
+        raise UsageError("« %s » désigne %d éléments identifiant (%s) : préciser --id%s"
+                         % (clean(args.pattern), len(found),
+                            ", ".join("%s%s %s" % ("%s " % i.account if multi and i.account else "", clean(i.name), i.id)
+                                      for i in found),
+                            " et --account" if multi and len(accounts) > 1 else ""))
+    return found[0]
+
+
+def _confirm_losses(args, item: LoginItem, lost: list) -> Optional[int]:
+    """URI `ssh://` perdues (complètes) dites sur stderr, puis « confirmer ? [o/N] » au terminal ;
+    None : écrire (réponse o, oui, y ou yes, sans casse). `--yes` : sans question. Sans terminal ou
+    `--nointeraction` : code 2 ; autre réponse, délai ou fin de saisie : code 1 ; rien écrit dans
+    ces deux cas."""
+    err("« %s » (id %s) : URI ssh:// retirée%s :" % (clean(item.name), item.id, "s" if len(lost) > 1 else ""))
+    for u in lost:
+        err("  %s" % clean(u))
+    if args.yes:
+        return None
+    if args.nointeraction:
+        err("confirmation impossible (--nointeraction) : rien écrit ; --yes pour retirer ces URI")
+        return RC_USAGE
+    from .prompt import open_foreground_tty, prompt_tty
+    fd = open_foreground_tty()
+    if fd is None:
+        err("confirmation impossible (pas de terminal au premier plan) : rien écrit ; --yes pour retirer ces URI")
+        return RC_USAGE
+    try:
+        try:
+            answer = prompt_tty(fd, "confirmer ? [o/N] ", prompt_timeout(os.environ), echo=True)
+        except PromptError as e:
+            err("pas de confirmation (%s) : rien écrit" % e)
+            return RC_NONE
+    finally:
+        os.close(fd)
+    if answer.strip().lower() in ("o", "oui", "y", "yes"):
+        return None
+    err("non confirmé : rien écrit")
+    return RC_NONE
+
+
+def _password_paths():
+    """Prérequis locaux de la régénération (chemins, socket de l'agent, chemin de sshvault),
+    avant tout accès au coffre : SshConfigError ou AgentError (code 4), rien écrit."""
+    paths = sshconfig.default_paths()
+    return paths, make_agent().socket, ensure_exe(paths)
+
+
+def _password_prereqs(accts: Accounts, alias: str, items: list, logins: list, will_have_hosts: bool, pre):
+    """Prérequis de la régénération, vérifiés avant toute écriture (comme `hosts`) : (chemins,
+    socket, exe, sources, exe des lignes à mot de passe). Les autres comptes sont lus sans invite
+    (verrouillés : leurs blocs gardés)."""
+    paths, socket, exe = pre
+    src = gather(accts, paths, {alias: items}, None, fresh_logins={alias: logins})
+    probe = [LoginItem(id="", name="", hosts=(("h", None),))] if will_have_hosts else []
+    pw_exe = password_exe(paths, src.logins + probe, exe)
+    sshconfig.build(src.items, paths, socket, exe, src.kept, src.logins, pw_exe)
+    return paths, socket, exe, src, pw_exe
+
+
+def run_password_add(args, accts: Accounts, prompt) -> int:
+    """`password add NOM --host [user@]hôte… [--user U]` : élément identifiant créé (mot de passe
+    saisi au terminal ou lu sur stdin, jamais en argument), relu, ssh_config régénéré. Ordre :
+    refus d'usage (2), prérequis de la régénération (4), coffre (3/4), doublons (2), saisie,
+    création."""
+    name = args.name.strip()
+    if not name:
+        raise UsageError("NOM vide")
+    if not name.isprintable():
+        raise UsageError("NOM : caractères imprimables seulement")
+    pairs = _login_pairs(args.hosts)  # InvalidHost (code 2) avant tout accès
+    if not pairs:
+        raise UsageError("au moins un --host [USER@]HÔTE")
+    user = check_login_user(args.user) if args.user is not None else None
+    seen, kept = [], []  # `db` et `admin@db` avec --user admin : une seule URI (la première écrite)
+    for p in pairs:
+        if _expected(p, user) not in seen:
+            seen.append(_expected(p, user))
+            kept.append(p)
+    pairs = kept
+    extra = _test_fields()
+    on_tty = _stdin_is_tty()
+    password = None
+    if on_tty:
+        if args.nointeraction:
+            raise UsageError("mot de passe : saisie au terminal impossible avec --nointeraction (le donner sur stdin) : "
+                             "rien créé")
+        from .prompt import open_foreground_tty
+        fd = open_foreground_tty()  # saisie possible ? dit avant tout accès au coffre
+        if fd is None:
+            raise UsageError("mot de passe : stdin est un terminal mais sshvault n'y est pas au premier plan : "
+                             "rien créé")
+        os.close(fd)
+    else:
+        password = _password_from_stdin()
+    alias = accts.write_one(args.account, "password add")  # code 2 avant tout accès
+    backend = accts.backend(alias)
+    pre = _password_paths()  # code 4 avant tout accès au coffre
+    backend.sync(prompt)  # doublons : état du serveur, pas un cache local périmé
+    items = tag(alias, backend.list_ssh_keys(prompt))
+    logins = tag(alias, backend.list_logins(prompt))
+    paths, socket, exe, src, pw_exe = _password_prereqs(accts, alias, items, logins, True, pre)
+    conflicts = _pair_conflicts([_expected(p, user) for p in pairs], src.logins)
+    if _refuse_conflicts(conflicts, accts, args.force):
+        return RC_USAGE
+    if password is None:
+        password = _password_from_tty(name)
+    uris = [login_uri(h, u) for h, u in pairs]
+    try:
+        item = backend.create_login(name, user, password, uris, prompt,
+                                    existing=[i.id for i in logins if i.name == name], extra_fields=extra)
+    finally:
+        del password
+    _warn_forced(conflicts, accts)  # écrit et relu : seulement maintenant
+    item = tag(alias, [item])[0]
+    regenerated = False
+    try:
+        print("élément « %s » créé (id %s)" % (clean(item.name), clean(item.id)), flush=True)
+        try:
+            regenerate(src.items, paths, socket, exe, kept=src.kept, notes=src.notes, logins=src.logins + [item],
+                       pw_exe=pw_exe)
+        except (sshconfig.SshConfigError, AgentError) as e:
+            err("élément créé dans le coffre, mais ssh_config non régénéré : %s" % e)
+            return RC_BACKEND
+        regenerated = True
+    except BaseException:
+        if not regenerated:
+            try:
+                err("élément créé : « %s » %s ; ssh_config non régénéré : lancer « sshvault ssh-config »"
+                    % (clean(item.name), clean(item.id)))
+            except (OSError, ValueError):
+                pass
+        raise
+    return RC_OK
+
+
+def run_password_hosts(args, accts: Accounts, prompt) -> int:
+    """`password hosts add|remove|set|list SÉLECTION [user@]hôte…` : URI `ssh://` d'un élément
+    identifiant. `list` lit les comptes par défaut (ou --account) ; une écriture vise un seul compte,
+    relue, rejouée une fois au plus ; `remove` et `set` disent les URI perdues et demandent
+    confirmation (`--yes` sinon)."""
+    cmd = args.hosts_cmd
+    if cmd == "list":
+        if not args.pattern.strip():
+            raise UsageError("sélection vide")
+        logins, rc = read_logins(accts, accts.read_set(args.account), prompt, every=args.by == "id")
+        item = _select_login(logins, args, multi=accts.multi)
+        if item is None:
+            return max(rc, RC_NONE)
+        for label in item.labels():
+            print(clean(label))
+        return rc
+    pairs = _login_pairs(args.hosts)  # InvalidHost (code 2) avant tout accès au coffre
+    if cmd == "add" and not pairs:
+        raise UsageError("aucun hôte à ajouter")
+    if cmd == "remove" and not pairs:
+        raise UsageError("aucun hôte à retirer")
+    if not args.pattern.strip():
+        raise UsageError("sélection vide")
+    alias = accts.write_one(args.account, "password hosts %s" % cmd)  # code 2 avant tout accès
+    backend = accts.backend(alias)
+    pre = _password_paths()  # code 4 avant tout accès au coffre
+    backend.sync(prompt)  # écriture : état du serveur, pas un cache local périmé
+    items = tag(alias, backend.list_ssh_keys(prompt))
+    logins = tag(alias, backend.list_logins(prompt))
+    # --id : tout élément identifiant du compte, même sans URI ssh: (toutes retirées par set "")
+    choices = tag(alias, backend.list_logins(prompt, every=True)) if args.by == "id" else logins
+    item = _select_login(choices, args, account=alias if accts.multi else None)
+    if item is None:
+        return RC_NONE
+    current = list(item.ssh_uris)
+    cur_pairs = [parse_ssh_uri(u) for u in current]
+    uname = item.username
+
+    def carriers(p):  # URI actuelles dont la paire attendue est celle de `p`
+        return [u for u, q in zip(current, cur_pairs) if _expected(q, uname) == _expected(p, uname)]
+    if cmd == "add":
+        want, asked = list(current), []
+        for p in pairs:
+            if _expected(p, uname) in asked:
+                continue  # répétée dans la commande (`db admin@db`, utilisateur admin) : une seule fois
+            asked.append(_expected(p, uname))
+            by = carriers(p)
+            if by:
+                print("« %s » : %s déjà présent (%s)" % (clean(item.name), _pair_label(_expected(p, uname)), clean(by[0])))
+            else:
+                want.append(login_uri(*p))
+    elif cmd == "remove":
+        missing = [p for p in pairs if p not in cur_pairs]
+        for p in missing:  # paire exacte de l'URI ; celle qui correspond par l'utilisateur attendu, dite
+            by = carriers(p)
+            hint = ""
+            if by:
+                q = parse_ssh_uri(by[0])
+                how = "son utilisateur" if q[1] is not None else "l'utilisateur de l'élément"
+                hint = " (%s porte %s par %s : retirer « %s »)" % (clean(by[0]), _pair_label(_expected(p, uname)), how,
+                                                                    _pair_label(q))
+            err("« %s » n'a pas l'URI ssh://%s%s" % (clean(item.name), _pair_label(p), hint))
+        if missing:
+            err("rien écrit")
+            return RC_NONE
+        want = [u for u, p in zip(current, cur_pairs) if p not in pairs]
+    else:
+        want, seen = [], []
+        for p in pairs:  # une URI déjà là pour cette paire est gardée telle quelle (port compris)
+            if _expected(p, uname) in seen:
+                continue
+            seen.append(_expected(p, uname))
+            same = [u for u, q in zip(current, cur_pairs) if q == p] or carriers(p)  # paire exacte, sinon attendue
+            want.append(same[0] if same else login_uri(*p))
+    left = list(want)
+    lost = []
+    for u in current:
+        if u in left:
+            left.remove(u)
+        else:
+            lost.append(u)
+    have = [_expected(q, uname) for q in cur_pairs]
+    added = []
+    for u in want:
+        e = _expected(parse_ssh_uri(u), uname)
+        if e not in have and e not in added:
+            added.append(e)
+    paths, socket, exe, src, pw_exe = _password_prereqs(accts, alias, items, logins, bool(want), pre)
+    conflicts = _pair_conflicts(added, src.logins, skip=(item.account, item.id))
+    if _refuse_conflicts(conflicts, accts, getattr(args, "force", False)):
+        return RC_USAGE
+    if want == current:
+        print("hôtes de « %s » inchangés : %s" % (clean(item.name), ",".join(clean(x) for x in item.labels()) or "aucun"))
+        updated = item
+    else:
+        if lost:
+            rc = _confirm_losses(args, item, lost)
+            if rc is not None:
+                return rc
+        updated = tag(alias, [backend.set_login_uris(item.id, want, prompt)])[0]
+        _warn_forced(conflicts, accts)  # écrit et relu : seulement maintenant
+        print("hôtes de « %s » : %s" % (clean(updated.name), ",".join(clean(x) for x in updated.labels()) or "aucun"))
+    logins_after = [i for i in src.logins if (i.account, i.id) != (updated.account, updated.id)] + [updated]
+    try:
+        regenerate(src.items, paths, socket, exe, kept=src.kept, notes=src.notes, logins=logins_after, pw_exe=pw_exe)
+    except (sshconfig.SshConfigError, AgentError) as e:
+        err("hôtes écrits dans le coffre, mais ssh_config non régénéré : %s" % e)
+        return RC_BACKEND
     return RC_OK
 
 

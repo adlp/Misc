@@ -420,11 +420,13 @@ def home(account, bw_exe, ring, report, witness):
                     check_witness(witness)
 
 
-def sv(home, *args, env=None):
+def sv(home, *args, env=None, input=None):
+    """sshvault dans le HOME de test ; stdin /dev/null, ou `input` (texte) sur un tube."""
     e = dict(home["env"])
     e.update(env or {})
+    io = {"stdin": subprocess.DEVNULL} if input is None else {"input": input}
     return subprocess.run([sys.executable, "-m", "sshvault", *args], env=e, capture_output=True, text=True,
-                          timeout=600, stdin=subprocess.DEVNULL, start_new_session=True)
+                          timeout=600, start_new_session=True, **io)
 
 
 #: secondes au plus pour lire le reste du terminal, puis la sortie standard, après la sortie de
@@ -708,6 +710,10 @@ def test_sshvault_sur_le_vrai_bw(account, vault, ssh_keys, home, report):
     # mots de passe d'hôte (story 17) : élément identifiant créé par bw, lu par password list et ssh-config
     check_passwords(account, vault, home, report)
 
+    # écriture des éléments identifiant (story 18) : password add (stdin), password hosts, relus par
+    # un autre client bw
+    check_password_write(account, vault, home, report)
+
     # chargement à la demande (story 5) : ssh vers un sshd local, agent vide, vrai bw
     check_ensure(account, vault, ssh_keys, home, report)
 
@@ -885,6 +891,59 @@ def check_passwords(account, vault, home, report):
         assert g.returncode == 0, account.scrub(g.stderr)
         assert not os.path.exists(os.path.join(home["runtime"], "sshvault", "pw")) or \
             not os.listdir(os.path.join(home["runtime"], "sshvault", "pw"))
+
+
+def check_password_write(account, vault, home, report):
+    """Story 18 : `password add` (mot de passe sur stdin, marqué pour le nettoyage), puis `password
+    hosts add`, `remove --yes`, `set --yes` ; après chacun, élément relu par le client du peuplement
+    (`bw get item` après sync) : nom, utilisateur, mot de passe, URI ; mot de passe jamais en
+    argument ni sur une sortie. L'élément est supprimé en fin de run (marqueur)."""
+    pop, session = vault["_reader"]
+    name = "sshvault-it %s ajouté" % TAG
+    secret = "jetable-ajout-" + TAG
+    a, b, c = ("%s-%s.it.example" % (x, TAG) for x in ("pwa", "pwb", "pwc"))
+    env = {"SSHVAULT_TEST_FIELD": "%s=%s" % (MARK, RUN)}
+    with ArgvWatch(home["env"]["SSHVAULT_BW"], [secret], heuristics=False) as w:
+        r = sv(home, "--nointeraction", "password", "add", name, "--host", a, "--user", "it-add", env=env,
+               input=secret + "\n")
+    report.add("sshvault password add", r)
+    check(account, r, 0, "password add")
+    m = re.match(r"élément « %s » créé \(id ([0-9a-f-]{36})\)$" % re.escape(name), r.stdout.splitlines()[0])
+    assert m, r.stdout
+    iid = m.group(1)
+    assert secret not in r.stdout + r.stderr
+    assert any("create" in x for x in w.seen) and not w.suspect, "mot de passe en argument : %s" % w.suspect[:3]
+
+    def reread():
+        assert pop.sync(session).returncode == 0, "sync du lecteur"
+        it = json.loads(pop.ok("get", "item", iid, session=session).stdout)
+        assert has_mark(it) and it["type"] == 1 and it["name"] == name
+        assert it["login"]["username"] == "it-add" and it["login"]["password"] == secret
+        return [u["uri"] for u in it["login"]["uris"]]
+    assert reread() == ["ssh://" + a]
+    text = open(os.path.join(home["env"]["HOME"], ".ssh", "sshvault", "config")).read()
+    assert "--id %s --host %s\"" % (iid, a) in text
+    r = sv(home, "--nointeraction", "password", "hosts", "add", "--id", iid, "root@" + b)
+    report.add("sshvault password hosts add", r)
+    check(account, r, 0, "password hosts add")
+    assert reread() == ["ssh://" + a, "ssh://root@" + b]
+    r = sv(home, "--nointeraction", "password", "hosts", "remove", "--id", iid, "root@" + b)
+    report.add("sshvault password hosts remove sans --yes", r)
+    check(account, r, 2, "password hosts remove sans --yes")
+    assert "ssh://root@" + b in r.stderr
+    r = sv(home, "--nointeraction", "password", "hosts", "remove", "--id", iid, "root@" + b, "--yes")
+    report.add("sshvault password hosts remove --yes", r)
+    check(account, r, 0, "password hosts remove --yes")
+    assert reread() == ["ssh://" + a]
+    r = sv(home, "--nointeraction", "password", "hosts", "set", "--id", iid, c, "--yes")
+    report.add("sshvault password hosts set --yes", r)
+    check(account, r, 0, "password hosts set --yes")
+    assert reread() == ["ssh://" + c]
+    r = sv(home, "--nointeraction", "password", "hosts", "list", "--id", iid)
+    check(account, r, 0, "password hosts list")
+    assert r.stdout == "it-add@%s\n" % c
+    text = open(os.path.join(home["env"]["HOME"], ".ssh", "sshvault", "config")).read()
+    assert "--id %s --host %s\"" % (iid, c) in text and "--host %s\"" % a not in text and secret not in text
 
 
 def check_uninstall(account, home, report):

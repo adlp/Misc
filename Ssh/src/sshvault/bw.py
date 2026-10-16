@@ -33,7 +33,7 @@ import termios
 from typing import Callable, Optional
 
 from .backend import (FORWARD_FIELD, HOSTS_FIELD, BackendError, BackendNotFound, ItemNotFound, LoginItem, LogoutUnknown,
-                      NotLoggedIn, login_hosts, ssh_scheme,
+                      NotLoggedIn, login_hosts, parse_ssh_uri, ssh_scheme,
                       PasswordRefused, Prompt, SshKeyItem, VaultBackend, VaultError, VaultLocked, VaultStatus, WriteFailed,
                       normalize_fingerprint, normalize_hosts, parse_hosts)
 from .fsutil import ensure_dir, exe_problem, exposure_warning
@@ -211,6 +211,7 @@ class BwBackend(VaultBackend):
         #: éléments identifiant de la dernière lecture du coffre (sans mot de passe) : une
         #: régénération après `list_ssh_keys` n'appelle pas bw une seconde fois
         self._logins: Optional[list] = None
+        self._every_login: list = []
 
     @property
     def exe(self) -> str:
@@ -736,7 +737,10 @@ class BwBackend(VaultBackend):
             ignored = tuple(u for u in ignored if ssh_scheme(u))
             if not ignored:
                 return None
-        return LoginItem(id=str(d.get("id") or ""), name=str(d.get("name") or ""), hosts=hosts, ignored=ignored)
+        username = login.get("username")
+        return LoginItem(id=str(d.get("id") or ""), name=str(d.get("name") or ""), hosts=hosts, ignored=ignored,
+                         username=username if isinstance(username, str) and username else None,
+                         ssh_uris=tuple(_valid_ssh_uris(d)))
 
     def list_vault(self, prompt: Optional[Prompt] = None) -> tuple:
         """(clés SSH, éléments identifiant) en un seul `bw list items`, triés par nom puis id."""
@@ -747,20 +751,25 @@ class BwBackend(VaultBackend):
             raise BackendError("erreur bw : « list items » n'a pas renvoyé de liste")
         items = [it for it in (self._item(d) for d in data) if it is not None]
         logins = [it for it in (self._login(d) for d in data) if it is not None]
+        # tous les identifiants (type 1), même sans URI ssh: : choisis par id (password hosts --id)
+        every = [_login_item(d) for d in data
+                 if isinstance(d, dict) and d.get("type") == LOGIN_TYPE and isinstance(d.get("login"), dict)]
         del data
         logins.sort(key=lambda i: (i.name.casefold(), i.id))
-        self._logins = logins
+        every.sort(key=lambda i: (i.name.casefold(), i.id))
+        self._logins, self._every_login = logins, every
         return sorted(items, key=lambda i: (i.name.casefold(), i.id)), list(logins)
 
     def list_ssh_keys(self, prompt: Optional[Prompt] = None) -> list:
         return self.list_vault(prompt)[0]
 
-    def list_logins(self, prompt: Optional[Prompt] = None) -> list:
+    def list_logins(self, prompt: Optional[Prompt] = None, every: bool = False) -> list:
         """Éléments identifiant ; ceux de la dernière lecture du coffre par ce backend s'il y en a eu
-        une (même commande), sinon un `bw list items`."""
-        if self._logins is not None:
-            return list(self._logins)
-        return self.list_vault(prompt)[1]
+        une (même commande), sinon un `bw list items`. `every` : tous les identifiants (type 1),
+        même sans URI `ssh:` (sans hôte)."""
+        if self._logins is None:
+            self.list_vault(prompt)
+        return list(self._every_login if every else self._logins)
 
     def get_login(self, item_id: str, prompt: Optional[Prompt] = None):
         """Un seul `bw get item` (cache local) : (élément identifiant, mot de passe en octets)."""
@@ -980,6 +989,155 @@ class BwBackend(VaultBackend):
         raise AssertionError("inaccessible")
 
 
+    # --- écriture des éléments identifiant (CAP-11) ---------------------------------------------
+
+    def create_login(self, name: str, username, password: str, uris, prompt: Optional[Prompt] = None,
+                     existing=None, extra_fields=()) -> LoginItem:
+        """Crée l'élément identifiant (sur stdin de `bw create`), le relit et le compare (nom,
+        utilisateur, mot de passe, URI). Échec ou blocage de `bw create` : `sync`, puis recherche
+        d'un élément identifiant de même nom et mêmes URI absent de `existing` (None : lus dans le
+        cache local avant la création). Trouvé : vérifié, succès. Absent : rejeu une seule fois.
+        Le mot de passe n'apparaît dans aucun message."""
+        uris = list(uris)
+        for u in uris:
+            if parse_ssh_uri(u) is None:
+                raise BackendError("URI refusée avant écriture : %s" % _clean(u))
+        item = new_login_item(name, username, password, uris, extra_fields)
+        try:
+            if existing is None:
+                existing = [str(d.get("id") or "") for d in self._list_raw(prompt) if _same_login(d, name, uris)]
+            known = set(existing)
+            label = _clean(name)
+            check = "vérifier par « %s » puis « sshvault password list%s »" % (self.cmd("sync"), self.hint)
+            try:
+                return self._create_login_checked(item, label, uris, known, prompt, check)
+            except BaseException as e:
+                if not isinstance(e, Exception):
+                    # interruption pendant bw create ou la relecture : la création a pu passer
+                    self.warnings.append("« %s » : création peut-être passée : %s" % (label, check))
+                raise
+        finally:
+            del item
+
+    def _create_login_checked(self, item, label, uris, known, prompt, check) -> LoginItem:
+        for attempt in (1, 2):
+            try:
+                created = self.create_item(item, prompt)
+                failure = None
+            except BackendError as e:  # code d'erreur, réponse illisible, délai dépassé
+                failure = e
+            if failure is None:
+                iid = created["id"]
+                del created
+                try:
+                    after = self.get_item(iid, prompt)
+                except VaultError as e:
+                    raise WriteFailed("« %s » : bw create a réussi (id %s), relecture impossible (%s) : état inconnu, "
+                                      "%s" % (label, iid, e, check)) from None
+                diff = _login_diff(after, item)
+                if diff:
+                    raise WriteFailed("« %s » : bw create a réussi (id %s) mais l'élément relu diffère (%s) : %s"
+                                      % (label, iid, diff, self._delete_login_hint(iid)))
+                return _login_item(after)
+            # Échec ou blocage : la création a pu passer côté serveur. État réel relu (sync, puis
+            # recherche par nom et URI) avant tout rejeu, jamais de doublon.
+            what = "« %s » : création en échec (%s)" % (label, failure)
+            try:
+                self._with_session(["sync"], "sync", prompt, attempts=2)
+                found = [d for d in self._list_raw(prompt) if _same_login(d, item["name"], uris)
+                         and str(d.get("id") or "") not in known]
+            except VaultError as e:
+                raise WriteFailed("%s ; relecture impossible (%s) : état inconnu, %s" % (what, e, check)) from None
+            if len(found) > 1:
+                raise WriteFailed("%s ; %d éléments identifiant nouveaux portent ce nom et ces URI (%s) : rien rejoué, "
+                                  "%s" % (what, len(found), ", ".join(str(d.get("id")) for d in found), check))
+            if found:
+                diff = _login_diff(found[0], item)
+                if diff:
+                    raise WriteFailed("%s ; élément créé malgré l'erreur (id %s) mais différent (%s) : rien rejoué ; "
+                                      "%s" % (what, found[0].get("id"), diff, self._delete_login_hint(found[0].get("id"))))
+                return _login_item(found[0])  # créé malgré l'erreur : vérifié à la relecture
+            if attempt == 2:
+                raise WriteFailed("%s, deux fois ; état relu : élément absent du coffre" % what)
+        raise AssertionError("inaccessible")
+
+    def _delete_login_hint(self, iid) -> str:
+        """Remède d'un élément créé mais différent : commande exacte, à coller, qui le supprime avec
+        les données de bw de ce compte (bw demande le mot de passe maître)."""
+        import shlex
+        cmd = "BITWARDENCLI_APPDATA_DIR=%s %s delete item %s" % (shlex.quote(self.appdata), shlex.quote(self.exe),
+                                                                  shlex.quote(str(iid)))
+        return ("supprimer l'élément %s (interface web, ou « %s ») avant de relancer la commande"
+                % (_clean(str(iid)), _clean(cmd)))
+
+    def set_login_uris(self, item_id: str, uris, prompt: Optional[Prompt] = None) -> LoginItem:
+        """URI `ssh://` valides de l'élément identifiant remplacées par `uris` ; tout le reste gardé
+        (mêmes règles d'écriture que `set_hosts`)."""
+        want = list(uris)
+        for u in want:
+            if parse_ssh_uri(u) is None:
+                raise BackendError("URI refusée avant écriture : %s" % _clean(u))
+        before = self.get_item(item_id, prompt)
+        try:
+            if before.get("type") != LOGIN_TYPE or not isinstance(before.get("login"), dict):
+                raise ItemNotFound("élément %s : pas un identifiant" % item_id)
+            name = _clean(str(before.get("name") or item_id))
+            new = with_login_uris(before, want)
+            if new == before:
+                return _login_item(before)
+            check = "vérifier par « %s » puis « sshvault password hosts list%s --id %s »" % (self.cmd("sync"),
+                                                                                          self.hint, item_id)
+            try:
+                return self._write_login(item_id, name, before, new, want, prompt, check)
+            except Exception:
+                raise
+            except BaseException:
+                # Ctrl-C, SIGTERM… pendant bw edit ou la relecture : l'écriture a pu passer.
+                self.warnings.append("hôtes de « %s » : écriture peut-être passée : %s" % (name, check))
+                raise
+        finally:
+            del before
+
+    def _write_login(self, item_id, name, before, new, want, prompt, check) -> LoginItem:
+        for attempt in (1, 2):
+            try:
+                self.edit_item(item_id, new, prompt)
+                failure = None
+            except BackendError as e:  # code d'erreur, réponse illisible, délai dépassé
+                failure = e
+            if failure is None:
+                try:
+                    after = self.get_item(item_id, prompt)
+                except VaultError as e:
+                    raise WriteFailed("hôtes de « %s » : bw edit a réussi, relecture impossible (%s) : état inconnu, "
+                                      "%s" % (name, e, check)) from None
+                if not _login_written(after, before, want):
+                    raise WriteFailed("hôtes de « %s » : bw edit a réussi mais l'élément relu diffère (URI ssh:// "
+                                      "relues : %s)" % (name, _fmt(_valid_ssh_uris(after))))
+                return _login_item(after)
+            # Échec ou blocage : l'écriture a pu passer. Relecture de l'état réel (sync, puis get)
+            # avant de décider ; rejeu une seule fois, et seulement si l'élément n'a pas changé.
+            failed = "hôtes de « %s » : écriture en échec (%s)" % (name, failure)
+            try:
+                self._with_session(["sync"], "sync", prompt, attempts=2)
+                after = self.get_item(item_id, prompt)
+            except VaultError as e:
+                raise WriteFailed("%s ; relecture impossible (%s) : état inconnu, %s" % (failed, e, check)) from None
+            if _login_written(after, before, want):
+                return _login_item(after)  # écrit malgré l'erreur : vérifié à la relecture
+            unchanged = (after.get("revisionDate") == before.get("revisionDate")
+                         and _valid_ssh_uris(after) == _valid_ssh_uris(before))
+            if not unchanged:
+                raise WriteFailed("%s ; l'élément a changé dans le coffre (URI ssh:// relues : %s) : rien rejoué ; "
+                                  "lancer « %s » puis relancer la commande"
+                                  % (failed, _fmt(_valid_ssh_uris(after)), self.cmd("sync")))
+            if attempt == 2:
+                raise WriteFailed("%s, deux fois ; état relu : élément inchangé (URI ssh:// : %s)"
+                                  % (failed, _fmt(_valid_ssh_uris(after))))
+            before, new = after, with_login_uris(after, want)
+        raise AssertionError("inaccessible")
+
+
 def _fmt(hosts) -> str:
     return ",".join(_clean(h) for h in hosts) or "aucun"
 
@@ -1081,3 +1239,150 @@ def with_hosts(item: dict, hosts: tuple, field: str = HOSTS_FIELD) -> dict:
     if out != old:
         new["fields"] = out
     return new
+
+
+# --- éléments identifiant (CAP-11) -----------------------------------------------------------------
+
+def _uri_entries(item: dict) -> list:
+    login = item.get("login") if isinstance(item, dict) else None
+    uris = login.get("uris") if isinstance(login, dict) else None
+    return uris if isinstance(uris, list) else []
+
+
+def _uris_of(item: dict) -> list:
+    """URI (texte) de l'élément identifiant, dans l'ordre."""
+    return [u.get("uri") for u in _uri_entries(item) if isinstance(u, dict) and isinstance(u.get("uri"), str)]
+
+
+def _valid_ssh_uris(item: dict) -> list:
+    """URI `ssh://` valides de l'élément, telles qu'écrites (port compris), dans l'ordre."""
+    return [u for u in _uris_of(item) if parse_ssh_uri(u) is not None]
+
+
+def _login_item(d: dict) -> LoginItem:
+    """Élément identifiant relu, même sans URI `ssh://` (toutes retirées par `set ""`)."""
+    it = BwBackend._login(d)
+    if it is not None:
+        return it
+    login = d.get("login") if isinstance(d.get("login"), dict) else {}
+    username = login.get("username")
+    return LoginItem(id=str(d.get("id") or ""), name=str(d.get("name") or ""),
+                     username=username if isinstance(username, str) and username else None)
+
+
+def _same_login(d, name: str, uris: list) -> bool:
+    return (isinstance(d, dict) and d.get("type") == LOGIN_TYPE and (d.get("name") or "") == name
+            and _uris_of(d) == list(uris))
+
+
+def _login_diff(after: dict, item: dict) -> str:
+    """Ce qui diffère entre l'élément identifiant relu et celui demandé (nom, utilisateur, mot de
+    passe, URI) ; "" si rien. Jamais la valeur du mot de passe dans le message."""
+    if after.get("type") != LOGIN_TYPE or not isinstance(after.get("login"), dict):
+        return "pas un identifiant"
+    got, want = after["login"], item["login"]
+    bad = []
+    if (after.get("name") or "") != (item.get("name") or ""):
+        bad.append("nom")
+    if (got.get("username") or "") != (want.get("username") or ""):
+        bad.append("utilisateur")
+    if (got.get("password") or "") != (want.get("password") or ""):
+        bad.append("mot de passe")
+    if _uris_of(after) != _uris_of(item):
+        bad.append("URI relues : %s" % _fmt(_uris_of(after)))
+    return ", ".join(bad)
+
+
+def _login_others(item: dict) -> tuple:
+    """Ce qu'une écriture des URI `ssh://` ne doit pas changer : type, nom, notes, champs, dossier,
+    favori, nouvelle demande du mot de passe maître, organisation, collections, historique des mots
+    de passe, utilisateur, mot de passe, TOTP, passkeys, autres URI (web, `ssh:` invalides : texte
+    et `match`) dans l'ordre. null et "" confondus."""
+    def v(x):
+        return "" if x is None else x
+    login = item.get("login") if isinstance(item.get("login"), dict) else {}
+    fields = [(v(f.get("name")), v(f.get("value")), f.get("type")) if isinstance(f, dict) else f
+              for f in (item.get("fields") or [])]
+    others = [(u.get("uri"), u.get("match")) if isinstance(u, dict) else u for u in _uri_entries(item)
+              if not (isinstance(u, dict) and parse_ssh_uri(u.get("uri")) is not None)]
+    return (item.get("type"), v(item.get("name")), v(item.get("notes")), fields, v(item.get("folderId")),
+            bool(item.get("favorite")), item.get("reprompt") or 0, v(item.get("organizationId")),
+            item.get("collectionIds") or [], item.get("passwordHistory") or [], v(login.get("username")),
+            v(login.get("password")), v(login.get("totp")), login.get("fido2Credentials") or [], others)
+
+
+def _ssh_entries(item: dict) -> list:
+    """(texte, `match`) des URI `ssh://` valides, dans l'ordre."""
+    return [(u.get("uri"), u.get("match")) for u in _uri_entries(item)
+            if isinstance(u, dict) and parse_ssh_uri(u.get("uri")) is not None]
+
+
+def _login_written(after: dict, before: dict, want: list) -> bool:
+    """URI `ssh://` relues = `want`, chacune avec le `match` attendu (celui d'avant pour une URI
+    gardée), et tout le reste comme avant."""
+    return (_valid_ssh_uris(after) == list(want) and _ssh_entries(after) == _ssh_entries(with_login_uris(before, want))
+            and _login_others(after) == _login_others(before))
+
+
+def with_login_uris(item: dict, want: list) -> dict:
+    """Copie de l'élément identifiant où seules les URI `ssh://` valides changent, remplacées par
+    `want` (dans l'ordre). Si `want` garde des URI actuelles dans leur ordre puis en ajoute de
+    nouvelles (add, remove), chaque URI gardée reste à sa place et les nouvelles suivent la
+    dernière URI `ssh://` valide ; sinon (set qui réordonne) toute la liste prend la place de la
+    première. Une URI gardée reprend son entrée d'origine (`match` compris). Autres URI et tout
+    le reste tels que bw les a rendus (revisionDate compris)."""
+    new = copy.deepcopy(item)
+    login = new["login"]
+    old = _uri_entries(item)
+    valid = [n for n, u in enumerate(old) if isinstance(u, dict) and parse_ssh_uri(u.get("uri")) is not None]
+    # préfixe de `want` pris dans l'ordre parmi les URI actuelles, puis seulement des nouvelles ?
+    kept, pos = set(), 0
+    for w in want:
+        k = next((i for i in range(pos, len(valid)) if old[valid[i]].get("uri") == w), None)
+        if k is None:
+            break
+        kept.add(valid[k])
+        pos = k + 1
+    tail = list(want[len(kept):])
+    inplace = all(t not in [old[n].get("uri") for n in valid] for t in tail)
+    out = []
+    if inplace:
+        last = valid[-1] if valid else None
+        for n, u in enumerate(old):
+            if n not in valid or n in kept:
+                out.append(copy.deepcopy(u))
+            if n == last:
+                out.extend({"match": None, "uri": t} for t in tail)
+        if last is None:
+            out.extend({"match": None, "uri": t} for t in tail)
+    else:
+        pool = [old[n] for n in valid]
+
+        def entry(uri):
+            for n, u in enumerate(pool):
+                if u.get("uri") == uri:
+                    return copy.deepcopy(pool.pop(n))
+            return {"match": None, "uri": uri}
+        placed = False
+        for n, u in enumerate(old):
+            if n in valid:
+                if not placed:
+                    out.extend(entry(w) for w in want)
+                    placed = True
+                continue
+            out.append(copy.deepcopy(u))
+    if out != old:
+        login["uris"] = out
+    return new
+
+
+def new_login_item(name: str, username, password: str, uris: list, extra_fields=()) -> dict:
+    """Élément « identifiant » à créer, sur le modèle de `bw get template item` et `item.login`
+    (2026.9.1) : utilisateur, mot de passe, URI `ssh://` ; champs texte en plus (tests)."""
+    fields = [{"name": n, "value": v, "type": 0, "linkedId": None} for n, v in extra_fields]
+    return {"passwordHistory": [], "revisionDate": None, "creationDate": None, "deletedDate": None,
+            "organizationId": None, "collectionIds": None, "folderId": None, "type": LOGIN_TYPE,
+            "name": name, "notes": None, "favorite": False, "fields": fields,
+            "login": {"fido2Credentials": [], "uris": [{"match": None, "uri": u} for u in uris],
+                      "username": username, "password": password, "totp": None},
+            "secureNote": None, "card": None, "identity": None, "sshKey": None, "reprompt": 0}

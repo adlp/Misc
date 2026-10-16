@@ -144,9 +144,43 @@ def parse_ssh_uri(uri) -> Optional[tuple]:
             return None
         from urllib.parse import unquote
         user = unquote(raw_user)
-        if not user or any(c.isspace() or ord(c) < 0x20 or 0x7f <= ord(c) <= 0x9f for c in user):
+        if _bad_user(user, colon=False):  # `:` écrit refusé plus haut (mot de passe dans l'URI)
             return None
     return host.lower(), user
+
+
+def _bad_user(user: str, colon: bool = True) -> bool:
+    """Utilisateur refusé : vide, blanc, caractère de contrôle, ou `:` (avec `colon`)."""
+    return (not user or (colon and ":" in user)
+            or any(c.isspace() or ord(c) < 0x20 or 0x7f <= ord(c) <= 0x9f for c in user))
+
+
+def check_login_user(user: str) -> str:
+    """Utilisateur attendu donné par l'utilisateur (`--user`, `user@hôte`) ; InvalidHost (code 2)."""
+    if not isinstance(user, str) or _bad_user(user):
+        raise InvalidHost("utilisateur invalide : %r (ni vide, ni blanc, ni caractère de contrôle, ni « : »)" % user)
+    return user
+
+
+def parse_login_host(spec: str) -> tuple:
+    """`[user@]hôte` donné par l'utilisateur → (hôte en minuscules, utilisateur ou None) ; hôte
+    littéral (lettres, chiffres, `.`, `-`, `_`, sans `-` en tête), jamais de port ; utilisateur
+    jusqu'au dernier `@`. InvalidHost (code 2) sinon."""
+    spec = (spec or "").strip()
+    user, at, host = spec.rpartition("@")
+    if not LOGIN_HOST_RE.fullmatch(host):
+        raise InvalidHost("hôte invalide : %r ([utilisateur@]hôte ; hôte : lettres, chiffres, « . », « - », « _ », "
+                          "sans motif ni port)" % spec)
+    return host.lower(), (check_login_user(user) if at else None)
+
+
+def login_uri(host: str, user: Optional[str] = None) -> str:
+    """URI écrite pour (hôte, utilisateur) : `ssh://hôte` ou `ssh://user@hôte`, utilisateur encodé,
+    jamais de port."""
+    if user is None:
+        return "ssh://%s" % host
+    from urllib.parse import quote
+    return "ssh://%s@%s" % (quote(user, safe=""), host)
 
 
 def ssh_scheme(uri) -> bool:
@@ -187,6 +221,10 @@ class LoginItem:
     #: URI ignorées (autre forme ou autre schéma), telles que dans l'élément
     ignored: tuple = field(default_factory=tuple)
     account: Optional[str] = None
+    #: `login.username` de l'élément (utilisateur des URI sans `user@`), None s'il est vide
+    username: Optional[str] = field(default=None, compare=False)
+    #: URI `ssh://` valides telles qu'écrites dans l'élément (port compris), dans l'ordre
+    ssh_uris: tuple = field(default_factory=tuple, compare=False)
 
     def host_names(self) -> tuple:
         out = []
@@ -316,9 +354,10 @@ class VaultBackend(abc.ABC):
         return found[0], self.get_private_key(item_id, prompt)
 
     @abc.abstractmethod
-    def list_logins(self, prompt: Optional[Prompt] = None) -> list:
+    def list_logins(self, prompt: Optional[Prompt] = None, every: bool = False) -> list:
         """Éléments « identifiant » à URI `ssh://` (CAP-11) : LoginItem, sans le mot de passe ;
-        un élément dont seules des URI `ssh:` invalides existent est rendu sans hôte (`ignored`)."""
+        un élément dont seules des URI `ssh:` invalides existent est rendu sans hôte (`ignored`).
+        `every` : tous les éléments identifiant, même sans URI `ssh:`."""
 
     @abc.abstractmethod
     def get_login(self, item_id: str, prompt: Optional[Prompt] = None):
@@ -350,3 +389,20 @@ class VaultBackend(abc.ABC):
         après un échec, l'état du serveur est relu (recherche par empreinte d'un élément absent
         de `existing`, les ids qui la portaient déjà) avant tout rejeu, sans doublon.
         Renvoie l'élément relu ; WriteFailed si la création n'aboutit pas ou ne se relit pas."""
+
+    @abc.abstractmethod
+    def create_login(self, name: str, username: Optional[str], password: str, uris: Sequence[str],
+                     prompt: Optional[Prompt] = None, existing: Optional[Iterable[str]] = None,
+                     extra_fields: Sequence[tuple] = ()) -> LoginItem:
+        """Crée un élément « identifiant » (CAP-11) : `login.username`, `login.password` (jamais
+        en argument ni dans un message), URI `uris` (`ssh://…`, dans l'ordre), le relit et le
+        compare (nom, utilisateur, mot de passe, URI). Échec ou blocage : état du serveur relu
+        (élément identifiant de même nom et mêmes URI absent de `existing`) avant un rejeu
+        unique, sans doublon. Renvoie l'élément relu ; WriteFailed sinon."""
+
+    @abc.abstractmethod
+    def set_login_uris(self, item_id: str, uris: Sequence[str], prompt: Optional[Prompt] = None) -> LoginItem:
+        """Remplace les URI `ssh://` valides de l'élément identifiant par `uris` (dans l'ordre) ;
+        nom, notes, champs, utilisateur, mot de passe, TOTP et autres URI (web, `ssh:` invalides)
+        gardés tels quels. Relu et comparé ; rejeu unique si l'élément relu n'a pas changé.
+        Renvoie l'élément relu ; ItemNotFound, WriteFailed sinon."""
