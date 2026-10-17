@@ -1,5 +1,59 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.206 — Aide simplifiée — 2026-10-17
+
+Chantier « reconstruction progressive », story 93 (demande de l'utilisateur). Mesuré sur 1.0.205 : `-h` de 110 lignes à
+plat, `DiffTop` absent, textes sans accents ; `-H` n'annonçait que 7 commandes (dont deux noms inconnus de `-c`), aucune fiche
+n'avait d'exemple, `-H DiffTop` et `-H LstBkpFls` répondaient « Desole pas de documentation » ; `usage()` sortait toujours
+en 1 (`sys.exit(1)` en fin de fonction) — aide réussie, erreur d'arguments, getopt invalide et argument parasite compris ;
+messages illisibles (`p`, `r`, `step2f`, « Mais comment on peut en arriver la ? ») ; `Login -n <nick> -r x` sans `-p`
+réécrivait la section du nick dans le fichier de conf AVANT de signaler l'option manquante.
+
+- **`-h`** (stdout) : les 36 commandes, une ligne chacune, en sept groupes (SAUVEGARDE ; CONSULTATION ET RESTAURATION ;
+  INDEX ET RECHERCHE ; RAPPORTS ET ÉTAT ; BASES LOCALES ; CONNEXION ; DIAGNOSTIC), ⚡ sur Prune, DelBkp, IdxPurge ; options
+  communes ; renvoi « Fiche détaillée avec exemples : borgHelper -H <commande> ». 54 lignes, 92 colonnes au plus. Code 0.
+- **`-H <commande>`** (stdout) : fiche pour chaque commande — titre, Syntaxe, Options (une par ligne, exactement celles que
+  la commande accepte), Description (détails longs repris des anciennes fiches et vérifiés dans le code), 2 à 4 exemples
+  commentés. Nom insensible à la casse ; `ListBkp`, `ListBkpFiles`, `listbkpfls` acceptés. Code 0 ; nom inconnu ou vide :
+  `[ERREUR] pas de fiche pour <nom>` (`''` si vide) + liste des fiches, code 2. Corrections au passage : TreeFind `-m`
+  facultatif (défaut `*`) ; FileHist sans `-b` : dernière archive indexée (tout l'historique : `-b ALL`) ; DiffBkp `-w`
+  accepté sans effet ; DuIdx `-R` : un JSON `{borghelper_version,pattern,rows}` ; RepoHistory/ArchiveHistory : plusieurs
+  nicks sans `-j`, un seul avec ; variable Sentry `BORGHELPERC_SENTRY_DSN` (l'aide citait `BORGHELPERC_SENTRY_ID`, jamais
+  lue) ; fiches qui citent des codes : « code 2 aussi : erreur d'arguments ».
+- **Erreur d'arguments** (stderr) : `[ERREUR] <Commande> : <message>`, la syntaxe de la commande, `  détail : borgHelper -H
+  <Commande>`, code 2 (avant : 1) — option manquante (`-f <chemin> obligatoire`…), refusée (`option -f non acceptée`),
+  réservée (`--rebuild réservé à Index`), getopt (`option -Z inconnue`, `option --h ambiguë`…), argument en trop, valeurs
+  d'Index (`-t`, `-T`, tranche incompatible), `-j` sur plusieurs nicks. Nouveaux refus (avant : trace Python, code 1) :
+  `-N`/`-p` non entiers (Report, IdxTop, DiffTop), DiffBkp `-b` à plus de deux archives. CodecSelfTest et PerfBench
+  refusent les options qui ne sont pas les leurs (avant : ignorées) et donnent leurs erreurs de valeur dans ce format
+  (« motif vide refusé », « motif invalide », « -n invalide » ; avant : leur propre ligne, code 2). `-c` inconnu (même avec
+  une option ou un argument en trop) : `[ERREUR] commande inconnue : <nom>` + `  commandes : borgHelper -h`, code 2 ; sans
+  `-c` : aide globale sur stderr, code 2.
+- **Avant toute écriture** : toutes ces vérifications passent avant la création du dossier de cache, la porte d'autorité des
+  dépôts externes (code 4) et la première écriture — Login ne réécrit plus le fichier de conf quand `-p` ou `-r` manque
+  (avec ou sans `-k`). Pour `-j` avec `-n ALL`, la liste des nicks est lue dans le rc (lecture seule). Analyse des options
+  inchangée (`_CLI_OPTAB`, mêmes règles).
+- **DelBkp** : seul `-b last` exact est refusé ; un nom d'archive qui contient « last » est désormais accepté (avant : refusé),
+  en CLI comme par `DELETE /delbkp` (décision de l'utilisateur). `-b` vide ou blanc refusé (code 2), en CLI et dans
+  `BorgHelper.delbkp` avant tout verrou et tout borg — mesuré sur 1.0.205 : `-b ''` lançait `borg delete ::`, qui demandait
+  de supprimer le DÉPÔT ENTIER (arrêté seulement par la question YES de borg, faute de terminal). Nom littéral pour borg :
+  accolades doublées dans `borg delete ::<nom>` (mesuré sur 1.0.206 avant ce correctif : `-b '{user:.0}'` ou `'{now:%n}'`,
+  marqueurs remplacés par borg, donnaient `::` — même question) ; nom non chaîne (bibliothèque) ou avec un caractère de
+  contrôle (saut de ligne, tabulation, NUL…) refusé, code 2. Login : `-r` vide ou blanc refusé.
+- **Login** : `-p`, `-r`, les noms `-n`/`-s` (règles de `_valid_nick_name` : ni `ALL`, ni liste, ni caractère spécial) et la
+  présence du fichier `-k` sont vérifiés avant toute écriture (avant : section du nick réécrite, puis refus ; `-n ALL`
+  étendu au nick du rc).
+- **Exemples** : Search `-f 'etc/nginx*'` et IdxPurge `-x var/log` (sans `/` initial : les chemins de l'index n'en ont pas ;
+  Search, DuIdx et IdxPurge ne le retirent pas — mesuré ; FileHist, TreeHist, TreeFind si). Argument parasite : conseil
+  `-n <nick>` seulement si la commande accepte `-n`.
+- borgHelperWWW non modifié : quatre routes peuvent tomber dans une erreur d'arguments (`DELETE /delbkp` avec `bid=last` ou
+  vide, `/diffbkp` avec une virgule dans un `bid` — avant : trace, code 1 —, /repohistory et /archivehistory sur plusieurs
+  nicks) — toujours 400 ; le corps porte `exitcode` 2 et le nouveau message ; les deux routes d'historique ne mettent plus
+  cette erreur en cache.
+- CodecSelfTest : dix contrôles « aide : … » (dont DelBkp `-b` vide : CLI et bibliothèque, aucun borg, aucun verrou) (table et groupes, ⚡, options, Syntaxe et Description, exemples analysés, `-h`,
+  `-H`, `-H` inconnu, `-c` absent ou inconnu, erreurs d'arguments par `_cli_main`, aucune écriture avant l'erreur) ;
+  RepoHistory/ArchiveHistory `-j` multi-nicks et la CLI d'Index exigent désormais le code 2 (et le texte de l'erreur).
+
 ## borgHelper 1.0.205, borgHelperWWW 1.31.19, UI 1.24.2 — Mesures jamais faites — 2026-10-17
 
 Chantier « reconstruction progressive », story 84 (reports D149, D155, D171, D198). Quatre mesures faites (borgHelper

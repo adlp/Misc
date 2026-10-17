@@ -17,6 +17,57 @@ borgHelper est structuré en trois couches :
 | `BorgRunner` | Subprocess borg + lecture/écriture borghelperrc |
 | `BorgHelper` | Services haut niveau — orchestre DB et Borg |
 
+### Aide et erreurs d'arguments (1.0.206, story 93)
+
+Une seule table, `_HELP` (une entrée par commande : nom affiché, groupe, description courte, syntaxe, options, description
+longue facultative, exemples, ⚡ si la commande supprime des données), d'où sont tirées les trois sorties : aide globale
+`_help_global_lines` (`-h`, groupes `_HELP_GROUPS`, une ligne par commande), fiche `_help_fiche_lines` (`-H`, nom résolu par
+`_help_lookup` : casse ignorée, anciens noms de `_HELP_ALIASES`) et erreur d'arguments `_usage_error(cmd, msg)` (`[ERREUR]
+<Commande> : <msg>`, ses lignes de syntaxe, `détail : borgHelper -H <Commande>`, code 2). `usage()` n'existe plus ;
+`BorgHelper.prune` appelle `_usage_error('prune', …)` sur sa branche inatteignable (KEEP_* vérifiées avant). `-h` et une
+fiche s'écrivent sur stdout (décision 5) ; erreurs et aide globale d'une erreur (sans `-c`, getopt sans `-c`) sur stderr.
+Nom vide (`-H ''`, `-c ''`) affiché `''` (`_shown`).
+
+Analyse des arguments, sortie de `_cli_main` (règles des options inchangées ; ajouts 1.0.206 dits ci-dessous) : `_CLI_SHORTOPTS`/`_CLI_LONGOPTS` (getopt),
+`_CLI_OPTAB` (options par commande, seule source), `_CLI_LONG_OWNER` (`--rebuild` : Index ; `--keys`/`--history` :
+BorgCleanup), `_cli_options` (option refusée -> `_CliArgError`), `_cli_required` (options obligatoires et combinaisons :
+Login `-p`/`-r`, noms `-s`/`-n` (`_valid_nick_name`) et fichier `-k` présent, Restore `-f` et `-w`/`-W` sans `-L`, DelBkp `-b` (ni vide ni blanc), Search/FileHist `-f`, tranche d'Index, `-t`,
+`-T` ; ajoutés en 1.0.206 : `-N`/`-p` entiers de Report/IdxTop/DiffTop, DiffBkp `-b` à une ou deux archives ; DelBkp : `-b last` exact seulement,
+décision 6). Ordre dans `_cli_main`, tout AVANT `BorgHelper()` (création du dossier de cache), la porte d'autorité (code 4)
+et la première écriture : getopt ; `-h`/`-H`/`-v` ; CodecSelfTest/PerfBench (`_CLI_EARLY`, décision 7 : `_cli_options` puis
+`_early_values_error`) ; commande inconnue ; `_cli_options` ; `_cli_required` ; `-j` d'un seul nick (IdxTop, DiffTop,
+RepoHistory, ArchiveHistory — `ALL` lu par `BorgRunner.cfgreadnicks`, lecture seule du rc). Le dispatch ne vérifie plus
+aucun argument (avant 1.0.206, Login réécrivait la section du nick avant de vérifier `-p`/`-r`, les noms et `-k` ; mesuré
+sur 1.0.205). `BorgHelper.delbkp` refuse aussi un nom vide ou blanc avant tout verrou et tout borg (`borg delete ::` = dépôt
+entier ; bibliothèque), ainsi qu'un nom non chaîne ou à caractère de contrôle (`_has_control_char`, aussi dans
+`_cli_required`) ; le nom passé à `borg delete` est rendu littéral par `_borg_literal` (accolades doublées : borg 1.2 remplace
+les marqueurs `{…}` de l'emplacement — `::{user:.0}` visait le dépôt entier ; `{{` redevient `{`, mesuré sur borg 1.2.6).
+Login : `-r` vide ou blanc refusé. Exemples des fiches : `_help_example_error` appelle `_cli_required(…, fs=False)` (sans le contrôle de
+`-k`, qui dépend de la machine).
+getopt en échec : commande lue par `_cli_guess_cmd` (dernier `-c`, options courtes groupées `-dcstats`/`-dc stats`) —
+inconnue : « commande inconnue » ; connue : erreur de cette commande ; aucune : `[ERREUR] <message>` + aide globale. Même
+règle pour un argument parasite. Messages de getopt en français (option inconnue, valeur attendue, sans valeur, ambiguë).
+
+Codes : `-h` et `-H <connue>` 0 ; `-H` inconnu, erreur d'arguments, `-c` inconnu ou absent 2 (avant : 1 pour toute aide et
+toute erreur d'arguments, getopt invalide et argument parasite compris — `usage()` sortait en 1 avant le `sys.exit(2)`).
+borgHelperWWW : statut HTTP inchangé (tout code non nul hors 4 -> 400), corps avec `exitcode` 2 et le nouveau message ;
+/repohistory et /archivehistory multi-nicks ne sont plus mis en cache (code 2, `[ERREUR]`).
+
+Contrôles CodecSelfTest « aide : … » : table = `_CLI_OPTAB` + `_CLI_EARLY` (36 entrées, chacune une fois dans `-h`, dans le
+groupe d'un oracle fixe {commande -> groupe}, ⚡ exactement sur Prune, DelBkp, IdxPurge) ; options de chaque fiche = options
+de la commande hors `-C -c -d -P` (longues comprises), chacune affichée, blocs Syntaxe et Description égaux à la table ;
+2 à 4 exemples, chacun accepté par `_help_example_error` (getopt, `_cli_options`, `_cli_required` ou `_early_values_error`,
+`-j` d'un seul nick) et affiché, avec des témoins refusés ; `-h`/`--help` (stdout, code 0, sept groupes dans l'ordre de
+l'aperçu A, <= 60 lignes, <= 100 colonnes, renvoi `-H`) ; `-H` (stdout, casse, alias, ⚡) ; `-H` inconnu ou vide (liste
+exacte des noms) ; sans `-c`, getopt sans `-c`, `-c` inconnu même avec `-Z` ou un argument, `-c ''` (rien créé) ; erreurs
+d'arguments par `_cli_main` (forme exacte des lignes, code 2 : options obligatoires, refusées, réservées, getopt, `-dcstats`,
+option longue ambiguë, argument parasite, Login, `-j` multi-nicks, `-N`/`-p`, DiffBkp, CodecSelfTest, PerfBench) ; avant
+toute écriture (Login : rc identique à l'octet, avec et sans `-k` ; dossier de cache jamais créé ; DelBkp `-b lastweek`
+accepté ; Login : `-n ALL`, liste, noms invalides, `-k` absent) ; DelBkp `-b` vide/blanc (CLI et bibliothèque, `BorgRunner.boex`
+remplacé par un journal : aucun borg, aucun verrou) ; aucun chemin d'exemple en `/…` pour Search, DuIdx, IdxPurge, Restore,
+LstBkpFls ; cas CodecSelfTest/PerfBench de `_hl_argerr` avec `codec_selftest`/`perf_bench` factices. Sortie vide : FAIL avec
+diagnostic, jamais une exception.
+
 ---
 
 ## Fichiers de données
@@ -299,7 +350,7 @@ complet, colonnes brutes, ordonné par `id` croissant : `{'borghelper_version','
 lecture bornée à `STATS_RETENTION_MONTHS` (1.0.127) : borne `SELECT datetime('now','-N months')` calculée une fois
 (1.0.192), puis deux requêtes — `rows` : `SELECT id,op,… FROM repo_stats WHERE nick=? AND updated_at >= ? ORDER BY id` ;
 `baseline` : `… AND updated_at < ? ORDER BY id DESC LIMIT 1` —, un seul nick à la fois (`nick=a,b`
-ou `ALL` sur plusieurs nicks rejeté par `usage(cmd)`), `{'error':...}` (jamais une exception) si
+ou `ALL` sur plusieurs nicks rejeté en erreur d'arguments, code 2 depuis 1.0.206), `{'error':...}` (jamais une exception) si
 `diff.db` n'existe pas encore. Depuis 1.0.192 (story 67) : clé `baseline` en plus, hors `rows` — ligne de plus grande
 `id` avant la borne (même forme qu'une ligne, `null` sinon) ; `rows` (`>=`) et `baseline` (`<`) comparent la même borne :
 jamais une même ligne dans les deux. `updated_at` est en UTC (`datetime('now')`), `archive_date` en heure locale (borg) : l'UI
@@ -2849,7 +2900,7 @@ avant le SIGTERM. `_record_index_last` (issue deadline/busy) écarte ces lignes 
 erreur, marque dite ou non), `_is_index_empty` (vraie erreur), `_codec_fail` et `_PerNick.__exit__` (nick isolé) ; fin du
 dispatch : commande de `_READER_CODE_CMDS` (liste explicite : search, filehist, treehist, treefind, duidx, idxtop, difftop,
 archivehistory, repohistory, cacheinfo, lstbkp, lstbkpfls — jamais `_CMD_OPS`, qui range tout le reste en « read ») et drapeau
-posé -> `sys.exit(1)` ; une sortie antérieure (`sys.exit`, `usage`) garde son code. Status (1.0.193, story 68, D148) : hors de
+posé -> `sys.exit(1)` ; une sortie antérieure (`sys.exit`, erreur d'arguments `_usage_error`) garde son code. Status (1.0.193, story 68, D148) : hors de
 cette liste — `status()` rend 1 si un nick finit en erreur (clé `error` de l'exception isolée, ou `last_backup.error` de
 `_status_one` : présence de la clé, jamais sa valeur — une exception au message vide rend `''`) ou si `_READER_FAILED` a
 augmenté pendant l'appel (valeur lue avant la boucle : `[ERREUR]` d'une lecture annexe, history.db, fantôme, marqueurs), 0

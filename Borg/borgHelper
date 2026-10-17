@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.205"
+Version="1.0.206"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -559,6 +559,16 @@ def _borg_glob_args(ftor):
     Vérifié sur borg 1.2.6 (démo : motif e1000 -> 4 fichiers sur 15 244 ; `/` de tête accepté)."""
     return [f'--pattern=+sh:{ftor}','--pattern=-sh:**']
 
+def _borg_literal(name):
+    """Nom d'archive littéral pour un emplacement borg (`::<nom>`) : borg 1.2 y remplace les marqueurs {…} (replace_placeholders,
+    str.format_map) — accolades doublées, « {{ » redevient « { » (mesuré sur borg 1.2.6 : `borg info ::srv-{{x}}` -> « Archive
+    srv-{x} does not exist » ; `::{user:.0}` -> le dépôt entier)."""
+    return name.replace('{','{{').replace('}','}}')
+
+def _has_control_char(s):
+    """Vrai si `s` contient un caractère de contrôle (C0 : saut de ligne, retour chariot, tabulation, NUL… ; DEL)."""
+    return any(ord(c)<32 or ord(c)==127 for c in s)
+
 def _borg_extract_args(bid,ftor):
     # 1.0.176 (story 39, A80, décision de l'utilisateur) : --numeric-ids (borg >= 1.2, déjà requis par `borg compact`) — avant
     # --numeric-owner, déprécié depuis borg 1.2 : « Warning: … Use --numeric-ids instead » à chaque extraction (code 0, mesuré)
@@ -1002,336 +1012,557 @@ def _lower_priority():
         try: subprocess.run([exe,'-c','3','-p',str(os.getpid())],capture_output=True,timeout=10)
         except (OSError,subprocess.SubprocessError): pass
 
-def usage(doc=None,debug=0):
-    if doc is None:
-        printer("   -H <Stats|Login|Mount|UMount|ListBkp|ListBkpFiles|Restore> [-C /root/.borghelperrc]")
-        printer("       Permet d'avoir les documentations detaillés des differentes commandes")
-        printer("   [-C /autre/.borghelperrc] [-P passphrase]  (combinable avec toute commande)")
-        printer("       -C : fichier de conf alternatif  |  -P : complète/supplante BORG_PASSPHRASE du fichier")
-        printer("       BORGHELPERC_RUNTIME_PASSPHRASE (env) : défaut de -P, invisible dans `ps aux` (préférer sur machine partagée)")
-        printer("   -c Stats [-n server-name/nickname]")
-        printer("       Liste les backup references, et le fait qu'ils soient mount ou pas")
-        printer("   -c Login [-s servername] [-n nickname] [-k keyfile.key] -p passphrase -r repo -m mountpoint")
-        printer("       n se log sur le serveur, utilise que si le serveur n'est pas referencé")
-        printer("   -c <Mount> [-n nickname/servername] [-b backupid/last/ALL]")
-        printer("       On monte le backup sur la derniere archive, ou celle precisée FS (BIEN Penser a demonter !!!)")
-        printer("   -c <UMount> [-n nickname/servername]")
-        printer("       On demonte le FS")
-        printer("   -c LstBkp [-n nickname/servername]")
-        printer("       On liste les backup connus")
-        printer("   -c LstBkpFls [-n nickname/servername] [-b backupid/last] [-j]")
-        printer("       On liste les fichiers d'un backup precis  |  -j : JSON")
-        printer("⚗️  -c Report [-n nickname/servername/ALL] [-N n] [-l] [-j] [-o]")
-        printer("       Rapport sur les backups  |  -l : HTML  |  -j : JSON  |  -N n : n dernières archives")
-        printer("       -o : mode offline (diff.db uniquement, aucun appel borg)")
-        printer("   -c DiffBkp [-n nickname/servername] [-b backupid] [-w where] [-j]")
-        printer("       Liste les mouvements des fichiers entre le backupid et le dernier backup  |  -j : JSON")
-        printer("   -c Restore [-n nickname/servername] [-b backupid/last] -f file2get -w where")
-        printer("       On lance la restauration")
-        printer("⚡️ -c DelBkp [-n nickname/servername] -b backupid")
-        printer("       ⚡️ On delete un backup sur le repo ⚡️ DANGER")
-        printer("   -c Init [-n nickname/servername]")
-        printer("       Initialisation du repo")
-        printer("   -c Bkp [-n nickname/servername] [-I]")
-        printer("       Lance un backup + indexation automatique (-I pour désactiver)")
-        printer("       stdout JSON enrichi : borgHelper_file_counts + borgHelper_files (debug)")
-        printer("   -c Key [-n nickname/servername/ALL]")
-        printer("       Exporte la clef du repo (format papier)")
-        printer("⚗️ ⚡️-c Prune [-n nickname/servername/ALL]")
-        printer("      ⚡️ On delete les vieux backup sur le repo ⚡️ DANGER")
-        printer("      Purge automatique du diff.db (archives supprimées)")
-        printer("   -c Index [-n nickname/servername/ALL] [-F] [-S] [-A archive]")
-        printer("       Indexe les diffs entre archives consécutives + snapshot de la dernière archive")
-        printer("       Parallèle par défaut (IDX_WORKERS=4 dans borghelperrc)")
-        printer("       -F : force la réindexation  |  -S : snapshot seul (sans recalculer les diffs)")
-        printer("       -A <archive> : réindexe uniquement la paire dont archive_new=<archive>")
-        printer("       [-t durée] [-T stats,snap,diff] [-b archive|date] [-B archive|date] : tranche pour cron")
-        printer("       (budget par nick, reprenable, priorité basse) — voir -H Index")
-        printer("       --rebuild [-F] : reconstruction dans un fichier fantôme, bascule à la fin — voir -H Index")
-        printer("       IndexSnap s'auto-répare : un type manquant (colonne snapshot_file.type) force un")
-        printer("       resnapshot complet automatique une fois (au prochain Bkp/Index), sans -F manuel")
-        printer("   -c Search -f <pattern> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-j]")
-        printer("       Cherche dans l'index des diffs par nom de fichier (glob * et ?)")
-        printer("       -b : depuis archive X  |  -B : jusqu'à archive Y  |  -b ALL : tout l'index  |  -j : JSON")
-        printer("   -c FileHist -f <chemin> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-j]")
-        printer("       Historique des changements d'un chemin exact  |  -j : JSON")
-        printer("   -c TreeHist [-f <préfixe>] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-X] [-j]")
-        printer("       Un seul tableau : contenu DIRECT de <préfixe> (racine si omis, lui-même en '.'),")
-        printer("       toujours en entier — pas de descente dans les sous-répertoires. Colonnes genre")
-        printer("       (répertoire/fichier/lien symbolique/…) + droits unix + propriétaire (dernier état")
-        printer("       connu) + événements de chaque entrée dans la plage")
-        printer("       (apparu/modifié/disparu…)  |  -b ALL : tout l'historique, sinon dernière archive indexée")
-        printer("       Un sous-répertoire montre un événement dès qu'un changement a eu lieu N'IMPORTE")
-        printer("       OÙ dans sa sous-arborescence (sans en lister le détail) ; un fichier, seulement le sien")
-        printer("       added/removed ne concernent QUE l'entrée elle-même — un mouvement interne, quel")
-        printer("       qu'il soit, remonte en 'modified' générique (jamais un added/removed emprunté)")
-        printer("       -j : sortie JSON {path,archive,entries:[{name,full_path,genre,mode,owner,is_dir,events}]}")
-        printer("   -c TreeFind [-f <préfixe>] -m <motif> [-n nickname/servername/ALL] [-j]")
-        printer("       Recherche récursive PAR NOM sous <préfixe> (racine si omis), dans le dernier")
-        printer("       snapshot connu. Motif minimal : '*' (n'importe quoi) et '.' (littéral) — voir -H TreeFind")
-        printer("   -c DuIdx [-f pattern] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-s col[:asc|desc]] [-j] [-R]")
-        printer("       Résumé du-like : taille/nb par type depuis le SQLite")
-        printer("       Sans -f : résumé global  |  -f '*' : par répertoire  |  -j : JSON  |  -R : brut par-chemin")
-        printer("   -c CacheInfo [-n nickname/servername/ALL]")
-        printer("       Affiche le contenu du cache SQLite")
-        printer("   -c CacheClean [-n nickname/servername/ALL]")
-        printer("       Supprime les entrées périmées du cache")
-        printer("   -c CodecSelfTest [-f <motif>] [-l]")
-        printer("       Auto-test du codec de chiffrement (bases temporaires, aucune vraie base touchée) ; code de sortie non nul si un contrôle échoue")
-        printer("       -f : groupe de contrôles (run PARTIEL) ; -l : liste des noms sans exécuter (préparation commune seule)")
-        printer("   -c PerfBench [-n <taille>] [-K]")
-        printer("       Mesure les temps des commandes de lecture sur un jeu synthétique (bases temporaires, plain et chiffré)")
-        printer("       -n <taille> : nb de lignes diff_index visé par mode (défaut 250000)  |  -K : + coût KDF/DbEncrypt/DbDecrypt")
-        printer("⚗️  -c IdxTop [-n nick/ALL] [-N top] [-p profondeur] [-j]")
-        printer("       Top N arborescences par entrées dans diff_index — diagnostiquer un diff.db volumineux")
-        printer("       -N n : top N (défaut 20)  |  -p d : profondeur répertoire (défaut 3)  |  -j : brut par-chemin (ignore -N/-p)")
-        printer("   -c RepoHistory -n nick -j")
-        printer("       Historique brut repo_stats (id/op/unique_csize/total_size/total_csize/updated_at), ordre chronologique")
-        printer("       + baseline : dernière mesure d'avant STATS_RETENTION_MONTHS (null si aucune), hors rows")
-        printer("       Un seul nick à la fois  |  destiné à l'API (borgHelperWWW /repohistory)")
-        printer("   -c ArchiveHistory -n nick -j")
-        printer("       Historique brut archive_stats (archive/archive_date/duration/tailles/nfiles), ordre chronologique")
-        printer("       Un seul nick à la fois  |  destiné à l'API (borgHelperWWW /archivehistory)")
-        printer("   -c Status [-n nick1,nick2/ALL] [-j]")
-        printer("       État rapide par nick : dernier backup connu, Bkp en cours, opération prioritaire")
-        printer("       (Restore/Prune, ambigu) — 100% local, jamais d'appel borg  |  -n ALL/multi-nick natif  |  -j : JSON")
-        printer("⚡️ -c IdxPurge [-x <pattern>] [-n nick/ALL] [-D]")
-        printer("       Purge rétroactive de diff_index + anciens snapshots + VACUUM  (-D : dry-run)")
-        printer("       Sans -x : lit IDX_EXCLUDE/IDX_INCLUDE depuis le borghelperrc")
-        printer("       -x '/var/lib/docker' : préfixe explicite  |  -x '*.pyc' : glob")
-        printer("       IDX_SNAP_KEEP dans borghelperrc : nb de snapshots à conserver (défaut = somme KEEP_*, sinon 10)")
-        printer("🔒 -c DbEncrypt [-n nick] [-D] [-y]")
-        printer("       Chiffre les chemins de diff.db en place (reprenable) + recrée cache.db chiffré")
-        printer("       -D : dry-run (rapport, rien changé)  |  -y : exécute réellement (sinon refus)")
-        printer("🔓 -c DbDecrypt [-n nick] [-D] [-y]")
-        printer("       Inverse de DbEncrypt — pas de contrôle DB_ENCRYPT (déchiffrer reste toujours permis)")
-        printer("🔑 -c DbRekey [-n nick] [-y]")
-        printer("       Ré-enveloppe la DEK avec une nouvelle KEK (aucune donnée rechiffrée) ; refuse sur base plain")
-        printer("🔍 -c DbStatus [-n nick/ALL]")
-        printer("       Mode (plain/siv1/migrating) de cache.db et diff.db pour chaque nick")
-        printer("🔁 -c BkpReconcile [-n nick/ALL] [-j]")
-        printer("       Rapproche les Bkp tués (archive « borgHelper run <id> » écrite -> ligne fermée en succès), sans Index")
-        printer("🧹 -c BorgCleanup [-D] [-y] [--keys] [--history]")
-        printer("       Restes de dépôts borg locaux disparus et fichiers de nicks retirés : aperçu ; -y retire (clés, historiques à part)")
-        printer("  Sentry configuration : BORGHELPERC_SENTRY_ID BORGHELPERC_SENTRY_FILE ou /usr/local/etc/borghelper-sentry")
-    elif doc=='key':
-        printer("   -c Key [-n nickname/servername/ALL]")
-        printer("       On export la clef de l'archive")
-    elif doc=='stats':
-        printer("   -c Stats [-n server-name/nickname]")
-        printer("       Affiche toutes les informations des serveurs connus")
-    elif doc=='login':
-        printer("   -c Login [-s servername] [-n nickname] [-k keyfile.key] -p passphrase -r repo")
-        printer("       Integre le serveur dans borgHelper")
-    elif doc=='mount':
-        printer("   -c Mount [-n nickname/servername] [-b backupid/last/ALL]")
-        printer("       Rend accessible les sauvegarde dans un repertoire visible via la commande Stat")
-    elif doc=='umount':
-        printer("   -c UMount [-n nickname/servername]")
-        printer("       Coupe cet acces")
-    elif doc=='lstbkp':
-        printer("   -c ListBkp [-n nickname/servername]")
-        printer("       Liste les backup (backupid) disponibles")
-    elif doc=='listbkpfls':
-        printer("   -c LstBkpFls [-n nickname/servername] -b backupid [-j]")
-        printer("       Liste les fichiers disponibles dans le backup backupid")
-        printer("       -j : sortie JSON {nick,archive,files:[chemin,...]}")
-    elif doc=='report':
-        printer("   -c Report [-n nickname/servername/ALL] [-N n] [-l] [-j] [-o]")
-        printer("       Rapport sur les backups (tailles, fraîcheur, stats de mouvement)")
-        printer("       -l : HTML  |  -j : JSON  |  -N n : n dernières archives (surcharge DISPLAY_BKP)")
-        printer("       -o : mode offline — diff.db uniquement, aucun appel borg")
-    elif doc=='diffbkp':
-        printer("   -c DiffBkp [-n nickname/servername] -b backupid [-w where] [-j]")
-        printer("       Liste les mouvements des fichiers entre le backupid et le dernier backup")
-        printer("       -j : sortie JSON {archive_old,archive_new,entries:[{change_type,path,size_before,size_after}],n_add,n_rem,n_mod}")
-    elif doc=='restore':
-        printer("   -c Restore [-n nickname/servername] [-b backupid] -f chemin (-w|-W) dest | -L")
-        printer("       Restaure un fichier ou une arborescence depuis une archive")
-        printer("       -b : archive précise  -f : chemin exact ou glob")
-        printer("       -w <dest> : avec sous-répertoires  -W <dest> : plate  -L : liste droits")
-    elif doc=='delbkp':
-        printer("   -c DelBkp [-n nickname/servername] -b backupid")
-        printer("       ⚡️ On delete un backup sur le repo ⚡️ DANGER")
-    elif doc=='bkp':
-        printer("   -c Bkp [-n nickname/servername] [-I]")
-        printer("       Lance le backup avec les paramètres du fichier de conf")
-        printer("       -I : désactive l'indexation")
-        printer("       stdout JSON : borgHelper_file_counts {added,modified,removed,...}")
-    elif doc=='prune':
-        printer("   -c Prune [-n nickname/serveur/ALL]")
-        printer("      ⚡️ Supprime les vieux backups selon KEEP_* ⚡️ DANGER")
-        printer("      Enchaîne borg compact + invalidation cache + purge diff.db")
-    elif doc=='init':
-        printer('   -c Init [-n nickname/servername]')
-        printer('      Initialise un nouveau dépôt borg (chiffrement repokey)')
-    elif doc=='index':
-        printer("   -c Index [-n nickname/servername/ALL] [-F] [-S] [-A archive]")
-        printer("   -c Index [-n nickname/servername/ALL] [-t durée] [-T stats,snap,diff] [-b archive|date] [-B archive|date]")
-        printer("       Indexe les diffs entre archives consécutives (incrémental, parallèle)")
-        printer("       -F : force la réindexation  -S : snapshot seul")
-        printer("       -A <archive> : réindexe uniquement la paire dont archive_new=<archive>")
-        printer("       Tranche (pour cron) : -t budget par nick (90, 90s, 5m, 1h), -T natures, -b/-B période ;")
-        printer("       stats puis snapshot de la dernière archive puis diffs du plus récent au plus ancien,")
-        printer("       reprenable, priorité basse (nice/ionice) ; avancement dans Status -j (build)")
-        printer("       Bkp/Restore/Prune/Report mettent l'Index en pause ; il reprend seul après leur fin")
-        printer("   -c Index --rebuild [-F] [-n nick] [-t durée] [-T ...] [-b ...] [-B ...]")
-        printer("       Reconstruit diff.db dans <diff.db>.rebuild pendant que l'ancienne base sert ; les tranches")
-        printer("       suivantes (-t...) le poursuivent, puis il remplace la base servie d'un coup. -F : repart de zéro.")
-        printer("       Refusé (code 3) : DB_NAME partagé, espace disque < 2,2 × la base, migration de chiffrement.")
-        printer("       Abandon (hors Index en cours) : supprimer .rebuild, .rebuild-wal, .rebuild-shm. Avancement : Status")
-        printer("       Auto-réparation : un type manquant (snapshot_file.type) force un resnapshot")
-        printer("       complet une fois, automatiquement, sans besoin de -F (voir TreeHist)")
-        printer("       IDX_WORKERS dans borghelperrc : nb de borg diff parallèles (défaut 4)")
-    elif doc=='search':
-        printer("   -c Search -f <pattern> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-j]")
-        printer("       Cherche dans l'index des diffs et le snapshot par pattern de chemin")
-        printer("       -j : sortie JSON {nick:[{date,archive,type,path,size_before,size_after},...]} par nick")
-    elif doc=='filehist':
-        printer("   -c FileHist -f <chemin> [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-j]")
-        printer("       Historique complet des changements d'un chemin exact")
-        printer("       -j : sortie JSON {nick:[{date,archive_before,archive_after,type,size_before,size_after},...]} par nick")
-    elif doc=='treehist':
-        printer("   -c TreeHist [-f <préfixe>] [-n nickname/servername/ALL] [-b archive|ALL] [-B archive] [-X] [-j]")
-        printer("       Un seul tableau : contenu DIRECT de <préfixe> (racine entière si omis) uniquement —")
-        printer("       jamais le contenu d'un sous-répertoire (relancer avec -f pointant dessus pour y")
-        printer("       descendre). Le répertoire courant apparaît lui-même en '.'. Toujours l'intégralité")
-        printer("       du contenu (snapshot), y compris les entrées sans événement dans la plage demandée.")
-        printer("       Colonnes : nom, genre (répertoire/fichier/lien symbolique/fifo/socket/périph.),")
-        printer("       droits unix ls-style (dernier état connu, ex. 'drwxr-xr-x'), propriétaire (dernier")
-        printer("       état connu, ex. 'root:root (0:0)'), type d'événement (added/modified/removed/…),")
-        printer("       archive, date")
-        printer("       -b : depuis archive X  |  -B : jusqu'à archive Y  |  -b ALL : tout l'index")
-        printer("       Sans -b/-B : dernière archive indexée seulement (comme Search)")
-        printer("       Genre/droits/propriétaire 'inconnu (réindexer)'/'—' : entrée snapshotée avant l'ajout")
-        printer("       de ces colonnes")
-        printer("       Un sous-répertoire affiche un événement dès qu'un changement a eu lieu N'IMPORTE")
-        printer("       OÙ dans sa sous-arborescence, sans en lister le détail (type/archive/date distincts")
-        printer("       uniquement) — un fichier n'affiche que ses propres événements")
-        printer("       added/removed sur un répertoire ne concernent QUE son entrée à lui (ex. 'added")
-        printer("       directory') — un mouvement interne quelconque remonte en 'modified' générique")
-        printer("       -j : sortie JSON {nick:{path,archive,entries:[{name,full_path,genre,mode,owner,is_dir,events}]}}")
-        printer("       -X : SEULEMENT ce qui a changé entre -b (exclue) et -B (incluse) — ajouté, modifié,")
-        printer("            supprimé (deleted/last_seen_archive) ; répertoire si un changement a eu lieu dessous")
-    elif doc=='treefind':
-        printer("   -c TreeFind [-f <préfixe>] -m <motif> [-n nickname/servername/ALL] [-j]")
-        printer("       Recherche récursive PAR NOM (pas le chemin complet) sous <préfixe> (racine entière")
-        printer("       si omis), dans le dernier snapshot connu (comme TreeHist, mais récursif et sans")
-        printer("       historique). Motif minimal : '*' = n'importe quelle suite de caractères, '.' reste")
-        printer("       littéral ; sans '*' (ni '?') dans <motif>, sous-chaîne implicite (comme Search)")
-        printer("       -j : sortie JSON {nick:{archive,scope,pattern,matches:[{name,full_path,parent,is_dir,genre,mode,owner}]}}")
-    elif doc=='duidx':
-        printer("   -c DuIdx [-f pattern] [-n nick/ALL] [-b archive|ALL] [-B archive] [-s col[:asc|desc]] [-j] [-R]")
-        printer("       Résumé du-like depuis le SQLite : taille et nb de fichiers par type")
-        printer("       -R : mode brut par-chemin, jamais groupé (une ligne JSON par chemin, avant agrégation)")
-    elif doc=='cacheinfo':
-        printer("   -c CacheInfo [-n nickname/servername/ALL]")
-        printer("       Affiche le contenu du cache SQLite")
-    elif doc=='codecselftest':
-        printer("   -c CodecSelfTest [-f <motif>] [-l]")
-        printer("       Vérifie codec de chemins/blobs, enveloppe de clés, en-tête, versions de schéma, DB_ENCRYPT/DB_KDF")
-        printer("       et permissions, sur des bases temporaires. OK/FAIL par contrôle ; code de sortie non nul au moindre échec.")
-        printer("       -f : seulement les contrôles dont le nom correspond (expression régulière, sans casse) — run PARTIEL,")
-        printer("            viser un groupe ('tranche|surveillance'), le run complet reste exigé avant commit ; code 2 si")
-        printer("            le motif est invalide ou ne sélectionne rien ; un décor dont dépendent les contrôles suivants tourne même")
-        printer("            si -f écarte son contrôle : en échec, ligne « DÉCOR EN ÉCHEC <nom> (…) » hors des totaux, code 1")
-        printer("       -l : liste les noms des contrôles (sélectionnés par -f) sans les exécuter — ni contrôle ni décor ; seule la")
-        printer("            préparation commune tourne (bases temporaires, retirées à la fin)")
-    elif doc=='perfbench':
-        printer("   -c PerfBench [-n <taille>] [-K]")
-        printer("       Génère un jeu de données synthétique (SQL direct, PAS de vrai borg) sur des bases temporaires")
-        printer("       plain et chiffrée, puis chronomètre TreeHist/TreeFind/Search/DuIdx/IdxTop/DiffTop/IdxPurge/")
-        printer("       _find_last_archive_with_file et le décodage mémoïsé. -n : nb de lignes diff_index visé par")
-        printer("       mode (défaut 250000)  |  -K : + coût KDF (light/standard/strong) et DbEncrypt/DbDecrypt sur ce jeu")
-        printer("       Fichiers temporaires toujours nettoyés (succès ou échec). Code de sortie non nul si une mesure a échoué.")
-    elif doc=='cacheclean':
-        printer("   -c CacheClean [-n nickname/servername/ALL]")
-        printer("       Supprime les entrées périmées du cache")
-    elif doc=='idxtop':
-        printer("   -c IdxTop [-n nick/servername/ALL] [-N top] [-p profondeur] [-j]")
-        printer("       Top N arborescences les plus volumineuses dans diff_index")
-        printer("       Utile pour identifier quoi ajouter à IDX_EXCLUDE avant IdxPurge")
-        printer("       -N n : nombre de résultats (défaut 20)  -p d : profondeur (défaut 3)")
-        printer("       -j : mode brut par-chemin, jamais groupé (une ligne JSON par chemin ; ignore -N/-p)")
-    elif doc=='repohistory':
-        printer("   -c RepoHistory -n nick -j")
-        printer("       Historique brut repo_stats (colonnes brutes, ordre chronologique par id) — un seul nick")
-        printer("       baseline : dernière mesure d'avant STATS_RETENTION_MONTHS (gardée par la purge), null si aucune")
-        printer("       Sans -j : message court, pas de crash (commande destinée à l'API)")
-    elif doc=='archivehistory':
-        printer("   -c ArchiveHistory -n nick -j")
-        printer("       Historique brut archive_stats (colonnes brutes, ordre chronologique par archive_date) — un seul nick")
-        printer("       Sans -j : message court, pas de crash (commande destinée à l'API)")
-    elif doc=='bkpreconcile':
-        printer("   -c BkpReconcile [-n nick1,nick2/ALL] [-j]")
-        printer("       Rapproche les Bkp tués (ligne bkp_status ouverte, rien de vivant) : archive « borgHelper run <id> »")
-        printer("       écrite -> ligne fermée en succès ; même règle que l'Index, sans Index (un borg list par nick à")
-        printer("       candidat)  |  -j : [{nick,verified,runs:{run_id:état}}]  |  code 1 : vérification impossible")
-        printer("       ou nick inconnu du rc, ou rc sans nick  |  passphrase borg ni dans le rc ni donnée : état")
-        printer("       « passphrase absente », code 1 — passphrase par le rc, BORGHELPERC_RUNTIME_PASSPHRASE ou -P")
-    elif doc=='status':
-        printer("   -c Status [-n nick1,nick2/ALL] [-j]")
-        printer("       État rapide (dernier backup connu + âge, Bkp en cours depuis quand, opération")
-        printer("       prioritaire Restore/Prune/DelBkp en cours) par nick — 100% local, lit archive_stats/")
-        printer("       bkp_status/priority.lock, jamais d'appel borg (rapide, hors ligne)")
-        printer("       -n nick1,nick2 ou ALL : plusieurs nicks nativement (contrairement à RepoHistory/")
-        printer("       ArchiveHistory)  |  -j : JSON, toujours une liste [{nick,last_backup,bkp_running,")
-        printer("       bkp_stale,priority_op_running,build,rebuild}, ...]")
-        printer("       Bkp sans fin au-delà du délai : « probablement interrompu » (bkp_stale {started_at,timeout_s},")
-        printer("       bkp_running null) ; délai = clé rc BKP_STATUS_TIMEOUT du nick ou [DEFAULT] (90s, 5m, 12h),")
-        printer("       sinon variable BORGHELPERWWW_BKP_STATUS_TIMEOUT, sinon 6 h — le même que borgHelperWWW")
-        printer("       build/rebuild : état de construction de la base servie / du fantôme (Index par tranches)")
-        printer("       Restore, Prune et DelBkp ne sont pas distingués (priority.lock ne porte pas cette info)")
-        printer("       code 1 : nick en erreur (base illisible, verrou, passphrase absente, migration, exception) ou [ERREUR] SQLite")
-    elif doc=='idxpurge':
-        printer("   -c IdxPurge [-x <pattern>] [-n nick/servername/ALL] [-D]")
-        printer("       Purge rétroactive des entrées diff_index + anciens snapshots + VACUUM")
-        printer("       Sans -x : lit IDX_EXCLUDE/IDX_INCLUDE depuis le borghelperrc")
-        printer("               → purge tout ce que les filtres actuels auraient exclu")
-        printer("       -x '/var/lib/docker' : préfixe explicite (tout sous cette arbo)")
-        printer("       -x '*.pyc' ou -x '*/.git/*' : glob (* matche /)")
-        printer("       -D : dry-run — affiche le volume sans rien supprimer")
-        printer("       Snapshots : purge automatique au-delà de IDX_SNAP_KEEP (défaut = somme KEEP_*, sinon 10)")
-        printer("       Workflow : IdxTop → modifier IDX_EXCLUDE → IdxPurge (sans -x)")
-    elif doc=='dbencrypt':
-        printer("   -c DbEncrypt [-n nick] [-D] [-y]")
-        printer("       Chiffre les chemins de diff.db (snapshot_file puis diff_index) EN PLACE, par lots")
-        printer("       transactionnels reprenables ; purge + recrée cache.db chiffré (pas de migration")
-        printer("       ligne à ligne pour le cache). Refuse si DB_ENCRYPT=false pour ce nick, si")
-        printer("       Bkp/Restore/Report/Index est en cours, ou si l'espace disque libre est insuffisant.")
-        printer("       -D : dry-run (tables/lignes/espace estimé, rien changé)")
-        printer("       -y : exécution réelle (sans -D ni -y : refus, rien changé)")
-        printer("       Interrompue puis relancée : reprend au curseur enregistré (DEK inchangée)")
-    elif doc=='dbdecrypt':
-        printer("   -c DbDecrypt [-n nick] [-D] [-y]")
-        printer("       Inverse de DbEncrypt (siv1 -> plain), même discipline (verrous, curseur, reprise,")
-        printer("       validation aller-retour avant le dernier commit). Pas de contrôle DB_ENCRYPT :")
-        printer("       déchiffrer reste toujours permis.")
-        printer("       -D : dry-run  |  -y : exécution réelle")
-    elif doc=='dbrekey':
-        printer("   -c DbRekey [-n nick] [-y]")
-        printer("       Ré-enveloppe la DEK existante de diff.db avec une nouvelle KEK (nouveau sel,")
-        printer("       nouveau nonce, DB_KDF courant du nick) — AUCUNE ligne de donnée n'est rechiffrée.")
-        printer("       Refuse si la base n'est pas siv1 (rien à re-clé) ou si une opération est en cours.")
-        printer("       -y : exécution réelle (sinon refus)")
-        printer("       borgHelperWWW >= 1.26.4 le prend en compte seul (relit l'en-tête de chiffrement) ;")
-        printer("       versions antérieures : redémarrer son process")
-    elif doc=='borgcleanup':
-        printer("   -c BorgCleanup [-D] [-y] [--keys] [--history]")
-        printer("       Restes de dépôts borg LOCAUX disparus (hors rc ; ~/.config/borg/security, ~/.cache/borg, clés)")
-        printer("       et fichiers borgHelper de nicks retirés du rc (CACHE_DIR) — jamais un dépôt distant ou configuré ;")
-        printer("       aussi l'entrée d'un ancien dépôt recréé au même chemin (autre id dans <dépôt>/config ; disque en rotation ?)")
-        printer("       Sans -y, ou -D : aperçu (chemins, tailles), rien supprimé  |  -y : retire sécurité, cache et fichiers régénérables")
-        printer("       -y : confirmation sur l'entrée standard (« o », puis « oui » pour clés et historiques) ; sans réponse : code 2")
-        printer("       -y --keys : aussi les clés (irréversible)  |  -y --history : aussi les historiques mesurés (history.db)")
-    elif doc=='dbstatus':
-        printer("   -c DbStatus [-n nick/ALL]")
-        printer("       Affiche le mode (plain/siv1/migrating) de cache.db et diff.db pour chaque nick")
-        printer("       Avertissement stderr (une fois) si une base reste 'plain' alors que DB_ENCRYPT est")
-        printer("       actif et qu'une passphrase est disponible — cite la commande DbEncrypt à lancer")
-    else:
-        printer(f"  Desole pas de documentation pour la commande {doc}")
-    sys.exit(1)
+# ── Aide (1.0.206, story 93, décisions de l'utilisateur) ───────────────────────────────────────────────────────────
+# Table UNIQUE d'où sont tirées l'aide globale (-h), les fiches (-H <commande>) et les erreurs d'arguments. Une entrée par
+# commande : celles de _CLI_OPTAB plus les deux commandes lancées avant lui (_CLI_EARLY). Options d'une fiche = options de
+# _CLI_OPTAB[cmd] (ou de _CLI_EARLY[cmd]) hors communes -C -c -d -P, ni plus ni moins (contrôlé par CodecSelfTest) ; chaque
+# exemple est accepté par l'analyseur de main (_help_example_error : getopt, _cli_options, _cli_required).
+_CLI_SHORTOPTS="c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILC:FSN:ox:DP:RyKXt:T:"
+_CLI_LONGOPTS=["help","rebuild","keys","history"]
+# Options acceptées par commande (seule source des options) — contenu inchangé depuis _cli_main (déplacé en 1.0.206).
+_CLI_OPTAB={k:v+'P' for k,v in {
+    'stats':'Ccdn','login':'Ccdsnkprm','mount':'Ccdnb','umount':'Ccdn',
+    'lstbkp':'Ccdn','lstbkpfls':'Ccdnbj','restore':'CcdnbfwWL','diffbkp':'Ccdnbwj',
+    'delbkp':'Ccdnb','bkp':'CcdnI','prune':'Ccdn','report':'CcdnlNjo',
+    'init':'Ccdn','key':'Ccdn','index':'CcdnFSAtTbB','search':'CcdnfbBj',
+    'filehist':'CcdnfbBj','cacheinfo':'Ccdn','cacheclean':'Ccdn','duidx':'CcdnfbBsjR',
+    'idxtop':'CcdnNpj','difftop':'CcdnNpbj','idxpurge':'CcdnxD','treehist':'CcdnfbBjX',
+    'treefind':'Ccdnfmj','dbencrypt':'CcdnDy','dbdecrypt':'CcdnDy','dbrekey':'Ccdny','dbstatus':'Ccdn',
+    'repohistory':'Ccdnj','archivehistory':'Ccdnj','status':'Ccdnj','borgcleanup':'CcdyD','bkpreconcile':'Ccdnj'}.items()}
+# Options longues de commande : réservées à une seule commande (_cli_options).
+_CLI_LONG_OWNER={'--rebuild':'index','--keys':'borgcleanup','--history':'borgcleanup'}
+# Commandes traitées par _cli_main AVANT _CLI_OPTAB (aucune base, aucun rc) : options lues par leur branche.
+_CLI_EARLY={'codecselftest':'fl','perfbench':'nK'}
+_CLI_COMMON='CcdP'
+# -j limité à un seul nick (contrôlé dans main après l'expansion de ALL)
+_CLI_JSON_ONE_NICK=('idxtop','difftop','repohistory','archivehistory')
+
+class _CliArgError(Exception):
+    """Erreur d'arguments d'une commande connue : message affiché par _usage_error."""
+
+_HELP_GROUPS=('SAUVEGARDE','CONSULTATION ET RESTAURATION','INDEX ET RECHERCHE','RAPPORTS ET ÉTAT','BASES LOCALES',
+              'CONNEXION','DIAGNOSTIC')
+_HELP_ALIASES={'listbkp':'lstbkp','listbkpfiles':'lstbkpfls','listbkpfls':'lstbkpfls'}   # anciens noms annoncés par l'aide
+_HN=('-n <nick>',"dépôt (défaut : nom de la machine)")
+_HNALL=('-n <nick>',"dépôt, liste a,b ou ALL (défaut : nom de la machine)")
+_HB_FROM=('-b <archive|ALL>',"depuis cette archive ; ALL : tout l'index (défaut : dernière archive indexée)")
+_HB_TO=('-B <archive>',"jusqu'à cette archive (incluse)")
+
+def _H(name,group,short,syntax,opts,ex,long=(),danger=False):
+    return {'name':name,'group':group,'short':short,'syntax':(syntax,) if isinstance(syntax,str) else tuple(syntax),
+            'opts':tuple(opts),'ex':tuple(ex),'long':tuple(long),'danger':danger}
+
+_HELP={
+    # ── SAUVEGARDE ──
+    'init':_H('Init',0,"Initialise un nouveau dépôt borg (chiffrement repokey)","-c Init [-n nick]",(_HN,),
+        (("crée le dépôt BORG_REPO du nick (borg init --encryption repokey)","borgHelper -c Init -n mon-serveur"),
+         ("dépôt du nick qui porte le nom de la machine","borgHelper -c Init")),
+        long=("Code de sortie : celui de borg init ; Code 2 aussi : erreur d'arguments.","Garder ensuite la clé : borgHelper -c Key")),
+    'bkp':_H('Bkp',0,"Lance une sauvegarde puis l'indexe (sauf -I)","-c Bkp [-n nick|a,b|ALL] [-I]",
+        (_HNALL,('-I',"sauvegarde seule : ni changements ni snapshot indexés, pas d'Index")),
+        (("sauvegarde + indexation automatique","borgHelper -c Bkp -n mon-serveur"),
+         ("sauvegarde seule, sans indexation","borgHelper -c Bkp -n mon-serveur -I"),
+         ("tous les nicks du fichier de conf, l'un après l'autre","borgHelper -c Bkp -n ALL")),
+        long=("Paramètres du nick dans le fichier de conf ; nécessite EXCLUDE, SER_LOGIN, SER_NAME.",
+              "stdout : JSON de borg create enrichi de borgHelper_file_counts {added,modified,removed}",
+              "(et borgHelper_files avec -d) ; messages sur stderr.",
+              "Plusieurs nicks : un Bkp après l'autre ; un nick en échec n'arrête pas les suivants ; code = le pire.")),
+    'prune':_H('Prune',0,"Supprime les vieilles archives selon les règles KEEP_*","-c Prune [-n nick|a,b|ALL]",(_HNALL,),
+        (("élague le dépôt du nick (irréversible)","borgHelper -c Prune -n mon-serveur"),
+         ("tous les nicks du fichier de conf","borgHelper -c Prune -n ALL")),
+        long=("Refusé sans clé KEEP_*, ou sans GLOB_ARCH (sauf dépôt externe) : il porterait sur toutes les archives.",
+              "Attend qu'un Index en cours se mette en pause, enchaîne borg compact, vide le cache du nick et",
+              "retire des bases les archives disparues."),danger=True),
+    'delbkp':_H('DelBkp',0,"Supprime une archive précise du dépôt","-c DelBkp [-n nick] -b archive",
+        (_HN,('-b <archive>',"nom exact de l'archive — obligatoire ; « last » seul refusé")),
+        (("supprime cette archive (irréversible) ; noms : borgHelper -c LstBkp",
+          "borgHelper -c DelBkp -n mon-serveur -b mon-serveur-root-2026-06-04T020001"),
+         ("avec un autre fichier de conf","borgHelper -C /etc/borghelperrc -c DelBkp -n mon-serveur -b srv-2026-06-04")),
+        long=("Un Index en cours se met en pause ; l'archive quitte aussitôt les bases (rapports, historique).",),danger=True),
+    'key':_H('Key',0,"Exporte la clé du dépôt (format papier)","-c Key [-n nick|a,b|ALL]",(_HNALL,),
+        (("clé du dépôt du nick (borg key export --paper)","borgHelper -c Key -n mon-serveur"),
+         ("clés de tous les nicks","borgHelper -c Key -n ALL"))),
+    'bkpreconcile':_H('BkpReconcile',0,"Rapproche les Bkp tués de leurs archives, sans Index",
+        "-c BkpReconcile [-n nick|a,b|ALL] [-j]",
+        (_HNALL,('-j',"JSON : [{nick,verified,runs:{run_id:état}}]")),
+        (("une ligne par Bkp resté ouvert (fermé, absent, vivant, orphelin…)","borgHelper -c BkpReconcile -n mon-serveur"),
+         ("tous les nicks, en JSON","borgHelper -c BkpReconcile -n ALL -j")),
+        long=("Ligne bkp_status ouverte sans processus vivant : archive « borgHelper run <id> » écrite -> ligne fermée",
+              "en succès ; même règle que l'Index, sans Index (un borg list par nick à candidat).",
+              "Code 1 : vérification impossible, nick inconnu du rc ou rc sans nick. Passphrase borg ni dans le rc",
+              "ni donnée : état « passphrase absente », code 1 — la donner par BORGHELPERC_RUNTIME_PASSPHRASE ou -P.",
+              "Code 2 aussi : erreur d'arguments.")),
+    # ── CONSULTATION ET RESTAURATION ──
+    'stats':_H('Stats',1,"État de montage de chaque dépôt enregistré","-c Stats [-n nick]",
+        (('-n <nick>',"un seul nick (défaut : tous les nicks du fichier de conf)"),),
+        (("tous les nicks : monté ou non","borgHelper -c Stats"),
+         ("un seul nick","borgHelper -c Stats -n mon-serveur"))),
+    'lstbkp':_H('LstBkp',1,"Liste les archives connues (base locale, sans borg)","-c LstBkp [-n nick]",(_HN,),
+        (("archives du nick, de la plus ancienne à la plus récente","borgHelper -c LstBkp -n mon-serveur"),
+         ("nick qui porte le nom de la machine","borgHelper -c LstBkp")),
+        long=("Lit les archives rangées par Bkp et Index ; aucune : lancer Index ou Bkp.",)),
+    'lstbkpfls':_H('LstBkpFls',1,"Liste les fichiers d'une archive (base locale, sans borg)",
+        "-c LstBkpFls [-n nick] [-b archive|last] [-j]",
+        (_HN,('-b <archive|last>',"archive (défaut et last : la plus récente de la base)"),
+         ('-j',"JSON : {nick,archive,files:[chemin,...]}")),
+        (("fichiers de la dernière archive","borgHelper -c LstBkpFls -n mon-serveur"),
+         ("fichiers d'une archive précise","borgHelper -c LstBkpFls -n mon-serveur -b mon-serveur-root-2025-04-02T213004"),
+         ("en JSON","borgHelper -c LstBkpFls -n mon-serveur -j")),
+        long=("Lit le snapshot de l'archive (rempli par Bkp et Index).",)),
+    'diffbkp':_H('DiffBkp',1,"Différences entre deux archives","-c DiffBkp [-n nick] [-b archive[,archive2]] [-j]",
+        (_HN,('-b <archive[,archive2]>',"une archive : comparée à la dernière ; deux : entre elles (défaut : les deux dernières)"),
+         ('-w <chemin>',"accepté, sans effet"),
+         ('-j',"JSON : {archive_old,archive_new,entries:[{change_type,path,size_before,size_after}],n_add,n_rem,n_mod}")),
+        (("les deux dernières archives","borgHelper -c DiffBkp -n mon-serveur"),
+         ("une archive comparée à la dernière","borgHelper -c DiffBkp -n mon-serveur -b archive-ancienne"),
+         ("entre deux archives précises, en JSON","borgHelper -c DiffBkp -n mon-serveur -b archive-1,archive-2 -j")),
+        long=("Colonne 1 : + ajouté, - supprimé, = présent dans les deux (modifié, droits, type).",
+              "Source : l'index si la paire est indexée, sinon borg diff (résultat rangé dans l'index).")),
+    'mount':_H('Mount',1,"Monte les archives du dépôt (FUSE) — penser à démonter","-c Mount [-n nick] [-b archive|last|ALL]",
+        (_HN,('-b <archive|last|ALL>',"ALL : toutes les archives (défaut) ; last : la dernière ; ou une archive")),
+        (("toutes les archives sous MOUNTPOINT","borgHelper -c Mount -n mon-serveur"),
+         ("la dernière archive seulement","borgHelper -c Mount -n mon-serveur -b last"),
+         ("une archive précise","borgHelper -c Mount -n mon-serveur -b mon-serveur-root-2026-06-04T020001")),
+        long=("Point de montage : MOUNTPOINT du nick, qui doit exister et être vide.",
+              "Le dépôt ne peut pas être sauvegardé tant qu'il est monté : démonter avec UMount.")),
+    'umount':_H('UMount',1,"Démonte les archives du dépôt","-c UMount [-n nick]",(_HN,),
+        (("démonte MOUNTPOINT du nick","borgHelper -c UMount -n mon-serveur"),
+         ("nick qui porte le nom de la machine","borgHelper -c UMount"))),
+    'restore':_H('Restore',1,"Restaure un fichier ou une arborescence depuis une archive",
+        "-c Restore [-n nick] [-b archive|last] -f chemin (-w dest | -W dest | -L)",
+        (_HN,('-b <archive|last>',"archive (défaut et last : la dernière de la base qui contient -f, sinon la dernière)"),
+         ('-f <chemin>',"chemin exact ou glob (* et ? ; ** franchit /) — obligatoire"),
+         ('-w <dest>',"restaure avec les sous-répertoires : répertoire, .tar/.tgz, ou - (tar sur stdout)"),
+         ('-W <dest>',"restaure à plat : fichiers à la racine de dest (mêmes formes)"),
+         ('-L',"liste droits et propriétaires, sans restaurer")),
+        (("dans /tmp/restauration, depuis la dernière archive qui contient le fichier",
+          "borgHelper -c Restore -n mon-serveur -f etc/nginx/nginx.conf -w /tmp/restauration"),
+         ("glob -> tgz plat","borgHelper -c Restore -n mon-serveur -f 'home/user/*.log' -W /tmp/logs.tgz"),
+         ("droits seulement, rien restauré","borgHelper -c Restore -n mon-serveur -f 'etc/nginx/*.conf' -L"),
+         ("tar vers stdout","borgHelper -c Restore -n mon-serveur -b srv-2026-06-04 -f home/user -w -")),
+        long=("Destination répertoire absente : créée ; inutilisable : refus, code 3, avant tout appel à borg.",
+              "Un Index en cours se met en pause pendant la restauration. Code 2 aussi : erreur d'arguments.")),
+    # ── INDEX ET RECHERCHE ──
+    'index':_H('Index',2,"Indexe les changements entre archives et le contenu de la dernière",
+        ("-c Index [-n nick|a,b|ALL] [-F] [-S] [-A archive]",
+         "-c Index [-n nick|a,b|ALL] [-t durée] [-T natures] [-b début] [-B fin]",
+         "-c Index [-n nick|a,b|ALL] --rebuild [-F] [-t durée] [-T natures] [-b début] [-B fin]"),
+        (_HNALL,('-F',"force la réindexation (avec --rebuild : jette le fantôme et repart de zéro)"),
+         ('-S',"snapshot seul, sans recalculer les diffs"),
+         ('-A <archive>',"réindexe seulement la paire dont l'archive récente est <archive>"),
+         ('-t <durée>',"tranche : budget par nick (90, 90s, 5m, 1h)"),
+         ('-T <natures>',"tranche : natures traitées, parmi stats,snap,diff (ex. diff ou stats,snap)"),
+         ('-b <archive|date>',"tranche : début de la période"),
+         ('-B <archive|date>',"tranche : fin de la période"),
+         ('--rebuild',"reconstruit diff.db dans un fichier fantôme (<diff.db>.rebuild), bascule à la fin")),
+        (("diffs + snapshot de la dernière archive","borgHelper -c Index -n mon-serveur"),
+         ("tranche de 20 min par nick (ligne cron conseillée, horaire)","borgHelper -c Index -n ALL -t 20m"),
+         ("diffs seuls, archives depuis le 1er septembre","borgHelper -c Index -n mon-serveur -T diff -b 2026-09-01"),
+         ("reconstruction dans un fichier fantôme, par tranches","borgHelper -c Index -n mon-serveur --rebuild -t 20m")),
+        long=("Incrémental et parallèle (IDX_WORKERS du fichier de conf : nb de borg diff simultanés, défaut 4).",
+              "Tranche (pour cron) : stats, puis snapshot de la dernière archive, puis diffs du plus récent au plus",
+              "ancien ; reprenable, priorité basse (nice/ionice) ; avancement dans Status -j (build).",
+              "-t/-T/-b/-B/--rebuild incompatibles avec -S et -A, et avec -F sauf --rebuild -F.",
+              "Bkp/Restore/Prune/Report mettent l'Index en pause ; il reprend seul après leur fin.",
+              "--rebuild : l'ancienne base sert pendant la reconstruction ; les tranches suivantes (-t…) la poursuivent,",
+              "puis elle remplace la base servie d'un coup. Refusé (code 3) : DB_NAME partagé, espace disque",
+              "< 2,2 × la base, migration de chiffrement. Abandon (hors Index en cours) : supprimer .rebuild,",
+              ".rebuild-wal, .rebuild-shm. Avancement : Status.",
+              "Auto-réparation : un type manquant (snapshot_file.type) force un resnapshot complet une fois,",
+              "automatiquement (au prochain Bkp/Index), sans besoin de -F. Code 2 aussi : erreur d'arguments.")),
+    'search':_H('Search',2,"Cherche des chemins dans l'index par motif",
+        "-c Search -f motif [-n nick|a,b|ALL] [-b archive|ALL] [-B archive] [-j]",
+        (('-f <motif>',"motif de chemin, sans / initial (glob * et ? ; sans joker : sous-chaîne) — obligatoire"),_HNALL,_HB_FROM,_HB_TO,
+         ('-j',"JSON : {nick:[{date,archive,type,path,size_before,size_after},...]}")),
+        (("chemins qui contiennent passwd, dernière archive indexée","borgHelper -c Search -f passwd -n mon-serveur"),
+         ("tous les .conf, tous les nicks, tout l'index","borgHelper -c Search -f '*.conf' -n ALL -b ALL"),
+         ("chemins sous etc/nginx, en JSON (chemins de l'index sans / initial)","borgHelper -c Search -f 'etc/nginx*' -n mon-serveur -j")),
+        long=("Cherche dans l'index des diffs et dans le snapshot.",)),
+    'filehist':_H('FileHist',2,"Historique des changements d'un chemin exact",
+        "-c FileHist -f chemin [-n nick|a,b|ALL] [-b archive|ALL] [-B archive] [-j]",
+        (('-f <chemin>',"chemin exact — obligatoire"),_HNALL,_HB_FROM,_HB_TO,
+         ('-j',"JSON : {nick:[{date,archive_before,archive_after,type,size_before,size_after},...]}")),
+        (("tout l'historique du fichier","borgHelper -c FileHist -f /etc/nginx/nginx.conf -n mon-serveur -b ALL"),
+         ("dernière archive indexée, tous les nicks","borgHelper -c FileHist -f /var/lib/postgresql -n ALL"),
+         ("en JSON","borgHelper -c FileHist -f /etc/nginx/nginx.conf -n mon-serveur -b ALL -j"))),
+    'treehist':_H('TreeHist',2,"Contenu direct d'un répertoire et ses événements",
+        "-c TreeHist [-f préfixe] [-n nick|a,b|ALL] [-b archive|ALL] [-B archive] [-X] [-j]",
+        (('-f <préfixe>',"répertoire montré (défaut : la racine)"),_HNALL,_HB_FROM,_HB_TO,
+         ('-X',"SEULEMENT ce qui a changé entre -b (exclue) et -B (incluse) : ajouté, modifié, supprimé"),
+         ('-j',"JSON : {nick:{path,archive,entries:[{name,full_path,genre,mode,owner,is_dir,events}]}}")),
+        (("contenu direct de la racine","borgHelper -c TreeHist -n mon-serveur"),
+         ("contenu direct de /etc, tout l'historique","borgHelper -c TreeHist -f /etc -n mon-serveur -b ALL"),
+         ("ce qui a changé sous /etc entre deux archives",
+          "borgHelper -c TreeHist -f /etc -n mon-serveur -b srv-2026-09-01 -B srv-2026-09-27 -X")),
+        long=("Un seul tableau : contenu DIRECT de <préfixe>, jamais celui d'un sous-répertoire (relancer avec -f",
+              "pointant dessus pour y descendre). Le répertoire lui-même apparaît en '.'. Toujours tout le contenu",
+              "(snapshot), y compris les entrées sans événement dans la plage demandée.",
+              "Colonnes : nom, genre (répertoire/fichier/lien symbolique/fifo/socket/périph.), droits unix",
+              "(ex. 'drwxr-xr-x') et propriétaire (ex. 'root:root (0:0)') du dernier état connu, type d'événement",
+              "(added/modified/removed/…), archive, date. 'inconnu (réindexer)'/'—' : entrée snapshotée avant",
+              "l'ajout de ces colonnes.",
+              "Un sous-répertoire montre un événement dès qu'un changement a eu lieu N'IMPORTE OÙ dessous, sans",
+              "le détail ; un fichier, seulement les siens. added/removed sur un répertoire ne concernent que son",
+              "entrée (ex. 'added directory') — un mouvement interne remonte en 'modified' générique.")),
+    'treefind':_H('TreeFind',2,"Recherche récursive par nom dans le dernier snapshot",
+        "-c TreeFind [-f préfixe] [-m motif] [-n nick|a,b|ALL] [-j]",
+        (('-f <préfixe>',"cherche sous ce répertoire (défaut : la racine)"),
+         ('-m <motif>',"motif de NOM : * = toute suite de caractères, . littéral ; sans * ni ? : sous-chaîne (défaut : *)"),
+         _HNALL,('-j',"JSON : {nick:{archive,scope,pattern,matches:[{name,full_path,parent,is_dir,genre,mode,owner}]}}")),
+        (("tous les .log de l'arborescence","borgHelper -c TreeFind -n mon-serveur -m '*.log'"),
+         ("sous un préfixe précis","borgHelper -c TreeFind -n mon-serveur -f /var/log -m 'error*'"),
+         ("sous-chaîne implicite, en JSON","borgHelper -c TreeFind -n mon-serveur -m backup -j")),
+        long=("Comme TreeHist, mais récursif et sans historique ; compare le nom, pas le chemin complet.",)),
+    'duidx':_H('DuIdx',2,"Résumé façon du : tailles et nombres par type de changement",
+        "-c DuIdx [-f motif] [-n nick|a,b|ALL] [-b archive|ALL] [-B archive] [-s colonne[:asc|:desc]] [-j] [-R]",
+        (('-f <motif>',"sans -f : résumé global ; '*' : par répertoire racine ; 'home/*' : sous home/ ; autre : filtre"),
+         _HNALL,_HB_FROM,_HB_TO,
+         ('-s <colonne[:asc|:desc]>',"tri : chemin (défaut), added, removed, présent"),
+         ('-j',"JSON"),
+         ('-R',"brut par chemin, jamais groupé : JSON {borghelper_version,pattern,rows} (ignore -s et -j)")),
+        (("résumé global par type","borgHelper -c DuIdx -n mon-serveur"),
+         ("détail par répertoire racine, trié par taille présente décroissante",
+          "borgHelper -c DuIdx -f '*' -s présent:desc -n mon-serveur"),
+         ("résumé global des .log, tous les nicks","borgHelper -c DuIdx -f '*.log' -n ALL"),
+         ("détail sous home/, en JSON","borgHelper -c DuIdx -f 'home/*' -j -n mon-serveur"))),
+    'idxtop':_H('IdxTop',2,"Arborescences les plus volumineuses de l'index",
+        "-c IdxTop [-n nick|a,b|ALL] [-N n] [-p profondeur] [-j]",
+        (_HNALL,('-N <n>',"nombre de lignes (défaut 20)"),('-p <profondeur>',"profondeur de répertoire (défaut 3)"),
+         ('-j',"brut par chemin, jamais groupé : JSON {borghelper_version,nick,rows} (ignore -N et -p) ; un seul nick")),
+        (("top 20, profondeur 3","borgHelper -c IdxTop -n mon-serveur"),
+         ("top 10, profondeur 4","borgHelper -c IdxTop -n mon-serveur -N 10 -p 4"),
+         ("brut, en JSON","borgHelper -c IdxTop -n mon-serveur -j")),
+        long=("Pour choisir quoi ajouter à IDX_EXCLUDE avant IdxPurge.",)),
+    'difftop':_H('DiffTop',2,"Arborescences les plus changées entre deux archives",
+        "-c DiffTop [-n nick|a,b|ALL] [-b ancienne,récente] [-N n] [-p profondeur] [-j]",
+        (_HNALL,('-b <ancienne,récente>',"paire d'archives (défaut : dernière paire indexée)"),
+         ('-N <n>',"nombre de lignes (défaut 10)"),('-p <profondeur>',"profondeur de répertoire (défaut 3)"),
+         ('-j',"brut par chemin, jamais groupé (JSON) ; un seul nick")),
+        (("top 10, profondeur 3, dernière paire indexée","borgHelper -c DiffTop -n mon-serveur"),
+         ("top 5 d'une paire explicite","borgHelper -c DiffTop -n mon-serveur -N 5 -b archive-old,archive-new"),
+         ("brut, en JSON","borgHelper -c DiffTop -n mon-serveur -j"))),
+    # ── RAPPORTS ET ÉTAT ──
+    'report':_H('Report',3,"Rapport des sauvegardes (tailles, fraîcheur, mouvements)",
+        "-c Report [-n nick|a,b|ALL] [-N n] [-l] [-j] [-o]",
+        (_HNALL,('-N <n>',"les n dernières archives (remplace DISPLAY_BKP)"),('-l',"HTML"),('-j',"JSON"),
+         ('-o',"hors ligne : diff.db seule, aucun appel borg")),
+        (("tous les nicks, texte","borgHelper -c Report -n ALL"),
+         ("5 dernières archives d'un nick","borgHelper -c Report -n mon-serveur -N 5"),
+         ("hors ligne, en JSON","borgHelper -c Report -n ALL -o -j"),
+         ("page HTML","borgHelper -c Report -n ALL -l")),
+        long=("Code 1 : un dépôt dépasse MAX_AGE_BKP heures sans sauvegarde ; code 2 : un dépôt inaccessible,",
+              "ou erreur d'arguments.")),
+    'status':_H('Status',3,"État rapide par nick (dernier backup, Bkp en cours), sans borg","-c Status [-n nick|a,b|ALL] [-j]",
+        (_HNALL,('-j',"JSON, toujours une liste [{nick,last_backup,bkp_running,bkp_stale,priority_op_running,build,rebuild},…]")),
+        (("un seul nick, texte","borgHelper -c Status -n mon-serveur"),
+         ("plusieurs nicks","borgHelper -c Status -n a,b"),
+         ("tous les nicks configurés, JSON","borgHelper -c Status -n ALL -j")),
+        long=("Dernier backup connu + âge, Bkp en cours depuis quand, opération prioritaire (Restore/Prune/DelBkp)",
+              "en cours — 100 % local (archive_stats, bkp_status, priority.lock), jamais d'appel borg.",
+              "Bkp sans fin au-delà du délai : « probablement interrompu » (bkp_stale {started_at,timeout_s},",
+              "bkp_running null) ; délai = clé BKP_STATUS_TIMEOUT du nick ou de [DEFAULT] (90s, 5m, 12h), sinon",
+              "variable BORGHELPERWWW_BKP_STATUS_TIMEOUT, sinon 6 h — le même que borgHelperWWW.",
+              "build/rebuild : construction de la base servie / du fantôme (Index par tranches).",
+              "Restore, Prune et DelBkp ne sont pas distingués (priority.lock ne porte pas cette info).",
+              "Code 1 : nick en erreur (base illisible, verrou, passphrase absente, migration, exception) ou",
+              "[ERREUR] SQLite. Code 2 aussi : erreur d'arguments.")),
+    'repohistory':_H('RepoHistory',3,"Historique brut de la taille du dépôt (JSON, pour l'API)","-c RepoHistory [-n nick|a,b|ALL] [-j]",
+        (('-n <nick>',"nick, liste a,b ou ALL ; un seul nick avec -j (défaut : nom de la machine)"),
+         ('-j',"JSON : {…,rows:[{id,op,unique_csize,total_size,total_csize,updated_at}],baseline}")),
+        (("historique repo_stats, JSON brut","borgHelper -c RepoHistory -n mon-serveur -j"),
+         ("nick qui porte le nom de la machine","borgHelper -c RepoHistory -j")),
+        long=("Colonnes brutes, ordre chronologique par id ; baseline : dernière mesure d'avant",
+              "STATS_RETENTION_MONTHS (gardée par la purge), null si aucune. Sans -j : message court.",
+              "Destinée à l'API (borgHelperWWW /repohistory) ; -j avec plusieurs nicks : refusé.")),
+    'archivehistory':_H('ArchiveHistory',3,"Historique brut des archives (JSON, pour l'API)","-c ArchiveHistory [-n nick|a,b|ALL] [-j]",
+        (('-n <nick>',"nick, liste a,b ou ALL ; un seul nick avec -j (défaut : nom de la machine)"),
+         ('-j',"JSON : historique archive_stats (archive, archive_date, durée, tailles, nfiles…)")),
+        (("historique archive_stats, JSON brut","borgHelper -c ArchiveHistory -n mon-serveur -j"),
+         ("nick qui porte le nom de la machine","borgHelper -c ArchiveHistory -j")),
+        long=("Colonnes brutes, ordre chronologique par archive_date. Sans -j : message court.",
+              "Destinée à l'API (borgHelperWWW /archivehistory) ; -j avec plusieurs nicks : refusé.")),
+    # ── BASES LOCALES ──
+    'cacheinfo':_H('CacheInfo',4,"Affiche le contenu du cache SQLite (cache.db)","-c CacheInfo [-n nick|a,b|ALL]",(_HNALL,),
+        (("cache d'un nick","borgHelper -c CacheInfo -n mon-serveur"),
+         ("cache de tous les nicks","borgHelper -c CacheInfo -n ALL"))),
+    'cacheclean':_H('CacheClean',4,"Supprime les entrées périmées du cache","-c CacheClean [-n nick|a,b|ALL]",(_HNALL,),
+        (("cache d'un nick","borgHelper -c CacheClean -n mon-serveur"),
+         ("cache de tous les nicks","borgHelper -c CacheClean -n ALL")),
+        long=("Périmées : antérieures à la dernière modification du dépôt (borg info) ; nick absent du fichier de",
+              "conf : tout son cache.")),
+    'idxpurge':_H('IdxPurge',4,"Purge de l'index les chemins exclus et les anciens snapshots",
+        "-c IdxPurge [-n nick|a,b|ALL] [-x motif] [-D]",
+        (_HNALL,('-x <motif>',"préfixe sans / initial ('var/lib/docker' ; un / initial ne cible rien) ou glob ('*.pyc', '*/.git/*')"),
+         ('-D',"aperçu : volume concerné, rien supprimé")),
+        (("aperçu selon IDX_EXCLUDE/IDX_INCLUDE","borgHelper -c IdxPurge -n mon-serveur -D"),
+         ("purge selon IDX_EXCLUDE/IDX_INCLUDE","borgHelper -c IdxPurge -n mon-serveur"),
+         ("purge un préfixe explicite","borgHelper -c IdxPurge -n mon-serveur -x var/log"),
+         ("purge un glob","borgHelper -c IdxPurge -n mon-serveur -x '*/node_modules/*'")),
+        long=("Purge rétroactive des entrées diff_index + anciens snapshots + VACUUM.",
+              "Sans -x : tout ce que les filtres IDX_EXCLUDE/IDX_INCLUDE actuels auraient exclu.",
+              "Snapshots : purgés au-delà de IDX_SNAP_KEEP (défaut = somme des KEEP_*, sinon 10).",
+              "Démarche : IdxTop -> modifier IDX_EXCLUDE -> IdxPurge (sans -x)."),danger=True),
+    'borgcleanup':_H('BorgCleanup',4,"Restes de dépôts borg disparus et de nicks retirés : aperçu, -y retire",
+        "-c BorgCleanup [-D] [-y] [--keys] [--history]",
+        (('-D',"aperçu explicite (chemins, tailles), rien supprimé ; l'emporte sur -y"),
+         ('-y',"retire sécurité, cache et fichiers régénérables (confirmation sur l'entrée standard)"),
+         ('--keys',"avec -y : aussi les clés (irréversible)"),
+         ('--history',"avec -y : aussi les historiques mesurés (history.db)")),
+        (("aperçu : rien n'est supprimé","borgHelper -c BorgCleanup"),
+         ("retire les entrées borg et les fichiers régénérables","borgHelper -c BorgCleanup -y"),
+         ("retire aussi les clés et les historiques mesurés","borgHelper -c BorgCleanup -y --keys --history")),
+        long=("Restes de dépôts borg LOCAUX disparus (hors rc ; ~/.config/borg/security, ~/.cache/borg, clés) et",
+              "fichiers borgHelper de nicks retirés du rc (CACHE_DIR) — jamais un dépôt distant ou configuré ; aussi",
+              "l'entrée d'un ancien dépôt recréé au même chemin (autre id dans <dépôt>/config).",
+              "-y : confirmation « o », puis « oui » pour clés et historiques ; sans réponse : code 2 (aussi :",
+              "erreur d'arguments).")),
+    'dbstatus':_H('DbStatus',4,"Mode de chiffrement (plain/siv1/migrating) des bases","-c DbStatus [-n nick|a,b|ALL]",(_HNALL,),
+        (("bases d'un nick","borgHelper -c DbStatus -n mon-serveur"),
+         ("bases de tous les nicks","borgHelper -c DbStatus -n ALL")),
+        long=("Mode de cache.db et diff.db. Avertissement stderr (une fois) si une base reste 'plain' alors que",
+              "DB_ENCRYPT est actif et qu'une passphrase est disponible — cite la commande DbEncrypt à lancer.")),
+    'dbencrypt':_H('DbEncrypt',4,"Chiffre en place les chemins de diff.db, recrée cache.db chiffré",
+        "-c DbEncrypt [-n nick|a,b|ALL] (-D | -y)",
+        (_HNALL,('-D',"aperçu : tables, lignes, espace estimé ; rien changé"),
+         ('-y',"exécution réelle (sans -D ni -y : refus, rien changé)")),
+        (("aperçu, rien changé","borgHelper -c DbEncrypt -n mon-serveur -D"),
+         ("chiffrement réel","borgHelper -c DbEncrypt -n mon-serveur -y")),
+        long=("Chemins de diff.db (snapshot_file puis diff_index) chiffrés EN PLACE, par lots transactionnels",
+              "reprenables ; cache.db purgé puis recréé chiffré. Refus : DB_ENCRYPT=false pour ce nick,",
+              "Bkp/Restore/Report/Index en cours, ou espace disque libre insuffisant.",
+              "Interrompue puis relancée : reprend au curseur enregistré (DEK inchangée).")),
+    'dbdecrypt':_H('DbDecrypt',4,"Déchiffre les bases (inverse de DbEncrypt)","-c DbDecrypt [-n nick|a,b|ALL] (-D | -y)",
+        (_HNALL,('-D',"aperçu, rien changé"),('-y',"exécution réelle (sans -D ni -y : refus, rien changé)")),
+        (("aperçu, rien changé","borgHelper -c DbDecrypt -n mon-serveur -D"),
+         ("déchiffrement réel","borgHelper -c DbDecrypt -n mon-serveur -y")),
+        long=("siv1 -> plain, même discipline que DbEncrypt (verrous, curseur, reprise, validation aller-retour",
+              "avant le dernier commit). Pas de contrôle DB_ENCRYPT : déchiffrer reste toujours permis.")),
+    'dbrekey':_H('DbRekey',4,"Ré-enveloppe la clé des données avec une nouvelle KEK","-c DbRekey [-n nick|a,b|ALL] -y",
+        (_HNALL,('-y',"exécution réelle (sinon refus)")),
+        (("nouvelle KEK pour diff.db du nick","borgHelper -c DbRekey -n mon-serveur -y"),
+         ("tous les nicks","borgHelper -c DbRekey -n ALL -y")),
+        long=("Ré-enveloppe la DEK existante de diff.db (nouveau sel, nouveau nonce, DB_KDF courant du nick) —",
+              "AUCUNE ligne de donnée rechiffrée. Refus : base non siv1, ou opération en cours.",
+              "borgHelperWWW >= 1.26.4 le prend en compte seul ; versions antérieures : redémarrer son process.")),
+    # ── CONNEXION ──
+    'login':_H('Login',5,"Enregistre un dépôt dans le fichier de conf",
+        "-c Login [-s serveur] [-n nick] -p passphrase -r dépôt [-k fichier.key] [-m point-de-montage]",
+        (('-s <serveur>',"nom du serveur, SER_NAME (défaut : nom de la machine)"),
+         ('-n <nick>',"section du fichier de conf (défaut : -s)"),
+         ('-p <passphrase>',"passphrase borg, écrite dans le fichier de conf — obligatoire"),
+         ('-r <dépôt>',"BORG_REPO — obligatoire"),
+         ('-k <fichier.key>',"clé borg à importer (borg key import)"),
+         ('-m <chemin>',"MOUNTPOINT (défaut : /mnt/borg/<nick>)")),
+        (("dépôt distant","borgHelper -c Login -n mon-serveur -s mon-serveur.domaine.com -p motdepasse -r user@repo:/mnt/borg/srv"),
+         ("dépôt local, avec import de clé","borgHelper -c Login -n mon-serveur -p motdepasse -r /mnt/borg/local -k /root/borg.key")),
+        long=("Section du nick réécrite : BORG_REPO, BORG_PASSPHRASE, SER_NAME, GLOB_ARCH (<serveur>-root-*),",
+              "MOUNTPOINT.")),
+    # ── DIAGNOSTIC ──
+    'codecselftest':_H('CodecSelfTest',6,"Auto-test de borgHelper sur des bases temporaires","-c CodecSelfTest [-f motif] [-l]",
+        (('-f <motif>',"seulement les contrôles dont le nom correspond (regex sans casse ; =nom : ce nom exact)"),
+         ('-l',"liste les noms des contrôles (sélectionnés par -f) sans les exécuter")),
+        (("run complet","borgHelper -c CodecSelfTest"),
+         ("un groupe seulement : run PARTIEL","borgHelper -c CodecSelfTest -f 'tranche|surveillance'"),
+         ("noms des contrôles sélectionnés, rien exécuté","borgHelper -c CodecSelfTest -l -f fantôme")),
+        long=("Codec de chemins/blobs, enveloppe de clés, en-tête, versions de schéma, DB_ENCRYPT/DB_KDF,",
+              "permissions… sur des bases temporaires (aucune vraie base touchée). OK/FAIL par contrôle ; code non",
+              "nul au moindre échec. -f : run PARTIEL (le run complet reste exigé avant commit) ; code 2 si le motif",
+              "est invalide ou ne sélectionne rien, ou option refusée ; un décor dont dépendent les contrôles suivants tourne même si -f",
+              "écarte son contrôle : en échec, ligne « DÉCOR EN ÉCHEC <nom> (…) » hors des totaux, code 1.",
+              "-l : ni contrôle ni décor ; seule la préparation commune tourne (bases temporaires, retirées).")),
+    'perfbench':_H('PerfBench',6,"Chronomètre les lectures sur un jeu synthétique","-c PerfBench [-n taille] [-K]",
+        (('-n <taille>',"lignes de diff_index visées par mode (défaut 250000)"),
+         ('-K',"ajoute le coût KDF (light/standard/strong) et DbEncrypt/DbDecrypt")),
+        (("jeu par défaut","borgHelper -c PerfBench"),
+         ("jeu plus gros","borgHelper -c PerfBench -n 500000"),
+         ("avec le coût KDF et DbEncrypt/DbDecrypt","borgHelper -c PerfBench -K")),
+        long=("Jeu synthétique (SQL direct, PAS de vrai borg) sur des bases temporaires plain et chiffrée ;",
+              "chronomètre TreeHist/TreeFind/Search/DuIdx/IdxTop/DiffTop/IdxPurge, la recherche d'archive de",
+              "Restore et le décodage mémoïsé. Fichiers temporaires toujours retirés. Code non nul si une mesure",
+              "a échoué. Code 2 aussi : erreur d'arguments.")),
+}
+
+def _help_width(s):
+    """Largeur affichée (colonnes de terminal) : caractères larges (⚡) comptés double."""
+    import unicodedata
+    return sum(2 if unicodedata.east_asian_width(c) in 'WF' else 1 for c in s)
+
+def _help_label(h):
+    return h['name']+(' ⚡' if h['danger'] else '')
+
+def _help_global_lines():
+    """Aide globale (-h) : commandes regroupées par type d'action, une ligne chacune, options communes, renvoi -H."""
+    out=[f"borgHelper {Version} — sauvegardes borg : borgHelper -c <commande> [options]",""]
+    for gi,g in enumerate(_HELP_GROUPS):
+        out.append(g)
+        for h in _HELP.values():
+            if h['group']!=gi: continue
+            lab=_help_label(h)
+            out.append(f"  {lab}{' '*max(1,16-_help_width(lab))}{h['short']}")
+    out+=["",
+          "OPTIONS COMMUNES",
+          "  -C <fichier>     fichier de conf (défaut : ~/.borghelperrc)",
+          "  -P <passphrase>  complète/supplante BORG_PASSPHRASE du fichier ; préférer la variable",
+          "                   BORGHELPERC_RUNTIME_PASSPHRASE (même rôle, invisible dans ps)",
+          "  -d               debug (cumulable : -dd)    -v  version    -h  cette aide",
+          "Sentry : BORGHELPERC_SENTRY_DSN, BORGHELPERC_SENTRY_FILE ou /usr/local/etc/borghelper-sentry",
+          "⚡ : supprime des données.  Erreur d'arguments ou commande inconnue : code 2.",
+          "Fiche détaillée avec exemples : borgHelper -H <commande>"]
+    return out
+
+def _help_fiche_lines(cmd):
+    """Fiche d'une commande (-H) : titre, Syntaxe, Options, Description (si utile), Exemples."""
+    h=_HELP[cmd]
+    out=[f"{h['name']} — {h['short']}"+(" ⚡ (supprime des données)" if h['danger'] else ''),"","Syntaxe"]
+    out+=[f"  borgHelper {s}" for s in h['syntax']]
+    out+=["","Options"]
+    w=max([_help_width(f) for f,_d in h['opts']]+[0])
+    out+=[f"  {f}{' '*(w-_help_width(f)+2)}{d}" for f,d in h['opts']]
+    if cmd not in _CLI_EARLY: out.append("  (et les options communes -C, -P, -d : borgHelper -h)")
+    if h['long']: out+=["","Description"]+[f"  {l}" for l in h['long']]
+    out+=["","Exemples"]
+    for i,(c,line) in enumerate(h['ex']):
+        if i: out.append("")
+        out+=[f"  # {c}",f"  {line}"]
+    return out
+
+def _help_out(lines,stream=None):
+    """Aide demandée (-h, -H connue) sur stdout (décision 5) ; aide globale d'une erreur (sans -c, getopt) sur stderr."""
+    for l in lines: print(l,file=stream or sys.stdout)
+
+def _shown(name):
+    """Nom tel que tapé, ou entre apostrophes s'il est vide ou blanc (« -c '' »)."""
+    return name if (name or '').strip() else repr(name or '')
+
+def _help_lookup(name):
+    """Clé de _HELP pour un nom de -H (casse ignorée, anciens noms acceptés), sinon None."""
+    k=(name or '').lower(); k=_HELP_ALIASES.get(k,k)
+    return k if k in _HELP else None
+
+def _help_global(code):
+    _help_out(_help_global_lines(),None if code==0 else sys.stderr); sys.exit(code)
+
+def _help_fiche(name):
+    """-H <commande> : fiche, code 0 ; nom inconnu : [ERREUR] + liste des noms, code 2."""
+    k=_help_lookup(name)
+    if k is None:
+        printer(f"[ERREUR] pas de fiche pour {_shown(name)}")
+        names=', '.join(h['name'] for h in _HELP.values()); line='  fiches :'
+        for nm in names.split(', '):
+            if len(line)+len(nm)+2>100: print(line,file=sys.stderr); line='   '
+            line+=' '+nm+','
+        print(line.rstrip(','),file=sys.stderr)
+        sys.exit(2)
+    _help_out(_help_fiche_lines(k)); sys.exit(0)
+
+def _usage_error(cmd,msg):
+    """Erreur d'arguments d'une commande connue (décision 3) : [ERREUR] <Commande> : <message>, syntaxe, renvoi -H ; code 2."""
+    h=_HELP.get(cmd); name=h['name'] if h else cmd
+    printer(f"[ERREUR] {name} : {msg}")
+    for s in (h['syntax'] if h else ()): print(f"  syntaxe : borgHelper {s}",file=sys.stderr)
+    print(f"  détail : borgHelper -H {name}",file=sys.stderr)
+    sys.exit(2)
+
+def _unknown_command(name):
+    printer(f"[ERREUR] commande inconnue : {_shown(name)}")
+    print("  commandes : borgHelper -h",file=sys.stderr)
+    sys.exit(2)
+
+def _cli_options(cmd,opts):
+    """Analyse des options d'une commande de _CLI_OPTAB (celle de _cli_main, déplacée en 1.0.206 sans changement de règle) ou
+    de _CLI_EARLY (1.0.206, décision 7 : CodecSelfTest/PerfBench refusent les autres options) : (options, nick) ; option
+    refusée -> _CliArgError."""
+    options={}; nick=socket.gethostname()
+    for opt,arg in opts:
+        if opt in _CLI_LONG_OWNER:   # --rebuild : Index (1.0.143) ; --keys/--history : BorgCleanup (1.0.160)
+            if cmd!=_CLI_LONG_OWNER[opt]: raise _CliArgError(f"{opt} réservé à {_HELP[_CLI_LONG_OWNER[opt]]['name']}")
+            options[opt]=arg; continue
+        if opt[1] not in (_CLI_OPTAB.get(cmd) or _CLI_COMMON+_CLI_EARLY[cmd]): raise _CliArgError(f"option {opt} non acceptée")
+        options[opt]=arg
+        if opt=='-n': nick=arg
+    return options,nick
+
+def _cli_required(cmd,options,fs=True):
+    """Contraintes d'arguments vérifiables sans rien lancer (options obligatoires, combinaisons, valeurs) : message ou None.
+    Appelée une fois par _cli_main, pour toute commande de _CLI_OPTAB (Login compris), juste après _cli_options : avant
+    BorgHelper() (dossier de cache), la porte d'autorité et toute écriture — le dispatch ne vérifie plus aucun argument.
+    fs=False (exemples des fiches) : sans le contrôle qui dépend de la machine (fichier -k de Login présent)."""
+    if cmd=='login':
+        if '-p' not in options: return "-p <passphrase> obligatoire"
+        if '-r' not in options: return "-r <dépôt> obligatoire"
+        if not options['-r'].strip(): return "-r vide refusé : chemin ou adresse du dépôt attendu"
+        # 1.0.206 (revue 2) : noms et clé vérifiés ici, avant toute écriture du rc (avant : cfgwrite d'abord ; -n ALL étendu)
+        serna=options.get('-s',socket.gethostname()); nk=options.get('-n',serna)
+        for what,v in (('nom de serveur (-s)',serna),('nick (-n)',nk)):
+            if not _valid_nick_name(v):
+                return (f"{what} invalide : {v!r} — lettres, chiffres, « . », « _ », « - » (début : lettre ou chiffre), "
+                        "ni ALL ni DEFAULT, ni liste")
+        if fs and '-k' in options and not (os.path.exists(options['-k']) and os.path.isfile(options['-k'])):
+            return f"-k {options['-k']!r} : fichier de clé absent"
+    elif cmd=='restore':
+        if '-f' not in options: return "-f <chemin> obligatoire"
+        if '-L' not in options and '-w' not in options and '-W' not in options: return "-w <dest> ou -W <dest> obligatoire (ou -L)"
+    elif cmd=='diffbkp':
+        if '-b' in options and options['-b'].count(',')>1: return f"-b {options['-b']!r} : une ou deux archives (a ou a,b)"
+    elif cmd=='delbkp':
+        if '-b' not in options: return "-b <archive> obligatoire"
+        if not options['-b'].strip(): return "-b vide refusé : nom d'archive exact attendu (borg delete :: viserait le dépôt entier)"
+        if _has_control_char(options['-b']): return f"-b {options['-b']!r} refusé : caractère de contrôle dans le nom d'archive"
+        if options['-b']=='last': return "-b last refusé : nom d'archive exact attendu"   # 1.0.206 (décision 6) : « last » exact seulement
+    elif cmd in ('search','filehist'):
+        if '-f' not in options: return "-f <motif> obligatoire" if cmd=='search' else "-f <chemin> obligatoire"
+    elif cmd=='index':
+        _rebuild='--rebuild' in options
+        _tranche=_rebuild or any(o in options for o in ('-t','-T','-b','-B'))
+        if _tranche and ('-S' in options or '-A' in options or ('-F' in options and not _rebuild)):
+            return "-t/-T/-b/-B/--rebuild (tranche) incompatibles avec -S et -A, et avec -F sauf --rebuild -F"
+        if '-t' in options and _parse_duration(options['-t']) is None:
+            return f"durée -t invalide : {options['-t']!r} (ex. 90, 90s, 5m, 1h)"
+        if '-T' in options:
+            nat=[x.strip() for x in options['-T'].split(',') if x.strip()]
+            if not nat or any(x not in ('stats','snap','diff') for x in nat):
+                return f"-T invalide : {options['-T']!r} (parmi stats,snap,diff)"
+    if cmd in ('report','idxtop','difftop'):   # int() de main : jamais une trace sur une valeur non entière
+        for o in ('-N','-p'):
+            if o in options:
+                try: int(options[o])
+                except ValueError: return f"{o} {options[o]!r} : entier attendu"
+    return None
+
+def _early_values_error(cmd,opts):
+    """Refus de valeur de CodecSelfTest (-f) et PerfBench (-n), dans l'ordre des options (chaque -f est lu) : message ou None."""
+    for opt,arg in opts:
+        if cmd=='codecselftest' and opt=='-f':
+            if not arg.strip(): return "motif vide refusé (il sélectionnerait tout : lancer sans -f)"
+            if arg.startswith('='):
+                if not arg[1:]: return "nom vide refusé après « = »"
+                continue
+            try: re.compile(arg,re.IGNORECASE)
+            except re.error as e: return f"motif invalide {arg!r} ({e})"
+        elif cmd=='perfbench' and opt=='-n':
+            try: int(arg)
+            except ValueError: return f"-n invalide : {arg!r} (entier attendu)"
+    return None
+
+def _help_example_error(cmd,line):
+    """None si la ligne d'exemple est acceptée par l'analyseur de _cli_main (getopt, _cli_options, puis _cli_required ou, pour
+    CodecSelfTest/PerfBench, _early_values_error), sinon le motif. -j avec une liste ou ALL est refusé pour les commandes de
+    _CLI_JSON_ONE_NICK (main le refuse après lecture des nicks du rc pour ALL)."""
+    try: a=shlex.split(line)
+    except ValueError as e: return f"shlex : {e}"
+    if not a or a[0]!='borgHelper': return "ne commence pas par borgHelper"
+    try: opts,args=getopt.getopt(a[1:],_CLI_SHORTOPTS,_CLI_LONGOPTS)
+    except getopt.GetoptError as e: return f"getopt : {e}"
+    if args: return f"argument(s) non reconnu(s) : {args}"
+    cs=[v.lower() for o,v in opts if o=='-c']
+    if not cs or cs[-1]!=cmd: return f"-c {cs} au lieu de {cmd}"
+    if any(o in ('-h','--help','-H','-v') for o,_v in opts): return "-h/-H/-v : la commande ne serait pas lancée"
+    try: options,nick=_cli_options(cmd,opts)
+    except _CliArgError as e: return str(e)
+    e=_early_values_error(cmd,opts) if cmd in _CLI_EARLY else _cli_required(cmd,options,fs=False)
+    if e: return e
+    if cmd in _CLI_JSON_ONE_NICK and '-j' in options and (',' in nick or nick=='ALL'): return "-j : un seul nick"
+    return None
 
 # ── DB encryption foundations (chiffrement des chemins — story 1) ─────────────
 # Codec (PathCodec/BlobCodec), enveloppe DEK/KEK, enc_header, _open_db (point d'ouverture
@@ -6594,11 +6825,20 @@ class BorgHelper:
     def delbkp(self,nick,bid,debug=0):
         # 1.0.142 : opération prioritaire comme Prune — un Index en cours se met en pause au lieu de disputer le verrou
         # du dépôt à borg delete/compact.
+        # 1.0.206 (revue 2 story 93, mesuré sur 1.0.205) : nom vide ou blanc -> `borg delete ::` = suppression du DÉPÔT ENTIER
+        # (seule la question YES de borg l'arrêtait) ; refusé avant tout verrou et tout borg, code 2
+        # revue 3 : nom non chaîne, ou caractère de contrôle (saut de ligne, tabulation, NUL…) : refusé de même
+        if not isinstance(bid,str) or not bid.strip():
+            printer(f"[ERREUR] {nick}: DelBkp refusé : nom d'archive vide (borg delete :: viserait le dépôt entier)"); sys.exit(2)
+        if _has_control_char(bid):
+            printer(f"[ERREUR] {nick}: DelBkp refusé : caractère de contrôle dans le nom d'archive {bid!r}"); sys.exit(2)
         if self.borg.repoLocalAbsent(nick): self._borg_stop(nick)   # 1.0.172 (A60) : avant tout verrou
         self.db.set_priority_lock(nick)
         try:
             self.db.wait_index_idle(nick)
-            rb=self.borg.boex(nick,['delete','::'+bid],debug=debug)
+            # revue 3 (mesuré, borg 1.2.6) : borg remplace les marqueurs {…} de l'emplacement — « {user:.0} » ou « {now:%n} » donnaient
+            # `::` (dépôt entier) ; accolades doublées : nom toujours littéral (« {{ » -> « { », format_map de replace_placeholders)
+            rb=self.borg.boex(nick,['delete','::'+_borg_literal(bid)],debug=debug)
             if not _borg_ok(rb):   # 1.0.172 : message lisible (plus de dict brut), code de borg inchangé
                 printer(self._borg_fail_msg(nick,'borg delete',_rb_errmsg(rb,'borg delete'))); sys.exit(_exit_code(rb['exitcode']))
             _borg_warn(nick,'borg delete',rb)   # 1.0.176 (A77) : code 1 -> archive supprimée, suite faite (avant : « a échoué », ni compact ni rapprochement)
@@ -6964,8 +7204,8 @@ class BorgHelper:
                     return dict(rb,cmd='borg compact')
                 else:
                     return ret
-            else:
-                usage('prune')
+            else:   # inatteignable (clé KEEP_* vérifiée plus haut) ; 1.0.206 : erreur d'arguments de Prune, code 2 (avant : usage('prune'), 1)
+                _usage_error('prune',"aucune règle KEEP_* utilisable")
         finally:
             self.db.clear_priority_lock(nick)
 
@@ -10887,6 +11127,256 @@ def codec_selftest(pattern=None,list_only=False):
             if not ok: print(f"  sans borg : -f {r0} {o0[-6:]} ; -l {r1} {o1[-4:]}")
             return ok
         check("sans borg : contrôle « vrai borg » filtré -> SKIP sous son nom (compté au bilan, code 0), -l le liste",_rbc_without_borg)
+        # ── Aide simplifiée (1.0.206, story 93) : table _HELP, -h, -H, erreurs d'arguments, codes de sortie ──
+        hl_rc=os.path.join(tmp,'hl-rc')
+        def _hl_rcfile(path,cache):
+            """rc du selftest (deux nicks hlA, hlB), écrit au premier appel — jamais hors d'un contrôle (-l n'écrit rien)."""
+            if not os.path.exists(path):
+                with open(path,'w') as f:
+                    f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(tmp,cache)}\n\n[hlA]\nBORG_REPO={os.path.join(tmp,'hl-repo')}\n\n"
+                            f"[hlB]\nBORG_REPO={os.path.join(tmp,'hl-repo-b')}\n")
+                os.chmod(path,0o600)   # sinon [WARN] de droits du rc sur stderr
+            return path
+        def _hl_cli(*args,rc=None):
+            """_cli_main en processus : (code, stdout, stderr) ; -C vers un rc du selftest (jamais le vrai)."""
+            rc=rc or _hl_rcfile(hl_rc,'hl-cache')
+            saved=sys.argv[:]; out=io.StringIO(); err=io.StringIO(); code='aucun sys.exit'
+            try:
+                sys.argv=['borgHelper','-C',rc]+list(args)
+                with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+                    try: _cli_main()
+                    except SystemExit as e: code=e.code
+            finally: sys.argv=saved
+            return code,out.getvalue(),err.getvalue()
+        def _hl_lines(text,what):
+            """Lignes d'une sortie ; vide -> None et diagnostic (le contrôle rend FAIL, jamais une exception)."""
+            L=text.splitlines()
+            if not L: print(f"  {what} : sortie vide")
+            return L or None
+        # oracles fixes (aperçu A de l'utilisateur), jamais relus de _HELP / _HELP_GROUPS
+        _HL_GROUPS_A=('SAUVEGARDE','CONSULTATION ET RESTAURATION','INDEX ET RECHERCHE','RAPPORTS ET ÉTAT','BASES LOCALES',
+                      'CONNEXION','DIAGNOSTIC')
+        _HL_GROUP_OF={**{n:'SAUVEGARDE' for n in ('Init','Bkp','Prune','DelBkp','Key','BkpReconcile')},
+                      **{n:'CONSULTATION ET RESTAURATION' for n in ('Stats','LstBkp','LstBkpFls','DiffBkp','Mount','UMount','Restore')},
+                      **{n:'INDEX ET RECHERCHE' for n in ('Index','Search','FileHist','TreeHist','TreeFind','DuIdx','IdxTop','DiffTop')},
+                      **{n:'RAPPORTS ET ÉTAT' for n in ('Report','Status','RepoHistory','ArchiveHistory')},
+                      **{n:'BASES LOCALES' for n in ('CacheInfo','CacheClean','IdxPurge','BorgCleanup','DbStatus','DbEncrypt',
+                                                     'DbDecrypt','DbRekey')},
+                      'Login':'CONNEXION','CodecSelfTest':'DIAGNOSTIC','PerfBench':'DIAGNOSTIC'}
+        _HL_DANGER={'Prune','DelBkp','IdxPurge'}
+        def _hl_block(L,head):
+            """Lignes d'un bloc de fiche : après la ligne `head` jusqu'à la ligne vide suivante (None si absent)."""
+            if head not in L: return None
+            i=L.index(head)+1; j=i
+            while j<len(L) and L[j]: j+=1
+            return L[i:j]
+        def _hl_table():
+            want=set(_CLI_OPTAB)|{'codecselftest','perfbench'}
+            c,o,e=_hl_cli('-h'); L=_hl_lines(o,'-h stdout')
+            if L is None: return False
+            seen={}; grp=None; danger=set()
+            for l in L:
+                if l in _HL_GROUPS_A: grp=l; continue
+                m=re.match(r'  (\S+)( ⚡)? ',l)
+                if m and grp and m.group(1) in _HL_GROUP_OF:
+                    seen.setdefault(m.group(1),[]).append(grp)
+                    if m.group(2): danger.add(m.group(1))
+            groups_ok={n:g for n,g in seen.items() if len(g)==1 and g[0]==_HL_GROUP_OF[n]}
+            ok=(set(_HELP)==want and len(_HELP)==36 and set(_CLI_EARLY)=={'codecselftest','perfbench'}
+                and {h['name'] for h in _HELP.values()}==set(_HL_GROUP_OF) and len(groups_ok)==36 and danger==_HL_DANGER)
+            if not ok: print(f"  table {sorted(set(_HELP)^want)} n={len(_HELP)} groupes faux {sorted(set(_HL_GROUP_OF)-set(groups_ok))} ⚡ {sorted(danger)}")
+            return ok
+        check("aide : une entrée par commande (_CLI_OPTAB + CodecSelfTest/PerfBench, 36), une fois dans -h, dans son groupe, ⚡ exact",_hl_table)
+        def _hl_opts():
+            bad=[]
+            for k,h in _HELP.items():
+                want=set(_CLI_EARLY[k]) if k in _CLI_EARLY else set(_CLI_OPTAB[k])-set('CcdP')
+                wantl={o for o,c in _CLI_LONG_OWNER.items() if c==k}
+                got=[re.match(r'(--[a-z]+|-[A-Za-z])( |$)',f) for f,_d in h['opts']]
+                if not all(got): bad.append((k,'forme')); continue
+                got=[m.group(1) for m in got]
+                if ({g[1] for g in got if not g.startswith('--')},{g for g in got if g.startswith('--')})!=(want,wantl) \
+                        or len(got)!=len(set(got)): bad.append((k,sorted(got),sorted(want|wantl))); continue
+                c,o,e=_hl_cli('-H',h['name']); L=o.splitlines()
+                if c!=0 or e or any(not re.search(r'^  '+re.escape(f)+r'  ',o,re.M) for f,_d in h['opts']): bad.append((k,'fiche',c)); continue
+                if _hl_block(L,'Syntaxe')!=[f"  borgHelper {x}" for x in h['syntax']]: bad.append((k,'Syntaxe',_hl_block(L,'Syntaxe')))
+                if h['long'] and _hl_block(L,'Description')!=[f"  {x}" for x in h['long']]: bad.append((k,'Description'))
+                if not h['long'] and 'Description' in L: bad.append((k,'Description sans long'))
+            if bad: print(f"  {bad[:5]}")
+            return not bad
+        check("aide : options de chaque fiche = options de la commande hors -C -c -d -P (longues comprises) ; Syntaxe et Description = table",_hl_opts)
+        def _hl_examples():
+            bad=[]
+            for k,h in _HELP.items():
+                if not 2<=len(h['ex'])<=4: bad.append((k,len(h['ex']))); continue
+                c,o,e=_hl_cli('-H',h['name'])
+                for com,line in h['ex']:
+                    why=_help_example_error(k,line)
+                    if why or f"\n  {line}\n" not in o+'\n' or f"  # {com}" not in o: bad.append((k,line,why))
+            # témoins : l'analyseur refuse ce que main refuse (sinon le contrôle passerait à vide)
+            neg=[('stats','borgHelper -c Stats -f x'),('restore','borgHelper -c Restore -n x -w /tmp/r'),
+                 ('restore','borgHelper -c Restore -f a'),('delbkp','borgHelper -c DelBkp -b last'),('search','borgHelper -c Search'),
+                 ('index','borgHelper -c Index -t 1m -S'),('index','borgHelper -c Index -T tout'),('login','borgHelper -c Login -r x'),
+                 ('report','borgHelper -c Report --rebuild'),('idxtop','borgHelper -c IdxTop -n ALL -j'),('stats','borgHelper -c Stats x'),
+                 ('stats','borgHelper -c Init'),('perfbench','borgHelper -c PerfBench -n x'),('codecselftest','borgHelper -c CodecSelfTest -j'),
+                 ('report','borgHelper -c Report -N x'),('diffbkp','borgHelper -c DiffBkp -b a,b,c'),('codecselftest','borgHelper -c CodecSelfTest -f ['),
+                 ('delbkp',"borgHelper -c DelBkp -b ''"),('delbkp',"borgHelper -c DelBkp -b '  '"),('delbkp',"borgHelper -c DelBkp -b 'a\nb'"),('delbkp',"borgHelper -c DelBkp -b 'a\tb'"),('login',"borgHelper -c Login -p x -r ''"),('login',"borgHelper -c Login -p x -r '  '"),('login','borgHelper -c Login -n ALL -p x -r y'),
+                 ('login',"borgHelper -c Login -s 'a b' -p x -r y"),('login','borgHelper -c Login -n a,b -p x -r y'),
+                 ]
+            # revue 2 : chemins de l'index stockés sans / initial — valeur de chemin d'exemple jamais « /… » pour une commande qui
+            # ne le retire pas (mesuré : Search et DuIdx ne trouvent rien, IdxPurge `_pat_cond` : « 0 ») ; FileHist (_path_stored),
+            # TreeHist et TreeFind (-f : _norm_lp) le retirent ; Restore : sélection d'archive par l'index sans normalisation
+            strip={'filehist','treehist','treefind'}; popt={'search':'-f','duidx':'-f','idxpurge':'-x','restore':'-f','lstbkpfls':'-f'}
+            for k,o in popt.items():
+                for com,line in _HELP[k]['ex']:
+                    a=shlex.split(line)
+                    if any(a[i]==o and a[i+1].startswith('/') for i in range(len(a)-1)): bad.append((k,line,'/ initial'))
+            if not strip.isdisjoint(popt): bad.append(('liste',sorted(strip&set(popt))))
+            miss=[x for x in neg if _help_example_error(*x) is None]
+            pos=[x for x in (('delbkp','borgHelper -c DelBkp -b lastweek'),) if _help_example_error(*x) is not None]
+            if bad or miss or pos: print(f"  exemples refusés {bad[:5]} ; témoins acceptés {miss} ; acceptés refusés {pos}")
+            return not bad and not miss and not pos
+        check("aide : 2 à 4 exemples par fiche, chacun accepté par l'analyseur de main et affiché par -H (témoins refusés)",_hl_examples)
+        def _hl_global():
+            res={}; c=L=heads=None
+            for a in ('-h','--help'):
+                c,o,e=_hl_cli(a); L=_hl_lines(o,f"{a} stdout")
+                if L is None: res[a]=False; continue
+                heads=[l for l in L if l in _HL_GROUPS_A]
+                res[a]=(c==0 and heads==list(_HL_GROUPS_A) and len(L)<=60 and max(_help_width(l) for l in L)<=100
+                        and 'Fiche détaillée avec exemples : borgHelper -H <commande>' in L and not e)
+            if not all(res.values()): print(f"  {res} code {c} lignes {len(L or [])} groupes {heads}")
+            return all(res.values())
+        check("aide : -h / --help -> stdout, code 0, 7 groupes de l'aperçu A dans l'ordre, <= 60 lignes, <= 100 colonnes, renvoi -H",_hl_global)
+        def _hl_fiche():
+            res={}
+            for a,name in (('Restore','Restore'),('restore','Restore'),('LISTBKP','LstBkp'),('ListBkpFiles','LstBkpFls'),
+                           ('listbkpfls','LstBkpFls'),('difftop','DiffTop')):
+                c,o,e=_hl_cli('-H',a); L=_hl_lines(o,f"-H {a} stdout") or []
+                res[a]=(c==0 and not e and bool(L) and L[0].startswith(name+' — ') and all(x in L for x in ('Syntaxe','Options','Exemples'))
+                        and any(l.startswith(f"  borgHelper -c {name}") for l in L))
+            c,o,e=_hl_cli('-H','DelBkp'); L=_hl_lines(o,'-H DelBkp stdout') or ['']
+            res['⚡']=c==0 and L[0].endswith('⚡ (supprime des données)')
+            if not all(res.values()): print(f"  {res}")
+            return all(res.values())
+        check("aide : -H <commande> (casse ignorée, anciens noms ListBkp/ListBkpFiles/listbkpfls) -> fiche sur stdout, code 0",_hl_fiche)
+        def _hl_unknown_fiche():
+            res={}
+            for nm,shown in (('Foo','Foo'),('',"''")):
+                c,o,e=_hl_cli('-H',nm); L=_hl_lines(e,f"-H {nm!r} stderr") or ['']
+                names=[x.strip() for l in L[1:] for x in l.replace('fiches :','').split(',') if x.strip()]
+                res[nm]=(c==2 and not o and L[0]==f"[ERREUR] pas de fiche pour {shown}  [borgHelper v{Version}]"
+                         and L[1:2] and L[1].startswith('  fiches : ') and names==[h['name'] for h in _HELP.values()])
+            if not all(res.values()): print(f"  {res} {e[-300:]!r}")
+            return all(res.values())
+        check("aide : -H inconnu ou vide -> [ERREUR] pas de fiche pour <nom> + liste exacte des noms, code 2",_hl_unknown_fiche)
+        def _hl_nocmd():
+            res={}
+            for args in ((),('-n','x')):
+                c,o,e=_hl_cli(*args); res[args]=c==2 and not o and 'Fiche détaillée avec exemples : borgHelper -H <commande>' in e
+            for args,shown in ((('-c','Foo','-n','x'),'Foo'),(('-c','Foo','-Z'),'Foo'),(('-c','Foo','x'),'Foo'),(('-c',''),"''")):
+                c,o,e=_hl_cli(*args)
+                res[args]=c==2 and e.splitlines()==[f"[ERREUR] commande inconnue : {shown}  [borgHelper v{Version}]",'  commandes : borgHelper -h']
+            c,o,e=_hl_cli('-Z'); L=e.splitlines()
+            res['-Z']=c==2 and L[:1]==[f"[ERREUR] option -Z inconnue  [borgHelper v{Version}]"] and 'Fiche détaillée avec exemples : borgHelper -H <commande>' in L
+            if not all(res.values()): print(f"  {[a for a,v in res.items() if not v]} {e[-300:]!r}")
+            return all(res.values()) and not os.path.exists(os.path.join(tmp,'hl-cache'))
+        check("aide : sans -c ou getopt sans -c -> aide globale, code 2 ; -c inconnu (même avec -Z ou un argument) -> commande inconnue, code 2",_hl_nocmd)
+        def _hl_argerr():
+            # revue 2 : codec_selftest/perf_bench factices — un refus retiré donne un FAIL, jamais un selftest imbriqué
+            with mock.patch.dict(globals(),{'codec_selftest':lambda *a,**k: 0,'perf_bench':lambda *a,**k: 0}): return _hl_argerr_run()
+        def _hl_argerr_run():
+            res={}; e=''; outs={}
+            for args,name,msg in ((('-c','Restore','-n','x','-w','/tmp/r'),'Restore','-f <chemin> obligatoire'),
+                                  (('-c','Stats','-f','x'),'Stats','option -f non acceptée'),
+                                  (('-c','report','--keys'),'Report','--keys réservé à BorgCleanup'),
+                                  (('-c','Stats','-Z'),'Stats','option -Z inconnue'),
+                                  (('-dcstats','-Z'),'Stats','option -Z inconnue'),(('-dc','stats','-Z'),'Stats','option -Z inconnue'),
+                                  (('-c','Index','--h'),'Index','option --h ambiguë'),
+                                  (('-c','DelBkp','-n','x','-b','last'),'DelBkp',"-b last refusé"),
+                                  (('-c','Search','-n','x','extra'),'Search','argument(s) non reconnu(s) : extra'),
+                                  (('-c','BorgCleanup','extra'),'BorgCleanup','argument(s) non reconnu(s) : extra'),
+                                  (('-c','DelBkp','-n','hlA','-b',''),'DelBkp','-b vide refusé'),
+                                  (('-c','Login','-n','ALL','-p','pw','-r','x'),'Login',"nick (-n) invalide : 'ALL'"),
+                                  (('-c','Search','-n','hlA'),'Search','-f <motif> obligatoire'),
+                                  (('-c','FileHist','-n','hlA'),'FileHist','-f <chemin> obligatoire'),
+                                  (('-c','Login','-n','hlA','-r','x'),'Login','-p <passphrase> obligatoire'),
+                                  (('-c','Login','-n','hlA','-p','pw'),'Login','-r <dépôt> obligatoire'),
+                                  (('-c','IdxTop','-n','hlA,hlB','-j'),'IdxTop','-j : un seul nick'),
+                                  (('-c','DiffTop','-n','ALL','-j'),'DiffTop','-j : un seul nick'),
+                                  (('-c','Report','-n','hlA','-N','x'),'Report',"-N 'x' : entier attendu"),
+                                  (('-c','IdxTop','-n','hlA','-p','2.5'),'IdxTop',"-p '2.5' : entier attendu"),
+                                  (('-c','DiffTop','-n','hlA','-N','dix'),'DiffTop',"-N 'dix' : entier attendu"),
+                                  (('-c','DiffBkp','-n','hlA','-b','a,b,c'),'DiffBkp',"-b 'a,b,c' : une ou deux archives"),
+                                  (('-c','CodecSelfTest','-n','3'),'CodecSelfTest','option -n non acceptée'),
+                                  (('-c','CodecSelfTest','-f',''),'CodecSelfTest','motif vide refusé'),
+                                  (('-c','CodecSelfTest','-f','['),'CodecSelfTest',"motif invalide '['"),
+                                  (('-c','PerfBench','-j'),'PerfBench','option -j non acceptée'),
+                                  (('-c','PerfBench','-n','x'),'PerfBench',"-n invalide : 'x'")):
+                c,o,e=_hl_cli(*args); L=_hl_lines(e,f"{args} stderr")
+                k=name.lower()
+                if L and 'argument(s) non reconnu(s)' in msg and ('-n <nick>' in L[0])!=('n' in _CLI_OPTAB.get(k,'')): L=None   # conseil -n
+                res[args]=(L is not None and c==2 and not o and len(L)==2+len(_HELP[k]['syntax']) and L[0].startswith(f"[ERREUR] {name} : {msg}")
+                           and L[1:-1]==[f"  syntaxe : borgHelper {s}" for s in _HELP[k]['syntax']]
+                           and L[-1]==f"  détail : borgHelper -H {name}")
+                outs[args]=(c,o[-150:],e[-300:])
+            for a in [a for a,v in res.items() if not v]: print(f"  {a} : (code, stdout, stderr) {outs.get(a)!r}")
+            return all(res.values())
+        check("aide : erreur d'arguments -> [ERREUR] <Commande> : <message>, syntaxe, détail : borgHelper -H <Commande>, code 2",_hl_argerr)
+        def _hl_before_writes():
+            """Erreurs d'arguments avant toute écriture : Login (-p ou -r manquant, avec et sans -k) laisse le rc identique à
+            l'octet ; option refusée ou obligatoire manquante : dossier de cache jamais créé. DelBkp -b <nom qui contient last> :
+            accepté (pas d'erreur d'arguments ; dépôt absent du selftest -> arrêt de borgHelper avant borg)."""
+            rc2=_hl_rcfile(os.path.join(tmp,'hl-rc2'),'hl-cache2'); before=open(rc2,'rb').read(); res={}
+            for args in (('-n','hlA','-r','x'),('-n','hlA','-p','pw'),('-n','hlA','-r','x','-k',os.path.join(tmp,'absent.key')),
+                         ('-n','hlA','-p','pw','-k',os.path.join(tmp,'absent.key')),('-s','hlZ','-r','x'),
+                         ('-n','ALL','-p','pw','-r','x'),('-n','bad name','-p','pw','-r','x'),('-s','bad name','-p','pw','-r','x'),
+                         ('-n','hlA','-p','pw','-r','x','-k','/absent.key'),('-n','hlA,hlB','-p','pw','-r','x'),
+                         ('-n','hlA','-p','pw','-r',''),('-n','hlA','-p','pw','-r','  ')):
+                c,o,e=_hl_cli('-c','Login',*args,rc=rc2); res[args]=c==2 and 'détail : borgHelper -H Login' in e
+            for args in (('-c','Stats','-f','x'),('-c','Restore','-n','hlA','-w','/tmp/r'),('-c','Index','-n','hlA','-T','tout'),
+                         ('-c','IdxTop','-n','ALL','-j')):
+                c,o,e=_hl_cli(*args,rc=rc2); res[args]=c==2
+            same=open(rc2,'rb').read()==before; nocache=not os.path.exists(os.path.join(tmp,'hl-cache2'))
+            c,o,e=_hl_cli('-c','DelBkp','-n','hlA','-b','lastweek'); res['lastweek']=c==2 and 'dépôt absent' in e and 'détail : borgHelper -H' not in e
+            if not (all(res.values()) and same and nocache): print(f"  {[a for a,v in res.items() if not v]} rc identique {same} sans cache {nocache} {e[-200:]!r}")
+            return all(res.values()) and same and nocache
+        check("aide : erreurs d'arguments avant toute écriture (Login : rc identique ; cache jamais créé) ; DelBkp -b lastweek accepté",_hl_before_writes)
+        def _hl_delbkp_empty():
+            """Revue 2-3 (mesuré : `borg delete ::` -> « completely DELETE the following repository », sur 1.0.205 avec -b '' et sur
+            1.0.206 avec -b '{user:.0}' ou '{now:%n}', marqueurs remplacés par borg) : -b vide, blanc, non chaîne ou avec un
+            caractère de contrôle refusé en CLI (code 2) et par BorgHelper.delbkp (bibliothèque, code 2) avant tout verrou
+            (set_priority_lock lève) et tout borg (BorgRunner.boex remplacé par un journal ; dépôt local présent : la garde « dépôt
+            absent » ne masque rien) ; accolades doublées dans l'argv de borg (nom littéral, jamais `::`)."""
+            rd=os.path.join(tmp,'hl-repo-d'); os.makedirs(rd,exist_ok=True); rc3=os.path.join(tmp,'hl-rc3')
+            with open(rc3,'w') as f: f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(tmp,'hl-cache3')}\n\n[hlD]\nBORG_REPO={rd}\n")
+            os.chmod(rc3,0o600)
+            calls=[]
+            def fake(self,nick,cmd,*a,**k): calls.append(list(cmd)); return {'exitcode':2,'stdout':[],'stderr':['refus du factice']}
+            def nolock(*a,**k): raise AssertionError("verrou pris avant la garde")
+            def lib(b,locked_ok):
+                bh3=BorgHelper(cfgfile=rc3); err=io.StringIO(); code='aucun sys.exit'
+                with contextlib.ExitStack() as st:
+                    st.enter_context(contextlib.redirect_stderr(err)); st.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                    if not locked_ok: st.enter_context(mock.patch.object(BorgHelperDB,'set_priority_lock',nolock))
+                    try: bh3.delbkp('hlD',b)
+                    except SystemExit as x: code=x.code
+                return code,err.getvalue()
+            res={}
+            with mock.patch.object(BorgRunner,'boex',fake):
+                for b in ('','  ','a\nb','a\tb','a\x00b','a\rb'):
+                    c,o,e=_hl_cli('-c','DelBkp','-n','hlD','-b',b,rc=rc3); res[f"cli {b!r}"]=c==2 and 'détail : borgHelper -H DelBkp' in e
+                    c,e=lib(b,False); res[f"lib {b!r}"]=c==2 and 'DelBkp refusé' in e
+                for b in (None,5,b'x'):
+                    c,e=lib(b,False); res[f"lib {b!r}"]=c==2 and 'DelBkp refusé' in e
+                refused=list(calls); calls.clear()
+                for b,want in (('srv-{x}','::srv-{{x}}'),('{user:.0}','::{{user:.0}}'),('{now:%n}','::{{now:%n}}')):
+                    c,o,e=_hl_cli('-c','DelBkp','-n','hlD','-b',b,rc=rc3)
+                    res[f"cli {b!r}"]=c==2 and calls==[['delete',want]] and 'détail : borgHelper -H' not in e; calls.clear()
+                    c,e=lib(b,True); res[f"lib {b!r}"]=c==2 and calls==[['delete',want]]; calls.clear()
+            if refused or not all(res.values()): print(f"  borg lancé sur un refus {refused} ; {[k for k,v in res.items() if not v]}")
+            return not refused and all(res.values())
+        check("aide : DelBkp -b vide, blanc, non chaîne ou à caractère de contrôle refusé (CLI et bibliothèque) avant verrou et borg ; accolades doublées",_hl_delbkp_empty)
         # ── alphabet / base64 strict ──
         check("alphabet : +->'.' /->'-' sans padding",lambda: _b64e(bytes([0xfb,0xff,0xbf]))=='.-.-' and _b64e(b'\x00')=='AA')
         check("_b64d : longueur = 1 mod 4 rejetée",lambda: raises(DbCodecError,lambda:_b64d('AAAAA')))
@@ -11293,10 +11783,10 @@ def codec_selftest(pattern=None,list_only=False):
                     except SystemExit as e: code=e.code
             finally:
                 sys.argv=saved_argv
-            return code not in (None,0),(out.getvalue()+err.getvalue())
-        check("RepoHistory -j -n a,b : rejeté (usage(cmd), code de sortie non nul)",
+            return code==2 and "[ERREUR] "+cmdname+" : -j : un seul nick" in err.getvalue(),(out.getvalue()+err.getvalue())   # 1.0.206 : code 2 (avant : 1)
+        check("RepoHistory -j -n a,b : rejeté (erreur d'arguments, code 2)",
               lambda: _cli_rh_multi_rejected('RepoHistory',rh_rc,'rhA,rhB')[0])
-        check("ArchiveHistory -j -n a,b : rejeté (usage(cmd), code de sortie non nul)",
+        check("ArchiveHistory -j -n a,b : rejeté (erreur d'arguments, code 2)",
               lambda: _cli_rh_multi_rejected('ArchiveHistory',rh_rc,'rhA,rhB')[0])
         check("ArchiveHistory -j -n ALL (plusieurs nicks configurés) : rejeté après expansion",
               lambda: _cli_rh_multi_rejected('ArchiveHistory',rh_rc,'ALL')[0])
@@ -23019,7 +23509,7 @@ fail()
                 dt=time.monotonic()-t0
             finally: _ix_slow(ctx,None,0)
             both=r3.stdout.count('construction partielle')==2
-            ok=(r1.returncode!=0 and 'incompatibles' in r1.stdout+r1.stderr and r2.returncode!=0 and both and 5<dt<3*2+10)
+            ok=(r1.returncode==2 and 'incompatibles' in r1.stdout+r1.stderr and r2.returncode==2 and '-T invalide' in r2.stdout+r2.stderr and both and 5<dt<3*2+10)   # 1.0.206 : 2 (avant : 1)
             if not ok: print(f"  CLI : {r1.returncode} {r2.returncode} durée {dt:.1f}s {r3.stdout[-300:]!r}")
             return ok
         def _ix_pause_on(ctx,b,nk,trigger,**kw):
@@ -25520,44 +26010,87 @@ def sentry_alert(kind,nick,message,cfg,extra=None,release=None):
         print(f"[WARN] alerte Sentry {kind} ({nick}) non envoyée : {type(e).__name__}: {e}",file=sys.stderr,flush=True)
         return False
 
+def _getopt_msg(err):
+    """Message de getopt en français : option inconnue, valeur manquante, valeur en trop (option longue)."""
+    m=re.match(r'option (\S+)',str(err)); o=m.group(1) if m else ''
+    if 'not recognized' in str(err): return f"option {o} inconnue"
+    if 'requires argument' in str(err): return f"option {o} : valeur attendue"
+    if 'must not have an argument' in str(err): return f"option {o} : sans valeur"
+    if 'not a unique prefix' in str(err): return f"option {o} ambiguë (plusieurs options longues commencent ainsi)"
+    return str(err)
+
+def _cli_guess_cmd(argv):
+    """Commande (telle que tapée) d'une ligne que getopt refuse : dernier -c lu comme getopt le lirait — options courtes
+    groupées (« -dcstats », « -dc stats »), valeur d'une option qui en prend une sautée, arrêt au premier argument ou à
+    « -- » ; une option inconnue est passée. None si aucun -c."""
+    takes={c for i,c in enumerate(_CLI_SHORTOPTS) if c!=':' and _CLI_SHORTOPTS[i+1:i+2]==':'}
+    cmd=None; i=0
+    while i<len(argv):
+        a=argv[i]; i+=1
+        if a=='--' or not a.startswith('-') or a=='-': break
+        if a.startswith('--'): continue
+        j=1
+        while j<len(a):
+            ch=a[j]; j+=1
+            if ch in takes:
+                if j<len(a): val=a[j:]
+                elif i<len(argv): val=argv[i]; i+=1
+                else: val=None
+                if ch=='c' and val is not None: cmd=val
+                break
+    return cmd
+
 def _cli_main():
     _READER_FAILED[0]=0   # 1.0.178 (A87) : appel en processus (selftest) : jamais l'erreur d'un appel précédent
     sentryid=_sentry_dsn()
     if sentryid:   # 1.0.182 (story 48) : DSN vide (fichier neutre) -> aucun import de sentry_sdk
         _sentry_init(sentryid)
 
+    # 1.0.206 (story 93, décisions de l'utilisateur) : aide et erreurs d'arguments tirées de _HELP ; -h et -H <commande connue>
+    # -> 0 (stdout) ; -H inconnu, erreur d'arguments, -c absent ou inconnu -> 2 (stderr). Avant : usage() sortait toujours en
+    # 1 (sys.exit(1) en fin de fonction), getopt invalide et argument parasite compris. -c inconnu : dit d'abord.
     try:
-        opts,args=getopt.getopt(sys.argv[1:],"c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILC:FSN:ox:DP:RyKXt:T:",["help","rebuild","keys","history"])
+        opts,args=getopt.getopt(sys.argv[1:],_CLI_SHORTOPTS,_CLI_LONGOPTS)
     except getopt.GetoptError as err:
-        print(err); usage(); sys.exit(2)
+        _g=_cli_guess_cmd(sys.argv[1:])
+        if _g is not None and _g.lower() not in _HELP: _unknown_command(_g)
+        if _g is not None: _usage_error(_g.lower(),_getopt_msg(err))
+        printer(f"[ERREUR] {_getopt_msg(err)}"); _help_global(2)
     if args:
-        printer(f"Argument(s) non reconnu(s) : {' '.join(args)}")
-        printer("Utiliser -n <nick> pour spécifier le dépôt.")
-        usage(); sys.exit(2)
+        _g=[a for o,a in opts if o=='-c']
+        if _g and _g[-1].lower() not in _HELP: _unknown_command(_g[-1])
+        _msg=f"argument(s) non reconnu(s) : {' '.join(args)}"
+        if _g:
+            _k=_g[-1].lower()
+            if 'n' in (_CLI_OPTAB.get(_k) or _CLI_COMMON+_CLI_EARLY[_k]): _msg+=" (désigner le dépôt par -n <nick>)"   # seulement si -n accepté
+            _usage_error(_k,_msg)
+        printer(f"[ERREUR] {_msg}"); _help_global(2)
 
     # 1ère passe : extraire cfgfile, passphrase, debug, cmd
     # BORGHELPERC_RUNTIME_PASSPHRASE : défaut process-scoped, plus sûr que -P (invisible dans `ps aux`)
-    cfgfile_arg=None; passphrase_arg=os.environ.get('BORGHELPERC_RUNTIME_PASSPHRASE'); debug=0; cmd=None
+    cfgfile_arg=None; passphrase_arg=os.environ.get('BORGHELPERC_RUNTIME_PASSPHRASE'); debug=0; cmd=None; cmd_name=None
     for opt,arg in opts:
         if opt=='-C': cfgfile_arg=os.path.expanduser(arg)
         elif opt=='-P': passphrase_arg=arg
         elif opt=='-d': debug+=1
         elif opt=='-v': print(f"Version {Version}"); sys.exit(0)
-        elif opt in ('-h','--help'): usage(); sys.exit(1)
-        elif opt=='-H': usage(arg.lower()); sys.exit(1)
-        elif opt=='-c': cmd=arg.lower()
+        elif opt in ('-h','--help'): _help_global(0)
+        elif opt=='-H': _help_fiche(arg)
+        elif opt=='-c': cmd=arg.lower(); cmd_name=arg
+
+    if cmd in _CLI_EARLY:   # 1.0.206 (décision 7) : options hors des leurs et valeurs refusées -> erreur d'arguments, code 2
+        try: _cli_options(cmd,opts)
+        except _CliArgError as e: _usage_error(cmd,str(e))
+        _e=_early_values_error(cmd,opts)
+        if _e: _usage_error(cmd,_e)
 
     if cmd=='codecselftest':  # avant BorgHelper() : ne doit créer ni cache ni lire le vrai rc
         _st_pat=None; _st_list=False   # 1.0.147 (A5) : -f motif (re, sans casse), -l liste sans exécuter
-        for opt,arg in opts:
+        for opt,arg in opts:   # valeurs déjà vérifiées (_early_values_error)
             if opt=='-f':
-                if not arg.strip(): print("CodecSelfTest : motif vide refusé (il sélectionnerait tout : lancer sans -f)"); sys.exit(2)
                 # 1.0.178 (story 41, A88) : « =nom » = ce nom exact, casse respectée, sans échappement (un contrôle seul)
-                if arg.startswith('='):
-                    if not arg[1:]: print("CodecSelfTest : nom vide refusé après « = »"); sys.exit(2)
-                    _st_pat=re.compile('^'+re.escape(arg[1:])+'$'); continue
-                try: _st_pat=re.compile(arg,re.IGNORECASE)
-                except re.error as e: print(f"CodecSelfTest : motif invalide {arg!r} ({e})"); sys.exit(2)
+                if arg.startswith('='): _st_pat=re.compile('^'+re.escape(arg[1:])+'$'); continue
+                _st_pat=re.compile(arg,re.IGNORECASE)
             elif opt=='-l': _st_list=True
         _st=codec_selftest(_st_pat,_st_list)
         sys.exit(2 if _st is None else (1 if _st else 0))
@@ -25565,39 +26098,24 @@ def _cli_main():
     if cmd=='perfbench':  # avant BorgHelper() : bases temporaires uniquement, jamais le vrai rc/cache
         _pb_size=None
         for opt,arg in opts:
-            if opt=='-n':
-                try: _pb_size=int(arg)
-                except ValueError: printer(f"-n invalide : {arg!r} (entier attendu)"); sys.exit(2)
+            if opt=='-n': _pb_size=int(arg)   # valeur déjà vérifiée (_early_values_error)
         sys.exit(perf_bench(size=_pb_size,with_kdf=any(opt=='-K' for opt,_arg in opts)))
 
+    # 1.0.206 : TOUTES les vérifications d'arguments AVANT BorgHelper() (création du dossier de cache), la porte d'autorité et
+    # toute écriture (Login réécrivait la section du nick avant de vérifier -p/-r) : commande, options (_cli_options), options
+    # obligatoires, combinaisons et valeurs (_cli_required), -j d'un seul nick (ALL : nicks lus dans le rc, lecture seule).
+    if cmd is None: _help_global(2)
+    if cmd not in _CLI_OPTAB: _unknown_command(cmd_name)
+    try: options,nick=_cli_options(cmd,opts)
+    except _CliArgError as e: _usage_error(cmd,str(e))
+    _e=_cli_required(cmd,options)
+    if _e: _usage_error(cmd,_e)
+    if cmd in _CLI_JSON_ONE_NICK and '-j' in options:
+        _nl=nick if nick!='ALL' else (BorgRunner(cfgfile=cfgfile_arg).cfgreadnicks(debug) or '')
+        if len(_nl.split(','))>1:
+            _usage_error(cmd,"-j : un seul nick à la fois (pas de liste a,b, ni ALL avec plusieurs nicks configurés)")
+
     bh=BorgHelper(cfgfile=cfgfile_arg,passphrase=passphrase_arg)
-
-    optab={'stats':'Ccdn','login':'Ccdsnkprm','mount':'Ccdnb','umount':'Ccdn',
-           'lstbkp':'Ccdn','lstbkpfls':'Ccdnbj','restore':'CcdnbfwWL','diffbkp':'Ccdnbwj',
-           'delbkp':'Ccdnb','bkp':'CcdnI','prune':'Ccdn','report':'CcdnlNjo',
-           'init':'Ccdn','key':'Ccdn','index':'CcdnFSAtTbB','search':'CcdnfbBj',
-           'filehist':'CcdnfbBj','cacheinfo':'Ccdn','cacheclean':'Ccdn','duidx':'CcdnfbBsjR',
-           'idxtop':'CcdnNpj','difftop':'CcdnNpbj','idxpurge':'CcdnxD','treehist':'CcdnfbBjX',
-           'treefind':'Ccdnfmj','dbencrypt':'CcdnDy','dbdecrypt':'CcdnDy','dbrekey':'Ccdny','dbstatus':'Ccdn',
-           'repohistory':'Ccdnj','archivehistory':'Ccdnj','status':'Ccdnj','borgcleanup':'CcdyD','bkpreconcile':'Ccdnj'}
-    optab={k:v+'P' for k,v in optab.items()}
-
-    if cmd is None or cmd not in optab.keys():
-        usage()
-
-    options={}; nick=socket.gethostname()
-    for opt,arg in opts:
-        if opt=='--rebuild':   # option longue de commande (1.0.143) : Index seulement
-            if cmd!='index': printer("--rebuild : réservé à Index"); usage(cmd)
-            options[opt]=arg; continue
-        if opt in ('--keys','--history'):   # 1.0.160 : BorgCleanup seulement
-            if cmd!='borgcleanup': printer(f"{opt} : réservé à BorgCleanup"); usage(cmd)
-            options[opt]=arg; continue
-        if opt[1] not in optab[cmd]:
-            printer("step2"+opt[1]); usage(cmd)
-        else:
-            options[opt]=arg
-        if opt=='-n': nick=arg
 
     if cmd=='login' and '-n' not in options:
         nick=options.get('-s',socket.gethostname())   # cible réelle de Login, contrôlée ci-dessous (1.0.142)
@@ -25628,8 +26146,6 @@ def _cli_main():
         serna=options.get('-s',socket.gethostname())
         if '-n' not in options: nick=serna
         bh.login(serna,nick,options.get('-k',None),options.get('-p',None),options.get('-r',None),options.get('-m',None),debug=debug)
-        if '-p' not in options: printer('p'); usage(cmd)
-        if '-r' not in options: printer('r'); usage(cmd)
     elif cmd=='mount':
         bh.mount(nick,bid=options.get('-b','ALL'),debug=debug)
     elif cmd=='umount':
@@ -25667,16 +26183,13 @@ def _cli_main():
     elif cmd=='restore':
         bid=options.get('-b',None)
         if bid=='last': bid=None
-        if '-f' not in options: usage(cmd)
         if '-L' in options:
             bh.listperms(nick,bid,options['-f'],debug=debug)
         else:
-            if '-w' not in options and '-W' not in options: usage(cmd)
             if '-W' in options: where=options['-W']; flat=True
             else: where=options['-w']; flat=False
             bh.restore(nick,bid,options['-f'],where,flat=flat,debug=debug)
     elif cmd=='delbkp':
-        if '-b' not in options or 'last' in options['-b']: usage(cmd)
         bh.delbkp(nick,options['-b'],debug=debug)
     elif cmd=='bkp':
         if ',' not in nick: bh.backup(nick,no_index=('-I' in options),debug=debug)
@@ -25727,16 +26240,10 @@ def _cli_main():
         _rebuild='--rebuild' in options   # 1.0.143 : fantôme (-F : jeté, reprise de zéro)
         # Tranche (1.0.141, AD-3) : -t budget, -T natures, -b/-B période ; jamais avec -F/-S/-A.
         _tranche=_rebuild or any(o in options for o in ('-t','-T','-b','-B'))
-        if _tranche and (_snaponly or _target is not None or (_force and not _rebuild)):
-            printer("Index : -t/-T/-b/-B/--rebuild (tranche) incompatibles avec -S et -A, et avec -F sauf --rebuild -F"); usage(cmd)
         _budget=_parse_duration(options['-t']) if '-t' in options else None
-        if '-t' in options and _budget is None:
-            printer(f"Index : durée -t invalide : {options['-t']!r} (ex. 90, 90s, 5m, 1h)"); usage(cmd)
         _natures=None
         if '-T' in options:
             _natures=[x.strip() for x in options['-T'].split(',') if x.strip()]
-            if not _natures or any(x not in ('stats','snap','diff') for x in _natures):
-                printer(f"Index : -T invalide : {options['-T']!r} (parmi stats,snap,diff)"); usage(cmd)
         _period=(options.get('-b'),options.get('-B')) if ('-b' in options or '-B' in options) else None
         if _tranche: _lower_priority()   # AD-4 : nice 10 + ionice idle, hérités par borg
         # Code de sortie (1.0.145, story 8 A3) : le pire rendu par index() sur les nicks traités — 1 (erreur), 2 (borg list en échec, 1.0.175), 3 (--rebuild
@@ -25773,10 +26280,8 @@ def _cli_main():
         if _orph: _release_orphan_connections()
         if _irc: sys.exit(_irc)
     elif cmd=='search':
-        if '-f' not in options: usage(cmd)
         bh.search(nick,options['-f'],archive_from=options.get('-b',None),archive_to=options.get('-B',None),debug=debug,as_json=('-j' in options))
     elif cmd=='filehist':
-        if '-f' not in options: usage(cmd)
         bh.filehist(nick,options['-f'],archive_from=options.get('-b',None),archive_to=options.get('-B',None),debug=debug,as_json=('-j' in options))
     elif cmd=='treehist':
         bh.treehist(nick,options.get('-f',None),archive_from=options.get('-b',None),archive_to=options.get('-B',None),debug=debug,as_json=('-j' in options),
@@ -25795,19 +26300,10 @@ def _cli_main():
     elif cmd=='idxtop':
         _depth=int(options.get('-p','3'))
         _topn=int(options.get('-N','20'))
-        if '-j' in options and len(nick.split(','))>1:
-            printer("IdxTop -j ne supporte qu'un seul nick à la fois (pas nick=a,b ni ALL avec plusieurs nicks configurés)")
-            usage(cmd)
         _per_nick_main(nick,lambda n: bh.idxtop(n,depth=_depth,topn=_topn,debug=debug,as_json=('-j' in options)))   # 1.0.167 (story 30, A47) : un nick en échec n'arrête plus les autres
     elif cmd=='repohistory':
-        if '-j' in options and len(nick.split(','))>1:
-            printer("RepoHistory -j ne supporte qu'un seul nick à la fois (pas nick=a,b ni ALL avec plusieurs nicks configurés)")
-            usage(cmd)
         _per_nick_main(nick,lambda n: bh.repo_history(n,debug=debug,as_json=('-j' in options)))   # 1.0.167 (story 30, A47) : un nick en échec n'arrête plus les autres
     elif cmd=='archivehistory':
-        if '-j' in options and len(nick.split(','))>1:
-            printer("ArchiveHistory -j ne supporte qu'un seul nick à la fois (pas nick=a,b ni ALL avec plusieurs nicks configurés)")
-            usage(cmd)
         _per_nick_main(nick,lambda n: bh.archive_history(n,debug=debug,as_json=('-j' in options)))   # 1.0.167 (story 30, A47) : un nick en échec n'arrête plus les autres
     elif cmd=='bkpreconcile':   # 1.0.189 (story 63) : code 1 si un nick n'a pas pu être vérifié
         _rc=bh.bkp_reconcile(nick,debug=debug,as_json=('-j' in options))
@@ -25821,9 +26317,6 @@ def _cli_main():
     elif cmd=='difftop':
         _depth=int(options.get('-p','3'))
         _topn=int(options.get('-N','10'))
-        if '-j' in options and len(nick.split(','))>1:
-            printer("DiffTop -j ne supporte qu'un seul nick à la fois (pas nick=a,b ni ALL avec plusieurs nicks configurés)")
-            usage(cmd)
         _per_nick_main(nick,lambda n: bh.difftop(n,bkp=options.get('-b'),depth=_depth,topn=_topn,debug=debug,as_json=('-j' in options)))   # 1.0.167 (story 30, A47) : un nick en échec n'arrête plus les autres
     elif cmd=='idxpurge':
         _dryrun='-D' in options
@@ -25858,7 +26351,7 @@ def _cli_main():
         # -D : aperçu explicite (comme IdxPurge/DbEncrypt), l'emporte sur -y — rien supprimé, aucune question
         sys.exit(bh.borg_cleanup(confirm='-y' in options and '-D' not in options,keys='--keys' in options,history='--history' in options))
     else:
-        printer("Mais comment on peut en arriver la ?"); usage()
+        _usage_error(cmd,"commande connue sans traitement (défaut de borgHelper)")   # inatteignable : chaque commande de _CLI_OPTAB a sa branche
     # 1.0.178 (story 41, A87, décisions de l'utilisateur) : lecteur qui a rencontré une erreur (SQLite réelle, nick arrêté parmi
     # plusieurs, chemin illisible) -> code 1 ; ses données (autres nicks, lignes partielles) restent affichées. Avant : code 0.
     if cmd in _READER_CODE_CMDS and _READER_FAILED[0]: sys.exit(1)

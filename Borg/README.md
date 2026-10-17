@@ -353,10 +353,41 @@ Chemins et passphrase sont masqués dans tout ce qui part (voir TECHNICAL.md, AD
 
 ```
 borgHelper -c <commande> [options]
-borgHelper -H <commande>    # aide détaillée d'une commande
-borgHelper -h               # aide générale
+borgHelper -h               # aide globale : commandes regroupées par type d'action
+borgHelper -H <commande>    # fiche d'une commande : syntaxe, options, description, exemples
 borgHelper -v               # version
 ```
+
+Aide (1.0.206) — `-h` liste les 36 commandes, une ligne chacune, en sept groupes : **SAUVEGARDE** (Init, Bkp, Prune ⚡,
+DelBkp ⚡, Key, BkpReconcile), **CONSULTATION ET RESTAURATION** (Stats, LstBkp, LstBkpFls, DiffBkp, Mount, UMount, Restore),
+**INDEX ET RECHERCHE** (Index, Search, FileHist, TreeHist, TreeFind, DuIdx, IdxTop, DiffTop), **RAPPORTS ET ÉTAT** (Report,
+Status, RepoHistory, ArchiveHistory), **BASES LOCALES** (CacheInfo, CacheClean, IdxPurge ⚡, BorgCleanup, DbStatus, DbEncrypt,
+DbDecrypt, DbRekey), **CONNEXION** (Login), **DIAGNOSTIC** (CodecSelfTest, PerfBench) ; ⚡ = la commande supprime des
+données. `-H <commande>` affiche sa fiche : syntaxe, options (une par ligne), description, 2 à 4 exemples commentés. Nom
+insensible à la casse ; les anciens noms `ListBkp`, `ListBkpFiles`, `listbkpfls` sont acceptés. `-h` et une fiche
+s'affichent sur stdout (`borgHelper -H Index | less`) ; les erreurs, et l'aide globale montrée faute de `-c`, sur stderr.
+
+Erreur d'arguments (option manquante, refusée par la commande, valeur invalide — `-N`/`-p` non entiers, DiffBkp `-b` à
+plus de deux archives, motif de CodecSelfTest… —, argument en trop), toujours vérifiée avant toute écriture (Login ne
+touche plus au fichier de conf : `-p`, `-r`, noms `-n`/`-s` — ni `ALL`, ni liste — et fichier `-k` vérifiés avant ; aucun
+dossier de cache créé ; DelBkp `-b` vide ou blanc refusé, aussi par la bibliothèque) :
+
+```
+[ERREUR] Restore : -f <chemin> obligatoire  [borgHelper v1.0.206]
+  syntaxe : borgHelper -c Restore [-n nick] [-b archive|last] -f chemin (-w dest | -W dest | -L)
+  détail : borgHelper -H Restore
+```
+
+Codes de sortie de l'aide et des arguments : `-h`, `-H <commande connue>` -> 0 ; `-H` inconnu (`[ERREUR] pas de fiche pour
+<nom>` + liste des fiches), erreur d'arguments, `-c` inconnu (`[ERREUR] commande inconnue : <nom>`, renvoi vers `-h`) ou
+absent (aide globale) -> 2. Avant 1.0.206, toute aide et toute erreur d'arguments sortaient en 1 (getopt invalide et
+argument parasite compris). CodecSelfTest et PerfBench refusent aussi les options qui ne sont pas les leurs.
+
+borgHelperWWW (inchangé) : quatre routes peuvent tomber dans une erreur d'arguments — `DELETE /delbkp` (`bid=last`, ou
+`bid` vide : avant, `borg delete ::` visait le dépôt entier, arrêté par la seule question de borg), `/diffbkp` avec une
+virgule dans un `bid` (`-b a,b,c` ; avant : trace Python, code 1), `/repohistory` et `/archivehistory` sur plusieurs nicks.
+Elles répondent toujours 400 ; le corps porte désormais `exitcode` 2 et le nouveau message, et les deux routes d'historique
+ne mettent plus cette erreur en cache.
 
 Options communes :
 
@@ -787,6 +818,9 @@ Supprime une archive précise. **Opération destructive.**
 borgHelper -c DelBkp -n mon-serveur -b archive-id
 ```
 
+`-b last` est refusé (nom exact attendu, code 2) ; depuis 1.0.206 un nom d'archive qui contient « last » est accepté
+(avant : refusé).
+
 Opération prioritaire (1.0.142) : un `Index` en cours se met en pause, comme pour `Prune`.
 
 L'archive supprimée quitte aussitôt les bases (rapports, historique, explorateur) : même rapprochement qu'après
@@ -1039,7 +1073,7 @@ Cherche par nom de fichier dans l'index des diffs et dans le snapshot.
 ```bash
 borgHelper -c Search -f passwd -n mon-serveur
 borgHelper -c Search -f '*.conf' -n ALL
-borgHelper -c Search -f '/etc/nginx*' -n mon-serveur
+borgHelper -c Search -f 'etc/nginx*' -n mon-serveur   # chemins de l'index sans / initial
 borgHelper -c Search -f passwd -n mon-serveur -j   # JSON : {nick:[{date,archive,type,path,size_before,size_after},...]}
 ```
 
@@ -1252,7 +1286,7 @@ Calcul : `nfiles − added_total − modified_total` (indexés + exclus). `nfile
 ---
 
 ### `RepoHistory` / `ArchiveHistory`
-Historique brut, colonnes brutes, pour un seul nick à la fois — destiné à l'API (`borgHelperWWW`
+Historique brut, colonnes brutes, pour un seul nick à la fois avec `-j` — destiné à l'API (`borgHelperWWW`
 `/repohistory`/`/archivehistory`), source des graphiques d'évolution des sauvegardes. Aucune métrique
 dérivée (gain Prune, % dédup) n'est calculée ici — uniquement les valeurs telles que stockées.
 
@@ -1263,7 +1297,7 @@ borgHelper -c ArchiveHistory -n mon-serveur -j    # historique archive_stats (pa
 
 | Option | Description |
 |--------|-------------|
-| `-n <nick>` | Un seul nick — jamais `nick=a,b` ni `ALL` sur plusieurs nicks configurés (rejeté, code de sortie non nul) |
+| `-n <nick>` | Avec `-j` : un seul nick — jamais `nick=a,b` ni `ALL` sur plusieurs nicks configurés (erreur d'arguments, code 2) ; sans `-j`, plusieurs nicks acceptés |
 | `-j` | Sortie JSON `{borghelper_version,nick,rows:[...]}` (`RepoHistory` : `+ baseline`, 1.0.192) — sans `-j` : message court, pas de crash (mode texte non destiné à un usage interactif élaboré) |
 
 `RepoHistory -j` : une ligne par événement `repo_stats` (`id`,`op` (`'bkp'|'prune'|'index'`),`unique_csize`,
@@ -1367,7 +1401,7 @@ borgHelper -c Status -n ALL -j               # tous les nicks configurés, JSON
 
 | Option | Description |
 |--------|-------------|
-| `-n <nick1,nick2>` / `-n ALL` | Un ou plusieurs nicks nativement (contrairement à `RepoHistory`/`ArchiveHistory` qui rejettent le multi-nick) — c'est le cas d'usage principal de `Status` |
+| `-n <nick1,nick2>` / `-n ALL` | Un ou plusieurs nicks nativement (contrairement à `RepoHistory`/`ArchiveHistory`, qui rejettent le multi-nick avec `-j`) — c'est le cas d'usage principal de `Status` |
 | `-j` | Sortie JSON — toujours une **liste**, même à un seul nick : `[{nick,last_backup,bkp_running,bkp_interrupted,bkp_stale,priority_op_running,build,rebuild}, ...]` — `rebuild` (1.0.143) : état du fichier fantôme (`build_state`), `null` sans reconstruction |
 
 En texte, en ligne de commande, une ligne finale signale les restes à nettoyer sur la machine, comme `Report`
@@ -1438,7 +1472,7 @@ Supprime rétroactivement des entrées de `diff_index`, purge les snapshots anci
 ```bash
 borgHelper -c IdxPurge -n mon-serveur -D              # dry-run selon IDX_EXCLUDE/IDX_INCLUDE
 borgHelper -c IdxPurge -n mon-serveur                 # purge selon IDX_EXCLUDE/IDX_INCLUDE
-borgHelper -c IdxPurge -n mon-serveur -x /var/log     # purge un préfixe explicite
+borgHelper -c IdxPurge -n mon-serveur -x var/log      # purge un préfixe explicite (sans / initial : un / ne cible rien)
 borgHelper -c IdxPurge -n mon-serveur -x '*/node_modules/*'  # purge un glob
 ```
 
