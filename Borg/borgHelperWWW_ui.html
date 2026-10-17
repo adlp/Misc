@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.24.1 -->
+<!-- UI_VERSION: 1.24.2 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -97,7 +97,7 @@
   <div>
     <span class="badge ok" id="destructiveBadge" hidden style="margin-right:8px" title="Prune/DelBkp désactivés sur ce serveur (BORGHELPERWWW_ALLOW_DESTRUCTIVE)">🔒 Destructions désactivées</span>
     <span class="badge warn" id="downloadsBadge" hidden style="margin-right:8px" title="/download/file et /download/tar désactivés sur ce serveur (BORGHELPERWWW_ALLOW_DOWNLOADS)">🚫 Téléchargements désactivés</span>
-    <span class="badge warn" id="http10Badge" hidden style="margin-right:8px" title="Requête reçue en HTTP/1.0 (proxy nginx sans « proxy_http_version 1.1; ») : un téléchargement interrompu par borg y passe pour complet — ajouter proxy_http_version 1.1; et proxy_set_header Connection &quot;&quot;; dans le location de borgHelperWWW">⚠ Proxy en HTTP/1.0 : téléchargement tronqué non détectable — proxy_http_version 1.1</span>
+    <span class="badge warn" id="http10Badge" hidden style="margin-right:8px" title="Requête reçue en HTTP/1.0 — proxy en HTTP/1.0 vers borgHelperWWW (nginx ancien, ou proxy_http_version 1.0) : un téléchargement interrompu par borg y passe pour complet — ajouter proxy_http_version 1.1; et proxy_set_header Connection &quot;&quot;; dans le location de borgHelperWWW">⚠ Proxy en HTTP/1.0 : téléchargement tronqué non détectable — proxy_http_version 1.1</span>
     <span class="badge err" id="fullAccessBadge" hidden style="margin-right:8px" title="Aucune restriction sur ce serveur : Prune/DelBkp et téléchargements sont tous les deux autorisés">⚠️ Tout autorisé</span>
     <button class="secondary" id="notifBtn" hidden onclick="openNotifications()" title="Notifications du navigateur au début/à la fin des sauvegardes">🔔 Notifications</button>
     <button class="secondary" id="serversBtn" hidden onclick="showMachines()">Serveurs</button>

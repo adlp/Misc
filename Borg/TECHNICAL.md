@@ -1245,7 +1245,34 @@ tranches de pages dans `live`, puis `wal_checkpoint(TRUNCATE)`, et `new` est sup
 | API backup | aucune erreur ni mélange, toutes les connexions voient la nouvelle base, écritures conservées |
 
 Les verrous de SQLite font le travail : un lecteur voit l'ancienne base ou la nouvelle, jamais un mélange ; les
-écrivains attendent la fin de la copie (100 Mo : 0,3 s de copie + 0,2 s de checkpoint). Pic disque : base servie +
+écrivains attendent la fin de la copie (100 Mo : 0,3 s de copie + 0,2 s de checkpoint ; story 84, D198, mesuré sur le SSD NVMe du poste de test (Samsung PM9A1) : `diff.db` de 370 Mo en 3,2 s, 699 Mo en
+5,5 s, 116-127 Mo/s ; écrivains lancés ~1 s après le début de la copie — défaut de sqlite3 5 s, `timeout=60`, reprise 300 s — :
+tous écrivent, attente 2,2 s puis 4,4 s, rien perdu ; un écrivain présent dès le début attend toute la copie : au défaut de 5 s,
+« database is locked » dès ~550-600 Mo ; plafonds : 60 s ≈ 7 Go, reprise 300 s ≈ 34 Go — moins sur un disque plus lent ou NFS). Depuis 1.0.205, tout écrivain de
+`diff.db` qui peut tourner pendant une bascule (fantôme sous index-running.lock ; compactage d'IdxPurge, qui ne prend aucun
+verrou — un Index tourne en même temps — ; compactage de Prune et DelBkp sous priority.lock) ouvre la base avec `timeout=60`
+ou passe par `_with_lock_retry` (300 s) : `indexsnap`, `_index_select_pairs`, `_index_finish`, `_shadow_swap` (après la
+bascule), `_db_migrate_run`, `db_rekey` et `archive_view_check(repair=True)` étaient au défaut de 5 s (`archive_view_check(db_path, repair, timeout=60)` :
+borgHelperWWW passe `timeout=2` et réessaie à la passe suivante de son contrôle périodique ; l'état de la vue est relu sous
+`BEGIN IMMEDIATE` avant DROP/CREATE VIEW, par `_repair_archive_view`, partagée avec `ensure_diff_db` ; « database is locked » :
+aucun `[WARN]` — prédicat `_db_busy` de borgHelper sur l'exception rendue par `archive_view_check(…, errors=[])` — sauf à la 3e
+passe verrouillée consécutive du nick (`_SCHEMA_BUSY`, remis à zéro par une passe sans erreur) : le `[WARN]` habituel, une fois ;
+`_repair_archive_view(held=True)` sans transaction ouverte : RuntimeError). DbEncrypt/DbDecrypt (`_db_migrate_run`) et DbRekey
+font leur KDF (`_enc_header_build`, `_enc_header_unlock`) HORS de tout verrou d'écriture, puis prennent le verrou
+(`BEGIN IMMEDIATE`), relisent l'en-tête et l'exigent identique à celui de la KDF (sinon « en-tête changé entre-temps —
+relancer »), revérifient `_db_locks_busy` et font la première écriture d'en-tête dans la même transaction (`held=True`) ;
+une `sqlite3.OperationalError` sous ce verrou (verrou : « en-tête verrouillé (…) — relancer » ; disque plein, lecture seule,
+E/S : « … — relancer ») devient DbModeError, toute autre `sqlite3.DatabaseError` (base abîmée) DbTamperError — `[ERREUR]`
+habituel, jamais une trace brute, même règle pour DbEncrypt, DbDecrypt et DbRekey ; `_enc_header_write`/`_enc_header_cas` avec
+`held=True` sans transaction ouverte : RuntimeError avant toute écriture. Délais courts voulus, sans
+perte : `_recheck_zero_pairs` et `_drop_orphan_exclusions` (2 s, refaits au prochain Index), `ensure_diff_db`/`ensure_cache_db`
+en lecteur (2 s, rien écrit si occupée), réparation de vue de borgHelperWWW (2 s, passe suivante). Garde AST
+CodecSelfTest « écrivains de diff.db : … » (délai ≥ 60 s jugé par valeur, `_with_lock_retry`
+réellement passé, ou liste blanche par appel avec raison : cache.db, history.db, fichiers jamais servis, lecture seule, délais courts voulus ;
+reprise comptée seulement sans `max_wait` court et pour une fonction imbriquée jamais appelée directement ; délai conditionnel
+d'`ensure_*` : branche écrivain jugée par valeur, branche lecteur en liste ; appelants d'une fonction acceptée par le défaut de
+son paramètre vérifiés — mot-clé, position, `Classe.méthode(obj, …)`, `**kw` signalé. Limites connues, reportées : paramètre
+de délai relié par `with … as`, `except … as`, `import`, `nonlocal`/`global` ou `match`, non vu comme une réaffectation). Pic disque : base servie +
 WAL (taille de la nouvelle) + nouvelle base. `abort()` est évalué entre deux tranches (opération prioritaire : la
 copie est annulée, la base reste l'ancienne). `changed()` est évalué après la première tranche, quand la copie tient
 déjà le verrou d'écriture : s'il est faux, aucune écriture ne peut plus être écrasée. Au moins deux tranches, car
@@ -2473,7 +2500,7 @@ absente ; toute autre valeur — `legacy`, `Legacy`, vide — : hérités), pas 
 **Téléchargements, index_last, sondes lecteur (1.0.177 / WWW 1.30.2 / UI 1.22.1, story 40)** : borgHelperWWW `_borg_stream(request,
 cmd, env, what, decoy, path, missing)` remplace `_stream_proc` — stderr de borg lu dans un thread, premier bloc lu AVANT la
 réponse : rien et code 1 + `missing` -> 404, rien et code ≥ 2/signal -> 502 (`_rb_errmsg`, leurre remplacé par le chemin
-demandé dans chaque ligne AVANT la mise en forme) ; premier bloc = 64 Kio ou la fin : fin atteinte -> code connu avant la réponse (≥ 2 : 502 ; code 1 sans sortie : 404 si « never matched », 502 pour un tar, sinon 200 vide) ; stderr : 200 dernières lignes ; sinon corps ASYNCHRONE (`run_in_threadpool`) qui vérifie le code à la fin : ≥ 2/signal -> `[ERREUR]` + `request.state.stream_aborted` ; client parti (corps annulé) -> borg tué (avant : bloqué sur son tube, zombie). Limite : la coupure n'est visible qu'en HTTP/1.1 (transfert par morceaux) — derrière nginx, `proxy_http_version 1.1` (décision de l'utilisateur, documenté). Le
+demandé dans chaque ligne AVANT la mise en forme) ; premier bloc = 64 Kio ou la fin : fin atteinte -> code connu avant la réponse (≥ 2 : 502 ; code 1 sans sortie : 404 si « never matched », 502 pour un tar, sinon 200 vide) ; stderr : 200 dernières lignes ; sinon corps ASYNCHRONE (`run_in_threadpool`) qui vérifie le code à la fin : ≥ 2/signal -> `[ERREUR]` + `request.state.stream_aborted` ; client parti (corps annulé) -> borg tué (avant : bloqué sur son tube, zombie). Limite : la coupure n'est visible qu'en HTTP/1.1 (transfert par morceaux) — derrière nginx, `proxy_http_version 1.1` (décision de l'utilisateur, documenté ; mesuré en story 84, D149 : nginx 1.31.7 parle déjà HTTP/1.1 à l'amont sans la directive, coupure vue par le client — curl code 18 ; `proxy_http_version 1.0` forcé : coupure invisible, curl code 0, 8,5 millions d'octets reçus sur 60 millions ; versions antérieures non mesurées — documentation de nginx : 1.0 par défaut avant le changement, version du changement non vérifiée ; `[WARN]` et infobulle du badge disent la cause sans l'attribuer à nginx, 1.31.19 / UI 1.24.2). Le
 middleware `_access_log_and_user_guard` enveloppe chaque réponse dans `_AbortableResponse`, qui retient le dernier message de corps
 (fin de transfert) quand le drapeau est posé : uvicorn ferme la connexion (« ASGI callable returned without completing
 response ») — une exception dans le corps ne suffit pas, BaseHTTPMiddleware (Starlette 0.18) la change en fin normale (mesuré).
@@ -2711,7 +2738,7 @@ include_me=True)` — le processus courant compte : sinon l'Index de fin d'un Bk
 d'un `borg create` orphelin vivant (`repo_orphan_create`, dépôt local seulement) ; sans candidat, ou dépôt local absent, rien
 d'autre. Sinon `boex(['list','--json','--format','{comment}{end}']+glob_args(cfg), forceEnv={'TZ':'UTC'})` (le JSON porte alors
 `comment` et `end` en plus des clés habituelles, `end` en heure locale de borg — d'où `TZ=UTC`, mesuré : borg suit `TZ` ; borg
-1.2.6) ; archives `.checkpoint` écartées (borg 1.1 les liste) ; pour chaque candidat dont une archive a le commentaire exact,
+1.2.6 ; coût mesuré en story 84, D171, dépôt de 100 archives, médianes : local `borg list --json` 0,66 s, avec ce `--format` 0,74 s ; ssh://localhost (`borg serve`) 1,81 s et 1,90 s, avec `--glob-archives` 1,74 s — ~0,1 s de plus que le `borg list` de tout Index, surcoût distant ~1,1 s (démarrage ssh et `borg serve`) ; latence d'un vrai réseau non mesurée) ; archives `.checkpoint` écartées (borg 1.1 les liste) ; pour chaque candidat dont une archive a le commentaire exact,
 `BorgHelperDB.close_bkp_status_reconciled(nick, run_id, fin)` : `UPDATE … SET finished_at=?, result='success' WHERE … AND
 finished_at IS NULL` (comparer-et-échanger, jamais d'écrasement ; `changed_during_backup`/`read_errors` restent NULL). 1.0.187
 (story 58) : juste AVANT la fermeture (revue : un arrêt entre les deux laissait une ligne fermée, plus jamais candidate, et son
@@ -2837,7 +2864,7 @@ démarré au chargement ; `_borg_killed(proc,st)` : code < 0, ou 143 (le vrai bo
 immédiat ; `st` passé : `_MEI*` relevés avant le signal) — le borg PyInstaller (`exec nice borg.wrapped`)
 a un enfant que tuer le PID de tête laissait vivre, tube ouvert (mesuré) ; `_borg_reap` (seulement si borghelperwww l'a tué :
 `st['why']`) retire les `_MEI*` apparus depuis son lancement et inutilisés (`_mei_dirs`/`_mei_in_use` de borgHelper). Registre
-`_LIVE_BORG` {Popen: état `last`/`why`/`mei`/`reading`}. Lectures par `read1` (`_rd`, chaque lecture — EOF compris — repousse
+`_LIVE_BORG` {Popen: état `last`/`why`/`mei`/`reading`}. Lectures par `read1` (mesuré en story 84, D155 : `/download/file` de 60 000 000 octets, 5 essais — `read1` médiane 13,2 s, ≈ 4,5 millions d'octets/s, contre 16,8 s pour une copie en `read(n)` ; read1 gardé) (`_rd`, chaque lecture — EOF compris — repousse
 `last`). Chien de garde par téléchargement, actif jusqu'au retrait du registre : borg vivant sans octet pendant TIMEOUT s (après
 un arrêt demandé, `_STOPPING` : `_STOP_IDLE`=10 s) -> groupe tué, `[ERREUR]` si vraiment tué par lui ; borg fini mais corps
 jamais lu -> au même délai (3600 s si TIMEOUT=0) tubes fermés et entrée retirée (`reading` : jamais pendant une lecture). Cause :
@@ -2850,7 +2877,7 @@ exécution directe) l'appelle à chaque signal — premier : `idle_only` (et `_S
 l'événement shutdown, `atexit` et `threading._register_atexit` (avant la jonction des fils non démons d'anyio bloqués dans
 `read1`) : tous. `_srv.started` faux -> code 3. TIMEOUT < 0 refusé au démarrage. `_note_http10(request)` dans le middleware :
 premier `scope['http_version']=='1.0'` hors `/healthz` -> `[WARN]` avec chemin et client (`_HTTP10_WARNED`) ; `http_version` dans
-`/version` et `/access`. UI : `_readerJson(r)` (code 0, ou code 1 avec sortie) pour l'explorateur (`/treehist`, `/treefind`) ;
+`/version` et `/access` (vérifié en story 84 derrière nginx 1.31.7 en `proxy_http_version 1.0` : un seul `[WARN]`, `/access` rend `1.0`). UI : `_readerJson(r)` (code 0, ou code 1 avec sortie) pour l'explorateur (`/treehist`, `/treefind`) ;
 `_parseHistoryResponse` accepte le code 1 avec JSON (`error`, ou `rows` + `partial` = `_errLine(stderr)` ; aucune ligne ->
 erreur), `loadCharts` écrit « Données partielles : … » sous un graphique dessiné ; `http10` depuis `/access` (`loadMyAccess`),
 sinon `/version`.

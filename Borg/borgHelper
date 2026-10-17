@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.204"
+Version="1.0.205"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -1774,11 +1774,15 @@ def _enc_header_read(conn):
         raise DbTamperError(f"base illisible, mode de chiffrement invérifiable ({e})") from None
     return row[0] if row else None
 
-def _enc_header_write(conn,header):
+def _enc_header_write(conn,header,held=False):
     """Écrit l'en-tête s'il n'existe pas (BEGIN IMMEDIATE + ON CONFLICT DO NOTHING). True si écrit.
-    Jamais INSERT OR REPLACE : deux créateurs concurrents ne doivent pas écraser la DEK."""
-    conn.commit()
-    conn.execute("BEGIN IMMEDIATE")
+    Jamais INSERT OR REPLACE : deux créateurs concurrents ne doivent pas écraser la DEK.
+    held=True (1.0.205, story 84) : l'appelant tient déjà BEGIN IMMEDIATE — écrit et valide dans SA transaction ; sans
+    transaction ouverte : RuntimeError, rien écrit."""
+    if held and not conn.in_transaction: raise RuntimeError("_enc_header_write(held=True) sans transaction ouverte")
+    if not held:
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
     try:
         cur=conn.execute("INSERT INTO db_meta(key,value) VALUES('enc_header',?) ON CONFLICT(key) DO NOTHING",
                          (json.dumps(header,sort_keys=True),))
@@ -1788,7 +1792,7 @@ def _enc_header_write(conn,header):
         conn.rollback(); raise
     return done
 
-def _enc_header_cas(conn,old_raw,new_header):
+def _enc_header_cas(conn,old_raw,new_header,held=False):
     """Mise à jour d'un en-tête déjà existant (distincte de _enc_header_write, réservée à la toute
     première écriture) : compare-and-swap sur la valeur brute (BEGIN IMMEDIATE, UPDATE ... WHERE
     value=old_raw). old_raw doit avoir été lu dans la même transaction (_enc_header_read juste avant).
@@ -1796,10 +1800,13 @@ def _enc_header_cas(conn,old_raw,new_header):
     avancement du curseur, migrating->siv1, ré-enveloppe DbRekey). Retourne True si mis à jour.
     sqlite3.OperationalError (ex. "database is locked" sous contention de BEGIN IMMEDIATE) est converti
     en DbModeError : les appelants de cette story n'ont qu'un seul contrat d'échec à gérer (True/False/
-    DbModeError), jamais une sqlite3.Error brute à traiter en plus."""
-    conn.commit()
+    DbModeError), jamais une sqlite3.Error brute à traiter en plus. held=True (1.0.205, story 84) : l'appelant tient déjà
+    BEGIN IMMEDIATE (verrou pris, puis verrous de borgHelper revérifiés) — mise à jour validée dans SA transaction ; sans
+    transaction ouverte : RuntimeError, rien écrit."""
+    if held and not conn.in_transaction: raise RuntimeError("_enc_header_cas(held=True) sans transaction ouverte")
+    if not held: conn.commit()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        if not held: conn.execute("BEGIN IMMEDIATE")
         cur=conn.execute("UPDATE db_meta SET value=? WHERE key='enc_header' AND value=?",
                           (json.dumps(new_header,sort_keys=True),old_raw))
         done=cur.rowcount==1
@@ -2003,7 +2010,9 @@ def _swap_db(live,new,nick=None,abort=None,changed=None,pages=4096,busy_limit=12
     Mécanisme : API backup de SQLite, par tranches de `pages` pages, puis wal_checkpoint(TRUNCATE). Les
     verrous de SQLite garantissent qu'un lecteur voit l'ancienne base ou la nouvelle, jamais un mélange, et
     que les connexions déjà ouvertes (persistantes comprises) voient la nouvelle à leur transaction suivante.
-    Les écrivains attendent la fin de la copie. Jamais os.replace sur une base servie : mesuré, un -wal non
+    Les écrivains attendent la fin de la copie (mesuré, 1.0.205, SSD NVMe : 116-127 Mo/s, 699 Mo en 5,5 s — d'où timeout=60 ou
+    _with_lock_retry pour tout écrivain de diff.db, sauf les délais courts voulus nommés dans _open_db :
+    _recheck_zero_pairs, _drop_orphan_exclusions, ensure_*_db en lecteur, réparation de vue de borgHelperWWW). Jamais os.replace sur une base servie : mesuré, un -wal non
     vide est alors rejoué sur la nouvelle base (lecteurs « no such table », ancien contenu réapparu) ; et
     supprimer -wal/-shm laisse les connexions ouvertes écrire dans l'ancien fichier (écritures perdues).
 
@@ -2085,7 +2094,15 @@ def _empty_snapshot(conn):
 _DEK_FAIL=set()   # 1.0.169 : clés (chemin, mac, condensé passphrase) dont l'enveloppe a refusé la passphrase — pas de KDF refaite
 
 def _open_db(db_path,nick=None,role='read',passphrase=None,empty_ok=False,_retried=False,create_file=None,**kw):
-    """Point d'ouverture UNIQUE des bases SQLite (AD-1). kw -> sqlite3 (timeout=60, ...).
+    """Point d'ouverture UNIQUE des bases SQLite (AD-1). kw -> sqlite3.connect (timeout, ...) ; sans timeout : défaut de
+    sqlite3, 5 s d'attente d'un verrou. 1.0.205 (story 84, D198) : tout écrivain de diff.db qui peut tourner pendant une bascule
+    (_swap_db : fantôme d'Index, compactage d'IdxPurge — sans verrou —, de Prune, de DelBkp) passe timeout=60 ou la reprise
+    _with_lock_retry (300 s). Exceptions voulues (délai court, rien perdu) : _recheck_zero_pairs et _drop_orphan_exclusions
+    (2 s, report au prochain Index), ensure_diff_db/ensure_cache_db en lecteur (create=False : 2 s, rien écrit si occupée),
+    réparation de vue de borgHelperWWW (archive_view_check timeout=2, nouvel essai à la passe suivante). Mesuré sur le SSD NVMe
+    du poste de test : 116-127 Mo/s (370 Mo en 3,2 s, 699 Mo en 5,5 s) ; un écrivain présent dès le début de la copie l'attend en
+    entier : au défaut de 5 s, il échoue dès ~550-600 Mo ; plafonds : 60 s ≈ 7 Go, reprise 300 s ≈ 34 Go — moins sur un disque
+    plus lent ou NFS.
     role : read|write|admin (validé et mémorisé ; 'read' seul peut recevoir la vue vide d'empty_ok, 'admin' seul ouvre une
     base 'migrating').
     nick=None : pas de codec au niveau base (_vacuum_db sans nick, scopecache.db).
@@ -2891,24 +2908,59 @@ class BorgHelperDB:
         return 'ok' if _sql_norm(v[0])==_sql_norm(_ARCHIVE_SNAPSHOT_V_SQL) else 'mismatch'
 
     @classmethod
-    def _repair_archive_view(cls,conn):
-        cls._executescript_atomic(conn,"DROP VIEW IF EXISTS archive_snapshot_v;\n"+_ARCHIVE_SNAPSHOT_V_SQL+";")
-
-    def archive_view_check(self,db_path,repair=False):
-        """Contrôle (et réparation si repair=True et 'mismatch'/'absent') de la vue d'une base existante,
-        sans passphrase (la vue ne porte aucun chemin). Pour borgHelperWWW, qui tourne en continu : -> état
-        AVANT réparation, 'empty' (fichier sans table : rien touché, 1.0.169), ou 'error: …'."""
+    def _repair_archive_view(cls,conn,held=False):
+        """Réparation UNIQUE de la vue archive_snapshot_v (1.0.205, story 84 : ensure_diff_db et archive_view_check) : état
+        relu sous BEGIN IMMEDIATE, DROP/CREATE VIEW seulement s'il est encore 'absent' ou 'mismatch' (un état lu avant une
+        bascule ne décide jamais d'une écriture faite après). held=True : l'appelant tient déjà BEGIN IMMEDIATE — travail
+        dans sa transaction, validation laissée à l'appelant ; sinon transaction en cours validée, puis BEGIN IMMEDIATE propre,
+        validée ici (annulée sur erreur). Rend l'état relu sous verrou ('ok', 'absent', 'mismatch', 'newer', 'empty').
+        held=True sans transaction ouverte : RuntimeError, rien lu ni écrit (jamais un DROP/CREATE hors verrou)."""
+        if held and not conn.in_transaction: raise RuntimeError("_repair_archive_view(held=True) sans transaction ouverte")
+        if not held:
+            if conn.in_transaction: conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
         try:
-            conn=_open_db(db_path,nick=None,role='admin' if repair else 'read')
+            st=cls._archive_view_state(conn) if _conn_has_table(conn) else 'empty'
+            if st in ('mismatch','absent'):
+                conn.execute("DROP VIEW IF EXISTS archive_snapshot_v"); conn.execute(_ARCHIVE_SNAPSHOT_V_SQL)
+            if not held: conn.commit()
+            return st
+        except BaseException:
+            if not held and conn.in_transaction:
+                try: conn.rollback()
+                except sqlite3.Error: pass
+            raise
+
+    def archive_view_check(self,db_path,repair=False,timeout=60,errors=None):
+        """Contrôle (et réparation si repair=True et 'mismatch'/'absent') de la vue d'une base existante,
+        sans passphrase (la vue ne porte aucun chemin). Pour borgHelperWWW, qui tourne en continu. Rend l'état lu ;
+        réparation : l'état RELU sous BEGIN IMMEDIATE juste avant la réparation (_repair_archive_view : 'absent'/'mismatch' =
+        réparée par cet appel, 'ok' = déjà bonne, réparée entre-temps ou basculée), 'empty' (fichier sans table : rien touché,
+        1.0.169), ou 'error: …'.
+        timeout (1.0.205, story 84, D198) : attente du verrou d'écriture (réparation pendant une bascule _swap_db). Défaut 60 s
+        pour les appelants de bibliothèque et CodecSelfTest (aucun appelant CLI) ; la réparation périodique réelle, celle de
+        borgHelperWWW (_schema_watch_pass), passe 2 s et réessaie à sa passe suivante. errors (liste) : reçoit l'exception
+        SQLite d'un rendu 'error: …' (borgHelperWWW la juge par _db_busy)."""
+        try:
+            conn=_open_db(db_path,nick=None,role='admin' if repair else 'read',timeout=timeout)
             try:
                 # 1.0.169 (revue story 32) : fichier sans table (0 octet laissé par l'O_CREAT d'un lecteur) : jamais de vue créée
                 # dessus — elle donnerait un schéma à une base pas encore née (plus de chiffrement d'office, A52 manqué)
                 if not _conn_has_table(conn): return 'empty'
                 st=self._archive_view_state(conn)
-                if repair and st in ('mismatch','absent'): self._repair_archive_view(conn)
+                if repair and st in ('mismatch','absent'):
+                    if conn.in_transaction: conn.commit()
+                    conn.execute("BEGIN IMMEDIATE")
+                    try: st=self._repair_archive_view(conn,held=True); conn.commit()
+                    except BaseException:
+                        if conn.in_transaction:
+                            try: conn.rollback()
+                            except sqlite3.Error: pass
+                        raise
                 return st
             finally: conn.close()
         except sqlite3.Error as e:
+            if errors is not None: errors.append(e)
             return f"error: {e}"
 
     def _reader_skip_fresh(self,db_path):
@@ -5510,36 +5562,62 @@ class BorgHelper:
         lot partiel visible). Connexion admin nue (nick=None) : le codec est géré ici à la main (DEK
         déchiffrée une fois), jamais via conn.codec — la base reste 'migrating' pendant toute l'opération,
         hors de portée de _open_db pour tout rôle non-admin (AD-11)."""
-        conn=_open_db(db_path,nick=None,role='admin')
+        conn=_open_db(db_path,nick=None,role='admin',timeout=60)   # 1.0.205 (D198) : IdxPurge (sans verrou) peut basculer en même temps
         try:
-            raw=_enc_header_read(conn)
             # Re-vérification des verrous juste avant la toute première écriture qui bascule la base en
             # 'migrating' (_db_migrate ne les a vérifiés qu'avant d'ouvrir cette connexion) : ne supprime
             # pas la fenêtre de course — la protection ferme d'AD-11 démarre une fois le mode réellement
             # 'migrating' — mais la réduit entre « on a décidé de démarrer » et « on a démarré ».
-            busy=self._db_locks_busy(nick)
-            if busy: raise DbModeError(f"{busy} — migration refusée")
-            if raw is None:
+            # 1.0.205 (story 84) : KDF d'abord, HORS de tout verrou d'écriture (comme avant), sur l'en-tête lu ici ; puis verrou
+            # d'écriture (BEGIN IMMEDIATE, jusqu'à 60 s pendant une bascule), en-tête relu sous ce verrou et exigé identique à
+            # celui de la KDF, verrous de borgHelper revérifiés, première écriture dans la même transaction (held=True) — une
+            # opération prioritaire démarrée pendant l'attente est vue.
+            raw0=_enc_header_read(conn); first=None
+            if raw0 is None:
                 if direction=='decrypt': raise DbModeError(f"{nick}: déjà en clair")
                 level=db_kdf_level(nick,cfg=cfg)
                 new_header,_dek=_enc_header_build(passphrase,'migrating',level)
-                new_header['migrating_dir']='encrypt'
-                if not _enc_header_write(conn,new_header):
-                    raise DbModeError(f"{nick}: en-tête créé entre-temps par un autre processus — relancer")
+                new_header['migrating_dir']='encrypt'; first=('write',new_header)
+            else:
+                h0=_enc_header_parse(raw0)
+                if h0['path_enc']=='siv1':
+                    if direction=='encrypt': raise DbModeError(f"{nick}: déjà chiffrée")
+                    # le MAC de l'enveloppe couvre path_enc (_wrap_mac) : un simple dict(header,path_enc=...)
+                    # laisserait un MAC calculé pour l'ancien path_enc — toujours reconstruire via
+                    # _enc_header_build (même DEK, nouveau sel/nonce/MAC) dès que path_enc change.
+                    dek0=_enc_header_unlock(h0,passphrase)
+                    level=db_kdf_level(nick,cfg=cfg)
+                    new_header,_dek0=_enc_header_build(passphrase,'migrating',level,dek=dek0)
+                    new_header['migrating_dir']='decrypt'; first=('cas',new_header)
+            def _sqlerr(e):   # base remplacée/abîmée depuis la première lecture : [ERREUR] habituel, jamais une trace brute
+                # OperationalError (verrou, disque plein, lecture seule, E/S au COMMIT) : DbModeError, comme _enc_header_cas l'a
+                # toujours fait — jamais présentée comme une altération ; DbTamperError seulement pour une base abîmée
+                if _db_busy(e): return DbModeError(f"{nick}: en-tête verrouillé ({e}) — relancer")
+                if isinstance(e,sqlite3.OperationalError): return DbModeError(f"{nick}: {e} — relancer")
+                return DbTamperError(f"{nick}: {e}")
+            try: conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.DatabaseError as e: raise _sqlerr(e) from None
+            try:
                 raw=_enc_header_read(conn)
-            header=_enc_header_parse(raw)
-            if header['path_enc']=='siv1':
-                if direction=='encrypt': raise DbModeError(f"{nick}: déjà chiffrée")
-                # le MAC de l'enveloppe couvre path_enc (_wrap_mac) : un simple dict(header,path_enc=...)
-                # laisserait un MAC calculé pour l'ancien path_enc — toujours reconstruire via
-                # _enc_header_build (même DEK, nouveau sel/nonce/MAC) dès que path_enc change.
-                dek0=_enc_header_unlock(header,passphrase)
-                level=db_kdf_level(nick,cfg=cfg)
-                new_header,_dek0=_enc_header_build(passphrase,'migrating',level,dek=dek0)
-                new_header['migrating_dir']='decrypt'
-                if not _enc_header_cas(conn,raw,new_header):
-                    raise DbModeError(f"{nick}: en-tête changé entre-temps — relancer")
-                raw=_enc_header_read(conn); header=_enc_header_parse(raw)
+                if raw!=raw0: raise DbModeError(f"{nick}: en-tête changé entre-temps — relancer")
+                busy=self._db_locks_busy(nick)
+                if busy: raise DbModeError(f"{busy} — migration refusée")
+                if first and first[0]=='write':
+                    if not _enc_header_write(conn,first[1],held=True):
+                        raise DbModeError(f"{nick}: en-tête créé entre-temps par un autre processus — relancer")
+                    raw=_enc_header_read(conn)
+                elif first:
+                    if not _enc_header_cas(conn,raw,first[1],held=True):
+                        raise DbModeError(f"{nick}: en-tête changé entre-temps — relancer")
+                    raw=_enc_header_read(conn)
+                header=_enc_header_parse(raw)
+                if conn.in_transaction: conn.commit()   # reprise ('migrating' déjà posé) : rien écrit ici, verrou rendu
+            except BaseException as e:
+                if conn.in_transaction:
+                    try: conn.rollback()
+                    except sqlite3.Error: pass
+                if isinstance(e,sqlite3.DatabaseError): raise _sqlerr(e) from None
+                raise
             if header['path_enc']!='migrating':
                 raise DbTamperError(f"{nick}: état d'en-tête inattendu ({header['path_enc']!r})")
             if header.get('migrating_dir') not in (None,direction):
@@ -5767,7 +5845,7 @@ class BorgHelper:
         busy=self._db_locks_busy(nick)
         if busy:
             printer(f"  [ERREUR] {busy} — DbRekey refusé"); return 2
-        conn=_open_db(db_path,nick=None,role='admin')
+        conn=_open_db(db_path,nick=None,role='admin',timeout=60)   # 1.0.205 (D198) : IdxPurge (sans verrou) peut basculer en même temps
         try:
             raw=_enc_header_read(conn)
             if raw is None:
@@ -5783,10 +5861,29 @@ class BorgHelper:
                 printer(f"  {nick}: DbRekey -> ajouter -y pour ré-envelopper la DEK avec une nouvelle KEK"); return 2
             level=db_kdf_level(nick,cfg=cfg)
             new_header,_dek2=_enc_header_build(passphrase,'siv1',level,dek=dek)
+            # 1.0.205 (story 84) : KDF faite ci-dessus, hors verrou ; verrou d'écriture pris ensuite (jusqu'à 60 s pendant une
+            # bascule), en-tête relu sous ce verrou et exigé identique à celui de la KDF, verrous revérifiés (une opération
+            # prioritaire démarrée pendant l'attente est vue), CAS dans la même transaction. Base remplacée/abîmée depuis la
+            # première lecture : [ERREUR], jamais une trace brute.
             try:
-                if not _enc_header_cas(conn,raw,new_header):
-                    raise DbModeError(f"{nick}: en-tête changé entre-temps — relancer DbRekey")
-            except DbModeError as e:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        if _enc_header_read(conn)!=raw: raise DbModeError(f"{nick}: en-tête changé entre-temps — relancer DbRekey")
+                        busy=self._db_locks_busy(nick)
+                        if busy:
+                            conn.rollback(); printer(f"  [ERREUR] {busy} — DbRekey refusé"); return 2
+                        if not _enc_header_cas(conn,raw,new_header,held=True):
+                            raise DbModeError(f"{nick}: en-tête changé entre-temps — relancer DbRekey")
+                    finally:
+                        if conn.in_transaction:
+                            try: conn.rollback()
+                            except sqlite3.Error: pass
+                except sqlite3.DatabaseError as e:   # même règle que _db_migrate_run : OperationalError -> DbModeError
+                    if _db_busy(e): raise DbModeError(f"en-tête verrouillé ({e}) — relancer") from None
+                    if isinstance(e,sqlite3.OperationalError): raise DbModeError(f"{e} — relancer") from None
+                    raise DbTamperError(str(e)) from None
+            except (DbModeError,DbTamperError) as e:
                 printer(f"  [ERREUR] {nick}: {e}"); return 2
             ck=(os.path.realpath(db_path),header['mac'],hashlib.sha256(_pw_bytes(passphrase)).digest())
             _DEK_CACHE.pop(ck,None); _CODEC_CACHE.pop(ck,None)  # ancienne enveloppe : mémo de ce processus purgé par prudence
@@ -7009,7 +7106,7 @@ class BorgHelper:
                 print(f"{nick}: snapshot {archive_name} déjà indexé"); return 0
             conn=None
             try:
-                conn=_open_db(db_path,nick=nick,role='write')
+                conn=_open_db(db_path,nick=nick,role='write',timeout=60)   # 1.0.205 (D198) : bascule d'IdxPurge possible
                 conn.execute("DELETE FROM archive_snapshot WHERE nick=? AND archive=?",(nick,archive_name))
                 conn.execute("DELETE FROM archive_snapshot_indexed WHERE nick=? AND archive=?",(nick,archive_name))
                 self.db._cleanup_snapshot_file_orphans(nick,conn)
@@ -7022,7 +7119,7 @@ class BorgHelper:
             # incrémental avant leur borg list) : retirées avant de refaire l'unité (AD-1 : unité = sentinelle).
             conn=None
             try:
-                conn=_open_db(db_path,nick=nick,role='write')
+                conn=_open_db(db_path,nick=nick,role='write',timeout=60)   # 1.0.205 (D198) : bascule d'IdxPurge possible
                 if conn.execute("DELETE FROM archive_snapshot WHERE nick=? AND archive=?",(nick,archive_name)).rowcount:
                     self.db._cleanup_snapshot_file_orphans(nick,conn)
                     conn.commit()
@@ -7546,7 +7643,7 @@ class BorgHelper:
         if pairs_to_purge:
             conn=None
             try:
-                conn=_open_db(db_path,nick=nick,role='write')
+                conn=_open_db(db_path,nick=nick,role='write',timeout=60)   # 1.0.205 (D198) : bascule d'IdxPurge possible
                 for a_old,a_new in pairs_to_purge:
                     conn.execute("DELETE FROM diff_index WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
                     conn.execute("DELETE FROM diff_indexed_pairs WHERE nick=? AND archive_old=? AND archive_new=?",(nick,a_old,a_new))
@@ -7851,7 +7948,7 @@ class BorgHelper:
         key=('state','pairs_done','pairs_total','archives_total','stats_done','snapshot')
         old=None
         try:
-            conn=_open_db(db_path,nick=nick,role='write')
+            conn=_open_db(db_path,nick=nick,role='write',timeout=60)   # 1.0.205 (D198) : bascule d'IdxPurge possible
             try:
                 row=conn.execute("SELECT value FROM db_meta WHERE key=?",(_build_state_key(nick),)).fetchone()
                 if row:
@@ -8046,7 +8143,7 @@ class BorgHelper:
         if res=='ok':
             plan['shadow']=None
             try:
-                c=_open_db(live,nick=None,role='write')
+                c=_open_db(live,nick=None,role='write',timeout=60)   # 1.0.205 (D198) : bascule d'IdxPurge possible
                 try: c.execute("DELETE FROM db_meta WHERE key='rebuild_header_fp'"); c.commit()
                 finally: c.close()
             except sqlite3.Error: pass
@@ -15275,6 +15372,135 @@ def codec_selftest(pattern=None,list_only=False):
                 except OSError: pass
             return r!=0 and _db5_mode(b,'m5')=='plain'
         check("DbEncrypt : Index en cours (verrou simulé) -> refus, base intacte",_db5_locked_refused)
+        def _db5_priority_during_wait():
+            """1.0.205 (story 84) : DbEncrypt puis DbRekey attendent le verrou d'écriture d'une base tenue par une autre connexion
+            (comme une bascule) ; une opération prioritaire (priority.lock d'un AUTRE processus vivant) apparaît pendant l'attente
+            -> revérification APRÈS la prise du verrou : refus (code 2, « migration refusée » / « DbRekey refusé »), rien écrit
+            (DbEncrypt : base plain, aucun en-tête ; DbRekey : en-tête inchangé). Témoin d'ordre : pendant l'attente, la
+            vérification des verrous n'a été faite qu'une fois (avant l'ouverture) — la seconde vient après le verrou."""
+            import threading as _th
+            res={}
+            for nk,kind in (('m84e','encrypt'),('m84r','rekey')):
+                b,paths=_db5_env(nk); p=b.db.get_diff_db(nk)
+                if kind=='rekey':
+                    with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): b.db_encrypt(nk,confirm=True)
+                def hdr():
+                    c=sqlite3.connect(p)
+                    try: return c.execute("SELECT value FROM db_meta WHERE key='enc_header'").fetchone()
+                    finally: c.close()
+                h0=hdr(); real=b._db_locks_busy; calls=[]; hold={}
+                def spy(n):
+                    calls.append(1); r=real(n)
+                    if len(calls)==1:   # 1re vérification (avant l'ouverture) : la base est tenue dès maintenant
+                        hold['c']=sqlite3.connect(p,isolation_level=None,check_same_thread=False); hold['c'].execute("BEGIN IMMEDIATE")
+                    return r
+                b._db_locks_busy=spy
+                prio=b.db._priority_holder_path(nk,os.getppid()); out=io.StringIO(); r=[None]
+                def go():
+                    r[0]=b.db_encrypt(nk,confirm=True) if kind=='encrypt' else b.db_rekey(nk,confirm=True)
+                th=_th.Thread(target=go,daemon=True)
+                try:
+                    with contextlib.redirect_stdout(out),contextlib.redirect_stderr(out):
+                        th.start(); t0=time.monotonic()
+                        while 'c' not in hold and th.is_alive() and time.monotonic()-t0<30: time.sleep(0.02)
+                        time.sleep(1.5); waiting=th.is_alive() and len(calls)==1
+                        with open(prio,'w') as f: f.write(str(os.getppid()))
+                        if 'c' in hold: hold['c'].execute("ROLLBACK")
+                        th.join(90)
+                finally:
+                    if 'c' in hold: hold['c'].close()
+                    try: os.unlink(prio)
+                    except OSError: pass
+                    b._db_locks_busy=real
+                txt=out.getvalue(); want='migration refusée' if kind=='encrypt' else 'DbRekey refusé'
+                res[kind]=(not th.is_alive() and waiting and r[0]==2 and len(calls)==2 and want in txt and 'priority lock' in txt
+                           and hdr()==h0 and (kind=='rekey' or (h0 is None and _db5_mode(b,nk)=='plain')),waiting,r[0],len(calls),txt[-200:])
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"     détail : {res}")
+            return ok
+        check("DbEncrypt / DbRekey : opération prioritaire apparue pendant l'attente du verrou d'écriture -> refus après le verrou, rien écrit (1.0.205)",_db5_priority_during_wait)
+        def _db5_kdf_outside_lock():
+            """1.0.205 (story 84) : DbEncrypt, DbRekey puis DbDecrypt — chaque KDF (_enc_header_build, _enc_header_unlock) tourne
+            HORS du verrou d'écriture de diff.db : une autre connexion prend BEGIN IMMEDIATE sans attendre (délai 0) au moment de
+            chaque KDF ; les trois commandes réussissent, base revenue en clair."""
+            nk='m84k'; b,paths=_db5_env(nk); p=b.db.get_diff_db(nk); g=globals(); rb,ru=g['_enc_header_build'],g['_enc_header_unlock']; probes=[]
+            def probe(what):
+                c=sqlite3.connect(p,timeout=0,isolation_level=None)
+                try: c.execute("BEGIN IMMEDIATE"); c.execute("ROLLBACK"); probes.append((what,True))
+                except sqlite3.OperationalError: probes.append((what,False))
+                finally: c.close()
+            def wb(*a,**k): probe('build'); return rb(*a,**k)
+            def wu(*a,**k): probe('unlock'); return ru(*a,**k)
+            g['_enc_header_build']=wb; g['_enc_header_unlock']=wu
+            try:
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                    r=(b.db_encrypt(nk,confirm=True),b.db_rekey(nk,confirm=True),b.db_decrypt(nk,confirm=True))
+            finally: g['_enc_header_build']=rb; g['_enc_header_unlock']=ru
+            ok=r==(0,0,0) and len(probes)>=4 and all(x for _,x in probes) and _db5_mode(b,nk)=='plain'
+            if not ok: print(f"     détail : codes={r} sondes={probes} mode={_db5_mode(b,nk)}")
+            return ok
+        check("DbEncrypt / DbRekey / DbDecrypt : chaque KDF hors du verrou d'écriture de diff.db (1.0.205)",_db5_kdf_outside_lock)
+        def _db5_readonly_write_mode_error():
+            """1.0.205 (story 84, revue 4) : erreur SQLite non verrou (« attempt to write a readonly database », comme disque plein ou
+            base en lecture seule) au BEGIN IMMEDIATE puis à la première écriture d'en-tête sous ce verrou -> DbEncrypt, DbDecrypt
+            et DbRekey : code 2, [ERREUR] … DbModeError (DbRekey : [ERREUR] seul), jamais DbTamperError ni trace, en-tête inchangé.
+            _enc_header_write/_enc_header_cas(held=True) sans transaction ouverte : RuntimeError, rien écrit."""
+            ro='attempt to write a readonly database'; real_ex=sqlite3.Connection.execute; res={}
+            def hdr(p):
+                c=sqlite3.connect(p)
+                try: return c.execute("SELECT value FROM db_meta WHERE key='enc_header'").fetchone()
+                finally: c.close()
+            for point in ('begin','write'):
+                nk=f'm84o{point[0]}'; b,paths=_db5_env(nk); p=b.db.get_diff_db(nk)
+                def ex(self,sql,*a,_pt=point):
+                    f=sys._getframe(1); nm=f.f_code.co_name; q=' '.join(str(sql).split()).upper()
+                    if ((_pt=='begin' and q=='BEGIN IMMEDIATE' and nm in ('_db_migrate_run','db_rekey')) or
+                        (_pt=='write' and nm in ('_enc_header_write','_enc_header_cas') and f.f_locals.get('held')
+                         and q.startswith(('INSERT INTO DB_META','UPDATE DB_META')))):
+                        raise sqlite3.OperationalError(ro)
+                    return real_ex(self,sql,*a)
+                def run(fn):
+                    o=io.StringIO(); h0=hdr(p)
+                    with contextlib.redirect_stdout(o),contextlib.redirect_stderr(o), mock.patch.object(BhConnection,'execute',ex):
+                        try: r=fn()
+                        except BaseException as e: r=f"exception {type(e).__name__}: {e}"
+                    t=o.getvalue()
+                    return (r==2 and '[ERREUR]' in t and ro in t and 'DbTamperError' not in t and 'Traceback' not in t and hdr(p)==h0,r,t[-200:])
+                res[f'{point} DbEncrypt']=run(lambda: b.db_encrypt(nk,confirm=True))
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): enc=b.db_encrypt(nk,confirm=True)
+                res[f'{point} chiffrée']=(enc==0 and _db5_mode(b,nk)=='siv1',enc)
+                res[f'{point} DbDecrypt']=run(lambda: b.db_decrypt(nk,confirm=True))
+                res[f'{point} DbRekey']=run(lambda: b.db_rekey(nk,confirm=True))
+                for k in ('DbEncrypt','DbDecrypt'):   # le nom de classe affiché par _db_migrate
+                    v=res[f'{point} {k}']; res[f'{point} {k}']=(v[0] and 'DbModeError' in v[2],)+v[1:]
+            # garde held=True sans transaction
+            nk='m84oh'; b,paths=_db5_env(nk); p=b.db.get_diff_db(nk)
+            c=_open_db(p,nick=None,role='admin')
+            try:
+                w=raises(RuntimeError,lambda: _enc_header_write(c,{'x':1},held=True)); w0=hdr(p) is None and not c.in_transaction
+                c.execute("INSERT INTO db_meta(key,value) VALUES('enc_header','brut')"); c.commit()
+                k=raises(RuntimeError,lambda: _enc_header_cas(c,'brut',{'x':2},held=True)); k0=hdr(p)==('brut',) and not c.in_transaction
+            finally: c.close()
+            res['held sans transaction']=(w and w0 and k and k0,w,w0,k,k0)
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"     détail : {[(n,v) for n,v in res.items() if not v[0]]}")
+            return ok
+        check("DbEncrypt / DbDecrypt / DbRekey : erreur SQLite non verrou sous le verrou -> DbModeError, jamais DbTamperError ; held=True sans transaction -> RuntimeError (1.0.205)",_db5_readonly_write_mode_error)
+        def _repair_view_held_needs_txn():
+            """1.0.205 (story 84) : _repair_archive_view(held=True) sans transaction ouverte -> RuntimeError, vue absente laissée
+            absente (jamais de DROP/CREATE hors verrou) ; held=False sur la même base : vue recréée, 'absent' rendu."""
+            bdb=BorgHelperDB(tmp,'rvh'); p=os.path.join(tmp,'rvh-diff.db'); _unlink_db(p); bdb.ensure_diff_db(p)
+            c=_open_db(p,nick=None,role='admin')
+            try:
+                c.execute("DROP VIEW archive_snapshot_v"); c.commit()
+                refused=raises(RuntimeError,lambda: BorgHelperDB._repair_archive_view(c,held=True))
+                still=c.execute("SELECT 1 FROM sqlite_master WHERE name='archive_snapshot_v'").fetchone() is None and not c.in_transaction
+                st=BorgHelperDB._repair_archive_view(c)
+                back=c.execute("SELECT sql FROM sqlite_master WHERE name='archive_snapshot_v'").fetchone()==(_ARCHIVE_SNAPSHOT_V_SQL,)
+            finally: c.close()
+            _unlink_db(p)
+            return refused and still and st=='absent' and back
+        check("_repair_archive_view(held=True) sans transaction -> RuntimeError, rien écrit ; held=False -> vue recréée (1.0.205)",_repair_view_held_needs_txn)
         def _db5_disk_full_refused():
             b,paths=_db5_env('m6')
             try:
@@ -15735,6 +15961,288 @@ def codec_selftest(pattern=None,list_only=False):
             finally: dbx.clear_priority_lock('psl')
             return held and ok is True and os.path.getsize(p)<s0 and 'opération prioritaire' not in out.getvalue()
         check("bascule : priority.lock de ce processus (Prune) -> compactage effectué, pas de report",_swap_self_lock)
+        def _swap_slow_writers():
+            """1.0.205 (story 84, D198) : bascule de plus de 5 s — copie ralentie dans un autre processus (verrou d'écriture
+            de la base servie tenu ~T s), écrivains lancés pendant la copie. (1) Nouvelle base sans vue : témoin sans délai
+            (défaut de sqlite3, 5 s) refusé (« database is locked ») AVANT la fin de la copie (heure de fin écrite par le
+            processus de copie) ; archive_view_check(repair=True) (60 s par défaut) et _index_finish (60 s) attendent plus de
+            5 s puis écrivent dans la nouvelle base. (2) Nouvelle base qui porte déjà la bonne vue (texte à espaces différents,
+            même définition normalisée) : archive_view_check, qui a lu « absent » avant la bascule et attendu le verrou, relit
+            sous BEGIN IMMEDIATE -> 'ok', aucun DROP/CREATE (texte de sqlite_master inchangé). Fil d'écrivain encore vivant après
+            son attente : FAIL, bases laissées (le fil s'en sert encore)."""
+            import types as _types, threading as _th
+            bdb=BorgHelperDB(tmp,'sws'); live=os.path.join(tmp,'sws-diff.db'); new=live+'.new'; marker=live+'.started'
+            fin_f=live+'.fin'; T=8.0; alive=[]; vsql=_ARCHIVE_SNAPSHOT_V_SQL.replace('\n    ','\n        ')
+            def _round(view_new,writers):
+                for p,gen in ((live,'A'),(new,'B')):
+                    _unlink_db(p); bdb.ensure_diff_db(p)
+                    c=_open_db(p,nick=None,role='admin')
+                    try:
+                        c.execute("DROP VIEW IF EXISTS archive_snapshot_v")   # base servie sans vue : l'écrivain lit « absent »
+                        if gen=='B' and view_new: c.execute(vsql)
+                        c.execute("INSERT OR REPLACE INTO db_meta VALUES('gen',?)",(gen,))
+                        if gen=='B': c.executemany("INSERT INTO db_meta VALUES(?,?)",[(f'pad{i}','x'*2000) for i in range(400)])
+                        c.commit()
+                    finally: c.close()
+                for f in (marker,fin_f):
+                    if os.path.exists(f): os.unlink(f)
+                def _child():
+                    t0=[]
+                    def _slow():   # rappel après chaque tranche : verrou de la base servie tenu dès la 1re, copie étirée à T s
+                        if not t0: t0.append(time.monotonic()); open(marker,'a').close()
+                        if time.monotonic()-t0[0]<T: time.sleep(0.25)
+                        return False
+                    r=_swap_db(live,new,pages=4,abort=_slow)
+                    with open(fin_f,'w') as fh: fh.write(repr(time.time()))   # fin de la copie (horloge commune aux processus)
+                    os._exit(0 if r=='ok' else 1)
+                p=_fork.Process(target=_child); p.start(); res={}
+                try:
+                    tw=time.monotonic()
+                    while not os.path.exists(marker) and p.is_alive() and time.monotonic()-tw<30: time.sleep(0.02)
+                    started=os.path.exists(marker)
+                    def _run(k,fn):
+                        t=time.monotonic()
+                        try: r=fn()
+                        except Exception as e: r=f"{type(e).__name__}: {e}"
+                        res[k]=(r,time.monotonic()-t,time.time())
+                    ths=[_th.Thread(target=_run,args=a,daemon=True) for a in writers]
+                    out=io.StringIO()
+                    with contextlib.redirect_stdout(out),contextlib.redirect_stderr(out):
+                        if started:
+                            for t in ths: t.start()
+                            for t in ths: t.join(120)
+                    alive.extend(t for t in ths if t.is_alive())
+                    p.join(60)
+                finally:
+                    if p.is_alive(): p.kill(); p.join(5)   # jamais d'orphelin qui garderait la base ouverte
+                try:
+                    with open(fin_f) as fh: fin=float(fh.read())
+                except (OSError,ValueError): fin=None
+                return started,p.exitcode,fin,res,out.getvalue()
+            def _witness():
+                c=_open_db(live,nick=None,role='write')   # sans timeout : défaut de sqlite3 (5 s)
+                try: c.execute("INSERT OR REPLACE INTO db_meta VALUES('witness','1')"); c.commit(); return 'écrit'
+                finally: c.close()
+            def _q1(sql,*a):
+                c=sqlite3.connect(live)
+                try: return c.execute(sql,a).fetchone()
+                finally: c.close()
+            fake=_types.SimpleNamespace(_build_state=lambda *a: BorgHelper._build_state(None,*a))
+            arch=[{'name':'sws-a1','start':'2026-01-01T00:00:00'}]
+            try:
+                s1,x1,fin1,r1,o1=_round(False,(('témoin',_witness),('vue',lambda: bdb.archive_view_check(live,repair=True)),
+                                               ('fin',lambda: BorgHelper._index_finish(fake,'sws',live,arch,None,True,True))))
+                if alive:
+                    print(f"     détail : {len(alive)} fil(s) d'écrivain encore vivant(s) après 120 s — bases laissées : {live}"); return False
+                gen=_q1("SELECT value FROM db_meta WHERE key='gen'")
+                view=_q1("SELECT sql FROM sqlite_master WHERE type='view' AND name='archive_snapshot_v'")
+                bs=_q1("SELECT 1 FROM db_meta WHERE key=?",_build_state_key('sws')) is not None
+                wit=_q1("SELECT 1 FROM db_meta WHERE key='witness'") is not None
+                w,v,f=(r1.get(k,(None,0,0)) for k in ('témoin','vue','fin'))
+                ok1=(s1 and x1==0 and fin1 is not None and gen==('B',)
+                     and isinstance(w[0],str) and 'locked' in w[0] and w[1]>=4.5 and w[2]<fin1 and not wit
+                     and v[0]=='absent' and v[1]>5 and view==(_ARCHIVE_SNAPSHOT_V_SQL,) and f[0]==0 and f[1]>5 and bs)
+                s2,x2,fin2,r2,o2=_round(True,(('vue',lambda: bdb.archive_view_check(live,repair=True)),))
+                if alive:
+                    print(f"     détail : fil d'écrivain encore vivant (cas 2) — bases laissées : {live}"); return False
+                v2=r2.get('vue',(None,0,0)); view2=_q1("SELECT sql FROM sqlite_master WHERE type='view' AND name='archive_snapshot_v'")
+                ok2=s2 and x2==0 and v2[0]=='ok' and v2[1]>=1 and view2==(vsql,)
+                if not (ok1 and ok2):
+                    print(f"     détail : (1) copie={s1} code={x1} fin={fin1} contenu={gen} témoin={w[0]!r} {w[1]:.1f} s fini avant la copie="
+                          f"{fin1 is not None and w[2]<fin1} (écrit={wit}) ; vue={v[0]!r} {v[1]:.1f} s (vue={view and view[0][:30]!r}) ; "
+                          f"fin={f[0]!r} {f[1]:.1f} s (état={bs}) ; sortie={o1.strip().splitlines()[:3]} — (2) copie={s2} code={x2} "
+                          f"vue={v2[0]!r} {v2[1]:.1f} s texte inchangé={view2==(vsql,)}")
+                return ok1 and ok2
+            finally:
+                if not alive:
+                    _unlink_db(live); _unlink_db(new)
+                    for fx in (marker,fin_f):
+                        try: os.unlink(fx)
+                        except OSError: pass
+        check("bascule lente (> 5 s) : témoin au défaut de sqlite3 refusé ; archive_view_check et _index_finish (60 s) attendent et écrivent ; vue déjà bonne relue sous verrou -> 'ok' (1.0.205, D198)",_swap_slow_writers)
+        def _diff_writer_guard():
+            """1.0.205 (story 84, D198) : garde AST. Chaque _open_db de rôle write/admin du code de production (hors CodecSelfTest,
+            _pb_*), rôle lu aussi en position, est accepté seulement par (1) un délai ≥ 60 s par VALEUR : constante numérique,
+            paramètre de la fonction dont le défaut est une constante ≥ 60 et jamais réaffecté dans son corps (chaque appel de
+            cette fonction dans le code de production qui passe ce paramètre : constante ≥ 60, sinon signalé), expression
+            conditionnelle alignée sur un rôle conditionnel (même test : branche d'écriture jugée) ; (2) une fonction imbriquée
+            réellement passée à _with_lock_retry (dernière définition de ce nom avant l'appel, reprise 300 s) ; (3) la liste
+            blanche PAR APPEL (fonction + texte du chemin de base), avec sa raison, chaque entrée couvrant exactement un site.
+            Un appel avec **kw n'est accepté que par la liste. Reprise : _with_lock_retry sans max_wait ou max_wait constante
+            ≥ 60, et la fonction imbriquée jamais appelée directement. Délai conditionnel d'ensure_* (écrivain/lecteur) : entrée
+            de liste (branche lecteur, raison) et branche écrivain jugée par valeur. Appelants d'une fonction acceptée par le
+            défaut de son paramètre : mot-clé, position (méthode liée ou `Classe.méthode(obj, …)`), **kw (invérifiable :
+            signalé). Sites de la story 84 : acceptés par valeur. Témoins : chaque refus, entrée de liste à deux sites, entrée
+            périmée, site de la story jugé par la liste ou absent. Limites connues (reportées) : paramètre de délai relié par
+            with … as, except … as, import, nonlocal/global ou match — non vu comme une réaffectation."""
+            import ast
+            white={('_open_db','db_path'):'récursion, kw transmis',
+                   ('_swap_db','new'):'copie source : jamais servie',
+                   ('_swap_db','live'):'la bascule elle-même : timeout=1 + busy_limit 120 s',
+                   ('BorgHelper._vacuum_db','tmp_path'):'copie .vacuum_tmp : jamais servie',
+                   ('BorgHelper._shadow_prepare','sp'):'fantôme : jamais servi',
+                   ('BorgHelper._db_migrate','db_path'):'lecture seule (en-tête, comptes)',
+                   ('BorgHelper._recheck_zero_pairs._do','db_path'):'busy_timeout=2000 explicite, report voulu sans perte (1.0.153)',
+                   ('BorgHelper._drop_orphan_exclusions','db_path'):'2 s voulu, report sans perte (1.0.201)',
+                   ('BorgHelperDB.ensure_cache_db','db_path'):('orelse','lecteur (create=False) : 2 s, rien écrit si occupée'),
+                   ('BorgHelperDB.ensure_diff_db','db_path'):('orelse','lecteur (create=False) : 2 s, rien écrit si occupée'),
+                   ('BorgHelperDB.ensure_history_db','path'):'history.db : jamais basculée',
+                   ('BorgHelperDB._migrate_to_history','hist'):'history.db : jamais basculée',
+                   ('BorgHelperDB._migrate_to_history._mark_done','hist'):'history.db : jamais basculée',
+                   ('BorgHelperDB.purge_stale_cache','db_path'):'cache.db : jamais basculée',
+                   ('BorgHelperDB.clear_cache_nick','db_path'):'cache.db : jamais basculée',
+                   ('BorgHelper.cache_prune_dryrun','db_path'):'cache.db : jamais basculée',
+                   ('BorgHelper.cacheJsonBoexWithLM','db_path'):'cache.db : jamais basculée',
+                   ('BorgHelper._db_migrate_cache','cache_path'):'cache.db : jamais basculée'}
+            need=('BorgHelper.indexsnap','BorgHelper._index_select_pairs','BorgHelper._index_finish','BorgHelper._shadow_swap',
+                  'BorgHelper._db_migrate_run','BorgHelper.db_rekey','BorgHelperDB.archive_view_check')
+            FN=(ast.FunctionDef,ast.AsyncFunctionDef)
+            def num(x): return isinstance(x,ast.Constant) and isinstance(x.value,(int,float)) and not isinstance(x.value,bool) and x.value>=60
+            def judge(src,white,need):
+                """-> (sites [(qn,chemin,ligne,verdict)], refusés, appelants à délai court, sites de need non jugés par valeur,
+                entrées de liste périmées, entrées à plusieurs sites)."""
+                t=ast.parse(src); par={}
+                for n in ast.walk(t):
+                    for ch in ast.iter_child_nodes(n): par[ch]=n
+                def chain(n):
+                    out=[]
+                    while n in par:
+                        n=par[n]
+                        if isinstance(n,FN+(ast.ClassDef,)): out.append(n)
+                    return out[::-1]
+                def prod(n): return not any(x.name=='codec_selftest' or x.name.startswith('_pb_') for x in chain(n))
+                def own(fn):   # noeuds de fn hors de ses fonctions imbriquées (les définitions elles-mêmes comprises)
+                    st=list(ast.iter_child_nodes(fn))
+                    while st:
+                        n=st.pop(); yield n
+                        if not isinstance(n,FN+(ast.Lambda,ast.ClassDef)): st.extend(ast.iter_child_nodes(n))
+                passed=set(); direct=set(); classes={c.name for c in ast.walk(t) if isinstance(c,ast.ClassDef)}
+                for fn in (n for n in ast.walk(t) if isinstance(n,FN)):
+                    nodes=list(own(fn)); defs=[n for n in nodes if isinstance(n,FN)]
+                    def resolve(name,line):
+                        c=[d for d in defs if d.name==name and d.lineno<line]
+                        return max(c,key=lambda d: d.lineno) if c else None
+                    for m in nodes:
+                        if not isinstance(m,ast.Call): continue
+                        if isinstance(m.func,ast.Name):   # appel direct d'une fonction imbriquée : pas de reprise
+                            d=resolve(m.func.id,m.lineno)
+                            if d is not None: direct.add(d)
+                        if getattr(m.func,'attr',getattr(m.func,'id',None))=='_with_lock_retry' and m.args and isinstance(m.args[0],ast.Name):
+                            mw=[k.value for k in m.keywords if k.arg=='max_wait']+m.args[1:2]
+                            if any(k.arg is None for k in m.keywords) or any(not num(x) for x in mw): continue   # attente courte ou inconnue
+                            d=resolve(m.args[0].id,m.lineno)
+                            if d is not None: passed.add(d)
+                passed-=direct
+                def params(fn):
+                    a=fn.args; ps=a.posonlyargs+a.args; ds=[None]*(len(ps)-len(a.defaults))+list(a.defaults)
+                    d=dict(zip([q.arg for q in ps],ds)); d.update(zip([k.arg for k in a.kwonlyargs],a.kw_defaults))
+                    return [q.arg for q in ps],d
+                def assigned(fn,name):
+                    for m in own(fn):
+                        tg=([m.target] if isinstance(m,(ast.AugAssign,ast.AnnAssign,ast.NamedExpr,ast.For)) else
+                            m.targets if isinstance(m,ast.Assign) else [])
+                        if any(isinstance(x,ast.Name) and x.id==name for g in tg for x in ast.walk(g)): return True
+                    return False
+                via_param={}   # nom de fonction -> (paramètre, index de position)
+                def by_value(x,role,fn):
+                    if num(x): return True
+                    if isinstance(x,ast.Name) and fn is not None:
+                        ps,d=params(fn)
+                        if x.id in d and d[x.id] is not None and num(d[x.id]) and not assigned(fn,x.id):
+                            via_param[fn.name]=(x.id,ps.index(x.id) if x.id in ps else None,ps[:1] in (['self'],['cls']))
+                            return True
+                        return False
+                    if isinstance(x,ast.IfExp) and isinstance(role,ast.IfExp) and ast.dump(x.test)==ast.dump(role.test):
+                        rb=[(r,v) for r,v in ((role.body,x.body),(role.orelse,x.orelse)) if not (isinstance(r,ast.Constant) and r.value=='read')]
+                        return bool(rb) and all(by_value(v,r,fn) for r,v in rb)
+                    return False
+                res=[]
+                for n in ast.walk(t):
+                    if not (isinstance(n,ast.Call) and isinstance(n.func,ast.Name) and n.func.id=='_open_db') or not prod(n): continue
+                    ch=chain(n)
+                    kw={k.arg:k.value for k in n.keywords if k.arg}; star=any(k.arg is None for k in n.keywords)
+                    role=kw.get('role',n.args[2] if len(n.args)>2 else None)
+                    if role is None or isinstance(role,ast.Constant) and role.value=='read': continue
+                    qn='.'.join(x.name for x in ch); fn=ch[-1] if ch and isinstance(ch[-1],FN) else None
+                    dbx=ast.unparse(n.args[0]) if n.args else ast.unparse(kw['db_path']) if 'db_path' in kw else '?'
+                    w=white.get((qn,dbx)); x=kw.get('timeout')
+                    if not star and x is not None and by_value(x,role,fn): v='valeur'
+                    elif not star and x is None and fn is not None and fn in passed: v='reprise'
+                    elif isinstance(w,tuple):   # (branche lecteur, raison) : la branche écrivain est jugée par valeur
+                        v='liste' if (not star and isinstance(x,ast.IfExp) and by_value(x.orelse if w[0]=='body' else x.body,role,fn)) else None
+                    elif w is not None: v='liste'
+                    else: v=None
+                    res.append((qn,dbx,n.lineno,v))
+                short=[]   # appelants qui passent un délai court à une fonction acceptée par le défaut de son paramètre
+                for n in ast.walk(t):
+                    if not isinstance(n,ast.Call) or not prod(n): continue
+                    nm=getattr(n.func,'attr',getattr(n.func,'id',None))
+                    if nm not in via_param: continue
+                    pn,pi,meth=via_param[nm]; vals=[k.value for k in n.keywords if k.arg==pn]
+                    if pi is not None:
+                        unbound=isinstance(n.func,ast.Attribute) and isinstance(n.func.value,ast.Name) and n.func.value.id in classes
+                        i=pi-(1 if meth and isinstance(n.func,ast.Attribute) and not unbound else 0)
+                        if 0<=i<len(n.args): vals.append(n.args[i])
+                    if any(k.arg is None for k in n.keywords) or any(not num(x) for x in vals):   # **kw : délai invérifiable
+                        short.append(('.'.join(x.name for x in chain(n)),nm,n.lineno))
+                bad=[(q,d,l) for q,d,l,v in res if v is None]
+                miss=[q for q in need if not [1 for r in res if r[0]==q] or any(r[3]!='valeur' for r in res if r[0]==q)]
+                cnt={k:sum(1 for q,d,l,v in res if (q,d)==k and v=='liste') for k in white}
+                return res,bad,short,miss,[k for k,c in cnt.items() if c==0],[k for k,c in cnt.items() if c>1]
+            with open(os.path.realpath(__file__),encoding='utf-8') as fh: src=fh.read()
+            res,bad,short,miss,stale,dup=judge(src,white,need)
+            ok_prod=not bad and not short and not miss and not stale and not dup
+            wsrc=("class BorgHelper:\n"
+                  "    def _vacuum_db(self,db_path,tmp_path):\n        c=_open_db(db_path,role='write')\n"          # 3 : base servie, liste = tmp_path seul
+                  "    def a(self,p):\n        c=_open_db(p,role='write',timeout=5)\n"                              # 5
+                  "    def b(self,p):\n        c=_open_db(p,role='write',timeout=_READER_WRITE_WAIT)\n"             # 7
+                  "    def c(self,p):\n        c=_open_db(p,None,'write')\n"                                        # 9 : rôle en position
+                  "    def d(self,p,timeout=5):\n        c=_open_db(p,role='admin',timeout=timeout)\n"                # 11
+                  "    def e(self,p,r):\n        c=_open_db(p,role='admin' if r else 'read',timeout=5 if r else 60)\n" # 13
+                  "    def g(self,p):\n        def _do():\n            return _open_db(p,role='write')\n"             # 16 : homonyme non passé
+                  "        def _do():\n            return _open_db(p,role='write')\n        return self._with_lock_retry(_do)\n"  # 18 : passé
+                  "    def h(self,p,timeout=60):\n        c=_open_db(p,role='admin',timeout=timeout)\n"               # 21
+                  "    def i(self,p,r):\n        c=_open_db(p,role='admin' if r else 'read',timeout=60 if r else 2)\n" # 23
+                  "    def j(self,p):\n        c=_open_db(p,nick=None,role='write',timeout=60.0)\n"                # 25
+                  "    def k(self,tmp_path):\n        c=_open_db(tmp_path,role='write')\n"                         # 27 : autre fonction
+                  "    def m(self,p,**kw):\n        c=_open_db(p,role='write',timeout=60,**kw)\n"                  # 29 : **kw
+                  "    def q(self,p,timeout=60):\n        timeout=5\n        c=_open_db(p,role='write',timeout=timeout)\n"  # 32 : réaffecté
+                  "    def u(self,x):\n        self.h(x,timeout=5); self.h(x,2); self.h(x,timeout=60); self.h(x)\n"  # 34 : appelants de h
+                  "    def w1(self,p):\n        c=_open_db(p,role='write')\n"                                        # 36 : liste, 2 sites
+                  "    def w2(self,p):\n        c=_open_db(p,role='write')\n"                                        # 38 : liste, 2 sites (autre clé)
+                  "def tests():\n    pass\n")
+            wwhite={('BorgHelper._vacuum_db','tmp_path'):'x',('BorgHelper.w1','p'):'x',('BorgHelper.w2','p'):'x',('BorgHelper.zz','p'):'x'}
+            wsrc+="class BorgHelper2:\n    def w1(self,p):\n        c=_open_db(p,role='write')\n"                  # 43 : autre classe, même méthode
+            wsrc=wsrc.replace("class BorgHelper2:\n    def w1","class BorgHelper:\n    def w1")                # même qualname -> clé à deux sites
+            wr,wb,ws,wm,wst,wd=judge(wsrc,wwhite,('BorgHelper.j','BorgHelper.k','BorgHelper.w2','BorgHelper.absente'))
+            wexp=[('BorgHelper._vacuum_db','db_path',3,None),('BorgHelper.a','p',5,None),('BorgHelper.b','p',7,None),('BorgHelper.c','p',9,None),
+                  ('BorgHelper.d','p',11,None),('BorgHelper.e','p',13,None),('BorgHelper.g._do','p',16,None),('BorgHelper.g._do','p',18,'reprise'),
+                  ('BorgHelper.h','p',21,'valeur'),('BorgHelper.i','p',23,'valeur'),('BorgHelper.j','p',25,'valeur'),('BorgHelper.k','tmp_path',27,None),
+                  ('BorgHelper.m','p',29,None),('BorgHelper.q','p',32,None),('BorgHelper.w1','p',36,'liste'),('BorgHelper.w2','p',38,'liste'),
+                  ('BorgHelper.w1','p',43,'liste')]
+            ok_w=(sorted(wr,key=lambda r: r[2])==wexp and sorted(ws)==[('BorgHelper.u','h',34),('BorgHelper.u','h',34)]
+                  and wm==['BorgHelper.k','BorgHelper.w2','BorgHelper.absente'] and wst==[('BorgHelper._vacuum_db','tmp_path'),('BorgHelper.zz','p')] and wd==[('BorgHelper.w1','p')])
+            wsrc2=("class K:\n"
+                   "    def a(self,p):\n        def _do():\n            return _open_db(p,role='write')\n"            # 4 : max_wait court
+                   "        return self._with_lock_retry(_do,max_wait=5)\n"
+                   "    def b(self,p):\n        def _do():\n            return _open_db(p,role='write')\n"            # 8 : aussi appelé directement
+                   "        _do()\n        return self._with_lock_retry(_do)\n"
+                   "    def c(self,p):\n        def _do():\n            return _open_db(p,role='write')\n"            # 13 : max_wait 600 en position
+                   "        return self._with_lock_retry(_do,600)\n"
+                   "    def ens(self,p,create=True):\n        c=_open_db(p,role='admin',timeout=60 if create else 2)\n"  # 16 : lecteur en liste
+                   "    def ens2(self,p,create=True):\n        c=_open_db(p,role='admin',timeout=5 if create else 2)\n"  # 18 : écrivain 5 s
+                   "    def h(self,p,timeout=60):\n        c=_open_db(p,role='admin',timeout=timeout)\n"              # 20
+                   "    def u(self,x,o):\n        self.h(x,**o); K.h(self,x,5); K.h(self,x,60); K.h(self,x)\n")      # 22 : **kw, non liée
+            wr2,_b2,ws2,wm2,wst2,wd2=judge(wsrc2,{('K.ens','p'):('orelse','r'),('K.ens2','p'):('orelse','r')},())
+            wexp2=[('K.a._do','p',4,None),('K.b._do','p',8,None),('K.c._do','p',13,'reprise'),('K.ens','p',16,'liste'),
+                   ('K.ens2','p',18,None),('K.h','p',20,'valeur')]
+            ok_w=ok_w and sorted(wr2,key=lambda r: r[2])==wexp2 and ws2==[('K.u','h',22),('K.u','h',22)] and wm2==[] and wst2==[('K.ens2','p')] and wd2==[]
+            if not (ok_prod and ok_w):
+                print(f"     détail : refusés={bad} appelants à délai court={short} sites story 84={[(q,[r for r in res if r[0]==q]) for q in miss]} "
+                      f"liste périmée={stale} à plusieurs sites={dup} — témoins : {sorted(wr,key=lambda r: r[2])} {ws} {wm} {wst} {wd} — "
+                      f"témoins 2 : {sorted(wr2,key=lambda r: r[2])} {ws2} {wm2} {wst2} {wd2}")
+            return ok_prod and ok_w
+        check("écrivains de diff.db : délai ≥ 60 s par valeur, _with_lock_retry ou liste blanche par appel ; sites de la story 84 à 60 s (garde AST, 1.0.205)",_diff_writer_guard)
         def _priority_holders():
             """1.0.145 (story 8 R1) : un fichier par porteur. Bkp (autre processus vivant) + Restore (ce processus) qui
             prend et rend le verrou -> Bkp toujours vu ; porteur mort -> ignoré puis retiré ; ancien fichier unique d'un
@@ -20886,8 +21394,8 @@ fail()
                   "shutil.rmtree=rm\n"
                   "if mode=='decor':\n"
                   "    rw=B._enc_header_write\n"
-                  "    def w(c,h):\n"
-                  "        r=rw(c,h)\n"
+                  "    def w(c,h,**k):\n"
+                  "        r=rw(c,h,**k)\n"
                   "        return False if sys._getframe(1).f_code.co_name=='<lambda>' else r\n"
                   "    B._enc_header_write=w\n"
                   "sys.argv=[p]+args; B._cli_main()\n")
@@ -21377,9 +21885,12 @@ fail()
             return ctx
         def _ix_slow(ctx,match,secs):
             """Script borg : journalise, attend `secs` si la sous-commande vaut `match` (sleep sans hériter des tubes :
-            tuer le script rend la main aussitôt), puis exec borg avec le BORG_BASE_DIR du test."""
+            tuer le script rend la main aussitôt), puis exec borg avec le BORG_BASE_DIR du test. `match` à deux mots
+            (1.0.205, ex. 'list --format') : comparé aux deux premiers arguments — seul ce borg list ralenti, pas le
+            list --json des archives."""
             _rb_wrapper(ctx['w'],ctx['bb'],f"echo \"$*\" >> {shlex.quote(ctx['log'])}\n"
                         +(f"sleep {secs} </dev/null >/dev/null 2>&1\n" if match=='ALL' else
+                          f"if [ \"$1 $2\" = \"{match}\" ]; then sleep {secs} </dev/null >/dev/null 2>&1; fi\n" if match and ' ' in match else
                           f"if [ \"$1\" = \"{match}\" ]; then sleep {secs} </dev/null >/dev/null 2>&1; fi\n" if match else ""))
         def _ix_log(ctx,clear=False):
             try:
@@ -22580,7 +23091,9 @@ fail()
                 finally: c.close()
             # 1) borg list des ajouts ralenti, tranche snap : arrêté à l'échéance -> rien d'écrit
             _q_run(b.index,'ixc',natures=['diff'])                  # paire A6->A7 (le snapshot incrémental s'appuie dessus)
-            _ix_slow(ctx,'list',4)
+            # 1.0.205 : seul le borg list des ajouts ralenti, au-delà du budget (8 s > 6 s) — ralentir aussi le list --json des
+            # archives (4 s) ne laissait que ~1,2 s au départ du list des ajouts : sous charge, jamais lancé (incr False, run complet)
+            _ix_slow(ctx,'list --format',8)
             _q_run(b.index,'ixc',natures=['snap'],budget=6)
             _ix_slow(ctx,None,0)
             killed=rows()

@@ -67,6 +67,7 @@ def _push_deps_hint(err):
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail, glob_args, _pid_stat,
                          _close_quiet,   # 1.31.17 (story 81) : fermeture garantie des ensure_*
+                         _db_busy,   # 1.31.19 (story 84) : verrou passager du contrôle de schéma
                          DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec,
                          _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES, _enc_header_read, sentry_alert, _bkp_status_timeout,
                          _sentry_alert_kinds, db_plain_anomalies, _cfg_bool, convert_octets_readable,
@@ -80,7 +81,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.31.18"
+WWW_VERSION="1.31.19"
 # Garde de fermeture SQLite (story 81) appliquée à CE fichier : liste blanche nommée ({fonction: ouvertures non prouvées}) et
 # nombre EXACT d'ouvertures de production analysées (push_selftest exclu). Constantes de WWW (1.31.18, story 83) : lues par son push
 # selftest et, par littéral dans la source, par la garde de borgHelper — un changement de WWW seul ne touche plus borgHelper.
@@ -745,6 +746,8 @@ def _push_muted(nick):
     return None
 
 _SCHEMA_WARNED=set()  # avertissements déjà émis (une fois par cause, pas à chaque passe)
+_SCHEMA_BUSY={}  # 1.31.19 (story 84) : nick -> passes consécutives sur base verrouillée (remis à zéro par une passe saine)
+_SCHEMA_BUSY_PASSES=3   # au-delà : le [WARN] « contrôle de schéma impossible » habituel (un verrou permanent n'est jamais muet)
 
 def _borghelper_disk_version():
     """Version= du borgHelper sur DISQUE (le module importé par ce processus au démarrage peut être plus
@@ -762,7 +765,11 @@ def _schema_watch_pass():
     [WARN] « redémarrer » (le code en mémoire est périmé) ; (2) pour chaque nick, vue archive_snapshot_v
     comparée à la définition du code : réparée si elle diffère — SAUF si le code en mémoire est périmé ou
     plus ancien que la base (jamais réécrire une définition plus récente avec une plus ancienne). Retourne
-    {nick: état avant réparation} (tests)."""
+    {nick: état} (tests) — état lu ; pour une réparation, relu sous BEGIN IMMEDIATE juste avant elle (archive_view_check).
+    1.31.19 (story 84) : réparation à 2 s ; base verrouillée (_db_busy de borgHelper, bascule _swap_db en cours) : aucun
+    [WARN], nouvel essai à la passe suivante — sauf à la 3e passe verrouillée consécutive du nick (_SCHEMA_BUSY_PASSES) : le
+    [WARN] habituel, une fois ; compteur remis à zéro par une passe sans erreur ; autre erreur : [WARN] une fois par cause,
+    comme avant."""
     def _warn(key,msg):
         if key in _SCHEMA_WARNED: return
         _SCHEMA_WARNED.add(key); print(f"[WARN] {msg}",file=sys.stderr,flush=True)
@@ -775,14 +782,19 @@ def _schema_watch_pass():
     for n in _nick_list('ALL'):
         p=_bh_paths.db.get_diff_db(n)
         if not os.path.exists(p): continue
-        st=_bh_paths.db.archive_view_check(p,repair=not stale)
+        # 1.31.19 (story 84, D198) : réparation à délai court (2 s) — base tenue par une bascule (_swap_db) : 'error: …', nouvel
+        # essai à la passe suivante ; jamais 60 s par nick dans la boucle du watcher
+        errs=[]; st=_bh_paths.db.archive_view_check(p,repair=not stale,timeout=2,errors=errs)
         states[n]=st
+        busy=st.startswith('error') and bool(errs) and _db_busy(errs[-1])
+        if busy: _SCHEMA_BUSY[n]=_SCHEMA_BUSY.get(n,0)+1
+        elif not st.startswith('error'): _SCHEMA_BUSY.pop(n,None)
         if st in ('mismatch','absent'):
             if stale: _warn(('view',n,disk),f"{n}: vue archive_snapshot_v différente du code — non réparée (code en mémoire périmé), redémarrer borgHelperWWW")
             else: print(f"[schema] {n}: vue archive_snapshot_v {'recréée' if st=='absent' else 'remise à jour'}",file=sys.stderr,flush=True)
         elif st=='newer':
             _warn(('newer',n),f"{n}: diff.db d'un schéma plus récent que borgHelper v{BORGHELPER_VERSION} en mémoire — redémarrer borgHelperWWW")
-        elif st.startswith('error'):
+        elif st.startswith('error') and (not busy or _SCHEMA_BUSY.get(n,0)>=_SCHEMA_BUSY_PASSES):   # 1.31.19 : verrou passager -> muet
             _warn(('error',n,st),f"{n}: contrôle de schéma impossible ({st})")
     return states
 
@@ -927,7 +939,8 @@ def _no_response_raised(x):
     return (tb is not None and tb.tb_frame.f_code.co_name=='call_next'
             and tb.tb_frame.f_code.co_filename.replace(os.sep,'/').endswith('starlette/middleware/base.py'))
 
-# 1.31.0 (story 41, A85, décision de l'utilisateur) : requête reçue en HTTP/1.0 (nginx sans `proxy_http_version 1.1`) -> une
+# 1.31.0 (story 41, A85, décision de l'utilisateur) : requête reçue en HTTP/1.0 (proxy en HTTP/1.0 : nginx ancien, ou
+# `proxy_http_version 1.0` ; texte neutre sur la cause, 1.31.19, story 84 — nginx 1.31.7 parle HTTP/1.1 par défaut) -> une
 # ligne [WARN] par processus : un /download/* coupé (borg en échec en cours d'envoi) y passe pour complet. /version renvoie aussi
 # `http_version` de la requête (bandeau de l'UI). Seul le saut proxy -> borgHelperWWW est visible.
 _HTTP10_WARNED=[False]
@@ -935,9 +948,10 @@ _HTTP10_WARNED=[False]
 def _note_http10(request):
     if request.scope.get('http_version')=='1.0' and not _HTTP10_WARNED[0] and request.url.path!='/healthz':   # sondes de proxy
         _HTTP10_WARNED[0]=True
-        print(f"[WARN] requête reçue en HTTP/1.0 ({request.url.path}, {request.client.host if request.client else '-'}) : un "
-              "téléchargement interrompu (/download/*) y passe pour complet — derrière nginx, "
-              "ajouter `proxy_http_version 1.1;` et `proxy_set_header Connection \"\";` (signalé une seule fois)",file=sys.stderr,flush=True)
+        print(f"[WARN] requête reçue en HTTP/1.0 ({request.url.path}, {request.client.host if request.client else '-'}) : "
+              "proxy en HTTP/1.0 vers borgHelperWWW (nginx ancien, ou proxy_http_version 1.0) : un téléchargement interrompu "
+              "(/download/*) y passe pour complet — ajouter `proxy_http_version 1.1;` et `proxy_set_header Connection \"\";` "
+              "(signalé une seule fois)",file=sys.stderr,flush=True)
 
 @app.middleware("http")
 async def _access_log_and_user_guard(request: Request, call_next):
@@ -6774,7 +6788,7 @@ def push_selftest():
                     n=e.getvalue().count('[WARN] requête reçue en HTTP/1.0')
                     v=client.get("/version").json(); acc=client.get(f"{P}/access",headers=H).json()
                     keys={'borghelperwww_version','borghelper_version','ui_version','http_version'}<=set(v) and v['borghelper_version']==BORGHELPER_VERSION
-                    ok=(a,b,c,w0,n)==('1.1','1.0','1.0',0,1) and 'proxy_http_version 1.1' in e.getvalue() and keys and acc.get('http_version')=='1.1'
+                    ok=(a,b,c,w0,n)==('1.1','1.0','1.0',0,1) and 'proxy_http_version 1.1' in e.getvalue() and '(nginx ancien, ou proxy_http_version 1.0)' in e.getvalue() and keys and acc.get('http_version')=='1.1'
                     if not ok: print(f"  {(a,b,c,w0,n,keys,acc.get('http_version'))}")
                     return ok
                 check("HTTP/1.0 détecté : /version http_version, [WARN] une seule fois par processus (A85)",_http10_detect)
@@ -7073,6 +7087,7 @@ def push_selftest():
                     old_ver=_borghelper_disk_version
                     alter="DROP VIEW archive_snapshot_v; CREATE VIEW archive_snapshot_v AS SELECT 1 AS x;"
                     try:
+                        _borghelper_disk_version=lambda: BORGHELPER_VERSION   # 1.31.19 : version chargée, jamais un borgHelper périmé sur disque
                         _bh_paths.db.ensure_diff_db(tmpdb)
                         c=sqlite3.connect(tmpdb); c.executescript(alter); c.close()
                         first=set(_schema_watch_pass().values()); second=set(_schema_watch_pass().values())
@@ -7087,6 +7102,49 @@ def push_selftest():
                         _bh_paths.db.get_diff_db=old; _borghelper_disk_version=old_ver; _SCHEMA_WARNED.clear()
                 check("contrôle périodique : vue archive_snapshot_v divergente réparée ; code en mémoire périmé -> non réparée, un seul avertissement",
                       _schema_watch_ok)
+                def _schema_watch_locked():
+                    """1.31.19 (story 84, D198) : base tenue par une autre connexion (BEGIN IMMEDIATE, comme une bascule) -> chaque
+                    passe rend la main en ~2 s ('error: database is locked') ; passes 1 et 2 : aucun [WARN] ; 3e passe verrouillée
+                    consécutive : le [WARN] habituel « contrôle de schéma impossible », une fois ; base libre : vue réparée, puis 'ok'
+                    (compteur remis à zéro) ; de nouveau tenue (avertissements oubliés) : 2 passes muettes — le compte repart de zéro.
+                    Version sur disque épinglée à la version chargée (un borgHelper périmé sur disque ne fausse pas le contrôle)."""
+                    global _borghelper_disk_version
+                    tmpdb=os.path.join(tmpdir,'schema-locked-diff.db'); g=globals(); nk='s84lk'
+                    old=_bh_paths.db.get_diff_db; old_nl=g['_nick_list']; old_ver=_borghelper_disk_version; h=None; err=io.StringIO()
+                    def hold():
+                        c=sqlite3.connect(tmpdb,isolation_level=None); c.execute("BEGIN IMMEDIATE"); return c
+                    def free(c): c.execute("ROLLBACK"); c.close()
+                    def passes(k):
+                        out=[]
+                        for _ in range(k):
+                            n0=err.getvalue().count('[WARN]'); t0=time.monotonic()
+                            with contextlib.redirect_stderr(err): st=_schema_watch_pass()
+                            out.append((st.get(nk),round(time.monotonic()-t0,1),err.getvalue().count('[WARN]')-n0))
+                        return out
+                    try:
+                        _bh_paths.db.get_diff_db=lambda n: tmpdb; g['_nick_list']=lambda x: [nk]; _SCHEMA_WARNED.clear(); _SCHEMA_BUSY.pop(nk,None)
+                        _borghelper_disk_version=lambda: BORGHELPER_VERSION
+                        _bh_paths.db.ensure_diff_db(tmpdb)
+                        def breakv():   # vue divergente : la passe doit écrire (une vue correcte se lit sans verrou en WAL)
+                            c=sqlite3.connect(tmpdb); c.executescript("DROP VIEW archive_snapshot_v; CREATE VIEW archive_snapshot_v AS SELECT 1 AS x;"); c.close()
+                        breakv(); h=hold(); locked=passes(3); free(h); h=None
+                        healed=passes(2)
+                        breakv(); _SCHEMA_WARNED.clear(); h=hold(); again=passes(2); free(h); h=None
+                        lk='error: database is locked'
+                        ok=([x[0] for x in locked]==[lk]*3 and all(1.5<=x[1]<6 for x in locked) and [x[2] for x in locked]==[0,0,1]
+                            and 'contrôle de schéma impossible (error: database is locked)' in err.getvalue()
+                            and [x[0] for x in healed]==['mismatch','ok'] and [x[2] for x in healed]==[0,0]
+                            and [x[0] for x in again]==[lk]*2 and [x[2] for x in again]==[0,0])
+                        if not ok: print(f"  {locked} {healed} {again} {err.getvalue()[-300:]!r}")
+                        return ok
+                    finally:
+                        if h is not None:
+                            try: free(h)
+                            except sqlite3.Error: pass
+                        _bh_paths.db.get_diff_db=old; g['_nick_list']=old_nl; _borghelper_disk_version=old_ver
+                        _SCHEMA_WARNED.clear(); _SCHEMA_BUSY.pop(nk,None)
+                check("contrôle périodique : base verrouillée (bascule) -> rendu en ~2 s, muet 2 passes puis [WARN] à la 3e, réparée ensuite, compte remis à zéro (1.31.19)",
+                      _schema_watch_locked)
                 check("memo de codec : en-tête chiffré posé en cours de route (DbEncrypt CLI) -> pris en compte sans redémarrage, lignes scopecache en clair de ce nick purgées",
                       _codec_memo_follows_header)
                 check("memo de codec : base vide née d'une autre passphrase -> nick verrouillé (jamais « en clair »), lecteur borgHelper : vue vide",

@@ -97,7 +97,7 @@ finally:
 (1.0.169 : avec `empty_ok=True` en lecture, une base siv1 en WAL sans aucun chemin que la passphrase n'ouvre pas est rendue
 vide — `conn.mode == 'empty'`, `codec None` (ce n'est PAS une base en clair), lecture seule, instantané figé — au lieu de
 `DbKeyError` ; une `DbKeyError` dont `wrong_key` est vrai signale une enveloppe qui refuse la passphrase (même type, même nom affiché) ; les `kw`,
-ex. `timeout=60`, sont transmis à `sqlite3`). Depuis 1.0.171, `role='read'` ne crée jamais de fichier : base inexistante
+ex. `timeout=60`, sont transmis à `sqlite3` ; sans `timeout`, le défaut de `sqlite3` : 5 s d'attente d'un verrou — un écrivain de `diff.db` qui peut tourner pendant une bascule (compactage, reconstruction : 116-127 Mo/s sur le SSD NVMe du poste de test, mesuré en 1.0.205 ; délais courts voulus nommés dans la docstring d'`_open_db`) passe `timeout=60`). Depuis 1.0.171, `role='read'` ne crée jamais de fichier : base inexistante
 (dossier présent) -> connexion vide en mémoire (`no such table` comme un fichier vide) ; dossier absent ou non traversable,
 fichier sans droits : `sqlite3.OperationalError` comme avant ; 1.0.172 : `create_file=False` ouvre en `write`/`admin` sans
 créer (`mode=rw`, fichier absent -> `sqlite3.OperationalError`) ; sinon `write`/`admin` créent le fichier en 0600. `db_encrypt_enabled(nick)` / `db_kdf_level(nick)` lisent `DB_ENCRYPT` /

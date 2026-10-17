@@ -1464,7 +1464,15 @@ entrées que `-x` a purgées.
 
 Après suppression, `IdxPurge` recalcule `diff_indexed_pairs.entry_count` et compacte le fichier via `VACUUM INTO` (dans le même répertoire, évite les problèmes de `/tmp` plein). Si le compactage échoue ou est reporté, les entrées sont quand même supprimées (message `[WARN] compactage impossible` ou `[WARN] compactage reporté : <raison>`) ; relancer `IdxPurge` plus tard, ou la procédure manuelle de LIBRARY.md.
 
-Le compactage laisse la base en mode WAL (1.0.137) et ne remplace plus jamais le fichier sous les processus qui l'ont ouvert (1.0.138) : il est reporté, base intacte, si un Bkp/Restore/Prune est en cours ou démarre, si la base est modifiée pendant la copie, ou si elle reste verrouillée en écriture par un autre processus. Si une base est momentanément verrouillée par un autre processus,
+Le compactage laisse la base en mode WAL (1.0.137) et ne remplace plus jamais le fichier sous les processus qui l'ont ouvert (1.0.138) : il est reporté, base intacte, si un Bkp/Restore/Prune est en cours ou démarre, si la base est modifiée pendant la copie, ou si elle reste verrouillée en écriture par un autre processus. Pendant la recopie finale (bascule, mesurée sur le SSD NVMe
+du poste de test : 699 Mo en 5,5 s), les autres écrivains de `diff.db` attendent : depuis 1.0.205, Index,
+DbEncrypt, DbDecrypt et DbRekey attendent jusqu'à 60 s (les écritures de Bkp et DiffBkp réessaient jusqu'à 300 s) au lieu
+d'échouer en « database is locked » au bout de 5 s ; exceptions voulues, sans perte : la révision des paires vides et le retrait
+des exclus orphelins de l'Index n'attendent que 2 s, puis sont reportés à l'Index suivant ([WARN]) ; une commande de lecture qui
+ferait en passant une mise à jour de schéma n'attend que 2 s, ne l'écrit pas et lit la base telle quelle ; le contrôle périodique de la vue par
+borgHelperWWW n'attend que 2 s et réessaie à sa passe suivante, sans message (à la 3e passe verrouillée de suite pour un
+nick : son `[WARN]` habituel « contrôle de schéma impossible », une fois). Si une base est
+momentanément verrouillée par un autre processus,
 borgHelper affiche `[ERREUR] DB occupée : … réessayer plus tard (ne PAS supprimer le fichier)`. Seul `[ERREUR] DB corrompue : …` invite
 à supprimer le fichier pour reconstruire. Supprimée pendant qu'un Index, un Bkp ou borgHelperWWW la tenait encore ouverte,
 une `diff.db` ou une `cache.db` ne peut pas être recréée tout de suite : `[ERREUR] DB : … recréée alors qu'un autre processus tenait encore
@@ -2150,8 +2158,9 @@ Ordre et moment : quand le corps du téléchargement constate l'échec de borg (
 vient AVANT la ligne `[req]` ; pour les autres lignes du même téléchargement (`[ERREUR]` du chien de garde d'inactivité,
 `[WARN]` d'abandon), l'ordre n'est pas garanti. La ligne arrive tard pour un client qui cesse de lire (jusqu'au chien de
 garde) ; elle manque si le processus est tué avant la fin du transfert, ou si la requête est annulée entre la fin de la route
-et le début de la réponse. Derrière nginx en HTTP/1.0 (sans
-`proxy_http_version 1.1`), le client peut toujours voir un flux coupé comme complet, même si la ligne dit ` (flux coupé)`.
+et le début de la réponse. Derrière un proxy qui parle HTTP/1.0 à borgHelperWWW (nginx ancien sans
+`proxy_http_version 1.1`, ou `proxy_http_version 1.0` — voir l'encadré « Reverse proxy » de `/download/file`), le client peut
+toujours voir un flux coupé comme complet, même si la ligne dit ` (flux coupé)`.
 
 **IP du navigateur** : si la connexion vient d'un reverse proxy listé dans
 `BORGHELPERWWW_TRUSTED_PROXIES` / `--trusted-proxies` / `trusted_proxies` (IP ou CIDR séparés par des
@@ -2992,14 +3001,22 @@ relayé, le second leur envoie SIGKILL ; 1.31.9 : les `/tmp/_MEI*` de leur borg 
 signal ne leur est pas relayé (seul le SIGKILL d'atexit) : leurs `_MEI*` peuvent rester.
 
 > **Reverse proxy : HTTP/1.1 obligatoire vers borgHelperWWW.** La coupure n'est visible qu'en HTTP/1.1 (transfert par
-> morceaux) ; en HTTP/1.0, une connexion fermée vaut fin normale et un fichier tronqué repasse pour complet. nginx parle
-> HTTP/1.0 à l'amont par défaut : ajouter `proxy_http_version 1.1;` (et `proxy_set_header Connection "";`) dans le
-> `location` qui mène à borgHelperWWW. Un client qui parle lui-même HTTP/1.0 directement n'est pas protégé (limite connue).
+> morceaux) ; en HTTP/1.0, une connexion fermée vaut fin normale et un fichier tronqué repasse pour complet. Toujours mettre
+> `proxy_http_version 1.1;` (et `proxy_set_header Connection "";`) dans le `location` qui mène à borgHelperWWW, quelle que
+> soit la version de nginx. Seul nginx 1.31.7 (image `nginx:alpine`, 2026-10-16) a été mesuré : il parle déjà HTTP/1.1 à
+> l'amont sans la directive ; les versions antérieures n'ont pas été mesurées (documentation de nginx : HTTP/1.0 par défaut
+> avant ce changement ; version du changement non vérifiée). Mesure derrière ce nginx (uvicorn 0.54, borg tué pendant un
+> `/download/file` de 60 000 000 octets) : sans la directive ou avec
+> `proxy_http_version 1.1`, borgHelperWWW voit HTTP/1.1, aucun `[WARN]`, et le client voit la coupure (curl : code 18,
+> transfert incomplet) ; avec `proxy_http_version 1.0`, la coupure est invisible (curl : code 0, 8,5 millions d'octets reçus sur 60 millions).
+> Un client qui parle lui-même HTTP/1.0 directement n'est pas protégé (limite connue).
 > **Détection (1.31.0)** : une requête reçue en HTTP/1.0 (hors `/healthz`) -> une ligne `[WARN]` au journal, avec chemin et
-> client (une fois par processus) ; `/version` et `/access` renvoient `http_version` de la requête et l'UI affiche le badge
+> client (une fois par processus ; 1.31.19 : cause dite « proxy en HTTP/1.0 vers borgHelperWWW (nginx ancien, ou
+> proxy_http_version 1.0) », même texte dans l'infobulle du badge) ; `/version` et `/access` renvoient `http_version` de la requête et l'UI affiche le badge
 > « ⚠ Proxy en HTTP/1.0 : téléchargement tronqué non détectable — proxy_http_version 1.1 » quand les téléchargements sont
 > permis (valeur de `/access`, servie sous le préfixe d'API comme `/download/*`). Seul le saut proxy -> borgHelperWWW est visible (un client HTTP/1.0 derrière un nginx en 1.1 ne
-> l'est pas).
+> l'est pas). Vérifié derrière nginx 1.31.7 en `proxy_http_version 1.0` : `[WARN]` une seule fois au journal, `/access` rend
+> `http_version: "1.0"` (badge de l'UI) ; sans la directive : `1.1`, aucun `[WARN]`.
 
 Depuis la Story 2.1 : un `path`/`prefix` hors du périmètre de l'appelant (`GROUPS_PATHS`, voir
 [Autorisation par groupes](#autorisation-par-groupes-reverse-proxy-oidcauth_request)) répond comme un chemin absent :

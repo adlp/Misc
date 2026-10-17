@@ -1,5 +1,64 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.205, borgHelperWWW 1.31.19, UI 1.24.2 — Mesures jamais faites — 2026-10-17
+
+Chantier « reconstruction progressive », story 84 (reports D149, D155, D171, D198). Quatre mesures faites (borgHelper
+1.0.204, borgHelperWWW 1.31.18, borg 1.2.6) ; D198 change des délais d'attente de verrou, D149 le texte du `[WARN]` et du badge
+HTTP/1.0.
+
+- **Écrivains de diff.db pendant une bascule** (D198) : mesuré sur le SSD NVMe du poste de test (Samsung PM9A1), `_swap_db` bascule `diff.db` à
+  116-127 Mo/s (370 Mo en 3,2 s, 699 Mo en 5,5 s) ; des écrivains lancés ~1 s après le début de la copie (défaut de sqlite3 5 s,
+  `timeout=60`, reprise 300 s) écrivent tous, rien perdu. Un écrivain présent dès le début de la copie l'attend en entier : au
+  défaut de 5 s, il échoue dès ~550-600 Mo ; plafonds désormais : 60 s ≈ 7 Go, reprise 300 s ≈ 34 Go (moins sur un disque plus
+  lent ou NFS). Inventaire site par site : le compactage d'IdxPurge ne prend aucun verrou, un Index tourne donc pendant sa
+  bascule. Passent à `timeout=60` : `indexsnap` (`--force` et lignes sans sentinelle), `_index_select_pairs` (purge des paires à
+  refaire), `_index_finish` (état de construction), `_shadow_swap` (après la bascule), `_db_migrate_run` (DbEncrypt/DbDecrypt),
+  `db_rekey` et `archive_view_check(repair=True)` (nouveau paramètre `timeout`, 60 s par défaut). Index, DbEncrypt, DbDecrypt et
+  DbRekey attendent donc jusqu'à 60 s pendant une bascule concurrente au lieu d'échouer (avant : « SQLite error … database is
+  locked » — Index : paire non refaite, état de construction non écrit ; DbEncrypt, DbRekey : échec). Délais courts voulus,
+  sans perte : `_recheck_zero_pairs` et `_drop_orphan_exclusions` (2 s, refaits au prochain Index), `ensure_diff_db`/
+  `ensure_cache_db` en lecteur (2 s, rien écrit si occupée), réparation de vue de borgHelperWWW (2 s, passe suivante).
+  DbEncrypt/DbDecrypt et DbRekey font leur KDF hors de tout verrou d'écriture (comme avant), puis prennent le verrou
+  d'écriture, relisent l'en-tête (identique à celui de la KDF, sinon « en-tête changé entre-temps — relancer ») et revérifient
+  les verrous de borgHelper (une opération prioritaire démarrée pendant l'attente est vue : refus, rien écrit) ; première
+  écriture d'en-tête dans la même transaction (`_enc_header_write`/`_enc_header_cas`, paramètre `held` ; `held=True` sans
+  transaction ouverte : RuntimeError, rien écrit) ; erreur SQLite sous ce verrou : `[ERREUR]` habituel, jamais une trace brute —
+  `sqlite3.OperationalError` (verrou, disque plein, base en lecture seule, E/S) -> DbModeError (« … — relancer »), toute autre
+  `sqlite3.DatabaseError` (base abîmée) -> DbTamperError, même règle pour les deux sens et pour DbRekey. Réparation de la vue relue sous `BEGIN IMMEDIATE` avant DROP/CREATE
+  VIEW (un état lu avant une bascule ne décide plus d'une écriture faite après), par une seule fonction
+  (`_repair_archive_view(conn, held)`) pour `ensure_diff_db` et `archive_view_check` ; celle-ci rend l'état relu sous verrou. Docstring d'`_open_db` corrigée (elle disait « timeout=60 » ; sans `timeout`,
+  c'est le défaut de sqlite3, 5 s). Contrôles CodecSelfTest : bascule étirée à ~7 s dans un autre processus (témoin au défaut
+  refusé avant la fin de la copie ; `archive_view_check` et `_index_finish` attendent puis écrivent dans la base basculée ; base
+  basculée qui porte déjà la bonne vue : `'ok'`, aucun DROP/CREATE) ; DbEncrypt/DbRekey et opération prioritaire apparue pendant
+  l'attente du verrou ; KDF hors verrou (une autre connexion prend le verrou sans attendre à chaque KDF) ;
+  `_repair_archive_view(held=True)` sans transaction : RuntimeError ; garde AST de tous les écrivains (délai ≥ 60 s jugé par valeur, paramètre jamais réaffecté et appelants
+  vérifiés, `_with_lock_retry` réellement passé sans `max_wait` court ni appel direct, ou liste blanche par appel avec sa raison,
+  une entrée = un site, branche lecteur seule pour `ensure_*` ; `**kw` refusé ; témoins ; limites reportées : paramètre relié par
+  with/except/import/nonlocal/match).
+- **borgHelperWWW 1.31.19** : le contrôle périodique de la vue (`_schema_watch_pass`) répare avec un délai de 2 s
+  (`archive_view_check(…, timeout=2)`) — base tenue par une bascule (`_db_busy` de borgHelper) : aucun `[WARN]`, nouvel essai à
+  la passe suivante, jamais 60 s par nick dans la boucle du watcher ; à la 3e passe verrouillée consécutive d'un nick, le `[WARN]`
+  habituel une fois (compteur remis à zéro par une passe sans erreur) ; autre erreur : `[WARN]` une fois, comme avant. Contrôle
+  du push selftest : base tenue -> rendu en ~2 s, muet deux passes, `[WARN]` à la 3e, réparée ensuite, compte remis à zéro ;
+  contrôles de la vue : version sur disque épinglée à la version chargée.
+- **HTTP/1.0 derrière nginx** (D149) : mesuré avec nginx 1.31.7 (`nginx:alpine`) et uvicorn 0.54 seulement — sans
+  `proxy_http_version`, nginx parle déjà HTTP/1.1 à l'amont (aucun `[WARN]`) et une coupure de `/download/file` (borg tué) arrive
+  au client (curl code 18) ; `proxy_http_version 1.0` forcé : `[WARN]` une fois, `/access` rend `http_version: "1.0"` (badge de
+  l'UI), coupure invisible (curl code 0, 8,5 millions d'octets reçus sur 60 millions). Versions antérieures non mesurées
+  (documentation de nginx : HTTP/1.0 par défaut avant le changement ; version du changement non vérifiée). Textes neutres sur la cause (décision de l'utilisateur) : `[WARN] requête reçue en
+  HTTP/1.0 …` (borgHelperWWW 1.31.19) et infobulle (`title`) du badge — texte du badge inchangé (UI 1.24.2) — disent « proxy en HTTP/1.0 vers borgHelperWWW (nginx
+  ancien, ou proxy_http_version 1.0) », conseil inchangé (`proxy_http_version 1.1;` et `proxy_set_header Connection "";`).
+- **Débit de `/download/*`** (D155) : `/download/file` de 60 000 000 octets, 5 essais, `read1` médiane 13,2 s (≈ 4,5 millions
+  d'octets/s) contre 16,8 s pour une copie en `read(n)` ; `read1` gardé (TECHNICAL).
+- **Coût du `borg list` du rapprochement** (D171) : 100 archives, médianes — local `borg list --json` 0,66 s, avec
+  `--format '{comment}{end}'` 0,74 s ; ssh://localhost (`borg serve`) 1,81 s et 1,90 s, `--glob-archives` 1,74 s : ~0,1 s de plus
+  que le `borg list` de tout Index, surcoût distant ~1,1 s (démarrage ssh et `borg serve`). Latence d'un vrai réseau non mesurée
+  (TECHNICAL).
+- **CodecSelfTest, « snapshot incrémental (ajouts) »** : échec intermittent sous charge (run complet, reproduit sous 14 processus
+  de calcul, 1.0.204 comme 1.0.205 : départ du `borg list --format` des ajouts à +4,6-4,8 s pour une échéance de 6 s). Le
+  ralentissement visait tout `borg list`, `list --json` des archives compris ; seul le `list --format` des ajouts est ralenti
+  désormais, 8 s, au-delà de l'échéance.
+
 ## borgHelper 1.0.204, borgHelperWWW 1.31.18 — Contrôles manquants — 2026-10-16
 
 Chantier « reconstruction progressive », story 83 (reports D214, D162, D132, D215). Code de production inchangé : contrôles
