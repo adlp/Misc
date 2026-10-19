@@ -721,7 +721,15 @@ borgHelper -c LstBkpFls -n mon-serveur -b mon-serveur-root-2025-04-02T213004
 borgHelper -c LstBkpFls -n mon-serveur -j   # JSON : {nick,archive,files:[chemin,...]}
 ```
 
-Nécessite le snapshot de l'archive peuplé (`Indexsnap`). Sinon : "Aucun fichier indexé — lancer 'indexsnap'" (`{"error": "..."}` avec `-j`).
+Lit le snapshot de l'archive (rempli par Bkp et Index ; seules les `IDX_SNAP_KEEP` archives les plus récentes en ont
+un, purge automatique). Archive sans snapshot : « Aucun snapshot pour <archive> dans la base (seules les IDX_SNAP_KEEP
+archives les plus récentes en ont un) » ; snapshot vide : « Aucun fichier dans le snapshot de <archive> (archive vide ou
+chemins exclus par IDX_INCLUDE/IDX_EXCLUDE) » ; archive absente de toute table d'archives de la base : « Archive <archive>
+inconnue de la base (voir LstBkp) » ; archive dans la fenêtre gardée mais sans snapshot : « Aucun snapshot pour <archive>
+dans la base (jamais fait ou sauté — Index --rebuild refait ceux des IDX_SNAP_KEEP archives les plus récentes) » (le
+message de rétention ci-dessus seulement pour une archive plus ancienne que la fenêtre) ; base absente : « Aucune archive
+indexée en base — lancer 'index' ou 'bkp'. » ; nick `NOIDX=1` : « <nick>: indexation désactivée (NOIDX=1) » — code 1, `{"error": "..."}` avec `-j`. Avant 1.0.207 : « Aucun fichier
+indexé pour <archive> — lancer 'indexsnap' », conseil faux (`Index -S` ne refait que la dernière archive).
 
 ---
 
@@ -935,7 +943,8 @@ statistiques, snapshot) s'affiche en fin de tranche et dans `Status`. `-S` passe
 dans `<conf>-<nick>-diff.db.rebuild` (même `CACHE_DIR`, `0600`) pendant que l'ancienne base reste servie — CLI et
 borgHelperWWW continuent de lire l'ancienne, sans changement. Il lance une première tranche (`-t` facultatif) ; ensuite,
 toute tranche (`Index` avec `-t`, `-T`, `-b` ou `-B`, comme la ligne cron conseillée `Index -n ALL -t 20m`) fait d'abord l'incrémental de la base servie, puis avance le
-fantôme avec le budget restant, dans le même ordre (snapshot, statistiques, diffs récents d'abord). Quand il est
+fantôme avec le budget restant, dans le même ordre (snapshot, statistiques, diffs récents d'abord), puis, en dernier
+(1.0.207), les snapshots des archives plus anciennes que la rétention garde. Quand il est
 complet, il remplace la base servie d'un coup, après avoir vérifié par un `borg list` que rien n'est arrivé entre-temps.
 Un Bkp, Restore, Prune ou Report met la reconstruction en pause comme tout Index ; pendant la bascule, il l'annule
 (base servie intacte, fantôme gardé, nouvel essai à la tranche suivante). L'Index sans option et celui de fin de Bkp ne
@@ -973,8 +982,31 @@ borgHelper -c Status -n mon-serveur                   # « Reconstruction (fant�
 - Abandonner : hors de tout `Index` en cours, supprimer `<diff.db>.rebuild` et ses `-wal`/`-shm` (jamais servis) ; un
   fantôme supprimé pendant une tranche est abandonné par celle-ci. Base servie absente : `--rebuild` la construit
   directement, sans fantôme.
-- La base reconstruite ne garde que le snapshot de la dernière archive, comme un `Index` complet : les snapshots
-  d'archives plus anciennes (gardés jusqu'à `IDX_SNAP_KEEP`) ne sont pas refaits. `history.db` (mesures) n'est jamais touchée.
+- Snapshots (1.0.207) : la reconstruction refait le snapshot de chaque archive que la rétention garde (`IDX_SNAP_KEEP`,
+  défaut : somme des `KEEP_*`, sinon 10 — les mêmes archives que la purge des snapshots garde), avec les règles `IDX_*`
+  actuelles, en dernier dans l'ordre de la tranche : snapshot de la dernière archive, statistiques, diffs, puis snapshots
+  des archives anciennes de la plus récente à la plus ancienne (un `borg list` complet par archive ; `-T snap` les
+  comprend, `-T stats`/`diff` non ; `-b/-B` les restreint comme les statistiques). À l'échéance, le `borg list` en cours
+  est tué et rien n'est écrit pour cette archive ; les archives déjà faites ne sont jamais refaites. Tant qu'il en
+  manque, le fantôme reste partiel : pas de bascule, `Status` « Reconstruction (fantôme) en cours », `snapshot: false`
+  dans `Status -j` ; la ligne de fin de tranche les compte (« snapshots 2/5 »). Même chose pour la construction directe
+  d'une base absente par `--rebuild` (`Status` : « Construction partielle : …, snapshot à faire »), poursuivie par tout
+  `Index` de la base (`-t`, sans option ; jamais l'Index d'un Bkp, qui ne la déclare pas complète non plus) jusqu'à ce
+  qu'elle soit complète ; pendant qu'un fantôme existe, seul le fantôme fait ces snapshots (tout Index). Marqueur
+  illisible : `[WARN]`, ni snapshots anciens ni état de construction écrit jusqu'au prochain Index ; marqueur non écrit :
+  `[ERREUR]`, construction arrêtée. `borg list` d'une archive
+  ancienne tué hors échéance (signal, code 143 d'un SIGTERM, code 1 sans sortie) ou en échec (erreur de borg) : snapshots
+  anciens arrêtés pour la tranche, nouvel essai à la suivante ; au 3e échec ou arrêt consécutif de la même archive (même
+  nom, même date), elle est sautée sans bloquer la bascule : « `[WARN] <nick>: snapshot de <archive> sauté pour cette
+  reconstruction (3e échec ou arrêt consécutif de borg list : <cause>) — Index --rebuild -F pour la reprendre de zéro` »
+  (`DB_NAME` partagé, où `-F` est refusé : « supprimer la base puis relancer Index --rebuild … »). `Index --rebuild -F`
+  repart d'un fantôme neuf et réessaie toutes les archives. L'échéance de la tranche ne compte jamais. `IDX_SNAP_KEEP`
+  Un snapshot non gardé après son unité ou une erreur d'`indexsnap` comptent comme un échec. `IDX_SNAP_KEEP`
+  ou `KEEP_*` invalide : un `[ERREUR]`, snapshots anciens et purge sautés (diffs et statistiques faits), reconstruction
+  jamais complète tant qu'il n'est pas corrigé. Avant 1.0.207, seule la dernière archive retrouvait son snapshot : `LstBkpFls -b <archive
+  ancienne>` n'avait plus rien, et le choix d'archive de `Restore` sans `-b` (dernière archive de la base qui contient le
+  fichier) lit ces mêmes snapshots.
+  L'`Index` sans `--rebuild` est inchangé (snapshot de la dernière archive). `history.db` (mesures) n'est jamais touchée.
 
 **`DIFF_KEEP`** (corrigé en 1.0.141, pour tout Index) : seules les N paires les plus récentes sont calculées et gardées.
 Avant, chaque Index recalculait les paires purgées au précédent, et la paire gardée changeait d'un Index à l'autre.
@@ -1487,7 +1519,7 @@ chemins stockés n'ont jamais de `/` initial), comportement volontairement prés
 
 Sans `-x`, lit `IDX_EXCLUDE`/`IDX_INCLUDE` depuis la configuration du nick et purge tout ce qui serait exclu à l'indexation.
 
-**Purge automatique des snapshots :** en fin d'opération, `IdxPurge` purge aussi les snapshots (`archive_snapshot`) au-delà du seuil `IDX_SNAP_KEEP`. Si `IDX_SNAP_KEEP` n'est pas défini, le seuil est calculé comme `sum(KEEP_DAILY + KEEP_WEEKLY + KEEP_MONTHLY + KEEP_YEARLY + KEEP_HOURLY)`, ou 10 si aucune règle KEEP_* n'est configurée. Le dry-run `-D` affiche également les snapshots qui seraient purgés.
+**Purge automatique des snapshots :** en fin d'opération, `IdxPurge` purge aussi les snapshots (`archive_snapshot`) au-delà du seuil `IDX_SNAP_KEEP` — les plus anciens par date d'archive (1.0.207 ; avant, par nom : une dernière archive au nom plus petit était purgée aussitôt), jamais celui de la dernière archive ; un snapshot sans aucune date connue est gardé (hors compte), ainsi que celui de l'archive la plus récente connue des statistiques. Valeur invalide : `[ERREUR]`, purge des snapshots sautée, code 1. Si `IDX_SNAP_KEEP` n'est pas défini, le seuil est calculé comme `sum(KEEP_DAILY + KEEP_WEEKLY + KEEP_MONTHLY + KEEP_YEARLY + KEEP_HOURLY)`, ou 10 si aucune règle KEEP_* n'est configurée. Le dry-run `-D` affiche également les snapshots qui seraient purgés.
 
 Les entrées supprimées rejoignent les exclus de leur paire (`diff_excluded_stats`, nombre et taille par type de changement, 1.0.154) : `modifications` de Report, ArchiveHistory et IdxTop sont inchangés par la purge (les fichiers purgés y comptent comme exclus — seule exception, un fichier `modified` dont la taille après vaut 0 compte alors sa taille avant, comme un exclu de l'Index), une paire entièrement vidée n'est pas prise pour une paire vide à tort, et DiffTop comme IdxTop affichent encore ses exclus (« IDX_* / IdxPurge », 1.0.155 pour IdxTop : plus de « diff_index vide » s'il reste des exclus). Détail des exclus par familles, comme Report (1.0.155) : `+` tous les ajouts (fichiers, répertoires, liens…), `-` toutes les suppressions, `=` tout le reste (`modified`, `changed link`, `mode`…) — la somme vaut le total.
 

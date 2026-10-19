@@ -1,5 +1,70 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.207 — Snapshots des archives anciennes après reconstruction — 2026-10-17
+
+Chantier « reconstruction progressive », story 85 (report D193, point « snapshots d'archives anciennes non refaits
+par une reconstruction »). Mesuré sur 1.0.206 (borg 1.2.6, bac neuf, `work/s85/mesure85.sh`) : nick à 4 archives sauvegardées
+avec Index -> 4 snapshots ; `Index --rebuild` -> 1 snapshot (dernière archive) ; `LstBkpFls -b <2e archive>` : 3 fichiers
+avant, « Aucun fichier indexé pour … — lancer 'indexsnap'. » après (`Index -S` ne refait que la dernière archive).
+
+- **Reconstruction** (`Index --rebuild`, fantôme ou construction directe d'une base absente ; décision A de l'utilisateur) :
+  refait le snapshot de chaque archive que la rétention garde (`IDX_SNAP_KEEP`, défaut : somme des `KEEP_*`, sinon 10 —
+  les archives que `_snapurge_check` garderait), avec les règles `IDX_*` actuelles. En dernier dans la tranche : snapshot de
+  la dernière archive, statistiques, diffs, puis snapshots anciens de la plus récente à la plus ancienne. Une archive = une
+  unité (`borg list` complet, même code que le snapshot de la dernière : `indexsnap(archive=…)`) ; échéance vérifiée entre
+  unités, `borg` en cours tué à l'échéance, rien d'écrit pour l'archive tuée ; reprise sans refaire les archives déjà
+  faites. `-T snap` les comprend, `-T stats`/`diff` non ; `-b/-B` les restreint comme les statistiques.
+- **Fantôme complet** (`build_state`, bascule) seulement une fois ces snapshots faits : `snapshot` reste `false` tant qu'il
+  en manque (clés de `build_state`, format de `Status -j` et texte « Construction partielle » inchangés). Ligne de fin de
+  tranche d'une reconstruction : « snapshots k/N » au lieu de « snapshot fait/à faire » ; un snapshot ancien fait compte
+  comme une progression (pas d'avertissement « aucune progression »).
+- **`borg list` d'une archive ancienne tué hors échéance ou en échec** (décision 3, précisée par les revues) : snapshots
+  anciens arrêtés pour la tranche, nouvel essai à la suivante ; au 3e échec ou arrêt consécutif de la même archive (nom et
+  date de début), sautée sans bloquer la bascule — `[WARN] <nick>: snapshot de <archive> sauté pour cette reconstruction (3e
+  échec ou arrêt consécutif de borg list : <cause>) — Index --rebuild -F pour la reprendre de zéro` (`DB_NAME` partagé :
+  supprimer la base puis relancer `Index --rebuild`) ; `--rebuild -F` réessaie tout. Tué = code négatif, ≥ 128 (143 d'un
+  SIGTERM géré par borg) ou 1 sans sortie ; l'échéance ne compte jamais. Compteurs dans le `db_meta` de la cible
+  (`snap_failed:`/`snap_skipped:<nick>`), retirés à la bascule et à la fin d'une construction directe.
+- **Construction directe** (base absente) poursuivie par `Index -t` et `Index` sans option (marqueur `rebuild_direct:<nick>`,
+  jamais sous NOIDX, illisible = présent) jusqu'à ce qu'elle soit complète — avant (revue) : la tranche suivante la
+  déclarait complète sans les snapshots anciens. Jamais par l'Index d'un Bkp (ciblé ou en attente), qui ne la déclare pas
+  complète ; base servie avec un fichier fantôme : seul le fantôme fait la phase (tout Index). Marqueur non écrit :
+  `[ERREUR]`, passe arrêtée (code 1) ; illisible : `[WARN]`, ni phase ni état de construction écrit. Un snapshot non gardé
+  après son unité ou un code d'erreur d'`indexsnap` comptent comme un échec (même seuil).
+- **Rétention des snapshots chronologique** (`indexsnap`, `IdxPurge`) : les plus anciens par date d'archive, jamais la
+  dernière. Mesuré sur 1.0.206 (bac s85, `IDX_SNAP_KEEP=2`, dernière archive `…-0000-recente`) : par nom, son snapshot était
+  fait puis supprimé aussitôt (« 11 entrées snapshot supprimées (3 archives anciennes) ») ; sur 1.0.207, `…0000-recente` et
+  `…222619` gardées. Un snapshot sans aucune date connue est gardé (hors compte) ; IdxPurge garde aussi celui de
+  l'archive la plus récente d'`archive_stats`.
+- `IDX_SNAP_KEEP`/`KEEP_*` invalide : un `[ERREUR]` lisible, seule la phase des snapshots anciens ou la purge est sautée
+  (diffs et statistiques faits ; reconstruction jamais complète), jamais une trace — Index, `indexsnap`, IdxPurge (code 1,
+  plus de ligne « aucun IDX_INCLUDE » trompeuse) ; `-H Index` : ordre de la tranche corrigé, snapshots
+  des archives gardées par `IDX_SNAP_KEEP` mentionnés.
+- **LstBkpFls** (décision A) : archive sans snapshot -> « Aucun snapshot pour <archive> dans la base (seules les
+  IDX_SNAP_KEEP archives les plus récentes en ont un) » ; sentinelle sans ligne -> « Aucun fichier dans le snapshot de
+  <archive> (archive vide ou chemins exclus par IDX_INCLUDE/IDX_EXCLUDE) » ; archive inconnue de la base -> « Archive <archive>
+  inconnue de la base (voir LstBkp) » seulement si elle n'est dans aucune table d'archives ; message de rétention seulement
+  pour une archive plus ancienne que la fenêtre gardée (sinon « … (jamais fait ou sauté — Index --rebuild refait …) ») ;
+  base absente -> message existant ; NOIDX -> « <nick>: indexation désactivée (NOIDX=1) ». Code 1 inchangé, `{"error": …}`
+  avec `-j`.
+- Inchangés : `Index` sans `--rebuild` (snapshot de la dernière archive), tranche ordinaire de la base servie, `Index -S`.
+  Rétention factorisée (`_snap_keep`, mêmes valeurs pour `indexsnap` et `IdxPurge`).
+- Mesure rejouée (bac recréé) : 4 snapshots avant et après `--rebuild` (2, 3, 4, 5 fichiers), lignes (archive, date, chemin
+  stocké, taille, mtime, type, mode, propriétaire) identiques, `LstBkpFls -b` identique pour les 4 archives, 8,5 s.
+- borgHelperWWW non modifié : `Status` (`build`/`rebuild`, mêmes clés) et `rebuild` relayés tels quels ; message de
+  `LstBkpFls` relayé dans `{"error": …}`.
+- CodecSelfTest (vrai borg) : neuf contrôles (dont : fenêtre de rétention avec 8 archives et IDX_SNAP_KEEP 10, 8, 5 ; codes 143 et 1 sans sortie comptés, échéance jamais comptée, 0 sans
+  sentinelle compté ; marqueur jamais sous NOIDX, base marquée + fantôme, conseil `DB_NAME` partagé, marqueur illisible ;
+  archive connue des seules paires ou lignes de snapshot ; sentinelles non rapprochées datées plus tard) — — dépôt neuf à 5 archives indexées une à une : snapshots refaits identiques
+  (sentinelles, chemins, versions) à ceux d'Index successifs, en clair, chiffrée et `IDX_SNAP_KEEP=3` (jamais un `borg list`
+  au-delà), après le dernier `borg diff`, construction directe, Index ordinaire et `-t` sans `--rebuild` inchangés, Index sans
+  option après une reconstruction sans phase, chaque message de LstBkpFls ; tranche tuée pendant le snapshot d'une archive
+  ancienne -> rien d'écrit pour elle, fantôme partiel (clés exactes, pas d'« aucune progression »), reprise, bascule ; tué
+  hors échéance / en échec -> compté, phase arrêtée, retour entier, entrées disparues retirées, sautée au 3e, clés retirées
+  à la bascule ; construction directe en plusieurs appels (`--rebuild -t`, `Index -t`, Index d'un Bkp sans phase, `Index`),
+  clés retirées à la fin ; noms non chronologiques (Index, `--rebuild`, IdxPurge dry-run et réel, sentinelle sans date
+  gardée) ; `IDX_SNAP_KEEP` invalide.
+
 ## borgHelper 1.0.206 — Aide simplifiée — 2026-10-17
 
 Chantier « reconstruction progressive », story 93 (demande de l'utilisateur). Mesuré sur 1.0.205 : `-h` de 110 lignes à

@@ -843,6 +843,10 @@ stats   : archives sans archive_stats (période), de la plus récente à la plus
 diffs   : paires visées (_diff_keep_pairs : les DIFF_KEEP plus récentes, période) non indexées, de la plus récente à
           la plus ancienne, IDX_WORKERS en parallèle ; puis DIFF_KEEP
     ↓
+snaps anciens (1.0.207, story 85 ; cible d'une reconstruction seulement : fantôme ou construction directe d'un
+          --rebuild) : archives gardées par IDX_SNAP_KEEP sans sentinelle (période), de la plus récente à la plus
+          ancienne, indexsnap(archive=…) = un borg list complet par archive = une unité (_index_old_snaps)
+    ↓
 point de taille du dépôt (repo_stats op='index') seulement s'il reste du budget — placé avant les diffs, il
 mangeait le budget de chaque tranche et pouvait empêcher toute paire d'aboutir
     ↓
@@ -858,7 +862,8 @@ build_state (db_meta, clé 'build_state:<nick>', JSON) : {state: partial|complet
   progression : avertissement (budget trop court). Un budget plus court que la plus longue unité ne progresse jamais : le choisir au-dessus
   de la durée d'un `borg diff` de deux archives consécutives.
 - `complete` = toutes les paires visées indexées, `archive_stats` pour toutes les archives, snapshot de la dernière
-  (NOIDX : stats seules). Tranche : `build_state` toujours écrit. Index sans option : mis à jour seulement s'il existe
+  (NOIDX : stats seules) ; cible d'une reconstruction (1.0.207) : aussi le snapshot de chaque archive gardée par
+  `IDX_SNAP_KEEP` (`snapshot` faux tant qu'il en manque). Tranche : `build_state` toujours écrit. Index sans option : mis à jour seulement s'il existe
   et a changé, jamais créé (base sans `build_state` = `complete`, AD-10). `Status -j` : champ `build`.
 - **DIFF_KEEP (1.0.141)** : les paires visées sont les N plus récentes dans l'ordre des archives, pour Index sans
   option aussi ; `_diff_keep_purge(archives=)` garde exactement ces paires (sans liste : date d'archive puis nom).
@@ -918,8 +923,36 @@ _shadow_swap : plan['reconcile_deferred'] → bascule reportée (1.0.202), sans 
   (jamais recréé par `ensure_diff_db` en passant) ; fichier vide ou sans schéma (ouverture concurrente) -> jeté sans être
   recréé hors `--rebuild` ; `-F` ne jette le fantôme que si la création est possible ; `-wal`/`-shm` orphelins supprimés
   avant la création ; purge `IDX_*` après les contrôles bon marché (liste, empreinte).
-- Snapshots : le fantôme n'a que celui de la dernière archive (comme un Index complet) ; les snapshots plus anciens de la
-  base servie (`IDX_SNAP_KEEP`) sont perdus à la bascule (report : deferred-work).
+- Snapshots (1.0.207, story 85, D193) : la cible d'une reconstruction (fantôme, ou base absente construite directement
+  par `--rebuild` : `plan['direct']`, puis marqueur `db_meta` `rebuild_direct:<nick>` lu par tout Index de la base, retiré
+  par `_index_finish` quand elle est complète) refait aussi le snapshot de chaque archive que la rétention garde. Ordre des unités
+  d'une tranche (`_index_tranche`) : snapshot de la dernière archive, stats (plus récente d'abord), diffs (plus récent
+  d'abord, purge `DIFF_KEEP`), puis snapshots anciens (`_index_old_snaps`, `snap_keep` non `None`), puis point de taille du
+  dépôt. Archives visées : `_snap_keep_names(archives, _snap_keep(cfg))` — les `IDX_SNAP_KEEP` plus récentes (date de début, puis nom), celles que
+  `_snapurge_check` garderait si toutes avaient un snapshot (aucune si ≤ 0) —, sans sentinelle, dans la période `-b/-B`,
+  de la plus récente à la plus ancienne. Une archive = une unité : `indexsnap(archive=…)`, même code que le snapshot de la
+  dernière (sentinelle, `_snap_link_versions`, `store_excluded_snap_stats`, purge), toujours un `borg list` complet (ni
+  incrémental ni auto-réparation : l'archive précédente n'a en général pas encore de snapshot) ; borg tué -> `'killed'`,
+  rien d'écrit (lignes sans sentinelle retirées au début de l'unité suivante). `_build_state(…, snap_keep)` : `snapshot`
+  vrai seulement si la dernière et les archives visées ont leur sentinelle (clés de `build_state` et format de `Status -j`
+  inchangés ; `_snaps` (faits, visés) sert à la ligne de fin de tranche « snapshots k/N » et n'est jamais écrit) ;
+  `_index_finish(…, olds)` : un snapshot ancien fait compte comme une progression (pas d'avertissement « aucune
+  progression ; le snapshot de la dernière fait par la tranche aussi). Échec du `borg list` d'une archive ancienne
+  (décision 3, revues 85) : `indexsnap` rend `('retry', cause)` (tué hors échéance : code < 0 ou ≥ 128, code 1 sans sortie
+  A77) ou `('failed', cause)` ; les deux incrémentent le même compteur `db_meta` `snap_failed:<nick>` [[nom, début, n]]
+  et arrêtent la phase pour la tranche ; au 3e consécutif -> `snap_skipped:<nick>` [[nom, début]], `[WARN] … sauté pour
+  cette reconstruction`, phase poursuivie, ni réessayée ni attendue par `_build_state`. Succès = sentinelle présente après
+  l'unité (compteur retiré) ; 0 sans sentinelle (non écrite ou purgée aussitôt) et code entier (base, mode changé) :
+  comptés au même compteur, phase arrêtée.
+  Échéance ou opération prioritaire : jamais comptées. Entrées dont (nom, début) n'est plus dans `borg list` retirées.
+  Les clés sont retirées à la bascule (`_shadow_swap`, avec `rebuild_direct`) et à la fin d'une construction directe.
+  Phase (`old`) : jamais pour un Index lancé par un Bkp (`plan['own']`, tour d'Index tenu) ni pour la base servie quand
+  un fichier fantôme existe (tout Index) — `snap_keep` compte quand même pour `build_state`. Marqueur `rebuild_direct` :
+  jamais écrit sous NOIDX ; écriture en échec -> `[ERREUR]`, passe arrêtée (code 1) ; illisible (`_direct_marker` -> None)
+  -> `[WARN]`, `_SK_DOUBT` : ni phase, ni `build_state` écrit. Rétention : `_plan_snap_keep` (une fois par Index) ; invalide : un
+  `[ERREUR]`, `_SK_INVALID` (phase sautée, `snapshot` faux) ; purge d'`indexsnap` et d'IdxPurge : `[ERREUR]`, purge sautée. Index sans
+  `--rebuild`, tranche ordinaire de la base servie, `Index -S` : inchangés. Avant 1.0.207, les
+  snapshots anciens de la base servie étaient perdus à la bascule.
 - `Status` : `rebuild` = `build_state` du fantôme lu dans son `db_meta` (sans codec), `{'state':'partial'}` avant la
   première fin de tranche, `null` sans fantôme.
 
@@ -957,7 +990,10 @@ Fallback borg list complet (si force, ou si incrémental échoue) :
     INSERT archive_snapshot_indexed
 
 Purge auto des snapshots anciens :
-    _snapurge_check / _snapurge_exec → supprime archives au-delà de IDX_SNAP_KEEP
+    _snapurge_check / _snapurge_exec → supprime archives au-delà de IDX_SNAP_KEEP, les plus anciennes par date
+        (snapshot, sinon archive_stats ; à date égale, nom ; 1.0.207 — avant : par nom), jamais la plus récente
+        datée ni `latest` (dernière de borg list ; IdxPurge : la plus récente d'archive_stats) ; sentinelle sans aucune
+        date : gardée, hors compte ; IdxPurge à rétention invalide : [ERREUR], rend 1 (code de sortie 1)
     IDX_SNAP_KEEP = config, ou sum(KEEP_*), ou 10
     Erreur non bloquante ([WARN])
 ```
